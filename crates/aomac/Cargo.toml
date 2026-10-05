@@ -1,0 +1,15 @@
+[package]
+name = "aomac"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ao-scene.workspace = true
+ao-rdb.workspace = true
+ao-formats.workspace = true
+ao-render.workspace = true
+ao-install.workspace = true
+clap = { version = "4", features = ["derive"] }
+glam = "0.29"

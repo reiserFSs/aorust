@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+ao-scene = { path = "crates/ao-scene" }
+ao-rdb = { path = "crates/ao-rdb" }
+ao-formats = { path = "crates/ao-formats" }
+ao-render = { path = "crates/ao-render" }
+ao-install = { path = "crates/ao-install" }
+ao-net = { path = "crates/ao-net" }
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
