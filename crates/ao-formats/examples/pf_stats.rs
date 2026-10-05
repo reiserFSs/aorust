@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 let dt = t.elapsed().as_secs_f64();
                 if !only.is_empty() {
-                    println!("{id} {name}: {dt:.2}s cells={} statels={} meshes={} instances={} missing={} failed={}", r.terrain_cells, r.statels, r.unique_meshes, scene.instances.len(), r.missing_meshes, r.failed_meshes);
+                    println!("{id} {name}: {dt:.2}s cells={} statels={} meshes={} instances={} verts={} missing={} failed={}", r.terrain_cells, r.statels, r.unique_meshes, scene.instances.len(), scene.meshes.iter().map(|m| m.vertices.len()).sum::<usize>(), r.missing_meshes, r.failed_meshes);
                 }
                 slow.push((dt, *id, name.clone(), r.terrain_cells, r.statels));
             }

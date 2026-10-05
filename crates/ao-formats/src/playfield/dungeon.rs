@@ -444,6 +444,8 @@ impl Surface {
 struct RoomBuf {
     vertices: Vec<Vertex>,
     by_tex: HashMap<Option<TextureKey>, Vec<u32>>,
+    /// Welding lookup: (material, position at 30 cells/m) -> vertex indices.
+    grid: HashMap<(Option<TextureKey>, [i32; 3]), Vec<u32>>,
 }
 
 /// Room placement (`Placer::place` convention) and the AO -> scene mirror.
@@ -490,7 +492,7 @@ impl Builder<'_> {
                 continue;
             }
             let mat = layer.get(bi).and_then(|&m| (self.textures)(m));
-            let base = self.out.vertices.len() as u32;
+            let mut block = Vec::with_capacity(verts.len());
             for v in verts {
                 let (px, pz) = (v[0] as f64 * c + v[2] as f64 * s, -(v[0] as f64) * s + v[2] as f64 * c);
                 let (nx, nz) = (v[3] as f64 * c + v[5] as f64 * s, -(v[3] as f64) * s + v[5] as f64 * c);
@@ -504,12 +506,16 @@ impl Builder<'_> {
                 let y2 = y + floor.height(u, w) + y * 0.25 * ceil.height(u, w);
                 let p = self.frame.point([px as f32 + origin[0], y2 as f32, pz as f32 + origin[1]]);
                 let n = self.frame.vec([(nx / l) as f32, (ny / l) as f32, (nz / l) as f32]);
-                self.out.vertices.push(Vertex { pos: p, normal: [n[0], n[1], -n[2]], uv: [v[6], v[7]], ..Default::default() });
+                block.push(Vertex { pos: p, normal: [n[0], n[1], -n[2]], uv: [v[6], v[7]], ..Default::default() });
             }
+            let remap = weld_block(&mut self.out, mat, &mut block);
             // z is mirrored: reverse the winding
             let idx = self.out.by_tex.entry(mat).or_default();
             for t in tris.chunks_exact(3) {
-                idx.extend([base + t[0] as u32, base + t[2] as u32, base + t[1] as u32]);
+                let [a, b, c] = [remap[t[0] as usize], remap[t[2] as usize], remap[t[1] as usize]];
+                if a != b && b != c && a != c {
+                    idx.extend([a, b, c]);
+                }
             }
         }
     }
@@ -588,6 +594,72 @@ pub(super) fn entry_spot(g: &Gnda, rec: &Record, props: &[Vec<[f32; 3]>]) -> Opt
     order.into_iter().find_map(|i| room_spot(g, &rec.rooms[i], props.get(i).map_or(&[], |p| p)))
 }
 
+/// Vertex welding of one cell block (`FUN_10001645`, N3 @0x10001645), against the vertices already
+/// built with the same material. A vertex matches an earlier one when the squared distance is
+/// <= 0.001 (`DAT_1003c8a0`), the squared normal difference <= 0.2 (`DAT_1003c898`) and the uv
+/// difference is an integer within +-0.1 (`DAT_1003c890`). The client hashes positions at 30 cells
+/// per metre (`DAT_1003c8a8`) and compares the 3x3x3 neighbourhood. The *whole block* is first shifted by
+/// one integer uv offset (the first offset found for two different vertices, else the last one) so its
+/// texture coordinates continue those of its neighbours; vertices that then coincide are dropped.
+/// Returns the output index of every vertex of `block` (kept ones are appended to `out`).
+fn weld_block(out: &mut RoomBuf, mat: Option<TextureKey>, block: &mut [Vertex]) -> Vec<u32> {
+    let d2 = |a: [f32; 3], b: [f32; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f32>();
+    let frac_ok = |d: f32| d - d.floor() <= 0.2; // d = old - new + 0.1
+    let find = |out: &RoomBuf, v: &Vertex, f: &mut dyn FnMut(u32, &Vertex)| {
+        let k = v.pos.map(|c| (c * 30.0).round() as i32);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for &j in out.grid.get(&(mat, [k[0] + dx, k[1] + dy, k[2] + dz])).into_iter().flatten() {
+                        let o = &out.vertices[j as usize];
+                        if d2(o.pos, v.pos) <= 0.001 && d2(o.normal, v.normal) <= 0.2 && frac_ok(o.uv[0] - v.uv[0] + 0.1) && frac_ok(o.uv[1] - v.uv[1] + 0.1) {
+                            f(j, o);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    // pass 1: the piece-wide uv offset
+    let mut seen: Vec<([i32; 2], usize)> = Vec::new();
+    let mut offset = None;
+    'scan: for (i, v) in block.iter().enumerate() {
+        let mut hits: Vec<[i32; 2]> = Vec::new();
+        find(out, v, &mut |_, o| hits.push([(o.uv[0] - v.uv[0] + 0.1).floor() as i32, (o.uv[1] - v.uv[1] + 0.1).floor() as i32]));
+        for off in hits {
+            match seen.iter().find(|s| s.0 == off) {
+                Some(&(_, owner)) if owner != i => {
+                    offset = Some(off);
+                    break 'scan;
+                }
+                Some(_) => {}
+                None if seen.len() < 20 => seen.push((off, i)),
+                None => {}
+            }
+        }
+        offset = seen.last().map(|s| s.0);
+    }
+    let off = offset.unwrap_or([0, 0]).map(|v| v as f32);
+    // pass 2: shift, then merge coinciding vertices
+    let mut remap = Vec::with_capacity(block.len());
+    for v in block.iter_mut() {
+        v.uv = [v.uv[0] + off[0], v.uv[1] + off[1]];
+        let mut hit = None;
+        find(out, v, &mut |j, o| {
+            if hit.is_none() && (o.uv[0] - v.uv[0]).abs() <= 0.1 && (o.uv[1] - v.uv[1]).abs() <= 0.1 {
+                hit = Some(j);
+            }
+        });
+        remap.push(hit.unwrap_or_else(|| {
+            let j = out.vertices.len() as u32;
+            out.grid.entry((mat, v.pos.map(|c| (c * 30.0).round() as i32))).or_default().push(j);
+            out.vertices.push(*v);
+            j
+        }));
+    }
+    remap
+}
+
 /// Builds the shell of `room` in scene space. `piece(id)` returns cell meshes, `textures` maps
 /// material indices to textures.
 fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<TextureKey>, piece: &mut dyn FnMut(u16) -> Option<Rc<Piece>>) -> Option<Mesh> {
@@ -601,7 +673,7 @@ fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<Text
         g,
         frame: Frame { rot: statel::ry(room.rot as f32 * std::f32::consts::FRAC_PI_2), pos: room.pos },
         textures,
-        out: RoomBuf { vertices: Vec::new(), by_tex: HashMap::new() },
+        out: RoomBuf { vertices: Vec::new(), by_tex: HashMap::new(), grid: HashMap::new() },
     };
     for z in z1..z2 {
         for x in x1..x2 {
@@ -625,7 +697,7 @@ fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<Text
             }
         }
     }
-    let RoomBuf { vertices, by_tex } = b.out;
+    let RoomBuf { vertices, by_tex, .. } = b.out;
     if vertices.is_empty() {
         return None;
     }
@@ -816,7 +888,8 @@ mod tests {
         let mut texture = |i: u8| Some(TextureKey { rdb_type: 1, id: i as u32 });
         let mesh = build_room(&g, &room, &mut texture, &mut piece).unwrap();
         // 8 floors (walls get the flat floor added) + one ceiling (interior cell only)
-        assert_eq!(mesh.vertices.len(), 8 * 4 + 4);
+        // welded: the floor corners of the 3x3 window (4x4 grid minus the corner without a floor) are shared
+        assert_eq!(mesh.vertices.len(), 15 + 4);
         let low: Vec<_> = mesh.vertices.iter().filter(|v| (v.pos[1] - 5.0).abs() < 1e-4).collect();
         let range = |f: &dyn Fn(&Vertex) -> f32| low.iter().map(|v| f(v)).fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(x), b.max(x)));
         // local x,z in [-4, 2]; rotated by one quarter turn about +Y (x' = z, z' = -x), scene z = -z'
@@ -848,5 +921,35 @@ mod tests {
         assert_eq!(scene.instances.len(), rec.rooms.len());
         assert!(scene.meshes.iter().all(|m| !m.vertices.is_empty()));
         assert!(!scene.textures.is_empty());
+        // welding: 184 561 shell vertices unwelded, 111 643 welded
+        assert!(scene.meshes.iter().map(|m| m.vertices.len()).sum::<usize>() < 150_000);
+    }
+
+    #[test]
+    fn weld_shifts_the_block_uv_and_merges_shared_corners() {
+        let v = |x: f32, n: [f32; 3], u: f32| Vertex { pos: [x, 0.0, 0.0], normal: n, uv: [u, 0.5], ..Default::default() };
+        let up = [0.0, 1.0, 0.0];
+        let mut out = RoomBuf { vertices: Vec::new(), by_tex: HashMap::new(), grid: HashMap::new() };
+        // first block: x = 0 (u 0), x = 1 (u 1)
+        let first = weld_block(&mut out, None, &mut [v(0.0, up, 0.0), v(1.0, up, 1.0)]);
+        assert_eq!(first, vec![0, 1]);
+        // neighbour block starts at x = 1 with u = 0 (tiled texture): shifted by +1 so its corner
+        // continues u = 1 and merges; the far vertex becomes u = 2. A vertex with another normal is kept.
+        let mut b = [v(1.0, up, 0.0), v(2.0, up, 1.0), v(1.0, [1.0, 0.0, 0.0], 0.0)];
+        assert_eq!(weld_block(&mut out, None, &mut b), vec![1, 2, 3]);
+        assert_eq!(out.vertices.len(), 4);
+        assert_eq!(out.vertices[2].uv[0], 2.0);
+        // another material never merges
+        let other = Some(TextureKey { rdb_type: 1, id: 1 });
+        assert_eq!(weld_block(&mut out, other, &mut [v(1.0, up, 1.0)]), vec![4]);
+    }
+
+    #[test]
+    fn height_layers_clamp_at_the_map_border() {
+        // N3 @0x10001c3b replicates the nearest valid row/column for the 4x4 corner window
+        let g = parse_gnda(&fixture(&[])).unwrap();
+        assert_eq!(g.at(-5, -3), 0);
+        assert_eq!(g.at(W as i32 + 4, W as i32 + 4), W * W - 1);
+        assert_eq!(g.at(2, -1), 2);
     }
 }
