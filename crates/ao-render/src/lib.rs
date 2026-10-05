@@ -3,7 +3,7 @@
 mod viewer;
 
 use anyhow::{anyhow, Context, Result};
-use ao_scene::{Scene, TextureKey};
+use ao_scene::{Blend, Environment, Scene, TextureKey};
 pub use glam::Vec3;
 use glam::{Mat4, Vec4};
 use std::collections::HashMap;
@@ -74,15 +74,15 @@ pub fn scene_bounds(scene: &Scene) -> Option<(Vec3, Vec3)> {
     (lo.x <= hi.x).then_some((lo, hi))
 }
 
-/// Default eye/target: the spawn point if set, else a 3/4 view framing the bounds.
+/// Default eye/target: `spawn` (+ `spawn_look_at`) if set, else a 3/4 view framing the bounds.
 pub fn default_view(scene: &Scene) -> (Vec3, Vec3) {
-    let Some((lo, hi)) = scene_bounds(scene) else { return (Vec3::new(0.0, 2.0, 5.0), Vec3::ZERO) };
+    let Some((lo, hi)) = scene_bounds(scene) else { return (scene.spawn.map_or(Vec3::new(0.0, 2.0, 5.0), Vec3::from), scene.spawn_look_at.map_or(Vec3::ZERO, Vec3::from)) };
     let center = (lo + hi) * 0.5;
     let r = ((hi - lo).length() * 0.5).max(0.5);
     match scene.spawn {
         Some(s) => {
             let s = Vec3::from(s);
-            (s, Vec3::new(center.x, s.y, center.z))
+            (s, scene.spawn_look_at.map_or(Vec3::new(center.x, s.y, center.z), Vec3::from))
         }
         None => (center + Vec3::new(0.6, 0.5, 1.0).normalize() * r * 1.8, center),
     }
@@ -93,26 +93,45 @@ pub fn default_view(scene: &Scene) -> (Vec3, Vec3) {
 struct Globals {
     view_proj: [[f32; 4]; 4],
     eye: [f32; 4],
-    sun: [f32; 4],
+    sun_dir: [f32; 4],
+    sun_color: [f32; 4],
+    ambient: [f32; 4],
     fog_color: [f32; 4],
     fog: [f32; 4],
 }
 
+/// One submesh draw. `pipe` = `blend as usize * 2 + two_sided as usize`.
 struct Draw {
     mesh: usize,
     first_index: u32,
     count: u32,
-    bind: usize,
-    alpha: bool,
-    inst: std::ops::Range<u32>,
+    mat: usize,
+    pipe: usize,
+}
+
+/// Static instance data: transform plus world-space bounding sphere.
+struct Inst {
+    m: [[f32; 4]; 4],
+    center: Vec3,
+    radius: f32,
 }
 
 struct Gpu {
     meshes: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
     inst_buf: Option<wgpu::Buffer>,
-    binds: Vec<wgpu::BindGroup>, // [0] = untextured fallback
-    draws: Vec<Draw>,
+    mats: Vec<wgpu::BindGroup>, // [0] = untextured white
+    opaque: Vec<Draw>,          // Opaque + AlphaTest, sorted by pipeline/mesh/material
+    blended: Vec<Draw>,         // AlphaBlend + Additive, drawn per visible instance, far to near
+    insts: Vec<Inst>,           // grouped by mesh
+    mesh_range: Vec<std::ops::Range<usize>>,
     radius: f32,
+}
+
+/// Last-frame counters (after frustum culling).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameStats {
+    pub instances: usize,
+    pub draw_calls: usize,
 }
 
 /// Colour + depth attachments sized to the output.
@@ -146,13 +165,39 @@ pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
+    pub stats: FrameStats,
     globals: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     tex_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    pipe_opaque: wgpu::RenderPipeline,
-    pipe_alpha: wgpu::RenderPipeline,
+    pipes: Vec<wgpu::RenderPipeline>, // indexed by Draw::pipe
     gpu: Gpu,
+    env: Environment,
+    // per-frame scratch
+    vis: Vec<[[f32; 4]; 4]>,
+    vis_src: Vec<u32>,
+    vis_range: Vec<std::ops::Range<u32>>,
+    sorted: Vec<(f32, u32, u32)>, // (distance, blended draw, visible instance)
+}
+
+fn default_environment(radius: f32) -> Environment {
+    let fog_end = (radius * 2.0).max(300.0);
+    let sky = SKY_SRGB.map(srgb_to_linear);
+    Environment {
+        sky_color: sky,
+        fog_color: sky,
+        fog_start: fog_end * 0.35,
+        fog_end,
+        ambient: [0.35, 0.38, 0.45],
+        sun_color: [0.75, 0.71, 0.64],
+        sun_dir: Vec3::new(0.4, 0.8, 0.3).normalize().to_array(),
+    }
+}
+
+/// Left, right, bottom, top, near, far planes (normalised, normals point inside).
+fn frustum_planes(vp: &Mat4) -> [Vec4; 6] {
+    let (r0, r1, r2, r3) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
+    [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2].map(|p| p / p.truncate().length())
 }
 
 impl Renderer {
@@ -192,18 +237,15 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let uniform_entry = |binding, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
         let g_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT)],
         });
         let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -229,6 +271,7 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -246,10 +289,17 @@ impl Renderer {
             bind_group_layouts: &[&g_layout, &tex_layout],
             push_constant_ranges: &[],
         });
-        let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 3 + (o / 16) as u32 };
+        let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
         let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
-        let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2];
-        let mk = |fs: &str| {
+        let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
+        let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+        let mk = |blend: Blend, two_sided: bool| {
+            let (fs, state, depth_write) = match blend {
+                Blend::Opaque => ("fs_opaque", None, true),
+                Blend::AlphaTest => ("fs_test", None, true),
+                Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
+                Blend::Additive => ("fs_add", Some(wgpu::BlendState { color: add, alpha: wgpu::BlendComponent::OVER }), false),
+            };
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
                 layout: Some(&layout),
@@ -258,28 +308,24 @@ impl Renderer {
                     entry_point: Some("vs"),
                     compilation_options: Default::default(),
                     buffers: &[
-                        wgpu::VertexBufferLayout {
-                            array_stride: 32,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &vert_attrs,
-                        },
-                        wgpu::VertexBufferLayout {
-                            array_stride: 64,
-                            step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: &inst_attrs,
-                        },
+                        wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
+                        wgpu::VertexBufferLayout { array_stride: 64, step_mode: wgpu::VertexStepMode::Instance, attributes: &inst_attrs },
                     ],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
                     entry_point: Some(fs),
                     compilation_options: Default::default(),
-                    targets: &[Some(format.into())],
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL })],
                 }),
-                primitive: wgpu::PrimitiveState::default(), // two-sided: no culling
+                primitive: wgpu::PrimitiveState {
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: (!two_sided).then_some(wgpu::Face::Back),
+                    ..Default::default()
+                },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH,
-                    depth_write_enabled: true,
+                    depth_write_enabled: depth_write,
                     depth_compare: wgpu::CompareFunction::Less,
                     stencil: Default::default(),
                     bias: Default::default(),
@@ -289,24 +335,33 @@ impl Renderer {
                 cache: None,
             })
         };
-        let (pipe_opaque, pipe_alpha) = (mk("fs_opaque"), mk("fs_alpha"));
+        let pipes = [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive]
+            .into_iter()
+            .flat_map(|b| [false, true].map(|two| (b, two)))
+            .map(|(b, two)| mk(b, two))
+            .collect();
         let mut r = Self {
             device,
             queue,
             format,
+            stats: FrameStats::default(),
             globals,
             globals_bg,
             tex_layout,
             sampler,
-            pipe_opaque,
-            pipe_alpha,
-            gpu: Gpu { meshes: vec![], inst_buf: None, binds: vec![], draws: vec![], radius: 100.0 },
+            pipes,
+            gpu: Gpu { meshes: vec![], inst_buf: None, mats: vec![], opaque: vec![], blended: vec![], insts: vec![], mesh_range: vec![], radius: 100.0 },
+            env: default_environment(100.0),
+            vis: vec![],
+            vis_src: vec![],
+            vis_range: vec![],
+            sorted: vec![],
         };
         r.upload(&Scene::default());
         Ok(r)
     }
 
-    fn texture_bind(&self, rgba: &[u8], w: u32, h: u32) -> wgpu::BindGroup {
+    fn texture_view(&self, rgba: &[u8], w: u32, h: u32) -> wgpu::TextureView {
         let mips = 32 - w.max(h).leading_zeros();
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -343,45 +398,76 @@ impl Renderer {
             }
             (cw, ch, data) = (nw, nh, next);
         }
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.tex_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex.create_view(&Default::default())) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-            ],
-        })
+        tex.create_view(&Default::default())
     }
 
     /// Replaces the GPU-side scene.
     pub fn upload(&mut self, scene: &Scene) {
-        let mut binds = vec![self.texture_bind(&[190, 190, 190, 255], 1, 1)];
-        let mut bind_of: HashMap<TextureKey, usize> = HashMap::new();
+        let mut views = vec![self.texture_view(&[255; 4], 1, 1)];
+        let mut view_of: HashMap<TextureKey, usize> = HashMap::new();
         for (k, t) in &scene.textures {
             if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize {
-                bind_of.insert(*k, binds.len());
-                binds.push(self.texture_bind(&t.rgba, t.width, t.height));
+                view_of.insert(*k, views.len());
+                views.push(self.texture_view(&t.rgba, t.width, t.height));
+            }
+        }
+        // One bind group per distinct (texture, base colour).
+        let mut mat_of: HashMap<(usize, [u32; 4]), usize> = HashMap::new();
+        let mut mats: Vec<wgpu::BindGroup> = vec![];
+        let mut material = |dev: &Renderer, view: usize, color: [f32; 4]| {
+            *mat_of.entry((view, color.map(f32::to_bits))).or_insert_with(|| {
+                let ub = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::bytes_of(&color),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                mats.push(dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &dev.tex_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[view]) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&dev.sampler) },
+                        wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
+                    ],
+                }));
+                mats.len() - 1
+            })
+        };
+
+        let mut by_mesh: Vec<Vec<Inst>> = scene.meshes.iter().map(|_| vec![]).collect();
+        let sphere: Vec<(Vec3, f32)> = scene
+            .meshes
+            .iter()
+            .map(|m| {
+                let (lo, hi) = m.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| {
+                    (l.min(Vec3::from(v.pos)), h.max(Vec3::from(v.pos)))
+                });
+                let c = (lo + hi) * 0.5;
+                let r = m.vertices.iter().map(|v| (Vec3::from(v.pos) - c).length()).fold(0.0, f32::max);
+                (c, r)
+            })
+            .collect();
+        for i in &scene.instances {
+            if let Some(v) = by_mesh.get_mut(i.mesh) {
+                let m = Mat4::from_cols_array_2d(&i.transform);
+                let scale = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
+                v.push(Inst { m: i.transform, center: m.transform_point3(sphere[i.mesh].0), radius: sphere[i.mesh].1 * scale });
             }
         }
 
-        // Instances grouped by mesh -> contiguous ranges in one instance buffer.
-        let mut by_mesh: Vec<Vec<[[f32; 4]; 4]>> = vec![vec![]; scene.meshes.len()];
-        for i in &scene.instances {
-            if let Some(v) = by_mesh.get_mut(i.mesh) {
-                v.push(i.transform);
-            }
-        }
-        let mut all: Vec<[[f32; 4]; 4]> = vec![];
-        let mut meshes = vec![];
-        let mut draws = vec![];
+        let (mut insts, mut mesh_range, mut meshes) = (vec![], vec![], vec![]);
+        let (mut opaque, mut blended) = (vec![], vec![]);
         for (mi, mesh) in scene.meshes.iter().enumerate() {
-            let range = all.len() as u32..(all.len() + by_mesh[mi].len()) as u32;
-            all.extend_from_slice(&by_mesh[mi]);
+            let list = std::mem::take(&mut by_mesh[mi]);
+            let range = insts.len()..insts.len() + list.len();
             let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
-            if mesh.vertices.is_empty() || idx_total == 0 || range.is_empty() {
+            if mesh.vertices.is_empty() || idx_total == 0 || list.is_empty() {
+                mesh_range.push(insts.len()..insts.len());
                 meshes.push(None);
                 continue;
             }
+            mesh_range.push(range);
+            insts.extend(list);
             let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&vertex_bytes(&mesh.vertices)),
@@ -399,14 +485,15 @@ impl Renderer {
                 }
                 let count = indices.len() as u32 - first;
                 if count > 0 {
-                    draws.push(Draw {
+                    let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
+                    let d = Draw {
                         mesh: mi,
                         first_index: first,
                         count,
-                        bind: s.texture.and_then(|k| bind_of.get(&k).copied()).unwrap_or(0),
-                        alpha: s.blend != ao_scene::Blend::Opaque,
-                        inst: range.clone(),
-                    });
+                        mat: material(self, view, s.base_color),
+                        pipe: s.blend as usize * 2 + s.two_sided as usize,
+                    };
+                    if matches!(s.blend, Blend::AlphaBlend | Blend::Additive) { blended.push(d) } else { opaque.push(d) }
                 }
             }
             let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -416,40 +503,75 @@ impl Renderer {
             });
             meshes.push(Some((vb, ib)));
         }
-        draws.sort_by_key(|d| d.alpha); // opaque first, then cutouts
-        let inst_buf = (!all.is_empty()).then(|| {
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&all),
-                usage: wgpu::BufferUsages::VERTEX,
+        opaque.sort_by_key(|d| (d.pipe, d.mesh, d.mat));
+        let inst_buf = (!insts.is_empty()).then(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("instances"),
+                size: (insts.len() * 64) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             })
         });
         let radius = scene_bounds(scene).map_or(100.0, |(l, h)| ((h - l).length() * 0.5).max(1.0));
-        self.gpu = Gpu { meshes, inst_buf, binds, draws, radius };
+        self.env = scene.environment.unwrap_or_else(|| default_environment(radius));
+        self.gpu = Gpu { meshes, inst_buf, mats, opaque, blended, insts, mesh_range, radius };
     }
 
-    /// Scene radius; viewer uses it for speed and far plane.
+    /// Scene radius; viewer uses it for speed.
     pub fn radius(&self) -> f32 {
         self.gpu.radius
     }
 
     /// Draws one frame into `resolve` (a view of the output texture).
-    pub fn render(&self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) {
-        let fog_end = (self.gpu.radius * 2.0).max(300.0);
-        let far = fog_end * 1.5;
+    pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) {
+        let env = self.env;
+        let far = (env.fog_end * 1.1).max(50.0);
         let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
         let vp = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.2, far) * Mat4::look_to_rh(cam.pos, cam.forward(), Vec3::Y);
-        let sky = SKY_SRGB.map(srgb_to_linear);
-        let sun = Vec3::new(0.4, 0.8, 0.3).normalize();
+        let v4 = |c: [f32; 3], w| Vec4::new(c[0], c[1], c[2], w).to_array();
         let g = Globals {
             view_proj: vp.to_cols_array_2d(),
             eye: cam.pos.extend(1.0).to_array(),
-            sun: sun.extend(0.0).to_array(),
-            fog_color: Vec4::new(sky[0], sky[1], sky[2], 1.0).to_array(),
-            fog: [fog_end * 0.35, fog_end, 0.0, 0.0],
+            sun_dir: v4(Vec3::from(env.sun_dir).normalize_or_zero().to_array(), 0.0),
+            sun_color: v4(env.sun_color, 0.0),
+            ambient: v4(env.ambient, 0.0),
+            fog_color: v4(env.fog_color, 1.0),
+            fog: [env.fog_start, env.fog_end, 0.0, 0.0],
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
+        // Frustum cull per instance (bounding spheres), compacting survivors per mesh.
+        let planes = frustum_planes(&vp);
+        self.vis.clear();
+        self.vis_src.clear();
+        self.vis_range.clear();
+        for r in &self.gpu.mesh_range {
+            let start = self.vis.len() as u32;
+            for (i, inst) in self.gpu.insts[r.clone()].iter().enumerate() {
+                let c = inst.center.extend(1.0);
+                if planes.iter().all(|p| p.dot(c) >= -inst.radius) {
+                    self.vis.push(inst.m);
+                    self.vis_src.push((r.start + i) as u32);
+                }
+            }
+            self.vis_range.push(start..self.vis.len() as u32);
+        }
+        if let Some(buf) = &self.gpu.inst_buf {
+            if !self.vis.is_empty() {
+                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
+            }
+        }
+        // Blended: one draw per (visible instance, submesh), far to near by instance centre.
+        self.sorted.clear();
+        for (di, d) in self.gpu.blended.iter().enumerate() {
+            for vi in self.vis_range[d.mesh].clone() {
+                let dist = (self.gpu.insts[self.vis_src[vi as usize] as usize].center - cam.pos).length();
+                self.sorted.push((dist, di as u32, vi));
+            }
+        }
+        self.sorted.sort_by(|a, b| b.0.total_cmp(&a.0)); // stable: ties keep submesh order
+
+        let mut calls = 0;
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -458,7 +580,7 @@ impl Renderer {
                     view: &t.msaa,
                     resolve_target: Some(resolve),
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: sky[0] as f64, g: sky[1] as f64, b: sky[2] as f64, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: env.sky_color[0] as f64, g: env.sky_color[1] as f64, b: env.sky_color[2] as f64, a: 1.0 }),
                         store: wgpu::StoreOp::Discard,
                     },
                 })],
@@ -473,32 +595,50 @@ impl Renderer {
             if let Some(inst) = &self.gpu.inst_buf {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_vertex_buffer(1, inst.slice(..));
-                let (mut cur_mesh, mut cur_alpha, mut cur_bind) = (usize::MAX, None, usize::MAX);
-                for d in &self.gpu.draws {
-                    if cur_alpha != Some(d.alpha) {
-                        pass.set_pipeline(if d.alpha { &self.pipe_alpha } else { &self.pipe_opaque });
-                        cur_alpha = Some(d.alpha);
+                let (mut pipe, mut mesh, mut mat) = (usize::MAX, usize::MAX, usize::MAX);
+                let mut draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>| {
+                    if pipe != d.pipe {
+                        pass.set_pipeline(&self.pipes[d.pipe]);
+                        pipe = d.pipe;
                     }
-                    if cur_mesh != d.mesh {
+                    if mesh != d.mesh {
                         let (vb, ib) = self.gpu.meshes[d.mesh].as_ref().unwrap();
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                        cur_mesh = d.mesh;
+                        mesh = d.mesh;
                     }
-                    if cur_bind != d.bind {
-                        pass.set_bind_group(1, &self.gpu.binds[d.bind], &[]);
-                        cur_bind = d.bind;
+                    if mat != d.mat {
+                        pass.set_bind_group(1, &self.gpu.mats[d.mat], &[]);
+                        mat = d.mat;
                     }
-                    pass.draw_indexed(d.first_index..d.first_index + d.count, 0, d.inst.clone());
+                    pass.draw_indexed(d.first_index..d.first_index + d.count, 0, insts);
+                    calls += 1;
+                };
+                for d in &self.gpu.opaque {
+                    let r = self.vis_range[d.mesh].clone();
+                    if !r.is_empty() {
+                        draw(&mut pass, d, r);
+                    }
+                }
+                for &(_, di, vi) in &self.sorted {
+                    draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1);
                 }
             }
         }
+        self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls };
         self.queue.submit([enc.finish()]);
     }
 }
 
 fn vertex_bytes(v: &[ao_scene::Vertex]) -> Vec<f32> {
-    v.iter().flat_map(|v| [v.pos[0], v.pos[1], v.pos[2], v.normal[0], v.normal[1], v.normal[2], v.uv[0], v.uv[1]]).collect()
+    v.iter()
+        .flat_map(|v| {
+            let [x, y, z] = v.pos;
+            let [nx, ny, nz] = v.normal;
+            let [r, g, b, a] = v.color;
+            [x, y, z, nx, ny, nz, v.uv[0], v.uv[1], r, g, b, a]
+        })
+        .collect()
 }
 
 /// Renders `scene` offscreen and writes an sRGB PNG.

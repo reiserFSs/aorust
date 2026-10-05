@@ -74,7 +74,22 @@ pub fn scene(count: usize) -> Scene {
         c.submeshes[0].texture = Some(key(1 + m));
         s.meshes.push(c);
     }
+    // Blend test: translucent blue glass, additive glow with a vertex-colour fade, cubes behind/between.
+    let mut glass = Mesh { vertices: quad([[-3., 0.5, 0.], [3., 0.5, 0.], [3., 4., 0.], [-3., 4., 0.]], [0., 0., 1.], 1.0), submeshes: vec![] };
+    glass.submeshes.push(Submesh { blend: Blend::AlphaBlend, base_color: [0.2, 0.5, 1.0, 0.45], ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) });
+    let mut glow = Mesh { vertices: quad([[-2., 0.5, 0.], [2., 0.5, 0.], [2., 3.5, 0.], [-2., 3.5, 0.]], [0., 0., 1.], 1.0), submeshes: vec![] };
+    glow.vertices[2].color = [1.0, 1.0, 1.0, 0.0];
+    glow.vertices[3].color = [1.0, 1.0, 1.0, 0.0];
+    glow.submeshes.push(Submesh { blend: Blend::Additive, base_color: [1.0, 0.45, 0.1, 1.0], ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) });
+    s.meshes.push(glass); // 10
+    s.meshes.push(glow); // 11
+    let at = |x: f32, y: f32, z: f32| Mat4::from_translation(Vec3::new(x, y, z)).to_cols_array_2d();
     s.instances.push(Instance { mesh: 0, transform: ao_scene::IDENTITY });
+    s.instances.push(Instance { mesh: 2, transform: Mat4::from_scale_rotation_translation(Vec3::splat(2.0), Quat::from_rotation_y(0.5), Vec3::new(-1., 1., 8.)).to_cols_array_2d() });
+    s.instances.push(Instance { mesh: 11, transform: at(1.0, 0., 10.5) }); // glow behind glass
+    s.instances.push(Instance { mesh: 10, transform: at(0., 0., 12.) });
+    s.instances.push(Instance { mesh: 11, transform: at(-1.5, 0., 13.5) }); // glow in front of glass
+    s.instances.push(Instance { mesh: 10, transform: at(2., 0., 14.5) }); // second glass, nearer
     for i in 0..5 {
         let t = Mat4::from_rotation_translation(Quat::from_rotation_y(i as f32 * 0.4), Vec3::new(-8. + i as f32 * 4.5, 0., 6.));
         s.instances.push(Instance { mesh: 1, transform: t.to_cols_array_2d() });
@@ -96,5 +111,6 @@ pub fn scene(count: usize) -> Scene {
         s.instances.push(Instance { mesh: 2 + (rnd() * 8.0) as usize % 8, transform: t.to_cols_array_2d() });
     }
     s.spawn = Some([0.0, 4.0, 22.0]);
+    s.spawn_look_at = Some([0.0, 2.0, 10.0]);
     s
 }

@@ -137,7 +137,8 @@ impl State {
             let p = self.cam.pos;
             self.window.set_title(&format!("aomac | {fps:.0} fps | {:.1} {:.1} {:.1} | speed {:.0}", p.x, p.y, p.z, self.speed));
             if self.perf {
-                eprintln!("{:.2} ms/frame ({fps:.0} fps)", 1000.0 / fps);
+                let st = self.renderer.stats;
+                eprintln!("{:.2} ms/frame ({fps:.0} fps) {} instances, {} draws", 1000.0 / fps, st.instances, st.draw_calls);
             }
             self.stat_t = Instant::now();
             self.stat_frames = 0;
