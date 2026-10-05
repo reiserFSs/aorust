@@ -23,12 +23,14 @@ pub struct Host {
     repose: Option<Scene>,
     /// Lens for the next frame (per-frame FOV changes of camera paths); `None` keeps the scene's lens.
     pub lens: Option<ao_scene::Lens>,
+    /// Frontend request: capture the cursor and deliver [`GameInput::MouseMotion`] (mouse-look); applied after each frame/input.
+    pub look: bool,
 }
 
 impl Host {
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None }
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, look: false }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -42,11 +44,21 @@ impl Host {
     }
 }
 
+/// Raw game input forwarded while the frontend has free-fly off (physical keys, so bindings are layout independent).
+#[derive(Clone, Copy, Debug)]
+pub enum GameInput {
+    Key { code: KeyCode, pressed: bool, repeat: bool },
+    /// Relative mouse movement in physical pixels, only while [`Host::look`] is set.
+    MouseMotion { dx: f32, dy: f32 },
+}
+
 /// The windowed GUI application: draws the original AO GUI (`ao_gui`) over the 3D scene.
 pub trait Frontend {
     fn gui(&self) -> &ao_gui::Gui;
     /// One input event, positions in GUI pixels.
     fn input(&mut self, ev: ao_gui::InputEvent, host: &mut Host);
+    /// Raw key/mouse-look input while `host.fly` is off (default: ignored).
+    fn game_input(&mut self, _ev: GameInput, _host: &mut Host) {}
     /// Per-frame logic (`dt` seconds, `size` = window in GUI pixels); returns the GUI draw list to paint.
     fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> ao_gui::DrawList;
 }
@@ -260,7 +272,7 @@ impl State {
         let cam = Camera::look_at(eye, at);
         let gui = frontend.map(|frontend| {
             let renderer = crate::GuiRenderer::new(&renderer, frontend.gui());
-            Gui { renderer, frontend, host: Host { camera: cam, fly: false, quit: false, scene: None, repose: None, lens: None }, cursor: (0.0, 0.0), mods: Default::default(), scale: (window.scale_factor().round() as u32).max(1) }
+            Gui { renderer, frontend, host: Host { camera: cam, ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale: (window.scale_factor().round() as u32).max(1) }
         });
         let now = Instant::now();
         Ok(Self {
@@ -359,6 +371,11 @@ impl State {
             c.pos += (c.forward() * (k(KeyCode::KeyW) - k(KeyCode::KeyS)) + c.right() * (k(KeyCode::KeyD) - k(KeyCode::KeyA)) + Vec3::Y * up) * step;
         }
         let (gui_out, quit) = self.run_gui(dt);
+        if let Some(want) = self.gui.as_ref().filter(|_| !self.fly()).map(|g| g.host.look) {
+            if want != self.looking {
+                self.set_look(want);
+            }
+        }
         if let Some(h) = self.hook.as_mut() {
             h(self.cam.pos, dt);
         }
@@ -425,6 +442,18 @@ impl ApplicationHandler for App {
             }
         }
         let fly = s.fly();
+        if let (WindowEvent::KeyboardInput { event, .. }, Some(g), false) = (&ev, &mut s.gui, fly) {
+            if let PhysicalKey::Code(code) = event.physical_key {
+                g.host.camera = s.cam;
+                g.frontend.game_input(GameInput::Key { code, pressed: event.state == ElementState::Pressed, repeat: event.repeat }, &mut g.host);
+                s.cam = g.host.camera;
+            }
+        }
+        if let Some(want) = s.gui.as_ref().filter(|_| !fly).map(|g| g.host.look) {
+            if want != s.looking {
+                s.set_look(want);
+            }
+        }
         match ev {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::KeyboardInput { event, .. } if fly || s.gui.is_none() => {
@@ -442,6 +471,9 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 s.keys.clear();
                 s.set_look(false);
+                if let Some(g) = &mut s.gui {
+                    g.host.look = false;
+                }
             }
             WindowEvent::MouseInput { button: MouseButton::Right, state, .. } if fly => s.set_look(state == ElementState::Pressed),
             WindowEvent::MouseWheel { delta, .. } if fly => {
@@ -463,8 +495,17 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, ev: DeviceEvent) {
-        if let (Some(s), DeviceEvent::MouseMotion { delta: (dx, dy) }) = (&mut self.state, ev) {
-            if s.looking {
+        let (Some(s), DeviceEvent::MouseMotion { delta: (dx, dy) }) = (&mut self.state, ev) else { return };
+        if !s.looking {
+            return;
+        }
+        match s.gui.as_mut().filter(|g| !g.host.fly) {
+            Some(g) => {
+                g.host.camera = s.cam;
+                g.frontend.game_input(GameInput::MouseMotion { dx: dx as f32, dy: dy as f32 }, &mut g.host);
+                s.cam = g.host.camera;
+            }
+            None => {
                 s.cam.yaw += dx as f32 * 0.0025;
                 s.cam.pitch = (s.cam.pitch - dy as f32 * 0.0025).clamp(-1.55, 1.55);
             }

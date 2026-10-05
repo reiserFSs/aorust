@@ -6,13 +6,14 @@ mod viewer;
 use anyhow::{anyhow, Context, Result};
 use ao_scene::{Blend, Environment, Scene, TextureKey};
 pub use glam::Vec3;
+pub use winit::keyboard::KeyCode;
 use glam::{Mat4, Vec4};
 use std::collections::HashMap;
 use std::path::Path;
 use wgpu::util::DeviceExt;
 
 pub use gui::GuiRenderer;
-pub use viewer::{run_frontend, Offscreen, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
+pub use viewer::{run_frontend, GameInput, Offscreen, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
 
 const MSAA: u32 = 4;
 const INST_RING: usize = 3;
