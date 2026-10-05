@@ -112,7 +112,7 @@ pub fn density_spawn(boxes: &[Box3], ground: &dyn Fn(f32, f32) -> Option<f32>, e
         // hover 12 m above the roof of the cluster statel nearest to its centre (or of a bigger solid covering that point)
         let &i = block.iter().min_by(|&&a, &&b| (cen[a][0] - cx).hypot(cen[a][2] - cz).total_cmp(&(cen[b][0] - cx).hypot(cen[b][2] - cz))).unwrap_or(&0);
         let (x, z) = (cen[i][0], cen[i][2]);
-        let roof = solid.iter().filter(|b| x > b.0[0] && x < b.1[0] && z > b.0[2] && z < b.1[2]).map(|b| b.1[1]).fold(f32::MIN, f32::max);
+        let roof = solid.iter().filter(|b| x >= b.0[0] && x <= b.1[0] && z >= b.0[2] && z <= b.1[2]).map(|b| b.1[1]).fold(boxes[i].1[1], f32::max);
         [x, roof + 12.0, z]
     });
     // face the heading with the most statels (15..250 m, +-40 degrees) that terrain does not block
@@ -178,4 +178,16 @@ pub fn support_below(scene: &Scene, p: [f32; 3]) -> Option<f32> {
 /// Bounds of everything in the scene (instance boxes).
 pub fn scene_bounds(scene: &Scene) -> Option<Box3> {
     instance_boxes(scene, 0).into_iter().reduce(|a, b| ([a.0[0].min(b.0[0]), a.0[1].min(b.0[1]), a.0[2].min(b.0[2])], [a.1[0].max(b.1[0]), a.1[1].max(b.1[1]), a.1[2].max(b.1[2])]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hover_fallback_is_finite_for_flat_boxes() {
+        // zero-width statel (sign / wall) with no ground: eye hovers 12 m over its top
+        let spot = density_spawn(&[([10.0, 0.0, 10.0], [10.0, 5.0, 14.0])], &|_, _| None, 4.0).unwrap();
+        assert_eq!(spot.eye, [10.0, 17.0, 12.0]);
+    }
 }
