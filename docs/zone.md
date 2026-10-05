@@ -32,7 +32,7 @@ Frame `sender` = acting dynel instance (1 = server), `receiver` = our character 
 | `60201D0E` | `SetWantedDirectionIIR_t` | 72 | 0 | unit direction vector (XZ) |
 | `1D3C0F1C` | `SpecialAttackWeaponIIR_t` | 58 | 1 | special attack list + initiative stats |
 | `36510078` | `n3ToClientQuitIIR_t` | 27 | 0 | dynel despawn |
-| `5E477770` | `CharacterActionIIR_t` | 22 | 1 | character action (ids unresolved) |
+| `5E477770` | `CharacterActionIIR_t` | 22 | 1 | character action: id table, sit/stand, emotes → [zone/actions.md](zone/actions.md) |
 | `3B1D2268` | `WeaponItemFullUpdateIIR_t` | 10 | 1 | a weapon item |
 | `5C654B28`, `754F1115`, `51492120`, `52526858`, `39343C68`, `25314D6D` | Missed/SpecialAttackInfo, CharSecSpecAttack, GenericCmd_t, Buff, CastNanoSpell | 11/3/3/3/3/3 | 0 | combat log, item use, buffs, nano casts |
 | `4F474E05` | `CorpseFullUpdateIIR_t` | 7 | 0 | corpse (tail raw) |
@@ -69,6 +69,8 @@ No ptype 5 (text) frame was received: server chat arrives as N3. Nothing is unde
    is never sent for a long time (visibility to others, timeouts) is unknown.
 
 ## 6. Plan for the in-game features (RE anchors)
+Character actions (`CharacterActionIIR_t` ids, sit/stand/camp logic, `SocialActionCmd_t` emotes): [zone/actions.md](zone/actions.md) (`ao_net::n3::action`, `play/combat/actions.rs`).
+
 Movement of other dynels, animation roles and name tags: [zone/motion.md](zone/motion.md) (`ao_net::n3::motion`, `ao_net::n3::nametag`).
 
 | feature | next step | anchors |
