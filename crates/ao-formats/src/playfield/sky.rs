@@ -464,7 +464,7 @@ mod tests {
         assert!(!noon.sky.is_empty() && !noon.textures.is_empty() && night.textures.is_empty(), "textures are sent once");
         // the cloud dome drifts, the layers other than clouds do not
         let drifting = noon.meshes.iter().flat_map(|m| &m.submeshes).filter(|s| s.uv_scroll != [0.0, 0.0]).count();
-        // clear weather (pf 566 has all-zero weights) leaves the cloud dome invisible, so it is dropped
+        // pf 566 has only the clear weight (w3 = 100): clear weather leaves the cloud dome invisible, so it is dropped
         assert!(drifting <= 1, "only ThickClouds scrolls");
         let (e1, e2) = (noon.environment.unwrap(), night.environment.unwrap());
         assert!(e1.sun_dir[1] > 0.3 && e2.sun_dir[1] < -0.3, "{:?} {:?}", e1.sun_dir, e2.sun_dir);
