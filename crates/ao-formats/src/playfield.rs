@@ -72,6 +72,8 @@ pub struct Report {
     pub no_mesh_statels: usize,
     /// Statels whose mesh record is absent from the database.
     pub missing_meshes: usize,
+    /// Their mesh ids (first-seen order, deduplicated).
+    pub missing_mesh_ids: Vec<u32>,
     /// Statels whose mesh failed to decode (first error kept).
     pub failed_meshes: usize,
     pub first_mesh_error: Option<String>,
@@ -238,6 +240,9 @@ impl Placer<'_> {
         }
         let Some(mesh) = self.mesh(s.mesh, &s.attrs) else {
             self.report.missing_meshes += 1;
+            if !self.report.missing_mesh_ids.contains(&s.mesh) {
+                self.report.missing_mesh_ids.push(s.mesh);
+            }
             return;
         };
         let mut r = statel::orientation(s.flags, s.scale);

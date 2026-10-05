@@ -93,6 +93,9 @@ fn main() -> anyhow::Result<()> {
         statels += r.statels;
         no_mesh += r.no_mesh_statels;
         missing_mesh += r.missing_meshes;
+        if !r.missing_mesh_ids.is_empty() {
+            println!("  playfield {id}: statel mesh records absent from rdb 1010001/1010026/any type: {:?}", r.missing_mesh_ids);
+        }
         let (mut u, mut e) = (0usize, 0usize);
         count_subs(&scene, &mut cache, &mut subs, &mut u, &mut e, &mut tris_untextured);
         subs_untextured += u;
