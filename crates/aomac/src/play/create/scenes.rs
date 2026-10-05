@@ -411,9 +411,8 @@ impl Play {
             }
         }
         if let Some(i) = new {
-            if !c.btns[i].enabled && !matches!(c.btns[i].kind, B::BreedBg | B::HeadArea) {
-                return;
-            }
+            // enabled or not: `Window::_FindView` ignores the enabled flag and `_CallMouseMoved` emits the view's mouse signal
+            // before the (virtual) `ButtonBase_c::MouseMove`, so a disabled button still plays its sound and sets its text
             let kind = c.btns[i].kind;
             self.cc_hover_enter(c, kind);
         }
@@ -745,7 +744,7 @@ impl Play {
         c.pending_suggest = false;
         if let Some(key) = name_state_key(code) {
             let t = self.cc_text(key);
-            self.cc_message(c, &t, if code == 0x1e || code == 0x1f { "SM_Sandy_CC_Nick" } else { "SM_Sandy_CC_GUI_Error" });
+            self.cc_message(c, &t, if code == 0x1e || code == 0x1f { None } else { Some("SM_Sandy_CC_GUI_Error") });
         } else {
             eprintln!("character creation: unknown state {code:#x}");
         }
@@ -754,14 +753,18 @@ impl Play {
     }
 
     /// `NameScene_t::Message(text)`: the text goes to global signal 0x184 (receiver UNRESOLVED), here a notice box; the
-    /// name scene falls back to state 0 and an error / nick sound plays.
-    fn cc_message(&mut self, c: &mut Create, text: &str, sound: &str) {
+    /// name scene falls back to state 0 and the error sound plays. The original also asks for `SM_Sandy_CC_Name` /
+    /// `SM_Sandy_CC_Nick`, but no sound bank defines them (`GetSoundPointer` → 0, `PlaySample(0)` returns; docs/screens.md
+    /// §12), so those callers pass `None` — silence is the faithful result.
+    fn cc_message(&mut self, c: &mut Create, text: &str, sound: Option<&str>) {
         self.message_box(text);
         for w in [c.info_w, c.name_w].into_iter().flatten() {
             self.gui.set_window_visible(w, false);
         }
         c.shown = false;
-        self.cc_sound(sound);
+        if let Some(sound) = sound {
+            self.cc_sound(sound);
+        }
         c.message_open = true;
         // `SetState(0)` → `UpdateButtonState`: Finish follows the name field again (Back stays disabled, as in the original)
         c.name_locked = false;
@@ -783,12 +786,12 @@ impl Play {
         let raw = c.name_w.map(|w| self.gui.text(w, "name")).unwrap_or_default();
         if raw.is_empty() {
             let t = self.cc_text("MustEnterName");
-            return self.cc_message(c, &t, "SM_Sandy_CC_Name");
+            return self.cc_message(c, &t, None);
         }
         let name = normalize_name(&raw);
         if let Err(e) = check_name(&name) {
             let t = self.cc_text(e.key());
-            return self.cc_message(c, &t, "SM_Sandy_CC_Nick");
+            return self.cc_message(c, &t, None);
         }
         c.name_locked = true;
         let (breed, gender) = cc_breed_to_gc(c.breed).unwrap_or((1, 3));

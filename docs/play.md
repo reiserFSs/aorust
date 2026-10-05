@@ -35,7 +35,7 @@ games category, macOS ≥ 12). The client is found from `$HOME/Games/ProjectRubi
 
 * **Server choice** is outside the original window (the original gets the server from the PRK launcher's `IA`/`IP` arguments):
   `--server` + remembered, no in-window picker.
-* New Character opens the original character creation, Delete the name-confirmation window (docs/screens.md §12); live creation is untested.
+* New Character opens the original character creation, Delete the name-confirmation window (docs/screens.md §12); live creation is untested. The creation cameras use the full `CharCreateCamera.dat` orientation incl. roll (`ao_render::Camera::roll`); the name-scene error sounds `SM_Sandy_CC_Name` / `SM_Sandy_CC_Nick` exist in no sound bank, so (like the original) they are silent; profession hover/leave/click text rules: docs/screens.md §12.
 * Row "Inactive" uses bit 0 of the list's per-row `status` word as RE'd (`docs/screens.md` §5.3); what PRK actually sends in that word is
   unverified (live check pending an account).
 * Preview socials are built on demand in the background (idle plays until ready); the original has no delay.
