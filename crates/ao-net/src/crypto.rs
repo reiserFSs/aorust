@@ -80,7 +80,7 @@ fn cbc_encrypt(k: &[u8; 16], plain: &[u8]) -> Vec<u8> {
     let kw = key_words(k);
     let mut prev = [0u32; 2];
     let mut out = Vec::with_capacity(plain.len());
-    for c in plain.chunks_exact(8) {
+    for c in plain.as_chunks::<8>().0 {
         let w = [
             u32::from_le_bytes(c[..4].try_into().unwrap()) ^ prev[0],
             u32::from_le_bytes(c[4..].try_into().unwrap()) ^ prev[1],
@@ -93,13 +93,13 @@ fn cbc_encrypt(k: &[u8; 16], plain: &[u8]) -> Vec<u8> {
 }
 
 fn cbc_decrypt(k: &[u8; 16], ct: &[u8]) -> Result<Vec<u8>> {
-    if ct.len() % 8 != 0 {
+    if !ct.len().is_multiple_of(8) {
         bail!("ciphertext not a multiple of 8");
     }
     let kw = key_words(k);
     let mut prev = [0u32; 2];
     let mut out = Vec::with_capacity(ct.len());
-    for c in ct.chunks_exact(8) {
+    for c in ct.as_chunks::<8>().0 {
         let cw = [
             u32::from_le_bytes(c[..4].try_into().unwrap()),
             u32::from_le_bytes(c[4..].try_into().unwrap()),
@@ -117,12 +117,12 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(2) {
         bail!("odd hex length");
     }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|e| anyhow!(e)))
-        .collect()
+    let nib = |c: u8| (c as char).to_digit(16).ok_or_else(|| anyhow!("bad hex digit"));
+    b.as_chunks::<2>().0.iter().map(|p| Ok((nib(p[0])? << 4 | nib(p[1])?) as u8)).collect()
 }
 
 /// Build the `UserCredentials` response string `"<dhX hex>-<ciphertext hex>"`.
@@ -253,6 +253,40 @@ mod tests {
         let r = make_challenge_response_with(&spub, "Me", &salt, "p|w", &x(), PREFIX).unwrap();
         let (u, s, p) = open_challenge_response(&sp, &r).unwrap();
         assert_eq!((u.as_str(), s, p.as_str()), ("Me", salt, "p|w"));
+    }
+
+    #[test]
+    fn open_rejects_malformed_without_panic() {
+        let sp = BigUint::from(3u8);
+        let long = "123456789abcdef123456789abcdef123456789abcdef";
+        for r in [
+            format!("{long}-a\u{FFFD}"),
+            format!("{long}-\u{FFFD}\u{FFFD}"),
+            format!("{long}-+f+f+f+f+f+f+f+f"),
+            format!("{long}-0123456789abcde"),
+            format!("{long}-"),
+            "-".into(),
+            "".into(),
+            "zz-00".into(),
+            format!("{long}-{}", "00".repeat(8)),
+        ] {
+            assert!(open_challenge_response(&sp, &r).is_err(), "{r:?}");
+        }
+        // pseudo-random strings, incl. non-ASCII
+        let alphabet: Vec<char> = "0123456789abcdef-|+\u{FFFD}é".chars().collect();
+        let mut s = 0x1234_5678_9abc_def1u64;
+        for _ in 0..5_000 {
+            let n = (s % 160) as usize;
+            let r: String = (0..n)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    alphabet[s as usize % alphabet.len()]
+                })
+                .collect();
+            let _ = open_challenge_response(&sp, &r);
+        }
     }
 
     #[test]

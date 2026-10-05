@@ -311,7 +311,7 @@ impl Message {
             NAME_IN_USE => Message::NameInUse(r.i32()?),
             CHARACTER_LIST => {
                 let n = r.i32()?;
-                if n < 0 || n > 1024 {
+                if !(0..=1024).contains(&n) {
                     bail!("character count {n} out of range");
                 }
                 let characters =
@@ -478,6 +478,51 @@ mod tests {
                 assert_eq!((z.event_server_type, z.player_id), (0, 0));
             }
             _ => unreachable!(),
+        }
+    }
+
+    /// Deterministic xorshift so failures reproduce.
+    fn rng(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    #[test]
+    fn decoders_never_panic() {
+        let types = [
+            USER_LOGIN, SERVER_SALT, USER_CREDENTIALS, LOGIN_ERROR, CHARACTER_LIST, NAME_IN_USE,
+            CHARACTER_CREATED, DELETE_CHARACTER, CHARACTER_DELETED, SELECT_CHARACTER, ZONE_INFO,
+            ZONE_LOGIN, ZONE_REDIRECTION, 0, 0xFFFF_FFFF,
+        ];
+        let valid = [
+            Message::CharacterList(CharacterList { characters: vec![entry()], ..Default::default() })
+                .encode_body(),
+            Message::UserCredentials { name: "n".into(), response: "ab-cd".into() }.encode_body(),
+            Message::UserLogin { protocol: 2, name: "a".into(), client_version: "v".into() }.encode_body(),
+        ];
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..20_000 {
+            let r = rng(&mut s);
+            let mut buf: Vec<u8> = if r & 1 == 0 {
+                (0..(rng(&mut s) % 96)).map(|_| rng(&mut s) as u8).collect()
+            } else {
+                let mut v = valid[(r >> 1) as usize % valid.len()].clone();
+                for _ in 0..(1 + rng(&mut s) % 4) {
+                    let i = rng(&mut s) as usize % v.len();
+                    v[i] = rng(&mut s) as u8;
+                }
+                v.truncate(rng(&mut s) as usize % (v.len() + 1));
+                v
+            };
+            if buf.len() >= 8 && rng(&mut s) & 3 == 0 {
+                buf[4..8].copy_from_slice(&[0x7F, 0xFF, 0xFF, 0xFF]);
+            }
+            for t in types {
+                let _ = Message::decode(t, &buf);
+            }
+            let _ = Frame::decode(&buf);
         }
     }
 
