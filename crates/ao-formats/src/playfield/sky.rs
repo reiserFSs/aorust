@@ -13,7 +13,7 @@
 //! * `Sun1`: additive `newsun_frame01.png` rays, colour (255,155,55), rotated by `GAME.Sun1Rotation`.
 //!
 //! The game writes `GameDayTime` and the sun rotations from the server clock (not available offline); we evaluate at the
-//! values of `Tweak_GAME_FrozenTime.txt` (`CurrentDayTime 2648.69`, `Sun1Rotation q(0.900351, -0.0951056, 0.344078, 0.248863)`),
+//! values of `Tweak_GAME_FrozenTime.txt` (`CurrentDayTime 2648.69`, `Sun1Rotation q(0.900351, -0.0951056, 0.344078, 0.248863)`, components x y z w),
 //! the client's own fixed-time debug setting.
 
 mod layers;
@@ -28,7 +28,7 @@ use super::environment::{srgb_to_linear, VIEW_DISTANCE};
 pub const DEFAULT_DAY_TIME: f32 = 2648.69;
 /// `GAME.CurrentDayTime / 6480` (27 * 60 * 4) is the factor that indexes every colour track.
 pub(super) const DAY_LENGTH: f32 = 6480.0;
-/// `Sun1Rotation` of `Tweak_GAME_FrozenTime.txt` as (w, x, y, z), valid at [`DEFAULT_DAY_TIME`].
+/// `Sun1Rotation` of `Tweak_GAME_FrozenTime.txt` as written, (x, y, z, w) (see [`rot`]), valid at [`DEFAULT_DAY_TIME`].
 const SUN1_ROT: [f32; 4] = [0.900351, -0.0951056, 0.344078, 0.248863];
 /// `Sun2Rotation` of the same file.
 const SUN2_ROT: [f32; 4] = [0.836913, -0.16263, 0.384351, 0.354122];
@@ -36,6 +36,10 @@ const SUN2_ROT: [f32; 4] = [0.836913, -0.16263, 0.384351, 0.354122];
 const NOON: f32 = 0.525;
 /// `GAME.ThickCloudsIntensity` offline [GUESS]: the game writes it from the server weather.
 const CLOUD_INTENSITY: f32 = 0.4;
+/// `GAME.HighAltitudeWindX/Z` per second [UNRESOLVED]: `FUN_100be767` (Gamecode) writes `speed * direction * dt * k` every
+/// frame (`DisplaySystem::FUN_100ad568` stores it at `+0xd8`), the weather's wind speed/direction and `k` were not found, so
+/// this is a drift of a few percent of a texture repeat per second, not the client's value.
+pub(super) const HIGH_ALTITUDE_WIND: [f32; 2] = [0.0004, 0.00015];
 /// `AddFogI` of the atmosphere object.
 pub(super) const ATMOSPHERE_FOG_DENSITY: f32 = 0.025;
 
@@ -185,16 +189,21 @@ pub fn day_factor(day_time: f32) -> f32 {
     day_time / DAY_LENGTH
 }
 
+/// `q(a, b, c, d)` of the scripts: FXS stores the four values as they are written, i.e. (x, y, z, w)
+/// (`FXS.dll` `FUN_10009c3b` copies the expressions in order; `RRefFrame::SetRotation` stores x, y, z, w).
 fn rot(q: [f32; 4]) -> script::Quat {
-    script::Quat { w: q[0], x: q[1], y: q[2], z: q[3] }
+    script::Quat { x: q[0], y: q[1], z: q[2], w: q[3] }
 }
+
+/// Where a `GAME.SunNRotation` points the sun: the `SunRays` fan sits at local z = -100 (`FUN_1005a7f6` DisplaySystem).
+const SUN_LOCAL: [f32; 3] = [0.0, 0.0, -1.0];
 
 /// Unit vector towards sun 1 in AO space at `day_time`. The server clock and the game's sun ephemeris are not available
 /// offline [FIT]: the sun runs on a great circle at one turn per day whose horizon crossings are at `NOON ± 0.25` (the
 /// `GroundLight` tracks switch on at factor ~0.27 and off at ~0.79) and that passes through the direction of the frozen
 /// `Sun1Rotation` at the frozen time, which fixes the noon elevation and azimuth.
 fn sun_ao(day_time: f32) -> [f32; 3] {
-    let d0 = rot(SUN1_ROT).rotate([0.0, 0.0, 1.0]);
+    let d0 = rot(SUN1_ROT).rotate(SUN_LOCAL);
     let w0 = std::f32::consts::TAU * (day_factor(DEFAULT_DAY_TIME) - NOON);
     let noon_elevation = (d0[1] / w0.cos()).clamp(-1.0, 1.0).asin();
     let (sin_e, cos_e) = noon_elevation.sin_cos();
@@ -217,8 +226,7 @@ fn sun2_ao(day_time: f32) -> [f32; 3] {
         (side, up)
     };
     let dot = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| a[k] * b[k]).sum::<f32>();
-    let z = [0.0, 0.0, 1.0];
-    let (d1, d2) = (rot(SUN1_ROT).rotate(z), rot(SUN2_ROT).rotate(z));
+    let (d1, d2) = (rot(SUN1_ROT).rotate(SUN_LOCAL), rot(SUN2_ROT).rotate(SUN_LOCAL));
     let (side, up) = basis(d1);
     let (c, a, b) = (dot(d2, d1), dot(d2, side), dot(d2, up));
     let d = sun_ao(day_time);
@@ -297,6 +305,45 @@ pub fn emit(sky: &Sky, tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut
     layers::emit(sky, &tweaks.objects(), store, scene, sky.dome(fog_color, super::environment::NEAR, fog_end), layers::Fog { color: fog_color, start: super::environment::NEAR, end: fog_end });
 }
 
+/// Re-evaluates an outdoor playfield's sky, fog tint and sun/ambient light at any `day_time` (the live time-of-day mode of the
+/// viewer). Textures already handed out are not sent again, so a long run only ships the vertex colours that change.
+pub struct SkyClock {
+    store: ao_rdb::RecordStore,
+    tweaks: Tweaks,
+    env: super::environment::Env,
+    sent: HashSet<ao_scene::TextureKey>,
+}
+
+impl SkyClock {
+    /// `None` for indoor playfields and playfields without a tweak script.
+    pub fn open(client_dir: &Path, id: u32) -> anyhow::Result<Option<SkyClock>> {
+        use anyhow::Context;
+        let store = ao_rdb::RecordStore::open(client_dir)?;
+        let raw = store.get(super::RECORD, id)?.with_context(|| format!("no playfield {id}"))?;
+        let rec = super::record::parse(&raw)?;
+        if !rec.is_outdoor() {
+            return Ok(None);
+        }
+        let mut tail = super::record::Rd::new(&raw, rec.tail);
+        super::water::parse(&mut tail)?;
+        let env = super::environment::parse(&mut tail)?;
+        Ok(Tweaks::load(client_dir, id, true).map(|tweaks| SkyClock { store, tweaks, env, sent: HashSet::new() }))
+    }
+
+    /// A scene with only `sky`, `meshes`, new `textures`, `environment` and the base `fog_model` (no volumes) filled in.
+    pub fn at(&mut self, day_time: f32) -> Scene {
+        let day_time = day_time.rem_euclid(DAY_LENGTH);
+        let mut scene = Scene::default();
+        let Some(sky) = Sky::new(&self.tweaks, day_time) else { return scene };
+        let environment = super::environment::to_scene(&self.env, true, Some(&sky));
+        emit(&sky, &self.tweaks, &self.store, &mut scene, environment.fog_color, environment.fog_end);
+        scene.fog_model = Some(super::environment::fog_model(&self.env, Some(&sky), vec![]));
+        scene.environment = Some(environment);
+        scene.textures.retain(|k, _| self.sent.insert(*k));
+        scene
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,7 +381,7 @@ mod tests {
     #[test]
     fn sun_orbit_hits_the_frozen_sample_and_sets_at_night() {
         // the frozen Sun1Rotation direction is reproduced exactly at the frozen time
-        let frozen = rot(SUN1_ROT).rotate([0.0, 0.0, 1.0]);
+        let frozen = rot(SUN1_ROT).rotate(SUN_LOCAL);
         let d = sun_ao(DEFAULT_DAY_TIME);
         assert!((0..3).all(|k| (d[k] - frozen[k]).abs() < 1e-4), "{d:?} {frozen:?}");
         // above the horizon between the track's sunrise and sunset, below it at midnight, always a unit vector
@@ -345,9 +392,22 @@ mod tests {
         assert!((u.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-4);
         // sun 2 keeps its frozen separation from sun 1
         let sep = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| a[k] * b[k]).sum::<f32>().acos().to_degrees();
-        let frozen2 = rot(SUN2_ROT).rotate([0.0, 0.0, 1.0]);
+        let frozen2 = rot(SUN2_ROT).rotate(SUN_LOCAL);
         let (want, got) = (sep(frozen, frozen2), sep(sun_ao(5000.0), sun2_ao(5000.0)));
         assert!(want > 5.0 && (want - got).abs() < 0.05, "{want} {got}");
+    }
+
+    #[test]
+    fn real_sky_clock_scrolls_clouds_moves_the_sun_and_ships_textures_once() {
+        let Some(dir) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/ProjectRubiKa/client")) else { return };
+        let Ok(Some(mut clock)) = SkyClock::open(&dir, 566) else { return };
+        let (noon, night) = (clock.at(3240.0), clock.at(0.0));
+        assert!(!noon.sky.is_empty() && !noon.textures.is_empty() && night.textures.is_empty(), "textures are sent once");
+        // the cloud dome drifts, the layers other than clouds do not
+        let drifting = noon.meshes.iter().flat_map(|m| &m.submeshes).filter(|s| s.uv_scroll != [0.0, 0.0]).count();
+        assert_eq!(drifting, 1, "only ThickClouds scrolls");
+        let (e1, e2) = (noon.environment.unwrap(), night.environment.unwrap());
+        assert!(e1.sun_dir[1] > 0.3 && e2.sun_dir[1] < -0.3, "{:?} {:?}", e1.sun_dir, e2.sun_dir);
     }
 
     #[test]

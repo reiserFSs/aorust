@@ -8,10 +8,10 @@
 use super::script::{self, Ctx, Obj, Quat};
 use super::srgb_to_linear;
 use crate::character::NameTable;
-use crate::mesh::{decode_mesh_into, MESH_TYPE};
+use crate::mesh::{decode_mesh_object_space, MESH_TYPE};
 use crate::texture::decode_texture;
 use ao_rdb::RecordStore;
-use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY, WHITE};
+use ao_scene::{Blend, Instance, Mesh, Scene, SkySpin, Submesh, TextureKey, Vertex, IDENTITY, WHITE};
 use std::collections::HashMap;
 
 const TEXTURES: u32 = 1_010_004;
@@ -49,13 +49,16 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
     });
     let ctx = Ctx {
         day_time: sky.day_time,
-        sun1: Quat::between([0.0, 0.0, 1.0], sky.sun_ao),
-        sun2: Quat::between([0.0, 0.0, 1.0], sky.sun2_ao),
+        sun1: Quat::between([0.0, 0.0, -1.0], sky.sun_ao),
+        sun2: Quat::between([0.0, 0.0, -1.0], sky.sun2_ao),
         cloud_intensity: super::CLOUD_INTENSITY,
         hq_offset: hq_offset(objs),
+        delta_time: 0.0,
+        wind: [0.0; 2],
+        counters: counters(objs),
     };
     let mut b = Builder { fog, store, names, ctx, objs, sky, scene, sorts };
-    let mut layers: Vec<(u32, Mesh)> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome)];
+    let mut layers: Vec<(u32, Mesh, Option<SkySpin>)> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None)];
     for o in objs.iter().filter(|o| o.field("Priority").is_some_and(|p| p.trim() == "e_RenderPriority_PreRendering")) {
         let mesh = match o.fxid() {
             "GenericMeshObject" => b.mesh_object(o).map(|m| b.fogged(o, m)),
@@ -66,14 +69,29 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         };
         // a layer whose every vertex alpha is 0 (sun below the horizon, `TFACTOR` 0) draws nothing
         if let Some(m) = mesh.filter(|m| m.vertices.iter().any(|v| v.color[3] > 0.0)) {
-            layers.push((b.sort(o), m));
+            let spin = if o.fxid() == "GenericMeshObject" { b.spin(o) } else { None };
+            layers.push((b.sort(o), m, spin));
         }
     }
     layers.sort_by_key(|l| l.0);
-    for (_, m) in layers {
+    for (_, m, spin) in layers {
         scene.meshes.push(m);
         scene.sky.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
+        scene.sky_spin.extend(spin.map(|s| SkySpin { instance: scene.sky.len() - 1, ..s }));
     }
+}
+
+/// Growth per second of every `Counter` field that integrates `GameDeltaTime` (`Counter: GAME.GameDeltaTime * 3 + This.Counter
+/// % 360`), keyed `Object.Counter`; per-frame counters without a time term (`DotStars`) are not time driven here.
+fn counters(objs: &[Obj]) -> std::collections::HashMap<String, f32> {
+    let at = |o: &Obj, e: &str, dt: f32| script::eval_field(o, &Ctx { delta_time: dt, ..Ctx::at(0.0) }, e, 0);
+    objs.iter()
+        .filter_map(|o| {
+            let e = o.field("Counter")?;
+            let rate = at(o, e, 1.0)? - at(o, e, 0.0)?;
+            (rate != 0.0).then(|| (format!("{}.Counter", o.name), rate))
+        })
+        .collect()
 }
 
 /// `PlayfieldData.UniversePosition` (`RKPP.<name>`) minus `RKPP.Omni_1_HQ`: `GAME.OffsetFromHQ_X/Z` of a camera standing at
@@ -174,13 +192,11 @@ impl Builder<'_> {
     fn mesh_object(&mut self, o: &Obj) -> Option<Mesh> {
         let id = self.names.id(MESH_TYPE, o.string("Mesh")?)?;
         let mut tmp = Scene::default();
-        decode_mesh_into(self.store, id, &mut tmp).ok()??;
+        // the visual draws the mesh data as stored; the tweak `Rotation` supplies the orientation (Max Z-up -> world)
+        decode_mesh_object_space(self.store, id, &mut tmp).ok()??;
         let mut mesh = tmp.meshes.pop()?;
         self.scene.textures.extend(tmp.textures);
-        // Only rotations driven by the game (moons: day time) are applied. The constant ones of the horizon dish, the cloud
-        // belt, the star dome and the vortex (`v(0,0,1), 90`, `v(0,0,1), 90 [ROT] v(0,1,0), 90`, ...) would stand these
-        // surfaces of revolution about Y on their side (a vertical wall for the ground map), so they stay as authored.
-        let q = o.field("Rotation").filter(|e| script::reads_game(o, e, 0)).and_then(|e| script::rotation(o, &self.ctx, e, 0)).unwrap_or(Quat::IDENTITY);
+        let q = o.field("Rotation").and_then(|e| script::rotation(o, &self.ctx, e, 0)).unwrap_or(Quat::IDENTITY);
         // `InitDirection`: where the object lies before `Rotation` (the moons: -X, the mesh itself is authored towards -Z)
         let q = match o.field("InitDirection").and_then(|e| script::vector(o, &self.ctx, e, 0)) {
             Some(init) => {
@@ -225,7 +241,9 @@ impl Builder<'_> {
             v.color = [srgb_to_linear(c[0] * gain), srgb_to_linear(c[1] * gain), srgb_to_linear(c[2] * gain), alpha * haze];
             v.uv = [v.uv[0] * scroll[0] + v.uv[1] * scroll[2] + scroll[4], v.uv[0] * scroll[1] + v.uv[1] * scroll[3] + scroll[5]];
         }
+        let uv_scroll = self.uv_scroll(o);
         for s in &mut mesh.submeshes {
+            s.uv_scroll = uv_scroll;
             s.two_sided = true;
             s.blend = match (o.flag("ALPHABLENDENABLE"), o.states.get("DESTBLEND").map(String::as_str)) {
                 (Some(true), Some("e_D3DBLEND_ONE")) => Blend::Additive,
@@ -249,25 +267,68 @@ impl Builder<'_> {
         Some(mesh)
     }
 
-    /// `e_SunRays`: one additive/alpha quad towards the direction of `Rotation`, `Size` degrees of half angle
-    /// [GUESS: the client scales `Size` by the view distance], faded in over the first 0.01 of elevation
-    /// (`FUN_1005a3a9` @DisplaySystem 0x1005a3a9: `(100 y)^4`, nothing below the horizon).
+    /// The turn the object's `Rotation` makes per second when it reads a time driven `Counter` (the Shadowlands vortex:
+    /// `Ry(Counter) [ROT] Rx(15)` with `Counter` growing by 3 per second): the rotation at `GameDeltaTime = 1` relative to the
+    /// baked one at 0, about the point the object's `Position` puts its origin. `instance` is filled in by the caller.
+    fn spin(&self, o: &Obj) -> Option<SkySpin> {
+        let e = o.field("Rotation")?;
+        let q0 = script::rotation(o, &self.ctx, e, 0)?;
+        let q1 = script::rotation(o, &Ctx { delta_time: 1.0, ..self.ctx.clone() }, e, 0)?;
+        let (axis, degrees) = q1.spin_from(q0)?;
+        let offset = o.field("Position").and_then(|e| script::vector(o, &self.ctx, e, 0)).unwrap_or([0.0; 3]);
+        // AO space is left handed: the same turn about the mirrored axis runs the other way in scene space
+        Some(SkySpin { instance: 0, axis: scene(axis), pivot: scene(offset), degrees_per_second: -degrees })
+    }
+
+    /// Texture drift in uv units per second of the object's `ScrollU` / `ScrollV` integrators (`This.ScrollU + GAME.GameDeltaTime
+    /// * k`, `... + GAME.HighAltitudeWindX % 1 * 10`): the first step of the per-frame expression evaluated with
+    /// `GameDeltaTime = 1 s` and the wind of `HIGH_ALTITUDE_WIND`. Added to the matrix translation, so it moves the baked uv 1:1.
+    fn uv_scroll(&self, o: &Obj) -> [f32; 2] {
+        let ctx = Ctx { delta_time: 1.0, wind: super::HIGH_ALTITUDE_WIND, ..self.ctx.clone() };
+        ["ScrollU", "ScrollV"].map(|f| o.field(f).and_then(|e| script::eval_field(o, &ctx, e, 0)).unwrap_or(0.0))
+    }
+
+    /// `e_SunRays` (`FUN_1005a7f6` builds the geometry, `FUN_1005a3a9` the per-frame alpha, DisplaySystem): a triangle fan of
+    /// `Vertices` points whose rim `i` (of `Vertices - 1`) sits at local `(Size * 9 sin a, Size * 9 cos a, -100)`,
+    /// `a = i / (Vertices - 1) * 360 * 3.14 / 180`, uv `0.5 + UVSize * 0.5 (sin a, cos a)` (default `UVSize` 0.8), centre
+    /// `(0, 0, -100)` uv (0.5, 0.5); rotated by `Rotation`. Colour `ColorR/G/B`, alpha `(100 y)^4` below elevation 0.01 and 0
+    /// below the horizon. The client's per-vertex rim alpha reduction (`255 - table[i & 7]`, a table the game fills
+    /// each frame) is [UNRESOLVED] and left out.
+    #[allow(clippy::approx_constant)] // the client's literal 3.14 (double 1008c380), not pi
     fn sun_rays(&mut self, o: &Obj) -> Option<Mesh> {
         let q = script::rotation(o, &self.ctx, o.field("Rotation")?, 0)?;
-        let d = q.rotate([0.0, 0.0, 1.0]);
-        let fade = if d[1] <= 0.0 { return None } else if d[1] < 0.01 { (100.0 * d[1]).powi(4) } else { 1.0 };
+        let c = q.rotate([0.0, 0.0, -1.0]);
+        let fade = if c[1] <= 0.0 { return None } else if c[1] < 0.01 { (100.0 * c[1]).powi(4) } else { 1.0 };
         let key = self.texture(o.texture.as_deref()?)?;
         let col = ["ColorR", "ColorG", "ColorB"].map(|n| script::float(o, &self.ctx, n, 255.0) / 255.0).map(srgb_to_linear);
-        let size = script::float(o, &self.ctx, "Size", 1.0);
+        let size = script::float(o, &self.ctx, "Size", 6.0);
+        let uv_size = script::float(o, &self.ctx, "UVSize", 0.8);
+        let n = (script::float(o, &self.ctx, "Vertices", 33.0) as usize).clamp(4, 256);
         let blend = if o.states.get("DESTBLEND").is_some_and(|v| v == "e_D3DBLEND_ONE") { Blend::Additive } else { Blend::AlphaBlend };
+        let color = [col[0], col[1], col[2], fade];
         let mut mesh = Mesh::default();
-        quad(&mut mesh, scene(d), (300.0 * size.to_radians().tan(), 300.0 * size.to_radians().tan()), [col[0], col[1], col[2], fade], [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]);
-        mesh.submeshes.push(Submesh { two_sided: true, blend, ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key)) });
+        // the sky is drawn on a sphere of 300 m, the client's fan sits at 100 units: scale by 3
+        let mut push = |local: [f32; 3], uv: [f32; 2]| {
+            let p = q.rotate(local).map(|v| v * 3.0);
+            mesh.vertices.push(Vertex { pos: scene(p), normal: [0.0, -1.0, 0.0], uv, color });
+        };
+        for i in 0..n - 1 {
+            let a = i as f32 / (n - 1) as f32 * 360.0 * 3.14 / 180.0;
+            push([size * 9.0 * a.sin(), size * 9.0 * a.cos(), -100.0], [uv_size * 0.5 * a.sin() + 0.5, uv_size * 0.5 * a.cos() + 0.5]);
+        }
+        push([0.0, 0.0, -100.0], [0.5, 0.5]);
+        let centre = (n - 1) as u32;
+        let mut idx: Vec<u32> = (0..centre - 1).flat_map(|i| [i, i + 1, centre]).collect();
+        idx.extend([centre - 1, 0, centre]);
+        mesh.submeshes.push(Submesh { two_sided: true, blend, ..Submesh::new(idx, Some(key)) });
         Some(mesh)
     }
 
-    /// `e_SingleCloud`, `Altitude` metres above the camera. [GUESS] The class only creates its materials
-    /// (`single_cloud01..04.png`, `FUN_100601dc`); placement is a fixed pseudo random ring of billboards.
+    /// `e_SingleCloud`, `Altitude` metres above the camera. The client (`VisualSingleCloud_t`, `FUN_1005485a` update,
+    /// `FUN_10053e45` respawn) keeps 10 clouds (high detail; 2 in low detail) as randomly warped 10 x 10 vertex sheets inside a
+    /// +-1600 m square around the camera that drift with the wind and respawn when they leave it; the sheet shapes, sizes
+    /// and vertex colours are procedural **[UNRESOLVED]**: we place 10 fixed 260 x 130 m billboards at random points of
+    /// the square (the textures are the client's `single_cloud01..04.png`).
     fn single_clouds(&mut self, o: &Obj) -> Option<Mesh> {
         let altitude = script::float(o, &self.ctx, "Altitude", 100.0);
         let keys: Vec<TextureKey> = (1..=4).filter_map(|n| self.texture(&format!("single_cloud0{n}.png"))).collect();
@@ -278,10 +339,10 @@ impl Builder<'_> {
         let tint = self.sky.cloud_light.map(srgb_to_linear);
         let mut mesh = Mesh::default();
         let mut per_key: Vec<Vec<u32>> = vec![vec![]; keys.len()];
-        for i in 0..32 {
-            let (az, dist) = (rng.next() * std::f32::consts::TAU, 150.0 + 750.0 * rng.next());
-            let dir = [az.sin() * dist, altitude, az.cos() * dist];
-            let len = dist.hypot(altitude);
+        for i in 0..10 {
+            let (x, z) = ((rng.next() * 2.0 - 1.0) * 1600.0, (rng.next() * 2.0 - 1.0) * 1600.0);
+            let dir = [x, altitude, z];
+            let len = x.hypot(z).hypot(altitude);
             let base = mesh.vertices.len() as u32;
             // a 260 x 130 m cloud seen at its distance
             quad(&mut mesh, scene(dir.map(|c| c / len)), (130.0 / len * 300.0, 65.0 / len * 300.0), [tint[0], tint[1], tint[2], 0.9], [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]);

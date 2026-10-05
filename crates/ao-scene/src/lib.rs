@@ -162,6 +162,19 @@ pub struct Scene {
     /// at the camera every frame and overrides `environment.fog_color` / `fog_end` (and the clear colour when it equals
     /// the fog colour). `None` = the static environment fog.
     pub fog_model: Option<FogModel>,
+    /// Constant rotations of `sky` instances (the Shadowlands vortex: a `Counter` that grows with `GameDeltaTime`).
+    pub sky_spin: Vec<SkySpin>,
+}
+
+/// A sky instance that turns about `axis` (right-handed scene space, unit) through the point `pivot` (relative to the
+/// camera) at `degrees_per_second`; the renderer composes it with the instance transform every frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SkySpin {
+    /// Index into [`Scene::sky`].
+    pub instance: usize,
+    pub axis: [f32; 3],
+    pub pivot: [f32; 3],
+    pub degrees_per_second: f32,
 }
 
 /// Local fog volume (`n3StatelFog_t`, statel file; `StatelFogRun` N3 @0x10024dbc): inside `radius` metres of `pos` the

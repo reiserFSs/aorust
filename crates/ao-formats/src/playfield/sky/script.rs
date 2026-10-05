@@ -280,7 +280,7 @@ impl Quat {
         Quat { w: l / 2.0, x: cross[0] / l, y: cross[1] / l, z: cross[2] / l }
     }
 
-    /// `self [ROT] next`: apply `self`, then `next`.
+    /// Apply `self`, then `next` (`next [ROT] self` in script order).
     pub fn then(self, n: Quat) -> Quat {
         Quat {
             w: n.w * self.w - n.x * self.x - n.y * self.y - n.z * self.z,
@@ -288,6 +288,17 @@ impl Quat {
             y: n.w * self.y - n.x * self.z + n.y * self.w + n.z * self.x,
             z: n.w * self.z + n.x * self.y - n.y * self.x + n.z * self.w,
         }
+    }
+
+    /// The rotation `s` with `base.then(s) == self` (`s` acts after `base`), as (unit axis, degrees in `0..=180`); `None`
+    /// when both are the same rotation.
+    pub fn spin_from(self, base: Quat) -> Option<([f32; 3], f32)> {
+        let inv = Quat { w: base.w, x: -base.x, y: -base.y, z: -base.z };
+        let s = inv.then(self);
+        let sign = if s.w < 0.0 { -1.0 } else { 1.0 };
+        let (w, v) = (s.w * sign, [s.x * sign, s.y * sign, s.z * sign]);
+        let sin = v.iter().map(|c| c * c).sum::<f32>().sqrt();
+        (sin > 1e-6).then(|| (v.map(|c| c / sin), 2.0 * sin.atan2(w).to_degrees()))
     }
 
     pub fn rotate(self, v: [f32; 3]) -> [f32; 3] {
@@ -302,6 +313,7 @@ impl Quat {
 }
 
 /// What the evaluator knows about the game state.
+#[derive(Clone)]
 pub struct Ctx {
     pub day_time: f32,
     pub sun1: Quat,
@@ -310,12 +322,18 @@ pub struct Ctx {
     pub cloud_intensity: f32,
     /// `GAME.OffsetFromHQ_X/Z`: the playfield's universe position relative to Omni-HQ.
     pub hq_offset: [f32; 2],
+    /// `GAME.GameDeltaTime`: 0 for a still frame, 1 to read per-second rates out of the per-frame integrators.
+    pub delta_time: f32,
+    /// `GAME.HighAltitudeWindX/Z` (the game writes `speed * direction * dt * k` every frame, `FUN_100be767`).
+    pub wind: [f32; 2],
+    /// `Object.Counter` references of other objects: their growth per second (the counters integrate `GameDeltaTime`).
+    pub counters: std::collections::HashMap<String, f32>,
 }
 
 impl Ctx {
     /// A context for expressions that do not depend on the game (offsets, counters, colours).
     pub fn at(day_time: f32) -> Ctx {
-        Ctx { day_time, sun1: Quat::IDENTITY, sun2: Quat::IDENTITY, cloud_intensity: 0.0, hq_offset: [0.0; 2] }
+        Ctx { day_time, sun1: Quat::IDENTITY, sun2: Quat::IDENTITY, cloud_intensity: 0.0, hq_offset: [0.0; 2], delta_time: 0.0, wind: [0.0; 2], counters: Default::default() }
     }
 }
 
@@ -348,10 +366,21 @@ fn variable(obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
         "GAME.ThickCloudsIntensity" => Some(ctx.cloud_intensity),
         "GAME.OffsetFromHQ_X" => Some(ctx.hq_offset[0]),
         "GAME.OffsetFromHQ_Z" => Some(ctx.hq_offset[1]),
+        "GAME.GameDeltaTime" => Some(ctx.delta_time),
+        "GAME.HighAltitudeWindX" => Some(ctx.wind[0]),
+        "GAME.HighAltitudeWindZ" => Some(ctx.wind[1]),
         _ if name.starts_with("GAME.") => Some(0.0),
-        _ if name.ends_with(".Counter") => Some(0.0),
+        _ if name.ends_with(".Counter") => {
+            let key = name.strip_prefix("This.").map_or_else(|| name.to_string(), |f| format!("{}.{f}", obj.name));
+            Some(ctx.counters.get(&key).map_or(0.0, |rate| rate * ctx.delta_time))
+        }
         _ => {
             let field = name.strip_prefix("This.")?;
+            // a self-integrating field (`ScrollU: This.ScrollU + ...`, counters) is 0 inside its own expression; elsewhere its
+            // per-second growth (`ctx.counters`, filled by `layers`) times the elapsed time
+            if obj.field(field).is_some_and(|e| e.contains(name)) {
+                return Some(ctx.counters.get(&format!("{}.{field}", obj.name)).map_or(0.0, |rate| rate * ctx.delta_time));
+            }
             spend()?;
             (depth < 4).then(|| eval_field(obj, ctx, obj.field(field)?, depth + 1)).flatten().or(Some(0.0))
         }
@@ -377,11 +406,6 @@ pub fn vector(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<[f32; 3]> 
     c.try_into().ok()
 }
 
-/// True when `expr` (following `This.<field>` references) reads the game state (`GAME.*`): day time, sun rotations.
-pub fn reads_game(obj: &Obj, expr: &str, depth: u32) -> bool {
-    expr.contains("GAME.") || (depth < 4 && expr.split("[ROT]").filter_map(|t| t.trim().strip_prefix("This.")).any(|f| obj.field(f).is_some_and(|e| reads_game(obj, e, depth + 1))))
-}
-
 /// Rotation expression → quaternion; `None` for anything the sky does not use.
 pub fn rotation(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<Quat> {
     if depth > 4 {
@@ -390,9 +414,11 @@ pub fn rotation(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<Quat> {
     if depth == 0 {
         reset_budget();
     }
+    // `a [ROT] b` is the Hamilton product `a * b`: `b` acts first (FXS `FUN_10004f91` computes `param * this`; the only
+    // order that stands Old Athen's / the horizon map's Max Z-up meshes upright under `Rz(90) [ROT] Ry(90)`)
     expr.split("[ROT]").try_fold(Quat::IDENTITY, |total, term| {
         spend()?;
-        Some(total.then(term_rotation(obj, ctx, term.trim(), depth)?))
+        Some(term_rotation(obj, ctx, term.trim(), depth)?.then(total))
     })
 }
 
@@ -412,7 +438,8 @@ fn term_rotation(obj: &Obj, ctx: &Ctx, term: &str, depth: u32) -> Option<Quat> {
     }
     let rest = term.strip_prefix("q(")?;
     let c: Vec<f32> = rest.split(')').next()?.split(',').map(|e| eval_field(obj, ctx, e, depth)).collect::<Option<_>>()?;
-    let [w, x, y, z]: [f32; 4] = c.try_into().ok()?;
+    // FXS stores the four values in written order = (x, y, z, w)
+    let [x, y, z, w]: [f32; 4] = c.try_into().ok()?;
     Some(Quat { w, x, y, z })
 }
 
@@ -493,24 +520,42 @@ Object Next
     }
 
     #[test]
-    fn game_dependence_follows_this_references() {
-        let o = parse_objects(SCRIPT);
-        assert!(reads_game(&o[0], o[0].field("Rotation").unwrap(), 0));
-        assert!(!reads_game(&o[1], o[1].field("Rotation").unwrap(), 0));
-    }
-
-    #[test]
-    fn composed_rotation_applies_left_first_and_counters_are_zero() {
+    fn composed_rotation_and_counters_are_zero() {
         let o = parse_objects(SCRIPT);
         let n = &o[1];
         let q = rotation(n, &ctx(0.0), n.field("Rotation").unwrap(), 0).unwrap();
         // 90 degrees about z takes +x to +y; the zero-angle second rotation leaves it
         let v = q.rotate([1.0, 0.0, 0.0]);
         assert!((v[1] - 1.0).abs() < 1e-5 && v[0].abs() < 1e-5, "{v:?}");
-        // [ROT] order: z-rotation first, then 90 about y takes (0,1,0) (already rotated) to itself
+        // `Quat::then` = apply self first
         let both = Quat::axis_angle([0.0, 0.0, 1.0], 90.0).then(Quat::axis_angle([0.0, 1.0, 0.0], 90.0));
         let w = both.rotate([1.0, 0.0, 0.0]);
         assert!((w[1] - 1.0).abs() < 1e-5, "{w:?}");
+    }
+
+    #[test]
+    fn rot_operator_acts_right_operand_first_like_the_real_horizon_objects() {
+        // Tweak_Rubi-Ka_Horizon: `Rz(90) [ROT] Ry(90)` must carry the Max Z-up mesh's up axis (+z) to world +y
+        let text = "Object H\n{\n  Quaternion U1: v( 0,0,1 ), 90\n  Quaternion U2: v( 0,1,0 ), 90\n  Quaternion Rotation: This.U1 [ROT] This.U2\n}\n";
+        let o = parse_objects(text);
+        let q = rotation(&o[0], &ctx(0.0), o[0].field("Rotation").unwrap(), 0).unwrap();
+        let up = q.rotate([0.0, 0.0, 1.0]);
+        assert!((up[1].abs() - 1.0).abs() < 1e-5 && up[0].abs() < 1e-5 && up[2].abs() < 1e-5, "{up:?}");
+    }
+
+    #[test]
+    fn scroll_integrators_give_per_second_rates_and_q_is_xyzw() {
+        let text = "Object C\n{\n  Float ScrollU: This.ScrollU + GAME.HighAltitudeWindX % 1 * 10\n  Float ScrollV: GAME.GameDeltaTime * -0.004 + This.ScrollV % 1\n  Quaternion Q: q( 0, 0, 0.70710678, 0.70710678 )\n}\n";
+        let o = parse_objects(text);
+        let ctx = Ctx { delta_time: 1.0, wind: [0.0004, 0.0], ..Ctx::at(0.0) };
+        let rate = |f: &str| eval_field(&o[0], &ctx, o[0].field(f).unwrap(), 0).unwrap();
+        assert!((rate("ScrollU") - 0.004).abs() < 1e-6 && (rate("ScrollV") + 0.004).abs() < 1e-6);
+        // a still frame (delta 0, no wind) does not move
+        let still = eval_field(&o[0], &Ctx::at(0.0), o[0].field("ScrollV").unwrap(), 0).unwrap();
+        assert_eq!(still, 0.0);
+        // q(a, b, c, d) = (x, y, z, w): 90 degrees about z takes +x to +y
+        let v = rotation(&o[0], &ctx, o[0].field("Q").unwrap(), 0).unwrap().rotate([1.0, 0.0, 0.0]);
+        assert!((v[1] - 1.0).abs() < 1e-5 && v[0].abs() < 1e-5, "{v:?}");
     }
 
     #[test]
