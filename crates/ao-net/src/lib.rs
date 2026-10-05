@@ -2,6 +2,7 @@
 //! (DH + TEA-CBC), the system messages from connect through character list / select / zone
 //! hand-off, and a threaded login/zone client ([`client`]). See docs/protocol.md.
 
+pub mod chat;
 pub mod client;
 pub mod conn;
 pub mod crypto;
