@@ -36,6 +36,16 @@ struct Window {
     default_button: Option<ViewId>,
 }
 
+/// First id handed out by `Gui::add_image` (above every skin id).
+pub const EXTRA_BASE: u32 = 0x10000;
+
+pub struct ExtraImage {
+    pub rgba: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    pub smooth: bool,
+}
+
 struct Popup {
     window: WindowId,
     combo: ViewId,
@@ -65,6 +75,7 @@ pub struct Gui {
     scroll_drag: Option<(ViewId, f32)>,
     /// Roots of `add_view` instances.
     items: std::collections::HashSet<ViewId>,
+    extras: Vec<ExtraImage>,
     /// Elements/attributes the engine could not honour while building views.
     pub warnings: Vec<String>,
 }
@@ -123,6 +134,7 @@ impl Gui {
             popup: None,
             scroll_drag: None,
             items: Default::default(),
+            extras: Vec::new(),
             warnings: Vec::new(),
         })
     }
@@ -909,8 +921,18 @@ impl Gui {
 
     /// Appends `text` (top-left at `x`,`y`, window pixels) in `font`/`color` (0xRRGGBB) to `list`.
     /// Returns the advance width in pixels.
-    pub fn text_cmds(&mut self, font: FontId, text: &str, x: i32, y: i32, color: u32, list: &mut DrawList) -> i32 {
-        self.draw_string(&mut list.cmds, font, text, x, y, rgb(color), 1.0, false)
+    pub fn text_cmds(&mut self, font: FontId, text: &str, x: i32, y: i32, color: u32, alpha: f32, list: &mut DrawList) -> i32 {
+        self.draw_string(&mut list.cmds, font, text, x, y, rgb(color), alpha, false)
+    }
+    /// Registers a runtime RGBA image (e.g. a loading screen); draw it with `DrawCmd::Gfx { id, .. }`.
+    /// `smooth` = bilinear sampling (`RenderWindow_t::UseFilter(true)`), else nearest.
+    pub fn add_image(&mut self, _name: &str, rgba: Vec<u8>, w: u32, h: u32, smooth: bool) -> GfxId {
+        let id = GfxId(EXTRA_BASE + self.extras.len() as u32);
+        self.extras.push(ExtraImage { rgba, w, h, smooth });
+        id
+    }
+    pub fn extra_images(&self) -> &[ExtraImage] {
+        &self.extras
     }
     /// Pixel width of `text` in `font`.
     pub fn text_width(&mut self, font: FontId, text: &str) -> i32 {

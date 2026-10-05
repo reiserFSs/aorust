@@ -14,7 +14,7 @@ pub use draw::{DrawCmd, DrawList, GlyphAtlas};
 pub use font::FontId;
 pub use geom::{Point, Rect};
 pub use gfx::{Atlas, AtlasEntry, GfxId, GfxSet};
-pub use gui::{Gui, WindowSize};
+pub use gui::{ExtraImage, Gui, WindowSize, EXTRA_BASE};
 pub use input::{Event, InputEvent, Key, Modifiers, MouseButton, ViewHandle, WindowId};
 pub use view::tvf;
 

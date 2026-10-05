@@ -31,6 +31,8 @@ pub struct GuiRenderer {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    linear: wgpu::Sampler,
+    extras: Vec<(wgpu::Texture, wgpu::TextureView)>,
     gfx_view: wgpu::TextureView,
     page_px: Vec<(f32, f32)>,
     glyph_tex: wgpu::Texture,
@@ -99,6 +101,12 @@ impl GuiRenderer {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
                 wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ],
         });
@@ -130,6 +138,8 @@ impl GuiRenderer {
             pipeline,
             layout,
             sampler,
+            linear: device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() }),
+            extras: Vec::new(),
             gfx_view,
             page_px: atlas.pages.iter().map(|p| (p.width as f32, p.height as f32)).collect(),
             glyph_tex,
@@ -152,9 +162,30 @@ impl GuiRenderer {
             );
             self.glyph_version = ga.version;
         }
+        for img in gui.extra_images().iter().skip(self.extras.len()) {
+            let t = r.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gui image"),
+                size: wgpu::Extent3d { width: img.w, height: img.h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            r.queue.write_texture(
+                t.as_image_copy(),
+                &img.rgba,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.w * 4), rows_per_image: Some(img.h) },
+                wgpu::Extent3d { width: img.w, height: img.h, depth_or_array_layers: 1 },
+            );
+            let v = t.create_view(&Default::default());
+            self.extras.push((t, v));
+        }
         // vertices + per-clip batches
         let mut verts: Vec<Vertex> = Vec::new();
-        let mut batches: Vec<(Option<[i32; 4]>, std::ops::Range<u32>)> = Vec::new();
+        let mut batches: Vec<(Option<[i32; 4]>, Option<usize>, std::ops::Range<u32>)> = Vec::new();
+        let mut cur_extra: Option<usize> = None;
         let mut clip: Option<[i32; 4]> = None;
         let mut start = 0u32;
         let quad = |verts: &mut Vec<Vertex>, d: [f32; 4], uv: [f32; 4], color: [f32; 4], kind: u32| {
@@ -166,29 +197,67 @@ impl GuiRenderer {
             match *c {
                 DrawCmd::Clip(nc) => {
                     if verts.len() as u32 > start {
-                        batches.push((clip, start..verts.len() as u32));
+                        batches.push((clip, cur_extra, start..verts.len() as u32));
                         start = verts.len() as u32;
                     }
                     clip = nc;
                 }
                 DrawCmd::Gfx { id, src, dst, tint, alpha } => {
+                    if id.0 >= ao_gui::EXTRA_BASE {
+                        let k = (id.0 - ao_gui::EXTRA_BASE) as usize;
+                        if k >= self.extras.len() {
+                            continue;
+                        }
+                        if cur_extra != Some(k) {
+                            if verts.len() as u32 > start {
+                                batches.push((clip, cur_extra, start..verts.len() as u32));
+                                start = verts.len() as u32;
+                            }
+                            cur_extra = Some(k);
+                        }
+                        let img = &gui.extra_images()[k];
+                        let uv = [src[0] / img.w as f32, src[1] / img.h as f32, (src[0] + src[2]) / img.w as f32, (src[1] + src[3]) / img.h as f32];
+                        quad(&mut verts, dst, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], 3 << 16);
+                        continue;
+                    }
+                    if cur_extra.is_some() {
+                        if verts.len() as u32 > start {
+                            batches.push((clip, cur_extra, start..verts.len() as u32));
+                            start = verts.len() as u32;
+                        }
+                        cur_extra = None;
+                    }
                     let Some(e) = gui.atlas().entry(id) else { continue };
                     let (pw, ph) = self.page_px[e.page as usize];
                     let uv = [(e.x as f32 + src[0]) / pw, (e.y as f32 + src[1]) / ph, (e.x as f32 + src[0] + src[2]) / pw, (e.y as f32 + src[1] + src[3]) / ph];
                     quad(&mut verts, dst, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], e.page);
                 }
                 DrawCmd::Glyph { src, dst, tint, alpha } => {
+                    if cur_extra.is_some() {
+                        if verts.len() as u32 > start {
+                            batches.push((clip, cur_extra, start..verts.len() as u32));
+                            start = verts.len() as u32;
+                        }
+                        cur_extra = None;
+                    }
                     let d = [dst[0] as f32, dst[1] as f32, (dst[0] + src[2] as i32) as f32, (dst[1] + src[3] as i32) as f32];
                     let uv = [src[0] as f32 / gw, src[1] as f32 / gh, (src[0] + src[2]) as f32 / gw, (src[1] + src[3]) as f32 / gh];
                     quad(&mut verts, d, uv, [tint[0] as f32 / 255.0, tint[1] as f32 / 255.0, tint[2] as f32 / 255.0, alpha], 1 << 16);
                 }
                 DrawCmd::Solid { dst, color, alpha } => {
+                    if cur_extra.is_some() {
+                        if verts.len() as u32 > start {
+                            batches.push((clip, cur_extra, start..verts.len() as u32));
+                            start = verts.len() as u32;
+                        }
+                        cur_extra = None;
+                    }
                     quad(&mut verts, dst, [0.0; 4], [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0, alpha], 2 << 16);
                 }
             }
         }
         if verts.len() as u32 > start {
-            batches.push((clip, start..verts.len() as u32));
+            batches.push((clip, cur_extra, start..verts.len() as u32));
         }
         if verts.is_empty() {
             return;
@@ -200,16 +269,24 @@ impl GuiRenderer {
             contents: bytemuck::bytes_of(&Globals { screen: [size.0 as f32, size.1 as f32], srgb: if r.format.is_srgb() { 1.0 } else { 0.0 }, _pad: 0.0 }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gui"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.gfx_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.glyph_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-            ],
-        });
+        let mk_bg = |extra: Option<usize>| {
+            let (view, samp) = match extra {
+                Some(k) => (&self.extras[k].1, if gui.extra_images()[k].smooth { &self.linear } else { &self.sampler }),
+                None => (&self.glyph_view, &self.sampler),
+            };
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gui"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.gfx_view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.glyph_view) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(samp) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(view) },
+                ],
+            })
+        };
+        let bgs: Vec<wgpu::BindGroup> = batches.iter().map(|b| mk_bg(b.1)).collect();
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gui") });
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -221,9 +298,9 @@ impl GuiRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
             pass.set_vertex_buffer(0, vb.slice(..));
-            for (c, range) in batches {
+            for ((c, _, range), bg) in batches.into_iter().zip(bgs.iter()) {
+                pass.set_bind_group(0, bg, &[]);
                 match c {
                     Some([x0, y0, x1, y1]) => {
                         let (x0, y0, x1, y1) = (x0 * scale as i32, y0 * scale as i32, x1 * scale as i32, y1 * scale as i32);

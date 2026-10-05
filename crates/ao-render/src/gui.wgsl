@@ -8,6 +8,7 @@ struct Globals {
 @group(0) @binding(1) var gfx_tex: texture_2d_array<f32>;
 @group(0) @binding(2) var glyph_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
+@group(0) @binding(4) var extra_tex: texture_2d<f32>;
 
 struct VIn {
     @location(0) pos: vec2<f32>,
@@ -48,6 +49,10 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
         let cov = textureSampleLevel(glyph_tex, samp, i.uv, 0.0).r;
         rgb = i.color.rgb;
         a = cov * i.color.a;
+    } else if ((i.kind >> 16u) == 3u) {
+        let t = textureSampleLevel(extra_tex, samp, i.uv, 0.0);
+        rgb = t.rgb * i.color.rgb;
+        a = t.a * i.color.a;
     } else if ((i.kind >> 16u) == 2u) {
         rgb = i.color.rgb;
         a = i.color.a;
