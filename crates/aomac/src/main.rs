@@ -66,6 +66,9 @@ enum What {
         /// Clip time in seconds (with --anim).
         #[arg(long, default_value_t = 0.0)]
         time: f32,
+        /// Head mesh id (rdb 1010001) attached to the body.
+        #[arg(long)]
+        head: Option<u32>,
     },
     /// Synthetic test scene.
     Demo {
@@ -99,11 +102,15 @@ fn main() -> Result<()> {
             let dir = client_dir(opts.client.clone())?;
             let scene: Scene = match what {
                 What::Demo { count } => demo::scene(count),
-                What::Char { id, anim, time } => {
+                What::Char { id, anim, time, head } => {
                     let store = RecordStore::open(&dir)?;
+                    if let Some(h) = head {
+                        ao_formats::character::load_character_with_head(&store, id, h, anim.map(|a| (a, time)))?
+                    } else {
                     match anim {
                         None => ao_formats::character::load_character(&store, id)?,
                         Some(a) => ao_formats::character::load_character_posed(&store, id, a, time)?,
+                    }
                     }
                 }
                 What::Mesh { id } => ao_formats::mesh::load_mesh(&RecordStore::open(&dir)?, id)?,
