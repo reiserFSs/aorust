@@ -756,6 +756,9 @@ impl Frontend for Play {
             _ => {}
         }
         for e in self.gui.input(ev) {
+            if self.hud.as_mut().is_some_and(|h| h.event(&mut self.gui, &e, &self.zone)) {
+                continue;
+            }
             self.handle(e, host);
         }
     }
@@ -814,6 +817,10 @@ impl Frontend for Play {
                     host.set_scene(*s);
                     host.camera = Camera::look_at(eye, at);
                     self.screen = Screen::InWorld;
+                    match hud::Hud::new(&mut self.gui, self.size) {
+                        Ok(h) => self.hud = Some(h),
+                        Err(e) => eprintln!("hud: {e:#}"),
+                    }
                     self.fade = Fade::Out(0.0);
                 }
             }
@@ -842,6 +849,10 @@ impl Frontend for Play {
         }
         if let Some(a) = &self.audio {
             a.update(dt, host.camera.pos.to_array(), ao_formats::playfield::DEFAULT_DAY_TIME);
+        }
+        if let Some(h) = self.hud.as_mut() {
+            h.resize(&mut self.gui, size);
+            h.update(&mut self.gui, &self.zone, dt);
         }
         let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
         let mut list = self.gui.frame(dt);

@@ -6,6 +6,7 @@ mod create;
 mod delete;
 mod flow;
 mod prefs;
+mod hud;
 mod preview;
 mod zone;
 
@@ -138,6 +139,8 @@ struct Play {
     welcome_image: bool,
     loading_name: &'static str,
 }
+    /// The in-world interface (`ControlCenterModule_c`), created when the world appears.
+    hud: Option<hud::Hud>,
 
 #[derive(Clone, Copy, PartialEq)]
 enum DialogKind {
@@ -213,6 +216,7 @@ impl Play {
             welcome_image: false,
             loading_name: "",
             text,
+            hud: None,
             gui,
             dir,
         })
