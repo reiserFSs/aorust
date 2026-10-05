@@ -165,3 +165,34 @@ fn limbs_stay_attached_with_the_models_own_clip_set() {
     // role lookup picks the fitting set for models no set is named after
     assert_eq!(role_anim(&store, 41664, &Role::Walk).unwrap(), 10191);
 }
+
+/// `FUN_1011d368` (GUI 0x1011d368): insertion-order head table; counts/orders measured against the client's rdb.
+#[test]
+fn head_table_follows_the_clients_builder() {
+    let Some(store) = store() else { return };
+    let t = |b, g, e| head_table(&store, b, g, e).unwrap();
+    let nums = |v: &[HeadEntry], s| v.iter().filter(|h| h.skin == s).map(|h| h.num).collect::<Vec<_>>();
+    // ExpansionFlags 0: ranges 0..30 (athrox, nano, opifex male), 0..32 minus #30 (opifex female), 0..50 / 0..51 (solitus)
+    let a = t(Breed::Atrox, Gender::Male, 0);
+    assert_eq!(nums(&a, Skin::Caucasian), (0..30).collect::<Vec<_>>());
+    assert_eq!(t(Breed::Atrox, Gender::Female, 0), a, "atrox is always the male table");
+    assert_eq!(a[12], HeadEntry { num: 12, mesh: 40098, skin: Skin::Caucasian });
+    let of = t(Breed::Opifex, Gender::Female, 0);
+    assert_eq!(nums(&of, Skin::Caucasian), (0..32).filter(|&n| n != 30).collect::<Vec<_>>());
+    // solitus: caucasian by number (skip list removes gaps), then african, then asian (not asian first)
+    let sm = t(Breed::Solitus, Gender::Male, 0);
+    let skins: Vec<Skin> = sm.iter().map(|h| h.skin).collect();
+    let (first_african, first_asian) = (skins.iter().position(|&s| s == Skin::African).unwrap(), skins.iter().position(|&s| s == Skin::Asian).unwrap());
+    assert!(first_african < first_asian && skins[..first_african].iter().all(|&s| s == Skin::Caucasian));
+    assert_eq!(nums(&sm, Skin::African), (0..9).collect::<Vec<_>>());
+    assert_eq!(nums(&sm, Skin::Asian), (0..6).collect::<Vec<_>>());
+    assert!(nums(&sm, Skin::Caucasian).iter().all(|n| *n < 51 && ![3, 4, 10, 11, 12, 14, 28, 29, 31, 32, 34, 37, 41, 47].contains(n)));
+    // the Shadowlands flag raises the ranges
+    assert!(t(Breed::Solitus, Gender::Female, 2).len() > t(Breed::Solitus, Gender::Female, 0).len());
+    assert_eq!(nums(&t(Breed::Solitus, Gender::Male, 2), Skin::Asian).len(), 9);
+    // every entry's mesh id is the record named by `head_<…>NN.abiff`
+    let names = NameTable::load(&store).unwrap();
+    for h in &sm {
+        assert!(names.name(1010001, h.mesh).is_some_and(|n| n.starts_with("head_solitusmale") && n.ends_with(&format!("{:02}.abiff", h.num))));
+    }
+}

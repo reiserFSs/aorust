@@ -142,9 +142,9 @@ lit by (a) the device state that `Randy_t`'s reset leaves and (b) the lights sto
   shine (mint, warm white): walls are tinted by the light they face, surfaces turned away from both lights are black (no ambient), the view is narrower vertically
   (horizontal 60°). Checked with `login_shot` renders of both versions (`/tmp` PNGs, not committed) and the `aomac play --fake-charlist` window.
 * **Specular (implemented)**: 9 of main's materials set `SPECULARENABLE` = 1 (`hull default`, `tech plated`, `grey-shit` = the floor, …), `spec` 0.9, `shin` 10–25; `ao-render` adds `Cs · Ls · (N·H)^power · atten` per vertex after the texture stage (`LOCALVIEWER` = 1, light specular = diffuse colour; see `docs/formats.md` *Vertex lighting*). With the two distant lights the highlights are weak: the `login_shot` render differs from the per-pixel one mostly by Gouraud shading on the pedestals.
-* **`CCCharacter_t::ShowSelectionGlow(bool)`** [GUI 0x1011a9ae] (the "selection glow") is a `GfxVisualShield` over the character's `RCATMesh_t` (colour `0xff40ff40`, a 0x2c8-byte
-  object, `+0x1a8` / `+0x2c0` from floats 0x101ae2ec / 0x101a9fa0). It is switched on/off only by `BreedScene_t::SlotBreedButton` [0x1011385b] — the character *creation* breed pick. The
-  login and character-selection screens never call it (no glow on the selection preview).
+* **`CCCharacter_t::ShowSelectionGlow(bool)`** [GUI 0x1011a9ae] (the "selection glow") is a `GfxVisualShield` over the character's `RCATMesh_t`; it is switched on/off only by
+  `BreedScene_t::SlotBreedButton` [0x1011385b] — the character *creation* breed hover — and **never visibly renders**; the full decode is in §12 *Breed hover glow*.
+  The login and character-selection screens never call it (no glow on the selection preview).
 
 **Verified by rendering**: `cargo run --release -p aomac --example login_shot -- 1 3 out.png` draws the five meshes (stage 1) with
 this camera (`LOGIN_CAMERA`, forward = rotate +Z by the quaternion = (0.012, −0.208, −0.978), then Z mirrored for the renderer) and the
@@ -402,9 +402,9 @@ are **not** read by the selection screen.
   (table 0x10272434, index 1…4), sex names `male/female` (table 0x10272448: 1 unisex, 2 male, 3 female); **Atrox (4) is forced to sex 2**
   (ctor: `if (breed==4) sex=2`); build suffix `""` for Build 1 (normal; `_thin` for 0, `_fat` for 2). The viewer is constructed with
   head 0, **Build 1, Height 1** [0x10005701: `CCCharacter_t(breed, sex, 0, 1, 1, "idle-stand_01_01")`], so `solitus_female.cir` etc.
-* head = first entry of the (breed, sex) head table built in `FUN_1011d368` (@0x1011d368) from meshes named `head_<race><sex>[_african|_asian]%02d.abiff`
-  (rdb 1010001), index 0…N−1, entries only for names that exist; first group of each (breed,sex) is the caucasian/default one, so head
-  0 = the lowest existing `NN` (`player_heads()[0]` in `ao_formats::character::player`). Head attached as attractor mesh (`AddAttractorMesh(0, headMesh, 4, 0)`).
+* head = entry 0 of the (breed, sex) head table that `HeadMeshData_t` (ctor `FUN_1011d368` [GUI 0x1011d368]) builds — **insertion order of a per-(sex, breed)
+  `std::vector<(mesh id, ethnicity)>`, not sorted by id** (decoded in §12 *Head table*; `ao_formats::character::head_table`, used by `screens::char_select_look`
+  with `ExpansionFlags` 0). Head attached as attractor mesh (`AddAttractorMesh(0, headMesh, 4, 0)`).
 * skin: `VisualCATMesh_t::SetSkinData(breed, sex, race)` with the race of the head entry → naked skin textures (rdb 1010011
   `<part>_<race><sex>[_caucation|_asian|_african]_naked.png`); this is what `load_player` already does.
 * animation: `PlayAnim("idle-stand_01_01", loop=false)` builds the clip name `<set>_<anim>.ani` with `set = "athrox"` for Atrox else
@@ -586,4 +586,50 @@ The login/selection camera of §2 is **not** in this file; it is hard-coded in `
 RE from GUI.dll (addresses in code comments): module states 0x514 → 0x44d `RunIntro` (camera transition [5 1], `SM_Sandy_CC_Opening_Music`, 10 s black fade) → 0x44e (texts MorningStar / GeosynchronousOrbit after 4 s, fade to black in the last 3 s) → [1 1 1] (Docking/ContinuingDNA texts) → scenes 0x3e9..0x3ec (Breed, Appearance, Profession, Name) → 0x4b1 exit [4 3]. World = 6 `charactercreation_*.abiff` (+ connectors `breed_0..6`, `character_0/1/3`), `CharCreateCamera.dat` played by the rig of `FUN_1011663e` (arc-length walk, ease (1−cos πp)/2, low-pass b = 0.935−min(dt,0.035)); custom transitions are the ones decoded from each scene's Next/Prev/ProfessionChanged/MoveCamera* (see `play/create/scenes.rs`). Widgets: `MakeButton` image buttons (GFX_GUI_CC_*, positions as display fractions), `MakeLabel` banners, HTML text area (title #eee, body #ccc), name `TextInputView` (label "Nickname:", colour 0xaaaaff, letters/digits only), validation `FUN_10123be2/1012382b`, `CreateCharacter(breed, sex, prof, head mesh, 90/100/110, build, name, 0)`, server error codes → texts (`NameScene_t::SetState`), 0x1e = NicknameTaken, 0x1f = NicknameInvalid. Text keys: text.mdb cat 600 by ElfHash of the key names found in the code.
 Delete: `CharacterDeleteWindow` (typed name must match, else MatchError box) → `delete_character` → row removed on `CharacterDeleted`.
 
-**Remaining gaps / UNRESOLVED**: selection glow (`GfxVisualShield`) not rendered; head table order (static map `FUN_100fd7c4`, caucasian→asian→african used) [INFERENCE]; camera roll ignored (yaw/pitch only); `GetScaleFromLowestResolution` taken as H/768; receiver of global signal 0x184 (`Message`) unknown → notice box; Esc (`SlotEscPressed` = camera tool) ignored; MatchError box replaces the delete window; after a created character the start playfield needs the zone messages (M3); Appearance/Profession/Name scenes and the intro/exit cinematics were implemented but only the Breed scene (hover, select, Next) and the Appearance entry were checked visually (`AOMAC_CC_SKIP_INTRO=1` debug env jumps to the breed scene); profession scene lighting/effects meshes unchecked.
+**Head table** (`HeadMeshData_t`, resolved from code; `ao_formats::character::head_table(store, breed, gender, expansions)`, test `character_real.rs::head_table_follows_the_clients_builder`).
+`HeadMeshDataRef_t` [GUI 0x1011a54f] ref-counts one global `HeadMeshData_t`; its first creation runs `FUN_1011d368` [0x1011d368]. `FUN_100fd7c4` is **not** a data table but the
+`std::map<int, T>::operator[]` instantiation, applied to two static maps (`DAT_102726d0` = female, keys 1–3; `DAT_102726cc` = male, keys 1–4 — Atrox exists only in the male map).
+Each value is a `std::vector<(mesh id, ethnicity)>` (`FUN_1011ebf2` = `push_back`, element 8 bytes), so **the order is insertion order**. A second global map (`DAT_102766a8`, `FUN_1011eb45` =
+`operator[]`) keeps per mesh id `{normal, hires, lores}` (`head_<…>NN.abiff`, `_hires`, `_lores`; `CCCharacter_t` only uses the normal one). For every block the name
+`sprintf("head_<name>%02d.abiff", NN)` is resolved with `InstanceManager_t::GetTypeInstance(0xf6951, …)`; if it equals the id of `default_mesh.abiff` (= not in rdb 1010001) the entry is dropped. Ethnicity
+(`BreedRace_e`): 1 caucasian, 2 african, 3 asian. Blocks, in this order within a vector (`NN` ranges depend on DValue `ExpansionFlags & 2` = Shadowlands: *without* / *with*):
+
+| (sex, breed) | blocks (`NN` limit without / with Shadowlands, skipped `NN`) |
+|---|---|
+| female / Opifex (2) | `opifexfemale` NN < 32 / 43 except 30 (eth 1) |
+| male / Opifex | `opifexmale` NN < 30 / 43 |
+| female / Solitus (1) | `solitusfemale` NN < 50 / 75 except {3,4,8,9,10,13,14,22,29,30,43,46,47} (eth 1), `solitusfemale_african` NN < 8 (eth 2), `solitusfemale_asian` NN < 7 (eth 3) |
+| male / Solitus | `solitusmale` NN < 51 / 255 except {3,4,10,11,12,14,28,29,31,32,34,37,41,47}, `solitusmale_african` NN < 9, `solitusmale_asian` NN < 6 / 9 |
+| male / Nano (3) | `nanomale` NN < 30 / 41 |
+| female / Nano | `nanofemale` NN < 30 / 43 |
+| male / Atrox (4) | `athrox` NN < 30 / 41 (`CCCharacter_t` forces sex male for Atrox) |
+
+The sex argument of the table functions is the `BreedSex_e` value: **3 = female** (static map `DAT_102726d0`), anything else male. Reading: `CCCharacter_t::MakeHeadMeshTable` [0x1011aacb] copies the vector of
+(breed, sex) (`FUN_1011d26d` = first element, `FUN_1011d0bd` = element after a given mesh id, wrapping) into `CCCharacter_t+0x50`. `GetHeadCount` = size, `GetHeadIndex` = `+0xc`, `GetHeadMeshID(i)` = `table[i].mesh`
+[0x1011a6a0]; `ChangeMesh`/`ChangeHead` [0x1011ab53 / 0x1011a631] clamp an index ≥ size to 0, attach `table[i].mesh` (`AddAttractorMesh(0, mesh, 4, 0)`) and set `+0x18` (race) = `table[i].eth` for `SetSkinData`.
+Appearance selector: `SelectNextHead` = index−1, `SelectPrevHead` = index+1 (mod count; the names are swapped in the decompile, `play/create/scenes.rs` follows the behaviour).
+
+* **Index vs. id.** The index is only the selector position (pref `CCSelectedHead`). On the wire a head is always the rdb 1010001 **mesh id**: `CreateCharacter.head = GetHeadMeshID(CCSelectedHead)` (`NameScene_t::SetState(0x1006)`,
+  protocol.md §5a), and `CharacterViewer_c::Update` [0x100054cd] takes the stored head as a mesh id and recovers the ethnicity with `FUN_1011d29b(breed, sex, meshId)` (linear search of the vector). The preview of a character without stored
+  appearance uses index 0. `screens::char_select_look` = `head_table(…, 0)[0]`; the creation code (`play/create.rs`) holds the table, index and sends `table[index].mesh`.
+* **Which `ExpansionFlags`.** The table is built when the first `CCCharacter_t` exists: `LoginModule_c::SlotInitialize` [0x10012204] constructs `CharSelectWindow_c` (0x10012379), whose `CharacterViewer_c` embeds a `CCCharacter_t`
+  (0x1000f278) — before `SlotCharListReceived` [0x1000ea33] stores the server's `expansions` into DValue `ExpansionFlags` (0x1000ea5a) — and the window (hence the reference count) lives for the whole login phase, including
+  character creation (`SlotCreatePressed` only emits a signal). A fresh client therefore uses the *without* column (`expansions` = 0, the default of the DValue, §8 table); the live DValue is read only at the construction.
+  **UNRESOLVED**: whether `LoginModule_c` is ever destroyed and rebuilt in one process (returning from the game to the login screen) — then the table would be built with the stored flags.
+* Difference to the earlier inference (all caucasian `NN` ascending, then asian, then african, no limits): the real order is caucasian, **african, asian**; the `NN` limits and skip lists cut the set (e.g. Atrox 30 heads (40 with the bit; `NN` 32
+  does not exist in rdb) instead of the 41 meshes in the data, i.e. without the expansion bit; Solitus male 52 entries, first ones `0,1,2,5,6,…`).
+
+**Breed hover glow** (`CCCharacter_t::ShowSelectionGlow`, `GfxVisualShield`; resolved: it is never displayed). `ShowSelectionGlow(true)` [GUI 0x1011a9ae] allocates a 0x2c8-byte `GfxVisualShield` [DisplaySystem 0x1001ce93] over the
+character's `RCATMesh_t` (`VisualCATMesh_t+0x90`; material null, flags 0, mode 0), sets colour `0xff40ff40` (vtable+0x54 stores `+0x18c`), `+0x1a8` = 0.2 (0x101ae2ec), `+0x2c0` = 1000.0 (0x101a9fa0),
+`GfxVisual::EnableRendering` (adds it to `RandyRoot_t`) and `RunFunction(0)`; `ShowSelectionGlow(false)` — or `true` when a glow already exists — deletes it (vtable[0], `FUN_1001d000` unregisters the vertex callback).
+What it would draw: `FUN_1001ce63` (Process) registers the vertex-process callback `FUN_1001cd09` on the CAT mesh; the callback copies every skinned batch (vertex 32 B: pos, normal, uv) into a 24-byte-vertex
+buffer (FVF 0x142 = XYZ|DIFFUSE|TEX1) with `pos' = pos + normal · 0.01` (`+0x1c8` = `[0x1008ae90]`), the index list re-based, and `FUN_1001c94f` writes the vertex colour: RGB = 0x40ff40, alpha =
+`ftol(255 · 0.2 · sin²(min(1000·1.0, π/2)))` = 51, i.e. a constant (0.25, 1.0, 0.25, 0.2) for every vertex (the lit/pulsing branch `+0x1ac` is never enabled). Device states (`FUN_1001c6e1`, render priority 6):
+CLIPPING 1, LIGHTING 0, ZWRITE 0, COLORVERTEX 1, emissive source = vertex colour 1, CULLMODE none (mode `+0x1f0` = 0), stage 0 = vertex diffuse for colour and alpha (no texture), ALPHABLEND 1 with SRC = SRCALPHA,
+DEST = INVSRCALPHA (`+0x190` = 0; ONE only for the additive flag). `FUN_1001c8a5` (vtable+0x34) draws it with the visual's world matrix (`RenderTriangleList(0x142, …)`) once `+0x178 == 0` (rendering enabled).
+**Why nothing is visible**: the only callers are the two calls in `BreedScene_t::SlotBreedButton` [0x1011385b]. On a hover change the function first stores `+0x60 = +0x64` (hovered breed 1–7, 0 none), then — if the hovered breed is not the
+selected `+0x68` and its character exists — calls `ShowSelectionGlow(chars[+0x64], true)` + the mouse-over sample (`PlaySample(+0x50)`, asm 0x10113a8d), and right after that `ShowSelectionGlow(chars[+0x60], false)` (asm 0x10113abd) —
+the *same* character, because `+0x60` was just overwritten. The glow is created and destroyed inside one call, no frame is rendered in between; the object of a previously hovered breed is never created either. No other code calls
+the function (xrefs: only these two, plus the export table; no other client DLL imports it). The port therefore reproduces the sound only (`play/create/scenes.rs`, `SM_Sandy_CC_GUI_Mouseover`); a renderer for the shield would be dead code.
+
+**Remaining gaps / UNRESOLVED**: selection glow: nothing to render — the client creates and destroys it within one call (§12 *Breed hover glow*); camera roll ignored (yaw/pitch only); `GetScaleFromLowestResolution` taken as H/768; receiver of global signal 0x184 (`Message`) unknown → notice box; Esc (`SlotEscPressed` = camera tool) ignored; MatchError box replaces the delete window; after a created character the start playfield needs the zone messages (M3); Appearance/Profession/Name scenes and the intro/exit cinematics were implemented but only the Breed scene (hover, select, Next) and the Appearance entry were checked visually (`AOMAC_CC_SKIP_INTRO=1` debug env jumps to the breed scene); profession scene lighting/effects meshes unchecked.

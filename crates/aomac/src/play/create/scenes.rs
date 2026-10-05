@@ -787,11 +787,7 @@ impl Play {
         }
         c.name_locked = true;
         let (breed, gender) = cc_breed_to_gc(c.breed).unwrap_or((1, 3));
-        let head = c.heads.get(c.head).and_then(|h| {
-            let store = RecordStore::open(&self.dir).ok()?;
-            let (b, g) = gc_breed(breed, gender)?;
-            character::player_heads(&store, b, g, h.1).ok()?.into_iter().find(|x| x.0 == h.0).map(|x| x.1 as i32)
-        });
+        let head = c.heads.get(c.head).map(|h| h.mesh as i32); // `GetHeadMeshID(CCSelectedHead)`: the rdb 1010001 id
         let req = CreateCharacterRequest {
             breed,
             gender,

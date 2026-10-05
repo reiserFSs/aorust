@@ -295,6 +295,58 @@ fn heads(names: &NameTable, breed: Breed, gender: Gender, skin: Skin) -> Result<
     Ok(v)
 }
 
+/// One entry of the creation head table ([`head_table`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadEntry {
+    /// `NN` of `head_<race><sex>[_<ethnicity>]NN.abiff`.
+    pub num: u32,
+    /// rdb 1010001 id of that mesh = the `head` value of `CreateCharacter` (`CCCharacter_t::GetHeadMeshID`).
+    pub mesh: u32,
+    /// Ethnicity of the entry (`BreedRace_e` 1 / 2 / 3 = caucasian / african / asian), selects the naked skin.
+    pub skin: Skin,
+}
+
+/// The head table of a (breed, sex) exactly as the client builds it: `HeadMeshData_t` ctor `FUN_1011d368` [GUI 0x1011d368],
+/// read by `CCCharacter_t::MakeHeadMeshTable` [0x1011aacb]. Per (sex, breed) a `std::vector<(mesh id, ethnicity)>`
+/// in **insertion order**, filled block by block with `head_<name>%02d.abiff` for `NN = 0..count` (entries whose mesh does
+/// not exist in rdb 1010001 and the skip lists are left out). Index `i` of the Appearance head selector = `table[i]`.
+///
+/// `expansions` is DValue `ExpansionFlags`; bit 2 (Shadowlands) raises the `NN` ranges. The table is built once, when the
+/// first `CCCharacter_t` exists — `CharacterViewer_c` of `CharSelectWindow_c`, constructed by `LoginModule_c::SlotInitialize`
+/// before the character list arrives — so a fresh client has `expansions == 0` (docs/screens.md § 12).
+pub fn head_table(store: &RecordStore, breed: Breed, gender: Gender, expansions: u32) -> Result<Vec<HeadEntry>> {
+    let names = NameTable::load(store)?;
+    let sl = expansions & 2 != 0;
+    let pick = |base: u32, full: u32| if sl { full } else { base };
+    // (name, ethnicity, count, skipped NN)
+    let blocks: Vec<(&str, Skin, u32, &[u32])> = match (breed, gender) {
+        (Breed::Atrox, _) => vec![("athrox", Skin::Caucasian, pick(0x1e, 0x29), &[])],
+        (Breed::Opifex, Gender::Female) => vec![("opifexfemale", Skin::Caucasian, pick(0x20, 0x2b), &[30])],
+        (Breed::Opifex, Gender::Male) => vec![("opifexmale", Skin::Caucasian, pick(0x1e, 0x2b), &[])],
+        (Breed::Nanomage, Gender::Female) => vec![("nanofemale", Skin::Caucasian, pick(0x1e, 0x2b), &[])],
+        (Breed::Nanomage, Gender::Male) => vec![("nanomale", Skin::Caucasian, pick(0x1e, 0x29), &[])],
+        (Breed::Solitus, Gender::Female) => vec![
+            ("solitusfemale", Skin::Caucasian, pick(0x32, 0x4b), &[3, 4, 8, 9, 10, 13, 14, 22, 29, 30, 43, 46, 47]),
+            ("solitusfemale_african", Skin::African, 8, &[]),
+            ("solitusfemale_asian", Skin::Asian, 7, &[]),
+        ],
+        (Breed::Solitus, Gender::Male) => vec![
+            ("solitusmale", Skin::Caucasian, pick(0x33, 0xff), &[3, 4, 10, 11, 12, 14, 28, 29, 31, 32, 34, 37, 41, 47]),
+            ("solitusmale_african", Skin::African, 9, &[]),
+            ("solitusmale_asian", Skin::Asian, pick(6, 9), &[]),
+        ],
+    };
+    let mut table = vec![];
+    for (name, skin, count, skip) in blocks {
+        for num in (0..count).filter(|n| !skip.contains(n)) {
+            if let Some(mesh) = names.id(MESH_TYPE, &format!("head_{name}{num:02}.abiff")) {
+                table.push(HeadEntry { num, mesh, skin });
+            }
+        }
+    }
+    Ok(table)
+}
+
 /// Naked-skin textures for a body's `*_default.png` parts: original texture id → rdb 1010011 key.
 fn skin_swaps(names: &NameTable, store: &RecordStore, model_id: u32, skin: Skin) -> Result<HashMap<u32, TextureKey>> {
     let mesh = load_cat_mesh(store, CHAR_MESH_TYPE, model_id)?;

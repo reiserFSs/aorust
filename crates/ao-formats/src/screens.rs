@@ -11,7 +11,7 @@
 //! Coordinates are AO's left-handed Y-up space unless a function says `render`; the renderer contract (ao-scene) is
 //! right-handed with Z negated, see [`ao_to_render`].
 
-use crate::character::{NameTable, Breed, Gender, Player, Role, Skin, load_player, player_heads, CHAR_MESH_TYPE};
+use crate::character::{NameTable, Breed, Gender, Player, Role, Skin, load_player, head_table, CHAR_MESH_TYPE};
 use crate::mesh::{decode_mesh_into, decode_mesh_lights};
 use anyhow::{bail, ensure, Context, Result};
 use ao_rdb::RecordStore;
@@ -302,8 +302,9 @@ pub fn char_select_look(store: &RecordStore, breed: i32, sex: i32) -> Result<Cha
     let sexname = if g == Gender::Male { "male" } else { "female" };
     let model_name = format!("{race}_{sexname}.cir");
     let model = names.id(CHAR_MESH_TYPE, &model_name).with_context(|| format!("no model {model_name}"))?;
-    let heads = player_heads(store, b, g, Skin::Caucasian)?;
-    let head = *heads.first().with_context(|| format!("no heads for {b:?} {g:?}"))?;
+    // head index 0 of the table the client builds before the character list arrives (`ExpansionFlags` 0)
+    let first = *head_table(store, b, g, 0)?.first().with_context(|| format!("no heads for {b:?} {g:?}"))?;
+    let head = (first.num, first.mesh);
     let set = if b == Breed::Atrox { "athrox" } else { sexname };
     let clip = |n: String| -> Result<(String, u32)> {
         let id = names.id(ANIM_TYPE, &n).with_context(|| format!("no clip {n}"))?;

@@ -10,7 +10,7 @@ mod frame;
 mod scenes;
 
 use super::*;
-use ao_formats::character::{self, Breed, Gender, Skin};
+use ao_formats::character::{self, Breed, Gender};
 use ao_formats::create::*;
 use ao_formats::screens::{ao_to_render, CharCreateCameras};
 use ao_net::msg::CreateCharacterRequest;
@@ -149,7 +149,7 @@ pub(super) struct Create {
     // name scene
     pending_suggest: bool,
     name_locked: bool,
-    heads: Vec<(u32, Skin)>,
+    heads: Vec<character::HeadEntry>,
     // animation / effects
     fades: Vec<Fade>,
     text_fades: Vec<TextFade>,
@@ -232,13 +232,13 @@ impl Create {
 // head table
 // ---------------------------------------------------------------------------------------------------------------
 
-/// `CCCharacter_t::MakeHeadMeshTable` (GUI 0x1011aacb): every head of the (breed, sex) with its ethnicity. The table is a
-/// static map of GUI.dll (`FUN_100fd7c4`) whose contents were not located; the order here is the caucasian heads by number,
-/// then (Solitus only) asian, then african **[INFERENCE]**.
-fn head_table(dir: &std::path::Path, breed: Breed, gender: Gender) -> Vec<(u32, Skin)> {
+/// `CCCharacter_t::MakeHeadMeshTable` (GUI 0x1011aacb): the head table of the (breed, sex) as `FUN_1011d368` builds it, in
+/// insertion order (`character::head_table`). The table is built once, when `CharSelectWindow_c` (created by
+/// `LoginModule_c::SlotInitialize` before the character list) constructs its first `CCCharacter_t`, so DValue
+/// `ExpansionFlags` is still 0 (docs/screens.md § 12).
+fn head_table(dir: &std::path::Path, breed: Breed, gender: Gender) -> Vec<character::HeadEntry> {
     let Ok(store) = RecordStore::open(dir) else { return vec![] };
-    let skins: &[Skin] = if breed == Breed::Solitus { &[Skin::Caucasian, Skin::Asian, Skin::African] } else { &[Skin::Caucasian] };
-    skins.iter().flat_map(|&s| character::player_heads(&store, breed, gender, s).unwrap_or_default().into_iter().map(move |h| (h.0, s))).collect()
+    character::head_table(&store, breed, gender, 0).unwrap_or_default()
 }
 
 fn gc_breed(b: i32, s: i32) -> Option<(Breed, Gender)> {
@@ -249,14 +249,10 @@ impl Create {
     fn spec(&self, breed_idx: usize, head: usize, build: i32) -> Option<Spec> {
         let (b, s, _) = CC_BREEDS[breed_idx];
         let (breed, gender) = gc_breed(b, s)?;
-        let table = if self.heads.is_empty() { head_table(&self.dir, breed, gender) } else { head_table_cached(&self.heads) };
-        let h = table.get(head).or(table.first()).copied()?;
-        Some(Spec { breed, gender, head: h, build: build.clamp(0, 2) as u8 })
+        let table = if self.heads.is_empty() { head_table(&self.dir, breed, gender) } else { self.heads.clone() };
+        let h = table.get(head).or(table.first())?;
+        Some(Spec { breed, gender, head: (h.num, h.skin), build: build.clamp(0, 2) as u8 })
     }
-}
-
-fn head_table_cached(t: &[(u32, Skin)]) -> Vec<(u32, Skin)> {
-    t.to_vec()
 }
 
 // ---------------------------------------------------------------------------------------------------------------
