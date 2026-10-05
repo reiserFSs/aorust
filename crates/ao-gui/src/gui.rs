@@ -1155,6 +1155,7 @@ impl Gui {
     fn mouse_down(&mut self, x: f32, y: f32) {
         // an open combo popup captures the click
         if let Some(p) = self.popup.take() {
+            let picked = self.popup_item_at(p.window, p.combo, x, y).is_some();
             if let Some(i) = self.popup_item_at(p.window, p.combo, x, y) {
                 let text = match &mut self.tree.views[p.combo].kind {
                     Kind::Combo(c) => {
@@ -1174,7 +1175,10 @@ impl Gui {
                 self.events.push(Event::ComboChanged { window: p.window, view: name, index: i, text });
             }
             self.set_combo_arrow(p.combo, false);
-            return;
+            // a pick consumes the click; a click elsewhere closes the popup and acts normally
+            if picked {
+                return;
+            }
         }
         for (wid, root, pos) in self.windows_top_down() {
             if self.windows[wid].as_ref().is_some_and(|w| w.framed) {
@@ -1403,13 +1407,11 @@ impl Gui {
     }
 
     fn key_down(&mut self, key: Key, mods: Modifiers) {
-        if self.popup.is_some() {
+        if let Some(p) = self.popup.take() {
+            self.set_combo_arrow(p.combo, false);
             if key == Key::Escape {
-                if let Some(p) = self.popup.take() {
-                    self.set_combo_arrow(p.combo, false);
-                }
+                return;
             }
-            return;
         }
         self.caret_epoch = self.time;
         match key {
