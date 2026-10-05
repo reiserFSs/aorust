@@ -170,7 +170,7 @@ Stat names below come from the client's own id -> name table built by `FUN_1002f
 | 59 | Sex | 3 | | 61 | Cash | 1000 |
 | 16..21 | Strength, Agility, Stamina, Intelligence, Sense, Psychic | 6 each | | 53 | IP | 1500 |
 | 52 | XP | 0 | | 350 | NextXP | 1450 |
-| 0 | Energy | 528961 | | 673 | VisualFlags | 31 |
+| 0 | Flags | 528961 | | 673 | VisualFlags | 31 |
 | 181 | MaxNCU (i16 group) | 8 | | 173 | CurrentMovementMode (u8 group) | 3 |
 | 224 | Features | 6 | | 360 | MonsterScale | 100 |
 | 214 | CurrentNano | 32 | | 221 | MaxNanoEnergy | 1 |

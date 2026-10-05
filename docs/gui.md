@@ -128,3 +128,86 @@ Events: `Clicked`, `TextChanged`, `EnterPressed`, `ComboChanged`, `Copy`, `Paste
 Title text of framed windows; frame hover/pressed state index; window drag/resize hit-testing; `PopupMenu_c` skin; `_AddLineDesc` line pitch;
 GDI dropout rules; layer-alpha values from `GUIColors.xml`/prefs (defaults used); tooltips (`View::SetToolTip` texts exist, not shown);
 double-click word selection; IME.
+
+## 11. Stat tables and the skills / inventory / wear windows (`ao_formats::stats`, `play/hud_stats.rs`)
+
+Evidence: `GUI.dll` (GUI) and `Gamecode.dll` (GC) addresses, decoded with Ghidra headless (`/tmp/aomac-ghidra/dsky/gui` = GUI.dll, `/tmp/aomac-ghidra/proto` = Gamecode.dll);
+anything not read from the binaries is marked **UNRESOLVED**.
+
+### 11.1 Stat id → name table (`crates/ao-formats/data/stat_names.txt`, `stats::name`)
+`n3EngineClientAnarchy_t::N3Msg_GetStatNameMap` [GC 0x10027483] is a `std::map<int, const char*>` filled by **`FUN_1002f009` [GC 0x1002f009–0x100321a9]** as a straight line of
+`MOV [EBP-4], id` / `CALL 0x1008a3e8` (map `operator[]`) / `MOV [EAX], &name` triples (a few ids are cleared with `AND [EBP-4], 0`, the store of the string then follows
+the *next* instruction; the extraction attributes the string to the id live at the `CALL`). `FUN_1003227a`, `FUN_100324d2`, `FUN_10035c99` are only the readers (`fStatToString`),
+not table builders. Result: **523 inserts, 521 distinct ids** (id 0x85 `LR_EnergyWeapon` and 0x2b2 `EquippedRHWeapon` are inserted twice with the same name), max id 1002; earlier docs said 524.
+Corrections to earlier notes: id **0 = `Flags`** and id **26 = `Energy`** (docs/zone/world.md listed "0 Energy").
+The file (9 KB, id + internal name, no game art) is committed; the extraction script (`StatTab.java`) walks the Ghidra function body (not committed, ~20 lines).
+Display strings come from `text.mdb` (`TextDb::by_id(cat, stat)`): **2000** internal CamelCase, **2001** description (shown in the skill details), **2002** long name ("Body Development"),
+**2003** short name ("Body Dev.", "Matt.Metam", "Time&Space") – the `StatRow` ctor `FUN_100fe956` reads 2003 (`LDBface::GetText(0x7d3, stat)`); category 10010 = skill group labels
+(`#10010:n` in `Skills.xml`, now resolved by `TextDb::label`: `#<category>:<id>` = `GetText(category, id)`).
+
+### 11.2 Own stats in `Zone` (`play/zone.rs`)
+`Zone.stats: HashMap<u32,i32>` is filled from the own `FullCharacterIIR_t` (groups `stats_a`, `stats_b`, `stats_u8`, `stats_i16`, `stat_map`, the `0x499602D2` marker skipped, as GC 0x10073a2f does)
+and updated by every own `StatIIR_t` (`who.instance == char_id`); other dynels' `StatIIR` never touch it. Test `own_stats_from_full_character_and_stat_deltas` (capture `zone_newchar_ithaca.rec`:
+Level 1, IP 1500, Cash 1000, 6 in every ability, 5 in every skill).
+
+### 11.3 Skills window (`Views/Skills.xml`, `SkillWindow` ctor `FUN_100fc18e` GUI 0x100fc18e)
+* Window: `Window(Rect(200,180)..(850,700), "", "Skills", style 0, flags 0x1000)`, one tab "Skills", help file "The Skill Window.html", loads `%sViews/Skills.xml`. We open a style-1 frame of
+  the same outer size (651×521); the style-0 frame + tab strip is **UNRESOLVED** (docs §6).
+* Groups `FUN_100fb596` [GUI 0x100fb596]: 11 groups (`abilities body meleew melees rangedw rangeds nanocast exploring combatheal traderepair disabled`, text `10010:0..9, 9999`) and the 75 skill
+  ids pushed per group (`FUN_100ff558(11)`, then `FUN_10064bee` with ECX = `window+0x8c + 0x10·group`; decoded from the asm, `stats::SKILL_GROUPS`; 6+7+10+5+11+6+7+5+6+10+2 = 75, each once).
+  The skill names equal the `ipdist.xml` stat names, except `ipdist` still says "Parry" for id 145 "Deflect".
+* Rows: class `StatRow` (`FUN_100fe956`): a `ButtonBase` over a `BorderView` (borders hidden) holding name `TextView` (border left 3), spacer, value `TextView`; the *info* rows (flag 1) add a `PowerbarView`
+  (`GFX_GUI_HOR_BAR_SMALL_EMPTY/BLUE` = ids 0xe0/0xe1) and two arrow `Button_c`; value = `N3Msg_GetSkill(stat, 2)`. Per group two row sets are created: `<g>_view` rows (compact/"minimised" mode, accordion
+  via the group button) and `<g>_group` rows (normal mode). `FUN_100f9552`: in normal mode a group button sets `infoselect` = 1 and `groupselect` = group index (right panel shows the rows);
+  `Minimized` mode toggles the `<g>_view` instead. We build the `_group` rows (name button + value text) as XML at run time (`Gui::add_view_xml`).
+* Other code: remaining IP `remaining_ip` = `N3Msg_GetSkill(0x35, 0)` (`FUN_100f96c2`); "Reset all skills (n)" `FUN_100fa45c`: `n = (GetSkill(0x15c) & 4 == 0) + GetSkill(0x2b3 FullIPRPoints)`, label
+  text.mdb 502/96620988 ("Reset all skills") + " (" n ")", enabled iff n ≥ 1; "Suggested IP distribution" (`suggest_ip`, handler `FUN_100faec0` → `FUN_100fac49`, `RecommendIPUse` `FUN_100f8d69` loads `%sdata/ipdist.xml`) is
+  available until level 20 (inittext). `ipdist.xml` = 14 professions × 75 stats `{levelrange min max pri 0..3}`; parser `stats::parse_ipdist` (tested against the client file).
+* **N3Msg_GetSkill(stat, mode)** [GC 0x10026d66]: mode 0 (and unknown) → stat object `vtable+0x3c(stat, 2)`; 1 → `FUN_100654e1`; 2 → `FUN_1006554c(stat, 1, 0)`; 3 → `FUN_10064800`; 4 → `FUN_1006554c(stat, 1, 1)`.
+  `GetSkillMax` `FUN_100651b5`, `GetSkillCost` `FUN_10061fdb` (float), `GetSkillCostLevel` `FUN_10062398`; they depend on profession (stat 0x3c), level (0x36), breed and `GameData` cost tables (`FUN_1013ecf0`,
+  `FUN_100c4ab1`, `FUN_100c499b`) – **not traced**.
+* Implemented: all of `Skills.xml` with the client skin, group labels, rows with live values from `Zone.stats` (test drives an own `StatIIR`: Strength 6 → 15 and IP 1500 → 1490 change the labels; a
+  foreign dynel's `StatIIR` does not), group selection, row click → details panel (`statName` long name, `statdesc` text 2001, `base`; frame close and `Close`.
+* **UNRESOLVED / not implemented**: the buffed value (modifier container `SimpleChar+0x1bc`, filled by Buff/Appearance messages) is shown equal to base; maximum skill, cost to improve, total cost, the
+  per-row power bars and arrow buttons (need `GetSkillMax`/`GetSkillCost` and the IP-spend messages); "Suggested IP distribution" (`FUN_100fac49`: the IP simulation over `ipdist.xml` priorities);
+  "Save Changes" / "Reset" (outgoing skill messages not identified); whether the "Disabled / Legacy" button is hidden unless a deprecated skill has points (the ctor does not hide it; later signal handlers
+  `FUN_100fa7ba` were not traced); row hover/selected colours (`TEXT_HOVER`/`TEXT_SELECTED` used); window position persistence (`LoadWndConfig`).
+
+### 11.4 Wear window (`WearView_c` `FUN_100e1bc9` GUI 0x100e1bc9, window name `wear_window`, title text.mdb 10000 "Wear")
+A `TabView` with four `MultiListView_c` item grids built by `FUN_100cc1b3` (`InventoryViewBase_c`, base `FUN_100cdb3a`): tabs "Weapon", "Armor"/"Clothes", "Implant" (text.mdb 10000/10003 strings) and a literal
+"Social". Every grid is `SetViewCellCounts(3,5)`, `SetGridIconSpacing(11, 9)` (floats 0x101bee04 / 0x101bfc88) with background `GFX_GUI_WEARVIEW_BG1` (0x1b4) / `BG2` (0x1b5, implants) and slot
+frames `GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED` (54×54). Slot tables (static initialisers `101a5464/101a5684/101a5860/101a5a80`, entries `{id, IPoint(x,y)}`): armor 15 cells row-major `1..15`
+(`100+id-1` = text.mdb 505 "Neck, Head, Back, Right Shoulder, Chest, Left Shoulder, Right Arm, Hands, Left Arm, Right Wrist, Legs, Left Wrist, Right Finger, Feet, Left Finger"), implants 13 cells (`200..212`,
+last at (1,4) = Feet), weapons 15 cells (`300..314` Hud 1-3, Utils 1-3, Right Hand, Deck, Left Hand, Deck 1-6), and the "Social" grid whose cells are ordered `1,15,2,3..14`.
+The client ships the finished tab art `GFX_GUI_WEARVIEW_WEAPON / CLOTHING / IMPLANTS` (192×320, tab strip "Weapons | Clothes | Implants" and the labelled slot frames baked in; tab header x ranges 4–72 /
+72–122 / 122–188, height 17, measured from the PNG): our window shows that art for the selected tab (three `BitmapView`s stacked, `TextButton` hit areas over the strip) in a 5 px border.
+Empty-safe: no item icons are drawn (`FullCharacter` inventory/equipment blocks are not decoded, docs/zone/world.md §2). **UNRESOLVED**: the fourth "Social" tab (art not found; not shown), the window frame/title
+(style, `TabView` strip), default window position, item icons/tooltips (`ACGItem_t` layout).
+
+### 11.5 Inventory window (`InventoryView_c` `FUN_100cc2ca` GUI 0x100cc2ca, `inventory_window`)
+`FUN_100cc2ca(type 0)` reads `inventory_window` window config + `item_position_map` (slots `i` → `IPoint(i%3, i/3)`, 21 positions), builds `FUN_100cc1b3 → ItemContainerView_c` (`FUN_100cdb3a`): a
+`MultiListView_c` with columns Icon / Name / Count (the `InventoryViewMode` pref selects list vs grid), `SetMaxItemCount(0x1e)` = **30 slots** for the character's own inventory (`0x15`/`100`/`0x66`
+for container / bank / reclaim kinds). We draw the grid mode with 30 empty slot frames (`GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED`, spacing 11×9 as the wear grids).
+**UNRESOLVED GUESS**: 5 columns × 6 rows (the inventory's `SetViewCellCounts`/default `InventoryViewMode` were not traced); the list mode; the window frame/position; item contents.
+
+### 11.6 Engine additions (ao-gui)
+`ViewSelector` (children share the bounds, `Gui::select_child(w, name, Some(i))` shows one and collapses the rest), `Gui::show_collapsing`, `Gui::add_view_xml`, **width groups**
+(`width_group` / `width_group_owner`: every member under the owner ancestor gets the widest preferred width of the group; `layout::group_width`), a `ScrollViewChild` with several children
+(the skill window makes the child itself the scroll client, `FUN_100fc18e`: implicit inner view), XML numeric character references (`&#8216;`), `TextDb::label("#cat:id")`.
+Word-wrapped text sizes itself from its current frame, so the skills window is laid out twice after opening.
+
+### 11.7 Reproduce
+`AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac hud_stats` writes `skills-0-initial/1-abilities/2-after-delta/3-nano.png`, `wear-0..2-*.png`, `inventory-wear-both.png`
+(real client XML + skin, stats from the `zone_newchar_ithaca.rec` capture). Other stat users: the HUD bars (`play/hud.rs`), docs/zone.md §6.
+
+## 10. In-world control centre (`play/hud.rs`, `play/hud_bar.rs`, `ao-gui` `expr.rs` / `gui/cc.rs`)
+
+Evidence (GUI.dll, project copy of `/tmp/aomac-ghidra/dsky/gui`):
+* `ControlCenterModule_c` ctor 0x1006c64d; `LoadMainConfig` 0x1006c371 loads `Variables.xml`, `MainPrefs.xml`, `LoginPrefs.xml`, `CharPrefs.xml` (defaults of every `dvalue:cc_*`: all true except `cc_mini_toolbar`; `NumHotbars` 1; windows false) then the user prefs. `SlotPlayerCharacterAlive` 0x1006afed creates the bars once the character is alive.
+* `FUN_1006f098` (`ControlCenterWindow_c`) loads `Views/ControlCenter.xml`, finds the docks by name and fills them: Left/RightWingDock = `CollapsingBitmapView_c` (`GFX_GUI_CONTROLCENTER_WING_LEFT` 0xb5 / `_RIGHT`), LeftBarDock = `LeftBarView_c` 0x1006f7c5 (bg `BOTTOM_LEFT` 0x99, HLayout `NCU`, `used/max` = stats 0xb4/0xb5, spacer, `CRED`, cash = stat 0x3d via `FormatNumeric`), RightBarDock = `RightBarView_c` 0x1006ff09 (`BOTTOM_RIGHT` 0x9a, `DEF`, `Slider_c` AGGDEF −100..100, `AGG`), Left/RightTargetCtrlDock = `CCTargetControl_c` 0x100746ec (HudTarget), RollupControllerDock = `RollupArea` `DockArea_c` (`InitialiseMessage` 0x1006a968: Rect(W−225, 20, W, H−191)). `FUN_1006ee1e` shows each view whose `activate_criteria` holds (`View::Show(CriteriaMonitor_c::Evaluate())`) → `Gui::apply_criteria` + `ao_gui::expr` (`dvalue:`, `stat:`/`s:`, `id:`, `&& || ! == != < > <= >= & | + -`).
+* Bars: `CharacterBar_c` 0x10066af6 = `PowerbarView_c(bg, full, left cap, right cap, Direction 3 = up)` in a style-3 `CharBarWindow_c` 0x1006d7c7; art `GFX_GUI_ACTIONVIEW_{HEALTH,NANO,XP,ALIENXP}BAR[_BACKGROUND|_LEFT|_RIGHT]` (11×107 + 9 px caps = 11×125, matching the saved frames 10×124 inclusive). Values: health stat 27/1 (0x100666b6), nano 214/221 (0x100667a8), XP (stat 0x34 − 0x39)/(0x15e − 0x39), level ≥200 uses 0x23d/0x240 (0x100668aa), alien XP 0x28/0xb2 (0x100669f7, created only if stat 0x185 (Expansion) & 0x18). Tooltip `View::SetToolTip(LDB text (cat 0x2710, key at 0x101b4300…), "%d / %d")` (key strings not resolved: UNRESOLVED, no tooltip set).
+* Menus: `CCMenu` → `ControlMenu_c` 0x10071524, entries `CCMenuEntry_c` 0x100660f2 (attrs `label bgicon invoke active_value criteria button_mode golden_button tooltip tooltip_body sub_script`); entries are stacked vertically, pitch = height + 4 (0x1007086f), invisible (criteria) entries skipped. Sub menus open in a style-3 window (flags 0xd3c) placed by 0x100653b6 (right of the button unless its centre is in the right half, bottom 7 px above the button bottom). Entry = `Button_c` with 3-slice art raised `BUTTON01_*` (0x9b/9d/9f, golden 0x9c/9e/a0), pressed `BUTTON03_*`, hover `BUTTON02_*` (0x10065b4e); `bgicon` 48×22 at layer alpha 0.85; `UpdateBgIconFade` 0x10127bdd: icon tint = 0x20 + (1−fade)·223, label shown when fade > 0.8, fade ±0.075 per `SlotFadeTimer`.
+* Shortcut bar: `ShortcutBarWindow_c` 0x100d94e9 / `ShortcutBarView_c` 0x100d8c12: radio (0x159/0x15a) + `TOOLBAR_CONTROL_H` 32×38 with up/down buttons + 10×1 `MultiListView` of `SLOT_32_CLOSED` (38×38, pitch 36) = 403×38. Config path `…/Containers/ShortcutBar_<n>.xml`.
+* `prefs/NewChar/*` (CCHealthBarConfig frames, ShortcutBar frames, DockAreas, Chat windows) is the install's new-character template; **no DLL contains the string `NewChar`** (searched all DLL/EXE, ASCII and UTF-16), so its consumer is UNRESOLVED; we use its `WindowFrame`s (clamped like `Window::MoveInsideScreen` 0x10154abc) as the first-login layout. Bars at (1075/1085, 794) sit right of the hotbar (662..1064, y 1017), consistent with a coherent default.
+
+Not done / UNRESOLVED: compass window (`CompassWindowConfig` Rect(1800,5,…) art `GFX_GUI_COMPASS*` not ported); `CCMiniToolbar` (hidden by default); AGG/DEF slider is static (default value of `N3Msg_GetAggDef` and dragging not traced); hotbar first-login contents (identities {0xdeb0: 0xc1a5, 0xc1a2, 0xc1a8, 0x14124} slots 0-2,9, `/follow` macro slot 3: no icon source offline) and slot interaction; fade timer period (50 Hz assumed); label-only entry width; RollupArea page windows (dock layout only reserved); bar tooltips; alien bar default position. Shots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac hud::tests` writes `hud-1280.png`, `hud-1920.png`.
