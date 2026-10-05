@@ -29,9 +29,9 @@ const LEN: usize = 26;
 /// Fog / ambient fields start here.
 const AMBIENT: usize = 0x13;
 
-/// `ViewDistance` (far clip plane handed to `VisualFog_t::AddClipPlanes`) is a user setting that is not stored in the data;
-/// this is the value used to turn the fog density into metres.
-pub(super) const VIEW_DISTANCE: f32 = 1000.0;
+/// Far clip plane = `ViewDistance` pref * 1000 m (`FUN_1001fc91` N3 @0x1001fc91, DisplaySystem `AddClipPlanes`); the pref is a 0..1 slider whose
+/// default is 0.8 (`SetDefaultLoginPrefs` GUI @0x10124b33: `InitDefaultFloat("ViewDistance", 0.8, 0, 1)`).
+pub(super) const VIEW_DISTANCE: f32 = 800.0;
 /// Near clip plane = start of the linear fog.
 pub(super) const NEAR: f32 = 0.5;
 /// Day sky (clear) colour, sRGB. The client's sky dome is time-of-day driven (`GfxVisualSkyrise`, not stored per playfield).
@@ -142,7 +142,7 @@ mod tests {
         let e = parse(&mut Rd::new(&fixture([30; 3], [0; 3], 50), 0)).unwrap();
         let s = to_scene(&e, true, None);
         assert!((s.fog_end - (VIEW_DISTANCE - (VIEW_DISTANCE - NEAR - 5.0) * 0.01)).abs() < 1e-3);
-        assert_eq!(s.fog_color, s.sky_color);
+        assert_eq!(s.fog_color, [srgb_to_linear(0.2); 3]);
         assert!(to_scene(&e, false, None).ambient[0] >= 0.01);
     }
 
