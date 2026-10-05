@@ -216,3 +216,41 @@ fn day_to_night_follows_the_authored_pause_clock() {
     assert!(a.set_music_layer(Some("desert\\Day")));
     assert!(a.now_playing().unwrap().to_ascii_lowercase().starts_with("dday"));
 }
+
+/// All 16 combat table layers exist in the real `anarchy.sws`, and the state overrides / restores the district layer.
+#[test]
+fn combat_music_overrides_the_district_layer() {
+    use ao_audio::combat::LAYERS;
+    use ao_audio::CombatSample;
+    let Some(dir) = client() else { return };
+    let project = ao_audio::sws::Project::parse(&std::fs::read(dir.join("cd_image/sound/music/env/anarchy.sws")).unwrap()).unwrap();
+    for n in LAYERS {
+        assert!(project.find_layer(n).is_some(), "layer {n}");
+    }
+    let store = RecordStore::open(&dir).unwrap();
+    let (scene, report) = load_playfield_report(&store, &dir, 566).unwrap();
+    let a = Audio::offline(&dir, 44100);
+    a.set_playfield(Some(PlayfieldAudio::load(&store, 566, &report.sounds).unwrap()));
+    let cam = scene.spawn.unwrap();
+    a.update(1.0, cam, 3240.0);
+    assert_eq!(a.music_layer().as_deref(), Some("desert\\Day"));
+    // fight an equal enemy: state 10 -> battle\Neutral at the next 1 Hz evaluation
+    let me = CombatSample { is_self: true, health_pct: 100, level: 50, ..Default::default() };
+    let foe = CombatSample { is_self: false, health_pct: 100, level: 50, id: 9, ..Default::default() };
+    a.set_combat_sample(&me);
+    a.set_combat_sample(&foe);
+    a.update(1.0, cam, 3240.0);
+    assert_eq!(a.combat_state(), 10);
+    assert_eq!(a.music_layer().as_deref(), Some("battle\\Neutral"));
+    // override name replaces the table layer
+    a.set_combat_music_override(Some("EP_01\\Battle_new"));
+    a.set_combat_sample(&me);
+    a.set_combat_sample(&foe);
+    a.update(1.0, cam, 3240.0);
+    assert_eq!(a.music_layer().as_deref(), Some("EP_01\\Battle_new"));
+    a.set_combat_music_override(None);
+    // the fight is over (no samples): state 0, district layer back
+    a.update(1.0, cam, 3240.0);
+    assert_eq!(a.combat_state(), 0);
+    assert_eq!(a.music_layer().as_deref(), Some("desert\\Day"));
+}

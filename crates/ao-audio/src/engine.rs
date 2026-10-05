@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use crate::combat::{char_sample, CharInfo, CombatSample};
 use crate::decode::{self, Pcm};
 use crate::game::{Library, PlayfieldAudio, Runtime};
 use crate::mixer::{Mixer, Source, Stats, VoiceDesc};
@@ -110,11 +111,13 @@ pub struct Prefs {
     pub fx: f32,
     pub music_on: bool,
     pub music: f32,
+    /// `BattlemusicMode` 0..=3 (0 = no combat music; default 3, `MainPrefs.xml`).
+    pub battlemusic_mode: i32,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { sound_on: true, master: 1.0, fx_on: true, fx: 1.0, music_on: true, music: 1.0 }
+        Prefs { sound_on: true, master: 1.0, fx_on: true, fx: 1.0, music_on: true, music: 1.0, battlemusic_mode: 3 }
     }
 }
 
@@ -201,6 +204,7 @@ impl Audio {
         if let Some(rt) = self.rt().as_mut() {
             rt.fx = if p.sound_on && p.fx_on { p.master * p.fx } else { 0.0 };
             rt.music.volume = if p.sound_on && p.music_on { p.master * p.music } else { 0.0 };
+            rt.combat.set_pref(p.battlemusic_mode);
         }
     }
 
@@ -259,7 +263,35 @@ impl Audio {
         }
     }
 
-    /// Music layer by name (`forest\day`); `None` fades the music out.
+    /// One `SandyInterface_t::CombatUpdate` call (see [`crate::combat`]): feed every character each game frame
+    /// (`ao_audio::char_sample` builds the sample like `Gamecode FUN_10059736`) *before* [`Audio::update`].
+    pub fn set_combat_sample(&self, s: &CombatSample) {
+        if let Some(rt) = self.rt().as_mut() {
+            rt.combat.combat_update(s);
+        }
+    }
+
+    /// [`char_sample`] + [`Audio::set_combat_sample`] for one character.
+    pub fn set_combat_char(&self, c: &CharInfo) {
+        if let Some(s) = char_sample(c) {
+            self.set_combat_sample(&s);
+        }
+    }
+
+    /// Combat music state 0..=16 (`SandyInterface_t+0x94`); 1..=16 override the district layer at its next 1 Hz evaluation.
+    pub fn combat_state(&self) -> u8 {
+        self.rt().as_ref().map_or(0, |r| r.combat.state())
+    }
+
+    /// `SetCombatMusicOverride(name)` (tweak value `CombatMusicOverride`): replaces every combat table layer.
+    pub fn set_combat_music_override(&self, name: Option<&str>) {
+        if let Some(rt) = self.rt().as_mut() {
+            rt.combat.set_override(name);
+        }
+    }
+
+    /// Music layer by name (`forest\day`); `None` fades the music out. Like `PlayMusic`, a combat state 1..=16
+    /// replaces the requested layer.
     pub fn set_music_layer(&self, name: Option<&str>) -> bool {
         let mut g = self.rt();
         let Some(rt) = g.as_mut() else { return false };
@@ -270,7 +302,7 @@ impl Audio {
             },
             None => None,
         };
-        rt.music.signal(layer);
+        rt.music.signal(rt.combat_layer().unwrap_or(layer));
         true
     }
 

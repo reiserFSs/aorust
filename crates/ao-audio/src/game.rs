@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use ao_formats::playfield::{zone_locator, SoundEmitter, ZoneLocator};
 use ao_rdb::RecordStore;
 
+use crate::combat::CombatMusic;
 use crate::district::Districts;
 use crate::engine::Shared;
 use crate::music::{MusicPlayer, Rng};
@@ -167,6 +168,8 @@ pub fn attenuation(d: f32, def_min: f32, def_max: f32, radius: Option<f32>) -> f
 pub(crate) struct Runtime {
     pub lib: Library,
     pub music: MusicPlayer,
+    /// `SandyInterface_t` combat music state (`CombatUpdate`/`Frameprocess`/`ProcessCombatMusic`).
+    pub combat: CombatMusic,
     pf: Option<PlayfieldAudio>,
     /// seconds since the last once-per-second music/district evaluation
     eval: f32,
@@ -190,7 +193,7 @@ pub(crate) struct Runtime {
 impl Runtime {
     pub fn new(sh: &Arc<Shared>, lib: Library, seed: u64) -> Runtime {
         let music = MusicPlayer::new(sh.clone(), lib.project.clone(), seed);
-        Runtime { lib, music, pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), fx: 1.0, weather: [0.0; 7], land_control: false, keepalive: HashMap::new() }
+        Runtime { lib, music, combat: CombatMusic::new(3), pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), fx: 1.0, weather: [0.0; 7], land_control: false, keepalive: HashMap::new() }
     }
 
     /// Emitters currently inside the camera's radius (or in their 2 s hold).
@@ -246,6 +249,7 @@ impl Runtime {
 
     /// Per frame: `cam` scene-space camera position, `day_time` the viewer clock (0..6480 s).
     pub fn update(&mut self, sh: &Shared, dt: f32, cam: [f32; 3], day_time: f32) {
+        self.combat.update(dt);
         let hours = day_time.rem_euclid(6480.0) * HOURS_PER_VIEWER_SECOND;
         let period = Period::at_hour(hours);
         self.eval += dt;
@@ -282,7 +286,8 @@ impl Runtime {
     /// Returns the district's ambience sound id.
     fn evaluate_district(&mut self, period: Period, cam: [f32; 3]) -> Option<u16> {
         let Some(d) = self.pf.as_ref().and_then(|p| p.district(cam)) else {
-            self.music.signal(None);
+            // [INFERENCE] a combat state also applies without a district
+            self.music.signal(self.combat_layer().flatten());
             return None;
         };
         // FUN_100b6d67: storm (max s3..s6 > 0.4) = slot 7, rain (s0 > 0.4) = 6, fog (s1 > 0.4) = 5, else the day period
@@ -301,8 +306,19 @@ impl Runtime {
         if self.land_control && d.lc_lvl.0 != 0 {
             layer = self.lib.project.find_layer("Landcontrol_neutral").unwrap_or(0xffff);
         }
-        self.music.signal((layer != 0xffff && layer < self.lib.project.layers.len()).then_some(layer));
+        let district = (layer != 0xffff && layer < self.lib.project.layers.len()).then_some(layer);
+        self.music.signal(self.combat_layer().unwrap_or(district));
         Some(sound_id)
+    }
+
+    /// `PlayMusic` (SI @0x100062e4): while the combat state is 1..=16 the layer is the `SetCombatMusicOverride` layer
+    /// (when `FindLayerID` finds it and it is not layer 0) or the table layer of the state (`None` = not found = silence).
+    /// Returns `None` outside combat so that the requested (district) layer plays.
+    pub fn combat_layer(&self) -> Option<Option<usize>> {
+        let table = self.combat.layer_name()?;
+        let p = &self.lib.project;
+        let ov = self.combat.override_name().and_then(|n| p.find_layer(n)).filter(|&l| l != 0);
+        Some(ov.or_else(|| p.find_layer(table)))
     }
 
     /// A district change fades the old id's layers out (4 s, the sound definitions' fade-out).
