@@ -18,6 +18,7 @@ pub const PT_SYSTEM: u16 = 1;
 /// Compression control. The client compares the *raw little-endian* short at header offset 2 with 0x7F
 /// (`Connection_t::Receive`/`Send`), so the wire bytes are `7f 00`: 0x7F00 as the big-endian `ptype` read here
 /// (seen live, docs/protocol.md §8).
+pub const PT_N3: u16 = 0xA;
 pub const PT_COMPRESSION: u16 = 0x7F00;
 /// Receive-side hard limit in `Connection_t::Receive`; the size field itself is u16.
 pub const MAX_SIZE: usize = 0xFFFF;

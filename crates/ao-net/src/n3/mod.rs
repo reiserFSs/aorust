@@ -34,6 +34,42 @@ impl N3Header {
     }
 }
 
+/// A decoded zone N3 message.
+#[derive(Debug, Clone, PartialEq)]
+pub enum N3 {
+    World(world::World),
+    Dynel(dynel::Dynel),
+    Misc(misc::Misc),
+    /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
+    Unknown(Vec<u8>),
+}
+
+/// One received N3 frame: header, frame `sender` (the acting dynel, 1 = server) and the decoded body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Message {
+    pub header: N3Header,
+    pub sender: u32,
+    pub body: N3,
+}
+
+/// Decode a `ptype` 0xA frame. `Err` for a malformed/truncated body of a known id.
+pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
+    if f.ptype != crate::frame::PT_N3 {
+        bail!("not an N3 frame (ptype {:#x})", f.ptype);
+    }
+    let (h, mut r) = N3Header::parse(&f.payload)?;
+    let body = if let Some(m) = world::decode(&h, &mut r)? {
+        N3::World(m)
+    } else if let Some(m) = dynel::decode(&h, &mut r)? {
+        N3::Dynel(m)
+    } else if let Some(m) = misc::decode(&h, &mut r)? {
+        N3::Misc(m)
+    } else {
+        N3::Unknown(f.payload[13..].to_vec())
+    };
+    Ok(Message { header: h, sender: f.sender, body })
+}
+
 /// Test helper: the live capture as `(ms since probe start, sent?, raw decoded frame bytes)`.
 #[cfg(test)]
 pub(crate) fn capture() -> Vec<(u32, bool, Vec<u8>)> {
@@ -61,6 +97,21 @@ pub(crate) fn capture_n3() -> Vec<crate::frame::Frame> {
         .collect()
 }
 
+/// Test helper: received N3 frames of `docs/captures/zone_newchar_ithaca.rec` (first seconds of a freshly created character).
+#[cfg(test)]
+pub(crate) fn capture_new_char() -> Vec<crate::frame::Frame> {
+    include_str!("../../../../docs/captures/zone_newchar_ithaca.rec")
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next()?, p.next()?, p.next()?);
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            (dir == "<").then(|| crate::frame::Frame::decode_with(&b, false).ok().flatten().map(|(f, _)| f)).flatten()
+        })
+        .filter(|f| f.ptype == crate::frame::PT_N3)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +124,25 @@ mod tests {
             let (h, _) = N3Header::parse(&f.payload).unwrap();
             assert!(h.target.kind > 0, "{h:?}");
         }
+    }
+
+    #[test]
+    fn every_captured_message_decodes() {
+        for f in capture_n3().iter().chain(capture_new_char().iter()) {
+            let m = decode(f).unwrap_or_else(|e| panic!("{:08X}: {e:#}", u32::from_be_bytes(f.payload[..4].try_into().unwrap())));
+            assert!(!matches!(m.body, N3::Unknown(_)), "undecoded {:08X}", m.header.msg_type);
+        }
+    }
+
+    #[test]
+    fn new_character_starts_in_playfield_4604() {
+        let first = capture_new_char().into_iter().map(|f| decode(&f).unwrap()).find_map(|m| match m.body {
+            N3::World(world::World::Playfield(p)) => Some(p),
+            _ => None,
+        });
+        let p = first.unwrap();
+        assert_eq!((p.playfield_id, p.rdb_playfield().unwrap().instance), (4604, 4604));
+        assert!((p.position[0] - 205.2).abs() < 0.1 && (p.position[2] - 255.9).abs() < 0.2, "{:?}", p.position);
     }
 
     #[test]
