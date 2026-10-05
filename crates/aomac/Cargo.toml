@@ -13,3 +13,6 @@ ao-render.workspace = true
 ao-install.workspace = true
 clap = { version = "4", features = ["derive"] }
 glam = "0.29"
+ao-net.workspace = true
+ao-audio = { path = "../ao-audio" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

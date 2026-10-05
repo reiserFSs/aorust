@@ -1,4 +1,5 @@
 mod demo;
+mod play;
 
 use anyhow::{bail, Context, Result};
 use ao_rdb::RecordStore;
@@ -10,12 +11,24 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(about = "Native macOS Anarchy Online client")]
 struct Cli {
+    /// Defaults to `play` (also what a macOS .app bundle launches).
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Login screen -> character select -> world (the real client).
+    Play {
+        #[arg(long)]
+        client: Option<PathBuf>,
+        /// Debug: skip login and show a built-in character list (offline 3D preview).
+        #[arg(long, hide = true)]
+        fake_charlist: bool,
+        /// Debug: character index selected first with --fake-charlist.
+        #[arg(long, hide = true, default_value_t = 0)]
+        select: usize,
+    },
     /// Download/patch the game client in place.
     Install {
         #[arg(long)]
@@ -118,7 +131,8 @@ fn client_dir(arg: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    match Cli::parse().cmd.unwrap_or(Cmd::Play { client: None, fake_charlist: false, select: 0 }) {
+        Cmd::Play { client, fake_charlist, select } => play::run(client_dir(client)?, fake_charlist.then_some(select)),
         Cmd::Install { client } => ao_install::run(&client_dir(client)?),
         Cmd::View { opts, what } => {
             let dir = client_dir(opts.client.clone())?;
