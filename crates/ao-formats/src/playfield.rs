@@ -106,6 +106,10 @@ pub fn load_playfield_report(store: &RecordStore, _client_dir: &Path, id: u32) -
             }
         }
         report.unique_meshes = placer.cache.values().filter(|m| m.is_some()).count();
+        for (i, zl) in file.lights.iter().enumerate() {
+            let frame = rec.rooms.get(i).map(|r| (statel::ry(r.rot as f32 * std::f32::consts::FRAC_PI_2), r.pos));
+            scene.lights.extend(zl.iter().filter_map(|l| statel::scene_light(l, frame)));
+        }
         props = file.zones.iter().map(|z| z.iter().filter(|s| s.mesh != 0).map(|s| s.pos).collect()).collect();
     }
     if let Some(g) = &grid {
