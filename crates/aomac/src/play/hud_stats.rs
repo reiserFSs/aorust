@@ -78,6 +78,16 @@ impl HudStats {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn window(&self, kind: WindowKind) -> Option<WindowId> {
+        match kind {
+            WindowKind::Skills => self.skills.as_ref().map(|s| s.window),
+            WindowKind::Inventory => self.inventory,
+            WindowKind::Character => self.wear.as_ref().map(|t| t.window),
+            _ => None,
+        }
+    }
+
     /// Kinds whose frame close button was pressed (the caller clears their menu state).
     pub(super) fn take_closed(&mut self) -> Vec<WindowKind> {
         std::mem::take(&mut self.closed)
@@ -444,5 +454,26 @@ mod tests {
         click(&mut s, &mut o, w, "tab_implants");
         assert_eq!(s.hud.wear.as_ref().unwrap().tab, 2);
         png(&mut s, &mut o, "wear-2-implants");
+    }
+
+    /// The real `Hud`: the menu toggles open the three windows, the frame close button (and `Close`) clears the menu state again.
+    #[test]
+    fn hud_opens_and_closes_the_windows() {
+        let Some((mut s, mut o)) = shot() else { return };
+        let mut hud = crate::play::hud::Hud::new(&mut s.gui, &ao_gui::client_dir(), SIZE).unwrap();
+        for k in [WindowKind::Skills, WindowKind::Inventory, WindowKind::Character] {
+            hud.toggle(&mut s.gui, k);
+            assert!(hud.is_open(k) && s.hud.is_open(k) == false, "{k:?}");
+        }
+        hud.update(&mut s.gui, &mut s.zone, 0.016);
+        o.frame(&mut s, 0.016);
+        let skills = hud.stats_window(WindowKind::Skills).unwrap();
+        assert_eq!(s.gui.text(skills, "remaining_ip"), "1500");
+        // frame close button → CloseRequested → the menu state is cleared
+        assert!(hud.event(&mut s.gui, &Event::CloseRequested { window: skills }, &s.zone));
+        assert!(!hud.is_open(WindowKind::Skills) && hud.is_open(WindowKind::Inventory));
+        hud.toggle(&mut s.gui, WindowKind::Inventory);
+        assert!(!hud.is_open(WindowKind::Inventory));
+        hud.close(&mut s.gui);
     }
 }
