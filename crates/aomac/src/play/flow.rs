@@ -468,7 +468,7 @@ impl Play {
     // ---- loading screen ----------------------------------------------------------------------------------------
 
     /// `AFCM::AddProgram(5)`: `ServerLogin3DModule_t` (docs/screens.md §7).
-    pub(super) fn start_loading(&mut self, host: &mut Host) {
+    fn show_loading(&mut self, host: &mut Host) {
         self.hide_login();
         for w in [self.progress_w.take(), self.char_w.take(), self.dialog_w.take().map(|d| d.0)].into_iter().flatten() {
             self.gui.close_window(w);
@@ -495,9 +495,28 @@ impl Play {
                 Err(e) => eprintln!("{}: {e}", path.display()),
             }
         }
+    }
+
+    /// The hand-off (`LoginEvent::ZoneHandoff`): loading screen plus `CharacterLoggedInMessage` -> `PlayStartupMusic`.
+    pub(super) fn start_loading(&mut self, host: &mut Host) {
+        self.show_loading(host);
         if let Some(a) = &self.audio {
             a.play_startup_music(); // CharacterLoggedInMessage -> PlayStartupMusic (timing here: at the hand-off)
         }
+    }
+
+    /// The server moves us to another playfield while we are in the world (`PlayfieldAnarchyFIIR_t` again, or a zone
+    /// redirection first): the old world's interface and dynels go, the loading screen comes back and the same wait for
+    /// `CharInPlay` restarts once the new world appears. [GUESS] the loading screen of a teleport is `ai_loading_login.png`
+    /// again without the startup music: `FlowControlModule_t::TeleportStartedMessage` [GUI 0x1002910e] only locks the input and
+    /// sends AFCM (0x1e, 0x112), the GUI has no other loading image (docs/zone/world.md §10).
+    fn begin_zone_change(&mut self, host: &mut Host) {
+        if let Some(h) = self.hud.take() {
+            h.close(&mut self.gui);
+        }
+        self.zone.reset_world();
+        self.world_frames = 0;
+        self.show_loading(host);
     }
 
     pub(super) fn loading_overlay(&mut self, list: &mut DrawList) {
@@ -522,12 +541,19 @@ impl Play {
 
     /// `PlayfieldAnarchyFIIR_t` arrived: load that playfield in the background (the loading screen stays up until it is ready).
     fn start_world_load(&mut self, id: u32) {
+        self.world_sky = None;
         let (dir, tx) = (self.dir.clone(), self.tx.clone());
+        // the zone clock and game day (`GameTimeIIR_t`) when the burst reached the playfield message; later `GameTime`s resync the live sky
+        let (day_time, day) = (self.zone.day_time(), self.zone.game_day as u32);
         std::thread::spawn(move || {
             let r = RecordStore::open(&dir)
-                .and_then(|store| ao_formats::playfield::load_playfield_at(&store, &dir, id, ao_formats::playfield::DEFAULT_DAY_TIME))
+                .and_then(|store| ao_formats::playfield::load_playfield_on_day(&store, &dir, id, day_time, day))
                 .map(Box::new)
                 .map_err(|e| format!("{e:#}"));
+            match ao_formats::playfield::SkyClock::open(&dir, id) {
+                Ok(c) => drop(tx.send(Bg::Sky(id, c))),
+                Err(e) => eprintln!("live sky of playfield {id}: {e:#}"),
+            }
             let _ = tx.send(Bg::World(id, r));
         });
     }
@@ -560,6 +586,10 @@ impl Play {
                     self.show_login(host);
                     self.show_error(1, 0); // ConnectToLH failed -> ShowError(1,0)
                 }
+                Bg::Sky(id, c) if Some(id) == self.zone.playfield => self.world_sky = c,
+                Bg::Sky(..) => {}
+                // a load that the server has since replaced by another playfield is dropped
+                Bg::World(id, _) if Some(id) != self.zone.playfield => {}
                 Bg::World(id, Ok(scene)) => {
                     eprintln!("playfield {id} loaded");
                     self.world_scene = Some(scene);
@@ -603,13 +633,27 @@ impl Play {
                 LoginEvent::ZoneHandoff { zone_ip, zone_port, character_id } => {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
                     self.zone = zone::Zone::new(character_id);
+                    self.zone.world.start(self.dir.clone(), character_id as i32);
                     self.world_frames = 0;
                     self.start_loading(host);
                 }
-                LoginEvent::ZoneFrame(f) => {
-                    if let zone::ZoneEvent::Playfield(id) = self.zone.on_frame(&f) {
+                LoginEvent::ZoneFrame(f) => match self.zone.on_frame(&f) {
+                    zone::ZoneEvent::Playfield(id) => {
                         eprintln!("zone: playfield {id}");
+                        if self.screen == Screen::InWorld {
+                            self.begin_zone_change(host);
+                        }
                         self.start_world_load(id);
+                    }
+                    // `GameTime_t::Update`: the clock jumps to the server's; the loading world already used the older one
+                    zone::ZoneEvent::Time => host.sky_clock = Some(self.zone.day_time()),
+                    zone::ZoneEvent::None => {}
+                },
+                LoginEvent::ZoneRedirect { zone_ip, zone_port } => {
+                    // the session thread has reconnected (system message 0x3C); the new server's burst follows
+                    eprintln!("zone redirection to {zone_ip}:{zone_port}");
+                    if self.screen == Screen::InWorld {
+                        self.begin_zone_change(host);
                     }
                 }
                 LoginEvent::Disconnected(why) if self.screen != Screen::InWorld => {
@@ -755,6 +799,9 @@ impl Frontend for Play {
             (Screen::CharSelect, InputEvent::Key { key: Key::Down, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(1, host),
             _ => {}
         }
+        if let Some(h) = self.hud.as_mut() {
+            h.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default());
+        }
         for e in self.gui.input(ev) {
             if self.hud.as_mut().is_some_and(|h| h.event(&mut self.gui, &e, &self.zone)) {
                 continue;
@@ -795,6 +842,7 @@ impl Frontend for Play {
         if self.screen == Screen::CharSelect {
             self.tick_preview(dt, host);
         }
+        self.zone.tick(dt);
         match self.fade {
             Fade::In(t) if self.screen == Screen::Loading => {
                 let t = t + dt;
@@ -815,9 +863,12 @@ impl Frontend for Play {
                         _ => ao_render::default_view(&s),
                     };
                     host.set_scene(*s);
+                    // the live sky follows the server's `GameTime` from here on (1 `GameDayTime` second per real second)
+                    let sky = self.world_sky.take().map(|c| c.on_day(self.zone.game_day as u32));
+                    host.live_sky = Some(sky.map(|mut c| ao_render::LiveSky { start: self.zone.day_time(), scale: 1.0, source: Box::new(move |t| c.at(t)) }));
                     host.camera = Camera::look_at(eye, at);
                     self.screen = Screen::InWorld;
-                    match hud::Hud::new(&mut self.gui, self.size) {
+                    match hud::Hud::new(&mut self.gui, &self.dir, self.size) {
                         Ok(h) => self.hud = Some(h),
                         Err(e) => eprintln!("hud: {e:#}"),
                     }
@@ -847,12 +898,15 @@ impl Frontend for Play {
                 }
             }
         }
+        if self.screen == Screen::InWorld {
+            self.zone.world.update(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host);
+        }
         if let Some(a) = &self.audio {
-            a.update(dt, host.camera.pos.to_array(), ao_formats::playfield::DEFAULT_DAY_TIME);
+            a.update(dt, host.camera.pos.to_array(), self.zone.day_time());
         }
         if let Some(h) = self.hud.as_mut() {
             h.resize(&mut self.gui, size);
-            h.update(&mut self.gui, &self.zone, dt);
+            h.update(&mut self.gui, &mut self.zone, dt);
         }
         let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
         let mut list = self.gui.frame(dt);

@@ -211,3 +211,74 @@ Evidence (GUI.dll, project copy of `/tmp/aomac-ghidra/dsky/gui`):
 * `prefs/NewChar/*` (CCHealthBarConfig frames, ShortcutBar frames, DockAreas, Chat windows) is the install's new-character template; **no DLL contains the string `NewChar`** (searched all DLL/EXE, ASCII and UTF-16), so its consumer is UNRESOLVED; we use its `WindowFrame`s (clamped like `Window::MoveInsideScreen` 0x10154abc) as the first-login layout. Bars at (1075/1085, 794) sit right of the hotbar (662..1064, y 1017), consistent with a coherent default.
 
 Not done / UNRESOLVED: compass window (`CompassWindowConfig` Rect(1800,5,…) art `GFX_GUI_COMPASS*` not ported); `CCMiniToolbar` (hidden by default); AGG/DEF slider is static (default value of `N3Msg_GetAggDef` and dragging not traced); hotbar first-login contents (identities {0xdeb0: 0xc1a5, 0xc1a2, 0xc1a8, 0x14124} slots 0-2,9, `/follow` macro slot 3: no icon source offline) and slot interaction; fade timer period (50 Hz assumed); label-only entry width; RollupArea page windows (dock layout only reserved); bar tooltips; alien bar default position. Shots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac hud::tests` writes `hud-1280.png`, `hud-1920.png`.
+
+## 13. Tooltips (`ao-gui` `gui/tooltip.rs`) and the target controls (`play/hud_target.rs`)
+
+### 13.1 Tooltips (GUI.dll)
+Evidence (decompiled GUI.dll, all addresses `0x1xxxxxxx`):
+* **Source of the texts**: `View::SetToolTip(title, body)` 0x1014dadf stores two strings in the view's extra data (`+0x140` title, `+0x15c` body); `View::GetToolTipText`
+  0x1014db1a returns them (or asks the virtual `ProvideToolTipText` 0x1014a750, which is `false` for plain views; `PowerBar_t::ToolTipCallback` 0x10020686,
+  `MultiListView_c::SlotProvideItemTooltip` 0x100092ce and `TextRenderer_c::ProvideToolTipText` 0x1016317a are the dynamic providers). XML views carry `tooltip="#Key"` /
+  `tooltip_body="#Key"` (ActionMenu entries, `OptionPanel/Root.xml`); `#` keys resolve through text.mdb like every other attribute.
+* **Timing**: `WindowController_c::UpdateToolTip(false)` 0x101577fd (mouse moved) walks the *topmost window under the pointer* (`FUN_10156d66`: children from the top child
+  down, then the view itself) to the deepest view whose `GetToolTipText` is non-empty; if it differs from the stored view (`+0xa0`) the shown tip is closed; then the texts
+  are stored and the deadline `timeGetTime() + 500` ms re-armed — **every mouse move over a tipped view restarts the 500 ms rest timer**. `WindowController_c::Render`
+  0x101572a1 creates `new ToolTip_c(title, body)` when the deadline passed, closing a tooltip that is still shown (so after the pointer rests again the tooltip jumps to the new
+  position). `HandleMouseDown/Up` 0x10157ab0 / 0x10157c34 call `UpdateToolTip(true)` (close + reset); `ToolTip_c::SlotGlobalMouseDown` 0x101499ab hides it on a click outside its
+  frame. `InputConfig_t::GetTooltipTime` (0x1000b5d2, a float at `InputConfig_t+0x20`) has no caller in the paths above (item tooltips): not used here.
+* **Window**: `ToolTip_c::ToolTip_c` 0x10149a0d = `Window(Rect(0,0,10,10), "", "info_window", style 2, flags 0x105)`; style 2 draws `BorderView_c::SetGfx(…, 0x1bf)` =
+  `GFX_GUI_WINDOW_BACKGROUND` (black, 15×15) at the layer-2 alpha **0.85** (`WndBorder::SetBorderGfx` 0x1015a82d) and no frame/buttons; the view is `InfoContainer_c`
+  (`FUN_101492c6`, view name `info_view`), inset by 1 px on every side when a body exists (`Rect::Resize(1,1,-1,-1)`).
+* **InfoContainer layout** (inclusive extents, padding `p = 1` without a body, `p = 2` with one): title `TextView_c("title_view", font 5 = NORMAL)`, body `TextView_c("text_view",
+  NORMAL)` with HTML flags `0x60` (MULTILINE | WORD_WRAP) and `SetAspectRatio(2.0)` (wrap width `ftol(sqrt(textArea) · 2)`, at least the title width: `TextRenderer_c::
+  CalculatePreferredSize` 0x101623ea). Preferred size: `x = max(titleW, bodyW) + 4p`, `y = titleH + 4p` (no body) or `titleH + bodyH + 1 + 7p`. `ViewSurface_c`s
+  (`ViewSurface_c(Rect, flags)`, flags = anchoring: bit0 left, bit1 right, bit2 top, bit3 bottom, `_LayoutSelf` 0x101509e1): four edge lines of thickness `p` (flags 0xd left, 7 top,
+  0xe right, 0xb bottom) in the **HOVER** colour, plus – with a body – a separator line `p` thick under the title (flags 7, HOVER), without a body a solid black fill (flags 0xf).
+  Title frame `(2p, 2p, R−2p, titleH+2p−1)`, body frame `(2p, titleH+5p, R−2p, B−2p)`. Without a body the title is drawn in the DEFAULT colour
+  (`TextRenderer_c::SetDefaultColor`), with a body both texts use the default text colour (UNRESOLVED GUESS: TEXT).
+* **Placement** `Window::MoveToMouse(false)` 0x10154e16: `x = mouse.x + 16`, or `mouse.x − (width+1)` if `mouse.x ≥ screenW/2`; `y = mouse.y + 32`, or `mouse.y − (height+1)` if
+  `mouse.y ≥ screenH/2`; then `MoveInsideScreen`.
+* Not decided from the binary (UNRESOLVED): the window size beyond the view (`pref + (2,2)` hits the argument list of `Window::ResizeTo` only through a mangled decompile; we use
+  `pref` + 2 only with a body, since the view is inset by 1), the title colour with a body, the sqrt operand of the aspect rule (we use unwrapped width × line height).
+
+Engine API (`ao_gui::Gui`): `tooltip=`/`tooltip_body=` on any XML element → `View::tip`; `set_tooltip(window, view, title, body)` / `set_tooltip_in(handle, …)` for dynamic
+texts; `set_screen_size` (default: largest visible window); `show_tooltip(title, body)` shows a `ToolTip_c` at the pointer immediately (`tooltip_shown`, `tooltip_rect` for
+tests). The timer runs on `Gui::frame(dt)`; `input()` feeds `UpdateToolTip`. Tests: `crates/ao-gui/tests/tooltip.rs` (500 ms rest, closing, placement, flip). Reproduce:
+`cargo run --release -p ao-gui --example dump_view -- LoginWindow out.png --size 640x400 --tooltip "Skills|Body text" --mouse 100,60`.
+
+### 13.2 Target selection (GUI.dll `TargetingModule_t`, `InputConfig_t`)
+* The selection is **client-local**: `TargetingModule_t::SetTarget(id, forced)` 0x100257b0 → `InputConfig_t::SetCurrentTarget` 0x10019df0 (identity at `InputConfig_t+0xc0`,
+  `GlobalSignals` emit) + `AFCM::Send(0x13, 0x126, id)` (received by `TargetingModule_t::SetTargetMessage` 0x10025c14 and `N3InterfaceModule_t::SetTargetMessage` (Interfaces
+  0x1000907a) → `n3EngineClientAnarchy_t::N3Msg_SelectedTarget` Gamecode 0x10017728 → `n3Camera_t::SetSelectedTarget` N3 0x10020358) + the selection `Indicator_t` (`FUN_100255be`,
+  not for targets with skill-flag 0x400) + the tip events `OnSelecting` / `OnSelectingNPC` / `OnSelectingPlayer`. **Nothing is sent to the server.**
+  `FrameProcess` 0x10025fa4 drops the target when the dynel disappeared (`N3Msg_GetPos` fails or `N3Msg_GetParent` ≠ 0) unless it was forced; `RemoveTarget` 0x2598b remembers it
+  as `m_cLastTarget`; `SelectSelf` 0x100259b1: no target → self; target is self → previous target; else remember + self.
+* Keys (GUI.dll default hotkeys, `InputConfig_t::SetDefaultHotkeys` 0x1001ad88 text): `TAB` next hostile, `SHIFT+TAB` previous hostile, `CTRL+TAB` next friendly,
+  `CTRL+SHIFT+TAB` previous friendly (`COMMAND_{NEXT,PREV}_{HOSTILE,FRIENDLY}_TARGET` → `N3Msg_GetCloseTarget(current, friendly, forward)`; the ordering is [INFERENCE]: by distance).
+* The pick: `InputConverterModule_t::InputGameSubmodeActionViewONMessage` 0x1001bcae → `N3Msg_SetMousePos` (Gamecode 0x1001613b) → `n3Camera_t::SetMousePos` (N3 0x10020571:
+  ray `(tan(fov/2)·x, tan(fov/2)/aspect·y, 1)` through the camera matrix, scaled by `VisualCamera_t::GetLengthOfViewcone`, cast into the collision world) → identity under the
+  mouse → `InputConfig_t::CheckObjectUnderMouse` 0x10019f00 picks the mouse pointer (`Pointer_e` 1–5 by `GetSkill(0x1e)` flags / NPC / `CanAttack`; cursor art not ported).
+  The mouse *click* → `SetTarget` dispatch itself was not found (the default hotkey list has no mouse command except debug ones; `HandleMouseDown` only emits `GlobalSignals`), so
+  UNRESOLVED: which signal turns a left click into `SetTargetMessage`, and any click-on-ground deselect. We select on a left click without drag, and a click on empty ground keeps the target.
+  We have no collision meshes of the dynels: `hud_target::pick` intersects the ray with one capsule per dynel ([`CAPSULE_HEIGHT`] 1.8 m, [`CAPSULE_RADIUS`] 0.5 m, UNRESOLVED GUESS).
+* The ground **selection indicator** and the hover pointer change need renderer support (ground decal / cursor art) and are not implemented.
+
+### 13.3 Target controls (`CCTargetControl_c`, GUI 0x100746ec; `play/hud_target.rs`)
+* `ControlCenterModule_c::CreateTargetMenus` 0x1006a0d4 builds two controls (friendly = `0x154` flag 0, hostile = 1) twice: the **dock** version (`LeftTargetCtrlDock` /
+  `RightTargetCtrlDock` of `ControlCenter.xml`, `Rect(10,0,0,36)`/`Rect(0,0,10,36)`) = `HLayout[left arrow 8×41 (0x93/0x95/0x94), target button 48×48 toggle (0xaa/0xac/0xab) with a
+  centred icon (friendly 0xae `TARGET_ICON_SELF` 38², hostile 0xad `…_OTHER` 40²), right arrow (0x96/0x98/0x97)]` (`Button_c::SetGfx(state 0 normal, 1 pressed = …STATE3, 2 hover =
+  …STATE2)`), and the **bar window** `CCFriendlyHealthBar` / `CCHostileHealthBar` (`CharBarWindow_c`, style 3, flags 0xe3c, criteria `dvalue:cc_section1 &&
+  dvalue:cc_{friendly,hostile}_health_bar`) at `y = 5`, `x = (screenW − 192)·{½·½, ½·3/2} − width/2`, bar width `(screenW − 192)/2 − 50` (verified: the install's `prefs/NewChar/Prefs.xml`
+  frames `Rect(25,5,1158,65)` / `Rect(1208,5,2341,52)` are exactly these for a 2558 px screen).
+* Bar window = `TargetHealthBar_c` (`FUN_10073598`; surfaces `GFX_GUI_TARGET_HB_LEFT/RIGHT` 9×11 caps tinted DEFAULT, `…_BACKGROUND` tinted DEFAULT, `…_SLIDER` untinted, repeating
+  16 px, covering `ratio` of the background) above a `TargetHeader_c` (`FUN_10073884`: corner-only `BorderView` `GFX_GUI_CC_TARGET_FRAME_TL/TR/BL/BR`, colour DEFAULT, bold caption
+  `<center>Selection</center>` — the other captions "Nano Target", "Fighting Target", "Nano / Fighting Target" belong to the NCU/fight variants — and the target's name in white, from
+  `N3Msg_GetName` + `String::StripSpecialChars`). `FUN_10072e49` tints the caps `0xff2222` when `+0x161`/`+0x162` is set (writers not identified: UNRESOLVED, caps stay DEFAULT).
+* Which control shows a target: attackable → hostile, otherwise friendly. Attackable (`FUN_100744ae`): NPC and `Side` (stat 0x21) differs from the own side; a player needs
+  `N3Msg_CanAttack` (not modelled). The dock arrows are bound to `TargetingModule_t::Get{Next,Prev}{Friendly,Hostile}TargetMessage` ([INFERENCE]), the friendly button to `SelectSelf`;
+  the hostile button's action (`FUN_1007303d`) and the target-of-target button (`FUN_10075342`, "Fighting Target:" in 0xff4444, `N3Msg_GetTargetTarget`), the NCU windows
+  (`NanoTargetNCUWindowConfig`, `FightTargetNCUWindowConfig`) are not implemented (UNRESOLVED).
+* Data: `Zone.target` (instance id), `DynelState { side, level, health, max_health }` (from `SimpleCharFullUpdate` and other characters' `StatIIR_t`). Tests in
+  `hud_target.rs` (ray math, capsule pick, cycling, `SelectSelf`, windows follow the selection, `AOMAC_SHOT_DIR` screenshots `target-hostile.png`, `target-friendly.png`).
+
+**Known gap (13.3)**: the dock arrows are not visible. `gfx_ids.txt` holds the AFCM `DynamicID_t` names truncated to 40 characters, so ids 0x93–0x95 / 0x96–0x98 (`…BIGARROW_{LEFT,RIGHT}_STATE1..3`) have three identical names and `GfxSet::size(GfxId(0x93))` is (0,0); the full uvgi names only exist under appended ids. Fix for the GuiEngine owner: map the n-th table id of a truncated duplicate to the n-th full uvgi name in sorted order (STATE1, STATE2, STATE3; consistent with `SetGfx(1, …STATE3 = pressed, 2, …STATE2 = hover)`). The target button, icons and health bars use unaffected ids.

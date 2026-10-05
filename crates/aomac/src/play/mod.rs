@@ -2,11 +2,21 @@
 //! 3D `LoginWorld_c` backdrop and `CharacterViewer_c` preview, loading screen, then the zone's playfield.
 //! The GUI is `ao_gui` (the client's own view XML + skin); the network is `ao_net::client`.
 
+mod avatar;
+mod camera;
+mod chat;
+mod controls;
 mod create;
 mod delete;
+mod dynels;
 mod flow;
-mod prefs;
 mod hud;
+mod hud_bar;
+mod hud_map;
+mod hud_stats;
+mod hud_target;
+mod movement;
+mod prefs;
 mod preview;
 mod zone;
 
@@ -43,6 +53,8 @@ enum Bg {
     Connected(u32, Result<LoginSession, String>),
     Backdrop(Result<Box<Scene>, String>),
     World(u32, Result<Box<Scene>, String>),
+    /// The live sky source of playfield `id` (`None`: indoor / no tweak script), sent just before its [`Bg::World`].
+    Sky(u32, Option<ao_formats::playfield::SkyClock>),
     /// The character-creation world (`charactercreation_*.abiff` + connectors), decoded in the background.
     CcWorld(Result<Box<CcWorld>, String>),
 }
@@ -128,6 +140,8 @@ struct Play {
     pending_fake: Option<usize>,
     pending_user: String,
     world_scene: Option<Box<Scene>>,
+    /// Live sky of the loading/loaded playfield, installed in the viewer when the world appears.
+    world_sky: Option<ao_formats::playfield::SkyClock>,
     time: f32,
     // character creation / deletion
     /// The delete window kept open below its `MatchError` box (the original's `DialogBox_c::Go` is modal on top of it).
@@ -138,9 +152,9 @@ struct Play {
     /// `SetLoadingScreen(n)`: the next loading screen is `welcome_to_rubika.jpg`.
     welcome_image: bool,
     loading_name: &'static str,
-}
     /// The in-world interface (`ControlCenterModule_c`), created when the world appears.
     hud: Option<hud::Hud>,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum DialogKind {
@@ -209,14 +223,15 @@ impl Play {
             pending_fake: fake_charlist,
             pending_user: String::new(),
             world_scene: None,
+            world_sky: None,
             time: 0.0,
             cc: None,
             cc_world: None,
             char_list: CharacterList::default(),
             welcome_image: false,
             loading_name: "",
-            text,
             hud: None,
+            text,
             gui,
             dir,
         })
