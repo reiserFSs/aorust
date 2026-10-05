@@ -29,13 +29,27 @@ pub struct Camera {
     pub pos: Vec3,
     pub yaw: f32,
     pub pitch: f32,
+    /// Rotation about the view axis, radians; positive turns the up vector towards [`Camera::right`] (0 = horizon level).
+    pub roll: f32,
 }
 
 impl Camera {
     pub fn look_at(eye: Vec3, at: Vec3) -> Self {
         let d = (at - eye).normalize_or_zero();
         let d = if d == Vec3::ZERO { -Vec3::Z } else { d };
-        Self { pos: eye, yaw: d.x.atan2(-d.z), pitch: d.y.asin() }
+        Self { pos: eye, yaw: d.x.atan2(-d.z), pitch: d.y.asin(), roll: 0.0 }
+    }
+    /// Camera at `eye` looking along `forward` with the given `up` (full orientation; `up` need not be orthogonal).
+    pub fn look_to_up(eye: Vec3, forward: Vec3, up: Vec3) -> Self {
+        let mut c = Self::look_at(eye, eye + forward);
+        let level = c.right().cross(c.forward());
+        c.roll = up.dot(c.right()).atan2(up.dot(level));
+        c
+    }
+    /// View-space up: the horizon-level up turned by `roll` about the view axis.
+    pub fn up(&self) -> Vec3 {
+        let (r, f) = (self.right(), self.forward());
+        r.cross(f) * self.roll.cos() + r * self.roll.sin()
     }
     pub fn forward(&self) -> Vec3 {
         Vec3::new(self.yaw.sin() * self.pitch.cos(), self.pitch.sin(), -self.yaw.cos() * self.pitch.cos())
@@ -942,7 +956,7 @@ impl Renderer {
         }
         let far = self.lens.far.unwrap_or_else(|| (env.fog_end * 1.1).max(50.0));
         let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
-        let vp = Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far) * Mat4::look_to_rh(cam.pos, cam.forward(), Vec3::Y);
+        let vp = Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far) * Mat4::look_to_rh(cam.pos, cam.forward(), cam.up());
         let v4 = |c: [f32; 3], w| Vec4::new(c[0], c[1], c[2], w).to_array();
         let w = ao_scene::wave_curves(self.time);
         let g = Globals {
@@ -1216,6 +1230,16 @@ fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: 
 
 #[cfg(test)]
 mod sky_tests {
+    #[test]
+    fn look_to_up_reproduces_forward_and_up() {
+        for (f, u) in [(Vec3::new(0.3, -0.2, -1.0), Vec3::new(0.5, 1.0, 0.1)), (Vec3::new(-1.0, 0.1, 0.4), Vec3::new(0.0, -1.0, 0.0))] {
+            let c = Camera::look_to_up(Vec3::ZERO, f, u);
+            let (f, u) = (f.normalize(), (u - f.normalize() * u.dot(f.normalize())).normalize());
+            assert!((c.forward() - f).length() < 1e-5 && (c.up() - u).length() < 1e-5, "{c:?}");
+        }
+        assert_eq!(Camera::look_at(Vec3::ZERO, -Vec3::Z).up(), Vec3::Y);
+    }
+
     use super::*;
     use ao_scene::{Instance, Mesh, SkySpin, Submesh, Texture, TextureKey, Vertex, IDENTITY};
 

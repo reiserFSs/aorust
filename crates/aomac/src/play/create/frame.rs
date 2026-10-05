@@ -44,8 +44,7 @@ impl Play {
         let pose = c.rig.pose();
         let f = pose.forward();
         let eye = ao_to_render(pose.pos);
-        let at = ao_to_render([pose.pos[0] + f[0], pose.pos[1] + f[1], pose.pos[2] + f[2]]);
-        host.camera = Camera::look_at(Vec3::from(eye), Vec3::from(at));
+        host.camera = Camera::look_to_up(Vec3::from(eye), Vec3::from(ao_to_render(f)), Vec3::from(ao_to_render(pose.up())));
         host.lens = Some(Lens { fov: pose.fov_deg.to_radians(), horizontal: true, near: CC_NEAR, far: Some(CC_FAR) });
         self.cc_draw(c, dt, &mut pre, &mut post);
         (pre, post)

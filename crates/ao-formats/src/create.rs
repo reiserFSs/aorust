@@ -185,6 +185,12 @@ impl Pose {
         let [x, y, z, w] = self.rot;
         [2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)]
     }
+
+    /// Up vector (+Y rotated by the quaternion); differs from +Y when the authored camera rolls.
+    pub fn up(&self) -> [f32; 3] {
+        let [x, y, z, w] = self.rot;
+        [2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x)]
+    }
 }
 
 impl From<&CameraPose> for Pose {
