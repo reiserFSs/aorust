@@ -12,6 +12,11 @@ use crate::decode::Pcm;
 /// (`AIL_open_stream`) are outside this pool.
 pub const MAX_VOICES: usize = 13;
 
+/// Stream handles left of Miles' 16 (`AIL_set_preference(3, 16)` @SI 0x10007c5a) after the 13 SFX samples: `SIMPlayer_t`
+/// keeps exactly three `AIL_open_stream` handles (cur / fading old / preloaded next, this+0x30..0x38). A fourth
+/// `AIL_open_stream` returns 0 (`FUN_10009ed5` @SIM 0x10009ed5), i.e. the stream is not played.
+pub const MAX_STREAMS: usize = 3;
+
 /// Where a voice's samples come from.
 pub enum Source {
     Sample(Arc<Pcm>),
@@ -85,10 +90,12 @@ impl Mixer {
     /// Starts a voice with the client's `AllocateChannel` rule (SI @0x10007d5c): finished voices are reclaimed first
     /// (ours leave the list when they end); when all 13 handles are busy a request of priority `r` ends one playing
     /// non-looping voice of priority `p`, trying `p = 2` down to `r` (looping voices are never stolen, a request of
-    /// priority above 2 never steals). Nothing stealable: not played (id 0).
+    /// priority above 2 never steals). Nothing stealable: not played (id 0). Stream voices (priority `None`) only
+    /// have [`MAX_STREAMS`] handles: beyond that nothing is played (id 0), nothing is stolen.
     pub fn play(&mut self, d: VoiceDesc) -> u64 {
-        if let Some(r) = d.priority {
-            if self.voices.iter().filter(|v| v.priority.is_some() && !v.done).count() >= MAX_VOICES {
+        match d.priority {
+            None if self.voices.iter().filter(|v| v.priority.is_none() && !v.done).count() >= MAX_STREAMS => return 0,
+            Some(r) if self.voices.iter().filter(|v| v.priority.is_some() && !v.done).count() >= MAX_VOICES => {
                 let victim = (r..=2).rev().find_map(|p| self.voices.iter().position(|v| v.priority == Some(p) && !v.looping && !v.done));
                 match victim {
                     Some(i) => {
@@ -97,6 +104,7 @@ impl Mixer {
                     None => return 0,
                 }
             }
+            _ => {}
         }
         let id = self.next_id;
         self.next_id += 1;

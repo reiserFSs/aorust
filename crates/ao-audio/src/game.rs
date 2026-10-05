@@ -340,7 +340,7 @@ impl Runtime {
                 if voice == 0 {
                     continue;
                 }
-                let timers = def.children.iter().map(|_| self.rng.unit() * (def.interval_max - def.interval_min).max(0.0) + def.interval_min).collect();
+                let timers = def.children.iter().map(|c| self.lib.sounds.get(*c).map_or(f32::MAX, |c| self.rng.unit() * (c.interval_max - c.interval_min).max(0.0) + c.interval_min)).collect();
                 self.ambient.insert(key, Ambient { voice, timers });
                 continue;
             }
@@ -403,15 +403,20 @@ impl Runtime {
                 st.started = true;
                 st.last_child = usize::MAX;
                 st.timers = def.children.iter().map(|c| self.lib.sounds.get(*c).map_or(f32::MAX, |c| c.interval_min + self.rng.unit() * (c.interval_max - c.interval_min).max(0.0))).collect();
-                if let Some(p) = def.file.as_deref().and_then(|f| sh.resolve(f)) {
-                    st.parent = sh.play_sample(&p, level, true, def.priority);
-                }
+                // (the parent loop is started below, where it is also retried)
                 if def.play_all {
                     for c in def.children.iter().filter_map(|c| self.lib.sounds.get(*c)) {
                         if let Some(p) = c.file.as_deref().and_then(|f| sh.resolve(f)) {
                             sh.play_sample(&p, level, false, c.priority);
                         }
                     }
+                }
+            }
+            // `AllocateChannel` found nothing (all 13 handles busy, none stealable): not played, asked again next frame
+            // while the sound is active
+            if st.parent == 0 {
+                if let Some(p) = def.file.as_deref().and_then(|f| sh.resolve(f)) {
+                    st.parent = sh.play_sample(&p, level, true, def.priority);
                 }
             }
             {
@@ -502,5 +507,69 @@ mod tests {
         assert!((attenuation(7.5, 0.0, 15.0, None) - 0.5).abs() < 1e-6);
         // min >= max: full level inside the radius, silent beyond
         assert_eq!(attenuation(10.0, 15.0, 15.0, Some(20.0)), 1.0);
+    }
+
+    fn client() -> Option<std::path::PathBuf> {
+        let d = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
+        d.join("cd_image/rdb.db").exists().then_some(d)
+    }
+
+    fn runtime(dir: &std::path::Path) -> (Arc<Shared>, Runtime) {
+        let sh = Shared::new(dir.join("cd_image/sound"), 44100);
+        let lib = Library::load(&sh.root).unwrap();
+        let rt = Runtime::new(&sh, lib, 1);
+        (sh, rt)
+    }
+
+    /// `AllocateChannel` with every handle busy and nothing stealable returns NULL; the emitter's next frame asks again
+    /// (it used to be armed once and never retried while the camera stayed inside).
+    #[test]
+    fn emitter_retries_when_the_pool_is_full() {
+        use crate::decode::Pcm;
+        use crate::mixer::{Source, VoiceDesc};
+        let Some(dir) = client() else { return };
+        let store = ao_rdb::RecordStore::open(&dir).unwrap();
+        let (_, report) = ao_formats::playfield::load_playfield_report(&store, &dir, 566).unwrap();
+        let (sh, mut rt) = runtime(&dir);
+        let pf = PlayfieldAudio::load(&store, 566, &report.sounds).unwrap();
+        let idx = pf.emitters.iter().position(|e| e.sound_id == 1000522882).expect("turbine emitter");
+        let pos = pf.emitters[idx].pos;
+        rt.set_playfield(&sh, Some(pf));
+        let silence = Arc::new(Pcm { rate: 44100, channels: 1, samples: vec![0.0; 44100] });
+        let pool: Vec<u64> = (0..13).map(|_| sh.mixer().play(VoiceDesc { priority: Some(0), looping: true, ..VoiceDesc::new(Source::Sample(silence.clone())) })).collect();
+        assert!(pool.iter().all(|v| *v != 0));
+        for _ in 0..20 {
+            rt.tick_emitters(&sh, 1.0, pos);
+        }
+        assert!(rt.emitters[idx].started);
+        assert_eq!(rt.emitters[idx].parent, 0, "pool full: not played");
+        sh.mixer().stop(pool[0]);
+        rt.tick_emitters(&sh, 0.1, pos);
+        assert_ne!(rt.emitters[idx].parent, 0, "retried once a handle is free");
+    }
+
+    /// Ambience child one-shots are first armed with the child's own interval (re-arming already did).
+    #[test]
+    fn ambience_children_first_arm_uses_their_own_interval() {
+        let Some(dir) = client() else { return };
+        let (sh, mut rt) = runtime(&dir);
+        let mut checked = 0;
+        for id in 0u16..120 {
+            let Some(def) = rt.lib.sounds.get(sound_id(&format!("SM_Sandy_Env_BackgroundDay_{id}"))).cloned() else { continue };
+            if def.children.is_empty() || def.file.as_deref().and_then(|f| sh.resolve(f)).is_none() {
+                continue;
+            }
+            rt.want = Some(id);
+            rt.ambient.clear();
+            rt.tick_ambience(&sh, 0.1, 15.0 * HOUR);
+            let Some(a) = rt.ambient.get(&(id, Period::Day)) else { continue };
+            for (tm, c) in a.timers.iter().zip(&def.children) {
+                let Some(c) = rt.lib.sounds.get(*c) else { continue };
+                assert!((c.interval_min..=c.interval_max.max(c.interval_min)).contains(tm), "id {id}: {tm} outside the child's {}..{}", c.interval_min, c.interval_max);
+                checked += (c.interval_min != def.interval_min || c.interval_max != def.interval_max) as usize;
+            }
+            sh.mixer().stop_all();
+        }
+        assert!(checked > 0, "some ambience child has an interval different from its parent's");
     }
 }

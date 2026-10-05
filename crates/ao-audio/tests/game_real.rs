@@ -101,9 +101,11 @@ fn pause_track_plays_then_pauses() {
     let a = Audio::offline(&dir, 44100);
     assert!(a.set_music_layer(Some("forest\\Day")));
     let (mut first_silence, mut resumed) = (None, None);
+    let mut buf = vec![0f32; 4410 * 2]; // the device drains the mixer: finished fades release their stream handles
     for i in 0..8000 {
         let t = i as f32 * 0.1;
         a.update(0.1, [0.0; 3], 3240.0);
+        a.render(&mut buf);
         let playing = a.now_playing().is_some();
         if !playing && first_silence.is_none() && t > 5.0 {
             first_silence = Some(t);
@@ -182,4 +184,35 @@ fn weather_slot_prefs_and_keepalive() {
     }
     assert_eq!(levels[10], 1);
     assert_eq!(levels[79], 0, "gone after the keep-alive expired");
+}
+
+/// Live day -> night at 566 (`desert\Day` -> `desert\Night`): the authored data has no Day -> Night transition, so the
+/// request waits (SIM `FUN_10008d2e`, force 0); the Day track's pause clock (94 bpm, 188 beats = 120 s) runs from the
+/// start of Day and is not restarted by the request, so the music falls silent at ~120 s, and a request that arrives in
+/// that silence starts the requested layer's entry sample at once (`SignalEvent` -> `Play(NULL, true)`).
+#[test]
+fn day_to_night_follows_the_authored_pause_clock() {
+    let Some(dir) = client() else { return };
+    let a = Audio::offline(&dir, 44100);
+    assert!(a.set_music_layer(Some("desert\\Day")));
+    let mut buf = vec![0f32; 4410 * 2];
+    let mut silent_at = None;
+    for i in 0..1500 {
+        let t = i as f32 * 0.1;
+        if i == 300 {
+            assert!(a.set_music_layer(Some("desert\\Night"))); // 30 s into Day
+        }
+        a.update(0.1, [0.0; 3], 3240.0);
+        a.render(&mut buf);
+        match a.now_playing() {
+            Some(n) if silent_at.is_none() => assert!(n.to_ascii_lowercase().starts_with("dday"), "{t}: {n}"),
+            None if silent_at.is_none() && t > 5.0 => silent_at = Some(t),
+            _ => {}
+        }
+    }
+    let s = silent_at.expect("Day span ends");
+    assert!((118.0..130.0).contains(&s), "silence ~120 s after Day started (not 120 s after the request): {s}");
+    assert!(a.now_playing().is_none(), "still silent at 150 s");
+    assert!(a.set_music_layer(Some("desert\\Day")));
+    assert!(a.now_playing().unwrap().to_ascii_lowercase().starts_with("dday"));
 }

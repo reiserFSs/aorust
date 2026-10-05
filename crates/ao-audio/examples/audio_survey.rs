@@ -1,4 +1,4 @@
-//! Decodes every audio file below `<client>/cd_image/sound` and prints a survey (`audio_survey <client_dir>`).
+//! Decodes every audio file below `<client>/cd_image/sound` and prints a survey (`audio_survey [client_dir]`, default `~/Games/ProjectRubiKa/client`).
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -31,7 +31,12 @@ fn codec(f: &Path) -> String {
 }
 
 fn main() {
-    let root = PathBuf::from(std::env::args().nth(1).expect("client dir")).join("cd_image/sound");
+    let client = std::env::args().nth(1).map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Games/ProjectRubiKa/client")));
+    let root = client.unwrap_or_default().join("cd_image/sound");
+    if !root.is_dir() {
+        eprintln!("audio_survey: {} not found; usage: audio_survey [client_dir] (default ~/Games/ProjectRubiKa/client)", root.display());
+        std::process::exit(2);
+    }
     let mut files = Vec::new();
     walk(&root, &mut files);
     files.sort();

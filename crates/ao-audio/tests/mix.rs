@@ -151,3 +151,22 @@ fn doppler_formula_and_pitch_rate() {
     m.render(&mut buf);
     assert_eq!(m.voice_count(), 0, "a 1 s sample at 200 % ends after 0.5 s");
 }
+
+/// 16 Miles handles = 13 SFX + 3 streams: a fourth `AIL_open_stream` fails (id 0), SFX voices are unaffected, and a
+/// stream whose sender is gone frees its handle.
+#[test]
+fn stream_handles_are_capped_at_three() {
+    let mut m = Mixer::new(RATE);
+    let open = |m: &mut Mixer| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let id = m.play(VoiceDesc { priority: None, ..VoiceDesc::new(Source::Stream { rx, rate: 44100, channels: 2 }) });
+        (id, tx)
+    };
+    let held: Vec<_> = (0..3).map(|_| open(&mut m)).collect();
+    assert!(held.iter().all(|(id, _)| *id != 0));
+    assert_eq!(open(&mut m).0, 0, "fourth stream: no handle left");
+    assert_ne!(m.play(VoiceDesc { priority: Some(1), ..VoiceDesc::new(Source::Sample(sine(440.0, 1.0, 0.1, RATE))) }), 0, "SFX pool is separate");
+    m.stop(held[0].0);
+    assert_ne!(open(&mut m).0, 0, "a closed stream frees its handle");
+    assert_eq!(open(&mut m).0, 0);
+}
