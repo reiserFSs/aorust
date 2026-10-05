@@ -1,6 +1,6 @@
 //! Device independent software mixer: sample/stream voices, per-voice volume, positional emitters, fades.
-//! Faithful to the client's SandyInterface (docs/formats.md `## audio`): no panning (the level goes to both
-//! channels), attenuation by distance to the listener *position* only, linear between min and max distance.
+//! Faithful to the client's SandyInterface (docs/formats.md `## audio`): no panning (a mono source goes to both
+//! channels at the voice level); distance attenuation is applied by the caller (`game::attenuation`).
 //! [`Mixer::render`] fills an interleaved stereo buffer; the cpal callback and the offline tests both call it.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -9,39 +9,6 @@ use std::sync::Arc;
 use crate::decode::Pcm;
 
 pub const MAX_VOICES: usize = 64;
-
-/// Distance model of a positional voice (`SandyInterface_t::PlaySample` @0x10002d98): silent beyond `max`, linear
-/// 1 -> 0 between `min` and `max`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Falloff {
-    pub min: f32,
-    pub max: f32,
-}
-
-impl Falloff {
-    pub fn gain(&self, d: f32) -> f32 {
-        if d > self.max {
-            0.0
-        } else if d > self.min {
-            ((self.max - self.min) - (d - self.min)) / (self.max - self.min)
-        } else {
-            1.0
-        }
-    }
-}
-
-/// The camera position (the client ignores the listener orientation).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Listener {
-    pub pos: [f32; 3],
-}
-
-impl Listener {
-    fn dist(&self, p: [f32; 3]) -> f32 {
-        let d = [p[0] - self.pos[0], p[1] - self.pos[1], p[2] - self.pos[2]];
-        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-    }
-}
 
 /// Where a voice's samples come from.
 pub enum Source {
@@ -54,12 +21,11 @@ pub struct VoiceDesc {
     pub source: Source,
     pub gain: f32,
     pub looping: bool,
-    pub emitter: Option<([f32; 3], Falloff)>,
 }
 
 impl VoiceDesc {
     pub fn new(source: Source) -> Self {
-        VoiceDesc { source, gain: 1.0, looping: false, emitter: None }
+        VoiceDesc { source, gain: 1.0, looping: false }
     }
 }
 
@@ -72,7 +38,6 @@ struct Voice {
     done: bool,
     gain: f32,
     looping: bool,
-    emitter: Option<([f32; 3], Falloff)>,
     fade: f32,
     fade_target: f32,
     fade_step: f32,
@@ -92,7 +57,6 @@ pub struct Stats {
 pub struct Mixer {
     pub rate: u32,
     pub master: f32,
-    pub listener: Listener,
     voices: Vec<Voice>,
     next_id: u64,
     pub stats: Arc<Stats>,
@@ -100,7 +64,7 @@ pub struct Mixer {
 
 impl Mixer {
     pub fn new(rate: u32) -> Self {
-        Mixer { rate, master: 1.0, listener: Listener::default(), voices: Vec::new(), next_id: 1, stats: Arc::default() }
+        Mixer { rate, master: 1.0, voices: Vec::new(), next_id: 1, stats: Arc::default() }
     }
 
     pub fn voice_count(&self) -> usize {
@@ -124,7 +88,7 @@ impl Mixer {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, emitter: d.emitter, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: f32::NAN });
+        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: f32::NAN });
         id
     }
 
@@ -166,9 +130,8 @@ impl Mixer {
         out.fill(0.0);
         let n = out.len() / 2;
         let ratio_out = self.rate as f64;
-        let l = self.listener;
         for v in &mut self.voices {
-            let g1 = v.emitter.map_or(1.0, |(pos, f)| f.gain(l.dist(pos))) * v.gain;
+            let g1 = v.gain;
             let g0 = if v.last.is_nan() { g1 } else { v.last };
             let (rate, ch) = match &v.src {
                 Source::Sample(p) => (p.rate, p.channels as usize),

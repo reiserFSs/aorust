@@ -11,7 +11,6 @@ use ao_rdb::RecordStore;
 
 use crate::district::Districts;
 use crate::engine::Shared;
-use crate::mixer::Falloff;
 use crate::music::{MusicPlayer, Rng};
 use crate::sbf::{sound_id, SoundDb, SoundDef};
 use crate::sws::Project;
@@ -126,9 +125,35 @@ struct Ambient {
     timers: Vec<f32>,
 }
 
+/// Keep-alive voice of one statel emitter (`PlayGameSound` called every frame while the camera is inside).
 #[derive(Default)]
 struct EmitterState {
-    voices: Vec<u64>,
+    voice: u64,
+    /// seconds since the camera was last inside the radius
+    idle: f32,
+    /// seconds until the next probability roll (`prob < 100` sounds roll at most once per second)
+    gate: f32,
+}
+
+/// Duration override of statel emitter calls (`StatelSoundRun`, N3 @0x10024e97): the sound is kept alive 2 s after the
+/// last call, then fades out over the definition's fade-out time.
+const EMITTER_HOLD: f32 = 2.0;
+
+/// `SandyInterface_t::PlaySample` distance rule (@0x10002d98): with a non-zero position, nothing plays beyond the max
+/// distance and the level falls linearly from 1 at `min` to 0 at `max`. A caller radius replaces the max distance and
+/// scales the min: `min = (def.min / def.max) * radius` when `def.min < def.max`, else `radius`.
+pub fn attenuation(d: f32, def_min: f32, def_max: f32, radius: Option<f32>) -> f32 {
+    let (min, max) = match radius {
+        Some(r) if r > 0.0 => (if def_min < def_max { def_min / def_max * r } else { r }, r),
+        _ => (def_min, def_max),
+    };
+    if d > max {
+        0.0
+    } else if d > min {
+        ((max - min) - (d - min)) / (max - min)
+    } else {
+        1.0
+    }
 }
 
 /// Mutable audio world state (one per [`crate::Audio`]).
@@ -156,7 +181,7 @@ impl Runtime {
     /// Plays a definition once, non-positionally, at `Total_FX`.
     pub fn play(&mut self, sh: &Shared, def: &SoundDef) -> Vec<u64> {
         let db = self.lib.sounds.clone();
-        play_def(sh, &db, def, None, self.fx, &mut self.rng)
+        play_def(sh, &db, def, self.fx, &mut self.rng)
     }
 
     pub fn set_playfield(&mut self, sh: &Shared, pf: Option<PlayfieldAudio>) {
@@ -185,7 +210,7 @@ impl Runtime {
         }
         self.music.tick(dt);
         self.tick_ambience(sh, dt, hours * HOUR);
-        self.tick_emitters(sh, cam);
+        self.tick_emitters(sh, dt, cam);
     }
 
     /// The 1 Hz music module (`FUN_100b6d67`): district of the camera's zone -> `music[DayPeriod]` layer.
@@ -233,7 +258,7 @@ impl Runtime {
             let alive = self.ambient.get(&key).map_or(false, |a| sh.mixer().is_playing(a.voice));
             if !alive {
                 let Some(path) = def.file.as_deref().and_then(|f| sh.resolve(f)) else { continue };
-                let voice = sh.play_sample(&path, vol, true, None);
+                let voice = sh.play_sample(&path, vol, true);
                 if voice == 0 {
                     continue;
                 }
@@ -250,49 +275,66 @@ impl Runtime {
                     // re-armed with a fresh random interval of the child's own range
                     *tm = child.interval_min + self.rng.unit() * (child.interval_max - child.interval_min).max(0.0);
                     if let Some(p) = child.file.as_deref().and_then(|f| sh.resolve(f)) {
-                        sh.play_sample(&p, vol, false, None);
+                        sh.play_sample(&p, vol, false);
                     }
                 }
             }
         }
     }
 
-    /// `EvaluateStatelSoundFog` (N3 @0x10024eff): an emitter whose radius contains the camera calls
-    /// `PlayGameSound(id, pos, ..., radius)`; here a sound is (re)started when its last voice has finished.
-    fn tick_emitters(&mut self, sh: &Shared, cam: [f32; 3]) {
+    /// `EvaluateStatelSoundFog` (N3 @0x10024eff, every frame): inside an emitter's radius `PlayGameSound(id, pos, 2 s,
+    /// ..., radius)` is called each frame: a looping sound whose level tracks the camera distance
+    /// (`radius`, linear), not restarted while it plays; 2 s after the last call it fades out.
+    fn tick_emitters(&mut self, sh: &Shared, dt: f32, cam: [f32; 3]) {
         let Some(pf) = &self.pf else { return };
         for (e, st) in pf.emitters.iter().zip(&mut self.emitters) {
             let d = ((e.pos[0] - cam[0]).powi(2) + (e.pos[1] - cam[1]).powi(2) + (e.pos[2] - cam[2]).powi(2)).sqrt();
+            let Some(def) = self.lib.sounds.get(e.sound_id) else { continue };
+            let alive = st.voice != 0 && sh.mixer().is_playing(st.voice);
             if d >= e.radius {
+                if alive {
+                    st.idle += dt;
+                    if st.idle >= EMITTER_HOLD {
+                        sh.mixer().fade(st.voice, 0.0, def.fade_out.max(0.001), true);
+                        st.voice = 0;
+                    }
+                }
                 continue;
             }
-            {
-                let m = sh.mixer();
-                st.voices.retain(|v| m.is_playing(*v));
-            }
-            if !st.voices.is_empty() {
+            st.idle = 0.0;
+            let level = attenuation(d, def.min_dist, def.max_dist, Some(e.radius)) * (def.vol_min + self.rng.unit() * (def.vol_max - def.vol_min)) * self.fx;
+            if alive {
+                sh.mixer().set_gain(st.voice, level);
                 continue;
             }
-            if let Some(def) = self.lib.sounds.get(e.sound_id) {
-                st.voices = play_def(sh, &self.lib.sounds, def, Some((e.pos, e.radius)), self.fx, &mut self.rng);
+            st.gate -= dt;
+            if st.gate > 0.0 {
+                continue;
+            }
+            if def.prob != 100 {
+                st.gate = 1.0;
+                if self.rng.next() % 200 >= def.prob as u32 {
+                    continue;
+                }
+            }
+            if let Some(p) = def.file.as_deref().and_then(|f| sh.resolve(f)) {
+                st.voice = sh.play_sample(&p, level, true);
             }
         }
     }
 }
 
-/// `SandyInterface_t::PlaySample` for a sound definition: probability gate, randomised volume, linear distance
-/// attenuation (`min_dist`..`max_dist`, or the caller's radius), file and children per the definition's flags.
-pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, at: Option<([f32; 3], f32)>, fx: f32, rng: &mut Rng) -> Vec<u64> {
+/// A one-shot non-positional sound definition (UI, children): probability gate, randomised volume, the file and
+/// its children per the definition's flags (`play_all`, or one `random_child`).
+pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, fx: f32, rng: &mut Rng) -> Vec<u64> {
     if def.prob != 100 && rng.next() % 200 >= def.prob as u32 {
         return Vec::new();
     }
     let vol = (def.vol_min + rng.unit() * (def.vol_max - def.vol_min)) * fx;
-    // [UNRESOLVED] exact use of the caller's radius; as the client's min/max distance pair it is the max distance
-    let emitter = at.map(|(pos, radius)| (pos, Falloff { min: def.min_dist, max: if radius > 0.0 { radius } else { def.max_dist } }));
     let mut out = Vec::new();
     let mut one = |d: &SoundDef| {
         if let Some(p) = d.file.as_deref().and_then(|f| sh.resolve(f)) {
-            let id = sh.play_sample(&p, vol, false, emitter);
+            let id = sh.play_sample(&p, vol, false);
             if id != 0 {
                 out.push(id);
             }
@@ -309,4 +351,35 @@ pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, at: Option<([f
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trapezoids_and_attenuation() {
+        let h = HOUR;
+        assert_eq!(ambience_level(Period::Night, 0.0), 1.0);
+        assert_eq!(ambience_level(Period::Night, 7.0 * h - K), 1.0);
+        assert!((ambience_level(Period::Night, 7.0 * h - K / 2.0) - 0.5).abs() < 1e-6);
+        assert!((ambience_level(Period::Dawn, 7.0 * h - K / 2.0) - 0.5).abs() < 1e-6);
+        assert_eq!(ambience_level(Period::Day, 12.0 * h), 1.0);
+        assert_eq!(ambience_level(Period::Day, 12.0 * h) + ambience_level(Period::Night, 12.0 * h), 1.0);
+        // forced to t = 1 late in the day: the night layer is back at full level, dusk is gone
+        assert_eq!(ambience_level(Period::Night, 23.0 * h - K / 2.0), 1.0);
+        assert_eq!(ambience_level(Period::Dusk, 23.0 * h - K / 2.0), 0.0);
+        assert_eq!(Period::at_hour(6.99), Period::Night);
+        assert_eq!(Period::at_hour(7.0), Period::Dawn);
+        assert_eq!(Period::at_hour(12.0), Period::Day);
+        assert_eq!(Period::at_hour(21.5), Period::Dusk);
+        assert_eq!(Period::at_hour(26.0), Period::Night);
+        // sbf default 0..15 m, caller radius 40 m: linear 1 -> 0 over the radius
+        assert_eq!(attenuation(0.0, 0.0, 15.0, Some(40.0)), 1.0);
+        assert!((attenuation(10.0, 0.0, 15.0, Some(40.0)) - 0.75).abs() < 1e-6);
+        assert_eq!(attenuation(41.0, 0.0, 15.0, Some(40.0)), 0.0);
+        assert!((attenuation(7.5, 0.0, 15.0, None) - 0.5).abs() < 1e-6);
+        // min >= max: full level inside the radius, silent beyond
+        assert_eq!(attenuation(10.0, 15.0, 15.0, Some(20.0)), 1.0);
+    }
 }

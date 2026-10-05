@@ -11,7 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::decode::{self, Pcm};
 use crate::game::{Library, PlayfieldAudio, Runtime};
-use crate::mixer::{Falloff, Listener, Mixer, Source, Stats, VoiceDesc};
+use crate::mixer::{Mixer, Source, Stats, VoiceDesc};
 
 /// State shared with the housekeeping thread.
 pub(crate) struct Shared {
@@ -88,12 +88,12 @@ impl Shared {
         id
     }
 
-    pub fn play_sample(&self, path: &Path, gain: f32, looping: bool, emitter: Option<([f32; 3], Falloff)>) -> u64 {
+    pub fn play_sample(&self, path: &Path, gain: f32, looping: bool) -> u64 {
         let Some(pcm) = self.load(path) else { return 0 };
         if pcm.frames() == 0 {
             return 0;
         }
-        self.mixer().play(VoiceDesc { gain, looping, emitter, ..VoiceDesc::new(Source::Sample(pcm)) })
+        self.mixer().play(VoiceDesc { gain, looping, ..VoiceDesc::new(Source::Sample(pcm)) })
     }
 }
 
@@ -192,9 +192,8 @@ impl Audio {
         }
     }
 
-    /// Per frame: listener = camera position (scene space), `day_time` = the viewer clock (0..6480 s).
+    /// Per frame: `cam` = camera = listener position (scene space), `day_time` = the viewer clock (0..6480 s).
     pub fn update(&self, dt: f32, cam: [f32; 3], day_time: f32) {
-        self.set_listener(cam);
         if let Some(rt) = self.rt().as_mut() {
             rt.update(&self.sh, dt, cam, day_time);
         }
@@ -242,15 +241,10 @@ impl Audio {
         }
     }
 
-    /// Listener = camera position (scene space).
-    pub fn set_listener(&self, pos: [f32; 3]) {
-        self.sh.mixer().listener = Listener { pos };
-    }
-
     /// Plays a file below `cd_image/sound` (e.g. `sfx/gui/click`) once, centred. Returns the voice id (0 = not played).
     pub fn play_sfx(&self, rel: &str, gain: f32) -> u64 {
         match self.sh.resolve(rel) {
-            Some(p) => self.sh.play_sample(&p, gain, false, None),
+            Some(p) => self.sh.play_sample(&p, gain, false),
             None => {
                 eprintln!("audio: no sound file for '{rel}'");
                 0

@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use ao_audio::decode::{decode_file, Pcm};
-use ao_audio::mixer::{Falloff, Mixer, Source, VoiceDesc};
+use ao_audio::mixer::{Mixer, Source, VoiceDesc};
 
 const RATE: u32 = 48_000;
 
@@ -43,23 +43,6 @@ fn one_shot_ends_and_goes_silent() {
     assert!(l > 0.2);
     assert_eq!(m.voice_count(), 0, "finished one-shot is removed");
     assert_eq!(render(&mut m, 0.1), (0.0, 0.0, 0.0));
-}
-
-#[test]
-fn emitter_linear_falloff() {
-    let fall = Falloff { min: 4.0, max: 100.0 };
-    let run = |pos: [f32; 3]| {
-        let mut m = Mixer::new(RATE);
-        m.listener.pos = [1.0, 2.0, 3.0];
-        m.play(VoiceDesc { looping: true, emitter: Some((pos, fall)), ..VoiceDesc::new(Source::Sample(sine(440.0, 1.0, 1.0, RATE))) });
-        render(&mut m, 0.5).0
-    };
-    let full = 1.0 / 2f32.sqrt();
-    near(run([1.0, 2.0, 3.0]), full, 0.005); // on top of the listener
-    near(run([1.0, 2.0, 3.0 - 4.0]), full, 0.005); // exactly min distance
-    near(run([1.0, 2.0, 3.0 - 52.0]), full * 0.5, 0.005); // halfway between min and max
-    near(run([1.0 + 96.0, 2.0, 3.0]), full * 4.0 / 96.0, 0.001); // 96 m: (96 - 92) / 96
-    assert_eq!(run([1.0, 2.0, 3.0 - 101.0]), 0.0, "silent beyond max distance");
 }
 
 #[test]
@@ -109,15 +92,12 @@ fn wav_decode_and_stream_voice() {
     let sh = ao_audio::Audio::offline(&dir, RATE);
     let id = sh.play_stream_file(&path, 1.0, 0.0);
     assert_ne!(id, 0);
-    let mut buf = vec![0f32; RATE as usize / 2 * 2];
+    let mut buf = vec![0f32; 2400 * 2]; // 50 ms blocks; the decoder thread may starve a block, so take the loudest
     let mut rms = 0f64;
-    for _ in 0..40 {
+    for _ in 0..16 {
         std::thread::sleep(std::time::Duration::from_millis(5));
         sh.render(&mut buf);
         rms = rms.max((buf.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / buf.len() as f64).sqrt());
-        if rms > 0.1 {
-            break;
-        }
     }
     near(rms as f32, 0.5 / 2f32.sqrt(), 0.02);
     std::fs::remove_dir_all(&dir).unwrap();

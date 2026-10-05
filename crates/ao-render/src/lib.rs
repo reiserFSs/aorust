@@ -11,7 +11,7 @@ use std::path::Path;
 use wgpu::util::DeviceExt;
 
 pub use egui;
-pub use viewer::{run_frontend, run_viewer, Frontend, Host};
+pub use viewer::{run_frontend, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
 
 const MSAA: u32 = 4;
 const INST_RING: usize = 3;

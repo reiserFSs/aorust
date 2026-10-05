@@ -56,6 +56,12 @@ struct ViewOpts {
     /// Look-at target (screenshot and interactive start), "x,y,z".
     #[arg(long, global = true, value_parser = vec3, allow_hyphen_values = true)]
     at: Option<[f32; 3]>,
+    /// Interactive playfield viewer: no audio (music, ambience, statel sound emitters).
+    #[arg(long, global = true)]
+    mute: bool,
+    /// Screenshot: seconds on the texture-scroll clock (drifting clouds, liquids).
+    #[arg(long, global = true, default_value_t = 0.0)]
+    anim_time: f32,
     /// Screenshot size, "WxH".
     #[arg(long, global = true, default_value = "1280x800", value_parser = size)]
     size: (u32, u32),
@@ -127,6 +133,31 @@ fn client_dir(arg: Option<PathBuf>) -> Result<PathBuf> {
     match arg {
         Some(p) => Ok(p),
         None => Ok(PathBuf::from(std::env::var("HOME").context("HOME unset")?).join("Games/ProjectRubiKa/client")),
+/// Opens the audio device and returns the per-frame hook that follows the camera (listener), the day clock and the
+/// playfield's music/ambience/emitters. A missing device or sound data disables audio with a message.
+fn playfield_audio(dir: &std::path::Path, pf: ao_audio::PlayfieldAudio, start: f32, scale: f32) -> Option<ao_render::FrameHook> {
+    let audio = match ao_audio::Audio::start(dir) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("audio disabled: {e:#}");
+            return None;
+        }
+    };
+    eprintln!("audio: {}", audio.device);
+    audio.set_playfield(Some(pf));
+    let (mut day, mut since_log) = (start, 0.0f32);
+    let log = std::env::var_os("AOMAC_AUDIO_LOG").is_some();
+    Some(Box::new(move |cam, dt| {
+        day += dt * scale;
+        audio.update(dt, cam.into(), day);
+        since_log += dt;
+        if log && since_log >= 2.0 {
+            since_log = 0.0;
+            eprintln!("{} music={:?}", audio.status(), audio.now_playing());
+        }
+    }))
+}
+
     }
 }
 
@@ -140,6 +171,8 @@ fn main() -> Result<()> {
                 What::Demo { count } => demo::scene(count),
                 What::Char { id, anim, time, head, role } => {
                     let store = RecordStore::open(&dir)?;
+            let mut live = None;
+            let mut pf_audio = None;
                     let anim = match role {
                         Some(r) => Some(ao_formats::character::role_anim(&store, id, &r)?),
                         None => anim,
@@ -165,8 +198,19 @@ fn main() -> Result<()> {
                     }
                     return Ok(());
                 }
-                What::Pf { id: Some(id), time_of_day, .. } => {
-                    ao_formats::playfield::load_playfield_at(&RecordStore::open(&dir)?, &dir, id, time_of_day.unwrap_or(ao_formats::playfield::DEFAULT_DAY_TIME))?
+                What::Pf { id: Some(id), time_of_day, time_scale, .. } => {
+                    let start = time_of_day.unwrap_or(ao_formats::playfield::DEFAULT_DAY_TIME);
+                    if let (Some(scale), None) = (time_scale, &opts.screenshot) {
+                        if let Some(mut clock) = ao_formats::playfield::SkyClock::open(&dir, id)? {
+                            live = Some(ao_render::LiveSky { start, scale, source: Box::new(move |t| clock.at(t)) });
+                        }
+                    }
+                    let store = RecordStore::open(&dir)?;
+                    let (scene, report) = ao_formats::playfield::load_playfield_report_at(&store, &dir, id, start)?;
+                    if !opts.mute && opts.screenshot.is_none() {
+                        pf_audio = Some((ao_audio::PlayfieldAudio::load(&store, id, &report.sounds)?, start, time_scale.unwrap_or(0.0)));
+                    }
+                    scene
                 }
                 What::Pf { id: None, .. } => bail!("view pf: give an id or --list"),
             };
@@ -182,7 +226,13 @@ fn main() -> Result<()> {
                     let mut scene = scene;
                     scene.spawn = opts.eye.or(scene.spawn);
                     scene.spawn_look_at = opts.at.or(scene.spawn_look_at);
-                    ao_render::run_viewer(scene)
+                    match pf_audio.and_then(|(pf, start, scale)| playfield_audio(&dir, pf, start, scale)) {
+                        Some(hook) => ao_render::run_viewer_hooked(scene, live, hook),
+                        None => match live {
+                            Some(live) => ao_render::run_viewer_live(scene, live),
+                            None => ao_render::run_viewer(scene),
+                        },
+                    }
                 }
             }
         }

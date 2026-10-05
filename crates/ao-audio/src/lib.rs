@@ -8,4 +8,4 @@ pub mod sbf;
 pub mod sws;
 
 pub use engine::Audio;
-pub use game::{ambience_level, Library, PlayfieldAudio, Period};
+pub use game::{ambience_level, attenuation, Library, Period, PlayfieldAudio};

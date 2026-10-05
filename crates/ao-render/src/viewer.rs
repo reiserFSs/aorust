@@ -77,7 +77,17 @@ struct App {
 
 /// Opens the interactive viewer; returns when the window closes.
 pub fn run_viewer(scene: Scene) -> Result<()> {
-    run(scene, None)
+    run(scene, None, None, None)
+}
+
+/// [`run_viewer`] with a moving sun and sky ([`LiveSky`]).
+pub fn run_viewer_live(scene: Scene, live: LiveSky) -> Result<()> {
+    run(scene, None, Some(live), None)
+}
+
+/// [`run_viewer`]/[`run_viewer_live`] calling `hook(camera position, dt)` every frame.
+pub fn run_viewer_hooked(scene: Scene, live: Option<LiveSky>, hook: FrameHook) -> Result<()> {
+    run(scene, None, live, Some(hook))
 }
 
 /// Opens the window with `frontend` drawn over `scene` (free-fly off until the frontend enables it).
@@ -85,16 +95,16 @@ pub fn run_frontend(scene: Scene, frontend: impl Frontend + 'static) -> Result<(
     run(scene, Some(Box::new(frontend)))
 }
 
-fn run(scene: Scene, frontend: Option<Box<dyn Frontend>>) -> Result<()> {
+fn run(scene: Scene, frontend: Option<Box<dyn Frontend>>, live: Option<LiveSky>, hook: Option<FrameHook>) -> Result<()> {
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
-    let mut app = App { scene, frontend, state: None, error: None };
+    let mut app = App { scene, frontend, live, hook, state: None, error: None };
     el.run_app(&mut app)?;
     app.error.map_or(Ok(()), Err)
 }
 
 impl State {
-    fn new(el: &ActiveEventLoop, scene: &Scene, frontend: Option<Box<dyn Frontend>>) -> Result<Self> {
+    fn new(el: &ActiveEventLoop, scene: &Scene, frontend: Option<Box<dyn Frontend>>, live: Option<LiveSky>, hook: Option<FrameHook>) -> Result<Self> {
         let window = Arc::new(el.create_window(
             Window::default_attributes().with_title("aomac").with_inner_size(winit::dpi::LogicalSize::new(1280, 800)),
         )?);
@@ -114,11 +124,20 @@ impl State {
             // egui blends in gamma space: it draws through a non-sRGB view of the same texture.
             view_formats: vec![renderer.format.remove_srgb_suffix()],
         };
+    /// Seconds since start (drives `Submesh::uv_scroll`).
+    clock: f32,
+    live: Option<LiveRun>,
+    hook: Option<FrameHook>,
         surface.configure(&renderer.device, &config);
         let targets = Targets::new(&renderer, config.width, config.height);
+/// Called once per frame with the camera position and the frame time (audio listener).
+pub type FrameHook = Box<dyn FnMut(Vec3, f32)>;
+
         let (eye, at) = default_view(scene);
         let speed = (renderer.radius() * 0.15).max(5.0);
         if std::env::var_os("AOMAC_PERF").is_some() {
+    live: Option<LiveSky>,
+    hook: Option<FrameHook>,
             eprintln!("start eye {eye:?} at {at:?}, scene bounds {:?}", crate::scene_bounds(scene));
         }
         let cam = Camera::look_at(eye, at);
@@ -193,6 +212,9 @@ impl State {
         let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [self.config.width, self.config.height], pixels_per_point: out.pixels_per_point };
         let jobs = g.ctx.tessellate(out.shapes, out.pixels_per_point);
         let mut enc = dev.create_command_encoder(&Default::default());
+            clock: 0.0,
+            live: live.map(LiveRun::new),
+            hook,
         let extra = g.renderer.update_buffers(dev, queue, &mut enc, &jobs, &screen);
         {
             let mut pass = enc
@@ -288,7 +310,7 @@ impl State {
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.state.is_none() {
-            match State::new(el, &self.scene, self.frontend.take()) {
+            match State::new(el, &self.scene, self.frontend.take(), self.live.take(), self.hook.take()) {
                 Ok(s) => self.state = Some(s),
                 Err(e) => {
                     self.error = Some(e);
@@ -299,6 +321,9 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
+        if let Some(h) = self.hook.as_mut() {
+            h(self.cam.pos, dt);
+        }
         let Some(s) = &mut self.state else { return };
         let mut over_gui = false;
         if let Some(g) = &mut s.gui {
