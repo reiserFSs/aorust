@@ -243,6 +243,23 @@ fn login_packet(char_id: u32, user: &str, key: &str) -> Vec<u8> {
     packet(0, &w.0)
 }
 
+/// System message 0x43 (`Client_t::ProcessMessage`, IF 0x10002a9e; docs/zone/misc.md §15): the chat servers to connect to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatServer {
+    pub host: String,
+    pub port: u16,
+    /// Second word; always 0.0 in captures (unresolved: load/weight).
+    pub extra: f32,
+}
+
+/// `payload` of a ptype-1 frame; `None` unless it is a well-formed 0x43 message.
+pub fn parse_server_list(payload: &[u8]) -> Option<Vec<ChatServer>> {
+    let mut r = Reader::new(payload);
+    (r.u32().ok()? == 0x43).then_some(())?;
+    let n = r.i32().ok()?;
+    (0..n.clamp(0, 64)).map(|_| Some(ChatServer { host: r.str_i32(255).ok()?, port: r.i32().ok()? as u16, extra: r.f32().ok()? })).collect()
+}
+
 /// Idle time before the client pings (`FUN_1016f6cb`: > 59 s since the last receive, then every 30 s).
 const PING_IDLE: Duration = Duration::from_secs(60);
 const PING_EVERY: Duration = Duration::from_secs(30);
@@ -448,6 +465,20 @@ mod tests {
         assert_eq!(ev[2].1, ChatEvent::UserName { id: 33512, name: "Aomacvolk".into() });
         assert!(matches!(&ev[3].1, ChatEvent::Vicinity { anon: true, text, .. } if text.starts_with("Welcome to Project Rubi-Ka!")));
         assert_eq!(ev.len(), 6);
+    }
+
+    #[test]
+    fn server_list_from_zone_capture() {
+        let l = include_str!("../../../docs/captures/zone_ithaca.rec")
+            .lines()
+            .find_map(|l| {
+                let hex = l.split(' ').nth(2)?;
+                let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+                let (f, _) = crate::frame::Frame::decode_with(&b, false).ok()??;
+                (l.split(' ').nth(1)? == "<").then(|| parse_server_list(&f.payload)).flatten()
+            })
+            .unwrap();
+        assert_eq!(l, vec![ChatServer { host: "199.241.136.157".into(), port: 7005, extra: 0.0 }]);
     }
 
     /// A mock server: challenge -> login packet (type 0, `IISS`, key redacted by the tap) -> LOGIN_OK -> a tell round trip.
