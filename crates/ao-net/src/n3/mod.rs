@@ -6,6 +6,8 @@
 pub mod combat;
 pub mod dynel;
 pub mod misc;
+pub mod motion;
+pub mod nametag;
 pub mod outgoing;
 pub mod world;
 

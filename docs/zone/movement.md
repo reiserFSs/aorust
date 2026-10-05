@@ -1,0 +1,259 @@
+# Own-character movement (RE of Gamecode.dll / Vehicle.dll / N3.dll)
+
+Implementation: `crates/aomac/src/play/movement.rs` (`Movement`, `Fsm`, `World`; unit tests `cargo test --release -p aomac movement`).
+Address tags: `[GC]` Gamecode.dll, `[VH]` Vehicle.dll (the steering integrator, imported into a private Ghidra project;
+`Vehicle_t` is not in the other projects), `[N3]` N3.dll, `[GUI]`, `[IF]` Interfaces.dll. All images base 0x10000000.
+Scope: how the control dynel moves and which `CharDCMoveIIR_t` it sends (format: `docs/zone/outgoing.md` §5). Corrects/extends
+outgoing.md §5.1.
+
+## 1. Object graph
+
+* `n3Dynel_t + 0x50` = `Vehicle_t*` (a `PlayerVehicle_t`/`CharVehicle_t` for the own character; vftables [GC] `PlayerVehicle_t` 0x10160ba4/0x10160bb0/**0x10160bbc**
+  (the 45-slot one is the primary, object offset 0), `NPCVehicle_t` 0x10160ad4.., `CharVehicle_t` 0x1016095c..). `Vehicle_t` itself
+  (position, velocity, steering integrator, `EnsureSurfaceAlignment`) lives in [VH]; the player-specific inputs and the
+  state machine in [GC].
+* `CharVehicle_t + 0x178` = `CharMovementStatus_t*` (the FSM, vftable [GC] 0x101606b4; ctor `FUN_1006c16d`, base `MovementStatus_t`
+  vftable 0x10160aa0, ctor `FUN_1007038f`). Reached through `FUN_1006ed98` (= `vehicle + 0x178`). Its state variables
+  (getters `FUN_100704e6..FUN_1007050a`, setters `FUN_1007052b..FUN_100705a0`):
+
+  | off | var | values |
+  |---|---|---|
+  | +4 | mode | 1 Frozen, 2 Walk, 3 Run (ctor), 4 Swim, 5 Crawl, 6 Sneak, 7 Fly, 8 SitGround, 0xB Sleep, 0xC Lounge (9 = camping?, see §9) |
+  | +8 | forward axis | 1 idle, 2 moving |
+  | +0xC | forward dir | 0, 1 forward, 2 reverse |
+  | +0x10 / +0x14 | strafe axis / dir | 1 idle, 2 moving / 0, 3 left, 4 right |
+  | +0x18 / +0x1C | elevate axis / dir | 1, 2 / 0, 5 up |
+  | +0x20 / +0x24 | turn axis / dir | 1 idle, 4 turning / 0, 3 left, 4 right |
+  | +0x28 | jump | 1 idle, 3 jumping |
+  | +0x30 (CharMovementStatus) | last speed mode | ctor 2 (walk); `SwitchToRun/Walk` apply sets 3/2; every `Leave*` returns to it |
+
+  FSM vftable: [3] `FUN_1006c1ab` IsAllowed(id), [6] `FUN_1006c460` → `FUN_1007069f` Transition(id), [7] `FUN_1006c469` IsMoving, [8]
+  `FUN_1006c60f` BuildTransition(id). `FUN_1007069f(id)`: `IsAllowed(id)` && `BuildTransition(id)` valid → copy new state, run the action's
+  `Apply` (action vftable [1]; the `Transition_t` stores the old state at +8 and the new one at +0x38, `FUN_1007034e/1007035a`).
+  `FUN_1006c469` IsMoving = forward axis 2 || strafe axis 2 || jump 3 || mode 7.
+
+## 2. Move types 1..0x2A (`FUN_1006c60f` jump table [GC 0x1006d0ee], 42 entries; verified entry by entry in the assembly)
+
+Names = RTTI/vftable names of the `TransitionAction_t` classes (vftable, Apply = vftable[1]). Entries `0x13 0x14 0x16 0x1f 0x20` (and every id
+> 0x2A, `JA 0x1006d030`) point at the default label 0x1006d030 = "no transition". Neighbouring cases share code only where noted
+(5/6/7/8 share the StrafeStop tail, 9/0xA and 0xC/0xD differ only in the action class, 0xB/0xE share TurnStop).
+
+| id | action class | vftable / Apply | jump-table target | build rule (current state → new state) |
+|---|---|---|---|---|
+| 0x01 | ForwardStart | 0x101606dc / 0x1006ea44 | 0x1006c6e3 | fwd axis 1, or (axis 2 and dir 2) → axis 2, dir 1 |
+| 0x02 | ForwardStop | 0x101606ec / 0x1006eb63 | 0x1006c765 | axis 2 ∧ dir 1 → axis 1, dir 0 |
+| 0x03 | ReverseStart | 0x101606fc / 0x1006ebd9 | 0x1006c7aa | axis 1, or (axis 2 ∧ dir 1) → axis 2, dir 2 |
+| 0x04 | ReverseStop | 0x1016070c / 0x1006ecf0 | 0x1006c7fa | axis 2 ∧ dir 2 → axis 1, dir 0 |
+| 0x05 | StrafeRightStart | 0x101607a0 / 0x1006d6ea | 0x1006c8f9 | strafe 1, or (2 ∧ dir 3) → 2, dir 4 |
+| 0x06 | StrafeStop (right) | 0x10160790 / 0x1006d69c | 0x1006c8e3 | strafe 2 ∧ dir 4 → 1, dir 0 |
+| 0x07 | StrafeLeftStart | 0x1016077c / 0x1006d5f4 | 0x1006c844 | strafe 1, or (2 ∧ dir 4) → 2, dir 3 |
+| 0x08 | StrafeStop (left) | 0x10160790 / 0x1006d69c | 0x1006c899 | strafe 2 ∧ dir 3 → 1, dir 0 |
+| 0x09 | TurnRightStart | 0x1016074c / 0x1006d4e9 | 0x1006c9b9 | always: turn 4, dir 4 |
+| 0x0A | MouseTurnRightStart | 0x1016075c / 0x1006d590 | 0x1006c9e7 | always: turn 4, dir 4 |
+| 0x0B | TurnStop (right) | 0x1016076c / 0x1006d5d0 | 0x1006ca65 | turn 4 ∧ dir 4 → 1, dir 0 |
+| 0x0C | TurnLeftStart | 0x1016071c / 0x1006d3fe | 0x1006c953 | always: turn 4, dir 3 |
+| 0x0D | MouseTurnLeftStart | 0x1016073c / 0x1006d4a9 | 0x1006c986 | always: turn 4, dir 3 |
+| 0x0E | TurnStop (left) | 0x1016076c / 0x1006d5d0 | 0x1006ca15 | turn 4 ∧ dir 3 → 1, dir 0 |
+| 0x0F | JumpStart | 0x101607b0 / 0x1006d792 | 0x1006ca82 | refused if jump 3 and mode ≠ 7; else jump 3 |
+| 0x10 | JumpStop | 0x101607c0 / 0x1006d821 | 0x1006cac2 | needs jump 3; jump → 1 unless mode 7 |
+| 0x11 | ElevateUpStart | 0x101607d0 / 0x1006d948 | 0x1006cb04 | mode 7 only: axis 2, dir 5 |
+| 0x12 | ElevateUpStop | 0x101607e0 / 0x1006d99c | 0x1006cb41 | axis 2 ∧ dir 5 → axis 1, dir 0 |
+| 0x13 0x14 | – | – | default | no transition (no class; unused) |
+| 0x15 | FullStop | 0x101607f4 / 0x1006d9e8 | 0x1006cb91 | forward/strafe/turn/elevate/jump axes → idle, dirs 0 |
+| 0x16 | – (sync) | – | default | no transition: position/rotation sync only (§4) |
+| 0x17 | SwitchToFrozenMode | 0x101608b8 / 0x1006e4d8 | 0x1006cdfa | mode 1 |
+| 0x18 | SwitchToWalkMode | 0x10160818 / 0x1006dba4 | 0x1006cc0b | mode 2 |
+| 0x19 | SwitchToRunMode | 0x10160804 / 0x1006da5d | 0x1006cbd5 | mode 3 and last-speed-mode := 3 immediately |
+| 0x1A | SwitchToSwimMode | 0x10160828 / 0x1006dd0c | 0x1006cc37 | mode 4 |
+| 0x1B | SwitchToCrawlMode | 0x101608d8 / 0x1006e646 | 0x1006cce5 | needs jump 1 ∧ forward axis 1; mode 5 |
+| 0x1C | SwitchToSneakMode | 0x10160848 / 0x1006deb1 | 0x1006cc8e | mode 6 |
+| 0x1D | SwitchToFlyMode | 0x10160868 / 0x1006dfaf | 0x1006ce2b | mode 7 |
+| 0x1E | SwitchToSitGroundMode | 0x10160888 / 0x1006e2be | 0x1006cd30 | needs !IsMoving ∧ Features bit 4; mode 8 |
+| 0x1F 0x20 | – | – | default | no transition |
+| 0x21 | SwitchToSleepMode | 0x101608e8 / 0x1006e6ff | 0x1006cedf | needs jump 1 ∧ forward axis 1; mode 0xB |
+| 0x22 | SwitchToLoungeMode | 0x10160908 / 0x1006e8a9 | 0x1006cf86 | needs !IsMoving ∧ jump 1 ∧ axis 1; mode 0xC |
+| 0x23 | LeaveSwimMode | 0x10160838 / 0x1006de93 | 0x1006cc63 | mode := last speed mode |
+| 0x24 | LeaveSneakMode | 0x10160858 / 0x1006df81 | 0x1006ccba | mode := last speed mode |
+| 0x25 | LeaveSitMode | 0x10160898 / 0x1006e372 | 0x1006cd88 | no Features bit 4 → SwitchToFrozen (mode 1); else if mode 8 → last speed mode |
+| 0x26 | LeaveFrozenMode | 0x101608c8 / 0x1006e5e3 | 0x1006ce00 | mode := last speed mode |
+| 0x27 | LeaveFlyMode | 0x10160878 / 0x1006e115 | 0x1006ce57 | mode := last speed mode |
+| 0x28 | LeaveCrawlMode | 0x101608a8 / 0x1006e3ff | 0x1006ce82 | refused if IsMoving; no Features bit 4 → frozen; mode 5 → last speed mode |
+| 0x29 | LeaveSleepMode | 0x101608f8 / 0x1006e79f | 0x1006cf2a | refused if IsMoving; (feature rule); mode 0xB → **8** (sit) |
+| 0x2A | LeaveLoungeMode | 0x10160918 / 0x1006e949 | 0x1006cfd5 | refused if IsMoving; (feature rule); mode 0xC → **8** (sit) |
+| 0x2B | (pseudo) mouse look | – | not a table entry | `N3Msg_MovementChanged` rewrites it to 0x16 and never builds a message (§5) |
+
+Quirk, kept: the new "elevate axis" local is initialised from the *strafe* axis (`FUN_100704f2` is called twice in the prologue,
+asm 0x1006c688/0x1006c68f), so any transition copies the strafe axis into the elevate axis.
+
+Names of the older notes: 0x0A/0x0D = `MouseTurnRight/LeftStart`; 0x18 = SwitchToWalk, 0x1C = SwitchToSneak (outgoing.md listed them unresolved);
+0x24 = LeaveSneak. The ids the captures contain (`01 02 07 08 09 0a 0b 0c 0d 0e 16 1e`) are all in the table (0x1e = SitGround: the NPCs sitting
+at the Arrival Hall bar, 60 of the 144 captured moves).
+
+### 2.1 Permission table (`FUN_1006c1ab`, vtable [3]) – id refused in mode
+
+| mode | refused ids (everything else allowed) |
+|---|---|
+| any other value | none |
+| 1 Frozen | all except 9 0xB 0xC 0xE 0x10 0x26 |
+| 2 Walk | 0x18, 0x21, 0x22, 0x25, and 0x1E while forward axis 2 or jumping |
+| 3 Run | 0x19, 0x21, 0x22, and 0x1E while forward axis 2 or jumping |
+| 4 Swim | 5 7 0xF 0x18 0x19 0x1B 0x1C 0x1D 0x1E 0x1F 0x24 0x27 0x28 |
+| 5 Crawl | 5 7 0xF, 0x18..0x19, 0x1C 0x1D 0x1E 0x27 |
+| 6 Sneak | 0x21 0x2A |
+| 7 Fly | 0x1B 0x1C 0x1E 0x21 0x22 0x25 0x28 0x29 0x2A |
+| 8 SitGround | all except 9..0xE, 0x1A, 0x25, and 0x21/0x22 only while !IsMoving |
+| 0xB Sleep | all except 0x1A 0x22 0x29 |
+| 0xC Lounge | all except 0x1A 0x21 0x2A |
+
+Note 0x16 (sync) is refused in Frozen, SitGround, Sleep, Lounge (and mode 5 passes it): a sitting character sends no syncs.
+
+## 3. `N3Msg_MovementChanged(action, f1, f2, bool)` [GC 0x18b5c] – the only key → message path
+
+GUI slots (`FlowControlModule_t::SlotMovement*` [GUI 0x10027ec1..0x10028077]) call `N3InterfaceModule_t::N3Msg_MovementChanged(action, &f)` [IF 0x1000902e],
+which forwards `(action, f, 0.0, **true**)` (asm 0x10009040: `PUSH 1`). The 4th argument is therefore always true. Slot polarity: `b == false`
+= start (`Forward(b) = b+1`, `StrafeLeft(b) = 7+b`, `Right(b) = 9+2b`, `Left(b) = 0xC+2b`); Forward/Back/StrafeLeft slots fire AFCM
+event (0xA, 0xE3) first when mode == 8 (sit-to-stand request).
+
+Order of events inside (all must hold, otherwise nothing happens, **nothing is sent**):
+
+1. control dynel exists; `0x2B` → `0x16` + "local" flag;
+2. `vehicle->vtbl[0x24]` (`FUN_10070fd0`): no path-following (`+0x108 == 0`) and `dynel+0x21d == 0`;
+3. `fsm.IsAllowed(action)` (§2.1);
+4. not (mode 7 ∧ action 0xF); not (action 0xF ∧ stat 0x296 MechData ≠ 0); not (action 0x18 ∧ `dynel+0x2c8 ≠ 0` ∧ `FUN_1002e347() ≠ 0`); not
+   (mode 8 ∧ action 0x1C);
+5. if mouse-look is active (`DAT_102e2588`): `0xC→7, 9→5, 0xE→8, 0xB→6` (turn keys become strafes);
+6. not local: build `CharDCMoveIIR_t(dynel.identity, action, RelPos, RelRot, f1, f2)` [GC 0x1006ba23] **from the pose before the action**, apply it
+   (`FUN_1006b84b`, vtable [2] of the IIR, §3.1), then `SendIIRToServer`. Local (mouse look): `dynel->vtbl[0x74](zero, RelRot, f1, f2)` =
+   `n3Dynel_t::VehicleForwardUpdate` [N3 0x10004ebd] (yaw += f1, pitch part f2 – see §9) and `client+0xFC := 1`.
+
+### 3.1 Applying a message (`FUN_1006b84b` → `FUN_1006bcc6`)
+
+* `FUN_1006bcc6`: dynel by identity; passes only if `vehicle->vtbl[0x24]` and not (action 0x1C ∧ `dynel+0x1d4 → +0x44 ≠ 1`) and
+  (control dynel ≠ this dynel **or** `ToBePassedOn == 1`, `FUN_1006bb6c` = vtable [3] `ToBePassedOn`, set to 1 only by the constructor of a locally
+  built message `FUN_1006bb28`, 0 for network-read messages `FUN_1006bb79`). Otherwise `ClearToBePassedOn`, drop.
+  **So `CharDCMoveIIR_t` received for the own character is ignored.** (Server corrections of the own position are not CharDCMoves.)
+  For a local message it stores `UpdateLastMotionMessageData` (time, RelPos, RelRot: `client+0xD8/0xF0/0xE0` [GC 0x10016a48]) and re-sets the
+  dynel pose to itself (`Vehicle_t::SetRelPosRot` is a no-op for identical values, velocity is kept).
+* then: Features (stat 0xE0) must have bit 2 or 4; with bit 4 every action is applied, with only bit 2 just the turn ids 9..0xE; action 0x16 →
+  `VehicleForwardUpdate(pos, rot, f1, f2)`; action ≠ 0xF and path-follow active → cancel it; action 0x1D (fly) additionally needs
+  `dynel+0x21c ≠ 0` or GmLevel (stat 0xD7) bit 0; finally `fsm.Transition(action)`.
+* the IIR is written after that (`FUN_1006bc55`): `elapsed_ms = (int)((now - DAT_102e32d8) * 1000)` with `now = GameTime_t+0x28` (double
+  seconds), **truncated** (`_ftol` = CVTTSD2SI; asm 0x1006bc62..0x1006bc78), then `DAT_102e32d8 := now` (initially 0, so the first message carries `now*1000`).
+  (outgoing.md says "round": it is a truncation.)
+
+## 4. Other producers and cadence
+
+* `CheckMotionUpdate` [GC 0x18eb8], called every frame: `t = now - client+0xD8` (`GetTimeSinceLastMotionMessage`);
+  1. `t > 5.0` ([GC 0x101574fc]) ∧ `vehicle->vtbl[0x27]` (`FUN_1006efe1` → `fsm.IsMoving`) → `MovementChanged(0x16, 0, 0, true)`; return;
+  2. `t > 0.25` ([GC 0x101574f8]) ∧ `client+0xFC` ∧ `acos(dot(RelRot, client+0xE0)) > 0.17` ([GC 0x101574f0], radians, no `abs`, no `2×`) →
+     `MovementChanged(0x16, 0, 0, true)`, `client+0xFC := 0`.
+  So a moving character repeats a 0x16 sync every ~5 s of silence; mouse turning produces one sync per ≥ 0.25 s once the heading differs from the
+  last sent one by 0.17 rad (quaternion half-angle: 0.34 rad of yaw). The `look` floats of every sent message are (0, 0) except the
+  mouse-look start moves, which also carry (0, 0): the look deltas of 0x2B are never put on the wire (`FUN_1006b9d6` writes the IIR's `+0x40/+0x44`;
+  `N3Msg_MovementChanged` only passes real values for the local branch).
+* `FUN_1005a5d6` [GC] (second `CharDCMoveIIR_t` producer) is the per-frame handler of the client character (`this+0x140 ≠ 0`): counter
+  `DAT_101bef94` (initial −1): `if (>0) --`; at 0 it builds a 0x16 move from RelPos/RelRot (look 0,0), applies it and sends it, counter := −1.
+  The counter is armed to 2 when `dynel+0x220 != GetZoneInstanceID()` (zone border crossed) and the old id was non-zero; i.e. **two frames after
+  entering a new zone a sync is sent**. It bypasses the permission checks of `N3Msg_MovementChanged`. (Also computes `VisualEnvFX_t::DisplaySyncPosition`.)
+* No other sender: `StartTeleportTry`, `EndCameraMouseLook` call `MovementChanged(0x16,…)` (outgoing.md §5.1).
+
+## 5. Mouse look (`N3Msg_MouseMovement(dx, dy)` [GC 0x1964b], `N3Msg_EndMouseMovement` [GC 0x19a38])
+
+* First event (`DAT_102e2588 == 0`): a key turn in progress is converted: left turn (dir 3, turn rate ≠ 0) → `MovementChanged(0xE)` then `(7)`; right → `(0xB)` then `(5)`. Then
+  `DAT_102e2588 := 1`.
+* Needs Features bit 2 or 4. If TurnSpeed (stat 0x10B) ≠ 0: `|dx| ≤ TurnSpeed / 100000 [GC 0x101575d0] * (client+0x68)` (client+0x68 unresolved).
+* `dx ≥ 0`: turn dir ∈ {0, 3} → `MovementChanged(0xA, 0, 0)` (the `dx` of that event is dropped); else (already turning right) → `MovementChanged(0x2B, dx, dy')`.
+  `dx < 0`: turn dir ∈ {0, 4} → `(0xD)`; else `(0x2B, dx, dy')`. `dy' = 0` in third person, `s_nInverted*dy` in first person (mode ≠ 7).
+* `0x2B` = local yaw rotation by `dx` radians (positive = right = same sense as TurnRightStart), marks the dynel dirty for `CheckMotionUpdate`.
+* Release: `DAT_102e2588 := 0`; if turn axis 4 → `MovementChanged(dir 4 ? 0xB : 0xE)`; if strafe axis 2 → `(8)` and `(6)`.
+* Keyboard turn keys while mouse-look is active are remapped to strafes (step 5 of §3).
+
+## 6. The vehicle (inputs and integration)
+
+`PlayerVehicle_t` inputs (floats): `+0x360` forward (±1, `FUN_100712a6`), `+0x364` strafe speed (`FUN_100712c6`), `+0x368` turn rate rad/s
+(`FUN_100712b6`), `+0x36C` elevate speed (`FUN_100712f7`). Set by the `Apply` functions of the actions (only when `vehicle->vtbl[0x23]` = player-controlled,
+true for `PlayerVehicle_t`):
+
+| action | effect |
+|---|---|
+| ForwardStart | `SetDirection(1)`, `fwd := 1`, recompute (`FUN_1006f4a2`), re-tune an active key turn (`FUN_1006c506`) |
+| ForwardStop | `fwd := 0`, **`Halt` (velocity := 0, instant stop)**, recompute, re-tune |
+| ReverseStart / ReverseStop | `fwd := −1`, `SetDirection(−1)` / `fwd := 0`, `Halt`, `SetDirection(1)` (a direction change halts) |
+| TurnLeft/RightStart | turn rate ∓ (below); MouseTurn*Start and TurnStop: 0 |
+| StrafeLeft/RightStart | `strafe := ∓ FUN_1006f894(class)` with class 2 (walk, sneak), 7 (fly), else 3; StrafeStop: 0 |
+| JumpStart | recompute, `vtbl[0x2c]` (`FUN_1006f9e9`) launch (§7) |
+| ElevateUpStart / Stop | `elevate := 3.0` / `−0.8` (hover sinks) |
+| FullStop, Frozen | `Halt`, `SetDirection(1)`, forward/strafe/turn := 0 |
+| Run/Walk | recompute; last-speed-mode := 3/2; from fly: `EnableFalling`, `y += 0.1`, elevate := 0 |
+| Fly | `DisableFalling`, `y += 0.5`, orientation mode 4 |
+| Sit | recompute, `Halt`; Crawl/Sleep/Lounge/Leave*: recompute, `CalculateGroundPoint` (snap to the ground) |
+
+**Speeds** (m/s; `FUN_1006f4a2` sets `SetMaxVel`, `SetMaxForce`; RS = `FUN_1006edb3`):
+RS = RunSpeed stat 0x9C, but below 15 % health (`ratio = Health(0x1B) / (Life(1) * 0.15) < 1`) `RS := ratio * (RS + 1000) − 1000`.
+
+| mode | max speed | note |
+|---|---|---|
+| Walk, Sneak, other | 1.5 | [GC 0x1015d76c]; not stat dependent |
+| Run forward (dir 1 or none) | `clamp(5.0 + RS/275, 1.5, 13)` | consts [GC 0x101574fc 0x10160a48 0x10160a34] |
+| Run reverse | `clamp(3.0 + RS*0.0025454545, 1.05, 9.1)` | [GC 0x10160a60 0x10160a54 0x10160a50] |
+| Swim | `clamp(3.0 + RS/440, 1.5, 8)` | |
+| Crawl | 1.0 | |
+| Fly | `clamp(7.0 + RS/275, 1.5, 15)` | |
+| Strafe (`FUN_1006f894`) | walk/sneak 1.5; run `clamp(2.5 + RS/550, 0.75, 6.5)`; fly `clamp(3.5 + RS/550, 0.75, 7.5)` | half of forward, except walking |
+
+Steering force `F = min(2 * mass * v, 100000, 10000)`, `mass = Vehicle+0x34` (10.0 when 0 [GC 0x1015f168], real source unresolved) ⇒ acceleration
+`F/mass = 2 v` m/s²: top speed after 0.5 s. The stat WalkSpeed/SwimSpeed are not read; **CurrentMovementMode (0xAD) is never read by the
+movement code** (immediates 0xAD occur only in the stat-name table). The WaitState stat (0x1AE) mirrors sit/crawl/sleep/lounge (`Apply` writes
+2/0xE/0xF/0x10, 0 on leave; `N3Msg_SitToggle` [GC 0x10028e0a] and `N3Msg_CrawlToggle` [GC 0x278c9] read it).
+
+**Key turn rates** (rad/s, `FUN_1006d3fe/1006d4e9/1006c506`): TurnSpeed (stat 0x10B) = 0: standing (forward axis 1) ∓3.5, moving ∓1.5 ([GC 0x10160690
+0x10160694 0x1016072c 0x10160728]); ≠ 0: `∓TurnSpeed/11000` standing, `× 0.5` moving. Negative = left. Captures: stand-still turns 3.6 rad/s,
+walking turns 1.2–1.9 rad/s.
+
+**Integrator** (`Vehicle_t::Run` [VH 0x1000e849] → `FUN_1000e3d3`; substeps ≤ `Vehicle+0x104`, frames > 4.0 s skip; gravity `s_vGravityAccel = −20`):
+1. airborne: `vy += −20 dt`, `|vy| ≤ 50`;
+2. `CalcSteering` (vtbl [0x13] `FUN_10070fee`; none in modes 1, 8, 9): forward input > 0 → `SteeringForward`: force = body forward × F; < 0 →
+   `SteeringReverse` (× −1). `v += force/mass*dt`, then `|v| ≤ maxVel`. No input → velocity unchanged (only `Halt` stops);
+3. strafe/elevate (vtbl [0x14] `FUN_1007118c`): direct velocity `right*strafe + up*elevate`; standing: truncated to maxVel; moving: the sum of velocity and strafe
+   is rescaled to the forward speed (diagonals are not faster); `pos += that*dt`; `pos += v*dt`, `pos.y += vy*dt`;
+4. turn (vtbl [0x15] `FUN_1007124c`, angular velocity `(0, rate, 0)`): standing → body quaternion := `q(Y, rate*dt) * q`; moving →
+   **the velocity vector is rotated** (`FUN_100014c3`), the body follows;
+5. `EnsureSurfaceAlignment` [VH 0x1000d1aa] (collision, ground, landing) and OrientationMode 0 (`FUN_1000c616`): body heading :=
+   horizontal direction of the velocity (opposite of it while `SetDirection(−1)`).
+
+Heading convention (see the module doc): `q = (0, sin(yaw/2), 0, cos(yaw/2))`, forward = `rot(0,0,1) = (sin yaw, 0, cos yaw)`, `yaw` increases clockwise
+(right). Validated against the captured relayed moves (`docs/captures/zone_ithaca.rec`, char 33402): after ForwardStart the displacement direction
+`atan2(dx, dz)` equals `2*atan2(q.y, q.w)` to < 0.01 rad, reverse moves point at `yaw + π`, left turns decrease `yaw`; unit test
+`heading_convention_matches_capture`. Scene mapping: scene = (x, y, −z) ⇒ `ao_render::Camera` yaw = `yaw`.
+
+## 7. Jump and falling
+
+`JumpStart.Apply` [GC 0x1006d792] → `vtbl[0x2c]` = `FUN_1006f9e9(h)`: ignored while `PlayerVehicle+0x164 ≠ 0` (a jump is in progress);
+height `h = FUN_1005844d` = `max(0.5, (Agility(0x11) + Strength(0x10))/200 + 1)` (sums > 800 are clamped to 800 unless GmLevel ≠ 0; consts [GC
+0x1015f368 0x1015f358 0x10155eb8 0x1015d0a4]); a ceiling raycast shortens `h` (not ported); launch speed `vy = sqrt(2 h |g|)`, `Vehicle_t::Impact` +
+`EnableFalling`. Landing (`LandNow` → vtbl [0x6c] `FUN_1006eef9`): if jump state 3 → `Transition(0x10)` (JumpStop), `+0x164 := 0`. No
+key-release action exists for jumping (`SlotMovementJump` acts on `b == false` only). Walking off an edge starts the same fall without a
+JumpStart. Terminal speed ±50 m/s.
+
+## 8. Role / animation mapping
+
+`role()` returns `Role::{Idle, Walk, Run, WalkBack, RunBack, WalkLeft, WalkRight, Sneak, Swim, IdleSwim, Crawl, SitGround, SleepGround, Lounge, Hover, JumpStand,
+JumpForward}` from the FSM (the original picks anim ids in the Apply functions: 0x86/0x87 strafe left/right in every mode, 0xC4/0xC5 turn in place
+(no `Role`, mapped to Idle), 0x9C jump standing / 0x9D jump moving, 0xB9/0xBA/0xBB landings, 0x85 swim, 0x67 crawl, 0x88 walk back, 0xDE run back).
+`anim_scale()`: `FUN_1006fb56`: `max_vel / ref_speed` (ref = the base speed of the mode: walk 1.5, run 5 / reverse 3, swim 3, fly 7, crawl 1) ×
+`100/MonsterScale(0x168)`, capped at 1.3 when `max_vel > 4` (consts [GC 0x10160a8c 0x10160a88]); the animation-calibration control (`FUN_100017f7`) is not modelled.
+
+## 9. Unresolved / approximated (labelled GUESS in the code)
+
+* `EnsureSurfaceAlignment` is reduced to the `World` trait: wall slide, support below with a step tolerance `0.48 + 2·step` (consts [VH 0x100127e0,
+  0x100127d8], rays from `y + 0.4` [VH 0x100127f8]), fall when no support, landing when `vy ≤ 0` and `y ≤ ground`. The real function casts three rays per
+  step, aligns the body to the surface normal (OrientationMode 1/3/4), checks the slope (`a4 < 0.5` [VH 0x10012134]) and wades through
+  `LiquidMediumData_t::m_vLiquidHeight`; the body sphere radius is `n3Dynel_t::GetBodyCollSphereRadi` (per dynel).
+* `MAX_SUBSTEP` (`Vehicle+0x104`), the mass source (`Vehicle+0x34`), the mouse clamp factor `client+0x68`, the walk lock condition
+  (`dynel+0x2c8`, `FUN_1002e347`), mode 9 (`FUN_10070fee` and `N3Msg_StartCamping` test it), the pitch half of `VehicleForwardUpdate` (first person
+  only), the jump ceiling clamp, the fly vertical limits.
+* Features bits: only bits 2 and 4 are read here (4 = may act, 2 = may turn); names of the other bits unknown. The default in `Stats` is 4.
+* Sit: `N3Msg_SitToggle` when already sitting (or WaitState 0xF/0x10) sends `CharacterActionIIR_t` op 0x57 instead of a move (layout not decoded
+  here); `Movement::sit_toggle` returns `StandRequest` for the caller.
+* Server messages that really change the own mode (WaitState stat changes, `CharacterActionIIR_t`) are not traced; `Movement::transition(id)` runs
+  the FSM without sending.

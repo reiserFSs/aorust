@@ -1,0 +1,1659 @@
+//! The own character's movement: a headless port of the original client's movement state machine
+//! (`Movement_n::MovementStatus_t` / `CharMovementStatus_t`), `PlayerVehicle_t` inputs, `Vehicle_t` integrator
+//! and the `CharDCMoveIIR_t` producers (`n3EngineClientAnarchy_t::N3Msg_MovementChanged` & co.).
+//! Evidence, addresses and the unresolved parts: `docs/zone/movement.md`.
+//!
+//! Coordinates are SERVER coordinates (Y up). The heading `yaw` is the server quaternion heading
+//! `2*atan2(q.y, q.w)` (`q = (0, sin(yaw/2), 0, cos(yaw/2))`); *forward* in the server XZ plane is `(sin yaw, cos yaw)`
+//! (`Vehicle_t::s_cReferenceForward = (0,0,1)` rotated by the body quaternion [Vehicle.dll 0x10019398], confirmed against
+//! the captured relayed moves: displacement after a ForwardStart points along `atan2(dx,dz) == yaw`). A positive yaw
+//! step turns right (clockwise seen from above): ForwardStart at yaw 0 moves +Z, TurnRight raises yaw. In scene
+//! coordinates (`scene_pos(p) = (x, y, -z)`) the same heading is the `ao_render::Camera` yaw: `(sin yaw, 0, -cos yaw)`.
+#![allow(dead_code)] // the full original action/stat surface; play/flow.rs consumes the parts it needs
+
+use ao_formats::character::Role;
+use ao_net::n3::{dynel::CharDCMove, outgoing::CharMove};
+
+/// Terrain / collision queries in SERVER coordinates.
+pub trait World {
+    /// Height of the highest walkable support at or below `p.y` (the caller passes a point 0.4 m above the feet,
+    /// Vehicle.dll `EnsureSurfaceAlignment` casts its rays from `y + 0.4`), `None` if there is none within reach.
+    fn ground(&self, p: [f32; 3]) -> Option<f32>;
+    /// Horizontal collision: the position reached when moving `from -> to` (slides along walls; `y` is passed through).
+    fn slide(&self, from: [f32; 3], to: [f32; 3]) -> [f32; 3];
+}
+
+/// `Movement_n::Mode_e` values (`CharMovementStatus_t + 4`).
+pub mod mode {
+    pub const FROZEN: u8 = 1;
+    pub const WALK: u8 = 2;
+    pub const RUN: u8 = 3;
+    pub const SWIM: u8 = 4;
+    pub const CRAWL: u8 = 5;
+    pub const SNEAK: u8 = 6;
+    pub const FLY: u8 = 7;
+    pub const SIT_GROUND: u8 = 8;
+    pub const SLEEP: u8 = 0xB;
+    pub const LOUNGE: u8 = 0xC;
+}
+
+/// `Movement_n::MovementAction_e` ids (the `CharDCMove` move type) with the transition class each one builds
+/// in `FUN_1006c60f`. Ids without a constant (0x13, 0x14, 0x1f, 0x20, 0x2b..) build no transition.
+pub mod id {
+    pub const FORWARD_START: u8 = 1;
+    pub const FORWARD_STOP: u8 = 2;
+    pub const REVERSE_START: u8 = 3;
+    pub const REVERSE_STOP: u8 = 4;
+    pub const STRAFE_RIGHT_START: u8 = 5;
+    pub const STRAFE_RIGHT_STOP: u8 = 6;
+    pub const STRAFE_LEFT_START: u8 = 7;
+    pub const STRAFE_LEFT_STOP: u8 = 8;
+    pub const TURN_RIGHT_START: u8 = 9;
+    pub const MOUSE_TURN_RIGHT_START: u8 = 0xA;
+    pub const TURN_RIGHT_STOP: u8 = 0xB;
+    pub const TURN_LEFT_START: u8 = 0xC;
+    pub const MOUSE_TURN_LEFT_START: u8 = 0xD;
+    pub const TURN_LEFT_STOP: u8 = 0xE;
+    pub const JUMP_START: u8 = 0xF;
+    pub const JUMP_STOP: u8 = 0x10;
+    pub const ELEVATE_UP_START: u8 = 0x11;
+    pub const ELEVATE_UP_STOP: u8 = 0x12;
+    pub const FULL_STOP: u8 = 0x15;
+    /// Position/rotation sync: no FSM transition.
+    pub const SYNC: u8 = 0x16;
+    pub const SWITCH_FROZEN: u8 = 0x17;
+    pub const SWITCH_WALK: u8 = 0x18;
+    pub const SWITCH_RUN: u8 = 0x19;
+    pub const SWITCH_SWIM: u8 = 0x1A;
+    pub const SWITCH_CRAWL: u8 = 0x1B;
+    pub const SWITCH_SNEAK: u8 = 0x1C;
+    pub const SWITCH_FLY: u8 = 0x1D;
+    pub const SWITCH_SIT_GROUND: u8 = 0x1E;
+    pub const SWITCH_SLEEP: u8 = 0x21;
+    pub const SWITCH_LOUNGE: u8 = 0x22;
+    pub const LEAVE_SWIM: u8 = 0x23;
+    pub const LEAVE_SNEAK: u8 = 0x24;
+    pub const LEAVE_SIT: u8 = 0x25;
+    pub const LEAVE_FROZEN: u8 = 0x26;
+    pub const LEAVE_FLY: u8 = 0x27;
+    pub const LEAVE_CRAWL: u8 = 0x28;
+    pub const LEAVE_SLEEP: u8 = 0x29;
+    pub const LEAVE_LOUNGE: u8 = 0x2A;
+    /// `N3Msg_MouseMovement` pseudo action: local look rotation, rewritten to [`SYNC`] and never sent.
+    pub const MOUSE_LOOK: u8 = 0x2B;
+}
+
+/// The `TransitionAction_i` classes (vftables Gamecode 0x101606dc..0x10160918) a transition runs when applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Act {
+    ForwardStart,
+    ForwardStop,
+    ReverseStart,
+    ReverseStop,
+    StrafeRightStart,
+    StrafeLeftStart,
+    StrafeStop,
+    TurnRightStart,
+    MouseTurnRightStart,
+    TurnLeftStart,
+    MouseTurnLeftStart,
+    TurnStop,
+    JumpStart,
+    JumpStop,
+    ElevateUpStart,
+    ElevateUpStop,
+    FullStop,
+    ToFrozen,
+    ToWalk,
+    ToRun,
+    ToSwim,
+    ToCrawl,
+    ToSneak,
+    ToFly,
+    ToSitGround,
+    ToSleep,
+    ToLounge,
+    LeaveSwim,
+    LeaveSneak,
+    LeaveSit,
+    LeaveFrozen,
+    LeaveFly,
+    LeaveCrawl,
+    LeaveSleep,
+    LeaveLounge,
+}
+
+/// `Movement_n::MovementStatus_t` (ctor `FUN_1007038f`, Gamecode 0x1007038f): the state-machine variables.
+/// Axis fields are 1 = idle / 2 = moving (turn: 4 = turning, jump: 3 = jumping); direction fields name the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fsm {
+    /// `+4` mode ([`mode`]).
+    pub mode: u8,
+    /// `+8` forward/back axis.
+    pub fwd: u8,
+    /// `+0xC` 0 none, 1 forward, 2 reverse.
+    pub fwd_dir: u8,
+    /// `+0x10` strafe axis.
+    pub strafe: u8,
+    /// `+0x14` 0 none, 3 left, 4 right.
+    pub strafe_dir: u8,
+    /// `+0x18` elevate axis.
+    pub elev: u8,
+    /// `+0x1C` 0 none, 5 up.
+    pub elev_dir: u8,
+    /// `+0x20` turn axis.
+    pub turn: u8,
+    /// `+0x24` 0 none, 3 left, 4 right.
+    pub turn_dir: u8,
+    /// `+0x28` jump (1 idle, 3 jumping).
+    pub jump: u8,
+    /// `CharMovementStatus_t + 0x30`: last walk/run mode (ctor `FUN_1006c16d`: 2); the `Leave*` transitions return to it.
+    pub last_speed_mode: u8,
+}
+
+impl Default for Fsm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fsm {
+    /// Initial state: run mode (`FUN_1007038f` stores 3), everything idle, last speed mode walk (`FUN_1006c16d`).
+    pub const fn new() -> Fsm {
+        Fsm { mode: mode::RUN, fwd: 1, fwd_dir: 0, strafe: 1, strafe_dir: 0, elev: 1, elev_dir: 0, turn: 1, turn_dir: 0, jump: 1, last_speed_mode: mode::WALK }
+    }
+
+    /// `CharMovementStatus_t` vtable slot 7 (`FUN_1006c469`).
+    pub fn is_moving(&self) -> bool {
+        self.fwd == 2 || self.strafe == 2 || self.jump == 3 || self.mode == mode::FLY
+    }
+
+    /// `CharMovementStatus_t` vtable slot 3 (`FUN_1006c1ab`): may action `id` be started in the current mode?
+    pub fn allowed(&self, id: u8) -> bool {
+        use mode::*;
+        let p = id as u32;
+        match self.mode {
+            FROZEN => matches!(id, 9 | 0xB | 0xC | 0xE | 0x10 | 0x26),
+            // 0x1e (sit) additionally refuses while moving forward or jumping.
+            WALK => !(matches!(id, 0x18 | 0x21 | 0x22 | 0x25) || (id == 0x1E && (self.fwd == 2 || self.jump == 3))),
+            RUN => !(matches!(id, 0x19 | 0x21 | 0x22) || (id == 0x1E && (self.fwd == 2 || self.jump == 3))),
+            SWIM => !matches!(id, 5 | 7 | 0xF | 0x18 | 0x19 | 0x1B | 0x1C | 0x1D | 0x1E | 0x1F | 0x24 | 0x27 | 0x28),
+            CRAWL => {
+                if p < 0x1A {
+                    !(p > 0x17 || matches!(id, 5 | 7 | 0xF))
+                } else if p < 0x1C {
+                    true
+                } else {
+                    !(p < 0x1F || id == 0x27)
+                }
+            }
+            SNEAK => !matches!(id, 0x21 | 0x2A),
+            FLY => !matches!(id, 0x1B | 0x1C | 0x1E | 0x21 | 0x22 | 0x25 | 0x28 | 0x29 | 0x2A),
+            SIT_GROUND => {
+                if p > 0x19 {
+                    match id {
+                        0x1A => true,
+                        0x21 | 0x22 => !self.is_moving(),
+                        0x25 => true,
+                        _ => false,
+                    }
+                } else {
+                    matches!(id, 9..=0xE)
+                }
+            }
+            SLEEP => matches!(id, 0x1A | 0x22 | 0x29),
+            LOUNGE => matches!(id, 0x1A | 0x21 | 0x2A),
+            _ => true,
+        }
+    }
+
+    /// `CharMovementStatus_t` vtable slot 8 (`FUN_1006c60f`, 42-way jump table Gamecode 0x1006d0ee): the state after
+    /// action `id` and the transition class to run, or `None` when the case refuses (jump-table default).
+    /// `can_move` = Features (stat 0xE0) bit 4.
+    pub fn build(&self, id: u8, can_move: bool) -> Option<(Fsm, Act)> {
+        use mode::*;
+        let mut n = *self;
+        // Original quirk: the new elevate axis is initialised from the *strafe* axis (`FUN_100704f2` called twice).
+        n.elev = self.strafe;
+        let last = self.last_speed_mode;
+        // Leave* with the "no move feature" path: the original falls into the SwitchToFrozen case.
+        let frozen = |mut n: Fsm| {
+            n.mode = FROZEN;
+            Some((n, Act::ToFrozen))
+        };
+        let act = match id {
+            id::FORWARD_START => {
+                // idle -> forward, or reverse -> forward (two separate branches in the original, same result)
+                if !(self.fwd == 1 || (self.fwd == 2 && self.fwd_dir == 2)) {
+                    return None;
+                }
+                n.fwd = 2;
+                n.fwd_dir = 1;
+                Act::ForwardStart
+            }
+            id::FORWARD_STOP if self.fwd == 2 && self.fwd_dir == 1 => {
+                n.fwd = 1;
+                n.fwd_dir = 0;
+                Act::ForwardStop
+            }
+            id::REVERSE_START if self.fwd == 1 || (self.fwd == 2 && self.fwd_dir == 1) => {
+                n.fwd = 2;
+                n.fwd_dir = 2;
+                Act::ReverseStart
+            }
+            id::REVERSE_STOP if self.fwd == 2 && self.fwd_dir == 2 => {
+                n.fwd = 1;
+                n.fwd_dir = 0;
+                Act::ReverseStop
+            }
+            id::STRAFE_RIGHT_START if self.strafe == 1 || (self.strafe == 2 && self.strafe_dir == 3) => {
+                n.strafe = 2;
+                n.strafe_dir = 4;
+                Act::StrafeRightStart
+            }
+            id::STRAFE_RIGHT_STOP if self.strafe == 2 && self.strafe_dir == 4 => {
+                n.strafe = 1;
+                n.strafe_dir = 0;
+                Act::StrafeStop
+            }
+            id::STRAFE_LEFT_START if self.strafe == 1 || (self.strafe == 2 && self.strafe_dir == 4) => {
+                n.strafe = 2;
+                n.strafe_dir = 3;
+                Act::StrafeLeftStart
+            }
+            id::STRAFE_LEFT_STOP if self.strafe == 2 && self.strafe_dir == 3 => {
+                n.strafe = 1;
+                n.strafe_dir = 0;
+                Act::StrafeStop
+            }
+            id::TURN_RIGHT_START | id::MOUSE_TURN_RIGHT_START => {
+                n.turn = 4;
+                n.turn_dir = 4;
+                if id == id::TURN_RIGHT_START { Act::TurnRightStart } else { Act::MouseTurnRightStart }
+            }
+            id::TURN_LEFT_START | id::MOUSE_TURN_LEFT_START => {
+                n.turn = 4;
+                n.turn_dir = 3;
+                if id == id::TURN_LEFT_START { Act::TurnLeftStart } else { Act::MouseTurnLeftStart }
+            }
+            id::TURN_RIGHT_STOP if self.turn == 4 && self.turn_dir == 4 => {
+                n.turn = 1;
+                n.turn_dir = 0;
+                Act::TurnStop
+            }
+            id::TURN_LEFT_STOP if self.turn == 4 && self.turn_dir == 3 => {
+                n.turn = 1;
+                n.turn_dir = 0;
+                Act::TurnStop
+            }
+            id::JUMP_START if !(self.jump == 3 && self.mode != FLY) => {
+                n.jump = 3;
+                Act::JumpStart
+            }
+            id::JUMP_STOP if self.jump == 3 => {
+                if self.mode != FLY {
+                    n.jump = 1;
+                }
+                Act::JumpStop
+            }
+            id::ELEVATE_UP_START if self.mode == FLY => {
+                n.elev = 2;
+                n.elev_dir = 5;
+                Act::ElevateUpStart
+            }
+            id::ELEVATE_UP_STOP if self.elev == 2 && self.elev_dir == 5 => {
+                n.elev_dir = 0;
+                n.elev = 1;
+                Act::ElevateUpStop
+            }
+            id::FULL_STOP => {
+                n.fwd = 1;
+                n.fwd_dir = 0;
+                n.strafe = 1;
+                n.strafe_dir = 0;
+                n.turn = 1;
+                n.turn_dir = 0;
+                n.jump = 1;
+                n.elev = 1;
+                n.elev_dir = 0;
+                Act::FullStop
+            }
+            id::SWITCH_FROZEN => {
+                n.mode = FROZEN;
+                Act::ToFrozen
+            }
+            id::SWITCH_WALK => {
+                n.mode = WALK;
+                Act::ToWalk
+            }
+            id::SWITCH_RUN => {
+                n.mode = RUN;
+                n.last_speed_mode = RUN;
+                Act::ToRun
+            }
+            id::SWITCH_SWIM => {
+                n.mode = SWIM;
+                Act::ToSwim
+            }
+            id::SWITCH_CRAWL if self.jump == 1 && self.fwd == 1 => {
+                n.mode = CRAWL;
+                Act::ToCrawl
+            }
+            id::SWITCH_SNEAK => {
+                n.mode = SNEAK;
+                Act::ToSneak
+            }
+            id::SWITCH_FLY => {
+                n.mode = FLY;
+                Act::ToFly
+            }
+            id::SWITCH_SIT_GROUND if !self.is_moving() && can_move => {
+                n.mode = SIT_GROUND;
+                Act::ToSitGround
+            }
+            id::SWITCH_SLEEP if self.jump == 1 && self.fwd == 1 => {
+                n.mode = SLEEP;
+                Act::ToSleep
+            }
+            id::SWITCH_LOUNGE if !self.is_moving() && self.jump == 1 && self.fwd == 1 => {
+                n.mode = LOUNGE;
+                Act::ToLounge
+            }
+            id::LEAVE_SWIM => {
+                n.mode = last;
+                Act::LeaveSwim
+            }
+            id::LEAVE_SNEAK => {
+                n.mode = last;
+                Act::LeaveSneak
+            }
+            id::LEAVE_FROZEN => {
+                n.mode = last;
+                Act::LeaveFrozen
+            }
+            id::LEAVE_FLY => {
+                n.mode = last;
+                Act::LeaveFly
+            }
+            id::LEAVE_SIT => {
+                if !can_move {
+                    return frozen(n);
+                }
+                if self.mode == SIT_GROUND {
+                    n.mode = last;
+                }
+                Act::LeaveSit
+            }
+            id::LEAVE_CRAWL if !self.is_moving() => {
+                if !can_move {
+                    return frozen(n);
+                }
+                if self.mode == CRAWL {
+                    n.mode = last;
+                }
+                Act::LeaveCrawl
+            }
+            id::LEAVE_SLEEP if !self.is_moving() => {
+                if !can_move {
+                    return frozen(n);
+                }
+                if self.mode == SLEEP {
+                    n.mode = SIT_GROUND;
+                }
+                Act::LeaveSleep
+            }
+            id::LEAVE_LOUNGE if !self.is_moving() => {
+                if !can_move {
+                    return frozen(n);
+                }
+                if self.mode == LOUNGE {
+                    n.mode = SIT_GROUND;
+                }
+                Act::LeaveLounge
+            }
+            _ => return None,
+        };
+        Some((n, act))
+    }
+}
+
+/// The stats the movement code reads (`GetStat(id, flag)` on the dynel's stat block).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stats {
+    /// 0x9C RunSpeed.
+    pub run_speed: i32,
+    /// 0x1B Health.
+    pub health: i32,
+    /// 0x01 Life (max health).
+    pub max_health: i32,
+    /// 0x10B TurnSpeed (0 = default rates).
+    pub turn_speed: i32,
+    /// 0x10 Strength / 0x11 Agility (jump height `FUN_1005844d`).
+    pub strength: i32,
+    pub agility: i32,
+    /// 0xE0 Features: bit 2 = may turn, bit 4 = may move (`FUN_1006b84b`, `FUN_10044b6e(4)`).
+    pub features: i32,
+    /// 0x296 MechData (non-zero: driving a vehicle; jump refused by `N3Msg_MovementChanged`).
+    pub mech_data: i32,
+    /// 0xD7 GmLevel (bit 0 enables the fly switch, `FUN_1006b84b`).
+    pub gm_level: i32,
+    /// 0x168 MonsterScale (animation time scale `100/scale`, `FUN_1006fb56`; 0 = none).
+    pub monster_scale: i32,
+    /// 0x1AE WaitState (0 none, 2 sit, 0xE crawl, 0xF sleep, 0x10 lounge) used by the crawl/sit toggles.
+    pub wait_state: i32,
+}
+
+impl Stats {
+    pub fn new(run_speed: i32) -> Self {
+        Stats { run_speed, health: 1, max_health: 1, turn_speed: 0, strength: 0, agility: 0, features: 4, mech_data: 0, gm_level: 0, monster_scale: 0, wait_state: 0 }
+    }
+
+    /// `FUN_1006edb3`: RunSpeed, reduced linearly once health drops below 15 % of Life
+    /// (`ratio = health / (life * 0.15)`; `ratio < 1 -> ratio * (rs + 1000) - 1000`).
+    fn eff_run_speed(&self) -> f32 {
+        let ratio = self.health as f32 / (self.max_health as f32 * 0.15);
+        if ratio < 1.0 {
+            ratio * (self.run_speed as f32 + 1000.0) - 1000.0
+        } else {
+            self.run_speed as f32
+        }
+    }
+
+    /// `FUN_1005844d`: jump height in metres, `(Agility + Strength) / 200 + 1`, at least 0.5 (sums above 800 are
+    /// clamped to 800 unless GmLevel != 0).
+    fn jump_height(&self) -> f32 {
+        let (mut s, mut a) = (self.strength as f32, self.agility as f32);
+        if s + a > 800.0 && self.gm_level == 0 {
+            s = 800.0;
+            a = 0.0;
+        }
+        ((a + s) / 200.0 + 1.0).max(0.5)
+    }
+}
+
+/// Result of [`Movement::sit_toggle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SitToggle {
+    /// A `SwitchToSitGround` (0x1E) move was emitted.
+    Sat,
+    /// Already sitting (or WaitState sleep/lounge): the original sends `CharacterActionIIR_t` op 0x57 instead
+    /// (`N3Msg_SitToggle` Gamecode 0x10028e0a); the caller has to do that.
+    StandRequest,
+    /// Refused (moving).
+    Ignored,
+}
+
+const GRAVITY: f32 = -20.0; // Vehicle_t::s_vGravityAccel [Vehicle.dll 0x1001938c]
+const VY_LIMIT: f32 = 50.0; // f64 @ Vehicle.dll 0x10012748
+const MASS: f32 = 10.0; // default when Vehicle +0x34 == 0 [GC 0x1015f168]; the real mass source is unresolved
+const SPEED_EPS: f32 = 0.001; // f32 @ Vehicle.dll 0x1001270c
+const MAX_DT: f32 = 4.0; // f32 @ Vehicle.dll 0x10012804: longer frames skip the integration
+const MAX_SUBSTEP: f32 = 0.05; // [GUESS] Vehicle +0x104 is not initialised in the code read
+const STEP_UP: f32 = 0.4; // ray origin above the feet, f64 @ Vehicle.dll 0x100127f8
+const STEP_DOWN: f32 = 0.48; // f32 @ Vehicle.dll 0x100127e0 (+2 * step length while walking, f64 @ 0x100127d8)
+/// `CheckMotionUpdate`: idle timeout while moving and the rotation-change check [GC 0x101574fc, 0x101574f8, 0x101574f0].
+const SYNC_PERIOD: f32 = 5.0;
+const ROT_SYNC_MIN_AGE: f32 = 0.25;
+const ROT_SYNC_ANGLE: f32 = 0.17;
+
+/// The own character's kinematic state and the movement message producers.
+pub struct Movement {
+    pos: [f32; 3],
+    /// Horizontal velocity (`Vehicle +0x64 / +0x6c`).
+    vel: [f32; 2],
+    /// Vertical speed (`Vehicle +0x54`).
+    vy: f32,
+    yaw: f32,
+    /// `Vehicle +0x90` direction (1 forward, -1 while reversing).
+    dir: i32,
+    airborne: bool,
+    falling_enabled: bool,
+    launch_y: f32,
+    /// `PlayerVehicle +0x164 == 0`: a new jump may start.
+    jump_ready: bool,
+    fsm: Fsm,
+    stats: Stats,
+    /// `PlayerVehicle` inputs: +0x360 forward (1/-1), +0x364 strafe speed, +0x368 turn rate, +0x36C elevate speed.
+    in_fwd: f32,
+    in_strafe: f32,
+    in_turn: f32,
+    in_elev: f32,
+    max_vel: f32,
+    ref_speed: f32,
+    force: f32,
+    /// `Vehicle +0x10 vtbl[0x24]` (`FUN_10070fd0`): no path following and the dynel is not flagged.
+    controllable: bool,
+    /// `dynel + 0x2c8 != 0 && FUN_1002e347() != 0`: refuses the walk switch (unresolved condition).
+    walk_locked: bool,
+    /// `n3EngineClientAnarchy_t + 0x68` factor of the TurnSpeed mouse clamp (unresolved, 1.0).
+    mouse_scale: f32,
+    // --- n3EngineClientAnarchy_t motion-message bookkeeping ---
+    clock: f64,
+    /// `+0xD8` time of the last motion message, `+0xE0` its rotation, `+0xF0` its position.
+    last_msg_time: f64,
+    last_rot: [f32; 4],
+    last_msg_pos: [f32; 3],
+    /// `+0xFC`: the mouse rotated the character since the last sync.
+    look_dirty: bool,
+    /// `DAT_102e2588`: mouse-look turning is active.
+    mouse_look: bool,
+    /// `DAT_102e32d8`: time of the last `CharDCMove` write (`elapsed_ms` base).
+    last_write: f64,
+    /// `DAT_101bef94` / `dynel + 0x220` (`FUN_1005a5d6`).
+    zone_counter: i32,
+    zone_inst: u32,
+    snap_pending: bool,
+    outbox: Vec<CharMove>,
+}
+
+fn rot_of(yaw: f32) -> [f32; 4] {
+    [0.0, (yaw * 0.5).sin(), 0.0, (yaw * 0.5).cos()]
+}
+
+/// Heading of a server quaternion (`2*atan2(y, w)`, in `(-pi, pi]` for `w >= 0`).
+pub fn yaw_of(q: [f32; 4]) -> f32 {
+    2.0 * q[1].atan2(q[3])
+}
+
+fn wrap(a: f32) -> f32 {
+    let t = std::f32::consts::TAU;
+    let a = a % t;
+    if a > std::f32::consts::PI {
+        a - t
+    } else if a <= -std::f32::consts::PI {
+        a + t
+    } else {
+        a
+    }
+}
+
+fn truncate(v: [f32; 2], max: f32) -> [f32; 2] {
+    let l = (v[0] * v[0] + v[1] * v[1]).sqrt();
+    if l != 0.0 && max < l {
+        let k = max / l;
+        [v[0] * k, v[1] * k]
+    } else {
+        v
+    }
+}
+
+impl Movement {
+    /// Character standing at `pos` heading `yaw` (server quaternion heading), RunSpeed stat `run_speed`.
+    pub fn new(pos: [f32; 3], yaw: f32, run_speed: i16) -> Self {
+        let mut m = Movement {
+            pos,
+            vel: [0.0; 2],
+            vy: 0.0,
+            yaw: wrap(yaw),
+            dir: 1,
+            airborne: false,
+            falling_enabled: true,
+            launch_y: pos[1],
+            jump_ready: true,
+            fsm: Fsm::new(),
+            stats: Stats::new(run_speed as i32),
+            in_fwd: 0.0,
+            in_strafe: 0.0,
+            in_turn: 0.0,
+            in_elev: 0.0,
+            max_vel: 0.0,
+            ref_speed: 1.0,
+            force: 0.0,
+            controllable: true,
+            walk_locked: false,
+            mouse_scale: 1.0,
+            clock: 0.0,
+            last_msg_time: 0.0,
+            last_rot: rot_of(yaw),
+            last_msg_pos: pos,
+            look_dirty: false,
+            mouse_look: false,
+            last_write: 0.0,
+            zone_counter: -1,
+            zone_inst: 0,
+            snap_pending: false,
+            outbox: Vec::new(),
+        };
+        m.recalc();
+        m
+    }
+
+    // ---- getters -------------------------------------------------------------------------------------------------
+
+    /// Position in server coordinates (feet).
+    pub fn pos(&self) -> [f32; 3] {
+        self.pos
+    }
+    /// Heading: the server quaternion heading, forward is `(sin yaw, cos yaw)` in server XZ.
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+    /// The `GetRelRot()` quaternion `(x, y, z, w)`.
+    pub fn rot(&self) -> [f32; 4] {
+        rot_of(self.yaw)
+    }
+    pub fn grounded(&self) -> bool {
+        !self.airborne
+    }
+    pub fn fsm(&self) -> &Fsm {
+        &self.fsm
+    }
+    pub fn stats(&self) -> &Stats {
+        &self.stats
+    }
+    /// Update stats (RunSpeed, health, Features, ...) from the stat stream; speeds are recomputed.
+    pub fn set_stats(&mut self, f: impl FnOnce(&mut Stats)) {
+        f(&mut self.stats);
+        self.recalc();
+    }
+    /// Current horizontal speed in m/s.
+    pub fn speed(&self) -> f32 {
+        (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt()
+    }
+    /// `Vehicle +0x3C` maximum speed of the current mode (m/s).
+    pub fn max_speed(&self) -> f32 {
+        self.max_vel
+    }
+    /// Playback speed factor of the movement clips (`FUN_1006fb56`: `max_vel / ref_speed`, times `100 / MonsterScale`,
+    /// at most 1.3 when `max_vel > 4`). The animation-calibration control factor (`FUN_100017f7`) is not modelled.
+    pub fn anim_scale(&self) -> f32 {
+        let mut s = self.max_vel / self.ref_speed;
+        if self.stats.monster_scale != 0 {
+            s *= 100.0 / self.stats.monster_scale as f32;
+        }
+        if s > 1.3 && self.max_vel > 4.0 {
+            s = 1.3;
+        }
+        s
+    }
+
+    /// Clip role for the current state. The original also plays turn-in-place clips (anim ids 0xC4/0xC5), which have no
+    /// [`Role`]; those states map to idle. Strafing plays WalkLeft/WalkRight in every mode (anim ids 0x86/0x87).
+    pub fn role(&self) -> Role {
+        use mode::*;
+        let f = &self.fsm;
+        let moving_h = f.fwd == 2 || f.strafe == 2;
+        if self.airborne || f.jump == 3 {
+            return if f.mode == FLY { Role::Hover } else if f.fwd == 2 { Role::JumpForward } else { Role::JumpStand };
+        }
+        match f.mode {
+            SIT_GROUND => Role::SitGround,
+            CRAWL => Role::Crawl,
+            SLEEP => Role::SleepGround,
+            LOUNGE => Role::Lounge,
+            FLY => Role::Hover,
+            SWIM => {
+                if moving_h {
+                    Role::Swim
+                } else {
+                    Role::IdleSwim
+                }
+            }
+            _ => {
+                let fast = f.mode == RUN;
+                if f.fwd == 2 {
+                    match (f.fwd_dir, f.mode) {
+                        (2, _) => {
+                            if fast {
+                                Role::RunBack
+                            } else {
+                                Role::WalkBack
+                            }
+                        }
+                        (_, SNEAK) => Role::Sneak,
+                        _ => {
+                            if fast {
+                                Role::Run
+                            } else {
+                                Role::Walk
+                            }
+                        }
+                    }
+                } else if f.strafe == 2 {
+                    if f.strafe_dir == 3 {
+                        Role::WalkLeft
+                    } else {
+                        Role::WalkRight
+                    }
+                } else {
+                    Role::Idle
+                }
+            }
+        }
+    }
+
+    // ---- inputs --------------------------------------------------------------------------------------------------
+
+    /// `N3Msg_MovementChanged(action, 0, 0, true)`: a key slot fired `action` (GUI slots always pass the 4th argument
+    /// `true`). `now` is the game time in seconds. The resulting `CharDCMove` (if any) is returned by the next
+    /// [`Movement::update`] / [`Movement::take_outgoing`].
+    pub fn action(&mut self, action: u8, now: f32) {
+        self.sync_clock(now);
+        self.movement_changed(action, 0.0, 0.0);
+    }
+
+    /// `N3Msg_MouseMovement(dx, dy)`: mouse-look yaw delta `dx` in radians (positive = right); `dy` only matters in
+    /// first person and is not applied (the pitch half of `VehicleForwardUpdate` is not ported).
+    pub fn mouse_turn(&mut self, dx: f32, dy: f32, now: f32) {
+        self.sync_clock(now);
+        if !self.mouse_look {
+            // First event: keyboard turning becomes strafing while the mouse steers.
+            if self.fsm.turn_dir == 3 && self.in_turn != 0.0 {
+                self.movement_changed(id::TURN_LEFT_STOP, 0.0, 0.0);
+                self.movement_changed(id::STRAFE_LEFT_START, 0.0, 0.0);
+            } else if self.fsm.turn_dir == 4 && self.in_turn != 0.0 {
+                self.movement_changed(id::TURN_RIGHT_STOP, 0.0, 0.0);
+                self.movement_changed(id::STRAFE_RIGHT_START, 0.0, 0.0);
+            }
+        }
+        self.mouse_look = true;
+        if self.stats.features & 6 == 0 {
+            return;
+        }
+        let mut dx = dx;
+        if self.stats.turn_speed != 0 {
+            // GetStat(0x10B): |dx| <= TurnSpeed / 100000 * (n3EngineClientAnarchy + 0x68, unresolved -> mouse_scale).
+            let lim = self.stats.turn_speed as f32 / 100000.0 * self.mouse_scale;
+            dx = dx.clamp(-lim, lim);
+        }
+        let td = self.fsm.turn_dir;
+        if dx >= 0.0 {
+            if td != 0 && td != 3 {
+                self.movement_changed(id::MOUSE_LOOK, dx, dy);
+            } else {
+                self.movement_changed(id::MOUSE_TURN_RIGHT_START, 0.0, 0.0);
+            }
+        } else if td == 0 || td == 4 {
+            self.movement_changed(id::MOUSE_TURN_LEFT_START, 0.0, 0.0);
+        } else {
+            self.movement_changed(id::MOUSE_LOOK, dx, dy);
+        }
+    }
+
+    /// `N3Msg_EndMouseMovement` (mouse-look button released): stop the mouse turn and the mouse-look strafes.
+    pub fn end_mouse_look(&mut self, now: f32) {
+        self.sync_clock(now);
+        self.mouse_look = false;
+        if self.fsm.turn == 4 {
+            let a = if self.fsm.turn_dir == 4 { id::TURN_RIGHT_STOP } else { id::TURN_LEFT_STOP };
+            self.movement_changed(a, 0.0, 0.0);
+        }
+        if self.fsm.strafe == 2 {
+            self.movement_changed(id::STRAFE_LEFT_STOP, 0.0, 0.0);
+            self.movement_changed(id::STRAFE_RIGHT_STOP, 0.0, 0.0);
+        }
+    }
+
+    /// Walk/run toggle: switch to the other speed mode (0x18 walk / 0x19 run; the permission table refuses the one
+    /// that is already active).
+    pub fn toggle_run(&mut self, now: f32) {
+        let a = if self.fsm.mode == mode::RUN { id::SWITCH_WALK } else { id::SWITCH_RUN };
+        self.action(a, now);
+    }
+
+    /// `N3Msg_SitToggle` (Gamecode 0x10028e0a), movement part.
+    pub fn sit_toggle(&mut self, now: f32) -> SitToggle {
+        if self.fsm.is_moving() {
+            return SitToggle::Ignored;
+        }
+        if self.stats.wait_state == 0xF || self.stats.wait_state == 0x10 || self.fsm.mode == mode::SIT_GROUND {
+            return SitToggle::StandRequest;
+        }
+        self.action(id::SWITCH_SIT_GROUND, now);
+        SitToggle::Sat
+    }
+
+    /// `N3Msg_CrawlToggle` (Gamecode 0x278c9): no-op while swimming.
+    pub fn crawl_toggle(&mut self, now: f32) {
+        if self.fsm.mode == mode::SWIM {
+            return;
+        }
+        let a = if self.stats.wait_state == 0xE { id::LEAVE_CRAWL } else { id::SWITCH_CRAWL };
+        self.action(a, now);
+    }
+
+    /// Server-driven state change (stat WaitState changes, `CharacterActionIIR_t`): runs the FSM transition without
+    /// sending anything. Returns whether the transition was taken.
+    pub fn transition(&mut self, id: u8) -> bool {
+        if !self.fsm.allowed(id) {
+            return false;
+        }
+        let Some((n, act)) = self.fsm.build(id, self.stats.features & 4 != 0) else { return false };
+        let old = std::mem::replace(&mut self.fsm, n);
+        self.apply_act(act, &old);
+        true
+    }
+
+    /// A `CharDCMoveIIR_t` received from the server for the own character. The original drops it
+    /// (`FUN_1006bcc6`: the control dynel only accepts messages it created itself, `ToBePassedOn == 1`), so this
+    /// changes nothing and returns `false`. Position corrections arrive as teleports ([`Movement::teleport`]).
+    pub fn server_move(&mut self, _mv: &CharDCMove) -> bool {
+        false
+    }
+
+    /// Place the character (spawn, teleport, playfield change): velocity and inputs are cleared.
+    pub fn teleport(&mut self, pos: [f32; 3], yaw: f32) {
+        self.pos = pos;
+        self.yaw = wrap(yaw);
+        self.vel = [0.0; 2];
+        self.vy = 0.0;
+        self.airborne = false;
+        self.launch_y = pos[1];
+        self.jump_ready = true;
+        self.fsm = Fsm { last_speed_mode: self.fsm.last_speed_mode, mode: self.fsm.mode, ..Fsm::new() };
+        self.in_fwd = 0.0;
+        self.in_strafe = 0.0;
+        self.in_turn = 0.0;
+        self.in_elev = 0.0;
+        self.dir = 1;
+        self.look_dirty = false;
+        self.last_rot = rot_of(self.yaw);
+        self.last_msg_pos = pos;
+        self.recalc();
+    }
+
+    /// `dynel + 0x220 / GetZoneInstanceID` changed (zone border crossed): arms the sync of `FUN_1005a5d6`.
+    pub fn zone_instance(&mut self, zone: u32) {
+        if zone != self.zone_inst {
+            if self.zone_inst != 0 && self.zone_counter == -1 {
+                self.zone_counter = 2;
+            }
+            self.zone_inst = zone;
+        }
+    }
+
+    /// Vehicle path-following / dead dynel: refuses all movement actions (`FUN_10070fd0`).
+    pub fn set_controllable(&mut self, c: bool) {
+        self.controllable = c;
+    }
+
+    /// Messages produced since the last call.
+    pub fn take_outgoing(&mut self) -> Vec<CharMove> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    // ---- per-frame -----------------------------------------------------------------------------------------------
+
+    /// Advance by `dt` seconds (`Vehicle_t::Run`), then `CheckMotionUpdate`; returns every `CharDCMove` to send.
+    pub fn update(&mut self, dt: f32, world: &dyn World) -> Vec<CharMove> {
+        self.clock += dt.max(0.0) as f64;
+        if self.snap_pending {
+            self.snap_pending = false;
+            if let Some(g) = world.ground([self.pos[0], self.pos[1] + STEP_UP, self.pos[2]]) {
+                self.pos[1] = g;
+            }
+        }
+        if dt > 0.0 && dt <= MAX_DT {
+            let mut left = dt;
+            while left > 0.0 {
+                let h = left.min(MAX_SUBSTEP);
+                self.step(h, world);
+                left -= h;
+            }
+        }
+        // FUN_1005a5d6: two frames after a zone change a sync is sent.
+        if self.zone_counter > 0 {
+            self.zone_counter -= 1;
+        }
+        if self.zone_counter == 0 {
+            self.emit(id::SYNC, 0.0, 0.0);
+            self.zone_counter = -1;
+        }
+        self.check_motion_update();
+        self.take_outgoing()
+    }
+
+    // ---- internals -----------------------------------------------------------------------------------------------
+
+    fn sync_clock(&mut self, now: f32) {
+        if now as f64 > self.clock {
+            self.clock = now as f64;
+        }
+    }
+
+    /// `n3EngineClientAnarchy_t::N3Msg_MovementChanged` [GC 0x18b5c].
+    fn movement_changed(&mut self, mut action: u8, f1: f32, f2: f32) {
+        let mut local = false;
+        if action == id::MOUSE_LOOK {
+            action = id::SYNC;
+            local = true;
+        }
+        if !self.controllable || !self.fsm.allowed(action) {
+            return;
+        }
+        if self.fsm.mode == mode::FLY && action == id::JUMP_START {
+            return;
+        }
+        if action == id::JUMP_START && self.stats.mech_data != 0 {
+            return;
+        }
+        if action == id::SWITCH_WALK && self.walk_locked {
+            return;
+        }
+        if self.fsm.mode == mode::SIT_GROUND && action == id::SWITCH_SNEAK {
+            return;
+        }
+        if self.mouse_look {
+            action = match action {
+                id::TURN_LEFT_START => id::STRAFE_LEFT_START,
+                id::TURN_RIGHT_START => id::STRAFE_RIGHT_START,
+                id::TURN_LEFT_STOP => id::STRAFE_LEFT_STOP,
+                id::TURN_RIGHT_STOP => id::STRAFE_RIGHT_STOP,
+                a => a,
+            };
+        }
+        if local {
+            // dynel->vtbl[0x74] = n3Dynel_t::VehicleForwardUpdate(zero, rot, dx, dy): the yaw part.
+            self.yaw = wrap(self.yaw + f1);
+            self.look_dirty = true;
+        } else {
+            self.emit(action, f1, f2);
+        }
+    }
+
+    /// `FUN_1006ba23` (build from the current pose) + `FUN_1006b84b` (apply) + `SendIIRToServer` (write).
+    fn emit(&mut self, action: u8, f1: f32, f2: f32) {
+        let mut msg = CharMove { action, pos: self.pos, rot: self.rot(), elapsed_ms: 0, look: [f1, f2] };
+        // FUN_1006bcc6 -> UpdateLastMotionMessageData
+        self.last_msg_time = self.clock;
+        self.last_rot = msg.rot;
+        self.last_msg_pos = msg.pos;
+        let feat = self.stats.features;
+        if feat & 6 != 0 && (feat & 4 != 0 || (8 < action && action < 15)) {
+            // action 0x16: VehicleForwardUpdate(pos, rot, 0, 0) changes nothing for the own, already placed dynel.
+            let gm_fly_ok = self.stats.gm_level & 1 != 0;
+            if !(action == id::SWITCH_FLY && !gm_fly_ok) {
+                self.transition(action);
+            }
+        }
+        // FUN_1006bc55: elapsed = (int)((now - last_write) * 1000), truncated (CVTTSD2SI).
+        msg.elapsed_ms = ((self.clock - self.last_write) * 1000.0) as i32;
+        self.last_write = self.clock;
+        self.outbox.push(msg);
+    }
+
+    /// `n3EngineClientAnarchy_t::CheckMotionUpdate` [GC 0x18eb8].
+    fn check_motion_update(&mut self) {
+        let age = (self.clock - self.last_msg_time) as f32;
+        if SYNC_PERIOD < age && self.fsm.is_moving() {
+            self.movement_changed(id::SYNC, 0.0, 0.0);
+            return;
+        }
+        if ROT_SYNC_MIN_AGE < age && self.look_dirty {
+            let (a, b) = (self.rot(), self.last_rot);
+            let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+            if dot.clamp(-1.0, 1.0).acos() > ROT_SYNC_ANGLE {
+                self.movement_changed(id::SYNC, 0.0, 0.0);
+                self.look_dirty = false;
+            }
+        }
+    }
+
+    fn forward(&self) -> [f32; 2] {
+        [self.yaw.sin(), self.yaw.cos()]
+    }
+
+    /// `FUN_1006f4a2` (the speed part): per-mode maximum speed, reference speed (animation) and steering force.
+    fn recalc(&mut self) {
+        use mode::*;
+        let rs = self.stats.eff_run_speed();
+        let (reference, v) = match self.fsm.mode {
+            RUN if self.fsm.fwd_dir == 2 => (3.0, (rs * 0.002_545_454_5 + 3.0).clamp(1.05, 9.1)),
+            RUN => (5.0, (rs / 275.0 + 5.0).clamp(1.5, 13.0)),
+            SWIM => (3.0, (rs / 440.0 + 3.0).clamp(1.5, 8.0)),
+            CRAWL => (1.0, 1.0),
+            FLY => (7.0, (rs / 275.0 + 7.0).clamp(1.5, 15.0)),
+            _ => (1.5, 1.5),
+        };
+        self.ref_speed = reference;
+        self.max_vel = v;
+        self.force = (2.0 * MASS * v).min(100_000.0).min(10_000.0);
+        if self.fsm.mode == FLY {
+            self.falling_enabled = false;
+            self.airborne = false;
+            self.vy = 0.0;
+        }
+    }
+
+    /// `FUN_1006f894`: strafe speed for the speed class `m` (2 walk/sneak, 3 run, 7 fly): half the forward speed,
+    /// except walking (the full 1.5).
+    fn strafe_speed(&self, m: u8) -> f32 {
+        let rs = self.stats.eff_run_speed();
+        let (base, div, max) = match m {
+            2 => return 1.5,
+            3 => (5.0, 275.0, 13.0),
+            4 => (3.0, 440.0, 8.0),
+            _ => (7.0, 275.0, 15.0),
+        };
+        (base * 0.5 + rs * (0.5 / div)).min(0.5 * max).max(0.75)
+    }
+
+    fn strafe_class(&self) -> u8 {
+        match self.fsm.mode {
+            mode::WALK | mode::SNEAK => 2,
+            mode::FLY => 7,
+            _ => 3,
+        }
+    }
+
+    /// Turn rate (rad/s, negative = left) for a key turn: `FUN_1006d3fe` / `FUN_1006d4e9` / `FUN_1006c506`.
+    fn turn_rate(&self, sign: f32) -> f32 {
+        let st = self.stats.turn_speed as f32;
+        let idle = self.fsm.fwd == 1;
+        match (idle, self.stats.turn_speed == 0) {
+            (true, true) => sign * 3.5,
+            (true, false) => sign * st / 11000.0,
+            (false, true) => sign * 1.5,
+            (false, false) => sign * st / 11000.0 * 0.5,
+        }
+    }
+
+    /// `FUN_1006c506`: after forward/back start/stop an active key turn switches between the standing and moving rate.
+    fn retune_turn(&mut self) {
+        if self.in_turn != 0.0 && self.fsm.turn != 1 {
+            let sign = if self.fsm.turn_dir == 3 { -1.0 } else { 1.0 };
+            self.in_turn = self.turn_rate(sign);
+        }
+    }
+
+    /// `Vehicle_t::Halt`.
+    fn halt(&mut self) {
+        self.vel = [0.0; 2];
+    }
+
+    fn enable_falling(&mut self) {
+        if !self.falling_enabled {
+            self.falling_enabled = true;
+            self.airborne = true; // LandNow + FUN_1000a1a7: fly -> walk starts a fall
+            self.vy = 0.0;
+            self.launch_y = self.pos[1];
+        }
+    }
+
+    /// `Vehicle_t::DisableFalling`.
+    fn disable_falling(&mut self) {
+        self.falling_enabled = false;
+        self.airborne = false;
+        self.vy = 0.0;
+    }
+
+    /// `FUN_1006f9e9` (vtable +0x2c): launch with `sqrt(2 h g)`; the ceiling clamp is not ported (needs a ceiling query).
+    fn jump_impulse(&mut self, h: f32) {
+        if !self.jump_ready {
+            return;
+        }
+        self.jump_ready = false;
+        self.launch_y = self.pos[1];
+        if !self.airborne {
+            self.vy += (2.0 * h * GRAVITY.abs()).sqrt();
+            self.airborne = true;
+        }
+    }
+
+    /// `Vehicle` landing callback `FUN_1006eef9`.
+    fn on_land(&mut self, y: f32) {
+        if self.fsm.jump == 3 {
+            self.transition(id::JUMP_STOP);
+        }
+        self.jump_ready = true;
+        self.launch_y = y;
+    }
+
+    /// The `Apply` virtual of the transition classes (`old` = the state before, `self.fsm` = the new state).
+    fn apply_act(&mut self, act: Act, old: &Fsm) {
+        match act {
+            Act::ForwardStart => {
+                self.set_direction(1);
+                self.in_fwd = 1.0;
+                self.recalc();
+                self.retune_turn();
+            }
+            Act::ForwardStop => {
+                self.in_fwd = 0.0;
+                self.halt();
+                self.recalc();
+                self.retune_turn();
+            }
+            Act::ReverseStart => {
+                self.in_fwd = -1.0;
+                self.set_direction(-1);
+                self.recalc();
+                self.retune_turn();
+            }
+            Act::ReverseStop => {
+                self.in_fwd = 0.0;
+                self.halt();
+                self.set_direction(1);
+                self.recalc();
+                self.retune_turn();
+            }
+            Act::TurnLeftStart => self.in_turn = self.turn_rate(-1.0),
+            Act::TurnRightStart => self.in_turn = self.turn_rate(1.0),
+            Act::MouseTurnLeftStart | Act::MouseTurnRightStart | Act::TurnStop => self.in_turn = 0.0,
+            Act::StrafeLeftStart | Act::StrafeRightStart => {
+                let sign = if act == Act::StrafeLeftStart { -1.0 } else { 1.0 };
+                self.in_strafe = sign * self.strafe_speed(self.strafe_class());
+                self.recalc();
+            }
+            Act::StrafeStop => self.in_strafe = 0.0,
+            Act::JumpStart => {
+                self.recalc();
+                let h = self.stats.jump_height();
+                self.jump_impulse(h);
+            }
+            Act::JumpStop => {}
+            Act::ElevateUpStart => {
+                self.recalc();
+                self.in_elev = 3.0;
+            }
+            Act::ElevateUpStop => self.in_elev = -0.8,
+            Act::FullStop => {
+                self.halt();
+                self.set_direction(1);
+                self.in_fwd = 0.0;
+                self.in_strafe = 0.0;
+                self.in_turn = 0.0;
+            }
+            Act::ToFrozen => {
+                self.halt();
+                self.set_direction(1);
+                self.in_fwd = 0.0;
+                self.in_strafe = 0.0;
+                self.in_turn = 0.0;
+                self.leave_fly(old);
+            }
+            Act::ToWalk | Act::ToRun => {
+                self.recalc();
+                self.fsm.last_speed_mode = if act == Act::ToRun { mode::RUN } else { mode::WALK };
+                self.leave_fly(old);
+            }
+            Act::ToSwim => {
+                self.recalc();
+                if old.strafe != 1 {
+                    self.in_strafe = 0.0;
+                }
+                self.leave_fly(old);
+                self.in_elev = 0.0;
+            }
+            Act::LeaveSwim | Act::LeaveSit | Act::LeaveFrozen => self.recalc(),
+            Act::ToSneak => {
+                if old.strafe == 2 {
+                    let sign = if old.strafe_dir == 3 { -1.0 } else { 1.0 };
+                    self.in_strafe = sign * self.strafe_speed(2);
+                }
+                self.recalc();
+            }
+            Act::LeaveSneak => self.recalc(),
+            Act::ToFly => {
+                self.recalc();
+                self.disable_falling();
+                self.pos[1] += 0.5;
+            }
+            Act::LeaveFly => {
+                self.recalc();
+                self.enable_falling();
+                self.pos[1] += 0.1;
+                self.in_elev = 0.0;
+            }
+            Act::ToSitGround => {
+                self.recalc();
+                self.halt();
+            }
+            Act::ToCrawl | Act::ToSleep | Act::ToLounge | Act::LeaveCrawl | Act::LeaveSleep | Act::LeaveLounge => {
+                self.recalc();
+                // CalculateGroundPoint + SetRelPos
+                self.snap_pending = true;
+            }
+        }
+    }
+
+    fn leave_fly(&mut self, old: &Fsm) {
+        if old.mode == mode::FLY {
+            self.enable_falling();
+            self.pos[1] += 0.1;
+            self.in_elev = 0.0;
+        }
+    }
+
+    /// `Vehicle_t::SetDirection`: a direction change halts.
+    fn set_direction(&mut self, d: i32) {
+        if d != self.dir {
+            self.halt();
+        }
+        self.dir = d;
+    }
+
+    /// One `Vehicle_t` sub-step (`FUN_1000e3d3` loop body) followed by `EnsureSurfaceAlignment`.
+    fn step(&mut self, h: f32, world: &dyn World) {
+        let old = self.pos;
+        let mode = self.fsm.mode;
+        // gravity
+        if self.airborne {
+            self.vy = (self.vy + GRAVITY * h).clamp(-VY_LIMIT, VY_LIMIT);
+        }
+        // CalcSteering (PlayerVehicle vtbl[0x13]): forward / reverse thrust along the body forward.
+        let steer = !matches!(mode, 1 | 8 | 9) && self.in_fwd != 0.0;
+        if steer || self.airborne {
+            if steer {
+                let f = self.forward();
+                let k = self.force * self.in_fwd.signum() / MASS * h;
+                self.vel[0] += f[0] * k;
+                self.vel[1] += f[1] * k;
+            }
+            self.vel = truncate(self.vel, self.max_vel);
+        }
+        let speed = self.speed();
+        let moving = speed > SPEED_EPS;
+        let mut v = self.vel;
+        // vtbl[0x14]: strafe (+ elevate) as a direct velocity.
+        if self.in_strafe != 0.0 || self.in_elev != 0.0 {
+            let f = self.forward();
+            let right = [f[1], -f[0]];
+            let mut s = [right[0] * self.in_strafe, right[1] * self.in_strafe];
+            if !moving {
+                s = truncate(s, self.max_vel);
+            } else {
+                let sum = [v[0] + s[0], v[1] + s[1]];
+                let l = (sum[0] * sum[0] + sum[1] * sum[1]).sqrt();
+                if l > 0.0 {
+                    let k = speed / l;
+                    v = [v[0] * k, v[1] * k];
+                    s = [s[0] * k, s[1] * k];
+                }
+            }
+            self.pos[0] += s[0] * h;
+            self.pos[2] += s[1] * h;
+            self.pos[1] += self.in_elev * h;
+        }
+        if moving || self.vy != 0.0 {
+            self.pos[0] += v[0] * h;
+            self.pos[2] += v[1] * h;
+            self.pos[1] += self.vy * h;
+        }
+        // vtbl[0x15]: turning. Standing: the body turns; moving: the velocity vector turns and the body follows it.
+        if self.in_turn.abs() > 1e-4 {
+            let a = self.in_turn * h;
+            if self.vel == [0.0, 0.0] {
+                self.yaw = wrap(self.yaw + a);
+            } else {
+                let (s, c) = a.sin_cos();
+                self.vel = [self.vel[0] * c + self.vel[1] * s, -self.vel[0] * s + self.vel[1] * c];
+            }
+        }
+        self.align(old, world);
+        // OrientationMode 0 (FUN_1000c616): the body faces the velocity (away from it while reversing).
+        if self.vel != [0.0, 0.0] {
+            let sg = if self.dir < 0 { -1.0 } else { 1.0 };
+            self.yaw = (sg * self.vel[0]).atan2(sg * self.vel[1]);
+        }
+    }
+
+    /// `Vehicle_t::EnsureSurfaceAlignment`, reduced to what [`World`] offers: wall sliding, snapping to the support
+    /// below (step tolerance `0.48 + 2 * step length`), start of a fall and landing. The multi-ray slope / liquid /
+    /// normal-alignment handling of the original is not ported (see docs/zone/movement.md).
+    fn align(&mut self, old: [f32; 3], world: &dyn World) {
+        let target = self.pos;
+        let slid = world.slide(old, target);
+        self.pos = [slid[0], target[1], slid[2]];
+        let mode = self.fsm.mode;
+        if mode == mode::FLY {
+            if let Some(g) = world.ground([self.pos[0], self.pos[1] + STEP_UP, self.pos[2]]) {
+                self.pos[1] = self.pos[1].max(g + 0.1);
+            }
+            return;
+        }
+        if !self.falling_enabled {
+            return;
+        }
+        let hstep = ((self.pos[0] - old[0]).powi(2) + (self.pos[2] - old[2]).powi(2)).sqrt();
+        let ground = world.ground([self.pos[0], old[1].max(self.pos[1]) + STEP_UP, self.pos[2]]);
+        if self.airborne {
+            let floor = ground.unwrap_or(self.launch_y);
+            if self.vy <= 0.0 && self.pos[1] <= floor {
+                self.pos[1] = floor;
+                self.vy = 0.0;
+                self.airborne = false;
+                self.on_land(floor);
+            }
+        } else {
+            match ground {
+                Some(g) if g >= old[1] - (STEP_DOWN + 2.0 * hstep) => self.pos[1] = g,
+                Some(_) => {
+                    // walked off an edge
+                    self.pos[1] = old[1];
+                    self.airborne = true;
+                    self.vy = 0.0;
+                    self.launch_y = old[1];
+                }
+                None => self.pos[1] = old[1],
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ao_net::n3::outgoing::{char_dc_move, parse_char_dc_move};
+
+    struct Flat(f32);
+    impl World for Flat {
+        fn ground(&self, _p: [f32; 3]) -> Option<f32> {
+            Some(self.0)
+        }
+        fn slide(&self, _from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
+            to
+        }
+    }
+    /// Wall at x >= 10.
+    struct Wall;
+    impl World for Wall {
+        fn ground(&self, _p: [f32; 3]) -> Option<f32> {
+            Some(0.0)
+        }
+        fn slide(&self, _from: [f32; 3], mut to: [f32; 3]) -> [f32; 3] {
+            to[0] = to[0].min(10.0);
+            to
+        }
+    }
+
+    fn run(m: &mut Movement, w: &dyn World, secs: f32) -> Vec<CharMove> {
+        let mut out = Vec::new();
+        let n = (secs * 60.0).round() as usize;
+        for _ in 0..n {
+            out.extend(m.update(1.0 / 60.0, w));
+        }
+        out
+    }
+
+    #[test]
+    fn walk_straight_stop_and_bytes() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([100.0, 0.0, 200.0], 0.0, 0);
+        m.action(id::FORWARD_START, 10.0);
+        let out = run(&mut m, &w, 0.0);
+        assert!(out.is_empty());
+        let out = m.take_outgoing();
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].action, out[0].pos, out[0].rot), (1, [100.0, 0.0, 200.0], [0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(out[0].elapsed_ms, 10_000); // first write: now * 1000
+        run(&mut m, &w, 2.0);
+        assert!((m.speed() - 5.0).abs() < 1e-3, "run speed {}", m.speed());
+        // accel 2*v for 0.5 s (1.25 m) + 1.5 s at 5 m/s
+        let d = m.pos()[2] - 200.0;
+        assert!((d - 8.75).abs() < 0.15, "dist {d}");
+        assert!((m.pos()[0] - 100.0).abs() < 1e-3);
+        assert_eq!(m.role(), Role::Run);
+        m.action(id::FORWARD_STOP, 12.0);
+        let out = m.take_outgoing();
+        assert_eq!((out[0].action, out[0].elapsed_ms), (2, 2000));
+        assert!((out[0].pos[2] - m.pos()[2]).abs() < 1e-5);
+        assert_eq!(m.speed(), 0.0);
+        assert_eq!(m.role(), Role::Idle);
+        // wire round trip
+        let bytes = char_dc_move(25988, &out[0]);
+        let (t, flag, back) = parse_char_dc_move(&bytes).unwrap();
+        assert_eq!((t.instance, flag, back), (25988, 1, out[0]));
+    }
+
+    #[test]
+    fn heading_convention_matches_capture() {
+        // Captured relayed move of char 33402 (zone_ithaca.rec, t=70451): quaternion y/w and the position it ended at.
+        let q = [0.0, -0.781_885_74, 0.0, 0.623_421_8];
+        let yaw = yaw_of(q);
+        let mut m = Movement::new([864.926_33, 40.004_997, 692.192_14], yaw, 6);
+        m.action(id::FORWARD_START, 1.0);
+        run(&mut m, &Flat(40.004_997), 1.0);
+        let d = [m.pos()[0] - 864.926_33, m.pos()[2] - 692.192_14];
+        // capture: (860.4958, 691.1804) after 4.4 m: direction (-0.975, -0.222)
+        let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        assert!((d[0] / l + 0.975).abs() < 0.01 && (d[1] / l + 0.222).abs() < 0.01, "{d:?}");
+        assert!((rot_of(yaw)[1] - q[1]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn turning_standing_and_moving() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::TURN_RIGHT_START, 0.0);
+        run(&mut m, &w, 0.5);
+        assert!((m.yaw() - 1.75).abs() < 0.02, "3.5 rad/s standing: {}", m.yaw());
+        m.action(id::TURN_RIGHT_STOP, 1.0);
+        let y = m.yaw();
+        run(&mut m, &w, 0.5);
+        assert_eq!(m.yaw(), y);
+        // turning left while walking is slower (1.5 rad/s) and the velocity follows the heading
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::FORWARD_START, 0.0);
+        run(&mut m, &w, 1.0);
+        m.action(id::TURN_LEFT_START, 1.0);
+        run(&mut m, &w, 1.0);
+        assert!((m.yaw() + 1.5).abs() < 0.05, "{}", m.yaw());
+        assert!((m.speed() - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn jump_arc() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::JUMP_START, 0.0);
+        let out = m.take_outgoing();
+        assert_eq!(out[0].action, 0x0F);
+        assert!(!m.grounded());
+        assert_eq!(m.role(), Role::JumpStand);
+        // default stats: h = 1 m, v0 = sqrt(2*1*20)
+        let mut peak = 0.0f32;
+        let mut t = 0.0;
+        let mut landed = None;
+        while t < 2.0 {
+            m.update(1.0 / 120.0, &w);
+            t += 1.0 / 120.0;
+            peak = peak.max(m.pos()[1]);
+            if m.grounded() && landed.is_none() {
+                landed = Some(t);
+            }
+        }
+        assert!((peak - 1.0).abs() < 0.05, "apex {peak}");
+        let l = landed.unwrap();
+        assert!((l - 2.0 * 40f32.sqrt() / 20.0).abs() < 0.05, "air time {l}");
+        assert_eq!(m.fsm().jump, 1, "landing runs JumpStop");
+        assert_eq!(m.pos()[1], 0.0);
+        // can jump again
+        m.action(id::JUMP_START, 3.0);
+        assert_eq!(m.take_outgoing().len(), 1);
+    }
+
+    #[test]
+    fn jump_height_from_stats() {
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.set_stats(|s| {
+            s.strength = 100;
+            s.agility = 100;
+        });
+        m.action(id::JUMP_START, 0.0);
+        let w = Flat(0.0);
+        let mut peak = 0.0f32;
+        for _ in 0..240 {
+            m.update(1.0 / 120.0, &w);
+            peak = peak.max(m.pos()[1]);
+        }
+        assert!((peak - 2.0).abs() < 0.06, "(100+100)/200+1 = 2 m: {peak}");
+    }
+
+    #[test]
+    fn speeds_from_stats() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 550);
+        m.action(id::FORWARD_START, 0.0);
+        run(&mut m, &w, 1.0);
+        assert!((m.speed() - 7.0).abs() < 1e-3, "5 + 550/275");
+        m.action(id::FORWARD_STOP, 1.0);
+        m.action(id::SWITCH_WALK, 1.0);
+        m.action(id::FORWARD_START, 1.0);
+        run(&mut m, &w, 1.0);
+        assert!((m.speed() - 1.5).abs() < 1e-3);
+        assert_eq!(m.role(), Role::Walk);
+        // hurt below 15 % life: run speed shrinks
+        m.set_stats(|s| {
+            s.health = 1;
+            s.max_health = 100;
+        });
+        m.action(id::FORWARD_STOP, 2.0);
+        m.action(id::SWITCH_RUN, 2.0);
+        m.action(id::FORWARD_START, 2.0);
+        run(&mut m, &w, 1.0);
+        let rs = (1.0 / 15.0) * (550.0 + 1000.0) - 1000.0;
+        assert!((m.speed() - (5.0f32 + rs / 275.0).max(1.5)).abs() < 1e-3, "{}", m.speed());
+    }
+
+    #[test]
+    fn strafe_reverse_and_permissions() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::STRAFE_RIGHT_START, 0.0);
+        run(&mut m, &w, 1.0);
+        assert!((m.pos()[0] - 2.5).abs() < 1e-3, "run strafe = 0.5 * 5 m/s: {:?}", m.pos());
+        assert_eq!(m.role(), Role::WalkRight);
+        m.action(id::STRAFE_LEFT_STOP, 1.0); // wrong direction: refused
+        assert_eq!(m.fsm().strafe, 2);
+        m.action(id::STRAFE_RIGHT_STOP, 1.0);
+        assert_eq!(m.fsm().strafe, 1);
+        // reverse: 3 m/s, body keeps facing +Z, role RunBack
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::REVERSE_START, 0.0);
+        run(&mut m, &w, 1.5);
+        assert!((m.speed() - 3.0).abs() < 1e-3);
+        assert!(m.pos()[2] < -3.0 && m.yaw().abs() < 1e-3, "{:?} {}", m.pos(), m.yaw());
+        assert_eq!(m.role(), Role::RunBack);
+        // table: no jump while swimming, no run switch while running, sit refused while moving
+        let f = Fsm::new();
+        assert!(!f.allowed(id::SWITCH_RUN) && f.allowed(id::SWITCH_WALK) && f.allowed(id::JUMP_START));
+        let swim = Fsm { mode: mode::SWIM, ..f };
+        assert!(!swim.allowed(id::JUMP_START) && swim.allowed(id::FORWARD_START));
+        assert!(Fsm { fwd: 2, fwd_dir: 1, ..f }.build(id::SWITCH_SIT_GROUND, true).is_none());
+        // unresolved/non-transition ids build nothing
+        for i in [0x13, 0x14, 0x16, 0x1f, 0x20, 0x2b, 0x2c] {
+            assert!(f.build(i, true).is_none(), "{i:#x}");
+        }
+        // elevate axis quirk: untouched axis copies the strafe axis
+        let st = Fsm { strafe: 2, strafe_dir: 3, ..f };
+        assert_eq!(st.build(id::TURN_LEFT_START, true).unwrap().0.elev, 2);
+    }
+
+    #[test]
+    fn sit_and_modes() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        assert_eq!(m.sit_toggle(0.0), SitToggle::Sat);
+        assert_eq!(m.fsm().mode, mode::SIT_GROUND);
+        assert_eq!(m.role(), Role::SitGround);
+        m.action(id::FORWARD_START, 1.0); // refused while sitting
+        assert_eq!(m.take_outgoing().len(), 1);
+        assert_eq!(m.fsm().fwd, 1);
+        assert_eq!(m.sit_toggle(2.0), SitToggle::StandRequest);
+        assert!(m.transition(id::LEAVE_SIT));
+        assert_eq!(m.fsm().mode, mode::WALK, "returns to the last speed mode (ctor: walk)");
+        run(&mut m, &w, 0.1);
+        // moving: sit refused
+        m.action(id::FORWARD_START, 3.0);
+        assert_eq!(m.sit_toggle(3.0), SitToggle::Ignored);
+        // server messages for the own dynel are dropped by the original
+        let mv = CharDCMove { move_type: 1, type_bit7: false, rot: [0.0, 0.0, 0.0, 1.0], pos: [1.0, 2.0, 3.0], time: 0, extra: [0.0; 2] };
+        let p = m.pos();
+        assert!(!m.server_move(&mv));
+        assert_eq!(m.pos(), p);
+    }
+
+    #[test]
+    fn sync_cadence() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::FORWARD_START, 100.0);
+        m.take_outgoing();
+        let out = run(&mut m, &w, 5.2);
+        assert_eq!(out.iter().map(|o| o.action).collect::<Vec<_>>(), vec![0x16], "sync after 5 s of motion");
+        assert!((5000..5100).contains(&out[0].elapsed_ms), "{}", out[0].elapsed_ms);
+        // standing still: nothing
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        assert!(run(&mut m, &w, 8.0).is_empty());
+    }
+
+    #[test]
+    fn mouse_look_rotation_sync() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.mouse_turn(0.05, 0.0, 1.0); // first event sends MouseTurnRightStart (dx dropped)
+        let out = m.take_outgoing();
+        assert_eq!(out.iter().map(|o| o.action).collect::<Vec<_>>(), vec![id::MOUSE_TURN_RIGHT_START]);
+        assert_eq!(m.yaw(), 0.0);
+        for i in 0..10 {
+            m.mouse_turn(0.05, 0.0, 1.0 + i as f32 * 0.01); // local rotation, no message
+        }
+        assert!(m.take_outgoing().is_empty());
+        assert!((m.yaw() - 0.5).abs() < 1e-5);
+        let out = run(&mut m, &w, 0.5);
+        assert_eq!(out.iter().map(|o| o.action).collect::<Vec<_>>(), vec![0x16], "0.5 rad > 0.17 -> sync after 0.25 s");
+        assert!((yaw_of(out[0].rot) - 0.5).abs() < 1e-4);
+        // opposite direction starts a left mouse turn; button release stops it
+        m.mouse_turn(-0.05, 0.0, 3.0);
+        m.end_mouse_look(3.1);
+        let acts: Vec<u8> = m.take_outgoing().iter().map(|o| o.action).collect();
+        assert_eq!(acts, vec![id::MOUSE_TURN_LEFT_START, id::TURN_LEFT_STOP]);
+        assert_eq!(m.fsm().turn, 1);
+        // small drifts stay silent
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.mouse_turn(0.0, 0.0, 0.0);
+        m.take_outgoing();
+        m.mouse_turn(0.1, 0.0, 0.1);
+        assert!(run(&mut m, &w, 1.0).is_empty(), "0.1 rad < 0.17");
+    }
+
+    #[test]
+    fn keys_become_strafes_under_mouse_look() {
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::TURN_LEFT_START, 0.0);
+        assert_eq!(m.fsm().turn, 4);
+        m.mouse_turn(0.01, 0.0, 0.1); // stops the key turn, starts a strafe, then a mouse turn
+        let acts: Vec<u8> = m.take_outgoing().iter().map(|o| o.action).collect();
+        assert_eq!(acts, vec![id::TURN_LEFT_START, id::TURN_LEFT_STOP, id::STRAFE_LEFT_START, id::MOUSE_TURN_RIGHT_START]);
+        m.action(id::TURN_LEFT_START, 0.2); // while mouse-looking: strafe left (already) -> refused as allowed? re-start ok
+        m.action(id::TURN_RIGHT_START, 0.2);
+        let acts: Vec<u8> = m.take_outgoing().iter().map(|o| o.action).collect();
+        assert_eq!(acts, vec![id::STRAFE_LEFT_START, id::STRAFE_RIGHT_START]);
+        assert_eq!(m.fsm().strafe_dir, 4);
+    }
+
+    #[test]
+    fn wall_slide_and_ground_following() {
+        let mut m = Movement::new([8.0, 0.0, 0.0], std::f32::consts::FRAC_PI_2, 0);
+        m.action(id::FORWARD_START, 0.0);
+        run(&mut m, &Wall, 1.0);
+        assert!((m.pos()[0] - 10.0).abs() < 1e-4);
+        // stepping off an edge starts a fall, stepping onto a stair snaps up
+        struct Stair;
+        impl World for Stair {
+            fn ground(&self, p: [f32; 3]) -> Option<f32> {
+                Some(if p[2] > 2.0 { 0.3 } else { 0.0 })
+            }
+            fn slide(&self, _f: [f32; 3], t: [f32; 3]) -> [f32; 3] {
+                t
+            }
+        }
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::FORWARD_START, 0.0);
+        run(&mut m, &Stair, 1.0);
+        assert!((m.pos()[1] - 0.3).abs() < 1e-5 && m.grounded());
+    }
+
+    #[test]
+    fn zone_change_sync() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.zone_instance(7);
+        m.zone_instance(9); // armed: two frames later a sync
+        assert!(m.update(0.016, &w).is_empty());
+        let out = m.update(0.016, &w);
+        assert_eq!(out.iter().map(|o| o.action).collect::<Vec<_>>(), vec![0x16]);
+        assert!(m.update(0.016, &w).is_empty());
+    }
+}

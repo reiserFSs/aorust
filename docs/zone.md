@@ -69,6 +69,8 @@ No ptype 5 (text) frame was received: server chat arrives as N3. Nothing is unde
    is never sent for a long time (visibility to others, timeouts) is unknown.
 
 ## 6. Plan for the in-game features (RE anchors)
+Movement of other dynels, animation roles and name tags: [zone/motion.md](zone/motion.md) (`ao_net::n3::motion`, `ao_net::n3::nametag`).
+
 | feature | next step | anchors |
 |---|---|---|
 | own character render | build `Player` from `SimpleCharFullUpdate` (breed, sex, `head_mesh` rdb 1010001 id, `cloth[]` texture ids per part, attractor meshes = weapons); place at `scene_pos(pos)`, yaw from `scene_forward`; camera third-person behind it | read GC 0x10078c24, apply 0x10077e13, construct `SimpleChar_t` 0x10077a84; `ao-formats/src/character.rs` (`Player::new`, `Equipment::wear`); docs/zone/dynel.md §1.3 |
