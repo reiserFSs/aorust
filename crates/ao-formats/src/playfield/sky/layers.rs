@@ -52,7 +52,7 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         day_time: sky.day_time,
         sun1: Quat::between([0.0, 0.0, -1.0], sky.sun_ao),
         sun2: Quat::between([0.0, 0.0, -1.0], sky.sun2_ao),
-        cloud_intensity: super::CLOUD_INTENSITY,
+        cloud_intensity: sky.weather.thick_clouds_intensity(),
         hq_offset: hq_offset(objs),
         delta_time: 0.0,
         wind: [0.0; 2],
@@ -403,9 +403,9 @@ impl Builder<'_> {
 
     /// Texture drift in uv units per second of the object's `ScrollU` / `ScrollV` integrators (`This.ScrollU + GAME.GameDeltaTime
     /// * k`, `... + GAME.HighAltitudeWindX % 1 * 10`): the first step of the per-frame expression evaluated with
-    /// `GameDeltaTime = 1 s` and the wind of `HIGH_ALTITUDE_WIND`. Added to the matrix translation, so it moves the baked uv 1:1.
+    /// `GameDeltaTime = 1 s` and the wind rate of `Sky::weather`. Added to the matrix translation, so it moves the baked uv 1:1.
     fn uv_scroll(&self, o: &Obj) -> [f32; 2] {
-        let ctx = Ctx { delta_time: 1.0, wind: super::HIGH_ALTITUDE_WIND, ..self.ctx.clone() };
+        let ctx = Ctx { delta_time: 1.0, wind: self.sky.weather.high_altitude_wind_rate, ..self.ctx.clone() };
         ["ScrollU", "ScrollV"].map(|f| o.field(f).and_then(|e| script::eval_field(o, &ctx, e, 0)).unwrap_or(0.0))
     }
 

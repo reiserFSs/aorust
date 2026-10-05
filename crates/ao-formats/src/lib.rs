@@ -8,3 +8,4 @@ pub mod mesh;
 pub mod playfield;
 pub mod screens;
 pub mod texture;
+pub mod weather;

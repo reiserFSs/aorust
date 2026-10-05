@@ -138,7 +138,7 @@ fn size(s: &str) -> Result<(u32, u32), String> {
 
 /// Opens the audio device and returns the per-frame hook that follows the camera (listener), the day clock and the
 /// playfield's music/ambience/emitters. A missing device or sound data disables audio with a message.
-fn playfield_audio(dir: &std::path::Path, pf: ao_audio::PlayfieldAudio, start: f32, scale: f32) -> Option<ao_render::FrameHook> {
+fn playfield_audio(dir: &std::path::Path, pf: ao_audio::PlayfieldAudio, mut weather: ao_formats::weather::Weather, start: f32, scale: f32) -> Option<ao_render::FrameHook> {
     let audio = match ao_audio::Audio::start(dir) {
         Ok(a) => a,
         Err(e) => {
@@ -152,6 +152,21 @@ fn playfield_audio(dir: &std::path::Path, pf: ao_audio::PlayfieldAudio, start: f
     let log = std::env::var_os("AOMAC_AUDIO_LOG").is_some();
     Some(Box::new(move |cam, dt| {
         day += dt * scale;
+        // FUN_100be767 / FUN_100b6d67: the weather runs per frame, its music slot state and the sky manager's sound levels
+        // (FUN_100bfa11, FUN_100be767) go to the mixer
+        weather.update(ao_formats::weather::OFFLINE_DAY + (day / 6480.0).floor() as u32, day.rem_euclid(6480.0) as f64, dt);
+        let w = weather.state();
+        audio.set_weather(w.music_state());
+        for (name, level) in [
+            ("SM_Sandy_Env_Rain", w.levels.rain),
+            ("SM_Sandy_Env_Wind", w.levels.wind),
+            ("SM_Sandy_Env_SandWind", w.levels.sand_wind),
+            ("SM_Sandy_Env_FalloutRWind", w.levels.fallout_red_wind),
+            ("SM_Sandy_Env_FalloutGWind", w.levels.fallout_green_wind),
+            ("SM_Sandy_Env_Quake", w.levels.quake),
+        ] {
+            audio.play_keepalive_level(name, level);
+        }
         audio.update(dt, cam.into(), day);
         since_log += dt;
         if log && since_log >= 2.0 {
@@ -215,7 +230,7 @@ fn main() -> Result<()> {
                     let store = RecordStore::open(&dir)?;
                     let (scene, report) = ao_formats::playfield::load_playfield_report_at(&store, &dir, id, start)?;
                     if !opts.mute && opts.screenshot.is_none() {
-                        pf_audio = Some((ao_audio::PlayfieldAudio::load(&store, id, &report.sounds)?, start, time_scale.unwrap_or(0.0)));
+                        pf_audio = Some((ao_audio::PlayfieldAudio::load(&store, id, &report.sounds)?, ao_formats::playfield::open_weather(&store, id)?, start, time_scale.unwrap_or(0.0)));
                     }
                     scene
                 }
@@ -233,7 +248,7 @@ fn main() -> Result<()> {
                     let mut scene = scene;
                     scene.spawn = opts.eye.or(scene.spawn);
                     scene.spawn_look_at = opts.at.or(scene.spawn_look_at);
-                    match pf_audio.and_then(|(pf, start, scale)| playfield_audio(&dir, pf, start, scale)) {
+                    match pf_audio.and_then(|(pf, weather, start, scale)| playfield_audio(&dir, pf, weather, start, scale)) {
                         Some(hook) => ao_render::run_viewer_hooked(scene, live, hook),
                         None => match live {
                             Some(live) => ao_render::run_viewer_live(scene, live),

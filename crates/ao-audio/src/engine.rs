@@ -205,7 +205,7 @@ impl Audio {
     }
 
     /// Weather state s0..s6 (rain, fog, cloud, wind, sand, fallout R/G storms): selects the fog/rain/storm music slot.
-    /// The weather schedule itself is not reconstructed (see docs `## audio`); the default is clear sky.
+    /// Feed it `ao_formats::weather::State::music_state()` every frame (see docs *Weather*); the default is clear sky.
     pub fn set_weather(&self, s: [f32; 7]) {
         if let Some(rt) = self.rt().as_mut() {
             rt.weather = s;
@@ -227,6 +227,21 @@ impl Audio {
         let db = rt.lib.sounds.clone();
         if let Some(d) = db.by_name(name) {
             rt.keepalive(&self.sh, d);
+        }
+    }
+
+    /// Like [`Audio::play_ui_keepalive`] with a per-call volume `0..=1` (`SM_Sandy_Env_Rain` / `Wind` / `SandWind` /
+    /// `FalloutRWind` / `FalloutGWind` / `Quake` levels of `ao_formats::weather::Levels`, set every frame by the client's
+    /// sky manager); a level of 0 does nothing.
+    pub fn play_keepalive_level(&self, name: &str, level: f32) {
+        if !(level > 0.0) {
+            return;
+        }
+        let mut g = self.rt();
+        let Some(rt) = g.as_mut() else { return };
+        let db = rt.lib.sounds.clone();
+        if let Some(d) = db.by_name(name) {
+            rt.keepalive_scaled(&self.sh, d, level.min(1.0));
         }
     }
 

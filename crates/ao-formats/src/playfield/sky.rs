@@ -36,12 +36,9 @@ const SUN1_ROT: [f32; 4] = [0.900351, -0.0951056, 0.344078, 0.248863];
 const SUN2_ROT: [f32; 4] = [0.836913, -0.16263, 0.384351, 0.354122];
 /// Day time factor of solar noon [FIT]: midway between the sunrise and sunset edges of the `GroundLight` tracks.
 const NOON: f32 = 0.525;
-/// `GAME.ThickCloudsIntensity` offline [GUESS]: the game writes it from the server weather.
-const CLOUD_INTENSITY: f32 = 0.4;
-/// `GAME.HighAltitudeWindX/Z` per second [UNRESOLVED]: `FUN_100be767` (Gamecode) writes `speed * direction * dt * k` every
-/// frame (`DisplaySystem::FUN_100ad568` stores it at `+0xd8`), the weather's wind speed/direction and `k` were not found, so
-/// this is a drift of a few percent of a texture repeat per second, not the client's value.
-pub(super) const HIGH_ALTITUDE_WIND: [f32; 2] = [0.0004, 0.00015];
+/// Seconds of 60 Hz wind history simulated before the weather of a static scene is read [GUESS]: the wind is a random walk
+/// started when the client enters the playfield (`weather` module docs), so there is no single faithful value.
+pub const WIND_WARMUP: f32 = 30.0;
 /// `AddFogI` of the atmosphere object.
 pub(super) const ATMOSPHERE_FOG_DENSITY: f32 = 0.025;
 
@@ -202,6 +199,8 @@ pub struct Sky {
     day_time: f32,
     /// `GAME.CurrentNightIntensity` (`NightIntensity` track of `Tweak_GAME.txt`, 1 when the script has none).
     night: f32,
+    /// `ThickCloudsIntensity` / `HighAltitudeWind` source (`crate::weather`); clear sky until [`Sky::set_weather`].
+    pub weather: crate::weather::State,
 }
 
 /// `DayTimeForGroundShadows = GameDayTime * 15`.
@@ -280,7 +279,12 @@ impl Sky {
         let sun = t.rgb(["GroundLightR", "GroundLightG", "GroundLightB"], f).map(|c| c.map(|v| (v * 2.0).min(1.0)));
         let ambient = t.at("AmbientLight", f).map(|a| [a; 3]).or_else(|| t.rgb(["AmbientLightR", "AmbientLightG", "AmbientLightB"], f));
         let cloud_light = t.rgb(["CloudLightR", "CloudLightG", "CloudLightB"], f).unwrap_or([1.0; 3]);
-        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, cloud_light, sun_dir: sun_dir(day_time), sun_ao: sun_ao(day_time), sun2_ao: sun2_ao(day_time), day_time, night: t.at("NightIntensity", f).unwrap_or(1.0) })
+        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, cloud_light, sun_dir: sun_dir(day_time), sun_ao: sun_ao(day_time), sun2_ao: sun2_ao(day_time), day_time, night: t.at("NightIntensity", f).unwrap_or(1.0), weather: crate::weather::State::clear() })
+    }
+
+    /// The weather of the playfield at this moment (`ThickCloudsIntensity`, `HighAltitudeWind`).
+    pub fn set_weather(&mut self, w: crate::weather::State) {
+        self.weather = w;
     }
 
     /// Camera-locked sky dome (`Scene::sky`, drawn unlit and unfogged by the renderer): the atmosphere strip's gradient
@@ -357,7 +361,8 @@ impl SkyClock {
     pub fn at(&mut self, day_time: f32) -> Scene {
         let day_time = day_time.rem_euclid(DAY_LENGTH);
         let mut scene = Scene::default();
-        let Some(sky) = Sky::new(&self.tweaks, day_time) else { return scene };
+        let Some(mut sky) = Sky::new(&self.tweaks, day_time) else { return scene };
+        sky.set_weather(weather_at(&self.env, day_time));
         let environment = super::environment::to_scene(&self.env, true, Some(&sky));
         emit(&sky, &self.tweaks, &self.store, &mut scene, environment.fog_color, environment.fog_end);
         scene.fog_model = Some(super::environment::fog_model(&self.env, Some(&sky), vec![]));
@@ -365,6 +370,24 @@ impl SkyClock {
         scene.textures.retain(|k, _| self.sent.insert(*k));
         scene
     }
+}
+
+/// The weather a static scene shows at `day_time`: the client's schedule of the playfield's `EnvironmentData` for the offline
+/// game day ([`crate::weather::OFFLINE_DAY`]) plus [`WIND_WARMUP`] seconds of wind.
+pub(super) fn weather_at(env: &super::environment::Env, day_time: f32) -> crate::weather::State {
+    crate::weather::Weather::sample(&env.raw, crate::weather::OFFLINE_DAY, day_time as f64, WIND_WARMUP).state()
+}
+
+/// A live weather for playfield `id` (`FUN_100bdb64` with the playfield's `EnvironmentData`): call
+/// [`crate::weather::Weather::update`] every frame.
+pub fn open_weather(store: &ao_rdb::RecordStore, id: u32) -> anyhow::Result<crate::weather::Weather> {
+    use anyhow::Context;
+    let raw = store.get(super::RECORD, id)?.with_context(|| format!("no playfield {id}"))?;
+    let rec = super::record::parse(&raw)?;
+    let mut tail = super::record::Rd::new(&raw, rec.tail);
+    super::water::parse(&mut tail)?;
+    let env = super::environment::parse(&mut tail)?;
+    Ok(crate::weather::Weather::new(&env.raw, crate::weather::OFFLINE_DAY))
 }
 
 /// Adds the playfield's distant scenery (city skylines, traffic ships) to `scene.instances` / `scene.movers`, see
@@ -467,5 +490,23 @@ mod tests {
         assert!(by("RKPP").is_some() && by("PlayfieldData").unwrap().field("UniversePosition") == Some("RKPP.Newland_City"));
         let (noon, night) = (Sky::new(&t, 3300.0).unwrap(), Sky::new(&t, 0.0).unwrap());
         assert!(noon.top_i > 0.99 && night.top_i < 0.1, "{} {}", noon.top_i, night.top_i);
+    }
+
+    #[test]
+    fn real_playfield_weather_drives_the_cloud_layer() {
+        let Some(dir) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/ProjectRubiKa/client")) else { return };
+        let Ok(store) = ao_rdb::RecordStore::open(&dir) else { return };
+        // 566 Newland City has no weather weights (clear), 560 has (docs: weather exists on 560, 590, 620, ...)
+        let clear = open_weather(&store, 566).unwrap();
+        assert_eq!(clear.state().thick_clouds_intensity(), 0.0);
+        let mut seen = 0f32;
+        for day in 0..4 {
+            for step in 0..216 {
+                let mut w = open_weather(&store, 560).unwrap();
+                w.update(day, step as f64 * 30.0, 1.0 / 60.0);
+                seen = seen.max(w.state().thick_clouds_intensity());
+            }
+        }
+        assert!(seen > 0.0 && seen <= 1.0, "{seen}");
     }
 }
