@@ -233,11 +233,6 @@ pub fn sun_dir(day_time: f32) -> [f32; 3] {
 }
 
 impl Sky {
-    /// Horizon colour (sRGB, scaled by its intensity).
-    pub fn bottom(&self) -> [f32; 3] {
-        self.bottom.map(|c| c * self.bottom_i)
-    }
-
     pub fn new(t: &Tweaks, day_time: f32) -> Option<Sky> {
         let f = day_factor(day_time);
         let colour = |side: &str| -> Option<([f32; 3], f32)> {
