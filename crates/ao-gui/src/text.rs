@@ -234,10 +234,8 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                 "center" => align_stack.push(Align::Center),
                 "a" => link += 1,
                 "p" | "div" | "b" | "i" | "u" | "span" => {
-                    if name == "div" || name == "p" || name == "b" || name == "i" || name == "u" || name == "span" {
-                        color_stack.push(*color_stack.last().unwrap());
-                        align_stack.push(*align_stack.last().unwrap());
-                    }
+                    color_stack.push(*color_stack.last().unwrap());
+                    align_stack.push(*align_stack.last().unwrap());
                 }
                 _ => {}
             },
@@ -295,7 +293,7 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                 _ => cur_runs.push(TextRun { text: wd.text, color: wd.color, link: wd.link }),
             }
         }
-        if wd.hard_break_after && n + 1 <= nwords {
+        if wd.hard_break_after && n < nwords {
             flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y);
         }
     }

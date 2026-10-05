@@ -24,10 +24,14 @@ const FRAME_B: i32 = 3;
 /// `GUIConfig_c` layer alpha: layer 2 (used by buttons) = 0.85.
 const BUTTON_ALPHA: f32 = 0.85;
 
+/// Resolves a `#Key` view attribute to text (`None` = unknown key).
+pub type Localize = Box<dyn Fn(&str) -> Option<String>>;
+
 /// How a window is sized when opened.
 #[derive(Clone, Copy, Debug)]
 pub enum WindowSize {
-    /// Preferred (minimum) size of the root view (`View::GetPreferredSize`).
+    /// `View::GetPreferredSize(true)` of the root view: what `LoginWindow_c`/`ProgressWindow_c`/`LimboWindow_c`
+    /// (0x10015331 / 0x100164cc / 0x10010311) pass to `Window::SetFrame(Rect(0,0,pref))`.
     Preferred,
     /// Pixel size (width, height).
     Fixed(u32, u32),
@@ -69,7 +73,7 @@ pub struct Gui {
     windows: Vec<Option<Window>>,
     glyphs: GlyphAtlas,
     glyph_map: HashMap<(FontId, char), Option<[u16; 4]>>,
-    localize: Box<dyn Fn(&str) -> Option<String>>,
+    localize: Localize,
     mouse: Point,
     hover: Option<ViewId>,
     pressed: Option<ViewId>,
@@ -103,7 +107,7 @@ fn rgb(c: u32) -> [u8; 3] {
 impl Gui {
     /// `client_dir` = the client root (contains `cd_image/`). `localize` resolves `#Key` attribute values
     /// (see `XMLObject_c::GetAttrString`); `None` keeps keys verbatim.
-    pub fn new(client_dir: &Path, localize: Option<Box<dyn Fn(&str) -> Option<String>>>) -> Result<Gui> {
+    pub fn new(client_dir: &Path, localize: Option<Localize>) -> Result<Gui> {
         let cd = client_dir.join("cd_image");
         let gui_dir = cd.join("gui/Default");
         let gfx = GfxSet::load(&gui_dir).context("load Graphics.uvgi")?;
@@ -238,7 +242,7 @@ impl Gui {
             WindowSize::Fixed(a, b) => (a as f32, b as f32),
             WindowSize::Preferred => {
                 let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors };
-                let p = layout::pref(&mut env, &self.tree, root, false);
+                let p = layout::pref(&mut env, &self.tree, root, true);
                 (p.x + 1.0, p.y + 1.0)
             }
         };
@@ -359,6 +363,21 @@ impl Gui {
                 b.toggle = toggle;
                 b.toggled = on;
             }
+        }
+    }
+    /// `CharSelectItem_c::SetSelected` 0x1000cb1a: toggles `name_btn` and shows `detailed_view` instead of
+    /// `summary_view` (the client swaps them inside the row container; here the unused one collapses so it
+    /// takes no layout space).  Relayouts the window.
+    pub fn set_item_selected(&mut self, h: ViewHandle, selected: bool) {
+        for (name, show) in [("summary_view", !selected), ("detailed_view", selected)] {
+            for v in self.find_all_in(h, name) {
+                self.tree.views[v].visible = show;
+                self.tree.views[v].flags |= VF_COLLAPSE_WHEN_HIDDEN;
+            }
+        }
+        self.set_toggle_in(h, "name_btn", true, selected);
+        if let Some(w) = self.window_of(h) {
+            self.relayout_window(w);
         }
     }
     /// Frame (relative to the window root) of a view inside an instance.
@@ -658,6 +677,7 @@ impl Gui {
     }
 
     /// Draws `s` with its top-left at (x, y); returns the pen advance. `password` draws `*`.
+    #[allow(clippy::too_many_arguments)]
     fn draw_string(&mut self, out: &mut Vec<DrawCmd>, font: FontId, s: &str, x: i32, y: i32, tint: [u8; 3], alpha: f32, password: bool) -> i32 {
         let mut pen = x;
         for ch in s.chars() {
@@ -998,6 +1018,7 @@ impl Gui {
 
     /// Appends `text` (top-left at `x`,`y`, window pixels) in `font`/`color` (0xRRGGBB) to `list`.
     /// Returns the advance width in pixels.
+    #[allow(clippy::too_many_arguments)]
     pub fn text_cmds(&mut self, font: FontId, text: &str, x: i32, y: i32, color: u32, alpha: f32, list: &mut DrawList) -> i32 {
         self.draw_string(&mut list.cmds, font, text, x, y, rgb(color), alpha, false)
     }
@@ -1038,12 +1059,12 @@ impl Gui {
                 self.drag_scroll(y);
                 self.drag_select(x);
             }
-            InputEvent::MouseDown { x, y, button } if button == MouseButton::Left => {
+            InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
                 self.mouse = Point::new(x, y);
                 self.update_hover();
                 self.mouse_down(x, y);
             }
-            InputEvent::MouseUp { x, y, button } if button == MouseButton::Left => {
+            InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
                 self.mouse = Point::new(x, y);
                 self.mouse_up();
             }

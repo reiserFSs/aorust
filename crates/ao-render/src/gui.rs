@@ -41,6 +41,9 @@ pub struct GuiRenderer {
     glyph_size: (u32, u32),
 }
 
+/// (scissor, extra-image slot, vertex range)
+type Batch = (Option<[i32; 4]>, Option<usize>, std::ops::Range<u32>);
+
 impl GuiRenderer {
     /// Uploads the skin atlas of `gui` and builds the pipeline for `r.format`.
     pub fn new(r: &Renderer, gui: &Gui) -> Self {
@@ -184,7 +187,7 @@ impl GuiRenderer {
         }
         // vertices + per-clip batches
         let mut verts: Vec<Vertex> = Vec::new();
-        let mut batches: Vec<(Option<[i32; 4]>, Option<usize>, std::ops::Range<u32>)> = Vec::new();
+        let mut batches: Vec<Batch> = Vec::new();
         let mut cur_extra: Option<usize> = None;
         let mut clip: Option<[i32; 4]> = None;
         let mut start = 0u32;

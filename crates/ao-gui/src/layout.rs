@@ -120,10 +120,7 @@ fn calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
         }
         Kind::Text(t) => text_pref(env, tree, id, t, max),
         Kind::Button(b) => button_pref(env, &b.label),
-        Kind::TextButton(b) => {
-            let s = text::string_size(env.fonts, env.colors, b.font, &b.text);
-            s
-        }
+        Kind::TextButton(b) => text::string_size(env.fonts, env.colors, b.font, &b.text),
         Kind::PowerBar(p) => {
             let g = |id: Option<crate::gfx::GfxId>| id.map(|g| env.gfx.size(g));
             let main = g(p.bg).or_else(|| g(p.full)).unwrap_or((0, 0));
@@ -254,13 +251,14 @@ pub fn button_pref(env: &mut Env, label: &str) -> Point {
     p.x -= 1.0;
     p.x += 10.0; // _DAT_101ae2d8
     // fVar1 = 2.0 + b.b + b.t + 2.0 + p.y  (_DAT_101a8b90 = 2.0)
-    p.y = 2.0 + b.b + b.t + 2.0 + p.y;
+    p.y += 2.0 + b.b + b.t + 2.0;
     p
 }
 
 // ------------------------------------------------------------------------------------ layout
 
 /// `View::SpaceOut` 0x1014a238; returns the left-over space.
+#[allow(clippy::too_many_arguments)]
 pub fn space_out(n: usize, avail: f32, sum_min: f32, total_weight: f32, min: &[f32], max: &[f32], weights: Option<&[f32]>, out: &mut [f32]) -> f32 {
     let mut avail = avail;
     let mut extra = avail - sum_min;

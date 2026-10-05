@@ -101,13 +101,13 @@ fn decode_png(name: &str, data: &[u8]) -> Result<GfxImage> {
     let mut rgba = Vec::with_capacity(n * 4);
     match info.color_type {
         png::ColorType::Rgb => {
-            for p in buf[..n * 3].chunks_exact(3) {
-                let key = p == COLOR_KEY;
+            for p in buf[..n * 3].as_chunks::<3>().0 {
+                let key = *p == COLOR_KEY;
                 rgba.extend_from_slice(&[p[0], p[1], p[2], if key { 0 } else { 255 }]);
             }
         }
         png::ColorType::Rgba => {
-            for p in buf[..n * 4].chunks_exact(4) {
+            for p in buf[..n * 4].as_chunks::<4>().0 {
                 let key = p[..3] == COLOR_KEY;
                 rgba.extend_from_slice(&[p[0], p[1], p[2], if key { 0 } else { p[3] }]);
             }

@@ -21,11 +21,11 @@ fn main() -> anyhow::Result<()> {
 
     let client = ao_gui::client_dir();
     let text = ao_formats::screens::TextDb::load(&client).ok();
-    let localize: Option<Box<dyn Fn(&str) -> Option<String>>> = text.map(|t| {
+    let localize: Option<ao_gui::Localize> = text.map(|t| {
         Box::new(move |s: &str| {
             let r = t.label(s);
             (r != s).then_some(r)
-        }) as Box<dyn Fn(&str) -> Option<String>>
+        }) as ao_gui::Localize
     });
     let mut gui = Gui::new(&client, localize)?;
     let (w, h) = match size {
@@ -119,16 +119,25 @@ fn fill_sample(gui: &mut Gui, name: &str) {
             gui.set_progress(0, "progress_bar", 0.4);
         }
         "CharacterSelectionWindow" => {
-            let _ = gui.set_layout_vertical(0, "characters_view", true);
-            for (i, (n, lvl, br, prof)) in [("Vhab", "220", "Atrox", "Soldier"), ("Reiserfs", "14", "Solitus", "Enforcer")].iter().enumerate() {
+            gui.set_layout_vertical(0, "characters_view", true);
+            // row 0 selected + activated, row 1 unselected + Inactive, row 2 unselected + activated
+            for (i, (n, lvl, br, prof)) in [("Vhab", "220", "Atrox", "Soldier"), ("Reiserfs", "14", "Solitus", "Enforcer"), ("Nanogirl", "88", "Nanomage", "Doctor")].iter().enumerate() {
                 if let Ok(it) = gui.add_view(0, "characters_view", "CharacterSelectionItem") {
                     gui.set_text_in(it, "name_btn", n);
                     gui.set_text_in(it, "level", lvl);
                     gui.set_text_in(it, "breed", br);
                     gui.set_text_in(it, "profession", prof);
-                    gui.set_toggle_in(it, "name_btn", true, i == 0);
-                    gui.set_visible_in(it, if i == 0 { "summary_view" } else { "detailed_view" }, false);
-                    gui.set_text_in(it, "status", "Inactive");
+                    gui.set_text_in(it, "gender", if i == 0 { "Male" } else { "Female" });
+                    gui.set_text_in(it, "location", "Newland City (566)");
+                    gui.set_item_selected(it, i == 0);
+                    if i == 1 {
+                        gui.set_text_in(it, "status", "Inactive");
+                        gui.set_color_in(it, "status", 0xEE4444);
+                    } else {
+                        for v in ["status", "status_left", "status_right", "status_lbl"] {
+                            gui.remove_view_in(it, v);
+                        }
+                    }
                 }
             }
             gui.set_text(0, "slots_available", "6/7 slots available");
