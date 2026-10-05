@@ -252,13 +252,16 @@ name = "aomac"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ao-audio",
  "ao-formats",
  "ao-install",
+ "ao-net",
  "ao-rdb",
  "ao-render",
  "ao-scene",
  "clap",
  "glam",
+ "image",
 ]
 
 [[package]]
@@ -3414,6 +3417,8 @@ dependencies = [
  "once_cell",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "url",
  "webpki-roots 0.26.11",
 ]

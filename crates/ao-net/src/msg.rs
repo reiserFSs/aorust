@@ -11,6 +11,7 @@ use std::net::Ipv4Addr;
 pub const LOGIN_ERROR: u32 = 0x0D;
 pub const CHARACTER_LIST: u32 = 0x0E;
 pub const NAME_IN_USE: u32 = 0x10;
+pub const REQUEST_REJECTED: u32 = 0x21;
 pub const CHARACTER_CREATED: u32 = 0x11;
 pub const DELETE_CHARACTER: u32 = 0x14;
 pub const CHARACTER_DELETED: u32 = 0x15;
@@ -217,6 +218,8 @@ pub enum Message {
     CharacterCreated { char_id: i32 },
     /// 0x10 server->client.
     NameInUse(i32),
+    /// 0x21 server->client: live PRK answer to an undecryptable `UserCredentials` (detail 9 observed).
+    RequestRejected(i32),
 }
 
 impl Message {
@@ -235,6 +238,7 @@ impl Message {
             Message::CharacterDeleted { .. } => CHARACTER_DELETED,
             Message::CharacterCreated { .. } => CHARACTER_CREATED,
             Message::NameInUse(_) => NAME_IN_USE,
+            Message::RequestRejected(_) => REQUEST_REJECTED,
         }
     }
 
@@ -254,7 +258,7 @@ impl Message {
                 w.bytes(response.as_bytes());
                 w.u8(0);
             }
-            Message::LoginError(c) | Message::NameInUse(c) => w.i32(*c),
+            Message::LoginError(c) | Message::NameInUse(c) | Message::RequestRejected(c) => w.i32(*c),
             Message::CharacterList(l) => {
                 w.i32(l.characters.len() as i32);
                 for c in &l.characters {
@@ -309,6 +313,7 @@ impl Message {
             },
             LOGIN_ERROR => Message::LoginError(r.i32()?),
             NAME_IN_USE => Message::NameInUse(r.i32()?),
+            REQUEST_REJECTED => Message::RequestRejected(r.i32()?),
             CHARACTER_LIST => {
                 let n = r.i32()?;
                 if !(0..=1024).contains(&n) {
@@ -445,6 +450,7 @@ mod tests {
         rt(Message::CharacterDeleted { char_id: None });
         rt(Message::CharacterCreated { char_id: 5 });
         rt(Message::NameInUse(30));
+        rt(Message::RequestRejected(9));
     }
 
     // Hand-derived from AuthClient / InitAuth: 'name[40] | i32 len+1 | bytes | NUL'.

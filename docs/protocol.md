@@ -2,9 +2,8 @@
 
 Scope: everything between "client opens TCP to the login server" and "client opens TCP to the zone
 server and presents its cookies", for the **PRK client 00.7.2_EP1** (`version.id`, `patch.version` = `0.7.2`).
-Implemented as pure encode/decode in `crates/ao-net` (no sockets). **Nothing here was captured from a live
-server** — every claim is from client disassembly (Ghidra 12.1.4 decompiler) or from CellAO / AOChat
-sources. Evidence tags:
+Implemented as encode/decode in `crates/ao-net` plus a threaded client (`ao_net::client`). §1–§7 come from client disassembly (Ghidra 12.1.4
+decompiler) or CellAO / AOChat sources; **§8 holds the live capture from Ithaca** (login phase up to the credential check). Evidence tags:
 
 | tag | meaning |
 |---|---|
@@ -183,6 +182,7 @@ x = `0123456789abcdef0123456789abcdef` -> `dhX = 8cc3b8c6…5a9c45`, `K` starts 
 | 0x15 | CharacterDeleted | S | (client reads nothing; resets `s_nCharID=0`; CellAO sends `i32 charId`) |
 | 0x11 | CharacterCreated | S | `i32 charId` (client stores it as `s_nCharID` and immediately sends 0x16) |
 | 0x10 | NameInUse | S | `i32` (CellAO: 0x1E) |
+| 0x21 | RequestRejected | S | `i32 detail` (live: reply to undecryptable UserCredentials, detail 9; §8) |
 
 Not implemented in `ao-net` (outside the connect→charselect→zone path): 0x0F CreateCharacter
 (`CharacterData_t` + `i32` `[IF 0x10001928]`), 0x55 RandomNameRequest / 0x56 SuggestName (`i16`-prefixed string
@@ -261,7 +261,8 @@ Next: `RedirectToServer` `[IF 0x1000291d]` connects `ACE_INET_Addr::set(port, ip
 `i32 ip`, `i16 port` -> `OpenConnection` to it, then `SendClientCookie` (0x1B). CellAO: `IPAddress` + `ushort` `[.../ZoneRedirectionMessage.cs]`.
 
 ### Other client-handled system messages (not implemented)
-* 0x20 -> fatal "Connection error: Protocol Not OK."; 0x21 -> `AFCM::Send(10, 0x11f)` (+ signal with an `i32`); 0x30 ->
+* 0x20 -> fatal "Connection error: Protocol Not OK."; 0x21 -> `AFCM::Send(10, 0x11f)` (+ signal with an `i32`; implemented as
+  `RequestRejected`, seen live: detail 9); 0x30 ->
   three ints; 0x23 -> ignored; others -> "Protocol error: Got unknown system message %u as reply" `[IF 0x10001e06]`, `[IF 0x10002a9e]`.
 * 0x43: `i32 n`, `n x { i32 len; u8 str[len]; i32; f32 }` -> signal at `GlobalSignals+0x1c8` `[IF 0x10002a9e case 0x43]`. CellAO's
   `ChatServerInfoMessage` is the `n=1` case: `i32 1, str host, i32 port, i32 unknown` `[CellAO .../ChatServerInfoMessage.cs]`.
@@ -275,19 +276,65 @@ ints. 4. Credentials plaintext pad rule (full block when aligned). 5. Server pub
 ## 7. `ao-net` map
 `frame::Frame{encode,decode,system,system_parts}`, `frame::RecvSeq` (§2); `crypto::{make_challenge_response[_with],
 open_challenge_response, tea_*}` (§4); `msg::Message{to_frame,from_frame,encode_body,decode}` and the structs for §5.
-`cargo test -p ao-net`: framing byte vectors (hand-derived from §2), TEA/DH/credentials known answers (§4 provenance),
-round trips for every message, malformed input rejection. Randomness (DH exponent, 8-byte prefix) is a caller input.
+`conn::Conn` (blocking framed TCP, tx seq, rx validation, wire tap with UserCredentials redacted);
+`client::{fetch_servers, ServerEntry, LoginSession{connect,login,select_character,poll}, LoginEvent}` — one background thread per session:
+login phase (UserLogin -> salt -> credentials -> CharacterList / LoginError), SelectCharacter -> ZoneInfo -> `ZoneHandoff`, then the thread
+connects to the zone server (3 tries, 1 s/2 s backoff), sends ZoneLogin, answers pings, reports `ZoneConnected{first frames}` and keeps the
+connection alive until the session is dropped. `LoginError` ends the thread without a `Disconnected` event.
+`examples/probe.rs`: diagnostic (hex dumps; credential-free modes; `--login` prompts on the TTY, password never an argument or logged).
+`cargo test -p ao-net`: framing byte vectors (hand-derived from §2), TEA/DH/credentials known answers (§4 provenance), round trips for every
+message, malformed input rejection, and the client state machine against in-process fake servers (failure replies replay the bytes captured in §8).
+Randomness (DH exponent, 8-byte prefix) is a caller input of `crypto`; the client draws it from the OS.
 
-## 8. Open questions (need a live capture / live connection — NOT done, permission pending)
-1. Does Ithaca's login server hold the private key for client key `Y` (§4)? Expected yes (client is PRK's), but any mismatch would only surface as `LoginError 0x6A`.
-2. Does PRK's server expect the account password in the `S` plaintext, or a launcher-issued token? (Client reads `s_cPlayerPasswd` from the UI; launcher passes none.)
-3. Exact `sender`/`receiver` header values PRK sends in server frames and whether the first server frame can be anything other than `ServerSalt`/`LoginError`.
-4. Real values of `status`, `allowedChars`, `expansions`, `slProfs`, `eventServerType`, `playerId`, and the `PlayfieldProxy` identity types in live `CharacterList`/`ZoneInfo`.
-5. Whether PRK sends extra system messages (0x43 chat server list, 0x4E, 0x21, 0x30) between 0x25 and 0x0E.
-6. Zone side: does the server speak first on the zone connection (ping/N3), and when exactly does the client emit 0x1B relative to connect (`N3ActivatedMessage` timing)? Ping (ptype 0xB, 0x28-byte header) layout and whether keepalive is required on the login connection were not analysed (`StartPingManager` only runs after `RedirectToServer`, `[IF 0x1000291d]`).
-7. Whether PRK enables `0x7F` compression on login or zone connections and its exact framing (zlib stream boundaries).
-8. Whether `version.id` content (`00.7.2_EP1`) is validated server-side and what the server answers on mismatch (0x20/0x21?).
-9. Meaning/encoding of the numeric error codes beyond the three CellAO names.
+## 8. Live probe (Ithaca, 2026-10) — what is settled, what needs an account
+
+Server list: `GET https://site.project-rk.com/api/status` -> `{"data":[{"loginIp":"199.241.136.157","loginPort":7000,"serverName":"Ithaca","count":199}]}`
+(`ao_net::client::fetch_servers`). Five short connections to `199.241.136.157:7000` with the fake name `aomac-probe` and a made-up
+password (`cargo run -p ao-net --example probe`); no real credentials were involved. Transcripts below are exact (UserCredentials bodies
+redacted by the tool; its length 0x1a2 = 417 chars + NUL = `dhX` 256 hex + `-` + 160 hex ciphertext).
+
+```
+>>> UserLogin (84 B)  0001 0001 0001 0054 00000000 00000001 | 00000022 00000002 "aomac-probe"+NUL*29 "00.7.2_EP1"+NUL*10
+<<< ServerSalt (52 B) 0001 0001 0001 0034 00000001 00000000 | 00000024 "2aefcfc2ec7ec3713f80e688e46c3d04"
+>>> UserCredentials (484 B) 0002 0001 0001 01e2 00000000 00000001 | 00000025 "aomac-probe"+NUL*29 000001a2 <417 chars>+NUL
+<<< LoginError (24 B) 0002 0001 0001 0018 00000000 00001f83 | 0000000d 0000006a
+<<< (garbage "abcd-0011223344556677" as credentials) 0002 0001 0001 0018 00000000 00001f83 | 00000021 00000009
+```
+
+1. **Client DH key / server holds the private half of `Y`: yes (strong evidence).** A real response built with this client's `Y` for an unknown
+   account/password is answered `LoginError 0x6A` (106, "invalid user/password"); an *undecryptable* response is answered differently
+   (`0x21`, `i32 9`). A server that could not derive our key would see garbage plaintext, take the second path. Not proven: a *correct* password
+   succeeding (needs an account).
+2. **Server frame header**: `seq` starts at 1 and increments per frame (2 for the reply); ServerSalt `sender=1 receiver=0`; the error replies
+   `sender=0 receiver=0x1f83` (same `0x1f83` CellAO sends). `version` field = 1, size unpadded, payload padded to 4. The first server frame is the
+   ServerSalt (never anything unsolicited); the server sends nothing until the client's UserLogin.
+3. **ServerSalt** is 32 bytes of **ASCII lowercase hex** (a random 16-byte value, hex-printed) — never contains NUL, so the NUL-truncation rule
+   (§4.1) is moot on PRK. Five different salts observed.
+4. **Keepalive on the login connection: none needed.** Idle for 40 s after ServerSalt: no server ping, no close. After a `LoginError` the server
+   also left the socket open for 10 s (the client drops it).
+5. **Compression (0x7F): not used** during login on Ithaca (no 0x7F frame seen in any of the five runs). Zone side unknown.
+6. **`version.id` is not checked at UserLogin** (`00.0.0_XX` still gets a ServerSalt). With bogus credentials + wrong version the reply is still
+   `0x6A`, so no version error path was reached; whether a *valid* login with a wrong version is refused stays open.
+7. **New message `0x21` `RequestRejected(i32)`** (§5): reply to undecryptable credentials, detail 9; the client forwards it as `AFCM::Send(10,0x11f)`.
+8. Codes seen: `0x6A` only (unknown account or wrong password are indistinguishable for `aomac-probe`).
+
+### Ping (ptype 0xB) — from disassembly, not yet seen live (zone side)
+`PingMessage_t::CreateDataBlock` `[MP 0x10002a9e]`, ctor `[MP 0x100028b7]`: payload after the 16-byte header = six BE u32
+`type, f14, t_orig, t_recv, t_send, f24` (0x28-byte header total) + optional extra data. `type` 1 = request, 2 = reply, 3 = extended request.
+Client receive `[IF 0x10001d36 Client_t::Receive]`: a type-1 ping whose `receiver == charId` is answered with a copy: `type=2`, `sender=charId`,
+`receiver=<request sender>`, `t_recv = t_send = ms since midnight`; other fields echoed. Own pings `SendPingMessageToServer` `[IF 0x10001719]`:
+`type 1`, `sender=charId`, `receiver=2`, `f24` = caller argument, `t_orig` = ms since midnight (`PreprocessOutgoingPing [CN 0x100058d5]`).
+What drives the client's own send period was not resolved; `ao-net` replies to server pings and sends its own every 30 s (**guess**).
+
+### Still open — needs a valid account (first real login; run `cargo run -p ao-net --example probe -- --login`)
+1. Does a correct account password produce the CharacterList, or does PRK expect a launcher token in the password slot (the launcher passes none)?
+2. Real `CharacterList` values: `status`, `allowedChars`, `expansions`, `slProfs`, `dataVersion`/`infoVersion`, PlayfieldProxy identity types.
+3. Extra system messages between 0x25 and 0x0E (0x43 chat-server list, 0x4E, 0x30): the client logs any undecoded one as a `Status` event.
+4. `ZoneInfo` real shape (22 vs 30 bytes), `eventServerType`, `playerId`.
+5. Zone side: does the server speak first; is `ZoneLogin` accepted right after TCP connect (the client sends it immediately; the original waits for
+   `N3ActivatedMessage` — the trigger is unresolved); zone-side 0x7F compression; own-ping period. `ZoneConnected` carries the first 16 frames
+   (ptype, first u32, sender, receiver, length, first 32 payload bytes) and the same are printed to stderr as `[ao-net] zone frame ...`.
+6. Whether a wrong `version.id` is refused for a valid account; meaning of codes other than 0x14/0x6A/0x6C/0x21-9.
 
 ## 9. Sources used
 * This repo's analysis of the binaries above (Ghidra 12.1.4, headless; scripts in `/tmp/aomac-ghidra/proto/scripts`).
