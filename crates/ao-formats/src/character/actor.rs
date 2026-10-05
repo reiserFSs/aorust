@@ -50,14 +50,29 @@ impl ActorAssets {
     }
 }
 
-/// Texture overrides `material name -> rdb 1010004 texture id` loaded for [`ActorRig::new`] (NPC skins, `TextureData_t`).
-pub fn texture_overrides(store: &RecordStore, pairs: &[(String, u32)]) -> PartTextures {
+/// Part textures of an NPC on `cat`: the wire `textures[]` list replaces the part textures (`SetCATTextures`, [`texture_overrides`]),
+/// worn `cloth[]` `(part, rdb 1010004 texture)` is composited over the part's texture with the green key cut out (the client's
+/// cloth-over-skin rule, [`overlay_on_skin`]; the consumer of the cloth table of morphed NPCs was not found, docs/zone/npc.md §6).
+pub fn npc_part_textures(store: &RecordStore, cat: &CatMesh, list: &[TextureOverride], cloth: &[(ClothPart, u32)]) -> PartTextures {
+    let load = |id: u32| {
+        let key = TextureKey { rdb_type: TEXTURE_TYPE, id };
+        load_texture(store, key).ok().flatten().map(|t| (key, t))
+    };
     let mut out = PartTextures::new();
-    for (name, id) in pairs {
-        let key = TextureKey { rdb_type: TEXTURE_TYPE, id: *id };
-        if let Some(tex) = load_texture(store, key).ok().flatten() {
-            out.insert(name.clone(), (key, tex));
+    for (i, o) in texture_overrides(cat, list) {
+        if let Some(t) = (o.texture != 0).then(|| load(o.texture)).flatten() {
+            out.insert(cat.parts[i].name.clone(), t);
         }
+    }
+    for &(part, id) in cloth {
+        let Some(p) = cat.parts.iter().find(|p| p.name == part.name()) else { continue };
+        let Some(over) = load(id) else { continue };
+        let under = out.get(&p.name).cloned().or_else(|| (p.texture != 0).then(|| load(p.texture)).flatten());
+        let entry = match under {
+            Some((k, base)) => (TextureKey { rdb_type: 0x4000_0000 | k.id, id }, overlay_on_skin(&base, &over.1)),
+            None => over,
+        };
+        out.insert(p.name.clone(), entry);
     }
     out
 }
@@ -104,6 +119,8 @@ impl ActorRig {
     /// meshes `(attractor place, rdb 1010001 mesh)` (`Attractor01_head` = place 0, `02_righthand` = 1, ...; unknown places are skipped).
     pub fn new(store: &RecordStore, model_id: u32, head: Option<u32>, overrides: &PartTextures, attachments: &[(u8, u32)]) -> Result<Self> {
         let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model_id)?;
+        // creature models have no head attractor: a head mesh is then not mounted (and the body keeps its own head part)
+        let head = head.filter(|_| cat.attractors.iter().any(|a| a.name.ends_with("_head")));
         let bind = bind_frames(&cat);
         let skin = skin_bind(&cat, &bind);
         let (mut model, ..) = assemble(store, &cat, &skin, overrides, head.is_some());
@@ -151,6 +168,17 @@ impl ActorRig {
     /// Body height in metres (bind pose), for name-tag placement.
     pub fn height(&self) -> f32 {
         self.model.meshes[0].vertices.iter().map(|v| v.pos[1]).fold(0.0, f32::max) + if self.head.is_some() { 0.25 } else { 0.0 }
+    }
+
+    /// Height (metres above the feet, bind pose, unscaled) of the name tag / indicator anchor: `Attractor01_head` + 0.5 m
+    /// (`VisualCATMesh_t::GetIndicatorPosition`, docs/zone/motion.md §6); models without a head attractor: body height + 0.3.
+    pub fn indicator_height(&self) -> f32 {
+        let anchor = self.cat.attractors.iter().position(|a| a.name.ends_with("_head")).and_then(|i| {
+            let att = &self.cat.attractors[i];
+            let bone = self.bind[att.bone as usize].or_else(|| self.nearest_frame(&self.bind, att.bone as usize))?;
+            Some(bone.mul(&Xf::from_qt(att.rot, att.pos)).t[1] + 0.5)
+        });
+        anchor.unwrap_or_else(|| self.height() + 0.3)
     }
 
     /// World frame of every bone in the pose (`FUN_100540a5`).

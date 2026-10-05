@@ -633,6 +633,11 @@ impl Play {
                 LoginEvent::ZoneHandoff { zone_ip, zone_port, character_id } => {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
                     self.zone = zone::Zone::new(character_id);
+                    let mut chat = chat::Chat::new();
+                    if let Some((u, p)) = &self.login_cred {
+                        chat.set_credentials(u, p);
+                    }
+                    self.chat = Some(chat);
                     self.zone.world.start(self.dir.clone(), character_id as i32);
                     self.world_frames = 0;
                     self.start_loading(host);
@@ -862,6 +867,7 @@ impl Frontend for Play {
                         (None, Some(e), None) => (Vec3::from(e), Vec3::from(e) + Vec3::Z),
                         _ => ao_render::default_view(&s),
                     };
+                    self.zone.world.lens = s.lens.unwrap_or_default();
                     host.set_scene(*s);
                     // the live sky follows the server's `GameTime` from here on (1 `GameDayTime` second per real second)
                     let sky = self.world_sky.take().map(|c| c.on_day(self.zone.game_day as u32));
@@ -910,6 +916,10 @@ impl Frontend for Play {
         }
         let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
         let mut list = self.gui.frame(dt);
+        if self.screen == Screen::InWorld {
+            let own = self.zone.own().map_or(host.camera.pos.to_array(), |d| zone::scene_pos(d.pos));
+            self.zone.world.name_tags(&mut self.gui, &host.camera, self.size, own, &mut list);
+        }
         if self.screen == Screen::Create {
             list.cmds.splice(0..0, pre.cmds);
             list.cmds.extend(post.cmds);
