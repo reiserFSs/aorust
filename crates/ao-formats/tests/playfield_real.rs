@@ -73,3 +73,18 @@ fn statel_lights_are_valid() {
         }
     }
 }
+
+/// Statel attributes replace `SimpleMesh` textures (505: rocks `(0 -> 6311)`), fog volumes and sound emitters are exposed.
+#[test]
+fn statel_attributes_fog_and_sound_are_decoded() {
+    let Some((store, dir)) = setup() else { return };
+    let (scene, r) = load_playfield_report(&store, &dir, 505).unwrap();
+    assert!(scene.textures.keys().any(|k| k.rdb_type == 1_010_004 && k.id == 6311), "override texture 6311 not loaded");
+    assert_eq!(r.fogs.len(), 1);
+    let (scene, r) = load_playfield_report(&store, &dir, 630).unwrap();
+    let m = scene.fog_model.expect("fog model");
+    assert_eq!(m.volumes.len(), r.fogs.len());
+    let v = m.volumes[0];
+    // inside a volume the fog is denser than the base fog, outside it is the base fog
+    assert!(m.at(v.pos).1 < m.at([1e6, 0.0, 0.0]).1);
+}
