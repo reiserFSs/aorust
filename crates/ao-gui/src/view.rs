@@ -562,6 +562,17 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             }
             id
         }
+        "ViewSelector" => {
+            // `ViewSelector_c`: its children share the parent's frame (stacked); the application shows one at a time
+            // (`Gui::select_child`, the original's `SetValue(index)` = vtable +0xf0).
+            let mut v = View::new(Kind::View);
+            apply_view_attrs(&mut v, e, 0);
+            let id = tree.add(v);
+            load_children(tree, ctx, id, e);
+            tree.views[id].stacked = true;
+            tree.views[id].node = Node::None;
+            id
+        }
         "ScrollViewChild" => {
             let mut v = View::new(Kind::ScrollChild);
             apply_view_attrs(&mut v, e, 0);

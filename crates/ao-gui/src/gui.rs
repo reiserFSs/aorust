@@ -297,6 +297,40 @@ impl Gui {
         Ok(id)
     }
 
+    /// Like [`Gui::add_view`] for view XML text built by the application (rows the original creates in code, e.g. `StatRow`).
+    pub fn add_view_xml(&mut self, w: WindowId, parent: &str, name: &str, src: &str) -> Result<ViewHandle> {
+        let p = self.find(w, parent).ok_or_else(|| anyhow!("no view {parent:?}"))?;
+        let root_el = xml::parse(src).with_context(|| format!("parse {name}"))?;
+        let view_el = root_el.children.first().ok_or_else(|| anyhow!("{name}: empty <root>"))?;
+        let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
+        let id = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{name}: cannot build"))?;
+        self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{name}: {w}")));
+        self.tree.append_child(p, id);
+        self.items.insert(id);
+        self.relayout_window(w);
+        Ok(id)
+    }
+
+    /// `ViewSelector_c::SetValue(index)`: shows child `index` of the named view and hides (and collapses) the others.
+    pub fn select_child(&mut self, w: WindowId, name: &str, index: Option<usize>) {
+        if let Some(p) = self.find(w, name) {
+            for (i, c) in self.tree.views[p].children.clone().into_iter().enumerate() {
+                self.tree.views[c].visible = Some(i) == index;
+                self.tree.views[c].flags |= VF_COLLAPSE_WHEN_HIDDEN;
+            }
+            self.relayout_window(w);
+        }
+    }
+
+    /// `View::Show(visible)` plus `View::SetFlags(0x100)` (collapse while hidden), as `SkillWindow` does for its group views.
+    pub fn show_collapsing(&mut self, w: WindowId, name: &str, visible: bool) {
+        if let Some(v) = self.find(w, name) {
+            self.tree.views[v].visible = visible;
+            self.tree.views[v].flags |= VF_COLLAPSE_WHEN_HIDDEN;
+            self.relayout_window(w);
+        }
+    }
+
     /// Removes all children of the named view (items added with `add_view` are dropped).
     pub fn remove_children(&mut self, w: WindowId, parent: &str) {
         if let Some(p) = self.find(w, parent) {
