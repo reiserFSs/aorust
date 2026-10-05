@@ -11,10 +11,12 @@ pub mod actor;
 mod anim;
 mod cat;
 mod names;
+mod npc;
 mod player;
 mod viewer_cache;
 
 pub use names::NameTable;
+pub use npc::*;
 pub use player::*;
 pub use viewer_cache::{CachedCharacter, ClothEntry, MeshEntry, ViewerCache};
 pub use anim::{CatAnim, Track};
