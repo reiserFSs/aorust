@@ -50,9 +50,9 @@ pub fn decode_mesh_into(store: &RecordStore, id: u32, scene: &mut Scene) -> Resu
 pub fn decode_record_into(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene) -> Result<Option<usize>> {
     let Some(bytes) = store.get(rdb_type, id)? else { return Ok(None) };
     let mesh = decode_archive(&bytes, |key| {
-        if !scene.textures.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = scene.textures.entry(key) {
             if let Some(t) = load_texture(store, key).ok().flatten() {
-                scene.textures.insert(key, t);
+                e.insert(t);
             }
         }
         scene.textures.contains_key(&key)
@@ -166,9 +166,9 @@ fn decode_archive(bytes: &[u8], mut have_texture: impl FnMut(TextureKey) -> bool
 impl Builder<'_, '_> {
     fn node(&mut self, i: usize, parent: &Mat, depth: usize) -> Result<()> {
         ensure!(depth < MAX_DEPTH, "frame tree too deep");
-        ensure!(!std::mem::replace(&mut self.visited[i], true), "cyclic frame tree");
         let ar = self.ar;
         let n = ar.objects.get(i).with_context(|| format!("dangling object ref {i}"))?;
+        ensure!(!std::mem::replace(&mut self.visited[i], true), "cyclic frame tree");
         let world = mul(&local_matrix(n), parent);
         if let Some(data) = n.ref1("data") {
             let data = ar.objects.get(data).context("dangling data ref")?;
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn quat_90_about_x_rotates_y_to_z() {
-        let q: Vec<u8> = [0.70710678f32, 0.0, 0.0, 0.70710678].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let q: Vec<u8> = [std::f32::consts::FRAC_1_SQRT_2, 0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2].iter().flat_map(|f| f.to_le_bytes()).collect();
         let n = Object { members: vec![crate::archive::Member { name: "local_rot", data: &q }] };
         let m = local_matrix(&n);
         // row-vector convention: (0,1,0) * M = row 1 = (0,0,1)
@@ -409,6 +409,23 @@ mod tests {
         assert_eq!(m.submeshes.len(), 1);
         assert_eq!(m.submeshes[0].indices, vec![0, 2, 1, 3, 1, 2]);
         assert!(m.submeshes[0].texture.is_none());
+    }
+
+    #[test]
+    fn out_of_range_child_ref_is_an_error() {
+        let mut b = vec![];
+        for x in [3u32, 0, 0, 1, 2] {
+            b.extend(x.to_le_bytes());
+        }
+        for n in ["obj", "chld"] {
+            b.extend(format!("1\0{n}\0").bytes());
+        }
+        b.extend(1u32.to_le_bytes());
+        let r = |v: &[i32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        b.extend(object(&[member(0, 0x11, &r(&[0]))]));
+        b.extend(object(&[member(1, 0x11, &r(&[0x4d00_0000]))]));
+        b.extend([0u8; 12]);
+        assert!(decode_archive(&b, |_| false).is_err());
     }
 
     /// One triangle with a `FAFMaterial_t` (diffuse, opacity) and a material `RDeltaState` holding `states`.
