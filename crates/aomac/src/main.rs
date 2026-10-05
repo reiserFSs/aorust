@@ -79,6 +79,10 @@ enum What {
         /// Game day time in seconds, 0..6480 (0 midnight, ~3240 noon; default: the client's frozen 2648.69).
         #[arg(long)]
         time_of_day: Option<f32>,
+        /// Interactive viewer: game seconds per real second (e.g. 60), so the sun, moons, sky colours and fog move live.
+        /// The ground shadow layer stays at the start time.
+        #[arg(long)]
+        time_scale: Option<f32>,
     },
     /// Character model record id, optionally posed by an animation clip.
     Char {
@@ -129,10 +133,6 @@ fn size(s: &str) -> Result<(u32, u32), String> {
     Ok((w.parse().map_err(|e| format!("{e}"))?, h.parse().map_err(|e| format!("{e}"))?))
 }
 
-fn client_dir(arg: Option<PathBuf>) -> Result<PathBuf> {
-    match arg {
-        Some(p) => Ok(p),
-        None => Ok(PathBuf::from(std::env::var("HOME").context("HOME unset")?).join("Games/ProjectRubiKa/client")),
 /// Opens the audio device and returns the per-frame hook that follows the camera (listener), the day clock and the
 /// playfield's music/ambience/emitters. A missing device or sound data disables audio with a message.
 fn playfield_audio(dir: &std::path::Path, pf: ao_audio::PlayfieldAudio, start: f32, scale: f32) -> Option<ao_render::FrameHook> {
@@ -158,6 +158,10 @@ fn playfield_audio(dir: &std::path::Path, pf: ao_audio::PlayfieldAudio, start: f
     }))
 }
 
+fn client_dir(arg: Option<PathBuf>) -> Result<PathBuf> {
+    match arg {
+        Some(p) => Ok(p),
+        None => Ok(PathBuf::from(std::env::var("HOME").context("HOME unset")?).join("Games/ProjectRubiKa/client")),
     }
 }
 
@@ -167,12 +171,12 @@ fn main() -> Result<()> {
         Cmd::Install { client } => ao_install::run(&client_dir(client)?),
         Cmd::View { opts, what } => {
             let dir = client_dir(opts.client.clone())?;
+            let mut live = None;
+            let mut pf_audio = None;
             let scene: Scene = match what {
                 What::Demo { count } => demo::scene(count),
                 What::Char { id, anim, time, head, role } => {
                     let store = RecordStore::open(&dir)?;
-            let mut live = None;
-            let mut pf_audio = None;
                     let anim = match role {
                         Some(r) => Some(ao_formats::character::role_anim(&store, id, &r)?),
                         None => anim,
@@ -219,7 +223,7 @@ fn main() -> Result<()> {
                     let (eye, at) = ao_render::default_view(&scene);
                     let eye = opts.eye.unwrap_or(eye.into());
                     let at = opts.at.unwrap_or(at.into());
-                    ao_render::render_to_png(&scene, eye, at, opts.size.0, opts.size.1, &path)
+                    ao_render::render_to_png_at(&scene, eye, at, opts.size.0, opts.size.1, &path, opts.anim_time)
                 }
                 None => {
                     // --eye/--at also place the interactive camera.

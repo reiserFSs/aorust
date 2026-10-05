@@ -6,4 +6,5 @@ mod archive;
 pub mod character;
 pub mod mesh;
 pub mod playfield;
+pub mod screens;
 pub mod texture;

@@ -216,16 +216,29 @@ struct Inst {
 struct Gpu {
     meshes: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
     inst_bufs: Vec<wgpu::Buffer>, // ring: a buffer is rewritten only after earlier frames using it were submitted
-    sky_bufs: Vec<wgpu::Buffer>,  // ring of per-frame sky instance transforms
     mats: Vec<wgpu::BindGroup>, // [0] = untextured white
     opaque: Vec<Draw>,          // Opaque + AlphaTest, sorted by pipeline/mesh/material
     blended: Vec<Draw>,         // AlphaBlend + Additive, drawn per visible instance, far to near
-    sky: Vec<(Draw, u32)>,      // (draw, index into `sky_xf`) in scene order
-    sky_xf: Vec<Mat4>,
     insts: Vec<Inst>,           // grouped by mesh
     mesh_range: Vec<std::ops::Range<usize>>,
     radius: f32,
     grid: ([f32; 4], [i32; 4]), // light grid origin+cell, dims
+}
+
+/// Sky backdrop with its own mesh/material tables, so [`Renderer::set_sky`] can swap it while the world stays.
+#[derive(Default)]
+struct SkyGpu {
+    meshes: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>, // indexed like the uploaded scene's meshes
+    mats: Vec<wgpu::BindGroup>,
+    draws: Vec<(Draw, u32)>, // (draw, index into `xf`) in scene order
+    xf: Vec<Mat4>,
+    spin: Vec<Option<ao_scene::SkySpin>>, // per `xf` entry
+    bufs: Vec<wgpu::Buffer>, // ring of per-frame instance transforms (translation = camera)
+}
+
+/// Material uniform of a submesh (see `shader.wgsl` `Mat`).
+fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 12] {
+    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], 0.0, 0.0]
 }
 
 /// Last-frame counters (after frustum culling).
@@ -276,6 +289,9 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     pipes: Vec<wgpu::RenderPipeline>, // indexed by Draw::pipe
     gpu: Gpu,
+    sky: SkyGpu,
+    /// Sky textures by key; kept across [`Renderer::set_sky`] so a live sky only ships new textures.
+    sky_views: HashMap<TextureKey, wgpu::TextureView>,
     env: Environment,
     /// Camera dependent fog (statel fog volumes), see `Scene::fog_model`.
     fog: Option<ao_scene::FogModel>,
@@ -466,7 +482,9 @@ impl Renderer {
             tex_layout,
             sampler,
             pipes,
-            gpu: Gpu { meshes: vec![], inst_bufs: vec![], sky_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], sky: vec![], sky_xf: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
+            sky: SkyGpu::default(),
+            sky_views: HashMap::new(),
+            gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
             env: default_environment(100.0),
             fog: None,
             frame: 0,
@@ -533,7 +551,7 @@ impl Renderer {
         let mut mat_of: HashMap<(usize, [u32; 12]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh| {
-            let u: [f32; 12] = [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], 0.0, 0.0];
+            let u = mat_uniform(s);
             *mat_of.entry((view, u.map(f32::to_bits))).or_insert_with(|| {
                 let ub = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
@@ -576,14 +594,11 @@ impl Renderer {
 
         let (mut insts, mut mesh_range, mut meshes) = (vec![], vec![], vec![]);
         let (mut opaque, mut blended) = (vec![], vec![]);
-        let mut sky_draws: HashMap<usize, Vec<Draw>> = HashMap::new();
-        let sky_used = |mi: usize| scene.sky.iter().any(|s| s.mesh == mi);
         for (mi, mesh) in scene.meshes.iter().enumerate() {
             let list = std::mem::take(&mut by_mesh[mi]);
-            let list_len = list.len();
             let range = insts.len()..insts.len() + list.len();
             let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
-            if mesh.vertices.is_empty() || idx_total == 0 || (list.is_empty() && !sky_used(mi)) {
+            if mesh.vertices.is_empty() || idx_total == 0 || list.is_empty() {
                 mesh_range.push(insts.len()..insts.len());
                 meshes.push(None);
                 continue;
@@ -610,12 +625,7 @@ impl Renderer {
                     let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
                     let mat = material(self, view, s);
                     let d = Draw { mesh: mi, first_index: first, count, mat, pipe: s.blend as usize * 2 + s.two_sided as usize };
-                    if sky_used(mi) {
-                        sky_draws.entry(mi).or_default().push(Draw { pipe: SKY_PIPE + s.blend as usize, ..d });
-                    }
-                    if list_len > 0 {
-                        if matches!(s.blend, Blend::AlphaBlend | Blend::Additive) { blended.push(d) } else { opaque.push(d) }
-                    }
+                    if matches!(s.blend, Blend::AlphaBlend | Blend::Additive) { blended.push(d) } else { opaque.push(d) }
                 }
             }
             let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -643,32 +653,101 @@ impl Renderer {
         let radius = scene_bounds(scene).map_or(100.0, |(l, h)| ((h - l).length() * 0.5).max(1.0));
         self.env = scene.environment.unwrap_or_else(|| default_environment(radius));
         self.fog = scene.fog_model.clone();
-        let mut sky = vec![];
-        let mut sky_xf = vec![];
-        for s in &scene.sky {
-            for d in sky_draws.get(&s.mesh).into_iter().flatten() {
-                sky.push((*d, sky_xf.len() as u32));
-            }
-            sky_xf.push(Mat4::from_cols_array_2d(&s.transform));
-        }
-        let sky_bufs = if sky_xf.is_empty() {
-            vec![]
-        } else {
-            (0..INST_RING)
-                .map(|_| {
-                    self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("sky"),
-                        size: (sky_xf.len() * 64) as u64,
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    })
-                })
-                .collect()
-        };
+        self.set_sky(scene);
         let grid = LightGrid::new(&scene.lights);
         self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
-        self.gpu = Gpu { meshes, inst_bufs, sky_bufs, mats, opaque, blended, sky, sky_xf, insts, mesh_range, radius, grid };
+        self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, insts, mesh_range, radius, grid };
+    }
+
+    /// Replaces only the sky backdrop (`scene.sky` instances of `scene.meshes`) and, when given, the environment (sun, ambient,
+    /// fog base, volumes kept); the world stays. Textures are cached by key, so `scene.textures` need only hold keys not sent before.
+    pub fn set_sky(&mut self, scene: &Scene) {
+        for (k, t) in &scene.textures {
+            if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize && !self.sky_views.contains_key(k) {
+                let v = self.texture_view(&t.rgba, t.width, t.height);
+                self.sky_views.insert(*k, v);
+            }
+        }
+        let white = self.texture_view(&[255; 4], 1, 1);
+        let mut sky = SkyGpu::default();
+        let mut mat_of: HashMap<(Option<TextureKey>, [u32; 12]), usize> = HashMap::new();
+        for (mi, mesh) in scene.meshes.iter().enumerate() {
+            let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
+            if mesh.vertices.is_empty() || idx_total == 0 || !scene.sky.iter().any(|s| s.mesh == mi) {
+                sky.meshes.push(None);
+                continue;
+            }
+            let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&vertex_bytes(&mesh.vertices)),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let nv = mesh.vertices.len() as u32;
+            let mut indices = Vec::with_capacity(idx_total);
+            let mut ranges = vec![];
+            for s in &mesh.submeshes {
+                let first = indices.len() as u32;
+                for t in s.indices.as_chunks::<3>().0 {
+                    if t.iter().all(|&i| i < nv) {
+                        indices.extend_from_slice(t.as_slice());
+                    }
+                }
+                let count = indices.len() as u32 - first;
+                if count == 0 {
+                    continue;
+                }
+                let key = s.texture.filter(|k| self.sky_views.contains_key(k));
+                let u = mat_uniform(s);
+                let mat = *mat_of.entry((key, u.map(f32::to_bits))).or_insert_with(|| {
+                    let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
+                    sky.mats.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.tex_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(key.map_or(&white, |k| &self.sky_views[&k])) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                            wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
+                        ],
+                    }));
+                    sky.mats.len() - 1
+                });
+                ranges.push(Draw { mesh: mi, first_index: first, count, mat, pipe: SKY_PIPE + s.blend as usize });
+            }
+            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&indices), usage: wgpu::BufferUsages::INDEX });
+            sky.meshes.push(Some((vb, ib)));
+            // draws are attached per instance below
+            for d in ranges {
+                sky.draws.push((d, u32::MAX));
+            }
+        }
+        // one draw per (instance, submesh), in instance order
+        let per_mesh = std::mem::take(&mut sky.draws);
+        for inst in &scene.sky {
+            for (d, _) in per_mesh.iter().filter(|(d, _)| d.mesh == inst.mesh) {
+                sky.draws.push((*d, sky.xf.len() as u32));
+            }
+            sky.xf.push(Mat4::from_cols_array_2d(&inst.transform));
+        }
+        sky.spin = (0..sky.xf.len()).map(|i| scene.sky_spin.iter().find(|s| s.instance == i).copied()).collect();
+        sky.bufs = if sky.xf.is_empty() {
+            vec![]
+        } else {
+            (0..INST_RING)
+                .map(|_| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("sky"), size: (sky.xf.len() * 64) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
+                .collect()
+        };
+        self.sky = sky;
+        if let Some(env) = scene.environment {
+            self.env = env;
+        }
+        // a live update brings the base fog of the new time; the playfield's fog volumes stay
+        if let Some(mut model) = scene.fog_model.clone() {
+            if let Some(old) = self.fog.take().filter(|_| model.volumes.is_empty()) {
+                model.volumes = old.volumes;
+            }
+            self.fog = Some(model);
+        }
     }
 
     /// Re-poses the uploaded scene in place: `scene` must be the same scene with only vertex positions/normals and
@@ -743,9 +822,27 @@ impl Renderer {
                 self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
             }
         }
-        let sky_buf = self.gpu.sky_bufs.get(self.frame);
+        let sky_buf = self.sky.bufs.get(self.frame);
         if let Some(buf) = sky_buf {
-            let xf: Vec<[[f32; 4]; 4]> = self.gpu.sky_xf.iter().map(|m| Mat4::from_cols(m.x_axis, m.y_axis, m.z_axis, cam.pos.extend(1.0))).map(|m| m.to_cols_array_2d()).collect();
+            // translation = camera; a spinning instance turns about its pivot (relative to the camera) first
+            let time = self.time;
+            let xf: Vec<[[f32; 4]; 4]> = self
+                .sky
+                .xf
+                .iter()
+                .zip(&self.sky.spin)
+                .map(|(m, spin)| {
+                    let (m, off) = match spin {
+                        Some(s) => {
+                            let r = Mat4::from_axis_angle(Vec3::from(s.axis).normalize_or_zero(), (s.degrees_per_second * time).to_radians());
+                            let p = Vec3::from(s.pivot);
+                            (r * *m, p - r.transform_vector3(p))
+                        }
+                        None => (*m, Vec3::ZERO),
+                    };
+                    Mat4::from_cols(m.x_axis, m.y_axis, m.z_axis, (cam.pos + off).extend(1.0)).to_cols_array_2d()
+                })
+                .collect();
             self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&xf));
         }
         // Blended: one draw per (visible instance, submesh), far to near by instance centre.
@@ -782,29 +879,29 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            let (mut pipe, mut mesh, mut mat) = (usize::MAX, usize::MAX, usize::MAX);
-            let mut draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>| {
+            let (mut pipe, mut mesh, mut mat) = (usize::MAX, (false, usize::MAX), (false, usize::MAX));
+            let mut draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
                 if pipe != d.pipe {
                     pass.set_pipeline(&self.pipes[d.pipe]);
                     pipe = d.pipe;
                 }
-                if mesh != d.mesh {
-                    let (vb, ib) = self.gpu.meshes[d.mesh].as_ref().unwrap();
+                if mesh != (sky, d.mesh) {
+                    let (vb, ib) = if sky { &self.sky.meshes } else { &self.gpu.meshes }[d.mesh].as_ref().unwrap();
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    mesh = d.mesh;
+                    mesh = (sky, d.mesh);
                 }
-                if mat != d.mat {
-                    pass.set_bind_group(1, &self.gpu.mats[d.mat], &[]);
-                    mat = d.mat;
+                if mat != (sky, d.mat) {
+                    pass.set_bind_group(1, &if sky { &self.sky.mats } else { &self.gpu.mats }[d.mat], &[]);
+                    mat = (sky, d.mat);
                 }
                 pass.draw_indexed(d.first_index..d.first_index + d.count, 0, insts);
                 calls += 1;
             };
             if let Some(sky) = sky_buf {
                 pass.set_vertex_buffer(1, sky.slice(..));
-                for (d, k) in &self.gpu.sky {
-                    draw(&mut pass, d, *k..*k + 1);
+                for (d, k) in &self.sky.draws {
+                    draw(&mut pass, d, *k..*k + 1, true);
                 }
             }
             if let Some(inst) = inst_buf {
@@ -812,11 +909,11 @@ impl Renderer {
                 for d in &self.gpu.opaque {
                     let r = self.vis_range[d.mesh].clone();
                     if !r.is_empty() {
-                        draw(&mut pass, d, r);
+                        draw(&mut pass, d, r, false);
                     }
                 }
                 for &(_, di, vi) in &self.sorted {
-                    draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1);
+                    draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1, false);
                 }
             }
         }
@@ -838,9 +935,15 @@ fn vertex_bytes(v: &[ao_scene::Vertex]) -> Vec<f32> {
 
 /// Renders `scene` offscreen and writes an sRGB PNG.
 pub fn render_to_png(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path) -> Result<()> {
+    render_to_png_at(scene, eye, look_at, width, height, path, 0.0)
+}
+
+/// [`render_to_png`] with the scrolling textures (`Submesh::uv_scroll`) at `time` seconds.
+pub fn render_to_png_at(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut r = Renderer::new(&instance, None)?;
     r.upload(scene);
+    r.time = time;
     let targets = Targets::new(&r, width, height);
     let out = r.device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -901,4 +1004,48 @@ fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: 
             wgpu::BindGroupEntry { binding: 3, resource: i.as_entire_binding() },
         ],
     })
+}
+
+#[cfg(test)]
+mod sky_tests {
+    use super::*;
+    use ao_scene::{Instance, Mesh, SkySpin, Submesh, Texture, TextureKey, Vertex, IDENTITY};
+
+    fn pixels(scene: &Scene, time: f32, name: &str) -> Option<Vec<u8>> {
+        let path = std::env::temp_dir().join(format!("ao-render-{}-{name}.png", std::process::id()));
+        // no GPU adapter: skip
+        render_to_png_at(scene, [0.0, 0.0, 0.0], [0.0, 0.0, -1.0], 64, 64, &path, time).ok()?;
+        let bytes = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        bytes
+    }
+
+    /// A sky quad straight ahead: a 2x1 checker texture (scrolled by `uv_scroll`) or a coloured corner (turned by `sky_spin`).
+    fn scene(scroll: [f32; 2], spin: Option<f32>) -> Scene {
+        let key = TextureKey { rdb_type: 1, id: 1 };
+        let mut s = Scene::default();
+        s.textures.insert(key, Texture { width: 2, height: 1, rgba: vec![255, 0, 0, 255, 0, 0, 255, 255] });
+        let v = |x: f32, y: f32, uv: [f32; 2], color: [f32; 4]| Vertex { pos: [x, y, -10.0], uv, color, ..Default::default() };
+        let c = [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]];
+        let vertices = vec![v(-9.0, -9.0, [0.0, 0.0], c[0]), v(9.0, -9.0, [1.0, 0.0], c[1]), v(9.0, 9.0, [1.0, 1.0], c[2]), v(-9.0, 9.0, [0.0, 1.0], c[3])];
+        let sub = Submesh { two_sided: true, uv_scroll: scroll, ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key)) };
+        s.meshes.push(Mesh { vertices, submeshes: vec![sub] });
+        s.sky.push(Instance { mesh: 0, transform: IDENTITY });
+        s.sky_spin.extend(spin.map(|d| SkySpin { instance: 0, axis: [0.0, 0.0, 1.0], pivot: [0.0; 3], degrees_per_second: d }));
+        s
+    }
+
+    #[test]
+    fn uv_scroll_and_sky_spin_change_the_picture_with_time() {
+        for (name, scroll, spin) in [("scroll", [0.5, 0.0], None), ("spin", [0.0, 0.0], Some(90.0))] {
+            let s = scene(scroll, spin);
+            let (Some(a), Some(b), Some(c)) = (pixels(&s, 0.0, name), pixels(&s, 1.0, name), pixels(&s, 0.0, name)) else { return };
+            assert_ne!(a, b, "{name}: time 1 s differs from time 0");
+            assert_eq!(a, c, "{name}: deterministic at the same time");
+        }
+        // a still sky does not depend on time
+        let s = scene([0.0; 2], None);
+        let (Some(a), Some(b)) = (pixels(&s, 0.0, "still"), pixels(&s, 5.0, "still")) else { return };
+        assert_eq!(a, b);
+    }
 }

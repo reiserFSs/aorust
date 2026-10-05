@@ -5,13 +5,14 @@ struct G {
     sun_color: vec4<f32>,
     ambient: vec4<f32>,
     fog_color: vec4<f32>,
-    fog: vec4<f32>,        // x = start, y = end
+    fog: vec4<f32>,        // x = start, y = end, z = time (s)
     grid: vec4<f32>,       // xyz = light grid origin, w = cell size
     dims: vec4<i32>,       // light grid cells (x, y, z)
 }
 struct Mat {
     color: vec4<f32>,
     emissive: vec4<f32>, // rgb = emissive, w = 1 when texture alpha is a glow mask
+    scroll: vec4<f32>,   // xy = uv drift per second
 }
 @group(0) @binding(0) var<uniform> g: G;
 @group(0) @binding(1) var<storage, read> lights: array<vec4<f32>>; // pairs: (pos, range), (colour, 0)
@@ -96,7 +97,7 @@ fn point_lights(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 
 // mode: 0 opaque, 1 alpha test, 2 alpha blend, 3 additive
 fn shade(i: VOut, mode: u32) -> vec4<f32> {
-    let t = textureSample(tex, samp, i.uv);
+    let t = textureSample(tex, samp, i.uv + mat.scroll.xy * g.fog.z);
     let c = t * i.color * mat.color;
     if mode == 1u && c.a < 0.5 {
         discard;
@@ -130,7 +131,7 @@ fn shade(i: VOut, mode: u32) -> vec4<f32> {
 
 // Sky: unlit, unfogged; opaque ignores alpha.
 fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
-    let c = textureSample(tex, samp, i.uv) * i.color * mat.color;
+    let c = textureSample(tex, samp, i.uv + mat.scroll.xy * g.fog.z) * i.color * mat.color;
     if mode == 1u && c.a < 0.5 {
         discard;
     }

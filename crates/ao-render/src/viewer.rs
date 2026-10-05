@@ -41,6 +41,54 @@ pub trait Frontend {
     fn frame(&mut self, ui: &mut egui::Ui, host: &mut Host, dt: f32);
 }
 
+/// Live time of day: `source(day_time)` returns a scene holding only the sky, its new textures and the environment
+/// ([`Renderer::set_sky`]); it runs on a worker thread, about twice a second of real time.
+pub struct LiveSky {
+    /// Game day time (seconds) at start.
+    pub start: f32,
+    /// Game seconds per real second.
+    pub scale: f32,
+    pub source: Box<dyn FnMut(f32) -> Scene + Send>,
+}
+
+/// Worker thread + clock of a [`LiveSky`].
+struct LiveRun {
+    day_time: f32,
+    scale: f32,
+    since: f32,
+    busy: bool,
+    req: std::sync::mpsc::Sender<f32>,
+    resp: std::sync::mpsc::Receiver<Scene>,
+}
+
+impl LiveRun {
+    fn new(live: LiveSky) -> Self {
+        let (req, req_rx) = std::sync::mpsc::channel::<f32>();
+        let (resp_tx, resp) = std::sync::mpsc::channel();
+        let mut source = live.source;
+        std::thread::spawn(move || {
+            for t in req_rx {
+                if resp_tx.send(source(t)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { day_time: live.start, scale: live.scale, since: f32::MAX, busy: false, req, resp }
+    }
+
+    /// Advances the clock by `dt` real seconds; the freshly computed sky, if one arrived.
+    fn tick(&mut self, dt: f32) -> Option<Scene> {
+        self.day_time += dt * self.scale;
+        self.since += dt;
+        let got = self.resp.try_recv().ok();
+        self.busy &= got.is_none();
+        if !self.busy && self.since >= 0.5 && self.req.send(self.day_time).is_ok() {
+            (self.busy, self.since) = (true, 0.0);
+        }
+        got
+    }
+}
+
 struct Gui {
     ctx: egui::Context,
     winit: egui_winit::State,
@@ -66,11 +114,20 @@ struct State {
     perf: bool,
     cpu: f32,
     gui: Option<Gui>,
+    /// Seconds since start (drives `Submesh::uv_scroll`).
+    clock: f32,
+    live: Option<LiveRun>,
+    hook: Option<FrameHook>,
 }
+
+/// Called once per frame with the camera position and the frame time (audio listener).
+pub type FrameHook = Box<dyn FnMut(Vec3, f32)>;
 
 struct App {
     scene: Scene,
     frontend: Option<Box<dyn Frontend>>,
+    live: Option<LiveSky>,
+    hook: Option<FrameHook>,
     state: Option<State>,
     error: Option<anyhow::Error>,
 }
@@ -92,7 +149,7 @@ pub fn run_viewer_hooked(scene: Scene, live: Option<LiveSky>, hook: FrameHook) -
 
 /// Opens the window with `frontend` drawn over `scene` (free-fly off until the frontend enables it).
 pub fn run_frontend(scene: Scene, frontend: impl Frontend + 'static) -> Result<()> {
-    run(scene, Some(Box::new(frontend)))
+    run(scene, Some(Box::new(frontend)), None, None)
 }
 
 fn run(scene: Scene, frontend: Option<Box<dyn Frontend>>, live: Option<LiveSky>, hook: Option<FrameHook>) -> Result<()> {
@@ -124,20 +181,11 @@ impl State {
             // egui blends in gamma space: it draws through a non-sRGB view of the same texture.
             view_formats: vec![renderer.format.remove_srgb_suffix()],
         };
-    /// Seconds since start (drives `Submesh::uv_scroll`).
-    clock: f32,
-    live: Option<LiveRun>,
-    hook: Option<FrameHook>,
         surface.configure(&renderer.device, &config);
         let targets = Targets::new(&renderer, config.width, config.height);
-/// Called once per frame with the camera position and the frame time (audio listener).
-pub type FrameHook = Box<dyn FnMut(Vec3, f32)>;
-
         let (eye, at) = default_view(scene);
         let speed = (renderer.radius() * 0.15).max(5.0);
         if std::env::var_os("AOMAC_PERF").is_some() {
-    live: Option<LiveSky>,
-    hook: Option<FrameHook>,
             eprintln!("start eye {eye:?} at {at:?}, scene bounds {:?}", crate::scene_bounds(scene));
         }
         let cam = Camera::look_at(eye, at);
@@ -164,6 +212,9 @@ pub type FrameHook = Box<dyn FnMut(Vec3, f32)>;
             cpu: 0.0,
             perf: std::env::var_os("AOMAC_PERF").is_some(),
             gui,
+            clock: 0.0,
+            live: live.map(LiveRun::new),
+            hook,
         })
     }
 
@@ -212,9 +263,6 @@ pub type FrameHook = Box<dyn FnMut(Vec3, f32)>;
         let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [self.config.width, self.config.height], pixels_per_point: out.pixels_per_point };
         let jobs = g.ctx.tessellate(out.shapes, out.pixels_per_point);
         let mut enc = dev.create_command_encoder(&Default::default());
-            clock: 0.0,
-            live: live.map(LiveRun::new),
-            hook,
         let extra = g.renderer.update_buffers(dev, queue, &mut enc, &jobs, &screen);
         {
             let mut pass = enc
@@ -245,6 +293,11 @@ pub type FrameHook = Box<dyn FnMut(Vec3, f32)>;
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
+        self.clock += dt;
+        self.renderer.time = self.clock;
+        if let Some(sky) = self.live.as_mut().and_then(|l| l.tick(dt)) {
+            self.renderer.set_sky(&sky);
+        }
 
         // HiDPI/resize: follow the physical size every frame.
         let PhysicalSize { width, height } = self.window.inner_size();
@@ -268,6 +321,9 @@ pub type FrameHook = Box<dyn FnMut(Vec3, f32)>;
             c.pos += (c.forward() * (k(KeyCode::KeyW) - k(KeyCode::KeyS)) + c.right() * (k(KeyCode::KeyD) - k(KeyCode::KeyA)) + Vec3::Y * up) * step;
         }
         let (gui_out, quit) = self.run_gui(dt);
+        if let Some(h) = self.hook.as_mut() {
+            h(self.cam.pos, dt);
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -321,9 +377,6 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
-        if let Some(h) = self.hook.as_mut() {
-            h(self.cam.pos, dt);
-        }
         let Some(s) = &mut self.state else { return };
         let mut over_gui = false;
         if let Some(g) = &mut s.gui {
@@ -383,5 +436,27 @@ impl ApplicationHandler for App {
         if let Some(s) = &self.state {
             s.window.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_sky_requests_at_the_scaled_clock_and_returns_the_worker_result() {
+        let source = Box::new(|t: f32| Scene { spawn: Some([t, 0.0, 0.0]), ..Scene::default() });
+        let mut live = LiveRun::new(LiveSky { start: 100.0, scale: 10.0, source });
+        // the first tick asks at once (clock 100 + 0.1 s * 10), later ticks wait for the answer and 0.5 s
+        assert!(live.tick(0.1).is_none() && live.busy);
+        let sky = (0..200).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            live.tick(0.0)
+        });
+        assert_eq!(sky.expect("worker answers").spawn, Some([101.0, 0.0, 0.0]));
+        assert!(!live.busy);
+        // no new request before half a second of real time has passed
+        assert!(live.tick(0.2).is_none() && !live.busy);
+        assert!(live.tick(0.4).is_none() && live.busy);
     }
 }

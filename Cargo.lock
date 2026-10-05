@@ -196,6 +196,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ao-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ao-formats",
+ "ao-render",
+ "png 0.17.16",
+ "pollster",
+ "skrifa",
+ "wgpu",
+]
+
+[[package]]
 name = "ao-install"
 version = "0.1.0"
 dependencies = [
@@ -231,6 +244,7 @@ name = "ao-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ao-gui",
  "ao-scene",
  "bytemuck",
  "egui",
