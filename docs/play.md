@@ -23,6 +23,14 @@ ProgressDialog-based box with "OK".
 
 Clipboard: Cmd+C/X/V/A in text fields use the OS clipboard (`arboard`); the password field never copies/cuts (`tvf::PASSWORD`).
 
+## In the world (M3 step 1)
+
+After `ZoneLogin` the zone's N3 stream (docs/zone.md) drives the flow: `PlayfieldAnarchyFIIR_t` names the playfield to load (so a freshly created character
+starts in its own start playfield, e.g. 4604 Arrival Hall, not in the list row's), the camera is placed at the player's `SimpleCharFullUpdateIIR_t`
+position (server `(x, y, z)` → scene `(x, y, -z)`, eye 1.7 m) facing its heading, and `CharInPlayIIR_t` is sent once after 10 world frames. Pings are answered
+by the session thread. `AOMAC_NET_TRACE=<file>` records every frame of the login and zone connections (`<ms> > | < <hex>`, credentials/cookies redacted) for protocol work;
+`cargo run -p ao-net --example probe -- --login --select N --wait 90 --out FILE` does the same without the GUI (credentials from the TTY / stdin, never arguments).
+
 ## App bundle
 
 `scripts/bundle.sh` → `target/aomac.app` (release build; `Contents/MacOS/aomac` execs `aomac-bin play`; Info.plist: high-res capable,
@@ -35,13 +43,15 @@ games category, macOS ≥ 12). The client is found from `$HOME/Games/ProjectRubi
 
 * **Server choice** is outside the original window (the original gets the server from the PRK launcher's `IA`/`IP` arguments):
   `--server` + remembered, no in-window picker.
-* New Character opens the original character creation, Delete the name-confirmation window (docs/screens.md §12); live creation is untested. The creation cameras use the full `CharCreateCamera.dat` orientation incl. roll (`ao_render::Camera::roll`); the name-scene error sounds `SM_Sandy_CC_Name` / `SM_Sandy_CC_Nick` exist in no sound bank, so (like the original) they are silent; profession hover/leave/click text rules: docs/screens.md §12.
-* Row "Inactive" uses bit 0 of the list's per-row `status` word as RE'd (`docs/screens.md` §5.3); what PRK actually sends in that word is
-  unverified (live check pending an account).
+* New Character opens the original character creation, Delete the name-confirmation window (docs/screens.md §12); live creation was exercised against Ithaca (docs/protocol.md §8: random name, NameInUse, created, list update, start in the Arrival Hall). The creation cameras use the full `CharCreateCamera.dat` orientation incl. roll (`ao_render::Camera::roll`); the name-scene error sounds `SM_Sandy_CC_Name` / `SM_Sandy_CC_Nick` exist in no sound bank, so (like the original) they are silent; profession hover/leave/click text rules: docs/screens.md §12.
+* Row "Inactive" uses bit 0 of the list's per-row `status` word as RE'd (`docs/screens.md` §5.3); PRK sends `status = 1` for ordinary characters
+  (live, both rows of the test account) and the rows are shown as normal (not "Inactive").
 * Preview socials are built on demand in the background (idle plays until ready); the original has no delay.
 * Preview lighting/FOV convention: UNRESOLVED (renderer default; `docs/screens.md` §11).
-* The startup music cue plays at the zone hand-off; the original starts it on `CharacterLoggedInMessage` (0x26) — the zone message
-  is not decoded yet (M3 seam: `Play::on_zone_event`).
+* The startup music cue plays at the zone hand-off; the original starts it on `CharacterLoggedInMessage` (0x26), a local AFCM message after the zone TCP connect
+  (docs/protocol.md §8 "Zone hand-off timing"), which is within a second of our hand-off + 4 s delay.
+* In the world only the camera is placed (own dynel position/heading, free-fly afterwards); the player's model, other dynels, chat and HUD are not rendered yet
+  (state is tracked in `play/zone.rs`, plan in docs/zone.md §6).
 
 ## Debug flags (hidden)
 

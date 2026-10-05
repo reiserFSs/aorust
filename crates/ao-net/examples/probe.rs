@@ -4,6 +4,7 @@
 //! cargo run -p ao-net --example probe -- [--server IP:PORT] [--user NAME] [--version STR]
 //!                                        [--wait SECS] [--bogus-credentials | --garbage-credentials] [--out FILE]
 //! cargo run -p ao-net --example probe -- --login      # real login, prompts on the TTY
+//! cargo run -p ao-net --example probe -- --login --select 0 --wait 90 --out cap.rec   # also enter the zone with the Nth character and record frames
 //! ```
 //! Without `--server` the first server of the PRK status API is used. Default mode is
 //! credential-free: UserLogin with a fake name, dump the reply, optionally (`--bogus-credentials`)
