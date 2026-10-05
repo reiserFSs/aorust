@@ -30,6 +30,8 @@ pub struct Statel {
 pub struct StatelFile {
     pub global: Vec<Statel>,
     pub zones: Vec<Vec<Statel>>,
+    /// Per zone/room lights (same indexing as `zones`).
+    pub lights: Vec<Vec<Light>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,21 +74,94 @@ fn fog_lists(r: &mut Rd) -> Result<()> {
     Ok(())
 }
 
-fn lights(r: &mut Rd) -> Result<()> {
+/// `FUN_10026e66` (N3 @0x10026e66) -> `VisualMesh_t::SetLight` (DisplaySystem @0x1006b6b0) -> `RLight_t`
+/// (randy31 @0x1003fd4a), whose `light_info` block is a `D3DLIGHT7`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Light {
+    /// Zone/room-local position.
+    pub pos: [f32; 3],
+    /// Orientation word (`flags >> 7` as for statels); a spot shines along its local +X.
+    pub flags: u32,
+    /// Type byte: bits 0..4 light type (2 = point, 4 = spot), bit 5 group flag, bit 6 selects the
+    /// `att2` divisor, bit 7 = the client creates no light at all.
+    pub kind: u8,
+    /// Diffuse colour bytes (`/255`).
+    pub rgb: [u8; 3],
+    /// `D3DLIGHT7.dvRange` (metres).
+    pub range: f32,
+    /// `D3DLIGHT7.dvAttenuation0..2`.
+    pub att: [f32; 3],
+    /// Spot half angles in radians (`SetSpotAngles` doubles them into theta/phi).
+    pub cone: [f32; 2],
+}
+
+fn lights(r: &mut Rd, out: &mut Vec<Light>) -> Result<()> {
     for _ in 0..r.u16()? {
-        r.skip(16)?;
+        let pos = r.vec3()?;
+        let flags = r.u32()?;
         let kind = r.u8()?;
-        r.skip(3)?;
-        match kind & 0x1f {
-            2 => r.skip(8)?,
-            4 => r.skip(12)?,
-            _ => {}
+        let rgb = [r.u8()?, r.u8()?, r.u8()?];
+        let mut l = Light { pos, flags, kind, rgb, range: 0.0, att: [0.0; 3], cone: [0.0; 2] };
+        if matches!(kind & 0x1f, 2 | 4) {
+            l.range = r.u16()? as f32;
+            l.att = [r.u16()? as f32 / 100.0, r.u16()? as f32 / 10_000.0, r.u16()? as f32 / if kind & 0x40 != 0 { 10_000.0 } else { 1_000_000.0 }];
+            if kind & 0x1f == 4 {
+                let deg = std::f32::consts::TAU / 360.0;
+                l.cone = [r.u16()? as f32 * deg, r.u16()? as f32 * deg];
+            }
         }
+        out.push(l);
     }
     Ok(())
 }
 
-fn zone(d: &[u8], a: usize, b: usize, layout: Layout) -> Result<Vec<Statel>> {
+/// Below this `D3DLIGHT7` attenuation factor a light is treated as dark (calibration guess).
+const FAINT: f32 = 0.05;
+
+/// Maps a statel light onto the contract's `ao_scene::Light` (linear falloff to 0 at `range`).
+///
+/// * `kind & 0x80` lights are never created by the client (`FUN_10026e66` returns null); lights with
+///   `range == 0` are culled by `RVisual_t::CullLights` (`0 < dvRange` test) -> `None`.
+/// * D3D7 intensity is `1/(a0 + a1 d + a2 d^2)` up to `range`. The effective range is where it drops below
+///   [`FAINT`] (at most `range`); the peak `k` is the least-squares fit of `k (1 - d/R)` to `min(1, I(d))`
+///   (the framebuffer saturates at 1). The client does its light maths on gamma values, so the colour is
+///   `(k * rgb/255)^2.2` like the ambient colour.
+/// * Spots (type 4) become point lights: the contract has no cones, so the light is moved along its axis
+///   by `R/2 (1 - sin(half angle))` (wide cones stay put, narrow ones light the area in front) and its range
+///   shrinks accordingly. A guess, no attempt at the cone edge.
+///
+/// `frame` = `(rotation, translation)` of the owning dungeon room (AO space); `None` outdoors.
+pub fn scene_light(l: &Light, frame: Option<([[f32; 3]; 3], [f32; 3])>) -> Option<ao_scene::Light> {
+    if l.kind & 0x80 != 0 || !matches!(l.kind & 0x1f, 2 | 4) || l.range <= 0.0 {
+        return None;
+    }
+    let inv = |d: f32| (l.att[0] + d * (l.att[1] + d * l.att[2])).recip();
+    const N: usize = 256;
+    let step = l.range / N as f32;
+    let reach = (0..=N).map(|i| i as f32 * step).find(|&d| !(inv(d) >= FAINT)).unwrap_or(l.range);
+    if reach <= 0.0 {
+        return None;
+    }
+    // k = 3 * integral_0^1 (1 - x) min(1, I(xR)) dx  (midpoint rule)
+    let k = 3.0 * (0..N).map(|i| { let x = (i as f32 + 0.5) / N as f32; (1.0 - x) * inv(x * reach).min(1.0) }).sum::<f32>() / N as f32;
+    let mut pos = l.pos;
+    let mut range = reach;
+    if l.kind & 0x1f == 4 {
+        let r = orientation(l.flags, 90);
+        let off = 0.5 * reach * (1.0 - l.cone[1].sin().abs());
+        for i in 0..3 {
+            pos[i] += r[i][0] * off;
+        }
+        range -= off;
+    }
+    if let Some((q, t)) = frame {
+        pos = [0, 1, 2].map(|i| q[i][0] * pos[0] + q[i][1] * pos[1] + q[i][2] * pos[2] + t[i]);
+    }
+    let color = l.rgb.map(|c| (k * c as f32 / 255.0).powf(2.2));
+    Some(ao_scene::Light { pos: [pos[0], pos[1], -pos[2]], color, range })
+}
+
+fn zone(d: &[u8], a: usize, b: usize, layout: Layout) -> Result<(Vec<Statel>, Vec<Light>)> {
     ensure!(a <= b && b <= d.len(), "bad zone range {a}..{b}");
     let mut r = Rd::new(&d[..b], a);
     let mut out = Vec::new();
@@ -105,9 +180,10 @@ fn zone(d: &[u8], a: usize, b: usize, layout: Layout) -> Result<Vec<Statel>> {
     }
     statels(&mut r, &mut out)?;
     statels(&mut r, &mut out)?;
-    lights(&mut r)?;
+    let mut lit = Vec::new();
+    lights(&mut r, &mut lit)?;
     ensure!(r.o == b, "zone {a}..{b}: {} unparsed bytes", b - r.o);
-    Ok(out)
+    Ok((out, lit))
 }
 
 fn parse_layout(d: &[u8], count: usize, layout: Layout) -> Result<StatelFile> {
@@ -121,11 +197,14 @@ fn parse_layout(d: &[u8], count: usize, layout: Layout) -> Result<StatelFile> {
         fog_lists(&mut r)?;
     }
     let mut zones = Vec::with_capacity(count);
+    let mut lit = Vec::with_capacity(count);
     for (i, &a) in offs.iter().enumerate() {
         let b = offs.get(i + 1).copied().unwrap_or(d.len());
-        zones.push(zone(d, a, b, layout)?);
+        let (z, l) = zone(d, a, b, layout)?;
+        zones.push(z);
+        lit.push(l);
     }
-    Ok(StatelFile { global, zones })
+    Ok(StatelFile { global, zones, lights: lit })
 }
 
 /// Parses with the layout expected for the playfield type, falling back to the other one
@@ -215,16 +294,70 @@ mod tests {
         o.extend(1u16.to_le_bytes());
         o.extend(statel_bytes(5.0, 0x2d00, 201717, 3));
         o.extend([0u8; 6]);
-        let s = zone(&o, 0, o.len(), Layout::Outdoor).unwrap();
+        let (s, l) = zone(&o, 0, o.len(), Layout::Outdoor).unwrap();
+        assert!(l.is_empty());
         assert_eq!(s, vec![Statel { pos: [5.0, 1.0, 2.0], flags: 0x2d00, mesh: 201717, scale: 90 }]);
         // dungeon: size=0, 2 empty fog lists, C=1 statel, D, lights
         let mut dg = vec![0u8; 4 + 4];
         dg.extend(1u16.to_le_bytes());
         dg.extend(statel_bytes(-3.0, 0x2d00, 6255, 0));
         dg.extend([0u8; 4]);
-        assert_eq!(zone(&dg, 0, dg.len(), Layout::Dungeon).unwrap()[0].mesh, 6255);
+        assert_eq!(zone(&dg, 0, dg.len(), Layout::Dungeon).unwrap().0[0].mesh, 6255);
         // the same bytes are not a valid outdoor zone
         assert!(zone(&dg, 0, dg.len(), Layout::Outdoor).is_err());
+    }
+
+    fn light_bytes(kind: u8, extra: &[u16]) -> Vec<u8> {
+        let mut d = Vec::new();
+        for v in [1.0f32, 2.0, 3.0] {
+            d.extend(v.to_le_bytes());
+        }
+        d.extend(0x2d00u32.to_le_bytes());
+        d.extend([kind, 255, 128, 0]);
+        for v in extra {
+            d.extend(v.to_le_bytes());
+        }
+        d
+    }
+
+    #[test]
+    fn light_kinds() {
+        // point (2), spot (4) with the att2 divisor flag (bit 6), and a type without extra data (1)
+        let mut d = 3u16.to_le_bytes().to_vec();
+        d.extend(light_bytes(2, &[30, 100, 250, 50]));
+        d.extend(light_bytes(4 | 0x40, &[12, 150, 0, 400, 45, 90]));
+        d.extend(light_bytes(1, &[]));
+        let mut out = Vec::new();
+        let mut r = Rd::new(&d, 0);
+        lights(&mut r, &mut out).unwrap();
+        assert_eq!(r.o, d.len());
+        assert_eq!((out[0].pos, out[0].rgb, out[0].range, out[0].att), ([1.0, 2.0, 3.0], [255, 128, 0], 30.0, [1.0, 0.025, 0.00005]));
+        assert_eq!(out[1].att, [1.5, 0.0, 0.04]);
+        assert!((out[1].cone[0] - 45f32.to_radians()).abs() < 1e-5 && (out[1].cone[1] - 90f32.to_radians()).abs() < 1e-5);
+        assert_eq!((out[2].range, out[2].att), (0.0, [0.0; 3]));
+    }
+
+    #[test]
+    fn scene_light_mapping() {
+        let l = |kind, range, att, cone| Light { pos: [1.0, 2.0, 3.0], flags: 0x2d00, kind, rgb: [255, 0, 255], range, att, cone };
+        // disabled bit, no range, unsupported type -> no light
+        assert!(scene_light(&l(0x82, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), None).is_none());
+        assert!(scene_light(&l(2, 0.0, [1.0, 0.0, 0.0], [0.0; 2]), None).is_none());
+        assert!(scene_light(&l(1, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), None).is_none());
+        // constant intensity 1 inside the range: ramp fit k = 3 * integral (1-x) = 1.5; z is mirrored
+        let p = scene_light(&l(2, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), None).unwrap();
+        assert_eq!((p.pos, p.range), ([1.0, 2.0, -3.0], 10.0));
+        assert!((p.color[0] - 1.5f32.powf(2.2)).abs() < 1e-3 && p.color[1] == 0.0);
+        // faint beyond 1/(1+d) < 0.05 -> reach 19 m even though range is 100
+        let q = scene_light(&l(2, 100.0, [1.0, 1.0, 0.0], [0.0; 2]), None).unwrap();
+        assert!((q.range - 19.0).abs() < 0.5);
+        // room frame: rot 90 degrees about Y (x' = z) plus translation
+        let f = Some((ry(std::f32::consts::FRAC_PI_2), [10.0, 0.0, 0.0]));
+        let r = scene_light(&l(2, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), f).unwrap();
+        assert!((r.pos[0] - 13.0).abs() < 1e-4 && (r.pos[2] + -1.0).abs() < 1e-4);
+        // narrow spot (half angle 0 deg) shifts along +X by R/2
+        let s = scene_light(&l(4, 10.0, [1.0, 0.0, 0.0], [0.0, 0.0]), None).unwrap();
+        assert!((s.pos[0] - 6.0).abs() < 1e-4 && (s.range - 5.0).abs() < 1e-4);
     }
 
     #[test]

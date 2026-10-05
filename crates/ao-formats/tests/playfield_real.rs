@@ -57,3 +57,18 @@ fn spawn_points_are_inside_and_above_the_floor() {
         assert!((at[0] - s[0]).hypot(at[2] - s[2]) > 1.0, "{id}: look-at above/below spawn");
     }
 }
+
+/// Statel lights reach `Scene.lights`: valid, inside a plausible distance of the scene and present in dungeons and cities.
+#[test]
+fn statel_lights_are_valid() {
+    let Some((store, dir)) = setup() else { return };
+    for (id, min) in [(127, 100), (362, 100), (566, 1)] {
+        let (scene, _) = load_playfield_report(&store, &dir, id).unwrap();
+        assert!(scene.lights.len() >= min, "{id}: {} lights", scene.lights.len());
+        let (lo, hi) = scene_bounds(&scene).unwrap();
+        for l in &scene.lights {
+            assert!(l.range > 0.0 && l.color.iter().all(|c| c.is_finite() && *c >= 0.0), "{id}: {l:?}");
+            assert!((0..3).all(|i| l.pos[i] >= lo[i] - 60.0 && l.pos[i] <= hi[i] + 60.0), "{id}: light {l:?} outside {lo:?}..{hi:?}");
+        }
+    }
+}

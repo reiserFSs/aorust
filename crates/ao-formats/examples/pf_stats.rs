@@ -27,6 +27,8 @@ fn main() -> anyhow::Result<()> {
     let mut mesh_errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut spawn_bad: Vec<(u32, String)> = Vec::new();
     let mut empty: Vec<u32> = Vec::new();
+    let mut lit: Vec<(usize, u32)> = Vec::new();
+    let mut light_total = 0usize;
     for (id, name) in &all {
         if !only.is_empty() && !only.contains(id) {
             continue;
@@ -42,6 +44,13 @@ fn main() -> anyhow::Result<()> {
                 if let Some(e) = r.first_mesh_error {
                     *mesh_errors.entry(e).or_default() += 1;
                 }
+                light_total += scene.lights.len();
+                if !scene.lights.is_empty() {
+                    lit.push((scene.lights.len(), *id));
+                }
+                if let Some(l) = scene.lights.iter().find(|l| !(l.range > 0.0 && l.pos.iter().chain(&l.color).all(|v| v.is_finite()))) {
+                    spawn_bad.push((*id, format!("{name}: invalid light {l:?}")));
+                }
                 if scene.instances.is_empty() {
                     empty.push(*id); // records without rooms: nothing to place a camera in
                 } else if let Some(why) = spawn_problem(&scene) {
@@ -49,7 +58,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 let dt = t.elapsed().as_secs_f64();
                 if !only.is_empty() {
-                    println!("{id} {name}: {dt:.2}s cells={} statels={} meshes={} instances={} verts={} missing={} failed={}", r.terrain_cells, r.statels, r.unique_meshes, scene.instances.len(), scene.meshes.iter().map(|m| m.vertices.len()).sum::<usize>(), r.missing_meshes, r.failed_meshes);
+                    println!("{id} {name}: {dt:.2}s cells={} statels={} meshes={} instances={} verts={} missing={} failed={} lights={}", r.terrain_cells, r.statels, r.unique_meshes, scene.instances.len(), scene.meshes.iter().map(|m| m.vertices.len()).sum::<usize>(), r.missing_meshes, r.failed_meshes, scene.lights.len());
                 }
                 slow.push((dt, *id, name.clone(), r.terrain_cells, r.statels));
             }
@@ -61,6 +70,11 @@ fn main() -> anyhow::Result<()> {
     }
     println!("ok={ok} failed={failed} statels={statels} instances={instances} statels-without-mesh={missing} mesh-decode-failures={mesh_fail}");
     println!("spawn checks: {} ok, {} failed, {} empty playfields (no rooms/statels in the data: {empty:?})", ok - spawn_bad.len() - empty.len(), spawn_bad.len(), empty.len());
+    lit.sort_by(|a, b| b.0.cmp(&a.0));
+    println!("lights: {light_total} in {} playfields; most: {:?}", lit.len(), &lit[..lit.len().min(8)]);
+    if !only.is_empty() {
+        println!("per playfield (count, id): {lit:?}");
+    }
     for (id, why) in &spawn_bad {
         println!("SPAWN FAIL {id} {why}");
     }
