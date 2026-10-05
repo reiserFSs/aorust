@@ -11,7 +11,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-/// What an egui [`Frontend`] can ask of the window/renderer between frames.
+/// What a [`Frontend`] can ask of the window/renderer between frames.
 pub struct Host {
     /// Camera used for the next frame. Written back from free-fly controls while `fly`.
     pub camera: Camera,
@@ -35,10 +35,13 @@ impl Host {
     }
 }
 
-/// An egui application drawn on top of the 3D scene (login screen, character select, ...).
+/// The windowed GUI application: draws the original AO GUI (`ao_gui`) over the 3D scene.
 pub trait Frontend {
-    /// Called once per frame with the root `ui`; `dt` in seconds.
-    fn frame(&mut self, ui: &mut egui::Ui, host: &mut Host, dt: f32);
+    fn gui(&self) -> &ao_gui::Gui;
+    /// One input event, positions in GUI pixels.
+    fn input(&mut self, ev: ao_gui::InputEvent, host: &mut Host);
+    /// Per-frame logic (`dt` seconds, `size` = window in GUI pixels); returns the GUI draw list to paint.
+    fn frame(&mut self, dt: f32, size: (u32, u32), host: &mut Host) -> ao_gui::DrawList;
 }
 
 /// Live time of day: `source(day_time)` returns a scene holding only the sky, its new textures and the environment
@@ -90,12 +93,72 @@ impl LiveRun {
 }
 
 struct Gui {
-    ctx: egui::Context,
-    winit: egui_winit::State,
-    renderer: egui_wgpu::Renderer,
+    renderer: crate::GuiRenderer,
     frontend: Box<dyn Frontend>,
     host: Host,
-    free: Vec<egui::TextureId>,
+    cursor: (f32, f32),
+    mods: ao_gui::Modifiers,
+    /// Physical pixels per GUI pixel.
+    scale: u32,
+}
+
+/// winit -> GUI input. Cursor positions are physical pixels / `scale`; Cmd counts as Ctrl (macOS shortcuts).
+fn gui_input(ev: &WindowEvent, cursor: &mut (f32, f32), mods: &mut ao_gui::Modifiers, scale: u32) -> Option<ao_gui::InputEvent> {
+    use ao_gui::{InputEvent as I, Key as K};
+    use winit::keyboard::{Key, NamedKey};
+    let s = scale as f32;
+    match ev {
+        WindowEvent::CursorMoved { position, .. } => {
+            *cursor = (position.x as f32 / s, position.y as f32 / s);
+            Some(I::MouseMove { x: cursor.0, y: cursor.1 })
+        }
+        WindowEvent::MouseInput { state, button, .. } => {
+            let button = match button {
+                MouseButton::Left => ao_gui::MouseButton::Left,
+                MouseButton::Right => ao_gui::MouseButton::Right,
+                MouseButton::Middle => ao_gui::MouseButton::Middle,
+                _ => return None,
+            };
+            let (x, y) = *cursor;
+            Some(if *state == ElementState::Pressed { I::MouseDown { x, y, button } } else { I::MouseUp { x, y, button } })
+        }
+        WindowEvent::MouseWheel { delta, .. } => {
+            let dy = match delta {
+                MouseScrollDelta::LineDelta(_, y) => *y,
+                MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+            };
+            Some(I::Wheel { x: cursor.0, y: cursor.1, dy })
+        }
+        WindowEvent::ModifiersChanged(m) => {
+            let st = m.state();
+            *mods = ao_gui::Modifiers { shift: st.shift_key(), ctrl: st.control_key() || st.super_key(), alt: st.alt_key() };
+            None
+        }
+        WindowEvent::KeyboardInput { event, .. } => {
+            let pressed = event.state == ElementState::Pressed;
+            let key = match &event.logical_key {
+                Key::Named(NamedKey::Backspace) => K::Backspace,
+                Key::Named(NamedKey::Delete) => K::Delete,
+                Key::Named(NamedKey::ArrowLeft) => K::Left,
+                Key::Named(NamedKey::ArrowRight) => K::Right,
+                Key::Named(NamedKey::ArrowUp) => K::Up,
+                Key::Named(NamedKey::ArrowDown) => K::Down,
+                Key::Named(NamedKey::Home) => K::Home,
+                Key::Named(NamedKey::End) => K::End,
+                Key::Named(NamedKey::Enter) => K::Enter,
+                Key::Named(NamedKey::Tab) => K::Tab,
+                Key::Named(NamedKey::Escape) => K::Escape,
+                Key::Character(c) => K::Letter(c.chars().next()?.to_ascii_lowercase()),
+                _ => return None,
+            };
+            let text = event.text.as_deref().filter(|t| pressed && !mods.ctrl && !t.chars().any(char::is_control));
+            match (text, key) {
+                (Some(t), _) => Some(I::Text(t.to_string())),
+                _ => Some(I::Key { key, pressed, mods: *mods }),
+            }
+        }
+        _ => None,
+    }
 }
 
 struct State {
@@ -178,8 +241,7 @@ impl State {
             present_mode: if std::env::var_os("AOMAC_NOVSYNC").is_some() { wgpu::PresentMode::AutoNoVsync } else { wgpu::PresentMode::AutoVsync },
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            // egui blends in gamma space: it draws through a non-sRGB view of the same texture.
-            view_formats: vec![renderer.format.remove_srgb_suffix()],
+            view_formats: vec![],
         };
         surface.configure(&renderer.device, &config);
         let targets = Targets::new(&renderer, config.width, config.height);
@@ -190,10 +252,8 @@ impl State {
         }
         let cam = Camera::look_at(eye, at);
         let gui = frontend.map(|frontend| {
-            let ctx = egui::Context::default();
-            let winit = egui_winit::State::new(ctx.clone(), egui::ViewportId::ROOT, &*window, Some(window.scale_factor() as f32), None, None);
-            let renderer = egui_wgpu::Renderer::new(&renderer.device, renderer.format.remove_srgb_suffix(), egui_wgpu::RendererOptions::default());
-            Gui { ctx, winit, renderer, frontend, host: Host { camera: cam, fly: false, quit: false, scene: None, repose: None }, free: vec![] }
+            let renderer = crate::GuiRenderer::new(&renderer, frontend.gui());
+            Gui { renderer, frontend, host: Host { camera: cam, fly: false, quit: false, scene: None, repose: None }, cursor: (0.0, 0.0), mods: Default::default(), scale: (window.scale_factor().round() as u32).max(1) }
         });
         let now = Instant::now();
         Ok(Self {
@@ -232,19 +292,12 @@ impl State {
         self.window.set_cursor_visible(!on);
     }
 
-    /// Runs the frontend; returns the egui output to paint (`None` without a frontend). True in `.1` = quit.
-    fn run_gui(&mut self, dt: f32) -> (Option<egui::FullOutput>, bool) {
+    /// Runs the frontend; returns its draw list (`None` without a frontend). True in `.1` = quit.
+    fn run_gui(&mut self, dt: f32) -> (Option<ao_gui::DrawList>, bool) {
         let Some(g) = &mut self.gui else { return (None, false) };
         g.host.camera = self.cam;
-        let input = g.winit.take_egui_input(&self.window);
-        let (frontend, host) = (&mut g.frontend, &mut g.host);
-        let out = g.ctx.run_ui(input, |ui| frontend.frame(ui, host, dt));
-        g.winit.handle_platform_output(&self.window, out.platform_output.clone());
-        // Texture deltas apply now, not at paint time: a frame whose surface texture is unavailable still consumes them.
-        for (id, delta) in &out.textures_delta.set {
-            g.renderer.update_texture(&self.renderer.device, &self.renderer.queue, *id, delta);
-        }
-        g.free.extend(out.textures_delta.free.iter().copied());
+        let size = (self.config.width / g.scale, self.config.height / g.scale);
+        let list = g.frontend.frame(dt, size, &mut g.host);
         self.cam = g.host.camera;
         if let Some(scene) = g.host.scene.take() {
             self.renderer.upload(&scene);
@@ -253,39 +306,12 @@ impl State {
         if let Some(scene) = g.host.repose.take() {
             self.renderer.repose(&scene);
         }
-        (Some(out), g.host.quit)
+        (Some(list), g.host.quit)
     }
 
-    fn paint_gui(&mut self, out: egui::FullOutput, frame: &wgpu::SurfaceTexture) {
+    fn paint_gui(&mut self, list: ao_gui::DrawList, view: &wgpu::TextureView) {
         let Some(g) = &mut self.gui else { return };
-        let (dev, queue) = (&self.renderer.device, &self.renderer.queue);
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor { format: Some(self.renderer.format.remove_srgb_suffix()), ..Default::default() });
-        let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [self.config.width, self.config.height], pixels_per_point: out.pixels_per_point };
-        let jobs = g.ctx.tessellate(out.shapes, out.pixels_per_point);
-        let mut enc = dev.create_command_encoder(&Default::default());
-        let extra = g.renderer.update_buffers(dev, queue, &mut enc, &jobs, &screen);
-        {
-            let mut pass = enc
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("egui"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                })
-                .forget_lifetime();
-            g.renderer.render(&mut pass, &jobs, &screen);
-        }
-        queue.submit(extra.into_iter().chain([enc.finish()]));
-        for id in g.free.drain(..) {
-            g.renderer.free_texture(&id);
-        }
+        g.renderer.draw(&self.renderer, view, (self.config.width, self.config.height), g.scale, g.frontend.gui(), &list);
     }
 
     /// True = quit requested.
@@ -311,8 +337,7 @@ impl State {
             self.targets = Targets::new(&self.renderer, width, height);
         }
 
-        let typing = self.gui.as_ref().is_some_and(|g| g.ctx.egui_wants_keyboard_input());
-        if self.fly() && !typing {
+        if self.fly() {
             let k = |c| self.keys.contains(&c) as i32 as f32;
             let fast = if self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight) { 5.0 } else { 1.0 };
             let step = self.speed * fast * dt;
@@ -337,8 +362,8 @@ impl State {
         let t0 = Instant::now();
         self.renderer.render(&view, &self.targets, &self.cam);
         self.cpu += t0.elapsed().as_secs_f32();
-        if let Some(out) = gui_out {
-            self.paint_gui(out, &frame);
+        if let Some(list) = gui_out {
+            self.paint_gui(list, &view);
         }
         self.window.pre_present_notify();
         frame.present();
@@ -378,17 +403,17 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
         let Some(s) = &mut self.state else { return };
-        let mut over_gui = false;
         if let Some(g) = &mut s.gui {
-            let r = g.winit.on_window_event(&s.window, &ev);
-            over_gui = r.consumed || (matches!(ev, WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }) && g.ctx.egui_wants_pointer_input());
+            if let Some(ie) = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale) {
+                g.frontend.input(ie, &mut g.host);
+            }
         }
+        let fly = s.fly();
         match ev {
             WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::KeyboardInput { event, .. } if !over_gui => {
+            WindowEvent::KeyboardInput { event, .. } if fly || s.gui.is_none() => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if event.state == ElementState::Pressed {
-                        // Escape quits the plain viewer only; the egui frontend owns it otherwise.
                         if code == KeyCode::Escape && s.gui.is_none() {
                             el.exit();
                         }
@@ -402,10 +427,8 @@ impl ApplicationHandler for App {
                 s.keys.clear();
                 s.set_look(false);
             }
-            WindowEvent::MouseInput { button: MouseButton::Right, state, .. } if s.fly() && (!over_gui || state == ElementState::Released) => {
-                s.set_look(state == ElementState::Pressed)
-            }
-            WindowEvent::MouseWheel { delta, .. } if s.fly() && !over_gui => {
+            WindowEvent::MouseInput { button: MouseButton::Right, state, .. } if fly => s.set_look(state == ElementState::Pressed),
+            WindowEvent::MouseWheel { delta, .. } if fly => {
                 let y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,

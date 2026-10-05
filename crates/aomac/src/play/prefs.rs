@@ -1,11 +1,14 @@
-//! `~/Library/Application Support/aomac/prefs.txt`: `key=value` lines. Never holds a password.
+//! `~/Library/Application Support/aomac/prefs.txt`: `key=value` lines. Stands in for the original's `prefs/Prefs.xml`
+//! `LauncherConfig` archive (docs/screens.md §3.3): remembered account names (never passwords), the selected account,
+//! plus the `SelectedCharacter` row and the chosen server.
 
 use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct Prefs {
-    pub remember: bool,
-    pub username: String,
+    pub accounts: Vec<String>,
+    pub selected_account: usize,
+    pub selected_character: i32,
     pub server: String,
 }
 
@@ -15,11 +18,12 @@ fn path() -> Option<PathBuf> {
 
 impl Prefs {
     pub fn load() -> Self {
-        let mut p = Prefs::default();
+        let mut p = Prefs { selected_character: -1, ..Default::default() };
         for line in path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default().lines() {
             match line.split_once('=') {
-                Some(("remember", v)) => p.remember = v == "1",
-                Some(("username", v)) => p.username = v.into(),
+                Some(("account", v)) if !v.is_empty() => p.accounts.push(v.into()),
+                Some(("selected_account", v)) => p.selected_account = v.parse().unwrap_or(0),
+                Some(("selected_character", v)) => p.selected_character = v.parse().unwrap_or(-1),
                 Some(("server", v)) => p.server = v.into(),
                 _ => {}
             }
@@ -27,11 +31,28 @@ impl Prefs {
         p
     }
 
-    /// Without `remember` the username is not written (an existing file is rewritten without it).
+    /// `SaveAccounts` equivalent: the selected account is the one in `current` (the name just logged in).
+    pub fn remember(&mut self, current: &str) {
+        if !self.accounts.iter().any(|a| a == current) {
+            self.accounts.push(current.into());
+        }
+        self.selected_account = self.accounts.iter().position(|a| a == current).unwrap_or(0);
+        self.save();
+    }
+
+    pub fn remove(&mut self, name: &str) {
+        self.accounts.retain(|a| a != name);
+        self.selected_account = 0;
+        self.save();
+    }
+
     pub fn save(&self) {
         let Some(f) = path() else { return };
-        let user = if self.remember { self.username.as_str() } else { "" };
-        let text = format!("remember={}\nusername={}\nserver={}\n", self.remember as u8, user.replace('\n', ""), self.server.replace('\n', ""));
+        let mut text = String::new();
+        for a in &self.accounts {
+            text += &format!("account={}\n", a.replace('\n', ""));
+        }
+        text += &format!("selected_account={}\nselected_character={}\nserver={}\n", self.selected_account, self.selected_character, self.server.replace('\n', ""));
         if let Some(dir) = f.parent() {
             let _ = std::fs::create_dir_all(dir);
         }

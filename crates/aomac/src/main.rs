@@ -22,6 +22,9 @@ enum Cmd {
     Play {
         #[arg(long)]
         client: Option<PathBuf>,
+        /// Server name (case-insensitive) from the status API; default: the last used, else the first.
+        #[arg(long)]
+        server: Option<String>,
         /// Debug: skip login and show a built-in character list (offline 3D preview).
         #[arg(long, hide = true)]
         fake_charlist: bool,
@@ -166,8 +169,8 @@ fn client_dir(arg: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd.unwrap_or(Cmd::Play { client: None, fake_charlist: false, select: 0 }) {
-        Cmd::Play { client, fake_charlist, select } => play::run(client_dir(client)?, fake_charlist.then_some(select)),
+    match Cli::parse().cmd.unwrap_or(Cmd::Play { client: None, server: None, fake_charlist: false, select: 0 }) {
+        Cmd::Play { client, server, fake_charlist, select } => play::run(client_dir(client)?, fake_charlist.then_some(select), server),
         Cmd::Install { client } => ao_install::run(&client_dir(client)?),
         Cmd::View { opts, what } => {
             let dir = client_dir(opts.client.clone())?;
