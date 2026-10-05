@@ -7,6 +7,7 @@
 //! on the CPU at an animation time. Output follows the ao-scene contract: the model's left-handed
 //! D3D space is mirrored by negating Z (and reversing triangle winding), as for static meshes.
 
+pub mod actor;
 mod anim;
 mod cat;
 mod names;
@@ -34,7 +35,7 @@ pub const CHAR_ANIM_TYPE: u32 = 1010003;
 /// Textures referenced by [`Part::texture`].
 const TEXTURE_TYPE: u32 = 1010004;
 /// Per-material texture overrides of a character: material name (`body`, `hands`, …) → texture + its key.
-pub(crate) type PartTextures = HashMap<String, (TextureKey, ao_scene::Texture)>;
+pub type PartTextures = HashMap<String, (TextureKey, ao_scene::Texture)>;
 /// A vertex's (bone-local or bind, other) position pair.
 type BindPair = ([f32; 3], [f32; 3]);
 /// Weights at or above this use bone 0 only (the engine's single-bone branch).

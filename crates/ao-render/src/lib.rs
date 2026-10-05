@@ -1206,9 +1206,19 @@ pub fn render_to_png(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32
 
 /// [`render_to_png`] with the scrolling textures (`Submesh::uv_scroll`) at `time` seconds.
 pub fn render_to_png_at(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32) -> Result<()> {
+    render_to_png_actors(scene, &[], vec![], eye, look_at, width, height, path, time)
+}
+
+/// [`render_to_png_at`] with dynamic actors on top of the scene (`models` for [`Renderer::add_actor_model`], `actors` for [`Renderer::set_actors`]).
+#[allow(clippy::too_many_arguments)]
+pub fn render_to_png_actors(scene: &Scene, models: &[(u64, Scene)], actors: Vec<ao_scene::ActorFrame>, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut r = Renderer::new(&instance, None)?;
     r.upload(scene);
+    for (k, m) in models {
+        r.add_actor_model(*k, m);
+    }
+    r.set_actors(actors);
     r.seek(time);
     let targets = Targets::new(&r, width, height);
     let out = r.device.create_texture(&wgpu::TextureDescriptor {

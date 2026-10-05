@@ -436,7 +436,7 @@ const COMPOSITE: u32 = 0x4000_0000;
 /// from the green `hands_*_default.png`). `[INFERENCE]` the static trace did not find the writer of the layer-1 slot
 /// (`FUN_10072763` is only reached from `FUN_10073e4f`; records start with a null base, `FUN_1007269e`), so "default
 /// texture = layer 1 under the cloth" rests on the screenshot and the green-keyed data, see docs/formats.md § Skin.
-fn part_textures(names: &NameTable, store: &RecordStore, model: u32, p: &Player) -> Result<PartTextures> {
+pub(super) fn part_textures(names: &NameTable, store: &RecordStore, model: u32, p: &Player) -> Result<PartTextures> {
     let mesh = load_cat_mesh(store, CHAR_MESH_TYPE, model)?;
     let mut out = PartTextures::new();
     for part in ClothPart::ALL {
