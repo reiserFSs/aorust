@@ -105,7 +105,7 @@ fn entry(id: i32) -> CharacterEntry {
 }
 
 #[test]
-fn login_select_zone_handoff_pings_and_first_zone_frames() {
+fn login_select_zone_handoff_pings_and_zone_frames() {
     let server_priv = BigUint::from(0x1234_5678_9abc_def0u64);
     let server_pub = BigUint::from(5u32).modpow(&server_priv, &crate::crypto::dh_prime());
     let (l, s) = start(server_pub);
@@ -168,11 +168,16 @@ fn login_select_zone_handoff_pings_and_first_zone_frames() {
     let w = |i: usize| u32::from_be_bytes(reply.payload[4 * i..4 * i + 4].try_into().unwrap());
     assert_eq!((w(0), w(2), w(5)), (2, 1000, 7)); // type 2, original timestamp and cookie echoed
 
-    let ev = events_until(&s, |e| matches!(e, LoginEvent::ZoneConnected { .. }));
-    let LoginEvent::ZoneConnected { messages } = ev.last().unwrap() else { unreachable!() };
-    assert_eq!(messages.len(), ZONE_COLLECT_MAX);
-    assert_eq!((messages[0].ptype, messages[0].msg_id), (PT_PING, Some(1)));
-    assert_eq!((messages[1].ptype, messages[1].msg_id, messages[1].len), (0xA, Some(0xDEAD_0000), 12));
+    // everything but the ping is forwarded, in order
+    let mut frames = Vec::new();
+    while frames.len() < 15 {
+        if let LoginEvent::ZoneFrame(f) = events_until(&s, |e| matches!(e, LoginEvent::ZoneFrame(_))).pop().unwrap() {
+            frames.push(f);
+        }
+    }
+    assert!(frames.iter().all(|f| f.ptype == 0xA && f.payload.len() == 12));
+    assert_eq!(u32::from_be_bytes(frames[0].payload[..4].try_into().unwrap()), 0xDEAD_0000);
+    assert_eq!(u32::from_be_bytes(frames[14].payload[..4].try_into().unwrap()), 0xDEAD_000E);
     drop(zone);
     let ev = events_until(&s, |e| matches!(e, LoginEvent::Disconnected(_)));
     assert!(matches!(ev.last().unwrap(), LoginEvent::Disconnected(_)));

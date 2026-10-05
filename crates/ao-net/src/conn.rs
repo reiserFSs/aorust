@@ -14,6 +14,19 @@ const MAX_BUFFERED: usize = 1 << 22;
 
 pub type Tap = Box<dyn FnMut(bool, &[u8]) + Send>;
 
+/// Tap that appends one `<ms since first call> <'>' sent | '<' received> <hex of the frame>` line per frame to `path`
+/// (docs/captures format; credentials/cookies already redacted by [`Conn`]).
+pub fn record_tap(path: std::path::PathBuf) -> Tap {
+    let t0 = Instant::now();
+    Box::new(move |sent, b| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+            let _ = writeln!(f, "{} {} {hex}", t0.elapsed().as_millis(), if sent { '>' } else { '<' });
+        }
+    })
+}
+
 pub struct Conn {
     stream: TcpStream,
     rx: Vec<u8>,
@@ -134,4 +147,40 @@ fn redact(f: &Frame, sent: bool) -> Option<Frame> {
     let mut r = f.clone();
     r.payload[range].fill(b'*');
     Some(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{Compress, Compression, FlushCompress};
+    use std::net::TcpListener;
+
+    /// The zone server's first frame is the `7f 00` control frame (bytes captured live, docs/protocol.md §8); everything
+    /// after it, coalesced into the same TCP write, is one zlib stream with a sync flush per write and unpadded frames.
+    #[test]
+    fn inflates_unpadded_frames_after_the_control_frame() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut wire = vec![0xdf, 0xdf, 0x7f, 0, 0, 1, 0, 0x10, 1, 0, 0, 0, 0, 0, 0, 0];
+            let mut z = Compress::new(Compression::fast(), true);
+            for seq in 1..=2u16 {
+                let f = Frame { seq, ptype: 0xA, sender: 1, receiver: 7, payload: vec![seq as u8; 5] };
+                let mut raw = f.encode().unwrap();
+                raw.truncate(21); // size = 16 + 5, no padding while compressed
+                let mut out = Vec::with_capacity(128);
+                z.compress_vec(&raw, &mut out, FlushCompress::Sync).unwrap();
+                wire.extend(out);
+            }
+            s.write_all(&wire).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let mut c = Conn::connect(addr).unwrap();
+        for seq in 1..=2u16 {
+            let f = c.recv(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!((f.seq, f.ptype, f.payload.as_slice()), (seq, 0xA, &[seq as u8; 5][..]));
+        }
+        srv.join().unwrap();
+    }
 }

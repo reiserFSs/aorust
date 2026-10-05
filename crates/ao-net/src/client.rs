@@ -26,9 +26,6 @@ const PT_PING: u16 = 0xB;
 /// (`Timer_t` milliseconds), then calls `Client_t::RedirectToServer`. docs/protocol.md §8.
 pub const ZONE_CONNECT_DELAY: Duration = Duration::from_millis(4000);
 const TICK: Duration = Duration::from_millis(100);
-/// How long after `ZoneLogin` the first zone frames are collected before `ZoneConnected` fires.
-const ZONE_COLLECT: Duration = Duration::from_secs(3);
-const ZONE_COLLECT_MAX: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerEntry {
@@ -64,20 +61,6 @@ fn parse_servers(v: &serde_json::Value) -> Result<Vec<ServerEntry>> {
         .collect()
 }
 
-/// One frame received from the zone server, for M3 planning.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ZoneMsgSummary {
-    pub ptype: u16,
-    /// System messages: the `u32` message type. Other ptypes: first payload `u32` (N3 header word, unverified).
-    pub msg_id: Option<u32>,
-    pub sender: u32,
-    pub receiver: u32,
-    /// Payload length (without the 16-byte header).
-    pub len: usize,
-    /// First (up to) 32 payload bytes.
-    pub head: Vec<u8>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginEvent {
     Status(String),
@@ -98,7 +81,10 @@ pub enum LoginEvent {
     /// Reply 0x56 to [`LoginSession::request_random_name`].
     RandomName(String),
     ZoneHandoff { zone_ip: Ipv4Addr, zone_port: u16, character_id: u32 },
-    ZoneConnected { messages: Vec<ZoneMsgSummary> },
+    /// Every frame the zone server sends after `ZoneLogin` except pings (answered by the session thread): N3 messages
+    /// (`ptype` 0xA, see [`crate::n3`]), system messages (`ptype` 1, e.g. 0x43), text. The 0x7F compression control is
+    /// consumed by [`Conn`].
+    ZoneFrame(Frame),
     Disconnected(String),
 }
 
@@ -329,7 +315,7 @@ fn run(
     }
 }
 
-/// Zone phase: connect (3 tries, 1 s / 2 s backoff), send `ZoneLogin`, answer pings, report the first frames.
+/// Zone phase: connect (3 tries, 1 s / 2 s backoff), send `ZoneLogin`, answer pings, forward every other frame.
 fn zone(z: crate::msg::ZoneInfo, tap: Option<Tap>, cmds: &Receiver<Cmd>, ev: &Sender<LoginEvent>) -> Result<()> {
     let addr = SocketAddr::from((z.ip, z.port));
     let mut delay = Duration::from_secs(1);
@@ -347,8 +333,6 @@ fn zone(z: crate::msg::ZoneInfo, tap: Option<Tap>, cmds: &Receiver<Cmd>, ev: &Se
     let id = z.char_id as u32;
     conn.send_message(&Message::ZoneLogin { char_id: z.char_id, cookie1: z.cookie1, cookie2: z.cookie2 })?;
     let _ = ev.send(LoginEvent::Status("zone login sent".into()));
-    let (mut seen, mut announced) = (Vec::new(), false);
-    let start = Instant::now();
     loop {
         if matches!(cmds.try_recv(), Err(TryRecvError::Disconnected)) {
             return Ok(());
@@ -356,28 +340,10 @@ fn zone(z: crate::msg::ZoneInfo, tap: Option<Tap>, cmds: &Receiver<Cmd>, ev: &Se
         if let Some(f) = conn.recv(TICK)? {
             if f.ptype == PT_PING {
                 reply_ping(&mut conn, &f, id)?;
-            }
-            if !announced {
-                let s = summarize(&f);
-                eprintln!("[ao-net] zone frame {s:?}");
-                seen.push(s);
+            } else if ev.send(LoginEvent::ZoneFrame(f)).is_err() {
+                return Ok(());
             }
         }
-        if !announced && (seen.len() >= ZONE_COLLECT_MAX || start.elapsed() >= ZONE_COLLECT) {
-            announced = true;
-            let _ = ev.send(LoginEvent::ZoneConnected { messages: std::mem::take(&mut seen) });
-        }
-    }
-}
-
-fn summarize(f: &Frame) -> ZoneMsgSummary {
-    ZoneMsgSummary {
-        ptype: f.ptype,
-        msg_id: f.payload.get(..4).map(|b| u32::from_be_bytes(b.try_into().unwrap())),
-        sender: f.sender,
-        receiver: f.receiver,
-        len: f.payload.len(),
-        head: f.payload[..f.payload.len().min(32)].to_vec(),
     }
 }
 

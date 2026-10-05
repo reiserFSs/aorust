@@ -182,8 +182,12 @@ impl Play {
         let (tx, gen) = (self.tx.clone(), self.conn_gen);
         // connect blocks (<= 10 s); the password only lives in this closure until the session thread owns it
         std::thread::spawn(move || {
-            let r = LoginSession::connect(&server)
-                .inspect(|s| s.login(&user, &pass))
+            // AOMAC_NET_TRACE=<file>: record every frame (credentials/cookies redacted) for protocol work
+            let r = match std::env::var_os("AOMAC_NET_TRACE") {
+                Some(p) => LoginSession::connect_traced(&server, ao_net::conn::record_tap(p.into())),
+                None => LoginSession::connect(&server),
+            }
+            .inspect(|s| s.login(&user, &pass))
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Bg::Connected(gen, r));
         });
