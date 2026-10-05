@@ -157,13 +157,18 @@ impl ChatNet {
                 tell: true,
                 ..Default::default()
             })),
-            ChatEvent::Vicinity { name, text, data, .. } => out.push(Out::Msg(ChatMsg {
-                group: 0x4000_0002,
-                from_name: name,
-                text,
-                kind: data.first().copied().unwrap_or(0),
-                ..Default::default()
-            })),
+            ChatEvent::Vicinity { name, text, data, .. } => {
+                let kind = data.first().copied().unwrap_or(0);
+                // HandleVicinityMessage [GUI 0x10086728]: kind 4..7 pick fixed window groups, everything else is "vicinity"
+                let group = match kind {
+                    4 => 0x4100_0000,
+                    5 => 0x4100_0001,
+                    6 => 0x4200_001b,
+                    7 => 0x4200_001a,
+                    _ => 0x4000_0002,
+                };
+                out.push(Out::Msg(ChatMsg { group, from_name: name, text, kind, ..Default::default() }));
+            }
             ChatEvent::System(text) => out.push(Out::Line(ChatLine::new(ChatKind::System, text))),
             ChatEvent::GroupJoin { group, name, flags, .. } => {
                 let key = group_key(group);

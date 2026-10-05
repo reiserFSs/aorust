@@ -35,7 +35,7 @@ for all nine classes below.
 | 465A4061 | `QuestFullUpdateIIR_t` | 0x101673a8 | `QuestFullUpdate` |
 | 41624F0D | `AppearanceUpdateIIR_c` | 0x10160cc4 | `AppearanceUpdate` |
 | 5E477770 | `CharacterActionIIR_t` | 0x10160e00 | `CharacterAction` |
-| 4F474E05 | `CorpseFullUpdateIIR_t` | 0x10166a5c | `Corpse` (partial) |
+| 4F474E05 | `CorpseFullUpdateIIR_t` | 0x10166a5c | `Corpse` |
 
 Rust API: `world::decode(&N3Header, &mut Reader) -> Result<Option<World>>`; `Ok(None)` for other
 ids. None of these is sent by the client in the capture, so there is no `encode`.
@@ -273,22 +273,18 @@ Live (22 messages, sender 1): `action` 0xA7 (167, own char at spawn), 0x63 (99; 
 `identity_b = {0, 503}`), 0x62 (98; `identity_a = {0xCF1B, 0x27E79}`, `identity_b = {1026282, 0}`),
 0xAD (173). `text` always empty. The action id space (`CharacterAction_e`?) was not traced: [UNRESOLVED].
 
-## 9. `CorpseFullUpdateIIR_t` 0x4F474E05 (partial)
+## 9. `CorpseFullUpdateIIR_t` 0x4F474E05 (decoded; look: `docs/zone/static.md` §5)
 
 Header `{0xC76A, n}` (7 live, 393-427 bytes). ReadSubClass [GC `FUN_1009f502`]: `u32 version = 8`,
 dynel base (§3; `blob` = corpse name e.g. `"Remains of Cross-Wired Junkbot\0"`, position/rotation of
 the corpse, 18 stat pairs, `x4ac` 50), then:
 
-* `FUN_100a6c58` spell list: `u32 W` + `GameData::SpellData_t` records. Live **1 spell** (W =
-  0x7e2) of type 0xCF27; the bytes between the size word and the owner identity are
-  `0000cf27 00001238 00000004 00000000 00000001 00000000 00000000 00000000 00000000 00000000 000001f7 00000001 00000004 0000b331 00000000`.
-  Spell records are type-driven (`SpellFormats_c::ReadBinary` [GD 0x1000f4a6] -> `GetFormat(typeid)` ->
-  `SpellFormat_c::ReadBinary` -> per-argument `BinaryToValue`); the per-type format table for 0xCF27
-  built in `SpellFormats_c::SpellFormats_c` [GD 0x1000fb0a] was **not** decoded, so the list is
-  left in `Corpse::rest` (starting at the size word).
-* then (from the reader, not exercised by the decoder): `Identity` owner at `+0x84` (live
-  `{0xC350, 1026310}`: the dead character, visible in the bytes after the spell), `vector<ClothData_t>`,
-  `i32 n` (`!= 0` => `vector<TextureData_t>`: 32-byte name, 2 x i32, i32).
+* `FUN_100a6c58` spell list: `u32 W` + `GameData::SpellData_t` records (`Corpse::spells`). Live **1 spell** (W =
+  0x7e2) of type 0xCF27: `0000cf27 <id> 00000004 | 00000000 | 00000001 00000000 00000000 00000000 00000000 00000000 000001f7 | 00000001 00000004 0000b331 00000000`
+  = header (type, id, version 4), criteria count 0, the 7 format arguments (`SpellFormats_c::SpellFormats_c` [GD 0x1000fb0a]),
+  then 4 integers whose reader was not found (`CorpseSpell::tail`, static.md §5). Other spell types are an error.
+* `Identity` owner at `+0x84` (`Corpse::owner`, live `{0xC350, 1026310}` = the dead character = stats 415/416), `vector<ClothData_t>`
+  (`Corpse::cloth`, 5 empty entries live), `i32 n` (`!= 0` => `vector<TextureData_t>`: 32-byte name, 2 x i32, i32; `Corpse::textures`, none live).
 
 Activate [GC 0x1009f5a4]: creates the corpse dynel (if absent), copies the owner identity, moves
 the corpse to the dead character's relative position when closer than a threshold, sets effects.
@@ -302,7 +298,7 @@ the corpse to the dead character's relative position when closer than a threshol
 * `FullCharacter`: element layouts of inventory (`ACGItem_t`), equipment/team blocks, spells
   (`SpellData_t`), perk map and quest bodies; meaning of the three entry groups and of the
   `stats_a`/`stats_b` split; ~180 stat ids have no name in the table that was recovered.
-* `Corpse`: everything after the spell list (owner identity, cloth, textures) is raw `rest`.
+* `Corpse`: the 4 integers after the 7 spell arguments (`CorpseSpell::tail`) and spell types other than 0xCF27 (static.md §5).
 * `GameTime.arg3`, `AppearanceUpdate.extra` and cloth `b..e`, `CharacterAction` action ids,
   `DynelBase.x4ac`, `flags`, `template`.
 

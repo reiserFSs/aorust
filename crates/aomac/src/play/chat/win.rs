@@ -569,6 +569,15 @@ impl ChatWindows {
         self.deliver(gui, group, |stamp| format!("<div indent=wrapped><font color={color}>{stamp}{}</font></div>", line.text));
     }
 
+    /// The event comes from one of the chat windows (the app must not handle it again).
+    pub fn owns(&self, ev: &Event) -> bool {
+        let w = match ev {
+            Event::EnterPressed { window, .. } | Event::Escape { window } | Event::LinkClicked { window, .. } | Event::TextChanged { window, .. } => *window,
+            _ => return false,
+        };
+        self.wins.iter().any(|x| x.id == w)
+    }
+
     fn index_of_input(&self, view: &str) -> Option<usize> {
         self.wins.iter().position(|w| w.input() == view)
     }
@@ -647,10 +656,36 @@ impl ChatWindows {
         }
     }
 
+    fn active_win(&self) -> Option<&Win> {
+        self.wins.iter().find(|w| w.active).or_else(|| self.wins.iter().find(|w| w.cfg.window_name == self.last_active))
+    }
+
+    /// Focus the input bar like `focus_input` and put `text` into it (`StartChatCmdMessage` opens it with "/").
+    pub fn focus_input_text(&mut self, gui: &mut Gui, text: &str) {
+        self.focus_input(gui);
+        if let Some(w) = self.active_win() {
+            let (id, v) = (w.id, w.input());
+            gui.set_text(id, &v, text);
+        }
+    }
+
     /// `#%016x#` of the output group of the window that has (or last had) the focus: where a plain line without `/` goes.
     pub fn active_output_group(&self) -> Option<String> {
-        let w = self.wins.iter().find(|w| w.active).or_else(|| self.wins.iter().find(|w| w.cfg.window_name == self.last_active))?;
+        let w = self.active_win()?;
         (w.cfg.output_group != 0).then(|| group_ident(w.cfg.output_group))
+    }
+
+    /// Id form of [`active_output_group`](Self::active_output_group).
+    pub fn active_output_id(&self) -> Option<u64> {
+        self.active_win().map(|w| w.cfg.output_group).filter(|g| *g != 0)
+    }
+
+    /// `/ch <group>` (`FUN_1009a06f`): the active window's output group becomes `id`.
+    pub fn set_output_group(&mut self, id: u64) {
+        let name = self.active_win().map(|w| w.cfg.window_name.clone());
+        if let Some(w) = self.wins.iter_mut().find(|w| Some(&w.cfg.window_name) == name.as_ref()) {
+            w.cfg.output_group = id;
+        }
     }
 
     /// Writes every window's `Config.xml` under `<prefs dir>/Chat/Windows/<window_name>/` (`FUN_10094a28`, at shutdown).
