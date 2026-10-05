@@ -422,11 +422,12 @@ mod tests {
         assert_eq!([pick(1, [1, 0], false).0, pick(1, [2, 0], false).0, pick(1, [0, 0], false).0], [LodPick::Full, LodPick::Hidden, LodPick::Hidden]);
         // file list 0 -> zone list 3, flag 8: full out to level 4, mode 1 (reduced) at level 5, mode 2 (reduced) at level 0
         assert_eq!([pick(0, [4, 0], false).0, pick(0, [5, 0], false).0, pick(0, [0, 0], false).0], [LodPick::Full, LodPick::Reduced, LodPick::Reduced]);
-        // file list 1 -> zone list 2, no flag 8 / reduced record: mode 1 (level 4) keeps what it showed last, mode 2 (5) finds no record
+        // file list 1 -> zone list 2, no flag 8 / reduced record: mode 1 (level 4) keeps what it showed last, mode 2 (5) asks for
+        // the missing 1010026 record, which the resource manager's fallback answers with the full mesh
         assert_eq!(pick(3, [3, 0], false), (LodPick::Full, false));
         assert_eq!(pick(3, [4, 0], false), (LodPick::Full, false));
-        assert_eq!(pick(3, [5, 0], false), (LodPick::Hidden, true));
-        assert_eq!(pick(3, [4, 0], true), (LodPick::Hidden, true));
+        assert_eq!(pick(3, [5, 0], false), (LodPick::Full, true));
+        assert_eq!(pick(3, [4, 0], true), (LodPick::Full, true));
         // global statel (zone list 4): state 2 (mode 1) only at level 0; the best mode of its zones wins
         assert_eq!((pick(2, [5, 5], false).0, pick(2, [0, 0], false).0, pick(2, [0, 1], false).0), (LodPick::Full, LodPick::Reduced, LodPick::Full));
         assert_eq!(l.zone_items, vec![vec![0, 1, 2, 3], vec![2]]);
@@ -540,11 +541,12 @@ impl StatelLod {
             1 => ident_reduced,
             _ => true,
         };
-        // a reduced identity without a 1010026 record creates no visual
+        // a reduced identity without a 1010026 record loads the full mesh: Interfaces.dll registers
+        // `ResourceManager::AddFallback(0xf696a, 0xf6951, null)` and `GetSync` retries a missing record with the fallback type
         let pick = match (reduced, item.reduced.is_some()) {
             (false, _) => LodPick::Full,
             (true, true) => LodPick::Reduced,
-            (true, false) => LodPick::Hidden,
+            (true, false) => LodPick::Full,
         };
         (pick, reduced)
     }
