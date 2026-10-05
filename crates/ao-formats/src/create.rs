@@ -289,6 +289,17 @@ impl CameraRig {
         }
     }
 
+    /// Camera-tool command 0x31 (`SlotEscPressed`, GUI 0x1011660a → `FUN_10116248(count)`): while a transition plays, it
+    /// stops and the camera snaps to the transition's last key camera; otherwise nothing happens.
+    pub fn stop(&mut self) {
+        if self.active {
+            if let Some(t) = self.target() {
+                self.pose = t;
+            }
+            self.active = false;
+        }
+    }
+
     pub fn pose(&self) -> Pose {
         self.pose
     }

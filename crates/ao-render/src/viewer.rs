@@ -413,7 +413,10 @@ impl ApplicationHandler for App {
         let Some(s) = &mut self.state else { return };
         if let Some(g) = &mut s.gui {
             if let Some(ie) = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale) {
+                // the frontend may move the camera from an input handler (e.g. a click that switches screens)
+                g.host.camera = s.cam;
                 g.frontend.input(ie, &mut g.host);
+                s.cam = g.host.camera;
             }
         }
         let fly = s.fly();

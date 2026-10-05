@@ -115,6 +115,7 @@ impl Play {
                 c.cur = Some(sc);
                 if sc == Sc::Profession {
                     c.prof_vis = true; // this[0xaa] = 1
+                    c.scene_dirty = true;
                 }
                 c.st = St::Wait(sc);
             }

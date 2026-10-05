@@ -757,18 +757,23 @@ impl Play {
     /// name scene falls back to state 0 and an error / nick sound plays.
     fn cc_message(&mut self, c: &mut Create, text: &str, sound: &str) {
         self.message_box(text);
-        if let Some(w) = c.name_w {
+        for w in [c.info_w, c.name_w].into_iter().flatten() {
             self.gui.set_window_visible(w, false);
         }
         c.shown = false;
         self.cc_sound(sound);
         c.message_open = true;
+        // `SetState(0)` → `UpdateButtonState`: Finish follows the name field again (Back stays disabled, as in the original)
+        c.name_locked = false;
+        self.cc_update_finish(c);
     }
 
     /// `NameScene_t::SetState(0x1009)` with the suggest flag: `Client_t::SuggestNickName(breed, sex, profession)`.
     fn cc_suggest(&mut self, c: &mut Create) {
         let (b, s) = cc_breed_to_gc(c.breed).unwrap_or((1, 3));
-        if let Some(sess) = &self.session {
+        if self.fake {
+            self.fake_events.push_back(LoginEvent::RandomName("Zalokon".into()));
+        } else if let Some(sess) = &self.session {
             sess.request_random_name(b, s, cc_prof_to_gc(c.prof));
         }
     }
@@ -800,10 +805,15 @@ impl Play {
         };
         eprintln!("create character: {req:?}");
         if self.fake {
-            // `--fake-charlist` has no server: stop here (the network step is covered by ao-net's fake-server tests)
-            eprintln!("(--fake-charlist) CreateCharacter not sent");
-            c.name_locked = false;
-            self.cc_update_finish(c);
+            // `--fake-charlist`: an in-process fake login server — "Taken" is in use, anything else is created and handed off
+            let taken = req.name.eq_ignore_ascii_case("taken");
+            eprintln!("(--fake-charlist) fake server answers: {}", if taken { "NameInUse" } else { "CharacterCreated + ZoneHandoff" });
+            if taken {
+                self.fake_events.push_back(LoginEvent::CharacterCreateFailed { code: 0x1e });
+            } else {
+                self.fake_events.push_back(LoginEvent::CharacterCreated { character_id: 1 });
+                self.fake_events.push_back(LoginEvent::ZoneHandoff { zone_ip: std::net::Ipv4Addr::LOCALHOST, zone_port: 0, character_id: 1 });
+            }
             return;
         }
         if let Some(sess) = &self.session {
@@ -868,7 +878,7 @@ impl Play {
             if c.message_open {
                 c.message_open = false;
                 c.shown = true;
-                if let Some(w) = c.name_w {
+                for w in [c.info_w, c.name_w].into_iter().flatten() {
                     self.gui.set_window_visible(w, true);
                 }
             }

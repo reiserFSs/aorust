@@ -553,7 +553,7 @@ impl Play {
                 }
             }
         }
-        while let Some(ev) = self.session.as_ref().and_then(|s| s.poll()) {
+        while let Some(ev) = self.fake_events.pop_front().or_else(|| self.session.as_ref().and_then(|s| s.poll())) {
             if self.screen == Screen::Create && self.create_session_event(&ev, host) {
                 continue;
             }
@@ -719,7 +719,12 @@ impl Frontend for Play {
         match (self.screen, &ev) {
             (Screen::Loading, _) => return, // full-screen InvisibleButton swallows input
             (Screen::Create, _) if self.create_input(&ev, host) => return,
-            (Screen::Create, InputEvent::Key { key: Key::Escape, .. }) => return, // `SlotEscPressed` drives the camera tool (docs/screens.md §12)
+            // `CharCreateModule_t::SlotEscPressed` (camera-tool command 0x31) and `DialogBox_c::SlotEscPressed` hear the same global signal
+            (Screen::Create, InputEvent::Key { key: Key::Escape, pressed: true, .. }) => {
+                if let Some(c) = self.cc.as_mut() {
+                    c.esc();
+                }
+            }
             (Screen::InWorld, InputEvent::Key { key: Key::Escape, pressed: true, .. }) => host.quit = true,
             (Screen::CharSelect, InputEvent::Key { key: Key::Up, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(-1, host),
             (Screen::CharSelect, InputEvent::Key { key: Key::Down, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(1, host),

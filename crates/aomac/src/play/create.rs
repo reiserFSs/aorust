@@ -375,6 +375,11 @@ impl Play {
 }
 
 impl Create {
+    /// `SlotEscPressed`: camera-tool command 0x31, see [`CameraRig::stop`].
+    pub(super) fn esc(&mut self) {
+        self.rig.stop();
+    }
+
     /// The exit cinematic reached the loading hand-over (`StaticDoneTimerCallback` 4: `AFCM::Send(0x12, 0x3d)`).
     pub(super) fn exit_done(&self) -> bool {
         self.st == St::Exit && self.created && self.handoff

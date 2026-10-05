@@ -109,6 +109,8 @@ struct Play {
     zone_summary: usize,
     in_world_msg: String,
     fake: bool,
+    /// `--fake-charlist`: the replies an in-process fake login server would send (random name, created, hand-off, …).
+    fake_events: std::collections::VecDeque<LoginEvent>,
     /// `--fake-charlist`: character index to show first once the window size is known.
     pending_fake: Option<usize>,
     pending_user: String,
@@ -181,6 +183,7 @@ pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String
         zone_summary: 0,
         in_world_msg: String::new(),
         fake: fake_charlist.is_some(),
+        fake_events: Default::default(),
         pending_fake: None,
         pending_user: String::new(),
         world_scene: None,
