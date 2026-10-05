@@ -36,8 +36,8 @@ fn building_with_cutout_masts() {
     let scene = load_mesh(&store, 3722).unwrap();
     assert_eq!(scene.instances.len(), 1);
     let m = &scene.meshes[0];
-    assert!(m.submeshes.iter().any(|s| s.alpha_test && s.texture.is_some()));
-    assert!(m.submeshes.iter().any(|s| !s.alpha_test));
+    assert!(m.submeshes.iter().any(|s| s.blend == ao_scene::Blend::AlphaTest && s.texture.is_some()));
+    assert!(m.submeshes.iter().any(|s| s.blend == ao_scene::Blend::Opaque));
     // upright building: taller than wide, standing on y ~ 0 (min y near the ground)
     let (min_y, max_y) = m.vertices.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v.pos[1]), b.max(v.pos[1])));
     assert!(max_y - min_y > 5.0 && min_y.abs() < 5.0, "y range {min_y}..{max_y}");

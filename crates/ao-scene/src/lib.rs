@@ -13,22 +13,53 @@ pub struct Texture {
     pub rgba: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct Vertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// Linear RGBA multiplier on the lit texel (baked shadow/lighting, terrain blend weight in `a`).
+    pub color: [f32; 4],
+}
+
+pub const WHITE: [f32; 4] = [1.0; 4];
+
+impl Default for Vertex {
+    fn default() -> Self {
+        Self { pos: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: WHITE }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Blend {
+    #[default]
+    Opaque,
+    /// Cutout at alpha 0.5, depth-written (foliage, fences).
+    AlphaTest,
+    /// Src-alpha blending, drawn after opaques back-to-front, no depth write (glass, water).
+    AlphaBlend,
+    /// Additive (src*alpha + dst), no depth write (glows, beams).
+    Additive,
 }
 
 /// Triangle list sharing the parent mesh's vertex buffer.
 #[derive(Clone, Debug)]
 pub struct Submesh {
     pub indices: Vec<u32>,
-    /// Key into [`Scene::textures`]; `None` draws untextured (vertex-lit grey).
+    /// Key into [`Scene::textures`]; `None` draws `base_color` only.
     pub texture: Option<TextureKey>,
-    /// Alpha-tested (cutout) material, e.g. foliage and fences.
-    pub alpha_test: bool,
+    pub blend: Blend,
+    /// Linear RGBA material colour, multiplied with texture and vertex colour.
+    pub base_color: [f32; 4],
+    /// Disable back-face culling (front faces are counter-clockwise in ao-scene space).
+    pub two_sided: bool,
+}
+
+impl Submesh {
+    pub fn new(indices: Vec<u32>, texture: Option<TextureKey>) -> Self {
+        Self { indices, texture, blend: Blend::Opaque, base_color: WHITE, two_sided: false }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -52,6 +83,20 @@ pub struct TextureKey {
     pub id: u32,
 }
 
+/// Per-playfield atmosphere; linear RGB.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Environment {
+    pub sky_color: [f32; 3],
+    pub fog_color: [f32; 3],
+    /// Fog is 0 at `fog_start` metres, full at `fog_end`.
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub ambient: [f32; 3],
+    pub sun_color: [f32; 3],
+    /// Unit vector pointing from the scene towards the sun.
+    pub sun_dir: [f32; 3],
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
     pub textures: HashMap<TextureKey, Texture>,
@@ -59,6 +104,10 @@ pub struct Scene {
     pub instances: Vec<Instance>,
     /// Suggested initial camera position (world space); `None` = frame the scene bounds.
     pub spawn: Option<[f32; 3]>,
+    /// Point the initial camera looks at; `None` = renderer's choice.
+    pub spawn_look_at: Option<[f32; 3]>,
+    /// `None` = renderer defaults.
+    pub environment: Option<Environment>,
 }
 
 pub const IDENTITY: [[f32; 4]; 4] = [

@@ -202,6 +202,7 @@ fn build_terrain(store: &RecordStore, tm: &ground::Tilemap, scene: &mut Scene) -
                     pos: [vx as f32 * cs, tm.height(vx, vz), -(vz as f32 * cs)],
                     normal: normal(vx, vz),
                     uv: [dx as f32, dz as f32],
+                    ..Default::default()
                 });
             }
             // CCW seen from +Y in scene space (z negated). Bit 14 of the tile value picks the
@@ -212,7 +213,7 @@ fn build_terrain(store: &RecordStore, tm: &ground::Tilemap, scene: &mut Scene) -
                 indices.extend([base, base + 1, base + 3, base, base + 3, base + 2]);
             }
         }
-        mesh.submeshes.push(Submesh { indices, texture, alpha_test: false });
+        mesh.submeshes.push(Submesh::new(indices, texture));
         scene.meshes.push(mesh);
         scene.instances.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
     }

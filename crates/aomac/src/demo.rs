@@ -1,6 +1,6 @@
 //! Synthetic scene proving the renderer independent of the format slices.
 
-use ao_scene::{Instance, Mesh, Scene, Submesh, Texture, TextureKey, Vertex};
+use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, Texture, TextureKey, Vertex};
 use glam::{Mat4, Quat, Vec3};
 
 fn key(id: u32) -> TextureKey {
@@ -14,7 +14,7 @@ fn tex(n: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Texture {
 
 fn quad(corners: [[f32; 3]; 4], normal: [f32; 3], uv_max: f32) -> Vec<Vertex> {
     let uv = [[0.0, uv_max], [uv_max, uv_max], [uv_max, 0.0], [0.0, 0.0]];
-    (0..4).map(|i| Vertex { pos: corners[i], normal, uv: uv[i] }).collect()
+    (0..4).map(|i| Vertex { pos: corners[i], normal, uv: uv[i], ..Default::default() }).collect()
 }
 
 fn cube() -> Mesh {
@@ -32,7 +32,7 @@ fn cube() -> Mesh {
         vertices.extend(quad([p(-1., -1.), p(-1., 1.), p(1., 1.), p(1., -1.)], n, 1.0));
     }
     let indices = (0..6u32).flat_map(|f| [0, 1, 2, 0, 2, 3].map(|i| f * 4 + i)).collect();
-    Mesh { vertices, submeshes: vec![Submesh { indices, texture: None, alpha_test: false }] }
+    Mesh { vertices, submeshes: vec![Submesh::new(indices, None)] }
 }
 
 pub fn scene(count: usize) -> Scene {
@@ -61,11 +61,11 @@ pub fn scene(count: usize) -> Scene {
 
     let ground = Mesh {
         vertices: quad([[-200., 0., 200.], [200., 0., 200.], [200., 0., -200.], [-200., 0., -200.]], [0., 1., 0.], 100.0),
-        submeshes: vec![Submesh { indices: vec![0, 1, 2, 0, 2, 3], texture: Some(key(0)), alpha_test: false }],
+        submeshes: vec![Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key(0)))],
     };
     let fence = Mesh {
         vertices: quad([[-2., 0., 0.], [2., 0., 0.], [2., 3., 0.], [-2., 3., 0.]], [0., 0., 1.], 1.0),
-        submeshes: vec![Submesh { indices: vec![0, 1, 2, 0, 2, 3], texture: Some(key(100)), alpha_test: true }],
+        submeshes: vec![Submesh { blend: Blend::AlphaTest, two_sided: true, ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key(100))) }],
     };
     s.meshes.push(ground);
     s.meshes.push(fence);

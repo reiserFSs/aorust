@@ -503,7 +503,7 @@ impl Builder<'_> {
                 let y2 = y + floor.height(u, w) + y * 0.25 * ceil.height(u, w);
                 let p = self.frame.point([px as f32 + origin[0], y2 as f32, pz as f32 + origin[1]]);
                 let n = self.frame.vec([(nx / l) as f32, (ny / l) as f32, (nz / l) as f32]);
-                self.out.vertices.push(Vertex { pos: p, normal: [n[0], n[1], -n[2]], uv: [v[6], v[7]] });
+                self.out.vertices.push(Vertex { pos: p, normal: [n[0], n[1], -n[2]], uv: [v[6], v[7]], ..Default::default() });
             }
             // z is mirrored: reverse the winding
             let idx = self.out.by_tex.entry(mat).or_default();
@@ -563,7 +563,7 @@ fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<Text
     }
     let mut keys: Vec<_> = by_tex.keys().copied().collect();
     keys.sort_by_key(|k| k.map(|k| (k.rdb_type, k.id)));
-    let submeshes = keys.into_iter().map(|k| Submesh { indices: by_tex[&k].clone(), texture: k, alpha_test: false }).collect();
+    let submeshes = keys.into_iter().map(|k| Submesh { two_sided: true, ..Submesh::new(by_tex[&k].clone(), k) }).collect();
     Some(Mesh { vertices, submeshes })
 }
 

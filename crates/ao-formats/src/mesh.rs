@@ -9,7 +9,7 @@ use crate::archive::{Archive, Object};
 use crate::texture::load_texture;
 use anyhow::{bail, ensure, Context, Result};
 use ao_rdb::RecordStore;
-use ao_scene::{Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
+use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
 use std::collections::HashMap;
 
 /// Primary static-mesh record type (full detail).
@@ -186,14 +186,18 @@ impl Builder<'_, '_> {
             }
             pos[2] = -pos[2];
             nrm[2] = -nrm[2];
-            self.mesh.vertices.push(Vertex { pos, normal: nrm, uv });
+            self.mesh.vertices.push(Vertex { pos, normal: nrm, uv, ..Default::default() });
         }
 
         // The Z flip mirrors the mesh; a node matrix with negative determinant mirrors it back.
         let reverse = det3(world) >= 0.0;
         let key = self.material(node_ds, sm);
         let sub = *self.groups.entry(key).or_insert_with(|| {
-            self.mesh.submeshes.push(Submesh { indices: vec![], texture: key.0, alpha_test: key.1 });
+            self.mesh.submeshes.push(Submesh {
+                blend: if key.1 { Blend::AlphaTest } else { Blend::Opaque },
+                two_sided: true,
+                ..Submesh::new(vec![], key.0)
+            });
             self.mesh.submeshes.len() - 1
         });
         for t in tris.chunks_exact(6) {

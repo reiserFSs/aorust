@@ -259,7 +259,7 @@ impl Renderer {
                     compilation_options: Default::default(),
                     buffers: &[
                         wgpu::VertexBufferLayout {
-                            array_stride: std::mem::size_of::<ao_scene::Vertex>() as u64,
+                            array_stride: 32,
                             step_mode: wgpu::VertexStepMode::Vertex,
                             attributes: &vert_attrs,
                         },
@@ -404,7 +404,7 @@ impl Renderer {
                         first_index: first,
                         count,
                         bind: s.texture.and_then(|k| bind_of.get(&k).copied()).unwrap_or(0),
-                        alpha: s.alpha_test,
+                        alpha: s.blend != ao_scene::Blend::Opaque,
                         inst: range.clone(),
                     });
                 }
