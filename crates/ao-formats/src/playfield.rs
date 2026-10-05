@@ -19,10 +19,12 @@ mod shadow;
 mod statel;
 mod terrain;
 mod water;
+mod zone;
 
 pub use ao_scene::FogVolume;
 pub use sky::{SkyClock, DEFAULT_DAY_TIME};
 pub use spawn::{floor_below, scene_bounds, support_below};
+pub use zone::{zone_locator, ZoneLocator};
 
 use std::collections::HashMap;
 use std::path::Path;

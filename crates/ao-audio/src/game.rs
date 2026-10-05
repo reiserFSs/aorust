@@ -1,0 +1,312 @@
+//! The client's game audio rules driven from data (docs/formats.md `## audio`): district music selection, the
+//! day-period ambience layers, statel sound emitters and `.sbf` sound definitions.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use ao_formats::playfield::{zone_locator, SoundEmitter, ZoneLocator};
+use ao_rdb::RecordStore;
+
+use crate::district::Districts;
+use crate::engine::Shared;
+use crate::mixer::Falloff;
+use crate::music::{MusicPlayer, Rng};
+use crate::sbf::{sound_id, SoundDb, SoundDef};
+use crate::sws::Project;
+
+/// rdb type of the per playfield district table (id = playfield id).
+const DISTRICTS: u32 = 1_000_014;
+
+/// `GameTime_t` (Gamecode ctor @0x1000af71): 27 hours of 3600 s per day; dawn 7..9 h, dusk 21..23 h.
+const HOUR: f32 = 3600.0;
+/// The viewer's clock (`GameDayTime`, 0..6480 s) is the 27 hour day at 240 s per game hour.
+const HOURS_PER_VIEWER_SECOND: f32 = 1.0 / 240.0;
+/// Ambience cross-fade half width (`_DAT_1015d640`, Gamecode).
+const K: f32 = 300.0;
+
+/// Parsed client sound data shared by everything.
+pub struct Library {
+    pub project: Arc<Project>,
+    pub sounds: Arc<SoundDb>,
+}
+
+impl Library {
+    /// `sound_dir` = `<client>/cd_image/sound`.
+    pub fn load(sound_dir: &Path) -> Result<Library> {
+        let read = |rel: &str| std::fs::read(sound_dir.join(rel)).with_context(|| rel.to_string());
+        let project = Project::parse(&read("music/env/anarchy.sws")?).context("anarchy.sws")?;
+        let mut sounds = SoundDb::parse(&read("SourceFiles/SM_Sandy_Game_Dummy.sbf")?).context("SM_Sandy_Game_Dummy.sbf")?;
+        sounds.merge(SoundDb::parse(&read("SourceFiles/SM_Sandy_Gui.sbf")?).context("SM_Sandy_Gui.sbf")?);
+        Ok(Library { project: Arc::new(project), sounds: Arc::new(sounds) })
+    }
+}
+
+/// Everything the audio needs from one playfield.
+pub struct PlayfieldAudio {
+    pub id: u32,
+    districts: Option<Districts>,
+    zones: ZoneLocator,
+    emitters: Vec<SoundEmitter>,
+}
+
+impl PlayfieldAudio {
+    /// `sounds` = `Report::sounds` of the scene load (statel sound emitters, scene space).
+    pub fn load(store: &RecordStore, id: u32, sounds: &[SoundEmitter]) -> Result<PlayfieldAudio> {
+        let districts = match store.get(DISTRICTS, id)? {
+            Some(d) => Some(Districts::parse(&d).with_context(|| format!("district table of playfield {id}"))?),
+            None => None,
+        };
+        Ok(PlayfieldAudio { id, districts, zones: zone_locator(store, id)?, emitters: sounds.to_vec() })
+    }
+
+    fn district(&self, cam: [f32; 3]) -> Option<&crate::district::District> {
+        self.districts.as_ref()?.district(self.zones.zone_at(cam)?)
+    }
+}
+
+/// Day period of the music module (`UpdateDayPeriod`, Gamecode @0x1000b1c2) from the game hour 0..27.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Period {
+    Dawn,
+    Day,
+    Dusk,
+    Night,
+}
+
+impl Period {
+    pub fn at_hour(h: f32) -> Period {
+        match h {
+            h if h < 7.0 => Period::Night,
+            h if h < 9.0 => Period::Dawn,
+            h if h < 21.0 => Period::Day,
+            h if h < 23.0 => Period::Dusk,
+            _ => Period::Night,
+        }
+    }
+
+    /// Slot of `DistrictData::music[]` (`music_ids[idx]` with idx = DayPeriod + 1, ours is 0 based).
+    fn music_slot(self) -> usize {
+        match self {
+            Period::Dawn => 0,
+            Period::Day => 1,
+            Period::Dusk => 2,
+            Period::Night => 3,
+        }
+    }
+}
+
+/// Volume of the ambience layer of `period` at time-of-day `t` seconds (game seconds, 0..97200): a trapezoid
+/// (`FUN_100ba221`): night 0,0,dawnS-K,dawnS; dawn dawnS-K,dawnS,dawnE-K,dawnE; day dawnE-K,dawnE,duskS-K,duskS;
+/// dusk duskS-K,duskS,duskE-K,duskE. The client forces `t = 1` once `t > duskE - K`.
+pub fn ambience_level(period: Period, t: f32) -> f32 {
+    let (dawn_s, dawn_e, dusk_s, dusk_e) = (7.0 * HOUR, 9.0 * HOUR, 21.0 * HOUR, 23.0 * HOUR);
+    let t = if t > dusk_e - K { 1.0 } else { t };
+    let (a, b, c, d) = match period {
+        Period::Night => (0.0, 0.0, dawn_s - K, dawn_s),
+        Period::Dawn => (dawn_s - K, dawn_s, dawn_e - K, dawn_e),
+        Period::Day => (dawn_e - K, dawn_e, dusk_s - K, dusk_s),
+        Period::Dusk => (dusk_s - K, dusk_s, dusk_e - K, dusk_e),
+    };
+    if t < a || t >= d {
+        0.0
+    } else if t < b {
+        (t - a) / (b - a)
+    } else if t <= c {
+        1.0
+    } else {
+        1.0 - (t - c) / (d - c)
+    }
+}
+
+/// One running ambience layer: a keep-alive looping parent plus its timed child one-shots.
+struct Ambient {
+    voice: u64,
+    timers: Vec<f32>,
+}
+
+#[derive(Default)]
+struct EmitterState {
+    voices: Vec<u64>,
+}
+
+/// Mutable audio world state (one per [`crate::Audio`]).
+pub(crate) struct Runtime {
+    pub lib: Library,
+    pub music: MusicPlayer,
+    pf: Option<PlayfieldAudio>,
+    /// seconds since the last once-per-second music/district evaluation
+    eval: f32,
+    ambient: HashMap<(u16, Period), Ambient>,
+    emitters: Vec<EmitterState>,
+    /// ambience sound id of the camera's district
+    want: Option<u16>,
+    rng: Rng,
+    /// `Total_FX` (master x FX x mutes).
+    pub fx: f32,
+}
+
+impl Runtime {
+    pub fn new(sh: &Arc<Shared>, lib: Library, seed: u64) -> Runtime {
+        let music = MusicPlayer::new(sh.clone(), lib.project.clone(), seed);
+        Runtime { lib, music, pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, rng: Rng(seed.rotate_left(17) | 1), fx: 1.0 }
+    }
+
+    /// Plays a definition once, non-positionally, at `Total_FX`.
+    pub fn play(&mut self, sh: &Shared, def: &SoundDef) -> Vec<u64> {
+        let db = self.lib.sounds.clone();
+        play_def(sh, &db, def, None, self.fx, &mut self.rng)
+    }
+
+    pub fn set_playfield(&mut self, sh: &Shared, pf: Option<PlayfieldAudio>) {
+        self.stop_ambience(sh, 0.0);
+        self.emitters = pf.as_ref().map(|p| p.emitters.iter().map(|_| EmitterState::default()).collect()).unwrap_or_default();
+        self.pf = pf;
+        self.eval = 1.0; // evaluate immediately
+    }
+
+    fn stop_ambience(&mut self, sh: &Shared, fade: f32) {
+        let mut m = sh.mixer();
+        for (_, a) in self.ambient.drain() {
+            m.fade(a.voice, 0.0, fade, true);
+        }
+    }
+
+    /// Per frame: `cam` scene-space camera position, `day_time` the viewer clock (0..6480 s).
+    pub fn update(&mut self, sh: &Shared, dt: f32, cam: [f32; 3], day_time: f32) {
+        let hours = day_time.rem_euclid(6480.0) * HOURS_PER_VIEWER_SECOND;
+        let period = Period::at_hour(hours);
+        self.eval += dt;
+        if self.pf.is_some() && self.eval >= 1.0 {
+            self.eval = 0.0;
+            let id = self.evaluate_district(period, cam);
+            self.set_ambience_district(sh, id);
+        }
+        self.music.tick(dt);
+        self.tick_ambience(sh, dt, hours * HOUR);
+        self.tick_emitters(sh, cam);
+    }
+
+    /// The 1 Hz music module (`FUN_100b6d67`): district of the camera's zone -> `music[DayPeriod]` layer.
+    /// Returns the district's ambience sound id.
+    fn evaluate_district(&mut self, period: Period, cam: [f32; 3]) -> Option<u16> {
+        let Some(d) = self.pf.as_ref().and_then(|p| p.district(cam)) else {
+            self.music.signal(None);
+            return None;
+        };
+        // [UNRESOLVED] weather slots (fog/rain/storm 5..7): the weather schedule seed is not known, clear sky assumed.
+        let layer = d.music[period.music_slot()];
+        let sound_id = d.sound_id;
+        // [UNRESOLVED] land-control districts (module flag +0xbc, set by the server) would use Landcontrol_neutral.
+        self.music.signal((layer != 0xffff && (layer as usize) < self.lib.project.layers.len()).then_some(layer as usize));
+        Some(sound_id)
+    }
+
+    /// A district change fades the old id's layers out (4 s, the sound definitions' fade-out).
+    fn set_ambience_district(&mut self, sh: &Shared, id: Option<u16>) {
+        let stale: Vec<_> = self.ambient.keys().filter(|(i, _)| Some(*i) != id).copied().collect();
+        for k in stale {
+            if let Some(a) = self.ambient.remove(&k) {
+                sh.mixer().fade(a.voice, 0.0, 4.0, true);
+            }
+        }
+        self.want = id;
+    }
+
+    /// Keeps the four `SM_Sandy_Env_Background{Night,Dawn,Day,Dusk}_<id>` layers of the district at their trapezoid
+    /// level; children are independent timed one-shots at the parent's level.
+    fn tick_ambience(&mut self, sh: &Shared, dt: f32, t: f32) {
+        let Some(id) = self.want else { return };
+        for (name, period) in [("Night", Period::Night), ("Dawn", Period::Dawn), ("Day", Period::Day), ("Dusk", Period::Dusk)] {
+            let level = ambience_level(period, t) * self.fx;
+            let key = (id, period);
+            let def = self.lib.sounds.get(sound_id(&format!("SM_Sandy_Env_Background{name}_{id}"))).cloned();
+            let Some(def) = def else { continue };
+            if level <= 0.0 {
+                if let Some(a) = self.ambient.remove(&key) {
+                    sh.mixer().fade(a.voice, 0.0, def.fade_out.max(0.001), true);
+                }
+                continue;
+            }
+            let vol = def.vol_max * level;
+            let alive = self.ambient.get(&key).map_or(false, |a| sh.mixer().is_playing(a.voice));
+            if !alive {
+                let Some(path) = def.file.as_deref().and_then(|f| sh.resolve(f)) else { continue };
+                let voice = sh.play_sample(&path, vol, true, None);
+                if voice == 0 {
+                    continue;
+                }
+                let timers = def.children.iter().map(|_| self.rng.unit() * (def.interval_max - def.interval_min).max(0.0) + def.interval_min).collect();
+                self.ambient.insert(key, Ambient { voice, timers });
+                continue;
+            }
+            let a = self.ambient.get_mut(&key).unwrap();
+            sh.mixer().set_gain(a.voice, vol);
+            for (i, tm) in a.timers.iter_mut().enumerate() {
+                *tm -= dt;
+                if *tm <= 0.0 {
+                    let Some(child) = self.lib.sounds.get(def.children[i]) else { *tm = f32::MAX; continue };
+                    // re-armed with a fresh random interval of the child's own range
+                    *tm = child.interval_min + self.rng.unit() * (child.interval_max - child.interval_min).max(0.0);
+                    if let Some(p) = child.file.as_deref().and_then(|f| sh.resolve(f)) {
+                        sh.play_sample(&p, vol, false, None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `EvaluateStatelSoundFog` (N3 @0x10024eff): an emitter whose radius contains the camera calls
+    /// `PlayGameSound(id, pos, ..., radius)`; here a sound is (re)started when its last voice has finished.
+    fn tick_emitters(&mut self, sh: &Shared, cam: [f32; 3]) {
+        let Some(pf) = &self.pf else { return };
+        for (e, st) in pf.emitters.iter().zip(&mut self.emitters) {
+            let d = ((e.pos[0] - cam[0]).powi(2) + (e.pos[1] - cam[1]).powi(2) + (e.pos[2] - cam[2]).powi(2)).sqrt();
+            if d >= e.radius {
+                continue;
+            }
+            {
+                let m = sh.mixer();
+                st.voices.retain(|v| m.is_playing(*v));
+            }
+            if !st.voices.is_empty() {
+                continue;
+            }
+            if let Some(def) = self.lib.sounds.get(e.sound_id) {
+                st.voices = play_def(sh, &self.lib.sounds, def, Some((e.pos, e.radius)), self.fx, &mut self.rng);
+            }
+        }
+    }
+}
+
+/// `SandyInterface_t::PlaySample` for a sound definition: probability gate, randomised volume, linear distance
+/// attenuation (`min_dist`..`max_dist`, or the caller's radius), file and children per the definition's flags.
+pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, at: Option<([f32; 3], f32)>, fx: f32, rng: &mut Rng) -> Vec<u64> {
+    if def.prob != 100 && rng.next() % 200 >= def.prob as u32 {
+        return Vec::new();
+    }
+    let vol = (def.vol_min + rng.unit() * (def.vol_max - def.vol_min)) * fx;
+    // [UNRESOLVED] exact use of the caller's radius; as the client's min/max distance pair it is the max distance
+    let emitter = at.map(|(pos, radius)| (pos, Falloff { min: def.min_dist, max: if radius > 0.0 { radius } else { def.max_dist } }));
+    let mut out = Vec::new();
+    let mut one = |d: &SoundDef| {
+        if let Some(p) = d.file.as_deref().and_then(|f| sh.resolve(f)) {
+            let id = sh.play_sample(&p, vol, false, emitter);
+            if id != 0 {
+                out.push(id);
+            }
+        }
+    };
+    one(def);
+    if def.play_all {
+        for c in def.children.iter().filter_map(|c| db.get(*c)) {
+            one(c);
+        }
+    } else if def.random_child && !def.children.is_empty() {
+        if let Some(c) = db.get(def.children[rng.next() as usize % def.children.len()]) {
+            one(c);
+        }
+    }
+    out
+}

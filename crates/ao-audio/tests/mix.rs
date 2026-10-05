@@ -24,53 +24,48 @@ fn near(a: f32, b: f32, tol: f32) {
 }
 
 #[test]
-fn centre_pan_and_resample() {
+fn both_channels_and_resample() {
     let mut m = Mixer::new(RATE);
-    // 22.05 kHz source must be resampled to 48 kHz and keep its amplitude: sine rms = amp / sqrt 2, centre pan = x0.7071
-    m.play(VoiceDesc { gain: 1.0, looping: true, ..VoiceDesc::new(Source::Sample(sine(441.0, 1.0, 0.8, 22_050))) });
+    // 22.05 kHz source must be resampled to 48 kHz and keep its amplitude; mono goes to both channels at full level
+    // (the client has no pan law): sine rms = amp / sqrt 2.
+    m.play(VoiceDesc { gain: 0.5, looping: true, ..VoiceDesc::new(Source::Sample(sine(441.0, 1.0, 0.8, 22_050))) });
     let (l, r, peak) = render(&mut m, 0.5);
-    let want = 0.8 / 2f32.sqrt() * std::f32::consts::FRAC_1_SQRT_2;
-    near(l, want, 0.01);
-    near(r, want, 0.01);
-    near(peak, 0.8 * std::f32::consts::FRAC_1_SQRT_2, 0.02);
+    near(l, 0.4 / 2f32.sqrt(), 0.005);
+    near(r, l, 1e-6);
+    near(peak, 0.4, 0.01);
 }
 
 #[test]
-fn hard_pan_and_silence_after_end() {
+fn one_shot_ends_and_goes_silent() {
     let mut m = Mixer::new(RATE);
-    m.play(VoiceDesc { pan: -1.0, ..VoiceDesc::new(Source::Sample(sine(440.0, 0.1, 0.5, RATE))) });
-    let (l, r, _) = render(&mut m, 0.11);
-    assert!(l > 0.2 && r < 1e-3, "{l} {r}");
+    m.play(VoiceDesc::new(Source::Sample(sine(440.0, 0.1, 0.5, RATE))));
+    let (l, _, _) = render(&mut m, 0.11);
+    assert!(l > 0.2);
     assert_eq!(m.voice_count(), 0, "finished one-shot is removed");
-    let (l, r, p) = render(&mut m, 0.1);
-    assert_eq!((l, r, p), (0.0, 0.0, 0.0));
+    assert_eq!(render(&mut m, 0.1), (0.0, 0.0, 0.0));
 }
 
 #[test]
-fn emitter_distance_and_side() {
-    let fall = Falloff { min: 4.0, max: 100.0, rolloff: 1.0 };
+fn emitter_linear_falloff() {
+    let fall = Falloff { min: 4.0, max: 100.0 };
     let run = |pos: [f32; 3]| {
         let mut m = Mixer::new(RATE);
-        // listener at origin looking down -z, +x is to the right (right-handed scene space)
+        m.listener.pos = [1.0, 2.0, 3.0];
         m.play(VoiceDesc { looping: true, emitter: Some((pos, fall)), ..VoiceDesc::new(Source::Sample(sine(440.0, 1.0, 1.0, RATE))) });
-        render(&mut m, 0.5)
+        render(&mut m, 0.5).0
     };
-    let (near_l, near_r, _) = run([4.0, 0.0, 0.0]);
-    let (far_l, far_r, _) = run([8.0, 0.0, 0.0]);
-    assert!(near_r > 0.6 && near_l < 1e-3, "emitter on the right: {near_l} {near_r}");
-    near(far_r / near_r, 0.5, 0.01); // inverse distance beyond min
-    assert!(far_l < 1e-3);
-    let (l, r, _) = run([0.0, 0.0, -2.0]);
-    near(l, r, 1e-4);
-    near(l, 0.5, 0.01); // inside min distance: full volume x centre pan
-    let (l, r, _) = run([0.0, 0.0, -150.0]);
-    assert_eq!((l, r), (0.0, 0.0), "silent beyond max distance");
+    let full = 1.0 / 2f32.sqrt();
+    near(run([1.0, 2.0, 3.0]), full, 0.005); // on top of the listener
+    near(run([1.0, 2.0, 3.0 - 4.0]), full, 0.005); // exactly min distance
+    near(run([1.0, 2.0, 3.0 - 52.0]), full * 0.5, 0.005); // halfway between min and max
+    near(run([1.0 + 96.0, 2.0, 3.0]), full * 4.0 / 96.0, 0.001); // 96 m: (96 - 92) / 96
+    assert_eq!(run([1.0, 2.0, 3.0 - 101.0]), 0.0, "silent beyond max distance");
 }
 
 #[test]
 fn fades_and_voice_cap() {
     let mut m = Mixer::new(RATE);
-    let id = m.play(VoiceDesc { looping: true, pan: -1.0, ..VoiceDesc::new(Source::Sample(sine(440.0, 1.0, 1.0, RATE))) });
+    let id = m.play(VoiceDesc { looping: true, ..VoiceDesc::new(Source::Sample(sine(440.0, 1.0, 1.0, RATE))) });
     m.fade(id, 0.0, 0.25, true);
     let (l1, _, _) = render(&mut m, 0.125); // first half of the ramp: louder than the second
     let (l2, _, _) = render(&mut m, 0.125);
@@ -124,6 +119,6 @@ fn wav_decode_and_stream_voice() {
             break;
         }
     }
-    near(rms as f32, 0.5 / 2f32.sqrt() * std::f32::consts::FRAC_1_SQRT_2, 0.05);
+    near(rms as f32, 0.5 / 2f32.sqrt(), 0.02);
     std::fs::remove_dir_all(&dir).unwrap();
 }

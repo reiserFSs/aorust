@@ -10,6 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::decode::{self, Pcm};
+use crate::game::{Library, PlayfieldAudio, Runtime};
 use crate::mixer::{Falloff, Listener, Mixer, Source, Stats, VoiceDesc};
 
 /// State shared with the housekeeping thread.
@@ -96,9 +97,15 @@ impl Shared {
     }
 }
 
+fn seed() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64)
+}
+
 /// Owns the output stream. Not `Send` (cpal streams are not on every platform); keep it on the main thread.
 pub struct Audio {
     pub(crate) sh: Arc<Shared>,
+    /// Game rules (music, ambience, emitters); `None` when the client's sound data is not there (offline tests).
+    rt: Mutex<Option<Runtime>>,
     _stream: Option<cpal::Stream>,
     pub device: String,
 }
@@ -112,6 +119,7 @@ impl Audio {
         let cfg = dev.default_output_config().context("output config")?;
         let (rate, ch) = (cfg.sample_rate().0, cfg.channels() as usize);
         let sh = Shared::new(client_dir.join("cd_image/sound"), rate);
+        let rt = Runtime::new(&sh, Library::load(&sh.root).context("client sound data")?, seed());
         let m = sh.clone();
         let mut scratch: Vec<f32> = Vec::new();
         let err = |e| eprintln!("audio stream error: {e}");
@@ -133,12 +141,14 @@ impl Audio {
         }
         .context("build output stream")?;
         stream.play().context("start output stream")?;
-        Ok(Audio { sh, _stream: Some(stream), device: format!("{name} ({rate} Hz, {ch} ch)") })
+        Ok(Audio { sh, rt: Mutex::new(Some(rt)), _stream: Some(stream), device: format!("{name} ({rate} Hz, {ch} ch)") })
     }
 
     /// Device-less engine that mixes nowhere: drive it with [`Audio::render`] (tests, offline renders).
     pub fn offline(client_dir: &Path, rate: u32) -> Audio {
-        Audio { sh: Shared::new(client_dir.join("cd_image/sound"), rate), _stream: None, device: "offline".into() }
+        let sh = Shared::new(client_dir.join("cd_image/sound"), rate);
+        let rt = Library::load(&sh.root).ok().map(|l| Runtime::new(&sh, l, 1));
+        Audio { sh, rt: Mutex::new(rt), _stream: None, device: "offline".into() }
     }
 
     pub fn render(&self, out: &mut [f32]) {
@@ -163,13 +173,78 @@ impl Audio {
         )
     }
 
-    pub fn set_master_volume(&self, v: f32) {
-        self.sh.mixer().master = v;
+    fn rt(&self) -> MutexGuard<'_, Option<Runtime>> {
+        self.rt.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Listener = camera (scene space, right handed).
-    pub fn set_listener(&self, pos: [f32; 3], forward: [f32; 3], up: [f32; 3]) {
-        self.sh.mixer().listener = Listener { pos, forward, up };
+    /// `Total_FX` / `Total_Music` of the client (master x channel volume, 0..1; all default 1.0).
+    pub fn set_volumes(&self, fx: f32, music: f32) {
+        if let Some(rt) = self.rt().as_mut() {
+            rt.fx = fx;
+            rt.music.volume = music;
+        }
+    }
+
+    /// Enters playfield `pf` (`None` leaves it): district music, ambience and statel emitters follow [`Audio::update`].
+    pub fn set_playfield(&self, pf: Option<PlayfieldAudio>) {
+        if let Some(rt) = self.rt().as_mut() {
+            rt.set_playfield(&self.sh, pf);
+        }
+    }
+
+    /// Per frame: listener = camera position (scene space), `day_time` = the viewer clock (0..6480 s).
+    pub fn update(&self, dt: f32, cam: [f32; 3], day_time: f32) {
+        self.set_listener(cam);
+        if let Some(rt) = self.rt().as_mut() {
+            rt.update(&self.sh, dt, cam, day_time);
+        }
+    }
+
+    /// Music layer by name (`forest\day`); `None` fades the music out.
+    pub fn set_music_layer(&self, name: Option<&str>) -> bool {
+        let mut g = self.rt();
+        let Some(rt) = g.as_mut() else { return false };
+        let layer = match name {
+            Some(n) => match rt.lib.project.find_layer(n) {
+                Some(l) => Some(l),
+                None => return false,
+            },
+            None => None,
+        };
+        rt.music.signal(layer);
+        true
+    }
+
+    /// Login/startup music (`SandyInterface_t::PlayStartupMusic` = layer `mountain\night`).
+    pub fn play_startup_music(&self) {
+        self.set_music_layer(Some("mountain\\night"));
+    }
+
+    /// File name of the music sample that is playing (diagnostics).
+    pub fn now_playing(&self) -> Option<String> {
+        self.rt().as_ref().and_then(|r| r.music.now_playing.clone())
+    }
+
+    /// Plays a named sound definition of the client (`SM_Sandy_CC_GUI_Select`, ... in `SM_Sandy_Gui.sbf`;
+    /// `SM_Sandy_*` is prepended with `CC_`/`Gui_` when the exact name is unknown) non-positionally.
+    /// Returns the voice ids started.
+    pub fn play_ui(&self, name: &str) -> Vec<u64> {
+        let mut g = self.rt();
+        let Some(rt) = g.as_mut() else { return Vec::new() };
+        let db = rt.lib.sounds.clone();
+        let def = [name.to_string(), format!("SM_Sandy_CC_{name}"), format!("SM_Sandy_Gui_{name}")].iter().find_map(|n| db.by_name(n));
+        match def {
+            Some(d) => rt.play(&self.sh, d),
+            None => {
+                eprintln!("audio: unknown sound '{name}'");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Listener = camera position (scene space).
+    pub fn set_listener(&self, pos: [f32; 3]) {
+        self.sh.mixer().listener = Listener { pos };
     }
 
     /// Plays a file below `cd_image/sound` (e.g. `sfx/gui/click`) once, centred. Returns the voice id (0 = not played).

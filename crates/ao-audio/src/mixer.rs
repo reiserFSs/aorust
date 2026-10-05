@@ -1,4 +1,6 @@
-//! Device independent software mixer: sample/stream voices, per-voice volume/pan, 3D emitters, fades.
+//! Device independent software mixer: sample/stream voices, per-voice volume, positional emitters, fades.
+//! Faithful to the client's SandyInterface (docs/formats.md `## audio`): no panning (the level goes to both
+//! channels), attenuation by distance to the listener *position* only, linear between min and max distance.
 //! [`Mixer::render`] fills an interleaved stereo buffer; the cpal callback and the offline tests both call it.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -8,59 +10,36 @@ use crate::decode::Pcm;
 
 pub const MAX_VOICES: usize = 64;
 
-/// Distance model of one 3D voice (Miles `AIL_set_sample_3D_distances(max, min)` + rolloff factor).
+/// Distance model of a positional voice (`SandyInterface_t::PlaySample` @0x10002d98): silent beyond `max`, linear
+/// 1 -> 0 between `min` and `max`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Falloff {
     pub min: f32,
     pub max: f32,
-    pub rolloff: f32,
 }
 
 impl Falloff {
-    /// Miles' inverse-distance law: full volume inside `min`, `(min / d)^rolloff` beyond it, silent at `max`.
     pub fn gain(&self, d: f32) -> f32 {
-        if d >= self.max {
+        if d > self.max {
             0.0
-        } else if d <= self.min {
-            1.0
+        } else if d > self.min {
+            ((self.max - self.min) - (d - self.min)) / (self.max - self.min)
         } else {
-            (self.min / d).powf(self.rolloff)
+            1.0
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// The camera position (the client ignores the listener orientation).
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Listener {
     pub pos: [f32; 3],
-    pub forward: [f32; 3],
-    pub up: [f32; 3],
-}
-
-impl Default for Listener {
-    fn default() -> Self {
-        Listener { pos: [0.0; 3], forward: [0.0, 0.0, -1.0], up: [0.0, 1.0, 0.0] }
-    }
-}
-
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
 impl Listener {
-    /// (distance, pan -1..1) of a point; scene space is right handed (right = forward x up).
-    fn locate(&self, p: [f32; 3]) -> (f32, f32) {
-        let d = sub(p, self.pos);
-        let dist = dot(d, d).sqrt();
-        let r = cross(self.forward, self.up);
-        let rl = dot(r, r).sqrt().max(1e-6);
-        let pan = if dist > 1e-4 { (dot(d, r) / rl / dist).clamp(-1.0, 1.0) } else { 0.0 };
-        (dist, pan)
+    fn dist(&self, p: [f32; 3]) -> f32 {
+        let d = [p[0] - self.pos[0], p[1] - self.pos[1], p[2] - self.pos[2]];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
     }
 }
 
@@ -71,23 +50,16 @@ pub enum Source {
     Stream { rx: Receiver<Vec<f32>>, rate: u32, channels: u16 },
 }
 
-enum Spatial {
-    /// Plain stereo/pan voice.
-    Flat { pan: f32 },
-    Emitter { pos: [f32; 3], falloff: Falloff },
-}
-
 pub struct VoiceDesc {
     pub source: Source,
     pub gain: f32,
     pub looping: bool,
-    pub pan: f32,
     pub emitter: Option<([f32; 3], Falloff)>,
 }
 
 impl VoiceDesc {
     pub fn new(source: Source) -> Self {
-        VoiceDesc { source, gain: 1.0, looping: false, pan: 0.0, emitter: None }
+        VoiceDesc { source, gain: 1.0, looping: false, emitter: None }
     }
 }
 
@@ -100,12 +72,12 @@ struct Voice {
     done: bool,
     gain: f32,
     looping: bool,
-    spatial: Spatial,
+    emitter: Option<([f32; 3], Falloff)>,
     fade: f32,
     fade_target: f32,
     fade_step: f32,
     stop_at_fade_end: bool,
-    last: (f32, f32),
+    last: f32,
 }
 
 #[derive(Default)]
@@ -152,11 +124,7 @@ impl Mixer {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let spatial = match d.emitter {
-            Some((pos, falloff)) => Spatial::Emitter { pos, falloff },
-            None => Spatial::Flat { pan: d.pan },
-        };
-        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, spatial, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: (f32::NAN, 0.0) });
+        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, emitter: d.emitter, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: f32::NAN });
         id
     }
 
@@ -200,17 +168,8 @@ impl Mixer {
         let ratio_out = self.rate as f64;
         let l = self.listener;
         for v in &mut self.voices {
-            let (sg_l, sg_r) = match v.spatial {
-                Spatial::Flat { pan } => pan_gains(pan),
-                Spatial::Emitter { pos, falloff } => {
-                    let (d, pan) = l.locate(pos);
-                    let (a, b) = pan_gains(pan);
-                    let g = falloff.gain(d);
-                    (a * g, b * g)
-                }
-            };
-            let (l0, r0) = if v.last.0.is_nan() { (sg_l * v.gain, sg_r * v.gain) } else { v.last };
-            let (l1, r1) = (sg_l * v.gain, sg_r * v.gain);
+            let g1 = v.emitter.map_or(1.0, |(pos, f)| f.gain(l.dist(pos))) * v.gain;
+            let g0 = if v.last.is_nan() { g1 } else { v.last };
             let (rate, ch) = match &v.src {
                 Source::Sample(p) => (p.rate, p.channels as usize),
                 Source::Stream { rate, channels, .. } => (*rate, *channels as usize),
@@ -221,7 +180,7 @@ impl Mixer {
                     break;
                 }
                 let t = i as f32 / n as f32;
-                let (gl, gr) = (l0 + (l1 - l0) * t, r0 + (r1 - r0) * t);
+                let g = (g0 + (g1 - g0) * t) * v.fade;
                 if v.fade != v.fade_target {
                     v.fade += v.fade_step;
                     if (v.fade_step >= 0.0 && v.fade >= v.fade_target) || (v.fade_step < 0.0 && v.fade <= v.fade_target) {
@@ -235,11 +194,11 @@ impl Mixer {
                     Some(s) => s,
                     None => break,
                 };
-                out[2 * i] += sl * gl * v.fade;
-                out[2 * i + 1] += sr * gr * v.fade;
+                out[2 * i] += sl * g;
+                out[2 * i + 1] += sr * g;
                 v.pos += step;
             }
-            v.last = (l1, r1);
+            v.last = g1;
         }
         self.voices.retain(|v| !v.done);
         let (mut sq, mut peak) = (0f64, 0f32);
@@ -255,12 +214,6 @@ impl Mixer {
         self.stats.rms_bits.store(rms.to_bits(), Relaxed);
         self.stats.peak_bits.fetch_max(peak.to_bits(), Relaxed); // non-negative floats order like their bits
     }
-}
-
-/// Constant power pan, `pan` -1 (left) .. 1 (right); returns (left, right) gains (centre = 0.707 each).
-fn pan_gains(pan: f32) -> (f32, f32) {
-    let a = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-    (a.cos(), a.sin())
 }
 
 /// One linearly interpolated source frame at `v.pos`, folded to mono-for-pan (stereo sources keep their channels).
