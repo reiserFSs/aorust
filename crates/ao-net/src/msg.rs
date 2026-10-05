@@ -385,7 +385,9 @@ impl Message {
                     characters,
                     allowed_characters: r.i32()?,
                     expansions: r.i32()?,
-                    sl_profs_enabled: r.i32()?,
+                    // Live PRK sends only two trailing ints (docs/protocol.md §8): the client's third read hits
+                    // end of stream and leaves its zero-initialised value.
+                    sl_profs_enabled: if r.remaining() >= 4 { r.i32()? } else { 0 },
                 })
             }
             SELECT_CHARACTER => Message::SelectCharacter { char_id: r.i32()? },
@@ -531,6 +533,19 @@ mod tests {
         rt(Message::CharacterCreated { char_id: 5 });
         rt(Message::NameInUse(30));
         rt(Message::RequestRejected(9));
+    }
+
+    /// Real PRK (Ithaca, 2026-10) CharacterList frame: one character, only two trailing ints (no slProfs).
+    #[test]
+    fn live_character_list() {
+        let b: Vec<u8> = (0..HEX.len() / 2).map(|i| u8::from_str_radix(&HEX[2 * i..2 * i + 2], 16).unwrap()).collect();
+        const HEX: &str = "0002000100010092000000010000615b0000000e000000010000000400006584610000c79d000011e60000000100000000000000000000000000000001000000050000658400000000000000055465737479000000010000000300000001000000010000000c6172656120756e6b6e6f776e000000000000000000000000000000000000000000000001000000320000001b0000";
+        let (f, used) = Frame::decode(&b).unwrap().unwrap();
+        assert_eq!(used, b.len());
+        let Message::CharacterList(l) = Message::from_frame(&f).unwrap() else { panic!() };
+        assert_eq!((l.allowed_characters, l.expansions, l.sl_profs_enabled), (50, 27, 0));
+        let c = &l.characters[0];
+        assert_eq!((c.info.name.as_str(), c.id, c.status, c.created), ("Testy", 0x6584, 1, true));
     }
 
     // Hand-derived from AuthClient / InitAuth: 'name[40] | i32 len+1 | bytes | NUL'.

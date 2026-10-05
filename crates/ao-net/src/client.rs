@@ -314,8 +314,9 @@ fn run(
                         Err(_) => thread::sleep(TICK), // peer closed: the original still redirects
                     }
                 }
+                let tap = conn.tap.take();
                 drop(conn);
-                return zone(z, cmds, ev).map(|()| false);
+                return zone(z, tap, cmds, ev).map(|()| false);
             }
             Ok(m) => send(LoginEvent::Status(format!("login server: {m:?}"))),
             Err(_) => send(LoginEvent::Status(format!(
@@ -329,7 +330,7 @@ fn run(
 }
 
 /// Zone phase: connect (3 tries, 1 s / 2 s backoff), send `ZoneLogin`, answer pings, report the first frames.
-fn zone(z: crate::msg::ZoneInfo, cmds: &Receiver<Cmd>, ev: &Sender<LoginEvent>) -> Result<()> {
+fn zone(z: crate::msg::ZoneInfo, tap: Option<Tap>, cmds: &Receiver<Cmd>, ev: &Sender<LoginEvent>) -> Result<()> {
     let addr = SocketAddr::from((z.ip, z.port));
     let mut delay = Duration::from_secs(1);
     let mut conn = loop {
@@ -342,6 +343,7 @@ fn zone(z: crate::msg::ZoneInfo, cmds: &Receiver<Cmd>, ev: &Sender<LoginEvent>) 
             }
         }
     };
+    conn.tap = tap;
     let id = z.char_id as u32;
     conn.send_message(&Message::ZoneLogin { char_id: z.char_id, cookie1: z.cookie1, cookie2: z.cookie2 })?;
     let _ = ev.send(LoginEvent::Status("zone login sent".into()));

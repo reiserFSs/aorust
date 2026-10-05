@@ -1,7 +1,7 @@
 //! Blocking framed TCP connection: sequence numbers, buffering, receive validation.
 
 use crate::frame::{Frame, RecvSeq, PT_SYSTEM};
-use crate::msg::{Message, USER_CREDENTIALS};
+use crate::msg::{Message, USER_CREDENTIALS, ZONE_INFO, ZONE_LOGIN};
 use anyhow::{anyhow, bail, Result};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -36,7 +36,7 @@ impl Conn {
         f.seq = self.tx_seq;
         let bytes = f.encode()?;
         if let Some(tap) = &mut self.tap {
-            let shown = redact(&f).and_then(|r| r.encode().ok()).unwrap_or_else(|| bytes.clone());
+            let shown = redact(&f, true).and_then(|r| r.encode().ok()).unwrap_or_else(|| bytes.clone());
             tap(true, &shown);
         }
         self.stream.write_all(&bytes)?;
@@ -53,7 +53,8 @@ impl Conn {
         loop {
             if let Some((f, used)) = Frame::decode(&self.rx)? {
                 if let Some(tap) = &mut self.tap {
-                    tap(false, &self.rx[..used]);
+                    let shown = redact(&f, false).and_then(|r| r.encode().ok());
+                    tap(false, shown.as_deref().unwrap_or(&self.rx[..used]));
                 }
                 self.rx.drain(..used);
                 if !self.rx_seq.accept(f.ptype, f.seq) {
@@ -80,12 +81,20 @@ impl Conn {
     }
 }
 
-/// Copy of a UserCredentials frame with the response replaced by `*` (same length).
-fn redact(f: &Frame) -> Option<Frame> {
-    if f.ptype != PT_SYSTEM || f.payload.len() < 4 + 44 || f.payload[..4] != USER_CREDENTIALS.to_be_bytes() {
+/// Copy of a frame with secrets replaced by `*` (same length): the UserCredentials response, the ZoneInfo
+/// cookies (received) and the ZoneLogin cookies (sent).
+fn redact(f: &Frame, sent: bool) -> Option<Frame> {
+    if f.ptype != PT_SYSTEM || f.payload.len() < 4 {
         return None;
     }
+    let id = u32::from_be_bytes(f.payload[..4].try_into().ok()?);
+    let range = match (sent, id) {
+        (true, USER_CREDENTIALS) if f.payload.len() >= 4 + 44 => 48..f.payload.len(),
+        (true, ZONE_LOGIN) if f.payload.len() >= 16 => 8..16,
+        (false, ZONE_INFO) if f.payload.len() >= 22 => 14..22,
+        _ => return None,
+    };
     let mut r = f.clone();
-    r.payload[48..].fill(b'*');
+    r.payload[range].fill(b'*');
     Some(r)
 }

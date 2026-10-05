@@ -21,8 +21,13 @@ use std::io::{BufRead, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+fn ms() -> u128 {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+
 fn hexdump(sent: bool, b: &[u8]) -> String {
-    let mut s = format!("{} {} bytes\n", if sent { ">>>" } else { "<<<" }, b.len());
+    let mut s = format!("{} {} bytes +{}ms\n", if sent { ">>>" } else { "<<<" }, b.len(), ms());
     for (i, c) in b.chunks(16).enumerate() {
         let hex: Vec<String> = c.iter().map(|x| format!("{x:02x}")).collect();
         let asc: String = c.iter().map(|&x| if (0x20..0x7f).contains(&x) { x as char } else { '.' }).collect();
@@ -33,11 +38,12 @@ fn hexdump(sent: bool, b: &[u8]) -> String {
 
 fn tap(out: Option<String>) -> ao_net::conn::Tap {
     Box::new(move |sent, b| {
-        let d = hexdump(sent, b);
-        print!("{d}");
+        print!("{}", hexdump(sent, b));
         if let Some(p) = &out {
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p).unwrap();
-            let _ = f.write_all(d.as_bytes());
+            // one record per frame: `<ms> <> or <> <hex>` (redacted bytes), for fixtures / decoders
+            let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+            let _ = writeln!(f, "{} {} {hex}", ms(), if sent { ">" } else { "<" });
         }
     })
 }
