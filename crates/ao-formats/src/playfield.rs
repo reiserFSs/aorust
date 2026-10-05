@@ -221,4 +221,29 @@ mod tests {
         let v = [-m[2][0], -m[2][1], -m[2][2]];
         assert!((v[0] - 1.0).abs() < 1e-5 && v[2].abs() < 1e-5);
     }
+
+    /// Statels sit on the terrain: the median gap between a placed object's origin and the heightfield is small,
+    /// also for the 22 maps with 16 bit height samples (556 Coast of Peace, 656, 4380 ...).
+    #[test]
+    fn statels_sit_on_the_terrain() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        let Ok(store) = RecordStore::open(&dir) else { return };
+        for id in [566u32, 600, 505, 556, 656, 4894, 6012, 6022] {
+            let Ok(Some(raw)) = store.get(RECORD, id) else { continue };
+            let rec = record::parse(&raw).unwrap();
+            let tm = ground::parse(&store.get(TILEMAP, rec.tilemap).unwrap().unwrap()).unwrap();
+            let scene = load_playfield(&store, &dir, id).unwrap();
+            let mut gaps: Vec<f32> = scene.instances.iter().filter_map(|i| {
+                let t = i.transform[3];
+                (t[0] != 0.0 || t[2] != 0.0).then(|| terrain_height(&tm, t[0], t[2]).map(|h| (t[1] - h).abs())).flatten()
+            }).collect();
+            if gaps.len() < 50 {
+                continue;
+            }
+            gaps.sort_by(f32::total_cmp);
+            let median = gaps[gaps.len() / 2];
+            assert!(median < 3.0, "playfield {id}: median statel-terrain gap {median} m over {} statels", gaps.len());
+        }
+    }
 }

@@ -144,6 +144,7 @@ pub fn parse(d: &[u8]) -> Result<Tilemap> {
     let small = chunks(get("heightmap_small_data")?)?;
     let tm = chunks(get("tilemap_compressed_data")?)?;
     ensure!(hm.len() == px * pz && small.len() == hm.len() && tm.len() == hm.len(), "patch count mismatch");
+    let mut wide = false;
     let mut heights = vec![0u16; vx * vz];
     let mut tiles = vec![0u16; (vx - 1) * (vz - 1)];
     let s = m + 1;
@@ -158,6 +159,7 @@ pub fn parse(d: &[u8]) -> Result<Tilemap> {
                 }
             }
             8 => {
+                wide = true;
                 let raw = inflate(h, 2 * s * s)?;
                 for (o, c) in a.iter_mut().zip(raw.chunks_exact(2)) {
                     *o = u16::from_le_bytes([c[0], c[1]]);
@@ -203,6 +205,9 @@ pub fn parse(d: &[u8]) -> Result<Tilemap> {
     // RDBTilemap: the tile index mask is 0x3fff when `tile_type_data` exists, 0xff otherwise
     // (DisplaySystem.dll @ 0x10036f17 sets AnarchyGroundData+0x60).
     let tile_mask = if members.iter().any(|m| m.0 == "tile_type_data" && m.1.len() > 4) { 0x3fff } else { 0xff };
+    // metres = sample * scale for both widths: 8 bit samples are stored `<< 8` (so `/ 256` in `height`); 16 bit maps (22 records:
+    // 556, 656, 4364, 4380-4388, 4894, 6001, 6012, 6022 ...) carry scales of 0.2..0.5 / 256 (= 0.00078..0.002) for the raw sample
+    let height_scale = if wide { height_scale * 256.0 } else { height_scale };
     Ok(Tilemap { cells_x: cells_x.min(vx - 1), cells_z: cells_z.min(vz - 1), cell_size, height_scale, tile_texture, tile_mask, verts_x: vx, verts_z: vz, heights, tiles })
 }
 
