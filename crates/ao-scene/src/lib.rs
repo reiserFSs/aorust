@@ -206,6 +206,28 @@ impl Default for Lens {
     }
 }
 
+/// A dynamic character-like object (players, NPCs, corpses, weapons in hand) drawn on top of the world by the renderer.
+///
+/// The renderer keeps one vertex buffer per (actor, model mesh) and the model's index buffers/materials/textures once per
+/// `model` key (`Renderer::add_actor_model`). Per frame the app submits the full list of actors to draw
+/// (`Host::actors`); an actor that is not submitted any more is forgotten.
+#[derive(Clone, Debug)]
+pub struct ActorFrame {
+    /// Stable id (dynel instance id); selects the actor's GPU vertex buffers.
+    pub id: u32,
+    /// Key given to `Renderer::add_actor_model`.
+    pub model: u64,
+    /// Actor to world transform (position, heading, scale).
+    pub transform: [[f32; 4]; 4],
+    /// Per model mesh: transform relative to `transform` (rigid mounts: head, weapons); missing entries = identity.
+    pub parts: Vec<[[f32; 4]; 4]>,
+    /// New vertices of model mesh 0 (the skinned body pose); `None` keeps the last ones (the bind-pose vertices of the model
+    /// at first sight).
+    pub skin: Option<Vec<Vertex>>,
+    /// Skip frustum culling (the own avatar).
+    pub always: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
     pub textures: HashMap<TextureKey, Texture>,

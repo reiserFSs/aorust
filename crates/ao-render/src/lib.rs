@@ -1,5 +1,6 @@
 //! wgpu renderer for `ao_scene::Scene`: windowed free-fly viewer (`viewer`) and offscreen PNG path.
 
+mod actors;
 mod gui;
 mod viewer;
 
@@ -383,6 +384,8 @@ pub struct Renderer {
     vis_src: Vec<u32>,
     vis_range: Vec<std::ops::Range<u32>>,
     sorted: Vec<(f32, u32, u32)>, // (distance, blended draw, visible instance)
+    /// Dynamic actors drawn after the world, see `actors.rs`.
+    act: actors::ActorLayer,
 }
 
 fn default_environment(radius: f32) -> Environment {
@@ -584,6 +587,7 @@ impl Renderer {
             vis_src: vec![],
             vis_range: vec![],
             sorted: vec![],
+            act: Default::default(),
         };
         r.upload(&Scene::default());
         Ok(r)
@@ -1041,6 +1045,7 @@ impl Renderer {
             self.vis_range.push(start..self.vis.len() as u32);
         }
         self.frame = (self.frame + 1) % INST_RING;
+        self.prepare_actors(cam.pos, &planes);
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         if let Some(buf) = inst_buf {
             if !self.vis.is_empty() {
@@ -1159,6 +1164,7 @@ impl Renderer {
                     draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1, false);
                 }
             }
+            calls += self.draw_actors(&mut pass);
         }
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls };
         self.queue.submit([enc.finish()]);

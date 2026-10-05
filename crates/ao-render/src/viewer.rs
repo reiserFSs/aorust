@@ -25,12 +25,29 @@ pub struct Host {
     pub lens: Option<ao_scene::Lens>,
     /// Frontend request: capture the cursor and deliver [`GameInput::MouseMotion`] (mouse-look); applied after each frame/input.
     pub look: bool,
+    /// Actor models to upload before the next frame (`key`, model scene), see [`Renderer::add_actor_model`]; drained by the viewer.
+    pub actor_models: Vec<(u64, Scene)>,
+    /// The actors to draw this frame ([`ao_scene::ActorFrame`]); push every frame, the viewer drains it. Actors that are not pushed are forgotten.
+    pub actors: Vec<ao_scene::ActorFrame>,
+    /// Forget all actor models and actors before applying `actor_models` (a new zone).
+    pub clear_actors: bool,
 }
 
 impl Host {
+    /// Hands the queued actor models and the frame's actors to the renderer.
+    fn apply_actors(&mut self, r: &mut Renderer) {
+        if std::mem::take(&mut self.clear_actors) {
+            r.clear_actors();
+        }
+        for (key, scene) in self.actor_models.drain(..) {
+            r.add_actor_model(key, &scene);
+        }
+        r.set_actors(std::mem::take(&mut self.actors));
+    }
+
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, look: false }
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -328,6 +345,7 @@ impl State {
         if let Some(lens) = g.host.lens.take() {
             self.renderer.set_lens(lens);
         }
+        g.host.apply_actors(&mut self.renderer);
         (Some(list), g.host.quit)
     }
 
@@ -550,6 +568,7 @@ impl Offscreen {
         if let Some(lens) = self.host.lens.take() {
             self.r.set_lens(lens);
         }
+        self.host.apply_actors(&mut self.r);
         list
     }
 
