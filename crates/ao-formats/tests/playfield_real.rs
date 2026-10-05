@@ -1,6 +1,6 @@
 //! Loads real playfields when the game client is installed; skips cleanly otherwise.
 
-use ao_formats::playfield::{list_playfields, load_playfield_report};
+use ao_formats::playfield::{floor_below, list_playfields, load_playfield_report, scene_bounds};
 use ao_rdb::RecordStore;
 
 fn setup() -> Option<(RecordStore, std::path::PathBuf)> {
@@ -41,4 +41,19 @@ fn dungeon_places_room_props() {
     let (scene, r) = load_playfield_report(&store, &dir, 127).unwrap();
     assert!(r.statels > 500 && r.failed_meshes == 0);
     assert!(!scene.instances.is_empty() && scene.spawn.is_some());
+}
+
+/// Default camera: inside the scene bounds, 0.5..30 m above terrain / room floor, looking somewhere else.
+#[test]
+fn spawn_points_are_inside_and_above_the_floor() {
+    let Some((store, dir)) = setup() else { return };
+    for id in [566, 705, 505, 127, 386, 152, 4327, 331] {
+        let (scene, _) = load_playfield_report(&store, &dir, id).unwrap();
+        let (s, at) = (scene.spawn.expect("spawn"), scene.spawn_look_at.expect("look-at"));
+        let (lo, hi) = scene_bounds(&scene).unwrap();
+        assert!((0..3).all(|i| s[i] >= lo[i] && s[i] <= hi[i] + if i == 1 { 50.0 } else { 0.0 }), "{id}: spawn {s:?} outside {lo:?}..{hi:?}");
+        let floor = floor_below(&scene, s).unwrap_or_else(|| panic!("{id}: no floor below {s:?}"));
+        assert!((0.5..30.0).contains(&(s[1] - floor)), "{id}: {} m above the floor", s[1] - floor);
+        assert!((at[0] - s[0]).hypot(at[2] - s[2]) > 1.0, "{id}: look-at above/below spawn");
+    }
 }
