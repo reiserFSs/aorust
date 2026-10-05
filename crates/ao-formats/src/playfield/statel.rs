@@ -141,21 +141,27 @@ pub fn parse(d: &[u8], count: usize, preferred: Layout) -> Result<StatelFile> {
     }
 }
 
-/// 3x3 rotation (row-major, column-vector convention, AO's left-handed space, right-hand-rule
-/// numerics) and per-axis scale of a statel (`FUN_1002777a`). `R = Rz(roll) Rx(pitch) Ry(heading)`.
-pub fn orientation(flags: u32, scale: u8) -> ([[f32; 3]; 3], [f32; 3]) {
+/// Linear part (3x3, row-major, column-vector convention, AO's left-handed space, right-hand-rule
+/// numerics) of a statel transform (`FUN_1002777a`): `R * S` with `R = Rz(roll) Rx(pitch) Ry(heading)`.
+///
+/// `flags & 1 == 0`: uniform scale `scale/100 + 0.1`. `flags & 1`: heading in 1/630 turns, stretch
+/// `k` and a shear `t` (`FUN_10026cdc(1, 1/k, 1/k)` then `FUN_10026d5c(t, 0)` build the anim matrix
+/// `[[1, t, 0], [0, 1/k, 0], [0, 0, 1/k]]` in row-vector form, applied before the uniform scale
+/// `s*k` and the rotation): `x' = s*k*x`, `y' = s*(k*t*x + y)`, `z' = s*z`.
+pub fn orientation(flags: u32, scale: u8) -> [[f32; 3]; 3] {
     let u = flags >> 7;
     let s = scale as f32 / 100.0 + 0.1;
     let deg = std::f32::consts::PI / 180.0;
     if flags & 1 == 0 {
         let (nine, rem) = if u < 0x163f500 { (u / 180, u % 180) } else { (u.wrapping_add(0xfe9c0b00), 180) };
         let r = mul(rz((nine / 360) as f32 * deg), mul(rx((rem as f32 - 90.0) * deg), ry((nine % 360) as f32 * deg)));
-        (r, [s; 3])
+        mul(r, [[s, 0.0, 0.0], [0.0, s, 0.0], [0.0, 0.0, s]])
     } else {
-        // Heading in 1/630 turns plus a stretch factor; the trailing translation term of the
-        // original (`FUN_10026d5c`) is not applied.
-        let k = ((u / 630) % 0xd3) as f32 / 100.0 + 0.5;
-        (ry((u % 630) as f32 * std::f32::consts::TAU / 630.0), [s * k, s, s])
+        let q = u / 630;
+        let k = (q % 211) as f32 / 100.0 + 0.5;
+        let t = (q / 211) as f32 / 100.0 - 1.25;
+        let r = ry((u % 630) as f32 * std::f32::consts::TAU / 630.0);
+        mul(r, [[s * k, 0.0, 0.0], [s * k * t, s, 0.0], [0.0, 0.0, s]])
     }
 }
 
@@ -224,11 +230,23 @@ mod tests {
     #[test]
     fn identity_and_heading() {
         // flags 0x2d00: u = 90 -> heading 0, pitch 0, roll 0; scale byte 90 -> 1.0
-        let (r, s) = orientation(0x2d00, 90);
+        let r = orientation(0x2d00, 90);
         assert_eq!(r, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
-        assert!((s[0] - 1.0).abs() < 1e-6);
         // heading 90: u = 90 + 180*90
-        let (r, _) = orientation((90 + 180 * 90) << 7, 90);
+        let r = orientation((90 + 180 * 90) << 7, 90);
         assert!((r[0][2] - 1.0).abs() < 1e-5 && r[0][0].abs() < 1e-5); // x' = z
+    }
+
+    #[test]
+    fn stretch_shear_form() {
+        // flags & 1: u = 630*(k100 + 211*t100) + heading; heading 0, k = 1.0 (k100 = 50), t = 0.5 (t100 = 175)
+        let u = 630 * (50 + 211 * 175);
+        let m = orientation((u << 7) | 1, 90);
+        let (k, t) = (1.0f32, 0.5f32);
+        assert!((m[0][0] - k).abs() < 1e-5 && (m[1][0] - k * t).abs() < 1e-5);
+        assert!((m[1][1] - 1.0).abs() < 1e-5 && (m[2][2] - 1.0).abs() < 1e-5 && m[0][1].abs() < 1e-6);
+        // heading 90 degrees (630/4 is not integral: use 315 = half turn): x -> -x, z -> -z, shear follows
+        let m = orientation(((u + 315) << 7) | 1, 90);
+        assert!((m[0][0] + k).abs() < 1e-4 && (m[1][0] - k * t).abs() < 1e-4 && (m[2][2] + 1.0).abs() < 1e-4);
     }
 }

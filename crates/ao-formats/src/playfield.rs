@@ -130,7 +130,7 @@ impl Placer<'_> {
             self.report.missing_meshes += 1;
             return;
         };
-        let (mut r, sc) = statel::orientation(s.flags, s.scale);
+        let mut r = statel::orientation(s.flags, s.scale);
         let mut p = s.pos;
         if let Some(room) = room {
             let q = statel::ry(room.rot as f32 * std::f32::consts::FRAC_PI_2);
@@ -141,17 +141,17 @@ impl Placer<'_> {
                 q[2][0] * p[0] + q[2][1] * p[1] + q[2][2] * p[2] + room.pos[2],
             ];
         }
-        self.scene.instances.push(Instance { mesh, transform: to_scene(&r, sc, p) });
+        self.scene.instances.push(Instance { mesh, transform: to_scene(&r, p) });
     }
 }
 
-/// AO (left-handed) `T * R * S` -> scene (z negated) column-major matrix: `F M F`, `F = diag(1,1,-1)`.
-fn to_scene(r: &[[f32; 3]; 3], s: [f32; 3], p: [f32; 3]) -> [[f32; 4]; 4] {
+/// AO (left-handed) `T * L` (`L` = linear part) -> scene (z negated) column-major matrix: `F M F`, `F = diag(1,1,-1)`.
+fn to_scene(r: &[[f32; 3]; 3], p: [f32; 3]) -> [[f32; 4]; 4] {
     let f = [1.0, 1.0, -1.0];
     let mut m = IDENTITY;
     for (j, col) in m.iter_mut().take(3).enumerate() {
         for (i, v) in col.iter_mut().take(3).enumerate() {
-            *v = r[i][j] * f[i] * f[j] * s[j];
+            *v = r[i][j] * f[i] * f[j];
         }
     }
     m[3] = [p[0], p[1], -p[2], 1.0];
@@ -227,13 +227,13 @@ mod tests {
     #[test]
     fn scene_transform_flips_z() {
         // heading 0, unit scale at AO (1, 2, 3) -> scene (1, 2, -3), identity rotation
-        let (r, s) = statel::orientation(0x2d00, 90);
-        let m = to_scene(&r, s, [1.0, 2.0, 3.0]);
+        let r = statel::orientation(0x2d00, 90);
+        let m = to_scene(&r, [1.0, 2.0, 3.0]);
         assert_eq!(m[3], [1.0, 2.0, -3.0, 1.0]);
         assert_eq!((m[0][0], m[1][1], m[2][2]), (1.0, 1.0, 1.0));
         // a +90 degree AO heading maps AO +z to AO +x; in scene space that is -z -> +x
-        let (r, s) = statel::orientation((90 + 180 * 90) << 7, 90);
-        let m = to_scene(&r, s, [0.0; 3]);
+        let r = statel::orientation((90 + 180 * 90) << 7, 90);
+        let m = to_scene(&r, [0.0; 3]);
         // image of scene -z axis (column 2 negated)
         let v = [-m[2][0], -m[2][1], -m[2][2]];
         assert!((v[0] - 1.0).abs() < 1e-5 && v[2].abs() < 1e-5);
