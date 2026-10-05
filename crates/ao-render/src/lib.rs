@@ -103,6 +103,7 @@ struct Globals {
     fog: [f32; 4],
     grid: [f32; 4],
     dims: [i32; 4],
+    wave: [[f32; 4]; 4],
 }
 
 /// One submesh draw. `pipe` = `blend as usize * 2 + two_sided as usize`; sky draws use `SKY_PIPE + blend`.
@@ -124,6 +125,7 @@ const MAX_CELLS: usize = 1 << 20;
 
 /// Static light grid: dense 3D cells, each listing up to `CELL_LIGHTS` lights whose sphere touches it.
 struct LightGrid {
+    zones: Vec<Option<u32>>, // statel zone per light (`Light::zone`), same order as `lights`
     lights: Vec<[f32; 4]>, // 4 per light: (pos, range), (colour, cos(phi/2) | 2 = no cone), (atten0..2, cos(theta/2)), (axis, 0)
     cells: Vec<[u32; 2]>,  // (first index, count)
     idx: Vec<u32>,
@@ -136,7 +138,7 @@ impl LightGrid {
     fn new(lights: &[ao_scene::Light]) -> Self {
         let lights: Vec<_> = lights.iter().filter(|l| l.range > 0.0 && l.pos.iter().all(|v| v.is_finite())).collect();
         if lights.is_empty() {
-            return Self { lights: vec![[0.0; 4]; 4], cells: vec![[0, 0]], idx: vec![0], origin: Vec3::ZERO, cell: 1.0, dims: [0; 3] };
+            return Self { zones: vec![], lights: vec![[0.0; 4]; 4], cells: vec![[0, 0]], idx: vec![0], origin: Vec3::ZERO, cell: 1.0, dims: [0; 3] };
         }
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for l in &lights {
@@ -201,7 +203,7 @@ impl LightGrid {
                 [[l.pos[0], l.pos[1], l.pos[2], l.range], [l.color[0], l.color[1], l.color[2], cos_phi], [a[0], a[1], a[2], cos_theta], [axis[0], axis[1], axis[2], 0.0]]
             })
             .collect();
-        Self { lights: gl, cells, idx, origin: lo, cell, dims }
+        Self { zones: lights.iter().map(|l| l.zone).collect(), lights: gl, cells, idx, origin: lo, cell, dims }
     }
 }
 
@@ -212,6 +214,15 @@ struct Inst {
     m: [[f32; 4]; 4],
     center: Vec3,
     radius: f32,
+}
+
+/// A traffic ship with its GPU instance slot and accumulators.
+struct MoverRun {
+    mover: ao_scene::Mover,
+    state: ao_scene::MoverState,
+    slot: usize,
+    /// Centre of the mesh's bounding sphere in object space.
+    local_center: Vec3,
 }
 
 /// `Scene::statel_lod` plus the GPU instance slot of every scene instance and the last zone levels.
@@ -244,19 +255,8 @@ struct SkyGpu {
     draws: Vec<(Draw, u32)>, // (draw, index into `xf`) in scene order
     xf: Vec<Mat4>,
     spin: Vec<Option<ao_scene::SkySpin>>, // per `xf` entry
+    wave: Vec<ao_scene::SkyWaveSpin>, // rotations driven by `GameWaveCurve*`
     bufs: Vec<wgpu::Buffer>, // ring of per-frame instance transforms (translation = camera)
-}
-
-/// Material uniform of a submesh (see `shader.wgsl` `Mat`).
-fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 12] {
-    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], s.sky_fog as u32 as f32, 0.0]
-}
-
-/// Last-frame counters (after frustum culling).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameStats {
-    pub instances: usize,
-    pub draw_calls: usize,
     colors: Vec<ColorAnim>,
 }
 
@@ -266,6 +266,19 @@ struct ColorAnim {
     sim: ao_scene::aurora::GloomySky,
     gain: f32,
     vertices: Vec<ao_scene::Vertex>,
+}
+
+/// Material uniform of a submesh (see `shader.wgsl` `Mat`).
+fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 16] {
+    let [wu, au, wv, av] = s.uv_wave;
+    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], s.sky_fog as u32 as f32, s.sun_flicker as u32 as f32, wu, au, wv, av]
+}
+
+/// Last-frame counters (after frustum culling).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameStats {
+    pub instances: usize,
+    pub draw_calls: usize,
 }
 
 /// Colour + depth attachments sized to the output.
@@ -317,6 +330,17 @@ pub struct Renderer {
     fog: Option<ao_scene::FogModel>,
     /// Statel distance LOD state, see `Scene::statel_lod`.
     lod: Option<LodState>,
+    /// Light storage buffer plus its pristine contents and the statel zone of each light (distance gating).
+    light_buf: wgpu::Buffer,
+    light_base: Vec<[f32; 4]>,
+    light_zones: Vec<Option<u32>>,
+    /// Traffic ships of the uploaded scene, see `Scene::movers`.
+    movers: Vec<MoverRun>,
+    /// `Scene::day_time` of the uploaded scene.
+    day_time: f32,
+    /// Game seconds per [`Renderer::time`] second for the traffic ships (1 = the game clock; the viewer sets the live
+    /// sky's scale).
+    pub day_time_rate: f32,
     // per-frame scratch
     frame: usize,
     vis: Vec<[[f32; 4]; 4]>,
@@ -399,7 +423,7 @@ impl Renderer {
             label: None,
             entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT), storage_entry(1), storage_entry(2), storage_entry(3)],
         });
-        let globals_bg = globals_bind(&device, &g_layout, &globals, &LightGrid::new(&[]));
+        let (globals_bg, light_buf) = globals_bind(&device, &g_layout, &globals, &LightGrid::new(&[]));
         let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -419,7 +443,7 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(2, wgpu::ShaderStages::VERTEX_FRAGMENT),
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -498,6 +522,9 @@ impl Renderer {
             format,
             stats: FrameStats::default(),
             time: 0.0,
+            movers: vec![],
+            day_time: 0.0,
+            day_time_rate: 1.0,
             globals,
             globals_bg,
             g_layout,
@@ -510,6 +537,9 @@ impl Renderer {
             env: default_environment(100.0),
             fog: None,
             lod: None,
+            light_buf,
+            light_base: vec![],
+            light_zones: vec![],
             frame: 0,
             vis: vec![],
             vis_src: vec![],
@@ -571,7 +601,7 @@ impl Renderer {
             }
         }
         // One bind group per distinct (texture, base colour, emissive, glow mask).
-        let mut mat_of: HashMap<(usize, [u32; 12]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, [u32; 16]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh| {
             let u = mat_uniform(s);
@@ -676,24 +706,24 @@ impl Renderer {
         let radius = scene_bounds(scene).map_or(100.0, |(l, h)| ((h - l).length() * 0.5).max(1.0));
         self.env = scene.environment.unwrap_or_else(|| default_environment(radius));
         self.fog = scene.fog_model.clone();
-        self.lod = scene.statel_lod.clone().map(|lod| {
-            let mut seen = vec![0usize; mesh_range.len()];
-            let slot = scene
-                .instances
-                .iter()
-                .map(|i| match mesh_range.get(i.mesh) {
-                    Some(r) if seen[i.mesh] < r.len() => {
-                        seen[i.mesh] += 1;
-                        r.start + seen[i.mesh] - 1
-                    }
-                    _ => usize::MAX,
-                })
-                .collect();
-            LodState { levels: vec![u8::MAX; lod.zones.len()], reduced: vec![false; lod.items.len()], lod, slot }
-        });
+        let slots = instance_slots(scene, &mesh_range);
+        self.lod = scene.statel_lod.clone().map(|lod| LodState { levels: vec![u8::MAX; lod.zones.len()], reduced: vec![false; lod.items.len()], lod, slot: slots.clone() });
+        let rate = self.day_time_rate;
+        self.day_time = scene.day_time;
+        self.movers = scene
+            .movers
+            .iter()
+            .filter_map(|m| {
+                let slot = *slots.get(m.instance).filter(|&&s| s != usize::MAX)?;
+                let local_center = sphere[scene.instances[m.instance].mesh].0;
+                Some(MoverRun { mover: m.clone(), state: ao_scene::MoverState::settled(m, scene.day_time, rate), slot, local_center })
+            })
+            .collect();
         self.set_sky(scene);
         let grid = LightGrid::new(&scene.lights);
-        self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
+        (self.globals_bg, self.light_buf) = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
+        self.light_zones = grid.zones.clone();
+        self.light_base = grid.lights.clone();
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
         self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, insts, mesh_range, radius, grid };
     }
@@ -709,7 +739,7 @@ impl Renderer {
         }
         let white = self.texture_view(&[255; 4], 1, 1);
         let mut sky = SkyGpu::default();
-        let mut mat_of: HashMap<(Option<TextureKey>, [u32; 12]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(Option<TextureKey>, [u32; 16]), usize> = HashMap::new();
         for (mi, mesh) in scene.meshes.iter().enumerate() {
             let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
             if mesh.vertices.is_empty() || idx_total == 0 || !scene.sky.iter().any(|s| s.mesh == mi) {
@@ -719,7 +749,7 @@ impl Renderer {
             let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&vertex_bytes(&mesh.vertices)),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
             let nv = mesh.vertices.len() as u32;
             let mut indices = Vec::with_capacity(idx_total);
@@ -768,6 +798,7 @@ impl Renderer {
             sky.xf.push(Mat4::from_cols_array_2d(&inst.transform));
         }
         sky.spin = (0..sky.xf.len()).map(|i| scene.sky_spin.iter().find(|s| s.instance == i).copied()).collect();
+        sky.wave = scene.sky_wave_spin.clone();
         sky.bufs = if sky.xf.is_empty() {
             vec![]
         } else {
@@ -775,6 +806,18 @@ impl Renderer {
                 .map(|_| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("sky"), size: (sky.xf.len() * 64) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }))
                 .collect()
         };
+        // a live update keeps the running simulation of an identical aurora
+        sky.colors = scene
+            .sky_colors
+            .iter()
+            .filter(|c| matches!(sky.meshes.get(c.mesh), Some(Some(_))))
+            .map(|c| ColorAnim {
+                mesh: c.mesh,
+                sim: self.sky.colors.iter().find(|o| o.sim.params == c.sim.params).map_or_else(|| c.sim.clone(), |o| o.sim.clone()),
+                gain: c.gain,
+                vertices: scene.meshes[c.mesh].vertices.clone(),
+            })
+            .collect();
         self.sky = sky;
         if let Some(env) = scene.environment {
             self.env = env;
@@ -806,18 +849,6 @@ impl Renderer {
                 }
             }
         }
-        // a live update keeps the running simulation of an identical aurora
-        sky.colors = scene
-            .sky_colors
-            .iter()
-            .filter(|c| matches!(sky.meshes.get(c.mesh), Some(Some(_))))
-            .map(|c| ColorAnim {
-                mesh: c.mesh,
-                sim: self.sky.colors.iter().find(|o| o.sim.params == c.sim.params).map_or_else(|| c.sim.clone(), |o| o.sim.clone()),
-                gain: c.gain,
-                vertices: scene.meshes[c.mesh].vertices.clone(),
-            })
-            .collect();
         for (zone, (&new, old)) in levels.iter().zip(&st.levels).enumerate() {
             if new == *old {
                 continue;
@@ -834,6 +865,11 @@ impl Renderer {
                 set(Some(item.full), pick == ao_scene::LodPick::Full);
                 set(item.reduced, pick == ao_scene::LodPick::Reduced);
             }
+        }
+        // lights follow the zone's list 5 state: `range = 0` switches a light off (the shader's hard cut at the range)
+        if self.light_zones.iter().any(Option::is_some) {
+            let data = gate_lights(&self.light_base, &self.light_zones, &levels);
+            self.queue.write_buffer(&self.light_buf, 0, bytemuck::cast_slice(&data));
         }
         st.levels = levels;
     }
@@ -856,6 +892,29 @@ impl Renderer {
         }
     }
 
+    /// One FXS frame for every traffic ship ([`ao_scene::Mover`]): the waypoint target of the game clock
+    /// (`Scene::day_time + time * day_time_rate`) feeds the per-frame accumulators, the instance follows.
+    fn step_movers(&mut self) {
+        let day = self.day_time + self.time * self.day_time_rate;
+        for r in &mut self.movers {
+            r.state.step(&r.mover, r.mover.target(day));
+            if let Some(g) = self.gpu.insts.get_mut(r.slot) {
+                g.m = r.mover.transform(&r.state);
+                g.center = Mat4::from_cols_array_2d(&g.m).transform_point3(r.local_center);
+            }
+        }
+    }
+
+    /// Sets [`Renderer::time`] and lets the traffic ships settle at that game time (the accumulators are per frame, a
+    /// jump needs the frames in between): screenshots at `--anim-time`.
+    pub fn seek(&mut self, time: f32) {
+        self.time = time;
+        let day = self.day_time + time * self.day_time_rate;
+        for r in &mut self.movers {
+            r.state = ao_scene::MoverState::settled(&r.mover, day, self.day_time_rate);
+        }
+    }
+
     /// Scene radius; viewer uses it for speed.
     pub fn radius(&self) -> f32 {
         self.gpu.radius
@@ -864,6 +923,7 @@ impl Renderer {
     /// Draws one frame into `resolve` (a view of the output texture).
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) {
         self.update_lod(cam.pos.x, cam.pos.z);
+        self.step_movers();
         let mut env = self.env;
         if let Some((color, end)) = self.fog.as_ref().map(|m| m.at(cam.pos.to_array())) {
             if env.sky_color == env.fog_color {
@@ -875,6 +935,7 @@ impl Renderer {
         let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
         let vp = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.2, far) * Mat4::look_to_rh(cam.pos, cam.forward(), Vec3::Y);
         let v4 = |c: [f32; 3], w| Vec4::new(c[0], c[1], c[2], w).to_array();
+        let w = ao_scene::wave_curves(self.time);
         let g = Globals {
             view_proj: vp.to_cols_array_2d(),
             eye: cam.pos.extend(1.0).to_array(),
@@ -885,6 +946,7 @@ impl Renderer {
             fog: [env.fog_start, env.fog_end, self.time, 0.0],
             grid: self.gpu.grid.0,
             dims: self.gpu.grid.1,
+            wave: std::array::from_fn(|i| std::array::from_fn(|j| w[i * 4 + j])),
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
@@ -911,6 +973,16 @@ impl Renderer {
                 self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
             }
         }
+        for a in &mut self.sky.colors {
+            a.sim.advance_to(self.time);
+            let lin = |c: u32, shift: u32| srgb_to_linear(((c >> shift & 255) as f32 / 255.0 * a.gain).min(1.0));
+            for (v, &c) in a.vertices.iter_mut().zip(a.sim.vertex_colors()) {
+                v.color = [lin(c, 16), lin(c, 8), lin(c, 0), (c >> 24) as f32 / 255.0];
+            }
+            if let Some(Some((vb, _))) = self.sky.meshes.get(a.mesh) {
+                self.queue.write_buffer(vb, 0, bytemuck::cast_slice(&vertex_bytes(&a.vertices)));
+            }
+        }
         let sky_buf = self.sky.bufs.get(self.frame);
         if let Some(buf) = sky_buf {
             // translation = camera; a spinning instance turns about its pivot (relative to the camera) first
@@ -920,8 +992,9 @@ impl Renderer {
                 .xf
                 .iter()
                 .zip(&self.sky.spin)
-                .map(|(m, spin)| {
-                    let (m, off) = match spin {
+                .enumerate()
+                .map(|(i, (m, spin))| {
+                    let (mut m, mut off) = match spin {
                         Some(s) => {
                             let r = Mat4::from_axis_angle(Vec3::from(s.axis).normalize_or_zero(), (s.degrees_per_second * time).to_radians());
                             let p = Vec3::from(s.pivot);
@@ -929,6 +1002,13 @@ impl Renderer {
                         }
                         None => (*m, Vec3::ZERO),
                     };
+                    // `GameWaveCurve*` driven turns (`SkyWaveSpin`) compose after the constant spin
+                    for ws in self.sky.wave.iter().filter(|ws| ws.instance == i) {
+                        let r = Mat4::from_axis_angle(Vec3::from(ws.axis).normalize_or_zero(), (ws.degrees * w[ws.curve & 15]).to_radians());
+                        let p = Vec3::from(ws.pivot);
+                        m = r * m;
+                        off = r.transform_vector3(off) + p - r.transform_vector3(p);
+                    }
                     Mat4::from_cols(m.x_axis, m.y_axis, m.z_axis, (cam.pos + off).extend(1.0)).to_cols_array_2d()
                 })
                 .collect();
@@ -1011,6 +1091,23 @@ impl Renderer {
     }
 }
 
+/// Scene instance index -> index into `Gpu::insts` (`usize::MAX` = not uploaded): instances of a mesh occupy that mesh's
+/// range in scene order.
+fn instance_slots(scene: &Scene, mesh_range: &[std::ops::Range<usize>]) -> Vec<usize> {
+    let mut seen = vec![0usize; mesh_range.len()];
+    scene
+        .instances
+        .iter()
+        .map(|i| match mesh_range.get(i.mesh) {
+            Some(r) if seen[i.mesh] < r.len() => {
+                seen[i.mesh] += 1;
+                r.start + seen[i.mesh] - 1
+            }
+            _ => usize::MAX,
+        })
+        .collect()
+}
+
 fn vertex_bytes(v: &[ao_scene::Vertex]) -> Vec<f32> {
     v.iter()
         .flat_map(|v| {
@@ -1032,7 +1129,7 @@ pub fn render_to_png_at(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut r = Renderer::new(&instance, None)?;
     r.upload(scene);
-    r.time = time;
+    r.seek(time);
     let targets = Targets::new(&r, width, height);
     let out = r.device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -1081,9 +1178,21 @@ fn storage<T: bytemuck::Pod>(device: &wgpu::Device, data: &[T]) -> wgpu::Buffer 
 }
 
 /// Group 0: globals uniform + the static light grid (lights, cells, per-cell index lists).
-fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, g: &LightGrid) -> wgpu::BindGroup {
-    let (l, c, i) = (storage(device, &g.lights), storage(device, &g.cells), storage(device, &g.idx));
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+/// Light storage with the lights of zones whose level disables list 5 switched off (`range = 0`).
+fn gate_lights(base: &[[f32; 4]], zones: &[Option<u32>], levels: &[u8]) -> Vec<[f32; 4]> {
+    let mut data = base.to_vec();
+    for (i, z) in zones.iter().enumerate() {
+        if z.is_some_and(|z| !ao_scene::StatelLod::lights_active(levels[z as usize])) {
+            data[i * 4][3] = 0.0;
+        }
+    }
+    data
+}
+
+fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, g: &LightGrid) -> (wgpu::BindGroup, wgpu::Buffer) {
+    let l = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&g.lights), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST });
+    let (c, i) = (storage(device, &g.cells), storage(device, &g.idx));
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout,
         entries: &[
@@ -1092,7 +1201,8 @@ fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: 
             wgpu::BindGroupEntry { binding: 2, resource: c.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: i.as_entire_binding() },
         ],
-    })
+    });
+    (bg, l)
 }
 
 #[cfg(test)]
@@ -1124,6 +1234,26 @@ mod sky_tests {
         s
     }
 
+    /// `GameWaveCurve2` is 1 at t = 0 and 0 at t = 3.6 s (phase 0, 50 deg/s): the wave driven uv offset, rotation and the sun fan
+    /// rim alpha must change the picture between the two instants.
+    #[test]
+    fn game_wave_curves_drive_uv_rotation_and_sun_flicker() {
+        let mut uv = scene([0.0; 2], None);
+        uv.meshes[0].submeshes[0].uv_wave = [2.0, 0.5, 0.0, 0.0];
+        let mut rot = scene([0.0; 2], None);
+        rot.sky_wave_spin.push(ao_scene::SkyWaveSpin { instance: 0, axis: [0.0, 0.0, 1.0], pivot: [0.0; 3], curve: 2, degrees: 90.0 });
+        let mut sun = scene([0.0; 2], None);
+        for (i, v) in sun.meshes[0].vertices.iter_mut().enumerate() {
+            v.normal = [0.0, -1.0, (i + 2) as f32]; // rim index 2..5: table entry 2 (= curve 2) fades the first corner
+        }
+        sun.meshes[0].submeshes[0].sun_flicker = true;
+        sun.meshes[0].submeshes[0].blend = ao_scene::Blend::AlphaBlend;
+        for (name, s) in [("uv_wave", uv), ("wave_spin", rot), ("sun_flicker", sun)] {
+            let (Some(a), Some(b)) = (pixels(&s, 0.0, name), pixels(&s, 3.6, name)) else { return };
+            assert_ne!(a, b, "{name}: curve 2 changes between t = 0 and 3.6 s");
+        }
+    }
+
     #[test]
     fn uv_scroll_and_sky_spin_change_the_picture_with_time() {
         for (name, scroll, spin) in [("scroll", [0.5, 0.0], None), ("spin", [0.0, 0.0], Some(90.0))] {
@@ -1136,5 +1266,19 @@ mod sky_tests {
         let s = scene([0.0; 2], None);
         let (Some(a), Some(b)) = (pixels(&s, 0.0, "still"), pixels(&s, 5.0, "still")) else { return };
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod lod_tests {
+    use super::gate_lights;
+
+    #[test]
+    fn lights_follow_their_zone_level() {
+        let base: Vec<[f32; 4]> = (0..3).flat_map(|i| [[0.0, 0.0, 0.0, 10.0 + i as f32], [1.0; 4], [0.0; 4], [0.0; 4]]).collect();
+        // light 0: zone 0 (level 2: on), light 1: zone 1 (level 0: off), light 2: no zone (always on)
+        let d = gate_lights(&base, &[Some(0), Some(1), None], &[2, 0]);
+        assert_eq!([d[0][3], d[4][3], d[8][3]], [10.0, 0.0, 12.0]);
+        assert_eq!(d[5], [1.0; 4]);
     }
 }

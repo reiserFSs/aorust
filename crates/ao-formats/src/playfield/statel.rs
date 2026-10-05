@@ -176,7 +176,7 @@ pub fn scene_light(l: &Light, frame: Option<([[f32; 3]; 3], [f32; 3])>) -> Optio
     });
     // all zero attenuation would be 1/0 in D3D (full intensity): keep it distinct from the contract's "linear" marker
     let atten = if l.att == [0.0; 3] { [f32::MIN_POSITIVE, 0.0, 0.0] } else { l.att };
-    Some(ao_scene::Light { pos: scene(to_world(l.pos, true)), color: l.rgb.map(|c| (c as f32 / 255.0).powf(2.2)), range: l.range, atten, spot })
+    Some(ao_scene::Light { pos: scene(to_world(l.pos, true)), color: l.rgb.map(|c| (c as f32 / 255.0).powf(2.2)), range: l.range, atten, spot, zone: None })
 }
 
 fn zone(d: &[u8], a: usize, b: usize, layout: Layout) -> Result<Zone> {

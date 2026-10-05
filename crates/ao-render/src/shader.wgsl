@@ -8,11 +8,13 @@ struct G {
     fog: vec4<f32>,        // x = start, y = end, z = time (s)
     grid: vec4<f32>,       // xyz = light grid origin, w = cell size
     dims: vec4<i32>,       // light grid cells (x, y, z)
+    wave: array<vec4<f32>, 4>, // GameWaveCurve0..15 (`ao_scene::wave_curves`)
 }
 struct Mat {
     color: vec4<f32>,
     emissive: vec4<f32>, // rgb = emissive, w = 1 when texture alpha is a glow mask
     scroll: vec4<f32>,   // xy = uv drift per second
+    wave: vec4<f32>,     // sky: (curve_u, amp_u, curve_v, amp_v) uv offset amp * GameWaveCurve; scroll.w = 1 for a flickering sun fan
 }
 @group(0) @binding(0) var<uniform> g: G;
 @group(0) @binding(1) var<storage, read> lights: array<vec4<f32>>; // pairs: (pos, range), (colour, 0)
@@ -60,6 +62,11 @@ fn vs(v: VIn) -> VOut { return vtx(v); }
 fn vs_sky(v: VIn) -> VOut {
     var o = vtx(v);
     o.clip.z = o.clip.w;
+    if mat.scroll.w > 0.5 && v.normal.z >= 0.0 {
+        // e_SunRays rim alpha * (255 - trunc(255 * curve[i & 7])) / 255 (FUN_1005a3a9), interpolated per vertex like the client
+        let k = u32(v.normal.z + 0.5) & 7u;
+        o.color.a = o.color.a * (1.0 - floor(255.0 * g.wave[k >> 2u][k & 3u]) / 255.0);
+    }
     return o;
 }
 
@@ -74,9 +81,15 @@ fn point_lights(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let e = cells[u32((c.z * g.dims.y + c.y) * g.dims.x + c.x)];
     var sum = vec3<f32>(0.0);
     // D3D7 fixed function: at most 8 active lights; the cell list is sorted strongest first.
-    for (var k = 0u; k < min(e.y, 8u); k = k + 1u) {
+    // Lights switched off by the statel distance LOD (range 0) do not count against the 8.
+    var used = 0u;
+    for (var k = 0u; k < e.y && used < 8u; k = k + 1u) {
         let li = light_idx[e.x + k] * 4u;
         let a = lights[li];
+        if a.w <= 0.0 {
+            continue;
+        }
+        used = used + 1u;
         let col = lights[li + 1u];
         let att = lights[li + 2u];
         let d = a.xyz - p;
@@ -131,7 +144,10 @@ fn shade(i: VOut, mode: u32) -> vec4<f32> {
 
 // Sky: unlit, unfogged; opaque ignores alpha.
 fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
-    let c = textureSample(tex, samp, i.uv + mat.scroll.xy * g.fog.z) * i.color * mat.color;
+    let wu = u32(mat.wave.x);
+    let wv = u32(mat.wave.z);
+    let wobble = vec2<f32>(mat.wave.y * g.wave[wu >> 2u][wu & 3u], mat.wave.w * g.wave[wv >> 2u][wv & 3u]);
+    let c = textureSample(tex, samp, i.uv + mat.scroll.xy * g.fog.z + wobble) * i.color * mat.color;
     if mode == 1u && c.a < 0.5 {
         discard;
     }

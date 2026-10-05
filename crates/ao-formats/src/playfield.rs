@@ -114,7 +114,7 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
     let environment = environment::to_scene(&env, rec.is_outdoor(), sky.as_ref());
     if let (Some(s), Some(t), true) = (&sky, &tweaks, rec.is_outdoor()) {
         sky::emit(s, t, store, &mut scene, environment.fog_color, environment.fog_end);
-        sky::emit_distant(t, store, &mut scene);
+        sky::emit_distant(t, store, &mut scene, day_time);
     }
     scene.environment = Some(environment);
     let mut report = Report::default();
@@ -170,7 +170,9 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
         report.unique_meshes = placer.cache.values().filter(|m| m.is_some()).count();
         for (i, zone) in file.zones.iter().enumerate() {
             let frame = rec.rooms.get(i).map(|r| (statel::ry(r.rot as f32 * std::f32::consts::FRAC_PI_2), r.pos));
-            scene.lights.extend(zone.lights.iter().filter_map(|l| statel::scene_light(l, frame)));
+            // outdoor lights belong to their tile-block zone and follow its distance level (`StatelLod::lights_active`)
+            let zone_id = file.outdoor.then_some(i as u32);
+            scene.lights.extend(zone.lights.iter().filter_map(|l| statel::scene_light(l, frame)).map(|l| ao_scene::Light { zone: zone_id, ..l }));
         }
         let rooms = std::iter::once(None).chain((0..file.zones.len()).map(|i| rec.rooms.get(i)));
         for (z, room) in std::iter::once(&file.global).chain(&file.zones).zip(rooms) {

@@ -74,6 +74,13 @@ pub struct Submesh {
     /// Sky submeshes only: vertex `normal.x` is the distance (metres, at the view distance) the vertex has in the client's
     /// fogged atmosphere strip; the renderer fogs it with the live fog (colour / end at the camera) instead of a baked one.
     pub sky_fog: bool,
+    /// Sky submeshes only: `[curve_u, amp_u, curve_v, amp_v]`, the uv offset `amp * GameWaveCurve<curve>(time)`
+    /// ([`wave_curves`]) added to the vertex uv every frame (a tweak `ScrollMatrix` translation driven by `GAME.GameWaveCurve*`;
+    /// the constant part is baked into the uv). `amp == 0` = off.
+    pub uv_wave: [f32; 4],
+    /// Sky submeshes only (`e_SunRays`): vertex `normal.z` is the fan rim index `i` (`-1` = centre); the renderer scales the rim
+    /// alpha by `(255 - table[i & 7]) / 255` with `table` = [`sun_flicker_table`] (`FUN_1005a3a9`).
+    pub sun_flicker: bool,
 }
 
 impl Submesh {
@@ -89,6 +96,8 @@ impl Submesh {
             prelit: false,
             uv_scroll: [0.0; 2],
             sky_fog: false,
+            uv_wave: [0.0; 4],
+            sun_flicker: false,
         }
     }
 }
@@ -106,6 +115,9 @@ pub struct Light {
     /// `D3DLIGHT7.dvAttenuation0..2`; all zero = linear falloff to zero at `range`.
     pub atten: [f32; 3],
     pub spot: Option<Spot>,
+    /// Statel zone the light belongs to (`Scene::statel_lod`): it only shines while [`StatelLod::lights_active`] holds for
+    /// that zone's level. `None` = always on.
+    pub zone: Option<u32>,
 }
 
 /// `D3DLIGHT_SPOT` cone: full inner angle `theta` and outer angle `phi` (radians, `dvTheta` / `dvPhi`), falloff 1:
@@ -176,18 +188,6 @@ pub struct Scene {
     pub statel_lod: Option<StatelLod>,
     /// Constant rotations of `sky` instances (the Shadowlands vortex: a `Counter` that grows with `GameDeltaTime`).
     pub sky_spin: Vec<SkySpin>,
-}
-
-/// A sky instance that turns about `axis` (right-handed scene space, unit) through the point `pivot` (relative to the
-/// camera) at `degrees_per_second`; the renderer composes it with the instance transform every frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SkySpin {
-    /// Index into [`Scene::sky`].
-    pub instance: usize,
-    pub axis: [f32; 3],
-    pub pivot: [f32; 3],
-    pub degrees_per_second: f32,
-}
     /// Rotations of `sky` instances driven by `GameWaveCurve*` ([`SkyWaveSpin`]).
     pub sky_wave_spin: Vec<SkyWaveSpin>,
     /// Vertex colours of `meshes` that the renderer re-simulates every frame (the Shadowlands aurora, [`aurora`]).
@@ -205,6 +205,18 @@ pub struct SkyColors {
     pub mesh: usize,
     pub sim: aurora::GloomySky,
     pub gain: f32,
+}
+
+/// A sky instance that turns about `axis` (right-handed scene space, unit) through the point `pivot` (relative to the
+/// camera) at `degrees_per_second`; the renderer composes it with the instance transform every frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SkySpin {
+    /// Index into [`Scene::sky`].
+    pub instance: usize,
+    pub axis: [f32; 3],
+    pub pivot: [f32; 3],
+    pub degrees_per_second: f32,
+}
 
 /// Local fog volume (`n3StatelFog_t`, statel file; `StatelFogRun` N3 @0x10024dbc): inside `radius` metres of `pos` the
 /// client adds fog `color` with density `density * (1 - (d / radius)^4)`.
@@ -286,6 +298,11 @@ mod tests {
     }
 
     #[test]
+    fn zone_lights_shine_only_in_the_middle_levels() {
+        assert_eq!([0, 1, 2, 3, 4, 5].map(StatelLod::lights_active), [false, true, true, true, false, false]);
+    }
+
+    #[test]
     fn zone_levels_follow_the_client_bands() {
         // half view length 400: radii 40, 60, 120, 160, 220 (the 0.1 factor hits the 40 m floor exactly)
         let l = lod();
@@ -362,6 +379,11 @@ impl StatelLod {
     pub const MIN_DISTANCE: f32 = 40.0;
     /// `STATE[level][zone list]`, zone lists 0..5 = (file statel list 3, 2, 1, 0, global refs, lights); `FUN_100286a9`.
     pub const STATE: [[u8; 6]; 6] = [[0, 0, 0, 1, 2, 0], [3, 3, 3, 3, 3, 3], [0, 3, 3, 3, 3, 3], [0, 0, 3, 3, 3, 3], [0, 0, 2, 3, 3, 0], [0, 0, 1, 2, 3, 0]];
+
+    /// Zone list 5 (the lights) is enabled (state 3) only in levels 1..=3 (`STATE[level][5]`).
+    pub fn lights_active(level: u8) -> bool {
+        Self::STATE[level as usize][5] != 0
+    }
 
     pub fn new(view_length: f32, zones: Vec<[f32; 2]>, items: Vec<LodItem>) -> Self {
         let mut zone_items = vec![Vec::new(); zones.len()];
