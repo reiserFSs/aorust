@@ -136,7 +136,8 @@ impl Builder<'_> {
     /// fog state is not stored in the scripts; the horizon map must not show as a brown band behind a fogged terrain].
     fn fogged(&self, o: &Obj, mut mesh: Mesh) -> Mesh {
         let horizon = self.sorts.get("Horizon").copied().unwrap_or(u32::MAX);
-        if !o.flag("FOGENABLE").unwrap_or_else(|| self.sort(o) >= horizon) {
+        let horizon_dish = o.flag("FOGENABLE").is_none() && self.sort(o) >= horizon;
+        if !o.flag("FOGENABLE").unwrap_or(horizon_dish) {
             return mesh;
         }
         let amount = |v: &Vertex| {
@@ -147,8 +148,17 @@ impl Builder<'_> {
             Some(c) => [16, 8, 0].map(|s| srgb_to_linear(((c >> s) & 255) as f32 / 255.0)),
             None => self.fog.color,
         };
+        // the ground dish ends in a straight line at elevation 0: let its rim fade out over the last 6 degrees so the sky
+        // (stars, atmosphere) meets it without a seam [GUESS]
+        if horizon_dish && mesh.submeshes.iter().all(|s| s.blend == Blend::Opaque) {
+            for v in &mut mesh.vertices {
+                let sin_el = v.pos[1] / v.pos.iter().map(|c| c * c).sum::<f32>().sqrt().max(1e-6);
+                v.color[3] *= (-sin_el / 6f32.to_radians().sin()).clamp(0.0, 1.0);
+            }
+            mesh.submeshes.iter_mut().for_each(|s| s.blend = Blend::AlphaBlend);
+        }
         let n = mesh.vertices.len() as u32;
-        let overlay: Vec<Vertex> = mesh.vertices.iter().map(|v| Vertex { color: [colour[0], colour[1], colour[2], amount(v)], ..*v }).collect();
+        let overlay: Vec<Vertex> = mesh.vertices.iter().map(|v| Vertex { color: [colour[0], colour[1], colour[2], amount(v) * v.color[3]], ..*v }).collect();
         let originals = mesh.submeshes.len();
         for v in &mut mesh.vertices {
             let f = amount(v);
@@ -216,7 +226,13 @@ impl Builder<'_> {
                 }
                 Light::Cloud(l) => l,
             };
-            v.color = [srgb_to_linear(c[0] * gain), srgb_to_linear(c[1] * gain), srgb_to_linear(c[2] * gain), alpha];
+            // cloud layers thin out towards the horizon (haze) instead of ending in the straight line where the fogged horizon
+            // dish starts [GUESS: the client's own cloud/fog blend was not found]
+            let haze = match light {
+                Light::Cloud(_) => (v.pos[1] / v.pos.iter().map(|c| c * c).sum::<f32>().sqrt().max(1e-6) / 0.25).clamp(0.0, 1.0),
+                _ => 1.0,
+            };
+            v.color = [srgb_to_linear(c[0] * gain), srgb_to_linear(c[1] * gain), srgb_to_linear(c[2] * gain), alpha * haze];
             v.uv = [v.uv[0] * scroll[0] + v.uv[1] * scroll[2] + scroll[4], v.uv[0] * scroll[1] + v.uv[1] * scroll[3] + scroll[5]];
         }
         for s in &mut mesh.submeshes {

@@ -359,29 +359,27 @@ pub fn rotation(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<Quat> {
     if depth > 4 {
         return None;
     }
-    let mut total = Quat::IDENTITY;
-    for term in expr.split("[ROT]") {
-        let term = term.trim();
-        let q = if let Some(f) = term.strip_prefix("This.") {
-            rotation(obj, ctx, obj.field(f)?, depth + 1)?
-        } else if term == "GAME.Sun1Rotation" {
-            ctx.sun1
-        } else if term == "GAME.Sun2Rotation" {
-            ctx.sun2
-        } else if let Some(rest) = term.strip_prefix("v(") {
-            let (axis, angle) = rest.split_once(')')?;
-            let axis = vector(obj, ctx, &format!("v({axis})"), depth)?;
-            Quat::axis_angle(axis, eval_field(obj, ctx, angle.trim().trim_start_matches(',').trim(), depth)?)
-        } else if let Some(rest) = term.strip_prefix("q(") {
-            let c: Vec<f32> = rest.split(')').next()?.split(',').map(|e| eval_field(obj, ctx, e, depth)).collect::<Option<_>>()?;
-            let [w, x, y, z] = c[..] else { return None };
-            Quat { w, x, y, z }
-        } else {
-            return None;
-        };
-        total = total.then(q);
+    expr.split("[ROT]").try_fold(Quat::IDENTITY, |total, term| Some(total.then(term_rotation(obj, ctx, term.trim(), depth)?)))
+}
+
+fn term_rotation(obj: &Obj, ctx: &Ctx, term: &str, depth: u32) -> Option<Quat> {
+    if let Some(f) = term.strip_prefix("This.") {
+        return rotation(obj, ctx, obj.field(f)?, depth + 1);
     }
-    Some(total)
+    match term {
+        "GAME.Sun1Rotation" => return Some(ctx.sun1),
+        "GAME.Sun2Rotation" => return Some(ctx.sun2),
+        _ => {}
+    }
+    if let Some(rest) = term.strip_prefix("v(") {
+        let (axis, angle) = rest.split_once(')')?;
+        let axis = vector(obj, ctx, &format!("v({axis})"), depth)?;
+        return Some(Quat::axis_angle(axis, eval_field(obj, ctx, angle.trim().trim_start_matches(',').trim(), depth)?));
+    }
+    let rest = term.strip_prefix("q(")?;
+    let c: Vec<f32> = rest.split(')').next()?.split(',').map(|e| eval_field(obj, ctx, e, depth)).collect::<Option<_>>()?;
+    let [w, x, y, z]: [f32; 4] = c.try_into().ok()?;
+    Some(Quat { w, x, y, z })
 }
 
 #[cfg(test)]
