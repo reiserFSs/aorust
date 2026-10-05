@@ -35,6 +35,16 @@ impl<'a> Reader<'a> {
     pub fn i32(&mut self) -> Result<i32> {
         Ok(self.u32()? as i32)
     }
+    pub fn i16(&mut self) -> Result<i16> {
+        Ok(self.u16()? as i16)
+    }
+    pub fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.bytes(8)?.try_into()?))
+    }
+    /// IEEE-754 single, big-endian on the wire.
+    pub fn f32(&mut self) -> Result<f32> {
+        Ok(f32::from_bits(self.u32()?))
+    }
     /// Fixed-width NUL-padded ASCII field (UserLogin name/version).
     pub fn fixed_str(&mut self, n: usize) -> Result<String> {
         let b = self.bytes(n)?;
@@ -75,6 +85,15 @@ impl Writer {
     }
     pub fn i32(&mut self, v: i32) {
         self.u32(v as u32);
+    }
+    pub fn i16(&mut self, v: i16) {
+        self.u16(v as u16);
+    }
+    pub fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+    pub fn f32(&mut self, v: f32) {
+        self.u32(v.to_bits());
     }
     pub fn bytes(&mut self, b: &[u8]) {
         self.0.extend_from_slice(b);
