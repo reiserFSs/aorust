@@ -228,6 +228,8 @@ pub struct FogVolume {
     /// 0..1 (the file stores percent).
     pub density: f32,
     pub radius: f32,
+    /// Dungeon room the volume belongs to: it is only evaluated while that room is the camera's room (see [`FogModel::rooms`]).
+    pub room: Option<u32>,
 }
 
 /// The client's per-frame fog accumulation (`VisualFog_t::AddFog` DisplaySystem @0x1005820c, `process` @0x10058443).
@@ -240,14 +242,26 @@ pub struct FogModel {
     /// View distance (fog end at density 0).
     pub far: f32,
     pub volumes: Vec<FogVolume>,
+    /// Dungeon rooms as `(AO world centre [x, z], half extents)`, index = room; empty outdoors. The client evaluates a room's
+    /// fog/sound lists only while `n3RoomMonitor_t` has the room enabled (N3 `RunFunction` @0x100260d2): here the camera's
+    /// room, found like `n3Playfield_t::PosToRoom` (first room containing the point, else room 0). Rooms that are also
+    /// enabled through open doors depend on the server's door state and are not modelled.
+    pub rooms: Vec<([f32; 2], [f32; 2])>,
 }
 
 impl FogModel {
+    /// Room containing scene-space `p` (x/z test only); `None` outdoors.
+    pub fn camera_room(&self, p: [f32; 3]) -> Option<usize> {
+        let (x, z) = (p[0], -p[2]);
+        (!self.rooms.is_empty()).then(|| self.rooms.iter().position(|(c, h)| x >= c[0] - h[0] && x < c[0] + h[0] && z >= c[1] - h[1] && z < c[1] + h[1]).unwrap_or(0))
+    }
+
     /// Fog at camera position `p`: `(linear RGB, fog end in metres)`. `AddFog` keeps a weighted mean
     /// `new = (d * c_new + D * c_old) / (d + D)` and the density `D = max(D, d)`; volumes are added in file order.
     pub fn at(&self, p: [f32; 3]) -> ([f32; 3], f32) {
         let (mut c, mut dens) = (self.base_color, self.base_density);
-        for v in &self.volumes {
+        let room = self.camera_room(p);
+        for v in self.volumes.iter().filter(|v| v.room.is_none_or(|r| Some(r as usize) == room)) {
             let d2: f32 = (0..3).map(|i| (p[i] - v.pos[i]).powi(2)).sum();
             let r2 = v.radius * v.radius;
             if v.radius > 0.0 && d2 < r2 {
@@ -275,7 +289,7 @@ mod tests {
     use super::*;
 
     fn model() -> FogModel {
-        FogModel { base_color: [0.2; 3], base_density: 0.1, near: 0.5, far: 800.0, volumes: vec![FogVolume { pos: [0.0; 3], color: [1.0, 0.0, 0.0], density: 0.9, radius: 100.0 }] }
+        FogModel { base_color: [0.2; 3], base_density: 0.1, near: 0.5, far: 800.0, volumes: vec![FogVolume { pos: [0.0; 3], color: [1.0, 0.0, 0.0], density: 0.9, radius: 100.0, room: None }], rooms: vec![] }
     }
 
     #[test]
@@ -295,6 +309,26 @@ mod tests {
     fn lod() -> StatelLod {
         let item = |class, flag8, reduced, zones: Vec<u32>| LodItem { full: 0, reduced, flag8, class, zones };
         StatelLod::new(800.0, vec![[0.0, 0.0], [1000.0, 0.0]], vec![item(0, true, Some(1), vec![0]), item(3, false, None, vec![0]), item(4, true, Some(1), vec![0, 1]), item(1, false, None, vec![0])])
+    }
+
+    #[test]
+    fn room_fog_is_only_evaluated_in_the_camera_room() {
+        let vol = |room, x| FogVolume { pos: [x, 0.0, 0.0], color: [1.0, 0.0, 0.0], density: 0.9, radius: 50.0, room };
+        let m = FogModel {
+            base_color: [0.2; 3],
+            base_density: 0.1,
+            near: 0.5,
+            far: 800.0,
+            volumes: vec![vol(Some(1), 100.0)],
+            // room 0 around x = 0, room 1 around x = 100 (z mirrored: scene z = -world z)
+            rooms: vec![([0.0, 0.0], [20.0, 20.0]), ([100.0, 0.0], [20.0, 20.0])],
+        };
+        let base_end = m.at([0.0, 0.0, 0.0]).1;
+        assert_eq!(m.camera_room([100.0, 0.0, 0.0]), Some(1));
+        // inside the volume's radius but in room 0: ignored; in room 1: applied
+        assert!((m.at([60.0, 0.0, 0.0]).1 - base_end).abs() < 1e-3 || m.camera_room([60.0, 0.0, 0.0]) == Some(0));
+        assert!(m.at([100.0, 0.0, 0.0]).1 < base_end);
+        assert_eq!(FogModel::default().camera_room([0.0; 3]), None);
     }
 
     #[test]

@@ -92,7 +92,7 @@ fn base_fog(env: &Env, sky: Option<&Sky>) -> ([f32; 3], f32) {
 /// Per-frame fog of a playfield: the base fog plus the statel file's local fog volumes (`Scene::fog_model`).
 pub fn fog_model(env: &Env, sky: Option<&Sky>, volumes: Vec<ao_scene::FogVolume>) -> ao_scene::FogModel {
     let (base_color, base_density) = base_fog(env, sky);
-    ao_scene::FogModel { base_color, base_density, near: NEAR, far: VIEW_DISTANCE, volumes }
+    ao_scene::FogModel { base_color, base_density, near: NEAR, far: VIEW_DISTANCE, volumes, rooms: vec![] }
 }
 
 pub fn to_scene(env: &Env, outdoor: bool, sky: Option<&Sky>) -> Environment {

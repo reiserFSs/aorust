@@ -52,6 +52,11 @@ fn room_half(rect: [u16; 4], rot: u8) -> [f32; 2] {
     }
 }
 
+/// Room rectangles as `(AO world centre [x, z], half extents)` (what `ZoneLocator` tests, for `ao_scene::FogModel::rooms`).
+pub(super) fn room_boxes(rooms: &[record::Room]) -> Vec<([f32; 2], [f32; 2])> {
+    rooms.iter().map(|r| ([r.pos[0], r.pos[2]], room_half(r.rect, r.rot))).collect()
+}
+
 pub fn zone_locator(store: &RecordStore, id: u32) -> Result<ZoneLocator> {
     let raw = store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?;
     let rec = record::parse(&raw)?;

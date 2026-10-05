@@ -22,7 +22,7 @@ mod water;
 mod zone;
 
 pub use ao_scene::FogVolume;
-pub use sky::{SkyClock, DEFAULT_DAY_TIME};
+pub use sky::{open_weather, SkyClock, DEFAULT_DAY_TIME};
 pub use spawn::{floor_below, scene_bounds, support_below};
 pub use zone::{zone_locator, ZoneLocator};
 
@@ -57,6 +57,8 @@ pub fn list_playfields(store: &RecordStore) -> Result<Vec<(u32, String)>> {
 /// frame the camera is within `radius` (`EvaluateStatelSoundFog`, N3 @0x10024eff). Scene space (z negated).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SoundEmitter {
+    /// Dungeon room the emitter belongs to (`None` outdoors: the global list is always evaluated).
+    pub room: Option<u32>,
     pub pos: [f32; 3],
     pub sound_id: u32,
     pub radius: f32,
@@ -110,7 +112,10 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
     let waters = water::parse(&mut tail).with_context(|| format!("liquids of playfield {id}"))?;
     let env = environment::parse(&mut tail).with_context(|| format!("environment of playfield {id}"))?;
     let tweaks = sky::Tweaks::load(client_dir, id, rec.is_outdoor());
-    let sky = tweaks.as_ref().and_then(|t| sky::Sky::new(t, day_time));
+    let sky = tweaks.as_ref().and_then(|t| sky::Sky::new(t, day_time)).map(|mut s| {
+        s.set_weather(sky::weather_at(&env, day_time));
+        s
+    });
     let environment = environment::to_scene(&env, rec.is_outdoor(), sky.as_ref());
     if let (Some(s), Some(t), true) = (&sky, &tweaks, rec.is_outdoor()) {
         sky::emit(s, t, store, &mut scene, environment.fog_color, environment.fog_end);
@@ -175,7 +180,9 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
             scene.lights.extend(zone.lights.iter().filter_map(|l| statel::scene_light(l, frame)).map(|l| ao_scene::Light { zone: zone_id, ..l }));
         }
         let rooms = std::iter::once(None).chain((0..file.zones.len()).map(|i| rec.rooms.get(i)));
-        for (z, room) in std::iter::once(&file.global).chain(&file.zones).zip(rooms) {
+        for (zi, (z, room)) in std::iter::once(&file.global).chain(&file.zones).zip(rooms).enumerate() {
+            // dungeon zone `zi - 1` is room `zi - 1`; the global list and every outdoor zone are always evaluated
+            let room_id = (!file.outdoor && zi > 0).then(|| zi as u32 - 1);
             let at = |p: [f32; 3]| {
                 let p = match room {
                     Some(r) => {
@@ -186,17 +193,20 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
                 };
                 [p[0], p[1], -p[2]]
             };
-            report.sounds.extend(z.sounds.iter().map(|e| SoundEmitter { pos: at(e.pos), sound_id: e.value, radius: e.radius as f32 }));
+            report.sounds.extend(z.sounds.iter().map(|e| SoundEmitter { room: room_id, pos: at(e.pos), sound_id: e.value, radius: e.radius as f32 }));
             report.fogs.extend(z.fogs.iter().map(|e| FogVolume {
                 pos: at(e.pos),
                 color: [e.value >> 16, e.value >> 8, e.value].map(|c| (c & 0xff) as f32 / 255.0),
                 density: (e.value >> 24) as f32 / 100.0,
                 radius: e.radius as f32,
+                room: room_id,
             }));
         }
         if !report.fogs.is_empty() {
             let volumes = report.fogs.clone();
-            scene.fog_model = Some(environment::fog_model(&env, sky.as_ref(), volumes));
+            let mut model = environment::fog_model(&env, sky.as_ref(), volumes);
+            model.rooms = if rec.is_outdoor() { vec![] } else { zone::room_boxes(&rec.rooms) };
+            scene.fog_model = Some(model);
         }
         props = file.zones.iter().map(|z| z.statels.iter().filter(|s| s.mesh != 0).map(|s| s.pos).collect()).collect();
     }

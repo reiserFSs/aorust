@@ -208,7 +208,12 @@ impl Runtime {
     /// `fade_out + duration`; `update` ends it `T` seconds after the last call, fading linearly over its last
     /// `fade_out` seconds (`FrameProcessSound` @SI 0x10003b70).
     pub fn keepalive(&mut self, sh: &Shared, def: &SoundDef) {
-        let level = def.vol_max * self.fx;
+        self.keepalive_scaled(sh, def, 1.0);
+    }
+
+    /// [`Runtime::keepalive`] with the per-call volume of `PlaySample(handle, .., volume, ..)` (weather: rain/wind levels).
+    pub fn keepalive_scaled(&mut self, sh: &Shared, def: &SoundDef, scale: f32) {
+        let level = def.vol_max * self.fx * scale;
         let t = def.fade_out + def.duration_max;
         if let Some(k) = self.keepalive.get_mut(&def.id) {
             if sh.mixer().is_playing(k.0) {
@@ -363,10 +368,13 @@ impl Runtime {
     /// SandyInterface play list, see docs].
     fn tick_emitters(&mut self, sh: &Shared, dt: f32, cam: [f32; 3]) {
         let Some(pf) = &self.pf else { return };
+        // dungeon rooms' emitters run only while the room is enabled: the camera's room (N3 `RunFunction` @0x100260d2, docs)
+        let cam_room = pf.zones.zone_at(cam);
         for (e, st) in pf.emitters.iter().zip(&mut self.emitters) {
+            let off = e.room.is_some_and(|r| Some(r as usize) != cam_room);
             let d = ((e.pos[0] - cam[0]).powi(2) + (e.pos[1] - cam[1]).powi(2) + (e.pos[2] - cam[2]).powi(2)).sqrt();
             let Some(def) = self.lib.sounds.get(e.sound_id) else { continue };
-            if d >= e.radius {
+            if d >= e.radius || off {
                 if st.started {
                     st.idle += dt;
                     if st.idle >= EMITTER_HOLD {
