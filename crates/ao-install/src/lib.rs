@@ -106,23 +106,37 @@ pub fn run(client_dir: &Path) -> Result<()> {
         eprintln!("patching to {dst}");
         let zip_path = dl_dir.join(format!("{dst}.zip"));
         download(&format!("{BASE}/{dst}.zip"), &zip_path)?;
-        eprintln!("extracting {dst}");
-        extract_zip(&zip_path, client_dir)?;
-        let rdb = client_dir.join(format!("{dst}.rdbpatch"));
-        if rdb.exists() {
-            eprintln!("applying {}", rdb.display());
-            let n = apply_rdbpatch(&client_dir.join("cd_image/rdb.db"), &rdb)?;
-            eprintln!("  {n} records");
-        }
-        fs::remove_file(&zip_path)?;
-        let df = client_dir.join(format!("{dst}.df"));
-        if df.exists() {
-            let n = process_df(&df, client_dir)?;
-            eprintln!("  deleted {n} files");
-        }
-        fs::write(client_dir.join("patch.version"), dst.to_string())?;
+        apply_patch(client_dir, &dst, &zip_path)?;
         eprintln!("now at {dst}");
     }
+    Ok(())
+}
+
+/// Extract `zip_path` over the client, apply `<dst>.rdbpatch`, drop the zip, process `<dst>.df`, and only
+/// then advance `patch.version` (atomically), so any failure leaves the old version and a rerun redoes
+/// the step (extraction overwrites, rdbpatch is one transaction of `INSERT OR REPLACE`).
+fn apply_patch(client_dir: &Path, dst: &Version, zip_path: &Path) -> Result<()> {
+    eprintln!("extracting {dst}");
+    if let Err(e) = extract_zip(zip_path, client_dir) {
+        let _ = fs::remove_file(zip_path); // unreadable archive: force a fresh download next run
+        return Err(e);
+    }
+    let rdb = client_dir.join(format!("{dst}.rdbpatch"));
+    if rdb.exists() {
+        eprintln!("applying {}", rdb.display());
+        let n = apply_rdbpatch(&client_dir.join("cd_image/rdb.db"), &rdb)?;
+        eprintln!("  {n} records");
+    }
+    fs::remove_file(zip_path)?;
+    // the launcher leaves the .df in place after processing; so do we
+    let df = client_dir.join(format!("{dst}.df"));
+    if df.exists() {
+        let n = process_df(&df, client_dir)?;
+        eprintln!("  deleted {n} files");
+    }
+    let tmp = client_dir.join("patch.version.tmp");
+    fs::write(&tmp, dst.to_string())?;
+    fs::rename(&tmp, client_dir.join("patch.version"))?;
     Ok(())
 }
 
@@ -139,6 +153,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
         Err(ureq::Error::Status(416, _)) => return Ok(()),
         Err(e) => return Err(e).with_context(|| format!("GET {url}")),
     };
+    eprintln!("  HTTP {}{}", resp.status(), if have > 0 { format!(" (Range: bytes={have}-)") } else { String::new() });
     let (mut done, total, mut file) = if resp.status() == 206 {
         // Content-Range: bytes a-b/total
         let total = resp.header("Content-Range").and_then(|r| r.rsplit('/').next()).and_then(|t| t.parse::<u64>().ok());
@@ -349,5 +364,54 @@ mod tests {
         assert!(!root.path().join("evil").exists());
         extract_zip(&mk("d/ok.txt"), &client).unwrap();
         assert_eq!(fs::read(client.join("d/ok.txt")).unwrap(), b"hi");
+    }
+
+    fn zip_with(path: &Path, files: &[(&str, &[u8])]) {
+        let mut w = zip::ZipWriter::new(File::create(path).unwrap());
+        for (n, d) in files {
+            w.start_file(*n, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(d).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn failed_patch_keeps_version() {
+        let root = tempfile::tempdir().unwrap();
+        let client = root.path().join("client");
+        fs::create_dir_all(client.join("cd_image")).unwrap();
+        fs::write(client.join("patch.version"), "0.1.0").unwrap();
+        Connection::open(client.join("cd_image/rdb.db")).unwrap().execute_batch("CREATE TABLE rdb_5 (id INTEGER PRIMARY KEY, version INTEGER, data BLOB);").unwrap();
+        let (zip, dst) = (root.path().join("0.1.1.zip"), v("0.1.1"));
+        let version = || fs::read_to_string(client.join("patch.version")).unwrap();
+
+        // 1. corrupt archive: version stays, bad zip discarded so the next run re-downloads
+        fs::write(&zip, b"not a zip").unwrap();
+        assert!(apply_patch(&client, &dst, &zip).is_err());
+        assert_eq!(version(), "0.1.0");
+        assert!(!zip.exists());
+
+        // 2. extraction hits an escaping entry after writing a good one: version stays, zip kept
+        zip_with(&zip, &[("ok.txt", b"1"), ("../evil", b"2")]);
+        assert!(apply_patch(&client, &dst, &zip).is_err());
+        assert_eq!(version(), "0.1.0");
+
+        // 3. truncated rdbpatch: version stays, zip + rdbpatch kept, db untouched
+        let mut bad = patch_bytes(&[(5, 1, b"new")]);
+        bad.truncate(bad.len() - 1);
+        zip_with(&zip, &[("0.1.1.rdbpatch", &bad)]);
+        assert!(apply_patch(&client, &dst, &zip).is_err());
+        assert_eq!(version(), "0.1.0");
+        assert!(zip.exists() && client.join("0.1.1.rdbpatch").exists());
+        let c = Connection::open(client.join("cd_image/rdb.db")).unwrap();
+        assert_eq!(c.query_row("SELECT count(*) FROM rdb_5", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+
+        // 4. a good patch afterwards succeeds: rdbpatch applied+removed, .df kept and processed, version advances
+        fs::write(client.join("old.txt"), "x").unwrap();
+        zip_with(&zip, &[("0.1.1.rdbpatch", &patch_bytes(&[(5, 1, b"new")])), ("0.1.1.df", b"old.txt")]);
+        apply_patch(&client, &dst, &zip).unwrap();
+        assert_eq!(version(), "0.1.1");
+        assert!(!zip.exists() && !client.join("0.1.1.rdbpatch").exists() && client.join("0.1.1.df").exists() && !client.join("old.txt").exists());
+        assert_eq!(c.query_row("SELECT count(*) FROM rdb_5", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
 }
