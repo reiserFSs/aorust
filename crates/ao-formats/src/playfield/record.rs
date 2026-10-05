@@ -69,6 +69,8 @@ pub struct Record {
     /// Number of zones (outdoor) or rooms (dungeon) = number of offsets in the statel file.
     pub count: u32,
     pub rooms: Vec<Room>,
+    /// Byte offset of the `RDBPlayfieldAnarchy_t` tail (liquid polygons, environment; see `water`/`environment`).
+    pub tail: usize,
 }
 
 impl Record {
@@ -95,8 +97,14 @@ pub fn parse(d: &[u8]) -> Result<Record> {
         for _ in 0..count {
             rooms.push(room(&mut r, version)?);
         }
+    } else {
+        // per zone: u32 n, n x camera attractor (vec3 + quat + vec3 + f32), see `RDBPlayfield_t::ReadBlob` @0x1001c115
+        for _ in 0..count {
+            let n = r.u32()? as usize;
+            r.skip(n * (12 + 16 + 12 + 4))?;
+        }
     }
-    Ok(Record { version, id, name, tilemap, zone_size, count, rooms })
+    Ok(Record { version, id, name, tilemap, zone_size, count, rooms, tail: r.o })
 }
 
 fn room(r: &mut Rd, version: u32) -> Result<Room> {
@@ -152,11 +160,16 @@ mod tests {
 
     #[test]
     fn outdoor_header() {
-        let mut d = header(8, 566, 566, 225);
-        d.extend([0u8; 40]);
+        let mut d = header(8, 566, 566, 2);
+        d.extend(1u32.to_le_bytes()); // zone 0: one camera attractor
+        d.extend([0u8; 12 + 16 + 12 + 4]);
+        d.extend(0u32.to_le_bytes()); // zone 1: none
+        let tail = d.len();
+        d.extend([7u8; 10]); // anarchy tail (water / environment)
         let r = parse(&d).unwrap();
-        assert_eq!((r.name.as_str(), r.count, r.zone_size, r.is_outdoor()), ("Test PF", 225, 10, true));
+        assert_eq!((r.name.as_str(), r.count, r.zone_size, r.is_outdoor()), ("Test PF", 2, 10, true));
         assert!(r.rooms.is_empty());
+        assert_eq!(r.tail, tail);
     }
 
     #[test]

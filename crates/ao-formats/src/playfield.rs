@@ -10,10 +10,14 @@
 //! right-handed mirror obtained by negating z (the convention of `mesh::decode_mesh_into`).
 
 mod dungeon;
+mod environment;
 mod ground;
 mod record;
 mod spawn;
+mod shadow;
 mod statel;
+mod terrain;
+mod water;
 
 pub use spawn::{floor_below, scene_bounds};
 
@@ -22,7 +26,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use ao_rdb::RecordStore;
-use ao_scene::{Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
+use ao_scene::{Instance, Scene, IDENTITY};
 
 use record::Room;
 use statel::{Layout, Statel};
@@ -30,8 +34,6 @@ use statel::{Layout, Statel};
 const RECORD: u32 = 1_000_001;
 const STATELS: u32 = 1_000_003;
 const TILEMAP: u32 = 1_000_009;
-/// Ground tile texture quality used for terrain (1010006: 256², 1010021: 128², 1010022: 64²).
-const TILE_TEXTURES: u32 = 1_010_021;
 
 /// Playfield ids with name, for `aomac view --list`.
 pub fn list_playfields(store: &RecordStore) -> Result<Vec<(u32, String)>> {
@@ -63,8 +65,14 @@ pub fn load_playfield(store: &RecordStore, client_dir: &Path, id: u32) -> Result
 }
 
 pub fn load_playfield_report(store: &RecordStore, _client_dir: &Path, id: u32) -> Result<(Scene, Report)> {
-    let rec = record::parse(&store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?)?;
+    let raw = store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?;
+    let rec = record::parse(&raw)?;
     let mut scene = Scene::default();
+    // RDBPlayfieldAnarchy_t tail: liquid polygons, then the environment (fog/ambient)
+    let mut tail = record::Rd::new(&raw, rec.tail);
+    let waters = water::parse(&mut tail).with_context(|| format!("liquids of playfield {id}"))?;
+    let env = environment::parse(&mut tail).with_context(|| format!("environment of playfield {id}"))?;
+    scene.environment = Some(environment::to_scene(&env, rec.is_outdoor()));
     let mut report = Report::default();
     let mut spot = None;
     let mut terrain = None;
@@ -74,10 +82,14 @@ pub fn load_playfield_report(store: &RecordStore, _client_dir: &Path, id: u32) -
         let d = store.get(TILEMAP, rec.tilemap)?.ok_or_else(|| anyhow!("playfield {id}: no tilemap {}", rec.tilemap))?;
         let tm = ground::parse(&d).with_context(|| format!("tilemap {}", rec.tilemap))?;
         report.terrain_cells = tm.cells_x * tm.cells_z;
-        build_terrain(store, &tm, &mut scene)?;
+        terrain::build(store, id, &tm, &mut scene)?;
         terrain = Some(tm);
     } else {
         grid = Some(dungeon::build(store, &rec, &mut scene)?);
+    }
+    if let Some(m) = water::build_mesh(&waters) {
+        scene.meshes.push(m);
+        scene.instances.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
     }
     let fixed = scene.instances.len();
     if let Some(d) = store.get(STATELS, id)? {
@@ -185,68 +197,6 @@ fn to_scene(r: &[[f32; 3]; 3], p: [f32; 3]) -> [[f32; 4]; 4] {
     }
     m[3] = [p[0], p[1], -p[2], 1.0];
     m
-}
-
-fn texture_key(store: &RecordStore, scene: &mut Scene, id: u16) -> Option<TextureKey> {
-    let key = TextureKey { rdb_type: TILE_TEXTURES, id: id as u32 };
-    if !scene.textures.contains_key(&key) {
-        let b = store.get(TILE_TEXTURES, id as u32).ok()??;
-        let at = b.windows(3).position(|w| w == [0xff, 0xd8, 0xff])?; // 24 byte header before the JPEG
-        scene.textures.insert(key, crate::texture::decode_texture(&b[at..]).ok()?);
-    }
-    Some(key)
-}
-
-/// One mesh per ground texture; every cell is its own quad (tile textures are per cell).
-fn build_terrain(store: &RecordStore, tm: &ground::Tilemap, scene: &mut Scene) -> Result<()> {
-    let mut by_tex: HashMap<Option<u16>, Vec<(u32, u32)>> = HashMap::new();
-    for z in 0..tm.cells_z {
-        for x in 0..tm.cells_x {
-            let tex = tm.tile_texture.get(tm.tile(x, z) as usize).copied();
-            by_tex.entry(tex).or_default().push((x as u32, z as u32));
-        }
-    }
-    let cs = tm.cell_size;
-    let normal = |x: usize, z: usize| -> [f32; 3] {
-        let (x0, x1) = (x.saturating_sub(1), (x + 1).min(tm.verts_x - 1));
-        let (z0, z1) = (z.saturating_sub(1), (z + 1).min(tm.verts_z - 1));
-        let dx = (tm.height(x1, z) - tm.height(x0, z)) / ((x1 - x0) as f32 * cs);
-        let dz = -(tm.height(x, z1) - tm.height(x, z0)) / ((z1 - z0) as f32 * cs); // scene z = -z
-        let l = (dx * dx + 1.0 + dz * dz).sqrt();
-        [-dx / l, 1.0 / l, -dz / l]
-    };
-    let mut keys: Vec<_> = by_tex.keys().copied().collect();
-    keys.sort();
-    for tex in keys {
-        let cells = &by_tex[&tex];
-        let texture = tex.and_then(|t| texture_key(store, scene, t));
-        let mut mesh = Mesh::default();
-        let mut indices = Vec::with_capacity(cells.len() * 6);
-        mesh.vertices.reserve(cells.len() * 4);
-        for &(x, z) in cells {
-            let base = mesh.vertices.len() as u32;
-            for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let (vx, vz) = (x as usize + dx, z as usize + dz);
-                mesh.vertices.push(Vertex {
-                    pos: [vx as f32 * cs, tm.height(vx, vz), -(vz as f32 * cs)],
-                    normal: normal(vx, vz),
-                    uv: [dx as f32, dz as f32],
-                    ..Default::default()
-                });
-            }
-            // CCW seen from +Y in scene space (z negated). Bit 14 of the tile value picks the
-            // quad diagonal (N3.dll n3RoomSurface_t::GetTileTriangles @ 0x10014888).
-            if tm.diagonal_p10_p01(x as usize, z as usize) {
-                indices.extend([base, base + 1, base + 2, base + 1, base + 3, base + 2]);
-            } else {
-                indices.extend([base, base + 1, base + 3, base, base + 3, base + 2]);
-            }
-        }
-        mesh.submeshes.push(Submesh::new(indices, texture));
-        scene.meshes.push(mesh);
-        scene.instances.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
