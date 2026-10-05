@@ -6,6 +6,7 @@
 //! `n3InfoItemRemote_t::MapToKey(class name)` (N3.dll 0x10009826, see [`super::misc::key`]) and
 //! the body is the class's `ReadSubClass` (Gamecode.dll vtable slot 7).
 
+use super::dynel::{ClothData as WornCloth, TextureData};
 use super::N3Header;
 use crate::msg::Identity;
 use crate::wire::Reader;
@@ -417,15 +418,35 @@ pub struct VendingMachine {
     pub base: DynelBase,
 }
 
-/// `CorpseFullUpdateIIR_t` (GC `FUN_1009f502`, ReadSubClass slot 7): version 8, base, then a
-/// `SpellData_t` list, owner identity, `ClothData_t` vector, `i32` + `TextureData_t` vector.
-/// The spell records are type-tagged by `GameData::SpellFormats_c` and are not decoded: `rest`
-/// starts with the spell list size word.
+/// One `GameData::SpellData_t` of a corpse (`SpellFormats_c::ReadBinary` [GD 0x1000f4a6]): header
+/// `{i32 type, i32 id, i32 format version}`, `i32` criteria count (`SpellData_t::ReadBinaryCriteria`
+/// [GD 0x1000d49f]), then the type's fixed arguments (`SpellFormat_c::ReadBinary` [GD 0x1000f39e],
+/// one `i32` per `Add` of the format built in `SpellFormats_c::SpellFormats_c` [GD 0x1000fb0a]).
+/// Only the live type 0xCF27 is decoded: its format has 7 `i32` arguments (stats 5, 6, 7, 0x2d, 0x2f,
+/// 0x30, 0xb); the 4 `i32` that follow them in every capture are kept in `tail` ([UNRESOLVED]: no reader
+/// for them was found in `SpellData_t`'s `>>`; docs/zone/static.md §5). Other types are an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpseSpell {
+    pub type_id: u32,
+    pub id: i32,
+    pub version: i32,
+    pub args: [i32; 7],
+    pub tail: [i32; 4],
+}
+
+/// `CorpseFullUpdateIIR_t` (GC `FUN_1009f502`, ReadSubClass slot 7): version 8, base, a `SpellData_t`
+/// list (`FUN_100a6c58`), the owner identity (`+0x84`, `FUN_1013cda9`), a `ClothData_t` vector (`+0x8c`)
+/// and `i32 n` + (if `n != 0`) a `TextureData_t` vector (`+0x90`). The corpse is drawn from
+/// `base.stats` (`CATMesh` 42 ...) plus `cloth` and `textures`, see `ao_formats::dynel_visual`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Corpse {
     pub version: u32,
     pub base: DynelBase,
-    pub rest: Vec<u8>,
+    pub spells: Vec<CorpseSpell>,
+    /// The dead character `{0xC350, id}` (equals stats `CorpseType` 415 / `CorpseInstance` 416).
+    pub owner: Identity,
+    pub cloth: Vec<WornCloth>,
+    pub textures: Vec<TextureData>,
 }
 
 impl Corpse {
@@ -435,8 +456,55 @@ impl Corpse {
             bail!("corpse version {version} (client expects 8)");
         }
         let base = DynelBase::read(r)?;
-        let (w, _) = counted(r)?;
-        Ok(Self { version, base, rest: rest_after(w, r)? })
+        let (_, n) = counted(r)?;
+        if n >= 1000 {
+            bail!("corpse spell count {n}");
+        }
+        let mut spells = Vec::new();
+        for _ in 0..n {
+            let (type_id, id, version) = (r.u32()?, r.i32()?, r.i32()?);
+            if type_id != 0xCF27 || version != 4 {
+                bail!("corpse spell type {type_id:#x} version {version}: only 0xCF27 v4 is decoded");
+            }
+            let criteria = r.i32()?;
+            if criteria != 0 {
+                bail!("corpse spell with {criteria} criteria is not decoded");
+            }
+            let mut args = [0; 7];
+            for a in &mut args {
+                *a = r.i32()?;
+            }
+            let tail = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+            spells.push(CorpseSpell { type_id, id, version, args, tail });
+        }
+        let owner = Identity::read(r)?;
+        let (_, n) = counted(r)?;
+        fits(n, 12, r)?;
+        let cloth = (0..n)
+            .map(|_| {
+                let raw = r.i32()?;
+                let (texture, page) = (r.i32()?, r.i32()?);
+                let extra = if raw > 0 && ((raw >> 16) as i16) > 0 { Some((r.i32()?, r.i32()?)) } else { None };
+                Ok(WornCloth { raw, texture, page, extra })
+            })
+            .collect::<Result<_>>()?;
+        let n = r.i32()?;
+        let mut textures = Vec::new();
+        if n != 0 {
+            let (_, n) = counted(r)?;
+            fits(n, 0x2c, r)?;
+            for _ in 0..n {
+                let raw = r.bytes(0x20)?;
+                let end = raw.iter().position(|&c| c == 0).unwrap_or(0x20);
+                textures.push(TextureData {
+                    material: String::from_utf8_lossy(&raw[..end]).into_owned(),
+                    texture: r.i32()?,
+                    field_24: r.i32()?,
+                    flag: r.i32()?,
+                });
+            }
+        }
+        Ok(Self { version, base, spells, owner, cloth, textures })
     }
 }
 
@@ -767,8 +835,18 @@ mod tests {
         assert_eq!(c.base.stats[0], (0, 0x0018_1805));
         let p = c.base.position.unwrap();
         assert!((p[0] - 873.94).abs() < 0.01 && (p[1] - 40.10).abs() < 0.01);
-        // spell list: one SpellData_t (type 0xCF27) follows, not decoded.
-        assert_eq!(&c.rest[..4], &(2 * UNIT).to_be_bytes());
+        // one SpellData_t (type 0xCF27), the dead character, five empty cloth parts, no texture list
+        assert_eq!(c.spells, [CorpseSpell { type_id: 0xCF27, id: 0x1238, version: 4, args: [1, 0, 0, 0, 0, 0, 0x1F7], tail: [1, 4, 0xB331, 0] }]);
+        assert_eq!(c.owner, Identity { kind: 0xC350, instance: 1_025_286 });
+        assert_eq!(c.cloth.iter().map(|k| (k.part(), k.texture, k.page)).collect::<Vec<_>>(), [(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)]);
+        assert!(c.textures.is_empty());
+        // every corpse names its dead character in stats CorpseType 415 / CorpseInstance 416
+        for (_, h, w) in &v {
+            let World::Corpse(c) = w else { unreachable!() };
+            let stat = |id| c.base.stats.iter().find(|s| s.0 == id).map(|s| s.1);
+            assert_eq!((stat(415), stat(416)), (Some(c.owner.kind), Some(c.owner.instance)), "{:?}", h.target);
+            assert_eq!(c.spells.len(), 1);
+        }
         let names: Vec<_> = v
             .iter()
             .map(|(_, _, w)| {
