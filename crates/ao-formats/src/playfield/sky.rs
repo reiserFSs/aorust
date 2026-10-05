@@ -344,6 +344,11 @@ impl SkyClock {
     }
 }
 
+/// Adds the playfield's static distant scenery (city skylines) to `scene.instances`, see `layers::emit_distant`.
+pub fn emit_distant(tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut Scene) {
+    layers::emit_distant(&tweaks.objects(), store, scene);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +413,17 @@ mod tests {
         assert_eq!(drifting, 1, "only ThickClouds scrolls");
         let (e1, e2) = (noon.environment.unwrap(), night.environment.unwrap());
         assert!(e1.sun_dir[1] > 0.3 && e2.sun_dir[1] < -0.3, "{:?} {:?}", e1.sun_dir, e2.sun_dir);
+    }
+
+    #[test]
+    fn real_city_skylines_are_placed_far_from_the_playfield() {
+        let Some(dir) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/ProjectRubiKa/client")) else { return };
+        let (Some(t), Ok(store)) = (Tweaks::load(&dir, 566, true), ao_rdb::RecordStore::open(&dir)) else { return };
+        let mut scene = Scene::default();
+        emit_distant(&t, &store, &mut scene);
+        // Newland City includes the Old Athen skyline (a UniversePosition point), at its universe offset
+        assert!(!scene.instances.is_empty(), "{}", scene.instances.len());
+        assert!(scene.instances.iter().all(|i| i.transform[3][0].abs() + i.transform[3][2].abs() > 1000.0), "far away");
     }
 
     #[test]
