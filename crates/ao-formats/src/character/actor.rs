@@ -251,3 +251,49 @@ impl ActorRig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> Option<RecordStore> {
+        let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
+        RecordStore::open(&dir).ok()
+    }
+
+    /// A solitus female with head and a weapon on the right hand: the body has the model's vertices, the head and the weapon
+    /// follow their attractor, a run clip moves the body and the head mount.
+    #[test]
+    fn player_rig_poses_body_and_mounts() {
+        let Some(store) = store() else { return };
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let look = PlayerLook { breed: Breed::Solitus, gender: Gender::Female, skin: Skin::Caucasian, build: 1, head: Some(40629), equipment: Equipment::default() };
+        let rig = ActorRig::player(&store, &assets, &look, &[(1, 7796)]).unwrap();
+        assert_eq!(rig.model().meshes.len(), 3, "body, head, weapon");
+        let run = assets.role(&store, rig.model_id, &Role::Run).unwrap().expect("run clip");
+        let (bind, bind_parts) = rig.pose(None);
+        let (v0, p0) = rig.pose(Some((&run, 0.0)));
+        let (v1, p1) = rig.pose(Some((&run, run.duration / 2.0)));
+        assert_eq!(bind.len(), v0.len());
+        assert_ne!(v0, v1, "the clip moves the body");
+        assert_ne!(p0[1], p1[1], "the head follows its bone");
+        assert_ne!(p0[2], p1[2], "the weapon follows the hand");
+        assert_eq!(p0[0], IDENTITY, "the body has no mount transform");
+        let h = rig.indicator_height();
+        assert!((1.5..2.6).contains(&h), "name tag anchor {h}");
+        assert!(bind_parts[1][3][1] > 1.2, "bind-pose head at the shoulders: {}", bind_parts[1][3][1]);
+    }
+
+    /// The Surf Lizard (record 22794 -> model 22773): `textures[]` replaces the part texture, a creature without `HeadMesh` mounts nothing.
+    #[test]
+    fn npc_rig_applies_texture_overrides() {
+        let Some(store) = store() else { return };
+        let cat = load_cat_mesh(&store, CHAR_MESH_TYPE, 22773).unwrap();
+        let list = [TextureOverride { material: "lizard_green", texture: 22768, env_texture: 0, alpha_mode: 0 }];
+        let o = npc_part_textures(&store, &cat, &list, &[]);
+        assert_eq!(o["lizard_green"].0, TextureKey { rdb_type: TEXTURE_TYPE, id: 22768 });
+        let rig = ActorRig::new(&store, 22773, None, &o, &[]).unwrap();
+        assert_eq!(rig.model().meshes.len(), 1, "body only");
+        assert!(rig.model().textures.contains_key(&TextureKey { rdb_type: TEXTURE_TYPE, id: 22768 }));
+    }
+}

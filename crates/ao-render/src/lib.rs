@@ -1381,6 +1381,37 @@ mod sky_tests {
         buf[(info.width as usize * (info.height as usize / 2) + info.width as usize / 2) * 4]
     }
 
+    /// Actor layer: a 1 m quad model (mesh 0 = body, mesh 1 = rigid mount) drawn at the actor transform, moved by new skin vertices
+    /// and part transforms, not visible behind the camera.
+    #[test]
+    fn actor_layer_draws_skins_mounts_and_culls() {
+        let quad = |x0: f32, col: [f32; 4]| Mesh {
+            vertices: [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)].iter().map(|&(x, y)| Vertex { pos: [x0 + x, y, 0.0], normal: [0.0, 0.0, 1.0], color: col, ..Default::default() }).collect(),
+            submeshes: vec![Submesh { two_sided: true, emissive: [1.0; 3], ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) }],
+        };
+        let model = Scene { meshes: vec![quad(0.0, [1.0, 0.0, 0.0, 1.0]), quad(0.0, [1.0, 0.0, 0.0, 1.0])], ..Default::default() };
+        let at = |x: f32, z: f32| [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [x, 0.0, z, 1.0]];
+        let frame = |transform, parts: Vec<[[f32; 4]; 4]>, skin: Option<Vec<Vertex>>, always| ao_scene::ActorFrame { id: 1, model: 7, transform, parts, skin, always };
+        let shot = |f: ao_scene::ActorFrame, name: &str| -> Option<u8> {
+            let path = std::env::temp_dir().join(format!("ao-render-actor-{}-{name}.png", std::process::id()));
+            render_to_png_actors(&Scene::default(), &[(7, model.clone())], vec![f], [0.0; 3], [0.0, 0.0, -1.0], 64, 64, &path, 0.0).ok()?;
+            let bytes = std::fs::read(&path).ok()?;
+            let _ = std::fs::remove_file(&path);
+            Some(centre(&bytes))
+        };
+        // the body quad (mesh 1 is pushed away by its part transform) straight ahead
+        let away = at(100.0, 0.0);
+        let Some(on) = shot(frame(at(0.0, -5.0), vec![IDENTITY, away], None, false), "on") else { return };
+        assert!(on > 240, "actor drawn: {on}");
+        // new skin vertices move the body out of the centre
+        let moved: Vec<Vertex> = model.meshes[0].vertices.iter().map(|v| Vertex { pos: [v.pos[0] + 50.0, v.pos[1], v.pos[2]], ..*v }).collect();
+        assert!(shot(frame(at(0.0, -5.0), vec![IDENTITY, away], Some(moved), false), "skin").unwrap() < 240);
+        // the rigid mount follows its part transform into the centre while the body is off to the side
+        assert!(shot(frame(at(50.0, -5.0), vec![IDENTITY, at(-50.0, 0.0)], None, false), "mount").unwrap() > 240);
+        // behind the camera: not visible
+        assert!(shot(frame(at(0.0, 5.0), vec![IDENTITY, away], None, false), "behind").unwrap() < 240);
+    }
+
     /// A `half`-metre wide quad facing the camera at z = -10 (normal +Z), lit by one white D3D light and nothing else.
     fn lit_quad(half: f32, light: [f32; 3], base: f32, specular: f32) -> Scene {
         let mut s = Scene::default();
