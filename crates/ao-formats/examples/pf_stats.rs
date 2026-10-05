@@ -49,6 +49,10 @@ fn main() -> anyhow::Result<()> {
                 light_total += scene.lights.len();
                 sounds += r.sounds.len();
                 fogs += r.fogs.len();
+                if !r.fogs.is_empty() {
+                    let f = &r.fogs;
+                    println!("fog volumes pf {id} {name}: {} radius {}..{} density {:.2}..{:.2} e.g. {:?} at {:?}", f.len(), f.iter().map(|v| v.radius).fold(f32::MAX, f32::min), f.iter().map(|v| v.radius).fold(0.0, f32::max), f.iter().map(|v| v.density).fold(9.0, f32::min), f.iter().map(|v| v.density).fold(0.0, f32::max), f[0].color, f[0].pos);
+                }
                 no_mesh += r.no_mesh_statels;
                 sound_ids.extend(r.sounds.iter().map(|e| e.sound_id));
                 if !scene.lights.is_empty() {

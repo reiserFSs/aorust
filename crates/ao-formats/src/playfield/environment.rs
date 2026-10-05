@@ -76,16 +76,27 @@ fn lin(c: [u8; 3]) -> [f32; 3] {
 /// `Scene::environment` for a playfield. `outdoor`: sun lit terrain (colours from the tweak scripts in `sky`, else
 /// fixed guesses). The fog colour is the density weighted mix of the record's `AddFog` and the atmosphere's
 /// (`VisualFog_t::AddFog` @0x1005820c: `new = (d * c_new + D * c_old) / (d + D)`, `D = max`).
-pub fn to_scene(env: &Env, outdoor: bool, sky: Option<&Sky>) -> Environment {
+/// The playfield fog after the record's and the atmosphere's `AddFog` calls: gamma space RGB and density.
+fn base_fog(env: &Env, sky: Option<&Sky>) -> ([f32; 3], f32) {
     let fog = env.fog_color();
     let (c1, d1) = if fog == [0, 0, 0] || env.fog_density() <= 0.0 { ([0.2; 3], 0.01) } else { (fog.map(|b| b as f32 / 255.0), env.fog_density()) };
-    let (fog_srgb, density) = match sky {
+    match sky {
         Some(s) => {
             let d = d1 + ATMOSPHERE_FOG_DENSITY;
             ([0, 1, 2].map(|k| (c1[k] * d1 + s.fog[k] * ATMOSPHERE_FOG_DENSITY) / d), d1.max(ATMOSPHERE_FOG_DENSITY))
         }
         None => (c1, d1),
-    };
+    }
+}
+
+/// Per-frame fog of a playfield: the base fog plus the statel file's local fog volumes (`Scene::fog_model`).
+pub fn fog_model(env: &Env, sky: Option<&Sky>, volumes: Vec<ao_scene::FogVolume>) -> ao_scene::FogModel {
+    let (base_color, base_density) = base_fog(env, sky);
+    ao_scene::FogModel { base_color, base_density, near: NEAR, far: VIEW_DISTANCE, volumes }
+}
+
+pub fn to_scene(env: &Env, outdoor: bool, sky: Option<&Sky>) -> Environment {
+    let (fog_srgb, density) = base_fog(env, sky);
     let fog_color = fog_srgb.map(srgb_to_linear);
     // `VisualFog_t::process`: the end only moves when far - near > 5, by (far - near - 5) * D
     let fog_end = VIEW_DISTANCE - (VIEW_DISTANCE - NEAR - 5.0) * density;

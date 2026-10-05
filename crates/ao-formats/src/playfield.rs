@@ -20,7 +20,8 @@ mod statel;
 mod terrain;
 mod water;
 
-pub use sky::DEFAULT_DAY_TIME;
+pub use ao_scene::FogVolume;
+pub use sky::{SkyClock, DEFAULT_DAY_TIME};
 pub use spawn::{floor_below, scene_bounds, support_below};
 
 use std::collections::HashMap;
@@ -57,22 +58,12 @@ pub struct SoundEmitter {
     pub radius: f32,
 }
 
-/// Local fog volume (`n3StatelFog_t`): inside `radius` the client calls `VisualFog_t::AddFog(color, density * (1 - (d/radius)^4))`
-/// (`StatelFogRun`, N3 @0x10024dbc). Scene space (z negated); `color` is gamma space RGB 0..1, `density` 0..1.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FogVolume {
-    pub pos: [f32; 3],
-    pub color: [f32; 3],
-    pub density: f32,
-    pub radius: f32,
-}
-
 /// What a load produced and what it had to skip.
 #[derive(Debug, Default, Clone)]
 pub struct Report {
     /// Ambient sound sources of the whole playfield (global and per zone/room).
     pub sounds: Vec<SoundEmitter>,
-    /// Local fog volumes of the whole playfield.
+    /// Local fog volumes of the whole playfield (also in `Scene::fog_model`).
     pub fogs: Vec<FogVolume>,
     pub terrain_cells: usize,
     pub statels: usize,
@@ -172,6 +163,10 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
                 density: (e.value >> 24) as f32 / 100.0,
                 radius: e.radius as f32,
             }));
+        }
+        if !report.fogs.is_empty() {
+            let volumes = report.fogs.clone();
+            scene.fog_model = Some(environment::fog_model(&env, sky.as_ref(), volumes));
         }
         props = file.zones.iter().map(|z| z.statels.iter().filter(|s| s.mesh != 0).map(|s| s.pos).collect()).collect();
     }

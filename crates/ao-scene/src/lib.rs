@@ -158,6 +158,55 @@ pub struct Scene {
     /// Sky domes/backdrops: instances of `meshes` drawn first, depth-write off, unfogged,
     /// with the transform's translation replaced by the camera position. Not in `instances`.
     pub sky: Vec<Instance>,
+    /// Dynamic fog: the playfield's base fog plus the local fog volumes of the statel file; the renderer re-evaluates it
+    /// at the camera every frame and overrides `environment.fog_color` / `fog_end` (and the clear colour when it equals
+    /// the fog colour). `None` = the static environment fog.
+    pub fog_model: Option<FogModel>,
+}
+
+/// Local fog volume (`n3StatelFog_t`, statel file; `StatelFogRun` N3 @0x10024dbc): inside `radius` metres of `pos` the
+/// client adds fog `color` with density `density * (1 - (d / radius)^4)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FogVolume {
+    pub pos: [f32; 3],
+    /// Gamma space RGB 0..1.
+    pub color: [f32; 3],
+    /// 0..1 (the file stores percent).
+    pub density: f32,
+    pub radius: f32,
+}
+
+/// The client's per-frame fog accumulation (`VisualFog_t::AddFog` DisplaySystem @0x1005820c, `process` @0x10058443).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FogModel {
+    /// Playfield fog after the record/atmosphere `AddFog` calls: gamma space RGB and density 0..1.
+    pub base_color: [f32; 3],
+    pub base_density: f32,
+    pub near: f32,
+    /// View distance (fog end at density 0).
+    pub far: f32,
+    pub volumes: Vec<FogVolume>,
+}
+
+impl FogModel {
+    /// Fog at camera position `p`: `(linear RGB, fog end in metres)`. `AddFog` keeps a weighted mean
+    /// `new = (d * c_new + D * c_old) / (d + D)` and the density `D = max(D, d)`; volumes are added in file order.
+    pub fn at(&self, p: [f32; 3]) -> ([f32; 3], f32) {
+        let (mut c, mut dens) = (self.base_color, self.base_density);
+        for v in &self.volumes {
+            let d2: f32 = (0..3).map(|i| (p[i] - v.pos[i]).powi(2)).sum();
+            let r2 = v.radius * v.radius;
+            if v.radius > 0.0 && d2 < r2 {
+                let d = v.density * (1.0 - (d2 / r2) * (d2 / r2));
+                if d + dens > 0.0 {
+                    c = std::array::from_fn(|i| (d * v.color[i] + dens * c[i]) / (d + dens));
+                }
+                dens = dens.max(d);
+            }
+        }
+        let end = if self.far - self.near > 5.0 { self.far - (self.far - self.near - 5.0) * dens } else { self.far };
+        (c.map(|v| v.powf(2.2)), end)
+    }
 }
 
 pub const IDENTITY: [[f32; 4]; 4] = [
@@ -166,3 +215,26 @@ pub const IDENTITY: [[f32; 4]; 4] = [
     [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model() -> FogModel {
+        FogModel { base_color: [0.2; 3], base_density: 0.1, near: 0.5, far: 800.0, volumes: vec![FogVolume { pos: [0.0; 3], color: [1.0, 0.0, 0.0], density: 0.9, radius: 100.0 }] }
+    }
+
+    #[test]
+    fn fog_end_follows_density_and_volume_centre_wins() {
+        let m = model();
+        // outside the volume: base fog only, end = far - (far - near - 5) * D
+        let (c, end) = m.at([200.0, 0.0, 0.0]);
+        assert!((end - (800.0 - 794.5 * 0.1)).abs() < 1e-3 && (c[0] - 0.2f32.powf(2.2)).abs() < 1e-6);
+        // centre: d = 0.9 -> mean (0.9 * red + 0.1 * grey) = 0.92 red, density 0.9
+        let (c, end) = m.at([0.0; 3]);
+        assert!((end - (800.0 - 794.5 * 0.9)).abs() < 1e-3 && (c[0] - 0.92f32.powf(2.2)).abs() < 1e-5 && (c[1] - 0.02f32.powf(2.2)).abs() < 1e-5);
+        // quartic falloff: at half the radius d = 0.9 * (1 - 1/16)
+        let (_, end) = m.at([50.0, 0.0, 0.0]);
+        assert!((end - (800.0 - 794.5 * 0.9 * (1.0 - 0.0625))).abs() < 1e-2);
+    }
+}

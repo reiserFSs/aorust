@@ -265,6 +265,8 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
     pub stats: FrameStats,
+    /// Seconds driving `Submesh::uv_scroll` (the viewer advances it; screenshots leave it at 0).
+    pub time: f32,
     globals: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     g_layout: wgpu::BindGroupLayout,
@@ -273,6 +275,8 @@ pub struct Renderer {
     pipes: Vec<wgpu::RenderPipeline>, // indexed by Draw::pipe
     gpu: Gpu,
     env: Environment,
+    /// Camera dependent fog (statel fog volumes), see `Scene::fog_model`.
+    fog: Option<ao_scene::FogModel>,
     // per-frame scratch
     frame: usize,
     vis: Vec<[[f32; 4]; 4]>,
@@ -453,6 +457,7 @@ impl Renderer {
             queue,
             format,
             stats: FrameStats::default(),
+            time: 0.0,
             globals,
             globals_bg,
             g_layout,
@@ -461,6 +466,7 @@ impl Renderer {
             pipes,
             gpu: Gpu { meshes: vec![], inst_bufs: vec![], sky_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], sky: vec![], sky_xf: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
             env: default_environment(100.0),
+            fog: None,
             frame: 0,
             vis: vec![],
             vis_src: vec![],
@@ -522,10 +528,10 @@ impl Renderer {
             }
         }
         // One bind group per distinct (texture, base colour, emissive, glow mask).
-        let mut mat_of: HashMap<(usize, [u32; 8]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, [u32; 12]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh| {
-            let u: [f32; 8] = [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }];
+            let u: [f32; 12] = [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], 0.0, 0.0];
             *mat_of.entry((view, u.map(f32::to_bits))).or_insert_with(|| {
                 let ub = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
@@ -634,6 +640,7 @@ impl Renderer {
         };
         let radius = scene_bounds(scene).map_or(100.0, |(l, h)| ((h - l).length() * 0.5).max(1.0));
         self.env = scene.environment.unwrap_or_else(|| default_environment(radius));
+        self.fog = scene.fog_model.clone();
         let mut sky = vec![];
         let mut sky_xf = vec![];
         for s in &scene.sky {
@@ -687,7 +694,13 @@ impl Renderer {
 
     /// Draws one frame into `resolve` (a view of the output texture).
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) {
-        let env = self.env;
+        let mut env = self.env;
+        if let Some((color, end)) = self.fog.as_ref().map(|m| m.at(cam.pos.to_array())) {
+            if env.sky_color == env.fog_color {
+                env.sky_color = color;
+            }
+            (env.fog_color, env.fog_end) = (color, end);
+        }
         let far = (env.fog_end * 1.1).max(50.0);
         let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
         let vp = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.2, far) * Mat4::look_to_rh(cam.pos, cam.forward(), Vec3::Y);
@@ -699,7 +712,7 @@ impl Renderer {
             sun_color: v4(env.sun_color, 0.0),
             ambient: v4(env.ambient, 0.0),
             fog_color: v4(env.fog_color, 1.0),
-            fog: [env.fog_start, env.fog_end, 0.0, 0.0],
+            fog: [env.fog_start, env.fog_end, self.time, 0.0],
             grid: self.gpu.grid.0,
             dims: self.gpu.grid.1,
         };
