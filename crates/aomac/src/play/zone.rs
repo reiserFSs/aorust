@@ -119,6 +119,7 @@ impl Zone {
                 let id = p.rdb_playfield().map_or(p.playfield_id, |i| i.instance) as u32;
                 self.playfield = Some(id);
                 self.reset_world();
+                self.world.on_playfield(id);
                 return ZoneEvent::Playfield(id);
             }
             N3::World(World::GameTime(t)) => {
