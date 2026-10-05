@@ -128,7 +128,7 @@ pub fn scene(count: usize) -> Scene {
     s.instances.push(Instance { mesh: gm_i, transform: scaled(2.5, Vec3::new(6., 1.25, 17.)) });
     s.sky.push(Instance { mesh: sky_i, transform: scaled(400.0, Vec3::ZERO) });
     for (p, c) in [([-9., 1.5, 20.], [3.0, 0.4, 0.3]), ([-2., 1.5, 21.], [0.3, 1.2, 3.0]), ([3., 1.5, 20.], [2.5, 2.2, 0.4]), ([9., 1.5, 21.], [0.6, 3.0, 0.8])] {
-        s.lights.push(ao_scene::Light { pos: p, color: c, range: 9.0 });
+        s.lights.push(ao_scene::Light { pos: p, color: c, range: 9.0, ..Default::default() });
     }
     // Dusk, so the emissive/glow/lit surfaces and point lights stand out.
     s.environment = Some(ao_scene::Environment {

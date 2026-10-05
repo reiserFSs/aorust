@@ -51,11 +51,17 @@ pub fn at_time(layers: &[Layer], t: f32) -> Layer {
     Layer { w: a.w, h: a.h, px }
 }
 
-/// Ground brightness of a shadow map sample `s` (0..1 = level / 15): `AnarchyGround_t::SetShadowMap` (DisplaySystem
-/// @0x10032570) builds a 16 entry palette `(level / 15 * 188 + 4) * (1 - fade)` (bytes; fade = 0 here), normalised to the lit
-/// level 15 (192) [guess: the engine's final gain of the lightmap stage is not decoded].
-pub fn brightness(s: f32) -> f32 {
-    (4.0 + 188.0 * s.clamp(0.0, 1.0)) / 192.0
+/// Palette entry of a shadow map sample `s` (0..1 = level / 15): `AnarchyGround_t::SetShadowMap` (DisplaySystem @0x10032570)
+/// fills a 16 entry palette with `(level / 15 * 188 + 4) * (1 - fade)` per channel (bytes, `_DAT_1008bd78` = 188,
+/// `_DAT_1008bd80` = 15, `_DAT_1008a698` = 4). `fade` is the float at `(*(obj + 0x2c)) + 8` (Gamecode `FUN_100bd614`, 0 when the
+/// pointer is null; what writes it is UNRESOLVED, 0 = no fade).
+///
+/// The ground draws with the two stage blob `AnarchyGround_t + 0x668` (ctor, DisplaySystem @0x100345xx): stage 0 =
+/// `COLOROP ADD(7)` of the shadow texture (this palette) and the diffuse vertex light, stage 1 = `MODULATE` of that and the
+/// tile texture, over the material `+0xa08` (diffuse white, **ambient black**): `tile * saturate(palette + sun * N.L + lights)`,
+/// no ambient term. Without a shadow map the single stage blob `+0x5e4` and material `+0xa0c` (ambient white) apply.
+pub fn palette(s: f32) -> f32 {
+    (4.0 + 188.0 * s.clamp(0.0, 1.0)) / 255.0
 }
 
 pub fn parse(d: &[u8]) -> Result<Vec<Layer>> {
@@ -112,7 +118,7 @@ mod tests {
         assert_eq!(at_time(&l, 50400.0).px[0], 80); // noon: layer 2 only
         assert_eq!(at_time(&l, 3000.0).px[0], 200); // night: layer 5
         assert_eq!(at_time(&l, 38700.0 + 11700.0 * 0.5).px[0], 60); // halfway 1 -> 2
-        assert!((brightness(1.0) - 1.0).abs() < 1e-6 && (brightness(0.0) - 4.0 / 192.0).abs() < 1e-6);
+        assert!((palette(1.0) - 192.0 / 255.0).abs() < 1e-6 && (palette(0.0) - 4.0 / 255.0).abs() < 1e-6);
     }
 
     #[test]

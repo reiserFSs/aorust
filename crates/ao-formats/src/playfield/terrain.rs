@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use ao_rdb::RecordStore;
-use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
+use ao_scene::{Blend, Environment, Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
 
 use super::ground::Tilemap;
 use super::shadow;
@@ -95,10 +95,23 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_
         [-dx / l, 1.0 / l, -dz / l]
     };
     // one texel per 2 cells along x, one per cell along z (see `shadow`)
-    let lit = |x: usize, z: usize| shade.as_ref().map_or(1.0, |s| shadow::brightness(s.sample(x as f32 * 0.5, z as f32)));
+    // With a shadow map the ground is `tile * saturate(palette + sun * N.L + lights)` (see `shadow::palette`), which the
+    // renderer's `prelit` mode (`min(vertex.rgb + 0.8 * ambient + lights, 1)`) evaluates when the vertex colour is
+    // `palette + sun * N.L - 0.8 * ambient` (computed here, linear in the interpolation like the engine's vertex lighting).
+    let env = scene.environment.unwrap_or(Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 0.0, fog_end: 1.0, ambient: [1.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0] });
+    let prelit = shade.is_some();
     let vertex = |x: usize, z: usize, a: f32, lift: f32| {
-        let l = lit(x, z);
-        Vertex { pos: [x as f32 * cs, tm.height(x, z) + lift, -(z as f32 * cs)], normal: normal(x, z), uv: [x as f32, z as f32], color: [l, l, l, a] }
+        let n = normal(x, z);
+        let color = match &shade {
+            Some(s) => {
+                let ndl = (n[0] * env.sun_dir[0] + n[1] * env.sun_dir[1] + n[2] * env.sun_dir[2]).max(0.0);
+                let p = shadow::palette(s.sample(x as f32 * 0.5, z as f32));
+                let c = [0, 1, 2].map(|c| p + env.sun_color[c] * ndl - 0.8 * env.ambient[c]);
+                [c[0], c[1], c[2], a]
+            }
+            None => [1.0, 1.0, 1.0, a],
+        };
+        Vertex { pos: [x as f32 * cs, tm.height(x, z) + lift, -(z as f32 * cs)], normal: n, uv: [x as f32, z as f32], color }
     };
     // CCW seen from +Y in scene space (z negated); bit 14 of the tile value picks the diagonal.
     let quad = |x: usize, z: usize, b: u32| {
@@ -158,11 +171,14 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_
             }
             for (t, indices) in base {
                 let texture = keys.get(&t).copied();
-                mesh.submeshes.push(Submesh::new(indices, texture));
+                let mut s = Submesh::new(indices, texture);
+                s.prelit = prelit;
+                mesh.submeshes.push(s);
             }
             for (t, indices) in over {
                 let mut s = Submesh::new(indices, keys.get(&t).copied());
                 s.blend = Blend::AlphaBlend;
+                s.prelit = prelit;
                 mesh.submeshes.push(s);
             }
             scene.meshes.push(mesh);

@@ -3,20 +3,21 @@
 //! ```text
 //! u32 version (=1)
 //! u32 offset[count]                 zone/room i = bytes [offset[i], offset[i+1]) (last: to end)
-//! global data: u32 v; if v != 4 { u16 n; n x statel; 2 x { u16 n; n x 18 byte fog/sound entry } }
+//! global data: u32 v; if v != 4 { u16 n; n x statel; { u16 n; n x fog entry }; { u16 n; n x sound entry } }
 //! zone, outdoor layout (heightfield playfields):
 //!   u16 k; k x u16; u16 n; n x statel; u16 n; n x statel;   (4 statel lists in total)
 //!   u16 n; n x statel; u16 n; n x statel; u16 n; n x light
 //! zone, dungeon layout:
-//!   u32 size; size bytes; 2 x { u16 n; n x 18 byte entry }; then the same last three lists
+//!   u32 size; size bytes; { u16 n; n x fog entry }; { u16 n; n x sound entry }; then the same last three lists
 //! statel := f32 x,y,z; u32 flags; u32 mesh_id; u8 scale; u8 nattr; attrs; [u32 colour if flags & 4]
+//! fog / sound entry := f32 x,y,z; u32 value; u16 radius      (`FUN_10027d90`, N3 @0x10027d90)
 //! ```
 
 use anyhow::{bail, ensure, Result};
 
 use super::record::Rd;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Statel {
     pub pos: [f32; 3],
     pub flags: u32,
@@ -24,14 +25,39 @@ pub struct Statel {
     pub mesh: u32,
     /// `scale/100 + 0.1` is the uniform scale.
     pub scale: u8,
+    /// `flags & 4`: per-instance colour word (the client keeps it with the statel; 9 212 of 2.36 M statels carry one).
+    pub colour: Option<u32>,
+    /// `(bit index, value)` attribute pairs: texture overrides `(SimpleMesh slot, rdb 1010004 id)` (`NewTextureData_t`).
+    pub attrs: Vec<(u8, u32)>,
+    /// Which of the four statel lists of the zone it came from (0..3; the lists are the zone's distance classes, see docs).
+    pub list: u8,
+}
+
+/// 18 byte fog or sound entry of the statel file (`n3StatelFog_t` / `n3StatelSound_t`, 0x14 bytes in memory with an
+/// active flag at +0x12). Position is zone-local for dungeon rooms, world space otherwise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Emitter {
+    pub pos: [f32; 3],
+    /// Fog: little endian `B, G, R, intensity %` (`StatelFogRun` N3 @0x10024dbc reads bytes +0xc/+0xd/+0xe as blue/green/red
+    /// and +0xf as intensity; `FUN_10027d90` clamps the intensity byte to 100). Sound: game sound id (`PlayGameSound`).
+    pub value: u32,
+    /// Influence radius in metres.
+    pub radius: u16,
+}
+
+/// Everything the statel file holds for one zone (outdoor tile block or dungeon room); `global` is zone-independent.
+#[derive(Debug, Default)]
+pub struct Zone {
+    pub statels: Vec<Statel>,
+    pub lights: Vec<Light>,
+    pub fogs: Vec<Emitter>,
+    pub sounds: Vec<Emitter>,
 }
 
 #[derive(Debug, Default)]
 pub struct StatelFile {
-    pub global: Vec<Statel>,
-    pub zones: Vec<Vec<Statel>>,
-    /// Per zone/room lights (same indexing as `zones`).
-    pub lights: Vec<Vec<Light>>,
+    pub global: Zone,
+    pub zones: Vec<Zone>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,36 +66,41 @@ pub enum Layout {
     Dungeon,
 }
 
-fn statel(r: &mut Rd) -> Result<Statel> {
+fn statel(r: &mut Rd, list: u8) -> Result<Statel> {
     let pos = r.vec3()?;
     let flags = r.u32()?;
     let mesh = r.u32()?;
     let scale = r.u8()?;
     let mut n = r.u8()?;
+    let mut attrs = Vec::new();
     while n != 0 {
         let mask = r.u32()?;
-        for _ in 0..mask.count_ones() {
-            r.u32()?;
+        for bit in (0..32u8).filter(|b| mask >> b & 1 != 0) {
+            attrs.push((bit, r.u32()?));
             n = n.wrapping_sub(1);
         }
     }
-    if flags & 4 != 0 {
-        r.u32()?; // colour
-    }
-    Ok(Statel { pos, flags, mesh, scale })
+    let colour = if flags & 4 != 0 { Some(r.u32()?) } else { None };
+    Ok(Statel { pos, flags, mesh, scale, colour, attrs, list })
 }
 
-fn statels(r: &mut Rd, out: &mut Vec<Statel>) -> Result<()> {
+fn statels(r: &mut Rd, out: &mut Vec<Statel>, list: u8) -> Result<()> {
     for _ in 0..r.u16()? {
-        out.push(statel(r)?);
+        out.push(statel(r, list)?);
     }
     Ok(())
 }
 
-fn fog_lists(r: &mut Rd) -> Result<()> {
-    for _ in 0..2 {
-        let n = r.u16()? as usize;
-        r.skip(n * 18)?;
+/// `FUN_10027d90`: fog list then sound list. Dungeon entries are room-local: the client turns them by the room rotation
+/// (`FUN_1003727d`, a Y rotation of an identity matrix) and adds the room position, exactly like statels.
+fn emitters(r: &mut Rd, zone: &mut Zone) -> Result<()> {
+    for list in 0..2 {
+        for _ in 0..r.u16()? {
+            let pos = r.vec3()?;
+            let (value, radius) = (r.u32()?, r.u16()?);
+            let value = if list == 0 && value >> 24 > 100 { value & 0xff_ffff | 100 << 24 } else { value };
+            [&mut zone.fogs, &mut zone.sounds][list].push(Emitter { pos, value, radius });
+        }
     }
     Ok(())
 }
@@ -115,96 +146,74 @@ fn lights(r: &mut Rd, out: &mut Vec<Light>) -> Result<()> {
     Ok(())
 }
 
-/// Below this `D3DLIGHT7` attenuation factor a light is treated as dark (calibration guess).
-const FAINT: f32 = 0.05;
-
-/// Maps a statel light onto the contract's `ao_scene::Light` (linear falloff to 0 at `range`).
+/// Maps a statel light onto the contract's `ao_scene::Light`, which carries the `D3DLIGHT7` fields the client sets
+/// (`RLight_t`, randy31 @0x1003fd4a): colour, `dvRange`, `dvAttenuation0..2` and, for spots, axis / `dvTheta` / `dvPhi`
+/// (`dvFalloff` = 1). The renderer evaluates the D3D7 fixed function formula, nothing is fitted.
 ///
 /// * `kind & 0x80` lights are never created by the client (`FUN_10026e66` returns null); lights with
 ///   `range == 0` are culled by `RVisual_t::CullLights` (`0 < dvRange` test) -> `None`.
-/// * D3D7 intensity is `1/(a0 + a1 d + a2 d^2)` up to `range`. The effective range is where it drops below
-///   [`FAINT`] (at most `range`); the peak `k` is the least-squares fit of `k (1 - d/R)` to `min(1, I(d))`
-///   capped at 1 (the framebuffer saturates). The client does its light maths on gamma values, so the colour is
-///   `(k * rgb/255)^2.2` like the ambient colour.
-/// * Spots (type 4) become point lights: the contract has no cones, so the light is moved along its axis
-///   by `R/2 (1 - sin(half angle))` (wide cones stay put, narrow ones light the area in front) and its range
-///   shrinks accordingly. A guess, no attempt at the cone edge.
+/// * The client does its light maths on gamma values, so the colour is `(rgb/255)^2.2` like the ambient colour.
+/// * A spot shines along its local +X; its half angles are doubled into `theta` / `phi` (`SetSpotAngles`).
 ///
 /// `frame` = `(rotation, translation)` of the owning dungeon room (AO space); `None` outdoors.
 pub fn scene_light(l: &Light, frame: Option<([[f32; 3]; 3], [f32; 3])>) -> Option<ao_scene::Light> {
     if l.kind & 0x80 != 0 || !matches!(l.kind & 0x1f, 2 | 4) || l.range <= 0.0 {
         return None;
     }
-    let inv = |d: f32| (l.att[0] + d * (l.att[1] + d * l.att[2])).recip();
-    const N: usize = 256;
-    let step = l.range / N as f32;
-    let reach = (0..=N).map(|i| i as f32 * step).find(|&d| inv(d).partial_cmp(&FAINT).is_none_or(|o| o.is_lt())).unwrap_or(l.range);
-    if reach <= 0.0 {
-        return None;
-    }
-    // k = 3 * integral_0^1 (1 - x) min(1, I(xR)) dx  (midpoint rule)
-    let k = (3.0 * (0..N).map(|i| { let x = (i as f32 + 0.5) / N as f32; (1.0 - x) * inv(x * reach).min(1.0) }).sum::<f32>() / N as f32).min(1.0);
-    let mut pos = l.pos;
-    let mut range = reach;
-    if l.kind & 0x1f == 4 {
+    let to_world = |v: [f32; 3], translate: bool| match frame {
+        Some((q, t)) => [0, 1, 2].map(|i| q[i][0] * v[0] + q[i][1] * v[1] + q[i][2] * v[2] + if translate { t[i] } else { 0.0 }),
+        None => v,
+    };
+    let scene = |v: [f32; 3]| [v[0], v[1], -v[2]];
+    let spot = (l.kind & 0x1f == 4).then(|| {
         let r = orientation(l.flags, 90);
-        let off = 0.5 * reach * (1.0 - l.cone[1].sin().abs());
-        for i in 0..3 {
-            pos[i] += r[i][0] * off;
-        }
-        range -= off;
-    }
-    if let Some((q, t)) = frame {
-        pos = [0, 1, 2].map(|i| q[i][0] * pos[0] + q[i][1] * pos[1] + q[i][2] * pos[2] + t[i]);
-    }
-    let color = l.rgb.map(|c| (k * c as f32 / 255.0).powf(2.2));
-    Some(ao_scene::Light { pos: [pos[0], pos[1], -pos[2]], color, range })
+        ao_scene::Spot { dir: scene(to_world([r[0][0], r[1][0], r[2][0]], false)), theta: 2.0 * l.cone[0], phi: 2.0 * l.cone[1] }
+    });
+    // all zero attenuation would be 1/0 in D3D (full intensity): keep it distinct from the contract's "linear" marker
+    let atten = if l.att == [0.0; 3] { [f32::MIN_POSITIVE, 0.0, 0.0] } else { l.att };
+    Some(ao_scene::Light { pos: scene(to_world(l.pos, true)), color: l.rgb.map(|c| (c as f32 / 255.0).powf(2.2)), range: l.range, atten, spot })
 }
 
-fn zone(d: &[u8], a: usize, b: usize, layout: Layout) -> Result<(Vec<Statel>, Vec<Light>)> {
+fn zone(d: &[u8], a: usize, b: usize, layout: Layout) -> Result<Zone> {
     ensure!(a <= b && b <= d.len(), "bad zone range {a}..{b}");
     let mut r = Rd::new(&d[..b], a);
-    let mut out = Vec::new();
+    let mut z = Zone::default();
     match layout {
         Layout::Outdoor => {
             let k = r.u16()? as usize;
             r.skip(2 * k)?;
-            statels(&mut r, &mut out)?;
-            statels(&mut r, &mut out)?;
+            statels(&mut r, &mut z.statels, 0)?;
+            statels(&mut r, &mut z.statels, 1)?;
         }
         Layout::Dungeon => {
             let size = r.u32()? as usize;
             r.skip(size)?;
-            fog_lists(&mut r)?;
+            emitters(&mut r, &mut z)?;
         }
     }
-    statels(&mut r, &mut out)?;
-    statels(&mut r, &mut out)?;
-    let mut lit = Vec::new();
-    lights(&mut r, &mut lit)?;
+    statels(&mut r, &mut z.statels, 2)?;
+    statels(&mut r, &mut z.statels, 3)?;
+    lights(&mut r, &mut z.lights)?;
     ensure!(r.o == b, "zone {a}..{b}: {} unparsed bytes", b - r.o);
-    Ok((out, lit))
+    Ok(z)
 }
 
 fn parse_layout(d: &[u8], count: usize, layout: Layout) -> Result<StatelFile> {
     let mut r = Rd::new(d, 0);
     ensure!(r.u32()? == 1, "unsupported statel file version");
     let offs: Vec<usize> = (0..count).map(|_| r.u32().map(|v| v as usize)).collect::<Result<_>>()?;
-    let mut global = Vec::new();
+    let mut global = Zone::default();
     // The global section only exists when zone 0 does not start right after the offset table.
     if offs.first().is_some_and(|&o| o > r.o) && r.u32()? != 4 {
-        statels(&mut r, &mut global)?;
-        fog_lists(&mut r)?;
+        statels(&mut r, &mut global.statels, 0)?;
+        emitters(&mut r, &mut global)?;
     }
     let mut zones = Vec::with_capacity(count);
-    let mut lit = Vec::with_capacity(count);
     for (i, &a) in offs.iter().enumerate() {
         let b = offs.get(i + 1).copied().unwrap_or(d.len());
-        let (z, l) = zone(d, a, b, layout)?;
-        zones.push(z);
-        lit.push(l);
+        zones.push(zone(d, a, b, layout)?);
     }
-    Ok(StatelFile { global, zones, lights: lit })
+    Ok(StatelFile { global, zones })
 }
 
 /// Parses with the layout expected for the playfield type, falling back to the other one
@@ -279,8 +288,10 @@ mod tests {
         d.extend(mesh.to_le_bytes());
         d.extend([90, nattr]);
         if nattr == 3 {
-            d.extend(7u32.to_le_bytes());
-            d.extend([0u8; 12]);
+            d.extend(0b10101u32.to_le_bytes()); // bits 0, 2, 4
+            for v in [40759u32, 0, 6315] {
+                d.extend(v.to_le_bytes());
+            }
         }
         d
     }
@@ -294,17 +305,43 @@ mod tests {
         o.extend(1u16.to_le_bytes());
         o.extend(statel_bytes(5.0, 0x2d00, 201717, 3));
         o.extend([0u8; 6]);
-        let (s, l) = zone(&o, 0, o.len(), Layout::Outdoor).unwrap();
-        assert!(l.is_empty());
-        assert_eq!(s, vec![Statel { pos: [5.0, 1.0, 2.0], flags: 0x2d00, mesh: 201717, scale: 90 }]);
+        let z = zone(&o, 0, o.len(), Layout::Outdoor).unwrap();
+        assert!(z.lights.is_empty());
+        assert_eq!(z.statels, vec![Statel { pos: [5.0, 1.0, 2.0], flags: 0x2d00, mesh: 201717, scale: 90, colour: None, attrs: vec![(0, 40759), (2, 0), (4, 6315)], list: 1 }]);
         // dungeon: size=0, 2 empty fog lists, C=1 statel, D, lights
         let mut dg = vec![0u8; 4 + 4];
         dg.extend(1u16.to_le_bytes());
         dg.extend(statel_bytes(-3.0, 0x2d00, 6255, 0));
         dg.extend([0u8; 4]);
-        assert_eq!(zone(&dg, 0, dg.len(), Layout::Dungeon).unwrap().0[0].mesh, 6255);
+        assert_eq!(zone(&dg, 0, dg.len(), Layout::Dungeon).unwrap().statels[0].mesh, 6255);
         // the same bytes are not a valid outdoor zone
         assert!(zone(&dg, 0, dg.len(), Layout::Outdoor).is_err());
+    }
+
+    #[test]
+    fn fog_and_sound_entries() {
+        let entry = |x: f32, value: u32, radius: u16| {
+            let mut d = Vec::new();
+            for v in [x, 0.0, 2.0] {
+                d.extend(v.to_le_bytes());
+            }
+            d.extend(value.to_le_bytes());
+            d.extend(radius.to_le_bytes());
+            d
+        };
+        // dungeon zone: empty blob, 2 fogs (the second with an intensity byte of 200 -> clamped to 100), 1 sound
+        let mut z = 0u32.to_le_bytes().to_vec();
+        z.extend(2u16.to_le_bytes());
+        z.extend(entry(1.0, 0x32_40_30_20, 15));
+        z.extend(entry(2.0, 0xc8_00_00_ff, 9));
+        z.extend(1u16.to_le_bytes());
+        z.extend(entry(-4.0, 1234, 60));
+        z.extend([0u8; 6]);
+        let z = zone(&z, 0, z.len(), Layout::Dungeon).unwrap();
+        assert_eq!(z.fogs.len(), 2);
+        assert_eq!((z.fogs[0].pos, z.fogs[0].value, z.fogs[0].radius), ([1.0, 0.0, 2.0], 0x32_40_30_20, 15));
+        assert_eq!(z.fogs[1].value, 0x64_00_00_ff);
+        assert_eq!((z.sounds[0].pos, z.sounds[0].value, z.sounds[0].radius), ([-4.0, 0.0, 2.0], 1234, 60));
     }
 
     fn light_bytes(kind: u8, extra: &[u16]) -> Vec<u8> {
@@ -344,20 +381,19 @@ mod tests {
         assert!(scene_light(&l(0x82, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), None).is_none());
         assert!(scene_light(&l(2, 0.0, [1.0, 0.0, 0.0], [0.0; 2]), None).is_none());
         assert!(scene_light(&l(1, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), None).is_none());
-        // constant intensity 1 inside the range: ramp fit 1.5 capped to 1; z is mirrored
-        let p = scene_light(&l(2, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), None).unwrap();
-        assert_eq!((p.pos, p.range), ([1.0, 2.0, -3.0], 10.0));
-        assert!((p.color[0] - 1.0).abs() < 1e-3 && p.color[1] == 0.0);
-        // faint beyond 1/(1+d) < 0.05 -> reach 19 m even though range is 100
-        let q = scene_light(&l(2, 100.0, [1.0, 1.0, 0.0], [0.0; 2]), None).unwrap();
-        assert!((q.range - 19.0).abs() < 0.5);
+        // D3D fields are passed through; z is mirrored; colour is gamma-converted
+        let p = scene_light(&l(2, 10.0, [1.0, 0.5, 0.25], [0.0; 2]), None).unwrap();
+        assert_eq!((p.pos, p.range, p.atten, p.spot), ([1.0, 2.0, -3.0], 10.0, [1.0, 0.5, 0.25], None));
+        assert!((p.color[0] - 1.0).abs() < 1e-6 && p.color[1] == 0.0);
         // room frame: rot 90 degrees about Y (x' = z) plus translation
         let f = Some((ry(std::f32::consts::FRAC_PI_2), [10.0, 0.0, 0.0]));
         let r = scene_light(&l(2, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), f).unwrap();
         assert!((r.pos[0] - 13.0).abs() < 1e-4 && (r.pos[2] + -1.0).abs() < 1e-4);
-        // narrow spot (half angle 0 deg) shifts along +X by R/2
-        let s = scene_light(&l(4, 10.0, [1.0, 0.0, 0.0], [0.0, 0.0]), None).unwrap();
-        assert!((s.pos[0] - 6.0).abs() < 1e-4 && (s.range - 5.0).abs() < 1e-4);
+        // spot: axis = local +X (scene z mirrored), angles doubled
+        let s = scene_light(&l(4, 10.0, [1.0, 0.0, 0.0], [0.2, 0.4]), None).unwrap().spot.unwrap();
+        assert!((s.dir[0] - 1.0).abs() < 1e-5 && (s.theta - 0.4).abs() < 1e-6 && (s.phi - 0.8).abs() < 1e-6);
+        // all-zero attenuation stays distinct from the contract's linear marker
+        assert_ne!(scene_light(&l(2, 10.0, [0.0; 3], [0.0; 2]), None).unwrap().atten, [0.0; 3]);
     }
 
     #[test]

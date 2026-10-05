@@ -48,13 +48,38 @@ pub fn list_playfields(store: &RecordStore) -> Result<Vec<(u32, String)>> {
     Ok(out)
 }
 
+/// Ambient sound source of the statel file (`n3StatelSound_t`): the client calls `PlayGameSound(id, pos, ...)` every
+/// frame the camera is within `radius` (`EvaluateStatelSoundFog`, N3 @0x10024eff). Scene space (z negated).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SoundEmitter {
+    pub pos: [f32; 3],
+    pub sound_id: u32,
+    pub radius: f32,
+}
+
+/// Local fog volume (`n3StatelFog_t`): inside `radius` the client calls `VisualFog_t::AddFog(color, density * (1 - (d/radius)^4))`
+/// (`StatelFogRun`, N3 @0x10024dbc). Scene space (z negated); `color` is gamma space RGB 0..1, `density` 0..1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FogVolume {
+    pub pos: [f32; 3],
+    pub color: [f32; 3],
+    pub density: f32,
+    pub radius: f32,
+}
+
 /// What a load produced and what it had to skip.
 #[derive(Debug, Default, Clone)]
 pub struct Report {
+    /// Ambient sound sources of the whole playfield (global and per zone/room).
+    pub sounds: Vec<SoundEmitter>,
+    /// Local fog volumes of the whole playfield.
+    pub fogs: Vec<FogVolume>,
     pub terrain_cells: usize,
     pub statels: usize,
     pub unique_meshes: usize,
-    /// Statels whose mesh record is missing.
+    /// Statels with mesh id 0: `FUN_1002777a` (N3 @0x1002777a) creates no object for them.
+    pub no_mesh_statels: usize,
+    /// Statels whose mesh record is absent from the database.
     pub missing_meshes: usize,
     /// Statels whose mesh failed to decode (first error kept).
     pub failed_meshes: usize,
@@ -108,30 +133,47 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
     } else {
         grid = Some(dungeon::build(store, &rec, &mut scene)?);
     }
-    if let Some(m) = water::build_mesh(&waters) {
-        scene.meshes.push(m);
-        scene.instances.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
-    }
+    water::emit(store, &waters, &mut scene);
     let fixed = scene.instances.len();
     if let Some(d) = store.get(STATELS, id)? {
         let layout = if rec.is_outdoor() { Layout::Outdoor } else { Layout::Dungeon };
         let file = statel::parse(&d, rec.count as usize, layout).with_context(|| format!("statels of playfield {id}"))?;
         let mut placer = Placer { store, scene: &mut scene, cache: HashMap::new(), report: &mut report };
-        for s in &file.global {
+        for s in &file.global.statels {
             placer.place(s, None);
         }
         for (i, zone) in file.zones.iter().enumerate() {
             let room = rec.rooms.get(i);
-            for s in zone {
+            for s in &zone.statels {
                 placer.place(s, room);
             }
         }
         report.unique_meshes = placer.cache.values().filter(|m| m.is_some()).count();
-        for (i, zl) in file.lights.iter().enumerate() {
+        for (i, zone) in file.zones.iter().enumerate() {
             let frame = rec.rooms.get(i).map(|r| (statel::ry(r.rot as f32 * std::f32::consts::FRAC_PI_2), r.pos));
-            scene.lights.extend(zl.iter().filter_map(|l| statel::scene_light(l, frame)));
+            scene.lights.extend(zone.lights.iter().filter_map(|l| statel::scene_light(l, frame)));
         }
-        props = file.zones.iter().map(|z| z.iter().filter(|s| s.mesh != 0).map(|s| s.pos).collect()).collect();
+        let rooms = std::iter::once(None).chain((0..file.zones.len()).map(|i| rec.rooms.get(i)));
+        for (z, room) in std::iter::once(&file.global).chain(&file.zones).zip(rooms) {
+            let at = |p: [f32; 3]| {
+                let p = match room {
+                    Some(r) => {
+                        let q = statel::ry(r.rot as f32 * std::f32::consts::FRAC_PI_2);
+                        [0, 1, 2].map(|i| q[i][0] * p[0] + q[i][1] * p[1] + q[i][2] * p[2] + r.pos[i])
+                    }
+                    None => p,
+                };
+                [p[0], p[1], -p[2]]
+            };
+            report.sounds.extend(z.sounds.iter().map(|e| SoundEmitter { pos: at(e.pos), sound_id: e.value, radius: e.radius as f32 }));
+            report.fogs.extend(z.fogs.iter().map(|e| FogVolume {
+                pos: at(e.pos),
+                color: [e.value >> 16, e.value >> 8, e.value].map(|c| (c & 0xff) as f32 / 255.0),
+                density: (e.value >> 24) as f32 / 100.0,
+                radius: e.radius as f32,
+            }));
+        }
+        props = file.zones.iter().map(|z| z.statels.iter().filter(|s| s.mesh != 0).map(|s| s.pos).collect()).collect();
     }
     if let Some(g) = &grid {
         spot = dungeon::entry_spot(g, &rec, &props);
@@ -169,16 +211,16 @@ fn terrain_height(tm: &ground::Tilemap, x: f32, z: f32) -> Option<f32> {
 struct Placer<'a> {
     store: &'a RecordStore,
     scene: &'a mut Scene,
-    cache: HashMap<u32, Option<usize>>,
+    cache: HashMap<(u32, Vec<(u8, u32)>), Option<usize>>,
     report: &'a mut Report,
 }
 
 impl Placer<'_> {
-    fn mesh(&mut self, id: u32) -> Option<usize> {
-        if let Some(&m) = self.cache.get(&id) {
+    fn mesh(&mut self, id: u32, attrs: &[(u8, u32)]) -> Option<usize> {
+        if let Some(&m) = self.cache.get(&(id, attrs.to_vec())) {
             return m;
         }
-        let m = match crate::mesh::decode_mesh_into(self.store, id, self.scene) {
+        let m = match crate::mesh::decode_statel_mesh(self.store, id, attrs, self.scene) {
             Ok(m) => m,
             Err(e) => {
                 self.report.first_mesh_error.get_or_insert_with(|| format!("mesh {id}: {e:#}"));
@@ -186,13 +228,17 @@ impl Placer<'_> {
                 None
             }
         };
-        self.cache.insert(id, m);
+        self.cache.insert((id, attrs.to_vec()), m);
         m
     }
 
     fn place(&mut self, s: &Statel, room: Option<&Room>) {
         self.report.statels += 1;
-        let Some(mesh) = self.mesh(s.mesh) else {
+        if s.mesh == 0 {
+            self.report.no_mesh_statels += 1;
+            return;
+        }
+        let Some(mesh) = self.mesh(s.mesh, &s.attrs) else {
             self.report.missing_meshes += 1;
             return;
         };

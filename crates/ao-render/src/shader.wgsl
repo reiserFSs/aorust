@@ -62,7 +62,9 @@ fn vs_sky(v: VIn) -> VOut {
     return o;
 }
 
-// Sum of static point lights from the cell containing `p` (linear falloff to 0 at range, wrapped lambert).
+// Sum of static lights from the cell containing `p`: D3D7 fixed function diffuse term
+// `colour * N.L * 1 / (a0 + a1 d + a2 d^2) * spot` for d <= range (zero beyond: dvRange is a hard cut); lights without
+// attenuation coefficients (a0 < 0) use the linear ramp 1 - d / range.
 fn point_lights(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let c = vec3<i32>(floor((p - g.grid.xyz) / g.grid.w));
     if any(c < vec3<i32>(0)) || any(c >= g.dims.xyz) {
@@ -72,13 +74,21 @@ fn point_lights(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
     // D3D7 fixed function: at most 8 active lights; the cell list is sorted strongest first.
     for (var k = 0u; k < min(e.y, 8u); k = k + 1u) {
-        let li = light_idx[e.x + k] * 2u;
+        let li = light_idx[e.x + k] * 4u;
         let a = lights[li];
+        let col = lights[li + 1u];
+        let att = lights[li + 2u];
         let d = a.xyz - p;
         let dist = length(d);
-        if dist < a.w {
-            let ndl = clamp((dot(n, d / max(dist, 1e-3)) + 0.5) / 1.5, 0.0, 1.0);
-            sum += lights[li + 1u].rgb * ((1.0 - dist / a.w) * ndl);
+        if dist <= a.w {
+            let l = d / max(dist, 1e-3);
+            var i = select(1.0 - dist / a.w, 1.0 / (att.x + dist * (att.y + dist * att.z)), att.x >= 0.0);
+            if col.w < 1.5 {
+                // spot: rho = cos(angle between -L and the axis); 1 inside theta/2, 0 outside phi/2, linear between
+                let rho = dot(-l, lights[li + 3u].xyz);
+                i = i * clamp((rho - col.w) / max(att.w - col.w, 1e-4), 0.0, 1.0);
+            }
+            sum += col.rgb * (i * max(dot(n, l), 0.0));
         }
     }
     return sum;

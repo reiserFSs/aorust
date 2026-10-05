@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use wgpu::util::DeviceExt;
 
-pub use viewer::run_viewer;
+pub use egui;
+pub use viewer::{run_frontend, run_viewer, Frontend, Host};
 
 const MSAA: u32 = 4;
 const INST_RING: usize = 3;
@@ -122,7 +123,7 @@ const MAX_CELLS: usize = 1 << 20;
 
 /// Static light grid: dense 3D cells, each listing up to `CELL_LIGHTS` lights whose sphere touches it.
 struct LightGrid {
-    lights: Vec<[f32; 4]>, // pairs: (pos, range), (colour, 0)
+    lights: Vec<[f32; 4]>, // 4 per light: (pos, range), (colour, cos(phi/2) | 2 = no cone), (atten0..2, cos(theta/2)), (axis, 0)
     cells: Vec<[u32; 2]>,  // (first index, count)
     idx: Vec<u32>,
     origin: Vec3,
@@ -134,7 +135,7 @@ impl LightGrid {
     fn new(lights: &[ao_scene::Light]) -> Self {
         let lights: Vec<_> = lights.iter().filter(|l| l.range > 0.0 && l.pos.iter().all(|v| v.is_finite())).collect();
         if lights.is_empty() {
-            return Self { lights: vec![[0.0; 4]; 2], cells: vec![[0, 0]], idx: vec![0], origin: Vec3::ZERO, cell: 1.0, dims: [0; 3] };
+            return Self { lights: vec![[0.0; 4]; 4], cells: vec![[0, 0]], idx: vec![0], origin: Vec3::ZERO, cell: 1.0, dims: [0; 3] };
         }
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for l in &lights {
@@ -154,6 +155,7 @@ impl LightGrid {
         for (li, l) in lights.iter().enumerate() {
             let p = Vec3::from(l.pos);
             let lum = l.color[0] + l.color[1] + l.color[2];
+            let d3d = l.atten != [0.0; 3];
             let a = ((p - l.range - lo) / cell).floor();
             let b = ((p + l.range - lo) / cell).floor();
             for z in (a.z.max(0.0) as i32)..=(b.z as i32).min(dims[2] - 1) {
@@ -165,7 +167,10 @@ impl LightGrid {
                             continue;
                         }
                         let centre = cmin + cell * 0.5;
-                        pairs.push((cell_of(x, y, z), lum / ((centre - p).length_squared() + cell * cell), li as u32));
+                        let dist = (centre - p).length();
+                        // intensity at the cell centre (capped at 1: the framebuffer saturates) ranks the lights of a cell
+                        let i = if d3d { (l.atten[0] + dist * (l.atten[1] + dist * l.atten[2])).recip().min(1.0) } else { (1.0 - dist / l.range).max(0.0) };
+                        pairs.push((cell_of(x, y, z), lum * i / (1.0 + dist / cell), li as u32));
                     }
                 }
             }
@@ -186,7 +191,15 @@ impl LightGrid {
         if idx.is_empty() {
             idx.push(0);
         }
-        let gl = lights.iter().flat_map(|l| [[l.pos[0], l.pos[1], l.pos[2], l.range], [l.color[0], l.color[1], l.color[2], 0.0]]).collect();
+        let gl = lights
+            .iter()
+            .flat_map(|l| {
+                // kind: 0 = linear ramp, 1 = D3D attenuation (atten x of the third vec4 is then the divisor sum)
+                let (cos_phi, cos_theta, axis) = l.spot.map_or((2.0, 0.0, [0.0; 3]), |s| ((s.phi * 0.5).cos(), (s.theta * 0.5).cos(), s.dir));
+                let a = if l.atten == [0.0; 3] { [-1.0, 0.0, 0.0] } else { l.atten }; // a0 < 0: linear
+                [[l.pos[0], l.pos[1], l.pos[2], l.range], [l.color[0], l.color[1], l.color[2], cos_phi], [a[0], a[1], a[2], cos_theta], [axis[0], axis[1], axis[2], 0.0]]
+            })
+            .collect();
         Self { lights: gl, cells, idx, origin: lo, cell, dims }
     }
 }
@@ -572,7 +585,7 @@ impl Renderer {
             let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&vertex_bytes(&mesh.vertices)),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
             let mut indices = Vec::with_capacity(idx_total);
             for s in &mesh.submeshes {
@@ -647,6 +660,24 @@ impl Renderer {
         self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
         self.gpu = Gpu { meshes, inst_bufs, sky_bufs, mats, opaque, blended, sky, sky_xf, insts, mesh_range, radius, grid };
+    }
+
+    /// Re-poses the uploaded scene in place: `scene` must be the same scene with only vertex positions/normals and
+    /// instance transforms changed (an animated character); textures, materials and indices are kept.
+    pub fn repose(&mut self, scene: &Scene) {
+        let mut seen = vec![0; self.gpu.mesh_range.len()];
+        for i in &scene.instances {
+            let Some(r) = self.gpu.mesh_range.get(i.mesh) else { continue };
+            if let Some(inst) = self.gpu.insts.get_mut(r.start + seen[i.mesh]).filter(|_| seen[i.mesh] < r.len()) {
+                inst.m = i.transform;
+            }
+            seen[i.mesh] += 1;
+        }
+        for (m, gpu) in scene.meshes.iter().zip(&self.gpu.meshes) {
+            if let Some((vb, _)) = gpu {
+                self.queue.write_buffer(vb, 0, bytemuck::cast_slice(&vertex_bytes(&m.vertices)));
+            }
+        }
     }
 
     /// Scene radius; viewer uses it for speed.

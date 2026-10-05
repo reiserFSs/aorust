@@ -62,6 +62,9 @@ pub struct Submesh {
     /// Baked-lighting surface (dungeon room shells): vertex colour is *emissive* light,
     /// `lit = tex * material * (vertex.rgb + 0.8 * ambient)`; no sun or point lights. Fog still applies.
     pub prelit: bool,
+    /// Texture coordinate drift in uv units per second (added to the vertex uv, wrapped by the sampler): scrolling clouds,
+    /// water-like layers. `[0, 0]` = static.
+    pub uv_scroll: [f32; 2],
 }
 
 impl Submesh {
@@ -75,17 +78,34 @@ impl Submesh {
             emissive: [0.0; 3],
             glow_mask: false,
             prelit: false,
+            uv_scroll: [0.0; 2],
         }
     }
 }
 
-/// Dynamic-style point light (world space), linear attenuation to zero at `range`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Dynamic-style light (world space), the fixed function D3D7 light of the original client (`D3DLIGHT7`).
+///
+/// Intensity at distance `d <= range` is `1 / (atten0 + atten1 d + atten2 d^2)` (D3D attenuation), 0 beyond `range`;
+/// with `atten == [0; 3]` it is the linear ramp `1 - d / range`. A [`Spot`] multiplies the D3D cone factor.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Light {
     pub pos: [f32; 3],
-    /// Linear RGB, already multiplied by intensity.
+    /// Linear RGB (the D3D diffuse colour).
     pub color: [f32; 3],
     pub range: f32,
+    /// `D3DLIGHT7.dvAttenuation0..2`; all zero = linear falloff to zero at `range`.
+    pub atten: [f32; 3],
+    pub spot: Option<Spot>,
+}
+
+/// `D3DLIGHT_SPOT` cone: full inner angle `theta` and outer angle `phi` (radians, `dvTheta` / `dvPhi`), falloff 1:
+/// factor 1 inside `theta`, 0 outside `phi`, linear in `cos(angle / 2)` between.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spot {
+    /// Unit axis (world space).
+    pub dir: [f32; 3],
+    pub theta: f32,
+    pub phi: f32,
 }
 
 #[derive(Clone, Debug, Default)]
