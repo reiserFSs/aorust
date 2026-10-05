@@ -1,5 +1,6 @@
 //! wgpu renderer for `ao_scene::Scene`: windowed free-fly viewer (`viewer`) and offscreen PNG path.
 
+mod gui;
 mod viewer;
 
 use anyhow::{anyhow, Context, Result};
@@ -11,6 +12,7 @@ use std::path::Path;
 use wgpu::util::DeviceExt;
 
 pub use egui;
+pub use gui::GuiRenderer;
 pub use viewer::{run_frontend, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
 
 const MSAA: u32 = 4;

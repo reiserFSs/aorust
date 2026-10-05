@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 ao-scene.workspace = true
+ao-gui.workspace = true
 wgpu = "29"
 winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
