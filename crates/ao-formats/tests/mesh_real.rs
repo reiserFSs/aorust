@@ -57,3 +57,19 @@ fn materials_carry_colour_blend_and_cull() {
     let s = &load_mesh(&store, 3722).unwrap().meshes[0].submeshes;
     assert!(s.iter().any(|s| !s.two_sided) && s.iter().any(|s| s.two_sided));
 }
+
+#[test]
+fn glow_and_emissive_fields_are_emitted() {
+    let Some(store) = store() else { return };
+    let (mut glow, mut emissive) = (0, 0);
+    for id in store.ids(MESH_TYPE).unwrap().into_iter().step_by(10) {
+        let mut scene = ao_scene::Scene::default();
+        let idx = ao_formats::mesh::decode_record_into(&store, MESH_TYPE, id, &mut scene).unwrap().unwrap();
+        for s in &scene.meshes[idx].submeshes {
+            assert!(!s.glow_mask || (s.blend == ao_scene::Blend::Opaque && s.texture.is_some()), "{id}: glow mask on a non-opaque/untextured submesh");
+            glow += usize::from(s.glow_mask);
+            emissive += usize::from(s.emissive != [0.0; 3]);
+        }
+    }
+    assert!(glow > 100 && emissive > 100, "glow {glow}, emissive {emissive}");
+}

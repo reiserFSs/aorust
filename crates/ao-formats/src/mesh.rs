@@ -9,7 +9,7 @@ use crate::archive::{Archive, Object};
 use crate::texture::load_texture;
 use anyhow::{bail, ensure, Context, Result};
 use ao_rdb::RecordStore;
-use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
+use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, Texture, TextureKey, Vertex, IDENTITY};
 use std::collections::HashMap;
 
 /// Primary static-mesh record type (full detail).
@@ -23,6 +23,10 @@ const D3DRS_DESTBLEND: i32 = 20;
 const D3DRS_CULLMODE: i32 = 22;
 const D3DRS_ALPHATESTENABLE: i32 = 15;
 const D3DRS_ALPHABLENDENABLE: i32 = 27;
+const D3DTSS_COLOROP: i32 = 1;
+const D3DTSS_COLORARG1: i32 = 2;
+const D3DTOP_ADD: i32 = 7;
+const D3DTA_ALPHAREPLICATE: i32 = 0x20;
 const D3DBLEND_ONE: i32 = 2;
 const D3DBLEND_SRCALPHA: i32 = 5;
 const D3DCULL_NONE: i32 = 1;
@@ -54,8 +58,25 @@ pub fn decode_record_into(store: &RecordStore, rdb_type: u32, id: u32, scene: &m
         scene.textures.contains_key(&key)
     })
     .with_context(|| format!("decoding mesh {rdb_type}/{id}"))?;
+    let mut mesh = mesh;
+    for sub in &mut mesh.submeshes {
+        if sub.blend == Blend::AlphaBlend && sub.base_color[3] >= 1.0 && sub.texture.and_then(|k| scene.textures.get(&k)).is_some_and(is_cutout) {
+            sub.blend = Blend::AlphaTest;
+        }
+    }
     scene.meshes.push(mesh);
     Ok(Some(scene.meshes.len() - 1))
+}
+
+/// Fraction of texels with a partial alpha (16..240) below which a blended texture is treated as a
+/// cutout. Guess: the engine blends these (rst 27=1, z-write off, sorted), but a texture whose alpha is
+/// essentially 0/255 looks the same alpha-tested while avoiding per-instance depth sorting.
+const CUTOUT_PARTIAL_MAX: f32 = 0.02;
+
+/// True for a texture whose alpha is (almost) only 0 or 255.
+fn is_cutout(t: &Texture) -> bool {
+    let partial = t.rgba.chunks_exact(4).filter(|p| (16..240).contains(&p[3])).count();
+    (partial as f32) <= CUTOUT_PARTIAL_MAX * (t.rgba.len() / 4) as f32
 }
 
 /// Row-major 4x4 for row vectors (`v' = v * M`), as used by the original engine.
@@ -106,12 +127,16 @@ struct MatKey {
     blend: Blend,
     two_sided: bool,
     color: [f32; 4],
+    emissive: [f32; 3],
+    glow_mask: bool,
 }
+
+type MatId = (Option<TextureKey>, u8, bool, [u32; 4], [u32; 3], bool);
 
 impl MatKey {
     /// Hashable identity (`Blend` and `f32` are not `Hash`).
-    fn id(&self) -> (Option<TextureKey>, u8, bool, [u32; 4]) {
-        (self.texture, self.blend as u8, self.two_sided, self.color.map(f32::to_bits))
+    fn id(&self) -> MatId {
+        (self.texture, self.blend as u8, self.two_sided, self.color.map(f32::to_bits), self.emissive.map(f32::to_bits), self.glow_mask)
     }
 }
 
@@ -119,7 +144,7 @@ struct Builder<'a, 'b> {
     ar: &'b Archive<'a>,
     mesh: Mesh,
     /// material -> index into `mesh.submeshes`
-    groups: HashMap<(Option<TextureKey>, u8, bool, [u32; 4]), usize>,
+    groups: HashMap<MatId, usize>,
     have_texture: &'b mut dyn FnMut(TextureKey) -> bool,
     visited: Vec<bool>,
 }
@@ -201,7 +226,17 @@ impl Builder<'_, '_> {
         let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
         let [r, g, b] = mat.and_then(|m| m.f32s::<3>("diff")).unwrap_or([1.0; 3]);
         let a = mat.and_then(|m| m.f32s::<1>("opac")).map_or(1.0, |o| o[0]);
-        MatKey { texture: tex, blend, two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [lin(r), lin(g), lin(b), a] }
+        // `FUN_1004ac5f` @1004ac5f: EMISSIVEMATERIALSOURCE (148) = MATERIAL only when the emissive
+        // luminance (0.299R+0.587G+0.114B, `FUN_1004a8c0`) exceeds 0; otherwise it reads the (absent) vertex colour.
+        let emis = mat.and_then(|m| m.f32s::<3>("emis")).unwrap_or([0.0; 3]);
+        let emissive = if 0.299 * emis[0] + 0.587 * emis[1] + 0.114 * emis[2] > 0.0 { emis.map(lin) } else { [0.0; 3] };
+        // Mode 5 of `FUN_10040645` (texture-alpha glow): stage 0 COLOROP = ADD, COLORARG1 = TEXTURE|ALPHAREPLICATE.
+        let stage0 = |ty: i32| [mat_ds, node_ds].into_iter().flatten().find_map(|ds| tss(ds, 0, ty));
+        let glow_mask = blend == Blend::Opaque
+            && tex.is_some()
+            && stage0(D3DTSS_COLOROP) == Some(D3DTOP_ADD)
+            && stage0(D3DTSS_COLORARG1).is_some_and(|v| v & D3DTA_ALPHAREPLICATE != 0);
+        MatKey { texture: tex, blend, two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [lin(r), lin(g), lin(b), a], emissive, glow_mask }
     }
 
     fn simple_mesh(&mut self, node_ds: Option<&Object>, sm: &Object, world: &Mat) -> Result<()> {
@@ -236,7 +271,7 @@ impl Builder<'_, '_> {
         let reverse = det3(world) >= 0.0;
         let key = self.material(node_ds, sm);
         let sub = *self.groups.entry(key.id()).or_insert_with(|| {
-            self.mesh.submeshes.push(Submesh { blend: key.blend, two_sided: key.two_sided, base_color: key.color, ..Submesh::new(vec![], key.texture) });
+            self.mesh.submeshes.push(Submesh { blend: key.blend, two_sided: key.two_sided, base_color: key.color, emissive: key.emissive, glow_mask: key.glow_mask, ..Submesh::new(vec![], key.texture) });
             self.mesh.submeshes.len() - 1
         });
         for t in tris.chunks_exact(6) {
@@ -249,6 +284,16 @@ impl Builder<'_, '_> {
         }
         Ok(())
     }
+}
+
+/// Texture-stage state `ty` of `stage` in a `RDeltaState` (`tstm_count` entries per stage, then
+/// `tst_type`/`tst_value` pairs, each member holding all elements; last write wins).
+fn tss(ds: &Object, stage: usize, ty: i32) -> Option<i32> {
+    let ints = |n: &str| ds.all(n).flat_map(|d| d.chunks_exact(4)).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>();
+    let (counts, types, values) = (ints("tstm_count"), ints("tst_type"), ints("tst_value"));
+    let first: usize = counts.get(..stage)?.iter().map(|&c| c as usize).sum();
+    let n = *counts.get(stage)? as usize;
+    types.get(first..first + n)?.iter().zip(values.get(first..first + n)?).rfind(|(t, _)| **t == ty).map(|(_, v)| *v)
 }
 
 fn le(d: &[u8]) -> Option<i32> {
@@ -368,7 +413,11 @@ mod tests {
 
     /// One triangle with a `FAFMaterial_t` (diffuse, opacity) and a material `RDeltaState` holding `states`.
     fn material_mesh(diff: [f32; 3], opac: f32, states: &[(i32, i32)]) -> Submesh {
-        const NAMES: [&str; 13] = ["obj", "data", "mesh", "vb_desc", "vertices", "trilist", "triangles", "material", "delta_state", "diff", "opac", "rst_type", "rst_value"];
+        material_mesh_emis(diff, [0.0; 3], opac, states)
+    }
+
+    fn material_mesh_emis(diff: [f32; 3], emis: [f32; 3], opac: f32, states: &[(i32, i32)]) -> Submesh {
+        const NAMES: [&str; 14] = ["obj", "data", "mesh", "vb_desc", "vertices", "trilist", "triangles", "material", "delta_state", "diff", "opac", "rst_type", "rst_value", "emis"];
         let mut b = vec![];
         for x in [3u32, 0, 0, 1, NAMES.len() as u32] {
             b.extend(x.to_le_bytes());
@@ -390,7 +439,7 @@ mod tests {
         b.extend(object(&[member(3, 9, &desc), member(4, 9, &blob(&vb)), member(5, 0x11, &r(&[3])), member(7, 0x11, &r(&[4]))]));
         let tris: Vec<u8> = [0u16, 1, 2].iter().flat_map(|i| i.to_le_bytes()).collect();
         b.extend(object(&[member(6, 9, &blob(&tris))]));
-        b.extend(object(&[member(8, 0x11, &r(&[5])), member(9, 0x10, &fl(&diff)), member(10, 0xa, &fl(&[opac]))]));
+        b.extend(object(&[member(8, 0x11, &r(&[5])), member(9, 0x10, &fl(&diff)), member(10, 0xa, &fl(&[opac])), member(13, 0x10, &fl(&emis))]));
         let mut ds = vec![];
         for &(t, v) in states {
             ds.push(member(11, 3, &r(&[t])));
@@ -408,6 +457,25 @@ mod tests {
         let s = material_mesh([0.5, 0.0, 1.0], 0.25, &[]);
         assert_eq!((s.blend, s.two_sided, s.texture), (Blend::Opaque, false, None));
         assert!((s.base_color[0] - 0.2140).abs() < 1e-3 && s.base_color[1] == 0.0 && s.base_color[2] == 1.0 && s.base_color[3] == 0.25);
+    }
+
+    #[test]
+    fn emissive_is_linear_and_only_kept_when_luminous() {
+        let s = material_mesh_emis([1.0; 3], [0.5, 0.0, 1.0], 1.0, &[]);
+        assert!((s.emissive[0] - 0.2140).abs() < 1e-3 && s.emissive[1] == 0.0 && s.emissive[2] == 1.0);
+        assert_eq!(material_mesh([1.0; 3], 1.0, &[]).emissive, [0.0; 3]);
+        assert!(!s.glow_mask);
+    }
+
+    #[test]
+    fn texture_stage_states_are_read_per_stage() {
+        // mode 5 of @10040645: stage 0 {ARG1 = TEXTURE|ALPHAREPLICATE, OP = ADD, ARG2 = DIFFUSE, ALPHAOP = DISABLE}, stage 1 {ARG1 = TEXTURE, OP = MODULATE, ARG2 = CURRENT}
+        let i = |v: &[i32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        let m = |name, d: &[u8]| crate::archive::Member { name, data: d.to_vec().leak() };
+        let ds = Object { members: vec![m("tstm_count", &i(&[4])), m("tst_type", &i(&[2, 1, 3, 4])), m("tst_value", &i(&[0x22, 7, 0, 1])), m("tstm_count", &i(&[3])), m("tst_type", &i(&[2, 1, 3])), m("tst_value", &i(&[2, 4, 1]))] };
+        assert_eq!((tss(&ds, 0, D3DTSS_COLORARG1), tss(&ds, 0, D3DTSS_COLOROP)), (Some(0x22), Some(D3DTOP_ADD)));
+        assert_eq!((tss(&ds, 1, D3DTSS_COLORARG1), tss(&ds, 1, D3DTSS_COLOROP)), (Some(2), Some(4)));
+        assert_eq!(tss(&ds, 2, D3DTSS_COLOROP), None);
     }
 
     #[test]
