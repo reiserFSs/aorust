@@ -15,7 +15,10 @@ use anyhow::{bail, Result};
 
 pub const HEADER_LEN: usize = 16;
 pub const PT_SYSTEM: u16 = 1;
-pub const PT_COMPRESSION: u16 = 0x7F;
+/// Compression control. The client compares the *raw little-endian* short at header offset 2 with 0x7F
+/// (`Connection_t::Receive`/`Send`), so the wire bytes are `7f 00`: 0x7F00 as the big-endian `ptype` read here
+/// (seen live, docs/protocol.md §8).
+pub const PT_COMPRESSION: u16 = 0x7F00;
 /// Receive-side hard limit in `Connection_t::Receive`; the size field itself is u16.
 pub const MAX_SIZE: usize = 0xFFFF;
 
@@ -49,6 +52,12 @@ impl Frame {
     /// Parse one frame from the front of `buf`. `Ok(None)` = need more bytes.
     /// Returns the frame and the number of bytes consumed (including padding).
     pub fn decode(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
+        Self::decode_with(buf, true)
+    }
+
+    /// As [`decode`](Self::decode); `padded = false` while receive compression is active (`Connection_t::Receive`
+    /// only rounds the size up to 4 when `this+0xc == 0`).
+    pub fn decode_with(buf: &[u8], padded: bool) -> Result<Option<(Frame, usize)>> {
         if buf.len() < HEADER_LEN {
             return Ok(None);
         }
@@ -58,8 +67,8 @@ impl Frame {
         if size < HEADER_LEN {
             bail!("frame size {size} < header");
         }
-        let padded = (size + 3) & !3;
-        if buf.len() < padded {
+        let used = if padded { (size + 3) & !3 } else { size };
+        if buf.len() < used {
             return Ok(None);
         }
         let f = Frame {
@@ -69,7 +78,7 @@ impl Frame {
             receiver: u32at(12),
             payload: buf[HEADER_LEN..size].to_vec(),
         };
-        Ok(Some((f, padded)))
+        Ok(Some((f, used)))
     }
 
     /// System-message payload = `u32 msg_type` + body (Message_t::HeaderSize(1) == 0x14).

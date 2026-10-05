@@ -73,6 +73,7 @@ fn main() -> anyhow::Result<()> {
     let mut a = std::env::args().skip(1);
     let (mut server, mut user, mut version) = (None, "aomac-probe".to_owned(), "00.7.2_EP1".to_owned());
     let (mut wait, mut bogus, mut garbage, mut login, mut out) = (5u64, false, false, false, None);
+    let mut select = None::<usize>; // --select N: pick the Nth listed character after login and stay in the zone for --wait seconds
     while let Some(k) = a.next() {
         match k.as_str() {
             "--server" => server = a.next(),
@@ -82,6 +83,7 @@ fn main() -> anyhow::Result<()> {
             "--bogus-credentials" => bogus = true,
             "--garbage-credentials" => garbage = true,
             "--login" => login = true,
+            "--select" => select = a.next().and_then(|v| v.parse().ok()),
             "--out" => out = a.next(),
             _ => anyhow::bail!("unknown argument {k} (passwords are never accepted as arguments)"),
         }
@@ -107,10 +109,15 @@ fn main() -> anyhow::Result<()> {
         let pw = prompt_password();
         let s = LoginSession::connect_traced(&entry, tap(out))?;
         s.login(u.trim(), &pw);
-        let end = Instant::now() + Duration::from_secs(wait.max(60));
+        let end = Instant::now() + Duration::from_secs(if select.is_some() { wait } else { wait.max(60) });
         while Instant::now() < end {
             while let Some(ev) = s.poll() {
                 println!("{ev:?}");
+                if let (LoginEvent::CharacterList(l), Some(n)) = (&ev, select) {
+                    if let Some(c) = l.characters.get(n) {
+                        s.select_character(c.id as u32);
+                    }
+                }
                 if matches!(ev, LoginEvent::Disconnected(_) | LoginEvent::LoginError { .. } | LoginEvent::Rejected { .. }) {
                     return Ok(());
                 }

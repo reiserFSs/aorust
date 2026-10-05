@@ -45,10 +45,10 @@ pub struct Identity {
 }
 
 impl Identity {
-    fn read(r: &mut Reader) -> Result<Self> {
+    pub fn read(r: &mut Reader) -> Result<Self> {
         Ok(Self { kind: r.i32()?, instance: r.i32()? })
     }
-    fn write(&self, w: &mut Writer) {
+    pub fn write(&self, w: &mut Writer) {
         w.i32(self.kind);
         w.i32(self.instance);
     }
