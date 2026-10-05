@@ -148,7 +148,7 @@ pub fn parse_objects(text: &str) -> Vec<Obj> {
 pub fn eval(expr: &str, var: &dyn Fn(&str) -> Option<f32>) -> Option<f32> {
     let b = expr.as_bytes();
     let mut pos = 0;
-    let v = binary(b, &mut pos, var)?;
+    let v = binary(b, &mut pos, var, 0)?;
     skip_ws(b, &mut pos);
     (pos == b.len()).then_some(v)
 }
@@ -159,8 +159,11 @@ fn skip_ws(b: &[u8], p: &mut usize) {
     }
 }
 
-fn binary(b: &[u8], p: &mut usize, var: &dyn Fn(&str) -> Option<f32>) -> Option<f32> {
-    let mut acc = primary(b, p, var)?;
+/// Nesting limit of parentheses / unary minus (the data never exceeds 3; deeper input is rejected, not recursed into).
+const MAX_NEST: u32 = 64;
+
+fn binary(b: &[u8], p: &mut usize, var: &dyn Fn(&str) -> Option<f32>, nest: u32) -> Option<f32> {
+    let mut acc = primary(b, p, var, nest)?;
     loop {
         skip_ws(b, p);
         let Some(&op) = b.get(*p) else { return Some(acc) };
@@ -168,7 +171,7 @@ fn binary(b: &[u8], p: &mut usize, var: &dyn Fn(&str) -> Option<f32>) -> Option<
             return Some(acc);
         }
         *p += 1;
-        let rhs = primary(b, p, var)?;
+        let rhs = primary(b, p, var, nest)?;
         acc = match op {
             b'+' => acc + rhs,
             b'-' => acc - rhs,
@@ -179,16 +182,19 @@ fn binary(b: &[u8], p: &mut usize, var: &dyn Fn(&str) -> Option<f32>) -> Option<
     }
 }
 
-fn primary(b: &[u8], p: &mut usize, var: &dyn Fn(&str) -> Option<f32>) -> Option<f32> {
+fn primary(b: &[u8], p: &mut usize, var: &dyn Fn(&str) -> Option<f32>, nest: u32) -> Option<f32> {
+    if nest > MAX_NEST {
+        return None;
+    }
     skip_ws(b, p);
     match *b.get(*p)? {
         b'-' => {
             *p += 1;
-            Some(-primary(b, p, var)?)
+            Some(-primary(b, p, var, nest + 1)?)
         }
         b'(' => {
             *p += 1;
-            let v = binary(b, p, var)?;
+            let v = binary(b, p, var, nest + 1)?;
             skip_ws(b, p);
             (b.get(*p) == Some(&b')')).then(|| *p += 1)?;
             Some(v)
@@ -315,6 +321,24 @@ impl Ctx {
 
 const DAY_LENGTH: f32 = 6480.0;
 
+thread_local! {
+    /// Remaining variable/rotation-term evaluations of the current top-level evaluation.
+    static BUDGET: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Evaluations one top-level expression may spend on `This.X` references and `[ROT]` terms. The sky scripts need < 20;
+/// a hostile script with many references per level would otherwise multiply out to `refs^depth`.
+const BUDGET_PER_EVAL: u32 = 2000;
+
+fn reset_budget() {
+    BUDGET.with(|b| b.set(BUDGET_PER_EVAL));
+}
+
+/// Spends one evaluation; `None` once the budget is gone.
+fn spend() -> Option<()> {
+    BUDGET.with(|b| b.get().checked_sub(1).map(|v| b.set(v)))
+}
+
 /// Value of `name` in `obj`'s expressions (`This.X` follows the field, depth limited because the `Counter` fields
 /// integrate themselves).
 fn variable(obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
@@ -328,12 +352,16 @@ fn variable(obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
         _ if name.ends_with(".Counter") => Some(0.0),
         _ => {
             let field = name.strip_prefix("This.")?;
+            spend()?;
             (depth < 4).then(|| eval_field(obj, ctx, obj.field(field)?, depth + 1)).flatten().or(Some(0.0))
         }
     }
 }
 
 pub fn eval_field(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<f32> {
+    if depth == 0 {
+        reset_budget();
+    }
     eval(expr, &|n| variable(obj, ctx, n, depth))
 }
 
@@ -359,7 +387,13 @@ pub fn rotation(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<Quat> {
     if depth > 4 {
         return None;
     }
-    expr.split("[ROT]").try_fold(Quat::IDENTITY, |total, term| Some(total.then(term_rotation(obj, ctx, term.trim(), depth)?)))
+    if depth == 0 {
+        reset_budget();
+    }
+    expr.split("[ROT]").try_fold(Quat::IDENTITY, |total, term| {
+        spend()?;
+        Some(total.then(term_rotation(obj, ctx, term.trim(), depth)?))
+    })
 }
 
 fn term_rotation(obj: &Obj, ctx: &Ctx, term: &str, depth: u32) -> Option<Quat> {
@@ -477,5 +511,32 @@ Object Next
         let both = Quat::axis_angle([0.0, 0.0, 1.0], 90.0).then(Quat::axis_angle([0.0, 1.0, 0.0], 90.0));
         let w = both.rotate([1.0, 0.0, 0.0]);
         assert!((w[1] - 1.0).abs() < 1e-5, "{w:?}");
+    }
+
+    #[test]
+    fn hostile_nesting_and_fan_out_terminate() {
+        let none = |_: &str| None;
+        let deep = format!("{}1{}", "(".repeat(100_000), ")".repeat(100_000));
+        assert!(eval(&deep, &none).is_none());
+        assert!(eval(&"-".repeat(100_000), &none).is_none());
+        assert_eq!(eval(&format!("{}1{}", "(".repeat(30), ")".repeat(30)), &none), Some(1.0));
+        // 80 references per level, 4 levels: 80^4 evaluations without a budget
+        let refs = (0..80).map(|i| format!("This.F{i}")).collect::<Vec<_>>().join(" + ");
+        let mut text = String::from("Object Bomb\n{\n");
+        for i in 0..80 {
+            text += &format!("  Float F{i}: {refs}\n");
+        }
+        text += "  Quaternion R: ";
+        text += &(0..80).map(|i| format!("This.Q{i}")).collect::<Vec<_>>().join(" [ROT] ");
+        text += "\n";
+        for i in 0..80 {
+            text += &format!("  Quaternion Q{i}: {}\n", (0..80).map(|j| format!("This.Q{j}")).collect::<Vec<_>>().join(" [ROT] "));
+        }
+        text += "  Float Top: 1\n}\n";
+        let o = &parse_objects(&text)[0];
+        let t = std::time::Instant::now();
+        let _ = eval_field(o, &ctx(0.0), o.field("F0").unwrap(), 0);
+        let _ = rotation(o, &ctx(0.0), o.field("R").unwrap(), 0);
+        assert!(t.elapsed().as_secs_f32() < 1.0, "{:?}", t.elapsed());
     }
 }

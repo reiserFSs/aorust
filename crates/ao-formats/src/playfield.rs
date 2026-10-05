@@ -78,6 +78,8 @@ pub fn load_playfield_report(store: &RecordStore, client_dir: &Path, id: u32) ->
 }
 
 pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32, day_time: f32) -> Result<(Scene, Report)> {
+    // the day repeats: wrap so colour tracks, ground shadows, sun and moons agree; NaN/inf fall back to the default
+    let day_time = if day_time.is_finite() { day_time.rem_euclid(sky::DAY_LENGTH) } else { DEFAULT_DAY_TIME };
     let raw = store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?;
     let rec = record::parse(&raw)?;
     let mut scene = Scene::default();

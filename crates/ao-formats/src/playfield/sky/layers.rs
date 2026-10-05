@@ -136,8 +136,7 @@ impl Builder<'_> {
     /// fog state is not stored in the scripts; the horizon map must not show as a brown band behind a fogged terrain].
     fn fogged(&self, o: &Obj, mut mesh: Mesh) -> Mesh {
         let horizon = self.sorts.get("Horizon").copied().unwrap_or(u32::MAX);
-        let horizon_dish = o.flag("FOGENABLE").is_none() && self.sort(o) >= horizon;
-        if !o.flag("FOGENABLE").unwrap_or(horizon_dish) {
+        if !o.flag("FOGENABLE").unwrap_or_else(|| self.sort(o) >= horizon) {
             return mesh;
         }
         let amount = |v: &Vertex| {
@@ -148,15 +147,6 @@ impl Builder<'_> {
             Some(c) => [16, 8, 0].map(|s| srgb_to_linear(((c >> s) & 255) as f32 / 255.0)),
             None => self.fog.color,
         };
-        // the ground dish ends in a straight line at elevation 0: let its rim fade out over the last 6 degrees so the sky
-        // (stars, atmosphere) meets it without a seam [GUESS]
-        if horizon_dish && mesh.submeshes.iter().all(|s| s.blend == Blend::Opaque) {
-            for v in &mut mesh.vertices {
-                let sin_el = v.pos[1] / v.pos.iter().map(|c| c * c).sum::<f32>().sqrt().max(1e-6);
-                v.color[3] *= (-sin_el / 6f32.to_radians().sin()).clamp(0.0, 1.0);
-            }
-            mesh.submeshes.iter_mut().for_each(|s| s.blend = Blend::AlphaBlend);
-        }
         let n = mesh.vertices.len() as u32;
         let overlay: Vec<Vertex> = mesh.vertices.iter().map(|v| Vertex { color: [colour[0], colour[1], colour[2], amount(v) * v.color[3]], ..*v }).collect();
         let originals = mesh.submeshes.len();
@@ -247,6 +237,15 @@ impl Builder<'_> {
                 s.base_color = WHITE;
             }
         }
+        // Opaque unlit backdrops (star dome / nebula belt, horizon dish, vortex) end in a straight line at elevation 0:
+        // fade their rim out over the last 6 degrees below the horizon so the sky meets them without a seam [GUESS]
+        if matches!(light, Light::Unlit) && mesh.submeshes.iter().all(|s| s.blend == Blend::Opaque) {
+            if self.sort(o) < self.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT) {
+                below_horizon_fade(&mut mesh);
+            } else {
+                rim_fade(&mut mesh);
+            }
+        }
         Some(mesh)
     }
 
@@ -330,6 +329,26 @@ impl Builder<'_> {
         mesh.submeshes.push(Submesh { two_sided: true, blend: Blend::Additive, ..Submesh::new(idx, Some(key)) });
         Some(mesh)
     }
+}
+
+/// Vertex alpha 1 at 6 degrees below the horizon and lower, 0 at elevation 0 and above; the
+/// submeshes become alpha blended.
+fn rim_fade(mesh: &mut Mesh) {
+    for v in &mut mesh.vertices {
+        let sin_el = v.pos[1] / v.pos.iter().map(|c| c * c).sum::<f32>().sqrt().max(1e-6);
+        v.color[3] *= (-sin_el / 6f32.to_radians().sin()).clamp(0.0, 1.0);
+    }
+    mesh.submeshes.iter_mut().for_each(|s| s.blend = Blend::AlphaBlend);
+}
+
+/// Star dome / nebula belt: the client's atmosphere strip hides everything below the horizon (our dome only reaches 15 degrees
+/// down), so the backdrop fades out from the horizon (alpha 1) to 10 degrees below it (0); alpha blended.
+fn below_horizon_fade(mesh: &mut Mesh) {
+    for v in &mut mesh.vertices {
+        let sin_el = v.pos[1] / v.pos.iter().map(|c| c * c).sum::<f32>().sqrt().max(1e-6);
+        v.color[3] *= (1.0 + sin_el / 10f32.to_radians().sin()).clamp(0.0, 1.0);
+    }
+    mesh.submeshes.iter_mut().for_each(|s| s.blend = Blend::AlphaBlend);
 }
 
 /// `Matrix ScrollMatrix` as the 2x3 affine texture transform `[m00 m01 m10 m11 m20 m21]` (identity when absent).

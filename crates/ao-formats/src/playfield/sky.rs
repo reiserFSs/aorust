@@ -27,7 +27,7 @@ use super::environment::{srgb_to_linear, VIEW_DISTANCE};
 /// `Tweak_GAME_FrozenTime.txt` `CurrentDayTime`: the time `load_playfield` uses.
 pub const DEFAULT_DAY_TIME: f32 = 2648.69;
 /// `GAME.CurrentDayTime / 6480` (27 * 60 * 4) is the factor that indexes every colour track.
-const DAY_LENGTH: f32 = 6480.0;
+pub(super) const DAY_LENGTH: f32 = 6480.0;
 /// `Sun1Rotation` of `Tweak_GAME_FrozenTime.txt` as (w, x, y, z), valid at [`DEFAULT_DAY_TIME`].
 const SUN1_ROT: [f32; 4] = [0.900351, -0.0951056, 0.344078, 0.248863];
 /// `Sun2Rotation` of the same file.
