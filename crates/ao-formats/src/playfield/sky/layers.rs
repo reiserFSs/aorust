@@ -12,7 +12,7 @@ use crate::character::NameTable;
 use crate::mesh::{decode_mesh_object_space, MESH_TYPE};
 use crate::texture::decode_texture;
 use ao_rdb::RecordStore;
-use ao_scene::{Blend, Instance, Mesh, Scene, SkyColors, SkySpin, Submesh, TextureKey, Vertex, IDENTITY, WHITE};
+use ao_scene::{Blend, Instance, Mesh, Scene, SkyColors, SkySpin, SkyWaveSpin, Submesh, TextureKey, Vertex, IDENTITY, WHITE};
 use std::collections::HashMap;
 
 const TEXTURES: u32 = 1_010_004;
@@ -58,16 +58,20 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         wind: [0.0; 2],
         night: sky.night,
         counters: counters(objs),
+        waves: [0.0; 16],
     };
     let mut b = Builder { fog, store, names, ctx, objs, sky, scene, sorts };
-    let mut layers: Vec<(u32, Mesh, Option<SkySpin>, Option<(ao_scene::aurora::GloomySky, f32)>)> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None, None)];
+    // (sort, mesh, constant spin, aurora simulation, wave driven turns)
+    type Layer = (u32, Mesh, Option<SkySpin>, Option<(ao_scene::aurora::GloomySky, f32)>, Vec<SkyWaveSpin>);
+    let mut layers: Vec<Layer> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None, None, vec![])];
     for o in objs.iter().filter(|o| o.field("Priority").is_some_and(|p| p.trim() == "e_RenderPriority_PreRendering")) {
+        let mut colors = None;
         let mesh = match o.fxid() {
-            "GenericMeshObject" => b.mesh_object(o).map(|m| b.fogged(o, m)),
             "GloomySky" => b.gloomy_sky(o).map(|(m, sim, gain)| {
                 colors = Some((sim, gain));
                 m
             }),
+            "GenericMeshObject" => b.mesh_object(o).map(|m| b.fogged(o, m)),
             "SunRays" => b.sun_rays(o),
             "SingleCloud" => b.single_clouds(o),
             "GenericVisualObject" => b.dot_points(o).map(|m| b.fogged(o, m)),
@@ -76,15 +80,16 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         // a layer whose every vertex alpha is 0 (sun below the horizon, `TFACTOR` 0) draws nothing
         if let Some(m) = mesh.filter(|m| m.vertices.iter().any(|v| v.color[3] > 0.0)) {
             let spin = if o.fxid() == "GenericMeshObject" { b.spin(o) } else { None };
-            layers.push((b.sort(o), m, spin));
+            layers.push((b.sort(o), m, spin, colors, wave_spins(o, &b.ctx)));
         }
     }
     layers.sort_by_key(|l| l.0);
-    for (_, m, spin) in layers {
+    for (_, m, spin, colors, waves) in layers {
         scene.meshes.push(m);
-        scene.sky.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
         scene.sky_colors.extend(colors.map(|(sim, gain)| SkyColors { mesh: scene.meshes.len() - 1, sim, gain }));
+        scene.sky.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
         scene.sky_spin.extend(spin.map(|s| SkySpin { instance: scene.sky.len() - 1, ..s }));
+        scene.sky_wave_spin.extend(waves.into_iter().map(|w| SkyWaveSpin { instance: scene.sky.len() - 1, ..w }));
     }
 }
 
@@ -172,6 +177,21 @@ pub fn emit_distant(objs: &[Obj], store: &RecordStore, scene: &mut Scene, day_ti
         let mut transform = IDENTITY;
         transform[3] = [pos[0], pos[1], -pos[2], 1.0];
         scene.instances.push(Instance { mesh: scene.meshes.len() - 1, transform });
+    }
+}
+
+/// The scale the client applies to a world-space mesh object. `GenericMeshObject` (`FUN_1005e716` @0x1005e716, DisplaySystem)
+/// reads the `Scale` field **only while `ScaleType` is 0** (`FUN_1001d156` = `RRefFrame::SetScale`); `e_ScaleByViewDistance` = 1,
+/// `e_ScaleByViewDistanceAndDirectionHeigh` = 2 and **`e_ScaleVisibleFarAway` = 3** (value blocks of the FXS enum parser
+/// @0x1000b015 / 0x1000c7f8 / 0x1000c810 / 0x1000c827) are never tested for their value anywhere (the only readers of the
+/// `ScaleType` variable are `FUN_1005e716`, `FUN_1005a3a9`, `FUN_1005b3c2`, `FUN_1004412e`, all of the form `type == 0`), so
+/// the `Scale` field is ignored and the object keeps the reference frame's default scale 1 (the 2 ships with `Scale 0.70`,
+/// `Alien_Craft_War_04/05`, are drawn at 1). The default of 1 is [INFERENCE]: the base `RRefFrame_t` constructor lives in randy31.dll.
+pub(super) fn object_scale(o: &Obj, ctx: &Ctx) -> f32 {
+    if o.field("ScaleType").is_some_and(|t| t.trim().starts_with("e_Scale")) {
+        1.0
+    } else {
+        script::float(o, ctx, "Scale", 1.0)
     }
 }
 
@@ -341,8 +361,10 @@ impl Builder<'_> {
             v.uv = [v.uv[0] * scroll[0] + v.uv[1] * scroll[2] + scroll[4], v.uv[0] * scroll[1] + v.uv[1] * scroll[3] + scroll[5]];
         }
         let uv_scroll = self.uv_scroll(o);
+        let uv_wave = uv_wave(o, &self.ctx);
         for s in &mut mesh.submeshes {
             s.uv_scroll = uv_scroll;
+            s.uv_wave = uv_wave;
             s.two_sided = true;
             s.blend = match (o.flag("ALPHABLENDENABLE"), o.states.get("DESTBLEND").map(String::as_str)) {
                 (Some(true), Some("e_D3DBLEND_ONE")) => Blend::Additive,
@@ -387,36 +409,6 @@ impl Builder<'_> {
         ["ScrollU", "ScrollV"].map(|f| o.field(f).and_then(|e| script::eval_field(o, &ctx, e, 0)).unwrap_or(0.0))
     }
 
-    /// `e_SunRays` (`FUN_1005a7f6` builds the geometry, `FUN_1005a3a9` the per-frame alpha, DisplaySystem): a triangle fan of
-    /// `Vertices` points whose rim `i` (of `Vertices - 1`) sits at local `(Size * 9 sin a, Size * 9 cos a, -100)`,
-    /// `a = i / (Vertices - 1) * 360 * 3.14 / 180`, uv `0.5 + UVSize * 0.5 (sin a, cos a)` (default `UVSize` 0.8), centre
-    /// `(0, 0, -100)` uv (0.5, 0.5); rotated by `Rotation`. Colour `ColorR/G/B`, alpha `(100 y)^4` below elevation 0.01 and 0
-    /// below the horizon. The client's per-vertex rim alpha reduction (`255 - table[i & 7]`, a table the game fills
-    /// each frame) is [UNRESOLVED] and left out.
-    #[allow(clippy::approx_constant)] // the client's literal 3.14 (double 1008c380), not pi
-    fn sun_rays(&mut self, o: &Obj) -> Option<Mesh> {
-        let q = script::rotation(o, &self.ctx, o.field("Rotation")?, 0)?;
-        let c = q.rotate([0.0, 0.0, -1.0]);
-        let fade = if c[1] <= 0.0 { return None } else if c[1] < 0.01 { (100.0 * c[1]).powi(4) } else { 1.0 };
-        let key = self.texture(o.texture.as_deref()?)?;
-        let col = ["ColorR", "ColorG", "ColorB"].map(|n| script::float(o, &self.ctx, n, 255.0) / 255.0).map(srgb_to_linear);
-        let size = script::float(o, &self.ctx, "Size", 6.0);
-        let uv_size = script::float(o, &self.ctx, "UVSize", 0.8);
-        let n = (script::float(o, &self.ctx, "Vertices", 33.0) as usize).clamp(4, 256);
-        let blend = if o.states.get("DESTBLEND").is_some_and(|v| v == "e_D3DBLEND_ONE") { Blend::Additive } else { Blend::AlphaBlend };
-        let color = [col[0], col[1], col[2], fade];
-        let mut mesh = Mesh::default();
-        // the sky is drawn on a sphere of 300 m, the client's fan sits at 100 units: scale by 3
-        let mut push = |local: [f32; 3], uv: [f32; 2]| {
-            let p = q.rotate(local).map(|v| v * 3.0);
-            mesh.vertices.push(Vertex { pos: scene(p), normal: [0.0, -1.0, 0.0], uv, color });
-        };
-        for i in 0..n - 1 {
-            let a = i as f32 / (n - 1) as f32 * 360.0 * 3.14 / 180.0;
-            push([size * 9.0 * a.sin(), size * 9.0 * a.cos(), -100.0], [uv_size * 0.5 * a.sin() + 0.5, uv_size * 0.5 * a.cos() + 0.5]);
-        }
-        push([0.0, 0.0, -100.0], [0.5, 0.5]);
-        let centre = (n - 1) as u32;
     /// `e_GloomySky` (Shadowlands aurora): the dome of `FUN_10046ccc` oriented by `Rotation`, with the colour map simulation
     /// (`ao_scene::aurora`, `FUN_10047300`) the renderer runs for its vertex colours. The state blob gives the blend
     /// (`DESTBLEND ONE` = additive, else alpha blend), the texture (`COLORARG1 ... | COMPLEMENT` = the inverted texture) and
@@ -449,9 +441,40 @@ impl Builder<'_> {
         Some((mesh, ao_scene::aurora::GloomySky::new(params), gain))
     }
 
+    /// `e_SunRays` (`FUN_1005a7f6` builds the geometry, `FUN_1005a3a9` the per-frame alpha, DisplaySystem): a triangle fan of
+    /// `Vertices` points whose rim `i` (of `Vertices - 1`) sits at local `(Size * 9 sin a, Size * 9 cos a, -100)`,
+    /// `a = i / (Vertices - 1) * 360 * 3.14 / 180`, uv `0.5 + UVSize * 0.5 (sin a, cos a)` (default `UVSize` 0.8), centre
+    /// `(0, 0, -100)` uv (0.5, 0.5); rotated by `Rotation`. Colour `ColorR/G/B`, alpha `(100 y)^4` below elevation 0.01 and 0
+    /// below the horizon. The rim alpha is `(255 - table[i & 7]) * A / 255` (`FUN_1005a3a9` @0x1005a3a9, `A` = the alpha above,
+    /// `table` = [`ao_scene::sun_flicker_table`], the game's per-frame `trunc(255 * GameWaveCurve_i)`): vertex `normal.z` carries
+    /// `i` (centre -1) and `Submesh::sun_flicker` makes the renderer apply it every frame.
+    #[allow(clippy::approx_constant)] // the client's literal 3.14 (double 1008c380), not pi
+    fn sun_rays(&mut self, o: &Obj) -> Option<Mesh> {
+        let q = script::rotation(o, &self.ctx, o.field("Rotation")?, 0)?;
+        let c = q.rotate([0.0, 0.0, -1.0]);
+        let fade = if c[1] <= 0.0 { return None } else if c[1] < 0.01 { (100.0 * c[1]).powi(4) } else { 1.0 };
+        let key = self.texture(o.texture.as_deref()?)?;
+        let col = ["ColorR", "ColorG", "ColorB"].map(|n| script::float(o, &self.ctx, n, 255.0) / 255.0).map(srgb_to_linear);
+        let size = script::float(o, &self.ctx, "Size", 6.0);
+        let uv_size = script::float(o, &self.ctx, "UVSize", 0.8);
+        let n = (script::float(o, &self.ctx, "Vertices", 33.0) as usize).clamp(4, 256);
+        let blend = if o.states.get("DESTBLEND").is_some_and(|v| v == "e_D3DBLEND_ONE") { Blend::Additive } else { Blend::AlphaBlend };
+        let color = [col[0], col[1], col[2], fade];
+        let mut mesh = Mesh::default();
+        // the sky is drawn on a sphere of 300 m, the client's fan sits at 100 units: scale by 3
+        let mut push = |local: [f32; 3], uv: [f32; 2], rim: f32| {
+            let p = q.rotate(local).map(|v| v * 3.0);
+            mesh.vertices.push(Vertex { pos: scene(p), normal: [0.0, -1.0, rim], uv, color });
+        };
+        for i in 0..n - 1 {
+            let a = i as f32 / (n - 1) as f32 * 360.0 * 3.14 / 180.0;
+            push([size * 9.0 * a.sin(), size * 9.0 * a.cos(), -100.0], [uv_size * 0.5 * a.sin() + 0.5, uv_size * 0.5 * a.cos() + 0.5], i as f32);
+        }
+        push([0.0, 0.0, -100.0], [0.5, 0.5], -1.0);
+        let centre = (n - 1) as u32;
         let mut idx: Vec<u32> = (0..centre - 1).flat_map(|i| [i, i + 1, centre]).collect();
         idx.extend([centre - 1, 0, centre]);
-        mesh.submeshes.push(Submesh { two_sided: true, blend, ..Submesh::new(idx, Some(key)) });
+        mesh.submeshes.push(Submesh { two_sided: true, blend, sun_flicker: true, ..Submesh::new(idx, Some(key)) });
         Some(mesh)
     }
 
@@ -577,5 +600,105 @@ impl Lcg {
     fn next(&mut self) -> f32 {
         self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         (self.0 >> 8) as f32 / (1u32 << 24) as f32
+    }
+}
+
+/// Turns driven by `GameWaveCurve*` (`Sun1_Moving`: `RotMove = v(0,0,1), GAME.GameWaveCurve0 * 4 - 2`, `Rotation = This.RotMove [ROT]
+/// GAME.Sun1Rotation`): per curve the rotation at `GameWaveCurve_k = 1` relative to the baked one at 0 (the expressions are
+/// affine in the angle), turned by `degrees * curve(time)` in the renderer. `instance` is filled in by the caller.
+fn wave_spins(o: &Obj, base: &Ctx) -> Vec<SkyWaveSpin> {
+    let Some(e) = o.field("Rotation") else { return vec![] };
+    let Some(q0) = script::rotation(o, base, e, 0) else { return vec![] };
+    let offset = o.field("Position").and_then(|e| script::vector(o, base, e, 0)).unwrap_or([0.0; 3]);
+    wave_curves_read(o, e, 0)
+        .into_iter()
+        .filter_map(|k| {
+            let ctx = Ctx { waves: std::array::from_fn(|i| (i == k) as u32 as f32), ..base.clone() };
+            let (axis, degrees) = script::rotation(o, &ctx, e, 0)?.spin_from(q0)?;
+            // AO space is left handed: the same turn about the mirrored axis runs the other way in scene space
+            Some(SkyWaveSpin { instance: 0, axis: scene(axis), pivot: scene(offset), curve: k, degrees: -degrees })
+        })
+        .collect()
+}
+
+/// `[curve_u, amp_u, curve_v, amp_v]` of the `ScrollMatrix` translation (`GAME.GameWaveCurve0 - 0.5 * 0.005`: the horizon map of
+/// the Shadowlands vortex wobbles by 0.005 uv): the first curve the u / v translation depends on and its change per unit curve; the
+/// constant part stays baked.
+fn uv_wave(o: &Obj, base: &Ctx) -> [f32; 4] {
+    let t0 = scroll_matrix(o, base);
+    let mut out = [0.0; 4];
+    for k in o.field("ScrollMatrix").map_or_else(Vec::new, |e| wave_curves_read(o, e, 0)) {
+        let t1 = scroll_matrix(o, &Ctx { waves: std::array::from_fn(|i| (i == k) as u32 as f32), ..base.clone() });
+        for (axis, slot) in [(4, 0), (5, 2)] {
+            if out[slot + 1] == 0.0 && t1[axis] != t0[axis] {
+                out[slot] = k as f32;
+                out[slot + 1] = t1[axis] - t0[axis];
+            }
+        }
+    }
+    out
+}
+
+/// Indices `N` of the `GAME.GameWaveCurveN` variables `expr` reads, following `This.<field>` references of `o` (depth limited).
+fn wave_curves_read(o: &Obj, expr: &str, depth: u32) -> Vec<usize> {
+    let mut out: Vec<usize> = vec![];
+    for word in expr.split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '_')) {
+        let k = word.strip_prefix("GAME.GameWaveCurve").and_then(|n| n.parse::<usize>().ok()).filter(|&k| k < 16);
+        let nested = word.strip_prefix("This.").filter(|_| depth < 4).and_then(|f| o.field(f)).map(|e| wave_curves_read(o, e, depth + 1));
+        for k in k.into_iter().chain(nested.into_iter().flatten()) {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_field_is_ignored_unless_scale_type_is_zero() {
+        let obj = |ty: Option<&str>| {
+            let mut o = Obj::default();
+            o.fields.insert("Scale".into(), "0.70".into());
+            o.fields.extend(ty.map(|t| ("ScaleType".to_string(), t.to_string())));
+            o
+        };
+        let ctx = Ctx::at(0.0);
+        assert_eq!(object_scale(&obj(None), &ctx), 0.7);
+        assert_eq!(object_scale(&obj(Some("e_World")), &ctx), 0.7);
+        for t in ["e_ScaleVisibleFarAway", "e_ScaleByViewDistance", "e_ScaleByViewDistanceAndDirectionHeigh"] {
+            assert_eq!(object_scale(&obj(Some(t)), &ctx), 1.0, "{t}");
+        }
+    }
+
+    const WAVES: &str = "
+Object Sun1_Moving
+{
+  Quaternion  RotMove:            v( 0,0,1 ), GAME.GameWaveCurve0 * 4 - 2
+  Quaternion  Rotation:           This.RotMove [ROT] GAME.Sun1Rotation
+  Vector      Position:           v( 0,0,0 )
+}
+Object VortexHorizon
+{
+  Matrix      ScrollMatrix:       m(                                 1,                                0, 0, 0
+                                                                     0,                                1, 0, 0
+                                      GAME.GameWaveCurve0 - 0.5 * 0.005, GAME.GameWaveCurve1 - 0.5 * 0.005, 1, 0
+                                                                     0,                                0, 0, 1 )
+}
+";
+
+    #[test]
+    fn wave_curve_terms_become_a_turn_and_a_uv_wobble() {
+        let objs = script::parse_objects(WAVES);
+        let ctx = Ctx::at(0.0);
+        let spins = wave_spins(&objs[0], &ctx);
+        assert_eq!(spins.len(), 1);
+        assert_eq!(spins[0].curve, 0);
+        assert!((spins[0].degrees.abs() - 4.0).abs() < 1e-3, "{}", spins[0].degrees);
+        assert_eq!(uv_wave(&objs[1], &ctx), [0.0, 0.005, 1.0, 0.005]);
+        assert!(wave_spins(&objs[1], &ctx).is_empty());
     }
 }

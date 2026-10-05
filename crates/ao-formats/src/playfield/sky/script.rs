@@ -2,8 +2,9 @@
 //! quaternions (`v(axis), degrees`, `q(w,x,y,z)`, `a [ROT] b`).
 //!
 //! Evaluation context (offline, no game running): `GAME.CurrentDayTime` / `DayTimeFactor` come from the requested time of
-//! day; every other value the game writes every frame (`GameWaveCurve*`, `GameDeltaTime`, wind, the `Counter` fields that
-//! integrate delta time) is 0, i.e. the sky is a still frame at that time.
+//! day; every other value the game writes every frame (`GameDeltaTime`, wind, the `Counter` fields that integrate delta
+//! time, the `GameWaveCurve*` waves) is 0, i.e. the baked sky is a still frame at that time (the renderer animates the
+//! waves, see `layers::wave_spins` / `uv_wave`).
 
 use std::collections::HashMap;
 
@@ -344,14 +345,19 @@ pub struct Ctx {
     pub delta_time: f32,
     /// `GAME.HighAltitudeWindX/Z` (the game writes `speed * direction * dt * k` every frame, `FUN_100be767`).
     pub wind: [f32; 2],
+    /// `GAME.CurrentNightIntensity` = `NightIntensity[DayTimeFactor]` (`Tweak_GAME.txt`).
+    pub night: f32,
     /// `Object.Counter` references of other objects: their growth per second (the counters integrate `GameDeltaTime`).
     pub counters: std::collections::HashMap<String, f32>,
+    /// `GAME.GameWaveCurve0..15` (`ao_scene::wave_curves`): 0 in the baked frame; the renderer adds the live waves, see `SkyWaveSpin`
+    /// and `Submesh::uv_wave`.
+    pub waves: [f32; 16],
 }
 
 impl Ctx {
     /// A context for expressions that do not depend on the game (offsets, counters, colours).
     pub fn at(day_time: f32) -> Ctx {
-        Ctx { day_time, sun1: Quat::IDENTITY, sun2: Quat::IDENTITY, cloud_intensity: 0.0, hq_offset: [0.0; 2], delta_time: 0.0, wind: [0.0; 2], night: 0.0, counters: Default::default() }
+        Ctx { day_time, sun1: Quat::IDENTITY, sun2: Quat::IDENTITY, cloud_intensity: 0.0, hq_offset: [0.0; 2], delta_time: 0.0, wind: [0.0; 2], night: 0.0, counters: Default::default(), waves: [0.0; 16] }
     }
 }
 
@@ -362,8 +368,6 @@ thread_local! {
     static BUDGET: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-    /// `GAME.CurrentNightIntensity` = `NightIntensity[DayTimeFactor]` (`Tweak_GAME.txt`).
-    pub night: f32,
 /// Evaluations one top-level expression may spend on `This.X` references and `[ROT]` terms. The sky scripts need < 20;
 /// a hostile script with many references per level would otherwise multiply out to `refs^depth`.
 const BUDGET_PER_EVAL: u32 = 2000;
@@ -389,6 +393,10 @@ fn variable(obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
         "GAME.GameDeltaTime" => Some(ctx.delta_time),
         "GAME.HighAltitudeWindX" => Some(ctx.wind[0]),
         "GAME.HighAltitudeWindZ" => Some(ctx.wind[1]),
+        "GAME.CurrentNightIntensity" => Some(ctx.night),
+        "e_Yes" | "e_TRUE" => Some(1.0),
+        "e_No" | "e_FALSE" => Some(0.0),
+        _ if name.starts_with("GAME.GameWaveCurve") => name["GAME.GameWaveCurve".len()..].parse::<usize>().ok().and_then(|k| ctx.waves.get(k).copied()).or(Some(0.0)),
         _ if name.starts_with("GAME.") => Some(0.0),
         _ if name.ends_with(".Counter") => {
             let key = name.strip_prefix("This.").map_or_else(|| name.to_string(), |f| format!("{}.{f}", obj.name));
@@ -407,9 +415,6 @@ fn variable(obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
     }
 }
 
-        "GAME.CurrentNightIntensity" => Some(ctx.night),
-        "e_Yes" | "e_TRUE" => Some(1.0),
-        "e_No" | "e_FALSE" => Some(0.0),
 pub fn eval_field(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<f32> {
     if depth == 0 {
         reset_budget();
