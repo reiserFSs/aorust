@@ -444,8 +444,10 @@ impl Surface {
 struct RoomBuf {
     vertices: Vec<Vertex>,
     by_tex: HashMap<Option<TextureKey>, Vec<u32>>,
-    /// Welding lookup: (material, position at 30 cells/m) -> vertex indices.
-    grid: HashMap<(Option<TextureKey>, [i32; 3]), Vec<u32>>,
+    /// Vertex count at the start of every swept cell (the `A[]` ring of `CreateDungeonRoom`, N3 @0x10008563).
+    cell_start: Vec<usize>,
+    /// Room width in cells (ring length).
+    width: usize,
 }
 
 /// Room placement (`Placer::place` convention) and the AO -> scene mirror.
@@ -508,7 +510,7 @@ impl Builder<'_> {
                 let n = self.frame.vec([(nx / l) as f32, (ny / l) as f32, (nz / l) as f32]);
                 block.push(Vertex { pos: p, normal: [n[0], n[1], -n[2]], uv: [v[6], v[7]], ..Default::default() });
             }
-            let remap = weld_block(&mut self.out, mat, &mut block);
+            let remap = weld_block(&mut self.out, &mut block);
             // z is mirrored: reverse the winding
             let idx = self.out.by_tex.entry(mat).or_default();
             for t in tris.chunks_exact(3) {
@@ -602,21 +604,19 @@ pub(super) fn entry_spot(g: &Gnda, rec: &Record, props: &[Vec<[f32; 3]>]) -> Opt
 /// one integer uv offset (the first offset found for two different vertices, else the last one) so its
 /// texture coordinates continue those of its neighbours; vertices that then coincide are dropped.
 /// Returns the output index of every vertex of `block` (kept ones are appended to `out`).
-fn weld_block(out: &mut RoomBuf, mat: Option<TextureKey>, block: &mut [Vertex]) -> Vec<u32> {
+fn weld_block(out: &mut RoomBuf, block: &mut [Vertex]) -> Vec<u32> {
     let d2 = |a: [f32; 3], b: [f32; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f32>();
     let frac_ok = |d: f32| d - d.floor() <= 0.2; // d = old - new + 0.1
+    // candidates (index order): the three cells above the current one, then the previous cell up to this block.
+    // `FUN_10001645` compares positions, normals and uvs only: the material plays no part.
+    let (cur, w, start) = (out.cell_start.len() as isize - 1, out.width as isize, out.vertices.len());
+    let cs = |k: isize| if k < 0 { 0 } else { out.cell_start[(k as usize).min(cur as usize)].min(start) };
+    let cands: Vec<usize> = (cs(cur - w - 1)..cs(cur - w + 2)).chain(cs(cur - 1)..start).collect();
     let find = |out: &RoomBuf, v: &Vertex, f: &mut dyn FnMut(u32, &Vertex)| {
-        let k = v.pos.map(|c| (c * 30.0).round() as i32);
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    for &j in out.grid.get(&(mat, [k[0] + dx, k[1] + dy, k[2] + dz])).into_iter().flatten() {
-                        let o = &out.vertices[j as usize];
-                        if d2(o.pos, v.pos) <= 0.001 && d2(o.normal, v.normal) <= 0.2 && frac_ok(o.uv[0] - v.uv[0] + 0.1) && frac_ok(o.uv[1] - v.uv[1] + 0.1) {
-                            f(j, o);
-                        }
-                    }
-                }
+        for &j in &cands {
+            let o = &out.vertices[j];
+            if d2(o.pos, v.pos) <= 0.001 && d2(o.normal, v.normal) <= 0.2 {
+                f(j as u32, o);
             }
         }
     };
@@ -625,16 +625,21 @@ fn weld_block(out: &mut RoomBuf, mat: Option<TextureKey>, block: &mut [Vertex]) 
     let mut offset = None;
     'scan: for (i, v) in block.iter().enumerate() {
         let mut hits: Vec<[i32; 2]> = Vec::new();
-        find(out, v, &mut |_, o| hits.push([(o.uv[0] - v.uv[0] + 0.1).floor() as i32, (o.uv[1] - v.uv[1] + 0.1).floor() as i32]));
+        find(out, v, &mut |_, o| {
+            if frac_ok(o.uv[0] - v.uv[0] + 0.1) && frac_ok(o.uv[1] - v.uv[1] + 0.1) {
+                hits.push([(o.uv[0] - v.uv[0] + 0.1).floor() as i32, (o.uv[1] - v.uv[1] + 0.1).floor() as i32]);
+            }
+        });
         for off in hits {
-            match seen.iter().find(|s| s.0 == off) {
-                Some(&(_, owner)) if owner != i => {
+            match seen.iter().position(|s| s.0 == off) {
+                Some(k) if seen[k].1 != i => {
                     offset = Some(off);
                     break 'scan;
                 }
                 Some(_) => {}
-                None if seen.len() < 20 => seen.push((off, i)),
-                None => {}
+                // the client's table holds 20 entries; a new one overwrites the last
+                None if seen.len() == 20 => seen[19] = (off, i),
+                None => seen.push((off, i)),
             }
         }
         offset = seen.last().map(|s| s.0);
@@ -651,13 +656,30 @@ fn weld_block(out: &mut RoomBuf, mat: Option<TextureKey>, block: &mut [Vertex]) 
             }
         });
         remap.push(hit.unwrap_or_else(|| {
-            let j = out.vertices.len() as u32;
-            out.grid.entry((mat, v.pos.map(|c| (c * 30.0).round() as i32))).or_default().push(j);
             out.vertices.push(*v);
-            j
+            out.vertices.len() as u32 - 1
         }));
     }
     remap
+}
+
+/// `n3Room_t::DepackLightmap` (N3 @0x10010eb7) + `FUN_100082a7` (N3 @0x100082a7): the room record stores
+/// `count` (= vertex count of the room shell) and a zlib stream (`FUN_1002a180`, zlib 1.2.5) that inflates to
+/// `count` little-endian u16 (`count * 6` bytes in room format version < 8 is not present in the data). Every
+/// u16 is the vertex diffuse colour of the shell vertex with the same index: `R = (v & 0x1f) << 3`,
+/// `G = (v >> 5 & 0x3f) << 2`, `B = (v >> 8) & 0xf8`, alpha 255. Returns sRGB bytes; `None` when the stream is
+/// shorter than `count * 2` (the client then paints all vertices white, `FUN_100082a7` first branch).
+fn depack_lightmap(count: u32, z: &[u8]) -> Option<Vec<[u8; 3]>> {
+    use std::io::Read;
+    let mut raw = Vec::with_capacity(count as usize * 2);
+    flate2::read::ZlibDecoder::new(z).read_to_end(&mut raw).ok()?;
+    if raw.len() < count as usize * 2 {
+        return None;
+    }
+    Some(raw.chunks_exact(2).take(count as usize).map(|c| {
+        let v = u16::from_le_bytes([c[0], c[1]]);
+        [((v & 0x1f) << 3) as u8, ((v >> 5 & 0x3f) << 2) as u8, (v >> 8 & 0xf8) as u8]
+    }).collect())
 }
 
 /// Builds the shell of `room` in scene space. `piece(id)` returns cell meshes, `textures` maps
@@ -673,41 +695,60 @@ fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<Text
         g,
         frame: Frame { rot: statel::ry(room.rot as f32 * std::f32::consts::FRAC_PI_2), pos: room.pos },
         textures,
-        out: RoomBuf { vertices: Vec::new(), by_tex: HashMap::new(), grid: HashMap::new() },
+        out: RoomBuf { vertices: Vec::new(), by_tex: HashMap::new(), cell_start: Vec::new(), width: (x2 - x1) as usize },
     };
     for z in z1..z2 {
         for x in x1..x2 {
+            b.out.cell_start.push(b.out.vertices.len());
             let Some((id, rot)) = g.cell_mesh(x, z) else { continue };
             let origin = [(x - x1) as f32 * g.cell + ox, (z - z1) as f32 * g.cell + oz];
-            let main = (id != 0).then(|| piece(id)).flatten();
-            if let Some(p) = &main {
-                b.add(p, rot, x, z, origin, -floor_min as f64, false);
-            }
-            // walls carry no floor: the client adds the flat floor piece of the tile
-            if main.as_ref().is_none_or(|p| p.blocks.first().is_none_or(|bl| bl.1.is_empty())) {
-                if let Some(f) = piece(g.floor_mesh(g.tile(x, z) as usize)) {
-                    b.add(&f, 0, x, z, origin, -floor_min as f64, true);
-                }
-            }
+            // piece order of `FUN_10001c3b` (N3 @0x10001c3b): corner posts, floor piece, main piece
             let corners = g.corners[z as usize * g.w + x as usize];
             for c in (0..4).filter(|c| corners & (1 << c) != 0) {
                 if let Some(p) = piece(g.corner_mesh(g.tile(x, z) as usize)) {
                     b.add(&p, c, x, z, origin, -floor_min as f64, false);
                 }
             }
+            let main = (id != 0).then(|| piece(id)).flatten();
+            // walls carry no floor: the client adds the flat floor piece of the tile
+            if main.as_ref().is_none_or(|p| p.blocks.first().is_none_or(|bl| bl.1.is_empty())) {
+                if let Some(f) = piece(g.floor_mesh(g.tile(x, z) as usize)) {
+                    b.add(&f, 0, x, z, origin, -floor_min as f64, true);
+                }
+            }
+            if let Some(p) = &main {
+                b.add(p, rot, x, z, origin, -floor_min as f64, false);
+            }
         }
     }
-    let RoomBuf { vertices, by_tex, .. } = b.out;
+    let RoomBuf { mut vertices, by_tex, .. } = b.out;
     if vertices.is_empty() {
         return None;
     }
+    // baked lighting only when the stream matches the shell vertex for vertex (97 % of rooms; the rest keep ambient light)
+    let prelit = match room.lightmap.as_ref().and_then(|l| depack_lightmap(l.0, &l.1)).filter(|c| c.len() == vertices.len()) {
+        Some(c) => {
+            for (v, c) in vertices.iter_mut().zip(c) {
+                let l = c.map(|b| super::environment::srgb_to_linear(b as f32 / 255.0));
+                v.color = [l[0], l[1], l[2], 1.0];
+            }
+            true
+        }
+        None => false,
+    };
     let mut keys: Vec<_> = by_tex.keys().copied().collect();
     keys.sort_by_key(|k| k.map(|k| (k.rdb_type, k.id)));
-    let submeshes = keys.into_iter().map(|k| Submesh { two_sided: true, ..Submesh::new(by_tex[&k].clone(), k) }).collect();
+    let submeshes = keys.into_iter().map(|k| Submesh { two_sided: true, prelit, ..Submesh::new(by_tex[&k].clone(), k) }).collect();
     Some(Mesh { vertices, submeshes })
 }
 
-fn material_texture(store: &RecordStore, textures: &mut HashMap<TextureKey, Texture>, m: u32) -> Option<TextureKey> {
+/// `VisualRoom_t::AddMaterial` (DisplaySystem @0x1006e916) pairs every material with the fallback texture
+/// `darkrock_tileable.png` (rdb 1010004). Dungeon material 1 (slot 0 of most tilemaps: unpainted cells) is the
+/// "Error" placeholder image in the PRK database, i.e. the texture that failed to resolve: draw the fallback.
+fn material_texture(store: &RecordStore, textures: &mut HashMap<TextureKey, Texture>, mut m: u32) -> Option<TextureKey> {
+    if m == 1 {
+        m = crate::character::NameTable::load(store).ok()?.id(OBJECT_TEXTURES, "darkrock_tileable.png")? | 0x8000_0000;
+    }
     let (ty, id) = if m & 0x8000_0000 != 0 { (OBJECT_TEXTURES, m & 0x7fff_ffff) } else { (DUNGEON_TEXTURES, m) };
     let key = TextureKey { rdb_type: ty, id };
     if !textures.contains_key(&key) {
@@ -882,7 +923,7 @@ mod tests {
     #[test]
     fn room_is_placed_like_statels_and_mirrored() {
         let g = parse_gnda(&fixture(&[])).unwrap();
-        let room = Room { rot: 1, rect: [1, 1, 4, 4], pos: [100.0, 5.0, 200.0], name: None };
+        let room = Room { rot: 1, rect: [1, 1, 4, 4], pos: [100.0, 5.0, 200.0], name: None, lightmap: None };
         let floor = Rc::new(floor_piece());
         let mut piece = |id: u16| (id == 7).then(|| floor.clone());
         let mut texture = |i: u8| Some(TextureKey { rdb_type: 1, id: i as u32 });
@@ -926,22 +967,38 @@ mod tests {
     }
 
     #[test]
+    fn lightmap_depack_matches_fun_100082a7() {
+        use std::io::Write;
+        // R = low 5 bits, G = middle 6, B = high 5 (client: `(v&0x1f)<<3`, `(v>>5&0x3f)<<2`, `v>>8&0xf8`)
+        let words = [0x0000u16, 0xffff, 0x001f, 0x07e0, 0xf800, 0x1922];
+        let raw: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&raw).unwrap();
+        let z = z.finish().unwrap();
+        let c = depack_lightmap(6, &z).unwrap();
+        assert_eq!(c[..5], [[0, 0, 0], [248, 252, 248], [248, 0, 0], [0, 252, 0], [0, 0, 248]]);
+        assert_eq!(c[5], [16, 36, 24]);
+        // a stream shorter than count*2 bytes is rejected (the client paints white)
+        assert!(depack_lightmap(7, &z).is_none());
+    }
+
+    #[test]
     fn weld_shifts_the_block_uv_and_merges_shared_corners() {
         let v = |x: f32, n: [f32; 3], u: f32| Vertex { pos: [x, 0.0, 0.0], normal: n, uv: [u, 0.5], ..Default::default() };
         let up = [0.0, 1.0, 0.0];
-        let mut out = RoomBuf { vertices: Vec::new(), by_tex: HashMap::new(), grid: HashMap::new() };
+        let mut out = RoomBuf { vertices: Vec::new(), by_tex: HashMap::new(), cell_start: vec![0], width: 4 };
         // first block: x = 0 (u 0), x = 1 (u 1)
-        let first = weld_block(&mut out, None, &mut [v(0.0, up, 0.0), v(1.0, up, 1.0)]);
+        let first = weld_block(&mut out, &mut [v(0.0, up, 0.0), v(1.0, up, 1.0)]);
         assert_eq!(first, vec![0, 1]);
         // neighbour block starts at x = 1 with u = 0 (tiled texture): shifted by +1 so its corner
         // continues u = 1 and merges; the far vertex becomes u = 2. A vertex with another normal is kept.
         let mut b = [v(1.0, up, 0.0), v(2.0, up, 1.0), v(1.0, [1.0, 0.0, 0.0], 0.0)];
-        assert_eq!(weld_block(&mut out, None, &mut b), vec![1, 2, 3]);
+        assert_eq!(weld_block(&mut out, &mut b), vec![1, 2, 3]);
         assert_eq!(out.vertices.len(), 4);
         assert_eq!(out.vertices[2].uv[0], 2.0);
-        // another material never merges
-        let other = Some(TextureKey { rdb_type: 1, id: 1 });
-        assert_eq!(weld_block(&mut out, other, &mut [v(1.0, up, 1.0)]), vec![4]);
+        // a cell that is not adjacent (its vertices are outside the candidate ranges) never merges
+        out.cell_start.extend([4, 4, 4, 4, 4, 4]);
+        assert_eq!(weld_block(&mut out, &mut [v(1.0, up, 1.0)]), vec![4]);
     }
 
     #[test]

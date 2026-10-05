@@ -55,6 +55,8 @@ pub struct Room {
     /// World position of the room centre; statels in the room are relative to it.
     pub pos: [f32; 3],
     pub name: Option<String>,
+    /// Baked vertex lighting: vertex count and the zlib stream (`n3Room_t::DepackLightmap`, see `dungeon`).
+    pub lightmap: Option<(u32, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,12 +118,10 @@ fn room(r: &mut Rd, version: u32) -> Result<Room> {
     let doors = r.u16()? as usize;
     r.skip(doors * 4)?; // (u16 door tile x, u16 door tile z) pairs, not needed for geometry
     let name = if flags & 0x80 != 0 { Some(cstr(r.take(32)?)) } else { None };
-    // lightmap: i32 size+4, i32 present, bytes
+    // lightmap: i32 zlib size + 4, i32 vertex count, zlib bytes
     let lm = r.u32()?;
-    let present = r.u32()?;
-    if present != 0 {
-        r.skip(lm.saturating_sub(4) as usize)?;
-    }
+    let count = r.u32()?;
+    let lightmap = if count != 0 { Some((count, r.take(lm.saturating_sub(4) as usize)?.to_vec())) } else { None };
     // liquid data: u32 (n+1)*0x3f1, n x { u32, u32 n1, n1 x vec3, u32 n2, n2 x 3 u16 }
     let water = r.u32()?;
     if water != 0 && water % 0x3f1 == 0 {
@@ -137,7 +137,7 @@ fn room(r: &mut Rd, version: u32) -> Result<Room> {
         let n = r.u32()? as usize;
         r.skip(n * (12 + 16 + if version >= 6 { 12 } else { 0 } + 4))?; // camera attractors
     }
-    Ok(Room { rot: flags & 3, rect, pos, name })
+    Ok(Room { rot: flags & 3, rect, pos, name, lightmap })
 }
 
 #[cfg(test)]

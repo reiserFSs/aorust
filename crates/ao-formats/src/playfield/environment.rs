@@ -79,11 +79,13 @@ pub fn to_scene(env: &Env, outdoor: bool) -> Environment {
     let fog = env.fog_color();
     let (fog_color, density) = if fog == [0, 0, 0] || env.fog_density() <= 0.0 { (sky, 0.01) } else { (lin(fog), env.fog_density()) };
     let fog_end = VIEW_DISTANCE - (VIEW_DISTANCE - NEAR - 5.0) * density;
+    let a = lin(env.ambient());
     let (ambient, sun_color) = if outdoor {
-        let a = lin(env.ambient());
         (a, a.map(|v| 1.0 - v))
     } else {
-        ([0.45; 3], [0.3; 3])
+        // `Tweak_Rubi-Ka_IndoorLight` AmbientLightCurrent 0.01 competes with the record ambient (`AddAmbientLight` keeps the
+        // per-channel maximum, DisplaySystem @0x10059d2c); no sun indoors; the room lightmaps carry the lighting
+        (a.map(|v| v.max(0.01)), [0.0; 3])
     };
     let l = (SUN_DIR[0] * SUN_DIR[0] + SUN_DIR[1] * SUN_DIR[1] + SUN_DIR[2] * SUN_DIR[2]).sqrt();
     Environment { sky_color: sky, fog_color, fog_start: NEAR, fog_end, ambient, sun_color, sun_dir: SUN_DIR.map(|v| v / l) }
@@ -122,7 +124,7 @@ mod tests {
         let s = to_scene(&e, true);
         assert!((s.fog_end - (VIEW_DISTANCE - (VIEW_DISTANCE - NEAR - 5.0) * 0.01)).abs() < 1e-3);
         assert_eq!(s.fog_color, s.sky_color);
-        assert!(to_scene(&e, false).ambient[0] >= 0.45);
+        assert!(to_scene(&e, false).ambient[0] >= 0.01);
     }
 
     #[test]

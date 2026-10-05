@@ -97,10 +97,16 @@ fn shade(i: VOut, mode: u32) -> vec4<f32> {
         n = -n; // lit from the viewer's side (two-sided surfaces, unreliable normals)
     }
     var light = g.ambient.rgb + g.sun_color.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + point_lights(i.wpos, n);
+    var lit: vec3<f32>;
+    if mat.emissive.w > 1.5 {
+        // prelit room shell: vertex colour is emissive light (engine: tex * (emissive + 0.8 * ambient))
+        lit = t.rgb * mat.color.rgb * (i.color.rgb + 0.8 * g.ambient.rgb);
+    } else {
     if mat.emissive.w > 0.5 {
         light = max(light, min(light + t.a, vec3<f32>(1.0))); // alpha = self-illumination mask (engine: saturate(a + lighting))
     }
-    let lit = c.rgb * (light + mat.emissive.rgb); // engine: tex * (emissive + lighting)
+    lit = c.rgb * (light + mat.emissive.rgb); // engine: tex * (emissive + lighting)
+    }
     let f = clamp((length(to_eye) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
     // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
     let add = mode == 3u;

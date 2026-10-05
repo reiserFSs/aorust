@@ -59,6 +59,9 @@ pub struct Submesh {
     /// Texture alpha is a self-illumination mask (opaque materials only): the texel is
     /// lit by `max(lighting, min(lighting + a, 1))` (engine: `saturate(a + lighting)`).
     pub glow_mask: bool,
+    /// Baked-lighting surface (dungeon room shells): vertex colour is *emissive* light,
+    /// `lit = tex * material * (vertex.rgb + 0.8 * ambient)`; no sun or point lights. Fog still applies.
+    pub prelit: bool,
 }
 
 impl Submesh {
@@ -71,6 +74,7 @@ impl Submesh {
             two_sided: false,
             emissive: [0.0; 3],
             glow_mask: false,
+            prelit: false,
         }
     }
 }
