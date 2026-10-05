@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use wgpu::util::DeviceExt;
 
-pub use egui;
 pub use gui::GuiRenderer;
 pub use viewer::{run_frontend, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
 
@@ -208,9 +207,21 @@ impl LightGrid {
 
 /// Static instance data: transform plus world-space bounding sphere.
 struct Inst {
+    /// Hidden by the statel distance LOD (`Scene::statel_lod`).
+    hidden: bool,
     m: [[f32; 4]; 4],
     center: Vec3,
     radius: f32,
+}
+
+/// `Scene::statel_lod` plus the GPU instance slot of every scene instance and the last zone levels.
+struct LodState {
+    lod: ao_scene::StatelLod,
+    /// Scene instance index -> index into `Gpu::insts` (`usize::MAX` = not uploaded).
+    slot: Vec<usize>,
+    levels: Vec<u8>,
+    /// Per item: the controller's current identity is the reduced mesh (`FUN_100241ab` keeps it between modes).
+    reduced: Vec<bool>,
 }
 
 struct Gpu {
@@ -238,7 +249,7 @@ struct SkyGpu {
 
 /// Material uniform of a submesh (see `shader.wgsl` `Mat`).
 fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 12] {
-    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], 0.0, 0.0]
+    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], s.sky_fog as u32 as f32, 0.0]
 }
 
 /// Last-frame counters (after frustum culling).
@@ -295,6 +306,8 @@ pub struct Renderer {
     env: Environment,
     /// Camera dependent fog (statel fog volumes), see `Scene::fog_model`.
     fog: Option<ao_scene::FogModel>,
+    /// Statel distance LOD state, see `Scene::statel_lod`.
+    lod: Option<LodState>,
     // per-frame scratch
     frame: usize,
     vis: Vec<[[f32; 4]; 4]>,
@@ -487,6 +500,7 @@ impl Renderer {
             gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
             env: default_environment(100.0),
             fog: None,
+            lod: None,
             frame: 0,
             vis: vec![],
             vis_src: vec![],
@@ -588,7 +602,7 @@ impl Renderer {
             if let Some(v) = by_mesh.get_mut(i.mesh) {
                 let m = Mat4::from_cols_array_2d(&i.transform);
                 let scale = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
-                v.push(Inst { m: i.transform, center: m.transform_point3(sphere[i.mesh].0), radius: sphere[i.mesh].1 * scale });
+                v.push(Inst { hidden: false, m: i.transform, center: m.transform_point3(sphere[i.mesh].0), radius: sphere[i.mesh].1 * scale });
             }
         }
 
@@ -653,6 +667,21 @@ impl Renderer {
         let radius = scene_bounds(scene).map_or(100.0, |(l, h)| ((h - l).length() * 0.5).max(1.0));
         self.env = scene.environment.unwrap_or_else(|| default_environment(radius));
         self.fog = scene.fog_model.clone();
+        self.lod = scene.statel_lod.clone().map(|lod| {
+            let mut seen = vec![0usize; mesh_range.len()];
+            let slot = scene
+                .instances
+                .iter()
+                .map(|i| match mesh_range.get(i.mesh) {
+                    Some(r) if seen[i.mesh] < r.len() => {
+                        seen[i.mesh] += 1;
+                        r.start + seen[i.mesh] - 1
+                    }
+                    _ => usize::MAX,
+                })
+                .collect();
+            LodState { levels: vec![u8::MAX; lod.zones.len()], reduced: vec![false; lod.items.len()], lod, slot }
+        });
         self.set_sky(scene);
         let grid = LightGrid::new(&scene.lights);
         self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
@@ -750,6 +779,44 @@ impl Renderer {
         }
     }
 
+    /// Applies the client's statel zone LOD for a camera at scene `(x, z)`: re-evaluates the zone levels and, when one
+    /// changed, which statels (and which of their meshes) are shown.
+    fn update_lod(&mut self, x: f32, z: f32) {
+        let Some(st) = self.lod.as_mut() else { return };
+        let levels: Vec<u8> = (0..st.lod.zones.len()).map(|i| st.lod.level(i, [x, z])).collect();
+        if levels == st.levels {
+            return;
+        }
+        if st.levels.iter().all(|&l| l == u8::MAX) {
+            // statels no zone shows (unreferenced global statels) are never created by the client
+            for item in st.lod.items.iter().filter(|i| i.zones.is_empty()) {
+                for i in [Some(item.full), item.reduced].into_iter().flatten() {
+                    if let Some(g) = st.slot.get(i).and_then(|&g| self.gpu.insts.get_mut(g)) {
+                        g.hidden = true;
+                    }
+                }
+            }
+        }
+        for (zone, (&new, old)) in levels.iter().zip(&st.levels).enumerate() {
+            if new == *old {
+                continue;
+            }
+            for &it in &st.lod.zone_items[zone] {
+                let item = &st.lod.items[it as usize];
+                let (pick, ident) = st.lod.pick(item, &levels, st.reduced[it as usize]);
+                st.reduced[it as usize] = ident;
+                let mut set = |inst: Option<usize>, show: bool| {
+                    if let Some(g) = inst.and_then(|i| st.slot.get(i)).and_then(|&g| self.gpu.insts.get_mut(g)) {
+                        g.hidden = !show;
+                    }
+                };
+                set(Some(item.full), pick == ao_scene::LodPick::Full);
+                set(item.reduced, pick == ao_scene::LodPick::Reduced);
+            }
+        }
+        st.levels = levels;
+    }
+
     /// Re-poses the uploaded scene in place: `scene` must be the same scene with only vertex positions/normals and
     /// instance transforms changed (an animated character); textures, materials and indices are kept.
     pub fn repose(&mut self, scene: &Scene) {
@@ -775,6 +842,7 @@ impl Renderer {
 
     /// Draws one frame into `resolve` (a view of the output texture).
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) {
+        self.update_lod(cam.pos.x, cam.pos.z);
         let mut env = self.env;
         if let Some((color, end)) = self.fog.as_ref().map(|m| m.at(cam.pos.to_array())) {
             if env.sky_color == env.fog_color {
@@ -808,7 +876,7 @@ impl Renderer {
             let start = self.vis.len() as u32;
             for (i, inst) in self.gpu.insts[r.clone()].iter().enumerate() {
                 let c = inst.center.extend(1.0);
-                if planes.iter().all(|p| p.dot(c) >= -inst.radius) {
+                if !inst.hidden && planes.iter().all(|p| p.dot(c) >= -inst.radius) {
                     self.vis.push(inst.m);
                     self.vis_src.push((r.start + i) as u32);
                 }
