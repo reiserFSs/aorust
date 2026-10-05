@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use ao_formats::playfield::{floor_below, list_playfields, load_playfield_report, scene_bounds};
+use ao_formats::playfield::{floor_below, support_below, list_playfields, load_playfield_report, scene_bounds};
 use ao_rdb::RecordStore;
 
 fn main() -> anyhow::Result<()> {
@@ -98,7 +98,9 @@ fn spawn_problem(scene: &ao_scene::Scene) -> Option<String> {
     if (0..3).any(|i| s[i] < lo[i] || s[i] > hi[i] + if i == 1 { 50.0 } else { 0.0 }) {
         return Some(format!("spawn {s:?} outside bounds {lo:?}..{hi:?}"));
     }
-    match floor_below(scene, s) {
+    // terrain/room floor first; only a spawn hovering over floating statels (no ground there) may stand on their tops
+    let floor = floor_below(scene, s).filter(|f| s[1] - f <= 30.0).or_else(|| support_below(scene, s));
+    match floor {
         None => Some(format!("no floor below spawn {s:?}")),
         Some(f) if s[1] - f < 0.5 || s[1] - f > 30.0 => Some(format!("spawn {s:?} is {:.1} m above the floor", s[1] - f)),
         _ if (at[0] - s[0]).hypot(at[2] - s[2]) < 1.0 => Some(format!("look-at {at:?} is straight above/below spawn {s:?}")),

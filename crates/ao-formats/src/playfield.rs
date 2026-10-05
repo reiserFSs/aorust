@@ -21,7 +21,7 @@ mod terrain;
 mod water;
 
 pub use sky::DEFAULT_DAY_TIME;
-pub use spawn::{floor_below, scene_bounds};
+pub use spawn::{floor_below, scene_bounds, support_below};
 
 use std::collections::HashMap;
 use std::path::Path;

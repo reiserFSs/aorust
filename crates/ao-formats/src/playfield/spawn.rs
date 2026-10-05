@@ -20,6 +20,11 @@ pub type Box3 = ([f32; 3], [f32; 3]);
 /// Statels larger than this (skydomes, backdrops) neither attract nor block the camera.
 const MAX_EXTENT: f32 = 150.0;
 const BUCKET: f32 = 32.0;
+/// Boxes up to this size block the spawn (larger ones are sky domes / backdrops).
+const MAX_SOLID: f32 = 1500.0;
+/// Median gap between the cluster's statel bottoms and the heightfield above which the field is not what the statels stand on
+/// (floating platforms over a dummy field: 6001; 4364 and 4380-4388 whose field disagrees with the statels).
+const MAX_TERRAIN_GAP: f32 = 6.0;
 
 pub fn mesh_bounds(m: &Mesh) -> Option<Box3> {
     let mut it = m.vertices.iter().map(|v| v.pos);
@@ -66,6 +71,8 @@ fn centre(b: &Box3) -> [f32; 3] {
 /// Outdoor / fallback spawn: eye `eye_h` above `ground(x, z)` next to the densest statel cluster,
 /// looking at the statels around it. `ground` returns `None` outside the walkable area.
 pub fn density_spawn(boxes: &[Box3], ground: &dyn Fn(f32, f32) -> Option<f32>, eye_h: f32) -> Option<Spot> {
+    // solid things the eye must not be inside: everything but sky domes (> 1500 m), including the big arenas/platforms
+    let solid: Vec<&Box3> = boxes.iter().filter(|b| b.0.iter().chain(&b.1).all(|v| v.is_finite()) && (0..3).all(|i| b.1[i] - b.0[i] < MAX_SOLID)).collect();
     let boxes: Vec<&Box3> = boxes.iter().filter(|b| b.0.iter().chain(&b.1).all(|v| v.is_finite()) && (0..3).all(|i| b.1[i] - b.0[i] < MAX_EXTENT)).collect();
     let cen: Vec<[f32; 3]> = boxes.iter().map(|b| centre(b)).collect();
     let key = |p: &[f32; 3]| ((p[0] / BUCKET).floor() as i32, (p[2] / BUCKET).floor() as i32);
@@ -83,9 +90,12 @@ pub fn density_spawn(boxes: &[Box3], ground: &dyn Fn(f32, f32) -> Option<f32>, e
     let n = block.len() as f32;
     let (cx, cz) = (block.iter().map(|&i| cen[i][0]).sum::<f32>() / n, block.iter().map(|&i| cen[i][2]).sum::<f32>() / n);
     // first free eye position on rings around the cluster centre
-    let blocked = |x: f32, z: f32, y0: f32, y1: f32| boxes.iter().any(|b| x > b.0[0] - 1.0 && x < b.1[0] + 1.0 && z > b.0[2] - 1.0 && z < b.1[2] + 1.0 && y1 > b.0[1] && y0 < b.1[1]);
+    let blocked = |x: f32, z: f32, y0: f32, y1: f32| solid.iter().any(|b| x > b.0[0] - 1.0 && x < b.1[0] + 1.0 && z > b.0[2] - 1.0 && z < b.1[2] + 1.0 && y1 > b.0[1] && y0 < b.1[1]);
+    let mut gaps: Vec<f32> = block.iter().filter_map(|&i| ground(cen[i][0], cen[i][2]).map(|g| (boxes[i].0[1] - g).abs())).collect();
+    gaps.sort_by(f32::total_cmp);
+    let trusted = gaps.get(gaps.len() / 2).is_none_or(|&g| g < MAX_TERRAIN_GAP);
     let mut eye = None;
-    'rings: for ring in 0..20 {
+    'rings: for ring in 0..if trusted { 20 } else { 0 } {
         let r = ring as f32 * 8.0;
         for a in 0..(if ring == 0 { 1 } else { 12 }) {
             let t = a as f32 * std::f32::consts::TAU / 12.0;
@@ -98,7 +108,13 @@ pub fn density_spawn(boxes: &[Box3], ground: &dyn Fn(f32, f32) -> Option<f32>, e
         }
     }
     // nothing free at street level (solid city blocks): hover above the tallest statel nearby
-    let eye = eye.unwrap_or_else(|| [cx, block.iter().map(|&i| boxes[i].1[1]).fold(f32::MIN, f32::max) + 12.0, cz + 30.0]);
+    let eye = eye.unwrap_or_else(|| {
+        // hover 12 m above the roof of the cluster statel nearest to its centre (or of a bigger solid covering that point)
+        let &i = block.iter().min_by(|&&a, &&b| (cen[a][0] - cx).hypot(cen[a][2] - cz).total_cmp(&(cen[b][0] - cx).hypot(cen[b][2] - cz))).unwrap_or(&0);
+        let (x, z) = (cen[i][0], cen[i][2]);
+        let roof = solid.iter().filter(|b| x > b.0[0] && x < b.1[0] && z > b.0[2] && z < b.1[2]).map(|b| b.1[1]).fold(f32::MIN, f32::max);
+        [x, roof + 12.0, z]
+    });
     // face the heading with the most statels (15..250 m, +-40 degrees) that terrain does not block
     let mut best: Option<(bool, usize, f32, f32)> = None; // clear, count, target x, z
     for k in 0..16 {
@@ -150,6 +166,13 @@ pub fn floor_below(scene: &Scene, p: [f32; 3]) -> Option<f32> {
         }
     }
     best
+}
+
+/// Highest surface under `p` including placed statels (box tops): what a spawn above floating platforms stands over.
+pub fn support_below(scene: &Scene, p: [f32; 3]) -> Option<f32> {
+    let boxes = instance_boxes(scene, 0);
+    let top = boxes.iter().filter(|b| p[0] > b.0[0] && p[0] < b.1[0] && p[2] > b.0[2] && p[2] < b.1[2] && b.1[1] <= p[1] && b.1[0] - b.0[0] < MAX_SOLID).map(|b| b.1[1]).fold(f32::MIN, f32::max);
+    floor_below(scene, p).into_iter().chain((top > f32::MIN).then_some(top)).reduce(f32::max)
 }
 
 /// Bounds of everything in the scene (instance boxes).
