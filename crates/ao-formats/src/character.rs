@@ -139,10 +139,10 @@ fn bone_world(mesh: &CatMesh, pose: Option<(&CatAnim, f32)>) -> Vec<Xf> {
     world
 }
 
-/// Bind-pose world rotation of each bone, recovered from vertices fully weighted to it
+/// Bind-pose world transform of each bone, recovered from vertices fully weighted to it
 /// (`bind = R * local + t` holds exactly; the file stores normals bone-local but no bind matrices).
 /// `None` when fewer than three non-collinear such vertices exist.
-fn bind_rotations(mesh: &CatMesh) -> Vec<Option<[[f32; 3]; 3]>> {
+fn bind_frames(mesh: &CatMesh) -> Vec<Option<Xf>> {
     let mut pts: Vec<Vec<([f32; 3], [f32; 3])>> = vec![vec![]; mesh.bones.len()];
     for v in mesh.submeshes.iter().flat_map(|s| &s.vertices) {
         if v.weight >= SINGLE_BONE_WEIGHT {
@@ -166,7 +166,9 @@ fn bind_rotations(mesh: &CatMesh) -> Vec<Option<[[f32; 3]; 3]>> {
                 [e1, cross(e3, e1), e3]
             };
             let (ea, ec) = (frame(u, sub(ac, a0)), frame(sub(cb, c0), sub(cc, c0)));
-            Some(std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| ec[k][i] * ea[k][j]).sum())))
+            let r = std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| ec[k][i] * ea[k][j]).sum()));
+            let ra = Xf { r, t: [0.0; 3] }.rot(a0);
+            Some(Xf { r, t: sub(c0, ra) })
         })
         .collect()
 }
@@ -189,8 +191,7 @@ fn face_normals(pos: &[[f32; 3]], idx: &[u16]) -> Vec<[f32; 3]> {
 /// Position + normal of every vertex of every submesh, in the model's left-handed space.
 type Skinned = Vec<Vec<([f32; 3], [f32; 3])>>;
 
-fn skin_bind(mesh: &CatMesh) -> Skinned {
-    let rot = bind_rotations(mesh);
+fn skin_bind(mesh: &CatMesh, frames: &[Option<Xf>]) -> Skinned {
     mesh.submeshes
         .iter()
         .map(|s| {
@@ -200,7 +201,7 @@ fn skin_bind(mesh: &CatMesh) -> Skinned {
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    let n = rot[v.bones[0] as usize].map_or(geo[i], |r| Xf { r, t: [0.0; 3] }.rot(v.normal));
+                    let n = frames[v.bones[0] as usize].map_or(geo[i], |f| f.rot(v.normal));
                     (v.bind, unit(n))
                 })
                 .collect()
@@ -291,7 +292,7 @@ fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned) -> Scene {
         let c: [f32; 3] = std::array::from_fn(|k| (lo[k] + hi[k]) / 2.0);
         let r = (0..3).map(|k| hi[k] - lo[k]).fold(0.0f32, f32::max);
         // characters face +Z in model space, i.e. -Z after the mirror
-        scene.spawn = Some([c[0], c[1], c[2] - 1.8 * r]);
+        scene.spawn = Some([c[0], c[1], c[2] - 1.25 * r]);
         scene.spawn_look_at = Some(c);
     }
     scene
@@ -310,9 +311,22 @@ pub fn load_character_posed(store: &RecordStore, id: u32, anim_id: u32, time_s: 
 
 /// General form: `rdb_type` is [`CHAR_MESH_TYPE`] or [`CHAR_MESH_LOW_TYPE`]; `pose` = (animation id, seconds).
 pub fn load_character_record(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>) -> Result<Scene> {
+    build(store, rdb_type, id, pose, None)
+}
+
+/// Character `id` with the static head mesh `head_mesh_id` (rdb 1010001, e.g. 40098 = `head_athroxmale001`)
+/// mounted on its `Attractor01_head` point; `pose` as in [`load_character_record`].
+pub fn load_character_with_head(store: &RecordStore, id: u32, head_mesh_id: u32, pose: Option<(u32, f32)>) -> Result<Scene> {
+    build(store, CHAR_MESH_TYPE, id, pose, Some(head_mesh_id))
+}
+
+fn build(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>, head: Option<u32>) -> Result<Scene> {
     let mesh = load_cat_mesh(store, rdb_type, id)?;
-    let skin = match pose {
-        None => skin_bind(&mesh),
+    let (skin, frames) = match pose {
+        None => {
+            let frames = bind_frames(&mesh);
+            (skin_bind(&mesh, &frames), frames)
+        }
         Some((anim_id, time_s)) => {
             let anim = load_anim(store, anim_id)?;
             ensure!(
@@ -323,10 +337,28 @@ pub fn load_character_record(store: &RecordStore, rdb_type: u32, id: u32, pose: 
             );
             let ms = time_s * 1000.0;
             let ms = if anim.duration > 0.0 { ms.rem_euclid(anim.duration) } else { 0.0 };
-            skin_pose(&mesh, &bone_world(&mesh, Some((&anim, ms))))
+            let world = bone_world(&mesh, Some((&anim, ms)));
+            (skin_pose(&mesh, &world), world.into_iter().map(Some).collect())
         }
     };
-    Ok(assemble(store, &mesh, &skin))
+    let mut scene = assemble(store, &mesh, &skin);
+    if let Some(head) = head {
+        let att = mesh.attractors.iter().find(|a| a.name.ends_with("_head")).context("model has no head attractor")?;
+        let bone = frames[att.bone as usize].context("head bone has no bind frame")?;
+        let w = bone.mul(&Xf::from_qt(att.rot, att.pos));
+        let idx = crate::mesh::decode_mesh_into(store, head, &mut scene)?.with_context(|| format!("no head mesh {head}"))?;
+        // the head vertices are already mirrored (Z negated): conjugate the mounting transform by the mirror
+        let flip = |i: usize, j: usize| if (i == 2) != (j == 2) { -1.0 } else { 1.0 };
+        let mut m = IDENTITY;
+        for c in 0..3 {
+            for r in 0..3 {
+                m[c][r] = w.r[r][c] * flip(r, c);
+            }
+        }
+        m[3] = [w.t[0], w.t[1], -w.t[2], 1.0];
+        scene.instances.push(Instance { mesh: idx, transform: m });
+    }
+    Ok(scene)
 }
 
 pub fn load_cat_mesh(store: &RecordStore, rdb_type: u32, id: u32) -> Result<CatMesh> {
@@ -350,4 +382,226 @@ pub fn compatible_animations(store: &RecordStore, mesh: &CatMesh) -> Result<Vec<
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+
+    fn u(v: &mut Vec<u8>, x: u32) {
+        v.extend(x.to_le_bytes());
+    }
+    fn f(v: &mut Vec<u8>, x: f32) {
+        v.extend(x.to_le_bytes());
+    }
+    fn s(v: &mut Vec<u8>, x: &str) {
+        u(v, x.len() as u32);
+        v.extend(x.as_bytes());
+    }
+    fn name32(v: &mut Vec<u8>, x: &str) {
+        let mut b = [0xCDu8; 32];
+        b[..x.len()].copy_from_slice(x.as_bytes());
+        b[x.len()] = 0;
+        v.extend(b);
+    }
+
+    /// root bone 0 -> child bone 1; one triangle fully weighted to bone 1 whose bind pose is the child
+    /// placed at (1,0,0); an attractor on bone 1. Texture table: 1 part.
+    fn mesh_record() -> Vec<u8> {
+        let mut v = vec![];
+        name32(&mut v, "root");
+        u(&mut v, 2 * 1009);
+        name32(&mut v, "skin");
+        for x in [7, 0, 0] {
+            u(&mut v, x);
+        }
+        u(&mut v, 0x05010500); // unidentified word
+        for x in [4, 0x104, 0xdead_beef] {
+            u(&mut v, x);
+        }
+        f(&mut v, 0.0);
+        f(&mut v, 0.0);
+        u(&mut v, 1); // materials
+        s(&mut v, "skin");
+        u(&mut v, 8); // flags: alpha is not transparency
+        s(&mut v, "skin.png");
+        for x in [0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.9, 0.9, 0.9, 0.0, 0.0, 0.0, 0.01, 0.0, 1.0] {
+            f(&mut v, x);
+        }
+        u(&mut v, 0); // header spheres
+        u(&mut v, 2); // bones
+        for (name, kids) in [("root", &[1u32][..]), ("child", &[][..])] {
+            s(&mut v, name);
+            f(&mut v, 1.0);
+            u(&mut v, kids.len() as u32);
+            kids.iter().for_each(|&k| u(&mut v, k));
+        }
+        u(&mut v, 1); // groups
+        s(&mut v, "-noselgroup-");
+        u(&mut v, 1); // submeshes
+        u(&mut v, 0); // material
+        u(&mut v, 3); // vertices: local (0,0,0) (0,1,0) (1,0,0) of bone 1; bind = local + (1,0,0)
+        for l in [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]] {
+            for p in [l, l, [l[0] + 1.0, l[1], l[2]], [0.0, 0.0, 1.0]] {
+                p.iter().for_each(|&c| f(&mut v, c));
+            }
+            f(&mut v, 0.25);
+            f(&mut v, 0.75);
+            u(&mut v, 1);
+            u(&mut v, 1);
+            f(&mut v, 1.0);
+        }
+        u(&mut v, 3);
+        for i in [0u16, 1, 2] {
+            v.extend(i.to_le_bytes());
+        }
+        u(&mut v, 1); // collision spheres
+        for x in [0.0, 0.5, 0.0, 0.25] {
+            f(&mut v, x);
+        }
+        u(&mut v, 1);
+        u(&mut v, 1); // attractors
+        s(&mut v, "Attractor01_head");
+        for x in [0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0] {
+            f(&mut v, x);
+        }
+        u(&mut v, 1);
+        v.extend([0u8; 12]);
+        v
+    }
+
+    /// Delta-code `vals` (one column) as big-endian `width`-byte words.
+    fn plane(vals: &[u32], width: usize) -> Vec<u8> {
+        let mut prev = 0u32;
+        let mut raw = vec![];
+        for &x in vals {
+            raw.extend(&x.wrapping_sub(prev).to_be_bytes()[4 - width..]);
+            prev = x;
+        }
+        let mut z = ZlibEncoder::new(vec![], Compression::default());
+        z.write_all(&raw).unwrap();
+        let comp = z.finish().unwrap();
+        let mut out = vec![];
+        u(&mut out, comp.len() as u32);
+        u(&mut out, raw.len() as u32);
+        out.extend(comp);
+        out
+    }
+
+    /// `ncols` interleaved columns of `vals`.
+    fn stream(vals: &[u32], ncols: usize, bits: u32) -> Vec<u8> {
+        (0..ncols).flat_map(|c| plane(&vals.iter().skip(c).step_by(ncols).copied().collect::<Vec<_>>(), bits.div_ceil(8) as usize)).collect()
+    }
+
+    /// Two tracks: bone 0 (root) identity; bone 1 translates (0,0,0) -> (2,0,0) over 1000 ms and
+    /// turns 0 -> 90 degrees about Z. Rotation 10 bit, translation 8 bit.
+    fn anim_record(signature: u32) -> Vec<u8> {
+        let mut v = vec![];
+        name32(&mut v, "root");
+        u(&mut v, 1);
+        u(&mut v, 250);
+        name32(&mut v, "left");
+        for x in [3, 0x100_0106] {
+            u(&mut v, x);
+        }
+        f(&mut v, 1000.0);
+        u(&mut v, signature);
+        f(&mut v, 0.5);
+        u(&mut v, 2);
+        v.extend([10i8 as u8, 8]);
+        let (t0, t1) = (0f32.to_bits(), 1000f32.to_bits());
+        let idx = [0, 0, 2, 1, 1, /* bone 1 */ 1, 0, 2, 2, 2];
+        let time = [t0, t0, t0, t1, t0, t1];
+        // bone 0 rot key: identity; bone 1: identity then 90 degrees; q = raw - 512
+        let rot = [512, 512, 512, 513, 512, 512, 512, 513, 512, 512, 612, 612];
+        let range = [0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0].map(f32::to_bits);
+        let trans = [0, 0, 0, 0, 0, 0, 255, 0, 0];
+        v.extend(stream(&idx, 1, 32));
+        v.extend(stream(&time, 1, 32));
+        v.extend(stream(&rot, 4, 10));
+        v.extend(stream(&range, 1, 32));
+        v.extend(stream(&trans, 3, 8));
+        v
+    }
+
+    #[test]
+    fn cat_mesh_fixture_parses() {
+        let m = CatMesh::parse(&mesh_record()).unwrap();
+        assert_eq!((m.root.as_str(), m.signature), ("root", 0xdead_beef));
+        assert_eq!(m.parts, [Part { name: "skin".into(), texture: 7, env_texture: 0, alpha_aux: 0 }]);
+        assert_eq!(m.materials[0].flags, 8);
+        assert_eq!(m.bones[0].children, [1]);
+        assert_eq!(m.parents(), [None, Some(0)]);
+        assert_eq!(m.bone_order(), [0, 1]);
+        assert_eq!(m.submeshes[0].vertices[2].bind, [2.0, 0.0, 0.0]);
+        assert_eq!(m.submeshes[0].indices, [0, 1, 2]);
+        assert_eq!((m.col_spheres.len(), m.attractors[0].name.as_str(), m.attractors[0].bone), (1, "Attractor01_head", 1));
+    }
+
+    #[test]
+    fn cat_mesh_rejects_corruption() {
+        let good = mesh_record();
+        assert!(CatMesh::parse(&good[..good.len() - 40]).is_err(), "truncated");
+        let mut bad = good.clone();
+        bad[32..36].copy_from_slice(&1010u32.to_le_bytes());
+        assert!(CatMesh::parse(&bad).is_err(), "part marker not a multiple of 1009");
+        let mut bad = good.clone();
+        let at = good.windows(4).rposition(|w| w == 3u32.to_le_bytes()).unwrap(); // index count
+        bad[at + 4..at + 6].copy_from_slice(&9u16.to_le_bytes());
+        assert!(CatMesh::parse(&bad).is_err(), "index beyond the vertex list");
+    }
+
+    #[test]
+    fn cat_anim_fixture_decodes_and_samples() {
+        let a = CatAnim::parse(&anim_record(0xdead_beef)).unwrap();
+        assert_eq!((a.version, a.duration, a.events.clone()), (0x106, 1000.0, vec![(250, "left".to_string())]));
+        assert_eq!(a.tracks.len(), 2);
+        let t = &a.tracks[1];
+        assert_eq!((t.bone, t.mode, t.rot.len(), t.trans.len()), (1, 2, 2, 2));
+        assert!((t.rot[1].1[2] - 0.7071).abs() < 1e-3 && (t.rot[1].1[3] - 0.7071).abs() < 1e-3);
+        assert!((t.trans[1].1[0] - 2.0).abs() < 1e-6 && t.trans[0].1 == [0.0; 3]);
+        let (q, p) = a.sample(1, 500.0).unwrap();
+        assert!((p[0] - 1.0).abs() < 1e-5);
+        assert!((q[2] - (std::f32::consts::PI / 8.0).sin()).abs() < 1e-3, "45 degrees halfway: {q:?}");
+        assert!(a.sample(7, 0.0).is_none());
+    }
+
+    #[test]
+    fn skinning_follows_the_animated_skeleton() {
+        let mesh = CatMesh::parse(&mesh_record()).unwrap();
+        let anim = CatAnim::parse(&anim_record(mesh.signature)).unwrap();
+        // bind: reconstructed frame of the child bone is a pure translation by (1,0,0)
+        let frames = bind_frames(&mesh);
+        assert!(frames[0].is_none());
+        let f1 = frames[1].unwrap();
+        assert!(f1.t.iter().zip([1.0, 0.0, 0.0]).all(|(a, b)| (a - b).abs() < 1e-5), "{:?}", f1.t);
+        assert!(f1.r.iter().flatten().zip([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]).all(|(a, b)| (a - b).abs() < 1e-5));
+        // t = 0: child sits at the root origin with identity rotation -> vertices are the bone-local positions
+        let at0 = skin_pose(&mesh, &bone_world(&mesh, Some((&anim, 0.0))));
+        assert_eq!(at0[0][1].0, [0.0, 1.0, 0.0]);
+        // t = 1000 (looped by the caller to the last key): +2 in x and a quarter turn about Z
+        let end = skin_pose(&mesh, &bone_world(&mesh, Some((&anim, 1000.0))));
+        let p = end[0][1].0;
+        assert!(p.iter().zip([1.0, 0.0, 0.0]).all(|(a, b)| (a - b).abs() < 1e-3), "{p:?}"); // R*(0,1,0)+(2,0,0) = (-1,0,0)+(2,0,0)
+        let n = end[0][1].1; // local normal +Z is the rotation axis
+        assert!((n[2] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn material_blend_follows_flags_and_alpha() {
+        let mut m = CatMesh::parse(&mesh_record()).unwrap().materials.remove(0);
+        let key = TextureKey { rdb_type: TEXTURE_TYPE, id: 1 };
+        let tex = |alphas: &[u8]| ao_scene::Texture { width: alphas.len() as u32, height: 1, rgba: alphas.iter().flat_map(|&a| [9, 9, 9, a]).collect() };
+        let blend = |m: &Material, t: &ao_scene::Texture| submesh_for(m, Some((key, t))).blend;
+        assert_eq!(blend(&m, &tex(&[0, 255])), Blend::Opaque, "flags & 8: alpha is not transparency");
+        m.flags = 0;
+        assert_eq!(blend(&m, &tex(&[0, 255])), Blend::AlphaTest);
+        assert_eq!(blend(&m, &tex(&[0, 128])), Blend::AlphaBlend);
+        assert_eq!(blend(&m, &tex(&[255])), Blend::Opaque);
+        m.opacity = 0.5;
+        assert_eq!(blend(&m, &tex(&[255])), Blend::AlphaBlend);
+        assert_eq!(submesh_for(&m, None).base_color[3], 0.5);
+    }
 }
