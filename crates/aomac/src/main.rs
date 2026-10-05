@@ -58,6 +58,15 @@ enum What {
         #[arg(long)]
         list: bool,
     },
+    /// Character model record id, optionally posed by an animation clip.
+    Char {
+        id: u32,
+        #[arg(long)]
+        anim: Option<u32>,
+        /// Clip time in seconds (with --anim).
+        #[arg(long, default_value_t = 0.0)]
+        time: f32,
+    },
     /// Synthetic test scene.
     Demo {
         /// Number of cube instances.
@@ -90,6 +99,13 @@ fn main() -> Result<()> {
             let dir = client_dir(opts.client.clone())?;
             let scene: Scene = match what {
                 What::Demo { count } => demo::scene(count),
+                What::Char { id, anim, time } => {
+                    let store = RecordStore::open(&dir)?;
+                    match anim {
+                        None => ao_formats::character::load_character(&store, id)?,
+                        Some(a) => ao_formats::character::load_character_posed(&store, id, a, time)?,
+                    }
+                }
                 What::Mesh { id } => ao_formats::mesh::load_mesh(&RecordStore::open(&dir)?, id)?,
                 What::Pf { list: true, .. } => {
                     let mut out = std::io::stdout().lock();

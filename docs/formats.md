@@ -23,7 +23,7 @@ Ported from the decompiled PRK launcher (`MainWindow.DownloadLatestVersion`, `Ht
 - Headless: `ao_render::render_to_png(scene, eye, look_at, w, h, path)`.
 - CLI (`--client DIR` default `~/Games/ProjectRubiKa/client`):
   - `aomac install [--client DIR]` → `ao_install::run`
-  - `aomac view mesh <id>` / `view pf <id>` / `view pf --list` / `view demo [--count N]`
+  - `aomac view mesh <id>` / `view char <id> [--anim A --time S]` / `view pf <id>` / `view pf --list` / `view demo [--count N]`
   - on any view: `--screenshot out.png [--eye x,y,z] [--at x,y,z] [--size WxH]` renders offscreen and exits (defaults: `ao_render::default_view`, 1280x800).
 - Perf (M4 Pro, release, 1280x800 logical = 2560x1600 px window, 4x MSAA, `AOMAC_NOVSYNC=1`, ms/frame; before = old renderer that drew every instance, no culling, treated all non-opaque blends as cutouts): pf 505 spawn view 2.95 -> 2.1-2.5; pf 566 spawn view 1.8 -> 0.85 (wgpu 29) ; pf 505 from 2.5 km up with ~26.6k statels visible 2.3 -> 5.3 (6689 draws; 5.7k of them are per-instance sorted AlphaBlend submeshes, CPU 2.7 ms; with those batched as opaque it is 4.2, so true sorted blending costs ~1 ms per 5.7k instances: producers should prefer AlphaTest for foliage cutouts); pf 566 from 500 m up 1.7 -> 1.9. Spawn-view numbers include scene changes by other slices between measurements. Demo `--count 10000`: 1.5-2.2 ms.
 
