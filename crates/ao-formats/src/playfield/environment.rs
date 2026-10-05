@@ -99,9 +99,10 @@ pub fn to_scene(env: &Env, outdoor: bool, sky: Option<&Sky>) -> Environment {
         // per-channel maximum, DisplaySystem @0x10059d2c); no sun indoors; the room lightmaps carry the lighting
         (false, _) => (a.map(|v| v.max(0.01)), [0.0; 3]),
     };
-    // indoors the clear colour is black (`Tweak_BlackBackground`); outdoors the atmosphere's horizon colour
+    // indoors the clear colour is black (`Tweak_BlackBackground`); outdoors it is the fog colour: everything at the far
+    // distance, the dome's lowest ring included, is fully fogged, so the clear colour must equal it (no band below the horizon)
     let sky_color = match (outdoor, sky) {
-        (true, Some(s)) => s.bottom().map(srgb_to_linear),
+        (true, Some(_)) => fog_color,
         (true, None) => SKY_SRGB.map(srgb_to_linear),
         _ => [0.0; 3],
     };
