@@ -19,6 +19,7 @@
 mod aurora;
 mod layers;
 mod script;
+mod traffic;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -53,7 +54,7 @@ impl Tweaks {
         let own = format!("Tweak_Playfield_{id}.txt");
         let first = if dir.join(&own).is_file() { own } else if outdoor { "Tweak_Playfield_OutdoorDefault.txt".into() } else { "Tweak_Playfield_IndoorDefault.txt".into() };
         let mut text = String::new();
-        flatten(&dir, &first, &mut HashSet::new(), &mut text);
+        flatten(&dir, &first, &mut HashSet::new(), &mut text, false);
         (!text.is_empty()).then_some(Tweaks(text))
     }
 
@@ -98,16 +99,36 @@ impl Tweaks {
     }
 }
 
-fn flatten(dir: &Path, name: &str, seen: &mut HashSet<String>, out: &mut String) {
-    if !seen.insert(name.to_string()) || seen.len() > 64 {
+/// `in_object`: the file is the body of an `Object` (an include inside an object block). Those are templates that every
+/// object needs its own copy of (`Template_Spaceship_*` in each ship), so only top-level includes are read once.
+fn flatten(dir: &Path, name: &str, seen: &mut HashSet<String>, out: &mut String, in_object: bool) {
+    if in_object {
+        if seen.len() > 64 {
+            return;
+        }
+    } else if !seen.insert(name.to_string()) || seen.len() > 64 {
         return;
     }
     let Ok(text) = std::fs::read_to_string(dir.join(name)) else { return };
+    let mut depth = in_object as u32;
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("");
+        match line.trim() {
+            "{" => depth += 1,
+            "}" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
         if let Some(inc) = line.trim().strip_prefix("!include") {
             let inc = inc.trim().trim_start_matches('{').trim_end_matches('}').trim();
-            flatten(dir, inc, seen, out);
+            if in_object || depth > 0 {
+                // a template inside an object: no `seen` bookkeeping, nesting is bounded by the include chain length
+                let mut chain = seen.clone();
+                if chain.insert(format!("{name}>{inc}")) {
+                    flatten(dir, inc, &mut chain, out, true);
+                }
+            } else {
+                flatten(dir, inc, seen, out, false);
+            }
         } else {
             out.push_str(line);
             out.push('\n');
@@ -346,9 +367,10 @@ impl SkyClock {
     }
 }
 
-/// Adds the playfield's static distant scenery (city skylines) to `scene.instances`, see `layers::emit_distant`.
-pub fn emit_distant(tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut Scene) {
-    layers::emit_distant(&tweaks.objects(), store, scene);
+/// Adds the playfield's distant scenery (city skylines, traffic ships) to `scene.instances` / `scene.movers`, see
+/// `layers::emit_distant`; `day_time` is the game day time the ships are posed at.
+pub fn emit_distant(tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut Scene, day_time: f32) {
+    layers::emit_distant(&tweaks.objects(), store, scene, day_time);
 }
 
 #[cfg(test)]
@@ -422,10 +444,12 @@ mod tests {
         let Some(dir) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/ProjectRubiKa/client")) else { return };
         let (Some(t), Ok(store)) = (Tweaks::load(&dir, 566, true), ao_rdb::RecordStore::open(&dir)) else { return };
         let mut scene = Scene::default();
-        emit_distant(&t, &store, &mut scene);
-        // Newland City includes the Old Athen skyline (a UniversePosition point), at its universe offset
-        assert!(!scene.instances.is_empty(), "{}", scene.instances.len());
-        assert!(scene.instances.iter().all(|i| i.transform[3][0].abs() + i.transform[3][2].abs() > 1000.0), "far away");
+        emit_distant(&t, &store, &mut scene, DEFAULT_DAY_TIME);
+        // Newland City includes the Old Athen skyline (a UniversePosition point), at its universe offset; the traffic ships
+        // (`Scene::movers`) fly near the city
+        let ships: Vec<usize> = scene.movers.iter().map(|m| m.instance).collect();
+        assert!(scene.instances.len() > ships.len(), "{}", scene.instances.len());
+        assert!(scene.instances.iter().enumerate().filter(|(i, _)| !ships.contains(i)).all(|(_, i)| i.transform[3][0].abs() + i.transform[3][2].abs() > 1000.0), "far away");
     }
 
     #[test]

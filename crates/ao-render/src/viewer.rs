@@ -321,6 +321,9 @@ impl State {
         self.last = now;
         self.clock += dt;
         self.renderer.time = self.clock;
+        if let Some(l) = &self.live {
+            self.renderer.day_time_rate = l.scale;
+        }
         if let Some(sky) = self.live.as_mut().and_then(|l| l.tick(dt)) {
             self.renderer.set_sky(&sky);
         }

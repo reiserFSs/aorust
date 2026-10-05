@@ -90,7 +90,7 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
 
 /// Position expressions of the scenery objects: `RKPP.<place> - PlayfieldData.UniversePosition + This.UniversePosition + v(..)`
 /// (terms separated by `+` / `-`, evaluated left to right).
-fn position_expr(objs: &[Obj], o: &Obj, expr: &str) -> Option<[f32; 3]> {
+pub(super) fn position_expr(objs: &[Obj], o: &Obj, expr: &str) -> Option<[f32; 3]> {
     let ctx = Ctx::at(0.0);
     let rkpp = objs.iter().find(|r| r.name == "RKPP")?;
     let place = |name: &str| script::vector(rkpp, &ctx, rkpp.field(name)?, 0);
@@ -102,6 +102,15 @@ fn position_expr(objs: &[Obj], o: &Obj, expr: &str) -> Option<[f32; 3]> {
         if t == "PlayfieldData.UniversePosition" {
             let pf = objs.iter().find(|p| p.name == "PlayfieldData")?;
             return place(pf.field("UniversePosition")?.trim().strip_prefix("RKPP.")?);
+        }
+        if let Some(n) = t.strip_prefix("RKWP.") {
+            // `RKWP.Pos_*` waypoint of `Tweak_RubiKa_Waypoints`: a place position plus a local offset
+            let w = objs.iter().find(|r| r.name == "RKWP")?;
+            return position_expr(objs, w, w.field(n)?);
+        }
+        if t == "This.WND" {
+            // `GAME.LowAltitudeWind * GameDeltaTime * 1.1` smoothed: the wind drift of the `_A` waypoints, 0 for a still frame
+            return Some([0.0; 3]);
         }
         if let Some(f) = t.strip_prefix("This.") {
             return script::vector(o, &ctx, o.field(f)?, 0);
@@ -124,21 +133,26 @@ fn position_expr(objs: &[Obj], o: &Obj, expr: &str) -> Option<[f32; 3]> {
 }
 
 /// Placed scenery of the tweak script that is not a sky layer: the `Priority Normal` world-space mesh objects whose
-/// `Visibility` is `GAME.GameShowSpaceship` (default 1: `FUN_10062d59` DisplaySystem sets the flag at `+0x189`) and whose
-/// `UniversePosition` is a single point, i.e. the static city skylines (`simplecity_oldathen.abiff`, ...). The traffic ships
-/// (`UniversePosition [N]` waypoint loops with stateful smoothing) are not emitted **[UNRESOLVED]**. Their `Scale`
-/// (`e_ScaleVisibleFarAway`) is taken as 1 [UNRESOLVED]. Added to `scene.instances` with the object-space mesh and the
-/// tweak `Rotation`, at `RKPP.<place> - PlayfieldData.UniversePosition + UniversePosition`.
-pub fn emit_distant(objs: &[Obj], store: &RecordStore, scene: &mut Scene) {
+/// `Visibility` is `GAME.GameShowSpaceship` (default 1: `FUN_10062d59` DisplaySystem sets the flag at `+0x189`). A
+/// `UniversePosition` that is a single point is a static city skyline (`simplecity_oldathen.abiff`, ...), added to
+/// `scene.instances` with the object-space mesh and the tweak `Rotation`, at
+/// `RKPP.<place> - PlayfieldData.UniversePosition + UniversePosition`; `UniversePosition [N]` waypoint loops are traffic
+/// ships ([`super::traffic`], `Scene::movers`). Their scale is [`object_scale`].
+pub fn emit_distant(objs: &[Obj], store: &RecordStore, scene: &mut Scene, day_time: f32) {
     let Ok(names) = NameTable::load(store) else { return };
     let ctx = Ctx::at(0.0);
+    scene.day_time = day_time;
+    let mut ship_meshes = HashMap::new();
     for o in objs {
-        let is_static = o.fxid() == "GenericMeshObject"
+        let is_scenery = o.fxid() == "GenericMeshObject"
             && o.field("Priority").is_some_and(|p| p.trim() == "e_RenderPriority_Normal")
             && o.field("PositionType").is_some_and(|p| p.trim() == "e_World")
-            && o.field("Visibility").is_some_and(|v| v.contains("GameShowSpaceship"))
-            && o.field("UniversePosition").is_some_and(|u| u.trim_start().starts_with("v("));
-        if !is_static {
+            && o.field("Visibility").is_some_and(|v| v.contains("GameShowSpaceship"));
+        if !is_scenery {
+            continue;
+        }
+        if !o.field("UniversePosition").is_some_and(|u| u.trim_start().starts_with("v(")) {
+            super::traffic::emit(objs, o, store, &names, scene, &mut ship_meshes, day_time);
             continue;
         }
         let (Some(pos), Some(id)) = (o.field("Position").and_then(|e| position_expr(objs, o, e)), o.string("Mesh").and_then(|m| names.id(MESH_TYPE, m))) else { continue };
@@ -149,7 +163,7 @@ pub fn emit_distant(objs: &[Obj], store: &RecordStore, scene: &mut Scene) {
         let Some(mut mesh) = tmp.meshes.pop() else { continue };
         scene.textures.extend(tmp.textures);
         let q = o.field("Rotation").and_then(|e| script::rotation(o, &ctx, e, 0)).unwrap_or(Quat::IDENTITY);
-        let scale = script::float(o, &ctx, "Scale", 1.0);
+        let scale = object_scale(o, &ctx);
         for v in &mut mesh.vertices {
             v.pos = scene_v(q.rotate(scene_v(v.pos)).map(|c| c * scale));
             v.normal = scene_v(q.rotate(scene_v(v.normal)));

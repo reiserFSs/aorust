@@ -138,6 +138,24 @@ pub fn parse_objects(text: &str) -> Vec<Obj> {
                     lines = peek.clone();
                 }
             }
+            // `Vector UniversePosition [N]` waypoint lists: one expression per following line (`RKWP.Pos_X`,
+            // `RKPP.Jobe - PlayfieldData.UniversePosition + v( .. )`, a leading `,`), stored newline separated; the
+            // declared size is kept as `UniversePosition[]`
+            if array && name == "UniversePosition" && !expr.contains("v(") {
+                let size = rest[end..].trim_start().trim_start_matches('[').split(']').next().unwrap_or("").trim().to_string();
+                let mut entries: Vec<String> = Some(expr.clone()).filter(|e| !e.is_empty()).into_iter().collect();
+                let mut peek = lines.clone();
+                while let Some(n) = peek.next() {
+                    let n = n.trim().trim_start_matches(',').trim();
+                    if n.is_empty() || n == "{" || n == "}" || TYPES.contains(&n.split_whitespace().next().unwrap_or("")) || n.starts_with("Expansion") || n.starts_with("StateBlob") {
+                        break;
+                    }
+                    entries.push(n.to_string());
+                    lines = peek.clone();
+                }
+                expr = entries.join("\n");
+                obj.fields.insert("UniversePosition[]".to_string(), size);
+            }
             obj.fields.insert(name, expr);
         }
     }
