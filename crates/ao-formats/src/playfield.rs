@@ -102,6 +102,15 @@ pub fn load_playfield_report(store: &RecordStore, client_dir: &Path, id: u32) ->
 }
 
 pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32, day_time: f32) -> Result<(Scene, Report)> {
+    load_playfield_report_on_day(store, client_dir, id, day_time, crate::weather::OFFLINE_DAY)
+}
+
+/// [`load_playfield_at`] for a server game day: `game_day` (`GameTime_t+0x4C`, `GameTimeIIR_t.arg3`) seeds the weather schedule.
+pub fn load_playfield_on_day(store: &RecordStore, client_dir: &Path, id: u32, day_time: f32, game_day: u32) -> Result<Scene> {
+    load_playfield_report_on_day(store, client_dir, id, day_time, game_day).map(|(s, _)| s)
+}
+
+pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: u32, day_time: f32, game_day: u32) -> Result<(Scene, Report)> {
     // the day repeats: wrap so colour tracks, ground shadows, sun and moons agree; NaN/inf fall back to the default
     let day_time = if day_time.is_finite() { day_time.rem_euclid(sky::DAY_LENGTH) } else { DEFAULT_DAY_TIME };
     let raw = store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?;
@@ -113,7 +122,7 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
     let env = environment::parse(&mut tail).with_context(|| format!("environment of playfield {id}"))?;
     let tweaks = sky::Tweaks::load(client_dir, id, rec.is_outdoor());
     let sky = tweaks.as_ref().and_then(|t| sky::Sky::new(t, day_time)).map(|mut s| {
-        s.set_weather(sky::weather_at(&env, day_time));
+        s.set_weather(sky::weather_at(&env, game_day, day_time));
         s
     });
     let mut environment = environment::to_scene(&env, rec.is_outdoor(), sky.as_ref());

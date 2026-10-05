@@ -360,6 +360,8 @@ pub struct SkyClock {
     tweaks: Tweaks,
     env: super::environment::Env,
     sent: HashSet<ao_scene::TextureKey>,
+    /// Game day seeding the weather schedule ([`crate::weather::OFFLINE_DAY`] unless [`SkyClock::on_day`]).
+    day: u32,
 }
 
 impl SkyClock {
@@ -375,7 +377,13 @@ impl SkyClock {
         let mut tail = super::record::Rd::new(&raw, rec.tail);
         super::water::parse(&mut tail)?;
         let env = super::environment::parse(&mut tail)?;
-        Ok(Tweaks::load(client_dir, id, true).map(|tweaks| SkyClock { store, tweaks, env, sent: HashSet::new() }))
+        Ok(Tweaks::load(client_dir, id, true).map(|tweaks| SkyClock { store, tweaks, env, sent: HashSet::new(), day: crate::weather::OFFLINE_DAY }))
+    }
+
+    /// The weather follows the server's game day (`GameTimeIIR_t.arg3`) instead of the offline day.
+    pub fn on_day(mut self, game_day: u32) -> Self {
+        self.day = game_day;
+        self
     }
 
     /// A scene with only `sky`, `meshes`, new `textures`, `environment` and the base `fog_model` (no volumes) filled in.
@@ -383,7 +391,7 @@ impl SkyClock {
         let day_time = day_time.rem_euclid(DAY_LENGTH);
         let mut scene = Scene::default();
         let Some(mut sky) = Sky::new(&self.tweaks, day_time) else { return scene };
-        sky.set_weather(weather_at(&self.env, day_time));
+        sky.set_weather(weather_at(&self.env, self.day, day_time));
         let mut environment = super::environment::to_scene(&self.env, true, Some(&sky));
         environment.sky_color = clear_color(&self.tweaks).map_or(environment.sky_color, |c| c.map(srgb_to_linear));
         emit(&sky, &self.tweaks, &self.store, &mut scene, environment.fog_color, environment.fog_end);
@@ -396,8 +404,8 @@ impl SkyClock {
 
 /// The weather a static scene shows at `day_time`: the client's schedule of the playfield's `EnvironmentData` for the offline
 /// game day ([`crate::weather::OFFLINE_DAY`]) plus [`WIND_WARMUP`] seconds of wind.
-pub(super) fn weather_at(env: &super::environment::Env, day_time: f32) -> crate::weather::State {
-    crate::weather::Weather::sample(&env.raw, crate::weather::OFFLINE_DAY, day_time as f64, WIND_WARMUP).state()
+pub(super) fn weather_at(env: &super::environment::Env, game_day: u32, day_time: f32) -> crate::weather::State {
+    crate::weather::Weather::sample(&env.raw, game_day, day_time as f64, WIND_WARMUP).state()
 }
 
 /// A live weather for playfield `id` (`FUN_100bdb64` with the playfield's `EnvironmentData`): call

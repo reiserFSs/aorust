@@ -31,6 +31,10 @@ pub struct Host {
     pub actors: Vec<ao_scene::ActorFrame>,
     /// Forget all actor models and actors before applying `actor_models` (a new zone).
     pub clear_actors: bool,
+    /// Replace the live sky ([`LiveSky`]; `Some(None)` = static sky) of the windowed viewer before the next frame; drained by the viewer.
+    pub live_sky: Option<Option<LiveSky>>,
+    /// Set the live sky clock (game day time, seconds) of the running [`LiveSky`] (a server time resync); drained by the viewer.
+    pub sky_clock: Option<f32>,
 }
 
 impl Host {
@@ -47,7 +51,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false }
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -341,6 +345,12 @@ impl State {
         }
         if let Some(scene) = g.host.repose.take() {
             self.renderer.repose(&scene);
+        }
+        if let Some(l) = g.host.live_sky.take() {
+            self.live = l.map(LiveRun::new);
+        }
+        if let (Some(t), Some(l)) = (g.host.sky_clock.take(), self.live.as_mut()) {
+            l.day_time = t;
         }
         if let Some(lens) = g.host.lens.take() {
             self.renderer.set_lens(lens);

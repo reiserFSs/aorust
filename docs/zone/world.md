@@ -305,3 +305,62 @@ the corpse to the dead character's relative position when closer than a threshol
 * `Corpse`: everything after the spell list (owner identity, cloth, textures) is raw `rest`.
 * `GameTime.arg3`, `AppearanceUpdate.extra` and cloth `b..e`, `CharacterAction` action ids,
   `DynelBase.x4ac`, `flags`, `template`.
+
+## 10. Time of day and playfield changes in the app (`play/zone.rs`, `play/flow.rs`)
+
+### 10.1 `GameTimeIIR_t` -> sky clock (RE of `GameTime_t`, Gamecode.dll, Ghidra disassembly of 0x1000b526)
+* **Ctor** `GameTime_t::GameTime_t` [GC 0x1000af71]: `+0x84 = +0x88 = 60` (seconds per minute / minutes per hour), `+0x8c = 3600`,
+  `+0x80 = 27` (**hours per day**), day-length double `+0x60 = 97200.0` [GC 0x10155ee8] (= 27 x 3600), `+0x68 = 24300.0`,
+  `+0x70 = 72900.0` (quarter / three quarters of the day, `SubtractTime[Exact]` wrap tests), `+0x5c = 15` (`TimeSpeed`,
+  `SetTimeSpeed` [GC 0x1000b1b5]), `+0x90/+0x94 = 21/2` dusk start / length, `+0x98/+0x9c = 7/2` dawn start / length (hours),
+  `+0xa4/+0xa8/+0xac/+0xbc = 1.0` (speed factors).
+* **`Update(float time, DayPeriod_e, int day, int unix)`** [GC 0x1000b526, from the `GameTimeIIR_t::Activate` [GC 0x100395ea]]:
+  `ti = ftol(time)`; `+0x20 = time - ti` (fraction), `+0x40 = ti % 60` (second), `+0x44 = (ti/60) % 60` (minute), `+0x48 = ti / 3600`
+  (hour, **not** wrapped at 27: the server sends a time inside the day), `+0x50 = fmod(hour*3600 + minute*60 + second, +0x60)` (**seconds
+  into the 97200 s game day**, `GetCurrentRealTime` [GC 0x1000b44c] returns it), `+0x4C = day` (`arg3`: **the game day number**,
+  so `GameTimeIIR_t.arg3` = 276425 is resolved), `+0xC0 = unix`, `+0xB8 = unix - _time64()`; then `UpdateDayPeriod` [GC 0x1000b1c2]
+  (hour `< 7` night, `< 9` dawn, `< 21` day, `< 23` dusk, else night; ids 3/0/1/2).
+* **Per frame** `RunFunction` [GC 0x1000b214]: `+0x20 += TimeSpeed * dt * factor` and `+0x50 += TimeSpeed * dt * factor` (`factor = 1.0`
+  by day and night; `dt` = n3 engine frame time) with the carry second -> minute -> hour (`% 27`) -> day (`+0x4C`) when the
+  fraction passes 1 s: the game clock runs **15 game seconds per real second**, a game day takes **6480 real seconds** (108 min).
+* **Mapping to the sky clock** (`GameDayTime` 0..6480, `DayTimeFactor = GameDayTime / 6480`): `GameDayTime = GameTime+0x50 / 15`.
+  Evidence: `DayTimeForGroundShadows = GameDayTime * 15` is compared with the ground-shadow table (bounds 0 .. 97700, GC 0x101c14d0,
+  docs/formats.md) = the in-day game seconds, and the audio/viewer clock of 240 s per game hour is 3600 / 15. **Not found:** the code
+  that writes the `GAME.GameDayTime` tweak value (no string reference in Gamecode.dll; FXS/other DLL), so this last step is [INFERENCE]
+  from those two consumers; the clock rate and day length above are from the code. Live capture: `time = 67170.0` -> 18:39:30 ->
+  `GameDayTime 4478` (day period 1 = day), the new-character capture 78435 -> 5229.
+* **App**: `Zone::on_frame` stores `day_time_of(time)` (`(time mod 97200) / 15`) and the game day; `Zone::tick(dt)` runs it once
+  per frame at 1 s/s (wraps at 6480); `ZoneEvent::Time` on every `GameTimeIIR_t` (also resyncs: the original's `Update` simply
+  overwrites the clock). Before the first message the frozen default (`DEFAULT_DAY_TIME`) is used. The world is loaded with
+  `load_playfield_on_day(.., zone.day_time(), zone.game_day)` (weather schedule seeded by the server game day instead of
+  `OFFLINE_DAY`, see docs/formats.md *Weather*), and when it appears the viewer gets `Host::live_sky = LiveSky { start: zone clock,
+  scale: 1.0, source: SkyClock::on_day(game_day) }` (the sky, sun, fog tint and light are re-evaluated twice a second); a later
+  `GameTime` sets `Host::sky_clock`. Audio (`Audio::update`) uses the zone clock too. Limit: the weather game day of a running
+  `SkyClock` is the one at world load (a resync across the 27 h day boundary does not change it) [ponytail].
+
+### 10.2 Playfield changes
+* **In-session zone change** `0x3C ZoneRedirection` (`ip[4]`, `u16 port`) [IF 0x10002a9e case 0x3C]: `ao_net::client` (zone phase)
+  reconnects (3 tries, 1 s / 2 s backoff, like the first connect), sends `ZoneLogin` again with the cookies of the earlier
+  `ZoneInfo` (protocol.md §5), keeps the wire tap and reports `LoginEvent::ZoneRedirect { zone_ip, zone_port }`; every following
+  frame (`PlayfieldAnarchyF`, own character, `GameTime`, ...) is a `ZoneFrame` of the new connection. Test
+  `zone_redirection_reconnects_with_the_same_cookies` (loopback servers). The original does this inside `Client_t` without the UI.
+* **Teleport UI** (`FlowControlModule_t`, GUI.dll): `TeleportStartedMessage` [GUI 0x1002910e] (registered at [GUI 0x1002ad2c]) sets `m_isTeleporting`, emits the `GlobalSignals_c` text signal with LDB text `0x6e` and
+  `+0x48`, clears `DisplaySystem+0x44`, sets `InputConfig+0x18 = 1` (input locked), stops `InputConfig+0x1a8` timer, sends
+  `AFCM::Send(0x1e, 0x112)` and saves the preferences; `TeleportEndedMessage` [GUI 0x100292ce] (also the `CharInPlay` countdown, docs/zone/outgoing.md §3)
+  clears the flag, reads `N3Msg_GetPosAndPF`, signals the new playfield (`BugReport_t::SetPFProxyInfo`, `N3Msg_GetPFName` /
+  `N3Msg_IsDungeon` text). `ServerLogin3DModule_t` [GUI 0x100175f0] (program 5, module 0x1b) is the only loading-screen module;
+  `AFCM::Send(.., 0x135)` (`StartClosingLoadscreen`) is called only from `ServerLogin3DModule_t`'s own setup [GUI 0x1001765c] and
+  `FlowControlModule_t::AliveMessage` [GUI 0x10028543]; `cd_image/gui/Default/gfx` holds only `ai_loading_login.png`, `welcome_to_rubika.jpg`
+  and the unused `loadingimage_fullscreen.jpg`: there is **no per-playfield loading image**.
+* **UNRESOLVED [GUESS]**: whether the original shows `ServerLogin3DModule_t` (program 5) again for a teleport (the receiver of
+  `AFCM (0x1e, 0x112)` and the sender of a second `AddProgram(5)` were not located: `Imm` scans of GUI.dll for 0x112 / 0x1e / 0x135
+  find only the send sites above, no registration). The app shows the same loading screen (`ai_loading_login.png`, black + image fade
+  in over `FADE_IN`, text "..Anarchy Online is loading..") without `PlayStartupMusic` (that is `CharacterLoggedInMessage`, the
+  login only).
+* **App** (`Play::begin_zone_change`): a `ZoneEvent::Playfield` or `LoginEvent::ZoneRedirect` while `Screen::InWorld` closes the
+  in-world interface, drops the dynels / actors (`Zone::reset_world`), clears `in_play_sent`/`world_frames` and shows the
+  loading screen again (`host.fly = false`); the new playfield is loaded in the background (a result for a playfield the server
+  has since replaced is dropped), the player is placed from the new own `SimpleCharFullUpdate` when the screen dissolves
+  and `CharInPlay` is sent after the same countdown (>= 11 frames) as the first time ([INFERENCE] from `SetMainDynel` -> event 6
+  -> `TeleportEndedMessage` running again, docs/zone/outgoing.md §3). Tests: `flow::tests::second_playfield_shows_the_loading_screen_again`
+  (captures `zone_newchar_ithaca.rec` then `zone_ithaca.rec`), `zone_redirect_shows_the_loading_screen`.

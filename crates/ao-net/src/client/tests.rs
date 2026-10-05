@@ -245,6 +245,39 @@ fn create_delete_and_name_suggestion_in_the_char_select_phase() {
     assert_eq!(srv.recv(), Message::SelectCharacter { char_id: 99 });
 }
 
+/// System message 0x3C in the zone phase: the session reconnects to the new address, repeats `ZoneLogin` with the same cookies, and
+/// client frames go to the new connection.
+#[test]
+fn zone_redirection_reconnects_with_the_same_cookies() {
+    let (l1, l2) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
+    let z = ZoneInfo { char_id: 77, ip: Ipv4Addr::LOCALHOST, port: l1.local_addr().unwrap().port(), cookie1: 0xAABB_CCDD, cookie2: 0x1122_3344, event_server_type: 0, player_id: 5 };
+    let (cmd_tx, cmd_rx) = channel::<Cmd>();
+    let (ev_tx, ev_rx) = channel();
+    thread::spawn(move || {
+        let _ = zone(z, None, &cmd_rx, &ev_tx);
+    });
+    let login = Message::ZoneLogin { char_id: 77, cookie1: 0xAABB_CCDD, cookie2: 0x1122_3344 };
+    let mut a = Fake::accept(&l1);
+    assert_eq!(a.recv(), login);
+    a.send(&Message::ZoneRedirection { ip: Ipv4Addr::LOCALHOST, port: l2.local_addr().unwrap().port() });
+    let mut b = Fake::accept(&l2);
+    assert_eq!(b.recv(), login);
+    let port = l2.local_addr().unwrap().port();
+    let seen = |want: &dyn Fn(&LoginEvent) -> bool| loop {
+        let e = ev_rx.recv_timeout(Duration::from_secs(10)).expect("event");
+        if want(&e) {
+            break e;
+        }
+    };
+    assert_eq!(seen(&|e| matches!(e, LoginEvent::ZoneRedirect { .. })), LoginEvent::ZoneRedirect { zone_ip: Ipv4Addr::LOCALHOST, zone_port: port });
+    cmd_tx.send(Cmd::Zone(Frame { seq: 0, ptype: 0xA, sender: 77, receiver: 0, payload: vec![1, 2, 3, 4] })).unwrap();
+    let f = b.rx.recv(Duration::from_secs(10)).unwrap().expect("client frame on the new connection");
+    assert_eq!((f.ptype, f.payload), (0xA, vec![1, 2, 3, 4]));
+    b.seq += 1;
+    b.raw(&Frame { seq: b.seq, ptype: 0xA, sender: 9, receiver: 77, payload: vec![9; 12] }.encode().unwrap());
+    assert!(matches!(seen(&|e| matches!(e, LoginEvent::ZoneFrame(_))), LoginEvent::ZoneFrame(f) if f.payload == vec![9; 12]));
+}
+
 #[test]
 fn status_api_json() {
     let v: serde_json::Value = serde_json::from_str(

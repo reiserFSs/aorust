@@ -8,7 +8,7 @@
 
 use crate::conn::{Conn, Tap};
 use crate::crypto::{login_server_pub, make_challenge_response_with};
-use crate::frame::Frame;
+use crate::frame::{Frame, PT_SYSTEM};
 use crate::msg::{CharacterList, CreateCharacterRequest, Message, REQUEST_REJECTED};
 use anyhow::{anyhow, bail, Result};
 use num_bigint::BigUint;
@@ -85,6 +85,10 @@ pub enum LoginEvent {
     /// (`ptype` 0xA, see [`crate::n3`]), system messages (`ptype` 1, e.g. 0x43), text. The 0x7F compression control is
     /// consumed by [`Conn`].
     ZoneFrame(Frame),
+    /// System message 0x3C (`ZoneRedirection`, Interfaces.dll 0x10002a9e case 0x3C): the zone server changed. The session thread has
+    /// already reconnected to `zone_ip:zone_port` and sent `ZoneLogin` again with the stored cookies (`SendClientCookie`); the
+    /// new server's burst (`PlayfieldAnarchyF`, own character, ...) follows as [`LoginEvent::ZoneFrame`]s on the new connection.
+    ZoneRedirect { zone_ip: Ipv4Addr, zone_port: u16 },
     Disconnected(String),
 }
 
@@ -322,9 +326,8 @@ fn run(
     }
 }
 
-/// Zone phase: connect (3 tries, 1 s / 2 s backoff), send `ZoneLogin`, answer pings, forward every other frame.
-fn zone(z: crate::msg::ZoneInfo, tap: Option<Tap>, cmds: &Receiver<Cmd>, ev: &Sender<LoginEvent>) -> Result<()> {
-    let addr = SocketAddr::from((z.ip, z.port));
+/// Connect to a zone server (3 tries, 1 s / 2 s backoff) and send `ZoneLogin` (`Client_t::SendClientCookie`).
+fn open_zone(addr: SocketAddr, tap: Option<Tap>, login: &Message) -> Result<Conn> {
     let mut delay = Duration::from_secs(1);
     let mut conn = loop {
         match Conn::connect(addr) {
@@ -337,8 +340,16 @@ fn zone(z: crate::msg::ZoneInfo, tap: Option<Tap>, cmds: &Receiver<Cmd>, ev: &Se
         }
     };
     conn.tap = tap;
+    conn.send_message(login)?;
+    Ok(conn)
+}
+
+/// Zone phase: connect, send `ZoneLogin`, answer pings, follow `ZoneRedirection`s (same login with the stored cookies on the new
+/// address, protocol.md §5), forward every other frame.
+fn zone(z: crate::msg::ZoneInfo, tap: Option<Tap>, cmds: &Receiver<Cmd>, ev: &Sender<LoginEvent>) -> Result<()> {
+    let login = Message::ZoneLogin { char_id: z.char_id, cookie1: z.cookie1, cookie2: z.cookie2 };
+    let mut conn = open_zone(SocketAddr::from((z.ip, z.port)), tap, &login)?;
     let id = z.char_id as u32;
-    conn.send_message(&Message::ZoneLogin { char_id: z.char_id, cookie1: z.cookie1, cookie2: z.cookie2 })?;
     let _ = ev.send(LoginEvent::Status("zone login sent".into()));
     loop {
         match cmds.try_recv() {
@@ -349,6 +360,11 @@ fn zone(z: crate::msg::ZoneInfo, tap: Option<Tap>, cmds: &Receiver<Cmd>, ev: &Se
         if let Some(f) = conn.recv(TICK)? {
             if f.ptype == PT_PING {
                 reply_ping(&mut conn, &f, id)?;
+            } else if let Some(Message::ZoneRedirection { ip, port }) = (f.ptype == PT_SYSTEM).then(|| Message::from_frame(&f).ok()).flatten() {
+                conn = open_zone(SocketAddr::from((ip, port)), conn.tap.take(), &login)?;
+                if ev.send(LoginEvent::ZoneRedirect { zone_ip: ip, zone_port: port }).is_err() {
+                    return Ok(());
+                }
             } else if ev.send(LoginEvent::ZoneFrame(f)).is_err() {
                 return Ok(());
             }
