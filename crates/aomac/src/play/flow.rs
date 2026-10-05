@@ -167,10 +167,7 @@ impl Play {
         // connect blocks (<= 10 s); the password only lives in this closure until the session thread owns it
         std::thread::spawn(move || {
             let r = LoginSession::connect(&server)
-                .map(|s| {
-                    s.login(&user, &pass);
-                    s
-                })
+                .inspect(|s| s.login(&user, &pass))
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Bg::Connected(r));
         });
@@ -299,8 +296,8 @@ impl Play {
         self.worker = Some(preview::Worker::start(self.dir.clone(), breed, sex));
         let Ok((b, _)) = screens::wire_breed_sex(breed, sex) else { return };
         let mut p = LOGIN_CAMERA.pos;
-        for k in 0..3 {
-            p[k] += screens::CHAR_VIEWER_OFFSET[k];
+        for (v, o) in p.iter_mut().zip(screens::CHAR_VIEWER_OFFSET) {
+            *v += o;
         }
         p[1] += screens::feet_offset_build1(b);
         self.char_pos = ao_to_render(p);

@@ -119,11 +119,13 @@ enum DialogKind {
 pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String>) -> Result<()> {
     let text = TextDb::load(&dir)?;
     let labels = TextDb::load(&dir)?;
-    let localize: Option<Box<dyn Fn(&str) -> Option<String>>> = Some(Box::new(move |s: &str| {
-        let r = labels.label(s);
-        (r != s).then_some(r)
-    }));
-    let gui = Gui::new(&dir, localize)?;
+    let gui = Gui::new(
+        &dir,
+        Some(Box::new(move |s: &str| {
+            let r = labels.label(s);
+            (r != s).then_some(r)
+        })),
+    )?;
     let (tx, rx) = channel();
     let audio = Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok();
     let mut p = Play {

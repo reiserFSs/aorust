@@ -21,8 +21,8 @@ fn main() -> Result<()> {
     scene.meshes.extend(ch.meshes);
     for mut i in ch.instances {
         i.mesh += mo;
-        for k in 0..3 {
-            i.transform[3][k] += p[k];
+        for (t, d) in i.transform[3].iter_mut().zip(p) {
+            *t += d;
         }
         scene.instances.push(i);
     }
