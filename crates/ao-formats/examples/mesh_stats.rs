@@ -8,6 +8,7 @@ fn main() -> anyhow::Result<()> {
     for ty in [MESH_TYPE, MESH_LOW_TYPE] {
         let (mut ok, mut empty, mut verts, mut tris) = (0usize, 0usize, 0usize, 0usize);
         let mut notex = 0usize;
+        let (mut blends, mut two_sided, mut coloured_untex, mut tinted_tex, mut subs) = ([0usize; 4], 0usize, 0usize, 0usize, 0usize);
         let (mut agree, mut disagree) = (0usize, 0usize);
         let mut fails: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         for id in store.ids(ty)? {
@@ -29,6 +30,14 @@ fn main() -> anyhow::Result<()> {
                     }
                     tris += m.submeshes.iter().map(|s| s.indices.len() / 3).sum::<usize>();
                     notex += m.submeshes.iter().filter(|s| s.texture.is_none()).count();
+                    for sub in &m.submeshes {
+                        subs += 1;
+                        blends[sub.blend as usize] += 1;
+                        two_sided += usize::from(sub.two_sided);
+                        let tint = sub.base_color[..3] != [1.0; 3];
+                        coloured_untex += usize::from(tint && sub.texture.is_none());
+                        tinted_tex += usize::from(tint && sub.texture.is_some());
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => fails.entry(format!("{:#}", e).split(": ").last().unwrap().to_string()).or_default().push(id),
@@ -36,6 +45,8 @@ fn main() -> anyhow::Result<()> {
         }
         println!("  winding vs normals: CCW-agree {agree}, disagree {disagree}");
         println!("type {ty}: geometry {ok}, no-geometry {empty}, verts {verts}, tris {tris}, untextured submeshes {notex}");
+        let [opaque, test, blend, add] = blends;
+        println!("  submeshes {subs}: opaque {opaque}, alpha-test {test}, alpha-blend {blend}, additive {add}; two-sided {two_sided}; coloured untextured {coloured_untex}, tinted textured {tinted_tex}");
         for (k, v) in fails { println!("  FAIL x{} {k}: e.g. {:?}", v.len(), &v[..v.len().min(5)]); }
     }
     Ok(())

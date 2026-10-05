@@ -17,8 +17,15 @@ pub const MESH_TYPE: u32 = 1010001;
 /// Second mesh record type sharing the ids of a subset of [`MESH_TYPE`] with fewer triangles.
 pub const MESH_LOW_TYPE: u32 = 1010026;
 
+// D3D7 render-state ids (the engine is D3D7: `_D3DMATERIAL7`, `_D3DRENDERSTATETYPE`).
+const D3DRS_SRCBLEND: i32 = 19;
+const D3DRS_DESTBLEND: i32 = 20;
+const D3DRS_CULLMODE: i32 = 22;
 const D3DRS_ALPHATESTENABLE: i32 = 15;
 const D3DRS_ALPHABLENDENABLE: i32 = 27;
+const D3DBLEND_ONE: i32 = 2;
+const D3DBLEND_SRCALPHA: i32 = 5;
+const D3DCULL_NONE: i32 = 1;
 const MAX_DEPTH: usize = 64;
 
 /// Decodes static mesh record `id` (with its textures) into a scene with one instance at the origin.
@@ -92,11 +99,27 @@ fn det3(m: &Mat) -> f32 {
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
 }
 
+/// Everything that makes two `SimpleMesh`es mergeable into one [`Submesh`].
+#[derive(Clone, Copy)]
+struct MatKey {
+    texture: Option<TextureKey>,
+    blend: Blend,
+    two_sided: bool,
+    color: [f32; 4],
+}
+
+impl MatKey {
+    /// Hashable identity (`Blend` and `f32` are not `Hash`).
+    fn id(&self) -> (Option<TextureKey>, u8, bool, [u32; 4]) {
+        (self.texture, self.blend as u8, self.two_sided, self.color.map(f32::to_bits))
+    }
+}
+
 struct Builder<'a, 'b> {
     ar: &'b Archive<'a>,
     mesh: Mesh,
-    /// (texture, alpha_test) -> index into `mesh.submeshes`
-    groups: HashMap<(Option<TextureKey>, bool), usize>,
+    /// material -> index into `mesh.submeshes`
+    groups: HashMap<(Option<TextureKey>, u8, bool, [u32; 4]), usize>,
     have_texture: &'b mut dyn FnMut(TextureKey) -> bool,
     visited: Vec<bool>,
 }
@@ -135,18 +158,19 @@ impl Builder<'_, '_> {
         Ok(())
     }
 
-    /// (texture, alpha_test) for a `SimpleMesh`: render states and texture channels come from the
-    /// node's own `delta_state` (e.g. the "alpha" states of foliage nodes) and the material's
-    /// `delta_state`; a texture on the node's state wins over the material's.
-    fn material(&mut self, node_ds: Option<&Object>, sm: &Object) -> (Option<TextureKey>, bool) {
+    /// Material of a `SimpleMesh`. Render states and texture channels come from the node's own
+    /// `delta_state` (e.g. the "alpha" states of foliage nodes) and the material's `delta_state`
+    /// (applied later by `RViewPort_t::SetMaterial`, so it wins); a texture on the node's state wins
+    /// over the material's. Colours come from `FAFMaterial_t` (`RMaterial_t::InitD3DMaterial` @100409c6).
+    fn material(&mut self, node_ds: Option<&Object>, sm: &Object) -> MatKey {
         let objs = &self.ar.objects;
-        let mat_ds = sm.ref1("material").and_then(|m| objs.get(m)).and_then(|m| m.ref1("delta_state")).and_then(|d| objs.get(d));
-        let (mut alpha, mut tex) = (false, None);
+        let mat = sm.ref1("material").and_then(|m| objs.get(m));
+        let mat_ds = mat.and_then(|m| m.ref1("delta_state")).and_then(|d| objs.get(d));
+        let state = |ty: i32| {
+            [mat_ds, node_ds].into_iter().flatten().find_map(|ds| ds.all("rst_type").zip(ds.all("rst_value")).filter(|&(t, _)| le(t) == Some(ty)).last().and_then(|(_, v)| le(v)))
+        };
+        let mut tex = None;
         for ds in [node_ds, mat_ds].into_iter().flatten() {
-            alpha |= ds
-                .all("rst_type")
-                .zip(ds.all("rst_value"))
-                .any(|(t, v)| matches!((le(t), le(v)), (Some(D3DRS_ALPHATESTENABLE | D3DRS_ALPHABLENDENABLE), Some(1))));
             // channel 0 = diffuse; fall back to the first bound channel
             let chans: Vec<_> = ds.all("tch_type").map(le).zip(ds.refs("tch_text")).collect();
             let found = chans.iter().find(|(t, _)| *t == Some(0)).or(chans.first()).and_then(|&(_, t)| {
@@ -158,7 +182,26 @@ impl Builder<'_, '_> {
             }
         }
         let tex = tex.filter(|&k| (self.have_texture)(k));
-        (tex, alpha && tex.is_some())
+        // Alpha test wins over blend when both are on (mode 2 of @10040645 sets both; the cutout is
+        // what survives without depth sorting). Blend factors ONE/ONE (or SRCALPHA/ONE) = additive.
+        let blend = if state(D3DRS_ALPHATESTENABLE) == Some(1) {
+            Blend::AlphaTest
+        } else if state(D3DRS_ALPHABLENDENABLE) == Some(1) {
+            let src = state(D3DRS_SRCBLEND);
+            if state(D3DRS_DESTBLEND) == Some(D3DBLEND_ONE) && matches!(src, Some(D3DBLEND_ONE | D3DBLEND_SRCALPHA)) {
+                Blend::Additive
+            } else {
+                Blend::AlphaBlend
+            }
+        } else {
+            Blend::Opaque
+        };
+        // D3D multiplies gamma-space values; the renderer multiplies sRGB-decoded textures in linear
+        // space, so the diffuse colour is converted to linear (power curve => identical result).
+        let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        let [r, g, b] = mat.and_then(|m| m.f32s::<3>("diff")).unwrap_or([1.0; 3]);
+        let a = mat.and_then(|m| m.f32s::<1>("opac")).map_or(1.0, |o| o[0]);
+        MatKey { texture: tex, blend, two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [lin(r), lin(g), lin(b), a] }
     }
 
     fn simple_mesh(&mut self, node_ds: Option<&Object>, sm: &Object, world: &Mat) -> Result<()> {
@@ -192,12 +235,8 @@ impl Builder<'_, '_> {
         // The Z flip mirrors the mesh; a node matrix with negative determinant mirrors it back.
         let reverse = det3(world) >= 0.0;
         let key = self.material(node_ds, sm);
-        let sub = *self.groups.entry(key).or_insert_with(|| {
-            self.mesh.submeshes.push(Submesh {
-                blend: if key.1 { Blend::AlphaTest } else { Blend::Opaque },
-                two_sided: true,
-                ..Submesh::new(vec![], key.0)
-            });
+        let sub = *self.groups.entry(key.id()).or_insert_with(|| {
+            self.mesh.submeshes.push(Submesh { blend: key.blend, two_sided: key.two_sided, base_color: key.color, ..Submesh::new(vec![], key.texture) });
             self.mesh.submeshes.len() - 1
         });
         for t in tris.chunks_exact(6) {
