@@ -79,6 +79,8 @@ pub struct Gui {
     caret_epoch: f32,
     popup: Option<Popup>,
     scroll_drag: Option<(ViewId, f32)>,
+    /// Window whose frame close button is held down.
+    frame_press: Option<WindowId>,
     /// Roots of `add_view` instances.
     items: std::collections::HashSet<ViewId>,
     extras: Vec<ExtraImage>,
@@ -139,6 +141,7 @@ impl Gui {
             caret_epoch: 0.0,
             popup: None,
             scroll_drag: None,
+            frame_press: None,
             items: Default::default(),
             extras: Vec::new(),
             warnings: Vec::new(),
@@ -209,9 +212,10 @@ impl Gui {
         }
     }
 
+    /// `pos` is the outer top-left for framed windows (as in `open_framed_window`).
     pub fn set_window_pos(&mut self, w: WindowId, pos: (i32, i32)) {
         if let Some(Some(win)) = self.windows.get_mut(w) {
-            win.pos = pos;
+            win.pos = if win.framed { (pos.0 + FRAME_L, pos.1 + FRAME_T) } else { pos };
         }
     }
     pub fn set_window_visible(&mut self, w: WindowId, v: bool) {
@@ -305,8 +309,12 @@ impl Gui {
     fn find_in(&self, h: ViewHandle, name: &str) -> Option<ViewId> {
         self.tree.find(h, name)
     }
+    fn find_all_in(&self, h: ViewHandle, name: &str) -> Vec<ViewId> {
+        self.tree.find_all(h, name)
+    }
+    /// All `*_in` setters apply to every view of that name in the instance.
     pub fn set_text_in(&mut self, h: ViewHandle, name: &str, text: &str) {
-        if let Some(v) = self.find_in(h, name) {
+        for v in self.find_all_in(h, name) {
             self.set_text_view(v, text);
         }
         if let Some(w) = self.window_of(h) {
@@ -320,7 +328,7 @@ impl Gui {
         }
     }
     pub fn set_visible_in(&mut self, h: ViewHandle, name: &str, visible: bool) {
-        if let Some(v) = self.find_in(h, name) {
+        for v in self.find_all_in(h, name) {
             self.tree.views[v].visible = visible;
         }
         if let Some(w) = self.window_of(h) {
@@ -329,7 +337,7 @@ impl Gui {
     }
     /// Removes a named view from its parent (`View::RemoveChild`).
     pub fn remove_view_in(&mut self, h: ViewHandle, name: &str) {
-        if let Some(v) = self.find_in(h, name) {
+        for v in self.find_all_in(h, name) {
             if let Some(p) = self.tree.views[v].parent.take() {
                 self.tree.views[p].children.retain(|c| *c != v);
             }
@@ -340,13 +348,13 @@ impl Gui {
     }
     /// Sets the colour (0xRRGGBB) of a `TextView` (`View::SetColor`).
     pub fn set_color_in(&mut self, h: ViewHandle, name: &str, color: u32) {
-        if let Some(v) = self.find_in(h, name) {
+        for v in self.find_all_in(h, name) {
             self.tree.views[v].color = color;
         }
     }
     /// Makes a `TextButton`/`Button` a toggle button and sets its state (`ButtonBase_c::SetToggleButton`/`SetValue`).
     pub fn set_toggle_in(&mut self, h: ViewHandle, name: &str, toggle: bool, on: bool) {
-        if let Some(v) = self.find_in(h, name) {
+        for v in self.find_all_in(h, name) {
             if let Kind::TextButton(b) = &mut self.tree.views[v].kind {
                 b.toggle = toggle;
                 b.toggled = on;
@@ -361,7 +369,7 @@ impl Gui {
         Some(Rect::new(o.0, o.1, o.0 + f.width(), o.1 + f.height()))
     }
     pub fn set_enabled_in(&mut self, h: ViewHandle, name: &str, enabled: bool) {
-        if let Some(v) = self.find_in(h, name) {
+        for v in self.find_all_in(h, name) {
             self.tree.views[v].enabled = enabled;
         }
     }
@@ -905,6 +913,16 @@ impl Gui {
         names.map(|n| self.gfx.id(n))
     }
 
+    /// `WndBorder::Layout` 0x1015a1d9: border icons are `GFX_GUI_WINDOW_*` 15x15 sprites (pref size 14x14 as
+    /// Rect r-l) at y = 5 from the window top; the icon button (BorderID 0) flush left, the close button
+    /// (BorderID 1) flush right (`x = bounds.r - w`).  Returns (icon, close) in screen px.
+    fn frame_buttons(&self, root: ViewId, pos: (i32, i32)) -> (Rect, Rect) {
+        let f = self.tree.views[root].frame;
+        let outer = Rect::new((pos.0 - FRAME_L) as f32, (pos.1 - FRAME_T) as f32, pos.0 as f32 + f.width() + FRAME_R as f32, pos.1 as f32 + f.height() + FRAME_B as f32);
+        let t = outer.t + 5.0;
+        (Rect::new(outer.l, t, outer.l + 14.0, t + 14.0), Rect::new(outer.r - 14.0, t, outer.r, t + 14.0))
+    }
+
     /// Outer + inner frame art of a style-1 window (`pos` = client origin).
     fn draw_frame(&mut self, root: ViewId, pos: (i32, i32), out: &mut Vec<DrawCmd>) {
         let f = self.tree.views[root].frame;
@@ -912,12 +930,19 @@ impl Gui {
         let o = self.frame_gfx(["GFX_GUI_WINDOW3_BORDER_TL", "GFX_GUI_WINDOW3_BORDER_TR", "GFX_GUI_WINDOW3_BORDER_BL", "GFX_GUI_WINDOW3_BORDER_BR", "GFX_GUI_WINDOW3_BORDER_LEFT", "GFX_GUI_WINDOW3_BORDER_TOP", "GFX_GUI_WINDOW3_BORDER_RIGHT", "GFX_GUI_WINDOW3_BORDER_BOTTOM", "GFX_GUI_WINDOW_BACKGROUND"]);
         self.draw_border(out, &o, outer, [255; 3], 0.33);
         let i = self.frame_gfx(["GFX_GUI_TAB_BORDER_TL", "GFX_GUI_TAB_BORDER_TR", "GFX_GUI_TAB_BORDER_BL", "GFX_GUI_TAB_BORDER_BR", "GFX_GUI_TAB_BORDER_LEFT", "GFX_GUI_TAB_BORDER_TOP", "GFX_GUI_TAB_BORDER_RIGHT", "GFX_GUI_TAB_BORDER_BOTTOM", "GFX_GUI_TAB_BACKGROUND"]);
-        let client = Rect::new(pos.0 as f32, pos.1 as f32, pos.0 as f32 + f.width(), pos.1 as f32 + f.height());
+        // DoSetFrame 0x10159888: inner border view = client frame grown by 1 on every side
+        let client = Rect::new(pos.0 as f32 - 1.0, pos.1 as f32 - 1.0, pos.0 as f32 + f.width() + 1.0, pos.1 as f32 + f.height() + 1.0);
         let col = self.map_color(0x1000000);
         self.draw_border(out, &i, client, col, 1.0);
-        if let Some(x) = self.gfx.id("GFX_GUI_WINDOW_CLOSE_X") {
-            let (l, t) = (outer.r - 5.0 - 14.0, outer.t + 5.0);
-            self.push_gfx(out, x, Rect::new(l, t, l + 14.0, t + 14.0), [255; 3], 1.0);
+        let (icon, close) = self.frame_buttons(root, pos);
+        let over = |r: Rect, m: Point| m.x >= r.l && m.x <= r.r + 1.0 && m.y >= r.t && m.y <= r.b + 1.0;
+        let m = self.mouse;
+        let pressed_close = self.frame_press.is_some() && over(close, m);
+        let close_name = if pressed_close { "GFX_GUI_WINDOW_CLOSE_X_STATE3" } else if over(close, m) { "GFX_GUI_WINDOW_CLOSE_X_STATE2" } else { "GFX_GUI_WINDOW_CLOSE_X" };
+        for (name, r) in [("GFX_GUI_WINDOW_ICON_I", icon), (close_name, close)] {
+            if let Some(x) = self.gfx.id(name) {
+                self.push_gfx(out, x, r, [255; 3], 1.0);
+            }
         }
     }
 
@@ -1153,10 +1178,9 @@ impl Gui {
         }
         for (wid, root, pos) in self.windows_top_down() {
             if self.windows[wid].as_ref().is_some_and(|w| w.framed) {
-                let f = self.tree.views[root].frame;
-                let (r, t) = (pos.0 as f32 + f.width() + FRAME_R as f32 - 5.0, (pos.1 - FRAME_T) as f32 + 5.0);
-                if x >= r - 14.0 && x <= r && y >= t && y <= t + 14.0 {
-                    self.events.push(Event::CloseRequested { window: wid });
+                let c = self.frame_buttons(root, pos).1;
+                if x >= c.l && x <= c.r + 1.0 && y >= c.t && y <= c.b + 1.0 {
+                    self.frame_press = Some(wid);
                     return;
                 }
             }
@@ -1263,6 +1287,15 @@ impl Gui {
     }
 
     fn mouse_up(&mut self) {
+        if let Some(wid) = self.frame_press.take() {
+            if let Some((root, pos)) = self.windows.get(wid).and_then(|w| w.as_ref()).map(|w| (w.root, w.pos)) {
+                let c = self.frame_buttons(root, pos).1;
+                let m = self.mouse;
+                if m.x >= c.l && m.x <= c.r + 1.0 && m.y >= c.t && m.y <= c.b + 1.0 {
+                    self.events.push(Event::CloseRequested { window: wid });
+                }
+            }
+        }
         if let Some(p) = self.pressed.take() {
             let over = self.hit(self.mouse.x, self.mouse.y).map(|h| h.1) == Some(p);
             match &mut self.tree.views[p].kind {

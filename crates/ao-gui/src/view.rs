@@ -276,6 +276,18 @@ impl Tree {
         }
         self.views[root].children.iter().find_map(|c| self.find(*c, name))
     }
+    /// Every view named `name` under `root` (an item holds `summary_view` and `detailed_view`, both with a `level` etc.).
+    pub fn find_all(&self, root: ViewId, name: &str) -> Vec<ViewId> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(v) = stack.pop() {
+            if self.views[v].name == name && !name.is_empty() {
+                out.push(v);
+            }
+            stack.extend(self.views[v].children.iter().rev());
+        }
+        out
+    }
 }
 
 // ------------------------------------------------------------------ attribute parsing (XMLObject_c)
