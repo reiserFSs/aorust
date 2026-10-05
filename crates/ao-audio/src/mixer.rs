@@ -43,6 +43,8 @@ struct Voice {
     gain: f32,
     looping: bool,
     priority: Option<u8>,
+    /// playback rate factor (`pitch% / 100`, `SE_Update2DSoundPitch`)
+    pitch: f32,
     fade: f32,
     fade_target: f32,
     fade_step: f32,
@@ -90,7 +92,7 @@ impl Mixer {
                 let victim = (r..=2).rev().find_map(|p| self.voices.iter().position(|v| v.priority == Some(p) && !v.looping && !v.done));
                 match victim {
                     Some(i) => {
-                        self.voices.swap_remove(i);
+                        self.voices.remove(i); // the oldest entry of that priority (list order)
                     }
                     None => return 0,
                 }
@@ -98,8 +100,15 @@ impl Mixer {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, priority: d.priority, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: f32::NAN });
+        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, priority: d.priority, pitch: 1.0, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: f32::NAN });
         id
+    }
+
+    /// `AIL_set_sample_playback_rate(base * pitch% / 100)`.
+    pub fn set_pitch(&mut self, id: u64, percent: f32) {
+        if let Some(v) = self.voices.iter_mut().find(|v| v.id == id) {
+            v.pitch = percent / 100.0;
+        }
     }
 
     pub fn set_gain(&mut self, id: u64, gain: f32) {
@@ -147,7 +156,7 @@ impl Mixer {
                 Source::Sample(p) => (p.rate, p.channels as usize),
                 Source::Stream { rate, channels, .. } => (*rate, *channels as usize),
             };
-            let step = rate as f64 / ratio_out;
+            let step = rate as f64 / ratio_out * v.pitch as f64;
             for i in 0..n {
                 if v.done {
                     break;
@@ -242,5 +251,37 @@ fn frame(s: &[f32], ch: usize, i: usize, j: usize, f: f32) -> (f32, f32) {
         (m, m)
     } else {
         (lerp(0), lerp(1))
+    }
+}
+
+/// ShipEngine Doppler pitch (`ExecuteCorePlayList` @SI 0x100025fc, disasm 0x10002770..0x100028c8; only the 5
+/// `SM_Sandy_ShipEngine_*` sounds, flag byte 7 bit 5, while they play and the emitter moves). `smooth` is the low-pass state
+/// (`sound+0x180`, starts 0); returns the playback rate in percent. The client's `factor` term (the speed when it lies in
+/// 0.8..=1.0, else 0.8) is decoded literally from the x87 sequence.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Doppler {
+    smooth: f32,
+}
+
+impl Doppler {
+    /// `velocity` of the emitter, `emitter`/`listener` positions (same units as the caller's vector).
+    pub fn update(&mut self, velocity: [f32; 3], emitter: [f32; 3], listener: [f32; 3]) -> Option<u32> {
+        let len = |a: [f32; 3]| (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+        let speed = len(velocity);
+        if velocity.iter().all(|c| c.abs() <= 1e-4) {
+            return None;
+        }
+        let u = [listener[0] - emitter[0], listener[1] - emitter[1], listener[2] - emitter[2]];
+        let ul = len(u);
+        let cosv = if u.iter().any(|c| c.abs() > 1e-4) {
+            (velocity[0] * u[0] + velocity[1] * u[1] + velocity[2] * u[2]) / (speed * ul)
+        } else {
+            -1.0
+        };
+        let x = (0.03 * speed * cosv).clamp(-1.0, 1.0);
+        self.smooth = 0.9 * self.smooth + 0.1 * (0.3 * x);
+        let base = 100 + (100.0 * self.smooth) as i32; // truncates toward zero
+        let factor = if (0.8..=1.0).contains(&speed) { speed } else { 0.8 };
+        Some((base as f32 * factor) as u32)
     }
 }

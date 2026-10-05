@@ -42,6 +42,8 @@ pub(super) struct Gnda {
     table: Vec<u16>,
     /// Tile index per cell (bit 7 = door/special flag).
     pub ty: Vec<u8>,
+    /// Height of each tile template in metres (`HSTA` chunk, `u16 / 10.0`; ReadBlob @0x10078391), indexed like `ids`.
+    pub tile_height: Vec<f32>,
     /// Floor height layer (`DHGA`), units of `height_scale`.
     pub floor: Vec<u8>,
     /// Ceiling stretch layer (`HCDA`), units of `height_scale`.
@@ -104,6 +106,7 @@ pub(super) fn parse_gnda(d: &[u8]) -> Result<Gnda> {
         ids,
         table,
         ty: vec![0; w * h],
+        tile_height: Vec::new(),
         floor: vec![0; w * h],
         ceil: vec![0; w * h],
         taha_lists: vec![Vec::new(); 32],
@@ -120,6 +123,13 @@ pub(super) fn parse_gnda(d: &[u8]) -> Result<Gnda> {
         let tag: [u8; 4] = r.take(4)?.try_into().unwrap();
         let size = r.u32()? as usize;
         let version = r.u32()?;
+        if &tag == b"HSTA" {
+            // unlike the other sections the size excludes the 12 byte header (24 = 12 tile heights)
+            let end = (start + 12 + size).min(d.len());
+            g.tile_height = d[(start + 12).min(end)..end].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c) as f32 / 10.0).collect();
+            r.o = (end + 3) & !3;
+            continue;
+        }
         if !tag.iter().all(u8::is_ascii_uppercase) || size < 12 || start + size > d.len() {
             break; // trailing bytes after the last section
         }
@@ -159,7 +169,7 @@ pub(super) fn parse_gnda(d: &[u8]) -> Result<Gnda> {
                 }
             }
             b"IRHA" => g.doors = body.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect(),
-            _ => {} // HSTA (tile heights): not needed for the shell
+            _ => {}
         }
         r.o = (start + size + (4 - (size & 3)) % 4).min(d.len()); // sections are padded to 4 bytes (by size)
     }
@@ -399,7 +409,7 @@ impl Gnda {
 /// Ceiling stretch of an `HCDA` byte in height-scale units: a signed value. The loader (`FUN_10077e6f`, DisplaySystem
 /// @0x10077e6f) adds 0x20 to every byte (wrapping), `FUN_10001c3b` subtracts 0x20 again from the unsigned byte, so
 /// raw 242..255 mean -14..-1 and the range is -32..223.
-fn stretch(raw: u8) -> f64 {
+pub(super) fn stretch(raw: u8) -> f64 {
     raw.wrapping_add(0x20) as f64 - 32.0
 }
 
@@ -534,7 +544,7 @@ impl Builder<'_> {
 }
 
 /// Lowest floor of the room becomes local y = 0 (`RDBPlayfield_t::CalculateRoomHeights`).
-fn floor_min(g: &Gnda, room: &Room) -> Option<f32> {
+pub(super) fn floor_min(g: &Gnda, room: &Room) -> Option<f32> {
     let [x1, z1, x2, z2] = room.rect.map(|v| v as i32);
     let m = (z1..z2).flat_map(|z| (x1..x2).map(move |x| (x, z))).filter(|&(x, z)| g.tile(x, z) != 0).map(|(x, z)| g.floor[g.at(x, z)] as f32 * g.height_scale).fold(f32::MAX, f32::min);
     (m != f32::MAX).then_some(m)

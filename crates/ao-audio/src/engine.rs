@@ -329,6 +329,11 @@ impl Audio {
         self.sh.play_stream(path, gain, fade_in)
     }
 
+    /// Sets a voice's playback rate in percent (`SE_Update2DSoundPitch`).
+    pub fn set_pitch(&self, id: u64, percent: f32) {
+        self.sh.mixer().set_pitch(id, percent);
+    }
+
     pub fn stop(&self, id: u64) {
         self.sh.mixer().stop(id);
     }

@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use ao_audio::decode::{decode_file, Pcm};
-use ao_audio::mixer::{Mixer, Source, VoiceDesc};
+use ao_audio::mixer::{Doppler, Mixer, Source, VoiceDesc};
 
 const RATE: u32 = 48_000;
 
@@ -121,4 +121,33 @@ fn voice_pool_priority_stealing() {
     // streams are outside the pool
     let (_tx, rx) = std::sync::mpsc::sync_channel(1);
     assert_ne!(m.play(VoiceDesc { priority: None, ..VoiceDesc::new(Source::Stream { rx, rate: 44100, channels: 2 }) }), 0);
+}
+
+#[test]
+fn doppler_formula_and_pitch_rate() {
+    // approaching at speed 0.9: x = 0.03*0.9*1 = 0.027, dv = 0.0081, s = 0.00081, base = 100 + trunc(0.081) = 100,
+    // factor = speed (0.8 <= 0.9 <= 1.0) -> 90 %
+    let mut d = Doppler::default();
+    assert_eq!(d.update([0.9, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 0.0, 0.0]), Some(90)); // receding: s = -0.00081 truncates to base 100
+    let mut d = Doppler::default();
+    assert_eq!(d.update([-0.9, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 0.0, 0.0]), Some(90));
+    // fast approach: x saturates at 1, dv 0.3, s converges to 0.3 -> base up to 130, factor 0.8 outside 0.8..1.0
+    let mut d = Doppler::default();
+    let mut last = 0;
+    for _ in 0..200 {
+        last = d.update([-50.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 0.0, 0.0]).unwrap();
+    }
+    assert_eq!(last, (129.0 * 0.8) as u32); // 100 + trunc(29.99..) = 129
+    // stationary: no update
+    assert_eq!(Doppler::default().update([0.0; 3], [1.0; 3], [0.0; 3]), None);
+
+    // playback rate: 200 % consumes the sample twice as fast
+    let mut m = Mixer::new(RATE);
+    let id = m.play(VoiceDesc::new(Source::Sample(sine(440.0, 1.0, 0.5, RATE))));
+    m.set_pitch(id, 200.0);
+    let mut buf = vec![0f32; RATE as usize / 2 * 2];
+    m.render(&mut buf);
+    assert_eq!(m.voice_count(), 1);
+    m.render(&mut buf);
+    assert_eq!(m.voice_count(), 0, "a 1 s sample at 200 % ends after 0.5 s");
 }
