@@ -281,8 +281,21 @@ impl CameraRig {
         }
     }
 
+    /// Puts the camera on camera `id` at once (no transition).
+    pub fn jump(&mut self, id: &[u32]) {
+        if let Some(p) = self.cams.get(id) {
+            self.pose = *p;
+            self.active = false;
+        }
+    }
+
     pub fn pose(&self) -> Pose {
         self.pose
+    }
+
+    /// Duration in seconds of the current transition (`FUN_10115541`), 0 when none.
+    pub fn duration(&self) -> f32 {
+        self.trans.iter().find(|t| Some(t.node) == self.cur).map_or(0.0, |t| t.duration)
     }
 
     /// Normalised progress of the running transition.

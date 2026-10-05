@@ -2,6 +2,8 @@
 //! 3D `LoginWorld_c` backdrop and `CharacterViewer_c` preview, loading screen, then the zone's playfield.
 //! The GUI is `ao_gui` (the client's own view XML + skin); the network is `ao_net::client`.
 
+mod create;
+mod delete;
 mod flow;
 mod prefs;
 mod preview;
@@ -9,7 +11,8 @@ mod preview;
 use anyhow::Result;
 use ao_audio::Audio;
 use ao_formats::screens::{self, TextDb};
-use ao_gui::{DrawCmd, DrawList, Event, FontId, Gui, GfxId, InputEvent, Key, WindowId, WindowSize};
+use ao_formats::create::CcWorld;
+use ao_gui::{DrawCmd, DrawList, Event, FontId, Gui, GfxId, InputEvent, Key, MouseButton, WindowId, WindowSize};
 use ao_net::client::{fetch_servers, LoginEvent, LoginSession, ServerEntry};
 use ao_net::msg::{CharacterEntry, CharacterList};
 use ao_rdb::RecordStore;
@@ -34,6 +37,8 @@ enum Bg {
     Connected(Result<LoginSession, String>),
     Backdrop(Result<Box<Scene>, String>),
     World(u32, Result<Box<Scene>, String>),
+    /// The character-creation world (`charactercreation_*.abiff` + connectors), decoded in the background.
+    CcWorld(Result<Box<CcWorld>, String>),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -44,6 +49,8 @@ enum Screen {
     Progress { timeout: f32, joining: bool },
     /// State 3.
     CharSelect,
+    /// `CharCreateModule_t` (docs/screens.md §12).
+    Create,
     /// Loading screen (`ServerLogin3DModule_t`): fading in or holding until the world is ready.
     Loading,
     InWorld,
@@ -107,6 +114,13 @@ struct Play {
     pending_user: String,
     world_scene: Option<Box<Scene>>,
     time: f32,
+    // character creation / deletion
+    cc: Option<Box<create::Create>>,
+    cc_world: Option<Box<CcWorld>>,
+    char_list: CharacterList,
+    /// `SetLoadingScreen(n)`: the next loading screen is `welcome_to_rubika.jpg`.
+    welcome_image: bool,
+    loading_name: &'static str,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -114,6 +128,10 @@ enum DialogKind {
     /// Error text; Cancel button relabelled "OK".
     Message,
     Activate,
+    /// `CharCreateModule_t::AskExitMessage` ("ExitCC").
+    ExitCc,
+    /// `CharDeleteWindow_c` (name confirmation).
+    Delete,
 }
 
 pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String>) -> Result<()> {
@@ -167,6 +185,11 @@ pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String
         pending_user: String::new(),
         world_scene: None,
         time: 0.0,
+        cc: None,
+        cc_world: None,
+        char_list: CharacterList::default(),
+        welcome_image: false,
+        loading_name: "",
         text,
         gui,
         dir: dir.clone(),

@@ -9,7 +9,7 @@ fn center(size: (u32, u32), outer: (u32, u32)) -> (i32, i32) {
     (((size.0 as f32) * 0.5 - (outer.0 as f32) * 0.5).floor() as i32, ((size.1 as f32) * 0.5 - (outer.1 as f32) * 0.5).floor() as i32)
 }
 
-fn breed_name(b: i32) -> &'static str {
+pub(super) fn breed_name(b: i32) -> &'static str {
     // Gamecode.dll GetBreedStr (docs/screens.md §5.3)
     match b {
         1 => "Solitus",
@@ -20,7 +20,7 @@ fn breed_name(b: i32) -> &'static str {
     }
 }
 
-fn sex_name(s: i32) -> &'static str {
+pub(super) fn sex_name(s: i32) -> &'static str {
     match s {
         2 => "Male",
         3 => "Female",
@@ -64,7 +64,7 @@ impl Play {
 
     // ---- window helpers ----------------------------------------------------------------------------------------
 
-    fn open_centered(&mut self, view: &str) -> Option<WindowId> {
+    pub(super) fn open_centered(&mut self, view: &str) -> Option<WindowId> {
         match self.gui.open_framed_window(view, (0, 0), WindowSize::Preferred) {
             Ok(w) => {
                 self.recenter(w);
@@ -77,12 +77,12 @@ impl Play {
         }
     }
 
-    fn recenter(&mut self, w: WindowId) {
+    pub(super) fn recenter(&mut self, w: WindowId) {
         let pos = center(self.size, self.gui.outer_size(w));
         self.gui.set_window_pos(w, pos);
     }
 
-    fn close_all(&mut self) {
+    pub(super) fn close_all(&mut self) {
         for w in [self.login_w.take(), self.progress_w.take(), self.char_w.take(), self.dialog_w.take().map(|d| d.0)].into_iter().flatten() {
             self.gui.close_window(w);
         }
@@ -202,7 +202,7 @@ impl Play {
     }
 
     /// Notice box for non-login errors (the client's own text strings / playfield load failures).
-    fn message_box(&mut self, text: &str) {
+    pub(super) fn message_box(&mut self, text: &str) {
         if let Some((w, _)) = self.dialog_w.take() {
             self.gui.close_window(w);
         }
@@ -223,7 +223,8 @@ impl Play {
         e.status & 1 != 0
     }
 
-    fn show_characters(&mut self, list: CharacterList, host: &mut Host) {
+    pub(super) fn show_characters(&mut self, list: CharacterList, host: &mut Host) {
+        self.char_list = list.clone();
         for w in [self.login_w.take(), self.progress_w.take(), self.char_w.take()].into_iter().flatten() {
             self.gui.close_window(w);
         }
@@ -274,8 +275,8 @@ impl Play {
         let fmt = self.text.by_key(10000, "AvailableCharSlots").unwrap_or_else(|| "%d/%d slots available".into());
         let slots = fmt.replacen("%d", &(self.slots - active).to_string(), 1).replacen("%d", &self.slots.to_string(), 1);
         g.set_text(win, "slots_available", &slots);
-        // New Character: enabled iff activeCount < slotCount. Character creation is not implemented (no CreateCharacter
-        // message in ao-net), so it stays disabled.
+        // New Character: enabled iff activeCount < slotCount (`CharSelectWindow_c::SlotCharListReceived`)
+        g.set_enabled(win, "create_btn", active < self.slots);
         g.relayout_window(win);
         if let Ok(i) = usize::try_from(self.prefs.selected_character) {
             if i < self.chars.len() {
@@ -295,7 +296,7 @@ impl Play {
         }
         self.gui.relayout_window(win);
         self.gui.set_enabled(win, "login_btn", true);
-        // Delete: needs the DeleteCharacter message (not in ao-net) -> stays disabled.
+        self.gui.set_enabled(win, "delete_btn", true);
         self.selected = Some(i);
         self.prefs.selected_character = i as i32;
         self.prefs.save();
@@ -442,7 +443,7 @@ impl Play {
     // ---- loading screen ----------------------------------------------------------------------------------------
 
     /// `AFCM::AddProgram(5)`: `ServerLogin3DModule_t` (docs/screens.md §7).
-    fn start_loading(&mut self, host: &mut Host) {
+    pub(super) fn start_loading(&mut self, host: &mut Host) {
         for w in [self.login_w.take(), self.progress_w.take(), self.char_w.take(), self.dialog_w.take().map(|d| d.0)].into_iter().flatten() {
             self.gui.close_window(w);
         }
@@ -451,8 +452,14 @@ impl Play {
         self.world_ready = false;
         self.world_scene = None;
         host.fly = false;
+        // `ServerLogin3DModule_t::SetLoadingScreen(n)`: after a creation `welcome_to_rubika.jpg` (docs/screens.md §7)
+        let image = if std::mem::take(&mut self.welcome_image) { "welcome_to_rubika.jpg" } else { "ai_loading_login.png" };
+        if self.loading_name != image {
+            self.loading_img = None;
+            self.loading_name = image;
+        }
         if self.loading_img.is_none() {
-            let path = self.dir.join("cd_image/gui/Default/gfx/ai_loading_login.png");
+            let path = self.dir.join("cd_image/gui/Default/gfx").join(image);
             match image::open(&path) {
                 Ok(img) => {
                     let img = img.to_rgba8();
@@ -467,7 +474,7 @@ impl Play {
         }
     }
 
-    fn loading_overlay(&mut self, list: &mut DrawList) {
+    pub(super) fn loading_overlay(&mut self, list: &mut DrawList) {
         let (w, h) = (self.size.0 as f32, self.size.1 as f32);
         let (black, a) = match self.fade {
             Fade::In(t) => (1.0, (t / FADE_IN).min(1.0)),
@@ -487,8 +494,13 @@ impl Play {
         self.gui.text_cmds(FontId::TtMin12, &text, (self.size.0 as i32 - tw) / 2, self.size.1 as i32 - 50, 0xDDDDDD, a, list);
     }
 
-    fn start_world_load(&mut self) {
-        let Some(c) = self.selected.and_then(|i| self.chars.get(i)) else { return };
+    fn start_world_load(&mut self, host: &mut Host) {
+        let Some(c) = self.selected.and_then(|i| self.chars.get(i)) else {
+            // a character that was just created: its start playfield comes from the zone messages (not decoded yet)
+            eprintln!("zone connected for a new character: start playfield unknown until the zone messages are decoded (M3)");
+            self.show_login(host);
+            return self.message_box("Your character was created. Entering the world needs the zone messages, which are not decoded yet.");
+        };
         let pf = &c.proxy.playfield;
         if pf.kind != PLAYFIELD_IDENTITY {
             eprintln!("playfield identity type {:#x} (expected {PLAYFIELD_IDENTITY:#x}); using instance {} as the id", pf.kind, pf.instance);
@@ -523,6 +535,7 @@ impl Play {
                     }
                 }
                 Bg::Backdrop(Err(e)) => eprintln!("login backdrop: {e}"),
+                Bg::CcWorld(r) => self.cc_world_loaded(r, host),
                 Bg::Connected(Ok(s)) => self.session = Some(s),
                 Bg::Connected(Err(e)) => {
                     eprintln!("connection failed: {e}");
@@ -541,6 +554,13 @@ impl Play {
             }
         }
         while let Some(ev) = self.session.as_ref().and_then(|s| s.poll()) {
+            if self.screen == Screen::Create && self.create_session_event(&ev, host) {
+                continue;
+            }
+            if let LoginEvent::CharacterDeleted { character_id } = &ev {
+                self.character_deleted(*character_id as i32, host);
+                continue;
+            }
             match ev {
                 LoginEvent::Status(s) => eprintln!("login: {s}"),
                 LoginEvent::CharacterList(l) => {
@@ -563,7 +583,7 @@ impl Play {
                 LoginEvent::ZoneConnected { messages } => {
                     self.zone_summary = messages.len();
                     eprintln!("zone connected, {} first frames", messages.len());
-                    self.start_world_load();
+                    self.start_world_load(host);
                 }
                 LoginEvent::Disconnected(why) if self.screen != Screen::InWorld => {
                     // [INFERENCE] AnarchyLauncher.url code 3 = "Server Lost"; the call site was not located in the DLL
@@ -607,13 +627,22 @@ impl Play {
                 } // ProgressWindow swallows its close request
             }
             Event::Escape { window } => {
-                if self.dialog_w.is_some_and(|d| d.0 == window) {
+                if self.dialog_w.is_some_and(|d| d.0 == window && d.1 == DialogKind::ExitCc) {
+                    self.cc_exit_answer(false, host);
+                } else if self.dialog_w.is_some_and(|d| d.0 == window) {
                     self.close_dialog();
+                    self.create_message_closed();
                 } else if Some(window) == self.char_w && self.dialog_w.is_none() {
                     self.show_login(host); // quit_btn / ESC -> Show(0)
                 }
             }
             Event::TextChanged { window, view, text } if Some(window) == self.login_w => self.login_text_changed(window, &view, &text),
+            Event::TextChanged { window, view, text } if view == "name" && self.screen == Screen::Create => {
+                self.create_text_changed(window, &text);
+            }
+            Event::TextChanged { window, view, text } if view == "name_input" && self.dialog_w.is_some_and(|d| d.0 == window) => {
+                self.gui.set_enabled(window, "ok_btn", !text.is_empty()); // CharDeleteWindow_c::SlotTextEdited
+            }
             Event::ComboChanged { window, view, text, .. } if Some(window) == self.login_w => self.login_text_changed(window, &view, &text),
             Event::Clicked { window, view, item } => {
                 if Some(window) == self.login_w {
@@ -639,6 +668,13 @@ impl Play {
                             self.close_dialog();
                             self.enter_world(host);
                         }
+                        ("ok_btn", Some(DialogKind::ExitCc)) => self.cc_exit_answer(true, host),
+                        ("cancel_btn", Some(DialogKind::ExitCc)) => self.cc_exit_answer(false, host),
+                        ("ok_btn", Some(DialogKind::Delete)) => self.delete_ok(host),
+                        ("cancel_btn", Some(DialogKind::Message)) => {
+                            self.close_dialog();
+                            self.create_message_closed();
+                        }
                         ("cancel_btn", _) => self.close_dialog(),
                         _ => {}
                     }
@@ -651,6 +687,8 @@ impl Play {
                         }
                         ("login_btn", _) => self.play_pressed(host),
                         ("quit_btn", _) => self.show_login(host),
+                        ("create_btn", _) => self.start_creation(host),
+                        ("delete_btn", _) => self.delete_pressed(),
                         _ => {}
                     }
                 }
@@ -659,7 +697,7 @@ impl Play {
         }
     }
 
-    fn close_dialog(&mut self) {
+    pub(super) fn close_dialog(&mut self) {
         if let Some((w, _)) = self.dialog_w.take() {
             self.gui.close_window(w);
         }
@@ -674,6 +712,8 @@ impl Frontend for Play {
     fn input(&mut self, ev: InputEvent, host: &mut Host) {
         match (self.screen, &ev) {
             (Screen::Loading, _) => return, // full-screen InvisibleButton swallows input
+            (Screen::Create, _) if self.create_input(&ev, host) => return,
+            (Screen::Create, InputEvent::Key { key: Key::Escape, .. }) => return, // `SlotEscPressed` drives the camera tool (docs/screens.md §12)
             (Screen::InWorld, InputEvent::Key { key: Key::Escape, pressed: true, .. }) => host.quit = true,
             (Screen::CharSelect, InputEvent::Key { key: Key::Up, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(-1, host),
             (Screen::CharSelect, InputEvent::Key { key: Key::Down, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(1, host),
@@ -749,7 +789,17 @@ impl Frontend for Play {
         if let Some(a) = &self.audio {
             a.update(dt, host.camera.pos.to_array(), ao_formats::playfield::DEFAULT_DAY_TIME);
         }
+        let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
         let mut list = self.gui.frame(dt);
+        if self.screen == Screen::Create {
+            list.cmds.splice(0..0, pre.cmds);
+            list.cmds.extend(post.cmds);
+            if self.cc.as_ref().is_some_and(|c| c.exit_done()) {
+                self.cc_close_windows();
+                self.cc = None;
+                self.start_loading(host);
+            }
+        }
         let fading_out = matches!(self.fade, Fade::Out(_)) && self.screen == Screen::InWorld;
         if self.screen == Screen::Loading || fading_out {
             self.loading_overlay(&mut list);

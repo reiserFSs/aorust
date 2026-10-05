@@ -4,8 +4,21 @@
 
 use std::path::PathBuf;
 
+/// `IndependentPrefs` `CCSelectedBreed/Height/Size/Head/Profession` of the character creation (docs/screens.md §12).
+#[derive(Clone, Default)]
+pub struct CcPrefs {
+    pub breed: i32,
+    pub height: i32,
+    pub size: i32,
+    pub head: i32,
+    pub profession: i32,
+}
+
 #[derive(Default)]
 pub struct Prefs {
+    pub cc: CcPrefs,
+    /// `WasCharacterCreated`: the next creation starts from scratch.
+    pub cc_created: bool,
     pub accounts: Vec<String>,
     pub selected_account: usize,
     pub selected_character: i32,
@@ -18,13 +31,19 @@ fn path() -> Option<PathBuf> {
 
 impl Prefs {
     pub fn load() -> Self {
-        let mut p = Prefs { selected_character: -1, ..Default::default() };
+        let mut p = Prefs { selected_character: -1, cc: CcPrefs { height: 1, size: 1, ..Default::default() }, ..Default::default() };
         for line in path().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default().lines() {
             match line.split_once('=') {
                 Some(("account", v)) if !v.is_empty() => p.accounts.push(v.into()),
                 Some(("selected_account", v)) => p.selected_account = v.parse().unwrap_or(0),
                 Some(("selected_character", v)) => p.selected_character = v.parse().unwrap_or(-1),
                 Some(("server", v)) => p.server = v.into(),
+                Some(("cc_breed", v)) => p.cc.breed = v.parse().unwrap_or(0),
+                Some(("cc_height", v)) => p.cc.height = v.parse().unwrap_or(1),
+                Some(("cc_size", v)) => p.cc.size = v.parse().unwrap_or(1),
+                Some(("cc_head", v)) => p.cc.head = v.parse().unwrap_or(0),
+                Some(("cc_profession", v)) => p.cc.profession = v.parse().unwrap_or(0),
+                Some(("cc_created", v)) => p.cc_created = v == "1",
                 _ => {}
             }
         }
@@ -53,6 +72,8 @@ impl Prefs {
             text += &format!("account={}\n", a.replace('\n', ""));
         }
         text += &format!("selected_account={}\nselected_character={}\nserver={}\n", self.selected_account, self.selected_character, self.server.replace('\n', ""));
+        let c = &self.cc;
+        text += &format!("cc_breed={}\ncc_height={}\ncc_size={}\ncc_head={}\ncc_profession={}\ncc_created={}\n", c.breed, c.height, c.size, c.head, c.profession, u8::from(self.cc_created));
         if let Some(dir) = f.parent() {
             let _ = std::fs::create_dir_all(dir);
         }

@@ -321,8 +321,27 @@ pub fn player_model(store: &RecordStore, breed: Breed, gender: Gender) -> Result
 /// A player character as on the creation screen: body model, head, naked skin, optionally posed with a
 /// role's clip at `time` seconds (looped).
 pub fn load_player(store: &RecordStore, p: &Player, pose: Option<(Role, f32)>) -> Result<Scene> {
+    load_player_build(store, p, 1, pose)
+}
+
+/// Body model id of a player type with `build` 0 / 1 / 2 = `_thin` / normal / `_fat` (`CCCharacter_t::ChangeMesh`,
+/// GUI 0x1011ab53: `<race>_<sex><suffix>.cir`).
+pub fn player_model_build(store: &RecordStore, breed: Breed, gender: Gender, build: u8) -> Result<u32> {
+    let suffix = match build {
+        0 => "_thin",
+        2 => "_fat",
+        _ => "",
+    };
+    let name = format!("{}_{}{suffix}.cir", breed.model_race(), gender.name());
+    NameTable::load(store)?
+        .id(CHAR_MESH_TYPE, &name)
+        .with_context(|| format!("no player model {name}: the client has no {breed:?} {gender:?}"))
+}
+
+/// [`load_player`] with the body of `build` ([`player_model_build`]).
+pub fn load_player_build(store: &RecordStore, p: &Player, build: u8, pose: Option<(Role, f32)>) -> Result<Scene> {
     let names = NameTable::load(store)?;
-    let model = player_model(store, p.breed, p.gender)?;
+    let model = player_model_build(store, p.breed, p.gender, build)?;
     let all = heads(&names, p.breed, p.gender, p.skin)?;
     let head = match p.head {
         Some(n) => all.iter().find(|h| h.0 == n).with_context(|| format!("no head {n} for {p:?}"))?.1,
