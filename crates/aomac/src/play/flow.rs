@@ -157,7 +157,10 @@ impl Play {
         }
         let server = match self.server() {
             Ok(s) => s,
-            Err(e) => return self.message_box(&e),
+            Err(e) => {
+                eprintln!("{e}");
+                return self.show_error(1, 0);
+            }
         };
         eprintln!("connecting to {} ({}:{}, {} online)", server.name, server.ip, server.port, server.players);
         self.pending_user = user.clone();
@@ -187,8 +190,20 @@ impl Play {
         self.progress_w = self.open_centered("ProgressDialog");
     }
 
-    /// Error / notice box. The original shows login errors in an embedded web page (docs/screens.md §3.6, UNRESOLVED);
-    /// this reuses the ProgressDialog view with its button relabelled.
+    /// `LoginModule_c::ShowError(code, arg)` [GUI 0x10011deb] (docs/screens.md §3.6): the original navigates its embedded
+    /// browser to `<ERRORURL><code>[-<arg>].html`; there is no embedded browser here, so the same URL opens in the default one.
+    fn show_error(&self, code: u32, arg: u32) {
+        let Some(base) = errorurl(&self.dir) else {
+            return eprintln!("login error {code}-{arg}: AnarchyLauncher.url has no ERRORURL");
+        };
+        let url = if arg != 0 { format!("{base}{code}-{arg}.html") } else { format!("{base}{code}.html") };
+        eprintln!("login error page: {url}");
+        if let Err(e) = std::process::Command::new("open").arg(&url).status() {
+            eprintln!("cannot open {url}: {e}");
+        }
+    }
+
+    /// Notice box for non-login errors (the client's own text strings / playfield load failures).
     fn message_box(&mut self, text: &str) {
         if let Some((w, _)) = self.dialog_w.take() {
             self.gui.close_window(w);
@@ -514,9 +529,9 @@ impl Play {
                 Bg::Backdrop(Err(e)) => eprintln!("login backdrop: {e}"),
                 Bg::Connected(Ok(s)) => self.session = Some(s),
                 Bg::Connected(Err(e)) => {
-                    // ShowError(1,0): server not found
+                    eprintln!("connection failed: {e}");
                     self.show_login(host);
-                    self.message_box(&format!("Connection failed: {e}"));
+                    self.show_error(1, 0); // ConnectToLH failed -> ShowError(1,0)
                 }
                 Bg::World(id, Ok(scene)) => {
                     eprintln!("playfield {id} loaded");
@@ -540,9 +555,10 @@ impl Play {
                     self.show_characters(l, host);
                 }
                 LoginEvent::LoginError { code, message } => {
-                    let text = if message.is_empty() { ao_net::client::login_error_text(code) } else { message };
+                    // SlotLoginReply: type 0x0d (LoginError) / 0x21 (RequestRejected) -> ShowError(type, arg)
+                    eprintln!("login error {code}: {message}");
                     self.show_login(host);
-                    self.message_box(&text);
+                    self.show_error(if message.contains("0x21") { 0x21 } else { 0x0d }, code);
                 }
                 LoginEvent::ZoneHandoff { zone_ip, zone_port, .. } => {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
@@ -554,8 +570,10 @@ impl Play {
                     self.start_world_load();
                 }
                 LoginEvent::Disconnected(why) if self.screen != Screen::InWorld => {
+                    // [INFERENCE] AnarchyLauncher.url code 3 = "Server Lost"; the call site was not located in the DLL
+                    eprintln!("login connection lost: {why}");
                     self.show_login(host);
-                    self.message_box(&format!("Disconnected: {why}"));
+                    self.show_error(3, 0);
                 }
                 other => self.on_zone_event(other),
             }
@@ -572,6 +590,19 @@ impl Play {
 
     fn handle(&mut self, ev: Event, host: &mut Host) {
         match ev {
+            Event::Copy(text) => {
+                if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+                    eprintln!("clipboard copy: {e}");
+                }
+            }
+            Event::PasteRequested => match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                Ok(t) => {
+                    for e in self.gui.input(InputEvent::Paste(t)) {
+                        self.handle(e, host);
+                    }
+                }
+                Err(e) => eprintln!("clipboard paste: {e}"),
+            },
             Event::CloseRequested { window } => {
                 if Some(window) == self.login_w {
                     host.quit = true; // SlotQuitRequested -> shutdown
@@ -729,4 +760,14 @@ impl Frontend for Play {
         }
         list
     }
+}
+
+/// `ERRORURL` of `cd_image/data/launcher/AnarchyLauncher.url` (`KEY=value` lines, `#` comments, keys case-insensitive).
+fn errorurl(dir: &std::path::Path) -> Option<String> {
+    let t = std::fs::read_to_string(dir.join("cd_image/data/launcher/AnarchyLauncher.url")).ok()?;
+    t.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("errorurl"))
+        .map(|(_, v)| v.trim().to_string())
 }
