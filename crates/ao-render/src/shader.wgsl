@@ -98,9 +98,9 @@ fn shade(i: VOut, mode: u32) -> vec4<f32> {
     }
     var light = g.ambient.rgb + g.sun_color.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + point_lights(i.wpos, n);
     if mat.emissive.w > 0.5 {
-        light = mix(light, vec3<f32>(1.0), t.a); // alpha = self-illumination mask
+        light = max(light, min(light + t.a, vec3<f32>(1.0))); // alpha = self-illumination mask (engine: saturate(a + lighting))
     }
-    let lit = c.rgb * light + mat.emissive.rgb;
+    let lit = c.rgb * (light + mat.emissive.rgb); // engine: tex * (emissive + lighting)
     let f = clamp((length(to_eye) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
     // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
     let add = mode == 3u;
@@ -115,7 +115,7 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
     if mode == 1u && c.a < 0.5 {
         discard;
     }
-    return vec4<f32>(c.rgb + mat.emissive.rgb, select(1.0, c.a, mode >= 2u));
+    return vec4<f32>(c.rgb * (vec3<f32>(1.0) + mat.emissive.rgb), select(1.0, c.a, mode >= 2u));
 }
 
 @fragment

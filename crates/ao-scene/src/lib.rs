@@ -54,10 +54,10 @@ pub struct Submesh {
     pub base_color: [f32; 4],
     /// Disable back-face culling (front faces are counter-clockwise in ao-scene space).
     pub two_sided: bool,
-    /// Linear RGB added after lighting (self-illumination), before fog.
+    /// Linear RGB added to the lighting term before texture modulation: `tex * (lighting + emissive)`, then fog.
     pub emissive: [f32; 3],
     /// Texture alpha is a self-illumination mask (opaque materials only): the texel is
-    /// shown at full brightness in proportion to alpha, i.e. `rgb * mix(lighting, 1, a)`.
+    /// lit by `max(lighting, min(lighting + a, 1))` (engine: `saturate(a + lighting)`).
     pub glow_mask: bool,
 }
 

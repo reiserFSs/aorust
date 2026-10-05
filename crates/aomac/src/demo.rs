@@ -114,8 +114,8 @@ pub fn scene(count: usize) -> Scene {
     s.textures.insert(key(101), tex(128, |x, y| if x % 32 > 8 && y % 32 > 8 { [255, 230, 140, 255] } else { [60, 60, 70, 0] }));
     s.textures.insert(key(102), tex(64, |_, y| { let t = y as f32 / 63.0; [(20.0 + 60.0 * t) as u8, (25.0 + 70.0 * t) as u8, (70.0 + 90.0 * t) as u8, 255] }));
     let mut em = cube();
-    em.submeshes[0].base_color = [0.1, 0.1, 0.1, 1.0];
-    em.submeshes[0].emissive = [0.1, 1.2, 0.3];
+    em.submeshes[0].base_color = [0.1, 0.5, 0.2, 1.0];
+    em.submeshes[0].emissive = [0.0, 1.0, 0.3];
     let mut gm = cube();
     gm.submeshes[0].texture = Some(key(101));
     gm.submeshes[0].glow_mask = true;
