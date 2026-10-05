@@ -16,3 +16,12 @@ ao-install = { path = "crates/ao-install" }
 ao-net = { path = "crates/ao-net" }
 anyhow = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Keep target/ small: no incremental cache, line tables only for debug builds.
+[profile.dev]
+incremental = false
+debug = "line-tables-only"
+
+[profile.test]
+incremental = false
+debug = "line-tables-only"
