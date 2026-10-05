@@ -35,7 +35,7 @@ Frame `sender` = acting dynel instance (1 = server), `receiver` = our character 
 | `5E477770` | `CharacterActionIIR_t` | 22 | 1 | character action: id table, sit/stand, emotes → [zone/actions.md](zone/actions.md) |
 | `3B1D2268` | `WeaponItemFullUpdateIIR_t` | 10 | 1 | a weapon item |
 | `5C654B28`, `754F1115`, `51492120`, `52526858`, `39343C68`, `25314D6D` | Missed/SpecialAttackInfo, CharSecSpecAttack, GenericCmd_t, Buff, CastNanoSpell | 11/3/3/3/3/3 | 0 | combat log, item use, buffs, nano casts |
-| `4F474E05` | `CorpseFullUpdateIIR_t` | 7 | 0 | corpse (tail raw) |
+| `4F474E05` | `CorpseFullUpdateIIR_t` | 7 | 0 | corpse dynel (kind 0xC76A); animations, hit/death sounds, death flow (`CharacterAction` 99), corpse stats → [zone/combat-anim.md](zone/combat-anim.md) |
 | `41624F0D` | `AppearanceUpdateIIR_c` | 2 | 1 | appearance (visual flags, cloth/attractor changes) |
 | `5F52412E` | `GameTimeIIR_t` | 1 | 1 | game clock (67170.0 s) + server unix time |
 | `2E2A4A6B`, `465A4061` | `OrgInfoPacketIIR_t`, `QuestFullUpdateIIR_t` | 1 | 1 | org info, quest list (empty) |

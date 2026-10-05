@@ -5,6 +5,7 @@
 mod avatar;
 mod camera;
 mod chat;
+mod combat;
 mod controls;
 mod create;
 mod delete;
