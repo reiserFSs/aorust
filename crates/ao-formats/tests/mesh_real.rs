@@ -42,3 +42,18 @@ fn building_with_cutout_masts() {
     let (min_y, max_y) = m.vertices.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v.pos[1]), b.max(v.pos[1])));
     assert!(max_y - min_y > 5.0 && min_y.abs() < 5.0, "y range {min_y}..{max_y}");
 }
+
+#[test]
+fn materials_carry_colour_blend_and_cull() {
+    let Some(store) = store() else { return };
+    // 9918: one flat-colour (untextured) submesh, red/pink diffuse
+    let s = &load_mesh(&store, 9918).unwrap().meshes[0].submeshes;
+    assert!(s.iter().any(|s| s.texture.is_none() && s.base_color[..3] != [1.0; 3]));
+    // 2175: translucent submesh (opacity 0.35, alpha blend) next to opaque ones
+    let s = &load_mesh(&store, 2175).unwrap().meshes[0].submeshes;
+    assert!(s.iter().any(|s| s.blend == ao_scene::Blend::AlphaBlend && (s.base_color[3] - 0.35).abs() < 1e-3));
+    assert!(s.iter().any(|s| s.blend == ao_scene::Blend::Opaque));
+    // 3722: culled walls plus two-sided cutout masts
+    let s = &load_mesh(&store, 3722).unwrap().meshes[0].submeshes;
+    assert!(s.iter().any(|s| !s.two_sided) && s.iter().any(|s| s.two_sided));
+}

@@ -365,4 +365,63 @@ mod tests {
         assert_eq!(m.submeshes[0].indices, vec![0, 2, 1, 3, 1, 2]);
         assert!(m.submeshes[0].texture.is_none());
     }
+
+    /// One triangle with a `FAFMaterial_t` (diffuse, opacity) and a material `RDeltaState` holding `states`.
+    fn material_mesh(diff: [f32; 3], opac: f32, states: &[(i32, i32)]) -> Submesh {
+        const NAMES: [&str; 13] = ["obj", "data", "mesh", "vb_desc", "vertices", "trilist", "triangles", "material", "delta_state", "diff", "opac", "rst_type", "rst_value"];
+        let mut b = vec![];
+        for x in [3u32, 0, 0, 1, NAMES.len() as u32] {
+            b.extend(x.to_le_bytes());
+        }
+        for n in NAMES {
+            b.extend(format!("1\0{n}\0").bytes());
+        }
+        b.extend(6u32.to_le_bytes());
+        let fl = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        let r = |v: &[i32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        b.extend(object(&[member(0, 0x11, &r(&[0]))])); // holder -> root 0 (the node)
+        b.extend(object(&[member(1, 0x11, &r(&[1]))])); // node: data -> 1
+        b.extend(object(&[member(2, 0x11, &r(&[2]))])); // data: mesh -> 2
+        let vb = fl(&[0., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 1., 0., 1., 0., 0., 1., 0., 0., 1.]);
+        let mut desc = vec![];
+        for x in [16u32, 65536, 0x112, 3] {
+            desc.extend(x.to_le_bytes());
+        }
+        b.extend(object(&[member(3, 9, &desc), member(4, 9, &blob(&vb)), member(5, 0x11, &r(&[3])), member(7, 0x11, &r(&[4]))]));
+        let tris: Vec<u8> = [0u16, 1, 2].iter().flat_map(|i| i.to_le_bytes()).collect();
+        b.extend(object(&[member(6, 9, &blob(&tris))]));
+        b.extend(object(&[member(8, 0x11, &r(&[5])), member(9, 0x10, &fl(&diff)), member(10, 0xa, &fl(&[opac]))]));
+        let mut ds = vec![];
+        for &(t, v) in states {
+            ds.push(member(11, 3, &r(&[t])));
+            ds.push(member(12, 3, &r(&[v])));
+        }
+        b.extend(object(&ds));
+        b.extend([0u8; 12]);
+        let mut m = decode_archive(&b, |_| false).unwrap();
+        assert_eq!(m.submeshes.len(), 1);
+        m.submeshes.remove(0)
+    }
+
+    #[test]
+    fn flat_colour_is_linear_base_color_and_default_is_opaque_culled() {
+        let s = material_mesh([0.5, 0.0, 1.0], 0.25, &[]);
+        assert_eq!((s.blend, s.two_sided, s.texture), (Blend::Opaque, false, None));
+        assert!((s.base_color[0] - 0.2140).abs() < 1e-3 && s.base_color[1] == 0.0 && s.base_color[2] == 1.0 && s.base_color[3] == 0.25);
+    }
+
+    #[test]
+    fn render_states_select_blend_and_cull() {
+        let blend = |st: &[(i32, i32)]| material_mesh([1.0; 3], 1.0, st);
+        assert_eq!(blend(&[(D3DRS_ALPHABLENDENABLE, 1)]).blend, Blend::AlphaBlend);
+        assert_eq!(blend(&[(D3DRS_ALPHABLENDENABLE, 0)]).blend, Blend::Opaque);
+        assert_eq!(blend(&[(D3DRS_ALPHATESTENABLE, 1)]).blend, Blend::AlphaTest);
+        // alpha test wins over blend (mode 2 of RMaterial_t's state preset sets both)
+        assert_eq!(blend(&[(D3DRS_ALPHATESTENABLE, 1), (D3DRS_ALPHABLENDENABLE, 1)]).blend, Blend::AlphaTest);
+        // ONE/ONE and SRCALPHA/ONE are additive (RSprite::EnableAdditiveRendering @10013128)
+        assert_eq!(blend(&[(D3DRS_ALPHABLENDENABLE, 1), (D3DRS_SRCBLEND, 2), (D3DRS_DESTBLEND, 2)]).blend, Blend::Additive);
+        assert_eq!(blend(&[(D3DRS_ALPHABLENDENABLE, 1), (D3DRS_SRCBLEND, 5), (D3DRS_DESTBLEND, 2)]).blend, Blend::Additive);
+        assert!(blend(&[(D3DRS_CULLMODE, D3DCULL_NONE)]).two_sided);
+        assert!(!blend(&[(D3DRS_CULLMODE, 3)]).two_sided);
+    }
 }
