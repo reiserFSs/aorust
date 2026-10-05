@@ -424,6 +424,11 @@ impl TextDb {
     /// A view label: `#Key` is looked up in [`CAT_LABELS`] then [`CAT_GUI`]; anything else is a literal.
     pub fn label(&self, s: &str) -> String {
         match s.strip_prefix('#') {
+            // `#<category>:<id>` = `LDBface::GetText(category, id)` (Skills.xml `#10010:0`)
+            Some(k) if k.split_once(':').is_some_and(|(c, i)| c.parse::<u32>().is_ok() && i.parse::<u32>().is_ok()) => {
+                let (c, i) = k.split_once(':').unwrap();
+                self.by_id(c.parse().unwrap(), i.parse().unwrap()).unwrap_or_else(|| s.to_string())
+            }
             Some(k) => self.by_key(CAT_LABELS, k).or_else(|| self.by_key(CAT_GUI, k)).unwrap_or_else(|| s.to_string()),
             None => s.to_string(),
         }
