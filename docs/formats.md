@@ -175,6 +175,7 @@ No record names an entry point (the server tells the client where a character ar
 * `list_playfields`: **601** playfields with names.
 * Load of all 601: **ok=601 failed=0**, 2 355 238 statels, 2 369 852 instances, 435 statels without mesh (mesh id 0 / 44795), 0 mesh decode failures; whole run ≈ 20 s.
 * Largest terrains: Avalon (505) 997 600 cells, 32 418 statels, 223 unique meshes: **0.13 s**; Coast of Peace (556) 952 000 cells + 79 845 statels: 0.13 s; slowest of all: 6013 Central Gateway 0.25 s.
+* Spawn checks (`pf_stats`, all 601): **595 ok, 0 failed, 6 empty** (playfields without rooms/statels in the data). Default-view screenshots (no `--eye`) inspected for 566, 705, 505, 127, 386, 152, 4327, 331.
 * Visual (`aomac view pf <id> --screenshot`): 566 Newland City (cliff-ringed city on the desert, buildings on the ground, platform + walkway over the crater), 705 Omni-1 Entertainment (octagonal plaza, radial avenues, tiled streets), 505 Avalon (domes, roads, plot grid), 600 Varmint Woods (forest, plot grid with roads).
 * Tests: unit tests in `playfield::{record,ground,statel}` and `playfield::tests` (hand-built fixtures: header/room parse, prefix sums + byte wrap + patch layout, zone layouts, orientation, z-flip transform); `tests/playfield_real.rs` (skips without the client).
 
