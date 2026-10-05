@@ -61,11 +61,11 @@ fn shade(i: VOut, mode: u32) -> vec4<f32> {
     let light = g.ambient.rgb + g.sun_color.rgb * max(dot(n, g.sun_dir.xyz), 0.0);
     let lit = c.rgb * light;
     let f = clamp((length(to_eye) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
-    switch mode {
-        case 2u: { return vec4<f32>(mix(lit, g.fog_color.rgb, f), c.a); }
-        case 3u: { return vec4<f32>(lit, c.a * (1.0 - f)); } // fade glow out instead of tinting it
-        default: { return vec4<f32>(mix(lit, g.fog_color.rgb, f), 1.0); }
-    }
+    // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
+    let add = mode == 3u;
+    let rgb = select(mix(lit, g.fog_color.rgb, f), lit, add);
+    let a = select(select(1.0, c.a, mode == 2u), c.a * (1.0 - f), add);
+    return vec4<f32>(rgb, a);
 }
 
 @fragment

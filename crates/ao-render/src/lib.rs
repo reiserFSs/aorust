@@ -13,6 +13,7 @@ use wgpu::util::DeviceExt;
 pub use viewer::run_viewer;
 
 const MSAA: u32 = 4;
+const INST_RING: usize = 3;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SKY_SRGB: [f32; 3] = [0.53, 0.72, 0.92];
 
@@ -118,7 +119,7 @@ struct Inst {
 
 struct Gpu {
     meshes: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
-    inst_buf: Option<wgpu::Buffer>,
+    inst_bufs: Vec<wgpu::Buffer>, // ring: a buffer is rewritten only after earlier frames using it were submitted
     mats: Vec<wgpu::BindGroup>, // [0] = untextured white
     opaque: Vec<Draw>,          // Opaque + AlphaTest, sorted by pipeline/mesh/material
     blended: Vec<Draw>,         // AlphaBlend + Additive, drawn per visible instance, far to near
@@ -174,6 +175,7 @@ pub struct Renderer {
     gpu: Gpu,
     env: Environment,
     // per-frame scratch
+    frame: usize,
     vis: Vec<[[f32; 4]; 4]>,
     vis_src: Vec<u32>,
     vis_range: Vec<std::ops::Range<u32>>,
@@ -186,7 +188,7 @@ fn default_environment(radius: f32) -> Environment {
     Environment {
         sky_color: sky,
         fog_color: sky,
-        fog_start: fog_end * 0.35,
+        fog_start: fog_end * 0.5,
         fog_end,
         ambient: [0.35, 0.38, 0.45],
         sun_color: [0.75, 0.71, 0.64],
@@ -208,15 +210,16 @@ impl Renderer {
             compatible_surface: surface,
             force_fallback_adapter: false,
         }))
-        .ok_or_else(|| anyhow!("no suitable GPU adapter"))?;
+        .map_err(|e| anyhow!("no suitable GPU adapter: {e}"))?;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
             },
-            None,
         ))
         .context("request_device")?;
         let format = match surface {
@@ -280,14 +283,14 @@ impl Renderer {
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             anisotropy_clamp: 16,
             ..Default::default()
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&g_layout, &tex_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&g_layout), Some(&tex_layout)],
+            immediate_size: 0,
         });
         let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
         let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
@@ -325,13 +328,14 @@ impl Renderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH,
-                    depth_write_enabled: depth_write,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: Default::default(),
-                    bias: Default::default(),
+                    // Blended overlays are often coplanar with the opaque surface below them.
+                    bias: if depth_write { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
                 }),
                 multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -350,8 +354,9 @@ impl Renderer {
             tex_layout,
             sampler,
             pipes,
-            gpu: Gpu { meshes: vec![], inst_buf: None, mats: vec![], opaque: vec![], blended: vec![], insts: vec![], mesh_range: vec![], radius: 100.0 },
+            gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], insts: vec![], mesh_range: vec![], radius: 100.0 },
             env: default_environment(100.0),
+            frame: 0,
             vis: vec![],
             vis_src: vec![],
             vis_range: vec![],
@@ -504,17 +509,23 @@ impl Renderer {
             meshes.push(Some((vb, ib)));
         }
         opaque.sort_by_key(|d| (d.pipe, d.mesh, d.mat));
-        let inst_buf = (!insts.is_empty()).then(|| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("instances"),
-                size: (insts.len() * 64) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        });
+        let inst_bufs = if insts.is_empty() {
+            vec![]
+        } else {
+            (0..INST_RING)
+                .map(|_| {
+                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("instances"),
+                        size: (insts.len() * 64) as u64,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                })
+                .collect()
+        };
         let radius = scene_bounds(scene).map_or(100.0, |(l, h)| ((h - l).length() * 0.5).max(1.0));
         self.env = scene.environment.unwrap_or_else(|| default_environment(radius));
-        self.gpu = Gpu { meshes, inst_buf, mats, opaque, blended, insts, mesh_range, radius };
+        self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, insts, mesh_range, radius };
     }
 
     /// Scene radius; viewer uses it for speed.
@@ -556,7 +567,9 @@ impl Renderer {
             }
             self.vis_range.push(start..self.vis.len() as u32);
         }
-        if let Some(buf) = &self.gpu.inst_buf {
+        self.frame = (self.frame + 1) % INST_RING;
+        let inst_buf = self.gpu.inst_bufs.get(self.frame);
+        if let Some(buf) = inst_buf {
             if !self.vis.is_empty() {
                 self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
             }
@@ -579,6 +592,7 @@ impl Renderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &t.msaa,
                     resolve_target: Some(resolve),
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r: env.sky_color[0] as f64, g: env.sky_color[1] as f64, b: env.sky_color[2] as f64, a: 1.0 }),
                         store: wgpu::StoreOp::Discard,
@@ -591,8 +605,9 @@ impl Renderer {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
-            if let Some(inst) = &self.gpu.inst_buf {
+            if let Some(inst) = inst_buf {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_vertex_buffer(1, inst.slice(..));
                 let (mut pipe, mut mesh, mut mat) = (usize::MAX, usize::MAX, usize::MAX);
@@ -643,7 +658,7 @@ fn vertex_bytes(v: &[ao_scene::Vertex]) -> Vec<f32> {
 
 /// Renders `scene` offscreen and writes an sRGB PNG.
 pub fn render_to_png(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path) -> Result<()> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut r = Renderer::new(&instance, None)?;
     r.upload(scene);
     let targets = Targets::new(&r, width, height);
@@ -675,7 +690,7 @@ pub fn render_to_png(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32
     r.queue.submit([enc.finish()]);
     let (tx, rx) = std::sync::mpsc::channel();
     buf.slice(..).map_async(wgpu::MapMode::Read, move |res| tx.send(res).unwrap());
-    r.device.poll(wgpu::Maintain::Wait);
+    r.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| anyhow!("poll: {e}"))?;
     rx.recv()??;
     let mapped = buf.slice(..).get_mapped_range();
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);

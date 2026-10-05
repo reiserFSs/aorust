@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use ao_rdb::RecordStore;
 use ao_scene::Scene;
 use clap::{Args, Parser, Subcommand};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -36,10 +37,10 @@ struct ViewOpts {
     /// Render offscreen to this PNG and exit.
     #[arg(long, global = true)]
     screenshot: Option<PathBuf>,
-    /// Camera position for --screenshot, "x,y,z" (default: framed on scene bounds).
+    /// Camera position (screenshot and interactive start), "x,y,z" (default: framed on scene bounds).
     #[arg(long, global = true, value_parser = vec3, allow_hyphen_values = true)]
     eye: Option<[f32; 3]>,
-    /// Look-at target for --screenshot, "x,y,z".
+    /// Look-at target (screenshot and interactive start), "x,y,z".
     #[arg(long, global = true, value_parser = vec3, allow_hyphen_values = true)]
     at: Option<[f32; 3]>,
     /// Screenshot size, "WxH".
@@ -91,8 +92,12 @@ fn main() -> Result<()> {
                 What::Demo { count } => demo::scene(count),
                 What::Mesh { id } => ao_formats::mesh::load_mesh(&RecordStore::open(&dir)?, id)?,
                 What::Pf { list: true, .. } => {
+                    let mut out = std::io::stdout().lock();
                     for (id, name) in ao_formats::playfield::list_playfields(&RecordStore::open(&dir)?)? {
-                        println!("{id}\t{name}");
+                        // Closed pipe (`| head`) is a normal way to stop reading.
+                        if writeln!(out, "{id}\t{name}").is_err() {
+                            break;
+                        }
                     }
                     return Ok(());
                 }
@@ -106,7 +111,13 @@ fn main() -> Result<()> {
                     let at = opts.at.unwrap_or(at.into());
                     ao_render::render_to_png(&scene, eye, at, opts.size.0, opts.size.1, &path)
                 }
-                None => ao_render::run_viewer(scene),
+                None => {
+                    // --eye/--at also place the interactive camera.
+                    let mut scene = scene;
+                    scene.spawn = opts.eye.or(scene.spawn);
+                    scene.spawn_look_at = opts.at.or(scene.spawn_look_at);
+                    ao_render::run_viewer(scene)
+                }
             }
         }
     }

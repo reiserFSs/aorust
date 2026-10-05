@@ -25,6 +25,7 @@ struct State {
     stat_t: Instant,
     stat_frames: u32,
     perf: bool,
+    cpu: f32,
 }
 
 struct App {
@@ -47,7 +48,7 @@ impl State {
         let window = Arc::new(el.create_window(
             Window::default_attributes().with_title("aomac").with_inner_size(winit::dpi::LogicalSize::new(1280, 800)),
         )?);
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone())?;
         let mut renderer = Renderer::new(&instance, Some(&surface))?;
         renderer.upload(scene);
@@ -66,6 +67,9 @@ impl State {
         let targets = Targets::new(&renderer, config.width, config.height);
         let (eye, at) = default_view(scene);
         let speed = (renderer.radius() * 0.15).max(5.0);
+        if std::env::var_os("AOMAC_PERF").is_some() {
+            eprintln!("start eye {eye:?} at {at:?}, scene bounds {:?}", crate::scene_bounds(scene));
+        }
         let now = Instant::now();
         Ok(Self {
             window,
@@ -80,6 +84,7 @@ impl State {
             last: now,
             stat_t: now,
             stat_frames: 0,
+            cpu: 0.0,
             perf: std::env::var_os("AOMAC_PERF").is_some(),
         })
     }
@@ -119,14 +124,17 @@ impl State {
         c.pos += (c.forward() * (k(KeyCode::KeyW) - k(KeyCode::KeyS)) + c.right() * (k(KeyCode::KeyD) - k(KeyCode::KeyA)) + Vec3::Y * up) * step;
 
         let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(_) => {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.renderer.device, &self.config);
                 return;
             }
+            _ => return, // timeout / occluded: skip this frame
         };
         let view = frame.texture.create_view(&Default::default());
+        let t0 = Instant::now();
         self.renderer.render(&view, &self.targets, &self.cam);
+        self.cpu += t0.elapsed().as_secs_f32();
         self.window.pre_present_notify();
         frame.present();
 
@@ -138,7 +146,8 @@ impl State {
             self.window.set_title(&format!("aomac | {fps:.0} fps | {:.1} {:.1} {:.1} | speed {:.0}", p.x, p.y, p.z, self.speed));
             if self.perf {
                 let st = self.renderer.stats;
-                eprintln!("{:.2} ms/frame ({fps:.0} fps) {} instances, {} draws", 1000.0 / fps, st.instances, st.draw_calls);
+                eprintln!("{:.2} ms/frame ({fps:.0} fps), render() cpu {:.2} ms, {} instances, {} draws", 1000.0 / fps, 1000.0 * self.cpu / self.stat_frames as f32, st.instances, st.draw_calls);
+                self.cpu = 0.0;
             }
             self.stat_t = Instant::now();
             self.stat_frames = 0;
