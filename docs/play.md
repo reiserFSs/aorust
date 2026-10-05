@@ -46,4 +46,4 @@ games category, macOS ≥ 12). The client is found from `$HOME/Games/ProjectRubi
 ## Debug flags (hidden)
 
 `--fake-charlist [--select N]` shows a built-in list (offline character-select check; Play then runs only the loading screen).
-`AOMAC_PERF=1` prints preview build timings.
+`AOMAC_PERF=1` prints preview build timings. With `--fake-charlist` an in-process fake server answers New Character (random name "Zalokon", "Taken" → name in use, else created + hand-off to the loading screen) and Delete; `AOMAC_CC_SKIP_INTRO=1` jumps to the breed scene; Esc in creation skips the running camera move (docs/screens.md §12).

@@ -36,6 +36,7 @@ impl Play {
             }
         } else {
             let t = self.text.by_key(10000, "NamesDontMatch").unwrap_or_default();
+            self.under_dialog = self.dialog_w.take().map(|d| d.0); // the delete window stays below the box
             self.message_box(&t); // the `MatchError` DialogBox
         }
     }

@@ -117,6 +117,8 @@ struct Play {
     world_scene: Option<Box<Scene>>,
     time: f32,
     // character creation / deletion
+    /// The delete window kept open below its `MatchError` box (the original's `DialogBox_c::Go` is modal on top of it).
+    under_dialog: Option<WindowId>,
     cc: Option<Box<create::Create>>,
     cc_world: Option<Box<CcWorld>>,
     char_list: CharacterList,
@@ -184,6 +186,7 @@ pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String
         in_world_msg: String::new(),
         fake: fake_charlist.is_some(),
         fake_events: Default::default(),
+        under_dialog: None,
         pending_fake: None,
         pending_user: String::new(),
         world_scene: None,

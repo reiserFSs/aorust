@@ -704,8 +704,12 @@ impl Play {
     }
 
     pub(super) fn close_dialog(&mut self) {
-        if let Some((w, _)) = self.dialog_w.take() {
+        if let Some((w, kind)) = self.dialog_w.take() {
             self.gui.close_window(w);
+            if let (DialogKind::Message, Some(under)) = (kind, self.under_dialog.take()) {
+                self.dialog_w = Some((under, DialogKind::Delete));
+                self.gui.focus(under, "name_input");
+            }
         }
     }
 }
