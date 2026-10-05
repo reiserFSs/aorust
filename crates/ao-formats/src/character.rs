@@ -31,6 +31,8 @@ pub const CHAR_MESH_LOW_TYPE: u32 = 1010027;
 pub const CHAR_ANIM_TYPE: u32 = 1010003;
 /// Textures referenced by [`Part::texture`].
 const TEXTURE_TYPE: u32 = 1010004;
+/// A vertex's (bone-local or bind, other) position pair.
+type BindPair = ([f32; 3], [f32; 3]);
 /// Weights at or above this use bone 0 only (the engine's single-bone branch).
 const SINGLE_BONE_WEIGHT: f32 = 0.999;
 
@@ -201,7 +203,7 @@ fn bind_frames(mesh: &CatMesh) -> Vec<Option<Xf>> {
     pts.iter()
         .map(|p| {
             let (a0, c0) = *p.first()?;
-            let far = |f: &dyn Fn(&([f32; 3], [f32; 3])) -> f32| p.iter().max_by(|x, y| f(x).total_cmp(&f(y))).copied();
+            let far = |f: &dyn Fn(&BindPair) -> f32| p.iter().max_by(|x, y| f(x).total_cmp(&f(y))).copied();
             let (ab, cb) = far(&|q| len(sub(q.0, a0)))?;
             let u = sub(ab, a0);
             let (ac, cc) = far(&|q| len(cross(u, sub(q.0, a0))))?;
@@ -225,7 +227,7 @@ fn bind_frames(mesh: &CatMesh) -> Vec<Option<Xf>> {
 /// Area-weighted vertex normals of a D3D (clockwise-front) triangle list; `cross(e1, e2)` points outwards.
 fn face_normals(pos: &[[f32; 3]], idx: &[u16]) -> Vec<[f32; 3]> {
     let mut n = vec![[0.0f32; 3]; pos.len()];
-    for t in idx.chunks_exact(3) {
+    for t in idx.as_chunks::<3>().0 {
         let [a, b, c] = [0, 1, 2].map(|k| pos[t[k] as usize]);
         let f = cross(sub(b, a), sub(c, a));
         for &i in t {
@@ -278,6 +280,39 @@ fn skin_pose(mesh: &CatMesh, world: &[Xf]) -> Skinned {
                 .collect()
         })
         .collect()
+}
+
+/// How far limbs have come apart in a pose, in metres: for every parent/child bone pair the nearest
+/// distance between the two bones' rigidly skinned vertices (at most 256 sampled each) in the pose
+/// minus the same in the bind pose; the maximum over pairs. A sound pose stays within a few
+/// centimetres (the pieces overlap at the joint and rotate about it), detached limbs open a gap.
+/// `time_s` loops like [`load_character_posed`].
+pub fn pose_detachment(store: &RecordStore, id: u32, anim_id: u32, time_s: f32) -> Result<f32> {
+    let mesh = load_cat_mesh(store, CHAR_MESH_TYPE, id)?;
+    let anim = load_anim(store, anim_id)?;
+    ensure!(anim.signature == mesh.signature, "animation {anim_id} does not fit model {id}");
+    let ms = if anim.duration > 0.0 { (time_s * 1000.0).rem_euclid(anim.duration) } else { 0.0 };
+    let world = bone_world(&mesh, Some((&anim, ms)));
+    let mut sets: Vec<Vec<BindPair>> = vec![vec![]; mesh.bones.len()]; // (bind, posed)
+    for v in mesh.submeshes.iter().flat_map(|s| &s.vertices).filter(|v| v.weight >= SINGLE_BONE_WEIGHT) {
+        let b = v.bones[0] as usize;
+        sets[b].push((v.bind, world[b].apply(v.local[0])));
+    }
+    let sample = |s: &[BindPair]| s.iter().step_by(s.len().div_ceil(256).max(1)).copied().collect::<Vec<_>>();
+    let gap = |a: &[BindPair], b: &[BindPair]| {
+        let min = |f: fn(&BindPair) -> [f32; 3]| a.iter().flat_map(|p| b.iter().map(move |q| len(sub(f(p), f(q))))).fold(f32::MAX, f32::min);
+        min(|p| p.1) - min(|p| p.0)
+    };
+    let sets: Vec<_> = sets.iter().map(|s| sample(s)).collect();
+    let mut worst = 0.0f32;
+    for (p, bone) in mesh.bones.iter().enumerate() {
+        for &c in &bone.children {
+            if !sets[p].is_empty() && !sets[c as usize].is_empty() {
+                worst = worst.max(gap(&sets[p], &sets[c as usize]));
+            }
+        }
+    }
+    Ok(worst)
 }
 
 fn linear(c: f32) -> f32 {
@@ -334,7 +369,7 @@ fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned, swaps: &HashMap
             out.submeshes.len() - 1
         });
         // mirroring Z turns the clockwise-front triangles counter-clockwise only if the winding is reversed
-        out.submeshes[si].indices.extend(sm.indices.chunks_exact(3).flat_map(|t| [t[0], t[2], t[1]]).map(|i| base + i as u32));
+        out.submeshes[si].indices.extend(sm.indices.as_chunks::<3>().0.iter().flat_map(|t| [t[0], t[2], t[1]]).map(|i| base + i as u32));
     }
     out.submeshes.retain(|s| !s.indices.is_empty());
     scene.meshes.push(out);
@@ -419,9 +454,9 @@ fn build(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>, 
         // the head vertices are already mirrored (Z negated): conjugate the mounting transform by the mirror
         let flip = |i: usize, j: usize| if (i == 2) != (j == 2) { -1.0 } else { 1.0 };
         let mut m = IDENTITY;
-        for c in 0..3 {
-            for r in 0..3 {
-                m[c][r] = w.r[r][c] * flip(r, c);
+        for (c, col) in m.iter_mut().enumerate().take(3) {
+            for (r, x) in col.iter_mut().enumerate().take(3) {
+                *x = w.r[r][c] * flip(r, c);
             }
         }
         m[3] = [w.t[0], w.t[1], -w.t[2], 1.0];
@@ -543,6 +578,38 @@ mod tests {
         v
     }
 
+    fn find(v: &[u8], pat: &[u8], nth: usize) -> usize {
+        v.windows(pat.len()).enumerate().filter(|(_, w)| *w == pat).nth(nth).unwrap().0
+    }
+
+    #[test]
+    fn parser_rejects_bad_bone_references_and_hierarchies() {
+        assert!(CatMesh::parse(&mesh_record()).is_ok());
+        let n = mesh_record().len();
+        for (what, off) in [("attractor", n - 16), ("collision sphere", n - 76)] {
+            let mut v = mesh_record();
+            v[off..off + 4].copy_from_slice(&9u32.to_le_bytes());
+            let e = format!("{:#}", CatMesh::parse(&v).unwrap_err());
+            assert!(e.contains(what) && e.contains("out of range"), "{e}");
+        }
+        // second `root` is the bone table entry: name(4+4) scale(4) n_child(4) child(4)
+        let root = find(&mesh_record(), b"root", 1) + 4 + 4;
+        let duplicate = |extra: u32| {
+            let mut v = mesh_record();
+            v[root..root + 4].copy_from_slice(&2u32.to_le_bytes());
+            v.splice(root + 8..root + 8, extra.to_le_bytes());
+            v
+        };
+        assert!(format!("{:#}", CatMesh::parse(&duplicate(1)).unwrap_err()).contains("more than one parent"));
+        // a bone that is its own child: the child entry's child count 0 -> 1, child 1
+        let mut v = mesh_record();
+        let child = find(&v, b"child", 0) + 5 + 4;
+        v[child..child + 4].copy_from_slice(&1u32.to_le_bytes());
+        v.splice(child + 4..child + 4, 1u32.to_le_bytes());
+        let e = format!("{:#}", CatMesh::parse(&v).unwrap_err());
+        assert!(e.contains("parent") || e.contains("cycle"), "{e}");
+    }
+
     /// Delta-code `vals` (one column) as big-endian `width`-byte words.
     fn plane(vals: &[u32], width: usize) -> Vec<u8> {
         let mut prev = 0u32;
@@ -631,7 +698,7 @@ mod tests {
         assert_eq!(a.tracks.len(), 2);
         let t = &a.tracks[1];
         assert_eq!((t.bone, t.mode, t.rot.len(), t.trans.len()), (1, 2, 2, 2));
-        assert!((t.rot[1].1[2] - 0.7071).abs() < 1e-3 && (t.rot[1].1[3] - 0.7071).abs() < 1e-3);
+        assert!((t.rot[1].1[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3 && (t.rot[1].1[3] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3);
         assert!((t.trans[1].1[0] - 2.0).abs() < 1e-6 && t.trans[0].1 == [0.0; 3]);
         let (q, p) = a.sample(1, 500.0).unwrap();
         assert!((p[0] - 1.0).abs() < 1e-5);

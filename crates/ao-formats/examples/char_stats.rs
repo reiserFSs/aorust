@@ -89,6 +89,24 @@ fn main() -> anyhow::Result<()> {
     for (k, v) in pfail {
         println!("  FAIL x{} {k}: e.g. {:?}", v.len(), &v[..v.len().min(5)]);
     }
+    // limb detachment with each model's own clip set (walk, else the first clip) at 0.6 s; wrong-set clips of
+    // the same skeleton hash have other bone lengths and are *not* expected to fit (see docs)
+    let (mut checked, mut worst, mut bad) = (0, (0.0f32, 0u32), vec![]);
+    for ids in sigs.values() {
+        for &id in ids {
+            let Ok(clips) = model_clips(&store, id) else { continue };
+            let Some(&(_, clip)) = clips.iter().find(|c| c.0 == "walk").or(clips.first()) else { continue };
+            let gap = pose_detachment(&store, id, clip, 0.6)?;
+            checked += 1;
+            if gap > worst.0 {
+                worst = (gap, id);
+            }
+            if gap > 0.15 {
+                bad.push((id, gap));
+            }
+        }
+    }
+    println!("limb detachment, own clip set: {checked} models checked, worst {:.3} m (model {}), above 0.15 m: {} {:?}", worst.0, worst.1, bad.len(), &bad[..bad.len().min(8)]);
     // name table coverage and the player tuple API
     let names = NameTable::load(&store)?;
     let named = |ty, ids: Vec<u32>| ids.iter().filter(|&&i| names.name(ty, i).is_some()).count();

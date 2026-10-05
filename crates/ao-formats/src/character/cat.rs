@@ -186,18 +186,22 @@ impl CatMesh {
                 }
                 let ni = count(&mut r, "index")?;
                 ensure!(ni % 3 == 0, "index count {ni} is not a multiple of 3");
-                let indices = r.bytes(ni * 2)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>();
+                let indices = r.bytes(ni * 2)?.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect::<Vec<_>>();
                 ensure!(indices.iter().all(|&i| (i as usize) < nv), "index out of range");
                 submeshes.push(SubMesh { group, material, vertices, indices });
             }
             for _ in 0..count(&mut r, "collision sphere")? {
                 let [x, y, z, radius] = r.f32s::<4>()?;
-                col_spheres.push(ColSphere { center: [x, y, z], radius, bone: r.u32()? });
+                let bone = r.u32()?;
+                ensure!((bone as usize) < nb, "collision sphere bone out of range");
+                col_spheres.push(ColSphere { center: [x, y, z], radius, bone });
             }
             for _ in 0..count(&mut r, "attractor")? {
                 let name = r.string()?;
                 let f = r.f32s::<8>()?;
-                attractors.push(Attractor { name, pos: [f[0], f[1], f[2]], rot: [f[3], f[4], f[5], f[6]], scale: f[7], bone: r.u32()? });
+                let bone = r.u32()?;
+                ensure!((bone as usize) < nb, "attractor bone out of range");
+                attractors.push(Attractor { name, pos: [f[0], f[1], f[2]], rot: [f[3], f[4], f[5], f[6]], scale: f[7], bone });
             }
         }
         // What follows is either 12 zero bytes or a progressive-mesh table (`vertex_reorder`, `indices`,
@@ -209,19 +213,22 @@ impl CatMesh {
 
     fn check(&self) -> Result<()> {
         ensure!(self.parts.len() == self.materials.len(), "{} texture parts for {} materials", self.parts.len(), self.materials.len());
-        let mut state = vec![0u8; self.bones.len()]; // 0 new, 1 on stack, 2 done: reject cycles
-        fn dfs(b: usize, bones: &[Bone], state: &mut [u8]) -> bool {
-            match state[b] {
-                1 => return false,
-                2 => return true,
-                _ => {}
+        // a forest: every bone has at most one parent (no shared or duplicate children) and no chain loops
+        let mut parent = vec![usize::MAX; self.bones.len()];
+        for (i, b) in self.bones.iter().enumerate() {
+            for &c in &b.children {
+                ensure!(parent[c as usize] == usize::MAX, "bone {c} has more than one parent");
+                parent[c as usize] = i;
             }
-            state[b] = 1;
-            let ok = bones[b].children.iter().all(|&c| dfs(c as usize, bones, state));
-            state[b] = 2;
-            ok
         }
-        ensure!((0..self.bones.len()).all(|b| dfs(b, &self.bones, &mut state)), "bone hierarchy has a cycle");
+        for start in 0..self.bones.len() {
+            let (mut cur, mut steps) = (start, 0);
+            while parent[cur] != usize::MAX {
+                cur = parent[cur];
+                steps += 1;
+                ensure!(steps <= self.bones.len(), "bone hierarchy has a cycle");
+            }
+        }
         Ok(())
     }
 

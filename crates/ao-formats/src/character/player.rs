@@ -8,7 +8,7 @@
 //!   green placeholder); the naked skins are rdb 1010011 `<part>_<race><sex>[_<ethnicity>]_naked.png`.
 
 use super::{load_cat_mesh, load_character_head_skin, CatAnim, NameTable, CHAR_ANIM_TYPE, CHAR_MESH_TYPE};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use ao_rdb::RecordStore;
 use ao_scene::{Scene, TextureKey};
 use std::{collections::HashMap, str::FromStr};
@@ -210,20 +210,47 @@ pub fn model_clips(store: &RecordStore, model_id: u32) -> Result<Vec<(String, u3
     let sig = load_cat_mesh(store, CHAR_MESH_TYPE, model_id)?.signature;
     let mut clips: Vec<(&str, u32)> = names.entries(CHAR_ANIM_TYPE).filter_map(|(id, n)| Some((n.strip_suffix(".ani")?, id))).collect();
     clips.sort_by_key(|c| c.1);
-    for set in clip_sets(model) {
+    let set_clips = |set: &str| -> Result<Vec<(String, u32)>> {
         let mut out = vec![];
         for (n, id) in &clips {
-            let Some(n) = n.strip_prefix(set.as_str()).and_then(|n| n.strip_prefix('_')) else { continue };
-            let fits = store.get(CHAR_ANIM_TYPE, *id)?.and_then(|b| CatAnim::signature_of(&b).ok()) == Some(sig);
-            if fits {
+            let Some(n) = n.strip_prefix(set).and_then(|n| n.strip_prefix('_')) else { continue };
+            if store.get(CHAR_ANIM_TYPE, *id)?.and_then(|b| CatAnim::signature_of(&b).ok()) == Some(sig) {
                 out.push((n.trim_end_matches("_01_01").to_string(), *id));
             }
         }
+        Ok(out)
+    };
+    for set in clip_sets(model) {
+        let out = set_clips(&set)?;
         if !out.is_empty() {
             return Ok(out);
         }
     }
-    bail!("no named clips for model {model_id} ({model})")
+    // A model that no set is named after (`skeleton_solitus`): clips of other sets with the same skeleton
+    // hash have other bone lengths and tear the limbs apart, so take the set that fits best.
+    let mut fitting: Vec<(&str, String, u32)> = vec![]; // (set, clip name, id) of every clip with this skeleton hash
+    for (n, id) in &clips {
+        let Some((set, rest)) = n.split_once('_') else { continue };
+        if store.get(CHAR_ANIM_TYPE, *id)?.and_then(|b| CatAnim::signature_of(&b).ok()) == Some(sig) {
+            fitting.push((set, rest.trim_end_matches("_01_01").to_string(), *id));
+        }
+    }
+    let mut sets: Vec<&str> = fitting.iter().map(|c| c.0).collect();
+    sets.sort_unstable();
+    sets.dedup();
+    let mut best: Option<(f32, Vec<(String, u32)>)> = None;
+    for set in sets {
+        let out: Vec<_> = fitting.iter().filter(|c| c.0 == set).map(|c| (c.1.clone(), c.2)).collect();
+        if out.len() < 5 {
+            continue;
+        }
+        let probe = out.iter().find(|c| c.0 == "walk").unwrap_or(&out[0]).1;
+        let gap = super::pose_detachment(store, model_id, probe, 0.6)?;
+        if best.as_ref().is_none_or(|b| gap < b.0) {
+            best = Some((gap, out));
+        }
+    }
+    best.map(|b| b.1).with_context(|| format!("no named clips for model {model_id} ({model})"))
 }
 
 /// The clip of every [`Role`] the model's set has (emotes included), ascending by clip id.

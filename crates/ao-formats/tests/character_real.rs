@@ -13,7 +13,7 @@ fn store() -> Option<RecordStore> {
 fn normal_agreement(scene: &Scene) -> f32 {
     let (mut agree, mut total) = (0, 0);
     for m in &scene.meshes {
-        for t in m.submeshes.iter().flat_map(|s| s.indices.chunks_exact(3)) {
+        for t in m.submeshes.iter().flat_map(|s| s.indices.as_chunks::<3>().0.iter()) {
             let [a, b, c] = [0, 1, 2].map(|k| m.vertices[t[k] as usize]);
             let e1: [f32; 3] = std::array::from_fn(|k| b.pos[k] - a.pos[k]);
             let e2: [f32; 3] = std::array::from_fn(|k| c.pos[k] - a.pos[k]);
@@ -140,7 +140,7 @@ fn player_tables_resolve_models_heads_and_clips() {
 #[test]
 fn players_have_skin_not_the_green_placeholder() {
     let Some(store) = store() else { return };
-    let green = |t: &ao_scene::Texture| t.rgba.chunks_exact(4).all(|p| p[..3] == [0, 255, 0]);
+    let green = |t: &ao_scene::Texture| t.rgba.as_chunks::<4>().0.iter().all(|p| p[..3] == [0, 255, 0]);
     for (breed, gender, _) in PLAYERS {
         let s = load_player_character(&store, breed, gender, 1, Some((Role::Idle, 0.0))).unwrap();
         assert!(s.instances.len() == 2, "body + head");
@@ -151,4 +151,17 @@ fn players_have_skin_not_the_green_placeholder() {
         let p = Player { breed: Breed::Solitus, gender: Gender::Male, skin, head: None };
         assert!(load_player(&store, &p, Some((Role::Walk, 0.6))).is_ok());
     }
+}
+
+#[test]
+fn limbs_stay_attached_with_the_models_own_clip_set() {
+    let Some(store) = store() else { return };
+    // 41664 `skeleton_solitus` shares the human skeleton hash but has solitus bone lengths: the `male` set fits,
+    // the athrox set (9375 `athrox_social-backflip`, 9382) tears the arms and feet off.
+    for (id, clip, ok) in [(41664, 10191, true), (41664, 9375, false), (41664, 9382, false), (5907, 10191, true), (5907, 9375, false), (5900, 9375, true)] {
+        let gap = pose_detachment(&store, id, clip, 0.6).unwrap();
+        assert_eq!(gap < 0.06, ok, "model {id} clip {clip}: gap {gap}");
+    }
+    // role lookup picks the fitting set for models no set is named after
+    assert_eq!(role_anim(&store, 41664, &Role::Walk).unwrap(), 10191);
 }
