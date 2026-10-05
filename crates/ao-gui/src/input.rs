@@ -62,4 +62,6 @@ pub enum Event {
     /// Ctrl+V pressed: the app should answer with `InputEvent::Paste`.
     PasteRequested,
     Escape { window: WindowId },
+    /// The frame's close button was clicked.
+    CloseRequested { window: WindowId },
 }

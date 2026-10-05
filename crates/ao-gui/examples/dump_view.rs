@@ -36,8 +36,8 @@ fn main() -> anyhow::Result<()> {
         }
         None => {
             let pad = 40;
-            let id = gui.open_window(&name, (pad, pad), WindowSize::Preferred)?;
-            let (ww, wh) = gui.window_size(id);
+            let id = if args.iter().any(|a| a == "--frame") { gui.open_framed_window(&name, (pad, pad), WindowSize::Preferred)? } else { gui.open_window(&name, (pad, pad), WindowSize::Preferred)? };
+            let (ww, wh) = gui.outer_size(id);
             (ww + 2 * pad as u32, wh + 2 * pad as u32)
         }
     };

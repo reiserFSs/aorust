@@ -17,6 +17,10 @@ use crate::xml;
 /// `GUIColors.xml` / `GUIConfig_c::GUIConfig_c` 0x1012f342 defaults: Default, Selected, Hover, Text,
 /// TextSelected, TextHover.
 const DEFAULT_PALETTE: [u32; 6] = [0x80e9f3, 0xffffcc, 0xa5ffdb, 0x99ccaa, 0x99ccaa, 0x99ccaa];
+const FRAME_L: i32 = 3;
+const FRAME_T: i32 = 24;
+const FRAME_R: i32 = 3;
+const FRAME_B: i32 = 3;
 /// `GUIConfig_c` layer alpha: layer 2 (used by buttons) = 0.85.
 const BUTTON_ALPHA: f32 = 0.85;
 
@@ -34,6 +38,8 @@ struct Window {
     pos: (i32, i32),
     visible: bool,
     default_button: Option<ViewId>,
+    /// Drawn inside the style-1 window frame (`open_framed_window`).
+    framed: bool,
 }
 
 /// First id handed out by `Gui::add_image` (above every skin id).
@@ -165,10 +171,33 @@ impl Gui {
         let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
         let root = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{view_name}: cannot build root"))?;
         self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{view_name}: {w}")));
-        self.windows.push(Some(Window { root, pos, visible: true, default_button: None }));
+        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false }));
         let id = self.windows.len() - 1;
         self.resize_window(id, size);
         Ok(id)
+    }
+
+    /// Opens `view_name` inside a `WndBorder` style-1 frame (GUI.dll `WndBorder::SetBorderGfx` 0x1015a82d,
+    /// `UpdateBorderSizes` 0x10159f98): outer `GFX_GUI_WINDOW3_BORDER_*` + `GFX_GUI_WINDOW_BACKGROUND`
+    /// at layer-1 alpha 0.33, inner `GFX_GUI_TAB_BORDER_*` + `GFX_GUI_TAB_BACKGROUND` (colour DEFAULT)
+    /// around the client, borders (3, 24, 3, 3), close button `GFX_GUI_WINDOW_CLOSE_X`.
+    /// `pos` is the outer top-left; `size` is the *client* size.
+    /// UNRESOLVED: title text placement, icon button visibility, exact inner-border rectangle.
+    pub fn open_framed_window(&mut self, view_name: &str, pos: (i32, i32), size: WindowSize) -> Result<WindowId> {
+        let id = self.open_window(view_name, (pos.0 + FRAME_L, pos.1 + FRAME_T), size)?;
+        if let Some(Some(w)) = self.windows.get_mut(id) {
+            w.framed = true;
+        }
+        Ok(id)
+    }
+
+    /// Outer size (client + frame) of a window in pixels.
+    pub fn outer_size(&self, w: WindowId) -> (u32, u32) {
+        let (cw, ch) = self.window_size(w);
+        match self.windows[w].as_ref() {
+            Some(win) if win.framed => (cw + (FRAME_L + FRAME_R) as u32, ch + (FRAME_T + FRAME_B) as u32),
+            _ => (cw, ch),
+        }
     }
 
     pub fn close_window(&mut self, w: WindowId) {
@@ -550,8 +579,11 @@ impl Gui {
     pub fn frame(&mut self, dt: f32) -> DrawList {
         self.time += dt;
         let mut out = DrawList::default();
-        let wins: Vec<(ViewId, (i32, i32))> = self.windows.iter().flatten().filter(|w| w.visible).map(|w| (w.root, w.pos)).collect();
-        for (root, pos) in wins {
+        let wins: Vec<(ViewId, (i32, i32), bool)> = self.windows.iter().flatten().filter(|w| w.visible).map(|w| (w.root, w.pos, w.framed)).collect();
+        for (root, pos, framed) in wins {
+            if framed {
+                self.draw_frame(root, pos, &mut out.cmds);
+            }
             self.draw_view(root, pos.0 as f32, pos.1 as f32, [255; 3], 1.0, true, &mut out.cmds);
         }
         self.draw_popup(&mut out.cmds);
@@ -869,6 +901,26 @@ impl Gui {
         Some((track, t, thumb_h))
     }
 
+    fn frame_gfx(&self, names: [&str; 9]) -> [Option<GfxId>; 9] {
+        names.map(|n| self.gfx.id(n))
+    }
+
+    /// Outer + inner frame art of a style-1 window (`pos` = client origin).
+    fn draw_frame(&mut self, root: ViewId, pos: (i32, i32), out: &mut Vec<DrawCmd>) {
+        let f = self.tree.views[root].frame;
+        let outer = Rect::new((pos.0 - FRAME_L) as f32, (pos.1 - FRAME_T) as f32, pos.0 as f32 + f.width() + FRAME_R as f32, pos.1 as f32 + f.height() + FRAME_B as f32);
+        let o = self.frame_gfx(["GFX_GUI_WINDOW3_BORDER_TL", "GFX_GUI_WINDOW3_BORDER_TR", "GFX_GUI_WINDOW3_BORDER_BL", "GFX_GUI_WINDOW3_BORDER_BR", "GFX_GUI_WINDOW3_BORDER_LEFT", "GFX_GUI_WINDOW3_BORDER_TOP", "GFX_GUI_WINDOW3_BORDER_RIGHT", "GFX_GUI_WINDOW3_BORDER_BOTTOM", "GFX_GUI_WINDOW_BACKGROUND"]);
+        self.draw_border(out, &o, outer, [255; 3], 0.33);
+        let i = self.frame_gfx(["GFX_GUI_TAB_BORDER_TL", "GFX_GUI_TAB_BORDER_TR", "GFX_GUI_TAB_BORDER_BL", "GFX_GUI_TAB_BORDER_BR", "GFX_GUI_TAB_BORDER_LEFT", "GFX_GUI_TAB_BORDER_TOP", "GFX_GUI_TAB_BORDER_RIGHT", "GFX_GUI_TAB_BORDER_BOTTOM", "GFX_GUI_TAB_BACKGROUND"]);
+        let client = Rect::new(pos.0 as f32, pos.1 as f32, pos.0 as f32 + f.width(), pos.1 as f32 + f.height());
+        let col = self.map_color(0x1000000);
+        self.draw_border(out, &i, client, col, 1.0);
+        if let Some(x) = self.gfx.id("GFX_GUI_WINDOW_CLOSE_X") {
+            let (l, t) = (outer.r - 5.0 - 14.0, outer.t + 5.0);
+            self.push_gfx(out, x, Rect::new(l, t, l + 14.0, t + 14.0), [255; 3], 1.0);
+        }
+    }
+
     fn draw_popup(&mut self, out: &mut Vec<DrawCmd>) {
         let Some(p) = &self.popup else { return };
         let (w, combo, hover) = (p.window, p.combo, p.hover);
@@ -1098,6 +1150,16 @@ impl Gui {
             }
             self.set_combo_arrow(p.combo, false);
             return;
+        }
+        for (wid, root, pos) in self.windows_top_down() {
+            if self.windows[wid].as_ref().is_some_and(|w| w.framed) {
+                let f = self.tree.views[root].frame;
+                let (r, t) = (pos.0 as f32 + f.width() + FRAME_R as f32 - 5.0, (pos.1 - FRAME_T) as f32 + 5.0);
+                if x >= r - 14.0 && x <= r && y >= t && y <= t + 14.0 {
+                    self.events.push(Event::CloseRequested { window: wid });
+                    return;
+                }
+            }
         }
         let Some((_, v)) = self.hit(x, y) else {
             self.focus = None;
