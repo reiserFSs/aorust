@@ -22,6 +22,7 @@ use anyhow::{ensure, Result};
 use ao_scene::Environment;
 
 use super::record::Rd;
+use super::sky::{Sky, ATMOSPHERE_FOG_DENSITY};
 
 /// Bytes of the on-disk `EnvironmentData_t` for `size == 30`.
 const LEN: usize = 26;
@@ -30,9 +31,9 @@ const AMBIENT: usize = 0x13;
 
 /// `ViewDistance` (far clip plane handed to `VisualFog_t::AddClipPlanes`) is a user setting that is not stored in the data;
 /// this is the value used to turn the fog density into metres.
-pub const VIEW_DISTANCE: f32 = 1000.0;
+pub(super) const VIEW_DISTANCE: f32 = 1000.0;
 /// Near clip plane = start of the linear fog.
-const NEAR: f32 = 0.5;
+pub(super) const NEAR: f32 = 0.5;
 /// Day sky (clear) colour, sRGB. The client's sky dome is time-of-day driven (`GfxVisualSkyrise`, not stored per playfield).
 const SKY_SRGB: [f32; 3] = [0.53, 0.72, 0.92];
 const SUN_DIR: [f32; 3] = [0.4, 0.8, 0.3];
@@ -72,23 +73,41 @@ fn lin(c: [u8; 3]) -> [f32; 3] {
     c.map(|b| srgb_to_linear(b as f32 / 255.0))
 }
 
-/// `Scene::environment` for a playfield. `outdoor`: sun lit terrain. Indoors the room lightmaps (`Room` lightmap,
-/// `n3Room_t::DepackLightmap` N3 @0x10010eb7) are not decoded, so the stored ambient is raised to a fill light.
-pub fn to_scene(env: &Env, outdoor: bool) -> Environment {
-    let sky = SKY_SRGB.map(srgb_to_linear);
+/// `Scene::environment` for a playfield. `outdoor`: sun lit terrain (colours from the tweak scripts in `sky`, else
+/// fixed guesses). The fog colour is the density weighted mix of the record's `AddFog` and the atmosphere's
+/// (`VisualFog_t::AddFog` @0x1005820c: `new = (d * c_new + D * c_old) / (d + D)`, `D = max`).
+pub fn to_scene(env: &Env, outdoor: bool, sky: Option<&Sky>) -> Environment {
     let fog = env.fog_color();
-    let (fog_color, density) = if fog == [0, 0, 0] || env.fog_density() <= 0.0 { (sky, 0.01) } else { (lin(fog), env.fog_density()) };
+    let (c1, d1) = if fog == [0, 0, 0] || env.fog_density() <= 0.0 { ([0.2; 3], 0.01) } else { (fog.map(|b| b as f32 / 255.0), env.fog_density()) };
+    let (fog_srgb, density) = match sky {
+        Some(s) => {
+            let d = d1 + ATMOSPHERE_FOG_DENSITY;
+            ([0, 1, 2].map(|k| (c1[k] * d1 + s.fog[k] * ATMOSPHERE_FOG_DENSITY) / d), d1.max(ATMOSPHERE_FOG_DENSITY))
+        }
+        None => (c1, d1),
+    };
+    let fog_color = fog_srgb.map(srgb_to_linear);
+    // `VisualFog_t::process`: the end only moves when far - near > 5, by (far - near - 5) * D
     let fog_end = VIEW_DISTANCE - (VIEW_DISTANCE - NEAR - 5.0) * density;
     let a = lin(env.ambient());
-    let (ambient, sun_color) = if outdoor {
-        (a, a.map(|v| 1.0 - v))
-    } else {
+    let (ambient, sun_color) = match (outdoor, sky) {
+        (true, s) => {
+            let amb = s.and_then(|s| s.ambient).map_or(a, |m| [0, 1, 2].map(|k| a[k].max(srgb_to_linear(m[k]))));
+            (amb, s.and_then(|s| s.sun).map_or(a.map(|v| 1.0 - v), |c| c.map(srgb_to_linear)))
+        }
         // `Tweak_Rubi-Ka_IndoorLight` AmbientLightCurrent 0.01 competes with the record ambient (`AddAmbientLight` keeps the
         // per-channel maximum, DisplaySystem @0x10059d2c); no sun indoors; the room lightmaps carry the lighting
-        (a.map(|v| v.max(0.01)), [0.0; 3])
+        (false, _) => (a.map(|v| v.max(0.01)), [0.0; 3]),
     };
-    let l = (SUN_DIR[0] * SUN_DIR[0] + SUN_DIR[1] * SUN_DIR[1] + SUN_DIR[2] * SUN_DIR[2]).sqrt();
-    Environment { sky_color: sky, fog_color, fog_start: NEAR, fog_end, ambient, sun_color, sun_dir: SUN_DIR.map(|v| v / l) }
+    // indoors the clear colour is black (`Tweak_BlackBackground`); outdoors the atmosphere's horizon colour
+    let sky_color = match (outdoor, sky) {
+        (true, Some(s)) => s.bottom().map(srgb_to_linear),
+        (true, None) => SKY_SRGB.map(srgb_to_linear),
+        _ => [0.0; 3],
+    };
+    let dir = sky.map_or(SUN_DIR, |s| s.sun_dir);
+    let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    Environment { sky_color, fog_color, fog_start: NEAR, fog_end, ambient, sun_color, sun_dir: dir.map(|v| v / l) }
 }
 
 #[cfg(test)]
@@ -113,7 +132,7 @@ mod tests {
         let e = parse(&mut r).unwrap();
         assert_eq!(r.o, d.len());
         assert_eq!((e.ambient(), e.fog_color(), e.fog_density()), ([50; 3], [68, 232, 107], 0.15));
-        let s = to_scene(&e, true);
+        let s = to_scene(&e, true, None);
         assert!((s.fog_end - (VIEW_DISTANCE - (VIEW_DISTANCE - NEAR - 5.0) * 0.15)).abs() < 1e-3);
         assert!(s.fog_color[1] > s.fog_color[0] && s.fog_color[1] > s.fog_color[2]);
     }
@@ -121,10 +140,10 @@ mod tests {
     #[test]
     fn black_fog_falls_back_to_default_density() {
         let e = parse(&mut Rd::new(&fixture([30; 3], [0; 3], 50), 0)).unwrap();
-        let s = to_scene(&e, true);
+        let s = to_scene(&e, true, None);
         assert!((s.fog_end - (VIEW_DISTANCE - (VIEW_DISTANCE - NEAR - 5.0) * 0.01)).abs() < 1e-3);
         assert_eq!(s.fog_color, s.sky_color);
-        assert!(to_scene(&e, false).ambient[0] >= 0.01);
+        assert!(to_scene(&e, false, None).ambient[0] >= 0.01);
     }
 
     #[test]

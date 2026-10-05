@@ -66,7 +66,7 @@ fn centre(b: &Box3) -> [f32; 3] {
 /// Outdoor / fallback spawn: eye `eye_h` above `ground(x, z)` next to the densest statel cluster,
 /// looking at the statels around it. `ground` returns `None` outside the walkable area.
 pub fn density_spawn(boxes: &[Box3], ground: &dyn Fn(f32, f32) -> Option<f32>, eye_h: f32) -> Option<Spot> {
-    let boxes: Vec<&Box3> = boxes.iter().filter(|b| (0..3).all(|i| b.1[i] - b.0[i] < MAX_EXTENT)).collect();
+    let boxes: Vec<&Box3> = boxes.iter().filter(|b| b.0.iter().chain(&b.1).all(|v| v.is_finite()) && (0..3).all(|i| b.1[i] - b.0[i] < MAX_EXTENT)).collect();
     let cen: Vec<[f32; 3]> = boxes.iter().map(|b| centre(b)).collect();
     let key = |p: &[f32; 3]| ((p[0] / BUCKET).floor() as i32, (p[2] / BUCKET).floor() as i32);
     let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -74,7 +74,7 @@ pub fn density_spawn(boxes: &[Box3], ground: &dyn Fn(f32, f32) -> Option<f32>, e
         grid.entry(key(c)).or_default().push(i);
     }
     let around = |k: (i32, i32), r: i32| -> Vec<usize> {
-        (-r..=r).flat_map(|dx| (-r..=r).map(move |dz| (k.0 + dx, k.1 + dz))).filter_map(|k| grid.get(&k)).flatten().copied().collect()
+        (-r..=r).flat_map(|dx| (-r..=r).map(move |dz| (k.0.saturating_add(dx), k.1.saturating_add(dz)))).filter_map(|k| grid.get(&k)).flatten().copied().collect()
     };
     let mut keys: Vec<_> = grid.keys().copied().collect();
     keys.sort();

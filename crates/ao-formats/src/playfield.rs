@@ -13,6 +13,7 @@ mod dungeon;
 mod environment;
 mod ground;
 mod record;
+mod sky;
 mod spawn;
 mod shadow;
 mod statel;
@@ -64,7 +65,7 @@ pub fn load_playfield(store: &RecordStore, client_dir: &Path, id: u32) -> Result
     load_playfield_report(store, client_dir, id).map(|(s, _)| s)
 }
 
-pub fn load_playfield_report(store: &RecordStore, _client_dir: &Path, id: u32) -> Result<(Scene, Report)> {
+pub fn load_playfield_report(store: &RecordStore, client_dir: &Path, id: u32) -> Result<(Scene, Report)> {
     let raw = store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?;
     let rec = record::parse(&raw)?;
     let mut scene = Scene::default();
@@ -72,7 +73,12 @@ pub fn load_playfield_report(store: &RecordStore, _client_dir: &Path, id: u32) -
     let mut tail = record::Rd::new(&raw, rec.tail);
     let waters = water::parse(&mut tail).with_context(|| format!("liquids of playfield {id}"))?;
     let env = environment::parse(&mut tail).with_context(|| format!("environment of playfield {id}"))?;
-    scene.environment = Some(environment::to_scene(&env, rec.is_outdoor()));
+    let sky = sky::Tweaks::load(client_dir, id, rec.is_outdoor()).and_then(|t| sky::Sky::new(&t));
+    let environment = environment::to_scene(&env, rec.is_outdoor(), sky.as_ref());
+    if let (Some(s), true) = (&sky, rec.is_outdoor()) {
+        sky::emit(s, store, &mut scene, environment.fog_color, environment.fog_end);
+    }
+    scene.environment = Some(environment);
     let mut report = Report::default();
     let mut spot = None;
     let mut terrain = None;
