@@ -242,7 +242,7 @@ The client has **no sky data in the playfield records**: the sky is a set of FXS
 | statels with attributes (texture overrides) | 108 863 (5 414 variants) | **now applied** (before: placeholder `primitive_default0N.png` / default rock) |
 | mesh→texture references (1010001) | 30 138 | 0 missing, 0 undecodable, 0 "Error" placeholder images |
 | mesh→texture references (1010026 LOD proxies) | 2 294 | 1 missing (1010004/162878; the proxies are used by the statel LOD, `add_lod`) |
-| scene submeshes in all playfields | 786 633 | 2 596 untextured with white diffuse (plain white materials of the data, e.g. 61 materials without texture channel, 27 emissive white), 0 error-texture; flat-colour untextured submeshes are intentional |
+| scene submeshes in all playfields | 786 633 | 2 596 untextured (`world_audit` at 6b3723c; the 283 / 61 / 27 breakdown of the older 767 998 run was not re-derived), 0 error-texture; flat-colour untextured submeshes are intentional |
 | statel lights | 8 278 (310 playfields) | drawn (*Statel lights*) |
 | fog volumes | 314 (42 playfields) | **now applied** (`Scene::fog_model`); the sky dome is fogged live with the same model (`Submesh::sky_fog`) |
 | sound emitters | 1 362 (55 ids) | exposed (`Report::sounds`, Audio) |
