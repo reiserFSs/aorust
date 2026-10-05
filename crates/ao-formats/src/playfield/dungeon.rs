@@ -152,13 +152,13 @@ pub(super) fn parse_gnda(d: &[u8]) -> Result<Gnda> {
                     let end = rest.windows(8).position(|x| x == b"IEND\xae\x42\x60\x82").ok_or_else(|| anyhow!("unterminated layer png"))? + 8;
                     let take = (g.layers - base).min(3);
                     let px = png(&rest[..end], w, h, 3)?;
-                    for (i, c) in px.chunks_exact(3).enumerate() {
+                    for (i, c) in px.as_chunks::<3>().0.iter().enumerate() {
                         g.layer[i * g.layers + base..i * g.layers + base + take].copy_from_slice(&c[..take]);
                     }
                     rest = &rest[end..];
                 }
             }
-            b"IRHA" => g.doors = body.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(),
+            b"IRHA" => g.doors = body.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect(),
             _ => {} // HSTA (tile heights): not needed for the shell
         }
         r.o = (start + size + (4 - (size & 3)) % 4).min(d.len()); // sections are padded to 4 bytes (by size)
@@ -513,7 +513,7 @@ impl Builder<'_> {
             let remap = weld_block(&mut self.out, &mut block);
             // z is mirrored: reverse the winding
             let idx = self.out.by_tex.entry(mat).or_default();
-            for t in tris.chunks_exact(3) {
+            for t in tris.as_chunks::<3>().0 {
                 let [a, b, c] = [remap[t[0] as usize], remap[t[2] as usize], remap[t[1] as usize]];
                 if a != b && b != c && a != c {
                     idx.extend([a, b, c]);
@@ -676,7 +676,7 @@ fn depack_lightmap(count: u32, z: &[u8]) -> Option<Vec<[u8; 3]>> {
     if raw.len() < count as usize * 2 {
         return None;
     }
-    Some(raw.chunks_exact(2).take(count as usize).map(|c| {
+    Some(raw.as_chunks::<2>().0.iter().take(count as usize).map(|c| {
         let v = u16::from_le_bytes([c[0], c[1]]);
         [((v & 0x1f) << 3) as u8, ((v >> 5 & 0x3f) << 2) as u8, (v >> 8 & 0xf8) as u8]
     }).collect())
@@ -751,9 +751,9 @@ fn material_texture(store: &RecordStore, textures: &mut HashMap<TextureKey, Text
     }
     let (ty, id) = if m & 0x8000_0000 != 0 { (OBJECT_TEXTURES, m & 0x7fff_ffff) } else { (DUNGEON_TEXTURES, m) };
     let key = TextureKey { rdb_type: ty, id };
-    if !textures.contains_key(&key) {
+    if let std::collections::hash_map::Entry::Vacant(e) = textures.entry(key) {
         let tex = store.get(ty, id).ok()??;
-        textures.insert(key, crate::texture::decode_texture(&tex).ok()?);
+        e.insert(crate::texture::decode_texture(&tex).ok()?);
     }
     Some(key)
 }
@@ -938,7 +938,7 @@ mod tests {
         assert!(mesh.vertices.iter().any(|v| (v.pos[1] - 9.0).abs() < 1e-4), "ceiling at y = 4");
         // right-handed CCW normal of every floor triangle points up
         for s in &mesh.submeshes {
-            for t in s.indices.chunks_exact(3) {
+            for t in s.indices.as_chunks::<3>().0 {
                 let p = |i: u32| mesh.vertices[i as usize].pos;
                 let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
                 if (a[1] - 5.0).abs() < 1e-4 && (b[1] - 5.0).abs() < 1e-4 && (c[1] - 5.0).abs() < 1e-4 {

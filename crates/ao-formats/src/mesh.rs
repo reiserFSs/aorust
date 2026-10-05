@@ -75,7 +75,7 @@ const CUTOUT_PARTIAL_MAX: f32 = 0.02;
 
 /// True for a texture whose alpha is (almost) only 0 or 255.
 fn is_cutout(t: &Texture) -> bool {
-    let partial = t.rgba.chunks_exact(4).filter(|p| (16..240).contains(&p[3])).count();
+    let partial = t.rgba.as_chunks::<4>().0.iter().filter(|p| (16..240).contains(&p[3])).count();
     (partial as f32) <= CUTOUT_PARTIAL_MAX * (t.rgba.len() / 4) as f32
 }
 
@@ -274,7 +274,7 @@ impl Builder<'_, '_> {
             self.mesh.submeshes.push(Submesh { blend: key.blend, two_sided: key.two_sided, base_color: key.color, emissive: key.emissive, glow_mask: key.glow_mask, ..Submesh::new(vec![], key.texture) });
             self.mesh.submeshes.len() - 1
         });
-        for t in tris.chunks_exact(6) {
+        for t in tris.as_chunks::<6>().0 {
             let ix: [u32; 3] = std::array::from_fn(|k| u16::from_le_bytes([t[2 * k], t[2 * k + 1]]) as u32);
             if ix.iter().any(|&i| i as usize >= count) {
                 bail!("triangle index out of range (vertex count {count})");
@@ -289,7 +289,7 @@ impl Builder<'_, '_> {
 /// Texture-stage state `ty` of `stage` in a `RDeltaState` (`tstm_count` entries per stage, then
 /// `tst_type`/`tst_value` pairs, each member holding all elements; last write wins).
 fn tss(ds: &Object, stage: usize, ty: i32) -> Option<i32> {
-    let ints = |n: &str| ds.all(n).flat_map(|d| d.chunks_exact(4)).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>();
+    let ints = |n: &str| ds.all(n).flat_map(|d| d.as_chunks::<4>().0.iter()).map(|c| i32::from_le_bytes(*c)).collect::<Vec<_>>();
     let (counts, types, values) = (ints("tstm_count"), ints("tst_type"), ints("tst_value"));
     let first: usize = counts.get(..stage)?.iter().map(|&c| c as usize).sum();
     let n = *counts.get(stage)? as usize;

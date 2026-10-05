@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     }
     println!("ok={ok} failed={failed} statels={statels} instances={instances} statels-without-mesh={missing} mesh-decode-failures={mesh_fail}");
     println!("spawn checks: {} ok, {} failed, {} empty playfields (no rooms/statels in the data: {empty:?})", ok - spawn_bad.len() - empty.len(), spawn_bad.len(), empty.len());
-    lit.sort_by(|a, b| b.0.cmp(&a.0));
+    lit.sort_by_key(|a| std::cmp::Reverse(a.0));
     println!("lights: {light_total} in {} playfields; most: {:?}", lit.len(), &lit[..lit.len().min(8)]);
     if !only.is_empty() {
         println!("per playfield (count, id): {lit:?}");

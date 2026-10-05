@@ -138,7 +138,7 @@ pub fn scene_light(l: &Light, frame: Option<([[f32; 3]; 3], [f32; 3])>) -> Optio
     let inv = |d: f32| (l.att[0] + d * (l.att[1] + d * l.att[2])).recip();
     const N: usize = 256;
     let step = l.range / N as f32;
-    let reach = (0..=N).map(|i| i as f32 * step).find(|&d| !(inv(d) >= FAINT)).unwrap_or(l.range);
+    let reach = (0..=N).map(|i| i as f32 * step).find(|&d| inv(d).partial_cmp(&FAINT).is_none_or(|o| o.is_lt())).unwrap_or(l.range);
     if reach <= 0.0 {
         return None;
     }

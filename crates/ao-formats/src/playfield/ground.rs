@@ -161,7 +161,7 @@ pub fn parse(d: &[u8]) -> Result<Tilemap> {
             8 => {
                 wide = true;
                 let raw = inflate(h, 2 * s * s)?;
-                for (o, c) in a.iter_mut().zip(raw.chunks_exact(2)) {
+                for (o, c) in a.iter_mut().zip(raw.as_chunks::<2>().0) {
                     *o = u16::from_le_bytes([c[0], c[1]]);
                 }
             }

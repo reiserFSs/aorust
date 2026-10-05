@@ -38,8 +38,8 @@ pub fn transform_box(b: &Box3, t: &[[f32; 4]; 4]) -> Box3 {
     let mut out = ([f32::MAX; 3], [f32::MIN; 3]);
     for c in 0..8 {
         let p = [if c & 1 == 0 { b.0[0] } else { b.1[0] }, if c & 2 == 0 { b.0[1] } else { b.1[1] }, if c & 4 == 0 { b.0[2] } else { b.1[2] }];
-        for i in 0..3 {
-            let v = t[0][i] * p[0] + t[1][i] * p[1] + t[2][i] * p[2] + t[3][i];
+        for (i, &t3) in t[3].iter().enumerate().take(3) {
+            let v = t[0][i] * p[0] + t[1][i] * p[1] + t[2][i] * p[2] + t3;
             out.0[i] = out.0[i].min(v);
             out.1[i] = out.1[i].max(v);
         }
@@ -129,7 +129,7 @@ pub fn floor_below(scene: &Scene, p: [f32; 3]) -> Option<f32> {
     for inst in scene.instances.iter().filter(|i| i.transform == ao_scene::IDENTITY) {
         let m = &scene.meshes[inst.mesh];
         for s in &m.submeshes {
-            for t in s.indices.chunks_exact(3) {
+            for t in s.indices.as_chunks::<3>().0 {
                 let [a, b, c] = [t[0], t[1], t[2]].map(|i| m.vertices[i as usize].pos);
                 // barycentric in xz
                 let d = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);

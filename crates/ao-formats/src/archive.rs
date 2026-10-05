@@ -113,14 +113,14 @@ impl<'a> Object<'a> {
     pub fn f32s<const N: usize>(&self, name: &str) -> Option<[f32; N]> {
         let d = self.get(name)?.get(..4 * N)?;
         let mut out = [0f32; N];
-        for (o, c) in out.iter_mut().zip(d.chunks_exact(4)) {
-            *o = f32::from_le_bytes(c.try_into().unwrap());
+        for (o, c) in out.iter_mut().zip(d.as_chunks::<4>().0) {
+            *o = f32::from_le_bytes(*c);
         }
         Some(out)
     }
     /// Object references of a member (one `obj`-typed member holds `n` refs); null refs are dropped.
     pub fn refs(&self, name: &str) -> Vec<usize> {
-        self.all(name).flat_map(|d| d.chunks_exact(4)).filter_map(|c| usize::try_from(i32::from_le_bytes(c.try_into().unwrap())).ok()).collect()
+        self.all(name).flat_map(|d| d.as_chunks::<4>().0.iter()).filter_map(|c| usize::try_from(i32::from_le_bytes(*c)).ok()).collect()
     }
     pub fn ref1(&self, name: &str) -> Option<usize> {
         self.refs(name).first().copied()

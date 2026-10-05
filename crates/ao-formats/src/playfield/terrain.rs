@@ -34,10 +34,10 @@ const NONE: u16 = u16::MAX;
 
 fn texture_key(store: &RecordStore, scene: &mut Scene, id: u16) -> Option<TextureKey> {
     let key = TextureKey { rdb_type: TILE_TEXTURES, id: id as u32 };
-    if !scene.textures.contains_key(&key) {
+    if let std::collections::hash_map::Entry::Vacant(e) = scene.textures.entry(key) {
         let b = store.get(TILE_TEXTURES, id as u32).ok()??;
         // 24 zero bytes, then a JPEG (417 tiles) or an RGBA PNG (432 Shadowlands tiles, alpha always 255)
-        scene.textures.insert(key, crate::texture::decode_texture(b.get(24..)?).ok()?);
+        e.insert(crate::texture::decode_texture(b.get(24..)?).ok()?);
     }
     Some(key)
 }
@@ -112,8 +112,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene) -> R
         for px in (0..cx).step_by(PATCH) {
             let (ex, ez) = ((px + PATCH).min(cx), (pz + PATCH).min(cz));
             let (nx, nz) = (ex - px + 1, ez - pz + 1);
-            let mut mesh = Mesh::default();
-            mesh.vertices = (0..nz).flat_map(|j| (0..nx).map(move |i| (i, j))).map(|(i, j)| vertex(px + i, pz + j, 1.0, 0.0)).collect();
+            let mut mesh = Mesh { vertices: (0..nz).flat_map(|j| (0..nx).map(move |i| (i, j))).map(|(i, j)| vertex(px + i, pz + j, 1.0, 0.0)).collect(), ..Default::default() };
             let mut base: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
             let mut over: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
             for z in pz..ez {
