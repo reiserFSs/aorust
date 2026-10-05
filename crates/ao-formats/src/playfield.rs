@@ -116,7 +116,10 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
         s.set_weather(sky::weather_at(&env, day_time));
         s
     });
-    let environment = environment::to_scene(&env, rec.is_outdoor(), sky.as_ref());
+    let mut environment = environment::to_scene(&env, rec.is_outdoor(), sky.as_ref());
+    if let Some(c) = tweaks.as_ref().and_then(sky::clear_color) {
+        environment.sky_color = c.map(environment::srgb_to_linear);
+    }
     if let (Some(s), Some(t), true) = (&sky, &tweaks, rec.is_outdoor()) {
         sky::emit(s, t, store, &mut scene, environment.fog_color, environment.fog_end);
         sky::emit_distant(t, store, &mut scene, day_time);

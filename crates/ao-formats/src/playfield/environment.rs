@@ -115,8 +115,10 @@ pub fn to_scene(env: &Env, outdoor: bool, sky: Option<&Sky>) -> Environment {
         // per-channel maximum, DisplaySystem @0x10059d2c); no sun indoors; the room lightmaps carry the lighting
         (false, _) => (a.map(|v| v.max(0.01)), [0.0; 3]),
     };
-    // indoors the clear colour is black (`Tweak_BlackBackground`); outdoors it is the fog colour: everything at the far
-    // distance, the dome's lowest ring included, is fully fogged, so the clear colour must equal it (no band below the horizon)
+    // the client never clears the colour buffer per frame; only an `e_ClearScreen` tweak object paints the background (applied by
+    // the loader through `sky::clear_color`, docs *Clear colour*). Without one (Rubi-Ka outdoors) the uncovered pixels are
+    // whatever the previous frame left, which cannot be reproduced: outdoors we use the fog colour (everything at the far
+    // distance, the dome's lowest ring included, is fully fogged, so no band shows below the horizon), indoors black [GUESS]
     let sky_color = match (outdoor, sky) {
         (true, Some(_)) => fog_color,
         (true, None) => SKY_SRGB.map(srgb_to_linear),

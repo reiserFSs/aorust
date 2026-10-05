@@ -339,6 +339,20 @@ pub fn emit(sky: &Sky, tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut
     layers::emit(sky, &tweaks.objects(), store, scene, sky.dome(), layers::Fog { color: fog_color, start: super::environment::NEAR, end: fog_end });
 }
 
+/// `Color` (sRGB) of the playfield's `e_ClearScreen` object (`Tweak_BlackBackground`, `Color 0xFFFF0000`, included by
+/// `Tweak_Playfield_IndoorDefault` and a few others): the client never clears the colour buffer per frame (the `DisplaySystem`
+/// frame functions pass the clear flag only for the `ToggleClearViewPort` debug toggle and the S3 driver quirk
+/// `Randy_t::NeedsClearFix`), so this full-screen quad is the only background there is. It is a pre-transformed quad
+/// (`FUN_10056f10`: x, y, z = 0.1, rhw = 10, diffuse = `Color`, `FUN_100570db` draws it with `ZFUNC ALWAYS`); its `FOGENABLE`
+/// has no effect because the fog starts at the near plane, beyond the quad's depth 0.1 [INFERENCE]. The colour is therefore the
+/// ARGB value as is: red, whatever the file name says. `None`: no such object, see docs *Clear colour*.
+pub fn clear_color(t: &Tweaks) -> Option<[f32; 3]> {
+    t.objects().iter().find(|o| o.fxid() == "ClearScreen").and_then(|o| {
+        let c = u32::from_str_radix(o.field("Color")?.trim().trim_start_matches("0x"), 16).ok()?;
+        Some([16, 8, 0].map(|s| (c >> s & 255) as f32 / 255.0))
+    })
+}
+
 /// Re-evaluates an outdoor playfield's sky, fog tint and sun/ambient light at any `day_time` (the live time-of-day mode of the
 /// viewer). Textures already handed out are not sent again, so a long run only ships the vertex colours that change.
 pub struct SkyClock {
@@ -370,7 +384,8 @@ impl SkyClock {
         let mut scene = Scene::default();
         let Some(mut sky) = Sky::new(&self.tweaks, day_time) else { return scene };
         sky.set_weather(weather_at(&self.env, day_time));
-        let environment = super::environment::to_scene(&self.env, true, Some(&sky));
+        let mut environment = super::environment::to_scene(&self.env, true, Some(&sky));
+        environment.sky_color = clear_color(&self.tweaks).map_or(environment.sky_color, |c| c.map(srgb_to_linear));
         emit(&sky, &self.tweaks, &self.store, &mut scene, environment.fog_color, environment.fog_end);
         scene.fog_model = Some(super::environment::fog_model(&self.env, Some(&sky), vec![]));
         scene.environment = Some(environment);
@@ -468,6 +483,17 @@ mod tests {
         assert!(drifting <= 1, "only ThickClouds scrolls");
         let (e1, e2) = (noon.environment.unwrap(), night.environment.unwrap());
         assert!(e1.sun_dir[1] > 0.3 && e2.sun_dir[1] < -0.3, "{:?} {:?}", e1.sun_dir, e2.sun_dir);
+    }
+
+    #[test]
+    fn clear_screen_object_gives_the_background_colour() {
+        let t = Tweaks("Object S\n{\n  Unsigned FXID: e_ClearScreen\n  Unsigned Color: 0xFFFF0000\n}\n".into());
+        assert_eq!(clear_color(&t), Some([1.0, 0.0, 0.0]));
+        assert_eq!(clear_color(&Tweaks("Object A\n{\n  Unsigned FXID: e_GenericMeshObject\n}\n".into())), None);
+        if let (Some(indoor), Some(rk)) = (real_tweaks(125), real_tweaks(566)) {
+            assert_eq!(clear_color(&indoor), Some([1.0, 0.0, 0.0]), "Tweak_BlackBackground");
+            assert_eq!(clear_color(&rk), None, "Rubi-Ka outdoors has no ClearScreen");
+        }
     }
 
     #[test]
