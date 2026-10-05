@@ -17,7 +17,7 @@ pub use geom::{Point, Rect};
 pub use gfx::{Atlas, AtlasEntry, GfxId, GfxSet};
 pub use gui::{ExtraImage, Gui, Localize, WindowSize, EXTRA_BASE};
 pub use input::{Event, InputEvent, Key, Modifiers, MouseButton, ViewHandle, WindowId};
-pub use view::tvf;
+pub use view::{tvf, CanvasItem};
 
 use std::path::PathBuf;
 
