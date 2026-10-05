@@ -285,18 +285,33 @@ pub struct FogModel {
     /// View distance (fog end at density 0).
     pub far: f32,
     pub volumes: Vec<FogVolume>,
-    /// Dungeon rooms as `(AO world centre [x, z], half extents)`, index = room; empty outdoors. The client evaluates a room's
-    /// fog/sound lists only while `n3RoomMonitor_t` has the room enabled (N3 `RunFunction` @0x100260d2): here the camera's
-    /// room, found like `n3Playfield_t::PosToRoom` (first room containing the point, else room 0). Rooms that are also
+    /// Dungeon room lookup (`None` outdoors). The client evaluates a room's fog/sound lists only while `n3RoomMonitor_t`
+    /// has the room enabled (N3 `RunFunction` @0x100260d2): here the camera's room, found like
+    /// `n3Playfield_t::PosToRoom` (first room whose `IsPosInside` holds, else room 0). Rooms that are also
     /// enabled through open doors depend on the server's door state and are not modelled.
-    pub rooms: Vec<([f32; 2], [f32; 2])>,
+    pub rooms: Option<RoomLocator>,
+}
+
+/// Scene-space position -> first dungeon room containing it (`n3Room_t::IsPosInside`), supplied by the loader.
+#[derive(Clone)]
+pub struct RoomLocator(pub std::sync::Arc<dyn Fn([f32; 3]) -> Option<usize> + Send + Sync>);
+
+impl std::fmt::Debug for RoomLocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RoomLocator")
+    }
+}
+
+impl PartialEq for RoomLocator {
+    fn eq(&self, o: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &o.0)
+    }
 }
 
 impl FogModel {
-    /// Room containing scene-space `p` (x/z test only); `None` outdoors.
+    /// Room containing scene-space `p` (room 0 when none does); `None` outdoors.
     pub fn camera_room(&self, p: [f32; 3]) -> Option<usize> {
-        let (x, z) = (p[0], -p[2]);
-        (!self.rooms.is_empty()).then(|| self.rooms.iter().position(|(c, h)| x >= c[0] - h[0] && x < c[0] + h[0] && z >= c[1] - h[1] && z < c[1] + h[1]).unwrap_or(0))
+        self.rooms.as_ref().map(|r| (r.0)(p).unwrap_or(0))
     }
 
     /// Fog at camera position `p`: `(linear RGB, fog end in metres)`. `AddFog` keeps a weighted mean
@@ -341,7 +356,7 @@ mod tests {
     }
 
     fn model() -> FogModel {
-        FogModel { base_color: [0.2; 3], base_density: 0.1, near: 0.5, far: 800.0, volumes: vec![FogVolume { pos: [0.0; 3], color: [1.0, 0.0, 0.0], density: 0.9, radius: 100.0, room: None }], rooms: vec![] }
+        FogModel { base_color: [0.2; 3], base_density: 0.1, near: 0.5, far: 800.0, volumes: vec![FogVolume { pos: [0.0; 3], color: [1.0, 0.0, 0.0], density: 0.9, radius: 100.0, room: None }], rooms: None }
     }
 
     #[test]
@@ -372,8 +387,8 @@ mod tests {
             near: 0.5,
             far: 800.0,
             volumes: vec![vol(Some(1), 100.0)],
-            // room 0 around x = 0, room 1 around x = 100 (z mirrored: scene z = -world z)
-            rooms: vec![([0.0, 0.0], [20.0, 20.0]), ([100.0, 0.0], [20.0, 20.0])],
+            // room 0 around x = 0, room 1 around x = 100
+            rooms: Some(RoomLocator(std::sync::Arc::new(|p| [0.0f32, 100.0].iter().position(|c| (p[0] - c).abs() < 20.0)))),
         };
         let base_end = m.at([0.0, 0.0, 0.0]).1;
         assert_eq!(m.camera_room([100.0, 0.0, 0.0]), Some(1));

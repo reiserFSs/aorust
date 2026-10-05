@@ -25,6 +25,10 @@ fn dungeon_spawn_is_inside_its_room() {
         if zl.room_at(spawn).is_some() {
             inside += 1;
         }
+        // the fog model finds the camera's room with the same IsPosInside test
+        if let Some(m) = &scene.fog_model {
+            assert_eq!(m.camera_room(spawn), Some(zl.room_at(spawn).unwrap_or(0)), "playfield {id}");
+        }
     }
     eprintln!("dungeon entry spots inside a room (IsPosInside): {inside}/{total}");
     assert!(total > 200 && inside == total, "{inside}/{total}");

@@ -59,22 +59,6 @@ fn rotate(v: [f32; 2], rot: u8) -> [f32; 2] {
     [v[0] * c + v[1] * s, -v[0] * s + v[1] * c]
 }
 
-/// Half extents of the room rectangle (2 m per dungeon tile, swapped for odd quarter turns).
-fn room_half(rect: [u16; 4], rot: u8) -> [f32; 2] {
-    let (w, d) = ((rect[2] - rect[0]) as f32, (rect[3] - rect[1]) as f32);
-    if rot & 1 == 1 {
-        [d, w]
-    } else {
-        [w, d]
-    }
-}
-
-/// Room rectangles as `(AO world centre [x, z], half extents)`: the plain box approximation used for
-/// `ao_scene::FogModel::rooms` (the exact audio test is [`room_contains`]).
-pub(super) fn room_boxes(rooms: &[record::Room]) -> Vec<([f32; 2], [f32; 2])> {
-    rooms.iter().map(|r| ([r.pos[0], r.pos[2]], room_half(r.rect, r.rot))).collect()
-}
-
 /// `n3Room_t::IsPosInside` (N3 @0x10011664) for an AO world position: (1) x/z inside the room rectangle
 /// (`GetRoomRect` @0x100101cb: `(x2-x1)*2 m` by `(z2-z1)*2 m`, swapped for odd `rot`, origin `pos - rotate(W'+1, H'+1)` plus
 /// the rot dependent shifts, both ends inclusive; `W' = (((x2-x1)-1) & !1) + 1`), (2) the tile under the position

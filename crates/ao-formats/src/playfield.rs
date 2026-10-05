@@ -205,7 +205,7 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
         if !report.fogs.is_empty() {
             let volumes = report.fogs.clone();
             let mut model = environment::fog_model(&env, sky.as_ref(), volumes);
-            model.rooms = if rec.is_outdoor() { vec![] } else { zone::room_boxes(&rec.rooms) };
+            model.rooms = (!rec.is_outdoor()).then(|| zone_locator(store, id).ok()).flatten().map(|zl| ao_scene::RoomLocator(std::sync::Arc::new(move |p| zl.room_at(p))));
             scene.fog_model = Some(model);
         }
         props = file.zones.iter().map(|z| z.statels.iter().filter(|s| s.mesh != 0).map(|s| s.pos).collect()).collect();
