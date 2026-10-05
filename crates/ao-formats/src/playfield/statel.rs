@@ -124,7 +124,7 @@ const FAINT: f32 = 0.05;
 ///   `range == 0` are culled by `RVisual_t::CullLights` (`0 < dvRange` test) -> `None`.
 /// * D3D7 intensity is `1/(a0 + a1 d + a2 d^2)` up to `range`. The effective range is where it drops below
 ///   [`FAINT`] (at most `range`); the peak `k` is the least-squares fit of `k (1 - d/R)` to `min(1, I(d))`
-///   (the framebuffer saturates at 1). The client does its light maths on gamma values, so the colour is
+///   capped at 1 (the framebuffer saturates). The client does its light maths on gamma values, so the colour is
 ///   `(k * rgb/255)^2.2` like the ambient colour.
 /// * Spots (type 4) become point lights: the contract has no cones, so the light is moved along its axis
 ///   by `R/2 (1 - sin(half angle))` (wide cones stay put, narrow ones light the area in front) and its range
@@ -143,7 +143,7 @@ pub fn scene_light(l: &Light, frame: Option<([[f32; 3]; 3], [f32; 3])>) -> Optio
         return None;
     }
     // k = 3 * integral_0^1 (1 - x) min(1, I(xR)) dx  (midpoint rule)
-    let k = 3.0 * (0..N).map(|i| { let x = (i as f32 + 0.5) / N as f32; (1.0 - x) * inv(x * reach).min(1.0) }).sum::<f32>() / N as f32;
+    let k = (3.0 * (0..N).map(|i| { let x = (i as f32 + 0.5) / N as f32; (1.0 - x) * inv(x * reach).min(1.0) }).sum::<f32>() / N as f32).min(1.0);
     let mut pos = l.pos;
     let mut range = reach;
     if l.kind & 0x1f == 4 {
@@ -344,10 +344,10 @@ mod tests {
         assert!(scene_light(&l(0x82, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), None).is_none());
         assert!(scene_light(&l(2, 0.0, [1.0, 0.0, 0.0], [0.0; 2]), None).is_none());
         assert!(scene_light(&l(1, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), None).is_none());
-        // constant intensity 1 inside the range: ramp fit k = 3 * integral (1-x) = 1.5; z is mirrored
+        // constant intensity 1 inside the range: ramp fit 1.5 capped to 1; z is mirrored
         let p = scene_light(&l(2, 10.0, [1.0, 0.0, 0.0], [0.0; 2]), None).unwrap();
         assert_eq!((p.pos, p.range), ([1.0, 2.0, -3.0], 10.0));
-        assert!((p.color[0] - 1.5f32.powf(2.2)).abs() < 1e-3 && p.color[1] == 0.0);
+        assert!((p.color[0] - 1.0).abs() < 1e-3 && p.color[1] == 0.0);
         // faint beyond 1/(1+d) < 0.05 -> reach 19 m even though range is 100
         let q = scene_light(&l(2, 100.0, [1.0, 1.0, 0.0], [0.0; 2]), None).unwrap();
         assert!((q.range - 19.0).abs() < 0.5);
