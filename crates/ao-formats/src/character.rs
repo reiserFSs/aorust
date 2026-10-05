@@ -336,6 +336,12 @@ fn submesh_for(mat: &Material, tex: Option<(TextureKey, &ao_scene::Texture)>) ->
         Some(_) => [1.0, 1.0, 1.0, mat.opacity],
         None => [linear(mat.diffuse[0]), linear(mat.diffuse[1]), linear(mat.diffuse[2]), mat.opacity],
     };
+    // `RMaterial_t::UpdateSpecular` @10040ff8 (ctor): SPECULARENABLE (29) = spec != black && shin_str > 0 && shin >= 0;
+    // `_D3DMATERIAL7.specular` = spec * shin_str, power = shin (`InitD3DMaterial` @100409c6).
+    if mat.specular != [0.0; 3] && mat.shininess_strength > 0.0 && mat.shininess >= 0.0 {
+        s.specular = mat.specular.map(|c| linear(c * mat.shininess_strength));
+        s.shininess = mat.shininess;
+    }
     s
 }
 

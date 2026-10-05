@@ -23,6 +23,7 @@ const D3DRS_DESTBLEND: i32 = 20;
 const D3DRS_CULLMODE: i32 = 22;
 const D3DRS_ALPHATESTENABLE: i32 = 15;
 const D3DRS_ALPHABLENDENABLE: i32 = 27;
+const D3DRS_SPECULARENABLE: i32 = 29;
 const D3DTSS_COLOROP: i32 = 1;
 const D3DTSS_COLORARG1: i32 = 2;
 const D3DTOP_ADD: i32 = 7;
@@ -165,14 +166,16 @@ struct MatKey {
     color: [f32; 4],
     emissive: [f32; 3],
     glow_mask: bool,
+    specular: [f32; 3],
+    shininess: f32,
 }
 
-type MatId = (Option<TextureKey>, u8, bool, [u32; 4], [u32; 3], bool);
+type MatId = (Option<TextureKey>, u8, bool, [u32; 4], [u32; 3], bool, [u32; 3], u32);
 
 impl MatKey {
     /// Hashable identity (`Blend` and `f32` are not `Hash`).
     fn id(&self) -> MatId {
-        (self.texture, self.blend as u8, self.two_sided, self.color.map(f32::to_bits), self.emissive.map(f32::to_bits), self.glow_mask)
+        (self.texture, self.blend as u8, self.two_sided, self.color.map(f32::to_bits), self.emissive.map(f32::to_bits), self.glow_mask, self.specular.map(f32::to_bits), self.shininess.to_bits())
     }
 }
 
@@ -284,7 +287,12 @@ impl Builder<'_, '_> {
             && tex.is_some()
             && stage0(D3DTSS_COLOROP) == Some(D3DTOP_ADD)
             && stage0(D3DTSS_COLORARG1).is_some_and(|v| v & D3DTA_ALPHAREPLICATE != 0);
-        MatKey { texture: tex, blend, two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [lin(r), lin(g), lin(b), a], emissive, glow_mask }
+        // `_D3DMATERIAL7.specular` = spec * shin_str, power = shin (`InitD3DMaterial` @100409c6); only drawn with SPECULARENABLE (29).
+        let spec = mat.and_then(|m| m.f32s::<3>("spec")).unwrap_or([0.0; 3]);
+        let strength = mat.and_then(|m| m.f32s::<1>("shin_str")).map_or(0.0, |v| v[0]);
+        let shininess = mat.and_then(|m| m.f32s::<1>("shin")).map_or(0.0, |v| v[0]);
+        let (specular, shininess) = if state(D3DRS_SPECULARENABLE) == Some(1) { (spec.map(|c| lin(c * strength)), shininess) } else { ([0.0; 3], 0.0) };
+        MatKey { texture: tex, blend, two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [lin(r), lin(g), lin(b), a], emissive, glow_mask, specular, shininess }
     }
 
     fn simple_mesh(&mut self, node_ds: Option<&Object>, sm: &Object, world: &Mat) -> Result<()> {
@@ -327,7 +335,7 @@ impl Builder<'_, '_> {
             }
         }
         let sub = *self.groups.entry(key.id()).or_insert_with(|| {
-            self.mesh.submeshes.push(Submesh { blend: key.blend, two_sided: key.two_sided, base_color: key.color, emissive: key.emissive, glow_mask: key.glow_mask, ..Submesh::new(vec![], key.texture) });
+            self.mesh.submeshes.push(Submesh { blend: key.blend, two_sided: key.two_sided, base_color: key.color, emissive: key.emissive, glow_mask: key.glow_mask, specular: key.specular, shininess: key.shininess, ..Submesh::new(vec![], key.texture) });
             self.mesh.submeshes.len() - 1
         });
         for t in tris.as_chunks::<6>().0 {

@@ -134,17 +134,14 @@ lit by (a) the device state that `Randy_t`'s reset leaves and (b) the lights sto
   Σ diffuse_mat · Ld · max(N·L, 0) · atten`, clamped to 1 after the sum, × texture. Every mesh node of the backdrop carries the render states 145 = 146 = 147 = 0 (material
   source) and 148 = 1 (`COLOR1`); the vertex format (FVF 0x112) has no colour, and a colour source whose vertex colour is absent falls back to the material (D3D9 documentation of
   `DIFFUSEMATERIALSOURCE`; **[INFERENCE]** that D3D7 does the same), so the material's own `diff` / `emis` are the diffuse / emissive terms — exactly what the loader already
-  uses (`base_color`, `emissive`; the floor material `grey-shit` has `diff` 0.32). `ao-render` evaluates this per pixel (clamp after the sum, same attenuation and range cut) instead of per vertex.
+  uses (`base_color`, `emissive`; the floor material `grey-shit` has `diff` 0.32). `ao-render` now evaluates this per vertex exactly like D3D7 (`docs/formats.md` *Vertex lighting*).
 * Implemented: `ao_formats::mesh::decode_mesh_lights` (the `RLight_t` nodes → `ao_scene::Light`, Z mirrored, colour `diffuse^2.2` like the statel lights, black lights dropped),
   `screens::login_environment()` (ambient 0, no sun, fog off, clear (0,0,0.2)), `screens::set_login_stage` (moves meshes *and* lights, `SetStage`), used by
   `login_world_scene`, `aomac play` (`show_backdrop`, `tick_preview`) and the `login_shot` example. Before this change the backdrop was drawn with the renderer's default
   environment (ambient 0.35/0.38/0.45, a warm sun, vertical 60°): the hall looked evenly white-grey. With the engine's values only the two coloured point lights
   shine (mint, warm white): walls are tinted by the light they face, surfaces turned away from both lights are black (no ambient), the view is narrower vertically
   (horizontal 60°). Checked with `login_shot` renders of both versions (`/tmp` PNGs, not committed) and the `aomac play --fake-charlist` window.
-* **Not reproduced — specular**: 9 of main's materials set `SPECULARENABLE` = 1 (`hull default`, `tech plated`, `grey-shit` = the floor, …) with `spec` 0.9, `shin` 10–25 and
-  `SPECULARMATERIALSOURCE` = material; D3D7 would add `Cs · Ls · (N·H)^power · atten` (`LOCALVIEWER` = 1, light specular = diffuse colour, material specular =
-  `spec × shin_str`, `RMaterial_t::InitD3DMaterial` 0x100409c6, power `shin`) after the texture stage. `ao-render` has no specular path (a renderer-wide limitation, `docs/formats.md`),
-  so these highlights are missing — **UNRESOLVED (not implemented)**, expected to be broad, dim glints from the two distant lights on the floor and plating.
+* **Specular (implemented)**: 9 of main's materials set `SPECULARENABLE` = 1 (`hull default`, `tech plated`, `grey-shit` = the floor, …), `spec` 0.9, `shin` 10–25; `ao-render` adds `Cs · Ls · (N·H)^power · atten` per vertex after the texture stage (`LOCALVIEWER` = 1, light specular = diffuse colour; see `docs/formats.md` *Vertex lighting*). With the two distant lights the highlights are weak: the `login_shot` render differs from the per-pixel one mostly by Gouraud shading on the pedestals.
 * **`CCCharacter_t::ShowSelectionGlow(bool)`** [GUI 0x1011a9ae] (the "selection glow") is a `GfxVisualShield` over the character's `RCATMesh_t` (colour `0xff40ff40`, a 0x2c8-byte
   object, `+0x1a8` / `+0x2c0` from floats 0x101ae2ec / 0x101a9fa0). It is switched on/off only by `BreedScene_t::SlotBreedButton` [0x1011385b] — the character *creation* breed pick. The
   login and character-selection screens never call it (no glow on the selection preview).
@@ -568,7 +565,7 @@ The login/selection camera of §2 is **not** in this file; it is hard-coded in `
 
 ## 11. UNRESOLVED
 
-* Specular highlights of the login backdrop / preview (`SPECULARENABLE` materials, D3D7 `LOCALVIEWER` specular) are not rendered — see §2 *Not reproduced*. Per-vertex (D3D) vs per-pixel (`ao-render`) lighting is a renderer-wide difference.
+* Login backdrop / preview lighting is per vertex (D3D7 Gouraud) with specular, see §2 and `docs/formats.md` *Vertex lighting*.
 * Whether the in-world camera (`n3Engine_t`) uses the same horizontal convention is not examined (the free-fly / playfield viewer keeps a 60° vertical lens); the login lens and lighting are resolved in §2.
 * Whether the border icon button is drawn when a window has no icon menu; the `flags & 0x800` ⇒ no pin rule is read from a decompile whose assignment was lost [INFERENCE].
 * Generic GUI button sounds (SandyInterface `GUISoundInitialisation`) and the exact StartupMusic cue.

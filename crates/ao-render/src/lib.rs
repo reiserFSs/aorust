@@ -269,9 +269,9 @@ struct ColorAnim {
 }
 
 /// Material uniform of a submesh (see `shader.wgsl` `Mat`).
-fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 16] {
+fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 20] {
     let [wu, au, wv, av] = s.uv_wave;
-    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], s.sky_fog as u32 as f32, s.sun_flicker as u32 as f32, wu, au, wv, av]
+    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], s.sky_fog as u32 as f32, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess]
 }
 
 /// Last-frame counters (after frustum culling).
@@ -417,7 +417,7 @@ impl Renderer {
         };
         let storage_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::VERTEX,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
@@ -604,7 +604,7 @@ impl Renderer {
             }
         }
         // One bind group per distinct (texture, base colour, emissive, glow mask).
-        let mut mat_of: HashMap<(usize, [u32; 16]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, [u32; 20]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh| {
             let u = mat_uniform(s);
@@ -743,7 +743,7 @@ impl Renderer {
         }
         let white = self.texture_view(&[255; 4], 1, 1);
         let mut sky = SkyGpu::default();
-        let mut mat_of: HashMap<(Option<TextureKey>, [u32; 16]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(Option<TextureKey>, [u32; 20]), usize> = HashMap::new();
         for (mi, mesh) in scene.meshes.iter().enumerate() {
             let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
             if mesh.vertices.is_empty() || idx_total == 0 || !scene.sky.iter().any(|s| s.mesh == mi) {
@@ -1275,6 +1275,45 @@ mod sky_tests {
         let s = scene([0.0; 2], None);
         let (Some(a), Some(b)) = (pixels(&s, 0.0, "still"), pixels(&s, 5.0, "still")) else { return };
         assert_eq!(a, b);
+    }
+
+    /// Red channel of the centre pixel of a PNG.
+    fn centre(png_bytes: &[u8]) -> u8 {
+        let mut r = png::Decoder::new(std::io::Cursor::new(png_bytes)).read_info().unwrap();
+        let mut buf = vec![0; r.output_buffer_size()];
+        let info = r.next_frame(&mut buf).unwrap();
+        buf[(info.width as usize * (info.height as usize / 2) + info.width as usize / 2) * 4]
+    }
+
+    /// A `half`-metre wide quad facing the camera at z = -10 (normal +Z), lit by one white D3D light and nothing else.
+    fn lit_quad(half: f32, light: [f32; 3], base: f32, specular: f32) -> Scene {
+        let mut s = Scene::default();
+        let v = |x: f32, y: f32| Vertex { pos: [x, y, -10.0], normal: [0.0, 0.0, 1.0], ..Default::default() };
+        let vertices = vec![v(-half, -half), v(half, -half), v(half, half), v(-half, half)];
+        let sub = Submesh { two_sided: true, base_color: [base, base, base, 1.0], specular: [specular; 3], shininess: 10.0, ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) };
+        s.meshes.push(Mesh { vertices, submeshes: vec![sub] });
+        s.instances.push(Instance { mesh: 0, transform: IDENTITY });
+        s.environment = Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 1e4, fog_end: 2e4, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0] });
+        s.lights.push(ao_scene::Light { pos: light, color: [1.0; 3], range: 1000.0, atten: [1.0, 0.0, 0.0], ..Default::default() });
+        s
+    }
+
+    /// D3D7 lights per vertex: the middle of a big quad whose corners the light barely grazes stays dark (a per-pixel light
+    /// would be at full N.L right under the light), and a point light closer to the quad lights its corners more.
+    #[test]
+    fn diffuse_light_is_evaluated_per_vertex_and_interpolated() {
+        let Some(far) = pixels(&lit_quad(20.0, [0.0, 0.0, -8.0], 1.0, 0.0), 0.0, "gouraud") else { return };
+        // corners: N.L = 2 / sqrt(800 + 4) = 0.07 -> centre = 0.07 linear = 75 sRGB, not the per-pixel 255
+        assert!((60..90).contains(&centre(&far)), "centre {}", centre(&far));
+    }
+
+    /// `SPECULARENABLE` materials add `specular * (N.H)^power` after the texture stage, also on a black diffuse material.
+    #[test]
+    fn specular_term_is_added_after_the_texture_stage() {
+        let (Some(on), Some(off)) = (pixels(&lit_quad(2.0, [0.0; 3], 0.0, 1.0), 0.0, "spec_on"), pixels(&lit_quad(2.0, [0.0; 3], 0.0, 0.0), 0.0, "spec_off")) else { return };
+        // light at the eye: H = L, N.H = N.L = 10 / sqrt(108) = 0.962 at the corners -> 0.962^10 = 0.68
+        assert_eq!(centre(&off), 0);
+        assert!(centre(&on) > 150, "specular {}", centre(&on));
     }
 }
 

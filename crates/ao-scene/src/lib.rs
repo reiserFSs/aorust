@@ -81,6 +81,11 @@ pub struct Submesh {
     /// Sky submeshes only (`e_SunRays`): vertex `normal.z` is the fan rim index `i` (`-1` = centre); the renderer scales the rim
     /// alpha by `(255 - table[i & 7]) / 255` with `table` = [`sun_flicker_table`] (`FUN_1005a3a9`).
     pub sun_flicker: bool,
+    /// `_D3DMATERIAL7.specular` = `spec * shin_str` (linear RGB) while `SPECULARENABLE` holds, else zero (= no specular term). Added
+    /// after the texture stage, per vertex: `specular * Σ light_colour * (N.H)^shininess * atten` for lights with `N.L > 0`.
+    pub specular: [f32; 3],
+    /// `_D3DMATERIAL7.power` (`shin`).
+    pub shininess: f32,
 }
 
 impl Submesh {
@@ -98,6 +103,8 @@ impl Submesh {
             sky_fog: false,
             uv_wave: [0.0; 4],
             sun_flicker: false,
+            specular: [0.0; 3],
+            shininess: 0.0,
         }
     }
 }
