@@ -69,6 +69,25 @@ enum What {
         /// Head mesh id (rdb 1010001) attached to the body.
         #[arg(long)]
         head: Option<u32>,
+        /// Animation role (clip name, e.g. walk, run, idle, social-bow) instead of --anim.
+        #[arg(long, conflicts_with = "anim")]
+        role: Option<ao_formats::character::Role>,
+    },
+    /// Player character assembled from creation-screen choices (body + head + naked skin).
+    Player {
+        breed: ao_formats::character::Breed,
+        gender: ao_formats::character::Gender,
+        /// Head number `NN` of head_<race><sex>NN.abiff (default: lowest).
+        #[arg(long)]
+        head: Option<u32>,
+        /// Solitus skin tone: caucasian (default), asian, african.
+        #[arg(long, default_value = "caucasian")]
+        skin: ao_formats::character::Skin,
+        #[arg(long)]
+        role: Option<ao_formats::character::Role>,
+        /// Clip time in seconds (with --role).
+        #[arg(long, default_value_t = 0.0)]
+        time: f32,
     },
     /// Synthetic test scene.
     Demo {
@@ -102,16 +121,21 @@ fn main() -> Result<()> {
             let dir = client_dir(opts.client.clone())?;
             let scene: Scene = match what {
                 What::Demo { count } => demo::scene(count),
-                What::Char { id, anim, time, head } => {
+                What::Char { id, anim, time, head, role } => {
                     let store = RecordStore::open(&dir)?;
-                    if let Some(h) = head {
-                        ao_formats::character::load_character_with_head(&store, id, h, anim.map(|a| (a, time)))?
-                    } else {
-                    match anim {
-                        None => ao_formats::character::load_character(&store, id)?,
-                        Some(a) => ao_formats::character::load_character_posed(&store, id, a, time)?,
+                    let anim = match role {
+                        Some(r) => Some(ao_formats::character::role_anim(&store, id, &r)?),
+                        None => anim,
+                    };
+                    match (head, anim) {
+                        (Some(h), a) => ao_formats::character::load_character_with_head(&store, id, h, a.map(|a| (a, time)))?,
+                        (None, None) => ao_formats::character::load_character(&store, id)?,
+                        (None, Some(a)) => ao_formats::character::load_character_posed(&store, id, a, time)?,
                     }
-                    }
+                }
+                What::Player { breed, gender, head, skin, role, time } => {
+                    let player = ao_formats::character::Player { breed, gender, skin, head };
+                    ao_formats::character::load_player(&RecordStore::open(&dir)?, &player, role.map(|r| (r, time)))?
                 }
                 What::Mesh { id } => ao_formats::mesh::load_mesh(&RecordStore::open(&dir)?, id)?,
                 What::Pf { list: true, .. } => {

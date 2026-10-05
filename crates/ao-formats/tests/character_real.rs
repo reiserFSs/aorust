@@ -98,3 +98,57 @@ fn compatible_animations_share_the_skeleton_hash() {
     let clips = compatible_animations(&store, &mesh).unwrap();
     assert!(clips.len() > 800 && clips.iter().any(|c| c.0 == 9382));
 }
+
+const PLAYERS: [(Breed, Gender, u32); 7] = [
+    (Breed::Atrox, Gender::Male, 5900),
+    (Breed::Solitus, Gender::Male, 5907),
+    (Breed::Opifex, Gender::Male, 5914),
+    (Breed::Nanomage, Gender::Male, 5921),
+    (Breed::Solitus, Gender::Female, 5927),
+    (Breed::Opifex, Gender::Female, 5934),
+    (Breed::Nanomage, Gender::Female, 5941),
+];
+
+#[test]
+fn player_tables_resolve_models_heads_and_clips() {
+    let Some(store) = store() else { return };
+    for (breed, gender, id) in PLAYERS {
+        assert_eq!(player_model(&store, breed, gender).unwrap(), id, "{breed:?} {gender:?}");
+        assert!(!player_heads(&store, breed, gender, Skin::Caucasian).unwrap().is_empty());
+    }
+    assert!(player_model(&store, Breed::Atrox, Gender::Female).is_err(), "the client has no atrox female");
+    let n = |b, g, s| player_heads(&store, b, g, s).unwrap().len();
+    assert_eq!(n(Breed::Atrox, Gender::Male, Skin::Caucasian), 41);
+    assert_eq!(n(Breed::Solitus, Gender::Male, Skin::Caucasian), 57);
+    assert_eq!(n(Breed::Solitus, Gender::Male, Skin::Asian), 9);
+    assert_eq!(n(Breed::Nanomage, Gender::Female, Skin::Caucasian), 43);
+    // 40098 is the mesh whose file is head_athrox12.abiff
+    assert!(player_heads(&store, Breed::Atrox, Gender::Male, Skin::Caucasian).unwrap().contains(&(12, 40098)));
+
+    let find = |model, role: Role| character_animations(&store, model).unwrap().into_iter().find(|c| c.0 == role).map(|c| c.1);
+    assert_eq!(find(5900, Role::Walk), Some(10078));
+    assert_eq!(find(5900, Role::Sneak), Some(9382)); // 9382 is `athrox_sneakcool`, not the walk
+    assert_eq!(find(5900, Role::Run), Some(9386));
+    assert_eq!(find(5900, Role::Idle), Some(9992));
+    assert_eq!(find(5907, Role::Walk), Some(10191));
+    assert_eq!(find(5927, Role::Walk), Some(10162));
+    assert_eq!(find(5934, Role::Idle), Some(10135)); // opifex women share the `female` set
+    assert_eq!(find(5900, Role::Emote("backflip".into())), Some(9375));
+    assert!(role_anim(&store, 5907, &Role::Emote("no-such-emote".into())).is_err());
+}
+
+#[test]
+fn players_have_skin_not_the_green_placeholder() {
+    let Some(store) = store() else { return };
+    let green = |t: &ao_scene::Texture| t.rgba.chunks_exact(4).all(|p| p[..3] == [0, 255, 0]);
+    for (breed, gender, _) in PLAYERS {
+        let s = load_player_character(&store, breed, gender, 1, Some((Role::Idle, 0.0))).unwrap();
+        assert!(s.instances.len() == 2, "body + head");
+        assert!(s.textures.values().all(|t| !green(t)), "{breed:?} {gender:?} still has a green texture");
+        assert!(s.textures.keys().any(|k| k.rdb_type == 1010011), "naked skin textures applied");
+    }
+    for skin in [Skin::Asian, Skin::African] {
+        let p = Player { breed: Breed::Solitus, gender: Gender::Male, skin, head: None };
+        assert!(load_player(&store, &p, Some((Role::Walk, 0.6))).is_ok());
+    }
+}

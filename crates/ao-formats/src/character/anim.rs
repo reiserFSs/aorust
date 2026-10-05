@@ -75,6 +75,23 @@ impl Delta {
 }
 
 impl CatAnim {
+    /// The skeleton hash of a record without decoding its keys (header fields of [`CatAnim::parse`]).
+    pub fn signature_of(d: &[u8]) -> Result<u32> {
+        let mut r = Rd::new(d);
+        r.name32()?;
+        let n_events = r.u32()? as usize;
+        ensure!(n_events * 36 <= r.remaining(), "event table overruns record");
+        for _ in 0..n_events {
+            r.u32()?;
+            r.name32()?;
+        }
+        ensure!(r.u32()? == 3, "file is not a CATAnim");
+        let version = r.u32()? & !0x100_0000;
+        r.u32()?; // duration (u32 or f32 by version)
+        ensure!(version > 0x104, "unsupported CATAnim version {version:#x}");
+        r.u32()
+    }
+
     pub fn parse(d: &[u8]) -> Result<Self> {
         let mut r = Rd::new(d);
         let root = r.name32()?;

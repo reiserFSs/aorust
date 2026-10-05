@@ -9,7 +9,11 @@
 
 mod anim;
 mod cat;
+mod names;
+mod player;
 
+pub use names::NameTable;
+pub use player::*;
 pub use anim::{CatAnim, Track};
 pub use cat::{Attractor, Bone, CatMesh, ColSphere, Material, Part, SkinVertex, SubMesh};
 
@@ -300,13 +304,15 @@ fn submesh_for(mat: &Material, tex: Option<(TextureKey, &ao_scene::Texture)>) ->
     s
 }
 
-fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned) -> (Scene, [f32; 3], [f32; 3]) {
+/// `with_head`: a head mesh is mounted, so the body's own `head` part (a one-triangle stub textured with
+/// the green `head_*_default.png` placeholder on Atrox) is left out.
+fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned, swaps: &HashMap<u32, TextureKey>, with_head: bool) -> (Scene, [f32; 3], [f32; 3]) {
     let mut scene = Scene::default();
     let mut out = Mesh::default();
     let mut textures: HashMap<u32, Option<TextureKey>> = HashMap::new();
     let mut by_material: HashMap<u32, usize> = HashMap::new();
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-    for (sm, sk) in mesh.submeshes.iter().zip(skin) {
+    for (sm, sk) in mesh.submeshes.iter().zip(skin).filter(|(sm, _)| !(with_head && mesh.parts[sm.material as usize].name == "head")) {
         let base = out.vertices.len() as u32;
         for (v, &(p, n)) in sm.vertices.iter().zip(sk) {
             let pos = [p[0], p[1], -p[2]];
@@ -319,7 +325,7 @@ fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned) -> (Scene, [f32
         let si = *by_material.entry(sm.material).or_insert_with(|| {
             let part = &mesh.parts[sm.material as usize];
             let key = *textures.entry(part.texture).or_insert_with(|| {
-                let key = TextureKey { rdb_type: TEXTURE_TYPE, id: part.texture };
+                let key = swaps.get(&part.texture).copied().unwrap_or(TextureKey { rdb_type: TEXTURE_TYPE, id: part.texture });
                 let tex = (part.texture != 0).then(|| load_texture(store, key).ok().flatten()).flatten()?;
                 scene.textures.insert(key, tex);
                 Some(key)
@@ -359,16 +365,28 @@ pub fn load_character_posed(store: &RecordStore, id: u32, anim_id: u32, time_s: 
 
 /// General form: `rdb_type` is [`CHAR_MESH_TYPE`] or [`CHAR_MESH_LOW_TYPE`]; `pose` = (animation id, seconds).
 pub fn load_character_record(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>) -> Result<Scene> {
-    build(store, rdb_type, id, pose, None)
+    build(store, rdb_type, id, pose, None, &HashMap::new())
 }
 
 /// Character `id` with the static head mesh `head_mesh_id` (rdb 1010001, e.g. 40098 = `head_athroxmale001`)
 /// mounted on its `Attractor01_head` point; `pose` as in [`load_character_record`].
 pub fn load_character_with_head(store: &RecordStore, id: u32, head_mesh_id: u32, pose: Option<(u32, f32)>) -> Result<Scene> {
-    build(store, CHAR_MESH_TYPE, id, pose, Some(head_mesh_id))
+    build(store, CHAR_MESH_TYPE, id, pose, Some(head_mesh_id), &HashMap::new())
 }
 
-fn build(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>, head: Option<u32>) -> Result<Scene> {
+/// [`load_character_with_head`] with an optional head and texture substitutions (original 1010004
+/// texture id → replacement key), e.g. the naked skins of [`load_player`].
+pub(crate) fn load_character_head_skin(
+    store: &RecordStore,
+    id: u32,
+    head: Option<u32>,
+    pose: Option<(u32, f32)>,
+    swaps: &HashMap<u32, TextureKey>,
+) -> Result<Scene> {
+    build(store, CHAR_MESH_TYPE, id, pose, head, swaps)
+}
+
+fn build(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>, head: Option<u32>, swaps: &HashMap<u32, TextureKey>) -> Result<Scene> {
     let mesh = load_cat_mesh(store, rdb_type, id)?;
     let (skin, frames) = match pose {
         None => {
@@ -389,7 +407,7 @@ fn build(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>, 
             (skin_pose(&mesh, &world), world.into_iter().map(Some).collect())
         }
     };
-    let (mut scene, lo, mut hi) = assemble(store, &mesh, &skin);
+    let (mut scene, lo, mut hi) = assemble(store, &mesh, &skin, swaps, head.is_some());
     if let Some(head) = head {
         let att = mesh.attractors.iter().find(|a| a.name.ends_with("_head")).context("model has no head attractor")?;
         let bone = match frames[att.bone as usize] {

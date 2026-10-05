@@ -89,6 +89,30 @@ fn main() -> anyhow::Result<()> {
     for (k, v) in pfail {
         println!("  FAIL x{} {k}: e.g. {:?}", v.len(), &v[..v.len().min(5)]);
     }
+    // name table coverage and the player tuple API
+    let names = NameTable::load(&store)?;
+    let named = |ty, ids: Vec<u32>| ids.iter().filter(|&&i| names.name(ty, i).is_some()).count();
+    println!(
+        "names: models {}/{}, clips {}/{}",
+        named(CHAR_MESH_TYPE, store.ids(CHAR_MESH_TYPE)?),
+        store.ids(CHAR_MESH_TYPE)?.len(),
+        named(CHAR_ANIM_TYPE, store.ids(CHAR_ANIM_TYPE)?),
+        store.ids(CHAR_ANIM_TYPE)?.len()
+    );
+    let (mut ok, mut total) = (0, 0);
+    for breed in [Breed::Solitus, Breed::Opifex, Breed::Nanomage, Breed::Atrox] {
+        for gender in [Gender::Male, Gender::Female] {
+            let Ok(model) = player_model(&store, breed, gender) else { println!("{breed:?} {gender:?}: no model in the client"); continue };
+            let roles = character_animations(&store, model)?;
+            let heads = player_heads(&store, breed, gender, Skin::Caucasian)?;
+            println!("{breed:?} {gender:?}: model {model}, {} heads, {} roles (walk {:?})", heads.len(), roles.len(), roles.iter().find(|r| r.0 == Role::Walk).map(|r| r.1));
+            for (head, _) in &heads {
+                total += 1;
+                ok += usize::from(load_player_character(&store, breed, gender, *head, Some((Role::Idle, 0.0))).is_ok());
+            }
+        }
+    }
+    println!("players assembled over every head (idle pose): {ok}/{total}");
     Ok(())
 }
 
