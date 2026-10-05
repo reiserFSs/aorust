@@ -156,6 +156,11 @@ pub struct Sky {
     pub sun_dir: [f32; 3],
 }
 
+/// `DayTimeForGroundShadows = GameDayTime * 15` at the default time.
+pub fn ground_shadow_time() -> f32 {
+    DAY_TIME * 15.0
+}
+
 pub fn day_factor() -> f32 {
     DAY_TIME / DAY_LENGTH
 }

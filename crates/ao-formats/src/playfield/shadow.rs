@@ -21,15 +21,6 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// `p`-th quantile (0..1) of the texel values, 0..1.
-    pub fn percentile(&self, p: f32) -> f32 {
-        let mut hist = [0usize; 256];
-        self.px.iter().for_each(|&v| hist[v as usize] += 1);
-        let target = (self.px.len() as f32 * p) as usize;
-        let mut acc = 0;
-        hist.iter().position(|&n| { acc += n; acc > target }).unwrap_or(255) as f32 / 255.0
-    }
-
     /// Bilinear lookup at texel coordinates (texel centres at +0.5), clamped to the image.
     pub fn sample(&self, x: f32, y: f32) -> f32 {
         let (fx, fy) = ((x - 0.5).clamp(0.0, (self.w - 1) as f32), (y - 0.5).clamp(0.0, (self.h - 1) as f32));
@@ -41,6 +32,30 @@ impl Layer {
         let bot = p(x0, y1) * (1.0 - tx) + p(x1, y1) * tx;
         (top * (1.0 - ty) + bot * ty) / 255.0
     }
+}
+
+/// Day time ranges (`DayTimeForGroundShadows = GameDayTime * 15`) and the layer pair blended in each
+/// (`FUN_100b7a72` Gamecode @0x100b7a72: table @0x101c14d0 (9 bounds), @0x101c14f4 (from layer), @0x101c1518 (to layer);
+/// `BlendShadowMaps(out, from, to, w, h, 1 - (t - lo) / (hi - lo))`): night (5) until 15300, then 5->0 (dawn), 0->1, 1->2 (noon
+/// at 50400), 2->3, 3->4 (dusk), 4->5, night again from 85500.
+const BOUNDS: [f32; 9] = [0.0, 15300.0, 27000.0, 38700.0, 50400.0, 62100.0, 73800.0, 85500.0, 97700.0];
+const FROM: [usize; 8] = [5, 5, 0, 1, 2, 3, 4, 5];
+const TO: [usize; 8] = [5, 0, 1, 2, 3, 4, 5, 5];
+
+/// The ground shadow map at `t = DayTimeForGroundShadows`: the client's blend of two layers (`BlendShadowMaps`).
+pub fn at_time(layers: &[Layer], t: f32) -> Layer {
+    let i = (0..8).find(|&i| t >= BOUNDS[i] && t < BOUNDS[i + 1]).unwrap_or(0);
+    let w = 1.0 - (t - BOUNDS[i]) / (BOUNDS[i + 1] - BOUNDS[i]);
+    let (a, b) = (&layers[FROM[i]], &layers[TO[i]]);
+    let px = a.px.iter().zip(&b.px).map(|(&x, &y)| (x as f32 * w + y as f32 * (1.0 - w)).round() as u8).collect();
+    Layer { w: a.w, h: a.h, px }
+}
+
+/// Ground brightness of a shadow map sample `s` (0..1 = level / 15): `AnarchyGround_t::SetShadowMap` (DisplaySystem
+/// @0x10032570) builds a 16 entry palette `(level / 15 * 188 + 4) * (1 - fade)` (bytes; fade = 0 here), normalised to the lit
+/// level 15 (192) [guess: the engine's final gain of the lightmap stage is not decoded].
+pub fn brightness(s: f32) -> f32 {
+    (4.0 + 188.0 * s.clamp(0.0, 1.0)) / 192.0
 }
 
 pub fn parse(d: &[u8]) -> Result<Vec<Layer>> {
@@ -89,6 +104,15 @@ mod tests {
         assert_eq!((l[2].w, l[2].h), (4, 2));
         assert!((l[2].sample(2.0, 1.0) - 100.0 / 255.0).abs() < 1e-6);
         assert!((l[5].sample(100.0, 100.0) - 250.0 / 255.0).abs() < 1e-6); // clamped
+    }
+
+    #[test]
+    fn day_time_blends_the_client_layer_pairs() {
+        let l: Vec<Layer> = (0..LAYERS).map(|i| Layer { w: 1, h: 1, px: vec![(i * 40) as u8] }).collect();
+        assert_eq!(at_time(&l, 50400.0).px[0], 80); // noon: layer 2 only
+        assert_eq!(at_time(&l, 3000.0).px[0], 200); // night: layer 5
+        assert_eq!(at_time(&l, 38700.0 + 11700.0 * 0.5).px[0], 60); // halfway 1 -> 2
+        assert!((brightness(1.0) - 1.0).abs() < 1e-6 && (brightness(0.0) - 4.0 / 192.0).abs() < 1e-6);
     }
 
     #[test]

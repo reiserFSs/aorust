@@ -10,7 +10,7 @@
 //!   vertex `v` that use texture `M`; a cell with base texture `T` overlays each other texture `M` (ascending texture id)
 //!   with alpha `w_M / (w_T + sum of w_M' of the overlays up to M)`. Over the opaque base this reproduces
 //!   `sum_M w_M(v) * tex_M` exactly at every vertex (continuous across cell and patch borders).
-//! * Shadows: rdb 1000007 layer `SUN_LAYER` (noon) multiplies the vertex colour (see `shadow`). The map already contains
+//! * Shadows: rdb 1000007, the client's day-time blend of two layers (`shadow::at_time`), multiplies the vertex colour (see `shadow`). The map already contains
 //!   hill shading; the geometric normals are kept anyway (the renderer flips normals that face away from the eye, so
 //!   flat "up" normals turn hills above the camera dark).
 
@@ -28,10 +28,6 @@ const TILE_TEXTURES: u32 = 1_010_021;
 const SHADOWS: u32 = 1_000_007;
 /// Cells per patch edge.
 const PATCH: usize = 64;
-/// Ground shadow map layer used (noon: the brightest of the five sun positions, see `shadow`).
-const SUN_LAYER: usize = 2;
-/// Brightness kept in full shadow (calibration knob; the client's lightmap blend factor is not known).
-const SHADOW_FLOOR: f32 = 0.35;
 /// Overlays are lifted by this much to stay above the coplanar base (the renderer also biases blended depth).
 const LIFT: f32 = 0.01;
 const NONE: u16 = u16::MAX;
@@ -89,7 +85,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene) -> R
     }
     // cells whose tile texture does not exist stay untextured and are never blended
     tex.iter_mut().filter(|t| missing.contains(t)).for_each(|t| *t = NONE);
-    let shade = store.get(SHADOWS, id).ok().flatten().and_then(|d| shadow::parse(&d).ok()).and_then(|l| l.into_iter().nth(SUN_LAYER));
+    let shade = store.get(SHADOWS, id).ok().flatten().and_then(|d| shadow::parse(&d).ok()).map(|l| shadow::at_time(&l, super::sky::ground_shadow_time()));
     let normal = |x: usize, z: usize| -> [f32; 3] {
         let (x0, x1) = (x.saturating_sub(1), (x + 1).min(tm.verts_x - 1));
         let (z0, z1) = (z.saturating_sub(1), (z + 1).min(tm.verts_z - 1));
@@ -99,9 +95,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene) -> R
         [-dx / l, 1.0 / l, -dz / l]
     };
     // one texel per 2 cells along x, one per cell along z (see `shadow`)
-    let lo = shade.as_ref().map_or(1.0, |s| s.percentile(0.9).max(0.05));
-    // flat lit ground (~90th percentile of the map) = full brightness; shadows keep SHADOW_FLOOR of it
-    let lit = |x: usize, z: usize| shade.as_ref().map_or(1.0, |s| SHADOW_FLOOR + (1.0 - SHADOW_FLOOR) * (s.sample(x as f32 * 0.5, z as f32) / lo).min(1.0));
+    let lit = |x: usize, z: usize| shade.as_ref().map_or(1.0, |s| shadow::brightness(s.sample(x as f32 * 0.5, z as f32)));
     let vertex = |x: usize, z: usize, a: f32, lift: f32| {
         let l = lit(x, z);
         Vertex { pos: [x as f32 * cs, tm.height(x, z) + lift, -(z as f32 * cs)], normal: normal(x, z), uv: [x as f32, z as f32], color: [l, l, l, a] }
