@@ -318,7 +318,8 @@ pub fn pose_detachment(store: &RecordStore, id: u32, anim_id: u32, time_s: f32) 
 }
 
 fn linear(c: f32) -> f32 {
-    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    c.max(0.0).powf(2.2)
+/// The scene contract carries colours as `c^2.2`; the renderer shades in the client's gamma space and inverts that.
 }
 
 /// Renderer material for one CAT material: blend from opacity and the texture's alpha channel
@@ -334,10 +335,11 @@ fn submesh_for(mat: &Material, tex: Option<(TextureKey, &ao_scene::Texture)>) ->
         }
     }
     s.blend = if mat.opacity < 1.0 || soft { Blend::AlphaBlend } else if cut { Blend::AlphaTest } else { Blend::Opaque };
-    s.base_color = match tex {
-        Some(_) => [1.0, 1.0, 1.0, mat.opacity],
-        None => [linear(mat.diffuse[0]), linear(mat.diffuse[1]), linear(mat.diffuse[2]), mat.opacity],
-    };
+    // `RViewPort_t::SetMaterial` (randy31 @0x1004b199) copies only opac, emis, spec * shin_str and shin into the `_D3DMATERIAL7`: its
+    // diffuse / ambient RGB stay white (`SetDefaultMaterial` @0x1004b61e), so `diffuse` / `ambient` tint nothing (they only reach D3D
+    // through `InitD3DMaterial` @0x100409c6 for per-frame material modifiers); EMISSIVEMATERIALSOURCE is the device default MATERIAL.
+    s.base_color = [1.0, 1.0, 1.0, mat.opacity];
+    s.emissive = mat.emissive.map(linear);
     // `RMaterial_t::UpdateSpecular` @10040ff8 (ctor): SPECULARENABLE (29) = spec != black && shin_str > 0 && shin >= 0;
     // `_D3DMATERIAL7.specular` = spec * shin_str, power = shin (`InitD3DMaterial` @100409c6).
     if mat.specular != [0.0; 3] && mat.shininess_strength > 0.0 && mat.shininess >= 0.0 {

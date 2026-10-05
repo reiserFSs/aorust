@@ -23,6 +23,11 @@ fn srgb_to_linear(c: f32) -> f32 {
     c.powf(2.2)
 }
 
+/// Inverse of [`srgb_to_linear`]: the scene contract's `c^2.2` colours back to the client's framebuffer-space values.
+fn gamma(c: f32) -> f32 {
+    c.max(0.0).powf(1.0 / 2.2)
+}
+
 /// Free-fly camera. Forward = (sin yaw·cos pitch, sin pitch, -cos yaw·cos pitch).
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
@@ -118,6 +123,9 @@ struct Globals {
     grid: [f32; 4],
     dims: [i32; 4],
     wave: [[f32; 4]; 4],
+    sun_g: [f32; 4],
+    ambient_g: [f32; 4],
+    fog_g: [f32; 4],
 }
 
 /// One submesh draw. `pipe` = `blend as usize * 2 + two_sided as usize`; sky draws use `SKY_PIPE + blend`.
@@ -214,7 +222,8 @@ impl LightGrid {
                 // kind: 0 = linear ramp, 1 = D3D attenuation (atten x of the third vec4 is then the divisor sum)
                 let (cos_phi, cos_theta, axis) = l.spot.map_or((2.0, 0.0, [0.0; 3]), |s| ((s.phi * 0.5).cos(), (s.theta * 0.5).cos(), s.dir));
                 let a = if l.atten == [0.0; 3] { [-1.0, 0.0, 0.0] } else { l.atten }; // a0 < 0: linear
-                [[l.pos[0], l.pos[1], l.pos[2], l.range], [l.color[0], l.color[1], l.color[2], cos_phi], [a[0], a[1], a[2], cos_theta], [axis[0], axis[1], axis[2], 0.0]]
+                // colours go to the shader in D3D (gamma) space, where the fixed function lighting sums them
+                [[l.pos[0], l.pos[1], l.pos[2], l.range], [gamma(l.color[0]), gamma(l.color[1]), gamma(l.color[2]), cos_phi], [a[0], a[1], a[2], cos_theta], [axis[0], axis[1], axis[2], 0.0]]
             })
             .collect();
         Self { zones: lights.iter().map(|l| l.zone).collect(), lights: gl, cells, idx, origin: lo, cell, dims }
@@ -376,6 +385,7 @@ fn default_environment(radius: f32) -> Environment {
         ambient: [0.35, 0.38, 0.45],
         sun_color: [0.75, 0.71, 0.64],
         sun_dir: Vec3::new(0.4, 0.8, 0.3).normalize().to_array(),
+        sun_specular: 1.0,
     }
 }
 
@@ -958,6 +968,7 @@ impl Renderer {
         let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
         let vp = Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far) * Mat4::look_to_rh(cam.pos, cam.forward(), cam.up());
         let v4 = |c: [f32; 3], w| Vec4::new(c[0], c[1], c[2], w).to_array();
+        let g4 = |c: [f32; 3], w| v4(c.map(gamma), w);
         let w = ao_scene::wave_curves(self.time);
         let g = Globals {
             view_proj: vp.to_cols_array_2d(),
@@ -970,6 +981,9 @@ impl Renderer {
             grid: self.gpu.grid.0,
             dims: self.gpu.grid.1,
             wave: std::array::from_fn(|i| std::array::from_fn(|j| w[i * 4 + j])),
+            sun_g: g4(env.sun_color, env.sun_specular),
+            ambient_g: g4(env.ambient, 0.0),
+            fog_g: g4(env.fog_color, 1.0),
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
@@ -1317,7 +1331,7 @@ mod sky_tests {
         let sub = Submesh { two_sided: true, base_color: [base, base, base, 1.0], specular: [specular; 3], shininess: 10.0, ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) };
         s.meshes.push(Mesh { vertices, submeshes: vec![sub] });
         s.instances.push(Instance { mesh: 0, transform: IDENTITY });
-        s.environment = Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 1e4, fog_end: 2e4, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0] });
+        s.environment = Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 1e4, fog_end: 2e4, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 0.0, 1.0], sun_specular: 1.0 });
         s.lights.push(ao_scene::Light { pos: light, color: [1.0; 3], range: 1000.0, atten: [1.0, 0.0, 0.0], ..Default::default() });
         s
     }
@@ -1327,8 +1341,9 @@ mod sky_tests {
     #[test]
     fn diffuse_light_is_evaluated_per_vertex_and_interpolated() {
         let Some(far) = pixels(&lit_quad(20.0, [0.0, 0.0, -8.0], 1.0, 0.0), 0.0, "gouraud") else { return };
-        // corners: N.L = 2 / sqrt(800 + 4) = 0.07 -> centre = 0.07 linear = 75 sRGB, not the per-pixel 255
-        assert!((60..90).contains(&centre(&far)), "centre {}", centre(&far));
+        // corners: N.L = 2 / sqrt(800 + 4) = 0.07; the lighting sum is gamma space (the client's), so the interpolated centre is
+        // 0.07 * 255 = 18, not the per-pixel 255
+        assert!((14..24).contains(&centre(&far)), "centre {}", centre(&far));
     }
 
     /// `SPECULARENABLE` materials add `specular * (N.H)^power` after the texture stage, also on a black diffuse material.
@@ -1338,6 +1353,45 @@ mod sky_tests {
         // light at the eye: H = L, N.H = N.L = 10 / sqrt(108) = 0.962 at the corners -> 0.962^10 = 0.68
         assert_eq!(centre(&off), 0);
         assert!(centre(&on) > 150, "specular {}", centre(&on));
+    }
+
+    /// D3D sums ambient + sun in framebuffer (gamma) space and saturates there: 0.5 + 0.5 = 1.0 (255), where a linear-space sum of
+    /// the same colours would only reach 176.
+    #[test]
+    fn lighting_sum_is_formed_in_gamma_space() {
+        let mut s = lit_quad(2.0, [0.0; 3], 1.0, 0.0);
+        s.lights.clear();
+        let e = s.environment.as_mut().unwrap();
+        (e.ambient, e.sun_color) = ([0.5_f32.powf(2.2); 3], [0.5_f32.powf(2.2); 3]);
+        let Some(png) = pixels(&s, 0.0, "gamma_sum") else { return };
+        assert!(centre(&png) >= 250, "sum {}", centre(&png));
+    }
+
+    /// Emissive is part of the saturated vertex colour: a fully emissive texel is the texture, not twice the texture.
+    #[test]
+    fn emissive_is_saturated_with_the_lighting() {
+        let mut s = lit_quad(2.0, [0.0; 3], 0.5_f32.powf(2.2), 0.0);
+        s.lights.clear();
+        s.meshes[0].submeshes[0].emissive = [1.0; 3];
+        s.environment.as_mut().unwrap().ambient = [1.0; 3];
+        let Some(png) = pixels(&s, 0.0, "emissive_sat") else { return };
+        assert!((120..136).contains(&centre(&png)), "emissive {}", centre(&png));
+    }
+
+    /// The sun is a directional light with specular colour `sun_specular * sun_color`.
+    #[test]
+    fn sun_specular_follows_the_light_intensity() {
+        let build = |intensity: f32| {
+            let mut s = lit_quad(2.0, [0.0; 3], 0.0, 1.0);
+            s.lights.clear();
+            let e = s.environment.as_mut().unwrap();
+            (e.sun_color, e.sun_specular) = ([1.0; 3], intensity);
+            s
+        };
+        let (Some(on), Some(off)) = (pixels(&build(1.0), 0.0, "sun_spec_on"), pixels(&build(0.0), 0.0, "sun_spec_off")) else { return };
+        // sun along +Z towards the eye: N.H = 1 on the whole quad, so the highlight is the full material specular
+        assert!(centre(&on) > 200, "specular {}", centre(&on));
+        assert_eq!(centre(&off), 0);
     }
 }
 

@@ -194,7 +194,7 @@ pub const LOGIN_LENS: ao_scene::Lens = ao_scene::Lens { fov: LOGIN_CAMERA.fov_ra
 /// viewport clear colour of (0, 0, 0.2) (`DisplaySystem` @0x10079121). Fog is "off" as a start beyond any distance.
 pub fn login_environment() -> ao_scene::Environment {
     let clear = [0.0, 0.0, 0.2_f32.powf(2.2)];
-    ao_scene::Environment { sky_color: clear, fog_color: clear, fog_start: 1.0e9, fog_end: 2.0e9, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0] }
+    ao_scene::Environment { sky_color: clear, fog_color: clear, fog_start: 1.0e9, fog_end: 2.0e9, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 1.0 }
 }
 
 /// The backdrop of `stage` as a renderer-space scene (meshes decoded with the usual Z mirror; `spawn` /

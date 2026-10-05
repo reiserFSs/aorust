@@ -237,7 +237,10 @@ impl Builder<'_, '_> {
     /// Material of a `SimpleMesh`. Render states and texture channels come from the node's own
     /// `delta_state` (e.g. the "alpha" states of foliage nodes) and the material's `delta_state`
     /// (applied later by `RViewPort_t::SetMaterial`, so it wins); a texture on the node's state wins
-    /// over the material's. Colours come from `FAFMaterial_t` (`RMaterial_t::InitD3DMaterial` @100409c6).
+    /// over the material's. Colours: `RViewPort_t::SetMaterial` @1004b199 copies only `opac`, `emis`, `spec * shin_str` and
+    /// `shin` into the `_D3DMATERIAL7`; its diffuse / ambient RGB stay at `SetDefaultMaterial`'s white (@1004b61e), so `diff` and
+    /// `ambi` do not tint anything here (they reach D3D only through `InitD3DMaterial` @100409c6 for sprites and
+    /// per-frame material modifiers).
     fn material(&mut self, node_ds: Option<&Object>, sm: &Object) -> MatKey {
         let objs = &self.ar.objects;
         let mat = sm.ref1("material").and_then(|m| objs.get(m));
@@ -272,15 +275,13 @@ impl Builder<'_, '_> {
         } else {
             Blend::Opaque
         };
-        // D3D multiplies gamma-space values; the renderer multiplies sRGB-decoded textures in linear
-        // space, so the diffuse colour is converted to linear (power curve => identical result).
-        let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
-        let [r, g, b] = mat.and_then(|m| m.f32s::<3>("diff")).unwrap_or([1.0; 3]);
+        // The scene contract carries colours as `c^2.2`; the renderer shades in the client's gamma space and inverts that.
+        let lin = |c: f32| c.max(0.0).powf(2.2);
         let a = mat.and_then(|m| m.f32s::<1>("opac")).map_or(1.0, |o| o[0]);
-        // `FUN_1004ac5f` @1004ac5f: EMISSIVEMATERIALSOURCE (148) = MATERIAL only when the emissive
-        // luminance (0.299R+0.587G+0.114B, `FUN_1004a8c0`) exceeds 0; otherwise it reads the (absent) vertex colour.
+        // EMISSIVEMATERIALSOURCE (148) stays at the device default MATERIAL for archive meshes: the emissive is `emis` as is
+        // (the luminance test of `FUN_1004ac5f` @1004ac5f only runs for `ConvertToLightmap`).
         let emis = mat.and_then(|m| m.f32s::<3>("emis")).unwrap_or([0.0; 3]);
-        let emissive = if 0.299 * emis[0] + 0.587 * emis[1] + 0.114 * emis[2] > 0.0 { emis.map(lin) } else { [0.0; 3] };
+        let emissive = emis.map(lin);
         // Mode 5 of `FUN_10040645` (texture-alpha glow): stage 0 COLOROP = ADD, COLORARG1 = TEXTURE|ALPHAREPLICATE.
         let stage0 = |ty: i32| [mat_ds, node_ds].into_iter().flatten().find_map(|ds| tss(ds, 0, ty));
         let glow_mask = blend == Blend::Opaque
@@ -292,7 +293,7 @@ impl Builder<'_, '_> {
         let strength = mat.and_then(|m| m.f32s::<1>("shin_str")).map_or(0.0, |v| v[0]);
         let shininess = mat.and_then(|m| m.f32s::<1>("shin")).map_or(0.0, |v| v[0]);
         let (specular, shininess) = if state(D3DRS_SPECULARENABLE) == Some(1) { (spec.map(|c| lin(c * strength)), shininess) } else { ([0.0; 3], 0.0) };
-        MatKey { texture: tex, blend, two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [lin(r), lin(g), lin(b), a], emissive, glow_mask, specular, shininess }
+        MatKey { texture: tex, blend, two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [1.0, 1.0, 1.0, a], emissive, glow_mask, specular, shininess }
     }
 
     fn simple_mesh(&mut self, node_ds: Option<&Object>, sm: &Object, world: &Mat) -> Result<()> {
@@ -648,16 +649,17 @@ mod tests {
     }
 
     #[test]
-    fn flat_colour_is_linear_base_color_and_default_is_opaque_culled() {
+    fn diffuse_is_white_opacity_is_kept_and_default_is_opaque_culled() {
+        // `diff` never reaches the D3D material of an archive mesh (RViewPort_t::SetMaterial), `opac` does
         let s = material_mesh([0.5, 0.0, 1.0], 0.25, &[]);
         assert_eq!((s.blend, s.two_sided, s.texture), (Blend::Opaque, false, None));
-        assert!((s.base_color[0] - 0.2140).abs() < 1e-3 && s.base_color[1] == 0.0 && s.base_color[2] == 1.0 && s.base_color[3] == 0.25);
+        assert_eq!(s.base_color, [1.0, 1.0, 1.0, 0.25]);
     }
 
     #[test]
-    fn emissive_is_linear_and_only_kept_when_luminous() {
+    fn emissive_is_the_material_emis_in_contract_colours() {
         let s = material_mesh_emis([1.0; 3], [0.5, 0.0, 1.0], 1.0, &[]);
-        assert!((s.emissive[0] - 0.2140).abs() < 1e-3 && s.emissive[1] == 0.0 && s.emissive[2] == 1.0);
+        assert!((s.emissive[0] - 0.5_f32.powf(2.2)).abs() < 1e-6 && s.emissive[1] == 0.0 && s.emissive[2] == 1.0);
         assert_eq!(material_mesh([1.0; 3], 1.0, &[]).emissive, [0.0; 3]);
         assert!(!s.glow_mask);
     }

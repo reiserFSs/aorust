@@ -130,11 +130,13 @@ lit by (a) the device state that `Randy_t`'s reset leaves and (b) the lights sto
   the lights while at most 8 exist (no range test; D3D applies `dvRange`), and only for visuals with the `enable_light` flag, which is 1 in all 41 nodes of the five meshes.
   `RVisual_t::SetMaxActiveLightCount(8)` is set at display init. The preview character (`VisualCATMesh_t` / `CCCharacter_t`) is a normal lit visual, so it gets the same lights;
   `RandyShadowlandsData_s::EnableCATLight` is never switched on here (only the world's environment object does).
-* **Vertex lighting equation** (D3D7 fixed function, per vertex, then Gouraud-interpolated): `colour = emissive + ambient_mat · (device ambient 0 + light ambient 0) +
-  Σ diffuse_mat · Ld · max(N·L, 0) · atten`, clamped to 1 after the sum, × texture. Every mesh node of the backdrop carries the render states 145 = 146 = 147 = 0 (material
-  source) and 148 = 1 (`COLOR1`); the vertex format (FVF 0x112) has no colour, and a colour source whose vertex colour is absent falls back to the material (D3D9 documentation of
-  `DIFFUSEMATERIALSOURCE`; **[INFERENCE]** that D3D7 does the same), so the material's own `diff` / `emis` are the diffuse / emissive terms — exactly what the loader already
-  uses (`base_color`, `emissive`; the floor material `grey-shit` has `diff` 0.32). `ao-render` now evaluates this per vertex exactly like D3D7 (`docs/formats.md` *Vertex lighting*).
+* **Vertex lighting equation** (D3D7 fixed function, per vertex, then Gouraud-interpolated): `colour = saturate(emissive + ambient_mat · (device ambient 0 + light ambient 0) +
+  Σ diffuse_mat · Ld · max(N·L, 0) · atten)` (the clamp is after the whole sum, emissive included), × texture, + specular, then fog; everything in the client's gamma space. Every mesh
+  node of the backdrop carries the render states 145 = 146 = 147 = 0 (material source) and 148 = 1 (`COLOR1`); the vertex format (FVF 0x112) has no colour, and a colour source whose
+  vertex colour is absent falls back to the material (D3D9 documentation of `AMBIENTMATERIALSOURCE`/`DIFFUSEMATERIALSOURCE`; **[INFERENCE]** that D3D7 does the same). The material
+  of the draw is the viewport's `D3DMATERIAL7`, which `RViewPort_t::SetMaterial` @randy31 0x1004b199 fills with only `opac`, `emis`, `spec · shin_str` and `shin`: **diffuse and ambient stay
+  white** (`SetDefaultMaterial` @0x1004b61e), so the backdrop's `diff` / `ambi` colours (the floor `grey-shit` has `diff` 0.32) tint nothing — the earlier loader used `diff` as a tint of
+  untextured materials, which the client does not do (details and the CAT/sun/colour-space RE: `docs/formats.md` *Vertex lighting*). `ao-render` evaluates this per vertex exactly like D3D7.
 * Implemented: `ao_formats::mesh::decode_mesh_lights` (the `RLight_t` nodes → `ao_scene::Light`, Z mirrored, colour `diffuse^2.2` like the statel lights, black lights dropped),
   `screens::login_environment()` (ambient 0, no sun, fog off, clear (0,0,0.2)), `screens::set_login_stage` (moves meshes *and* lights, `SetStage`), used by
   `login_world_scene`, `aomac play` (`show_backdrop`, `tick_preview`) and the `login_shot` example. Before this change the backdrop was drawn with the renderer's default

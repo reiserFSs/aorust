@@ -139,6 +139,7 @@ pub fn scene(count: usize) -> Scene {
         ambient: [0.06, 0.07, 0.12],
         sun_color: [0.12, 0.1, 0.12],
         sun_dir: [0.4, 0.8, 0.3],
+        sun_specular: 1.0,
     });
     s.spawn = Some([0.0, 4.0, 22.0]);
     s.spawn_look_at = Some([0.0, 2.0, 10.0]);

@@ -56,17 +56,21 @@ pub struct Submesh {
     /// Key into [`Scene::textures`]; `None` draws `base_color` only.
     pub texture: Option<TextureKey>,
     pub blend: Blend,
-    /// Linear RGBA material colour, multiplied with texture and vertex colour.
+    /// Linear RGBA tint multiplied with the texture (and the vertex colour). Archive meshes and CAT models always carry white RGB +
+    /// `opac`: `RViewPort_t::SetMaterial` (randy31 @0x1004b199) never copies the material's `diff`/`ambi` RGB into the
+    /// `_D3DMATERIAL7`, whose diffuse and ambient stay white (`SetDefaultMaterial` @0x1004b61e).
     pub base_color: [f32; 4],
     /// Disable back-face culling (front faces are counter-clockwise in ao-scene space).
     pub two_sided: bool,
-    /// Linear RGB added to the lighting term before texture modulation: `tex * (lighting + emissive)`, then fog.
+    /// `_D3DMATERIAL7.emissive` = the material's `emis` (linear RGB; `EMISSIVEMATERIALSOURCE` = MATERIAL). D3D adds it to the vertex
+    /// lighting sum, which is then saturated: `tex * saturate(emissive + ambient + diffuse lights)`, then fog.
     pub emissive: [f32; 3],
     /// Texture alpha is a self-illumination mask (opaque materials only): the texel is
     /// lit by `max(lighting, min(lighting + a, 1))` (engine: `saturate(a + lighting)`).
     pub glow_mask: bool,
-    /// Baked-lighting surface (dungeon room shells): vertex colour is *emissive* light,
-    /// `lit = tex * material * (vertex.rgb + 0.8 * ambient)`; no sun or point lights. Fog still applies.
+    /// Baked-lighting surface (dungeon room shells, shadow-mapped ground): `Vertex::color.rgb` is an *additive* light in D3D
+    /// (gamma) space, not linear: `lit = tex * tint * saturate(vertex.rgb + 0.8 * ambient + point/spot diffuse)` (all gamma
+    /// space); no sun, no specular. Fog still applies.
     pub prelit: bool,
     /// Texture coordinate drift in uv units per second (added to the vertex uv, wrapped by the sampler): scrolling clouds,
     /// water-like layers. `[0, 0]` = static.
@@ -170,6 +174,9 @@ pub struct Environment {
     pub sun_color: [f32; 3],
     /// Unit vector pointing from the scene towards the sun.
     pub sun_dir: [f32; 3],
+    /// `SpecularLightIntensity` of the sun tweak: the sun `D3DLIGHT7` specular colour is `sun_specular * sun_color`
+    /// (DisplaySystem `FUN_10059b98` @0x10059b98). 1.0 in every default tweak.
+    pub sun_specular: f32,
 }
 
 /// Perspective lens of the camera (`VisualCamera_t(fov, aspect, near, far)` -> `RCamera_t`, randy31 @0x1002a68a).

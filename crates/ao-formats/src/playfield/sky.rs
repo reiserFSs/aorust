@@ -85,6 +85,11 @@ impl Tweaks {
         None
     }
 
+    /// `Float <name>: <number>` (first definition).
+    fn scalar(&self, name: &str) -> Option<f32> {
+        self.0.lines().find_map(|l| l.trim_start().strip_prefix("Float")?.trim_start().strip_prefix(name)?.trim_start().strip_prefix(':')?.split_whitespace().next()?.parse().ok())
+    }
+
     /// Array `name` at day time factor `f` (linear interpolation over the entries, [INFERENCE]: FXS array access).
     fn at(&self, name: &str, f: f32) -> Option<f32> {
         let a = self.array(name)?;
@@ -188,6 +193,8 @@ pub struct Sky {
     /// `GroundLightCurrent` (sRGB) and `AmbientLightCurrent`.
     pub sun: Option<[f32; 3]>,
     pub ambient: Option<[f32; 3]>,
+    /// `SpecularLightIntensity` of the sun light (`Float SpecularLightIntensity: 1.0`; 0.01 in `Tweak_Playfield_Alien_LandingCraft`).
+    pub sun_specular: f32,
     /// `CloudLightCurrent` (sRGB), white when the script has no cloud light track.
     cloud_light: [f32; 3],
     /// Unit vector towards the sun in scene space.
@@ -279,7 +286,7 @@ impl Sky {
         let sun = t.rgb(["GroundLightR", "GroundLightG", "GroundLightB"], f).map(|c| c.map(|v| (v * 2.0).min(1.0)));
         let ambient = t.at("AmbientLight", f).map(|a| [a; 3]).or_else(|| t.rgb(["AmbientLightR", "AmbientLightG", "AmbientLightB"], f));
         let cloud_light = t.rgb(["CloudLightR", "CloudLightG", "CloudLightB"], f).unwrap_or([1.0; 3]);
-        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, cloud_light, sun_dir: sun_dir(day_time), sun_ao: sun_ao(day_time), sun2_ao: sun2_ao(day_time), day_time, night: t.at("NightIntensity", f).unwrap_or(1.0), weather: crate::weather::State::clear() })
+        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, sun_specular: t.scalar("SpecularLightIntensity").unwrap_or(1.0), cloud_light, sun_dir: sun_dir(day_time), sun_ao: sun_ao(day_time), sun2_ao: sun2_ao(day_time), day_time, night: t.at("NightIntensity", f).unwrap_or(1.0), weather: crate::weather::State::clear() })
     }
 
     /// The weather of the playfield at this moment (`ThickCloudsIntensity`, `HighAltitudeWind`).

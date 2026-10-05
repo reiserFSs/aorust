@@ -96,9 +96,11 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_
     };
     // one texel per 2 cells along x, one per cell along z (see `shadow`)
     // With a shadow map the ground is `tile * saturate(palette + sun * N.L + lights)` (see `shadow::palette`), which the
-    // renderer's `prelit` mode (`min(vertex.rgb + 0.8 * ambient + lights, 1)`) evaluates when the vertex colour is
-    // `palette + sun * N.L - 0.8 * ambient` (computed here, linear in the interpolation like the engine's vertex lighting).
-    let env = scene.environment.unwrap_or(Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 0.0, fog_end: 1.0, ambient: [1.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0] });
+    // renderer's `prelit` mode (`saturate(vertex.rgb + 0.8 * ambient + lights)`, all in the client's gamma space) evaluates when
+    // the vertex colour is `palette + sun * N.L - 0.8 * ambient` (computed here in gamma space, interpolated by the Gouraud
+    // stage like the engine's vertex lighting).
+    let env = scene.environment.unwrap_or(Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 0.0, fog_end: 1.0, ambient: [1.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 1.0 });
+    let (sun, ambient) = (env.sun_color.map(super::environment::linear_to_srgb), env.ambient.map(super::environment::linear_to_srgb));
     let prelit = shade.is_some();
     let vertex = |x: usize, z: usize, a: f32, lift: f32| {
         let n = normal(x, z);
@@ -106,7 +108,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_
             Some(s) => {
                 let ndl = (n[0] * env.sun_dir[0] + n[1] * env.sun_dir[1] + n[2] * env.sun_dir[2]).max(0.0);
                 let p = shadow::palette(s.sample(x as f32 * 0.5, z as f32));
-                let c = [0, 1, 2].map(|c| p + env.sun_color[c] * ndl - 0.8 * env.ambient[c]);
+                let c = [0, 1, 2].map(|c| p + sun[c] * ndl - 0.8 * ambient[c]);
                 [c[0], c[1], c[2], a]
             }
             None => [1.0, 1.0, 1.0, a],

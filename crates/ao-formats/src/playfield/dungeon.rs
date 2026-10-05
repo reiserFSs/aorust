@@ -766,7 +766,8 @@ fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<Text
     let prelit = match room.lightmap.as_ref().and_then(|l| depack_lightmap(l.0, &l.1)).filter(|c| c.len() == vertices.len()) {
         Some(c) => {
             for (v, c) in vertices.iter_mut().zip(c) {
-                let l = c.map(|b| super::environment::srgb_to_linear(b as f32 / 255.0));
+                // D3D diffuse bytes: the additive light is used as is (gamma space, see `Submesh::prelit`)
+                let l = c.map(|b| b as f32 / 255.0);
                 v.color = [l[0], l[1], l[2], 1.0];
             }
             true

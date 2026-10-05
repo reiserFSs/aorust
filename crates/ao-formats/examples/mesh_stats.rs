@@ -8,7 +8,7 @@ fn main() -> anyhow::Result<()> {
     for ty in [MESH_TYPE, MESH_LOW_TYPE] {
         let (mut ok, mut empty, mut verts, mut tris) = (0usize, 0usize, 0usize, 0usize);
         let mut notex = 0usize;
-        let (mut blends, mut two_sided, mut coloured_untex, mut tinted_tex, mut subs) = ([0usize; 4], 0usize, 0usize, 0usize, 0usize);
+        let (mut blends, mut two_sided, mut subs) = ([0usize; 4], 0usize, 0usize);
         let (mut agree, mut disagree, mut emissive, mut glow, mut glow_emissive) = (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut specular = 0usize;
         let mut fails: BTreeMap<String, Vec<u32>> = BTreeMap::new();
@@ -40,9 +40,6 @@ fn main() -> anyhow::Result<()> {
                         glow += usize::from(sub.glow_mask);
                         specular += usize::from(sub.specular != [0.0; 3] && sub.shininess > 0.0);
                         glow_emissive += usize::from(em && sub.glow_mask);
-                        let tint = sub.base_color[..3] != [1.0; 3];
-                        coloured_untex += usize::from(tint && sub.texture.is_none());
-                        tinted_tex += usize::from(tint && sub.texture.is_some());
                     }
                 }
                 Ok(None) => {}
@@ -52,7 +49,7 @@ fn main() -> anyhow::Result<()> {
         println!("  winding vs normals: CCW-agree {agree}, disagree {disagree}");
         println!("type {ty}: geometry {ok}, no-geometry {empty}, verts {verts}, tris {tris}, untextured submeshes {notex}");
         let [opaque, test, blend, add] = blends;
-        println!("  submeshes {subs}: opaque {opaque}, alpha-test {test}, alpha-blend {blend}, additive {add}; two-sided {two_sided}; coloured untextured {coloured_untex}, tinted textured {tinted_tex}");
+        println!("  submeshes {subs}: opaque {opaque}, alpha-test {test}, alpha-blend {blend}, additive {add}; two-sided {two_sided}");
         println!("  emissive submeshes {emissive}, glow-mask submeshes {glow} (both {glow_emissive}), specular submeshes {specular}");
         for (k, v) in fails { println!("  FAIL x{} {k}: e.g. {:?}", v.len(), &v[..v.len().min(5)]); }
     }

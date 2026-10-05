@@ -9,6 +9,9 @@ struct G {
     grid: vec4<f32>,       // xyz = light grid origin, w = cell size
     dims: vec4<i32>,       // light grid cells (x, y, z)
     wave: array<vec4<f32>, 4>, // GameWaveCurve0..15 (`ao_scene::wave_curves`)
+    sun_g: vec4<f32>,      // rgb = sun colour in D3D (gamma) space, w = SpecularLightIntensity
+    ambient_g: vec4<f32>,  // device ambient, gamma space
+    fog_g: vec4<f32>,      // fog colour, gamma space
 }
 struct Mat {
     color: vec4<f32>,
@@ -44,6 +47,7 @@ struct VOut {
     @location(4) light: vec3<f32>,
     @location(5) dlight: vec3<f32>,
     @location(6) spec: vec3<f32>,
+    @location(7) tint: vec3<f32>,
 }
 
 fn vtx(v: VIn) -> VOut {
@@ -61,10 +65,13 @@ fn vtx(v: VIn) -> VOut {
 @vertex
 fn vs(v: VIn) -> VOut {
     var o = vtx(v);
+    let prelit = mat.emissive.w > 1.5;
     let l = light_vertex(o.wpos, o.n);
-    o.light = l.light;
+    // prelit surfaces: the vertex colour is the baked additive light in D3D space (see `shade`)
+    o.light = select(l.light, v.color.rgb, prelit);
     o.dlight = l.dlight;
     o.spec = l.spec;
+    o.tint = to_g(mat.color.rgb * select(v.color.rgb, vec3<f32>(1.0), prelit));
     return o;
 }
 
@@ -81,19 +88,35 @@ fn vs_sky(v: VIn) -> VOut {
     return o;
 }
 
-// D3D7 fixed-function vertex lighting (`IDirect3DDevice7::DrawIndexedPrimitive` with LIGHTING = 1, SHADEMODE = GOURAUD): evaluated
-// once per vertex, the results are interpolated across the triangle and modulated with the texture in the fragment stage.
-// Material sources are the material (render states 145..147 = 0, FVF 0x112 has no vertex colour); device AMBIENT is `g.ambient`.
-struct Lit {
-    light: vec3<f32>, // saturate(ambient + sun diffuse + point/spot diffuse); the emissive term is added in the fragment stage
-    dlight: vec3<f32>, // point/spot diffuse alone (prelit surfaces add it to the baked vertex colour)
-    spec: vec3<f32>, // material specular * sum of light specular terms (SPECULARENABLE), added after the texture stage
+// The client computes in framebuffer (gamma) space: D3D7 fixed function lighting, the texture stage (`tex * vertex colour`), the
+// specular add, fog and the blend all operate on the 8 bit gamma values, textures are not decoded. The scene contract hands over
+// colours as `c^2.2` ("linear"), the render target is sRGB: so the whole surface is shaded in gamma space (colours recovered
+// with `to_g`, the texture re-encoded with the exact inverse of the hardware sRGB decode) and the result is decoded with
+// `srgb_dec`, which the sRGB target encodes back to the very 8 bit value the client would have written.
+fn to_g(v: vec3<f32>) -> vec3<f32> {
+    return pow(max(v, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
+fn srgb_enc(l: vec3<f32>) -> vec3<f32> {
+    return select(1.055 * pow(l, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * l, l <= vec3<f32>(0.0031308));
+}
+fn srgb_dec(s: vec3<f32>) -> vec3<f32> {
+    return select(pow((s + 0.055) / 1.055, vec3<f32>(2.4)), s / 12.92, s <= vec3<f32>(0.04045));
 }
 
-// Sum over the lights of the grid cell containing `p`. D3D7 per light: attenuation `1 / (a0 + a1 d + a2 d^2)` for d <= dvRange (hard
-// cut), spot factor `clamp((rho - cos(phi/2)) / (cos(theta/2) - cos(phi/2)), 0, 1)` with `rho = -L.axis` (dvFalloff = 1),
-// diffuse `colour * max(N.L, 0)`, specular (only when N.L > 0, power > 0, LOCALVIEWER = 1) `colour * (N.H)^power`, `H = |L + V|`.
-// Lights without attenuation coefficients (a0 < 0) use the linear ramp `1 - d / range` (demo lights).
+// D3D7 fixed-function vertex lighting (`IDirect3DDevice7::DrawIndexedPrimitive` with LIGHTING = 1, SHADEMODE = GOURAUD): evaluated
+// once per vertex, the results are interpolated across the triangle and modulated with the texture in the fragment stage.
+// Material: diffuse and ambient white (`RViewPort_t::SetMaterial` leaves them at `SetDefaultMaterial`'s 1.0), emissive and
+// specular from `mat`; device AMBIENT is `g.ambient_g`. Everything below is gamma space.
+struct Lit {
+    light: vec3<f32>, // saturate(emissive + ambient + sun diffuse + point/spot diffuse) = the D3D vertex diffuse colour
+    dlight: vec3<f32>, // point/spot diffuse alone (prelit surfaces add it to the baked vertex colour)
+    spec: vec3<f32>, // saturate(material specular * sum of light specular terms) (SPECULARENABLE), added after the texture stage
+}
+
+// Sum over the lights of the grid cell containing `p` (colours are gamma space). D3D7 per light: attenuation
+// `1 / (a0 + a1 d + a2 d^2)` for d <= dvRange (hard cut), spot factor `clamp((rho - cos(phi/2)) / (cos(theta/2) - cos(phi/2)), 0, 1)`
+// with `rho = -L.axis` (dvFalloff = 1), diffuse `colour * max(N.L, 0)`, specular (only when N.L > 0, power > 0, LOCALVIEWER = 1)
+// `colour * (N.H)^power`, `H = |L + V|`. Lights without attenuation coefficients (a0 < 0) use the linear ramp `1 - d / range`.
 fn vertex_lights(p: vec3<f32>, n: vec3<f32>, power: f32) -> array<vec3<f32>, 2> {
     var diff = vec3<f32>(0.0);
     var spec = vec3<f32>(0.0);
@@ -142,40 +165,45 @@ fn light_vertex(p: vec3<f32>, n_in: vec3<f32>) -> Lit {
     let n = select(vec3<f32>(0.0, 1.0, 0.0), n_in / nl, nl > 1e-6);
     let power = mat.spec.w;
     let dl = vertex_lights(p, n, power);
+    // the sun: a directional light, diffuse = GroundLightCurrent, specular = SpecularLightIntensity * GroundLightCurrent
+    let s = g.sun_dir.xyz;
+    let sn = dot(n, s);
+    var sun_spec = vec3<f32>(0.0);
+    if sn > 0.0 && power > 0.0 {
+        sun_spec = g.sun_g.rgb * (g.sun_g.w * pow(max(dot(n, normalize(s + normalize(g.eye.xyz - p))), 0.0), power));
+    }
     var o: Lit;
     o.dlight = dl[0];
-    o.light = min(g.ambient.rgb + g.sun_color.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + dl[0], vec3<f32>(1.0));
-    o.spec = min(mat.spec.rgb * dl[1], vec3<f32>(1.0));
+    o.light = min(to_g(mat.emissive.rgb) + g.ambient_g.rgb + g.sun_g.rgb * max(sn, 0.0) + dl[0], vec3<f32>(1.0));
+    o.spec = min(to_g(mat.spec.rgb) * (dl[1] + sun_spec), vec3<f32>(1.0));
     return o;
 }
 
 // mode: 0 opaque, 1 alpha test, 2 alpha blend, 3 additive
 fn shade(i: VOut, mode: u32) -> vec4<f32> {
     let t = textureSample(tex, samp, i.uv + mat.scroll.xy * g.fog.z);
-    let c = t * i.color * mat.color;
-    if mode == 1u && c.a < 0.5 {
+    let alpha = t.a * i.color.a * mat.color.a;
+    if mode == 1u && alpha < 0.5 {
         discard;
     }
     let to_eye = g.eye.xyz - i.wpos;
     var light = i.light;
     var spec = i.spec;
-    var lit: vec3<f32>;
     if mat.emissive.w > 1.5 {
-        // prelit room shell: vertex colour is emissive light (engine: tex * saturate(lightmap + 0.8 * ambient + dlight))
-        lit = t.rgb * mat.color.rgb * min(i.color.rgb + 0.8 * g.ambient.rgb + i.dlight, vec3<f32>(1.0));
+        // prelit: vertex colour is additive light (engine: tex * saturate(lightmap + 0.8 * ambient + dlight))
+        light = clamp(i.light + 0.8 * g.ambient_g.rgb + i.dlight, vec3<f32>(0.0), vec3<f32>(1.0));
         spec = vec3<f32>(0.0);
-    } else {
-        if mat.emissive.w > 0.5 {
-            light = max(light, min(light + t.a, vec3<f32>(1.0))); // alpha = self-illumination mask (engine: saturate(a + lighting))
-        }
-        lit = c.rgb * (light + mat.emissive.rgb) + spec; // engine: tex * (emissive + lighting) + specular
+    } else if mat.emissive.w > 0.5 {
+        light = min(light + t.a, vec3<f32>(1.0)); // alpha = self-illumination mask (stage 0 ADD: saturate(a + lighting))
     }
+    // texture stage MODULATE, then the specular add (both clamped to the framebuffer range), then fog: all in gamma space
+    let lit = min(srgb_enc(t.rgb) * i.tint * light + spec, vec3<f32>(1.0));
     let f = clamp((length(to_eye) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
     // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
     let add = mode == 3u;
-    let rgb = select(mix(lit, g.fog_color.rgb, f), lit, add);
-    let a = select(select(1.0, c.a, mode == 2u), c.a * (1.0 - f), add);
-    return vec4<f32>(rgb, a);
+    let rgb = select(mix(lit, g.fog_g.rgb, f), lit, add);
+    let a = select(select(1.0, alpha, mode == 2u), alpha * (1.0 - f), add);
+    return vec4<f32>(srgb_dec(rgb), a);
 }
 
 // Sky: unlit, unfogged; opaque ignores alpha.

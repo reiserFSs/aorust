@@ -44,11 +44,11 @@ fn building_with_cutout_masts() {
 }
 
 #[test]
-fn materials_carry_colour_blend_and_cull() {
+fn materials_carry_opacity_blend_and_cull() {
     let Some(store) = store() else { return };
-    // 9918: one flat-colour (untextured) submesh, red/pink diffuse
+    // 9918: one flat-colour (untextured) submesh whose `diff` is pink in the data; the D3D material stays white
     let s = &load_mesh(&store, 9918).unwrap().meshes[0].submeshes;
-    assert!(s.iter().any(|s| s.texture.is_none() && s.base_color[..3] != [1.0; 3]));
+    assert!(s.iter().any(|s| s.texture.is_none()) && s.iter().all(|s| s.base_color[..3] == [1.0; 3]));
     // 2175: translucent submesh (opacity 0.35, alpha blend) next to opaque ones
     let s = &load_mesh(&store, 2175).unwrap().meshes[0].submeshes;
     assert!(s.iter().any(|s| s.blend == ao_scene::Blend::AlphaBlend && (s.base_color[3] - 0.35).abs() < 1e-3));

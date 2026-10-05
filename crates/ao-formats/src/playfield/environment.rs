@@ -69,6 +69,11 @@ pub fn srgb_to_linear(c: f32) -> f32 {
     c.powf(2.2)
 }
 
+/// Inverse of [`srgb_to_linear`]: a scene-contract colour back to the client's gamma-space (framebuffer) value.
+pub fn linear_to_srgb(c: f32) -> f32 {
+    c.max(0.0).powf(1.0 / 2.2)
+}
+
 fn lin(c: [u8; 3]) -> [f32; 3] {
     c.map(|b| srgb_to_linear(b as f32 / 255.0))
 }
@@ -119,7 +124,7 @@ pub fn to_scene(env: &Env, outdoor: bool, sky: Option<&Sky>) -> Environment {
     };
     let dir = sky.map_or(SUN_DIR, |s| s.sun_dir);
     let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-    Environment { sky_color, fog_color, fog_start: NEAR, fog_end, ambient, sun_color, sun_dir: dir.map(|v| v / l) }
+    Environment { sky_color, fog_color, fog_start: NEAR, fog_end, ambient, sun_color, sun_dir: dir.map(|v| v / l), sun_specular: sky.map_or(1.0, |s| s.sun_specular) }
 }
 
 #[cfg(test)]
