@@ -3,6 +3,7 @@
 //! an [`Identity`], one flag byte, then the type-specific body (layouts: docs/zone.md).
 //! Fixtures come from the sanitized live capture `docs/captures/zone_ithaca.rec`.
 
+pub mod combat;
 pub mod dynel;
 pub mod misc;
 pub mod outgoing;

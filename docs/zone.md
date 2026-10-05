@@ -78,6 +78,7 @@ No ptype 5 (text) frame was received: server chat arrives as N3. Nothing is unde
 | chat | incoming: N3 text IIRs (not yet identified — only 0x43 chat-server info seen); outgoing vicinity/whisper/shout via `ptype 5` `TextMessage` (`outgoing::text_payload/text_frame`); connect the chat server `199.241.136.157:7005` (0x43) — protocol not captured | Client_t::SendVicinityMessage IF 0x10001464; docs/zone/misc.md §14–15 |
 | HUD / stats | `FullCharacter` stats (Health 34, Level 1, Cash, IP, abilities) + `StatIIR_t` deltas → HUD bars/windows; names via the client's own stat table (GC 0x10027483 / 0x1002f009, 524 ids) | docs/zone/world.md §2, docs/zone/dynel.md §3 |
 | combat | `Attack/AttackInfo/StopFight/MissedAttackInfo/SpecialAttack*` decoders exist; effects/animations need the character animation state machine | docs/zone/misc.md §3–11 |
+| combat input / outgoing | `combat::{attack, stop_fight, sec_spec_attack}` encoders (flag byte 0), `can_attack`, `AttackGate` (`+0x79` guard), `default_attack`; keys/clicks → N3Msg chain | docs/zone/combat-net.md |
 | time of day | `GameTimeIIR_t.time` (67170.0) → sky clock (`GameDayTime` wraps at 6480 s; 67170 mod 6480 = 2370) | docs/zone/world.md §4 |
 | playfield changes | `PlayfieldAnarchyF` again (+ `ZoneRedirection` 0x3C when the zone server changes) | docs/zone/world.md §1, protocol.md §5 |
 
