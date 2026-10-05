@@ -3,6 +3,7 @@
 //! Format notes live in `docs/formats.md`.
 
 mod archive;
+pub mod character;
 pub mod mesh;
 pub mod playfield;
 pub mod texture;
