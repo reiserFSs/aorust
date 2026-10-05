@@ -14,6 +14,22 @@ fn walk(d: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Container + codec from the file header (RIFF `fmt ` tag).
+fn codec(f: &Path) -> String {
+    let h = std::fs::read(f).map(|d| d[..d.len().min(24)].to_vec()).unwrap_or_default();
+    if h.len() >= 22 && &h[..4] == b"RIFF" {
+        let tag = u16::from_le_bytes([h[20], h[21]]);
+        return match tag {
+            1 => "wav PCM".into(),
+            2 => "wav MS-ADPCM".into(),
+            0x11 => "wav IMA-ADPCM".into(),
+            0x55 => "wav MPEG-L3".into(),
+            t => format!("wav tag {t:#x}"),
+        };
+    }
+    "ogg Vorbis".into()
+}
+
 fn main() {
     let root = PathBuf::from(std::env::args().nth(1).expect("client dir")).join("cd_image/sound");
     let mut files = Vec::new();
@@ -29,8 +45,10 @@ fn main() {
                 secs += p.frames() as f64 / p.rate as f64;
                 let peak = p.samples.iter().fold(0f32, |m, s| m.max(s.abs()));
                 assert!(peak.is_finite());
-                let ext = f.extension().unwrap().to_string_lossy().to_ascii_lowercase();
-                *fmts.entry(format!("{ext} {} Hz {} ch", p.rate, p.channels)).or_default() += 1;
+                *fmts.entry(format!("{} {} Hz {} ch", codec(f), p.rate, p.channels)).or_default() += 1;
+                if p.frames() == 0 {
+                    *fmts.entry("(empty data chunk)".into()).or_default() += 1;
+                }
             }
             Err(e) => fails.entry(e.to_string().split(": ").last().unwrap_or("").to_string()).or_default().push(format!("{}: {e}", f.strip_prefix(&root).unwrap().display())),
         }

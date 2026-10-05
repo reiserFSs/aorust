@@ -139,10 +139,10 @@ impl Archive {
         m.0.get(self.index.get(key)?)
     }
     fn u32s(&self, m: &Msg, key: &str) -> Vec<u32> {
-        self.ent(m, key).map_or(vec![], |e| e.data.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+        self.ent(m, key).map_or(vec![], |e| e.data.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect())
     }
     fn f32s(&self, m: &Msg, key: &str) -> Vec<f32> {
-        self.ent(m, key).map_or(vec![], |e| e.data.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        self.ent(m, key).map_or(vec![], |e| e.data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
     }
     fn bytes(&self, m: &Msg, key: &str) -> Vec<u8> {
         self.ent(m, key).map_or(vec![], |e| e.data.clone())

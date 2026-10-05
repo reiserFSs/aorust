@@ -125,10 +125,17 @@ struct Ambient {
     timers: Vec<f32>,
 }
 
-/// Keep-alive voice of one statel emitter (`PlayGameSound` called every frame while the camera is inside).
+/// State of one statel emitter (`PlayGameSound` called every frame while the camera is inside).
 #[derive(Default)]
 struct EmitterState {
-    voice: u64,
+    started: bool,
+    /// looping voice of the definition's own file
+    parent: u64,
+    /// currently playing child one-shot
+    child: u64,
+    last_child: usize,
+    /// per child: seconds until it fires (timed children of definitions with neither `play_all` nor `random_child`)
+    timers: Vec<f32>,
     /// seconds since the camera was last inside the radius
     idle: f32,
     /// seconds until the next probability roll (`prob < 100` sounds roll at most once per second)
@@ -176,6 +183,11 @@ impl Runtime {
     pub fn new(sh: &Arc<Shared>, lib: Library, seed: u64) -> Runtime {
         let music = MusicPlayer::new(sh.clone(), lib.project.clone(), seed);
         Runtime { lib, music, pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, rng: Rng(seed.rotate_left(17) | 1), fx: 1.0 }
+    }
+
+    /// Emitters currently inside the camera's radius (or in their 2 s hold).
+    pub fn active_emitters(&self) -> usize {
+        self.emitters.iter().filter(|e| e.started).count()
     }
 
     /// Plays a definition once, non-positionally, at `Total_FX`.
@@ -255,7 +267,7 @@ impl Runtime {
                 continue;
             }
             let vol = def.vol_max * level;
-            let alive = self.ambient.get(&key).map_or(false, |a| sh.mixer().is_playing(a.voice));
+            let alive = self.ambient.get(&key).is_some_and(|a| sh.mixer().is_playing(a.voice));
             if !alive {
                 let Some(path) = def.file.as_deref().and_then(|f| sh.resolve(f)) else { continue };
                 let voice = sh.play_sample(&path, vol, true);
@@ -284,41 +296,81 @@ impl Runtime {
 
     /// `EvaluateStatelSoundFog` (N3 @0x10024eff, every frame): inside an emitter's radius `PlayGameSound(id, pos, 2 s,
     /// ..., radius)` is called each frame: a looping sound whose level tracks the camera distance
-    /// (`radius`, linear), not restarted while it plays; 2 s after the last call it fades out.
+    /// (`radius`, linear), not restarted while it plays; 2 s after the last call it fades out. Children follow the
+    /// definition's flags: `random_child` = one child at a time, re-picked (never the same twice) when it ends,
+    /// `play_all` = all at start, otherwise timed one-shots per child interval [INFERENCE: flag semantics from the
+    /// SandyInterface play list, see docs].
     fn tick_emitters(&mut self, sh: &Shared, dt: f32, cam: [f32; 3]) {
         let Some(pf) = &self.pf else { return };
         for (e, st) in pf.emitters.iter().zip(&mut self.emitters) {
             let d = ((e.pos[0] - cam[0]).powi(2) + (e.pos[1] - cam[1]).powi(2) + (e.pos[2] - cam[2]).powi(2)).sqrt();
             let Some(def) = self.lib.sounds.get(e.sound_id) else { continue };
-            let alive = st.voice != 0 && sh.mixer().is_playing(st.voice);
             if d >= e.radius {
-                if alive {
+                if st.started {
                     st.idle += dt;
                     if st.idle >= EMITTER_HOLD {
-                        sh.mixer().fade(st.voice, 0.0, def.fade_out.max(0.001), true);
-                        st.voice = 0;
+                        let mut m = sh.mixer();
+                        for v in [st.parent, st.child] {
+                            m.fade(v, 0.0, def.fade_out.max(0.001), true);
+                        }
+                        *st = EmitterState::default();
                     }
                 }
                 continue;
             }
             st.idle = 0.0;
             let level = attenuation(d, def.min_dist, def.max_dist, Some(e.radius)) * (def.vol_min + self.rng.unit() * (def.vol_max - def.vol_min)) * self.fx;
-            if alive {
-                sh.mixer().set_gain(st.voice, level);
-                continue;
-            }
-            st.gate -= dt;
-            if st.gate > 0.0 {
-                continue;
-            }
-            if def.prob != 100 {
-                st.gate = 1.0;
-                if self.rng.next() % 200 >= def.prob as u32 {
+            if !st.started {
+                st.gate -= dt;
+                if st.gate > 0.0 {
                     continue;
                 }
+                if def.prob != 100 {
+                    st.gate = 1.0;
+                    if self.rng.next() % 200 >= def.prob as u32 {
+                        continue;
+                    }
+                }
+                st.started = true;
+                st.last_child = usize::MAX;
+                st.timers = def.children.iter().map(|c| self.lib.sounds.get(*c).map_or(f32::MAX, |c| c.interval_min + self.rng.unit() * (c.interval_max - c.interval_min).max(0.0))).collect();
+                if let Some(p) = def.file.as_deref().and_then(|f| sh.resolve(f)) {
+                    st.parent = sh.play_sample(&p, level, true);
+                }
+                if def.play_all {
+                    for c in def.children.iter().filter_map(|c| self.lib.sounds.get(*c)) {
+                        if let Some(p) = c.file.as_deref().and_then(|f| sh.resolve(f)) {
+                            sh.play_sample(&p, level, false);
+                        }
+                    }
+                }
             }
-            if let Some(p) = def.file.as_deref().and_then(|f| sh.resolve(f)) {
-                st.voice = sh.play_sample(&p, level, true);
+            {
+                let mut m = sh.mixer();
+                m.set_gain(st.parent, level);
+                m.set_gain(st.child, level);
+            }
+            if def.random_child && !def.children.is_empty() && !sh.mixer().is_playing(st.child) {
+                let n = def.children.len();
+                let mut i = self.rng.next() as usize % n;
+                if i == st.last_child {
+                    i = (i + 1) % n;
+                }
+                st.last_child = i;
+                if let Some(p) = self.lib.sounds.get(def.children[i]).and_then(|c| c.file.as_deref()).and_then(|f| sh.resolve(f)) {
+                    st.child = sh.play_sample(&p, level, false);
+                }
+            } else if !def.play_all && !def.random_child {
+                for (i, tm) in st.timers.iter_mut().enumerate() {
+                    *tm -= dt;
+                    if *tm <= 0.0 {
+                        let Some(c) = self.lib.sounds.get(def.children[i]) else { *tm = f32::MAX; continue };
+                        *tm = c.interval_min + self.rng.unit() * (c.interval_max - c.interval_min).max(0.0);
+                        if let Some(p) = c.file.as_deref().and_then(|f| sh.resolve(f)) {
+                            sh.play_sample(&p, level, false);
+                        }
+                    }
+                }
             }
         }
     }

@@ -40,6 +40,8 @@ struct Playing {
 enum State {
     Idle,
     Playing(Playing),
+    /// Closing sample of a pause transition (`ptrans`) fading the layer out; silence follows.
+    Ending { voice: u64, left: f32, pause: f32 },
     /// Silence between two play spans of a pause track.
     Paused { left: f32 },
 }
@@ -92,8 +94,9 @@ impl MusicPlayer {
     }
 
     fn stop_current(&mut self, fade: f32) {
-        if let State::Playing(p) = std::mem::replace(&mut self.state, State::Idle) {
-            self.sh.mixer().fade(p.voice, 0.0, fade, true);
+        match std::mem::replace(&mut self.state, State::Idle) {
+            State::Playing(Playing { voice, .. }) | State::Ending { voice, .. } => self.sh.mixer().fade(voice, 0.0, fade, true),
+            _ => {}
         }
         self.now_playing = None;
     }
@@ -184,6 +187,8 @@ impl MusicPlayer {
                 self.start_entry(layer, fade);
             }
             State::Paused { left } => self.state = State::Paused { left: left - dt },
+            State::Ending { left, pause, .. } if left - dt <= 0.0 => self.state = State::Paused { left: pause },
+            State::Ending { voice, left, pause } => self.state = State::Ending { voice, left: left - dt, pause },
             State::Playing(p) => self.tick_playing(layer, p, dt),
         }
     }
@@ -191,47 +196,72 @@ impl MusicPlayer {
     fn tick_playing(&mut self, layer: usize, mut p: Playing, dt: f32) {
         p.t += dt;
         self.played += dt;
-        let Some(next) = p.next.clone() else {
-            // no successor: the sample plays out, then the layer restarts from an entry sample
-            let end = self.proj.samples[p.sample].end_ms as f32 / 1000.0;
-            if !(p.t > end + 0.5 && !self.sh.mixer().is_playing(p.voice)) {
+        let sample = &self.proj.samples[p.sample];
+        let end = sample.end_ms as f32 / 1000.0;
+        let Some((pause_secs, fade)) = self.pause_due(layer) else {
+            let Some(next) = p.next.clone() else {
+                // no successor: the sample plays out, then the layer restarts from an entry sample
+                if p.t <= end + 0.5 {
+                    self.state = State::Playing(p);
+                }
+                return;
+            };
+            if p.t + LOOKAHEAD < next.fot_ms as f32 / 1000.0 {
                 self.state = State::Playing(p);
+                return;
             }
+            let fade = next.ftime_ms as f32 / 1000.0;
+            self.sh.mixer().fade(p.voice, 0.0, fade, true);
+            self.start(next.to, fade); // on failure the state stays Idle and the layer restarts
             return;
         };
-        if p.t + LOOKAHEAD < next.fot_ms as f32 / 1000.0 {
+        // pause track: the play span is over. A sample with a pause transition (`ptrans`) crosses into its closing
+        // sample at that transition's `fot`; others fade out at their normal transition point (ptype 0 = hard cut).
+        let closing = sample.ptrans.iter().find_map(|t| self.sample_path(t.to).map(|path| (t.clone(), path)));
+        let fot = match (&closing, &p.next) {
+            (Some((t, _)), _) => t.fot_ms as f32 / 1000.0,
+            (None, Some(n)) => n.fot_ms as f32 / 1000.0,
+            (None, None) => end,
+        };
+        if p.t + LOOKAHEAD < fot {
             self.state = State::Playing(p);
             return;
         }
-        if let Some((secs, fade)) = self.due_pause(layer) {
-            // pause track: fade the span out (ptype 0 = hard cut) and stay silent for the pause length
-            self.sh.mixer().fade(p.voice, 0.0, fade, true);
-            self.state = State::Paused { left: secs };
-            self.now_playing = None;
-            return;
+        self.advance_node(layer);
+        let mut m = self.sh.mixer();
+        match closing {
+            Some((t, path)) => {
+                m.fade(p.voice, 0.0, t.ftime_ms as f32 / 1000.0, true);
+                drop(m);
+                let ending = self.sh.play_stream(&path, self.gain(t.to), t.ftime_ms as f32 / 1000.0);
+                self.now_playing = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                self.state = State::Ending { voice: ending, left: self.proj.samples[t.to].end_ms as f32 / 1000.0, pause: pause_secs };
+            }
+            None => {
+                m.fade(p.voice, 0.0, fade, true);
+                self.now_playing = None;
+                self.state = State::Paused { left: pause_secs };
+            }
         }
-        let fade = next.ftime_ms as f32 / 1000.0;
-        self.sh.mixer().fade(p.voice, 0.0, fade, true);
-        self.start(next.to, fade); // on failure the state stays Idle and the layer restarts
     }
 
-    /// `Some((pause seconds, fade-out seconds))` when the current play span of the layer's pause track is over;
-    /// advances to the next node.
-    fn due_pause(&mut self, layer: usize) -> Option<(f32, f32)> {
+    /// `Some((pause seconds, fade-out seconds))` once the current play span of the layer's pause track is over.
+    fn pause_due(&self, layer: usize) -> Option<(f32, f32)> {
         let pt = &self.proj.pauses[self.proj.layers[layer].pause?];
         let n = pt.nodes.get(self.node)?;
         let beat = 60.0 / pt.bpm.max(1.0);
-        if self.played < n.play_beats as f32 * beat {
-            return None;
-        }
-        let fade = if n.ptype == 0 { 0.0 } else { n.fade_out_ms as f32 / 1000.0 };
-        let secs = n.pause_beats as f32 * beat;
+        (self.played >= n.play_beats as f32 * beat).then(|| (n.pause_beats as f32 * beat, if n.ptype == 0 { 0.0 } else { n.fade_out_ms as f32 / 1000.0 }))
+    }
+
+    /// Next pause track node (`loopto` after the last).
+    fn advance_node(&mut self, layer: usize) {
+        let Some(p) = self.proj.layers[layer].pause else { return };
+        let pt = &self.proj.pauses[p];
         self.node += 1;
         if self.node >= pt.nodes.len() {
             self.node = pt.loopto.min(pt.nodes.len() - 1);
         }
         self.played = 0.0;
-        Some((secs, fade))
     }
 
     fn node_fade_in(&self, layer: usize) -> f32 {

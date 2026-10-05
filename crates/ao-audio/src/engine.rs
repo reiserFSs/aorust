@@ -163,11 +163,12 @@ impl Audio {
     pub fn status(&self) -> String {
         let s = self.stats();
         format!(
-            "audio[{}]: {} callbacks, {} frames, {} voices, rms {:.4}, peak {:.3}",
+            "audio[{}]: {} callbacks, {} frames, {} voices, {} emitters, rms {:.4}, peak {:.3}",
             self.device,
             s.callbacks.load(Relaxed),
             s.frames.load(Relaxed),
             s.voices.load(Relaxed),
+            self.active_emitters(),
             f32::from_bits(s.rms_bits.load(Relaxed)),
             f32::from_bits(s.peak_bits.load(Relaxed)),
         )
@@ -217,6 +218,18 @@ impl Audio {
     /// Login/startup music (`SandyInterface_t::PlayStartupMusic` = layer `mountain\night`).
     pub fn play_startup_music(&self) {
         self.set_music_layer(Some("mountain\\night"));
+    }
+
+    /// Statel sound emitters that are currently audible (camera inside their radius).
+    pub fn active_emitters(&self) -> usize {
+        self.rt().as_ref().map_or(0, |r| r.active_emitters())
+    }
+
+    /// Name of the current music layer (`desert\\Day`), `None` = silence.
+    pub fn music_layer(&self) -> Option<String> {
+        let g = self.rt();
+        let m = &g.as_ref()?.music;
+        m.layer().map(|l| m.project().layers[l].name.clone())
     }
 
     /// File name of the music sample that is playing (diagnostics).
