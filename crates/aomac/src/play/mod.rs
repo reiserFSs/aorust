@@ -34,7 +34,7 @@ const FADE_OUT: f32 = 7.0;
 
 enum Bg {
     Servers(Result<Vec<ServerEntry>, String>),
-    Connected(Result<LoginSession, String>),
+    Connected(u32, Result<LoginSession, String>),
     Backdrop(Result<Box<Scene>, String>),
     World(u32, Result<Box<Scene>, String>),
     /// The character-creation world (`charactercreation_*.abiff` + connectors), decoded in the background.
@@ -88,6 +88,8 @@ struct Play {
     dialog_w: Option<(WindowId, DialogKind)>,
     progress_t: f32,
     session: Option<LoginSession>,
+    /// bumped by `show_login`; tags the connect thread so a late result after Cancel/timeout is dropped
+    conn_gen: u32,
     // character selection
     backdrop: Option<Box<Scene>>,
     chars: Vec<CharacterEntry>,
@@ -166,6 +168,7 @@ pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String
         dialog_w: None,
         progress_t: 0.0,
         session: None,
+        conn_gen: 0,
         backdrop: None,
         chars: vec![],
         rows: vec![],

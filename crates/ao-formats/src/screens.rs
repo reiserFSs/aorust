@@ -110,7 +110,7 @@ impl CharCreateCameras {
             tag(&mut w, "sec")?;
             tag(&mut w, "KeyframeCount:")?;
             let k: usize = num(&mut w)?;
-            let mut keyframes = Vec::with_capacity(k);
+            let mut keyframes = Vec::new(); // k is untrusted: the loop fails at the first missing `C:`
             for _ in 0..k {
                 tag(&mut w, "C:")?;
                 keyframes.push(ids(&mut w)?);
@@ -400,7 +400,7 @@ impl TextDb {
             if cat == u32::MAX {
                 continue; // the string pool
             }
-            let mut v = Vec::with_capacity((end - start) / 8);
+            let mut v = Vec::with_capacity(end.saturating_sub(start) / 8);
             let mut o = start;
             while o + 8 <= end {
                 v.push((u32_at(o)?, u32_at(o + 4)?));
@@ -473,6 +473,17 @@ mod tests {
     use super::*;
 
     const CAMS: &str = "CameraCount: 2\r\nID: 1 \r\nPos: 1 2 3\r\nRot: 0 1 0 0\r\ndegFOV: 60\r\nID: 1 1 \r\nPos: -1.5 2 3e-2\r\nRot: 0 0 0 1\r\ndegFOV: 38\r\nTransitionCount: 1\r\nTransitionId: 1 \r\nDuration: 1.8 sec\r\nKeyframeCount: 2\r\nC: 1 \r\nC: 1 1 \r\n";
+
+    #[test]
+    fn fuzz_repros_are_errors() {
+        assert!(CharCreateCameras::parse(&CAMS.replace("KeyframeCount: 2", "KeyframeCount: 18446744073709551615")).is_err());
+        // table entry starting past the end of the file
+        let mut d = b"MMDB".to_vec();
+        for v in [1u32, 5, 0x1000] {
+            d.extend(v.to_le_bytes());
+        }
+        let _ = TextDb::parse(d);
+    }
 
     #[test]
     fn camera_file_grammar() {

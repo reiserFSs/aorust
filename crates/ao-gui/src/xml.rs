@@ -4,7 +4,7 @@
 //! inside quoted attribute values; `Views/Skills.xml` relies on that.  Only elements, attributes,
 //! text-less content, comments and declarations are needed.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 
 #[derive(Clone, Debug, Default)]
 pub struct Element {
@@ -33,7 +33,10 @@ fn decode(s: &str) -> String {
 struct P<'a> {
     s: &'a [u8],
     i: usize,
+    depth: u32,
 }
+
+const MAX_DEPTH: u32 = 64;
 
 impl<'a> P<'a> {
     fn ws(&mut self) {
@@ -66,6 +69,13 @@ impl<'a> P<'a> {
         String::from_utf8_lossy(&self.s[st..self.i]).into_owned()
     }
     fn element(&mut self) -> Result<Element> {
+        ensure!(self.depth < MAX_DEPTH, "xml: nesting deeper than {MAX_DEPTH}");
+        self.depth += 1;
+        let r = self.element_inner();
+        self.depth -= 1;
+        r
+    }
+    fn element_inner(&mut self) -> Result<Element> {
         // at '<'
         self.i += 1;
         let mut e = Element { name: self.name(), ..Default::default() };
@@ -92,7 +102,7 @@ impl<'a> P<'a> {
             }
             self.i += 1;
             self.ws();
-            let q = self.s[self.i];
+            let q = self.s.get(self.i).copied().unwrap_or(0);
             if q != b'"' && q != b'\'' {
                 bail!("xml: unquoted attribute {k} in <{}>", e.name);
             }
@@ -130,7 +140,7 @@ impl<'a> P<'a> {
 
 /// Parses a document and returns its root element.
 pub fn parse(src: &str) -> Result<Element> {
-    let mut p = P { s: src.as_bytes(), i: 0 };
+    let mut p = P { s: src.as_bytes(), i: 0, depth: 0 };
     loop {
         while p.i < p.s.len() && p.s[p.i] != b'<' {
             p.i += 1;
@@ -157,5 +167,13 @@ mod tests {
         assert_eq!(e.children.len(), 2);
         assert_eq!(e.children[0].attr("v"), Some("<b>x</b>\ny"));
         assert_eq!(e.children[0].attr("w"), Some("1"));
+    }
+
+    #[test]
+    fn malformed_input_is_an_error_not_a_panic() {
+        assert!(parse("<a b=").is_err());
+        assert!(parse("<a b=   ").is_err());
+        assert!(parse(&"<a>".repeat(200_000)).is_err());
+        assert!(parse(&format!("{}{}", "<a>".repeat(60), "</a>".repeat(60))).is_ok());
     }
 }

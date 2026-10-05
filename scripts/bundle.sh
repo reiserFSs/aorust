@@ -3,11 +3,13 @@
 set -e
 cd "$(dirname "$0")/.."
 CLIENT="${AOMAC_CLIENT:-$HOME/Games/ProjectRubiKa/client}"
-APP=target/aomac.app
+TD="${CARGO_TARGET_DIR:-target}"
+APP="$TD/aomac.app"
 cargo build --release -p aomac
+[ -f "$TD/release/aomac" ] || { echo "missing $TD/release/aomac" >&2; exit 1; }
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/aomac "$APP/Contents/MacOS/aomac-bin"
+cp "$TD/release/aomac" "$APP/Contents/MacOS/aomac-bin"
 cat > "$APP/Contents/MacOS/aomac" <<'L'
 #!/bin/sh
 exec "$(dirname "$0")/aomac-bin" play "$@"

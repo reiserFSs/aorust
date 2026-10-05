@@ -254,7 +254,7 @@ constants 780/410 at 0x101a9c70/0x101a9c74). `AnarchyLauncher.url` is parsed in 
 `KEY=value`, `#` comments skipped, key lower-cased: `showurl`, `accounturl`, `loginurl`, `errorurl`, and `N=value` code map lines
 (`1=331 …` the "special codes" 1…7 documented in the file header: 1 server not found, 2 login handler not found, 3 server lost,
 4 server timeout, 5 login handler lost, 6 player not ok, 7 character not ok). `ShowError(1,0)` is used for connect failures.
-**aomac** (no embedded browser): `Play::show_error` opens the identical URL with `open` and keeps the login window up. Evidence
+**aomac** (no embedded browser): `Play::show_error` opens the identical URL with `open` and keeps the login window up (args are signed `%d`; a negative detail gives `33--1.html`). The `LoginWindow` is created once and hidden/shown like the original (`SlotInitialize` creates all windows once); `Show(0)` bumps a connection generation so a connect still in flight when the user cancels or the progress timeout fires is dropped and its session closed (`ResetConnectionAndConfig`). A `0x21` reply during character creation also goes through `ShowError` (+`Show(0)`, leaving the creation scene), not the name-scene box. Evidence
 (curl, 2026-10-05, read-only): `http://client.project-rk.com/errors/<n>.html` 301→https and returns a generic static HTML page (teal
 `#0a574f` body, "Project: Rubi-Ka" header, h2 "<title by code> - 0", body "An unknown error occurred. Please contact support", Discord
 footer and 4 links); the codes tried (1, 13, 14, 331) differ only in the h2 title. Content is remote and generic, so a native

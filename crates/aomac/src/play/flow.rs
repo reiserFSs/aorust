@@ -82,8 +82,16 @@ impl Play {
         self.gui.set_window_pos(w, pos);
     }
 
+    /// `LoginWindow_c::Hide`: the window lives for the whole session.
+    pub(super) fn hide_login(&mut self) {
+        if let Some(w) = self.login_w {
+            self.gui.set_window_visible(w, false);
+        }
+    }
+
     pub(super) fn close_all(&mut self) {
-        for w in [self.login_w.take(), self.progress_w.take(), self.char_w.take(), self.dialog_w.take().map(|d| d.0)].into_iter().flatten() {
+        self.hide_login();
+        for w in [self.progress_w.take(), self.char_w.take(), self.dialog_w.take().map(|d| d.0)].into_iter().flatten() {
             self.gui.close_window(w);
         }
     }
@@ -93,11 +101,18 @@ impl Play {
     /// `LoginModule_c::Show(0)` + `LoginWindow_c::Focus`.
     pub(super) fn show_login(&mut self, host: &mut Host) {
         self.close_all();
-        self.session = None;
+        self.conn_gen += 1; // a connect still in flight is stale now (Bg::Connected is dropped)
+        self.session = None; // dropping the session closes the connection (ResetConnectionAndConfig)
+        if self.cc.is_some() {
+            self.cc_close_windows();
+            self.cc = None;
+        }
         self.screen = Screen::Login;
         self.show_backdrop(0, host);
-        let Some(w) = self.open_centered("LoginWindow") else { return };
+        // the original creates the LoginWindow once and Show/Hide it (docs/screens.md §1)
+        let Some(w) = self.login_w.or_else(|| self.open_centered("LoginWindow")) else { return };
         self.login_w = Some(w);
+        self.gui.set_window_visible(w, true);
         let g = &mut self.gui;
         g.set_visible(w, "steam_btn", false); // view_flags 256: hidden unless running under Steam
         g.set_feature_flags(w, "password", ao_gui::tvf::PASSWORD);
@@ -164,20 +179,21 @@ impl Play {
         self.pending_user = user.clone();
         self.gui.set_text(w, "password", ""); // ResetConnectionAndConfig clears name/password
         self.show_progress(CONNECT_TIMEOUT, false, host);
-        let tx = self.tx.clone();
+        let (tx, gen) = (self.tx.clone(), self.conn_gen);
         // connect blocks (<= 10 s); the password only lives in this closure until the session thread owns it
         std::thread::spawn(move || {
             let r = LoginSession::connect(&server)
                 .inspect(|s| s.login(&user, &pass))
                 .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Bg::Connected(r));
+            let _ = tx.send(Bg::Connected(gen, r));
         });
     }
 
     // ---- state 1 / 4: progress ---------------------------------------------------------------------------------
 
     fn show_progress(&mut self, timeout: f32, joining: bool, host: &mut Host) {
-        for w in [self.login_w.take(), self.progress_w.take(), self.char_w.take()].into_iter().flatten() {
+        self.hide_login();
+        for w in [self.progress_w.take(), self.char_w.take()].into_iter().flatten() {
             self.gui.close_window(w);
         }
         self.screen = Screen::Progress { timeout, joining };
@@ -190,7 +206,7 @@ impl Play {
 
     /// `LoginModule_c::ShowError(code, arg)` [GUI 0x10011deb] (docs/screens.md §3.6): the original navigates its embedded
     /// browser to `<ERRORURL><code>[-<arg>].html`; there is no embedded browser here, so the same URL opens in the default one.
-    fn show_error(&self, code: u32, arg: u32) {
+    fn show_error(&self, code: u32, arg: i32) {
         let Some(base) = errorurl(&self.dir) else {
             return eprintln!("login error {code}-{arg}: AnarchyLauncher.url has no ERRORURL");
         };
@@ -225,7 +241,8 @@ impl Play {
 
     pub(super) fn show_characters(&mut self, list: CharacterList, host: &mut Host) {
         self.char_list = list.clone();
-        for w in [self.login_w.take(), self.progress_w.take(), self.char_w.take()].into_iter().flatten() {
+        self.hide_login();
+        for w in [self.progress_w.take(), self.char_w.take()].into_iter().flatten() {
             self.gui.close_window(w);
         }
         self.screen = Screen::CharSelect;
@@ -444,7 +461,8 @@ impl Play {
 
     /// `AFCM::AddProgram(5)`: `ServerLogin3DModule_t` (docs/screens.md §7).
     pub(super) fn start_loading(&mut self, host: &mut Host) {
-        for w in [self.login_w.take(), self.progress_w.take(), self.char_w.take(), self.dialog_w.take().map(|d| d.0)].into_iter().flatten() {
+        self.hide_login();
+        for w in [self.progress_w.take(), self.char_w.take(), self.dialog_w.take().map(|d| d.0)].into_iter().flatten() {
             self.gui.close_window(w);
         }
         self.screen = Screen::Loading;
@@ -536,8 +554,9 @@ impl Play {
                 }
                 Bg::Backdrop(Err(e)) => eprintln!("login backdrop: {e}"),
                 Bg::CcWorld(r) => self.cc_world_loaded(r, host),
-                Bg::Connected(Ok(s)) => self.session = Some(s),
-                Bg::Connected(Err(e)) => {
+                Bg::Connected(gen, _) if gen != self.conn_gen => {} // cancelled/timed out: dropping the result closes the connection
+                Bg::Connected(_, Ok(s)) => self.session = Some(s),
+                Bg::Connected(_, Err(e)) => {
                     eprintln!("connection failed: {e}");
                     self.show_login(host);
                     self.show_error(1, 0); // ConnectToLH failed -> ShowError(1,0)
@@ -574,13 +593,13 @@ impl Play {
                     // SlotLoginReply: type 0x0d (LoginError) -> ShowError(type, arg)
                     eprintln!("login error {code}: {message}");
                     self.show_login(host);
-                    self.show_error(0x0d, code);
+                    self.show_error(0x0d, code as i32);
                 }
                 LoginEvent::Rejected { code, detail } => {
                     // SlotLoginReply: type 0x21 (RequestRejected) -> ShowError(type, detail)
                     eprintln!("login rejected (system message {code:#x}, detail {detail})");
                     self.show_login(host);
-                    self.show_error(code, detail as u32);
+                    self.show_error(code, detail);
                 }
                 LoginEvent::ZoneHandoff { zone_ip, zone_port, .. } => {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
