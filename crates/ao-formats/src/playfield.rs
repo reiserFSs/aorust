@@ -20,6 +20,7 @@ mod statel;
 mod terrain;
 mod water;
 
+pub use sky::DEFAULT_DAY_TIME;
 pub use spawn::{floor_below, scene_bounds};
 
 use std::collections::HashMap;
@@ -60,12 +61,23 @@ pub struct Report {
     pub first_mesh_error: Option<String>,
 }
 
-/// Decodes playfield `id` (terrain + placed static meshes) into a world-space scene.
+/// Decodes playfield `id` (terrain + placed static meshes) into a world-space scene at the client's frozen day time
+/// ([`DEFAULT_DAY_TIME`]).
 pub fn load_playfield(store: &RecordStore, client_dir: &Path, id: u32) -> Result<Scene> {
-    load_playfield_report(store, client_dir, id).map(|(s, _)| s)
+    load_playfield_at(store, client_dir, id, DEFAULT_DAY_TIME)
+}
+
+/// Like [`load_playfield`] with the sky, sun/ambient light, fog tint and ground shadows of `day_time` (`GameDayTime`,
+/// 0..6480 seconds of the 27 minute Rubi-Ka day; 0 is midnight, 3240 about noon).
+pub fn load_playfield_at(store: &RecordStore, client_dir: &Path, id: u32, day_time: f32) -> Result<Scene> {
+    load_playfield_report_at(store, client_dir, id, day_time).map(|(s, _)| s)
 }
 
 pub fn load_playfield_report(store: &RecordStore, client_dir: &Path, id: u32) -> Result<(Scene, Report)> {
+    load_playfield_report_at(store, client_dir, id, DEFAULT_DAY_TIME)
+}
+
+pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32, day_time: f32) -> Result<(Scene, Report)> {
     let raw = store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?;
     let rec = record::parse(&raw)?;
     let mut scene = Scene::default();
@@ -73,10 +85,11 @@ pub fn load_playfield_report(store: &RecordStore, client_dir: &Path, id: u32) ->
     let mut tail = record::Rd::new(&raw, rec.tail);
     let waters = water::parse(&mut tail).with_context(|| format!("liquids of playfield {id}"))?;
     let env = environment::parse(&mut tail).with_context(|| format!("environment of playfield {id}"))?;
-    let sky = sky::Tweaks::load(client_dir, id, rec.is_outdoor()).and_then(|t| sky::Sky::new(&t));
+    let tweaks = sky::Tweaks::load(client_dir, id, rec.is_outdoor());
+    let sky = tweaks.as_ref().and_then(|t| sky::Sky::new(t, day_time));
     let environment = environment::to_scene(&env, rec.is_outdoor(), sky.as_ref());
-    if let (Some(s), true) = (&sky, rec.is_outdoor()) {
-        sky::emit(s, store, &mut scene, environment.fog_color, environment.fog_end);
+    if let (Some(s), Some(t), true) = (&sky, &tweaks, rec.is_outdoor()) {
+        sky::emit(s, t, store, &mut scene, environment.fog_color, environment.fog_end);
     }
     scene.environment = Some(environment);
     let mut report = Report::default();
@@ -88,7 +101,7 @@ pub fn load_playfield_report(store: &RecordStore, client_dir: &Path, id: u32) ->
         let d = store.get(TILEMAP, rec.tilemap)?.ok_or_else(|| anyhow!("playfield {id}: no tilemap {}", rec.tilemap))?;
         let tm = ground::parse(&d).with_context(|| format!("tilemap {}", rec.tilemap))?;
         report.terrain_cells = tm.cells_x * tm.cells_z;
-        terrain::build(store, id, &tm, &mut scene)?;
+        terrain::build(store, id, &tm, &mut scene, day_time)?;
         terrain = Some(tm);
     } else {
         grid = Some(dungeon::build(store, &rec, &mut scene)?);

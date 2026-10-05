@@ -57,6 +57,9 @@ enum What {
         id: Option<u32>,
         #[arg(long)]
         list: bool,
+        /// Game day time in seconds, 0..6480 (0 midnight, ~3240 noon; default: the client's frozen 2648.69).
+        #[arg(long)]
+        time_of_day: Option<f32>,
     },
     /// Character model record id, optionally posed by an animation clip.
     Char {
@@ -148,7 +151,9 @@ fn main() -> Result<()> {
                     }
                     return Ok(());
                 }
-                What::Pf { id: Some(id), .. } => ao_formats::playfield::load_playfield(&RecordStore::open(&dir)?, &dir, id)?,
+                What::Pf { id: Some(id), time_of_day, .. } => {
+                    ao_formats::playfield::load_playfield_at(&RecordStore::open(&dir)?, &dir, id, time_of_day.unwrap_or(ao_formats::playfield::DEFAULT_DAY_TIME))?
+                }
                 What::Pf { id: None, .. } => bail!("view pf: give an id or --list"),
             };
             match opts.screenshot {

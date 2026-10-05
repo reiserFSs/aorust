@@ -69,7 +69,7 @@ fn weight_of(w: &[(u16, u8); 4], n: usize, total: f32, t: u16) -> f32 {
     w[..n].iter().find(|e| e.0 == t).map_or(0.0, |e| e.1 as f32 / total)
 }
 
-pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene) -> Result<()> {
+pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_time: f32) -> Result<()> {
     let (cx, cz, cs) = (tm.cells_x, tm.cells_z, tm.cell_size);
     // texture id per cell
     let mut tex: Vec<u16> = (0..cz).flat_map(|z| (0..cx).map(move |x| (x, z))).map(|(x, z)| tm.tile_texture.get(tm.tile(x, z) as usize).copied().unwrap_or(NONE)).collect();
@@ -85,7 +85,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene) -> R
     }
     // cells whose tile texture does not exist stay untextured and are never blended
     tex.iter_mut().filter(|t| missing.contains(t)).for_each(|t| *t = NONE);
-    let shade = store.get(SHADOWS, id).ok().flatten().and_then(|d| shadow::parse(&d).ok()).map(|l| shadow::at_time(&l, super::sky::ground_shadow_time()));
+    let shade = store.get(SHADOWS, id).ok().flatten().and_then(|d| shadow::parse(&d).ok()).map(|l| shadow::at_time(&l, super::sky::ground_shadow_time(day_time)));
     let normal = |x: usize, z: usize| -> [f32; 3] {
         let (x0, x1) = (x.saturating_sub(1), (x + 1).min(tm.verts_x - 1));
         let (z0, z1) = (z.saturating_sub(1), (z + 1).min(tm.verts_z - 1));
@@ -229,7 +229,7 @@ mod tests {
         assert_eq!((layers[2].w, layers[2].h), (96, 192));
         assert!(layers[2].w * 2 >= tm.verts_x - 1 && layers[2].h >= tm.verts_z - 1);
         let mut scene = Scene::default();
-        build(&store, 566, &tm, &mut scene).unwrap();
+        build(&store, 566, &tm, &mut scene, crate::playfield::DEFAULT_DAY_TIME).unwrap();
         assert!(scene.instances.len() >= 9); // 150 x 150 cells = 3 x 3 patches
         assert!(scene.meshes.iter().flat_map(|m| &m.submeshes).any(|s| s.blend == Blend::AlphaBlend));
     }

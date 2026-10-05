@@ -16,22 +16,28 @@
 //! values of `Tweak_GAME_FrozenTime.txt` (`CurrentDayTime 2648.69`, `Sun1Rotation q(0.900351, -0.0951056, 0.344078, 0.248863)`),
 //! the client's own fixed-time debug setting.
 
+mod layers;
+mod script;
+
 use std::collections::HashSet;
 use std::path::Path;
+use ao_scene::{Mesh, Scene, Submesh, Vertex};
+use super::environment::{srgb_to_linear, VIEW_DISTANCE};
 
-use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, Texture, TextureKey, Vertex, IDENTITY};
-
-use super::environment::{srgb_to_linear, NEAR, VIEW_DISTANCE};
-
-/// `Tweak_GAME_FrozenTime.txt`.
-const DAY_TIME: f32 = 2648.69;
-/// `GAME.DayTimeFactor = CurrentDayTime / 6480` (27 * 60 * 4).
+/// `Tweak_GAME_FrozenTime.txt` `CurrentDayTime`: the time `load_playfield` uses.
+pub const DEFAULT_DAY_TIME: f32 = 2648.69;
+/// `GAME.CurrentDayTime / 6480` (27 * 60 * 4) is the factor that indexes every colour track.
 const DAY_LENGTH: f32 = 6480.0;
-/// `Sun1Rotation` as (w, x, y, z) of that file.
+/// `Sun1Rotation` of `Tweak_GAME_FrozenTime.txt` as (w, x, y, z), valid at [`DEFAULT_DAY_TIME`].
 const SUN1_ROT: [f32; 4] = [0.900351, -0.0951056, 0.344078, 0.248863];
+/// `Sun2Rotation` of the same file.
+const SUN2_ROT: [f32; 4] = [0.836913, -0.16263, 0.384351, 0.354122];
+/// Day time factor of solar noon [FIT]: midway between the sunrise and sunset edges of the `GroundLight` tracks.
+const NOON: f32 = 0.525;
+/// `GAME.ThickCloudsIntensity` offline [GUESS]: the game writes it from the server weather.
+const CLOUD_INTENSITY: f32 = 0.4;
 /// `AddFogI` of the atmosphere object.
 pub(super) const ATMOSPHERE_FOG_DENSITY: f32 = 0.025;
-const MESH_TEXTURES: u32 = 1_010_004;
 
 /// All tweak files a playfield includes, concatenated (comments removed).
 pub struct Tweaks(String);
@@ -44,6 +50,11 @@ impl Tweaks {
         let mut text = String::new();
         flatten(&dir, &first, &mut HashSet::new(), &mut text);
         (!text.is_empty()).then_some(Tweaks(text))
+    }
+
+    /// Every `Object` of the flattened script.
+    pub fn objects(&self) -> Vec<script::Obj> {
+        script::parse_objects(&self.0)
     }
 
     /// Values of `Float <name> [N]: ...` (first definition).
@@ -144,59 +155,110 @@ fn sample(a: &[f32], f: f32) -> f32 {
 
 /// Everything the tweak scripts contribute to a scene (colours in sRGB 0..1 like the client's D3D values).
 pub struct Sky {
-    /// `ColorTop/Bottom` (I scaled), sRGB.
+    /// `ColorTop/Bottom` and their intensity `I` (the vertex alpha of the atmosphere strip), sRGB.
     top: [f32; 3],
     bottom: [f32; 3],
+    top_i: f32,
+    bottom_i: f32,
     /// `AddFog` colour of the atmosphere object (sRGB).
     pub fog: [f32; 3],
     /// `GroundLightCurrent` (sRGB) and `AmbientLightCurrent`.
     pub sun: Option<[f32; 3]>,
     pub ambient: Option<[f32; 3]>,
+    /// `CloudLightCurrent` (sRGB), white when the script has no cloud light track.
+    cloud_light: [f32; 3],
     /// Unit vector towards the sun in scene space.
     pub sun_dir: [f32; 3],
+    /// Unit vectors towards sun 1 and sun 2 in AO space (left handed).
+    sun_ao: [f32; 3],
+    sun2_ao: [f32; 3],
+    /// `GAME.CurrentDayTime` the sky was evaluated at.
+    day_time: f32,
 }
 
-/// `DayTimeForGroundShadows = GameDayTime * 15` at the default time.
-pub fn ground_shadow_time() -> f32 {
-    DAY_TIME * 15.0
+/// `DayTimeForGroundShadows = GameDayTime * 15`.
+pub fn ground_shadow_time(day_time: f32) -> f32 {
+    day_time * 15.0
 }
 
-pub fn day_factor() -> f32 {
-    DAY_TIME / DAY_LENGTH
+pub fn day_factor(day_time: f32) -> f32 {
+    day_time / DAY_LENGTH
 }
 
-/// `Unit1ZDirection [ROT] Sun1Rotation` (AO world, left handed) mirrored to scene space.
-pub fn sun_dir() -> [f32; 3] {
-    let [w, x, y, z] = SUN1_ROT;
-    let d = [2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)];
+fn rot(q: [f32; 4]) -> script::Quat {
+    script::Quat { w: q[0], x: q[1], y: q[2], z: q[3] }
+}
+
+/// Unit vector towards sun 1 in AO space at `day_time`. The server clock and the game's sun ephemeris are not available
+/// offline [FIT]: the sun runs on a great circle at one turn per day whose horizon crossings are at `NOON ± 0.25` (the
+/// `GroundLight` tracks switch on at factor ~0.27 and off at ~0.79) and that passes through the direction of the frozen
+/// `Sun1Rotation` at the frozen time, which fixes the noon elevation and azimuth.
+fn sun_ao(day_time: f32) -> [f32; 3] {
+    let d0 = rot(SUN1_ROT).rotate([0.0, 0.0, 1.0]);
+    let w0 = std::f32::consts::TAU * (day_factor(DEFAULT_DAY_TIME) - NOON);
+    let noon_elevation = (d0[1] / w0.cos()).clamp(-1.0, 1.0).asin();
+    let (sin_e, cos_e) = noon_elevation.sin_cos();
+    // azimuth of the noon sun: that of the frozen sun minus the azimuth swept since noon
+    let a = d0[0].atan2(d0[2]) - w0.sin().atan2(w0.cos() * cos_e);
+    let w = std::f32::consts::TAU * (day_factor(day_time) - NOON);
+    let (sin_w, cos_w) = w.sin_cos();
+    [cos_w * cos_e * a.sin() + sin_w * a.cos(), sin_e * cos_w, cos_w * cos_e * a.cos() - sin_w * a.sin()]
+}
+
+/// Sun 2 keeps its frozen offset from sun 1 in sun 1's own (azimuth, elevation) frame [INFERENCE: its ephemeris is not
+/// stored, the two frozen rotations are 13 degrees apart].
+fn sun2_ao(day_time: f32) -> [f32; 3] {
+    // basis (to the side, up along the sky) around a sun direction
+    let basis = |d: [f32; 3]| {
+        let side = [d[2], 0.0, -d[0]];
+        let l = (side[0] * side[0] + side[2] * side[2]).sqrt().max(1e-6);
+        let side = side.map(|c| c / l);
+        let up = [d[1] * side[2] - d[2] * side[1], d[2] * side[0] - d[0] * side[2], d[0] * side[1] - d[1] * side[0]];
+        (side, up)
+    };
+    let dot = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| a[k] * b[k]).sum::<f32>();
+    let z = [0.0, 0.0, 1.0];
+    let (d1, d2) = (rot(SUN1_ROT).rotate(z), rot(SUN2_ROT).rotate(z));
+    let (side, up) = basis(d1);
+    let (c, a, b) = (dot(d2, d1), dot(d2, side), dot(d2, up));
+    let d = sun_ao(day_time);
+    let (side, up) = basis(d);
+    std::array::from_fn(|k| c * d[k] + a * side[k] + b * up[k])
+}
+
+/// Unit vector towards sun 1 in scene space (`z` mirrored) at `day_time`.
+pub fn sun_dir(day_time: f32) -> [f32; 3] {
+    let d = sun_ao(day_time);
     [d[0], d[1], -d[2]]
 }
 
 impl Sky {
-    /// Horizon colour (sRGB).
+    /// Horizon colour (sRGB, scaled by its intensity).
     pub fn bottom(&self) -> [f32; 3] {
-        self.bottom
+        self.bottom.map(|c| c * self.bottom_i)
     }
 
-    pub fn new(t: &Tweaks) -> Option<Sky> {
-        let f = day_factor();
-        let colour = |side: &str| -> Option<[f32; 3]> {
+    pub fn new(t: &Tweaks, day_time: f32) -> Option<Sky> {
+        let f = day_factor(day_time);
+        let colour = |side: &str| -> Option<([f32; 3], f32)> {
             let i = t.at(&format!("Color{side}I"), f)?;
             let c = t.rgb([&format!("Color{side}R"), &format!("Color{side}G"), &format!("Color{side}B")].map(|s| s.as_str()), f)?;
-            Some(c.map(|v| (v * i).clamp(0.0, 1.0)))
+            Some((c, i))
         };
-        let (top, bottom) = (colour("Top")?, colour("Bottom")?);
+        let ((top, top_i), (bottom, bottom_i)) = (colour("Top")?, colour("Bottom")?);
         // AddFogIntensity = (bottom I + middle I) / 2, AddFogR = (bottom R + middle R) / 2 * intensity (left to right)
         let (bi, mi) = (t.at("ColorBottomI", f)?, t.at("ColorMiddleI", f)?);
         let (b, m) = (t.rgb(["ColorBottomR", "ColorBottomG", "ColorBottomB"], f)?, t.rgb(["ColorMiddleR", "ColorMiddleG", "ColorMiddleB"], f)?);
         let fog = [0, 1, 2].map(|k| ((b[k] + m[k]) / 2.0 * (bi + mi) / 2.0).clamp(0.0, 1.0));
         let sun = t.rgb(["GroundLightR", "GroundLightG", "GroundLightB"], f).map(|c| c.map(|v| (v * 2.0).min(1.0)));
         let ambient = t.at("AmbientLight", f).map(|a| [a; 3]).or_else(|| t.rgb(["AmbientLightR", "AmbientLightG", "AmbientLightB"], f));
-        Some(Sky { top, bottom, fog, sun, ambient, sun_dir: sun_dir() })
+        let cloud_light = t.rgb(["CloudLightR", "CloudLightG", "CloudLightB"], f).unwrap_or([1.0; 3]);
+        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, cloud_light, sun_dir: sun_dir(day_time), sun_ao: sun_ao(day_time), sun2_ao: sun2_ao(day_time), day_time })
     }
 
     /// Camera-locked sky dome (`Scene::sky`, drawn unlit and unfogged by the renderer): the atmosphere strip's gradient
-    /// with the fog of the world baked in (the client draws the strip with `FOGENABLE`).
+    /// with the fog of the world baked in (the client draws the strip with `FOGENABLE`). Vertex alpha is the strip's
+    /// intensity `I`: the dome lets the star dome, dot stars and moons behind it show through at night.
     pub fn dome(&self, fog_color: [f32; 3], fog_start: f32, fog_end: f32) -> Mesh {
         const SEG: usize = 24;
         const ELEV: [f32; 12] = [-15.0, 0.0, 4.0, 9.0, 16.0, 25.0, 35.0, 45.0, 55.0, 65.0, 78.0, 90.0];
@@ -211,12 +273,13 @@ impl Sky {
             let d = dist / 1000.0 * VIEW_DISTANCE;
             let fog = ((d - fog_start) / (fog_end - fog_start).max(1e-3)).clamp(0.0, 1.0);
             let c = [0, 1, 2].map(|k| (bottom[k] * (1.0 - s) + top[k] * s) * (1.0 - fog) + fog_color[k] * fog);
+            let alpha = self.bottom_i * (1.0 - s) + self.top_i * s;
             for j in 0..=SEG {
                 let a = j as f32 / SEG as f32 * std::f32::consts::TAU;
                 vertices.push(Vertex {
                     pos: [radius * er.cos() * a.cos(), radius * er.sin(), radius * er.cos() * a.sin()],
                     normal: [0.0, -1.0, 0.0],
-                    color: [c[0], c[1], c[2], 1.0],
+                    color: [c[0], c[1], c[2], alpha],
                     ..Default::default()
                 });
             }
@@ -229,40 +292,14 @@ impl Sky {
                 indices.extend([a, b, a + 1, a + 1, b, b + 1]);
             }
         }
-        Mesh { vertices, submeshes: vec![Submesh { two_sided: true, ..Submesh::new(indices, None) }] }
-    }
-
-    /// `Sun1` rays: additive `newsun_frame01.png` quad towards the sun, tinted (255,155,55)
-    /// [guess: the half angle of 6 degrees stands for `Size 6.0` at view-distance scale].
-    pub fn sun(&self, store: &ao_rdb::RecordStore, scene: &mut Scene) -> Option<Mesh> {
-        let id = crate::character::NameTable::load(store).ok()?.id(MESH_TEXTURES, "newsun_frame01.png")?;
-        let key = TextureKey { rdb_type: MESH_TEXTURES, id };
-        let tex: Texture = crate::texture::decode_texture(&store.get(MESH_TEXTURES, id).ok()??).ok()?;
-        scene.textures.insert(key, tex);
-        let d = self.sun_dir;
-        let up = if d[1].abs() > 0.99 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
-        let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-        let norm = |a: [f32; 3]| { let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt(); a.map(|v| v / l) };
-        let r = norm(cross(up, d));
-        let u = cross(d, r);
-        let (dist, half) = (300.0, 300.0 * 6f32.to_radians().tan());
-        let colour = [255.0, 155.0, 55.0].map(|v| srgb_to_linear(v / 255.0));
-        let p = |sx: f32, sy: f32| [0, 1, 2].map(|k| d[k] * dist + (r[k] * sx + u[k] * sy) * half);
-        let vertices = [(-1.0, -1.0, 0.0, 1.0), (1.0, -1.0, 1.0, 1.0), (1.0, 1.0, 1.0, 0.0), (-1.0, 1.0, 0.0, 0.0)]
-            .map(|(x, y, tu, tv)| Vertex { pos: p(x, y), normal: [-d[0], -d[1], -d[2]], uv: [tu, tv], color: [colour[0], colour[1], colour[2], 1.0] })
-            .to_vec();
-        let sub = Submesh { two_sided: true, blend: Blend::Additive, ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key)) };
-        Some(Mesh { vertices, submeshes: vec![sub] })
+        Mesh { vertices, submeshes: vec![Submesh { two_sided: true, blend: ao_scene::Blend::AlphaBlend, ..Submesh::new(indices, None) }] }
     }
 }
 
-/// Adds the dome and the sun to `scene.sky`.
-pub fn emit(sky: &Sky, store: &ao_rdb::RecordStore, scene: &mut Scene, fog_color: [f32; 3], fog_end: f32) {
-    let meshes = [Some(sky.dome(fog_color, NEAR, fog_end)), sky.sun(store, scene)];
-    for m in meshes.into_iter().flatten() {
-        scene.meshes.push(m);
-        scene.sky.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
-    }
+/// Adds the sky of the playfield's tweak script to `scene.sky`: the atmosphere dome and every `BackgroundSort` object
+/// (see `layers`).
+pub fn emit(sky: &Sky, tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut Scene, fog_color: [f32; 3], fog_end: f32) {
+    layers::emit(sky, &tweaks.objects(), store, scene, sky.dome(fog_color, super::environment::NEAR, fog_end), layers::Fog { color: fog_color, start: super::environment::NEAR, end: fog_end });
 }
 
 #[cfg(test)]
@@ -284,15 +321,54 @@ mod tests {
         assert!((t.at("Foo", 0.75).unwrap() - 2.5).abs() < 1e-6);
     }
 
+    fn real_tweaks(id: u32) -> Option<Tweaks> {
+        let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
+        Tweaks::load(&dir, id, true)
+    }
+
     #[test]
     fn real_rubi_ka_noon_is_a_bright_blue_sky() {
-        let Some(home) = std::env::var_os("HOME") else { return };
-        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
-        let Some(t) = Tweaks::load(&dir, 566, true) else { return };
-        let s = Sky::new(&t).unwrap();
+        let Some(t) = real_tweaks(566) else { return };
+        let s = Sky::new(&t, DEFAULT_DAY_TIME).unwrap();
         assert!(s.top[2] > s.top[0] && s.bottom.iter().all(|&v| v > 0.3), "{:?} {:?}", s.top, s.bottom);
         assert!(s.sun.unwrap()[0] > 0.5);
-        let d = sun_dir();
+        let d = sun_dir(DEFAULT_DAY_TIME);
         assert!(d[1] > 0.0 && (d.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn sun_orbit_hits_the_frozen_sample_and_sets_at_night() {
+        // the frozen Sun1Rotation direction is reproduced exactly at the frozen time
+        let frozen = rot(SUN1_ROT).rotate([0.0, 0.0, 1.0]);
+        let d = sun_ao(DEFAULT_DAY_TIME);
+        assert!((0..3).all(|k| (d[k] - frozen[k]).abs() < 1e-4), "{d:?} {frozen:?}");
+        // above the horizon between the track's sunrise and sunset, below it at midnight, always a unit vector
+        let height = |f: f32| sun_ao(f * DAY_LENGTH)[1];
+        assert!(height(NOON) > 0.3 && height(0.0) < -0.3 && height(0.97) < 0.0);
+        assert!(height(0.28) > 0.0 && height(0.76) > 0.0 && height(0.22) < 0.0 && height(0.82) < 0.0);
+        let u = sun_ao(1234.0);
+        assert!((u.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-4);
+        // sun 2 keeps its frozen separation from sun 1
+        let sep = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| a[k] * b[k]).sum::<f32>().acos().to_degrees();
+        let frozen2 = rot(SUN2_ROT).rotate([0.0, 0.0, 1.0]);
+        let (want, got) = (sep(frozen, frozen2), sep(sun_ao(5000.0), sun2_ao(5000.0)));
+        assert!(want > 5.0 && (want - got).abs() < 0.05, "{want} {got}");
+    }
+
+    #[test]
+    fn real_sky_objects_are_all_found_and_night_hides_the_atmosphere() {
+        let Some(t) = real_tweaks(566) else { return };
+        let objs = t.objects();
+        let by = |n: &str| objs.iter().find(|o| o.name == n);
+        assert_eq!(by("Moon2").unwrap().string("Mesh"), Some("moonmesh_small.abiff"));
+        assert_eq!(by("ThickClouds").unwrap().string("Mesh"), Some("skydome_clouds.abiff"));
+        assert_eq!(by("Horizon").unwrap().string("Mesh"), Some("horizon_object.abiff"));
+        assert_eq!(by("Universe").unwrap().string("Mesh"), Some("nebulas_sphere.abiff"), "BP01 overrides the star dome");
+        assert_eq!(by("Sun1").unwrap().texture.as_deref(), Some("newsun_frame01.png"));
+        assert_eq!(by("DotStars").unwrap().texture.as_deref(), Some("clouds3.png"));
+        assert!(by("DotStarsMesh").unwrap().field("Vertex").unwrap().matches("v(").count() == 5);
+        assert!(by("RKPP").is_some() && by("PlayfieldData").unwrap().field("UniversePosition") == Some("RKPP.Newland_City"));
+        let (noon, night) = (Sky::new(&t, 3300.0).unwrap(), Sky::new(&t, 0.0).unwrap());
+        assert!(noon.top_i > 0.99 && night.top_i < 0.1, "{} {}", noon.top_i, night.top_i);
     }
 }
