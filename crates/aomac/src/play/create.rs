@@ -8,6 +8,8 @@
 mod actor;
 mod frame;
 mod scenes;
+#[cfg(test)]
+mod shots;
 
 use super::*;
 use ao_formats::character::{self, Breed, Gender};

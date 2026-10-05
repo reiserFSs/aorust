@@ -26,6 +26,11 @@ pub struct Host {
 }
 
 impl Host {
+    /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
+    pub fn headless() -> Self {
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None }
+    }
+
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
     pub fn repose(&mut self, scene: Scene) {
         self.repose = Some(scene);
@@ -470,6 +475,59 @@ impl ApplicationHandler for App {
         if let Some(s) = &self.state {
             s.window.request_redraw();
         }
+    }
+}
+
+/// A [`Frontend`] driven without a window: the same per-frame sequence as the windowed app (`frame`, scene upload, lens,
+/// 3D render, GUI draw) into an offscreen texture. Used by the headless screenshot tests.
+pub struct Offscreen {
+    r: Renderer,
+    targets: Targets,
+    gr: crate::GuiRenderer,
+    pub host: Host,
+    size: (u32, u32),
+}
+
+impl Offscreen {
+    pub fn new(fe: &dyn Frontend, size: (u32, u32)) -> Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = Renderer::new(&instance, None)?;
+        let (targets, gr) = (Targets::new(&r, size.0, size.1), crate::GuiRenderer::new(&r, fe.gui()));
+        Ok(Self { r, targets, gr, host: Host::headless(), size })
+    }
+
+    /// One `Frontend::frame`, applying what it asked of the host.
+    pub fn frame(&mut self, fe: &mut dyn Frontend, dt: f32) -> ao_gui::DrawList {
+        self.r.time += dt;
+        let list = fe.frame(dt, self.size, &mut self.host);
+        if let Some(scene) = self.host.scene.take() {
+            self.r.upload(&scene);
+        }
+        if let Some(scene) = self.host.repose.take() {
+            self.r.repose(&scene);
+        }
+        if let Some(lens) = self.host.lens.take() {
+            self.r.set_lens(lens);
+        }
+        list
+    }
+
+    /// Renders the current scene with the host camera, draws `list` over it and writes the PNG.
+    pub fn png(&mut self, fe: &dyn Frontend, list: &ao_gui::DrawList, path: &std::path::Path) -> Result<()> {
+        let tex = self.r.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        self.r.render(&view, &self.targets, &self.host.camera);
+        self.gr.draw(&self.r, &view, self.size, 1, fe.gui(), list);
+        crate::texture_to_png(&self.r, &tex, self.size.0, self.size.1, path)
     }
 }
 

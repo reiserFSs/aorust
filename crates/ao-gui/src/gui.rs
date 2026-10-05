@@ -228,6 +228,9 @@ impl Gui {
             win.pos = if win.framed { (pos.0 + FRAME_L, pos.1 + FRAME_T) } else { pos };
         }
     }
+    pub fn window_visible(&self, w: WindowId) -> bool {
+        matches!(self.windows.get(w), Some(Some(win)) if win.visible)
+    }
     pub fn set_window_visible(&mut self, w: WindowId, v: bool) {
         if let Some(Some(win)) = self.windows.get_mut(w) {
             win.visible = v;

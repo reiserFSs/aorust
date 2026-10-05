@@ -27,6 +27,9 @@ pub struct Prefs {
 
 /// aomac's prefs directory (stand-in for the client's `prefs/`; also holds `CharacterViewer.xml`).
 pub fn dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("AOMAC_PREFS_DIR") {
+        return Some(d.into()); // tests / scratch runs
+    }
     Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/aomac"))
 }
 

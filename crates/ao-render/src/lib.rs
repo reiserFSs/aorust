@@ -12,7 +12,7 @@ use std::path::Path;
 use wgpu::util::DeviceExt;
 
 pub use gui::GuiRenderer;
-pub use viewer::{run_frontend, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
+pub use viewer::{run_frontend, Offscreen, run_viewer, run_viewer_hooked, run_viewer_live, FrameHook, Frontend, Host, LiveSky};
 
 const MSAA: u32 = 4;
 const INST_RING: usize = 3;
@@ -1180,6 +1180,11 @@ pub fn render_to_png_at(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: 
     });
     r.render(&out.create_view(&Default::default()), &targets, &Camera::look_at(eye.into(), look_at.into()));
 
+    texture_to_png(&r, &out, width, height, path)
+}
+
+/// Reads back a `r.format` texture and writes it as PNG.
+pub(crate) fn texture_to_png(r: &Renderer, out: &wgpu::Texture, width: u32, height: u32, path: &Path) -> Result<()> {
     let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let buf = r.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,

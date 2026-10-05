@@ -482,7 +482,8 @@ mod tests {
         for v in [1u32, 5, 0x1000] {
             d.extend(v.to_le_bytes());
         }
-        let _ = TextDb::parse(d);
+        assert!(TextDb::parse(d).is_ok(), "an entry past the end is an empty category, not a panic");
+        assert!(TextDb::parse(b"MMDB\x05\0\0\0".to_vec()).is_err(), "truncated table");
     }
 
     #[test]

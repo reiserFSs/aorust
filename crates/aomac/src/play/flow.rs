@@ -206,12 +206,16 @@ impl Play {
 
     /// `LoginModule_c::ShowError(code, arg)` [GUI 0x10011deb] (docs/screens.md §3.6): the original navigates its embedded
     /// browser to `<ERRORURL><code>[-<arg>].html`; there is no embedded browser here, so the same URL opens in the default one.
-    fn show_error(&self, code: u32, arg: i32) {
+    fn show_error(&mut self, code: u32, arg: i32) {
         let Some(base) = errorurl(&self.dir) else {
             return eprintln!("login error {code}-{arg}: AnarchyLauncher.url has no ERRORURL");
         };
         let url = if arg != 0 { format!("{base}{code}-{arg}.html") } else { format!("{base}{code}.html") };
         eprintln!("login error page: {url}");
+        self.opened_urls.push(url.clone());
+        if cfg!(test) {
+            return; // tests never launch a browser
+        }
         if let Err(e) = std::process::Command::new("open").arg(&url).status() {
             eprintln!("cannot open {url}: {e}");
         }
@@ -851,3 +855,6 @@ fn errorurl(dir: &std::path::Path) -> Option<String> {
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("errorurl"))
         .map(|(_, v)| v.trim().to_string())
 }
+
+#[cfg(test)]
+mod tests;
