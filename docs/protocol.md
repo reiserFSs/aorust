@@ -229,7 +229,8 @@ server replies are dispatched by `Client_t::ProcessMessage` `[IF 0x10002a9e]` (h
   `0x0E` -> `Show(CharSelect)`; `0x0D`, `0x10`, `0x21` -> `ShowError(type, detail)`; `0x17` -> `CharacterID` DValue + `LoadUserConfig` + `AFCM::AddProgram(5)`; `0x4E` nothing more;
   any other type (e.g. `0x11`) -> signal `GlobalSignals+0x184("Unknown error during login")` (only reached if `LoginModule_c` is still connected). Emit args: `0x0E (0xe,0)`, `0x0D (0xd,code)`,
   `0x10 (0x10,code)`, `0x21 (0x21,detail)`, `0x4E (0x4e,0)`, `0x17 (0x17,0)`, `0x11 (0x11,0)` (`[IF 0x10002a9e]` asm `0x10002f.. - 0x10003639`).
-* `ao-net` session: after the character list, `LoginError`/`RequestRejected` are reported but the session stays up (the original keeps the connection; it only ends
+* `ao-net` session: `LoginError` (0x0D) -> `LoginEvent::LoginError { code, message }`, `RequestRejected` (0x21) -> `LoginEvent::Rejected { code: 0x21, detail }`
+  (the app maps them to `ShowError(0x0d, code)` / `ShowError(0x21, detail)`). After the character list both are reported but the session stays up (the original keeps the connection; it only ends
   before the list); `ZoneInfo`/`ZoneRedirection` handling is untouched (tests `login_select_zone_handoff_*`).
 
 **UNRESOLVED**: real-server layouts of 0x0F reply codes beyond `NameInUse`'s `i32` (CellAO sends 0x1E; the client only forwards it); whether PRK uses additional reply ids

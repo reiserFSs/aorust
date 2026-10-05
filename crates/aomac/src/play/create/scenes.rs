@@ -836,6 +836,10 @@ impl Play {
                 self.cc_name_error(&mut c, *code as i32);
                 true
             }
+            LoginEvent::Rejected { detail, .. } => {
+                self.cc_name_error(&mut c, *detail);
+                true
+            }
             LoginEvent::CharacterCreated { .. } => {
                 // SetState(0x1007): WasCharacterCreated = 1
                 self.prefs.cc_created = true;

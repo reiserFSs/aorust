@@ -9,7 +9,7 @@
 use crate::conn::{Conn, Tap};
 use crate::crypto::{login_server_pub, make_challenge_response_with};
 use crate::frame::Frame;
-use crate::msg::{CharacterList, CreateCharacterRequest, Message};
+use crate::msg::{CharacterList, CreateCharacterRequest, Message, REQUEST_REJECTED};
 use anyhow::{anyhow, bail, Result};
 use num_bigint::BigUint;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -84,6 +84,9 @@ pub enum LoginEvent {
     CharacterList(CharacterList),
     /// After this the session thread ends silently (no `Disconnected`).
     LoginError { code: u32, message: String },
+    /// Reply 0x21 (`RequestRejected`, client `AFCM::Send(10,0x11f)` + `SlotLoginReply(0x21, detail)`): `code` is the
+    /// system message id (0x21), `detail` its `i32` body. Same session semantics as `LoginError`.
+    Rejected { code: u32, detail: i32 },
     /// Reply 0x11 to [`LoginSession::create_character`]; the session then sends `SelectCharacter(character_id)`
     /// by itself exactly like `Client_t::ProcessMessage` (Interfaces.dll 0x10002a9e) and a `ZoneHandoff` follows.
     CharacterCreated { character_id: u32 },
@@ -270,10 +273,7 @@ fn run(
                 }
             }
             Ok(Message::RequestRejected(detail)) => {
-                send(LoginEvent::LoginError {
-                    code: detail as u32,
-                    message: format!("server rejected the login request (system message 0x21, detail {detail})"),
-                });
+                send(LoginEvent::Rejected { code: REQUEST_REJECTED, detail });
                 if phase != Phase::Listed {
                     return Ok(true);
                 }

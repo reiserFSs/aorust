@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
         while Instant::now() < end {
             while let Some(ev) = s.poll() {
                 println!("{ev:?}");
-                if matches!(ev, LoginEvent::Disconnected(_) | LoginEvent::LoginError { .. }) {
+                if matches!(ev, LoginEvent::Disconnected(_) | LoginEvent::LoginError { .. } | LoginEvent::Rejected { .. }) {
                     return Ok(());
                 }
             }

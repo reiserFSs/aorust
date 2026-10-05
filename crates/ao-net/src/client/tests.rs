@@ -73,9 +73,9 @@ fn start(server_pub: BigUint) -> (TcpListener, LoginSession) {
 
 #[test]
 fn captured_failure_replies_end_the_session_quietly() {
-    for (frame, code, text) in [
-        (LOGIN_ERROR_FRAME, 0x6A, "invalid username or password"),
-        (REJECTED_FRAME, 9, "server rejected the login request (system message 0x21, detail 9)"),
+    for (frame, want) in [
+        (LOGIN_ERROR_FRAME, LoginEvent::LoginError { code: 0x6A, message: "invalid username or password".into() }),
+        (REJECTED_FRAME, LoginEvent::Rejected { code: 0x21, detail: 9 }),
     ] {
         let (l, s) = start(login_server_pub());
         s.login("aomac-probe", "not-a-real-password");
@@ -87,8 +87,8 @@ fn captured_failure_replies_end_the_session_quietly() {
         assert_eq!(name, "aomac-probe");
         assert!(response.contains('-') && !response.contains("not-a-real"));
         srv.raw(&hex(frame));
-        let ev = events_until(&s, |e| matches!(e, LoginEvent::LoginError { .. }));
-        assert_eq!(*ev.last().unwrap(), LoginEvent::LoginError { code, message: text.into() });
+        let ev = events_until(&s, |e| matches!(e, LoginEvent::LoginError { .. } | LoginEvent::Rejected { .. }));
+        assert_eq!(*ev.last().unwrap(), want);
         drop(srv); // server closes: no Disconnected after a reported error
         thread::sleep(Duration::from_millis(400));
         assert_eq!(s.poll(), None);
@@ -218,6 +218,8 @@ fn create_delete_and_name_suggestion_in_the_char_select_phase() {
     // a LoginError during the char-select phase is reported but does not end the session
     srv.send(&Message::LoginError(0x14));
     assert!(matches!(events_until(&s, |e| matches!(e, LoginEvent::LoginError { .. })).last().unwrap(), LoginEvent::LoginError { code: 0x14, .. }));
+    srv.send(&Message::RequestRejected(9));
+    assert_eq!(*events_until(&s, |e| matches!(e, LoginEvent::Rejected { .. })).last().unwrap(), LoginEvent::Rejected { code: 0x21, detail: 9 });
 
     s.delete_character(77);
     assert_eq!(srv.recv(), Message::DeleteCharacter { char_id: 77 });

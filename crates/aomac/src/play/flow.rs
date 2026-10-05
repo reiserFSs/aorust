@@ -571,10 +571,16 @@ impl Play {
                     self.show_characters(l, host);
                 }
                 LoginEvent::LoginError { code, message } => {
-                    // SlotLoginReply: type 0x0d (LoginError) / 0x21 (RequestRejected) -> ShowError(type, arg)
+                    // SlotLoginReply: type 0x0d (LoginError) -> ShowError(type, arg)
                     eprintln!("login error {code}: {message}");
                     self.show_login(host);
-                    self.show_error(if message.contains("0x21") { 0x21 } else { 0x0d }, code);
+                    self.show_error(0x0d, code);
+                }
+                LoginEvent::Rejected { code, detail } => {
+                    // SlotLoginReply: type 0x21 (RequestRejected) -> ShowError(type, detail)
+                    eprintln!("login rejected (system message {code:#x}, detail {detail})");
+                    self.show_login(host);
+                    self.show_error(code, detail as u32);
                 }
                 LoginEvent::ZoneHandoff { zone_ip, zone_port, .. } => {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
