@@ -145,6 +145,21 @@ mod tests {
         assert!((p.position[0] - 205.2).abs() < 0.1 && (p.position[2] - 255.9).abs() < 0.2, "{:?}", p.position);
     }
 
+    /// The CharInPlay frame the app sent in a live session (sequence 2, after ZoneLogin) is what `outgoing` builds.
+    #[test]
+    fn char_in_play_matches_the_live_session() {
+        let rec = include_str!("../../../../docs/captures/zone_enter_ithaca.rec");
+        let sent: Vec<Vec<u8>> = rec
+            .lines()
+            .filter_map(|l| l.split_once(' ')?.1.strip_prefix("> "))
+            .map(|h| (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect())
+            .collect();
+        let live = sent.iter().find(|b| b[2..4] == [0, 0xA]).unwrap();
+        let mut f = outgoing::n3_frame(0, 0x82e8, outgoing::char_in_play(0x82e8));
+        f.seq = 2;
+        assert_eq!(&f.encode().unwrap(), live);
+    }
+
     #[test]
     fn playfield_message_header() {
         let f = capture_n3().into_iter().find(|f| f.payload[..4] == 0x5F4B1A39u32.to_be_bytes()).unwrap();
