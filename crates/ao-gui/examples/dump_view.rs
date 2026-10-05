@@ -76,6 +76,14 @@ fn main() -> anyhow::Result<()> {
         });
     }
     r.queue.submit([enc.finish()]);
+    // `--tooltip "Title|Body" [--mouse x,y]`: the `ToolTip_c` window at the pointer (`docs/gui.md` §11)
+    if let Some(i) = args.iter().position(|a| a == "--tooltip") {
+        let (t, b) = args[i + 1].split_once('|').unwrap_or((&args[i + 1], ""));
+        let (mx, my) = args.iter().position(|a| a == "--mouse").and_then(|i| args[i + 1].split_once(',').map(|(x, y)| (x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0)))).unwrap_or((w as f32 / 3.0, h as f32 / 3.0));
+        gui.set_screen_size(w, h);
+        gui.input(ao_gui::InputEvent::MouseMove { x: mx, y: my });
+        gui.show_tooltip(t, b);
+    }
     let list = gui.frame(0.0);
     gr.draw(&r, &view, (w, h), 1, &gui, &list);
 

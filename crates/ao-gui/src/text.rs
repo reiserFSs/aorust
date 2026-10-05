@@ -60,6 +60,8 @@ pub struct TextRun {
     /// `None` = the renderer's default colour.
     pub color: Option<u32>,
     pub link: bool,
+    /// `href` of the enclosing `<a>` (empty = none).
+    pub href: String,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +162,7 @@ struct Word {
     text: String,
     color: Option<u32>,
     link: bool,
+    href: String,
     /// width in px of the word including its trailing space
     w: i32,
     hard_break_after: bool,
@@ -175,6 +178,7 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
     let mut color_stack: Vec<Option<u32>> = vec![None];
     let mut align_stack = vec![Align::Left];
     let mut link = 0usize;
+    let mut hrefs: Vec<String> = Vec::new();
     let measure = |fnt: &mut crate::font::Font, s: &str| -> i32 {
         if password {
             s.chars().map(|_| fnt.advance('*')).sum()
@@ -182,7 +186,7 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
             fnt.text_width(s)
         }
     };
-    let push_text = |words: &mut Vec<Word>, fnt: &mut crate::font::Font, s: &str, color: Option<u32>, link: bool, align: Align| {
+    let push_text = |words: &mut Vec<Word>, fnt: &mut crate::font::Font, s: &str, color: Option<u32>, link: bool, href: &str, align: Align| {
         // split into words keeping spaces attached to the preceding word
         let mut cur = String::new();
         let mut it = s.chars().peekable();
@@ -190,12 +194,12 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
             cur.push(c);
             if c == ' ' && it.peek() != Some(&' ') {
                 let w = measure(fnt, &cur);
-                words.push(Word { text: std::mem::take(&mut cur), color, link, w, hard_break_after: false, align });
+                words.push(Word { text: std::mem::take(&mut cur), color, link, href: href.to_string(), w, hard_break_after: false, align });
             }
         }
         if !cur.is_empty() {
             let w = measure(fnt, &cur);
-            words.push(Word { text: cur, color, link, w, hard_break_after: false, align });
+            words.push(Word { text: cur, color, link, href: href.to_string(), w, hard_break_after: false, align });
         }
     };
     for tok in tokenize(text) {
@@ -208,22 +212,22 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                             if let Some(w) = words.last_mut() {
                                 w.hard_break_after = true;
                             } else {
-                                words.push(Word { text: String::new(), color: None, link: false, w: 0, hard_break_after: true, align: *align_stack.last().unwrap() });
+                                words.push(Word { text: String::new(), color: None, link: false, href: String::new(), w: 0, hard_break_after: true, align: *align_stack.last().unwrap() });
                             }
                         } else {
-                            push_text(&mut words, fonts.font(font), " ", *color_stack.last().unwrap(), link > 0, *align_stack.last().unwrap());
+                            push_text(&mut words, fonts.font(font), " ", *color_stack.last().unwrap(), link > 0, hrefs.last().map_or("", |h| h.as_str()), *align_stack.last().unwrap());
                         }
                     }
                     first = false;
                     let part = part.trim_end_matches('\r');
-                    push_text(&mut words, fonts.font(font), part, *color_stack.last().unwrap(), link > 0, *align_stack.last().unwrap());
+                    push_text(&mut words, fonts.font(font), part, *color_stack.last().unwrap(), link > 0, hrefs.last().map_or("", |h| h.as_str()), *align_stack.last().unwrap());
                 }
             }
             Tok::Br => {
                 if let Some(w) = words.last_mut() {
                     w.hard_break_after = true;
                 } else {
-                    words.push(Word { text: String::new(), color: None, link: false, w: 0, hard_break_after: true, align: *align_stack.last().unwrap() });
+                    words.push(Word { text: String::new(), color: None, link: false, href: String::new(), w: 0, hard_break_after: true, align: *align_stack.last().unwrap() });
                 }
             }
             Tok::Open(name, attrs) => match name.as_str() {
@@ -232,7 +236,10 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                     color_stack.push(c.or(*color_stack.last().unwrap()));
                 }
                 "center" => align_stack.push(Align::Center),
-                "a" => link += 1,
+                "a" => {
+                    link += 1;
+                    hrefs.push(attrs.iter().find(|(k, _)| k == "href").map(|(_, v)| v.clone()).unwrap_or_default());
+                }
                 "p" | "div" | "b" | "i" | "u" | "span" => {
                     color_stack.push(*color_stack.last().unwrap());
                     align_stack.push(*align_stack.last().unwrap());
@@ -250,7 +257,10 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                         align_stack.pop();
                     }
                 }
-                "a" => link = link.saturating_sub(1),
+                "a" => {
+                    link = link.saturating_sub(1);
+                    hrefs.pop();
+                }
                 "p" | "div" | "b" | "i" | "u" | "span" => {
                     if color_stack.len() > 1 {
                         color_stack.pop();
@@ -289,8 +299,8 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
         cur_w += wd.w;
         if !wd.text.is_empty() {
             match cur_runs.last_mut() {
-                Some(r) if r.color == wd.color && r.link == wd.link => r.text.push_str(&wd.text),
-                _ => cur_runs.push(TextRun { text: wd.text, color: wd.color, link: wd.link }),
+                Some(r) if r.color == wd.color && r.link == wd.link && r.href == wd.href => r.text.push_str(&wd.text),
+                _ => cur_runs.push(TextRun { text: wd.text, color: wd.color, link: wd.link, href: wd.href }),
             }
         }
         if wd.hard_break_after && n < nwords {

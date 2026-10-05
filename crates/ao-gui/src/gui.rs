@@ -14,6 +14,10 @@ use crate::text::{self, Colors};
 use crate::view::*;
 use crate::xml;
 
+mod cc;
+mod canvas;
+mod tooltip;
+
 /// `GUIColors.xml` / `GUIConfig_c::GUIConfig_c` 0x1012f342 defaults: Default, Selected, Hover, Text,
 /// TextSelected, TextHover.
 const DEFAULT_PALETTE: [u32; 6] = [0x80e9f3, 0xffffcc, 0xa5ffdb, 0x99ccaa, 0x99ccaa, 0x99ccaa];
@@ -44,6 +48,8 @@ struct Window {
     default_button: Option<ViewId>,
     /// Drawn inside the style-1 window frame (`open_framed_window`).
     framed: bool,
+    /// `Window::FadeTo` target: multiplies everything drawn in the window (chat windows, docs/chat/gui.md).
+    alpha: f32,
 }
 
 /// First id handed out by `Gui::add_image` (above every skin id).
@@ -88,8 +94,11 @@ pub struct Gui {
     /// Roots of `add_view` instances.
     items: std::collections::HashSet<ViewId>,
     extras: Vec<ExtraImage>,
+    /// `TextRenderer_c` shadow offset (ctor default Point(1,1), 0x10163412); the shadow surface is the text in black.
+    text_shadow: (i32, i32),
     /// Elements/attributes the engine could not honour while building views.
     pub warnings: Vec<String>,
+    tip: tooltip::TipState,
 }
 
 fn px(r: Rect) -> [f32; 4] {
@@ -148,7 +157,9 @@ impl Gui {
             frame_press: None,
             items: Default::default(),
             extras: Vec::new(),
+            text_shadow: (1, 1),
             warnings: Vec::new(),
+            tip: Default::default(),
         })
     }
 
@@ -184,7 +195,7 @@ impl Gui {
         let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
         let root = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{name}: cannot build root"))?;
         self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{name}: {w}")));
-        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false }));
+        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false, alpha: 1.0 }));
         let id = self.windows.len() - 1;
         self.resize_window(id, size);
         Ok(id)
@@ -250,7 +261,7 @@ impl Gui {
         let (cw, ch) = match size {
             WindowSize::Fixed(a, b) => (a as f32, b as f32),
             WindowSize::Preferred => {
-                let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors };
+                let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default() };
                 let p = layout::pref(&mut env, &self.tree, root, true);
                 (p.x + 1.0, p.y + 1.0)
             }
@@ -259,7 +270,7 @@ impl Gui {
     }
 
     fn relayout(&mut self, root: ViewId, frame: Rect) {
-        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors };
+        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default() };
         layout::set_frame(&mut env, &mut self.tree, root, frame);
     }
 
@@ -537,6 +548,33 @@ impl Gui {
             self.caret_epoch = self.time;
         }
     }
+    /// Unfocuses whatever view has the keyboard focus.
+    pub fn clear_focus(&mut self) {
+        self.focus = None;
+    }
+    /// `Window::FadeTo` end value (0..1): multiplies the alpha of everything in the window.
+    pub fn set_window_alpha(&mut self, w: WindowId, alpha: f32) {
+        if let Some(Some(win)) = self.windows.get_mut(w) {
+            win.alpha = alpha.clamp(0.0, 1.0);
+        }
+    }
+    pub fn window_alpha(&self, w: WindowId) -> f32 {
+        self.windows.get(w).and_then(|w| w.as_ref()).map_or(1.0, |w| w.alpha)
+    }
+    /// `TextRenderer_c::SetShadowOffset` (applies to every view drawn with `tvf::RENDER_SHADOW`).
+    pub fn set_text_shadow_offset(&mut self, dx: i32, dy: i32) {
+        self.text_shadow = (dx, dy);
+    }
+    /// `View::ScrollToBottom` on the named `ScrollView` (after the content changed).
+    pub fn scroll_to_bottom(&mut self, w: WindowId, name: &str) {
+        let Some(sv) = self.find(w, name) else { return };
+        let Some(child) = self.tree.views[sv].children.first().copied() else { return };
+        let Some(inner) = self.tree.views[child].children.first().copied() else { return };
+        let max = ((self.tree.views[inner].frame.height() + 1.0) - (self.tree.views[sv].frame.height() + 1.0)).max(0.0);
+        if let Kind::ScrollView(sd) = &mut self.tree.views[sv].kind {
+            sd.offset.y = max;
+        }
+    }
     pub fn focused_view(&self) -> Option<String> {
         self.focus.map(|f| self.outer_name(f))
     }
@@ -648,15 +686,17 @@ impl Gui {
     /// Builds the draw list for all visible windows (later windows on top).
     pub fn frame(&mut self, dt: f32) -> DrawList {
         self.time += dt;
+        self.tick_cc_fades(dt);
         let mut out = DrawList::default();
-        let wins: Vec<(ViewId, (i32, i32), bool)> = self.windows.iter().flatten().filter(|w| w.visible).map(|w| (w.root, w.pos, w.framed)).collect();
-        for (root, pos, framed) in wins {
+        let wins: Vec<(ViewId, (i32, i32), bool, f32)> = self.windows.iter().flatten().filter(|w| w.visible).map(|w| (w.root, w.pos, w.framed, w.alpha)).collect();
+        for (root, pos, framed, alpha) in wins {
             if framed {
                 self.draw_frame(root, pos, &mut out.cmds);
             }
-            self.draw_view(root, pos.0 as f32, pos.1 as f32, [255; 3], 1.0, true, &mut out.cmds);
+            self.draw_view(root, pos.0 as f32, pos.1 as f32, [255; 3], alpha, true, &mut out.cmds);
         }
         self.draw_popup(&mut out.cmds);
+        self.tip_frame(&mut out.cmds);
         out
     }
 
@@ -750,6 +790,8 @@ impl Gui {
                 self.draw_border(out, &b.gfx, rect, t, parent_alpha * v.alpha * b.local_alpha);
             }
             Kind::Button(b) => self.draw_button(out, &v, b, rect, tint, alpha),
+            Kind::CcEntry(c) => self.draw_cc_entry(out, c, v.enabled, rect, tint, alpha),
+            Kind::Canvas(c) => self.draw_canvas(out, c, rect, alpha),
             Kind::TextButton(b) => {
                 let col = if b.pressed || b.toggled { b.pressed_color } else if b.hover { b.hover_color } else { b.color };
                 let t = mul(tint, self.map_color(col));
@@ -801,7 +843,7 @@ impl Gui {
                     self.draw_view(*c, x0 - off.x, y0 - off.y, tint, alpha, false, out);
                 }
             }
-            Kind::Button(_) | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) | Kind::Bitmap { .. } => {}
+            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) => {}
             _ => {
                 for c in &v.children {
                     self.draw_view(*c, x0, y0, tint, alpha, false, out);
@@ -843,7 +885,25 @@ impl Gui {
     }
 
     fn draw_powerbar(&mut self, out: &mut Vec<DrawCmd>, p: &PowerBarData, r: Rect, alpha: f32) {
-        // PowerbarView_c::Initialize 0x1013ec3f / Recalculate 0x1013e789
+        // PowerbarView_c::Initialize 0x1013ec3f / Recalculate 0x1013e789: the first cap (`left_gfx`: top / left end) and the second cap
+        // (`right_gfx`: bottom / right end) frame the main-axis extent; the background and the bar start after the first cap.
+        let horiz = p.dir == 1 || p.dir == 2;
+        let capsz = |g: Option<GfxId>| g.map_or(0.0, |g| if horiz { self.gfx.size(g).0 as f32 } else { self.gfx.size(g).1 as f32 });
+        let (c1, c2) = (capsz(p.left), capsz(p.right));
+        let mut r = r;
+        if let Some(g) = p.left {
+            let (w, h) = self.gfx.size(g);
+            self.push_gfx(out, g, Rect::new(r.l, r.t, r.l + w as f32 - 1.0, r.t + h as f32 - 1.0), [255; 3], alpha);
+        }
+        if let Some(g) = p.right {
+            let (w, h) = self.gfx.size(g);
+            self.push_gfx(out, g, Rect::new(r.r - w as f32 + 1.0, r.b - h as f32 + 1.0, r.r, r.b), [255; 3], alpha);
+        }
+        if horiz {
+            (r.l, r.r) = (r.l + c1, r.r - c2);
+        } else {
+            (r.t, r.b) = (r.t + c1, r.b - c2);
+        }
         if let Some(bg) = p.bg {
             self.push_gfx(out, bg, r, [255; 3], alpha);
         }
@@ -882,6 +942,7 @@ impl Gui {
         let focused = self.focus == Some(id);
         let wrap = if t.tvf & tvf::WORD_WRAP != 0 { Some(r.width() as i32 + 1) } else { None };
         let layout = text::layout_text(&mut self.fonts, &self.colors, t.font, &t.text, t.tvf, wrap);
+        let fill_dy = self.fill_bottom_dy(id, t.tvf, layout.height);
         let clip = [r.l as i32, r.t as i32, r.r as i32 + 1, r.b as i32 + 1];
         if editable {
             out.push(DrawCmd::Clip(Some(clip)));
@@ -900,18 +961,25 @@ impl Gui {
                 out.push(DrawCmd::Solid { dst: [(origin_x + sx) as f32, r.t, (origin_x + ex) as f32, r.t + font_h as f32], color: [0xc0; 3], alpha });
             }
         }
-        for line in &layout.lines {
-            let lx = match line.align {
-                Align::Right => r.l as i32 + 1 + (r.width() as i32 - line.width),
-                Align::Center => r.l as i32 + (r.width() as i32 + 1 - line.width) / 2,
-                _ => origin_x,
-            };
-            let mut pen = lx;
-            let y = r.t as i32 + line.y;
-            for run in &line.runs {
-                let c = run.color.map_or(tint, |c| mul(tint, rgb(c)));
-                let c = if run.link { mul(tint, rgb(0x2299ff)) } else { c };
-                pen += self.draw_string(out, t.font, &run.text, pen, y, c, alpha, pw);
+        // TVF_RENDER_SHADOW 0x1000: `_AllocateBitmap` 0x1016095b clones the text surface, colour 0 (black), alpha 1, behind the text.
+        let shadow = (t.tvf & tvf::RENDER_SHADOW != 0).then_some(self.text_shadow);
+        let passes: &[bool] = if shadow.is_some() { &[true, false] } else { &[false] };
+        for &is_shadow in passes {
+            let (dx, dy) = if is_shadow { shadow.unwrap_or((0, 0)) } else { (0, 0) };
+            for line in &layout.lines {
+                let lx = match line.align {
+                    Align::Right => r.l as i32 + 1 + (r.width() as i32 - line.width),
+                    Align::Center => r.l as i32 + (r.width() as i32 + 1 - line.width) / 2,
+                    _ => origin_x,
+                };
+                let mut pen = lx;
+                let y = r.t as i32 + line.y + fill_dy;
+                for run in &line.runs {
+                    let c = run.color.map_or(tint, |c| mul(tint, rgb(c)));
+                    let c = if run.link { mul(tint, rgb(0x2299ff)) } else { c };
+                    let c = if is_shadow { [0; 3] } else { c };
+                    pen += self.draw_string(out, t.font, &run.text, pen + dx, y + dy, c, alpha, pw);
+                }
             }
         }
         if editable && focused {
@@ -1053,7 +1121,7 @@ impl Gui {
         }
         let (l, t) = if is_root { (0.0, 0.0) } else { (ox + v.frame.l, oy + v.frame.t) };
         let r = Rect::new(l, t, l + v.frame.width(), t + v.frame.height());
-        if !is_root && r.contains(Point::new(x, y)) && matches!(v.kind, Kind::Border(_) | Kind::Button(_) | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) | Kind::Input | Kind::Combo(_)) {
+        if !is_root && r.contains(Point::new(x, y)) && matches!(v.kind, Kind::Border(_) | Kind::Button(_) | Kind::CcEntry(_) | Kind::Canvas(_) | Kind::Bitmap { .. } | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) | Kind::Input | Kind::Combo(_)) {
             return true;
         }
         v.children.iter().any(|c| self.covers(*c, x, y, false, l, t))
@@ -1101,15 +1169,19 @@ impl Gui {
                 }
                 self.drag_scroll(y);
                 self.drag_select(x);
+                self.drag_canvas(x, y);
+                self.tip_update(false);
             }
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
                 self.mouse = Point::new(x, y);
                 self.update_hover();
+                self.tip_update(true);
                 self.mouse_down(x, y);
             }
             InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
                 self.mouse = Point::new(x, y);
                 self.mouse_up();
+                self.tip_update(true);
             }
             InputEvent::Wheel { x, y, dy } => self.wheel(x, y, dy),
             InputEvent::Key { key, pressed: true, mods } => self.key_down(key, mods),
@@ -1165,7 +1237,7 @@ impl Gui {
         }
         let inside = clip_r.contains(Point::new(x, y)) && !clip_r.is_empty();
         let interactive = match &v.kind {
-            Kind::Button(_) | Kind::TextButton(_) | Kind::ScrollView(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. } => true,
+            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::Canvas(_) | Kind::ScrollView(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. } => true,
             Kind::Text(t) => t.tvf & (tvf::ACCEPT_TXT_INPUT | tvf::ACCEPT_MOUSE_INPUT) != 0,
             _ => false,
         };
@@ -1179,6 +1251,7 @@ impl Gui {
                 if let Some(id) = id {
                     match &mut self.tree.views[id].kind {
                         Kind::Button(b) => b.hover = state,
+                        Kind::CcEntry(b) => b.hover = state,
                         Kind::TextButton(b) => b.hover = state,
                         _ => {}
                     }
@@ -1191,6 +1264,7 @@ impl Gui {
             let over = self.hover == Some(p);
             match &mut self.tree.views[p].kind {
                 Kind::Button(b) => b.pressed = over,
+                Kind::CcEntry(b) => b.pressed = over,
                 Kind::TextButton(b) => b.pressed = over,
                 _ => {}
             }
@@ -1258,10 +1332,11 @@ impl Gui {
             return;
         };
         match self.tree.views[v].kind.clone() {
-            Kind::Button(_) | Kind::TextButton(_) => {
+            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) => {
                 self.pressed = Some(v);
                 match &mut self.tree.views[v].kind {
                     Kind::Button(b) => b.pressed = true,
+                    Kind::CcEntry(b) => b.pressed = true,
                     Kind::TextButton(b) => b.pressed = true,
                     _ => {}
                 }
@@ -1282,7 +1357,16 @@ impl Gui {
                     self.open_combo(c);
                 }
             }
+            Kind::Text(t) => {
+                if let Some(href) = self.link_at(v, &t, x, y) {
+                    if let Some(window) = self.window_of(v) {
+                        let view = self.tree.views[v].name.clone();
+                        self.events.push(Event::LinkClicked { window, view, href });
+                    }
+                }
+            }
             Kind::Bitmap { .. } => {}
+            Kind::Canvas(_) => self.canvas_down(v, x, y),
             Kind::ScrollView(_) => self.scrollbar_press(v, y),
             _ => {}
         }
@@ -1366,8 +1450,12 @@ impl Gui {
         }
         if let Some(p) = self.pressed.take() {
             let over = self.hit(self.mouse.x, self.mouse.y).map(|h| h.1) == Some(p);
+            if over {
+                self.canvas_up(p);
+            }
             match &mut self.tree.views[p].kind {
                 Kind::Button(b) => b.pressed = false,
+                Kind::CcEntry(b) => b.pressed = false,
                 Kind::TextButton(b) => {
                     b.pressed = false;
                     if over && b.toggle {
@@ -1376,7 +1464,7 @@ impl Gui {
                 }
                 _ => {}
             }
-            if over && matches!(self.tree.views[p].kind, Kind::Button(_) | Kind::TextButton(_)) && self.tree.views[p].enabled {
+            if over && matches!(self.tree.views[p].kind, Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_)) && self.tree.views[p].enabled {
                 if let Some(w) = self.window_of(p) {
                     let view = self.tree.views[p].name.clone();
                     let item = self.item_of(p);
@@ -1387,7 +1475,45 @@ impl Gui {
         self.scroll_drag = None;
     }
 
+    /// `TVF_FILL_BOTTOM_UP` 0x400 (`ChatTextView` 0x100925ff flags 0xe6c): content shorter than the enclosing `ScrollView` sits at its bottom.
+    fn fill_bottom_dy(&self, v: ViewId, tvf_flags: u32, content_h: i32) -> i32 {
+        if tvf_flags & tvf::FILL_BOTTOM_UP == 0 {
+            return 0;
+        }
+        let sv = self.tree.views[v].parent.and_then(|c| self.tree.views[c].parent);
+        let vis = sv.filter(|s| matches!(self.tree.views[*s].kind, Kind::ScrollView(_))).map_or(0, |s| self.tree.views[s].frame.height() as i32 + 1);
+        (vis - content_h).max(0)
+    }
+
+    /// `href` of the `<a>` run under window-space (x, y) in a read-only `TextView` (`TextRenderer_c::GetHyperLink` 0x10162c36).
+    fn link_at(&mut self, v: ViewId, t: &TextData, x: f32, y: f32) -> Option<String> {
+        let o = self.origin(v);
+        let (wx, wy) = self.window_of(v).and_then(|w| self.windows[w].as_ref()).map_or((0, 0), |w| w.pos);
+        let (rx, ry) = (x - wx as f32 - o.0, y - wy as f32 - o.1);
+        let width = self.tree.views[v].frame.width() as i32 + 1;
+        let wrap = if t.tvf & tvf::WORD_WRAP != 0 { Some(width) } else { None };
+        let layout = text::layout_text(&mut self.fonts, &self.colors, t.font, &t.text, t.tvf, wrap);
+        let ry = ry - self.fill_bottom_dy(v, t.tvf, layout.height) as f32;
+        let line_h = self.fonts.font(t.font).height as f32;
+        let line = layout.lines.iter().find(|l| ry >= l.y as f32 && ry < l.y as f32 + line_h)?;
+        let mut pen = match line.align {
+            Align::Right => (width - line.width) as f32,
+            Align::Center => ((width - line.width) / 2) as f32,
+            _ => 0.0,
+        };
+        for run in &line.runs {
+            let w = self.fonts.font(t.font).text_width(&run.text) as f32;
+            if rx >= pen && rx < pen + w {
+                return (!run.href.is_empty()).then(|| run.href.clone());
+            }
+            pen += w;
+        }
+        None
+    }
     fn wheel(&mut self, x: f32, y: f32, dy: f32) {
+        if self.canvas_wheel(x, y, dy) {
+            return;
+        }
         // nearest ScrollView ancestor of the hit view (or the view itself)
         let mut cur = self.hit(x, y).map(|h| h.1);
         while let Some(c) = cur {

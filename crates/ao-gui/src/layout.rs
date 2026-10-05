@@ -18,6 +18,8 @@ pub struct Env<'a> {
     pub gfx: &'a GfxSet,
     pub fonts: &'a mut FontSystem,
     pub colors: &'a Colors,
+    /// Widest preferred width per (owner view, width group), valid for one layout pass.
+    pub groups: std::collections::HashMap<(ViewId, String), (f32, f32)>,
 }
 
 const BIG: f32 = 16000.0; // _DAT_101c61bc
@@ -29,6 +31,48 @@ fn included(tree: &Tree, c: ViewId) -> bool {
 }
 
 /// `View::GetPreferredSize(max)` after `UpdatePreferredSize` clamping.
+/// Ungrouped clamped preferred size.
+fn pref_plain(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
+    let v = &tree.views[id];
+    let mut p = calc(env, tree, id, max);
+    if !max {
+        p.x = p.x.max(v.min_size.x).min(v.max_limit.x);
+        p.y = p.y.max(v.min_size.y).min(v.max_limit.y);
+    } else {
+        p.x = p.x.max(v.min_size.x).max(v.max_size.x).min(v.max_limit.x);
+        p.y = p.y.max(v.min_size.y).max(v.max_size.y).min(v.max_limit.y);
+    }
+    p
+}
+
+/// Widest (min, max) preferred width of the members of `group` below the ancestor of `id` named `owner` (the root when none matches).
+fn group_width(env: &mut Env, tree: &Tree, id: ViewId, group: &str, owner: &str) -> (f32, f32) {
+    let mut o = id;
+    let mut cur = Some(id);
+    while let Some(c) = cur {
+        o = c;
+        if tree.views[c].name == owner && !owner.is_empty() {
+            break;
+        }
+        cur = tree.views[c].parent;
+    }
+    if let Some(w) = env.groups.get(&(o, group.to_string())) {
+        return *w;
+    }
+    env.groups.insert((o, group.to_string()), (-1.0, -1.0)); // nested members of the same group see "no group" while it is computed
+    let mut members = vec![];
+    let mut stack = vec![o];
+    while let Some(v) = stack.pop() {
+        if tree.views[v].width_group.as_ref().is_some_and(|g| g.0 == group) {
+            members.push(v);
+        }
+        stack.extend(tree.views[v].children.iter().copied());
+    }
+    let w = members.iter().fold((-1.0f32, -1.0f32), |a, m| (a.0.max(pref_plain(env, tree, *m, false).x), a.1.max(pref_plain(env, tree, *m, true).x)));
+    env.groups.insert((o, group.to_string()), w);
+    w
+}
+
 pub fn pref(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
     let v = &tree.views[id];
     let mut p = calc(env, tree, id, max);
@@ -38,6 +82,11 @@ pub fn pref(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
     } else {
         p.x = p.x.max(v.min_size.x).max(v.max_size.x).min(v.max_limit.x);
         p.y = p.y.max(v.min_size.y).max(v.max_size.y).min(v.max_limit.y);
+    }
+    if let Some((g, owner)) = v.width_group.clone() {
+        // guard against the member computing its own group while the group is being computed (members never nest in Skills.xml)
+        let w = group_width(env, tree, id, &g, &owner);
+        p.x = p.x.max(if max { w.1 } else { w.0 });
     }
     p
 }
@@ -120,6 +169,17 @@ fn calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
         }
         Kind::Text(t) => text_pref(env, tree, id, t, max),
         Kind::Button(b) => button_pref(env, &b.label),
+        Kind::CcEntry(c) => {
+            // Button_c::CalculatePreferredSize 0x10127ee4, 3-slice border mode: x = content (+1 const) - 1, y = border art height.
+            // icon entries: the 48x22 `bgicon`; label-only entries: text + 8 px each side (UNRESOLVED: 3-slice border sizes), min 47.
+            let (w, h) = c.icon.map_or((0, 22), |g| env.gfx.size(g));
+            let mut p = Point::new(w as f32 - 1.0, h.max(22) as f32 - 1.0);
+            if c.icon.is_none() {
+                let s = text::string_size(env.fonts, env.colors, crate::font::FontId::Normal, &c.label);
+                p.x = (s.x + 16.0).max(46.0);
+            }
+            p
+        }
         Kind::TextButton(b) => text::string_size(env.fonts, env.colors, b.font, &b.text),
         Kind::PowerBar(p) => {
             let g = |id: Option<crate::gfx::GfxId>| id.map(|g| env.gfx.size(g));
@@ -180,7 +240,7 @@ fn calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
             let s = text::string_size(env.fonts, env.colors, crate::font::FontId::Normal, label);
             Point::new(11.0 + 4.0 + s.x + 1.0, s.y.max(10.0))
         }
-        Kind::View | Kind::Border(_) | Kind::Input | Kind::Combo(_) | Kind::RadioGroup { .. } | Kind::Unsupported(_) => node_calc(env, tree, id, max),
+        Kind::View | Kind::Border(_) | Kind::Canvas(_) | Kind::Input | Kind::Combo(_) | Kind::RadioGroup { .. } | Kind::Unsupported(_) => node_calc(env, tree, id, max),
     }
 }
 

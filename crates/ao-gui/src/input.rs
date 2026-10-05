@@ -65,4 +65,12 @@ pub enum Event {
     /// The style-1 frame's close button was released over itself (`WndBorder::SlotCloseButton` 0x10159705
     /// posts message 0x98968b to the window; the application decides: quit for LoginWindow, ignore for the progress window).
     CloseRequested { window: WindowId },
+    /// A read-only `TextView` was clicked on an `<a href=..>` run (`TextRenderer_c::GetHyperLink` 0x10162c36); activation on mouse-down is a guess.
+    LinkClicked { window: WindowId, view: String, href: String },
+    /// The left button was dragged over a `CanvasView` (mouse delta since the last step, pixels).
+    CanvasDrag { window: WindowId, view: String, dx: f32, dy: f32 },
+    /// Left click (press and release within 3 px) on a `CanvasView`; `x`,`y` relative to the view.
+    CanvasClick { window: WindowId, view: String, x: f32, y: f32 },
+    /// Mouse wheel over a `CanvasView` (`dy` notches, positive = up; `x`,`y` relative to the view).
+    CanvasWheel { window: WindowId, view: String, dy: f32, x: f32, y: f32 },
 }

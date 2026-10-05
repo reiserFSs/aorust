@@ -27,7 +27,30 @@ fn decode(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }
-    s.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    // numeric character references (`&#8216;` in Skills.xml), then the five predefined entities (`&amp;` last)
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("&#") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 2..];
+        let (digits, radix) = match tail.strip_prefix(['x', 'X']) {
+            Some(h) => (h, 16),
+            None => (tail, 10),
+        };
+        let n = digits.find(';').and_then(|e| u32::from_str_radix(&digits[..e], radix).ok().map(|v| (v, e)));
+        match n.and_then(|(v, e)| char::from_u32(v).map(|c| (c, e))) {
+            Some((c, e)) => {
+                out.push(c);
+                rest = &digits[e + 1..];
+            }
+            None => {
+                out.push_str("&#");
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
 struct P<'a> {

@@ -1,5 +1,6 @@
 //! Renderer-agnostic Anarchy Online GUI engine (see `docs/gui.md`).
 pub mod draw;
+pub mod expr;
 pub mod font;
 pub mod geom;
 pub mod gfx;

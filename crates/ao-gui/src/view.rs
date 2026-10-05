@@ -158,6 +158,47 @@ pub struct ComboData {
     pub open: bool,
 }
 
+/// `CCMenuEntry_c` (GUI.dll 0x1006667e, ctor 0x100660f2): a `Button_c` with the control-centre 3-slice art
+/// (`SetGfx` in 0x10065b4e: raised 0x9b/0x9d/0x9f = `GFX_GUI_CONTROLCENTER_BUTTON01_*`, pressed 0xa4/0xa6/0xa8 = `BUTTON03_*`,
+/// hover 0xa1..0xa3 = `BUTTON02_*`; golden_button: 0x9c/0x9e/0xa0 and 0xa5/0xa7/0xa9) and the `bgicon` background icon.
+#[derive(Clone, Debug, Default)]
+pub struct CcEntryData {
+    pub label: String,
+    pub icon: Option<GfxId>,
+    pub golden: bool,
+    /// `button_mode` none/toggle (1/0 → pressed look follows `active`) vs `button` (2: momentary).
+    pub toggle: bool,
+    /// The entry's dvalue is true (toggle entries show the pressed art).
+    pub active: bool,
+    pub hover: bool,
+    pub pressed: bool,
+    /// `tooltip` / `tooltip_body` (`View::SetToolTip`).
+    pub tip: Option<(String, String)>,
+    /// The entry opens a sub menu.
+    pub submenu: bool,
+    /// `Button_c+0x1dc`: hover fade 0..1 (`SlotFadeTimer` 0x10127c6d, +0.075 per tick while the mouse is inside, −0.075 otherwise).
+    pub fade: f32,
+}
+
+/// One thing a [`Kind::Canvas`] paints; coordinates are relative to the view's top-left.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CanvasItem {
+    /// `src` = x, y, w, h in image pixels, `dst` = x0, y0, x1, y1 (exclusive).
+    Image { id: GfxId, src: [f32; 4], dst: [f32; 4], alpha: f32 },
+    Solid { dst: [f32; 4], color: u32, alpha: f32 },
+    /// [`CanvasItem::Image`] multiplied by `color` (0xRRGGBB or a ColorID such as `0x1000000` = DEFAULT, like `ViewSurface_c::SetColor`).
+    ImageTint { id: GfxId, src: [f32; 4], dst: [f32; 4], color: u32, alpha: f32 },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CanvasData {
+    pub items: Vec<CanvasItem>,
+    /// Mouse position of the last drag step while the left button is held.
+    pub drag: Option<Point>,
+    /// Where the button went down (a release within 3 px is a click).
+    pub down: Point,
+}
+
 #[derive(Clone, Debug)]
 pub enum Kind {
     View,
@@ -169,6 +210,11 @@ pub enum Kind {
     TextButton(TextButtonData),
     PowerBar(PowerBarData),
     Bitmap { gfx: Vec<GfxId>, index: usize },
+    CcEntry(CcEntryData),
+    /// Host-painted view (the map windows): the application sets the items with `Gui::set_canvas` and receives
+    /// `Event::CanvasDrag` / `Event::CanvasWheel`. No client counterpart: it stands for the custom `View_c::Draw` of
+    /// `PlanetMapView_c` / `PFMapRenderer_c` (GUI.dll), whose content is not skin art.
+    Canvas(CanvasData),
     /// TextInputView_c: outer view whose children are `BorderView(INSET)` → editor `TextView`.
     Input,
     /// ComboBox_c = TextInputView + arrow BitmapView inside the border (`ComboBox_c::Initialize` 0x100021bb).
@@ -224,6 +270,13 @@ pub struct View {
     /// `View::SetAlpha`.
     pub alpha: f32,
     pub tab_order: i32,
+    /// `activate_criteria` / `criteria` expression (`docs/gui.md` §10): evaluated by `Gui::apply_criteria`.
+    pub criteria: String,
+    /// `View::SetToolTip` title and body (`+0x140` / `+0x15c` of the view's extra data); `None` = the view provides none.
+    pub tip: Option<(String, String)>,
+    /// `width_group` / `width_group_owner` (`View::SetWidthGroup`): all views of one group under the owner ancestor get the group's widest
+    /// preferred width (docs/gui.md §11; Skills.xml).
+    pub width_group: Option<(String, String)>,
 }
 
 impl View {
@@ -249,6 +302,9 @@ impl View {
             color: 0xffffff,
             alpha: 1.0,
             tab_order: -1,
+            criteria: String::new(),
+            tip: None,
+            width_group: None,
         }
     }
 }
@@ -383,6 +439,8 @@ fn apply_view_attrs(v: &mut View, e: &Element, default_flags: u32) {
     v.h_align = Align::parse(e.attr("h_alignment").unwrap_or(""));
     v.v_align = Align::parse(e.attr("v_alignment").unwrap_or(""));
     v.tab_order = e.attr("tab_order").and_then(parse_int).map_or(-1, |v| v as i32);
+    v.width_group = e.attr("width_group").filter(|g| !g.is_empty()).map(|g| (g.to_string(), e.attr("width_group_owner").unwrap_or("").to_string()));
+    v.criteria = e.attr("activate_criteria").or_else(|| e.attr("criteria")).unwrap_or("").to_string();
 }
 
 fn default_gfx(ctx: &BuildCtx, ids: [u32; 9]) -> [Option<GfxId>; 9] {
@@ -520,6 +578,11 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             apply_view_attrs(&mut v, e, 0);
             tree.add(v)
         }
+        "CanvasView" => {
+            let mut v = View::new(Kind::Canvas(CanvasData::default()));
+            apply_view_attrs(&mut v, e, 0);
+            tree.add(v)
+        }
         "PowerBar" => {
             let mut v = View::new(Kind::PowerBar(PowerBarData {
                 bg: ctx.gfx_attr(e, "bg_gfx"),
@@ -541,6 +604,37 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
         "BitmapView" => {
             let mut v = View::new(Kind::Bitmap { gfx: ctx.gfx_attr(e, "bitmap_id").into_iter().collect(), index: 0 });
             apply_view_attrs(&mut v, e, 4);
+            v.color = color_attr(e, "color", 0xffffff); // `View::SetColor` (control-centre art is tinted DEFAULT)
+            let id = tree.add(v);
+            if !e.children.is_empty() {
+                // BitmapView with a layout node and child views (LeftBarView_c / RightBarView_c, GUI.dll 0x1006f7c5 / 0x1006ff09)
+                load_children(tree, ctx, id, e);
+            }
+            id
+        }
+        "CCMenu" => {
+            // ControlMenu_c root (GUI.dll 0x10071524, no own window): entries stacked vertically (0x1007086f: pitch = height + 4);
+            // the application fills it (`Gui::add_view_xml`), found by its `script` name.
+            let mut v = View::new(Kind::View);
+            apply_view_attrs(&mut v, e, 4);
+            v.name = e.attr("script").unwrap_or("").to_string();
+            v.node = Node::V;
+            v.h_align = Align::Left;
+            tree.add(v)
+        }
+        "CCMenuEntry" => {
+            let icon = e.attr("bgicon").and_then(|s| s.trim().strip_prefix("id:")).and_then(|n| ctx.gfx.id(n));
+            let mode = e.attr("button_mode").map(str::to_ascii_lowercase);
+            let mut v = View::new(Kind::CcEntry(CcEntryData {
+                label: ctx.string(e, "label"),
+                icon,
+                golden: e.attr("golden_button").is_some(),
+                toggle: mode.as_deref() != Some("button"),
+                tip: e.attr("tooltip").map(|t| (ctx.text(t), ctx.string(e, "tooltip_body"))),
+                submenu: e.attr("submenu").is_some(),
+                ..Default::default()
+            }));
+            apply_view_attrs(&mut v, e, 0);
             tree.add(v)
         }
         "TextInputView" | "ComboBox" => build_input(tree, ctx, e, e.name == "ComboBox"),
@@ -569,8 +663,8 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             apply_view_attrs(&mut v, e, 0);
             let id = tree.add(v);
             load_children(tree, ctx, id, e);
-            tree.views[id].stacked = true;
-            tree.views[id].node = Node::None;
+            // children fill the bounds (`LayoutNode`: preferred size = largest child), only the selected one is shown
+            tree.views[id].node = Node::Base;
             id
         }
         "ScrollViewChild" => {
@@ -578,6 +672,18 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             apply_view_attrs(&mut v, e, 0);
             let id = tree.add(v);
             load_children(tree, ctx, id, e);
+            // The client the scroll view lays out is one view (login window: `characters_view`); `SkillWindow` (`FUN_100fc18e`) makes the
+            // `ScrollViewChild` itself that client. Several children therefore go into an implicit inner view carrying the layout node.
+            if tree.views[id].children.len() > 1 {
+                let kids = std::mem::take(&mut tree.views[id].children);
+                let mut inner = View::new(Kind::View);
+                inner.node = tree.views[id].node;
+                let inner_id = tree.add(inner);
+                for k in kids {
+                    tree.append_child(inner_id, k);
+                }
+                tree.append_child(id, inner_id);
+            }
             id
         }
         "CheckBox" => {
@@ -608,6 +714,10 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             id
         }
     };
+    // `tooltip` / `tooltip_body` attributes: `View::SetToolTip(title, body)` (GUI.dll 0x1014dadf).
+    if let Some(t) = e.attr("tooltip") {
+        tree.views[id].tip = Some((ctx.text(t), ctx.string(e, "tooltip_body")));
+    }
     Some(id)
 }
 
