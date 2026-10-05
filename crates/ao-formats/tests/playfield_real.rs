@@ -31,7 +31,8 @@ fn outdoor_city_has_terrain_and_buildings() {
         }
     }
     // terrain heights stay in the plausible range of the 8 bit map (0..51 m at scale 0.2)
-    let max_y = scene.meshes.iter().flat_map(|m| m.vertices.iter()).map(|v| v.pos[1]).fold(f32::MIN, f32::max);
+    let sky: Vec<usize> = scene.sky.iter().map(|i| i.mesh).collect();
+    let max_y = scene.meshes.iter().enumerate().filter(|(i, _)| !sky.contains(i)).flat_map(|(_, m)| m.vertices.iter()).map(|v| v.pos[1]).fold(f32::MIN, f32::max);
     assert!(max_y > 20.0 && max_y < 400.0, "max y {max_y}");
 }
 
