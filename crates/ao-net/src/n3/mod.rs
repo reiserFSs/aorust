@@ -5,6 +5,7 @@
 
 pub mod combat;
 pub mod dynel;
+pub mod chat;
 pub mod misc;
 pub mod motion;
 pub mod nametag;
@@ -44,6 +45,8 @@ pub enum N3 {
     Dynel(dynel::Dynel),
     Misc(misc::Misc),
     /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
+    /// `ChatTextIIR_t` / `FeedbackIIR_t` / `FormatFeedbackIIR_t`.
+    Chat(chat::N3Chat),
     Unknown(Vec<u8>),
 }
 
@@ -68,6 +71,8 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
     } else if let Some(m) = misc::decode(&h, &mut r)? {
         N3::Misc(m)
     } else {
+    } else if let Some(m) = chat::decode(&h, &mut r)? {
+        N3::Chat(m)
         N3::Unknown(f.payload[13..].to_vec())
     };
     Ok(Message { header: h, sender: f.sender, body })
