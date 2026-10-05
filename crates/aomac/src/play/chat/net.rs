@@ -14,6 +14,8 @@ pub enum Out {
     Line(ChatLine),
     /// S2C_GROUP_JOIN: a channel to show/subscribe (`ChatGUIModule_c::AddGroup` 0x10085f91).
     GroupAdd { group: u64, name: String, flags: u32 },
+    /// S2C_SYS_MESSAGE_LOCAL_FMT: text id of category 20000 with its arguments (formatted by the hub with the text db).
+    SystemFmt { sender: u32, kind: u32, text_id: u32, args: Vec<ao_net::chat::FmtArg> },
     /// S2C_GROUP_PART (`RemoveGroup` 0x1008603d).
     GroupRemove { group: u64, name: String },
 }
@@ -169,6 +171,7 @@ impl ChatNet {
                 };
                 out.push(Out::Msg(ChatMsg { group, from_name: name, text, kind, ..Default::default() }));
             }
+            ChatEvent::SystemFmt { sender, kind, text_id, args } => out.push(Out::SystemFmt { sender, kind, text_id, args }),
             ChatEvent::System(text) => out.push(Out::Line(ChatLine::new(ChatKind::System, text))),
             ChatEvent::GroupJoin { group, name, flags, .. } => {
                 let key = group_key(group);
@@ -250,6 +253,32 @@ mod tests {
     #[test]
     fn backoff_matches_client() {
         assert_eq!([backoff(0), backoff(1), backoff(2), backoff(3), backoff(9)], [4.096, 8.192, 16.384, 32.768, 32.768]);
+    }
+
+    /// Replay of a live session (docs/captures/chat_session_ithaca.rec): groups, MOTD, own group message echo, tell to an offline friend.
+    #[test]
+    fn live_session_replay() {
+        let mut n = ChatNet::default();
+        let mut out = vec![];
+        for l in include_str!("../../../../../docs/captures/chat_session_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next(), p.next().unwrap(), p.next().unwrap());
+            if dir != "<" {
+                continue;
+            }
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            let t = u16::from_be_bytes([b[0], b[1]]);
+            if t != 0 {
+                n.on_event(ao_net::chat::decode(t, &b[4..]).unwrap(), &mut out);
+            }
+        }
+        let names: Vec<_> = n.groups.values().map(String::as_str).collect();
+        assert_eq!(names, ["Neutral", "Omni-Tek", "Clan", "Global", "Global Trade", "IRRK News Wire", "Server Announcements"].map(|x| x));
+        assert_eq!(n.group_by_name("global"), Some(0x5_0000_0014));
+        let msgs: Vec<&ChatMsg> = out.iter().filter_map(|o| if let Out::Msg(m) = o { Some(m) } else { None }).collect();
+        assert!(msgs.iter().any(|m| m.group_name == "Global" && m.from_name == "Aomacvolk" && m.text == "aomac client test"), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.text.starts_with("This player is currently offline")));
+        assert!(msgs.iter().any(|m| m.text.starts_with("Welcome to Project Rubi-Ka!") && m.group == 0x4000_0002));
     }
 
     #[test]

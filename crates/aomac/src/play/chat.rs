@@ -4,6 +4,7 @@
 
 mod cmd;
 mod line;
+mod log;
 mod net;
 pub(super) mod win;
 mod zone;
@@ -19,7 +20,7 @@ use cmd::{ChatAction, CmdCtx, GroupInfo, GroupKind, Target};
 use line::{ChatKind, ChatLine};
 use net::Out;
 use std::collections::HashSet;
-use win::{ChatWindows, WinOut, G_VICINITY};
+use win::{ChatWindows, WinOut, G_VICINITY, LOCAL_GROUPS};
 
 /// Identity kind of characters (`SimpleChar_t`).
 const CHAR_KIND: i32 = 0xC350;
@@ -40,7 +41,7 @@ pub(super) struct Chat {
 }
 
 enum Back {
-    Line(ChatLine),
+    Line(ChatLine, Option<String>),
     Msg(line::ChatMsg),
     Group(u64, String),
     Ungroup(u64),
@@ -64,7 +65,7 @@ impl Chat {
             self.win = Some(ChatWindows::new(gui, screen)?);
             for b in std::mem::take(&mut self.backlog) {
                 match b {
-                    Back::Line(l) => self.line(gui, l),
+                    Back::Line(l, h) => self.line_to(gui, l, h.as_deref()),
                     Back::Msg(m) => self.msg(gui, m),
                     Back::Group(g, n) => self.group(g, n),
                     Back::Ungroup(g) => self.ungroup(g),
@@ -75,10 +76,17 @@ impl Chat {
     }
 
     fn line(&mut self, gui: &mut Gui, l: ChatLine) {
+        self.line_to(gui, l, None);
+    }
+    /// `hint` = name of the group (window class) the line belongs to.
+    fn line_to(&mut self, gui: &mut Gui, l: ChatLine, hint: Option<&str>) {
         match &mut self.win {
-            Some(w) => w.push(gui, &l, None),
-            None => self.backlog.push(Back::Line(l)),
+            Some(w) => w.push(gui, &l, hint),
+            None => self.backlog.push(Back::Line(l, hint.map(str::to_owned))),
         }
+    }
+    fn class_name(&self, class: u64) -> Option<String> {
+        LOCAL_GROUPS.iter().find(|g| g.0 == class).map(|g| g.1.to_owned()).or_else(|| self.net.groups.get(&class).cloned())
     }
     fn msg(&mut self, gui: &mut Gui, m: line::ChatMsg) {
         match &mut self.win {
@@ -121,17 +129,40 @@ impl Chat {
             PT_SYSTEM => self.net.on_system_frame(f, zone.char_id),
             PT_N3 => {
                 let Ok(m) = n3::decode(f) else { return };
-                let N3::Chat(c) = &m.body else { return };
-                let ctx = zone::ZoneChatCtx {
-                    texts,
-                    name_of: &|id| zone.dynels.get(&(id as i32)).map(|d| d.name.clone()),
-                    header_is_char: m.header.target.kind == CHAR_KIND,
-                    target: zone.target.map(|t| t as u32),
-                    fighting: None,
-                    mouse: None,
+                if let N3::Chat(c) = &m.body {
+                    let ctx = zone::ZoneChatCtx {
+                        texts,
+                        name_of: &|id| zone.dynels.get(&(id as i32)).map(|d| d.name.clone()),
+                        header_is_char: m.header.target.kind == CHAR_KIND,
+                        target: zone.target.map(|t| t as u32),
+                        fighting: None,
+                        mouse: None,
+                    };
+                    for t in zone::routed(c, &ctx) {
+                        let hint = self.class_name(t.channel as u64);
+                        self.line_to(gui, t.line, hint.as_deref());
+                    }
+                    return;
+                }
+                // combat / stat / level feedback lines (docs/chat/log.md); evaluated before `zone.on_frame` applies the stat change
+                let own = Identity { kind: CHAR_KIND, instance: zone.char_id as i32 };
+                let dyn_of = |id: Identity| (id.kind == CHAR_KIND).then(|| zone.dynels.get(&id.instance)).flatten();
+                let filter = log::ChatFilter::default();
+                let ctx = log::LogCtx {
+                    own,
+                    name: &|id| dyn_of(id).map(|d| d.name.clone()),
+                    text: &|c, i| texts.by_id(c, i),
+                    is_npc: &|id| dyn_of(id).is_some_and(|d| d.npc),
+                    is_own_pet: &|_| false,
+                    nano_name: &|_| None,
+                    stat: &|id, st| (id == own).then(|| zone.stat(st as u32)).flatten(),
+                    filter: &filter,
                 };
-                for l in zone::lines(c, &ctx) {
-                    self.line(gui, l);
+                for ev in log::events(&m) {
+                    for l in log::classify(&ev, &ctx) {
+                        let hint = self.class_name(l.class as u64);
+                        self.line_to(gui, l.line, hint.as_deref());
+                    }
                 }
             }
             _ => {}
@@ -139,7 +170,7 @@ impl Chat {
     }
 
     /// Per frame: chat-server events into the windows, window fades.
-    pub fn update(&mut self, gui: &mut Gui, dt: f32) {
+    pub fn update(&mut self, gui: &mut Gui, dt: f32, texts: &TextDb) {
         for o in self.net.update(dt) {
             match o {
                 Out::Msg(m) => {
@@ -149,6 +180,19 @@ impl Chat {
                     self.msg(gui, m);
                 }
                 Out::Line(l) => self.line(gui, l),
+                Out::SystemFmt { text_id, args, .. } => {
+                    // HandleSystemMessage-style local format: template = text id of category 20000, 'l' args are text ids of the same category
+                    let a: Vec<log::Arg> = args
+                        .into_iter()
+                        .map(|a| match a {
+                            ao_net::chat::FmtArg::Int(v) => log::Arg::N(v as i32),
+                            ao_net::chat::FmtArg::Str(s) => log::Arg::S(s),
+                            ao_net::chat::FmtArg::TextId(i) => log::Arg::S(texts.by_id(20000, i).unwrap_or_default()),
+                        })
+                        .collect();
+                    let t = log::ldb_format(&texts.by_id(20000, text_id).unwrap_or_default(), &a);
+                    self.line(gui, ChatLine::new(ChatKind::System, t));
+                }
                 Out::GroupAdd { group, name, .. } => self.group(group, name),
                 Out::GroupRemove { group, .. } => self.ungroup(group),
             }
@@ -173,7 +217,8 @@ impl Chat {
                 self.focus_text(gui, "/");
                 true
             }
-            InputEvent::Key { key: ao_gui::Key::Letter('R'), pressed: true, mods, .. } if mods.shift => {
+            // Shift+R arrives as the text "R" (the viewer sends text, not a key, for printable keys)
+            InputEvent::Text(t) if t == "R" => {
                 let prefill = {
                     let (groups, text) = (self.groups(), |k: &str| texts.by_key(10001, &format!("ChatCmdFeedback_{k}")).unwrap_or_default());
                     cmd::reply_prefill(&self.cmd_ctx(zone, &groups, None, &text))
