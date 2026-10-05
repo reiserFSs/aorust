@@ -131,6 +131,26 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!("players assembled over every head (idle pose): {ok}/{total}");
+    // SetSkinData coverage: every slot of every player type, build and solitus ethnicity resolves its naked skin
+    let (mut slots, mut found) = (0, 0);
+    for (breed, gender) in [(Breed::Solitus, Gender::Male), (Breed::Solitus, Gender::Female), (Breed::Opifex, Gender::Male), (Breed::Opifex, Gender::Female), (Breed::Nanomage, Gender::Male), (Breed::Nanomage, Gender::Female), (Breed::Atrox, Gender::Male)] {
+        for skin in if breed == Breed::Solitus { vec![Skin::Caucasian, Skin::Asian, Skin::African] } else { vec![Skin::Caucasian] } {
+            for part in ClothPart::ALL {
+                slots += 1;
+                found += usize::from(names.id(1010011, &skin_texture_name(breed, gender, skin, part)).is_some());
+            }
+        }
+    }
+    println!("naked skin slots resolved by SetSkinData's name rule: {found}/{slots}");
+    let (mut scenes, mut skinned) = (0, 0);
+    for (breed, gender) in [(Breed::Solitus, Gender::Male), (Breed::Solitus, Gender::Female), (Breed::Opifex, Gender::Male), (Breed::Opifex, Gender::Female), (Breed::Nanomage, Gender::Male), (Breed::Nanomage, Gender::Female), (Breed::Atrox, Gender::Male)] {
+        for build in 0..3 {
+            scenes += 1;
+            let p = Player::new(breed, gender, Skin::Caucasian, None);
+            skinned += usize::from(load_player_build(&store, &p, build, None).is_ok_and(|s| s.textures.keys().filter(|k| k.rdb_type == 1010011).count() == 5));
+        }
+    }
+    println!("player bodies (thin/normal/fat) with all five slots skinned: {skinned}/{scenes}");
     Ok(())
 }
 

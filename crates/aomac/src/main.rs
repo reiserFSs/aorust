@@ -206,7 +206,7 @@ fn main() -> Result<()> {
                     }
                 }
                 What::Player { breed, gender, head, skin, role, time } => {
-                    let player = ao_formats::character::Player { breed, gender, skin, head };
+                    let player = ao_formats::character::Player::new(breed, gender, skin, head);
                     ao_formats::character::load_player(&RecordStore::open(&dir)?, &player, role.map(|r| (r, time)))?
                 }
                 What::Mesh { id } => ao_formats::mesh::load_mesh(&RecordStore::open(&dir)?, id)?,

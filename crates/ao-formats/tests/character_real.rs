@@ -138,19 +138,53 @@ fn player_tables_resolve_models_heads_and_clips() {
 }
 
 #[test]
-fn players_have_skin_not_the_green_placeholder() {
+fn unequipped_players_show_naked_skin_on_every_slot_and_build() {
     let Some(store) = store() else { return };
     let green = |t: &ao_scene::Texture| t.rgba.as_chunks::<4>().0.iter().all(|p| p[..3] == [0, 255, 0]);
     for (breed, gender, _) in PLAYERS {
         let s = load_player_character(&store, breed, gender, 1, Some((Role::Idle, 0.0))).unwrap();
         assert!(s.instances.len() == 2, "body + head");
         assert!(s.textures.values().all(|t| !green(t)), "{breed:?} {gender:?} still has a green texture");
-        assert!(s.textures.keys().any(|k| k.rdb_type == 1010011), "naked skin textures applied");
+        // SetSkinData: every one of the five slots is its rdb 1010011 skin, none keeps the model's `*_default.png`
+        let skins = s.textures.keys().filter(|k| k.rdb_type == 1010011).count();
+        assert_eq!(skins, 5, "{breed:?} {gender:?}");
+        assert!(!s.meshes[0].submeshes.iter().any(|m| m.texture.is_some_and(|k| k.rdb_type == 1010004)), "body slot with the default texture");
+        for build in [0, 2] {
+            let p = Player::new(breed, gender, Skin::Caucasian, Some(1));
+            let s = load_player_build(&store, &p, build, None).unwrap();
+            assert_eq!(s.textures.keys().filter(|k| k.rdb_type == 1010011).count(), 5, "{breed:?} {gender:?} build {build}");
+        }
     }
+    // solitus ethnicity picks the race's skin on every slot
     for skin in [Skin::Asian, Skin::African] {
-        let p = Player { breed: Breed::Solitus, gender: Gender::Male, skin, head: None };
-        assert!(load_player(&store, &p, Some((Role::Walk, 0.6))).is_ok());
+        let p = Player::new(Breed::Solitus, Gender::Male, skin, None);
+        let s = load_player(&store, &p, Some((Role::Walk, 0.6))).unwrap();
+        assert_eq!(s.textures.keys().filter(|k| k.rdb_type == 1010011).count(), 5);
     }
+}
+
+#[test]
+fn worn_cloth_replaces_the_skin_except_where_it_is_green() {
+    let Some(store) = store() else { return };
+    let names = NameTable::load(&store).unwrap();
+    // hands_*_default.png is the solid green placeholder: wearing it leaves the skin; body_*_default.png is opaque cloth
+    let hands = names.id(1010004, "hands_athroxmale_default.png").unwrap();
+    let body = names.id(1010004, "body_athroxmale_default.png").unwrap();
+    let mut p = Player::new(Breed::Atrox, Gender::Male, Skin::Caucasian, Some(1));
+    let bare = load_player(&store, &p, None).unwrap();
+    p.equipment.wear(ClothPart::Hands, hands);
+    p.equipment.wear(ClothPart::Body, body);
+    let s = load_player(&store, &p, None).unwrap();
+    let tex_of = |s: &ao_scene::Scene, name: &str| {
+        let id = names.id(1010011, name).unwrap();
+        s.textures.iter().find(|(k, _)| (k.rdb_type, k.id) == (1010011, id) || k.rdb_type == 0x4000_0000 | id).map(|(k, t)| (*k, t.rgba.clone()))
+    };
+    let (_, hands_bare) = tex_of(&bare, "hands_athroxmale_naked.png").unwrap();
+    let (_, hands_worn) = tex_of(&s, "hands_athroxmale_naked.png").unwrap();
+    assert_eq!(hands_bare, hands_worn, "an all-green glove shows the skin everywhere");
+    let (k, body_worn) = tex_of(&s, "body_athroxmale_naked.png").unwrap();
+    assert!(k.rdb_type & 0x4000_0000 != 0 && k.id == body, "composite key");
+    assert_ne!(tex_of(&bare, "body_athroxmale_naked.png").unwrap().1, body_worn);
 }
 
 #[test]

@@ -48,7 +48,7 @@ impl Worker {
 }
 
 fn frames(store: &RecordStore, look: &CharSelectLook, role: Role) -> anyhow::Result<Vec<Scene>> {
-    let player = Player { breed: look.breed, gender: look.gender, skin: look.skin, head: Some(look.head.0) };
+    let player = Player::new(look.breed, look.gender, look.skin, Some(look.head.0));
     let model = character::player_model(store, look.breed, look.gender)?;
     let anim = character::load_anim(store, character::role_anim(store, model, &role)?)?;
     let n = ((anim.duration / 1000.0 * FPS).round() as usize).max(1);
@@ -64,7 +64,7 @@ fn frames(store: &RecordStore, look: &CharSelectLook, role: Role) -> anyhow::Res
 fn run(dir: &std::path::Path, breed: i32, sex: i32, req: &Receiver<Option<usize>>, tx: &Sender<Out>) -> anyhow::Result<()> {
     let store = RecordStore::open(dir)?;
     let look = screens::char_select_look(&store, breed, sex)?;
-    let player = Player { breed: look.breed, gender: look.gender, skin: look.skin, head: Some(look.head.0) };
+    let player = Player::new(look.breed, look.gender, look.skin, Some(look.head.0));
     if tx.send(Out::First(Box::new(character::load_player(&store, &player, Some((Role::Idle, 0.0)))?))).is_err() {
         return Ok(());
     }

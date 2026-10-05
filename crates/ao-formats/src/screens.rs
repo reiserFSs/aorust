@@ -327,7 +327,7 @@ impl CharSelectLook {
     /// The body + head + naked skin (bind pose or the idle clip at `time` seconds), at the origin in renderer space;
     /// place it with [`ao_to_render`]`(self.position)`.
     pub fn scene(&self, store: &RecordStore, role: Option<(Role, f32)>) -> Result<Scene> {
-        load_player(store, &Player { breed: self.breed, gender: self.gender, skin: self.skin, head: Some(self.head.0) }, role)
+        load_player(store, &Player::new(self.breed, self.gender, self.skin, Some(self.head.0)), role)
     }
 }
 

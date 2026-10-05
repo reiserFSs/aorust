@@ -50,7 +50,7 @@ impl Worker {
 }
 
 fn player(spec: Spec) -> Player {
-    Player { breed: spec.breed, gender: spec.gender, skin: spec.head.1, head: Some(spec.head.0) }
+    Player::new(spec.breed, spec.gender, spec.head.1, Some(spec.head.0))
 }
 
 fn frames(store: &RecordStore, spec: Spec, role: Role) -> anyhow::Result<Vec<Scene>> {

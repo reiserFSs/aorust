@@ -406,7 +406,10 @@ are **not** read by the selection screen.
   `std::vector<(mesh id, ethnicity)>`, not sorted by id** (decoded in §12 *Head table*; `ao_formats::character::head_table`, used by `screens::char_select_look`
   with `ExpansionFlags` 0). Head attached as attractor mesh (`AddAttractorMesh(0, headMesh, 4, 0)`).
 * skin: `VisualCATMesh_t::SetSkinData(breed, sex, race)` with the race of the head entry → naked skin textures (rdb 1010011
-  `<part>_<race><sex>[_caucation|_asian|_african]_naked.png`); this is what `load_player` already does.
+  `<part>_<race><sex>[_caucation|_asian|_african]_naked.png`) on layer 0 of the five materials `hands body feet arms legs`; **no cloth layer is
+  set** by `ChangeMesh`/`ChangeHead` (GUI decompile, 0x1011ab53 / 0x1011a631), so the creation screen shows the bare skin and the model's own
+  `*_default.png` never appears (see formats.md § Skin, `FUN_1007457f`). `load_player` does exactly this; `Player.equipment` is the cloth layer
+  that `CharacterViewer_c::Update` [0x100054cd] applies to existing characters in the select screen.
 * animation: `PlayAnim("idle-stand_01_01", loop=false)` builds the clip name `<set>_<anim>.ani` with `set = "athrox"` for Atrox else
   `"male"`/`"female"` (e.g. `male_idle-stand_01_01.ani` rdb 1010003 id 10173, `female_idle-stand_01_01.ani` 10135,
   `athrox_idle-stand_01_01.ani` 9992). It is played **once, not looped**; `RunFunction` [0x1011a7d6] each frame: when `IsAnimDone`,

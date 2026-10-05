@@ -4,14 +4,16 @@
 //! * clips are named `<set>_<role>_01_01.ani` (`%s_%s_01_01.ani` in Gamecode.dll); the set is `athrox`
 //!   for Atrox bodies and `male`/`female` for the other breeds (all human bodies share one skeleton);
 //! * heads are meshes `head_<race><sex>[_<ethnicity>]<NN>.abiff` (`head_%s%s%02d.abiff` in GUI.dll);
-//! * skin: the body models are textured `<part>_<race><sex>_default.png` (starter clothing, hands a
-//!   green placeholder); the naked skins are rdb 1010011 `<part>_<race><sex>[_<ethnicity>]_naked.png`.
+//! * skin: a player's body materials (`hands body feet arms legs`) show the rdb 1010011 naked skin
+//!   `<part>_<race><sex>[_<ethnicity>]_naked.png` with worn cloth textures composited over it, see [`part_textures`];
+//!   the models' `*_default.png` are the textures of non-player users of the same bodies (NPCs).
 
-use super::{load_cat_mesh, load_character_head_skin, CatAnim, NameTable, CHAR_ANIM_TYPE, CHAR_MESH_TYPE};
+use super::{load_cat_mesh, load_character_head_skin, CatAnim, NameTable, PartTextures, CHAR_ANIM_TYPE, CHAR_MESH_TYPE};
+use crate::texture::load_texture;
 use anyhow::{Context, Result};
 use ao_rdb::RecordStore;
-use ao_scene::{Scene, TextureKey};
-use std::{collections::HashMap, str::FromStr};
+use ao_scene::{Scene, Texture, TextureKey};
+use std::str::FromStr;
 
 /// Static meshes (heads).
 const MESH_TYPE: u32 = 1010001;
@@ -52,6 +54,15 @@ pub struct Player {
     pub skin: Skin,
     /// Head number `NN` (see [`player_heads`]); `None` = the lowest available.
     pub head: Option<u32>,
+    /// Worn cloth per body slot ([`Equipment`]); default = nothing worn.
+    pub equipment: Equipment,
+}
+
+impl Player {
+    /// An unequipped player.
+    pub fn new(breed: Breed, gender: Gender, skin: Skin, head: Option<u32>) -> Self {
+        Self { breed, gender, skin, head, equipment: Equipment::default() }
+    }
 }
 
 impl Breed {
@@ -347,19 +358,97 @@ pub fn head_table(store: &RecordStore, breed: Breed, gender: Gender, expansions:
     Ok(table)
 }
 
-/// Naked-skin textures for a body's `*_default.png` parts: original texture id → rdb 1010011 key.
-fn skin_swaps(names: &NameTable, store: &RecordStore, model_id: u32, skin: Skin) -> Result<HashMap<u32, TextureKey>> {
-    let mesh = load_cat_mesh(store, CHAR_MESH_TYPE, model_id)?;
-    let solitus = names.name(CHAR_MESH_TYPE, model_id).is_some_and(|n| n.starts_with("solitus"));
-    let mut swaps = HashMap::new();
-    for part in &mesh.parts {
-        let Some(stem) = names.name(TEXTURE_TYPE, part.texture).and_then(|n| n.strip_suffix("_default.png")) else { continue };
-        let eth = if solitus { skin.skin_infix() } else { "" };
-        if let Some(id) = names.id(SKIN_TYPE, &format!("{stem}{eth}_naked.png")) {
-            swaps.insert(part.texture, TextureKey { rdb_type: SKIN_TYPE, id });
+/// `ClothData_t::ClothPart_e`, the body slots the client textures separately (the model's materials of the same
+/// names). Order and names: table behind `ClothData_t::GetName` [GameData.dll 0x1000a5f0] (`hands body feet arms legs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClothPart {
+    Hands,
+    Body,
+    Feet,
+    Arms,
+    Legs,
+}
+
+impl ClothPart {
+    pub const ALL: [ClothPart; 5] = [ClothPart::Hands, ClothPart::Body, ClothPart::Feet, ClothPart::Arms, ClothPart::Legs];
+
+    pub fn name(self) -> &'static str {
+        ["hands", "body", "feet", "arms", "legs"][self as usize]
+    }
+}
+
+/// What a player wears, per [`ClothPart`]: the rdb 1010004 texture id the client draws over the skin
+/// (`SetCATTexture(part, id, TextureLayer 2)`, Gamecode `FUN_1004b5ab` @0x1004b5ab / GUI `CharacterViewer_c::Update`),
+/// `None` = nothing worn on that slot. Filled from server data by the caller; an unequipped player is the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Equipment(pub [Option<u32>; 5]);
+
+impl Equipment {
+    pub fn wear(&mut self, part: ClothPart, texture: u32) {
+        self.0[part as usize] = Some(texture);
+    }
+}
+
+/// rdb 1010011 name of the naked skin of a body slot: `FUN_1006ff7f` [DisplaySystem 0x1006ff7f] =
+/// `<part>_<breed><sex>[_<race>]_naked.png` with `sex` forced to `male` for Atrox (`breed == 4`) and the race
+/// (`caucation`/`african`/`asian`) only for Solitus (`breed == 1`).
+pub fn skin_texture_name(breed: Breed, gender: Gender, skin: Skin, part: ClothPart) -> String {
+    let sex = if breed == Breed::Atrox { "male" } else { gender.name() };
+    let race = if breed == Breed::Solitus { skin.skin_infix() } else { "" };
+    format!("{}_{}{sex}{race}_naked.png", part.name(), breed.model_race())
+}
+
+/// `RGB565` green (0, 255, 0): the chroma key of cloth textures (`FUN_10074393` @0x10074393 compares the 16-bit
+/// texel with `0x07e0`). The 8-bit → 565 conversion is `r>>3, g>>2, b>>3` (`RTexture_t::Load`'s rounding is not
+/// traced; an unresolved guess that only matters for near-green texels).
+fn is_key(px: &[u8]) -> bool {
+    px[0] >> 3 == 0 && px[1] >> 2 == 0x3f && px[2] >> 3 == 0
+}
+
+/// The client's cloth-over-skin composite (`FUN_1007457f` → `FUN_10074393`): every texel of `cloth` except the
+/// green key replaces the skin texel at the same position; the skin is stretched to the cloth's size.
+/// A cloth without key texels is used as is.
+pub fn overlay_on_skin(skin: &Texture, cloth: &Texture) -> Texture {
+    if !cloth.rgba.as_chunks::<4>().0.iter().any(|c| is_key(c)) {
+        return cloth.clone();
+    }
+    let mut out = Texture { width: cloth.width, height: cloth.height, rgba: Vec::with_capacity(cloth.rgba.len()) };
+    for (i, c) in cloth.rgba.as_chunks::<4>().0.iter().enumerate() {
+        if is_key(c) {
+            let (x, y) = (i as u32 % cloth.width, i as u32 / cloth.width);
+            let s = ((y * skin.height / cloth.height) * skin.width + x * skin.width / cloth.width) as usize * 4;
+            out.rgba.extend_from_slice(&skin.rgba[s..s + 4]);
+        } else {
+            out.rgba.extend_from_slice(c);
         }
     }
-    Ok(swaps)
+    out
+}
+
+/// Key of a skin/cloth composite: a type with this bit set carries the skin id, `id` the cloth texture id.
+const COMPOSITE: u32 = 0x4000_0000;
+
+/// The textures of a player's body materials, as `VisualCATMesh_t::SetSkinData` [DisplaySystem 0x1007298b →
+/// 0x10070439] and the cloth list set them: layer 0 = the naked skin of every [`ClothPart`]; layer 2 = the worn
+/// cloth texture, composited over the skin. The model's own `*_default.png` (layer 1) is **not** used: for a
+/// player (mesh with a head, `FUN_10058078` @Gamecode 0x10058078) no layer-1 texture is ever set, and the
+/// record's base texture is null (`FUN_1007269e`), so `FUN_1007457f` yields the skin alone when nothing is worn.
+fn part_textures(names: &NameTable, store: &RecordStore, p: &Player) -> Result<PartTextures> {
+    let mut out = PartTextures::new();
+    for part in ClothPart::ALL {
+        let Some(id) = names.id(SKIN_TYPE, &skin_texture_name(p.breed, p.gender, p.skin, part)) else { continue };
+        let key = TextureKey { rdb_type: SKIN_TYPE, id };
+        let Some(skin) = load_texture(store, key)? else { continue };
+        let worn = p.equipment.0[part as usize].and_then(|t| Some((t, load_texture(store, TextureKey { rdb_type: TEXTURE_TYPE, id: t }).ok()??)));
+        out.insert(
+            part.name().to_string(),
+            match worn {
+                Some((t, cloth)) => (TextureKey { rdb_type: COMPOSITE | id, id: t }, overlay_on_skin(&skin, &cloth)),
+                None => (key, skin),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// Body model id (rdb 1010002) of a player type (`athrox_male.cir`, `solitus_female.cir`, …).
@@ -400,13 +489,13 @@ pub fn load_player_build(store: &RecordStore, p: &Player, build: u8, pose: Optio
         None => all.first().with_context(|| format!("no heads for {p:?}"))?.1,
     };
     let pose = pose.map(|(r, t)| role_anim(store, model, &r).map(|a| (a, t))).transpose()?;
-    load_character_head_skin(store, model, Some(head), pose, &skin_swaps(&names, store, model, p.skin)?)
+    load_character_head_skin(store, model, Some(head), pose, &part_textures(&names, store, p)?)
 }
 
 /// [`load_player`] with the default (caucasian) skin: the (breed, gender, head index) tuple of the
 /// creation screen.
 pub fn load_player_character(store: &RecordStore, breed: Breed, gender: Gender, head: u32, pose: Option<(Role, f32)>) -> Result<Scene> {
-    load_player(store, &Player { breed, gender, skin: Skin::Caucasian, head: Some(head) }, pose)
+    load_player(store, &Player { breed, gender, skin: Skin::Caucasian, head: Some(head), equipment: Equipment::default() }, pose)
 }
 
 #[cfg(test)]
@@ -437,5 +526,47 @@ mod tests {
         assert_eq!("Atrox".parse::<Breed>().unwrap(), Breed::Atrox);
         assert!("troll".parse::<Breed>().unwrap_err().contains("solitus"));
         assert_eq!("african".parse::<Skin>().unwrap(), Skin::African);
+    }
+
+    #[test]
+    fn skin_names_follow_setskindata() {
+        let n = |b, g, s, p| skin_texture_name(b, g, s, p);
+        assert_eq!(n(Breed::Atrox, Gender::Male, Skin::African, ClothPart::Hands), "hands_athroxmale_naked.png");
+        assert_eq!(n(Breed::Solitus, Gender::Male, Skin::Caucasian, ClothPart::Body), "body_solitusmale_caucation_naked.png");
+        assert_eq!(n(Breed::Solitus, Gender::Female, Skin::Asian, ClothPart::Legs), "legs_solitusfemale_asian_naked.png");
+        assert_eq!(n(Breed::Opifex, Gender::Female, Skin::African, ClothPart::Arms), "arms_opifexfemale_naked.png");
+        assert_eq!(n(Breed::Nanomage, Gender::Male, Skin::Caucasian, ClothPart::Feet), "feet_nanomagemale_naked.png");
+    }
+
+    fn tex(w: u32, h: u32, px: &[[u8; 4]]) -> Texture {
+        Texture { width: w, height: h, rgba: px.iter().flatten().copied().collect() }
+    }
+
+    #[test]
+    fn cloth_shows_over_skin_except_where_green() {
+        let skin = tex(2, 1, &[[200, 150, 100, 255], [210, 160, 110, 255]]);
+        let cloth = tex(2, 1, &[[10, 20, 30, 255], [0, 255, 0, 255]]);
+        let t = overlay_on_skin(&skin, &cloth);
+        assert_eq!(t.rgba, [10, 20, 30, 255, 210, 160, 110, 255]);
+        // near-green that is not 565 green (0x07e0) is cloth
+        assert!(!is_key(&[8, 255, 0, 255]) && !is_key(&[0, 251, 0, 255]) && is_key(&[7, 252, 7, 255]));
+        // no key texel: the cloth as is, whatever the skin size
+        let opaque = tex(1, 1, &[[1, 2, 3, 4]]);
+        assert_eq!(overlay_on_skin(&skin, &opaque).rgba, [1, 2, 3, 4]);
+        // the skin is stretched to the cloth's size
+        let big = tex(4, 2, &[[0, 255, 0, 255]; 8]);
+        let t = overlay_on_skin(&skin, &big);
+        assert_eq!((t.width, t.height), (4, 2));
+        assert_eq!(&t.rgba[..8], [200, 150, 100, 255, 200, 150, 100, 255]);
+        assert_eq!(&t.rgba[8..16], [210, 160, 110, 255, 210, 160, 110, 255]);
+    }
+
+    #[test]
+    fn equipment_is_per_slot_and_empty_by_default() {
+        let mut e = Equipment::default();
+        assert!(ClothPart::ALL.iter().all(|p| e.0[*p as usize].is_none()));
+        e.wear(ClothPart::Legs, 42);
+        assert_eq!(e.0[4], Some(42));
+        assert_eq!(ClothPart::ALL.map(ClothPart::name), ["hands", "body", "feet", "arms", "legs"]);
     }
 }
