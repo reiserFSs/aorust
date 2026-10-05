@@ -520,18 +520,9 @@ impl Play {
         self.gui.text_cmds(FontId::TtMin12, &text, (self.size.0 as i32 - tw) / 2, self.size.1 as i32 - 50, 0xDDDDDD, a, list);
     }
 
-    fn start_world_load(&mut self, host: &mut Host) {
-        let Some(c) = self.selected.and_then(|i| self.chars.get(i)) else {
-            // a character that was just created: its start playfield comes from the zone messages (not decoded yet)
-            eprintln!("zone connected for a new character: start playfield unknown until the zone messages are decoded (M3)");
-            self.show_login(host);
-            return self.message_box("Your character was created. Entering the world needs the zone messages, which are not decoded yet.");
-        };
-        let pf = &c.proxy.playfield;
-        if pf.kind != PLAYFIELD_IDENTITY {
-            eprintln!("playfield identity type {:#x} (expected {PLAYFIELD_IDENTITY:#x}); using instance {} as the id", pf.kind, pf.instance);
-        }
-        let (id, dir, tx) = (pf.instance as u32, self.dir.clone(), self.tx.clone());
+    /// `PlayfieldAnarchyFIIR_t` arrived: load that playfield in the background (the loading screen stays up until it is ready).
+    fn start_world_load(&mut self, id: u32) {
+        let (dir, tx) = (self.dir.clone(), self.tx.clone());
         std::thread::spawn(move || {
             let r = RecordStore::open(&dir)
                 .and_then(|store| ao_formats::playfield::load_playfield_at(&store, &dir, id, ao_formats::playfield::DEFAULT_DAY_TIME))
@@ -609,14 +600,17 @@ impl Play {
                     self.show_login(host);
                     self.show_error(code, detail);
                 }
-                LoginEvent::ZoneHandoff { zone_ip, zone_port, .. } => {
+                LoginEvent::ZoneHandoff { zone_ip, zone_port, character_id } => {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
+                    self.zone = zone::Zone::new(character_id);
+                    self.world_frames = 0;
                     self.start_loading(host);
                 }
-                LoginEvent::ZoneConnected { messages } => {
-                    self.zone_summary = messages.len();
-                    eprintln!("zone connected, {} first frames", messages.len());
-                    self.start_world_load(host);
+                LoginEvent::ZoneFrame(f) => {
+                    if let zone::ZoneEvent::Playfield(id) = self.zone.on_frame(&f) {
+                        eprintln!("zone: playfield {id}");
+                        self.start_world_load(id);
+                    }
                 }
                 LoginEvent::Disconnected(why) if self.screen != Screen::InWorld => {
                     // [INFERENCE] AnarchyLauncher.url code 3 = "Server Lost"; the call site was not located in the DLL
@@ -806,9 +800,15 @@ impl Frontend for Play {
             Fade::Hold if self.world_ready => {
                 // world ready: StartClosingLoadscreen -> the loading screen dissolves into the world
                 if let Some(s) = self.world_scene.take() {
-                    let (eye, at) = match (s.spawn, s.spawn_look_at) {
-                        (Some(e), Some(a)) => (Vec3::from(e), Vec3::from(a)),
-                        (Some(e), None) => (Vec3::from(e), Vec3::from(e) + Vec3::Z),
+                    // the player's own dynel (SimpleCharFullUpdate, arrives with the zone burst) decides; the scene's
+                    // density-based spawn is only the fallback when the server sent none
+                    let (eye, at) = match (self.zone.own(), s.spawn, s.spawn_look_at) {
+                        (Some(d), ..) => {
+                            let e = Vec3::from(zone::scene_pos(d.pos)) + Vec3::Y * EYE_HEIGHT;
+                            (e, e + Vec3::from(zone::scene_forward(d.yaw.unwrap_or(0.0))))
+                        }
+                        (None, Some(e), Some(a)) => (Vec3::from(e), Vec3::from(a)),
+                        (None, Some(e), None) => (Vec3::from(e), Vec3::from(e) + Vec3::Z),
                         _ => ao_render::default_view(&s),
                     };
                     host.set_scene(*s);
@@ -827,6 +827,18 @@ impl Frontend for Play {
                 }
             }
             _ => {}
+        }
+        if self.screen == Screen::InWorld && !self.zone.in_play_sent {
+            self.world_frames += 1;
+            if self.world_frames > IN_PLAY_FRAMES {
+                // WaitingToStartGame (GUI 0x10027d73): after the TeleportEnded countdown the client sends CharInPlayIIR_t once
+                self.zone.in_play_sent = true;
+                if let Some(s) = &self.session {
+                    let id = self.zone.char_id;
+                    s.send_zone(ao_net::n3::outgoing::n3_frame(0, id, ao_net::n3::outgoing::char_in_play(id as i32)));
+                    eprintln!("zone: CharInPlay sent ({} frames, {} dynels known)", self.zone.frames, self.zone.dynels.len());
+                }
+            }
         }
         if let Some(a) = &self.audio {
             a.update(dt, host.camera.pos.to_array(), ao_formats::playfield::DEFAULT_DAY_TIME);

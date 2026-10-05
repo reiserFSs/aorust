@@ -7,6 +7,7 @@ mod delete;
 mod flow;
 mod prefs;
 mod preview;
+mod zone;
 
 use anyhow::Result;
 use ao_audio::Audio;
@@ -31,6 +32,10 @@ const JOIN_TIMEOUT: f32 = 30.0;
 /// `ServerLogin3DModule_t` fades (GUI 0x101aa198 / 0x101aa190); the unit (ms) is an assumption (docs/screens.md §7).
 const FADE_IN: f32 = 4.0;
 const FADE_OUT: f32 = 7.0;
+/// Frames after the world appeared before `CharInPlay` is sent (`TeleportEndedMessage` countdown, docs/zone/outgoing.md §3).
+const IN_PLAY_FRAMES: u32 = 10;
+/// Camera height above the player's feet; [GUESS] same eye height as the playfield spawn heuristic (1.7 m), the client's player camera is not ported yet.
+const EYE_HEIGHT: f32 = 1.7;
 
 enum Bg {
     Servers(Result<Vec<ServerEntry>, String>),
@@ -110,7 +115,10 @@ struct Play {
     loading_img: Option<(GfxId, u32, u32)>,
     fade: Fade,
     world_ready: bool,
-    zone_summary: usize,
+    /// State of the current zone connection (`ZoneHandoff` .. disconnect).
+    zone: zone::Zone,
+    /// Frames drawn since the world appeared; `CharInPlay` is sent after [`flow::IN_PLAY_FRAMES`].
+    world_frames: u32,
     in_world_msg: String,
     fake: bool,
     /// `--fake-charlist`: the replies an in-process fake login server would send (random name, created, hand-off, …).
@@ -189,7 +197,8 @@ impl Play {
             loading_img: None,
             fade: Fade::In(0.0),
             world_ready: false,
-            zone_summary: 0,
+            zone: zone::Zone::default(),
+            world_frames: 0,
             in_world_msg: String::new(),
             fake: fake_charlist.is_some(),
             fake_events: Default::default(),

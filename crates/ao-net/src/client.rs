@@ -103,6 +103,8 @@ enum Cmd {
     Create(CreateCharacterRequest),
     Delete(u32),
     RandomName { breed: i32, gender: i32, profession: i32 },
+    /// A frame for the zone connection (sequence number assigned by the connection); dropped before the zone is up.
+    Zone(Frame),
 }
 
 pub struct LoginSession {
@@ -167,6 +169,11 @@ impl LoginSession {
     /// `Client_t::SuggestNickName(breed, gender, profession)` (Interfaces.dll 0x1000188e); answered by [`LoginEvent::RandomName`].
     pub fn request_random_name(&self, breed: i32, gender: i32, profession: i32) {
         let _ = self.cmds.send(Cmd::RandomName { breed, gender, profession });
+    }
+
+    /// Queue a client frame (e.g. [`crate::n3::outgoing::n3_frame`]) for the zone server; ignored until the zone connection exists.
+    pub fn send_zone(&self, f: Frame) {
+        let _ = self.cmds.send(Cmd::Zone(f));
     }
 
     pub fn poll(&self) -> Option<LoginEvent> {
@@ -334,8 +341,10 @@ fn zone(z: crate::msg::ZoneInfo, tap: Option<Tap>, cmds: &Receiver<Cmd>, ev: &Se
     conn.send_message(&Message::ZoneLogin { char_id: z.char_id, cookie1: z.cookie1, cookie2: z.cookie2 })?;
     let _ = ev.send(LoginEvent::Status("zone login sent".into()));
     loop {
-        if matches!(cmds.try_recv(), Err(TryRecvError::Disconnected)) {
-            return Ok(());
+        match cmds.try_recv() {
+            Err(TryRecvError::Disconnected) => return Ok(()),
+            Ok(Cmd::Zone(f)) => conn.send(f)?,
+            Ok(_) | Err(TryRecvError::Empty) => {}
         }
         if let Some(f) = conn.recv(TICK)? {
             if f.ptype == PT_PING {
