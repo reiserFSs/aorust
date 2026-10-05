@@ -16,6 +16,7 @@ use ao_rdb::RecordStore;
 use ao_scene::{Instance, Mesh, Scene, Submesh, Texture, TextureKey, Vertex, IDENTITY};
 
 use super::record::{Rd, Record, Room};
+use super::spawn::Spot;
 use super::{statel, TILEMAP};
 
 /// rdb type of the cell meshes.
@@ -514,6 +515,79 @@ impl Builder<'_> {
     }
 }
 
+/// Lowest floor of the room becomes local y = 0 (`RDBPlayfield_t::CalculateRoomHeights`).
+fn floor_min(g: &Gnda, room: &Room) -> Option<f32> {
+    let [x1, z1, x2, z2] = room.rect.map(|v| v as i32);
+    let m = (z1..z2).flat_map(|z| (x1..x2).map(move |x| (x, z))).filter(|&(x, z)| g.tile(x, z) != 0).map(|(x, z)| g.floor[g.at(x, z)] as f32 * g.height_scale).fold(f32::MAX, f32::min);
+    (m != f32::MAX).then_some(m)
+}
+
+/// Local position of the centre of the room's first cell.
+fn room_origin(g: &Gnda, room: &Room) -> (f32, f32) {
+    let half = |n: i32| (((n - 1) & !1) + 1) as f32 * 0.5 * g.cell;
+    (-half(room.rect[2] as i32 - room.rect[0] as i32), -half(room.rect[3] as i32 - room.rect[1] as i32))
+}
+
+/// Camera inside `room`: eye height `EYE_H` on an open floor cell. Small rooms and corridors use the
+/// cell with the longest open run along an axis, looking down it; open halls (over 400 cells) use
+/// the cell nearest the centre, looking at the room's props (`props` = local statel positions).
+fn room_spot(g: &Gnda, room: &Room, props: &[[f32; 3]]) -> Option<Spot> {
+    const EYE_H: f32 = 1.7;
+    let [x1, z1, x2, z2] = room.rect.map(|v| v as i32);
+    if x2 as usize > g.w || z2 as usize > g.h {
+        return None;
+    }
+    let fmin = floor_min(g, room)?;
+    let (ox, oz) = room_origin(g, room);
+    let open = |x: i32, z: i32| (x1..x2).contains(&x) && (z1..z2).contains(&z) && g.tile(x, z) != 0;
+    let (mx, mz) = ((x1 + x2) as f32 * 0.5, (z1 + z2) as f32 * 0.5);
+    let hall = (z1..z2).flat_map(|z| (x1..x2).map(move |x| (x, z))).filter(|&(x, z)| open(x, z)).count() > 400;
+    let mut best: Option<(i32, f32, i32, i32, i32, i32)> = None; // run, -distance to centre, cell, dir
+    for z in z1..z2 {
+        for x in x1..x2 {
+            if !open(x, z) {
+                continue;
+            }
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let run = (1..).take_while(|&k| open(x + dx * k, z + dz * k)).count() as i32;
+                let near = -((x as f32 + 0.5 - mx).powi(2) + (z as f32 + 0.5 - mz).powi(2));
+                let score = if hall { (0, near) } else { (run, near) };
+                if best.is_none_or(|b| score > (b.0, b.1)) {
+                    best = Some((score.0, near, x, z, dx, dz));
+                }
+            }
+        }
+    }
+    let (_, _, x, z, dx, dz) = best?;
+    let hs = g.height_scale;
+    let floor_at = |cx: i32, cz: i32| -> f32 {
+        let h = |px: i32, pz: i32| g.floor[g.at(px, pz)] as f32 * hs;
+        (h(cx - 1, cz - 1) + h(cx, cz - 1) + h(cx - 1, cz) + h(cx, cz)) * 0.25 - fmin
+    };
+    let local = |cx: f32, cz: f32, up: f32| [(cx - x1 as f32) * g.cell + ox, up, (cz - z1 as f32) * g.cell + oz];
+    let frame = Frame { rot: statel::ry(room.rot as f32 * std::f32::consts::FRAC_PI_2), pos: room.pos };
+    let y = floor_at(x, z);
+    let eye = local(x as f32, z as f32, y + EYE_H);
+    let mut at = local((x + dx * 8) as f32, (z + dz * 8) as f32, y + EYE_H * 0.8);
+    if hall && !props.is_empty() {
+        // statel positions are room-local too (origin = room centre): aim at their centroid
+        let n = props.len() as f32;
+        let c = [props.iter().map(|p| p[0]).sum::<f32>() / n, props.iter().map(|p| p[2]).sum::<f32>() / n];
+        if (c[0] - eye[0]).hypot(c[1] - eye[2]) > 5.0 {
+            at = [c[0], y + EYE_H * 0.8, c[1]];
+        }
+    }
+    Some(Spot { eye: frame.point(eye), at: frame.point(at) })
+}
+
+/// Camera for dungeon `rec`: entrance-like rooms first (`Entrance`, `Lobby`, `start…`), then in file
+/// order; `props[i]` = local statel positions of room `i`.
+pub(super) fn entry_spot(g: &Gnda, rec: &Record, props: &[Vec<[f32; 3]>]) -> Option<Spot> {
+    let named = |r: &Room| r.name.as_ref().is_some_and(|n| ["entr", "lobby", "start", "enter"].iter().any(|k| n.to_lowercase().contains(k)));
+    let order = (0..rec.rooms.len()).filter(|&i| named(&rec.rooms[i])).chain((0..rec.rooms.len()).filter(|&i| !named(&rec.rooms[i])));
+    order.into_iter().find_map(|i| room_spot(g, &rec.rooms[i], props.get(i).map_or(&[], |p| p)))
+}
+
 /// Builds the shell of `room` in scene space. `piece(id)` returns cell meshes, `textures` maps
 /// material indices to textures.
 fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<TextureKey>, piece: &mut dyn FnMut(u16) -> Option<Rc<Piece>>) -> Option<Mesh> {
@@ -521,14 +595,8 @@ fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<Text
     if x2 as usize > g.w || z2 as usize > g.h {
         return None;
     }
-    let hs = g.height_scale;
-    // lowest floor of the room becomes local y = 0 (`RDBPlayfield_t::CalculateRoomHeights`)
-    let floor_min = (z1..z2).flat_map(|z| (x1..x2).map(move |x| (x, z))).filter(|&(x, z)| g.tile(x, z) != 0).map(|(x, z)| g.floor[g.at(x, z)] as f32 * hs).fold(f32::MAX, f32::min);
-    if floor_min == f32::MAX {
-        return None;
-    }
-    let half = |n: i32| (((n - 1) & !1) + 1) as f32 * 0.5 * g.cell;
-    let (ox, oz) = (-half(x2 - x1), -half(z2 - z1));
+    let floor_min = floor_min(g, room)?;
+    let (ox, oz) = room_origin(g, room);
     let mut b = Builder {
         g,
         frame: Frame { rot: statel::ry(room.rot as f32 * std::f32::consts::FRAC_PI_2), pos: room.pos },
@@ -578,7 +646,7 @@ fn material_texture(store: &RecordStore, textures: &mut HashMap<TextureKey, Text
 }
 
 /// Adds the shells of all rooms of dungeon playfield `rec` to `scene`.
-pub(super) fn build(store: &RecordStore, rec: &Record, scene: &mut Scene) -> Result<()> {
+pub(super) fn build(store: &RecordStore, rec: &Record, scene: &mut Scene) -> Result<Gnda> {
     let d = store.get(TILEMAP, rec.tilemap)?.ok_or_else(|| anyhow!("playfield {}: no tilemap {}", rec.id, rec.tilemap))?;
     let g = parse_gnda(&d).with_context(|| format!("dungeon tilemap {}", rec.tilemap))?;
     let mut cached: Vec<Option<Option<TextureKey>>> = vec![None; g.mats.len()];
@@ -598,8 +666,9 @@ pub(super) fn build(store: &RecordStore, rec: &Record, scene: &mut Scene) -> Res
         scene.meshes.push(mesh);
         scene.instances.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
     }
-    Ok(())
+    Ok(g)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

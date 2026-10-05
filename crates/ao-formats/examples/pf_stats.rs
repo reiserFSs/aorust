@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use ao_formats::playfield::{list_playfields, load_playfield_report};
+use ao_formats::playfield::{floor_below, list_playfields, load_playfield_report, scene_bounds};
 use ao_rdb::RecordStore;
 
 fn main() -> anyhow::Result<()> {
@@ -25,6 +25,8 @@ fn main() -> anyhow::Result<()> {
     let mut slow = Vec::new();
     let (mut statels, mut instances, mut mesh_fail, mut missing) = (0usize, 0usize, 0usize, 0usize);
     let mut mesh_errors: BTreeMap<String, usize> = BTreeMap::new();
+    let mut spawn_bad: Vec<(u32, String)> = Vec::new();
+    let mut empty: Vec<u32> = Vec::new();
     for (id, name) in &all {
         if !only.is_empty() && !only.contains(id) {
             continue;
@@ -40,6 +42,11 @@ fn main() -> anyhow::Result<()> {
                 if let Some(e) = r.first_mesh_error {
                     *mesh_errors.entry(e).or_default() += 1;
                 }
+                if scene.instances.is_empty() {
+                    empty.push(*id); // records without rooms: nothing to place a camera in
+                } else if let Some(why) = spawn_problem(&scene) {
+                    spawn_bad.push((*id, format!("{name}: {why}")));
+                }
                 let dt = t.elapsed().as_secs_f64();
                 if !only.is_empty() {
                     println!("{id} {name}: {dt:.2}s cells={} statels={} meshes={} instances={} missing={} failed={}", r.terrain_cells, r.statels, r.unique_meshes, scene.instances.len(), r.missing_meshes, r.failed_meshes);
@@ -53,6 +60,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!("ok={ok} failed={failed} statels={statels} instances={instances} statels-without-mesh={missing} mesh-decode-failures={mesh_fail}");
+    println!("spawn checks: {} ok, {} failed, {} empty playfields (no rooms/statels in the data: {empty:?})", ok - spawn_bad.len() - empty.len(), spawn_bad.len(), empty.len());
+    for (id, why) in &spawn_bad {
+        println!("SPAWN FAIL {id} {why}");
+    }
     for (reason, ids) in &reasons {
         println!("FAILED x{}: {reason}  ids={:?}", ids.len(), &ids[..ids.len().min(12)]);
     }
@@ -64,4 +75,19 @@ fn main() -> anyhow::Result<()> {
         println!("slowest: {id} {name}: {dt:.2}s ({cells} terrain cells, {statels} statels)");
     }
     Ok(())
+}
+
+/// Spawn must exist, lie inside the scene bounds, have terrain/floor below it (0.5..30 m) and look at a different point.
+fn spawn_problem(scene: &ao_scene::Scene) -> Option<String> {
+    let (Some(s), Some(at)) = (scene.spawn, scene.spawn_look_at) else { return Some("no spawn/look-at".into()) };
+    let Some((lo, hi)) = scene_bounds(scene) else { return Some("empty scene".into()) };
+    if (0..3).any(|i| s[i] < lo[i] || s[i] > hi[i] + if i == 1 { 50.0 } else { 0.0 }) {
+        return Some(format!("spawn {s:?} outside bounds {lo:?}..{hi:?}"));
+    }
+    match floor_below(scene, s) {
+        None => Some(format!("no floor below spawn {s:?}")),
+        Some(f) if s[1] - f < 0.5 || s[1] - f > 30.0 => Some(format!("spawn {s:?} is {:.1} m above the floor", s[1] - f)),
+        _ if (at[0] - s[0]).hypot(at[2] - s[2]) < 1.0 => Some(format!("look-at {at:?} is straight above/below spawn {s:?}")),
+        _ => None,
+    }
 }

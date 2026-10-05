@@ -12,7 +12,10 @@
 mod dungeon;
 mod ground;
 mod record;
+mod spawn;
 mod statel;
+
+pub use spawn::{floor_below, scene_bounds};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,7 +24,7 @@ use anyhow::{anyhow, Context, Result};
 use ao_rdb::RecordStore;
 use ao_scene::{Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
 
-use record::{Record, Room};
+use record::Room;
 use statel::{Layout, Statel};
 
 const RECORD: u32 = 1_000_001;
@@ -63,17 +66,20 @@ pub fn load_playfield_report(store: &RecordStore, _client_dir: &Path, id: u32) -
     let rec = record::parse(&store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?)?;
     let mut scene = Scene::default();
     let mut report = Report::default();
-    let mut spawn = None;
+    let mut spot = None;
+    let mut terrain = None;
+    let mut grid = None;
+    let mut props: Vec<Vec<[f32; 3]>> = Vec::new();
     if rec.is_outdoor() {
         let d = store.get(TILEMAP, rec.tilemap)?.ok_or_else(|| anyhow!("playfield {id}: no tilemap {}", rec.tilemap))?;
         let tm = ground::parse(&d).with_context(|| format!("tilemap {}", rec.tilemap))?;
         report.terrain_cells = tm.cells_x * tm.cells_z;
-        let (cx, cz) = (tm.cells_x / 2, tm.cells_z / 2);
-        spawn = Some([cx as f32 * tm.cell_size, tm.height(cx, cz) + 80.0, -(cz as f32 * tm.cell_size)]);
         build_terrain(store, &tm, &mut scene)?;
+        terrain = Some(tm);
     } else {
-        dungeon::build(store, &rec, &mut scene)?;
+        grid = Some(dungeon::build(store, &rec, &mut scene)?);
     }
+    let fixed = scene.instances.len();
     if let Some(d) = store.get(STATELS, id)? {
         let layout = if rec.is_outdoor() { Layout::Outdoor } else { Layout::Dungeon };
         let file = statel::parse(&d, rec.count as usize, layout).with_context(|| format!("statels of playfield {id}"))?;
@@ -88,16 +94,39 @@ pub fn load_playfield_report(store: &RecordStore, _client_dir: &Path, id: u32) -
             }
         }
         report.unique_meshes = placer.cache.values().filter(|m| m.is_some()).count();
-        if spawn.is_none() {
-            spawn = first_room_spawn(&rec);
-        }
+        props = file.zones.iter().map(|z| z.iter().filter(|s| s.mesh != 0).map(|s| s.pos).collect()).collect();
     }
-    scene.spawn = spawn;
+    if let Some(g) = &grid {
+        spot = dungeon::entry_spot(g, &rec, &props);
+    }
+    if spot.is_none() {
+        // outdoor (or a dungeon without a usable room): next to the densest statel cluster
+        let boxes = spawn::instance_boxes(&scene, fixed);
+        let low = boxes.iter().map(|b| b.0[1]).fold(f32::MAX, f32::min);
+        spot = match &terrain {
+            Some(tm) => spawn::density_spawn(&boxes, &|x, z| terrain_height(tm, x, z), 4.0).or_else(|| {
+                // terrain only: hover above the middle of the map
+                let (x, z) = (tm.cells_x as f32 * tm.cell_size * 0.5, -(tm.cells_z as f32 * tm.cell_size * 0.5));
+                let y = terrain_height(tm, x, z)? + 25.0;
+                Some(spawn::Spot { eye: [x, y, z], at: [x, y - 10.0, z - 60.0] })
+            }),
+            None => spawn::density_spawn(&boxes, &|_, _| Some(low), 1.7),
+        };
+    }
+    scene.spawn = spot.map(|s| s.eye);
+    scene.spawn_look_at = spot.map(|s| s.at);
     Ok((scene, report))
 }
 
-fn first_room_spawn(rec: &Record) -> Option<[f32; 3]> {
-    rec.rooms.first().map(|r| [r.pos[0], r.pos[1] + 3.0, -r.pos[2]])
+/// Bilinear terrain height at scene `(x, z)`; `None` outside the heightfield.
+fn terrain_height(tm: &ground::Tilemap, x: f32, z: f32) -> Option<f32> {
+    let (fx, fz) = (x / tm.cell_size, -z / tm.cell_size);
+    if fx < 0.0 || fz < 0.0 || fx >= tm.cells_x as f32 || fz >= tm.cells_z as f32 {
+        return None;
+    }
+    let (ix, iz, ax, az) = (fx as usize, fz as usize, fx.fract(), fz.fract());
+    let (a, b) = (tm.height(ix, iz) * (1.0 - ax) + tm.height(ix + 1, iz) * ax, tm.height(ix, iz + 1) * (1.0 - ax) + tm.height(ix + 1, iz + 1) * ax);
+    Some(a * (1.0 - az) + b * az)
 }
 
 struct Placer<'a> {
