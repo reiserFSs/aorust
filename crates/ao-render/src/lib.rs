@@ -248,6 +248,15 @@ struct MoverRun {
     local_center: Vec3,
 }
 
+/// An instance the client re-poses every frame (`Scene::far_away`, [`ao_scene::far_away_pose`]).
+struct FarAwayRun {
+    slot: usize,
+    /// Pose of a static instance; ships take the pose their mover just computed.
+    base: Option<Mat4>,
+    local_center: Vec3,
+    local_radius: f32,
+}
+
 /// `Scene::statel_lod` plus the GPU instance slot of every scene instance and the last zone levels.
 struct LodState {
     lod: ao_scene::StatelLod,
@@ -361,6 +370,7 @@ pub struct Renderer {
     light_zones: Vec<Option<u32>>,
     /// Traffic ships of the uploaded scene, see `Scene::movers`.
     movers: Vec<MoverRun>,
+    far_away: Vec<FarAwayRun>,
     /// `Scene::day_time` of the uploaded scene.
     day_time: f32,
     /// Game seconds per [`Renderer::time`] second for the traffic ships (1 = the game clock; the viewer sets the live
@@ -549,6 +559,7 @@ impl Renderer {
             stats: FrameStats::default(),
             time: 0.0,
             movers: vec![],
+            far_away: vec![],
             day_time: 0.0,
             day_time_rate: 1.0,
             globals,
@@ -747,6 +758,16 @@ impl Renderer {
                 Some(MoverRun { mover: m.clone(), state: ao_scene::MoverState::settled(m, scene.day_time, rate), slot, local_center })
             })
             .collect();
+        self.far_away = scene
+            .far_away
+            .iter()
+            .filter_map(|&i| {
+                let slot = *slots.get(i).filter(|&&s| s != usize::MAX)?;
+                let (local_center, local_radius) = sphere[scene.instances[i].mesh];
+                let is_mover = scene.movers.iter().any(|m| m.instance == i);
+                Some(FarAwayRun { slot, base: (!is_mover).then(|| Mat4::from_cols_array_2d(&scene.instances[i].transform)), local_center, local_radius })
+            })
+            .collect();
         self.set_sky(scene);
         let grid = LightGrid::new(&scene.lights);
         (self.globals_bg, self.light_buf) = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
@@ -938,6 +959,20 @@ impl Renderer {
         }
     }
 
+    /// `e_ScaleVisibleFarAway` objects: pulled in towards the camera like the client's `GenericMeshObject::Process`.
+    fn pose_far_away(&mut self, cam: Vec3) {
+        for r in &self.far_away {
+            let Some(g) = self.gpu.insts.get_mut(r.slot) else { continue };
+            let base = r.base.unwrap_or_else(|| Mat4::from_cols_array_2d(&g.m));
+            let (pos, s) = ao_scene::far_away_pose(base.w_axis.truncate().to_array(), cam.to_array());
+            let m = Mat4::from_cols(base.x_axis * s, base.y_axis * s, base.z_axis * s, Vec3::from(pos).extend(1.0));
+            let scale = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
+            g.m = m.to_cols_array_2d();
+            g.center = m.transform_point3(r.local_center);
+            g.radius = r.local_radius * scale;
+        }
+    }
+
     /// Sets [`Renderer::time`] and lets the traffic ships settle at that game time (the accumulators are per frame, a
     /// jump needs the frames in between): screenshots at `--anim-time`.
     pub fn seek(&mut self, time: f32) {
@@ -957,6 +992,7 @@ impl Renderer {
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) {
         self.update_lod(cam.pos.x, cam.pos.z);
         self.step_movers();
+        self.pose_far_away(cam.pos);
         let mut env = self.env;
         if let Some((color, end)) = self.fog.as_ref().map(|m| m.at(cam.pos.to_array())) {
             if env.sky_color == env.fog_color {

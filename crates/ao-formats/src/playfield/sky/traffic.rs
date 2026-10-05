@@ -136,6 +136,9 @@ pub fn emit(objs: &[Obj], o: &Obj, store: &RecordStore, names: &NameTable, scene
     };
     mover.instance = scene.instances.len();
     scene.instances.push(Instance { mesh, transform: mover.transform(&MoverState::settled(&mover, day_time, 1.0)) });
+    if super::layers::is_far_away(o) {
+        scene.far_away.push(mover.instance);
+    }
     scene.movers.push(mover);
 }
 

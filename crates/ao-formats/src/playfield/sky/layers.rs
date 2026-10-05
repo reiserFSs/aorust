@@ -182,16 +182,26 @@ pub fn emit_distant(objs: &[Obj], store: &RecordStore, scene: &mut Scene, day_ti
         let mut transform = IDENTITY;
         transform[3] = [pos[0], pos[1], -pos[2], 1.0];
         scene.instances.push(Instance { mesh: scene.meshes.len() - 1, transform });
+        if is_far_away(o) {
+            scene.far_away.push(scene.instances.len() - 1);
+        }
     }
+}
+
+/// `ScaleType e_ScaleVisibleFarAway` (= 3): the client pulls the object in towards the camera every frame, see
+/// [`ao_scene::far_away_pose`] (`FUN_1005c124`, the `GenericMeshObject` process function).
+pub(super) fn is_far_away(o: &Obj) -> bool {
+    o.field("ScaleType").is_some_and(|t| t.trim() == "e_ScaleVisibleFarAway")
 }
 
 /// The scale the client applies to a world-space mesh object. `GenericMeshObject` (`FUN_1005e716` @0x1005e716, DisplaySystem)
 /// reads the `Scale` field **only while `ScaleType` is 0** (`FUN_1001d156` = `RRefFrame::SetScale`); `e_ScaleByViewDistance` = 1,
-/// `e_ScaleByViewDistanceAndDirectionHeigh` = 2 and **`e_ScaleVisibleFarAway` = 3** (value blocks of the FXS enum parser
-/// @0x1000b015 / 0x1000c7f8 / 0x1000c810 / 0x1000c827) are never tested for their value anywhere (the only readers of the
-/// `ScaleType` variable are `FUN_1005e716`, `FUN_1005a3a9`, `FUN_1005b3c2`, `FUN_1004412e`, all of the form `type == 0`), so
-/// the `Scale` field is ignored and the object keeps the reference frame's default scale 1 (the 2 ships with `Scale 0.70`,
-/// `Alien_Craft_War_04/05`, are drawn at 1). The default of 1 is [INFERENCE]: the base `RRefFrame_t` constructor lives in randy31.dll.
+/// `e_ScaleByViewDistanceAndDirectionHeigh` = 2 and `e_ScaleVisibleFarAway` = 3 (value blocks of the FXS enum parser
+/// @0x1000b015 / 0x1000c7f8 / 0x1000c810 / 0x1000c827) do not use the `Scale` field either: `FUN_1005e716` tests `type == 0`
+/// only, and for type 3 the per-frame `FUN_1005c124` calls `SetScale` itself ([`ao_scene::far_away_pose`]). Outside its
+/// 950..5000 m window that scale is 1, so the object keeps the reference frame's default scale 1 (the 2 ships with
+/// `Scale 0.70`, `Alien_Craft_War_04/05`, are drawn at 1). The default of 1 is [INFERENCE]: the base `RRefFrame_t`
+/// constructor lives in randy31.dll.
 pub(super) fn object_scale(o: &Obj, ctx: &Ctx) -> f32 {
     if o.field("ScaleType").is_some_and(|t| t.trim().starts_with("e_Scale")) {
         1.0

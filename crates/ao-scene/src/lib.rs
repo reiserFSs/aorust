@@ -237,6 +237,9 @@ pub struct Scene {
     pub sky_colors: Vec<SkyColors>,
     /// Traffic ships: instances of `instances` whose transform the renderer advances every frame ([`Mover`]).
     pub movers: Vec<Mover>,
+    /// Instances of `instances` whose script has `ScaleType e_ScaleVisibleFarAway` (city skylines, ships): the renderer
+    /// re-poses them every frame with [`far_away_pose`] (`GenericMeshObject::Process`, DisplaySystem @0x1005c124).
+    pub far_away: Vec<usize>,
     /// Game day time (seconds, 0..6480) the scene was built at; the movers' clock starts here.
     pub day_time: f32,
 }
@@ -335,6 +338,23 @@ impl FogModel {
     }
 }
 
+/// `e_ScaleVisibleFarAway` (`FUN_1005c124` @0x1005c124): an object between 950 and 5000 m from the camera is pulled to 950 m
+/// along the same direction, shrunk by `1 - t` and lowered with `y *= 1 - t^4` (`t = (d - 950) / 4050`); nearer or farther
+/// objects stay where they are (and beyond the far plane, invisible). Returns the new position and the scale factor.
+pub fn far_away_pose(pos: [f32; 3], cam: [f32; 3]) -> ([f32; 3], f32) {
+    const LO: f32 = 950.0;
+    const HI: f32 = 5000.0;
+    let r: [f32; 3] = std::array::from_fn(|i| pos[i] - cam[i]);
+    let d = r.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if d <= LO || HI <= d {
+        return (pos, 1.0);
+    }
+    let t = (d - LO) / (HI - LO);
+    let mut p: [f32; 3] = std::array::from_fn(|i| cam[i] + r[i] / d * LO);
+    p[1] *= 1.0 - t * t * t * t;
+    (p, 1.0 - t)
+}
+
 pub const IDENTITY: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -396,6 +416,20 @@ mod tests {
         assert!((m.at([60.0, 0.0, 0.0]).1 - base_end).abs() < 1e-3 || m.camera_room([60.0, 0.0, 0.0]) == Some(0));
         assert!(m.at([100.0, 0.0, 0.0]).1 < base_end);
         assert_eq!(FogModel::default().camera_room([0.0; 3]), None);
+    }
+
+    #[test]
+    fn far_away_objects_are_pulled_in_to_950_m_and_shrunk() {
+        let cam = [0.0; 3];
+        assert_eq!(far_away_pose([0.0, 0.0, 900.0], cam), ([0.0, 0.0, 900.0], 1.0), "inside 950 m: untouched");
+        assert_eq!(far_away_pose([0.0, 0.0, 5000.0], cam), ([0.0, 0.0, 5000.0], 1.0), "from 5000 m: untouched");
+        // 3000 m ahead: t = 2050 / 4050, pulled to 950 m, scale 1 - t
+        let (p, s) = far_away_pose([0.0, 0.0, 3000.0], cam);
+        assert!((s - (1.0 - 2050.0 / 4050.0)).abs() < 1e-5 && (p[2] - 950.0).abs() < 1e-3, "{p:?} {s}");
+        // height is multiplied by 1 - t^4 (cam at y = 0 so the pulled-in y is 950 * dir.y)
+        let (p, s) = far_away_pose([0.0, 1000.0, 3000.0], cam);
+        let (t, dir) = (1.0 - s, 1000.0 / (1000.0f32.powi(2) + 3000.0f32.powi(2)).sqrt());
+        assert!((p[1] - 950.0 * dir * (1.0 - t.powi(4))).abs() < 1e-2, "{p:?}");
     }
 
     #[test]
