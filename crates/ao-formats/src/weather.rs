@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(i, 0x78);
         assert_eq!(r.s[0x78], R250_INIT[0x78].wrapping_add(0x1234_5678));
         let v = r.next_u32();
-        assert_eq!(v, s0[(0x78 + 0x67) % 250] ^ s0[0x78]);
+        assert_eq!(v, s0[0x78 + 0x67] ^ s0[0x78]); // (0x78 + 0x67) < 250: no wrap
         assert_eq!(r.i, 0x79);
         // seeds above 0xf9 clamp the start index
         assert_eq!(R250::new(0xfe).i, 0xf9);
@@ -923,8 +923,8 @@ mod tests {
             assert!(s.levels.rain >= 0.0 && s.levels.rain <= 1.0 && s.levels.wind <= 1.0);
             // cloud is the max of the other layers
             assert!(s.fields[2] >= s.fields[0] && s.fields[2] >= s.fields[1] && s.fields[2] >= s.fields[4]);
-            for i in 0..7 {
-                seen[i] |= s.fields[i] > 0.0;
+            for (seen, f) in seen.iter_mut().zip(&s.fields) {
+                *seen |= *f > 0.0;
             }
             assert!((s.fields[15] - 100.0 / 255.0).abs() < 1e-6);
             assert!((s.fields[21] - 0.12).abs() < 1e-6);
@@ -939,13 +939,13 @@ mod tests {
         let s = cfg.schedule(4);
         let t0 = s.events.iter().map(|e| e.time).filter(|&t| (6600.0..12000.0).contains(&t)).fold(f32::MAX, f32::min);
         let day_t = (t0 - s.window) as f64;
-        let mut prev = None;
+        let mut prev: Option<f32> = None;
         let mut max_jump = 0f32;
         for k in 0..400 {
             let w = Weather::sample(&env(), 4, day_t + k as f64 * 0.5, 0.05);
             let c = w.state().fields[2];
             if let Some(p) = prev {
-                max_jump = max_jump.max((c - p as f32).abs());
+                max_jump = max_jump.max((c - p).abs());
             }
             prev = Some(c);
         }

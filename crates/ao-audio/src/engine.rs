@@ -234,7 +234,7 @@ impl Audio {
     /// `FalloutRWind` / `FalloutGWind` / `Quake` levels of `ao_formats::weather::Levels`, set every frame by the client's
     /// sky manager); a level of 0 does nothing.
     pub fn play_keepalive_level(&self, name: &str, level: f32) {
-        if !(level > 0.0) {
+        if level <= 0.0 || level.is_nan() {
             return;
         }
         let mut g = self.rt();

@@ -425,7 +425,7 @@ impl Builder<'_> {
         if o.states.get("TSS_COLORARG1").is_some_and(|c| c.contains("COMPLEMENT")) {
             key = key.and_then(|k| {
                 let mut t = self.scene.textures.get(&k)?.clone();
-                t.rgba.chunks_exact_mut(4).for_each(|p| p[..3].iter_mut().for_each(|c| *c = 255 - *c));
+                t.rgba.as_chunks_mut::<4>().0.iter_mut().for_each(|p| p[..3].iter_mut().for_each(|c| *c = 255 - *c));
                 let inv = TextureKey { rdb_type: 0, id: 0x8000_0000 | k.id };
                 self.scene.textures.insert(inv, t);
                 Some(inv)
