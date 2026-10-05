@@ -333,7 +333,7 @@ pub struct Ctx {
 impl Ctx {
     /// A context for expressions that do not depend on the game (offsets, counters, colours).
     pub fn at(day_time: f32) -> Ctx {
-        Ctx { day_time, sun1: Quat::IDENTITY, sun2: Quat::IDENTITY, cloud_intensity: 0.0, hq_offset: [0.0; 2], delta_time: 0.0, wind: [0.0; 2], counters: Default::default() }
+        Ctx { day_time, sun1: Quat::IDENTITY, sun2: Quat::IDENTITY, cloud_intensity: 0.0, hq_offset: [0.0; 2], delta_time: 0.0, wind: [0.0; 2], night: 0.0, counters: Default::default() }
     }
 }
 
@@ -344,6 +344,8 @@ thread_local! {
     static BUDGET: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+    /// `GAME.CurrentNightIntensity` = `NightIntensity[DayTimeFactor]` (`Tweak_GAME.txt`).
+    pub night: f32,
 /// Evaluations one top-level expression may spend on `This.X` references and `[ROT]` terms. The sky scripts need < 20;
 /// a hostile script with many references per level would otherwise multiply out to `refs^depth`.
 const BUDGET_PER_EVAL: u32 = 2000;
@@ -387,6 +389,9 @@ fn variable(obj: &Obj, ctx: &Ctx, name: &str, depth: u32) -> Option<f32> {
     }
 }
 
+        "GAME.CurrentNightIntensity" => Some(ctx.night),
+        "e_Yes" | "e_TRUE" => Some(1.0),
+        "e_No" | "e_FALSE" => Some(0.0),
 pub fn eval_field(obj: &Obj, ctx: &Ctx, expr: &str, depth: u32) -> Option<f32> {
     if depth == 0 {
         reset_budget();

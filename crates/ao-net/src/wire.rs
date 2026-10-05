@@ -50,6 +50,14 @@ impl<'a> Reader<'a> {
         let b = self.bytes(n as usize)?;
         Ok(String::from_utf8_lossy(b).trim_end_matches('\0').to_owned())
     }
+    /// `i16` length + bytes (`FUN_10005d97` `[IF]`): 0 -> "", >= 0x8000 -> "" and the stream is flagged bad (we error).
+    pub fn str_i16(&mut self) -> Result<String> {
+        let n = self.u16()? as usize;
+        if n >= 0x8000 {
+            bail!("i16 string length {n:#x} invalid");
+        }
+        Ok(String::from_utf8_lossy(self.bytes(n)?).trim_end_matches('\0').to_owned())
+    }
 }
 
 #[derive(Default)]
@@ -81,5 +89,11 @@ impl Writer {
     pub fn str_i32(&mut self, s: &str) {
         self.i32(s.len() as i32);
         self.bytes(s.as_bytes());
+    }
+    /// `i16` length + bytes (`FUN_10004a34`), length clamped to 0xFFFF.
+    pub fn str_i16(&mut self, s: &str) {
+        let b = &s.as_bytes()[..s.len().min(0xFFFF)];
+        self.u16(b.len() as u16);
+        self.bytes(b);
     }
 }

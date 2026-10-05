@@ -177,15 +177,63 @@ x = `0123456789abcdef0123456789abcdef` -> `dhX = 8cc3b8c6…5a9c45`, `K` starts 
 | 0x17 | ZoneInfo | S | `i32 charId`, `u8 ip[4]`, `u16 port`, `u32 cookie1`, `u32 cookie2`, `u32 eventServerType`, `u32 playerId` |
 | 0x1B | ZoneLogin | C (to zone) | `i32 charId`, `u32 cookie1`, `u32 cookie2` |
 | 0x3C | ZoneRedirection | S | `u8 ip[4]`, `u16 port` |
+| 0x0F | CreateCharacter | C | `CharacterData_t` (49 bytes + `i32`-string name …, see §5a) + `i32 starterArea` |
 | 0x14 | DeleteCharacter | C | `i32 charId` |
 | 0x15 | CharacterDeleted | S | (client reads nothing; resets `s_nCharID=0`; CellAO sends `i32 charId`) |
 | 0x11 | CharacterCreated | S | `i32 charId` (client stores it as `s_nCharID` and immediately sends 0x16) |
-| 0x10 | NameInUse | S | `i32` (CellAO: 0x1E) |
+| 0x10 | NameInUse | S | `i32 code` (CellAO: 0x1E) |
 | 0x21 | RequestRejected | S | `i32 detail` (live: reply to undecryptable UserCredentials, detail 9; §8) |
+| 0x55 | RandomNameRequest | C | `i32 breed`, `i32 gender`, `i32 profession` |
+| 0x56 | SuggestName | S | `i16 len` + bytes |
 
-Not implemented in `ao-net` (outside the connect→charselect→zone path): 0x0F CreateCharacter
-(`CharacterData_t` + `i32` `[IF 0x10001928]`), 0x55 RandomNameRequest / 0x56 SuggestName (`i16`-prefixed string
-`[IF 0x10002a9e case 0x56]`), 0x43 chat-server list, 0x4E character info push, 0x20/0x21/0x23/0x30 (see below).
+Not implemented in `ao-net` (outside the connect→charselect→create/delete→zone path): 0x43 chat-server list, 0x4E character info
+push, 0x20/0x23/0x30 (see below).
+
+### 5a. Character create / delete / name suggestion (char-select phase) — `ao-net` `Message::{CreateCharacter,RandomNameRequest,SuggestName,DeleteCharacter,CharacterCreated,NameInUse,CharacterDeleted}`
+
+All client messages are `SystemMessage_t(type, 0, 1, size, buf)` (ptype 1, sender 0, receiver 1) `[IF 0x10001928/0x1000188e/0x10001a67]`;
+server replies are dispatched by `Client_t::ProcessMessage` `[IF 0x10002a9e]` (header ids unchecked).
+
+* **0x0F CreateCharacter** `[IF 0x10001928 Client_t::CreateCharacter(breed, gender, profession, head, height, width, name, int)]`:
+  a `BinaryStream(0x800)` gets `operator<<(CharacterData_t)` (= `WriteDataStream` `[MP 0x100011eb]` + `CharacterInfo_c::WriteStream` `[MP 0x10001784]`,
+  i.e. exactly one `CharacterList` row body as in §5 `CharacterEntry`) followed by `i32 param_8` (no status int; that slot *is* the trailing int).
+  The `CharacterData_t` is `CharacterData_t(0)` (id 0, zeroed `PlayfieldProxy` written with its `'a'` version byte, `created=0`) with a
+  default-constructed `CharacterInfo_c` (`InitDefault` `[MP 0x10001881]`: ids 0, level 0, name/area `"name unknown"`/`"area unknown"`, banned 0,
+  empty ban reason) whose fields are overwritten as: `+0x24 breed = param_1`, `+0x28 gender = param_2`, `+0x2c profession = param_3`,
+  `+0x70 head = param_4`, `+0x74 height = param_5`, `+0x78 width = param_6`, name = `param_7`; area stays `"area unknown"`. Wire (all BE):
+  `i32 4, i32 0, u8 'a', {i32,i32} playfield, i32 attr, i32 door, {i32,i32} doorId, i32 created(0), i32 5, i32 0, i32 0, i32 nameLen, name,
+  i32 breed, i32 gender, i32 prof, i32 level(0), i32 12, "area unknown", i32 banned(0), i32 0 (ban reason len), i32 head, i32 height, i32 width, i32 param_8`.
+  Matches CellAO `CreateCharacterMessage` (49-byte `Unknown1`, name, breed, gender, profession, level, area, 2 ints, head, scale, fatness, `StarterArea`)
+  `[CellAO Libraries/Source/CellAO.Messages/SystemMessages/CreateCharacterMessage.cs]`; so `param_8` = CellAO `StarterArea`.
+  Caller `NameScene_t::SetState(0x1006)` `[GUI 0x1011f75e]`: `ConvertCCBreedToGCBreedAndSex(CCSelectedBreed)` -> breed/gender, `ConvertCCProfToGCProf(CCSelectedProfession)`
+  -> profession, `head = CCCharacter_t::GetHeadMeshID(CCSelectedHead)`, `height = 90 (CCSelectedHeight==0) | 100 (==1) | 110 (else)`,
+  `width = CCSelectedSize` (raw pref), `name = CCSelectedName`, `param_8 = *(NameScene_t+0x74)`, which `NameScene_t::NameScene_t` initialises to 0
+  `[GUI 0x1011ff0a]` and no function of the class writes -> always 0 (UNRESOLVED: not searched in all of GUI.dll for external writers).
+* **0x11 CharacterCreated** `i32 id` -> `s_nCharID = id`, **`LoginCharacter()` at once** (0x16 SelectCharacter, §"0x16"), then signal `Client+0x80`
+  (arg 0) and the generic reply signal `Client+0x68(0x11, 0)`. `ao-net` does the same (`LoginEvent::CharacterCreated`, then it sends SelectCharacter itself).
+* **0x10 NameInUse** `i32 code` -> signal `Client+0x80(code)` and `+0x68(0x10, code)`.
+* **0x15 CharacterDeleted** body not read; emits `Client+0x74()` then `s_nCharID = 0`. `Client_t::DeleteCharacter` `[IF 0x10001a67]` sends `i32 s_nCharID`, which
+  `LoginModule_c::SlotDeleteCharacter(id)` `[GUI 0x100112f5]` set first -> the slot sees the pending id: `LoginEvent::CharacterDeleted{character_id}` = the pending id.
+  `CharSelectWindow_c::SlotCharacterDeleted(id)` `[GUI 0x1000ed5c]` removes the row locally; the client does **not** re-request the list.
+* **0x55 RandomNameRequest** `[IF 0x1000188e Client_t::SuggestNickName(a,b,c)]`: `BinaryStream(0xC)`, `i32 a, i32 b, i32 c`. Caller `NameScene_t::SetState(0x1009)`
+  `[GUI 0x1011f75e]`: `(breed, gender)` from `ConvertCCBreedToGCBreedAndSex(CCSelectedBreed)`, `profession = ConvertCCProfToGCProf(CCSelectedProfession)`.
+  CellAO's `RandomNameRequestMessage` has a single field (Profession) `[CellAO .../RandomNameRequestMessage.cs]` — it would read `breed` as profession
+  (UNRESOLVED: real PRK server layout not observed; `ao-net` follows the client).
+* **0x56 SuggestName** `i16 len` (0 -> empty string; `>= 0x8000` -> empty string and the stream error flag `clear(4)`; `FUN_10005d97`) + bytes -> signal `Client+0x78(string)`.
+* **Signal wiring (CharCreateModule_t::InitialiseMessage `[GUI 0x1011ba81]`)**: `Client+0x7c` -> `LHConnectFeedbackMessage(int)` = `NameScene_t::SetState(arg ? arg : 0x1009)`
+  (emitted by 0x0E CharacterList with arg 0 and by 0x0D LoginError with the code); `Client+0x80` -> `CharacterCreateFeedbackMessage(int)` = `SetState(arg ? arg : 0x1007)`
+  (0x11 with 0 -> `WasCharacterCreated=1`; 0x10 with the code); `Client+0x78` -> `SuggestNameFeedbackMessage(string)` = `SetSuggestedName`. `ZoneInfo`
+  keeps its path (`GlobalSignals+0x210` -> `LoginOKMessage` -> `SetState(0x1008)`; `+0x68(0x17,0)` -> `LoginModule_c::SlotLoginReply`). States `1..10, 0x13..0x15, 0x1c, 0x1e, 0x1f` show LDB text
+  (category `0x258`, id = state) in the name scene (`NameScene_t::SetState`), i.e. LoginError/NameInUse codes are text ids (`0x1e` = CellAO NameInUse code).
+* **Generic reply signal `Client+0x68(type, detail)`** -> `LoginModule_c::SlotLoginReply` `[GUI 0x11f8f]`: `0x0E` and `0x4E` also save `s_cPlayerName` (Username DValue / `LoadUserConfig`);
+  `0x0E` -> `Show(CharSelect)`; `0x0D`, `0x10`, `0x21` -> `ShowError(type, detail)`; `0x17` -> `CharacterID` DValue + `LoadUserConfig` + `AFCM::AddProgram(5)`; `0x4E` nothing more;
+  any other type (e.g. `0x11`) -> signal `GlobalSignals+0x184("Unknown error during login")` (only reached if `LoginModule_c` is still connected). Emit args: `0x0E (0xe,0)`, `0x0D (0xd,code)`,
+  `0x10 (0x10,code)`, `0x21 (0x21,detail)`, `0x4E (0x4e,0)`, `0x17 (0x17,0)`, `0x11 (0x11,0)` (`[IF 0x10002a9e]` asm `0x10002f.. - 0x10003639`).
+* `ao-net` session: after the character list, `LoginError`/`RequestRejected` are reported but the session stays up (the original keeps the connection; it only ends
+  before the list); `ZoneInfo`/`ZoneRedirection` handling is untouched (tests `login_select_zone_handoff_*`).
+
+**UNRESOLVED**: real-server layouts of 0x0F reply codes beyond `NameInUse`'s `i32` (CellAO sends 0x1E; the client only forwards it); whether PRK uses additional reply ids
+for create failures (other ids hit `InvalidResponseHandle` `[IF 0x10001e06]`, not analysed); `starter_area` semantics beyond CellAO's name; width as raw size pref vs. percent.
 
 ### 0x22 UserLogin `[IF 0x100025a9 InitAuth]`
 `stream << 2; write(name,0x28); write(version,0x14)`; sent as `SystemMessage_t(0x22, 0, 1, size, buf)`. `name` =

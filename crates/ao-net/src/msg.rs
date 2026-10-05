@@ -15,6 +15,7 @@ pub const REQUEST_REJECTED: u32 = 0x21;
 pub const CHARACTER_CREATED: u32 = 0x11;
 pub const DELETE_CHARACTER: u32 = 0x14;
 pub const CHARACTER_DELETED: u32 = 0x15;
+pub const CREATE_CHARACTER: u32 = 0x0F;
 pub const SELECT_CHARACTER: u32 = 0x16;
 pub const ZONE_INFO: u32 = 0x17;
 pub const ZONE_LOGIN: u32 = 0x1B;
@@ -22,6 +23,8 @@ pub const USER_LOGIN: u32 = 0x22;
 pub const SERVER_SALT: u32 = 0x24;
 pub const USER_CREDENTIALS: u32 = 0x25;
 pub const ZONE_REDIRECTION: u32 = 0x3C;
+pub const RANDOM_NAME_REQUEST: u32 = 0x55;
+pub const SUGGEST_NAME: u32 = 0x56;
 
 /// `LoginError` codes (CellAO `LoginError.cs`; client only forwards the int to its UI).
 pub const ERR_ALREADY_LOGGED_IN: i32 = 0x14;
@@ -31,6 +34,8 @@ pub const ERR_BANNED_OR_NOT_PAID: i32 = 0x6C;
 const PLAYFIELD_PROXY_VERSION: u8 = b'a';
 const CHARACTER_DATA_VERSION: i32 = 4;
 const CHARACTER_INFO_VERSION: i32 = 5;
+/// `CharacterInfo_c::InitDefault` (MessageProtocol.dll 0x10001881).
+const DEFAULT_AREA: &str = "area unknown";
 const MAX_STR: usize = 0xFE; // CharacterInfo_c::ReadStream accepts len < 0xFF
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -177,6 +182,45 @@ pub struct CharacterList {
     pub sl_profs_enabled: i32,
 }
 
+/// Arguments of `Client_t::CreateCharacter` (Interfaces.dll 0x10001928; called from `NameScene_t::SetState(0x1006)`,
+/// GUI.dll 0x1011f75e). Everything else of the `CharacterData_t` is the default-constructed value
+/// (id 0, zero playfield proxy, not created, level 0, area "area unknown", no ban).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CreateCharacterRequest {
+    pub breed: i32,
+    pub gender: i32,
+    pub profession: i32,
+    /// Head mesh id (`CCCharacter_t::GetHeadMeshID`), stored in `CharacterInfo_c+0x70`.
+    pub head: i32,
+    /// Height in percent (GUI: 90 / 100 / 110), `CharacterInfo_c+0x74`.
+    pub height: i32,
+    /// `CharacterInfo_c+0x78` (GUI passes the `CCSelectedSize` pref).
+    pub width: i32,
+    pub name: String,
+    /// Trailing `i32` after the `CharacterData_t` (CellAO `StarterArea`); GUI passes `NameScene_t+0x74` (always 0 there).
+    pub starter_area: i32,
+}
+
+impl CreateCharacterRequest {
+    fn entry(&self) -> CharacterEntry {
+        CharacterEntry {
+            info: CharacterInfo {
+                name: self.name.clone(),
+                breed: self.breed,
+                gender: self.gender,
+                profession: self.profession,
+                area: DEFAULT_AREA.into(),
+                head: self.head,
+                height: self.height,
+                width: self.width,
+                ..Default::default()
+            },
+            status: self.starter_area,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneInfo {
     pub char_id: i32,
@@ -210,6 +254,12 @@ pub enum Message {
     ZoneLogin { char_id: i32, cookie1: u32, cookie2: u32 },
     /// 0x3C server->client (zone teleport between servers).
     ZoneRedirection { ip: Ipv4Addr, port: u16 },
+    /// 0x0F client->server: `CharacterData_t` + `i32` (Client_t::CreateCharacter).
+    CreateCharacter(CreateCharacterRequest),
+    /// 0x55 client->server (Client_t::SuggestNickName 0x1000188e): three `i32`.
+    RandomNameRequest { breed: i32, gender: i32, profession: i32 },
+    /// 0x56 server->client: `i16`-prefixed string.
+    SuggestName(String),
     /// 0x14 client->server.
     DeleteCharacter { char_id: i32 },
     /// 0x15 server->client; the client reads no body (CellAO sends the id).
@@ -234,6 +284,9 @@ impl Message {
             Message::ZoneInfo(_) => ZONE_INFO,
             Message::ZoneLogin { .. } => ZONE_LOGIN,
             Message::ZoneRedirection { .. } => ZONE_REDIRECTION,
+            Message::CreateCharacter(_) => CREATE_CHARACTER,
+            Message::RandomNameRequest { .. } => RANDOM_NAME_REQUEST,
+            Message::SuggestName(_) => SUGGEST_NAME,
             Message::DeleteCharacter { .. } => DELETE_CHARACTER,
             Message::CharacterDeleted { .. } => CHARACTER_DELETED,
             Message::CharacterCreated { .. } => CHARACTER_CREATED,
@@ -294,6 +347,13 @@ impl Message {
                 w.bytes(&ip.octets());
                 w.u16(*port);
             }
+            Message::CreateCharacter(c) => c.entry().write(&mut w),
+            Message::RandomNameRequest { breed, gender, profession } => {
+                for v in [breed, gender, profession] {
+                    w.i32(*v);
+                }
+            }
+            Message::SuggestName(n) => w.str_i16(n),
         }
         w.0
     }
@@ -356,6 +416,24 @@ impl Message {
                 ip: Ipv4Addr::from(<[u8; 4]>::try_from(r.bytes(4)?)?),
                 port: r.u16()?,
             },
+            CREATE_CHARACTER => {
+                let e = CharacterEntry::read(&mut r)?;
+                let i = e.info;
+                Message::CreateCharacter(CreateCharacterRequest {
+                    breed: i.breed,
+                    gender: i.gender,
+                    profession: i.profession,
+                    head: i.head,
+                    height: i.height,
+                    width: i.width,
+                    name: i.name,
+                    starter_area: e.status,
+                })
+            }
+            RANDOM_NAME_REQUEST => {
+                Message::RandomNameRequest { breed: r.i32()?, gender: r.i32()?, profession: r.i32()? }
+            }
+            SUGGEST_NAME => Message::SuggestName(r.str_i16()?),
             t => bail!("unhandled system message {t:#x}"),
         })
     }
@@ -368,6 +446,8 @@ impl Message {
             Message::UserLogin { .. }
             | Message::UserCredentials { .. }
             | Message::SelectCharacter { .. }
+            | Message::CreateCharacter(_)
+            | Message::RandomNameRequest { .. }
             | Message::DeleteCharacter { .. } => (0, 1),
             _ => (1, 0),
         }
@@ -540,5 +620,25 @@ mod tests {
             .encode_body();
         b[4 + 8] = b'b'; // corrupt PlayfieldProxy version byte
         assert!(Message::decode(CHARACTER_LIST, &b).is_err());
+    }
+
+    #[test]
+    fn create_character_layout_matches_client_stream() {
+        let req = CreateCharacterRequest {
+            breed: 1, gender: 2, profession: 6, head: 4, height: 100, width: 1, name: "Ab".into(), starter_area: 7,
+        };
+        let m = Message::CreateCharacter(req);
+        let b = m.encode_body();
+        // 49-byte CharacterData prefix (CellAO CreateCharacterMessage.Unknown1), then i32-string name
+        assert_eq!(&b[..8], &[0, 0, 0, 4, 0, 0, 0, 0]); // version 4, id 0
+        assert_eq!(b[8], b'a');
+        assert_eq!(&b[45..49], &[0, 0, 0, 0]); // info.org_instance
+        assert_eq!(&b[49..55], &[0, 0, 0, 2, b'A', b'b']);
+        assert_eq!(&b[b.len() - 4..], &[0, 0, 0, 7]);
+        rt(m);
+        rt(Message::RandomNameRequest { breed: 1, gender: 2, profession: 6 });
+        assert_eq!(Message::SuggestName("Zed".into()).encode_body(), [0, 3, b'Z', b'e', b'd']);
+        rt(Message::SuggestName("Zed".into()));
+        rt(Message::SuggestName(String::new()));
     }
 }

@@ -16,6 +16,7 @@
 //! values of `Tweak_GAME_FrozenTime.txt` (`CurrentDayTime 2648.69`, `Sun1Rotation q(0.900351, -0.0951056, 0.344078, 0.248863)`, components x y z w),
 //! the client's own fixed-time debug setting.
 
+mod aurora;
 mod layers;
 mod script;
 
@@ -179,6 +180,8 @@ pub struct Sky {
     /// `GAME.CurrentDayTime` the sky was evaluated at.
     day_time: f32,
 }
+    /// `GAME.CurrentNightIntensity` (`NightIntensity` track of `Tweak_GAME.txt`, 1 when the script has none).
+    night: f32,
 
 /// `DayTimeForGroundShadows = GameDayTime * 15`.
 pub fn ground_shadow_time(day_time: f32) -> f32 {
@@ -256,7 +259,7 @@ impl Sky {
         let sun = t.rgb(["GroundLightR", "GroundLightG", "GroundLightB"], f).map(|c| c.map(|v| (v * 2.0).min(1.0)));
         let ambient = t.at("AmbientLight", f).map(|a| [a; 3]).or_else(|| t.rgb(["AmbientLightR", "AmbientLightG", "AmbientLightB"], f));
         let cloud_light = t.rgb(["CloudLightR", "CloudLightG", "CloudLightB"], f).unwrap_or([1.0; 3]);
-        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, cloud_light, sun_dir: sun_dir(day_time), sun_ao: sun_ao(day_time), sun2_ao: sun2_ao(day_time), day_time })
+        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, cloud_light, sun_dir: sun_dir(day_time), sun_ao: sun_ao(day_time), sun2_ao: sun2_ao(day_time), day_time, night: t.at("NightIntensity", f).unwrap_or(1.0) })
     }
 
     /// Camera-locked sky dome (`Scene::sky`, drawn unlit and unfogged by the renderer): the atmosphere strip's gradient

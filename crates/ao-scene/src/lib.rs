@@ -3,6 +3,12 @@
 //! Conventions: right-handed, +Y up, units are AO world units (1.0 = 1 metre).
 //! Matrices are column-major `[[f32; 4]; 4]` (`m[col][row]`), applied as `M * v`.
 
+pub mod aurora;
+pub mod mover;
+pub mod wave;
+pub use wave::{sun_flicker_table, wave_curves, SkyWaveSpin};
+pub use mover::{Counter, Mover, MoverState, RotTerm};
+
 use std::collections::HashMap;
 
 /// Decoded texture, tightly packed RGBA8 (sRGB), row-major, top row first.
@@ -182,6 +188,23 @@ pub struct SkySpin {
     pub pivot: [f32; 3],
     pub degrees_per_second: f32,
 }
+    /// Rotations of `sky` instances driven by `GameWaveCurve*` ([`SkyWaveSpin`]).
+    pub sky_wave_spin: Vec<SkyWaveSpin>,
+    /// Vertex colours of `meshes` that the renderer re-simulates every frame (the Shadowlands aurora, [`aurora`]).
+    pub sky_colors: Vec<SkyColors>,
+    /// Traffic ships: instances of `instances` whose transform the renderer advances every frame ([`Mover`]).
+    pub movers: Vec<Mover>,
+    /// Game day time (seconds, 0..6480) the scene was built at; the movers' clock starts here.
+    pub day_time: f32,
+}
+
+/// `meshes[mesh]` gets its vertex colours from `sim` (ARGB map entry per vertex, vertex `i` = map texel `i`), advanced to
+/// the renderer's time every frame. Colour = `min(rgb * gain, 1)` (D3D `MODULATE2X/4X`) in linear space, alpha = a / 255.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkyColors {
+    pub mesh: usize,
+    pub sim: aurora::GloomySky,
+    pub gain: f32,
 
 /// Local fog volume (`n3StatelFog_t`, statel file; `StatelFogRun` N3 @0x10024dbc): inside `radius` metres of `pos` the
 /// client adds fog `color` with density `density * (1 - (d / radius)^4)`.

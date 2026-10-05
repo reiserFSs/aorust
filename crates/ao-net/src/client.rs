@@ -9,7 +9,7 @@
 use crate::conn::{Conn, Tap};
 use crate::crypto::{login_server_pub, make_challenge_response_with};
 use crate::frame::Frame;
-use crate::msg::{CharacterList, Message};
+use crate::msg::{CharacterList, CreateCharacterRequest, Message};
 use anyhow::{anyhow, bail, Result};
 use num_bigint::BigUint;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -84,6 +84,16 @@ pub enum LoginEvent {
     CharacterList(CharacterList),
     /// After this the session thread ends silently (no `Disconnected`).
     LoginError { code: u32, message: String },
+    /// Reply 0x11 to [`LoginSession::create_character`]; the session then sends `SelectCharacter(character_id)`
+    /// by itself exactly like `Client_t::ProcessMessage` (Interfaces.dll 0x10002a9e) and a `ZoneHandoff` follows.
+    CharacterCreated { character_id: u32 },
+    /// Reply 0x10 (`NameInUse`) to a create request: `code` is the `i32` body (CellAO 0x1E); the CC UI shows
+    /// LDB text `code` (`NameScene_t::SetState(code)`, docs/protocol.md §5a). The session stays usable.
+    CharacterCreateFailed { code: i32 },
+    /// Reply 0x15 to [`LoginSession::delete_character`] (id = the pending delete; the server body is ignored like the original).
+    CharacterDeleted { character_id: u32 },
+    /// Reply 0x56 to [`LoginSession::request_random_name`].
+    RandomName(String),
     ZoneHandoff { zone_ip: Ipv4Addr, zone_port: u16, character_id: u32 },
     ZoneConnected { messages: Vec<ZoneMsgSummary> },
     Disconnected(String),
@@ -101,6 +111,9 @@ pub fn login_error_text(code: u32) -> String {
 enum Cmd {
     Login(String, String),
     Select(u32),
+    Create(CreateCharacterRequest),
+    Delete(u32),
+    RandomName { breed: i32, gender: i32, profession: i32 },
 }
 
 pub struct LoginSession {
@@ -152,6 +165,21 @@ impl LoginSession {
         let _ = self.cmds.send(Cmd::Select(character_id));
     }
 
+    /// `Client_t::CreateCharacter` (Interfaces.dll 0x10001928). Valid once the character list arrived.
+    pub fn create_character(&self, req: CreateCharacterRequest) {
+        let _ = self.cmds.send(Cmd::Create(req));
+    }
+
+    /// `LoginModule_c::SlotDeleteCharacter` -> `Client_t::DeleteCharacter` (GUI 0x100112f5, IF 0x10001a67).
+    pub fn delete_character(&self, character_id: u32) {
+        let _ = self.cmds.send(Cmd::Delete(character_id));
+    }
+
+    /// `Client_t::SuggestNickName(breed, gender, profession)` (Interfaces.dll 0x1000188e); answered by [`LoginEvent::RandomName`].
+    pub fn request_random_name(&self, breed: i32, gender: i32, profession: i32) {
+        let _ = self.cmds.send(Cmd::RandomName { breed, gender, profession });
+    }
+
     pub fn poll(&self) -> Option<LoginEvent> {
         self.events.try_recv().ok()
     }
@@ -179,6 +207,7 @@ fn run(
     };
     let (mut name, mut password) = (String::new(), None::<String>);
     let mut phase = Phase::Idle;
+    let mut pending_delete = 0u32; // Client_t::s_nCharID while a delete is in flight
     loop {
         match cmds.try_recv() {
             Ok(Cmd::Login(u, p)) if phase == Phase::Idle => {
@@ -194,6 +223,17 @@ fn run(
                 conn.send_message(&Message::SelectCharacter { char_id: id as i32 })?;
                 phase = Phase::Selecting;
                 send(LoginEvent::Status("requesting zone".into()));
+            }
+            Ok(Cmd::Create(req)) if phase == Phase::Listed => {
+                conn.send_message(&Message::CreateCharacter(req))?;
+                send(LoginEvent::Status("creating character".into()));
+            }
+            Ok(Cmd::Delete(id)) if phase == Phase::Listed => {
+                pending_delete = id;
+                conn.send_message(&Message::DeleteCharacter { char_id: id as i32 })?;
+            }
+            Ok(Cmd::RandomName { breed, gender, profession }) if phase == Phase::Listed => {
+                conn.send_message(&Message::RandomNameRequest { breed, gender, profession })?;
             }
             Ok(_) => send(LoginEvent::Status("command ignored in current state".into())),
             Err(TryRecvError::Disconnected) => return Ok(true),
@@ -225,15 +265,32 @@ fn run(
             Ok(Message::LoginError(code)) => {
                 let code = code as u32;
                 send(LoginEvent::LoginError { code, message: login_error_text(code) });
-                return Ok(true);
+                if phase != Phase::Listed {
+                    return Ok(true);
+                }
             }
             Ok(Message::RequestRejected(detail)) => {
                 send(LoginEvent::LoginError {
                     code: detail as u32,
                     message: format!("server rejected the login request (system message 0x21, detail {detail})"),
                 });
-                return Ok(true);
+                if phase != Phase::Listed {
+                    return Ok(true);
+                }
             }
+            Ok(Message::CharacterCreated { char_id }) if phase == Phase::Listed => {
+                // ProcessMessage 0x11: s_nCharID = id; LoginCharacter() (0x16) at once.
+                send(LoginEvent::CharacterCreated { character_id: char_id as u32 });
+                conn.send_message(&Message::SelectCharacter { char_id })?;
+                phase = Phase::Selecting;
+            }
+            Ok(Message::NameInUse(code)) if phase == Phase::Listed => {
+                send(LoginEvent::CharacterCreateFailed { code });
+            }
+            Ok(Message::CharacterDeleted { .. }) if phase == Phase::Listed => {
+                send(LoginEvent::CharacterDeleted { character_id: std::mem::take(&mut pending_delete) });
+            }
+            Ok(Message::SuggestName(n)) if phase == Phase::Listed => send(LoginEvent::RandomName(n)),
             Ok(Message::CharacterList(l)) => {
                 phase = Phase::Listed;
                 send(LoginEvent::CharacterList(l));

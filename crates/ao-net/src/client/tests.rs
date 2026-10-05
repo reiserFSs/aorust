@@ -178,6 +178,66 @@ fn login_select_zone_handoff_pings_and_first_zone_frames() {
     assert!(matches!(ev.last().unwrap(), LoginEvent::Disconnected(_)));
 }
 
+/// Login + credentials against a fake server, returns the connected server end with the list already delivered.
+fn listed(l: &TcpListener, s: &LoginSession, server_priv: &BigUint) -> Fake {
+    s.login("Testy", "hunter2");
+    let mut srv = Fake::accept(l);
+    assert!(matches!(srv.recv(), Message::UserLogin { .. }));
+    srv.raw(&hex(SALT_FRAME));
+    srv.seq = 1;
+    let Message::UserCredentials { response, .. } = srv.recv() else { panic!() };
+    assert!(open_challenge_response(server_priv, &response).is_ok());
+    let list = CharacterList { characters: vec![entry(77)], allowed_characters: 3, expansions: 255, sl_profs_enabled: 1 };
+    srv.send(&Message::CharacterList(list));
+    events_until(s, |e| matches!(e, LoginEvent::CharacterList(_)));
+    srv
+}
+
+#[test]
+fn create_delete_and_name_suggestion_in_the_char_select_phase() {
+    let server_priv = BigUint::from(0x1234_5678_9abc_def0u64);
+    let server_pub = BigUint::from(5u32).modpow(&server_priv, &crate::crypto::dh_prime());
+    let (l, s) = start(server_pub);
+    let mut srv = listed(&l, &s, &server_priv);
+
+    s.request_random_name(1, 2, 6);
+    assert_eq!(srv.recv(), Message::RandomNameRequest { breed: 1, gender: 2, profession: 6 });
+    srv.send(&Message::SuggestName("Zorbak".into()));
+    assert_eq!(*events_until(&s, |e| matches!(e, LoginEvent::RandomName(_))).last().unwrap(), LoginEvent::RandomName("Zorbak".into()));
+
+    let req = CreateCharacterRequest {
+        breed: 1, gender: 2, profession: 6, head: 4, height: 110, width: 1, name: "Zorbak".into(), starter_area: 0,
+    };
+    s.create_character(req.clone());
+    assert_eq!(srv.recv(), Message::CreateCharacter(req.clone()));
+    srv.send(&Message::NameInUse(0x1E));
+    assert_eq!(
+        *events_until(&s, |e| matches!(e, LoginEvent::CharacterCreateFailed { .. })).last().unwrap(),
+        LoginEvent::CharacterCreateFailed { code: 0x1E }
+    );
+    // a LoginError during the char-select phase is reported but does not end the session
+    srv.send(&Message::LoginError(0x14));
+    assert!(matches!(events_until(&s, |e| matches!(e, LoginEvent::LoginError { .. })).last().unwrap(), LoginEvent::LoginError { code: 0x14, .. }));
+
+    s.delete_character(77);
+    assert_eq!(srv.recv(), Message::DeleteCharacter { char_id: 77 });
+    srv.send(&Message::CharacterDeleted { char_id: None });
+    assert_eq!(
+        *events_until(&s, |e| matches!(e, LoginEvent::CharacterDeleted { .. })).last().unwrap(),
+        LoginEvent::CharacterDeleted { character_id: 77 }
+    );
+
+    s.create_character(req);
+    assert!(matches!(srv.recv(), Message::CreateCharacter(_)));
+    srv.send(&Message::CharacterCreated { char_id: 99 });
+    assert_eq!(
+        *events_until(&s, |e| matches!(e, LoginEvent::CharacterCreated { .. })).last().unwrap(),
+        LoginEvent::CharacterCreated { character_id: 99 }
+    );
+    // the original logs the new character in immediately
+    assert_eq!(srv.recv(), Message::SelectCharacter { char_id: 99 });
+}
+
 #[test]
 fn status_api_json() {
     let v: serde_json::Value = serde_json::from_str(

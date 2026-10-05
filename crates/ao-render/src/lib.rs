@@ -257,6 +257,15 @@ fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 12] {
 pub struct FrameStats {
     pub instances: usize,
     pub draw_calls: usize,
+    colors: Vec<ColorAnim>,
+}
+
+/// A sky mesh whose vertex colours are re-simulated every frame ([`ao_scene::SkyColors`]).
+struct ColorAnim {
+    mesh: usize,
+    sim: ao_scene::aurora::GloomySky,
+    gain: f32,
+    vertices: Vec<ao_scene::Vertex>,
 }
 
 /// Colour + depth attachments sized to the output.
@@ -797,6 +806,18 @@ impl Renderer {
                 }
             }
         }
+        // a live update keeps the running simulation of an identical aurora
+        sky.colors = scene
+            .sky_colors
+            .iter()
+            .filter(|c| matches!(sky.meshes.get(c.mesh), Some(Some(_))))
+            .map(|c| ColorAnim {
+                mesh: c.mesh,
+                sim: self.sky.colors.iter().find(|o| o.sim.params == c.sim.params).map_or_else(|| c.sim.clone(), |o| o.sim.clone()),
+                gain: c.gain,
+                vertices: scene.meshes[c.mesh].vertices.clone(),
+            })
+            .collect();
         for (zone, (&new, old)) in levels.iter().zip(&st.levels).enumerate() {
             if new == *old {
                 continue;

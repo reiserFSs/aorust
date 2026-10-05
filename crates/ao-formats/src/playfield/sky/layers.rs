@@ -5,13 +5,14 @@
 //! All sky objects are `e_LockToCamera` with `ZFUNC ALWAYS` and no z write, so only their order and angular size matter:
 //! meshes are baked at `Scale` times their authored size (the renderer pins the sky to the far plane).
 
+use super::aurora;
 use super::script::{self, Ctx, Obj, Quat};
 use super::srgb_to_linear;
 use crate::character::NameTable;
 use crate::mesh::{decode_mesh_object_space, MESH_TYPE};
 use crate::texture::decode_texture;
 use ao_rdb::RecordStore;
-use ao_scene::{Blend, Instance, Mesh, Scene, SkySpin, Submesh, TextureKey, Vertex, IDENTITY, WHITE};
+use ao_scene::{Blend, Instance, Mesh, Scene, SkyColors, SkySpin, Submesh, TextureKey, Vertex, IDENTITY, WHITE};
 use std::collections::HashMap;
 
 const TEXTURES: u32 = 1_010_004;
@@ -55,13 +56,18 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         hq_offset: hq_offset(objs),
         delta_time: 0.0,
         wind: [0.0; 2],
+        night: sky.night,
         counters: counters(objs),
     };
     let mut b = Builder { fog, store, names, ctx, objs, sky, scene, sorts };
-    let mut layers: Vec<(u32, Mesh, Option<SkySpin>)> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None)];
+    let mut layers: Vec<(u32, Mesh, Option<SkySpin>, Option<(ao_scene::aurora::GloomySky, f32)>)> = vec![(b.sorts.get("Atmosphere").copied().unwrap_or(ATMOSPHERE_SORT), dome, None, None)];
     for o in objs.iter().filter(|o| o.field("Priority").is_some_and(|p| p.trim() == "e_RenderPriority_PreRendering")) {
         let mesh = match o.fxid() {
             "GenericMeshObject" => b.mesh_object(o).map(|m| b.fogged(o, m)),
+            "GloomySky" => b.gloomy_sky(o).map(|(m, sim, gain)| {
+                colors = Some((sim, gain));
+                m
+            }),
             "SunRays" => b.sun_rays(o),
             "SingleCloud" => b.single_clouds(o),
             "GenericVisualObject" => b.dot_points(o).map(|m| b.fogged(o, m)),
@@ -77,6 +83,7 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
     for (_, m, spin) in layers {
         scene.meshes.push(m);
         scene.sky.push(Instance { mesh: scene.meshes.len() - 1, transform: IDENTITY });
+        scene.sky_colors.extend(colors.map(|(sim, gain)| SkyColors { mesh: scene.meshes.len() - 1, sim, gain }));
         scene.sky_spin.extend(spin.map(|s| SkySpin { instance: scene.sky.len() - 1, ..s }));
     }
 }
@@ -396,6 +403,38 @@ impl Builder<'_> {
         }
         push([0.0, 0.0, -100.0], [0.5, 0.5]);
         let centre = (n - 1) as u32;
+    /// `e_GloomySky` (Shadowlands aurora): the dome of `FUN_10046ccc` oriented by `Rotation`, with the colour map simulation
+    /// (`ao_scene::aurora`, `FUN_10047300`) the renderer runs for its vertex colours. The state blob gives the blend
+    /// (`DESTBLEND ONE` = additive, else alpha blend), the texture (`COLORARG1 ... | COMPLEMENT` = the inverted texture) and
+    /// the `MODULATE2X/4X` gain on the diffuse colour. Alpha is `tex.a * diffuse.a` [INFERENCE: the stage-0 alpha default].
+    fn gloomy_sky(&mut self, o: &Obj) -> Option<(Mesh, ao_scene::aurora::GloomySky, f32)> {
+        let params = aurora::params(o, &self.ctx)?;
+        let (mut vertices, indices) = aurora::mesh(o, &self.ctx, &params);
+        let q = o.field("Rotation").and_then(|e| script::rotation(o, &self.ctx, e, 0)).unwrap_or(Quat::IDENTITY);
+        for v in &mut vertices {
+            v.pos = scene(q.rotate(v.pos));
+            v.normal = [0.0, -1.0, 0.0];
+        }
+        let mut key = o.texture.as_deref().and_then(|n| self.texture(n));
+        if o.states.get("TSS_COLORARG1").is_some_and(|c| c.contains("COMPLEMENT")) {
+            key = key.and_then(|k| {
+                let mut t = self.scene.textures.get(&k)?.clone();
+                t.rgba.chunks_exact_mut(4).for_each(|p| p[..3].iter_mut().for_each(|c| *c = 255 - *c));
+                let inv = TextureKey { rdb_type: 0, id: 0x8000_0000 | k.id };
+                self.scene.textures.insert(inv, t);
+                Some(inv)
+            });
+        }
+        let blend = if o.states.get("DESTBLEND").is_some_and(|v| v == "e_D3DBLEND_ONE") { Blend::Additive } else { Blend::AlphaBlend };
+        let gain = match o.states.get("TSS_COLOROP").map(String::as_str) {
+            Some("e_D3DTOP_MODULATE4X") => 4.0,
+            Some("e_D3DTOP_MODULATE2X") => 2.0,
+            _ => 1.0,
+        };
+        let mesh = Mesh { vertices, submeshes: vec![Submesh { two_sided: true, blend, ..Submesh::new(indices, key) }] };
+        Some((mesh, ao_scene::aurora::GloomySky::new(params), gain))
+    }
+
         let mut idx: Vec<u32> = (0..centre - 1).flat_map(|i| [i, i + 1, centre]).collect();
         idx.extend([centre - 1, 0, centre]);
         mesh.submeshes.push(Submesh { two_sided: true, blend, ..Submesh::new(idx, Some(key)) });
