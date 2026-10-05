@@ -70,7 +70,8 @@ fn point_lights(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     }
     let e = cells[u32((c.z * g.dims.y + c.y) * g.dims.x + c.x)];
     var sum = vec3<f32>(0.0);
-    for (var k = 0u; k < e.y; k = k + 1u) {
+    // D3D7 fixed function: at most 8 active lights; the cell list is sorted strongest first.
+    for (var k = 0u; k < min(e.y, 8u); k = k + 1u) {
         let li = light_idx[e.x + k] * 2u;
         let a = lights[li];
         let d = a.xyz - p;
@@ -96,11 +97,13 @@ fn shade(i: VOut, mode: u32) -> vec4<f32> {
     if dot(n, to_eye) < 0.0 {
         n = -n; // lit from the viewer's side (two-sided surfaces, unreliable normals)
     }
-    var light = g.ambient.rgb + g.sun_color.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + point_lights(i.wpos, n);
+    let dyn_light = point_lights(i.wpos, n);
+    // D3D7 saturates the summed vertex lighting per channel.
+    var light = min(g.ambient.rgb + g.sun_color.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + dyn_light, vec3<f32>(1.0));
     var lit: vec3<f32>;
     if mat.emissive.w > 1.5 {
-        // prelit room shell: vertex colour is emissive light (engine: tex * (emissive + 0.8 * ambient))
-        lit = t.rgb * mat.color.rgb * (i.color.rgb + 0.8 * g.ambient.rgb);
+        // prelit room shell: vertex colour is emissive light (engine: tex * saturate(lightmap + 0.8 * ambient + dynamic))
+        lit = t.rgb * mat.color.rgb * min(i.color.rgb + 0.8 * g.ambient.rgb + dyn_light, vec3<f32>(1.0));
     } else {
     if mat.emissive.w > 0.5 {
         light = max(light, min(light + t.a, vec3<f32>(1.0))); // alpha = self-illumination mask (engine: saturate(a + lighting))
