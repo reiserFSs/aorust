@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use crate::decode::Pcm;
 
-pub const MAX_VOICES: usize = 64;
+/// SFX sample handles of the client (`SoundEngineInterface_t+0x14 = 13`, ctor @SI 0x10007d0b). Music streams
+/// (`AIL_open_stream`) are outside this pool.
+pub const MAX_VOICES: usize = 13;
 
 /// Where a voice's samples come from.
 pub enum Source {
@@ -21,11 +23,13 @@ pub struct VoiceDesc {
     pub source: Source,
     pub gain: f32,
     pub looping: bool,
+    /// Pool priority (sbf byte 6 bits 5-6: 0 highest .. 2); `None` = stream voice outside the 13 handle pool.
+    pub priority: Option<u8>,
 }
 
 impl VoiceDesc {
     pub fn new(source: Source) -> Self {
-        VoiceDesc { source, gain: 1.0, looping: false }
+        VoiceDesc { source, gain: 1.0, looping: false, priority: Some(1) }
     }
 }
 
@@ -38,6 +42,7 @@ struct Voice {
     done: bool,
     gain: f32,
     looping: bool,
+    priority: Option<u8>,
     fade: f32,
     fade_target: f32,
     fade_step: f32,
@@ -75,20 +80,25 @@ impl Mixer {
         self.voices.iter().any(|v| v.id == id && !v.done)
     }
 
-    /// Starts a voice; with `MAX_VOICES` busy the quietest non-looping voice is stolen (or the request dropped, id 0).
+    /// Starts a voice with the client's `AllocateChannel` rule (SI @0x10007d5c): finished voices are reclaimed first
+    /// (ours leave the list when they end); when all 13 handles are busy a request of priority `r` ends one playing
+    /// non-looping voice of priority `p`, trying `p = 2` down to `r` (looping voices are never stolen, a request of
+    /// priority above 2 never steals). Nothing stealable: not played (id 0).
     pub fn play(&mut self, d: VoiceDesc) -> u64 {
-        if self.voices.len() >= MAX_VOICES {
-            let victim = self.voices.iter().enumerate().filter(|(_, v)| !v.looping).min_by(|a, b| (a.1.gain * a.1.fade).total_cmp(&(b.1.gain * b.1.fade))).map(|(i, _)| i);
-            match victim {
-                Some(i) => {
-                    self.voices.swap_remove(i);
+        if let Some(r) = d.priority {
+            if self.voices.iter().filter(|v| v.priority.is_some() && !v.done).count() >= MAX_VOICES {
+                let victim = (r..=2).rev().find_map(|p| self.voices.iter().position(|v| v.priority == Some(p) && !v.looping && !v.done));
+                match victim {
+                    Some(i) => {
+                        self.voices.swap_remove(i);
+                    }
+                    None => return 0,
                 }
-                None => return 0,
             }
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: f32::NAN });
+        self.voices.push(Voice { id, src: d.source, cur: Vec::new(), pos: 0.0, done: false, gain: d.gain, looping: d.looping, priority: d.priority, fade: 1.0, fade_target: 1.0, fade_step: 0.0, stop_at_fade_end: false, last: f32::NAN });
         id
     }
 

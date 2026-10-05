@@ -9,8 +9,6 @@ use std::sync::Arc;
 use crate::engine::Shared;
 use crate::sws::{Project, Transition};
 
-/// Fade of a layer change (`SandyInterface_t::PlayMusic` -> `SIMPlayer::SignalEvent(layer, force, 2000)`).
-const LAYER_FADE: f32 = 2.0;
 /// The client starts the next stream `AIL_digital_latency` before `fot`; we use a fixed decoder start-up allowance.
 const LOOKAHEAD: f32 = 0.05;
 
@@ -78,27 +76,32 @@ impl MusicPlayer {
         &self.proj
     }
 
-    /// `SandyInterface_t::PlayMusic`: switch to `layer` (`None` = silence); the same layer is a no-op.
+    /// `SandyInterface_t::PlayMusic` -> `SIMPlayer::SignalEvent(layer, force = 0, 2000)` (SIM @0x1000a599): the request is
+    /// only stored. The playing layer keeps going until its current sample has an authored transition into the new
+    /// layer ahead of the playhead (the transition's own `fot`/`ftime` cross-fade is used; `force` is 0 outside the
+    /// debug toggle, so the 2000 ms synthetic cross-fade of forced transitions never applies). A silent player (idle,
+    /// pause track silence, closing sample) starts the new layer's entry sample immediately. `None` (`Stop(false, true)`)
+    /// lets the current sample play to its end without a fade. The pause clock restarts on every layer change
+    /// (`FUN_1000289f`).
     pub fn signal(&mut self, layer: Option<usize>) {
         if layer == self.layer {
             return;
         }
-        self.stop_current(LAYER_FADE);
         self.layer = layer;
         self.played = 0.0;
         self.node = 0;
-        self.state = State::Idle;
-        if let Some(l) = layer {
-            self.start_entry(l, LAYER_FADE);
+        match (std::mem::replace(&mut self.state, State::Idle), layer) {
+            (State::Playing(mut p), Some(_)) => {
+                p.next = self.pick_next(p.sample, p.t);
+                self.state = State::Playing(p);
+            }
+            (State::Playing(mut p), None) => {
+                p.next = None;
+                self.state = State::Playing(p);
+            }
+            (_, Some(l)) => self.start_entry(l, 0.0),
+            (_, None) => self.now_playing = None,
         }
-    }
-
-    fn stop_current(&mut self, fade: f32) {
-        match std::mem::replace(&mut self.state, State::Idle) {
-            State::Playing(Playing { voice, .. }) | State::Ending { voice, .. } => self.sh.mixer().fade(voice, 0.0, fade, true),
-            _ => {}
-        }
-        self.now_playing = None;
     }
 
     /// Path of a sample: `<music/env>/<layer name with \ -> />/<name>.{wav,mp3,ogg}`, matched case-insensitively.
@@ -121,7 +124,7 @@ impl MusicPlayer {
             return false;
         }
         self.now_playing = path.file_name().map(|n| n.to_string_lossy().into_owned());
-        let next = self.pick_next(s);
+        let next = self.pick_next(s, 0.0);
         self.state = State::Playing(Playing { sample: s, voice, t: 0.0, next });
         true
     }
@@ -140,14 +143,34 @@ impl MusicPlayer {
         }
     }
 
-    /// `FUN_10008c7e`: weighted random over the sample's transitions to samples that exist on disk; the chosen one
-    /// keeps its weight, every other candidate gains 1 (reset to 1 when one passes 999).
-    fn pick_next(&mut self, s: usize) -> Option<Transition> {
-        let cands: Vec<Transition> = self.proj.samples[s].trans.iter().filter(|t| self.sample_path(t.to).is_some()).cloned().collect();
+    /// `FUN_10008d2e` + `FUN_10008c7e`: candidates are the transitions of `s` that start ahead of the playhead `t`
+    /// (`fot - 10 ms > pos`) and whose sample exists. With a pending request for another layer the earliest
+    /// transitions into it win; otherwise the ones that stay in the sample's own layer.
+    fn pick_next(&mut self, s: usize, t: f32) -> Option<Transition> {
+        let own = self.proj.samples[s].layer;
+        let ahead: Vec<Transition> = self.proj.samples[s].trans.iter().filter(|x| x.fot_ms as f32 / 1000.0 - 0.01 > t && self.sample_path(x.to).is_some()).cloned().collect();
+        let proj = &self.proj;
+        let into = |l: usize| ahead.iter().filter(|x| proj.samples[x.to].layer == l).cloned().collect::<Vec<_>>();
+        let mut cands = match self.layer {
+            Some(tl) if tl != own => {
+                let a = into(tl);
+                let min = a.iter().map(|x| x.fot_ms).min();
+                a.into_iter().filter(|x| Some(x.fot_ms) == min).collect()
+            }
+            _ => Vec::new(),
+        };
+        if cands.is_empty() {
+            cands = into(own);
+        }
+        self.weighted(s, cands)
+    }
+
+    /// Weighted random among `cands`; the chosen one keeps its weight, every other candidate gains 1 (reset to 1 when one
+    /// passes 999). [INFERENCE] a `pri` of 0 (all sampled transitions) starts at weight 1.
+    fn weighted(&mut self, s: usize, cands: Vec<Transition>) -> Option<Transition> {
         if cands.is_empty() {
             return None;
         }
-        // [INFERENCE] a pri of 0 (all sampled transitions) still has to be selectable: initial weight max(pri, 1)
         let w: Vec<u32> = cands.iter().map(|t| *self.weights.entry((s, t.to)).or_insert(t.pri.max(1) as u32)).collect();
         let total: u32 = w.iter().sum();
         let mut r = self.rng.next() % total;
@@ -168,17 +191,25 @@ impl MusicPlayer {
             }
         }
         if reset {
-            self.weights.retain(|_, v| {
-                *v = 1;
-                true
-            });
+            self.weights.values_mut().for_each(|v| *v = 1);
         }
         Some(cands[pick].clone())
     }
 
     /// Advances the music clock by `dt` seconds.
     pub fn tick(&mut self, dt: f32) {
-        let Some(layer) = self.layer else { return };
+        let Some(layer) = self.layer else {
+            // stopped: the current sample plays out, then the player is idle
+            if let State::Playing(mut p) = std::mem::replace(&mut self.state, State::Idle) {
+                p.t += dt;
+                if p.t < self.proj.samples[p.sample].end_ms as f32 / 1000.0 {
+                    self.state = State::Playing(p);
+                } else {
+                    self.now_playing = None;
+                }
+            }
+            return;
+        };
         match std::mem::replace(&mut self.state, State::Idle) {
             // nothing started yet (a missing file at signal time): retry
             State::Idle => self.start_entry(layer, 0.0),
@@ -196,6 +227,14 @@ impl MusicPlayer {
     fn tick_playing(&mut self, layer: usize, mut p: Playing, dt: f32) {
         p.t += dt;
         self.played += dt;
+        // decision point (every update): a pending layer request needs an authored transition into it
+        if self.proj.samples[p.sample].layer != layer && p.next.as_ref().is_none_or(|n| self.proj.samples[n.to].layer != layer) {
+            if let Some(n) = self.pick_next(p.sample, p.t) {
+                if self.proj.samples[n.to].layer == layer {
+                    p.next = Some(n);
+                }
+            }
+        }
         let sample = &self.proj.samples[p.sample];
         let end = sample.end_ms as f32 / 1000.0;
         let Some((pause_secs, fade)) = self.pause_due(layer) else {

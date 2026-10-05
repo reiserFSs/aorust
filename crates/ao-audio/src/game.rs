@@ -179,12 +179,18 @@ pub(crate) struct Runtime {
     rng: Rng,
     /// `Total_FX` (master x FX x mutes).
     pub fx: f32,
+    /// Weather state floats s0..s6 (rain, fog, cloud, wind, sand, fallout R, fallout G storms); all 0 = clear.
+    pub weather: [f32; 7],
+    /// Module flag +0xbc: land-control areas of a district with a land-control level use `Landcontrol_neutral`.
+    pub land_control: bool,
+    /// Keep-alive UI sounds by sound id: (voice, seconds left, base level, fade-out).
+    keepalive: HashMap<u32, (u64, f32, f32, f32)>,
 }
 
 impl Runtime {
     pub fn new(sh: &Arc<Shared>, lib: Library, seed: u64) -> Runtime {
         let music = MusicPlayer::new(sh.clone(), lib.project.clone(), seed);
-        Runtime { lib, music, pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), fx: 1.0 }
+        Runtime { lib, music, pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), fx: 1.0, weather: [0.0; 7], land_control: false, keepalive: HashMap::new() }
     }
 
     /// Emitters currently inside the camera's radius (or in their 2 s hold).
@@ -196,6 +202,27 @@ impl Runtime {
     pub fn play(&mut self, sh: &Shared, def: &SoundDef) -> Vec<u64> {
         let db = self.lib.sounds.clone();
         play_def(sh, &db, def, self.fx, &mut self.rng)
+    }
+
+    /// `PlaySample` keep-alive (`SM_Sandy_CC_Ambience`, ...): each call sets the level and re-arms the sound to
+    /// `fade_out + duration`; `update` ends it `T` seconds after the last call, fading linearly over its last
+    /// `fade_out` seconds (`FrameProcessSound` @SI 0x10003b70).
+    pub fn keepalive(&mut self, sh: &Shared, def: &SoundDef) {
+        let level = def.vol_max * self.fx;
+        let t = def.fade_out + def.duration_max;
+        if let Some(k) = self.keepalive.get_mut(&def.id) {
+            if sh.mixer().is_playing(k.0) {
+                *k = (k.0, t, level, def.fade_out);
+                sh.mixer().set_gain(k.0, level);
+                return;
+            }
+        }
+        if let Some(p) = def.file.as_deref().and_then(|f| sh.resolve(f)) {
+            let voice = sh.play_sample(&p, level, true, def.priority);
+            if voice != 0 {
+                self.keepalive.insert(def.id, (voice, t, level, def.fade_out));
+            }
+        }
     }
 
     pub fn set_playfield(&mut self, sh: &Shared, pf: Option<PlayfieldAudio>) {
@@ -223,6 +250,18 @@ impl Runtime {
             self.set_ambience_district(id);
         }
         self.music.tick(dt);
+        self.keepalive.retain(|_, (voice, left, level, fade)| {
+            *left -= dt;
+            let mut m = sh.mixer();
+            if *left <= 0.0 {
+                m.stop(*voice);
+                return false;
+            }
+            if *fade > *left {
+                m.set_gain(*voice, *level * *left / *fade);
+            }
+            true
+        });
         self.dying.retain_mut(|(hold, voice, fade)| {
             *hold -= dt;
             if *hold <= 0.0 {
@@ -241,11 +280,23 @@ impl Runtime {
             self.music.signal(None);
             return None;
         };
-        // [UNRESOLVED] weather slots (fog/rain/storm 5..7): the weather schedule seed is not known, clear sky assumed.
-        let layer = d.music[period.music_slot()];
+        // FUN_100b6d67: storm (max s3..s6 > 0.4) = slot 7, rain (s0 > 0.4) = 6, fog (s1 > 0.4) = 5, else the day period
+        let w = &self.weather;
+        let slot = if w[3..].iter().cloned().fold(0.0, f32::max) > 0.4 {
+            6
+        } else if w[0] > 0.4 {
+            5
+        } else if w[1] > 0.4 {
+            4
+        } else {
+            period.music_slot()
+        };
+        let mut layer = d.music[slot] as usize;
         let sound_id = d.sound_id;
-        // [UNRESOLVED] land-control districts (module flag +0xbc, set by the server) would use Landcontrol_neutral.
-        self.music.signal((layer != 0xffff && (layer as usize) < self.lib.project.layers.len()).then_some(layer as usize));
+        if self.land_control && d.lc_lvl.0 != 0 {
+            layer = self.lib.project.find_layer("Landcontrol_neutral").unwrap_or(0xffff);
+        }
+        self.music.signal((layer != 0xffff && layer < self.lib.project.layers.len()).then_some(layer));
         Some(sound_id)
     }
 
@@ -280,7 +331,7 @@ impl Runtime {
             let alive = self.ambient.get(&key).is_some_and(|a| sh.mixer().is_playing(a.voice));
             if !alive {
                 let Some(path) = def.file.as_deref().and_then(|f| sh.resolve(f)) else { continue };
-                let voice = sh.play_sample(&path, vol, true);
+                let voice = sh.play_sample(&path, vol, true, def.priority);
                 if voice == 0 {
                     continue;
                 }
@@ -297,7 +348,7 @@ impl Runtime {
                     // re-armed with a fresh random interval of the child's own range
                     *tm = child.interval_min + self.rng.unit() * (child.interval_max - child.interval_min).max(0.0);
                     if let Some(p) = child.file.as_deref().and_then(|f| sh.resolve(f)) {
-                        sh.play_sample(&p, vol, false);
+                        sh.play_sample(&p, vol, false, child.priority);
                     }
                 }
             }
@@ -345,12 +396,12 @@ impl Runtime {
                 st.last_child = usize::MAX;
                 st.timers = def.children.iter().map(|c| self.lib.sounds.get(*c).map_or(f32::MAX, |c| c.interval_min + self.rng.unit() * (c.interval_max - c.interval_min).max(0.0))).collect();
                 if let Some(p) = def.file.as_deref().and_then(|f| sh.resolve(f)) {
-                    st.parent = sh.play_sample(&p, level, true);
+                    st.parent = sh.play_sample(&p, level, true, def.priority);
                 }
                 if def.play_all {
                     for c in def.children.iter().filter_map(|c| self.lib.sounds.get(*c)) {
                         if let Some(p) = c.file.as_deref().and_then(|f| sh.resolve(f)) {
-                            sh.play_sample(&p, level, false);
+                            sh.play_sample(&p, level, false, c.priority);
                         }
                     }
                 }
@@ -367,8 +418,8 @@ impl Runtime {
                     i = (i + 1) % n;
                 }
                 st.last_child = i;
-                if let Some(p) = self.lib.sounds.get(def.children[i]).and_then(|c| c.file.as_deref()).and_then(|f| sh.resolve(f)) {
-                    st.child = sh.play_sample(&p, level, false);
+                if let Some((p, pr)) = self.lib.sounds.get(def.children[i]).and_then(|c| Some((sh.resolve(c.file.as_deref()?)?, c.priority))) {
+                    st.child = sh.play_sample(&p, level, false, pr);
                 }
             } else if !def.play_all && !def.random_child {
                 for (i, tm) in st.timers.iter_mut().enumerate() {
@@ -377,7 +428,7 @@ impl Runtime {
                         let Some(c) = self.lib.sounds.get(def.children[i]) else { *tm = f32::MAX; continue };
                         *tm = c.interval_min + self.rng.unit() * (c.interval_max - c.interval_min).max(0.0);
                         if let Some(p) = c.file.as_deref().and_then(|f| sh.resolve(f)) {
-                            sh.play_sample(&p, level, false);
+                            sh.play_sample(&p, level, false, c.priority);
                         }
                     }
                 }
@@ -396,7 +447,7 @@ pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, fx: f32, rng: 
     let mut out = Vec::new();
     let mut one = |d: &SoundDef| {
         if let Some(p) = d.file.as_deref().and_then(|f| sh.resolve(f)) {
-            let id = sh.play_sample(&p, vol, false);
+            let id = sh.play_sample(&p, vol, false, d.priority);
             if id != 0 {
                 out.push(id);
             }

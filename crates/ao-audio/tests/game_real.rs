@@ -116,3 +116,70 @@ fn pause_track_plays_then_pauses() {
     assert!((118.0..135.0).contains(&s), "pause starts after ~120 s of music: {s}");
     assert!((r - s - 600.0).abs() < 6.0, "silence lasts ~600 s: {s} -> {r}");
 }
+
+/// mountain\day has authored transitions into mountain\night: after the request the day layer keeps playing until such a
+/// transition fires, then the night layer plays (no 2 s fade logic: SIM `SignalEvent` with force 0).
+#[test]
+fn layer_change_uses_authored_transition() {
+    let Some(dir) = client() else { return };
+    let a = Audio::offline(&dir, 44100);
+    assert!(a.set_music_layer(Some("mountain\\day")));
+    for _ in 0..30 {
+        a.update(0.1, [0.0; 3], 3240.0);
+    }
+    assert!(a.set_music_layer(Some("mountain\\night")));
+    assert_eq!(a.music_layer().as_deref(), Some("mountain\\night"));
+    let first = a.now_playing().unwrap();
+    assert!(first.to_ascii_lowercase().starts_with("md"), "{first}");
+    let mut switched = None;
+    for i in 0..1200 {
+        a.update(0.1, [0.0; 3], 3240.0);
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        if let Some(n) = a.now_playing() {
+            if n.to_ascii_lowercase().starts_with("mn") {
+                switched = Some((i as f32 * 0.1, n));
+                break;
+            }
+        }
+    }
+    assert!(switched.is_some(), "night layer reached through an authored transition (was {first})");
+}
+
+#[test]
+fn weather_slot_prefs_and_keepalive() {
+    let Some(dir) = client() else { return };
+    let store = RecordStore::open(&dir).unwrap();
+    let (scene, report) = load_playfield_report(&store, &dir, 566).unwrap();
+    let a = Audio::offline(&dir, 44100);
+    a.set_playfield(Some(PlayfieldAudio::load(&store, 566, &report.sounds).unwrap()));
+    a.update(1.0, scene.spawn.unwrap(), 3240.0);
+    assert_eq!(a.music_layer().as_deref(), Some("desert\\Day"));
+    // rain slot of district 566 = desert\Night (docs: fog/rain/storm desert\Night x3)
+    a.set_weather([0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    a.update(1.0, scene.spawn.unwrap(), 3240.0);
+    assert_eq!(a.music_layer().as_deref(), Some("desert\\Night"));
+
+    // prefs: muted music / FX
+    let b = Audio::offline(&dir, 44100);
+    b.set_prefs(&ao_audio::Prefs { music_on: false, ..Default::default() });
+    b.play_startup_music();
+    let (rms, _) = run(&b, 2.0, [0.0; 3], 0.0);
+    assert!(rms < 1e-6, "music muted: {rms}");
+
+    // keep-alive: ends 5 s (1 s duration + 4 s fade-out) after the last call, level falls over the last 4 s
+    let c = Audio::offline(&dir, 44100);
+    c.play_ui_keepalive("SM_Sandy_CC_Ambience");
+    let voices = |a: &Audio| a.stats().voices.load(std::sync::atomic::Ordering::Relaxed);
+    let mut buf = vec![0f32; 4410 * 2];
+    let mut levels = Vec::new();
+    for i in 0..80 {
+        c.update(0.1, [0.0; 3], 0.0);
+        if i < 20 {
+            c.play_ui_keepalive("SM_Sandy_CC_Ambience"); // caller keeps calling for 2 s
+        }
+        c.render(&mut buf);
+        levels.push(voices(&c));
+    }
+    assert_eq!(levels[10], 1);
+    assert_eq!(levels[79], 0, "gone after the keep-alive expired");
+}

@@ -81,24 +81,41 @@ impl Shared {
             }
         });
         let mut m = self.mixer();
-        let id = m.play(VoiceDesc { gain, ..VoiceDesc::new(Source::Stream { rx, rate, channels }) });
+        let id = m.play(VoiceDesc { gain, priority: None, ..VoiceDesc::new(Source::Stream { rx, rate, channels }) });
         if id != 0 && fade_in > 0.0 {
             m.fade_from_zero(id, fade_in);
         }
         id
     }
 
-    pub fn play_sample(&self, path: &Path, gain: f32, looping: bool) -> u64 {
+    pub fn play_sample(&self, path: &Path, gain: f32, looping: bool, priority: u8) -> u64 {
         let Some(pcm) = self.load(path) else { return 0 };
         if pcm.frames() == 0 {
             return 0;
         }
-        self.mixer().play(VoiceDesc { gain, looping, ..VoiceDesc::new(Source::Sample(pcm)) })
+        self.mixer().play(VoiceDesc { gain, looping, priority: Some(priority), ..VoiceDesc::new(Source::Sample(pcm)) })
     }
 }
 
 fn seed() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64)
+}
+
+/// The client's sound prefs (`cd_image/gui/Default/LoginPrefs.xml` defaults: all 1.0 / on).
+#[derive(Clone, Copy, Debug)]
+pub struct Prefs {
+    pub sound_on: bool,
+    pub master: f32,
+    pub fx_on: bool,
+    pub fx: f32,
+    pub music_on: bool,
+    pub music: f32,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Prefs { sound_on: true, master: 1.0, fx_on: true, fx: 1.0, music_on: true, music: 1.0 }
+    }
 }
 
 /// Owns the output stream. Not `Send` (cpal streams are not on every platform); keep it on the main thread.
@@ -178,11 +195,38 @@ impl Audio {
         self.rt.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `Total_FX` / `Total_Music` of the client (master x channel volume, 0..1; all default 1.0).
-    pub fn set_volumes(&self, fx: f32, music: f32) {
+    /// Applies the client's sound prefs (`SoundOptionsMonitor_c`, GUI @0x100c4ace): `Total_FX = master * FX * mutes`,
+    /// `Total_Music = master * Music * mutes`.
+    pub fn set_prefs(&self, p: &Prefs) {
         if let Some(rt) = self.rt().as_mut() {
-            rt.fx = fx;
-            rt.music.volume = music;
+            rt.fx = if p.sound_on && p.fx_on { p.master * p.fx } else { 0.0 };
+            rt.music.volume = if p.sound_on && p.music_on { p.master * p.music } else { 0.0 };
+        }
+    }
+
+    /// Weather state s0..s6 (rain, fog, cloud, wind, sand, fallout R/G storms): selects the fog/rain/storm music slot.
+    /// The weather schedule itself is not reconstructed (see docs `## audio`); the default is clear sky.
+    pub fn set_weather(&self, s: [f32; 7]) {
+        if let Some(rt) = self.rt().as_mut() {
+            rt.weather = s;
+        }
+    }
+
+    /// Module flag +0xbc (server driven): land-control districts play `Landcontrol_neutral`.
+    pub fn set_land_control(&self, on: bool) {
+        if let Some(rt) = self.rt().as_mut() {
+            rt.land_control = on;
+        }
+    }
+
+    /// `PlaySample` of a keep-alive sound such as `SM_Sandy_CC_Ambience`: call every frame while it should sound;
+    /// it ends 1 s + 4 s (duration + fade-out of the definition) after the last call. `update` must run every frame.
+    pub fn play_ui_keepalive(&self, name: &str) {
+        let mut g = self.rt();
+        let Some(rt) = g.as_mut() else { return };
+        let db = rt.lib.sounds.clone();
+        if let Some(d) = db.by_name(name) {
+            rt.keepalive(&self.sh, d);
         }
     }
 
@@ -257,7 +301,7 @@ impl Audio {
     /// Plays a file below `cd_image/sound` (e.g. `sfx/gui/click`) once, centred. Returns the voice id (0 = not played).
     pub fn play_sfx(&self, rel: &str, gain: f32) -> u64 {
         match self.sh.resolve(rel) {
-            Some(p) => self.sh.play_sample(&p, gain, false),
+            Some(p) => self.sh.play_sample(&p, gain, false, 1),
             None => {
                 eprintln!("audio: no sound file for '{rel}'");
                 0

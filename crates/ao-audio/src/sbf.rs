@@ -71,6 +71,8 @@ pub struct SoundDef {
     pub sequential: bool,
     /// Flag b6: one child per trigger, random, never the same twice in a row.
     pub random_child: bool,
+    /// Voice-pool priority (byte 6 bits 5-6): 0 = highest (503 records: env/ambience), 1 = default (5320), 2 (17).
+    pub priority: u8,
     /// 46 material variant ids (0 = none).
     pub variants: Vec<u32>,
 }
@@ -124,6 +126,7 @@ impl SoundDb {
                     play_all: flags & 0x04 != 0,
                     sequential: flags & 0x08 != 0,
                     random_child: flags & 0x40 != 0,
+                    priority: (r[6] >> 5) & 3,
                     variants: (0..46).map(|i| u(0x14 + 4 * i)).collect(),
                 };
                 // The client updates an existing object in place when an id repeats (later wins).

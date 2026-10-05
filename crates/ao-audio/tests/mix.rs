@@ -102,3 +102,23 @@ fn wav_decode_and_stream_voice() {
     near(rms as f32, 0.5 / 2f32.sqrt(), 0.02);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn voice_pool_priority_stealing() {
+    let snd = || Source::Sample(sine(440.0, 5.0, 0.01, RATE));
+    let mut m = Mixer::new(RATE);
+    // fill the 13 handles with priority 1 one-shots
+    let ids: Vec<u64> = (0..13).map(|_| m.play(VoiceDesc { priority: Some(1), ..VoiceDesc::new(snd()) })).collect();
+    assert!(ids.iter().all(|i| *i != 0));
+    // priority 2 cannot steal priority 1 (only [r, 2]) -> dropped
+    assert_eq!(m.play(VoiceDesc { priority: Some(2), ..VoiceDesc::new(snd()) }), 0);
+    // priority 0 steals one
+    let hi = m.play(VoiceDesc { priority: Some(0), ..VoiceDesc::new(snd()) });
+    assert_ne!(hi, 0);
+    assert_eq!(m.voice_count(), 13);
+    // a priority 3 request never steals
+    assert_eq!(m.play(VoiceDesc { priority: Some(3), ..VoiceDesc::new(snd()) }), 0);
+    // streams are outside the pool
+    let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+    assert_ne!(m.play(VoiceDesc { priority: None, ..VoiceDesc::new(Source::Stream { rx, rate: 44100, channels: 2 }) }), 0);
+}
