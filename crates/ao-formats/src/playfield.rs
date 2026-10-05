@@ -208,10 +208,13 @@ fn terrain_height(tm: &ground::Tilemap, x: f32, z: f32) -> Option<f32> {
     Some(a * (1.0 - az) + b * az)
 }
 
+/// A statel's mesh record plus its texture-override attributes: each distinct pair is one decoded scene mesh.
+type MeshKey = (u32, Vec<(u8, u32)>);
+
 struct Placer<'a> {
     store: &'a RecordStore,
     scene: &'a mut Scene,
-    cache: HashMap<(u32, Vec<(u8, u32)>), Option<usize>>,
+    cache: HashMap<MeshKey, Option<usize>>,
     report: &'a mut Report,
 }
 

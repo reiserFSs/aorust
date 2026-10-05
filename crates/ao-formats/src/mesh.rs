@@ -48,8 +48,29 @@ pub fn decode_mesh_into(store: &RecordStore, id: u32, scene: &mut Scene) -> Resu
 
 /// Like [`decode_mesh_into`] for an explicit mesh record type ([`MESH_TYPE`] or [`MESH_LOW_TYPE`]).
 pub fn decode_record_into(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene) -> Result<Option<usize>> {
+    decode_record(store, rdb_type, id, scene, false, &[])
+}
+
+/// Texture used by statel attribute overrides: `NewTextureData_t` ids are 1010004 records (`acg_tiles_metal_corroded_plain.png`, ...).
+const OVERRIDE_TEXTURES: u32 = 1_010_004;
+
+/// A statel's mesh with its attributes applied: `(slot, texture id)` pairs replace the texture of the `slot`-th
+/// `SimpleMesh` (counted over the whole node tree in traversal order, empty ones included). Statel attributes are
+/// `std::vector<NewTextureData_t>` (`{i32 slot, u32 texture}`, 8 bytes) handed to `VisualMesh_t::SetMesh` (DisplaySystem
+/// @0x1006b623) -> `AsyncMesh` (@0x1007125c) -> `FUN_100714c2`; see `docs/formats.md` § playfields.
+pub fn decode_statel_mesh(store: &RecordStore, id: u32, overrides: &[(u8, u32)], scene: &mut Scene) -> Result<Option<usize>> {
+    decode_record(store, MESH_TYPE, id, scene, false, overrides)
+}
+
+/// Like [`decode_mesh_into`] but with the vertices exactly as stored (node object space, the frame tree's matrices are
+/// not applied): what a `RTriMesh_t` visual built straight from the mesh data draws (the sky objects).
+pub fn decode_mesh_object_space(store: &RecordStore, id: u32, scene: &mut Scene) -> Result<Option<usize>> {
+    decode_record(store, MESH_TYPE, id, scene, true, &[])
+}
+
+fn decode_record(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene, object_space: bool, overrides: &[(u8, u32)]) -> Result<Option<usize>> {
     let Some(bytes) = store.get(rdb_type, id)? else { return Ok(None) };
-    let mesh = decode_archive(&bytes, |key| {
+    let mesh = decode_archive_with(&bytes, object_space, overrides, |key| {
         if let std::collections::hash_map::Entry::Vacant(e) = scene.textures.entry(key) {
             if let Some(t) = load_texture(store, key).ok().flatten() {
                 e.insert(t);
@@ -68,6 +89,20 @@ pub fn decode_record_into(store: &RecordStore, rdb_type: u32, id: u32, scene: &m
     Ok(Some(scene.meshes.len() - 1))
 }
 
+/// Every texture a mesh record references (before the load check, in first-use order, deduped); `None` = no record.
+pub fn texture_refs(store: &RecordStore, rdb_type: u32, id: u32) -> Result<Option<Vec<TextureKey>>> {
+    let Some(bytes) = store.get(rdb_type, id)? else { return Ok(None) };
+    let mut refs = Vec::new();
+    decode_archive(&bytes, false, |k| {
+        if !refs.contains(&k) {
+            refs.push(k);
+        }
+        false
+    })
+    .with_context(|| format!("decoding mesh {rdb_type}/{id}"))?;
+    Ok(Some(refs))
+}
+
 /// Fraction of texels with a partial alpha (16..240) below which a blended texture is treated as a
 /// cutout. Guess: the engine blends these (rst 27=1, z-write off, sorted), but a texture whose alpha is
 /// essentially 0/255 looks the same alpha-tested while avoiding per-instance depth sorting.
@@ -81,6 +116,7 @@ fn is_cutout(t: &Texture) -> bool {
 
 /// Row-major 4x4 for row vectors (`v' = v * M`), as used by the original engine.
 type Mat = [[f32; 4]; 4];
+const IDENTITY_MAT: Mat = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
 
 fn mul(a: &Mat, b: &Mat) -> Mat {
     let mut o = [[0.0; 4]; 4];
@@ -147,9 +183,18 @@ struct Builder<'a, 'b> {
     groups: HashMap<MatId, usize>,
     have_texture: &'b mut dyn FnMut(TextureKey) -> bool,
     visited: Vec<bool>,
+    /// Ignore every node matrix (vertices as stored).
+    object_space: bool,
+    /// Statel texture overrides `(SimpleMesh slot, texture id)` and the running slot counter.
+    overrides: &'b [(u8, u32)],
+    slot: usize,
 }
 
-fn decode_archive(bytes: &[u8], mut have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
+fn decode_archive(bytes: &[u8], object_space: bool, have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
+    decode_archive_with(bytes, object_space, &[], have_texture)
+}
+
+fn decode_archive_with(bytes: &[u8], object_space: bool, overrides: &[(u8, u32)], mut have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
     let ar = Archive::parse(bytes)?;
     let mut b = Builder {
         ar: &ar,
@@ -157,6 +202,9 @@ fn decode_archive(bytes: &[u8], mut have_texture: impl FnMut(TextureKey) -> bool
         groups: HashMap::new(),
         have_texture: &mut have_texture,
         visited: vec![false; ar.objects.len()],
+        object_space,
+        overrides,
+        slot: 0,
     };
     b.node(ar.root, &IDENTITY, 0)?;
     b.mesh.submeshes.retain(|s| !s.indices.is_empty());
@@ -169,7 +217,7 @@ impl Builder<'_, '_> {
         let ar = self.ar;
         let n = ar.objects.get(i).with_context(|| format!("dangling object ref {i}"))?;
         ensure!(!std::mem::replace(&mut self.visited[i], true), "cyclic frame tree");
-        let world = mul(&local_matrix(n), parent);
+        let world = if self.object_space { IDENTITY_MAT } else { mul(&local_matrix(n), parent) };
         if let Some(data) = n.ref1("data") {
             let data = ar.objects.get(data).context("dangling data ref")?;
             let node_ds = n.ref1("delta_state").and_then(|d| ar.objects.get(d));
@@ -269,7 +317,15 @@ impl Builder<'_, '_> {
 
         // The Z flip mirrors the mesh; a node matrix with negative determinant mirrors it back.
         let reverse = det3(world) >= 0.0;
-        let key = self.material(node_ds, sm);
+        let mut key = self.material(node_ds, sm);
+        let slot = self.slot;
+        self.slot += 1;
+        if let Some(&(_, id)) = self.overrides.iter().find(|o| o.0 as usize == slot) {
+            let tex = TextureKey { rdb_type: OVERRIDE_TEXTURES, id };
+            if (self.have_texture)(tex) {
+                key.texture = Some(tex);
+            }
+        }
         let sub = *self.groups.entry(key.id()).or_insert_with(|| {
             self.mesh.submeshes.push(Submesh { blend: key.blend, two_sided: key.two_sided, base_color: key.color, emissive: key.emissive, glow_mask: key.glow_mask, ..Submesh::new(vec![], key.texture) });
             self.mesh.submeshes.len() - 1
@@ -398,7 +454,7 @@ mod tests {
         b.extend(object(&[member(7, 9, &blob(&tris))]));
         b.extend([0u8; 12]);
 
-        let m = decode_archive(&b, |_| false).unwrap();
+        let m = decode_archive(&b, false, |_| false).unwrap();
         assert_eq!(m.vertices.len(), 4);
         // (-25, 25, 0) * M + t = (-24, 2, 28); Z negated for the right-handed output -> -28
         assert_eq!(m.vertices[0].pos, [-24.0, 2.0, -28.0]);
@@ -409,6 +465,47 @@ mod tests {
         assert_eq!(m.submeshes.len(), 1);
         assert_eq!(m.submeshes[0].indices, vec![0, 2, 1, 3, 1, 2]);
         assert!(m.submeshes[0].texture.is_none());
+    }
+
+    /// Two untextured `SimpleMesh`es (one triangle each) that merge into one submesh; a statel texture override on
+    /// slot 1 must split the second one off with the override texture (`NewTextureData_t`, see `decode_statel_mesh`).
+    #[test]
+    fn statel_override_replaces_the_texture_of_one_slot() {
+        const NAMES: [&str; 7] = ["obj", "data", "mesh", "vb_desc", "vertices", "trilist", "triangles"];
+        let mut b = vec![];
+        for x in [3u32, 0, 0, 1, NAMES.len() as u32] {
+            b.extend(x.to_le_bytes());
+        }
+        for n in NAMES {
+            b.extend(format!("1\0{n}\0").bytes());
+        }
+        b.extend(6u32.to_le_bytes());
+        let fl = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        let r = |v: &[i32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        b.extend(object(&[member(0, 0x11, &r(&[0]))]));
+        b.extend(object(&[member(1, 0x11, &r(&[1]))]));
+        b.extend(object(&[member(2, 0x11, &r(&[2, 3]))]));
+        let vb = fl(&[0., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 1., 0., 0., 1., 0., 1., 0., 0., 1., 1.]);
+        let mut desc = vec![];
+        for x in [16u32, 65536, 0x112, 3] {
+            desc.extend(x.to_le_bytes());
+        }
+        for tri in [4, 5] {
+            b.extend(object(&[member(3, 9, &desc), member(4, 9, &blob(&vb)), member(5, 0x11, &r(&[tri]))]));
+        }
+        let tris: Vec<u8> = [0u16, 1, 2].iter().flat_map(|i| i.to_le_bytes()).collect();
+        for _ in 0..2 {
+            b.extend(object(&[member(6, 9, &blob(&tris))]));
+        }
+        b.extend([0u8; 12]);
+
+        assert_eq!(decode_archive(&b, false, |_| true).unwrap().submeshes.len(), 1);
+        let key = TextureKey { rdb_type: OVERRIDE_TEXTURES, id: 77 };
+        let m = decode_archive_with(&b, false, &[(1, 77)], |k| k == key).unwrap();
+        assert_eq!(m.submeshes.len(), 2);
+        assert_eq!((m.submeshes[0].texture, m.submeshes[1].texture), (None, Some(key)));
+        // an override whose texture does not exist leaves the slot as authored
+        assert_eq!(decode_archive_with(&b, false, &[(1, 77)], |_| false).unwrap().submeshes.len(), 1);
     }
 
     #[test]
@@ -425,7 +522,7 @@ mod tests {
         b.extend(object(&[member(0, 0x11, &r(&[0]))]));
         b.extend(object(&[member(1, 0x11, &r(&[0x4d00_0000]))]));
         b.extend([0u8; 12]);
-        assert!(decode_archive(&b, |_| false).is_err());
+        assert!(decode_archive(&b, false, |_| false).is_err());
     }
 
     /// One triangle with a `FAFMaterial_t` (diffuse, opacity) and a material `RDeltaState` holding `states`.
@@ -464,7 +561,7 @@ mod tests {
         }
         b.extend(object(&ds));
         b.extend([0u8; 12]);
-        let mut m = decode_archive(&b, |_| false).unwrap();
+        let mut m = decode_archive(&b, false, |_| false).unwrap();
         assert_eq!(m.submeshes.len(), 1);
         m.submeshes.remove(0)
     }

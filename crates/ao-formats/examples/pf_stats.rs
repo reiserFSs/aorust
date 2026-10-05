@@ -29,6 +29,8 @@ fn main() -> anyhow::Result<()> {
     let mut empty: Vec<u32> = Vec::new();
     let mut lit: Vec<(usize, u32)> = Vec::new();
     let mut light_total = 0usize;
+    let (mut sounds, mut fogs, mut no_mesh) = (0usize, 0usize, 0usize);
+    let mut sound_ids = std::collections::BTreeSet::new();
     for (id, name) in &all {
         if !only.is_empty() && !only.contains(id) {
             continue;
@@ -45,6 +47,10 @@ fn main() -> anyhow::Result<()> {
                     *mesh_errors.entry(e).or_default() += 1;
                 }
                 light_total += scene.lights.len();
+                sounds += r.sounds.len();
+                fogs += r.fogs.len();
+                no_mesh += r.no_mesh_statels;
+                sound_ids.extend(r.sounds.iter().map(|e| e.sound_id));
                 if !scene.lights.is_empty() {
                     lit.push((scene.lights.len(), *id));
                 }
@@ -71,6 +77,7 @@ fn main() -> anyhow::Result<()> {
     println!("ok={ok} failed={failed} statels={statels} instances={instances} statels-without-mesh={missing} mesh-decode-failures={mesh_fail}");
     println!("spawn checks: {} ok, {} failed, {} empty playfields (no rooms/statels in the data: {empty:?})", ok - spawn_bad.len() - empty.len(), spawn_bad.len(), empty.len());
     lit.sort_by_key(|a| std::cmp::Reverse(a.0));
+    println!("statel sound emitters {sounds} ({} distinct ids), fog volumes {fogs}, mesh-0 statels {no_mesh}", sound_ids.len());
     println!("lights: {light_total} in {} playfields; most: {:?}", lit.len(), &lit[..lit.len().min(8)]);
     if !only.is_empty() {
         println!("per playfield (count, id): {lit:?}");
