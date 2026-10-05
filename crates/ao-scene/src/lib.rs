@@ -276,15 +276,18 @@ mod tests {
     #[test]
     fn statel_modes_follow_the_zone_state_table() {
         let l = lod();
-        let pick = |i: usize, levels: [u8; 2]| l.pick(&l.items[i], &levels);
+        let pick = |i: usize, levels: [u8; 2], prev: bool| l.pick(&l.items[i], &levels, prev);
         // file list 3 -> zone list 0 (small clutter): only within the nearest band
-        assert_eq!([pick(1, [1, 0]), pick(1, [2, 0]), pick(1, [0, 0])], [LodPick::Full, LodPick::Hidden, LodPick::Hidden]);
+        assert_eq!([pick(1, [1, 0], false).0, pick(1, [2, 0], false).0, pick(1, [0, 0], false).0], [LodPick::Full, LodPick::Hidden, LodPick::Hidden]);
         // file list 0 -> zone list 3, flag 8: full out to level 4, mode 1 (reduced) at level 5, mode 2 (reduced) at level 0
-        assert_eq!([pick(0, [4, 0]), pick(0, [5, 0]), pick(0, [0, 0])], [LodPick::Full, LodPick::Reduced, LodPick::Reduced]);
-        // file list 1 -> zone list 2 without flag 8 / reduced mesh: mode 1 keeps the full mesh, mode 2 finds no record
-        assert_eq!([pick(3, [3, 0]), pick(3, [4, 0]), pick(3, [5, 0]), pick(3, [0, 0])], [LodPick::Full, LodPick::Full, LodPick::Hidden, LodPick::Hidden]);
+        assert_eq!([pick(0, [4, 0], false).0, pick(0, [5, 0], false).0, pick(0, [0, 0], false).0], [LodPick::Full, LodPick::Reduced, LodPick::Reduced]);
+        // file list 1 -> zone list 2, no flag 8 / reduced record: mode 1 (level 4) keeps what it showed last, mode 2 (5) finds no record
+        assert_eq!(pick(3, [3, 0], false), (LodPick::Full, false));
+        assert_eq!(pick(3, [4, 0], false), (LodPick::Full, false));
+        assert_eq!(pick(3, [5, 0], false), (LodPick::Hidden, true));
+        assert_eq!(pick(3, [4, 0], true), (LodPick::Hidden, true));
         // global statel (zone list 4): state 2 (mode 1) only at level 0; the best mode of its zones wins
-        assert_eq!((pick(2, [5, 5]), pick(2, [0, 0]), pick(2, [0, 1])), (LodPick::Full, LodPick::Reduced, LodPick::Full));
+        assert_eq!((pick(2, [5, 5], false).0, pick(2, [0, 0], false).0, pick(2, [0, 1], false).0), (LodPick::Full, LodPick::Reduced, LodPick::Full));
         assert_eq!(l.zone_items, vec![vec![0, 1, 2, 3], vec![2]]);
     }
 }
@@ -368,22 +371,35 @@ impl StatelLod {
         }
     }
 
-    /// What `item` shows when its zones are at `levels`.
-    pub fn pick(&self, item: &LodItem, levels: &[u8]) -> LodPick {
+    /// What `item` shows when its zones are at `levels`, given whether its current identity is the reduced mesh
+    /// (`ident_reduced`, the controller's `+0x14` word, initially the full mesh); returns the pick and the new identity.
+    /// `FUN_100241ab` changes the identity only for mode 0 (full), mode 1 with flag 8 and mode 2 (reduced): a statel
+    /// without flag 8 at mode 1, or one that was hidden, keeps whatever it showed last.
+    pub fn pick(&self, item: &LodItem, levels: &[u8], ident_reduced: bool) -> (LodPick, bool) {
         // state -> mode (`local_18` of FUN_10028577: 1 -> 2, 2 -> 1, 3 -> 0); the statel uses the lowest mode requested
-        let mode = item.zones.iter().filter_map(|&z| match Self::STATE[levels[z as usize] as usize][[3, 2, 1, 0, 4][item.class as usize]] {
-            0 => None,
-            1 => Some(2),
-            2 => Some(1),
-            _ => Some(0),
-        }).min();
-        match mode {
-            None => LodPick::Hidden,
-            Some(0) => LodPick::Full,
-            // mode 1 switches to the reduced mesh only for statels with flag 8, otherwise the mesh stays as it is (full)
-            Some(1) if !item.flag8 => LodPick::Full,
-            // mode 2 always asks for 0xf696a; without that record nothing is created
-            Some(_) => if item.reduced.is_some() { LodPick::Reduced } else { LodPick::Hidden },
-        }
+        let mode = item
+            .zones
+            .iter()
+            .filter_map(|&z| match Self::STATE[levels[z as usize] as usize][[3, 2, 1, 0, 4][item.class as usize]] {
+                0 => None,
+                1 => Some(2),
+                2 => Some(1),
+                _ => Some(0),
+            })
+            .min();
+        let Some(mode) = mode else { return (LodPick::Hidden, ident_reduced) };
+        let reduced = match mode {
+            0 => false,
+            1 if item.flag8 => true,
+            1 => ident_reduced,
+            _ => true,
+        };
+        // a reduced identity without a 1010026 record creates no visual
+        let pick = match (reduced, item.reduced.is_some()) {
+            (false, _) => LodPick::Full,
+            (true, true) => LodPick::Reduced,
+            (true, false) => LodPick::Hidden,
+        };
+        (pick, reduced)
     }
 }

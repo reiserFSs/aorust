@@ -48,6 +48,9 @@ pub struct Emitter {
 /// Everything the statel file holds for one zone (outdoor tile block or dungeon room); `global` is zone-independent.
 #[derive(Debug, Default)]
 pub struct Zone {
+    /// Outdoor zones: indices into the global statel list (compacted: mesh id 0 entries do not exist) of the global
+    /// statels this zone keeps visible (`FUN_100275f6`, N3 @0x100275f6 resolves them against the controller's list).
+    pub global_refs: Vec<u16>,
     pub statels: Vec<Statel>,
     pub lights: Vec<Light>,
     pub fogs: Vec<Emitter>,
@@ -56,6 +59,8 @@ pub struct Zone {
 
 #[derive(Debug, Default)]
 pub struct StatelFile {
+    /// The outdoor zone layout was used (statels are under distance control).
+    pub outdoor: bool,
     pub global: Zone,
     pub zones: Vec<Zone>,
 }
@@ -180,8 +185,9 @@ fn zone(d: &[u8], a: usize, b: usize, layout: Layout) -> Result<Zone> {
     let mut z = Zone::default();
     match layout {
         Layout::Outdoor => {
-            let k = r.u16()? as usize;
-            r.skip(2 * k)?;
+            for _ in 0..r.u16()? {
+                z.global_refs.push(r.u16()?);
+            }
             statels(&mut r, &mut z.statels, 0)?;
             statels(&mut r, &mut z.statels, 1)?;
         }
@@ -213,7 +219,7 @@ fn parse_layout(d: &[u8], count: usize, layout: Layout) -> Result<StatelFile> {
         let b = offs.get(i + 1).copied().unwrap_or(d.len());
         zones.push(zone(d, a, b, layout)?);
     }
-    Ok(StatelFile { global, zones })
+    Ok(StatelFile { outdoor: layout == Layout::Outdoor, global, zones })
 }
 
 /// Parses with the layout expected for the playfield type, falling back to the other one
@@ -316,6 +322,20 @@ mod tests {
         assert_eq!(zone(&dg, 0, dg.len(), Layout::Dungeon).unwrap().statels[0].mesh, 6255);
         // the same bytes are not a valid outdoor zone
         assert!(zone(&dg, 0, dg.len(), Layout::Outdoor).is_err());
+    }
+
+    #[test]
+    fn outdoor_zone_keeps_its_global_statel_refs() {
+        // k = 2 global refs (3, 7), then lists 0..3 (list 2 holds one statel), lights
+        let mut o = 2u16.to_le_bytes().to_vec();
+        o.extend([3, 0, 7, 0]);
+        o.extend(0u16.to_le_bytes());
+        o.extend(0u16.to_le_bytes());
+        o.extend(1u16.to_le_bytes());
+        o.extend(statel_bytes(5.0, 0x2d00, 201717, 0));
+        o.extend([0u8; 4]);
+        let z = zone(&o, 0, o.len(), Layout::Outdoor).unwrap();
+        assert_eq!((z.global_refs, z.statels[0].list), (vec![3, 7], 2));
     }
 
     #[test]

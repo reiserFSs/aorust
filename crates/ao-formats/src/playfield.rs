@@ -39,6 +39,8 @@ use statel::{Layout, Statel};
 const RECORD: u32 = 1_000_001;
 const STATELS: u32 = 1_000_003;
 const TILEMAP: u32 = 1_000_009;
+/// `VisualCamera_t::GetLengthOfViewcone` (far - near) at the default view distance.
+const LOD_VIEW_LENGTH: f32 = environment::VIEW_DISTANCE - environment::NEAR;
 
 /// Playfield ids with name, for `aomac view --list`.
 pub fn list_playfields(store: &RecordStore) -> Result<Vec<(u32, String)>> {
@@ -112,6 +114,7 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
     let environment = environment::to_scene(&env, rec.is_outdoor(), sky.as_ref());
     if let (Some(s), Some(t), true) = (&sky, &tweaks, rec.is_outdoor()) {
         sky::emit(s, t, store, &mut scene, environment.fog_color, environment.fog_end);
+        sky::emit_distant(t, store, &mut scene);
     }
     scene.environment = Some(environment);
     let mut report = Report::default();
@@ -119,6 +122,8 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
     let mut terrain = None;
     let mut grid = None;
     let mut props: Vec<Vec<[f32; 3]>> = Vec::new();
+    let mut lod_items: Vec<Placed> = Vec::new();
+    let (mut lod_zone_size, mut lod_tiles_x, mut lod_count) = (0.0f32, 0usize, 0usize);
     if rec.is_outdoor() {
         let d = store.get(TILEMAP, rec.tilemap)?.ok_or_else(|| anyhow!("playfield {id}: no tilemap {}", rec.tilemap))?;
         let tm = ground::parse(&d).with_context(|| format!("tilemap {}", rec.tilemap))?;
@@ -134,15 +139,34 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
         let layout = if rec.is_outdoor() { Layout::Outdoor } else { Layout::Dungeon };
         let file = statel::parse(&d, rec.count as usize, layout).with_context(|| format!("statels of playfield {id}"))?;
         let mut placer = Placer { store, scene: &mut scene, cache: HashMap::new(), report: &mut report };
+        // outdoor statels are under the client's zone LOD (`StatelLod`); global statels (the compacted list of mesh != 0
+        // entries) are shown by the zones whose index list names them
+        let tiles_x = terrain.as_ref().map_or(0, |t| t.cells_x / rec.zone_size.max(1) as usize);
+        let lod = file.outdoor && tiles_x > 0;
+        let mut globals: Vec<usize> = Vec::new();
         for s in &file.global.statels {
-            placer.place(s, None);
+            if let Some(it) = placer.place(s, None, 4) {
+                globals.push(lod_items.len());
+                lod_items.push(it);
+            }
         }
         for (i, zone) in file.zones.iter().enumerate() {
             let room = rec.rooms.get(i);
             for s in &zone.statels {
-                placer.place(s, room);
+                if let Some(mut it) = placer.place(s, room, s.list) {
+                    it.zones.push(i as u32);
+                    lod_items.push(it);
+                }
+            }
+            for &g in &zone.global_refs {
+                if let Some(&k) = globals.get(g as usize) {
+                    lod_items[k].zones.push(i as u32);
+                }
             }
         }
+        lod_zone_size = terrain.as_ref().map_or(0.0, |t| t.cell_size * rec.zone_size as f32);
+        lod_tiles_x = if lod { tiles_x } else { 0 };
+        lod_count = file.zones.len();
         report.unique_meshes = placer.cache.values().filter(|m| m.is_some()).count();
         for (i, zone) in file.zones.iter().enumerate() {
             let frame = rec.rooms.get(i).map(|r| (statel::ry(r.rot as f32 * std::f32::consts::FRAC_PI_2), r.pos));
@@ -191,6 +215,9 @@ pub fn load_playfield_report_at(store: &RecordStore, client_dir: &Path, id: u32,
             None => spawn::density_spawn(&boxes, &|_, _| Some(low), 1.7),
         };
     }
+    if lod_tiles_x > 0 {
+        add_lod(store, &mut scene, &mut report, lod_items, lod_tiles_x, lod_zone_size, lod_count);
+    }
     scene.spawn = spot.map(|s| s.eye);
     scene.spawn_look_at = spot.map(|s| s.at);
     Ok((scene, report))
@@ -207,8 +234,19 @@ fn terrain_height(tm: &ground::Tilemap, x: f32, z: f32) -> Option<f32> {
     Some(a * (1.0 - az) + b * az)
 }
 
-/// A statel's mesh record plus its texture-override attributes: each distinct pair is one decoded scene mesh.
-type MeshKey = (u32, Vec<(u8, u32)>);
+/// A statel's mesh record type and id plus its texture-override attributes: each distinct triple is one decoded scene mesh.
+type MeshKey = (u32, u32, Vec<(u8, u32)>);
+
+/// A placed statel awaiting its LOD bookkeeping.
+struct Placed {
+    instance: usize,
+    mesh: u32,
+    attrs: Vec<(u8, u32)>,
+    transform: [[f32; 4]; 4],
+    flag8: bool,
+    class: u8,
+    zones: Vec<u32>,
+}
 
 struct Placer<'a> {
     store: &'a RecordStore,
@@ -218,11 +256,12 @@ struct Placer<'a> {
 }
 
 impl Placer<'_> {
-    fn mesh(&mut self, id: u32, attrs: &[(u8, u32)]) -> Option<usize> {
-        if let Some(&m) = self.cache.get(&(id, attrs.to_vec())) {
+    fn mesh(&mut self, rdb_type: u32, id: u32, attrs: &[(u8, u32)]) -> Option<usize> {
+        let key = (rdb_type, id, attrs.to_vec());
+        if let Some(&m) = self.cache.get(&key) {
             return m;
         }
-        let m = match crate::mesh::decode_statel_mesh(self.store, id, attrs, self.scene) {
+        let m = match crate::mesh::decode_statel_mesh(self.store, rdb_type, id, attrs, self.scene) {
             Ok(m) => m,
             Err(e) => {
                 self.report.first_mesh_error.get_or_insert_with(|| format!("mesh {id}: {e:#}"));
@@ -230,22 +269,23 @@ impl Placer<'_> {
                 None
             }
         };
-        self.cache.insert((id, attrs.to_vec()), m);
+        self.cache.insert(key, m);
         m
     }
 
-    fn place(&mut self, s: &Statel, room: Option<&Room>) {
+    /// Places statel `s` (zone list `class`, 4 = global); returns the placement for the LOD pass.
+    fn place(&mut self, s: &Statel, room: Option<&Room>, class: u8) -> Option<Placed> {
         self.report.statels += 1;
         if s.mesh == 0 {
             self.report.no_mesh_statels += 1;
-            return;
+            return None;
         }
-        let Some(mesh) = self.mesh(s.mesh, &s.attrs) else {
+        let Some(mesh) = self.mesh(crate::mesh::MESH_TYPE, s.mesh, &s.attrs) else {
             self.report.missing_meshes += 1;
             if !self.report.missing_mesh_ids.contains(&s.mesh) {
                 self.report.missing_mesh_ids.push(s.mesh);
             }
-            return;
+            return None;
         };
         let mut r = statel::orientation(s.flags, s.scale);
         let mut p = s.pos;
@@ -258,8 +298,29 @@ impl Placer<'_> {
                 q[2][0] * p[0] + q[2][1] * p[1] + q[2][2] * p[2] + room.pos[2],
             ];
         }
-        self.scene.instances.push(Instance { mesh, transform: to_scene(&r, p) });
+        let transform = to_scene(&r, p);
+        self.scene.instances.push(Instance { mesh, transform });
+        Some(Placed { instance: self.scene.instances.len() - 1, mesh: s.mesh, attrs: s.attrs.clone(), transform, flag8: s.flags & 8 != 0, class, zones: Vec::new() })
     }
+}
+
+/// Builds `Scene::statel_lod`: appends the reduced-mesh (rdb 1010026) twin of every statel that has one, after all
+/// fixed content so spawn selection does not see them. Items without a zone (global statels no zone references) are
+/// never created by the client either and stay hidden (`pick` with no zones).
+fn add_lod(store: &RecordStore, scene: &mut Scene, report: &mut Report, items: Vec<Placed>, tiles_x: usize, zone_size: f32, zone_count: usize) {
+    let zones = (0..zone_count).map(|i| [((i % tiles_x) as f32 + 0.5) * zone_size, -(((i / tiles_x) as f32 + 0.5) * zone_size)]).collect();
+    let mut placer = Placer { store, scene: &mut *scene, cache: HashMap::new(), report };
+    let items = items
+        .into_iter()
+        .map(|it| {
+            let reduced = placer.mesh(crate::mesh::MESH_LOW_TYPE, it.mesh, &it.attrs).map(|mesh| {
+                placer.scene.instances.push(Instance { mesh, transform: it.transform });
+                placer.scene.instances.len() - 1
+            });
+            ao_scene::LodItem { full: it.instance, reduced, flag8: it.flag8, class: it.class, zones: it.zones }
+        })
+        .collect();
+    scene.statel_lod = Some(ao_scene::StatelLod::new(LOD_VIEW_LENGTH, zones, items));
 }
 
 /// AO (left-handed) `T * L` (`L` = linear part) -> scene (z negated) column-major matrix: `F M F`, `F = diag(1,1,-1)`.

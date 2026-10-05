@@ -54,12 +54,12 @@ pub fn decode_record_into(store: &RecordStore, rdb_type: u32, id: u32, scene: &m
 /// Texture used by statel attribute overrides: `NewTextureData_t` ids are 1010004 records (`acg_tiles_metal_corroded_plain.png`, ...).
 const OVERRIDE_TEXTURES: u32 = 1_010_004;
 
-/// A statel's mesh with its attributes applied: `(slot, texture id)` pairs replace the texture of the `slot`-th
+/// A statel's mesh (`rdb_type` = [`MESH_TYPE`] or the reduced [`MESH_LOW_TYPE`]) with its attributes applied: `(slot, texture id)` pairs replace the texture of the `slot`-th
 /// `SimpleMesh` (counted over the whole node tree in traversal order, empty ones included). Statel attributes are
 /// `std::vector<NewTextureData_t>` (`{i32 slot, u32 texture}`, 8 bytes) handed to `VisualMesh_t::SetMesh` (DisplaySystem
 /// @0x1006b623) -> `AsyncMesh` (@0x1007125c) -> `FUN_100714c2`; see `docs/formats.md` § playfields.
-pub fn decode_statel_mesh(store: &RecordStore, id: u32, overrides: &[(u8, u32)], scene: &mut Scene) -> Result<Option<usize>> {
-    decode_record(store, MESH_TYPE, id, scene, false, overrides)
+pub fn decode_statel_mesh(store: &RecordStore, rdb_type: u32, id: u32, overrides: &[(u8, u32)], scene: &mut Scene) -> Result<Option<usize>> {
+    decode_record(store, rdb_type, id, scene, false, overrides)
 }
 
 /// Like [`decode_mesh_into`] but with the vertices exactly as stored (node object space, the frame tree's matrices are
