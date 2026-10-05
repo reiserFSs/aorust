@@ -40,8 +40,8 @@ fn texture_key(store: &RecordStore, scene: &mut Scene, id: u16) -> Option<Textur
     let key = TextureKey { rdb_type: TILE_TEXTURES, id: id as u32 };
     if !scene.textures.contains_key(&key) {
         let b = store.get(TILE_TEXTURES, id as u32).ok()??;
-        let at = b.windows(3).position(|w| w == [0xff, 0xd8, 0xff])?; // 24 byte header before the JPEG
-        scene.textures.insert(key, crate::texture::decode_texture(&b[at..]).ok()?);
+        // 24 zero bytes, then a JPEG (417 tiles) or an RGBA PNG (432 Shadowlands tiles, alpha always 255)
+        scene.textures.insert(key, crate::texture::decode_texture(b.get(24..)?).ok()?);
     }
     Some(key)
 }
@@ -76,13 +76,19 @@ fn weight_of(w: &[(u16, u8); 4], n: usize, total: f32, t: u16) -> f32 {
 pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene) -> Result<()> {
     let (cx, cz, cs) = (tm.cells_x, tm.cells_z, tm.cell_size);
     // texture id per cell
-    let tex: Vec<u16> = (0..cz).flat_map(|z| (0..cx).map(move |x| (x, z))).map(|(x, z)| tm.tile_texture.get(tm.tile(x, z) as usize).copied().unwrap_or(NONE)).collect();
-    let mut keys: BTreeMap<u16, Option<TextureKey>> = BTreeMap::new();
+    let mut tex: Vec<u16> = (0..cz).flat_map(|z| (0..cx).map(move |x| (x, z))).map(|(x, z)| tm.tile_texture.get(tm.tile(x, z) as usize).copied().unwrap_or(NONE)).collect();
+    let mut keys: BTreeMap<u16, TextureKey> = BTreeMap::new();
+    let mut missing = std::collections::BTreeSet::new();
     for &t in &tex {
-        if t != NONE && !keys.contains_key(&t) {
-            keys.insert(t, texture_key(store, scene, t));
+        if t != NONE && !keys.contains_key(&t) && !missing.contains(&t) {
+            match texture_key(store, scene, t) {
+                Some(k) => drop(keys.insert(t, k)),
+                None => drop(missing.insert(t)),
+            }
         }
     }
+    // cells whose tile texture does not exist stay untextured and are never blended
+    tex.iter_mut().filter(|t| missing.contains(t)).for_each(|t| *t = NONE);
     let shade = store.get(SHADOWS, id).ok().flatten().and_then(|d| shadow::parse(&d).ok()).and_then(|l| l.into_iter().nth(SUN_LAYER));
     let normal = |x: usize, z: usize| -> [f32; 3] {
         let (x0, x1) = (x.saturating_sub(1), (x + 1).min(tm.verts_x - 1));
@@ -158,11 +164,11 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene) -> R
                 }
             }
             for (t, indices) in base {
-                let texture = keys.get(&t).copied().flatten();
+                let texture = keys.get(&t).copied();
                 mesh.submeshes.push(Submesh::new(indices, texture));
             }
             for (t, indices) in over {
-                let mut s = Submesh::new(indices, keys.get(&t).copied().flatten());
+                let mut s = Submesh::new(indices, keys.get(&t).copied());
                 s.blend = Blend::AlphaBlend;
                 mesh.submeshes.push(s);
             }
