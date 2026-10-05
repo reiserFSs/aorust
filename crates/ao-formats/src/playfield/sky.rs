@@ -200,9 +200,9 @@ pub struct Sky {
     sun2_ao: [f32; 3],
     /// `GAME.CurrentDayTime` the sky was evaluated at.
     day_time: f32,
-}
     /// `GAME.CurrentNightIntensity` (`NightIntensity` track of `Tweak_GAME.txt`, 1 when the script has none).
     night: f32,
+}
 
 /// `DayTimeForGroundShadows = GameDayTime * 15`.
 pub fn ground_shadow_time(day_time: f32) -> f32 {
