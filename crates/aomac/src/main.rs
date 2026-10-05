@@ -117,6 +117,11 @@ enum What {
         /// Clip time in seconds (with --role).
         #[arg(long, default_value_t = 0.0)]
         time: f32,
+        /// Directory with a `CharacterViewer.xml` appearance cache: shows its entry `--char-id` (breed/gender/skin/head are then taken from the cache).
+        #[arg(long)]
+        cache: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        char_id: i32,
     },
     /// Synthetic test scene.
     Demo {
@@ -205,9 +210,17 @@ fn main() -> Result<()> {
                         (None, Some(a)) => ao_formats::character::load_character_posed(&store, id, a, time)?,
                     }
                 }
-                What::Player { breed, gender, head, skin, role, time } => {
-                    let player = ao_formats::character::Player::new(breed, gender, skin, head);
-                    ao_formats::character::load_player(&RecordStore::open(&dir)?, &player, role.map(|r| (r, time)))?
+                What::Player { breed, gender, head, skin, role, time, cache, char_id } => {
+                    let store = RecordStore::open(&dir)?;
+                    let pose = role.map(|r| (r, time));
+                    match cache {
+                        // the select-screen preview of a cached character (CharacterViewer.xml in `cache`)
+                        Some(d) => {
+                            let c = ao_formats::character::ViewerCache::load(&d).0.remove(&char_id).with_context(|| format!("no character {char_id} in {}", d.display()))?;
+                            ao_formats::character::load_cached_character(&store, &c, pose)?
+                        }
+                        None => ao_formats::character::load_player(&store, &ao_formats::character::Player::new(breed, gender, skin, head), pose)?,
+                    }
                 }
                 What::Mesh { id } => ao_formats::mesh::load_mesh(&RecordStore::open(&dir)?, id)?,
                 What::Pf { list: true, .. } => {

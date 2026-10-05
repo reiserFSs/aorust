@@ -428,22 +428,28 @@ pub fn overlay_on_skin(skin: &Texture, cloth: &Texture) -> Texture {
 /// Key of a skin/cloth composite: a type with this bit set carries the skin id, `id` the cloth texture id.
 const COMPOSITE: u32 = 0x4000_0000;
 
-/// The textures of a player's body materials, as `VisualCATMesh_t::SetSkinData` [DisplaySystem 0x1007298b →
-/// 0x10070439] and the cloth list set them: layer 0 = the naked skin of every [`ClothPart`]; layer 2 = the worn
-/// cloth texture, composited over the skin. The model's own `*_default.png` (layer 1) is **not** used: for a
-/// player (mesh with a head, `FUN_10058078` @Gamecode 0x10058078) no layer-1 texture is ever set, and the
-/// record's base texture is null (`FUN_1007269e`), so `FUN_1007457f` yields the skin alone when nothing is worn.
-fn part_textures(names: &NameTable, store: &RecordStore, p: &Player) -> Result<PartTextures> {
+/// The textures of a player's body materials. `VisualCATMesh_t::SetSkinData` [DisplaySystem 0x1007298b → 0x10070439] puts the
+/// naked skin of every [`ClothPart`] on layer 0 of the material of that name; what is drawn over it is the worn cloth
+/// (layer 2), and with nothing worn the model's own texture of that material (`*_default.png`, layer 1), composited by
+/// `FUN_10074393` with the green key cut out. The retail creation screen shows exactly that (olive/brown suits for Solitus,
+/// white top + orange trousers for Opifex, black suits for Nanomage, orange vest for Atrox, skin-coloured hands and faces
+/// from the green `hands_*_default.png`). `[INFERENCE]` the static trace did not find the writer of the layer-1 slot
+/// (`FUN_10072763` is only reached from `FUN_10073e4f`; records start with a null base, `FUN_1007269e`), so "default
+/// texture = layer 1 under the cloth" rests on the screenshot and the green-keyed data, see docs/formats.md § Skin.
+fn part_textures(names: &NameTable, store: &RecordStore, model: u32, p: &Player) -> Result<PartTextures> {
+    let mesh = load_cat_mesh(store, CHAR_MESH_TYPE, model)?;
     let mut out = PartTextures::new();
     for part in ClothPart::ALL {
         let Some(id) = names.id(SKIN_TYPE, &skin_texture_name(p.breed, p.gender, p.skin, part)) else { continue };
         let key = TextureKey { rdb_type: SKIN_TYPE, id };
         let Some(skin) = load_texture(store, key)? else { continue };
-        let worn = p.equipment.0[part as usize].and_then(|t| Some((t, load_texture(store, TextureKey { rdb_type: TEXTURE_TYPE, id: t }).ok()??)));
+        let own = mesh.parts.iter().find(|m| m.name == part.name()).map(|m| m.texture).filter(|&t| t != 0);
+        let over = p.equipment.0[part as usize].or(own);
+        let over = over.and_then(|t| Some((t, load_texture(store, TextureKey { rdb_type: TEXTURE_TYPE, id: t }).ok()??)));
         out.insert(
             part.name().to_string(),
-            match worn {
-                Some((t, cloth)) => (TextureKey { rdb_type: COMPOSITE | id, id: t }, overlay_on_skin(&skin, &cloth)),
+            match over {
+                Some((t, tex)) => (TextureKey { rdb_type: COMPOSITE | id, id: t }, overlay_on_skin(&skin, &tex)),
                 None => (key, skin),
             },
         );
@@ -488,8 +494,25 @@ pub fn load_player_build(store: &RecordStore, p: &Player, build: u8, pose: Optio
         Some(n) => all.iter().find(|h| h.0 == n).with_context(|| format!("no head {n} for {p:?}"))?.1,
         None => all.first().with_context(|| format!("no heads for {p:?}"))?.1,
     };
+    build_player(store, &names, model, head, p, pose)
+}
+
+/// Body `model` (rdb 1010002) with head mesh `head` (rdb 1010001) and the skin/cloth textures of `p`.
+fn build_player(store: &RecordStore, names: &NameTable, model: u32, head: u32, p: &Player, pose: Option<(Role, f32)>) -> Result<Scene> {
     let pose = pose.map(|(r, t)| role_anim(store, model, &r).map(|a| (a, t))).transpose()?;
-    load_character_head_skin(store, model, Some(head), pose, &part_textures(&names, store, p)?)
+    load_character_head_skin(store, model, Some(head), pose, &part_textures(names, store, model, p)?)
+}
+
+/// The select-screen preview of a cached character (`CharacterViewer_c::Update` 0x100054cd with a `prefs/CharacterViewer.xml`
+/// entry): the cached body model, head mesh and worn cloth; the skin race is that of the head's entry in the creation head table
+/// (`FUN_1011d29b`; Caucasian when the head is not in the table). Attractor meshes other than the head are not mounted.
+pub fn load_cached_character(store: &RecordStore, c: &super::CachedCharacter, pose: Option<(Role, f32)>) -> Result<Scene> {
+    let names = NameTable::load(store)?;
+    let (breed, gender) = crate::screens::wire_breed_sex(c.breed, c.sex)?;
+    let head = c.head_mesh();
+    let skin = head_table(store, breed, gender, 2)?.iter().find(|h| h.mesh == head).map_or(Skin::Caucasian, |h| h.skin);
+    let p = Player { breed, gender, skin, head: None, equipment: c.equipment() };
+    build_player(store, &names, u32::try_from(c.mesh_id).context("negative model id")?, head, &p, pose)
 }
 
 /// [`load_player`] with the default (caucasian) skin: the (breed, gender, head index) tuple of the

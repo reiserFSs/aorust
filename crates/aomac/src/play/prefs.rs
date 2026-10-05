@@ -25,8 +25,13 @@ pub struct Prefs {
     pub server: String,
 }
 
+/// aomac's prefs directory (stand-in for the client's `prefs/`; also holds `CharacterViewer.xml`).
+pub fn dir() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/aomac"))
+}
+
 fn path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/aomac/prefs.txt"))
+    Some(dir()?.join("prefs.txt"))
 }
 
 impl Prefs {

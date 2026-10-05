@@ -307,7 +307,7 @@ impl Play {
         self.playing = None;
         self.char_ready = false;
         self.preview_error = None;
-        self.worker = Some(preview::Worker::start(self.dir.clone(), breed, sex));
+        self.worker = Some(preview::Worker::start(self.dir.clone(), breed, sex, self.chars[i].info.id));
         let Ok((b, _)) = screens::wire_breed_sex(breed, sex) else { return };
         let mut p = LOGIN_CAMERA.pos;
         for (v, o) in p.iter_mut().zip(screens::CHAR_VIEWER_OFFSET) {

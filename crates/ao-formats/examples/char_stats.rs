@@ -147,10 +147,10 @@ fn main() -> anyhow::Result<()> {
         for build in 0..3 {
             scenes += 1;
             let p = Player::new(breed, gender, Skin::Caucasian, None);
-            skinned += usize::from(load_player_build(&store, &p, build, None).is_ok_and(|s| s.textures.keys().filter(|k| k.rdb_type == 1010011).count() == 5));
+            skinned += usize::from(load_player_build(&store, &p, build, None).is_ok_and(|s| s.textures.keys().filter(|k| k.rdb_type & 0x4000_0000 != 0).count() == 5));
         }
     }
-    println!("player bodies (thin/normal/fat) with all five slots skinned: {skinned}/{scenes}");
+    println!("player bodies (thin/normal/fat) with all five slots skin+default composited: {skinned}/{scenes}");
     Ok(())
 }
 

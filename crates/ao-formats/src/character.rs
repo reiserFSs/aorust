@@ -11,9 +11,11 @@ mod anim;
 mod cat;
 mod names;
 mod player;
+mod viewer_cache;
 
 pub use names::NameTable;
 pub use player::*;
+pub use viewer_cache::{CachedCharacter, ClothEntry, MeshEntry, ViewerCache};
 pub use anim::{CatAnim, Track};
 pub use cat::{Attractor, Bone, CatMesh, ColSphere, Material, Part, SkinVertex, SubMesh};
 
@@ -317,9 +319,9 @@ pub fn pose_detachment(store: &RecordStore, id: u32, anim_id: u32, time_s: f32) 
     Ok(worst)
 }
 
+/// The scene contract carries colours as `c^2.2`; the renderer shades in the client's gamma space and inverts that.
 fn linear(c: f32) -> f32 {
     c.max(0.0).powf(2.2)
-/// The scene contract carries colours as `c^2.2`; the renderer shades in the client's gamma space and inverts that.
 }
 
 /// Renderer material for one CAT material: blend from opacity and the texture's alpha channel
