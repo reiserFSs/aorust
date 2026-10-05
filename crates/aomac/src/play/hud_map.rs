@@ -373,8 +373,13 @@ impl HudMap {
                     if dx * dx + dz * dz > DOT_RANGE * DOT_RANGE {
                         continue;
                     }
-                    // UNRESOLVED: the original's colour per character class (MAPSQUARE_CLAN/OMNI/NEUTRAL/MONSTER/TEAMMEMBER)
-                    let name = if d.npc { "GFX_GUI_MAPSQUARE_MONSTER" } else { "GFX_GUI_MAPSQUARE_NEUTRAL" };
+                    // UNRESOLVED: the original's choice among MAPSQUARE_CLAN/OMNI/NEUTRAL/MONSTER/TEAMMEMBER/SHOP (by art name and `Side`)
+                    let name = match (d.npc, d.side) {
+                        (true, _) => "GFX_GUI_MAPSQUARE_MONSTER",
+                        (_, 1) => "GFX_GUI_MAPSQUARE_CLAN",
+                        (_, 2) => "GFX_GUI_MAPSQUARE_OMNI",
+                        _ => "GFX_GUI_MAPSQUARE_NEUTRAL",
+                    };
                     if let Some(g) = gui.gfx().id(name) {
                         let s = to_screen(d.pos[0], d.pos[2]);
                         items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, 4.0, 4.0], dst: [s[0].floor() - 2.0, s[1].floor() - 2.0, s[0].floor() + 2.0, s[1].floor() + 2.0], alpha: 1.0 });
@@ -507,4 +512,148 @@ fn pick_planet_map(client: &std::path::Path, pf: Option<u32>) -> anyhow::Result<
         }
     }
     Ok(rubika)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::play::zone::DynelState;
+    use ao_formats::screens::TextDb;
+    use ao_gui::{DrawList, InputEvent, MouseButton};
+    use ao_render::{Frontend, Host, Offscreen};
+    use std::time::{Duration, Instant};
+
+    struct Shot {
+        gui: Gui,
+        map: HudMap,
+        zone: Zone,
+    }
+
+    impl Frontend for Shot {
+        fn gui(&self) -> &Gui {
+            &self.gui
+        }
+        fn input(&mut self, ev: InputEvent, _host: &mut Host) {
+            for e in self.gui.input(ev) {
+                self.map.event(&mut self.gui, &e, &self.zone);
+            }
+        }
+        fn frame(&mut self, dt: f32, _size: (u32, u32), _host: &mut Host) -> DrawList {
+            self.map.update(&mut self.gui, &self.zone, dt);
+            self.gui.frame(dt)
+        }
+    }
+
+    fn shot() -> Option<(Shot, Offscreen)> {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/textures/PlanetMap").exists() {
+            eprintln!("skipping: no client");
+            return None;
+        }
+        let labels = TextDb::load(&dir).unwrap();
+        let gui = Gui::new(&dir, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
+        let s = Shot { gui, map: HudMap::new(&dir), zone: Zone::default() };
+        let o = Offscreen::new(&s, (640, 600)).unwrap();
+        Some((s, o))
+    }
+
+    fn png(s: &mut Shot, o: &mut Offscreen, name: &str) {
+        let mut list = DrawList::default();
+        for _ in 0..4 {
+            list = o.frame(s, 0.016);
+        }
+        if let Some(dir) = std::env::var_os("AOMAC_SHOT_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            o.png(s, &list, &std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
+        }
+    }
+
+    fn own_at(s: &mut Shot, playfield: u32, pos: [f32; 3], yaw: f32) {
+        s.zone.char_id = 7;
+        s.zone.playfield = Some(playfield);
+        s.zone.dynels.insert(7, DynelState { name: "Testy".into(), pos, yaw: Some(yaw), npc: false, side: 0, level: 1, health: 1, max_health: 1 });
+    }
+
+    /// Plays frames until the playfield map's worker delivered the ground image.
+    fn wait_ground(s: &mut Shot, o: &mut Offscreen) {
+        let t = Instant::now();
+        while s.map.pf.as_ref().is_some_and(|p| p.ground.is_none()) && t.elapsed() < Duration::from_secs(60) {
+            o.frame(s, 0.016);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// World position of an opaque ground pixel near the middle of the opaque area.
+    fn some_floor(s: &Shot) -> [f32; 3] {
+        let g = &s.map.pf.as_ref().unwrap().ground.as_ref().expect("no ground map").map;
+        let (mut sx, mut sy, mut n) = (0u64, 0u64, 0u64);
+        for (i, a) in g.rgba.chunks_exact(4).enumerate() {
+            if a[3] != 0 {
+                sx += i as u64 % g.width as u64;
+                sy += i as u64 / g.width as u64;
+                n += 1;
+            }
+        }
+        // the opaque pixel closest to the centroid
+        let (cx, cy) = ((sx / n) as i64, (sy / n) as i64);
+        let best = g.rgba.chunks_exact(4).enumerate().filter(|(_, a)| a[3] != 0).map(|(i, _)| (i as i64 % g.width as i64, i as i64 / g.width as i64)).min_by_key(|&(x, y)| (x - cx).pow(2) + (y - cy).pow(2)).unwrap();
+        [g.origin[0] + (best.0 as f32 + 0.5) * g.mpp, 0.0, g.origin[1] - (best.1 as f32 + 0.5) * g.mpp]
+    }
+
+    #[test]
+    fn playfield_maps() {
+        for (pf, tag) in [(4604u32, "arrival-hall"), (4582, "icc-shuttleport"), (566, "newland-city")] {
+            let Some((mut s, mut o)) = shot() else { return };
+            s.map.open(&mut s.gui, WindowKind::Map);
+            own_at(&mut s, pf, [0.0; 3], 0.0);
+            wait_ground(&mut s, &mut o);
+            let pos = some_floor(&s);
+            own_at(&mut s, pf, pos, 0.6);
+            png(&mut s, &mut o, &format!("map-{tag}"));
+            // a map upgrade (stat MapNavigation) turns the dot into the heading arrow
+            s.zone.stats.insert(STAT_MAP_NAVIGATION, 1);
+            png(&mut s, &mut o, &format!("map-{tag}-upgraded"));
+        }
+    }
+
+    #[test]
+    fn planet_map_follows_the_character_and_zooms() {
+        let Some((mut s, mut o)) = shot() else { return };
+        s.map.open(&mut s.gui, WindowKind::PlanetMap);
+        // Newland City, 100 m east of its origin
+        own_at(&mut s, 566, [100.0, 0.0, 200.0], 0.0);
+        png(&mut s, &mut o, "planet-566-level0");
+        let p = s.map.planet.as_ref().unwrap();
+        let lv = &p.map.as_ref().unwrap().index.levels[0];
+        let m = lv.locate(&p.map.as_ref().unwrap().coords[&566], 100.0, 200.0);
+        assert_eq!(p.center, m);
+        // the zoom-in button (first of the row), then drag the map: the view moves, the follow state is kept until the character moves
+        let w = s.map.planet.as_ref().unwrap().window;
+        let r = s.gui.view_rect(w, "buttons").unwrap();
+        let (x, y) = (r.l + 2.0 + 13.0, r.t + 13.0);
+        s.input(InputEvent::MouseMove { x, y }, &mut o.host);
+        s.input(InputEvent::MouseDown { x, y, button: MouseButton::Left }, &mut o.host);
+        s.input(InputEvent::MouseUp { x, y, button: MouseButton::Left }, &mut o.host);
+        assert_eq!(s.map.planet.as_ref().unwrap().level, 1);
+        png(&mut s, &mut o, "planet-566-level1");
+        let c = s.map.planet.as_ref().unwrap().center;
+        let mr = s.gui.view_rect(w, "map").unwrap();
+        let (x, y) = (mr.l + 100.0, mr.t + 100.0);
+        s.input(InputEvent::MouseMove { x, y }, &mut o.host);
+        s.input(InputEvent::MouseDown { x, y, button: MouseButton::Left }, &mut o.host);
+        s.input(InputEvent::MouseMove { x: x + 30.0, y: y + 10.0 }, &mut o.host);
+        s.input(InputEvent::MouseUp { x: x + 30.0, y: y + 10.0, button: MouseButton::Left }, &mut o.host);
+        let d = s.map.planet.as_ref().unwrap().center;
+        assert_eq!([d[0] - c[0], d[1] - c[1]], [-30.0, -10.0]);
+        // an indoor playfield has no entry in the coordinates: no marker, the view keeps its place
+        own_at(&mut s, 4604, [10.0, 0.0, 10.0], 0.0);
+        png(&mut s, &mut o, "planet-4604-no-marker");
+        // Shadowlands playfield: the Shadowlands map is picked
+        let some_sl = ao_formats::planetmap::PlanetMap::load(&ao_gui::client_dir(), SHADOWLANDS_INDEX).unwrap().coords.keys().copied().find(|k| !ao_formats::planetmap::PlanetMap::load(&ao_gui::client_dir(), RUBIKA_INDEX).unwrap().coords.contains_key(k));
+        if let Some(id) = some_sl {
+            own_at(&mut s, id, [100.0, 0.0, 100.0], 0.0);
+            png(&mut s, &mut o, "planet-shadowlands");
+            assert_eq!(s.map.planet.as_ref().unwrap().map.as_ref().unwrap().index.kind, "Shadowlands");
+        }
+    }
 }
