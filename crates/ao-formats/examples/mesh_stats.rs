@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
                     if m.vertices.is_empty() { empty += 1 } else { ok += 1 }
                     verts += m.vertices.len();
                     for sub in &m.submeshes {
-                        for t in sub.indices.chunks_exact(3) {
+                        for t in sub.indices.as_chunks::<3>().0 {
                             let [a, b, c] = [0, 1, 2].map(|k| m.vertices[t[k] as usize]);
                             let e1: [f32; 3] = std::array::from_fn(|k| b.pos[k] - a.pos[k]);
                             let e2: [f32; 3] = std::array::from_fn(|k| c.pos[k] - a.pos[k]);
