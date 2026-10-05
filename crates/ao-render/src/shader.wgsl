@@ -135,7 +135,12 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
     if mode == 1u && c.a < 0.5 {
         discard;
     }
-    return vec4<f32>(c.rgb * (vec3<f32>(1.0) + mat.emissive.rgb), select(1.0, c.a, mode >= 2u));
+    var rgb = c.rgb * (vec3<f32>(1.0) + mat.emissive.rgb);
+    if mat.scroll.z > 0.5 {
+        // atmosphere strip: fogged with the live fog at the camera (normal.x = its distance at the view distance)
+        rgb = mix(rgb, g.fog_color.rgb, clamp((i.n.x - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0));
+    }
+    return vec4<f32>(rgb, select(1.0, c.a, mode >= 2u));
 }
 
 @fragment

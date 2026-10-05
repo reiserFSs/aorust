@@ -260,9 +260,9 @@ impl Sky {
     }
 
     /// Camera-locked sky dome (`Scene::sky`, drawn unlit and unfogged by the renderer): the atmosphere strip's gradient
-    /// with the fog of the world baked in (the client draws the strip with `FOGENABLE`). Vertex alpha is the strip's
+    /// fogged at render time with the live fog (the client draws the strip with `FOGENABLE`; `Submesh::sky_fog`, vertex normal.x = distance). Vertex alpha is the strip's
     /// intensity `I`: the dome lets the star dome, dot stars and moons behind it show through at night.
-    pub fn dome(&self, fog_color: [f32; 3], fog_start: f32, fog_end: f32) -> Mesh {
+    pub fn dome(&self) -> Mesh {
         const SEG: usize = 24;
         const ELEV: [f32; 12] = [-15.0, 0.0, 4.0, 9.0, 16.0, 25.0, 35.0, 45.0, 55.0, 65.0, 78.0, 90.0];
         let radius = 400.0;
@@ -274,14 +274,13 @@ impl Sky {
             let s = if e <= 0.0 { 0.0 } else { (1000.0 * tan / (400.0 + 800.0 * tan)).min(1.0) };
             let dist = if e <= 0.0 { 1000.0 } else if s < 1.0 { (400.0 * s).hypot(1000.0 - 800.0 * s) } else { 400.0 / er.sin() };
             let d = dist / 1000.0 * VIEW_DISTANCE;
-            let fog = ((d - fog_start) / (fog_end - fog_start).max(1e-3)).clamp(0.0, 1.0);
-            let c = [0, 1, 2].map(|k| (bottom[k] * (1.0 - s) + top[k] * s) * (1.0 - fog) + fog_color[k] * fog);
+            let c = [0, 1, 2].map(|k| bottom[k] * (1.0 - s) + top[k] * s);
             let alpha = self.bottom_i * (1.0 - s) + self.top_i * s;
             for j in 0..=SEG {
                 let a = j as f32 / SEG as f32 * std::f32::consts::TAU;
                 vertices.push(Vertex {
                     pos: [radius * er.cos() * a.cos(), radius * er.sin(), radius * er.cos() * a.sin()],
-                    normal: [0.0, -1.0, 0.0],
+                    normal: [d, 0.0, 0.0],
                     color: [c[0], c[1], c[2], alpha],
                     ..Default::default()
                 });
@@ -295,14 +294,14 @@ impl Sky {
                 indices.extend([a, b, a + 1, a + 1, b, b + 1]);
             }
         }
-        Mesh { vertices, submeshes: vec![Submesh { two_sided: true, blend: ao_scene::Blend::AlphaBlend, ..Submesh::new(indices, None) }] }
+        Mesh { vertices, submeshes: vec![Submesh { two_sided: true, blend: ao_scene::Blend::AlphaBlend, sky_fog: true, ..Submesh::new(indices, None) }] }
     }
 }
 
 /// Adds the sky of the playfield's tweak script to `scene.sky`: the atmosphere dome and every `BackgroundSort` object
 /// (see `layers`).
 pub fn emit(sky: &Sky, tweaks: &Tweaks, store: &ao_rdb::RecordStore, scene: &mut Scene, fog_color: [f32; 3], fog_end: f32) {
-    layers::emit(sky, &tweaks.objects(), store, scene, sky.dome(fog_color, super::environment::NEAR, fog_end), layers::Fog { color: fog_color, start: super::environment::NEAR, end: fog_end });
+    layers::emit(sky, &tweaks.objects(), store, scene, sky.dome(), layers::Fog { color: fog_color, start: super::environment::NEAR, end: fog_end });
 }
 
 /// Re-evaluates an outdoor playfield's sky, fog tint and sun/ambient light at any `day_time` (the live time-of-day mode of the

@@ -65,6 +65,9 @@ pub struct Submesh {
     /// Texture coordinate drift in uv units per second (added to the vertex uv, wrapped by the sampler): scrolling clouds,
     /// water-like layers. `[0, 0]` = static.
     pub uv_scroll: [f32; 2],
+    /// Sky submeshes only: vertex `normal.x` is the distance (metres, at the view distance) the vertex has in the client's
+    /// fogged atmosphere strip; the renderer fogs it with the live fog (colour / end at the camera) instead of a baked one.
+    pub sky_fog: bool,
 }
 
 impl Submesh {
@@ -79,6 +82,7 @@ impl Submesh {
             glow_mask: false,
             prelit: false,
             uv_scroll: [0.0; 2],
+            sky_fog: false,
         }
     }
 }
@@ -162,6 +166,8 @@ pub struct Scene {
     /// at the camera every frame and overrides `environment.fog_color` / `fog_end` (and the clear colour when it equals
     /// the fog colour). `None` = the static environment fog.
     pub fog_model: Option<FogModel>,
+    /// Distance dependent statel visibility, see [`StatelLod`]. `None` = every instance is always drawn.
+    pub statel_lod: Option<StatelLod>,
     /// Constant rotations of `sky` instances (the Shadowlands vortex: a `Counter` that grows with `GameDeltaTime`).
     pub sky_spin: Vec<SkySpin>,
 }
@@ -249,5 +255,135 @@ mod tests {
         // quartic falloff: at half the radius d = 0.9 * (1 - 1/16)
         let (_, end) = m.at([50.0, 0.0, 0.0]);
         assert!((end - (800.0 - 794.5 * 0.9 * (1.0 - 0.0625))).abs() < 1e-2);
+    }
+
+    fn lod() -> StatelLod {
+        let item = |class, flag8, reduced, zones: Vec<u32>| LodItem { full: 0, reduced, flag8, class, zones };
+        StatelLod::new(800.0, vec![[0.0, 0.0], [1000.0, 0.0]], vec![item(0, true, Some(1), vec![0]), item(3, false, None, vec![0]), item(4, true, Some(1), vec![0, 1]), item(1, false, None, vec![0])])
+    }
+
+    #[test]
+    fn zone_levels_follow_the_client_bands() {
+        // half view length 400: radii 40, 60, 120, 160, 220 (the 0.1 factor hits the 40 m floor exactly)
+        let l = lod();
+        let at = |d: f32| l.level(0, [d, 0.0]);
+        assert_eq!([at(10.0), at(50.0), at(100.0), at(140.0), at(200.0), at(300.0)], [1, 2, 3, 4, 5, 0]);
+        // a short view length keeps the 40 m floor for every band
+        let s = StatelLod::new(100.0, vec![[0.0, 0.0]], vec![]);
+        assert_eq!([s.level(0, [39.0, 0.0]), s.level(0, [41.0, 0.0])], [1, 0]);
+    }
+
+    #[test]
+    fn statel_modes_follow_the_zone_state_table() {
+        let l = lod();
+        let pick = |i: usize, levels: [u8; 2]| l.pick(&l.items[i], &levels);
+        // file list 3 -> zone list 0 (small clutter): only within the nearest band
+        assert_eq!([pick(1, [1, 0]), pick(1, [2, 0]), pick(1, [0, 0])], [LodPick::Full, LodPick::Hidden, LodPick::Hidden]);
+        // file list 0 -> zone list 3, flag 8: full out to level 4, mode 1 (reduced) at level 5, mode 2 (reduced) at level 0
+        assert_eq!([pick(0, [4, 0]), pick(0, [5, 0]), pick(0, [0, 0])], [LodPick::Full, LodPick::Reduced, LodPick::Reduced]);
+        // file list 1 -> zone list 2 without flag 8 / reduced mesh: mode 1 keeps the full mesh, mode 2 finds no record
+        assert_eq!([pick(3, [3, 0]), pick(3, [4, 0]), pick(3, [5, 0]), pick(3, [0, 0])], [LodPick::Full, LodPick::Full, LodPick::Hidden, LodPick::Hidden]);
+        // global statel (zone list 4): state 2 (mode 1) only at level 0; the best mode of its zones wins
+        assert_eq!((pick(2, [5, 5]), pick(2, [0, 0]), pick(2, [0, 1])), (LodPick::Full, LodPick::Reduced, LodPick::Full));
+        assert_eq!(l.zone_items, vec![vec![0, 1, 2, 3], vec![2]]);
+    }
+}
+
+/// Which representation of a statel is shown (`FUN_100241ab`, N3 @0x100241ab).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LodPick {
+    Hidden,
+    /// `Identity{0xf6951, id}`: the full mesh (rdb 1010001).
+    Full,
+    /// `Identity{0xf696a, id}`: the reduced mesh (rdb 1010026).
+    Reduced,
+}
+
+/// One statel under distance control: its full-mesh instance, the optional reduced-mesh twin (both are entries of
+/// `Scene::instances`, the renderer shows at most one of them) and the zones that reference it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LodItem {
+    pub full: usize,
+    pub reduced: Option<usize>,
+    /// Statel flag bit 3: the reduced mesh may replace the full one in mode 1 (`extraout_ECX[8]` of `FUN_1002435c`).
+    pub flag8: bool,
+    /// Zone list class 0..4 (`StatelLod::STATE` columns; 4 = global statel referenced through a zone's index list).
+    pub class: u8,
+    /// Indices into `StatelLod::zones` (one for zone statels, every referencing zone for global statels).
+    pub zones: Vec<u32>,
+}
+
+/// The client's statel zone LOD (`n3StatelController_t`, N3.dll). Every frame `FUN_10028ca6` gives each zone a level 0..5
+/// from the distance between the camera and the zone centre (`FUN_10028ab7`); `FUN_100286a9` then sets a state per
+/// statel list of the zone (`STATE`), `FUN_10028577` turns states into modes (1 -> 2, 2 -> 1, 3 -> 0, 0 = disabled) and
+/// `FUN_1002431a` shows each statel in the best (lowest) mode any referencing zone requests.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StatelLod {
+    /// `VisualCamera_t::GetLengthOfViewcone` = far - near of the camera (metres).
+    pub view_length: f32,
+    /// Zone centres `[x, z]` in scene space.
+    pub zones: Vec<[f32; 2]>,
+    pub items: Vec<LodItem>,
+    /// Item indices per zone (derived by [`StatelLod::new`]).
+    pub zone_items: Vec<Vec<u32>>,
+}
+
+impl StatelLod {
+    /// Distances of the levels as fractions of half the view length (`n3StatelController` zone manager +0x2c..+0x3c,
+    /// floats 0.1, 0.15, 0.3, 0.4, 0.55 at N3 @0x1003d61c, 0x1003e674, 0x1003e29c, 0x1003e670, 0x1003e66c).
+    pub const FACTORS: [f32; 5] = [0.1, 0.15, 0.3, 0.4, 0.55];
+    /// Lower bound of every distance (float 40.0 at N3 @0x1003e668).
+    pub const MIN_DISTANCE: f32 = 40.0;
+    /// `STATE[level][zone list]`, zone lists 0..5 = (file statel list 3, 2, 1, 0, global refs, lights); `FUN_100286a9`.
+    pub const STATE: [[u8; 6]; 6] = [[0, 0, 0, 1, 2, 0], [3, 3, 3, 3, 3, 3], [0, 3, 3, 3, 3, 3], [0, 0, 3, 3, 3, 3], [0, 0, 2, 3, 3, 0], [0, 0, 1, 2, 3, 0]];
+
+    pub fn new(view_length: f32, zones: Vec<[f32; 2]>, items: Vec<LodItem>) -> Self {
+        let mut zone_items = vec![Vec::new(); zones.len()];
+        for (i, it) in items.iter().enumerate() {
+            for &z in &it.zones {
+                zone_items[z as usize].push(i as u32);
+            }
+        }
+        Self { view_length, zones, items, zone_items }
+    }
+
+    /// `FUN_10028ab7`: level of a zone for a camera at `cam` (x, z).
+    pub fn level(&self, zone: usize, cam: [f32; 2]) -> u8 {
+        let c = self.zones[zone];
+        let d2 = (cam[0] - c[0]).powi(2) + (cam[1] - c[1]).powi(2);
+        let half = self.view_length * 0.5;
+        let r = Self::FACTORS.map(|f| (half * f).max(Self::MIN_DISTANCE).powi(2));
+        if d2 < r[0] {
+            1
+        } else if d2 < r[1] {
+            2
+        } else if d2 < r[2] {
+            3
+        } else if d2 < r[3] {
+            4
+        } else if d2 < r[4] {
+            5
+        } else {
+            0
+        }
+    }
+
+    /// What `item` shows when its zones are at `levels`.
+    pub fn pick(&self, item: &LodItem, levels: &[u8]) -> LodPick {
+        // state -> mode (`local_18` of FUN_10028577: 1 -> 2, 2 -> 1, 3 -> 0); the statel uses the lowest mode requested
+        let mode = item.zones.iter().filter_map(|&z| match Self::STATE[levels[z as usize] as usize][[3, 2, 1, 0, 4][item.class as usize]] {
+            0 => None,
+            1 => Some(2),
+            2 => Some(1),
+            _ => Some(0),
+        }).min();
+        match mode {
+            None => LodPick::Hidden,
+            Some(0) => LodPick::Full,
+            // mode 1 switches to the reduced mesh only for statels with flag 8, otherwise the mesh stays as it is (full)
+            Some(1) if !item.flag8 => LodPick::Full,
+            // mode 2 always asks for 0xf696a; without that record nothing is created
+            Some(_) => if item.reduced.is_some() { LodPick::Reduced } else { LodPick::Hidden },
+        }
     }
 }
