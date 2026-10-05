@@ -34,6 +34,9 @@ fn main() -> anyhow::Result<()> {
                     notex += m.parts.iter().filter(|p| p.texture == 0).count();
                     missing_tex += m.parts.iter().filter(|p| p.texture != 0 && store.get(1010004, p.texture).ok().flatten().is_none()).count();
                     unit_scale += m.bones.iter().filter(|b| b.scale != 1.0).count();
+                    if std::env::args().any(|a| a == "--scaled") && m.bones.iter().any(|b| b.scale != 1.0) {
+                        println!("scaled bones in {ty}/{id}: {:?}", m.bones.iter().filter(|b| b.scale != 1.0).take(3).map(|b| (b.name.as_str(), b.scale)).collect::<Vec<_>>());
+                    }
                     nofit += usize::from(m.submeshes.is_empty());
                     // the full scene path (textures, skinning of the bind pose)
                     if let Err(e) = load_character_record(&store, ty, id, None) {

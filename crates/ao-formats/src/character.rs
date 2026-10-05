@@ -126,17 +126,62 @@ fn unit(a: [f32; 3]) -> [f32; 3] {
 /// Bones without a track keep an identity rotation and zero offset.
 fn bone_world(mesh: &CatMesh, pose: Option<(&CatAnim, f32)>) -> Vec<Xf> {
     let parents = mesh.parents();
+    let scale = translation_scales(mesh);
     let mut world = vec![Xf::ID; mesh.bones.len()];
-    let mut scale = vec![1.0f32; mesh.bones.len()];
     for b in mesh.bone_order() {
         let (q, t) = pose.and_then(|(a, ms)| a.sample(b, ms)).unwrap_or(([0.0, 0.0, 0.0, 1.0], [0.0; 3]));
         let local = Xf::from_qt(q, t.map(|c| c * scale[b]));
         world[b] = parents[b].map_or(local, |p| world[p].mul(&local));
+    }
+    world
+}
+
+/// Factor applied to each bone's animated translation: the product of its ancestors' `Bone::scale`
+/// (race proportions: the opifex skeleton shortens the shared human clips' bone lengths).
+fn translation_scales(mesh: &CatMesh) -> Vec<f32> {
+    let mut scale = vec![1.0f32; mesh.bones.len()];
+    for b in mesh.bone_order() {
         for &c in &mesh.bones[b].children {
             scale[c as usize] = mesh.bones[b].scale * scale[b];
         }
     }
-    world
+    scale
+}
+
+/// Bind frame of a bone without skin vertices: the nearest fitted ancestor's frame carried down the
+/// chain with the local transforms of `rest` (the clip whose first frame is closest to the bind pose).
+fn derived_bind_frame(mesh: &CatMesh, frames: &[Option<Xf>], rest: &CatAnim, bone: usize) -> Xf {
+    let (parents, scale) = (mesh.parents(), translation_scales(mesh));
+    let (mut chain, mut cur) = (vec![], bone);
+    let base = loop {
+        if let Some(f) = frames[cur] {
+            break f;
+        }
+        chain.push(cur);
+        match parents[cur] {
+            Some(p) => cur = p,
+            None => break Xf::ID,
+        }
+    };
+    chain.iter().rev().fold(base, |w, &b| {
+        let (q, t) = rest.sample(b, 0.0).unwrap_or(([0.0, 0.0, 0.0, 1.0], [0.0; 3]));
+        w.mul(&Xf::from_qt(q, t.map(|c| c * scale[b])))
+    })
+}
+
+/// The compatible clip whose first frame deviates least (summed rotation angle) from the fitted bind frames.
+fn best_rest_clip(store: &RecordStore, mesh: &CatMesh, frames: &[Option<Xf>]) -> Result<CatAnim> {
+    let trace = |a: &Xf, b: &Xf| (0..3).map(|i| (0..3).map(|k| a.r[k][i] * b.r[k][i]).sum::<f32>()).sum::<f32>();
+    let mut best: Option<(f32, CatAnim)> = None;
+    for id in store.ids(CHAR_ANIM_TYPE)? {
+        let Some(a) = store.get(CHAR_ANIM_TYPE, id)?.and_then(|b| CatAnim::parse(&b).ok()).filter(|a| a.signature == mesh.signature) else { continue };
+        let world = bone_world(mesh, Some((&a, 0.0)));
+        let score: f32 = frames.iter().zip(&world).filter_map(|(f, w)| f.map(|f| ((trace(&f, w) - 1.0) / 2.0).clamp(-1.0, 1.0).acos())).sum();
+        if best.as_ref().is_none_or(|b| score < b.0) {
+            best = Some((score, a));
+        }
+    }
+    best.map(|b| b.1).context("no animation to derive the head bone's rest frame from")
 }
 
 /// Bind-pose world transform of each bone, recovered from vertices fully weighted to it
@@ -255,7 +300,7 @@ fn submesh_for(mat: &Material, tex: Option<(TextureKey, &ao_scene::Texture)>) ->
     s
 }
 
-fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned) -> Scene {
+fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned) -> (Scene, [f32; 3], [f32; 3]) {
     let mut scene = Scene::default();
     let mut out = Mesh::default();
     let mut textures: HashMap<u32, Option<TextureKey>> = HashMap::new();
@@ -288,14 +333,17 @@ fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned) -> Scene {
     out.submeshes.retain(|s| !s.indices.is_empty());
     scene.meshes.push(out);
     scene.instances.push(Instance { mesh: 0, transform: IDENTITY });
+    (scene, lo, hi)
+}
+
+/// Camera in front of the model's bounds (characters face +Z in model space, i.e. -Z after the mirror).
+fn frame_view(scene: &mut Scene, lo: [f32; 3], hi: [f32; 3]) {
     if lo[0] <= hi[0] {
         let c: [f32; 3] = std::array::from_fn(|k| (lo[k] + hi[k]) / 2.0);
         let r = (0..3).map(|k| hi[k] - lo[k]).fold(0.0f32, f32::max);
-        // characters face +Z in model space, i.e. -Z after the mirror
         scene.spawn = Some([c[0], c[1], c[2] - 1.25 * r]);
         scene.spawn_look_at = Some(c);
     }
-    scene
 }
 
 /// Decodes character model `id` (rdb [`CHAR_MESH_TYPE`]) in its bind pose.
@@ -341,10 +389,13 @@ fn build(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>, 
             (skin_pose(&mesh, &world), world.into_iter().map(Some).collect())
         }
     };
-    let mut scene = assemble(store, &mesh, &skin);
+    let (mut scene, lo, mut hi) = assemble(store, &mesh, &skin);
     if let Some(head) = head {
         let att = mesh.attractors.iter().find(|a| a.name.ends_with("_head")).context("model has no head attractor")?;
-        let bone = frames[att.bone as usize].context("head bone has no bind frame")?;
+        let bone = match frames[att.bone as usize] {
+            Some(f) => f,
+            None => derived_bind_frame(&mesh, &frames, &best_rest_clip(store, &mesh, &frames)?, att.bone as usize),
+        };
         let w = bone.mul(&Xf::from_qt(att.rot, att.pos));
         let idx = crate::mesh::decode_mesh_into(store, head, &mut scene)?.with_context(|| format!("no head mesh {head}"))?;
         // the head vertices are already mirrored (Z negated): conjugate the mounting transform by the mirror
@@ -357,7 +408,9 @@ fn build(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>, 
         }
         m[3] = [w.t[0], w.t[1], -w.t[2], 1.0];
         scene.instances.push(Instance { mesh: idx, transform: m });
+        hi[1] = hi[1].max(w.t[1] + 0.3); // head height above the mount point
     }
+    frame_view(&mut scene, lo, hi);
     Ok(scene)
 }
 

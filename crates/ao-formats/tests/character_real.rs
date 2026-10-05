@@ -80,8 +80,9 @@ fn animation_poses_the_mesh_and_checks_the_skeleton() {
 #[test]
 fn head_mounts_above_the_body_and_follows_the_pose() {
     let Some(store) = store() else { return };
-    for pose in [None, Some((9382, 0.6))] {
-        let scene = load_character_with_head(&store, 5900, 40098, pose).unwrap(); // head_athroxmale001
+    // 5900 + head_athroxmale001; 5914 (opifex) has no skin on its head bone: the mount frame is derived
+    for (body, head, pose) in [(5900, 40098, None), (5900, 40098, Some((9382, 0.6))), (5914, 40250, None)] {
+        let scene = load_character_with_head(&store, body, head, pose).unwrap();
         assert_eq!(scene.instances.len(), 2);
         let m = scene.instances[1].transform;
         assert!((1.2..2.0).contains(&m[3][1]), "head mount height {}", m[3][1]);
