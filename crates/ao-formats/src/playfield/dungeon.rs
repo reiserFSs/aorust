@@ -127,7 +127,7 @@ pub(super) fn parse_gnda(d: &[u8]) -> Result<Gnda> {
         match &tag {
             b"DCGA" => g.ty = png(body, w, h, 1)?,
             b"DHGA" => g.floor = png(body, w, h, 1)?,
-            b"HCDA" => g.ceil = png(body, w, h, 1)?, // the client adds 0x20 and subtracts it again
+            b"HCDA" => g.ceil = png(body, w, h, 1)?, // stretch is a signed byte: the loader (FUN_10077e6f) adds 0x20 to each byte, the warp subtracts 0x20 again
             b"TAHA" => {
                 let mut s = Rd::new(body, 0);
                 for _ in 0..s.u16()? {
@@ -250,7 +250,10 @@ impl Gnda {
         let key = canonical | (state & 0x70);
         let slot = KEYS.iter().position(|&k| k == key).map_or(0, |i| i + 1);
         let nb = if state == 0 { t } else { 0 };
-        let mut mesh = if slot > 0 { self.table[(t * 32 + nb) * 16 + slot - 1] } else { 0 };
+        // `FUN_10016967` reads word `byte` of the row; a key that is not in `KEYS` has byte 0, i.e. the word right
+        // before the row (slot 15 of the previous row; the client's table is `u16[tile][32][16]` starting at +0x23c)
+        let row = (t * 32 + nb) * 16;
+        let mut mesh = if slot > 0 { self.table[row + slot - 1] } else { self.table[row - 1] };
         let over = self.taha_at(x, z) >> 2;
         if over != 0 {
             if let Some(&m) = self.taha_lists[t].get(over as usize - 1) {
@@ -393,6 +396,13 @@ impl Gnda {
     }
 }
 
+/// Ceiling stretch of an `HCDA` byte in height-scale units: a signed value. The loader (`FUN_10077e6f`, DisplaySystem
+/// @0x10077e6f) adds 0x20 to every byte (wrapping), `FUN_10001c3b` subtracts 0x20 again from the unsigned byte, so
+/// raw 242..255 mean -14..-1 and the range is -32..223.
+fn stretch(raw: u8) -> f64 {
+    raw.wrapping_add(0x20) as f64 - 32.0
+}
+
 /// Catmull-Rom style slope polynomial (`FUN_100023ad` / `FUN_10002479`): `c = [c0..c5]`.
 fn slope(p: [f64; 4], da: f64, d3: f64, swap: bool) -> [f64; 6] {
     let f = 0.25;
@@ -484,13 +494,13 @@ impl Builder<'_> {
         let g = self.g;
         let hs = g.height_scale as f64;
         let floor = Surface::new(|px, pz| g.floor[g.at(px, pz)] as f64 * hs + yoff, x, z);
-        let ceil = Surface::new(|px, pz| g.ceil[g.at(px, pz)] as f64 * hs, x, z);
+        let ceil = Surface::new(|px, pz| stretch(g.ceil[g.at(px, pz)]) * hs, x, z);
         let theta = rot as f64 * FRAC_PI_2 + PI;
         let (s, c) = theta.sin_cos();
         let cell = g.cell as f64;
         let layer = &g.layer[(z as usize * g.w + x as usize) * g.layers..][..g.layers];
         for (bi, (verts, tris)) in piece.blocks.iter().enumerate() {
-            if tris.is_empty() || (only_floor && bi > 0) {
+            if verts.is_empty() || (only_floor && bi > 0) {
                 continue;
             }
             let mat = layer.get(bi).and_then(|&m| (self.textures)(m));
@@ -605,29 +615,44 @@ pub(super) fn entry_spot(g: &Gnda, rec: &Record, props: &[Vec<[f32; 3]>]) -> Opt
 /// texture coordinates continue those of its neighbours; vertices that then coincide are dropped.
 /// Returns the output index of every vertex of `block` (kept ones are appended to `out`).
 fn weld_block(out: &mut RoomBuf, block: &mut [Vertex]) -> Vec<u32> {
-    let d2 = |a: [f32; 3], b: [f32; 3]| (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f32>();
-    let frac_ok = |d: f32| d - d.floor() <= 0.2; // d = old - new + 0.1
+    // The comparisons are x87 code with float operands: differences of two floats are exact, the constants are
+    // doubles that hold the floats 0.1 / 0.2 (bytes at 0x1003c890 / 0x1003c898) and every result stored to a float
+    // local is rounded to f32. Ties (uv 0.95 / 0.05 / 1.05 ...) decide merges, so the order of operations matters:
+    // `(c - v) + 0.1` is rounded once, `off - (c - v)` once.
+    const K1: f64 = 0.1f32 as f64;
+    const K2: f64 = 0.2f32 as f64;
+    let len2 = |a: [f32; 3], b: [f32; 3]| {
+        let d = |i: usize| (b[i] - a[i]) as f64; // `FUN_10001340` stores float differences
+        d(2) * d(2) + d(0) * d(0) + d(1) * d(1) // `FUN_100013a9` sums in this order
+    };
     // candidates (index order): the three cells above the current one, then the previous cell up to this block.
-    // `FUN_10001645` compares positions, normals and uvs only: the material plays no part.
+    // `FUN_10001645` compares positions, normals and uvs only: the material plays no part. Its position hash
+    // prefilter (bytes 0x7f & round(30 p), accepts a difference of -2..1) never rejects a pair within 0.0316 m.
     let (cur, w, start) = (out.cell_start.len() as isize - 1, out.width as isize, out.vertices.len());
     let cs = |k: isize| if k < 0 { 0 } else { out.cell_start[(k as usize).min(cur as usize)].min(start) };
     let cands: Vec<usize> = (cs(cur - w - 1)..cs(cur - w + 2)).chain(cs(cur - 1)..start).collect();
     let find = |out: &RoomBuf, v: &Vertex, f: &mut dyn FnMut(u32, &Vertex)| {
         for &j in &cands {
             let o = &out.vertices[j];
-            if d2(o.pos, v.pos) <= 0.001 && d2(o.normal, v.normal) <= 0.2 {
+            if len2(o.pos, v.pos) <= 0.001f32 as f64 && len2(o.normal, v.normal) <= K2 {
                 f(j as u32, o);
             }
         }
     };
+    // integer part (as i16) of `(cand - v) + 0.1` when its fraction is <= 0.2
+    let step = |c: f32, v: f32| {
+        let t = (c as f64 - v as f64 + K1) as f32;
+        let fl = (t as f64).floor();
+        (t as f64 - fl <= K2).then_some(fl as i32 as i16)
+    };
     // pass 1: the piece-wide uv offset
-    let mut seen: Vec<([i32; 2], usize)> = Vec::new();
+    let mut seen: Vec<([i16; 2], usize)> = Vec::new();
     let mut offset = None;
     'scan: for (i, v) in block.iter().enumerate() {
-        let mut hits: Vec<[i32; 2]> = Vec::new();
+        let mut hits: Vec<[i16; 2]> = Vec::new();
         find(out, v, &mut |_, o| {
-            if frac_ok(o.uv[0] - v.uv[0] + 0.1) && frac_ok(o.uv[1] - v.uv[1] + 0.1) {
-                hits.push([(o.uv[0] - v.uv[0] + 0.1).floor() as i32, (o.uv[1] - v.uv[1] + 0.1).floor() as i32]);
+            if let (Some(u), Some(w)) = (step(o.uv[0], v.uv[0]), step(o.uv[1], v.uv[1])) {
+                hits.push([u, w]);
             }
         });
         for off in hits {
@@ -645,17 +670,19 @@ fn weld_block(out: &mut RoomBuf, block: &mut [Vertex]) -> Vec<u32> {
         offset = seen.last().map(|s| s.0);
     }
     let off = offset.unwrap_or([0, 0]).map(|v| v as f32);
-    // pass 2: shift, then merge coinciding vertices
+    // pass 2: a vertex that coincides with an earlier one (uv compared against the unshifted uv: |off - (c - v)| <= 0.1)
+    // is dropped, a kept one gets the offset added
+    let near = |off: f32, c: f32, v: f32| ((off as f64 - (c as f64 - v as f64)) as f32).abs() as f64 <= K1;
     let mut remap = Vec::with_capacity(block.len());
     for v in block.iter_mut() {
-        v.uv = [v.uv[0] + off[0], v.uv[1] + off[1]];
         let mut hit = None;
         find(out, v, &mut |j, o| {
-            if hit.is_none() && (o.uv[0] - v.uv[0]).abs() <= 0.1 && (o.uv[1] - v.uv[1]).abs() <= 0.1 {
+            if hit.is_none() && near(off[0], o.uv[0], v.uv[0]) && near(off[1], o.uv[1], v.uv[1]) {
                 hit = Some(j);
             }
         });
         remap.push(hit.unwrap_or_else(|| {
+            v.uv = [v.uv[0] + off[0], v.uv[1] + off[1]];
             out.vertices.push(*v);
             out.vertices.len() as u32 - 1
         }));
@@ -725,7 +752,7 @@ fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<Text
     if vertices.is_empty() {
         return None;
     }
-    // baked lighting only when the stream matches the shell vertex for vertex (97 % of rooms; the rest keep ambient light)
+    // baked lighting only when the stream matches the shell vertex for vertex (1991 of 2000 rooms; the rest keep ambient light)
     let prelit = match room.lightmap.as_ref().and_then(|l| depack_lightmap(l.0, &l.1)).filter(|c| c.len() == vertices.len()) {
         Some(c) => {
             for (v, c) in vertices.iter_mut().zip(c) {
@@ -1002,11 +1029,64 @@ mod tests {
     }
 
     #[test]
+    fn ceiling_stretch_is_a_signed_byte() {
+        assert_eq!([stretch(0), stretch(37), stretch(223), stretch(224), stretch(242), stretch(255)], [0.0, 37.0, 223.0, -32.0, -14.0, -1.0]);
+    }
+
+    #[test]
+    fn weld_decides_uv_ties_like_the_x87_code() {
+        let v = |u: f32| Vertex { pos: [1.0, 2.0, 3.0], normal: [0.0, 1.0, 0.0], uv: [u, 0.0], ..Default::default() };
+        let mut out = RoomBuf { vertices: Vec::new(), by_tex: HashMap::new(), cell_start: vec![0], width: 4 };
+        weld_block(&mut out, &mut [v(1.05)]);
+        // 0.95 -> 1.05 is an offset of 0.1 + 0.1 - 2e-8 in float arithmetic: (1.05 - 0.95) + 0.1 = 0.19999996 <= 0.2, so
+        // the uv offset is 0 and |0 - 0.0999999642| <= 0.1 merges the vertices
+        assert_eq!(weld_block(&mut out, &mut [v(0.95)]), vec![0]);
+        // 0.05 -> 0.95: (0.050000012 - 0.95) + 0.1 = -0.79999995, fraction 0.2000000477 > 0.2, no offset, |0 - 0.9| > 0.1: kept
+        let mut out = RoomBuf { vertices: Vec::new(), by_tex: HashMap::new(), cell_start: vec![0], width: 4 };
+        weld_block(&mut out, &mut [v(0.050000012)]);
+        assert_eq!(weld_block(&mut out, &mut [v(0.95)]), vec![1]);
+    }
+
+    #[test]
     fn height_layers_clamp_at_the_map_border() {
         // N3 @0x10001c3b replicates the nearest valid row/column for the 4x4 corner window
         let g = parse_gnda(&fixture(&[])).unwrap();
         assert_eq!(g.at(-5, -3), 0);
         assert_eq!(g.at(W as i32 + 4, W as i32 + 4), W * W - 1);
         assert_eq!(g.at(2, -1), 2);
+    }
+
+    /// Over every dungeon room of the client data: the shell vertex count must equal the room's baked lightmap
+    /// count (`Room::lightmap.0`, the vertex count `CreateDungeonRoom` produced when the lightmap was baked).
+    /// `cargo test --release -p ao-formats dungeon_lightmap_survey -- --ignored --nocapture` prints the tally.
+    #[test]
+    #[ignore]
+    fn dungeon_lightmap_survey() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let Ok(store) = RecordStore::open(&std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client")) else { return };
+        let (mut rooms, mut ok) = (0, 0);
+        let mut bad = Vec::new();
+        for (id, _) in super::super::list_playfields(&store).unwrap() {
+            let Some(rec) = store.get(super::super::RECORD, id).ok().flatten() else { continue };
+            let rec = super::super::record::parse(&rec).unwrap();
+            let Some(d) = store.get(TILEMAP, rec.tilemap).ok().flatten().filter(|_| rec.tilemap != rec.id) else { continue };
+            let g = parse_gnda(&d).unwrap();
+            let mut pieces: HashMap<u16, Option<Rc<Piece>>> = HashMap::new();
+            let mut piece = |id: u16| -> Option<Rc<Piece>> {
+                pieces.entry(id).or_insert_with(|| store.get(PIECES, id as u32).ok().flatten().and_then(|b| parse_piece(&b).ok()).map(Rc::new)).clone()
+            };
+            for (ri, room) in rec.rooms.iter().enumerate() {
+                let Some(lm) = &room.lightmap else { continue };
+                let n = build_room(&g, room, &mut |_| None, &mut piece).map_or(0, |m| m.vertices.len());
+                rooms += 1;
+                if n == lm.0 as usize {
+                    ok += 1;
+                } else {
+                    bad.push((id, ri, n as i64 - lm.0 as i64));
+                }
+            }
+        }
+        println!("rooms with lightmap {rooms}, shell vertex count == lightmap count: {ok}; mismatching (playfield, room, delta): {bad:?}");
+        assert!(ok * 100 >= rooms * 99, "lightmap match rate regressed: {ok}/{rooms}");
     }
 }
