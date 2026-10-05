@@ -3,7 +3,7 @@
 Scope: everything between "client opens TCP to the login server" and "client opens TCP to the zone
 server and presents its cookies", for the **PRK client 00.7.2_EP1** (`version.id`, `patch.version` = `0.7.2`).
 Implemented as encode/decode in `crates/ao-net` plus a threaded client (`ao_net::client`). §1–§7 come from client disassembly (Ghidra 12.1.4
-decompiler) or CellAO / AOChat sources; **§8 holds the live capture from Ithaca** (login phase up to the credential check). Evidence tags:
+decompiler) or CellAO / AOChat sources; **§8 holds the live captures from Ithaca** (login, character list, creation, zone hand-off; zone traffic in docs/zone.md). Evidence tags:
 
 | tag | meaning |
 |---|---|
@@ -71,9 +71,9 @@ off  size  field
   `[CN 0x100019ba]`. **The server's first frame must have `seq >= 1`.** CellAO starts at 1 `[CellAO Server/LoginEngine/CoreClient/Client.cs:73,175-177]`.
 * Buffering is stream-oriented: header (16 bytes) is accumulated first, then `padded(size)-16` more bytes; frames may
   be split/coalesced arbitrarily across TCP reads.
-* Type `0x7F` (CellAO `InitiateCompressionMessage`): `receiver == 0` -> header bytes 8..10 / 10..12 are raw compression
-  parameters passed to `SetCompressionReceive`/`SetCompression`; `receiver != 0` -> the client re-targets an `ACE_INET_Addr`
-  (ip = `receiver`, port = BE u16 at bytes 8..10) `[CN 0x100019ba]`. Not needed for login; the compressed framing is **not** reverse-engineered here.
+* Type `0x7F` (CellAO `InitiateCompressionMessage`; wire bytes `7f 00`, the client compares the raw LE short): `receiver == 0` -> header bytes 8..10 / 10..12 are raw
+  LE shorts passed to `SetCompressionReceive`/`SetCompression`; `receiver != 0` -> the client re-targets an `ACE_INET_Addr`
+  (ip = `receiver`, port = BE u16 at bytes 8..10) `[CN 0x100019ba]`. Used by the zone server right after ZoneLogin: zlib stream, frames unpadded (§8 "Authenticated session").
 * Header `sender`/`receiver` as sent by the original: client -> login server `(0, 1)` for UserLogin/UserCredentials/
   SelectCharacter/DeleteCharacter/CreateCharacter; ZoneLogin `(charId, 2)` (`SystemMessage_t(type, sender, receiver, size, data)`
   ctor `[MP 0x10002d20]`; call sites `InitAuth 0x100025a9`, `AuthClient 0x10001b65`, `LoginCharacter 0x10001c5b`, `SendClientCookie 0x100013b0`). The client does not validate the
@@ -327,7 +327,7 @@ open_challenge_response, tea_*}` (§4); `msg::Message{to_frame,from_frame,encode
 `conn::Conn` (blocking framed TCP, tx seq, rx validation, wire tap with UserCredentials redacted);
 `client::{fetch_servers, ServerEntry, LoginSession{connect,login,select_character,poll}, LoginEvent}` — one background thread per session:
 login phase (UserLogin -> salt -> credentials -> CharacterList / LoginError), SelectCharacter -> ZoneInfo -> `ZoneHandoff`, then the thread
-connects to the zone server (3 tries, 1 s/2 s backoff), sends ZoneLogin, answers pings, reports `ZoneConnected{first frames}` and keeps the
+connects to the zone server (3 tries, 1 s/2 s backoff), sends ZoneLogin, answers pings, forwards every other frame as `ZoneFrame` and keeps the
 connection alive until the session is dropped. `LoginError` ends the thread without a `Disconnected` event.
 `examples/probe.rs`: diagnostic (hex dumps; credential-free modes; `--login` prompts on the TTY, password never an argument or logged).
 `cargo test -p ao-net`: framing byte vectors (hand-derived from §2), TEA/DH/credentials known answers (§4 provenance), round trips for every
@@ -414,16 +414,43 @@ machine; `ao-net` sends ZoneLogin immediately after connect (**unresolved/uncali
 * UserCredentials `AuthClient` `[IF 0x10001b65]`: `name[40]`, `i32 len+1`, `len+1` bytes (incl. NUL), `SystemMessage_t(0x25, 0, 1)`. ZoneLogin
   `SendClientCookie` `[IF 0x100013b0]`: `i32 charId, i32 cookie1, i32 cookie2`, `SystemMessage_t(0x1b, sender charId, receiver 2)`. All match `msg.rs`.
 
-### Still open — needs a valid account (first real login; run `cargo run -p ao-net --example probe -- --login`)
-1. Does a correct account password produce the CharacterList, or does PRK expect a launcher token in the password slot (the launcher passes none)?
-2. Real `CharacterList` values: `status`, `allowedChars`, `expansions`, `slProfs`, `dataVersion`/`infoVersion`, PlayfieldProxy identity types.
-3. Extra system messages between 0x25 and 0x0E (0x43 chat-server list, 0x4E, 0x30): the client logs any undecoded one as a `Status` event.
-4. `ZoneInfo` real shape (22 vs 30 bytes), `eventServerType`, `playerId`.
-5. Zone side: does the server speak first; is `ZoneLogin` accepted immediately after TCP connect (the client sends it immediately, as the original
-   does on the wire, see "Zone hand-off timing" — only the local N3-engine start-up time before it is not reproduced); zone-side 0x7F compression.
-   `ZoneConnected` carries the first 16 frames (ptype, first u32, sender, receiver, length, first 32 payload bytes), also printed to stderr as
-   `[ao-net] zone frame ...`.
-6. Whether a wrong `version.id` is refused for a valid account; meaning of codes other than 0x14/0x6A/0x6C/0x21-9.
+### Authenticated session (Ithaca, 2026-10-06, test account approved by PRK staff)
+
+Raw records (redacted; `<ms> <'>' sent | '<' received> <hex of one decoded frame>`): `docs/captures/login_ithaca.rec`
+(UserLogin → salt → credentials → CharacterList), `create_ithaca.rec` (random name ×2, create → NameInUse, create → Created → Select → ZoneInfo),
+`zone_ithaca.rec` (80 s in a zone, existing character), `zone_newchar_ithaca.rec` (first 10 s of the new character). Tests decode them
+(`msg::tests::live_character_list`, `n3::tests`).
+
+1. **Credentials**: the plain account password, built exactly as §4, is accepted (no launcher token). `CharacterList` follows 0.25 s after
+   `UserCredentials`; no other message in between (frame seq 1 = ServerSalt, seq 2 = CharacterList, `sender=1`, `receiver` = a per-session value such as
+   `0x615b` / `0x5b..`, the client ignores it).
+2. **CharacterList** (148 bytes on the wire, payload 130): `dataVersion 4`, `infoVersion 5`, proxy `'a'`, **playfield Identity (0xC79D = 51101, 4582)**, `attribute 1`,
+   `exitDoor 0`, `exitDoorId (0,0)`, `created 1`, `orgInstance 0`, name `Testy`, `breed 1, gender 3, profession 1, level 1`, `area "area unknown"`, `banned 0`, ban reason `""`,
+   `head 0, height 0, width 0`, **`status 1`**, then **`allowedChars 50, expansions 27 (0x1b)` and no third int** (the client's `slProfs` read hits end of
+   stream → 0). `ao_net::msg` now accepts the 8-byte tail. Gender codes: the create request for a male Solitus carries 2, the list's female Solitus has 3.
+   `status 1` rows are *active* in the GUI (the row is not shown as "Inactive"; see docs/screens.md §5.3). The app showed
+   "ICC Shuttleport (4582)", 49/50 slots available.
+3. **ZoneInfo is the 22-byte (CellAO) variant** — `charId, ip, port(i16), cookie1, cookie2` only; `eventServerType`/`playerId` are absent (0).
+   Zone port depends on the character (8504 for playfield 4582, 8503 for the new character's start playfield 4604); ip stayed 199.241.136.157.
+4. **Zone side**: the server speaks only after `ZoneLogin`. ZoneLogin sent 4.13 s after ZoneInfo (4 s loadscreen delay) was accepted at once; the first
+   server frame follows after 120 ms. Server frame `sender`=1 (system / world) or the acting dynel id, `receiver` = our character id.
+5. **Compression**: the first frame is a 16-byte compression control frame `df df 7f 00 | 00 01 | 00 10 | 01 00 00 00 | 00 00 00 00`. The client reads
+   the `ptype` as a raw little-endian short (`7f 00` = 0x7F, i.e. 0x7F00 when read big-endian like every other field) and `Connection_t::Receive`
+   `[CN 0x100019ba]` calls `SetCompressionReceive(LE short at header+8 = 1)` + `SetCompression(LE short at +10 = 0, +8)` `[CN 0x1000194f, 0x100013b4]`.
+   From the next byte on the server→client stream is **one zlib stream (header `78 01`, zlib 1.2.5, Z_SYNC_FLUSH after every write)**; the decompressed bytes are
+   ordinary frames that are **not padded to 4**. The send side stays uncompressed (level 0; `SetCompression` only answers with a control frame
+   when the requested send level differs from the current one, which is 0 → nothing is sent; verified: the server kept streaming for 80 s with
+   only ping replies from us). `ao_net::conn::Conn` inflates transparently.
+6. **Ping**: the server sends a type-1 ping (`sender = receiver = charId`, ptype 0xB, 40 bytes) first 4.9 s after ZoneLogin, then **every 30.0 s**
+   (9701, 39712, 69686 ms in the capture). Payload `type 1, f14 0, t_orig 0x0003d4db, t_recv 0, t_send 0, f24 0x0005bf9b`; our reply (type 2, `t_recv = t_send =`
+   ms since midnight, others echoed, sender = receiver = charId) kept the session alive. The client never originates pings (§8 Ping).
+7. **Zone traffic**: 1 system message (0x43 chat server `199.241.136.157:7005`) and ~1100 N3 messages (`ptype` 0xA) in 80 s; layouts and ids:
+   `docs/zone.md`. Nothing from the client was needed besides ZoneLogin and ping replies to keep the connection open for 80 s.
+8. **Character creation** (existing slot, 49/50 free): `0x55` RandomNameRequest `(breed, gender, profession)` → `0x56` SuggestName (`i16 len` + name) — both live;
+   `0x0F` CreateCharacter (134/138-byte frames, layout §5a) → name "Edric" taken: `0x10` NameInUse body `0x1e` (30, shown as "Nickname is already in use.");
+   unique name "Aomacvolk" → **`0x11` CharacterCreated `i32 charId (0x82e8 = 33512)` + one more `u32` (0x520eb100, unknown; the client ignores it)**, the client's
+   automatic `0x16` SelectCharacter followed at once, `0x17` ZoneInfo 120 ms later.
+9. A wrong `version.id` for a valid account was not tried (would be a second live login with deliberately bad data; not needed).
 
 ## 9. Sources used
 * This repo's analysis of the binaries above (Ghidra 12.1.4, headless; scripts in `/tmp/aomac-ghidra/proto/scripts`).
