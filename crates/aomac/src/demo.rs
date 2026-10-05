@@ -110,6 +110,36 @@ pub fn scene(count: usize) -> Scene {
         );
         s.instances.push(Instance { mesh: 2 + (rnd() * 8.0) as usize % 8, transform: t.to_cols_array_2d() });
     }
+    // Self-illumination: a uniformly emissive cube and a glow-mask cube (window grid lit by alpha), plus a sky box.
+    s.textures.insert(key(101), tex(128, |x, y| if x % 32 > 8 && y % 32 > 8 { [255, 230, 140, 255] } else { [60, 60, 70, 0] }));
+    s.textures.insert(key(102), tex(64, |_, y| { let t = y as f32 / 63.0; [(20.0 + 60.0 * t) as u8, (25.0 + 70.0 * t) as u8, (70.0 + 90.0 * t) as u8, 255] }));
+    let mut em = cube();
+    em.submeshes[0].base_color = [0.1, 0.1, 0.1, 1.0];
+    em.submeshes[0].emissive = [0.1, 1.2, 0.3];
+    let mut gm = cube();
+    gm.submeshes[0].texture = Some(key(101));
+    gm.submeshes[0].glow_mask = true;
+    let mut sky = cube();
+    sky.submeshes[0].texture = Some(key(102));
+    let (em_i, gm_i, sky_i) = (s.meshes.len(), s.meshes.len() + 1, s.meshes.len() + 2);
+    s.meshes.extend([em, gm, sky]);
+    let scaled = |sc: f32, p: Vec3| Mat4::from_scale_rotation_translation(Vec3::splat(sc), Quat::from_rotation_y(0.3), p).to_cols_array_2d();
+    s.instances.push(Instance { mesh: em_i, transform: scaled(2.0, Vec3::new(-6., 1., 17.)) });
+    s.instances.push(Instance { mesh: gm_i, transform: scaled(2.5, Vec3::new(6., 1.25, 17.)) });
+    s.sky.push(Instance { mesh: sky_i, transform: scaled(400.0, Vec3::ZERO) });
+    for (p, c) in [([-9., 1.5, 20.], [3.0, 0.4, 0.3]), ([-2., 1.5, 21.], [0.3, 1.2, 3.0]), ([3., 1.5, 20.], [2.5, 2.2, 0.4]), ([9., 1.5, 21.], [0.6, 3.0, 0.8])] {
+        s.lights.push(ao_scene::Light { pos: p, color: c, range: 9.0 });
+    }
+    // Dusk, so the emissive/glow/lit surfaces and point lights stand out.
+    s.environment = Some(ao_scene::Environment {
+        sky_color: [0.02, 0.03, 0.08],
+        fog_color: [0.03, 0.04, 0.09],
+        fog_start: 150.0,
+        fog_end: 600.0,
+        ambient: [0.06, 0.07, 0.12],
+        sun_color: [0.12, 0.1, 0.12],
+        sun_dir: [0.4, 0.8, 0.3],
+    });
     s.spawn = Some([0.0, 4.0, 22.0]);
     s.spawn_look_at = Some([0.0, 2.0, 10.0]);
     s

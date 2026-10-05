@@ -131,6 +131,9 @@ pub struct Scene {
     /// `None` = renderer defaults.
     pub environment: Option<Environment>,
     pub lights: Vec<Light>,
+    /// Sky domes/backdrops: instances of `meshes` drawn first, depth-write off, unfogged,
+    /// with the transform's translation replaced by the camera position. Not in `instances`.
+    pub sky: Vec<Instance>,
 }
 
 pub const IDENTITY: [[f32; 4]; 4] = [

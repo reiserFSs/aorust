@@ -99,15 +99,96 @@ struct Globals {
     ambient: [f32; 4],
     fog_color: [f32; 4],
     fog: [f32; 4],
+    grid: [f32; 4],
+    dims: [i32; 4],
 }
 
-/// One submesh draw. `pipe` = `blend as usize * 2 + two_sided as usize`.
+/// One submesh draw. `pipe` = `blend as usize * 2 + two_sided as usize`; sky draws use `SKY_PIPE + blend`.
+#[derive(Clone, Copy)]
 struct Draw {
     mesh: usize,
     first_index: u32,
     count: u32,
     mat: usize,
     pipe: usize,
+}
+
+/// Pipelines 0..8 are scene (blend x cull); 8..12 are sky (per blend, two-sided, no depth).
+const SKY_PIPE: usize = 8;
+/// Lights kept per grid cell (strongest first) and the minimum cell edge in metres.
+const CELL_LIGHTS: usize = 16;
+const MIN_CELL: f32 = 8.0;
+const MAX_CELLS: usize = 1 << 20;
+
+/// Static light grid: dense 3D cells, each listing up to `CELL_LIGHTS` lights whose sphere touches it.
+struct LightGrid {
+    lights: Vec<[f32; 4]>, // pairs: (pos, range), (colour, 0)
+    cells: Vec<[u32; 2]>,  // (first index, count)
+    idx: Vec<u32>,
+    origin: Vec3,
+    cell: f32,
+    dims: [i32; 3],
+}
+
+impl LightGrid {
+    fn new(lights: &[ao_scene::Light]) -> Self {
+        let lights: Vec<_> = lights.iter().filter(|l| l.range > 0.0 && l.pos.iter().all(|v| v.is_finite())).collect();
+        if lights.is_empty() {
+            return Self { lights: vec![[0.0; 4]; 2], cells: vec![[0, 0]], idx: vec![0], origin: Vec3::ZERO, cell: 1.0, dims: [0; 3] };
+        }
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for l in &lights {
+            lo = lo.min(Vec3::from(l.pos) - l.range);
+            hi = hi.max(Vec3::from(l.pos) + l.range);
+        }
+        let mut cell = MIN_CELL;
+        let dims_for = |c: f32| ((hi - lo) / c).ceil().max(Vec3::ONE);
+        while { let d = dims_for(cell); (d.x * d.y * d.z) as usize > MAX_CELLS } {
+            cell *= 2.0;
+        }
+        let d = dims_for(cell);
+        let dims = [d.x as i32, d.y as i32, d.z as i32];
+        let cell_of = |x: i32, y: i32, z: i32| ((z * dims[1] + y) * dims[0] + x) as u32;
+        // (cell, score, light): score ranks lights inside a cell, brightest and nearest to the cell centre first.
+        let mut pairs: Vec<(u32, f32, u32)> = vec![];
+        for (li, l) in lights.iter().enumerate() {
+            let p = Vec3::from(l.pos);
+            let lum = l.color[0] + l.color[1] + l.color[2];
+            let a = ((p - l.range - lo) / cell).floor();
+            let b = ((p + l.range - lo) / cell).floor();
+            for z in (a.z.max(0.0) as i32)..=(b.z as i32).min(dims[2] - 1) {
+                for y in (a.y.max(0.0) as i32)..=(b.y as i32).min(dims[1] - 1) {
+                    for x in (a.x.max(0.0) as i32)..=(b.x as i32).min(dims[0] - 1) {
+                        let cmin = lo + Vec3::new(x as f32, y as f32, z as f32) * cell;
+                        let near = p.clamp(cmin, cmin + cell);
+                        if (near - p).length_squared() >= l.range * l.range {
+                            continue;
+                        }
+                        let centre = cmin + cell * 0.5;
+                        pairs.push((cell_of(x, y, z), lum / ((centre - p).length_squared() + cell * cell), li as u32));
+                    }
+                }
+            }
+        }
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
+        let mut cells = vec![[0u32, 0u32]; (dims[0] * dims[1] * dims[2]) as usize];
+        let mut idx = Vec::with_capacity(pairs.len());
+        for (c, _, li) in pairs {
+            let e = &mut cells[c as usize];
+            if e[1] == 0 {
+                e[0] = idx.len() as u32;
+            }
+            if (e[1] as usize) < CELL_LIGHTS {
+                idx.push(li);
+                e[1] += 1;
+            }
+        }
+        if idx.is_empty() {
+            idx.push(0);
+        }
+        let gl = lights.iter().flat_map(|l| [[l.pos[0], l.pos[1], l.pos[2], l.range], [l.color[0], l.color[1], l.color[2], 0.0]]).collect();
+        Self { lights: gl, cells, idx, origin: lo, cell, dims }
+    }
 }
 
 /// Static instance data: transform plus world-space bounding sphere.
@@ -120,12 +201,16 @@ struct Inst {
 struct Gpu {
     meshes: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
     inst_bufs: Vec<wgpu::Buffer>, // ring: a buffer is rewritten only after earlier frames using it were submitted
+    sky_bufs: Vec<wgpu::Buffer>,  // ring of per-frame sky instance transforms
     mats: Vec<wgpu::BindGroup>, // [0] = untextured white
     opaque: Vec<Draw>,          // Opaque + AlphaTest, sorted by pipeline/mesh/material
     blended: Vec<Draw>,         // AlphaBlend + Additive, drawn per visible instance, far to near
+    sky: Vec<(Draw, u32)>,      // (draw, index into `sky_xf`) in scene order
+    sky_xf: Vec<Mat4>,
     insts: Vec<Inst>,           // grouped by mesh
     mesh_range: Vec<std::ops::Range<usize>>,
     radius: f32,
+    grid: ([f32; 4], [i32; 4]), // light grid origin+cell, dims
 }
 
 /// Last-frame counters (after frustum culling).
@@ -169,6 +254,7 @@ pub struct Renderer {
     pub stats: FrameStats,
     globals: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
+    g_layout: wgpu::BindGroupLayout,
     tex_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     pipes: Vec<wgpu::RenderPipeline>, // indexed by Draw::pipe
@@ -246,15 +332,17 @@ impl Renderer {
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
+        let storage_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
         let g_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT), storage_entry(1), storage_entry(2), storage_entry(3)],
         });
-        let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &g_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() }],
-        });
+        let globals_bg = globals_bind(&device, &g_layout, &globals, &LightGrid::new(&[]));
         let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -296,19 +384,21 @@ impl Renderer {
         let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
         let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let mk = |blend: Blend, two_sided: bool| {
+        let mk = |blend: Blend, two_sided: bool, sky: bool| {
             let (fs, state, depth_write) = match blend {
                 Blend::Opaque => ("fs_opaque", None, true),
                 Blend::AlphaTest => ("fs_test", None, true),
                 Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
                 Blend::Additive => ("fs_add", Some(wgpu::BlendState { color: add, alpha: wgpu::BlendComponent::OVER }), false),
             };
+            let fs = if sky { ["fs_sky_opaque", "fs_sky_test", "fs_sky_blend", "fs_sky_add"][blend as usize] } else { fs };
+            let depth_write = depth_write && !sky;
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs"),
+                    entry_point: Some(if sky { "vs_sky" } else { "vs" }),
                     compilation_options: Default::default(),
                     buffers: &[
                         wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
@@ -323,13 +413,13 @@ impl Renderer {
                 }),
                 primitive: wgpu::PrimitiveState {
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: (!two_sided).then_some(wgpu::Face::Back),
+                    cull_mode: (!two_sided && !sky).then_some(wgpu::Face::Back),
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH,
                     depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    depth_compare: Some(if sky { wgpu::CompareFunction::Always } else { wgpu::CompareFunction::Less }),
                     stencil: Default::default(),
                     // Blended overlays are often coplanar with the opaque surface below them.
                     bias: if depth_write { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
@@ -341,8 +431,9 @@ impl Renderer {
         };
         let pipes = [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive]
             .into_iter()
-            .flat_map(|b| [false, true].map(|two| (b, two)))
-            .map(|(b, two)| mk(b, two))
+            .flat_map(|b| [false, true].map(|two| (b, two, false)))
+            .chain([Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive].map(|b| (b, true, true)))
+            .map(|(b, two, sky)| mk(b, two, sky))
             .collect();
         let mut r = Self {
             device,
@@ -351,10 +442,11 @@ impl Renderer {
             stats: FrameStats::default(),
             globals,
             globals_bg,
+            g_layout,
             tex_layout,
             sampler,
             pipes,
-            gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], insts: vec![], mesh_range: vec![], radius: 100.0 },
+            gpu: Gpu { meshes: vec![], inst_bufs: vec![], sky_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], sky: vec![], sky_xf: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
             env: default_environment(100.0),
             frame: 0,
             vis: vec![],
@@ -416,14 +508,15 @@ impl Renderer {
                 views.push(self.texture_view(&t.rgba, t.width, t.height));
             }
         }
-        // One bind group per distinct (texture, base colour).
-        let mut mat_of: HashMap<(usize, [u32; 4]), usize> = HashMap::new();
+        // One bind group per distinct (texture, base colour, emissive, glow mask).
+        let mut mat_of: HashMap<(usize, [u32; 8]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
-        let mut material = |dev: &Renderer, view: usize, color: [f32; 4]| {
-            *mat_of.entry((view, color.map(f32::to_bits))).or_insert_with(|| {
+        let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh| {
+            let u: [f32; 8] = [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], s.glow_mask as u32 as f32];
+            *mat_of.entry((view, u.map(f32::to_bits))).or_insert_with(|| {
                 let ub = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
-                    contents: bytemuck::bytes_of(&color),
+                    contents: bytemuck::bytes_of(&u),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
                 mats.push(dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -462,11 +555,14 @@ impl Renderer {
 
         let (mut insts, mut mesh_range, mut meshes) = (vec![], vec![], vec![]);
         let (mut opaque, mut blended) = (vec![], vec![]);
+        let mut sky_draws: HashMap<usize, Vec<Draw>> = HashMap::new();
+        let sky_used = |mi: usize| scene.sky.iter().any(|s| s.mesh == mi);
         for (mi, mesh) in scene.meshes.iter().enumerate() {
             let list = std::mem::take(&mut by_mesh[mi]);
+            let list_len = list.len();
             let range = insts.len()..insts.len() + list.len();
             let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
-            if mesh.vertices.is_empty() || idx_total == 0 || list.is_empty() {
+            if mesh.vertices.is_empty() || idx_total == 0 || (list.is_empty() && !sky_used(mi)) {
                 mesh_range.push(insts.len()..insts.len());
                 meshes.push(None);
                 continue;
@@ -491,14 +587,14 @@ impl Renderer {
                 let count = indices.len() as u32 - first;
                 if count > 0 {
                     let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
-                    let d = Draw {
-                        mesh: mi,
-                        first_index: first,
-                        count,
-                        mat: material(self, view, s.base_color),
-                        pipe: s.blend as usize * 2 + s.two_sided as usize,
-                    };
-                    if matches!(s.blend, Blend::AlphaBlend | Blend::Additive) { blended.push(d) } else { opaque.push(d) }
+                    let mat = material(self, view, s);
+                    let d = Draw { mesh: mi, first_index: first, count, mat, pipe: s.blend as usize * 2 + s.two_sided as usize };
+                    if sky_used(mi) {
+                        sky_draws.entry(mi).or_default().push(Draw { pipe: SKY_PIPE + s.blend as usize, ..d });
+                    }
+                    if list_len > 0 {
+                        if matches!(s.blend, Blend::AlphaBlend | Blend::Additive) { blended.push(d) } else { opaque.push(d) }
+                    }
                 }
             }
             let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -525,7 +621,32 @@ impl Renderer {
         };
         let radius = scene_bounds(scene).map_or(100.0, |(l, h)| ((h - l).length() * 0.5).max(1.0));
         self.env = scene.environment.unwrap_or_else(|| default_environment(radius));
-        self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, insts, mesh_range, radius };
+        let mut sky = vec![];
+        let mut sky_xf = vec![];
+        for s in &scene.sky {
+            for d in sky_draws.get(&s.mesh).into_iter().flatten() {
+                sky.push((*d, sky_xf.len() as u32));
+            }
+            sky_xf.push(Mat4::from_cols_array_2d(&s.transform));
+        }
+        let sky_bufs = if sky_xf.is_empty() {
+            vec![]
+        } else {
+            (0..INST_RING)
+                .map(|_| {
+                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("sky"),
+                        size: (sky_xf.len() * 64) as u64,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                })
+                .collect()
+        };
+        let grid = LightGrid::new(&scene.lights);
+        self.globals_bg = globals_bind(&self.device, &self.g_layout, &self.globals, &grid);
+        let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
+        self.gpu = Gpu { meshes, inst_bufs, sky_bufs, mats, opaque, blended, sky, sky_xf, insts, mesh_range, radius, grid };
     }
 
     /// Scene radius; viewer uses it for speed.
@@ -548,6 +669,8 @@ impl Renderer {
             ambient: v4(env.ambient, 0.0),
             fog_color: v4(env.fog_color, 1.0),
             fog: [env.fog_start, env.fog_end, 0.0, 0.0],
+            grid: self.gpu.grid.0,
+            dims: self.gpu.grid.1,
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
@@ -573,6 +696,11 @@ impl Renderer {
             if !self.vis.is_empty() {
                 self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.vis));
             }
+        }
+        let sky_buf = self.gpu.sky_bufs.get(self.frame);
+        if let Some(buf) = sky_buf {
+            let xf: Vec<[[f32; 4]; 4]> = self.gpu.sky_xf.iter().map(|m| Mat4::from_cols(m.x_axis, m.y_axis, m.z_axis, cam.pos.extend(1.0))).map(|m| m.to_cols_array_2d()).collect();
+            self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&xf));
         }
         // Blended: one draw per (visible instance, submesh), far to near by instance centre.
         self.sorted.clear();
@@ -607,28 +735,34 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            let (mut pipe, mut mesh, mut mat) = (usize::MAX, usize::MAX, usize::MAX);
+            let mut draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>| {
+                if pipe != d.pipe {
+                    pass.set_pipeline(&self.pipes[d.pipe]);
+                    pipe = d.pipe;
+                }
+                if mesh != d.mesh {
+                    let (vb, ib) = self.gpu.meshes[d.mesh].as_ref().unwrap();
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    mesh = d.mesh;
+                }
+                if mat != d.mat {
+                    pass.set_bind_group(1, &self.gpu.mats[d.mat], &[]);
+                    mat = d.mat;
+                }
+                pass.draw_indexed(d.first_index..d.first_index + d.count, 0, insts);
+                calls += 1;
+            };
+            if let Some(sky) = sky_buf {
+                pass.set_vertex_buffer(1, sky.slice(..));
+                for (d, k) in &self.gpu.sky {
+                    draw(&mut pass, d, *k..*k + 1);
+                }
+            }
             if let Some(inst) = inst_buf {
-                pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_vertex_buffer(1, inst.slice(..));
-                let (mut pipe, mut mesh, mut mat) = (usize::MAX, usize::MAX, usize::MAX);
-                let mut draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>| {
-                    if pipe != d.pipe {
-                        pass.set_pipeline(&self.pipes[d.pipe]);
-                        pipe = d.pipe;
-                    }
-                    if mesh != d.mesh {
-                        let (vb, ib) = self.gpu.meshes[d.mesh].as_ref().unwrap();
-                        pass.set_vertex_buffer(0, vb.slice(..));
-                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                        mesh = d.mesh;
-                    }
-                    if mat != d.mat {
-                        pass.set_bind_group(1, &self.gpu.mats[d.mat], &[]);
-                        mat = d.mat;
-                    }
-                    pass.draw_indexed(d.first_index..d.first_index + d.count, 0, insts);
-                    calls += 1;
-                };
                 for d in &self.gpu.opaque {
                     let r = self.vis_range[d.mesh].clone();
                     if !r.is_empty() {
@@ -702,4 +836,23 @@ pub fn render_to_png(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header()?.write_image_data(&pixels)?;
     Ok(())
+}
+
+fn storage<T: bytemuck::Pod>(device: &wgpu::Device, data: &[T]) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(data), usage: wgpu::BufferUsages::STORAGE })
+}
+
+/// Group 0: globals uniform + the static light grid (lights, cells, per-cell index lists).
+fn globals_bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, g: &LightGrid) -> wgpu::BindGroup {
+    let (l, c, i) = (storage(device, &g.lights), storage(device, &g.cells), storage(device, &g.idx));
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: l.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: c.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: i.as_entire_binding() },
+        ],
+    })
 }
