@@ -880,6 +880,47 @@ impl Gui {
         }
     }
 
+    /// True when `(x, y)` is over something interactive or any non-root view of a visible window
+    /// (a full-screen transparent window such as CharacterSelectionWindow does not count by itself).
+    pub fn wants_mouse(&self, x: f32, y: f32) -> bool {
+        if self.popup.is_some() || self.hit(x, y).is_some() {
+            return true;
+        }
+        for (_, root, pos) in self.windows_top_down() {
+            if self.covers(root, x - pos.0 as f32, y - pos.1 as f32, true, 0.0, 0.0) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn covers(&self, id: ViewId, x: f32, y: f32, is_root: bool, ox: f32, oy: f32) -> bool {
+        let v = &self.tree.views[id];
+        if !v.visible {
+            return false;
+        }
+        let (l, t) = if is_root { (0.0, 0.0) } else { (ox + v.frame.l, oy + v.frame.t) };
+        let r = Rect::new(l, t, l + v.frame.width(), t + v.frame.height());
+        if !is_root && r.contains(Point::new(x, y)) && matches!(v.kind, Kind::Border(_) | Kind::Button(_) | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) | Kind::Input | Kind::Combo(_)) {
+            return true;
+        }
+        v.children.iter().any(|c| self.covers(*c, x, y, false, l, t))
+    }
+
+    /// Appends `text` (top-left at `x`,`y`, window pixels) in `font`/`color` (0xRRGGBB) to `list`.
+    /// Returns the advance width in pixels.
+    pub fn text_cmds(&mut self, font: FontId, text: &str, x: i32, y: i32, color: u32, list: &mut DrawList) -> i32 {
+        self.draw_string(&mut list.cmds, font, text, x, y, rgb(color), 1.0, false)
+    }
+    /// Pixel width of `text` in `font`.
+    pub fn text_width(&mut self, font: FontId, text: &str) -> i32 {
+        self.fonts.font(font).text_width(text)
+    }
+    /// Line height of `font` in pixels.
+    pub fn font_height(&mut self, font: FontId) -> i32 {
+        self.fonts.font(font).height
+    }
+
     // ------------------------------------------------------------------ input
 
     /// Feeds one input event; returns the UI events it produced.

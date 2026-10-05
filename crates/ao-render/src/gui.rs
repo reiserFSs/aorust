@@ -139,8 +139,9 @@ impl GuiRenderer {
         }
     }
 
-    /// Draws `list` over `target` (size in pixels = the GUI coordinate system). The target is loaded, not cleared.
-    pub fn draw(&mut self, r: &Renderer, target: &wgpu::TextureView, size: (u32, u32), gui: &Gui, list: &DrawList) {
+    /// Draws `list` over `target` (`size` = target pixels, `scale` = target pixels per GUI pixel, nearest-neighbour). The target is loaded, not cleared.
+    pub fn draw(&mut self, r: &Renderer, target: &wgpu::TextureView, size: (u32, u32), scale: u32, gui: &Gui, list: &DrawList) {
+        let sc = scale.max(1) as f32;
         let ga = gui.glyph_atlas();
         if ga.version != self.glyph_version {
             r.queue.write_texture(
@@ -157,7 +158,7 @@ impl GuiRenderer {
         let mut clip: Option<[i32; 4]> = None;
         let mut start = 0u32;
         let quad = |verts: &mut Vec<Vertex>, d: [f32; 4], uv: [f32; 4], color: [f32; 4], kind: u32| {
-            let v = |x, y, u, v| Vertex { pos: [x, y], uv: [u, v], color, kind };
+            let v = |x: f32, y: f32, u, v| Vertex { pos: [x * sc, y * sc], uv: [u, v], color, kind };
             verts.extend_from_slice(&[v(d[0], d[1], uv[0], uv[1]), v(d[2], d[1], uv[2], uv[1]), v(d[0], d[3], uv[0], uv[3]), v(d[2], d[1], uv[2], uv[1]), v(d[2], d[3], uv[2], uv[3]), v(d[0], d[3], uv[0], uv[3])]);
         };
         let (gw, gh) = (self.glyph_size.0 as f32, self.glyph_size.1 as f32);
@@ -225,6 +226,7 @@ impl GuiRenderer {
             for (c, range) in batches {
                 match c {
                     Some([x0, y0, x1, y1]) => {
+                        let (x0, y0, x1, y1) = (x0 * scale as i32, y0 * scale as i32, x1 * scale as i32, y1 * scale as i32);
                         let (x0, y0) = (x0.clamp(0, size.0 as i32), y0.clamp(0, size.1 as i32));
                         let (x1, y1) = (x1.clamp(x0, size.0 as i32), y1.clamp(y0, size.1 as i32));
                         pass.set_scissor_rect(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
