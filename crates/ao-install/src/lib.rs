@@ -1,6 +1,6 @@
 //! PRK client installer/patcher, ported from the PRK launcher (see docs/formats.md `## installer`).
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -135,33 +135,83 @@ fn apply_patch(client_dir: &Path, dst: &Version, zip_path: &Path) -> Result<()> 
         eprintln!("  deleted {n} files");
     }
     let tmp = client_dir.join("patch.version.tmp");
-    fs::write(&tmp, dst.to_string())?;
+    let mut f = File::create(&tmp)?;
+    f.write_all(dst.to_string().as_bytes())?;
+    f.sync_all()?;
+    drop(f);
     fs::rename(&tmp, client_dir.join("patch.version"))?;
+    File::open(client_dir)?.sync_all()?; // persist the rename
     Ok(())
 }
 
 /// Download with HTTP Range resume into `dest` (kept on failure so the next run resumes).
+/// A partial file is only continued when the server confirms the offset; a 416 is only trusted when
+/// the local size equals the server's size, otherwise the stale file is discarded and fetched afresh.
 fn download(url: &str, dest: &Path) -> Result<()> {
-    let have = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-    let mut req = ureq::get(url);
-    if have > 0 {
-        req = req.set("Range", &format!("bytes={have}-"));
+    let mut have = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+    loop {
+        let mut req = ureq::get(url);
+        if have > 0 {
+            req = req.set("Range", &format!("bytes={have}-"));
+        }
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(416, _)) if have > 0 => {
+                let server = ureq::head(url).call().with_context(|| format!("HEAD {url}"))?;
+                if server.header("Content-Length").and_then(|t| t.parse::<u64>().ok()) == Some(have) {
+                    eprintln!("  HTTP 416, local file already complete ({have} B)");
+                    return Ok(());
+                }
+                eprintln!("  HTTP 416 but local size {have} != server size, restarting");
+                fs::remove_file(dest)?;
+                have = 0;
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("GET {url}")),
+        };
+        eprintln!("  HTTP {}{}", resp.status(), if have > 0 { format!(" (Range: bytes={have}-)") } else { String::new() });
+        match resp_plan(resp.status(), resp.header("Content-Range"), resp.header("Content-Length"), have) {
+            Plan::Restart => {
+                eprintln!("  Content-Range does not continue at {have}, restarting");
+                fs::remove_file(dest)?;
+                have = 0;
+            }
+            Plan::Append(total) => return stream(resp, dest, have, total, true),
+            Plan::Fresh(total) => return stream(resp, dest, 0, total, false),
+        }
     }
-    let resp = match req.call() {
-        Ok(r) => r,
-        // already complete
-        Err(ureq::Error::Status(416, _)) => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("GET {url}")),
-    };
-    eprintln!("  HTTP {}{}", resp.status(), if have > 0 { format!(" (Range: bytes={have}-)") } else { String::new() });
-    let (mut done, total, mut file) = if resp.status() == 206 {
-        // Content-Range: bytes a-b/total
-        let total = resp.header("Content-Range").and_then(|r| r.rsplit('/').next()).and_then(|t| t.parse::<u64>().ok());
-        (have, total, OpenOptions::new().append(true).open(dest)?)
-    } else {
-        let total = resp.header("Content-Length").and_then(|t| t.parse::<u64>().ok());
-        (0, total, File::create(dest)?)
-    };
+}
+
+#[derive(Debug, PartialEq)]
+enum Plan {
+    /// Continue the partial file; value = total size from `Content-Range`.
+    Append(Option<u64>),
+    /// Overwrite from byte 0; value = `Content-Length`.
+    Fresh(Option<u64>),
+    /// 206 for a different offset than requested: drop the partial file and ask again without Range.
+    Restart,
+}
+
+/// Decide what to do with a successful response given `have` bytes already on disk.
+fn resp_plan(status: u16, content_range: Option<&str>, content_length: Option<&str>, have: u64) -> Plan {
+    if status != 206 {
+        return Plan::Fresh(content_length.and_then(|t| t.parse().ok()));
+    }
+    // Content-Range: bytes a-b/total
+    let parsed = content_range.and_then(|r| {
+        let (range, total) = r.trim().strip_prefix("bytes ")?.split_once('/')?;
+        let start: u64 = range.split_once('-')?.0.trim().parse().ok()?;
+        Some((start, total.trim().parse::<u64>().ok()))
+    });
+    match parsed {
+        Some((start, total)) if start == have => Plan::Append(total),
+        _ => Plan::Restart,
+    }
+}
+
+fn stream(resp: ureq::Response, dest: &Path, start: u64, total: Option<u64>, append: bool) -> Result<()> {
+    let mut done = start;
+    let mut file = if append { OpenOptions::new().append(true).create(true).open(dest)? } else { File::create(dest)? };
     let mut r = resp.into_reader();
     let mut buf = vec![0u8; 1 << 20];
     let mut last = u64::MAX;
@@ -222,7 +272,8 @@ pub fn apply_rdbpatch(db: &Path, patch: &Path) -> Result<usize> {
     if count < 0 {
         bail!("negative record count");
     }
-    let mut conn = Connection::open(db).with_context(|| format!("opening {}", db.display()))?;
+    // never create an empty rdb.db: a missing database means a broken client
+    let mut conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX).with_context(|| format!("opening {}", db.display()))?;
     let tx = conn.transaction()?;
     for _ in 0..count {
         let ty = u32le(take(4)?);
@@ -413,5 +464,97 @@ mod tests {
         assert_eq!(version(), "0.1.1");
         assert!(!zip.exists() && !client.join("0.1.1.rdbpatch").exists() && client.join("0.1.1.df").exists() && !client.join("old.txt").exists());
         assert_eq!(c.query_row("SELECT count(*) FROM rdb_5", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    /// Minimal HTTP server over `data`: GET/HEAD, honours `Range: bytes=N-` unless `lie` (then answers
+    /// 206 starting at 0). Serves until the process ends; returns the URL and a log of "METHOD status".
+    fn serve(data: Vec<u8>, lie: bool) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/p.zip", l.local_addr().unwrap());
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lg = log.clone();
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let mut rd = BufReader::new(c.try_clone().unwrap());
+                let (mut method, mut range) = (String::new(), None::<u64>);
+                let mut line = String::new();
+                while rd.read_line(&mut line).unwrap_or(0) > 2 {
+                    if method.is_empty() {
+                        method = line.split(' ').next().unwrap().to_string();
+                    }
+                    if let Some(r) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        range = r.trim().trim_end_matches('-').parse().ok();
+                    }
+                    line.clear();
+                }
+                let n = data.len() as u64;
+                let (status, head, body): (u16, String, &[u8]) = match range {
+                    Some(a) if a >= n => (416, format!("Content-Range: bytes */{n}\r\n"), &[]),
+                    Some(_) if lie => (206, format!("Content-Range: bytes 0-{}/{n}\r\n", n - 1), &data[..]),
+                    Some(a) => (206, format!("Content-Range: bytes {a}-{}/{n}\r\n", n - 1), &data[a as usize..]),
+                    None => (200, String::new(), &data[..]),
+                };
+                lg.lock().unwrap().push(format!("{method} {status}"));
+                let _ = write!(c, "HTTP/1.1 {status} X\r\n{head}Content-Length: {}\r\nConnection: close\r\n\r\n", if status == 416 && method == "HEAD" { 0 } else { body.len() });
+                if method != "HEAD" {
+                    let _ = c.write_all(body);
+                }
+            }
+        });
+        (url, log)
+    }
+
+    #[test]
+    fn download_resume_checks() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("p.zip");
+        let (url, log) = serve(data.clone(), false);
+
+        // valid partial: 206 and appended
+        fs::write(&dest, &data[..30_000]).unwrap();
+        download(&url, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), data);
+        assert_eq!(log.lock().unwrap().as_slice(), ["GET 206"]);
+
+        // complete file: 416 confirmed by HEAD size, file untouched
+        log.lock().unwrap().clear();
+        download(&url, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), data);
+        assert_eq!(log.lock().unwrap().as_slice(), ["GET 416", "HEAD 200"]);
+
+        // oversized stale file: 416 but size differs -> discarded and refetched in full
+        log.lock().unwrap().clear();
+        let mut big = data.clone();
+        big.extend([9u8; 500]);
+        fs::write(&dest, big).unwrap();
+        download(&url, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), data);
+        assert_eq!(log.lock().unwrap().as_slice(), ["GET 416", "HEAD 200", "GET 200"]);
+
+        // server answers 206 for the wrong offset: partial discarded, refetched from 0
+        let (url, log) = serve(data.clone(), true);
+        fs::write(&dest, &data[..30_000]).unwrap();
+        download(&url, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), data);
+        assert_eq!(log.lock().unwrap().first().unwrap(), "GET 206");
+    }
+
+    #[test]
+    fn resp_plan_cases() {
+        assert_eq!(resp_plan(200, None, Some("10"), 5), Plan::Fresh(Some(10)));
+        assert_eq!(resp_plan(206, Some("bytes 5-9/10"), None, 5), Plan::Append(Some(10)));
+        assert_eq!(resp_plan(206, Some("bytes 0-9/10"), None, 5), Plan::Restart);
+        assert_eq!(resp_plan(206, None, None, 5), Plan::Restart);
+    }
+
+    #[test]
+    fn rdbpatch_missing_db_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, p) = (dir.path().join("rdb.db"), dir.path().join("x.rdbpatch"));
+        fs::write(&p, patch_bytes(&[(5, 1, b"a")])).unwrap();
+        assert!(apply_rdbpatch(&db, &p).is_err());
+        assert!(!db.exists() && p.exists());
     }
 }
