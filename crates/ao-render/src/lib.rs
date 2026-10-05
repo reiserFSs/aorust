@@ -75,7 +75,7 @@ pub fn scene_bounds(scene: &Scene) -> Option<(Vec3, Vec3)> {
     (lo.x <= hi.x).then_some((lo, hi))
 }
 
-/// Default eye/target: `spawn` (+ `spawn_look_at`) if set, else a 3/4 view framing the bounds.
+/// Default eye/target: `spawn` (+ `spawn_look_at`) if set, else a 3/4 view framing the bounds (distance 2.4 r: the bounding sphere needs r/sin(30°) = 2 r for the 60° vertical FOV, plus margin; 16:10 or wider).
 pub fn default_view(scene: &Scene) -> (Vec3, Vec3) {
     let Some((lo, hi)) = scene_bounds(scene) else { return (scene.spawn.map_or(Vec3::new(0.0, 2.0, 5.0), Vec3::from), scene.spawn_look_at.map_or(Vec3::ZERO, Vec3::from)) };
     let center = (lo + hi) * 0.5;
@@ -85,7 +85,7 @@ pub fn default_view(scene: &Scene) -> (Vec3, Vec3) {
             let s = Vec3::from(s);
             (s, scene.spawn_look_at.map_or(Vec3::new(center.x, s.y, center.z), Vec3::from))
         }
-        None => (center + Vec3::new(0.6, 0.5, 1.0).normalize() * r * 1.8, center),
+        None => (center + Vec3::new(0.6, 0.5, 1.0).normalize() * r * 2.4, center),
     }
 }
 
@@ -579,9 +579,9 @@ impl Renderer {
                 let first = indices.len() as u32;
                 let nv = mesh.vertices.len() as u32;
                 // Drop whole triangles that index out of range rather than crash the GPU.
-                for t in s.indices.chunks_exact(3) {
+                for t in s.indices.as_chunks::<3>().0 {
                     if t.iter().all(|&i| i < nv) {
-                        indices.extend_from_slice(t);
+                        indices.extend_from_slice(t.as_slice());
                     }
                 }
                 let count = indices.len() as u32 - first;

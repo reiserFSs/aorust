@@ -105,7 +105,7 @@ pub fn scene(count: usize) -> Scene {
         let sc = 0.5 + rnd() * 2.5;
         let t = Mat4::from_scale_rotation_translation(
             Vec3::splat(sc),
-            Quat::from_rotation_y(rnd() * 6.28),
+            Quat::from_rotation_y(rnd() * std::f32::consts::TAU),
             Vec3::new((rnd() - 0.5) * 2.0 * half, sc / 2.0, (rnd() - 0.5) * 2.0 * half),
         );
         s.instances.push(Instance { mesh: 2 + (rnd() * 8.0) as usize % 8, transform: t.to_cols_array_2d() });
