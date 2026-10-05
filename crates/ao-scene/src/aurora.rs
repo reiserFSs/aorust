@@ -192,9 +192,14 @@ impl GloomySky {
         let step = self.params.curve_step;
         for ci in 0..self.params.curves.len() {
             let c = self.params.curves[ci].clone();
-            let mut x = 0.0f32;
-            // `step <= 0` would never leave the loop (the client's own tweak comment: "never bigger than 1.0")
-            while w > 0.0 && step > 0.0 && x < w {
+            // `step <= 0` would never leave the loop (the client's own tweak comment: "never bigger than 1.0"), and a
+            // step so small that `x + step == x` would not either: sample by index, at most 65 536 samples (the map is
+            // <= 65 535 texels wide, a retail step is 0.5..1).
+            for i in 0..65_536u32 {
+                let x = i as f32 * step;
+                if !(w > 0.0 && step > 0.0 && x < w) {
+                    break;
+                }
                 let u = x / w * pi * 0.5;
                 let mut v = 0.0f32;
                 for k in 0..4 {
@@ -207,7 +212,6 @@ impl GloomySky {
                 let y = h * 0.5 * v;
                 let color = if self.rng.next() % 1000 < c.chance { c.rand_color } else { c.main_color };
                 self.plot(x - (self.params.width >> 1) as f32, y, c.intensity, color);
-                x += step;
             }
         }
     }
@@ -293,6 +297,14 @@ mod tests {
         assert!(s.vertex_colors().iter().any(|&v| v >> 24 > 0), "plot visible in the vertex copy");
         // 255 * weight <= 255, fade 200: only alphas above 200 survive for the next frame, as alpha - 200
         assert!(s.map.iter().all(|&v| v == 0 || (v >> 24) <= 55));
+    }
+
+    #[test]
+    fn tiny_curve_step_terminates() {
+        let mut p = params();
+        p.curve_step = 1e-10;
+        let mut s = GloomySky::new(p);
+        s.step(STEP);
     }
 
     #[test]

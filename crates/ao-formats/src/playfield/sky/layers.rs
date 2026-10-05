@@ -96,6 +96,11 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
 /// Position expressions of the scenery objects: `RKPP.<place> - PlayfieldData.UniversePosition + This.UniversePosition + v(..)`
 /// (terms separated by `+` / `-`, evaluated left to right).
 pub(super) fn position_expr(objs: &[Obj], o: &Obj, expr: &str) -> Option<[f32; 3]> {
+    position_expr_at(objs, o, expr, 0)
+}
+
+/// `depth` counts the `RKWP.` waypoint hops (a self-referencing script would otherwise recurse forever).
+fn position_expr_at(objs: &[Obj], o: &Obj, expr: &str, depth: u8) -> Option<[f32; 3]> {
     let ctx = Ctx::at(0.0);
     let rkpp = objs.iter().find(|r| r.name == "RKPP")?;
     let place = |name: &str| script::vector(rkpp, &ctx, rkpp.field(name)?, 0);
@@ -111,7 +116,7 @@ pub(super) fn position_expr(objs: &[Obj], o: &Obj, expr: &str) -> Option<[f32; 3
         if let Some(n) = t.strip_prefix("RKWP.") {
             // `RKWP.Pos_*` waypoint of `Tweak_RubiKa_Waypoints`: a place position plus a local offset
             let w = objs.iter().find(|r| r.name == "RKWP")?;
-            return position_expr(objs, w, w.field(n)?);
+            return position_expr_at(objs, w, w.field(n)?, depth.checked_add(1).filter(|&d| d < 8)?);
         }
         if t == "This.WND" {
             // `GAME.LowAltitudeWind * GameDeltaTime * 1.1` smoothed: the wind drift of the `_A` waypoints, 0 for a still frame
@@ -657,6 +662,13 @@ fn wave_curves_read(o: &Obj, expr: &str, depth: u32) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_referencing_waypoint_is_rejected() {
+        let objs = super::super::script::parse_objects("Object RKPP\n{\n  Vector A v(1,2,3)\n}\nObject RKWP\n{\n  Vector P RKWP.P\n}\n");
+        let o = objs[1].clone();
+        assert_eq!(position_expr(&objs, &o, "RKWP.P"), None);
+    }
 
     #[test]
     fn scale_field_is_ignored_unless_scale_type_is_zero() {

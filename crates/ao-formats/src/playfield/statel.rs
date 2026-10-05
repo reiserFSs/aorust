@@ -28,7 +28,7 @@ pub struct Statel {
     /// `flags & 4`: per-instance colour word (the client keeps it with the statel; 9 212 of 2.36 M statels carry one).
     pub colour: Option<u32>,
     /// `(bit index, value)` attribute pairs: texture overrides `(SimpleMesh slot, rdb 1010004 id)` (`NewTextureData_t`).
-    pub attrs: Vec<(u8, u32)>,
+    pub attrs: Vec<(u32, u32)>,
     /// Which of the four statel lists of the zone it came from (0..3; the lists are the zone's distance classes, see docs).
     pub list: u8,
 }
@@ -78,12 +78,15 @@ fn statel(r: &mut Rd, list: u8) -> Result<Statel> {
     let scale = r.u8()?;
     let mut n = r.u8()?;
     let mut attrs = Vec::new();
+    // The client's slot counter (`FUN_1002777a`) is set once and runs over every bit of every mask word.
+    let mut word = 0u32;
     while n != 0 {
         let mask = r.u32()?;
-        for bit in (0..32u8).filter(|b| mask >> b & 1 != 0) {
-            attrs.push((bit, r.u32()?));
+        for bit in (0..32u32).filter(|b| mask >> b & 1 != 0) {
+            attrs.push((word * 32 + bit, r.u32()?));
             n = n.wrapping_sub(1);
         }
+        word += 1;
     }
     let colour = if flags & 4 != 0 { Some(r.u32()?) } else { None };
     Ok(Statel { pos, flags, mesh, scale, colour, attrs, list })
@@ -300,6 +303,24 @@ mod tests {
             }
         }
         d
+    }
+
+    #[test]
+    fn attr_slots_continue_across_mask_words() {
+        // mesh 42556 case: word 0 empty, word 1 has bits 0 and 2 -> slots 32 and 34 (`FUN_1002777a`)
+        let mut d = Vec::new();
+        for v in [0f32, 0.0, 0.0] {
+            d.extend(v.to_le_bytes());
+        }
+        d.extend(0u32.to_le_bytes());
+        d.extend(42556u32.to_le_bytes());
+        d.extend([90, 2]);
+        d.extend(0u32.to_le_bytes());
+        d.extend(0b101u32.to_le_bytes());
+        d.extend(42914u32.to_le_bytes());
+        d.extend(42907u32.to_le_bytes());
+        let s = statel(&mut Rd::new(&d, 0), 0).unwrap();
+        assert_eq!(s.attrs, vec![(32, 42914), (34, 42907)]);
     }
 
     #[test]

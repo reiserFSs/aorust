@@ -247,13 +247,13 @@ fn terrain_height(tm: &ground::Tilemap, x: f32, z: f32) -> Option<f32> {
 }
 
 /// A statel's mesh record type and id plus its texture-override attributes: each distinct triple is one decoded scene mesh.
-type MeshKey = (u32, u32, Vec<(u8, u32)>);
+type MeshKey = (u32, u32, Vec<(u32, u32)>);
 
 /// A placed statel awaiting its LOD bookkeeping.
 struct Placed {
     instance: usize,
     mesh: u32,
-    attrs: Vec<(u8, u32)>,
+    attrs: Vec<(u32, u32)>,
     transform: [[f32; 4]; 4],
     flag8: bool,
     class: u8,
@@ -268,7 +268,7 @@ struct Placer<'a> {
 }
 
 impl Placer<'_> {
-    fn mesh(&mut self, rdb_type: u32, id: u32, attrs: &[(u8, u32)]) -> Option<usize> {
+    fn mesh(&mut self, rdb_type: u32, id: u32, attrs: &[(u32, u32)]) -> Option<usize> {
         let key = (rdb_type, id, attrs.to_vec());
         if let Some(&m) = self.cache.get(&key) {
             return m;

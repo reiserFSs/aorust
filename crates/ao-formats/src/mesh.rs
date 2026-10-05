@@ -59,7 +59,7 @@ const OVERRIDE_TEXTURES: u32 = 1_010_004;
 /// `SimpleMesh` (counted over the whole node tree in traversal order, empty ones included). Statel attributes are
 /// `std::vector<NewTextureData_t>` (`{i32 slot, u32 texture}`, 8 bytes) handed to `VisualMesh_t::SetMesh` (DisplaySystem
 /// @0x1006b623) -> `AsyncMesh` (@0x1007125c) -> `FUN_100714c2`; see `docs/formats.md` § playfields.
-pub fn decode_statel_mesh(store: &RecordStore, rdb_type: u32, id: u32, overrides: &[(u8, u32)], scene: &mut Scene) -> Result<Option<usize>> {
+pub fn decode_statel_mesh(store: &RecordStore, rdb_type: u32, id: u32, overrides: &[(u32, u32)], scene: &mut Scene) -> Result<Option<usize>> {
     decode_record(store, rdb_type, id, scene, false, overrides)
 }
 
@@ -69,7 +69,7 @@ pub fn decode_mesh_object_space(store: &RecordStore, id: u32, scene: &mut Scene)
     decode_record(store, MESH_TYPE, id, scene, true, &[])
 }
 
-fn decode_record(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene, object_space: bool, overrides: &[(u8, u32)]) -> Result<Option<usize>> {
+fn decode_record(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene, object_space: bool, overrides: &[(u32, u32)]) -> Result<Option<usize>> {
     let Some(bytes) = store.get(rdb_type, id)? else { return Ok(None) };
     let mesh = decode_archive_with(&bytes, object_space, overrides, |key| {
         if let std::collections::hash_map::Entry::Vacant(e) = scene.textures.entry(key) {
@@ -189,7 +189,7 @@ struct Builder<'a, 'b> {
     /// Ignore every node matrix (vertices as stored).
     object_space: bool,
     /// Statel texture overrides `(SimpleMesh slot, texture id)` and the running slot counter.
-    overrides: &'b [(u8, u32)],
+    overrides: &'b [(u32, u32)],
     slot: usize,
 }
 
@@ -197,7 +197,7 @@ fn decode_archive(bytes: &[u8], object_space: bool, have_texture: impl FnMut(Tex
     decode_archive_with(bytes, object_space, &[], have_texture)
 }
 
-fn decode_archive_with(bytes: &[u8], object_space: bool, overrides: &[(u8, u32)], mut have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
+fn decode_archive_with(bytes: &[u8], object_space: bool, overrides: &[(u32, u32)], mut have_texture: impl FnMut(TextureKey) -> bool) -> Result<Mesh> {
     let ar = Archive::parse(bytes)?;
     let mut b = Builder {
         ar: &ar,

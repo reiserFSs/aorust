@@ -17,7 +17,7 @@ pub fn params(o: &Obj, ctx: &Ctx) -> Option<GloomyParams> {
     let flag = |n: &str| f(n) != 0.0;
     let (width, height) = (f("ColorMapWidth") as usize, f("ColorMapHeight") as usize);
     // the map is a vertex grid indexed with u16 in the client
-    if width < 2 || height < 2 || width * height > 65_535 {
+    if width < 2 || height < 2 || width.checked_mul(height).is_none_or(|n| n > 65_535) {
         return None;
     }
     let n = (f("NumberOfCurves") as i32).clamp(1, 9) as usize;
@@ -114,6 +114,12 @@ mod tests {
         }
         text += "}\n";
         parse_objects(&text).remove(0)
+    }
+
+    #[test]
+    fn overflowing_map_size_is_rejected() {
+        let o = parse_objects("Object A\n{\n  Unsigned FXID: e_GloomySky\n  Unsigned ColorMapWidth 9223372036854775808u\n  Unsigned ColorMapHeight 2u\n}\n").remove(0);
+        assert!(params(&o, &Ctx::at(0.0)).is_none());
     }
 
     #[test]
