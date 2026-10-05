@@ -1,7 +1,7 @@
 //! The screens of docs/screens.md as behaviour on top of `ao_gui` windows.
 
 use super::*;
-use ao_formats::screens::{ao_to_render, LOGIN_CAMERA, LOGIN_STAGE_Y_STEP};
+use ao_formats::screens::{ao_to_render, set_login_stage, LOGIN_CAMERA};
 use ao_net::msg::CharacterInfo;
 
 fn center(size: (u32, u32), outer: (u32, u32)) -> (i32, i32) {
@@ -56,9 +56,7 @@ impl Play {
     fn show_backdrop(&mut self, stage: u32, host: &mut Host) {
         let Some(b) = &self.backdrop else { return };
         let mut s = (**b).clone();
-        for i in &mut s.instances {
-            i.transform[3][1] = stage as f32 * LOGIN_STAGE_Y_STEP;
-        }
+        set_login_stage(&mut s, stage);
         self.mesh_base = s.meshes.len();
         host.camera = Camera::look_at(Vec3::from(s.spawn.unwrap_or_default()), Vec3::from(s.spawn_look_at.unwrap_or_default()));
         host.set_scene(s);
@@ -341,9 +339,7 @@ impl Play {
                 preview::Out::First(mut ch) => {
                     let Some(b) = &self.backdrop else { continue };
                     let mut s = (**b).clone();
-                    for i in &mut s.instances {
-                        i.transform[3][1] = LOGIN_STAGE_Y_STEP;
-                    }
+                    set_login_stage(&mut s, 1);
                     let base = s.meshes.len();
                     self.mesh_base = base;
                     s.textures.extend(std::mem::take(&mut ch.textures));

@@ -81,17 +81,73 @@ duplicate geometry does not overlap; `FMUL double [0x101a9f90]` in `AddMesh`). A
 |---|---|---|
 | position (x,y,z) | **(0.657694, 2.27458, −10.5489)** | floats at 0x101a9a9c, 0x101a9a98, 0x101a9a94 (ctor stores them into the stage record at +0) |
 | rotation quaternion (x,y,z,w) | **(0.000490287, −0.994476, 0.104805, −0.00575912)** | floats 0x101aa064, 0x101aa060, 0x101aa05c, 0x101aa058 (stage record +0xc; `Quaternion_t` default is (0,0,0,1) = `param_1[6]=1.0` in `FUN_10016273` so w is last) |
-| FOV | 1.0472 rad = **60°** | 0x101a9f98; passed as first arg of `VisualCamera_t::VisualCamera_t(fov, aspect, near, far)` |
+| FOV | 1.0472 rad = **60° horizontal** (vertical = 2·atan(tan 30° / aspect): 46.8° at 4:3, 39.7° at 16:10, 36.0° at 16:9) | 0x101a9f98; passed as first arg of `VisualCamera_t::VisualCamera_t(fov, aspect, near, far)`, see *Lens* below |
 | aspect | `DisplayWidth / DisplayHeight` | ctor |
 | near / far | **0.5 / 1000** | 0x101a9f9c / 0x101a9fa0 |
 
 Space is AO's left-handed, Y-up, 1 unit = 1 m (`docs/formats.md` § mesh). The yaw is ≈ 2·asin(0.9945) ≈ 168° with a 12° downward pitch
-(2·asin(0.1048)), i.e. the camera looks along −Z. Whether the 60° is vertical or horizontal FOV is **UNRESOLVED** (the D3D camera class is
-not decompiled; the character-creation camera file uses the same "degFOV" 60 convention).
+(2·asin(0.1048)), i.e. the camera looks along −Z.
 
-No lights, fog or sky are created by `LoginWorld_c`, `CCCharacter_t`, `CharacterViewer_c`, `LoginModule_c` or `ServerLogin3DModule_t`
-(searched every call to `*Light*`, `*Ambient*`, `*Fog*` in those classes: none). The meshes' own light/prelit data is therefore all
-the lighting there is — what the engine's default render state adds is **UNRESOLVED**.
+**Lens — the 60° is the HORIZONTAL field of view (resolved).** `VisualCamera_t::VisualCamera_t(fov, aspect, near, far)` [DisplaySystem
+0x1006b12f] builds `RCamera_t(fov, aspect, near, far, parent, anim)` [randy31 0x1002a68a, args at `[EBP+8..0x14]`]: `t = tan(fov · 0.5)`
+(the double at 0x1009fd98 is 0.5, `_CItan` via 0x10078c3a), view-plane window `left = −t, right = +t, top = t / aspect, bottom = −t / aspect`
+(object +0xa4 / 0xac / 0xa8 / 0xb0), `near` +0xb4, `far` +0xb8. `RCamera_t::GetTransformationMatrix` [0x1002ab22] turns it into the D3D
+left-handed projection `m00 = 2 / (right − left) = 1 / tan(fov/2)`, `m11 = m00 · 2 / (top − bottom) = aspect / tan(fov/2)`,
+`m22 = far / (far − near)`, `m32 = −near · far / (far − near)`, `m23 = 1` (x scale independent of the aspect ⇒ horizontal angle).
+`RCamera_t::SetViewPlaneWindow(fov, aspect)` [0x1002a8e1] uses the same two lines, and the character-creation module calls it
+(`VisualCamera_t::SetViewPlaneWindow(degFOV · π / 180, aspect)`, GUI 0x1011c81c in `FrameProcess` 0x1011c02c): **`degFOV` of
+`CharCreateCamera.dat` (§10) is horizontal as well.** `LoginWorld_c` never calls `SetViewPlaneWindow`; its aspect is `DisplayWidth /
+DisplayHeight` (the window's, here). Implemented: `ao_scene::Lens { fov, horizontal, near, far }` (`Scene::lens`, `Lens::vertical_fov(aspect)`),
+used by `ao-render` (`Renderer::render`), `ao_formats::screens::LOGIN_LENS` = 60° horizontal, 0.5 / 1000. The free-fly viewer and the playfields keep
+`Lens::default()` (60° vertical, near 0.2, far from the fog) — whether the in-world camera is also horizontal is not examined here.
+
+**Lighting — what the client actually does (resolved).** No code of `LoginWorld_c`, `CCCharacter_t`, `CharacterViewer_c`, `LoginModule_c` or
+`ServerLogin3DModule_t` creates lights, sets an ambient colour or fog (searched every reference to `*Light*`, `*Ambient*`, `*Fog*` in GUI.dll:
+only `AnarchyGround_t::ToggleLightingFix`, a pref string `FogMode`, and the character-*creation* `CCCharacter_t::ShowSelectionGlow` below). So the scene is
+lit by (a) the device state that `Randy_t`'s reset leaves and (b) the lights stored in the meshes:
+
+* **Device state** — `FUN_10041ede` [randy31 0x10041ede, run by the `Randy_t` constructor 0x10043365] sets every state explicitly
+  (`render_t::SetRenderState` wrapper 0x1002397c, `SetTextureStageState` wrapper 0x10023adc): `LIGHTING` (137) = 1, **`AMBIENT` (139) = 0 (black)**,
+  `COLORVERTEX` (141) = 1, `LOCALVIEWER` (142) = 1, `NORMALIZENORMALS` (143) = 0 (1 only when `Randy_t::s_eHardwareLevel & 2`), material sources
+  `DIFFUSE/SPECULAR/AMBIENT` (145–147) = `COLOR1/COLOR2/COLOR2`, `EMISSIVE` (148) = `MATERIAL`, **`SPECULARENABLE` (29) = 0**, **`FOGENABLE` (28) = 0**
+  (`FOGCOLOR` 0x00ff0000, `FOGTABLEMODE` LINEAR, density 0 — never enabled here: `Randy_t::EnableFog` / `SetFogParameters` are only called from the
+  world's `VisualFog_t`), `ZENABLE` 1 (2 = W-buffer when `EnableWBuffer`), `ZWRITE` 1, `ZFUNC` LESSEQUAL, `CULLMODE` CCW (3), `SHADEMODE` GOURAUD, dithering only on 16-bit
+  buffers, `ALPHABLEND` 0 with SRCALPHA / INVSRCALPHA, `ALPHATEST` 0. Texture stage 0: `COLOROP` = `ALPHAOP` = MODULATE (texture × diffuse), address mode WRAP;
+  **filtering `MAG` = `MIN` = LINEAR, `MIP` = LINEAR (trilinear)** whenever `D3DDEVICEDESC7.dpcTriCaps.dwTextureFilterCaps` has `LINEARMIPLINEAR` (0x20; else
+  linear / point-mip, else point), max anisotropy 1 (`ao-render` already samples trilinear + repeat). No `D3DRS_AMBIENT` write happens in the login: the only
+  writers of the ambient state are `VisualAmbientLight_t` (`FUN_10059d82` 0x10059d82, runs the accumulated `AddAmbientLight` maximum — fed by the world's
+  `EnvironmentLightObject_t`, which `FUN_1005b86b` initialises to white; no such object exists before a world is loaded) and the statel/CAT light-texture helpers.
+* **Clear colour**: the 3D `RViewPort_t` is created by `FUN_10079121` [DisplaySystem 0x10079121] and its background set to **(0, 0, 0.2)** (`_DAT_10089e34` =
+  0.2 stored over `viewport+0x34..0x3c`). `DisplaySystem_t` +0x34 ("clear colour buffer", set by `ToggleClearViewPort`, 0 by default) is false, so the colour buffer is
+  only cleared when `Randy_t::NeedsClearFix` says so (`FUN_100793b8`); the depth buffer is cleared every frame. The backdrop covers the whole screen, so the colour is
+  invisible in practice.
+* **Lights of the meshes**: `charactercreation_main.abiff` (200350) contains three `RLight_t` nodes (class with a `light_info` member = a **`D3DLIGHT7`**, 0x68 bytes,
+  loaded by `RLight_t::RLight_t(ObjectArchive_c*)` randy31 0x1003fe81): all three `D3DLIGHT_POINT`, range 200, falloff 1, attenuation `(0, 0.005, 0)` (intensity
+  `1 / (0.005 d)`: ≥ 1 within 200 m, so it saturates), ambient component 0, diffuse = specular colour; node positions (AO space, through the frame tree) (−15.16, −36.79, −56.78)
+  **diffuse black** (contributes nothing), (4.72, −122.67, 52.50) diffuse (0.710, 0.906, 0.867) mint, (79.05, 92.25, 99.66) diffuse (1.000, 0.969, 0.906) warm white. The other four
+  meshes hold none. `RLight_t::Process` (0x1003ff72) appends each light of the processed frame tree to the per-frame list; `RVisual_t::CullLights` (0x1004ce96, called from
+  `RTriMesh_t::Render` 0x10049761 and the CAT mesh render paths) gives **every** visual whose `grp_mask` shares a bit with the light's (default `0xffffffff` both) all of
+  the lights while at most 8 exist (no range test; D3D applies `dvRange`), and only for visuals with the `enable_light` flag, which is 1 in all 41 nodes of the five meshes.
+  `RVisual_t::SetMaxActiveLightCount(8)` is set at display init. The preview character (`VisualCATMesh_t` / `CCCharacter_t`) is a normal lit visual, so it gets the same lights;
+  `RandyShadowlandsData_s::EnableCATLight` is never switched on here (only the world's environment object does).
+* **Vertex lighting equation** (D3D7 fixed function, per vertex, then Gouraud-interpolated): `colour = emissive + ambient_mat · (device ambient 0 + light ambient 0) +
+  Σ diffuse_mat · Ld · max(N·L, 0) · atten`, clamped to 1 after the sum, × texture. Every mesh node of the backdrop carries the render states 145 = 146 = 147 = 0 (material
+  source) and 148 = 1 (`COLOR1`); the vertex format (FVF 0x112) has no colour, and a colour source whose vertex colour is absent falls back to the material (D3D9 documentation of
+  `DIFFUSEMATERIALSOURCE`; **[INFERENCE]** that D3D7 does the same), so the material's own `diff` / `emis` are the diffuse / emissive terms — exactly what the loader already
+  uses (`base_color`, `emissive`; the floor material `grey-shit` has `diff` 0.32). `ao-render` evaluates this per pixel (clamp after the sum, same attenuation and range cut) instead of per vertex.
+* Implemented: `ao_formats::mesh::decode_mesh_lights` (the `RLight_t` nodes → `ao_scene::Light`, Z mirrored, colour `diffuse^2.2` like the statel lights, black lights dropped),
+  `screens::login_environment()` (ambient 0, no sun, fog off, clear (0,0,0.2)), `screens::set_login_stage` (moves meshes *and* lights, `SetStage`), used by
+  `login_world_scene`, `aomac play` (`show_backdrop`, `tick_preview`) and the `login_shot` example. Before this change the backdrop was drawn with the renderer's default
+  environment (ambient 0.35/0.38/0.45, a warm sun, vertical 60°): the hall looked evenly white-grey. With the engine's values only the two coloured point lights
+  shine (mint, warm white): walls are tinted by the light they face, surfaces turned away from both lights are black (no ambient), the view is narrower vertically
+  (horizontal 60°). Checked with `login_shot` renders of both versions (`/tmp` PNGs, not committed) and the `aomac play --fake-charlist` window.
+* **Not reproduced — specular**: 9 of main's materials set `SPECULARENABLE` = 1 (`hull default`, `tech plated`, `grey-shit` = the floor, …) with `spec` 0.9, `shin` 10–25 and
+  `SPECULARMATERIALSOURCE` = material; D3D7 would add `Cs · Ls · (N·H)^power · atten` (`LOCALVIEWER` = 1, light specular = diffuse colour, material specular =
+  `spec × shin_str`, `RMaterial_t::InitD3DMaterial` 0x100409c6, power `shin`) after the texture stage. `ao-render` has no specular path (a renderer-wide limitation, `docs/formats.md`),
+  so these highlights are missing — **UNRESOLVED (not implemented)**, expected to be broad, dim glints from the two distant lights on the floor and plating.
+* **`CCCharacter_t::ShowSelectionGlow(bool)`** [GUI 0x1011a9ae] (the "selection glow") is a `GfxVisualShield` over the character's `RCATMesh_t` (colour `0xff40ff40`, a 0x2c8-byte
+  object, `+0x1a8` / `+0x2c0` from floats 0x101ae2ec / 0x101a9fa0). It is switched on/off only by `BreedScene_t::SlotBreedButton` [0x1011385b] — the character *creation* breed pick. The
+  login and character-selection screens never call it (no glow on the selection preview).
 
 **Verified by rendering**: `cargo run --release -p aomac --example login_shot -- 1 3 out.png` draws the five meshes (stage 1) with
 this camera (`LOGIN_CAMERA`, forward = rotate +Z by the quaternion = (0.012, −0.208, −0.978), then Z mirrored for the renderer) and the
@@ -508,11 +564,12 @@ TransitionCount: M
 53 cameras (IDs `1`, `1 1`, `1 1 1` … `5 2`; FOV 38…105°) and 23 transitions (durations 0.3 … 25 s). Camera `1 1 1…` (positions around
 (63,108,40) … (26,2.7,32)) is the breed-selection fly-in, `2`, `3 …`, `4 …` the profession/appearance scenes near the origin region
 (x ≈ −30…28, z ≈ −59…8), `5` / `5 1` / `5 2` far away at (−1489, 4, 52) / (−1496,−140,101). `ao_formats::screens::CharCreateCameras` is the typed parser.
-The login/selection camera of §2 is **not** in this file; it is hard-coded in `LoginWorld_c`.
+The login/selection camera of §2 is **not** in this file; it is hard-coded in `LoginWorld_c`. `degFOV` is the **horizontal** field of view in degrees (`VisualCamera_t::SetViewPlaneWindow(degFOV · π/180, aspect)`, §2 *Lens*).
 
 ## 11. UNRESOLVED
 
-* Vertical vs horizontal 60° FOV and the true lighting of the `charactercreation_*.abiff` backdrop (the render check in §2 uses the renderer's default lighting).
+* Specular highlights of the login backdrop / preview (`SPECULARENABLE` materials, D3D7 `LOCALVIEWER` specular) are not rendered — see §2 *Not reproduced*. Per-vertex (D3D) vs per-pixel (`ao-render`) lighting is a renderer-wide difference.
+* Whether the in-world camera (`n3Engine_t`) uses the same horizontal convention is not examined (the free-fly / playfield viewer keeps a 60° vertical lens); the login lens and lighting are resolved in §2.
 * Whether the border icon button is drawn when a window has no icon menu; the `flags & 0x800` ⇒ no pin rule is read from a decompile whose assignment was lost [INFERENCE].
 * Generic GUI button sounds (SandyInterface `GUISoundInitialisation`) and the exact StartupMusic cue.
 * Per-user prefs sub-path (`<prefs>/<user>/…`).

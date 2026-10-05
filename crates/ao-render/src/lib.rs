@@ -326,6 +326,8 @@ pub struct Renderer {
     /// Sky textures by key; kept across [`Renderer::set_sky`] so a live sky only ships new textures.
     sky_views: HashMap<TextureKey, wgpu::TextureView>,
     env: Environment,
+    /// Lens of the loaded scene (`Scene::lens`).
+    lens: ao_scene::Lens,
     /// Camera dependent fog (statel fog volumes), see `Scene::fog_model`.
     fog: Option<ao_scene::FogModel>,
     /// Statel distance LOD state, see `Scene::statel_lod`.
@@ -535,6 +537,7 @@ impl Renderer {
             sky_views: HashMap::new(),
             gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
             env: default_environment(100.0),
+            lens: ao_scene::Lens::default(),
             fog: None,
             lod: None,
             light_buf,
@@ -705,6 +708,7 @@ impl Renderer {
         };
         let radius = scene_bounds(scene).map_or(100.0, |(l, h)| ((h - l).length() * 0.5).max(1.0));
         self.env = scene.environment.unwrap_or_else(|| default_environment(radius));
+        self.lens = scene.lens.unwrap_or_default();
         self.fog = scene.fog_model.clone();
         let slots = instance_slots(scene, &mesh_range);
         self.lod = scene.statel_lod.clone().map(|lod| LodState { levels: vec![u8::MAX; lod.zones.len()], reduced: vec![false; lod.items.len()], lod, slot: slots.clone() });
@@ -931,9 +935,9 @@ impl Renderer {
             }
             (env.fog_color, env.fog_end) = (color, end);
         }
-        let far = (env.fog_end * 1.1).max(50.0);
+        let far = self.lens.far.unwrap_or_else(|| (env.fog_end * 1.1).max(50.0));
         let aspect = t.size.0 as f32 / t.size.1.max(1) as f32;
-        let vp = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.2, far) * Mat4::look_to_rh(cam.pos, cam.forward(), Vec3::Y);
+        let vp = Mat4::perspective_rh(self.lens.vertical_fov(aspect), aspect, self.lens.near, far) * Mat4::look_to_rh(cam.pos, cam.forward(), Vec3::Y);
         let v4 = |c: [f32; 3], w| Vec4::new(c[0], c[1], c[2], w).to_array();
         let w = ao_scene::wave_curves(self.time);
         let g = Globals {

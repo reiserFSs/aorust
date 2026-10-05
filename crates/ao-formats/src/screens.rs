@@ -12,7 +12,7 @@
 //! right-handed with Z negated, see [`ao_to_render`].
 
 use crate::character::{NameTable, Breed, Gender, Player, Role, Skin, load_player, player_heads, CHAR_MESH_TYPE};
-use crate::mesh::decode_mesh_into;
+use crate::mesh::{decode_mesh_into, decode_mesh_lights};
 use anyhow::{bail, ensure, Context, Result};
 use ao_rdb::RecordStore;
 use ao_scene::{Instance, Scene, IDENTITY};
@@ -185,21 +185,50 @@ pub fn login_world_ids(store: &RecordStore) -> Result<Vec<(&'static str, u32)>> 
     LOGIN_MESHES.iter().map(|n| Ok((*n, names.id(MESH_TYPE, n).with_context(|| format!("no mesh {n}"))?))).collect()
 }
 
+/// The lens of `LoginWorld_c`: `VisualCamera_t(1.0472, DisplayWidth / DisplayHeight, 0.5, 1000)`. `RCamera_t` reads the angle
+/// as the **horizontal** field of view (randy31 `RCamera_t::RCamera_t` @0x1002a68a, docs/screens.md §2).
+pub const LOGIN_LENS: ao_scene::Lens = ao_scene::Lens { fov: LOGIN_CAMERA.fov_rad, horizontal: true, near: LOGIN_CAMERA.near, far: Some(LOGIN_CAMERA.far) };
+
+/// What the login world is lit with. No code of the login classes touches lights, ambient or fog, so the device state
+/// `Randy_t`'s reset (randy31 @0x10041ede) leaves is all there is: `D3DRS_AMBIENT` = 0, `FOGENABLE` = 0, no sun, and a
+/// viewport clear colour of (0, 0, 0.2) (`DisplaySystem` @0x10079121). Fog is "off" as a start beyond any distance.
+pub fn login_environment() -> ao_scene::Environment {
+    let clear = [0.0, 0.0, 0.2_f32.powf(2.2)];
+    ao_scene::Environment { sky_color: clear, fog_color: clear, fog_start: 1.0e9, fog_end: 2.0e9, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0] }
+}
+
 /// The backdrop of `stage` as a renderer-space scene (meshes decoded with the usual Z mirror; `spawn` /
-/// `spawn_look_at` are [`LOGIN_CAMERA`] converted with [`ao_to_render`], looking 5 m ahead).
+/// `spawn_look_at` are [`LOGIN_CAMERA`] converted with [`ao_to_render`], looking 5 m ahead), lit by the `RLight_t` nodes of
+/// the meshes only ([`login_environment`], [`LOGIN_LENS`]).
 pub fn login_world_scene(store: &RecordStore, stage: u32) -> Result<Scene> {
     let mut scene = Scene::default();
+    let y = stage as f32 * LOGIN_STAGE_Y_STEP;
     for (_, id) in login_world_ids(store)? {
         let mesh = decode_mesh_into(store, id, &mut scene)?.with_context(|| format!("mesh {id} missing"))?;
         let mut transform = IDENTITY;
-        transform[3][1] = stage as f32 * LOGIN_STAGE_Y_STEP;
+        transform[3][1] = y;
         scene.instances.push(Instance { mesh, transform });
+        scene.lights.extend(decode_mesh_lights(store, MESH_TYPE, id, [0.0, y, 0.0])?);
     }
+    scene.environment = Some(login_environment());
+    scene.lens = Some(LOGIN_LENS);
     let c = LOGIN_CAMERA;
     let f = c.forward();
     scene.spawn = Some(ao_to_render(c.pos));
     scene.spawn_look_at = Some(ao_to_render([c.pos[0] + 5.0 * f[0], c.pos[1] + 5.0 * f[1], c.pos[2] + 5.0 * f[2]]));
     Ok(scene)
+}
+
+/// `LoginWorld_c::SetStage`: moves the backdrop (meshes and the lights inside them) to `stage`. Call before adding other instances.
+pub fn set_login_stage(scene: &mut Scene, stage: u32) {
+    let y = stage as f32 * LOGIN_STAGE_Y_STEP;
+    let from = scene.instances.first().map_or(y, |i| i.transform[3][1]);
+    for i in &mut scene.instances {
+        i.transform[3][1] = y;
+    }
+    for l in &mut scene.lights {
+        l.pos[1] += y - from;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------

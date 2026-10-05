@@ -165,6 +165,33 @@ pub struct Environment {
     pub sun_dir: [f32; 3],
 }
 
+/// Perspective lens of the camera (`VisualCamera_t(fov, aspect, near, far)` -> `RCamera_t`, randy31 @0x1002a68a).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lens {
+    /// Field of view in radians. `RCamera_t` takes `tan(fov / 2)` as the half width of the view plane at distance 1 and
+    /// derives the half height by dividing it by the aspect: the angle is **horizontal**, see [`Lens::vertical_fov`].
+    pub fov: f32,
+    /// `true` = `fov` is the horizontal angle (the original engine), `false` = vertical.
+    pub horizontal: bool,
+    pub near: f32,
+    /// `None` = the renderer picks the far plane from the fog distance.
+    pub far: Option<f32>,
+}
+
+impl Lens {
+    /// Vertical field of view for a viewport of `aspect` = width / height.
+    pub fn vertical_fov(&self, aspect: f32) -> f32 {
+        if self.horizontal { 2.0 * ((self.fov * 0.5).tan() / aspect).atan() } else { self.fov }
+    }
+}
+
+impl Default for Lens {
+    /// The free-fly viewer / playfield default: 60 degrees vertical, near 0.2.
+    fn default() -> Self {
+        Self { fov: std::f32::consts::FRAC_PI_3, horizontal: false, near: 0.2, far: None }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
     pub textures: HashMap<TextureKey, Texture>,
@@ -176,6 +203,8 @@ pub struct Scene {
     pub spawn_look_at: Option<[f32; 3]>,
     /// `None` = renderer defaults.
     pub environment: Option<Environment>,
+    /// `None` = [`Lens::default`].
+    pub lens: Option<Lens>,
     pub lights: Vec<Light>,
     /// Sky domes/backdrops: instances of `meshes` drawn first, depth-write off, unfogged,
     /// with the transform's translation replaced by the camera position. Not in `instances`.
@@ -287,6 +316,15 @@ pub const IDENTITY: [[f32; 4]; 4] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horizontal_fov_shrinks_the_vertical_angle_with_the_aspect() {
+        let l = Lens { fov: 60f32.to_radians(), horizontal: true, near: 0.5, far: Some(1000.0) };
+        // 4:3: tan(v/2) = tan(30 deg) * 3/4
+        assert!((l.vertical_fov(4.0 / 3.0).to_degrees() - 46.827).abs() < 1e-2);
+        assert!((l.vertical_fov(1.0).to_degrees() - 60.0).abs() < 1e-4);
+        assert!((Lens::default().vertical_fov(2.0).to_degrees() - 60.0).abs() < 1e-4);
+    }
 
     fn model() -> FogModel {
         FogModel { base_color: [0.2; 3], base_density: 0.1, near: 0.5, far: 800.0, volumes: vec![FogVolume { pos: [0.0; 3], color: [1.0, 0.0, 0.0], density: 0.9, radius: 100.0, room: None }], rooms: vec![] }

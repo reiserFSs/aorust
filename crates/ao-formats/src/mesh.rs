@@ -378,6 +378,53 @@ impl FvfLayout {
     }
 }
 
+/// The `RLight_t` nodes of a mesh archive (`light_info` = a `D3DLIGHT7`, `RLight_t::RLight_t(ObjectArchive_c*)` randy31
+/// @0x1003fe81) as renderer-space lights (Z negated, `offset` added in AO space first). `RLight_t::Process` (@0x1003ff72)
+/// registers every light of the loaded frame tree; `RVisual_t::CullLights` (@0x1004ce96) hands them to each visual that shares
+/// a `grp_mask` bit (all ones by default, also in the data), without any range test while at most 8 exist, so the list is
+/// what lights the meshes. Colours are `diffuse^2.2` like the statel lights; lights whose diffuse colour is black add
+/// nothing and are dropped. Directional lights (`D3DLIGHT_DIRECTIONAL`) do not occur in the data and are rejected.
+pub fn decode_mesh_lights(store: &RecordStore, rdb_type: u32, id: u32, offset: [f32; 3]) -> Result<Vec<ao_scene::Light>> {
+    let Some(bytes) = store.get(rdb_type, id)? else { return Ok(vec![]) };
+    let ar = Archive::parse(&bytes)?;
+    let mut out = vec![];
+    let mut visited = vec![false; ar.objects.len()];
+    let mut stack = vec![(ar.root, IDENTITY_MAT, 0usize)];
+    while let Some((i, parent, depth)) = stack.pop() {
+        ensure!(depth < MAX_DEPTH, "frame tree too deep");
+        let n = ar.objects.get(i).with_context(|| format!("dangling object ref {i}"))?;
+        ensure!(!std::mem::replace(&mut visited[i], true), "cyclic frame tree");
+        let world = mul(&local_matrix(n), &parent);
+        if let Some(info) = n.get("light_info") {
+            ensure!(info.len() == 0x68, "light_info of {} bytes", info.len());
+            let w = |k: usize| u32::from_le_bytes(info[4 * k..4 * k + 4].try_into().unwrap());
+            let f = |k: usize| f32::from_bits(w(k));
+            // D3DLIGHT7: type, diffuse rgba, specular rgba, ambient rgba, position, direction, range, falloff, att0..2, theta, phi
+            let diffuse = [f(1), f(2), f(3)];
+            if diffuse != [0.0; 3] {
+                let scene = |v: [f32; 3]| [v[0] + offset[0], v[1] + offset[1], -(v[2] + offset[2])];
+                let spot = match w(0) {
+                    1 => None,
+                    2 => Some(ao_scene::Spot { dir: [world[2][0], world[2][1], -world[2][2]], theta: f(24), phi: f(25) }),
+                    t => bail!("RLight_t of D3D type {t} in mesh {id}"),
+                };
+                let att = [f(21), f(22), f(23)];
+                out.push(ao_scene::Light {
+                    pos: scene([world[3][0], world[3][1], world[3][2]]),
+                    color: diffuse.map(|c| c.powf(2.2)),
+                    range: f(19),
+                    // all zero attenuation is 1/0 in D3D (full intensity), distinct from the contract's "linear" marker
+                    atten: if att == [0.0; 3] { [f32::MIN_POSITIVE, 0.0, 0.0] } else { att },
+                    spot,
+                    zone: None,
+                });
+            }
+        }
+        stack.extend(n.refs("chld").into_iter().map(|c| (c, world, depth + 1)));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -38,6 +38,16 @@ fn login_world() {
     assert_eq!(s.instances.len(), 5);
     assert_eq!(s.instances[0].transform[3][1], -0.01);
     assert_eq!(s.spawn, Some([0.657694, 2.27458, 10.5489]));
+    // lighting = the two non-black RLight_t nodes of charactercreation_main (D3DLIGHT7 point lights, range 200, att (0, 0.005, 0)),
+    // D3D default ambient 0, no sun
+    assert_eq!(s.lights.len(), 2);
+    for (l, pos) in s.lights.iter().zip([[79.05347, 92.24551, -99.65992], [4.721284, -122.670135, -52.49632]]) {
+        assert!(l.pos.iter().zip(pos).all(|(a, b)| (a - b).abs() < 1e-3), "{:?}", l.pos);
+        assert_eq!((l.range, l.atten, l.spot), (200.0, [0.0, 0.005, 0.0], None));
+    }
+    let e = s.environment.unwrap();
+    assert_eq!((e.ambient, e.sun_color), ([0.0; 3], [0.0; 3]));
+    assert_eq!(s.lens, Some(LOGIN_LENS));
 }
 
 #[test]
