@@ -174,6 +174,8 @@ pub(crate) struct Runtime {
     emitters: Vec<EmitterState>,
     /// ambience sound id of the camera's district
     want: Option<u16>,
+    /// voices whose caller stopped re-triggering: (hold seconds left, voice, fade-out seconds)
+    dying: Vec<(f32, u64, f32)>,
     rng: Rng,
     /// `Total_FX` (master x FX x mutes).
     pub fx: f32,
@@ -182,7 +184,7 @@ pub(crate) struct Runtime {
 impl Runtime {
     pub fn new(sh: &Arc<Shared>, lib: Library, seed: u64) -> Runtime {
         let music = MusicPlayer::new(sh.clone(), lib.project.clone(), seed);
-        Runtime { lib, music, pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, rng: Rng(seed.rotate_left(17) | 1), fx: 1.0 }
+        Runtime { lib, music, pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), fx: 1.0 }
     }
 
     /// Emitters currently inside the camera's radius (or in their 2 s hold).
@@ -218,9 +220,16 @@ impl Runtime {
         if self.pf.is_some() && self.eval >= 1.0 {
             self.eval = 0.0;
             let id = self.evaluate_district(period, cam);
-            self.set_ambience_district(sh, id);
+            self.set_ambience_district(id);
         }
         self.music.tick(dt);
+        self.dying.retain_mut(|(hold, voice, fade)| {
+            *hold -= dt;
+            if *hold <= 0.0 {
+                sh.mixer().fade(*voice, 0.0, *fade, true);
+            }
+            *hold > 0.0
+        });
         self.tick_ambience(sh, dt, hours * HOUR);
         self.tick_emitters(sh, dt, cam);
     }
@@ -241,11 +250,12 @@ impl Runtime {
     }
 
     /// A district change fades the old id's layers out (4 s, the sound definitions' fade-out).
-    fn set_ambience_district(&mut self, sh: &Shared, id: Option<u16>) {
+    fn set_ambience_district(&mut self, id: Option<u16>) {
         let stale: Vec<_> = self.ambient.keys().filter(|(i, _)| Some(*i) != id).copied().collect();
         for k in stale {
             if let Some(a) = self.ambient.remove(&k) {
-                sh.mixer().fade(a.voice, 0.0, 4.0, true);
+                // keep-alive sound whose caller stopped: full level for its duration (1 s), then the 4 s fade-out
+                self.dying.push((1.0, a.voice, 4.0));
             }
         }
         self.want = id;
