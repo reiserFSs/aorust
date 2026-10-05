@@ -62,6 +62,7 @@ pub enum Event {
     /// Ctrl+V pressed: the app should answer with `InputEvent::Paste`.
     PasteRequested,
     Escape { window: WindowId },
-    /// The frame's close button was clicked.
+    /// The style-1 frame's close button was released over itself (`WndBorder::SlotCloseButton` 0x10159705
+    /// posts message 0x98968b to the window; the application decides: quit for LoginWindow, ignore for the progress window).
     CloseRequested { window: WindowId },
 }
