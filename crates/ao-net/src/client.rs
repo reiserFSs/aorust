@@ -21,13 +21,14 @@ pub const STATUS_URL: &str = "https://site.project-rk.com/api/status";
 /// `version.id` of the PRK client this reimplements (docs/protocol.md §3).
 pub const CLIENT_VERSION: &str = "00.7.2_EP1";
 const PT_PING: u16 = 0xB;
+/// Delay between `ZoneInfo` and the zone TCP connect: `ServerLogin3DModule_t::FrameProcess`
+/// (GUI.dll 0x10016edd) fades the loadscreen in for the double at GUI.dll 0x101aa198 = 4000.0 ms
+/// (`Timer_t` milliseconds), then calls `Client_t::RedirectToServer`. docs/protocol.md §8.
+pub const ZONE_CONNECT_DELAY: Duration = Duration::from_millis(4000);
 const TICK: Duration = Duration::from_millis(100);
 /// How long after `ZoneLogin` the first zone frames are collected before `ZoneConnected` fires.
 const ZONE_COLLECT: Duration = Duration::from_secs(3);
 const ZONE_COLLECT_MAX: usize = 16;
-/// Own keepalive ping period on the zone connection. ponytail: guess; the original's period was
-/// not found (`SendPingMessageToServer` caller unresolved), the server pings us anyway.
-const ZONE_PING_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerEntry {
@@ -121,14 +122,14 @@ impl LoginSession {
     fn connect_with(server: &ServerEntry, tap: Option<Tap>) -> Result<Self> {
         let mut conn = Conn::connect(SocketAddr::from((server.ip, server.port)))?;
         conn.tap = tap;
-        Ok(Self::spawn(conn, login_server_pub()))
+        Ok(Self::spawn(conn, login_server_pub(), ZONE_CONNECT_DELAY))
     }
 
-    pub(crate) fn spawn(conn: Conn, server_pub: BigUint) -> Self {
+    pub(crate) fn spawn(conn: Conn, server_pub: BigUint, zone_delay: Duration) -> Self {
         let (cmds, cmd_rx) = channel();
         let (ev_tx, events) = channel();
         thread::spawn(move || {
-            let quiet = run(conn, &cmd_rx, &ev_tx, &server_pub);
+            let quiet = run(conn, &cmd_rx, &ev_tx, &server_pub, zone_delay);
             match quiet {
                 Ok(true) => {}
                 Ok(false) => {
@@ -171,6 +172,7 @@ fn run(
     cmds: &Receiver<Cmd>,
     ev: &Sender<LoginEvent>,
     server_pub: &BigUint,
+    zone_delay: Duration,
 ) -> Result<bool> {
     let send = |e: LoginEvent| {
         let _ = ev.send(e);
@@ -242,6 +244,19 @@ fn run(
                     zone_port: z.port,
                     character_id: z.char_id as u32,
                 });
+                // The loadscreen module fades in for 4000 ms before `RedirectToServer` replaces
+                // (closes) the login connection; until then pings are still answered.
+                let until = Instant::now() + zone_delay;
+                while Instant::now() < until {
+                    if matches!(cmds.try_recv(), Err(TryRecvError::Disconnected)) {
+                        return Ok(true);
+                    }
+                    match conn.recv(TICK) {
+                        Ok(Some(f)) if f.ptype == PT_PING => reply_ping(&mut conn, &f, 0)?,
+                        Ok(_) => {}
+                        Err(_) => thread::sleep(TICK), // peer closed: the original still redirects
+                    }
+                }
                 drop(conn);
                 return zone(z, cmds, ev).map(|()| false);
             }
@@ -274,7 +289,7 @@ fn zone(z: crate::msg::ZoneInfo, cmds: &Receiver<Cmd>, ev: &Sender<LoginEvent>) 
     conn.send_message(&Message::ZoneLogin { char_id: z.char_id, cookie1: z.cookie1, cookie2: z.cookie2 })?;
     let _ = ev.send(LoginEvent::Status("zone login sent".into()));
     let (mut seen, mut announced) = (Vec::new(), false);
-    let (start, mut last_ping) = (Instant::now(), Instant::now());
+    let start = Instant::now();
     loop {
         if matches!(cmds.try_recv(), Err(TryRecvError::Disconnected)) {
             return Ok(());
@@ -292,10 +307,6 @@ fn zone(z: crate::msg::ZoneInfo, cmds: &Receiver<Cmd>, ev: &Sender<LoginEvent>) 
         if !announced && (seen.len() >= ZONE_COLLECT_MAX || start.elapsed() >= ZONE_COLLECT) {
             announced = true;
             let _ = ev.send(LoginEvent::ZoneConnected { messages: std::mem::take(&mut seen) });
-        }
-        if last_ping.elapsed() >= ZONE_PING_EVERY {
-            last_ping = Instant::now();
-            conn.send(ping_frame(1, id, 2, [0, ms_since_midnight(), 0, 0, 0], &[]))?;
         }
     }
 }
@@ -315,7 +326,7 @@ fn ms_since_midnight() -> u32 {
     (SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis()) % 86_400_000) as u32
 }
 
-/// Ping frame (`PingMessage_t::CreateDataBlock`, MessageProtocol.dll 0x10002a9e): payload =
+/// Ping reply frame (`PingMessage_t::CreateDataBlock`, MessageProtocol.dll 0x10002a9e): payload =
 /// `type, f14, t_orig, t_recv, t_send, f24` (BE u32, `w` = `[f14, t_orig, t_recv, t_send, f24]`) + extra data.
 fn ping_frame(kind: u32, sender: u32, receiver: u32, w: [u32; 5], extra: &[u8]) -> Frame {
     let mut payload = kind.to_be_bytes().to_vec();

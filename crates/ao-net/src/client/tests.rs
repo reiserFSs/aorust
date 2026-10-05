@@ -63,10 +63,12 @@ fn events_until(s: &LoginSession, done: impl Fn(&LoginEvent) -> bool) -> Vec<Log
     panic!("timed out; events so far: {got:?}");
 }
 
+const ZONE_DELAY: Duration = Duration::from_millis(700);
+
 fn start(server_pub: BigUint) -> (TcpListener, LoginSession) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let conn = Conn::connect(l.local_addr().unwrap()).unwrap();
-    (l, LoginSession::spawn(conn, server_pub))
+    (l, LoginSession::spawn(conn, server_pub, ZONE_DELAY))
 }
 
 #[test]
@@ -142,6 +144,11 @@ fn login_select_zone_handoff_pings_and_first_zone_frames() {
         LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port, character_id: 77 }
     );
 
+    // the zone connect happens only after the loadscreen delay; the login socket is still serviced
+    zone_l.set_nonblocking(true).unwrap();
+    thread::sleep(ZONE_DELAY / 3);
+    assert!(zone_l.accept().is_err(), "connected before the loadscreen fade finished");
+    zone_l.set_nonblocking(false).unwrap();
     let mut zone = Fake::accept(&zone_l);
     assert_eq!(zone.recv(), Message::ZoneLogin { char_id: 77, cookie1: 0xAABB_CCDD, cookie2: 0x1122_3344 });
     // server ping (type 1) addressed to the character, t_orig = 1000, then 15 N3-ish frames

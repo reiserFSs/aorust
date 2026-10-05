@@ -112,10 +112,9 @@ C                                            S (login server)
 
 * On zone-hand-off the client stores `s_nServerIPAddr/s_nServerPort/s_nCharID/s_nCookie1/s_nCookie2/s_nPlayerID/
   s_nEventServerType` (statics) and signals the game layer; `Client_t::RedirectToServer` (state 4, new
-  `TcpConnection_t`, start `PingManager`) then connects to the zone server `[IF 0x1000291d]`. `SendClientCookie` is
-  called from `NetworkModule_t::N3ActivatedMessage` `[IF 0x100077a7]`, i.e. once the N3 engine reports "activated"
-  — the exact moment relative to the TCP connect is `[inference]` (call chain through a signal/slot table at
-  `0x10027148`/`0x10027168` was not resolved).
+  `TcpConnection_t`, start `PingManager`) then connects to the zone server `[IF 0x1000291d]`; this runs ≥ 4000 ms after `ZoneInfo`, and
+  `SendClientCookie` is called from `NetworkModule_t::N3ActivatedMessage` `[IF 0x100077a7]`, which `N3StartMessage` triggers after `CharacterLoggedIn`;
+  the chain is resolved in §8 "Zone hand-off timing".
 * The same `SendClientCookie` is used for **in-session zone changes** after message `0x3C ZoneRedirection`
   (new ip/port only; the cookies are the ones stored from the previous `ZoneInfo`) `[IF 0x10002a9e case 0x3C]`.
 * Zone-server traffic after `ZoneLogin` (N3 messages, ping manager) is out of scope.
@@ -322,18 +321,59 @@ redacted by the tool; its length 0x1a2 = 417 chars + NUL = `dhX` 256 hex + `-` +
 `PingMessage_t::CreateDataBlock` `[MP 0x10002a9e]`, ctor `[MP 0x100028b7]`: payload after the 16-byte header = six BE u32
 `type, f14, t_orig, t_recv, t_send, f24` (0x28-byte header total) + optional extra data. `type` 1 = request, 2 = reply, 3 = extended request.
 Client receive `[IF 0x10001d36 Client_t::Receive]`: a type-1 ping whose `receiver == charId` is answered with a copy: `type=2`, `sender=charId`,
-`receiver=<request sender>`, `t_recv = t_send = ms since midnight`; other fields echoed. Own pings `SendPingMessageToServer` `[IF 0x10001719]`:
-`type 1`, `sender=charId`, `receiver=2`, `f24` = caller argument, `t_orig` = ms since midnight (`PreprocessOutgoingPing [CN 0x100058d5]`).
-What drives the client's own send period was not resolved; `ao-net` replies to server pings and sends its own every 30 s (**guess**).
+`receiver=<request sender>`, `t_recv = t_send = ms since midnight`; other fields echoed.
+
+**The client never originates pings.** `SendPingMessageToServer` `[IF 0x10001719]` / `SendExtendedPingMessageToServer` `[IF 0x1000179f]` (type 1 / 3,
+`sender=charId`, `receiver=2`) have no caller: Ghidra finds only the export-table slots (`0x10027180`/`0x10027170`, an RVA table), no module imports
+them by name (byte search over every `*.dll`/`*.exe` of the client: the names occur only in `Interfaces.dll`), and the import tables of the only
+importers of `Interfaces.dll` (GUI.dll, AnarchyOnline.exe; checked with pefile) list no ping symbol. `Client_t::StartPingManager` `[IF 0x1000134d]`
+only allocates the 8-byte `PingManager_t` used to stamp/measure RTT of pings that arrive. So there is no ping timer to reproduce: `ao-net` only
+replies to server pings (the earlier 30 s own-ping guess was removed).
+
+### Zone hand-off timing (resolved from GUI.dll / Interfaces.dll / AFCM.dll)
+AFCM (`AFCM.dll`) is a module/message bus: `RegisterMessageModule(program, module, ...)` `[AFCM 0x10004582]`, `Send(module, msg)` `[AFCM 0x100033cc]` →
+`Distribute(module, msg)` `[AFCM 0x1000173e]` queues `msg` for `module`. Modules: 0x13 = N3Interface (program 6) `[IF 0x1000a25b]`, 0x18 = Network
+(program 7) `[IF 0x100077bd]`, 0x1b = `ServerLogin3DModule_t` (program 5) `[GUI 0x100175f0]`.
+
+1. `0x17 ZoneInfo` arrives → `LoginModule_c::SlotLoginReply` `[GUI 0x10011f8f]` (branch `reply==0x17`) stores `CharacterID`, loads the user config and
+   `AddProgram(5)` (the loadscreen, `ServerLogin3DModule_t`). (`0x0E` → `Show(3)` char-select; `0x10`, `0x21`, `0x4E` have their own branches.)
+2. `ServerLogin3DModule_t::InitialiseMessage` `[GUI 0x1001753e]` sets fade-in mode and the start time; `FrameProcess` `[GUI 0x10016edd]` ramps alpha for
+   **4000 ms** (double `0x101aa198` = 4000.0, compared with `Timer_t` milliseconds), then emits the `GlobalSignals+0x208` signal and calls
+   `Client_t::RedirectToServer` `[IF 0x1000291d]`. (The other fade, `StartClosingLoadscreenMessage` `[GUI 0x10016cd8]`, msg 0x135, fades out over 7000 ms = double
+   `0x101aa190` and then `RemoveProgram(5)`.) → **zone TCP connect happens ≥ 4 s after ZoneInfo**; the login socket stays open until then:
+   `OpenConnection` `[IF 0x10002861]` closes and deletes the old `TcpConnection_t` before creating the new one.
+3. `RedirectToServer`: connect, `StartPingManager`, then `AFCM::Send(0x1b, 0x26)`. Nothing is written to the socket here.
+4. Message `0x26` on module 0x1b = `ServerLogin3DModule_t::CharacterLoggedInMessage` `[GUI 0x10016d30]`: starts the startup music if `SoundOnOff` and
+   `MusicOn` prefs are set (`SandyInterfaceModule_t::PlayStartupMusic`), `AddProgram(6)`, `Send(0x13, 0xE6)`.
+5. `0xE6` on module 0x13 = `N3InterfaceModule_t::N3StartMessage` `[IF 0x10007d6f]`: creates `n3EngineClientAnarchy_t`, `OpenClient(rdb, CharacterID)`, then
+   `Send(0x18, 0xE4)` and `Send(10, 0xE4)`.
+6. `0xE4` on module 0x18 = `NetworkModule_t::N3ActivatedMessage` `[IF 0x100077a7]` → `Client_t::SendClientCookie` `[IF 0x100013b0]` = **ZoneLogin**
+   (guarded by the "connected" flag at `Client_t+0xa8`). The sibling `FlowControlModule_t::N3ActivatedMessage` `[GUI 0x1002790e]` does `AddProgram(4)`.
+
+So on the wire the original sends **nothing** between the zone TCP connect and ZoneLogin, and waits for no server message (the N3 engine that handles
+server N3 traffic only exists after step 5, so the server cannot meaningfully speak N3 first; pings are answered by `Client_t::Receive` regardless).
+The only unmodelled part is the local duration of steps 3–6 (message-bus frames + `n3EngineClientAnarchy_t` construction/`OpenClient`), which depends on the
+machine; `ao-net` sends ZoneLogin immediately after connect (**unresolved/uncalibrated**: whether the server tolerates/needs a later ZoneLogin is only known on a live zone).
+`ao-net` reproduces step 2: `client::ZONE_CONNECT_DELAY = 4000 ms`; the login connection stays open (pings answered) during it.
+
+### Byte-identity of what the client sends (re-derived from `Interfaces.dll`, not from CellAO)
+* UserLogin `InitAuth` `[IF 0x100025a9]`: zeroed 40-byte name buffer ← `strncpy(s_cPlayerName, 0x28)`; zeroed 20-byte version buffer ← first line of
+  `<client dir>/version.id` via `ifstream::open(path, ios::in /*mode 1, no binary*/, _SH_DENYNO 0x40)` + `getline(buf, 0x14)` (asm `[IF 0x1000263a-0x10002653]`;
+  `PUSH EDI(0), PUSH 0x14` is the 64-bit `streamsize`). The file on disk is `00.7.2_EP1\r\n`; text mode folds CRLF to LF, `getline` stops at LF → exactly
+  `"00.7.2_EP1"` + 10 NULs. Body = `i32 2, name[40], version[20]` (64 bytes = `tellp`), `SystemMessage_t(0x22, sender 0, receiver 1, 64, data)`. The 84-byte frame sent
+  by `ao-net` (§8 transcript) is exactly this; the live server accepted it with a ServerSalt.
+* UserCredentials `AuthClient` `[IF 0x10001b65]`: `name[40]`, `i32 len+1`, `len+1` bytes (incl. NUL), `SystemMessage_t(0x25, 0, 1)`. ZoneLogin
+  `SendClientCookie` `[IF 0x100013b0]`: `i32 charId, i32 cookie1, i32 cookie2`, `SystemMessage_t(0x1b, sender charId, receiver 2)`. All match `msg.rs`.
 
 ### Still open — needs a valid account (first real login; run `cargo run -p ao-net --example probe -- --login`)
 1. Does a correct account password produce the CharacterList, or does PRK expect a launcher token in the password slot (the launcher passes none)?
 2. Real `CharacterList` values: `status`, `allowedChars`, `expansions`, `slProfs`, `dataVersion`/`infoVersion`, PlayfieldProxy identity types.
 3. Extra system messages between 0x25 and 0x0E (0x43 chat-server list, 0x4E, 0x30): the client logs any undecoded one as a `Status` event.
 4. `ZoneInfo` real shape (22 vs 30 bytes), `eventServerType`, `playerId`.
-5. Zone side: does the server speak first; is `ZoneLogin` accepted right after TCP connect (the client sends it immediately; the original waits for
-   `N3ActivatedMessage` — the trigger is unresolved); zone-side 0x7F compression; own-ping period. `ZoneConnected` carries the first 16 frames
-   (ptype, first u32, sender, receiver, length, first 32 payload bytes) and the same are printed to stderr as `[ao-net] zone frame ...`.
+5. Zone side: does the server speak first; is `ZoneLogin` accepted immediately after TCP connect (the client sends it immediately, as the original
+   does on the wire, see "Zone hand-off timing" — only the local N3-engine start-up time before it is not reproduced); zone-side 0x7F compression.
+   `ZoneConnected` carries the first 16 frames (ptype, first u32, sender, receiver, length, first 32 payload bytes), also printed to stderr as
+   `[ao-net] zone frame ...`.
 6. Whether a wrong `version.id` is refused for a valid account; meaning of codes other than 0x14/0x6A/0x6C/0x21-9.
 
 ## 9. Sources used
