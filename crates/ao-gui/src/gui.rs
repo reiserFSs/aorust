@@ -173,11 +173,17 @@ impl Gui {
     pub fn open_window(&mut self, view_name: &str, pos: (i32, i32), size: WindowSize) -> Result<WindowId> {
         let path = self.views_dir.join(format!("{view_name}.xml"));
         let src = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let root_el = xml::parse(&src).with_context(|| format!("parse {}", path.display()))?;
-        let view_el = root_el.children.first().ok_or_else(|| anyhow!("{view_name}: empty <root>"))?;
+        self.open_window_xml(view_name, &src, pos, size)
+    }
+
+    /// Like [`Gui::open_window`] for view XML text built by the application (screens the original creates in code, e.g.
+    /// the character-creation scenes); `name` only labels warnings.
+    pub fn open_window_xml(&mut self, name: &str, src: &str, pos: (i32, i32), size: WindowSize) -> Result<WindowId> {
+        let root_el = xml::parse(src).with_context(|| format!("parse {name}"))?;
+        let view_el = root_el.children.first().ok_or_else(|| anyhow!("{name}: empty <root>"))?;
         let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
-        let root = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{view_name}: cannot build root"))?;
-        self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{view_name}: {w}")));
+        let root = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{name}: cannot build root"))?;
+        self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{name}: {w}")));
         self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false }));
         let id = self.windows.len() - 1;
         self.resize_window(id, size);

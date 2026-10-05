@@ -21,6 +21,8 @@ pub struct Host {
     pub quit: bool,
     scene: Option<Scene>,
     repose: Option<Scene>,
+    /// Lens for the next frame (per-frame FOV changes of camera paths); `None` keeps the scene's lens.
+    pub lens: Option<ao_scene::Lens>,
 }
 
 impl Host {
@@ -253,7 +255,7 @@ impl State {
         let cam = Camera::look_at(eye, at);
         let gui = frontend.map(|frontend| {
             let renderer = crate::GuiRenderer::new(&renderer, frontend.gui());
-            Gui { renderer, frontend, host: Host { camera: cam, fly: false, quit: false, scene: None, repose: None }, cursor: (0.0, 0.0), mods: Default::default(), scale: (window.scale_factor().round() as u32).max(1) }
+            Gui { renderer, frontend, host: Host { camera: cam, fly: false, quit: false, scene: None, repose: None, lens: None }, cursor: (0.0, 0.0), mods: Default::default(), scale: (window.scale_factor().round() as u32).max(1) }
         });
         let now = Instant::now();
         Ok(Self {
@@ -305,6 +307,9 @@ impl State {
         }
         if let Some(scene) = g.host.repose.take() {
             self.renderer.repose(&scene);
+        }
+        if let Some(lens) = g.host.lens.take() {
+            self.renderer.set_lens(lens);
         }
         (Some(list), g.host.quit)
     }

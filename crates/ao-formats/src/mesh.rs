@@ -425,6 +425,32 @@ pub fn decode_mesh_lights(store: &RecordStore, rdb_type: u32, id: u32, offset: [
     Ok(out)
 }
 
+/// The named connectors of a mesh archive (`RConnector_t`, class 0x4b: `name` + `originator` = the frame node it hangs
+/// on; `VisualMesh_t::GetConnector` / `CCCharacter_t::MoveToConnector`) with the node's world matrix, **AO space**
+/// (row-vector convention, left-handed, no Z mirror). `anim_matrix * local` of every ancestor applies as for the meshes.
+pub fn decode_mesh_connectors(store: &RecordStore, rdb_type: u32, id: u32) -> Result<Vec<(String, [[f32; 4]; 4])>> {
+    let Some(bytes) = store.get(rdb_type, id)? else { return Ok(vec![]) };
+    let ar = Archive::parse(&bytes)?;
+    let mut world: Vec<Option<Mat>> = vec![None; ar.objects.len()];
+    let mut stack = vec![(ar.root, IDENTITY_MAT, 0usize)];
+    while let Some((i, parent, depth)) = stack.pop() {
+        ensure!(depth < MAX_DEPTH, "frame tree too deep");
+        let n = ar.objects.get(i).with_context(|| format!("dangling object ref {i}"))?;
+        let w = mul(&local_matrix(n), &parent);
+        world[i] = Some(w);
+        stack.extend(n.refs("chld").into_iter().map(|c| (c, w, depth + 1)));
+    }
+    Ok(ar
+        .objects
+        .iter()
+        .filter_map(|o| {
+            let name = String::from_utf8_lossy(o.blob("name")?).into_owned();
+            let node = usize::try_from(o.i32("originator")?).ok()?;
+            Some((name, (*world.get(node)?)?))
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

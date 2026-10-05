@@ -878,6 +878,11 @@ impl Renderer {
         st.levels = levels;
     }
 
+    /// Replaces the lens of the loaded scene (a camera path that changes the field of view every frame).
+    pub fn set_lens(&mut self, lens: ao_scene::Lens) {
+        self.lens = lens;
+    }
+
     /// Re-poses the uploaded scene in place: `scene` must be the same scene with only vertex positions/normals and
     /// instance transforms changed (an animated character); textures, materials and indices are kept.
     pub fn repose(&mut self, scene: &Scene) {
