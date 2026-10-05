@@ -152,7 +152,7 @@ Weapon firing / impact sounds of real weapons are **not** played by this combat 
 
 ## 7. Corpses (`CorpseInfo`)
 `CorpseFullUpdateIIR_t` (0x4F474E05, header kind **0xC76A**, decoder `ao_net::n3::world::Corpse`, reader `FUN_1009f502`, ctor `FUN_1009f7b0`, vtable 0x10166a5c): a **separate dynel**
-(`Corpse_t`; **[INFERENCE]** item-like: `FUN_100a4dcc` treats it as a `SimpleItem_t`; name `Remains of <owner name>`), created with stats `Flags`(0) 0x181805, `CATMesh`(42) = the model, `MonsterScale`(360), `Sex`, `Breed`, `Cash`(61) (loot money),
+(`Corpse_t` : `Chest_t` : `SimpleItem_t` family [GC 0x101622d4, docs/zone/static.md §1]; its mesh / cloth / look resolution is `ao_formats::dynel_visual`, docs/zone/static.md; name `Remains of <owner name>`), created with stats `Flags`(0) 0x181805, `CATMesh`(42) = the model, `MonsterScale`(360), `Sex`, `Breed`, `Cash`(61) (loot money),
 **`DeadTimer`(34) = 600**, **`TimeExist`(8) = 18000 / 180000**, `CorpseType`(415) = 50000, `CorpseInstance`(416) = owner id, `MultipleCount`(412) = 1; 5 cloth slots, no textures
 [DATA: 7 corpses]. Position/rotation = the dead char's last position (live: identical to its `FollowTarget` position). The corpse has no animation key in the capture (`CorpseAnimKey` 417
 absent; code `FUN_100a4dcc` reads it only for the spell-effect "play animation on item" path, `FUN_10010e36(item, key < 100, 1)`), so the pose the corpse mesh takes is **[UNRESOLVED]**
