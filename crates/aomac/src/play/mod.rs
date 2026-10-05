@@ -516,7 +516,7 @@ impl Play {
     fn world_ui(&mut self, ctx: &egui::Context, host: &mut Host) {
         if let Some(a) = &self.audio {
             let c = host.camera;
-            a.set_listener(c.pos.to_array(), c.forward().to_array(), [0.0, 1.0, 0.0]);
+            a.update(ctx.input(|i| i.stable_dt), c.pos.to_array(), ao_formats::playfield::DEFAULT_DAY_TIME);
         }
         egui::Area::new("hud".into()).anchor(Align2::LEFT_TOP, [10.0, 10.0]).show(ctx, |ui| {
             ui.label(RichText::new(&self.status).color(Color32::WHITE).background_color(Color32::from_black_alpha(140)));
