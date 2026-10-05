@@ -54,12 +54,34 @@ pub struct Submesh {
     pub base_color: [f32; 4],
     /// Disable back-face culling (front faces are counter-clockwise in ao-scene space).
     pub two_sided: bool,
+    /// Linear RGB added after lighting (self-illumination), before fog.
+    pub emissive: [f32; 3],
+    /// Texture alpha is a self-illumination mask (opaque materials only): the texel is
+    /// shown at full brightness in proportion to alpha, i.e. `rgb * mix(lighting, 1, a)`.
+    pub glow_mask: bool,
 }
 
 impl Submesh {
     pub fn new(indices: Vec<u32>, texture: Option<TextureKey>) -> Self {
-        Self { indices, texture, blend: Blend::Opaque, base_color: WHITE, two_sided: false }
+        Self {
+            indices,
+            texture,
+            blend: Blend::Opaque,
+            base_color: WHITE,
+            two_sided: false,
+            emissive: [0.0; 3],
+            glow_mask: false,
+        }
     }
+}
+
+/// Dynamic-style point light (world space), linear attenuation to zero at `range`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Light {
+    pub pos: [f32; 3],
+    /// Linear RGB, already multiplied by intensity.
+    pub color: [f32; 3],
+    pub range: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -108,6 +130,7 @@ pub struct Scene {
     pub spawn_look_at: Option<[f32; 3]>,
     /// `None` = renderer defaults.
     pub environment: Option<Environment>,
+    pub lights: Vec<Light>,
 }
 
 pub const IDENTITY: [[f32; 4]; 4] = [
