@@ -176,25 +176,27 @@ fn gui_input(ev: &WindowEvent, cursor: &mut (f32, f32), mods: &mut ao_gui::Modif
         }
         WindowEvent::KeyboardInput { event, .. } => {
             let pressed = event.state == ElementState::Pressed;
-            let key = match &event.logical_key {
-                Key::Named(NamedKey::Backspace) => K::Backspace,
-                Key::Named(NamedKey::Delete) => K::Delete,
-                Key::Named(NamedKey::ArrowLeft) => K::Left,
-                Key::Named(NamedKey::ArrowRight) => K::Right,
-                Key::Named(NamedKey::ArrowUp) => K::Up,
-                Key::Named(NamedKey::ArrowDown) => K::Down,
-                Key::Named(NamedKey::Home) => K::Home,
-                Key::Named(NamedKey::End) => K::End,
-                Key::Named(NamedKey::Enter) => K::Enter,
-                Key::Named(NamedKey::Tab) => K::Tab,
-                Key::Named(NamedKey::Escape) => K::Escape,
-                Key::Character(c) => K::Letter(c.chars().next()?.to_ascii_lowercase()),
-                _ => return None,
+            let key: Option<K> = match &event.logical_key {
+                Key::Named(NamedKey::Backspace) => Some(K::Backspace),
+                Key::Named(NamedKey::Delete) => Some(K::Delete),
+                Key::Named(NamedKey::ArrowLeft) => Some(K::Left),
+                Key::Named(NamedKey::ArrowRight) => Some(K::Right),
+                Key::Named(NamedKey::ArrowUp) => Some(K::Up),
+                Key::Named(NamedKey::ArrowDown) => Some(K::Down),
+                Key::Named(NamedKey::Home) => Some(K::Home),
+                Key::Named(NamedKey::End) => Some(K::End),
+                Key::Named(NamedKey::Enter) => Some(K::Enter),
+                Key::Named(NamedKey::Tab) => Some(K::Tab),
+                Key::Named(NamedKey::Escape) => Some(K::Escape),
+                Key::Character(c) => Some(K::Letter(c.chars().next()?.to_ascii_lowercase())),
+                // keys without a GUI meaning (Space, ...) still type their text into a focused field
+                _ => None,
             };
             let text = event.text.as_deref().filter(|t| pressed && !mods.ctrl && !t.chars().any(char::is_control));
             match (text, key) {
                 (Some(t), _) => Some(I::Text(t.to_string())),
-                _ => Some(I::Key { key, pressed, mods: *mods }),
+                (None, Some(key)) => Some(I::Key { key, pressed, mods: *mods }),
+                _ => None,
             }
         }
         _ => None,
@@ -463,9 +465,22 @@ impl ApplicationHandler for App {
         let Some(s) = &mut self.state else { return };
         if let Some(g) = &mut s.gui {
             if let Some(ie) = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale) {
+                // a key that types a character also presses that key first: hotkeys (docs/gui.md 12.1) read the key, text fields the text.
+                // The OS key repeat only repeats the text: hotkeys act on the press.
+                let repeat = matches!(&ev, WindowEvent::KeyboardInput { event, .. } if event.repeat);
+                let key = match (&ie, &ev) {
+                    (ao_gui::InputEvent::Text(_), WindowEvent::KeyboardInput { event, .. }) if !repeat => match &event.logical_key {
+                        winit::keyboard::Key::Character(c) => c.chars().next().map(|c| ao_gui::InputEvent::Key { key: ao_gui::Key::Letter(c.to_ascii_lowercase()), pressed: true, mods: g.mods }),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let ie = Some(ie).filter(|ie| !(repeat && matches!(ie, ao_gui::InputEvent::Key { key: ao_gui::Key::Letter(_), pressed: true, .. })));
                 // the frontend may move the camera from an input handler (e.g. a click that switches screens)
                 g.host.camera = s.cam;
-                g.frontend.input(ie, &mut g.host);
+                for ie in key.into_iter().chain(ie) {
+                    g.frontend.input(ie, &mut g.host);
+                }
                 s.cam = g.host.camera;
             }
         }
