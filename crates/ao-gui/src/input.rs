@@ -95,4 +95,17 @@ pub enum Event {
     MenuPicked { id: u32 },
     /// A slider item of the popup menu changed (`value` 0.0..=1.0); the menu stays open.
     MenuSlider { id: u32, value: f32 },
+    /// The selection of a `DropdownMenu` changed (`DropdownMenu_c::SelectByIndex(.., true)`, signal `+0x128`): list index and item id.
+    DropdownChanged { window: WindowId, view: String, index: usize, id: i64 },
+    /// `ListViewBase_c::ItemSelected` (signal `+0x148`): item id and its new state. `view` = name of the `StringListView`.
+    ListSelected { window: WindowId, view: String, id: String, selected: bool },
+    /// A mouse button went down on a row of a `StringListView` (`ListViewBase_c` signal `+0x14c`, after the folder toggle and the selection): `button` 1 left /
+    /// 2 right, `clicks` 2 for the second press of the same row within [`crate::DOUBLE_CLICK_TIME`].
+    ListItemMouse { window: WindowId, view: String, id: String, button: u8, clicks: u8 },
+    /// `MultiListViewItem_c::Select(.., true)` on a row of a `MultiListView` (signal `+0x144`).
+    MultiSelected { window: WindowId, view: String, id: i64, selected: bool },
+    /// `MultiListView_c::MouseDown` signal: the row under the pointer (`None` = empty area) with the button (1 left, 2 right) and press count.
+    MultiMouse { window: WindowId, view: String, id: Option<i64>, button: u8, clicks: u8 },
+    /// A column header was resized (`SlotColumnResized`): the new width (for the window's saved config).
+    MultiColumnResized { window: WindowId, view: String, col: i32, width: f32 },
 }

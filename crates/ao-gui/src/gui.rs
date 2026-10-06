@@ -18,6 +18,8 @@ mod cc;
 mod checkbox;
 mod canvas;
 mod frame;
+mod hscroll;
+mod listview;
 mod popup;
 mod select;
 mod tooltip;
@@ -124,6 +126,8 @@ pub struct Gui {
     frame_press: Option<WindowId>,
     /// Frame drag / tab drag / popup menu / text selection state (`gui/{frame,popup,select}.rs`).
     ix: frame::Ix,
+    /// State of the list widgets (`gui/listview.rs`, `gui/hscroll.rs`).
+    wx: listview::Wx,
     /// Last mouse press on a `CanvasView` (view, button, time, position) for double-click detection.
     canvas_press: Option<(ViewId, MouseButton, f32, Point)>,
     /// Roots of `add_view` instances.
@@ -191,6 +195,7 @@ impl Gui {
             scroll_drag: None,
             frame_press: None,
             ix: Default::default(),
+            wx: Default::default(),
             canvas_press: None,
             items: Default::default(),
             extras: Vec::new(),
@@ -591,6 +596,10 @@ impl Gui {
     pub fn set_enabled(&mut self, w: WindowId, name: &str, enabled: bool) {
         if let Some(v) = self.find(w, name) {
             self.tree.views[v].enabled = enabled;
+            if matches!(self.tree.views[v].kind, Kind::Dropdown(_)) {
+                // `DropdownMenu_c::EnabledStateChanged` 0x1012b8b8: `SetColor(0xffffff / 0x909090)`
+                self.tree.views[v].color = if enabled { 0xffffff } else { 0x909090 };
+            }
             if let Some(e) = self.editor_of(v) {
                 self.tree.views[e].enabled = enabled;
             }
@@ -647,7 +656,7 @@ impl Gui {
         let Some(sv) = self.find(w, name) else { return };
         let Some(child) = self.tree.views[sv].children.first().copied() else { return };
         let Some(inner) = self.tree.views[child].children.first().copied() else { return };
-        let max = ((self.tree.views[inner].frame.height() + 1.0) - (self.tree.views[sv].frame.height() + 1.0)).max(0.0);
+        let max = ((self.tree.views[inner].frame.height() + 1.0) - self.viewport(sv).1).max(0.0);
         if let Kind::ScrollView(sd) = &mut self.tree.views[sv].kind {
             sd.offset.y = max;
         }
@@ -781,6 +790,7 @@ impl Gui {
     /// Builds the draw list for all visible windows (later windows on top).
     pub fn frame(&mut self, dt: f32) -> DrawList {
         self.time += dt;
+        self.widgets_sync();
         self.tick_cc_fades(dt);
         self.sel_autoscroll(dt);
         let mut out = DrawList::default();
@@ -893,6 +903,9 @@ impl Gui {
             Kind::Button(b) => self.draw_button(out, &v, b, rect, tint, alpha),
             Kind::CcEntry(c) => self.draw_cc_entry(out, c, v.enabled, rect, tint, alpha),
             Kind::Canvas(c) => self.draw_canvas(out, c, rect, alpha),
+            Kind::List(l) => self.draw_list(out, l, rect, tint, alpha),
+            Kind::Multi(m) => self.draw_multi(out, m, rect, tint, alpha),
+            Kind::MultiHeader { rows } => self.draw_multi_header(out, id, *rows, rect, tint, alpha),
             Kind::TextButton(b) => {
                 let col = if b.pressed || b.toggled { b.pressed_color } else if b.hover { b.hover_color } else { b.color };
                 let t = mul(tint, self.map_color(col));
@@ -1103,7 +1116,10 @@ impl Gui {
     }
 
     fn draw_scrollbar(&mut self, out: &mut Vec<DrawCmd>, sv: ViewId, r: Rect, tint: [u8; 3], alpha: f32) {
+        self.draw_hscrollbar(out, sv, r, tint, alpha);
         let Some((track, thumb_t, thumb_h)) = self.scroll_geometry(sv) else { return };
+        // the viewport is shorter than the view while the horizontal bar takes the bottom row
+        let rb = r.t + self.viewport(sv).1 - 1.0;
         let x = r.r - layout::SCROLLBAR_W;
         let gid = |n: &str| self.gfx.id(n);
         let up = gid("GFX_GUI_SCROLLBAR_GRAY_UP_NORMAL");
@@ -1112,13 +1128,13 @@ impl Gui {
         let full = gid("GFX_GUI_SCROLLBAR_GRAY_FULL");
         let w = layout::SCROLLBAR_W;
         if let Some(g) = empty {
-            self.push_gfx(out, g, Rect::new(x, r.t + 11.0, x + w, r.b - 11.0), tint, alpha);
+            self.push_gfx(out, g, Rect::new(x, r.t + 11.0, x + w, rb - 11.0), tint, alpha);
         }
         if let Some(g) = up {
             self.push_gfx(out, g, Rect::new(x, r.t, x + w, r.t + 10.0), tint, alpha);
         }
         if let Some(g) = down {
-            self.push_gfx(out, g, Rect::new(x, r.b - 10.0, x + w, r.b), tint, alpha);
+            self.push_gfx(out, g, Rect::new(x, rb - 10.0, x + w, rb), tint, alpha);
         }
         if let Some(g) = full {
             let t0 = r.t + 11.0 + thumb_t;
@@ -1134,7 +1150,7 @@ impl Gui {
         let child = *view.children.first()?;
         let inner = *self.tree.views[child].children.first()?;
         let content = self.tree.views[inner].frame.height() + 1.0;
-        let vis = view.frame.height() + 1.0;
+        let vis = self.viewport(sv).1;
         let bar_shown = matches!(sd.v_mode, ScrollMode::Always) || (matches!(sd.v_mode, ScrollMode::Auto | ScrollMode::AutoReserve) && content > vis);
         if !bar_shown {
             return None;
@@ -1270,7 +1286,7 @@ impl Gui {
         }
         let (l, t) = if is_root { (0.0, 0.0) } else { (ox + v.frame.l, oy + v.frame.t) };
         let r = Rect::new(l, t, l + v.frame.width(), t + v.frame.height());
-        if !is_root && r.contains(Point::new(x, y)) && matches!(v.kind, Kind::Border(_) | Kind::Button(_) | Kind::CcEntry(_) | Kind::Canvas(_) | Kind::Bitmap { .. } | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) | Kind::Input | Kind::Combo(_)) {
+        if !is_root && r.contains(Point::new(x, y)) && matches!(v.kind, Kind::Border(_) | Kind::Button(_) | Kind::CcEntry(_) | Kind::Canvas(_) | Kind::Bitmap { .. } | Kind::TextButton(_) | Kind::Text(_) | Kind::PowerBar(_) | Kind::Input | Kind::Combo(_) | Kind::Dropdown(_) | Kind::List(_) | Kind::Multi(_) | Kind::MultiHeader { .. }) {
             return true;
         }
         v.children.iter().any(|c| self.covers(*c, x, y, false, l, t))
@@ -1322,6 +1338,8 @@ impl Gui {
                     }
                 }
                 self.drag_scroll(y);
+                self.hscroll_drag(x);
+                self.header_drag(x);
                 self.drag_select(x);
                 self.drag_canvas(x, y);
                 self.frame_mouse_move(x, y);
@@ -1354,6 +1372,7 @@ impl Gui {
                 if self.ix.menu.is_some() {
                     self.menu_mouse_down(x, y);
                 } else {
+                    self.widget_right_down(x, y);
                     self.frame_right_down(x, y);
                 }
             }
@@ -1363,6 +1382,7 @@ impl Gui {
             InputEvent::Paste(s) => self.text_input(&s),
             _ => {}
         }
+        self.widgets_sync();
         std::mem::take(&mut self.events)
     }
 
@@ -1421,7 +1441,7 @@ impl Gui {
         }
         let inside = clip_r.contains(Point::new(x, y)) && !clip_r.is_empty();
         let interactive = match &v.kind {
-            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::Canvas(_) | Kind::ScrollView(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. } => true,
+            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::Canvas(_) | Kind::ScrollView(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. } | Kind::Dropdown(_) | Kind::List(_) | Kind::Multi(_) | Kind::MultiHeader { .. } => true,
             Kind::Text(t) => t.tvf & (tvf::ACCEPT_TXT_INPUT | tvf::ACCEPT_MOUSE_INPUT) != 0,
             _ => false,
         };
@@ -1559,7 +1579,14 @@ impl Gui {
             }
             Kind::Bitmap { .. } => {}
             Kind::Canvas(_) => self.canvas_down(v, x, y),
-            Kind::ScrollView(_) => self.scrollbar_press(v, y),
+            Kind::ScrollView(_) => {
+                if !self.hscroll_press(v, x, y) {
+                    self.scrollbar_press(v, y)
+                }
+            }
+            Kind::Dropdown(_) | Kind::List(_) | Kind::Multi(_) | Kind::MultiHeader { .. } => {
+                self.widget_down(v, x, y);
+            }
             _ => {}
         }
     }
@@ -1671,6 +1698,8 @@ impl Gui {
             }
         }
         self.scroll_drag = None;
+        self.wx.hdrag = None;
+        self.header_up();
     }
 
     /// `TVF_FILL_BOTTOM_UP` 0x400 (`ChatTextView` 0x100925ff flags 0xe6c): content shorter than the enclosing `ScrollView` sits at its bottom.
@@ -1727,7 +1756,7 @@ impl Gui {
         let Some(child) = self.tree.views[sv].children.first().copied() else { return };
         let Some(inner) = self.tree.views[child].children.first().copied() else { return };
         let content = self.tree.views[inner].frame.height() + 1.0;
-        let vis = self.tree.views[sv].frame.height() + 1.0;
+        let vis = self.viewport(sv).1;
         let max_off = (content - vis).max(0.0);
         if let Kind::ScrollView(sd) = &mut self.tree.views[sv].kind {
             sd.offset.y = (sd.offset.y + dy).clamp(0.0, max_off);
@@ -1740,7 +1769,7 @@ impl Gui {
         let win_y = self.window_of(sv).and_then(|w| self.windows[w].as_ref()).map_or(0, |w| w.pos.1) as f32;
         let top = o.1 + win_y;
         let rel = y - top;
-        let vis = self.tree.views[sv].frame.height() + 1.0;
+        let vis = self.viewport(sv).1;
         if rel < 11.0 {
             self.scroll_by(sv, -13.0);
         } else if rel > vis - 11.0 {
@@ -1763,7 +1792,7 @@ impl Gui {
         let child = self.tree.views[sv].children[0];
         let inner = self.tree.views[child].children[0];
         let content = self.tree.views[inner].frame.height() + 1.0;
-        let vis = self.tree.views[sv].frame.height() + 1.0;
+        let vis = self.viewport(sv).1;
         let max_off = (content - vis).max(0.0);
         if let Kind::ScrollView(sd) = &mut self.tree.views[sv].kind {
             sd.offset.y = if track - thh > 0.0 { t / (track - thh) * max_off } else { 0.0 };

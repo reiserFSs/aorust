@@ -9,6 +9,7 @@ pub mod input;
 pub mod layout;
 pub mod text;
 pub mod view;
+pub mod widgets;
 pub mod xml;
 
 pub use draw::{DrawCmd, DrawList, GlyphAtlas};

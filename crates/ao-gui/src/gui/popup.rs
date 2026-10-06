@@ -171,7 +171,7 @@ impl Gui {
                 }
                 self.menu_slide(x);
             } else if it.enabled && !it.sep && it.sub.is_empty() {
-                self.events.push(Event::MenuPicked { id: it.id });
+                self.menu_picked(it.id);
                 self.ix.menu = None;
             }
         } else if !on {

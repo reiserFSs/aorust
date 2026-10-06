@@ -13,6 +13,7 @@ use crate::font::FontId;
 use crate::geom::{Point, Rect};
 use crate::gfx::{GfxId, GfxSet};
 use crate::xml::Element;
+pub use crate::widgets::{DropdownData, ListData, ListItem, MultiCell, MultiCol, MultiData, MultiKey, MultiRow};
 
 pub type ViewId = usize;
 
@@ -228,6 +229,14 @@ pub enum Kind {
     Input,
     /// ComboBox_c = TextInputView + arrow BitmapView inside the border (`ComboBox_c::Initialize` 0x100021bb).
     Combo(ComboData),
+    /// `DropdownMenu_c` (docs/gui.md §13): outer view of the label border + arrow.
+    Dropdown(DropdownData),
+    /// `ListViewBase_c` (the client of `ScrolledListView_c`, XML `StringListView`).
+    List(ListData),
+    /// `MultiListView_c` rows (list mode); the application builds it with the element `MultiListView` (the original news it in code).
+    Multi(MultiData),
+    /// `ColumnHeaderView_c` of a `MultiListView_c`; `rows` = the [`Kind::Multi`] view it belongs to.
+    MultiHeader { rows: ViewId },
     ScrollView(ScrollData),
     ScrollChild,
     CheckBox { label: String, checked: bool },
@@ -646,7 +655,10 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             apply_view_attrs(&mut v, e, 0);
             tree.add(v)
         }
-        "TextInputView" | "ComboBox" | "DropdownMenu" => build_input(tree, ctx, e, e.name != "TextInputView"), // DropdownMenu_c (LFTView.xml): drawn like the ComboBox (GUESS, DropdownMenu_c not traced)
+        "TextInputView" | "ComboBox" => build_input(tree, ctx, e, e.name != "TextInputView"),
+        "DropdownMenu" => build_dropdown(tree, ctx, e),
+        "StringListView" => build_list(tree, ctx, e),
+        "MultiListView" => build_multi(tree, ctx, e),
         "ScrollView" => {
             let mode = |k: &str| match e.attr(k).map(str::to_ascii_lowercase).as_deref() {
                 Some("auto") => ScrollMode::Auto,
@@ -784,3 +796,105 @@ fn build_input(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element, combo: bool) ->
     tree.append_child(outer_id, border_id);
     outer_id
 }
+
+fn scroll_mode(e: &Element, key: &str) -> ScrollMode {
+    match e.attr(key).map(str::to_ascii_lowercase).as_deref() {
+        Some("auto") => ScrollMode::Auto,
+        Some("auto_reserve") => ScrollMode::AutoReserve,
+        Some("always") => ScrollMode::Always,
+        _ => ScrollMode::None,
+    }
+}
+
+/// `DropdownMenu_c::DropdownMenu_c(TiXmlElement*)` 0x1012c30c + `Initialize` 0x1012bf10: `View(el, 0, true)` with an `HLayoutNode`; children in order
+/// `BorderView(SetGfx(6, 7, 8) = GFX_GUI_DROPDOWNMENU_LEFT/MIDDLE/RIGHT, `SetLocalColor(DEFAULT)`, client = label `TextView` with client borders
+/// (6, 3, 6, 3) = `_DAT_101b5234`/`_DAT_101a96d4`)` and `BitmapView(AddBitmap(4, 5) = GFX_GUI_DROPDOWNMENU_CLOSED/OPEN, SetLocalColor(DEFAULT))`.
+/// The label's min/max preferred size is `(_DAT_101c5d04 = 70, -1)` until items are inserted (`RecalcMaxStringWidth` 0x1012ba12 keeps it at the widest item).
+fn build_dropdown(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> ViewId {
+    let mut outer = View::new(Kind::Dropdown(DropdownData::default()));
+    apply_view_attrs(&mut outer, e, 0);
+    outer.node = Node::H;
+    let outer_id = tree.add(outer);
+
+    let g = |i: u32| ctx.gfx.image(GfxId(i)).map(|_| GfxId(i));
+    let mut gfx = [None; 9];
+    // `BorderView_c::SetGfx(int, int, int)` 0x10125c1b: left (0x18c), middle (0x19c = the background slot), right (0x194)
+    gfx[4] = g(6);
+    gfx[6] = g(8);
+    gfx[8] = g(7);
+    let mut border = View::new(Kind::Border(BorderData { gfx, local_alpha: 1.0, local_color: 0x1000000 }));
+    border.flags = 4;
+    border.node = Node::Base;
+    // `BorderView_c::CalculatePreferredSize` 0x10126517 (3-slice mode): at least left + 1 + right + 1 wide and as high as the art (22 px)
+    border.min_size = Point::new(16.0, 21.0);
+    let border_id = tree.add(border);
+
+    let mut label = View::new(Kind::Text(TextData { text: String::new(), font: FontId::Normal, tvf: 0, min_pref: Point::new(70.0, -1.0), max_pref: Point::new(70.0, -1.0), caret: 0, anchor: None, scroll_x: 0.0 }));
+    label.name = "_text".into();
+    label.borders = Rect::new(6.0, 3.0, 6.0, 3.0);
+    let label_id = tree.add(label);
+    tree.append_child(border_id, label_id);
+
+    let mut arrow = View::new(Kind::Bitmap { gfx: [4, 5].iter().filter_map(|i| g(*i)).collect(), index: 0 });
+    arrow.flags = 4;
+    arrow.color = 0x1000000;
+    arrow.name = "_arrow".into();
+    let arrow_id = tree.add(arrow);
+
+    tree.append_child(outer_id, border_id);
+    tree.append_child(outer_id, arrow_id);
+    outer_id
+}
+
+/// `ScrolledListView_c(TiXmlElement*, int)` 0x10131dea (element `StringListView`): a `ScrollView` read from the same element whose client is a
+/// `ListViewBase_c` (`SetClient(list, null)`). The list sits in the usual `ScrollViewChild` and is as large as the viewport or its content.
+fn build_list(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> ViewId {
+    let _ = ctx;
+    let mut sv = View::new(Kind::ScrollView(ScrollData { v_mode: scroll_mode(e, "v_scrollbar_mode"), h_mode: scroll_mode(e, "h_scrollbar_mode"), offset: Point::default() }));
+    apply_view_attrs(&mut sv, e, 0);
+    sv.node = Node::Base;
+    let sv_id = tree.add(sv);
+    let child_id = tree.add(View::new(Kind::ScrollChild));
+    let mut list = View::new(Kind::List(ListData::default()));
+    list.max_size = Point::new(16000.0, 16000.0);
+    let list_id = tree.add(list);
+    tree.append_child(child_id, list_id);
+    tree.append_child(sv_id, child_id);
+    sv_id
+}
+
+/// `MultiListView_c(Rect, flags, 0, 0)` 0x10136423 in list layout mode (`SetLayoutMode(1)`): the header (`ColumnHeaderView_c`, 0x1013a8c3) above a
+/// `ScrollView(2, 2)` (`+0x29c`, both bars automatic) whose client is the item view (`+0x2a0`). The original builds the widget in code, so the element
+/// only exists in this engine (attributes: the common view ones and `feature_flags`, default 0).
+fn build_multi(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> ViewId {
+    let _ = ctx;
+    let mut outer = View::new(Kind::View);
+    apply_view_attrs(&mut outer, e, 0);
+    outer.node = Node::V;
+    let outer_id = tree.add(outer);
+
+    let mut rows = View::new(Kind::Multi(MultiData { flags: attr_u32(e, "feature_flags", 0), ..Default::default() }));
+    rows.max_size = Point::new(16000.0, 16000.0);
+    let rows_id = tree.add(rows);
+
+    let mut header = View::new(Kind::MultiHeader { rows: rows_id });
+    header.h_align = Align::Left;
+    header.min_size = Point::new(-1.0, MULTI_HEADER_H);
+    header.max_size = Point::new(16000.0, MULTI_HEADER_H);
+    let header_id = tree.add(header);
+
+    let mut sv = View::new(Kind::ScrollView(ScrollData { v_mode: ScrollMode::Auto, h_mode: ScrollMode::Auto, offset: Point::default() }));
+    sv.node = Node::Base;
+    sv.max_size = Point::new(16000.0, 16000.0);
+    let sv_id = tree.add(sv);
+    let child_id = tree.add(View::new(Kind::ScrollChild));
+    tree.append_child(child_id, rows_id);
+    tree.append_child(sv_id, child_id);
+
+    tree.append_child(outer_id, header_id);
+    tree.append_child(outer_id, sv_id);
+    outer_id
+}
+
+/// `ColumnHeaderButton_c` preferred height (0x10139b82): the label's preferred extent (font height 13 - 1 = 12) plus the 3 px label insets on both sides.
+pub const MULTI_HEADER_H: f32 = 12.0 + 3.0 + 3.0;

@@ -240,7 +240,17 @@ fn calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
             let s = text::string_size(env.fonts, env.colors, crate::font::FontId::Normal, label);
             Point::new(11.0 + 4.0 + s.x + 1.0, s.y.max(10.0))
         }
-        Kind::View | Kind::Border(_) | Kind::Canvas(_) | Kind::Input | Kind::Combo(_) | Kind::RadioGroup { .. } | Kind::Unsupported(_) => node_calc(env, tree, id, max),
+        Kind::View
+        | Kind::Border(_)
+        | Kind::Canvas(_)
+        | Kind::Input
+        | Kind::Combo(_)
+        | Kind::Dropdown(_)
+        | Kind::List(_)
+        | Kind::Multi(_)
+        | Kind::MultiHeader { .. }
+        | Kind::RadioGroup { .. }
+        | Kind::Unsupported(_) => node_calc(env, tree, id, max),
     }
 }
 
@@ -488,19 +498,25 @@ fn layout_scroll(env: &mut Env, tree: &mut Tree, id: ViewId) {
     match tree.views[id].kind.clone() {
         Kind::ScrollView(sd) => {
             let Some(client) = tree.views[id].children.first().copied() else { return };
-            // client = ScrollViewChild; decide scrollbar visibility from its content height
-            let mut r = b;
+            // client = ScrollViewChild; decide scrollbar visibility from its content size (the bars shrink each other's viewport)
             let reserve_v = matches!(sd.v_mode, ScrollMode::AutoReserve | ScrollMode::Always);
-            if reserve_v {
-                r.r -= SCROLLBAR_W + 1.0;
-            }
-            set_frame(env, tree, client, r);
-            if matches!(sd.v_mode, ScrollMode::Auto) {
-                let content = content_height(env, tree, client);
-                if content > b.height() {
+            let reserve_h = matches!(sd.h_mode, ScrollMode::AutoReserve | ScrollMode::Always);
+            let (mut vbar, mut hbar) = (reserve_v, reserve_h);
+            for _ in 0..3 {
+                let mut r = b;
+                if vbar {
                     r.r -= SCROLLBAR_W + 1.0;
-                    set_frame(env, tree, client, r);
                 }
+                if hbar {
+                    r.b -= SCROLLBAR_W + 1.0;
+                }
+                set_frame(env, tree, client, r);
+                let nv = vbar || (matches!(sd.v_mode, ScrollMode::Auto) && content_height(env, tree, client) > r.height());
+                let nh = hbar || (matches!(sd.h_mode, ScrollMode::Auto) && content_width(env, tree, client) > r.width());
+                if (nv, nh) == (vbar, hbar) {
+                    break;
+                }
+                (vbar, hbar) = (nv, nh);
             }
         }
         Kind::ScrollChild => {
@@ -539,5 +555,22 @@ pub fn content_height(env: &mut Env, tree: &mut Tree, scroll_child: ViewId) -> f
         }
     } else {
         cmin.y
+    }
+}
+
+/// Width (extent) of the scrolled content (same rule as [`content_height`]).
+pub fn content_width(env: &mut Env, tree: &mut Tree, scroll_child: ViewId) -> f32 {
+    let Some(inner) = tree.views[scroll_child].children.first().copied() else { return -1.0 };
+    let cmin = pref(env, tree, inner, false);
+    let cmax = pref(env, tree, inner, true);
+    let w = tree.views[scroll_child].frame.width();
+    if cmin.x < w {
+        if cmax.x <= w {
+            cmax.x
+        } else {
+            w
+        }
+    } else {
+        cmin.x
     }
 }

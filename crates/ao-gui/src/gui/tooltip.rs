@@ -28,7 +28,7 @@ pub(super) struct TipState {
     body: String,
     deadline: Option<f32>,
     shown: Option<Shown>,
-    screen: (f32, f32),
+    pub(super) screen: (f32, f32),
 }
 
 struct Shown {
