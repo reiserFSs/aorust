@@ -41,17 +41,27 @@ item), `N3Msg_NPCChatEndTrade` 0x10017fb1 (flag = `!param_4`), `N3Msg_SendNPCCha
   `FUN_10059e8a` [GUI]: `Window(Rect(0, 0, 399.0, 299.0), "", "", style 0, flags 0x1000)` (`_DAT_101b1d18/1c`), one tab titled with `N3Msg_GetName(npc)`,
   `MoveToCenter`, `LoadWndConfig` of the DValue `NPCChatWindowConfig` (empty on a fresh install), `esc_npcchat` (LoginPrefs default false) decides whether Esc closes it.
   Our client area is 400 x 300 and the window is centred.
-* `NPCChatView_c` (`FUN_10058ed8`): vertical layout of two `TextView_c` (HTML parser features `0x6c`, vertical scrollbar mode 2 = auto): the text at `+0x128`, the answer
-  list at `+0x12c`, with a draggable splitter bitmap between them (`BitmapView_c`, mouse pointer 10). Both have borders of 5 px. The text view's height is
-  `floor(split * (height + 1) - 1)` with `text_split_proportion` = 0.7 (`FUN_10058100`, `_DAT_101af644`); the splitter drag (`FUN_10058371`) stores a new proportion
-  clamped to a range (constants `_DAT_101b2050/54/58`, not read) -- **the drag is not ported**.
+* `NPCChatView_c` (`FUN_10058ed8`): vertical layout of two `TextView_c(Rect, "", "", FontID 8 = LARGE, 5, 0, false)` [CODE: the ctor `??0TextView_c@@QAE@ABVRect@@PBDABV..@W4FontID_e@@II_N@Z`
+  is `(rect, name, text, font, uint, uint, bool)`] (HTML parser features `0x6c`, vertical scrollbar mode 2 = auto): the text at `+0x128`, the answer
+  list at `+0x12c`, with a draggable splitter bitmap between them (`BitmapView_c(Rect, "", 0x120 = GFX_GUI_NPCCHAT_SEPERATOR (32 x 3), 0, 4)` at `+0x130`, `ExtendMaxSize((16000, -1))`). The
+  text view has borders (5,5,5,0), the answer view (5,5,5,5). The text view's preferred height is `floor(split * (Height + 1) - 1)` with `Height + 1` = the view's pixel height and
+  `text_split_proportion` = 0.7 (`FUN_10058100`, `_DAT_101af644`, `Message::FindFloat` of the window config), applied as min `Point(0, h)` / max `Point(16000, h)` by `FUN_1005824d`
+  (also on every frame change, vtable slot 27 `FUN_10058458`).
+* **Splitter drag** [CODE]: vtable slot 15 `FUN_10058186` (mouse down, button 1) -- when the point is inside the splitter's frame (`+0x130`): `this+0x180 = Point(0, FUN_10058100()) - point`
+  (the grab offset), `this+0x17c = 1`, the mouse is captured (vtable `+0xac`); slot 17 `FUN_10058460` (mouse move): without a drag, over the splitter frame
+  `View::SetMousePointer(this, 10)` (the pointer row 10 = `GFX_GUI_POINTER_VER_DRAG` 0x13f, hotspot (6,16), docs/gui.md §13.2), otherwise the default pointer; while dragging
+  `FUN_10058371(y = offset.y + point.y)`: `split = y / (Height + 1.0)`; `split < 0.1` (`_DAT_101b2058` = the double 0x3fb99999a0000000 = 0.1f) -> `split = 0.1f` (`_DAT_101b2054`);
+  else `split > 0.9` (`_DAT_101af630`, double 0.9f) -> `0.9f` (`_DAT_101b2050`); then `FUN_1005824d` re-lays the view out; slot 16 `FUN_10058230` (mouse up) ends the drag. Port:
+  `interact_chat::NpcChat::{drag_start, drag_by, drag_end, pointer_over}` + `split_from`, the splitter being a `CanvasView` (`CanvasPress/Drag/Release`) painted with the separator art
+  ([INFERENCE]: stretched over the width; `BitmapView_c` drawing not read); `Play::interact_pointer` draws the pointer sprite over the splitter and hides the OS pointer.
+  Note the `- 1` of `FUN_10058100`: the dragged text height is `floor(y - 1)` (a press without movement keeps 209, the first pixel of movement lowers it by 1 more).
 * Text composition (`FUN_100586fd`, the `AddText` slot; ported as `interact_chat::Composer`, tests in that file). `type` = `NPCChatTextType_e`:
 
 | type | HTML prefix | note |
 |---|---|---|
 | 0 | `<font color=CCNPCChatText>` | when the previous text was not type 0: `<br>` (only if the view has text) + NPC name + `": "` |
 | 1 | `<font color=CCNPCOOCText>` | `<br>` unless the previous text was type 1 or the view is empty |
-| 2 | `<br><font color=CCNPCChatQuestion>` | the echoed answer: only with the pref `ShowNPCQuestions` (IndependentPrefs, absent from every prefs xml = 0) as `<own name>: <text>`; otherwise nothing but the empty font tags |
+| 2 | `<br><font color=CCNPCChatQuestion>` | the echoed answer: only with the pref `ShowNPCQuestions` (IndependentPrefs login int, default **1** in `SetDefaultLoginPrefs`, `dvalue/indep.rs`; `Hud::dvalues.prefs.int_any`) as `<own name>: <text>`; otherwise nothing but the empty font tags |
 | 3 | `<br><font color=CCNPCChatSystem>` | |
 | 4 | `<br><font color=CCNPCChatEmote>` | NPC name + `" "` + text |
 | 5 | `<br><font color=CCNPCChatDescription>` | |
@@ -63,10 +73,27 @@ item), `N3Msg_NPCChatEndTrade` 0x10017fb1 (flag = `!param_4`), `N3Msg_SendNPCCha
   `<div indent=wrapped><img src=tdb://id:GFX_GUI_NPCCHAT_BULLET> <a href=%u style=text-decoration:none><font color=CCNPCChatQuestion>%s</font></a></div>` (`%u` = index,
   `%s` = `String::Escape(answer)`). The link slot `FUN_10058d1a`: `atol(href)`, in range -> adds the answer as a type-2 text, `N3Msg_SendNPCChatAnswer(own, npc, index)`,
   clears the answer view and the vector.
-* The button bar (`ButtonBar_c`, `FUN_10059704`): four `Button_c` (gfx 0x3f/0x40, 0x44/0x45, 0x42/0x43, 0x49/0x4a, tooltips LDB 0x2710): request description
-  (`FUN_100584f1` -> `N3Msg_NPCChatRequestDescription`), `FUN_100582eb`, trade (`FUN_1005852c` -> `N3Msg_NPCChatStartTrade`, or end of a running trade), and the fourth
-  (`LAB_1005834a`). Enable flags: description = `b20` of `KnubotOpenChatWindow`, trade = `b21`, the fourth = bit 21 of the NPC's stat 0. The bar is its own window docked
-  to the chat window (`FUN_10058577`, dock position 5, tab title LDB 0x2710). **Not ported** (see §6).
+  The bullets and the hanging indent are the HTML parser's: `ao-gui` `text::layout_text` now implements them [CODE: `HTMLParser_c::_ParseTag` 0x1015c9ad, `FUN_1015ed05`, `TextRenderer_c::_ReWrap`
+  0x10161ba4 / `_AddLineDesc` 0x10161b44 / `_RenderLine` 0x10161112]: `<img src=tdb://id:NAME>` (or `rdb://`; token 3, the sprite of `GuiResourceManager_t::GetGuiTexture`) is an inline sprite copied
+  top-aligned at the pen (`SpriteInfo_t::Copy`), its width advances the pen and counts as a word; `<div>` / `<center>` are tokens 0xc / 0xd, `indent=wrapped` sets bit 1 of the div's attribute
+  word: `_ReWrap` runs a line counter (-1 outside, 0 in the div, +1 per `_AddLineDesc`) and gives every line with counter > 0 the indent `LineDesc+4 = 10` px (`TextLine::indent`, included in
+  its width). A div is a block (a line of its own); the chat window's `<br>` joins right behind a `</div>` add nothing, so the chat keeps its look. `<a href style=text-decoration:none>`:
+  `_ParseTag` sets the attribute bits 6 (underline + link colour `+0x1c0` = 0x2299ff) **only when the style is absent or something else** -- with `text-decoration:none` the run keeps the
+  font colour, which is why the answers are `CCNPCChatQuestion` green (0x4fd553) and not link blue. Tests: `ao-gui/tests/html_text.rs`.
+* The button bar (`ButtonBar_c`, `FUN_10059704`; ctor `BorderView_c(Rect, "", 0, 4)` + `HLayoutNode`): four `Button_c` (`Button_c(Rect, "", "", -1, 0, 0, 0, 0)`, `Button_c::SetGfx(state, id)`
+  states 0 raised / 1 pressed / 2 hover = highlight art, `StateChanged` 0x10128338): description `GFX_GUI_BUTTON_DESC_NORMAL/PRESSED` (0x3f/0x40), info `INFO_*` (0x44/0x45), trade `GIVE_*` (0x42/0x43),
+  use `SHOP_*` (0x49/0x4a) (37 x 31 px each, `SetBorders` (5,5,0,5) for the first three, (5,5,5,5) for the last), tooltips `LDBface::GetText(10000, key)` = `RequestNPCdescription`, `RequestNPCinfo`, `GiveItems`, `Shop`
+  (keys read off the `PUSH` operands at 0x10059a90.. -- the decompile drops them). Handlers (connected in `FUN_10058ed8` in this order):
+  1. `FUN_100584f1` -> `N3Msg_NPCChatRequestDescription(own, npc)` (the server answers with `AppendText` type 5);
+  2. `FUN_100582eb` -> `InfoViewModule_c::ShowURL("charid://%u/%u", npc.kind, npc.instance)` (the info page of the NPC; ours: `Interact::take_info_urls` -> `ChatWindows::show_url`);
+  3. `FUN_1005852c` -> `N3Msg_NPCChatStartTrade` when no trade bar exists (`this+0x140 == 0`), else `FUN_10058408` (cancel the trade, §11);
+  4. `LAB_1005834a` -> `N3Msg_UseItem(npc, false)` (`GetInstance` 0x101a772c + `N3Msg_UseItem` 0x101a75f0; for a character target [GC 0x100286f8] builds the `ItemActionData{own, target}`
+     `GenericCmd_t` command 3 of §8, `Interact::use_object`).
+  Enable flags (`FUN_10058ed8`): description = `b20` of `KnubotOpenChatWindow`, trade = `b21`, use = bit 21 of the NPC's stat 0 (`N3Msg_GetSkill(npc, 0, 2) >> 21 & 1`, read when the window
+  is built; ours tracks stat 0 of every dynel from the `StatIIR_t` frames, `Interact::trade.flags0` -- [INFERENCE] that the server sends stat 0 for NPCs), info always. The bar is its own window
+  `Window(Rect(50, 50, 100, 100), "", "", style 2, flags 0x183c)` with one tab titled `GetText(10000, "Tab_Tools")` (never shown: style 2 = the black 0.85 alpha background, no frame), shown and docked
+  to the chat window with `Window::DockWindow(slot 5)`: `Window::LayoutDockedWindows` [GUI 0x101550ed] puts slot 5 left aligned below the window (`x = L, y = B + 1`, inclusive rect); slot 2
+  (the trade window) at `x = R, y = T` stacked downwards. Port: `interact_chat::{ChatTexts, BarFlags, dock_below, dock_right}`, tests in `interact_chat` / `interact_trade`.
 * Closing the window with its close button runs the destructor `FUN_10059d7f`: `N3Msg_NPCChatCloseWindow(own, npc)` unless `this[0x98]` is set (the server closed it).
 
 ## 3. `N3Msg_DefaultActionOnDynel` (right click, left double click)
@@ -310,3 +337,41 @@ template read from the inventory when the server adds them; the status light; fo
 * [UNRESOLVED] Docking: the window is free (left of the rollup column, 192 px wide = the dock's width) instead of a `RollupArea` page; its close button declines. List geometry (3 columns of 54 px slots, `(1,1)..(1000,..)` cell counts
   not mapped), the "Credits" label colour (the engine's `TextView` default), the 1 s timer unit (µs [INFERENCE]), digits-only cash field (feature flag `0x2000` of `FUN_100e039a` not decoded), `Feedback_*`
   refusals of `N3Msg_TradeAddItem`, item info page, `TowerType` of the target and the characters' sphere radii.
+
+## 11. NPC trade (`NPCChatTradeBar_c`, `KnubotStartTrade` / `KnubotTrade` / `KnubotFinishTrade` / `KnubotRejectedItems`)
+
+Code: `interact_trade.rs` (window + flow), `interact_chat.rs` (bar, dock slots), `n3/knubot.rs` (`end_trade`, `trade_item`, `start_trade`). `[GUI]` / `[GC]` addresses of the 32-bit DLLs.
+
+* **Start.** The trade button (§2) sends `KnubotStartTrade(value 0, "")` (`N3Msg_NPCChatStartTrade` [GC 0x1001cee9]). The server's `KnubotStartTrade(value, text)` runs `FUN_10128554` -> GlobalSignals
+  `+0xfc` -> `FUN_10058a4c` [GUI] (value = the number of items the NPC takes, text = the NPC's trade text; its format is only known from the live server: [UNRESOLVED-live], we show it verbatim). If no trade bar
+  exists (`this+0x140 == 0`): `new NPCChatTradeBar_c(npc, value)` (`FUN_100575a1`), connect its `+0x1a8` signal to `FUN_10058408`, create its window (the same `Window(Rect(50,50,100,100), "", "", style 2, 0x183c)`,
+  tab title `GetText(10000, "Trade")`), show it, `DockWindow(slot 2)` of the chat window; then the answer view (`this+300`) gets `<font color=CCNPCChatTrade>text</font>` (`CCNPCChatTrade` = 0x00dadfba).
+  Whatever the answer list held is replaced; a second `StartTrade` with a bar open does nothing.
+* **The bar** (`FUN_100575a1`, a `BorderView_c` with a `VLayoutNode`, children in this order, all borders 5 unless noted): `TextView_c` `"GIVE ITEM"` (`value == 1`) / `"GIVE ITEMS"` (hard-coded English, font 5 =
+  NORMAL); the item container `FUN_100cdb3a` = `ItemContainerView_c(msg, 2, own identity, 0xb, 0x15, 0xe, 0)` (a `MultiListView_c` with an `Icon` column; `SetMaxItemCount(value)`,
+  `SetViewCellCounts((value != 1) + 1, (value + 1) / 2)` = 1 column for one item, else 2 columns and `ceil(value / 2)` rows, no scrollbars); `TextView_c` `"GIVE CREDITS"` (borders 5,5,5,0); an inset `BorderView_c`
+  (borders 5,5,5,0) around a credits `TextView_c` (HTML flags `0x200d` = ACCEPT_TXT_INPUT | ACCEPT_MOUSE_INPUT | ALLOW_TEXT_SELECTION | NUMERIC, min size `(0, -1)`, max `(16000, -1)`, client borders 3);
+  a horizontal row of two buttons: accept `GFX_GUI_BUTTON_V_NORMAL/PRESSED` (0x4b/0x4c, 43 x 25) and decline `GFX_GUI_BUTTON_X_*` (0x4d/0x4e), borders (5,5,5,5) / (0,5,5,5).
+  The item cells are our `CanvasView` of 54 px cells (`GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED` with the 48 px item icon, the inventory grid's metrics: [INFERENCE], `ItemContainerView_c` cell metrics not read).
+  The window shows on the black 0.85 alpha style-2 background (`GFX_GUI_WINDOW_BACKGROUND`).
+* **Adding an item** (`FUN_100572f2`, the container's drop signal `+0x2dc`): when the container holds fewer than `value` items and the `DragObject_c` has mime `inventory/item` with `container_id`, `item_id`
+  and no (or zero) `split_count`: `N3Msg_NPCChatAddTradeItem(own, npc, item)` [GC 0x10017ea0] and `DragObject_c::Accept(2)`; otherwise `Cancel`. The Gamecode side checks the item may be given away
+  (`FUN_1004b80a(.., 0x70)` = the "delete item" action check: nodrop / bank / vehicle rules, not ported: the server validates) and moves it to the trade container (`FUN_1004aab1`: an inventory event 0x11 into slot
+  0 of container type 0, the client-side effect of the `ItemContainerView_c`). Wire: `KnubotTrade(op 0, Identity 0:0, item)`. Ours: the inventory drag of `hud_stats/item_ui.rs` reports a drop over a
+  foreign window (`Dnd::dropped` -> `Hud::take_item_drops`), `Play::interact_trade_frame` hands the ones over the container to `Interact::trade_drop`, which mirrors the item in the container
+  (the original mirrors the server-side container: [UNRESOLVED-live] what the server sends back, nothing is expected: `KnubotTrade` has no `Activate`).
+* **Removing** (`FUN_10057421`, signal `+0x2e0`) -> `N3Msg_NPCChatRemoveTradeItem(own, npc, item)` [GC 0x10017f31] = `KnubotTrade(op 1, 0:0, item)`; the other signal `+0x2e4` (`FUN_10057473`) ->
+  `ShowURL("itemid://%d/%d")`. [UNRESOLVED] which gesture raises which signal; ours: left double click removes, right click shows the info.
+* **Accept** (`FUN_100574dc`): `cash = GetSkill(0x3d (Cash), 2)`, `n = atoi(credits text)`; when `n > cash` the field is rewritten to `cash` and `n = cash`; `N3Msg_NPCChatEndTrade(own, npc, n, true)` [GC 0x10017fb1],
+  which lowers the own Cash (stat `0x3d`) by `n` locally (`SetStat(0x3d, cash - n)`) and sends `KnubotFinishTrade(flag = !accepted = 0, value = n)`. **Decline**, the trade button of a running trade, and the
+  bar's `+0x1a8` signal (`FUN_10057289`, also connected to a GlobalSignals slot) run `FUN_10058408`: `this+0x188 = 3` (the composer's last text type), `N3Msg_NPCChatEndTrade(own, npc, 0, false)` (the
+  `accepted == false` branch calls `FUN_100587c7` / vtable `+0x10(8)` / `FUN_100666a3(0)`, which shows `Feedback_TradeCancelled` when a player trade was active; ours: nothing) =
+  `KnubotFinishTrade(flag 1, value 0)`, then `FUN_100582b7` deletes the bar and its window. (The previous doc of `end_trade` had the flag inverted.)
+* **End.** `KnubotFinishTrade` S->C has no `Activate`. `KnubotRejectedItems(items, value)` `Activate` `FUN_101281c6`: walks the own inventory's slots and re-lays the items that came back (`FUN_1002ada2` /
+  `FUN_1002a946` per slot; ours: the item positions are kept by the server's `InventoryUpdated` messages, [UNRESOLVED] the local re-layout), `Cash += value` (`SetStat(0x3d, cash + value)`: the credits that were not
+  taken), then emits GlobalSignals `+0x100` -> `LAB_10058362`: `this+0x188 = 3`, `FUN_100582b7` (the trade window is deleted). Ours: `Interact::on_trade_knubot`.
+* Closing the dialogue (player or server) deletes the trade window with it (`NPCChatView_c` owns the bar: `FUN_10059d7f` destructor).
+* Harness API (`#[cfg(test)]`): `Interact::trade_dump(gui)`, `press_button(gui, i)` (0 description, 1 info, 2 trade, 3 use; false when the button is disabled), `trade_add(gui, item)`, `trade_accept(gui, zone,
+  credits)`, `trade_decline(gui, zone)`; non-test: `trade_drop`, `trade_wants`, `take_cash_delta`, `take_info_urls`. Tests: `interact_trade::tests` (flow with synthetic Knubot frames, wire frames, drops, double click,
+  Cash clamp, windows closed with the dialogue), `interact_chat::tests` (bar art ids, enable flags, clicks, splitter drag through real pointer events and the clamp), `n3::knubot::tests::trade_wire_layout`.
+  `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac npc_dialogue_render` writes `npc_answers.png` (bullets, green answers, 10 px hanging indent, bar below, splitter line) and `npc_trade.png`.

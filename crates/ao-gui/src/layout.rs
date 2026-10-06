@@ -168,7 +168,13 @@ fn calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
             }
         }
         Kind::Text(t) => text_pref(env, tree, id, t, max),
-        Kind::Button(b) => button_pref(env, &b.label),
+        Kind::Button(b) => match b.gfx_override {
+            Some([raised, ..]) => {
+                let (w, h) = env.gfx.size(raised);
+                Point::new(w as f32 - 1.0, h as f32 - 1.0)
+            }
+            None => button_pref(env, &b.label),
+        },
         Kind::CcEntry(c) => {
             // Button_c::CalculatePreferredSize 0x10127ee4, 3-slice border mode: x = content (+1 const) - 1, y = border art height.
             // icon entries: the 48x22 `bgicon`; label-only entries: text + 8 px each side (UNRESOLVED: 3-slice border sizes), min 47.

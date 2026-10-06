@@ -162,7 +162,8 @@ impl Gui {
         let gfx = GfxSet::load(&gui_dir).context("load Graphics.uvgi")?;
         let atlas = Atlas::pack(&gfx, 2048)?;
         let fonts = FontSystem::new(&cd, &gfx, None)?;
-        let colors = Colors::load(&gui_dir)?;
+        let mut colors = Colors::load(&gui_dir)?;
+        colors.images = gfx.iter().map(|(_, i)| (i.name.clone(), (i.width as i32, i.height as i32))).collect();
         let mut palette = DEFAULT_PALETTE;
         if let Ok(src) = std::fs::read_to_string(gui_dir.join("GUIColors.xml")) {
             if let Ok(root) = xml::parse(&src) {
@@ -219,6 +220,10 @@ impl Gui {
     }
     pub fn fonts(&mut self) -> &mut FontSystem {
         &mut self.fonts
+    }
+    /// The font system and the colour / image tables [`text::layout_text`] needs (layout of HTML outside a view).
+    pub fn text_parts(&mut self) -> (&mut FontSystem, &Colors) {
+        (&mut self.fonts, &self.colors)
     }
 
     // ------------------------------------------------------------------ windows
@@ -614,6 +619,19 @@ impl Gui {
             }
         }
     }
+    /// `TextRenderer_c::SetMinPreferredSize` / `SetMaxPreferredSize` of a `TextView` (`FUN_1005824d` for the NPC chat text part), then re-lays the window out.
+    pub fn set_text_pref_size(&mut self, w: WindowId, name: &str, min: (f32, f32), max: (f32, f32)) {
+        if let Some(v) = self.find(w, name).and_then(|v| self.editor_of(v)) {
+            if let Kind::Text(t) = &mut self.tree.views[v].kind {
+                t.min_pref = Point::new(min.0, min.1);
+                t.max_pref = Point::new(max.0, max.1);
+            }
+            // the XML `min_size` / `max_size` clamp the view's own preferred size too (`View::UpdatePreferredSize`)
+            self.tree.views[v].min_size = Point::new(min.0, min.1);
+            self.tree.views[v].max_size = Point::new(max.0, max.1);
+        }
+        self.relayout_window(w);
+    }
     /// `PowerbarView_c::SetValue` (0..1).
     pub fn set_progress(&mut self, w: WindowId, name: &str, value: f32) {
         if let Some(v) = self.find(w, name) {
@@ -970,6 +988,12 @@ impl Gui {
     fn draw_button(&mut self, out: &mut Vec<DrawCmd>, v: &View, b: &ButtonData, r: Rect, tint: [u8; 3], alpha: f32) {
         let disabled = if v.enabled { [255; 3] } else { [0x90; 3] }; // Button_c::StateChanged: 0xffffff / 0x909090
         let tint = mul(tint, disabled);
+        if let Some([raised, down, hover]) = b.gfx_override {
+            // icon button: the art of the state (`StateChanged`: the hover art replaces the raised one under the pointer)
+            let id = if b.pressed { down } else if b.hover && v.enabled { hover } else { raised };
+            self.push_gfx(out, id, r, tint, alpha);
+            return;
+        }
         let g = |ids: [u32; 9]| -> [Option<GfxId>; 9] {
             let mut o = [None; 9];
             for (s, i) in o.iter_mut().zip(ids) {
@@ -1093,9 +1117,17 @@ impl Gui {
                     Align::Center => r.l as i32 + (r.width() as i32 + 1 - line.width) / 2,
                     _ => origin_x,
                 };
-                let mut pen = lx;
+                let mut pen = lx + line.indent;
                 let y = r.t as i32 + line.y + fill_dy;
                 for run in &line.runs {
+                    if let Some((name, w, h)) = &run.img {
+                        // inline `<img>`: top-aligned at the pen (`_RenderLine` `SpriteInfo_t::Copy`); the text shadow is a clone of the text surface only
+                        if let (Some(id), false) = (self.gfx.id(name), is_shadow) {
+                            self.push_gfx(out, id, Rect::new(pen as f32, y as f32, (pen + w - 1) as f32, (y + h - 1) as f32), tint, alpha);
+                        }
+                        pen += w;
+                        continue;
+                    }
                     let c = run.color.map_or(tint, |c| mul(tint, rgb(c)));
                     let c = if run.link { mul(tint, rgb(0x2299ff)) } else { c };
                     let c = if is_shadow { [0; 3] } else { c };
@@ -1724,13 +1756,14 @@ impl Gui {
         let ry = ry - self.fill_bottom_dy(v, t.tvf, layout.height) as f32;
         let line_h = self.fonts.font(t.font).height as f32;
         let line = layout.lines.iter().find(|l| ry >= l.y as f32 && ry < l.y as f32 + line_h)?;
-        let mut pen = match line.align {
-            Align::Right => (width - line.width) as f32,
-            Align::Center => ((width - line.width) / 2) as f32,
-            _ => 0.0,
-        };
+        let mut pen = line.indent as f32
+            + match line.align {
+                Align::Right => (width - line.width) as f32,
+                Align::Center => ((width - line.width) / 2) as f32,
+                _ => 0.0,
+            };
         for run in &line.runs {
-            let w = self.fonts.font(t.font).text_width(&run.text) as f32;
+            let w = run.advance(self.fonts.font(t.font)) as f32;
             if rx >= pen && rx < pen + w {
                 return (!run.href.is_empty()).then(|| run.href.clone());
             }

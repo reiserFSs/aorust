@@ -68,7 +68,7 @@ impl Gui {
             return 0;
         }
         let line = &layout.lines[li];
-        let rx = x - ox - Self::line_pen(line.align, width, line.width) as f32;
+        let rx = x - ox - (Self::line_pen(line.align, width, line.width) + line.indent) as f32;
         let (start, s, hard) = &flat[li];
         let n = s.chars().count();
         let mut acc = 0.0;
@@ -185,7 +185,7 @@ impl Gui {
             }
             let chars: Vec<char> = text.chars().collect();
             let mut adv = |k: usize| -> f32 { chars[..k.min(n)].iter().map(|c| self.fonts.font(font).advance(*c)).sum::<i32>() as f32 };
-            let pen = r_l + Self::line_pen(layout.lines[li].align, width, layout.lines[li].width) as f32;
+            let pen = r_l + (Self::line_pen(layout.lines[li].align, width, layout.lines[li].width) + layout.lines[li].indent) as f32;
             let (x0, x1) = (pen + adv(s0 - start), pen + adv((s1 - start).min(n)));
             if x1 > x0 {
                 let y = r_t + (layout.lines[li].y + dy) as f32;
@@ -203,7 +203,7 @@ mod tests {
     use crate::view::Align;
 
     fn line(s: &str, hard: bool) -> TextLine {
-        TextLine { y: 0, width: 0, align: Align::Left, runs: vec![TextRun { text: s.into(), color: None, link: false, href: String::new() }], hard_break: hard }
+        TextLine { y: 0, width: 0, indent: 0, align: Align::Left, runs: vec![TextRun { text: s.into(), color: None, link: false, href: String::new(), img: None }], hard_break: hard }
     }
 
     #[test]

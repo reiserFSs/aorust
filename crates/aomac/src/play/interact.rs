@@ -5,9 +5,10 @@
 //!   [`Interact::on_frame`] turns into the NPC chat window ([`interact_chat`](super::interact_chat)).
 //! * Everything the player does in a dialogue goes out through [`Interact::take_outbox`].
 
-use super::interact_chat::{ChatOut, NpcChat};
+use super::interact_chat::NpcChat;
 use super::interact_grid::GridUi;
 use super::interact_ptrade::PTradeUi;
+use super::interact_trade::TradeUi;
 use super::interact_use::UseUi;
 use super::zone::Zone;
 use ao_gui::{Event, Gui};
@@ -33,7 +34,9 @@ pub struct Interact {
     last_click: Option<(Identity, f32)>,
     /// Last value of stat `0x300` per dynel.
     talk: HashMap<i32, i32>,
-    chat: Option<NpcChat>,
+    pub(super) chat: Option<NpcChat>,
+    /// The NPC trade window and the button bar's state (`interact_trade.rs`).
+    pub(super) trade: TradeUi,
     /// Grid / whompah / shuttle destination window (`interact_grid.rs`).
     grid: GridUi,
     /// Object use: the confirmation dialog, the loot windows, refusals the chat shows (`interact_use.rs`).
@@ -113,6 +116,10 @@ impl Interact {
                     if stat == STAT_TALK {
                         self.talk.insert(who.instance, v);
                     }
+                    // stat 0 bit 21 enables the fourth button of the dialogue's bar (`FUN_10058ed8`)
+                    if stat == 0 {
+                        self.trade.flags0.insert(who.instance, v);
+                    }
                 }
             }
             N3::Knubot(k) => self.on_knubot(gui, k, zone),
@@ -129,17 +136,14 @@ impl Interact {
         let own = Self::own_name(zone);
         match k {
             // `FUN_1002d36x`: an open window is deleted first (its destructor sends `NPCChatCloseWindow`), then a new one is built
-            Knubot::Open { npc, .. } => {
+            Knubot::Open { npc, b20, b21 } => {
                 if let Some(old) = self.chat.take() {
                     let (n, id) = (old.npc, self.own_id());
                     old.close(gui);
                     self.send(knubot::close_window(id, n));
                 }
                 let name = zone.dynels.get(&npc.instance).map(|d| d.name.clone()).unwrap_or_default();
-                match NpcChat::open(gui, self.screen, npc, &name) {
-                    Ok(c) => self.chat = Some(c),
-                    Err(e) => eprintln!("interact: NPC chat window: {e:#}"),
-                }
+                self.open_chat(gui, npc, &name, b20, b21);
             }
             Knubot::AppendText { npc, kind, text } => {
                 if let Some(c) = self.chat.as_mut().filter(|c| c.npc == npc) {
@@ -162,8 +166,10 @@ impl Interact {
                     c.close(gui);
                 }
             }
+            Knubot::StartTrade { .. } | Knubot::RejectedItems { .. } => self.on_trade_knubot(gui, &k),
             _ => {}
         }
+        self.trade_sync(gui);
     }
 
     /// GUI events of the NPC chat window; `true` when consumed.
@@ -180,21 +186,16 @@ impl Interact {
             out.into_iter().for_each(|p| self.send(p));
             return true;
         }
+        if self.trade_event(gui, ev, zone) {
+            return true;
+        }
         let own = Self::own_name(zone);
         let Some(c) = self.chat.as_mut() else { return false };
-        let npc = c.npc;
         let Some(out) = c.event(gui, ev, &own) else { return false };
-        let id = self.own_id();
-        match out {
-            Some(ChatOut::Answer(i)) => self.send(knubot::answer(id, npc, i)),
-            Some(ChatOut::Closed) => {
-                if let Some(c) = self.chat.take() {
-                    c.close(gui);
-                }
-                self.send(knubot::close_window(id, npc));
-            }
-            None => {}
+        if let Some(out) = out {
+            self.chat_out(gui, out);
         }
+        self.trade_sync(gui);
         true
     }
 
@@ -205,7 +206,7 @@ impl Interact {
         let Some(c) = self.chat.as_mut() else { return false };
         let npc = c.npc;
         match c.link(gui, &index.to_string(), &own) {
-            Some(ChatOut::Answer(i)) => {
+            Some(super::interact_chat::ChatOut::Answer(i)) => {
                 let id = self.own_id();
                 self.send(knubot::answer(id, npc, i));
                 true

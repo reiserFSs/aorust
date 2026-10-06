@@ -196,6 +196,11 @@ impl IndepPrefs {
         self.set_of(k).ints.get(name).map(|p| p.value)
     }
 
+    /// The int pref `name` of whichever set has it (login first), for readers outside the DValue code (`ShowNPCQuestions` of the NPC chat view).
+    pub fn int_any(&self, name: &str) -> Option<i32> {
+        [Kind::Login, Kind::Char].into_iter().find_map(|k| self.set_of(k).ints.get(name).map(|p| p.value))
+    }
+
     pub fn get_float(&self, name: &str, k: Kind) -> Option<f32> {
         self.set_of(k).floats.get(name).map(|p| p.value)
     }

@@ -121,7 +121,7 @@ pub struct BorderData {
 #[derive(Clone, Debug)]
 pub struct ButtonData {
     pub label: String,
-    /// Optional `gfxid_raised/pressed/hover` override (`Button_c::Button_c(TiXmlElement*)`).
+    /// Icon art instead of the 9-slice border: raised, pressed, hover (XML `gfxid_raised/pressed/hover`; `Button_c::SetGfx`). The button is the icon's size.
     pub gfx_override: Option<[GfxId; 3]>,
     pub pressed: bool,
     pub hover: bool,
@@ -575,7 +575,11 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
         "Button" => {
             let mut v = View::new(Kind::Button(ButtonData {
                 label: ctx.string(e, "label"),
-                gfx_override: None,
+                // `Button_c::SetGfx(state, id)` of an icon button (NPC chat button bar `FUN_10059704`): raised / pressed / hover art by gfx name
+                gfx_override: {
+                    let g = |k: &str| e.attr(k).and_then(|n| ctx.gfx.id(n));
+                    g("gfxid_raised").map(|r| [r, g("gfxid_pressed").unwrap_or(r), g("gfxid_hover").unwrap_or(r)])
+                },
                 pressed: false,
                 hover: false,
             }));

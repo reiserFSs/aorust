@@ -18,6 +18,7 @@ impl Play {
         }
         let mut i = Interact::new(self.zone.char_id, self.size);
         i.set_client_dir(self.dir.clone());
+        i.trade.texts = super::interact_chat::ChatTexts::load(&self.text);
         i.ptrade.set_texts(self.text.by_key(10000, "MsgBox_Yes").unwrap_or_default(), self.text.by_key(10000, "MsgBox_No").unwrap_or_default());
         self.interact = Some(i);
     }
@@ -58,6 +59,7 @@ impl Play {
                 s.send_zone(f);
             }
         }
+        self.interact_trade_frame();
         self.interact_ptrade_frame();
     }
 
@@ -80,6 +82,9 @@ impl Play {
     /// * Left button on an object that is not a character (characters are the HUD's selection, [`Play::interact_left_click`]): the second click on it within
     ///   the double-click time runs `N3Msg_DefaultActionOnDynel` (`FUN_1002c2ee`, not on the own character).
     pub(super) fn interact_mouse(&mut self, ev: &InputEvent, host: &Host) {
+        if let (InputEvent::MouseMove { x, y }, Some(i)) = (ev, self.interact.as_mut()) {
+            i.trade.mouse = (*x, *y);
+        }
         let InputEvent::MouseUp { x, y, button: button @ (MouseButton::Left | MouseButton::Right) } = *ev else { return };
         let clicked = self.player.as_mut().is_some_and(|p| p.take_clicks().contains(&button));
         if !clicked || self.gui.wants_mouse(x, y) {

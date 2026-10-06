@@ -476,7 +476,6 @@ impl Hud {
     }
 
     /// Puts back the drops no window claimed.
-    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
     pub(super) fn requeue_item_drops(&mut self, drops: Vec<(u32, f32, f32)>) {
         self.stats.requeue_drops(drops);
     }

@@ -58,6 +58,7 @@ pub enum Knubot {
     AppendText { npc: Identity, kind: i32, text: String },
     AnswerList { npc: Identity, answers: Vec<String> },
     StartTrade { npc: Identity, value: i32, text: String },
+    /// `flag` = the trade was cancelled (`!accepted` of `N3Msg_NPCChatEndTrade`), `value` the credits given.
     FinishTrade { npc: Identity, flag: bool, value: i32 },
     Trade { npc: Identity, op: i32, a: Identity, b: Identity },
     RejectedItems { npc: Identity, items: Vec<(Identity, i32, i32)>, value: i32 },
@@ -179,10 +180,11 @@ pub fn start_trade(own: Identity, npc: Identity) -> Vec<u8> {
     Knubot::StartTrade { npc, value: 0, text: String::new() }.encode(own)
 }
 
-/// `N3Msg_NPCChatEndTrade` [GC 0x10017fb1]: `flag` is `!param_4` (true when the trade is finished by the player's accept, false when aborted),
-/// `value` is `param_3` (the money / item count).
-pub fn end_trade(own: Identity, npc: Identity, value: i32, flag: bool) -> Vec<u8> {
-    Knubot::FinishTrade { npc, flag, value }.encode(own)
+/// `N3Msg_NPCChatEndTrade` [GC 0x10017fb1] `(own, npc, value, accepted)`: the message flag is `!accepted` (`FUN_10127ce8(.., value, accepted == false)`), `value` the
+/// credits given. The accept button (`FUN_100574dc` [GUI]) passes `accepted = true` (the client also lowers its own Cash, stat `0x3d`, by `value`), the decline button
+/// and the trade button of a running trade (`FUN_10058408`) pass `accepted = false, value = 0`.
+pub fn end_trade(own: Identity, npc: Identity, value: i32, accepted: bool) -> Vec<u8> {
+    Knubot::FinishTrade { npc, flag: !accepted, value }.encode(own)
 }
 
 /// `N3Msg_NPCChatAddTradeItem` / `RemoveTradeItem` [GC 0x10017ea0 / 0x10017f31]: `op` 0 add, 1 remove; the first identity stays zero.
@@ -319,6 +321,31 @@ mod tests {
         let mut want = message_key("KnubotAnswerIIR_c").to_be_bytes().to_vec();
         want.extend([0, 0, 0xC3, 0x50, 0, 0, 0x82, 0xe8, 0, 0, 2, 0, 0, 0xC3, 0x50, 0, 0, 0x12, 0x67, 0, 0, 0, 1]);
         assert_eq!(b, want);
+    }
+
+    /// `N3Msg_NPCChatEndTrade`: accept = flag 0 with the credits, cancel = flag 1 with 0; the add / remove item messages carry a zero first identity.
+    #[test]
+    fn trade_wire_layout() {
+        let head = |name: &str| {
+            let mut w = message_key(name).to_be_bytes().to_vec();
+            w.extend([0, 0, 0xC3, 0x50, 0, 0, 0x82, 0xe8, 0, 0, 2, 0, 0, 0xC3, 0x50, 0, 0, 0x12, 0x67]);
+            w
+        };
+        let mut want = head("KnubotFinishTradeIIR_c");
+        want.extend([0, 0, 0, 0, 0, 0, 0x03, 0xe8]);
+        assert_eq!(end_trade(OWN, NPC, 1000, true), want);
+        let mut want = head("KnubotFinishTradeIIR_c");
+        want.extend([0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(end_trade(OWN, NPC, 0, false), want);
+        let item = Identity { kind: 0x68, instance: 0x41 };
+        let mut want = head("KnubotTradeIIR_c");
+        want.extend([0, 0, 0, 0]);
+        want.extend([0; 8]);
+        want.extend([0, 0, 0, 0x68, 0, 0, 0, 0x41]);
+        assert_eq!(trade_item(OWN, NPC, 0, item), want);
+        let b = end_trade(OWN, NPC, 5, false);
+        let (h, mut r) = N3Header::parse(&b).unwrap();
+        assert_eq!(decode(&h, &mut r).unwrap(), Some(Knubot::FinishTrade { npc: NPC, flag: true, value: 5 }));
     }
 
     #[test]

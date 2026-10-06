@@ -112,10 +112,12 @@ Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), co
 * Each window keeps at most **100** lines (`FUN_10088e92` pops the oldest when `size > 100`), then scrolls to the bottom; window logging (`is_logged`) writes `<window>/Log.txt`
   (`"\n"`→`<br>` escaped lines) — **not ported**.
 * Link rendering: `TextRenderer_c` ctor 0x10163412 sets link colour `0xff2299ff` (+0x1c0), shadow offset Point(1,1) (+0x254), default colour 0xff000000 = view colour.
-  `<a>` runs always use the link colour (`_RenderLine` 0x10161112: `attrib & 4 → +0x1c0`), so names/group names are blue; `text-decoration:none` only suppresses the underline.
+  `<a>` runs use the link colour when their attribute word has bit 4 (`_RenderLine` 0x10161112: `attrib & 4 → +0x1c0`); `HTMLParser_c::_ParseTag` 0x1015c9ad sets that word to 6 (underline + link colour) only when the
+  `style` attribute is absent or not `text-decoration:none`, so names / group names written as `<a style="text-decoration:none" href=..>` keep the line's font colour (corrected: they were blue before;
+  `ao-gui` `layout_text` now follows this, docs/zone/interact.md §2).
   Shadow = a clone of the text surface with colour 0 (black), alpha 1, behind the text (`_AllocateBitmap` 0x1016095b, only with flag 0x1000 = `ChatView::shadow`, `+0x1ba`, default **off**,
   setter `FUN_1008e04f`; offset from pref `ChatTextShadowOffset`: 0 → 0, 1 → 1, 2 → 2, else 1; shipped value 1).
-* **Not ported**: `<div indent=wrapped>` hanging indent of wrapped lines; per-line fading (`is_message_fading_enabled`, prefs `ChatTextFadeDelay`/`ChatTextFadeTime`, `FUN_1008f432`
+* The `<div indent=wrapped>` hanging indent of wrapped lines (10 px, `_AddLineDesc` 0x10161b44) is ported (docs/zone/interact.md §2). **Not ported**: per-line fading (`is_message_fading_enabled`, prefs `ChatTextFadeDelay`/`ChatTextFadeTime`, `FUN_1008f432`
   → `FUN_1009349d`; shipped false, prefs absent from CharPrefs/MainPrefs; the menu entry only stores the flag). Text selection/copy, right-click menus, window drag/resize and tabs: §10-§13.
 
 ## 6. Input bar, links, activation

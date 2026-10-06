@@ -234,7 +234,6 @@ impl HudStats {
         std::mem::take(&mut self.dnd.dropped)
     }
 
-    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
     pub(in crate::play) fn requeue_drops(&mut self, drops: Vec<(u32, f32, f32)>) {
         self.dnd.dropped.extend(drops);
     }

@@ -21,6 +21,8 @@ use std::path::Path;
 #[derive(Default, Clone)]
 pub struct Colors {
     named: HashMap<String, String>,
+    /// Size of every gfx by name, for `<img src=tdb://id:NAME>` (filled by `Gui::new` from `Graphics.uvgi`).
+    pub images: HashMap<String, (i32, i32)>,
 }
 
 impl Colors {
@@ -62,12 +64,24 @@ pub struct TextRun {
     pub link: bool,
     /// `href` of the enclosing `<a>` (empty = none).
     pub href: String,
+    /// An inline `<img>`: gfx name, width, height (the run has no text; it is drawn top-aligned at the pen, `_RenderLine` 0x10161112 `SpriteInfo_t::Copy`).
+    pub img: Option<(String, i32, i32)>,
+}
+
+impl TextRun {
+    /// Advance of the run: the text in `font`, or the image width.
+    pub fn advance(&self, fnt: &mut crate::font::Font) -> i32 {
+        self.img.as_ref().map_or_else(|| fnt.text_width(&self.text), |i| i.1)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct TextLine {
     pub y: i32,
+    /// Including [`TextLine::indent`].
     pub width: i32,
+    /// Left indent of a wrapped line of a `<div indent=wrapped>` ([`WRAP_INDENT`]).
+    pub indent: i32,
     pub align: Align,
     pub runs: Vec<TextRun>,
     /// The line ends at a real line break (`<br>` / `\n`), not at a word wrap (text selection copies a `\n` only here).
@@ -163,12 +177,31 @@ fn parse_tag_attrs(s: &str) -> Vec<(String, String)> {
 struct Word {
     text: String,
     color: Option<u32>,
+    /// link-coloured (`<a>` without `style=text-decoration:none`)
     link: bool,
     href: String,
+    /// `<img>`: gfx name and size
+    img: Option<(String, i32, i32)>,
     /// width in px of the word including its trailing space
     w: i32,
     hard_break_after: bool,
     align: Align,
+    /// inside a `<div indent=wrapped>`
+    wrapped: bool,
+    /// first word of such a div
+    div_start: bool,
+}
+
+/// Indent of the wrapped lines of a `<div indent=wrapped>`: `_AddLineDesc` 0x10161b44 sets `LineDesc+4 = 10` for every line added after the first of the div
+/// (the counter `param_5` of `_ReWrap` 0x10161ba4 is 0 at the div, -1 outside, +1 per added line).
+const WRAP_INDENT: i32 = 10;
+
+/// `<img src=tdb://id:NAME>` (`FUN_1015ed05`): the size of the gfx `NAME` in `colors.images`.
+fn image_of(colors: &Colors, attrs: &[(String, String)]) -> Option<(String, i32, i32)> {
+    let src = attrs.iter().find(|(k, _)| k == "src").map(|(_, v)| v.as_str())?;
+    let name = src.get(..6).filter(|p| p.eq_ignore_ascii_case("tdb://")).and_then(|_| src[6..].strip_prefix("id:"))?;
+    let &(w, h) = colors.images.get(name)?;
+    Some((name.to_string(), w, h))
 }
 
 /// Lays `text` out. `wrap` = available width in pixels (only used with `TVF_WORD_WRAP`).
@@ -179,8 +212,13 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
     let mut words: Vec<Word> = Vec::new();
     let mut color_stack: Vec<Option<u32>> = vec![None];
     let mut align_stack = vec![Align::Left];
-    let mut link = 0usize;
-    let mut hrefs: Vec<String> = Vec::new();
+    // open `<a>`: (href, link colour). `<a style=text-decoration:none>` is clickable but not link-coloured (`_ParseTag` 0x1015c9ad sets the attribute bits 6 only otherwise).
+    let mut hrefs: Vec<(String, bool)> = Vec::new();
+    // open `<div>` / `<center>`: is it `indent=wrapped`?
+    let mut divs: Vec<bool> = Vec::new();
+    let mut div_starts: Vec<usize> = Vec::new();
+    // the last token closed a `<div>`: a `<br>` right behind it adds nothing (the block already ended the line)
+    let mut block_closed = false;
     let measure = |fnt: &mut crate::font::Font, s: &str| -> i32 {
         if password {
             s.chars().map(|_| fnt.advance('*')).sum()
@@ -188,7 +226,19 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
             fnt.text_width(s)
         }
     };
-    let push_text = |words: &mut Vec<Word>, fnt: &mut crate::font::Font, s: &str, color: Option<u32>, link: bool, href: &str, align: Align| {
+    let new_word = |text: String, color: Option<u32>, link: &(String, bool), w: i32, align: Align, wrapped: bool| Word {
+        text,
+        color,
+        link: link.1,
+        href: link.0.clone(),
+        img: None,
+        w,
+        hard_break_after: false,
+        align,
+        wrapped,
+        div_start: false,
+    };
+    let push_text = |words: &mut Vec<Word>, fnt: &mut crate::font::Font, s: &str, color: Option<u32>, link: &(String, bool), align: Align, wrapped: bool| {
         // split into words keeping spaces attached to the preceding word
         let mut cur = String::new();
         let mut it = s.chars().peekable();
@@ -196,17 +246,23 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
             cur.push(c);
             if c == ' ' && it.peek() != Some(&' ') {
                 let w = measure(fnt, &cur);
-                words.push(Word { text: std::mem::take(&mut cur), color, link, href: href.to_string(), w, hard_break_after: false, align });
+                words.push(new_word(std::mem::take(&mut cur), color, link, w, align, wrapped));
             }
         }
         if !cur.is_empty() {
             let w = measure(fnt, &cur);
-            words.push(Word { text: cur, color, link, href: href.to_string(), w, hard_break_after: false, align });
+            words.push(new_word(cur, color, link, w, align, wrapped));
         }
     };
+    let no_link = (String::new(), false);
     for tok in tokenize(text) {
+        let wrapped = divs.iter().any(|w| *w);
+        let align = *align_stack.last().unwrap();
+        let link = hrefs.last().unwrap_or(&no_link).clone();
+        let color = *color_stack.last().unwrap();
         match tok {
             Tok::Text(t) => {
+                block_closed = false;
                 let mut first = true;
                 for part in t.split('\n') {
                     if !first {
@@ -214,56 +270,101 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                             if let Some(w) = words.last_mut() {
                                 w.hard_break_after = true;
                             } else {
-                                words.push(Word { text: String::new(), color: None, link: false, href: String::new(), w: 0, hard_break_after: true, align: *align_stack.last().unwrap() });
+                                words.push(Word { hard_break_after: true, ..new_word(String::new(), None, &no_link, 0, align, wrapped) });
                             }
                         } else {
-                            push_text(&mut words, fonts.font(font), " ", *color_stack.last().unwrap(), link > 0, hrefs.last().map_or("", |h| h.as_str()), *align_stack.last().unwrap());
+                            push_text(&mut words, fonts.font(font), " ", color, &link, align, wrapped);
                         }
                     }
                     first = false;
                     let part = part.trim_end_matches('\r');
-                    push_text(&mut words, fonts.font(font), part, *color_stack.last().unwrap(), link > 0, hrefs.last().map_or("", |h| h.as_str()), *align_stack.last().unwrap());
+                    push_text(&mut words, fonts.font(font), part, color, &link, align, wrapped);
                 }
             }
             Tok::Br => {
+                if std::mem::take(&mut block_closed) {
+                    continue;
+                }
                 if let Some(w) = words.last_mut() {
                     w.hard_break_after = true;
                 } else {
-                    words.push(Word { text: String::new(), color: None, link: false, href: String::new(), w: 0, hard_break_after: true, align: *align_stack.last().unwrap() });
+                    words.push(Word { hard_break_after: true, ..new_word(String::new(), None, &no_link, 0, align, wrapped) });
                 }
             }
-            Tok::Open(name, attrs) => match name.as_str() {
-                "font" => {
-                    let c = attrs.iter().find(|(k, _)| k == "color").and_then(|(_, v)| colors.parse(v));
-                    color_stack.push(c.or(*color_stack.last().unwrap()));
+            Tok::Open(name, attrs) => {
+                block_closed = false;
+                match name.as_str() {
+                    "font" => {
+                        let c = attrs.iter().find(|(k, _)| k == "color").and_then(|(_, v)| colors.parse(v));
+                        color_stack.push(c.or(color));
+                    }
+                    "center" => {
+                        align_stack.push(Align::Center);
+                        divs.push(false);
+                    }
+                    "a" => {
+                        let href = attrs.iter().find(|(k, _)| k == "href").map(|(_, v)| v.clone()).unwrap_or_default();
+                        let plain = attrs.iter().any(|(k, v)| k == "style" && v.eq_ignore_ascii_case("text-decoration:none"));
+                        hrefs.push((href, !plain));
+                    }
+                    "div" => {
+                        // block: starts on a line of its own (`_ParseTag`: div = token 0xc)
+                        if let Some(w) = words.last_mut() {
+                            w.hard_break_after = true;
+                        }
+                        let w = attrs.iter().any(|(k, v)| k == "indent" && v.eq_ignore_ascii_case("wrapped"));
+                        if w {
+                            div_starts.push(words.len());
+                        }
+                        divs.push(w);
+                        color_stack.push(color);
+                        align_stack.push(align);
+                    }
+                    "p" | "b" | "i" | "u" | "span" => {
+                        color_stack.push(color);
+                        align_stack.push(align);
+                    }
+                    "img" => {
+                        if let Some((n, w, h)) = image_of(colors, &attrs) {
+                            words.push(Word { img: Some((n, w, h)), ..new_word(String::new(), color, &link, w, align, wrapped) });
+                        }
+                    }
+                    _ => {}
                 }
-                "center" => align_stack.push(Align::Center),
-                "a" => {
-                    link += 1;
-                    hrefs.push(attrs.iter().find(|(k, _)| k == "href").map(|(_, v)| v.clone()).unwrap_or_default());
-                }
-                "p" | "div" | "b" | "i" | "u" | "span" => {
-                    color_stack.push(*color_stack.last().unwrap());
-                    align_stack.push(*align_stack.last().unwrap());
-                }
-                _ => {}
-            },
+            }
             Tok::Close(name) => match name.as_str() {
                 "font" => {
+                    block_closed = false;
                     if color_stack.len() > 1 {
                         color_stack.pop();
                     }
                 }
                 "center" => {
+                    block_closed = false;
+                    divs.pop();
                     if align_stack.len() > 1 {
                         align_stack.pop();
                     }
                 }
                 "a" => {
-                    link = link.saturating_sub(1);
+                    block_closed = false;
                     hrefs.pop();
                 }
-                "p" | "div" | "b" | "i" | "u" | "span" => {
+                "div" => {
+                    divs.pop();
+                    if let Some(w) = words.last_mut() {
+                        w.hard_break_after = true;
+                    }
+                    block_closed = true;
+                    if color_stack.len() > 1 {
+                        color_stack.pop();
+                    }
+                    if align_stack.len() > 1 {
+                        align_stack.pop();
+                    }
+                }
+                "p" | "b" | "i" | "u" | "span" => {
+                    block_closed = false;
                     if color_stack.len() > 1 {
                         color_stack.pop();
                     }
@@ -273,6 +374,11 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                 }
                 _ => {}
             },
+        }
+    }
+    for i in div_starts {
+        if let Some(w) = words.get_mut(i) {
+            w.div_start = true;
         }
     }
     // wrap
@@ -280,37 +386,64 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
     let mut layout = TextLayout::default();
     let mut cur_runs: Vec<TextRun> = Vec::new();
     let mut cur_w = 0;
+    let mut cur_h = line_h;
     let mut cur_align = Align::Left;
     let mut y = 0;
-    let flush = |layout: &mut TextLayout, runs: &mut Vec<TextRun>, w: &mut i32, align: Align, y: &mut i32, hard: bool| {
-        // trailing space of the last word does not count towards the line width (`GetStringSize`-style trim)
+    // `_ReWrap`'s wrapped-line counter: -1 outside a `<div indent=wrapped>`, 0 at its first line, +1 per line added
+    let mut wrap_ct: i32 = -1;
+    let mut indent = 0;
+    let flush = |layout: &mut TextLayout, runs: &mut Vec<TextRun>, w: &mut i32, h: &mut i32, y: &mut i32, align: Align, indent: i32, hard: bool| {
         layout.max_width = layout.max_width.max(*w);
-        layout.lines.push(TextLine { y: *y, width: *w, align, runs: std::mem::take(runs), hard_break: hard });
-        *y += line_h;
+        layout.lines.push(TextLine { y: *y, width: *w, align, runs: std::mem::take(runs), hard_break: hard, indent });
+        *y += *h;
         *w = 0;
+        *h = line_h;
     };
     let nwords = words.len();
     for (n, wd) in words.into_iter().enumerate() {
+        if wd.div_start {
+            wrap_ct = 0;
+        } else if !wd.wrapped {
+            wrap_ct = -1;
+        }
+        // a fresh line takes the indent of the counter state
+        if cur_w == 0 && cur_runs.is_empty() {
+            indent = if wrap_ct > 0 { WRAP_INDENT } else { 0 };
+            cur_w = indent;
+        }
         if let Some(l) = limit {
             let trimmed = wd.w - if wd.text.ends_with(' ') { fonts.font(font).advance(' ') } else { 0 };
-            if cur_w > 0 && cur_w + trimmed > l {
-                flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y, false);
+            if cur_w > indent && cur_w + trimmed > l {
+                flush(&mut layout, &mut cur_runs, &mut cur_w, &mut cur_h, &mut y, cur_align, indent, false);
+                if wrap_ct >= 0 {
+                    wrap_ct += 1;
+                }
+                indent = if wrap_ct > 0 { WRAP_INDENT } else { 0 };
+                cur_w = indent;
             }
         }
         cur_align = wd.align;
         cur_w += wd.w;
-        if !wd.text.is_empty() {
+        if let Some((_, _, h)) = wd.img {
+            cur_h = cur_h.max(h);
+        }
+        if wd.img.is_some() {
+            cur_runs.push(TextRun { text: String::new(), color: wd.color, link: wd.link, href: wd.href, img: wd.img });
+        } else if !wd.text.is_empty() {
             match cur_runs.last_mut() {
-                Some(r) if r.color == wd.color && r.link == wd.link && r.href == wd.href => r.text.push_str(&wd.text),
-                _ => cur_runs.push(TextRun { text: wd.text, color: wd.color, link: wd.link, href: wd.href }),
+                Some(r) if r.img.is_none() && r.color == wd.color && r.link == wd.link && r.href == wd.href => r.text.push_str(&wd.text),
+                _ => cur_runs.push(TextRun { text: wd.text, color: wd.color, link: wd.link, href: wd.href, img: None }),
             }
         }
         if wd.hard_break_after && n < nwords {
-            flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y, true);
+            flush(&mut layout, &mut cur_runs, &mut cur_w, &mut cur_h, &mut y, cur_align, indent, true);
+            if wrap_ct >= 0 {
+                wrap_ct += 1;
+            }
         }
     }
     if !cur_runs.is_empty() || layout.lines.is_empty() {
-        flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y, false);
+        flush(&mut layout, &mut cur_runs, &mut cur_w, &mut cur_h, &mut y, cur_align, indent, false);
     }
     layout.height = y;
     // a trailing break leaves an empty last line only when text is non-empty; empty text keeps one line

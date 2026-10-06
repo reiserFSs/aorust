@@ -1260,6 +1260,7 @@ impl Frontend for Play {
             if let Some(h) = self.hud.as_mut() {
                 h.draw_cursor(&self.gui, &self.zone, host, &mut list);
             }
+            self.interact_pointer(host, &mut list);
         }
         if self.screen == Screen::Create {
             list.cmds.splice(0..0, pre.cmds);
