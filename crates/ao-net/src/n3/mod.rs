@@ -7,8 +7,11 @@ pub mod action;
 pub mod combat;
 pub mod chat;
 pub mod dynel;
+pub mod inventory;
+pub mod knubot;
 pub mod misc;
 pub mod motion;
+pub mod nano;
 pub mod nametag;
 pub mod outgoing;
 pub mod pet;
@@ -55,6 +58,10 @@ pub enum N3 {
     Teleport(teleport::Teleport),
     /// `AddPetIIR_c` / `RemovePetIIR_c`: the own pet list.
     Pet(pet::PetList),
+    /// Server inventory messages: `ContainerAddItemIIR_t`, `ItemReplacedIIR_c`, `InventoryUpdate(d)IIR_t` (docs/gui.md §11.12).
+    Inventory(inventory::InventoryMsg),
+    /// `Knubot*IIR_c`: NPC dialogue and NPC trade (docs/zone/interact.md).
+    Knubot(knubot::Knubot),
     /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
     Unknown(Vec<u8>),
 }
@@ -85,6 +92,10 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
         N3::Teleport(m)
     } else if let Some(m) = pet::decode(&h, &mut r)? {
         N3::Pet(m)
+    } else if let Some(m) = inventory::decode(&h, &mut r)? {
+        N3::Inventory(m)
+    } else if let Some(m) = knubot::decode(&h, &mut r)? {
+        N3::Knubot(m)
     } else {
         N3::Unknown(f.payload[13..].to_vec())
     };
