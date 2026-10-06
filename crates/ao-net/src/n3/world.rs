@@ -277,6 +277,13 @@ impl InventoryEntry {
     }
 }
 
+/// `FUN_1002a41a` [GC]: size word `(n+1)*0x3f1`, then `n` [`InventoryEntry`]s (32 bytes each).
+pub(crate) fn read_inventory(r: &mut Reader) -> Result<Vec<InventoryEntry>> {
+    let (_, n) = counted(r)?;
+    fits(n, 32, r)?;
+    (0..n).map(|_| InventoryEntry::read(r)).collect()
+}
+
 /// `FullCharacterIIR_t::ReadSubClass` (GC 0x10073881). Reading stops (and `rest` holds the
 /// unread bytes, starting with the size word/flag that could not be decoded) at the first
 /// non-empty equipment block, spell list or perk map: their element layouts (`SpellData_t`, perk
@@ -329,9 +336,7 @@ impl FullCharacter {
 
     fn body(&mut self, r: &mut Reader) -> Result<()> {
         // this+0x70: `FUN_1002a41a`: size word (n+1)*0x3f1, per element `u32 slot; i16; i16; Identity; ACGItem_t` (`FUN_1002a04a`).
-        let (_, n) = counted(r)?;
-        fits(n, 32, r)?;
-        self.inventory = (0..n).map(|_| InventoryEntry::read(r)).collect::<Result<_>>()?;
+        self.inventory = read_inventory(r)?;
         let (_, n) = counted(r)?;
         fits(n, 4, r)?;
         self.list_18 = (0..n).map(|_| r.i32()).collect::<Result<_>>()?;
