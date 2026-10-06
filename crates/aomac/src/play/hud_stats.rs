@@ -7,11 +7,11 @@
 //! * Stat: `StatView_c` (`FUN_1007ff6e`), [`stat_view`].
 
 mod buffs;
-mod items;
+pub(in crate::play) mod items;
 mod skill_model;
 mod stat_view;
 mod zone_inv;
-mod inv_grid;
+pub(in crate::play) mod inv_grid;
 mod item_dnd;
 mod item_ui;
 

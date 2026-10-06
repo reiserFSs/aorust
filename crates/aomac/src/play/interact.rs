@@ -7,6 +7,7 @@
 
 use super::interact_chat::{ChatOut, NpcChat};
 use super::interact_grid::GridUi;
+use super::interact_use::UseUi;
 use super::zone::Zone;
 use ao_gui::{Event, Gui};
 use ao_net::frame::Frame;
@@ -26,21 +27,23 @@ const CMD_USE_ITEM: i32 = 3;
 
 #[derive(Default)]
 pub struct Interact {
-    own: u32,
+    pub(super) own: u32,
     /// The last plain left click (dynel, `Play::time`), for double-click detection.
-    last_click: Option<(i32, f32)>,
+    last_click: Option<(Identity, f32)>,
     /// Last value of stat `0x300` per dynel.
     talk: HashMap<i32, i32>,
     chat: Option<NpcChat>,
     /// Grid / whompah / shuttle destination window (`interact_grid.rs`).
     grid: GridUi,
+    /// Object use: the confirmation dialog, the loot windows, refusals the chat shows (`interact_use.rs`).
+    pub(super) use_ui: UseUi,
     outbox: Vec<Frame>,
     /// Text of `KnubotCloseChatWindow` for the chat window ([INFERENCE]: the `+0xf0` slot's consumer was not located; the live server sends the reason, e.g. "You are too far away from <npc> to continue this conversation.").
     notices: Vec<String>,
     /// `n3Command_t` sequence numbers of the commands we sent.
     seq: i32,
     /// Screen size for centring the window.
-    screen: (u32, u32),
+    pub(super) screen: (u32, u32),
     /// Every NPC dialogue line seen, in order, for the live harness (`HTML` as shown).
     pub log: Vec<String>,
 }
@@ -54,7 +57,7 @@ impl Interact {
         self.screen = screen;
     }
 
-    fn own_id(&self) -> Identity {
+    pub(super) fn own_id(&self) -> Identity {
         Identity { kind: DYNEL_CHAR, instance: self.own as i32 }
     }
 
@@ -68,7 +71,7 @@ impl Interact {
     }
 
     /// Records a left click on `id` at `now`; true when it is the second click of a double click.
-    pub fn double_click(&mut self, id: i32, now: f32) -> bool {
+    pub fn double_click(&mut self, id: Identity, now: f32) -> bool {
         let double = self.last_click.is_some_and(|(i, t)| i == id && now - t <= ao_gui::DOUBLE_CLICK_TIME);
         self.last_click = if double { None } else { Some((id, now)) };
         double
@@ -76,6 +79,7 @@ impl Interact {
 
     /// The zone changes or the connection ends: the dialogue window goes away without a word to the server.
     pub fn close_all(&mut self, gui: &mut Gui) {
+        self.use_ui.close_all(gui);
         self.grid.close_all(gui);
         if let Some(c) = self.chat.take() {
             c.close(gui);
@@ -90,7 +94,7 @@ impl Interact {
         std::mem::take(&mut self.outbox)
     }
 
-    fn send(&mut self, payload: Vec<u8>) {
+    pub(super) fn send(&mut self, payload: Vec<u8>) {
         self.outbox.push(n3_frame(0, self.own, payload));
     }
 
@@ -98,6 +102,7 @@ impl Interact {
     pub fn on_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &Zone) {
         let Ok(m) = n3::decode(f) else { return };
         let who = m.header.target;
+        self.watch_objects(gui, &m);
         match m.body {
             N3::Dynel(Dynel::Stat(s)) if who.kind == DYNEL_CHAR => {
                 for (stat, v) in s.stats {
@@ -158,6 +163,10 @@ impl Interact {
     /// GUI events of the NPC chat window; `true` when consumed.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
         let me = self.own_id();
+        if let Some(out) = self.use_ui.event(gui, ev) {
+            self.use_out(zone, out);
+            return true;
+        }
         if let Some(out) = self.grid.event(gui, ev, me) {
             out.into_iter().for_each(|p| self.send(p));
             return true;
@@ -220,12 +229,20 @@ impl Interact {
     }
 }
 
-/// What [`Interact::default_action`] did.
+/// What [`Interact::default_action`] / [`Interact::default_action_on`] / [`Interact::use_item`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
     /// `KnubotOpenChatWindow` sent.
     Talk,
+    /// `ClientGetItemIIR_t` sent (`N3Msg_GetItem`): `Can` bit 0.
+    Get,
+    /// `GenericCmd_t` 3 sent (`N3Msg_UseItem`): `Can` bit 3, or the confirmation was answered Yes.
+    Use,
+    /// `Can` bit 4: the "UseItem" confirmation dialog is asked for (`GuiSystem_c::ConfirmUseItemDialogue`).
+    Confirm,
+    /// Refused with the `Feedback_*` text of the key (chat category 110).
+    Refused(&'static str),
 }
 
 /// Live-harness helpers (`flow/live.rs` steps `talk`, `dlg`, `answer`, `useobj`, `npcs`).

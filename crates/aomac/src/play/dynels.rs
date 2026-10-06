@@ -132,6 +132,8 @@ pub struct Built {
     pub visible: bool,
     /// Items whose mesh has node keyframes (doors, vending machines): the animation data (docs/zone/doors.md).
     pub item: Option<ItemRig>,
+    /// The stats of an item-family dynel: its template's overlaid by the message's (`N3Msg_DefaultActionOnDynel` reads `Can`, interact.rs).
+    pub stats: Vec<(u32, i32)>,
 }
 
 /// A skinned pose held for good: vertices and mount transforms.
@@ -259,7 +261,7 @@ fn static_model(store: &RecordStore, mesh: u32, override_texture: Option<u32>) -
 }
 
 fn plain(model: ao_scene::Scene, visible: bool) -> Built {
-    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None }
+    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None, stats: Vec::new() }
 }
 
 fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::Result<Built> {
@@ -274,12 +276,12 @@ fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::
                 (Some(cat), _) => {
                     let rig = ActorRig::new(store, cat, None, &Default::default(), &Default::default(), &[])?;
                     let held = rig.pose(None);
-                    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), ..plain(Default::default(), v.visible) })
+                    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), stats: eff, ..plain(Default::default(), v.visible) })
                 }
                 (None, Some(mesh)) => {
                     let model = static_model(store, mesh, v.override_texture)?;
                     let item = ItemRig::new(store, mesh, &model, &eff, tpl.map(|t| t.sounds).unwrap_or_default());
-                    Ok(Built { item, ..plain(model, v.visible) })
+                    Ok(Built { item, stats: eff, ..plain(model, v.visible) })
                 }
                 (None, None) => anyhow::bail!("item dynel without a model"),
             }
@@ -488,10 +490,17 @@ struct Prop {
     submitted: bool,
     /// Door / animated item state and the pose the renderer holds (docs/zone/doors.md).
     anim: PropAnim,
+    /// Stats set by messages (full update, `StatIIR_t`); they win over the template's ([`Built::stats`]).
+    stats: Vec<(u32, i32)>,
 }
 
 /// Identity kinds of `Door_t` (`DoorRibosome_t`, docs/zone/static.md §3).
 const DOOR_KINDS: [i32; 3] = [0xC748, 0xDAC6, 0xC73A];
+
+/// Stat `Can` (0x1e): bit 0 = can be picked up, bit 3 = can be used (`N3Msg_DefaultActionOnDynel` [GC 0x100291da]).
+pub const CAN_STAT: u32 = 0x1e;
+/// `Corpse_t`'s constructor [GC 0x1007e652] pre-sets `Can` to 8 (`FUN_10088d80(0x1e, 8)`).
+const CORPSE_CAN: i32 = 8;
 
 /// First `ActorFrame::id` of props (character instances stay far below).
 const PROP_ID_BASE: u32 = 0x4000_0000;
@@ -650,8 +659,56 @@ impl Dynels {
         if !replace {
             self.next_prop += 1;
         }
-        self.props.insert((kind, instance), Prop { id, key: look.key(), pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default() });
+        let stats = match &look {
+            Look::Item { stats, .. } => stats.clone(),
+            Look::Corpse(_) => vec![(CAN_STAT, CORPSE_CAN)],
+            Look::Char(_) => vec![],
+        };
+        self.props.insert((kind, instance), Prop { id, key: look.key(), pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default(), stats });
         self.pending.push(look);
+    }
+    /// Message stats of the known prop `who` (a corpse's, a `StatIIR_t`'s): they replace earlier values.
+    fn set_stats(&mut self, who: ao_net::msg::Identity, new: impl Iterator<Item = (u32, i32)>) {
+        let Some(p) = self.props.get_mut(&(who.kind, who.instance)) else { return };
+        for (id, v) in new {
+            match p.stats.iter_mut().find(|s| s.0 == id) {
+                Some(s) => s.1 = v,
+                None => p.stats.push((id, v)),
+            }
+        }
+    }
+
+    /// Test hook: a prop with message stats and no model.
+    #[cfg(test)]
+    pub(super) fn test_prop(&mut self, who: ao_net::msg::Identity, stats: Vec<(u32, i32)>) {
+        self.add_prop(who.kind, who.instance, Look::Item { template: None, stats }, [0.0; 3], None, 1.0);
+    }
+
+    /// Stat `id` of the non-character dynel `(kind, instance)`: a message's value, else its template's (`None` while the model is not built
+    /// yet, the dynel is unknown or has no such stat).
+    pub fn stat_of(&self, kind: i32, instance: i32, id: u32) -> Option<i32> {
+        let p = self.props.get(&(kind, instance))?;
+        ao_formats::dynel_visual::get(&p.stats, id).or_else(|| match self.models.get(&p.key) {
+            Some(Model::Ready { built, .. }) => ao_formats::dynel_visual::get(&built.stats, id),
+            _ => None,
+        })
+    }
+
+    /// The non-character dynels the camera's selection line can hit (`FUN_10020a3c`, docs/zone/interact.md §8): the visible, built props
+    /// with the box of their model. Each [`super::hud_pick::PickBody::id`] is the prop's `ActorFrame::id`; the identity is the second value.
+    /// [INFERENCE] The original tests `VisualMesh_t` bodies against a bounding sphere and their triangles (`FUN_1006bb2a`); the box of the
+    /// model's vertices stands in for it. The box is computed per call (a click, not per frame).
+    pub fn pick_props(&self) -> Vec<(super::hud_pick::PickBody, ao_net::msg::Identity)> {
+        self.props
+            .iter()
+            .filter_map(|(&(kind, instance), p)| {
+                let Some(Model::Ready { built, .. }) = self.models.get(&p.key) else { return None };
+                let verts = built.held.as_ref().map(|h| &h.0).into_iter().chain(built.model.meshes.iter().map(|m| &m.vertices)).flatten();
+                let bounds = super::hud_pick::bounds_of(verts.map(|v| &v.pos))?;
+                let body = super::hud_pick::PickBody { id: p.id as i32, bounds, pos: scene_pos(p.pos), yaw: scene_yaw(p.yaw), scale: p.scale };
+                built.visible.then_some((body, ao_net::msg::Identity { kind, instance }))
+            })
+            .collect()
     }
 
     /// A message for the door `who` (queued while its model is still being built; unknown doors ignore it, like the client's `GetDynel`).
@@ -721,6 +778,7 @@ impl Dynels {
                         });
                         if let Some(pos) = c.base.position {
                             self.add_prop(who.kind, who.instance, look, pos, c.base.rotation, v.scale);
+                            self.set_stats(who, stats.iter().copied());
                         }
                     }
                     Err(e) => eprintln!("dynels: corpse {}: {e:#}", who.instance),
@@ -740,6 +798,9 @@ impl Dynels {
                 }
             }
             _ if who.kind != CHAR_KIND => {
+                if let N3::Dynel(Dynel::Stat(s)) = &m.body {
+                    self.set_stats(who, s.stats.iter().map(|x| (x.0 as u32, x.1)));
+                }
                 if matches!(m.body, N3::Misc(Misc::ToClientQuit)) {
                     self.props.remove(&(who.kind, who.instance));
                     if let Some((holder, hand)) = self.weapons.remove(&who.instance) {
@@ -1329,6 +1390,20 @@ mod tests {
         let failed = z.world.models.values().filter(|m| matches!(m, Model::Failed)).count();
         eprintln!("{} models ready, {failed} failed, {} actors, {} props", models.len(), actors.len(), z.world.props.len());
         assert!(!actors.is_empty());
+        // object use (docs/zone/interact.md §8): `Corpse_t`'s constructor sets Can 8, the vending machine's template has bit 3 (use);
+        // built props have a pick box and a ray at one of them hits it, nearest first
+        let corpse = z.world.props.keys().find(|k| k.0 == 0xC76A).copied().unwrap();
+        assert_eq!(z.world.stat_of(corpse.0, corpse.1, CAN_STAT), Some(8));
+        let vending = z.world.props.keys().find(|k| k.0 == 0xC75B).copied().unwrap();
+        assert!(z.world.stat_of(vending.0, vending.1, CAN_STAT).is_some_and(|c| c & 8 != 0), "vending machine Can");
+        let picks = z.world.pick_props();
+        assert!(picks.len() >= 2 && picks.iter().all(|(b, _)| (0..3).all(|i| b.bounds.0[i] <= b.bounds.1[i])), "{} pick boxes", picks.len());
+        let (body, who) = picks.iter().find(|(_, id)| id.kind == 0xC76A).unwrap();
+        let mid = [body.pos[0], body.pos[1] + (body.bounds.0[1] + body.bounds.1[1]) * 0.5 * body.scale, body.pos[2]];
+        let origin = ao_render::Vec3::new(mid[0] + 4.0, mid[1] + 0.5, mid[2] + 4.0);
+        let toward = (ao_render::Vec3::new(mid[0], mid[1], mid[2]) - origin).normalize();
+        let hit = crate::play::interact_use::pick_objects(&crate::play::hud_target::Ray { origin, dir: toward, len: 100.0 }, &z);
+        assert_eq!(hit.first(), Some(who), "{hit:?}");
         if let Ok(out) = std::env::var("AOMAC_DYNEL_SHOT") {
             let scene = ao_formats::playfield::load_playfield_at(&RecordStore::open(&dir).unwrap(), &dir, 4582, ao_formats::playfield::DEFAULT_DAY_TIME).unwrap();
             // AOMAC_DYNEL_LOOK=<kind hex like c76a | npc | player>: camera 4 m from the first such dynel instead of the player's view

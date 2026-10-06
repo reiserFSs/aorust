@@ -147,3 +147,93 @@ object, built in `FUN_1002e537`); its show slot **`FUN_1002e313` [GUI]**:
 ### 7.4 Live-harness API (`Interact`, `cfg(test)`)
 `grid_dump(&gui) -> String` (rows as shown, display order: `[index] location | playfield (pf id, identity)`) and `grid_select(&mut gui, index) -> bool` (selects list entry `index` and presses
 Go; the `GridSelected` and the cancel go to `take_outbox`). Open window state is also in `GridUi::dump`.
+
+## 8. Using objects (doors, terminals, vending machines, items on the ground, corpses)
+
+Code: `crates/aomac/src/play/interact_use.rs` (rules, `UseUi`, picking), `interact_play.rs` (clicks, per-frame pump), `dynels.rs` (`Dynels::stat_of`, `pick_props`,
+`Built::stats`, `Prop::stats`). Tests: `interact_use::tests` (decision table, message bytes, refusals), `dynels::tests::captured_dynels_become_actors` (real client: the captured
+corpse / vending machine have Can 8, pick boxes, a ray at a corpse hits it).
+
+### 8.1 Which click does what (`FUN_1002c469` / `FUN_1002c2ee` [GUI], decompiled)
+* **Right button, release** (`FUN_1002c469`, `InputConfig_t+0xb0` = the object under the pointer): `Identity.kind == 50000` (a character) -> `N3Msg_DefaultActionOnDynel`; **anything else
+  -> `N3Msg_UseItem(id, false)` directly** (not `DefaultActionOnDynel`; the earlier note in docs/gui.md §13.2 had it right). [CODE]
+* **Left button, second click** (`FUN_1002c2ee`, press with click count 2, the pref `DoubleclickAction`, LoginPrefs default true): `N3Msg_DefaultActionOnDynel(id)` for every object except
+  the own character (`InputConfig_t+0xd8` = own identity), including non-characters. [CODE] Ours: the second release on the same object within `DOUBLE_CLICK_TIME`
+  (`Interact::double_click`, keyed by identity).
+* The keybind "Use" (hotbar special action 3, `FUN_1004256c`) is `N3Msg_UseItem(target, false)` on the current target (`hud_use.rs::use_target`); targets are characters here, so only the
+  character branch of `UseItem` is reachable that way. Objects are not selectable (`Zone::target` holds character ids), see 8.5.
+
+### 8.2 `N3Msg_DefaultActionOnDynel` for a non-character [GC 0x100291da, CODE]
+`FUN_10058e36(id)` is "kind == 50000 and the dynel exists"; otherwise `FUN_1008720e(id)` = `GetDynel` cast to `SimpleItem_t` (all of corpses, vending machines, doors, terminals, ground items;
+a dynel we do not know = nothing happens), then `Can` = `GetStat(0x1e, 2)`:
+
+| `Can` | action |
+|---|---|
+| bit 0 (1) | `N3Msg_GetItem(id)` |
+| else bit 3 (8) | `N3Msg_UseItem(id, false)` |
+| else | nothing |
+
+`interact_use::decide(can)` is that table (`CAN_PICK_UP` / `CAN_USE`); `Interact::default_action_on(zone, identity)` is the whole function (character -> `default_action`).
+`Can` per object: `Dynels::stat_of(kind, instance, 0x1e)` = the message stats (full update, `StatIIR_t` for a non-character) over the template's (`Built::stats` = `effective_stats` of the
+rdb 1000020 record, built on the worker); `Corpse_t`'s constructor [GC 0x1007e652] presets **Can = 8** (`FUN_10088d80(0x1e, 8)`) and stat `0x1b3` = 1. The captured vending machine's template has Can 8.
+
+### 8.3 `N3Msg_GetItem` [GC 0x10027beb, CODE]
+`FUN_1002a1b0(0x40) == -1` (no free bag slot `0x40..0x5e`) -> chat feedback `Feedback_InventoryFull`; else, if the dynel is a `SimpleItem_t` that is not already in a bag (`+0x130`) and its pick-up
+check returns 2 (`vtable +0xc4` = `FUN_10088529`, see below), the local pick-up animation `FUN_10081e74(char, 1)` plays; `FUN_10015258(own + 0x14, id)` builds **`ClientGetItemIIR_t`**
+(`n3InfoItemRemote_t` ctor with the class name; to-be-passed-on byte 0, vftable 0x10157320, `Write` = `FUN_1013cd89` = two `i32` of the identity) and `n3Dynel_t::SendIIRToObservers` sends it.
+Wire: `u32 MapToKey("ClientGetItemIIR_t")`, header `{0xC350, own}`, byte 0, `Identity` kind + instance (`ao_net::n3::inventory::get_item`, test `get_item_is_header_plus_one_identity`;
+`interact_use::tests::get_item_message_and_full_bag` runs it through `Interact`). `FUN_10088529` (the item's check, returns 6 already held / 2 pick up / 7 `Feedback_CantCarryThat` (Can bit 0 clear) /
+10 `Feedback_AlreadyGotUniqueItem` (unique item, stat 0x17 / flag 0x8000000) / 1 `Feedback_CantTakeFixtureFromBuilding` (own-building rule `PlayfieldAnarchy_t::IsOwnedBuilding`)) is **not
+ported** and neither is the pick-up animation; the server enforces the rules. [UNRESOLVED: whether the server answers a refused pick-up with a feedback text.]
+
+### 8.4 `N3Msg_UseItem(id, bool)` for what is not an inventory item [GC 0x100286f8, CODE]
+Identity kinds: `0x69` -> `Feedback_ItemCantBeUsedFromBank`, `0x6a` -> `Feedback_ItemsCantBeUsedFromCorpse`, `0x6e` -> `Feedback_MoveItemToInventory` (the own instance: container open, not ported),
+`50000` (a character): the own instance does nothing, else `GenericCmd_t`; any other kind > 50000 (a world object): if `!param_2` and `Can & 0x10` -> **`GlobalSignals +0xa0` =
+`GuiSystem_c::ConfirmUseItemDialogue(id)`** [GUI 0x1003012f]: a `DialogBox_c` named "UseItem", text `LDB(0x2715, stat 0x2af of the object)` or, when the object has no stat 0x2af,
+`LDB(0x3e8, "Item_ConfirmUse")`, buttons `MsgBox_Yes` / `MsgBox_No` (category 10000, as the team invite); the result slot `ConfirmUseItemResult` [GUI 0x1002f759]: button 0 -> `N3Msg_UseItem(id, true)`.
+Otherwise (and after Yes) the mesh's `VisualMesh_t::AdvertisingUseAction` (billboards: client side, nothing sent; **not ported**, UNRESOLVED) and then
+`GenericCmd_t(state 0, seq, cmd 3, ItemActionData{flag 0, actor = own, item = id})` (`FUN_1003aa0f` + `FUN_1007c95c`, queued with `vtable +0x2c`): `Interact::use_object`
+(test `world_object_use_is_a_generic_cmd_3` decodes it with `Misc::decode`). Inventory items (kinds 0x65..0x68, 0x6b, 0x73, `0xdead`, `0xdeae`, `0xdac3`, `0xdeaa`: wear / unwear, bank,
+reclaim, special actions) are the item windows' (`hud_stats/item_ui.rs`); `Interact::use_item` ignores kinds below 50000. Our dialog is `hud_dialog::Dialogs` (the HUD's `DialogBox_c`), the text
+ids are from the code, whether the live LDB has category 0x2715 / key `Item_ConfirmUse` is not checked (empty body otherwise).
+
+### 8.5 Picking non-characters
+`Dynels::pick_props` gives the visible, built props (corpses, vending machines, doors and terminals placed by rdb 1000026, items) a `hud_pick::PickBody`: the box over the vertices of the built model
+(`Built::held` for CAT models, else the mesh) with the prop's `ActorFrame` transform. [INFERENCE] The original tests plain `VisualMesh_t` bodies against a bounding sphere and their
+triangles (`FUN_1006bb2a`, docs/gui.md §13.2); the box stands in for it (the box of a door that has swung open is its closed box). `interact_use::pick_objects` merges them with the characters
+(one `hud_pick::hits` list, nearest first) and maps the ids back to identities. **Selection is not extended:** `Zone::target` and the target bars stay character-only (a left click on an object does
+nothing but arm the double click), so the original's `SetTarget` on an item (`N3Msg_isIDOnGround`) is not reproduced.
+
+### 8.6 Harness API (`Interact`)
+`default_action_on(&zone, identity) -> Action` (`None / Talk / Get / Use / Confirm / Refused(key)`), `default_action(instance)` (characters), `use_item(&zone, identity, confirmed)`, `get_item(&zone, identity)`,
+`use_object(identity)` (the raw `GenericCmd` 3, used after Yes), `Interact::can_of(&zone, identity) -> Option<i32>`, `take_feedback()` (refusal keys; `Play::interact_frame` prints them from chat category 110),
+`take_outbox()`, and (`cfg(test)`) `loot_dump(&mut gui)`. `interact_use::decide(can)` / `CAN_PICK_UP` / `CAN_USE` / `CAN_CONFIRM`.
+
+## 9. The container (loot) window of corpses
+Code: `interact_loot.rs`, `interact_use.rs::{watch_objects, use_out}`. Test: `interact_use::tests::corpse_loot_window_opens_with_the_flag_and_a_double_click_takes_an_item`, `interact_loot::tests`.
+
+**Proven flow [CODE]:**
+1. Using the corpse sends `GenericCmd_t` 3 (§8.4). A `Corpse_t` has Can 8, so a double click / right click uses it.
+2. The server answers with **`InventoryUpdateIIR_t`** (`0x4E536976`, decoded by `ao_net::n3::inventory`): header = the own character, body `capacity, kind, items, container identity (the
+   `Chest_t`: kind 0xC76A corpse, 0xC749 chest), word, flag`. `Activate` `FUN_100a040e` [GC]: the header must be a `SimpleChar_t`; a `Chest_t` container gets the new item list (`FUN_1002aeca`), its
+   `+0x1dc` = word, `FUN_1004af97` (container view refresh) and, **when flag != 0**, the chest's flags `&= ~0x40`, `vtable +0x40` and **`vtable +0xac(char)` = `FUN_1007e11e`**, then `FUN_100116d5` =
+   `GlobalSignals +0x8c` (container changed). `FUN_1007e11e` calls `FUN_1003f5b2(identity, stat 0x1b3 == 0, 0)`: registers the open container and emits **`GlobalSignals +0x84`** (`FUN_10011754`:
+   `Identity, bool, bool`) -> `InventoryGUIModule_c::SlotContainerOpened` [GUI 0x100c71a3] (connected in `SlotInitialize` 0x100c722f) -> `FUN_100cc2ca(1, id)`: **`InventoryView_c` of type 1** (a window
+   unless one is open already). A SimpleChar container (our own bag etc.) takes the other branch (`FUN_1004775e`, bank / overflow); our own `Zone::apply_inventory` ignores `Update`.
+3. The window (`FUN_100cc2ca`): a `MultiListView_c` item view (`FUN_100cc1b3`) with `SetMaxItemCount(0x15)` = **21 cells, 3 per row** (the `item_position_map` loop uses `n % 3`, `n / 3`, `n < 0x15`), for a corpse
+   with the pref `esc_corpses` (Esc closes) and the saved config `TempContainer_%u.xml`; the cell art is the inventory's (`GFX_GUI_MULTILISTVIEW_SLOT_48_*`).
+4. Taking an item: a double click on a cell (`FUN_100ca1e7` [GUI]; not on the own inventory view `+0x14c`) calls `MoveItemToInventory(item identity)`; the item identity of a corpse window is
+   **`{0x6a, container slot}`** [INFERENCE: the dispatcher `FUN_1004ad44` [GC] routes kind `0x6a` to `FUN_10046b0b` (`param_1[0x60]` = the open container -> the own bag, then the +0x8c / +0x8d signals), and
+   `N3Msg_UseItem` names kind 0x6a "items cannot be used from a corpse"]. The move is sent like the unequip of `hud_stats` (`N3Msg_MoveItemToInventory(item, bag, 0x6f)` =
+   `ClientMoveItemToInventoryIIR_t(item, ANY_BAG_SLOT)`); `Feedback_InventoryFull` without a free bag slot. The server-side checks the client shows are `Feedback_NotAllowedToLoot` and
+   `Feedback_YouCantLootNoDropItems` (`FUN_1004b80a`, not evaluated here).
+
+**Ours:** `LootUi` opens a tabbed window with a 3 x 7 grid canvas (cells and spacing of the inventory grid, 54 px slot art, 48 px item pictures from rdb 1010008 through `hud_stats::items::Items`,
+tooltip = item name) when an `Update` for a non-character container with flag != 0 arrives, refreshes it on later `Update`s (flag 0), closes it with its close button / Esc; double click on an item sends
+the move. The title is the corpse's name from `CorpseFullUpdateIIR_t`'s name blob ("Remains of ..."), centred on the screen.
+
+**[UNRESOLVED]:** (a) no capture of a loot answer exists: the order / flag of the live server's `InventoryUpdateIIR_t` and that `flag` is set on the first answer are from the code only; (b) the window title
+(`String::Format` of `FUN_100cc2ca` was not read; the saved window position `container_position` / `container_id` and `TempContainer_%u.xml` are not stored); (c) the original's
+list / grid mode switch (`InventoryViewMode`) and the scrollbar of the container view; (d) the identity kind of chest (0xC749) items; (e) team loot (`Feedback_TeamLoot*`, "Random Looter" / "Looter" columns of
+`FUN_100ca2d3`) and the "take all" (none found in the view); (f) the window closing message: the original's close path (`SlotContainerClosed`, `GlobalSignals +0x88`, emitted by `FUN_100117f6`
+from the bank / reclaim / ... activations) was not traced for corpses, nothing is sent when our window is closed; (g) the look of the window was not compared with a retail screenshot.
