@@ -62,7 +62,10 @@ impl Chat {
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
     pub fn open(&mut self, gui: &mut Gui, screen: (u32, u32)) -> Result<()> {
         if self.win.is_none() {
-            self.win = Some(ChatWindows::new(gui, screen)?);
+            let mut w = ChatWindows::new(gui, screen)?;
+            // HUD footprint (wings 190/65 px, shortcut bar 38 px at 1280x828, measured from the HUD art): only the template default windows avoid it
+            w.set_reserved(gui, win::Reserved { left: 190, right: 65, bottom: 38 });
+            self.win = Some(w);
             for b in std::mem::take(&mut self.backlog) {
                 match b {
                     Back::Line(l, h) => self.line_to(gui, l, h.as_deref()),

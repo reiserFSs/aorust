@@ -1,0 +1,30 @@
+# Chat: live results (Ithaca, 2026-10-05, character "Aomacvolk", app + probe)
+
+Captures (credentials/username redacted, public-channel text of other players kept as is):
+`docs/captures/chat_login_ithaca.rec` (standalone login, probe), `docs/captures/chat_session_ithaca.rec` (app session: login, groups, MOTD, own Global message, tell to an offline character).
+Replay tests: `ao_net::chat::tests::live_login_capture_decodes`, `play::chat::net::tests::live_session_replay`.
+
+## What was exercised
+
+| step | result |
+|---|---|
+| zone sends 0x43 -> app connects to `199.241.136.157:7005` | login accepted (type 0 `IISS` with char id, user, DH/TEA key), type 5 LOGIN_OK 150 ms later |
+| own name | `0x14` USER_NAME `33512 Aomacvolk` |
+| MOTD | three anonymous vicinity packets (0x23), shown in the Default Window in the vicinity colour (`ctch_vicinity`) |
+| name table | ~700 `0x14` USER_NAME packets right after login (all known/online characters, ~450 B/s for the first seconds), kept in `ChatNet::names` |
+| channel list | seven `0x3c` GROUP_JOIN: `Neutral` (87/0), `Omni-Tek` (87/2), `Clan` (87/1), `Global` (05/20, flags 0x11), `Global Trade` (86/21, 0x11), `IRRK News Wire` (0c/2000, 0x13), `Server Announcements` (0c/2001, 0x13). PRK has no "OOC"/"Newbie Help" groups on this server; `Global` is the public chat channel. Group id key = `kind << 32 | id`. |
+| others' messages | `0x41` GROUP_MESSAGE in `Global`; text carries HTML (`<a href="itemref://…">`), shown in the group colour with `[Global]` link prefix and sender link |
+| we say `/g Global aomac client test` | sent `0x41 GSD` (`05 00000014`, text, data `00 01 00`), the server **echoes it back to us** as a normal GROUP_MESSAGE from our own id (data block empty): `[Global] Aomacvolk: aomac client test` is shown from the echo, not drawn locally |
+| `/tell Testy aomac client test` | `0x15` lookup `Testy` -> `0x15 {id 0x6584, "Testy"}`, `0x1e ISD` tell, server answers with an anonymous 0x23 line "This player is currently offline and will not receive your message."; the local echo "To Testy: …" is our own line [GUESS format] |
+| vicinity `aomac client test` (ptype 5 kind 3, 52-byte frame, target `{0,0}`) | accepted (connection stays up), **no echo and no reply observed** with nobody else in the hall; whether other players see it was not verifiable with one session |
+| Space key in the input bar | was dropped by `ao-render` (named key without text); fixed in `viewer.rs` |
+
+Outgoing ptype-5 frame as sent (hex, seq 4):
+`0004 0005 0001 0034 000082e8 00000002 | 00000003 00000000 00000000 00000014 0011 "aomac client test" 00` (header `ptype 5, size 0x34, sender = char id, receiver = 2`; payload `kind 3, identity {0,0}, len 0x14, u16 len 0x11 + text + kind byte 0`).
+
+## Gaps (labelled)
+
+* Vicinity/shout/whisper from other players arrive on the chat server as 0x22/0x23 (decoded, group routing per GUI 0x10086728); the zone N3 text classes (`ChatTextIIR_t` …) did not occur in the session.
+* Outgoing-tell echo text, tell windows (per-sender windows) and the reply list: tells are routed to the "Tell Messages" group.
+* Private groups (`/invite` …), buddy list, `/cc`, LFT: decoders exist (`ao_net::chat`), no UI.
+* Reconnect after a dropped chat connection: pacing implemented (`ChatNet`), not exercised live.
