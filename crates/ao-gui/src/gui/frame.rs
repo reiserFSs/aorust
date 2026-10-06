@@ -148,6 +148,11 @@ pub fn insert_index(tabs: &[Rect], x: f32) -> usize {
 }
 
 impl Gui {
+    /// A frame / tab drag is in progress or a popup menu is open (applications write pending settings once this is false).
+    pub fn interacting(&self) -> bool {
+        self.ix.frame_drag.is_some() || self.ix.tab_drag.is_some() || self.ix.menu.is_some()
+    }
+
     /// `Window::SetStyle` flags 0x8 / 0x10|0x20 inverted: lets the user move / resize a style-0 window by its frame (docs/chat/gui.md §2).
     pub fn set_window_frame(&mut self, w: WindowId, movable: bool, resizable: bool) {
         if let Some(Some(win)) = self.windows.get_mut(w) {
@@ -240,8 +245,14 @@ impl Gui {
     /// Left press on the frame of a tabbed window. True = consumed.
     pub(super) fn frame_mouse_down(&mut self, x: f32, y: f32) -> bool {
         let p = Point::new(x, y);
+        let top_hit = self.hit(x, y).map(|h| h.0);
         for (wid, root, pos) in self.windows_top_down() {
             if !self.is_tabbed(wid) {
+                // a window above (a framed one covering the point, or one with a widget under the pointer) hides the frames below
+                let covers = self.windows[wid].as_ref().is_some_and(|w| w.framed) && self.outer_of(wid).is_some_and(|o| x >= o.l && x < o.r + 1.0 && y >= o.t && y < o.b + 1.0);
+                if covers || top_hit == Some(wid) {
+                    return false;
+                }
                 continue;
             }
             let Some(o) = self.outer_of(wid) else { continue };
@@ -303,6 +314,7 @@ impl Gui {
     }
 
     pub(super) fn frame_mouse_up(&mut self) {
+        self.menu_mouse_up();
         self.ix.frame_drag = None;
         let Some(d) = self.ix.tab_drag.take() else { return };
         if !d.moved {

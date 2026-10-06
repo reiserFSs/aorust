@@ -19,6 +19,8 @@ pub enum WinOut {
     LinkClicked(String),
     /// `user://NAME` clicked (`ChatView_c` signal +0x130 -> `OpenTellWindow` 0x10085df8).
     OpenTell(String),
+    /// "IgnoreUser" of a user link's menu (`FUN_1008dd24`): toggles ignoring the character (`/ignore NAME`).
+    IgnoreUser(String),
 }
 
 // ------------------------------------------------------------------------------------------------------------ groups
@@ -215,6 +217,11 @@ pub struct Cfg {
     pub frame: Option<[f32; 4]>,
     /// Loaded from the client template / code defaults, not from the character's own saved config (not serialized).
     pub template: bool,
+    /// `tab_index`: position of this window among the tabs of its `ChatWindow` (`FUN_100974b5` inserts before the first tab with a greater index).
+    pub tab_index: i32,
+    /// `chat_window_config/is_frontmost` / `is_backmost` -> window flags 0x100 / 0x200 (`FUN_10097ae3`).
+    pub frontmost: bool,
+    pub backmost: bool,
 }
 
 impl Cfg {
@@ -240,6 +247,9 @@ impl Cfg {
             set: vec![],
             frame: None,
             template: false,
+            tab_index: 0,
+            frontmost: false,
+            backmost: false,
         }
     }
 
@@ -275,6 +285,10 @@ impl Cfg {
                 c.frame = Some([n[0], n[1], n[2], n[3]]);
             }
         }
+        let flag = |k: &str| find("chat_window_config").is_some_and(|a| a.children.iter().any(|e| e.attr("name") == Some(k) && e.attr("value") == Some("true")));
+        c.frontmost = flag("is_frontmost");
+        c.backmost = flag("is_backmost");
+        c.tab_index = val("tab_index").and_then(|v| v.parse().ok()).unwrap_or(0);
         Some(c)
     }
 
@@ -292,7 +306,8 @@ impl Cfg {
         if let Some(r) = self.frame {
             let _ = writeln!(o, "        <Rect name=\"WindowFrame\" value=\"Rect({:.6},{:.6},{:.6},{:.6})\" />", r[0], r[1], r[2], r[3]);
         }
-        o += "        <Bool name=\"is_backmost\" value=\"false\" />\n        <Bool name=\"is_frontmost\" value=\"false\" />\n    </Archive>\n    <Archive code=\"0\" name=\"chat_view_config\" />\n";
+        let _ = writeln!(o, "        <Bool name=\"is_backmost\" value=\"{}\" />\n        <Bool name=\"is_frontmost\" value=\"{}\" />", self.backmost, self.frontmost);
+        o += "    </Archive>\n    <Archive code=\"0\" name=\"chat_view_config\" />\n";
         let _ = writeln!(o, "    <Int32 name=\"visual_mode\" value=\"{}\" />", self.visual_mode);
         let og = if self.output_group == 0 { String::new() } else { group_ident(self.output_group) };
         let _ = writeln!(o, "    <String name=\"output_group\" value='&quot;{og}&quot;' />");
@@ -311,7 +326,7 @@ impl Cfg {
         ] {
             let _ = writeln!(o, "    <Bool name=\"{k}\" value=\"{v}\" />");
         }
-        let _ = writeln!(o, "    <Int32 name=\"tab_index\" value=\"0\" />");
+        let _ = writeln!(o, "    <Int32 name=\"tab_index\" value=\"{}\" />", self.tab_index);
         let _ = writeln!(o, "    <String name=\"window_name\" value='&quot;{}&quot;' />", self.window_name);
         let _ = writeln!(o, "    <Bool name=\"is_default_window\" value=\"false\" />");
         let _ = writeln!(o, "    <Bool name=\"is_startup_window\" value=\"{}\" />", self.startup);
@@ -412,13 +427,14 @@ const FADE_OUT: f32 = 1.0; // FadeTo(inactive alpha, 1000000 us)
 
 struct Win {
     cfg: Cfg,
+    /// The GUI window of the frame that holds this window's tab.
     id: WindowId,
+    /// Index into `ChatWindows::frames`.
+    frame: usize,
     n: usize,
     lines: VecDeque<String>,
     alpha: f32,
     target: f32,
-    /// Last placement (x, y, w, h): what `Window::SaveWndConfig` writes as `WindowFrame`.
-    placed: (i32, i32, u32, u32),
     /// Alpha change per second of the running fade.
     rate: f32,
     active: bool,
@@ -431,10 +447,25 @@ impl Win {
     fn scroll(&self) -> String {
         format!("scroll_{}", self.n)
     }
+    fn chat(&self) -> String {
+        format!("chat_{}", self.n)
+    }
+}
+
+/// One `ChatWindow_c`: a GUI window with the tabs of its windows (a visual-mode-2 window has exactly one tab and no frame).
+struct Frame {
+    id: WindowId,
+    /// Indices into `ChatWindows::wins` in tab order (`tab_index`).
+    docs: Vec<usize>,
+    /// Selected tab (index into `docs`).
+    sel: usize,
+    /// Last outer frame (x, y, w, h): what `Window::SaveWndConfig` writes as `WindowFrame`.
+    placed: (i32, i32, u32, u32),
 }
 
 pub struct ChatWindows {
     wins: Vec<Win>,
+    frames: Vec<Frame>,
     screen: (u32, u32),
     groups: HashMap<u64, String>,
     text: Option<TextDb>,
@@ -443,6 +474,10 @@ pub struct ChatWindows {
     last_active: String,
     next_n: usize,
     reserved: Reserved,
+    /// A frame / tab / setting changed and has not been written yet ([`ChatWindows::update`] saves once the pointer is idle).
+    dirty: bool,
+    /// What the open popup menu acts on.
+    menu: Option<menu::Ctx>,
 }
 
 /// `ChatView_c` text view flags 0xe6c (`FUN_100925ff`): ENABLE_SHADOW | FILL_BOTTOM_UP | DISABLE_RC_MENU | WORD_WRAP | MULTILINE |
@@ -451,321 +486,8 @@ const TEXT_FLAGS: &str = "TVF_ENABLE_SHADOW|TVF_FILL_BOTTOM_UP|TVF_DISABLE_RC_ME
 /// `InputBar_c` (`FUN_100919ab`) editor flags 0x800f (the part ao-gui names): ACCEPT_TXT_INPUT | ACCEPT_MOUSE_INPUT | ALLOW_TEXT_SELECTION | ENABLE_SHADOW.
 const INPUT_FLAGS: &str = "TVF_ACCEPT_TXT_INPUT|TVF_ACCEPT_MOUSE_INPUT|TVF_ALLOW_TEXT_SELECTION|TVF_ENABLE_SHADOW";
 
-impl ChatWindows {
-    /// Opens the windows from (first hit): `<prefs dir>/Chat/Windows/*/Config.xml`, the client's `prefs/NewChar/Chat/Windows/*`,
-    /// else the code defaults of `FUN_10094c58`.
-    pub fn new(gui: &mut Gui, screen: (u32, u32)) -> Result<Self> {
-        let client = ao_gui::client_dir();
-        let prefs = super::super::prefs::dir();
-        let mut cfgs = prefs.as_deref().map(read_windows).unwrap_or_default();
-        if cfgs.is_empty() {
-            cfgs = read_windows(&client.join("prefs/NewChar"));
-            cfgs.iter_mut().for_each(|c| c.template = true);
-        }
-        if cfgs.is_empty() {
-            cfgs = code_defaults();
-            cfgs.iter_mut().for_each(|c| c.template = true);
-        }
-        let mut s = ChatWindows {
-            wins: vec![],
-            screen,
-            groups: LOCAL_GROUPS.iter().map(|(i, n)| (*i, n.to_string())).collect(),
-            text: TextDb::load(&client).ok(),
-            prefs,
-            last_active: String::new(),
-            next_n: 0,
-            reserved: Reserved::default(),
-        };
-        s.last_active = cfgs.iter().find(|c| c.startup).or(cfgs.first()).map(|c| c.window_name.clone()).unwrap_or_default();
-        for c in cfgs.into_iter().filter(|c| c.open) {
-            s.open(gui, c)?;
-        }
-        Ok(s)
-    }
-
-    fn open(&mut self, gui: &mut Gui, cfg: Cfg) -> Result<usize> {
-        let n = self.next_n;
-        self.next_n += 1;
-        let (x, y, w, h) = place(cfg.frame, cfg.template, self.screen, self.reserved);
-        let line_h = gui.font_height(ao_gui::FontId::Chat) as u32;
-        // `ChatView_c::FUN_1008d728`, input mode 1: input bar at its preferred height (one text line in a 5 px border), the text
-        // frame ends 5 px above it; the GroupChatView border is 3 px (`_DAT_101a96d4`).
-        let input = if cfg.textinput {
-            format!(
-                r#"<BorderView name="input_border_{n}" layout_borders="Rect(0,5,0,0)" min_size="Point(-1,{ih})" max_size="Point(16000,{ih})">
-                     <TextView name="input_{n}" max_size="Point(16000,-1)" layout_borders="Rect(5,5,5,5)" font="CHAT" feature_flags="{INPUT_FLAGS}"/>
-                   </BorderView>"#,
-                ih = line_h + 10
-            )
-        } else {
-            String::new()
-        };
-        let src = format!(
-            r#"<root><View name="chat_{n}" view_layout="vertical" layout_borders="Rect(3,3,3,3)">
-                 <BorderView name="text_border_{n}" max_size="Point(16000,16000)">
-                   <ScrollView name="scroll_{n}" v_scrollbar_mode="always" layout_borders="Rect(5,5,5,5)" max_size="Point(16000,16000)">
-                     <ScrollViewChild view_layout="vertical" max_size="Point(16000,16000)">
-                       <TextView name="text_{n}" max_size="Point(16000,-1)" font="CHAT" feature_flags="{TEXT_FLAGS}"/>
-                     </ScrollViewChild>
-                   </ScrollView>
-                 </BorderView>
-                 {input}
-               </View></root>"#
-        );
-        let id = gui.open_window_xml("ChatWindow", &src, (x, y), WindowSize::Fixed(w, h))?;
-        gui.set_text_shadow_offset(1, 1); // `ChatTextShadowOffset` pref default 1 (CharPrefs.xml), `FUN_1008d673`
-        let alpha = cfg.alpha_inactive;
-        gui.set_window_alpha(id, alpha);
-        // `is_backmost` / `is_frontmost` → window flags 0x200 / 0x100 (`FUN_10097ae3`); default: normal stacking
-        gui.set_window_layer(id, 0);
-        self.wins.push(Win { cfg, id, n, placed: (x, y, w, h), lines: VecDeque::new(), alpha, target: alpha, rate: 0.0, active: false });
-        Ok(self.wins.len() - 1)
-    }
-
-    pub fn resize(&mut self, gui: &mut Gui, screen: (u32, u32)) {
-        if screen == self.screen {
-            return;
-        }
-        self.screen = screen;
-        self.replace_all(gui);
-    }
-
-    fn replace_all(&mut self, gui: &mut Gui) {
-        for w in &mut self.wins {
-            let (x, y, ww, hh) = place(w.cfg.frame, w.cfg.template, self.screen, self.reserved);
-            w.placed = (x, y, ww, hh);
-            gui.set_window_pos(w.id, (x, y));
-            gui.resize_window(w.id, WindowSize::Fixed(ww, hh));
-        }
-    }
-
-    /// The screen area the HUD's wings/bars cover; only the *template* default windows (first run) are kept clear of it (see [`place`]).
-    /// Windows with a saved frame are positioned as the original does and may overlap the HUD (they draw above it).
-    pub fn set_reserved(&mut self, gui: &mut Gui, reserved: Reserved) {
-        if reserved != self.reserved {
-            self.reserved = reserved;
-            self.replace_all(gui);
-        }
-    }
-
-    /// Hides/shows every chat window (the whole interface hidden, e.g. cutscenes); text keeps accumulating.
-    pub fn set_visible(&mut self, gui: &mut Gui, visible: bool) {
-        for w in &self.wins {
-            gui.set_window_visible(w.id, visible);
-        }
-        if !visible {
-            gui.clear_focus();
-        }
-    }
-
-    /// `ChatGUIModule_c::AddGroup` (0x10085f91): a group the chat server announced (windows that do not exclude it show it).
-    pub fn add_group(&mut self, id: u64, name: &str) {
-        self.groups.insert(id, name.to_string());
-    }
-
-    pub fn remove_group(&mut self, id: u64) {
-        if id >> 32 != 0 {
-            self.groups.remove(&id);
-        }
-    }
-
-    fn group_name(&self, id: u64) -> String {
-        self.groups.get(&id).cloned().unwrap_or_default()
-    }
-
-    fn fill(&mut self, gui: &mut Gui, i: usize, html: &str) {
-        let w = &mut self.wins[i];
-        w.lines.push_back(html.to_string());
-        while w.lines.len() > MAX_LINES {
-            w.lines.pop_front();
-        }
-        let all = w.lines.iter().map(String::as_str).collect::<Vec<_>>().join("<br>");
-        gui.set_text(w.id, &format!("text_{}", w.n), &all);
-        gui.scroll_to_bottom(w.id, &w.scroll());
-    }
-
-    fn deliver(&mut self, gui: &mut Gui, group: u64, make: impl Fn(&str) -> String) {
-        for i in 0..self.wins.len() {
-            if self.wins[i].cfg.shows(group) {
-                let stamp = if self.wins[i].cfg.show_timestamps { timestamp() } else { String::new() };
-                let html = make(&stamp);
-                self.fill(gui, i, &html);
-            }
-        }
-    }
-
-    /// A message of the chat server / zone chat (`FUN_10084f9e` -> `FUN_1009b4cf`).
-    pub fn push_msg(&mut self, gui: &mut Gui, m: &ChatMsg) {
-        let mut m = m.clone();
-        if m.tell && m.group == 0 {
-            m.group = G_TELL;
-        }
-        let name = if m.group_name.is_empty() { self.group_name(m.group) } else { m.group_name.clone() };
-        if m.group >> 32 != 0 && !name.is_empty() {
-            self.groups.entry(m.group).or_insert_with(|| name.clone());
-        }
-        let color = group_color(m.group, m.kind);
-        let db = self.text.as_ref();
-        let whispers = db.and_then(|d| d.by_key(10001, "Whispers")).unwrap_or_else(|| " whispers: ".into());
-        let shouts = db.and_then(|d| d.by_key(10001, "Shouts")).unwrap_or_else(|| " shouts: ".into());
-        self.deliver(gui, m.group, |stamp| format_line(&m, &name, color, stamp, &whispers, &shouts));
-    }
-
-    /// A line the client itself generates (errors, command feedback, system, combat feedback).
-    /// `group_hint` = a group name (`Other` combat lines name their group, `ChatKind::Group` its channel).
-    pub fn push(&mut self, gui: &mut Gui, line: &ChatLine, group_hint: Option<&str>) {
-        let by_name = |n: &str| self.groups.iter().find(|(_, g)| g.eq_ignore_ascii_case(n)).map(|(i, _)| *i);
-        let (group, color) = match &line.kind {
-            ChatKind::Error | ChatKind::System | ChatKind::CmdFeedback => (G_SYSTEM, line.kind.color_name().to_string()),
-            ChatKind::TellOut | ChatKind::TellIn => (G_TELL, line.kind.color_name().to_string()),
-            ChatKind::Vicinity | ChatKind::Shout | ChatKind::Whisper | ChatKind::Emote => (G_VICINITY, line.kind.color_name().to_string()),
-            ChatKind::Group(n) => {
-                let id = group_hint.and_then(by_name).or_else(|| by_name(n)).unwrap_or(0);
-                (id, group_color(id, 0).to_string())
-            }
-            ChatKind::Other(c) => (group_hint.and_then(by_name).unwrap_or(G_SYSTEM), c.to_string()),
-        };
-        self.deliver(gui, group, |stamp| format!("<div indent=wrapped><font color={color}>{stamp}{}</font></div>", line.text));
-    }
-
-    /// The event comes from one of the chat windows (the app must not handle it again).
-    pub fn owns(&self, ev: &Event) -> bool {
-        let w = match ev {
-            Event::EnterPressed { window, .. } | Event::Escape { window } | Event::LinkClicked { window, .. } | Event::TextChanged { window, .. } => *window,
-            _ => return false,
-        };
-        self.wins.iter().any(|x| x.id == w)
-    }
-
-    fn index_of_input(&self, view: &str) -> Option<usize> {
-        self.wins.iter().position(|w| w.input() == view)
-    }
-
-    pub fn event(&mut self, gui: &mut Gui, ev: &Event) -> Vec<WinOut> {
-        let mut out = vec![];
-        match ev {
-            Event::EnterPressed { view, .. } => {
-                if let Some(i) = self.index_of_input(view) {
-                    let w = &self.wins[i];
-                    let text = gui.text(w.id, view).trim_end().to_string();
-                    let group = (w.cfg.output_group != 0).then(|| group_ident(w.cfg.output_group));
-                    let (id, deactivate) = (w.id, w.cfg.deactivate_on_send);
-                    gui.set_text(id, view, "");
-                    if !text.is_empty() {
-                        out.push(WinOut::Submit { text, window_group: group });
-                    }
-                    if deactivate || self.wins[i].cfg.output_group == 0 {
-                        gui.clear_focus();
-                    }
-                }
-            }
-            Event::Escape { window } => {
-                if self.wins.iter().any(|w| w.id == *window) {
-                    gui.clear_focus();
-                }
-            }
-            Event::LinkClicked { window, href, .. } => {
-                if let Some(rest) = href.strip_prefix("user://") {
-                    out.push(WinOut::OpenTell(rest.to_string()));
-                } else if let Some(rest) = href.strip_prefix("chatgroup://") {
-                    // `ChatView_c` signal +0x134: the window's output group becomes the clicked group (docs/chat/gui.md §6, guess)
-                    if let (Some(g), Some(w)) = (parse_ident(rest), self.wins.iter_mut().find(|w| w.id == *window)) {
-                        w.cfg.output_group = g;
-                    }
-                } else {
-                    out.push(WinOut::LinkClicked(href.clone()));
-                }
-            }
-            _ => {}
-        }
-        out
-    }
-
-    /// Activation fades (`FUN_10096b23`): the window whose input bar has the keyboard focus is *active* (alpha
-    /// `window_transparency_active`, fade 0.2 s), all others fade to `window_transparency_inactive` over 1 s.
-    pub fn update(&mut self, gui: &mut Gui, dt: f32) {
-        let focused = gui.focused_view();
-        let hide = |w: &Win, active: bool| w.cfg.hide_input_when_inactive && !active;
-        for w in &mut self.wins {
-            let active = focused.as_deref() == Some(w.input().as_str());
-            if active != w.active {
-                w.active = active;
-                w.target = if active { w.cfg.alpha_active } else { w.cfg.alpha_inactive };
-                w.rate = (w.target - w.alpha).abs() / if active { FADE_IN } else { FADE_OUT };
-                if active {
-                    self.last_active = w.cfg.window_name.clone();
-                }
-                if w.cfg.textinput {
-                    gui.set_visible(w.id, &format!("input_border_{}", w.n), !hide(w, active));
-                }
-            }
-            if w.alpha != w.target {
-                let step = w.rate * dt;
-                w.alpha = if (w.target - w.alpha).abs() <= step { w.target } else { w.alpha + step * (w.target - w.alpha).signum() };
-                gui.set_window_alpha(w.id, w.alpha);
-            }
-        }
-    }
-
-    /// Enter in the game: focus the input bar of the last active window (`ChatLastActiveWindow`, else the first window with one).
-    pub fn focus_input(&mut self, gui: &mut Gui) {
-        let pick = self.wins.iter().find(|w| w.cfg.window_name == self.last_active && w.cfg.textinput).or_else(|| self.wins.iter().find(|w| w.cfg.textinput));
-        if let Some(w) = pick {
-            gui.focus(w.id, &w.input());
-        }
-    }
-
-    fn active_win(&self) -> Option<&Win> {
-        self.wins.iter().find(|w| w.active).or_else(|| self.wins.iter().find(|w| w.cfg.window_name == self.last_active))
-    }
-
-    /// Focus the input bar like `focus_input` and put `text` into it (`StartChatCmdMessage` opens it with "/").
-    pub fn focus_input_text(&mut self, gui: &mut Gui, text: &str) {
-        self.focus_input(gui);
-        if let Some(w) = self.active_win() {
-            let (id, v) = (w.id, w.input());
-            gui.set_text(id, &v, text);
-        }
-    }
-
-    /// `#%016x#` of the output group of the window that has (or last had) the focus: where a plain line without `/` goes.
-    pub fn active_output_group(&self) -> Option<String> {
-        let w = self.active_win()?;
-        (w.cfg.output_group != 0).then(|| group_ident(w.cfg.output_group))
-    }
-
-    /// Id form of [`active_output_group`](Self::active_output_group).
-    pub fn active_output_id(&self) -> Option<u64> {
-        self.active_win().map(|w| w.cfg.output_group).filter(|g| *g != 0)
-    }
-
-    /// `/ch <group>` (`FUN_1009a06f`): the active window's output group becomes `id`.
-    pub fn set_output_group(&mut self, id: u64) {
-        let name = self.active_win().map(|w| w.cfg.window_name.clone());
-        if let Some(w) = self.wins.iter_mut().find(|w| Some(&w.cfg.window_name) == name.as_ref()) {
-            w.cfg.output_group = id;
-        }
-    }
-
-    /// Writes every window's `Config.xml` under `<prefs dir>/Chat/Windows/<window_name>/` (`FUN_10094a28`, at shutdown).
-    pub fn save(&self) -> std::io::Result<()> {
-        let Some(dir) = &self.prefs else { return Ok(()) };
-        for w in &self.wins {
-            let d = dir.join("Chat/Windows").join(&w.cfg.window_name);
-            std::fs::create_dir_all(&d)?;
-            let mut cfg = w.cfg.clone();
-            let (x, y, ww, hh) = w.placed;
-            cfg.frame = Some([x as f32, y as f32, (x + ww as i32 - 1) as f32, (y + hh as i32 - 1) as f32]);
-            std::fs::write(d.join("Config.xml"), cfg.to_xml(&|g| self.group_name(g)))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn window_ids(&self) -> Vec<WindowId> {
-        self.wins.iter().map(|w| w.id).collect()
-    }
-}
+mod menu;
+mod windows;
 
 #[cfg(test)]
 mod tests;

@@ -90,8 +90,9 @@ Original: `Window(rect, title, name, style 1, flags)` → `WndBorder::SetStyle` 
   over the close button (the application decides: LoginWindow → quit, ProgressDialog → ignore). Hover shows `_STATE2`, pressed `_STATE3`
   (**UNRESOLVED**: which `Button_c` state index maps hover/pressed; the three sprites are pixel-identical in this skin, so it is invisible).
 * `set_window_pos` / `open_framed_window` take the **outer** top-left; `outer_size`, `window_size` (client).
-* **UNRESOLVED**: hit-testing/dragging/resizing (`HitTest` 0x101593d6 flags 0x10/0x20/0x8 → not resizable / not movable); the layer-1 alpha value is the
-  0.33 default (`GUIConfig_c`), not read from prefs. The window title text is §6.1 (style 0).
+* Hit-testing / dragging / resizing of style-0 frames: RE'd and ported for the chat windows (docs/chat/gui.md §10: `WndBorder::HitTest` 0x101593d6, `MouseMove` 0x10159c27, `DoSetFrame` 0x10159888; `Gui::set_window_frame`);
+  style-1 frames are not draggable here (no caller needs it). The layer-1 alpha value is the
+  0.33 default (`GUIConfig_c`), not read from prefs. The window title text is §6.1 (style 0); several tabs / tab dragging: docs/chat/gui.md §11.
 
 ### 6.1 Style-0 window with a tab strip (`Gui::open_tabbed_window[_xml]`)
 The in-world windows are `DockWindow_c` (`FUN_1003bdd4`: `Window(Rect(), "", "", style 0, flags 0x1000)`), and a `DockableView_c` (`FUN_10038b47`) is a *tab*: `Window::InsertTab(index,

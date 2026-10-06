@@ -18,6 +18,8 @@ pub struct MenuItem {
     pub sep: bool,
     /// Non-empty = a sub-menu opens beside the item.
     pub sub: Vec<MenuItem>,
+    /// `Some(v)` = a slider item (0.0..=1.0).
+    pub slider: Option<f32>,
 }
 
 impl MenuItem {
@@ -33,6 +35,10 @@ impl MenuItem {
     pub fn submenu(text: &str, sub: Vec<MenuItem>) -> Self {
         MenuItem { sub, ..Self::entry(0, text) }
     }
+    /// A `PopupMenuSliderItem_c` with value `v` in 0.0..=1.0; changes arrive as [`Event::MenuSlider`].
+    pub fn slider(id: u32, v: f32) -> Self {
+        MenuItem { slider: Some(v), ..Self::entry(id, "") }
+    }
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
         self
@@ -46,6 +52,16 @@ pub(super) struct Menu {
     /// Indices of the open sub-menu chain (`path[k]` = the item of level k whose sub-menu is shown).
     path: Vec<usize>,
     hover: Option<(usize, usize)>,
+    /// Slider item being dragged: (level, item).
+    drag: Option<(usize, usize)>,
+}
+
+fn menu_item_mut(m: &mut Menu, lv: usize, i: usize) -> Option<&mut MenuItem> {
+    let mut items = &mut m.items;
+    for &p in m.path.iter().take(lv) {
+        items = &mut items.get_mut(p)?.sub;
+    }
+    items.get_mut(i)
 }
 
 const PAD: f32 = 6.0;
@@ -62,7 +78,7 @@ struct Panel {
 impl Gui {
     /// Opens a popup menu with its top-left at `at` (kept inside `bounds` = the screen size). Replaces an open one.
     pub fn open_menu(&mut self, at: (i32, i32), bounds: (i32, i32), items: Vec<MenuItem>) {
-        self.ix.menu = Some(Menu { items, at, bounds, path: vec![], hover: None });
+        self.ix.menu = Some(Menu { items, at, bounds, path: vec![], hover: None, drag: None });
     }
 
     pub fn close_menu(&mut self) {
@@ -92,7 +108,8 @@ impl Gui {
         let fh = self.fonts.font(FontId::Normal).height as f32 + 2.0;
         let mut panels: Vec<Panel> = vec![];
         for (lv, items) in levels.iter().enumerate() {
-            let w = items.iter().map(|i| i.text.chars().map(|c| self.fonts.font(FontId::Normal).advance(c)).sum::<i32>()).max().unwrap_or(0) as f32 + 2.0 * PAD + 2.0 * COL;
+            let slider_w = if items.iter().any(|i| i.slider.is_some()) { 120.0 } else { 0.0 };
+            let w = (items.iter().map(|i| i.text.chars().map(|c| self.fonts.font(FontId::Normal).advance(c)).sum::<i32>()).max().unwrap_or(0) as f32 + 2.0 * PAD + 2.0 * COL).max(slider_w);
             let h: f32 = items.iter().map(|i| if i.sep { SEP_H } else { fh }).sum::<f32>() + 4.0;
             let (mut x, mut y) = match panels.last() {
                 None => (at.0 as f32, at.1 as f32),
@@ -148,7 +165,12 @@ impl Gui {
         let Some(m) = &self.ix.menu else { return };
         if let Some((lv, i)) = hit {
             let it = Self::menu_levels(m)[lv][i].clone();
-            if it.enabled && !it.sep && it.sub.is_empty() {
+            if it.slider.is_some() && it.enabled {
+                if let Some(m) = &mut self.ix.menu {
+                    m.drag = Some((lv, i));
+                }
+                self.menu_slide(x);
+            } else if it.enabled && !it.sep && it.sub.is_empty() {
                 self.events.push(Event::MenuPicked { id: it.id });
                 self.ix.menu = None;
             }
@@ -157,7 +179,32 @@ impl Gui {
         }
     }
 
+    /// Drag of a slider item: the value follows the pointer across the item (`PopupMenuSliderItem_c`), [`Event::MenuSlider`] on every change.
+    fn menu_slide(&mut self, x: f32) {
+        let Some((lv, i)) = self.ix.menu.as_ref().and_then(|m| m.drag) else { return };
+        let panels = self.menu_panels();
+        let Some(r) = panels.get(lv).and_then(|p| p.items.iter().find(|(_, k)| *k == i)).map(|(r, _)| *r) else { return };
+        let v = ((x - (r.l + 4.0)) / (r.width() - 8.0)).clamp(0.0, 1.0);
+        let Some(m) = &mut self.ix.menu else { return };
+        let Some(it) = menu_item_mut(m, lv, i) else { return };
+        if it.slider != Some(v) {
+            it.slider = Some(v);
+            let id = it.id;
+            self.events.push(Event::MenuSlider { id, value: v });
+        }
+    }
+
+    pub(super) fn menu_mouse_up(&mut self) {
+        if let Some(m) = &mut self.ix.menu {
+            m.drag = None;
+        }
+    }
+
     pub(super) fn menu_mouse_move(&mut self, x: f32, y: f32) {
+        if self.ix.menu.as_ref().is_some_and(|m| m.drag.is_some()) {
+            self.menu_slide(x);
+            return;
+        }
         let hit = self.menu_item_at(x, y);
         let Some(m) = &mut self.ix.menu else { return };
         m.hover = hit;
@@ -185,6 +232,14 @@ impl Gui {
                 let it = &levels[lv][*i];
                 if it.sep {
                     out.push(DrawCmd::Solid { dst: [r.l + 2.0, r.t + 2.0, r.r - 1.0, r.t + 3.0], color: [0x80; 3], alpha: 1.0 });
+                    continue;
+                }
+                if let Some(v) = it.slider {
+                    // `PopupMenuSliderItem_c` (0.0..1.0): UNRESOLVED skin, drawn as a bar with a knob
+                    let (l, r2, mid) = (r.l + 4.0, r.r - 4.0, (r.t + r.b) * 0.5);
+                    out.push(DrawCmd::Solid { dst: [l, mid - 1.0, r2, mid + 1.0], color: [0x80; 3], alpha: 1.0 });
+                    let kx = l + (r2 - l) * v.clamp(0.0, 1.0);
+                    out.push(DrawCmd::Solid { dst: [kx - 2.0, r.t + 2.0, kx + 2.0, r.b - 1.0], color: [255; 3], alpha: 1.0 });
                     continue;
                 }
                 if it.enabled && hover == Some((lv, *i)) || (it.enabled && !it.sub.is_empty() && m_path_has(&self.ix.menu, lv, *i)) {

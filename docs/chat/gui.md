@@ -34,8 +34,8 @@ Decompile dumps used (not committed): `ChatGUIModule_c::Initialize` 0x100872bd, 
   else `FadeTo(window_transparency_inactive, 1 s)` (200000 / 1000000 µs). Defaults 0.8 / 0.3 (`_DAT_101b8a54` = 0.8, `_DAT_101ae0ec` = 0.3);
   the menu's two sliders write them (`FUN_10096db3` / `FUN_10096de4`).
   *Port*: `Gui::set_window_alpha` multiplies everything drawn in the window; active = the window's input bar has the keyboard focus.
-* `is_frontmost` / `is_backmost` (chat_window_config) set window flags 0x100 / 0x200 (`FUN_10097ae3`). Not ported (no z-order layer API).
-* Mode 0 (framed "Normal") is **not ported**: it is drawn like mode 2 (GAP; needs the style-0 TabView frame in ao-gui).
+* `is_frontmost` / `is_backmost` (chat_window_config) set window flags 0x100 / 0x200 (`FUN_10097ae3`): ported as `Gui::set_window_layer` (1 / -1), toggled by the menu entries *AlwaysOnTop* / *AlwaysBehind* (§12) and persisted.
+* Mode 0 (framed "Normal") is ported: a style-0 `ao_gui` window with the tab strip (docs/gui.md §6.1), movable / resizable by its frame, one tab per chat window (§10, §11). The Window menu's *Normal* entry switches to it.
 
 ## 3. Layout inside the window (`ChatView_c::FUN_1008d728`, input mode set by `FUN_10090442`)
 
@@ -116,8 +116,7 @@ Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), co
   Shadow = a clone of the text surface with colour 0 (black), alpha 1, behind the text (`_AllocateBitmap` 0x1016095b, only with flag 0x1000 = `ChatView::shadow`, `+0x1ba`, default **off**,
   setter `FUN_1008e04f`; offset from pref `ChatTextShadowOffset`: 0 → 0, 1 → 1, 2 → 2, else 1; shipped value 1).
 * **Not ported**: `<div indent=wrapped>` hanging indent of wrapped lines; per-line fading (`is_message_fading_enabled`, prefs `ChatTextFadeDelay`/`ChatTextFadeTime`, `FUN_1008f432`
-  → `FUN_1009349d`; shipped false, prefs absent from CharPrefs/MainPrefs); text selection/copy from the read-only chat text (ao-gui selects editable fields only);
-  right-click menus (`ChatWindowMenu_*`, `FUN_100998bc`, `FUN_1008e135`); window drag/resize (ao-gui has no movable windows yet); tabs (`Window::InsertTab`; each port window has one tab).
+  → `FUN_1009349d`; shipped false, prefs absent from CharPrefs/MainPrefs; the menu entry only stores the flag). Text selection/copy, right-click menus, window drag/resize and tabs: §10-§13.
 
 ## 6. Input bar, links, activation
 
@@ -126,7 +125,7 @@ Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), co
 * Prompt overlay (`InputBar_c`, `ChatShowOGrpInInputBar`): output-group name in the output group's colour at alpha 0.6, shifted 4.0 px (`_DAT_101b0840`) right while the editor has focus. **Not ported** (pref default
   unknown; `win.rs` exposes `active_output_group()` instead). `InputHistory.xml` (`TextLine text=…`, `cursor_pos`) per window: not ported.
 * Links: `FUN_1008e322` → `user://NAME` → signal +0x130 (→ `OpenTellWindow` 0x10085df8 = `FUN_100a6568` tell window), `chatgroup://ID` → signal +0x134 (sets that window's output group),
-  anything else → `ChatGUIModule_c::ShowItemRefLink` 0x10085cb5 (`itemref://`, `charref://`, `chatcmd:///…`). Port: `ao_gui::Event::LinkClicked` (activation on mouse-down is a **GUESS**) →
+  anything else → `ChatGUIModule_c::ShowItemRefLink` 0x10085cb5 (`itemref://`, `charref://`, `chatcmd:///…`). Port: `ao_gui::Event::LinkClicked` (activation on mouse-down: confirmed, `TextRenderer_c::MouseDown` 0x101637ef, §13) →
   `WinOut::OpenTell` / output group change / `WinOut::LinkClicked`. Tell windows themselves (`FUN_100a658b`, per-user config files) are not ported: the hub opens/routes them.
 * Activation: `SlotGroupWindowActivated` 0x10086fb0; `StartChatCmdMessage` 0x10021f18 / `StartChatReplyMessage` 0x10021fd0 (Enter / reply keys) → `focus_input()` focuses the last active window's editor.
 
@@ -149,15 +148,83 @@ chat windows after them (normal stacking = creation order).
 the input bar under the bottom HUD row): template frames are scaled horizontally by `free width / 2304` (free width = screen minus the HUD's wings, `Reserved{left,right}`), keep their height, and are
 bottom-anchored `Reserved.bottom` px above the screen bottom (`ChatWindows::set_reserved`, the hub passes the HUD's footprint; test screenshot used left 190 / right 65 / bottom 38 measured from the HUD art).
 Once saved (`ChatWindows::save` writes the *placed* rectangle) the windows load as ordinary absolute frames. Without a frame: centred, 400x200 (`FUN_10097ae3`).
-Window drag/resize is **not ported**: the original's borderless style-3 chat window has no frame handles (`HitTest` 0x101593d6 is the frame's; moving a visual_mode 2 window needs the frame/menu mode),
-ao-gui has no movable windows. `ChatWindows::set_visible(false/true)` hides/shows all windows (they keep collecting lines; focus is dropped) so HUD hide/show does not disturb them.
+Window drag/resize: see §10 (a mode-2 window is fixed in the original too; the menu switches it to the movable style-0 frame). `ChatWindows::set_visible(false/true)` hides/shows all windows (they keep collecting lines; focus is dropped) so HUD hide/show does not disturb them.
 
 ## 8. ao-gui additions (additive)
 
 `Gui::set_window_alpha/window_alpha` (`Window::FadeTo` target), `Gui::set_window_layer` (backmost/frontmost), `Gui::set_text_shadow_offset` + `TVF_RENDER_SHADOW` drawing (black copy behind), `TVF_FILL_BOTTOM_UP` (short content sits at the
-bottom of its `ScrollView`), `Gui::scroll_to_bottom`, `Gui::clear_focus`, `Event::LinkClicked { window, view, href }` for read-only `TextView`s (`TextRun::href`).
+bottom of its `ScrollView`), `Gui::scroll_to_bottom`, `Gui::clear_focus`, `Event::LinkClicked { window, view, href }` for read-only `TextView`s (`TextRun::href`). Window frame, tabs, popup menus and text selection (§10-§13):
+`set_window_frame` / `set_window_size_limits` / `set_window_tabs` / `set_window_context` / `window_outer_frame` / `set_window_outer_frame` / `interacting`, `open_menu` / `close_menu` / `MenuItem`, `selected_text` / `clear_selection`,
+events `WindowFrame`, `TabSelected`, `TabDropped`, `FrameIcon`, `ContextMenu`, `MenuPicked`, `MenuSlider`; modules `gui/{frame,popup,select}.rs`.
 
 ## 9. Verification
 
 `cargo test --release -p aomac chat::win` (line formats, colours, subscription rule, shipped template parse/round-trip, routing, fades, submit, 100-line cap; GUI tests skip without the client).
 Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot -- --nocapture` → `chat-inactive.png`, `chat-active.png` (see the observations in the final report of the change).
+
+## 10. Window frame: how a chat window is moved and resized (RE, GUI.dll)
+
+* A chat window in **mode 2 cannot be moved or resized** by the mouse. `FUN_10096ec5` (mode setter) calls `Window::SetStyle(3, (flags & 0x300) | 0xc3c)`: 0x8 = not movable, 0x10 | 0x20 = not resizable,
+  0x4 = no border buttons. `WndBorder::HitTest` 0x101593d6 returns hit items: 1 move, 2 left, 3 top, 4 right, 5 bottom, 6 TL, 7 TR, 8 BL, 9 BR (0 when window flag 0x1; the resize items only when `flags & 0x30 == 0`,
+  the move item only when `flags & 0x8 == 0`). The original's way to a movable window is the **menu**: right button anywhere in the `ChatView` (`ChatView_c::MouseDown` 0x1008f5dd, button 2 →
+  `Window::GetIconMenu` (vtable +0x3c) → `PopupMenu_c::Go`) or the frame's icon button (`WndBorder::SlotIconButton` 0x1015a74e) → "Visual > Mode > Normal" (`FUN_100998bc`, setter `FUN_100993c0` → `FUN_10096ec5`
+  → `Window::SetStyle(0, flags & 0x300)`), after which the window is a style-0 frame (3, 7, 3, 3 border + TabView strip, §2).
+* **Hit zones** (`WndBorder::Layout` 0x1015a1d9, rects at `this+0x23c..0x2bc`): the four corner rects are `Rect::TranslateTL/TR/BL/BR` of the bounds, the edges `TranslateBorderLeft/Right/Top/Bottom` between the
+  corners, the **move zone** (`+0x23c`) is the top-border strip between the corners from the row below the top border (`+0x2c8 + 1.0`) down to row **18.0** (`_DAT_101c894c`), i.e. the tab strip. Corner/edge thickness = the
+  border sizes (3, 7, 3, 3): the `Translate*` helpers are imported from Utils.dll, which is not in the Ghidra project, so the corner size is a **GUESS** (border-sized squares). Port: `ao_gui::hit_item`.
+* **Drag** (`MouseDown` 0x101595f7 / `MouseMove` 0x10159c27 / `MouseUp` 0x101596a7): MouseDown stores the hit item (`+0x1d4`), the grab offset (pointer − `GetHitPointBase`: the dragged corner's position) and the
+  frame; MouseMove sets the dragged edges to `pointer − grab` (item 1: the whole frame is translated), then `DoSetFrame` 0x10159888: the *client* size is clamped to `SetSizeLimits` (default min (0, 0), max (INT_MAX, INT_MAX),
+  ctor 0x1015b44b), the edge opposite to the dragged one stays fixed (top moves for items 3/6/7, left for 2/6/8), and the outer width is floored at `+0x2ec − 1` (the width of the border-button row: each button
+  adds 5 + 13 px → icon + close = 36 px, so 35 as an extent; **GUESS** that no pin/help button is present). `UpdateMousePointer` 0x101594fc: move = pointer 7, horizontal resize 0xb, vertical 10, diagonals 9 / 8
+  (the port uses the OS cursor; shapes **not applied**). Dragging does **not** call `MoveInsideScreen`; `SaveWndConfig` writes `GetFrame` as `WindowFrame`.
+* Port: `Gui::set_window_frame(w, movable, resizable)`, `set_window_size_limits`, `window_outer_frame`, `set_window_outer_frame`, `Event::WindowFrame`; `ChatWindows` keeps `Frame::placed` in sync, writes the frame into every
+  tab's `Config.xml` (`WindowFrame`, `tab_index`), and saves when the pointer is idle (the original saves at shutdown, `FUN_10094a28`; the port has no shutdown hook). `MIN_CLIENT` (50 × 60) is a **GUESS**:
+  `ChatWindow_c` sets no size limits, so the original lets the client shrink to 0 and relies on view minimum sizes.
+
+## 11. Tabs (`Window::InsertTab`)
+
+* A `ChatWindow_c` holds several `GroupChatView_c` tabs, each one window document (`Chat/Windows/WindowN`). `FUN_100974b5` (`Window::InsertTab(index, FUN_100ab980 title, view)`) inserts before the first tab with a
+  greater `tab_index` (document `+0x1e8`) and selects it; the title is the window's `name`. Tab press = `TabView` selection; `FUN_10096b23` takes the alpha of the selected tab's window.
+* **Drag**: `ChatWindow_c` connects `TabView` signals: `FUN_10097340` (drag start: `TabView::CreateDragImage`, `DragObject_c(mime "chat_gui/group_chat_view", Message{tab_index})`, `View::BeginDrag`),
+  `FUN_10097881` (drop on a `ChatWindow`'s `TabView`, accepts only that mime: the dropped tab goes to the position the pointer is at in the target; every other document's `tab_index` ≥ the new index is incremented in
+  the target and (`FUN_10097636`) decremented in the source; the source window closes when it has no tab left) and `FUN_10097d0b` (drop on nothing: with **fewer than 2 tabs** `DragObject_c::Cancel`; otherwise a
+  new `ChatWindow_c` (`FUN_10097ae3`) at `GetBounds() + Point` with `MoveInsideScreen(true, true, true)`, the tab moved there with `tab_index` 0).
+* Unselected tab art `GFX_GUI_TAB_INACTIVE_LEFT/MIDDLE/RIGHT` (0x1a1..0x1a3), text colour 0 (`Tab::SetSelected` 0x10146110), alpha × `_DAT_101c4978` = 2.0: we cannot multiply 0.85, so the port draws the inactive tab at
+  half the layer alpha (**GUESS**); the tab drag image is drawn at half alpha. Drag threshold 4 px (**GUESS**), tear-out offset 20 px (**GUESS**; the `Point` of `FUN_10097d0b` is not readable), tabs side by side without a gap (**GUESS**).
+* **Persistence (GUESS)**: the config keys contain only `tab_index` and the per-window `WindowFrame`; the document-to-window grouping (`+0x98`, assigned in `FUN_100abfa3`'s loop and `FUN_100974b5`) is not written by
+  `FUN_1009a77b`. The port groups windows in mode 0 whose saved `WindowFrame` is identical into one frame, ordered by `tab_index`, and writes the same frame into every tab of a frame.
+* Port: `Gui::set_window_tabs`, `window_tabs`, `Event::TabSelected`, `Event::TabDropped { window, tab, x, y, target }`; `ChatWindows::{select_tab, tab_dropped}` (reorder, dock, tear-out; rebuilds the GUI windows).
+  A window with several tabs cannot switch to Borderless (its menu entry is disabled: **GUESS**; the original's `SetStyle` is per window while `visual_mode` is per document).
+
+## 12. Menus (`PopupMenu_c`)
+
+* **Window menu** `FUN_100998bc`: submenu *Style_Mode* (boolean *Mode_Normal* = `visual_mode == 0`, *Mode_Borderless* = `visual_mode == 2`; each calls `FUN_100993c0`); for modes ≠ 0 a submenu
+  *Style_Transparancy* with two `PopupMenuSliderItem_c` (0..1; first = inactive `+0x174`, key `…Transparancy_InactiveToolTip`, second = active `+0x170`); separator; booleans *ShowTimestamps* (`+0x16a`),
+  *DisableTextInput* (`+0x167 == 0`), *Style_HideInputBarWhenInactive* (`+0x169`, disabled when text input is off), *Style_FadeMessages*. `FUN_10096f9f` appends separator + *Style_AlwaysBehind* (window flag 0x200)
+  and *Style_AlwaysOnTop* (0x100). Strings are text-db category 10001 keys (`LDBface::GetText(0x2711, key)`; the keys above are read from the DLL, the texts from `text.mdb`).
+* **Icon / right-click menu** `FUN_10097289` (opened by `FUN_100983b0` on the window's icon menu): the window menu as the first entry (header *ChatWindowMenu_Visual*) + separator;
+  `GroupChatView_c::FUN_100ab4dc` inserts *TalkToChannel* ▸, *ChannelSubscribeMenu* ▸, boolean *AutoSubscribeChannels* (`+0x163`), separator, then *ChatConfiguration*, *RenameWindow*, *DeleteWindow*, *NewWindow*
+  (the last four open dialogs and are **not ported**; the relative order of the two inserters is a **GUESS**). Group lists: sorted by name (**GUESS**; the original iterates its group map).
+* **User-link menu** `FUN_1008e135` (a `user://NAME` link under a right press, `FUN_1008f5dd`): *IgnoreUser*, *OpenChat*, *SendTell* (each present when its `ChatView` flag bit 0x1/0x2/0x4 is set; **GUESS** all three);
+  the slots re-emit `NAME` on signals +0x148 / +0x14c / +0x150. Port: IgnoreUser → `/ignore NAME`, OpenChat and SendTell → the tell window / `/tell NAME ` (`WinOut::IgnoreUser` / `OpenTell`).
+* The text view itself shows no menu (`DISABLE_RC_MENU` 0x200 → `TextRenderer_c::MouseDown` button 2 falls through to the parent `View::MouseDown`), so the right press reaches `ChatView`.
+* Port: `ao_gui::MenuItem` (entry / check / separator / submenu / slider), `Gui::open_menu`, `Event::{ContextMenu, FrameIcon, MenuPicked, MenuSlider}`. **UNRESOLVED**: the `PopupMenu_c` skin (the combo popup's
+  raised border art is used), the check mark and sub-menu arrow art (a 5 px square and `>`), slider art.
+  Not ported (need dialogs / other windows): *ChatConfiguration*, *RenameWindow*, *DeleteWindow*, *NewWindow*, `chat_group_window`.
+
+## 13. Text selection and copy
+
+* `TextRenderer_c::MouseDown` 0x101637ef: left button with flag 0x4 (ACCEPT_MOUSE_INPUT): a hyperlink attribute under the pointer fires the link signal **on mouse-down** (this resolves the earlier GUESS about link activation); else
+  `SetCursorPosition` + `BeginSelection` 0x1016108a (clears every other `TextRenderer`'s selection: one selection at a time) + mouse capture. `MouseMove` 0x101639c6: outside the view a 20 ms timer (`SlotScrollTimer`) scrolls;
+  inside, `SetCursorPosition` + `ExpandSelection`. `SelectAll` 0x101610cd. The highlight is `Clear(rect, 0xc0c0c0)` (`_RenderString`). There is **no double-click word selection** in `MouseDown` (nothing to port).
+* Copy: `CopyActiveSelectionToClipboard` 0x10160f84 → `CopyToClipboard` 0x10160d15: `HTMLParser_c::ExtractText(range)`, `\n` → CRLF, `CF_UNICODETEXT` + `CF_TEXT`, then `ClearSelection`. Port: Ctrl+C / Cmd+C
+  (`Modifiers::ctrl` = Ctrl or Cmd) with a selection → `Event::Copy(plain text)` (the app writes the clipboard through `arboard`, `flow.rs`), then the selection is cleared; soft-wrapped lines join without a break,
+  real breaks give `\n` (LF on macOS). A press anywhere else clears the selection (**GUESS**: `SlotGlobalMouseDown` 0x1016083d is read as "lose focus" only). The auto-scroll step is one line per 20 ms (**GUESS**).
+* Port: `ao_gui` `select.rs` (`Gui::selected_text`, `clear_selection`), `TextLine::hard_break`; `TVF_FILL_BOTTOM_UP` text is now hit-testable where it is drawn (links in short logs were unreachable before).
+
+## 14. Verification of §10-§13
+
+`cargo test --release -p ao-gui --test frame` (hit zones, drag/resize clamps, tab select/drop, popup menu, selection + Ctrl+C) and `cargo test --release -p aomac chat::win` (menu → frame → drag →
+save/reload, border windows fixed, dock / tear-out / reload grouping, selection copy, right-click settings). Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_frame_shot -- --nocapture` →
+`frame-tabs.png` (docked tabs "Combat" selected, "Default Window" inactive, icon and close buttons), `frame-selection.png` (grey `0xc0c0c0` highlight over lines of the bottom-filled text),
+`frame-menu.png` (right-click menu with the Visual sub-menu open).

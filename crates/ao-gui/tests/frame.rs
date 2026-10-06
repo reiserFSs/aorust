@@ -144,3 +144,20 @@ fn selection_extracts_text_and_copy_clears_it() {
     press(&mut g, r.l + 290.0, r.b + 40.0);
     assert_eq!(g.selected_text(), None);
 }
+
+#[test]
+fn popup_slider_item_reports_values_and_stays_open() {
+    let Some(mut g) = gui() else { return };
+    g.open_menu((50, 50), (800, 600), vec![MenuItem::slider(7, 0.0)]);
+    // press in the middle of the slider row, drag to the far right, release: values 0..1, menu still open
+    let evs = g.input(InputEvent::MouseDown { x: 110.0, y: 58.0, button: MouseButton::Left });
+    let v = match evs.as_slice() {
+        [Event::MenuSlider { id: 7, value }] => *value,
+        other => panic!("{other:?}"),
+    };
+    assert!((0.3..0.7).contains(&v), "{v}");
+    let evs = g.input(InputEvent::MouseMove { x: 400.0, y: 58.0 });
+    assert_eq!(evs, vec![Event::MenuSlider { id: 7, value: 1.0 }]);
+    assert!(g.input(InputEvent::MouseUp { x: 400.0, y: 58.0, button: MouseButton::Left }).is_empty());
+    assert!(g.menu_open());
+}

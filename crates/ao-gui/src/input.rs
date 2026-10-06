@@ -93,4 +93,6 @@ pub enum Event {
     ContextMenu { window: WindowId, x: i32, y: i32, link: Option<String> },
     /// An entry of the popup menu opened with `Gui::open_menu` was chosen.
     MenuPicked { id: u32 },
+    /// A slider item of the popup menu changed (`value` 0.0..=1.0); the menu stays open.
+    MenuSlider { id: u32, value: f32 },
 }

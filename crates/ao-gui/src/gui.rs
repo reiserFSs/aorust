@@ -1411,6 +1411,14 @@ impl Gui {
                 return Some(h);
             }
         }
+        // `TVF_FILL_BOTTOM_UP` text is drawn `dy` below its frame (short content sits at the bottom of the ScrollView): the visible lines are hit-testable too
+        let mut clip_r = clip_r;
+        if let Kind::Text(t) = &v.kind {
+            if t.tvf & tvf::FILL_BOTTOM_UP != 0 {
+                let dy = self.fill_bottom_dy(id, t.tvf, v.frame.height() as i32 + 1);
+                clip_r = clip.map_or(r, |c| c.intersect(&Rect::new(r.l, r.t, r.r, r.b + dy as f32)));
+            }
+        }
         let inside = clip_r.contains(Point::new(x, y)) && !clip_r.is_empty();
         let interactive = match &v.kind {
             Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::Canvas(_) | Kind::ScrollView(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. } => true,
