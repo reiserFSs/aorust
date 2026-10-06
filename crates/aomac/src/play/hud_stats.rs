@@ -226,6 +226,23 @@ impl HudStats {
         std::mem::take(&mut self.outbox)
     }
 
+    /// Inventory items dropped over a foreign window since the last call: `(slot, x, y)` (the NPC trade window takes them).
+    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
+    pub(in crate::play) fn take_drops(&mut self) -> Vec<(u32, f32, f32)> {
+        std::mem::take(&mut self.dnd.dropped)
+    }
+
+    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
+    pub(in crate::play) fn requeue_drops(&mut self, drops: Vec<(u32, f32, f32)>) {
+        self.dnd.dropped.extend(drops);
+    }
+
+    /// Name and icon of the item template `low_id` (`items.rs` cache).
+    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
+    pub(in crate::play) fn item_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<(String, Option<(ao_gui::GfxId, u32, u32)>)> {
+        self.items.info(gui, low_id).map(|i| (i.name.clone(), i.icon))
+    }
+
     pub(super) fn open(&mut self, gui: &mut Gui, rollup: &mut Rollup, kind: WindowKind) {
         if self.is_open(kind) {
             return;

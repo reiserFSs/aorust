@@ -96,7 +96,11 @@ impl HudStats {
                         Some(p) => self.drop_action(zone, d.slot, p),
                         // released over the world: `N3Msg_DropItem` (the position under the cursor is picked by the 3D view: UNRESOLVED, we drop at our feet)
                         None if !gui.wants_mouse(x, y) => Some(Action::Drop { item: inv::item_identity(d.slot) }),
-                        None => None,
+                        // released over another window (the NPC trade window, `play/interact_trade.rs`): the drop is reported to whoever owns that window
+                        None => {
+                            self.dnd.dropped.push((d.slot, x, y));
+                            None
+                        }
                     };
                     if let Some(a) = action {
                         self.run(zone, a, dest);

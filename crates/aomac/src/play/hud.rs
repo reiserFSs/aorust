@@ -470,6 +470,24 @@ impl Hud {
         std::mem::take(&mut self.outbox)
     }
 
+    /// Inventory items released over a foreign window since the last call (`HudStats::take_drops`).
+    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
+    pub(super) fn take_item_drops(&mut self) -> Vec<(u32, f32, f32)> {
+        self.stats.take_drops()
+    }
+
+    /// Puts back the drops no window claimed.
+    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
+    pub(super) fn requeue_item_drops(&mut self, drops: Vec<(u32, f32, f32)>) {
+        self.stats.requeue_drops(drops);
+    }
+
+    /// Name and icon of an item template (`HudStats::item_info`).
+    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
+    pub(super) fn item_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<(String, Option<(ao_gui::GfxId, u32, u32)>)> {
+        self.stats.item_info(gui, low_id)
+    }
+
     /// Hotbar slots activated since the last call (`FUN_100d79c9`).
     /// The character a world click selected since the last call (CTRL/ALT + click also attacks it: `FUN_1002c469`).
     pub(super) fn take_click(&mut self) -> Option<i32> {

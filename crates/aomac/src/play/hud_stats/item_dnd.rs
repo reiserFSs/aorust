@@ -108,6 +108,8 @@ pub struct Dnd {
     /// Last click for the double click: where, and the [`Dnd::clock`] time.
     pub last_click: Option<(Place, f32)>,
     pub clock: f32,
+    /// Items released over a window that is not an inventory place: `(slot, x, y)`, drained by [`super::HudStats::take_drops`].
+    pub dropped: Vec<(u32, f32, f32)>,
 }
 
 pub struct Drag {
