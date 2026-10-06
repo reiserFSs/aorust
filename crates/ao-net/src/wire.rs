@@ -7,11 +7,16 @@ use anyhow::{bail, Result};
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    little_endian: bool,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self { buf, pos: 0, little_endian: false }
+    }
+    /// RDB BinaryStream primitives are little-endian; string bytes are unchanged.
+    pub fn little_endian(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0, little_endian: true }
     }
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
@@ -28,10 +33,12 @@ impl<'a> Reader<'a> {
         Ok(self.bytes(1)?[0])
     }
     pub fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_be_bytes(self.bytes(2)?.try_into()?))
+        let bytes = self.bytes(2)?.try_into()?;
+        Ok(if self.little_endian { u16::from_le_bytes(bytes) } else { u16::from_be_bytes(bytes) })
     }
     pub fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_be_bytes(self.bytes(4)?.try_into()?))
+        let bytes = self.bytes(4)?.try_into()?;
+        Ok(if self.little_endian { u32::from_le_bytes(bytes) } else { u32::from_be_bytes(bytes) })
     }
     pub fn i32(&mut self) -> Result<i32> {
         Ok(self.u32()? as i32)
@@ -40,7 +47,8 @@ impl<'a> Reader<'a> {
         Ok(self.u16()? as i16)
     }
     pub fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_be_bytes(self.bytes(8)?.try_into()?))
+        let bytes = self.bytes(8)?.try_into()?;
+        Ok(if self.little_endian { u64::from_le_bytes(bytes) } else { u64::from_be_bytes(bytes) })
     }
     /// IEEE-754 single, big-endian on the wire.
     pub fn f32(&mut self) -> Result<f32> {

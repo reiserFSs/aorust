@@ -30,6 +30,8 @@ pub const CONTAINER_ADD_ITEM: u32 = 0x4753_7A24; // ContainerAddItemIIR_t
 pub const ITEM_REPLACED: u32 = 0x3A22_3B50; // ItemReplacedIIR_c
 pub const INVENTORY_UPDATED: u32 = 0x485E_7202; // InventoryUpdatedIIR_t
 pub const INVENTORY_UPDATE: u32 = 0x4E53_6976; // InventoryUpdateIIR_t
+pub const BANK: u32 = 0x343C_287F;
+pub const BANK_CORPSE: u32 = 0x5221_3420;
 pub const DROP_TEMPLATE: u32 = 0x3A24_3F41; // DropTemplateIIR_t
 /// `MapToKey("ClientMoveItemToInventoryIIR_t")` (string at GC 0x10157380).
 pub const CLIENT_MOVE_ITEM: u32 = 0x5469_373F;
@@ -203,10 +205,14 @@ pub enum InventoryMsg {
     /// `InventoryUpdatedIIR_t`: an `i32` the GUI is told about (`FUN_10074e49` emits it on the global inventory signal for the own dynel).
     Updated(i32),
     Update(InventoryUpdate),
+    /// BankIIR_t read 0x10071fcf; activation 0x10072002 opens DEAD:header.instance.
+    Bank(Vec<InventoryEntry>),
+    /// BankCorpseIIR_t read 0x10071e42; activation 0x10071e95 registers DEAE:instance.
+    Reclaim { entries: Vec<InventoryEntry>, instance: i32 },
 }
 
 /// `GameData::operator>>(ACGItem_t)` [GameData 0x1000e9d7], as in [`InventoryEntry`].
-fn read_acg(r: &mut Reader) -> Result<AcgItem> {
+pub(super) fn read_acg(r: &mut Reader) -> Result<AcgItem> {
     let (low_id, high_id, mut level) = (r.i32()?, r.i32()?, r.i32()?);
     r.i32()?;
     if level > 0x1ff {
@@ -217,6 +223,12 @@ fn read_acg(r: &mut Reader) -> Result<AcgItem> {
 
 pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<InventoryMsg>> {
     Ok(match h.msg_type {
+        BANK | BANK_CORPSE => {
+            let entries = super::world::read_inventory(r)?;
+            let bank = if h.msg_type == BANK { InventoryMsg::Bank(entries) } else { InventoryMsg::Reclaim { entries, instance: r.i32()? } };
+            ensure!(r.remaining() == 0, "Bank inventory: {} trailing bytes", r.remaining());
+            Some(bank)
+        }
         CONTAINER_ADD_ITEM => {
             let (item, container, slot) = (Identity::read(r)?, Identity::read(r)?, r.i32()?);
             ensure!(r.remaining() == 0, "ContainerAddItemIIR_t: {} trailing bytes", r.remaining());
@@ -256,6 +268,8 @@ mod tests {
 
     #[test]
     fn keys_are_the_class_name_hashes() {
+        assert_eq!(message_key("BankIIR_t"), BANK);
+        assert_eq!(message_key("BankCorpseIIR_t"), BANK_CORPSE);
         assert_eq!(message_key("ClientMoveItemToInventoryIIR_t"), CLIENT_MOVE_ITEM);
         assert_eq!(message_key("ClientContainerAddItemIIR_t"), CLIENT_CONTAINER_ADD_ITEM);
         assert_eq!(message_key("ContainerAddItemIIR_t"), CONTAINER_ADD_ITEM);
@@ -304,6 +318,18 @@ mod tests {
     fn parse(b: &[u8]) -> Result<Option<InventoryMsg>> {
         let (h, mut r) = N3Header::parse(b)?;
         decode(&h, &mut r)
+    }
+
+    #[test]
+    fn bank_and_reclaim_use_the_inventory_vector() {
+        let bank = hex("343c287f 0000c350 00000007 01 000007e2 00000005 0001 0003 00000069 00000005 00000010 00000011 00000019 00000000");
+        let Some(InventoryMsg::Bank(entries)) = parse(&bank).unwrap() else { panic!() };
+        assert_eq!((entries.len(), entries[0].slot, entries[0].item.low_id), (1, 5, 16));
+        for n in 13..bank.len() { assert!(parse(&bank[..n]).is_err()); }
+        assert!(parse(&[bank.clone(), vec![0]].concat()).is_err());
+        let reclaim = hex("52213420 0000c350 00000007 01 000003f1 00000009");
+        assert_eq!(parse(&reclaim).unwrap(), Some(InventoryMsg::Reclaim { entries: vec![], instance: 9 }));
+        for n in 13..reclaim.len() { assert!(parse(&reclaim[..n]).is_err()); }
     }
 
     #[test]

@@ -8,9 +8,11 @@ pub mod combat;
 pub mod chat;
 pub mod dynel;
 pub mod grid;
+pub mod info;
 pub mod inventory;
 pub mod knubot;
 pub mod misc;
+pub mod mission_selection;
 pub mod motion;
 pub mod nano;
 pub mod nametag;
@@ -74,6 +76,8 @@ pub enum N3 {
     Trade(trade::Trade),
     /// `ShopUpdateIIR_t`: the stock of a vending machine (docs/zone/interact.md, "Vending machines / shops").
     Shop(shop::ShopUpdate),
+    /// Mission terminal alternatives (`QuestAlternativeIIR_t`).
+    MissionSelection(mission_selection::Alternatives),
     /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
     Unknown(Vec<u8>),
 }
@@ -114,6 +118,8 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
         N3::Trade(m)
     } else if let Some(m) = shop::decode(&h, &mut r)? {
         N3::Shop(m)
+    } else if let Some(m) = mission_selection::decode(&h, &mut r)? {
+        N3::MissionSelection(m)
     } else {
         N3::Unknown(f.payload[13..].to_vec())
     };

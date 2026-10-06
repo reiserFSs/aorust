@@ -118,20 +118,7 @@ fn read_token(r: &mut Reader) -> Result<Vec<u8>> {
 pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<Grid>> {
     Ok(Some(match h.msg_type {
         DESTINATION_SELECT => {
-            let v = r.i32()?;
-            if v % COUNT_UNIT != 0 || !(1..=MAX_ENTRIES + 1).contains(&(v / COUNT_UNIT)) {
-                bail!("grid destination count word {v:#x}");
-            }
-            let n = v / COUNT_UNIT - 1;
-            let mut destinations = Vec::with_capacity((n as usize).min(1024));
-            for _ in 0..n {
-                let playfield = r.i32()?;
-                let target = Identity::read(r)?;
-                let name = r.str_i16()?;
-                let (v2c, v28) = (r.i32()?, r.i32()?);
-                destinations.push(Destination { playfield, target, name, v2c, v28 });
-            }
-            Grid::DestinationSelect { destinations, token: read_token(r)? }
+            Grid::DestinationSelect { destinations: read_destinations(r)?, token: read_token(r)? }
         }
         SELECTED => {
             let token = read_token(r)?;
@@ -141,6 +128,23 @@ pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<Grid>> {
         }
         _ => return Ok(None),
     }))
+}
+
+pub(super) fn read_destinations(r: &mut Reader) -> Result<Vec<Destination>> {
+    let v = r.i32()?;
+    if v % COUNT_UNIT != 0 || !(1..=MAX_ENTRIES + 1).contains(&(v / COUNT_UNIT)) {
+        bail!("grid destination count word {v:#x}");
+    }
+    let n = v / COUNT_UNIT - 1;
+    let mut destinations = Vec::with_capacity((n as usize).min(1024));
+    for _ in 0..n {
+        let playfield = r.i32()?;
+        let target = Identity::read(r)?;
+        let name = r.str_i16()?;
+        let (v2c, v28) = (r.i32()?, r.i32()?);
+        destinations.push(Destination { playfield, target, name, v2c, v28 });
+    }
+    Ok(destinations)
 }
 
 #[cfg(test)]

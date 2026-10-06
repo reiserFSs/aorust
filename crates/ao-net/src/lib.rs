@@ -9,4 +9,6 @@ pub mod crypto;
 pub mod frame;
 pub mod msg;
 pub mod n3;
-mod wire;
+pub mod wire;
+
+pub use wire::{Reader, Writer};

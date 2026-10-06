@@ -161,7 +161,7 @@ fn reward_box(r: &mut Reader) -> Result<RewardBox> {
 }
 
 /// One `Quest_t` body (after the list element's identity).
-fn quest_body(r: &mut Reader, id: Identity) -> Result<Quest> {
+pub(super) fn quest_body(r: &mut Reader, id: Identity) -> Result<Quest> {
     let version = r.i32()?;
     if !(7..=15).contains(&version) {
         bail!("Quest_t version {version}");
@@ -318,7 +318,7 @@ impl Quest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::wire::Writer;
 

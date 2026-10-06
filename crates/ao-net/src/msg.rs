@@ -38,7 +38,7 @@ const CHARACTER_INFO_VERSION: i32 = 5;
 const DEFAULT_AREA: &str = "area unknown";
 const MAX_STR: usize = 0xFE; // CharacterInfo_c::ReadStream accepts len < 0xFF
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Identity {
     pub kind: i32,
     pub instance: i32,

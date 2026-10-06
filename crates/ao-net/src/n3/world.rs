@@ -42,6 +42,7 @@ pub enum World {
     Corpse(Corpse),
     Door(Door),
     DoorStatus(DoorStatus),
+    Info(Box<super::info::InfoPacket>),
 }
 
 /// Decode one of this module's messages; `Ok(None)` for any other message type.
@@ -58,6 +59,7 @@ pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<World>> {
         CORPSE_FULL_UPDATE => World::Corpse(Corpse::read(r)?),
         DOOR_FULL_UPDATE => World::Door(Door::read(r)?),
         DOOR_STATUS_UPDATE => World::DoorStatus(DoorStatus::read(r)?),
+        super::info::INFO_PACKET => World::Info(Box::new(super::info::InfoPacket::read(r)?)),
         _ => return Ok(None),
     }))
 }
@@ -539,16 +541,15 @@ impl DoorStatus {
 /// `{i32 type, i32 id, i32 format version}`, `i32` criteria count (`SpellData_t::ReadBinaryCriteria`
 /// [GD 0x1000d49f]), then the type's fixed arguments (`SpellFormat_c::ReadBinary` [GD 0x1000f39e],
 /// one `i32` per `Add` of the format built in `SpellFormats_c::SpellFormats_c` [GD 0x1000fb0a]).
-/// Only the live type 0xCF27 is decoded: its format has 7 `i32` arguments (stats 5, 6, 7, 0x2d, 0x2f,
-/// 0x30, 0xb); the 4 `i32` that follow them in every capture are kept in `tail` ([UNRESOLVED]: no reader
-/// for them was found in `SpellData_t`'s `>>`; docs/zone/static.md §5). Other types are an error.
+/// Only the live type 0xCF27 is decoded: four standard arguments precede its seven type
+/// arguments (stats 5, 6, 7, 0x2d, 0x2f, 0x30, 0xb), as added by GD 0x1000fa93.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorpseSpell {
     pub type_id: u32,
     pub id: i32,
     pub version: i32,
     pub args: [i32; 7],
-    pub tail: [i32; 4],
+    pub standard: [i32; 4],
 }
 
 /// `CorpseFullUpdateIIR_t` (GC `FUN_1009f502`, ReadSubClass slot 7): version 8, base, a `SpellData_t`
@@ -587,12 +588,12 @@ impl Corpse {
             if criteria != 0 {
                 bail!("corpse spell with {criteria} criteria is not decoded");
             }
+            let standard = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
             let mut args = [0; 7];
             for a in &mut args {
                 *a = r.i32()?;
             }
-            let tail = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-            spells.push(CorpseSpell { type_id, id, version, args, tail });
+            spells.push(CorpseSpell { type_id, id, version, args, standard });
         }
         let owner = Identity::read(r)?;
         let (_, n) = counted(r)?;
@@ -1070,7 +1071,7 @@ mod tests {
         let p = c.base.position.unwrap();
         assert!((p[0] - 873.94).abs() < 0.01 && (p[1] - 40.10).abs() < 0.01);
         // one SpellData_t (type 0xCF27), the dead character, five empty cloth parts, no texture list
-        assert_eq!(c.spells, [CorpseSpell { type_id: 0xCF27, id: 0x1238, version: 4, args: [1, 0, 0, 0, 0, 0, 0x1F7], tail: [1, 4, 0xB331, 0] }]);
+        assert_eq!(c.spells, [CorpseSpell { type_id: 0xCF27, id: 0x1238, version: 4, standard: [1, 0, 0, 0], args: [0, 0, 0x1F7, 1, 4, 0xB331, 0] }]);
         assert_eq!(c.owner, Identity { kind: 0xC350, instance: 1_025_286 });
         assert_eq!(c.cloth.iter().map(|k| (k.part(), k.texture, k.page)).collect::<Vec<_>>(), [(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0)]);
         assert!(c.textures.is_empty());
