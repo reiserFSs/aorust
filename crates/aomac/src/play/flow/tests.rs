@@ -160,12 +160,22 @@ impl Rig {
             self.event(LoginEvent::ZoneFrame(f.clone()));
         }
     }
+    /// Frames until the teleport ended (the new world is shown again).
+    fn settle(&mut self) {
+        let t = Instant::now();
+        while self.p.teleporting {
+            assert!(t.elapsed() < Duration::from_secs(120), "timeout waiting for the new world");
+            self.p.frame(0.5, (1280, 800), &mut self.host);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
-/// A second `PlayfieldAnarchyFIIR_t` while in the world: loading screen again, dynels dropped, the new playfield loaded, `CharInPlay`
-/// owed again; `GameTimeIIR_t` drives the zone clock (docs/zone/world.md §10).
+/// A second `PlayfieldAnarchyFIIR_t` while in the world: `TeleportStarted` (no loading screen, interface kept, world hidden), the
+/// dynels dropped, the new playfield loaded, `CharInPlay` owed again after `TeleportEnded`; `GameTimeIIR_t` drives the zone clock
+/// (docs/zone/world.md §10, docs/zone/world.md §10.2).
 #[test]
-fn second_playfield_shows_the_loading_screen_again() {
+fn second_playfield_keeps_the_interface_and_hides_the_world() {
     let Some(mut r) = rig() else { return };
     let first = captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec"));
     let second = captured(include_str!("../../../../../docs/captures/zone_ithaca.rec"));
@@ -194,30 +204,61 @@ fn second_playfield_shows_the_loading_screen_again() {
     r.burst(&second[..pf]);
     assert!(r.p.screen == Screen::InWorld);
     r.event(LoginEvent::ZoneFrame(second[pf].clone()));
-    assert!(r.p.screen == Screen::Loading, "the loading screen is shown again");
-    assert!(matches!(r.p.fade, Fade::In(_)) && !r.p.world_ready && r.p.hud.is_none());
+    // `TeleportStartedMessage`: no loading screen, the HUD and chat stay, the world is hidden behind the GUI, input locked
+    assert!(r.p.screen == Screen::InWorld && r.p.teleporting && !r.p.world_ready && !matches!(r.p.fade, Fade::In(_)));
+    assert!(r.p.hud.is_some() && r.p.chat.is_some() && r.p.player.is_none());
+    let list = r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(matches!(list.cmds.get(1), Some(DrawCmd::Solid { color: [0, 0, 0], alpha, .. }) if *alpha == 1.0), "black under the GUI");
+    assert_eq!(r.p.text.by_key(110, "ChangingArea").as_deref(), Some("Changing area. Please wait."));
     assert!(r.p.zone.dynels.is_empty() && !r.p.zone.in_play_sent && r.p.zone.playfield == Some(4582));
     r.burst(&second[pf + 1..]);
     assert_eq!(r.p.zone.day_time(), 4478.0, "resynced by the new burst's GameTime (67170 s = 18:39:30)");
     assert!(r.host.sky_clock.take().is_some(), "the live sky clock is resynced");
-    r.enter();
+    assert_eq!(r.p.world_frames, 0, "the countdown starts at TeleportEnded, not while the world loads");
+    r.settle();
+    assert!(r.p.hud.is_some() && matches!(r.p.fade, Fade::Hold), "TeleportEnded: no fade");
     for _ in 0..IN_PLAY_FRAMES + 2 {
         r.p.frame(0.016, (1280, 800), &mut r.host);
     }
     assert!(r.p.zone.in_play_sent, "CharInPlay is due again in the new world");
     assert!(r.p.zone.own().is_none() && r.p.zone.dynels.len() > 10);
     assert!(matches!(r.host.live_sky, Some(Some(_))), "4582 is outdoors: live sky");
+    assert_eq!(r.p.text.by_key(110, "EnteringPF").as_deref(), Some("Entering '%s'"));
 }
 
-/// `ZoneRedirection` (the session thread already reconnected): while in the world the loading screen comes back before the new burst.
+/// `ZoneRedirection` (the session thread already reconnected): while in the world `TeleportStarted` runs before the new burst.
 #[test]
-fn zone_redirect_shows_the_loading_screen() {
+fn zone_redirect_starts_the_teleport() {
     let Some(mut r) = rig() else { return };
     r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
     r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
     r.enter();
     r.event(LoginEvent::ZoneRedirect { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 2 });
-    assert!(r.p.screen == Screen::Loading && r.p.zone.dynels.is_empty() && !r.p.zone.in_play_sent);
+    assert!(r.p.screen == Screen::InWorld && r.p.teleporting && r.p.zone.dynels.is_empty() && !r.p.zone.in_play_sent);
+}
+
+/// `n3TeleportIIR_t` for the own character (`StartTeleport`) starts the zone change before the playfield arrives, once (the
+/// `m_isTeleporting` guard); in the same playfield it only places a dynel and starts nothing (docs/zone/world.md §10.2).
+#[test]
+fn teleport_iir_starts_the_zone_change_only_with_a_destination() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    let tp = |who: i32, dest: i32| {
+        let proxy = ao_net::msg::PlayfieldProxy { exit_door_id: ao_net::msg::Identity { kind: 0x9C50, instance: dest }, ..Default::default() };
+        let t = ao_net::n3::teleport::Teleport { target: ao_net::msg::Identity { kind: 50000, instance: who }, pos: [1.0, 2.0, 3.0], rot: [0.0, 1.0, 0.0, 0.0], proxy, ..Default::default() };
+        LoginEvent::ZoneFrame(ao_net::n3::outgoing::n3_frame(0, 1, t.encode(1)))
+    };
+    r.event(tp(33512, 0));
+    assert!(!r.p.teleporting, "same playfield: no TeleportStarted");
+    assert_eq!(r.p.zone.own().unwrap().pos, [1.0, 2.0, 3.0]);
+    r.event(tp(99, 4604));
+    assert!(!r.p.teleporting, "another character's destination is ignored");
+    r.event(tp(33512, 4604));
+    assert!(r.p.screen == Screen::InWorld && r.p.teleporting && r.p.hud.is_some() && r.p.zone.dynels.is_empty());
+    r.event(tp(33512, 4604)); // `if (!m_isTeleporting)`: the second one does nothing
+    assert!(r.p.teleporting);
 }
 
 /// The own character on the captured Arrival Hall start: the avatar is built, the login window's focus is gone (it blocked every key),

@@ -32,6 +32,9 @@ pub enum ZoneEvent {
     Playfield(u32),
     /// `GameTimeIIR_t`: [`Zone::day_time`] was set (first time or a resync).
     Time,
+    /// `n3TeleportIIR_t` for the own character with a destination playfield (`n3EngineClient_t::StartTeleport`): the old playfield
+    /// is stopped and `PlayfieldAnarchy_t::Run` posts `TeleportStarted` (docs/zone/world.md §10.2).
+    Teleport,
     None,
 }
 
@@ -185,6 +188,18 @@ impl Zone {
                 if let Some(d) = self.dynels.get_mut(&who.instance) {
                     d.pos = mv.pos;
                     d.yaw = Some(mv.yaw());
+                }
+            }
+            // `n3TeleportIIR_t::Activate` [N3 0x10029f87]: a destination playfield only matters for the own character
+            // (`StartTeleport`); otherwise the dynel is placed (`SetRelPosRot`)
+            N3::Teleport(t) if who.kind == CHAR_KIND => {
+                if t.is_zone_change() {
+                    if who.instance == self.char_id as i32 {
+                        return ZoneEvent::Teleport;
+                    }
+                } else if let Some(d) = self.dynels.get_mut(&who.instance) {
+                    d.pos = t.pos;
+                    d.yaw = Some(ao_net::n3::dynel::yaw(&t.rot));
                 }
             }
             N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => {

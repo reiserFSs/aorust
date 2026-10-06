@@ -38,7 +38,7 @@ Live (Ithaca, 2026-10-06, Aomacvolk): `cargo test --release -p aomac live_walk -
 `play/flow/live.rs`) drives the real `Play` offscreen through `ao_render::Offscreen` (no window; needed because a locked screen never renders windows): login, character
 pick, zone, then key steps and a collision-route autopilot (`goto=x:z`). Results: the server accepted every move (positions persist across relogs: the next login started
 exactly where the previous run stopped); walking from the Arrival Hall start (205.2, 1.0, 255.8) around the exhibits and through the central ICC shuttleport tunnel
-(x ~ 193, z ~ 157) made the server send `PlayfieldAnarchyF` 4582 (Newland City, start at 931, 20, 729) -> the loading screen -> the new world with terrain following and jumping.
+(x ~ 193, z ~ 157) made the server send `PlayfieldAnarchyF` 4582 (Newland City, start at 931, 20, 729) -> (that build showed the loading screen; the original does not, the zone change now follows docs/zone/world.md §10.2: interface kept, "Changing area. Please wait.") -> the new world with terrain following and jumping.
 Headless equivalents: `flow::tests::{own_character_walks_from_the_keyboard, autopilot_crosses_the_arrival_hall}`.
 
 ## In the world (M3 step 1)
