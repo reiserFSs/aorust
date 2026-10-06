@@ -570,7 +570,8 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             }
             id
         }
-        "TextView" => tree.add(new_text_view(ctx, e)),
+        // `ScrollingTextView_c` (the partner name of `TradeGUI.xml`): a `TextView_c` that scrolls a too-wide text; the scrolling is not ported
+        "TextView" | "ScrollingTextView" => tree.add(new_text_view(ctx, e)),
         "Button" => {
             let mut v = View::new(Kind::Button(ButtonData {
                 label: ctx.string(e, "label"),

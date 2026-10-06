@@ -224,6 +224,11 @@ impl Chat {
         }
     }
 
+    /// `IgnoreSystem_t::IsCharacterIgnored(id)`.
+    pub fn is_ignored(&self, id: u32) -> bool {
+        self.ignored.contains(&id)
+    }
+
     /// `FUN_10058b00(key)` [GC 0x10058b00]: the `Feedback_*` text (category 110) of the client character as a plain System-window line
     /// (`FUN_10012b05(0, text, 0)`: no colour code, so no `<font>`).
     pub fn feedback(&mut self, gui: &mut Gui, key: &str, texts: &TextDb) {

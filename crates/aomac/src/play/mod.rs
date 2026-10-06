@@ -46,6 +46,7 @@ mod interact_chat;
 mod interact_grid;
 mod interact_loot;
 mod interact_play;
+mod interact_ptrade;
 mod interact_use;
 mod logout;
 mod own_nanos;

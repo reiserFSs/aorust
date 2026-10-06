@@ -471,7 +471,6 @@ impl Hud {
     }
 
     /// Inventory items released over a foreign window since the last call (`HudStats::take_drops`).
-    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
     pub(super) fn take_item_drops(&mut self) -> Vec<(u32, f32, f32)> {
         self.stats.take_drops()
     }
@@ -483,8 +482,7 @@ impl Hud {
     }
 
     /// Name and icon of an item template (`HudStats::item_info`).
-    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
-    pub(super) fn item_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<(String, Option<(ao_gui::GfxId, u32, u32)>)> {
+    pub(super) fn item_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<super::hud_stats::ItemInfo> {
         self.stats.item_info(gui, low_id)
     }
 
@@ -945,7 +943,7 @@ impl Hud {
 }
 
 /// `String::FormatNumeric` (GUI 0x1006e8f2): decimal with thousands separators. [INFERENCE] ',' (the client's locale separator).
-fn group(n: i32) -> String {
+pub(super) fn group(n: i32) -> String {
     let s = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

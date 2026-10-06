@@ -113,7 +113,10 @@ impl Interact {
     /// follows [`Interact::default_action`]; for an object [`decide`] over its `Can` picks `GetItem` / `UseItem(id, false)`.
     pub fn default_action_on(&mut self, zone: &Zone, id: Identity) -> Action {
         if id.kind == DYNEL_CHAR {
-            return self.default_action(id.instance);
+            return match self.default_action(id.instance) {
+                Action::None => self.trade_action(zone, id.instance),
+                a => a,
+            };
         }
         match Self::can_of(zone, id).map(decide) {
             Some(Action::Get) => self.get_item(zone, id),

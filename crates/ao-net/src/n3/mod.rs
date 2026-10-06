@@ -21,6 +21,7 @@ pub mod server_move;
 pub mod spells;
 pub mod team;
 pub mod textcmd;
+pub mod trade;
 pub mod teleport;
 pub mod world;
 
@@ -68,6 +69,8 @@ pub enum N3 {
     Knubot(knubot::Knubot),
     /// `GridDestinationSelectIIR_t` / `GridSelectedIIR_t`: grid terminal / whompah / shuttle destinations (docs/zone/interact.md).
     Grid(grid::Grid),
+    /// `TradeIIR_t`: the player-to-player trade (docs/zone/interact.md, "Player trade").
+    Trade(trade::Trade),
     /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
     Unknown(Vec<u8>),
 }
@@ -104,6 +107,8 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
         N3::Knubot(m)
     } else if let Some(m) = grid::decode(&h, &mut r)? {
         N3::Grid(m)
+    } else if let Some(m) = trade::decode(&h, &mut r)? {
+        N3::Trade(m)
     } else {
         N3::Unknown(f.payload[13..].to_vec())
     };

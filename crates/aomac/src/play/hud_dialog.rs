@@ -61,6 +61,12 @@ impl<T: Copy> Dialogs<T> {
         !self.open.is_empty()
     }
 
+    /// The windows of the open dialogs (tests click their buttons).
+    #[cfg(test)]
+    pub(super) fn windows(&self) -> Vec<WindowId> {
+        self.open.iter().map(|o| o.win).collect()
+    }
+
     pub(super) fn close_all(&mut self, gui: &mut Gui) {
         for o in self.open.drain(..) {
             gui.close_window(o.win);

@@ -18,6 +18,7 @@ impl Play {
         }
         let mut i = Interact::new(self.zone.char_id, self.size);
         i.set_client_dir(self.dir.clone());
+        i.ptrade.set_texts(self.text.by_key(10000, "MsgBox_Yes").unwrap_or_default(), self.text.by_key(10000, "MsgBox_No").unwrap_or_default());
         self.interact = Some(i);
     }
 
@@ -47,11 +48,17 @@ impl Play {
             }
         }
         i.show_confirms(&mut self.gui, &self.text, &self.zone);
+        for key in i.ptrade.take_feedback() {
+            if let Some(c) = self.chat.as_mut() {
+                c.feedback(&mut self.gui, key, &self.text);
+            }
+        }
         for f in i.take_outbox() {
             if let Some(s) = &self.session {
                 s.send_zone(f);
             }
         }
+        self.interact_ptrade_frame();
     }
 
     /// A plain left click that selected character `id`: the second one on the same dynel within [`ao_gui::DOUBLE_CLICK_TIME`] is a double click,

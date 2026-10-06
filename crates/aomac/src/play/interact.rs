@@ -7,6 +7,7 @@
 
 use super::interact_chat::{ChatOut, NpcChat};
 use super::interact_grid::GridUi;
+use super::interact_ptrade::PTradeUi;
 use super::interact_use::UseUi;
 use super::zone::Zone;
 use ao_gui::{Event, Gui};
@@ -37,6 +38,8 @@ pub struct Interact {
     grid: GridUi,
     /// Object use: the confirmation dialog, the loot windows, refusals the chat shows (`interact_use.rs`).
     pub(super) use_ui: UseUi,
+    /// The player-to-player trade (`interact_ptrade.rs`).
+    pub(super) ptrade: PTradeUi,
     outbox: Vec<Frame>,
     /// Text of `KnubotCloseChatWindow` for the chat window ([INFERENCE]: the `+0xf0` slot's consumer was not located; the live server sends the reason, e.g. "You are too far away from <npc> to continue this conversation.").
     notices: Vec<String>,
@@ -80,6 +83,7 @@ impl Interact {
     /// The zone changes or the connection ends: the dialogue window goes away without a word to the server.
     pub fn close_all(&mut self, gui: &mut Gui) {
         self.use_ui.close_all(gui);
+        self.ptrade.close_all(gui);
         self.grid.close_all(gui);
         if let Some(c) = self.chat.take() {
             c.close(gui);
@@ -112,6 +116,8 @@ impl Interact {
                 }
             }
             N3::Knubot(k) => self.on_knubot(gui, k, zone),
+            N3::Trade(t) => self.on_trade(gui, t, who, zone),
+            N3::Inventory(m) => self.ptrade_inventory(&m),
             N3::Grid(Grid::DestinationSelect { destinations, token }) => self.grid.activate(gui, self.screen, zone, who, destinations, token),
             _ => {}
         }
@@ -165,6 +171,9 @@ impl Interact {
         let me = self.own_id();
         if let Some(out) = self.use_ui.event(gui, ev) {
             self.use_out(zone, out);
+            return true;
+        }
+        if self.ptrade_event(gui, ev, zone) {
             return true;
         }
         if let Some(out) = self.grid.event(gui, ev, me) {
@@ -239,6 +248,8 @@ pub enum Action {
     Get,
     /// `GenericCmd_t` 3 sent (`N3Msg_UseItem`): `Can` bit 3, or the confirmation was answered Yes.
     Use,
+    /// `TradeIIR_t` op 0 sent (`N3Msg_TradeStart`): a character that is not talkable.
+    Trade,
     /// `Can` bit 4: the "UseItem" confirmation dialog is asked for (`GuiSystem_c::ConfirmUseItemDialogue`).
     Confirm,
     /// Refused with the `Feedback_*` text of the key (chat category 110).

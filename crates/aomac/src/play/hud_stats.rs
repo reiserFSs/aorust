@@ -120,6 +120,9 @@ struct Inventory {
     pending_drop: Option<(usize, usize)>,
 }
 
+/// Name and icon (picture, width, height) of an item template.
+pub(in crate::play) type ItemInfo = (String, Option<(ao_gui::GfxId, u32, u32)>);
+
 pub(super) struct HudStats {
     db: TextDb,
     model: Model,
@@ -227,7 +230,6 @@ impl HudStats {
     }
 
     /// Inventory items dropped over a foreign window since the last call: `(slot, x, y)` (the NPC trade window takes them).
-    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
     pub(in crate::play) fn take_drops(&mut self) -> Vec<(u32, f32, f32)> {
         std::mem::take(&mut self.dnd.dropped)
     }
@@ -238,8 +240,7 @@ impl HudStats {
     }
 
     /// Name and icon of the item template `low_id` (`items.rs` cache).
-    #[allow(dead_code)] // consumed by interact_trade.rs / interact_ptrade.rs
-    pub(in crate::play) fn item_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<(String, Option<(ao_gui::GfxId, u32, u32)>)> {
+    pub(in crate::play) fn item_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<ItemInfo> {
         self.items.info(gui, low_id).map(|i| (i.name.clone(), i.icon))
     }
 

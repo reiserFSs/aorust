@@ -237,3 +237,76 @@ the move. The title is the corpse's name from `CorpseFullUpdateIIR_t`'s name blo
 list / grid mode switch (`InventoryViewMode`) and the scrollbar of the container view; (d) the identity kind of chest (0xC749) items; (e) team loot (`Feedback_TeamLoot*`, "Random Looter" / "Looter" columns of
 `FUN_100ca2d3`) and the "take all" (none found in the view); (f) the window closing message: the original's close path (`SlotContainerClosed`, `GlobalSignals +0x88`, emitted by `FUN_100117f6`
 from the bank / reclaim / ... activations) was not traced for corpses, nothing is sent when our window is closed; (g) the look of the window was not compared with a retail screenshot.
+
+## 10. Player trade (`TradeIIR_t`, `TradeView_c`)
+
+Code: `crates/ao-net/src/n3/trade.rs` (codec), `crates/aomac/src/play/interact_ptrade.rs` (window + state). Tests: `n3::trade::tests` (key hash, wire bytes of every client message,
+round trips, truncation, bad version / op), `play::interact_ptrade::tests` (default action rules, window layout, op handlers, frames sent by every button, drag & drop, a screenshot with
+`AOMAC_SHOT_DIR`). Harness: `Interact::ptrade_dump(&gui)` (cfg(test)), `Interact::trade_action(&zone, id)`.
+
+### 10.1 The message (`TradeIIR_t`, key `36284F6E` = `MapToKey("TradeIIR_t")`)
+
+[CODE] One `n3InfoItemRemote_t` subclass (ctor `FUN_1007a733` [GC], vftable 0x101616e8) for everything. Wire: N3 header (target = the character the state belongs to; for everything
+the client sends, the own character), **flag byte 0** (`this[0xc] = 0` after the ctor), `i32 2` (`DAT_101c069c`; read `FUN_1007a60b` rejects any other value), `i8 op`, `Identity a` (`+0x1c`),
+`Identity b` (`+0x24`); an op `> 10` (unsigned) fails the read; write `FUN_1007a674`. `Activate` (`FUN_1007a6b6`) takes the header's dynel: a `SimpleChar_t` gets `FUN_100587c7` (lazily creates its
+`Trade_c`, `FUN_1006618c`, at `SimpleChar+0x1c8`) and `FUN_100674ab(op, a, b)`; a `VendingMachine_t` goes to the shop path (`FUN_1009a23c`, **not ported**).
+
+| op | client sender [GC] | `a` / `b` | received (`FUN_100674ab` case) |
+|---|---|---|---|
+| 0 start | `N3Msg_TradeStart` 0x100190e0 | partner / 0 | `FUN_100663e4`: only for the client character; open trade or `Feedback_YouAreAlreadyInATrade`; `GlobalSignals +0xd4 (type, own, a, b)`, type 0 when `b` is zero (player trade), else 1 / 2 (shops, vending) |
+| 1 accept | `N3Msg_TradeAccept` 0x10015bfd | 0 / 0 | `FUN_10066598`: client character only, `+0xe0(1)` + `+0x70` |
+| 2 abort | `N3Msg_TradeAbort(flag)` 0x10015ccf | `{0, flag}` / 0 | `FUN_100666a3`: clears the state, `Feedback_TradeCancelled` when `flag` (`a.instance`) and the owner is the client character, `+0x70`, `+0xe4(0)`, then the same for the partner's state with flag 1 |
+| 3 confirm | `N3Msg_TradeConfirm` 0x10015c66 | 0 / 0 | `FUN_100673a0`: client character only, `+0xe8` |
+| 4 complete | - | - | `FUN_100668d1`: `+0xe4(1)`, the items of the trade containers change hands in the client's inventory model (`FUN_1002ada2`, `FUN_1002abc0`), `+0x70` |
+| 5 add item | `N3Msg_TradeAddItem` 0x100191f6 | character / item `{0x68, bag slot}` | `FUN_10066cf7`: `+0xd8` |
+| 6 remove item | `N3Msg_TradeRemoveItem` 0x1001721c | character / item | `FUN_10066faf`: `+0xd8` |
+| 7 cash | `N3Msg_TradeSetCash` 0x10015dbc | `{0, cash}` / 0 | `FUN_100672c7`: `cash >= 0`; `+0xdc(cash)` only when the header is the partner of the client character |
+| 8, 9 | - | - | vending machine items (`FUN_10067109`, `FUN_100671e8`), not ported |
+| 10 | - | - | `FUN_1006741b`: client character only, `+0xe0(0)` (accepted state reset) |
+
+`N3Msg_TradeStart` also checks (before sending): the target is a `SimpleChar_t` whose stat `0x184` (`TowerType`) is 0, `FUN_10059ca0` (bounding-sphere distance `<= _DAT_101574fc` = **5.0 m**, dungeon
+door test), else `Feedback_TargetOutsideRangeForTrade`; afterwards the local event `0x19` is posted (`FUN_10012a1e`, no network effect found). `N3Msg_TradeRemoveItem` of the own container
+refuses with `Feedback_NoRoomInInventory` when the bag has no free slot (`FUN_1002a1b0(0x40) == -1`). `N3Msg_TradeAddItem` refuses by item flags (`vtable+0x14` of the item, with `Feedback_*` texts whose keys the
+decompile hides): **not ported** [UNRESOLVED].
+
+### 10.2 Default action
+
+`N3Msg_DefaultActionOnDynel` [GC 0x100291da] on a character that is not talkable (stat `0x300` bit 0), the own character not fighting (`controller+0x44 == 1`): `Interact::trade_action`. The fight state is
+`Zone::fight_target` (the relayed `AttackIIR_t` / `StopFightIIR_t` model). The bounding sphere radius of the characters is per model and not known: [GUESS] 0.5 m each (the body collision default), i.e.
+the centres may be 6.0 m apart. The `TowerType` of the target is not tracked (assumed 0). `Feedback_TargetOutsideRangeForTrade` goes to the chat.
+
+### 10.3 The window (`TradeView_c`, GUI.dll 0x100e092f; `PlayerTrade` of `Views/TradeGUI.xml`)
+
+[CODE] `InventoryGUIModule_c::SlotStartTrade` [GUI 0x100c6ff4] (signal `+0xd4`): an ignored partner (`IgnoreSystem_t`) -> `N3Msg_TradeAbort(false)`; else an existing trade view is deleted and
+`TradeView_c(type, own, partner, b)` is built (`+0x1a4` mode 0 `PlayerTrade`, `+0x1c8` partner, `+0x1d0` own). The view is a `DockableView_c` titled "Trade", preferred `Rect(0, 0, 119.0, 452.0)`
+(`_DAT_101bfa98/9c`), docked into `RollupArea` (`FUN_10038c98`). Built from the XML: `PartnerName` (`ScrollingTextView`, text = the partner's name), "Bought Items" (the partner's items), `PartnerInventoryDock`,
+"Credits" + `PartnerCashView` (read-only, "0", green `0x44dd44`), "Sold Items", `OurInventoryDock`, "Credits" + `OurCashView` (editable, green), `AcceptButton`, `DeclineButton`, `PartnerStatusDock`
+(a `BitmapView_c` with gfx `0x15b` `GFX_GUI_RED_LIGHT` and `0xd9` `GFX_GUI_GREEN_LIGHT`: index 0 / 1). The docks hold `MultiListView_c`s (`FUN_100cdb3a`), view cell counts `(1, 1)..(1000, ..)`, vertical scrollbar.
+
+| signal | slot | effect |
+|---|---|---|
+| `+0xd8` | `FUN_100dfbf3` | cost display (shop mode only; the lists repaint) |
+| `+0xdc (cash)` | `FUN_100dfe5e` | `PartnerCashView` = `String::FormatNumeric(cash)` |
+| `+0xe0 (b)` | `FUN_100df971` | 1: own cash field read-only and formatted, status light green; 0: editable again, light red, Accept enabled, `TradeDoubleConfirmDlg` closed |
+| `+0xe4 (b)` | `InventoryGUIModule_c::SlotTradeCompleted` [GUI 0x100c6bc6] | the trade view is deleted |
+| `+0xe8` | `FUN_100e066c` | `DialogBox_c` "Trade" (name `TradeDoubleConfirmDlg`) with the literal text "Are you sure you want to complete this trade?"; its result `FUN_100df843`: button 0 = `TradeAccept`, 1 = `FUN_100df810` = `TradeAbort(true)` |
+
+Buttons / input: Accept `FUN_100dfd33` = (pending cash sent first) the field is shown formatted, Accept disabled, light green, **`N3Msg_TradeConfirm`** (`N3Msg_TradeAccept` in shop mode); Decline `FUN_100df810` = `TradeAbort(true)`;
+the own cash field: each edit starts an `EventTimer_c` (`FUN_100df82d`: `Start(0xf4240, 0, 1)`), when it fires `FUN_100df942` sends `TradeSetCash(atol(text))`; Esc = decline when the option `esc_trades`
+(`LoginPrefs.xml`: true) is set; a drag object of mime `inventory/item` without `split_count` dropped on the own list = `TradeAddItem(own, item)` (`FUN_100df870`); item double click on the own list =
+`TradeRemoveItem(own, item)` (`FUN_100df67e`); partner list items open the item info page (`itemid://%d/%d`, `FUN_100df73e`, **not ported**).
+
+**Ported:** all of the above in `interact_ptrade.rs`; the inventory drag comes from `HudStats::take_drops` (an inventory item released over a window); lists: items of the own side show the
+template read from the inventory when the server adds them; the status light; formatted cash (`hud::group`: ',' [INFERENCE]); the confirmation box is `hud_dialog::Dialogs` (title "Trade" is not shown).
+**GUI engine:** `ScrollingTextView` is built as a `TextView` (no marquee scrolling).
+
+### 10.4 Unresolved
+
+* [UNRESOLVED] **What the PRK server sends.** The handlers are the original's, keyed on the header identity (the character the state belongs to): our op 0 reply is expected with the own character as header and
+  `a` = the partner; the partner's cash with the partner as header. Not seen live yet (no second account); if the server uses other headers, only `Interact::on_trade` changes.
+* [UNRESOLVED] How the partner's item templates reach the client: op 5 carries only an item identity of the *partner's* bag. We show the template when an `InventoryUpdateIIR_t` with the partner's identity
+  arrives ([INFERENCE], `Interact::ptrade_inventory`), else an empty slot.
+* [UNRESOLVED] Op 4 (complete): the original moves the traded items between the inventories itself; we leave `Zone::inventory` to the server's own inventory messages.
+* [UNRESOLVED] Docking: the window is free (left of the rollup column, 192 px wide = the dock's width) instead of a `RollupArea` page; its close button declines. List geometry (3 columns of 54 px slots, `(1,1)..(1000,..)` cell counts
+  not mapped), the "Credits" label colour (the engine's `TextView` default), the 1 s timer unit (µs [INFERENCE]), digits-only cash field (feature flag `0x2000` of `FUN_100e039a` not decoded), `Feedback_*`
+  refusals of `N3Msg_TradeAddItem`, item info page, `TowerType` of the target and the characters' sphere radii.
