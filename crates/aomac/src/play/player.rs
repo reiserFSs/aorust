@@ -104,14 +104,6 @@ impl Player {
         self.serial
     }
 
-    pub fn pos(&self) -> [f32; 3] {
-        self.movement.pos()
-    }
-
-    pub fn yaw(&self) -> f32 {
-        self.movement.yaw()
-    }
-
     /// Movement FSM mode (`FUN_100704e6`; 4 = swimming).
     pub fn mode(&self) -> u32 {
         u32::from(self.movement.fsm().mode)
@@ -202,7 +194,7 @@ impl Player {
         self.clock += dt;
         self.controls.set_text_input(text_input);
         host.look = self.controls.mouse_capture();
-        let s = |id| zone.stat(id).map(|v| v as i32);
+        let s = |id| zone.stat(id);
         self.movement.set_stats(|st| {
             // stat ids: RunSpeed 0x9C, Health 0x1B, Life 1, TurnSpeed 0x10B, Strength 0x10, Agility 0x11, Features 0xE0, ...
             for (field, id) in [

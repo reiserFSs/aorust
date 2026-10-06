@@ -43,6 +43,7 @@ impl AvatarPose {
 /// Reference speed `Vehicle_t+0x170` of a movement mode (`FUN_1006f4a2` @Gamecode: `FUN_100704e6` = mode, `FUN_100704ee` =
 /// sub-mode): mode 3 with sub-mode 2 and mode 4 -> 3.0 (`_DAT_1015d69c`), mode 7 -> 7.0, mode 3 otherwise -> 5.0
 /// (`_DAT_101574fc`), every other mode -> 1.5 (`_DAT_1015d76c`); mode 5 leaves the previous value (`None`).
+#[cfg(test)]
 pub fn ref_speed(mode: u32, sub_mode: u32) -> Option<f32> {
     match (mode, sub_mode) {
         (5, _) => None,
@@ -59,7 +60,7 @@ pub fn ref_speed(mode: u32, sub_mode: u32) -> Option<f32> {
 pub fn anim_rate(calibration: f32, monster_scale_pct: f32, speed: f32, ref_speed: f32, forced: bool) -> f32 {
     let body = if monster_scale_pct == 0.0 { 1.0 } else { 100.0 / monster_scale_pct };
     let mut r = calibration * body * (speed / ref_speed);
-    if !(r > 0.0) {
+    if r.is_nan() || r <= 0.0 {
         return 1.0;
     }
     if !forced && r > 1.3 && speed > 4.0 {
@@ -205,7 +206,7 @@ pub struct Avatar {
 impl Avatar {
     /// Builds the rig from the own dynel's update. `id` is the dynel instance id (`ActorFrame::id`).
     pub fn new(store: &RecordStore, client_dir: &Path, id: u32, u: &SimpleCharFullUpdate) -> Result<Self> {
-        let mut assets = ActorAssets::new(store)?;
+        let assets = ActorAssets::new(store)?;
         let (breed, gender) = wire_breed_sex(u.breed as i32, u.sex as i32)?;
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
@@ -219,10 +220,6 @@ impl Avatar {
     /// The model for `Host::actor_models` (key [`MODEL_KEY`]).
     pub fn model(&self) -> &Scene {
         self.rig.model()
-    }
-
-    pub fn rig(&self) -> &ActorRig {
-        &self.rig
     }
 
     /// Switches the clip when the role changes; a change between locomotion clips keeps the gait phase, any other restarts.
@@ -253,10 +250,6 @@ impl Avatar {
         self.rate = anim_rate(self.calibration.get(self.rig.model_id, self.clip_id), self.scale * 100.0, pose.speed, pose.ref_speed, false);
         self.pose = pose;
         Ok(())
-    }
-
-    pub fn pose(&self) -> &AvatarPose {
-        &self.pose
     }
 
     /// Whether a one-shot clip (jump) has played to its end.
