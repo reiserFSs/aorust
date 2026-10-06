@@ -27,10 +27,25 @@ pub struct Prefs {
 
 /// aomac's prefs directory (stand-in for the client's `prefs/`; also holds `CharacterViewer.xml`).
 pub fn dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(d) = TEST_DIR.with(|t| t.borrow().clone()) {
+        return Some(d);
+    }
     if let Some(d) = std::env::var_os("AOMAC_PREFS_DIR") {
         return Some(d.into()); // tests / scratch runs
     }
     Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/aomac"))
+}
+
+#[cfg(test)]
+thread_local! { static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) }; }
+
+/// Test scratch dir: per test thread (tests run in parallel; the process-wide env var alone races), the env var stays for helper threads.
+#[cfg(test)]
+pub fn set_test_dir(d: impl Into<PathBuf>) {
+    let d = d.into();
+    std::env::set_var("AOMAC_PREFS_DIR", &d);
+    TEST_DIR.with(|t| *t.borrow_mut() = Some(d));
 }
 
 fn path() -> Option<PathBuf> {

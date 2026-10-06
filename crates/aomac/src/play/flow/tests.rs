@@ -18,7 +18,7 @@ fn rig() -> Option<Rig> {
         return None;
     }
     let scratch = std::env::temp_dir().join(format!("aomac-play-test-{}", std::process::id()));
-    std::env::set_var("AOMAC_PREFS_DIR", &scratch);
+    crate::play::prefs::set_test_dir(&scratch);
     let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = l.local_addr().unwrap().port();
     let mut p = Play::new(dir, None, None, None).unwrap();

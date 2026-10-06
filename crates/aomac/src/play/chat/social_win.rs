@@ -714,7 +714,7 @@ mod tests {
         if !client.join("cd_image/gui").exists() {
             return None;
         }
-        std::env::set_var("AOMAC_PREFS_DIR", std::env::temp_dir().join("aomac-social-test-prefs"));
+        crate::play::prefs::set_test_dir(std::env::temp_dir().join("aomac-social-test-prefs"));
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("aomac-social-test-prefs"));
         let labels = TextDb::load(&client).ok()?;
         let db = TextDb::load(&client).ok()?;

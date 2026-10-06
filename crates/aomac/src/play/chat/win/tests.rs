@@ -99,7 +99,7 @@ fn test_dir() -> PathBuf {
 
 fn open_in(gui: &mut Gui, dir: &Path, screen: (u32, u32)) -> ChatWindows {
     let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("AOMAC_PREFS_DIR", dir);
+    crate::play::prefs::set_test_dir(dir);
     ChatWindows::new(gui, screen).unwrap()
 }
 
@@ -204,7 +204,7 @@ fn chat_win_shot() {
     if !client.join("cd_image/gui").exists() {
         return eprintln!("skipping: no client");
     }
-    std::env::set_var("AOMAC_PREFS_DIR", std::env::temp_dir().join("aomac-chatgui-shot-prefs"));
+    crate::play::prefs::set_test_dir(std::env::temp_dir().join("aomac-chatgui-shot-prefs"));
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join("aomac-chatgui-shot-prefs"));
     let labels = TextDb::load(&client).unwrap();
     let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
