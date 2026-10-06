@@ -227,6 +227,16 @@ fn live_walk() {
             }
             "goto" => {
                 // autopilot along a collision route: W/S/C/Z by the offset to the next waypoint (the heading stays put)
+                // `goto=<instance>` walks to the dynel (2 m short of it is close enough: the route ends on its cell)
+                let resolved;
+                let v = match v.parse::<i32>() {
+                    Ok(id) => {
+                        let d = &l.p.zone.dynels[&id];
+                        resolved = format!("{}:{}", d.pos[0], d.pos[2]);
+                        resolved.as_str()
+                    }
+                    Err(_) => v,
+                };
                 let (x, z) = v.split_once(':').unwrap();
                 let col = ao_formats::playfield::collision::Collision::load(&ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap(), l.p.zone.playfield.unwrap()).unwrap();
                 let path = route(&col, l.p.zone.own().unwrap().pos, (x.parse().unwrap(), z.parse().unwrap()));

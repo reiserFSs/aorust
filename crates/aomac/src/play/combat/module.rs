@@ -71,6 +71,25 @@ pub struct Module {
     pose_events: Vec<ActionEvent>,
 }
 
+/// `Feedback_*` texts of the server's attack refusal (`CharacterAction` 0x76, `FUN_1005d0d8` case 0x23 @ 0x1005d92b): the jump table at
+/// 0x1005f0e7 maps `identity_a.instance` 1..=14 to these strings (read from the table, in this order).
+const ATTACK_REFUSED: [&str; 14] = [
+    "Feedback_CombatIsNotPossibleInThisDistrict",
+    "Feedback_AttackNotAllowedSinceYouAreOnSameSide",
+    "Feedback_YouCannotAttackThisPlayerTooFarAwayInLevel",
+    "Feedback_YouCannotAttackYourPet",
+    "Feedback_NotAllowedToAttackTeamMembers",
+    "Feedback_PvpNotAllowedInThisDistrict",
+    "Feedback_PvpNotAllowedSinceYouAreNeutral",
+    "Feedback_PvpNotAllowedSinceYourTeamIsNeutral",
+    "Feedback_CantAttackTargetIsInPvpGrace",
+    "Feedback_DefenseShieldEnabled",
+    "Feedback_YouCannotAttackThisTowerTooFarAwayInLevel",
+    "Feedback_CantAttackTargetYouAreInMixedTeam",
+    "Feedback_TowersCanOnlyBeAttackedWhenGaslevelBelow75",
+    "Feedback_CantAttackTargetYouAreInMixedTeamBattlestation",
+];
+
 struct NoTexts;
 impl super::log::Texts for NoTexts {
     fn feedback(&self, _: &str) -> Option<String> {
@@ -113,12 +132,9 @@ impl Module {
         }
     }
 
-    pub fn combat(&self) -> &Combat {
+    #[cfg(test)]
+    fn combat(&self) -> &Combat {
         &self.combat
-    }
-
-    pub fn actions(&self) -> &Actions {
-        &self.actions
     }
 
     /// The own character is in a fight (`N3Msg_IsAttacking`).
@@ -170,8 +186,20 @@ impl Module {
     pub fn on_frame(&mut self, f: &Frame) {
         if let Ok(m) = ao_net::n3::decode(f) {
             if let ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(a)) = &m.body {
-                if m.header.target.instance == self.own && a.action == super::state::ACTION_DIE {
-                    self.death_anim = Some(a.identity_b.instance as u16);
+                if m.header.target.instance == self.own {
+                    match a.action {
+                        super::state::ACTION_DIE => self.death_anim = Some(a.identity_b.instance as u16),
+                        // `FUN_1005d0d8` case 0x31 (action 0x93): "starting the attack failed", clears the `+0x79` guard
+                        0x93 => self.feedback.extend(self.gate.on_format_feedback(0x31)),
+                        // action 0x76: the server refused the attack; `identity_a.instance` selects the text (jump table 0x1005f0e7)
+                        0x76 => {
+                            self.gate.pending = false;
+                            if let Some(k) = usize::try_from(a.identity_a.instance - 1).ok().and_then(|i| ATTACK_REFUSED.get(i)) {
+                                self.feedback.push(k);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -188,11 +216,7 @@ impl Module {
                     // FUN_10069c68 cleared the controller's +0x79 guard after CanAttack(report = 0) passed
                     self.gate.on_attack_applied(true);
                 }
-                CombatEvent::Died { dynel, .. } if *dynel == self.own => {
-                    if self.dying.is_none() {
-                        self.dying = Some(Dying::new(0, true));
-                    }
-                }
+                CombatEvent::Died { dynel, .. } if *dynel == self.own && self.dying.is_none() => self.dying = Some(Dying::new(0, true)),
                 _ => {}
             }
             self.events.push(e);
@@ -466,6 +490,21 @@ mod tests {
         assert_eq!(m.assist(&z), Err("Feedback_NoTargetToAssist"));
         z.target = Some(OWN as i32);
         assert_eq!(m.assist(&z), Err("Feedback_CantAssistYourself"));
+    }
+
+    /// The live refusal of an attack on a Surf Lizard (`CharacterAction` 0x93 then 0x76 with instance 6): texts, gate cleared.
+    #[test]
+    fn server_refusal_prints_text_and_clears_the_gate() {
+        let (mut m, z, _) = primed();
+        m.command(Command::Attack, &z, 2);
+        m.take_outbox();
+        let own = Identity { kind: DYNEL_CHAR, instance: OWN as i32 };
+        let mk = |act: i32, a: Identity| n3_frame(0, OWN, action::character_action_for(own, &ao_net::n3::world::CharacterAction { action: act, param: 0, identity_a: a, identity_b: Identity::default(), text: String::new() }));
+        m.on_frame(&mk(0x93, Identity::default()));
+        m.on_frame(&mk(0x76, Identity { kind: 0, instance: 6 }));
+        assert_eq!(m.take_feedback(), vec!["Feedback_StartingAttackFailed", "Feedback_PvpNotAllowedInThisDistrict"]);
+        m.command(Command::Attack, &z, 2);
+        assert_eq!(sent(&mut m).len(), 1, "the guard is clear again");
     }
 
     #[test]

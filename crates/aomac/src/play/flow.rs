@@ -831,6 +831,10 @@ impl Frontend for Play {
         }
         if let Some(h) = self.hud.as_mut() {
             h.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default());
+            // TAB cycles the target (`COMMAND_NEXT_HOSTILE_TARGET`, only outside text input): it must not also move the GUI focus into the chat input
+            if matches!(ev, InputEvent::Key { key: Key::Tab, .. }) && self.screen == Screen::InWorld && !self.gui.text_focused() {
+                return;
+            }
         }
         for e in self.gui.input(ev) {
             if self.chat.as_mut().is_some_and(|c| c.event(&mut self.gui, &e, &self.zone, &self.text)) {
