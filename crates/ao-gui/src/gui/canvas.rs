@@ -28,6 +28,15 @@ impl Gui {
         }
     }
 
+    /// Updates `View::SetMinPreferredSize` / `SetMaxPreferredSize` and propagates the layout change.
+    pub fn set_view_pref_size(&mut self, w: WindowId, name: &str, min: (f32, f32), max: (f32, f32)) {
+        if let Some(v) = self.find(w, name) {
+            self.tree.views[v].min_size = Point::new(min.0, min.1);
+            self.tree.views[v].max_size = Point::new(max.0, max.1);
+            self.relayout_window(w);
+        }
+    }
+
     /// Tooltips over rectangles of the `CanvasView` called `name` (replaces the previous ones); texts follow `View::SetToolTip`.
     pub fn set_canvas_tips(&mut self, w: WindowId, name: &str, tips: Vec<CanvasTip>) {
         if let Some(v) = self.find(w, name) {

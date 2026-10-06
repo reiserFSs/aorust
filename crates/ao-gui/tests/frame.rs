@@ -25,6 +25,35 @@ fn framed(g: &mut Gui, pos: (i32, i32), size: (u32, u32)) -> usize {
 }
 
 #[test]
+fn framed_root_text_right_click_captures_before_context_dispatch() {
+    let Some(mut g) = gui() else { return };
+    // ChatView is a root TextView: unlike child content it must not rely on covers().
+    let xml = r#"<root><TextView name="chat" font="CHAT" max_size="Point(16000,16000)" feature_flags="TVF_WORD_WRAP|TVF_MULTILINE|TVF_DISABLE_RC_MENU"/></root>"#;
+    let w = g.open_tabbed_window_xml("chat", "Chat", xml, (314, 187), WindowSize::Fixed(430, 203)).unwrap();
+    g.set_window_context(w, true);
+    for (x, y) in [(596.0, 384.0), (315.0, 419.0)] {
+        g.input(InputEvent::MouseMove { x, y });
+        assert!(g.wants_mouse(x, y), "capture must precede Play's world mouse routing");
+        let events = g.input(InputEvent::MouseDown { x, y, button: MouseButton::Right });
+        assert!(events.iter().any(|e| matches!(e, Event::ContextMenu { window, .. } if *window == w)));
+        g.input(InputEvent::MouseUp { x, y, button: MouseButton::Right });
+        assert!(g.wants_mouse(x, y));
+    }
+    assert!(!g.wants_mouse(800.0, 500.0));
+    assert!(g.wants_mouse(344.0, 197.0), "title frame also captures world input");
+    g.set_window_frame(w, true, true);
+    press(&mut g, 344.0, 197.0);
+    assert!(g.wants_mouse(1000.0, 700.0), "frame drag keeps capture outside its rectangle");
+    release(&mut g, 1000.0, 700.0);
+    assert!(!g.wants_mouse(1000.0, 700.0));
+    g.set_window_visible(w, false);
+    assert!(!g.wants_mouse(596.0, 384.0));
+    // Empty borderless roots remain transparent to world input.
+    g.open_window_xml("overlay", "<root><View/></root>", (0, 0), WindowSize::Fixed(1280, 800)).unwrap();
+    assert!(!g.wants_mouse(596.0, 384.0));
+}
+
+#[test]
 fn drag_the_strip_moves_and_resizing_clamps() {
     let Some(mut g) = gui() else { return };
     let w = framed(&mut g, (100, 100), (300, 150));

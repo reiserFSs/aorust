@@ -900,7 +900,8 @@ fn build_multi(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> ViewId {
     header.max_size = Point::new(16000.0, MULTI_HEADER_H);
     let header_id = tree.add(header);
 
-    let mut sv = View::new(Kind::ScrollView(ScrollData { v_mode: ScrollMode::Auto, h_mode: ScrollMode::Auto, offset: Point::default() }));
+    let mode = |key| if e.attr(key).is_some() { scroll_mode(e, key) } else { ScrollMode::Auto };
+    let mut sv = View::new(Kind::ScrollView(ScrollData { v_mode: mode("v_scrollbar_mode"), h_mode: mode("h_scrollbar_mode"), offset: Point::default() }));
     sv.node = Node::Base;
     sv.max_size = Point::new(16000.0, 16000.0);
     let sv_id = tree.add(sv);

@@ -174,6 +174,32 @@ fn multi_list_sorts_by_header_selects_and_resizes() {
 }
 
 #[test]
+fn multi_image_cells_scroll_with_original_wide_columns() {
+    let Some((mut g, w)) = rig() else { return };
+    let icon = g.add_image("list-icon", vec![255; 48 * 48 * 4], 48, 48, true);
+    for (id, label, width) in [(0, "", 16.0), (1, "Name", 200.0), (2, "Count", 30.0), (3, "Price", 100.0), (4, "Quality", 100.0)] {
+        g.multi_add_column(w, "ml", id, label, width, if id == 0 { 0 } else { 14 });
+    }
+    g.multi_add_row(w, "ml", 1, vec![MultiCell::image(icon), MultiCell::text("Item"), MultiCell::num(1), MultiCell::num(20), MultiCell::num(5)], true);
+    let r = g.view_rect(w, "ml").unwrap();
+    let before = g.frame(0.0);
+    let image = |cmds: &[ao_gui::DrawCmd]| cmds.iter().find_map(|cmd| match cmd {
+        ao_gui::DrawCmd::Gfx { id, src, dst, .. } if *id == icon => Some((*src, *dst)),
+        _ => None,
+    }).unwrap();
+    let (src, dst) = image(&before.cmds);
+    assert_eq!(src, [0.0, 0.0, 48.0, 48.0]);
+    assert_eq!([dst[2] - dst[0], dst[3] - dst[1]], [16.0, 16.0]);
+    // The automatic horizontal bar sits at the bottom of the client. Its right arrow advances 13px.
+    click(&mut g, r.r - 4.0, r.b - 4.0);
+    let after = g.frame(0.0);
+    assert_eq!(image(&after.cmds).1[0], dst[0] - 13.0);
+    assert_eq!(g.multi_columns(w, "ml").iter().map(|c| c.1).collect::<Vec<_>>(), [16.0, 200.0, 30.0, 100.0, 100.0]);
+    // Content clips above the horizontal bar, not over its arrows/track.
+    assert!(before.cmds.iter().any(|cmd| matches!(cmd, ao_gui::DrawCmd::Clip(Some(c)) if c[1] as f32 > r.t && c[3] == (r.b - 10.0) as i32)));
+}
+
+#[test]
 fn rig_is_real() {
     // the other tests return early without a client: make sure they ran against one when it is installed
     if ao_gui::client_dir().join("cd_image/gui").exists() {

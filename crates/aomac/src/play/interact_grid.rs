@@ -96,8 +96,8 @@ impl GridUi {
         let (pf_rank, loc_rank) = (ranks(pf.iter().map(String::as_str)), ranks(self.entries.iter().map(|d| d.name.as_str())));
         for (i, d) in self.entries.iter().enumerate() {
             let cells = vec![
-                MultiCell { text: d.name.clone(), key: MultiKey::Num(pf_rank[pf[i].as_str()]) },
-                MultiCell { text: pf[i].clone(), key: MultiKey::Num(loc_rank[d.name.as_str()]) },
+                MultiCell { text: d.name.clone(), key: MultiKey::Num(pf_rank[pf[i].as_str()]), image: None },
+                MultiCell { text: pf[i].clone(), key: MultiKey::Num(loc_rank[d.name.as_str()]), image: None },
             ];
             gui.multi_add_row(win, "targets", i as i64, cells, true);
         }

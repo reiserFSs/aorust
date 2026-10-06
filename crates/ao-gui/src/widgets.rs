@@ -111,17 +111,22 @@ pub enum MultiKey {
 pub struct MultiCell {
     pub text: String,
     pub key: MultiKey,
+    /// Image content, independent of the column's sorting key.
+    pub image: Option<crate::gfx::GfxId>,
 }
 
 impl MultiCell {
     pub fn text(s: &str) -> Self {
-        MultiCell { text: s.into(), key: MultiKey::Text }
+        MultiCell { text: s.into(), key: MultiKey::Text, image: None }
     }
     pub fn num(n: i64) -> Self {
-        MultiCell { text: n.to_string(), key: MultiKey::Num(n) }
+        MultiCell { text: n.to_string(), key: MultiKey::Num(n), image: None }
     }
     pub fn unsorted(s: &str) -> Self {
-        MultiCell { text: s.into(), key: MultiKey::Equal }
+        MultiCell { text: s.into(), key: MultiKey::Equal, image: None }
+    }
+    pub fn image(id: crate::gfx::GfxId) -> Self {
+        MultiCell { text: String::new(), key: MultiKey::Equal, image: Some(id) }
     }
 }
 

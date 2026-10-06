@@ -32,12 +32,19 @@ fn tab_alpha(selected: bool, fade: f32) -> f32 {
 pub(super) struct WinFx {
     pub movable: bool,
     pub resizable: bool,
+    pub title_move: bool,
     pub context: bool,
     pub tabs: Vec<String>,
     pub sel: usize,
     /// Client size limits in pixels (`WndBorder::SetSizeLimits`); a max of 0 = unlimited.
     pub min: (u32, u32),
     pub max: (u32, u32),
+}
+
+pub(super) struct ViewTabs {
+    titles: Vec<String>,
+    widths: Vec<f32>,
+    selected: usize,
 }
 
 pub(super) struct FrameDrag {
@@ -155,6 +162,55 @@ pub fn insert_index(tabs: &[Rect], x: f32) -> usize {
 }
 
 impl Gui {
+    /// An in-view TabView strip (`TopBorderView::Layout` 0x1014725e):
+    /// equal-weight `SpaceOut`, bounded by padding / full title widths.
+    /// Returns the allocated pixel widths for the owner's tab hit areas.
+    pub fn set_view_tabs(&mut self, w: WindowId, name: &str, titles: &[String], selected: usize, width: u32) -> Vec<f32> {
+        let Some(v) = self.find(w,name) else { return vec![] };
+        let n = titles.len();
+        // Tab::CalculatePreferredSize(false) 0x10146217..101462aa
+        // measures just the first title character, not the full title.
+        let min: Vec<_> = titles.iter().map(|t| t.chars().next().map_or(0,|ch| self.fonts.font(FontId::Normal).advance(ch)) as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R).collect();
+        let max: Vec<_> = titles.iter().map(|t| self.tab_title_width(t) as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R).collect();
+        let mut widths = vec![0.0;n];
+        if n != 0 {
+            // TopBorderView default left margin 2 (float 0x101ae17c);
+            // neighbouring tabs overlap 6 px (double 0x101b36a8).
+            layout::space_out(n,width.saturating_sub(2) as f32 + n.saturating_sub(1) as f32 * 6.0,min.iter().sum(),1.0,&min,&max,None,&mut widths);
+            for (i,w) in widths.iter_mut().enumerate() { *w = (w.round()).clamp(min[i],max[i]); }
+        }
+        self.view_tabs.insert(v, ViewTabs { titles:titles.to_vec(), widths:widths.clone(), selected });
+        widths
+    }
+
+    pub fn select_view_tab(&mut self, w: WindowId, name: &str, selected: usize) {
+        if let Some(v) = self.find(w,name) {
+            if let Some(t) = self.view_tabs.get_mut(&v) { t.selected = selected; }
+        }
+    }
+
+    pub(super) fn draw_view_tabs(&mut self, out: &mut Vec<DrawCmd>, id: ViewId, rect: Rect, alpha: f32) {
+        let Some(tabs) = self.view_tabs.remove(&id) else { return };
+        let outer = out.iter().rev().find_map(|c| if let DrawCmd::Clip(c) = c { Some(*c) } else { None }).flatten();
+        let mut clip = [rect.l as i32,rect.t as i32,rect.r as i32+1,rect.b as i32+1];
+        if let Some(o) = outer { clip = [clip[0].max(o[0]),clip[1].max(o[1]),clip[2].min(o[2]),clip[3].min(o[3])]; }
+        clip[2] = clip[2].max(clip[0]);
+        clip[3] = clip[3].max(clip[1]);
+        out.push(DrawCmd::Clip(Some(clip)));
+        let tint = self.map_color(0x1000000);
+        for selected in [false, true] {
+            let mut x = rect.l + 2.0;
+            for (i,(title,width)) in tabs.titles.iter().zip(&tabs.widths).enumerate() {
+                if (i == tabs.selected) == selected {
+                    self.draw_tab(out,Rect::new(x,rect.t,x+width-1.0,rect.t+TAB_H-1.0),title,selected,tint,alpha);
+                }
+                x += width - 6.0;
+            }
+        }
+        out.push(DrawCmd::Clip(outer));
+        self.view_tabs.insert(id,tabs);
+    }
+
     /// A frame / tab drag is in progress or a popup menu is open (applications write pending settings once this is false).
     pub fn interacting(&self) -> bool {
         self.ix.frame_drag.is_some() || self.ix.tab_drag.is_some() || self.ix.menu.is_some()
@@ -222,7 +278,7 @@ impl Gui {
         self.resize_window(w, WindowSize::Fixed(cw, ch));
     }
 
-    fn outer_of(&self, w: WindowId) -> Option<Rect> {
+    pub(super) fn outer_of(&self, w: WindowId) -> Option<Rect> {
         let (x, y, ow, oh) = self.window_outer_frame(w)?;
         Some(Rect::new(x as f32, y as f32, (x + ow as i32 - 1) as f32, (y + oh as i32 - 1) as f32))
     }
@@ -263,10 +319,9 @@ impl Gui {
         let p = Point::new(x, y);
         let top_hit = self.hit(x, y).map(|h| h.0);
         for (wid, root, pos) in self.windows_top_down() {
-            if !self.is_tabbed(wid) {
-                // a window above (a framed one covering the point, or one with a widget under the pointer) hides the frames below
-                let covers = self.windows[wid].as_ref().is_some_and(|w| w.framed) && self.outer_of(wid).is_some_and(|o| x >= o.l && x < o.r + 1.0 && y >= o.t && y < o.b + 1.0);
-                if covers || top_hit == Some(wid) {
+            if !self.windows[wid].as_ref().is_some_and(|w| w.framed) {
+                // A frameless widget above hides frames below it.
+                if top_hit == Some(wid) {
                     return false;
                 }
                 continue;
@@ -276,14 +331,14 @@ impl Gui {
                 continue;
             }
             let fx = self.windows[wid].as_ref().map(|w| w.fx.clone()).unwrap_or_default();
-            if fx.movable {
+            if fx.movable && self.is_tabbed(wid) {
                 let icon = self.frame_buttons(root, pos, true).0;
                 if p.x >= icon.l && p.x <= icon.r + 1.0 && p.y >= icon.t && p.y <= icon.b + 1.0 {
                     self.events.push(Event::FrameIcon { window: wid, x: icon.l as i32, y: icon.b as i32 + 1 });
                     return true;
                 }
             }
-            let rects = self.tab_rects(wid);
+            let rects = if self.is_tabbed(wid) { self.tab_rects(wid) } else { vec![] };
             if let Some(i) = rects.iter().position(|r| r.contains(p)) {
                 if let Some(Some(win)) = self.windows.get_mut(wid) {
                     if !win.fx.tabs.is_empty() {
@@ -292,6 +347,11 @@ impl Gui {
                     }
                 }
                 self.events.push(Event::TabSelected { window: wid, index: i });
+                // DockWindow titles move the sole-tab frame; explicit chat tabs
+                // retain their independent tear-off gesture.
+                if (fx.tabs.is_empty() || fx.title_move && fx.tabs.len() == 1) && fx.movable {
+                    self.ix.frame_drag = Some(FrameDrag { window: wid, hit: 1, mouse0: p, start: o });
+                }
                 self.ix.tab_drag = Some(TabDrag { window: wid, tab: i, mouse0: p, moved: false });
                 return true;
             }
@@ -337,20 +397,21 @@ impl Gui {
             return;
         }
         let m = self.mouse;
-        let mut target = None;
+        let target = self.tab_drop_target(m.x,m.y);
+        self.events.push(Event::TabDropped { window: d.window, tab: d.tab, x: m.x as i32, y: m.y as i32, target });
+    }
+
+    /// TabView drop destination, shared by window tabs and RollupPage headers.
+    pub fn tab_drop_target(&mut self, x: f32, y: f32) -> Option<(WindowId,usize)> {
         for (wid, _, _) in self.windows_top_down() {
-            if !self.is_tabbed(wid) {
-                continue;
-            }
+            if !self.is_tabbed(wid) { continue; }
             let Some(o) = self.outer_of(wid) else { continue };
             let tv = o.resize(BORDER.0, BORDER.1, -BORDER.2, -BORDER.3);
-            if m.x >= tv.l && m.x <= tv.r + 1.0 && m.y >= tv.t && m.y < tv.t + TAB_H + 1.0 {
-                let rects = self.tab_rects(wid);
-                target = Some((wid, insert_index(&rects, m.x)));
-                break;
+            if x >= tv.l && x <= tv.r + 1.0 && y >= tv.t && y < tv.t + TAB_H + 1.0 {
+                return Some((wid,insert_index(&self.tab_rects(wid),x)));
             }
         }
-        self.events.push(Event::TabDropped { window: d.window, tab: d.tab, x: m.x as i32, y: m.y as i32, target });
+        None
     }
 
     /// Right press: [`Event::ContextMenu`] for the topmost window with the context flag whose frame / client contains the pointer.
@@ -407,10 +468,19 @@ impl Gui {
         // The title is a `TextView` (HTML subset): a `<font color=..>` run keeps its own colour, the rest uses the tab's text colour.
         let runs = self.tab_runs(title);
         let mut pen = (tab.l + TAB_PAD_L) as i32;
+        let outer = out.iter().rev().find_map(|c| if let DrawCmd::Clip(c) = c { Some(*c) } else { None }).flatten();
+        let mut clip = [(tab.l + TAB_PAD_L) as i32,tab.t as i32,(tab.r + 1.0 - TAB_PAD_R) as i32,tab.b as i32+1];
+        if let Some(o) = outer {
+            clip = [clip[0].max(o[0]),clip[1].max(o[1]),clip[2].min(o[2]),clip[3].min(o[3])];
+        }
+        clip[2] = clip[2].max(clip[0]);
+        clip[3] = clip[3].max(clip[1]);
+        out.push(DrawCmd::Clip(Some(clip)));
         for run in runs {
             let c = run.color.map_or(text, rgb);
             pen += self.draw_string(out, FontId::Normal, &run.text, pen, tab.t as i32, c, alpha, false);
         }
+        out.push(DrawCmd::Clip(outer));
     }
 
     /// Runs of a tab title (`FUN_100ab980` builds `name` + ` <font color=green>[group]</font>`; markup-free titles give one run).
@@ -489,4 +559,5 @@ mod tests {
         assert_eq!(insert_index(&tabs, 40.0), 1);
         assert_eq!(insert_index(&tabs, 90.0), 2);
     }
+
 }

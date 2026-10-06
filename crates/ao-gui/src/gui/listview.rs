@@ -778,6 +778,26 @@ impl Gui {
         self.multi_view(w, name).and_then(|v| self.multi_data(v)).map_or(vec![], |m| m.cols.iter().map(|c| (c.id, c.width, c.flags & 1 != 0)).collect())
     }
 
+    /// `MultiListView_c::LoadColumnInfo` (GUI 10136991): saved order, width and visibility bit only.
+    pub fn multi_restore_columns(&mut self, w: WindowId, name: &str, columns: &[(i32, f32, Option<bool>)]) {
+        let Some(v) = self.multi_view(w, name) else { return };
+        let Some(m) = self.multi_mut(v) else { return };
+        let mut next = 0;
+        for &(id, width, hidden) in columns {
+            let Some(from) = m.cols.iter().position(|c| c.id == id) else { continue };
+            if from < next { continue; }
+            m.cols[next..=from].rotate_right(1);
+            for row in &mut m.rows {
+                if row.cells.len() > from { row.cells[next..=from].rotate_right(1); }
+            }
+            let col = &mut m.cols[next];
+            col.width = width;
+            if let Some(hidden) = hidden { col.flags = (col.flags & !1) | u32::from(hidden); }
+            next += 1;
+        }
+        self.multi_layout(v);
+    }
+
     /// `MultiListViewItem_c::Select(selected, emit)` + `ItemSelectionStateChanged` 0x1013476a (needs the selection feature flags 0x40 / 0x80; single
     /// selection deselects the others without a signal).
     pub fn multi_select(&mut self, w: WindowId, name: &str, id: i64, selected: bool, emit: bool) {
@@ -1008,6 +1028,20 @@ impl Gui {
             }
             for (ci, x, cw) in &cols {
                 if let Some(c) = r.cells.get(*ci) {
+                    if let Some(id) = c.image {
+                        let (iw, ih) = if id.0 >= EXTRA_BASE {
+                            self.extras.get((id.0 - EXTRA_BASE) as usize).map_or((0, 0), |im| (im.w, im.h))
+                        } else {
+                            self.gfx.size(id)
+                        };
+                        if iw > 0 && ih > 0 {
+                            // InventoryListViewMultiColView_c::Layout (0x1003e3ee) fixes the icon
+                            // frame at Rect(0,0,15,15), independent of the resized column width.
+                            let size = ROW_H + 1.0;
+                            out.push(DrawCmd::Gfx { id, src: [0.0, 0.0, iw as f32, ih as f32],
+                                dst: [rect.l + x, y, rect.l + x + size, y + size], tint, alpha });
+                        }
+                    }
                     if c.text.contains('<') {
                         // the item's text view renders the HTML subset (`<font color=aqua>` keys, `<font color=red>NONE</font>` of the key-bindings page)
                         self.draw_markup(out, &c.text, (rect.l + x) as i32, y as i32, tint, alpha);

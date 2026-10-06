@@ -134,6 +134,7 @@ pub struct Gui {
     border_hover: Option<WindowId>,
     /// Frame drag / tab drag / popup menu / text selection state (`gui/{frame,popup,select}.rs`).
     ix: frame::Ix,
+    view_tabs: HashMap<ViewId, frame::ViewTabs>,
     /// State of the list widgets (`gui/listview.rs`, `gui/hscroll.rs`).
     wx: listview::Wx,
     /// Last mouse press on a `CanvasView` (view, button, time, position) for double-click detection.
@@ -210,6 +211,7 @@ impl Gui {
             border_hover: None,
             ix: Default::default(),
             wx: Default::default(),
+            view_tabs: HashMap::new(),
             canvas_press: None,
             items: Default::default(),
             extras: Vec::new(),
@@ -294,6 +296,24 @@ impl Gui {
             w.bd.pin = true;
             w.bd.fade = true;
         }
+    }
+
+    /// Reparents a dockable view between a rollup page and a DockWindow without
+    /// replacing its window/view handles. The outer origin and client size stay.
+    pub fn set_window_dock_frame(&mut self, id: WindowId, title: Option<&str>) {
+        let Some((x, y, _, _)) = self.window_outer_frame(id) else { return };
+        if let Some(Some(w)) = self.windows.get_mut(id) {
+            w.framed = title.is_some();
+            w.title = title.map(str::to_owned);
+            w.fx.tabs.clear();
+            w.fx.sel = 0;
+            w.fx.movable = title.is_some();
+            w.fx.resizable = title.is_some();
+            w.fx.title_move = title.is_some();
+            w.bd.pin = title.is_some();
+            w.bd.fade = title.is_some();
+        }
+        self.set_window_pos(id, (x, y));
     }
 
     /// Client insets (left, top, right, bottom) of the frame of a window.
@@ -414,6 +434,22 @@ impl Gui {
         self.items.insert(id);
         self.relayout_window(w);
         Ok(id)
+    }
+
+    /// Wraps an existing window root in view XML, retaining every old view
+    /// handle. Dock controllers use this to add a RollupPage header/body.
+    pub fn wrap_window_xml(&mut self, w: WindowId, src: &str, parent: &str) -> Result<()> {
+        let old = self.windows.get(w).and_then(Option::as_ref).ok_or_else(|| anyhow!("closed window"))?.root;
+        let e = xml::parse(src)?;
+        let e = e.children.first().ok_or_else(|| anyhow!("empty wrapper"))?;
+        let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
+        let root = build(&mut self.tree, &mut ctx, e).ok_or_else(|| anyhow!("cannot build wrapper"))?;
+        let p = self.tree.find(root, parent).ok_or_else(|| anyhow!("no wrapper parent {parent}"))?;
+        self.warnings.extend(ctx.warnings);
+        self.tree.append_child(p, old);
+        self.windows[w].as_mut().unwrap().root = root;
+        self.relayout_window(w);
+        Ok(())
     }
 
     /// `ViewSelector_c::SetValue(index)`: shows child `index` of the named view and hides (and collapses) the others.
@@ -661,6 +697,16 @@ impl Gui {
                 t.tvf |= flags;
             }
         }
+    }
+    /// `HTMLParser_c::ClearFeatureFlags` on a text input's editor.
+    pub fn clear_feature_flags(&mut self, w: WindowId, name: &str, flags: u32) {
+        if let Some(e) = self.find(w, name).and_then(|v| self.editor_of(v)) {
+            if let Kind::Text(t) = &mut self.tree.views[e].kind { t.tvf &= !flags; }
+        }
+    }
+    /// `TextRenderer_c::SetDefaultColor` on the text editor, without tinting its frame.
+    pub fn set_text_color(&mut self, w: WindowId, name: &str, color: u32) {
+        if let Some(e) = self.find(w, name).and_then(|v| self.editor_of(v)) { self.tree.views[e].color = color; }
     }
     /// `TextRenderer_c::SetMinPreferredSize` / `SetMaxPreferredSize` of a `TextView` (`FUN_1005824d` for the NPC chat text part), then re-lays the window out.
     pub fn set_text_pref_size(&mut self, w: WindowId, name: &str, min: (f32, f32), max: (f32, f32)) {
@@ -977,7 +1023,10 @@ impl Gui {
             }
             Kind::Button(b) => self.draw_button(out, &v, b, rect, tint, alpha),
             Kind::CcEntry(c) => self.draw_cc_entry(out, c, v.enabled, rect, tint, alpha),
-            Kind::Canvas(c) => self.draw_canvas(out, c, rect, alpha),
+            Kind::Canvas(c) => {
+                self.draw_canvas(out, c, rect, alpha);
+                self.draw_view_tabs(out, id, rect, alpha);
+            }
             Kind::List(l) => self.draw_list(out, l, rect, tint, alpha),
             Kind::Multi(m) => self.draw_multi(out, m, rect, tint, alpha),
             Kind::MultiHeader { rows } => self.draw_multi_header(out, id, *rows, rect, tint, alpha),
@@ -1021,7 +1070,8 @@ impl Gui {
         // children
         match &v.kind {
             Kind::ScrollView(_) => {
-                out.push(DrawCmd::Clip(Some([rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1])));
+                let (vw, vh) = self.viewport(id);
+                out.push(DrawCmd::Clip(Some([rect.l as i32, rect.t as i32, (rect.l + vw) as i32, (rect.t + vh) as i32])));
                 for c in &v.children {
                     self.draw_view(*c, x0, y0, tint, alpha, false, out);
                 }
@@ -1360,10 +1410,17 @@ impl Gui {
     /// True when `(x, y)` is over something interactive or any non-root view of a visible window
     /// (a full-screen transparent window such as CharacterSelectionWindow does not count by itself).
     pub fn wants_mouse(&self, x: f32, y: f32) -> bool {
-        if self.popup.is_some() || self.hit(x, y).is_some() {
+        if self.interacting() || self.popup.is_some() || self.hit(x, y).is_some() {
             return true;
         }
-        for (_, root, pos) in self.windows_top_down() {
+        for (window, root, pos) in self.windows_top_down() {
+            // WndBorder consumes the whole outer frame, including empty client space
+            // and a root TextView (chat). Match frame mouse/context dispatch.
+            if self.windows[window].as_ref().is_some_and(|w| w.framed)
+                && self.outer_of(window).is_some_and(|r| r.contains(Point::new(x, y)))
+            {
+                return true;
+            }
             if self.covers(root, x - pos.0 as f32, y - pos.1 as f32, true, 0.0, 0.0) {
                 return true;
             }
