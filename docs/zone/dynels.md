@@ -35,6 +35,13 @@ N3 frame ──Zone::on_frame──▶ Dynels::on_message ──▶ Char (Mover)
 * `Look` (hash = model key) is what the app derives from a message: `Char` (SimpleCharFullUpdate: breed/sex/race/fatness, head,
   `MonsterData`, `textures[]`, page-0 `cloth[]`, attractor meshes), `Corpse`, `Item` (StaticInstance template + stats).
   Equal looks share one model: the 81 characters of the capture need 13 models.
+* Cache lifetime (implementation: `ao-render/src/viewer.rs::Host::set_scene`, `play/dynels.rs::sync_scene`, `play/tags.rs::TagLayer::frame`):
+  CPU models survive playfield changes, but each scene replacement advances the host generation and invalidates every model's uploaded flag
+  and every tag sprite hash. This also covers a scene arriving asynchronously after a playfield notification and an intervening upload;
+  reused characters, corpses, props and unchanged selection/attack/name tags are uploaded again before drawing in the new scene.
+* Unweighted attachment bind frames use the same best-rest-clip selection as the character loader (`character.rs::best_rest_clip`);
+  `ActorAssets` memoises successful selections by `(model id, skeleton signature)` across appearance rebuilds. Model id matters because
+  the score uses that model's fitted bind frames; different models sharing a skeleton must not share the selected clip.
 
 ## 2. What is drawn and how
 

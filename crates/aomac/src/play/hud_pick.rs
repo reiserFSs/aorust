@@ -180,7 +180,8 @@ mod tests {
         use ao_formats::character::actor::ActorRig;
         let Some(dir) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/ProjectRubiKa/client")).filter(|d| d.join("cd_image/rdb.db").exists()) else { return };
         let store = ao_rdb::RecordStore::open(&dir).unwrap();
-        let rig = ActorRig::new(&store, 22773, None, &Default::default(), &Default::default(), &[]).unwrap();
+        let assets = ao_formats::character::actor::ActorAssets::new(&store).unwrap();
+        let rig = ActorRig::new(&store, &assets, 22773, None, &Default::default(), &Default::default(), &[]).unwrap();
         let (verts, _) = rig.pose(None);
         let (lo, hi) = bounds_of(verts.iter().map(|v| &v.pos)).unwrap();
         eprintln!("surf lizard bind box {lo:?} {hi:?}");

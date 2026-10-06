@@ -9,17 +9,30 @@ use super::*;
 use crate::character::player::part_textures;
 use ao_scene::Vertex;
 use std::sync::Arc;
+use std::cell::RefCell;
 
 /// Shared caches of the loaders: the name table, per-model clip tables and parsed clips.
 pub struct ActorAssets {
     pub names: NameTable,
     clips: HashMap<u32, Arc<Vec<(String, u32)>>>,
     anims: HashMap<u32, Arc<CatAnim>>,
+    rest: RefCell<HashMap<(u32, u32), Arc<CatAnim>>>,
 }
 
 impl ActorAssets {
     pub fn new(store: &RecordStore) -> Result<Self> {
-        Ok(Self { names: NameTable::load(store)?, clips: HashMap::new(), anims: HashMap::new() })
+        Ok(Self { names: NameTable::load(store)?, clips: HashMap::new(), anims: HashMap::new(), rest: RefCell::new(HashMap::new()) })
+    }
+
+    /// Rest selection depends on the model's fitted bind frames, not just its skeleton signature.
+    fn rest(&self, store: &RecordStore, model: u32, cat: &CatMesh, bind: &[Option<Xf>]) -> Result<Arc<CatAnim>> {
+        let key = (model, cat.signature);
+        if let Some(rest) = self.rest.borrow().get(&key) {
+            return Ok(rest.clone());
+        }
+        let rest = Arc::new(best_rest_clip(store, cat, bind)?);
+        self.rest.borrow_mut().insert(key, rest.clone());
+        Ok(rest)
     }
 
     /// Clip name -> clip id of a model (`walk`, `idle-stand`, `social-bow`, ...), cached ([`model_clips`]).
@@ -169,7 +182,7 @@ impl ActorRig {
     /// Body model `model_id` (rdb 1010002), optional head mesh (rdb 1010001), per-material texture `overrides` and env/alpha `layers`
     /// ([`npc_part_layers`]) and attachment
     /// meshes `(attractor place, rdb 1010001 mesh)` (`Attractor01_head` = place 0, `02_righthand` = 1, ...; unknown places are skipped).
-    pub fn new(store: &RecordStore, model_id: u32, head: Option<u32>, overrides: &PartTextures, layers: &PartLayers, attachments: &[(u8, u32)]) -> Result<Self> {
+    pub fn new(store: &RecordStore, assets: &ActorAssets, model_id: u32, head: Option<u32>, overrides: &PartTextures, layers: &PartLayers, attachments: &[(u8, u32)]) -> Result<Self> {
         let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model_id)?;
         // creature models have no head attractor: a head mesh is then not mounted (and the body keeps its own head part)
         let head = head.filter(|_| cat.attractors.iter().any(|a| a.name.ends_with("_head")));
@@ -197,7 +210,7 @@ impl ActorRig {
         // nearest weighted ancestor directly buries Atrox heads in the torso.
         // Match character::build, resolving the rest clip once, never per pose.
         if mounts.iter().any(|m| bind[cat.attractors[m.attractor].bone as usize].is_none()) {
-            let rest = best_rest_clip(store, &cat, &bind)?;
+            let rest = assets.rest(store, model_id, &cat, &bind)?;
             for mount in &mounts {
                 let bone = cat.attractors[mount.attractor].bone as usize;
                 if bind[bone].is_none() {
@@ -217,7 +230,7 @@ impl ActorRig {
         let model = player_model_build(store, look.breed, look.gender, look.build)?;
         let p = Player { breed: look.breed, gender: look.gender, skin: look.skin, head: None, equipment: look.equipment };
         let overrides = part_textures(&assets.names, store, model, &p)?;
-        Self::new(store, model, look.head, &overrides, &PartLayers::new(), attachments)
+        Self::new(store, assets, model, look.head, &overrides, &PartLayers::new(), attachments)
     }
 
     /// The textured model for `Renderer::add_actor_model`.
@@ -337,9 +350,18 @@ mod tests {
     fn atrox_unweighted_head_mount_matches_character_loader() {
         let Some(store) = store() else { return };
         let assets = ActorAssets::new(&store).unwrap();
+        let mut first_rest = None;
         for head in [40103, 223940] {
             let look = PlayerLook { breed: Breed::Atrox, gender: Gender::Male, skin: Skin::Caucasian, build: 1, head: Some(head), equipment: Equipment::default() };
             let rig = ActorRig::player(&store, &assets, &look, &[]).unwrap();
+            // A mounted bone may already have a fitted bind frame in this client dataset.
+            // Exercise selection explicitly rather than assuming this appearance needs the fallback.
+            let bind = bind_frames(rig.cat());
+            let rest = assets.rest(&store, rig.model_id, rig.cat(), &bind).unwrap();
+            if let Some(first) = &first_rest {
+                assert!(Arc::ptr_eq(first, &rest), "appearance rebuild reuses the rest selection");
+            }
+            first_rest = Some(rest);
             let reference = load_character_with_head(&store, rig.model_id, head, None).unwrap();
             let (_, mounts) = rig.pose(None);
             let expected = reference.instances.iter().find(|i| i.mesh == 1).expect("reference head").transform;
@@ -347,6 +369,15 @@ mod tests {
                 assert!((actual - expected).abs() < 1e-5, "head {head}: {actual} != {expected}");
             }
         }
+        assert_eq!(assets.rest.borrow().len(), 1);
+        let model = player_model_build(&store, Breed::Atrox, Gender::Male, 1).unwrap();
+        let mut cat = load_cat_mesh(&store, CHAR_MESH_TYPE, model).unwrap();
+        let bind = bind_frames(&cat);
+        let different_model = assets.rest(&store, model + 1, &cat, &bind).unwrap();
+        assert!(!Arc::ptr_eq(first_rest.as_ref().unwrap(), &different_model), "equal signatures do not alias distinct fitted models");
+        cat.signature = u32::MAX;
+        assert!(assets.rest(&store, model, &cat, &bind).is_err(), "changed signature cannot reuse a cached clip");
+        assert_eq!(assets.rest.borrow().len(), 2, "failed selections are not cached");
     }
 
     /// A solitus female with head and a weapon on the right hand: the body has the model's vertices, the head and the weapon
@@ -426,7 +457,8 @@ mod tests {
         let names = NameTable::load(&store).unwrap();
         let o = npc_part_textures(&store, &names, &cat, None, &list, &[]);
         assert_eq!(o["lizard_green"].0, TextureKey { rdb_type: TEXTURE_TYPE, id: 22768 });
-        let rig = ActorRig::new(&store, 22773, None, &o, &PartLayers::new(), &[]).unwrap();
+        let assets = ActorAssets::new(&store).unwrap();
+        let rig = ActorRig::new(&store, &assets, 22773, None, &o, &PartLayers::new(), &[]).unwrap();
         assert_eq!(rig.model().meshes.len(), 1, "body only");
         assert!(rig.model().textures.contains_key(&TextureKey { rdb_type: TEXTURE_TYPE, id: 22768 }));
     }
@@ -459,7 +491,8 @@ mod tests {
         let cat = load_cat_mesh(&store, CHAR_MESH_TYPE, 42370).unwrap();
         let Some(p) = cat.parts.iter().find(|p| p.env_texture != 0) else { return };
         let envs = |layers: &PartLayers| {
-            let rig = ActorRig::new(&store, 42370, None, &PartTextures::new(), layers, &[]).unwrap();
+            let assets = ActorAssets::new(&store).unwrap();
+            let rig = ActorRig::new(&store, &assets, 42370, None, &PartTextures::new(), layers, &[]).unwrap();
             rig.model().meshes[0].submeshes.iter().filter_map(|s| s.env_texture.map(|k| k.id)).collect::<Vec<_>>()
         };
         assert!(envs(&PartLayers::new()).contains(&p.env_texture));

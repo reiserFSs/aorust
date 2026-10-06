@@ -21,6 +21,7 @@ pub struct Host {
     pub quit: bool,
     scene: Option<Scene>,
     repose: Option<Scene>,
+    scene_generation: u64,
     /// Lens for the next frame (per-frame FOV changes of camera paths); `None` keeps the scene's lens.
     pub lens: Option<ao_scene::Lens>,
     /// Fog density multiplier of the `FogMode` pref ([`ao_scene::fog_mode_density_scale`]); `None` leaves it as it is; drained by the viewer.
@@ -57,7 +58,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false }
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -65,8 +66,14 @@ impl Host {
         self.repose = Some(scene);
     }
 
+    /// Changes whenever replacing the scene invalidates cached actor uploads.
+    pub fn scene_generation(&self) -> u64 {
+        self.scene_generation
+    }
+
     /// Replaces the rendered scene (uploaded before the next frame).
     pub fn set_scene(&mut self, scene: Scene) {
+        self.scene_generation = self.scene_generation.wrapping_add(1);
         // Queued poses/models belong to the replaced topology, not the newly uploaded scene.
         self.repose = None;
         self.actor_models.clear();
@@ -670,6 +677,9 @@ mod tests {
         assert!(host.repose.is_none());
         assert!(host.actor_models.is_empty() && host.actors.is_empty());
         assert!(host.clear_actors);
+        assert_eq!(host.scene_generation(), 1);
+        host.set_scene(Scene::default());
+        assert_eq!(host.scene_generation(), 2);
     }
 
     #[test]

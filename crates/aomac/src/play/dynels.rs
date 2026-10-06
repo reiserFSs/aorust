@@ -323,7 +323,7 @@ fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::
             let v = visual(&eff, default_mesh(&assets.names)?);
             match (v.cat_mesh, v.mesh) {
                 (Some(cat), _) => {
-                    let rig = ActorRig::new(store, cat, None, &Default::default(), &Default::default(), &[])?;
+                    let rig = ActorRig::new(store, assets, cat, None, &Default::default(), &Default::default(), &[])?;
                     let held = rig.pose(None);
                     Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), item_kind, stats: eff, ..plain(Default::default(), v.visible) })
                 }
@@ -364,7 +364,7 @@ fn build_corpse(store: &RecordStore, assets: &mut ActorAssets, c: &CorpseLook) -
             let cat = load_cat_mesh(store, CHAR_MESH_TYPE, c.cat_mesh)?;
             let list: Vec<TextureOverride> = c.textures.iter().map(|(m, t)| TextureOverride { material: m, texture: *t, env_texture: 0, alpha_mode: 0 }).collect();
             let cloth: Vec<(ClothPart, u32)> = c.cloth.iter().filter(|c| c.1 > 0).filter_map(|&(p, t)| Some((*ClothPart::ALL.get(p as usize)?, t))).collect();
-            ActorRig::new(store, c.cat_mesh, c.head, &npc_part_textures(store, &assets.names, &cat, c.head, &list, &cloth), &npc_part_layers(&cat, &list), &[])?
+            ActorRig::new(store, assets, c.cat_mesh, c.head, &npc_part_textures(store, &assets.names, &cat, c.head, &list, &cloth), &npc_part_layers(&cat, &list), &[])?
         }
     };
     let animation = c.animation.map(|(record, key)| {
@@ -469,7 +469,7 @@ fn npc_rig(store: &RecordStore, assets: &ActorAssets, look: &CharLook, head: Opt
     let cloth: Vec<(ClothPart, u32)> = look.cloth.iter().filter(|c| c.1 > 0).filter_map(|&(p, t)| Some((*ClothPart::ALL.get(p as usize)?, t as u32))).collect();
     let skin_head = rec.stat(64).filter(|&h| h > 0).map(|h| h as u32);
     let overrides = npc_part_textures(store, &assets.names, &cat, skin_head, &list, &cloth);
-    let rig = ActorRig::new(store, model, head, &overrides, &npc_part_layers(&cat, &list), attachments)?;
+    let rig = ActorRig::new(store, assets, model, head, &overrides, &npc_part_layers(&cat, &list), attachments)?;
     Ok((rig, rec))
 }
 
@@ -605,6 +605,7 @@ pub struct Dynels {
     playfield: Option<u32>,
     models: HashMap<u64, Model>,
     asked: HashSet<u64>,
+    scene_generation: u64,
     /// Pref `ShowAllNames` (default off, docs/zone/motion.md §6): name tags over every dynel within [`NAME_TAG_RADIUS`].
     pub show_all_names: bool,
     /// `DisplayCharViewDistance` in metres (default 80, `FUN_1001f964` N3 0x1001f964; docs/chat/dvalue.md): characters farther from the
@@ -654,6 +655,7 @@ impl Default for Dynels {
             playfield: None,
             models: HashMap::new(),
             asked: HashSet::new(),
+            scene_generation: 0,
             show_all_names: std::env::var_os("AOMAC_SHOW_ALL_NAMES").is_some(),
             char_view_distance: 80.0,
             lens: Lens::default(),
@@ -1322,8 +1324,25 @@ impl Dynels {
         }
     }
 
+    /// Scene replacement can arrive after the playfield notification and erase already queued uploads.
+    fn sync_scene(&mut self, host: &Host) {
+        if self.scene_generation == host.scene_generation() {
+            return;
+        }
+        self.scene_generation = host.scene_generation();
+        for model in self.models.values_mut() {
+            if let Model::Ready { uploaded, .. } = model {
+                *uploaded = false;
+            }
+        }
+        for prop in self.props.values_mut() {
+            prop.submitted = false;
+        }
+    }
+
     /// Advances the dynels and hands the visible ones to the renderer. `cam` = camera position in scene space, `fwd` = its view direction.
     pub fn update(&mut self, dt: f32, cam: [f32; 3], fwd: [f32; 3], host: &mut Host) {
+        self.sync_scene(host);
         self.cam = cam;
         self.tick_sounds(dt);
         let Some(dir) = self.dir.clone() else { return };
@@ -1673,6 +1692,33 @@ impl Dynels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_replacement_invalidates_every_cached_model_even_after_zone_upload() {
+        let mut world = Dynels::default();
+        for key in 1..=3 {
+            world.models.insert(key, Model::Ready { built: Box::new(plain(Default::default(), true)), uploaded: true });
+        }
+        world.models.insert(4, Model::Loading);
+        world.models.insert(5, Model::Failed);
+        world.on_playfield(4582);
+        let mut host = Host::headless();
+        world.sync_scene(&host);
+        assert!(world.models.values().filter_map(|m| match m { Model::Ready { uploaded, .. } => Some(*uploaded), _ => None }).all(|u| u));
+        // The asynchronous scene arrives after the playfield notification (and possibly an upload).
+        host.set_scene(Default::default());
+        world.sync_scene(&host);
+        assert_eq!(world.models.len(), 5, "CPU models and pending builds survive zoning");
+        assert!(world.models.values().filter_map(|m| match m { Model::Ready { uploaded, .. } => Some(*uploaded), _ => None }).all(|u| !u));
+        if let Model::Ready { uploaded, .. } = world.models.get_mut(&1).unwrap() {
+            *uploaded = true;
+        }
+        world.sync_scene(&host);
+        assert!(matches!(world.models[&1], Model::Ready { uploaded: true, .. }), "same scene does not trigger repeated uploads");
+        host.set_scene(Default::default());
+        world.sync_scene(&host);
+        assert!(matches!(world.models[&1], Model::Ready { uploaded: false, .. }));
+    }
 
     #[test]
     fn item_use_class_follows_template_without_remapping_identity() {

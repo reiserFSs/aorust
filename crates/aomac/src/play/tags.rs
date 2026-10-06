@@ -167,6 +167,7 @@ fn quad_model(width_px: u32, rgba: Vec<u8>) -> Scene {
 pub struct TagLayer {
     slots: HashMap<(IndicatorKind, i32), usize>,
     shown: HashMap<usize, u64>,
+    scene_generation: u64,
 }
 
 fn hash_of(t: &Tag) -> u64 {
@@ -187,6 +188,10 @@ impl TagLayer {
 
     /// Pushes the quads of `tags` (earlier entries win a full pool) for the camera of `host`; uploads changed sprites.
     pub fn frame(&mut self, gui: &mut Gui, host: &mut Host, tags: &[Tag]) {
+        if self.scene_generation != host.scene_generation() {
+            self.scene_generation = host.scene_generation();
+            self.shown.clear();
+        }
         let keep: HashSet<_> = tags.iter().map(|t| (t.kind, t.id)).collect();
         self.slots.retain(|k, _| keep.contains(k));
         let (right, up) = (host.camera.right(), host.camera.up());
@@ -383,6 +388,11 @@ mod tests {
         host.actors.clear();
         layer.frame(&mut gui, &mut host, &tags);
         assert!(host.actor_models.is_empty() && host.actors.len() == 3, "unchanged tags are not uploaded again");
+        host.set_scene(Scene::default());
+        layer.frame(&mut gui, &mut host, &tags);
+        assert_eq!((host.actor_models.len(), host.actors.len()), (3, 3), "all unchanged tag kinds reupload after scene replacement");
+        host.actor_models.clear();
+        host.actors.clear();
         let mut changed = tags.clone();
         changed[0].bar = Some((40, 0xff0000));
         layer.frame(&mut gui, &mut host, &changed);
