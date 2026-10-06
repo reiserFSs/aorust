@@ -22,6 +22,13 @@ Replay tests: `ao_net::chat::tests::live_login_capture_decodes`, `play::chat::ne
 Outgoing ptype-5 frame as sent (hex, seq 4):
 `0004 0005 0001 0034 000082e8 00000002 | 00000003 00000000 00000000 00000014 0011 "aomac client test" 00` (header `ptype 5, size 0x34, sender = char id, receiver = 2`; payload `kind 3, identity {0,0}, len 0x14, u16 len 0x11 + text + kind byte 0`).
 
+## Re-run 2026-10-06 (offscreen live harness, step `say=<line>`)
+
+`say=/say aomac vicinity test` after 4 s in the world: zone frame sent (`net.rec`: ptype 5, size 0x36: ` 000082e8 00000002 | 00000003 ... 0013 "aomac vicinity test"`, kind 3 text frame);
+the chat server answered within the 12 s wait with `0x22` `000082e8 0013 "aomac vicinity test" 0001 00` (own id, data = `00`; test `decodes_vicinity_echo_of_own_text`).
+The offscreen screenshot shows the line `(03:31) Aomacvolk: aomac vicinity test` in the Default Window in the vicinity colour below the three MOTD lines (and a pink server announcement line).
+Note: a plain line (no `/say`) from `run_line` without a window output group sends nothing (as in the original: no feedback).
+
 ## Gaps (labelled)
 
 * Vicinity/shout/whisper from other players arrive on the chat server as 0x22/0x23 (decoded, group routing per GUI 0x10086728); the zone N3 text classes (`ChatTextIIR_t` …) did not occur in the session.

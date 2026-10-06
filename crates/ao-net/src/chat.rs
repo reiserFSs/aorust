@@ -76,8 +76,28 @@ pub enum ChatEvent {
     GroupMessage { group: GroupId, from: u32, text: String, data: Vec<u8> },
     /// S2C_PONG (0x64) `D`.
     Pong(Vec<u8>),
-    /// Any other type (raw, for logging): S2C_FORWARD_DATA 0x6e, LFT 0x5dd, ADM_MUX_INFO ... not decoded.
+    /// S2C_LFT_QUERY_RESULT (0x5dd, format `BISIIBBS`, GUI 0x1016f037) = `ppj::Client_c::LftQueryReply_t` (action kind 10).
+    LftReply(LftReply),
+    /// Any other type (raw, for logging): S2C_FORWARD_DATA 0x6e, S2C_ADM_MUX_INFO 0x44c (three lists, GUI 0x1016f103), ... not decoded.
     Other { ptype: u16, payload: Vec<u8> },
+}
+
+/// One LFT search result (S2C 0x5dd). `ChatGUIModule_c::HandleLFTMessage` [GUI 0x10087069]: `status` 0 = a candidate (emitted on
+/// GlobalSignals+0x1f0 as `(id, name, level, profession, playfield, side, description)`), 2 = end of the result list
+/// (emitted with id 0 / empty strings / -1s: re-enables the Search button), anything else is ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LftReply {
+    pub status: u8,
+    pub id: u32,
+    pub name: String,
+    pub level: u32,
+    /// Playfield id (`N3Msg_GetPFName`).
+    pub playfield: u32,
+    /// Text id of category 2005 (0 neutral, 1 clan, 2 omni).
+    pub side: u8,
+    /// Text id of category 2004 (1..15).
+    pub profession: u8,
+    pub description: String,
 }
 
 /// Argument of [`ChatEvent::SystemFmt`]: type char 'I' / 'S' / 'l' (= text-db id of category 20000) followed by its value.
@@ -140,6 +160,16 @@ pub fn decode(ptype: u16, payload: &[u8]) -> Result<ChatEvent> {
         0x3d => ChatEvent::GroupPart(group(r)?),
         0x41 => ChatEvent::GroupMessage { group: group(r)?, from: r.u32()?, text: string(r)?, data: data(r)? },
         0x64 => ChatEvent::Pong(data(r)?),
+        0x5dd => ChatEvent::LftReply(LftReply {
+            status: r.u8()?,
+            id: r.u32()?,
+            name: string(r)?,
+            level: r.u32()?,
+            playfield: r.u32()?,
+            side: r.u8()?,
+            profession: r.u8()?,
+            description: string(r)?,
+        }),
         _ => ChatEvent::Other { ptype, payload: payload.to_vec() },
     })
 }
@@ -173,6 +203,10 @@ pub enum ChatCmd {
     /// 0x5dc `S`: looking-for-team ON with the team description [GUI 0x1016cafc]; 0x5dd (no fields): OFF [GUI 0x1016cb22].
     LftOn(String),
     LftOff,
+    /// 0x5de `IIII`: search for looking-for-team characters [GUI 0x1016cb36, caller `FUN_100ef912` = the LFT window's Search button]:
+    /// `side` = the Side dropdown's item id (7 "any" -> -1), `professions` = `1 << profession id` (item id 0x10 "any" -> -1),
+    /// `location` = the Location dropdown's selected *index* (0 this playfield, 1 anywhere, 2 Rubi-Ka, 3 Shadowlands); the fourth word is always -1.
+    LftQuery { side: u32, professions: u32, location: u32 },
     /// 0x40 `GID`: set group flags (mute etc.).
     GroupFlags { group: GroupId, flags: u32 },
     Quit,
@@ -280,6 +314,13 @@ pub fn encode(cmd: &ChatCmd) -> Option<Vec<u8>> {
             0x5dc
         }
         ChatCmd::LftOff => 0x5dd,
+        ChatCmd::LftQuery { side, professions, location } => {
+            w.u32(*side);
+            w.u32(*professions);
+            w.u32(*location);
+            w.u32(u32::MAX);
+            0x5de
+        }
         ChatCmd::GroupFlags { group, flags } => {
             put_group(&mut w, *group);
             w.u32(*flags);
@@ -463,6 +504,15 @@ mod tests {
         v
     }
 
+    /// Live 2026-10-06 (Ithaca): the chat server's answer to the vicinity line `aomac vicinity test`: sender = own id, text, data = one byte 0.
+    #[test]
+    fn decodes_vicinity_echo_of_own_text() {
+        let mut p = 0x82e8u32.to_be_bytes().to_vec();
+        p.extend(s("aomac vicinity test"));
+        p.extend(s("\0"));
+        assert_eq!(decode(0x22, &p).unwrap(), ChatEvent::Vicinity { from: 0x82e8, text: "aomac vicinity test".into(), data: vec![0] });
+    }
+
     #[test]
     fn decodes_tell_and_group_message() {
         let mut p = 7u32.to_be_bytes().to_vec();
@@ -518,6 +568,29 @@ mod tests {
         assert_eq!(f, [0, 0x6e, 0, 12, 0, 0, 0, 9, 1, 0x20, 3, b'a', b'b', b'x', b'y', b'z']);
         assert_eq!(encode(&ChatCmd::LftOn("hi".into())).unwrap(), [0x05, 0xdc, 0, 4, 0, 2, b'h', b'i']);
         assert_eq!(encode(&ChatCmd::LftOff).unwrap(), [0x05, 0xdd, 0, 0]);
+
+        // 0x5de `IIII` (side, profession mask, location, -1) [GUI 0x1016cb36; caller FUN_100ef912]
+        assert_eq!(
+            encode(&ChatCmd::LftQuery { side: u32::MAX, professions: 1 << 3, location: 2 }).unwrap(),
+            [0x05, 0xde, 0, 16, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 8, 0, 0, 0, 2, 0xff, 0xff, 0xff, 0xff]
+        );
+    }
+
+    /// S2C 0x5dd `BISIIBBS` = status, id, name, level, playfield, side, profession, description (GUI 0x1016f037; fields per HandleLFTMessage).
+    #[test]
+    fn decodes_lft_reply() {
+        let mut p = vec![0];
+        p.extend(77u32.to_be_bytes());
+        p.extend(s("Bob"));
+        p.extend(123u32.to_be_bytes());
+        p.extend(4001u32.to_be_bytes());
+        p.extend([2, 6]);
+        p.extend(s("need heals"));
+        assert_eq!(
+            decode(0x5dd, &p).unwrap(),
+            ChatEvent::LftReply(LftReply { status: 0, id: 77, name: "Bob".into(), level: 123, playfield: 4001, side: 2, profession: 6, description: "need heals".into() })
+        );
+        assert!(decode(0x5dd, &p[..8]).is_err());
     }
 
     /// Live capture (Ithaca, 2026-10-05): challenge, login, OK, own name, the three MOTD lines as anonymous vicinity messages.
