@@ -1244,6 +1244,11 @@ impl Gui {
     pub fn extra_images(&self) -> &[ExtraImage] {
         &self.extras
     }
+    /// Bitmap of `ch` in `font` (`bits`: 0 = keyed, 1 = full coverage, 2..=255 = grey), for drawing text into an image instead of the
+    /// draw list (world-space name tags).
+    pub fn glyph(&mut self, font: FontId, ch: char) -> &crate::font::Glyph {
+        self.fonts.font(font).glyph(ch)
+    }
     /// Pixel width of `text` in `font`.
     pub fn text_width(&mut self, font: FontId, text: &str) -> i32 {
         self.fonts.font(font).text_width(text)

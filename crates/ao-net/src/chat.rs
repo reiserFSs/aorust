@@ -153,8 +153,9 @@ pub enum ChatCmd {
     Tell { to: u32, text: String },
     /// 0x41 `GSD` (kind 0xE -> private group message 0x39 `ISD`).
     Group { group: GroupId, text: String },
-    /// 0x28 `ID` / 0x29 `I`: buddy list.
-    BuddyAdd(u32),
+    /// 0x28 `ID` / 0x29 `I`: buddy list. `D` is one byte: 1 = "add to buddy list" (menu action `user_id`, GUI 0x100a6940 via 0x100a7e73 / 0x100a6210),
+    /// 0 = the temporary entry the client creates when it opens a tell window (0x100a5e7a) to follow the character's online state.
+    BuddyAdd { id: u32, permanent: bool },
     BuddyRemove(u32),
     /// Private chat group (`/invite`, `/kick`, accept an invite, `/leave`): 0x32 `I` invite, 0x33 `I` kick (the player's id),
     /// 0x34 `I` join (the group = its owner's id) [GUI 0x1016c96e; caller 0x100a6e0c = accepting an invite], 0x35 `I` part
@@ -185,8 +186,13 @@ fn put_group(w: &mut Writer, g: GroupId) {
     w.u8(g.kind);
     w.u32(g.id);
 }
-/// The `D` argument of text messages: the original passes the message's attribute block; a lone NUL is what AOChat sends.
-const NO_DATA: &[u8] = &[0];
+/// `D` of an outgoing tell (0x1e) without link attachment: one byte = the chat request's kind field, 0 for a tell
+/// [GUI 0x1008947b -> 0x10089c00: `buf[0] = req.kind; buf[1..] = FUN_10089163(attachment)`, which returns 0 without attachment; 0x1016c8c9 gets `(buf, 1)`].
+const TELL_DATA: &[u8] = &[0];
+/// `D` of an outgoing group / private group message (0x41 / 0x39) without attachment: `(NULL, 0)`, an empty block
+/// [GUI 0x1008a400..0x1008a436: `n = FUN_10089163(att, buf, 0x10000)`; `FUN_1016c9f4(.., n > 0 ? buf : NULL, n)`].
+/// With an attachment (item link macro) the block is `pack("BBBSS", 1, b0, b1, s1, s2)` [FUN_10089163], not produced by this client.
+const NO_DATA: &[u8] = &[];
 
 /// Serialize `ptype` + payload into a wire packet.
 pub fn packet(ptype: u16, body: &[u8]) -> Vec<u8> {
@@ -207,7 +213,7 @@ pub fn encode(cmd: &ChatCmd) -> Option<Vec<u8>> {
         ChatCmd::Tell { to, text } => {
             w.u32(*to);
             put_s(&mut w, text.as_bytes());
-            put_s(&mut w, NO_DATA);
+            put_s(&mut w, TELL_DATA);
             0x1e
         }
         ChatCmd::Group { group, text } if group.kind == KIND_PRIVATE_GROUP => {
@@ -222,9 +228,9 @@ pub fn encode(cmd: &ChatCmd) -> Option<Vec<u8>> {
             put_s(&mut w, NO_DATA);
             0x41
         }
-        ChatCmd::BuddyAdd(id) => {
+        ChatCmd::BuddyAdd { id, permanent } => {
             w.u32(*id);
-            put_s(&mut w, NO_DATA);
+            put_s(&mut w, &[*permanent as u8]);
             0x28
         }
         ChatCmd::BuddyRemove(id) => {
@@ -492,9 +498,11 @@ mod tests {
     fn encodes_group_and_tell() {
         let g = GroupId { kind: 3, id: 5 };
         let b = encode(&ChatCmd::Group { group: g, text: "a".into() }).unwrap();
-        assert_eq!(b, [0, 0x41, 0, 11, 3, 0, 0, 0, 5, 0, 1, b'a', 0, 1, 0]);
+        assert_eq!(b, [0, 0x41, 0, 10, 3, 0, 0, 0, 5, 0, 1, b'a', 0, 0]); // D = (NULL, 0)
         let b = encode(&ChatCmd::Tell { to: 1, text: "a".into() }).unwrap();
-        assert_eq!(b, [0, 0x1e, 0, 10, 0, 0, 0, 1, 0, 1, b'a', 0, 1, 0]);
+        assert_eq!(b, [0, 0x1e, 0, 10, 0, 0, 0, 1, 0, 1, b'a', 0, 1, 0]); // D = one kind byte 0
+        assert_eq!(encode(&ChatCmd::BuddyAdd { id: 1, permanent: true }).unwrap(), [0, 0x28, 0, 7, 0, 0, 0, 1, 0, 1, 1]);
+        assert_eq!(encode(&ChatCmd::BuddyAdd { id: 1, permanent: false }).unwrap(), [0, 0x28, 0, 7, 0, 0, 0, 1, 0, 1, 0]);
     }
 
     /// Field codes `I`/`s`/`M` (pack function GUI 0x1017161f) and the private-group request ids (GUI 0x1016c8c9..).

@@ -558,42 +558,6 @@ impl HudTarget {
     }
 }
 
-/// `GFX_GUI_INDICATOR_SELECTED` (0xe6, 128×32, colour-keyed corner brackets); `GFX_GUI_INDICATOR_ATTACKING` is 0xe5 (used by the
-/// fight-target indicator `FightingTargetMessage` 0x10025947 creates, not drawn here).
-const INDICATOR_SELECTED: u32 = 0xe6;
-
-/// The selection `Indicator_t` of `TargetingModule_t::SetTarget` (`FUN_100255be`, rebuilt by `FUN_10024e14`, GUI): a 32 px high
-/// plate, 128 px wide (256 when the text is wider than 128 px), made of the left and the right half of the corner-bracket art
-/// at its ends, the tag line (font 2 = `FontGameShell12`) centred at the top and a 64×4 health bar at y 14..18 (`FUN_10024c03`:
-/// `ftol(ratio·64)` px in the bar colour, the rest 0x333333; shown for selection indicators only). The original draws the plate
-/// as a world-space billboard (`VisualSprite_t(width/128, 0.3, "[3] TargetIndicatorMat")`, priority 6) at the head anchor
-/// `GetIndicatorPosition`; here it is drawn 1:1 in GUI pixels, centred on the projected anchor ([INFERENCE]: sprite origin =
-/// centre), because glyphs cannot be scaled in a draw list. UNRESOLVED: the bar colour (`+0x28`, a `Consider` gradient for
-/// `Consider_e == 3`, else 0xffffff, which is used) and the clan line.
-fn draw_indicator(gui: &mut Gui, text: &str, rgb: u32, x: f32, y: f32, health: f32, list: &mut ao_gui::DrawList) {
-    use ao_gui::{DrawCmd, FontId, GfxId};
-    let tw = gui.text_width(FontId::Shell, text);
-    let w = if tw <= 128 { 128.0 } else { 256.0 };
-    let (x0, y0) = ((x - w / 2.0).floor(), (y - 16.0).floor());
-    let half = 64.0;
-    for (src_x, dst_x) in [(0.0, x0), (half, x0 + w - half)] {
-        list.cmds.push(DrawCmd::Gfx { id: GfxId(INDICATOR_SELECTED), src: [src_x, 0.0, half, 32.0], dst: [dst_x, y0, dst_x + half, y0 + 32.0], tint: [255; 3], alpha: 1.0 });
-    }
-    gui.text_cmds(FontId::Shell, text, (x0 + (w - tw as f32) / 2.0) as i32, y0 as i32 + 1, rgb, 1.0, list);
-    let bx = x0 + (w - 64.0) / 2.0;
-    let fill = (health.clamp(0.0, 1.0) * 64.0).floor();
-    list.cmds.push(DrawCmd::Solid { dst: [bx, y0 + 14.0, bx + fill, y0 + 18.0], color: [255; 3], alpha: 1.0 });
-    list.cmds.push(DrawCmd::Solid { dst: [bx + fill, y0 + 14.0, bx + 64.0, y0 + 18.0], color: [0x33; 3], alpha: 1.0 });
-}
-
-/// Draws the selection indicator of the target over its head (`TargetingModule_t` keeps one `Indicator_t` for the target unless the
-/// target has skill flag 0x400; the dynel must have a model for its head anchor).
-pub(super) fn selection_indicator(gui: &mut Gui, zone: &Zone, cam: &Camera, size: (u32, u32), list: &mut ao_gui::DrawList) {
-    let Some(id) = zone.target else { return };
-    let Some((x, y, tag)) = zone.world.indicator_anchor(id, cam, size) else { return };
-    draw_indicator(gui, &tag.text, tag.rgb(), x, y, info(zone, id).map_or(0.0, |i| i.health), list);
-}
-
 /// `TargetHealthBar_c` surfaces (`FUN_10073598`, `FUN_10072ead`): caps at both ends tinted DEFAULT, the background between them
 /// (DEFAULT) and the slider over the background up to `ratio` of its width; the slider texture (16 px) repeats along the bar (its
 /// source frame is the destination size). Red caps (`0xff2222`, `FUN_10072e49` when `+0x161`/`+0x162` is set) are UNRESOLVED:

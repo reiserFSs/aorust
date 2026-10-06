@@ -72,7 +72,12 @@ Field codes (pack `FUN_1017161f`, unpack `FUN_10171ae5`):
 `0x15 S` lookup name; `0x1e ISD` tell; `0x28 ID` / `0x29 I` buddy add / remove; `0x33 I` / `0x34 I` / `0x35 I` private group join / leave / …;
 `0x39 ISD` private group message; `0x40 GID` group flags; `0x41 GSD` group message (`FUN_1016c9f4` picks 0x39 when the group kind is 0xE);
 `0x46 IG`, `0x47 IIII`, `0x578 IS`, `0x579 S`, `0x5dc S`, `0x5dd (empty)`, `0x5de IIII`, `0x3e9..0x406` (LFT / mail / misc, not implemented).
-`D` of outgoing text is `(ptr, len)` supplied by the GUI; we send a single NUL like AOChat [UNVERIFIED which the original sends].
+`D` of outgoing requests (RE of the GUI callers, GUI.dll, 2026-10):
+* tell 0x1e [`0x1008947b` -> `0x10089c00` -> `FUN_1016c8c9`]: `D = buf[0..n+1]`, `buf[0] = request.kind` (0 for a typed tell), `buf[1..] = FUN_10089163(attachment)`; the attachment serializer returns 0 when the message has no link attachment, so **D = `00`** (1 byte).
+* group 0x41 / private group 0x39 [`0x1008a400..0x1008a436` -> `FUN_1016c9f4`]: `n = FUN_10089163(att, buf, 0x10000)`, `D = (n > 0 ? buf : NULL, n)`: **empty block (u16 0)** without attachment. (An item-link attachment would be `pack("BBBSS", 1, b0, b1, s1, s2)`, the same TLV tag 1 `BBSS` the receiver parses in `FUN_10085b4a`; not produced by the port, which has no item-link macros.)
+* group flags 0x40 [`0x10086186`]: `D = (NULL, 0)`.
+* buddy add 0x28 [`FUN_1016c91a`]: `D` = 1 byte; **1** from the "add to buddy list" menu action (`0x100a7e73` -> `0x100a6940`), **0** for the temporary entry created when a tell window opens (`0x100a5e7a`).
+Earlier builds sent a lone NUL everywhere (AOChat habit); the live server accepted it, the original differs for group/private-group messages and buddy add.
 
 ## Message data block (`D`)
 
@@ -83,4 +88,4 @@ Field codes (pack `FUN_1017161f`, unpack `FUN_10171ae5`):
 ## Unresolved
 
 * Group announcements (0x3c) did not come in the standalone probe login (12 s) but arrived ~35 s after the zone login in the app (docs/chat/live.md); the trigger is unknown (zone presence or time).
-* Exact content of the outgoing `D` block, and the reduction applied to incoming text (`RemoteFormat::ParseString`, `HTMLParser_c::ExtractText`).
+* The reduction applied to incoming text (`RemoteFormat::ParseString`, `HTMLParser_c::ExtractText`).

@@ -268,6 +268,87 @@ pub fn health_bar_fill_px(health: i32, max_health: i32) -> u32 {
     (health.min(max_health.max(1)).max(0) as f64 * 64.0 / m) as u32
 }
 
+/// The three kinds of `Indicator_t` (ctor `FUN_100255be(identity, attacking, healthbar)` [GUI 0x100255be]); the only creators are
+/// `HandleNametags` (0x10025d96, `(id,0,0)`), `SetTarget` (0x100257b0, `(id,0,1)`) and `FrameProcess` (0x10025fa4, `(id,1,1)`). The
+/// plate and the health bar share the one flag byte (`+0x31`): nametags have neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IndicatorKind {
+    Nametag,
+    Selection,
+    Attacking,
+}
+
+impl IndicatorKind {
+    /// `GFX_GUI_INDICATOR_ATTACKING` 0xe5 when the attack byte (`+0x30`) is set, else `GFX_GUI_INDICATOR_SELECTED` 0xe6 (`FUN_10024e14`);
+    /// `None` for plain nametags.
+    pub fn plate_gfx(self) -> Option<u32> {
+        match self {
+            IndicatorKind::Nametag => None,
+            IndicatorKind::Selection => Some(0xe6),
+            IndicatorKind::Attacking => Some(0xe5),
+        }
+    }
+    /// Plate and health bar (`FUN_10024c03` tests `+0x31`).
+    pub fn has_bar(self) -> bool {
+        self != IndicatorKind::Nametag
+    }
+}
+
+/// `SetTarget` creates the selection indicator only when the target's stat `Flags` (0) has bit 0x400 clear
+/// (`N3Msg_GetSkill(id, 0) & 0x400 == 0`, GUI 0x100257b0).
+pub fn selection_indicator_exists(target_flags: i32) -> bool {
+    target_flags & 0x400 == 0
+}
+
+/// `HandleNametags` lists characters from `N3Msg_GetDynelsInVicinity(50000)`; [`NAME_TAG_RADIUS`], not the client character, `InPlay`
+/// ≠ 0 and stat `Features` bit 7 (0x80) clear [GC 0x1001df09]. `features` = the dynel's Features stat when known.
+pub fn nametag_listed(features: Option<i32>) -> bool {
+    features.is_none_or(|f| f == INVALID_STAT || f & 0x80 == 0)
+}
+
+/// `FUN_10024d5b` [GUI 0x10024d5b] shows the sprite only when `N3Msg_GetIndicatorPosition` has `x > 0` (server coordinates; anything
+/// else, e.g. an unplaced dynel, hides it).
+pub fn tag_anchor_visible(server_x: f32) -> bool {
+    server_x > 0.0
+}
+
+/// Where everything goes in the 32 px high tag sprite (`FUN_10024e14`, `FUN_10024c03`, TextOutput_t [GUI 0x23581, Alignment 0x231d8]):
+/// text lines are centred in the sprite (`TextOutput` flag 0x800) at y = 1 (name) and y = 19 (organisation, `Print(…, 0, 0x13, …)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TagLayout {
+    pub width: u32,
+    pub text_x: i32,
+    pub org_x: i32,
+    /// Left edge of the 64 px health bar (`(width − 64) / 2`), rows [`BAR_Y0`]..[`BAR_Y1`].
+    pub bar_x: i32,
+}
+
+pub const TEXT_Y: i32 = 1;
+pub const ORG_Y: i32 = 19;
+pub const BAR_Y0: i32 = 14;
+pub const BAR_Y1: i32 = 18;
+pub const BAR_W: i32 = 64;
+
+/// Layout for a name of `text_px` and an organisation line of `org_px` pixels (0 = none).
+pub fn tag_layout(text_px: i32, org_px: i32) -> TagLayout {
+    let width = sprite_width_px(text_px.max(org_px).max(0) as u32);
+    let centre = |px: i32| (width as i32 - px) / 2;
+    TagLayout { width, text_x: centre(text_px), org_x: centre(org_px), bar_x: (width as i32 - BAR_W) / 2 }
+}
+
+/// Colour of the bar background right of the fill.
+pub const BAR_BACKGROUND: u32 = 0x333333;
+
+/// Camera-facing quad of a tag (`RSprite` mode 1, randy31 0x10013ab2 copies the camera's rotation; vertices 0x100132b3: pivot 0 = centred,
+/// half extents `size · 0.5`, rotated by 3.14 rad): the four corners for a camera with unit axes `right`, `up`, centred at `centre`.
+/// Order: top-left, top-right, bottom-left, bottom-right as the viewer sees them.
+pub fn billboard_corners(centre: [f32; 3], right: [f32; 3], up: [f32; 3], width_px: u32) -> [[f32; 3]; 4] {
+    let (w, h) = sprite_world_size(width_px);
+    let (hw, hh) = (w * 0.5, h * 0.5);
+    let at = |sx: f32, sy: f32| [0, 1, 2].map(|i| centre[i] + right[i] * hw * sx + up[i] * hh * sy);
+    [at(-1.0, 1.0), at(1.0, 1.0), at(-1.0, -1.0), at(1.0, -1.0)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +406,38 @@ mod tests {
         assert_eq!(sprite_world_size(256), (2.0, 0.3));
         assert_eq!(color_code_rgb(12), Some(0xff0000));
         assert_eq!(color_code_rgb(10), Some(0x2299ff));
+    }
+
+    #[test]
+    fn indicator_rules() {
+        assert_eq!(IndicatorKind::Nametag.plate_gfx(), None);
+        assert_eq!((IndicatorKind::Selection.plate_gfx(), IndicatorKind::Attacking.plate_gfx()), (Some(0xe6), Some(0xe5)));
+        assert!(!IndicatorKind::Nametag.has_bar() && IndicatorKind::Selection.has_bar() && IndicatorKind::Attacking.has_bar());
+        assert!(selection_indicator_exists(0) && selection_indicator_exists(0x3ff) && !selection_indicator_exists(0x400));
+        assert!(nametag_listed(None) && nametag_listed(Some(INVALID_STAT)) && nametag_listed(Some(0x7f)) && !nametag_listed(Some(0x80)));
+        assert!(tag_anchor_visible(1.0) && !tag_anchor_visible(0.0) && !tag_anchor_visible(-3.0));
+    }
+
+    #[test]
+    fn layout_centres_and_widens() {
+        let l = tag_layout(40, 0);
+        assert_eq!((l.width, l.text_x, l.bar_x), (128, 44, 32));
+        let wide = tag_layout(129, 0);
+        assert_eq!((wide.width, wide.text_x, wide.bar_x), (256, 63, 96));
+        // the organisation line widens the sprite too
+        assert_eq!(tag_layout(40, 200).width, 256);
+    }
+
+    #[test]
+    fn billboard_shrinks_with_distance() {
+        // pinhole camera at the origin looking along +z, 90° vertical fov, 1000 px high: projected height = 0.3 · 500 / z
+        let px = |z: f32| {
+            let c = billboard_corners([0.0, 0.0, z], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 128);
+            (c[0][1] - c[2][1]) * 500.0 / z
+        };
+        assert!((px(1.0) - 150.0).abs() < 1e-3 && (px(3.0) - 50.0).abs() < 1e-3 && (px(10.0) - 15.0).abs() < 1e-3);
+        // a 256 px sprite is twice as wide, as high
+        let c = billboard_corners([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 256);
+        assert_eq!((c[1][0] - c[0][0], c[0][1] - c[2][1]), (2.0, 0.3));
     }
 }

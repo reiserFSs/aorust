@@ -17,8 +17,19 @@ N3 frame ──Zone::on_frame──▶ Dynels::on_message ──▶ Char (Mover)
 * `ao_scene::ActorFrame` / `Renderer::add_actor_model` / `Host::{actors, actor_models}` (`crates/ao-render/src/actors.rs`): the model's
   indices, materials and textures are uploaded once per key; the skinned body (`meshes[0]`) has one vertex buffer per actor that
   is rewritten when a new pose is supplied; head and attached weapons are rigid meshes that only get a transform. Actors are
-  frustum-culled per mesh (bounding sphere + 1 m pose margin on the body), opaque parts first, blended parts far to near,
-  after the world. Actors that are not pushed in a frame are forgotten (`Renderer::set_actors`).
+  frustum-culled per mesh (bounding sphere + 1 m pose margin on the body). Actors that are not pushed in a frame are forgotten
+  (`Renderer::set_actors`).
+* **Draw order** (RE: `DisplaySystem_t::Render` @0x100793b8 = `RViewPort_t::Render(list a, list b, type, first bucket, last bucket)` @0x1004bfff
+  calls; a visual is queued by `RVisual_t::AddToRenderList` @0x1004c9c2 into `list × 0x708 distance buckets`): sky/ground lists 0–2, then **lists 3 + 4** (3 = opaque
+  meshes and the CAT visual `FUN_10056ed6` without transparency (`SetRenderPriority(3)`); **4 = `VisualLiquid_t`** = the water ctor @0x10067385 `SetRenderPriority(4)`), then the blended
+  **lists 5 + 6** far → near (5 = blended meshes, 6 = CAT visuals with opacity < 1 / colour modifiers, particle effects), then `RenderRefraction(list 4)` (water's second look), the whole
+  thing once for the far distance buckets (≥ 500) and once for the near ones; list 7 (fader) and 9/10 last. So an **opaque actor is drawn before the water surface** and
+  the water blends over it (actors standing in / under water are tinted), while blended actor parts come after the water. The renderer does exactly that (`Submesh::liquid`,
+  set by `playfield/water.rs`): sky → world opaque → actors opaque → liquids (lava's opaque layer first) → blended world far→near → actors blended far→near.
+  Not modelled: the far/near split at bucket 500 (≥ ~500 m, beyond what actors reach), `RenderRefraction`'s second water pass, the CAT visual's transparent-material second pass per
+  actor (`+0xbd` flag: here each submesh is classified by its blend), water drawn near→far (the client's bucket order for lists 3/4) instead of far→near.
+* Actor materials: the AlphaMode of the part's texture and the **environment (sphere-map) layer** are applied per submesh (`Submesh::glow_mask` / `blend`, `Submesh::env_texture`),
+  rules and addresses in docs/zone/npc.md §5; the wire `TextureData` env texture and alpha mode flow through `CharLook::textures` → `TextureOverride` → `actor::npc_part_layers` → `ActorRig::new`.
 * `ao_formats::character::actor::ActorRig` builds a model from a CAT model + head + part textures + attachment meshes and
   skins it on the CPU for any clip/time (`pose`) — 600 body vertices, ≈ 5 µs per pose.
 * `Look` (hash = model key) is what the app derives from a message: `Char` (SimpleCharFullUpdate: breed/sex/race/fatness, head,
@@ -57,11 +68,16 @@ while it is behind the camera; held poses (corpses, dead characters at the end o
 
 ## 4. Name tags
 
-Only with the pref `ShowAllNames` (off by default in the original, `OptionPanel/Root.xml`; here `Dynels::show_all_names`, env
-`AOMAC_SHOW_ALL_NAMES` for testing): text, colour and anchor per docs/zone/motion.md §6 (`ao_net::n3::nametag`), font `FontGameShell12`,
-dynels within 30 m of the player. **Not faithful yet:** the original draws the text into a world-space billboard (`width/128 × 0.3` m, so it
-shrinks with distance); the GUI draw list only has 1:1 glyphs, so the tag is drawn at native size at the projected anchor. The selection /
-attack indicator over a targeted dynel belongs to the target window (`hud_target.rs`).
+Name tags and the target indicators are the original's world-space billboards (`play/tags.rs`, details and addresses in docs/zone/motion.md §6):
+`Dynels::name_tags(dt, gui, host, own_pos, indicators)` composes the 32 px sprite (name line `FontGameShell12` at y = 1, organisation line at
+y = 19, plate 0xe6 / 0xe5 and the 64×4 health bar for indicators), uploads it as a four-vertex alpha-test emissive model and pushes one camera-facing
+`ActorFrame` per tag, `width/128 × 0.3` m big, centred on the head anchor, so it shrinks with perspective. Which tags exist: the selected
+target's indicator (unless its `Flags` has bit 0x400), the attacked dynel's indicator (`Zone::fight_target` of the own character), and with the
+pref `ShowAllNames` (off by default, here `Dynels::show_all_names`, env `AOMAC_SHOW_ALL_NAMES` for testing) the nametags of the characters within
+30 m of the player, rebuilt every 2 s. Colours: white, green/blue by `Flags`, red for stat 345 / hostile battle-station players; the original has
+no faction / con / team tint of the name (motion.md §6), the con colour only fills the health bar. There is no hover tag in the original (the
+object under the mouse only picks the pointer). Not modelled: ignored-character icon, `InPlay`/visibility/parent tests, org line (needs `IsOrgNameShownOverHead`
+and the clan string, not decoded), more than 96 tags at once.
 
 ## 5. Open items
 
@@ -69,5 +85,5 @@ attack indicator over a targeted dynel belongs to the target window (`hud_target
 * `Features` of players is an inference (bit 4); NPC `Features` come from their record.
 * Environment-map layer (`TextureData.env_texture`), `AlphaMode` 5. Heads/attachments: the mounted set is exactly the message's attractor list (`CharacterMesh::ClearAttractors` drops the `HeadMesh` entry added before it, `actor::attractor_list`, docs/zone/npc.md §6); a flag-bit-2 message mounts none.
 * Weapon attractor orientation: the mesh is mounted with the attractor's frame as is; no weapon-specific rotation was found.
-* Name tag billboard scaling (§4); health bars / indicators over heads.
+* Indicators over non-character dynels (corpses, props); the ignored-character icon on the tag plate (§4).
 * Doors do not animate (open/close state is server driven and no door message is decoded).

@@ -77,6 +77,15 @@ pub fn npc_part_textures(store: &RecordStore, cat: &CatMesh, list: &[TextureOver
     out
 }
 
+/// The env-texture / alpha-mode part of the wire `textures[]` list (`SetCATTexture` layers 3 and 1, [`texture_overrides`]) per part
+/// name; parts the list does not touch keep the part table's env texture and the constructor's alpha mode ([`PartLayer`]).
+pub fn npc_part_layers(cat: &CatMesh, list: &[TextureOverride]) -> PartLayers {
+    texture_overrides(cat, list)
+        .into_iter()
+        .map(|(i, o)| (cat.parts[i].name.clone(), PartLayer { env_texture: o.env_texture, alpha_mode: (o.texture != 0).then_some(o.alpha_mode) }))
+        .collect()
+}
+
 /// What a player looks like on the wire (`SimpleCharFullUpdate` packed word, head, cloth).
 #[derive(Clone, Debug)]
 pub struct PlayerLook {
@@ -139,15 +148,16 @@ pub fn attractor_list(head: Option<u32>, wire: &[(u8, u32)]) -> Vec<(u8, u32)> {
 }
 
 impl ActorRig {
-    /// Body model `model_id` (rdb 1010002), optional head mesh (rdb 1010001), per-material texture `overrides` and attachment
+    /// Body model `model_id` (rdb 1010002), optional head mesh (rdb 1010001), per-material texture `overrides` and env/alpha `layers`
+    /// ([`npc_part_layers`]) and attachment
     /// meshes `(attractor place, rdb 1010001 mesh)` (`Attractor01_head` = place 0, `02_righthand` = 1, ...; unknown places are skipped).
-    pub fn new(store: &RecordStore, model_id: u32, head: Option<u32>, overrides: &PartTextures, attachments: &[(u8, u32)]) -> Result<Self> {
+    pub fn new(store: &RecordStore, model_id: u32, head: Option<u32>, overrides: &PartTextures, layers: &PartLayers, attachments: &[(u8, u32)]) -> Result<Self> {
         let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model_id)?;
         // creature models have no head attractor: a head mesh is then not mounted (and the body keeps its own head part)
         let head = head.filter(|_| cat.attractors.iter().any(|a| a.name.ends_with("_head")));
         let bind = bind_frames(&cat);
         let skin = skin_bind(&cat, &bind);
-        let (mut model, ..) = assemble(store, &cat, &skin, overrides, head.is_some());
+        let (mut model, ..) = assemble(store, &cat, &skin, overrides, layers, head.is_some());
         let used = (0..cat.submeshes.len()).filter(|&i| !(head.is_some() && cat.parts[cat.submeshes[i].material as usize].name == "head")).collect();
         let mut mounts = vec![];
         let mut head_att = None;
@@ -177,7 +187,7 @@ impl ActorRig {
         let model = player_model_build(store, look.breed, look.gender, look.build)?;
         let p = Player { breed: look.breed, gender: look.gender, skin: look.skin, head: None, equipment: look.equipment };
         let overrides = part_textures(&assets.names, store, model, &p)?;
-        Self::new(store, model, look.head, &overrides, attachments)
+        Self::new(store, model, look.head, &overrides, &PartLayers::new(), attachments)
     }
 
     /// The textured model for `Renderer::add_actor_model`.
@@ -316,11 +326,10 @@ mod tests {
         let list = [TextureOverride { material: "lizard_green", texture: 22768, env_texture: 0, alpha_mode: 0 }];
         let o = npc_part_textures(&store, &cat, &list, &[]);
         assert_eq!(o["lizard_green"].0, TextureKey { rdb_type: TEXTURE_TYPE, id: 22768 });
-        let rig = ActorRig::new(&store, 22773, None, &o, &[]).unwrap();
+        let rig = ActorRig::new(&store, 22773, None, &o, &PartLayers::new(), &[]).unwrap();
         assert_eq!(rig.model().meshes.len(), 1, "body only");
         assert!(rig.model().textures.contains_key(&TextureKey { rdb_type: TEXTURE_TYPE, id: 22768 }));
     }
-}
 
     /// `ClearAttractors` drops the head `AddAttractorMesh(0, HeadMesh)` just added: only the wire list survives, ordered by place.
     #[test]
@@ -330,3 +339,31 @@ mod tests {
         // equal places: the later insert goes before the earlier one
         assert_eq!(attractor_list(None, &[(1, 7), (1, 8), (0, 3)]), vec![(0, 3), (1, 8), (1, 7)]);
     }
+
+    /// Wire env texture / alpha mode reach the part: only a part whose layer-1 texture was replaced takes the wire alpha mode.
+    #[test]
+    fn wire_layers_per_part() {
+        let part = |n: &str| Part { name: n.into(), texture: 1, env_texture: 2, alpha_aux: 0 };
+        let cat = CatMesh { root: String::new(), parts: vec![part("arms"), part("body")], signature: 0, materials: vec![], spheres: vec![], bones: vec![], submeshes: vec![], col_spheres: vec![], attractors: vec![] };
+        let t = |material, texture, env_texture, alpha_mode| TextureOverride { material, texture, env_texture, alpha_mode };
+        let l = npc_part_layers(&cat, &[t("body", 7, 0, 5), t("arms", 0, 9, 0), t("none", 1, 1, 1)]);
+        assert_eq!(l["body"], PartLayer { env_texture: 0, alpha_mode: Some(5) });
+        assert_eq!(l["arms"], PartLayer { env_texture: 9, alpha_mode: None }, "env only: alpha mode stays the constructor's");
+        assert_eq!(l.len(), 2);
+    }
+
+    /// Model 42370 has a part with an environment texture (`env_sleek.png`): the rig's submesh carries it, the wire layer replaces it.
+    #[test]
+    fn part_env_texture_reaches_the_submesh() {
+        let Some(store) = store() else { return };
+        let cat = load_cat_mesh(&store, CHAR_MESH_TYPE, 42370).unwrap();
+        let Some(p) = cat.parts.iter().find(|p| p.env_texture != 0) else { return };
+        let envs = |layers: &PartLayers| {
+            let rig = ActorRig::new(&store, 42370, None, &PartTextures::new(), layers, &[]).unwrap();
+            rig.model().meshes[0].submeshes.iter().filter_map(|s| s.env_texture.map(|k| k.id)).collect::<Vec<_>>()
+        };
+        assert!(envs(&PartLayers::new()).contains(&p.env_texture));
+        let swapped = PartLayers::from([(p.name.clone(), PartLayer { env_texture: 22768, alpha_mode: None })]);
+        assert!(envs(&swapped).contains(&22768));
+    }
+}

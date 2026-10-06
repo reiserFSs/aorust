@@ -995,8 +995,8 @@ impl Frontend for Play {
         let mut list = self.gui.frame(dt);
         if self.screen == Screen::InWorld {
             let own = self.zone.own().map_or(host.camera.pos.to_array(), |d| zone::scene_pos(d.pos));
-            self.zone.world.name_tags(&mut self.gui, &host.camera, self.size, own, &mut list);
-            super::hud_target::selection_indicator(&mut self.gui, &self.zone, &host.camera, self.size, &mut list);
+            let indicators = super::tags::indicators(&self.zone);
+            self.zone.world.name_tags(dt, &mut self.gui, host, own, &indicators);
             self.fight_draw(host, &mut list);
         }
         if self.screen == Screen::Create {

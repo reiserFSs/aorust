@@ -26,6 +26,8 @@ struct ActorGpu {
     /// Own body vertex buffer, created at the first pose.
     vb: Option<wgpu::Buffer>,
     seen: u64,
+    /// Model key of the last submitted frame (a replaced model only invalidates its own actors' buffers).
+    model: u64,
 }
 
 /// One visible (actor, model mesh) with its slot in the instance buffer.
@@ -87,25 +89,32 @@ impl Renderer {
                     continue;
                 }
                 let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
-                let u = mat_uniform(s);
-                let mat = *mat_of.entry((view, u.map(f32::to_bits))).or_insert_with(|| {
-                    let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: None,
-                        contents: bytemuck::bytes_of(&u),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
-                    mats.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.tex_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[view]) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                            wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
-                        ],
-                    }));
-                    mats.len() - 1
-                });
+                let mut bind = |view: usize, u: [f32; 20]| {
+                    *mat_of.entry((view, u.map(f32::to_bits))).or_insert_with(|| {
+                        let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::bytes_of(&u),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+                        mats.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &self.tex_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[view]) },
+                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                                wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
+                            ],
+                        }));
+                        mats.len() - 1
+                    })
+                };
+                let mat = bind(view, mat_uniform(s));
                 draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe: s.blend as usize * 2 + s.two_sided as usize });
+                // the env layer redraws the same triangles right after them, in the same phase (`FUN_10056ed6`)
+                if let Some(ev) = s.env_texture.and_then(|k| view_of.get(&k).copied()) {
+                    let mat = bind(ev, [0.0; 20]);
+                    draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe: env_pipe(s.blend, s.two_sided) });
+                }
             }
             let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
@@ -119,7 +128,7 @@ impl Renderer {
         }
         self.act.models.insert(key, Model { meshes, mats });
         // actors of a replaced model rebuild their body buffer at the next pose
-        for a in self.act.actors.values_mut() {
+        for a in self.act.actors.values_mut().filter(|a| a.model == key) {
             a.vb = None;
         }
     }
@@ -137,8 +146,9 @@ impl Renderer {
         let tick = self.act.tick;
         for f in &mut frames {
             let Some(body) = self.act.models.get(&f.model).and_then(|m| m.meshes.first()).and_then(Option::as_ref) else { continue };
-            let a = self.act.actors.entry(f.id).or_insert(ActorGpu { vb: None, seen: tick });
+            let a = self.act.actors.entry(f.id).or_insert(ActorGpu { vb: None, seen: tick, model: f.model });
             a.seen = tick;
+            a.model = f.model;
             if let Some(skin) = f.skin.take().filter(|s| s.len() == body.nverts) {
                 let bytes = bytemuck::cast_slice(&vertex_bytes(&skin)).to_vec();
                 match &a.vb {
@@ -197,20 +207,22 @@ impl Renderer {
         }
     }
 
-    /// Draws the prepared actors into the world pass: opaque/cutout first, then blended parts far to near.
-    pub(crate) fn draw_actors<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) -> usize {
+    /// Draws one phase of the prepared actors into the world pass: the opaque/cutout parts (`blended == false`, the client's render
+    /// list 3, drawn with the world's opaque meshes before the liquids) or the blended parts far to near (list 6, after the liquids
+    /// and the blended world).
+    pub(crate) fn draw_actors<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, blended: bool) -> usize {
         let layer = &self.act;
         let Some(buf) = layer.bufs.get(self.frame).filter(|_| !layer.items.is_empty()) else { return 0 };
         let mut calls = 0;
         let mut order: Vec<usize> = (0..layer.items.len()).collect();
-        let mut one = |pass: &mut wgpu::RenderPass<'a>, i: usize, blended: bool| {
+        let mut one = |pass: &mut wgpu::RenderPass<'a>, i: usize| {
             let it = &layer.items[i];
             let model = &layer.models[&it.model];
             let Some(mesh) = model.meshes[it.mesh].as_ref() else { return };
             let own = (it.mesh == 0).then(|| layer.actors.get(&it.actor)?.vb.as_ref()).flatten();
             let mut bound = false;
             for d in &mesh.draws {
-                if matches!(d.pipe / 2, 2 | 3) != blended {
+                if blended_pipe(d.pipe) != blended {
                     continue;
                 }
                 if !bound {
@@ -225,13 +237,41 @@ impl Renderer {
                 calls += 1;
             }
         };
-        for &i in &order {
-            one(pass, i, false);
+        if blended {
+            order.sort_by(|&a, &b| layer.items[b].dist.total_cmp(&layer.items[a].dist));
         }
-        order.sort_by(|&a, &b| layer.items[b].dist.total_cmp(&layer.items[a].dist));
         for i in order {
-            one(pass, i, true);
+            one(pass, i);
         }
         calls
+    }
+}
+
+/// Pipeline of the env layer of a submesh that draws with `blend`: the env pipelines live behind the scene/sky ones and come in
+/// an opaque-phase and a blended-phase set (same pipeline, different phase index).
+fn env_pipe(blend: Blend, two_sided: bool) -> usize {
+    (if matches!(blend, Blend::AlphaBlend | Blend::Additive) { ENV_BLEND_PIPE } else { ENV_PIPE }) + two_sided as usize
+}
+
+/// Whether a draw belongs to the blended actor phase (client render list 6) rather than the opaque one (list 3).
+fn blended_pipe(pipe: usize) -> bool {
+    matches!(pipe / 2, 2 | 3) || pipe >= ENV_BLEND_PIPE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_layer_follows_the_phase_of_its_submesh() {
+        for (blend, blended) in [(Blend::Opaque, false), (Blend::AlphaTest, false), (Blend::AlphaBlend, true), (Blend::Additive, true)] {
+            for two in [false, true] {
+                let base = blend as usize * 2 + two as usize;
+                assert_eq!(blended_pipe(base), blended);
+                assert_eq!(blended_pipe(env_pipe(blend, two)), blended, "{blend:?}");
+                assert!(env_pipe(blend, two) >= ENV_PIPE && env_pipe(blend, two) < ENV_PIPE + 4);
+            }
+        }
+        assert_eq!(env_pipe(Blend::Opaque, true) - env_pipe(Blend::Opaque, false), 1, "two-sided pipeline follows the one-sided one");
     }
 }

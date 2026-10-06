@@ -24,6 +24,7 @@ mod player;
 mod prefs;
 mod preview;
 mod zone;
+mod tags;
 
 use anyhow::Result;
 use ao_audio::Audio;
