@@ -20,12 +20,13 @@ impl Zone {
     /// * `ContainerAddItemIIR_t` with the own character as container and an item identity of the own pages (`FUN_10047d77(kind, from = item.instance,
     ///   to = slot)`): the item at `from` and the cell `to` swap places (`FUN_1002a200` swaps two vector cells), `to == 0x6f` means the first
     ///   free bag slot (`FUN_1002a1b0(0x40)`, nothing happens when the bag is full). The "has item" check `FUN_1002a82b(from)` makes a move of
-    ///   an empty cell a no-op. Bank (`0x69`), backpack (`0x6b`), trade (`0x6e`) and the other special kinds of `FUN_1004ad44` and the pick-up
+    ///   an empty cell a no-op. An item `{0x6b, word << 16 | slot}` of a corpse / chest list moves into the bag (`take_from_container`). Bank (`0x69`), trade (`0x6e`) and the other special kinds of `FUN_1004ad44` and the pick-up
     ///   of a ground item (container `{0, 0}`, `FUN_10047eb2`: needs the item dynel's stats) are **not decoded** (UNRESOLVED): they leave the inventory unchanged.
     /// * `ItemReplacedIIR_c`: a worn slot (`< 0x40`) gets the new item when it differs from the current one (`FUN_1004cf08`).
-    /// * `InventoryUpdate(d)IIR_t` concern chests / the signal only (`FUN_100a040e`, `FUN_10074e49`): the own inventory is not touched.
+    /// * `InventoryUpdateIIR_t` of a chest / corpse stores its list in [`Zone::containers`] (`FUN_100a040e`); `InventoryUpdatedIIR_t` is the signal only (`FUN_10074e49`).
     pub fn apply_inventory(&mut self, msg: &InventoryMsg) {
         match msg {
+            InventoryMsg::ContainerAdd { item, container, slot } if item.kind == inv::KIND_IN_CONTAINER => self.take_from_container(*item, *container, *slot),
             InventoryMsg::ContainerAdd { item, container, slot } => {
                 if *container != self.own_identity() || inv::slot_kind(item.instance.max(0) as u32) != item.kind || item.instance < 0 {
                     return;
@@ -72,8 +73,42 @@ impl Zone {
                     }
                 }
             }
+            // `FUN_100a040e`: the contents of a chest / corpse replace the stored list (the own character's pages are `FullCharacterIIR_t`'s)
+            InventoryMsg::Update(u) if u.container.kind != 0xC350 => {
+                let mut entries = u.entries.clone();
+                entries.sort_by_key(|e| e.slot);
+                self.containers.insert((u.container.kind, u.container.instance), (u.word, entries));
+            }
             InventoryMsg::Updated(_) | InventoryMsg::Update(_) => {}
         }
+    }
+}
+
+impl Zone {
+    /// `ContainerAddItemIIR_t` for an item `{0x6b, word << 16 | slot}` into the own character (`FUN_1004ad44` -> `FUN_1004a7b3(item, slot)` [GC]): the item
+    /// is looked up in the container registered under `word` (`FUN_10048644`, the list of its last `InventoryUpdateIIR_t`), the cell `slot` of that
+    /// list is emptied (`FUN_1002a64f(slot, 0)`) and the item goes to the bag slot `slot_to` (`0x6f` / `-1` = the first free bag slot
+    /// `FUN_1002a1b0(0x40)`, nothing happens when the bag is full). [UNRESOLVED]: the stack merge `FUN_1002a2bc(0x16, ...)` the original tries for a
+    /// stackable item first (`FUN_1002a5ff`) is not applied.
+    fn take_from_container(&mut self, item: Identity, container: Identity, slot_to: i32) {
+        if container != self.own_identity() {
+            return;
+        }
+        let (key, from) = (item.instance >> 16, (item.instance & 0xffff) as u32);
+        let Some(&at) = self.containers.iter().find(|(_, (word, l))| i32::from(*word as i16) == key && l.iter().any(|e| e.slot == from)).map(|(k, _)| k) else { return };
+        let to = match slot_to {
+            inv::ANY_BAG_SLOT | -1 => match self.free_bag_slot() {
+                Some(s) => s,
+                None => return,
+            },
+            s if s >= inv::BAG_FIRST as i32 && !self.inventory.contains_key(&(s as u32)) => s as u32,
+            _ => return,
+        };
+        let list = &mut self.containers.get_mut(&at).expect("found above").1;
+        let mut e = list.remove(list.iter().position(|e| e.slot == from).expect("found above"));
+        e.slot = to;
+        e.a &= !0x40;
+        self.inventory.insert(to, e);
     }
 }
 
@@ -139,5 +174,56 @@ mod tests {
         z.apply_inventory(&InventoryMsg::ItemReplaced { slot: 0x12, old: z.inventory[&0x12].item, new });
         z.apply_inventory(&InventoryMsg::ItemReplaced { slot: 0x40, old: z.inventory[&0x40].item, new });
         assert_eq!((z.inventory[&0x12].item, z.inventory[&0x40].item.low_id), (new, 6));
+    }
+
+    /// Own-account kill (`docs/captures/zone_loot_take_ithaca.rec`, own id 0x830e): `InventoryUpdateIIR_t` (corpse `{0xC76A, 0xfd8}`, word 0x70, one
+    /// item) -> our take `{0x6b, 0x00700000}` -> the server's `ContainerAddItemIIR_t` (container = own, slot 0x6f): the item lands in bag slot 0x40
+    /// and leaves the corpse list.
+    #[test]
+    fn captured_corpse_take_moves_the_item_into_the_bag() {
+        let mut z = Zone::new(0x830e);
+        let mut seen_update = false;
+        for l in include_str!("../../../../../docs/captures/zone_loot_take_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            if dir != "<" {
+                continue;
+            }
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            let f = ao_net::frame::Frame::decode_with(&b, false).unwrap().unwrap().0;
+            z.on_frame(&f);
+            if !seen_update && !z.containers.is_empty() {
+                seen_update = true;
+                let (word, list) = &z.containers[&(0xc76a, 0xfd8)];
+                assert_eq!((*word, list.len(), list[0].slot, list[0].item.low_id), (0x70, 1, 0, 248_323));
+                assert!(z.inventory.is_empty());
+            }
+        }
+        assert!(seen_update);
+        assert_eq!(z.inventory.len(), 1);
+        assert_eq!((z.inventory[&0x40].slot, z.inventory[&0x40].item.low_id), (0x40, 248_323));
+        assert!(z.containers[&(0xc76a, 0xfd8)].1.is_empty());
+    }
+
+    #[test]
+    fn corpse_take_with_a_full_bag_or_unknown_item_changes_nothing() {
+        let mut z = Zone::new(7);
+        let corpse = Identity { kind: 0xc76a, instance: 1 };
+        let entry = InventoryEntry { slot: 3, a: 0, b: 0, id: Identity::default(), item: AcgItem { low_id: 5, high_id: 5, level: 1 } };
+        z.apply_inventory(&InventoryMsg::Update(inv::InventoryUpdate { capacity: 21, kind: 2, entries: vec![entry], container: corpse, word: 0x70, flag: true }));
+        let own = Identity { kind: 0xC350, instance: 7 };
+        let take = |slot: u32, key: i32| InventoryMsg::ContainerAdd { item: inv::container_item_identity(key, slot), container: own, slot: inv::ANY_BAG_SLOT };
+        z.apply_inventory(&take(4, 0x70));
+        z.apply_inventory(&take(3, 0x71));
+        assert!(z.inventory.is_empty() && z.containers[&(0xc76a, 1)].1.len() == 1);
+        for s in inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS {
+            put(&mut z, s, s as i32);
+        }
+        let before = z.inventory.clone();
+        z.apply_inventory(&take(3, 0x70));
+        assert_eq!(z.inventory, before);
+        z.inventory.remove(&0x50);
+        z.apply_inventory(&take(3, 0x70));
+        assert_eq!(z.inventory[&0x50].item.low_id, 5);
     }
 }

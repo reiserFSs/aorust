@@ -105,6 +105,9 @@ pub struct Zone {
     pub stats: HashMap<u32, i32>,
     /// The own inventory by slot (`FullCharacterIIR_t` inventory; slots 0..0x3f equipment pages, 0x40.. bag; docs/gui.md §11.5).
     pub inventory: HashMap<u32, ao_net::n3::world::InventoryEntry>,
+    /// The contents of the chests / corpses the server sent (`InventoryUpdateIIR_t`, `FUN_100a040e`): container identity -> (`word`, entries by slot).
+    /// `{0x6b, word << 16 | slot}` item identities resolve against it (`FUN_10048644`; `play/hud_stats/zone_inv.rs`).
+    pub containers: HashMap<(i32, i32), (i32, Vec<ao_net::n3::world::InventoryEntry>)>,
     /// Other players / NPCs as renderer actors (`play/dynels.rs`).
     pub world: super::dynels::Dynels,
     /// The selected target (`InputConfig_t+0xc0`, set by `TargetingModule_t::SetTarget` GUI 0x100257b0): the dynel instance id.
@@ -223,6 +226,7 @@ impl Zone {
     /// burst re-announces the dynels, and `CharInPlay` is owed again after the new world appears (docs/zone/outgoing.md §3).
     pub fn reset_world(&mut self) {
         self.world.clear();
+        self.containers.clear();
         self.dynels.clear();
         self.fight_target.clear();
         self.own_events.clear();

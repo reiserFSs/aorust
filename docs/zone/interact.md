@@ -253,19 +253,29 @@ Code: `interact_loot.rs`, `interact_use.rs::{watch_objects, use_out}`. Test: `in
    unless one is open already). A SimpleChar container (our own bag etc.) takes the other branch (`FUN_1004775e`, bank / overflow); our own `Zone::apply_inventory` ignores `Update`.
 3. The window (`FUN_100cc2ca`): a `MultiListView_c` item view (`FUN_100cc1b3`) with `SetMaxItemCount(0x15)` = **21 cells, 3 per row** (the `item_position_map` loop uses `n % 3`, `n / 3`, `n < 0x15`), for a corpse
    with the pref `esc_corpses` (Esc closes) and the saved config `TempContainer_%u.xml`; the cell art is the inventory's (`GFX_GUI_MULTILISTVIEW_SLOT_48_*`).
-4. Taking an item: a double click on a cell (`FUN_100ca1e7` [GUI]; not on the own inventory view `+0x14c`) calls `MoveItemToInventory(item identity)`; the item identity of a corpse window is
-   **`{0x6a, container slot}`** [INFERENCE: the dispatcher `FUN_1004ad44` [GC] routes kind `0x6a` to `FUN_10046b0b` (`param_1[0x60]` = the open container -> the own bag, then the +0x8c / +0x8d signals), and
-   `N3Msg_UseItem` names kind 0x6a "items cannot be used from a corpse"]. The move is sent like the unequip of `hud_stats` (`N3Msg_MoveItemToInventory(item, bag, 0x6f)` =
-   `ClientMoveItemToInventoryIIR_t(item, ANY_BAG_SLOT)`); `Feedback_InventoryFull` without a free bag slot. The server-side checks the client shows are `Feedback_NotAllowedToLoot` and
-   `Feedback_YouCantLootNoDropItems` (`FUN_1004b80a`, not evaluated here).
+4. Taking an item: a double click on a cell (`FUN_100ca1e7` [GUI]; not on the own inventory view `+0x14c`, which uses `N3Msg_UseItem`; with Shift / Ctrl and a trade view `N3Msg_TradeAddItem`) calls
+   `N3InterfaceModule_t::MoveItemToInventory(item)` [Interfaces 0x10008197] = `n3EngineClientAnarchy_t::N3Msg_MoveItemToInventory(item, InventoryId 1, 0x6f)` [GC 0x10027a30] = `ClientMoveItemToInventoryIIR_t
+   (item, ANY_BAG_SLOT)` (`FUN_1001534a`: `+0x20/+0x24` = the item identity, `+0x28` = 0x6f). **`item` is the identity stored in the list row (`FUN_1003d830(1, id)` in `FUN_100cdb3a`), i.e. the id of
+   the `InventoryEntry_t` list `N3Msg_GetContainerInventoryList` [GC 0x1001753e] returns for a `Chest_t` (vtable `+0x104` = `FUN_1007de99`): `{0x6b, chest[+0x1dc] * 0x10000 + slot}`**, where
+   `chest[+0x1dc]` is the **`word` of the container's last `InventoryUpdateIIR_t`** (`FUN_100a040e`) and `slot` the index in the container's inventory (the entry's `slot` field). `FUN_100a040e` also
+   registers `word -> container identity` (`FUN_1004af97`, lookup `FUN_10048644`); every consumer decodes the item back as `key = (short)(instance >> 16)`, `slot = instance & 0xffff` (`FUN_10048829`,
+   `FUN_1004a7b3`, `FUN_10048678`, `FUN_100490cd`, `FUN_10049e8f`, the source check `FUN_1004b80a` with kind `0x6b`). Kind `0x6a` is the **own overflow/reclaim container** (`0xdeae`, `FUN_10046b0b`),
+   NOT a corpse item, and the entry's own `id` (`{0x09000001, 0x44b2c5}`) is a different thing (the item's dynel identity) the client never sends. **Own kill (capture `zone_loot_own_kill_ithaca.rec`):
+   update word 0x70, container `{0xC76A, 0xe22}` -> items `{0x6b, 0x00700000}` and `{0x6b, 0x00700001}`; wire `5469373f 0000c350 <own> 00 0000006b 00700001 0000006f`** (test
+   `inventory::tests::corpse_item_identity_is_kind_6b_with_the_update_word_as_key`, `interact_captures::own_kill_take_identity_is_kind_6b_word_and_slot`). The earlier sends `{0x6a, cell}`, `{0x6a, 1}`,
+   `{0xC76A, 0}` and the entry id were all wrong, hence ignored. `N3Msg_IsItemPossibleToUnWear` [GC 0x10026763] passes kind 0x6b, `FUN_1004b80a` is the client-side refusal table (own bag full:
+   `Feedback_InventoryFull` before sending; `Feedback_NotAllowedToLoot`, `Feedback_YouCantLootNoDropItems` [not evaluated]).
+   **Live-proven** (`zone_loot_take_ithaca.rec`): the server answers the take with `ContainerAddItemIIR_t` `{item {0x6b, 0x00700000}, container = own, slot 0x6f}`; the client applies it as `FUN_1004a7b3`
+   (container cell emptied via `FUN_1002a64f`, item into the first free bag slot `FUN_1002a1b0(0x40)`): `Zone::containers` keeps each corpse list from its `InventoryUpdate`, `Zone::apply_inventory`
+   moves the entry into the bag and `LootUi::taken` empties the window cell (tests `zone_inv::tests::captured_corpse_take_moves_the_item_into_the_bag`, `interact_use::tests::captured_take_empties_the_loot_window`). [UNRESOLVED] the stack merge of stackable items (`FUN_1002a5ff` / `FUN_1002a2bc(0x16)`).
 
 **Ours:** `LootUi` opens a tabbed window with a 3 x 7 grid canvas (cells and spacing of the inventory grid, 54 px slot art, 48 px item pictures from rdb 1010008 through `hud_stats::items::Items`,
 tooltip = item name) when an `Update` for a non-character container with flag != 0 arrives, refreshes it on later `Update`s (flag 0), closes it with its close button / Esc; double click on an item sends
 the move. The title is the corpse's name from `CorpseFullUpdateIIR_t`'s name blob ("Remains of ..."), centred on the screen.
 
-**[UNRESOLVED]:** (a) no capture of a loot answer exists: the order / flag of the live server's `InventoryUpdateIIR_t` and that `flag` is set on the first answer are from the code only; (b) the window title
+**[UNRESOLVED]:** (a) the order / flag of the live server's answer is now captured (one `InventoryUpdateIIR_t`, flag 1, word 0x70); (b) the window title
 (`String::Format` of `FUN_100cc2ca` was not read; the saved window position `container_position` / `container_id` and `TempContainer_%u.xml` are not stored); (c) the original's
-list / grid mode switch (`InventoryViewMode`) and the scrollbar of the container view; (d) the identity kind of chest (0xC749) items; (e) team loot (`Feedback_TeamLoot*`, "Random Looter" / "Looter" columns of
+list / grid mode switch (`InventoryViewMode`) and the scrollbar of the container view; (d) chest (0xC749) items use the same `Chest_t` path (`FUN_1007de99`, kind 0x6b) but were never captured; (e) team loot (`Feedback_TeamLoot*`, "Random Looter" / "Looter" columns of
 `FUN_100ca2d3`) and the "take all" (none found in the view); (f) the window closing message: the original's close path (`SlotContainerClosed`, `GlobalSignals +0x88`, emitted by `FUN_100117f6`
 from the bank / reclaim / ... activations) was not traced for corpses, nothing is sent when our window is closed; (g) the look of the window was not compared with a retail screenshot.
 
@@ -402,8 +412,8 @@ Captures (login traffic excluded): `docs/captures/zone_npc_dialogue_ithaca.rec`,
 
 ### 12.3 Objects
 * Vending machine (0xC75B): echo, then `ShopUpdateIIR_t` (key 58362220, 36 items) and a `TradeIIR_t` **op 0** (START, not op 2: version word `00000002`, op byte `00`) pair: header = own, `a` = the machine, `b` = `{0xC767, 0x116f7753}` (a session identity); then header = the machine, `a` = own, the same `b` (buy UI: section 13).
-* Corpse (0xC76A, "Remains of Uncle Pumpkin-Head"): echo + `InventoryUpdateIIR_t` (flag set) -> loot window (screenshot checked). Double click sends `MoveItemToInventory({0x6a, cell}, any)`; the server ignored it and
-  the `entry.id` identity for a corpse another player killed. [UNRESOLVED] taking from our own kill is untested (no kill was reachable).
+* Corpse (0xC76A, "Remains of Uncle Pumpkin-Head"): echo + `InventoryUpdateIIR_t` (flag set) -> loot window (screenshot checked). The first double click sent `MoveItemToInventory({0x6a, cell}, any)`; the server ignored it, as it
+  did `{0x6a,1}`, `{0xC76A,0}` and the entry id, also on our own kill (`zone_loot_own_kill_ithaca.rec`). The identity the original client builds is `{0x6b, update word << 16 | slot}` (section 9, step 4) [UNRESOLVED-live until re-run].
 * Grid terminal / whompah: none in pf 4582/4833/800, `GridDestinationSelect` never received [UNRESOLVED-live]. Player trade needs a second player [UNRESOLVED-live].
 
 ## 13. Vending machines / shops

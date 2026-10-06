@@ -112,3 +112,9 @@ low health); two kills were made with the sit-rest between fights (`X`).
 Capture `docs/captures/zone_kill_ithaca.rec`, test `module::death_tests::live_kill_capture`.
 **Loot**: the corpse opens (2 items + Cash +1) but every `MoveItemToInventory` variant is ignored (`docs/captures/zone_loot_own_kill_ithaca.rec`, docs/zone/interact.md §9, §12.3): open.
 **Weapons**: a new character has an empty inventory (no starter items), so wielding / unwielding and the weapon swing lists could not be tried live.
+
+**Loot (fixed, live-verified)**: with the identity of the original (`{0x6b, word << 16 | slot}`, docs/zone/interact.md §9) the server answers the take with
+`ContainerAddItemIIR_t` (`docs/captures/zone_loot_take_ithaca.rec`) and the items land in the bag: "Perfectly Formed Seashell" and "Battered Light Combat Armor Pants" went to bag slots
+0x41 / 0x42, the loot window cells emptied one by one, a "Spinal Section" from an earlier kill was still in slot 0x40 after a relog. Two of the corpses opened were other players' kills
+(the server lets them be looted too); the own kill's loot worked the same way. Not tried live: wear / unwear (the pants were looted at the end of a session and not persisted by the
+server before the relog, `dclick=<slot hex>` harness step exists), weapons (none obtainable without the Borealis key item).

@@ -5,22 +5,20 @@ use super::hud_stats::inv_grid::{cell_origin, BORDER, ICON as CELL, SPACING};
 use super::hud_stats::items::{Items, SLOT};
 use ao_gui::{CanvasItem, CanvasTip, Event, Gui, WindowId, WindowSize};
 use ao_net::msg::Identity;
-use ao_net::n3::inventory::InventoryUpdate;
+use ao_net::n3::inventory::{container_item_identity, InventoryUpdate};
 use ao_net::n3::world::InventoryEntry;
 use std::path::Path;
 
 /// `SetMaxItemCount(0x15)` of a container view (docs/gui.md §11.5) and the `item_position_map` loop of `FUN_100cc2ca` (`n % 3`, `n / 3`, `n < 0x15`).
 const SLOTS: usize = 0x15;
 const COLUMNS: usize = 3;
-/// `Identity_t::kind` of an item in a corpse's window: `FUN_1004ad44` [GC] sends kind `0x6a` to `FUN_10046b0b` (the corpse -> own bag move) and
-/// `N3Msg_UseItem` refuses it with `Feedback_ItemsCantBeUsedFromCorpse`; the instance is the slot in the container. [INFERENCE]: the kind of the
-/// items of a chest (0xC749) was not separated from it.
-pub const KIND_CORPSE_ITEM: i32 = 0x6a;
 const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
 
 struct Loot {
     window: WindowId,
     container: Identity,
+    /// `word` of the last `InventoryUpdateIIR_t` (chest `+0x1dc`): the key of the items' identities (`container_item_identity`).
+    word: i32,
     /// The items in the order of their cells (by container slot).
     entries: Vec<InventoryEntry>,
     /// The cell of the last short click and when (`Interact::now`), for the double click.
@@ -99,12 +97,13 @@ impl LootUi {
                 let (ow, oh) = gui.outer_size(window);
                 // `Window::MoveToCenter` is the default of a window without a saved frame (`container_position` is not stored)
                 gui.set_window_pos(window, ((screen.0 as i32 - ow as i32) / 2, (screen.1 as i32 - oh as i32) / 2));
-                self.open.push(Loot { window, container, entries: vec![], clicked: None });
+                self.open.push(Loot { window, container, word: u.word, entries: vec![], clicked: None });
                 self.open.len() - 1
             }
             None => return,
         };
         self.open[at].entries = entries;
+        self.open[at].word = u.word;
         self.draw(gui, at);
     }
 
@@ -126,6 +125,15 @@ impl LootUi {
         let w = self.open[at].window;
         gui.set_canvas(w, "grid", cmds);
         gui.set_canvas_tips(w, "grid", tips);
+    }
+
+    /// `ContainerAddItemIIR_t` for `{0x6b, key << 16 | slot}` into our bag (`FUN_1004a7b3`: the container cell is emptied, `FUN_100490cd` refreshes the
+    /// view): the item leaves the open window whose last update carried `word == key` (as a signed short).
+    pub fn taken(&mut self, gui: &mut Gui, item: Identity) {
+        let (key, slot) = (item.instance >> 16, (item.instance & 0xffff) as u32);
+        let Some(at) = self.open.iter().position(|l| i32::from(l.word as i16) == key && l.entries.iter().any(|e| e.slot == slot)) else { return };
+        self.open[at].entries.retain(|e| e.slot != slot);
+        self.draw(gui, at);
     }
 
     /// `(container, entry.id)` of cell `n` of the first window (live harness).
@@ -153,7 +161,7 @@ impl LootUi {
                 let Some(n) = cell_at(*x, *y).filter(|&n| n < l.entries.len()) else { return Some(None) };
                 let double = l.clicked.is_some_and(|(c, t)| c == n && now - t <= ao_gui::DOUBLE_CLICK_TIME);
                 l.clicked = if double { None } else { Some((n, now)) };
-                Some(double.then(|| Identity { kind: KIND_CORPSE_ITEM, instance: l.entries[n].slot as i32 }))
+                Some(double.then(|| container_item_identity(l.word, l.entries[n].slot)))
             }
             Event::CloseRequested { window } | Event::Escape { window } if self.open.iter().any(|l| l.window == *window) => {
                 let i = self.open.iter().position(|l| l.window == *window)?;
@@ -197,7 +205,7 @@ mod tests {
 
     fn update(flag: bool, slots: &[u32]) -> InventoryUpdate {
         let entries = slots.iter().map(|&s| InventoryEntry { slot: s, a: 0, b: 0, id: Identity::default(), item: AcgItem { low_id: 1, high_id: 1, level: 1 } }).collect();
-        InventoryUpdate { capacity: 21, kind: 0, entries, container: Identity { kind: 0xC76A, instance: 5 }, word: 0, flag }
+        InventoryUpdate { capacity: 21, kind: 0, entries, container: Identity { kind: 0xC76A, instance: 5 }, word: 0x70, flag }
     }
 
     #[test]
@@ -220,7 +228,7 @@ mod tests {
         let (ox, oy) = cell_origin(1, 0, gap());
         let click = Event::CanvasClick { window: w, view: "grid".into(), x: ox + 2.0, y: oy + 2.0 };
         assert_eq!(ui.event(&mut gui, &click, 1.0), Some(None));
-        assert_eq!(ui.event(&mut gui, &click, 1.2), Some(Some(Identity { kind: KIND_CORPSE_ITEM, instance: 3 })));
+        assert_eq!(ui.event(&mut gui, &click, 1.2), Some(Some(Identity { kind: 0x6b, instance: 0x0070_0003 })));
         // too slow: no double click; an empty cell: nothing
         assert_eq!(ui.event(&mut gui, &click, 5.0), Some(None));
         let (ex, ey) = cell_origin(2, 5, gap());

@@ -213,6 +213,12 @@ impl Interact {
                 let ui = &mut self.use_ui;
                 ui.loot.update(gui, ui.dir.as_deref(), self.screen, u.container, &title, u);
             }
+            // the server's answer to the take: `{0x6b, word << 16 | slot}` goes into our bag, the corpse list loses it (zone side: `Zone::apply_inventory`)
+            N3::Inventory(InventoryMsg::ContainerAdd { item, container, .. })
+                if item.kind == inventory::KIND_IN_CONTAINER && *container == (Identity { kind: DYNEL_CHAR, instance: self.own as i32 }) =>
+            {
+                self.use_ui.loot.taken(gui, *item);
+            }
             _ => {}
         }
     }
@@ -357,7 +363,7 @@ mod tests {
         assert_eq!(payloads(&mut i).len(), 1);
     }
 
-    /// `InventoryUpdateIIR_t` (header = the own character) for the corpse `{0xC76A, 5}`: capacity 0x15, kind 0, `items` = (slot, item id), flag.
+    /// `InventoryUpdateIIR_t` (header = the own character) for the corpse `{0xC76A, 5}`: capacity 0x15, kind 0, `items` = (slot, item id), word 0x70, flag.
     fn loot_frame(own: u32, items: &[(u32, i32)], flag: bool) -> ao_net::frame::Frame {
         let mut b = vec![];
         let put = |b: &mut Vec<u8>, v: u32| b.extend(v.to_be_bytes());
@@ -377,7 +383,7 @@ mod tests {
         }
         put(&mut b, 0xC76A);
         put(&mut b, 5);
-        put(&mut b, 0);
+        put(&mut b, 0x70);
         put(&mut b, u32::from(flag));
         n3_frame(1, own, b)
     }
@@ -401,7 +407,7 @@ mod tests {
         assert_eq!(dump.len(), 1);
         assert_eq!((dump[0].0, dump[0].1.len()), (corpse, 2));
         assert!(!dump[0].1[0].2.is_empty(), "the item has its record name: {dump:?}");
-        // the cell of the second item; a double click sends the move to any bag slot
+        // the cell of the second item; a double click sends the move to any bag slot with `{0x6b, word << 16 | slot}` (`FUN_1007de99`)
         let w = i.use_ui.loot_window(corpse).unwrap();
         let (ox, oy) = super::super::hud_stats::inv_grid::cell_origin(1, 0, (10.0, 10.0));
         let click = Event::CanvasClick { window: w, view: "grid".into(), x: ox + 2.0, y: oy + 2.0 };
@@ -411,7 +417,33 @@ mod tests {
         i.tick(1.2);
         assert!(i.event(&mut gui, &click, &zone));
         let p = payloads(&mut i);
-        assert_eq!(p, [inventory::move_item_to_inventory(0x6584, Identity { kind: 0x6a, instance: 4 }, ANY_BAG_SLOT)]);
+        assert_eq!(p, [inventory::move_item_to_inventory(0x6584, Identity { kind: 0x6b, instance: 0x0070_0004 }, ANY_BAG_SLOT)]);
+    }
+
+    /// The same capture through the loot window: the window opens with the update and the server's `ContainerAddItemIIR_t` empties the taken cell.
+    #[test]
+    fn captured_take_empties_the_loot_window() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() {
+            return;
+        }
+        let mut gui = Gui::new(&client, None).unwrap();
+        gui.set_screen_size(1280, 800);
+        let zone = Zone::new(0x830e);
+        let mut i = Interact::new(0x830e, (1280, 800));
+        i.set_client_dir(client);
+        let mut rows = vec![];
+        for l in include_str!("../../../../docs/captures/zone_loot_take_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            if dir == "<" {
+                let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+                i.on_frame(&mut gui, &ao_net::frame::Frame::decode_with(&b, false).unwrap().unwrap().0, &zone);
+                rows.push(i.loot_dump(&mut gui).iter().map(|(_, r)| r.len()).sum::<usize>());
+            }
+        }
+        assert!(rows.contains(&1), "{rows:?}");
+        assert_eq!(rows.last(), Some(&0), "{rows:?}");
     }
 
     #[test]

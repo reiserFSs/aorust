@@ -53,8 +53,17 @@ pub const KIND_IMPLANT_PAGE: i32 = 0x67;
 pub const KIND_BAG: i32 = 0x68;
 /// Bank item (`N3Msg_UseItem`: "Feedback_ItemCantBeUsedFromBank").
 pub const KIND_BANK: i32 = 0x69;
-/// Item inside a backpack: `instance` low 16 bits = slot, high 16 bits = backpack slot (`FUN_1004a7b3`).
+/// An item inside a `Chest_t` (corpse 0xC76A, chest 0xC749, backpack): `instance = key * 0x10000 + slot`, `key` = the `word` of the container's last
+/// `InventoryUpdateIIR_t` (chest `+0x1dc`; `FUN_1004af97` registers `key -> container identity`, `FUN_10048644` looks it up), `slot` = the index in the
+/// container's inventory. Built by `FUN_1007de99` [GC] (the list `N3Msg_GetContainerInventoryList` returns for a chest) and read back by `FUN_1004b80a`,
+/// `FUN_1004a7b3`, `FUN_10048829` (`instance >> 16` as signed short, `& 0xffff`).
 pub const KIND_IN_CONTAINER: i32 = 0x6b;
+
+/// The identity of the item in `slot` of the container whose last `InventoryUpdateIIR_t` carried `word` (`FUN_1007de99`).
+pub fn container_item_identity(word: i32, slot: u32) -> Identity {
+    Identity { kind: KIND_IN_CONTAINER, instance: word.wrapping_mul(0x10000).wrapping_add(slot as i32) }
+}
+
 /// An item of the social page.
 pub const KIND_SOCIAL_PAGE: i32 = 0x73;
 
@@ -329,5 +338,27 @@ mod tests {
         }
         assert!(parse(&[b.clone(), vec![0]].concat()).is_err());
         assert_eq!(parse(&hex("00000001 0000c350 00000001 00")).unwrap(), None);
+    }
+
+    /// Own kill on Ithaca (`docs/captures/zone_loot_own_kill_ithaca.rec`): the corpse's `InventoryUpdateIIR_t` and the take the original client sends
+    /// (`FUN_100ca1e7` -> `MoveItemToInventory(item)` = `N3Msg_MoveItemToInventory(item, 1, 0x6f)`, the item built by `FUN_1007de99`).
+    #[test]
+    fn corpse_item_identity_is_kind_6b_with_the_update_word_as_key() {
+        let b = hex(
+            "4e536976 0000c350 0000830e 01 00000015 00000002 00000bd3
+             00000000 00a1 0001 09000001 0044b2c5 0000a690 0000a690 00000001 00000000
+             00000001 00a1 0001 09000001 0044b2c6 0003ca03 0003ca03 00000001 00000000
+             0000c76a 00000e22 00000070 00000001",
+        );
+        let Some(InventoryMsg::Update(u)) = parse(&b).unwrap() else { panic!() };
+        assert_eq!((u.container, u.word, u.flag), (Identity { kind: 0xc76a, instance: 0xe22 }, 0x70, true));
+        // the entry's own `id` (kind 0x09000001) is NOT what the client sends back
+        assert_eq!(u.entries[0].id, Identity { kind: 0x0900_0001, instance: 0x44b2c5 });
+        let ids: Vec<_> = u.entries.iter().map(|e| container_item_identity(u.word, e.slot)).collect();
+        assert_eq!(ids, [Identity { kind: 0x6b, instance: 0x0070_0000 }, Identity { kind: 0x6b, instance: 0x0070_0001 }]);
+        let take = move_item_to_inventory(0x830e, ids[1], ANY_BAG_SLOT);
+        assert_eq!(take, hex("5469373f 0000c350 0000830e 00 0000006b 00700001 0000006f"));
+        // the key is a signed short (`*(short *)(id + 6)`)
+        assert_eq!(container_item_identity(-1, 2).instance >> 16, -1);
     }
 }

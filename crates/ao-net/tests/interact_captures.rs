@@ -78,9 +78,31 @@ fn use_key_on_teleporter_and_machine_and_corpse() {
     let u = loot.expect("the corpse's InventoryUpdate");
     assert_eq!(u.entries.iter().map(|e| e.item.low_id).collect::<Vec<_>>(), [269202, 284201]);
     assert_eq!(takes, 1);
-    // the take is `MoveItemToInventory({0x6a, cell 0}, any bag slot)`
+    // the take is `MoveItemToInventory({0x6a, cell 0}, any bag slot)`: what the client sent at the time, an identity the server ignores (see below)
     let take = frames.iter().find(|(_, _, f)| f.payload[..4] == 0x5469373fu32.to_be_bytes()).unwrap();
     assert_eq!(take.2.payload, inventory::move_item_to_inventory(OWN, Identity { kind: 0x6a, instance: 0 }, 0x6f));
+}
+
+/// Own kill (`zone_loot_own_kill_ithaca.rec`, own id 0x830e): the corpse's `InventoryUpdateIIR_t` (word 0x70, 2 items) and the five takes sent then, none
+/// of them the identity the original client builds (`FUN_1007de99`: `{0x6b, word << 16 | slot}`).
+#[test]
+fn own_kill_take_identity_is_kind_6b_word_and_slot() {
+    let frames = load(include_str!("../../../docs/captures/zone_loot_own_kill_ithaca.rec"));
+    let u = frames
+        .iter()
+        .find_map(|(_, _, f)| match n3::decode(f).unwrap().body {
+            N3::Inventory(InventoryMsg::Update(u)) => Some(u),
+            _ => None,
+        })
+        .expect("the corpse's InventoryUpdate");
+    assert_eq!((u.container, u.word, u.flag, u.entries.len()), (Identity { kind: 0xc76a, instance: 0xe22 }, 0x70, true, 2));
+    let ids: Vec<_> = u.entries.iter().map(|e| inventory::container_item_identity(u.word, e.slot)).collect();
+    assert_eq!(ids, [Identity { kind: 0x6b, instance: 0x0070_0000 }, Identity { kind: 0x6b, instance: 0x0070_0001 }]);
+    let sent: Vec<_> = frames.iter().filter(|(_, from_server, f)| !from_server && f.payload[..4] == 0x5469373fu32.to_be_bytes()).collect();
+    assert_eq!(sent.len(), 5);
+    for (_, _, f) in &sent {
+        assert!(ids.iter().all(|&id| f.payload != inventory::move_item_to_inventory(0x830e, id, 0x6f)), "the capture predates the fix");
+    }
 }
 
 #[test]
