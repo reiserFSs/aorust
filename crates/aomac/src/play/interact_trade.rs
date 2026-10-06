@@ -412,16 +412,11 @@ impl Interact {
         true
     }
 
-    /// Put the inventory item `item` into the trade container as if it was dropped on it; false without an open trade window or when it does not fit.
-    pub fn trade_add(&mut self, gui: &mut Gui, item: Identity) -> bool {
-        let (me, npc) = (self.own_id(), self.chat.as_ref().map(|c| c.npc));
-        let (Some(t), Some(npc)) = (self.trade.win.as_mut(), npc) else { return false };
-        if !t.has_room() {
-            return false;
-        }
-        t.add(gui, TradeItem { id: item, name: String::new(), icon: None });
-        self.send(knubot::trade_item(me, npc, 0, item));
-        true
+    /// Put a resolved inventory slot into the container through the same drop path as the HUD.
+    pub fn trade_add(&mut self, gui: &mut Gui, slot: u32, info: super::hud_stats::ItemInfo) -> bool {
+        let Some(t) = self.trade.win.as_ref().filter(|t| t.has_room()) else { return false };
+        let Some(r) = gui.view_rect(t.win, "items") else { return false };
+        self.trade_drop(gui, slot, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0, info)
     }
 
     /// Press the accept button with `credits` in the credits field.
@@ -557,9 +552,9 @@ mod tests {
         // items: three fit, the fourth is refused
         let item = |n| Identity { kind: 0x68, instance: 0x40 + n };
         for n in 0..3 {
-            assert!(i.trade_add(&mut gui, item(n)));
+            assert!(i.trade_add(&mut gui, (0x40 + n) as u32, Default::default()));
         }
-        assert!(!i.trade_add(&mut gui, item(3)));
+        assert!(!i.trade_add(&mut gui, 0x43, Default::default()));
         assert_eq!(sent(&mut i).len(), 3);
         assert!(i.trade_dump(&gui).contains("max 3"));
         // accept with more credits than Cash: clamped to Cash, the field is rewritten, Cash drops at once
@@ -605,10 +600,18 @@ mod tests {
         let (x, y) = (r.l + 10.0, r.t + 10.0);
         assert!(i.trade_wants(&gui, x, y));
         assert!(!i.trade_wants(&gui, r.l - 100.0, r.t));
-        assert!(i.trade_drop(&mut gui, 0x40, x, y, ("Sword".into(), None)));
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/rdb.db").exists() { return; }
+        let mut items = super::super::hud_stats::items::Items::new(&client);
+        let info = items.info(&mut gui, 248323).map(|i| (i.name.clone(), i.icon)).unwrap();
+        assert_eq!(info.0, "Spinal Section");
+        let icon = info.1.expect("retail Spinal Section icon");
+        assert!(i.trade_add(&mut gui, 0x40, info.clone()));
+        assert_eq!(i.trade.win.as_ref().unwrap().items[0].name, "Spinal Section");
+        assert!(gui.frame(0.0).cmds.iter().any(|cmd| matches!(cmd, DrawCmd::Gfx { id, .. } if *id == icon.0)));
         assert_eq!(sent(&mut i), vec![Knubot::Trade { npc: NPC, op: 0, a: Identity::default(), b: Identity { kind: 0x68, instance: 0x40 } }]);
         // the same item twice is not added again; the drop is still this window's
-        assert!(i.trade_drop(&mut gui, 0x40, x, y, ("Sword".into(), None)));
+        assert!(i.trade_drop(&mut gui, 0x40, x, y, info));
         assert!(sent(&mut i).is_empty());
         // a double click on the first cell takes it out again
         let win = i.trade.win.as_ref().unwrap().win;
@@ -683,7 +686,11 @@ mod tests {
         o.png(&fe, &list, &std::path::Path::new(&dir).join("npc_answers.png")).unwrap();
         // the trade: the text replaces the answers, the trade window docks to the right
         feed(&mut i, &mut fe.0, &z, Knubot::StartTrade { npc: NPC, value: 3, text: "Give me 3 items and some credits".into() });
-        assert!(i.trade_add(&mut fe.0, Identity { kind: 0x68, instance: 0x40 }));
+        let mut items = super::super::hud_stats::items::Items::new(&ao_gui::client_dir());
+        let info = items.info(&mut fe.0, 248323).map(|i| (i.name.clone(), i.icon)).unwrap();
+        assert_eq!(info.0, "Spinal Section");
+        assert!(info.1.is_some());
+        assert!(i.trade_add(&mut fe.0, 0x40, info));
         i.chat.as_mut().unwrap().sync_docks(&mut fe.0, i.trade.win.as_ref().map(|t| t.win));
         let list = o.frame(&mut fe, 0.016);
         o.png(&fe, &list, &std::path::Path::new(&dir).join("npc_trade.png")).unwrap();

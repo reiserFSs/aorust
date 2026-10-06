@@ -11,6 +11,15 @@ use ao_render::{GameInput, KeyCode, Offscreen};
 use std::io::BufRead;
 use std::time::{Duration, Instant};
 
+fn approach_state(zone: &super::super::zone::Zone, fixed: Option<(f32, f32)>, id: i32) -> Option<(&super::super::zone::DynelState, (f32, f32))> {
+    let own = zone.own()?;
+    let goal = match fixed {
+        Some(point) => point,
+        None => { let target = zone.dynels.get(&id)?; (target.pos[0], target.pos[2]) }
+    };
+    Some((own, goal))
+}
+
 struct Live {
     p: Play,
     o: Offscreen,
@@ -428,18 +437,26 @@ fn live_walk() {
                 // `approach=x:z` walks to a point instead
                 let fixed = v.split_once(':').map(|(x, z)| (x.parse::<f32>().unwrap(), z.parse::<f32>().unwrap()));
                 let id: i32 = if v == "target" { l.p.zone.target.unwrap() } else { v.parse().unwrap_or(0) };
-                let goal = |l: &Live| fixed.unwrap_or_else(|| (l.p.zone.dynels[&id].pos[0], l.p.zone.dynels[&id].pos[2]));
-                let dist = |l: &Live| {
-                    let (a, b) = (l.p.zone.own().unwrap().pos, goal(l));
-                    ((b.0 - a[0]).powi(2) + (b.1 - a[2]).powi(2)).sqrt()
-                };
+                let dist = |pos: [f32; 3], goal: (f32, f32)| ((goal.0 - pos[0]).powi(2) + (goal.1 - pos[2]).powi(2)).sqrt();
                 let wrap = |a: f32| (a + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
                 let (mut sign, mut turn_left_is_pos) = (1.0f32, true);
                 let (t0, mut held): (Instant, Option<&str>) = (Instant::now(), None);
-                let (mut last_chk, mut last_err, mut last_dist) = (Instant::now(), 0.0f32, dist(&l));
-                while t0.elapsed().as_secs() < 60 && dist(&l) > 2.5 {
+                let pf0 = l.p.zone.playfield;
+                let (own, goal) = approach_state(&l.p.zone, fixed, id).expect("approach requires an own dynel and a destination");
+                let (mut last_chk, mut last_err, mut last_dist) = (Instant::now(), 0.0f32, dist(own.pos, goal));
+                while t0.elapsed().as_secs() < 60 {
                     l.tick();
-                    let (me, to) = (l.p.zone.own().unwrap().clone(), goal(&l));
+                    // Match goto: death or a zone hand-off ends the old-world movement.
+                    if l.p.fight.as_ref().is_some_and(|m| m.is_dying()) || l.p.zone.playfield != pf0 {
+                        eprintln!("approach ended on death or zone change: {}", l.pos());
+                        break;
+                    }
+                    let Some((me, to)) = approach_state(&l.p.zone, fixed, id) else {
+                        eprintln!("approach ended: own dynel or destination removed: {}", l.pos());
+                        break;
+                    };
+                    let distance = dist(me.pos, to);
+                    if distance <= 2.5 { last_dist = distance; break; }
                     let want = (sign * (to.0 - me.pos[0])).atan2(to.1 - me.pos[2]);
                     let err = wrap(want - me.yaw.unwrap_or(0.0));
                     let key = if err.abs() > 0.12 { Some(if (err > 0.0) == turn_left_is_pos { "A" } else { "D" }) } else { Some("W") };
@@ -454,19 +471,19 @@ fn live_walk() {
                     }
                     if last_chk.elapsed().as_secs_f32() > 0.7 {
                         if held == Some("W") {
-                            if dist(&l) > last_dist + 0.3 {
+                            if distance > last_dist + 0.3 {
                                 sign = -sign; // walking away: the heading convention is mirrored
                             }
                         } else if err.abs() > last_err.abs() + 0.05 {
                             turn_left_is_pos = !turn_left_is_pos;
                         }
-                        (last_chk, last_err, last_dist) = (Instant::now(), err, dist(&l));
+                        (last_chk, last_err, last_dist) = (Instant::now(), err, distance);
                     }
                 }
                 if let Some(k) = held {
                     l.key(code(k), false);
                 }
-                eprintln!("approached {id} to {:.1} m: {}", dist(&l), l.pos());
+                eprintln!("after approach {id} (last measured {last_dist:.1} m): {}", l.pos());
             }
             // chat: `say=<line>` runs the line as if typed in the chat bar (`/say hi`, `/g Global hi`, `/tell X hi`; a line without a leading `/` is dropped by `run_line`)
             "chatdrop" => l.p.chat.as_ref().expect("chat hub").drop_connection(),
@@ -813,7 +830,7 @@ fn live_walk() {
                 let mut v: Vec<_> = l.p.zone.world.prop_list().into_iter().map(|(k, i, p, c)| (((p[0] - me[0]).powi(2) + (p[2] - me[2]).powi(2)).sqrt(), k, i, p, c)).filter(|e| e.0 < v.parse().unwrap_or(30.0)).collect();
                 v.sort_by(|a, b| a.0.total_cmp(&b.0));
                 for (d, k, i, p, c) in v {
-                    eprintln!("prop {k}:{i} kind={k:#x} can={c:?} dist={d:.1} at {:.1},{:.1},{:.1}", p[0], p[1], p[2]);
+                    eprintln!("prop {k}:{i} kind={k:#x} class={:#x?} can={c:?} dist={d:.1} at {:.1},{:.1},{:.1}", l.p.zone.world.item_class_of(k, i), p[0], p[1], p[2]);
                 }
             }
             // `use=<kind>:<instance>`: `N3Msg_DefaultActionOnDynel` on a world object (`Can` bit 0 get, bit 3 use), then what the UI shows
@@ -849,7 +866,12 @@ fn live_walk() {
                     ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() }
                 };
                 let p = &mut l.p;
-                eprintln!("tadd {v}: {}", p.interact.as_mut().unwrap().trade_add(&mut p.gui, item));
+                let slot = p.zone.inventory.iter().find_map(|(&slot, entry)| (ao_net::n3::inventory::item_identity(slot) == item || entry.id == item).then_some((slot, entry.item.low_id)));
+                let added = slot.and_then(|(slot, low)| {
+                    let info = p.hud.as_mut()?.item_info(&mut p.gui, low)?;
+                    Some(p.interact.as_mut().unwrap().trade_add(&mut p.gui, slot, info))
+                }).unwrap_or(false);
+                eprintln!("tadd {v}: {added}");
                 l.wait(3.0);
             }
             "taccept" | "tdecline" => {
@@ -1051,6 +1073,21 @@ mod pilot_tests {
     fn one_cell_route_starts_at_the_last_cell() {
         assert_eq!(Pilot::new(vec![(1.0, 2.0)]).idx(), 0);
         assert_eq!(Pilot::new(vec![(1.0, 2.0), (2.0, 2.0), (3.0, 2.0)]).idx(), 1);
+    }
+
+    #[test]
+    fn approach_stops_when_own_or_destination_is_removed() {
+        use crate::play::zone::{DynelState, Zone};
+        let mut zone = Zone::new(1);
+        let dynel = |pos| DynelState { name: String::new(), pos, yaw: None, npc: false, side: 0, level: 1, health: 5, max_health: 5 };
+        zone.dynels.insert(1, dynel([1.0, 0.0, 2.0]));
+        zone.dynels.insert(2, dynel([3.0, 0.0, 4.0]));
+        assert_eq!(super::approach_state(&zone, None, 2).unwrap().1, (3.0, 4.0));
+        zone.dynels.remove(&2);
+        assert!(super::approach_state(&zone, None, 2).is_none());
+        assert!(super::approach_state(&zone, Some((3.0, 4.0)), 2).is_some());
+        zone.dynels.remove(&1);
+        assert!(super::approach_state(&zone, Some((3.0, 4.0)), 2).is_none());
     }
 }
 
