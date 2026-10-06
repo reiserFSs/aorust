@@ -22,6 +22,9 @@ use std::path::Path;
 /// District fight-mode level of the own zone (`FUN_1003e1d0` [GC]); the original returns 2 without `PlayfieldDistrictInfo` data. [UNRESOLVED] not read.
 const DISTRICT_FIGHT_LEVEL: i32 = 2;
 
+/// Length of the jump's ceiling ray (f32 100.0 @ GC 0x10155eb0).
+const JUMP_CEILING_RAY: f32 = 100.0;
+
 /// Server-coordinate view of the scene-coordinate [`Collision`] for [`Movement`].
 struct Ground<'a>(Option<&'a Collision>);
 
@@ -32,6 +35,9 @@ fn flip(p: [f32; 3]) -> [f32; 3] {
 impl World for Ground<'_> {
     fn ground(&self, p: [f32; 3]) -> Option<f32> {
         self.0?.ground(flip(p))
+    }
+    fn ceiling(&self, p: [f32; 3]) -> Option<f32> {
+        self.0?.line(flip(p), flip([p[0], p[1] + JUMP_CEILING_RAY, p[2]])).map(|h| h.p[1])
     }
     fn align(&self, old: [f32; 3], new: [f32; 3], body: &Body, st: &mut SurfaceState) -> Aligned {
         match self.0 {
@@ -135,6 +141,11 @@ impl Player {
     /// Ends a held clip (resurrection).
     pub fn stand(&mut self) {
         self.transient = None;
+    }
+
+    /// The point `to` is visible from `from` (no collision geometry in between): effects of occluded dynels are hidden by the depth test.
+    pub fn line_clear(&self, from: [f32; 3], to: [f32; 3]) -> bool {
+        self.collision.as_ref().is_none_or(|c| segment_clear(c, from, to))
     }
 
     /// CTRL / ALT held (mouse clicks do not carry modifiers).

@@ -21,6 +21,9 @@ pub trait World {
     /// Ground height under the FEET position `p` (`Surface_i::CalculateClosestPoint`: terrain / floor, raised by a short KD
     /// ray), `None` outside the playfield.
     fn ground(&self, p: [f32; 3]) -> Option<f32>;
+    /// `Surface_i::GetLineIntersection(p, p + (0, 100, 0))` [vtbl +0xc]: height of the first surface hit straight above the FEET position `p`
+    /// (the jump's ceiling raycast, `FUN_1006f9e9` [GC]); `None` when nothing is within 100 m.
+    fn ceiling(&self, p: [f32; 3]) -> Option<f32>;
     /// `Vehicle_t::EnsureSurfaceAlignment` for one integration step `old -> new` (feet positions): wall sweep, ground
     /// following, support test (`docs/zone/collision.md` §3.4).
     fn align(&self, old: [f32; 3], new: [f32; 3], body: &Body, st: &mut SurfaceState) -> Aligned;
@@ -499,6 +502,8 @@ const GRAVITY: f32 = -20.0; // Vehicle_t::s_vGravityAccel [Vehicle.dll 0x1001938
 const VY_LIMIT: f32 = 50.0; // f64 @ Vehicle.dll 0x10012748
 const MASS: f32 = 10.0; // default when Vehicle +0x34 == 0 [GC 0x1015f168]; the real mass source is unresolved
 const SPEED_EPS: f32 = 0.001; // f32 @ Vehicle.dll 0x1001270c
+/// Smallest jump height under a low ceiling (f32 0.1 @ GC 0x10160810).
+const JUMP_MIN_HEADROOM: f32 = 0.1;
 const MAX_DT: f32 = 4.0; // f32 @ Vehicle.dll 0x10012804: longer frames skip the integration
 const MAX_SUBSTEP: f32 = 0.05; // [GUESS] Vehicle +0x104 is not initialised in the code read
 /// `CheckMotionUpdate`: idle timeout while moving and the rotation-change check [GC 0x101574fc, 0x101574f8, 0x101574f0].
@@ -527,6 +532,8 @@ pub struct Movement {
     launch_y: f32,
     /// `PlayerVehicle +0x164 == 0`: a new jump may start.
     jump_ready: bool,
+    /// Jump height of a `JumpStart` whose launch waits for the next [`Movement::update`] (ceiling raycast).
+    jump_pending: Option<f32>,
     fsm: Fsm,
     stats: Stats,
     /// `PlayerVehicle` inputs: +0x360 forward (1/-1), +0x364 strafe speed, +0x368 turn rate, +0x36C elevate speed.
@@ -616,6 +623,7 @@ impl Movement {
             falling_enabled: true,
             launch_y: pos[1],
             jump_ready: true,
+            jump_pending: None,
             fsm: Fsm::new(),
             stats: Stats::new(run_speed as i32),
             in_fwd: 0.0,
@@ -1046,6 +1054,9 @@ impl Movement {
                 self.pos[1] = g + FOOT_CLEARANCE;
             }
         }
+        if let Some(h) = self.jump_pending.take() {
+            self.launch_jump(h, world);
+        }
         if self.ballistic.is_some() {
             if dt > 0.0 && dt <= MAX_DT {
                 self.run_ballistic(dt, world);
@@ -1252,12 +1263,27 @@ impl Movement {
         self.vy = 0.0;
     }
 
-    /// `FUN_1006f9e9` (vtable +0x2c): launch with `sqrt(2 h g)`; the ceiling clamp is not ported (needs a ceiling query).
+    /// `FUN_1006f9e9` (vtable +0x2c), first half: a jump in progress (`PlayerVehicle +0x164 != 0`) ignores the request; otherwise it is
+    /// remembered and [`Movement::launch_jump`] runs it at the next [`Movement::update`], the first point with a collision query for the
+    /// ceiling raycast.
     fn jump_impulse(&mut self, h: f32) {
         if !self.jump_ready {
             return;
         }
         self.jump_ready = false;
+        self.jump_pending = Some(h);
+    }
+
+    /// `FUN_1006f9e9` second half: `h` is shortened to the free height under the ceiling (`Surface_i::GetLineIntersection` from the position
+    /// straight up 100 m; `hit.y - pos.y - 2 * BodyScale`, at least 0.1, f64 @GC 0x1015def8 / f32 0x10160810), then the launch speed is
+    /// `sqrt(2 h |g|)` (`Vehicle_t::Impact((0, v * mass, 0))` adds `v` to the vertical speed while on the ground). The own dynel is a
+    /// player, so the `dynel + 0x21c` NPC minimum of 1.5 m does not apply.
+    fn launch_jump(&mut self, h: f32, world: &dyn World) {
+        let scale = if self.stats.monster_scale != 0 { self.stats.monster_scale as f32 / 100.0 } else { 1.0 };
+        let h = match world.ceiling(self.pos) {
+            Some(y) => h.min((y - self.pos[1] - 2.0 * scale).max(JUMP_MIN_HEADROOM)),
+            None => h,
+        };
         self.launch_y = self.pos[1];
         if !self.airborne {
             self.vy += (2.0 * h * GRAVITY.abs()).sqrt();
@@ -1546,6 +1572,9 @@ mod tests {
         fn ground(&self, _p: [f32; 3]) -> Option<f32> {
             Some(self.0)
         }
+        fn ceiling(&self, _p: [f32; 3]) -> Option<f32> {
+            None
+        }
         fn align(&self, _old: [f32; 3], new: [f32; 3], body: &Body, _st: &mut SurfaceState) -> Aligned {
             carried(self.0, new, body)
         }
@@ -1555,6 +1584,9 @@ mod tests {
     impl World for Wall {
         fn ground(&self, _p: [f32; 3]) -> Option<f32> {
             Some(0.0)
+        }
+        fn ceiling(&self, _p: [f32; 3]) -> Option<f32> {
+            None
         }
         fn align(&self, _old: [f32; 3], mut new: [f32; 3], body: &Body, _st: &mut SurfaceState) -> Aligned {
             new[0] = new[0].min(10.0);
@@ -1644,6 +1676,7 @@ mod tests {
         m.action(id::JUMP_START, 0.0);
         let out = m.take_outgoing();
         assert_eq!(out[0].action, 0x0F);
+        m.update(0.0, &w); // the launch runs in the next update (ceiling raycast)
         assert!(!m.grounded());
         assert_eq!(m.role(), Role::JumpStand);
         // default stats: h = 1 m, v0 = sqrt(2*1*20)
@@ -1676,14 +1709,62 @@ mod tests {
             s.strength = 100;
             s.agility = 100;
         });
-        m.action(id::JUMP_START, 0.0);
         let w = Flat(0.0);
+        m.action(id::JUMP_START, 0.0);
+        m.update(0.0, &w);
         let mut peak = 0.0f32;
         for _ in 0..240 {
             m.update(1.0 / 120.0, &w);
             peak = peak.max(m.pos()[1]);
         }
         assert!((peak - 2.0).abs() < 0.06, "(100+100)/200+1 = 2 m: {peak}");
+    }
+
+    /// `FUN_1006f9e9` numbers: `v0 = sqrt(2 h 20)`, apex `h`, and the ceiling clamp `hit.y - y - 2 * scale` (at least 0.1).
+    #[test]
+    fn jump_numbers_and_ceiling_clamp() {
+        struct Ceil(f32);
+        impl World for Ceil {
+            fn ground(&self, p: [f32; 3]) -> Option<f32> {
+                Flat(0.0).ground(p)
+            }
+            fn ceiling(&self, _p: [f32; 3]) -> Option<f32> {
+                Some(self.0)
+            }
+            fn align(&self, o: [f32; 3], n: [f32; 3], b: &Body, st: &mut SurfaceState) -> Aligned {
+                Flat(0.0).align(o, n, b, st)
+            }
+        }
+        let apex = |w: &dyn World, scale: i32| {
+            let mut m = Movement::new([0.0; 3], 0.0, 0);
+            m.set_stats(|s| {
+                s.strength = 100;
+                s.agility = 100; // h = 2 m
+                s.monster_scale = scale;
+            });
+            m.action(id::JUMP_START, 0.0);
+            m.update(0.0, w);
+            let v0 = m.vy;
+            let mut peak = 0.0f32;
+            for _ in 0..240 {
+                m.update(1.0 / 240.0, w);
+                peak = peak.max(m.pos()[1]);
+            }
+            (v0, peak)
+        };
+        let (v0, peak) = apex(&Flat(0.0), 0);
+        assert!((v0 - 80f32.sqrt()).abs() < 1e-4 && (peak - 2.0).abs() < 0.06, "{v0} {peak}");
+        // ceiling 3.5 m over the feet, body scale 1: free height 1.5 m
+        let (v0, peak) = apex(&Ceil(3.5), 100);
+        assert!((v0 - 60f32.sqrt()).abs() < 1e-4 && (peak - 1.5).abs() < 0.05, "{v0} {peak}");
+        // a body scaled 1.5x needs 3 m of headroom: 0.5 m left
+        let (v0, _) = apex(&Ceil(3.5), 150);
+        assert!((v0 - 20f32.sqrt()).abs() < 1e-4, "{v0}");
+        // a ceiling lower than the head: the 0.1 m floor
+        let (v0, _) = apex(&Ceil(1.0), 100);
+        assert!((v0 - 4f32.sqrt()).abs() < 1e-4, "{v0}");
+        // a high ceiling does not matter
+        assert!((apex(&Ceil(50.0), 100).0 - 80f32.sqrt()).abs() < 1e-4);
     }
 
     #[test]
@@ -1973,6 +2054,9 @@ mod tests {
             }
             fn align(&self, _o: [f32; 3], t: [f32; 3], body: &Body, _st: &mut SurfaceState) -> Aligned {
                 carried(if t[2] > 2.0 { 0.3 } else { 0.0 }, t, body)
+            }
+            fn ceiling(&self, _p: [f32; 3]) -> Option<f32> {
+                None
             }
         }
         let mut m = Movement::new([0.0; 3], 0.0, 0);

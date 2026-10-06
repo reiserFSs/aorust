@@ -230,8 +230,10 @@ Heading convention (see the module doc): `q = (0, sin(yaw/2), 0, cos(yaw/2))`, f
 
 `JumpStart.Apply` [GC 0x1006d792] → `vtbl[0x2c]` = `FUN_1006f9e9(h)`: ignored while `PlayerVehicle+0x164 ≠ 0` (a jump is in progress);
 height `h = FUN_1005844d` = `max(0.5, (Agility(0x11) + Strength(0x10))/200 + 1)` (sums > 800 are clamped to 800 unless GmLevel ≠ 0; consts [GC
-0x1015f368 0x1015f358 0x10155eb8 0x1015d0a4]); a ceiling raycast shortens `h` (not ported); launch speed `vy = sqrt(2 h |g|)`, `Vehicle_t::Impact` +
-`EnableFalling`. Landing (`LandNow` → vtbl [0x6c] `FUN_1006eef9`): if jump state 3 → `Transition(0x10)` (JumpStop), `+0x164 := 0`. No
+0x1015f368 0x1015f358 0x10155eb8 0x1015d0a4]); the ceiling raycast `Surface_i::GetLineIntersection(pos, pos + (0,100,0))` (vtable +0xc, f32 100 @ GC 0x10155eb0; N3 slot 3 = slot 4 without the normal) shortens `h` to
+`max(hit.y - pos.y - 2*BodyScale, 0.1)` (`BodyScale = MonsterScale/100`; f64 0.1 @ 0x1015def8, f32 0.1 @ 0x10160810; `World::ceiling`, launched at the next `Movement::update`); `+0x164 := h`;
+an NPC (`dynel+0x21c != 0`) is raised to at least 1.5 (f32 @ 0x1015d76c, not applicable to the own player); launch speed `vy = sqrt(2 h |g|)` = `Vehicle_t::Impact((0, v*mass, 0))` [VH 0xa1b8:
+`vy += impulse.y / mass`, only while not airborne and with zero x/z] + `EnableFalling`. Test `jump_numbers_and_ceiling_clamp`. Landing (`LandNow` → vtbl [0x6c] `FUN_1006eef9`): if jump state 3 → `Transition(0x10)` (JumpStop), `+0x164 := 0`. No
 key-release action exists for jumping (`SlotMovementJump` acts on `b == false` only). Walking off an edge starts the same fall without a
 JumpStart. Terminal speed ±50 m/s.
 
@@ -251,7 +253,7 @@ JumpForward}` from the FSM (the original picks anim ids in the Apply functions: 
   `LiquidMediumData_t::m_vLiquidHeight`; the body sphere radius is `n3Dynel_t::GetBodyCollSphereRadi` (per dynel).
 * `MAX_SUBSTEP` (`Vehicle+0x104`), the mass source (`Vehicle+0x34`), the mouse clamp factor `client+0x68`, the walk lock condition
   (`dynel+0x2c8`, `FUN_1002e347`), mode 9 (`FUN_10070fee` and `N3Msg_StartCamping` test it), the pitch half of `VehicleForwardUpdate` (first person
-  only), the jump ceiling clamp, the fly vertical limits.
+  only), the fly vertical limits (the jump ceiling clamp is ported, §7).
 * Features bits: only bits 2 and 4 are read here (4 = may act, 2 = may turn); names of the other bits unknown. The default in `Stats` is 4.
 * Sit / server-driven mode and position changes are traced in §10; what stays open is listed there.
 
