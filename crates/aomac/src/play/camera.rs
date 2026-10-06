@@ -5,7 +5,6 @@
 //! The scene frame is the renderer's (Y up, forward = (sin yaw, 0, -cos yaw)); `avatar_yaw` is the heading of the
 //! avatar in that convention (the integration layer converts the server heading).
 
-#![allow(dead_code)] // documented constants and accessors for tests / the live harness
 
 use super::camera_views::{Sight, Views};
 use super::controls::{CamCmd, CamKey, ControlPrefs};
@@ -19,9 +18,6 @@ use std::f32::consts::{FRAC_PI_2, PI};
 pub const FOV_HORIZONTAL: f32 = FRAC_PI_2;
 /// Near clip plane: the third `VisualCamera_t` constructor argument of `n3EngineClient_t::CreateCamera` (N3 @0x10007842, `_DAT_1003ce50`).
 pub const NEAR: f32 = 0.2;
-/// Far clip plane at creation (`_DAT_1003ce54`); the `ViewDistance` callback (`FUN_1001fc91`, registered to fire at once)
-/// replaces it immediately, see [`far_plane`].
-pub const FAR_AT_CREATE: f32 = 200.0;
 /// `ViewDistance` default (`SetDefaultLoginPrefs` GUI @0x10124b33).
 pub const VIEW_DISTANCE: f32 = 0.8;
 
@@ -34,11 +30,6 @@ pub fn far_plane(view_distance: f32) -> f32 {
 /// distance, which is the fog distance the playfield lens already carries).
 pub fn lens(base: Lens) -> Lens {
     Lens { fov: FOV_HORIZONTAL, horizontal: true, near: NEAR, ..base }
-}
-
-/// Vertical field of view for a window aspect ratio (width / height) given [`FOV_HORIZONTAL`].
-pub fn vertical_fov(aspect: f32) -> f32 {
-    2.0 * ((FOV_HORIZONTAL * 0.5).tan() / aspect).atan()
 }
 
 /// `PreferredCamPosY` / `PreferredCamPosZ` defaults (GUI `SetDefaultLoginPrefs` @0x10124b33): the unit direction from the
@@ -385,27 +376,33 @@ impl Camera3p {
         self.views = Some(v);
     }
 
-    pub fn views(&self) -> Option<&Views> {
-        self.views.as_ref()
-    }
-
     /// `PreferredCameraMode` in use (1, 2 or 3).
+    #[cfg(test)]
     pub fn mode(&self) -> u8 {
         self.mode
     }
 
+    #[cfg(test)]
     pub fn is_first_person(&self) -> bool {
         self.first_person
     }
 
     /// Distance look target - camera (third person).
+    #[cfg(test)]
     pub fn distance(&self) -> f32 {
         self.dist
     }
 
     /// Camera heading relative to the avatar and elevation (third person), radians.
+    #[cfg(test)]
     pub fn orbit(&self) -> (f32, f32) {
         (self.yaw_off, self.elev)
+    }
+
+    /// One frame without occlusion testing.
+    #[cfg(test)]
+    pub fn update(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32) -> Camera {
+        self.update_with(avatar_pos, avatar_yaw, dt, &Sight::OPEN)
     }
 
     /// Whether the own avatar is drawn: always in third person, in first person only with `ShowMyCharacter`.
@@ -563,10 +560,6 @@ impl Camera3p {
         self.pivot_height = (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
     }
 
-    /// One frame without occlusion testing.
-    pub fn update(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32) -> Camera {
-        self.update_with(avatar_pos, avatar_yaw, dt, &Sight::OPEN)
-    }
 
     /// One frame. `sight` answers what the camera asks of the world: line of sight (free of terrain/statels), closed doors
     /// between rooms and the ground under a point (scene frame).
@@ -1106,7 +1099,7 @@ mod tests {
         // mode 3 ignores attractors
         c.apply(&CamCmd::PrevView);
         let v = c.update([10.0, 0.0, -1.0], 0.0, 0.016);
-        assert!(c.views().unwrap().selected().is_some());
+        assert!(c.views.as_ref().unwrap().selected().is_some());
         assert!((v.pos - Vec3::new(10.0, 0.0, -1.0)).length() > 4.0);
         // mode 1: the camera flies to the attractor (scene z = -server z) and stops there
         c.apply(&CamCmd::NextView); // 2
@@ -1119,12 +1112,13 @@ mod tests {
         assert!((v.pos - Vec3::new(10.0, 5.0, 0.0)).length() < 0.2, "{:?}", v.pos);
         // Ctrl+F8 drops it again
         c.apply(&CamCmd::NextView);
-        assert!(c.views().unwrap().selected().is_none());
+        assert!(c.views.as_ref().unwrap().selected().is_none());
     }
 
     #[test]
     fn fov_is_ninety_degrees_horizontal() {
-        assert!(near(vertical_fov(1.0), FRAC_PI_2));
-        assert!(near(vertical_fov(16.0 / 9.0).to_degrees(), 58.716));
+        let l = lens(Lens::default());
+        assert!(near(l.vertical_fov(1.0), FRAC_PI_2));
+        assert!(near(l.vertical_fov(16.0 / 9.0).to_degrees(), 58.716));
     }
 }

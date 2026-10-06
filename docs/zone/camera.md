@@ -125,7 +125,7 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
   distance; Numpad 7 (`N3Msg_CameraSetDefaultPos` → `ForceUpdatePrefDir`) stores the current ones into `PreferredCamPos*`/`PreferredCamDist`
   (the prefs persist across sessions: `CameraVehicleFixedThird_t::SetPrefs` [N3 0x1001f004]; not persisted by `Camera3p`).
 * **Field of view**: `SetViewPlaneWindow(π/2, aspect)` (`FUN_1002107a`, `_DAT_1003ccf8` = 1.5708): **90° horizontal** (58.7° vertical at 16:9);
-  `camera::vertical_fov(aspect)`.
+  `Lens::vertical_fov(aspect)`.
   **Near / far [RE, resolved].** `n3EngineClient_t::CreateCamera` [N3 0x10007842] calls the `n3Camera_t` ctor `FUN_10021a76` with
   (`fov` π/2 `_DAT_1003ccf8`, `aspect` = pref `AspectRation`, **near 0.2** `_DAT_1003ce50`, **far 200** `_DAT_1003ce54`, first-person flag); the ctor
   passes them to `VisualCamera_t::VisualCamera_t(fov, aspect, near, far)` (stored at `+0x150/+0x154/+0x168/+0x16c`). The `ViewDistance`

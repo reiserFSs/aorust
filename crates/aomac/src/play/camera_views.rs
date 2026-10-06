@@ -17,6 +17,7 @@ pub struct Sight<'a> {
     pub ground: &'a dyn Fn([f32; 3]) -> Option<f32>,
 }
 
+#[cfg(test)]
 impl Sight<'static> {
     /// Nothing in the way, no rooms, no ground.
     pub const OPEN: Sight<'static> = Sight { clear: &|_, _| true, door_closed: &|_, _| false, ground: &|_| None };
