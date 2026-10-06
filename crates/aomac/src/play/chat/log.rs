@@ -579,7 +579,7 @@ pub enum LogEvent {
     /// `AbsorbIIR_t` 264E5F61.
     Absorb { who: Identity, amount: i32, dtype: i32 },
     /// `HealthDamageIIR_t` 3710256C: `delta` < 0 = damage; `attacker.kind == 0` = none.
-    HealthDamage { who: Identity, delta: i32, dtype: i32, attacker: Identity, nano: i32 },
+    HealthDamage { who: Identity, health: i32, delta: i32, dtype: i32, death_cause: i32, attacker: Identity, nano: i32 },
     /// `ReflectAttackIIR_t` 1C3A4F77.
     Reflect { who: Identity, amount: i32, attacker: Identity },
     /// `ShieldAttackIIR_t` 25192476.
@@ -639,8 +639,10 @@ pub fn from_n3(m: &Message) -> Option<LogEvent> {
             ABSORB => Some(LogEvent::Absorb { who, amount: be32(b, 0)?, dtype: be32(b, 4)? }),
             HEALTH_DAMAGE => Some(LogEvent::HealthDamage {
                 who,
+                health: be32(b, 0)?,
                 delta: be32(b, 4)?,
                 dtype: be32(b, 8)?,
+                death_cause: be32(b, 12)?,
                 attacker: ident(b, 16)?,
                 nano: be32(b, 24)?,
             }),
@@ -1014,7 +1016,7 @@ pub fn classify(ev: &LogEvent, ctx: &LogCtx) -> Vec<LogLine> {
                 combat(&Call { dtype: *dtype, ..Call::new(cat, *who, *amount) }, ctx, &mut out);
             }
         }
-        LogEvent::HealthDamage { who, delta, dtype, attacker, nano } => {
+        LogEvent::HealthDamage { who, delta, dtype, attacker, nano, .. } => {
             // [GC 0x100a00c8]
             if who.kind != 50000 || !ctx.known(*who) {
                 return out;
@@ -1360,12 +1362,12 @@ mod tests {
             assert_eq!(texts(classify(&xp(-30), ctx))[0].2, "You lost 30 xp.");
             let l = texts(classify(&LogEvent::Stat { who: id(1), stat: 0x23d, new: 4 }, ctx));
             assert_eq!(l[0].2, "You gained 4 points of Shadowknowledge.");
-            let l = texts(classify(&LogEvent::HealthDamage { who: id(1), delta: 12, dtype: 0, attacker: Identity::default(), nano: 0 }, ctx));
+            let l = texts(classify(&LogEvent::HealthDamage { who: id(1), health: 100, delta: 12, dtype: 0, death_cause: 0, attacker: Identity::default(), nano: 0 }, ctx));
             assert_eq!(l, vec![(class::ME_GOT_HEALTH, "CCMeHealedColor", "You were healed for 12 points.".into())]);
             // nano damage with a nano program and an attacker
-            let l = texts(classify(&LogEvent::HealthDamage { who: id(1), delta: -40, dtype: 95, attacker: id(2), nano: 163449 }, ctx));
+            let l = texts(classify(&LogEvent::HealthDamage { who: id(1), health: 100, delta: -40, dtype: 95, death_cause: 0, attacker: id(2), nano: 163449 }, ctx));
             assert_eq!(l[0].2, "You were attacked with Nano#163449 for 40 points of cold damage.");
-            let l = texts(classify(&LogEvent::HealthDamage { who: id(4), delta: -40, dtype: 95, attacker: id(1), nano: 163449 }, ctx));
+            let l = texts(classify(&LogEvent::HealthDamage { who: id(4), health: 100, delta: -40, dtype: 95, death_cause: 0, attacker: id(1), nano: 163449 }, ctx));
             assert_eq!((l[0].0, l[0].2.as_str()), (class::YOU_HIT_OTHER_WITH_NANO, "You hit Alice with Nano#163449 for 40 points of cold damage."));
             // absorb, shields
             let l = texts(classify(&LogEvent::Absorb { who: id(1), amount: 8, dtype: 91 }, ctx));
@@ -1522,7 +1524,7 @@ mod tests {
         let m = raw(ABSORB, who, &[8, 91]);
         assert_eq!(from_n3(&m), Some(LogEvent::Absorb { who, amount: 8, dtype: 91 }));
         let m = raw(HEALTH_DAMAGE, who, &[100, -40, 95, 7, 50000, 2, 163449]);
-        assert_eq!(from_n3(&m), Some(LogEvent::HealthDamage { who, delta: -40, dtype: 95, attacker: id(2), nano: 163449 }));
+        assert_eq!(from_n3(&m), Some(LogEvent::HealthDamage { who, health: 100, delta: -40, dtype: 95, death_cause: 7, attacker: id(2), nano: 163449 }));
         let m = raw(REFLECT_ATTACK, who, &[12, 50000, 2, 3]);
         assert_eq!(from_n3(&m), Some(LogEvent::Reflect { who, amount: 12, attacker: id(2) }));
         let m = raw(SHIELD_ATTACK, who, &[12, 50000, 2, 3]);

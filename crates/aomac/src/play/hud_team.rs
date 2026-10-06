@@ -337,6 +337,7 @@ impl HudTeam {
         let fh = fh.max(gui.outer_size(w.window).1);
         let (px, py) = (x.min(self.screen.0.saturating_sub(fw) as i32).max(0), y.min(self.screen.1.saturating_sub(fh) as i32).max(0));
         gui.set_window_outer_frame(w.window, (px, py, fw, fh));
+        gui.set_window_size_limits(w.window, (fw.saturating_sub(10), fh.saturating_sub(31)), (0, 0));
         Ok(w)
     }
 
@@ -362,6 +363,7 @@ impl HudTeam {
         if let Err(e) = gui.add_view_xml(w.window, "buttons", "TeamButtons", &src) {
             eprintln!("hud: team buttons: {e:#}");
         }
+        gui.relayout_window(w.window);
     }
 
     /// Per-frame refresh (`FUN_100779db` header text, `FUN_10077bf2` rows, `FUN_100775ac` bars, `FUN_1007791c` Recruit state).
@@ -400,7 +402,7 @@ impl HudTeam {
             let frac = |c: i32, m: i32| if m > 0 { (c as f32 / m as f32).clamp(0.0, 1.0) } else { 0.0 };
             let (hp, nano) = match m {
                 None => (0.0, 0.0),
-                Some(m) if m.id.instance == own => (frac(zone.stat(27).unwrap_or(0), zone.stat(1).unwrap_or(0)), frac(zone.stat(214).unwrap_or(0), zone.stat(221).unwrap_or(0))),
+                Some(m) if m.id.instance == own => (frac(zone.skill_value(27).unwrap_or(0), zone.skill_value(1).unwrap_or(0)), frac(zone.skill_value(214).unwrap_or(0), zone.skill_value(221).unwrap_or(0))),
                 Some(m) => {
                     let known = zone.dynels.get(&m.id.instance).filter(|d| d.max_health > 0).map(|d| (d.health, d.max_health));
                     let h = known.unwrap_or(m.health);
@@ -580,6 +582,20 @@ mod tests {
         let w = h.win.as_ref().unwrap().window;
         let (x, y, ow, oh) = gui.window_outer_frame(w).unwrap();
         assert!(x >= 0 && y >= 0 && x + ow as i32 <= 1280 && y + oh as i32 <= 800, "{x},{y} {ow}x{oh}");
+        let mut rollup = crate::play::hud_rollup::Rollup::new(&dir, (1280, 800));
+        rollup.register_window(&mut gui, "team_view", w).unwrap();
+        for (width, height) in [(ow, oh), (ow + 80, oh + 60)] {
+            gui.set_window_outer_frame(w, (x, y, width, height));
+            let body = gui.view_rect(w, "body").unwrap();
+            assert_eq!(body.width() + 1.0, gui.window_size(w).0 as f32);
+            assert_eq!(body.height() + 1.0, gui.window_size(w).1 as f32);
+            for i in 0..ROWS {
+                for part in ["idx", "name", "hp", "nano"] {
+                    let row = gui.view_rect(w, &format!("{part}{i}")).unwrap();
+                    assert!(row.l >= body.l && row.r <= body.r, "{part}{i}: {row:?} outside {body:?}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -38,7 +38,7 @@ convention, which is what the placement needs).
 |---|---|
 | `breed`, `sex` | `screens::wire_breed_sex` -> `Breed`/`Gender` (Atrox is always male) |
 | `fatness` (stat 0x2F, 2 bits) | body model: 0 `_thin`, 1 normal, 2 `_fat` (`player_model_build`, same names as the creation screen's `CCCharacter_t::ChangeMesh`); **[GUESS]** 3 -> normal. In the client the body is the `Mesh` stat (0xC, `FUN_10057c75` reads stat 0xC; the select-screen cache stores it as `MeshID`); the wire message carries no mesh id, and the code that derives stat 0xC from breed/sex/fatness was **not found** (Gamecode grep for `.cir`/`_thin`/`_fat`/`Fatness` strings and stat 0x2F/0x3B users in 0x10077e13 gave nothing; the stat is set through the dynel's virtual `SetStat`) |
-| head | the attractor entry of place 0 wins over `head_mesh` (as `CCCharacter_t::ChangeHead` / `CachedCharacter::head_mesh`; GC 0x10077e13 calls `AddAttractorMesh(0, HeadMesh, 4, 0)` then `ClearAttractors/AddAttractors(list)`) |
+| head | place 0 overrides `head_mesh`; when place 0 is absent a full update retains the separately mounted `HeadMesh` (GC 0x10077e13 uses base `CharacterMesh::ClearAttractors`, not the visual clear that removes render children; captured Xantarr, dynel.md §1.3). An empty AppearanceUpdate list does clear the head. |
 | skin race | derived from the head mesh via the creation head table (`head_table`, like `load_cached_character`); `race` stat is 1 in every capture |
 | `cloth[]` | page-0 entries -> `CachedCharacter::equipment()` (`texture` over `<part>_<race>_naked.png`, green key `0x07e0` removed, unequipped parts wear the model's `*_default.png`; `ActorRig::player` -> `part_textures`). Entries with `page != 0` are ignored (the dynel stores `cloth[page*5+part]`, which page the renderer shows was not traced) |
 | `attractors[]` (place != 0) | weapons/lights as rigid meshes on `Attractor<place+1>_*` bones (`ActorRig::new` attachments) |
@@ -70,7 +70,7 @@ if (rate > 0) SetSpeedScale(handle, rate)   // else the authored rate 1.0
   pair). The file (`mesh anim factor`, e.g. `5900 9382 1.10` = athrox male sneakcool) is loaded by `avatar::Calibration`.
   Duplicate pairs (the file has some): last wins - **[GUESS]**, insert policy not traced.
 * `100 / MonsterScale` is 1.0 when the stat is 0 (`_DAT_10158670` = 100.0 double).
-* `speed` = `Vehicle_t+0x3c` (current ground speed, m/s), `ref_speed` = `Vehicle_t+0x170`, set by `FUN_1006f4a2` from the movement mode
+* `speed` = `Vehicle_t+0x3c` (maximum velocity of the movement mode, m/s; current speed is `+0xcc`, Vehicle `FUN_1000e3d3` / `SetVel` 0x1000a4e1), `ref_speed` = `Vehicle_t+0x170`, set by `FUN_1006f4a2` from the movement mode
   (`FUN_100704e6`) and sub-mode (`FUN_100704ee`): mode 3/sub 2 and mode 4 -> 3.0 (`_DAT_1015d69c`), mode 3 otherwise -> 5.0
   (`_DAT_101574fc`), mode 7 -> 7.0 (`_DAT_10160a44`), anything else -> 1.5 (`_DAT_1015d76c`), mode 5 keeps the old value (`avatar::ref_speed`).
   The same function sets the vehicle's max velocity = `ref_speed + RunSpeed * k` (k = 1/275 for mode 3/sub 1 and the default, 0.002545
@@ -80,6 +80,47 @@ if (rate > 0) SetSpeedScale(handle, rate)   // else the authored rate 1.0
   avatar's ground speed comes entirely from the movement code, never from the clips.
 
 API: `AvatarPose { role, speed, ref_speed }` (`AvatarPose::still(role)` for idle/sit/emote), `Avatar::set_pose/update(dt)/frame()`.
+
+The shared CAT clock is milliseconds: DisplaySystem 0x10074bb4 → 0x10074228 → 0x10072fde advances `abs(frameSeconds * 1000 * speedScale)` (double 1000.0 at 0x1008aa78); Randy `SetTime` 0x10051cfc stores it unchanged. `ActorRig` samples the supplied time without wrapping; own-avatar and other-character playback choose loop-marker wrapping or one-shot clamping before sampling. Death samples exactly the last frame, and its first terminal skin upload bypasses distance throttling before being held. Other characters use the same calibration/body-scale/reference-speed formula as the own avatar, looking up the selected variant's RDB id (`CatAnim::source_id`), not the AbstractAnimID or the skill-adjusted maximum as divisor.
+
+`retail_authored_gait_durations_use_milliseconds_and_calibration` reads model 5907's CAT 10191/10194 and `Setupf/animcalibration.txt`: walk duration 2433 ms, loop 733–1733, factor 0.90; run duration 4000 ms, loop 1166–1933, factor 1.15. At reference speeds 1.5/5.0 m/s the port's measured clock periods are 1.111111/0.666957 seconds, respectively (formula-derived ground distance 1.666667/3.334783 m per cycle). These are authored time/rate checks, not a claim that a screenshot proves zero foot sliding.
+
+### Engine frame delta (window hitches)
+
+`N3InterfaceModule_t::FrameProcessor` (Interfaces **0x10007f32**) passes
+`**(Timer_t + 0x14)` directly to the engine's virtual slot `+8`.
+`n3EngineClientAnarchy_t::RunEngine` (Gamecode **0x100180e6**) forwards that
+argument to `n3EngineClient_t::RunEngine` (N3 **0x10007a01**), which forwards it
+to `n3Engine_t::RunEngine` (N3 **0x100066ad**). The latter stores the argument
+unchanged at engine **+0x68**, runs the root, and adds it to engine `+0x70`.
+There is no 0.1-second clamp on this route.
+
+The source is `Timer_t::FrameProcess` (AFCM **0x100065d3**); `GetDeltaTime`
+(**0x1000657e**) simply reads the same `+0x14` pointer. Its performance-counter
+path bounds negative elapsed time to zero and has a **100.0-second**, not
+0.1-second, upper bound (comparison **0x100066a7–0x100066ba**, double
+**0x10010b50 = 100.0**). It quantizes elapsed seconds through milliseconds
+(double **0x10010b60 = 1000.0**, stores **0x10006710/15/1b**).
+The integer conversion (**0x10007f86**, positive rounding correction
+**0x10007fcd–0x10007fe0**) truncates toward zero, but this does **not** discard
+each frame's sub-millisecond fraction: residual seconds at **0x10017088**
+are added to the next elapsed interval and rewritten at **0x10006702** as
+elapsed minus quantized seconds.
+The fallback accumulates `DeltaTimer_t::GetDeltaTime` milliseconds and divides
+the elapsed ticks by 1000 without an upper clamp; its maximum-framerate loop
+waits for a minimum frame duration rather than discarding a hitch.
+DeltaTimer **0x1000107f** reads system time and subtracts the previous value;
+`WrapperTime_t::ReadSystemTime` (**0x1000114b**) uses `timeGetTime`,
+subtraction (**0x100010bb**) is plain float subtraction, and `Normalize`
+(**0x100011a2**) is a bare return.
+
+The native monotonic window clock therefore uses `min(100.0)`, matching
+the high-resolution retail route instead of the former `min(0.1)`, so normal
+render hitches do not discard animation time. The fallback retail clock is
+unbounded as described above; millisecond quantization is not reproduced by
+this narrow window-clock fix. Movement/vehicle substeps and offscreen clocks
+are unchanged. Evidence: read-only Ghidra decompilation of the named functions,
+plus instruction and double-constant reads for the QPC bound.
 
 ## 4. Unresolved / labelled
 
@@ -110,9 +151,9 @@ Capture `docs/captures/zone_wear_rifle_borealis.rec` (Aomacvolk, Borealis; doubl
 | 4 | `CharacterAction` 0xa7 (empty), 0x83 (`identity_a` = item, `identity_b = {0, 6}`) | same with `{0, 0x41}` |
 | 5 | **`AppearanceUpdateIIR_c`** with 2 attractors `{a 1, b 0x3ddf, c 0, d 2}` (right hand = place 1, the item's `WeaponMesh`) and `{a 0, b 0x9ee9, d 4}` (head) | the same message with the head attractor only |
 
-* The mesh in the hand is **the `AppearanceUpdate` attractor list**, not the weapon dynel (`FUN_100a1216` disables its visibility while it has a parent): `AppearanceUpdateIIR_c::Activate` [GC 0x10071679] = `VisualCATMesh_t::ClearAttractors` + `CharacterMesh::AddAttractors(list)` (same as the full update's, `ao_formats::character::actor::attractor_list`). `Zone` turns an own update into `OwnEvent::Attractors((place, mesh)...)` (and keeps `own_update.attractors` current for a rebuilt `Player`); `Player::apply_own_events` -> `Avatar::set_attractors`: place 0 = head, the rest are `ActorRig` mounts; the rig is rebuilt **only when the head or the mounted meshes differ** (an identical list = no work), the model is uploaded again under `MODEL_KEY`, the current clip keeps playing (same body model). Tests: `avatar::tests::worn_weapon_mounts_its_mesh_and_switches_the_stance` (mesh count +1 on wear, back on unwear), `dynels::variant_tests::own_wield_follows_the_captured_wear_and_unwear` (lists from the capture).
+* The mesh in the hand is **the `AppearanceUpdate` attractor list**, not the weapon dynel (`FUN_100a1216` disables its visibility while it has a parent): `AppearanceUpdateIIR_c::Activate` [GC 0x10071679] = cloth writes through `FUN_100480fc`, then `VisualCATMesh_t::ClearAttractors` + `CharacterMesh::AddAttractors(list)`. `Zone` emits `OwnEvent::Appearance` and updates `own_update` cloth by page/part, attractors, visual flags and mode for a rebuilt `Player`. `Player::apply_own_events` -> `Avatar::set_appearance` applies page-0 cloth deltas (unnamed parts remain, texture 0 clears), replaces the head/mount set, and rebuilds `ActorRig::player` only when equipment, head or mounts differ. This reuses the full update's skin/cloth compositor and reuploads `MODEL_KEY` without restarting the current clip. Regression `captured_appearance_cloth_reaches_live_avatar_and_rebuild_snapshot` uses the wear capture's body-cloth clear and checks the live rig and cached full-update look agree.
 * Wield state of the own character is the same as for every character: `Dynels::wield` (`WeaponItemFullUpdate` of the own dynel, slot 6 / 8; swing lists, `AnimSet` / `ItemDelay`) and `Armory` (`DamageType` 0x5a projectile for the rifle; bare hands = the martial-arts item, melee, slot 0, again after the unwear). The **unwear is `CharacterAction` 0x61**, not a `ToClientQuit` (the weapon dynel stays in the bag): `Dynels::unwield_slot` / `Armory::unwield_slot`. The weapon update with the bag slot 0x41 is not a hand and is ignored.
 * Stance (docs/zone/combat-anim.md §4): while `Dynels::wielded_set(own)` is a weapon, `Avatar::set_stance` makes the idle out of a fight the equip routine's idle (rifle `idle-2h` 0x41e, bazooka 0x424, every other weapon the plain `idle-stand`), the fight idle (`IdleCombat`, `Player::fighting`) the weapon's list 0x10 (`idle-rifle`), and walk / run the rifle's constants 0x421 / 0x422 (`combat::anim::{peace_idle, fight_idle, wield_walk_run}`), each when the model's set has the clip (else the plain role); `Dynels::update` draws other wielders the same way. Swings: `combat/glue.rs::swing` -> `Dynels::pick_swing(own)` -> rifle `0x3ff` sped up for `ItemDelay` 100.
 * **Draw / holster / wield gesture** (traced: combat-anim.md §4): the wear itself plays nothing visible out of a fight (`FUN_1003c930` is replaced within the frame by the idle it starts; [INFERENCE]); the **unwear** plays the wield gesture 0x6d (`wield`) once (`Module::on_frame` 0x61 -> `Module::take_anims` -> `Player::play(Role::Clip("wield"))`); a **fight start** plays the weapon's list-0x1a clip (rifle `rifle-start` 0x3fc) once and then the fight idle, a **fight stop** the list-0x1b clip (`rifle-stop` 0x3fe) once and then the plain idle (`combat/glue.rs::stance`, `FightStarted` / `FightStopped`). Same for every other character (`Dynels::play_once`).
-* **Not done / unresolved**: the bare-hand draw / holster (martial-arts item lists, record layout not decoded); the cloth part of `AppearanceUpdate` for the **own** avatar (other characters apply it, see below).
+* **Not done / unresolved**: the bare-hand draw / holster (martial-arts item lists, record layout not decoded); selection of cloth pages other than page 0.
 * **Other characters** (`Dynels::on_message`, `CharLook::apply_appearance`): `AppearanceUpdateIIR_c::Activate` [GC 0x10071679] is not specific to the own dynel: `FUN_10058e36` only tests the identity kind 50000 (`SimpleChar_t`, players and NPCs alike, no NPC branch), then `FUN_100480fc` (cloth: entry `(page*5 + part)`, `{b = texture, c = page}` of the wire `ClothData`; written only when the texture changed, a texture 0 clears the part, parts not named stay), stat 0x2A1 `VisualFlags`, `FUN_100572b9(extra)`, and `VisualCATMesh_t::ClearAttractors` [DS 0x10073d8a] (walks the same list at `this+4` as `CharacterMesh::ClearAttractors` [DS 0x10071dd0], deletes every node, head included) + `CharacterMesh::AddAttractors(wire list)`. So the mounted set is exactly the update's list, also when the full update carried the `SET_DYNEL_800` skip flag. `Dynels` edits the character's `CharLook` (cloth page 0 by part, sorted; attractors replaced; `visual_flags`) and sends the changed look through the worker's `Req::Model`; the character keeps drawing its old model (`Char::next`) until the new one is ready. Evidence: in `zone_ithaca.rec` the player 33513 arrives with no attractors and receives his head (place 0, mesh 223820) only through this update; the NPC 1026282's full update and its update both have an empty list; the wear capture's lists retargeted to another player (`other_player_wields_and_unwields_live`: rifle `{1, 0x3ddf}` + head, then head only, the player's earlier back item `{5, ..}` is dropped by the wholesale replace) rebuild his model each time.

@@ -25,6 +25,9 @@ impl Play {
 
     pub(super) fn interact_zone_frame(&mut self, f: &Frame) {
         if let Some(i) = self.interact.as_mut() {
+            if let Some(hud) = self.hud.as_ref() {
+                i.mission.load_config(&hud.dvalues);
+            }
             i.on_frame(&mut self.gui, f, &self.zone);
         }
     }
@@ -38,6 +41,10 @@ impl Play {
         let Some(i) = self.interact.as_mut() else { return };
         i.resize(self.size);
         i.tick(self.time);
+        if let Some(hud) = self.hud.as_mut() {
+            i.mission.load_config(&hud.dvalues);
+            i.mission.save_config(&mut hud.dvalues);
+        }
         for t in i.take_notices() {
             if let Some(c) = self.chat.as_mut() {
                 c.system_line(&mut self.gui, &t, 12);
@@ -54,6 +61,16 @@ impl Play {
                 c.feedback(&mut self.gui, key, &self.text);
             }
         }
+        for url in i.mission.take_urls() {
+            if let Some(chat) = self.chat.as_mut() {
+                chat.show_url(&mut self.gui, &self.zone, &self.text, &url);
+            }
+        }
+        if let Some(marker) = i.mission.take_marker() {
+            if let Some(hud) = self.hud.as_mut() {
+                hud.set_mission(Some(marker));
+            }
+        }
         for f in i.take_outbox() {
             if let Some(s) = &self.session {
                 s.send_zone(f);
@@ -62,6 +79,7 @@ impl Play {
         self.interact_trade_frame();
         self.interact_ptrade_frame();
         self.interact_shop_frame();
+        self.interact_bank_frame();
     }
 
     /// A plain left click that selected character `id`: the second one on the same dynel within [`ao_gui::DOUBLE_CLICK_TIME`] is a double click,

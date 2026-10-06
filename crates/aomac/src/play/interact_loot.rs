@@ -21,6 +21,8 @@ struct Loot {
     word: i32,
     /// The items in the order of their cells (by container slot).
     entries: Vec<InventoryEntry>,
+    /// GUI 0x100cdb3a: bank 0x66; ordinary chest 0x15.
+    slots: usize,
     /// The cell of the last short click and when (`Interact::now`), for the double click.
     clicked: Option<(usize, f32)>,
 }
@@ -41,11 +43,14 @@ fn gap() -> (f32, f32) {
 }
 
 /// The size of the grid canvas: `rows` rows of cells with the default spacing and the view borders (`RecalcCellCount`, docs/gui.md §11.5).
-fn canvas_size() -> (u32, u32) {
-    let rows = SLOTS.div_ceil(COLUMNS) as f32;
+fn canvas_size_for(slots: usize) -> (u32, u32) {
+    let rows = slots.div_ceil(COLUMNS) as f32;
     let (w, h) = (2.0 * BORDER + COLUMNS as f32 * (CELL + 1.0) + (COLUMNS as f32 - 1.0) * gap().0, 2.0 * BORDER + rows * (CELL + 1.0) + (rows - 1.0) * gap().1);
     (w as u32, h as u32)
 }
+
+#[cfg(test)]
+fn canvas_size() -> (u32, u32) { canvas_size_for(SLOTS) }
 
 /// Top-left corner of the 54 px slot art of cell `n` (the art is centred on the 48 px cell, as in the inventory window).
 fn slot_origin(n: usize) -> (f32, f32) {
@@ -55,14 +60,35 @@ fn slot_origin(n: usize) -> (f32, f32) {
 }
 
 /// The cell under the canvas position.
-fn cell_at(x: f32, y: f32) -> Option<usize> {
-    (0..SLOTS).find(|&n| {
+fn cell_at_for(x: f32, y: f32, slots: usize) -> Option<usize> {
+    (0..slots).find(|&n| {
         let (ox, oy) = cell_origin(n % COLUMNS, n / COLUMNS, gap());
         x >= ox && x < ox + CELL + 1.0 && y >= oy && y < oy + CELL + 1.0
     })
 }
 
+#[cfg(test)]
+fn cell_at(x: f32, y: f32) -> Option<usize> { cell_at_for(x, y, SLOTS) }
+
 impl LootUi {
+    pub fn bank_drop(&self, gui: &Gui, x: f32, y: f32) -> Option<Identity> {
+        self.open.iter().find(|l| l.container.kind == 0xdead && gui.view_rect(l.window, "scrollview").is_some_and(|r| x >= r.l && x < r.r && y >= r.t && y < r.b)).map(|l| l.container)
+    }
+
+    pub fn refresh_bank(&mut self, gui: &mut Gui, entries: &[InventoryEntry]) {
+        let Some(at) = self.open.iter().position(|l| l.container.kind == 0xdead) else { return };
+        if self.open[at].entries != entries {
+            self.open[at].entries = entries.to_vec();
+            self.open[at].entries.sort_by_key(|e| e.slot);
+            self.draw(gui, at);
+        }
+    }
+
+    pub fn close_bank(&mut self, gui: &mut Gui) {
+        if let Some(at) = self.open.iter().position(|l| l.container.kind == 0xdead) {
+            gui.close_window(self.open.remove(at).window);
+        }
+    }
     #[cfg(test)]
     pub fn is_open(&self, container: Identity) -> bool {
         self.open.iter().any(|l| l.container == container)
@@ -82,22 +108,31 @@ impl LootUi {
     /// `InventoryUpdateIIR_t` for `container` [GC 0x100a040e]: the contents are replaced; with `u.flag` the container is opened (a window appears
     /// unless one is open already, `SlotContainerOpened`), without it only an open window is refreshed (`+0x8c`, container changed).
     pub fn update(&mut self, gui: &mut Gui, dir: Option<&Path>, screen: (u32, u32), container: Identity, title: &str, u: &InventoryUpdate) {
+        let slots = if container.kind == 0xdead { 0x66 } else { SLOTS };
         if self.items.is_none() {
             self.items = dir.map(Items::new);
         }
         let mut entries = u.entries.clone();
         entries.sort_by_key(|e| e.slot);
-        entries.truncate(SLOTS);
+        entries.truncate(slots);
         let at = match self.open.iter().position(|l| l.container == container) {
             Some(i) => i,
             None if u.flag => {
-                let (w, h) = canvas_size();
-                let xml = format!("<root><View view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></View></root>");
-                let Ok(window) = gui.open_tabbed_window_xml("LootView", title, &xml, (0, 0), WindowSize::Preferred) else { return };
+                let (w, h) = canvas_size_for(slots);
+                let xml = if container.kind == 0xdead {
+                    format!("<root><ScrollView name=\"scrollview\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point({w},1)\" max_size=\"Point(16000,16000)\"><ScrollViewChild view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></ScrollViewChild></ScrollView></root>")
+                } else {
+                    format!("<root><View view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></View></root>")
+                };
+                // [UNRESOLVED guess] bank's saved InventoryView frame is not loaded here:
+                // reuse the existing three-column viewport until bank config persistence is ported.
+                // Searched GUI 0x100cc2ca/0x100cdb3a and shipped CharPrefs.xml; capacity, not initial viewport, is fixed by code.
+                let size = if container.kind == 0xdead { WindowSize::Fixed(w, canvas_size_for(SLOTS).1) } else { WindowSize::Preferred };
+                let Ok(window) = gui.open_tabbed_window_xml("LootView", title, &xml, (0, 0), size) else { return };
                 let (ow, oh) = gui.outer_size(window);
                 // `Window::MoveToCenter` is the default of a window without a saved frame (`container_position` is not stored)
                 gui.set_window_pos(window, ((screen.0 as i32 - ow as i32) / 2, (screen.1 as i32 - oh as i32) / 2));
-                self.open.push(Loot { window, container, word: u.word, entries: vec![], clicked: None });
+                self.open.push(Loot { window, container, word: u.word, slots, entries: vec![], clicked: None });
                 self.open.len() - 1
             }
             None => return,
@@ -110,7 +145,7 @@ impl LootUi {
     fn draw(&mut self, gui: &mut Gui, at: usize) {
         let slot_gfx = gui.gfx_id(SLOT_GFX).map(ao_gui::GfxId);
         let (mut cmds, mut tips) = (vec![], vec![]);
-        for n in 0..SLOTS {
+        for n in 0..self.open[at].slots {
             let (x, y) = slot_origin(n);
             if let Some(g) = slot_gfx {
                 cmds.push(CanvasItem::Image { id: g, src: [0.0, 0.0, SLOT, SLOT], dst: [x, y, x + SLOT, y + SLOT], alpha: 1.0 });
@@ -156,12 +191,13 @@ impl LootUi {
     /// time (`FUN_100ca1e7` -> `MoveItemToInventory(item)`): the item to take.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, now: f32) -> Option<Option<Identity>> {
         match ev {
+            Event::Escape { window } if self.open.iter().any(|l| l.window == *window && l.container.kind == 0xdead) => Some(None),
             Event::CanvasClick { window, view, x, y } if view == "grid" => {
                 let l = self.open.iter_mut().find(|l| l.window == *window)?;
-                let Some(n) = cell_at(*x, *y).filter(|&n| n < l.entries.len()) else { return Some(None) };
+                let Some(n) = cell_at_for(*x, *y, l.slots).filter(|&n| n < l.entries.len()) else { return Some(None) };
                 let double = l.clicked.is_some_and(|(c, t)| c == n && now - t <= ao_gui::DOUBLE_CLICK_TIME);
                 l.clicked = if double { None } else { Some((n, now)) };
-                Some(double.then(|| container_item_identity(l.word, l.entries[n].slot)))
+                Some(double.then(|| if l.container.kind == 0xdead { Identity { kind: 0x69, instance: l.entries[n].slot as i32 } } else { container_item_identity(l.word, l.entries[n].slot) }))
             }
             Event::CloseRequested { window } | Event::Escape { window } if self.open.iter().any(|l| l.window == *window) => {
                 let i = self.open.iter().position(|l| l.window == *window)?;
@@ -201,6 +237,25 @@ mod tests {
         assert_eq!(cell_at(0.0, 0.0), None);
         let (ox, oy) = cell_origin(0, 0, gap());
         assert_eq!(cell_at(ox + CELL + 3.0, oy + 1.0), None);
+    }
+
+    #[test]
+    fn bank_has_102_cells_and_uses_bank_item_identities() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        let mut ui = LootUi::default();
+        let c = Identity { kind: 0xdead, instance: 7 };
+        let mut u = update(true, &[101]);
+        u.container = c;
+        ui.update(&mut gui, None, (1280, 800), c, "Bank", &u);
+        assert_eq!(ui.open[0].slots, 102);
+        assert_eq!(ui.take(&mut gui, 0, 1.0), Some(Identity { kind: 0x69, instance: 101 }));
+        let w = ui.open[0].window;
+        ui.event(&mut gui, &Event::Escape { window: w }, 2.0);
+        assert!(ui.is_open(c), "bank is not registered with the Esc handler");
+        ui.close_bank(&mut gui);
+        assert!(!ui.is_open(c));
     }
 
     fn update(flag: bool, slots: &[u32]) -> InventoryUpdate {

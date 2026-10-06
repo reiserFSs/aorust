@@ -673,6 +673,41 @@ impl Movement {
         m
     }
 
+    /// Restore the FullUpdate vehicle state without replaying movement transitions.
+    /// PlayerVehicle read hook [GC 0x1007135d], CharVehicle [GC 0x1006f03e],
+    /// FSM [GC 0x10070438 / 0x1006c4dc]; the four player inputs follow at byte 26.
+    pub fn restore_blob(&mut self, blob: &[u8]) {
+        let Some(s) = ao_net::n3::motion::Status::from_blob(blob) else { return };
+        let float = |offset: usize| f32::from_be_bytes(blob[offset..offset + 4].try_into().unwrap());
+        if ![0, 4, 8].into_iter().all(|offset| float(offset).is_finite())
+            || (blob.len() >= 42 && ![26, 30, 34, 38].into_iter().all(|offset| float(offset).is_finite()))
+        {
+            return;
+        }
+        self.fsm = Fsm {
+            mode: s.mode as u8,
+            last_speed_mode: s.prev_mode as u8,
+            fwd: if s.forward == 0 { 1 } else { 2 },
+            fwd_dir: match s.forward { -1 => 2, 1 => 1, _ => 0 },
+            strafe: if s.strafe == 0 { 1 } else { 2 },
+            strafe_dir: match s.strafe { -1 => 3, 1 => 4, _ => 0 },
+            elev: if s.elevating { 2 } else { 1 },
+            elev_dir: if s.elevating { 5 } else { 0 },
+            turn: if s.turn == 0 { 1 } else { 4 },
+            turn_dir: match s.turn { -1 => 3, 1 => 4, _ => 0 },
+            jump: if s.jumping { 3 } else { 1 },
+        };
+        self.recalc();
+        self.vel = [float(0), float(8)];
+        self.vy = float(4);
+        if blob.len() >= 42 {
+            self.in_fwd = float(26);
+            self.in_strafe = float(30);
+            self.in_turn = float(34);
+            self.in_elev = float(38);
+        }
+    }
+
     // ---- getters -------------------------------------------------------------------------------------------------
 
     /// Position in server coordinates (feet).
@@ -1709,6 +1744,48 @@ mod tests {
             out.extend(m.update(1.0 / 60.0, w));
         }
         out
+    }
+
+    #[test]
+    fn full_update_restores_speed_axes_and_player_inputs() {
+        let mut blob = [0u8; 42];
+        blob[12..22].copy_from_slice(&[mode::RUN, 2, 1, 1, 0, 1, 0, 1, 0, 1]);
+        blob[22..26].copy_from_slice(&(mode::RUN as i32).to_be_bytes());
+        blob[26..30].copy_from_slice(&1.0f32.to_be_bytes());
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.teleport([0.0; 3], 0.0);
+        m.restore_blob(&blob);
+        assert_eq!((m.fsm.mode, m.fsm.last_speed_mode, m.fsm.fwd, m.in_fwd), (mode::RUN, mode::RUN, 2, 1.0));
+        assert_eq!(m.max_speed(), 5.0);
+        m.surface.event = Some(LiquidEvent::Enter);
+        m.liquid_callbacks();
+        assert_eq!(m.fsm.mode, mode::SWIM);
+        m.surface.event = Some(LiquidEvent::Leave);
+        m.liquid_callbacks();
+        assert_eq!(m.fsm.mode, mode::RUN);
+        blob[12] = mode::WALK;
+        blob[25] = mode::WALK;
+        m.restore_blob(&blob);
+        m.surface.event = Some(LiquidEvent::Enter);
+        m.liquid_callbacks();
+        m.surface.event = Some(LiquidEvent::Leave);
+        m.liquid_callbacks();
+        assert_eq!((m.fsm.mode, m.fsm.last_speed_mode, m.max_speed()), (mode::WALK, mode::WALK, 1.5));
+        let before = (m.fsm, m.vel, m.vy, m.in_fwd, m.max_speed());
+        m.restore_blob(&blob[..25]);
+        assert_eq!((m.fsm, m.vel, m.vy, m.in_fwd, m.max_speed()), before);
+        blob[12] = 0xff;
+        m.restore_blob(&blob);
+        assert_eq!((m.fsm, m.vel, m.vy, m.in_fwd, m.max_speed()), before);
+        blob[12] = mode::WALK;
+        blob[0..4].copy_from_slice(&f32::NAN.to_be_bytes());
+        m.restore_blob(&blob);
+        assert_eq!((m.fsm, m.vel, m.vy, m.in_fwd, m.max_speed()), before);
+        blob[0..4].copy_from_slice(&0.0f32.to_be_bytes());
+        blob[26..30].copy_from_slice(&f32::INFINITY.to_be_bytes());
+        m.restore_blob(&blob);
+        assert_eq!((m.fsm, m.vel, m.vy, m.in_fwd, m.max_speed()), before);
+        assert!(m.take_outgoing().is_empty());
     }
 
     #[test]

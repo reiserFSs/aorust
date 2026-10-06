@@ -15,7 +15,7 @@ use super::hud::WindowKind;
 use super::hud_bar::{self, ShortcutBar, SlotUse};
 use super::hud_listview::{self as lv, ListView, ListWindow, MenuTexts, Mode, Row, Spec};
 use super::hud_rollup::Rollup;
-use super::hud_special::{template_of, SpecialList};
+use super::hud_special::SpecialList;
 use ao_gui::view::CanvasItem;
 use ao_gui::{Gui, InputEvent, MouseButton, WindowSize};
 use std::collections::HashMap;
@@ -124,7 +124,7 @@ impl HudActionWin {
         let shown: Vec<(u32, u32, f32)> = list
             .entries()
             .iter()
-            .filter_map(|e| template_of(e.shown).map(|t| (t, e.shown)))
+            .filter_map(|e| e.template().map(|t| (t, e.shown)))
             .take(CELLS)
             .map(|(t, a)| {
                 let p = list.progress(a).map_or(-1.0, |(p, _)| if timers { p } else { 1.0 });

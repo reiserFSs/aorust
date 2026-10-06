@@ -222,7 +222,7 @@ Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot 
 * **Persistence (GUESS)**: the config keys contain only `tab_index` and the per-window `WindowFrame`; the document-to-window grouping (`+0x98`, assigned in `FUN_100abfa3`'s loop and `FUN_100974b5`) is not written by
   `FUN_1009a77b`. The port groups windows in mode 0 whose saved `WindowFrame` is identical into one frame, ordered by `tab_index`, and writes the same frame into every tab of a frame.
 * Port: `Gui::set_window_tabs`, `window_tabs`, `Event::TabSelected`, `Event::TabDropped { window, tab, x, y, target }`; `ChatWindows::{select_tab, tab_dropped}` (reorder, dock, tear-out; rebuilds the GUI windows).
-  A window with several tabs cannot switch to Borderless (its menu entry is disabled: **GUESS**; the original's `SetStyle` is per window while `visual_mode` is per document).
+  Switching a docked document to Borderless now tears it into its own frame using the existing tear-out path, so the mode remains selectable. This is a port interaction policy, not a verified retail multi-tab mode-change rule.
 
 ## 12. Menus (`PopupMenu_c`)
 
@@ -236,6 +236,7 @@ Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot 
 * **User-link menu** `FUN_1008e135` (a `user://NAME` link under a right press, `FUN_1008f5dd`): *IgnoreUser*, *OpenChat*, *SendTell* (each present when its `ChatView` flag bit 0x1/0x2/0x4 is set; **GUESS** all three);
   the slots re-emit `NAME` on signals +0x148 / +0x14c / +0x150. Port: IgnoreUser → `/ignore NAME`, OpenChat and SendTell → the tell window / `/tell NAME ` (`WinOut::IgnoreUser` / `OpenTell`).
 * The text view itself shows no menu (`DISABLE_RC_MENU` 0x200 → `TextRenderer_c::MouseDown` button 2 falls through to the parent `View::MouseDown`), so the right press reaches `ChatView`.
+* Port input boundary: `Gui::wants_mouse` captures the entire visible framed window, including empty client space and a root `TextView`, matching `frame_right_down`'s frame/client context dispatch. `Play::input` queries capture **before** GUI dispatch (`flow.rs`), so omitting the root/frame let one right press both queue a world click and open the chat menu. Reported reproduction: DefaultWindow outer `(314,187)..(754,420)`, pointer `(596,384)`, MouseMove/right-down/right-up. Regression: `ao-gui/tests/frame.rs::framed_root_text_right_click_captures_before_context_dispatch`; hidden frames and empty borderless roots retain passthrough. This changes no saved chat visual-mode setting.
 * Port: `ao_gui::MenuItem` (entry / check / separator / submenu / slider), `Gui::open_menu`, `Event::{ContextMenu, FrameIcon, MenuPicked, MenuSlider}`. **UNRESOLVED**: the `PopupMenu_c` skin (the combo popup's
   raised border art is used), the check mark and sub-menu arrow art (a 5 px square and `>`), slider art.
   Not ported (need dialogs / other windows): *ChatConfiguration*, *RenameWindow*, *DeleteWindow*, *NewWindow*, `chat_group_window`.
@@ -260,9 +261,15 @@ save/reload, border windows fixed, dock / tear-out / reload grouping, selection 
 ## 15. Retail comparison and live settings (GuiFidelity pass)
 
 **What the retail screenshot is.** `/tmp/GuiFidelity/ref.png` (an older retail build than 0.7.2, user supplied) shows the chat window in visual mode **0** (style-0 frame, `i` icon, tab strip with two tabs, pin + X).
-That is not a contradiction of the shipped data: the template windows say `visual_mode 2` (client/prefs/NewChar/Chat/Windows/Window{1,2}/Config.xml), the screenshot's user chose *Visual > Mode > Normal* and
-dragged the "Combat" tab onto the "Default Window" strip (§10, §11). The tab titles `Default Window [Clan OOC]` / `Combat [Atlantean Pact *AP*]` are `FUN_100ab980` with `ChatShowOGrpInTitleBar` = its shipped
-default **true** (LoginPrefs.xml line 8). So Normal mode is the thing to be pixel-faithful in, and the borderless default must be what `FUN_100aab08` / `FUN_1008daa0` / `Window::UpdateFadeLevel` say (§2).
+The shipped template instead says `visual_mode 2` (`prefs/NewChar/Chat/Windows/Window1/Config.xml:57`, Window2 likewise); Window1 lines 59–60 set inactive/active alpha 0.3/0.8, line 64 enables text input, and line 74 names it "Default Window".
+The screenshot's mode-0 appearance does not establish a shipped fresh-character default. Its group-decorated tab titles are `FUN_100ab980` with `ChatShowOGrpInTitleBar` = the shipped **true** (`cd_image/gui/Default/LoginPrefs.xml:8`; input-group prompt is true at line 7).
+
+**Intentional user-requested default deviation (2026-10-06).** Fresh characters in the port start in Normal mode (0), with Default Window and Combat docked into one framed tab strip and the Default Window input line enabled. This deliberately replaces the shipped mode-2 template layout with the requested retail screenshot look; it is not claimed to be the original NewChar default.
+`fresh_layout` changes only newly adopted template/code defaults: mode 0, shared first-window frame, ordered tab indices. Mode 0 retains its opaque text (`FadeTo(1.0)`, §2) and retail framed background art; saved per-window modes, opacity, output groups and frames are never overridden. Normal and Borderless remain selectable through the Visual > Mode menu and persist.
+
+**Character-local saved documents.** `ChatWindows::new_for_character` uses the account/`Char<ID>` directory supplied by `DValues::char_dir` (`LoadUserConfig` 0x1006bacd; see `dvalue.rs::open_user`), rather than sharing root `Chat/Windows` between all characters. Existing port root `Chat/Windows` is renamed once into the first character without its own window archive; existing character archives take precedence and are not overwritten. Unrelated logs/preferences are untouched. Regression tests `chat_documents_are_character_local_and_legacy_customizations_survive_once` and `fresh_characters_start_framed_tabbed_with_input_and_can_switch_modes` cover migration, isolation, fresh tabs/input and saved Borderless reload.
+
+**Frame close routing.** A live click at `(744,540)` on the visible X of frame `(314,528,440,233)` previously did nothing: `ChatWindows::owns` omitted `Event::CloseRequested`, and its event handler had no close branch. The frame now hides all its documents and persists `is_window_open=false`, rather than deleting their channel settings/history. Closed documents remain loaded but hidden across a reload; Enter reopens the last input frame. The fresh-layout regression also covers ownership, hidden state, save/reload and reopening. This retention/reopen policy is implemented in the port; the exact retail multi-tab close scope has not been separately decompiled.
 
 Defects found and fixed (all verified against the decompiles above):
 

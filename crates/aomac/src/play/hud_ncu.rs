@@ -154,7 +154,7 @@ impl HudNcu {
         self.clock += dt;
         let Some(win) = self.win.as_ref() else { return };
         let w = win.win;
-        let title = Self::title_for(&self.texts, zone.stat(STAT_NCU_USED).unwrap_or(0), zone.stat(STAT_NCU_MAX).unwrap_or(0));
+        let title = Self::title_for(&self.texts, zone.skill_value(STAT_NCU_USED).unwrap_or(0), zone.skill_value(STAT_NCU_MAX).unwrap_or(0));
         if title != self.title {
             win.set_title(gui, &title);
             self.title = title;

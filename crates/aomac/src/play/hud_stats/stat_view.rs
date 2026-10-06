@@ -78,7 +78,7 @@ impl StatView {
         for b in &BARS {
             xml += &format!(
                 "<View view_layout=\"stacked\" name=\"{n}_box\" layout_borders=\"Rect(3,2,3,0)\" min_size=\"Point({bw},{bh})\" max_size=\"Point({bw},{bh})\"><PowerBar name=\"{n}\" bg_gfx=\"GFX_GUI_HOR_BAR_EMPTY\" full_gfx=\"{}\" direction=\"right\"/>\
-                 <TextView name=\"{n}_label\" h_alignment=\"center\" v_alignment=\"center\"/></View>",
+                 <View view_layout=\"horizontal\" h_alignment=\"center\" v_alignment=\"center\"><TextView name=\"{n}_label\"/></View></View>",
                 b.full,
                 n = b.name
             );
@@ -123,7 +123,7 @@ impl StatView {
 
     /// The handlers of the ctor's `GetCharStatSignal` connections, run once per frame over the own stats.
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone) {
-        let st = |id: u32| zone.stat(id).unwrap_or(0);
+        let st = |id: u32| zone.skill_value(id).unwrap_or(0);
         let name = zone.own().map(|d| d.name.as_str()).unwrap_or_default();
         // `FUN_1007f99b` / `FUN_1007fa1c`
         self.text(gui, "name", format!("<FONT color=#ffffff>Name:</font> <FONT color=#bbbbff>{}</font>", esc(name)));

@@ -20,6 +20,8 @@ pub struct Track {
 
 #[derive(Clone, Debug)]
 pub struct CatAnim {
+    /// RDB 1010003 id supplied by the asset loader; zero for a raw parsed stream.
+    pub source_id: u32,
     /// Name field: skeleton root bone (`Bip01_ac`, `Bone01_Main`, …).
     pub root: String,
     /// Named markers (time in ms, name): `loopstart`, `attack`, `right`, …
@@ -29,7 +31,8 @@ pub struct CatAnim {
     pub duration: f32,
     /// Skeleton hash, equal to `CatMesh::signature` of the meshes it animates.
     pub signature: u32,
-    /// Float at `CATKeyframeAnimData_t+0x30`; ~0.5 for walk-like clips, meaning not decoded.
+    /// Float at `CATKeyframeAnimData_t+0x30`; unresolved meaning, not the playback clock multiplier
+    /// (DisplaySystem 0x10072fde uses only seconds * 1000 * the animation's speed scale).
     pub param: f32,
     pub tracks: Vec<Track>,
 }
@@ -158,7 +161,7 @@ impl CatAnim {
             ensure!((bone as usize) < 4096, "track bone index {bone} out of range");
             tracks.push(Track { bone, mode, rot: rk, trans: tk });
         }
-        Ok(Self { root, events, version, duration, signature, param, tracks })
+        Ok(Self { source_id: 0, root, events, version, duration, signature, param, tracks })
     }
 
     /// Local (rotation quaternion xyzw, translation) of `bone` at `t_ms`, `None` if the clip has no track for it.

@@ -12,9 +12,9 @@
 //! Life          = level * b[0x259] + GetStat(0x98, 0) * b[0x25a] + b[600] + hp_lvl     // SetStat(1, ..)
 //! MaxNanoEnergy = level * b[0x25c] + GetStat(0x84, 0) * b[0x25d] + b[0x25b] + nano_lvl // SetStat(0xdd, ..)
 //! ```
-//! `GetStat(stat, 0)` is `GetSkill(stat, 2)`: the raw stat plus its trickle-down ([`SkillTables::trickle`]); the bonus / percent maps of the stat
-//! modifier object (`SimpleChar+0x1bc`: buffs, items) are not wired into the own stats yet, so the value is unbuffed (UNRESOLVED, docs/gui.md 11.10). A breed without a record yields the error code 2 for each of
-//! the three breed values (`FUN_100c43d4`). Check: a level 1 Solitus Soldier with all abilities 6 (BodyDev / NanoPool 5 + trickle 1 = 6) gets
+//! `GetStat(stat, 0)` is `GetSkill(stat, 2)`: raw plus percent, buffed-ability trickle-down and direct bonuses. The HUD passes its shared
+//! modifier-aware skill model to [`PoolTables::max_pools`]; [`PoolTables::own`] is the unmodified-table calculation used by table checks.
+//! A breed without a record yields the error code 2 for each breed value (`FUN_100c43d4`). A level 1 Solitus Soldier with all abilities 6 gets
 //! `6·1 + 6·3 + 10 = 34` health and `4·1 + 6·3 + 10 = 32` nano, exactly the dynel header's `max_health` 34 and the `CurrentNano` 32 of the captures.
 
 use super::skills::{Character, SkillTables};

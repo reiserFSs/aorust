@@ -16,14 +16,13 @@
 //!   trade window is deleted and the last text type becomes 3.
 
 use super::interact::Interact;
-use super::interact_chat::{style2_xml, BarFlags, ChatOut, ChatTexts, NpcChat, STAT0_USE_BIT};
+use super::interact_chat::{style2_xml, BarFlags, ChatOut, ChatTexts, NpcChat};
 use super::zone::Zone;
 use super::Play;
 use ao_gui::{tvf, CanvasItem, DrawCmd, DrawList, Event, GfxId, Gui, MouseButton, WindowId, WindowSize};
 use ao_net::msg::Identity;
 use ao_net::n3::inventory as inv;
 use ao_net::n3::knubot::{self, Knubot};
-use std::collections::HashMap;
 
 /// Cash (`0x3d`, `N3Msg_GetSkill(0x3d, 2)` in `FUN_100574dc`).
 pub const STAT_CASH: u32 = 0x3d;
@@ -177,8 +176,6 @@ pub struct TradeUi {
     pub texts: ChatTexts,
     /// Pref `ShowNPCQuestions` (default 1).
     pub show_questions: bool,
-    /// Last value of stat 0 per dynel (`bit 21` enables the fourth button).
-    pub flags0: HashMap<i32, i32>,
     /// Change of the own Cash stat to apply (accept: minus the credits, rejected items: plus the value).
     pub cash_delta: i32,
     /// `ShowURL` requests of the bar's info button / the container.
@@ -190,7 +187,7 @@ pub struct TradeUi {
 
 impl Default for TradeUi {
     fn default() -> Self {
-        TradeUi { win: None, texts: ChatTexts::default(), show_questions: true, flags0: HashMap::new(), cash_delta: 0, info_urls: vec![], mouse: (-1.0, -1.0), rejected: vec![] }
+        TradeUi { win: None, texts: ChatTexts::default(), show_questions: true, cash_delta: 0, info_urls: vec![], mouse: (-1.0, -1.0), rejected: vec![] }
     }
 }
 
@@ -205,9 +202,8 @@ impl TradeUi {
 impl Interact {
     /// `KnubotOpenChatWindow` -> `NPCChatView_c` (`FUN_10058ed8`): the window with the bar whose buttons are enabled by `b20` (description), `b21` (trade) and stat 0
     /// bit 21 of the NPC (use).
-    pub(super) fn open_chat(&mut self, gui: &mut Gui, npc: Identity, name: &str, b20: bool, b21: bool) {
+    pub(super) fn open_chat(&mut self, gui: &mut Gui, npc: Identity, name: &str, b20: bool, b21: bool, use_npc: bool) {
         self.trade.close(gui);
-        let use_npc = self.trade.flags0.get(&npc.instance).is_some_and(|v| v & STAT0_USE_BIT != 0);
         match NpcChat::open(gui, self.screen, npc, name, BarFlags { description: b20, trade: b21, use_npc }, &self.trade.texts) {
             Ok(mut c) => {
                 c.show_questions = self.trade.show_questions;
@@ -448,6 +444,7 @@ impl Interact {
 mod tests {
     use super::*;
     use crate::play::interact_chat::{dock_below, dock_right};
+    use crate::play::interact_chat::STAT0_USE_BIT;
     use crate::play::zone::DynelState;
     use ao_gui::InputEvent;
     use ao_net::n3::misc::Misc;
@@ -502,10 +499,10 @@ mod tests {
     #[test]
     fn bar_buttons_send_their_messages() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
+        let mut z = zone();
         let mut i = Interact::new(OWN, (1280, 800));
         // stat 0 bit 21 of the NPC enables the fourth button (read when the window is built)
-        i.trade.flags0.insert(4711, STAT0_USE_BIT);
+        z.character_stats.entry(4711).or_default().insert(0, STAT0_USE_BIT);
         feed(&mut i, &mut gui, &z, Knubot::Open { npc: NPC, b20: true, b21: false });
         assert!(i.press_button(&mut gui, 0));
         assert!(!i.press_button(&mut gui, 2), "trade needs b21");
@@ -522,9 +519,9 @@ mod tests {
     #[test]
     fn use_button_sends_the_use_command() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
+        let mut z = zone();
         let mut i = Interact::new(OWN, (1280, 800));
-        i.trade.flags0.insert(4711, STAT0_USE_BIT);
+        z.character_stats.entry(4711).or_default().insert(0, STAT0_USE_BIT);
         feed(&mut i, &mut gui, &z, Knubot::Open { npc: NPC, b20: false, b21: false });
         assert!(i.press_button(&mut gui, 3));
         let f = i.take_outbox();

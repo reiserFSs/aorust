@@ -92,6 +92,59 @@ impl ItemTemplate {
     }
 }
 
+/// GC 100cb3b2: round the distance from the smaller value, not the final signed value.
+/// QLs are unsigned 16-bit; extrapolation is not clamped.
+pub fn interpolate_acg_value(a: i32, b: i32, aq: i32, bq: i32, q: i32) -> i32 {
+    let (aq, bq, q) = (aq as u16 as i32, bq as u16 as i32, q as u16 as i32);
+    if a == b || aq == bq || q == aq { return a; }
+    if q == bq { return b; }
+    let (base, end, from, to) = if a < b { (a, b, aq, bq) } else { (b, a, bq, aq) };
+    base.wrapping_add((((q - from) as f64 * end.wrapping_sub(base) as f64 / (to - from) as f64) + 0.5) as i32)
+}
+
+/// GC 10082a3d / 100cc270 / 100cb689: nearest-template metadata (tie high),
+/// selective stat interpolation, and the quadratic Value adjustment (100cb611).
+pub fn interpolate_item_templates(low: &ItemTemplate, high: &ItemTemplate, ql: i32) -> Result<ItemTemplate> {
+    let ql = if (1..=511).contains(&(ql as u16 as i32)) { ql as u16 as i32 } else { 1 };
+    let aq = low.stat(54).unwrap_or(0) as u16 as i32;
+    let bq = high.stat(54).unwrap_or(0) as u16 as i32;
+    ensure!((1..=511).contains(&aq) && (1..=511).contains(&bq), "invalid template QL");
+    let mut out = if (ql - aq).abs() < (ql - bq).abs() { low.clone() } else { high.clone() };
+    if aq != bq {
+        ensure!(low.stats.len() == high.stats.len(), "different template stat counts");
+        for (id, value) in &mut out.stats {
+            if matches!(*id, 1 | 2 | 26 | 27 | 36 | 45 | 73 | 74 | 75 | 101 | 134 | 210..=212 | 236 | 250 | 284..=287 | 289 | 294 | 297 | 299 | 341 | 422 | 538) {
+                let a = low.stat(*id).unwrap_or(0);
+                let b = high.stat(*id).unwrap_or(0);
+                *value = interpolate_acg_value(a, b, aq, bq, ql);
+                if *id == 74 && a != b && *value != a && *value != b {
+                    let min = a.min(b) as f32;
+                    let span = a.max(b) as f32 - min;
+                    if span != 0.0 {
+                        let ratio = ((*value as f64 - min as f64) as f32) / span;
+                        *value = (ratio as f64 * ratio as f64 * span as f64 + min as f64) as i32;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(v) = out.stats.iter_mut().find(|s| s.0 == 54) { v.1 = ql; }
+    else { out.stats.push((54, ql)); }
+    Ok(out)
+}
+
+#[cfg(test)]
+#[test]
+fn acg_interpolation_rounds_from_minimum_and_squares_value() {
+    assert_eq!(interpolate_acg_value(-10, -1, 1, 3, 2), -5);
+    assert_eq!(interpolate_acg_value(10, 1, 1, 3, 2), 6);
+    assert_eq!(interpolate_acg_value(10, 20, 1, 3, 0), 6);
+    let template = |ql, value, name: &str| ItemTemplate { kind: 0xc74a, stats: vec![(54, ql), (74, value)], name: Some(name.into()), sounds: vec![] };
+    let out = interpolate_item_templates(&template(1, 100, "low"), &template(3, 200, "high"), 2).unwrap();
+    assert_eq!(out.name.as_deref(), Some("high"));
+    assert_eq!(out.stat(74), Some(125));
+}
+
 /// Parse the leading stat list (and name, if present) of an rdb 1000020 record.
 pub fn parse_item_template(rec: &[u8]) -> Result<ItemTemplate> {
     let mut at = 0usize;

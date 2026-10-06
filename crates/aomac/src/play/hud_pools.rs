@@ -3,34 +3,33 @@
 //! Every slot reads `cur` and `max` through `N3Msg_GetSkill(stat, 2)`, computes `r = (float)cur / (float)max` and, only when `1.0 < r`, replaces it by
 //! 1.0 (`SetValue(Variant(r))` on the `PowerbarView_c`, tooltip `"%d / %d"` = `cur`, `max`). Nothing clamps a negative value (we clamp to 0, UNRESOLVED), nothing guards `max == 0`
 //! (`cur / 0` = +inf → the bar is full, `0 / 0` = NaN → UNRESOLVED how `PowerbarView_c::SetValue` paints it; we draw an empty bar).
-//! PRK's `FullCharacter` carries `Life` (1) = 1 and `MaxNanoEnergy` (221) = 1; `GetSkill(1 | 221, 2)` is the plain stored stat (no trickle-down row, no
-//! bonus), but the client overwrites both stats with its own formula (`FUN_1006208d`, [`ao_formats::stats::pools`], docs/gui.md 10.4) whenever the
-//! character is set up and BodyDevelopment / NanoPool are set: [`Pools::apply`] does that on the own stats before the bars read them.
+//! PRK's `FullCharacter` carries `Life` (1) = 1 and `MaxNanoEnergy` (221) = 1; the client overwrites both raw stats using its own formula
+//! (`FUN_1006208d`, [`ao_formats::stats::pools`], docs/gui.md 10.4) whenever BodyDevelopment / NanoPool change. [`Pools::apply`] uses the shared
+//! modifier-aware skill values before the own skill projection and all HUD bars are refreshed.
 
 use super::zone::Zone;
-use ao_formats::stats::{pools::{self, PoolTables}, skills::SkillTables};
+use ao_formats::stats::{pools::{self, PoolTables}, skills::Character};
 use std::path::Path;
 
 /// The tables of `FUN_1006208d` (empty when the client's rdb is missing: the stats stay as the server sent them).
-pub(super) struct Pools(Option<(PoolTables, SkillTables)>);
+pub(super) struct Pools(Option<PoolTables>);
 
 impl Pools {
     pub(super) fn new(dir: &Path) -> Self {
         let load = || -> anyhow::Result<_> {
             let store = ao_rdb::RecordStore::open(dir)?;
-            Ok((PoolTables::load(&store)?, SkillTables::load(&store)?))
+            PoolTables::load(&store)
         };
         Self(load().map_err(|e| eprintln!("hud: pool tables: {e:#}")).ok())
     }
 
-    /// Stores the computed `Life` / `MaxNanoEnergy` once the own `FullCharacter` stats (the level) are in. The stat modifier maps (`SimpleChar+0x1bc`)
-    /// are not wired into the own stats yet (docs/gui.md 11.10), so the skills are unbuffed (UNRESOLVED).
-    pub(super) fn apply(&self, zone: &mut Zone) {
-        let Some((pool, skills)) = &self.0 else { return };
+    /// Stores the computed raw maxima using the same buffed BodyDevelopment / NanoPool as `GetStat(skill, 0)` (`FUN_1006208d`).
+    pub(super) fn apply(&self, zone: &mut Zone, skill: &dyn Fn(&Zone, u32) -> i32) {
+        let Some(pool) = &self.0 else { return };
         if zone.stat(0x36).is_none() {
             return;
         }
-        let (life, nano) = pool.own(skills, |s| zone.stat(s));
+        let (life, nano) = pool.max_pools(&Character::from_stats(|s| zone.stat(s)), skill(zone, pools::BODY_DEV), skill(zone, pools::NANO_POOL));
         zone.stats.insert(pools::LIFE, life);
         zone.stats.insert(pools::MAX_NANO, nano);
     }
@@ -114,11 +113,15 @@ mod tests {
             }
         }
         assert_eq!((z.stat(1), z.stat(221)), (Some(1), Some(1)), "what PRK sends");
-        Pools::new(&dir).apply(&mut z);
+        let skills = ao_formats::stats::skills::SkillTables::load(&ao_rdb::RecordStore::open(&dir).unwrap()).unwrap();
+        let skill = |z: &Zone, id| z.stat(id).unwrap_or(0) + skills.trickle(id, Character::from_stats(|s| z.stat(s)).abilities) as i32;
+        Pools::new(&dir).apply(&mut z, &skill);
         assert_eq!((z.stat(1), z.stat(27), z.stat(221), z.stat(214)), (Some(34), Some(34), Some(32), Some(32)));
         assert_eq!(ratio(z.stat(27).unwrap(), z.stat(1).unwrap()), 1.0);
         z.stats.insert(27, 27);
-        Pools::new(&dir).apply(&mut z);
+        Pools::new(&dir).apply(&mut z, &skill);
         assert!((ratio(z.stat(27).unwrap(), z.stat(1).unwrap()) - 27.0 / 34.0).abs() < 1e-6, "a hit of 7 must show");
+        Pools::new(&dir).apply(&mut z, &|z, id| skill(z, id) + if id == pools::BODY_DEV { 10 } else { 0 });
+        assert_eq!((z.stat(1), z.stat(221)), (Some(64), Some(32)), "buffed BodyDevelopment adds three Life per point for Solitus");
     }
 }

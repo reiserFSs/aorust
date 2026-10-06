@@ -8,7 +8,7 @@ mod filter;
 mod info;
 mod line;
 mod macros;
-mod log;
+pub(super) mod log;
 mod net;
 mod social;
 mod social_hub;
@@ -55,6 +55,7 @@ pub(super) enum GameAction {
     Duel { pet: bool, op: ao_net::n3::action::duel::Op },
     /// Yes in the "StartPvP" dialog (`GuiSystem_c::StartPvPFightResult`, GUI 0x1002f789): `N3Msg_StartPvP(target)`.
     StartPvp(ao_net::msg::Identity),
+    BankClose,
 }
 
 /// Results of chat commands that other layers apply (taken once per frame by the flow with [`Chat::take_requests`]).
@@ -160,10 +161,16 @@ impl Chat {
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
-    pub fn open(&mut self, gui: &mut Gui, screen: (u32, u32)) -> Result<()> {
+    pub fn open(&mut self, gui: &mut Gui, screen: (u32, u32), char_dir: Option<&std::path::Path>) -> Result<()> {
         self.screen = screen;
+        if let Some(dir) = char_dir {
+            self.swin.set_character_dir(dir);
+        }
         if self.win.is_none() {
-            let mut w = ChatWindows::new(gui, screen)?;
+            let mut w = match char_dir {
+                Some(dir) => ChatWindows::new_for_character(gui, screen, dir)?,
+                None => ChatWindows::new(gui, screen)?,
+            };
             // HUD footprint (wings 190/65 px, shortcut bar 38 px at 1280x828, measured from the HUD art): only the template default windows avoid it
             w.set_reserved(gui, win::Reserved { left: 190, right: 65, bottom: 38 });
             self.win = Some(w);
@@ -221,11 +228,16 @@ impl Chat {
     }
 
     pub fn resize(&mut self, gui: &mut Gui, screen: (u32, u32)) {
-        self.swin.resize(screen);
+        self.swin.resize(gui, screen);
         self.screen = screen;
         if let Some(w) = &mut self.win {
             w.resize(gui, screen);
         }
+    }
+
+    /// Retail Friends is a DockableView; LFT is a plain Window and must not join the dock controller.
+    pub fn dock_windows(&self) -> impl Iterator<Item = (&'static str, ao_gui::WindowId)> {
+        self.swin.friends_window().map(|id| ("friends_window", id)).into_iter()
     }
 
     /// `IgnoreSystem_t::IsCharacterIgnored(id)`.
@@ -398,6 +410,12 @@ impl Chat {
             PT_SYSTEM => self.net.on_system_frame(f, zone.char_id),
             PT_N3 => {
                 let Ok(m) = n3::decode(f) else { return };
+                if let N3::World(ao_net::n3::world::World::Info(packet)) = &m.body {
+                    match info::character_html(zone, m.header.target, packet, texts) {
+                        Ok(html) => self.info.character_page(gui, m.header.target, html),
+                        Err(error) => self.system_line(gui, &format!("Character info failed: {error:#}"), 12),
+                    }
+                }
                 if let N3::Chat(c) = &m.body {
                     let ctx = zone::ZoneChatCtx {
                         texts,
@@ -605,6 +623,14 @@ impl Chat {
         for o in outs {
             match o {
                 info::InfoOut::Command(c) => self.run_line(gui, &c, zone, texts),
+                info::InfoOut::Character(target) => self.outbox.push(ao_net::n3::outgoing::n3_frame(0, zone.char_id, ao_net::n3::info::request(zone.char_id as i32, target))),
+                info::InfoOut::Quest(target) => {
+                    match info::quest_html(zone, target, texts) {
+                        Ok(Some(html)) => self.info.quest_page(gui, target, html),
+                        Ok(None) => {},
+                        Err(error) => self.system_line(gui, &format!("Mission info failed: {error:#}"), 12),
+                    }
+                }
                 // `GlobalSignals+0x17c(0, text, 0xc)`: red line in the System window
                 info::InfoOut::Error(t) => self.system_line(gui, &t, 12),
             }
@@ -676,12 +702,12 @@ impl Chat {
     fn voice_cmd(&mut self, gui: &mut Gui, zone: &Zone, cmd: &str, sound: Option<String>) {
         let err = |t: &str| ChatLine::new(ChatKind::Other("CCChatCmdFeedbackError"), format!("<div><font color=CCChatCmdFeedbackError>{t}</font></div>"));
         // stat 0x185 (Expansion) bit 0; the required name `FUN_1016c316` joins is not decoded: [GUESS] "Notum Wars" (bit 0 of the expansion flags)
-        if zone.stat(0x185).unwrap_or(0) & 1 == 0 {
+        if zone.skill_value(0x185).unwrap_or(0) & 1 == 0 {
             return self.line(gui, err("This function requires Notum Wars."));
         }
         let Some(sound) = sound else { return self.line(gui, err(&format!("Usage: {cmd} &lt;sound name&gt;"))) };
         let own = zone.own().map_or(String::new(), |d| d.name.clone());
-        let v = voice::Voice { breed: zone.stat(4).unwrap_or(0), sex: zone.stat(0x3b).unwrap_or(0), fx: voice::fx_name(self.voice_prefs.fx_type).into(), sound };
+        let v = voice::Voice { breed: zone.skill_value(4).unwrap_or(0), sex: zone.skill_value(0x3b).unwrap_or(0), fx: voice::fx_name(self.voice_prefs.fx_type).into(), sound };
         let cd = ao_gui::client_dir().join("cd_image");
         let cands = voice::candidates(&own, &v);
         if !voice::installed(&cd, &cands) {
@@ -833,9 +859,9 @@ impl Chat {
             pet: ao_net::n3::textcmd::PetState {
                 pets: &pets,
                 target_name: zone.target.and_then(|t| zone.dynels.get(&t)).map(|d| d.name.clone()),
-                // `FUN_10044b6e`: stat `Features` (0xE0); only the own one is tracked, the target's stats are not kept
+                // `FUN_10044b6e`: Features of both participants gate following.
                 own_features: zone.stat(0xE0).unwrap_or(0) as u32,
-                target_features: 0,
+                target_features: zone.target.and_then(|id| zone.stat_of(id, 0xe0)).unwrap_or(0) as u32,
                 // `FUN_1003e1d0` ([`Zone::fight_level`]); [INFERENCE] both `FUN_1003e228` calls of the `/follow` gate take no explicit dynel in
                 // the decompile, so the target uses the same district level
                 own_fight_level: zone.fight_level.unwrap_or(super::fightmode::DEFAULT_LEVEL),
@@ -844,7 +870,7 @@ impl Chat {
                 can_move: true,
                 move_mode: 0,
             },
-            visual_flags: zone.stat(0x2a1).unwrap_or(0),
+            visual_flags: zone.skill_value(0x2a1).unwrap_or(0),
             reclaim_open: false,
         };
         let out = zonecmd::perform(a, &ctx);
@@ -873,6 +899,7 @@ impl Chat {
         }
         for l in out.local {
             match l {
+                ao_net::n3::textcmd::Local::BankClose => self.game.push(GameAction::BankClose),
                 // `OrganizationGUIModule_c::LeaveOrg` 0x10052568 / `OpenDisbandDialog` 0x100520dd
                 ao_net::n3::textcmd::Local::OrgLeaveDialog => {
                     let body = texts.by_key(10000, "ReallyLeaveOrg").unwrap_or_default();
@@ -974,7 +1001,7 @@ impl Chat {
             ChatAction::ShowUrl(u) => self.show_url(gui, zone, texts, &u),
             // FUN_100b6f0d: only from level 4 on (stat 0x36 > 3); `prev` steps back, anything else forward, never below 0
             ChatAction::TipOfTheDay { prev } => {
-                if zone.stat(0x36).unwrap_or(0) > 3 {
+                if zone.skill_value(0x36).unwrap_or(0) > 3 {
                     self.tip = (self.tip + if prev { -1 } else { 1 }).max(0);
                     let u = self.info.tip_url(self.tip);
                     let outs = self.info.show_url(gui, self.screen, &u, true);
@@ -1044,7 +1071,7 @@ mod tests {
         super::super::prefs::set_test_dir(&dir);
         let mut gui = Gui::new(&client, None).unwrap();
         let mut c = Chat::new();
-        c.open(&mut gui, (1280, 800)).unwrap();
+        c.open(&mut gui, (1280, 800), None).unwrap();
         let (zone, texts) = (Zone::default(), TextDb::load(&client).unwrap());
         let press = |c: &mut Chat, gui: &mut Gui, key: Key, mods: Modifiers, f: &crate::play::options::keys::FixedKeys| {
             gui.clear_focus();

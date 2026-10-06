@@ -49,6 +49,8 @@ pub(super) struct PerkDef {
     pub flags: u32,
     /// Profession bit set: 0 general, one bit = profession perk, several = group perk (`IsProfessionPerk` / `IsGroupPerk` / `IsGeneralPerk`).
     pub mask: u32,
+    /// RDB word 4 / runtime +0x14: granted Action_e, not an item template (`GC 10052aca`).
+    pub action: u32,
 }
 
 #[derive(Default)]
@@ -71,7 +73,7 @@ impl PerkDb {
             .filter_map(|id| {
                 let r = store.get(PERK_LIST, id).ok().flatten()?;
                 let w = |i: usize| r.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-                Some(PerkDef { id, item: w(0)?, precursor: w(1)?, flags: w(2)?, mask: w(3)? })
+                Some(PerkDef { id, item: w(0)?, precursor: w(1)?, flags: w(2)?, mask: w(3)?, action: w(4)? })
             })
             .collect();
         Self::from_defs(defs)
@@ -136,6 +138,12 @@ impl PerkDb {
 pub(super) struct Known(pub BTreeMap<i32, i32>);
 
 impl Known {
+    /// `GC 10052aca`: learned catalogue entries grant their nonzero Action_e.
+    #[cfg(test)]
+    pub(super) fn actions<'a>(&'a self, db: &'a PerkDb) -> impl Iterator<Item = u32> + 'a {
+        self.0.keys().filter_map(|&id| db.get(id as u32)).map(|d| d.action).filter(|&a| a != 0)
+    }
+
     /// `FUN_10052bc9` / `FUN_10052c6d`: the perks of `alien` (flag bit 1) or normal kind that count as used (`flags & 0xc2 == 0`, resp. bit 1).
     pub(super) fn used(&self, db: &PerkDb, alien: bool) -> i32 {
         self.0.keys().filter_map(|&id| db.get(id as u32)).filter(|d| if alien { d.flags & flag::ALIEN != 0 } else { d.flags & (flag::SKIPPED | flag::ALIEN) == 0 }).count() as i32
@@ -306,7 +314,7 @@ impl HudPerks {
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone) {
         let Some(mut w) = self.win.take() else { return };
         let points = self.points(zone);
-        let expansion = zone.stat(EXPANSION).unwrap_or(0);
+        let expansion = zone.skill_value(EXPANSION).unwrap_or(0);
         let alien = expansion & 8 != 0 && zone.stat(ALIEN_LEVEL).unwrap_or(0) >= 1;
         let sig = (self.tab, self.known.clone(), points, alien);
         if w.drawn.as_ref() != Some(&sig) {
@@ -343,7 +351,7 @@ impl HudPerks {
             let src = format!("<root><TextView value=\"{}{}\" color=\"0xCCFFFF\"/></root>", self.text(k), v);
             let _ = gui.add_view_xml(w.window, "points", "PerkPoints", &src);
         }
-        let lines = self.db.lines(zone.stat(EXPANSION).unwrap_or(0), zone.stat(BREED).unwrap_or(0), zone.stat(PROFESSION).unwrap_or(0));
+        let lines = self.db.lines(zone.skill_value(EXPANSION).unwrap_or(0), zone.stat(BREED).unwrap_or(0), zone.stat(PROFESSION).unwrap_or(0));
         gui.remove_children(w.window, "lines");
         for (k, line) in lines[self.tab.min(2)].clone().iter().enumerate() {
             let mut src = format!("<root><View view_layout=\"horizontal\" name=\"line{k}\" layout_borders=\"Rect(3,2,3,2)\">");
@@ -438,7 +446,17 @@ mod tests {
     use super::*;
 
     fn def(id: u32, precursor: u32, flags: u32, mask: u32) -> PerkDef {
-        PerkDef { id, item: 0, precursor, flags, mask }
+        PerkDef { id, item: 0, precursor, flags, mask, action: 0 }
+    }
+
+    #[test]
+    fn learned_actions_are_catalogue_action_ids_not_perk_items() {
+        let mut a = def(111, 110, 0, 32852);
+        a.item = 211656;
+        a.action = 10111;
+        let db = PerkDb::from_defs(vec![a, def(100, 0, 0, 128)]);
+        let known = Known(BTreeMap::from([(111, 0), (100, 0), (999, 0)]));
+        assert_eq!(known.actions(&db).collect::<Vec<_>>(), [10111]);
     }
 
     /// The perk lines stack below each other (they were all drawn at the top: a `ScrollViewChild` needs its one layout view inside) and start at the left.

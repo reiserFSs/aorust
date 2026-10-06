@@ -30,14 +30,22 @@ pub struct Worker {
 
 impl Worker {
     /// Starts building the preview of `(breed, sex)`; dropping the worker stops the thread.
-    pub fn start(dir: PathBuf, breed: i32, sex: i32, char_id: i32) -> Worker {
+    pub fn start(dir: PathBuf, breed: i32, sex: i32, char_id: i32, head: i32) -> Worker {
         let (req, req_rx) = channel::<Option<usize>>();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            if let Err(e) = run(&dir, breed, sex, char_id, &req_rx, &tx) {
+            if let Err(e) = run(&dir, breed, sex, char_id, head, &req_rx, &tx) {
                 let _ = tx.send(Out::Failed(format!("{e:#}")));
             }
         });
+        Worker { req, rx }
+    }
+
+    #[cfg(test)]
+    pub(super) fn queued_first(scene: Scene) -> Worker {
+        let (req, _) = channel();
+        let (tx, rx) = channel();
+        tx.send(Out::First(Box::new(scene))).unwrap();
         Worker { req, rx }
     }
 
@@ -54,6 +62,35 @@ fn cached(client: &std::path::Path, char_id: i32) -> Option<character::CachedCha
     let mut dirs = vec![super::prefs::dir()?];
     dirs.push(client.join("prefs"));
     dirs.iter().find_map(|d| character::ViewerCache::load(d).0.remove(&char_id))
+}
+
+/// The creation reply supplies the identity, not the appearance. Keep the submitted mesh ids in the existing viewer cache.
+pub(super) fn remember_created(client: &std::path::Path, id: i32, req: &ao_net::msg::CreateCharacterRequest) -> anyhow::Result<()> {
+    let dir = super::prefs::dir().ok_or_else(|| anyhow::anyhow!("preferences directory unavailable"))?;
+    let store = RecordStore::open(client)?;
+    let (breed, gender) = screens::wire_breed_sex(req.breed, req.gender)?;
+    let mesh = character::player_model_build(&store, breed, gender, req.width.clamp(0, 2) as u8)?;
+    remember_created_in(&dir, id, req, mesh as i32)
+}
+
+fn remember_created_in(dir: &std::path::Path, id: i32, req: &ao_net::msg::CreateCharacterRequest, mesh_id: i32) -> anyhow::Result<()> {
+    let mut cache = character::ViewerCache::load(dir);
+    cache.update(character::CachedCharacter {
+        id,
+        time: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().min(i32::MAX as u64) as i32,
+        mesh_id,
+        head_id: req.head,
+        breed: req.breed,
+        sex: req.gender,
+        fatness: req.width,
+        ..Default::default()
+    });
+    cache.save(dir)?;
+    Ok(())
+}
+
+fn listed_appearance(id: i32, breed: i32, sex: i32, mesh_id: i32, head: i32) -> Option<character::CachedCharacter> {
+    (head > 0).then_some(character::CachedCharacter { id, mesh_id, head_id: head, breed, sex, fatness: 1, ..Default::default() })
 }
 
 fn scene(store: &RecordStore, look: &CharSelectLook, cache: Option<&character::CachedCharacter>, pose: (Role, f32)) -> anyhow::Result<Scene> {
@@ -79,10 +116,10 @@ fn frames(store: &RecordStore, look: &CharSelectLook, cache: Option<&character::
         .collect()
 }
 
-fn run(dir: &std::path::Path, breed: i32, sex: i32, char_id: i32, req: &Receiver<Option<usize>>, tx: &Sender<Out>) -> anyhow::Result<()> {
+fn run(dir: &std::path::Path, breed: i32, sex: i32, char_id: i32, head: i32, req: &Receiver<Option<usize>>, tx: &Sender<Out>) -> anyhow::Result<()> {
     let store = RecordStore::open(dir)?;
     let look = screens::char_select_look(&store, breed, sex)?;
-    let cache = cached(dir, char_id);
+    let cache = cached(dir, char_id).or_else(|| listed_appearance(char_id, breed, sex, look.model as i32, head));
     if tx.send(Out::First(Box::new(scene(&store, &look, cache.as_ref(), (Role::Idle, 0.0))?))).is_err() {
         return Ok(());
     }
@@ -112,5 +149,35 @@ fn run(dir: &std::path::Path, breed: i32, sex: i32, char_id: i32, req: &Receiver
         if tx.send(Out::Clip(clip, f)).is_err() {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn created_head_survives_reload_under_acknowledged_identity() {
+        let dir = std::env::temp_dir().join(format!("aomac-created-preview-{}", std::process::id()));
+        let req = ao_net::msg::CreateCharacterRequest { breed: 4, gender: 2, head: 40682, width: 2, ..Default::default() };
+        remember_created_in(&dir, 33512, &req, 5907).unwrap();
+        let req2 = ao_net::msg::CreateCharacterRequest { head: 40683, ..req.clone() };
+        remember_created_in(&dir, 33513, &req2, 5908).unwrap();
+        let cache = character::ViewerCache::load(&dir);
+        assert_eq!(cache.0[&33512].head_mesh(), 40682);
+        assert_eq!(cache.0[&33513].head_mesh(), 40683);
+        assert_eq!((cache.0[&33512].mesh_id, cache.0[&33512].fatness), (5907, 2));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod listed_tests {
+    #[test]
+    fn supplied_list_head_is_used_and_missing_legacy_head_falls_back() {
+        let c = super::listed_appearance(9, 4, 2, 5907, 40683).unwrap();
+        assert_eq!((c.id, c.head_mesh()), (9, 40683));
+        assert!(super::listed_appearance(9, 4, 2, 5907, 0).is_none());
+        assert!(super::listed_appearance(9, 4, 2, 5907, -1).is_none());
     }
 }

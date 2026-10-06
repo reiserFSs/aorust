@@ -20,7 +20,7 @@ pub const MODEL_KEY: u64 = 0x4156_0000_0000_0001;
 #[derive(Clone, Debug, PartialEq)]
 pub struct AvatarPose {
     pub role: Role,
-    /// Current ground speed in m/s (`Vehicle_t+0x3c`); 0 for non-moving roles.
+    /// Maximum speed of the current movement mode in m/s (`Vehicle_t+0x3c`); 0 for non-moving roles.
     pub speed: f32,
     /// Reference speed of the movement mode (`Vehicle_t+0x170`, [`ref_speed`]); the clip plays at `speed / ref_speed` times
     /// its calibrated rate ([`anim_rate`]).
@@ -111,8 +111,9 @@ impl AvatarLook {
     /// `skin_of_head` gives the skin race of a head mesh (creation head table), as the select-screen preview does.
     pub fn from_update(u: &SimpleCharFullUpdate, skin_of_head: impl FnOnce(u32) -> Skin) -> Result<Self> {
         let (breed, gender) = wire_breed_sex(u.breed as i32, u.sex as i32)?;
-        // The head is delivered as stat HeadMesh and as attractor (place 0); the attractor wins like `CachedCharacter::head_mesh`.
-        let head = u.attractors.iter().find(|a| a.place == 0).map(|a| a.mesh).or(u.head_mesh).filter(|&h| h > 0).map(|h| h as u32);
+        // Fullupdate's base ClearAttractors only clears bookkeeping (DS 0x10071dd0), not the HeadMesh child.
+        let skip_attractors = u.flags & ao_net::n3::dynel::flag::SET_DYNEL_800 != 0;
+        let head = (!skip_attractors).then(|| u.attractors.iter().find(|a| a.place == 0).map(|a| a.mesh)).flatten().or(u.head_mesh).filter(|&h| h > 0).map(|h| h as u32);
         // Worn cloth: page 0 only (`cloth[page * 5 + part]`, docs/zone/dynel.md §1.3); which page the renderer shows is not traced.
         let cloth = CachedCharacter {
             cloth: u.cloth.iter().filter(|c| c.page == 0).map(|c| ClothEntry { body_part: c.part(), texture: c.texture, ..Default::default() }).collect(),
@@ -128,7 +129,7 @@ impl AvatarLook {
                 head,
                 equipment: cloth.equipment(),
             },
-            attachments: u.attractors.iter().filter(|a| a.place != 0 && a.mesh > 0).map(|a| (a.place, a.mesh as u32)).collect(),
+            attachments: u.attractors.iter().filter(|a| !skip_attractors && a.place != 0 && a.mesh > 0).map(|a| (a.place, a.mesh as u32)).collect(),
             scale: if u.monster_scale > 0 { u.monster_scale as f32 / 100.0 } else { 1.0 },
         })
     }
@@ -278,7 +279,7 @@ impl Fader {
 pub struct Avatar {
     id: u32,
     rig: ActorRig,
-    /// What `rig` was built from (the look of the `SimpleCharFullUpdate`, later changed by [`Avatar::set_attractors`]).
+    /// What `rig` was built from (full update plus [`Avatar::set_appearance`] deltas).
     look: PlayerLook,
     attachments: Vec<(u8, u32)>,
     assets: ActorAssets,
@@ -325,19 +326,24 @@ impl Avatar {
         self.rig.model()
     }
 
-    /// `AppearanceUpdateIIR_c::Activate` [GC 0x10071679]: `ClearAttractors` + `AddAttractors(list)` (`(AttractorPlace_e, rdb 1010001 mesh)`, place 0 =
-    /// the head, [`attractor_list`](ao_formats::character::actor::attractor_list)). The rig is rebuilt only when the head or a hand / shoulder mesh changed;
-    /// true = a new model that the caller has to upload again (key [`MODEL_KEY`]). The current clip keeps playing (same body model).
-    pub fn set_attractors(&mut self, store: &RecordStore, list: &[(u8, u32)]) -> Result<bool> {
-        let head = list.iter().find(|a| a.0 == 0).map(|a| a.1);
-        let mut attachments: Vec<(u8, u32)> = list.iter().filter(|a| a.0 != 0).copied().collect();
+    /// Apply cloth deltas and replace attractors (`AppearanceUpdateIIR_c::Activate`, GC 0x10071679).
+    /// Returns whether the caller must upload the rebuilt model; keeps the current animation.
+    pub fn set_appearance(&mut self, store: &RecordStore, appearance: &ao_net::n3::world::AppearanceUpdate) -> Result<bool> {
+        let head = appearance.attractors.iter().find(|a| a.a == 0 && a.b > 0).map(|a| a.b as u32);
+        let mut attachments: Vec<(u8, u32)> = appearance.attractors.iter().filter(|a| a.a != 0 && a.b > 0).map(|a| (a.a, a.b as u32)).collect();
         attachments.sort_unstable();
         let mut old = self.attachments.clone();
         old.sort_unstable();
-        if head == self.look.head && attachments == old {
+        let mut equipment = self.look.equipment;
+        for c in appearance.cloth.iter().filter(|c| c.c == 0) {
+            if let Some(slot) = usize::try_from(c.id).ok().and_then(|i| equipment.0.get_mut(i)) {
+                *slot = (c.b > 0).then_some(c.b as u32);
+            }
+        }
+        if head == self.look.head && attachments == old && equipment.0 == self.look.equipment.0 {
             return Ok(false);
         }
-        let look = PlayerLook { head, ..self.look.clone() };
+        let look = PlayerLook { head, equipment, ..self.look.clone() };
         self.rig = ActorRig::player(store, &self.assets, &look, &attachments)?;
         self.look = look;
         self.attachments = attachments;
@@ -498,6 +504,60 @@ mod tests {
             .expect("own update in the capture")
     }
 
+
+    #[test]
+    fn fullupdate_keeps_head_mesh_and_honors_attractor_skip() {
+        let mut u = own_update();
+        let head = u.head_mesh.filter(|&h| h > 0).unwrap() as u32;
+        u.attractors.clear();
+        assert_eq!(AvatarLook::from_update(&u, |_| Skin::Caucasian).unwrap().look.head, Some(head));
+        u.attractors.push(ao_net::n3::dynel::AttractorMesh { place: 0, mesh: 7, field: 0, byte: 4 });
+        u.attractors.push(ao_net::n3::dynel::AttractorMesh { place: 1, mesh: 7796, field: 0, byte: 2 });
+        assert_eq!(AvatarLook::from_update(&u, |_| Skin::Caucasian).unwrap().look.head, Some(7));
+        u.flags |= ao_net::n3::dynel::flag::SET_DYNEL_800;
+        let look = AvatarLook::from_update(&u, |_| Skin::Caucasian).unwrap();
+        assert_eq!(look.look.head, Some(head));
+        assert!(look.attachments.is_empty());
+    }
+    #[test]
+    fn captured_appearance_cloth_reaches_live_avatar_and_rebuild_snapshot() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut u = own_update();
+        u.cloth.push(ao_net::n3::dynel::ClothData { raw: 1, texture: 154207, page: 0, extra: None });
+        u.flags |= ao_net::n3::dynel::flag::SET_DYNEL_800;
+        let mut avatar = Avatar::new(&store, &dir, 7, &u).unwrap();
+        let mut zone = super::super::zone::Zone::new(0x82e8);
+        zone.own_update = Some(Box::new(u));
+        let rec = include_str!("../../../../docs/captures/zone_wear_rifle_borealis.rec");
+        let frame = rec.lines().filter_map(|l| {
+            let mut p = l.split(' ');
+            let (_, direction, hex) = (p.next()?, p.next()?, p.next()?);
+            if direction != "<" { return None; }
+            let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            Frame::decode_with(&bytes, false).ok().flatten().map(|(f, _)| f)
+        }).find(|f| matches!(n3::decode(f).map(|m| m.body), Ok(N3::World(n3::world::World::Appearance(_))))).unwrap();
+        zone.on_frame(&frame);
+        let appearance = zone.own_events.iter().find_map(|e| match e {
+            super::super::zone::OwnEvent::Appearance(a) => Some(a),
+            _ => None,
+        }).unwrap();
+        assert!(appearance.cloth.iter().any(|c| c.id == 1 && c.c == 0 && c.b == 0), "capture clears body cloth");
+        let clip = (avatar.clip_id, avatar.ms);
+        assert!(avatar.set_appearance(&store, appearance).unwrap());
+        assert_eq!(avatar.look.equipment.0[1], None);
+        assert_eq!((avatar.clip_id, avatar.ms), clip);
+        assert!(!avatar.set_appearance(&store, appearance).unwrap());
+        let rebuilt = AvatarLook::from_update(zone.own_update.as_ref().unwrap(), |_| Skin::Caucasian).unwrap();
+        assert_eq!(rebuilt.look.equipment.0, avatar.look.equipment.0);
+        let mut delta = appearance.clone();
+        delta.cloth = vec![n3::world::ClothData { id: 1, packed: 1, b: 154207, c: 0, ..Default::default() }];
+        assert!(avatar.set_appearance(&store, &delta).unwrap());
+        assert_eq!(avatar.look.equipment.0[1], Some(154207));
+        delta.cloth.clear();
+        assert!(!avatar.set_appearance(&store, &delta).unwrap(), "unnamed cloth remains equipped");
+    }
+
     #[test]
     fn look_of_the_captured_character() {
         let u = own_update();
@@ -554,7 +614,7 @@ mod tests {
 
     #[test]
     fn loop_markers_and_one_shots() {
-        let a = CatAnim { root: String::new(), events: vec![(200, "loopstart".into())], version: 0, duration: 1000.0, signature: 0, param: 0.0, tracks: vec![] };
+        let a = CatAnim { source_id: 0, root: String::new(), events: vec![(200, "loopstart".into())], version: 0, duration: 1000.0, signature: 0, param: 0.0, tracks: vec![] };
         assert_eq!(clip_time(&a, 500.0, false), 500.0);
         assert_eq!(clip_time(&a, 1100.0, false), 300.0, "wraps to loopstart, not 0");
         let c = CatAnim { events: vec![(200, "loopstart".into()), (600, "loopend".into())], ..a.clone() };
@@ -606,6 +666,27 @@ mod tests {
         p.set_float("FadeCharacterEndDist", 2.0, Kind::Char);
         p.set_float("FadeCharacterEndAlpha", 0.5, Kind::Char);
         assert_eq!(Fade::from_prefs(&p), Fade { on: false, start: 4.0, end: 2.0, end_alpha: 0.5 });
+    }
+
+    #[test]
+    fn retail_authored_gait_durations_use_milliseconds_and_calibration() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let calibration = Calibration::load(&dir);
+        for (id, duration, start, end, speed, reference, factor) in [
+            (10191, 2433.0, 733.0, 1733.0, 1.5, 1.5, 0.90),
+            (10194, 4000.0, 1166.0, 1933.0, 5.0, 5.0, 1.15),
+        ] {
+            let clip = assets.anim(&store, id).unwrap();
+            assert_eq!(clip.duration, duration);
+            assert_eq!(loop_span(&clip), Some((start, end)));
+            assert_eq!(calibration.get(5907, id), factor);
+            let rate = anim_rate(factor, 100.0, speed, reference, false);
+            let seconds_per_cycle = (end - start) / (1000.0 * rate);
+            assert!((clip_time(&clip, start + seconds_per_cycle * 1000.0 * rate, false) - start).abs() < 0.001);
+            eprintln!("CAT {id}: authored {duration}ms, loop {start}..{end}, rate {rate}, cycle {seconds_per_cycle:.6}s, stride {:.6}m", speed * seconds_per_cycle);
+        }
     }
 
     /// The head attractor world position is the feet + head height straight up (idle), in the actor's frame.
@@ -730,11 +811,12 @@ mod tests {
         let store = RecordStore::open(&dir).unwrap();
         let mut a = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
         let head = a.look.head.unwrap();
+        let appearance = |list: &[(u8, u32)]| ao_net::n3::world::AppearanceUpdate { cloth: Vec::new(), attractors: list.iter().map(|&(a, b)| ao_net::n3::world::Attractor { a, b: b as i32, c: 0, d: 0 }).collect(), visual_flags: 31, extra: 0 };
         let plain = (a.model().meshes.len(), a.frame().parts.len());
-        assert!(!a.set_attractors(&store, &[(0, head)]).unwrap(), "the login list is unchanged");
-        assert!(a.set_attractors(&store, &[(1, 0x3ddf), (0, head)]).unwrap());
+        assert!(!a.set_appearance(&store, &appearance(&[(0, head)])).unwrap(), "the login list is unchanged");
+        assert!(a.set_appearance(&store, &appearance(&[(1, 0x3ddf), (0, head)])).unwrap());
         assert_eq!((a.model().meshes.len(), a.frame().parts.len()), (plain.0 + 1, plain.1 + 1), "the rifle is one more mounted mesh");
-        assert!(!a.set_attractors(&store, &[(0, head), (1, 0x3ddf)]).unwrap(), "same set, other order");
+        assert!(!a.set_appearance(&store, &appearance(&[(0, head), (1, 0x3ddf)])).unwrap(), "same set, other order");
         let idle = a.clip_id;
         a.set_stance(Some(3));
         a.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
@@ -762,10 +844,10 @@ mod tests {
         a.set_stance(None);
         a.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
         assert_eq!(a.clip_id, idle);
-        assert!(a.set_attractors(&store, &[(0, head)]).unwrap());
+        assert!(a.set_appearance(&store, &appearance(&[(0, head)])).unwrap());
         assert_eq!((a.model().meshes.len(), a.frame().parts.len()), plain);
         if let Some(png) = std::env::var_os("AVATAR_SHOT_RIFLE") {
-            a.set_attractors(&store, &[(1, 0x3ddf), (0, head)]).unwrap();
+            a.set_appearance(&store, &appearance(&[(1, 0x3ddf), (0, head)])).unwrap();
             a.set_stance(Some(3));
             a.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
             a.update(0.3);

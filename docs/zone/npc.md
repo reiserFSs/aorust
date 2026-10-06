@@ -128,6 +128,7 @@ if tex2 != 0: SetCATTexture(name, material=-1, tex2, layer 3,                   
   Layer 0 = skin base, 1 = diffuse, 3 = environment [CODE: constants 0/1/3 in the three call sites].
 * `ao_formats::character::texture_overrides(&CatMesh, &[TextureOverride])` returns `(part index, TextureOverride)`; a texture of 0 keeps the part's own.
   (The `[0x10150828]` compare in `FUN_10070247` — substitute id 0x440aa/alpha 5 when `tex` equals a global — is a zero in the static image; treated as never true.)
+* **Humanoid green-hand fix**: `npc_part_textures(store, names, cat, skin_head, textures, cloth)` now selects layer 0 from the record's `HeadMesh` (including named humanoid heads), then composites layer 2 if worn, otherwise the wire replacement/model-default layer 1. Previously it omitted layer 0 and drew solid-green default hands directly; cloth also keyed against the default rather than skin. The key remains only source overlay `RGB565 0x07e0` (`FUN_10074393`); creature materials and mounted head/hair textures are unchanged. Regression `icc_guard_hands_show_record_head_skin` uses record 254118, model 5907 and head 40627 (skin follows the head, not the body's breed/sex); the cross-breed offline survey is in `player.rs`. CharVisuals integrated verification: 35/35 character tests passed, including these regressions and the humanoid NPC-record survey. CharVisuals inspected the live ICC offscreen approach to Brandon Thorn: both hands skin-coloured in the teal suit, unlike the user's prior pure-green-hand screenshot. Legitimate green player hair was not changed.
 
 **AlphaMode** (resolved, randy31 + DisplaySystem). `FUN_10070247` calls `FUN_100700e9(name, -1, tex, layer, alpha, flag)`; the node (`FUN_1006fc70`: name, material, RTexture, tex id, layer, alpha) is applied by
 `FUN_1006fdae` as `FUN_10073e4f(material, tex, layer)` (**layer 3 → `RMaterial_t::SetEnvTexture`** @0x10040e5f on the mesh's substitute material, `RCATMesh::CreateSubstMaterial`; layers 0/1/2 → texture slots
@@ -167,10 +168,14 @@ of the same triangles in the submesh's own phase, depth `LESS_EQUAL`). The CAT r
 * **Attractors**: `FUN_10077e13`, only when message flag bit 2 (`SET_DYNEL_800`) is clear: `CharacterMesh::AddAttractorMesh(cm, place 0, headMesh(+0xac), 4, 0)`, then
   `CharacterMesh::ClearAttractors` [DS 0x10071dd0], then `AddAttractors(cm, vector<AttractorMeshData_t>)`; an attractor = (place, rdb 1010001 mesh, int, byte) mounted on the model's `AttractorNN_*` point
   (lizard mesh: `Attractor01_head`, `Attractor06_back`; 5907: head, left/right hand, shoulders, back). Same code for players and NPCs [CODE].
-  **`CharacterMesh::ClearAttractors` walks the attractor list (`this+4`, the list `AddAttractorMesh` [DS 0x10071cce] inserts into, ordered by place, new node before the first node with place >= its own) and deletes
-  every node: the head added one call earlier is gone.** The mounted set is therefore exactly the wire list; the head is its place-0 entry (`HeadMesh` and the place-0 entry are equal in every capture), a list without place 0 shows no head,
-  and the `HeadMesh` stat of the NPC *record* only feeds `SetSkinData` (`FUN_10058078`). (`VisualCATMesh_t::ClearAttractors` [DS 0x10073d8a], called by the appearance update `FUN_10071679` before `AddAttractors`, is a separate method that also unmounts from the render mesh and sets `+0x78`.)
-  The runtime head change `FUN_10059376` = `RemoveAttractorMesh(0, old)` + `AddAttractorMesh(0, new, 4, ...)`. Implemented as `actor::attractor_list` (test `clear_attractors_drops_the_head_mesh`), used by `dynels::build_char`.
+  `CharacterMesh::ClearAttractors` deletes bookkeeping nodes but does not remove render children.
+  Unlike that base method, `VisualCATMesh_t::ClearAttractors` [DS 0x10073d8a] calls `FUN_10072873` →
+  `RCATMesh_t::RemoveAttractorChild` for mounted entries and sets `+0x78`. Thus a full update retains
+  its separately mounted `HeadMesh` when place 0 is absent (captured Xantarr, head 223820, empty list;
+  dynel.md §1.3); an appearance update replaces the rendered set and can clear the head.
+  The NPC record's `HeadMesh` only feeds `SetSkinData` (`FUN_10058078`).
+  The runtime head change `FUN_10059376` removes/adds place 0. `CharLook::from_update` retains the
+  full-update head before `actor::attractor_list` orders the wire bookkeeping list.
 * **MonsterScale** (stat 0x168 = 360; wire percent): `FUN_1005bea6` ends with `n3VisualDynel_t::SetBodyScale(stat(0x168, kind 3) / 100.0)` (`_DAT_10158670` = 100.0);
   the stat setter clamps to **≥ 20** (`FUN_10059e6a`: `0x168` → 0x14) and `CharRadius` (0x1a5) = `MonsterScale × value / 100` (same function). Uniform scale of the whole model.
 * **Visibility**: `DisableVisibility` = `n3VisualDynel+0xc9 = 0` (N3 @0x1001954a; Enable sets 1; the VisualCATMesh has its own `+0x70`). `FUN_10077e13` calls it for

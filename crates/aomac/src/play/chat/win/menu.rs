@@ -50,13 +50,10 @@ impl ChatWindows {
     }
 
     /// The window menu of one window (`FUN_100998bc` + `FUN_10096f9f`).
-    fn window_menu(&self, d: usize, tabs: usize) -> Vec<MenuItem> {
+    fn window_menu(&self, d: usize) -> Vec<MenuItem> {
         let c = &self.wins[d].cfg;
         let mut mode = vec![MenuItem::check(id(OP_MODE, 0), &self.label("ChatWindowMenu_Style_Mode_Normal"), c.visual_mode == 0)];
-        // **GUESS**: a window with several tabs cannot become borderless (the borderless style has no tab strip)
-        let mut border = MenuItem::check(id(OP_MODE, 2), &self.label("ChatWindowMenu_Style_Mode_Borderless"), c.visual_mode == 2);
-        border.enabled = tabs < 2;
-        mode.push(border);
+        mode.push(MenuItem::check(id(OP_MODE, 2), &self.label("ChatWindowMenu_Style_Mode_Borderless"), c.visual_mode == 2));
         let mut m = vec![MenuItem::submenu(&self.label("ChatWindowMenu_Style_Mode"), mode)];
         if c.visual_mode != 0 {
             // two `PopupMenuSliderItem_c` (0..1): inactive first (`FUN_10099801`), then active (`FUN_100997be`)
@@ -95,7 +92,7 @@ impl ChatWindows {
             let subscribe: Vec<MenuItem> = groups.iter().enumerate().map(|(i, g)| MenuItem::check(id(OP_SUBSCRIBE, i as u32), &self.group_name(*g), c.shows(*g))).collect();
             // order: window submenu (`FUN_10097289` inserts it first), separator, then `FUN_100ab4dc`'s entries (**GUESS**: the relative order of the two inserters)
             vec![
-                MenuItem::submenu(&self.label("ChatWindowMenu_Visual"), self.window_menu(d, self.frames[fi].docs.len())),
+                MenuItem::submenu(&self.label("ChatWindowMenu_Visual"), self.window_menu(d)),
                 MenuItem::separator(),
                 MenuItem::submenu(&self.label("ChatWindowMenu_TalkToChannel"), talk),
                 MenuItem::submenu(&self.label("ChatWindowMenu_ChannelSubscribeMenu"), subscribe),
@@ -125,7 +122,12 @@ impl ChatWindows {
         match op {
             OP_MODE => {
                 let mode = arg as i32;
-                if self.wins[d].cfg.visual_mode != mode && (mode == 0 || self.frames[fi].docs.len() < 2) {
+                if self.wins[d].cfg.visual_mode != mode {
+                    // A borderless document cannot share a tab strip; reuse the existing tear-out path before changing its style.
+                    if mode != 0 && self.frames[fi].docs.len() > 1 {
+                        self.tab_dropped(gui, self.frames[fi].id, self.frames[fi].sel, None);
+                    }
+                    let fi = self.wins[d].frame;
                     self.wins[d].cfg.visual_mode = mode;
                     // `FUN_10096ec5` -> `Window::SetStyle`: the frame keeps its outer rectangle, the client shrinks / grows by the border
                     self.rebuild_frame(gui, fi);

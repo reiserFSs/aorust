@@ -120,6 +120,7 @@ impl Player {
                     movement.teleport([u.pos[0], g + FOOT_CLEARANCE, u.pos[2]], u.yaw().unwrap_or(0.0));
                 }
             }
+            movement.restore_blob(&u.blob);
             let prefs_xml = std::fs::read_to_string(dir.join("cd_image/gui/Default/CharPrefs.xml")).unwrap_or_default();
             let prefs = ControlPrefs::from_xml(&prefs_xml);
             let mut camera = Camera3p::new(&prefs, avatar.head_height().unwrap_or(camera::MIN_PIVOT_HEIGHT));
@@ -171,6 +172,14 @@ impl Player {
     pub fn set_control_prefs(&mut self, p: &ControlPrefs) {
         self.controls.set_prefs(p.clone());
         self.camera.set_prefs(p);
+    }
+
+    pub fn select_camera_mode(&mut self, mode: u8) {
+        self.camera.select_mode(mode);
+    }
+
+    pub fn camera_mode(&self) -> u8 {
+        self.camera.selected_mode()
     }
 
     /// The shared key binding table (`options/keys.rs`) changed: movement, camera, combat and pick-up keys follow at once.
@@ -545,9 +554,9 @@ impl Player {
                         f.update(&u);
                     }
                 }
-                OwnEvent::Attractors(list) => match self.avatar.set_attractors(&self.store, &list) {
+                OwnEvent::Appearance(appearance) => match self.avatar.set_appearance(&self.store, &appearance) {
                     Ok(changed) => self.model_sent &= !changed, // the next frame uploads the rebuilt model again
-                    Err(e) => eprintln!("avatar attractors: {e:#}"),
+                    Err(e) => eprintln!("avatar appearance: {e:#}"),
                 },
             }
         }

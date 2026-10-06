@@ -9,12 +9,46 @@ pub(super) const MIN_CLIENT: (u32, u32) = (50, 60);
 /// readable in the decompile): **GUESS** 20 px down-right.
 const TEAR_OFFSET: f32 = 20.0;
 
+/// Move only the legacy window documents; logs and unrelated preferences are untouched.
+pub(super) fn migrate_windows(root: &Path, character: &Path) -> Result<()> {
+    let old = root.join("Chat/Windows");
+    let new = character.join("Chat/Windows");
+    if old.is_dir() && !new.exists() && root != character {
+        std::fs::create_dir_all(character.join("Chat"))?;
+        std::fs::rename(old, new)?;
+    }
+    Ok(())
+}
+
+/// User-selected port default: the retail framed/tabbed look, rather than the shipped mode-2 NewChar layout.
+/// Saved documents are never changed. See docs/chat/gui.md §15.
+pub(super) fn fresh_layout(cfgs: &mut [Cfg]) {
+    let frame = cfgs.first().and_then(|c| c.frame);
+    for (index, cfg) in cfgs.iter_mut().enumerate() {
+        cfg.visual_mode = 0;
+        cfg.frame = frame;
+        cfg.tab_index = index as i32;
+    }
+}
+
 impl ChatWindows {
     /// Opens the windows from (first hit): `<prefs dir>/Chat/Windows/*/Config.xml`, the client's `prefs/NewChar/Chat/Windows/*`,
     /// else the code defaults of `FUN_10094c58`.
     pub fn new(gui: &mut Gui, screen: (u32, u32)) -> Result<Self> {
+        Self::new_with_prefs(gui, screen, super::super::super::prefs::dir())
+    }
+
+    /// Retail saves chat documents below the account's character directory, not the shared prefs root.
+    /// Adopt the port's old shared documents once, so existing custom modes/tabs are not discarded or inherited by every new character.
+    pub fn new_for_character(gui: &mut Gui, screen: (u32, u32), character: &Path) -> Result<Self> {
+        if let Some(root) = super::super::super::prefs::dir() {
+            migrate_windows(&root, character)?;
+        }
+        Self::new_with_prefs(gui, screen, Some(character.to_path_buf()))
+    }
+
+    fn new_with_prefs(gui: &mut Gui, screen: (u32, u32), prefs: Option<PathBuf>) -> Result<Self> {
         let client = ao_gui::client_dir();
-        let prefs = super::super::super::prefs::dir();
         let mut cfgs = prefs.as_deref().map(read_windows).unwrap_or_default();
         if cfgs.is_empty() {
             cfgs = read_windows(&client.join("prefs/NewChar"));
@@ -23,6 +57,9 @@ impl ChatWindows {
         if cfgs.is_empty() {
             cfgs = code_defaults();
             cfgs.iter_mut().for_each(|c| c.template = true);
+        }
+        if cfgs.iter().all(|c| c.template) {
+            fresh_layout(&mut cfgs);
         }
         let mut s = ChatWindows {
             wins: vec![],
@@ -39,7 +76,7 @@ impl ChatWindows {
             pw: WinPrefs::default(),
         };
         s.last_active = cfgs.iter().find(|c| c.startup).or(cfgs.first()).map(|c| c.window_name.clone()).unwrap_or_default();
-        for c in cfgs.into_iter().filter(|c| c.open) {
+        for c in cfgs {
             s.add_doc(c);
         }
         // Windows in the normal (tabbed) mode with the very same saved `WindowFrame` share one `ChatWindow`, ordered by `tab_index`
@@ -47,7 +84,7 @@ impl ChatWindows {
         let mut groups: Vec<Vec<usize>> = vec![];
         for d in 0..s.wins.len() {
             let c = &s.wins[d].cfg;
-            if c.visual_mode == 0 && c.frame.is_some() {
+            if c.visual_mode == 0 && (c.frame.is_some() || c.template) {
                 if let Some(g) = groups.iter_mut().find(|g| s.wins[g[0]].cfg.visual_mode == 0 && s.wins[g[0]].cfg.frame == c.frame) {
                     g.push(d);
                     continue;
@@ -185,6 +222,7 @@ impl ChatWindows {
         gui.set_window_alpha(id, a);
         // `is_backmost` / `is_frontmost` -> window flags 0x200 / 0x100 (`FUN_10097ae3`); default: normal stacking. **GUESS**: frontmost wins if both are set.
         gui.set_window_layer(id, if s.cfg.frontmost { 1 } else if s.cfg.backmost { -1 } else { 0 });
+        gui.set_window_visible(id, docs.iter().any(|&d| self.wins[d].cfg.open));
         Ok(id)
     }
 
@@ -331,6 +369,7 @@ impl ChatWindows {
             | Event::TabSelected { window, .. }
             | Event::TabDropped { window, .. }
             | Event::WindowFrame { window }
+            | Event::CloseRequested { window }
             | Event::ContextMenu { window, .. } => *window,
             Event::MenuPicked { .. } | Event::MenuSlider { .. } => return self.menu.is_some(),
             _ => return false,
@@ -344,6 +383,19 @@ impl ChatWindows {
 
     pub fn event(&mut self, gui: &mut Gui, ev: &Event) -> Vec<WinOut> {
         let mut out = vec![];
+        // Closing a frame hides all of its documents, retaining their channels/history for reopening.
+        if let Event::CloseRequested { window } = ev {
+            if let Some(fi) = self.frame_of(*window) {
+                self.sync_frame_cfg(fi);
+                for &d in &self.frames[fi].docs {
+                    self.wins[d].cfg.open = false;
+                }
+                gui.set_window_visible(*window, false);
+                gui.clear_focus();
+                self.dirty = true;
+            }
+            return out;
+        }
         match ev {
             Event::EnterPressed { view, .. } => {
                 if let Some(i) = self.index_of_input(view) {
@@ -439,7 +491,7 @@ impl ChatWindows {
 
     /// A tab was dropped (`FUN_10097881` accept on another `ChatWindow`'s `TabView`, `FUN_10097d0b` tear-out): reorder, dock into the target window, or
     /// (only with 2+ tabs) open a new window at the old frame + [`TEAR_OFFSET`].
-    fn tab_dropped(&mut self, gui: &mut Gui, window: WindowId, tab: usize, target: Option<(WindowId, usize)>) {
+    pub(super) fn tab_dropped(&mut self, gui: &mut Gui, window: WindowId, tab: usize, target: Option<(WindowId, usize)>) {
         let Some(src) = self.frame_of(window) else { return };
         let Some(&d) = self.frames[src].docs.get(tab) else { return };
         match target {
@@ -596,6 +648,11 @@ impl ChatWindows {
         let pick = self.wins.iter().position(|w| w.cfg.window_name == self.last_active && w.cfg.textinput).or_else(|| self.wins.iter().position(|w| w.cfg.textinput));
         if let Some(i) = pick {
             let fi = self.wins[i].frame;
+            for &d in &self.frames[fi].docs {
+                self.wins[d].cfg.open = true;
+            }
+            gui.set_window_visible(self.frames[fi].id, true);
+            self.dirty = true;
             if let Some(pos) = self.frames[fi].docs.iter().position(|&d| d == i) {
                 if self.frames[fi].sel != pos {
                     self.select_tab(gui, fi, pos);

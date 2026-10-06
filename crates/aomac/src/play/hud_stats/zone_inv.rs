@@ -26,6 +26,30 @@ impl Zone {
     /// * `InventoryUpdateIIR_t` of a chest / corpse stores its list in [`Zone::containers`] (`FUN_100a040e`); `InventoryUpdatedIIR_t` is the signal only (`FUN_10074e49`).
     pub fn apply_inventory(&mut self, msg: &InventoryMsg) {
         match msg {
+            InventoryMsg::Bank(entries) => {
+                self.containers.insert((0xdead, self.char_id as i32), (0, entries.clone()));
+            }
+            InventoryMsg::Reclaim { entries, instance } => {
+                self.containers.insert((0xdeae, *instance), (0, entries.clone()));
+            }
+            InventoryMsg::ContainerAdd { item, container, .. } if container.kind == 0xdead && container.instance == self.char_id as i32 => {
+                let Some((_, entries)) = self.containers.get_mut(&(0xdead, self.char_id as i32)) else { return };
+                let Some(slot) = (0..0x66).find(|s| !entries.iter().any(|e| e.slot == *s)) else { return };
+                if item.instance < 0 || inv::slot_kind(item.instance as u32) != item.kind { return; }
+                if let Some(mut e) = self.inventory.remove(&(item.instance as u32)) {
+                    e.slot = slot;
+                    entries.push(e);
+                    entries.sort_by_key(|e| e.slot);
+                }
+            }
+            InventoryMsg::ContainerAdd { item, container, .. } if item.kind == inv::KIND_BANK && *container == self.own_identity() => {
+                let Some(slot) = self.free_bag_slot() else { return };
+                let Some((_, entries)) = self.containers.get_mut(&(0xdead, self.char_id as i32)) else { return };
+                let Some(at) = entries.iter().position(|e| e.slot as i32 == item.instance) else { return };
+                let mut e = entries.remove(at);
+                e.slot = slot;
+                self.inventory.insert(slot, e);
+            }
             InventoryMsg::ContainerAdd { item, container, slot } if item.kind == inv::KIND_IN_CONTAINER => self.take_from_container(*item, *container, *slot),
             InventoryMsg::ContainerAdd { item, container, slot } => {
                 if *container != self.own_identity() || inv::slot_kind(item.instance.max(0) as u32) != item.kind || item.instance < 0 {
@@ -124,6 +148,19 @@ mod tests {
 
     fn add(from: u32, to: i32) -> InventoryMsg {
         InventoryMsg::ContainerAdd { item: inv::item_identity(from), container: Identity { kind: 0xC350, instance: 7 }, slot: to }
+    }
+
+    #[test]
+    fn bank_confirmation_moves_to_first_free_slots() {
+        let mut z = Zone::new(7);
+        put(&mut z, 0x40, 100);
+        z.apply_inventory(&InventoryMsg::Bank(vec![]));
+        z.apply_inventory(&InventoryMsg::ContainerAdd { item: inv::item_identity(0x40), container: Identity { kind: 0xdead, instance: 7 }, slot: 99 });
+        assert!(z.inventory.is_empty());
+        assert_eq!(z.containers[&(0xdead, 7)].1[0].slot, 0);
+        z.apply_inventory(&InventoryMsg::ContainerAdd { item: Identity { kind: inv::KIND_BANK, instance: 0 }, container: Identity { kind: 0xc350, instance: 7 }, slot: 99 });
+        assert_eq!(z.inventory[&0x40].item.low_id, 100);
+        assert!(z.containers[&(0xdead, 7)].1.is_empty());
     }
 
     #[test]

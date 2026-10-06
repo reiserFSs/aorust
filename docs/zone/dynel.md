@@ -90,7 +90,7 @@ Conditions use the first flags word `F` (`i32` after the version byte) and the s
 | 16 | `i16` | `monster_scale` | stat `MonsterScale` (0x168), percent (`SetBodyScale(stat / 100.0)`, constant [GC 0x10158670] = 100.0): players 100, NPCs 36-181. |
 | 17 | `i16` | `visual_flags` | stat `VisualFlags` (0x2A1): 31 (127 for one player). |
 | 18 | `u8` | `mode` | `SimpleChar_t+0x208` via `FUN_100572b9`; 0 (79×) / 1 (2×). **Unresolved.** |
-| 19 | `i32 len` + bytes | `blob` | raw copy (`FUN_1006761c`) handed to the object at `SimpleChar_t+0x50` (`vtable+0xac`). 42 bytes for players, 28 for NPCs. **Unresolved**, see §1.5. |
+| 19 | `i32 len` + bytes | `blob` | raw copy (`FUN_1006761c`) handed to the vehicle at `SimpleChar_t+0x50` (`vtable+0xac`). 42 bytes for players, 28 for NPCs: velocity, FSM axes/current mode, remembered walk/run mode; players also carry four movement inputs ([movement.md](movement.md), FullUpdate vehicle initialization). |
 | 20 | `i32` | `head_mesh` | iff `F & 0x80`: stat `HeadMesh` (0x40) = **rdb 1010001 mesh id of the head** (Testy 40629 = `head_solitusfemale00.abiff`). |
 | 21 | `i16` (`F & 0x2000`) / `u8` | `run_speed` | stat `RunSpeed` (0x9C) (`SetStat`, signed). Players 6, 34, 70; NPCs 6-144. |
 | 22 | `Identity` | `target` | iff `F & 0x400`: passed to `FUN_10069c68` (a `SimpleChar_t` combat routine). **[GUESS]** the character's current fight target: the guards that have it set point at the `Scout - Jaax'Sinuh` NPCs they fight, and they have lowered health. |
@@ -113,7 +113,7 @@ Anything after step 33 is returned in `rest` (empty in every capture).
 `0` NPC/monster layout (live set on all 78 NPCs, clear on the 3 players) · `1` stat `InPlay` (0xC2) · `2` apply sets dynel flag `0x800`
 (`FUN_10044cb5`) and **skips** the attractor block (clear: `AddAttractorMesh(0, HeadMesh, 4, 0)`, `ClearAttractors`, `AddAttractors(list)`, [GC 0x100780c0]) · `3` stat `CanChangeClothes` (0xDF) · `4` textures ·
 `5` parent · `6` playfield · `7` head mesh · `8` list_190 · `9` rotation · `10` target · `11` health width · `12` level width · `13` run speed width ·
-`14` health delta · `16` path · `17/19/25` NPC field widths · `18` dynel flag `0x800000` (`FUN_10044cb5`) · `21`/`22` call `vtable+0x18` of the stat object (`dynel+0xe8`) with `0x800` / `0x400` [GC 0x1007846e] · `23/24` bytes · `26` PC extra · `27` own dynel only: stat `0x300` = 1 (else 0) [GC 0x10078520] · `28` stat `HasAlwaysLootable` (0x159) = 1 · `29` shadow breed · `30` identity list. Live values:
+`14` health delta · `16` path · `17/19/25` NPC field widths · `18` dynel flag `0x800000` (`FUN_10044cb5`) · `21`/`22` call `vtable+0x18` of the stat object (`dynel+0xe8`) with `0x800` / `0x400` [GC 0x1007846e] · `23/24` bytes · `26` PC extra · `27` **NPC dynel only** (`SimpleChar+0x21c != 0`): stat `0x300` = 1 (else 0) [GC instructions 0x1007850f–0x10078539; the earlier “own dynel” reading was incorrect] · `28` stat `HasAlwaysLootable` (0x159) = 1 · `29` shadow breed · `30` identity list. Live values:
 players `0x4ac2` = bits 1, 6, 7, 9, 11, 14; NPCs `0x20a4a43/0x20a4a53` (plain monsters), `0x20a6a43/0x20a6e43/0x20a6ac3/0x20a6ec3/0x20a2ec3`
 (humanoid guards/scouts: bits 7 and 13/14 add head mesh and wide run speed), bit 25 (`0x2000000`) is set on all NPCs (`PetType` as byte).
 
@@ -136,6 +136,28 @@ is a page index: `FUN_100480fc` [GC] stores entry `e` at `dynel->cloth[(e.page *
 `Stanko` (places 1 and 2) and `(1, 262556 EP3_assault_rifle_03, 0, 2)` on the guards; Bergdoktor has `(5, 26163 summon_light, 0, 0)`. Place indices match
 the DisplaySystem strings `Attractor01_head`, `Attractor02_righthand`, `Attractor03_lefthand`, … (place = number − 1) in all captured cases; the last
 `u8` (4 head, 2 weapon, 0 light) is unresolved.
+
+Full-update head omission is real: `zone_enter_ithaca.rec` contains **Xantarr**, breed 1 / sex 2,
+flags `0x4ac2`, `HeadMesh = 223820`, and an empty attractor list. Do not treat this as a headless
+character. The two retail clear methods differ: `CharacterMesh::ClearAttractors` [DS `0x10071dd0`]
+deletes bookkeeping nodes, whereas `VisualCATMesh_t::ClearAttractors` [DS `0x10073d8a`] additionally
+calls `FUN_10072873` on mounted nodes; that function calls `RCATMesh_t::RemoveAttractorChild`.
+The full-update path [GC `0x10077e13`, block `0x100780c0`] uses the former after adding `HeadMesh`;
+appearance updates use the latter. `CharLook::from_update` therefore retains the separately
+mounted head when place 0 is absent; `apply_appearance` still replaces the mounted set, including
+clearing a head for an empty list. Flag bit 2 continues to skip the full-update block.
+Focused read-only survey with the existing release format decoder decoded **360/360** unique
+creation-head meshes (all breeds/sexes, expansion masks 0 and 2) to nonempty geometry; captured
+Bergdoktor head 40103, Stanko head 223940 and Testy head 40629 each decoded to 101 vertices.
+Regression: `full_update_head_survives_missing_attractor_but_appearance_clears_it`.
+Rendered replay additionally exposed a distinct Atrox mounting defect: a successfully decoded head
+was buried inside the torso. `ActorRig` had used the nearest weighted ancestor directly for an
+unweighted attractor bone, dropping that bone's local rotation and translation. Construction now
+reuses `character::build`'s `best_rest_clip` / `derived_bind_frame` resolution once, outside the pose
+hot path. `atrox_unweighted_head_mount_matches_character_loader` compares the complete head
+transform for captured heads 40103 and 223940 with the existing character loader.
+`captured_remote_appearance_screenshots` renders front/back PNGs of the unmodified captured
+Xantarr, Stanko (dual shotguns), and Bergdoktor (cloth/back attachment) with `AOMAC_SHOT_DIR`.
 
 **What feeds the existing app model** (`crates/ao-formats/src/character/player.rs`, `Player::new(breed, gender, skin, head)`):
 
@@ -204,8 +226,7 @@ with fewer stats written (the `n3Dynel_t+0x21c` flag).
 
 **Live changes** (`AppearanceUpdateIIR_c`, [GC 0x10071679], docs/zone/world.md §7): applied to any `SimpleChar_t` of identity kind 50000, NPCs included (no NPC special case): cloth entries by `(page*5 + part)` (`FUN_100480fc`, only changed textures written, 0 clears), `VisualFlags` stat 0x2A1, and the attractor list replaced wholesale (`ClearAttractors` + `AddAttractors`). `Dynels::on_message` edits the `CharLook` (`CharLook::apply_appearance`) and rebuilds the model through `Req::Model`; details and evidence in docs/zone/avatar.md §5.
 
-**Unresolved:** `field_108`, `mode`, the blob (28/42 bytes live: `00×12, 03, 01, 0001 0001 0001 0001, 0000, 0002|0003, …`; a stat update in the capture sets
-`CurrentMovementMode` (0xAD) = 3 and the blob has a `03` at byte 12, **[GUESS]** movement state), the exact meaning of `AttractorMeshData` byte/int, `target`
+**Unresolved:** `field_108`, `mode`, the exact meaning of `AttractorMeshData` byte/int, `target`
 (`+0xbc`), `path`, `list_190`, `effects`, bits 2/18/21/22 consumers, the MonsterData → model mapping, the sign of the heading, and the PC `extra`/`name_parts` strings
 (code paths read, never seen on the wire).
 

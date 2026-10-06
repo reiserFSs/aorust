@@ -267,21 +267,26 @@ The `EffectType` 413 / `ImpactEffectType` 414 effect scripts (`FUN_1009ad7d`) ar
 `CorpseFullUpdateIIR_t` (0x4F474E05, header kind **0xC76A**, decoder `ao_net::n3::world::Corpse`, reader `FUN_1009f502`, ctor `FUN_1009f7b0`, vtable 0x10166a5c): a **separate dynel**
 (`Corpse_t` : `Chest_t` : `SimpleItem_t` family [GC 0x101622d4, docs/zone/static.md §1]; its mesh / cloth / look resolution is `ao_formats::dynel_visual`, docs/zone/static.md; name `Remains of <owner name>`), created with stats `Flags`(0) 0x181805, `CATMesh`(42) = the model, `MonsterScale`(360), `Sex`, `Breed`, `Cash`(61) (loot money),
 **`DeadTimer`(34) = 600**, **`TimeExist`(8) = 18000 / 180000**, `CorpseType`(415) = 50000, `CorpseInstance`(416) = owner id, `MultipleCount`(412) = 1; 5 cloth slots, no textures
-[DATA: 7 corpses]. Position/rotation = the dead char's last position (live: identical to its `FollowTarget` position). The corpse has no animation key in the capture (`CorpseAnimKey` 417
-absent; code `FUN_100a4dcc` reads it only for the spell-effect "play animation on item" path, `FUN_10010e36(item, key < 100, 1)`), so the corpse plays **no clip**: it is the unanimated
-CAT mesh (bind pose), evidence in docs/zone/static.md §5 (not the owner's death clip held on its last frame).
+[DATA: 7 corpses]. Position/rotation = the dead char's last position. The play-animation spell supplies key 503 and its NPC record:
+the four standard arguments had previously been mistaken for type arguments, hiding the non-social branch of `FUN_100a4dcc`.
+The corpse holds the resulting death pose, rather than bind pose; corrected field mapping and addresses are in docs/zone/static.md §5.
 * Looting: `GenericCmd_t` (state 1, cmd 3, `Item{actor = own, item = {0xC76A, id}}`) 1.1 s after the corpse appeared (capture, 44741 ms vs 43632 ms) is the loot request; **[INFERENCE]** it opens the corpse inventory
   (`CORPSE_INVENTORY`, `N3Msg_SetLootAccess`, `Feedback_NotAllowedToLoot`, team loot strings); `BankCorpseIIR_t`, `ReclaimBooth_t` (the "Reclaim" window) are the player-corpse side.
 * Despawn: server driven (`n3ToClientQuitIIR_t` for the corpse; live corpse 5163 left 40 s after it arrived while `TimeExist` = 180000). The units of `DeadTimer` / `TimeExist`
   are **[UNRESOLVED]** (no code reads stat 34 / 8 by number; `DeadTimer` appears only in the stat table).
-* **Implementation** (`Dynels::on_message`, `ao_formats::dynel_visual::corpse_visual`): the corpse dynel is a prop keyed `{0xC76A, instance}`, drawn unanimated. Nothing else of the update is
-  read by any client code found (no reader of `DeadTimer` / `TimeExist` / `CorpseType` / `CorpseInstance` by number, owner link unused), so the combat layer keeps **no** corpse record: the former `CorpseInfo` /
-  `corpse_stat` / `CORPSE_KIND` were deleted (no consumer). The dying NPC is removed by its own `n3ToClientQuit` (2.92-2.99 s after action 99, capture `zone_fight_ithaca.rec`), the corpse
-  appears 1 ms later as an independent dynel; nothing hides or links the owner's dynel.
-* Regression tests: `dynels::variant_tests::replayed_kill_plays_the_death_clip` (action 99 -> `Special::Die(503)` holds the clip, record sound at its position, quit removes the char),
-  `combat::module::death_tests::{captured_kill_stores_the_death_animation, own_death_holds_the_animation_and_reports_after_three_seconds}`. The selection leaves with the dynel
-  (`TargetingModule::update` clears `Zone::target` once `Zone::dynels` lost it; `Zone` drops it on `ToClientQuit`). The "dead leet stayed standing" sighting could not be reproduced from the capture:
-  the quit arrives after 2.92-2.99 s and the death clip is held until then.
+* **Implementation** (`Dynels::on_message`, `ao_formats::dynel_visual::corpse_visual`): the corpse is an independent prop keyed `{0xC76A, instance}`.
+  Its NPC-record death clip is resolved from the spell and its terminal pose held. The character's death freezes movement at its death position;
+  health-zero stat updates cannot replace an already selected death clip. Corpse creation removes its owner actor even if it precedes the owner's quit.
+  The corpse remains until its own server despawn; loot updates do not remove it.
+* **Full kill evidence** (`docs/captures/zone_kill_ithaca.rec`, lines 382–397): character `0xf7f82` gets action99/key503 at 216107 ms;
+  at 219058 ms the character quit precedes corpse `{0xc76a,0xcf3}`, then a late StopFight still targets the removed character.
+  The corpse spell's standard fields are `[1,0,0,0]`, type fields `[0,0,503,1,4,17655,0]`.
+  At 246428 ms the server sends its inventory, confirming the distinct corpse identity is the loot target.
+* Regression: `captured_kill_replaces_character_with_persistent_corpse` replays every received capture frame, asserting selected death clears,
+  death movement freezes, owner removal, correct spell alignment/position, and persistence through the late fight/loot frames.
+  `corpse_holds_death_pose` compares the held vertices to the actual NPC-record terminal animation pose (real-data test).
+* **Health boundary [CODE]**: computed combat health/death-cause (`FUN_1005ae91`) is not itself the `CharDie` flag transition.
+  The renderer's death state responds to server action99 or explicit health-zero stat/full updates; no extra computed-hit-to-animation bridge is invented.
 
 ## 8. Not found / open
 * The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.

@@ -83,7 +83,7 @@ and the clan string, not decoded), more than 96 tags at once.
 
 * A server-sent `CorpseAnimKey` 1..99 (never captured) would start a social clip on the corpse (static.md §5).
 * `Features` of players is an inference (bit 4); NPC `Features` come from their record.
-* Corpse `TextureData` env texture / alpha mode are passed as 0 (the corpse path takes `(material, texture)` pairs; both are 0 in every capture). `ClearAttractors` vs. the head mesh: the mounted set is exactly the message's attractor list (`CharacterMesh::ClearAttractors` drops the `HeadMesh` entry added before it, `actor::attractor_list`, docs/zone/npc.md §6); a flag-bit-2 message mounts none.
+* Corpse `TextureData` env texture / alpha mode are passed as 0 (the corpse path takes `(material, texture)` pairs; both are 0 in every capture). Full updates preserve the separately mounted `HeadMesh` when the attractor list omits place 0: base `CharacterMesh::ClearAttractors` deletes bookkeeping but does not remove render children. Appearance updates use `VisualCATMesh_t::ClearAttractors` and replace the rendered set, including the head (dynel.md §1.3); a flag-bit-2 full update skips the mounting block.
 * Weapon attractor orientation: the mesh is mounted with the attractor's frame as is; no weapon-specific rotation was found.
 * Indicators over non-character dynels (corpses, props); the ignored-character icon on the tag plate (§4).
 * Doors: open / close / lock is the server's `DoorStatusUpdateIIR_t`; the mesh animation, sounds and the open items that animate (vending machines) are ported (docs/zone/doors.md). Open: dungeon room doors and door collision (docs/zone/doors.md §6).

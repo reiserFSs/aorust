@@ -10,6 +10,7 @@ mod buffs;
 pub(in crate::play) mod items;
 mod skill_model;
 mod stat_view;
+mod equipment;
 mod zone_inv;
 pub(in crate::play) mod inv_grid;
 mod item_dnd;
@@ -30,16 +31,14 @@ use std::path::Path;
 /// 0x101a95a8 = 700). Rects are inclusive: 651 x 521 outer.
 const SKILLS_POS: (i32, i32) = (200, 180);
 const SKILLS_OUTER: (u32, u32) = (651, 521);
-/// `GFX_GUI_WEARVIEW_*` art size; the three tab headers are read off the art (x ranges below).
+/// Equipment body art (the baked three-tab strip is covered by the real four-tab strip).
 const WEAR_ART: (u32, u32) = (192, 320);
-/// Tab header x ranges inside the art (measured at row y = 3: separators at x = 72 and 122, outer edges 4 and 188), height 17. The fourth tab,
-/// "Social" (`TabView::AppendTab("Social")`, `FUN_100e1bc9`), has no art: UNRESOLVED, it is a plain text button under the art and shows the
-/// clothes art (the social grid has the same 15 cells).
-const WEAR_TABS: [(&str, &str, i32, i32); 4] = [
-    ("weapons", "GFX_GUI_WEARVIEW_WEAPON", 4, 72),
-    ("clothes", "GFX_GUI_WEARVIEW_CLOTHING", 72, 122),
-    ("implants", "GFX_GUI_WEARVIEW_IMPLANTS", 122, 188),
-    ("social", "GFX_GUI_WEARVIEW_CLOTHING", 0, 0),
+/// `WearView_c` 0x100e2640/269c/26f2/2748: three localized titles and literal Social.
+const WEAR_TABS: [(&str, &str); 4] = [
+    ("weapons", "GFX_GUI_WEARVIEW_WEAPON"),
+    ("clothes", "GFX_GUI_WEARVIEW_CLOTHING"),
+    ("implants", "GFX_GUI_WEARVIEW_IMPLANTS"),
+    ("social", "GFX_GUI_WEARVIEW_CLOTHING"),
 ];
 const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
 const SLOT_OPEN_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_OPEN";
@@ -127,6 +126,8 @@ pub(super) struct HudStats {
     db: TextDb,
     model: Model,
     items: Items,
+    equipment: equipment::Equipment,
+    pools: super::hud_pools::Pools,
     skills: Option<Skills>,
     wear: Option<Tabbed>,
     inventory: Option<Inventory>,
@@ -179,6 +180,8 @@ impl HudStats {
             db: TextDb::load(dir)?,
             model,
             items: Items::new(dir),
+            equipment: equipment::Equipment::new(dir),
+            pools: super::hud_pools::Pools::new(dir),
             skills: None,
             wear: None,
             inventory: None,
@@ -287,9 +290,9 @@ impl HudStats {
         }
     }
 
-    /// Name, `MultipleCount` and `Value` (stat 0x4a, the shop price column) of the item template `low_id` (`interact_shop.rs`).
-    pub(in crate::play) fn shop_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<(String, i32, i32)> {
-        self.items.info(gui, low_id).map(|i| (i.name.clone(), i.count, i.stat(0x4a).unwrap_or(0)))
+    /// Name, count and Value resolved from both ACG endpoints at the actual quality level.
+    pub(in crate::play) fn shop_info(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> Option<(String, i32, i32, Option<ao_gui::GfxId>)> {
+        self.items.shop_info(gui, item)
     }
 
     pub(super) fn open(&mut self, gui: &mut Gui, rollup: &mut Rollup, kind: WindowKind) {
@@ -572,7 +575,6 @@ impl HudStats {
         }
         let Some(s) = self.skills.as_mut() else { return };
         let get = |id: u32| zone.stat(id);
-        self.model.refresh_buffs(&get, &zone.active_spells);
         // "Suggested IP distribution" is available until level 20 (inittext).
         gui.set_enabled(s.window, "suggest_ip", zone.stat(stats::LEVEL).unwrap_or(0) < 20);
         // `FUN_100fa45c`: "Reset all skills (n)", n = (stat 0x15c bit 2 clear) + FullIPRPoints (0x2b3); enabled when n >= 1
@@ -660,17 +662,24 @@ impl HudStats {
         // the clothes art of the social tab: a second view of it (the three names above toggle visibility one by one)
         xml += &format!("<BitmapView name=\"social\" bitmap_id=\"{}\"/>", WEAR_TABS[3].1);
         xml += &format!("<CanvasView name=\"items\" min_size=\"Point({aw},{ah})\" max_size=\"Point({aw},{ah})\"/>");
-        // tab header hit areas laid over the art
-        xml += "<View view_layout=\"horizontal\" h_alignment=\"left\" v_alignment=\"top\">";
-        xml += &format!("<View min_size=\"Point({0},17)\" max_size=\"Point({0},17)\"/>", WEAR_TABS[0].2);
-        for (name, _, l, r) in WEAR_TABS.iter().take(3) {
-            xml += &format!("<TextButton name=\"tab_{name}\" text=\"\" min_size=\"Point({0},17)\" max_size=\"Point({0},17)\"/>", r - l);
-        }
-        xml += "<HLayoutSpacer/></View></View>";
-        xml += "<View view_layout=\"horizontal\" h_alignment=\"left\"><TextButton name=\"tab_social\" text=\"Social\" color=\"0xFFFFFF\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" layout_borders=\"Rect(4,3,4,0)\"/></View>";
-        xml += "</View></root>";
+        // The original appends all four tabs to the same TabView; no extra
+        // Social row below the equipment body (`FUN_100e1bc9`).
+        xml += &format!("<View view_layout=\"vertical\" v_alignment=\"top\"><View view_layout=\"stacked\" min_size=\"Point({aw},17)\" max_size=\"Point({aw},17)\"><CanvasView name=\"wear_tabs\"/><View name=\"wear_tab_hits\" view_layout=\"horizontal\" h_alignment=\"left\"/></View><VLayoutSpacer/></View></View></View></root>");
         // `WearView_c` (`FUN_100e1bc9`) is a `DockableView_c` titled `GetText(10000, "Wear")`, docked in the rollup column (`WearViewConfig`: `DockableViewDockName = "RollupArea"`, page 317 px)
         let w = rollup.open_page(gui, WEAR_KEY, &self.db.by_key(10000, "Wear").unwrap_or_default(), &xml, ah as f32)?;
+        let titles = ["Weapon", "Tab_Clothing", "Tab_Implants"].map(|k| self.db.by_key(10000,k).unwrap_or_default());
+        let titles = [titles[0].clone(), titles[1].clone(), titles[2].clone(), "Social".to_owned()];
+        let widths = gui.set_view_tabs(w, "wear_tabs", &titles, 0, aw);
+        gui.set_canvas(w,"wear_tabs",vec![CanvasItem::Solid { dst:[0.0,0.0,aw as f32,17.0],color:0x404040,alpha:1.0 }]);
+        let mut hits = String::from("<root><View view_layout=\"horizontal\" h_alignment=\"left\"><View min_size=\"Point(2,17)\" max_size=\"Point(2,17)\"/>");
+        let mut left = 2;
+        for (i, ((name, _), width)) in WEAR_TABS.iter().zip(widths).enumerate() {
+            let width = (width as i32 - if i + 1 < WEAR_TABS.len() { 6 } else { 0 }).min(aw as i32 - left);
+            left += width;
+            hits += &format!("<TextButton name=\"tab_{name}\" text=\"\" min_size=\"Point({width},17)\" max_size=\"Point({width},17)\"/>");
+        }
+        hits += "</View></root>";
+        gui.add_view_xml(w, "wear_tab_hits", "WearTabHits", &hits)?;
         self.wear = Some(Tabbed { window: w, tab: 0, drawn: vec![(u32::MAX, 0)] });
         self.select_wear_tab(gui, 0);
         Ok(())
@@ -679,6 +688,7 @@ impl HudStats {
     fn select_wear_tab(&mut self, gui: &mut Gui, tab: usize) {
         let Some(t) = self.wear.as_mut() else { return };
         t.tab = tab;
+        gui.select_view_tab(t.window, "wear_tabs", tab);
         for (i, (name, ..)) in WEAR_TABS.iter().enumerate() {
             gui.set_visible(t.window, name, i == tab);
         }
@@ -851,8 +861,12 @@ impl HudStats {
 
     // ------------------------------------------------------------------------------------------------------------ dispatch
 
-    pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone, _dt: f32) {
+    pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
         self.dnd.clock += _dt;
+        self.equipment.refresh(zone);
+        self.model.refresh_buffs(&|id| zone.stat(id), &zone.active_spells, self.equipment.effects(), self.equipment.attack_weights());
+        self.pools.apply(zone, &|z, id| self.model.value(&|s| z.stat(s), id));
+        self.model.publish(zone);
         self.update_skills(gui, zone);
         self.update_wear(gui, zone);
         self.update_inventory(gui, zone);
@@ -940,7 +954,7 @@ mod tests {
             }
         }
         fn frame(&mut self, dt: f32, _size: (u32, u32), _host: &mut Host) -> DrawList {
-            self.hud.update(&mut self.gui, &self.zone, dt);
+            self.hud.update(&mut self.gui, &mut self.zone, dt);
             self.gui.frame(dt)
         }
     }
@@ -1156,7 +1170,21 @@ mod tests {
         s.zone.on_frame(&stat_frame(33512, &[(stats::HEALTH, 50), (22, 77)]));
         o.frame(&mut s, 0.016);
         assert_eq!(s.gui.text(w, "health_label"), format!("<center>50 / {}</center>", health.1));
-        assert!(s.gui.text(w, "value0").contains("77"), "AMS row: {}", s.gui.text(w, "value0"));
+        let ams = s.hud.model.value(&|id| s.zone.stat(id), 100) + s.hud.model.value(&|id| s.zone.stat(id), 276);
+        assert_eq!(s.gui.text(w, "value0"), format!("<FONT color=#bbbbff>{ams}</font>"), "unarmed AMS is recomputed, not the raw server placeholder");
+        // Stats must refresh modifiers even while the Skills window is closed.
+        s.zone.apply_effects(&[ao_net::n3::spells::spell(0xcf35, &[(0, 91), (0x27, 123)])], true);
+        s.zone.on_frame(&stat_frame(33512, &[(91, 10), (52, 150), (57, 100), (350, 300)]));
+        o.frame(&mut s, 0.016);
+        assert!(s.gui.text(w, "value1").contains("133"), "buffed melee AC: {}", s.gui.text(w, "value1"));
+        assert_eq!(s.gui.text(w, "xp_label"), "<center>50 / 200</center>");
+        s.zone.on_frame(&stat_frame(33512, &[(52, 175)]));
+        o.frame(&mut s, 0.016);
+        assert_eq!(s.gui.text(w, "xp_label"), "<center>75 / 200</center>", "StatIIR XP refresh");
+        let bar = s.gui.view_rect(w, "health").unwrap();
+        let label = s.gui.view_rect(w, "health_label").unwrap();
+        assert!(((bar.l + bar.r) - (label.l + label.r)).abs() <= 1.0, "horizontal centre: {bar:?} {label:?}");
+        assert!(((bar.t + bar.b) - (label.t + label.b)).abs() <= 1.0, "vertical centre: {bar:?} {label:?}");
         png(&mut s, &mut o, "stat-1-hurt");
         assert!(s.hud.window(WindowKind::Stat).is_some());
         s.hud.close(&mut s.gui, &mut s.rollup, WindowKind::Stat);
@@ -1184,6 +1212,11 @@ mod tests {
         let w = s.hud.window(WindowKind::Character).unwrap();
         o.frame(&mut s, 0.016);
         assert!(s.gui.warnings.is_empty(), "{:?}", s.gui.warnings);
+        let weapons = s.gui.view_rect(w,"tab_weapons").unwrap();
+        let social = s.gui.view_rect(w,"tab_social").unwrap();
+        let body = s.gui.view_rect(w,"body").unwrap();
+        assert_eq!(social.t,weapons.t, "Social belongs in the four-tab strip");
+        assert!(social.b <= body.b && social.r <= body.r, "no tab leaks into the next rollup page");
         // weapons tab: Right Hand = slot 6 is cell 6 (column 0, row 2)
         assert_eq!(s.gui.canvas_items(w, "items").len(), 1);
         png(&mut s, &mut o, "wear-0-weapons-items");

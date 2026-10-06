@@ -62,6 +62,8 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
   Texts are category 10001: `Befriend %s`, `Invite %s`, `Delete %s`, `Ignore %s`, `Unignore %s`.
 * Opening: `SlotFriendWindowActivated` 0x100871a0 creates the window (class size 0x1b8) when the HUD's `friends_window` dvalue turns true and closes it when false
   (`WindowKind::Friends`, Ctrl+R); the HUD button pops out when the user closes the window (`Chat::take_closed_windows`).
+* Fresh constructor trace (2026-10-06): `FUN_100a9c58` calls the `DockableView` base `FUN_10038b47(Rect, "friends_window", "Friends", 5, 0)` before installing the `FriendListView_c` vtable; `SlotFriendWindowActivated` allocates the view and passes it to `FUN_1000c930`, not to a `Window` constructor. The port exposes this view's owner WindowId through `Chat::dock_windows` so the HUD controller registers `friends_window`; LFT is not included.
+
 
 ## 4. Tell windows (`OpenTellWindow` 0x10085df8 = `FUN_10085b01` + `FUN_100a6568` = `FUN_100a5e7a` + `FUN_100a75e8(1,1)`)
 
@@ -109,7 +111,9 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
   inserted at their id as index, `SelectByID(saved id, true)`, Search reads the selected item ids and the selected *index* of Location) and the `MultiListView` (list mode, flags
   0x40, 6 columns `AddColumn(i, label, width, 0xe)`, rows `AddItem(.., sorted = true)` ordered by the Name column, compare per column as `FUN_100ef4a1`, header click re-sorts,
   header drag resizes, selected row = `ViewSurface` 0x88aadd; the row is selected by the application slot `FUN_100efacd` = `Select(true, true)` on the mouse-down signal). Column
-  widths and the three selected ids persist in `<prefs dir>/LFTWindowConfig.xml` (same `Message` archive schema as the chat window configs).
+  widths and the three selected ids persist in `<character prefs>/LFTWindowConfig.xml` (same `Message` archive schema as the chat window configs).
+* Geometry/pin persistence: `FUN_100f03fb` constructs style 0 with flags `0x1000`, then calls `MoveToCenter` and `Window::LoadWndConfig`; destructor `FUN_100efb97` calls `Window::SaveWndConfig` before writing `LFTWindowConfig`. The port now enables frame movement/resizing and restores/saves inclusive `WindowFrame` and `WindowPinButtonState`, reusing `hud_wincfg::Cfg`/`inside_screen`. Friends' fallback owner frame also preserves geometry; the registered dock controller owns its dock/rollup placement. Character directories are supplied once through `SocialWin::set_character_dir`; legacy shared Friends/LFT files migrate once without overwriting a character's own archive. Regression `social_frames_and_pin_persist_per_character` covers geometry/pin reload and character isolation. Viewport changes retain right/bottom-edge attachment and move windows inside the new screen without changing size.
+
 
 ## 7. Not faithful / unresolved (each labelled in code)
 
@@ -117,7 +121,7 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
   (`0xd5` open, `0xd4` closed), the 15 px indent and the 0.5 s icon blink come from `StringListViewItem_c` / `ListViewBaseItem_c`. A click on a friend toggles its tell window
   (`FUN_100a9b4b`: `FUN_100a75e8(1 - is_open)`, 0 closes it); a click on a chat-window item (show / hide that chat window, `FUN_1009adae`, and its menu `FUN_100a83ac`) is not ported.
   UNRESOLVED left in the widgets: the horizontal scroll-bar art, the popup menu skin (shared `PopupMenu_c`), `ResizeColumnToFit` (fits the widest cell), a sort marker in the header.
-* Friends window position (centred), tell window layout, tell routing preferences (section 4), the "Chat Windows" folder content (needs `ChatWindows` names), chat window
+* Friends window initial position (centred fallback until dock registration), tell window layout, tell routing preferences (section 4), the "Chat Windows" folder content (needs `ChatWindows` names), chat window
   assignment check boxes (section 5), `ChatPGInviteAction` pref store, Mail entry, LFT reset at `FUN_1007850a`, team state for the LFT Invite button (port has no team state yet).
 * Kick: the original queues `GroupAction(part)` before the "left private group" text (order delivered to a removed group is unknown); the port prints the text first.
 

@@ -4,9 +4,8 @@
 //! * clips are named `<set>_<role>_01_01.ani` (`%s_%s_01_01.ani` in Gamecode.dll); the set is `athrox`
 //!   for Atrox bodies and `male`/`female` for the other breeds (all human bodies share one skeleton);
 //! * heads are meshes `head_<race><sex>[_<ethnicity>]<NN>.abiff` (`head_%s%s%02d.abiff` in GUI.dll);
-//! * skin: a player's body materials (`hands body feet arms legs`) show the rdb 1010011 naked skin
-//!   `<part>_<race><sex>[_<ethnicity>]_naked.png` with worn cloth textures composited over it, see [`part_textures`];
-//!   the models' `*_default.png` are the textures of non-player users of the same bodies (NPCs).
+//! * skin: body materials (`hands body feet arms legs`) show rdb 1010011 naked skin
+//!   with the model's default outfit or worn cloth composited over it, see [`part_textures`].
 
 use super::{load_cat_mesh, load_character_head_skin, CatAnim, NameTable, PartTextures, CHAR_ANIM_TYPE, CHAR_MESH_TYPE};
 use crate::texture::load_texture;
@@ -401,6 +400,27 @@ pub fn skin_texture_name(breed: Breed, gender: Gender, skin: Skin, part: ClothPa
     format!("{}_{}{sex}{race}_naked.png", part.name(), breed.model_race())
 }
 
+/// Head resource naming identifies the skin passed to `SetSkinData` for humanoid NPCs
+/// (Gamecode `FUN_100c2c15`, see docs/zone/npc.md). Non-human heads do not select body skin.
+pub(super) fn head_skin(names: &NameTable, head: u32) -> Option<(Breed, Gender, Skin)> {
+    let name = names.name(MESH_TYPE, head)?.strip_prefix("head_")?;
+    let (breed, rest) = [
+        ("solitus", Breed::Solitus), ("opifex", Breed::Opifex),
+        ("nano", Breed::Nanomage), ("athrox", Breed::Atrox),
+    ].into_iter().find_map(|(prefix, breed)| name.strip_prefix(prefix).map(|rest| (breed, rest)))?;
+    let (gender, rest) = if breed == Breed::Atrox {
+        (Gender::Male, rest)
+    } else if let Some(rest) = rest.strip_prefix("male") {
+        (Gender::Male, rest)
+    } else {
+        (Gender::Female, rest.strip_prefix("female")?)
+    };
+    let skin = if rest.starts_with("_asian") { Skin::Asian }
+        else if rest.starts_with("_african") { Skin::African }
+        else { Skin::Caucasian };
+    Some((breed, gender, skin))
+}
+
 /// `RGB565` green (0, 255, 0): the chroma key of cloth textures (`FUN_10074393` @0x10074393 compares the 16-bit
 /// texel with `0x07e0`). The 8-bit → 565 conversion is `r>>3, g>>2, b>>3` (`RTexture_t::Load`'s rounding is not
 /// traced; an unresolved guess that only matters for near-green texels).
@@ -526,6 +546,55 @@ pub fn load_player_character(store: &RecordStore, breed: Breed, gender: Gender, 
 
 #[cfg(test)]
 mod tests {
+    /// Offline survey: source overlay keys only, never head or hair colours.
+    #[test]
+    fn humanoid_defaults_and_cloth_key_to_real_skin() {
+        let Some(dir) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+        let Ok(store) = RecordStore::open(&dir.join("Games/ProjectRubiKa/client")) else { return };
+        let names = NameTable::load(&store).unwrap();
+        let mut keyed = 0;
+        for breed in [Breed::Solitus, Breed::Opifex, Breed::Nanomage, Breed::Atrox] {
+            for gender in [Gender::Male, Gender::Female] {
+                if breed == Breed::Atrox && gender == Gender::Female { continue }
+                for skin in [Skin::Caucasian, Skin::Asian, Skin::African] {
+                    let head = heads(&names, breed, gender, skin).unwrap()[0].1;
+                    for build in 0..3 {
+                        let model = player_model_build(&store, breed, gender, build).unwrap();
+                        let cat = load_cat_mesh(&store, CHAR_MESH_TYPE, model).unwrap();
+                        let p = Player::new(breed, gender, skin, None);
+                        let player = part_textures(&names, &store, model, &p).unwrap();
+                        let npc = super::super::actor::npc_part_textures(&store, &names, &cat, Some(head), &[], &[]);
+                        for part in ClothPart::ALL {
+                            let source = cat.parts.iter().find(|p| p.name == part.name()).unwrap().texture;
+                            let over = load_texture(&store, TextureKey { rdb_type: TEXTURE_TYPE, id: source }).unwrap().unwrap();
+                            let skin_id = names.id(SKIN_TYPE, &skin_texture_name(breed, gender, skin, part)).unwrap();
+                            let base = load_texture(&store, TextureKey { rdb_type: SKIN_TYPE, id: skin_id }).unwrap().unwrap();
+                            let list = [super::super::TextureOverride { material: part.name(), texture: source, env_texture: 0, alpha_mode: 0 }];
+                            let wire = super::super::actor::npc_part_textures(&store, &names, &cat, Some(head), &list, &[]);
+                            let cloth = super::super::actor::npc_part_textures(&store, &names, &cat, Some(head), &[], &[(part, source)]);
+                            let mut worn = p;
+                            worn.equipment.wear(part, source);
+                            let worn = part_textures(&names, &store, model, &worn).unwrap();
+                            for (i, px) in over.rgba.as_chunks::<4>().0.iter().enumerate() {
+                                let expected = if is_key(px) {
+                                    keyed += 1;
+                                    let x = i as u32 % over.width;
+                                    let y = i as u32 / over.width;
+                                    let s = ((y * base.height / over.height) * base.width + x * base.width / over.width) as usize * 4;
+                                    &base.rgba[s..s + 4]
+                                } else { px.as_slice() };
+                                for out in [&player, &npc, &wire, &cloth, &worn] {
+                                    assert_eq!(&out[part.name()].1.rgba[i * 4..i * 4 + 4], expected, "{breed:?} {gender:?} {skin:?} build {build} {part:?} texel {i}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(keyed > 0, "survey must exercise source 0x07e0 texels");
+    }
+
     use super::*;
 
     #[test]

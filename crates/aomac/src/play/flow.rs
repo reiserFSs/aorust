@@ -347,7 +347,7 @@ impl Play {
         self.playing = None;
         self.char_ready = false;
         self.preview_error = None;
-        self.worker = Some(preview::Worker::start(self.dir.clone(), breed, sex, self.chars[i].info.id));
+        self.worker = Some(preview::Worker::start(self.dir.clone(), breed, sex, self.chars[i].id, self.chars[i].info.head));
         let Ok((b, _)) = screens::wire_breed_sex(breed, sex) else { return };
         let mut p = LOGIN_CAMERA.pos;
         for (v, o) in p.iter_mut().zip(screens::CHAR_VIEWER_OFFSET) {
@@ -375,10 +375,11 @@ impl Play {
     /// Preview animation: `CCCharacter_t::RunFunction` (docs/screens.md §5.5).
     fn tick_preview(&mut self, dt: f32, host: &mut Host) {
         let Some(wk) = &self.worker else { return };
+        // Preserve queued First/Clip messages until the backdrop can accept their mesh topology.
+        let Some(b) = &self.backdrop else { return };
         while let Ok(m) = wk.rx.try_recv() {
             match m {
                 preview::Out::First(mut ch) => {
-                    let Some(b) = &self.backdrop else { continue };
                     let mut s = (**b).clone();
                     set_login_stage(&mut s, 1);
                     let base = s.meshes.len();
@@ -1107,7 +1108,8 @@ impl Frontend for Play {
                     }
                     // after the HUD: the chat windows draw above its bar windows (as in the original, whose bar windows are backmost)
                     if let (Some(c), false) = (self.chat.as_mut(), teleported) {
-                        if let Err(e) = c.open(&mut self.gui, self.size) {
+                        let char_dir = self.hud.as_ref().and_then(|h| h.dvalues.char_dir());
+                        if let Err(e) = c.open(&mut self.gui, self.size, char_dir) {
                             eprintln!("chat: {e:#}");
                         }
                     }
@@ -1157,6 +1159,10 @@ impl Frontend for Play {
                     let (b, f) = h.key_tables();
                     p.set_keys(b, f);
                     p.set_view_distance(h.dvalues.view_distance());
+                    if let Some(mode) = h.take_menu_camera() {
+                        p.select_camera_mode(mode);
+                    }
+                    h.sync_camera_mode(p.camera_mode());
                     p.set_control_prefs(&super::controls::ControlPrefs::from_dvalues(&h.dvalues));
                     p.set_fade(super::avatar::Fade::from_prefs(&h.dvalues.prefs));
                 }
@@ -1205,6 +1211,12 @@ impl Frontend for Play {
                 a.set_prefs(&super::options::audio_prefs(&h.dvalues));
             }
             a.update(dt, host.camera.pos.to_array(), self.zone.day_time());
+        }
+        // ActionMenu RunChatScript uses the same command path as a line entered in chat.
+        for script in self.hud.as_mut().map(|h| h.take_menu_scripts()).unwrap_or_default() {
+            if let Some(c) = self.chat.as_mut() {
+                c.run_line(&mut self.gui, &script, &self.zone, &self.text);
+            }
         }
         if let Some(c) = self.chat.as_mut() {
             c.resize(&mut self.gui, size);
@@ -1282,6 +1294,11 @@ impl Frontend for Play {
         // Friends / Team Search windows follow the HUD's `friends_window` / `lft_window` dvalues (docs/chat/social.md)
         if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_mut()) {
             c.sync_windows(&mut self.gui, h.dvalue("friends_window"), h.dvalue("lft_window"), &self.text);
+            for (key, window) in c.dock_windows() {
+                if let Err(e) = h.register_dock(&mut self.gui, key, window) {
+                    eprintln!("dock {key}: {e:#}");
+                }
+            }
             for d in c.take_closed_windows() {
                 h.set_dvalue(&mut self.gui, d, false);
             }

@@ -14,10 +14,8 @@
 //! `FullCharacterIIR_t`'s spell list (run by `FUN_10073a2f` after the stats) and `ApplySpellsIIR_t` (apply flag 0 = undo). Spells whose `Target` (standard
 //! argument 0x20) is 0xe or 0x17 run on the owner / pet relation of the character, not on it (`FUN_100026d0`), so they are not kept.
 //!
-//! **UNRESOLVED / not modelled** (searched: `FUN_100026d0`, `FUN_100a59f5`, callers of `FUN_100644c8` / `FUN_1006497b`, the item records of rdb 1000020):
-//! * Item events (event 14 = Wear in the data: armor and implants carry `0xcf35` spells with `GetStat(0) = stat`, `GetStat(0x27) = amount`, e.g. 1000020:101103)
-//!   run on equip in code that was not found (`FUN_1004b300` rescales implant amounts by the item's quality when the character level changes through
-//!   `FUN_10047805`); the interpolation between an `ACGItem`'s low and high record by its quality is not traced either, so worn items add nothing here.
+//! Item Wear effects are supplied by `equipment.rs`: `FUN_100cba71` merges the low/high templates by QL; modifier functions interpolate argument 39 only.
+//! **UNRESOLVED / not modelled**:
 //! * Timed effects: `FUN_100a59f5` ends spells with a duration (`GetStat(0x19)`, function `0xcf16`) by itself; the server's undo `ApplySpellsIIR_t` is what removes
 //!   a spell here.
 //! * The delta of `0xcfb7` / `0xcff5` is fixed at apply time in the client (stored in the spell object for the undo); it is recomputed from the current
@@ -59,9 +57,10 @@ impl Zone {
 
 /// The two maps after the spells ran in order. `level` is `GetStat(0x36, 2)`; `current(stat, maps)` is `GetStat(stat, 0)` (the buffed value) under the maps
 /// built so far (`0xcff5` takes a percentage of it).
-pub fn modifiers(active: &[Spell], level: i32, current: &dyn Fn(u32, &Modifiers) -> i32) -> Modifiers {
+/// Wear and running spells share the same maps, so percent-of-current effects see preceding equipment bonuses.
+pub fn modifiers_with_equipment(active: &[Spell], wear: &[Spell], level: i32, current: &dyn Fn(u32, &Modifiers) -> i32) -> Modifiers {
     let mut m = Modifiers::default();
-    for s in active {
+    for s in wear.iter().chain(active) {
         let Ok(target) = u32::try_from(s.stat(stat::STAT)) else { continue };
         let amount = s.stat(stat::VALUE);
         match s.function {
@@ -91,7 +90,7 @@ mod tests {
     #[test]
     fn writers_fill_the_bonus_and_percent_maps() {
         let spells = [modify(0xCF35, 108, 2), modify(0xCF14, 108, 40), modify(0xCF35, 101, 3), modify(0xCFC0, 110, 25), modify(0xCFB7, 109, 100), modify(0xCF22, 5, 5)];
-        let m = modifiers(&spells, 50, &|_, _| 0);
+        let m = modifiers_with_equipment(&spells, &[], 50, &|_, _| 0);
         assert_eq!(m.bonus.get(&108), Some(&42));
         assert_eq!(m.bonus.get(&101), Some(&3));
         assert_eq!(m.bonus.get(&109), Some(&25), "100 * 50 / 200");
@@ -103,8 +102,10 @@ mod tests {
     fn percent_of_value_reads_the_buffed_value_so_far() {
         let spells = [modify(0xCF35, 108, 20), modify(0xCFF5, 108, 10)];
         // GetStat(108, 0) = 100 + the bonus built so far (20) = 120: 10 % -> +12
-        let m = modifiers(&spells, 1, &|stat, m| 100 + m.bonus.get(&stat).copied().unwrap_or(0));
+        let m = modifiers_with_equipment(&spells, &[], 1, &|stat, m| 100 + m.bonus.get(&stat).copied().unwrap_or(0));
         assert_eq!(m.bonus.get(&108), Some(&32));
+        let m = modifiers_with_equipment(&[modify(0xCFF5, 108, 10)], &[modify(0xCF35, 108, 20)], 1, &|_, m| 100 + m.bonus.get(&108).copied().unwrap_or(0));
+        assert_eq!(m.bonus[&108], 32);
     }
 
     #[test]
@@ -133,7 +134,7 @@ mod tests {
         body.extend([0, 0, 0xC3, 0x50, 0, 0, 0, 7, 1]);
         let msg = ao_net::n3::spells::parse(&body).unwrap();
         assert_eq!((msg.target.instance, msg.apply), (7, true));
-        let m = modifiers(&msg.spells, 1, &|_, _| 0);
+        let m = modifiers_with_equipment(&msg.spells, &[], 1, &|_, _| 0);
         assert_eq!((m.bonus[&108], m.bonus[&113]), (2, 105));
     }
 }

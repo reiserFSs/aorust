@@ -35,14 +35,18 @@ impl Info {
     }
 }
 
+/// A shop item's name, count, Value and icon.
+pub type ShopInfo = (String, i32, i32, Option<GfxId>);
+
 pub struct Items {
     store: Option<RecordStore>,
     cache: HashMap<i32, Option<Info>>,
+    shop_cache: HashMap<(i32, i32, i32), Option<ShopInfo>>,
 }
 
 impl Items {
     pub fn new(dir: &Path) -> Self {
-        Self { store: RecordStore::open(dir).ok(), cache: HashMap::new() }
+        Self { store: RecordStore::open(dir).ok(), cache: HashMap::new(), shop_cache: HashMap::new() }
     }
 
     /// The record of an item (`None` without rdb or record). Icon textures are created once per item.
@@ -56,6 +60,30 @@ impl Items {
             self.cache.insert(low_id, info);
         }
         self.cache[&low_id].as_ref()
+    }
+
+    /// ACG-resolved shop name/count/Value; malformed endpoint templates never fall back to low QL.
+    pub fn shop_info(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> Option<ShopInfo> {
+        let key = (item.low_id, item.high_id, item.level);
+        if !self.shop_cache.contains_key(&key) {
+            let result = (|| -> anyhow::Result<Option<ShopInfo>> {
+                let Some(store) = self.store.as_ref() else { return Ok(None) };
+                let Some(low) = item_template(store, u32::try_from(item.low_id)?)? else { return Ok(None) };
+                let high = if item.high_id == item.low_id { None } else {
+                    let Some(high) = item_template(store, u32::try_from(item.high_id)?)? else { return Ok(None) };
+                    Some(high)
+                };
+                let t = ao_formats::dynel_visual::interpolate_item_templates(&low, high.as_ref().unwrap_or(&low), item.level)?;
+                let icon = t.stat(STAT_ICON).filter(|&id| id > 0).and_then(|id| icon_image(gui, store, id as u32)).map(|(id, _, _)| id);
+                Ok(Some((t.name.clone().unwrap_or_default(), t.stat(STAT_COUNT).filter(|&c| c > 0).unwrap_or(1), t.stat(0x4a).unwrap_or(0), icon)))
+            })();
+            let info = match result {
+                Ok(info) => info,
+                Err(e) => { eprintln!("shop: invalid ACG {item:?}: {e:#}"); None }
+            };
+            self.shop_cache.insert(key, info);
+        }
+        self.shop_cache[&key].clone()
     }
 
     /// The record of an item that [`Items::info`] already loaded.

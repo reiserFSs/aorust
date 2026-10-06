@@ -103,6 +103,9 @@ pub struct TargetInfo {
     pub level: i32,
     /// `Health / MaxHealth`, 0..1.
     pub health: f32,
+    /// Retail `N3Msg_Consider` gradient used by `TargetHealthBar_c::SetTarget` (GUI 0x1007313a).
+    pub color: u32,
+    pub max_health: i32,
     /// `FUN_100744ae` (GUI 0x100744ae): an NPC is attackable iff its `Side` (0x21) differs from the own one; players need
     /// `N3Msg_CanAttack` (PvP rules, not modelled: never).
     pub hostile: bool,
@@ -118,16 +121,21 @@ pub fn info(zone: &Zone, id: i32) -> Option<TargetInfo> {
     let d = zone.dynels.get(&id)?;
     let is_self = id == zone.char_id as i32;
     let (health, max, level, side) = if is_self {
-        (zone.stat(stats::HEALTH).unwrap_or(d.health), zone.stat(stats::LIFE).unwrap_or(d.max_health), zone.stat(stats::LEVEL).unwrap_or(d.level), d.side)
+        (zone.skill_value(stats::HEALTH).unwrap_or(d.health), zone.skill_value(stats::LIFE).unwrap_or(d.max_health), zone.skill_value(stats::LEVEL).unwrap_or(d.level), d.side)
     } else {
         (d.health, d.max_health, d.level, d.side)
     };
-    let own_side = zone.stat(stats::SIDE).map_or_else(|| zone.own().map_or(0, |o| o.side), |s| s as u8);
+    let own_side = zone.skill_value(stats::SIDE).map_or_else(|| zone.own().map_or(0, |o| o.side), |s| s as u8);
+    let own_level = zone.skill_value(stats::LEVEL).or_else(|| zone.own().map(|o| o.level)).unwrap_or(0);
+    let range = zone.skill_value(0x113).unwrap_or(ao_net::n3::nametag::INVALID_STAT);
+    let [r, g, b, _] = ao_net::n3::nametag::con_color(ao_net::n3::nametag::consider_ratio(level, own_level, range));
     Some(TargetInfo {
         id,
         name: clean(&d.name),
         level,
         health: if max > 0 { (health as f32 / max as f32).clamp(0.0, 1.0) } else { 0.0 },
+        color: u32::from_be_bytes([0, r, g, b]),
+        max_health: max,
         hostile: d.npc && !is_self && side != own_side,
         is_self,
     })
@@ -199,6 +207,27 @@ struct Bar {
     hostile: bool,
     width: f32,
     shown: Option<TargetInfo>,
+    rows: [Option<(TargetInfo, &'static str, bool)>; 2],
+}
+
+/// `FUN_1007313a`: stat 1 feeds sqrt(2 * sqrt(MaxHealth)); 64 is `_DAT_101b5ebc`,
+/// 0.01 is the double `_DAT_101b5c60`. The screen-derived width is an upper bound, not the displayed width.
+fn health_bar_width(max_width: f32, max_health: i32) -> f32 {
+    let scale = ((max_health as u32 as f64).sqrt() * 2.0).sqrt() * 0.01;
+    (64.0 + (max_width - 64.0) * scale as f32).floor().clamp(64.0, max_width)
+}
+
+/// `FUN_10073d0f`: selection is a nano target for characters; fight always lives on the hostile control.
+fn control_targets(selection: Option<&TargetInfo>, fight: Option<&TargetInfo>, hostile: bool) -> [Option<(i32, &'static str, bool)>; 2] {
+    if !hostile {
+        return [selection.filter(|s| !s.hostile && fight.is_none_or(|f| f.id != s.id)).map(|s| (s.id, "Nano Target", false)), None];
+    }
+    let nano = selection.filter(|s| s.hostile);
+    match (nano, fight) {
+        (Some(s), Some(f)) if s.id == f.id => [Some((f.id, "Nano / Fighting<br>Target", true)), None],
+        (s, Some(f)) => [Some((f.id, "Fighting Target", true)), s.map(|s| (s.id, "Nano Target", false))],
+        (s, None) => [s.map(|s| (s.id, "Nano Target", false)), None],
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -261,18 +290,29 @@ impl HudTarget {
     pub(super) fn new(gui: &mut Gui, cc: WindowId, size: (u32, u32)) -> anyhow::Result<Self> {
         let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (-1.0, -1.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None };
         t.create_bars(gui)?;
+        // `TargetHeader_c` 0x10073884 measures all four captions before clearing the initial text.
+        let cap = ["Selection", "Nano Target", "Fighting Target", "Nano / Fighting", "Target"]
+            .into_iter().map(|caption| gui.text_width(ao_gui::FontId::Bold, caption)).max().unwrap_or(0);
         for (dock, d) in [("LeftTargetCtrlDock", &t.docks[0]), ("RightTargetCtrlDock", &t.docks[1])] {
+            let prefix = if d.hostile { "ht" } else { "ft" };
+            let mut headers = String::new();
+            for row in 0..2 {
+                headers.push_str(&format!("<BorderView name=\"{prefix}_header{row}\" min_size=\"Point({cap},0)\" view_flags=\"0x100\" view_layout=\"vertical\" tl_gfx=\"GFX_GUI_CC_TARGET_FRAME_TL\" tr_gfx=\"GFX_GUI_CC_TARGET_FRAME_TR\" bl_gfx=\"GFX_GUI_CC_TARGET_FRAME_BL\" br_gfx=\"GFX_GUI_CC_TARGET_FRAME_BR\" left_gfx=\"\" top_gfx=\"\" right_gfx=\"\" bottom_gfx=\"\" color=\"DEFAULT\" layout_borders=\"Rect(0,0,0,10)\"><TextView name=\"{prefix}_title{row}\" font=\"BOLD\" value=\"\"/><TextView name=\"{prefix}_name{row}\" font=\"NORMAL\" value=\"\"/></BorderView>"));
+            }
             let src = format!(
-                "<root><View view_layout=\"horizontal\">\
+                "<root><View view_layout=\"vertical\">{headers}<View view_layout=\"horizontal\">\
                  <CanvasView name=\"{p}\" min_size=\"Point(7,40)\" max_size=\"Point(7,40)\" layout_borders=\"Rect(0,0,5,0)\"/>\
                  <CanvasView name=\"{b}\" min_size=\"Point(47,47)\" max_size=\"Point(47,47)\"/>\
                  <CanvasView name=\"{n}\" min_size=\"Point(7,40)\" max_size=\"Point(7,40)\" layout_borders=\"Rect(5,0,0,0)\"/>\
-                 </View></root>",
+                 </View></View></root>",
                 p = d.view(Part::Prev),
                 b = d.view(Part::Button),
                 n = d.view(Part::Next)
             );
             gui.add_view_xml(cc, dock, dock, &src)?;
+            for row in 0..2 {
+                gui.set_visible(cc, &format!("{prefix}_header{row}"), false);
+            }
         }
         Ok(t)
     }
@@ -283,9 +323,6 @@ impl HudTarget {
 
     fn create_bars(&mut self, gui: &mut Gui) -> anyhow::Result<()> {
         let w = Self::bar_width(self.size);
-        // `TargetHeader_c` (`FUN_10073884`): corner-only `BorderView` (GFX_GUI_CC_TARGET_FRAME_TL/TR/BL/BR = 0x88,0x89,0x86,0x87),
-        // colour DEFAULT, a bold title and the name below. Its width is the widest of the four captions.
-        let cap = ["Selection", "Nano Target", "Fighting Target", "Nano / Fighting"].iter().map(|c| gui.text_width(ao_gui::FontId::Bold, c)).max().unwrap_or(0);
         for hostile in [false, true] {
             // `TargetTargetButton_c` (`FUN_10075342`), first child of the hostile window: a corner `BorderView` (the header's frame
             // gfx, colour 0x7fffff) with the caption "Fighting Target:" and the target's target name, borders 3 px, 5 px below.
@@ -299,16 +336,10 @@ impl HudTarget {
                 ""
             };
             let src = format!(
-                "<root><View view_layout=\"vertical\">{tot}\
-                 <CanvasView name=\"bar\" min_size=\"Point({bw},10)\" max_size=\"Point({bw},10)\"/>\
-                 <BorderView name=\"header\" view_layout=\"vertical\" min_size=\"Point({hw},0)\" tl_gfx=\"GFX_GUI_CC_TARGET_FRAME_TL\" tr_gfx=\"GFX_GUI_CC_TARGET_FRAME_TR\" \
-                 bl_gfx=\"GFX_GUI_CC_TARGET_FRAME_BL\" br_gfx=\"GFX_GUI_CC_TARGET_FRAME_BR\" left_gfx=\"\" top_gfx=\"\" right_gfx=\"\" bottom_gfx=\"\" color=\"DEFAULT\" layout_borders=\"Rect(0,0,0,10)\">\
-                 <TextView name=\"title\" font=\"BOLD\" value=\"{title}\" layout_borders=\"Rect(8,5,8,0)\"/>\
-                 <TextView name=\"name\" font=\"NORMAL\" value=\"\" layout_borders=\"Rect(8,0,8,4)\"/>\
-                 </BorderView></View></root>",
-                bw = w as i32 - 1,
-                hw = cap + 16,
-                title = esc("<center>Selection</center>")
+                "<root><View view_layout=\"vertical\">\
+                 <View name=\"row0\" view_flags=\"0x100\" view_layout=\"vertical\"><CanvasView name=\"bar\" min_size=\"Point(63,10)\" max_size=\"Point(63,10)\"/><TextView name=\"name\" font=\"NORMAL\" value=\"\" layout_borders=\"Rect(0,0,0,10)\"/></View>\
+                 {tot}<View name=\"row1\" view_flags=\"0x100\" view_layout=\"vertical\"><CanvasView name=\"bar1\" min_size=\"Point(63,10)\" max_size=\"Point(63,10)\"/><TextView name=\"name1\" font=\"NORMAL\" value=\"\" layout_borders=\"Rect(0,0,0,10)\"/></View>\
+                 </View></root>"
             );
             let name = if hostile { "CCHostileHealthBar" } else { "CCFriendlyHealthBar" };
             let window = gui.open_window_xml(name, &src, (0, 5), WindowSize::Preferred)?;
@@ -316,7 +347,7 @@ impl HudTarget {
                 gui.set_visible(window, "tot", false);
             }
             gui.set_window_visible(window, false);
-            self.bars.push(Bar { window, hostile, width: w, shown: None });
+            self.bars.push(Bar { window, hostile, width: w, shown: None, rows: [None, None] });
         }
         self.place(gui);
         Ok(())
@@ -345,6 +376,7 @@ impl HudTarget {
             let w = Self::bar_width(size);
             for b in &mut self.bars {
                 b.width = w;
+                b.rows = [None, None];
             }
             self.place(gui);
         }
@@ -445,7 +477,8 @@ impl HudTarget {
     /// Click handler of `TargetTargetButton_c` (`LAB_10073554`): when `N3Msg_CanClickTargetTarget(target, targetsTarget)` the
     /// target's target is selected (`Send(0x1e, 0x126)`).
     fn tot_click(&mut self, zone: &mut Zone) {
-        if let (Some(cur), Some(tot)) = (zone.target, self.tot) {
+        let current = self.bars.iter().find(|b| b.hostile).and_then(|b| b.shown.as_ref()).map(|i| i.id);
+        if let (Some(cur), Some(tot)) = (current, self.tot) {
             if can_click_target_target(zone, cur, tot) {
                 self.select(zone, Some(tot));
             }
@@ -512,11 +545,19 @@ impl HudTarget {
             return;
         }
         let ray = pick_ray(&host.camera, &host.lens.unwrap_or_default(), (vp.0 as f32, vp.1 as f32), (x, y));
-        let mouse = object_under(&pick_all(&ray, zone), zone.target).and_then(|id| {
-            let d = zone.dynels.get(&id)?;
-            let (flags, features) = zone.world.pointer_stats(id)?;
+        let hits = super::interact_use::pick_objects(&ray, zone);
+        let target = zone.target.map(|instance| ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance });
+        let mouse = target.filter(|id| hits.contains(id)).or_else(|| hits.first().copied()).and_then(|id| {
+            if id.kind != ao_net::n3::outgoing::DYNEL_CHAR {
+                let can = super::interact::Interact::can_of(zone, id)?;
+                return Some(super::hud_cursor::choose_object(can, host.mods.shift, dblclick));
+            }
+            let d = zone.dynels.get(&id.instance)?;
+            let (flags, features) = zone.world.pointer_stats(id.instance)?;
+            let flags = zone.stat_of(id.instance, 0).unwrap_or(flags);
+            let features = zone.stat_of(id.instance, 0xe0).or(features);
             let own_side = zone.own().map_or(0, |o| o.side as i32);
-            let hover = super::hud_cursor::Hover { npc: d.npc, flags, features, side: d.side as i32, own_side, team: None, own_team: zone.stat(6).unwrap_or(0), vulnerable: false };
+            let hover = super::hud_cursor::Hover { npc: d.npc, flags, features, side: d.side as i32, own_side, team: zone.stat_of(id.instance, 6), own_team: zone.stat(6).unwrap_or(0), vulnerable: false };
             Some(super::hud_cursor::choose(&hover, host.mods.shift, host.mods.ctrl || host.mods.alt, dblclick))
         });
         super::hud_cursor::draw(|g| gui.gfx().size(g), mode, (x, y), mouse.unwrap_or_default(), list);
@@ -529,26 +570,48 @@ impl HudTarget {
             zone.target = None;
         }
         let sel = zone.target.and_then(|t| info(zone, t));
+        let fight = zone.fight_target.get(&(zone.char_id as i32)).and_then(|t| info(zone, *t));
+        let mut layout_changed = false;
         for b in &mut self.bars {
-            let mine = sel.clone().filter(|i| i.hostile == b.hostile && self.bars_enabled[usize::from(b.hostile)]);
-            if mine != b.shown {
-                gui.set_window_visible(b.window, mine.is_some());
-                if let Some(i) = &mine {
-                    gui.set_text(b.window, "name", &format!("<center><font color=0xffffff>{}</font></center>", i.name));
-                    gui.relayout_window(b.window);
+            let targets = control_targets(sel.as_ref(), fight.as_ref(), b.hostile)
+                .map(|t| t.and_then(|(id, caption, attacking)| info(zone, id).map(|i| (i, caption, attacking))));
+            let prefix = if b.hostile { "ht" } else { "ft" };
+            let enabled = self.bars_enabled[usize::from(b.hostile)];
+            b.shown = targets[0].as_ref().map(|(i, _, _)| i.clone()).filter(|_| enabled);
+            gui.set_window_visible(b.window, enabled && targets.iter().any(Option::is_some));
+            if targets == b.rows {
+                continue;
+            }
+            layout_changed = true;
+            for (row, target) in targets.iter().enumerate() {
+                let dock_row = if b.hostile && targets[1].is_some() { 1 - row } else { row };
+                gui.set_visible(self.cc, &format!("{prefix}_header{dock_row}"), target.is_some());
+                gui.set_visible(b.window, &format!("row{row}"), target.is_some());
+                let (bar, name) = if row == 0 { ("bar", "name") } else { ("bar1", "name1") };
+                let mut items = Vec::new();
+                if let Some((i, caption, attacking)) = target {
+                    let color = if *attacking { 0xff4444 } else { 0xffffff };
+                    let text = format!("<center><font color=0x{color:06x}>{}</font></center>", esc(&i.name));
+                    gui.set_text(b.window, name, &text);
+                    gui.set_text(self.cc, &format!("{prefix}_name{dock_row}"), &text);
+                    gui.set_text(self.cc, &format!("{prefix}_title{dock_row}"), &format!("<center>{caption}</center>"));
+                    let width = health_bar_width(b.width, i.max_health) + 18.0;
+                    gui.set_view_pref_size(b.window, bar, (width - 1.0, 10.0), (width - 1.0, 10.0));
+                    bar_items(width as i32, i.health, i.color, &mut items);
                 }
-                b.shown = mine;
+                gui.set_canvas(b.window, bar, items);
             }
-            let mut items = vec![];
-            if let Some(i) = &b.shown {
-                bar_items(b.width as i32, i.health, &mut items);
-            }
-            gui.set_canvas(b.window, "bar", items);
+            gui.relayout_window(b.window);
+            b.rows = targets;
         }
+        if layout_changed {
+            gui.relayout_window(self.cc);
+        }
+        self.place(gui);
         // `FUN_10073b9e`: the target-of-target button of the shown hostile window (pref `Targetstarget`, `N3Msg_GetTargetTarget`)
         let tot = self
             .targets_target
-            .then(|| zone.target.and_then(|t| zone.fight_target.get(&t).copied()))
+            .then(|| self.bars.iter().find(|b| b.hostile).and_then(|b| b.shown.as_ref()).and_then(|t| zone.fight_target.get(&t.id).copied()))
             .flatten()
             .filter(|t| zone.dynels.contains_key(t))
             .filter(|_| self.bars.iter().any(|b| b.hostile && b.shown.is_some()));
@@ -591,9 +654,10 @@ impl HudTarget {
 
 /// `TargetHealthBar_c` surfaces (`FUN_10073598`, `FUN_10072ead`): caps at both ends tinted DEFAULT, the background between them
 /// (DEFAULT) and the slider over the background up to `ratio` of its width; the slider texture (16 px) repeats along the bar (its
-/// source frame is the destination size). Red caps (`0xff2222`, `FUN_10072e49` when `+0x161`/`+0x162` is set) are UNRESOLVED:
-/// the writers of those flags were not identified.
-fn bar_items(width: i32, ratio: f32, out: &mut Vec<ao_gui::view::CanvasItem>) {
+/// source frame is the destination size). Red caps require attacking `+0x161` and in-attack-range `+0x162`,
+/// delivered by `FUN_1007353f` from `GlobalSignals+0x64` (GC 0x10068969 / 0x100679c1).
+/// The port lacks the slot's effective attack range and both retail collision radii; caps retain DEFAULT rather than guessing.
+fn bar_items(width: i32, ratio: f32, color: u32, out: &mut Vec<ao_gui::view::CanvasItem>) {
     use ao_gui::view::CanvasItem::ImageTint;
     use ao_gui::GfxId;
     let (cap_w, h) = (9.0, 11.0);
@@ -601,13 +665,13 @@ fn bar_items(width: i32, ratio: f32, out: &mut Vec<ao_gui::view::CanvasItem>) {
     let default = 0x1000000;
     out.push(ImageTint { id: GfxId(HB_LEFT), src: [0.0, 0.0, cap_w, h], dst: [0.0, 0.0, cap_w, h], color: default, alpha: 1.0 });
     out.push(ImageTint { id: GfxId(HB_RIGHT), src: [0.0, 0.0, cap_w, h], dst: [w - cap_w, 0.0, w, h], color: default, alpha: 1.0 });
-    let (l, r) = (cap_w, w - cap_w);
-    out.push(ImageTint { id: GfxId(HB_BACKGROUND), src: [0.0, 0.0, 16.0, h], dst: [l, 0.0, r, h], color: default, alpha: 1.0 });
-    let fill = ((r - l) * ratio).floor();
+    let (l, r) = (cap_w + 1.0, w - cap_w - 1.0);
+    out.push(ImageTint { id: GfxId(HB_BACKGROUND), src: [0.0, 0.0, r - l, h], dst: [l, 0.0, r, h], color: default, alpha: 1.0 });
+    let fill = (r - l) * ratio;
     let mut x = 0.0;
     while x < fill {
         let tw = (fill - x).min(16.0);
-        out.push(ao_gui::view::CanvasItem::Image { id: GfxId(HB_SLIDER), src: [0.0, 0.0, tw, h], dst: [l + x, 0.0, l + x + tw, h], alpha: 1.0 });
+        out.push(ImageTint { id: GfxId(HB_SLIDER), src: [0.0, 0.0, tw, h], dst: [l + x, 0.0, l + x + tw, h], color, alpha: 1.0 });
         x += 16.0;
     }
 }
@@ -635,6 +699,31 @@ pub(super) fn gui_key_id(key: ao_gui::Key) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_health_width_tint_and_control_routing() {
+        let mut z = Zone::new(1);
+        z.stats.insert(stats::LEVEL, 5);
+        z.stats.insert(0x113, 5);
+        z.stats.insert(stats::SIDE, 1);
+        z.dynels.insert(2, dyn_at("Selected", [0.0; 3], true, 0));
+        z.dynels.insert(3, dyn_at("Fighter", [0.0; 3], true, 0));
+        let selected = info(&z, 2).unwrap();
+        let fight = info(&z, 3).unwrap();
+        assert_eq!(selected.color, 0xfff000);
+        assert_eq!(control_targets(Some(&selected), None, true), [Some((2, "Nano Target", false)), None]);
+        assert_eq!(control_targets(Some(&selected), Some(&selected), true), [Some((2, "Nano / Fighting<br>Target", true)), None]);
+        assert_eq!(control_targets(Some(&selected), Some(&fight), true), [Some((3, "Fighting Target", true)), Some((2, "Nano Target", false))]);
+        assert_eq!(control_targets(Some(&selected), Some(&fight), false), [None, None]);
+        assert_eq!(health_bar_width(494.0, 0), 64.0);
+        assert_eq!(health_bar_width(494.0, 10_000), 124.0);
+        assert_eq!(health_bar_width(494.0, 100_000_000), 494.0);
+        let mut items = Vec::new();
+        bar_items(100, selected.health, selected.color, &mut items);
+        assert!(items.iter().any(|i| matches!(i, ao_gui::view::CanvasItem::ImageTint { id, color: 0xfff000, .. } if id.0 == HB_SLIDER)));
+        z.dynels.get_mut(&2).unwrap().health = 0;
+        assert_eq!(info(&z, 2).unwrap().health, 0.0, "presentation consumes the central health projection");
+    }
     use ao_gui::{Gui, InputEvent, WindowSize};
 
     fn dyn_at(name: &str, p: [f32; 3], npc: bool, side: u8) -> DynelState {
@@ -847,10 +936,17 @@ mod tests {
         let (fr, ho) = (&fe.ht.bars[0], &fe.ht.bars[1]);
         assert!(fr.shown.is_none() && ho.shown.as_ref().is_some_and(|i| i.name == "Surf Lizard"));
         assert!(!fe.gui.window_visible(fr.window) && fe.gui.window_visible(ho.window));
+        assert!(fe.gui.view_rect(ho.window, "header").is_none(), "top control has no dock header box");
+        let bar = fe.gui.view_rect(ho.window, "bar").unwrap();
+        let name = fe.gui.view_rect(ho.window, "name").unwrap();
+        assert!(name.t > bar.b, "name is directly below the health bar");
+        assert!(bar.width() < 150.0, "small-health targets use the derived active width, not the screen maximum");
+        assert!(fe.gui.view_rect(fe.ht.cc, "ht_header0").is_some(), "caption/frame belongs above the dock");
         let (w, _) = fe.gui.window_size(ho.window);
         let sw = size.0 as f32;
         assert_eq!(fe.gui.window_pos(ho.window), ((((sw - 192.0) * 0.5 * 1.5) - w as f32 * 0.5).floor() as i32, 5));
-        assert_eq!(fe.gui.window_pos(fr.window).0, (((sw - 192.0) * 0.5 * 0.5) - w as f32 * 0.5).floor() as i32);
+        let (friendly_width, _) = fe.gui.window_size(fr.window);
+        assert_eq!(fe.gui.window_pos(fr.window).0, (((sw - 192.0) * 0.5 * 0.5) - friendly_width as f32 * 0.5).floor() as i32);
         // the dynel leaves: the target and the window go
         fe.zone.dynels.remove(&2);
         fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);

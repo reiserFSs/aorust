@@ -72,6 +72,11 @@ impl Play {
                 }
                 GameAction::Camp => self.camp(),
                 GameAction::SelectSelf => self.zone.target = Some(self.zone.char_id as i32),
+                GameAction::BankClose => {
+                    if let Some(interact) = self.interact.as_mut() {
+                        interact.bank_close(&mut self.gui);
+                    }
+                }
                 GameAction::Assist => match self.fight.as_ref().map(|m| m.assist(&self.zone)) {
                     Some(Ok(t)) => self.zone.target = Some(t),
                     Some(Err(key)) if !key.is_empty() => {
@@ -100,14 +105,10 @@ impl Play {
         let Some(m) = self.fight.as_mut() else { return };
         m.update(dt, &self.zone, self.audio.as_ref());
         let own = self.zone.char_id as i32;
-        // `AttackInfo` / `StatIIR` / death change the own `Health` (27) stat in place (docs/zone/combat-log.md §3): the interface reads that one store
+        // Every health consumer (target, team, nametag and NPC info) reads the zone stores.
         let events = m.take_events();
         for e in &events {
-            if let CombatEvent::Health { dynel, health, .. } = e {
-                if *dynel == own {
-                    self.zone.stats.insert(ao_formats::stats::HEALTH, *health);
-                }
-            }
+            sync_stats(&mut self.zone, e);
         }
         if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
             for e in &events {
@@ -373,5 +374,106 @@ fn stance(world: &mut Dynels, mut player: Option<&mut Player>, own: i32, events:
         if fighting(who) {
             fight_idle(world, &mut player, own, who, true, true);
         }
+    }
+}
+
+fn sync_stats(zone: &mut crate::play::zone::Zone, event: &CombatEvent) {
+    if let CombatEvent::StatChanged { dynel, stat, value } = event {
+        zone.character_stats.entry(*dynel).or_default().insert(*stat, *value);
+        if *dynel == zone.char_id as i32 {
+            zone.stats.insert(*stat, *value);
+        }
+        if *stat == ao_formats::stats::LEVEL {
+            if let Some(d) = zone.dynels.get_mut(dynel) {
+                d.level = *value;
+            }
+        }
+        return;
+    }
+    let CombatEvent::Health { dynel, health, max_health, .. } = event else { return };
+    let stats = zone.character_stats.entry(*dynel).or_default();
+    stats.insert(ao_formats::stats::HEALTH, *health);
+    if *dynel == zone.char_id as i32 {
+        // Own Life is computed by the pool layer, not the FullCharacter wire value.
+        zone.stats.insert(ao_formats::stats::HEALTH, *health);
+    } else {
+        stats.insert(ao_formats::stats::pools::LIFE, *max_health);
+    }
+    if let Some(d) = zone.dynels.get_mut(dynel) {
+        d.health = *health;
+        if *dynel != zone.char_id as i32 {
+            d.max_health = *max_health;
+        }
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use crate::play::combat::state::{Combat, CHAR_KIND};
+    use crate::play::combat::log::fake::Fixed;
+
+    #[test]
+    fn npc_hit_and_authoritative_health_reach_all_zone_views() {
+        let mut combat = Combat::new(Box::new(Fixed::new()));
+        let mut zone = crate::play::zone::Zone::default();
+        zone.char_id = 1;
+        combat.add_test_char(1, "Player", false, 100);
+        combat.add_test_char(2, "NPC", true, 50);
+        zone.dynels.insert(2, crate::play::zone::DynelState {
+            name: "NPC".into(), pos: [0.0; 3], yaw: None, npc: true,
+            side: 0, level: 1, health: 50, max_health: 50,
+        });
+        // Compact N3 packets using the retail Attack, AttackInfo and HealthDamage layouts.
+        let packet = |kind: u32, id: i32, words: &[i32]| {
+            let mut payload = kind.to_be_bytes().to_vec();
+            payload.extend_from_slice(&CHAR_KIND.to_be_bytes());
+            payload.extend_from_slice(&id.to_be_bytes());
+            payload.push(0);
+            for word in words { payload.extend_from_slice(&word.to_be_bytes()); }
+            ao_net::frame::Frame { seq: 1, ptype: ao_net::frame::PT_N3, sender: 1, receiver: 1, payload }
+        };
+        let apply = |combat: &mut Combat, zone: &mut crate::play::zone::Zone, frame| {
+            let events = combat.on_frame(&frame, 1);
+            for event in &events { sync_stats(zone, event); }
+            events
+        };
+        let ch = |instance| ao_net::msg::Identity { kind: CHAR_KIND, instance };
+        let frame = |body: ao_net::n3::misc::Misc| ao_net::frame::Frame {
+            seq: 1, ptype: ao_net::frame::PT_N3, sender: 1, receiver: 1,
+            payload: body.encode(ch(1), 0),
+        };
+        apply(&mut combat, &mut zone, frame(ao_net::n3::misc::Misc::Attack(ao_net::n3::misc::Attack { target: ch(2), flag: 0 })));
+        let hit = apply(&mut combat, &mut zone, frame(ao_net::n3::misc::Misc::AttackInfo(ao_net::n3::misc::AttackInfo {
+            damage: 10, value_20: -1, slot: 0, other: ch(2), unk_2c: 0, unk_30: 3, unk_34: 0,
+        })));
+        assert!(hit.iter().any(|e| matches!(e, CombatEvent::Hit { victim: 2, .. })));
+        assert_eq!(zone.dynels[&2].health, 40);
+        assert_eq!(zone.stat_of(2, ao_formats::stats::HEALTH), Some(40));
+        let update = apply(&mut combat, &mut zone, packet(0x3710_256C, 2, &[37, -3, 95, 0, CHAR_KIND, 1, 0]));
+        assert_eq!(combat.char(2).unwrap().health(), 37);
+        assert_eq!(zone.dynels[&2].health, 37);
+        assert_eq!(zone.stat_of(2, ao_formats::stats::HEALTH), Some(37));
+        assert!(matches!(update.as_slice(), [CombatEvent::Health { health: 37, delta: -3, .. }]));
+        // A repeated authoritative value must not subtract its feedback delta a second time.
+        apply(&mut combat, &mut zone, packet(0x3710_256C, 2, &[37, -3, 95, 0, CHAR_KIND, 1, 0]));
+        assert_eq!(zone.dynels[&2].health, 37);
+        apply(&mut combat, &mut zone, packet(0x3710_256C, 1, &[91, -9, 95, 0, CHAR_KIND, 2, 0]));
+        assert_eq!(zone.stats[&ao_formats::stats::HEALTH], 91);
+        assert_eq!(zone.character_stats[&1][&ao_formats::stats::HEALTH], 91);
+        apply(&mut combat, &mut zone, packet(0x7F40_5A16, 2, &[12, 100, 200, 150, 300, 2, 8, 50]));
+        assert_eq!(zone.dynels[&2].level, 12);
+        assert_eq!(zone.stat_of(2, 0x113), Some(8));
+        assert_eq!(combat.char(2).unwrap().stat(0x113), 8);
+        assert_eq!(zone.stat_of(2, 0x25), None); // TitleLevel is own-char gated.
+        apply(&mut combat, &mut zone, packet(0x7F40_5A16, 1, &[13, 101, 201, 151, 301, 2, 9, 51]));
+        assert_eq!(zone.stat_of(1, 0x36), Some(13));
+        assert_eq!(zone.stat_of(1, 0x113), Some(9));
+        assert_eq!(zone.stat_of(1, 0x25), Some(2));
+        // HealthDamage sets the absolute value before calling the death routine.
+        let death = apply(&mut combat, &mut zone, packet(0x3710_256C, 2, &[5, -32, 95, 4, CHAR_KIND, 1, 0]));
+        assert!(matches!(death.first(), Some(CombatEvent::Health { health: 5, .. })));
+        assert_eq!(zone.dynels[&2].health, 0);
+        assert!(death.iter().any(|e| matches!(e, CombatEvent::Died { dynel: 2, cause: 4 })));
     }
 }

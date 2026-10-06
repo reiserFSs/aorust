@@ -37,7 +37,9 @@ impl ActorAssets {
         if let Some(a) = self.anims.get(&id) {
             return Ok(a.clone());
         }
-        let a = Arc::new(load_anim(store, id)?);
+        let mut a = load_anim(store, id)?;
+        a.source_id = id;
+        let a = Arc::new(a);
         self.anims.insert(id, a.clone());
         Ok(a)
     }
@@ -50,10 +52,10 @@ impl ActorAssets {
     }
 }
 
-/// Part textures of an NPC on `cat`: the wire `textures[]` list replaces the part textures (`SetCATTextures`, [`texture_overrides`]),
-/// worn `cloth[]` `(part, rdb 1010004 texture)` is composited over the part's texture with the green key cut out (the client's
-/// cloth-over-skin rule, [`overlay_on_skin`]; the consumer of the cloth table of morphed NPCs was not found, docs/zone/npc.md §6).
-pub fn npc_part_textures(store: &RecordStore, cat: &CatMesh, list: &[TextureOverride], cloth: &[(ClothPart, u32)]) -> PartTextures {
+/// NPC layer 0 skin is selected by the record's HeadMesh (`FUN_100c2c15`).
+/// Wire `textures[]` replaces layer 1, cloth replaces layer 2; either body overlay
+/// keys against naked skin, never against an already-composited default outfit.
+pub fn npc_part_textures(store: &RecordStore, names: &NameTable, cat: &CatMesh, skin_head: Option<u32>, list: &[TextureOverride], cloth: &[(ClothPart, u32)]) -> PartTextures {
     let load = |id: u32| {
         let key = TextureKey { rdb_type: TEXTURE_TYPE, id };
         load_texture(store, key).ok().flatten().map(|t| (key, t))
@@ -63,6 +65,22 @@ pub fn npc_part_textures(store: &RecordStore, cat: &CatMesh, list: &[TextureOver
         if let Some(t) = (o.texture != 0).then(|| load(o.texture)).flatten() {
             out.insert(cat.parts[i].name.clone(), t);
         }
+    }
+    if let Some((breed, gender, skin)) = skin_head.and_then(|head| super::player::head_skin(names, head)) {
+        for part in ClothPart::ALL {
+            let Some(p) = cat.parts.iter().find(|p| p.name == part.name()) else { continue };
+            let Some(id) = names.id(1010011, &skin_texture_name(breed, gender, skin, part)) else { continue };
+            let key = TextureKey { rdb_type: 1010011, id };
+            let Some(base) = load_texture(store, key).ok().flatten() else { continue };
+            let over = cloth.iter().rev().find(|c| c.0 == part).and_then(|c| load(c.1))
+                .or_else(|| out.remove(&p.name)).or_else(|| load(p.texture));
+            let entry = match over {
+                Some((k, tex)) => (TextureKey { rdb_type: 0x4000_0000 | id, id: k.id }, overlay_on_skin(&base, &tex)),
+                None => (key, base),
+            };
+            out.insert(p.name.clone(), entry);
+        }
+        return out;
     }
     for &(part, id) in cloth {
         let Some(p) = cat.parts.iter().find(|p| p.name == part.name()) else { continue };
@@ -99,14 +117,14 @@ pub struct PlayerLook {
     pub equipment: Equipment,
 }
 
-/// The attractor meshes `(place, rdb 1010001 mesh)` a character carries after the client applied its full update
-/// (`FUN_10077e13` [GC 0x10077e13], only when message flag bit 2 `SET_DYNEL_800` is clear):
-/// `CharacterMesh::AddAttractorMesh(0, HeadMesh)`, then **`CharacterMesh::ClearAttractors`** [DS 0x10071dd0] (deletes every node of
-/// the attractor list, the head just added included), then `CharacterMesh::AddAttractors(wire list)` (per entry
-/// `AddAttractorMesh` [DS 0x10071cce]). So the wire `HeadMesh` stat never reaches the model by itself: the head is the place-0
-/// entry of the wire list (the later runtime head change `FUN_10059376` removes/adds place 0 the same way). The list is ordered
-/// by place; a new entry is inserted before the first node whose place is `>=` its own (equal places: the later one first).
-/// `head` is `HeadMesh` (non-zero only), `wire` the message's attractor list.
+/// Ordered attractor bookkeeping after `CharacterMesh::ClearAttractors` [DS 0x10071dd0]
+/// and `AddAttractors` (new equal-place entries precede old ones).
+/// This is not the complete rendered set of a full update: unlike
+/// `VisualCATMesh_t::ClearAttractors` [DS 0x10073d8a], the base clear does not call
+/// `RCATMesh_t::RemoveAttractorChild` through `FUN_10072873`. A separately mounted
+/// `HeadMesh` can therefore survive when the wire list omits place 0.
+/// Full-update callers must retain that head before using this ordering helper;
+/// appearance-update callers pass exactly their replacement wire list.
 pub fn attractor_list(head: Option<u32>, wire: &[(u8, u32)]) -> Vec<(u8, u32)> {
     let mut list: Vec<(u8, u32)> = vec![];
     let add = |list: &mut Vec<(u8, u32)>, e: (u8, u32)| {
@@ -155,7 +173,7 @@ impl ActorRig {
         let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model_id)?;
         // creature models have no head attractor: a head mesh is then not mounted (and the body keeps its own head part)
         let head = head.filter(|_| cat.attractors.iter().any(|a| a.name.ends_with("_head")));
-        let bind = bind_frames(&cat);
+        let mut bind = bind_frames(&cat);
         let skin = skin_bind(&cat, &bind);
         let (mut model, ..) = assemble(store, &cat, &skin, overrides, layers, head.is_some());
         let used = (0..cat.submeshes.len()).filter(|&i| !(head.is_some() && cat.parts[cat.submeshes[i].material as usize].name == "head")).collect();
@@ -173,6 +191,18 @@ impl ActorRig {
             let Some(att) = cat.attractors.iter().position(|a| a.name.starts_with(&prefix)) else { continue };
             if let Some(mesh) = crate::mesh::decode_mesh_into(store, id, &mut model)? {
                 mounts.push(Mount { attractor: att, mesh });
+            }
+        }
+        // Unweighted attractor bones still have local transforms. Using their
+        // nearest weighted ancestor directly buries Atrox heads in the torso.
+        // Match character::build, resolving the rest clip once, never per pose.
+        if mounts.iter().any(|m| bind[cat.attractors[m.attractor].bone as usize].is_none()) {
+            let rest = best_rest_clip(store, &cat, &bind)?;
+            for mount in &mounts {
+                let bone = cat.attractors[mount.attractor].bone as usize;
+                if bind[bone].is_none() {
+                    bind[bone] = Some(derived_bind_frame(&cat, &bind, &rest, bone));
+                }
             }
         }
         model.instances.clear();
@@ -211,7 +241,7 @@ impl ActorRig {
         let att = self.cat.attractors.iter().find(|a| a.name.ends_with("_head"))?;
         let b = att.bone as usize;
         let bone = match clip.filter(|(a, _)| a.signature == self.cat.signature) {
-            Some((a, ms)) => self.world(Some((a, if a.duration > 0.0 { ms.rem_euclid(a.duration) } else { 0.0 })))[b],
+            Some((a, ms)) => self.world(Some((a, ms)))[b],
             None => self.bind[b].or_else(|| self.nearest_frame(&self.bind, b))?,
         };
         Some(bone.mul(&Xf::from_qt(att.rot, att.pos)).t)
@@ -235,9 +265,9 @@ impl ActorRig {
     }
 
     /// Body vertices (same layout as `model().meshes[0]`) and the per-mesh mount transforms (column-major, relative to the actor)
-    /// for `clip` at `ms` milliseconds (looped); `None` = bind pose. `parts[0]` is identity.
+    /// for `clip` at `ms` milliseconds (caller controls looping); `None` = bind pose. `parts[0]` is identity.
     pub fn pose(&self, clip: Option<(&CatAnim, f32)>) -> (Vec<Vertex>, Vec<[[f32; 4]; 4]>) {
-        let clip = clip.filter(|(a, _)| a.signature == self.cat.signature).map(|(a, ms)| (a, if a.duration > 0.0 { ms.rem_euclid(a.duration) } else { 0.0 }));
+        let clip = clip.filter(|(a, _)| a.signature == self.cat.signature);
         let mut verts = self.model.meshes[0].vertices.clone();
         let frames: Vec<Option<Xf>> = match clip {
             Some(_) => self.world(clip).into_iter().map(Some).collect(),
@@ -303,6 +333,22 @@ mod tests {
         RecordStore::open(&dir).ok()
     }
 
+    #[test]
+    fn atrox_unweighted_head_mount_matches_character_loader() {
+        let Some(store) = store() else { return };
+        let assets = ActorAssets::new(&store).unwrap();
+        for head in [40103, 223940] {
+            let look = PlayerLook { breed: Breed::Atrox, gender: Gender::Male, skin: Skin::Caucasian, build: 1, head: Some(head), equipment: Equipment::default() };
+            let rig = ActorRig::player(&store, &assets, &look, &[]).unwrap();
+            let reference = load_character_with_head(&store, rig.model_id, head, None).unwrap();
+            let (_, mounts) = rig.pose(None);
+            let expected = reference.instances.iter().find(|i| i.mesh == 1).expect("reference head").transform;
+            for (actual, expected) in mounts[1].iter().flatten().zip(expected.iter().flatten()) {
+                assert!((actual - expected).abs() < 1e-5, "head {head}: {actual} != {expected}");
+            }
+        }
+    }
+
     /// A solitus female with head and a weapon on the right hand: the body has the model's vertices, the head and the weapon
     /// follow their attractor, a run clip moves the body and the head mount.
     #[test]
@@ -316,6 +362,11 @@ mod tests {
         let (bind, bind_parts) = rig.pose(None);
         let (v0, p0) = rig.pose(Some((&run, 0.0)));
         let (v1, p1) = rig.pose(Some((&run, run.duration / 2.0)));
+        let death = assets.role(&store, rig.model_id, &Role::Clip("die-knees".into())).unwrap().expect("death clip");
+        let end = rig.pose(Some((&death, death.duration)));
+        assert_eq!(end, rig.pose(Some((&death, death.duration + 1000.0))), "terminal poses clamp instead of wrapping");
+        assert_ne!(end, rig.pose(Some((&death, 0.0))), "death must not return to its first frame");
+        assert_eq!(rig.head_attractor(Some((&death, death.duration))), rig.head_attractor(Some((&death, death.duration + 1000.0))));
         assert_eq!(bind.len(), v0.len());
         assert_ne!(v0, v1, "the clip moves the body");
         assert_ne!(p0[1], p1[1], "the head follows its bone");
@@ -326,13 +377,54 @@ mod tests {
         assert!(bind_parts[1][3][1] > 1.2, "bind-pose head at the shoulders: {}", bind_parts[1][3][1]);
     }
 
+    #[test]
+    fn icc_guard_hands_show_record_head_skin() {
+        let Some(store) = store() else { return };
+        let names = NameTable::load(&store).unwrap();
+        let rec = NpcRecord::load(&store, 254118).unwrap();
+        let cat = load_cat_mesh(&store, CHAR_MESH_TYPE, rec.mesh().unwrap()).unwrap();
+        let out = npc_part_textures(&store, &names, &cat, rec.head_mesh(), &[], &[]);
+        // SetSkinData follows the record head, not its solitus-male body model.
+        let (breed, gender, tone) = super::super::player::head_skin(&names, rec.head_mesh().unwrap()).unwrap();
+        let skin_id = names.id(1010011, &skin_texture_name(breed, gender, tone, ClothPart::Hands)).unwrap();
+        let skin = load_texture(&store, TextureKey { rdb_type: 1010011, id: skin_id }).unwrap().unwrap();
+        let source_id = cat.parts.iter().find(|p| p.name == "hands").unwrap().texture;
+        let source = load_texture(&store, TextureKey { rdb_type: TEXTURE_TYPE, id: source_id }).unwrap().unwrap();
+        assert!(source.rgba.as_chunks::<4>().0.iter().all(|p| p[..3] == [0, 255, 0]));
+        assert_eq!(out["hands"].1.rgba, overlay_on_skin(&skin, &source).rgba);
+    }
+
+    #[test]
+    fn humanoid_npc_records_composite_body_defaults() {
+        let Some(store) = store() else { return };
+        let names = NameTable::load(&store).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for id in store.ids(NPC_TYPE).unwrap() {
+            let rec = NpcRecord::load(&store, id).unwrap();
+            let (Some(model), Some(head)) = (rec.mesh(), rec.head_mesh()) else { continue };
+            let Some((breed, gender, skin)) = super::super::player::head_skin(&names, head) else { continue };
+            if !seen.insert((model, head)) { continue }
+            let cat = load_cat_mesh(&store, CHAR_MESH_TYPE, model).unwrap();
+            let out = npc_part_textures(&store, &names, &cat, Some(head), &[], &[]);
+            for part in ClothPart::ALL {
+                let Some(p) = cat.parts.iter().find(|p| p.name == part.name()) else { continue };
+                let Some(skin_id) = names.id(1010011, &skin_texture_name(breed, gender, skin, part)) else { continue };
+                let base = load_texture(&store, TextureKey { rdb_type: 1010011, id: skin_id }).unwrap().unwrap();
+                let Some(over) = load_texture(&store, TextureKey { rdb_type: TEXTURE_TYPE, id: p.texture }).unwrap() else { continue };
+                assert_eq!(out[part.name()].1.rgba, overlay_on_skin(&base, &over).rgba, "NPC {id}, model {model}, head {head}, {part:?}");
+            }
+        }
+        assert!(!seen.is_empty());
+    }
+
     /// The Surf Lizard (record 22794 -> model 22773): `textures[]` replaces the part texture, a creature without `HeadMesh` mounts nothing.
     #[test]
     fn npc_rig_applies_texture_overrides() {
         let Some(store) = store() else { return };
         let cat = load_cat_mesh(&store, CHAR_MESH_TYPE, 22773).unwrap();
         let list = [TextureOverride { material: "lizard_green", texture: 22768, env_texture: 0, alpha_mode: 0 }];
-        let o = npc_part_textures(&store, &cat, &list, &[]);
+        let names = NameTable::load(&store).unwrap();
+        let o = npc_part_textures(&store, &names, &cat, None, &list, &[]);
         assert_eq!(o["lizard_green"].0, TextureKey { rdb_type: TEXTURE_TYPE, id: 22768 });
         let rig = ActorRig::new(&store, 22773, None, &o, &PartLayers::new(), &[]).unwrap();
         assert_eq!(rig.model().meshes.len(), 1, "body only");

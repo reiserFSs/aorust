@@ -156,6 +156,28 @@ Pairs are applied ascending by stat id (std::map, duplicates overwritten). For e
 * the value is stored (`FUN_10062349`). A health change that the preceding `AttackInfo` already applied therefore has `delta == 0` and prints nothing.
 Live: 69 StatIIR messages with one pair each, of which only a few are `Health` (`215 | 190`) — see dynel.md §3.
 
+`combat/glue.rs` forwards every `CombatEvent::Health` into `Zone.dynels` and
+`Zone.character_stats`, not just the own `Zone.stats[27]`. This keeps target,
+team and nametag bars on the same applied health value. Own Life remains the
+pool layer's computed maximum. The compact-packet regression
+`npc_hit_and_authoritative_health_reach_all_zone_views` uses the existing
+`Misc::encode` Attack/AttackInfo layouts and the HealthDamage reader layout
+([GC 0x100a002d], `docs/chat/log.md` wire table): NPC 50 → hit 40 →
+authoritative 37, repeated authoritative 37 stays 37. The HealthDamage
+`+0x18` field is the new absolute health; `+0x1c` is feedback, never a second
+subtraction from the hit's already-applied health.
+
+HealthDamage apply [GC 0x100a00c8] sets Health from `+0x18`, then calls
+`FUN_1005ae91` if the cause at `+0x24` is nonzero. NewLevel apply
+[GC 0x10075a0c, assembly 0x10075a4d..0x10075a92] sets
+`Level=f[0]`, `XP=f[2]`, `IP=f[1]`, `LastXP=f[3]`,
+`NextXP=f[4]`, `XPKillRange=f[6]` for every SimpleChar. The own-character
+gate is later at `0x10075aab`; positive `TitleLevel=f[5]` is applied inside
+that gate (`0x10075cd3..0x10075ce1`). The combat layer applies these absolute
+values without synthesizing StatIIR XP feedback; chat retains its existing
+NewLevel formatting. The same compact-packet regression covers both own and
+NPC level/range updates and HealthDamage-before-death ordering.
+
 ## 6. Floating numbers
 Created by the formatter tail for every message with a non-zero value; the number is `sprintf("%d", value)` (signed, no sign character added, e.g. XP loss `-5`), the colour is the line's category.
 

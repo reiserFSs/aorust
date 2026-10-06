@@ -795,6 +795,7 @@ impl Play {
         }
         c.name_locked = true;
         let req = cc_request(c, name);
+        c.pending_appearance = Some(req.clone());
         eprintln!("create character: {req:?}");
         if self.fake {
             // `--fake-charlist`: an in-process fake login server — "Taken" is in use, anything else is created and handed off
@@ -835,7 +836,12 @@ impl Play {
                 true
             }
             // 0x21 RequestRejected is not a name-scene state: Client+0x68 -> SlotLoginReply -> ShowError (docs/protocol.md), handled by the flow
-            LoginEvent::CharacterCreated { .. } => {
+            LoginEvent::CharacterCreated { character_id } => {
+                if let Some(req) = c.pending_appearance.take() {
+                    if let Err(e) = super::super::preview::remember_created(&self.dir, *character_id as i32, &req) {
+                        eprintln!("created character appearance cache: {e:#}");
+                    }
+                }
                 // SetState(0x1007): WasCharacterCreated = 1
                 self.prefs.cc_created = true;
                 self.prefs.save();
@@ -905,6 +911,7 @@ impl Play {
             c.heads = super::head_table(&self.dir, breed, gender);
         }
         let req = cc_request(&c, name.to_string());
+        c.pending_appearance = Some(req.clone());
         eprintln!("create character: {req:?}");
         if let Some(sess) = &self.session {
             sess.create_character(req);

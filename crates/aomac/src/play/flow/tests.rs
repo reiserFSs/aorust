@@ -29,6 +29,19 @@ fn rig() -> Option<Rig> {
     Some(Rig { p, host, port, _l: l })
 }
 
+#[test]
+fn preview_first_waits_for_backdrop_instead_of_losing_upload() {
+    let Some(mut r) = rig() else { return };
+    r.p.backdrop = None;
+    r.p.char_ready = false;
+    r.p.worker = Some(preview::Worker::queued_first(Scene::default()));
+    r.p.tick_preview(0.016, &mut r.host);
+    assert!(!r.p.char_ready);
+    r.p.backdrop = Some(Box::new(Scene::default()));
+    r.p.tick_preview(0.016, &mut r.host);
+    assert!(r.p.char_ready, "queued initial mesh must upload once the backdrop exists");
+}
+
 impl Rig {
     fn click(&mut self, window: WindowId, view: &str) {
         self.p.handle(Event::Clicked { window, view: view.into(), item: None }, &mut self.host);

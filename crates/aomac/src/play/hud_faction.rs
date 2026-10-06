@@ -140,7 +140,7 @@ impl HudFaction {
         let first = rows.iter().any(|r| r.value.is_none());
         let mut rebuilt = false;
         for (i, row) in rows.iter_mut().enumerate() {
-            let value = zone.stat(STATS[i]).unwrap_or(0);
+            let value = zone.skill_value(STATS[i]).unwrap_or(0);
             let fill = if i == 0 { 0xde } else if value < 0 { 0xdd } else { 0xdc };
             let dir = if i != 0 && value < 0 { "left" } else { "right" };
             let sign_changed = row.value.is_none_or(|v| (v < 0) != (value < 0));

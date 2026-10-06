@@ -782,6 +782,7 @@ mod tests {
     #[test]
     fn cat_anim_fixture_decodes_and_samples() {
         let a = CatAnim::parse(&anim_record(0xdead_beef)).unwrap();
+        assert_eq!(a.source_id, 0, "raw streams have no RDB provenance");
         assert_eq!((a.version, a.duration, a.events.clone()), (0x106, 1000.0, vec![(250, "left".to_string())]));
         assert_eq!(a.tracks.len(), 2);
         let t = &a.tracks[1];
@@ -792,6 +793,8 @@ mod tests {
         assert!((p[0] - 1.0).abs() < 1e-5);
         assert!((q[2] - (std::f32::consts::PI / 8.0).sin()).abs() < 1e-3, "45 degrees halfway: {q:?}");
         assert!(a.sample(7, 0.0).is_none());
+        assert_eq!(a.sample(1, a.duration), a.sample(1, a.duration + 1000.0), "terminal key holds");
+        assert_ne!(a.sample(1, a.duration), a.sample(1, 0.0), "terminal time must not wrap");
     }
 
     #[test]

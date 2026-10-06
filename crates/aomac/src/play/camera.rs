@@ -390,6 +390,21 @@ impl Camera3p {
         self.views = Some(v);
     }
 
+    /// Direct CameraMenu selection (CameraCoordinator GUI 0x10064387): 0 first-person, 1/2/3 third-person vehicle.
+    pub fn select_mode(&mut self, mode: u8) {
+        if mode > 3 { return; }
+        self.first_person = mode == 0;
+        if mode != 0 && self.mode != mode {
+            self.mode = mode;
+            self.vehicle = self.vehicle.replaced();
+            self.blind_time = 0.0;
+        }
+    }
+
+    pub fn selected_mode(&self) -> u8 {
+        if self.first_person { 0 } else { self.mode }
+    }
+
     /// `PreferredCameraMode` in use (1, 2 or 3).
     #[cfg(test)]
     pub fn mode(&self) -> u8 {
@@ -686,6 +701,26 @@ mod tests {
 
     fn near(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
+    }
+
+    #[test]
+    fn menu_selects_each_vehicle_and_retains_third_person_preference() {
+        let mut c = cam();
+        let orbit = c.orbit();
+        let distance = c.distance();
+        for mode in [1, 2, 3, 0] {
+            c.select_mode(mode);
+            assert_eq!(c.selected_mode(), mode);
+            assert_eq!(c.orbit(), orbit);
+            assert_eq!(c.distance(), distance);
+            assert_eq!(c.is_first_person(), mode == 0);
+        }
+        assert_eq!(c.mode(), 3);
+        c.apply(&CamCmd::ToggleView);
+        assert_eq!(c.selected_mode(), 3);
+        c.select_mode(2);
+        c.set_prefs(&ControlPrefs::default());
+        assert_eq!(c.selected_mode(), 2);
     }
 
     #[test]

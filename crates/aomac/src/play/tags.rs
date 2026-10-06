@@ -221,12 +221,13 @@ impl TagLayer {
 /// level and own stat 0x113, [`nt::con_color`]).
 pub fn indicators(zone: &Zone) -> Vec<Indicator> {
     let me = zone.char_id as i32;
-    let own_level = zone.stat(stats::LEVEL).or_else(|| zone.own().map(|o| o.level)).unwrap_or(0);
-    let range = zone.stat(0x113).unwrap_or(nt::INVALID_STAT);
+    let own_level = zone.skill_value(stats::LEVEL).or_else(|| zone.own().map(|o| o.level)).unwrap_or(0);
+    let range = zone.skill_value(0x113).unwrap_or(nt::INVALID_STAT);
     let one = |id: i32, kind| {
         let d = zone.dynels.get(&id)?;
-        let (health, max) = if id == me { (zone.stat(stats::HEALTH).unwrap_or(d.health), zone.stat(stats::LIFE).unwrap_or(d.max_health)) } else { (d.health, d.max_health) };
-        let [r, g, b, _] = nt::con_color(nt::consider_ratio(d.level, own_level, range));
+        let (health, max) = if id == me { (zone.skill_value(stats::HEALTH).unwrap_or(d.health), zone.skill_value(stats::LIFE).unwrap_or(d.max_health)) } else { (d.health, d.max_health) };
+        let level = if id == me { own_level } else { d.level };
+        let [r, g, b, _] = nt::con_color(nt::consider_ratio(level, own_level, range));
         Some(Indicator { id, kind, bar: Some(((health, max), u32::from_be_bytes([0, r, g, b]))) })
     };
     let sel = zone.target.and_then(|id| one(id, IndicatorKind::Selection));

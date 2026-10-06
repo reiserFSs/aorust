@@ -15,8 +15,9 @@ Conventions: Y up; `yaw = 2·atan2(qy,qw)`, facing `(sin yaw, 0, cos yaw)`, yaw 
 `<Name>TransitionAction_t::vftable` it allocates, so the table below is exact. The `CharDCMoveIIR_t` move type **is** this id (docs/zone/dynel.md §2).
 Status object layout: `+4` mode, `+8/+0xc` forward state (1 stopped, 2 moving) / dir (1 fwd, 2 back), `+0x10/+0x14` strafe state / dir (3 left, 4 right), `+0x18/+0x1c`
 elevate state / dir (5 up), `+0x20/+0x24` turn state (1 stopped, 4 turning) / dir (3 left, 4 right), `+0x28` jump state (1 ground, 3 jumping), `+0x30` previous mode.
-Defaults `FUN_1007038f`: mode 3 (run), every state 1, dirs 0, jump 1; `FUN_1006c16d`: previous mode 2. The `SimpleCharFullUpdate` blob (12 zero bytes + this status as 10 bytes,
-`FUN_10070438`, + BE `i32` previous mode + 2 bytes; 28 bytes, 42 with a 16-byte tail in 3 captures) is exactly this: all 81 captured blobs = defaults (test `captured_blobs_are_the_default_status`).
+Defaults `FUN_1007038f`: mode 3 (run), every state 1, dirs 0, jump 1; `FUN_1006c16d`: previous mode 2. The `SimpleCharFullUpdate` blob starts with 12 velocity bytes, then this status as 10 bytes
+(`FUN_10070438`) and a BE `i32` previous mode (`FUN_1006c4dc`). All 81 captured blobs have the default axes/current mode, but their remembered mode is Walk **or Run** (test `captured_blobs_are_the_default_status`).
+NPC blobs are 28 bytes; player blobs are 42 bytes, with four input floats immediately after the remembered mode (`PlayerVehicle` read hook `FUN_1007135d`, see [movement.md](movement.md)).
 
 | id | transition | guard (current status) → new status | live DC count |
 |---|---|---|---|

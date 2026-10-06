@@ -5,6 +5,26 @@
 use ao_gui::{Event, Gui, WindowId, WindowSize};
 use std::path::PathBuf;
 
+#[path = "character_info.rs"]
+mod character;
+#[path = "info_fields.rs"]
+mod fields;
+#[path = "info_template_spells.rs"]
+mod template_spells;
+#[path = "info_tower_interpolation.rs"]
+mod tower_interpolation;
+#[path = "quest_info.rs"]
+mod quest;
+
+pub fn character_html(zone: &crate::play::zone::Zone, id: ao_net::msg::Identity, packet: &ao_net::n3::info::InfoPacket, texts: &ao_formats::screens::TextDb) -> anyhow::Result<String> {
+    character::html(zone, id, packet, texts)
+}
+
+pub fn quest_html(zone: &crate::play::zone::Zone, id: ao_net::msg::Identity, texts: &ao_formats::screens::TextDb) -> anyhow::Result<Option<String>> {
+    let store = ao_rdb::RecordStore::open(&ao_gui::client_dir())?;
+    quest::html(zone,id,texts,Some(&store))
+}
+
 /// `FUN_100eeedb`: `Point(_DAT_101b1840 = 400, _DAT_101b172c = 500)`, used as the client size (**GUESS**: the decompile only shows the
 /// constants returned; the window's creation rectangle is `Rect()` and the config archive `InfoViewConfig` is empty on a fresh install).
 const CLIENT: (u32, u32) = (400, 500);
@@ -16,6 +36,10 @@ pub enum InfoOut {
     Command(String),
     /// "Infoview failed to load and show file: <%s>" on `GlobalSignals+0x17c` with colour code 0xc (`CCRed`).
     Error(String),
+    /// `FUN_10031011`: request the server's character information packet.
+    Character(ao_net::msg::Identity),
+    /// Quest item information (`FUN_1003565d`), resolved synchronously from the zone's quest registry.
+    Quest(ao_net::msg::Identity),
 }
 
 /// One visited page (`std::list` node: url at +8, html at +0x24, scroll location at +0x40).
@@ -136,6 +160,14 @@ fn extract_section(html: &str, n: i32) -> String {
     String::new()
 }
 
+/// Character identities followed by optional embedded HTML (`charref://`).
+fn character_url(s: &str) -> Option<(ao_net::msg::Identity, &str)> {
+    let mut parts = s.splitn(3, '/');
+    let kind = parts.next()?.parse().ok()?;
+    let instance = parts.next()?.parse().ok()?;
+    Some((ao_net::msg::Identity { kind, instance }, parts.next().unwrap_or("")))
+}
+
 impl InfoView {
     pub fn new(client: &std::path::Path) -> Self {
         Self { text_dir: client.join("cd_image/text"), win: None, hist: History::default(), url: String::new() }
@@ -167,15 +199,31 @@ impl InfoView {
     /// (link clicks pass false): the same URL again closes the window.
     pub fn show_url(&mut self, gui: &mut Gui, screen: (u32, u32), url: &str, toggle: bool) -> Vec<InfoOut> {
         let was_open = self.win.is_some();
-        // charid:// itemid:// shopitemid:// itemref:// skillid:// charref:// build their pages from game data (`FUN_100384f3`): not ported
+        // `FUN_100384f3` generates item pages, not character pages.
         let lower = url.to_ascii_lowercase();
-        for p in ["charref://", "charid://", "itemid://", "shopitemid://", "itemref://", "skillid://"] {
+        for p in ["shopitemid://", "itemref://", "skillid://"] {
             if lower.starts_with(p) {
-                eprintln!("chat: InfoView {p} pages need the item/character info generator (not ported)");
+                eprintln!("chat: InfoView {p} pages need the item/skill info generator (not ported)");
                 return vec![];
             }
         }
-        let (key, body, out) = if lower.starts_with("text://") {
+        let (key, body, out) = if lower.starts_with("itemid://") {
+            let Some((id, tail)) = character_url(&url[9..]) else { return vec![] };
+            if id.kind != ao_net::n3::quest::QUEST_KIND || !tail.is_empty() {
+                eprintln!("chat: InfoView itemid pages other than quests are not ported");
+                return vec![];
+            }
+            (url.to_owned(), Some(String::new()), vec![InfoOut::Quest(id)])
+        } else if lower.starts_with("charid://") {
+            let Some((id, tail)) = character_url(&url[9..]) else { return vec![] };
+            if !tail.is_empty() { return vec![]; }
+            (url.to_owned(), Some("<center><font color=CCRed>Please wait<br>Transferring information</font></center>".into()), vec![InfoOut::Character(id)])
+        } else if lower.starts_with("charref://") {
+            let Some((_, body)) = character_url(&url[10..]) else { return vec![] };
+            if body.is_empty() { return vec![]; }
+            let key = &url[..url.len() - body.len() - 1];
+            (key.to_owned(), Some(body.to_owned()), vec![])
+        } else if lower.starts_with("text://") {
             (text_url_key(url), Some(url[7..].to_owned()), vec![])
         } else if lower.starts_with("chatcmd://") {
             return vec![InfoOut::Command(url[10..].to_owned())];
@@ -205,6 +253,23 @@ impl InfoView {
         self.hist.visit(&key, text, scroll);
         self.show_current(gui);
         out
+    }
+
+    /// `InfoView_c` response slot: a response for an older target must not replace the current page.
+    pub fn character_page(&mut self, gui: &mut Gui, id: ao_net::msg::Identity, html: String) {
+        self.identity_page(gui,"charid://",id,html);
+    }
+
+    pub fn quest_page(&mut self, gui: &mut Gui, id: ao_net::msg::Identity, html: String) {
+        self.identity_page(gui,"itemid://",id,html);
+    }
+
+    fn identity_page(&mut self, gui: &mut Gui, scheme: &str, id: ao_net::msg::Identity, html: String) {
+        if self.win.is_none() || !self.url.get(..scheme.len()).is_some_and(|s|s.eq_ignore_ascii_case(scheme)) || !character_url(&self.url[scheme.len()..]).is_some_and(|(target,_)| target == id) { return; }
+        let key = self.url.clone();
+        let scroll = self.win.map(|w| gui.scroll_offset(w, "BrowserView")).unwrap_or_default();
+        self.hist.visit(&key, html, scroll);
+        self.show_current(gui);
     }
 
     fn ensure_window(&mut self, gui: &mut Gui, screen: (u32, u32)) {
@@ -281,6 +346,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn character_identity_keeps_embedded_html_intact() {
+        let id = ao_net::msg::Identity { kind: 50000, instance: 42 };
+        assert_eq!(character_url("50000/42"), Some((id, "")));
+        assert_eq!(character_url("50000/42/<a href=\"chatcmd:///inspect 42\">Info</a>"), Some((id, "<a href=\"chatcmd:///inspect 42\">Info</a>")));
+        for bad in ["50000", "x/42", "50000/x", "50000/2147483648"] {
+            assert!(character_url(bad).is_none());
+        }
+    }
+
+    #[test]
     fn section_extraction_matches_the_tip_file_layout() {
         let html = "<section>one</section>\n\n<section></font>two</section>\n<section>three";
         assert_eq!(extract_section(html, 0), "one");
@@ -328,6 +403,33 @@ mod tests {
             return None;
         }
         Some((Gui::new(&client, None).unwrap(), InfoView::new(&client)))
+    }
+
+    #[test]
+    fn character_requests_render_replies_and_reject_stale_targets() {
+        let Some((mut gui, mut iv)) = rig() else { return };
+        let id = ao_net::msg::Identity { kind: 50000, instance: 42 };
+        assert_eq!(iv.show_url(&mut gui, (1280,800), "charid://50000/42", true), [InfoOut::Character(id)]);
+        let w = iv.window().expect("character Info window");
+        assert!(gui.text(w,"BrowserView").contains("Transferring information"));
+        iv.character_page(&mut gui, id, "<font color=CCInfoHeadline>NPC</font><br>".into());
+        assert!(gui.text(w,"BrowserView").contains("NPC"));
+        assert_eq!(iv.show_url(&mut gui,(1280,800),"CHARID://050000/042",false),[InfoOut::Character(id)]);
+        iv.character_page(&mut gui,id,"normalized identity".into());
+        assert!(gui.text(w,"BrowserView").contains("normalized identity"));
+        assert_eq!(iv.url,"CHARID://050000/042");
+        iv.show_url(&mut gui,(1280,800),"charid://50000/43",true);
+        iv.character_page(&mut gui,id,"stale".into());
+        assert!(!gui.text(w,"BrowserView").contains("stale"));
+        iv.show_url(&mut gui,(1280,800),"charref://50000/42/<font color=CCInfoHeadline>saved</font>",false);
+        assert!(gui.text(w,"BrowserView").contains("saved"));
+        assert_eq!(iv.url,"charref://50000/42");
+        let quest = ao_net::msg::Identity {kind:ao_net::n3::quest::QUEST_KIND,instance:77};
+        assert_eq!(iv.show_url(&mut gui,(1280,800),"itemid://56003/77",false),[InfoOut::Quest(quest)]);
+        iv.quest_page(&mut gui,quest,"<font color=CCInfoHeadline>Mission</font>".into());
+        assert!(gui.text(w,"BrowserView").contains("Mission"));
+        iv.character_page(&mut gui,id,"wrong page".into());
+        assert!(!gui.text(w,"BrowserView").contains("wrong page"));
     }
 
     #[test]

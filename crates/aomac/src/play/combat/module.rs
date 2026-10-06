@@ -342,7 +342,7 @@ impl Module {
     }
 
     fn attacker(&self, zone: &Zone, mode: u32) -> Attacker {
-        let s = |id| zone.stat(id).unwrap_or(0);
+        let s = |id| zone.skill_value(id).unwrap_or(0);
         Attacker {
             id: self.own,
             is_client: true,

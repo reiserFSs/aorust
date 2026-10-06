@@ -151,6 +151,7 @@ pub(super) struct Create {
     // name scene
     pending_suggest: bool,
     name_locked: bool,
+    pending_appearance: Option<CreateCharacterRequest>,
     heads: Vec<character::HeadEntry>,
     // animation / effects
     fades: Vec<Fade>,
@@ -214,6 +215,7 @@ impl Create {
             head_state: 0,
             pending_suggest: false,
             name_locked: false,
+            pending_appearance: None,
             heads: vec![],
             fades: vec![],
             text_fades: vec![],

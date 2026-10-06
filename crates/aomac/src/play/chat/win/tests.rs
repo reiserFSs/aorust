@@ -69,12 +69,41 @@ fn shipped_template_parses() {
     assert_eq!(v.len(), 2);
     let w1 = &v[0];
     assert_eq!((w1.name.as_str(), w1.window_name.as_str(), w1.output_group, w1.autosubscribe, w1.show_timestamps), ("Default Window", "Window1", G_VICINITY, true, true));
+    assert_eq!((w1.visual_mode, w1.textinput, w1.alpha_inactive, w1.alpha_active), (2, true, 0.3, 0.8));
+    assert_eq!((alpha_of(w1, false), alpha_of(w1, true)), (0.3, 0.8));
     assert_eq!(w1.frame, Some([277.0, 1206.0, 1273.0, 1439.0]));
     assert!(w1.set.contains(&0x4200_0012) && w1.set.len() == 22 && w1.shows(G_VICINITY));
     assert!(!v[1].textinput && !v[1].autosubscribe && v[1].shows(0x4200_0012) && !v[1].shows(G_VICINITY));
     // round trip through the writer
     let again = Cfg::parse(&w1.to_xml(&|_| String::new())).unwrap();
     assert_eq!(&again, w1);
+}
+
+#[test]
+fn chat_documents_are_character_local_and_legacy_customizations_survive_once() {
+    let root = test_dir().join("character-local");
+    let _ = std::fs::remove_dir_all(&root);
+    let first = root.join("Account/Char1");
+    let second = root.join("Account/Char2");
+    let legacy = root.join("Chat/Windows/Window1");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let mut custom = code_defaults().remove(0);
+    custom.visual_mode = 0;
+    custom.output_group = 0x300000001;
+    custom.alpha_inactive = 0.65;
+    std::fs::write(legacy.join("Config.xml"), custom.to_xml(&|_| String::new())).unwrap();
+    super::windows::migrate_windows(&root, &first).unwrap();
+    assert_eq!(read_windows(&first), vec![custom.clone()]);
+    assert!(!root.join("Chat/Windows").exists());
+    super::windows::migrate_windows(&root, &second).unwrap();
+    assert!(read_windows(&second).is_empty(), "a fresh character must not inherit another character's mode/group");
+    // A character's own settings win over legacy settings, without overwriting either archive.
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("Config.xml"), code_defaults()[0].to_xml(&|_| String::new())).unwrap();
+    super::windows::migrate_windows(&root, &first).unwrap();
+    assert_eq!(read_windows(&first), vec![custom]);
+    assert!(legacy.join("Config.xml").exists());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -111,9 +140,58 @@ fn rig(screen: (u32, u32)) -> Option<(Gui, ChatWindows)> {
     }
     let dir = test_dir();
     let _ = std::fs::remove_dir_all(&dir);
+    // Existing interaction tests exercise saved retail mode-2 documents, independently of the port's fresh-character default.
+    for mut cfg in read_windows(&client.join("prefs/NewChar")) {
+        let (x, y, w, h) = place(cfg.frame, true, screen, Reserved::default());
+        cfg.frame = Some([x as f32, y as f32, (x + w as i32 - 1) as f32, (y + h as i32 - 1) as f32]);
+        let window = dir.join("Chat/Windows").join(&cfg.window_name);
+        std::fs::create_dir_all(&window).unwrap();
+        std::fs::write(window.join("Config.xml"), cfg.to_xml(&|_| String::new())).unwrap();
+    }
     let mut gui = Gui::new(&client, None).unwrap();
     let ch = open_in(&mut gui, &dir, screen);
     Some((gui, ch))
+}
+
+#[test]
+fn fresh_characters_start_framed_tabbed_with_input_and_can_switch_modes() {
+    let client = ao_gui::client_dir();
+    if !client.join("cd_image/gui").exists() {
+        return eprintln!("skipping: no client");
+    }
+    let root = test_dir();
+    let _ = std::fs::remove_dir_all(&root);
+    crate::play::prefs::set_test_dir(&root);
+    let character = root.join("Account/Char1");
+    let mut gui = Gui::new(&client, None).unwrap();
+    let mut ch = ChatWindows::new_for_character(&mut gui, (1280, 800), &character).unwrap();
+    assert_eq!(ch.frames.len(), 1);
+    assert_eq!(ch.wins[0].cfg.visual_mode, 0);
+    assert!(ch.wins[0].cfg.textinput);
+    assert_eq!(gui.window_alpha(ch.frames[0].id), 1.0);
+    assert_eq!(gui.window_tabs(ch.frames[0].id).0, ["Default Window <font color=green>[Vicinity]</font>", "Combat"]);
+    let id = ch.frames[0].id;
+    let close = Event::CloseRequested { window: id };
+    assert!(ch.owns(&close));
+    ch.event(&mut gui, &close);
+    assert!(!gui.window_visible(id), "the frame close button must not leave chat blocking world input");
+    assert!(ch.wins.iter().all(|w| !w.cfg.open));
+    ch.save().unwrap();
+    close_all(&mut gui, &ch);
+    ch = ChatWindows::new_for_character(&mut gui, (1280, 800), &character).unwrap();
+    assert!(!gui.window_visible(ch.frames[0].id), "closed state survives relog without losing documents");
+    ch.focus_input(&mut gui);
+    assert!(gui.window_visible(ch.frames[0].id));
+    assert!(ch.wins.iter().all(|w| w.cfg.open));
+    ch.test_pick(&mut gui, 0, OP_MODE, 2);
+    assert_eq!(ch.frames.len(), 2, "changing a docked tab to borderless tears it out");
+    assert_eq!(ch.wins[0].cfg.visual_mode, 2);
+    ch.save().unwrap();
+    close_all(&mut gui, &ch);
+    let saved = ChatWindows::new_for_character(&mut gui, (1280, 800), &character).unwrap();
+    assert_eq!(saved.wins[0].cfg.visual_mode, 2, "saved modes must not receive the fresh default override");
+    close_all(&mut gui, &saved);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn sample(gui: &mut Gui, ch: &mut ChatWindows) {

@@ -122,6 +122,8 @@ pub enum CombatEvent {
     Log(LogLine),
     /// Health (stat 27) / max health (stat 1) of `dynel` changed.
     Health { dynel: i32, health: i32, max_health: i32, delta: i32 },
+    /// Absolute stat applied by NewLevelIIR (GC 0x10075a0c), without StatIIR delta feedback.
+    StatChanged { dynel: i32, stat: u32, value: i32 },
     /// `dynel` died: `cause` = `FUN_1005ae91` mode (1 terminate, 2 reflect, 3 shield, 4 weapon, 5 spell, 6 fall, 7 liquid) or
     /// 0 for the server's `CharacterAction` 99.
     Died { dynel: i32, cause: u32 },
@@ -191,6 +193,31 @@ impl Combat {
         let Ok(m) = n3::decode(f) else { return ev };
         let h = m.header.target;
         self.arms.on_message(&m, self.chars.get(&h.instance).is_some_and(|c| c.npc));
+        // Reuse the retail ReadSubClass decoder shared with chat; its delta is feedback,
+        // not another subtraction after AttackInfo has already applied a hit.
+        if matches!(m.body, N3::Unknown(_)) {
+            match crate::play::chat::log::from_n3(&m) {
+                Some(crate::play::chat::log::LogEvent::HealthDamage { who, health, death_cause, .. }) if who.kind == CHAR_KIND => {
+                    self.set_health(who.instance, health, &mut ev);
+                    if death_cause != 0 && self.chars.contains_key(&who.instance) {
+                        self.die(who.instance, death_cause, &mut ev);
+                    }
+                }
+                Some(crate::play::chat::log::LogEvent::NewLevel { who, f }) if who.kind == CHAR_KIND => {
+                    if let Some(c) = self.chars.get_mut(&who.instance) {
+                        for (stat, value) in [(0x36, f[0]), (0x34, f[2]), (0x35, f[1]), (0x39, f[3]), (0x15e, f[4]), (0x113, f[6])] {
+                            c.stats.insert(stat as i32, value);
+                            ev.push(CombatEvent::StatChanged { dynel: who.instance, stat, value });
+                        }
+                        if who.instance == self.own && f[5] > 0 {
+                            c.stats.insert(0x25, f[5]);
+                            ev.push(CombatEvent::StatChanged { dynel: who.instance, stat: 0x25, value: f[5] });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         match m.body {
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if h.kind == CHAR_KIND => {
                 let c = self.chars.entry(h.instance).or_default();

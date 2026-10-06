@@ -1,12 +1,13 @@
 //! In-game interactions a new player needs: talking to NPCs (KnuBot dialogue), using world objects. Layouts and evidence: docs/zone/interact.md.
 //!
-//! * [`Interact::default_action`] is `N3Msg_DefaultActionOnDynel` [GC 0x100291da] (right click, double click): a character with the dialogue flag
+//! * [`Interact::default_action_on`] is `N3Msg_DefaultActionOnDynel` [GC 0x100291da] (right click, double click): a character with the dialogue flag
 //!   (stat `0x300`, bit 0) gets `KnubotOpenChatWindowIIR_c`; the server answers with `KnubotOpenChatWindow` / `AppendText` / `AnswerList`, which
 //!   [`Interact::on_frame`] turns into the NPC chat window ([`interact_chat`](super::interact_chat)).
 //! * Everything the player does in a dialogue goes out through [`Interact::take_outbox`].
 
 use super::interact_chat::NpcChat;
 use super::interact_grid::GridUi;
+use super::interact_mission::MissionUi;
 use super::interact_ptrade::PTradeUi;
 use super::interact_shop::ShopUi;
 use super::interact_trade::TradeUi;
@@ -19,8 +20,7 @@ use ao_net::n3::grid::Grid;
 use ao_net::n3::knubot::{self, Knubot};
 use ao_net::n3::misc::{GenericArgs, GenericCmd, Misc};
 use ao_net::n3::outgoing::{n3_frame, DYNEL_CHAR};
-use ao_net::n3::{self, dynel::Dynel, N3};
-use std::collections::HashMap;
+use ao_net::n3::{self, N3};
 
 /// Stat `0x300` (no name in the client's table): bit 0 marks a character the player can talk to (`N3Msg_DefaultActionOnDynel` tests
 /// `HasStat(0x300)` and `GetStat(0x300, 2) & 1`). The server sends it as a `StatIIR_t` pair per NPC (docs/zone/dynel.md §3).
@@ -33,8 +33,6 @@ pub struct Interact {
     pub(super) own: u32,
     /// The last plain left click (dynel, `Play::time`), for double-click detection.
     last_click: Option<(Identity, f32)>,
-    /// Last value of stat `0x300` per dynel.
-    talk: HashMap<i32, i32>,
     pub(super) chat: Option<NpcChat>,
     /// The NPC trade window and the button bar's state (`interact_trade.rs`).
     pub(super) trade: TradeUi,
@@ -46,6 +44,8 @@ pub struct Interact {
     pub(super) ptrade: PTradeUi,
     /// The vending machine buy window (`interact_shop.rs`).
     pub(super) shop: ShopUi,
+    /// Mission terminal selection (`MissionSelectionView_c`).
+    pub(super) mission: MissionUi,
     outbox: Vec<Frame>,
     /// Text of `KnubotCloseChatWindow` for the chat window ([INFERENCE]: the `+0xf0` slot's consumer was not located; the live server sends the reason, e.g. "You are too far away from <npc> to continue this conversation.").
     notices: Vec<String>,
@@ -74,10 +74,6 @@ impl Interact {
         zone.own().map(|d| d.name.clone()).unwrap_or_default()
     }
 
-    /// The dialogue flag of `id` (`HasStat(0x300) && GetStat(0x300) & 1`).
-    pub fn talkable(&self, id: i32) -> bool {
-        self.talk.get(&id).is_some_and(|v| v & 1 != 0)
-    }
 
     /// Records a left click on `id` at `now`; true when it is the second click of a double click.
     pub fn double_click(&mut self, id: Identity, now: f32) -> bool {
@@ -92,6 +88,7 @@ impl Interact {
         self.ptrade.close_all(gui);
         self.shop_close_all(gui);
         self.grid.close_all(gui);
+        self.mission.close_all(gui);
         if let Some(c) = self.chat.take() {
             c.close(gui);
         }
@@ -109,28 +106,34 @@ impl Interact {
         self.outbox.push(n3_frame(0, self.own, payload));
     }
 
-    /// Every received zone frame: `StatIIR_t` pairs of stat `0x300`, and the Knubot messages.
+    /// Every received zone frame: Knubot, trade, inventory and grid messages.
     pub fn on_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &Zone) {
         let Ok(m) = n3::decode(f) else { return };
         let who = m.header.target;
+        self.shop.literacy = zone.skill_value(0xa1).unwrap_or(0).min(3000);
         self.watch_objects(gui, &m);
         self.shop_watch(&m);
         match m.body {
-            N3::Dynel(Dynel::Stat(s)) if who.kind == DYNEL_CHAR => {
-                for (stat, v) in s.stats {
-                    if stat == STAT_TALK {
-                        self.talk.insert(who.instance, v);
-                    }
-                    // stat 0 bit 21 enables the fourth button of the dialogue's bar (`FUN_10058ed8`)
-                    if stat == 0 {
-                        self.trade.flags0.insert(who.instance, v);
-                    }
-                }
-            }
             N3::Knubot(k) => self.on_knubot(gui, k, zone),
             N3::Trade(t) => self.on_trade(gui, t, who, zone),
             N3::Inventory(m) => self.ptrade_inventory(&m),
             N3::Grid(Grid::DestinationSelect { destinations, token }) => self.grid.activate(gui, self.screen, zone, who, destinations, token),
+            N3::MissionSelection(alternatives) if who == self.own_id() => {
+                if let Some(notice) = self.mission.alternatives(gui, alternatives) {
+                    self.notices.push(notice);
+                }
+            }
+            N3::Misc(Misc::GenericCmd(cmd)) if cmd.state == 1 && cmd.cmd == CMD_USE_ITEM => {
+                if let GenericArgs::Item { actor, item, .. } = cmd.args {
+                    if actor == self.own_id() && zone.world.item_class_of(item.kind, item.instance) == Some(0xdac1) {
+                        // QuestBooth use callback (`FUN_10086571`) emits GlobalSignals +0x164.
+                        let origin_type = zone.world.stat_of(item.kind, item.instance, 0x1ea).filter(|v| (1..=8).contains(v)).unwrap_or(1) as u8;
+                        if let Err(error) = self.mission.open(gui, self.screen, origin_type, item) {
+                            eprintln!("mission selection: {error:#}");
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -148,7 +151,8 @@ impl Interact {
                     self.send(knubot::close_window(id, n));
                 }
                 let name = zone.dynels.get(&npc.instance).map(|d| d.name.clone()).unwrap_or_default();
-                self.open_chat(gui, npc, &name, b20, b21);
+                let use_npc = zone.stat_of(npc.instance, 0).is_some_and(|flags| flags & super::interact_chat::STAT0_USE_BIT != 0);
+                self.open_chat(gui, npc, &name, b20, b21, use_npc);
             }
             Knubot::AppendText { npc, kind, text } => {
                 if let Some(c) = self.chat.as_mut().filter(|c| c.npc == npc) {
@@ -184,10 +188,14 @@ impl Interact {
             self.use_out(zone, out);
             return true;
         }
-        if self.ptrade_event(gui, ev, zone) || self.shop_event(gui, ev) {
+        if self.ptrade_event(gui, ev, zone) || self.shop_event(gui, ev, zone) {
             return true;
         }
         if let Some(out) = self.grid.event(gui, ev, me) {
+            out.into_iter().for_each(|p| self.send(p));
+            return true;
+        }
+        if let Some(out) = self.mission.event(gui, ev, me, zone) {
             out.into_iter().for_each(|p| self.send(p));
             return true;
         }
@@ -220,21 +228,6 @@ impl Interact {
         }
     }
 
-    /// `N3Msg_DefaultActionOnDynel` [GC 0x100291da] on a character. The dialogue branch: `HasStat(0x300)` with bit 0 -> `KnubotOpenChatWindowIIR_c(own,
-    /// npc, 0, 0)` (`FUN_10127f4d`). The player-trade branch (`N3Msg_TradeStart`) is not ported: a new player has nobody to trade with.
-    /// Returns what the action was.
-    pub fn default_action(&mut self, id: i32) -> Action {
-        if id == self.own as i32 {
-            return Action::None;
-        }
-        if self.talkable(id) {
-            let (own, npc) = (self.own_id(), Identity { kind: DYNEL_CHAR, instance: id });
-            self.send(knubot::open_chat_window(own, npc));
-            return Action::Talk;
-        }
-        Action::None
-    }
-
     /// `N3Msg_UseItem` [GC 0x100286f8] on a world object: `GenericCmd_t(state 0, seq, cmd 3, ItemActionData{actor = own, item})`.
     pub fn use_object(&mut self, item: Identity) {
         self.seq += 1;
@@ -244,7 +237,7 @@ impl Interact {
     }
 }
 
-/// What [`Interact::default_action`] / [`Interact::default_action_on`] / [`Interact::use_item`] did.
+/// What [`Interact::default_action_on`] / [`Interact::use_item`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
@@ -256,6 +249,8 @@ pub enum Action {
     Use,
     /// `TradeIIR_t` op 0 sent (`N3Msg_TradeStart`): a character that is not talkable.
     Trade,
+    /// `TradeIIR_t` op 2 sent (`N3Msg_TradeAbort(true)`).
+    Abort,
     /// `Can` bit 4: the "UseItem" confirmation dialog is asked for (`GuiSystem_c::ConfirmUseItemDialogue`).
     Confirm,
     /// Refused with the `Feedback_*` text of the key (chat category 110).
@@ -294,8 +289,8 @@ impl Interact {
     }
 
     /// `(instance, stat 0x300)` of every dynel the server flagged.
-    pub fn flagged(&self) -> Vec<(i32, i32)> {
-        let mut v: Vec<_> = self.talk.iter().map(|(k, v)| (*k, *v)).collect();
+    pub fn flagged(&self, zone: &Zone) -> Vec<(i32, i32)> {
+        let mut v: Vec<_> = zone.dynels.keys().filter_map(|id| zone.stat_of(*id, STAT_TALK as u32).map(|value| (*id, value))).collect();
         v.sort();
         v
     }

@@ -60,6 +60,8 @@ pub struct Model {
     cost: HashMap<u32, i32>,
     /// The bonus / percent maps of the active spells (`SimpleChar+0x1bc`), see [`Model::refresh_buffs`].
     mods: Modifiers,
+    /// AMS raw value rebuilt from the equipped weapon's attack list (`FUN_10068359`).
+    ams: i32,
 }
 
 impl Model {
@@ -92,11 +94,40 @@ impl Model {
     }
 
     /// Rebuilds the modifier maps from the spells running on the own character (`hud_stats/buffs.rs`); the window calls it every update.
-    pub fn refresh_buffs(&mut self, get: Get, active: &[ao_net::n3::spells::Spell]) {
+    pub fn refresh_buffs(&mut self, get: Get, active: &[ao_net::n3::spells::Spell], wear: &[ao_net::n3::spells::Spell], attack: Option<&[(u32, i32)]>) {
         let (ch, lock) = (Character::from_stats(get), get(buffs::LOCK_STAT).unwrap_or(0));
         let tables = &self.tables;
         let current = |stat: u32, m: &Modifiers| buffs::skill_value(tables, stat, get(stat).unwrap_or(0), &ch, m, lock);
-        self.mods = super::buffs::modifiers(active, get(stats::LEVEL).unwrap_or(0), &current);
+        self.mods = super::buffs::modifiers_with_equipment(active, wear, get(stats::LEVEL).unwrap_or(0), &current);
+        // `FUN_10081c67` truncates each weighted term, then adds AMSModifier only for a positive armed total.
+        self.ams = match attack {
+            None => self.value(get, 100) + self.value(get, 276),
+            Some(weights) => {
+                let sum: i32 = weights.iter().map(|&(skill, weight)| self.value(get, skill) * weight / 100).sum();
+                if sum > 0 { sum + self.value(get, 276) } else { sum }
+            }
+        };
+    }
+
+    /// `GetSkill(stat, 2)`, without the Skills window's pending ability points (which belong to mode 4).
+    pub fn value(&self, get: Get, stat: u32) -> i32 {
+        let raw = if stat == 22 { self.ams } else { get(stat).unwrap_or(0) };
+        buffs::skill_value(&self.tables, stat, raw, &Character::from_stats(get), &self.mods, get(buffs::LOCK_STAT).unwrap_or(0))
+    }
+
+    /// Reuses the map allocation; raw values remain untouched so trickle-down is never added twice.
+    pub fn publish(&self, zone: &mut super::super::zone::Zone) {
+        let mut values = std::mem::take(&mut zone.skill_values);
+        values.clear();
+        let get = |id| zone.stat(id);
+        let ch = Character::from_stats(get);
+        let lock = get(buffs::LOCK_STAT).unwrap_or(0);
+        for id in zone.stats.keys().chain(self.mods.bonus.keys()).chain(self.mods.percent.keys()).copied().chain([22]) {
+            if values.contains_key(&id) { continue; }
+            let raw = if id == 22 { self.ams } else { get(id).unwrap_or(0) };
+            values.insert(id, buffs::skill_value(&self.tables, id, raw, &ch, &self.mods, lock));
+        }
+        zone.skill_values = values;
     }
 
     pub fn row(&self, get: Get, stat: u32) -> Row {
@@ -222,6 +253,34 @@ mod tests {
     /// Hand-made tables: a single skill (stat 152) costing `factor / 10 * n` IP, maximum 3 raw points at level 1.
     fn tiny() -> Model {
         Model::new(SkillTables::default(), vec![])
+    }
+
+    #[test]
+    fn attack_rating_rebuilds_from_buffed_skills_and_weapon_weights() {
+        let get = stats_of(&[(22, 999), (100, 11), (112, 17), (276, 3)]);
+        let mut m = tiny();
+        let wear = [ao_net::n3::spells::spell(0xcf35, &[(0, 100), (0x27, 4)])];
+        m.refresh_buffs(&get, &[], &wear, None);
+        assert_eq!(m.value(&get, 22), 18, "unarmed: Martial Arts + wear bonus + AMSModifier");
+        m.refresh_buffs(&get, &[], &wear, Some(&[(100, 33), (112, 67)]));
+        assert_eq!(m.value(&get, 22), 18, "truncate each weighted term: 4 + 11 + 3");
+        m.refresh_buffs(&get, &[], &[], Some(&[]));
+        assert_eq!(m.value(&get, 22), 0, "an armed empty attack list is not Martial Arts");
+    }
+
+    #[test]
+    fn published_values_refresh_without_overwriting_raw_stats() {
+        let mut z = super::super::super::zone::Zone::new(42);
+        z.stats.insert(91, 10);
+        let active = [ao_net::n3::spells::spell(0xcf35, &[(0, 91), (0x27, 123)])];
+        let mut m = tiny();
+        m.refresh_buffs(&|id| z.stat(id), &active, &[], None);
+        m.publish(&mut z);
+        assert_eq!((z.stat(91), z.skill_value(91)), (Some(10), Some(133)));
+        z.stats.insert(91, 20);
+        m.refresh_buffs(&|id| z.stat(id), &active, &[], None);
+        m.publish(&mut z);
+        assert_eq!((z.stat(91), z.skill_value(91)), (Some(20), Some(143)));
     }
 
     #[test]

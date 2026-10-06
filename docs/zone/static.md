@@ -73,8 +73,17 @@ u32 element count
 elements: { u32 type; u32 sub; payload }       ; FUN_1002b297 [GC] (switch on type/sub)
   {0x0F,0x17}  stats:  u32 size word (n+1)*0x3F1, n × (u32 stat, i32 value)     <- ALWAYS the first element (119540/119540)
   {0x15,0x21}  names:  u16 name len, u16 description len, name, description
-  {0x02,*}     SpellData_t list (FUN_100a6c58)        {0x04,4} {0x14,0x13} {0x16,0x24} {0x17,0x25} ... (not needed)
+  {0x02,*}     SpellData_t list: positive size word (n+1)*1009, n < 1000, n spells (FUN_100a6c58)
 ```
+
+Tower info event lists 24/25/26 are decoded by `play/chat/info_template_spells.rs`, using the same
+`ao_net::n3::spells::read_spell` format reader with LE BinaryStream primitives (string bytes unchanged).
+The walker follows `FUN_1002b297`: stats, names, spell lists, integer multimaps
+(`FUN_1007d59f` / `FUN_1007d6d5`) and attribute criteria (`FUN_1008a007` →
+`FUN_10084ed0`). Invalid size words, truncated records, unsupported elements and unsupported spell
+payloads return errors instead of empty modifiers. Real rdb 1000020:201534 has list24
+`0xcf35` stat91 value1 target2, list26 `0xcf35` stat92 value1 target2, and no list25.
+Regression checks include that conditional real record and malformed/truncated small records.
 
 Example (rdb 1000020:248371, 271 bytes, the captured vending machine): `5b c7 00 00 | 03 00 00 00 | 0f 00 00 00 17 00
 00 00 | 5b 2b 00 00` = kind 0xC75B, 3 elements, stat list of 10 pairs: ItemClass 0, Can 8, Flags 0x80023203, Placement 0,
@@ -160,24 +169,19 @@ All 7: 5 empty cloth entries (part 0..4, texture 0), no `TextureData`, a `HeadMe
 The cloth/texture lists of NPC corpses are therefore empty: the model's default skin/textures show. A **player** corpse would
 carry cloth textures and a head (not captured).
 
-**Pose / animation [CODE, resolved]: none, the corpse is drawn unanimated (bind pose).** `Corpse_t`'s overrides never start a clip:
-`FUN_1007e7e2` (visual init, vtable `+0x7c`) = cloth `SetCATTexture`, then (stat `HeadMesh` 0x40 != 0) `SetSkinData` +
-`AddAttractorMesh(0, head, 2, 0)` (no `ClearAttractors` here), then `SetBodyScale(MonsterScale/100)`; `FUN_1007e622` / `FUN_1007e642`
-(vtable `+0xc0` / `+0xc8`) set / clear the looter flag `+0x1f0` and call `FUN_1007e11e` / `FUN_1007e198` (register / unregister the looting
-character in its `+0x1d0` component via `FUN_10058816` + `FUN_1003f5b2` / `FUN_1003f3b2`, dynel flag 0x80 / stat 0x62, effects 0x12 / 0x13: no
-animation call); `FUN_1007e8e1` (slot `+0x6c`) = a clamped stat read (0..100000, else 100) and an `LDBformat` text feed; `+0x50` returns 2
-(`FUN_1007e61c`); `FUN_1007e072` = collision flags; the ctor `FUN_1007e652` only sets stats. `VisualCATMesh_t::SetMesh` [DS 0x100728b7] only
-issues the async load (`FUN_10070656`); its completion `FUN_100704b8` creates the `RCATMesh` / `CATRender_t::SetMesh` without an animation, and
-`VisualCATMesh_t::SetAnimation` [DS 0x10073f23] has no caller inside DisplaySystem (export only).
-The only Gamecode path that animates an item is the spell **0xCF27** (`FUN_100a59f5` case 0xcf0b / 0xcf27 / 0xcf2a -> `FUN_100a4dcc`; every
-captured corpse carries one): `stat 5 != 0` targets `GetDynel(stat5, stat6)`, else the executing dynel (= the corpse); for a `SimpleItem_t`
-target with `stat 0x2d == 0`: `key` = the item's stat 0x1a1 (`CorpseAnimKey`) unless it is -1, then the spell's stat 7; **only `key < 100`** runs
-`FUN_10010e36(item, key, 1)` = `FUN_10010c57(key)` name rule (social ids 1..0x46) -> `VisualCATMesh_t::SetAnimation`. The captured spell
-arguments `(5,6,7,0x2d,0x2f,0x30,0xb) = (1,0,0,0,0,0,0x1f7)` and the absent `CorpseAnimKey` give key 0 (no social name) or, if the 0x1f7 were
-stat 7, 503 (the die animation id, but >= 100): no clip in both readings. The pose is therefore what an unanimated `CATRender` shows: the
-vertices as stored (bind pose); `build_corpse` uses `ActorRig::pose(None)` (test `corpse_is_unanimated`). The earlier "last frame of the die
-clip" guess is removed. **[UNRESOLVED]** a server-sent `CorpseAnimKey` 1..99 (never captured): the social clip would start (meaning of the
-`SetTime(handle, 0.0, total)` arguments not traced).
+**Pose / animation [CODE + DATA]: hold the final death pose.** The earlier bind-pose conclusion decoded the spell arguments at the wrong offset.
+`SpellFormat_c::SpellFormat_c` [GD 0x1000fa93] adds four standard values **before** the type arguments.
+The captured corpse therefore has standard `(1,0,0,0)` and type arguments
+`(stat5,stat6,stat7,stat0x2d,stat0x2f,stat0x30,stat0xb) = (0,0,503,1,4,NPC-record,0)`.
+`FUN_100a4dcc` [GC 0x100a4dcc], nonzero stat0x2d branch, sees stat0x2f = 4:
+`FUN_1004dd31(stat0x30)` selects the NPC record, `FUN_1004d8f9(stat7)` resolves key 503,
+then `FUN_100109db(item, animation, 0, 1, 1)` applies it. The social-only `<100` branch is **not** taken.
+`build_corpse` resolves the same NPC record/key and holds its terminal pose; retail lying corpses contradict the old bind-pose assertion.
+`FUN_100109db` [GC 0x100109db] calls `SetAnimation(..., layer0, ..., rate1)` then, with its final argument = 1,
+sets both `SetTime` bounds to `GetTotalTime(handle)`: **the last frame is held**. Verified by headless `DumpAddr.java`
+on the existing `playfield/P_Gamecode` project (0x100109db, 0x1004dd31, 0x1004d8f9).
+
+**Live interaction check (2026-10-06, Aomacrceg, ICC beach):** Beach Leet 1034868 received action 99/key 503 at 75696 ms; its quit and corpse `{0xC76A,9150}` arrived at 78671 ms, in that order (2975 ms later). The only Health `StatIIR` in this exchange set health to 4 before the final kill; no separate health-zero stat arrived. The real offscreen play flow showed the low corpse beside the avatar's feet (partially occluded by the avatar), with no living-character selection. After moving the chat frame away, real mouse clicks at 668,492 then right-click at 636,500 opened **Remains of Beach Leet** with an item visible in its loot grid; the corpse remained a `Can=8` prop afterwards. `live_walk` passed. The helper now rejects GUI-covered pick points, so clicking the chat menu cannot masquerade as a corpse-use test.
 
 ### Spell record (`GameData::SpellData_t`, GC list reader `FUN_100a6c58`, GD `operator>>` 0x1000d686)
 
@@ -185,12 +189,10 @@ clip" guess is removed. **[UNRESOLVED]** a server-sent `CorpseAnimKey` 1..99 (ne
 4), `SpellData_t::ReadBinaryCriteria` [GD 0x1000d49f] = `i32 count (≤ 1000)` + `count × Criterion_t`, then `SpellFormat_c::ReadBinary`
 [GD 0x1000f39e/0x1000f95c]: one value per argument of the type's format (`BinaryToValue` [GD 0x1000f01d]: `ComplexType` 1 = `i32 len + bytes`,
 anything else `i32`; `GetBaseType` GD 0x1000eac0). The formats are built in `SpellFormats_c::SpellFormats_c` [GD 0x1000fb0a]. Type 0xCF27
-has 7 integer arguments (stats 5, 6, 7, 0x2d, 0x2f, 0x30, 0xb). The corpse's spell is (all 7):
-`cf27 <id> 4 | 0 | 1 0 0 0 0 0 0x1f7 | 1 4 <x> 0` with `x` = 0xb331 / 0x44f7 / 0x762c for junkbot / cutecreature / giant_snake.
-**[UNRESOLVED]** the last four integers (`1 4 x 0`): the decoded format has 7 arguments, `SpellData_t::operator>>` reads nothing after
-them and the corpse owner identity (`{0xC350, CorpseInstance}`) provably starts after them in all 7 captures. `Corpse` therefore keeps them as
-`CorpseSpell::tail` and refuses any spell type other than 0xCF27 v4 or with criteria. Item records show the same shape for other types
-(`cf16 0 4 | 0 | 9 values`, `cf0a`, `cf35`), so the same gap applies to them.
+has seven integer type arguments (stats 5, 6, 7, 0x2d, 0x2f, 0x30, 0xb), preceded by four standard arguments.
+The corpse's complete spell is `cf27 <id> 4 | criteria-count 0 | standard 1 0 0 0 | type 0 0 0x1f7 1 4 <NPC-record> 0`.
+There is no unexplained tail: the old `CorpseSpell::tail` was the last four type arguments.
+The parser now exposes `standard` and correctly aligned `args`, with the original captured bytes in its regression.
 
 ## 6. Vending machines (`VendingMachineFullUpdate`, kind 0xC75B)
 

@@ -14,10 +14,13 @@
 //!
 //! UNRESOLVED: the scrolling of the controller (`scroll_offset` of the config, mouse wheel) is ours (wheel over the area, pages that end up
 //! completely outside the screen are hidden: no window clipping); the header's popup menu (the "i" button, `FUN_10048736`: one entry of `LDBface::GetText(0x2710, ..)`
-//! whose key is not decompiled), drag to reorder / undock (`FUN_10048d3f`: `dockableview/view` drag object) and the header art colours.
+//! whose key is not decompiled) and the header art colours. Header reorder/undock and free-window tab grouping live in `docks.rs`.
 
 use ao_gui::{CanvasItem, Event, GfxId, Gui, InputEvent, WindowId, WindowSize};
 use std::path::Path;
+
+mod docks;
+use docks::{DockGroup, PageDrag};
 
 /// Width of the area, inclusive pixels (`Rect(W - 191, ..., W, ...)`).
 pub const AREA_W: u32 = 192;
@@ -51,6 +54,9 @@ struct Page {
     key: String,
     window: WindowId,
     expanded: bool,
+    title: String,
+    docked: bool,
+    wrapped: bool,
 }
 
 pub enum RollupEvent {
@@ -69,6 +75,8 @@ pub struct Rollup {
     scroll: f32,
     /// The dock config changed since [`Rollup::take_dirty`].
     dirty: bool,
+    groups: Vec<DockGroup>,
+    drag: Option<PageDrag>,
 }
 
 /// Strips the quotes around a dvalue string (`value='"wear_window"'`).
@@ -105,10 +113,11 @@ pub fn read_scroll(src: &str) -> Option<f32> {
 impl Rollup {
     pub fn new(dir: &Path, screen: (u32, u32)) -> Self {
         let config = std::fs::read_to_string(dir.join("prefs/NewChar/DockAreas/RollupArea.xml")).map(|s| read_config(&s)).unwrap_or_default();
-        Self { config, pages: vec![], screen, scroll: 0.0, dirty: false }
+        Self { config, pages: vec![], screen, scroll: 0.0, dirty: false, groups: vec![], drag: None }
     }
 
     pub fn set_screen(&mut self, gui: &mut Gui, screen: (u32, u32)) {
+        self.resize_groups(gui, screen);
         self.screen = screen;
         self.layout(gui);
     }
@@ -141,7 +150,7 @@ impl Rollup {
         let w = AREA_W;
         let src = format!(
             "<root><View view_layout=\"vertical\" h_alignment=\"left\">\
-             <View view_layout=\"stacked\" min_size=\"Point({w},{header})\" max_size=\"Point({w},{header})\"><CanvasView name=\"header_bg\" min_size=\"Point({w},{header})\" max_size=\"Point({w},{header})\"/>\
+             <View name=\"rollup_header\" view_layout=\"stacked\" min_size=\"Point({w},{header})\" max_size=\"Point({w},{header})\"><CanvasView name=\"header_bg\" min_size=\"Point({w},{header})\" max_size=\"Point({w},{header})\"/>\
              <View view_layout=\"horizontal\" v_alignment=\"top\">{}<TextView name=\"title\" value=\"{}\" layout_borders=\"Rect(8,2,0,2)\"/><HLayoutSpacer/>{}{}</View></View>\
              <View view_layout=\"stacked\" name=\"body\" h_alignment=\"left\" min_size=\"Point({w},{bh})\" max_size=\"Point({w},{bh})\"><CanvasView name=\"body_bg\" min_size=\"Point({w},{bh})\" max_size=\"Point({w},{bh})\"/>{view_xml_inner}</View>\
              </View></root>",
@@ -167,7 +176,7 @@ impl Rollup {
         let mut bg = vec![CanvasItem::Solid { dst: [0.0, 0.0, w as f32, bh], color: 0x404040, alpha: 1.0 }];
         bg.extend(image(gui, BG, [0.0, 0.0, w as f32, bh]));
         gui.set_canvas(window, "body_bg", bg);
-        let mut page = Page { key: key.to_string(), window, expanded: cfg.expanded };
+        let mut page = Page { key: key.to_string(), window, expanded: cfg.expanded, title: title.to_string(), docked: true, wrapped: false };
         self.paint_arrow(gui, &mut page, arrow);
         if !cfg.expanded {
             gui.show_collapsing(window, "body", false);
@@ -196,6 +205,7 @@ impl Rollup {
             let p = self.pages.remove(i);
             gui.close_window(p.window);
             self.layout(gui);
+            self.sync_groups(gui);
         }
     }
 
@@ -205,14 +215,26 @@ impl Rollup {
         }
     }
 
+    /// Size an owner wrapper from its page height, not its free-resize ceiling.
+    fn resize_page(&self, gui: &mut Gui, page: &Page) {
+        if page.wrapped {
+            let height = self.config.iter().find(|c| c.key == page.key).unwrap().height;
+            gui.set_view_pref_size(page.window, "body", (0.0, height), (16000.0, height));
+            gui.resize_window(page.window, WindowSize::Preferred);
+            gui.set_view_pref_size(page.window, "body", (0.0, height), (16000.0, 16000.0));
+        } else {
+            gui.resize_window(page.window, WindowSize::Preferred);
+        }
+    }
+
     /// Places the pages (`FUN_10048232`): top to bottom from the area top minus the scroll offset, [`GAP`] px apart.
     pub fn layout(&mut self, gui: &mut Gui) {
         let (x, top, _) = self.area();
-        let total: i32 = self.pages.iter().map(|p| gui.window_size(p.window).1 as i32 + GAP).sum();
+        let total: i32 = self.pages.iter().filter(|p| p.docked).map(|p| gui.window_size(p.window).1 as i32 + GAP).sum();
         let max_scroll = (total - (self.screen.1 as i32 - AREA_BOTTOM - top)).max(0) as f32;
         self.scroll = self.scroll.clamp(0.0, max_scroll);
         let mut y = top - self.scroll as i32;
-        for p in &self.pages {
+        for p in self.pages.iter().filter(|p| p.docked) {
             let h = gui.window_size(p.window).1 as i32;
             gui.set_window_pos(p.window, (x, y));
             // no clipping of windows: a page entirely outside the screen is hidden
@@ -226,7 +248,7 @@ impl Rollup {
         let mut p = self.pages.remove(i);
         p.expanded = on;
         gui.show_collapsing(p.window, "body", on);
-        gui.resize_window(p.window, WindowSize::Preferred);
+        self.resize_page(gui, &p);
         self.paint_arrow(gui, &mut p, size);
         if let Some(c) = self.config.iter_mut().find(|c| c.key == p.key) {
             c.expanded = on;
@@ -239,6 +261,9 @@ impl Rollup {
     /// Header clicks and the wheel over the area.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event) -> Option<RollupEvent> {
         let Event::CanvasClick { window, view, .. } = ev else { return None };
+        if self.pages.iter().any(|p| p.window == *window && !p.docked) {
+            return None;
+        }
         let i = self.pages.iter().position(|p| p.window == *window)?;
         match view.as_str() {
             "arrow" => {
@@ -248,12 +273,14 @@ impl Rollup {
                 Some(RollupEvent::Handled)
             }
             "close" => Some(RollupEvent::Closed(self.pages[i].key.clone())),
-            _ => Some(RollupEvent::Handled),
+            "icon" | "header_bg" => Some(RollupEvent::Handled),
+            _ => None,
         }
     }
 
     /// Mouse wheel over the area scrolls the column.
     pub fn input(&mut self, gui: &mut Gui, ev: &InputEvent) {
+        self.drag_input(gui, ev);
         if let InputEvent::Wheel { x, y, dy } = *ev {
             let (left, top, bottom) = self.area();
             if x >= left as f32 && y >= top as f32 && y < bottom as f32 && !self.pages.is_empty() {
@@ -264,21 +291,6 @@ impl Rollup {
         }
     }
 
-    /// `RollupController_c` dtor / `DockingController_c` 0x1003a0a1: the dock's `dock_config` (`dock_node_configs` = `page_height` + `is_page_expanded` per view in
-    /// dock order, `docked_view_identities`, `scroll_offset`) as the `DockAreas/RollupArea.xml` file of the shipped template.
-    pub fn config_xml(&self) -> String {
-        let mut nodes = String::new();
-        let mut ids = String::new();
-        for c in &self.config {
-            nodes += &format!("<Archive code=\"0\"><Float name=\"page_height\" value=\"{:.6}\" /><Bool name=\"is_page_expanded\" value=\"{}\" /></Archive>", c.height, c.expanded);
-            ids += &format!("<String value='&quot;{}&quot;' />", c.key);
-        }
-        format!(
-            "<Archive code=\"0\"><Archive code=\"0\" name=\"dock_config\"><Array name=\"dock_node_configs\">{nodes}</Array><Array name=\"docked_view_identities\">{ids}</Array>\
-             <Float name=\"scroll_offset\" value=\"{:.6}\" /></Archive><String name=\"dock_type\" value='&quot;RollupController&quot;' /><String name=\"dock_name\" value='&quot;RollupArea&quot;' /></Archive>",
-            self.scroll
-        )
-    }
 
     /// The character's own `DockAreas/RollupArea.xml` (the HUD is built before the prefs are read): order, page state and scroll replace the template's.
     pub fn load_user(&mut self, gui: &mut Gui, src: &str) {
@@ -303,9 +315,9 @@ impl Rollup {
         self.dirty = false;
     }
 
-    /// The file text when something changed since the last call (a page expanded / collapsed / added, the column scrolled).
-    pub fn take_dirty(&mut self) -> Option<String> {
-        std::mem::take(&mut self.dirty).then(|| self.config_xml())
+    /// Dock snapshots are written only once the user's interaction finishes.
+    pub fn take_dock_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
     }
 }
 

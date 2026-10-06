@@ -21,8 +21,7 @@
 //!   overlays, 2 ("detailed") draws everything. A negative mouse position hides the pointer.
 //! * The character rule (`CheckObjectUnderMouse`, character branch): see [`choose`].
 //!
-//! UNRESOLVED: the branch for items / doors / corpses (skill `0x1e` flags bits 0, 3, 0x100000: pointer BLUE with PICKUP / OPERATE
-//! details) is traced but unreachable: `Zone::dynels` holds characters only, so no other object can be under the pointer here.
+//! Items / doors / corpses use skill `0x1e` (`Can`): bit 0 takes precedence over bit 3, selecting BLUE with PICKUP / OPERATE.
 //! The own character is never picked (`hud_pick.rs`), so its GREEN `(2, −1, −1)` case does not occur. Others' `Team` (stat 6) and
 //! `HasVulnerableFightMode` (Gamecode 0x10016fea: a playfield PvP rule `FUN_1003e228` — 2: sides differ, 3: teams differ and nonzero,
 //! 4: always — whose source was not traced) are not known: team counts as different and the rule as 0 (never vulnerable by it).
@@ -59,17 +58,20 @@ impl Pointer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Detail {
     Attack,
+    Pickup,
+    Operate,
     Lookat,
     Talk,
     Trade,
 }
-// Rows PICKUP 0x147, OPERATE 0x144, QUESTION 0x149 and DENIED 0x145 exist in the table but only the item / door branch of
-// `CheckObjectUnderMouse` (unreachable here, see the header) and the overlay rule "no badge for DENIED" use them: not modelled.
+// QUESTION 0x149 and DENIED 0x145 are not requested by the implemented hover rules.
 
 impl Detail {
     pub fn gfx(self) -> GfxId {
         GfxId(match self {
             Detail::Attack => 0x146,
+            Detail::Pickup => 0x147,
+            Detail::Operate => 0x144,
             Detail::Lookat => 0x148,
             Detail::Talk => 0x14a,
             Detail::Trade => 0x14b,
@@ -155,6 +157,22 @@ pub fn choose(h: &Hover, shift: bool, ctrl: bool, dblclick: bool) -> Mouse {
     m
 }
 
+/// The non-character `Can` branch of GUI 0x10019f00. Shift overrides the left detail, not the right action.
+pub fn choose_object(can: i32, shift: bool, dblclick: bool) -> Mouse {
+    let right = if can & super::interact_use::CAN_PICK_UP != 0 {
+        Some(Detail::Pickup)
+    } else if can & super::interact_use::CAN_USE != 0 {
+        Some(Detail::Operate)
+    } else {
+        None
+    };
+    Mouse {
+        pointer: if right.is_some() { Pointer::Blue } else { Pointer::Standard },
+        left: if shift { Some(Detail::Lookat) } else if dblclick { right } else { None },
+        right,
+    }
+}
+
 /// `FUN_10020120` for `MouseCursorMode` `mode`: the details to show and whether the click overlays are drawn.
 pub fn apply_mode(mode: i64, m: Mouse) -> (Mouse, bool) {
     match mode {
@@ -201,6 +219,19 @@ pub fn draw(size: impl Fn(GfxId) -> (u32, u32), mode: i64, pos: (f32, f32), m: M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_can_details_follow_pickup_precedence_and_modifiers() {
+        for (can, detail) in [(1, Detail::Pickup), (8, Detail::Operate), (9, Detail::Pickup)] {
+            assert_eq!(choose_object(can, false, true), Mouse { pointer: Pointer::Blue, left: Some(detail), right: Some(detail) });
+            assert_eq!(choose_object(can, false, false).left, None);
+            assert_eq!(choose_object(can, true, false), Mouse { pointer: Pointer::Blue, left: Some(Detail::Lookat), right: Some(detail) });
+        }
+        assert_eq!(choose_object(0, false, true), Mouse::default());
+        assert_eq!(choose_object(0, true, true).left, Some(Detail::Lookat));
+        assert_eq!(Detail::Pickup.gfx(), GfxId(0x147));
+        assert_eq!(Detail::Operate.gfx(), GfxId(0x144));
+    }
 
     fn player() -> Hover {
         Hover { side: 2, own_side: 1, ..Default::default() }

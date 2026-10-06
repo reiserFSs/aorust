@@ -32,6 +32,16 @@ outgoing.md §5.1.
   `Apply` (action vftable [1]; the `Transition_t` stores the old state at +8 and the new one at +0x38, `FUN_1007034e/1007035a`).
   `FUN_1006c469` IsMoving = forward axis 2 || strafe axis 2 || jump 3 || mode 7.
 
+### FullUpdate vehicle initialization
+
+The own character previously kept the constructor's remembered Walk mode instead of deserializing its FullUpdate vehicle blob; leaving water therefore returned a server-initialized runner to Walk.
+`PlayerVehicle_t` primary vtable `0x10160bbc`, slot `+0xac` (`0x10160c68`), points to [GC `0x1007135d`]: it calls `0x1006f03e`, then reads four floats into inputs `+0x360..+0x36c`.
+`0x1006f03e` reads a velocity vec3 through `0x1000404e`, calls `0x1006c4dc` for the FSM at vehicle `+0x178`, then calls `Vehicle_t::SetVel`.
+`0x1006c4dc` calls `0x10070438` (ten FSM bytes), then reads the remembered mode as an integer into FSM `+0x30`.
+Thus the 42-byte player blob is velocity (three big-endian floats, bytes 0..12), ten FSM bytes (12..22), remembered mode (big-endian i32, 22..26), and forward/strafe/turn/elevate input floats (26..42).
+The hook does not execute transition actions or synthesize inputs from axes. `Movement::restore_blob` reuses `Status::from_blob`, restores serialized velocity and player inputs, and recalculates the model's per-mode speed parameters. `Player::new` applies it after initial ground placement because placement clears axes and inputs. Short/unknown-mode blobs rejected by `Status::from_blob`, or non-finite serialized velocity/input floats, leave movement unchanged.
+
+
 ## 2. Move types 1..0x2A (`FUN_1006c60f` jump table [GC 0x1006d0ee], 42 entries; verified entry by entry in the assembly)
 
 Names = RTTI/vftable names of the `TransitionAction_t` classes (vftable, Apply = vftable[1]). Entries `0x13 0x14 0x16 0x1f 0x20` (and every id
@@ -178,6 +188,9 @@ side-3 NPCs by the given metres) and the harness now ends a `goto` when the own 
 * **Swimming**: the nearest deep water by a walkable route is the lake at (773, 8.8, 589) (the plateau's south-east foot; the nearer pools at (592, 89, 521) / (592, 59, 565) are not
   reachable by the collision route). A 576-cell `goto` (`AOMAC_LIVE_AVOID=8`, around the Pumpkin-Head line) ended with the FSM in **mode 4 (Swim)** at y 9.99 (surface 10.0): the avatar holds the IdleSwim clip (0xc3, arms out, shot inspected; night 20:49 RKT, so the shot is dark).
   The earlier harness `water` scan mixed the server and the collision z axis (`player::to_col` negates z) and pointed `goto=400:-147` at the wrong place; fixed with a test.
+* **Swim → ground restores Run** (post-fix, offscreen real live flow, audio muted): `AOMAC_LIVE_CHAR=Aomacvolk AOMAC_LIVE_AVOID=8 AOMAC_LIVE_STEPS='wait=2,pos,goto=773:589,pos,goto=760:575,pos,W=1,pos' cargo test --release -p aomac live_walk -- --ignored --nocapture`.
+  The received own blob restored remembered Run at login. The second route crossed deep water at (768.43, 9.99, 583.20), FSM **4**, then emerged at (760.13, 15.01, 581.31), FSM **3**, with remembered Run unchanged. On dry land a one-second forward hold moved (760.19, 17.03, 575.24) → (756.34, 18.80, 575.65), rather than the 1.5 m/s Walk mode. No run-toggle key was used. Live test passed.
+  Integrated-snapshot `movement::tests` passed all 25 cases, including `full_update_restores_speed_axes_and_player_inputs` (also checks explicitly remembered Walk, invalid blobs and no outgoing messages).
 
 ## 5. Mouse look (`N3Msg_MouseMovement(dx, dy)` [GC 0x1964b], `N3Msg_EndMouseMovement` [GC 0x19a38])
 

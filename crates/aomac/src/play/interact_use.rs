@@ -56,7 +56,7 @@ pub(super) enum UseOut {
 #[derive(Default)]
 pub struct UseUi {
     dialogs: Dialogs<Identity>,
-    loot: LootUi,
+    pub(super) loot: LootUi,
     /// The client directory (item records and icons of the loot window).
     dir: Option<PathBuf>,
     /// `Play::time`, for the double click of the loot window.
@@ -110,13 +110,39 @@ impl Interact {
     }
 
     /// `N3Msg_DefaultActionOnDynel` [GC 0x100291da] on any dynel (double click; the right click on a character). Not the own character. A character
-    /// follows [`Interact::default_action`]; for an object [`decide`] over its `Can` picks `GetItem` / `UseItem(id, false)`.
+    /// Alive characters dialogue first, then player trade or NPC use; dead characters use. Fight gates read the target's controller, not ours.
     pub fn default_action_on(&mut self, zone: &Zone, id: Identity) -> Action {
+        if id == self.own_id() {
+            return Action::None;
+        }
         if id.kind == DYNEL_CHAR {
-            return match self.default_action(id.instance) {
-                Action::None => self.trade_action(zone, id.instance),
-                a => a,
-            };
+            let Some(target) = zone.dynels.get(&id.instance) else { return Action::None };
+            let flags = zone.stat_of(id.instance, 0).unwrap_or(0);
+            if flags & 0x8000000 != 0 {
+                return Action::None;
+            }
+            if zone.stat_of(self.own as i32, 0x296).unwrap_or(0) != 0 {
+                self.use_ui.feedback.push("Feedback_NotInVehicle");
+                return Action::Refused("Feedback_NotInVehicle");
+            }
+            let usable = flags & 0x200000 != 0;
+            if !zone.world.is_dead(id.instance) {
+                if zone.stat_of(id.instance, super::interact::STAT_TALK as u32).is_some_and(|v| v & 1 != 0) {
+                    self.send(ao_net::n3::knubot::open_chat_window(self.own_id(), id));
+                    return Action::Talk;
+                }
+                if !target.npc || !usable {
+                    return if zone.fight_target.contains_key(&id.instance) { Action::None } else { self.trade_action(zone, id.instance) };
+                }
+            }
+            if zone.fight_target.contains_key(&id.instance) {
+                return Action::None;
+            }
+            if usable && zone.stat_of(self.own as i32, 0).unwrap_or(0) & 8 != 0 {
+                self.send(ao_net::n3::trade::abort(self.own_id(), true));
+                return Action::Abort;
+            }
+            return self.use_item(zone, id, false);
         }
         match Self::can_of(zone, id).map(decide) {
             Some(Action::Get) => self.get_item(zone, id),
@@ -204,6 +230,12 @@ impl Interact {
     /// the header must be a character, the container a `Chest_t`; the contents are replaced, the window opens with the message's flag).
     pub(super) fn watch_objects(&mut self, gui: &mut Gui, m: &Message) {
         match &m.body {
+            N3::Inventory(InventoryMsg::Bank(entries)) if m.header.target == self.own_id() => {
+                let container = Identity { kind: 0xdead, instance: self.own as i32 };
+                let u = inventory::InventoryUpdate { capacity: 0x66, kind: 3, entries: entries.clone(), container, word: 0, flag: true };
+                let ui = &mut self.use_ui;
+                ui.loot.update(gui, ui.dir.as_deref(), self.screen, container, "Bank", &u);
+            }
             N3::World(World::Corpse(c)) => {
                 let name = c.base.blob.split(|&b| b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
                 self.use_ui.names.insert((m.header.target.kind, m.header.target.instance), name);
@@ -279,6 +311,42 @@ mod tests {
 
     fn payloads(i: &mut Interact) -> Vec<Vec<u8>> {
         i.take_outbox().into_iter().map(|f| f.payload).collect()
+    }
+
+    #[test]
+    fn character_default_action_follows_original_branch_order() {
+        use crate::play::zone::DynelState;
+        let own = 1;
+        let npc = Identity { kind: DYNEL_CHAR, instance: 2 };
+        let mut zone = Zone::new(own);
+        for (id, is_npc) in [(1, false), (2, true)] {
+            zone.dynels.insert(id, DynelState { name: id.to_string(), pos: [0.0; 3], yaw: None, npc: is_npc, side: 0, level: 1, health: 10, max_health: 10 });
+        }
+        let mut i = Interact::new(own, (800, 600));
+        zone.character_stats.entry(2).or_default().insert(0x300, 1);
+        zone.character_stats.entry(2).or_default().insert(0, 0x8000000);
+        assert_eq!(i.default_action_on(&zone, npc), Action::None);
+        zone.character_stats.entry(2).or_default().insert(0, 0x200000);
+        zone.stats.insert(0x296, 1);
+        assert_eq!(i.default_action_on(&zone, npc), Action::Refused("Feedback_NotInVehicle"));
+        assert!(payloads(&mut i).is_empty());
+        zone.stats.insert(0x296, 0);
+        zone.fight_target.insert(2, 1);
+        assert_eq!(i.default_action_on(&zone, npc), Action::Talk, "dialogue precedes the target fight gate");
+        assert_eq!(i.take_outbox()[0].payload, ao_net::n3::knubot::open_chat_window(i.own_id(), npc));
+        zone.character_stats.entry(2).or_default().insert(0x300, 0);
+        assert_eq!(i.default_action_on(&zone, npc), Action::None);
+        zone.fight_target.clear();
+        assert_eq!(i.default_action_on(&zone, npc), Action::Use);
+        assert!(matches!(ao_net::n3::decode(&i.take_outbox()[0]).unwrap().body, N3::Misc(Misc::GenericCmd(_))));
+        zone.stats.insert(0, 8);
+        assert_eq!(i.default_action_on(&zone, npc), Action::Abort);
+        assert_eq!(i.take_outbox()[0].payload, ao_net::n3::trade::abort(i.own_id(), true));
+        zone.character_stats.entry(2).or_default().insert(0, 0);
+        assert_eq!(i.default_action_on(&zone, npc), Action::Trade, "NPCs without the use flag take the trade branch");
+        assert_eq!(i.take_outbox()[0].payload, ao_net::n3::trade::start(i.own_id(), npc));
+        assert_eq!(i.default_action_on(&zone, i.own_id()), Action::None);
+        assert_eq!(i.default_action_on(&zone, Identity { kind: DYNEL_CHAR, instance: 99 }), Action::None);
     }
 
     #[test]

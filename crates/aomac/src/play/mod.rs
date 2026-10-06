@@ -24,6 +24,7 @@ mod hud_compass;
 mod hud_dialog;
 mod hud_faction;
 mod hud_perks;
+mod hud_pet;
 mod hud_team;
 mod hud_wincfg;
 mod hud_winb;
@@ -46,9 +47,11 @@ mod interact;
 mod interact_chat;
 mod interact_grid;
 mod interact_loot;
+mod interact_mission;
 mod interact_play;
 mod interact_ptrade;
 mod interact_shop;
+mod interact_bank;
 mod interact_trade;
 mod interact_use;
 mod logout;
@@ -330,18 +333,20 @@ impl Play {
             dir,
         })
     }
-}
 
-pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String>) -> Result<()> {
-    let audio = Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok();
-    let p = Play::new(dir.clone(), fake_charlist, server_arg, audio)?;
-    {
-        let (tx, dir) = (p.tx.clone(), dir);
+    fn start_backdrop(&self) {
+        let (tx, dir) = (self.tx.clone(), self.dir.clone());
         std::thread::spawn(move || {
             let r = RecordStore::open(&dir).and_then(|s| screens::login_world_scene(&s, 0)).map(Box::new).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Bg::Backdrop(r));
         });
     }
+}
+
+pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String>) -> Result<()> {
+    let audio = Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok();
+    let p = Play::new(dir.clone(), fake_charlist, server_arg, audio)?;
+    p.start_backdrop();
     if fake_charlist.is_none() {
         let tx = p.tx.clone();
         std::thread::spawn(move || {

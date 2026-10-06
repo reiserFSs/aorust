@@ -72,9 +72,8 @@ pub enum OwnEvent {
     Relocated { parent: Identity, pos: Option<[f32; 3]> },
     /// `FightModeUpdate_t` [GC 0x10124b70] for the current playfield (the district table is the player's, `fightmode.rs`).
     FightMode(ao_net::n3::server_move::FightModeUpdate),
-    /// `AppearanceUpdateIIR_c` [GC 0x10071679] of the own dynel: its attractor meshes `(AttractorPlace_e, rdb 1010001 mesh)` replace the current ones
-    /// (wield / unwield of a weapon: the weapon mesh in a hand attractor, docs/zone/avatar.md §5).
-    Attractors(Vec<(u8, u32)>),
+    /// `AppearanceUpdateIIR_c` [GC 0x10071679]: cloth deltas and the replacement attractor set.
+    Appearance(ao_net::n3::world::AppearanceUpdate),
 }
 
 /// Events of the client-initiated teleport path (`n3EngineClientAnarchy_t::StartTeleportTry` / `TeleportTrier_t`, docs/zone/world.md §10.2).
@@ -103,9 +102,24 @@ pub struct Zone {
     clock: Option<f32>,
     /// `GameTime_t+0x4C`, the game day (`GameTimeIIR_t.arg3`); seeds the weather schedule (docs/zone/world.md §10).
     pub game_day: i32,
-    /// The own character's stats: `FullCharacterIIR_t` (stats_a, stats_b, u8, i16, map groups) then every own `StatIIR_t`
+    /// The own character's raw stats: `FullCharacterIIR_t` (stats_a, stats_b, u8, i16) then every own `StatIIR_t`.
     /// (docs/zone/world.md §2; the interface reads them like `N3Msg_GetSkill`). [`ao_formats::stats`] names the ids.
     pub stats: HashMap<u32, i32>,
+    /// FullCharacter +0x44 replaces modifier object +8 (`FUN_10073a2f` / `FUN_1006416c`), not the raw stat array.
+    pub stat_adjustments: HashMap<u32, i32>,
+    /// Own `GetSkill(stat, 2)` projection, refreshed from raw stats and modifier maps before HUD consumers.
+    pub skill_values: HashMap<u32, i32>,
+    /// Per-character skills received from full dynel updates and `StatIIR_t` (GC `N3Msg_GetSkill`).
+    pub character_stats: HashMap<i32, HashMap<u32, i32>>,
+    /// Latest InfoPacket per character (`GC 0x1003e694` replaces the cached packet).
+    pub info_packets: HashMap<Identity, ao_net::n3::info::InfoPacket>,
+    /// Organization-name registry populated by `OrgInfoPacketIIR_t` (`FUN_1003f4fb`).
+    pub org_names: HashMap<i32, String>,
+    /// Generated quest alternatives, retained for the original itemid information pages.
+    pub mission_alternatives: HashMap<Identity, ao_net::n3::quest::Quest>,
+    pub quests: HashMap<Identity, ao_net::n3::quest::Quest>,
+    /// GameTime's server unix clock, advanced with frame time (GC GameTime_t +0xb4).
+    server_unix: Option<f64>,
     /// The own inventory by slot (`FullCharacterIIR_t` inventory; slots 0..0x3f equipment pages, 0x40.. bag; docs/gui.md §11.5).
     pub inventory: HashMap<u32, ao_net::n3::world::InventoryEntry>,
     /// The contents of the chests / corpses the server sent (`InventoryUpdateIIR_t`, `FUN_100a040e`): container identity -> (`word`, entries by slot).
@@ -124,6 +138,8 @@ pub struct Zone {
     /// `(action, duration)` of the own relayed `CharacterActionIIR_t` actions `0x14` (the recharge feed, `identity_b = {action, duration}`;
     /// [GC 0x1005e2cd]); `Hud::update` drains it into the special-action list.
     pub recharge_feed: Vec<(i32, i32)>,
+    /// `GC 1005e49b`: `(Action_e, template)` registered by own CharacterAction 0xb4.
+    pub special_registration_feed: Vec<(u32, u32)>,
     /// The own pet list (`dynel+0x1d8` -> `+0x1c`, `AddPetIIR_c` / `RemovePetIIR_c`; docs/zone/pets.md): service towers included.
     pub pets: Vec<Identity>,
     /// The spells currently running on the own character (`FullCharacterIIR_t` list, `ApplySpellsIIR_t`): their stat bonuses are the buffs of
@@ -179,7 +195,28 @@ impl Zone {
 
     /// An own stat (`INVALID` markers are never stored).
     pub fn stat(&self, id: u32) -> Option<i32> {
+        // `FUN_10051fa2`: NPCNumPets is the pet list's size, not a stale received stat.
+        if id == 0x1ca {
+            return Some(self.pets.len() as i32);
+        }
         self.stats.get(&id).copied()
+    }
+
+    pub fn skill_value(&self, id: u32) -> Option<i32> {
+        if id == 0x1ca { return self.stat(id); }
+        self.skill_values.get(&id).copied().or_else(|| self.stat(id))
+    }
+
+    pub fn skill_value_of(&self, instance: i32, id: u32) -> Option<i32> {
+        if instance == self.char_id as i32 { self.skill_value(id) } else { self.stat_of(instance, id) }
+    }
+
+    pub fn stat_of(&self, instance: i32, stat: u32) -> Option<i32> {
+        if instance == self.char_id as i32 {
+            self.stat(stat).or_else(|| self.character_stats.get(&instance)?.get(&stat).copied())
+        } else {
+            self.character_stats.get(&instance)?.get(&stat).copied()
+        }
     }
 
     /// `FullCharacter` Activate [GC 0x10073a2f]: each group is applied in order, skipping the `0x499602D2` marker.
@@ -197,9 +234,16 @@ impl Zone {
     /// `GameDayTime` second per real second.
     pub fn tick(&mut self, dt: f32) {
         self.nanos.tick(dt);
+        if let Some(t) = &mut self.server_unix {
+            *t += f64::from(dt);
+        }
         if let Some(t) = &mut self.clock {
             *t = (*t + dt).rem_euclid(GAME_DAY_SECS / TIME_SPEED);
         }
+    }
+
+    pub fn server_now(&self) -> Option<u32> {
+        self.server_unix.map(|t| t.max(0.0) as u32)
     }
 
     /// `n3EngineClientAnarchy_t::StartTeleportTry` [GC 0x10018f9a] after the movement sync: creates the `TeleportTrier_t` (its constructor gets
@@ -231,6 +275,9 @@ impl Zone {
         self.world.clear();
         self.containers.clear();
         self.dynels.clear();
+        self.character_stats.clear();
+        self.info_packets.clear();
+        self.mission_alternatives.clear();
         self.fight_target.clear();
         self.own_events.clear();
         self.parents.clear();
@@ -256,8 +303,109 @@ impl Zone {
         *self.counts.entry(m.header.msg_type).or_default() += 1;
         let who = m.header.target;
         self.world.on_message(&m);
+        // Death and corpse replacement invalidate the living character selection even before its quit arrives.
+        let removed = match &m.body {
+            N3::World(World::Corpse(c)) if c.owner.kind == CHAR_KIND => Some(c.owner.instance),
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == 99 => Some(who.instance),
+            N3::Dynel(Dynel::Stat(s)) if who.kind == CHAR_KIND && s.stats.iter().any(|&(id, value)| id as u32 == ao_formats::stats::HEALTH && value <= 0) => Some(who.instance),
+            N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => Some(who.instance),
+            _ => None,
+        };
+        if removed.is_some_and(|id| self.target == Some(id)) {
+            self.target = None;
+        }
+        if let N3::World(World::Corpse(c)) = &m.body {
+            if c.owner.kind == CHAR_KIND {
+                self.dynels.remove(&c.owner.instance);
+                self.character_stats.remove(&c.owner.instance);
+                self.fight_target.remove(&c.owner.instance);
+            }
+        }
+        if who.kind == CHAR_KIND {
+            match &m.body {
+                N3::Dynel(Dynel::Stat(u)) => {
+                    self.character_stats.entry(who.instance).or_default().extend(u.stats.iter().filter(|s| s.1 != ao_formats::stats::INVALID).map(|s| (s.0 as u32, s.1)));
+                }
+                N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
+                    let s = self.character_stats.entry(who.instance).or_default();
+                    s.extend([(0, u.flags2 as i32), (1, u.max_health), (4, u.breed as i32), (0x1b, u.health), (0x21, u.side as i32), (0x36, u.level as i32), (0x3b, u.sex as i32), (0x185, u.expansion as i32), (0x294, u.account_flags as i32), (0x2a1, u.visual_flags as i32)]);
+                    if let ao_net::n3::dynel::CharClass::Npc(n) = &u.class {
+                        s.extend([(0x184, n.tower_type as i32), (0x1c7, n.npc_family as i32), (0x200, n.pet_type as i32)]);
+                        // NPC-only dialogue flag (`SimpleChar+0x21c`, GC 0x1007850f–0x10078539).
+                        s.insert(0x300, i32::from(u.flags & (1 << 27) != 0));
+                    }
+                    if let Some(master) = u.pet_master {
+                        s.insert(0xc4, master);
+                    }
+                    if who.instance == self.char_id as i32 {
+                        self.stats.insert(0, u.flags2 as i32);
+                    }
+                }
+                _ => {}
+            }
+        }
         self.nanos.on_message(who, Identity { kind: CHAR_KIND, instance: self.char_id as i32 }, &m.body);
         match m.body {
+            N3::Trade(t) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                // Trade start sets Flags bit 8; abort/complete clear it (`FUN_100661bf`, `FUN_100666a3`, `FUN_100668d1`).
+                let flags = self.stat_of(who.instance, 0).unwrap_or(0);
+                let flags = match t.op {
+                    ao_net::n3::trade::START => flags | 8,
+                    ao_net::n3::trade::ABORT | ao_net::n3::trade::COMPLETE => flags & !8,
+                    _ => flags,
+                };
+                self.stats.insert(0, flags);
+                self.character_stats.entry(who.instance).or_default().insert(0, flags);
+            }
+            N3::MissionSelection(alternatives) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                self.mission_alternatives = alternatives.missions.into_iter().map(|a| (a.quest.id, a.quest)).collect();
+            }
+            N3::World(World::Quests(update)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                if update.quests.len() == update.quest_count {
+                    self.quests = update.quests.into_iter().map(|q| (q.id, q)).collect();
+                }
+            }
+            N3::World(World::Info(packet)) => {
+                // `InfoPacket_t::Apply` [GC 0x10045fba]: shared sentinel stats, then remote-character stats.
+                let stats = self.character_stats.entry(who.instance).or_default();
+                for (id, value) in [(0x267, packet.v3c), (0x268, packet.v40), (0xa9, packet.v44)] {
+                    if value != ao_net::n3::world::STAT_UNSET {
+                        stats.insert(id, value);
+                        if who.instance == self.char_id as i32 { self.stats.insert(id, value); }
+                    }
+                }
+                if who.instance != self.char_id as i32 {
+                    if let Some(dynel) = self.dynels.get_mut(&who.instance) {
+                        dynel.health = packet.v20;
+                        dynel.max_health = packet.v24;
+                    }
+                    for (id, value) in [(0x3c, packet.v32 as i32), (0xa, packet.v33 as i32), (0x25, packet.v34 as i32), (0x170, packet.v35 as i32), (0x1b, packet.v20), (1, packet.v24)] {
+                        stats.insert(id, value);
+                    }
+                    if self.dynels.get(&who.instance).is_some_and(|d| d.npc) {
+                        stats.insert(0xcc, packet.v28);
+                        stats.insert(5, packet.v2c);
+                    }
+                    if packet.flags & 0x10 != 0 {
+                        if let Some(values) = packet.side_xp {
+                            for (i, value) in values.into_iter().enumerate() { stats.insert(0x231 + i as u32, value); }
+                        }
+                    }
+                    if let Some(values) = packet.player_values {
+                        for (id, value) in [0x2a2, 0x2a3, 0x2a4, 0x2a6, 0x2a8, 0x2aa, 0x2ab, 0x2ac].into_iter().zip(values) { stats.insert(id, value); }
+                    }
+                }
+                self.info_packets.insert(who, *packet);
+            }
+            N3::World(World::OrgInfo(org)) => {
+                if who.kind == CHAR_KIND {
+                    self.character_stats.entry(who.instance).or_default().insert(5, org.org_id);
+                    if who.instance == self.char_id as i32 {
+                        self.stats.insert(5, org.org_id);
+                    }
+                }
+                self.org_names.insert(org.org_id, org.name);
+            }
             N3::World(World::Playfield(p)) => {
                 let id = p.rdb_playfield().map_or(p.playfield_id, |i| i.instance) as u32;
                 self.playfield = Some(id);
@@ -268,13 +416,14 @@ impl Zone {
             N3::World(World::GameTime(t)) => {
                 self.clock = Some(day_time_of(t.time));
                 self.game_day = t.arg3;
+                self.server_unix = Some(f64::from(t.arg4));
                 return ZoneEvent::Time;
             }
             N3::World(World::FullCharacter(c)) if who.instance == self.char_id as i32 => {
                 self.apply_stats(c.stats_a.iter().chain(&c.stats_b).copied());
                 self.apply_stats(c.stats_u8.iter().map(|s| (s.0 as u32, s.1 as i32)));
                 self.apply_stats(c.stats_i16.iter().map(|s| (s.0 as u32, s.1 as i32)));
-                self.apply_stats(c.stat_map.iter().map(|s| (s.0 as u32, s.1)));
+                self.stat_adjustments = c.stat_map.iter().map(|s| (s.0 as u32, s.1)).collect();
                 // `FUN_1002aeca` replaces the character's inventory vector by the message's elements
                 self.inventory = c.inventory.iter().map(|e| (e.slot, *e)).collect();
                 self.set_effects(&c.spells);
@@ -342,17 +491,27 @@ impl Zone {
                 let v = |p: &ao_net::n3::misc::Vec3| [p.x, p.y, p.z];
                 self.own_events.push(OwnEvent::Follow { mode: f.mode, target: (f.target.kind == CHAR_KIND && f.target.instance != 0).then_some(f.target.instance), pos: v(&f.pos), path: f.path.iter().map(v).collect() });
             }
-            // `AppearanceUpdateIIR_c::Activate`: `ClearAttractors` + `AddAttractors(wire list)`; `own_update` follows so a rebuilt avatar keeps the weapon
+            // Keep the full-update snapshot current as well as applying the live appearance delta.
             N3::World(World::Appearance(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
-                let list: Vec<(u8, u32)> = a.attractors.iter().filter(|t| t.b > 0).map(|t| (t.a, t.b as u32)).collect();
                 if let Some(u) = self.own_update.as_mut() {
+                    for c in &a.cloth {
+                        u.cloth.retain(|old| old.page != c.c || old.part() != c.id);
+                        u.cloth.push(ao_net::n3::dynel::ClothData { raw: c.packed, texture: c.b, page: c.c, extra: (c.packed > 0 && (c.packed >> 16) as i16 > 0).then_some((c.d, c.e)) });
+                    }
                     u.attractors = a.attractors.iter().map(|t| ao_net::n3::dynel::AttractorMesh { place: t.a, mesh: t.b, field: t.c, byte: t.d }).collect();
+                    u.flags &= !ao_net::n3::dynel::flag::SET_DYNEL_800;
+                    u.head_mesh = a.attractors.iter().find(|t| t.a == 0).map(|t| t.b).filter(|&mesh| mesh > 0);
+                    u.visual_flags = a.visual_flags;
+                    u.mode = a.extra;
                 }
-                self.own_events.push(OwnEvent::Attractors(list));
+                self.own_events.push(OwnEvent::Appearance(a));
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 if a.action == 0x14 {
                     self.recharge_feed.push((a.identity_b.kind, a.identity_b.instance));
+                }
+                if a.action == 0xb4 && a.identity_b.kind > 0 && a.identity_a.instance > 0 {
+                    self.special_registration_feed.push((a.identity_b.kind as u32, a.identity_a.instance as u32));
                 }
                 // `FUN_1005d0d8` case 0x5a (action 0xd0, 0x1005e8b5): `SetStat(identity_b.kind, identity_b.instance)` on the drained character (Health / Nano)
                 if a.action == 0xd0 && a.identity_b.kind > 0 {
@@ -390,6 +549,7 @@ impl Zone {
             }
             N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => {
                 self.dynels.remove(&who.instance);
+                self.character_stats.remove(&who.instance);
                 self.fight_target.remove(&who.instance);
             }
             N3::Misc(Misc::Attack(a)) if who.kind == CHAR_KIND && a.target.kind == CHAR_KIND => {
@@ -547,6 +707,20 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn incoming_trade_updates_the_local_trade_flag() {
+        use ao_net::n3::{outgoing::n3_frame, trade};
+        let mut z = Zone::new(42);
+        let own = Identity { kind: CHAR_KIND, instance: 42 };
+        z.stats.insert(0, 0x200);
+        for (op, expected) in [(trade::START, 0x208), (trade::ABORT, 0x200), (trade::START, 0x208), (trade::COMPLETE, 0x200)] {
+            let payload = trade::Trade { op, a: Identity::default(), b: Identity::default() }.encode(own);
+            z.on_frame(&n3_frame(0, 42, payload));
+            assert_eq!(z.stat_of(42, 0), Some(expected));
+            assert_eq!(z.character_stats[&42][&0], expected);
+        }
+    }
+
     /// `GameTimeIIR_t` 67170 s (live capture) = 18:39:30 of the 27 h day = 4478 s of the 6480 s sky clock; it runs 1 s per real second and wraps.
     #[test]
     fn game_time_sets_the_sky_clock() {
@@ -644,6 +818,45 @@ mod tests {
     }
 
     #[test]
+    fn full_character_adjustment_map_is_not_raw_stats() {
+        let mut w = ao_net::Writer::default();
+        w.u32(ao_net::n3::world::FULL_CHARACTER);
+        Identity { kind: CHAR_KIND, instance: 42 }.write(&mut w);
+        w.u8(0);
+        w.u32(26);
+        for _ in 0..3 { w.u32(0x3f1); } // inventory, list18, triples24
+        for _ in 0..3 { w.u32(0); w.u32(0); } // effect groups
+        w.u32(2 * 0x3f1);
+        w.u32(52); w.i32(150);
+        for _ in 0..3 { w.u32(0x3f1); } // stats_b, u8, i16
+        w.i32(1);
+        w.u32(52); w.i32(999);
+        w.u32(0); // no equipment blocks
+        for _ in 0..3 { w.u32(0x3f1); } // identities, spells, perks
+        let mut z = Zone::new(42);
+        z.on_frame(&ao_net::n3::outgoing::n3_frame(0, 42, w.0));
+        assert_eq!(z.stat(52), Some(150));
+        assert_eq!(z.stat_adjustments.get(&52), Some(&999));
+    }
+
+    #[test]
+    fn organization_packet_updates_character_membership_and_registry() {
+        let mut z = Zone::new(42);
+        let own = Identity { kind: CHAR_KIND, instance: 42 };
+        let mut w = ao_net::Writer::default();
+        w.u32(ao_net::n3::world::ORG_INFO_PACKET);
+        own.write(&mut w);
+        w.u8(0);
+        w.i32(123);
+        w.str_i16("Test Organization");
+        z.on_frame(&ao_net::n3::outgoing::n3_frame(0, 42, w.0));
+        assert_eq!(z.stat_of(42, 5), Some(123));
+        assert_eq!(z.org_names.get(&123).map(String::as_str), Some("Test Organization"));
+        z.reset_world();
+        assert_eq!(z.org_names.get(&123).map(String::as_str), Some("Test Organization"));
+    }
+
+    #[test]
     fn own_stats_from_full_character_and_stat_deltas() {
         use ao_formats::stats as st;
         let mut z = Zone::new(33512);
@@ -660,6 +873,12 @@ mod tests {
         assert!(!z.stats.values().any(|&v| v == st::INVALID));
         // other dynels' StatIIR must not leak into the own stats
         assert!(health.windows(2).any(|w| w[0] != w[1]) || !health.is_empty());
+        for (&id, d) in z.dynels.iter().filter(|(id, _)| **id != z.char_id as i32) {
+            assert_eq!(z.stat_of(id, st::LEVEL), Some(d.level));
+            assert_eq!(z.stat_of(id, st::HEALTH), Some(d.health));
+        }
+        z.reset_world();
+        assert!(z.character_stats.is_empty());
     }
 
     /// Moving NPCs (move types 1/2 = forward start/stop) travel along `scene_forward(yaw)`: the heading handedness.

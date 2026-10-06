@@ -398,6 +398,37 @@ are **not** read by the selection screen.
 2. otherwise (**the normal first-run case**): `CCCharacter_t::SetBreed(breed, sex, 0)` [0x1011ae14] = default naked character of that
    breed/sex with head index **0**.
 
+The native creation path now seeds that same `CharacterViewer.xml` cache when login reply **0x11** supplies the new character identity
+(`ao-net/msg.rs::CharacterCreated`, body = one i32; `create/scenes.rs::create_session_event`). It snapshots the submitted request before sending,
+then writes its actual head mesh, breed/sex and build-resolved body mesh under the acknowledged id, preserving other entries.
+Previously no native writer existed: a successfully created non-default head therefore fell through to head index 0 on selection.
+The preview lookup also uses `CharacterEntry.id`, not the nested `CharacterInfo.id`, matching `CharacterData_t::ReadBlobStream` [0x100011c5].
+`CharacterInfo` versions >3 do carry head/height/width; v3 omits them (`msg.rs::CharacterEntry::read`), so absence is not universal and those fields
+are not a replacement for the viewer cache. Native selection additionally uses a positive list head when no cache exists, as explicitly requested
+for server-supplied appearance; this extends the historical retail fallback above, without overriding cached equipment. Regression:
+`supplied_list_head_is_used_and_missing_legacy_head_falls_back` checks that branch; `created_head_survives_reload_under_acknowledged_identity`
+checks persisted distinct heads and build across reload. The ignored `live_walk` hook `AOMAC_LIVE_CC=<name> AOMAC_LIVE_SELECT_AFTER=1` asserts the chosen head is non-default and
+cached, drops the world session and builds a fresh selection frontend with the acknowledged id (deliberately different nested info id),
+waits for GPU preview upload and saves `select-after.png` under `AOMAC_LIVE_SHOTS`. It does not claim a server-refreshed list.
+It also accepts `AOMAC_LIVE_CHAR=<existing created character>` to retry the selection capture without creating another character; that route
+checks the cached head is non-default but does not compare it with the current creation preferences.
+The ignored **offline** `cached_created_select_shot` needs only `AOMAC_SELECT_ID`, `AOMAC_PREFS_DIR` and `AOMAC_LIVE_SHOTS`; it renders the saved
+appearance through a fresh `Play`/`Offscreen` selection frontend without credentials or a live connection. Both screenshot routes wait for
+`char_ready` instead of the former fixed two-second delay, which could capture a still-blank asynchronously built preview.
+`Host::set_scene` invalidates queued reposes and actor updates from the replaced scene before upload; applying such a queued pose to a different
+mesh topology violates `Renderer::repose`'s same-scene contract. `replacing_scene_discards_pending_old_topology_updates` covers that queue boundary.
+The harness now calls the same `Play::start_backdrop` bootstrap as native `run`; previously only `run` spawned the login-world loader, so
+`Play::new`-based harnesses could never display a selection preview. `tick_preview` also retains queued `First`/`Clip` output until that
+asynchronous backdrop exists, covered by `preview_first_waits_for_backdrop_instead_of_losing_upload`.
+
+**Observed verification (2026-10-06, CharVisuals integrated snapshot):** live creation of `Aomacchvq` succeeded with acknowledged id **33578**,
+submitted head **40099**, height **110**, build **2**. The saved cache contains `MeshID=23365, HeadID=40099, Breed=4, Sex=1, Fatness=2`.
+`cached_created_select_shot` passed in **0.44 s**, and the backdrop-race regression passed in **0.01 s**. Inspection of `select-after.png`
+showed the real LoginWorld backdrop and fat Atrox in orange default outfit, with dark swept hair matching the selected creation `cc-1` head.
+Earlier attempts to reuse the still-active world frontend failed with mismatched GPU buffers; that unsupported test transition was replaced by
+the fresh real selection frontend above, not treated as a successful check. The observed shot verifies saved created appearance, not a new
+server-fetched character list.
+
 `CCCharacter_t` [GUI 0x1011ad5f ctor, `ChangeMesh` 0x1011ab53, `PlayAnim` 0x1011a6b0, `RunFunction` 0x1011a7d6]:
 
 * body model = rdb **1010002** (0xf6952) named `<breed>_<sex><build>.cir`, breed names `solitus/opifex/nanomage/athrox`

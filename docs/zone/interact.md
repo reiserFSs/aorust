@@ -90,7 +90,7 @@ item), `N3Msg_NPCChatEndTrade` 0x10017fb1 (flag = `!param_4`), `N3Msg_SendNPCCha
   4. `LAB_1005834a` -> `N3Msg_UseItem(npc, false)` (`GetInstance` 0x101a772c + `N3Msg_UseItem` 0x101a75f0; for a character target [GC 0x100286f8] builds the `ItemActionData{own, target}`
      `GenericCmd_t` command 3 of §8, `Interact::use_object`).
   Enable flags (`FUN_10058ed8`): description = `b20` of `KnubotOpenChatWindow`, trade = `b21`, use = bit 21 of the NPC's stat 0 (`N3Msg_GetSkill(npc, 0, 2) >> 21 & 1`, read when the window
-  is built; ours tracks stat 0 of every dynel from the `StatIIR_t` frames, `Interact::trade.flags0` -- [INFERENCE] that the server sends stat 0 for NPCs), info always. The bar is its own window
+  is built; ours reads `Zone::stat_of` from the shared full-update / `StatIIR_t` character skills, without a separate dialogue cache), info always. The bar is its own window
   `Window(Rect(50, 50, 100, 100), "", "", style 2, flags 0x183c)` with one tab titled `GetText(10000, "Tab_Tools")` (never shown: style 2 = the black 0.85 alpha background, no frame), shown and docked
   to the chat window with `Window::DockWindow(slot 5)`: `Window::LayoutDockedWindows` [GUI 0x101550ed] puts slot 5 left aligned below the window (`x = L, y = B + 1`, inclusive rect); slot 2
   (the trade window) at `x = R, y = T` stacked downwards. Port: `interact_chat::{ChatTexts, BarFlags, dock_below, dock_right}`, tests in `interact_chat` / `interact_trade`.
@@ -101,15 +101,53 @@ item), `N3Msg_NPCChatEndTrade` 0x10017fb1 (flag = `!param_4`), `N3Msg_SendNPCCha
 [GC 0x100291da], called from `ActionViewMouseHandler_c`'s release (docs/zone/combat-net.md §5.2) with the identity under the pointer. For a **character** [CODE]:
 
 1. `HasStat(0x8000000)` of the target -> nothing; the own character's stat `0x296` ( = in a vehicle) non-zero -> chat feedback `Feedback_NotInVehicle`.
-2. Stat `0x300` of the target (no name in the client's table; the server sends it as `StatIIR_t` pair `(0x300, 0|1)` per NPC, docs/zone/dynel.md §3) with **bit 0** -> `KnubotOpenChatWindowIIR_c`
-   (header = own character, NPC identity, `0, 0`; `FUN_10127f4d`) -- this is the dialogue.
-3. Otherwise, outside a fight (`controller+0x44 == 1`): `N3Msg_TradeStart(target)` (player trade; **not ported**), or `N3Msg_UseItem` / `TradeAbort`.
+2. For a living target (`SimpleChar+0x138` bit 4 clear), stat `0x300` bit 0 opens `KnubotOpenChatWindowIIR_c` (header = own character, NPC identity, `0, 0`; `FUN_10127f4d`).
+3. Otherwise a living target that is a player (`+0x21c == 0`) or lacks Flags bit `0x200000` starts player trade only when the **target's** fight controller (`+0x1d4`, `+0x44`) is idle (1).
+4. All remaining characters use the same target-idle gate. With target Flags `0x200000` and own Flags bit 8, abort the trade (`N3Msg_TradeAbort(true)`); otherwise `N3Msg_UseItem(target, false)`.
+
+The target controller in steps 3–4 is explicit in the decompile of 0x100291da; the previous description incorrectly called this the own character's fight state. `+0x21c` is NPC and `+0x138` bit 4 is dead (docs/zone/combat-log.md §1; death action 99, combat-anim.md). Self identity is rejected before all branches.
 
 For a non-character `Identity` (item / world object): stat `Can` (0x1e) bit 0 -> `N3Msg_GetItem`, bit 3 (8) -> `N3Msg_UseItem(identity, false)`.
 
 `N3Msg_UseItem` [GC 0x100286f8] for a world object: not an inventory item, not a character -> `GenericCmd_t` (`52526858`) `state 0, seq, cmd 3` with
 `ItemActionData{flag 0, actor = own character, item = the object}` (`FUN_1003aa0f`, `FUN_1007c95c(actor, data, 3)`), queued with the engine's `vtable+0x2c`
 (docs/zone/misc.md §8 has the layout; the server's confirmations are the `state 1` copies in the capture).
+
+## 4. Interaction inventory and original access paths
+
+This client version does **not** open a world/dynel popup for right-click: GUI `FUN_1002c469` button 2 calls DefaultActionOnDynel for kind 50000, UseItem otherwise (§8.1). A new popup with Info/Follow/Assist/Trade/Invite would not reproduce that handler. GUI import cross-references corroborate the access paths below: `TeamJoinRequest` pointer 0x101a77c0 is used by `SlotForceInviteDlg` 0x1007b2c9, selected-target invite 0x10077c8e, and LFT invite 0x100eff95; `AssistFight` pointer 0x101a78a8 is used by the chat handler 0x100b7bc5. These are not `AppendMenuEntry` builders.
+
+| Target / action | Original path | Message / window |
+|---|---|---|
+| Quest giver / conversational NPC | Right-click or left double-click, stat 0x300 bit 0 | KnuBot open, append text, answer list; NPCChatWindow (§1–2) |
+| NPC give-items trade | NPC chat Give button, server b21 | KnuBot StartTrade / Trade / FinishTrade; NPC trade bar (§11) |
+| NPC shop/use | NPC Flags bit 21; chat Shop button or default action | UseItem GenericCmd 3; server-selected trade/shop window (§13) |
+| Player trade | World default action, living idle player | TradeIIR START; TradeView (§10) |
+| NPC / player Info | Shift+left click; NPC chat Info button; team-row InfoOn menu | charid URL, RequestInfoPacket; InfoView |
+| Player Follow | `/follow`, including initial hotbar Follow macro | FollowTargetIIR_c, key 0x260f3671 (chat/cmd.md) |
+| Player Assist | `/assist` | N3Msg_AssistFight 0x10027374 reads target's fight target |
+| Team invite | Team Recruit button; normal special action; chat/LFT invite | TeamJoinRequest CharacterAction 0x1a; team window (hud_team.rs) |
+| Pet commands | CommandMenu → PetMenu.xml | RunChatScript `/pet follow/behind/wait/guard/attack/terminate/report/heal`; text-command codecs |
+| Door / terminal / ground item / corpse | Right-click UseItem; left double-click Can bit 0 GetItem, else bit 3 UseItem | ClientGetItem or GenericCmd 3; server response decides container/shop/mission/bank/grid UI |
+| Item onto NPC / object | Inventory drag released over dynel | GenericCmd 0x20 character, 5 object (§8.7) |
+
+Features stat 0xe0 controls attackability pointers (NPC 0x20000000; player 0x4000001), follow permission, and grid window bit 0x800 (§7). It does not imply an invented world menu. The pet menu's XML Actions and special-action categories are the existing ControlMenu subsystem, not world right-click popups.
+
+## 5. Bank and reclaim
+
+`BankIIR_t` key 0x343c287f reads the inventory vector (`FUN_10071fcf` → `FUN_10125657` → `FUN_1002a41a`); `BankCorpseIIR_t` key 0x52213420 reads the same vector followed by an i32 reclaim instance (`FUN_10071e42`). Bank activation 0x10072002 assigns own instance to `{0xdead, own}`, registers it and opens the container through GlobalSignals +0x84; reclaim activation 0x10071e95 registers `{0xdeae, wire_instance}` without the open flag.
+
+GUI `SlotContainerOpened` 0x100c71a3 builds the same `InventoryView_c` type 1 as a corpse (0x100cc2ca), with `bank_window` and bank IconPosition map type 3. `ItemContainerView_c` 0x100cdb3a gives banks **102 cells**, ordinary chests 21; banks are not registered for Esc closure. `interact_bank.rs` / `interact_loot.rs` reuse the container renderer with variable capacity and scrolling. The reused 3×7-cell visible viewport is [INFERENCE], not a retail screenshot measurement; saved bank frame and icon-position persistence remain the container renderer's unresolved configuration path.
+
+Bank items have identity `{0x69, slot}`. Deposit is `ContainerAddItemIIR_t` to the bank; confirmation assigns the first free bank cell 0..101 (`FUN_100492fa`). Withdrawal uses MoveItemToInventory and the first free bag cell (`FUN_10046a3d`, ignoring the confirmation's requested slot). `/bank close` is local (`FUN_10046bdd`), routed through the chat game action to `Interact::bank_close`; it sends no command. Regression checks cover bank/reclaim wire bounds, 102-cell window behavior and confirmed inventory transfers.
+
+## 6. NPC and player information
+
+`charid://kind/instance` is not the item generator 0x100384f3 (which returns empty for character kinds). GUI 0x100ee05c → 0x10031011 requests the character packet. GC `N3Msg_RequestInfoPacket` 0x10027271 → 0x1003f5fc builds **CharacterActionIIR_t action 0x69**, identity_a = requested character, param = 0, identity_b = zero, empty text; header = own and passed-on byte 0 (constructor 0x1007253f).
+
+`InfoPacketIIR_t` key 0x4d38242e (registration 0x1000f4f2, constructor 0x1007495e) reads via 0x100749bf → 0x10045d02. The full conditional layout is implemented in `ao-net/n3/info.rs`, including grid destination lists (0x10128f1e) and ACG items (0x1004662a). Activation 0x10074a1d → 0x10045fba applies the packet's numeric skills and 0x1003e694 caches it in the info holder at +0x7c and emits GlobalSignals +0x34. `Zone::info_packets` retains those packets; the existing InfoView request/response path invokes the character HTML renderer instead of discarding charid URLs. GUI formatter dispatcher 0x1003843f selects NPC 0x100336fb or player 0x10033db4.
+
+
 
 ## 7. Grid / whompah / shuttle (`GridDestinationSelectIIR_t`, `GridSelectedIIR_t`, `TeleportTarget_c`)
 
@@ -200,7 +238,7 @@ a dynel we do not know = nothing happens), then `Can` = `GetStat(0x1e, 2)`:
 | else bit 3 (8) | `N3Msg_UseItem(id, false)` |
 | else | nothing |
 
-`interact_use::decide(can)` is that table (`CAN_PICK_UP` / `CAN_USE`); `Interact::default_action_on(zone, identity)` is the whole function (character -> `default_action`).
+`interact_use::decide(can)` is that table (`CAN_PICK_UP` / `CAN_USE`); `Interact::default_action_on(zone, identity)` also implements the character branches of §3.
 `Can` per object: `Dynels::stat_of(kind, instance, 0x1e)` = the message stats (full update, `StatIIR_t` for a non-character) over the template's (`Built::stats` = `effective_stats` of the
 rdb 1000020 record, built on the worker); `Corpse_t`'s constructor [GC 0x1007e652] presets **Can = 8** (`FUN_10088d80(0x1e, 8)`) and stat `0x1b3` = 1. The captured vending machine's template has Can 8.
 
@@ -232,7 +270,7 @@ triangles (`FUN_1006bb2a`, docs/gui.md §13.2); the box stands in for it (the bo
 nothing but arm the double click), so the original's `SetTarget` on an item (`N3Msg_isIDOnGround`) is not reproduced.
 
 ### 8.6 Harness API (`Interact`)
-`default_action_on(&zone, identity) -> Action` (`None / Talk / Get / Use / Confirm / Refused(key)`), `default_action(instance)` (characters), `use_item(&zone, identity, confirmed)`, `get_item(&zone, identity)`,
+`default_action_on(&zone, identity) -> Action` (`None / Talk / Get / Use / Trade / Abort / Confirm / Refused(key)`), `use_item(&zone, identity, confirmed)`, `get_item(&zone, identity)`,
 `use_object(identity)` (the raw `GenericCmd` 3, used after Yes), `Interact::can_of(&zone, identity) -> Option<i32>`, `take_feedback()` (refusal keys; `Play::interact_frame` prints them from chat category 110),
 `take_outbox()`, and (`cfg(test)`) `loot_dump(&mut gui)`. `interact_use::decide(can)` / `CAN_PICK_UP` / `CAN_USE` / `CAN_CONFIRM`.
 
@@ -312,9 +350,8 @@ decompile hides): **not ported** [UNRESOLVED].
 
 ### 10.2 Default action
 
-`N3Msg_DefaultActionOnDynel` [GC 0x100291da] on a character that is not talkable (stat `0x300` bit 0), the own character not fighting (`controller+0x44 == 1`): `Interact::trade_action`. The fight state is
-`Zone::fight_target` (the relayed `AttackIIR_t` / `StopFightIIR_t` model). The bounding sphere radius of the characters is per model and not known: [GUESS] 0.5 m each (the body collision default), i.e.
-the centres may be 6.0 m apart. The `TowerType` of the target is not tracked (assumed 0). `Feedback_TargetOutsideRangeForTrade` goes to the chat.
+`N3Msg_DefaultActionOnDynel` [GC 0x100291da] dispatches to player trade for a living non-dialogue character without the NPC use flag, subject to the **target's** idle fight controller (§3). The fight state is `Zone::fight_target` (relayed `AttackIIR_t` / `StopFightIIR_t`).
+`N3Msg_TradeStart` also checks TowerType and range (§10.1). Per-character skills are retained by `Zone::character_stats` / `stat_of` from `SimpleCharFullUpdateIIR_t` and `StatIIR_t`; full updates supply NPC `TowerType`. The bounding sphere radius of characters is still unresolved: the existing range check uses [GUESS] 0.5 m each, permitting centres 6.0 m apart. `Feedback_TargetOutsideRangeForTrade` goes to the chat.
 
 ### 10.3 The window (`TradeView_c`, GUI.dll 0x100e092f; `PlayerTrade` of `Views/TradeGUI.xml`)
 
@@ -429,14 +466,14 @@ Header target = the machine, flag byte 0. Body: `i32 (n + 1) * 0x3f1` (`FUN_1009
 **`{0x6f, index}`** (`FUN_100153eb(&{0x6f, i}, ...)`, appended to the list at `+0x1e4`)); an empty result says **`Feedback_ShopContainsNoEntries`**. These are the only two shop classes the client registers (`s_ShopUpdateIIR_t` 0x101568e8 and the already known `VendingMachineFullUpdateIIR_t` 0x101569fc: grep of the symbol table for `Shop` / `Vending`).
 
 ### 13.2 Starting the trade [CODE + LIVE]
-`TradeIIR_t` op 0 with a **non-zero `b`** (the player trade has `b == 0`, §10.1). Header = own character: `FUN_100663e4` (`a` = the machine, a `VendingMachine_t`) computes the type (`FUN_1009959d` = the currency stat id, default 0x3d Cash; `FUN_100995e0` selects type 1 `ShopTrade` or **2 `ShopBuy`**: the plain machine is type 2 [INFERENCE: the function's body is a thin getter that was not followed]) and emits `GlobalSignals +0xd4 (type, own, a, b)` ->
+`TradeIIR_t` op 0 with a **non-zero `b`** (the player trade has `b == 0`, §10.1). Header = own character: `FUN_100663e4` computes the type: GC `1009959d` reads ShopType stat 0x9c, missing/zero defaults to 0x3d Cash; `100995e0` is true exactly for Cash, selecting type 1 `ShopTrade`, otherwise type 2 `ShopBuy`. It emits `GlobalSignals +0xd4 (type, own, a, b)` ->
 `InventoryGUIModule_c::SlotStartTrade` [GUI 0x100c6ff4]: an existing trade view is deleted, a new `TradeView_c(type, own, partner = machine, b)` [GUI 0x100e092f] is built (`+0x1a4` type, `+0x1c8` partner, `+0x1d0` own, `+0x1d8` b). The copy with header = the machine (`FUN_1009a23c` case 0) creates the machine's per-player session record (`{trade list, a, b, min(own stat 0xa1, 3000)}`).
 An open trade refuses with `Feedback_YouAreAlreadyInATrade` (shop or player trade).
 
 ### 13.3 The window (`TradeView_c` type 2, view `ShopBuy` of `Views/TradeGUI.xml`) [CODE]
-* Title "Trade", client 192 x 453 like the player trade (§10.3: the dockable view, docking into the `RollupArea` is not ported: a free window left of the rollup column). Config DValue `ShopViewConfig` (not persisted), `esc_shops` (`LoginPrefs.xml`: true) = Esc declines.
+* Title "Trade", client 192 x 453 like the player trade. GUI `100e092f` forces the transient dockable view into `RollupArea` with an empty persistent identity; the port registers it with the existing rollup controller. Types 1 and 2 share config DValue `ShopViewConfig`; `esc_shops` (`LoginPrefs.xml`: true) = Esc declines.
 * View XML `ShopBuy`: `PartnerName` (the machine's name: `N3Msg_GetName`, or its parent's), "Shop" + `ShopInventoryDock`, "Bought Items" + `PartnerInventoryDock`, "Credits" + `PartnerCashView` (read-only, "0", green 0x44dd44, `FUN_100e039a`), `AcceptButton`, `DeclineButton`. There is **no** own credits field and no status light in this view (those are `PlayerTrade` / `ShopTrade`).
-* `ShopInventoryDock` (`FUN_100dfeca`): `ItemContainerView_c` `FUN_100cdb3a(msg, mode 1, machine, flags 0xf, 0x15, 6, 0)`: mode 1 = `N3Msg_GetContainerInventoryList(machine)` = the stock; cell counts (1,1)..(1000,1000), horizontal scrollbar off, vertical auto. `PartnerInventoryDock` (`FUN_100e0053`): mode 2 = `N3Msg_TradeGetInventory(machine)` = `FUN_1009991a` (the session's list, the bought items), flags 0xf in shop types (0xb in the player trade), cell counts (1,1)..(1000,1) (one row).
+* `ShopInventoryDock` (`FUN_100dfeca`): `ItemContainerView_c` `FUN_100cdb3a(msg, mode 1, machine, flags 0xf, 0x15, 6, 0)`: mode 1 = `N3Msg_GetContainerInventoryList(machine)` = the stock; preferred cell counts (1,1)..(1000,1000), horizontal scrollbar off, vertical auto. `PartnerInventoryDock` (`FUN_100e0053`): mode 2 = `N3Msg_TradeGetInventory(machine)` = `FUN_1009991a` (the session's list, the bought items), flags 0xf in shop types (0xb in player trade), preferred counts (1,1)..(1000,1). This caps **preferred height**, not item row count: `SetViewCellCounts` `10132d68` writes preferred-size bounds (and clamps 1000 to 50); `GetClientPreferredSize` `10133255` consumes them. Auto-arranged `GridPosToViewPos` `10132fdb` wraps item index `x` to `(x % viewport_columns, y + x / viewport_columns)`, so bought items wrap and scroll vertically instead of overflowing a horizontal tray.
 * Columns by flags (`FUN_100cdb3a`): Icon (id 0, 16 px), Name (1, 200), Count (2, 30; flag 1), Price (3, 100; flag 4), Quality (4, 100; flag 8); list sorted by Name. Row cells (`FUN_100404a9`, `FUN_100cd4b6`): count = stat 0x19c (0 -> 1), **price = `N3Msg_GetShopItemStat(item, 0x4a)`** (`n3EngineClientAnarchy_t` 0x10017a38: the item's `VendingMachine_t` virtual +0x108; shown empty when 0 or 0x499602d2), quality = level; the tooltip of the price (`FUN_10031562`) is `FormatNumeric(price)` in the text LDB 0x1fa.
 * Credits (`FUN_100dfbf3`, GlobalSignals `+0xd8`, emitted after every item add / remove): `PartnerCashView` = `FormatNumeric` of the cost of the list (`FUN_10099d56`: sum of price x count over the bought items); the machine's `TradeIIR_t` op 7 sets it directly (`FUN_100672c7` -> `+0xdc` -> `FUN_100dfe5e`).
 * Buttons: Accept (`FUN_100dfd33`) disables itself and sends **`N3Msg_TradeAccept`** (`TradeIIR_t` op 1; the player trade sends `TradeConfirm`); Decline (`FUN_100df810`) = `N3Msg_TradeAbort(true)` (op 2, `a = {0, 1}`); the frame's close button and Esc decline too.
@@ -444,11 +481,43 @@ An open trade refuses with `Feedback_YouAreAlreadyInATrade` (shop or player trad
 * Server messages the window handles (`FUN_100674ab` cases): op 5 / 8 (`FUN_10066cf7`, `FUN_10067109`: vending add, `FUN_10047268(0x21, item)`) add `b` to the bought list, op 6 / 9 remove it, op 7 from the machine sets the credits, **op 4 (complete)** with header = own closes the window (`SlotTradeCompleted`), **op 2 (abort)** closes it (`Feedback_TradeCancelled` when sent by the machine [`FUN_1009a23c` case 2 -> `FUN_100666a3(1)`] or `a.instance != 0`), a zone change closes it silently (`Interact::close_all`).
 
 ### 13.4 Port
-`Shop::open` builds the window from the `ShopBuy` element of the client's `TradeGUI.xml` (the engine's loader opens only the first view of a file), puts one `MultiListView` per dock and fills them lazily per frame (`Play::interact_shop_frame`: the item templates come from the hud's `Items`; price = the template's stat 0x4a `Value`). Names of machines come from `VendingMachineFullUpdateIIR_t`'s name blob (empty when it was not seen).
+`Shop::open` selects `ShopTrade` for Cash and `ShopBuy` for other currencies from the original XML. Type 1 includes the own sold-items dock and calculated, noneditable own cash (`GUI 100e039a` clears input feature flags 0xd in shop mode). Drops onto any of its three lists send `TradeAddItem` (`100df870`); server ops 5/8 and 6/9 add/remove stock identities in bought items and bag identities in sold items. Sold items snapshot inventory templates before ownership changes; double click removes the item, with the shared bag-room rule. Accept sends `TradeAccept`; op 3 uses the existing trade confirmation dialog, RESET restores Accept, abort/complete/zone change close the window and confirmation. Names come from `VendingMachineFullUpdateIIR_t`.
+Shop inputs use the original text-editor flags rather than disabling the control: `100e039a` clears 0xd and sets green `0x44dd44`; `100dfbf3` sets the own balance to red `0xdd4444` when negative, green otherwise. Stock and tray scrollbars follow `100dfeca`/`100e0053`/`100e0211`: horizontal **none**, vertical **auto**, in list and grid modes. Wide list columns clip to the original viewport, while column resizing/reordering and saved visibility remain available.
+The shop list/grid wrapper carries the same explicit min/max dock size as its children: stacked views have no layout node and `View::CalculatePreferredSize` returns (-1,-1) (`ao-gui/layout.rs::node_calc`; the same wrapper constraint is documented in gui.md §6.5). Child sizes alone do not reserve its area. A collapsed wrapper gives its active grid an inverted/empty drop rectangle; the cash-shop regression requires positive tray geometry before checking the unchanged `TradeAddItem` bytes.
 `Interact::shop.quick` = Shift or Ctrl held (`host.mods`, set per input event). Harness (`cfg(test)`): `shop_dump(&gui)` (name, stock rows `[i] Name | Count | Price | Quality`, bought rows, credits, the Accept state, the trade log), `shop_buy(&mut gui, index) -> bool` (plain double click on stock item `index`: `MoveItemToInventory({0x6f, index})`), `shop_add(&mut gui, index)` (Shift double click: `TradeAddItem`), `shop_remove(&mut gui, bought_index)`, `shop_press(&mut gui, accept)`; live steps `shop`, `shopbuy=<i>`, `shopadd=<i>`, `shoprm=<i>`, `shopaccept`, `shopdecline`.
 
 ### 13.5 Not ported / unresolved
 * [UNRESOLVED-live] Which of the two buy gestures the PRK server answers: after `shopadd` the server should echo `TradeIIR_t` op 5 (or 8) into the bought list and Accept (`op 1`) end with op 4; `shopbuy` (the corpse's `MoveItemToInventory` was ignored for a foreign corpse, §12.3) may be ignored the same way. Whether the server sends the bought items as an `InventoryUpdateIIR_t` / sets the credits with op 7 is not known: the port tracks ops 5/6/8/9/7 only.
-* [UNRESOLVED] **The exact price.** `N3Msg_GetShopItemStat` calls `VendingMachine_t` virtual +0x108 (stat 0x4a) with the client character; the vftable slot could not be isolated (the class has five vftables, slot 66 of the SimpleItem base is an unrelated check), so the template's `Value` (stat 0x4a of the rdb 1000020 record `low_id`, no QL interpolation) is shown. The client-side credits check of `N3Msg_TradeAddItem` (`FUN_100662b7`, message text LDB 0x6e) is not ported: the server validates.
-* [UNRESOLVED] Type 1 `ShopTrade` (player shops / the machine with `FUN_100995e0` true; has the own items dock and cash field, and `FUN_100df870` drops on all three docks) is not built: no such server message was seen. The type decision for a plain machine is [INFERENCE].
-* [UNRESOLVED] List look: the engine's `MultiListView` has no picture cells (the Icon column is missing), the column widths are squeezed to the dock (Name 56, Count 40, Price 46, Quality 44 instead of 200 / 30 / 100 / 100: [GUESS]), grid vs list mode (`FUN_100cda29` / `InventoryViewMode`) is not mapped, the bought list's one-row cell counts are not reproduced; the `RollupArea` docking, the item info page (`itemid://`) and the saved `shop_listview_config` / `partner_listview_config` are not ported. The machine's name is empty without a captured `VendingMachineFullUpdate`.
+* Buy pricing (`GC 10099954`, x87 instructions): truncate Value × BuyPrice(0x1ab)/100, then Cash discount `min(truncate(min(CL,3000)/10×.25),90)` and add truncate(discount×base/-100). Sell proceeds (`GC 10099d56`, assembly 10099dc0–10099e42): truncate Value × SellPrice(0x1aa)/100, sentinel Value 0x499602d2 → zero, then add truncate(truncate(CL/10×.25)×base/100). CL is snapshotted at trade start (`1009a23c`). Bought total multiplies unit price by count; sold total iterates own trade entries. GUI `100dfbf3` displays sold proceeds minus bought cost in own cash. Server op 7 remains authoritative. The client-side affordability check `100662b7` remains unresolved.
+* Shop callbacks now carry the complete `AcgItem` through both bought and sold pricing. `Items::shop_info` loads both rdb endpoints and uses the shared `interpolate_item_templates` path (below), including same-ID QL normalization; results cache by `(low, high, QL)`. Missing records produce no template; malformed interpolation emits an error and never substitutes the low endpoint. Thus QL-interpolated Value is implemented; only the client-side affordability precheck remains unresolved.
+* List/grid presentation uses original Icon 16 / Name 200 / Count 30 / Price 100 / Quality 100 widths, native list image cells, and the inventory's existing Canvas grid layout (`inv_grid`, 48 px cells, original slot art). All auto-arranged grids wrap to viewport columns (`10132fdb`); bought/sold docks prefer one cell row in height, not one item row. `100dfad8` adds the `ListMode` check item to the trade window menu: for shop types it controls **stock only**, not the bought/sold trays. `10040b7b` creates the check, `100408d1` toggles `SetLayoutMode(0/1)`. `100cda29` is **inventory refresh**, not a mode toggle; the old attribution to `InventoryViewMode` was incorrect. The GUI binary contains the `InventoryViewMode` string at `101aaa2c`, referenced only by a data pointer at `10262a68` in the inspected snapshot; no executable mode-pref path was found there. Gamecode string searches found neither `InventoryViewMode` nor `ShopViewConfig`.
+* Persistence: `100407b4` stores column config, list/grid sort column/order and (when requested) `listview_mode`; `1004094e` restores them. `StoreColumnInfo` `10133579` serializes **all** columns as parallel `col_id` / `col_flags` / `col_width` arrays, including hidden columns. `LoadColumnInfo` `10136991` restores saved order, widths and **only flag bit 0 (hidden)**, preserving other constructor flags; unmatched existing columns append in their existing state, rather than being implicitly hidden. `100e092f` restores `shop_listview_config` and `partner_listview_config` from `ShopViewConfig`. Destructor `100df4d9` writes **only `shop_listview_config` for shop types** (partner config is saved only for player-trade type 0). The port follows that distinction and retains other archive children; regressions cover stock mode/sort round-trip, column flags and untouched partner mode. Item info (`itemid://`) and the client-side affordability precheck remain unresolved; no retail screenshot comparison was performed for this change.
+
+### ACG dummy-template interpolation (tower info and shared template values)
+`N3Msg_CreateDummyItemID` GC `10016621` calls `10082a3d`: load both rdb `1000020` records, select the nearest template QL (stat54; equal distance selects high), preserve its metadata, set ACG fields, then call `100cc270` → `100cba71`. Invalid ACG QL (unsigned16 outside1..511) becomes1. `100cb689` selectively interpolates item stats; other identifiers, names and flags remain from the selected template. Scalar `100cb3b2` uses unsigned16 QLs without clamping, adds0.5 to the interpolated distance from the smaller endpoint value, truncates, then adds that smaller value. This differs from rounding the signed final value. Value stat74 additionally applies `100cb611`: normalize the rounded value between min/max endpoint Values, square that ratio, rescale and truncate (intermediate bounds/ratio are float32). Implemented in `ao-formats::dynel_visual`.
+Tower spell lists24/25/26 follow `100cba71`: criterion values interpolate with equal count/key checks (`100cb934`); scalar arguments interpolate only for the opcode field tables at `1016b168..1016b1f8` (`100cb4ba`/`100cb44d`). ModifyStat/ModifySkill/ModifyTowerValue functions cf14/cf35/cfaa interpolate argument39; cf76 has no scalar interpolation selector. Different-stat modifier entries are matched by function/stat0, falling back to the selected spell when an endpoint lacks a match. `info_tower_interpolation.rs` supplies these values to the tower HTML formatter. GC pointer `10154580` is **Color_t::Interpolate**, not GameData item interpolation (callsite `100d6874`).
+
+## 14. Mission terminals
+
+QuestBooth templates have runtime class **0xdac1** (static.md). The placed `DynelData` wire identity is preserved, not remapped: `CreateFromTemplate(template, identity)` chooses the runtime class from the template. Only confirmed `GenericCmd_t state 1, cmd 3` with the own actor invokes their use callback: GC 0x1007c76a → 0x1003bac9 → 0x1003b947 → 0x1003b6e0 → SimpleItem action slot +0x9c (0x100877a6), then runtime use slot +0x58 → QuestBooth 0x10086571. `Dynels::item_class_of` resolves this template class separately from the supplied identity; an unknown/unbuilt prop does not open a mission window. It emits GlobalSignals +0x164 through 0x10011875 with terminal identity and origin type: valid stat 0x1ea in 1..8, otherwise 1. A request/state-0 packet or another player's use does not open our window.
+
+GUI `MissionSelectionView_c` 0x100d06af is constructed natively, not from an XML file. Baseline preferred Point(167,112), inclusive 168×113; 3×2 mission icon list; difficulty slider 0..100/default50; six advanced sliders -100..100/default0. Endpoint labels come from QuestSel_* texts, common width = widest label +5. `Slider_c` 0x1014448a uses gfx 0x91 (11×18 knob) and 0x92 background; drag starts on the knob and preserves its grab offset. Expand/collapse gfx 0x47/0x46, buttons RequestMissions / AcceptMission / MsgBox_Cancel. The existing canvas input renderer reproduces these controls.
+
+Generate handler 0x100cff7e checks cash against the own level and requires two free bag slots; accept 0x100d0214 also requires two slots. The request is `QuestAlternativeIIR_t` key 0x5c436609, version byte4, difficulty band `floor(ui_difficulty×0.10891088843345642 +1)`, six signed dimension bytes, seed0, origin type and identity, and zero alternatives (GC 0x1001620e / 0x100c9b9a / 0x100cadfa). The response includes generated Quest bodies and seed (0x100cacdb); selection is `CreateQuestIIR_t` key 0x291f361b with the selected mission identity (0x1001738d / 0x100cab36). All client headers use own identity and passed-on byte0.
+
+`interact_mission.rs` builds the original list, slider and button structure, preserves MissionSelectionViewConfig (`show_advanced_options`, `difficulty`, `dim_good/ctrl/secret/mystery/stealth/reward`) and obeys `esc_missionselection`. Alternative quests are retained separately from accepted quests for the original itemid information page; list/context actions feed the existing InfoView and HUD mission map/compass marker. Checks cover exact request/select/response bytes and truncation, original defaults, UI request/selection/cancel, and own-confirmed-use activation.
+
+The confirmed-use regression loads real retail template `1000020:41568` (class bytes `c1 da 00 00`) through the production prop builder. It supplies a different unchanged placed identity kind `0xc748`, rejects an unbuilt prop, and verifies that only the own confirmed use invokes the ready QuestBooth runtime callback. This is fixture verification, not evidence of a live terminal session.
+
+
+### 14.1 Quest information pages
+
+The actual quest identity kind is **0xdac3 = 56003**, not 56000. GUI item-information dispatcher 0x100384f3 routes it to 0x1003565d. `quest_info.rs` reproduces title, description, remaining time, team label, and Reward section with cash, XP/SK and itemref links/icons (or NoReward), in the original order; the formatter does not invent a criteria/actions table. The first two reward integers are cash/XP (GC 0x100172f9 / 0x1001732c); a nonzero single reward item replaces the list (0x1001b481).
+
+Shadowknowledge replaces XP only at levels 200..220 on a playfield whose N3ReadBlob flags have bit 1 (file +0x34, version ≥9; 0x1001c115). GC 0x1006263f multiplies XP by the float32 factor `faction×0.0010000000474974513/50000`, truncates and clamps; faction stat is 572 for side1, 569 for side2, 566 otherwise. `Zone::quests` and `mission_alternatives` share the original InfoView page path; `server_now` advances the synchronized GameTime unix clock without float32 epoch precision loss.
+
+
+### 14.2 Pointer-path live checks
+
+The harness accepts `rightdyn=<instance or exact name>` and `doubledyn=<instance or exact name>` alongside `clickdyn` / `hoverdyn`; these locate a visible pick point outside GUI windows and send actual mouse move/down/up events. `goto` accepts a dynel instance, exact name, or x:z. These interaction checks use the same picking/default-action path as the windowed app, rather than calling the dialogue method directly. `clickdyn=shift+<id>` exercises character Info; `props=<radius>` inventories available doors/terminals/shops before using them.
+

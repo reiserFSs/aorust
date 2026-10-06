@@ -284,7 +284,7 @@ mod tests {
         let (l, db) = (TextDb::load(&client).ok()?, TextDb::load(&client).ok()?);
         let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(l.label(s)).filter(|r| r != s)))).ok()?;
         let mut c = Chat::new();
-        c.open(&mut gui, (1280, 828)).ok()?;
+        c.open(&mut gui, (1280, 828), None).ok()?;
         c.own_id = 1;
         Some((gui, db, c))
     }

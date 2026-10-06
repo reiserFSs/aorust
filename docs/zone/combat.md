@@ -36,7 +36,9 @@ Previously the feed combined the live fight controller with `Zone::dynels`' olde
 `StopFightIIR_t` still goes through `Combat::stop_fight` (`FUN_10079d75` → `FUN_10068b7f`), clearing state and target; no synthetic stop or change to the SandyInterface music FSM is needed.
 Nonlocal samples retain the retail requirement: fighting, and targeting the local character or Health exactly zero (`ao_audio::combat::char_sample`).
 Regression `kill_and_stop_fight_restore_district_music_from_live_stats` starts both controllers, applies an `AttackInfo` hit while the zone snapshot stays at 50 HP, checks audio sees zero, relays both stops, and checks music state 0 / no combat layer after the victory lock.
-The district layer is selected at the next district evaluation (≤1 s; SandyInterface `SetupENVSounds` @0x1000657d). This regression has been added but not executed in this editing pass.
+The district layer is selected at the next district evaluation (≤1 s; SandyInterface `SetupENVSounds` @0x1000657d).
+Verified `cargo test --release -p aomac kill_and_stop_fight_restore_district_music_from_live_stats` (pass, clean and integrated snapshots) and `cargo test --release -p ao-audio combat::tests` (11 pass).
+Live muted `AOMAC_AUDIO_LOG=1 AOMAC_COMBAT_LOG=1`, Aomacrceg in ICC beach: `goto=hunt,Q=0.1,wait=45,fight,audio,wait=25,audio` killed Beach Leet 1031952, relayed own `FightStopped` and target `Died`, and printed `attacking=false`. After the kill the active samples were `MN08.wav` then `MN05.wav`, both shipped under `sound/music/env/mountain/night/`, rather than a battle layer.
 
 
 ## Controls (CharPrefs.xml `KeyBindings`, provider = `provider_hash(name)`)

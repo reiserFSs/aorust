@@ -8,7 +8,7 @@ use ao_gui::view::{ListItem, MultiCell};
 use ao_gui::{Event, Gui, MenuItem, WindowId, WindowSize};
 use ao_net::chat::LftReply;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Namespace of this module's popup menu ids ([`Event::MenuPicked`]).
 const MENU_BASE: u32 = 0x5C00_0000;
@@ -35,13 +35,13 @@ pub enum Req {
 
 // ------------------------------------------------------------------------------------------------ persistence
 
-/// `<prefs dir>/<file>`: stand-in for the DValue (`FriendsWindowConfig`, `LFTWindowConfig`) the original keeps in the character prefs.
-fn cfg_path(file: &str) -> Option<PathBuf> {
-    super::super::prefs::dir().map(|d| d.join(file))
+/// Character-local stand-in files for the FriendsWindowConfig/LFTWindowConfig DValue archives.
+fn cfg_path(prefs: Option<&Path>, file: &str) -> Option<PathBuf> {
+    prefs.map(|d| d.join(file))
 }
 
-fn read_cfg(file: &str) -> Vec<(String, String)> {
-    let Some(src) = cfg_path(file).and_then(|p| std::fs::read_to_string(p).ok()) else { return vec![] };
+fn read_cfg(prefs: Option<&Path>, file: &str) -> Vec<(String, String)> {
+    let Some(src) = cfg_path(prefs, file).and_then(|p| std::fs::read_to_string(p).ok()) else { return vec![] };
     let Ok(root) = ao_gui::xml::parse(&src) else { return vec![] };
     root.children.iter().filter_map(|c| Some((c.attr("name")?.to_owned(), c.attr("value")?.trim_matches('\'').trim_matches('"').to_owned()))).collect()
 }
@@ -59,12 +59,43 @@ fn cfg_xml(items: &[(&str, &str, String)]) -> String {
     o + "</Archive>\n"
 }
 
-fn write_cfg(file: &str, items: &[(&str, &str, String)]) {
-    if let Some(p) = cfg_path(file) {
+fn write_cfg(gui: &Gui, win: WindowId, prefs: Option<&Path>, file: &str, items: &[(&str, &str, String)]) {
+    if let Some(p) = cfg_path(prefs, file) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let _ = std::fs::write(p, cfg_xml(items));
+        let mut items = items.to_vec();
+        if let Some((x, y, w, h)) = gui.window_outer_frame(win) {
+            items.push(("Rect", "WindowFrame", format!("Rect({x},{y},{},{})", x + w as i32 - 1, y + h as i32 - 1)));
+            items.push(("Bool", "WindowPinButtonState", gui.window_pinned(win).to_string()));
+        }
+        if let Err(error) = std::fs::write(&p, cfg_xml(&items)) {
+            eprintln!("saving social config {}: {error}", p.display());
+        }
+    }
+}
+
+/// Window::LoadWndConfig (0x10154d6e), followed by MoveInsideScreen(false,true,true).
+fn restore_frame(gui: &mut Gui, win: WindowId, cfg: &[(String, String)], screen: (u32, u32)) {
+    gui.set_window_frame(win, true, true);
+    let items: Vec<_> = cfg.iter().filter_map(|(key, value)| {
+        let kind = match key.as_str() {
+            "WindowFrame" => "Rect",
+            "WindowPinButtonState" => "Bool",
+            _ => return None,
+        };
+        Some((kind, key.as_str(), value.clone()))
+    }).collect();
+    let root = ao_gui::xml::parse(&cfg_xml(&items)).expect("generated social config");
+    let place = crate::play::hud_wincfg::Cfg::parse(&root);
+    if let Some([l, t, r, b]) = place.frame {
+        gui.set_window_outer_frame(win, (l as i32, t as i32, (r - l).max(0.0) as u32 + 1, (b - t).max(0.0) as u32 + 1));
+    }
+    if let Some(pin) = place.pin {
+        gui.set_window_pinned(win, pin);
+    }
+    if let Some(frame) = gui.window_outer_frame(win) {
+        gui.set_window_pos(win, crate::play::hud_wincfg::inside_screen(frame, screen));
     }
 }
 
@@ -145,6 +176,7 @@ struct LftWin {
 #[derive(Default)]
 pub struct SocialWin {
     screen: (u32, u32),
+    prefs: Option<PathBuf>,
     friends: Option<FriendsWin>,
     tells: Vec<TellWin>,
     dialogs: Vec<Dlg>,
@@ -170,11 +202,41 @@ enum Action {
 
 impl SocialWin {
     pub fn new(screen: (u32, u32)) -> Self {
-        Self { screen, ..Default::default() }
+        Self { screen, prefs: super::super::prefs::dir(), ..Default::default() }
     }
 
-    pub fn resize(&mut self, screen: (u32, u32)) {
+    /// Bind persistence once the character preference directory is known; preserve legacy content once without sharing it between characters.
+    pub fn set_character_dir(&mut self, character: &Path) {
+        if let Some(root) = super::super::prefs::dir() {
+            if root.as_path() != character {
+                for file in ["FriendsWindowConfig.xml", "LFTWindowConfig.xml"] {
+                    let old = root.join(file);
+                    let new = character.join(file);
+                    if old.is_file() && !new.exists() {
+                        if let Err(error) = std::fs::create_dir_all(character).and_then(|()| std::fs::rename(&old, &new)) {
+                            eprintln!("migrating social config {}: {error}", old.display());
+                        }
+                    }
+                }
+            }
+        }
+        self.prefs = Some(character.to_path_buf());
+    }
+
+    pub fn resize(&mut self, gui: &mut Gui, screen: (u32, u32)) {
+        let windows = self.friends.iter().map(|f| f.win).chain(self.lft.iter().map(|l| l.win)).chain(self.tells.iter().map(|t| t.win)).chain(self.dialogs.iter().map(|d| d.win));
+        for win in windows {
+            if let Some((x, y, w, h)) = gui.window_outer_frame(win) {
+                let x = if x + w as i32 == self.screen.0 as i32 { screen.0 as i32 - w as i32 } else { x };
+                let y = if y + h as i32 == self.screen.1 as i32 { screen.1 as i32 - h as i32 } else { y };
+                gui.set_window_pos(win, crate::play::hud_wincfg::inside_screen((x, y, w, h), screen));
+            }
+        }
         self.screen = screen;
+    }
+
+    pub fn friends_window(&self) -> Option<WindowId> {
+        self.friends.as_ref().map(|f| f.win)
     }
 
     pub fn owns(&self, w: WindowId) -> bool {
@@ -191,19 +253,20 @@ impl SocialWin {
     pub fn set_friends(&mut self, gui: &mut Gui, open: bool, soc: &Social, tx: &Texts, chat_windows: &[String]) {
         match (open, self.friends.is_some()) {
             (true, false) => {
-                let cfg = read_cfg("FriendsWindowConfig.xml");
+                let cfg = read_cfg(self.prefs.as_deref(), "FriendsWindowConfig.xml");
                 let open = FOLDER_KEYS.map(|k| cfg.iter().find(|(n, _)| n == k).is_none_or(|(_, v)| v == "true"));
                 let src = "<root><View view_layout=\"vertical\"><StringListView name=\"list\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" max_size=\"Point(16000,16000)\"/></View></root>";
                 let Ok(win) = gui.open_tabbed_window_xml("Friends", "Friends", src, (0, 0), WindowSize::Fixed(FRIENDS_SIZE.0, FRIENDS_SIZE.1)) else { return };
                 // `Window::MoveToCenter` (no saved frame): GUESS, the position is not in the binary's defaults
                 let (w, h) = gui.outer_size(win);
                 gui.set_window_pos(win, ((self.screen.0 as i32 - w as i32) / 2, (self.screen.1 as i32 - h as i32) / 2));
+                restore_frame(gui, win, &cfg, self.screen);
                 self.friends = Some(FriendsWin { win, open });
                 self.refresh_friends(gui, soc, tx, chat_windows);
             }
             (false, true) => {
                 if let Some(f) = self.friends.take() {
-                    self.save_friends(&f);
+                    self.save_friends(gui, &f);
                     gui.close_window(f.win);
                 }
             }
@@ -211,9 +274,9 @@ impl SocialWin {
         }
     }
 
-    fn save_friends(&mut self, f: &FriendsWin) {
+    fn save_friends(&mut self, gui: &Gui, f: &FriendsWin) {
         let items: Vec<(&str, &str, String)> = FOLDER_KEYS.iter().zip(f.open).map(|(k, o)| ("Bool", *k, o.to_string())).collect();
-        write_cfg("FriendsWindowConfig.xml", &items);
+        write_cfg(gui, f.win, self.prefs.as_deref(), "FriendsWindowConfig.xml", &items);
         self.folder_state = Some(f.open);
     }
 
@@ -294,7 +357,7 @@ impl SocialWin {
             }
             Event::CloseRequested { window } if *window == win => {
                 if let Some(f) = self.friends.take() {
-                    self.save_friends(&f);
+                    self.save_friends(gui, &f);
                     gui.close_window(f.win);
                 }
                 self.closed.push("friends_window");
@@ -455,7 +518,7 @@ impl SocialWin {
             gui.set_window_visible(l.win, true);
             return;
         }
-        let cfg = read_cfg("LFTWindowConfig.xml");
+        let cfg = read_cfg(self.prefs.as_deref(), "LFTWindowConfig.xml");
         let get = |k: &str| cfg.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         let title = tx.0.by_key(100, "Team Search").unwrap_or_else(|| "Team Search".into());
         let (x, y, w, h) = LFT_FRAME;
@@ -466,6 +529,7 @@ impl SocialWin {
         gui.set_window_help(win, Some("The LFT Window.html")); // `FUN_100f03fb` (string 0x101c109c)
         let (ow, oh) = gui.outer_size(win);
         gui.set_window_pos(win, ((self.screen.0 as i32 - ow as i32) / 2 + 5, (self.screen.1 as i32 - oh as i32) / 2 + 26));
+        restore_frame(gui, win, &cfg, self.screen);
         let professions: Vec<u32> = social::lft_professions().chain([0x10]).collect();
         // `DropdownMenu_c::InsertItem(id, ...)`: every item goes in at its id as index; the resulting order is the id order
         for (i, (id, t)) in LFT_SIDES.iter().enumerate() {
@@ -585,7 +649,7 @@ impl SocialWin {
             ("Float", "LocationColWidth", width(4)),
             ("Float", "DescColWidth", width(5)),
         ];
-        write_cfg("LFTWindowConfig.xml", &items);
+        write_cfg(gui, l.win, self.prefs.as_deref(), "LFTWindowConfig.xml", &items);
         gui.close_window(l.win);
     }
 
@@ -735,6 +799,40 @@ mod tests {
         let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).ok()?;
         gui.set_screen_size(1280, 800);
         Some((gui, db))
+    }
+
+    #[test]
+    fn social_frames_and_pin_persist_per_character() {
+        let Some((mut gui, db)) = rig() else { return };
+        let root = std::env::temp_dir().join("aomac-social-frame-regression");
+        let _ = std::fs::remove_dir_all(&root);
+        crate::play::prefs::set_test_dir(&root);
+        let character = root.join("Account/Char1");
+        let tx = Texts(&db);
+        let mut windows = SocialWin::new((1280, 800));
+        windows.set_character_dir(&character);
+        windows.set_friends(&mut gui, true, &Social::default(), &tx, &[]);
+        let friends = windows.friends.as_ref().unwrap().win;
+        gui.set_window_outer_frame(friends, (30, 50, 250, 300));
+        gui.set_window_pinned(friends, true);
+        windows.open_lft(&mut gui, &Lft::default(), &tx, false);
+        let lft = windows.lft_window().unwrap();
+        gui.set_window_outer_frame(lft, (300, 100, 700, 550));
+        windows.close_all(&mut gui, &tx);
+        windows.set_friends(&mut gui, true, &Social::default(), &tx, &[]);
+        let friends = windows.friends.as_ref().unwrap().win;
+        assert_eq!(gui.window_outer_frame(friends), Some((30, 50, 250, 300)));
+        assert!(gui.window_pinned(friends));
+        windows.open_lft(&mut gui, &Lft::default(), &tx, false);
+        assert_eq!(gui.window_outer_frame(windows.lft_window().unwrap()), Some((300, 100, 700, 550)));
+        assert!(character.join("FriendsWindowConfig.xml").is_file());
+        assert!(!root.join("FriendsWindowConfig.xml").exists());
+        windows.close_all(&mut gui, &tx);
+        windows.set_character_dir(&root.join("Account/Char2"));
+        windows.set_friends(&mut gui, true, &Social::default(), &tx, &[]);
+        assert_ne!(gui.window_outer_frame(windows.friends.as_ref().unwrap().win), Some((30, 50, 250, 300)));
+        windows.close_all(&mut gui, &tx);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn click(gui: &mut Gui, win: WindowId, view: &str) -> Vec<Event> {

@@ -2,7 +2,7 @@
 //! "Player trade". The wire codec is [`ao_net::n3::trade`].
 //!
 //! The client's model (Gamecode `Trade_c`, `FUN_100674ab` dispatcher) is driven by what the server sends; the window only asks:
-//! * default action on a character (not talkable, own character not fighting, target in range): `TradeIIR_t` op 0 ([`Interact::trade_action`]);
+//! * default action on a character (not talkable, target not fighting and in range): `TradeIIR_t` op 0 ([`Interact::trade_action`]);
 //! * the server's op 0 opens the window (`GlobalSignals +0xd4` -> `InventoryGUIModule_c::SlotStartTrade` [GUI 0x100c6ff4]), an ignored partner is answered with
 //!   `TradeAbort(false)`;
 //! * an item dragged from the inventory onto the own items -> `TradeAddItem`, double click on an own item -> `TradeRemoveItem`; the lists change when the
@@ -207,6 +207,16 @@ impl PTradeUi {
         self.pending = None;
     }
 
+    pub(super) fn shop_confirmation(&mut self, gui: &mut Gui, screen: (u32, u32), open: bool) {
+        if open {
+            if !self.confirm.is_open() {
+                let [yes, no] = self.buttons.clone();
+                self.confirm.go(gui, screen, (), CONFIRM_TEXT, &[yes, no]);
+            }
+        } else {
+            self.confirm.close_all(gui);
+        }
+    }
     pub fn take_feedback(&mut self) -> Vec<&'static str> {
         std::mem::take(&mut self.feedback)
     }
@@ -214,11 +224,11 @@ impl PTradeUi {
 
 impl Interact {
     /// `N3Msg_TradeStart(target)` [GC 0x100190e0], the character branch of `N3Msg_DefaultActionOnDynel` [GC 0x100291da] when the target is not talkable:
-    /// outside a fight, not the own character, a `SimpleChar_t` without `TowerType` (stat 0x184, not tracked: assumed 0) and within [`RANGE`]
+    /// not the own character, a `SimpleChar_t` without `TowerType` (stat 0x184) and within [`RANGE`]
     /// (`FUN_10059ca0`; the dungeon door test of its tail is not ported), else `Feedback_TargetOutsideRangeForTrade`. Sends `TradeIIR_t` op 0 (target, 0).
     pub fn trade_action(&mut self, zone: &Zone, id: i32) -> Action {
         let own = self.own as i32;
-        if id == own || zone.fight_target.contains_key(&own) {
+        if id == own || zone.stat_of(id, 0x184).unwrap_or(0) != 0 {
             return Action::None;
         }
         let (Some(me), Some(them)) = (zone.dynels.get(&own), zone.dynels.get(&id)) else { return Action::None };
@@ -235,7 +245,7 @@ impl Interact {
     /// The `TradeIIR_t` the server sent; `who` is its header identity (the character the state belongs to). Handlers: `FUN_100674ab` [GC] and what it calls.
     pub(super) fn on_trade(&mut self, gui: &mut Gui, t: Trade, who: Identity, zone: &Zone) {
         let me = self.own_id();
-        if self.shop_trade(gui, &t, who, self.ptrade.trade.is_some() || self.ptrade.pending.is_some()) {
+        if self.shop_trade(gui, &t, who, self.ptrade.trade.is_some() || self.ptrade.pending.is_some(), zone) {
             return;
         }
         let ui = &mut self.ptrade;
@@ -458,6 +468,7 @@ impl Interact {
     /// The inventory items released over a window: those over the own item list are added (see [`Interact::ptrade_drop`]).
     pub(super) fn ptrade_drops(&mut self, gui: &Gui, zone: &Zone, drops: Vec<(u32, f32, f32)>) {
         for (slot, x, y) in drops {
+            self.shop_drop(gui, zone, slot, x, y);
             self.ptrade_drop(gui, zone, slot, x, y);
         }
     }
@@ -568,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn default_action_starts_a_trade_only_within_range_and_outside_fights() {
+    fn default_action_starts_a_trade_only_within_range_and_target_outside_fights() {
         let mut z = zone();
         let mut i = Interact::new(OWN as u32, (1280, 800));
         // 5.5 m between the centres = 4.5 m between the assumed 0.5 m spheres
@@ -580,10 +591,16 @@ mod tests {
         assert_eq!(i.trade_action(&z, OWN), Action::None);
         assert_eq!(i.trade_action(&z, 99), Action::None, "unknown dynel");
         z.fight_target.insert(OWN, 77);
-        assert_eq!(i.trade_action(&z, 77), Action::None, "the own character is fighting");
+        assert_eq!(i.default_action_on(&z, BOB), Action::Trade, "only the target's fight controller gates default action");
+        assert_eq!(sent(&mut i).len(), 1);
+        z.fight_target.insert(77, OWN);
+        assert_eq!(i.default_action_on(&z, BOB), Action::None, "the target is fighting");
         assert!(i.take_outbox().is_empty());
         // the same through the default action of a (not talkable) character
         z.fight_target.clear();
+        z.character_stats.entry(77).or_default().insert(0x184, 1);
+        assert_eq!(i.trade_action(&z, 77), Action::None, "towers cannot trade");
+        z.character_stats.entry(77).or_default().insert(0x184, 0);
         assert_eq!(i.default_action_on(&z, BOB), Action::Trade);
         assert_eq!(sent(&mut i).len(), 1);
     }

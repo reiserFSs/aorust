@@ -67,6 +67,11 @@ impl Host {
 
     /// Replaces the rendered scene (uploaded before the next frame).
     pub fn set_scene(&mut self, scene: Scene) {
+        // Queued poses/models belong to the replaced topology, not the newly uploaded scene.
+        self.repose = None;
+        self.actor_models.clear();
+        self.actors.clear();
+        self.clear_actors = true;
         self.scene = Some(scene);
     }
 }
@@ -389,7 +394,8 @@ impl State {
     /// True = quit requested.
     fn frame(&mut self) -> bool {
         let now = Instant::now();
-        let dt = (now - self.last).as_secs_f32().min(0.1);
+        // Retail high-resolution Timer_t bounds elapsed time at 100 seconds, not 0.1.
+        let dt = (now - self.last).as_secs_f32().min(100.0);
         self.last = now;
         self.clock += dt;
         self.renderer.time = self.clock;
@@ -605,6 +611,12 @@ impl Offscreen {
         Ok(Self { r, targets, gr, host: Host::headless(), size })
     }
 
+    /// Changes the render surface size without replacing the live frontend or its GUI state.
+    pub fn resize(&mut self, size: (u32, u32)) {
+        self.size = (size.0.max(1), size.1.max(1));
+        self.targets = Targets::new(&self.r, self.size.0, self.size.1);
+    }
+
     /// One `Frontend::frame`, applying what it asked of the host.
     pub fn frame(&mut self, fe: &mut dyn Frontend, dt: f32) -> ao_gui::DrawList {
         self.r.time += dt;
@@ -647,6 +659,18 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_scene_discards_pending_old_topology_updates() {
+        let mut host = Host::headless();
+        host.repose(Scene::default());
+        host.actor_models.push((1, Scene::default()));
+        host.set_scene(Scene::default());
+        assert!(host.scene.is_some());
+        assert!(host.repose.is_none());
+        assert!(host.actor_models.is_empty() && host.actors.is_empty());
+        assert!(host.clear_actors);
+    }
 
     #[test]
     fn live_sky_requests_at_the_scaled_clock_and_returns_the_worker_result() {

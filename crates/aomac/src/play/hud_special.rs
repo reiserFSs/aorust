@@ -78,6 +78,14 @@ pub struct Entry {
     pub alt: u32,
     /// `+0x10` / the identity: the action it shows now.
     pub shown: u32,
+    /// Template supplied by `GC 10042e16` for dynamically registered actions.
+    pub registered_template: Option<u32>,
+}
+
+impl Entry {
+    pub fn template(&self) -> Option<u32> {
+        self.registered_template.or_else(|| template_of(self.shown))
+    }
 }
 
 /// What the own character is doing: the inputs of the toggles (`FUN_1006d196` movement-mode switch, `FUN_10068b7f` / `FUN_100593d3` fight
@@ -135,7 +143,17 @@ impl SpecialList {
     /// `FUN_10042c9f`: an entry for `action` (skipped when the map has no template or the action is listed already).
     fn add(&mut self, action: u32, alt: u32) {
         if template_of(action).is_some() && !self.entries.iter().any(|e| e.key == action) {
-            self.entries.push(Entry { key: action, alt, shown: action });
+            self.entries.push(Entry { key: action, alt, shown: action, registered_template: None });
+        }
+    }
+
+    /// `GC 10042e16`: the server supplies the template; catalogue perk items are not action templates.
+    pub fn register(&mut self, action: u32, template: u32) {
+        if template == 0 { return; }
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.key == action) {
+            entry.registered_template = Some(template);
+        } else {
+            self.entries.push(Entry { key: action, alt: 0, shown: action, registered_template: Some(template) });
         }
     }
 
@@ -184,7 +202,7 @@ impl SpecialList {
 
     /// `FUN_1003f121(identity)`: the entry currently showing template `instance`.
     pub fn find(&self, instance: u32) -> Option<&Entry> {
-        self.entries.iter().find(|e| template_of(e.shown) == Some(instance))
+        self.entries.iter().find(|e| e.template() == Some(instance))
     }
 
     /// The entries in list order (the Actions window shows them in this order).
@@ -257,6 +275,17 @@ impl SpecialList {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registered_perk_template_is_authoritative() {
+        let mut l = SpecialList::new();
+        l.register(10111, 213010);
+        l.register(10111, 213010);
+        let e = l.find(213010).unwrap();
+        assert_eq!((e.shown, e.template()), (10111, Some(213010)));
+        assert_eq!(l.entries().iter().filter(|e| e.key == 10111).count(), 1);
+        assert!(l.find(211656).is_none());
+    }
+
     use super::*;
 
     fn shown(l: &SpecialList) -> Vec<u32> {
@@ -268,7 +297,7 @@ mod tests {
     fn initial_list_shows_the_first_action_of_each_toggle() {
         let l = SpecialList::new();
         assert_eq!(shown(&l), [3, 1, 0xb, 0x4c, 0x11, 0x13, 0x51, 0x14, 0x86]);
-        assert_eq!(l.entries[2], Entry { key: 0xb, alt: 0x4e, shown: 0xb });
+        assert_eq!(l.entries[2], Entry { key: 0xb, alt: 0x4e, shown: 0xb, registered_template: None });
     }
 
     /// Sit shows Stand, release shows Sit; a hotbar slot holding Sit follows the queued change and the change is queued once.
