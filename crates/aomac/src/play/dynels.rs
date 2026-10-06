@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
+use super::combat::anim as canim;
 use super::zone::{scene_pos, scene_yaw};
 
 /// Identity kind of character / NPC dynels (`SimpleChar_t`).
@@ -37,6 +38,10 @@ pub const NAME_TAG_RADIUS: f32 = 30.0;
 /// NPC record key of the generic death clip and of the first unarmed attack ([`ao_formats::character::NpcAnim`]).
 const DIE_KEY: u32 = 6000;
 const ATTACK_KEY: u32 = 1033;
+/// Weapon item stat `AnimSet` (0x161): selects the stance clips (docs/zone/combat-anim.md §3.1).
+const STAT_ANIM_SET: u32 = 353;
+/// Weapon stance clips loaded with every character model: idle (list 0x10) of the anim sets 0/1/3/6/7/8 and walk/run of a 2H stance.
+const STANCE_IDS: &[u16] = &[0x3f3, 0x3e9, 0x3fd, 0xb6, 0xcb, 0x424, 0x421, 0x422];
 
 /// Everything of a `SimpleCharFullUpdate` that decides what the model looks like; equal looks share one model.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -131,11 +136,14 @@ enum Req {
     Model { key: u64, look: Look },
     /// The dynels the playfield places by itself (rdb 1000026).
     Placed(u32),
+    /// A wielded weapon: its `AnimSet` (stat 353) from the template record under the message stats.
+    Weapon { holder: i32, slot: usize, template: Option<u32>, stats: Vec<(u32, i32)> },
 }
 
 enum Resp {
     Model { key: u64, result: Result<Built, String> },
     Placed(u32, Vec<PlacedDynel>),
+    Weapon { holder: i32, slot: usize, set: Option<i32> },
 }
 
 /// Background builder: reads the rdb and composes textures off the UI thread.
@@ -159,6 +167,11 @@ impl Worker {
             for r in req_rx {
                 let resp = match r {
                     Req::Model { key, look } => Resp::Model { key, result: build(&store, &mut assets, &look).map_err(|e| format!("{e:#}")) },
+                    Req::Weapon { holder, slot, template, stats } => {
+                        let tpl = template.and_then(|t| item_template(&store, t).ok().flatten());
+                        let set = effective_stats(tpl.as_ref(), &stats).iter().find(|s| s.0 == STAT_ANIM_SET).map(|s| s.1);
+                        Resp::Weapon { holder, slot, set }
+                    }
                     Req::Placed(pf) => Resp::Placed(
                         pf,
                         placed_dynels(&store, pf).unwrap_or_else(|e| {
@@ -335,6 +348,28 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
             }
         }
     }
+    // weapon stance clips: players resolve the id by file name in the model's set, NPCs through their record (parent chain only)
+    for &id in STANCE_IDS {
+        let clip = match &rec {
+            Some(rec) => {
+                let mut k = id as u32;
+                loop {
+                    if let Some(&c) = rec.anim_variants(k).first() {
+                        break Some(c);
+                    }
+                    let next = ao_formats::character::fallback_key(k);
+                    if next == 0 || next == k {
+                        break None;
+                    }
+                    k = next;
+                }
+            }
+            None => canim::resolve_clip(&assets.names, canim::clip_set(look.breed, look.sex), id, false).map(|c| c.0),
+        };
+        if let Some(a) = clip.map(|c| assets.anim(store, c)).transpose()?.filter(|a| a.signature == sig) {
+            clips.insert(id as u32, a);
+        }
+    }
     let tag_height = rig.indicator_height();
     let features = rec.as_ref().and_then(|r| r.stat(ao_net::n3::motion::STAT_FEATURES as u32));
     Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), clips, features, tag_height, ..plain(Default::default(), true) })
@@ -419,6 +454,11 @@ pub struct Dynels {
     next_prop: u32,
     /// Looks asked for before the worker existed.
     pending: Vec<Look>,
+    /// `AnimSet` of the weapon in the right (slot 6) / left (slot 8) hand of a holder.
+    wield: HashMap<i32, [Option<i32>; 2]>,
+    /// Weapon dynel instance -> (holder, hand index).
+    weapons: HashMap<i32, (i32, usize)>,
+    pending_weapons: Vec<(i32, usize, Option<u32>, Vec<(u32, i32)>)>,
     /// The playfield whose placed dynels (rdb 1000026) are still to be requested.
     want_placed: Option<u32>,
     playfield: Option<u32>,
@@ -440,6 +480,9 @@ impl Default for Dynels {
             props: HashMap::new(),
             next_prop: PROP_ID_BASE,
             pending: vec![],
+            wield: HashMap::new(),
+            weapons: HashMap::new(),
+            pending_weapons: vec![],
             want_placed: None,
             playfield: None,
             models: HashMap::new(),
@@ -557,9 +600,26 @@ impl Dynels {
                 }
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == 99 => self.die(who.instance, a.identity_b.instance as u32),
+            N3::Dynel(Dynel::WeaponItemFullUpdate(w)) if w.parent.kind == CHAR_KIND => {
+                // body location 6 = right hand, 8 = left hand (docs/zone/static.md §4)
+                if let Some(hand) = match w.byte_71 {
+                    6 => Some(0),
+                    8 => Some(1),
+                    _ => None,
+                } {
+                    let stats: Vec<(u32, i32)> = w.stats.iter().map(|&(i, v)| (i as u32, v)).collect();
+                    self.weapons.insert(who.instance, (w.parent.instance, hand));
+                    self.pending_weapons.push((w.parent.instance, hand, static_instance(&stats), stats));
+                }
+            }
             _ if who.kind != CHAR_KIND => {
                 if matches!(m.body, N3::Misc(Misc::ToClientQuit)) {
                     self.props.remove(&(who.kind, who.instance));
+                    if let Some((holder, hand)) = self.weapons.remove(&who.instance) {
+                        if let Some(w) = self.wield.get_mut(&holder) {
+                            w[hand] = None;
+                        }
+                    }
                 }
             }
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
@@ -644,9 +704,13 @@ impl Dynels {
         if let Some(pf) = self.want_placed.take() {
             let _ = worker.tx.send(Req::Placed(pf));
         }
+        for (holder, slot, template, stats) in std::mem::take(&mut self.pending_weapons) {
+            let _ = worker.tx.send(Req::Weapon { holder, slot, template, stats });
+        }
         let mut placed = vec![];
         while let Ok(r) = worker.rx.try_recv() {
             match r {
+                Resp::Weapon { holder, slot, set } => self.wield.entry(holder).or_default()[slot] = set,
                 Resp::Model { key, result: Ok(built) } => {
                     self.models.insert(key, Model::Ready { built, uploaded: false });
                 }
@@ -711,6 +775,7 @@ impl Dynels {
             if *id == own {
                 continue;
             }
+            let id_ref = id;
             let Some(Model::Ready { built, uploaded }) = self.models.get_mut(&c.key) else { continue };
             let Some(rig) = built.rig.clone() else { continue };
             if !c.features_set {
@@ -743,6 +808,18 @@ impl Dynels {
                 },
                 Special::None => {
                     let (id, a) = clip_of(built, state).map_or((0x78, None), |(i, a)| (i, Some(a)));
+                    // a wielder: weapon idle (list 0x10 of the first weapon in slot 6, 8) and 2H walk/run (lists 0x2a / 0x2b)
+                    let set = self.wield.get(id_ref).and_then(|w| w.iter().flatten().next().copied());
+                    let stance = set.and_then(|set| {
+                        let key = match state {
+                            AnimState::Idle => canim::list::IDLE,
+                            AnimState::Walk => canim::list::WALK_2H,
+                            AnimState::Run => canim::list::RUN_2H,
+                            _ => return None,
+                        };
+                        canim::weapon_list(set, false, false, key).first().and_then(|&sid| built.clips.get(&(sid as u32)).map(|a| (sid as u32, a)))
+                    });
+                    let (id, a) = stance.map_or((id, a), |(i, a)| (i, Some(a)));
                     let nominal = match state {
                         AnimState::Walk | AnimState::WalkBack => max_speed(Mode::Walk, state == AnimState::WalkBack, c.mover.skill()),
                         AnimState::Run | AnimState::RunBack => max_speed(Mode::Run, state == AnimState::RunBack, c.mover.skill()),
@@ -898,7 +975,7 @@ mod tests {
             z.world.update(0.05, eye, fwd, &mut host);
             models.append(&mut host.actor_models);
             actors = std::mem::take(&mut host.actors);
-            let pending = keys(&z).iter().any(|k| matches!(z.world.models.get(k), None | Some(Model::Loading))) || z.world.want_placed.is_some() || z.world.props.len() < 12;
+            let pending = keys(&z).iter().any(|k| matches!(z.world.models.get(k), None | Some(Model::Loading))) || z.world.want_placed.is_some() || z.world.props.len() < 12 || z.world.wield.len() < 3;
             if !pending {
                 break;
             }
