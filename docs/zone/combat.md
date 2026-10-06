@@ -17,7 +17,8 @@ keys / hotbar / chat ─► Cmd::{Attack,SwitchTarget,Special(stat),Sit} (contro
                       ─► frames (ao_net::n3::combat / action, ptype 0xA) ─► LoginSession::send_zone
 Module::update ─► ao_audio::Audio::set_combat_char for every dynel (combat music, `FUN_10059736`) ; floating numbers age out ;
                   own death timer (`CharDie_t`, 3 s, then `CharacterAction` 0x98)
-glue: Hit/SpecialAttack ─► Dynels::attack(id) (swing clip) ; own char ─► Player::play(Role::Clip("unarmed-rswing"))
+glue: Hit/SpecialAttack ─► `swing()` (glue.rs): weapon list 0xb / special list key of the wielded weapon's AnimSet (combat-anim.md §3) ─►
+      Player::swing (own) | Dynels::play_once / attack (others; creatures = record key 0x40a) ; death/hit sounds ─► Dynels::char_sound
       Died(own) ─► Player::play(Role::Clip(anim_name(death anim)), hold) ; Health>0 ─► Player::stand ; fighting ─► `idle-unarmed` stance
       Emote ─► Dynels::play_once(id, social id) | Player::play(Role::Emote(name))
       Floating ─► `fight_draw`: HUD number (own char) or the number above the head (others) on the draw list
@@ -47,7 +48,8 @@ Key ids were computed from the shipped CharPrefs.xml (`provider_hash` of each `A
 * The weapon-specific parts of `N3Msg_SecondarySpecialAttack` (`FUN_10063be4` recharge, `FUN_100686fb` weapon slot availability,
   `FUN_100679c1` range, `FUN_10058908` line of sight): the server refuses such attacks itself; the client text for the refusal arrives as a
   `FormatFeedback`/`CharacterAction` 0x76 and is printed by the chat layer.
-* Own swing animation: always `unarmed-rswing`; the weapon swing lists (`combat-anim.md` §3) are not applied to the own avatar yet.
+* Own swing animation: the wielded weapon's list (combat-anim.md §3); bare hands, own-item specials and AnimSet 4/5 play `unarmed-rswing` (item record multimap layout not decoded, labelled GUESS).
+* `/duel`, `/petduel`, the received PvP / duel action ids: [combat-duel.md](combat-duel.md), [actions.md](actions.md) §7.
 * The HUD floating-number reference y (`DAT_102761c0`) and the effect `0x2f5a` bitmap font (material 40): the numbers are drawn with the
   GUI `Shell` font at the lower third of the screen (own) / above the head (others), colours and life/rise speed from the client.
 * Combat music `flag` input (`dynel+0x21c`, writer unknown) is fed as false; stat 421 as 0 (stored, never read by a decision).
@@ -67,5 +69,14 @@ With the announce: Aomacvolk (lvl 1) vs a Beach Leet (12 HP), capture `docs/capt
 back (7), `< StopFight`, `< StatIIR` 0x34 (XP) = 145 ("You received 145 xp." and the yellow 145), "You can loot these remains." (corpse), then
 the deselect `> LookAt(none,0)`. Window captures inspected: world damage number above the target, own HUD numbers at the left edge, the combat
 log lines ("You hit Beach Leet for 4 points of projectile damage", "You tried to hit Beach Leet, but missed!"), the XP bar filling.
-Observed gaps: the HP bar of the Hud did not drop after the leet's 7 (Hud/Zone health bookkeeping, `34 / 1` max shows the max-health stat is
-not applied); the dead leet stays drawn with the selection box (Dynels corpse handling).
+Observed gaps of that capture, status after the wiring pass: the maximum health was `1` because the own `FullCharacter` carries `Life` (1) = 1 and
+`Combat` stored it over the header's value (now skipped, `state.rs` test `full_character_life_does_not_replace_the_header_max_health`; the Hud bar
+shows `40 / 40` for the lvl 2 Aomacvolk live, the maximum itself is computed by `hud_pools`); the dead leet standing drawn with the selection box:
+the death clip holds until the server's `n3ToClientQuit` ~3 s later (`Dynels::die`, `Zone` removal, `hud_target` clears the selection), no extra
+state found in the capture replay (`dynels::tests::replayed_kill_plays_the_death_clip`).
+
+Live re-check (this build, headless harness with the real audio engine, `AOMAC_AUDIO_LOG=1`): login, HUD `40 / 40`, `LookAt` + `Attack` accepted
+from the cliff top above the beach (the server did not deal hits at 15 m height difference), world numbers / swings of other dynels and door/fight
+sound calls (`game sound <id> ...: N voice(s)`) appeared. **Not re-run:** the kill of a Beach Leet with own swing / hit sound / corpse / XP in this build,
+because the saved character position kept being moved by other sessions (beach reachable only by a ~1000 m swim and a ledge, then the position
+was moved to another playfield); the previous capture above remains the evidence for kill, corpse and XP.
