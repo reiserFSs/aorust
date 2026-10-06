@@ -137,7 +137,7 @@ impl Gui {
     /// Topmost window under the mouse decides (`UpdateToolTip` stops at the first window containing the pointer; a
     /// full-screen transparent window only counts where it has visible content, as for `wants_mouse`).
     fn tip_view_at(&self, x: f32, y: f32) -> Option<(ViewId, usize)> {
-        for (_, root, pos) in self.windows_top_down() {
+        for (_, root, pos) in self.windows_at(x, y) {
             let (lx, ly) = (x - pos.0 as f32, y - pos.1 as f32);
             if let Some(v) = self.tip_in(root, lx, ly, true, 0.0, 0.0) {
                 return Some(v);

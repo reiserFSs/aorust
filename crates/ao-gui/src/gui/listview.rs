@@ -1060,7 +1060,7 @@ impl Gui {
         let Some(m) = self.multi_data(rows).cloned() else { return };
         let off = self.header_offset(hv);
         let art: [Option<GfxId>; 9] = [0x155, 0x157, 0x150, 0x152, 0x153, 0x156, 0x154, 0x151, 0x14f].map(|i| self.gfx.image(GfxId(i)).map(|_| GfxId(i)));
-        out.push(DrawCmd::Clip(Some([rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1])));
+        let outer = push_clip(out, [rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1]);
         let mut end = 0.0f32;
         for (i, x, cw) in Self::multi_cols(&m) {
             let cell = Rect::new(rect.l + x - off, rect.t, rect.l + x - off + cw, rect.b);
@@ -1073,7 +1073,7 @@ impl Gui {
         if filler.r > filler.l {
             self.draw_border(out, &art, filler, tint, alpha);
         }
-        out.push(DrawCmd::Clip(None));
+        out.push(DrawCmd::Clip(outer));
     }
 
     /// Right press: rows of lists and multi lists raise their mouse signal with button 2; the header opens its column menu.

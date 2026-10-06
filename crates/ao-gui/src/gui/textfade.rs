@@ -118,13 +118,13 @@ impl Gui {
         let now = self.time;
         let Some(f) = self.text_fades.get(&id) else { return };
         let lines: Vec<(String, i32, f32, f32)> = f.lines.iter().map(|l| (l.html.clone(), l.h, l.off, f.alpha(l, now))).collect();
-        out.push(DrawCmd::Clip(Some([rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1])));
+        let outer = push_clip(out, [rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1]);
         for (html, h, off, alpha) in lines {
             let top = rect.b + 1.0 - off - h as f32;
             let t = TextData { text: html, font: FontId::Chat, tvf: FLAGS, min_pref: Point::new(-1.0, -1.0), max_pref: Point::new(-1.0, -1.0), caret: 0, anchor: None, scroll_x: 0.0, hint: String::new() };
             self.draw_text_view(out, id, &t, Rect::new(rect.l, top, rect.r, top + h as f32 - 1.0), tint, alpha);
         }
-        out.push(DrawCmd::Clip(None));
+        out.push(DrawCmd::Clip(outer));
     }
 }
 

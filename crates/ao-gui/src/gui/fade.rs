@@ -175,7 +175,7 @@ impl Gui {
     pub(super) fn fade_hover(&mut self) {
         let (x, y) = (self.mouse.x, self.mouse.y);
         let mut group = String::new();
-        for (_, root, pos) in self.windows_top_down() {
+        for (_, root, pos) in self.windows_at(x, y) {
             if let Some(v) = self.deepest_at(root, x - pos.0 as f32, y - pos.1 as f32, true, 0.0, 0.0) {
                 let mut cur = Some(v);
                 while let Some(c) = cur {

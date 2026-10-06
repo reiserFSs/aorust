@@ -12,8 +12,9 @@
 //! around the view XML of the owner, [`Rollup::layout`] places them. Other HUD windows dock with `Rollup::open_page` (key = the window's dvalue
 //! name, e.g. `nano_window`) and take [`RollupEvent::Closed`] to close their state.
 //!
-//! UNRESOLVED: the scrolling of the controller (`scroll_offset` of the config, mouse wheel) is ours (wheel over the area, pages that end up
-//! completely outside the screen are hidden: no window clipping); the header's popup menu (the "i" button, `FUN_10048736`: one entry of `LDBface::GetText(0x2710, ..)`
+//! Shared clipping is traced in `View::_CallRender` 0x1014d2e3: inherited/screen rect intersection, recursive propagation,
+//! flag 0x1 viewport application and restoration. Rollup-area parenting / clip-flag setup remains [INFERENCE].
+//! UNRESOLVED: controller scrolling (`scroll_offset`, mouse wheel) is ours; the header's popup menu (`FUN_10048736`: one entry of `LDBface::GetText(0x2710, ..)`
 //! whose key is not decompiled) and the header art colours. Header reorder/undock and free-window tab grouping live in `docks.rs`.
 
 use ao_gui::{CanvasItem, Event, GfxId, Gui, InputEvent, WindowId, WindowSize};
@@ -236,16 +237,19 @@ impl Rollup {
 
     /// Places the pages (`FUN_10048232`): top to bottom from the area top minus the scroll offset, [`GAP`] px apart.
     pub fn layout(&mut self, gui: &mut Gui) {
-        let (x, top, _) = self.area();
+        let (x, top, bottom) = self.area();
         let total: i32 = self.pages.iter().filter(|p| p.docked).map(|p| gui.window_size(p.window).1 as i32 + GAP).sum();
         let max_scroll = (total - (self.screen.1 as i32 - AREA_BOTTOM - top)).max(0) as f32;
         self.scroll = self.scroll.clamp(0.0, max_scroll);
         let mut y = top - self.scroll as i32;
+        for p in &self.pages {
+            gui.set_window_clip(p.window, p.docked.then_some([x, top, self.screen.0 as i32, (bottom + 1).min(self.screen.1 as i32)]));
+        }
         for p in self.pages.iter().filter(|p| p.docked) {
             let h = gui.window_size(p.window).1 as i32;
             gui.set_window_pos(p.window, (x, y));
-            // no clipping of windows: a page entirely outside the screen is hidden
-            gui.set_window_visible(p.window, y + h > 0 && y < self.screen.1 as i32);
+            // Cull pages wholly outside the viewport; partial pages retain the area scissor.
+            gui.set_window_visible(p.window, y + h > top && y <= bottom);
             y += h + GAP;
         }
     }
@@ -342,6 +346,45 @@ fn inner_xml(src: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ClipShot { gui: Gui }
+
+    impl ao_render::Frontend for ClipShot {
+        fn gui(&self) -> &Gui { &self.gui }
+        fn input(&mut self, ev: InputEvent, _host: &mut ao_render::Host) { self.gui.input(ev); }
+        fn frame(&mut self, dt: f32, _size: (u32, u32), _host: &mut ao_render::Host) -> ao_gui::DrawList {
+            self.gui.frame(dt)
+        }
+    }
+
+    #[test]
+    fn scrolled_appended_page_offscreen_clip() {
+        let Some(out) = std::env::var_os("AOMAC_SHOT_DIR") else { return };
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let size = (640, 600);
+        let mut gui = Gui::new(&dir, None).unwrap();
+        gui.set_screen_size(size.0, size.1);
+        let mut rollup = Rollup::new(&dir, size);
+        rollup.open_page(&mut gui, "first", "First", "<root><View/></root>", 200.0).unwrap();
+        let xml = r#"<root><View view_layout="vertical"><ScrollView max_size="Point(16000,16000)"><ScrollViewChild view_layout="vertical" max_size="Point(16000,16000)"><CanvasView name="paint" min_size="Point(185,800)" max_size="Point(185,800)"/></ScrollViewChild></ScrollView></View></root>"#;
+        let page = rollup.open_page(&mut gui, "shop_clip", "Shop-like appended page", xml, 800.0).unwrap();
+        gui.set_canvas(page, "paint", vec![CanvasItem::Solid { dst: [0.0, 0.0, 185.0, 800.0], color: 0x00ff00, alpha: 1.0 }]);
+        rollup.scroll = 10000.0;
+        rollup.layout(&mut gui);
+        assert!(gui.window_outer_frame(page).unwrap().1 < AREA_TOP, "page crosses the top viewport edge");
+        assert!(!gui.wants_mouse(500.0, 10.0));
+        let mut shot = ClipShot { gui };
+        let mut off = ao_render::Offscreen::new(&shot, size).unwrap();
+        let list = off.frame(&mut shot, 0.016);
+        std::fs::create_dir_all(&out).unwrap();
+        let path = Path::new(&out).join("rollup-clipped.png");
+        off.png(&shot, &list, &path).unwrap();
+        let image = image::open(path).unwrap().to_rgba8();
+        let green = |p: &image::Rgba<u8>| p[1] > 200 && p[0] < 30 && p[2] < 30;
+        assert!((0..AREA_TOP as u32).all(|y| (449..640).all(|x| !green(image.get_pixel(x, y)))), "nested canvas must not paint above RollupArea");
+        assert!((AREA_TOP as u32..375).any(|y| green(image.get_pixel(500, y))), "visible part of nested canvas is rendered");
+    }
 
     const XML: &str = r#"<Archive code="0"><Archive code="0" name="dock_config"><Array name="dock_node_configs">
         <Archive code="0"><Float name="page_height" value="215.000000" /><Bool name="is_page_expanded" value="true" /></Archive>

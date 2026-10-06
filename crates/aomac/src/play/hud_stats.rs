@@ -861,6 +861,13 @@ impl HudStats {
 
     // ------------------------------------------------------------------------------------------------------------ dispatch
 
+    pub(super) fn configure_stat(&mut self, d: &super::dvalue::DValues) {
+        if let Some(s) = self.stat.as_mut() { s.configure(d); }
+    }
+
+    pub(super) fn stat_event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone, d: &mut super::dvalue::DValues) -> bool {
+        self.stat.as_mut().is_some_and(|s| s.event(gui, ev, zone, d, self.screen))
+    }
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
         self.dnd.clock += _dt;
         self.equipment.refresh(zone);
@@ -939,6 +946,7 @@ mod tests {
         hud: HudStats,
         zone: Zone,
         rollup: Rollup,
+        dvalues: super::super::dvalue::DValues,
     }
 
     impl Frontend for Shot {
@@ -950,10 +958,12 @@ mod tests {
             self.rollup.input(&mut self.gui, &ev);
             for e in self.gui.input(ev) {
                 self.rollup.event(&mut self.gui, &e);
+                self.hud.stat_event(&mut self.gui, &e, &self.zone, &mut self.dvalues);
                 self.hud.event(&mut self.gui, &e, &self.zone);
             }
         }
         fn frame(&mut self, dt: f32, _size: (u32, u32), _host: &mut Host) -> DrawList {
+            self.hud.configure_stat(&self.dvalues);
             self.hud.update(&mut self.gui, &mut self.zone, dt);
             self.gui.frame(dt)
         }
@@ -983,7 +993,7 @@ mod tests {
         }
         let hud = HudStats::new(&dir, SIZE).unwrap();
         let rollup = Rollup::new(&dir, SIZE);
-        let shot = Shot { gui, hud, zone, rollup };
+        let shot = Shot { gui, hud, zone, rollup, dvalues: super::super::dvalue::DValues::new(&dir) };
         let off = Offscreen::new(&shot, SIZE).unwrap();
         Some((shot, off))
     }
@@ -1152,6 +1162,48 @@ mod tests {
         }
         png(&mut s, &mut o, "skills-7-suggested");
         eprintln!("pending: {:?}, remaining {rem}", (16..=21).map(|a| (a, s.hud.model.pending(a))).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn stat_view_config_menu_controls_bars_and_persists() {
+        use super::super::dvalue::{DValues, Variant, CAT_CHAR};
+        let Some((mut s, mut o)) = shot() else { return };
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Stat);
+        s.zone.on_frame(&stat_frame(33512, &[(389, 0x18)]));
+        png(&mut s, &mut o, "stats-default");
+        let w = s.hud.window(WindowKind::Stat).unwrap();
+        let names = ["alienxp_box", "xp_box", "duel_box", "team_box", "solo_box"];
+        let baseline = stat_view::Config::load(&s.dvalues).0;
+        assert_eq!(names.iter().filter(|name| s.gui.is_visible(w, name)).count(), 2);
+        for (name, shown) in names.iter().zip(baseline) { assert_eq!(s.gui.is_visible(w, name), shown); }
+        let initial_rows_top = s.gui.view_rect(w, "label0").unwrap().t;
+        let bar_pitch = s.gui.view_rect(w, "nano_box").unwrap().t - s.gui.view_rect(w, "health_box").unwrap().t;
+        for (i, name) in names.iter().enumerate() {
+            assert!(s.hud.stat_event(&mut s.gui, &Event::ContextMenu { window: w, x: 300, y: 100, link: None }, &s.zone, &mut s.dvalues));
+            let row_height = s.gui.fonts().font(ao_gui::FontId::Normal).height as f32 + 2.0;
+            let events = s.gui.input(InputEvent::MouseDown { x: 320.0, y: 102.0 + (i as f32 + 0.5) * row_height, button: ao_gui::MouseButton::Left });
+            assert!(events.iter().any(|e| matches!(e, Event::MenuPicked { id } if *id == 0x5354_0000 | i as u32)));
+            for event in &events { s.hud.stat_event(&mut s.gui, event, &s.zone, &mut s.dvalues); }
+            s.gui.input(InputEvent::MouseUp { x: 320.0, y: 102.0 + (i as f32 + 0.5) * row_height, button: ao_gui::MouseButton::Left });
+            assert_eq!(s.gui.is_visible(w, name), !baseline[i], "menu toggles {name}");
+        }
+        png(&mut s, &mut o, "stats-configured");
+        assert_ne!(s.gui.view_rect(w, "label0").unwrap().t, initial_rows_top, "collapsed bars reflow the Stats rows inside the saved-height rollup page");
+        assert_eq!(s.gui.view_rect(w, "nano_box").unwrap().t - s.gui.view_rect(w, "health_box").unwrap().t, bar_pitch, "saved outer height must not stretch bars as visible count changes");
+        let saved = s.dvalues.save_config(CAT_CHAR);
+        let mut restored = DValues::new(&ao_gui::client_dir());
+        assert!(restored.load_config(&saved, CAT_CHAR, false));
+        assert_eq!(stat_view::Config::load(&restored).0, baseline.map(|v| !v));
+        s.hud.close(&mut s.gui, &mut s.rollup, WindowKind::Stat);
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Stat);
+        s.dvalues = restored;
+        o.frame(&mut s, 0.016);
+        let w = s.hud.window(WindowKind::Stat).unwrap();
+        for (name, shown) in names.iter().zip(baseline.map(|v| !v)) { assert_eq!(s.gui.is_visible(w, name), shown); }
+        s.dvalues.set("StatViewConfig", Variant::Archive("<Archive name=\"StatViewConfig\"><Bool name=\"AIXPBar\" value=\"true\"/></Archive>".into()));
+        s.zone.on_frame(&stat_frame(33512, &[(389, 0)]));
+        o.frame(&mut s, 0.016);
+        assert!(!s.gui.is_visible(w, "alienxp_box"), "saved true cannot bypass the expansion gate");
     }
 
     #[test]

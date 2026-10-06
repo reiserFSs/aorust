@@ -173,7 +173,7 @@ impl Gui {
     /// Left press on close / pin / `?` of the topmost framed window under the pointer. The icon button is handled by the frame code. True = consumed.
     pub(super) fn border_press(&mut self, x: f32, y: f32) -> bool {
         let p = Point::new(x, y);
-        for (wid, _, _) in self.windows_top_down() {
+        for (wid, _, _) in self.windows_at(x, y) {
             let Some((ox, oy, ow, oh)) = self.window_outer_frame(wid).filter(|_| self.windows[wid].as_ref().is_some_and(|w| w.framed)) else { continue };
             if !(x >= ox as f32 && x < (ox + ow as i32) as f32 && y >= oy as f32 && y < (oy + oh as i32) as f32) {
                 continue;
@@ -228,7 +228,7 @@ impl Gui {
     pub(super) fn update_window_hover(&mut self) {
         let m = self.mouse;
         let hovered = self
-            .windows_top_down()
+            .windows_at(m.x, m.y)
             .into_iter()
             .find(|(wid, root, pos)| match self.windows[*wid].as_ref() {
                 Some(w) if w.framed => self.window_outer_frame(*wid).is_some_and(|(x, y, ow, oh)| m.x >= x as f32 && m.x < (x + ow as i32) as f32 && m.y >= y as f32 && m.y < (y + oh as i32) as f32),

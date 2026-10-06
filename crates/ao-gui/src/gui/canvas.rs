@@ -37,6 +37,21 @@ impl Gui {
         }
     }
 
+    /// Fits a named owner's height to its visible content instead of stretching it
+    /// inside a larger saved dock page. Recomputes after collapsed rows change.
+    pub fn fit_view_height(&mut self, w: WindowId, name: &str) {
+        let Some(id) = self.find(w, name) else { return };
+        self.tree.views[id].min_size.y = 0.0;
+        self.tree.views[id].max_size.y = 0.0;
+        self.tree.views[id].max_limit.y = 16000.0;
+        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default() };
+        let height = layout::pref(&mut env, &self.tree, id, false).y;
+        self.tree.views[id].min_size.y = height;
+        self.tree.views[id].max_size.y = height;
+        self.tree.views[id].max_limit.y = height;
+        self.relayout_window(w);
+    }
+
     /// Tooltips over rectangles of the `CanvasView` called `name` (replaces the previous ones); texts follow `View::SetToolTip`.
     pub fn set_canvas_tips(&mut self, w: WindowId, name: &str, tips: Vec<CanvasTip>) {
         if let Some(v) = self.find(w, name) {
@@ -64,12 +79,7 @@ impl Gui {
 
     pub(super) fn draw_canvas(&self, out: &mut Vec<DrawCmd>, c: &CanvasData, rect: Rect, alpha: f32) {
         // the renderer keeps one scissor: inside a `ScrollView` (itself a clip) the canvas clips to the intersection and restores the outer one
-        let outer = out.iter().rev().find_map(|c| if let DrawCmd::Clip(c) = c { Some(*c) } else { None }).flatten();
-        let mut own = [rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1];
-        if let Some(o) = outer {
-            own = [own[0].max(o[0]), own[1].max(o[1]), own[2].min(o[2]).max(own[0].max(o[0])), own[3].min(o[3]).max(own[1].max(o[1]))];
-        }
-        out.push(DrawCmd::Clip(Some(own)));
+        let outer = push_clip(out, [rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1]);
         for item in &c.items {
             match *item {
                 CanvasItem::Image { id, src, dst, alpha: a } => {

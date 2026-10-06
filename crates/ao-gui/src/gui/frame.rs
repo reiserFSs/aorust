@@ -191,12 +191,7 @@ impl Gui {
 
     pub(super) fn draw_view_tabs(&mut self, out: &mut Vec<DrawCmd>, id: ViewId, rect: Rect, alpha: f32) {
         let Some(tabs) = self.view_tabs.remove(&id) else { return };
-        let outer = out.iter().rev().find_map(|c| if let DrawCmd::Clip(c) = c { Some(*c) } else { None }).flatten();
-        let mut clip = [rect.l as i32,rect.t as i32,rect.r as i32+1,rect.b as i32+1];
-        if let Some(o) = outer { clip = [clip[0].max(o[0]),clip[1].max(o[1]),clip[2].min(o[2]),clip[3].min(o[3])]; }
-        clip[2] = clip[2].max(clip[0]);
-        clip[3] = clip[3].max(clip[1]);
-        out.push(DrawCmd::Clip(Some(clip)));
+        let outer = push_clip(out, [rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1]);
         let tint = self.map_color(0x1000000);
         for selected in [false, true] {
             let mut x = rect.l + 2.0;
@@ -318,7 +313,7 @@ impl Gui {
     pub(super) fn frame_mouse_down(&mut self, x: f32, y: f32) -> bool {
         let p = Point::new(x, y);
         let top_hit = self.hit(x, y).map(|h| h.0);
-        for (wid, root, pos) in self.windows_top_down() {
+        for (wid, root, pos) in self.windows_at(x, y) {
             if !self.windows[wid].as_ref().is_some_and(|w| w.framed) {
                 // A frameless widget above hides frames below it.
                 if top_hit == Some(wid) {
@@ -403,7 +398,7 @@ impl Gui {
 
     /// TabView drop destination, shared by window tabs and RollupPage headers.
     pub fn tab_drop_target(&mut self, x: f32, y: f32) -> Option<(WindowId,usize)> {
-        for (wid, _, _) in self.windows_top_down() {
+        for (wid, _, _) in self.windows_at(x, y) {
             if !self.is_tabbed(wid) { continue; }
             let Some(o) = self.outer_of(wid) else { continue };
             let tv = o.resize(BORDER.0, BORDER.1, -BORDER.2, -BORDER.3);
@@ -416,7 +411,7 @@ impl Gui {
 
     /// Right press: [`Event::ContextMenu`] for the topmost window with the context flag whose frame / client contains the pointer.
     pub(super) fn frame_right_down(&mut self, x: f32, y: f32) {
-        for (wid, _, _) in self.windows_top_down() {
+        for (wid, _, _) in self.windows_at(x, y) {
             let ctx = matches!(self.windows.get(wid), Some(Some(w)) if w.fx.context);
             let Some(o) = self.outer_of(wid) else { continue };
             if !(x >= o.l && x < o.r + 1.0 && y >= o.t && y < o.b + 1.0) {
@@ -468,14 +463,7 @@ impl Gui {
         // The title is a `TextView` (HTML subset): a `<font color=..>` run keeps its own colour, the rest uses the tab's text colour.
         let runs = self.tab_runs(title);
         let mut pen = (tab.l + TAB_PAD_L) as i32;
-        let outer = out.iter().rev().find_map(|c| if let DrawCmd::Clip(c) = c { Some(*c) } else { None }).flatten();
-        let mut clip = [(tab.l + TAB_PAD_L) as i32,tab.t as i32,(tab.r + 1.0 - TAB_PAD_R) as i32,tab.b as i32+1];
-        if let Some(o) = outer {
-            clip = [clip[0].max(o[0]),clip[1].max(o[1]),clip[2].min(o[2]),clip[3].min(o[3])];
-        }
-        clip[2] = clip[2].max(clip[0]);
-        clip[3] = clip[3].max(clip[1]);
-        out.push(DrawCmd::Clip(Some(clip)));
+        let outer = push_clip(out, [(tab.l + TAB_PAD_L) as i32, tab.t as i32, (tab.r + 1.0 - TAB_PAD_R) as i32, tab.b as i32 + 1]);
         for run in runs {
             let c = run.color.map_or(text, rgb);
             pen += self.draw_string(out, FontId::Normal, &run.text, pen, tab.t as i32, c, alpha, false);

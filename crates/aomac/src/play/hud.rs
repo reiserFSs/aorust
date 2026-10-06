@@ -728,6 +728,7 @@ impl Hud {
         self.options.update(gui, &self.dvalues, &resolver(&self.dvalues, zone));
         self.sync_options(gui);
         self.apply_fades(gui);
+        self.stats.configure_stat(&self.dvalues);
         self.stats.update(gui, zone, _dt);
         let st = |id: u32| zone.skill_value(id).unwrap_or(0);
         let xp = hud_pools::xp(st);
@@ -972,6 +973,9 @@ impl Hud {
             }
             Some(RollupEvent::Handled) => return true,
             None => {}
+        }
+        if self.stats.stat_event(gui, ev, zone, &mut self.dvalues) {
+            return true;
         }
         if self.stats.event(gui, ev, zone) {
             for k in self.stats.take_closed() {

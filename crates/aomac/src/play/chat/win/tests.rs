@@ -108,13 +108,15 @@ fn chat_documents_are_character_local_and_legacy_customizations_survive_once() {
 
 #[test]
 fn frames_are_placed_inside_the_screen() {
-    let (x, y, w, h) = place(Some([277.0, 1206.0, 1273.0, 1439.0]), true, (1280, 800), Reserved { left: 190, right: 65, bottom: 38 });
-    assert!(x >= 0 && y >= 0 && x as u32 + w <= 1280 && y as u32 + h <= 800);
-    assert_eq!(place(None, false, (1280, 800), Reserved::default()), (440, 300, 400, 200));
-    // saved frames: translated inside the screen, never resized (`MoveInsideScreen(false, true, true)`)
-    assert_eq!(place(Some([277.0, 1206.0, 1273.0, 1439.0]), false, (1280, 828), Reserved::default()), (277, 594, 997, 234));
-    assert_eq!(place(Some([-10.0, 100.0, 289.0, 199.0]), false, (1280, 828), Reserved::default()), (0, 100, 300, 100));
-    assert_eq!(place(Some([1200.0, 100.0, 1499.0, 199.0]), false, (1280, 828), Reserved::default()), (980, 100, 300, 100));
+    // Inclusive template coordinates use the same absolute translation as saved documents.
+    assert_eq!(place(Some([277.0, 1206.0, 1273.0, 1439.0]), (1280, 800)), (277, 566, 997, 234));
+    assert_eq!(place(Some([1273.0, 1206.0, 2303.0, 1440.0]), (1667, 900)), (636, 665, 1031, 235));
+    assert_eq!(place(None, (1280, 800)), (440, 300, 400, 200));
+    // Saved frames translate, never resize, even when wider than the screen.
+    assert_eq!(place(Some([277.0, 1206.0, 1273.0, 1439.0]), (1280, 828)), (277, 594, 997, 234));
+    assert_eq!(place(Some([-10.0, 100.0, 289.0, 199.0]), (1280, 828)), (0, 100, 300, 100));
+    assert_eq!(place(Some([1200.0, 100.0, 1499.0, 199.0]), (1280, 828)), (980, 100, 300, 100));
+    assert_eq!(place(Some([100.0, 100.0, 1799.0, 199.0]), (1280, 828)), (0, 100, 1700, 100));
 }
 
 /// `ChatWindows::new` reads the prefs dir from the process environment: serialise the set + open.
@@ -140,17 +142,22 @@ fn rig(screen: (u32, u32)) -> Option<(Gui, ChatWindows)> {
     }
     let dir = test_dir();
     let _ = std::fs::remove_dir_all(&dir);
-    // Existing interaction tests exercise saved retail mode-2 documents, independently of the port's fresh-character default.
-    for mut cfg in read_windows(&client.join("prefs/NewChar")) {
-        let (x, y, w, h) = place(cfg.frame, true, screen, Reserved::default());
-        cfg.frame = Some([x as f32, y as f32, (x + w as i32 - 1) as f32, (y + h as i32 - 1) as f32]);
+    write_interaction_windows(&client, &dir, screen);
+    let mut gui = Gui::new(&client, None).unwrap();
+    let ch = open_in(&mut gui, &dir, screen);
+    Some((gui, ch))
+}
+
+// Explicit saved, nonoverlapping frames keep input/drag tests independent of fresh placement policy.
+fn write_interaction_windows(client: &Path, dir: &Path, screen: (u32, u32)) {
+    for (i, mut cfg) in read_windows(&client.join("prefs/NewChar")).into_iter().enumerate() {
+        let x = 20 + i as u32 * (screen.0 / 2);
+        let y = screen.1 - 254;
+        cfg.frame = Some([x as f32, y as f32, (x + screen.0 / 2 - 40 - 1) as f32, (y + 233) as f32]);
         let window = dir.join("Chat/Windows").join(&cfg.window_name);
         std::fs::create_dir_all(&window).unwrap();
         std::fs::write(window.join("Config.xml"), cfg.to_xml(&|_| String::new())).unwrap();
     }
-    let mut gui = Gui::new(&client, None).unwrap();
-    let ch = open_in(&mut gui, &dir, screen);
-    Some((gui, ch))
 }
 
 #[test]
@@ -166,6 +173,10 @@ fn fresh_characters_start_framed_tabbed_with_input_and_can_switch_modes() {
     let mut gui = Gui::new(&client, None).unwrap();
     let mut ch = ChatWindows::new_for_character(&mut gui, (1280, 800), &character).unwrap();
     assert_eq!(ch.frames.len(), 1);
+    assert_eq!(ch.frames[0].placed, (277, 566, 997, 234), "fresh template width stays absolute at 1280");
+    ch.resize(&mut gui, (1667, 900));
+    assert_eq!(ch.frames[0].placed, (277, 666, 997, 234), "wider screens translate the original frame without scaling");
+    ch.resize(&mut gui, (1280, 800));
     assert_eq!(ch.wins[0].cfg.visual_mode, 0);
     assert!(ch.wins[0].cfg.textinput);
     assert_eq!(gui.window_alpha(ch.frames[0].id), 1.0);
@@ -186,10 +197,18 @@ fn fresh_characters_start_framed_tabbed_with_input_and_can_switch_modes() {
     ch.test_pick(&mut gui, 0, OP_MODE, 2);
     assert_eq!(ch.frames.len(), 2, "changing a docked tab to borderless tears it out");
     assert_eq!(ch.wins[0].cfg.visual_mode, 2);
+    ch.wins[0].cfg.frame = Some([1200.0, 100.0, 1499.0, 199.0]);
+    ch.wins[0].cfg.alpha_inactive = 0.42;
+    ch.wins[0].cfg.output_group = G_SYSTEM;
+    ch.resize(&mut gui, (1667, 900));
+    ch.resize(&mut gui, (1280, 800));
     ch.save().unwrap();
     close_all(&mut gui, &ch);
     let saved = ChatWindows::new_for_character(&mut gui, (1280, 800), &character).unwrap();
     assert_eq!(saved.wins[0].cfg.visual_mode, 2, "saved modes must not receive the fresh default override");
+    assert_eq!(saved.frames[saved.wins[0].frame].placed, (980, 100, 300, 100), "saved frame translates without fresh-template replacement");
+    assert_eq!(saved.wins[0].cfg.alpha_inactive, 0.42);
+    assert_eq!(saved.wins[0].cfg.output_group, G_SYSTEM);
     close_all(&mut gui, &saved);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -300,14 +319,16 @@ fn chat_win_shot() {
     let labels = TextDb::load(&client).unwrap();
     let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
     let mut zone = Zone::default();
-    for (id, v) in [(1, 125), (27, 125), (221, 100), (214, 100), (54, 1), (52, 40), (57, 0), (350, 1500), (61, 1234), (180, 0), (181, 150)] {
+    // Same captured level-one Solitus Soldier inputs as hud::tests::shot; retail formulas derive 34 Life / 32 Nano.
+    zone.stats.extend(ao_formats::stats::skills::ABILITIES.into_iter().map(|id| (id, 6)));
+    zone.stats.extend(ao_formats::stats::SKILL_GROUPS.iter().skip(1).flat_map(|g| g.stats).map(|&id| (id as u32, 5)));
+    for (id, v) in [(4, 1), (37, 1), (60, 1), (1, 1), (27, 34), (221, 1), (214, 32), (54, 1), (52, 40), (57, 0), (350, 1450), (61, 1234), (180, 0), (181, 150)] {
         zone.stats.insert(id, v);
     }
     let mut hud = Hud::new(&mut gui, &client, size).unwrap();
     hud.update(&mut gui, &mut zone, 0.0);
     // the chat windows are created after the HUD windows (normal stacking = creation order)
     let mut ch = ChatWindows::new(&mut gui, size).unwrap();
-    ch.set_reserved(&mut gui, Reserved { left: 190, right: 65, bottom: 38 });
     struct Fe(Gui);
     impl ao_render::Frontend for Fe {
         fn gui(&self) -> &Gui {
@@ -322,7 +343,8 @@ fn chat_win_shot() {
     }
     let mut fe = Fe(gui);
     sample(&mut fe.0, &mut ch);
-    for variant in ["inactive", "active"] {
+    assert_eq!(ch.frames[0].placed, (277, 594, 997, 234));
+    for variant in ["fresh", "inactive", "active"] {
         if variant == "active" {
             ch.focus_input(&mut fe.0);
             fe.0.input(InputEvent::Text("/v hello there".into()));
@@ -343,7 +365,7 @@ fn chat_win_shot() {
 fn windows_open_at_their_frames() {
     let Some((gui, ch)) = rig((1280, 800)) else { return };
     for w in &ch.wins {
-        let (_, _, pw, ph) = place(w.cfg.frame, w.cfg.template, (1280, 800), Reserved::default());
+        let (_, _, pw, ph) = place(w.cfg.frame, (1280, 800));
         assert_eq!(gui.window_size(w.id), (pw, ph), "{}", w.cfg.name);
     }
 }
@@ -548,6 +570,7 @@ fn chat_frame_shot() {
     let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
     let dir = test_dir();
     let _ = std::fs::remove_dir_all(&dir);
+    write_interaction_windows(&client, &dir, size);
     let mut ch = open_in(&mut gui, &dir, size);
     sample(&mut gui, &mut ch);
     ch.test_pick(&mut gui, 0, OP_MODE, 0);

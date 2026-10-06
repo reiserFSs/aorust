@@ -353,40 +353,16 @@ fn read_windows(dir: &Path) -> Vec<Cfg> {
     v.into_iter().map(|x| x.1).collect()
 }
 
-/// Reference screen of the shipped template frames (their largest right edge is 2303, bottom 1440): **GUESS**, only used for
-/// template-sourced windows (see [`place`]).
-const REF_SCREEN: (f32, f32) = (2304.0, 1440.0);
-
-/// Pixels of the screen the HUD covers at the left / right (wings) and the bottom (bar row).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Reserved {
-    pub left: i32,
-    pub right: i32,
-    pub bottom: i32,
-}
-
 /// Outer rectangle (x, y, w, h) of a window.
 ///
-/// * Frame from the character's own saved config: `Window::LoadWndConfig` 0x10154d6e = `WndBorder::SetClientFrame(WindowFrame)` (absolute
-///   screen coordinates from the top-left, inclusive Rect; style 3 has no border so client = outer) followed by
-///   `Window::MoveInsideScreen(false, true, true)` 0x10154abc: **translate** (never resize) so the frame lies inside the screen
-///   (`WindowController_c` +0x80 = display size). There is no HUD/ControlCenter avoidance anywhere in the chat code.
-/// * Frame from the client's shipped template (`prefs/NewChar`, authored on a 2304x1440 screen): the same rule would stack the two
-///   windows on top of each other on smaller screens, so (**GUESS, no original evidence**) the template is scaled horizontally by
-///   `free width / 2304` (the screen minus the HUD's side wings), keeps its height and sits bottom-anchored above the HUD's bottom bar row.
-/// * No frame: `Window::MoveToCenter`, 400 x 200 (`_DAT_101b1840` / `_DAT_101a959c`, `FUN_10097ae3`).
-fn place(frame: Option<[f32; 4]>, template: bool, screen: (u32, u32), reserved: Reserved) -> (i32, i32, u32, u32) {
+/// Every supplied frame, irrespective of source: `Window::LoadWndConfig` 0x10154d6e =
+/// `WndBorder::SetClientFrame(WindowFrame)` (absolute top-left coordinates, inclusive Rect),
+/// followed by `Window::MoveInsideScreen(false, true, true)` 0x10154abc: translate, never resize.
+/// There is no resolution scaling or HUD avoidance.
+/// No frame: `Window::MoveToCenter`, 400 x 200 (`_DAT_101b1840` / `_DAT_101a959c`, `FUN_10097ae3`).
+fn place(frame: Option<[f32; 4]>, screen: (u32, u32)) -> (i32, i32, u32, u32) {
     let (sw, sh) = (screen.0 as f32, screen.1 as f32);
     match frame {
-        Some([l, t, r, b]) if template => {
-            let (x0, area_w) = (reserved.left as f32, (sw - (reserved.left + reserved.right) as f32).max(120.0));
-            let kx = (area_w / REF_SCREEN.0).min(1.0);
-            let w = ((r - l + 1.0) * kx).round().clamp(120.0, area_w);
-            let h = (b - t + 1.0).clamp(60.0, sh);
-            let x = (x0 + l * kx).round().clamp(x0, (x0 + area_w - w).max(x0));
-            let y = (sh - reserved.bottom as f32 - h).max(0.0);
-            (x as i32, y as i32, w as u32, h as u32)
-        }
         Some([l, t, r, b]) => {
             let (w, h) = (r - l + 1.0, b - t + 1.0);
             let dx = if l < 0.0 { -l } else if r > sw - 1.0 { (sw - 1.0 - r).max(-l) } else { 0.0 };
@@ -526,7 +502,6 @@ pub struct ChatWindows {
     /// `ChatLastActiveWindow` (`window_name`).
     last_active: String,
     next_n: usize,
-    reserved: Reserved,
     /// A frame / tab / setting changed and has not been written yet ([`ChatWindows::update`] saves once the pointer is idle).
     dirty: bool,
     /// What the open popup menu acts on.

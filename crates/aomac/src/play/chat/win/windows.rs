@@ -70,7 +70,6 @@ impl ChatWindows {
             prefs,
             last_active: String::new(),
             next_n: 0,
-            reserved: Reserved::default(),
             dirty: false,
             menu: None,
             pw: WinPrefs::default(),
@@ -94,7 +93,7 @@ impl ChatWindows {
         }
         for mut g in groups {
             g.sort_by_key(|&d| s.wins[d].cfg.tab_index);
-            let outer = place(s.wins[g[0]].cfg.frame, s.wins[g[0]].cfg.template, s.screen, s.reserved);
+            let outer = place(s.wins[g[0]].cfg.frame, s.screen);
             s.add_frame(gui, g, outer)?;
         }
         Ok(s)
@@ -270,17 +269,8 @@ impl ChatWindows {
     fn replace_all(&mut self, gui: &mut Gui) {
         for f in &mut self.frames {
             let c = &self.wins[f.docs[0]].cfg;
-            f.placed = place(c.frame, c.template, self.screen, self.reserved);
+            f.placed = place(c.frame, self.screen);
             gui.set_window_outer_frame(f.id, f.placed);
-        }
-    }
-
-    /// The screen area the HUD's wings/bars cover; only the *template* default windows (first run) are kept clear of it (see [`place`]).
-    /// Windows with a saved frame are positioned as the original does and may overlap the HUD (they draw above it).
-    pub fn set_reserved(&mut self, gui: &mut Gui, reserved: Reserved) {
-        if reserved != self.reserved {
-            self.reserved = reserved;
-            self.replace_all(gui);
         }
     }
 
@@ -539,7 +529,7 @@ impl ChatWindows {
                 f.sel = f.sel.min(f.docs.len() - 1);
                 let (x, y, w, h) = f.placed;
                 let r = [x as f32 + TEAR_OFFSET, y as f32 + TEAR_OFFSET, (x + w as i32 - 1) as f32 + TEAR_OFFSET, (y + h as i32 - 1) as f32 + TEAR_OFFSET];
-                let outer = place(Some(r), false, self.screen, Reserved::default());
+                let outer = place(Some(r), self.screen);
                 self.sync_frame_cfg(src);
                 self.rebuild_frame(gui, src);
                 match self.add_frame(gui, vec![d], outer) {

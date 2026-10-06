@@ -102,6 +102,7 @@ impl Rollup {
         self.remove_key(key);
         let Some(at) = self.pages.iter().position(|p| p.key == key) else { return };
         self.pages[at].docked = false;
+        gui.set_window_visible(self.pages[at].window, true);
         let p = &self.pages[at];
         gui.show_collapsing(p.window, "rollup_header", false);
         gui.show_collapsing(p.window, "body", true);
@@ -187,6 +188,11 @@ impl Rollup {
     pub(super) fn drag_input(&mut self, gui: &mut Gui, ev: &InputEvent) {
         match *ev {
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
+                let (left, top, bottom) = self.area();
+                if x < left as f32 || x >= self.screen.0 as f32 || y < top as f32 || y >= (bottom + 1) as f32 {
+                    self.drag = None;
+                    return;
+                }
                 let p = self.pages.iter().rev().find(|p| p.docked && gui.view_rect(p.window, "rollup_header").is_some_and(|r| r.contains(ao_gui::Point::new(x,y))) && !["icon", "arrow", "close"].iter().any(|n| gui.view_rect(p.window, n).is_some_and(|r| r.contains(ao_gui::Point::new(x,y)))));
                 self.drag = p.map(|p| PageDrag { key: p.key.clone(), start: (x,y), moved: false });
             }
@@ -333,6 +339,35 @@ impl Rollup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn docked_viewport_culls_and_free_page_removes_clip() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut rollup = Rollup::new(&dir, (1280, 400));
+        let xml = "<root><CanvasView name=\"content\" min_size=\"Point(185,200)\" max_size=\"Point(185,200)\"/></root>";
+        let w = rollup.open_page(&mut gui, "clip_test", "Clip", xml, 200.0).unwrap();
+        let (left, top, bottom) = rollup.area();
+        let clips: Vec<_> = gui.frame(0.0).cmds.into_iter().filter_map(|c| if let ao_gui::DrawCmd::Clip(c) = c { Some(c) } else { None }).collect();
+        assert!(clips.contains(&Some([left, top, 1280, bottom + 1])));
+        assert!(!gui.wants_mouse(left as f32 + 50.0, bottom as f32 + 10.0));
+        rollup.free_page(&mut gui, "clip_test", left, bottom + 10);
+        assert!(gui.window_visible(w));
+        assert!(gui.wants_mouse(left as f32 + 50.0, bottom as f32 + 50.0));
+        let clips: Vec<_> = gui.frame(0.0).cmds.into_iter().filter_map(|c| if let ao_gui::DrawCmd::Clip(c) = c { Some(c) } else { None }).collect();
+        assert!(!clips.contains(&Some([left, top, 1280, bottom + 1])));
+        rollup.dock_page(&mut gui, "clip_test", top);
+        let other = rollup.open_page(&mut gui, "clip_other", "Other", xml, 200.0).unwrap();
+        rollup.scroll = 0.0;
+        rollup.layout(&mut gui);
+        assert!(!gui.window_visible(other), "second page is below the area but still on screen");
+        rollup.scroll = 10000.0;
+        rollup.layout(&mut gui);
+        assert!(!gui.window_visible(w), "first page is entirely above the area");
+        rollup.free_page(&mut gui, "clip_test", 100, 100);
+        assert!(gui.window_visible(w), "freeing a culled page restores visibility");
+    }
+
     #[test]
     fn user_config_can_omit_a_registered_wrapped_page() {
         let dir = ao_gui::client_dir();

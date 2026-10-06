@@ -67,7 +67,7 @@ for the listed groups, so the set always equals the file's list, and the two fun
 An autosubscribe window therefore shows **every group not in its list**, including channels announced later (`FUN_10083be4` → new group → `FUN_1009d589`
 auto-adds to those windows); a normal window shows only its list.
 
-**Default windows.** (a) Shipped: `client/prefs/NewChar/Chat/Windows/Window1|2/Config.xml` (read-only data; the first run copies them):
+**Default windows.** (a) Adopted data: `client/prefs/NewChar/Chat/Windows/Window1|2/Config.xml` (read-only). Using these documents when no character archive exists is intentional port policy, not an established retail default: no client DLL/EXE references `NewChar`, and the PRK launcher writes runtime `Prefs.xml` without copying it.
 * `Window1` "Default Window": startup, autosubscribe, `output_group #0000000040000002#` (Vicinity), text input on, `show_timestamps` **true**, mode 2, 0.8/0.3,
   excludes `0x41000001` (Other Pets) and 21 combat groups (0x42000001…0x42000017 minus 4/0x10/0x13, 0x4200001b, 0x42000018, …) — i.e. it shows Vicinity, System,
   Tell Messages, Your Pets, Research, Loot-team, and every chat-server channel. Frame `Rect(277,1206,1273,1439)`.
@@ -169,10 +169,7 @@ reads from `is_backmost`), so chat windows draw above them. Port: `place()` (tes
 `ao_gui::Gui::set_window_layer(w, -1|0|1)` (-1 backmost, 1 frontmost; draw and hit-test order, creation order inside a layer) — **the HUD must mark its ControlCenter/bar windows backmost (-1)** or create the
 chat windows after them (normal stacking = creation order).
 
-**GUESS (no original evidence)** for the *shipped template only* (`prefs/NewChar`, authored on a 2304x1440 screen; applying the rule above on a 1280-wide screen would pile Window2 on top of Window1 and put
-the input bar under the bottom HUD row): template frames are scaled horizontally by `free width / 2304` (free width = screen minus the HUD's wings, `Reserved{left,right}`), keep their height, and are
-bottom-anchored `Reserved.bottom` px above the screen bottom (`ChatWindows::set_reserved`, the hub passes the HUD's footprint; test screenshot used left 190 / right 65 / bottom 38 measured from the HUD art).
-Once saved (`ChatWindows::save` writes the *placed* rectangle) the windows load as ordinary absolute frames. Without a frame: centred, 400x200 (`FUN_10097ae3`).
+**All supplied frames use the same absolute rule**, including the intentionally adopted NewChar data: no 2304-wide reference screen, proportional scaling, or HUD reservation. On 1280x800, Window1 retains its exact 997x234 size at `(277,566)`; on 1667x900, Window2 retains 1031x235 at `(636,665)`. Fresh framed/tabbed policy (§11) shares Window1's frame rather than substituting the original 400x200 code fallback. Saved customization remains authoritative. Without a frame: centred, 400x200 (`FUN_10097ae3`); this is the original code fallback, not the adopted-template policy.
 Window drag/resize: see §10 (a mode-2 window is fixed in the original too; the menu switches it to the movable style-0 frame). `ChatWindows::set_visible(false/true)` hides/shows all windows (they keep collecting lines; focus is dropped) so HUD hide/show does not disturb them.
 
 ## 8. ao-gui additions (additive)
@@ -185,7 +182,7 @@ events `WindowFrame`, `TabSelected`, `TabDropped`, `FrameIcon`, `ContextMenu`, `
 ## 9. Verification
 
 `cargo test --release -p aomac chat::win` (line formats, colours, subscription rule, shipped template parse/round-trip, routing, fades, submit, 100-line cap; GUI tests skip without the client).
-Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot -- --nocapture` → `chat-inactive.png`, `chat-active.png` (see the observations in the final report of the change).
+Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot -- --nocapture` → `chat-fresh.png` (fresh framed/tabbed 997px template width over the HUD), `chat-inactive.png`, `chat-active.png`. The same frontend and offscreen renderer generate all three.
 
 ## 10. Window frame: how a chat window is moved and resized (RE, GUI.dll)
 
@@ -264,7 +261,7 @@ save/reload, border windows fixed, dock / tear-out / reload grouping, selection 
 The shipped template instead says `visual_mode 2` (`prefs/NewChar/Chat/Windows/Window1/Config.xml:57`, Window2 likewise); Window1 lines 59–60 set inactive/active alpha 0.3/0.8, line 64 enables text input, and line 74 names it "Default Window".
 The screenshot's mode-0 appearance does not establish a shipped fresh-character default. Its group-decorated tab titles are `FUN_100ab980` with `ChatShowOGrpInTitleBar` = the shipped **true** (`cd_image/gui/Default/LoginPrefs.xml:8`; input-group prompt is true at line 7).
 
-**Intentional user-requested default deviation (2026-10-06).** Fresh characters in the port start in Normal mode (0), with Default Window and Combat docked into one framed tab strip and the Default Window input line enabled. This deliberately replaces the shipped mode-2 template layout with the requested retail screenshot look; it is not claimed to be the original NewChar default.
+**Intentional user-requested default deviation (2026-10-06).** Fresh characters in the port intentionally adopt the existing NewChar data and start in Normal mode (0), with Default Window and Combat docked into one framed tab strip and the Default Window input line enabled. This deliberately replaces the adopted mode-2 layout with the requested retail screenshot look; neither template adoption nor framed/tabbed appearance is claimed to be the original fresh-character default. The original no-document code fallback remains 400x200 (§2).
 `fresh_layout` changes only newly adopted template/code defaults: mode 0, shared first-window frame, ordered tab indices. Mode 0 retains its opaque text (`FadeTo(1.0)`, §2) and retail framed background art; saved per-window modes, opacity, output groups and frames are never overridden. Normal and Borderless remain selectable through the Visual > Mode menu and persist.
 
 **Character-local saved documents.** `ChatWindows::new_for_character` uses the account/`Char<ID>` directory supplied by `DValues::char_dir` (`LoadUserConfig` 0x1006bacd; see `dvalue.rs::open_user`), rather than sharing root `Chat/Windows` between all characters. Existing port root `Chat/Windows` is renamed once into the first character without its own window archive; existing character archives take precedence and are not overwritten. Unrelated logs/preferences are untouched. Regression tests `chat_documents_are_character_local_and_legacy_customizations_survive_once` and `fresh_characters_start_framed_tabbed_with_input_and_can_switch_modes` cover migration, isolation, fresh tabs/input and saved Borderless reload.

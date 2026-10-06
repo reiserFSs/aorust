@@ -56,6 +56,18 @@ const TAB_PAD_R: f32 = 16.0;
 /// `GUIConfig_c` layer alpha: layer 2 (used by buttons) = 0.85.
 const BUTTON_ALPHA: f32 = 0.85;
 
+/// Intersect a nested scissor and return the parent to restore after drawing.
+fn push_clip(out: &mut Vec<DrawCmd>, mut clip: [i32; 4]) -> Option<[i32; 4]> {
+    let outer = out.iter().rev().find_map(|c| if let DrawCmd::Clip(c) = c { Some(*c) } else { None }).flatten();
+    if let Some(o) = outer {
+        clip = [clip[0].max(o[0]), clip[1].max(o[1]), clip[2].min(o[2]), clip[3].min(o[3])];
+    }
+    clip[2] = clip[2].max(clip[0]);
+    clip[3] = clip[3].max(clip[1]);
+    out.push(DrawCmd::Clip(Some(clip)));
+    outer
+}
+
 /// Resolves a `#Key` view attribute to text (`None` = unknown key).
 pub type Localize = Box<dyn Fn(&str) -> Option<String>>;
 
@@ -73,6 +85,7 @@ struct Window {
     root: ViewId,
     pos: (i32, i32),
     visible: bool,
+    clip: Option<[i32; 4]>,
     default_button: Option<ViewId>,
     /// Drawn inside the style-1 window frame (`open_framed_window`) or, with a title, the style-0 frame (`open_tabbed_window`).
     framed: bool,
@@ -259,7 +272,7 @@ impl Gui {
         let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
         let root = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{name}: cannot build root"))?;
         self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{name}: {w}")));
-        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false, title: None, alpha: 1.0, layer: 0, fx: Default::default(), bd: Default::default() }));
+        self.windows.push(Some(Window { root, pos, visible: true, clip: None, default_button: None, framed: false, title: None, alpha: 1.0, layer: 0, fx: Default::default(), bd: Default::default() }));
         let id = self.windows.len() - 1;
         self.resize_window(id, size);
         Ok(id)
@@ -359,6 +372,12 @@ impl Gui {
     pub fn set_window_visible(&mut self, w: WindowId, v: bool) {
         if let Some(Some(win)) = self.windows.get_mut(w) {
             win.visible = v;
+        }
+    }
+    /// Screen-space viewport, with exclusive right/bottom edges; `None` removes it.
+    pub fn set_window_clip(&mut self, w: WindowId, clip: Option<[i32; 4]>) {
+        if let Some(Some(win)) = self.windows.get_mut(w) {
+            win.clip = clip;
         }
     }
     /// Size of the window content in pixels.
@@ -907,9 +926,10 @@ impl Gui {
         let mut out = DrawList::default();
         let mut order: Vec<(WindowId, &Window)> = self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (i, w))).collect();
         order.sort_by_key(|(_, w)| w.layer); // stable: creation order inside a layer
-        type Job = (WindowId, ViewId, (i32, i32), bool, f32, Option<String>);
-        let wins: Vec<Job> = order.into_iter().map(|(i, w)| (i, w.root, w.pos, w.framed, w.alpha * w.bd.cur, w.title.clone())).collect();
-        for (wid, root, pos, framed, alpha, title) in wins {
+        type Job = (WindowId, ViewId, (i32, i32), bool, f32, Option<String>, Option<[i32; 4]>);
+        let wins: Vec<Job> = order.into_iter().map(|(i, w)| (i, w.root, w.pos, w.framed, w.alpha * w.bd.cur, w.title.clone(), w.clip)).collect();
+        for (wid, root, pos, framed, alpha, title, clip) in wins {
+            out.cmds.push(DrawCmd::Clip(clip));
             if framed {
                 let first = out.cmds.len();
                 self.draw_frame(root, pos, title.as_deref(), &mut out.cmds);
@@ -919,6 +939,7 @@ impl Gui {
             }
             self.draw_view(root, pos.0 as f32, pos.1 as f32, [255; 3], alpha, true, &mut out.cmds);
         }
+        out.cmds.push(DrawCmd::Clip(None));
         self.draw_popup(&mut out.cmds);
         self.draw_tab_ghost(&mut out.cmds);
         self.draw_menu(&mut out.cmds);
@@ -1071,11 +1092,11 @@ impl Gui {
         match &v.kind {
             Kind::ScrollView(_) => {
                 let (vw, vh) = self.viewport(id);
-                out.push(DrawCmd::Clip(Some([rect.l as i32, rect.t as i32, (rect.l + vw) as i32, (rect.t + vh) as i32])));
+                let outer = push_clip(out, [rect.l as i32, rect.t as i32, (rect.l + vw) as i32, (rect.t + vh) as i32]);
                 for c in &v.children {
                     self.draw_view(*c, x0, y0, tint, alpha, false, out);
                 }
-                out.push(DrawCmd::Clip(None));
+                out.push(DrawCmd::Clip(outer));
                 self.draw_scrollbar(out, id, rect, tint, alpha);
             }
             Kind::ScrollChild => {
@@ -1195,9 +1216,7 @@ impl Gui {
         let layout = text::layout_text(&mut self.fonts, &self.colors, t.font, &t.text, t.tvf, wrap);
         let fill_dy = self.fill_bottom_dy(id, t.tvf, layout.height);
         let clip = [r.l as i32, r.t as i32, r.r as i32 + 1, r.b as i32 + 1];
-        if editable {
-            out.push(DrawCmd::Clip(Some(clip)));
-        }
+        let outer = if editable { push_clip(out, clip) } else { None };
         let pw = t.tvf & tvf::PASSWORD != 0;
         let chars: Vec<char> = t.text.chars().collect();
         let font_h = self.fonts.font(t.font).height;
@@ -1265,7 +1284,7 @@ impl Gui {
             }
         }
         if editable {
-            out.push(DrawCmd::Clip(None));
+            out.push(DrawCmd::Clip(outer));
         }
     }
 
@@ -1413,7 +1432,7 @@ impl Gui {
         if self.interacting() || self.popup.is_some() || self.hit(x, y).is_some() {
             return true;
         }
-        for (window, root, pos) in self.windows_top_down() {
+        for (window, root, pos) in self.windows_at(x, y) {
             // WndBorder consumes the whole outer frame, including empty client space
             // and a root TextView (chat). Match frame mouse/context dispatch.
             if self.windows[window].as_ref().is_some_and(|w| w.framed)
@@ -1541,9 +1560,19 @@ impl Gui {
         v.into_iter().rev().map(|(_, i, r, p)| (i, r, p)).collect()
     }
 
+    fn windows_at(&self, x: f32, y: f32) -> Vec<(WindowId, ViewId, (i32, i32))> {
+        let mut windows = self.windows_top_down();
+        windows.retain(|(w, _, _)| {
+            self.windows[*w].as_ref().unwrap().clip.is_none_or(|c| {
+                x >= c[0] as f32 && y >= c[1] as f32 && x < c[2] as f32 && y < c[3] as f32
+            })
+        });
+        windows
+    }
+
     /// Topmost interactive view under the mouse, with its window.
     fn hit(&self, x: f32, y: f32) -> Option<(WindowId, ViewId)> {
-        for (wid, root, pos) in self.windows_top_down() {
+        for (wid, root, pos) in self.windows_at(x, y) {
             let (lx, ly) = (x - pos.0 as f32, y - pos.1 as f32);
             if let Some(v) = self.hit_view(root, lx, ly, true, 0.0, 0.0, None) {
                 return Some((wid, v));
@@ -2190,4 +2219,59 @@ fn delete_selection(t: &mut TextData) -> bool {
     }
     t.anchor = None;
     false
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    #[test]
+    fn nested_clips_intersect_and_restore_empty_intersections() {
+        let parent = Some([10, 20, 100, 80]);
+        let mut out = vec![DrawCmd::Clip(parent)];
+        let outer = push_clip(&mut out, [0, 30, 200, 60]);
+        assert_eq!(outer, parent);
+        assert!(matches!(out.last(), Some(DrawCmd::Clip(Some([10, 30, 100, 60])))));
+        let inner = push_clip(&mut out, [110, 0, 120, 10]);
+        assert!(matches!(out.last(), Some(DrawCmd::Clip(Some([110, 30, 110, 30])))));
+        out.push(DrawCmd::Clip(inner));
+        out.push(DrawCmd::Clip(outer));
+        assert!(matches!(out.last(), Some(DrawCmd::Clip(c)) if *c == parent));
+    }
+
+    #[test]
+    fn window_viewport_filters_input_and_restores_drawing() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let xml = r#"<root><View view_layout="vertical"><ScrollView max_size="Point(16000,16000)"><ScrollViewChild view_layout="vertical" max_size="Point(16000,16000)"><CanvasView name="c" min_size="Point(100,100)" max_size="Point(100,100)" tooltip="Page"/></ScrollViewChild></ScrollView></View></root>"#;
+        let w = gui.open_window_xml("clip", xml, (0, 0), WindowSize::Fixed(100, 100)).unwrap();
+        let clip = [0, 20, 100, 60];
+        gui.set_window_clip(w, Some(clip));
+        assert!(gui.hit(10.0, 30.0).is_some());
+        assert!(gui.wants_mouse(10.0, 30.0));
+        assert!(gui.hit(10.0, 60.0).is_none());
+        assert!(!gui.wants_mouse(10.0, 60.0));
+        let clips: Vec<_> = gui.frame(0.0).cmds.into_iter().filter_map(|c| if let DrawCmd::Clip(c) = c { Some(c) } else { None }).collect();
+        assert!(clips.len() >= 6, "window, scroll and canvas clips and restorations");
+        assert!(clips[..clips.len()-1].iter().all(|c| c.is_some_and(|r| r[0] >= clip[0] && r[1] >= clip[1] && r[2] <= clip[2] && r[3] <= clip[3])));
+        assert_eq!(clips.last(), Some(&None));
+        let canvas = gui.find(w, "c").unwrap();
+        gui.tree.views[canvas].fade_group = "clip".into();
+        gui.set_tooltip(w, "c", "Page", "");
+        gui.input(InputEvent::MouseMove { x: 10.0, y: 60.0 });
+        gui.frame(1.0);
+        assert!(gui.tooltip_shown().is_none());
+        assert_eq!(gui.tree.views[canvas].alpha, 0.33);
+        gui.input(InputEvent::MouseMove { x: 10.0, y: 30.0 });
+        gui.frame(1.0);
+        assert_eq!(gui.tooltip_shown().map(|t| t.0), Some("Page"));
+        assert!(gui.tree.views[canvas].alpha > 0.33);
+        gui.set_window_clip(w, None);
+        assert!(gui.hit(10.0, 60.0).is_some());
+        let top = gui.open_window_xml("top", xml, (0, 0), WindowSize::Fixed(100, 100)).unwrap();
+        gui.set_window_clip(top, Some(clip));
+        assert_eq!(gui.hit(10.0, 30.0).map(|h| h.0), Some(top));
+        assert_eq!(gui.hit(10.0, 60.0).map(|h| h.0), Some(w));
+    }
 }

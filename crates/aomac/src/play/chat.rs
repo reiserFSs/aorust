@@ -167,12 +167,10 @@ impl Chat {
             self.swin.set_character_dir(dir);
         }
         if self.win.is_none() {
-            let mut w = match char_dir {
+            let w = match char_dir {
                 Some(dir) => ChatWindows::new_for_character(gui, screen, dir)?,
                 None => ChatWindows::new(gui, screen)?,
             };
-            // HUD footprint (wings 190/65 px, shortcut bar 38 px at 1280x828, measured from the HUD art): only the template default windows avoid it
-            w.set_reserved(gui, win::Reserved { left: 190, right: 65, bottom: 38 });
             self.win = Some(w);
             for b in std::mem::take(&mut self.backlog) {
                 match b {
