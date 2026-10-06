@@ -15,12 +15,14 @@ struct Live {
     o: Offscreen,
     last: Instant,
     shots: Option<std::path::PathBuf>,
+    /// Longest frame time handed to the game (the autopilot sets it: a slow offscreen frame must not skip over a ramp edge).
+    dt_cap: f32,
 }
 
 impl Live {
     fn tick(&mut self) -> ao_gui::DrawList {
         std::thread::sleep(Duration::from_millis(16));
-        let dt = self.last.elapsed().as_secs_f32();
+        let dt = self.last.elapsed().as_secs_f32().min(self.dt_cap);
         self.last = Instant::now();
         self.o.frame(&mut self.p, dt)
     }
@@ -46,23 +48,28 @@ impl Live {
         }
     }
     fn pos(&self) -> String {
-        self.p.zone.own().map_or("?".into(), |d| format!("server pos {:.2} {:.2} {:.2} yaw {:.2}", d.pos[0], d.pos[1], d.pos[2], d.yaw.unwrap_or(0.0)))
+        let mode = self.p.player.as_ref().map_or(0, |p| p.mode());
+        self.p.zone.own().map_or("?".into(), |d| format!("server pos {:.2} {:.2} {:.2} yaw {:.2} fsm mode {mode}", d.pos[0], d.pos[1], d.pos[2], d.yaw.unwrap_or(0.0)))
     }
     fn key(&mut self, code: KeyCode, pressed: bool) {
         self.p.game_input(GameInput::Key { code, pressed, repeat: false }, &mut self.o.host);
     }
 }
 
-/// Presses W/S/C/Z so the character follows a [`route`] (it never turns: strafing does the sideways part).
+/// Presses W/S/C/Z so the character follows a [`route`] (it never turns: strafing does the sideways part, whatever the heading).
 pub(super) struct Pilot {
     path: Vec<(f32, f32)>,
     i: usize,
     held: Vec<&'static str>,
+    /// Swimming has no strafing: the pilot steers with the turn keys instead. `+1`: `A` raises the yaw; flipped when a turn made the heading error
+    /// grow (`probe` = when the turn key went down and the error then).
+    turn_sign: f32,
+    probe: Option<(std::time::Instant, f32)>,
 }
 
 impl Pilot {
     pub(super) fn new(path: Vec<(f32, f32)>) -> Self {
-        Pilot { path, i: 1, held: vec![] }
+        Pilot { path, i: 1, held: vec![], turn_sign: 1.0, probe: None }
     }
 
     pub(super) fn held(&self) -> &[&'static str] {
@@ -103,9 +110,38 @@ impl Pilot {
         if self.i == last && dist(self.path[last]) < 0.6 {
             return true;
         }
+        if p.player.as_ref().is_some_and(|pl| pl.mode() == 4) {
+            // swimming (FSM mode 4): forward and turn only, towards a point four metres along the route
+            let tgt = self.path[(self.i + 8).min(last)];
+            let yaw = p.zone.own().unwrap().yaw.unwrap_or(0.0);
+            let tau = 2.0 * std::f32::consts::PI;
+            let err = ((tgt.0 - pos[0]).atan2(tgt.1 - pos[2]) - yaw + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI;
+            let turn = (err.abs() > 0.3).then_some(if (err > 0.0) == (self.turn_sign > 0.0) { "A" } else { "D" });
+            match (turn, self.probe) {
+                (Some(_), None) => self.probe = Some((std::time::Instant::now(), err)),
+                (Some(_), Some((t, e0))) if t.elapsed().as_secs_f32() > 0.6 => {
+                    if err.abs() > e0.abs() + 0.1 {
+                        self.turn_sign = -self.turn_sign;
+                    }
+                    self.probe = None;
+                }
+                (None, _) => self.probe = None,
+                _ => {}
+            }
+            let mut want = vec![];
+            want.extend(turn);
+            if err.abs() < 1.2 {
+                want.push("W");
+            }
+            self.set(p, host, want);
+            return false;
+        }
         let tgt = self.path[(self.i + 3).min(last)];
         let (dx, dz) = (tgt.0 - pos[0], tgt.1 - pos[2]);
-        let want = [(dz < -0.2, "W"), (dz > 0.2, "S"), (dx < -0.2, "C"), (dx > 0.2, "Z")].iter().filter(|w| w.0).map(|w| w.1).collect();
+        // the heading stays put, so the world offset goes to the keys through it: forward = (sin yaw, cos yaw), left = (-cos yaw, sin yaw)
+        let (s, c) = p.zone.own().unwrap().yaw.unwrap_or(0.0).sin_cos();
+        let (fwd, left) = (dx * s + dz * c, -dx * c + dz * s);
+        let want = [(fwd > 0.2, "W"), (fwd < -0.2, "S"), (left > 0.2, "Z"), (left < -0.2, "C")].iter().filter(|w| w.0).map(|w| w.1).collect();
         self.set(p, host, want);
         false
     }
@@ -117,32 +153,51 @@ pub(super) fn route(c: &ao_formats::playfield::collision::Collision, from: [f32;
     let cell = 0.5f32;
     let at = |x: f32, z: f32| ((x / cell).round() as i32, (z / cell).round() as i32);
     let (start, goal) = (at(from[0], from[2]), at(to.0, to.1));
-    let pos = |n: (i32, i32)| [n.0 as f32 * cell, from[1], -(n.1 as f32 * cell)];
-    let mut prev: HashMap<(i32, i32), (i32, i32)> = HashMap::from([(start, start)]);
-    let mut q = VecDeque::from([start]);
-    while let Some(n) = q.pop_front() {
-        if n == goal {
-            break;
-        }
-        for d in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let m = (n.0 + d.0, n.1 + d.1);
-            let (a, b) = (pos(n), pos(m));
-            if prev.contains_key(&m) || c.ground(b).is_none() {
-                continue;
+    // Breadth first over the lattice; `fall` also accepts stepping off a ledge (down at most 12 m) when no walkable route reaches the goal
+    // (a character standing on an isolated ledge can only leave it that way).
+    let search = |fall: bool| {
+        // the ground position reached in every cell (the heights differ: slopes and cliffs decide what is walkable)
+        let mut here: HashMap<(i32, i32), [f32; 3]> = HashMap::from([(start, [from[0], from[1], -from[2]])]);
+        let mut prev: HashMap<(i32, i32), (i32, i32)> = HashMap::from([(start, start)]);
+        let mut q = VecDeque::from([start]);
+        while let Some(n) = q.pop_front() {
+            if n == goal {
+                break;
             }
-            let mut p = a;
-            let ok = (1..=5).all(|i| {
-                let t = i as f32 / 5.0;
-                let want = [a[0] + (b[0] - a[0]) * t, p[1], a[2] + (b[2] - a[2]) * t];
-                let w = c.walk(p, want);
-                p = w.pos;
-                !w.airborne && (p[0] - want[0]).abs() + (p[2] - want[2]).abs() < 0.03
-            });
-            if ok {
+            for d in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let m = (n.0 + d.0, n.1 + d.1);
+                let a = here[&n];
+                let b = [m.0 as f32 * cell, a[1], -(m.1 as f32 * cell)];
+                let Some(g) = c.ground(b) else { continue };
+                if prev.contains_key(&m) {
+                    continue;
+                }
+                let mut p = a;
+                let walked = (1..=5).all(|i| {
+                    let t = i as f32 / 5.0;
+                    let want = [a[0] + (b[0] - a[0]) * t, p[1], a[2] + (b[2] - a[2]) * t];
+                    let w = c.walk(p, want);
+                    p = w.pos;
+                    !w.airborne && (p[0] - want[0]).abs() + (p[2] - want[2]).abs() < 0.03
+                }) && (p[1] - a[1]).abs() <= ao_formats::playfield::collision::STEP_HEIGHT + 0.12;
+                if !walked {
+                    let w = c.walk(a, [b[0], a[1], b[2]]);
+                    let open = (w.pos[0] - b[0]).abs() + (w.pos[2] - b[2]).abs() < 0.03;
+                    if !(fall && open && w.airborne && g < a[1] - 0.6 && a[1] - g <= 12.0) {
+                        continue;
+                    }
+                    p = [b[0], g, b[2]];
+                }
                 prev.insert(m, n);
+                here.insert(m, p);
                 q.push_back(m);
             }
         }
+        prev
+    };
+    let mut prev = search(false);
+    if !prev.contains_key(&goal) {
+        prev = search(true);
     }
     let end = if prev.contains_key(&goal) { goal } else { *prev.keys().min_by_key(|n| (n.0 - goal.0).pow(2) + (n.1 - goal.1).pow(2)).unwrap() };
     let mut path = vec![end];
@@ -197,7 +252,7 @@ fn live_walk() {
     if let Some(d) = &shots {
         std::fs::create_dir_all(d).unwrap();
     }
-    let mut l = Live { p, o, last: Instant::now(), shots };
+    let mut l = Live { p, o, last: Instant::now(), shots, dt_cap: f32::INFINITY };
     l.tick();
     let w = l.p.login_w.unwrap();
     l.p.gui.set_text(w, "username", &user);
@@ -340,15 +395,27 @@ fn live_walk() {
                 let col = ao_formats::playfield::collision::Collision::load(&ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap(), l.p.zone.playfield.unwrap()).unwrap();
                 let path = route(&col, l.p.zone.own().unwrap().pos, (x.parse().unwrap(), z.parse().unwrap()));
                 eprintln!("route of {} cells", path.len());
+                let route_len = path.len();
                 let mut pilot = Pilot::new(path);
                 let t = Instant::now();
+                l.dt_cap = 0.1;
+                let (mut last_log, mut logs) = (Instant::now(), 0);
                 loop {
                     l.tick();
-                    if pilot.step(&mut l.p, &mut l.o.host) || t.elapsed().as_secs() > 120 {
+                    if last_log.elapsed().as_secs() >= 4 {
+                        last_log = Instant::now();
+                        eprintln!("goto progress: cell {}/{} {} held {:?}", pilot.idx(), route_len, l.pos(), pilot.held());
+                        logs += 1;
+                        if logs % 4 == 1 {
+                            l.shot(&format!("goto{logs}"));
+                        }
+                    }
+                    if pilot.step(&mut l.p, &mut l.o.host) || t.elapsed().as_secs() > 240 {
                         break;
                     }
                 }
                 pilot.release(&mut l.p, &mut l.o.host);
+                l.dt_cap = f32::INFINITY;
                 eprintln!("after goto {v}: {}", l.pos());
             }
             // `press=F8` / `press=CTRL+F8` / `press=SHIFT+F8`: modifiers down, tap the last key, release (F8 = first/third person,
@@ -506,6 +573,31 @@ fn live_walk() {
                 let (kind, inst) = v.split_once(':').unwrap();
                 l.p.interact.as_mut().unwrap().use_object(ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() });
                 l.wait(3.0);
+            }
+            // `inv`: the own inventory (slot, item ids, count) as the zone state holds it
+            "inv" => {
+                let mut v: Vec<_> = l.p.zone.inventory.iter().collect();
+                v.sort_by_key(|e| *e.0);
+                for (slot, e) in v {
+                    eprintln!("inv slot {slot:#x}: {e:?}");
+                }
+            }
+            // `zc=secs`: runs frames for that long and prints the zone change state every 0.5 s (playfield, teleporting, awaiting the CharInPlay
+            // echo, world ready, screen fade, own position) and writes a frame `zc<n>` every second
+            "zc" => {
+                let (t, mut n) = (Instant::now(), 0);
+                while t.elapsed().as_secs_f32() < v.parse().unwrap() {
+                    let list = l.tick();
+                    if t.elapsed().as_secs_f32() >= n as f32 * 0.5 {
+                        n += 1;
+                        eprintln!("zc {:.1}s: pf {:?} teleporting {} awaiting_alive {} world_ready {} in_play_sent {} player {} dynels {} {}", t.elapsed().as_secs_f32(), l.p.zone.playfield, l.p.teleporting, l.p.awaiting_alive, l.p.world_ready, l.p.zone.in_play_sent, l.p.player.is_some(), l.p.zone.dynels.len(), l.pos());
+                        if n % 2 == 1 {
+                            if let Some(dir) = &l.shots {
+                                l.o.png(&l.p, &list, &dir.join(format!("zc{}.png", n / 2))).unwrap();
+                            }
+                        }
+                    }
+                }
             }
             "cam" => {
                 let c = l.o.host.camera;
