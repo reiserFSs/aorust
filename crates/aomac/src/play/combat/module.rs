@@ -548,6 +548,39 @@ mod tests {
         assert_eq!(m.take_feedback(), vec!["Feedback_StartingAttackFailed", "Feedback_PvpNotAllowedInThisDistrict"]);
     }
 
+    /// The first fight that worked live (docs/captures/zone_fight_ithaca.rec, Aomacvolk on a Beach Leet, after the `LookAtIIR_t`
+    /// selection announce was added): the frames we sent are reproduced, the replies drive the whole fight.
+    #[test]
+    fn live_fight_capture() {
+        let own = 0x82e8;
+        let mut m = Module::with_texts(Box::new(Fixed::new()), own);
+        let (mut sent, mut hits, mut stopped, mut started) = (vec![], 0, false, false);
+        for l in include_str!("../../../../../docs/captures/zone_fight_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            let f = Frame::decode_with(&b, false).unwrap().unwrap().0;
+            if dir == ">" {
+                sent.push(f.payload);
+                continue;
+            }
+            m.on_frame(&f);
+            for e in m.take_events() {
+                match e {
+                    CombatEvent::Hit { attacker, .. } if attacker == own as i32 => hits += 1,
+                    CombatEvent::FightStarted { who, .. } if who == own as i32 => started = true,
+                    CombatEvent::FightStopped { who } if who == own as i32 => stopped = true,
+                    _ => {}
+                }
+            }
+        }
+        let t = Identity { kind: DYNEL_CHAR, instance: 0xfd6a9 };
+        assert_eq!(sent[0], net::look_at(own as i32, t, 1));
+        assert_eq!(sent[1], net::attack(own as i32, t, 0));
+        assert!(started && stopped && hits >= 3, "{started} {stopped} {hits}");
+        assert!(m.numbers().iter().any(|n| n.text == "145"), "the XP number");
+    }
+
     #[test]
     fn attack_without_target_is_refused() {
         let (mut m, mut z, _) = primed();

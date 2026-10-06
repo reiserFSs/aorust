@@ -53,15 +53,19 @@ Key ids were computed from the shipped CharPrefs.xml (`provider_hash` of each `A
 * Combat music `flag` input (`dynel+0x21c`, writer unknown) is fed as false; stat 421 as 0 (stored, never read by a decision).
 * Hit reaction (`imp-*`) and miss/dodge animations: selector not found (combat-anim.md §8).
 
-## Live result (Ithaca, Testy lvl 1, playfield 4582 beach; headless `live_walk` steps, no desktop capture)
+## Live result (Ithaca, pf 4582 beach; headless `live_walk` sessions, no desktop capture)
 
-* TAB selects the nearest hostile (Surf Lizard 1026757, `side 3`), Q sends `AttackIIR_t` (22 B, `28494070 0000c350 00006584 00 | 0000c350 000faac5 00`,
-  byte-identical to `combat::attack`); the Surf Lizard, Shore Snake, Surf Lizard and Beach Leet were tried: the server answers every time with
-  `CharacterAction` 0x93 (FormatFeedback case 0x31) and 0x76 with `identity_a.instance = 6`; the jump table at 0x1005f0e7 maps that to
-  `Feedback_PvpNotAllowedInThisDistrict` (the doc's earlier address-order guess for 11 was wrong; the table is now read out in `module.rs`).
-  The client clears the `+0x79` guard and prints both texts. Capture: `docs/captures/zone_attack_refused_ithaca.rec` (test `live_refusal_capture`).
-  So no fight of our own character could be started on this beach (district rule of the server, not the client); the NPC-vs-NPC fights all around
-  (hundreds of Attack / AttackInfo / StopFight relays) did drive the fight state, floating numbers and the swing clips.
-* The Arrival Hall (Aomacvolk, pf 4604) has only friendly NPCs.
-* [UNRESOLVED] Whether a different district (the junkbot area) accepts the attack: the autopilot route to the junkbots left the walkable
-  area, so it was not exercised. Everything after a started fight (echo, StopFight, swing, music) is covered by replays only.
+**Selection must be announced first.** The original client sends `LookAtIIR_t` (`2252445F`, body `Identity target, i32 mode`, 25 bytes,
+header flag 0) whenever the selection changes: `FUN_1003fb35` [GC] (the SetTarget handler) -> `FUN_1003b73e` (characters, mode 1; also
+sets own stats 0x1af = 3 and 0x18d = a relation bitmask) or `FUN_1003b0db` (anything else / no target, mode 0; stats 0x1af = 4, 0x18d = 8), writer
+`FUN_10074f41`, ctor `FUN_10074f69`. Without it the server refuses every attack: it answers `CharacterAction` 0x93 then 0x76 with instance 6
+(`Feedback_PvpNotAllowedInThisDistrict`, jump table 0x1005f0e7; capture `zone_attack_refused_ithaca.rec`). `combat::look_at` +
+`Module::announce` (before any command and every frame) fix that.
+
+With the announce: Aomacvolk (lvl 1) vs a Beach Leet (12 HP), capture `docs/captures/zone_fight_ithaca.rec` (test `live_fight_capture`):
+`> LookAt(leet,1)`, `> Attack(leet,0)`, `< Attack` echo (fight starts), AttackInfo hits of 4 / 4 / 5 (crit, unk_30 = 4) and one miss, the leet hits
+back (7), `< StopFight`, `< StatIIR` 0x34 (XP) = 145 ("You received 145 xp." and the yellow 145), "You can loot these remains." (corpse), then
+the deselect `> LookAt(none,0)`. Window captures inspected: world damage number above the target, own HUD numbers at the left edge, the combat
+log lines ("You hit Beach Leet for 4 points of projectile damage", "You tried to hit Beach Leet, but missed!"), the XP bar filling.
+Observed gaps: the HP bar of the Hud did not drop after the leet's 7 (Hud/Zone health bookkeeping, `34 / 1` max shows the max-health stat is
+not applied); the dead leet stays drawn with the selection box (Dynels corpse handling).
