@@ -35,10 +35,12 @@ pub enum WindowKind {
     Team,
     Perks,
     Faction,
+    /// `stat_window` (`StatView_c`)
+    Stat,
 }
 
 impl WindowKind {
-    pub const ALL: [WindowKind; 13] = [
+    pub const ALL: [WindowKind; 14] = [
         WindowKind::Skills,
         WindowKind::Inventory,
         WindowKind::Character,
@@ -52,6 +54,7 @@ impl WindowKind {
         WindowKind::Team,
         WindowKind::Perks,
         WindowKind::Faction,
+        WindowKind::Stat,
     ];
 
     /// The dvalue / menu entry name (`ActionMenu/*.xml` `name=`).
@@ -70,6 +73,7 @@ impl WindowKind {
             WindowKind::Team => "team_view",
             WindowKind::Perks => "perk_window",
             WindowKind::Faction => "faction_window",
+            WindowKind::Stat => "stat_window",
         }
     }
 
@@ -304,7 +308,7 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: default_dvalues(dir), bars: vec![], bar_titles, menu_roots, popup: None, open: vec![], stats: HudStats::new(dir)?, map: HudMap::new(dir), target, shortcuts: vec![], compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![] };
+        let mut hud = Hud { cc, size, dvalues: default_dvalues(dir), bars: vec![], bar_titles, menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, map: HudMap::new(dir), target, shortcuts: vec![], compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
         hud.target.targets_target = hud.dvalues.get("Targetstarget").is_some_and(|v| *v != 0);
         hud.fill_docks(gui);
         hud.create_bars(gui, dir);
@@ -317,6 +321,14 @@ impl Hud {
         hud.refresh(gui, &Zone::default());
         Ok(hud)
     }
+        // the windows the NewChar template opens at the first login (`<Value name="wear_window" value="true">`, `stat_window`; the wear window first, the stat
+        // window is placed below it); the other windows of the template (nano, ncu, team) are not implemented by this HUD
+        let template = std::fs::read_to_string(dir.join("prefs/NewChar/Prefs.xml")).ok().and_then(|t| xml::parse(&t).ok());
+        for k in [WindowKind::Character, WindowKind::Stat] {
+            if template.as_ref().is_some_and(|r| r.children.iter().any(|c| c.name == "Value" && c.attr("name") == Some(k.dvalue()) && c.attr("value") == Some("true"))) {
+                hud.open(gui, k);
+            }
+        }
 
     /// `FUN_1006f098` (0x1006f098): wings, bottom bars and menus go into the dock views of `ControlCenter.xml`.
     fn fill_docks(&mut self, gui: &mut Gui) {
@@ -404,6 +416,7 @@ impl Hud {
             self.size = size;
             gui.resize_window(self.cc, WindowSize::Fixed(size.0, size.1));
             for s in &mut self.shortcuts {
+            self.stats.set_screen(size);
                 s.resize(gui, size);
             }
             self.fit_rollup_dock(gui);
@@ -566,6 +579,7 @@ impl Hud {
             }
         }
         let Event::Clicked { window, view, .. } = ev else { return false };
+            self.outbox.extend(self.stats.take_outbox());
         let popup = self.popup.as_ref().map(|p| p.window);
         if *window != self.cc && Some(*window) != popup {
             return false;
@@ -804,6 +818,12 @@ mod tests {
         // typing a name into a text field must not open windows
         let w = s.gui.open_window("LoginWindow", (0, 0), WindowSize::Preferred).unwrap();
         s.gui.focus(w, "username");
+        // Ctrl+9 = `WINDOW_STAT`: the stat window is open from the start (NewChar template), so the first press closes it
+        assert!(s.hud.is_open(WindowKind::Stat));
+        s.input(key('9', ctrl), &mut o.host);
+        assert!(!s.hud.is_open(WindowKind::Stat));
+        s.input(key('9', ctrl), &mut o.host);
+        assert!(s.hud.is_open(WindowKind::Stat));
         assert!(s.gui.text_focused());
         s.input(key('p', none), &mut o.host);
         s.input(key('6', ctrl), &mut o.host);

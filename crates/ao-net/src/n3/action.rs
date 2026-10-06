@@ -353,6 +353,12 @@ pub fn simple(action: i32, a: Identity, b: Identity) -> CharacterAction {
     CharacterAction { action, param: 0, identity_a: a, identity_b: b, text: String::new() }
 }
 
+/// `N3Msg_ResetSkill(stat)` [GC 0x1001cdae] (the skill window's "Reset this skill" / `stat` 0 = "Reset all skills"): `FUN_1007253f(hdr, a = {0,0},
+/// param 0, action 0x9a, b = {0, stat}, "")` sent with `SendIIRToObservers` (disassembled: the pushes before the call are `""`, `&{0,stat}`, `0x9a`, `0`, `&{0,0}`).
+pub fn reset_skill(char_id: i32, stat: i32) -> Vec<u8> {
+    character_action(char_id, &simple(0x9a, Identity::default(), Identity { kind: 0, instance: stat }))
+}
+
 /// `SocialActionCmd_t` body: `n3Command_t` `state` (`+0x18`, 0 from the client), command `counter` (`+0x1c`,
 /// `s_nCommandRefCntr++`), then the `AbstractAnimID_e` (`+0x20`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,6 +710,8 @@ mod tests {
         );
         let (h, back) = parse_character_action(&character_action(0x6584, &a)).unwrap();
         assert_eq!((h.target.instance, back), (0x6584, a));
+        // N3Msg_ResetSkill(0x98): identity_b = {0, stat}
+        assert_eq!(reset_skill(0x6584, 0x98), hex("5e477770 0000c350 00006584 00  0000009a 00000000 00000000 00000000 00000000 00000098 0000"));
     }
 
     #[test]

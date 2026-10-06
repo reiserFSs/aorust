@@ -113,7 +113,7 @@ pub fn char_key_id(c: char) -> Option<u32> {
 /// `WINDOW_SKILLS` = 102 (U), `WINDOW_WEAR` 262252 = CTRL+1, `WINDOW_MISSION` CTRL+4, `WINDOW_TEAM` CTRL+5, `WINDOW_MAP` 262257 = CTRL+6,
 /// `WINDOW_FRIENDS` CTRL+7, `WINDOW_NANO` CTRL+8, `WINDOW_NCU` CTRL+0), plus the fixed `KEY_OPEN_PERK_WINDOW` = SHIFT+P (commands table in
 /// GUI.dll). They agree with the help texts (`text/help/The * Window.html`). Providers with no window of ours (`WINDOW_SPECIALACTION` CTRL+2,
-/// `WINDOW_KNOWLEDGE` CTRL+3, `WINDOW_STAT` CTRL+9, `WINDOW_RAID` SHIFT+CTRL+R, ...) are not listed. All of them are blocked by `TextInputMode`.
+/// `WINDOW_KNOWLEDGE` CTRL+3, `WINDOW_RAID` SHIFT+CTRL+R, ...) are not listed. All of them are blocked by `TextInputMode`.
 pub const WINDOW_BINDINGS: &[(u32, WindowKind)] = &[
     (90, WindowKind::Inventory),
     (102, WindowKind::Skills),
@@ -124,6 +124,7 @@ pub const WINDOW_BINDINGS: &[(u32, WindowKind)] = &[
     (112 | id::CTRL, WindowKind::Team),
     (113 | id::CTRL, WindowKind::Map),
     (114 | id::CTRL, WindowKind::Friends),
+    (116 | id::CTRL, WindowKind::Stat),
     (115 | id::CTRL, WindowKind::Nano),
     (117 | id::CTRL, WindowKind::Ncu),
 ];
@@ -858,6 +859,7 @@ mod tests {
                 if let Some((n, w)) = providers.iter().find(|(n, _)| u64::from(provider_hash(n)) == p) {
                     assert!(WINDOW_BINDINGS.contains(&(input, *w)), "{n}: {input}");
                     found += 1;
+            ("WINDOW_STAT", WindowKind::Stat),
                 }
             }
         }

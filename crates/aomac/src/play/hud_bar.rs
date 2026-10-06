@@ -160,7 +160,7 @@ fn special_action(gui: &mut Gui, store: &ao_rdb::RecordStore, instance: u32) -> 
 }
 
 /// rdb 1010008 PNG as a GUI texture (`Format_e 2`: pure green is the colour key, `SpriteInfo_t::ConvertImage` [DS 0x1007b8e2]).
-fn icon_image(gui: &mut Gui, store: &ao_rdb::RecordStore, id: u32) -> Option<(GfxId, u32, u32)> {
+pub(super) fn icon_image(gui: &mut Gui, store: &ao_rdb::RecordStore, id: u32) -> Option<(GfxId, u32, u32)> {
     let png = store.get(ICON_TYPE, id).ok()??;
     let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
