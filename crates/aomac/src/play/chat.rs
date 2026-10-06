@@ -268,6 +268,17 @@ impl Chat {
         self.dialog(gui, kind, body, buttons, None);
     }
 
+    /// Leaving the world (`ActivateGameClosing(2)`, GUI 0x10028194): every chat-layer window closes; dropping the `Chat` then drops its
+    /// chat-server session (the session thread ends when its command channel disconnects).
+    pub fn close(&mut self, gui: &mut Gui, texts: &TextDb) {
+        if let Some(w) = self.win.as_mut() {
+            w.close_all(gui);
+        }
+        self.info.close(gui);
+        self.dialogs.close_all(gui);
+        self.swin.close_all(gui, &social_win::Texts(texts));
+    }
+
     /// `GuiSystem_c::CloseDuelWindows` [GUI 0x1002f833].
     pub fn close_duel_dialog(&mut self, gui: &mut Gui) {
         self.dialogs.close_duel(gui);
@@ -288,7 +299,7 @@ impl Chat {
         self.line_to(gui, ChatLine::new(ChatKind::System, log::window_html(log::color_name(code), text)), Some("System"));
     }
 
-    /// `FlowControlModule_t` logout texts (LDB category 200 `ClosingClient` / `LogoutStarted` (fed 30) / `TimedLogoutAborted`): GlobalSignals+0x17c, code 12.
+    /// `FlowControlModule_t` logout texts (LDB category 200 `ClosingClient` / `LogoutStartedXseconds` (fed 30) / `TimedLogoutAborted`): GlobalSignals+0x17c, code 12.
     pub fn logout_line(&mut self, gui: &mut Gui, key: &str, secs: Option<i32>, texts: &TextDb) {
         let t = texts.by_key(200, key).unwrap_or_default();
         let t = log::ldb_format(&t, &secs.map(log::Arg::N).into_iter().collect::<Vec<_>>());
@@ -1068,5 +1079,17 @@ mod tests {
         let Some(h) = std::env::var_os("HOME") else { return };
         let Ok(db) = TextDb::load(&std::path::Path::new(&h).join("Games/ProjectRubiKa/client")) else { return };
         assert_eq!(db.by_key(10001, "ChatTellMsgToField").as_deref(), Some("To [%s]: "));
+    }
+
+    /// The camp/quit texts of `FlowControlModule_t` (GUI string table: `ClosingClient`, `TimedLogoutAborted`, `LogoutStartedXseconds`) exist in text.mdb cat 200.
+    #[test]
+    fn logout_keys_resolve() {
+        let Some(h) = std::env::var_os("HOME") else { return };
+        let Ok(db) = TextDb::load(&std::path::Path::new(&h).join("Games/ProjectRubiKa/client")) else { return };
+        for k in ["ClosingClient", "TimedLogoutAborted", "LogoutStartedXseconds"] {
+            assert!(db.by_key(200, k).is_some_and(|t| !t.is_empty()), "{k}");
+        }
+        assert_eq!(db.by_key(200, "LogoutStartedXseconds").as_deref(), Some("Timed logout started. This will take %d seconds."));
+        assert!(db.by_key(200, "LogoutStarted").is_none());
     }
 }

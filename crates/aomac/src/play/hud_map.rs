@@ -333,10 +333,12 @@ impl HudMap {
             if let Some(m) = marker {
                 p.center = m;
             }
-            if p.followed.is_none() && marker.is_none() && p.center == [0.0; 2] {
-                p.center = [(lv.rect[0] + lv.rect[2]) as f32 / 2.0, (lv.rect[1] + lv.rect[3]) as f32 / 2.0];
-            }
             p.followed = marker;
+        }
+        // no marker and the view never placed (an unmapped playfield on first open): the middle of the level's map
+        // [UNRESOLVED GUESS: the original's `BitmapTileView_c` may start at scroll 0]
+        if marker.is_none() && p.center == [0.0; 2] {
+            p.center = [(lv.rect[0] + lv.rect[2]) as f32 / 2.0, (lv.rect[1] + lv.rect[3]) as f32 / 2.0];
         }
         let (cw, ch) = gui.canvas_size(p.window, "map");
         let (cw, ch) = (cw as f32, ch as f32);
@@ -745,6 +747,18 @@ mod tests {
         s.zone.stats.insert(585, 1 << 15);
         png(&mut s, &mut o, "map-owned-by-area-bit");
         assert!(s.map.pf.as_ref().unwrap().available);
+    }
+
+    /// First open on an unmapped playfield (ICC beach 4582): the view starts in the middle of the map, not at its north-west corner.
+    #[test]
+    fn planet_map_unmapped_playfield_is_centred() {
+        let Some((mut s, mut o)) = shot() else { return };
+        s.map.open(&mut s.gui, &mut s.rollup, WindowKind::PlanetMap);
+        own_at(&mut s, 4582, [10.0, 0.0, 10.0], 0.0);
+        png(&mut s, &mut o, "planet-4582-centred");
+        let p = s.map.planet.as_ref().unwrap();
+        let lv = &p.map.as_ref().unwrap().index.levels[p.level];
+        assert_eq!(p.center, [(lv.rect[0] + lv.rect[2]) as f32 / 2.0, (lv.rect[1] + lv.rect[3]) as f32 / 2.0]);
     }
 
     #[test]

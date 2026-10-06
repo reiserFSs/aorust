@@ -52,6 +52,14 @@ impl Live {
         self.p.zone.own().map_or("?".into(), |d| format!("server pos {:.2} {:.2} {:.2} yaw {:.2} fsm mode {mode}", d.pos[0], d.pos[1], d.pos[2], d.yaw.unwrap_or(0.0)))
     }
     fn key(&mut self, code: KeyCode, pressed: bool) {
+        // the window host tracks the modifier state from the modifier keys (`viewer.rs`): the hot keys read it as `host.mods`
+        let m = &mut self.o.host.mods;
+        match code {
+            KeyCode::ShiftLeft => m.shift = pressed,
+            KeyCode::ControlLeft => m.ctrl = pressed,
+            KeyCode::AltLeft => m.alt = pressed,
+            _ => {}
+        }
         self.p.game_input(GameInput::Key { code, pressed, repeat: false }, &mut self.o.host);
     }
 }
@@ -69,7 +77,7 @@ pub(super) struct Pilot {
 
 impl Pilot {
     pub(super) fn new(path: Vec<(f32, f32)>) -> Self {
-        Pilot { path, i: 1, held: vec![], turn_sign: 1.0, probe: None }
+        Pilot { i: 1.min(path.len().saturating_sub(1)), path, held: vec![], turn_sign: 1.0, probe: None }
     }
 
     pub(super) fn held(&self) -> &[&'static str] {
@@ -211,7 +219,8 @@ pub(super) fn route(c: &ao_formats::playfield::collision::Collision, from: [f32;
 }
 
 fn code(name: &str) -> KeyCode {
-    match name {
+    use KeyCode::*;
+    match name.to_ascii_uppercase().as_str() {
         "W" => KeyCode::KeyW,
         "A" => KeyCode::KeyA,
         "S" => KeyCode::KeyS,
@@ -232,6 +241,39 @@ fn code(name: &str) -> KeyCode {
         "CTRL" => KeyCode::ControlLeft,
         "NUMPAD8" => KeyCode::Numpad8,
         "NUMPAD5" => KeyCode::Numpad5,
+        "ALT" => KeyCode::AltLeft,
+        "F10" => F10,
+        "F9" => F9,
+        "F11" => F11,
+        "F12" => F12,
+        "0" => Digit0,
+        "1" => Digit1,
+        "2" => Digit2,
+        "3" => Digit3,
+        "4" => Digit4,
+        "5" => Digit5,
+        "6" => Digit6,
+        "7" => Digit7,
+        "8" => Digit8,
+        "9" => Digit9,
+        "E" => KeyE,
+        "F" => KeyF,
+        "G" => KeyG,
+        "H" => KeyH,
+        "J" => KeyJ,
+        "K" => KeyK,
+        "L" => KeyL,
+        "M" => KeyM,
+        "N" => KeyN,
+        "O" => KeyO,
+        "P" => KeyP,
+        "R" => KeyR,
+        "T" => KeyT,
+        "U" => KeyU,
+        "V" => KeyV,
+        "Y" => KeyY,
+        "ESCAPE" => Escape,
+        "ENTER" => Enter,
         n => panic!("unknown key {n}"),
     }
 }
@@ -266,6 +308,45 @@ fn live_walk() {
     l.p.handle(Event::Clicked { window: w, view: "login_btn".into(), item: None }, &mut l.o.host);
     l.until("character list", 60, |p| p.screen == Screen::CharSelect);
     let cw = l.p.char_w.unwrap();
+    // `AOMAC_LIVE_CC=<name>`: New Character, then the four scenes with real clicks at window coordinates (the offline `create::shots` ones: Atrox,
+    // Tall/Heavy/head arrow, Soldier, the name typed), a `cc-<scene>` shot each (`AOMAC_LIVE_SHOTS`), nothing is sent; the close button's exit
+    // dialog is answered No and the session ends. The intro runs as in the game (`AOMAC_CC_SKIP_INTRO=1` skips it).
+    if let Ok(name) = std::env::var("AOMAC_LIVE_CC") {
+        l.p.handle(Event::Clicked { window: cw, view: "create_btn".into(), item: None }, &mut l.o.host);
+        let click = |l: &mut Live, x: f32, y: f32| {
+            l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+            l.wait(0.1);
+            for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
+                l.p.input(ev, &mut l.o.host);
+                l.tick();
+            }
+            l.wait(0.1);
+        };
+        for scene in 0..4 {
+            let t = Instant::now();
+            while !l.p.live_cc_active(scene) {
+                assert!(t.elapsed() < Duration::from_secs(180), "creation scene {scene} never became active");
+                l.tick();
+            }
+            l.wait(3.0); // the actors' background loads
+            match scene {
+                0 => click(&mut l, 1100.0, 380.0),
+                1 => [(1147.0, 221.0), (1150.0, 461.0), (127.0, 135.0)].into_iter().for_each(|(x, y)| click(&mut l, x, y)),
+                2 => click(&mut l, 1150.0, 280.0),
+                _ => l.p.input(ao_gui::InputEvent::Text(name.clone()), &mut l.o.host),
+            }
+            l.wait(1.5);
+            l.shot(&format!("cc-{scene}"));
+            if scene < 3 {
+                click(&mut l, 1170.0, 760.0); // Next
+            }
+        }
+        click(&mut l, 1247.0, 38.0); // close: AskExitMessage
+        l.shot("cc-exit-dialog");
+        l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, mods: Default::default() }, &mut l.o.host);
+        l.wait(0.5);
+        return;
+    }
     // `AOMAC_LIVE_NEW=<name>:<CC breed 1..7>:<CC profession 1..14>`: New Character, the creation module sends its request (no scene clicks),
     // the login server's `CharacterCreated` + `ZoneHandoff` take the app into the world
     if let Ok(spec) = std::env::var("AOMAC_LIVE_NEW") {
@@ -280,6 +361,8 @@ fn live_walk() {
     } else {
         let i = l.p.chars.iter().position(|c| c.info.name == want).expect("character not on the account");
         l.p.select_row(i, &mut l.o.host);
+        l.wait(2.0);
+        l.shot("charselect"); // the detail panel of the picked character (breed / gender / profession / location)
         l.p.handle(Event::Clicked { window: cw, view: "login_btn".into(), item: None }, &mut l.o.host);
     }
     l.until("world", 120, |p| p.screen == Screen::InWorld && matches!(p.fade, Fade::Hold));
@@ -347,7 +430,7 @@ fn live_walk() {
                 }
                 eprintln!("approached {id} to {:.1} m: {}", dist(&l), l.pos());
             }
-            // chat: `say=<line>` runs the line as if typed in the chat bar (`/g Global hi`, `/tell X hi`, plain = vicinity)
+            // chat: `say=<line>` runs the line as if typed in the chat bar (`/say hi`, `/g Global hi`, `/tell X hi`; a line without a leading `/` is dropped by `run_line`)
             "chatdrop" => l.p.chat.as_ref().expect("chat hub").drop_connection(),
             "say" => {
                 let p = &mut l.p;
@@ -397,6 +480,23 @@ fn live_walk() {
             "fight" => {
                 let m = l.p.fight.as_ref().unwrap();
                 eprintln!("fight: attacking={} numbers={:?}", m.attacking(), m.numbers().iter().map(|n| n.text.as_str()).collect::<Vec<_>>());
+            }
+            // `water`: the nearest deep-water ground points (liquid surface > 0.5 m above the ground) within 300 m, for `goto=x:z` (swimming runs)
+            "water" => {
+                let pos = l.p.zone.own().unwrap().pos;
+                let col = ao_formats::playfield::collision::Collision::load(&ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap(), l.p.zone.playfield.unwrap()).unwrap();
+                let mut found = vec![];
+                for ix in -75..=75 {
+                    for iz in -75..=75 {
+                        let (x, z) = (pos[0] + ix as f32 * 4.0, pos[2] + iz as f32 * 4.0);
+                        let Some(g) = col.ground([x, pos[1] + 50.0, z]) else { continue };
+                        if col.liquid_at([x, g, z]).is_some_and(|w| w.level - g > 0.5) {
+                            found.push((((x - pos[0]).powi(2) + (z - pos[2]).powi(2)).sqrt(), x, g, z));
+                        }
+                    }
+                }
+                found.sort_by(|a, b| a.0.total_cmp(&b.0));
+                eprintln!("water: {} cells; nearest {:?}", found.len(), &found[..found.len().min(5)]);
             }
             "goto" => {
                 // autopilot along a collision route: W/S/C/Z by the offset to the next waypoint (the heading stays put)
@@ -452,7 +552,7 @@ fn live_walk() {
             }
             // `press=F8` / `press=CTRL+F8` / `press=SHIFT+F8`: modifiers down, tap the last key, release (F8 = first/third person,
             // Ctrl+F8 cycles the camera vehicle, Shift+F8 steps the scripted views)
-            "press" => {
+            "press" | "ui" => {
                 let keys: Vec<KeyCode> = v.split('+').map(code).collect();
                 for &c in &keys {
                     l.key(c, true);
@@ -480,14 +580,9 @@ fn live_walk() {
                 l.tick();
                 eprintln!("after {step}: {}", l.pos());
             }
-            // UI steps: `ui=ctrl+6` / `ui=u` (window hotkey strokes), `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` (left-clicks
-            // the first screen point whose pick ray hits the dynel)
-            "ui" => {
-                let mods = ao_gui::Modifiers { ctrl: v.contains("ctrl+"), ..Default::default() };
-                let c = v.rsplit('+').next().unwrap().chars().next().unwrap();
-                l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Letter(c), pressed: true, mods }, &mut l.o.host);
-                l.tick();
-            }
+            // UI steps: `ui=ctrl+6` / `ui=u` are `press` (a key stroke through `game_input`, where the window hot keys live, with `host.mods`
+            // following the modifier keys), `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` (left-clicks the first screen point whose pick ray
+            // hits the dynel)
             "move" | "click" => {
                 let (x, y) = v.split_once(':').map(|(x, y)| (x.parse().unwrap(), y.parse().unwrap())).unwrap();
                 l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
@@ -814,4 +909,16 @@ fn live_walk() {
     }
     l.wait(1.0);
     eprintln!("final: {}", l.pos());
+}
+
+#[cfg(test)]
+mod pilot_tests {
+    use super::Pilot;
+
+    /// A one-cell route (target in the own cell) starts on its last cell, so `step` can report arrival.
+    #[test]
+    fn one_cell_route_starts_at_the_last_cell() {
+        assert_eq!(Pilot::new(vec![(1.0, 2.0)]).idx(), 0);
+        assert_eq!(Pilot::new(vec![(1.0, 2.0), (2.0, 2.0), (3.0, 2.0)]).idx(), 1);
+    }
 }

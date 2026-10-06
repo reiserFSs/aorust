@@ -322,6 +322,13 @@ impl HudTarget {
         Ok(())
     }
 
+    /// Leaving the world: the health-bar windows go.
+    pub(super) fn close(&mut self, gui: &mut Gui) {
+        for b in self.bars.drain(..) {
+            gui.close_window(b.window);
+        }
+    }
+
     fn place(&mut self, gui: &mut Gui) {
         let sw = self.size.0 as f32;
         for b in &self.bars {

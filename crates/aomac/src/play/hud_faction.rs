@@ -118,6 +118,8 @@ impl HudFaction {
     fn build(&mut self, gui: &mut Gui) -> anyhow::Result<(WindowId, Vec<Row>)> {
         let xml = "<root><View view_layout=\"vertical\" name=\"faction_root\"/></root>";
         let w = gui.open_tabbed_window_xml("FactionView", "Faction", xml, (0, 0), WindowSize::Preferred)?;
+        // a stacked view has no layout node, so the bar's cell carries the size of its background art (`GFX_GUI_HOR_BAR_EMPTY`)
+        let bg = gui.gfx().size(ao_gui::GfxId(BG));
         let mut rows = vec![];
         for (i, name) in SHORT_NAMES.iter().enumerate() {
             let b = match i {
@@ -125,25 +127,25 @@ impl HudFaction {
                 6 => "Rect(2,1,2,2)",
                 _ => "Rect(2,1,2,1)",
             };
-            let src = format!("<root><View view_layout=\"horizontal\" name=\"factionbar{i}\" layout_borders=\"{b}\"><View name=\"bar{i}\" view_layout=\"stacked\"/></View></root>");
+            let src = format!("<root><View view_layout=\"horizontal\" name=\"factionbar{i}\" layout_borders=\"{b}\"><View name=\"bar{i}\" view_layout=\"stacked\" min_size=\"Point({},{})\"/></View></root>", bg.0 - 1, bg.1 - 1);
             gui.add_view_xml(w, "faction_root", name, &src)?;
             rows.push(Row { value: None, titled: self.title_shown });
         }
-        gui.relayout_window(w);
-        let (ow, oh) = gui.outer_size(w);
-        gui.set_window_pos(w, ((self.screen.0 as i32 - ow as i32) / 2, (self.screen.1 as i32 - oh as i32) / 2));
         Ok((w, rows))
     }
 
     /// `FUN_1005d68c` for every bar whose stat changed.
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone) {
         let Some((w, rows)) = &mut self.window else { return };
+        let first = rows.iter().any(|r| r.value.is_none());
+        let mut rebuilt = false;
         for (i, row) in rows.iter_mut().enumerate() {
             let value = zone.stat(STATS[i]).unwrap_or(0);
             let fill = if i == 0 { 0xde } else if value < 0 { 0xdd } else { 0xdc };
             let dir = if i != 0 && value < 0 { "left" } else { "right" };
             let sign_changed = row.value.is_none_or(|v| (v < 0) != (value < 0));
             if sign_changed {
+                rebuilt = true;
                 // the bar is rebuilt with the other fill art / direction (`View::RemoveChild`, new `PowerbarView_c`)
                 gui.remove_children(*w, &format!("bar{i}"));
                 let name = |id: u32| gui.gfx().name(ao_gui::GfxId(id)).unwrap_or_default().to_string();
@@ -171,6 +173,14 @@ impl HudFaction {
             row.value = Some(value);
             row.titled = self.title_shown;
         }
+        if rebuilt {
+            // the window is sized by its content, which exists only now; the first time it is also centred
+            gui.resize_window(*w, WindowSize::Preferred);
+            if first {
+                let (ow, oh) = gui.outer_size(*w);
+                gui.set_window_pos(*w, ((self.screen.0 as i32 - ow as i32) / 2, (self.screen.1 as i32 - oh as i32) / 2));
+            }
+        }
     }
 
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event) -> bool {
@@ -197,6 +207,23 @@ mod tests {
 
     fn bands() -> Vec<Band> {
         vec![Band { min: -50000, max: -30001 }, Band { min: -1000, max: -1 }, Band { min: 0, max: 999 }, Band { min: 1000, max: 4999 }]
+    }
+
+    /// The window is sized by its seven bars once they exist (a stacked cell has no layout node: it was a 14 x 62 sliver) and is centred.
+    #[test]
+    fn window_holds_seven_bars_and_is_centred() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() {
+            return;
+        }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut f = HudFaction::new(&dir, (1280, 800));
+        f.open(&mut gui);
+        f.update(&mut gui, &Zone::default());
+        let (w, _) = f.window.as_ref().unwrap();
+        let (x, y, ow, oh) = gui.window_outer_frame(*w).unwrap();
+        assert!(ow >= 179 && oh >= 7 * 23, "{ow}x{oh}");
+        assert_eq!((x, y), ((1280 - ow as i32) / 2, (800 - oh as i32) / 2));
     }
 
     #[test]

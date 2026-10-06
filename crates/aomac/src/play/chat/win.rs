@@ -507,6 +507,15 @@ impl WinPrefs {
     }
 }
 
+impl ChatWindows {
+    /// Closes every chat window frame.
+    pub fn close_all(&mut self, gui: &mut Gui) {
+        for f in self.frames.drain(..) {
+            gui.close_window(f.id);
+        }
+    }
+}
+
 pub struct ChatWindows {
     wins: Vec<Win>,
     frames: Vec<Frame>,

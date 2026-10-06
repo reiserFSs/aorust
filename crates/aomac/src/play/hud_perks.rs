@@ -259,7 +259,7 @@ impl HudPerks {
                    <View view_layout=\"horizontal\" name=\"tabs\" layout_borders=\"Rect(5,5,5,0)\"/>\
                    <View view_layout=\"vertical\" name=\"points\" layout_borders=\"Rect(5,5,5,0)\"/>\
                    <BorderView name=\"lines_border\" layout_borders=\"Rect(5,5,5,5)\"><ScrollView name=\"lines_scroll\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point(1,1)\" max_size=\"Point(16000,16000)\">\
-                   <ScrollViewChild view_layout=\"vertical\" name=\"lines\"/></ScrollView></BorderView>\
+                   <ScrollViewChild><View view_layout=\"vertical\" name=\"lines\"/></ScrollViewChild></ScrollView></BorderView>\
                    <View view_layout=\"horizontal\" name=\"bottom\" layout_borders=\"Rect(5,0,5,5)\"/></View></root>";
         let title = self.text("PerkWindow");
         let pos = ((self.screen.0 as i32 - CLIENT.0 as i32) / 2, (self.screen.1 as i32 - CLIENT.1 as i32) / 2);
@@ -354,7 +354,7 @@ impl HudPerks {
                 let name = self.name(id).replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;");
                 src += &format!("<TextButton name=\"perk_{id}\" text=\"{name}\" color=\"{color:#08X}\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" layout_borders=\"Rect(0,0,10,0)\"/>");
             }
-            src += "</View></root>";
+            src += "<HLayoutSpacer/></View></root>"; // left-aligned
             let _ = gui.add_view_xml(w.window, "lines", "PerkLine", &src);
         }
         gui.relayout_window(w.window);
@@ -439,6 +439,26 @@ mod tests {
 
     fn def(id: u32, precursor: u32, flags: u32, mask: u32) -> PerkDef {
         PerkDef { id, item: 0, precursor, flags, mask }
+    }
+
+    /// The perk lines stack below each other (they were all drawn at the top: a `ScrollViewChild` needs its one layout view inside) and start at the left.
+    #[test]
+    fn perk_lines_stack_in_the_scroll_view() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() {
+            return;
+        }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut h = HudPerks::new(&dir, (1280, 800));
+        h.open(&mut gui);
+        let mut z = Zone::default();
+        for (k, v) in [(PROFESSION, 6), (BREED, 1), (EXPANSION, 0xff), (LEVEL, 30)] {
+            z.stats.insert(k, v);
+        }
+        h.update(&mut gui, &z);
+        let w = h.win.as_ref().unwrap().window;
+        let (a, b) = (gui.view_rect(w, "line0").unwrap(), gui.view_rect(w, "line1").unwrap());
+        assert!(b.t > a.t + 5.0 && a.l == b.l, "{a:?} {b:?}");
     }
 
     #[test]

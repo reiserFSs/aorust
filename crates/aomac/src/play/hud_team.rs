@@ -11,6 +11,8 @@ use std::path::Path;
 
 /// The window shows six `TeamBar_c` rows (`FUN_100785f0` loop `< 6`, `FUN_10077bf2`).
 const ROWS: usize = 6;
+/// Row height of a `TeamBar_c`, inclusive pixels (UNRESOLVED guess: two 5 px bars + borders; the original size was not decoded).
+const ROW_H: u32 = 16;
 /// `SetDefaultColor`: leader `0x11eeaa`; otherwise `(!inTree - 1 & 0x777777) + 0x888888` = white when the character is known, grey when not (`FUN_100775ac`).
 const LEADER: u32 = 0x11eeaa;
 const KNOWN: u32 = 0xffffff;
@@ -24,7 +26,7 @@ const MENU_INFO: u32 = 1;
 const MENU_LEADER: u32 = 2;
 const MENU_KICK: u32 = 3;
 /// `DockArea1.xml` (`docked_view_identities "team_view"`): saved `WindowFrame` Rect(1836,893,2030,1050) of the template.
-const DOCK_FALLBACK: (i32, i32) = (1836, 893);
+const DOCK_FALLBACK: (i32, i32, u32, u32) = (1836, 893, 195, 158);
 
 /// One entry of the member list (`TeamMemberNode_c`: identity + name) with what the bars read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +188,8 @@ pub(super) struct HudTeam {
     pub(super) state: TeamState,
     win: Option<Win>,
     texts: Option<TextDb>,
-    frame: (i32, i32),
+    /// Outer frame (x, y, width, height) from `DockArea1.xml` `WindowFrame` (inclusive `Rect`).
+    frame: (i32, i32, u32, u32),
     screen: (u32, u32),
     /// Zone frames to send (leave, kick, transfer, join request, request reply).
     pub(super) outbox: Vec<Frame>,
@@ -202,7 +205,7 @@ pub(super) struct HudTeam {
 }
 
 /// `Rect(l,t,r,b)` of the first `WindowFrame` in a `prefs/NewChar` archive.
-fn dock_frame(dir: &Path, file: &str) -> Option<(i32, i32)> {
+fn dock_frame(dir: &Path, file: &str) -> Option<(i32, i32, u32, u32)> {
     let t = std::fs::read_to_string(dir.join("prefs/NewChar/DockAreas").join(file)).ok()?;
     let root = ao_gui::xml::parse(&t).ok()?;
     fn find(e: &ao_gui::xml::Element) -> Option<String> {
@@ -210,7 +213,7 @@ fn dock_frame(dir: &Path, file: &str) -> Option<(i32, i32)> {
     }
     let v = find(&root)?;
     let n: Vec<f32> = v.trim_start_matches("Rect(").trim_end_matches(')').split(',').filter_map(|p| p.trim().parse().ok()).collect();
-    (n.len() == 4).then(|| (n[0] as i32, n[1] as i32))
+    (n.len() == 4).then(|| (n[0] as i32, n[1] as i32, (n[2] - n[0]) as u32 + 1, (n[3] - n[1]) as u32 + 1))
 }
 
 fn esc(s: &str) -> String {
@@ -304,7 +307,7 @@ impl HudTeam {
                    <View name=\"buttons\" view_layout=\"horizontal\" layout_borders=\"Rect(0,5,0,5)\"/>\
                    <View name=\"rows\" view_layout=\"vertical\"/></View></root>";
         let title = self.text("Team");
-        let (x, y) = self.frame;
+        let (x, y, fw, fh) = self.frame;
         let window = gui.open_tabbed_window_xml("TeamView", &title, xml, (x, y), WindowSize::Preferred)?;
         let gfx = |id: u32| gui.gfx().name(ao_gui::GfxId(id)).unwrap_or_default().to_string();
         // `TeamBar_c` (`FUN_100791f7`): bars `PowerbarView_c(bounds, 0x1b, 0x1a, 0, 0, right)` (health) and `(0x1d, 0x1c)` (nano); separators `BitmapView_c(0xd6)`
@@ -314,7 +317,7 @@ impl HudTeam {
             let top = if i == 0 { format!("<BitmapView bitmap_id=\"{sep}\" max_size=\"Point(16000,-1)\"/>") } else { String::new() };
             let src = format!(
                 "<root><View view_layout=\"vertical\" name=\"row{i}\">{top}\
-                 <View view_layout=\"stacked\"><CanvasView name=\"hl{i}\"/>\
+                 <View view_layout=\"stacked\" min_size=\"Point(-1,{ROW_H})\" max_size=\"Point(16000,{ROW_H})\"><CanvasView name=\"hl{i}\"/>\
                  <View view_layout=\"horizontal\"><TextView name=\"idx{i}\" value=\"{n}\" layout_borders=\"Rect(3,2,0,2)\"/><HLayoutSpacer/>\
                  <TextView name=\"name{i}\" value=\"\" layout_borders=\"Rect(5,2,5,2)\"/><HLayoutSpacer/>\
                  <View view_layout=\"vertical\" layout_borders=\"Rect(2,2,2,2)\">\
@@ -327,6 +330,13 @@ impl HudTeam {
         }
         let mut w = Win { window, rows, buttons: (false, false) };
         self.build_buttons(gui, &mut w, true);
+        // `LoadWndConfig` applies the saved `WindowFrame` (the template's size) and ends in `Window::MoveInsideScreen`: the origin comes from a bigger screen
+        // The template's height (157) is the client's own default; a stacked row has no layout node, so the rows carry `min_size`
+        // (UNRESOLVED: the original `TeamBar_c` height) and the window grows to hold six of them.
+        gui.resize_window(w.window, WindowSize::Preferred);
+        let fh = fh.max(gui.outer_size(w.window).1);
+        let (px, py) = (x.min(self.screen.0.saturating_sub(fw) as i32).max(0), y.min(self.screen.1.saturating_sub(fh) as i32).max(0));
+        gui.set_window_outer_frame(w.window, (px, py, fw, fh));
         Ok(w)
     }
 
@@ -555,6 +565,21 @@ mod tests {
         // own team record with instance 0 clears everything
         feed(&mut h, team_member(ME, &TeamMember { member: ME, team: Identity::default(), sub_team: 0, profession: 1, level: 30, name: "Me".into() }));
         assert!(!h.state.in_team());
+    }
+
+    /// The DockArea1 origin (1836, 893) is off a 1280x800 screen: the window opens inside it (`MoveInsideScreen`).
+    #[test]
+    fn opens_inside_the_screen() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() {
+            return;
+        }
+        let mut gui = ao_gui::Gui::new(&dir, None).unwrap();
+        let mut h = HudTeam::new(&dir, (1280, 800));
+        h.open(&mut gui);
+        let w = h.win.as_ref().unwrap().window;
+        let (x, y, ow, oh) = gui.window_outer_frame(w).unwrap();
+        assert!(x >= 0 && y >= 0 && x + ow as i32 <= 1280 && y + oh as i32 <= 800, "{x},{y} {ow}x{oh}");
     }
 
     #[test]

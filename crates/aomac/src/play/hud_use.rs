@@ -236,12 +236,12 @@ impl Play {
         match action::start_camping(&c) {
             Ok(out) => {
                 self.send_outgoing(out);
-                // `CampStartedMessage` [GUI 0x10029d38]: timer 40000 "Logout", state 0 -> 1, text `LogoutStarted` fed 30 (code 12)
+                // `CampStartedMessage` [GUI 0x10029d38]: timer 40000 "Logout", state 0 -> 1, text `LogoutStartedXseconds` fed 30 (code 12)
                 self.camp = Some(0.0);
                 self.camp_bar_open();
                 self.logout.camp_started();
                 if let Some(c) = self.chat.as_mut() {
-                    c.logout_line(&mut self.gui, "LogoutStarted", Some(CAMP_SECONDS as i32), &self.text);
+                    c.logout_line(&mut self.gui, "LogoutStartedXseconds", Some(CAMP_SECONDS as i32), &self.text);
                 }
                 true
             }

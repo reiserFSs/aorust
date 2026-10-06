@@ -344,7 +344,7 @@ View vertical, layout_borders Rect(0,0,0,10)
 container and sets the toggle). Field text (`SetupView` [0x1000e2ec], row data = `CharacterData_t`; wire fields = `ao_net::msg::CharacterInfo`):
 
 * `name` = character name; `level` = `Format("%d", level)` (`DAT_101a99a4` = "%d").
-* `gender` = `GetSexStr(sex)` (lower case "male"/"female"/…), **first letter upper-cased** by the view code → "Male", "Female".
+* `gender` = `GetSexStr(sex)` (lower case "male"/"female"/…), **first letter upper-cased** by the view code → "Male", "Female". The table (Gamecode, built at ~0x10032450) is map[0]="NONE" (0x1015ae74), map[1]="uni" (0x1015ae70), map[2]="male", map[3]="female", so sex 1 (the Atrox, `CreateCharacter` sends 1; live charlist: breed 4 gender 1) reads "Uni" (also text.mdb 1005/101); `flow::sex_name` follows it (test `flow::tests::sex_names_follow_the_get_sex_str_table`).
 * `breed` = `GetBreedStr(breed)` — display strings are hard-coded in Gamecode (`FUN_1003227a` @GC: "Solitus","Opifex","Nanomage","Atrox",…); 
   note "Atrox" (not text.mdb's "Athrox" in category 1005/604).
 * `profession` = text.mdb category **2004**, id = profession (1 Soldier … 15 Shade; `LDBface::GetText(0x7d4, prof)`), or, when the

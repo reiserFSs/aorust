@@ -589,6 +589,19 @@ impl SocialWin {
         gui.close_window(l.win);
     }
 
+    /// Leaving the world: every social window closes (Friends and Team Search save their configs as on a normal close).
+    pub fn close_all(&mut self, gui: &mut Gui, tx: &Texts) {
+        self.set_friends(gui, false, &Social::default(), tx, &[]);
+        self.close_lft(gui, tx);
+        for t in self.tells.drain(..) {
+            gui.close_window(t.win);
+        }
+        for d in self.dialogs.drain(..) {
+            gui.close_window(d.win);
+        }
+        self.menu.clear();
+    }
+
     pub fn lft_busy_changed(&mut self, gui: &mut Gui, busy: bool) {
         if let Some(l) = &self.lft {
             gui.set_enabled(l.win, "Search", !busy);

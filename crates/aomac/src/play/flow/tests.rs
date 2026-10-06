@@ -450,4 +450,29 @@ fn character_created_and_handoff_reach_the_world() {
     assert!(r.p.screen == Screen::Loading && r.p.cc.is_none());
     r.enter();
     assert!(r.p.player.is_some());
+
+/// Leaving the world for the login screen (`/camp`, `ActivateGameClosing(2)`): the chat windows close and the chat/interact layers are
+/// dropped (their chat-server session ends), so nothing of the world stays over the login backdrop and a re-entry opens no duplicates.
+#[test]
+fn leaving_the_world_closes_chat_and_interact() {
+    let Some(mut r) = rig() else { return };
+    let first = captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec"));
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&first);
+    r.enter();
+    for _ in 0..IN_PLAY_FRAMES + 2 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    assert!(r.p.chat.is_some() && r.p.interact.is_some() && r.p.gui.window_ids().len() > 3);
+    r.p.show_login(&mut r.host);
+    assert!(r.p.chat.is_none() && r.p.interact.is_none() && r.p.hud.is_none());
+    let left: Vec<_> = r.p.gui.window_ids().into_iter().map(|w| (w, r.p.gui.view_names(w))).collect();
+    assert_eq!(r.p.gui.window_ids(), vec![r.p.login_w.unwrap()], "only the login window is left: {left:?}");
+}
+
+/// `GetSexStr` (Gamecode): NONE / uni / male / female, first letter upper-cased; the Atrox are sex 1 = "Uni".
+#[test]
+fn sex_names_follow_the_get_sex_str_table() {
+    assert_eq!([0, 1, 2, 3].map(sex_name), ["NONE", "Uni", "Male", "Female"]);
+    assert_eq!(format!("{} {}", breed_name(4), sex_name(1)), "Atrox Uni");
 }

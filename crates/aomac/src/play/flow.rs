@@ -21,7 +21,10 @@ pub(super) fn breed_name(b: i32) -> &'static str {
 }
 
 pub(super) fn sex_name(s: i32) -> &'static str {
+    // Gamecode.dll GetSexStr table (~0x10032450): NONE, uni, male, female; the view upper-cases the first letter (docs/screens.md §5.3)
     match s {
+        0 => "NONE",
+        1 => "Uni",
         2 => "Male",
         3 => "Female",
         _ => "Unknown",
@@ -106,6 +109,13 @@ impl Play {
         self.hud_pending.clear();
         if let Some(h) = self.hud.take() {
             h.close(&mut self.gui); // leaving the world
+        }
+        // `ActivateGameClosing(2)` (GUI 0x10028194): the chat windows close and the chat connection ends, the interaction windows go
+        if let Some(mut c) = self.chat.take() {
+            c.close(&mut self.gui, &self.text);
+        }
+        if let Some(mut i) = self.interact.take() {
+            i.close_all(&mut self.gui);
         }
         if self.cc.is_some() {
             self.cc_close_windows();

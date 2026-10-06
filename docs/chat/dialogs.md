@@ -107,8 +107,9 @@ Both after `/afk` already switched AFK on with the default message (cmd.md §`/a
 * State `FlowControlModule_t::m_eLoggingOutTimed` (GUI 0x102760c8): 0 none, 1 timed logout to the system, 2 timed logout to the login; `m_nQuitToSystemTime` (0x102760d0, `Timer_t+0x24` ms). Port: `play/logout.rs` (`Logout`, tests) + `play/hud_use.rs`.
 * `/camp` (0x100b587d): `AFCM::Send(10, 0x134)`. 0x134 is registered at 0x1002aef8 for `FlowControlModule_t::StartQuitToLoginMessage` (0x10027c74): unless state 2, state 0 → `N3Msg_StartCamping` (failure: return, state stays;
   refusals as chat feedback; docs/zone/actions.md §3), then state 2 (also from state 1: no second camping). `CampStartedMessage` (0x10029d38): deletes the old `m_pcCampTimer`, state 0 → 1, timer 40000 ms "Logout", prints
-  text cat 200 key `LogoutStarted` (key string 0x101ae5b0) fed 30 on GlobalSignals+0x17c, colour code 12. `CancelCampMessage` (0x10029c26): deletes the timer, `m_nQuitToSystemTime = 0`, prints `TimedLogoutAborted`
+  text cat 200 key `LogoutStartedXseconds` (key string 0x101ae5b0; the shorter `LogoutStarted` is not in text.mdb) fed 30 on GlobalSignals+0x17c, colour code 12. `CancelCampMessage` (0x10029c26): deletes the timer, `m_nQuitToSystemTime = 0`, prints `TimedLogoutAborted`
   (0x101ae59c, colour 12), state 0.
+* Leaving the world for the login (`Play::show_login`, the port's `ActivateGameClosing(2)` clear-up): the chat windows (frames, `/open` windows, Friends / Team Search / tells, dialogs, InfoView), the `Chat` itself (dropping it ends its chat-server session: the session thread returns when its command channel disconnects, so the character no longer stays on the chat server) and the interaction layer (`Interact::close_all`) are closed and dropped; the next `ZoneHandoff` builds fresh ones, so no duplicate windows survive a re-entry (`flow::tests::leaving_the_world_closes_chat_and_interact`). The HUD's target health-bar windows are closed with the HUD (they leaked before).
 * The countdown ends with the server dropping the connection: `ServerLostMessage` (0x10028d50): state != 0 → `ActivateGameClosing(state)` (1 = quit the game, 2 = config saved, screen cleared, back to login: 0x10028194),
   state 0 → status 3 (connection lost). So a camp started by the hotkey (`0x51`, state 0 → 1 by `CampStarted`) ends in a **quit**, `/camp` ends at the login. Port: `Play::camp_frame` (30 s, [INFERENCE] the expiry is the server's, no client apply of `StartLogoutIIR_t`).
 * `/quit` (0x100b5895): `AFCM::Send(10, 0x133)` → `StartQuitToSystemMessage` (0x10029a0d): emits `GlobalSignals+0x294` and `+0x20c` (listeners not traced [UNRESOLVED]); if state == 1 **or** `m_nQuitToSystemTime != 0 && now < time + 3000`
@@ -143,7 +144,7 @@ The Fanatic group (`/anon /stuck /list /shop /teleport /tp /monster /npc /spawn 
 | `/messagebox` | 0x100b7a6f | implemented (§2) |
 | `/text <t>` | 0x100b5913: `FUN_1009b37f(token1, 0x52)` | implemented (info-coloured local line) |
 | `/funcom` | 0x100b59d3: "Funcom made this excellent product :)\nThank you for playing Anarchy Online." (0x52) | implemented |
-| `/camp` `/quit` | AFCM 0x134 / 0x133 | implemented (§3): `/camp` state 2, `/quit` 3-second double rule + camp-then-quit (state 1), texts `LogoutStarted` / `ClosingClient` / `TimedLogoutAborted`; only the +0x294 / +0x20c signal listeners are untraced |
+| `/camp` `/quit` | AFCM 0x134 / 0x133 | implemented (§3): `/camp` state 2, `/quit` 3-second double rule + camp-then-quit (state 1), texts `LogoutStartedXseconds` / `ClosingClient` / `TimedLogoutAborted`; only the +0x294 / +0x20c signal listeners are untraced |
 | `/open` `/close` `/toggle` | 0x100b77b6 | implemented for the InfoView and HUD windows (§3) |
 | `/afk` dialog | 0x100b7cb8 + `FUN_10082a6f` | implemented (§2.1) |
 | `/org leave`, `/org disband` dialogs | 0x10052568 / 0x100520dd | implemented (§2) |

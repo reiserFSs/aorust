@@ -1083,8 +1083,9 @@ impl Movement {
                 self.pos[1] = g + FOOT_CLEARANCE;
             }
         }
-        // `Vehicle_t::Run` (Vehicle.dll @0x1000e849) reads the speed `+0xcc` before the frame (an `Impact` does not touch it)
-        let still = self.vel == [0.0, 0.0] && self.vy == 0.0;
+        // `Vehicle_t::Run` (Vehicle.dll @0x1000e849) reads the speed `+0xcc` before the frame (an `Impact` does not touch it). `+0xcc`
+        // is the length of the horizontal-plane velocity `+0x64..+0x6c` only (FUN_1000e3d3); the vertical speed `+0x54` (jump/fall) is separate
+        let still = self.vel == [0.0, 0.0];
         if let Some(h) = self.jump_pending.take() {
             self.launch_jump(h, world);
         }
@@ -1101,7 +1102,7 @@ impl Movement {
                 left -= h;
             }
             // ... and, in the free-roam branch (`+0x108 == 0`), runs the vtable `+0x70` callback when it went from 0 to > 0
-            if still && free && (self.vel != [0.0, 0.0] || self.vy != 0.0) {
+            if still && free && self.vel != [0.0, 0.0] {
                 self.start_moving_callback();
             }
         }
@@ -1809,6 +1810,23 @@ mod tests {
         assert_eq!(m.take_outgoing().len(), 1);
     }
 
+    /// A standing jump stays in place: Vehicle `+0xcc` is the horizontal speed only (RE Vehicle.dll 0x1000e849/0x1000e3d3), so no
+    /// ForwardStart callback fires and nothing moves forward after the landing.
+    #[test]
+    fn standing_jump_stays_in_place() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::JUMP_START, 0.0);
+        m.take_outgoing();
+        for _ in 0..360 {
+            m.update(1.0 / 120.0, &w);
+            assert_eq!(m.speed(), 0.0);
+        }
+        assert!(m.grounded());
+        assert_eq!(m.fsm().fwd_dir, 0, "no ForwardStart");
+        assert_eq!((m.pos()[0], m.pos()[2]), (0.0, 0.0));
+    }
+
     #[test]
     fn jump_height_from_stats() {
         let mut m = Movement::new([0.0; 3], 0.0, 0);
@@ -2204,24 +2222,29 @@ mod tests {
         assert!(m.update(0.016, &w).is_empty());
     }
 
-    /// `FUN_1006ef34` (vehicle vtable `+0x70`): a body that goes from rest to moving without a key (walking off an edge, jumping on the spot)
-    /// runs ForwardStart, or ReverseStart while `GetDir` is negative; one that stands on the ground does not.
+    /// `FUN_1006ef34` (vehicle vtable `+0x70`): a body whose horizontal speed (`+0xcc`) goes from 0 to > 0 without a key runs ForwardStart,
+    /// or ReverseStart while `GetDir` is negative; one that stands on the ground, falls or jumps (vertical speed only) does not.
     #[test]
-    fn starting_to_fall_from_rest_runs_forward_or_reverse_start() {
+    fn starting_to_move_from_rest_runs_forward_or_reverse_start() {
         let mut m = Movement::new([0.0, 0.0, 0.0], 0.0, 0);
         run(&mut m, &Flat(0.0), 0.5);
         assert_eq!((m.fsm().fwd, m.fsm().fwd_dir), (1, 0), "standing on the ground: nothing starts");
         let mut m = Movement::new([0.0, 5.0, 0.0], 0.0, 0);
         run(&mut m, &Flat(0.0), 0.1);
-        assert_eq!((m.fsm().fwd, m.fsm().fwd_dir), (2, 1), "walk-off: ForwardStart");
-        let mut m = Movement::new([0.0, 5.0, 0.0], 0.0, 0);
-        m.dir = -1;
+        assert_eq!((m.fsm().fwd, m.fsm().fwd_dir), (1, 0), "falling from rest: vertical speed only, nothing starts");
+        let mut m = Movement::new([0.0, 0.0, 0.0], 0.0, 0);
+        m.in_fwd = 1.0; // thrust without the FSM having started a move
         run(&mut m, &Flat(0.0), 0.1);
-        assert_eq!((m.fsm().fwd, m.fsm().fwd_dir), (2, 2), "walk-off while reversing: ReverseStart");
+        assert_eq!((m.fsm().fwd, m.fsm().fwd_dir), (2, 1), "speed 0 -> > 0 without a key: ForwardStart");
+        let mut m = Movement::new([0.0, 0.0, 0.0], 0.0, 0);
+        m.dir = -1;
+        m.in_fwd = -1.0;
+        run(&mut m, &Flat(0.0), 0.1);
+        assert_eq!((m.fsm().fwd, m.fsm().fwd_dir), (2, 2), "while reversing: ReverseStart");
         let mut m = Movement::new([0.0, 0.0, 0.0], 0.0, 0);
         m.jump_impulse(2.0);
         run(&mut m, &Flat(0.0), 0.1);
-        assert_eq!(m.fsm().fwd, 2, "a jump from a standstill fires the callback");
+        assert_eq!(m.fsm().fwd, 1, "a jump from a standstill does not fire the callback");
     }
 
     #[test]

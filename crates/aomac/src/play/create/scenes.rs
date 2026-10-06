@@ -884,6 +884,11 @@ fn cc_request(c: &Create, name: String) -> CreateCharacterRequest {
 
 #[cfg(test)]
 impl Play {
+    /// Live harness (`AOMAC_LIVE_CC`): scene `scene` (0 breed .. 3 name) is shown and takes input.
+    pub(in crate::play) fn live_cc_active(&self, scene: usize) -> bool {
+        self.cc.as_ref().is_some_and(|c| c.st == St::Active && c.cur == Some(Sc::from(scene)))
+    }
+
     /// Live harness: the creation module with the given CC breed / profession selections (the scenes' clicks are not driven) sends the
     /// request `NameScene_t::StartServerCreation` would. The module must be initialised (`cc_try_init`), the selections are set like the picks.
     pub(in crate::play) fn live_create(&mut self, name: &str, breed: i32, prof: i32) -> bool {

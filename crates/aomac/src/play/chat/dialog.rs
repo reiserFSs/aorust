@@ -112,6 +112,12 @@ impl Dialogs {
         self.open.iter().map(|o| o.win)
     }
 
+    pub fn close_all(&mut self, gui: &mut Gui) {
+        for o in self.open.drain(..) {
+            gui.close_window(o.win);
+        }
+    }
+
     /// `GuiSystem_c::CloseDuelWindows` [GUI 0x1002f833]: `FindWindowName("DuelChallenge")` (the first of the received / sent dialogs) is closed
     /// without an answer.
     pub fn close_duel(&mut self, gui: &mut Gui) {
