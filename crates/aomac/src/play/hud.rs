@@ -400,7 +400,17 @@ impl Hud {
             match gui.open_window_xml(spec.cfg, &src, (0, 0), WindowSize::Preferred) {
                 Ok(window) => {
                     let (w, h) = gui.window_size(window);
-                    let (x, y) = frames.get(spec.cfg).map_or((0.0, 0.0), |f| (f[0], f[1]));
+                    let (x, y) = match (frames.get(spec.cfg), self.bars.last()) {
+                        (Some(f), _) => (f[0], f[1]),
+                        // UNRESOLVED GUESS: the template has no `CCAlienXPBarConfig` frame and the factory's default is not decompiled; the bar
+                        // sits right of the XP bar (the health / nano bars are 10 px apart), left of it when that leaves the screen.
+                        (None, Some(xp)) => {
+                            let (px, py) = gui.window_pos(xp.window);
+                            let right = px + 10;
+                            ((if right as u32 + w <= self.size.0 { right } else { px - 10 }) as f32, py as f32)
+                        }
+                        (None, None) => (0.0, 0.0),
+                    };
                     let x = x.min(self.size.0.saturating_sub(w) as f32).max(0.0);
                     let y = y.min(self.size.1.saturating_sub(h) as f32).max(0.0);
                     gui.set_window_pos(window, (x as i32, y as i32));
@@ -796,6 +806,22 @@ mod tests {
         assert_eq!(s.hud.bar_titles, ["Health", "Nano", "Experience", "Alien Experience"]);
         assert_eq!(s.hud.dvalues.get("Targetstarget"), Some(&0));
         assert!(!s.hud.target.targets_target);
+    }
+
+    /// `CCAlienXPBarConfig` has no saved frame in the NewChar template: the bar must not fall back to the screen corner (live 2026-10-06 showed it at 0,0),
+    /// it sits beside the XP bar and never on top of it, also when the XP frame had to be clamped.
+    #[test]
+    fn alien_bar_sits_beside_the_xp_bar() {
+        for size in [(1280, 800), (1920, 1080)] {
+            let Some((s, _)) = shot(size) else { return };
+            let pos = |cfg: &str| {
+                let b = s.hud.bars.iter().find(|b| b.spec.cfg == cfg).unwrap();
+                s.gui.window_pos(b.window)
+            };
+            let (xp, alien) = (pos("CCXPBarConfig"), pos("CCAlienXPBarConfig"));
+            assert_eq!(alien.1, xp.1, "{size:?}");
+            assert_eq!((alien.0 - xp.0).abs(), 10, "{size:?}");
+        }
     }
 
     /// Ctrl+6 = Map, P = Planet Map, Shift+P = Perks, I = Inventory (help texts / CharPrefs.xml); a focused text field swallows them.

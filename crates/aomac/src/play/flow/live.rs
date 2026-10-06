@@ -3,7 +3,8 @@
 //!  cargo test --release -p aomac live_walk -- --ignored --nocapture`.
 //! Credentials come from stdin only. Steps (comma separated): `KEY=secs` holds a letter/arrow/space key (`W A S D Z C SPACE UP LEFT`),
 //! `wait=secs`, `shot=name` (PNG into AOMAC_LIVE_SHOTS), `pos` prints the own position, `press=F8|CTRL+F8|SHIFT+F8` taps keys (camera),
-//! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens.
+//! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens. HUD steps: `ui=u|ctrl+1` window hotkey,
+//! `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
 use super::*;
 use ao_render::{GameInput, KeyCode, Offscreen};
 use std::io::BufRead;
@@ -220,7 +221,7 @@ fn live_walk() {
                 let mut v: Vec<_> = l.p.zone.dynels.iter().map(|(i, d)| (((d.pos[0] - me[0]).powi(2) + (d.pos[2] - me[2]).powi(2)).sqrt(), *i, d.clone())).filter(|e| e.0 < 60.0).collect();
                 v.sort_by(|a, b| a.0.total_cmp(&b.0));
                 for (dist, i, d) in v {
-                    eprintln!("near {i} {:?} npc={} lvl={} hp={}/{} side={} dist={dist:.1}", d.name, d.npc, d.level, d.health, d.max_health, d.side);
+                    eprintln!("near {i} {:?} npc={} lvl={} hp={}/{} side={} dist={dist:.1} at {:.0},{:.1},{:.0}", d.name, d.npc, d.level, d.health, d.max_health, d.side, d.pos[0], d.pos[1], d.pos[2]);
                 }
             }
             // `approach=<instance>`: servo the heading with A/D and walk with W until 2.5 m from the dynel (the conventions of the yaw
@@ -274,6 +275,23 @@ fn live_walk() {
             "say" => {
                 let p = &mut l.p;
                 p.chat.as_mut().expect("chat hub").run_line(&mut p.gui, v, &p.zone, &p.text);
+            }
+            // `buddyadd=<name>` / `buddyrm=<name>` / `lftsearch=<side>:<profession>:<location>` (dropdown ids, 7 / 16 = any): the Friends / Team Search
+            // window requests; `friendswin` / `lftwin` toggle those windows through the HUD dvalues (as Ctrl+R / the right menu do)
+            "buddyadd" | "buddyrm" | "lftsearch" => {
+                for _ in 0..2 {
+                    let p = &mut l.p;
+                    if p.chat.as_mut().expect("chat hub").live_social(&mut p.gui, k, v, &p.zone, &p.text) {
+                        break;
+                    }
+                    l.wait(3.0);
+                }
+            }
+            "friendswin" | "lftwin" => {
+                let d = if k == "friendswin" { "friends_window" } else { "lft_window" };
+                let h = l.p.hud.as_mut().expect("hud");
+                h.set_dvalue(&mut l.p.gui, d, v != "off");
+                l.tick();
             }
             "tab" => {
                 l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Tab, pressed: true, mods: ao_gui::Modifiers::default() }, &mut l.o.host);
@@ -386,6 +404,26 @@ fn live_walk() {
                 }
                 l.tick();
                 eprintln!("target {:?}", l.p.zone.target);
+            }
+            // `mdrag=x1:y1:x2:y2` GUI left drag (slider knob, windows) in 10 steps; `watch=secs` prints every own stat that changed meanwhile
+            "mdrag" => {
+                let c: Vec<f32> = v.split(':').map(|n| n.parse().unwrap()).collect();
+                l.p.input(ao_gui::InputEvent::MouseMove { x: c[0], y: c[1] }, &mut l.o.host);
+                l.p.input(ao_gui::InputEvent::MouseDown { x: c[0], y: c[1], button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                for i in 1..=10 {
+                    l.tick();
+                    let t = i as f32 / 10.0;
+                    l.p.input(ao_gui::InputEvent::MouseMove { x: c[0] + (c[2] - c[0]) * t, y: c[1] + (c[3] - c[1]) * t }, &mut l.o.host);
+                }
+                l.p.input(ao_gui::InputEvent::MouseUp { x: c[2], y: c[3], button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                l.tick();
+            }
+            "watch" => {
+                let before = l.p.zone.stats.clone();
+                l.wait(v.parse().unwrap());
+                let mut d: Vec<_> = l.p.zone.stats.iter().filter(|(k, x)| before.get(*k) != Some(*x)).map(|(k, x)| format!("{k}: {:?}->{x}", before.get(k))).collect();
+                d.sort();
+                eprintln!("watch: {}", d.join(" "));
             }
             "cam" => {
                 let c = l.o.host.camera;
