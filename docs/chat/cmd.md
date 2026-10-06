@@ -91,11 +91,14 @@ Global map (`FUN_100badf1` 0x100badf1..0x100bbc30; handler address in the 2nd co
 | `/petition /fxscript /selectself /funcom /bug /showfile /tipoftheday /option /setoption /dvalue /open /toggle /close /messagebox /assist /text /start /camp /quit /chardist /viewdist /char&viewdist /voice /macro /petduel /duel /filter /waypoint /rp /reclaim` | see `GLOBAL_CMDS` | GUI-local | `ChatAction::ClientCommand(line)` (not chat) |
 | `/played` | 1 | 0x100b2321 | prints "Time: %02d:%02d local (%02d:%02d GMT), %02d:%02d game<br>" + "Date: ..." then `N3Msg_TextCommand("played")` |
 | `/version /bank /team /org /born /pet /follow /items /raid` | -1 | 0x100b2278 | `N3Msg_TextCommand(window, Expand(line[1..]), target)` (Interfaces 0x10008a72 -> Gamecode 0x176db -> FUN_1003fba6) |
-| GM: `/chr /getlocal /setlocal /getlocalfull /monsterdata /clearunique /tplocal /clone /criterialocal /damagemult /joycamacc /spelllocal /resetskill` | -1 | 0x100b2278 | same, gated by `stat:gmlevel != 0` (FUN_100b24e4 0x100b25eb..) |
+| `/chr /getlocal /setlocal /getlocalfull /monsterdata /clearunique /tplocal` | -1 | 0x100b2278 | forwarded as above (no GUI gate; `FUN_1003fba6` itself checks GmLevel, see §Zone commands) |
+| GM: `/clone /criterialocal /damagemult /joycamacc /spelllocal /resetskill` | -1 | 0x100b2278 | same, GUI gate `stat:gmlevel & 0x0001` (string 0x101baa04, assigned in the 3rd registration loop of FUN_100b24e4 at 0x100b272c); false -> `CommandNotAuthorized` |
 | `/inspect` | 2 | 0x100b2228 | `N3Msg_Inspect(character 50000, strtoul(tok1))` |
 | `/anim` `/emote` | 2 | 0x100b2be7 / 0x100b2aba | `N3Msg_DoSocialAction(id)`; `/emote` looks the name up in the 70-entry table (0x101badc4+12*id), else "Error: No emote named 'X'." |
 | `/<emote>` (70 names, `EMOTES`) | 1 | 0x100b2aba | same; with argc 1 the token is the whole line so `/wave now` does nothing (faithful quirk) |
-| `/command /gfx /tower /terminate /getfull /anon /stuck /list /shop /teleport /tp /monster /npc /spawn /reload /weather /perks /perk /gethash /item /dumphash /framerate /lazyreload /spawnacgentrance /spawnquest /syncdisplay /teleportdynel /reloadgfxtweak /togglegroundlightingfix` | 2..4 | 0x100b30cf, 0x100b314f ... | forwarded as above (FUN_100b39f6) |
+| `/anon /stuck /list /shop /teleport /tp /monster /npc /spawn /reload /weather /perks /perk /gethash /item /dumphash /framerate /lazyreload /spawnacgentrance /spawnquest /syncdisplay /teleportdynel /getfull` | 2 | 0x100b30cf | `Fanatic::ClientInterface_c::Command(window, target, line without slash)` = `FanaticIIR_t` (not `N3Msg_TextCommand`; line NOT expanded) |
+| `/tower` | 2 | 0x100b314f | `create` (and `terminate` on a tower target) -> Fanatic; everything else `N3Msg_TextCommand(line)` (unexpanded) |
+| `/command /gfx /terminate /reloadgfxtweak /togglegroundlightingfix /rp /reclaim` | | 0x100b379b / 0x100b3258 / 0x100b345e / 0x100b3317 / 0x100b30ad / 0x100b21dd / 0x100b21ca | GUI-local (dialogs, reloads); not decoded -> `ClientCommand` |
 
 ### `/g` `/group` `/ch` group matching (`FUN_10083814`)
 
@@ -150,15 +153,117 @@ executed (0x1008947b / 0x10089dfc), i.e. by the hub, not by `parse`.
 (0x10021fd0, Shift+R) opens it with `"/tell " + <head of reply list> + " "` (handler 0x1009494e, strings 0x101b8850 `"/tell "`,
 0x101aa270 `" "`); with an empty reply list the bar opens empty (`reply_prefill`).
 
+## Zone commands (`N3Msg_TextCommand`, `FUN_1003fba6`) — `ao_net::n3::textcmd`
+
+Chain: GUI wrapper 0x100b2278 (`ExpandChatTextArgs(line[1..])`, target = `InputConfig_t+0xc0`) -> Interfaces 0x10008a72 -> Gamecode
+`N3Msg_TextCommand` 0x176db: `GetClientControlDynel` must exist, `FUN_10058816` (lazy singleton at `this+0x1d0`, no wire effect), then
+`FUN_1003fba6(window, text, target)`. It reads the first word with `istringstream >> string` (`FUN_10043f4d`) and compares with
+`std::string::compare` (`FUN_10043dea`): **case-sensitive** (the GUI map before it is not); unknown words do nothing at all.
+Everything sent goes through `n3Dynel_t::SendIIRToObservers(control dynel, iir)` = zone connection, ptype 10; all header identities are
+`{0xC350, own char id}`, "to be passed on" byte 0.
+
+`CharacterActionIIR_t` ctor `FUN_1007253f(target, idA, param, action, idB, text)` (asm push order: `text, idB, action, window, idA, target`;
+stored at `+0x20/+0x1c/+0x18/+0x28/+0x30`). **`param` = the window id** for text commands (0 for `items` and `Inspect`).
+
+| word (case-sensitive) | gate | wire | evidence |
+|---|---|---|---|
+| `version` | – | action 0x9d, idA/idB 0 | 0x1003fc56..0x1003fcb5 |
+| `items` / `items list` | – | action 0xf4 (`FUN_1004b1ab`), param 0 | 0x1003fd1a |
+| `items delete <n>` | – | action 0xf5 (`FUN_1004b254`), idB `{0,n}`; a non-numeric word leaves `n` = the window id (`sscanf` into the argument slot) | 0x1003fd6b..0x1003fdd4 |
+| `resetskill <stat>` | GmLevel (`N3Msg_GetSkill(0xd7,2)`) | 0x9a, idB `{0,n}`; `n` = digits (`%u`) else `FUN_1002edf3` stat-name lookup (`_stricmp`; unknown 0x499602d2) | 0x1003fdf9 |
+| `clearunique <stat>` | GM | 0xae, idB `{0,n}` (same parse) | 0x1004038e |
+| `clone` | GM | 0x96 | 0x100400c5 |
+| `damagemult [list\|<n>]` | GM | 0x67, idB `{0,n}`, default n 100, `list` -> idB 0 | 0x10040221 |
+| `played` | – | 0x85 (after the GUI printed the time lines, below) | 0x10040187 |
+| `born` | – | 0x86 | 0x10041c3a |
+| `bank open` / `close` / `info` | open: GM | 0x24 / local close (`FUN_10046bdd`) / 0x5c; sub-word list `bankcmd` 0x102e2630: open 1, close 2, info 3 (`_stricmp`) | 0x1003ff2b |
+| `team` | in team (`FUN_100657d1`) | not in team: `Feedback_YouAreNotMemberOfTeam`; no word: `Feedback_AvailableTeamCommands` + `Feedback_TeamLoot` + `Feedback_TeamLootAll`; `team loot` -> 0x91; `team loot <x>` -> own id == team leader id: 0x7f idA `{0, teamcmd(x)}`, else `Feedback_OnlyTeamLeaderCanChangeLootOrder`. `teamcmd` list 0x102e2660: team 1, loot 2, all 3, leader 4, alpha 5 | 0x100406df..0x100408d9 |
+| `raid <sub>` | – | `RaidCmdIIR_c` (below); subs (map 0x102e2720): create 1, list 2, listlocal 3, move 4, lootaccess 5, locks 6 | 0x100404bb..0x100406d4 |
+| `org <sub> <rest>` | – | `OrgClientIIR_c` (below) | 0x100408e3..0x10041491 |
+| `pet ..`, `tower ..`, `follow` | | `PetCommandIIR_c` (ctor 0x10076260) / `FollowTargetIIR_c` (0x100734f8) built from engine state (pet command table `FUN_10053d69`, positions, FSM): **not decoded** (`TextResult::Unsupported`) | 0x10041ca8.. |
+| `getlocal setlocal getlocalfull criterialocal spelllocal monsterdata joycamacc tplocal` | GM | client-side debug (`DebugSpellListToChat`, `SetRelPos` ..): not decoded | 0x10041525.. |
+
+`ao_net::n3::textcmd::text_command(line, &TextState) -> TextResult` implements the table (byte-layout tests in the module); feedback keys are text.mdb
+**category 110** (`LDBface::GetTextPtr(0x6e, key)`; e.g. `Feedback_YouAreNotMemberOfTeam` = "You are not a member of a team!"), emitted through
+GlobalSignals+0x17c with colour code 0 (the window default; our `ChatKind::System` is a guess).
+
+### `OrgClientIIR_c` — key `MapToKey` = 7F4B3108
+
+Ctor 0x10126164 `(target, window, code, Identity*, text, flag)`; write 0x10125fef: `u8 code`, `Identity id`, `i32 window`, then `i16 len + text`
+for codes {1,7,9,0xd,0x11,0x13,0x14,0x17,0x18,0x19,0x1a,0x1b,0x1c}, or a `u8` flag (0) for code 10. (The ctor's `"&amp;"` -> `"&"` replacement for codes
+1/0x1a starts its `find` at `npos` and therefore never runs: dead code in the original.) `id` = the engine's current target (`n3EngineClientAnarchy_t+0x5c`,
+[INFERENCE: same as the GUI target]), `{0,0}` for ranks/contract/debt/city.
+The word after `org` is looked up in the map at 0x102e2710 (`help` 1, `create` 2, `ranks` 3, `governingform` 4, `info` 5, `promote` 6, `demote` 7, `name` 8, `history` 9,
+`description` 10, `objective` 11, `leave` 12, `invite` 13, `disband` 14, `kick` 15, `contract` 16, `tax` 17, `bank` 18, `startvote` 19, `vote` 20, `stopvote` 21,
+`debt` 22, `city` 23; case-insensitivity of this `std::map<String,int>` is [INFERENCE]). The rest of the line (after `ws`) must be printable ASCII, else
+`CannotUseLettersX` (`%s` = the offending characters). Jump table 0x1004218f (index `value - 2`):
+
+| sub | wire code / text | sub | wire code / text |
+|---|---|---|---|
+| create | 0x01 rest | kick | rest empty: 0x0c; else 0x0d rest |
+| ranks | 0x02 | contract | 0x03 |
+| governingform | 0x1b rest | tax | 0x11 rest |
+| info | 0x05 | bank | none: 0x12; `add <x>`: 0x13 x; `remove <x>`: 0x14 x; else `OrgCommandHelp` |
+| promote | 0x0a (+flag 0) | startvote | rest empty: `OrgVoteHelp`; else 0x07 rest |
+| demote | 0x0b | vote | empty: `OrgVoteHelpInfo`; rest == "info": 0x08; else 0x09 rest |
+| name | 0x1a rest | stopvote | 0x1c rest |
+| history | 0x17 rest | debt | 0x16 |
+| description | 0x19 rest | city | 0x1f |
+| objective | 0x18 rest | leave / disband | local confirmation dialogs (no wire) |
+| invite | 0x0e | unknown / `help` | `OrgCommandHelp` |
+
+### `RaidCmdIIR_c`
+
+Ctor 0x100a3531, write 0x100a34ea: `i32 cmd`, `Identity a`, and only for cmd 5 `Identity b, Identity c`. `move <slot> <group>`: a = `{strtoul(slot), atoi(group)}`
+(group > 6 aborts silently); `lootaccess <x> <y> <z>`: a = `{0xC76A, atoi x}`, b = `{atoi y, 0}`, c = `{0xC350, strtoul z}`; create/list/locks: a = 0;
+`listlocal` is local (`FUN_100586da` + `FUN_10065f00`).
+
+### Fanatic commands — `FanaticIIR_t` (Fanatic.dll)
+
+`Fanatic::ClientInterface_c::Command(window, target, text)` 0x10001066: header `{0xC350, char}` (control dynel, `vtable+0x1c`), passed-on 0, body
+(write 0x10001112): `i32 window, Identity target, i32 len, bytes` (no terminator). GUI handler 0x100b30cf passes `target = InputConfig_t+0xc0` and the line without
+its slash, not expanded.
+
+### Other client-side commands handled in `perform` (`play/chat/zonecmd.rs`)
+
+* `/inspect <id>`: `N3Msg_Inspect(Identity{50000,id})` 0x1001dc58 = action 0x105, param 0, idA = the identity, idB 0.
+* `/<emote>`, `/emote <name>`, `/anim <name>`: `N3Msg_DoSocialAction(anim)` 0x100269d3 -> `SocialActionCmd_t` (counter `s_nCommandRefCntr++`). Refused (cat 110 keys):
+  FSM state 4 (swimming) `Feedback_CantDoSocialActionsWhileSwimming`; vehicle equipped and anim 0x44/0x45 (sleep/lounge) `Feedback_YouCanNotDoThisWithAVehicleEquipped`;
+  anim 0x44/0x45 while not sitting/sleeping/lounging (state 8/0xb/0xc) `Feedback_MustSitToLoungeOrSleep`.
+* `/played`: GUI 0x100b2321 first prints `Time: %02d:%02d local (%02d:%02d GMT), %02d:%02d game<br>` + `Date: %02d. %s %d local` (colour 0x52; local = `_localtime64`,
+  GMT = `_gmtime64`, game clock = `N3Msg_GetCurrentHour/Minute`, month names `Jan..Dec` from 0x101ba9d4), then `N3Msg_TextCommand("played")`.
+* `/help <topic>` -> `file://` + the topic's file (0x100b6d56): the file name is returned and the hub resolves `text/help/<file>` (the directory prefix is built in
+  `InfoViewModule_c::ShowURL`, not decoded).
+
+## Chat-server requests (`ChatCmd`; GUI senders 0x1016c8c9..0x1016cdd7)
+
+The input line queues an `Action_t` (`FUN_10085a6a(FUN_1002bae5()+0x14, action)`); the chat connection handler (`FUN_10089dfc`, switch at 0x1008a43b on `action+0`)
+performs it. Names are resolved by lookup 0x15 first (`ChatCmdFeedback_UnknownUser` otherwise, 0x1008a2c2).
+
+| class | origin | sender | packet | `ChatCmd` |
+|---|---|---|---|---|
+| 2 / sub 0 | `/tell` (`FUN_100ba2e6`) | 0x1016c8c9 | 0x1e `ISD` | `Tell` |
+| 2 / sub 1 | `/cc info <name>` | 0x1016cac2 | 0x6e `IM` (`{"commane": "ccinfo", "destination": "chatserver"}`, key/value roles [GUESS]) | `Forward` |
+| 2 / sub 5 | `/name <x>` = tell to the name "name-request"; prints `ChatCmdFeedback_Name_SendingNameChangeRequest` | 0x1016c8c9 | 0x1e `ISD` | `Tell` |
+| 2 / sub 4 | `/petition` (position + playfield text, opens `petition_window`) | 0x1016c8c9 | 0x1e | not implemented |
+| 3 | `/invite <nick>` (`FUN_100ba6db`) | 0x1016d57d | 0x32 `I`; own id -> `ChatCmdFeedback_Ignore_CantInviteYourself` | `PrivInvite` |
+| 4 | `/kick <nick>` | 0x1016c954 | 0x33 `I` | `PrivKick` |
+| 5 | `/leave <nick>` | 0x1016c988 | 0x35 `I` (group id = owner id) | `PrivPart` |
+| – | accept an invite (0x100a6e0c) | 0x1016c96e | 0x34 `I` (declining sends 0x35) | `PrivJoin` |
+| 9 | `/ignore <nick>` | local `IgnoreSystem_t` | own id -> `Ignore_CantIgnoreYourself`; else toggle, `Ignore_(Un)IgnoringCharacter` | hub |
+| 10 / 11 | `/lft [text]` (`FUN_100b69b0` -> `FUN_100f01a3`) | 0x1016cafc / 0x1016cb22 | 0x5dc `S` (team description) / 0x5dd (none); prints text.mdb cat 100 `LFTon`/`LFToff` | `LftOn`/`LftOff` |
+| – | `/cc <args..>` (`FUN_100ba105` -> 0x1016cadf) | 0x1016cadf | 0x78 `sI`: argument strings (pack code `s`: u16 count + `S`s), window id | `Cc` |
+
+The earlier `ChatCmd::PrivJoin/PrivPart` ids (0x33/0x34) were wrong and are corrected, with `PrivInvite`/`PrivKick` added. `LFTWindowConfig.TeamDesc` (a DValue) is stored locally by
+`FUN_100f01a3`; not ported.
+
 ## Gaps / guesses
 
-* The `/help <cmd>` redirect condition and the keys marked `*` in `HELP_TOPICS` (org, pet, chat, team, misc, list, perk, raid share
-  their string with another literal; inferred from chatcommands.html).
+* `pet`, `tower` (non-create), `follow`, the GM debug commands, `/petition`, `/rp`, `/reclaim`, `/terminate`, `/command`, `/gfx` are not decoded (see the tables).
+* The engine target used by `OrgClientIIR_c` (`+0x5c`) is taken to be the GUI target; the colour of `Feedback_*` lines (code 0 through GlobalSignals+0x17c); case-insensitivity of the
+  org/raid sub-word maps; the key/value roles of the `/cc info` forward map.
+* The `/<cmd> help` redirect condition and the keys marked `*` in `HELP_TOPICS` (org, pet, chat, team, misc, list, perk, raid share their string with another literal; inferred from chatcommands.html).
 * Colour code (0x51 vs 0x52) of the feedback calls whose argument the decompile lost.
-* GM gating flags of the debug commands registered by 0x100b39f6 (their registrar arguments depend on a register the listing
-  filter hid); they are forwarded ungated, the server enforces.
-* `/tower` (0x100b314f: `create`/`terminate` subcommands go to `Fanatic::ClientInterface_c::Command`), `/terminate`, `/command`, `/gfx`
-  handlers not decoded; all become `ZoneCommand` of the full line.
-* Tell target capitalisation: the client does **no** case folding (`ExpandChatTextArgs` only); the name is resolved on the chat
-  server (lookup 0x15). "You can't send private messages to yourself." (0x1008947b) compares ids after the lookup: hub's job.
+* Tell target capitalisation: the client does **no** case folding (`ExpandChatTextArgs` only); the name is resolved on the chat server (lookup 0x15). "You can't send private messages to
+  yourself." (0x1008947b) compares ids after the lookup: hub's job.
 * A script file fallback passes only its name (`RunScript`); how arguments reach the script is not decoded.

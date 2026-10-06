@@ -66,7 +66,7 @@ pub struct CmdCtx<'a> {
     pub target: Option<Target>,
     /// Name of the fighting target (`N3Msg_GetAttackingID`, `%f`).
     pub fight_target: Option<&'a str>,
-    /// `stat:gmlevel` (GM-only commands answer `CommandNotAuthorized` when 0).
+    /// `stat:gmlevel` (the GUI condition is `stat:gmlevel & 0x0001`; false answers `CommandNotAuthorized`).
     pub gm_level: u32,
     /// Pref `ChatWarnWhenSpeakingToUnsubGroups`.
     pub warn_unsub: bool,
@@ -133,6 +133,11 @@ pub enum ChatAction {
     PlayedTime,
     /// `N3Msg_TextCommand(window, text, target)`: `text` is the line without the leading `/`, `%` args expanded.
     ZoneCommand(String),
+    /// `Fanatic::ClientInterface_c::Command` (FanaticIIR_t): the line without its slash, NOT `%`-expanded (GUI 0x100b30cf).
+    FanaticCommand(String),
+    /// `/tower <sub> ..` (GUI 0x100b314f): `create` -> Fanatic, `terminate` -> Fanatic when the target is a tower, everything else `N3Msg_TextCommand`.
+    /// Carries the line without its slash (`%`-expanded only when it goes to `N3Msg_TextCommand`: it does not, see docs).
+    Tower(String),
     /// A GUI-local command that is not chat (`/camp`, `/quit`, `/open`, `/option` ...): the unmodified line.
     ClientCommand(String),
 }
@@ -167,6 +172,10 @@ enum Kind {
     Played,
     /// `FUN_100b2278`: forward the line to the game.
     Forward,
+    /// `FUN_100b30cf`: `Fanatic::ClientInterface_c::Command(window, target, line without slash)`.
+    Fanatic,
+    /// `FUN_100b314f`.
+    Tower,
     /// `/<emote name>` (argc 1, `FUN_100b2aba`).
     SocialMove,
     Client,
@@ -259,13 +268,13 @@ const GLOBAL_CMDS: &[Cmd] = &[
     c("/follow", -1, Kind::Forward),
     c("/items", -1, Kind::Forward),
     c("/raid", -1, Kind::Forward),
-    gm("/chr", -1, Kind::Forward),
-    gm("/getlocal", -1, Kind::Forward),
-    gm("/setlocal", -1, Kind::Forward),
-    gm("/getlocalfull", -1, Kind::Forward),
-    gm("/monsterdata", -1, Kind::Forward),
-    gm("/clearunique", -1, Kind::Forward),
-    gm("/tplocal", -1, Kind::Forward),
+    c("/chr", -1, Kind::Forward),
+    c("/getlocal", -1, Kind::Forward),
+    c("/setlocal", -1, Kind::Forward),
+    c("/getlocalfull", -1, Kind::Forward),
+    c("/monsterdata", -1, Kind::Forward),
+    c("/clearunique", -1, Kind::Forward),
+    c("/tplocal", -1, Kind::Forward),
     gm("/clone", -1, Kind::Forward),
     gm("/criterialocal", -1, Kind::Forward),
     gm("/damagemult", -1, Kind::Forward),
@@ -278,36 +287,37 @@ const GLOBAL_CMDS: &[Cmd] = &[
     // FUN_100b2e87
     c("/anim", 2, Kind::Anim),
     c("/emote", 2, Kind::Emote),
-    // FUN_100b39f6 (GM/debug; the client-side gm flag of these is unresolved, the server enforces it)
-    c("/command", 4, Kind::Forward),
-    c("/gfx", 3, Kind::Forward),
-    c("/tower", 2, Kind::Forward),
-    c("/terminate", 2, Kind::Forward),
-    c("/getfull", 2, Kind::Forward),
-    c("/anon", 2, Kind::Forward),
-    c("/stuck", 2, Kind::Forward),
-    c("/list", 2, Kind::Forward),
-    c("/shop", 2, Kind::Forward),
-    c("/teleport", 2, Kind::Forward),
-    c("/tp", 2, Kind::Forward),
-    c("/monster", 2, Kind::Forward),
-    c("/npc", 2, Kind::Forward),
-    c("/spawn", 2, Kind::Forward),
-    c("/reload", 2, Kind::Forward),
-    c("/weather", 2, Kind::Forward),
-    c("/perks", 2, Kind::Forward),
-    c("/perk", 2, Kind::Forward),
-    c("/gethash", 2, Kind::Forward),
-    c("/item", 2, Kind::Forward),
-    c("/dumphash", 2, Kind::Forward),
-    c("/framerate", 2, Kind::Forward),
-    c("/lazyreload", 2, Kind::Forward),
-    c("/spawnacgentrance", 2, Kind::Forward),
-    c("/spawnquest", 2, Kind::Forward),
-    c("/syncdisplay", 2, Kind::Forward),
-    c("/teleportdynel", 2, Kind::Forward),
-    c("/reloadgfxtweak", 0, Kind::Forward),
-    c("/togglegroundlightingfix", 0, Kind::Forward),
+    // FUN_100b39f6: handler GUI 0x100b30cf = Fanatic::ClientInterface_c::Command (`Kind::Fanatic`); /tower 0x100b314f; /command 0x100b379b,
+    // /gfx 0x100b3258, /terminate 0x100b345e, /reloadgfxtweak 0x100b3317, /togglegroundlightingfix 0x100b30ad are GUI-local (not decoded).
+    c("/command", 4, Kind::Client),
+    c("/gfx", 3, Kind::Client),
+    c("/tower", 2, Kind::Tower),
+    c("/terminate", 2, Kind::Client),
+    c("/getfull", 2, Kind::Fanatic),
+    c("/anon", 2, Kind::Fanatic),
+    c("/stuck", 2, Kind::Fanatic),
+    c("/list", 2, Kind::Fanatic),
+    c("/shop", 2, Kind::Fanatic),
+    c("/teleport", 2, Kind::Fanatic),
+    c("/tp", 2, Kind::Fanatic),
+    c("/monster", 2, Kind::Fanatic),
+    c("/npc", 2, Kind::Fanatic),
+    c("/spawn", 2, Kind::Fanatic),
+    c("/reload", 2, Kind::Fanatic),
+    c("/weather", 2, Kind::Fanatic),
+    c("/perks", 2, Kind::Fanatic),
+    c("/perk", 2, Kind::Fanatic),
+    c("/gethash", 2, Kind::Fanatic),
+    c("/item", 2, Kind::Fanatic),
+    c("/dumphash", 2, Kind::Fanatic),
+    c("/framerate", 2, Kind::Fanatic),
+    c("/lazyreload", 2, Kind::Fanatic),
+    c("/spawnacgentrance", 2, Kind::Fanatic),
+    c("/spawnquest", 2, Kind::Fanatic),
+    c("/syncdisplay", 2, Kind::Fanatic),
+    c("/teleportdynel", 2, Kind::Fanatic),
+    c("/reloadgfxtweak", 0, Kind::Client),
+    c("/togglegroundlightingfix", 0, Kind::Client),
 ];
 
 /// Social move names, id = index + 1 (table at GUI 0x101badc4 + 12*id, 70 entries, `FUN_100b29a1`); each is also a `/<name>` command.
@@ -589,7 +599,7 @@ pub fn parse(input: &str, ctx: &CmdCtx) -> Vec<ChatAction> {
         }
         return vec![err(ctx, &fmt(&key(ctx, "CommandNotFound"), &[&word[1..]]))];
     };
-    if cmd.gm && ctx.gm_level == 0 {
+    if cmd.gm && ctx.gm_level & 1 == 0 {
         return vec![err(ctx, &key(ctx, "CommandNotAuthorized"))];
     }
     let toks = tokenize(input, cmd.argc);
@@ -788,6 +798,14 @@ fn run(cmd: &Cmd, line: &str, t: &[String], ctx: &CmdCtx) -> Vec<ChatAction> {
         }
         Kind::Played => vec![ChatAction::PlayedTime, ChatAction::ZoneCommand("played".into())],
         Kind::Forward => vec![ChatAction::ZoneCommand(expand(&line[1..], ctx))],
+        Kind::Fanatic => vec![ChatAction::FanaticCommand(line[1..].to_string())],
+        Kind::Tower => {
+            if n < 2 {
+                vec![]
+            } else {
+                vec![ChatAction::Tower(line[1..].to_string())]
+            }
+        }
         Kind::Client => vec![ChatAction::ClientCommand(line.to_string())],
     }
 }
@@ -1042,7 +1060,7 @@ mod tests {
         let a = parse("/ch ne", &c);
         assert_eq!(fb(&a[0]), "<div><font color=CCChatCmdFeedbackError>ambiguous:<font color=white>Newbie Help<font color=white>, Neu Org News|/ch ne</font></div>");
         // gm-only forwarded command
-        assert_eq!(fb(&parse("/getlocal x", &c)[0]), "<div><font color=CCChatCmdFeedbackError>not authorized</font></div>");
+        assert_eq!(fb(&parse("/clone x", &c)[0]), "<div><font color=CCChatCmdFeedbackError>not authorized</font></div>");
     }
 
     #[test]
@@ -1116,8 +1134,12 @@ mod tests {
         assert_eq!(emote_id("wave"), Some(62));
         assert_eq!(emote_id("facepalm"), Some(70));
         assert_eq!(parse("/inspect 1234", &c), [ChatAction::Inspect(1234)]);
-        c.gm_level = 1;
         assert_eq!(parse("/getlocal 1", &c), [ChatAction::ZoneCommand("getlocal 1".into())]);
+        assert_eq!(parse("/stuck Now %m", &c), [ChatAction::FanaticCommand("stuck Now %m".into())]);
+        assert_eq!(parse("/tower create 3", &c), [ChatAction::Tower("tower create 3".into())]);
+        assert_eq!(parse("/tower", &c), []);
+        c.gm_level = 1;
+        assert_eq!(parse("/clone", &c), [ChatAction::ZoneCommand("clone".into())]);
         c.chat_connected = false;
         assert!(fb(&parse("/cc addbuddy bob", &c)[0]).contains("Not connected to chat-server."));
         c.last_tell_from = None;
