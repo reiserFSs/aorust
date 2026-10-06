@@ -12,7 +12,7 @@
 //! depend on handedness, so it is applied unchanged. Constants carry their Vehicle.dll / N3.dll addresses; see
 //! `docs/zone/collision.md` §3.4 for the walk-through and the deviations.
 
-use super::{add_v as add, cross, dot, scale_v as scale, sub, unit, Collision, Terrain, Tri};
+use super::{add_v as add, cross, dot, scale_v as scale, sub, unit, zone, Collision, Terrain, Tri};
 
 type V = [f32; 3];
 
@@ -54,6 +54,22 @@ impl Body {
     pub const WALKING: Body = Body { falling_enabled: true, airborne: false, vy: 0.0, teleport: false };
 }
 
+/// What the liquid medium state machine asks the vehicle's owner to do (`Vehicle_t` vtable `+0x80` / `+0x84`): the player
+/// vehicle's `+0x80` (Gamecode `FUN_1006f99e`) clears MechData and runs the movement FSM transition SwitchToSwimMode (0x1a), `+0x84`
+/// (`FUN_1006ef74`) runs LeaveSwimMode (0x23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiquidEvent {
+    /// The character went into water deeper than [`SWIM_DEPTH`]: it starts swimming.
+    Enter,
+    /// The character left deep water (shallow water, out of the water, falling disabled).
+    Leave,
+}
+
+/// `Vehicle+0x100` (ctor `Vehicle_t::Vehicle_t` @0x1000ce2f, f32 @0x100127a4): water deeper than this over the closest point is
+/// "swimming" depth, shallower water is waded. The closest point is never deeper than 1.2 m below the surface
+/// (`closest`), so a 1.2 m reading means the ground is at least that far down.
+pub const SWIM_DEPTH: f32 = 1.19;
+
 /// State `EnsureSurfaceAlignment` keeps between steps.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceState {
@@ -63,11 +79,49 @@ pub struct SurfaceState {
     pub room: i32,
     /// `GetLastAllowedGlobalPositionInZone`.
     pub last: V,
+    /// `Vehicle+0xfc`, the liquid medium mode: 0 walker (wades in shallow water, swims in deep water, the default of every
+    /// vehicle and never changed for the player: no writer exists in Vehicle.dll / Gamecode.dll), 1 refuses deep water (the step is
+    /// undone), 2 callbacks only, 3 refuses everything but deep water, 4 hovers 0.25 m above the surface.
+    pub medium: u32,
+    /// `Vehicle+0x100`: depth over the closest point that counts as deep ([`SWIM_DEPTH`]).
+    pub wade_depth: f32,
+    /// `Vehicle+0x120`: the enter callback ran and the leave callback has not.
+    pub in_liquid: bool,
+    /// `Vehicle+0x10c`: how far the feet are below the surface (set while `feet < level`; -9999 once the feet are above the
+    /// surface in modes 0 and 2).
+    pub submersion: f32,
+    /// The callback this step fired, if any; the caller consumes it (`Option::take`).
+    pub event: Option<LiquidEvent>,
+    /// `n3Dynel_t::GetBodyCollSphereRadi` (`dynel->vtbl[+0x10]`, @0x10004dd3): radius of the dynel's torso `CollPrim_t`
+    /// (`n3VisualDynel_t::UpdateCollision` @0x10019be4: the model's torso sphere radius times the body scale, 0.5 when the model gives a
+    /// negative one), the length of the push-back of a refused room transition ([`Collision::veto`]); 0 without a collision primitive.
+    pub radius: f32,
+    /// Heading of the dynel (yaw, AO world: forward is `(sin, cos)`): the push-back of a refused transition from a standstill goes
+    /// along its backwards vector (`rot * (0, 0, -1)`, `n3Dynel_t::GetGlobalRot`).
+    pub heading: f32,
+    /// `n3Dynel_t` `+0x74 / +0x78` (`SetParentDynelID`, written by `AddChildDynel` @0x100059f7 / `RelocateDynel` @0x10005a7c): the dynel
+    /// rides another dynel; `VetoRoomTransition` leaves such dynels alone.
+    pub parented: bool,
 }
+
+/// `_DAT_1003cb20`: the torso sphere radius of a model that reports a negative one.
+pub const DEFAULT_BODY_RADIUS: f32 = 0.5;
 
 impl Default for SurfaceState {
     fn default() -> Self {
-        SurfaceState { stuck: 0, room: -1, last: [0.0; 3] }
+        SurfaceState {
+            stuck: 0,
+            room: -1,
+            last: [0.0; 3],
+            medium: 0,
+            wade_depth: SWIM_DEPTH,
+            in_liquid: false,
+            submersion: NO_LIQUID,
+            event: None,
+            radius: DEFAULT_BODY_RADIUS,
+            heading: 0.0,
+            parented: false,
+        }
     }
 }
 
@@ -102,6 +156,71 @@ pub struct Closest {
 }
 
 const NO_LIQUID: f32 = -9999.0;
+/// Feet clearance over the closest point in liquid medium mode 4 (hover, f64 @0x100127e8).
+const HOVER_CLEARANCE: f32 = 0.25;
+/// Feet within this of the liquid surface (f64 @0x100127a8) are in the liquid; also the minimum depth of mode 3.
+const SURFACE_BAND: f32 = 0.1;
+/// Feet float this far under the surface in deep water (f64 @0x100124e0, 0.01).
+const FLOAT_OFFSET: f32 = 0.01;
+/// Mode 3 keeps the feet at most this far under the surface (f32 @0x100127c0, 0.1).
+const SUBMERGE: f32 = 0.1;
+
+/// The liquid medium state machine at the end of `EnsureSurfaceAlignment` (@0x1000dd8c..0x1000e0ec) for `Vehicle+0xfc`
+/// (`st.medium`): returns the feet height, or `None` when the whole step is undone (modes 1 and 3 refuse the liquid).
+/// `level` is the liquid surface of the closest-point query (`m_vLiquidHeight`), `ground` its height; `depth = level - ground`
+/// is the water over the ground, `deep` means above `Vehicle+0x100`. The owner's callbacks are reported through `st.event`.
+pub(super) fn medium(st: &mut SurfaceState, body: &Body, feet: f32, level: f32, ground: f32) -> Option<f32> {
+    let depth = level - ground;
+    let deep = depth > st.wade_depth;
+    let falling = body.falling_enabled;
+    let leave = |st: &mut SurfaceState| {
+        if st.in_liquid {
+            st.in_liquid = false;
+            st.event = Some(LiquidEvent::Leave);
+        }
+    };
+    // deep water, modes 0 and 2: the enter callback needs falling enabled; a body that stops falling leaves again
+    let swim = |st: &mut SurfaceState| {
+        if !st.in_liquid {
+            if falling {
+                st.in_liquid = true;
+                st.event = Some(LiquidEvent::Enter);
+            }
+        } else if !falling {
+            st.in_liquid = false;
+            st.event = Some(LiquidEvent::Leave);
+        }
+    };
+    match st.medium {
+        0 if feet < level + SURFACE_BAND => {
+            if !deep {
+                leave(st);
+                // wading: stay on the ground under the water
+                Some(if body.vy <= LAND_VY && falling { level - depth + FOOT_CLEARANCE } else { feet })
+            } else {
+                swim(st);
+                Some(feet.max(level - FLOAT_OFFSET))
+            }
+        }
+        0 | 2 if feet >= level + SURFACE_BAND => {
+            st.submersion = NO_LIQUID;
+            leave(st);
+            Some(feet)
+        }
+        2 => {
+            if deep {
+                swim(st);
+            } else {
+                leave(st);
+            }
+            Some(feet)
+        }
+        1 => (level <= feet || !deep).then_some(feet),
+        3 => (depth >= SURFACE_BAND).then(|| feet.min(level - SUBMERGE)),
+        4 => Some(feet.max(level + HOVER_CLEARANCE)),
+        _ => Some(feet),
+    }
+}
 
 fn len2(v: V) -> f32 {
     dot(v, v)
@@ -167,7 +286,7 @@ impl Terrain {
             if n[1] < 0.0 {
                 n = neg(n);
             }
-            Tri { a: p[i], b: p[j], c: p[k], n: norm(n), floor: 0 }
+            Tri { a: p[i], b: p[j], c: p[k], n: norm(n), floor: 0, zone: 0 }
         })
     }
 
@@ -199,11 +318,12 @@ impl Terrain {
 }
 
 impl Collision {
-    /// Nearest front-face hit of the segment among the grid triangles; `floors` includes the dungeon tile floors.
-    fn nearest(&self, a: V, b: V, floors: bool) -> Option<(f32, Hit)> {
+    /// Nearest front-face hit of the segment among the grid triangles; `floors` includes the dungeon tile floors. `zone` (0 = any)
+    /// limits the KD triangles to the one surface of that zone / room (`tri.zone`); untagged triangles always count.
+    fn nearest(&self, a: V, b: V, floors: bool, zone: u32) -> Option<(f32, Hit)> {
         let mut best: Option<(f32, Hit)> = None;
         for t in self.near_aabb(a[0].min(b[0]), a[2].min(b[2]), a[0].max(b[0]), a[2].max(b[2])) {
-            if t.floor != 0 && !floors {
+            if (t.floor != 0 && !floors) || (zone != 0 && t.zone != 0 && t.zone != zone) {
                 continue;
             }
             if let Some((s, p)) = t.seg_hit(a, b) {
@@ -223,7 +343,7 @@ impl Collision {
         if self.rooms.is_some() && self.room_at(a, -1).is_none() && self.room_at(b, -1).is_none() {
             return None;
         }
-        let kd = self.nearest(a, b, true);
+        let kd = self.nearest(a, b, true, 0);
         let terrain = self.terrain.as_ref().and_then(|t| {
             let w = |p: V| [p[0], p[1], -p[2]];
             t.seg_hit(w(a), w(b)).map(|(s, p, n)| (s, Hit { p: w(p), n: w(n) }))
@@ -244,12 +364,15 @@ impl Collision {
     ///   it is not lower;
     /// * both: the character cannot stand deeper than 1.2 m below a liquid surface, `y` is reported at least 0.001 in rooms.
     pub fn closest(&self, p: V, hint: i32) -> Option<Closest> {
+        let room = self.rooms.as_ref().and_then(|_| self.room_at(p, hint));
         let (pos, normal) = if let Some(t) = &self.terrain {
             let (h, n) = t.at(p[0], -p[2])?;
             let mut out = ([p[0], h, p[2]], n);
             let dy = p[1] - h;
             if dy >= 0.0 {
-                if let Some((_, k)) = self.nearest(p, [p[0], p[1] - (dy + 0.3), p[2]], false) {
+                // `GetSurfaceForCell(GetCellIdFromPos(p))`: only the KD surface of the zone holding the point (first non-null of the cell)
+                let zone = zone::grid_zone(t.tm.cell_size, self.zone_size, t.tm.cells_x, t.tm.cells_z, p) as u32 + 1;
+                if let Some((_, k)) = self.nearest(p, [p[0], p[1] - (dy + 0.3), p[2]], false, zone) {
                     if k.p[1] > h {
                         out = (k.p, k.n);
                     }
@@ -258,15 +381,15 @@ impl Collision {
             out
         } else if self.rooms.is_none() {
             // `from_scene` fallback / synthetic geometry (no surface class): the nearest face within 100 m below the point
-            let (_, k) = self.nearest(p, [p[0], p[1] - 100.0, p[2]], true)?;
+            let (_, k) = self.nearest(p, [p[0], p[1] - 100.0, p[2]], true, 0)?;
             (k.p, k.n)
         } else {
-            let Some(room) = self.room_at(p, hint) else { return Some(Closest { pos: [p[0], 0.0, p[2]], normal: [0.0; 3], liquid: NO_LIQUID }) };
+            let Some(room) = room else { return Some(Closest { pos: [p[0], 0.0, p[2]], normal: [0.0; 3], liquid: NO_LIQUID }) };
             let (fy, fnorm) = self.tile_floor(room, p)?;
             // FUN_1002e48e: a KD miss answers y = 0, a room without KD surface leaves -1000
-            let kd = match self.nearest(p, [p[0], p[1] - 1.0, p[2]], false) {
+            let kd = match self.nearest(p, [p[0], p[1] - 1.0, p[2]], false, room as u32 + 1) {
                 Some((_, k)) => Some((k.p, k.n)),
-                None if self.tris.iter().any(|t| t.floor == 0) => Some(([p[0], 0.0, p[2]], [0.0, 1.0, 0.0])),
+                None if self.kd_zones.contains(&(room as u32 + 1)) => Some(([p[0], 0.0, p[2]], [0.0, 1.0, 0.0])),
                 None => None,
             };
             match kd {
@@ -275,7 +398,7 @@ impl Collision {
             }
         };
         let (mut pos, mut normal) = (pos, normal);
-        let liquid = self.liquid_at([pos[0], pos[1], pos[2]]);
+        let liquid = self.liquid_probe(pos, p[1], room);
         let level = liquid.map_or(NO_LIQUID, |l| l.level);
         if liquid.is_some() && pos[1] < level - super::WADE_DEPTH {
             pos[1] = level - super::WADE_DEPTH;
@@ -354,25 +477,30 @@ impl Collision {
         p[0] = frac(p[0]).clamp(0.1, 7999.9);
         p[2] = -frac(-p[2]).clamp(0.1, 7999.9);
         p[1] = p[1].clamp(0.01, 1999.9);
+        if st.parented {
+            return false;
+        }
         let cur = self.room_at(*p, st.room).map_or(-1, |i| i as i32);
         if cur == st.room {
             if cur == -1 {
-                *p = self.safe_pos(st);
+                *p = self.safe_pos();
                 return true;
             }
             st.last = *p;
             return false;
         }
         if !self.room_transition_allowed(st.room, cur) {
+            // back to the last allowed position, pushed `0.1 * R / 2` away from the wall: along `last - p` (normalised), from a
+            // standstill along the body's backwards vector (scene z is mirrored); a nudge that leaves every room goes the other way
             let to_last = sub(st.last, *p);
-            let dir = unit(to_last).unwrap_or([0.0; 3]);
-            // [GUESS] the radius is `dynel->vtbl[+0x10]()` (not resolved), the sweep radius stands in
-            *p = add(st.last, scale([dir[0] * 0.1, 0.0, dir[2] * 0.1], RADIUS / 2.0));
+            let dir = if is_zero(to_last) { [-st.heading.sin(), 0.0, st.heading.cos()] } else { norm(to_last) };
+            let nudge = scale([dir[0] * 0.1, 0.0, dir[2] * 0.1], st.radius / 2.0);
+            *p = add(st.last, nudge);
             if self.room_at(*p, -1).is_none() {
-                *p = st.last;
+                *p = sub(st.last, nudge);
             }
-            if self.room_at(*p, st.room).is_none() {
-                *p = self.safe_pos(st);
+            if self.room_at(*p, -1).is_none() {
+                *p = self.safe_pos();
             }
             return true;
         }
@@ -381,22 +509,21 @@ impl Collision {
         false
     }
 
-    /// `PlayfieldAnarchy_t::GetSafePos` (Gamecode @0x10121815: the position of room `playfield+0x44`, whose index is not
-    /// resolved): the last allowed position, else the origin of the first room.
-    fn safe_pos(&self, st: &SurfaceState) -> V {
-        if st.last != [0.0; 3] {
-            return st.last;
-        }
-        self.rooms.as_ref().and_then(|r| r.rooms.first()).map_or([0.0; 3], |(room, _)| [room.pos[0], room.pos[1], -room.pos[2]])
+    /// `PlayfieldAnarchy_t::GetSafePos` dungeon branch (Gamecode @0x10121815): the centre of room `playfield + 0x44`, the index copied by
+    /// `n3Playfield_t::CreatePlayfieldFromResource` (@0x1000e006) from the resource's `+0x4c`, which `RDBPlayfield_t` zeroes in its
+    /// constructor (@0x1001bf0e) and `ReadBlob` never writes: room 0. Not the last allowed position. See [`room_safe_pos`].
+    fn safe_pos(&self) -> V {
+        self.rooms.as_ref().and_then(|r| r.rooms.first().map(|(room, min_floor)| super::room_safe_pos(&r.gnda, room, *min_floor))).unwrap_or([0.0; 3])
     }
 
     /// `Vehicle_t::EnsureSurfaceAlignment` (Vehicle.dll @0x1000d1aa) for one integration step `old -> new` (feet positions):
     /// the veto retry loop, the sphere sweep ([`Collision::sweep`]), the closest-point clamp, the three ground rays and the
     /// grounded test with the step tolerance. Orientation mode 0 (the character: heading only, no body tilt).
     ///
-    /// Not ported (see docs): the liquid medium state machine of `Vehicle+0xfc` (wading / swimming callbacks, the feet
-    /// offsets of its modes 1-4 and `Vehicle+0x10c`), orientation modes 1/3/4, `Vehicle+0x13c` (steep slopes allowed, 0 for characters).
+    /// The liquid medium of `Vehicle+0xfc` is [`medium`]; its callbacks come back in `st.event`. Not ported (see docs):
+    /// orientation modes 1/3/4 (body tilt), `Vehicle+0x13c` (steep slopes allowed, 0 for characters).
     pub fn align(&self, old: V, new: V, body: &Body, st: &mut SurfaceState) -> Aligned {
+        st.event = None;
         let flag = if !body.falling_enabled || body.airborne || body.teleport { 1.0 } else { 0.0 };
         // veto loop: back off along the step in tenths until the position is accepted
         let mut cur = new;
@@ -431,8 +558,10 @@ impl Collision {
         let (x, z) = (c[0], c[2]);
         let mut feet = c[1] - super::RAY_LIFT;
         let cp = self.closest([x, feet, z], st.room).unwrap_or(Closest { pos: [0.0; 3], normal: [0.0; 3], liquid: NO_LIQUID });
-        if feet < cp.pos[1] + FOOT_CLEARANCE {
-            feet = cp.pos[1] + FOOT_CLEARANCE;
+        // mode 4 (hover) keeps 0.25 m (f64 @0x100127e8) instead of 0.01 over the closest point
+        let clearance = if st.medium == 4 { HOVER_CLEARANCE } else { FOOT_CLEARANCE };
+        if feet < cp.pos[1] + clearance {
+            feet = cp.pos[1] + clearance;
         }
         max_y = if body.teleport { feet + 1.0 } else { max_y.max(feet) };
         let mut tol = super::STEP_HEIGHT;
@@ -470,6 +599,15 @@ impl Collision {
             }
         } else {
             st.stuck = 0;
+        }
+        // the liquid medium state machine closes the step (`EnsureSurfaceAlignment` @0x1000dd8c..)
+        let (mut x, mut z) = (x, z);
+        match medium(st, body, feet, cp.liquid, cp.pos[1]) {
+            Some(f) => feet = f,
+            None => (x, feet, z) = (old[0], old[1], old[2]),
+        }
+        if feet < cp.liquid {
+            st.submersion = cp.liquid - feet;
         }
         let mut pos = [x, feet, z];
         self.veto(&mut pos, st);

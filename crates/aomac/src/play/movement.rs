@@ -12,9 +12,11 @@
 #![allow(dead_code)] // the full original action/stat surface; play/flow.rs consumes the parts it needs
 
 use ao_formats::character::Role;
-use ao_formats::playfield::collision::{Aligned, Body, SurfaceState, FOOT_CLEARANCE};
+use ao_formats::playfield::collision::{Aligned, Body, LiquidEvent, SurfaceState, FOOT_CLEARANCE};
 use ao_net::n3::action::SitInput;
 use ao_net::n3::{dynel::CharDCMove, outgoing::CharMove};
+
+mod fx;
 
 /// Terrain / collision queries in SERVER coordinates.
 pub trait World {
@@ -494,6 +496,8 @@ struct Ballistic {
 /// Stat ids written by the transition `Apply` functions (`SetStat`, `dynel+0xe8 -> vtbl[0x10]`).
 pub const STAT_REST_MODIFIER: u32 = 0x1A9;
 pub const STAT_WAIT_STATE: u32 = 0x1AE;
+/// MechData stat (0x296): cleared by the liquid-enter callback.
+pub const STAT_MECH_DATA: u32 = 0x296;
 /// `Flags` stat bits the stat hook turns into vehicle switches.
 const FLAG_NO_FALL: i32 = 0x2000_0000;
 const FLAG_NO_SURFACE: i32 = i32::MIN;
@@ -576,6 +580,8 @@ pub struct Movement {
     surface_collision: bool,
     /// Stats written locally by transition `Apply`s, handed to the stat holder by [`Movement::take_stat_writes`].
     stat_writes: Vec<(u32, i32)>,
+    /// Nano-effect state of the own character (Features counters, crowd-control state, vehicle class): `movement/fx.rs`.
+    fx: fx::Fx,
     outbox: Vec<CharMove>,
 }
 
@@ -651,6 +657,7 @@ impl Movement {
             follow: Vec::new(),
             surface_collision: true,
             stat_writes: Vec::new(),
+            fx: fx::Fx::default(),
             outbox: Vec::new(),
         };
         m.recalc();
@@ -895,7 +902,8 @@ impl Movement {
         self.vy = 0.0;
         self.airborne = false;
         self.launch_y = pos[1];
-        self.surface = SurfaceState::default();
+        // `Vehicle +0x120` (the liquid callback flag) survives a placement: the FSM mode (swimming) does too
+        self.surface = SurfaceState { in_liquid: self.surface.in_liquid, ..SurfaceState::default() };
         self.jump_ready = true;
         self.fsm = Fsm { last_speed_mode: self.fsm.last_speed_mode, mode: self.fsm.mode, ..Fsm::new() };
         self.in_fwd = 0.0;
@@ -979,6 +987,9 @@ impl Movement {
 
     /// `SetStat` from an `Apply`: also mirrored into [`Stats`] where the FSM reads it back.
     fn write_stat(&mut self, id: u32, v: i32) {
+        if id == STAT_MECH_DATA {
+            self.stats.mech_data = v;
+        }
         if id == STAT_WAIT_STATE {
             self.stats.wait_state = v;
         }
@@ -1009,6 +1020,7 @@ impl Movement {
         if running {
             let body = Body { falling_enabled: self.falling_enabled, airborne: self.airborne, vy: self.vy, teleport: false };
             self.pos = world.align(old, p, &body, &mut self.surface).pos;
+            self.liquid_callbacks();
             let d = (0..3).map(|i| (self.pos[i] - p[i]).powi(2)).sum::<f32>().sqrt();
             if d >= BALLISTIC_ABORT {
                 self.pos = old;
@@ -1373,6 +1385,7 @@ impl Movement {
                 if old.strafe != 1 {
                     self.in_strafe = 0.0;
                 }
+                self.write_rest(None, 0); // SetStat(WaitState, 0) [FUN_1006dd0c]
                 self.leave_fly(old);
                 self.in_elev = 0.0;
             }
@@ -1455,6 +1468,24 @@ impl Movement {
         self.dir = d;
     }
 
+    /// The liquid medium callbacks of the player vehicle that `EnsureSurfaceAlignment` fires through its vtable (`Vehicle +0x80` / `+0x84`,
+    /// `SurfaceState::event`): entering deep water (`FUN_1006f99e` [GC]) clears MechData (the dynel is a player: `dynel+0x21c == 0`) and
+    /// runs SwitchToSwimMode (0x1a); leaving it (`FUN_1006ef74`) runs LeaveSwimMode (0x23). Both go through the permission table.
+    fn liquid_callbacks(&mut self) {
+        match self.surface.event.take() {
+            Some(LiquidEvent::Enter) => {
+                if self.stats.mech_data != 0 {
+                    self.write_stat(STAT_MECH_DATA, 0);
+                }
+                self.transition(id::SWITCH_SWIM);
+            }
+            Some(LiquidEvent::Leave) => {
+                self.transition(id::LEAVE_SWIM);
+            }
+            None => {}
+        }
+    }
+
     /// One `Vehicle_t` sub-step (`FUN_1000e3d3` loop body) followed by `EnsureSurfaceAlignment`.
     fn step(&mut self, h: f32, world: &dyn World) {
         let old = self.pos;
@@ -1526,8 +1557,8 @@ impl Movement {
 
     /// `Vehicle_t::EnsureSurfaceAlignment` through [`World::align`] (wall sweep, ground following, support test with the step
     /// tolerance `0.48 + 1.1547 * step length`), then the fall bookkeeping of the original: nothing carries a walking body ->
-    /// `FUN_1000a1a7` starts a fall, ground under a falling body -> `LandNow`. The liquid medium transitions (`Vehicle +0xfc`)
-    /// are not ported (see docs/zone/collision.md).
+    /// `FUN_1000a1a7` starts a fall, ground under a falling body -> `LandNow`. The liquid medium (`Vehicle +0xfc`, wading / swimming)
+    /// runs inside the world's `align`; its callbacks come back as [`Movement::liquid_callbacks`].
     fn align(&mut self, old: [f32; 3], world: &dyn World) {
         if !self.surface_collision {
             self.airborne = false;
@@ -1537,6 +1568,7 @@ impl Movement {
         let body = Body { falling_enabled: self.falling_enabled, airborne: self.airborne, vy: self.vy, teleport: false };
         let r = world.align(old, self.pos, &body, &mut self.surface);
         self.pos = r.pos;
+        self.liquid_callbacks();
         if !self.falling_enabled {
             return;
         }

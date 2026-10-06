@@ -114,7 +114,9 @@ fn collision_vehicle_walks_the_newbie_plain() {
                 airborne += usize::from(w.airborne);
                 if !w.airborne {
                     let ground = c.ground(w.pos).unwrap();
-                    assert!((w.pos[1] - ground - 0.01).abs() < 0.2, "feet {:?} ground {ground}", w.pos);
+                    // deep water floats the feet 1 cm under the surface (liquid medium state machine), else they follow the ground
+                    let want = if st.in_liquid { w.liquid - 0.01 } else { ground + 0.01 };
+                    assert!((w.pos[1] - want).abs() < 0.2, "feet {:?} ground {ground} liquid {} swimming {}", w.pos, w.liquid, st.in_liquid);
                 }
                 far += usize::from((w.pos[0] - p[0] - 0.1).abs() < 1e-3);
                 p = w.pos;
@@ -161,6 +163,51 @@ fn collision_arrival_hall_rooms_and_doors() {
         c.set_door_passable(b, a, true);
         assert!(c.room_transition_allowed(a as i32, b as i32));
     }
+}
+
+/// The camera's `IsDoorOpenBetweenRooms` flag (`ChangeRoomStatus`): links start closed, only real links change, independent of `Door_t::CanPass`.
+#[test]
+fn collision_door_open_flag_of_a_real_link() {
+    let Some((store, _)) = setup() else { return };
+    let mut c = Collision::load(&store, 6131).unwrap(); // ICC Holodeck Alien Training: one link
+    let (a, b) = c.room_links()[0];
+    let (au, bu) = (a as usize, b as usize);
+    assert!(!c.door_open_between(au, bu) && !c.door_open_between(bu, au));
+    c.set_door_open(b, a, true);
+    assert!(c.door_open_between(au, bu) && c.door_open_between(bu, au));
+    assert!(c.room_transition_allowed(a as i32, b as i32), "the pass check is a different state");
+    c.set_door_open(a, a, true);
+    c.set_door_open(a, 0xffff, true);
+    assert!(!c.door_open_between(au, au));
+    c.set_door_open(a, b, false);
+    assert!(!c.door_open_between(au, bu));
+    // a pair without a link cannot be opened
+    let free = (0..64u16).find(|&r| r != a && !c.room_links().contains(&(a.min(r), a.max(r)))).unwrap();
+    c.set_door_open(a, free, true);
+    assert!(!c.door_open_between(au, free as usize));
+}
+
+/// `GetDoorLinkFromPos`: scanning the plane around the spawn finds exactly the playfield's door links, each door once per room
+/// entry, and nothing far from every door.
+#[test]
+fn collision_door_links_are_found_by_door_position() {
+    let Some((store, dir)) = setup() else { return };
+    let c = Collision::load(&store, 6131).unwrap(); // ICC Holodeck Alien Training
+    let s = load_playfield(&store, &dir, 6131).unwrap().spawn.unwrap();
+    let mut found = std::collections::BTreeSet::new();
+    let mut hits = 0;
+    for x in -300..=300 {
+        for z in -300..=300 {
+            if let Some((a, b)) = c.door_link_from_pos([s[0] + x as f32, s[1], s[2] + z as f32]) {
+                found.insert((a.min(b), a.max(b)));
+                hits += 1;
+            }
+        }
+    }
+    eprintln!("6131 door links found {found:?} ({hits} lattice hits), links {:?}", c.room_links());
+    let links: std::collections::BTreeSet<_> = c.room_links().into_iter().collect();
+    assert!(!found.is_empty() && found.is_subset(&links), "found {found:?} links {links:?}");
+    assert!(hits < 600 * 600 / 50, "doors are small: {hits} of the lattice points match");
 }
 
 #[test]
@@ -218,6 +265,35 @@ fn collision_kd_versions_and_liquids() {
     let _ = found; // the city may have no liquid polygon: only the query must be well defined
 }
 
+/// `Collision::in_teleportal` (`n3Zone_t::IsPosInTeleportal`) on real portals: the centroid of every teleportal polygon of an outdoor
+/// playfield (4001) and a dungeon (4310) lies in it (at the polygon's own height), a point off the polygon's bounds does not, and the
+/// plain spawn is no portal. The survey of every record: `cargo run --release -p ao-formats --example portal_survey`.
+#[test]
+fn collision_teleportal_of_real_polygons() {
+    let Some((store, dir)) = setup() else { return };
+    for pf in [4001u32, 4310] {
+        let c = Collision::load(&store, pf).unwrap();
+        let (mut seen, mut hit) = (0, 0);
+        for zone in 0..4096u32 {
+            let Some((v, d)) = store.get_versioned(kd::SURFACE_TYPE, pf << 16 | zone).unwrap() else { continue };
+            let s = kd::parse(v, &d).unwrap();
+            if s.portal.len() < 3 {
+                continue;
+            }
+            seen += 1;
+            let n = s.portal.len() as f32;
+            let mid = s.portal.iter().fold([0.0f32; 3], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n, a[2] + p[2] / n]);
+            // scene space mirrors z; a zone whose polygon is another zone's replica answers through its own zone
+            hit += usize::from(c.in_teleportal([mid[0], mid[1], -mid[2]]));
+            let far = [s.portal.iter().map(|p| p[0]).fold(f32::MIN, f32::max) + 50.0, mid[1], -mid[2]];
+            assert!(!c.in_teleportal(far), "pf {pf} zone {zone}: a point right of the polygon is no portal");
+        }
+        assert!(seen > 0 && hit * 2 >= seen, "pf {pf}: {hit} of {seen} portal centroids are inside");
+    }
+    let spawn = load_playfield(&store, &dir, 4582).unwrap().spawn.unwrap();
+    assert!(!Collision::load(&store, 4582).unwrap().in_teleportal(spawn), "Newland City has no teleportal polygon");
+}
+
 /// Survey of every collision record of the client: all decode with their markers (`cargo test --release -p ao-formats
 /// collision_survey -- --ignored`, about 15 s).
 #[test]
@@ -232,4 +308,33 @@ fn collision_survey_all_records_decode() {
         ok += 1;
     }
     assert!(ok > 200_000 && tris > 40_000_000, "{ok} records, {tris} triangles");
+}
+
+/// Dungeon liquids of the room records (`n3Room_t` reader N3 @0x10012803): playfield 120 has a room liquid of kind 2 at local
+/// y 5.0 (room pos y 0.395); a character standing on the floor in it is wading, the closest point never lies deeper than 1.2 m
+/// below the surface, and a point outside every room has no liquid.
+#[test]
+fn collision_room_liquids_are_found_in_dungeons() {
+    let Some((store, _)) = setup() else { return };
+    let c = Collision::load(&store, 120).unwrap();
+    let mut found = None;
+    'scan: for x in (0..400).step_by(2) {
+        for z in (0..500).step_by(2) {
+            for y in [1.0f32, 6.0, 10.0, 20.0] {
+                let p = [x as f32, y, -(z as f32)];
+                if c.room_of(p).is_none() {
+                    continue;
+                }
+                let cp = c.closest(p, -1).unwrap();
+                if cp.liquid > -9000.0 {
+                    found = Some((p, cp));
+                    break 'scan;
+                }
+            }
+        }
+    }
+    let (p, cp) = found.expect("a room liquid of playfield 120 is reachable");
+    assert!(cp.liquid > cp.pos[1] - 40.0 && cp.pos[1] >= cp.liquid - 1.2 - 1e-3, "{p:?} {cp:?}");
+    assert_eq!(c.liquid_at(cp.pos).map(|l| l.level), Some(cp.liquid));
+    assert!(c.liquid_at([p[0], p[1] + 5000.0, p[2]]).is_none(), "outside every room");
 }

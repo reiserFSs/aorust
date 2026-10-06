@@ -20,12 +20,13 @@ use ao_scene::{Scene, IDENTITY};
 
 use super::dungeon::{floor_min, parse_gnda, Gnda};
 use super::record::{self, Rd, Room};
-use super::zone::room_contains;
+use super::zone::{self, room_contains};
 use super::{ground, water, RECORD, TILEMAP};
 
 pub mod kd;
+mod portal;
 mod vehicle;
-pub use vehicle::{Aligned, Body, Closest, Hit, SurfaceState, FOOT_CLEARANCE, RADIUS};
+pub use vehicle::{Aligned, Body, Closest, Hit, LiquidEvent, SurfaceState, FOOT_CLEARANCE, RADIUS, SWIM_DEPTH};
 
 /// A surface triangle is walkable ground when its normal's y is at least this (Vehicle.dll `EnsureSurfaceAlignment`
 /// @0x1000d1aa, f32 @0x10012134, found by the `Avatar.Movement` RE); steeper faces are walls.
@@ -67,6 +68,9 @@ struct Tri {
     n: [f32; 3],
     /// Dungeon tile floor of room `floor - 1` (0: a KD volume triangle).
     floor: u16,
+    /// KD volume triangle of zone / room `zone - 1` (`CellSurface_t::SetSurfaceForCell`, rdb 1000013 `playfield << 16 | index`);
+    /// 0 = not part of a zone surface (terrain cells, scene fallback geometry, synthetic test geometry: always considered).
+    zone: u32,
 }
 
 /// Heightfield of an outdoor playfield (`n3TilemapSurface_t`).
@@ -86,6 +90,11 @@ pub struct Collision {
     terrain: Option<Terrain>,
     rooms: Option<Rooms>,
     liquids: Vec<(Tri, u32)>,
+    /// Teleportal polygons by zone and the zone grid size (`PlayfieldRecord::zone_size`), for [`Collision::in_teleportal`].
+    portals: portal::Portals,
+    zone_size: usize,
+    /// Zones / rooms that own a KD surface record (`tri.zone` tags), also those without triangles.
+    kd_zones: HashSet<u32>,
 }
 
 /// Dungeon rooms with the tilemap: a position is only valid inside one (`n3RoomSurface_t::VetoPosition` @0x10015587).
@@ -98,6 +107,9 @@ struct Rooms {
     links: HashSet<(u16, u16)>,
     /// Links whose `Door_t` does not let the character pass (`FUN_1007f74d` false); empty = every door passable.
     blocked: HashSet<(u16, u16)>,
+    /// Links whose door is open: the flag byte of the room link map entry (`n3Playfield_t::ChangeRoomStatus` @0x1000d17e, set by
+    /// `DoorOpened` / `DoorClosed`; entries start closed). Separate from `blocked`: this is what `IsDoorOpenBetweenRooms` reads.
+    open: HashSet<(u16, u16)>,
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -123,7 +135,7 @@ fn unit(v: [f32; 3]) -> Option<[f32; 3]> {
 impl Tri {
     /// Scene-space triangle with an explicit unit normal.
     fn with_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3], n: [f32; 3]) -> Option<Tri> {
-        Some(Tri { a, b, c, n: unit(n)?, floor: 0 })
+        Some(Tri { a, b, c, n: unit(n)?, floor: 0, zone: 0 })
     }
     /// AO world triangle (left handed, outward normal `(b-a) x (c-a)`, see `kd`) mirrored into scene space.
     fn from_world(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Option<Tri> {
@@ -279,7 +291,7 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, origin: lo, dims, cell, start, items, big, terrain, rooms, liquids }
+        Collision { tris, origin: lo, dims, cell, start, items, big, terrain, rooms, liquids, portals: portal::Portals::default(), zone_size: 1, kd_zones: HashSet::new() }
     }
 
     /// Collision of the loaded scene's identity-placed meshes (terrain, room shells): the documented fallback when the
@@ -323,14 +335,21 @@ impl Collision {
                     links.insert(((i as u16).min(z), (i as u16).max(z)));
                 }
             }
-            rooms = Some(Rooms { gnda: Box::new(g), rooms: list, links, blocked: HashSet::new() });
+            rooms = Some(Rooms { gnda: Box::new(g), rooms: list, links, blocked: HashSet::new(), open: HashSet::new() });
         }
+        let mut portals = portal::Portals::default();
+        let mut kd_zones = HashSet::new();
         for zone in 0..rec.count {
             let Some((version, data)) = store.get_versioned(kd::SURFACE_TYPE, id << 16 | zone)? else { continue };
-            let s = kd::parse(version, &data).with_context(|| format!("collision surface {id}:{zone}"))?;
+            let mut s = kd::parse(version, &data).with_context(|| format!("collision surface {id}:{zone}"))?;
+            if !s.portal.is_empty() {
+                portals.zones.insert(zone, std::mem::take(&mut s.portal));
+            }
+            kd_zones.insert(zone + 1);
             for v in &s.volumes {
                 for t in &v.tris {
-                    if let Some(tri) = Tri::from_world(v.verts[t[0] as usize], v.verts[t[1] as usize], v.verts[t[2] as usize]) {
+                    if let Some(mut tri) = Tri::from_world(v.verts[t[0] as usize], v.verts[t[1] as usize], v.verts[t[2] as usize]) {
+                        tri.zone = zone + 1;
                         tris.push(tri);
                     }
                 }
@@ -346,7 +365,24 @@ impl Collision {
                 }
             }
         }
-        Ok(Collision::build(tris, terrain, rooms, liquids))
+        // room liquids (`n3Room_t` reader N3 @0x10012803 -> `n3Zone_t::AddLiquidCollisionData` @0x1001a9c5): room-local
+        // vertices, never rotated; the collision data skips sloped (odd) kinds (`FUN_1000b0d1`: `if (kind & 1) return`).
+        for (i, room) in rec.rooms.iter().enumerate() {
+            for w in room.waters.iter().filter(|w| w.kind & 1 == 0) {
+                for t in &w.tris {
+                    let p = t.map(|i| add_v(w.verts[i as usize], room.pos));
+                    if let Some(mut tri) = Tri::from_world(p[0], p[1], p[2]) {
+                        tri.floor = i as u16 + 1;
+                        liquids.push((tri, w.kind));
+                    }
+                }
+            }
+        }
+        let mut c = Collision::build(tris, terrain, rooms, liquids);
+        c.portals = portals;
+        c.kd_zones = kd_zones;
+        c.zone_size = rec.zone_size.max(1) as usize;
+        Ok(c)
     }
 
     /// Number of grid triangles (KD volumes, dungeon floors); the heightfield is analytic.
@@ -398,13 +434,42 @@ impl Collision {
         self.closest(p, -1).map(|c| c.pos[1])
     }
 
-    /// Liquid covering `(p.x, p.z)` whose surface is at or above `p.y` (the point is submerged), highest surface first.
+    /// Liquid at the ground point `p` (`liquid_probe` with the point itself as the probed height).
     pub fn liquid_at(&self, p: [f32; 3]) -> Option<Liquid> {
+        self.liquid_probe(p, p[1], self.rooms.as_ref().and_then(|_| self.room_at(p, -1)))
+    }
+
+    /// Liquid test of a closest-point query: `ground` is the closest point found, `y` the queried height, `room` the dungeon room.
+    ///
+    /// * dungeon (`n3Zone_t::PerformLiquidCollisionTest` @0x1001a80c, `FUN_1000b498`; the room's own list only): the **first**
+    ///   triangle whose xz projection holds the point, with `ground.y <` the triangle's top and a plane height above the room origin
+    ///   `> 0`, decides; it counts when `level - depth < y` with `depth = (kind >> 5) / 10` m (`kind >> 5 == 0`: 100 000 m, the
+    ///   `n3WaterData_t` kind keeps the liquid type in bits 0..4, `FUN_1000b0d1`);
+    /// * outdoors: the highest surface at or above `ground.y` ([GUESS]: the zone's `VisualWaterInfo_t` list is walked in its own
+    ///   order by `WaterCollisionInfo_t::PerformCollisionTest` @DisplaySystem 0x10039d3c, same test as the room one; where those
+    ///   objects are built from the outdoor polygons was not traced).
+    fn liquid_probe(&self, ground: [f32; 3], y: f32, room: Option<usize>) -> Option<Liquid> {
+        if let Some(r) = &self.rooms {
+            let tag = room? as u16 + 1;
+            let oy = r.rooms[tag as usize - 1].0.pos[1];
+            for (t, kind) in self.liquids.iter().filter(|(t, _)| t.floor == tag) {
+                let top = t.a[1].max(t.b[1]).max(t.c[1]);
+                if t.n[1].abs() > 1e-6 && ground[1] < top && t.contains_xz(ground[0], ground[2]) {
+                    let level = t.y_at(ground[0], ground[2]);
+                    if level - oy <= 0.0 {
+                        continue;
+                    }
+                    let depth = if kind >> 5 == 0 { 100_000.0 } else { (kind >> 5) as f32 / 10.0 };
+                    return (level - depth < y).then_some(Liquid { level, kind: *kind });
+                }
+            }
+            return None;
+        }
         let mut best: Option<Liquid> = None;
         for (t, kind) in &self.liquids {
-            if t.n[1].abs() > 1e-6 && t.contains_xz(p[0], p[2]) {
-                let level = t.y_at(p[0], p[2]);
-                if level >= p[1] && best.is_none_or(|b| level > b.level) {
+            if t.n[1].abs() > 1e-6 && t.contains_xz(ground[0], ground[2]) {
+                let level = t.y_at(ground[0], ground[2]);
+                if level >= ground[1] && best.is_none_or(|b| level > b.level) {
                     best = Some(Liquid { level, kind: *kind });
                 }
             }
@@ -458,6 +523,18 @@ impl Collision {
         self.room_at(p, -1)
     }
 
+    /// `n3Zone_t::IsPosInTeleportal` [N3 0x1001a86a] for a scene-space position (feet; the client passes `Vehicle_t::GetGlobalPos`): the
+    /// polygon of the zone holding the point (`GetZoneInstance`: the zone grid outdoors, `PosToRoom` or 0 in a dungeon) contains its
+    /// x/z. Zones without a portal never answer. [`Collision::from_scene`] has none.
+    pub fn in_teleportal(&self, p: [f32; 3]) -> bool {
+        let zone = match (&self.terrain, &self.rooms) {
+            (Some(t), _) => zone::grid_zone(t.tm.cell_size, self.zone_size, t.tm.cells_x, t.tm.cells_z, p),
+            (None, Some(_)) => self.room_at(p, -1).unwrap_or(0),
+            (None, None) => return false,
+        };
+        self.portals.contains(zone as u32, [p[0], p[1], -p[2]])
+    }
+
     /// Dungeon: the door links `(a, b)`, `a < b`, sorted.
     pub fn room_links(&self) -> Vec<(u16, u16)> {
         let mut v: Vec<_> = self.rooms.iter().flat_map(|r| r.links.iter().copied()).collect();
@@ -477,6 +554,70 @@ impl Collision {
                 r.blocked.insert(k);
             }
         }
+    }
+
+    /// `n3Playfield_t::DoorOpened` / `DoorClosed` (vtable +0x3c / +0x40, @0x1000d2bf / @0x1000d2e8) -> `ChangeRoomStatus`
+    /// @0x1000d17e: sets the open flag of the link joining rooms `a` and `b` (nothing for a pair without a link, equal rooms or
+    /// `0xffff`). Every link starts closed.
+    pub fn set_door_open(&mut self, a: u16, b: u16, open: bool) {
+        if let Some(r) = &mut self.rooms {
+            let k = (a.min(b), a.max(b));
+            if a != b && a != 0xffff && b != 0xffff && r.links.contains(&k) {
+                if open {
+                    r.open.insert(k);
+                } else {
+                    r.open.remove(&k);
+                }
+            }
+        }
+    }
+
+    /// `n3Playfield_t::IsDoorOpenBetweenRooms` @0x1000d1e9: the link's flag is 1 (`-1` rooms and unlinked pairs: closed).
+    pub fn door_open_between(&self, a: usize, b: usize) -> bool {
+        let (a, b) = (a.min(b), a.max(b));
+        self.rooms.as_ref().is_some_and(|r| r.open.contains(&(a as u16, b as u16)))
+    }
+
+    /// `n3Playfield_t::PosToRoom(p, hint)` @0x1000c8aa for a scene position: the `hint` room first when it holds `p`, else the
+    /// first room that does. `None` outdoors and outside every room.
+    pub fn pos_to_room(&self, p: [f32; 3], hint: Option<usize>) -> Option<usize> {
+        self.room_at(p, hint.map_or(-1, |h| h as i32))
+    }
+
+    /// The door link whose door stands within 1.2 m (x and z, a box) of the scene position `p`: `n3Room_t::GetDoorLinkFromPos`
+    /// @0x100105f9 asked of every room in order (`Door_t::LinkDoorToRooms`), result `(room, connected room)` of the first match
+    /// (feed it to [`Collision::set_door_open`] / [`Collision::set_door_passable`]). A door entry's `tile << 2 | orientation`
+    /// word gives the tile of the room's rectangle (row length `x2 - x1`); the door sits on that tile's edge `orientation`
+    /// (0: +z, 1: +x, 2: -z, 3: -x, 0.99 m off the tile centre, f64 @0x1003d368), room-local with the room's centre as origin
+    /// (`dungeon::room_origin`), turned `rot` quarter turns about +Y and moved by the room position. `None` outdoors / no door.
+    pub fn door_link_from_pos(&self, p: [f32; 3]) -> Option<(u16, u16)> {
+        const NUDGE: f32 = 0.99;
+        const TOLERANCE: f32 = 1.2;
+        let r = self.rooms.as_ref()?;
+        let (px, pz) = (p[0], -p[2]); // AO world
+        for (i, (room, _)) in r.rooms.iter().enumerate() {
+            let (w, h) = (room.rect[2].saturating_sub(room.rect[0]) as i32, room.rect[3].saturating_sub(room.rect[1]) as i32);
+            if w == 0 {
+                continue;
+            }
+            let half = |n: i32| (((n - 1) & !1) + 1) as f32 * 0.5 * r.gnda.cell;
+            let (c, s) = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)][room.rot as usize & 3];
+            for (&zone, &word) in room.door_zones.iter().zip(&room.door_tiles) {
+                let tile = (word >> 2) as i32;
+                let (mut x, mut z) = ((tile % w) as f32 * r.gnda.cell - half(w), (tile / w) as f32 * r.gnda.cell - half(h));
+                match word & 3 {
+                    0 => z += NUDGE,
+                    1 => x += NUDGE,
+                    2 => z -= NUDGE,
+                    _ => x -= NUDGE,
+                }
+                let (gx, gz) = (room.pos[0] + x * c + z * s, room.pos[2] - x * s + z * c);
+                if (px - TOLERANCE..px + TOLERANCE).contains(&gx) && (pz - TOLERANCE..pz + TOLERANCE).contains(&gz) {
+                    return Some((i as u16, zone));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -527,6 +668,34 @@ fn room_floor(g: &super::dungeon::Gnda, room: &Room, id: u16, out: &mut Vec<Tri>
             }
         }
     }
+}
+
+/// `PlayfieldAnarchy_t::GetSafePos` for a room (Gamecode @0x10121815): the room centre with `y` forced to the highest of the four tile
+/// corner heights (`n3Room_t::ForcePosInY` @0x100112cb) when the centre tile is walkable, else the centre of the first walkable tile
+/// (x outer, z inner, `GetAPosInRoom` @0x100111a0; its height uses the same corner rule: [GUESS], `GetTileCenterGlobalPos` not decoded).
+fn room_safe_pos(g: &Gnda, room: &Room, min_floor: f32) -> [f32; 3] {
+    let [x1, z1, x2, z2] = room.rect.map(|v| v as i32);
+    let (wp, hp) = ((((x2 - x1 - 1) & !1) + 1), (((z2 - z1 - 1) & !1) + 1));
+    let h = |x: i32, z: i32| {
+        let (x, z) = (x.max(0).min(g.w as i32 - 1) as usize, z.max(0).min(g.h as i32 - 1) as usize);
+        g.floor[z * g.w + x] as f32 * g.height_scale - min_floor + room.pos[1]
+    };
+    let walkable = |tx: i32, tz: i32| tx >= 0 && tz >= 0 && (tx as usize) < g.w && (tz as usize) < g.h && g.ty[tz as usize * g.w + tx as usize] & 0x7f != 0;
+    let top = |tx: i32, tz: i32| h(tx, tz).max(h(tx - 1, tz)).max(h(tx - 1, tz - 1)).max(h(tx, tz - 1));
+    let (c, s) = [(1.0f32, 0.0f32), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)][(room.rot & 3) as usize];
+    let (ctx, ctz) = ((x1 * 2 + wp + 1).div_euclid(2), (z1 * 2 + hp + 1).div_euclid(2));
+    if walkable(ctx, ctz) {
+        return [room.pos[0], top(ctx, ctz), -room.pos[2]];
+    }
+    for tx in x1..x2 {
+        for tz in z1..z2 {
+            if walkable(tx, tz) {
+                let (dx, dz) = (tx as f32 * 2.0 + 1.0 - x1 as f32 * 2.0 - (wp + 1) as f32, tz as f32 * 2.0 + 1.0 - z1 as f32 * 2.0 - (hp + 1) as f32);
+                return [room.pos[0] + dx * c + dz * s, top(tx, tz), -(room.pos[2] - dx * s + dz * c)];
+            }
+        }
+    }
+    [room.pos[0], room.pos[1], -room.pos[2]]
 }
 
 #[cfg(test)]
@@ -677,5 +846,62 @@ mod tests {
         assert_eq!(t.closest([2.0, 0.0, 0.0]), [1.0, 0.0, 0.0]);
         let e = t.closest([1.0, 1.0, 0.0]);
         assert!((e[0] - 0.5).abs() < 1e-6 && (e[1] - 0.5).abs() < 1e-6);
+    }
+
+    /// Liquid medium state machine (`EnsureSurfaceAlignment` tail): wading follows the ground, deep water floats the feet 1 cm under
+    /// the surface and fires the callbacks once, leaving fires the other one; the refusing / hover modes of `Vehicle+0xfc`.
+    #[test]
+    fn liquid_medium_modes() {
+        use super::vehicle::medium;
+        let body = Body::WALKING;
+        let mut st = SurfaceState::default();
+        // shallow (0.5 m over the ground): feet stand on the ground, no callback
+        assert_eq!(medium(&mut st, &body, 0.2, 1.0, 0.5), Some(0.51));
+        assert!(st.event.is_none() && !st.in_liquid);
+        // deep (ground 2 m under the surface, the closest point stops at 1.2 m): feet float 1 cm under the surface, Enter once
+        assert_eq!(medium(&mut st, &body, -0.19, 1.0, -0.2), Some(0.99));
+        assert_eq!((st.event.take(), st.in_liquid), (Some(LiquidEvent::Enter), true));
+        assert_eq!(medium(&mut st, &body, 0.99, 1.0, -0.2), Some(0.99));
+        assert!(st.event.is_none(), "still swimming");
+        // back to shallow water: Leave, feet on the ground again
+        assert_eq!(medium(&mut st, &body, 0.3, 1.0, 0.5), Some(0.51));
+        assert_eq!((st.event.take(), st.in_liquid), (Some(LiquidEvent::Leave), false));
+        // out of the water (feet >= level + 0.1): nothing, the submersion marker is cleared
+        st.submersion = 0.5;
+        assert_eq!(medium(&mut st, &body, 1.2, 1.0, 0.5), Some(1.2));
+        assert_eq!(st.submersion, -9999.0);
+        // without falling the enter callback never fires
+        let flying = Body { falling_enabled: false, ..body };
+        assert_eq!(medium(&mut st, &flying, 0.0, 1.0, -0.2), Some(0.99));
+        assert!(st.event.is_none() && !st.in_liquid);
+        // mode 1 refuses deep water (the step is undone), shallow water and dry land pass
+        let mut st1 = SurfaceState { medium: 1, ..SurfaceState::default() };
+        assert_eq!(medium(&mut st1, &body, 0.0, 1.0, -0.2), None);
+        assert_eq!(medium(&mut st1, &body, 0.2, 1.0, 0.5), Some(0.2));
+        assert_eq!(medium(&mut st1, &body, 2.0, 1.0, -0.2), Some(2.0));
+        // mode 3 only allows deep water, held at most 0.1 m under the surface; mode 4 hovers 0.25 m above it
+        let mut st3 = SurfaceState { medium: 3, ..SurfaceState::default() };
+        assert_eq!(medium(&mut st3, &body, 2.0, 1.0, -0.2), Some(0.9));
+        assert_eq!(medium(&mut st3, &body, 0.0, 1.0, 0.95), None);
+        let mut st4 = SurfaceState { medium: 4, ..SurfaceState::default() };
+        assert_eq!(medium(&mut st4, &body, 0.0, 1.0, -0.2), Some(1.25));
+        // mode 2: callbacks only, the feet are never moved
+        let mut st2 = SurfaceState { medium: 2, ..SurfaceState::default() };
+        assert_eq!(medium(&mut st2, &body, 0.0, 1.0, -0.2), Some(0.0));
+        assert_eq!(st2.event.take(), Some(LiquidEvent::Enter));
+    }
+
+    /// A step into a deep pool through `align`: the character ends up floating, the event is reported once.
+    #[test]
+    fn align_floats_in_deep_water() {
+        let pool = vec![(Tri::with_normal([-20.0, 13.0, -20.0], [-20.0, 13.0, 20.0], [20.0, 13.0, 20.0], [0.0, 1.0, 0.0]).unwrap(), 0)];
+        let c = Collision::build(quad(10.0, -20.0, 20.0, -20.0, 20.0), None, None, pool);
+        let mut st = SurfaceState::default();
+        let a = c.align([0.0, 10.1, 5.0], [0.5, 10.1, 5.0], &Body::WALKING, &mut st);
+        assert!((a.pos[1] - 12.99).abs() < 1e-4 && a.liquid == 13.0, "{a:?}");
+        assert_eq!(st.event, Some(LiquidEvent::Enter));
+        assert!((st.submersion - 0.01).abs() < 1e-5, "{}", st.submersion);
+        let b = c.align(a.pos, [1.0, a.pos[1], 5.0], &Body::WALKING, &mut st);
+        assert!(st.event.is_none() && (b.pos[1] - 12.99).abs() < 1e-4, "{b:?}");
     }
 }

@@ -137,7 +137,8 @@ wall. The rule for a character: the rooms must be joined by a door link (`n3Room
 entry of the room record; the link map is built in `n3Playfield_t::InitializeSpace`, key `(min, max)`), directly or through one intermediate room; every
 registered `Door_t` on the way must satisfy `Door_t::CanPass` (Gamecode `FUN_1007f74d`: feature bit 0x80 / `FUN_1007f58e`); a link without a registered door
 is free; `to == -1` is always refused. Ported: `Collision::veto`, `room_transition_allowed`, `set_door_passable` (the `Door_t` state is the caller's:
-nothing calls it yet). **[DATA]** 4604 has three rooms but no door entries at all; the whole hall, corridor and shuttle tunnel are room 2.
+nothing calls it yet). The camera's attractor test reads a **different** flag, the link entry's open byte (`IsDoorOpenBetweenRooms` @0x1000d1e9, set by `DoorOpened`/`DoorClosed` @0x1000d2bf/@0x1000d2e8 →
+`ChangeRoomStatus` @0x1000d17e; entries start closed): `Collision::set_door_open` / `door_open_between` / `pos_to_room` (docs/zone/camera.md §7). **[DATA]** 4604 has three rooms but no door entries at all; the whole hall, corridor and shuttle tunnel are room 2.
 
 ### 3.4 `Vehicle_t::EnsureSurfaceAlignment` (Vehicle.dll @0x1000d1aa) and its sweep `FUN_1000b2e5` (@0x1000b2e5)
 Port: `collision/vehicle.rs` (`Collision::align`, `sweep`, `line`, `closest`, `veto`). Vehicle.dll was imported into a private Ghidra project;
@@ -185,22 +186,25 @@ Sliding up a single steep plane is therefore possible for one step, but the body
   (tests, autopilot). `Body::WALKING`, `RADIUS = 0.4`, `FOOT_CLEARANCE = 0.01`.
 * `line(a, b) -> Option<Hit{p, n}>` (`GetLineIntersection`), `closest(feet, room_hint)`, `veto(&mut p, &mut SurfaceState) -> bool`, `ground(feet) -> Option<f32>` (= closest point
   height; replaces the "highest surface at or below" query, the KD ray is limited to terrain delta + 0.3 m outdoors and 1 m in dungeons, dungeon tile floors are cast from the plane),
-  `liquid_at`, `inside`, `room_of`, `room_links`, `room_transition_allowed`, `set_door_passable`, `sphere_hit` (camera boom only), `triangle_count`.
+  `liquid_at`, `inside`, `room_of`, `pos_to_room`, `room_links`, `room_transition_allowed`, `set_door_passable`, `set_door_open`, `door_open_between`, `sphere_hit` (camera boom only), `triangle_count`,
+  `in_teleportal(scene_pos)` (`n3Zone_t::IsPosInTeleportal` N3 0x1001a86a: the portal polygon of the zone holding the point, x/z parity test `FUN_1001b21a`, see docs/zone/world.md §10.2).
 * `kd::parse(version, bytes) -> Surface{volumes, nodes, portal, portal_dest}`: the decoder of section 2.
 * Removed with the cutover: `support`, `wading_ground`, `slide(from, to, radius, height)` (capsule push-out). `MIN_FLOOR_NY` (0.5), `STEP_HEIGHT` (0.48, the base tolerance), `RAY_LIFT` (0.4), `WADE_DEPTH` (1.2).
 
 ## 5. Deviations / unresolved
 
-* Dungeon `line` uses exact triangle tests; the client marches the clipped segment in 1 m steps over tile triangles and falls back to `CalculateClosestPoint(end)` when the end lies under the floor. Same
-  result unless the floor is missing under the end point.
-* `closest` outdoors asks the KD triangles of all zones; the client asks only the first KD surface of the position's cell (`GetSurfaceForCell`). KD miss: the client writes y = 0, which can
-  never beat the terrain (heights are unsigned) so it is not reproduced. Dungeon KD miss with a KD surface present writes y = 0 and loses against any floor above 0.
-* Not ported: the liquid medium state machine of `Vehicle+0xfc` (wading/swimming callbacks, feet offsets of its modes, `Vehicle+0x10c`), orientation modes 1/3/4 (extra rays, body tilt,
-  blended up vector `Vehicle+0x12c`), `Vehicle+0x13c`. Room liquids (dungeon record) are still skipped by `record.rs` (`liquid_at` knows outdoor polygons only): **gap**.
-* `VetoRoomTransition`: the nudge radius (`dynel->vtbl[+0x10]()`) is unresolved (0.4 used); `GetSafePos` room index (`playfield+0x44`) unresolved (last allowed position, else room 0). The `Door_t` state
-  is not fed by any caller (every link passable). The tile-word diagonal bit `0x4000` is assumed 0.
-* The dynel flags `+0x74` / `+0x78` (skip the transition check) are assumed 0.
-* v4 invisible surfaces are treated like visible ones; teleport portals are decoded but not interpreted here. Not found: any navmesh for the player.
+Closed (AfCollision):
+* **Room liquids** (N3 `FUN_10012803` @0x10012803 room reader): `u32 (n+1)*0x3f1` (else "broken water data"), per liquid `kind, nv, nv x vec3 (y snapped to 1 cm), nt, nt x 3 u16`; even kinds with `nv != 3` become a fan around the vertex centroid. `n3Zone_t::AddLiquidCollisionData` @0x1001a9c5 multiplies the rotation `rot*pi/2` by the f64 constant 0.0 @0x1003cb08: vertices are room-local, **never rotated** (world = `room.pos + v`; verified on data). `FUN_1000b0d1` skips odd kinds. Test: `n3Zone_t::PerformLiquidCollisionTest` @0x1001a80c / `FUN_1000b498`: first triangle holding x/z with `ground.y < top` and local plane height > 0; counts when `level - depth < y`, `depth = (kind>>5)/10` (none: 1e5). `Collision::liquid_probe`, `Room::waters`. Outdoor polygons: still highest surface (the creation of the outdoor `WaterCollisionInfo_t` @DisplaySystem 0x10039d3c objects was not traced).
+* **Liquid medium** (`Vehicle+0xfc`, EnsureSurfaceAlignment tail 0x1000dd8c..): `vehicle.rs::medium`; modes 0..4, wade threshold `+0x100` = 1.19 (ctor), `+0x120` callback flag, `+0x10c` submersion. Player vehicle: mode 0 (no writer exists); callbacks `+0x80` = `FUN_1006f99e` (clear MechData, Transition 0x1a), `+0x84` = `FUN_1006ef74` (Transition 0x23); wired in `Movement::liquid_callbacks`; SwitchToSwim also writes WaitState 0.
+* **VetoRoomTransition radius** = `dynel->vtbl[+0x10]` = `n3Dynel_t::GetBodyCollSphereRadi` @0x10004dd3: torso `CollPrim` radius from `n3VisualDynel_t::UpdateCollision` @0x10019be4 (model torso sphere x body scale, 0.5 if negative). `SurfaceState::radius` defaults to 0.5; feeding the model's col sphere is NOT wired (which sphere is the torso one: first, [GUESS]). Push-back is `last + dir*0.1*R/2`, else `last - nudge`, else `GetSafePos`; standstill uses the backwards heading vector.
+* **GetSafePos** (`playfield+0x44` = resource `+0x4c`, zero from the ctor, never written): room 0, centre, y = max of 4 tile corners; not the last position. **Dynel `+0x74/+0x78`** = parent dynel id (`SetParentDynelID`); veto skipped while parented (`SurfaceState::parented`).
+* **Per-cell closest**: KD triangles are tagged with their zone/room; the closest-point query only sees the surface of the position's zone (`n3TilemapSurface_t::CalculateClosestPoint` @0x10018f0c `GetSurfaceForCell`).
+
+Open:
+* Dungeon `line` uses exact triangle tests (the client marches 1 m steps). KD miss outdoors not reproduced (never beats terrain).
+* Orientation modes 1/3/4, `Vehicle+0x13c`. Fall-start callback `FUN_1006ef34` (Transition ForwardStart/ReverseStart) not ported (movement slice).
+* Door state wiring (`set_door_passable` / `set_door_open` from DoorStatusUpdate) NOT done: needs door dynel -> room link (`GetDoorLinkFromPos` 0x100105f9, requested from AfCamera).
+* Tile diagonal bit 0x4000 assumed 0; v4 invisible surfaces (`EnableInvisCheck`) treated as visible; own body radius not fed; torso sphere choice unverified.
 
 ## 6. Verification (commands, observed)
 

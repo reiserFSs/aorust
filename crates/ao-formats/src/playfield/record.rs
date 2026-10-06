@@ -3,6 +3,8 @@
 
 use anyhow::{ensure, Result};
 
+use super::water::Water;
+
 /// Little-endian cursor over a record.
 pub(super) struct Rd<'a> {
     pub d: &'a [u8],
@@ -61,6 +63,14 @@ pub struct Room {
     /// @0x10010990 reads the first `u16` of each 4 byte entry, the second one is `tile << 2 | orientation`, `RegisterDoorPosition`
     /// @0x1001037e).
     pub door_zones: Vec<u16>,
+    /// The second `u16` of each door entry, parallel to `door_zones`: `tile << 2 | orientation`, the tile counted in the room's
+    /// rectangle rows (`n3Room_t::GetDoorLinkFromPos` @0x100105f9, `GetDoorPosRot` @0x10010acf).
+    pub door_tiles: Vec<u16>,
+    /// Liquid polygons in room-local coordinates (world = `pos + v`: the client's `n3Zone_t::AddLiquidCollisionData` multiplies
+    /// the rotation angle `rot * pi/2` by the zero constant f64 @0x1003cb08, so the vertices are never rotated), already
+    /// triangulated like the client's `n3WaterData_t` array: even kinds with `nv != 3` are a fan around the vertex centroid
+    /// (the last vertex), the rest use the file's triangle list.
+    pub waters: Vec<Water>,
 }
 
 /// A scripted camera position of a zone/room (`PointCameraAttractor_t`, N3 vtable 0x1003e4f4, built by `FUN_10023bbb` from the
@@ -163,28 +173,47 @@ fn room(r: &mut Rd, version: u32, attractors: &mut Vec<Vec<CameraAttractor>>) ->
     let pos = r.vec3()?;
     let doors = r.u16()? as usize;
     let mut door_zones = Vec::with_capacity(doors);
+    let mut door_tiles = Vec::with_capacity(doors);
     for _ in 0..doors {
         door_zones.push(r.u16()?);
-        r.u16()?;
+        door_tiles.push(r.u16()?);
     }
     let name = if flags & 0x80 != 0 { Some(cstr(r.take(32)?)) } else { None };
     // lightmap: i32 zlib size + 4, i32 vertex count, zlib bytes
     let lm = r.u32()?;
     let count = r.u32()?;
     let lightmap = if count != 0 { Some((count, r.take(lm.saturating_sub(4) as usize)?.to_vec())) } else { None };
-    // liquid data: u32 (n+1)*0x3f1, n x { u32, u32 n1, n1 x vec3, u32 n2, n2 x 3 u16 }
+    // liquid data (`n3Room_t` reader N3 @0x10012803): u32 (n+1)*0x3f1 (anything else: "Room contains broken water data"),
+    // n x { u32 kind, u32 nv, nv x vec3 (y snapped to 1 cm), u32 nt, nt x 3 u16 }
     let water = r.u32()?;
-    if water != 0 && water % 0x3f1 == 0 {
-        for _ in 0..water / 0x3f1 - 1 {
-            r.u32()?;
-            let n1 = r.u32()? as usize;
-            r.skip(n1 * 12)?;
-            let n2 = r.u32()? as usize;
-            r.skip(n2 * 6)?;
+    ensure!(water != 0 && water % 0x3f1 == 0, "room contains broken water data ({water:#x})");
+    let mut waters = Vec::new();
+    for _ in 0..water / 0x3f1 - 1 {
+        let kind = r.u32()?;
+        let nv = r.u32()? as usize;
+        ensure!(nv < 60_000, "implausible room liquid vertex count {nv}");
+        let mut verts = Vec::with_capacity(nv + 1);
+        for _ in 0..nv {
+            let [x, y, z] = r.vec3()?;
+            verts.push([x, (y * 100.0 + 0.5).floor() / 100.0, z]);
         }
+        let nt = r.u32()? as usize;
+        let mut tris = Vec::with_capacity(nt.max(nv));
+        for _ in 0..nt {
+            let t = [r.u16()?, r.u16()?, r.u16()?];
+            ensure!(t.iter().all(|&i| (i as usize) < nv), "room liquid triangle index out of range");
+            tris.push(t);
+        }
+        if kind & 1 == 0 && nv != 3 {
+            // a flat polygon is a fan around the vertex centroid (the triangle list of the file is not used)
+            let c = verts.iter().fold([0.0f32; 3], |a, v| [a[0] + v[0], a[1] + v[1], a[2] + v[2]]).map(|s| s / nv.max(1) as f32);
+            verts.push(c);
+            tris = (0..nv).map(|i| [nv as u16, ((i + nv - 1) % nv) as u16, i as u16]).collect();
+        }
+        waters.push(Water { kind, verts, tris });
     }
     attractors.push(camera_attractors(r, version)?);
-    Ok(Room { rot: flags & 3, rect, pos, name, lightmap, door_zones })
+    Ok(Room { rot: flags & 3, rect, pos, name, lightmap, door_zones, door_tiles, waters })
 }
 
 #[cfg(test)]
@@ -234,11 +263,26 @@ mod tests {
         let mut name = b"Ladies' Room".to_vec();
         name.resize(32, 0);
         d.extend(name);
-        d.extend([0u8; 16]); // lightmap size, present, liquid, camera attractor count
+        d.extend([0u8; 8]); // lightmap size, present
+        d.extend((2 * 0x3f1u32).to_le_bytes()); // one liquid polygon: kind 0, a 2 x 2 quad with the y values 1.234 / 1.0
+        d.extend([0u8; 4]);
+        d.extend(4u32.to_le_bytes());
+        for (x, y, z) in [(0.0f32, 1.234, 0.0), (2.0, 1.0, 0.0), (2.0, 1.0, 2.0), (0.0, 1.0, 2.0)] {
+            for v in [x, y, z] {
+                d.extend(v.to_le_bytes());
+            }
+        }
+        d.extend(2u32.to_le_bytes());
+        d.extend([0u8; 12]); // the file's triangle list is ignored for a flat polygon
+        d.extend(0u32.to_le_bytes()); // camera attractors
         let r = parse(&d).unwrap();
         assert_eq!(r.rooms.len(), 1);
         let room = &r.rooms[0];
         assert_eq!((room.rot, room.rect, room.pos), (1, [145, 117, 154, 122], [184.0, 107.5, 224.0]));
         assert_eq!(room.name.as_deref(), Some("Ladies' Room"));
+        let w = &room.waters[0];
+        assert_eq!((w.verts.len(), w.tris.len(), w.verts[0][1]), (5, 4, 1.23));
+        assert!(w.verts[4].iter().zip([1.0, 1.0575, 1.0]).all(|(a, b)| (a - b).abs() < 1e-5), "{:?}", w.verts[4]); // centroid; the fan closes on vertex 0
+        assert_eq!(w.tris[0], [4, 3, 0]);
     }
 }
