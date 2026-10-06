@@ -28,6 +28,10 @@ pub struct District {
     pub music: [u16; 8],
     pub npc_lvl: (u16, u16),
     pub lc_lvl: (u16, u16),
+    /// Centre of the district (`f32[3]`, server coordinates).
+    pub centre: [f32; 3],
+    /// `u8 fight mode` after `u8 respawn %, i32 respawn time` (GD `operator>>` @0x100049be); 0 when the record ends early.
+    pub fight_mode: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +87,8 @@ fn header_at(d: &[u8], p: usize, ver: u16) -> Option<(District, usize)> {
     };
     let mut music = [0u16; 8];
     music.copy_from_slice(&ids[1..]);
-    Some((District { name, sound_id: ids[0], music, npc_lvl: npc, lc_lvl: lc }, end))
+    let fight_mode = d.get(end + 5).copied().unwrap_or(0);
+    Some((District { name, sound_id: ids[0], music, npc_lvl: npc, lc_lvl: lc, centre: [f(0)?, f(4)?, f(8)?], fight_mode }, end))
 }
 
 impl Districts {

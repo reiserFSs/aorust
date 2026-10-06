@@ -291,6 +291,8 @@ pub(super) struct Hud {
     outbox: Vec<Frame>,
     /// Activated hotbar slots the game has to carry out (the flow drains them).
     uses: Vec<SlotUse>,
+    /// The character a plain world click selected this frame ([`Hud::take_click`]).
+    click: Option<i32>,
 }
 
 impl Hud {
@@ -450,6 +452,11 @@ impl Hud {
     }
 
     /// Hotbar slots activated since the last call (`FUN_100d79c9`).
+    /// The character a world click selected since the last call (CTRL/ALT + click also attacks it: `FUN_1002c469`).
+    pub(super) fn take_click(&mut self) -> Option<i32> {
+        self.click.take()
+    }
+
     pub(super) fn take_uses(&mut self) -> Vec<SlotUse> {
         std::mem::take(&mut self.uses)
     }
@@ -541,7 +548,12 @@ impl Hud {
         }
         // target docks, world click-to-select (hud_target.rs) and the Tab target keys
         if let Some(pos) = self.target.input(gui, zone, ev) {
-            self.target.world_click(zone, cam, lens, self.size, pos);
+            if self.target.world_click(zone, cam, lens, self.size, pos) {
+                self.click = zone.target;
+            }
+        }
+        if std::mem::take(&mut self.target.attack) {
+            self.uses.push(SlotUse::SpecialAction(0xb));
         }
         if let InputEvent::Key { key, pressed: true, mods } = ev {
             if gui.focused_view().is_none() {
