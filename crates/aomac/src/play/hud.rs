@@ -1167,6 +1167,9 @@ impl Hud {
     /// Dockable views owned outside Hud (the chat FriendsView) share this
     /// controller and the character's DockAreas persistence.
     pub(super) fn register_dock(&mut self, gui: &mut Gui, key: &str, window: WindowId) -> anyhow::Result<()> {
+        if self.rollup.contains(window) {
+            return Ok(());
+        }
         self.rollup.register_window(gui, key, window)?;
         self.rollup.restore_docks(gui, &[]);
         Ok(())
@@ -1388,6 +1391,25 @@ mod tests {
         assert_eq!(group(0), "0");
         assert_eq!(group(1234567), "1,234,567");
         assert_eq!(group(-1000), "-1,000");
+    }
+
+    #[test]
+    fn repeated_external_dock_registration_preserves_live_frame() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = Hud::new(&mut gui, &dir, (1280, 800)).unwrap();
+        let window = gui.open_tabbed_window_xml("external", "External", "<root><View/></root>", (100, 100), WindowSize::Fixed(185, 127)).unwrap();
+        hud.register_dock(&mut gui, "external_view", window).unwrap();
+        gui.set_window_pos(window, (320, 240));
+        gui.resize_window(window, WindowSize::Fixed(260, 210));
+        gui.set_window_pinned(window, true);
+        let frame = gui.window_outer_frame(window);
+        for _ in 0..3 {
+            hud.register_dock(&mut gui, "external_view", window).unwrap();
+            assert_eq!(gui.window_outer_frame(window), frame);
+            assert!(gui.window_pinned(window));
+        }
     }
 
     #[test]

@@ -30,6 +30,36 @@ fn rig() -> Option<Rig> {
 }
 
 #[test]
+fn character_info_first_response_and_refresh_use_current_packet_stats() {
+    let Some(mut r) = rig() else { return };
+    r.p.zone = zone::Zone::new(42);
+    r.p.chat = Some(super::super::chat::Chat::new());
+    r.p.chat.as_mut().unwrap().show_url(&mut r.p.gui, &r.p.zone, &r.p.text, "charid://50000/77");
+    let window = r.p.gui.window_ids().into_iter().find(|&w| r.p.gui.view_names(w).iter().any(|name| name == "BrowserView")).unwrap();
+    assert!(r.p.gui.text(window, "BrowserView").contains("Transferring information"));
+    for (title_level, killed, deaths) in [(3, 731, 29), (5, 947, 41)] {
+        let mut w = ao_net::Writer::default();
+        w.u32(ao_net::n3::info::INFO_PACKET);
+        ao_net::msg::Identity { kind: 50000, instance: 77 }.write(&mut w);
+        w.u8(0);
+        // Legacy player response: flags, breed/profession/title/obsolete/visual profession.
+        for byte in [0, 1, 1, title_level, 0, 1] { w.u8(byte); }
+        w.i16(0);
+        for value in [100, 100, 0, 0] { w.i32(value); }
+        for value in ["First", "Last", "", ""] { w.str_i16(value); }
+        for value in [killed, deaths, 0] { w.i32(value); }
+        for _ in 0..8 { w.i32(0); }
+        r.event(LoginEvent::ZoneFrame(ao_net::n3::outgoing::n3_frame(0, 42, w.0)));
+        let page = r.p.gui.text(window, "BrowserView");
+        assert!(page.contains(&format!("TitleLevel {title_level}")), "{page}");
+        for (key, value) in [("NumInvadersKilled", killed), ("KilledByInvaders", deaths)] {
+            let label = r.p.text.by_key(506, key).unwrap();
+            assert!(page.contains(&format!("{label}</font><font color=CCInfoText>{value}</font>")), "{page}");
+        }
+    }
+}
+
+#[test]
 fn preview_first_waits_for_backdrop_instead_of_losing_upload() {
     let Some(mut r) = rig() else { return };
     r.p.backdrop = None;

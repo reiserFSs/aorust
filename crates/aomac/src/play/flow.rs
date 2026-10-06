@@ -752,9 +752,6 @@ impl Play {
                     }
                 }
                 LoginEvent::ZoneFrame(f) => {
-                    if let Some(c) = self.chat.as_mut() {
-                        c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text);
-                    }
                     if let Some(m) = self.fight.as_mut() {
                         m.on_frame(&f);
                     }
@@ -765,7 +762,12 @@ impl Play {
                             None => self.hud_pending.push(f.clone()),
                         }
                     }
-                    match self.zone.on_frame(&f) {
+                    // InfoPacket Apply (GC 0x10045fba) updates skills before its info signal builds the page.
+                    let zone_event = self.zone.on_frame(&f);
+                    if let Some(c) = self.chat.as_mut() {
+                        c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text);
+                    }
+                    match zone_event {
                         zone::ZoneEvent::Playfield(id) => {
                             eprintln!("zone: playfield {id}");
                             if self.screen == Screen::InWorld {

@@ -333,6 +333,33 @@ impl Rollup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_config_can_omit_a_registered_wrapped_page() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut rollup = Rollup::new(&dir, (1280, 800));
+        let window = gui.open_tabbed_window_xml("omitted", "Omitted", "<root><View/></root>", (100, 100), WindowSize::Fixed(185, 127)).unwrap();
+        rollup.register_window(&mut gui, "omitted_view", window).unwrap();
+        let src = r#"<Archive><Archive name="dock_config"><Array name="dock_node_configs"><Archive><Float name="page_height" value="80"/><Bool name="is_page_expanded" value="true"/></Archive></Array><Array name="docked_view_identities"><String value="other_view"/></Array></Archive></Archive>"#;
+        rollup.load_user(&mut gui, src);
+        assert!(!rollup.config.iter().any(|c| c.key == "omitted_view"));
+        gui.resize_window(window, WindowSize::Fixed(260, 210));
+        let height = gui.window_size(window).1;
+        rollup.resize_page(&mut gui, &rollup.pages[0]);
+        assert_eq!(gui.window_size(window).1, height);
+        gui.show_collapsing(window, "rollup_header", true);
+        let docked_height = gui.window_size(window).1;
+        rollup.resize_page(&mut gui, &rollup.pages[0]);
+        assert_eq!(gui.window_size(window).1, docked_height, "missing page config must not count the visible header twice");
+        rollup.free_page(&mut gui, "omitted_view", 320, 240);
+        assert_eq!(gui.window_size(window).1, height);
+        let (x, y, ..) = gui.window_outer_frame(window).unwrap();
+        assert_eq!((x, y), (320, 240), "free dock placement uses the outer frame, not its inset client origin");
+        gui.resize_window(window, WindowSize::Fixed(300, 250));
+        assert_eq!(gui.window_size(window), (300, 250), "fallback sizing retains the elastic free-window body");
+    }
+
     use super::*;
 
     #[test]

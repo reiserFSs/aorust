@@ -218,7 +218,14 @@ impl Rollup {
     /// Size an owner wrapper from its page height, not its free-resize ceiling.
     fn resize_page(&self, gui: &mut Gui, page: &Page) {
         if page.wrapped {
-            let height = self.config.iter().find(|c| c.key == page.key).unwrap().height;
+            let Some(config) = self.config.iter().find(|c| c.key == page.key) else {
+                // No saved page height: retain the current content size, rather than
+                // deriving a new preferred height from the wrapper's elastic body.
+                let (width, height) = gui.window_size(page.window);
+                gui.resize_window(page.window, WindowSize::Fixed(width, height));
+                return;
+            };
+            let height = config.height;
             gui.set_view_pref_size(page.window, "body", (0.0, height), (16000.0, height));
             gui.resize_window(page.window, WindowSize::Preferred);
             gui.set_view_pref_size(page.window, "body", (0.0, height), (16000.0, 16000.0));
