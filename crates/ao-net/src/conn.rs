@@ -2,13 +2,13 @@
 
 use crate::frame::{Frame, RecvSeq, PT_COMPRESSION, PT_SYSTEM};
 use flate2::{Decompress, FlushDecompress};
-use crate::msg::{Message, USER_CREDENTIALS, ZONE_INFO, ZONE_LOGIN};
+use crate::msg::{Message, USER_CREDENTIALS, USER_LOGIN, ZONE_INFO, ZONE_LOGIN};
 use anyhow::{anyhow, bail, Result};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-/// Wire tap: `(sent, exact bytes)`. UserCredentials bodies are redacted before the tap sees them.
+/// Wire tap: `(sent, exact bytes)`. Authentication usernames/responses and cookies are redacted before the tap sees them.
 /// Upper bound for buffered decompressed bytes (a frame is at most 64 KiB).
 const MAX_BUFFERED: usize = 1 << 22;
 
@@ -131,21 +131,25 @@ impl Conn {
     }
 }
 
-/// Copy of a frame with secrets replaced by `*` (same length): the UserCredentials response, the ZoneInfo
-/// cookies (received) and the ZoneLogin cookies (sent).
+/// Copy of a frame with secrets replaced by `*` (same length): UserLogin/UserCredentials usernames,
+/// the UserCredentials response, ZoneInfo cookies (received) and ZoneLogin cookies (sent).
 fn redact(f: &Frame, sent: bool) -> Option<Frame> {
     if f.ptype != PT_SYSTEM || f.payload.len() < 4 {
         return None;
     }
     let id = u32::from_be_bytes(f.payload[..4].try_into().ok()?);
     let range = match (sent, id) {
-        (true, USER_CREDENTIALS) if f.payload.len() >= 4 + 44 => 48..f.payload.len(),
+        (true, USER_LOGIN) => 8.min(f.payload.len())..48.min(f.payload.len()),
+        (true, USER_CREDENTIALS) => 48.min(f.payload.len())..f.payload.len(),
         (true, ZONE_LOGIN) if f.payload.len() >= 16 => 8..16,
         (false, ZONE_INFO) if f.payload.len() >= 22 => 14..22,
         _ => return None,
     };
     let mut r = f.clone();
     r.payload[range].fill(b'*');
+    if sent && id == USER_CREDENTIALS {
+        r.payload[4..44.min(f.payload.len())].fill(b'*');
+    }
     Some(r)
 }
 
@@ -154,6 +158,63 @@ mod tests {
     use super::*;
     use flate2::{Compress, Compression, FlushCompress};
     use std::net::TcpListener;
+
+    #[test]
+    fn authentication_tap_redacts_usernames_and_response_without_changing_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut conn = Conn::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let (tapped, captured) = std::sync::mpsc::channel();
+        conn.tap = Some(Box::new(move |sent, bytes| {
+            assert!(sent);
+            tapped.send(bytes.to_vec()).unwrap();
+        }));
+        let username = "synthetic-trace-user";
+        let response = "synthetic-auth-response";
+        for (seq, message) in [
+            Message::UserLogin { protocol: 2, name: username.into(), client_version: "00.7.2_EP1".into() },
+            Message::UserCredentials { name: username.into(), response: response.into() },
+        ].into_iter().enumerate() {
+            let original = message.to_frame(seq as u16 + 1);
+            let wire = original.encode().unwrap();
+            conn.send_message(&message).unwrap();
+            let mut received = vec![0; wire.len()];
+            peer.read_exact(&mut received).unwrap();
+            assert_eq!(received, wire);
+            let shown = captured.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(shown.len(), wire.len());
+            assert!(!shown.windows(username.len()).any(|bytes| bytes == username.as_bytes()));
+            assert!(!shown.windows(response.len()).any(|bytes| bytes == response.as_bytes()));
+            let (redacted, used) = Frame::decode_with(&shown, true).unwrap().unwrap();
+            assert_eq!(used, shown.len());
+            assert_eq!((redacted.seq, redacted.ptype, redacted.sender, redacted.receiver),
+                (original.seq, original.ptype, original.sender, original.receiver));
+            let mut expected = original.payload.clone();
+            if seq == 0 {
+                expected[8..48].fill(b'*');
+            } else {
+                expected[4..44].fill(b'*');
+                expected[48..].fill(b'*');
+            }
+            assert_eq!(redacted.payload, expected);
+        }
+        // Even incomplete authentication fields must not leak their available bytes.
+        for id in [USER_LOGIN, USER_CREDENTIALS] {
+            let frame = Message::UserCredentials { name: username.into(), response: response.into() }.to_frame(1);
+            for len in 4..frame.payload.len() {
+                let mut partial = frame.clone();
+                partial.payload[..4].copy_from_slice(&id.to_be_bytes());
+                partial.payload.truncate(len);
+                let shown = redact(&partial, true).unwrap();
+                let start = if id == USER_LOGIN { 8 } else { 4 };
+                let end = if id == USER_LOGIN { 48 } else { 44 };
+                assert!(shown.payload[start.min(len)..end.min(len)].iter().all(|&byte| byte == b'*'));
+                if id == USER_CREDENTIALS {
+                    assert!(shown.payload[48.min(len)..].iter().all(|&byte| byte == b'*'));
+                }
+            }
+        }
+    }
 
     /// The zone server's first frame is the `7f 00` control frame (bytes captured live, docs/protocol.md §8); everything
     /// after it, coalesced into the same TCP write, is one zlib stream with a sync flush per write and unpadded frames.

@@ -48,8 +48,9 @@ A standing jump stays in place (docs/zone/collision.md, Fall-start callback: `Ve
 After `ZoneLogin` the zone's N3 stream (docs/zone.md) drives the flow: `PlayfieldAnarchyFIIR_t` names the playfield to load (so a freshly created character
 starts in its own start playfield, e.g. 4604 Arrival Hall, not in the list row's), the camera is placed at the player's `SimpleCharFullUpdateIIR_t`
 position (server `(x, y, z)` → scene `(x, y, -z)`, eye 1.7 m) facing its heading, and `CharInPlayIIR_t` is sent once after 10 world frames. Pings are answered
-by the session thread. `AOMAC_NET_TRACE=<file>` records every frame of the login and zone connections (`<ms> > | < <hex>`, credentials/cookies redacted) for protocol work;
+by the session thread. `AOMAC_NET_TRACE=<file>` records every frame of the login and zone connections (`<ms> > | < <hex>`, authentication usernames, responses and cookies redacted) for protocol work;
 `cargo run -p ao-net --example probe -- --login --select N --wait 90 --out FILE` does the same without the GUI (credentials from the TTY / stdin, never arguments).
+`Conn` masks the username in both `UserLogin` and `UserCredentials`, plus the credential response, before any wire tap receives the frame; frame lengths and non-secret fields remain unchanged. Regression: `ao-net` test `authentication_tap_redacts_usernames_and_response_without_changing_wire` uses synthetic authentication data and checks that the server still receives the original bytes.
 
 ## App bundle
 
