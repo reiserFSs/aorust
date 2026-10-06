@@ -214,6 +214,20 @@ impl HudNano {
             .collect()
     }
 
+    pub(super) fn shortcut_info(&mut self, gui: &mut Gui, id: i32) -> Option<super::hud_stats::ItemInfo> {
+        self.db.info(gui, id).map(|info| (info.name.clone(), info.icon))
+    }
+
+    /// GlobalSignals +0x110: `FUN_100d4319` / `FUN_100d435b` select the uploaded program's page.
+    pub(super) fn select_learned(&mut self, gui: &mut Gui, id: i32) {
+        if self.win.is_none() {
+            return;
+        }
+        let Some(info) = self.db.info(gui, id) else { return };
+        self.page = self.moved.get(&id).copied().unwrap_or_else(|| info.school().unwrap_or(FAVORITES));
+        self.built = None;
+    }
+
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone, dt: f32) {
         self.clock += dt;
         let Some(win) = self.win.as_mut() else { return };
@@ -241,7 +255,7 @@ impl HudNano {
 
     /// `FUN_100d3b11`: cast the program on the selected target (self when there is none and the program needs no target: `FUN_1004f6a0`'s
     /// `target == {0,0} && flags & 0x8000 == 0` rewrite).
-    fn cast(&mut self, gui: &mut Gui, zone: &Zone, id: i32) {
+    pub(super) fn cast(&mut self, gui: &mut Gui, zone: &Zone, id: i32) {
         let own = Identity { kind: outgoing::DYNEL_CHAR, instance: zone.char_id as i32 };
         let info = self.db.info(gui, id);
         let needs_target = info.is_some_and(|i| i.stat(stat::FLAGS).unwrap_or(0) & 0x8000 != 0);
@@ -375,6 +389,39 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             o.png(s, &list, &std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
         }
+    }
+
+    #[test]
+    fn server_upload_refreshes_open_programs_and_casts() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("cd_image/gui").exists() {
+            eprintln!("skipping: no client");
+            return;
+        }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut rollup = Rollup::new(&dir, (1100, 760));
+        let mut programs = HudNano::new(&dir, (1100, 760)).unwrap();
+        let mut zone = Zone::new(7);
+        programs.open(&mut gui, &mut rollup);
+        assert_eq!(programs.page, FAVORITES);
+        programs.update(&mut gui, &zone, 0.0);
+        assert!(programs.shown().is_empty());
+        let learned = ao_net::n3::action::simple(nano::action::LEARNED, Identity::default(), nano::nano(163449));
+        let frame = outgoing::n3_frame(0, 7, ao_net::n3::action::character_action(7, &learned));
+        zone.on_frame(&frame);
+        for id in zone.nanos.take_learned() {
+            programs.select_learned(&mut gui, id);
+        }
+        assert_eq!(programs.page, 4, "upload selects Space rather than leaving the empty Favorites page");
+        programs.update(&mut gui, &zone, 0.0);
+        assert_eq!(zone.nanos.programs, [163449]);
+        assert_eq!(programs.shown(), [163449]);
+        zone.on_frame(&frame);
+        assert_eq!(zone.nanos.programs, [163449], "duplicate server upload is idempotent");
+        assert!(zone.nanos.take_learned().is_empty());
+        zone.set_target(Some(Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
+        programs.cast(&mut gui, &zone, 163449);
+        assert_eq!(programs.take_outbox()[0].payload, nano::cast_nano(7, 163449, Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
     }
 
     /// The Programs and NCU windows with real nano records: pages by school, effects with their remaining time.

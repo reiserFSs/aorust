@@ -78,13 +78,17 @@ impl Compass {
     pub(super) fn new(gui: &mut Gui, screen: (u32, u32)) -> anyhow::Result<Self> {
         let src = format!("<root><CanvasView name=\"compass\" min_size=\"Point({},{})\" max_size=\"Point({},{})\"/></root>", W - 1.0, H - 1.0, W - 1.0, H - 1.0);
         let window = gui.open_window_xml("CompassWindow", &src, (0, 0), WindowSize::Preferred)?;
+        // CompassView's left capture/MoveBy path bypasses WndBorder (GUI 10066fc4/10067000).
+        gui.set_window_move_region(window, Some(ao_gui::Rect::new(0.0, 0.0, W - 1.0, H - 1.0)));
         let mut c = Compass { window, waypoint: None, shown: None };
         c.resize(gui, screen);
         Ok(c)
     }
 
     pub(super) fn resize(&mut self, gui: &mut Gui, screen: (u32, u32)) {
-        gui.set_window_pos(self.window, origin(screen));
+        if gui.window_moved(self.window) { return; }
+        let pos = origin(screen);
+        gui.set_window_pos(self.window, pos);
     }
 
     /// `criteria` of the window (`dvalue:cc_section1 && dvalue:cc_compass`).
@@ -161,6 +165,20 @@ fn items(gui: &Gui, a: f32, bearing: Option<f32>) -> Vec<CanvasItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_keeps_moved_compass_and_repositions_default() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut c = Compass::new(&mut gui, (1280, 800)).unwrap();
+        c.resize(&mut gui, (1920, 1080));
+        assert_eq!(gui.window_pos(c.window), origin((1920, 1080)));
+        gui.set_window_pos(c.window, (240, 100));
+        gui.set_window_moved(c.window, true);
+        c.resize(&mut gui, (1280, 800));
+        assert_eq!(gui.window_pos(c.window), (240, 100));
+    }
 
     /// Facing north (server heading 0, forward +z) the strip is centred on its first column (the "N" at x = 0), facing east
     /// (heading pi/2, forward +x) on the "E" a quarter of the way along. The original scrolls by `255 * frac` over the 256 px

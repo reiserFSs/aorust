@@ -343,8 +343,8 @@ impl HudOptions {
         let fixed_tab = if has_fixed { fixed_tab } else { String::new() };
         let src = format!(
             "<root><ViewSelector name=\"{TABS}\"><View view_layout=\"horizontal\" h_alignment=\"left\">\
-             <View view_layout=\"vertical\" layout_borders=\"Rect(10,10,0,10)\">\
-             <BorderView layout_borders=\"Rect(0,0,5,10)\"><View layout_borders=\"Rect(5,5,5,5)\"><StringListView name=\"{TREE}\" v_scrollbar_mode=\"auto\" max_size=\"Point(16000,16000)\"/></View></BorderView>\
+             <View name=\"categories\" view_layout=\"vertical\" layout_borders=\"Rect(10,10,0,10)\">\
+             <BorderView layout_borders=\"Rect(0,0,5,10)\"><View layout_borders=\"Rect(5,5,5,5)\"><StringListView name=\"{TREE}\" v_scrollbar_mode=\"auto_reserve\" max_size=\"Point(16000,16000)\"/></View></BorderView>\
              <View view_layout=\"horizontal\"><HLayoutSpacer/><View view_layout=\"vertical\">\
              <Button name=\"b1\" label=\"{}\" layout_borders=\"Rect(5,10,5,0)\" width_group=\"QuitButtons\"/>\
              <Button name=\"b2\" label=\"{}\" layout_borders=\"Rect(5,10,5,0)\" width_group=\"QuitButtons\"/>\
@@ -369,6 +369,7 @@ impl HudOptions {
         let (px, py) = ((x.min(self.screen.0 as i32 - ow as i32)).max(0), (y.min(self.screen.1 as i32 - oh as i32)).max(0));
         gui.set_window_outer_frame(id, (px, py, ow, oh));
 
+        gui.batch_updates(|gui| {
         let mut controls = vec![];
         let mut leaves = vec![];
         let mut folders = vec![];
@@ -409,6 +410,8 @@ impl HudOptions {
         if let Some(leaf) = self.win.as_ref().and_then(|w| w.leaves.get(w.selected).cloned()) {
             gui.list_select(id, TREE, &leaf, true, false);
         }
+        // Establish the initial page's sizing before restoring visibility (native AppendView selects page 0).
+        gui.select_child(id, PAGES, Some(0));
         gui.select_child(id, PAGES, Some(selected));
         // `AppendTab("Preferences")`, `AppendTab("Fixed keys")` (only when HotKeys.xml loaded), `AppendTab("Key bindings")`
         let mut tabs = vec!["Preferences".to_string()];
@@ -424,10 +427,14 @@ impl HudOptions {
         self.keypages.populate_binds(gui, id, &table, &self.texts);
         let sel = (cfg.tab.max(0) as usize).min(tabs.len() - 1);
         gui.set_window_tabs(id, &tabs, sel);
+        gui.select_child(id, TABS, Some(0));
         gui.select_child(id, TABS, Some(sel));
         if let Some(w) = self.win.as_mut() {
             w.tab = sel as i32;
         }
+        });
+        // OptionWindow_c 0x100c3c44 caps the category panel to its minimum preferred width.
+        gui.fit_view_width(id, "categories");
     }
 
     /// `OptionWindow_c` dtor: the frame, open folders and selection go into `OptionWindowConfig` (the flow saves the DValue files).

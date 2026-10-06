@@ -408,6 +408,7 @@ impl Hud {
                 Err(e) => eprintln!("hud: shortcut bar {n}: {e:#}"),
             }
         }
+        hud.register_hud_positions(gui);
         hud.refresh(gui, &Zone::default());
         // the windows the NewChar template opens at the first login (`<Value name="wear_window" value="true">`, `stat_window`; the wear window first, the stat
         // window is placed below it); the other windows of the template (nano, ncu, team) are not implemented by this HUD
@@ -420,8 +421,29 @@ impl Hud {
         Ok(hud)
     }
 
+    fn register_hud_positions(&mut self, gui: &mut Gui) {
+        use super::hud_wincfg::Store;
+        for b in &self.bars {
+            self.wincfg.attach_hud(gui, &self.dvalues, b.window, Store::Value(b.spec.cfg), self.size);
+            let (w, h) = gui.window_size(b.window);
+            gui.set_window_move_region(b.window, Some(ao_gui::Rect { l: 0.0, t: 0.0, r: w.saturating_sub(1) as f32, b: h.saturating_sub(1) as f32 }));
+        }
+        if let Some(c) = &self.compass {
+            self.wincfg.attach_hud(gui, &self.dvalues, c.window, Store::Value("CompassWindowConfig"), self.size);
+        }
+        for (id, name) in self.target.persistent_windows() {
+            self.wincfg.attach_hud(gui, &self.dvalues, id, Store::Value(name), self.size);
+        }
+        for (n, b) in self.shortcuts.iter().enumerate() {
+            self.wincfg.attach_hud(gui, &self.dvalues, b.window, Store::Container(n), self.size);
+        }
+    }
+
     /// `FUN_1006f098` (0x1006f098): wings, bottom bars and menus go into the dock views of `ControlCenter.xml`.
     fn fill_docks(&mut self, gui: &mut Gui) {
+        if let Err(e) = super::hud_rollup::fill_toolbar(gui, self.cc) {
+            eprintln!("hud: CCMiniToolbar: {e:#}");
+        }
         let wing = |id: &str| format!("<root><BitmapView bitmap_id=\"{id}\" color=\"0x1000000\"/></root>");
         // LeftBarView_c / RightBarView_c are BitmapViews with an HLayoutNode whose child View (borders) holds the labels
         let bar = |id: &str, inner: &str, borders: &str| {
@@ -486,6 +508,9 @@ impl Hud {
     /// The fade dvalues, applied live: `CCFadeLow` / `CCFadeHigh` / `CCFadeDelay` drive the `FadeGroupController_c` (gui/fade.rs, docs/gui.md
     /// §10.8), `cc_rollup_controller_fade_level` the alpha of the black surface behind the rollup column (`RollupController_c` 0x10048346).
     fn apply_fades(&self, gui: &mut Gui) {
+        for (view, key, _, _) in super::hud_rollup::TOOLBAR {
+            gui.set_button_pressed(self.cc, view, self.dvalues.flag(key));
+        }
         let f = |n: &str, d: f32| self.dvalues.get_f32(n).unwrap_or(d);
         gui.set_fade_params(f("CCFadeLow", 0.33), f("CCFadeHigh", 0.85), f("CCFadeDelay", 2.0));
         gui.set_backdrop(self.cc, "RollupArea", f("cc_rollup_controller_fade_level", 0.0));
@@ -616,6 +641,14 @@ impl Hud {
         self.stats.requeue_drops(drops);
     }
 
+    pub(super) fn activate_item(&mut self, zone: &Zone, slot: u32) {
+        self.stats.activate_item(zone, slot);
+    }
+
+    pub(super) fn activate_nano(&mut self, gui: &mut Gui, zone: &Zone, id: i32) {
+        self.nano.cast(gui, zone, id);
+    }
+
     /// Name and icon of an item template (`HudStats::item_info`).
     pub(super) fn item_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<super::hud_stats::ItemInfo> {
         self.stats.item_info(gui, low_id)
@@ -641,6 +674,7 @@ impl Hud {
     pub(super) fn take_info_urls(&mut self) -> Vec<String> {
         let mut v = self.mission.take_urls();
         v.append(&mut self.help_urls);
+        v.extend(self.stats.take_info_urls());
         v
     }
 
@@ -674,13 +708,17 @@ impl Hud {
         let want = hud_bar::default_count(d);
         while self.shortcuts.len() > want {
             if let Some(s) = self.shortcuts.pop() {
+                self.wincfg.detach_hud(gui, &mut self.dvalues, s.window);
                 s.close(gui);
             }
         }
         while self.shortcuts.len() < want {
             let n = self.shortcuts.len();
             match ShortcutBar::new(gui, self.options.dir(), n, self.size) {
-                Ok(b) => self.shortcuts.push(b),
+                Ok(b) => {
+                    self.wincfg.attach_hud(gui, &self.dvalues, b.window, super::hud_wincfg::Store::Container(n), self.size);
+                    self.shortcuts.push(b);
+                }
                 Err(e) => {
                     eprintln!("hud: shortcut bar {n}: {e:#}");
                     break;
@@ -755,6 +793,19 @@ impl Hud {
         }
         gui.set_text(self.cc, "cash", &group(st(sid::CASH)));
         gui.set_text(self.cc, "ncu", &format!("{}/{}", st(sid::NCU_USED), st(sid::NCU_MAX)));
+        for id in zone.nanos.take_learned() {
+            if self.dvalues.flag("OpenNanoWindow") {
+                self.open(gui, WindowKind::Nano);
+            }
+            self.nano.select_learned(gui, id);
+            if self.dvalues.flag("ShortcutNewNanos") {
+                if let Some((name, icon)) = self.nano.shortcut_info(gui, id) {
+                    if let Some(bar) = self.shortcuts.iter_mut().find(|b| b.is_active()) {
+                        bar.add_learned_nano(gui, id, &name, icon);
+                    }
+                }
+            }
+        }
         self.nano.update(gui, zone, _dt);
         self.ncu.update(gui, zone, _dt);
         self.outbox.extend(self.nano.take_outbox());
@@ -816,7 +867,16 @@ impl Hud {
         self.actwin.input(gui, ev, &self.actions.list, mods, &mut self.shortcuts);
         self.uses.extend(self.actwin.take_uses());
         // item drag and drop between the wear window and the inventory (hud_stats/item_ui.rs)
-        self.stats.input(gui, zone, ev);
+        self.stats.input(gui, zone, ev, mods);
+        let mut unclaimed = Vec::new();
+        for (slot, x, y) in self.stats.take_drops() {
+            let info = zone.inventory.get(&slot).and_then(|e| self.stats.item_info(gui, e.item.low_id));
+            let claimed = info.is_some_and(|(name, icon)| self.shortcuts.iter_mut().any(|bar| bar.drop_item(gui, slot, &name, icon, x, y)));
+            if !claimed {
+                unclaimed.push((slot, x, y));
+            }
+        }
+        self.stats.requeue_drops(unclaimed);
         self.rollup.input(gui, ev);
         self.options.input(gui, &mut self.dvalues, ev);
         // Esc closes the windows whose `esc_*` option was set when they opened (`esc_inventory`, `esc_wear`, `esc_nano`, `esc_perkwindow`, `esc_planetmap`, `esc_optionpanel`)
@@ -950,6 +1010,9 @@ impl Hud {
 
     /// `true` when the event was consumed by the HUD.
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
+        if self.wincfg.hud_frame_event(gui, ev, self.size) {
+            return true;
+        }
         if self.rollup.dock_event(gui, ev) {
             return true;
         }
@@ -1016,6 +1079,13 @@ impl Hud {
             return true;
         }
         let Event::Clicked { window, view, .. } = ev else { return false };
+        if *window == self.cc {
+            if let Some((_, key, _, _)) = super::hud_rollup::TOOLBAR.iter().find(|(id, _, _, _)| *id == view.as_str()) {
+                self.toggle_dvalue(gui, key);
+                gui.set_button_pressed(self.cc, view, self.dvalues.flag(key));
+                return true;
+            }
+        }
         let popup = self.popup.as_ref().map(|p| p.window);
         if *window != self.cc && Some(*window) != popup {
             return false;
@@ -1396,6 +1466,40 @@ mod tests {
         assert_eq!(group(0), "0");
         assert_eq!(group(1234567), "1,234,567");
         assert_eq!(group(-1000), "-1,000");
+    }
+
+    #[test]
+    fn native_mini_toolbar_setting_order_and_window_toggles() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = Hud::new(&mut gui, &dir, (1280, 800)).unwrap();
+        let mut zone = Zone::default();
+        hud.update(&mut gui, &mut zone, 0.0);
+        assert!(!hud.dvalues.flag("cc_mini_toolbar"), "retail default remains disabled");
+        assert!(!gui.is_visible(hud.cc, "CCMiniToolbar"));
+        hud.dvalues.set_i64("cc_mini_toolbar", 1);
+        hud.update(&mut gui, &mut zone, 0.0);
+        assert!(gui.is_visible(hud.cc, "CCMiniToolbar"));
+        let mut previous = None;
+        for (view, key, _, art) in super::super::hud_rollup::TOOLBAR {
+            let rect = gui.view_rect(hud.cc, view).unwrap();
+            let width = gui.gfx().size(ao_gui::GfxId(gui.gfx_id(art).unwrap())).0 as f32;
+            assert_eq!(rect.width() + 1.0, width);
+            if let Some(right) = previous { assert_eq!(rect.l, right + 1.0); }
+            previous = Some(rect.r);
+            let before = hud.dvalues.flag(key);
+            let cc = hud.cc;
+            assert!(hud.event(&mut gui, &Event::Clicked { window: cc, view: view.into(), item: None }, &zone));
+            assert_eq!(hud.dvalues.flag(key), !before);
+            if let Some(kind) = WindowKind::from_dvalue(key) {
+                assert_eq!(hud.open.contains(&kind), !before);
+            }
+        }
+        hud.dvalues.set_i64("cc_rollup_panel", 0);
+        hud.update(&mut gui, &mut zone, 0.0);
+        assert!(!gui.is_visible(hud.cc, "CCMiniToolbar"), "native criteria includes the rollup panel");
+        hud.close(&mut gui);
     }
 
     #[test]
@@ -2009,6 +2113,39 @@ mod tests {
         assert_eq!(s.hud.stats.inventory_cols(), Some(cols1));
         assert_eq!(s.gui.window_outer_frame(s.hud.stats_window(WindowKind::Skills).unwrap()), Some(sk));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn inventory_shortcut_drop_and_use() {
+        let Some((mut s, _)) = shot((1280, 800)) else { return };
+        let bar = &mut s.hud.shortcuts[0];
+        let (wx, wy) = s.gui.window_pos(bar.window);
+        let (x, y) = (wx as f32 + 43.0 + 36.0 * 5.0 + 17.0, wy as f32 + 19.0);
+        assert!(bar.drop_item(&mut s.gui, ao_net::n3::inventory::BAG_FIRST, "Nano Crystal", None, x, y));
+        bar.use_slot(5, &s.hud.actions.list);
+        assert_eq!(bar.take_uses(), [SlotUse::Item(ao_net::n3::inventory::BAG_FIRST)]);
+        assert!(!bar.drop_item(&mut s.gui, 65, "Other", None, x, y + 100.0));
+    }
+
+    #[test]
+    fn server_learned_nano_opens_programs_at_its_school() {
+        let Some((mut s, _)) = shot((1280, 800)) else { return };
+        s.hud.dvalues.set_i64("OpenNanoWindow", 1);
+        s.hud.dvalues.set_i64("ShortcutNewNanos", 1);
+        let learned = ao_net::n3::action::simple(ao_net::n3::nano::action::LEARNED, Default::default(), ao_net::n3::nano::nano(163449));
+        let frame = ao_net::n3::outgoing::n3_frame(0, s.zone.char_id, ao_net::n3::action::character_action(s.zone.char_id as i32, &learned));
+        s.zone.on_frame(&frame);
+        s.hud.update(&mut s.gui, &mut s.zone, 0.016);
+        assert!(s.hud.is_open(WindowKind::Nano));
+        assert_eq!(s.hud.nano.shown(), [163449], "learned Space nano must not remain hidden on Favorites");
+        assert_eq!(s.hud.shortcuts[0].slot_names()[4], "Shadow Touch");
+        s.hud.shortcuts[0].use_slot(4, &s.hud.actions.list);
+        assert_eq!(s.hud.shortcuts[0].take_uses(), [SlotUse::Nano(163449)]);
+        s.hud.close_kind(&mut s.gui, WindowKind::Nano);
+        s.hud.dvalues.set_i64("OpenNanoWindow", 0);
+        s.zone.on_frame(&frame);
+        s.hud.update(&mut s.gui, &mut s.zone, 0.016);
+        assert!(!s.hud.is_open(WindowKind::Nano), "duplicate learned reply is not a new upload");
     }
 
     /// The first-login hotbar: Start Combat / Walk / Sit / Suspended Animation icons from rdb 1010008, the Follow macro, use,

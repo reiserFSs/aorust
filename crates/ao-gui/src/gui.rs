@@ -164,6 +164,9 @@ pub struct Gui {
     fade: fade::FadeCtl,
     /// Chat text areas with message fading on (`gui/textfade.rs`), keyed by the hidden `ScrollView`.
     text_fades: HashMap<ViewId, textfade::TextFade>,
+    update_depth: usize,
+    dirty_lists: Vec<ViewId>,
+    dirty_windows: Vec<WindowId>,
 }
 
 fn px(r: Rect) -> [f32; 4] {
@@ -233,6 +236,9 @@ impl Gui {
             tip: Default::default(),
             fade: Default::default(),
             text_fades: HashMap::new(),
+            update_depth: 0,
+            dirty_lists: Vec::new(),
+            dirty_windows: Vec::new(),
         })
     }
 
@@ -394,7 +400,7 @@ impl Gui {
         let (cw, ch) = match size {
             WindowSize::Fixed(a, b) => (a as f32, b as f32),
             WindowSize::Preferred => {
-                let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default() };
+                let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default(), preferred: Default::default(), group_depth: 0 };
                 let p = layout::pref(&mut env, &self.tree, root, true);
                 (p.x + 1.0, p.y + 1.0)
             }
@@ -403,16 +409,41 @@ impl Gui {
     }
 
     fn relayout(&mut self, root: ViewId, frame: Rect) {
-        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default() };
+        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default(), preferred: Default::default(), group_depth: 0 };
         layout::set_frame(&mut env, &mut self.tree, root, frame);
     }
 
     /// Recomputes the layout of a window keeping its size (call after changing text, visibility, ...).
     pub fn relayout_window(&mut self, w: WindowId) {
+        if self.update_depth > 0 {
+            if !self.dirty_windows.contains(&w) {
+                self.dirty_windows.push(w);
+            }
+            return;
+        }
         if let Some(Some(win)) = self.windows.get(w) {
             let (root, f) = (win.root, self.tree.views[win.root].frame);
             self.relayout(root, f);
         }
+    }
+
+    /// Populates widgets without repeatedly measuring lists and laying out windows.
+    /// Geometry is refreshed when the outermost batch finishes.
+    pub fn batch_updates<R>(&mut self, update: impl FnOnce(&mut Self) -> R) -> R {
+        self.update_depth += 1;
+        let result = update(self);
+        if self.update_depth == 1 {
+            while let Some(v) = self.dirty_lists.pop() {
+                self.measure_list(v);
+            }
+        }
+        self.update_depth -= 1;
+        if self.update_depth == 0 {
+            while let Some(w) = self.dirty_windows.pop() {
+                self.relayout_window(w);
+            }
+        }
+        result
     }
 
     /// `Window::SetDefaultButton`: Enter activates this button.
@@ -474,11 +505,23 @@ impl Gui {
     /// `ViewSelector_c::SetValue(index)`: shows child `index` of the named view and hides (and collapses) the others.
     pub fn select_child(&mut self, w: WindowId, name: &str, index: Option<usize>) {
         if let Some(p) = self.find(w, name) {
-            for (i, c) in self.tree.views[p].children.clone().into_iter().enumerate() {
+            if self.tree.views[p].node == Node::Selector && self.tree.views[p].selector_pref_child.is_none() {
+                self.tree.views[p].selector_pref_child = index.and_then(|i| self.tree.views[p].children.get(i).copied());
+            }
+            for i in 0..self.tree.views[p].children.len() {
+                let c = self.tree.views[p].children[i];
                 self.tree.views[c].visible = Some(i) == index;
                 self.tree.views[c].flags |= VF_COLLAPSE_WHEN_HIDDEN;
             }
-            self.relayout_window(w);
+            if self.tree.views[p].node == Node::Selector && self.update_depth == 0 {
+                // ViewSelector_c::SetValue 0x1015002a only sizes the selected page.
+                if let Some(c) = index.and_then(|i| self.tree.views[p].children.get(i).copied()) {
+                    let frame = self.tree.views[p].frame;
+                    self.relayout(c, Rect::new(0.0, 0.0, frame.width(), frame.height()));
+                }
+            } else {
+                self.relayout_window(w);
+            }
         }
     }
 
@@ -679,12 +722,23 @@ impl Gui {
     /// `TextView_c::SetText` / `TextInputView_c::SetText`; also sets button labels.
     pub fn set_text(&mut self, w: WindowId, name: &str, text: &str) {
         let Some(v) = self.find(w, name) else { return };
+        let unchanged = match &self.tree.views[v].kind {
+            Kind::Button(b) => b.label == text,
+            Kind::TextButton(b) => b.text == text,
+            _ => self.editor_of(v).is_some_and(|e| matches!(&self.tree.views[e].kind, Kind::Text(t) if t.text == text)),
+        };
+        if unchanged {
+            return;
+        }
         self.set_text_view(v, text);
         self.relayout_window(w);
     }
 
     pub fn set_visible(&mut self, w: WindowId, name: &str, visible: bool) {
         if let Some(v) = self.find(w, name) {
+            if self.tree.views[v].visible == visible {
+                return;
+            }
             self.tree.views[v].visible = visible;
             self.relayout_window(w);
         }
@@ -1438,6 +1492,10 @@ impl Gui {
             if self.windows[window].as_ref().is_some_and(|w| w.framed)
                 && self.outer_of(window).is_some_and(|r| r.contains(Point::new(x, y)))
             {
+                return true;
+            }
+            if self.windows[window].as_ref().and_then(|w| w.fx.move_region)
+                .is_some_and(|r| r.contains(Point::new(x - pos.0 as f32, y - pos.1 as f32))) {
                 return true;
             }
             if self.covers(root, x - pos.0 as f32, y - pos.1 as f32, true, 0.0, 0.0) {
@@ -2237,6 +2295,25 @@ mod clip_tests {
         out.push(DrawCmd::Clip(inner));
         out.push(DrawCmd::Clip(outer));
         assert!(matches!(out.last(), Some(DrawCmd::Clip(c)) if *c == parent));
+    }
+
+    #[test]
+    fn unchanged_updates_and_moves_preserve_child_layout() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let w = gui.open_window_xml("move", r#"<root><View><TextView name="label" value="same"/></View></root>"#, (0, 0), WindowSize::Fixed(100, 100)).unwrap();
+        let label = gui.find(w, "label").unwrap();
+        let sentinel = Rect::new(1.0, 2.0, 3.0, 4.0);
+        gui.tree.views[label].frame = sentinel;
+        gui.set_text(w, "label", "same");
+        gui.set_visible(w, "label", true);
+        let (_, _, width, height) = gui.window_outer_frame(w).unwrap();
+        gui.set_window_outer_frame(w, (30, 40, width, height));
+        assert_eq!(gui.tree.views[label].frame, sentinel);
+        assert_eq!(gui.window_outer_frame(w), Some((30, 40, width, height)));
+        gui.set_window_outer_frame(w, (30, 40, width + 10, height));
+        assert_ne!(gui.tree.views[label].frame, sentinel);
     }
 
     #[test]

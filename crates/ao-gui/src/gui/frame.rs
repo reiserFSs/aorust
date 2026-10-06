@@ -33,6 +33,9 @@ pub(super) struct WinFx {
     pub movable: bool,
     pub resizable: bool,
     pub title_move: bool,
+    /// Client-local HUD drag surface; style-3 windows move through their views, not WndBorder.
+    pub move_region: Option<Rect>,
+    pub moved: bool,
     pub context: bool,
     pub tabs: Vec<String>,
     pub sel: usize,
@@ -219,6 +222,23 @@ impl Gui {
         }
     }
 
+    /// Enables the view-owned drag surface of a frameless HUD window.
+    pub fn set_window_move_region(&mut self, w: WindowId, region: Option<Rect>) {
+        if let Some(Some(win)) = self.windows.get_mut(w) {
+            win.fx.move_region = region;
+        }
+    }
+
+    pub fn window_moved(&self, w: WindowId) -> bool {
+        self.windows.get(w).and_then(Option::as_ref).is_some_and(|win| win.fx.moved)
+    }
+
+    pub fn set_window_moved(&mut self, w: WindowId, moved: bool) {
+        if let Some(Some(win)) = self.windows.get_mut(w) {
+            win.fx.moved = moved;
+        }
+    }
+
     /// `WndBorder::SetSizeLimits(min, max)`: client size limits in pixels (max 0 = unlimited).
     pub fn set_window_size_limits(&mut self, w: WindowId, min: (u32, u32), max: (u32, u32)) {
         if let Some(Some(win)) = self.windows.get_mut(w) {
@@ -267,10 +287,13 @@ impl Gui {
         let Some(Some(win)) = self.windows.get(w) else { return };
         let i = if win.framed { self.insets(win) } else { (0, 0, 0, 0) };
         let (cw, ch) = (f.2.saturating_sub((i.0 + i.2) as u32).max(1), f.3.saturating_sub((i.1 + i.3) as u32).max(1));
+        let resized = self.window_size(w) != (cw, ch);
         if let Some(Some(win)) = self.windows.get_mut(w) {
             win.pos = (f.0 + i.0, f.1 + i.1);
         }
-        self.resize_window(w, WindowSize::Fixed(cw, ch));
+        if resized {
+            self.resize_window(w, WindowSize::Fixed(cw, ch));
+        }
     }
 
     pub(super) fn outer_of(&self, w: WindowId) -> Option<Rect> {
@@ -315,6 +338,14 @@ impl Gui {
         let top_hit = self.hit(x, y).map(|h| h.0);
         for (wid, root, pos) in self.windows_at(x, y) {
             if !self.windows[wid].as_ref().is_some_and(|w| w.framed) {
+                if let Some(region) = self.windows[wid].as_ref().and_then(|w| w.fx.move_region) {
+                    if region.contains(Point::new(x - pos.0 as f32, y - pos.1 as f32)) {
+                        if let Some(start) = self.outer_of(wid) {
+                            self.ix.frame_drag = Some(FrameDrag { window: wid, hit: 1, mouse0: p, start });
+                            return true;
+                        }
+                    }
+                }
                 // A frameless widget above hides frames below it.
                 if top_hit == Some(wid) {
                     return false;
@@ -374,6 +405,7 @@ impl Gui {
             let new = (r.l as i32, r.t as i32, (r.width() + 1.0) as u32, (r.height() + 1.0) as u32);
             if self.window_outer_frame(wid) != Some(new) {
                 self.set_window_outer_frame(wid, new);
+                self.set_window_moved(wid, true);
                 self.events.push(Event::WindowFrame { window: wid });
             }
         }
@@ -491,6 +523,27 @@ mod tests {
 
     fn outer() -> Rect {
         Rect::new(100.0, 200.0, 399.0, 349.0) // 300 x 150 px
+    }
+
+    #[test]
+    fn frameless_hud_drag_moves_without_resizing_or_leaking_clicks() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let w = gui.open_window_xml("hud", "<root><CanvasView name=\"bar\"/></root>", (20, 30), WindowSize::Fixed(11, 125)).unwrap();
+        gui.set_window_move_region(w, Some(Rect::new(0.0, 0.0, 10.0, 124.0)));
+        assert!(gui.input(crate::InputEvent::MouseDown { x: 25.0, y: 50.0, button: crate::MouseButton::Left }).is_empty());
+        assert!(gui.interacting());
+        let events = gui.input(crate::InputEvent::MouseMove { x: 125.0, y: 120.0 });
+        assert!(events.contains(&Event::WindowFrame { window: w }));
+        assert_eq!(gui.window_pos(w), (120, 100));
+        assert_eq!(gui.window_size(w), (11, 125));
+        assert!(gui.window_moved(w));
+        assert!(gui.input(crate::InputEvent::MouseUp { x: 125.0, y: 120.0, button: crate::MouseButton::Left }).is_empty());
+        assert!(!gui.interacting());
+        gui.set_window_move_region(w, None);
+        gui.input(crate::InputEvent::MouseDown { x: 125.0, y: 120.0, button: crate::MouseButton::Left });
+        assert!(!gui.interacting());
     }
 
     #[test]

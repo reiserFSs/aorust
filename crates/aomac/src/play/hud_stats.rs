@@ -6,11 +6,11 @@
 //! * Inventory: `InventoryView_c` (`FUN_100cc2ca`): a `MultiListView` slot grid / list, 30 slots for the character's own inventory.
 //! * Stat: `StatView_c` (`FUN_1007ff6e`), [`stat_view`].
 
-mod buffs;
+pub(in crate::play) mod buffs;
 pub(in crate::play) mod items;
 mod skill_model;
 mod stat_view;
-mod equipment;
+pub(in crate::play) mod equipment;
 mod zone_inv;
 pub(in crate::play) mod inv_grid;
 mod item_dnd;
@@ -145,6 +145,8 @@ pub(super) struct HudStats {
     /// Pointer state of the item drag and drop, and the sequence number of our `GenericCmd_t`s (docs/gui.md §11.12).
     dnd: item_dnd::Dnd,
     use_seq: i32,
+    info_urls: Vec<String>,
+    info_click: bool,
 }
 
 /// Value of the first `<Bool name=NAME value=..>` below `e`.
@@ -194,6 +196,8 @@ impl HudStats {
             status: String::new(),
             dnd: Default::default(),
             use_seq: 0,
+            info_urls: vec![],
+            info_click: false,
         })
     }
 
@@ -777,6 +781,7 @@ impl HudStats {
         sig.push((u32::MAX - 1, i32::from(inv.list)));
         sig.push((u32::MAX - 2, hover_code(self.dnd.hover)));
         sig.extend(slots.iter().filter_map(|&s| inv.positions.get(s).map(|c| (0x8000_0000 | s, (c.0 * 100 + c.1) as i32))));
+        sig.extend(slots.iter().map(|&slot| (0x4000_0000 | slot, i32::from(zone.inventory[&slot].b))));
         if inv.drawn == sig {
             return;
         }
@@ -797,9 +802,10 @@ impl HudStats {
             for (n, e) in bag.iter().enumerate() {
                 let Some(i) = self.items.info(gui, e.item.low_id) else { continue };
                 xml += &format!(
-                    "<View view_layout=\"horizontal\"><CanvasView name=\"icon{n}\" min_size=\"Point(16,16)\" max_size=\"Point(16,16)\"/>{}{}{}</View>",
+                    "<View name=\"item{}\" view_layout=\"horizontal\"><CanvasView name=\"icon{n}\" min_size=\"Point(16,16)\" max_size=\"Point(16,16)\"/>{}<TextView name=\"count{}\" value=\"{}\" min_size=\"Point(30,-1)\" max_size=\"Point(30,-1)\"/>{}</View>",
+                    e.slot,
                     col(&esc(&i.name), 200),
-                    col(&i.count.to_string(), 30),
+                    e.slot, e.b,
                     col(&e.item.level.to_string(), 100)
                 );
                 icons.push((n, i.icon));
@@ -954,7 +960,7 @@ mod tests {
             &self.gui
         }
         fn input(&mut self, ev: InputEvent, _host: &mut Host) {
-            self.hud.input(&mut self.gui, &self.zone, &ev);
+            self.hud.input(&mut self.gui, &self.zone, &ev, _host.mods);
             self.rollup.input(&mut self.gui, &ev);
             for e in self.gui.input(ev) {
                 self.rollup.event(&mut self.gui, &e);
@@ -1121,6 +1127,14 @@ mod tests {
         png(&mut s, &mut o, "skills-5-details");
         // Save Changes: stat -> pending + raw
         assert!(s.hud.take_outbox().is_empty());
+        let accept = s.gui.view_rect(w, "Accept").unwrap();
+        let (x, y, width, height) = s.gui.window_outer_frame(w).unwrap();
+        assert!(
+            accept.l >= x as f32 && accept.t >= y as f32
+                && accept.r < (x + width as i32) as f32 && accept.b < (y + height as i32) as f32,
+            "selecting a skill must keep Save Changes inside the window: {accept:?}",
+        );
+        assert!(s.gui.is_enabled(w, "Accept"));
         click(&mut s, &mut o, w, "Accept");
         let out = s.hud.take_outbox();
         assert_eq!(out.len(), 1);
@@ -1246,6 +1260,81 @@ mod tests {
     /// An inventory entry of the rdb record `low_id` in `slot`.
     fn item(slot: u32, low_id: i32, level: i32) -> InventoryEntry {
         InventoryEntry { slot, a: 0, b: 0, id: Identity { kind: 0, instance: 0 }, item: AcgItem { low_id, high_id: low_id, level } }
+    }
+
+    #[test]
+    fn inventory_list_refreshes_server_consumed_stack_count() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() || !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = HudStats::new(&dir, SIZE).unwrap();
+        let mut zone = Zone::new(7);
+        let mut entry = item(0x40, 218395, 1);
+        entry.b = 3;
+        zone.inventory.insert(entry.slot, entry);
+        hud.open_inventory(&mut gui).unwrap();
+        hud.set_inventory_list(true);
+        hud.update_inventory(&mut gui, &zone);
+        let window = hud.inventory.as_ref().unwrap().window;
+        assert_eq!(gui.text(window, "count64"), "3");
+        let consumed = ao_net::n3::outgoing::n3_frame(0, 7, ao_net::n3::inventory::delete_item(
+            7, ao_net::n3::inventory::item_identity(0x40), Identity { kind: 1, instance: 0 }));
+        zone.on_frame(&consumed);
+        hud.update_inventory(&mut gui, &zone);
+        assert_eq!(gui.text(window, "count64"), "2", "count-only server change rebuilds the visible row");
+    }
+
+    #[test]
+    fn item_inspection_does_not_use_or_drag_inventory_and_wear() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = HudStats::new(&dir, SIZE).unwrap();
+        let mut rollup = Rollup::new(&dir, SIZE);
+        let mut zone = Zone::new(33512);
+        zone.inventory.insert(6, item(6, 0xc1a5, 1));
+        zone.inventory.insert(0x40, item(0x40, 0xc1a2, 3));
+        hud.open(&mut gui, &mut rollup, WindowKind::Character);
+        hud.open(&mut gui, &mut rollup, WindowKind::Inventory);
+        hud.update(&mut gui, &mut zone, 0.016);
+        for (kind, view, slot, local) in [
+            (WindowKind::Inventory, "grid", 0x40, inv_grid::cell_origin(0, 0, hud.inventory.as_ref().unwrap().gap)),
+            (WindowKind::Character, "items", 6, items::wear_origin(0, 2)),
+        ] {
+            let w = hud.window(kind).unwrap();
+            let r = gui.view_rect(w, view).unwrap();
+            let (x, y) = (r.l + local.0 + 4.0, r.t + local.1 + 4.0);
+            for (button, mods) in [
+                (ao_gui::MouseButton::Left, ao_gui::Modifiers { shift: true, ..Default::default() }),
+                (ao_gui::MouseButton::Right, ao_gui::Modifiers::default()),
+            ] {
+                hud.input(&mut gui, &zone, &InputEvent::MouseDown { x, y, button }, mods);
+                hud.input(&mut gui, &zone, &InputEvent::MouseMove { x: x + 20.0, y }, mods);
+                assert!(hud.dnd.drag.is_none() && hud.dnd.press.is_none());
+                hud.input(&mut gui, &zone, &InputEvent::MouseUp { x, y, button }, mods);
+                if button == ao_gui::MouseButton::Left {
+                    hud.event(&mut gui, &Event::CanvasClick { window: w, view: view.into(), x: local.0 + 4.0, y: local.1 + 4.0 }, &zone);
+                }
+                let id = ao_net::n3::inventory::item_identity(slot);
+                assert_eq!(hud.take_info_urls(), [format!("itemid://{}/{}", id.kind, id.instance)]);
+                assert!(hud.take_outbox().is_empty());
+            }
+        }
+        let w = hud.window(WindowKind::Inventory).unwrap();
+        let r = gui.view_rect(w, "grid").unwrap();
+        let empty = inv_grid::cell_origin(1, 0, hud.inventory.as_ref().unwrap().gap);
+        hud.input(&mut gui, &zone, &InputEvent::MouseDown { x: r.l + empty.0 + 4.0, y: r.t + empty.1 + 4.0, button: ao_gui::MouseButton::Right }, Default::default());
+        assert!(hud.take_info_urls().is_empty() && hud.take_outbox().is_empty());
+        hud.set_inventory_list(true);
+        hud.update(&mut gui, &mut zone, 0.016);
+        let w = hud.window(WindowKind::Inventory).unwrap();
+        let r = gui.view_rect(w, "item64").unwrap();
+        hud.input(&mut gui, &zone, &InputEvent::MouseDown { x: r.l + 2.0, y: r.t + 2.0, button: ao_gui::MouseButton::Right }, Default::default());
+        assert_eq!(hud.take_info_urls().len(), 1);
+        assert!(hud.take_outbox().is_empty());
+        hud.input(&mut gui, &zone, &InputEvent::MouseDown { x: r.l + 2.0, y: r.t + 2.0, button: ao_gui::MouseButton::Left }, Default::default());
+        hud.input(&mut gui, &zone, &InputEvent::MouseMove { x: r.l + 22.0, y: r.t + 2.0 }, Default::default());
+        assert_eq!(hud.dnd.drag.as_ref().map(|d| d.slot), Some(0x40), "list rows share the inventory drag route");
     }
 
     /// Worn items appear in their cells of the four wear tabs, bag items in the inventory grid and list (icons from rdb 1010008).

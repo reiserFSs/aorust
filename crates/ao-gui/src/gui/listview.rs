@@ -382,8 +382,33 @@ impl Gui {
         rec(l, 0, id)
     }
 
+    fn defer_list_measure(&mut self, v: ViewId) -> bool {
+        if self.update_depth == 0 {
+            return false;
+        }
+        if !self.dirty_lists.contains(&v) {
+            self.dirty_lists.push(v);
+        }
+        true
+    }
+
+    pub(super) fn measure_list(&mut self, v: ViewId) {
+        match &self.tree.views[v].kind {
+            Kind::List(_) => self.list_layout_now(v),
+            Kind::Multi(_) => self.multi_layout_now(v),
+            _ => {}
+        }
+    }
+
     /// Re-measures every item (`StringListViewItem_c::SetSize` of the item view's preferred size), then resizes the view to its content.
     fn list_layout(&mut self, v: ViewId) {
+        if self.defer_list_measure(v) {
+            return;
+        }
+        self.list_layout_now(v);
+    }
+
+    fn list_layout_now(&mut self, v: ViewId) {
         let Some(mut l) = self.list_data(v).cloned() else { return };
         let fh = self.fonts.font(FontId::Normal).height as f32;
         for i in 1..l.items.len() {
@@ -493,6 +518,19 @@ impl Gui {
         Self::list_find(l, id).map(|i| &l.items[i])
     }
 
+    /// Screen-space bounds of a visible tree row, including its scroll offset.
+    pub fn list_item_rect(&self, w: WindowId, name: &str, id: &str) -> Option<Rect> {
+        let v = self.list_view(w, name)?;
+        let list = self.list_data(v)?;
+        let item = Self::list_find(list, id)?;
+        let row = list_rows(list).into_iter().find(|row| row.item == item)?;
+        let origin = self.origin(v);
+        let win = self.windows.get(w)?.as_ref()?;
+        let (x, y) = (origin.0 + win.pos.0 as f32 + row.x, origin.1 + win.pos.1 as f32 + row.y);
+        let size = list.items[item].size;
+        Some(Rect::new(x, y, x + size.x, y + size.y))
+    }
+
     /// `ListViewBaseItem_c::OpenFolder`.
     pub fn list_open_folder(&mut self, w: WindowId, name: &str, id: &str, open: bool) {
         let Some(v) = self.list_view(w, name) else { return };
@@ -547,7 +585,7 @@ impl Gui {
                 self.events.push(Event::ListSelected { window, view, id, selected });
             }
         }
-        self.list_layout(v);
+        // Selection changes paint/signals, not the item's measured size or folder rows.
     }
 
     /// `ListViewBase_c::MouseDown` 0x101312c6 (any button): the row under the pointer toggles its folder, selects (multi select toggles) and raises the
@@ -636,6 +674,13 @@ impl Gui {
     }
 
     fn multi_layout(&mut self, v: ViewId) {
+        if self.defer_list_measure(v) {
+            return;
+        }
+        self.multi_layout_now(v);
+    }
+
+    fn multi_layout_now(&mut self, v: ViewId) {
         let Some(m) = self.multi_data(v) else { return };
         let (w, n) = (Self::multi_width(m), m.rows.len());
         let h = if n == 0 { 0.0 } else { n as f32 * ROW_PITCH - (ROW_PITCH - ROW_H - 1.0) };

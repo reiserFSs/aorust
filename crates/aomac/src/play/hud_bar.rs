@@ -63,6 +63,10 @@ pub(super) enum SlotUse {
     Unavailable,
     /// A text macro: the macro text is emitted on GlobalSignals +0x180 and runs as if typed into the chat input.
     Macro(String),
+    /// Inventory item identity used by `N3Msg_UseItem` (GUI `FUN_100d79c9`, type 1).
+    Item(u32),
+    /// Nano identity of a type 4 shortcut.
+    Nano(i32),
 }
 
 #[derive(Clone, Debug)]
@@ -126,11 +130,14 @@ fn window_xml(label_h: f32, timer_h: f32) -> String {
             h = h,
         );
     }
+    // Native page centre is spinner-local 19 (`101beda0` f64), not 16: a 6px left border shifts the preferred label centre by 3.
     format!(
         "<root><View view_layout=\"stacked\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\">\
          <CanvasView name=\"bar\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/>\
-         <View view_layout=\"horizontal\" h_alignment=\"left\"><View min_size=\"Point({sp},{h})\" max_size=\"Point({sp},{h})\"/>{cells}</View></View></root>",
-        sp = CHROME_W - 1.0,
+         <View view_layout=\"horizontal\" h_alignment=\"left\"><View min_size=\"Point({radio},{h})\" max_size=\"Point({radio},{h})\"/>\
+         <View view_layout=\"vertical\" h_alignment=\"center\" min_size=\"Point({control},{h})\" max_size=\"Point({control},{h})\"><TextView name=\"page\" value=\"1\" font=\"NORMAL\" color=\"0xffff00\" layout_borders=\"Rect(6,0,0,0)\"/></View>{cells}</View></View></root>",
+        radio = RADIO_W - 1.0,
+        control = CONTROL_W - 1.0,
     )
 }
 
@@ -236,6 +243,8 @@ impl ShortcutBar {
             items.push(CanvasItem::ImageTint { id: g, src: [shrink, 0.0, ICON - 2.0 * shrink, ICON], dst: [x + shrink, ICON_Y, x + ICON - shrink, ICON_Y + ICON], color: 0, alpha: 1.0 });
         }
         gui.set_canvas(self.window, "bar", items);
+        // Native spinner `FUN_100da8eb`: preferred-sized NORMAL (font 5) yellow label, rows 1..9,0.
+        gui.set_text(self.window, "page", &((self.row + 1) % ROWS).to_string());
         for (i, s) in self.slots.iter().enumerate() {
             // short tooltips (`ShortcutShortTooltips` = true in LoginPrefs.xml): the item name. UNRESOLVED: the long form.
             gui.set_tooltip(self.window, &format!("slot{i}"), s.as_ref().map_or("", |s| s.name.as_str()), "");
@@ -260,6 +269,8 @@ impl ShortcutBar {
         match s.kind {
             KIND_SPECIAL_ACTION => self.uses.push(list.find(s.instance).map_or(SlotUse::Unavailable, |e| SlotUse::SpecialAction(e.shown))),
             KIND_MACRO => self.uses.push(SlotUse::Macro(s.text.clone())),
+            kind if kind as i32 == ao_net::n3::nano::NANO_KIND => self.uses.push(SlotUse::Nano(s.instance as i32)),
+            kind if matches!(kind as i32, ao_net::n3::inventory::KIND_WEAPON_PAGE | ao_net::n3::inventory::KIND_ARMOR_PAGE | ao_net::n3::inventory::KIND_IMPLANT_PAGE | ao_net::n3::inventory::KIND_BAG | ao_net::n3::inventory::KIND_SOCIAL_PAGE) => self.uses.push(SlotUse::Item(s.instance)),
             _ => {}
         }
     }
@@ -287,6 +298,8 @@ impl ShortcutBar {
     /// Per frame: the hold timer, the identities following their list entries, the recharge overlays (`FUN_1003d3ff`).
     /// `changes` = [`SpecialList::take_changes`] of this frame, `locked` = `LockHotbars`, `timers` = `IconTimers` / `IconTimerText`.
     pub(super) fn update(&mut self, gui: &mut Gui, dt: f32, list: &SpecialList, changes: &[(u32, u32)], locked: bool, timers: (bool, bool)) {
+        // Spinner capture/MoveBy (`100db4d6` / `100db335`), not the slot list; LockHotbars gates movement.
+        gui.set_window_move_region(self.window, (!locked).then(|| ao_gui::Rect::new(RADIO_W, 0.0, CHROME_W - 1.0, BAR_H - 1.0)));
         let mut dirty = self.timer_text != timers.1;
         self.timer_text = timers.1;
         for &(old, new) in changes {
@@ -355,7 +368,9 @@ impl ShortcutBar {
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
                 self.mouse = (x, y);
                 if let Some(d) = self.row_button(gui, x, y) {
-                    self.set_row(gui, self.row.saturating_add_signed(d).min(ROWS - 1));
+                    // HUD input precedes Gui::input for this same event: arrows page without capturing the window.
+                    gui.set_window_move_region(self.window, None);
+                    self.set_row(gui, (self.row as isize + d).rem_euclid(ROWS as isize) as usize);
                     return;
                 }
                 self.press = self.slot_at(gui, x, y).filter(|&i| self.slots[i].is_some()).map(|slot| Press { slot, held: 0.0 });
@@ -381,8 +396,8 @@ impl ShortcutBar {
     }
 
     /// The toolbar control's up / down buttons (`GFX_GUI_TOOLBAR_BUTTON_UP` / `_DOWN` at x = 11 of the control, 1 px from its top / bottom, see
-    /// [`Self::paint`]): `-1` = previous row, `+1` = next row. UNRESOLVED: the buttons' own handler was not traced; one row per click is taken from
-    /// the row keys' `Scroll(-(cell height * n))`.
+    /// [`Self::paint`]): `-1` = previous row, `+1` = next row. Native arrow handlers (`100dae98..100daec5`) wrap
+    /// with `(row + 9) % 10` / `(row + 1) % 10`, then call `100daa9e`.
     fn row_button(&self, gui: &Gui, x: f32, y: f32) -> Option<isize> {
         let (px, py) = gui.window_pos(self.window);
         let (lx, ly) = (x - px as f32 - RADIO_W - 11.0, y - py as f32);
@@ -426,9 +441,31 @@ impl ShortcutBar {
         true
     }
 
+    /// An inventory drag creates a shortcut, not an inventory move (`FUN_100d8047`).
+    pub(super) fn drop_item(&mut self, gui: &mut Gui, slot: u32, name: &str, icon: Option<(GfxId, u32, u32)>, x: f32, y: f32) -> bool {
+        let Some(to) = self.slot_at(gui, x, y) else { return false };
+        let id = ao_net::n3::inventory::item_identity(slot);
+        self.slots[to] = Some(Slot { kind: id.kind as u32, instance: slot, name: name.to_owned(), icon, text: String::new() });
+        self.paint(gui);
+        true
+    }
+
     fn begin_drag(&mut self, gui: &mut Gui, from: usize, x: f32, y: f32) {
         let Some(slot) = self.slots[from].clone() else { return };
         self.start_drag(gui, Some(from), slot, x, y);
+    }
+
+    /// Learned nano signal (`FUN_100d7999`): active bar, first free cell across all rows.
+    pub(super) fn add_learned_nano(&mut self, gui: &mut Gui, id: i32, name: &str, icon: Option<(GfxId, u32, u32)>) {
+        if !self.primary { return; }
+        for row in 0..ROWS {
+            let slots = if row == self.row { &mut self.slots } else { &mut self.rows[row] };
+            if let Some(to) = slots.iter().position(Option::is_none) {
+                slots[to] = Some(Slot { kind: ao_net::n3::nano::NANO_KIND as u32, instance: id as u32, name: name.to_owned(), icon, text: String::new() });
+                if row == self.row { self.paint(gui); }
+                return;
+            }
+        }
     }
 
     /// `FUN_100d82d4` (`/macro`): the new macro `{0xc789, id}` is dragged from no slot; a drop on a slot puts it there, a drop elsewhere discards it.
@@ -532,5 +569,55 @@ mod tests {
             assert!((s.t + s.b - l.t - l.b).abs() <= 1.0 && (s.l + s.r - l.l - l.r).abs() <= 1.0, "label{i} {l:?} centred in slot{i} {s:?}");
             assert_eq!(s.l, CHROME_W + i as f32 * PITCH, "slot{i} x");
         }
+    }
+
+    #[test]
+    fn spinner_page_and_plain_drag_respect_lock_and_arrows() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &dir, 1, (1280, 800)).unwrap();
+        let list = SpecialList::new();
+        assert_eq!(gui.text(bar.window, "page"), "1");
+        for row in [1, 8, 9, 0] {
+            bar.set_row(&mut gui, row);
+            assert_eq!(gui.text(bar.window, "page"), ((row + 1) % 10).to_string());
+            let label = gui.view_frame(bar.window, "page").unwrap();
+            assert_eq!(label.height() + 1.0, gui.font_height(ao_gui::FontId::Normal) as f32, "spinner uses native font 5");
+            assert_eq!(label.l, RADIO_W + (19.0 - (label.width() + 1.0) * 0.5).floor(), "native spinner-local centre is 19");
+            assert!((label.t + label.b - (BAR_H - 1.0)).abs() <= 1.0);
+        }
+        // Follow the actual HUD-before-GUI event order with no Shift/Alt modifiers.
+        let drag = |bar: &mut ShortcutBar, gui: &mut Gui, local: (f32, f32)| {
+            let (px, py) = gui.window_pos(bar.window);
+            let (x, y) = (px as f32 + local.0, py as f32 + local.1);
+            for ev in [
+                InputEvent::MouseDown { x, y, button: MouseButton::Left },
+                InputEvent::MouseMove { x: x + 12.0, y: y + 7.0 },
+                InputEvent::MouseUp { x: x + 12.0, y: y + 7.0, button: MouseButton::Left },
+            ] {
+                bar.input(gui, &ev, &list, Default::default());
+                gui.input(ev);
+            }
+        };
+        let original = gui.window_pos(bar.window);
+        bar.update(&mut gui, 0.0, &list, &[], true, (true, true));
+        drag(&mut bar, &mut gui, (RADIO_W + 2.0, BAR_H / 2.0));
+        assert_eq!(gui.window_pos(bar.window), original, "locked spinner cannot move");
+        bar.update(&mut gui, 0.0, &list, &[], false, (true, true));
+        drag(&mut bar, &mut gui, (CHROME_W + 5.0, BAR_H / 2.0));
+        assert_eq!(gui.window_pos(bar.window), original, "slots cannot move the bar");
+        drag(&mut bar, &mut gui, (RADIO_W + 12.0, BAR_H - 10.0));
+        assert_eq!(gui.text(bar.window, "page"), "2");
+        assert_eq!(gui.window_pos(bar.window), original, "arrow pages without dragging");
+        bar.set_row(&mut gui, 0);
+        drag(&mut bar, &mut gui, (RADIO_W + 12.0, 2.0));
+        assert_eq!(gui.text(bar.window, "page"), "0", "up wraps from first to last");
+        drag(&mut bar, &mut gui, (RADIO_W + 12.0, BAR_H - 10.0));
+        assert_eq!(gui.text(bar.window, "page"), "1", "down wraps from last to first");
+        assert_eq!(gui.window_pos(bar.window), original, "wrap arrows do not drag");
+        bar.update(&mut gui, 0.0, &list, &[], false, (true, true));
+        drag(&mut bar, &mut gui, (RADIO_W + 2.0, BAR_H / 2.0));
+        assert_eq!(gui.window_pos(bar.window), (original.0 + 12, original.1 + 7), "plain spinner drag moves");
     }
 }

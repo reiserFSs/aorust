@@ -20,6 +20,8 @@ pub struct Env<'a> {
     pub colors: &'a Colors,
     /// Widest preferred width per (owner view, width group), valid for one layout pass.
     pub groups: std::collections::HashMap<(ViewId, String), (f32, f32)>,
+    pub preferred: std::collections::HashMap<(ViewId, bool), Point>,
+    pub group_depth: usize,
 }
 
 const BIG: f32 = 16000.0; // _DAT_101c61bc
@@ -33,6 +35,11 @@ fn included(tree: &Tree, c: ViewId) -> bool {
 /// `View::GetPreferredSize(max)` after `UpdatePreferredSize` clamping.
 /// Ungrouped clamped preferred size.
 fn pref_plain(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
+    if env.group_depth == 0 {
+        if let Some(p) = env.preferred.get(&(id, max)) {
+            return *p;
+        }
+    }
     let v = &tree.views[id];
     let mut p = calc(env, tree, id, max);
     if !max {
@@ -41,6 +48,9 @@ fn pref_plain(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
     } else {
         p.x = p.x.max(v.min_size.x).max(v.max_size.x).min(v.max_limit.x);
         p.y = p.y.max(v.min_size.y).max(v.max_size.y).min(v.max_limit.y);
+    }
+    if env.group_depth == 0 {
+        env.preferred.insert((id, max), p);
     }
     p
 }
@@ -60,6 +70,7 @@ fn group_width(env: &mut Env, tree: &Tree, id: ViewId, group: &str, owner: &str)
         return *w;
     }
     env.groups.insert((o, group.to_string()), (-1.0, -1.0)); // nested members of the same group see "no group" while it is computed
+    env.group_depth += 1;
     let mut members = vec![];
     let mut stack = vec![o];
     while let Some(v) = stack.pop() {
@@ -70,19 +81,15 @@ fn group_width(env: &mut Env, tree: &Tree, id: ViewId, group: &str, owner: &str)
     }
     let w = members.iter().fold((-1.0f32, -1.0f32), |a, m| (a.0.max(pref_plain(env, tree, *m, false).x), a.1.max(pref_plain(env, tree, *m, true).x)));
     env.groups.insert((o, group.to_string()), w);
+    env.group_depth -= 1;
+    // Group discovery temporarily suppresses nested group widths.
+    env.preferred.clear();
     w
 }
 
 pub fn pref(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
     let v = &tree.views[id];
-    let mut p = calc(env, tree, id, max);
-    if !max {
-        p.x = p.x.max(v.min_size.x).min(v.max_limit.x);
-        p.y = p.y.max(v.min_size.y).min(v.max_limit.y);
-    } else {
-        p.x = p.x.max(v.min_size.x).max(v.max_size.x).min(v.max_limit.x);
-        p.y = p.y.max(v.min_size.y).max(v.max_size.y).min(v.max_limit.y);
-    }
+    let mut p = pref_plain(env, tree, id, max);
     if let Some((g, owner)) = v.width_group.clone() {
         // guard against the member computing its own group while the group is being computed (members never nest in Skills.xml)
         let w = group_width(env, tree, id, &g, &owner);
@@ -93,9 +100,18 @@ pub fn pref(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
 
 fn node_calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
     let v = &tree.views[id];
-    let kids: Vec<ViewId> = v.children.iter().copied().filter(|c| included(tree, *c)).collect();
+    let sizing_child = v.selector_pref_child.filter(|child| v.children.contains(child));
+    let kids: Vec<ViewId> = v.children.iter().copied().filter(|c| {
+        if v.node == Node::Selector && sizing_child.is_some() { Some(*c) == sizing_child } else { included(tree, *c) }
+    }).collect();
     // (cmin, cmax, borders) per included child
-    let info: Vec<(Point, Point, Rect)> = kids.iter().map(|c| (pref(env, tree, *c, false), pref(env, tree, *c, true), tree.views[*c].borders)).collect();
+    let info: Vec<(Point, Point, Rect)> = kids.iter().map(|c| {
+        let min = pref(env, tree, *c, false);
+        // Minimum aggregation never consumes the maximum; do not recursively
+        // calculate it (including during uncached width-group discovery).
+        let mx = if max { pref(env, tree, *c, true) } else { min };
+        (min, mx, tree.views[*c].borders)
+    }).collect();
     match v.node {
         Node::H => {
             let (mut min, mut mx) = (Point::new(-1.0, 0.0), Point::new(-1.0, BIG));
@@ -131,7 +147,7 @@ fn node_calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
                 min
             }
         }
-        Node::Base => {
+        Node::Base | Node::Selector => {
             let (mut min, mut mx) = (Point::new(-1.0, -1.0), Point::new(BIG, BIG));
             for (cmin, cmax, b) in &info {
                 min.x = min.x.max(cmin.x + b.l + b.r);
@@ -401,6 +417,14 @@ pub fn space_out(n: usize, avail: f32, sum_min: f32, total_weight: f32, min: &[f
 /// Sets `id`'s frame (inclusive extents, parent coordinates) and re-lays-out its subtree
 /// (`View::SetFrame` 0x1014cce5 → `_ReLayout`).
 pub fn set_frame(env: &mut Env, tree: &mut Tree, id: ViewId, frame: Rect) {
+    if tree.views[id].frame != frame {
+        // Multiline text measures against its frame; ancestors and width groups
+        // can therefore change preferred size too.
+        // ponytail: whole-pass invalidation can be quadratic on deep trees;
+        // track dependent ancestors/groups only if resize profiling warrants it.
+        env.preferred.clear();
+        env.groups.clear();
+    }
     tree.views[id].frame = frame;
     layout(env, tree, id);
 }
@@ -423,7 +447,7 @@ pub fn layout(env: &mut Env, tree: &mut Tree, id: ViewId) {
     }
     match tree.views[id].node {
         Node::None => {}
-        Node::Base => {
+        Node::Base | Node::Selector => {
             let kids: Vec<ViewId> = tree.views[id].children.iter().copied().filter(|c| included(tree, *c)).collect();
             for c in kids {
                 let r = b.shrink(&tree.views[c].borders);
@@ -524,6 +548,14 @@ fn layout_scroll(env: &mut Env, tree: &mut Tree, id: ViewId) {
                 }
                 (vbar, hbar) = (nv, nh);
             }
+            // A folder collapse, page resize or content update can shorten the scroll range.
+            let viewport = tree.views[client].frame;
+            let max_x = (content_width(env, tree, client) - viewport.width()).max(0.0);
+            let max_y = (content_height(env, tree, client) - viewport.height()).max(0.0);
+            if let Kind::ScrollView(scroll) = &mut tree.views[id].kind {
+                scroll.offset.x = scroll.offset.x.clamp(0.0, max_x);
+                scroll.offset.y = scroll.offset.y.clamp(0.0, max_y);
+            }
         }
         Kind::ScrollChild => {
             let Some(inner) = tree.views[id].children.first().copied() else { return };
@@ -578,5 +610,42 @@ pub fn content_width(env: &mut Env, tree: &mut Tree, scroll_child: ViewId) -> f3
         }
     } else {
         cmin.x
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_preferred_sizes_are_cached_and_frames_invalidate_groups() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let skin = dir.join("cd_image/gui/Default");
+        let gfx = GfxSet::load(&skin).unwrap();
+        let mut fonts = FontSystem::new(&dir.join("cd_image"), &gfx, None).unwrap();
+        let colors = Colors::load(&skin).unwrap();
+        let mut tree = Tree::default();
+        let root = tree.add(View::new(Kind::View));
+        tree.views[root].node = Node::V;
+        let mut parent = root;
+        for _ in 0..32 {
+            let child = tree.add(View::new(Kind::View));
+            tree.views[child].node = Node::V;
+            tree.append_child(parent, child);
+            parent = child;
+        }
+        let leaf = tree.add(View::new(Kind::Spacer { min: Point::new(12.0, 7.0), max: Point::new(24.0, 9.0) }));
+        tree.append_child(parent, leaf);
+        let mut env = Env { gfx: &gfx, fonts: &mut fonts, colors: &colors, groups: Default::default(), preferred: Default::default(), group_depth: 0 };
+        assert_eq!(pref(&mut env, &tree, root, false), Point::new(12.0, 7.0));
+        assert_eq!(pref(&mut env, &tree, root, true), Point::new(24.0, 9.0));
+        assert_eq!(env.preferred.len(), tree.views.len() * 2);
+        tree.views[leaf].width_group = Some(("width".into(), String::new()));
+        assert_eq!(pref(&mut env, &tree, leaf, false).x, 12.0);
+        assert!(!env.groups.is_empty());
+        set_frame(&mut env, &mut tree, leaf, Rect::new(0.0, 0.0, 100.0, 20.0));
+        assert!(env.preferred.is_empty());
+        assert!(env.groups.is_empty());
     }
 }

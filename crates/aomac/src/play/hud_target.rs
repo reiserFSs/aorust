@@ -334,6 +334,10 @@ impl HudTarget {
         }
         Ok(t)
     }
+    pub(super) fn persistent_windows(&self) -> impl Iterator<Item = (WindowId, &'static str)> + '_ {
+        self.bars.iter().map(|b| (b.window, if b.hostile { "CCHostileHealthBarConfig" } else { "CCFriendlyHealthBarConfig" }))
+    }
+
 
     fn bar_width(size: (u32, u32)) -> f32 {
         ((size.0 as f32 - SIDE_MARGIN) * 0.5 - BAR_MARGIN).floor().max(64.0)
@@ -380,11 +384,15 @@ impl HudTarget {
 
     fn place(&mut self, gui: &mut Gui) {
         let sw = self.size.0 as f32;
-        for b in &self.bars {
-            let (ww, _) = gui.window_size(b.window);
+        for b in &mut self.bars {
+            let (ww, hh) = gui.window_size(b.window);
+            // CharBarWindow's child mouse signals move its style-3 frame (GUI 10067b8c/10067bf4).
+            gui.set_window_move_region(b.window, Some(ao_gui::Rect::new(0.0, 0.0, ww.saturating_sub(1) as f32, hh.saturating_sub(1) as f32)));
+            if gui.window_moved(b.window) { continue; }
             let k = if b.hostile { 1.5 } else { 0.5 };
             let x = ((sw - SIDE_MARGIN) * 0.5 * k - ww as f32 * 0.5).floor();
-            gui.set_window_pos(b.window, (x as i32, 5));
+            let pos = (x as i32, 5);
+            gui.set_window_pos(b.window, pos);
         }
     }
 
@@ -634,13 +642,12 @@ impl HudTarget {
                 }
                 gui.set_canvas(b.window, bar, items);
             }
-            gui.relayout_window(b.window);
+            gui.resize_window(b.window, WindowSize::Preferred);
             b.rows = targets;
         }
         if layout_changed {
             gui.relayout_window(self.cc);
         }
-        self.place(gui);
         // `FUN_10073b9e`: the target-of-target button of the shown hostile window (pref `Targetstarget`, `N3Msg_GetTargetTarget`)
         let tot = self
             .targets_target
@@ -655,9 +662,10 @@ impl HudTarget {
                 if let Some(t) = tot {
                     gui.set_text(w, "tot_name", &format!("<font color=0xffffff>{}</font>", clean(&zone.dynels[&t].name)));
                 }
-                gui.relayout_window(w);
+                gui.resize_window(w, WindowSize::Preferred);
             }
         }
+        self.place(gui);
         let hover = self.dock_at(gui, self.mouse.0, self.mouse.1);
         for d in &self.docks {
             for p in [Part::Prev, Part::Button, Part::Next] {
@@ -1014,6 +1022,43 @@ mod tests {
         zone.dynels.insert(1, dyn_at("Aomacvolk", [0.0; 3], false, 1));
         zone.dynels.insert(2, DynelState { health: 45, max_health: 60, ..dyn_at("Surf Lizard", [0.0, 0.0, 5.0], true, 0) });
         Some(Fe { gui, ht, zone })
+    }
+
+    #[test]
+    fn moved_target_bars_survive_updates_and_resize() {
+        let Some(mut fe) = fe((1280, 800)) else { return };
+        let ids: Vec<_> = fe.ht.persistent_windows().map(|(id, _)| id).collect();
+        for (i, id) in ids.iter().enumerate() {
+            fe.gui.set_window_pos(*id, (200 + i as i32 * 220, 90));
+            fe.gui.set_window_moved(*id, true);
+        }
+        fe.zone.target = Some(2);
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        fe.ht.resize(&mut fe.gui, (1920, 1080));
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(fe.gui.window_pos(*id), (200 + i as i32 * 220, 90));
+        }
+    }
+
+    #[test]
+    fn target_bar_window_adopts_live_width_and_visible_rows() {
+        let Some(mut fe) = fe((1280, 800)) else { return };
+        fe.zone.target = Some(2);
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        let w = fe.ht.bars[1].window;
+        let single = fe.gui.window_size(w);
+        let bar = fe.gui.view_rect(w, "bar").unwrap();
+        let pos = fe.gui.window_pos(w);
+        assert_eq!(bar.t, pos.1 as f32, "a collapsed second row must not centre the first row below its native origin");
+        assert!(bar.l >= pos.0 as f32 && bar.r < pos.0 as f32 + single.0 as f32, "the live bar width must fit its window");
+        fe.zone.dynels.insert(3, dyn_at("Boar", [0.0, 0.0, 9.0], true, 0));
+        fe.zone.fight_target.insert(1, 3);
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert!(fe.gui.window_size(w).1 > single.1);
+        fe.zone.fight_target.remove(&1);
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert_eq!(fe.gui.window_size(w), single);
     }
 
     #[test]

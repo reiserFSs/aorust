@@ -44,11 +44,21 @@ impl Gui {
         self.tree.views[id].min_size.y = 0.0;
         self.tree.views[id].max_size.y = 0.0;
         self.tree.views[id].max_limit.y = 16000.0;
-        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default() };
+        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default(), preferred: Default::default(), group_depth: 0 };
         let height = layout::pref(&mut env, &self.tree, id, false).y;
         self.tree.views[id].min_size.y = height;
         self.tree.views[id].max_size.y = height;
         self.tree.views[id].max_limit.y = height;
+        self.relayout_window(w);
+    }
+
+    /// `View::LimitMaxSize(Point(minPreferred.x, ...))`: keep an owner's content width.
+    pub fn fit_view_width(&mut self, w: WindowId, name: &str) {
+        let Some(id) = self.find(w, name) else { return };
+        self.tree.views[id].max_limit.x = 16000.0;
+        let mut env = Env { gfx: &self.gfx, fonts: &mut self.fonts, colors: &self.colors, groups: Default::default(), preferred: Default::default(), group_depth: 0 };
+        let width = layout::pref(&mut env, &self.tree, id, false).x;
+        self.tree.views[id].max_limit.x = width;
         self.relayout_window(w);
     }
 

@@ -43,6 +43,32 @@ const COLLAPSE: &str = "GFX_GUI_ROLLUP_COLLAPSE_STATE1";
 const CLOSE: &str = "GFX_GUI_WINDOW_CLOSE_X";
 const BG: &str = "GFX_GUI_TAB_BACKGROUND";
 
+/// `MiniToolbar_c` 0x100726b3: ordered view identity, DValue, tooltip and native art.
+pub(super) const TOOLBAR: [(&str, &str, &str, &str); 10] = [
+    ("mini_wear", "wear_window", "Wear", "GFX_GUI_SB_WEAR"),
+    ("mini_action", "specialaction_window", "Controls", "GFX_GUI_SB_ACTION"),
+    ("mini_ref", "knowledge_window", "Knowledge", "GFX_GUI_SB_REF"),
+    ("mini_mission", "mission_window", "Mission", "GFX_GUI_SB_MISSION"),
+    ("mini_team", "team_view", "Team", "GFX_GUI_SB_TEAM"),
+    ("mini_map", "map_window", "Map", "GFX_GUI_SB_MAP"),
+    ("mini_friends", "friends_window", "Friends", "GFX_GUI_SB_FRIENDS"),
+    ("mini_nano", "nano_window", "Programs", "GFX_GUI_SB_NANO"),
+    ("mini_stat", "stat_window", "Stats", "GFX_GUI_SB_STAT"),
+    ("mini_ncu", "ncu_window", "NCU", "GFX_GUI_SB_NCU"),
+];
+
+pub(super) fn fill_toolbar(gui: &mut Gui, window: WindowId) -> anyhow::Result<()> {
+    let mut src = String::from("<root><View view_layout=\"horizontal\" v_alignment=\"top\">");
+    // 0x10072b33: raised = OFF; pressed and hover = ON; native tooltip has no body.
+    // 0x100724e8 advances by inclusive button width + 1, with no extra gap.
+    for (view, _, tooltip, art) in TOOLBAR {
+        src += &format!("<Button name=\"{view}\" gfxid_raised=\"{art}_OFF\" gfxid_pressed=\"{art}\" gfxid_hover=\"{art}\" tooltip=\"{tooltip}\"/>");
+    }
+    src += "</View></root>";
+    gui.add_view_xml(window, "CCMiniToolbar", "MiniToolbarButtons", &src)?;
+    Ok(())
+}
+
 /// `page_height` / `is_page_expanded` of a docked view (`dock_node_configs`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageConfig {
@@ -218,11 +244,12 @@ impl Rollup {
 
     /// Size an owner wrapper from its page height, not its free-resize ceiling.
     fn resize_page(&self, gui: &mut Gui, page: &Page) {
+        let width = if page.docked { AREA_W } else { gui.window_size(page.window).0 };
         if page.wrapped {
             let Some(config) = self.config.iter().find(|c| c.key == page.key) else {
                 // No saved page height: retain the current content size, rather than
                 // deriving a new preferred height from the wrapper's elastic body.
-                let (width, height) = gui.window_size(page.window);
+                let height = gui.window_size(page.window).1;
                 gui.resize_window(page.window, WindowSize::Fixed(width, height));
                 return;
             };
@@ -233,6 +260,8 @@ impl Rollup {
         } else {
             gui.resize_window(page.window, WindowSize::Preferred);
         }
+        let height = gui.window_size(page.window).1;
+        gui.resize_window(page.window, WindowSize::Fixed(width, height));
     }
 
     /// Places the pages (`FUN_10048232`): top to bottom from the area top minus the scroll offset, [`GAP`] px apart.

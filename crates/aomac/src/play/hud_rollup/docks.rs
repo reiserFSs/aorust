@@ -1,7 +1,7 @@
 //! Dockable-view moves (`RollupController` 0x10048d3f, DockWindow 0x1003bdd4).
 use super::*;
 use crate::play::hud_wincfg::DockState;
-use ao_gui::{MouseButton, WindowSize};
+use ao_gui::MouseButton;
 
 pub(super) struct DockGroup {
     name: String,
@@ -126,8 +126,6 @@ impl Rollup {
         gui.show_collapsing(p.window, "rollup_header", true);
         gui.show_collapsing(p.window, "body", p.expanded);
         self.resize_page(gui, &p);
-        let h = gui.window_size(p.window).1;
-        gui.resize_window(p.window, WindowSize::Fixed(AREA_W, h));
         let at = self.pages.iter().position(|p| p.docked && gui.window_pos(p.window).1 + gui.window_size(p.window).1 as i32 / 2 > y).unwrap_or(self.pages.len());
         self.pages.insert(at, p);
         let keys: Vec<_> = self.pages.iter().filter(|p| p.docked).map(|p| p.key.clone()).collect();
@@ -320,10 +318,7 @@ impl Rollup {
                 gui.show_collapsing(p.window, "rollup_header", true);
                 p.expanded = self.config.iter().find(|c| c.key == p.key).is_none_or(|c| c.expanded);
                 gui.show_collapsing(p.window, "body", p.expanded);
-                let window = p.window;
                 self.resize_page(gui, &self.pages[i]);
-                let h = gui.window_size(window).1;
-                gui.resize_window(window, WindowSize::Fixed(AREA_W, h));
             } else {
                 gui.show_collapsing(p.window, "rollup_header", false);
                 gui.show_collapsing(p.window, "body", true);
@@ -339,6 +334,30 @@ impl Rollup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wrapped_dock_toggle_keeps_column_width_and_owner_rows() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut rollup = Rollup::new(&dir, (1280, 800));
+        let xml = "<root><View view_layout=\"vertical\"><CanvasView name=\"rows\" min_size=\"Point(0,120)\" max_size=\"Point(16000,120)\"/></View></root>";
+        let window = gui.open_tabbed_window_xml("team_test", "Team", xml, (100, 100), WindowSize::Fixed(185, 140)).unwrap();
+        rollup.register_window(&mut gui, "team_test", window).unwrap();
+        rollup.dock_page(&mut gui, "team_test", AREA_TOP);
+        for expanded in [false, true, false, true] {
+            let index = rollup.pages.iter().position(|p| p.window == window).unwrap();
+            rollup.set_expanded(&mut gui, index, expanded, (15, 15));
+            assert_eq!(gui.window_size(window).0, AREA_W);
+            if expanded {
+                let body = gui.view_rect(window, "body").unwrap();
+                let rows = gui.view_rect(window, "rows").unwrap();
+                assert!(rows.l >= body.l && rows.r <= body.r, "{rows:?} outside {body:?}");
+            }
+        }
+        rollup.free_page(&mut gui, "team_test", 100, 100);
+        assert_eq!(gui.window_size(window).0, AREA_W, "undock must not request the elastic maximum width");
+    }
+
     #[test]
     fn docked_viewport_culls_and_free_page_removes_clip() {
         let dir = ao_gui::client_dir();

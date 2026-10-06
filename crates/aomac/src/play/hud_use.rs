@@ -26,6 +26,16 @@ impl Play {
                 }
                 // type 6: `N3Msg_PerformSpecialAction(Action_e)` -> `FUN_1004256c` (docs/zone/combat-net.md §5.3)
                 SlotUse::SpecialAction(a) => self.special_action(a),
+                SlotUse::Item(slot) => {
+                    if let Some(h) = self.hud.as_mut() {
+                        h.activate_item(&self.zone, slot);
+                    }
+                }
+                SlotUse::Nano(id) => {
+                    if let Some(h) = self.hud.as_mut() {
+                        h.activate_nano(&mut self.gui, &self.zone, id);
+                    }
+                }
                 SlotUse::Unavailable => {
                     if let Some(c) = self.chat.as_mut() {
                         c.feedback(&mut self.gui, "Feedback_ActionIsNotAvailable", &self.text);

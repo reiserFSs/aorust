@@ -47,6 +47,8 @@ pub enum Node {
     None,
     /// `LayoutNode` base class: children fill the bounds (BorderView, TextInputView).
     Base,
+    /// `ViewSelector_c`: selection sizes the page without reflowing its ancestors.
+    Selector,
     V,
     H,
 }
@@ -281,6 +283,8 @@ pub struct View {
     pub h_align: Align,
     pub v_align: Align,
     pub node: Node,
+    /// Unresolved initial sizing convention: anchor preferences to the initial page, not visibility (docs/gui.md).
+    pub selector_pref_child: Option<ViewId>,
     pub stacked: bool,
     pub flags: u32,
     pub visible: bool,
@@ -321,6 +325,7 @@ impl View {
             h_align: Align::Center,
             v_align: Align::Center,
             node: Node::None,
+            selector_pref_child: None,
             stacked: false,
             flags: 0,
             visible: true,
@@ -647,6 +652,14 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             }
             id
         }
+        "CCMiniToolbar" => {
+            // The application supplies the native control-centre window toggles.
+            let mut v = View::new(Kind::View);
+            apply_view_attrs(&mut v, e, 0);
+            v.name = "CCMiniToolbar".into();
+            v.node = Node::H;
+            tree.add(v)
+        }
         "CCMenu" => {
             // ControlMenu_c root (GUI.dll 0x10071524, no own window): entries stacked vertically (0x1007086f: pitch = height + 4);
             // the application fills it (`Gui::add_view_xml`), found by its `script` name.
@@ -701,8 +714,8 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             apply_view_attrs(&mut v, e, 0);
             let id = tree.add(v);
             load_children(tree, ctx, id, e);
-            // children fill the bounds (`LayoutNode`: preferred size = largest child), only the selected one is shown
-            tree.views[id].node = Node::Base;
+            // Initial preferred sizing retains the existing selected-page convention; docs/gui.md.
+            tree.views[id].node = Node::Selector;
             id
         }
         "ScrollViewChild" => {

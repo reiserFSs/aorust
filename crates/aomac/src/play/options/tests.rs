@@ -76,9 +76,6 @@ impl Rig {
         }
         self.gui.list_select(id, TREE, &leaf, true, true);
         self.send(InputEvent::MouseMove { x: 0.0, y: 0.0 });
-        self.opt.win.as_mut().unwrap().selected = page;
-        self.gui.select_child(id, PAGES, Some(page));
-        self.send(InputEvent::MouseMove { x: 0.0, y: 0.0 });
         // scroll the page (its `ScrollView`) until the control is inside the viewport
         let pg = format!("pg{page}");
         for _ in 0..3 {
@@ -95,6 +92,19 @@ impl Rig {
     fn click(&mut self, view: &str) {
         let r = self.gui.view_rect(self.win(), view).unwrap_or_else(|| panic!("no view {view}"));
         let (x, y) = (r.l + 3.0, r.t + 3.0);
+        self.send(InputEvent::MouseMove { x, y });
+        self.send(InputEvent::MouseDown { x, y, button: MouseButton::Left });
+        self.send(InputEvent::MouseUp { x, y, button: MouseButton::Left });
+    }
+
+    fn click_tree(&mut self, item: &str) {
+        let id = self.win();
+        let row = self.gui.list_item_rect(id, TREE, item).unwrap();
+        let viewport = self.gui.view_rect(id, TREE).unwrap();
+        let offset = self.gui.scroll_offset(id, TREE);
+        self.gui.set_scroll_offset(id, TREE, offset + row.t - viewport.t);
+        let row = self.gui.list_item_rect(id, TREE, item).unwrap();
+        let (x, y) = (row.l + 3.0, row.t + 3.0);
         self.send(InputEvent::MouseMove { x, y });
         self.send(InputEvent::MouseDown { x, y, button: MouseButton::Left });
         self.send(InputEvent::MouseUp { x, y, button: MouseButton::Left });
@@ -116,6 +126,49 @@ fn label_paths_split_into_folder_levels() {
     let l = levels("GUI/Control Center");
     assert_eq!(l, [("GUI".into(), "GUI".into(), false), ("GUIControl Center".into(), "Control Center".into(), true)]);
     assert_eq!(levels("Audio"), [("Audio".into(), "Audio".into(), true)]);
+}
+
+#[test]
+fn category_selection_keeps_quit_buttons_inside_preferences() {
+    let Some(mut r) = Rig::new() else { return };
+    // Synchronization must still react to an external archive change, not only local edits.
+    r.d.set("KeyBindings", Variant::Archive(keys::Bindings::default().archive()));
+    r.tick();
+    assert!(r.opt.keypages.rows().iter().all(|row| row.input == 0));
+    r.tick();
+    assert!(r.opt.keypages.rows().iter().all(|row| row.input == 0));
+    let id = r.win();
+    let outer = r.gui.window_outer_frame(id).unwrap();
+    let leaves = r.opt.win.as_ref().unwrap().leaves.clone();
+    for folder in r.opt.win.as_ref().unwrap().folders.clone() {
+        r.gui.list_open_folder(id, TREE, &folder, true);
+    }
+    let category_frame = r.gui.view_rect(id, TREE).unwrap();
+    for (page, leaf) in leaves.iter().enumerate() {
+        r.click_tree(leaf);
+        assert_eq!(r.opt.win.as_ref().unwrap().selected, page, "{leaf}");
+        assert_eq!(r.gui.window_outer_frame(id), Some(outer), "{leaf}");
+        let tree = r.gui.view_rect(id, TREE).unwrap();
+        assert_eq!(tree, category_frame, "{leaf}: selecting a page moves the category pane");
+        assert!(tree.r > tree.l, "{leaf}: category tree has negative width: {tree:?}");
+        let viewport = r.gui.view_rect(id, &format!("pg{page}")).unwrap();
+        for button in ["b1", "b2"] {
+            let rect = r.gui.view_rect(id, button).unwrap();
+            assert!(rect.l >= outer.0 as f32, "{leaf}: {button} escapes left edge: {rect:?}");
+            assert!(rect.t > tree.b, "{leaf}: {button} overlaps tree: {rect:?} / {tree:?}");
+            assert!(rect.r < viewport.l, "{leaf}: {button} overlaps page: {rect:?} / {viewport:?}");
+            assert!(rect.b < (outer.1 + outer.3 as i32) as f32, "{leaf}: {button} escapes window: {rect:?}");
+        }
+        // Folder content changes must not remeasure the currently visible page into the root.
+        let folder = r.opt.win.as_ref().unwrap().folders[0].clone();
+        r.click_tree(&folder);
+        r.click_tree(&folder);
+        assert_eq!(r.gui.view_rect(id, TREE), Some(category_frame), "{leaf}: folder toggles reflow the pane");
+    }
+    r.click("b1");
+    assert_eq!(r.opt.take_actions(), [Action::Quit]);
+    r.click("b2");
+    assert_eq!(r.opt.take_actions(), [Action::Camp]);
 }
 
 #[test]

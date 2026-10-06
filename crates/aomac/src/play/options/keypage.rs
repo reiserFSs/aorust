@@ -87,8 +87,9 @@ pub(super) struct KeyPages {
     dir: std::path::PathBuf,
     texts: Texts,
     screen: (u32, u32),
-    /// The working copy of the binding table (re-read from the DValue every frame).
+    /// The working copy of the binding table, refreshed when its archive changes.
     table: Bindings,
+    source: Option<String>,
     fixed_ids: Vec<(String, String)>,
 }
 
@@ -134,6 +135,7 @@ impl KeyPages {
             texts: Texts { no_key: t("NoKey"), ok: t("MsgBox_OK"), cancel: t("MsgBox_Cancel"), body: t("BindDialogText") },
             screen,
             table: Bindings::default(),
+            source: None,
             fixed_ids: vec![],
         }
     }
@@ -299,6 +301,7 @@ impl KeyPages {
             }
             self.rows.extend(inputs.into_iter().map(|input| Row { provider: p.hash, input }));
         }
+        gui.batch_updates(|gui| {
         gui.multi_clear(win, BINDS);
         for (i, r) in self.rows.iter().enumerate() {
             let p = self.providers.iter().find(|p| p.hash == r.provider).unwrap();
@@ -311,6 +314,7 @@ impl KeyPages {
         } else {
             self.selected = None;
         }
+        });
     }
 
     /// The rows in list order (tests).
@@ -321,7 +325,9 @@ impl KeyPages {
 
     fn store(&mut self, d: &mut DValues) {
         self.table.version = keys::VERSION.max(self.table.version);
-        d.set("KeyBindings", Variant::Archive(self.table.archive()));
+        let archive = self.table.archive();
+        self.source = Some(archive.clone());
+        d.set("KeyBindings", Variant::Archive(archive));
     }
 
     /// The table in the DValue changed under us (another tab, a reset): the rows follow.
@@ -330,6 +336,10 @@ impl KeyPages {
             return;
         }
         if let Some(Variant::Archive(t)) = d.get("KeyBindings") {
+            if self.source.as_deref() == Some(t.as_str()) {
+                return;
+            }
+            self.source = Some(t.clone());
             let b = Bindings::from_archive(t);
             if b != self.table {
                 self.table = b;

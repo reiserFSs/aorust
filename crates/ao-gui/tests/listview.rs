@@ -27,6 +27,50 @@ fn click(g: &mut Gui, x: f32, y: f32) -> Vec<Event> {
 }
 
 #[test]
+fn nested_population_batch_matches_immediate_list_layout() {
+    let Some((mut immediate, wi)) = rig() else { return };
+    let Some((mut batched, wb)) = rig() else { return };
+    let populate = |g: &mut Gui, w| {
+        let mut folder = ListItem::new("folder", "Folder", 0xd5, 0xd4);
+        folder.folder = true;
+        folder.open = true;
+        g.list_add(w, "fl", None, folder);
+        for i in 0..20 {
+            g.list_add(w, "fl", Some("folder"), ListItem::new(&format!("row{i}"), &format!("Row {i}"), 0xd8, 0));
+        }
+        g.multi_add_column(w, "ml", 0, "Category", 100.0, 8);
+        for i in 0..20 {
+            g.multi_add_row(w, "ml", i, vec![MultiCell::unsorted(&format!("Row {i}"))], true);
+        }
+    };
+    populate(&mut immediate, wi);
+    batched.batch_updates(|g| g.batch_updates(|g| populate(g, wb)));
+    for view in ["fl", "ml"] {
+        assert_eq!(batched.view_rect(wb, view), immediate.view_rect(wi, view));
+    }
+    assert_eq!(batched.multi_row_ids(wb, "ml"), immediate.multi_row_ids(wi, "ml"));
+    assert_eq!(batched.list_item(wb, "fl", "row19").unwrap().size, immediate.list_item(wi, "fl", "row19").unwrap().size);
+}
+
+#[test]
+fn collapsing_scrolled_folder_clamps_offset_without_another_scroll_event() {
+    let Some((mut g, w)) = rig() else { return };
+    g.batch_updates(|g| {
+        let mut folder = ListItem::new("folder", "Folder", 0xd5, 0xd4);
+        folder.folder = true;
+        folder.open = true;
+        g.list_add(w, "fl", None, folder);
+        for i in 0..30 {
+            g.list_add(w, "fl", Some("folder"), ListItem::new(&format!("row{i}"), "Row", 0xd8, 0));
+        }
+    });
+    g.set_scroll_offset(w, "fl", 10000.0);
+    assert!(g.scroll_offset(w, "fl") > 0.0);
+    g.list_open_folder(w, "fl", "folder", false);
+    assert_eq!(g.scroll_offset(w, "fl"), 0.0);
+}
+
+#[test]
 fn dropdown_opens_a_popup_and_selects_by_index_with_ids() {
     let Some((mut g, w)) = rig() else { return };
     // inserting at an id as index, the first insert selects item 0 and raises the signal

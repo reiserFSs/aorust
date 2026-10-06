@@ -10,8 +10,8 @@
 //!   `<CharPrefsPath>/DockAreas/<dock_name>.xml` = `{dock_name, dock_type, dock_config}` (`FUN_1003a005` builds the directory, `FUN_1003a5e6` reads every file
 //!   of it back) -> [`Store::Dock`]. The dock's `docked_view_identities` is the dvalue name of the view (`inventory_window`, `team_view`, ...).
 //!
-//! The wear / stat / nano / friends pages are `RollupArea` pages (`hud_rollup.rs`); the `CharBarWindow_c`, compass and shortcut bar windows are created
-//! with the window flag 0x8 (not movable: flags 0xe3c / 0xd3c / 0x183c, `WndBorder::HitTest` 0x101593d6), so their frame never changes.
+//! The wear / stat / nano / friends pages are `RollupArea` pages (`hud_rollup.rs`).
+//! Control-centre windows retain their own DValue archives; shortcut windows retain their container XML.
 //!
 //! Plain windows are tracked by [`WinCfgs::update`]. Dock windows are saved by the controller through
 //! [`WinCfgs::save_docks`], retaining ordered identities, selected tabs and rollup node configuration.
@@ -52,9 +52,10 @@ pub(super) enum Store {
     Value(&'static str),
     /// `DockAreas/<dock_name>.xml` of the dock holding this view identity.
     Dock(&'static str),
+    Container(usize),
 }
 
-/// The store of a window kind; `None` for the rollup pages, the options window (own archive, `options.rs`) and the fixed windows.
+/// The store of a window kind; rollup pages, options and separately registered HUD surfaces use their owner's store.
 pub(super) fn store_of(kind: WindowKind) -> Option<Store> {
     Some(match kind {
         WindowKind::Skills => Store::Value("SkillConfig"),
@@ -248,7 +249,7 @@ fn write_dock(state: &DockState, root: &mut Element) {
 }
 
 struct Tracked {
-    kind: WindowKind,
+    kind: Option<WindowKind>,
     id: WindowId,
     store: Store,
     last: Cfg,
@@ -357,6 +358,11 @@ impl WinCfgs {
                 (cfg, true)
             }
             Store::Dock(id) => find_dock(d.char_dir(), &self.client, id).map_or((Cfg::default(), false), |(_, e, user)| (Cfg::parse(&e), user)),
+            Store::Container(n) => {
+                let cfg = d.char_dir().and_then(|p| std::fs::read_to_string(p.join(format!("Containers/ShortcutBar_{n}.xml"))).ok())
+                    .and_then(|s| xml::parse(&s).ok()).map(|e| Cfg::parse(&e)).unwrap_or_default();
+                (cfg, true)
+            }
         }
     }
 
@@ -364,26 +370,37 @@ impl WinCfgs {
     /// `MoveInsideScreen`, the pin state; the window becomes movable (`WndBorder::HitTest`, flags without 0x8). Windows without a store are left alone.
     pub fn attach(&mut self, gui: &mut Gui, d: &DValues, kind: WindowKind, id: WindowId, screen: (u32, u32)) {
         let Some(store) = store_of(kind) else { return };
-        self.tracked.retain(|t| t.kind != kind);
+        self.tracked.retain(|t| t.kind != Some(kind));
         let size = resizable(kind);
         gui.set_window_frame(id, true, size);
-        self.apply(gui, d, kind, id, store, screen);
+        self.apply(gui, d, Some(kind), id, store, screen);
         // a dock stores `selected_tab` (`~DockWindow_c` 0x1003b672: `Window::GetTabSelection`, 0 for the single tab), a plain window does not
         let tab = matches!(store, Store::Dock(_)).then(|| self.load(d, store).0.tab.unwrap_or(0));
         if let Some(last) = current(gui, id, tab) {
-            self.tracked.push(Tracked { kind, id, store, last });
+            self.tracked.push(Tracked { kind: Some(kind), id, store, last });
         }
     }
 
-    fn apply(&self, gui: &mut Gui, d: &DValues, kind: WindowKind, id: WindowId, store: Store, screen: (u32, u32)) {
+    /// Registers an unframed control-centre window without changing its chrome.
+    pub fn attach_hud(&mut self, gui: &mut Gui, d: &DValues, id: WindowId, store: Store, screen: (u32, u32)) {
+        self.tracked.retain(|t| t.id != id);
+        self.apply(gui, d, None, id, store, screen);
+        if let Some(last) = current(gui, id, None) {
+            self.tracked.push(Tracked { kind: None, id, store, last });
+        }
+    }
+
+    fn apply(&self, gui: &mut Gui, d: &DValues, kind: Option<WindowKind>, id: WindowId, store: Store, screen: (u32, u32)) {
         let (cfg, user) = self.load(d, store);
+        if kind.is_none() { gui.set_window_moved(id, false); }
         if let (Some([l, t, r, b]), true) = (cfg.frame, user) {
             let (x, y, w, h) = (l as i32, t as i32, (r - l) as u32 + 1, (b - t) as u32 + 1);
-            if resizable(kind) {
+            if kind.is_some_and(resizable) {
                 gui.set_window_outer_frame(id, (x, y, w, h));
             }
             let (w, h) = gui.outer_size(id);
             gui.set_window_pos(id, inside_screen((x, y, w, h), screen));
+            if kind.is_none() { gui.set_window_moved(id, true); }
         }
         if let Some(p) = cfg.pin {
             gui.set_window_pinned(id, p);
@@ -402,10 +419,21 @@ impl WinCfgs {
         }
     }
 
+    /// View-owned HUD drag callbacks call `MoveInsideScreen` after `MoveBy`.
+    pub fn hud_frame_event(&self, gui: &mut Gui, ev: &ao_gui::Event, screen: (u32, u32)) -> bool {
+        let ao_gui::Event::WindowFrame { window } = ev else { return false };
+        if !self.tracked.iter().any(|t| t.kind.is_none() && t.id == *window) { return false; }
+        if let Some(frame) = gui.window_outer_frame(*window) {
+            gui.set_window_pos(*window, inside_screen(frame, screen));
+        }
+        true
+    }
+
     /// Keep windows touching a screen edge attached to that edge when the
     /// viewport changes, then apply `MoveInsideScreen` without changing size.
     pub fn resize_screen(&mut self, gui: &mut Gui, old: (u32, u32), new: (u32, u32)) {
         for t in &self.tracked {
+            if t.kind.is_none() && !gui.window_moved(t.id) { continue; }
             let Some((x, y, w, h)) = gui.window_outer_frame(t.id) else { continue };
             let x = if x + w as i32 == old.0 as i32 { new.0 as i32 - w as i32 } else { x };
             let y = if y + h as i32 == old.1 as i32 { new.1 as i32 - h as i32 } else { y };
@@ -420,6 +448,7 @@ impl WinCfgs {
         self.tracked.retain(|t| gui.window_outer_frame(t.id).is_some());
         for i in 0..self.tracked.len() {
             let t = &self.tracked[i];
+            if t.kind.is_none() && !gui.window_moved(t.id) { continue; }
             let Some(cur) = current(gui, t.id, t.last.tab) else { continue };
             if cur != t.last {
                 self.save(d, i, &cur);
@@ -428,9 +457,17 @@ impl WinCfgs {
         }
     }
 
+    pub fn detach_hud(&mut self, gui: &Gui, d: &mut DValues, id: WindowId) {
+        let Some(i) = self.tracked.iter().position(|t| t.id == id) else { return };
+        if let Some(cur) = current(gui, id, None) {
+            if gui.window_moved(id) && cur != self.tracked[i].last { self.save(d, i, &cur); }
+        }
+        self.tracked.remove(i);
+    }
+
     /// `~DockWindow_c` / the window dtor: the final state goes to the store, the window is no longer tracked.
     pub fn detach(&mut self, gui: &Gui, d: &mut DValues, kind: WindowKind) {
-        let Some(i) = self.tracked.iter().position(|t| t.kind == kind) else { return };
+        let Some(i) = self.tracked.iter().position(|t| t.kind == Some(kind)) else { return };
         if let Some(cur) = current(gui, self.tracked[i].id, self.tracked[i].last.tab) {
             if cur != self.tracked[i].last {
                 self.save(d, i, &cur);
@@ -441,9 +478,14 @@ impl WinCfgs {
 
     /// Leaving the world: every window saves its final state.
     pub fn detach_all(&mut self, gui: &Gui, d: &mut DValues) {
-        for k in self.tracked.iter().map(|t| t.kind).collect::<Vec<_>>() {
-            self.detach(gui, d, k);
+        for i in 0..self.tracked.len() {
+            let t = &self.tracked[i];
+            if t.kind.is_none() && !gui.window_moved(t.id) { continue; }
+            if let Some(cur) = current(gui, self.tracked[i].id, self.tracked[i].last.tab) {
+                if cur != self.tracked[i].last { self.save(d, i, &cur); }
+            }
         }
+        self.tracked.clear();
     }
 
     fn save(&self, d: &mut DValues, i: usize, cfg: &Cfg) {
@@ -454,10 +496,24 @@ impl WinCfgs {
                     _ => archive(name),
                 };
                 cfg.write_into(&mut e);
-                d.set(name, Variant::Archive(element_xml(&e)));
+                let value = Variant::Archive(element_xml(&e));
+                if d.exists(name) { d.set(name, value); }
+                else { d.add(name, value, true, CAT_CHAR, None, None, false); }
             }
             // DockingController owns group placement; a singleton must not overwrite it.
             Store::Dock(_) => {}
+            Store::Container(n) => {
+                let Some(chr) = d.char_dir() else { return };
+                let dir = chr.join("Containers");
+                let path = dir.join(format!("ShortcutBar_{n}.xml"));
+                let mut root = std::fs::read_to_string(&path).ok().and_then(|s| xml::parse(&s).ok())
+                    .or_else(|| std::fs::read_to_string(self.client.join(format!("prefs/NewChar/Containers/ShortcutBar_{n}.xml"))).ok().and_then(|s| xml::parse(&s).ok()))
+                    .unwrap_or_else(|| Element { name: "Archive".into(), attrs: vec![("code".into(), "0".into())], children: vec![] });
+                cfg.write_into(&mut root);
+                if let Err(err) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, element_xml(&root))) {
+                    eprintln!("prefs: {}: {err}", path.display());
+                }
+            }
         }
     }
 }
@@ -525,6 +581,55 @@ impl ListCfg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hud_defaults_are_not_saved_until_moved_and_reload_marks_saved_position() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let tmp = std::env::temp_dir().join(format!("aomac-hud-move-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut d = DValues::new(&client);
+        d.open_user(&tmp, "test", 7);
+        let mut gui = Gui::new(&client, None).unwrap();
+        let c = super::super::hud_compass::Compass::new(&mut gui, (1280, 800)).unwrap();
+        let mut cfgs = WinCfgs::new(&client);
+        cfgs.attach_hud(&mut gui, &d, c.window, Store::Value("CompassWindowConfig"), (1280, 800));
+        gui.set_window_pos(c.window, (300, 80));
+        cfgs.update(&gui, &mut d);
+        assert!(cfgs.load(&d, Store::Value("CompassWindowConfig")).0.frame.is_none());
+        gui.set_window_moved(c.window, true);
+        cfgs.update(&gui, &mut d);
+        assert_eq!(cfgs.load(&d, Store::Value("CompassWindowConfig")).0.frame.unwrap()[..2], [300.0, 80.0]);
+        gui.set_window_pos(c.window, (0, 0));
+        cfgs.reload(&mut gui, &d, (1280, 800));
+        assert_eq!(gui.window_pos(c.window), (300, 80));
+        assert!(gui.window_moved(c.window));
+        gui.set_window_pos(c.window, (-70, -30));
+        assert!(cfgs.hud_frame_event(&mut gui, &ao_gui::Event::WindowFrame { window: c.window }, (1280, 800)));
+        assert_eq!(gui.window_pos(c.window), (0, 0));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn hotbar_frame_save_retains_container_fields() {
+        let tmp = std::env::temp_dir().join(format!("aomac-hotbar-cfg-{}", std::process::id()));
+        let mut d = DValues::new(&tmp);
+        d.open_user(&tmp.join("prefs"), "test", 7);
+        let dir = d.char_dir().unwrap().join("Containers");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ShortcutBar_2.xml");
+        std::fs::write(&path, "<Archive code=\"0\"><Archive name=\"position_map\" code=\"0\"/><Int32 name=\"selected_bar\" value=\"3\"/><Int32 name=\"bar_orientation\" value=\"1\"/></Archive>").unwrap();
+        let mut cfgs = WinCfgs::new(&tmp);
+        cfgs.tracked.push(Tracked { kind: None, id: 1, store: Store::Container(2), last: Cfg::default() });
+        let cfg = Cfg { frame: Some([90.0, 70.0, 492.0, 107.0]), pin: None, tab: None };
+        cfgs.save(&mut d, 0, &cfg);
+        assert_eq!(cfgs.load(&d, Store::Container(2)).0, cfg);
+        let root = xml::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(child(&root, "selected_bar"), Some("3"));
+        assert_eq!(child(&root, "bar_orientation"), Some("1"));
+        assert!(root.children.iter().any(|e| e.attr("name") == Some("position_map")));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
 
     #[test]
     fn item_list_config_roundtrips_original_fields_without_losing_window_fields() {

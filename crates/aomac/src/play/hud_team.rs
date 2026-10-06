@@ -596,6 +596,19 @@ mod tests {
                 }
             }
         }
+        let (left, top, _) = rollup.area();
+        assert!(rollup.dock_event(&mut gui, &ao_gui::Event::TabDropped { window: w, tab: 0, x: left, y: top, target: None }));
+        for _ in 0..4 {
+            rollup.event(&mut gui, &ao_gui::Event::CanvasClick { window: w, view: "arrow".into(), x: 0.0, y: 0.0 });
+            assert_eq!(gui.window_size(w).0, crate::play::hud_rollup::AREA_W);
+        }
+        let body = gui.view_rect(w, "body").unwrap();
+        for i in 0..ROWS {
+            for part in ["idx", "name", "hp", "nano"] {
+                let row = gui.view_rect(w, &format!("{part}{i}")).unwrap();
+                assert!(row.l >= body.l && row.r <= body.r, "docked {part}{i}: {row:?} outside {body:?}");
+            }
+        }
     }
 
     #[test]

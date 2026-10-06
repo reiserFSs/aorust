@@ -369,6 +369,13 @@ impl Zone {
             }
         }
         self.nanos.on_message(who, Identity { kind: CHAR_KIND, instance: self.char_id as i32 }, &m.body);
+        if who == (Identity { kind: CHAR_KIND, instance: self.char_id as i32 }) {
+            if let N3::World(World::CharacterAction(a)) = &m.body {
+                if a.action == ao_net::n3::inventory::ACTION_DELETE_ITEM {
+                    self.delete_inventory_item(a.identity_a, a.identity_b.kind > 0);
+                }
+            }
+        }
         match m.body {
             N3::Trade(t) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 // Trade start sets Flags bit 8; abort/complete clear it (`FUN_100661bf`, `FUN_100666a3`, `FUN_100668d1`).
