@@ -118,8 +118,20 @@ pub enum ChatAction {
     NameRequest(String),
     /// `/lft [text]`: `on` = new LFT state.
     Lft { on: bool, text: String },
-    /// `/help [topic]`: open `text/help/<file>` in the InfoView (`file://` + file).
-    ShowHelp { file: String },
+    /// `/help [topic]`, `/showfile <file>`, `/tipoftheday`: `InfoViewModule_c::ShowURL(url)` (`file://<name>[?section=N]`).
+    ShowUrl(String),
+    /// `/tipoftheday [prev]` (`FUN_100b6f0d`): next/previous tip, the hub keeps `CurrentTipOfTheDay` and checks the level (stat 0x36 > 3).
+    TipOfTheDay { prev: bool },
+    /// `/messagebox <text>` (`FUN_100b7a6f`): a `DialogBox_c` with one OK button; the text is `%`-expanded.
+    MessageBox(String),
+    /// `/camp`: AFCM 0x134 = `FlowControlModule_t::StartQuitToLoginMessage` (GUI 0x10027c74).
+    Camp,
+    /// `/quit`: AFCM 0x133 = `StartQuitToSystemMessage` (GUI 0x10029a0d).
+    Quit,
+    /// `/start <url>` (`FUN_100b9a84` -> `FUN_100b94e0`): `ShellExecute("open", url)` for `http://` / `https://` only; the argument is the first token.
+    Start(String),
+    /// `/open` `/close` `/toggle <window>` (`FUN_100b77b6`): `name` without its quotes.
+    Window { name: String, op: WindowOp },
     /// `/script <name>` or a `scripts/<name>` file.
     RunScript(String),
     /// `/<emote>` or `/emote <name>`: `N3Msg_DoSocialAction(id)`; id = index in [`EMOTES`] + 1.
@@ -140,6 +152,47 @@ pub enum ChatAction {
     Tower(String),
     /// A GUI-local command that is not chat (`/camp`, `/quit`, `/open`, `/option` ...): the unmodified line.
     ClientCommand(String),
+}
+
+/// `/open` `/close` `/toggle` (`FUN_100b77b6`): the sense the shared handler gets (0 open, 1 close, 2 toggle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowOp {
+    Open,
+    Close,
+    Toggle,
+}
+
+/// Names of `/open` `/close` `/toggle` and the DValue each one drives (table at GUI 0x1026c4a0, 24 `{name, dvalue}` pairs).
+pub const WINDOW_NAMES: &[(&str, &str)] = &[
+    ("ChatConfig", "chat_group_window"),
+    ("Controls", "specialaction_window"),
+    ("Faction", "faction_window"),
+    ("Friends", "friends_window"),
+    ("InfoView", "info_window"),
+    ("Inventory", "inventory_window"),
+    ("Knowledge", "knowledge_window"),
+    ("LeftMenu", "cc_left_menu"),
+    ("Missions", "mission_window"),
+    ("Nano", "nano_window"),
+    ("NCU", "ncu_window"),
+    ("Perks", "perk_window"),
+    ("Pet", "pet_window"),
+    ("PlanetMap", "planetmap_window"),
+    ("PlayfieldMap", "map_window"),
+    ("RightMenu", "cc_right_menu"),
+    ("Settings", "optionpanel_window"),
+    ("Shortcutbar", "shortcutbar_window"),
+    ("Stats", "stat_window"),
+    ("Team", "team_view"),
+    ("Tradeskill", "tradeskill_window"),
+    ("Wear", "wear_window"),
+    ("Raid", "raid_window"),
+    ("ItemStore", "itemshop_window"),
+];
+
+/// DValue of a `/open` window name (case-insensitive, `_stricmp` list walk).
+pub fn window_dvalue(name: &str) -> Option<&'static str> {
+    WINDOW_NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, d)| *d)
 }
 
 // --------------------------------------------------------------------------------------------------------------
@@ -179,6 +232,18 @@ enum Kind {
     /// `/<emote name>` (argc 1, `FUN_100b2aba`).
     SocialMove,
     Client,
+    /// `/showfile`
+    ShowFile,
+    Tip,
+    MessageBox,
+    /// `/text`: local info line.
+    Text,
+    /// `/funcom`: local info line.
+    Funcom,
+    Camp,
+    Quit,
+    Start,
+    Window(WindowOp),
 }
 
 struct Cmd {
@@ -220,22 +285,22 @@ const GLOBAL_CMDS: &[Cmd] = &[
     c("/fxscript", 3, Kind::Client),
     c("/help", 2, Kind::Help),
     c("/selectself", 1, Kind::Client),
-    c("/funcom", 1, Kind::Client),
+    c("/funcom", 1, Kind::Funcom),
     c("/bug", 2, Kind::Client),
-    c("/showfile", 2, Kind::Client),
-    c("/tipoftheday", 2, Kind::Client),
+    c("/showfile", 2, Kind::ShowFile),
+    c("/tipoftheday", 2, Kind::Tip),
     c("/option", 3, Kind::Client),
     c("/setoption", 3, Kind::Client),
     c("/dvalue", 3, Kind::Client),
-    c("/open", 2, Kind::Client),
-    c("/toggle", 2, Kind::Client),
-    c("/close", 2, Kind::Client),
-    c("/messagebox", 2, Kind::Client),
+    c("/open", 2, Kind::Window(WindowOp::Open)),
+    c("/toggle", 2, Kind::Window(WindowOp::Toggle)),
+    c("/close", 2, Kind::Window(WindowOp::Close)),
+    c("/messagebox", 2, Kind::MessageBox),
     c("/assist", 2, Kind::Client),
-    c("/text", 2, Kind::Client),
-    c("/start", 2, Kind::Client),
-    c("/camp", 1, Kind::Client),
-    c("/quit", 1, Kind::Client),
+    c("/text", 2, Kind::Text),
+    c("/start", 2, Kind::Start),
+    c("/camp", 1, Kind::Camp),
+    c("/quit", 1, Kind::Quit),
     c("/chardist", 2, Kind::Client),
     c("/viewdist", 2, Kind::Client),
     c("/char&viewdist", 3, Kind::Client),
@@ -610,7 +675,7 @@ pub fn parse(input: &str, ctx: &CmdCtx) -> Vec<ChatAction> {
     let second = if cmd.argc < 3 { tokenize(input, -1) } else { toks.clone() };
     if second.get(1).is_some_and(|t| t.eq_ignore_ascii_case("help")) {
         if let Some((_, f)) = HELP_TOPICS.iter().find(|(k, _)| k.eq_ignore_ascii_case(&word[1..])) {
-            return vec![ChatAction::ShowHelp { file: f.to_string() }];
+            return vec![ChatAction::ShowUrl(format!("file://{f}"))];
         }
     }
     run(cmd, input, &toks, ctx)
@@ -767,10 +832,10 @@ fn run(cmd: &Cmd, line: &str, t: &[String], ctx: &CmdCtx) -> Vec<ChatAction> {
         }
         Kind::Help => {
             if n < 2 {
-                return vec![ChatAction::ShowHelp { file: "helpcommands.html".into() }];
+                return vec![ChatAction::ShowUrl("file://helpcommands.html".into())];
             }
             match HELP_TOPICS.iter().find(|(k, _)| k.eq_ignore_ascii_case(&t[1])) {
-                Some((_, f)) => vec![ChatAction::ShowHelp { file: f.to_string() }],
+                Some((_, f)) => vec![ChatAction::ShowUrl(format!("file://{f}"))],
                 None => vec![err(ctx, &format!("Error: no help topic named '{}'.", t[1]))],
             }
         }
@@ -807,6 +872,53 @@ fn run(cmd: &Cmd, line: &str, t: &[String], ctx: &CmdCtx) -> Vec<ChatAction> {
             }
         }
         Kind::Client => vec![ChatAction::ClientCommand(line.to_string())],
+        // FUN_100b6e66
+        Kind::ShowFile => {
+            if n < 2 {
+                return usage(ctx, &t[0], " filename");
+            }
+            vec![ChatAction::ShowUrl(format!("file://{}", t[1]))]
+        }
+        // FUN_100b6f0d: the level gate (stat 0x36 > 3) and the tip counter are the hub's
+        Kind::Tip => vec![ChatAction::TipOfTheDay { prev: t.get(1).is_some_and(|a| a.trim().eq_ignore_ascii_case("prev")) }],
+        // FUN_100b7a6f
+        Kind::MessageBox => {
+            if n < 2 {
+                return usage(ctx, &t[0], " &lt;message&gt;");
+            }
+            vec![ChatAction::MessageBox(x(1))]
+        }
+        // FUN_100b5913 (colour 0x52)
+        Kind::Text => {
+            if n < 2 {
+                return vec![];
+            }
+            vec![info(ctx, &t[1])]
+        }
+        // FUN_100b59d3 (colour 0x52)
+        Kind::Funcom => vec![info(ctx, "Funcom made this excellent product :)\nThank you for playing Anarchy Online.")],
+        Kind::Camp => vec![ChatAction::Camp],
+        Kind::Quit => vec![ChatAction::Quit],
+        // FUN_100b9a84: usage " <URL>"; FUN_100b94e0 starts only http:// and https:// (case-insensitive) with the first token
+        Kind::Start => {
+            if n < 2 {
+                return usage(ctx, &t[0], " &lt;URL&gt;");
+            }
+            let url = t[1].split_whitespace().next().unwrap_or("");
+            let l = url.to_ascii_lowercase();
+            if l.starts_with("http://") || l.starts_with("https://") {
+                vec![ChatAction::Start(url.to_string())]
+            } else {
+                vec![]
+            }
+        }
+        // FUN_100b77b6: quotes around the name are stripped
+        Kind::Window(op) => {
+            if n < 2 {
+                return usage(ctx, &t[0], " window");
+            }
+            vec![ChatAction::Window { name: t[1].trim_matches('"').to_string(), op }]
+        }
     }
 }
 
@@ -1023,9 +1135,9 @@ mod tests {
         assert_eq!(one("/o hello"), [ChatAction::Group { group: "Clan".into(), text: "hello".into() }]);
         assert_eq!(one("/t hello"), [ChatAction::Group { group: "Team".into(), text: "hello".into() }]);
         assert_eq!(one("/name Foo"), [ChatAction::NameRequest("Foo".into())]);
-        assert_eq!(one("/help chat"), [ChatAction::ShowHelp { file: "chatcommands.html".into() }]);
-        assert_eq!(one("/help"), [ChatAction::ShowHelp { file: "helpcommands.html".into() }]);
-        assert_eq!(one("/macro help"), [ChatAction::ShowHelp { file: "Macrocommands.html".into() }]);
+        assert_eq!(one("/help chat"), [ChatAction::ShowUrl("file://chatcommands.html".into())]);
+        assert_eq!(one("/help"), [ChatAction::ShowUrl("file://helpcommands.html".into())]);
+        assert_eq!(one("/macro help"), [ChatAction::ShowUrl("file://Macrocommands.html".into())]);
     }
 
     #[test]
@@ -1128,7 +1240,8 @@ mod tests {
         assert_eq!(parse("/version", &c), [ChatAction::ZoneCommand("version".into())]);
         assert_eq!(parse("/team invite %m", &c), [ChatAction::ZoneCommand("team invite Me".into())]);
         assert_eq!(parse("/played", &c), [ChatAction::PlayedTime, ChatAction::ZoneCommand("played".into())]);
-        assert_eq!(parse("/camp", &c), [ChatAction::ClientCommand("/camp".into())]);
+        assert_eq!(parse("/camp", &c), [ChatAction::Camp]);
+        assert_eq!(parse("/quit", &c), [ChatAction::Quit]);
         assert_eq!(parse("/wave", &c), [ChatAction::Social(emote_id("wave").unwrap())]);
         assert_eq!(parse("/emote Hug", &c), [ChatAction::Social(emote_id("hug").unwrap())]);
         assert_eq!(emote_id("wave"), Some(62));
@@ -1147,6 +1260,37 @@ mod tests {
         assert_eq!(reply_prefill(&c), "");
         c.last_tell_from = Some("Bob");
         assert_eq!(reply_prefill(&c), "/tell Bob ");
+    }
+
+    #[test]
+    fn gui_local_dialog_commands() {
+        let gs = groups();
+        let mut c = ctx(&gs, &txt);
+        // /showfile, /tipoftheday, /messagebox (FUN_100b6e66 / 0x100b6f0d / 0x100b7a6f)
+        assert_eq!(parse("/showfile my file.html", &c), [ChatAction::ShowUrl("file://my file.html".into())]);
+        assert_eq!(fb(&parse("/showfile", &c)[0]), "<div><font color=CCChatCmdFeedbackError>Usage: /showfile filename</font></div>");
+        assert_eq!(parse("/tipoftheday", &c), [ChatAction::TipOfTheDay { prev: false }]);
+        assert_eq!(parse("/TipOfTheDay PREV", &c), [ChatAction::TipOfTheDay { prev: true }]);
+        c.own_name = "Me";
+        assert_eq!(parse("/messagebox hi %m", &c), [ChatAction::MessageBox("hi Me".into())]);
+        assert!(fb(&parse("/messagebox", &c)[0]).contains("Usage: /messagebox &lt;message&gt;"));
+        // /text and /funcom are info lines (0x52)
+        assert!(fb(&parse("/text hello %m", &c)[0]).starts_with("<div><font color=CCChatCmdFeedbackInfo>hello Me"));
+        assert!(fb(&parse("/funcom", &c)[0]).contains("Funcom made this excellent product"));
+        assert_eq!(parse("/text", &c), []);
+        // /open /close /toggle: quotes stripped, table lookup is the hub's
+        assert_eq!(parse("/open \"Inventory\"", &c), [ChatAction::Window { name: "Inventory".into(), op: WindowOp::Open }]);
+        assert_eq!(parse("/close infoview", &c), [ChatAction::Window { name: "infoview".into(), op: WindowOp::Close }]);
+        assert_eq!(parse("/toggle Nano", &c), [ChatAction::Window { name: "Nano".into(), op: WindowOp::Toggle }]);
+        assert!(fb(&parse("/open", &c)[0]).contains("Usage: /open window"));
+        assert_eq!(window_dvalue("infoview"), Some("info_window"));
+        assert_eq!(window_dvalue("ItemStore"), Some("itemshop_window"));
+        assert_eq!(window_dvalue("nope"), None);
+        assert_eq!(WINDOW_NAMES.len(), 24);
+        // /start only starts http(s) URLs
+        assert_eq!(parse("/start https://example.org/x y", &c), [ChatAction::Start("https://example.org/x".into())]);
+        assert_eq!(parse("/start ftp://example.org", &c), []);
+        assert!(fb(&parse("/start", &c)[0]).contains("Usage: /start &lt;URL&gt;"));
     }
 
     /// The real text db has every key we use (category 10001).

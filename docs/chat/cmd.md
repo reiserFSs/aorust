@@ -87,7 +87,7 @@ Global map (`FUN_100badf1` 0x100badf1..0x100bbc30; handler address in the 2nd co
 | `/name` | 2 | 0x100ba5b7 | action 2 / sub 5 "name-request"; usage `&lt;new name&gt;` |
 | `/cc` | -1 | 0x100ba105 | `info <name>` (exactly 3 tokens) -> action; `< 2` tokens "Invalid syntax"; chat server down "Error: Not connected to chat-server."; else all tokens expanded and handed to `Client_c` (0x1016cadf) |
 | `/lft` | 2 | 0x100b69b0 | `FUN_100f01a3(on, text)`: with text on, bare toggles |
-| `/help` | 2 | 0x100b6d56 | topic map lookup -> `file://<file>` in InfoView; none: "Error: no help topic named 'X'."; no argument: `helpcommands.html` |
+| `/help` | 2 | 0x100b6d56 | topic map lookup -> `file://<file>` in the InfoView (docs/chat/dialogs.md §1); none: "Error: no help topic named 'X'."; no argument: `helpcommands.html` |
 | `/petition /fxscript /selectself /funcom /bug /showfile /tipoftheday /option /setoption /dvalue /open /toggle /close /messagebox /assist /text /start /camp /quit /chardist /viewdist /char&viewdist /voice /macro /petduel /duel /filter /waypoint /rp /reclaim` | see `GLOBAL_CMDS` | GUI-local | `ChatAction::ClientCommand(line)` (not chat) |
 | `/played` | 1 | 0x100b2321 | prints "Time: %02d:%02d local (%02d:%02d GMT), %02d:%02d game<br>" + "Date: ..." then `N3Msg_TextCommand("played")` |
 | `/version /bank /team /org /born /pet /follow /items /raid` | -1 | 0x100b2278 | `N3Msg_TextCommand(window, Expand(line[1..]), target)` (Interfaces 0x10008a72 -> Gamecode 0x176db -> FUN_1003fba6) |
@@ -278,8 +278,7 @@ its slash, not expanded.
   anim 0x44/0x45 while not sitting/sleeping/lounging (state 8/0xb/0xc) `Feedback_MustSitToLoungeOrSleep`.
 * `/played`: GUI 0x100b2321 first prints `Time: %02d:%02d local (%02d:%02d GMT), %02d:%02d game<br>` + `Date: %02d. %s %d local` (colour 0x52; local = `_localtime64`,
   GMT = `_gmtime64`, game clock = `N3Msg_GetCurrentHour/Minute`, month names `Jan..Dec` from 0x101ba9d4), then `N3Msg_TextCommand("played")`.
-* `/help <topic>` -> `file://` + the topic's file (0x100b6d56): the file name is returned and the hub resolves `text/help/<file>` (the directory prefix is built in
-  `InfoViewModule_c::ShowURL`, not decoded).
+* `/help <topic>` -> `ChatAction::ShowUrl("file://" + file)`; the InfoView resolves `cd_image/text/help/<file>` (decoded: docs/chat/dialogs.md §1).
 
 ## Chat-server requests (`ChatCmd`; GUI senders 0x1016c8c9..0x1016cdd7)
 

@@ -15,6 +15,7 @@ use crate::view::*;
 use crate::xml;
 
 mod cc;
+mod checkbox;
 mod canvas;
 mod frame;
 mod popup;
@@ -583,6 +584,10 @@ impl Gui {
             self.relayout_window(w);
         }
     }
+    /// `View::IsEnabled` of the named view (false when it does not exist).
+    pub fn is_enabled(&self, w: WindowId, name: &str) -> bool {
+        self.find(w, name).is_some_and(|v| self.tree.views[v].enabled)
+    }
     pub fn set_enabled(&mut self, w: WindowId, name: &str, enabled: bool) {
         if let Some(v) = self.find(w, name) {
             self.tree.views[v].enabled = enabled;
@@ -646,6 +651,20 @@ impl Gui {
         if let Kind::ScrollView(sd) = &mut self.tree.views[sv].kind {
             sd.offset.y = max;
         }
+    }
+    /// Vertical scroll offset (px) of the named `ScrollView` (`View::GetScrollOffset`); 0 if it is not one.
+    pub fn scroll_offset(&self, w: WindowId, name: &str) -> f32 {
+        match self.find(w, name).map(|sv| &self.tree.views[sv].kind) {
+            Some(Kind::ScrollView(sd)) => sd.offset.y,
+            _ => 0.0,
+        }
+    }
+    /// `View::ScrollTo(0, y)` on the named `ScrollView`, clamped to the content (after the text changed).
+    pub fn set_scroll_offset(&mut self, w: WindowId, name: &str, y: f32) {
+        let Some(sv) = self.find(w, name) else { return };
+        let Kind::ScrollView(sd) = &self.tree.views[sv].kind else { return };
+        let dy = y - sd.offset.y;
+        self.scroll_by(sv, dy);
     }
     pub fn focused_view(&self) -> Option<String> {
         self.focus.map(|f| self.outer_name(f))
@@ -763,6 +782,7 @@ impl Gui {
     pub fn frame(&mut self, dt: f32) -> DrawList {
         self.time += dt;
         self.tick_cc_fades(dt);
+        self.sel_autoscroll(dt);
         let mut out = DrawList::default();
         let mut order: Vec<&Window> = self.windows.iter().flatten().filter(|w| w.visible).collect();
         order.sort_by_key(|w| w.layer); // stable: creation order inside a layer
@@ -775,13 +795,14 @@ impl Gui {
             self.draw_view(root, pos.0 as f32, pos.1 as f32, [255; 3], alpha, true, &mut out.cmds);
         }
         self.draw_popup(&mut out.cmds);
+        self.draw_tab_ghost(&mut out.cmds);
+        self.draw_menu(&mut out.cmds);
         self.tip_frame(&mut out.cmds);
         out
     }
 
     fn push_gfx(&self, out: &mut Vec<DrawCmd>, id: GfxId, dst: Rect, tint: [u8; 3], alpha: f32) {
         let (w, h) = self.gfx.size(id);
-        self.sel_autoscroll(dt);
         if w == 0 || dst.r < dst.l || dst.b < dst.t {
             return;
         }
@@ -794,8 +815,6 @@ impl Gui {
             let (w, h) = self.gfx.size(g);
             (w as f32, h as f32)
         });
-        self.draw_tab_ghost(&mut out.cmds);
-        self.draw_menu(&mut out.cmds);
         let [tl, tr, bl, br, left, top, right, bottom, bg] = *gfx;
         let (stl, str_, sbl, sbr) = (sz(tl), sz(tr), sz(bl), sz(br));
         // corner dst rects (inclusive); a missing corner is the degenerate Rect(l,t,l-1,t-1)
@@ -1043,6 +1062,12 @@ impl Gui {
                 out.push(DrawCmd::Solid { dst: [(origin_x + sx) as f32, r.t, (origin_x + ex) as f32, r.t + font_h as f32], color: [0xc0; 3], alpha });
             }
         }
+        // selection of a read-only text (`_RenderString`: `Clear(rect, 0xc0c0c0)` behind the glyphs)
+        if !editable {
+            for q in self.sel_rects(id, &layout, r.l, r.t, fill_dy, r.width() as i32 + 1, t.font) {
+                out.push(DrawCmd::Solid { dst: q, color: [0xc0; 3], alpha });
+            }
+        }
         // TVF_RENDER_SHADOW 0x1000: `_AllocateBitmap` 0x1016095b clones the text surface, colour 0 (black), alpha 1, behind the text.
         let shadow = (t.tvf & tvf::RENDER_SHADOW != 0).then_some(self.text_shadow);
         let passes: &[bool] = if shadow.is_some() { &[true, false] } else { &[false] };
@@ -1061,12 +1086,6 @@ impl Gui {
                     let c = if run.link { mul(tint, rgb(0x2299ff)) } else { c };
                     let c = if is_shadow { [0; 3] } else { c };
                     pen += self.draw_string(out, t.font, &run.text, pen + dx, y + dy, c, alpha, pw);
-        // selection of a read-only text (`_RenderString`: `Clear(rect, 0xc0c0c0)` behind the glyphs)
-        if !editable {
-            for q in self.sel_rects(id, &layout, r.l, r.t, fill_dy, r.width() as i32 + 1, t.font) {
-                out.push(DrawCmd::Solid { dst: q, color: [0xc0; 3], alpha });
-            }
-        }
                 }
             }
         }
@@ -1305,6 +1324,9 @@ impl Gui {
                 self.drag_scroll(y);
                 self.drag_select(x);
                 self.drag_canvas(x, y);
+                self.frame_mouse_move(x, y);
+                self.sel_drag(x, y);
+                self.menu_mouse_move(x, y);
                 self.tip_update(false);
             }
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
@@ -1320,6 +1342,8 @@ impl Gui {
             InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
                 self.mouse = Point::new(x, y);
                 self.mouse_up();
+                self.frame_mouse_up();
+                self.sel_end();
                 self.tip_update(true);
             }
             InputEvent::MouseDown { x, y, button: MouseButton::Right } => {
@@ -1327,9 +1351,11 @@ impl Gui {
                 self.update_hover();
                 self.tip_update(true);
                 self.canvas_right_down(x, y);
-                self.frame_mouse_move(x, y);
-                self.sel_drag(x, y);
-                self.menu_mouse_move(x, y);
+                if self.ix.menu.is_some() {
+                    self.menu_mouse_down(x, y);
+                } else {
+                    self.frame_right_down(x, y);
+                }
             }
             InputEvent::Wheel { x, y, dy } => self.wheel(x, y, dy),
             InputEvent::Key { key, pressed: true, mods } => self.key_down(key, mods),
@@ -1341,8 +1367,6 @@ impl Gui {
     }
 
     fn windows_top_down(&self) -> Vec<(WindowId, ViewId, (i32, i32))> {
-                self.frame_mouse_up();
-                self.sel_end();
         let mut v: Vec<(i8, WindowId, ViewId, (i32, i32))> = self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (w.layer, i, w.root, w.pos))).collect();
         v.sort_by_key(|k| (k.0, k.1));
         v.into_iter().rev().map(|(_, i, r, p)| (i, r, p)).collect()
@@ -1350,11 +1374,6 @@ impl Gui {
 
     /// Topmost interactive view under the mouse, with its window.
     fn hit(&self, x: f32, y: f32) -> Option<(WindowId, ViewId)> {
-                if self.ix.menu.is_some() {
-                    self.menu_mouse_down(x, y);
-                } else {
-                    self.frame_right_down(x, y);
-                }
         for (wid, root, pos) in self.windows_top_down() {
             let (lx, ly) = (x - pos.0 as f32, y - pos.1 as f32);
             if let Some(v) = self.hit_view(root, lx, ly, true, 0.0, 0.0, None) {
@@ -1448,6 +1467,8 @@ impl Gui {
     }
 
     fn mouse_down(&mut self, x: f32, y: f32) {
+        // `BeginSelection` of any renderer clears the others; a press elsewhere ends the selection (**GUESS**: `SlotGlobalMouseDown` 0x1016083d only drops focus)
+        self.ix.sel = None;
         // an open combo popup captures the click
         if let Some(p) = self.popup.take() {
             let picked = self.popup_item_at(p.window, p.combo, x, y).is_some();
@@ -1466,8 +1487,6 @@ impl Gui {
                         t.anchor = None;
                     }
                 }
-        // `BeginSelection` of any renderer clears the others; a press elsewhere ends the selection (**GUESS**: `SlotGlobalMouseDown` 0x1016083d only drops focus)
-        self.ix.sel = None;
                 let name = self.tree.views[p.combo].name.clone();
                 self.events.push(Event::ComboChanged { window: p.window, view: name, index: i, text });
             }
@@ -1485,6 +1504,9 @@ impl Gui {
                     return;
                 }
             }
+        }
+        if self.frame_mouse_down(x, y) {
+            return;
         }
         let Some((_, v)) = self.hit(x, y) else {
             self.focus = None;
@@ -1504,9 +1526,6 @@ impl Gui {
             Kind::Text(t) if t.tvf & tvf::ACCEPT_TXT_INPUT != 0 => {
                 // click inside a ComboBox editor opens the popup (ComboBox_c::MouseDown 0x10001ec0)
                 let combo = self.combo_of(v);
-        if self.frame_mouse_down(x, y) {
-            return;
-        }
                 self.focus = Some(v);
                 self.caret_epoch = self.time;
                 let idx = self.char_at(v, x);
@@ -1525,6 +1544,9 @@ impl Gui {
                         let view = self.tree.views[v].name.clone();
                         self.events.push(Event::LinkClicked { window, view, href });
                     }
+                } else if t.tvf & tvf::ALLOW_TEXT_SELECTION != 0 && t.tvf & tvf::ACCEPT_MOUSE_INPUT != 0 {
+                    // `TextRenderer_c::MouseDown` 0x101637ef: left press on text = `BeginSelection` + mouse capture
+                    self.sel_begin(v, x, y);
                 }
             }
             Kind::Bitmap { .. } => {}
@@ -1543,9 +1565,6 @@ impl Gui {
             cur = p;
         }
         None
-                } else if t.tvf & tvf::ALLOW_TEXT_SELECTION != 0 && t.tvf & tvf::ACCEPT_MOUSE_INPUT != 0 {
-                    // `TextRenderer_c::MouseDown` 0x101637ef: left press on text = `BeginSelection` + mouse capture
-                    self.sel_begin(v, x, y);
     }
 
     fn set_combo_arrow(&mut self, combo: ViewId, open: bool) {
@@ -1630,7 +1649,12 @@ impl Gui {
                 }
                 _ => {}
             }
-            if over && matches!(self.tree.views[p].kind, Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_)) && self.tree.views[p].enabled {
+            if over && self.tree.views[p].enabled {
+                if let Kind::CheckBox { checked, .. } = &mut self.tree.views[p].kind {
+                    *checked = !*checked; // CheckBox_c: a click toggles; reported like a button press
+                }
+            }
+            if over && matches!(self.tree.views[p].kind, Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::CheckBox { .. }) && self.tree.views[p].enabled {
                 if let Some(w) = self.window_of(p) {
                     let view = self.tree.views[p].name.clone();
                     let item = self.item_of(p);
@@ -1763,6 +1787,13 @@ impl Gui {
     }
 
     fn key_down(&mut self, key: Key, mods: Modifiers) {
+        if key == Key::Escape && self.ix.menu.take().is_some() {
+            return;
+        }
+        // Ctrl+C with a selection in a read-only text (`CopyActiveSelectionToClipboard` 0x10160f84)
+        if mods.ctrl && key == Key::Letter('c') && self.ix.sel.is_some() && self.sel_copy() {
+            return;
+        }
         if let Some(p) = self.popup.take() {
             self.set_combo_arrow(p.combo, false);
             if key == Key::Escape {
@@ -1781,13 +1812,6 @@ impl Gui {
                 let next = match cur {
                     Some(i) => {
                         if mods.shift {
-        if key == Key::Escape && self.ix.menu.take().is_some() {
-            return;
-        }
-        // Ctrl+C with a selection in a read-only text (`CopyActiveSelectionToClipboard` 0x10160f84)
-        if mods.ctrl && key == Key::Letter('c') && self.ix.sel.is_some() && self.sel_copy() {
-            return;
-        }
                             (i + n - 1) % n
                         } else {
                             (i + 1) % n

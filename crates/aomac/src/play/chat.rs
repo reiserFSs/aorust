@@ -3,12 +3,19 @@
 //! performs what an input line asks for.
 
 mod cmd;
+mod dialog;
+mod info;
 mod line;
 mod log;
 mod net;
+mod social;
+mod social_hub;
+mod social_win;
 pub(super) mod win;
 mod zone;
 mod zonecmd;
+
+pub(super) use cmd::WindowOp;
 
 use super::zone::Zone;
 use ao_formats::screens::TextDb;
@@ -33,6 +40,8 @@ pub(super) enum GameAction {
     Social(u32),
     /// `/assist`.
     Assist,
+    /// `/camp`: AFCM 0x134 (`StartQuitToLoginMessage`, GUI 0x10027c74): camp, then back to the login screen.
+    Camp,
 }
 
 pub(super) struct Chat {
@@ -55,6 +64,21 @@ pub(super) struct Chat {
     /// `s_nCommandRefCntr` of the social commands sent.
     social_counter: i32,
     own_id: u32,
+    /// `InfoView_c` (`/help`, `/showfile`, `/tipoftheday`, `text://` links).
+    info: info::InfoView,
+    /// `DialogBox_c` boxes and the `/afk` message dialog.
+    dialogs: dialog::Dialogs,
+    /// DValue `CurrentTipOfTheDay` (CharPrefs.xml default -1).
+    tip: i32,
+    /// `/open` `/close` `/toggle` of the HUD windows: taken by the flow ([`Chat::take_windows`]).
+    windows: Vec<(&'static str, cmd::WindowOp)>,
+    quit: bool,
+    screen: (u32, u32),
+    /// Buddy list, tell windows, private groups, LFT (docs/chat/social.md).
+    social: social::Social,
+    swin: social_win::SocialWin,
+    /// Lines of each tell partner's window (kept while it is closed).
+    tell_log: std::collections::HashMap<u32, Vec<String>>,
 }
 
 enum Back {
@@ -73,11 +97,12 @@ impl Chat {
     pub fn new() -> Self {
         let mut net = net::ChatNet::default();
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
-        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0 }
+        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default() }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
     pub fn open(&mut self, gui: &mut Gui, screen: (u32, u32)) -> Result<()> {
+        self.screen = screen;
         if self.win.is_none() {
             let mut w = ChatWindows::new(gui, screen)?;
             // HUD footprint (wings 190/65 px, shortcut bar 38 px at 1280x828, measured from the HUD art): only the template default windows avoid it
@@ -133,6 +158,8 @@ impl Chat {
     }
 
     pub fn resize(&mut self, gui: &mut Gui, screen: (u32, u32)) {
+        self.swin.resize(screen);
+        self.screen = screen;
         if let Some(w) = &mut self.win {
             w.resize(gui, screen);
         }
@@ -154,6 +181,37 @@ impl Chat {
 
     pub fn take_game(&mut self) -> Vec<GameAction> {
         std::mem::take(&mut self.game)
+    }
+
+    /// `/open` `/close` `/toggle` requests for the HUD windows: `(DValue name, op)`, applied by the flow (`WindowKind::from_dvalue`).
+    pub fn take_windows(&mut self) -> Vec<(&'static str, cmd::WindowOp)> {
+        std::mem::take(&mut self.windows)
+    }
+
+    /// `/quit` (`StartQuitToSystemMessage`, GUI 0x10029a0d): taken by the flow, which ends the session.
+    pub fn take_quit(&mut self) -> bool {
+        std::mem::take(&mut self.quit)
+    }
+
+    /// True while a dialog box or the InfoView is open: Esc closes those first (`DialogBox_c::SlotEscPressed`, `esc_dialogs` / `esc_infoview` default true).
+    pub fn esc_closes(&self) -> bool {
+        self.dialogs.is_open() || self.info.window().is_some()
+    }
+
+    /// Esc key: closes the topmost dialog / the InfoView; `true` when something was closed.
+    pub fn escape(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb) -> bool {
+        if let Some(w) = self.dialogs.windows().last() {
+            let (_, a) = self.dialogs.event(gui, &Event::Escape { window: w });
+            if let Some(a) = a {
+                self.answer(gui, a, Some(zone), texts);
+            }
+            return true;
+        }
+        if self.info.window().is_some() {
+            self.info.close(gui);
+            return true;
+        }
+        false
     }
 
     /// Frames to send to the zone server.
@@ -215,6 +273,7 @@ impl Chat {
                 Out::Msg(m) => {
                     if m.tell {
                         self.last_tell_from = Some(m.from_name.clone());
+                        self.social_tell_in(gui, m.from_id, &m.from_name, &m.text, m.flags & 1 != 0, texts);
                     }
                     self.msg(gui, m);
                 }
@@ -235,7 +294,13 @@ impl Chat {
                 Out::NameOp { op, id, name } => self.name_op(gui, op, id, &name, texts),
                 Out::GroupAdd { group, name, .. } => self.group(group, name),
                 Out::GroupRemove { group, .. } => self.ungroup(group),
+                Out::Social(e) => self.social_event(gui, e, texts),
+                Out::OpenTell { id, name } => self.social_open_tell_out(gui, id, &name, texts),
             }
+        }
+        self.social_update(gui, dt);
+        for a in self.dialogs.update(gui, dt) {
+            self.answer(gui, a, None, texts);
         }
         if let Some(w) = &mut self.win {
             w.update(gui, dt);
@@ -290,17 +355,104 @@ impl Chat {
 
     /// A GUI event; `true` if it was a chat window's.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone, texts: &TextDb) -> bool {
+        let (hit, ans) = self.dialogs.event(gui, ev);
+        if hit {
+            if let Some(a) = ans {
+                self.answer(gui, a, Some(zone), texts);
+            }
+            return true;
+        }
+        let (hit, outs) = self.info.event(gui, self.screen, ev);
+        if hit {
+            self.info_out(gui, outs, zone, texts);
+            return true;
+        }
+        if self.social_ui_event(gui, ev, zone, texts) {
+            return true;
+        }
         let Some(w) = &mut self.win else { return false };
         let outs = w.event(gui, ev);
         let handled = !outs.is_empty() || w.owns(ev);
         for o in outs {
             match o {
                 WinOut::Submit { text, window_group } => self.submit(gui, &text, window_group.as_deref().and_then(ident_id), zone, texts),
-                WinOut::OpenTell(name) => self.focus_text(gui, &format!("/tell {name} ")),
-                WinOut::LinkClicked(href) => eprintln!("chat: link {href} (no handler)"),
+                // `user://NAME` -> `OpenTellWindow` 0x10085df8: the tell window opens (docs/chat/social.md)
+                WinOut::OpenTell(name) => self.open_tell_named(gui, &name, texts),
+                // user-link menu "IgnoreUser" (`FUN_1008dd24`): the `/ignore <nick>` path
+                WinOut::IgnoreUser(name) => self.run_line(gui, &format!("/ignore {name}"), zone, texts),
+                // `FUN_1008e322` -> `ChatGUIModule_c::ShowItemRefLink` 0x10085cb5: itemref:// itemid:// charref:// text:// open in the InfoView;
+                // chatcmd:// runs the command (**GUESS**: the chat view's own handler is not decoded, the InfoView treats them the same way)
+                WinOut::LinkClicked(href) => {
+                    let lower = href.to_ascii_lowercase();
+                    if ["itemref://", "itemid://", "charref://", "text://", "chatcmd://"].iter().any(|p| lower.starts_with(p)) {
+                        let outs = self.info.show_url(gui, self.screen, &href, true);
+                        self.info_out(gui, outs, zone, texts);
+                    } else {
+                        eprintln!("chat: link {href} (no handler)");
+                    }
+                }
             }
         }
         handled
+    }
+
+    fn info_out(&mut self, gui: &mut Gui, outs: Vec<info::InfoOut>, zone: &Zone, texts: &TextDb) {
+        for o in outs {
+            match o {
+                info::InfoOut::Command(c) => self.run_line(gui, &c, zone, texts),
+                // `GlobalSignals+0x17c(0, text, 0xc)`: red line in the System window
+                info::InfoOut::Error(t) => self.system_line(gui, &t, 12),
+            }
+        }
+    }
+
+    /// `DialogBox_c` + `Go` + `MoveToCenter`.
+    fn dialog(&mut self, gui: &mut Gui, kind: dialog::Kind, body: String, buttons: Vec<String>, input: Option<String>) {
+        self.dialogs.go(gui, self.screen, &dialog::Spec { kind, body, buttons, input });
+    }
+
+    /// What a decided dialog does: org leave / disband send `N3Msg_Org*Confirmed` on Yes (button 0); the AFK dialog is `FUN_100b6576`.
+    fn answer(&mut self, gui: &mut Gui, a: dialog::Answer, zone: Option<&Zone>, texts: &TextDb) {
+        match (a.kind, a.button) {
+            (dialog::Kind::OrgLeave, 0) => self.outbox.extend(zone.map(|z| zonecmd::org_confirmed(z.char_id, true, Self::target_identity(z)))),
+            (dialog::Kind::OrgDisband, 0) => self.outbox.extend(zone.map(|z| zonecmd::org_confirmed(z.char_id, false, Self::target_identity(z)))),
+            (dialog::Kind::Afk, 0) => {
+                let text = a.text;
+                if text.is_empty() {
+                    self.system_line(gui, "Using default AFK message.", 0);
+                } else if self.afk.as_deref() != Some(text.as_str()) {
+                    let t = texts.by_key(10001, "ChatCmdFeedback_ChangedAFKMessageTo").unwrap_or_default();
+                    let old = self.afk.clone().unwrap_or_default();
+                    self.system_line(gui, &log::ldb_format(&t, &[log::Arg::S(old), log::Arg::S(text.clone())]), 0);
+                    self.afk = Some(text);
+                }
+            }
+            (dialog::Kind::Afk, _) => {
+                self.afk = None;
+                self.system_line(gui, "AFK off.", 0);
+            }
+            _ => {}
+        }
+    }
+
+    fn yes_no(texts: &TextDb) -> Vec<String> {
+        ["MsgBox_Yes", "MsgBox_No"].iter().map(|k| texts.by_key(10000, k).unwrap_or_else(|| k.trim_start_matches("MsgBox_").to_owned())).collect()
+    }
+
+    /// `/open` `/close` `/toggle` (`FUN_100b77b6`): the 24-entry name table drives a DValue; the InfoView is ours, the other windows go to the HUD
+    /// through [`Chat::take_windows`]. Names that are not in the table select a *chat window* by name in the original (`FUN_10093c1f`): not ported.
+    fn window_cmd(&mut self, gui: &mut Gui, name: &str, op: cmd::WindowOp) {
+        let Some(dv) = cmd::window_dvalue(name) else { return };
+        if dv == "info_window" {
+            let open = self.info.window().is_some();
+            match (op, open) {
+                (cmd::WindowOp::Open, false) | (cmd::WindowOp::Toggle, false) => self.info.open(gui, self.screen),
+                (cmd::WindowOp::Close, true) | (cmd::WindowOp::Toggle, true) => self.info.close(gui),
+                _ => {}
+            }
+        } else {
+            self.windows.push((dv, op));
+        }
     }
 
     fn groups(&self) -> Vec<GroupInfo> {
@@ -340,9 +492,16 @@ impl Chat {
         }
     }
 
-    /// A line the GUI runs as if typed (hotbar text macros: the macro text is emitted on GlobalSignals +0x180, GUI `FUN_100d79c9`).
+    /// A line the GUI runs as if typed (hotbar text macros and `chatcmd://` links: the text is emitted on GlobalSignals +0x180 and
+    /// split by GUI `FUN_100a3f43`: `%` args expanded, then cut at every literal `\n ` (backslash, n, blank); each stripped part goes
+    /// to the command dispatcher `FUN_100a39e5`, whose result is ignored: parts without a leading `/` are dropped).
     pub fn run_line(&mut self, gui: &mut Gui, text: &str, zone: &Zone, texts: &TextDb) {
-        self.submit(gui, text, None, zone, texts);
+        for part in text.split("\\n ") {
+            let part = part.trim();
+            if part.starts_with('/') {
+                self.submit(gui, part, None, zone, texts);
+            }
+        }
     }
 
     fn submit(&mut self, gui: &mut Gui, text: &str, out_group: Option<u64>, zone: &Zone, texts: &TextDb) {
@@ -408,10 +567,6 @@ impl Chat {
                 zonecmd::ChatReq::ByName { name, op } => self.net.lookup_op(&name, op),
             }
         }
-        if let Some(f) = out.help_file {
-            // the help pages open in the InfoView (not ported): say where the page is
-            self.line(gui, ChatLine::new(ChatKind::CmdFeedback, format!("Help: text/help/{f}")));
-        }
         if out.social_sent {
             self.social_counter += 1;
         }
@@ -419,7 +574,18 @@ impl Chat {
             eprintln!("chat: text command not implemented: {u}");
         }
         for l in out.local {
-            eprintln!("chat: local effect not implemented: {l:?}");
+            match l {
+                // `OrganizationGUIModule_c::LeaveOrg` 0x10052568 / `OpenDisbandDialog` 0x100520dd
+                ao_net::n3::textcmd::Local::OrgLeaveDialog => {
+                    let body = texts.by_key(10000, "ReallyLeaveOrg").unwrap_or_default();
+                    self.dialog(gui, dialog::Kind::OrgLeave, body, Self::yes_no(texts), None);
+                }
+                ao_net::n3::textcmd::Local::OrgDisbandDialog => {
+                    let body = texts.by_key(501, "Org_ConfirmDisband").unwrap_or_default();
+                    self.dialog(gui, dialog::Kind::OrgDisband, body, Self::yes_no(texts), None);
+                }
+                l => eprintln!("chat: local effect not implemented: {l:?}"),
+            }
         }
     }
 
@@ -472,7 +638,7 @@ impl Chat {
             ChatAction::Feedback(l) => self.line(gui, l),
             ChatAction::Tell { to, text } => {
                 if text.is_empty() {
-                    self.focus_text(gui, &format!("/tell {to} "));
+                    self.open_tell_named(gui, &to, texts);
                 } else {
                     self.net.tell(&to, &text);
                     // outgoing tell echo: text-db template "To [%s]: " (cat 10001 key ChatTellMsgToField, text.mdb line 6574) + text
@@ -501,6 +667,33 @@ impl Chat {
             }
             ChatAction::Social(id) => self.game.push(GameAction::Social(id)),
             ChatAction::ClientCommand(c) if c.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/assist")) => self.game.push(GameAction::Assist),
+            ChatAction::ShowUrl(u) => {
+                let outs = self.info.show_url(gui, self.screen, &u, true);
+                self.info_out(gui, outs, zone, texts);
+            }
+            // FUN_100b6f0d: only from level 4 on (stat 0x36 > 3); `prev` steps back, anything else forward, never below 0
+            ChatAction::TipOfTheDay { prev } => {
+                if zone.stat(0x36).unwrap_or(0) > 3 {
+                    self.tip = (self.tip + if prev { -1 } else { 1 }).max(0);
+                    let u = self.info.tip_url(self.tip);
+                    let outs = self.info.show_url(gui, self.screen, &u, true);
+                    self.info_out(gui, outs, zone, texts);
+                }
+            }
+            ChatAction::MessageBox(t) => {
+                let ok = texts.by_key(10000, "MsgBox_OK").unwrap_or_else(|| "OK".into());
+                self.dialog(gui, dialog::Kind::MessageBox, t, vec![ok], None);
+            }
+            ChatAction::AfkPrompt { default, body } => self.dialog(gui, dialog::Kind::Afk, body, vec!["Ok".into()], Some(default)),
+            ChatAction::Camp => self.game.push(GameAction::Camp),
+            ChatAction::Quit => self.quit = true,
+            // FUN_100b94e0: `ShellExecuteA("open", url)`; the macOS equivalent (`Play::show_error` does the same for the login error pages)
+            ChatAction::Start(u) => {
+                if let Err(e) = std::process::Command::new("open").arg(&u).spawn() {
+                    eprintln!("chat: /start {u}: {e}");
+                }
+            }
+            ChatAction::Window { name, op } => self.window_cmd(gui, &name, op),
             a if zonecmd::handles(&a) => self.zone_action(gui, &a, zone, texts),
             other => eprintln!("chat: action not implemented: {other:?}"),
         }

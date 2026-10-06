@@ -93,8 +93,6 @@ pub struct ZoneOut {
     pub frames: Vec<Frame>,
     pub chat: Vec<ChatReq>,
     pub lines: Vec<ChatLine>,
-    /// `/help`: file name below `text/help/` for the info window.
-    pub help_file: Option<String>,
     /// GUI side effects without a wire message (dialogs, local windows).
     pub local: Vec<Local>,
     /// The social command counter was used (`s_nCommandRefCntr++`).
@@ -116,7 +114,6 @@ pub fn handles(a: &ChatAction) -> bool {
             | ChatAction::Anim(_)
             | ChatAction::Inspect(_)
             | ChatAction::PlayedTime
-            | ChatAction::ShowHelp { .. }
             | ChatAction::Invite(_)
             | ChatAction::Kick(_)
             | ChatAction::Leave(_)
@@ -238,6 +235,12 @@ fn push_payload(out: &mut ZoneOut, ctx: &ZoneCmdCtx, p: Vec<u8>) {
     out.frames.push(n3_frame(0, ctx.char_id, p));
 }
 
+/// The wire message of the org leave / disband confirmation dialogs (`N3Msg_OrgLeaveConfirmed` / `N3Msg_OrgDisbandConfirmed`).
+pub fn org_confirmed(char_id: u32, leave: bool, target: Identity) -> Frame {
+    let (code, id) = if leave { (textcmd::org::LEAVE_CONFIRMED, Identity { kind: 0, instance: 0 }) } else { (textcmd::org::DISBAND_CONFIRMED, target) };
+    n3_frame(0, char_id, textcmd::org_client(char_id as i32, 0, code, id, ""))
+}
+
 /// `FUN_1003fba6` result -> frames, lines, local effects.
 fn text_command(out: &mut ZoneOut, ctx: &ZoneCmdCtx, line: &str) {
     match textcmd::text_command(line, &text_state(ctx)) {
@@ -300,7 +303,6 @@ pub fn perform(a: &ChatAction, ctx: &ZoneCmdCtx) -> ZoneOut {
             push_payload(&mut out, ctx, textcmd::inspect(ctx.char_id as i32, Identity { kind: 50000, instance: *id as i32 }));
         }
         ChatAction::PlayedTime => out.lines.push(info_line(&played_line(ctx.now_unix, ctx.tz_offset_min, ctx.game_time))),
-        ChatAction::ShowHelp { file } => out.help_file = Some(file.clone()),
         ChatAction::Invite(n) => out.chat.push(ChatReq::ByName { name: n.clone(), op: NameOp::Invite }),
         ChatAction::Kick(n) => out.chat.push(ChatReq::ByName { name: n.clone(), op: NameOp::Kick }),
         ChatAction::Leave(n) => out.chat.push(ChatReq::ByName { name: n.clone(), op: NameOp::Leave }),
@@ -493,7 +495,6 @@ mod tests {
         assert!(o.lines[0].text.contains("Ignored characters:") && o.lines[1].text.contains("5\tBob"));
         let o = perform(&ChatAction::NameRequest("Newname".into()), &c);
         assert_eq!(o.chat, [ChatReq::ByName { name: "name-request".into(), op: NameOp::Tell("Newname".into()) }]);
-        assert_eq!(perform(&ChatAction::ShowHelp { file: "chatcommands.html".into() }, &c).help_file.as_deref(), Some("chatcommands.html"));
         assert!(!handles(&ChatAction::Vicinity("x".into())));
     }
 

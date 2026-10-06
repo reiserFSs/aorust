@@ -66,6 +66,7 @@ impl Play {
                         m.social(id as i32, mode);
                     }
                 }
+                GameAction::Camp => self.camp(),
                 GameAction::Assist => match self.fight.as_ref().map(|m| m.assist(&self.zone)) {
                     Some(Ok(t)) => self.zone.target = Some(t),
                     Some(Err(key)) if !key.is_empty() => {

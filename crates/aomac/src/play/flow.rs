@@ -852,6 +852,12 @@ impl Frontend for Play {
                     c.esc();
                 }
             }
+            // a dialog box / the InfoView is open: Esc closes it first (`DialogBox_c::SlotEscPressed`; `esc_dialogs` / `esc_infoview` default true)
+            (Screen::InWorld, InputEvent::Key { key: Key::Escape, pressed: true, .. }) if self.chat.as_ref().is_some_and(|c| c.esc_closes()) => {
+                if let Some(c) = self.chat.as_mut() {
+                    c.escape(&mut self.gui, &self.zone, &self.text);
+                }
+            }
             (Screen::InWorld, InputEvent::Key { key: Key::Escape, pressed: true, .. }) => host.quit = true,
             (Screen::CharSelect, InputEvent::Key { key: Key::Up, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(-1, host),
             (Screen::CharSelect, InputEvent::Key { key: Key::Down, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(1, host),
@@ -1035,6 +1041,30 @@ impl Frontend for Play {
                 for f in c.take_outbox() {
                     s.send_zone(f);
                 }
+            }
+        }
+        // `/quit` and `/open` `/close` `/toggle` of the chat input (docs/chat/dialogs.md §3)
+        let (wins, quit) = self.chat.as_mut().map(|c| (c.take_windows(), c.take_quit())).unwrap_or_default();
+        if quit {
+            host.quit = true;
+        }
+        if let Some(h) = self.hud.as_mut() {
+            use super::chat::WindowOp;
+            for (dv, op) in wins {
+                if let Some(k) = hud::WindowKind::from_dvalue(dv) {
+                    match op {
+                        WindowOp::Open => h.open(&mut self.gui, k),
+                        WindowOp::Close => h.close_kind(&mut self.gui, k),
+                        WindowOp::Toggle => h.toggle(&mut self.gui, k),
+                    }
+                }
+            }
+        }
+        // Friends / Team Search windows follow the HUD's `friends_window` / `lft_window` dvalues (docs/chat/social.md)
+        if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_mut()) {
+            c.sync_windows(&mut self.gui, h.dvalue("friends_window"), h.dvalue("lft_window"), &self.text);
+            for d in c.take_closed_windows() {
+                h.set_dvalue(&mut self.gui, d, false);
             }
         }
         if let Some(h) = self.hud.as_mut() {

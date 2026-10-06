@@ -51,6 +51,10 @@ pub mod org {
     pub const KICK_TARGET: u8 = 0x0c;
     pub const KICK_NAME: u8 = 0x0d;
     pub const INVITE: u8 = 0x0e;
+    /// `N3Msg_OrgDisbandConfirmed` (Gamecode 0x1001a611: code 6, id = the engine target `+0x5c`, empty text, flag 0).
+    pub const DISBAND_CONFIRMED: u8 = 0x06;
+    /// `N3Msg_OrgLeaveConfirmed` (Gamecode 0x1001a7c1: code 0x10, id {0,0}).
+    pub const LEAVE_CONFIRMED: u8 = 0x10;
     pub const TAX: u8 = 0x11;
     pub const BANK: u8 = 0x12;
     pub const BANK_ADD: u8 = 0x13;
