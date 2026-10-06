@@ -362,6 +362,8 @@ impl Chat {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         let ignored: Vec<(u32, String)> = self.ignored.iter().map(|&i| (i, self.net.name_of(i).unwrap_or_default().to_owned())).collect();
         let secs = (zone.day_time() * 15.0) as u32;
+        let pets: Vec<ao_net::n3::textcmd::Pet> =
+            zone.pets.iter().map(|&id| ao_net::n3::textcmd::Pet { id, name: zone.dynels.get(&id.instance).map(|d| d.name.clone()) }).collect();
         let ctx = zonecmd::ZoneCmdCtx {
             texts,
             char_id: zone.char_id,
@@ -380,6 +382,20 @@ impl Chat {
             now_unix: now,
             tz_offset_min: zonecmd::local_offset_minutes(now),
             game_time: (secs / 3600, secs / 60 % 60),
+            pet: ao_net::n3::textcmd::PetState {
+                pets: &pets,
+                target_name: zone.target.and_then(|t| zone.dynels.get(&t)).map(|d| d.name.clone()),
+                // `FUN_10044b6e`: stat `Features` (0xE0); only the own one is tracked, the target's stats are not kept
+                own_features: zone.stat(0xE0).unwrap_or(0) as u32,
+                target_features: 0,
+                // [UNRESOLVED] `FUN_1003e1d0` needs `PlayfieldDistrictInfo`/`FightModeHandler`: the original's no-data default 2, as
+                // `Player::follow_gated` (so `/follow` answers `Feedback_CantFollow` until the district level is read)
+                own_fight_level: 2,
+                target_fight_level: 2,
+                // [UNRESOLVED] `vtbl[0x90]` of the own vehicle (docs/chat/cmd.md §/follow): a controllable avatar
+                can_move: true,
+                move_mode: 0,
+            },
         };
         let out = zonecmd::perform(a, &ctx);
         self.outbox.extend(out.frames);

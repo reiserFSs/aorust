@@ -51,6 +51,8 @@ pub struct ZoneCmdCtx<'a> {
     pub tz_offset_min: i32,
     /// `N3Msg_GetCurrentHour/Minute` (game clock).
     pub game_time: (u32, u32),
+    /// Engine state `/pet`, `/tower`, `/follow` read (`PetState::move_mode` is taken from [`Self::move_mode`]).
+    pub pet: textcmd::PetState<'a>,
 }
 
 /// A chat-server request that needs the character id of a name first (lookup 0x15, the original's `Action_t` classes 2/3/4/5/9).
@@ -228,6 +230,7 @@ fn text_state<'a>(ctx: &'a ZoneCmdCtx) -> TextState<'a> {
         in_team: ctx.in_team,
         team_leader: ctx.team_leader,
         stat_id: ctx.stat_id,
+        pet: textcmd::PetState { move_mode: ctx.move_mode, ..ctx.pet.clone() },
     }
 }
 
@@ -378,6 +381,7 @@ mod tests {
             now_unix: 0,
             tz_offset_min: 0,
             game_time: (0, 0),
+            pet: Default::default(),
         }
     }
 
@@ -410,7 +414,17 @@ mod tests {
         assert_eq!(o.lines[0].text, "Invalid /org command. Type /org help  in chat to view available commands.");
         let o = perform(&ChatAction::ZoneCommand("org create caf\u{e9}".into()), &c);
         assert_eq!(o.lines[0].text, "You cannot use letters ( \u{e9} ) in this command.");
-        assert!(perform(&ChatAction::ZoneCommand("follow".into()), &c).unsupported == ["follow"]);
+        // `/follow`: the target dynel is unknown -> nothing happens; known and free to move -> FollowTargetIIR_c + "Following X"
+        assert!(perform(&ChatAction::ZoneCommand("follow".into()), &c) == ZoneOut::default());
+        c.pet.target_name = Some("Bob".into());
+        c.pet.can_move = true;
+        let o = perform(&ChatAction::ZoneCommand("follow".into()), &c);
+        assert_eq!(o.frames.len(), 1);
+        assert!(o.lines[0].text.contains("Bob"), "{:?}", o.lines[0].text);
+        let pets = [textcmd::Pet { id: Identity { kind: DYNEL_CHAR, instance: 500 }, name: Some("Rex".into()) }];
+        c.pet.pets = &pets;
+        assert_eq!(perform(&ChatAction::ZoneCommand("pet Rex attack".into()), &c).frames.len(), 1);
+        assert_eq!(perform(&ChatAction::ZoneCommand("tower attack".into()), &c).frames.len(), 1);
         assert!(perform(&ChatAction::ZoneCommand("nonsense".into()), &c) == ZoneOut::default());
     }
 

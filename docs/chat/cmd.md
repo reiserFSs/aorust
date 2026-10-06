@@ -180,12 +180,58 @@ stored at `+0x20/+0x1c/+0x18/+0x28/+0x30`). **`param` = the window id** for text
 | `team` | in team (`FUN_100657d1`) | not in team: `Feedback_YouAreNotMemberOfTeam`; no word: `Feedback_AvailableTeamCommands` + `Feedback_TeamLoot` + `Feedback_TeamLootAll`; `team loot` -> 0x91; `team loot <x>` -> own id == team leader id: 0x7f idA `{0, teamcmd(x)}`, else `Feedback_OnlyTeamLeaderCanChangeLootOrder`. `teamcmd` list 0x102e2660: team 1, loot 2, all 3, leader 4, alpha 5 | 0x100406df..0x100408d9 |
 | `raid <sub>` | – | `RaidCmdIIR_c` (below); subs (map 0x102e2720): create 1, list 2, listlocal 3, move 4, lootaccess 5, locks 6 | 0x100404bb..0x100406d4 |
 | `org <sub> <rest>` | – | `OrgClientIIR_c` (below) | 0x100408e3..0x10041491 |
-| `pet ..`, `tower ..`, `follow` | | `PetCommandIIR_c` (ctor 0x10076260) / `FollowTargetIIR_c` (0x100734f8) built from engine state (pet command table `FUN_10053d69`, positions, FSM): **not decoded** (`TextResult::Unsupported`) | 0x10041ca8.. |
+| `pet <..>` / `tower <..>` | | `PetCommandIIR_c` (below); gates `Feedback_YouHaveNoPet` / `YouHaveNoServiceTower` (own pet list empty), `InvalidPetcommand` / `InvalidTowerCommand` | 0x10041ca8 / 0x10041df4 |
+| `follow` | | `FollowTargetIIR_c` toward the current target (below) | 0x10041f02 |
 | `getlocal setlocal getlocalfull criterialocal spelllocal monsterdata joycamacc tplocal` | GM | client-side debug (`DebugSpellListToChat`, `SetRelPos` ..): not decoded | 0x10041525.. |
 
 `ao_net::n3::textcmd::text_command(line, &TextState) -> TextResult` implements the table (byte-layout tests in the module); feedback keys are text.mdb
 **category 110** (`LDBface::GetTextPtr(0x6e, key)`; e.g. `Feedback_YouAreNotMemberOfTeam` = "You are not a member of a team!"), emitted through
 GlobalSignals+0x17c with colour code 0 (the window default; our `ChatKind::System` is a guess).
+
+### `/pet`, `/tower` — `PetCommandIIR_c` (key 6B333303)
+
+Dispatch (`FUN_1003fba6`, `std::string::compare`, case-sensitive): `pet` 0x10041ca8 (string 0x1015d910), `tower` 0x10041df4 (0x1015d8c8). Both: the own pet list
+(`dynel+0x1d8` -> `+0x1c`, `FUN_10051fa2` = its size; service towers live in the same list, docs/zone/pets.md) must be non-empty, else `Feedback_YouHaveNoPet` /
+`Feedback_YouHaveNoServiceTower`; `strlen(line) > 4`, else `Feedback_InvalidPetcommand` / `Feedback_InvalidTowerCommand`; then `FUN_10053d69(line + 4 | line + 6, own identity,
+list<Identity>* out)` returns the command entry `{code, arg, char* text}` (12 bytes, `FUN_10053d17`) or NULL (-> the Invalid feedback). Byte offsets 4 / 6 are fixed, so a bare
+`tower` (5 chars) reads past the terminator in the original [UNDEFINED; we treat it as no words]. `code 0x11` (`script`) sends nothing: `sprintf("scripts/%s", text)` +
+`FUN_10052230(path, pets, flag = 1 for tower)` queue a pet script (`Local::PetScript`; **UNRESOLVED**: script runner `FUN_10055681` not ported, the hub logs it). Otherwise
+`PetCommandIIR_c` ctor 0x10076260 `(window, own identity, entry, pets, tower_byte)` is sent via `SendIIRToObservers` (pass-on flag 0: ctor ends `this[0xc] = 0`).
+
+`FUN_10053d69` (the parser; maps built on first use at 0x10053da5..0x100541e1, `std::map<std::string,int>`, lookups case-sensitive [INFERENCE: default `std::less`]):
+
+1. Words: blanks are only `' '`; a word starting with `"` runs to the next `"` (or the end), another word ends at the next `' '` or `"` (the delimiter is consumed) — `ao_net::n3::textcmd::pet_words`.
+2. Last word in **map 1** (command alone): `follow 1, behind 2, survive 3, wait 4, guard 6, attack 7, terminate 10, free 11, heal 12, report 14`.
+3. Else, with >= 2 words: the last word is the argument, the one before must be in **map 2**: `cycle 5` (arg `a`... -> 1, `w`... -> 0, first letter via `tolower`, else invalid), `social 9`
+   (arg = emote id by `_stricmp`, `FUN_10053c73` over the table 0x1015eb98, = `action::emote_by_name`; unknown -> invalid), `rename 15`, `chat 16`, `script 17` (arg = the entry text, kept <= 255 bytes `FUN_10053ccd`).
+4. The remaining words are pet names. None: all pets (empty list) — except `rename`, which pushes `FUN_10058816(own)+0x5c` (the current target [INFERENCE: that helper field is the selected target]).
+   First word `all` (`_stricmp`): all pets. Otherwise each name is matched against every pet of the list: `String::StripSpecialChars(x, false)` [Utils 0x1000d764: drops `0x10` + the next char and everything from
+   `0x11` to `0x12`] on both, `String::CompareNoCase(.., -1)` [Utils 0x1000de83: `towupper` per code point]; matches are appended (duplicates possible). No match at all -> NULL.
+
+Wire (write slot 8 0x100760b7, read 0x100761a3; the reader accepts `code` 1..=0x10 and `len` <= 250), after the 13-byte N3 header (`u32 key`, own `{0xC350, char}`, `u8 0`):
+
+| type | field |
+|---|---|
+| i32 | window (`ChatWindowNode+0x1ec`) |
+| i32 | code (above) |
+| i32 | arg (cycle 0/1, social emote id, else 0) |
+| i32 + n x Identity | pets: `(n + 1) * 0x3f1` then the identities (`FUN_1003a527`); n = 0 = all pets |
+| i32 | 0 = `/pet`, 1 = `/tower` |
+| i32 + bytes | `strlen(text)`, text (rename/chat name or text, empty otherwise) |
+
+`ao_net::n3::textcmd::pet_command`; byte-layout tests `pet_tests`. All `/tower <word>` lines reach here except `create` (and `terminate` with a tower target), which the GUI sends as Fanatic (§Fanatic).
+
+### `/follow` — `FollowTargetIIR_c` (key 260F3671), Gamecode 0x10041f02
+
+Gates in order: target dynel (`FUN_10058e36(target)`, kind 0xC350) missing -> silent. For the own dynel and for the target: `FUN_1003e228(FUN_10058816(dynel)) > 1` (district fight-mode level, see below) or
+`Features` (stat 0xE0, `FUN_10044b6e`) bit 0 or bit 26 (`0x4000000`) -> `Feedback_CantFollow`. Own vehicle (`dynel+0x50`) missing, or its `vtbl[0x90]()` false, or the movement FSM mode (`vehicle+0x178` -> `+4`) in
+{1, 8, 9, 0xb, 0xc} -> `Feedback_YouCantMove`. Else the IIR is sent (ctor 0x100734f8 at 0x1004206b) and `Feedback "FollowingX"` (`%s` = the target's name, `vtbl[0xe8]+0x34`) is printed.
+The ctor arguments are `(own identity, target identity, speed = 2.5 [0x1015d87c], mode 0, position 0,0,0, no path)`, the ctor ends with `EnablePassOn` (pass-on byte **1**). The writer (0x10073030) takes the long
+form because the speed is non-zero: `u8 2, u8 mode 0, Identity target, f32 2.5, Vec3 0 0 0, u8 count 0` (`textcmd::follow_target`, test `follow_sends_the_long_form_and_gates`). No local effect: the movement
+only happens when the server answers with its own `FollowTargetIIR_c` (docs/zone/misc.md §2).
+GM branches: none in `/follow`, `/pet`, `/tower` (the only GM-gated words of `FUN_1003fba6` are listed above). **Unresolved inputs** (hub passes defaults, `play/chat.rs::zone_action`): the district fight-mode level
+(`FUN_1003e1d0`, default 2 without `PlayfieldDistrictInfo` data; the hub passes 2 like `Player::follow_gated`, so `/follow` currently answers `Feedback_CantFollow`), the target's `Features` (not tracked, 0),
+the meaning of `vtbl[0x90]` of the own vehicle (hub: true) and the FSM mode (`ZoneCmdCtx::move_mode`, 0 = unknown).
 
 ### `OrgClientIIR_c` — key `MapToKey` = 7F4B3108
 
@@ -259,7 +305,7 @@ The earlier `ChatCmd::PrivJoin/PrivPart` ids (0x33/0x34) were wrong and are corr
 
 ## Gaps / guesses
 
-* `pet`, `tower` (non-create), `follow`, the GM debug commands, `/petition`, `/rp`, `/reclaim`, `/terminate`, `/command`, `/gfx` are not decoded (see the tables).
+* The GM debug commands, `/petition`, `/rp`, `/reclaim`, `/terminate`, `/command`, `/gfx` are not decoded (see the tables). `/pet`, `/tower`, `/follow` are decoded; open inputs: pet script runner, district fight-mode level, vehicle `vtbl[0x90]`, `rename` default target (see their sections).
 * The engine target used by `OrgClientIIR_c` (`+0x5c`) is taken to be the GUI target; the colour of `Feedback_*` lines (code 0 through GlobalSignals+0x17c); case-insensitivity of the
   org/raid sub-word maps; the key/value roles of the `/cc info` forward map.
 * The `/<cmd> help` redirect condition and the keys marked `*` in `HELP_TOPICS` (org, pet, chat, team, misc, list, perk, raid share their string with another literal; inferred from chatcommands.html).

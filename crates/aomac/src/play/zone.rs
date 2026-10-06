@@ -2,7 +2,8 @@
 //! own dynel (start position / heading) and the other dynels the server announced. Evidence and layouts: docs/zone.md.
 
 use ao_net::frame::Frame;
-use ao_net::n3::{self, dynel::Dynel, misc::Misc, world::World, N3};
+use ao_net::msg::Identity;
+use ao_net::n3::{self, dynel::Dynel, misc::Misc, pet::PetList, world::World, N3};
 use std::collections::{BTreeMap, HashMap};
 
 /// `CurrentNano` stat id (0xd6): the second value `ResurrectIIR_t` sets.
@@ -88,6 +89,8 @@ pub struct Zone {
     /// The fight controller target of every dynel (`SimpleChar+0x1d4`, `+0x4c/+0x50`, set by the relayed `AttackIIR_t`, cleared by
     /// `StopFightIIR_t`; `N3Msg_GetTargetTarget` GC 0x1001641d reads it): fighter → its target instance id.
     pub fight_target: HashMap<i32, i32>,
+    /// The own pet list (`dynel+0x1d8` -> `+0x1c`, `AddPetIIR_c` / `RemovePetIIR_c`; docs/zone/pets.md): service towers included.
+    pub pets: Vec<Identity>,
     /// Pending [`OwnEvent`]s (drained by the player each frame).
     pub own_events: Vec<OwnEvent>,
 }
@@ -253,6 +256,12 @@ impl Zone {
             N3::Misc(Misc::StopFight(_)) if who.kind == CHAR_KIND => {
                 self.fight_target.remove(&who.instance);
             }
+            // `FUN_1007145e` / `FUN_100768ac`: add (once) / remove the pet identity of the header dynel's list (only the own one is read)
+            N3::Pet(p) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => match p {
+                PetList::Add(i) if !self.pets.contains(&i) => self.pets.push(i),
+                PetList::Add(_) => {}
+                PetList::Remove(i) => self.pets.retain(|x| *x != i),
+            },
             _ => {}
         }
         ZoneEvent::None

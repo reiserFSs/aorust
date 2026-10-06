@@ -14,6 +14,7 @@
 
 use super::action::character_action;
 use super::outgoing::{message_key, DYNEL_CHAR};
+use super::misc::{FollowTarget, Misc, Vec3};
 use super::world::CharacterAction;
 use crate::msg::Identity;
 use crate::wire::Writer;
@@ -143,6 +144,34 @@ pub struct TextState<'a> {
     pub team_leader: bool,
     /// `FUN_1002edf3`: stat name -> `Stat_e` (`_stricmp`), `None` if unknown (the original then uses 0x499602d2).
     pub stat_id: &'a dyn Fn(&str) -> Option<i32>,
+    pub pet: PetState<'a>,
+}
+
+/// One entry of the own pet list (`dynel+0x1d8` -> `+0x1c`, filled by `AddPetIIR_c` / `RemovePetIIR_c`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pet {
+    pub id: Identity,
+    /// Name of the pet's dynel (`vtbl[0xe8]+0x34`); `None` when the dynel is unknown (`FUN_10058e36` null: never matches a name).
+    pub name: Option<String>,
+}
+
+/// Engine state read by `/pet`, `/tower` and `/follow` (all `Default` = nothing known).
+#[derive(Debug, Clone, Default)]
+pub struct PetState<'a> {
+    /// The own pet list (service towers are in the same list: `Feedback_YouHaveNoServiceTower` tests its size too).
+    pub pets: &'a [Pet],
+    /// `/follow`: name of the target dynel (`FUN_10058e36(target)` non-null); `None` = no such dynel, the command does nothing.
+    pub target_name: Option<String>,
+    /// `Features` (stat 0xE0) of the own / target dynel (`FUN_10044b6e`).
+    pub own_features: u32,
+    pub target_features: u32,
+    /// District fight-mode level (`FUN_1003e228`; default 2 without district data) of the own / target dynel.
+    pub own_fight_level: i32,
+    pub target_fight_level: i32,
+    /// Own vehicle exists and its `vtbl[0x90]` is true (`FUN_100574e2`; [UNRESOLVED] meaning of the slot).
+    pub can_move: bool,
+    /// Current movement FSM state (`FUN_100704e6`), 0 = unknown.
+    pub move_mode: i32,
 }
 
 /// `FUN_1002edf3` result for an unknown name (`Stat_e` "invalid").
@@ -156,7 +185,7 @@ pub struct Feedback {
 }
 
 /// GUI-side effects (dialogs) that have no wire message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Local {
     /// `/bank close`: closes the bank window (`FUN_10046bdd`).
     BankClose,
@@ -165,6 +194,9 @@ pub enum Local {
     /// `/org leave` (confirmation dialog, `FUN_1000446b` signal) and `/org disband`.
     OrgLeaveDialog,
     OrgDisbandDialog,
+    /// `/pet script <name>` / `/tower script <name>`: `FUN_10052230("scripts/<name>", pets, tower)` queues a pet script on the
+    /// engine; no `PetCommandIIR_c` is sent. [UNRESOLVED] the script runner (`FUN_10055681`) is not ported.
+    PetScript { path: String, pets: Vec<Identity>, tower: bool },
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -180,8 +212,7 @@ pub enum TextResult {
     Handled(TextOut),
     /// First word not in `FUN_1003fba6` (or it does nothing for these words/arguments): the original sends and prints nothing.
     Ignored,
-    /// A command of `FUN_1003fba6` whose layout is not decoded (docs/chat/cmd.md gaps): `pet`, `tower`, `follow`, the local
-    /// GM debug commands.
+    /// A command of `FUN_1003fba6` whose layout is not decoded (docs/chat/cmd.md gaps): the local GM debug commands.
     Unsupported(&'static str),
 }
 
@@ -280,6 +311,36 @@ fn fb(key: &'static str) -> Feedback {
     Feedback { key, arg: None }
 }
 
+/// `PetCommandIIR_c` (key `6B333303`; ctor Gamecode 0x10076260, write slot 8 = 0x100760b7, read 0x100761a3): after the N3 header
+/// `i32 window, i32 code, i32 arg, list<Identity> pets, i32 tower, i32 len, bytes text`. The list is `(n + 1) * 0x3f1` then `n`
+/// identities (0x1003a527; empty = all pets); `tower` is the ctor's last argument (0 = `/pet`, 1 = `/tower`); `text` is the entry's
+/// `+8` string (`FUN_10053ccd` keeps at most 255 bytes). The client's reader accepts `code` 1..=0x10 and `len` <= 250.
+pub fn pet_command(char_id: i32, window: i32, code: i32, arg: i32, pets: &[Identity], tower: bool, text: &str) -> Vec<u8> {
+    let mut w = Writer::default();
+    header(&mut w, "PetCommandIIR_c", char_id);
+    w.i32(window);
+    w.i32(code);
+    w.i32(arg);
+    w.i32((pets.len() as i32 + 1) * 0x3f1);
+    pets.iter().for_each(|p| p.write(&mut w));
+    w.i32(i32::from(tower));
+    let t = &text.as_bytes()[..text.len().min(255)];
+    w.i32(t.len() as i32);
+    w.bytes(t);
+    w.0
+}
+
+/// `FollowTargetIIR_c` as `/follow` builds it (ctor Gamecode 0x100734f8 called at 0x1004206b, write 0x10073030): header = own dynel,
+/// flag 1 (`EnablePassOn` at the end of the ctor), target = the current target, speed 2.5 (`[0x1015d87c]`), mode 0, position 0,0,0,
+/// no waypoints. The speed is non-zero so the writer always takes the long form.
+pub fn follow_target(char_id: i32, target: Identity) -> Vec<u8> {
+    let f = FollowTarget { form: 2, mode: 0, target, speed: FOLLOW_SPEED, pos: Vec3::default(), path: Vec::new() };
+    Misc::FollowTarget(f).encode(id(DYNEL_CHAR, char_id), 1)
+}
+
+/// `/follow` speed argument of the ctor (`[0x1015d87c]` = 0x40200000).
+pub const FOLLOW_SPEED: f32 = 2.5;
+
 /// `FUN_1003fba6(window, line, target)`; `line` has no slash and is already `ExpandChatTextArgs`'d.
 pub fn text_command(line: &str, st: &TextState) -> TextResult {
     let mut ss = Words::new(line);
@@ -329,9 +390,9 @@ pub fn text_command(line: &str, st: &TextState) -> TextResult {
         "team" => team(&mut ss, st),
         "raid" => raid(&mut ss, st),
         "org" => org_cmd(&mut ss, st),
-        "pet" => TextResult::Unsupported("pet"),
-        "tower" => TextResult::Unsupported("tower"),
-        "follow" => TextResult::Unsupported("follow"),
+        "pet" => pet_cmd(false, line, st),
+        "tower" => pet_cmd(true, line, st),
+        "follow" => follow(st),
         "getlocal" | "setlocal" | "getlocalfull" | "criterialocal" | "spelllocal" | "monsterdata" | "joycamacc" | "tplocal" if st.gm => {
             TextResult::Unsupported("gm debug command")
         }
@@ -452,6 +513,147 @@ fn org_cmd(ss: &mut Words, st: &TextState) -> TextResult {
     TextResult::Handled(TextOut { payloads: vec![org_client(st.char_id, st.window, c, who, text)], ..Default::default() })
 }
 
+/// `FUN_10053d69` map 1 (`DAT_102e30a8`, command is the last word): follow 1, behind 2, survive 3, wait 4, guard 6, attack 7,
+/// terminate 10, free 11, heal 12, report 14. `std::map<string,int>`: case-sensitive.
+fn pet_code1(w: &[u8]) -> Option<i32> {
+    let n = ["follow", "behind", "survive", "wait", "", "guard", "attack", "", "", "terminate", "free", "heal", "", "report"];
+    n.iter().position(|&c| !c.is_empty() && c.as_bytes() == w).map(|i| i as i32 + 1)
+}
+
+/// `FUN_10053d69` map 2 (`DAT_102e30ac`, the command precedes its argument word): cycle 5, social 9, rename 15, chat 16, script 17.
+fn pet_code2(w: &[u8]) -> Option<i32> {
+    [(&b"cycle"[..], 5), (b"social", 9), (b"rename", 15), (b"chat", 16), (b"script", 17)].iter().find(|(n, _)| *n == w).map(|&(_, c)| c)
+}
+
+/// The word splitter of `FUN_10053d69` (0x10054245..0x10054362): skips blanks (only `' '`); a word starting with `"` runs to the
+/// next `"` (or the end), any other ends at the next blank or `"` (the delimiter is consumed).
+fn pet_words(s: &[u8]) -> Vec<Vec<u8>> {
+    let find = |c: u8, from: usize| s.get(from..).and_then(|t| t.iter().position(|&x| x == c)).map(|i| i + from);
+    let (mut v, mut pos) = (Vec::new(), 0);
+    while pos < s.len() {
+        while pos < s.len() && s[pos] == b' ' {
+            pos += 1;
+        }
+        if pos >= s.len() {
+            break;
+        }
+        let (a, b) = (find(b' ', pos), find(b'"', pos + 1));
+        let end = if s[pos] == b'"' { b } else { a.into_iter().chain(b).min() };
+        let from = pos + usize::from(s[pos] == b'"');
+        v.push(s[from..end.unwrap_or(s.len())].to_vec());
+        match end {
+            Some(e) => pos = e + 1,
+            None => break,
+        }
+    }
+    v
+}
+
+/// `String::StripSpecialChars(s, false)` [Utils 0x1000d764]: drops `0x10` and the char after it, and everything between `0x11` and `0x12`.
+fn strip_special(s: &str) -> String {
+    let (mut out, mut skip, mut it) = (String::new(), false, s.chars());
+    while let Some(c) = it.next() {
+        match c {
+            '\x10' => {
+                it.next();
+            }
+            '\x11' => skip = true,
+            '\x12' => skip = false,
+            _ if !skip => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `String::CompareNoCase(a, b, -1) == 0` [Utils 0x1000de83]: `towupper` of every code point.
+fn eq_nocase(a: &str, b: &str) -> bool {
+    let up = |s: &str| s.chars().map(|c| c.to_uppercase().next().unwrap_or(c)).collect::<Vec<_>>();
+    up(a) == up(b)
+}
+
+/// `/pet` and `/tower` (Gamecode 0x10041ca8 / 0x10041df4): `text` = the line after `"pet "` / `"tower "` (byte offsets 4 / 6),
+/// `FUN_10053d69` parses it into `{code, arg, text}` plus the list of the addressed pets.
+fn pet_cmd(tower: bool, line: &str, st: &TextState) -> TextResult {
+    let invalid = || TextResult::Handled(TextOut { feedback: vec![fb(if tower { "Feedback_InvalidTowerCommand" } else { "Feedback_InvalidPetcommand" })], ..Default::default() });
+    let p = &st.pet;
+    if p.pets.is_empty() {
+        return TextResult::Handled(TextOut { feedback: vec![fb(if tower { "Feedback_YouHaveNoServiceTower" } else { "Feedback_YouHaveNoPet" })], ..Default::default() });
+    }
+    // strlen > 4 (also for "tower": a bare "tower" then reads past the terminator in the original [UNDEFINED]: treated as empty)
+    if line.len() <= 4 {
+        return invalid();
+    }
+    let mut words = pet_words(line.as_bytes().get(if tower { 6 } else { 4 }..).unwrap_or_default());
+    let Some(last) = words.last().cloned() else { return invalid() };
+    let (mut code, mut arg, mut text) = (pet_code1(&last).unwrap_or(0), 0, String::new());
+    if code == 0 && words.len() >= 2 {
+        words.pop();
+        if let Some(c) = pet_code2(words.last().unwrap()) {
+            code = c;
+            let a = String::from_utf8_lossy(&last).into_owned();
+            match c {
+                5 => match last.first().map(u8::to_ascii_lowercase) {
+                    Some(b'a') => arg = 1,
+                    Some(b'w') => arg = 0,
+                    _ => code = 0,
+                },
+                9 => {
+                    arg = super::action::emote_by_name(&a).map_or(0, |e| e.id);
+                    if arg == 0 {
+                        code = 0;
+                    }
+                }
+                _ => text = a,
+            }
+        }
+    }
+    words.pop();
+    if code == 0 {
+        return invalid();
+    }
+    let names: Vec<String> = words.iter().map(|w| String::from_utf8_lossy(w).into_owned()).collect();
+    let mut ids = Vec::new();
+    match names.first() {
+        // `rename` without a pet name: `FUN_10058816(own)+0x5c` [INFERENCE: the current target]
+        None if code == 0xf => ids.push(st.target),
+        None => {}
+        Some(n) if n.eq_ignore_ascii_case("all") => {}
+        Some(_) => {
+            for n in &names {
+                let n = strip_special(n);
+                ids.extend(p.pets.iter().filter(|x| x.name.as_deref().is_some_and(|m| eq_nocase(&n, &strip_special(m)))).map(|x| x.id));
+            }
+            if ids.is_empty() {
+                return invalid();
+            }
+        }
+    }
+    if code == 0x11 {
+        return TextResult::Handled(TextOut { local: vec![Local::PetScript { path: format!("scripts/{text}"), pets: ids, tower }], ..Default::default() });
+    }
+    TextResult::Handled(TextOut { payloads: vec![pet_command(st.char_id, st.window, code, arg, &ids, tower, &text)], ..Default::default() })
+}
+
+/// `/follow` (Gamecode 0x10041f02..0x10042187): follow the current target.
+fn follow(st: &TextState) -> TextResult {
+    let p = &st.pet;
+    let say = |f: Feedback| TextResult::Handled(TextOut { feedback: vec![f], ..Default::default() });
+    let Some(name) = &p.target_name else { return TextResult::Handled(TextOut::default()) };
+    let blocked = |level: i32, features: u32| level > 1 || features & 1 != 0 || features & 0x400_0000 != 0;
+    if blocked(p.own_fight_level, p.own_features) || blocked(p.target_fight_level, p.target_features) {
+        return say(fb("Feedback_CantFollow"));
+    }
+    if !p.can_move || matches!(p.move_mode, 1 | 8 | 9 | 0xb | 0xc) {
+        return say(fb("Feedback_YouCantMove"));
+    }
+    TextResult::Handled(TextOut {
+        payloads: vec![follow_target(st.char_id, st.target)],
+        feedback: vec![Feedback { key: "FollowingX", arg: Some(name.clone()) }],
+        ..Default::default()
+    })
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // tests (byte layouts follow the read/write functions cited above)
 // ---------------------------------------------------------------------------------------------------------------
@@ -462,7 +664,7 @@ mod tests {
     use crate::n3::action::parse_character_action;
 
     fn state<'a>(stat: &'a dyn Fn(&str) -> Option<i32>) -> TextState<'a> {
-        TextState { char_id: 0x1234, window: 7, target: id(DYNEL_CHAR, 99), gm: false, in_team: true, team_leader: true, stat_id: stat }
+        TextState { char_id: 0x1234, window: 7, target: id(DYNEL_CHAR, 99), gm: false, in_team: true, team_leader: true, stat_id: stat, pet: PetState::default() }
     }
     fn no_stat(_: &str) -> Option<i32> {
         None
@@ -637,5 +839,165 @@ mod tests {
         assert_eq!((atoi("-12x"), atoi("x"), strtoul("42 "), strtoul("x"), scan_u("7z"), scan_u("-1")), (-12, 0, 42, 0, Some(7), None));
         assert_eq!(team_code("LOOT"), 2);
         assert_eq!(org_code("Kick"), 15);
+    }
+}
+
+#[cfg(test)]
+mod pet_tests {
+    use super::*;
+
+    fn pets() -> Vec<Pet> {
+        vec![Pet { id: id(DYNEL_CHAR, 500), name: Some("Rex".into()) }, Pet { id: id(DYNEL_CHAR, 501), name: Some("\u{11}ff0000\u{12}Fido Jr".into()) }]
+    }
+    fn st<'a>(pets: &'a [Pet], stat: &'a dyn Fn(&str) -> Option<i32>) -> TextState<'a> {
+        TextState {
+            char_id: 0x1234,
+            window: 7,
+            target: id(DYNEL_CHAR, 99),
+            gm: false,
+            in_team: false,
+            team_leader: false,
+            stat_id: stat,
+            pet: PetState { pets, target_name: Some("Bob".into()), can_move: true, ..Default::default() },
+        }
+    }
+    fn none(_: &str) -> Option<i32> {
+        None
+    }
+    fn payload(r: TextResult) -> Vec<u8> {
+        match r {
+            TextResult::Handled(o) if o.payloads.len() == 1 => o.payloads.into_iter().next().unwrap(),
+            other => panic!("{other:?}"),
+        }
+    }
+    fn fbk(r: TextResult) -> Vec<&'static str> {
+        match r {
+            TextResult::Handled(o) => o.feedback.iter().map(|f| f.key).collect(),
+            other => panic!("{other:?}"),
+        }
+    }
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn keys_match_the_registry() {
+        assert_eq!(message_key("PetCommandIIR_c"), 0x6B33_3303);
+        assert_eq!(message_key("FollowTargetIIR_c"), 0x260F_3671);
+    }
+
+    #[test]
+    fn pet_attack_for_all_pets() {
+        let (p, s) = (pets(), none);
+        let b = payload(text_command("pet attack", &st(&p, &s)));
+        // key, {0xC350, 0x1234}, passed-on 0 | window 7, code 7, arg 0, list (0+1)*0x3f1, tower 0, len 0
+        assert_eq!(hex(&b), "6b333303 0000c350 00001234 00 00000007 00000007 00000000 000003f1 00000000 00000000".replace(' ', ""));
+    }
+
+    #[test]
+    fn pet_rename_by_name_strips_markup_and_ignores_case() {
+        let (p, s) = (pets(), none);
+        let b = payload(text_command("pet rex rename Max", &st(&p, &s)));
+        assert_eq!(
+            hex(&b[13..]),
+            "00000007 0000000f 00000000 000007e2 0000c350 000001f4 00000000 00000003 4d6178".replace(' ', "")
+        );
+        // quoted name with a blank, matched against the markup-stripped dynel name
+        let b = payload(text_command("pet \"fido jr\" heal", &st(&p, &s)));
+        assert_eq!(hex(&b[13..]), "00000007 0000000c 00000000 000007e2 0000c350 000001f5 00000000 00000000".replace(' ', ""));
+        // an unknown name drops the command
+        assert_eq!(fbk(text_command("pet Nobody attack", &st(&p, &s))), ["Feedback_InvalidPetcommand"]);
+        // `all` addresses every pet (empty list)
+        let b = payload(text_command("pet ALL guard", &st(&p, &s)));
+        assert_eq!(hex(&b[13..13 + 16]), "00000007 00000006 00000000 000003f1".replace(' ', ""));
+        // rename without a pet name sends the current target [INFERENCE]
+        let b = payload(text_command("pet rename Zed", &st(&p, &s)));
+        assert_eq!(hex(&b[17..]), "0000000f 00000000 000007e2 0000c350 00000063 00000000 00000003 5a6564".replace(' ', ""));
+    }
+
+    #[test]
+    fn pet_arguments() {
+        let (p, s) = (pets(), none);
+        let arg = |l: &str| i32::from_be_bytes(payload(text_command(l, &st(&p, &s)))[21..25].try_into().unwrap());
+        assert_eq!(arg("pet cycle a"), 1);
+        assert_eq!(arg("pet cycle Wait"), 0);
+        assert_eq!(fbk(text_command("pet cycle x", &st(&p, &s))), ["Feedback_InvalidPetcommand"]);
+        let bow = crate::n3::action::emote_by_name("bow").unwrap().id;
+        assert_eq!(arg("pet social BOW"), bow);
+        assert_eq!(fbk(text_command("pet social nosuchemote", &st(&p, &s))), ["Feedback_InvalidPetcommand"]);
+    }
+
+    #[test]
+    fn tower_sets_the_tower_flag() {
+        let (p, s) = (pets(), none);
+        let b = payload(text_command("tower terminate", &st(&p, &s)));
+        assert_eq!(hex(&b[13..]), "00000007 0000000a 00000000 000003f1 00000001 00000000".replace(' ', ""));
+        assert_eq!(fbk(text_command("tower", &st(&p, &s))), ["Feedback_InvalidTowerCommand"]);
+    }
+
+    #[test]
+    fn pet_gates_and_scripts() {
+        let s = none;
+        assert_eq!(fbk(text_command("pet attack", &st(&[], &s))), ["Feedback_YouHaveNoPet"]);
+        assert_eq!(fbk(text_command("tower attack", &st(&[], &s))), ["Feedback_YouHaveNoServiceTower"]);
+        let p = pets();
+        for l in ["pet", "pet ", "pet x", "pet \"", "pets attack"] {
+            let r = text_command(l, &st(&p, &s));
+            if l == "pets attack" {
+                assert_eq!(r, TextResult::Ignored);
+            } else {
+                assert_eq!(fbk(r), ["Feedback_InvalidPetcommand"], "{l}");
+            }
+        }
+        match text_command("pet Rex script fight.txt", &st(&p, &s)) {
+            TextResult::Handled(o) => {
+                assert!(o.payloads.is_empty());
+                assert_eq!(o.local, [Local::PetScript { path: "scripts/fight.txt".into(), pets: vec![id(DYNEL_CHAR, 500)], tower: false }]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn word_splitter() {
+        let w = |s: &str| pet_words(s.as_bytes()).into_iter().map(|x| String::from_utf8(x).unwrap()).collect::<Vec<_>>();
+        assert_eq!(w("  a  b "), ["a", "b"]);
+        assert_eq!(w("\"Rex Jr\" attack"), ["Rex Jr", "attack"]);
+        assert_eq!(w("ab\"cd ef"), ["ab", "cd", "ef"]);
+        assert_eq!(w("\"open end"), ["open end"]);
+        assert_eq!(w("\"\" x"), ["", "x"]);
+        assert!(w("   ").is_empty());
+        assert_eq!(strip_special("\u{10}x\u{11}hidden\u{12}Rex"), "Rex");
+    }
+
+    #[test]
+    fn follow_sends_the_long_form_and_gates() {
+        let (p, s) = (pets(), none);
+        let b = payload(text_command("follow", &st(&p, &s)));
+        // key, header {0xC350, 0x1234}, passed-on 1 | form 2, mode 0, target {0xC350, 99}, speed 2.5, pos 0,0,0, count 0
+        assert_eq!(hex(&b), "260f3671 0000c350 00001234 01 02 00 0000c350 00000063 40200000 00000000 00000000 00000000 00".replace(' ', ""));
+        let mut o = match text_command("follow", &st(&p, &s)) {
+            TextResult::Handled(o) => o,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(o.feedback.remove(0), Feedback { key: "FollowingX", arg: Some("Bob".into()) });
+        let go = |f: &dyn Fn(&mut PetState)| {
+            let mut t = st(&p, &s);
+            f(&mut t.pet);
+            fbk(text_command("follow", &t))
+        };
+        assert_eq!(go(&|s| s.own_fight_level = 2), ["Feedback_CantFollow"]);
+        assert_eq!(go(&|s| s.target_features = 1), ["Feedback_CantFollow"]);
+        assert_eq!(go(&|s| s.own_features = 0x400_0000), ["Feedback_CantFollow"]);
+        assert_eq!(go(&|s| s.can_move = false), ["Feedback_YouCantMove"]);
+        for m in [1, 8, 9, 0xb, 0xc] {
+            assert_eq!(go(&|s| s.move_mode = m), ["Feedback_YouCantMove"]);
+        }
+        assert_eq!(go(&|s| s.move_mode = 4), ["FollowingX"]);
+        assert_eq!(text_command("follow", &{
+            let mut t = st(&p, &s);
+            t.pet.target_name = None;
+            t
+        }), TextResult::Handled(TextOut::default()));
     }
 }

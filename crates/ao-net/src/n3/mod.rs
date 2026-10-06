@@ -11,6 +11,7 @@ pub mod misc;
 pub mod motion;
 pub mod nametag;
 pub mod outgoing;
+pub mod pet;
 pub mod server_move;
 pub mod textcmd;
 pub mod teleport;
@@ -52,6 +53,8 @@ pub enum N3 {
     Chat(chat::N3Chat),
     /// `n3TeleportIIR_t`: the server moves a dynel (in place or to another playfield).
     Teleport(teleport::Teleport),
+    /// `AddPetIIR_c` / `RemovePetIIR_c`: the own pet list.
+    Pet(pet::PetList),
     /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
     Unknown(Vec<u8>),
 }
@@ -80,6 +83,8 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
         N3::Chat(m)
     } else if let Some(m) = teleport::decode(&h, &mut r)? {
         N3::Teleport(m)
+    } else if let Some(m) = pet::decode(&h, &mut r)? {
+        N3::Pet(m)
     } else {
         N3::Unknown(f.payload[13..].to_vec())
     };

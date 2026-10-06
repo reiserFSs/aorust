@@ -174,7 +174,7 @@ TextMessage_t(type = 3 vicinity | 4 shout | 2 whisper, sender = s_nCharID, recei
 search over GUI/Gamecode/Interfaces finds only registrations; probable: our own or the target's id — `{0,0}` is used in the unit test only
 as a byte example), (b) whether the GUI's `len` counts a trailing NUL, (c) ptype-5 *received* text is out of scope here (none in the capture).
 Slash commands (`N3Msg_TextCommand` [GC 0x176db] → `FUN_1003fba6`) are not text frames: they are dispatched client side and become
-`CharacterActionIIR_t`, `FollowTargetIIR_c`, `OrgClientIIR_c`, `PetCommandIIR_c`, `RaidCmdIIR_c` via `SendIIRToObservers` (layouts not decoded here).
+`CharacterActionIIR_t`, `FollowTargetIIR_c`, `OrgClientIIR_c`, `PetCommandIIR_c`, `RaidCmdIIR_c` via `SendIIRToObservers` (`PetCommandIIR_c` / `FollowTargetIIR_c` layouts: docs/chat/cmd.md §/pet, §/follow; the others there too).
 [INFERENCE] Private/channel chat (org, tell, general) uses the separate chat server, not this connection; no code for it was read.
 
 ## 7. Other client senders (class only; layouts NOT decoded here)
