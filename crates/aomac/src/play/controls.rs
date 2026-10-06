@@ -302,6 +302,9 @@ pub struct ControlPrefs {
     pub mouse_look_inverted: bool,
     /// `3rdPersonCamera`: start in third person.
     pub third_person: bool,
+    /// `PreferredCameraMode` (1..3): the camera vehicle of third person, 3 = `CameraVehicleFixedThird_t(rigid)`, 2 = the
+    /// same damped, 1 = the plain `CameraVehicle_t` (`FUN_10020290` @N3 0x10020290). Ctrl+F8 cycles 3 -> 2 -> 1 -> 3.
+    pub preferred_camera_mode: u8,
     /// `ShowMyCharacter`: draw the own avatar in first person.
     pub show_my_character: bool,
 }
@@ -319,6 +322,7 @@ impl Default for ControlPrefs {
             mouse_wheel: 0,
             mouse_look_inverted: false,
             third_person: true,
+            preferred_camera_mode: 3,
             show_my_character: false,
         }
     }
@@ -345,6 +349,8 @@ impl ControlPrefs {
                 "MouseWheel" => p.mouse_wheel = value.parse().unwrap_or(0),
                 "MouseLookInverted" => p.mouse_look_inverted = b(),
                 "ShowMyCharacter" => p.show_my_character = b(),
+                // 0 would mean first person; entering third person maps it to 1 (`FUN_10021859` @N3 0x10021859)
+                "PreferredCameraMode" => p.preferred_camera_mode = value.parse::<u8>().ok().filter(|m| *m <= 3).map_or(p.preferred_camera_mode, |m| m.max(1)),
                 _ => {}
             }
         }
@@ -386,7 +392,7 @@ pub enum CamCmd {
     SetPreferred,
     /// F8: toggles `3rdPersonCamera`.
     ToggleView,
-    /// Ctrl+F8 / Shift+F8: next / previous scripted camera attractor of the playfield.
+    /// Ctrl+F8: drop the attractor and cycle the camera vehicle (`GetNextVisibleAttractor`); Shift+F8: previous attractor.
     NextView,
     PrevView,
     /// A left-button look ended (`N3Msg_EndCameraMouseLook`).
@@ -495,6 +501,11 @@ impl Controls {
             c.bindings.extend_from_slice(FIXED_BINDINGS);
         }
         c
+    }
+
+    /// CTRL or ALT is down (the `& 0xc` qualifier of `ActionViewMouseHandler_c`'s release slot; which bit is which is unresolved).
+    pub fn attack_modifier(&self) -> bool {
+        self.ctrl || self.alt
     }
 
     pub fn prefs(&self) -> &ControlPrefs {
@@ -848,6 +859,7 @@ mod tests {
             ("WINDOW_FRIENDS", WindowKind::Friends),
             ("WINDOW_NANO", WindowKind::Nano),
             ("WINDOW_NCU", WindowKind::Ncu),
+            ("WINDOW_STAT", WindowKind::Stat),
         ];
         let mut input = 0;
         let mut found = 0;
@@ -859,7 +871,6 @@ mod tests {
                 if let Some((n, w)) = providers.iter().find(|(n, _)| u64::from(provider_hash(n)) == p) {
                     assert!(WINDOW_BINDINGS.contains(&(input, *w)), "{n}: {input}");
                     found += 1;
-            ("WINDOW_STAT", WindowKind::Stat),
                 }
             }
         }
@@ -936,6 +947,18 @@ mod tests {
         let mut c = ctl();
         assert_eq!(c.on_mouse_button(MouseButton::Middle, true), vec![Cmd::Move(1)]);
         assert_eq!(c.on_mouse_button(MouseButton::Middle, false), vec![Cmd::Move(2)]);
+    }
+
+    /// The client has no left+right chord: `AnarchyOnline.exe` maps `WM_*BUTTON*` 1:1 to the input ids 1/5/9, no GUI/Gamecode code
+    /// tests two buttons together (docs/zone/camera.md §5), so holding both starts the two looks and moves nothing.
+    #[test]
+    fn both_buttons_do_not_move_forward() {
+        let mut c = ctl();
+        assert_eq!(c.on_mouse_button(MouseButton::Left, true), vec![]);
+        assert_eq!(c.on_mouse_button(MouseButton::Right, true), vec![]);
+        for cmd in c.on_mouse_motion(30.0, 0.0) {
+            assert!(!matches!(cmd, Cmd::Move(1)), "{cmd:?}");
+        }
     }
 
     #[test]

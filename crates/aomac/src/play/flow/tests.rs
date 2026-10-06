@@ -253,6 +253,7 @@ fn teleport_iir_starts_the_zone_change_only_with_a_destination() {
     r.event(tp(33512, 0));
     assert!(!r.p.teleporting, "same playfield: no TeleportStarted");
     assert_eq!(r.p.zone.own().unwrap().pos, [1.0, 2.0, 3.0]);
+    assert!(matches!(r.p.zone.own_events.last(), Some(zone::OwnEvent::Place { pos, yaw, full_reset: true }) if *pos == [1.0, 2.0, 3.0] && (*yaw - std::f32::consts::PI).abs() < 1e-5));
     r.event(tp(99, 4604));
     assert!(!r.p.teleporting, "another character's destination is ignored");
     r.event(tp(33512, 4604));
@@ -309,4 +310,51 @@ fn autopilot_crosses_the_arrival_hall() {
         assert!(frames < 6000, "stuck at {:?}", r.p.zone.own().unwrap().pos);
     }
     eprintln!("arrived after {frames} frames at {:?}", r.p.zone.own().unwrap().pos);
+}
+
+/// The live harness' `press=F8` and `drag=right:dx:dy`, headless: the player lens has the client's near plane, F8 puts the camera at the
+/// head (first person), a right drag turns the character by `counts / 1000 * MouseTurnSensitivity` radians (docs/zone/camera.md §4, §5).
+#[test]
+fn first_person_and_mouse_look_from_the_input_events() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    for _ in 0..30 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    assert_eq!(r.host.lens.unwrap().near, 0.2, "the player camera's near plane (VisualCamera_t, CreateCamera)");
+    let feet = |r: &Rig| {
+        let p = r.p.zone.own().unwrap().pos;
+        ao_render::Vec3::new(p[0], p[1], -p[2])
+    };
+    let d3 = (r.host.camera.pos - feet(&r)).length();
+    assert!(d3 > 4.0 && d3 < 6.5, "third person: {d3} m from the feet");
+    let tap = |r: &mut Rig, code| {
+        for pressed in [true, false] {
+            r.p.game_input(ao_render::GameInput::Key { code, pressed, repeat: false }, &mut r.host);
+            r.p.frame(0.016, (1280, 800), &mut r.host);
+        }
+    };
+    tap(&mut r, ao_render::KeyCode::F8);
+    for _ in 0..30 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    let eye = r.host.camera.pos - feet(&r);
+    assert!(eye.y > 1.2 && eye.y < 2.2 && eye.x.hypot(eye.z) < 0.3, "first person eye {eye:?}");
+    // right drag: 100 counts at sensitivity 10 = 1 rad of character turn
+    let yaw0 = r.p.zone.own().unwrap().yaw.unwrap_or(0.0);
+    let (x, y, button) = (640.0, 400.0, ao_gui::MouseButton::Right);
+    r.p.input(ao_gui::InputEvent::MouseDown { x, y, button }, &mut r.host);
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    for _ in 0..4 {
+        r.p.game_input(ao_render::GameInput::MouseMotion { dx: 25.0, dy: 0.0 }, &mut r.host);
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    r.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut r.host);
+    for _ in 0..60 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    let turned = (r.p.zone.own().unwrap().yaw.unwrap_or(0.0) - yaw0 + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
+    assert!(turned.abs() > 0.5 && turned.abs() < 1.5, "turned {turned} rad");
 }

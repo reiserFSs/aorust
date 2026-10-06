@@ -10,6 +10,7 @@
 //! right-handed mirror obtained by negating z (the convention of `mesh::decode_mesh_into`).
 
 pub mod collision;
+mod camera;
 mod dungeon;
 mod environment;
 mod ground;
@@ -22,6 +23,8 @@ mod terrain;
 mod water;
 mod zone;
 
+pub use camera::{camera_views, CameraViews};
+pub use record::CameraAttractor;
 pub use ao_scene::FogVolume;
 pub use sky::{open_weather, SkyClock, DEFAULT_DAY_TIME};
 pub use spawn::{floor_below, scene_bounds, support_below};

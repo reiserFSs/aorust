@@ -284,6 +284,13 @@ impl Avatar {
     pub fn height(&self) -> f32 {
         self.rig.height() * self.scale
     }
+
+    /// Height of the head attractor over the feet in the current pose, times the body scale: the camera look target
+    /// (`FUN_10020af1` N3, docs/zone/camera.md §3). `None` for models without a head attractor.
+    pub fn head_height(&self) -> Option<f32> {
+        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
+        self.rig.head_attractor(clip).map(|p| p[1] * self.scale)
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +389,27 @@ mod tests {
     fn client() -> Option<std::path::PathBuf> {
         let d = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
         d.join("cd_image/rdb.db").exists().then_some(d)
+    }
+
+    /// The camera look target: the head attractor of the solitus male is at the face, bobs while running, and scales with the body.
+    #[test]
+    fn head_attractor_height_is_the_camera_look_target() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let idle = a.head_height().expect("players have a head attractor");
+        eprintln!("head attractor height (idle) {idle:.3} m, body {:.3} m", a.height());
+        assert!(idle > 1.4 && idle < 1.8 && idle < a.height(), "{idle}");
+        a.set_pose(&store, AvatarPose { role: Role::Run, speed: 5.0, ref_speed: 5.0 }).unwrap();
+        let mut ys = Vec::new();
+        for _ in 0..30 {
+            a.update(0.02);
+            ys.push(a.head_height().unwrap());
+        }
+        let (lo, hi) = ys.iter().fold((f32::MAX, f32::MIN), |(l, h), &y| (l.min(y), h.max(y)));
+        assert!(hi - lo > 0.005 && hi - lo < 0.3, "run bob {lo}..{hi}");
+        a.scale = 2.0;
+        assert!((a.head_height().unwrap() / ys[29] - 2.0).abs() < 1e-3);
     }
 
     /// Real model: roles pick different clips, a pose moves the body, the frame is transformed by position + heading.

@@ -346,6 +346,47 @@ fn live_walk() {
                 l.tick();
                 eprintln!("after {step}: {}", l.pos());
             }
+            // UI steps: `ui=ctrl+6` / `ui=u` (window hotkey strokes), `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` (left-clicks
+            // the first screen point whose pick ray hits the dynel)
+            "ui" => {
+                let mods = ao_gui::Modifiers { ctrl: v.contains("ctrl+"), ..Default::default() };
+                let c = v.rsplit('+').next().unwrap().chars().next().unwrap();
+                l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Letter(c), pressed: true, mods }, &mut l.o.host);
+                l.tick();
+            }
+            "move" | "click" => {
+                let (x, y) = v.split_once(':').map(|(x, y)| (x.parse().unwrap(), y.parse().unwrap())).unwrap();
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                if k == "click" {
+                    for ev in [ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
+                        l.tick();
+                        l.p.input(ev, &mut l.o.host);
+                    }
+                }
+                l.tick();
+            }
+            "clickdyn" => {
+                let id: i32 = v.parse().unwrap();
+                let (cam, lens) = (l.o.host.camera, l.o.host.lens.unwrap_or_default());
+                let mut hit = None;
+                'g: for y in (0..800).step_by(8) {
+                    for x in (0..1280).step_by(8) {
+                        let ray = crate::play::hud_target::pick_ray(&cam, &lens, (1280.0, 800.0), (x as f32, y as f32));
+                        if crate::play::hud_target::pick_all(&ray, &l.p.zone.dynels).contains(&id) {
+                            hit = Some((x as f32, y as f32));
+                            break 'g;
+                        }
+                    }
+                }
+                let (x, y) = hit.expect("dynel not on screen");
+                eprintln!("clickdyn {id} at {x},{y}");
+                for ev in [ao_gui::InputEvent::MouseMove { x, y }, ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
+                    l.tick();
+                    l.p.input(ev, &mut l.o.host);
+                }
+                l.tick();
+                eprintln!("target {:?}", l.p.zone.target);
+            }
             "cam" => {
                 let c = l.o.host.camera;
                 eprintln!("camera pos {:.2} {:.2} {:.2} yaw {:.2} pitch {:.2} lens {:?}", c.pos.x, c.pos.y, c.pos.z, c.yaw, c.pitch, l.o.host.lens);

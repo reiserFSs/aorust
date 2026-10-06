@@ -4,15 +4,36 @@
 //!
 //! The scene frame is the renderer's (Y up, forward = (sin yaw, 0, -cos yaw)); `avatar_yaw` is the heading of the
 //! avatar in that convention (the integration layer converts the server heading).
-#![allow(dead_code)] // wired into play/flow.rs by the integration owner
 
+#![allow(dead_code)] // documented constants and accessors for tests / the live harness
+
+use super::camera_views::Views;
 use super::controls::{CamCmd, CamKey, ControlPrefs};
 use ao_render::{Camera, Vec3};
+use ao_scene::Lens;
 use std::f32::consts::{FRAC_PI_2, PI};
 
 /// The world camera is created with `SetViewPlaneWindow(π/2, aspect)` (`n3Camera_t` ctor, N3 @0x10021a76 / `FUN_1002107a`
 /// @0x1002107a, constant `_DAT_1003ccf8`): 90° *horizontal*.
 pub const FOV_HORIZONTAL: f32 = FRAC_PI_2;
+/// Near clip plane: the third `VisualCamera_t` constructor argument of `n3EngineClient_t::CreateCamera` (N3 @0x10007842, `_DAT_1003ce50`).
+pub const NEAR: f32 = 0.2;
+/// Far clip plane at creation (`_DAT_1003ce54`); the `ViewDistance` callback (`FUN_1001fc91`, registered to fire at once)
+/// replaces it immediately, see [`far_plane`].
+pub const FAR_AT_CREATE: f32 = 200.0;
+/// `ViewDistance` default (`SetDefaultLoginPrefs` GUI @0x10124b33).
+pub const VIEW_DISTANCE: f32 = 0.8;
+
+/// Far plane for a `ViewDistance` pref (`FUN_1001fc91`): `view_distance * 1000`, at least `near + 50` (`_DAT_1003e248`).
+pub fn far_plane(view_distance: f32) -> f32 {
+    (view_distance * 1000.0).max(NEAR + 50.0)
+}
+
+/// The lens of the player camera over the playfield's `base` (far plane: the client's [`far_plane`] of the default view
+/// distance, which is the fog distance the playfield lens already carries).
+pub fn lens(base: Lens) -> Lens {
+    Lens { fov: FOV_HORIZONTAL, horizontal: true, near: NEAR, ..base }
+}
 
 /// Vertical field of view for a window aspect ratio (width / height) given [`FOV_HORIZONTAL`].
 pub fn vertical_fov(aspect: f32) -> f32 {
@@ -48,16 +69,76 @@ pub const COLLISION_RADIUS: f32 = 0.35;
 const OCCLUSION_LO: f32 = 0.01;
 const OCCLUSION_HI: f32 = 0.95;
 const OCCLUSION_EPS: f32 = 0.001;
-/// Height of the look target above the feet when the avatar did not supply one. [UNRESOLVED] The client uses the world
-/// position of the `Attractor31_camera` attractor, falling back to `Attractor01_head` (`FUN_10020af1` @N3 0x10020af1);
-/// the head attractor's bind-pose height is not extracted yet (solitus male: head top 1.62 m).
-pub const DEFAULT_PIVOT_HEIGHT: f32 = 1.5;
+/// The look target is never lower than this above the feet (`_DAT_1003e29c` clamp at the end of `FUN_10020bdb`, N3
+/// @0x10020bdb); it is also what a model without a head attractor gets (`FUN_10020af1` fails, the target stays at 0).
+pub const MIN_PIVOT_HEIGHT: f32 = 0.3;
+/// Per-frame blend of the look target height towards the animated head attractor (`FUN_10020bdb`): third person keeps 0.8 of
+/// the old value (`_DAT_1003d9c4`) and takes 0.2 (`_DAT_1003ce50`); first person takes 0.999 and keeps 0.0001.
+const HEAD_BLEND_3RD: f32 = 0.2;
+const HEAD_BLEND_1ST: f32 = 0.999;
+
+/// `Vehicle_t` steering of the camera dynel (Vehicle.dll `SteeringArrive` @0x1000ab28, integrator `FUN_1000e3d3`). Mass,
+/// top speed and brake distance are `FUN_1001faa1` / `UpdateMotionConstraints` @N3 0x1001e602 for an avatar that runs
+/// (top speed `min(16, 6 * avatar speed)`, force `mass * v / 0.3`, brake `0.3 * v`).
+const VEHICLE_MASS: f32 = 20.0;
+const VEHICLE_MAX_SPEED: f32 = 16.0;
+const VEHICLE_BRAKE: f32 = 0.3 * VEHICLE_MAX_SPEED;
+const VEHICLE_MAX_FORCE: f32 = VEHICLE_MASS * VEHICLE_MAX_SPEED / 0.3;
+/// Integration substep. [GUESS] the client limits it by `Vehicle_t +0x104` (not read).
+const VEHICLE_STEP: f32 = 1.0 / 60.0;
+/// Arrival radius of the camera vehicle (`_DAT_1003d618`, `SteeringCamArrive`) and of an attractor (`_DAT_1003d61c`).
+const ARRIVE_RADIUS: f32 = 0.01;
+const ATTRACTOR_RADIUS: f32 = 0.1;
+/// Mode 1 pushes the camera out to this distance from the look target (`CameraVehicle_t::Update` @0x1001e54f, `_DAT_1003e04c`)
+/// and lifts it by `CHASE_LIFT` per frame while it is below the target (`_DAT_1003d9d0`).
+const CHASE_MIN_DISTANCE: f32 = 0.9;
+const CHASE_LIFT: f32 = 0.4;
+
+/// The camera dynel as a steered vehicle (modes 1 and 2); mode 3 snaps it every frame.
+#[derive(Clone, Copy, Default)]
+struct Vehicle {
+    pos: Vec3,
+    vel: Vec3,
+}
+
+impl Vehicle {
+    /// `SteeringArrive(target, radius)` + the integration over `dt`: desired velocity = towards the target at
+    /// `min(max_speed, distance / brake * max_speed)`, force = `(desired - vel) * mass * 4` limited to `max_force`.
+    fn arrive(&mut self, target: Vec3, radius: f32, dt: f32) {
+        let mut left = dt;
+        while left > 0.0 {
+            let h = left.min(VEHICLE_STEP);
+            left -= h;
+            let to = target - self.pos;
+            let d2 = to.length_squared();
+            if d2 < radius * radius || d2 < 0.01 {
+                self.vel = Vec3::ZERO; // SteeringHalt
+                continue;
+            }
+            let d = d2.sqrt();
+            let desired = to / d * (d / VEHICLE_BRAKE * VEHICLE_MAX_SPEED).min(VEHICLE_MAX_SPEED);
+            let force = ((desired - self.vel) * (VEHICLE_MASS * 4.0)).clamp_length_max(VEHICLE_MAX_FORCE);
+            self.vel = (self.vel + force * h / VEHICLE_MASS).clamp_length_max(VEHICLE_MAX_SPEED);
+            self.pos += self.vel * h;
+        }
+    }
+
+    fn snap(&mut self, pos: Vec3) {
+        self.pos = pos;
+        self.vel = Vec3::ZERO;
+    }
+}
 
 /// Third-person (mode 3) and first-person (mode 0) camera of the own character.
 pub struct Camera3p {
     prefs: ControlPrefs,
     first_person: bool,
+    /// `PreferredCameraMode` 1..3 (the third-person vehicle).
+    mode: u8,
+    /// Height of the look target over the feet now (blended towards `head`).
     pivot_height: f32,
+    /// Animated head attractor height the look target follows.
+    head: f32,
     /// Camera heading relative to the avatar heading (0 = behind it), radians, +dx = looking right.
     yaw_off: f32,
     /// Elevation of the camera above the look target, radians.
@@ -71,16 +152,23 @@ pub struct Camera3p {
     /// First person: view offset from the avatar heading and look-down pitch (`CameraVehicleFirstPerson_t::SetRotAngles`).
     fp_yaw: f32,
     fp_pitch: f32,
+    vehicle: Vehicle,
+    views: Option<Views>,
+    /// Shift+F8 was pressed; handled in the next frame (it needs the character's position).
+    prev_view: bool,
 }
 
 impl Camera3p {
-    /// `pivot_height`: height of the look target over the feet ([`DEFAULT_PIVOT_HEIGHT`]).
-    pub fn new(prefs: &ControlPrefs, pivot_height: f32) -> Self {
+    /// `head_height`: height of the head attractor over the feet ([`MIN_PIVOT_HEIGHT`] without one).
+    pub fn new(prefs: &ControlPrefs, head_height: f32) -> Self {
         let elev = DEFAULT_DIRECTION[1].asin();
+        let head_height = head_height.max(MIN_PIVOT_HEIGHT);
         Self {
             prefs: prefs.clone(),
             first_person: !prefs.third_person,
-            pivot_height,
+            mode: prefs.preferred_camera_mode.clamp(1, 3),
+            pivot_height: head_height,
+            head: head_height,
             yaw_off: 0.0,
             elev,
             dist: DEFAULT_DISTANCE,
@@ -89,11 +177,29 @@ impl Camera3p {
             keys: [false; 6],
             fp_yaw: 0.0,
             fp_pitch: 0.0,
+            vehicle: Vehicle::default(),
+            views: None,
+            prev_view: false,
         }
     }
 
-    pub fn set_pivot_height(&mut self, h: f32) {
-        self.pivot_height = h;
+    /// The animated head attractor height (feet-relative, body scale applied) the look target follows each frame.
+    pub fn set_head(&mut self, h: f32) {
+        self.head = h.max(MIN_PIVOT_HEIGHT);
+    }
+
+    /// The playfield's scripted views (`n3Zone_t::GetCameraAttractorList`).
+    pub fn set_views(&mut self, v: Views) {
+        self.views = Some(v);
+    }
+
+    pub fn views(&self) -> Option<&Views> {
+        self.views.as_ref()
+    }
+
+    /// `PreferredCameraMode` in use (1, 2 or 3).
+    pub fn mode(&self) -> u8 {
+        self.mode
     }
 
     pub fn is_first_person(&self) -> bool {
@@ -136,8 +242,9 @@ impl Camera3p {
             }
             CamCmd::SetPreferred => self.preferred = (self.yaw_off, self.elev, self.dist),
             CamCmd::ToggleView => self.first_person = !self.first_person,
-            // scripted camera attractors of the playfield: not implemented, see docs/zone/camera.md
-            CamCmd::NextView | CamCmd::PrevView => {}
+            CamCmd::NextView => self.next_view(),
+            // The attractor only steers the plain `CameraVehicle_t` (mode 1), see `update_with`; stepping needs a position.
+            CamCmd::PrevView => self.prev_view = true,
             CamCmd::EndLook => {
                 if self.first_person {
                     let turn = self.fp_yaw.rem_euclid(2.0 * PI);
@@ -147,6 +254,23 @@ impl Camera3p {
             }
         }
         None
+    }
+
+    /// Ctrl+F8, `n3Camera_t::GetNextVisibleAttractor` @N3 0x10021987: drops the selected attractor and the wheel zoom still
+    /// pending and, in third person, switches `PreferredCameraMode` 1 -> 3 -> 2 -> 1 (the old and new vehicle are swapped,
+    /// the camera keeps its place; the avatar's heading offset is the same).
+    fn next_view(&mut self) {
+        if let Some(v) = &mut self.views {
+            v.clear();
+        }
+        self.pending_zoom = 0.0;
+        if !self.first_person {
+            self.mode = match self.mode {
+                1 => 3,
+                3 => 2,
+                _ => 1,
+            };
+        }
     }
 
     fn rotate(&mut self, dx: f32, dy: f32) {
@@ -209,6 +333,13 @@ impl Camera3p {
         }
     }
 
+    /// `FUN_10020bdb`: the look target height follows the animated head attractor, blended per frame (60 Hz equivalent).
+    fn follow_head(&mut self, dt: f32) {
+        let keep = if self.first_person { 1.0 - HEAD_BLEND_1ST } else { 1.0 - HEAD_BLEND_3RD };
+        let a = 1.0 - keep.powf(dt * 60.0);
+        self.pivot_height = (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
+    }
+
     /// One frame without occlusion testing.
     pub fn update(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32) -> Camera {
         self.update_with(avatar_pos, avatar_yaw, dt, &|_, _| true)
@@ -217,15 +348,53 @@ impl Camera3p {
     /// One frame. `clear(from, to)` answers whether the segment is free of terrain/statels (scene frame).
     pub fn update_with(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) -> Camera {
         self.step_keys_and_zoom(dt);
-        let pivot = Vec3::from(avatar_pos) + Vec3::Y * self.pivot_height;
+        self.follow_head(dt);
+        let feet = Vec3::from(avatar_pos);
+        let pivot = feet + Vec3::Y * self.pivot_height;
         if self.first_person {
             return Camera { pos: pivot, yaw: avatar_yaw + self.fp_yaw, pitch: -self.fp_pitch, roll: 0.0 };
+        }
+        // scripted views: ranked every 10th frame and Shift+F8 steps them
+        let guide = self.views.as_ref().and_then(Views::selected).map_or(self.vehicle.pos, |v| v.pos);
+        if let Some(v) = &mut self.views {
+            v.tick(dt, feet, guide, clear);
+            if std::mem::take(&mut self.prev_view) {
+                v.prev(feet, guide, clear);
+            }
         }
         let h = avatar_yaw + self.yaw_off;
         let fwd = Vec3::new(h.sin(), 0.0, -h.cos());
         let dir = -fwd * self.elev.cos() + Vec3::Y * self.elev.sin();
         let want = pivot + dir * self.dist;
-        let eye = occlude(pivot, want, dir, clear);
+        let optimal = occlude(pivot, want, dir, clear);
+        let eye = match self.mode {
+            // CameraVehicleFixedThird_t(rigid): `DecideSnap` places the camera on the optimal position every frame
+            3 => {
+                self.vehicle.snap(optimal);
+                optimal
+            }
+            // CameraVehicleFixedThird_t(damped): `SteeringCamArrive(optimal, 0.01)`
+            2 => {
+                self.vehicle.arrive(optimal, ARRIVE_RADIUS, dt);
+                self.vehicle.pos
+            }
+            // CameraVehicle_t (`CalcSteering` @N3 0x1001e797)
+            _ => {
+                match self.views.as_ref().and_then(Views::selected) {
+                    Some(v) => self.vehicle.arrive(v.pos, ATTRACTOR_RADIUS, dt),
+                    None => {
+                        let off = pivot - self.vehicle.pos;
+                        let len = off.length().max(1e-4);
+                        let mut desired = pivot - off / len * len.max(CHASE_MIN_DISTANCE);
+                        if self.vehicle.pos.y < pivot.y {
+                            desired.y += CHASE_LIFT;
+                        }
+                        self.vehicle.arrive(desired, ARRIVE_RADIUS, dt);
+                    }
+                }
+                self.vehicle.pos
+            }
+        };
         Camera::look_at(eye, pivot)
     }
 }
@@ -423,6 +592,122 @@ mod tests {
         }
         assert!(near(a.orbit().0, b.orbit().0));
         assert!(near(a.orbit().0, 0.2 * 60.0)); // 0.02 * sensitivity 10 rad per frame at 60 Hz
+    }
+
+    #[test]
+    fn the_look_target_follows_the_head_attractor_with_a_blend() {
+        let mut c = cam();
+        c.set_head(1.7);
+        let v = c.update([0.0; 3], 0.0, 1.0 / 60.0);
+        // one 60 Hz frame of 0.2: 1.5 -> 1.54
+        assert!(near(Camera::look_at(v.pos, Vec3::ZERO).pos.y, v.pos.y));
+        assert!(near(c.pivot_height, 1.5 + 0.2 * 0.2));
+        for _ in 0..120 {
+            c.update([0.0; 3], 0.0, 1.0 / 60.0);
+        }
+        assert!(near(c.pivot_height, 1.7));
+        // first person tracks (almost) at once
+        let mut f = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, 1.5);
+        f.set_head(1.7);
+        assert!(near(f.update([0.0; 3], 0.0, 1.0 / 60.0).pos.y, 1.7));
+        // never below 0.3 m
+        c.set_head(0.0);
+        assert!(near(c.head, MIN_PIVOT_HEIGHT));
+    }
+
+    #[test]
+    fn near_far_and_lens() {
+        assert_eq!(NEAR, 0.2);
+        assert_eq!(far_plane(VIEW_DISTANCE), 800.0);
+        assert_eq!(far_plane(0.0), NEAR + 50.0);
+        let l = lens(Lens { fov: 1.0, horizontal: false, near: 0.5, far: Some(900.0) });
+        assert_eq!((l.fov, l.horizontal, l.near, l.far), (FOV_HORIZONTAL, true, 0.2, Some(900.0)));
+    }
+
+    #[test]
+    fn next_view_cycles_the_camera_vehicle_3_2_1() {
+        let mut c = cam();
+        assert_eq!(c.mode(), 3);
+        for want in [2, 1, 3, 2] {
+            c.apply(&CamCmd::NextView);
+            assert_eq!(c.mode(), want);
+        }
+        // first person: only the attractor is dropped
+        let mut f = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, 1.5);
+        f.apply(&CamCmd::NextView);
+        assert_eq!(f.mode(), 3);
+        // the pref picks the start mode, 0 maps to 1
+        assert_eq!(ControlPrefs::from_xml(r#"<Value name="PreferredCameraMode" value="1"/>"#).preferred_camera_mode, 1);
+        assert_eq!(ControlPrefs::from_xml(r#"<Value name="PreferredCameraMode" value="0"/>"#).preferred_camera_mode, 1);
+        assert_eq!(Camera3p::new(&ControlPrefs { preferred_camera_mode: 2, ..Default::default() }, 1.5).mode(), 2);
+    }
+
+    #[test]
+    fn damped_mode_arrives_at_the_rigid_position_without_overshoot() {
+        let mut rigid = cam();
+        let target = rigid.update([0.0; 3], 0.0, 0.016).pos;
+        let mut c = cam();
+        c.update([0.0; 3], 0.0, 0.016);
+        c.apply(&CamCmd::NextView); // 2
+        // the avatar steps 10 m: the camera trails and then settles on the rigid spot
+        let first = c.update([10.0, 0.0, 0.0], 0.0, 1.0 / 60.0).pos;
+        let rigid_now = rigid.update([10.0, 0.0, 0.0], 0.0, 1.0 / 60.0).pos;
+        assert!((first - rigid_now).length() > 5.0, "lags behind the avatar");
+        let mut dist = (first - rigid_now).length();
+        for _ in 0..300 {
+            let d = (c.update([10.0, 0.0, 0.0], 0.0, 1.0 / 60.0).pos - rigid_now).length();
+            assert!(d <= dist + 1e-3, "monotone approach");
+            dist = d;
+        }
+        assert!(dist < 0.05, "{dist}");
+        assert!(near(target.y, rigid_now.y));
+    }
+
+    #[test]
+    fn chase_mode_stays_put_and_backs_off_a_close_target() {
+        let mut c = cam();
+        let p0 = c.update([0.0; 3], 0.0, 0.016).pos;
+        c.apply(&CamCmd::NextView);
+        c.apply(&CamCmd::NextView); // mode 1
+        assert_eq!(c.mode(), 1);
+        // the avatar walks off: the camera is above the target already and does not follow, but keeps watching it
+        let v = c.update([0.0, 0.0, -8.0], 0.0, 1.0 / 60.0);
+        assert!((v.pos - p0).length() < 0.5);
+        assert!((v.forward() - (Vec3::new(0.0, 1.5, -8.0) - v.pos).normalize()).length() < 1e-3);
+        // a target inside 0.9 m is pushed out to 0.9 m
+        let mut d = cam();
+        d.update([0.0; 3], 0.0, 0.016);
+        d.apply(&CamCmd::NextView);
+        d.apply(&CamCmd::NextView);
+        for _ in 0..600 {
+            d.update([d.vehicle.pos.x, -0.4, d.vehicle.pos.z + 0.2], 0.0, 1.0 / 60.0);
+        }
+        assert!(d.vehicle.pos.is_finite());
+    }
+
+    #[test]
+    fn previous_view_selects_an_attractor_that_steers_mode_one() {
+        use ao_formats::playfield::{CameraAttractor, CameraViews};
+        let a = CameraAttractor { pos: [10.0, 5.0, 0.0], rot: [0.0, 0.0, 0.0, 1.0], target: [10.0, 1.5, 1.0], range: 1.0 };
+        let mut c = cam();
+        c.set_views(Views::new(CameraViews::new(vec![vec![a]], None, vec![]), Box::new(|_| 0)));
+        // mode 3 ignores attractors
+        c.apply(&CamCmd::PrevView);
+        let v = c.update([10.0, 0.0, -1.0], 0.0, 0.016);
+        assert!(c.views().unwrap().selected().is_some());
+        assert!((v.pos - Vec3::new(10.0, 0.0, -1.0)).length() > 4.0);
+        // mode 1: the camera flies to the attractor (scene z = -server z) and stops there
+        c.apply(&CamCmd::NextView); // 2
+        c.apply(&CamCmd::NextView); // 1
+        c.apply(&CamCmd::PrevView);
+        let mut v = c.update([10.0, 0.0, -1.0], 0.0, 1.0 / 60.0);
+        for _ in 0..600 {
+            v = c.update([10.0, 0.0, -1.0], 0.0, 1.0 / 60.0);
+        }
+        assert!((v.pos - Vec3::new(10.0, 5.0, 0.0)).length() < 0.2, "{:?}", v.pos);
+        // Ctrl+F8 drops it again
+        c.apply(&CamCmd::NextView);
+        assert!(c.views().unwrap().selected().is_none());
     }
 
     #[test]

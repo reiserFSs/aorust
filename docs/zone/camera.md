@@ -32,7 +32,7 @@ Tags: **[RE]** read from code/data, **[INFERENCE]** conclusion from structure, *
 | 25 (Backspace) | `MOVEMENT_TOGGLEWALK` | `SlotMovementWalkToggle` [0x1002809d] | `N3Msg_PerformSpecialAction(0x12 - (GetLastSpeedMode() != 2))` |
 | 34/35/32/33 (↑ ↓ ← →) | `MOVEMENT_{FORWARD,BACK,LEFT,RIGHT}_GLOBAL_V2` | `SlotMovementGlobal*` [0x100289aa, 0x100289e7, 0x10028a24, 0x10028a61] → the slots above | 1/2, 3/4, 0xC/0xE, 9/0xB |
 | 46 (F8) | `CAMERA_TOGGLE3RD` | `SlotToggleCameraView` [0x10027c9f]: toggles pref `3rdPersonCamera` | – |
-| Shift+F8 / Ctrl+F8 | `CAMERA_PREVVIEW` / `CAMERA_NEXTVIEW` | `SlotPrev/NextCameraView` [0x10027d0b, 0x10027cf0] → `n3Camera_t::Get{Previous,Next}VisibleAttractor` | – |
+| Shift+F8 / Ctrl+F8 | `CAMERA_PREVVIEW` / `CAMERA_NEXTVIEW` | `SlotPrev/NextCameraView` [0x10027d0b, 0x10027cf0] → `N3Msg_Prev/NextCameraView` [GC 0x10015fd7 / 0x10015fc9] → `n3Camera_t::GetPreviousVisibleAttractor` [N3 0x10020faa] / `GetNextVisibleAttractor` [0x10021987] (§7) | – |
 | 50 (F12) | `CAMERA_SCREENSHOT` | screenshot | – |
 | 99 (R) | `ACTION_PICKUPITEM` | `SlotPickupItem` [0x100280d1] → `N3Msg_GetItem(object under mouse)` | – |
 
@@ -92,13 +92,20 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
 * **Look target** (`FUN_10020af1` [N3 0x10020af1], `FUN_10020bdb`): world position of the CAT attractor `Attractor31_camera` of the own
   model, falling back to `AttractorMesh::GetName(0)` = `Attractor01_head`, times the body scale. `Attractor31_camera` exists only on
   vehicle/mech models (28 occurrences in rdb 1010002, all on `Bone Gun Base` / `Bone cocpit` models; none on the player models, e.g. 5907, 5927, 5900) so players use the head attractor.
-  **[UNRESOLVED]** its bind-pose height (`ActorRig` exposes no attractor world frame yet): `Camera3p::new(prefs, pivot_height)` takes
-  it from the avatar; `DEFAULT_PIVOT_HEIGHT = 1.5` m is a labelled stand-in (head top of the solitus male is 1.62 m).
-  The client then smooths it only when `UseNoBobCamera` (`+0x1e0`) and clamps its height ≥ 0.3.
+  **Height [RE, resolved].** `FUN_10020af1` takes the translation of `VisualCATMesh_t::GetAttractorMatrix("Attractor31_camera")`, else of
+  `Attractor01_head`, of the *animated* skeleton and multiplies it by `GetBodyScale`; `FUN_10020bdb` (every frame, also
+  `UpdateTargetEye` [N3 0x10021187]) then blends the stored height towards it: third person keeps 0.8 of the old value and takes 0.2
+  (`_DAT_1003d9c4`, `_DAT_1003ce50`), first person takes 0.999 (`_DAT_1003e2a4`; the camera is on the head and bobs with it). Horizontal x/z come from the
+  first sample (`+0x234/+0x23c`) and are not followed [INFERENCE: ≈0, not measured: `Camera3p` uses the height only]. The result is
+  clamped to ≥ 0.3 m (`_DAT_1003e29c`); a model without either attractor leaves the target at the feet + 0.3.
+  Implemented: `ActorRig::head_attractor(clip)` (cat-frame translation of `Attractor01_head` in the playing clip) →
+  `Avatar::head_height()` (× body scale) → `Camera3p::set_head`, blended by `follow_head`. Solitus male (rdb 5900 family): **1.793 m idle**
+  (body 1.871 m), bobbing ±1.5 cm while running; the old stand-in `DEFAULT_PIVOT_HEIGHT` 1.5 m is gone.
+  With `UseNoBobCamera` (`+0x1e0`, default 0, not implemented) the target follows only beyond 0.01 m of movement (`_DAT_1003e2b4`, 0.25 m hysteresis `_DAT_1003e2b0`).
 * **Position**: `target + direction · distance` with `direction` in the avatar frame (`RecalcOptimalPos` [N3 0x1001f371]); defaults
   `(0, 0.316, −0.948)` × 5.0 m: 5 m behind and 1.58 m above the target, elevation 18.4°. The camera looks at the target, is rigid
   (`SetRelPosRot` in `DecideSnap` [N3 0x1001f537], flag `+0x214`) and follows the avatar heading because the offset is avatar-relative.
-  **[INFERENCE]** the ctor flag `+0x214` is true for the player (rigid snap); the false path (`SteeringCamArrive`, damped) was not exercised.
+  **[INFERENCE]** the ctor flag `+0x214` is true for the player (rigid snap). **[RE, resolved]** `FUN_10020290` [N3 0x10020290] builds the vehicle from `PreferredCameraMode`: 0 first person, 1 plain `CameraVehicle_t` (`FUN_1001f9c9`), 2 `CameraVehicleFixedThird_t(false)` (damped: `CalcSteering` = `SteeringCamArrive(optimal pos, 0.01)`), 3 `CameraVehicleFixedThird_t(true)` (rigid `DecideSnap`, default). Modes 1/2 are §7.
 * **Occlusion** (`RecalcOptimalPos`): `LineOfSight(target, wanted + dir·radius)`; if blocked, bisect the fraction in `[0.01, 0.95]`
   (`_DAT_1003d618`, `_DAT_1003e228`) up to 20 times until the bracket is ≤ 0.001 (`_DAT_1003e220`); the camera sits at the last clear
   fraction. The camera dynel has a collision sphere of radius 0.35 (`_DAT_1003ce4c` in `CreateCamera`) → `COLLISION_RADIUS`, the margin
@@ -118,12 +125,17 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
   distance; Numpad 7 (`N3Msg_CameraSetDefaultPos` → `ForceUpdatePrefDir`) stores the current ones into `PreferredCamPos*`/`PreferredCamDist`
   (the prefs persist across sessions: `CameraVehicleFixedThird_t::SetPrefs` [N3 0x1001f004]; not persisted by `Camera3p`).
 * **Field of view**: `SetViewPlaneWindow(π/2, aspect)` (`FUN_1002107a`, `_DAT_1003ccf8` = 1.5708): **90° horizontal** (58.7° vertical at 16:9);
-  `camera::vertical_fov(aspect)`. Near/far: far = `ViewDistance`·1000 (`FUN_1001fc91`), the near plane comes from the (unrecovered) `CreateCamera`
-  arguments [UNRESOLVED] (docs/formats.md keeps 0.5 m as a guess).
+  `camera::vertical_fov(aspect)`.
+  **Near / far [RE, resolved].** `n3EngineClient_t::CreateCamera` [N3 0x10007842] calls the `n3Camera_t` ctor `FUN_10021a76` with
+  (`fov` π/2 `_DAT_1003ccf8`, `aspect` = pref `AspectRation`, **near 0.2** `_DAT_1003ce50`, **far 200** `_DAT_1003ce54`, first-person flag); the ctor
+  passes them to `VisualCamera_t::VisualCamera_t(fov, aspect, near, far)` (stored at `+0x150/+0x154/+0x168/+0x16c`). The `ViewDistance`
+  callback (`FUN_1001fc91`, registered with the fire-now flag) replaces far at once by `max(ViewDistance·1000, near + 50)` (pref default 0.8 →
+  800 m) and calls `VisualFog_t::AddClipPlanes(near, far)`; the camera is rebuilt with the old pose. `camera::NEAR`, `far_plane`,
+  `camera::lens(base)`; `Player::frame` sets the lens once (near 0.2; far stays the playfield lens' 800 m, which is that formula). The fog
+  start `environment::NEAR` (0.5, docs/formats.md) is the fog agent's and is untouched.
 * **Free camera**: the original has none for players. There are GM-only debug cameras (`COMMAND_DEBUG_TOGGLE_CAMERAMODE` = Ctrl+Alt+C, `DEBUG_CAM_*`,
   `[GMLevel1Mode]`) and `COMMAND_TOGGLE_FLYING_MODE_DEBUG` = F7 (GM level). Free-fly in play mode is therefore a debug feature only.
-* **Scripted views** (Shift/Ctrl+F8 → `GetNext/PreviousVisibleAttractor`, `FUN_10021921`): cycle the playfield's camera attractors
-  (`n3Zone_t::GetCameraAttractorList`, those of docs/formats.md); the camera is steered to the attractor. **Not implemented** (`CamCmd::NextView/PrevView` are no-ops).
+* **Scripted views and Ctrl/Shift+F8**: §7.
 
 ## 4. First person (mode 0, `CameraVehicleFirstPerson_t`)
 
@@ -153,12 +165,50 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
 * Release (`FUN_1002c469`, `FUN_1002c14d`/`FUN_1002c0e5`): if no look was active or the accumulated movement is ≤ **0.02** (`_DAT_101aeaf4`) it
   is a click (left: select the object under the cursor — `N3Msg_GetNextTarget`/`SwitchTarget`; right: `N3Msg_DefaultActionOnDynel`; double click
   with `DoubleclickAction`); then the look ends (`N3Msg_EndCameraMouseLook` / `N3Msg_EndMouseLook`).
-* Middle button = input 9 = forward while held (binding table). **[UNRESOLVED]** forward on both buttons: no binding or code found
-  (searched the `KeyBindings` archive, `FUN_1002c2ee`/`FUN_1002c469`, `InputConfig_t::CheckMode` users); not implemented.
+* Middle button = input 9 = forward while held (binding table).
+* **Both buttons = forward: not in the client [RE, negative].** Every layer maps buttons 1:1: `AnarchyOnline.exe` `FUN_00404a66` (window proc;
+  `0x201/0x203/0x202` → 1/3/4, `0x204/0x206/0x205` → 5/7/8, `0x207/0x209/0x208` → 9/11/12, `InputConfig_t::AddUserInput`), `InputConfig_t::
+  ProcessInput` [GUI 0x1001a31a] fires a hotkey when all keys of *its* list are down but the `KeyBindings` loader (`FUN_10018bbf`) stores one input per
+  bind and the default archive has no chord, the fixed key table has none, `ActionViewMouseHandler_c` (§5) keeps one pending look, and
+  `N3Msg_MouseMovement`/`MovementChanged` [GC] read no button state (`GetAsyncKeyState` is not imported by any game DLL). `Controls` therefore does not
+  move on both buttons (test `both_buttons_do_not_move_forward`); holding both starts the two looks as the client does. The wheel/middle button is the mouse forward.
 
 ## 6. Not resolved
 
-* Attractor height of the look target (§3), near plane (§3), `CameraVehicleFixedThird_t` ctor flag `+0x214` (§3), the movement-state
-  values 3/4/7/8 used by `N3Msg_MouseMovement` (3 = turning left, 4 = turning right by the keys, 7 = jump, 8 = sitting; from the branch
+* `UseNoBobCamera` smoothing, the horizontal part of the head attractor (x/z), `CameraVehicle_t` sensor steering (`UpdateSensors`,
+  `CalculateSensorSteerDir`, `FUN_1002046f`), the lateral avoidance branch of `SteeringCamArrive` and the second chase branch of
+  `CameraVehicle_t::CalcSteering` (flags `+0x1cc/+0x1cd`, never found set), `Vehicle_t`'s integration substep (`+0x104`).
+* The movement-state values 3/4/7/8 used by `N3Msg_MouseMovement` (3 = turning left, 4 = turning right by the keys, 7 = jump, 8 = sitting; from the branch
   structure), `N3Msg_EndMouseLook`, `FUN_1006ed98`/`FUN_10070506` (movement controller state getters, Gamecode).
-* The bob smoothing of the look target (`UseNoBobCamera`), the chase camera modes 1/2 and `CameraAttractor` views.
+
+## 7. Camera vehicles and scripted views (Ctrl+F8 / Shift+F8)
+
+**Ctrl+F8 is not "next attractor".** `n3Camera_t::GetNextVisibleAttractor` [N3 0x10021987] = `CameraVehicle_t::SetCameraAttractor(0)` (drop the
+attractor), `+0x204 = 0` (drop the pending wheel zoom) and, unless first person (`PreferredCameraMode` 0): `PreferredCameraMode` **1 → 3, 3 → 2,
+2 → 1** (`FUN_10020032` stores the pref, `FUN_10021859` swaps the vehicle). `CamCmd::NextView` does exactly that (`Camera3p::mode`).
+
+**Shift+F8** (`GetPreviousVisibleAttractor` [N3 0x10020faa]) steps `+0x21c` back through the list at `+0x20c` (12-byte `{zone, index, score}`;
+index 0 wraps to the last) and calls `CameraVehicle_t::SetCameraAttractor(list[i])`; an empty list clears it. **The attractor only steers
+mode 1**: `CameraVehicle_t::CalcSteering` [N3 0x1001e797] branches on `+0x1a0` (`attractor->vtbl[1]` = `FUN_10023ab1` = `SteeringArrive(attractor.pos, 0.1)`), while
+`CameraVehicleFixedThird_t::CalcSteering` [0x1001f752] (modes 2, 3) never reads it. The camera keeps looking at the look target (`SetEyeTargetLocalPos`).
+When the index is -1 (after a list change) the code would index at -2: `Views::prev` steps from "none" like from index 0 [INFERENCE].
+
+**The list** (`FUN_100220bb`, rebuilt every 10th frame by `FUN_10022345` unless `+0x228`): the attractors of the character's zone and its
+neighbours (`CellSpaceBase_t::GenerateNeighborList(zone, out, 1)`, a virtual of the playfield's cell space; implemented as the 8-neighbourhood / door-connected
+rooms [INFERENCE], `CameraViews::neighbours`) whose score (`PointCameraAttractor_t` vtbl+0xc `FUN_10023c8a`, from the character's feet + 1 m) is below 100000, sorted ascending.
+Score = distance; 10000 when < 0.5 m horizontally away; + 1000 per metre the authored target is beyond `range`; + 100 when the attractor lies in the direction of the
+camera's current spot (dot > 0.9); + 50 when that spot is in the clear and the character lies beyond it; + 10000 below y = 0.1. Not a candidate: disabled
+(`range ≥ 2.0` sets byte `+0x30`, `FUN_10023bbb`), line of sight attractor → character blocked (`FUN_10023bfc`; its closed-door room test is not applied: doors count as open).
+With no index (-1) and none selected for `+0x224` = 1.2 s since the last automatic pick (`+0x220` starts at 20 s) `FUN_10021921` selects entry 0 on its own. `Views::tick`, `Views::prev`.
+
+**Data.** Playfield record (rdb 1000001), per zone / room: `u32 n` (< 1000), n × { vec3 pos, quat rot, vec3 target (version ≥ 6, else = pos), f32 range } =
+`PointCameraAttractor_t` (`+4`, `+0x10`, `+0x20`, `+0x2c`; `RDBPlayfield_t::ReadBlob` [N3 0x1001c115], `n3Room_t` reader 0x10012803), world coordinates.
+`ao_formats::playfield::{camera_views, CameraViews, CameraAttractor}`. Whole game: **208 attractors in 53 playfields, 6 usable (`range < 2`)**: playfield 322 (3) and 1892 (3),
+pinned by a real-data test; so in retail the scripted views exist in two zones, and only in mode 1.
+
+**Vehicle model** (modes 1, 2; `Vehicle_t::SteeringArrive` Vehicle.dll 0x1000ab28, integrator `FUN_1000e3d3`, `UpdateMotionConstraints` [N3 0x1001e602]): mass 20, top speed
+16 (= `min(16, 6 · avatar speed)`, ≥ 2), force limit `mass · v / 0.3`, brake distance `0.3 · v`; desired velocity = towards the target at `min(v, distance / brake · v)`,
+steering force `(desired − velocity) · mass · 4`, stop inside the radius. Mode 3 snaps the vehicle to the optimal spot every frame (`DecideSnap`), mode 2 arrives at it
+(radius 0.01), mode 1 (`CameraVehicle_t`): without an attractor `CalcSteering`'s first branch asks for `target − unit(target − pos) · max(|target − pos|, 0.9)` (`+0x198`, `_DAT_1003e04c`) plus 0.4 m
+while the camera is below the target, i.e. **the camera stays where it is, watches the character, is pushed out to 0.9 m and lifted to the target's height** [RE of the
+branch as decompiled; the sensor steering and the second branch are unresolved, so mode 1 may follow in the retail client in cases not modelled here].
