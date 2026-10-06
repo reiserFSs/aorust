@@ -69,6 +69,8 @@ pub(super) struct ListView {
     order: Vec<i32>,
     /// Last Clicked time per row for the list layout's double click.
     last_click: Option<(i32, f32)>,
+    /// Recharge overlays of grid icons: `(row key, progress)` (see [`ListView::set_fades`]).
+    fades: Vec<(i32, f32)>,
     /// Painted state, to skip identical repaints.
     painted: Option<(Mode, Vec<i32>, Option<i32>)>,
 }
@@ -93,7 +95,7 @@ pub(super) fn scroll_xml(min_h: f32, w: f32) -> String {
 
 impl ListView {
     pub fn new(mode: Mode, columns: Vec<Column>, cols: usize, min_rows: usize, sort: (u32, bool)) -> Self {
-        Self { mode, columns, cols, min_rows, selected: None, sort, rows: vec![], order: vec![], last_click: None, painted: None }
+        Self { mode, columns, cols, min_rows, selected: None, sort, rows: vec![], order: vec![], last_click: None, fades: vec![], painted: None }
     }
 
     #[cfg(test)]
@@ -126,6 +128,15 @@ impl ListView {
                     o
                 }
             });
+        }
+    }
+
+    /// The disabled overlay of icons whose action recharges (`FUN_10040001`: `GFX_GUI_ICONFADER32` tinted 0, source and destination shrunk from both
+    /// sides by `W * 0.5 * (1 - progress)`, `FUN_1003efe6`; the same as the hotbar's), progress = remaining / total. Repaints when it changed.
+    pub fn set_fades(&mut self, fades: Vec<(i32, f32)>) {
+        if self.fades != fades {
+            self.fades = fades;
+            self.painted = None;
         }
     }
 
@@ -191,6 +202,10 @@ impl ListView {
             let Some(row) = row else { continue };
             if let Some((g, gw, gh)) = row.icon {
                 items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, gw as f32, gh as f32], dst: [x, y, x + icon, y + icon], alpha: 1.0 });
+            }
+            if let (Some((_, p)), Some(g)) = (self.fades.iter().find(|f| f.0 == row.key), gui.gfx_id("GFX_GUI_ICONFADER32").map(GfxId)) {
+                let shrink = (icon - 1.0) * 0.5 * (1.0 - p.clamp(0.0, 1.0));
+                items.push(CanvasItem::ImageTint { id: g, src: [shrink, 0.0, icon - 2.0 * shrink, icon], dst: [x + shrink, y, x + icon - shrink, y + icon], color: 0, alpha: 1.0 });
             }
             if self.selected == Some(row.key) {
                 put(&mut items, open);

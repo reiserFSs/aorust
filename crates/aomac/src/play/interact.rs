@@ -11,7 +11,6 @@ use ao_gui::{Event, Gui};
 use ao_net::frame::Frame;
 use ao_net::msg::Identity;
 use ao_net::n3::knubot::{self, Knubot};
-#[cfg(test)]
 use ao_net::n3::misc::{GenericArgs, GenericCmd, Misc};
 use ao_net::n3::outgoing::{n3_frame, DYNEL_CHAR};
 use ao_net::n3::{self, dynel::Dynel, N3};
@@ -21,7 +20,6 @@ use std::collections::HashMap;
 /// `HasStat(0x300)` and `GetStat(0x300, 2) & 1`). The server sends it as a `StatIIR_t` pair per NPC (docs/zone/dynel.md §3).
 pub const STAT_TALK: i32 = 0x300;
 /// `GenericCmd_t` command of `N3Msg_UseItem` for a world object: `FUN_1007c95c(actor, ItemActionData, 3)` [GC 0x100286f8].
-#[cfg(test)]
 const CMD_USE_ITEM: i32 = 3;
 
 #[derive(Default)]
@@ -34,7 +32,6 @@ pub struct Interact {
     chat: Option<NpcChat>,
     outbox: Vec<Frame>,
     /// `n3Command_t` sequence numbers of the commands we sent.
-    #[cfg(test)]
     seq: i32,
     /// Screen size for centring the window.
     screen: (u32, u32),
@@ -195,7 +192,6 @@ impl Interact {
     }
 
     /// `N3Msg_UseItem` [GC 0x100286f8] on a world object: `GenericCmd_t(state 0, seq, cmd 3, ItemActionData{actor = own, item})`.
-    #[cfg(test)]
     pub fn use_object(&mut self, item: Identity) {
         self.seq += 1;
         let cmd = GenericCmd { state: 0, seq: self.seq, cmd: CMD_USE_ITEM, args: GenericArgs::Item { flag: 0, actor: self.own_id(), item } };

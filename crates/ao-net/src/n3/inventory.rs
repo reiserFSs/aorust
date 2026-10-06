@@ -122,6 +122,15 @@ pub fn move_item_to_inventory(char_id: i32, item: Identity, slot: i32) -> Vec<u8
     w.0
 }
 
+/// `N3Msg_GetItem(item)` [GC 0x10027beb] -> `ClientGetItemIIR_t` (`FUN_10015258`, `Write` = one `Identity`): pick the world item up. The sender
+/// first refuses with `Feedback_InventoryFull` when no bag slot `0x40..` is free (`FUN_1002a1b0(0x40) == -1`).
+pub fn get_item(char_id: i32, item: Identity) -> Vec<u8> {
+    let mut w = Writer::default();
+    header(&mut w, super::outgoing::message_key("ClientGetItemIIR_t"), char_id);
+    item.write(&mut w);
+    w.0
+}
+
 /// `ClientContainerAddItemIIR_t`: add `item` to `container` (a backpack / chest / the own character).
 pub fn container_add_item(char_id: i32, container: Identity, item: Identity) -> Vec<u8> {
     let mut w = Writer::default();
@@ -245,6 +254,14 @@ mod tests {
         assert_eq!(message_key("InventoryUpdatedIIR_t"), INVENTORY_UPDATED);
         assert_eq!(message_key("InventoryUpdateIIR_t"), INVENTORY_UPDATE);
         assert_eq!(message_key("DropTemplateIIR_t"), DROP_TEMPLATE);
+    }
+
+    #[test]
+    fn get_item_is_header_plus_one_identity() {
+        let p = get_item(0x6584, Identity { kind: 0xCF1B, instance: 0x27E79 });
+        assert_eq!(p.len(), 4 + 8 + 1 + 8);
+        assert_eq!(p[..4], message_key("ClientGetItemIIR_t").to_be_bytes());
+        assert_eq!(p[4..], [0, 0, 0xc3, 0x50, 0, 0, 0x65, 0x84, 0, 0, 0, 0xcf, 0x1b, 0, 2, 0x7e, 0x79][..]);
     }
 
     #[test]

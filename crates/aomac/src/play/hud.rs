@@ -13,6 +13,8 @@ pub(super) use super::hud_map::ground_map;
 use super::hud_aggdef::{self, AggDef};
 use super::hud_bar::{self, ShortcutBar, SlotUse};
 use super::hud_actions::HudActions;
+use super::hud_special::SpecialList;
+use super::hud_actionwin::HudActionWin;
 use super::hud_keys::{HudKey, KeyMap};
 use super::hud_pools;
 use super::hud_compass::Compass;
@@ -272,6 +274,8 @@ pub(super) struct Hud {
     shortcuts: Vec<ShortcutBar>,
     /// The special-action list the hotbar slots and the Actions window show (`hud_actions.rs`).
     pub(super) actions: HudActions,
+    /// The Actions window (`hud_actionwin.rs`).
+    actwin: HudActionWin,
     /// Hot keys from the `KeyBindings` archive (`hud_keys.rs`) and the archive text they were built from.
     keys: KeyMap,
     keys_src: String,
@@ -302,7 +306,7 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, pools: hud_pools::Pools::new(dir), menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), keys: KeyMap::default(), keys_src: String::new(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
+        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, pools: hud_pools::Pools::new(dir), menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
         hud.target.targets_target = hud.dvalues.flag("Targetstarget");
         hud.fill_docks(gui);
         hud.create_bars(gui);
@@ -424,6 +428,7 @@ impl Hud {
             self.winb.set_screen(size);
             self.nano.set_screen(size);
             self.ncu.set_screen(size);
+            self.actwin.set_screen(size);
             self.mission.set_screen(size);
             gui.resize_window(self.cc, WindowSize::Fixed(size.0, size.1));
             for s in &mut self.shortcuts {
@@ -576,12 +581,18 @@ impl Hud {
         }
         // the special-action list (equipment, recharge) and the hotbar slots following it (`hud_actions.rs`, `hud_bar.rs`)
         self.actions.update(zone, _dt);
+        // the recharge feed: relayed `CharacterActionIIR_t` 0x14 (`hud_special::SpecialList::feed_recharge`)
+        let pct = zone.stat(SpecialList::STAT_RECHARGE_PCT).unwrap_or(0);
+        for (action, duration) in std::mem::take(&mut zone.recharge_feed) {
+            self.actions.list.feed_recharge(action as u32, duration, pct);
+        }
         let changes = self.actions.list.take_changes();
         let locked = self.dvalues.flag("LockHotbars");
         let timers = (self.dvalues.flag("IconTimers"), self.dvalues.flag("IconTimerText"));
         for s in &mut self.shortcuts {
             s.update(gui, _dt, &self.actions.list, &changes, locked, timers);
         }
+        self.actwin.update(gui, &self.actions.list, _dt, timers.0);
     }
 
     /// Mouse-down outside an open sub menu closes it (the original's popup menus lose focus).
@@ -590,6 +601,8 @@ impl Hud {
             s.input(gui, ev, &self.actions.list, mods);
             self.uses.extend(s.take_uses());
         }
+        self.actwin.input(gui, ev, &self.actions.list, mods, &mut self.shortcuts);
+        self.uses.extend(self.actwin.take_uses());
         // item drag and drop between the wear window and the inventory (hud_stats/item_ui.rs)
         self.stats.input(gui, zone, ev);
         self.rollup.input(gui, ev);
@@ -650,8 +663,12 @@ impl Hud {
                         self.uses.extend(s.take_uses());
                     }
                 }
-                // `SHORTUCT_BAR_ROW_n` scrolls the bar's list view to row `n` (`FUN_100d85fb`): the bars have one row here (UNRESOLVED, docs/gui.md §10.5)
-                HudKey::BarRow(_) => {}
+                // `SHORTUCT_BAR_ROW_n` scrolls the bar's list view to row `n` (`FUN_100d85fb`)
+                HudKey::BarRow(n) => {
+                    if let Some(s) = self.shortcuts.iter_mut().find(|s| s.is_active()) {
+                        s.set_row(gui, n);
+                    }
+                }
                 HudKey::BarSelect(n) => {
                     if n < self.shortcuts.len() {
                         for (i, s) in self.shortcuts.iter_mut().enumerate() {
@@ -800,6 +817,9 @@ impl Hud {
         if HudNcu::handles(kind) {
             self.ncu.open(gui);
         }
+        if HudActionWin::handles(kind) {
+            self.actwin.open(gui, &mut self.rollup);
+        }
         if HudMission::handles(kind) {
             self.mission.open(gui);
         }
@@ -819,6 +839,9 @@ impl Hud {
         }
         if HudNcu::handles(kind) {
             self.ncu.close(gui);
+        }
+        if HudActionWin::handles(kind) {
+            self.actwin.close(gui, &mut self.rollup);
         }
         if HudMission::handles(kind) {
             self.mission.close(gui);
@@ -889,6 +912,7 @@ impl Hud {
         self.rollup.close_all(gui);
         self.nano.close(gui, &mut self.rollup);
         self.ncu.close(gui);
+        self.actwin.close(gui, &mut self.rollup);
         self.mission.close(gui);
         self.map.close_all(gui, &mut self.rollup);
         self.winb.close_all(gui);
@@ -1140,6 +1164,59 @@ mod tests {
         send(&mut s, InputEvent::MouseMove { x: knob + 500.0, y: r.t + 5.0 });
         send(&mut s, InputEvent::MouseUp { x: knob + 500.0, y: r.t + 5.0, button: MouseButton::Left });
         assert_eq!(s.hud.take_outbox()[0].payload, ao_net::n3::outgoing::set_stat(25988, 0x33, 100));
+    }
+
+    /// The Actions window (Ctrl+2): the 9 base entries in list order with their rdb names, a click is the use, a held press drags the action onto a hotbar
+    /// slot, the recharge feed (`CharacterActionIIR_t` 0x14) makes the overlay, the hotbar rows page with the up / down buttons and the row keys.
+    #[test]
+    fn actions_window_uses_drags_and_recharges() {
+        use super::super::hud_special::template_of;
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        // the template's wear / stat pages first sit above it in the rollup column; the Actions page is moved to the top by closing them
+        for k in [WindowKind::Character, WindowKind::Stat, WindowKind::Team] {
+            s.hud.close_kind(&mut s.gui, k);
+        }
+        s.hud.open(&mut s.gui, WindowKind::Actions);
+        png(&mut s, &mut o, "hud-actions");
+        let want: Vec<i32> = [3, 1, 0xb, 0x4c, 0x11, 0x13, 0x51, 0x14, 0x86].iter().map(|&a| template_of(a).unwrap() as i32).collect();
+        assert_eq!(s.hud.actwin.shown(), want);
+        let centre = |s: &Shot, i: usize| s.hud.actwin.cell_centre(&s.gui, i).expect("grid");
+        // a short press is the use on the release; Start Combat is the third icon
+        let (x, y) = centre(&s, 2);
+        send(&mut s, InputEvent::MouseDown { x, y, button: MouseButton::Left });
+        assert!(s.hud.take_uses().is_empty());
+        send(&mut s, InputEvent::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(s.hud.take_uses(), vec![SlotUse::SpecialAction(0xb)]);
+        // Walk held for 0.3 s is dragged and dropped on hotbar slot 7
+        let (x, y) = centre(&s, 4);
+        send(&mut s, InputEvent::MouseDown { x, y, button: MouseButton::Left });
+        s.hud.update(&mut s.gui, &mut s.zone, 0.4);
+        let win = s.hud.shortcuts[0].window;
+        let (wx, wy) = s.gui.window_pos(win);
+        let (sx, sy) = (wx as f32 + 43.0 + 36.0 * 7.0 + 17.0, wy as f32 + 19.0);
+        send(&mut s, InputEvent::MouseMove { x: sx, y: sy });
+        send(&mut s, InputEvent::MouseUp { x: sx, y: sy, button: MouseButton::Left });
+        assert!(s.hud.take_uses().is_empty(), "the release of a drag is no use");
+        assert_eq!(s.hud.shortcuts[0].slot_names()[7], "Walk");
+        // the recharge feed of action 0x86 (Search) shows its overlay and counts down
+        s.zone.recharge_feed.push((0x86, 30));
+        png(&mut s, &mut o, "hud-actions-recharge");
+        assert!(s.hud.actions.list.progress(0x86).is_some());
+        // hotbar rows: down shows the empty row 1, up returns; the row key `Shift+2` goes to row 1 again
+        let (bx, by) = (wx as f32 + 11.0 + 11.0 + 4.0, wy as f32 + 30.0);
+        send(&mut s, InputEvent::MouseDown { x: bx, y: by, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseUp { x: bx, y: by, button: MouseButton::Left });
+        assert_eq!((s.hud.shortcuts[0].row(), s.hud.shortcuts[0].slot_names()[0].as_str()), (1, ""));
+        let up = (bx, wy as f32 + 5.0);
+        send(&mut s, InputEvent::MouseDown { x: up.0, y: up.1, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseUp { x: up.0, y: up.1, button: MouseButton::Left });
+        assert_eq!((s.hud.shortcuts[0].row(), s.hud.shortcuts[0].slot_names()[0].as_str()), (0, "Start Combat"));
+        s.hud.shortcuts[0].set_row(&mut s.gui, 3);
+        s.hud.shortcuts[0].set_row(&mut s.gui, 0);
+        assert_eq!(s.hud.shortcuts[0].slot_names()[7], "Walk", "rows keep their slots");
+        // closing removes the page
+        s.hud.close_kind(&mut s.gui, WindowKind::Actions);
+        assert!(s.hud.actwin.shown().is_empty());
     }
 
     /// The first-login hotbar: Start Combat / Walk / Sit / Suspended Animation icons from rdb 1010008, the Follow macro, use,

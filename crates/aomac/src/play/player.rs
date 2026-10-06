@@ -480,6 +480,16 @@ impl Player {
         self.movement.toggle_run(self.clock);
     }
 
+    /// Special actions 0x14 / 0x8d, `N3Msg_CrawlToggle` [GC 0x278c9] (movement part).
+    pub fn toggle_crawl(&mut self) {
+        self.movement.crawl_toggle(self.clock);
+    }
+
+    /// Special action 0x4f: `N3Msg_MovementChanged(0x24)` = leave sneak mode.
+    pub fn leave_sneak(&mut self) {
+        self.movement.action(mv::LEAVE_SNEAK, self.clock);
+    }
+
     /// FSM `vtable[3](0x1e)`: the sit transition is allowed (`N3Msg_StartCamping`).
     pub fn can_sit(&self) -> bool {
         self.movement.fsm().allowed(0x1e)

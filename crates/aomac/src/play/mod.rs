@@ -18,6 +18,7 @@ mod flow;
 mod hud;
 mod hud_aggdef;
 mod hud_actions;
+mod hud_actionwin;
 mod hud_bar;
 mod hud_compass;
 mod hud_dialog;

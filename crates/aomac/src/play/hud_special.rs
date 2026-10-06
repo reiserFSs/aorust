@@ -93,6 +93,13 @@ pub struct OwnState {
     pub camping: bool,
 }
 
+/// `FUN_1006389c` [GC 0x1006389c]: `trunc(d * pct / 100.0 + d + 0.5)` with `pct = max(stat 0x17e, -50)`, except for the special attacks (Brawl 0x8e,
+/// Dimach 0x90, Sneak Attack 0x92, Fast Attack 0x93, Burst 0x94, Fling Shot 0x96, Aimed Shot 0x97, Full Auto 0xa7, 0x243, 0x2a1) where `pct = 0`.
+pub fn recharge_time(action: u32, duration: i32, pct: i32) -> i32 {
+    let pct = if matches!(action, 0x8e | 0x90 | 0x92..=0x94 | 0x96 | 0x97 | 0xa7 | 0x243 | 0x2a1) { 0 } else { pct.max(-0x32) };
+    (f64::from(duration * pct) / 100.0 + f64::from(duration) + 0.5) as i32
+}
+
 /// One record of the recharge list (`FUN_10063c50`: `{+4 action, +8 total, +0xc remaining}` in seconds, `FUN_10064301` prints h:m:s).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Recharge {
@@ -180,6 +187,11 @@ impl SpecialList {
         self.entries.iter().find(|e| template_of(e.shown) == Some(instance))
     }
 
+    /// The entries in list order (the Actions window shows them in this order).
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
     /// The identity changes since the last call.
     pub fn take_changes(&mut self) -> Vec<(u32, u32)> {
         std::mem::take(&mut self.changes)
@@ -212,11 +224,22 @@ impl SpecialList {
         }
     }
 
-    /// Starts / replaces the recharge record of `action`.
-    #[allow(dead_code)] // no producer yet: the message that fills the client's recharge list is not decoded (docs/gui.md §10.5)
-    pub fn set_recharge(&mut self, action: u32, total: f32, remaining: f32) {
-        self.recharge.retain(|r| r.action != action);
-        self.recharge.push(Recharge { action, total, remaining });
+    /// The own stat `0x17e` read by [`recharge_time`] (`FUN_1006389c` [GC]: `GetStat(0x17e, 0)`).
+    pub const STAT_RECHARGE_PCT: u32 = 0x17e;
+
+    /// A relayed `CharacterActionIIR_t` action `0x14` of the own character: `identity_b = {kind: action, instance: duration}` (case 2 of the apply
+    /// switch `FUN_1005d0d8`, handler [GC 0x1005e2cd] -> `FUN_100655d3`). A record of that action is *extended* by the adjusted duration (total and
+    /// remaining), otherwise a new `{action, total, remaining}` is made (`FUN_10064a6e`); the duration is the unit [`SpecialList::progress`] counts
+    /// down in (seconds, as `FUN_10064301` splits it into h:m:s). `pct` = stat `0x17e`.
+    pub fn feed_recharge(&mut self, action: u32, duration: i32, pct: i32) {
+        let t = recharge_time(action, duration, pct) as f32;
+        match self.recharge.iter_mut().find(|r| r.action == action) {
+            Some(r) => {
+                r.total += t;
+                r.remaining += t;
+            }
+            None => self.recharge.push(Recharge { action, total: t, remaining: t }),
+        }
     }
 
     pub fn tick(&mut self, dt: f32) {
@@ -290,13 +313,28 @@ mod tests {
         assert_eq!(l.entries.len(), 9);
     }
 
+    /// `FUN_100655d3`: a second record of the same action extends the first; `FUN_1006389c`: percent stat except for special attacks, floor -50.
+    #[test]
+    fn recharge_feed_extends_and_scales() {
+        assert_eq!(recharge_time(0x94, 20, 50), 20, "special attacks ignore stat 0x17e");
+        assert_eq!(recharge_time(0x11, 20, 50), 30);
+        assert_eq!(recharge_time(0x11, 20, -90), 10, "floored at -50 %");
+        assert_eq!(recharge_time(0x11, 7, -10), 6, "7 - 0.7 + 0.5 = 6.8, truncated");
+        let mut l = SpecialList::new();
+        l.feed_recharge(0x88, 30, 0);
+        l.tick(10.0);
+        l.feed_recharge(0x88, 30, 0);
+        assert_eq!(l.progress(0x88), Some((50.0 / 60.0, 50)));
+    }
+
     /// Recharge: unavailable while a record exists, progress is `remaining / total`, the icon timer text is seconds below a minute.
     #[test]
     fn recharge_greys_the_slot_and_counts_down() {
         let mut l = SpecialList::new();
         l.sync_equipment(&[(0x800, -1)], 0);
         assert_eq!(l.progress(0x94), None);
-        l.set_recharge(0x94, 20.0, 15.0);
+        l.feed_recharge(0x94, 20, 0);
+        l.tick(5.0);
         assert_eq!(l.progress(0x94), Some((0.75, 15)));
         l.tick(10.0);
         assert_eq!(l.progress(0x94), Some((0.25, 5)));

@@ -55,8 +55,79 @@ impl Play {
                 self.cancel_camp();
                 self.send_outgoing(vec![action::stop_camping()]);
             }
+            // Use / Pick-Up on the selected target (`FUN_1004256c`: identity = the targeting object's `+0x5c`, `Zone::target`)
+            3 => self.use_target(),
+            1 => self.pick_up(),
+            // `N3Msg_TryEnterSneakMode` [GC 0x293c0]: refused with a vehicle (stat MechData 0x296), else `CharacterActionIIR_t` 0xa3. How the server's
+            // answer puts the movement FSM into sneak mode is not traced here (the apply table ignores 0xa3: docs/zone/actions.md).
+            0x13 => {
+                if self.zone.stat(0x296).unwrap_or(0) != 0 {
+                    self.feedback("Feedback_YouCantSneakInVehicle");
+                } else {
+                    self.send_outgoing(vec![action::plain_action(action::id::SNEAK)]);
+                }
+            }
+            // `MovementChanged(0x24)`: leave sneak
+            0x4f => {
+                if let Some(p) = self.player.as_mut() {
+                    p.leave_sneak();
+                }
+            }
+            // `N3Msg_CrawlToggle` [GC 0x278c9]: entering crawl is refused while polymorphed (stat 0x167)
+            0x14 | 0x8d => {
+                let leaving = self.zone.stat(0x1ae) == Some(0xe);
+                if !leaving && self.zone.stat(0x167).unwrap_or(0) != 0 {
+                    self.feedback("Feedback_YouCantBePolymorphed");
+                } else if let Some(p) = self.player.as_mut() {
+                    p.toggle_crawl();
+                }
+            }
+            0x89 => self.send_outgoing(vec![action::plain_action(action::id::FORAGE)]),
+            0x86 => self.search(),
+            // Reload `FUN_1006949a` [GC]: action 0xd2. UNRESOLVED: its gate `FUN_10029e66` (a field of the manager's `+4` object being 0).
+            0x6e => self.send_outgoing(vec![action::plain_action(action::id::RELOAD)]),
             _ => eprintln!("hud: special action {a:#x} has no consumer yet"),
         }
+    }
+
+    fn feedback(&mut self, key: &str) {
+        if let Some(c) = self.chat.as_mut() {
+            c.feedback(&mut self.gui, key, &self.text);
+        }
+    }
+
+    /// `N3Msg_UseItem(target, false)` [GC 0x286f8] for a character target (kind 50000): not on self, sent as `GenericCmd` 3 (`Interact::use_object`).
+    /// Without a target the original sends the empty identity; nothing is sent here. Items and world objects cannot be selected (`Zone::target` holds
+    /// character ids only), so the item branches of the function (wear, bank, corpse, `Feedback_Items*`) have no input.
+    fn use_target(&mut self) {
+        let Some(t) = self.zone.target.filter(|&t| t != self.zone.char_id as i32) else { return };
+        if let Some(i) = self.interact.as_mut() {
+            i.use_object(ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: t });
+        }
+    }
+
+    /// `N3Msg_GetItem(target)` [GC 0x27beb]: `Feedback_InventoryFull` when no bag slot (`0x40..0x5e`) is free, else `ClientGetItemIIR_t`.
+    fn pick_up(&mut self) {
+        let Some(t) = self.zone.target else { return };
+        if (0x40..0x5e).all(|s| self.zone.inventory.contains_key(&s)) {
+            return self.feedback("Feedback_InventoryFull");
+        }
+        let item = ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: t };
+        let payload = ao_net::n3::inventory::get_item(self.zone.char_id as i32, item);
+        if let Some(m) = self.fight.as_mut() {
+            m.push(payload);
+        }
+    }
+
+    /// Search `FUN_1003fa2c` [GC]: nothing while the Search recharge (action 0x88) runs (the original prints its remaining time through
+    /// `FUN_10064301`; the text keys are UNRESOLVED), else `Feedback_SearchingForHiddenObjects` and `CharacterActionIIR_t` 0x42 (the effect 0xb01c on
+    /// the own dynel is not created).
+    fn search(&mut self) {
+        if self.hud.as_ref().is_some_and(|h| h.actions.list.progress(0x88).is_some()) {
+            return;
+        }
+        self.feedback("Feedback_SearchingForHiddenObjects");
+        self.send_outgoing(vec![action::plain_action(action::id::SEARCH)]);
     }
 
     /// `/camp` / `StartQuitToLoginMessage` [GUI 0x10027c74]: unless already camping to the login (state 2), `N3Msg_StartCamping` (from state 0;

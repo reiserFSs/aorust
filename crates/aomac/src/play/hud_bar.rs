@@ -11,6 +11,11 @@ use std::path::Path;
 
 /// `MultiListView_c::SetViewCellCounts(10, 1)` (0x100d8c12).
 const SLOTS: usize = 10;
+/// Rows of slots a bar holds. The use / row handlers address a slot as `n + row * 10` (`FUN_100d7cef` [GUI 0x100d7cef]) and the row keys
+/// `SHORTUCT_BAR_ROW_0..9` scroll the list to row `n` (`FUN_100d85fb`: `Scroll(-(cell height * n))`). UNRESOLVED GUESS: the row count 10 (the
+/// ctor `FUN_100d8c12` sets the view cell count (10, 1) and never calls `SetMaxItemCount`; the content height that clamps the scroll was not
+/// traced), taken from the ten row providers.
+const ROWS: usize = 10;
 /// Grid cell pitch: 32 px icon + `SetGridIconSpacing(4, 4)` (`_DAT_101b0840` = 4.0); the slot art `GFX_GUI_MULTILISTVIEW_SLOT_32_CLOSED`
 /// is 38 x 38 (3 px border) and is centred on the 32 px icon, so neighbouring slots overlap by 2 px. The saved frames of
 /// `prefs/NewChar/Containers/ShortcutBar_*.xml` (402 x 37 inclusive = 403 x 38) = radio 11 + control 32 + 10 x 36.
@@ -65,8 +70,8 @@ pub(super) struct Slot {
     kind: u32,
     instance: u32,
     /// `N3Msg_GetName` (item template name, macro name): the tooltip title.
-    name: String,
-    icon: Option<(GfxId, u32, u32)>,
+    pub(super) name: String,
+    pub(super) icon: Option<(GfxId, u32, u32)>,
     /// Macro text (`TextMacro_t+0x24`).
     text: String,
 }
@@ -81,7 +86,11 @@ struct Drag {
 pub(super) struct ShortcutBar {
     pub(super) window: WindowId,
     primary: bool,
+    /// The visible row.
     slots: [Option<Slot>; SLOTS],
+    /// Every row; the entry of the visible row is empty (its slots are in `slots`, see [`Self::set_row`]).
+    rows: Vec<[Option<Slot>; SLOTS]>,
+    row: usize,
     /// Left button is down on this slot and has not been held for [`HOLD_DELAY`] (`MultiListView_c::MouseDown` +0x265 / the hold timer).
     press: Option<Press>,
     drag: Option<Drag>,
@@ -178,7 +187,7 @@ impl ShortcutBar {
         let (x, y) = (20, 20);
         let store = ao_rdb::RecordStore::open(dir).ok();
         let slots = if n == 0 { first_login(gui, store.as_ref()) } else { Default::default() };
-        let mut bar = ShortcutBar { window, primary: n == 0, slots, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true };
+        let mut bar = ShortcutBar { window, primary: n == 0, slots, rows: vec![Default::default(); ROWS], row: 0, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true };
         bar.place(gui, (x, y), screen);
         bar.paint(gui);
         Ok(bar)
@@ -281,6 +290,13 @@ impl ShortcutBar {
         let mut dirty = self.timer_text != timers.1;
         self.timer_text = timers.1;
         for &(old, new) in changes {
+            for r in 0..self.rows.len() {
+                for i in 0..SLOTS {
+                    if self.rows[r][i].as_ref().is_some_and(|s| s.kind == KIND_SPECIAL_ACTION && s.instance == old) {
+                        self.rows[r][i] = self.icon_slot(gui, new);
+                    }
+                }
+            }
             for i in 0..SLOTS {
                 if self.slots[i].as_ref().is_some_and(|s| s.kind == KIND_SPECIAL_ACTION && s.instance == old) {
                     self.slots[i] = self.icon_slot(gui, new);
@@ -338,6 +354,10 @@ impl ShortcutBar {
         match *ev {
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
                 self.mouse = (x, y);
+                if let Some(d) = self.row_button(gui, x, y) {
+                    self.set_row(gui, self.row.saturating_add_signed(d).min(ROWS - 1));
+                    return;
+                }
                 self.press = self.slot_at(gui, x, y).filter(|&i| self.slots[i].is_some()).map(|slot| Press { slot, held: 0.0 });
             }
             InputEvent::MouseMove { x, y } => {
@@ -358,6 +378,52 @@ impl ShortcutBar {
             }
             _ => {}
         }
+    }
+
+    /// The toolbar control's up / down buttons (`GFX_GUI_TOOLBAR_BUTTON_UP` / `_DOWN` at x = 11 of the control, 1 px from its top / bottom, see
+    /// [`Self::paint`]): `-1` = previous row, `+1` = next row. UNRESOLVED: the buttons' own handler was not traced; one row per click is taken from
+    /// the row keys' `Scroll(-(cell height * n))`.
+    fn row_button(&self, gui: &Gui, x: f32, y: f32) -> Option<isize> {
+        let (px, py) = gui.window_pos(self.window);
+        let (lx, ly) = (x - px as f32 - RADIO_W - 11.0, y - py as f32);
+        let size = |n: &str| gui.gfx_id(n).map_or((0, 0), |g| gui.gfx().size(GfxId(g)));
+        let (up, down) = (size("GFX_GUI_TOOLBAR_BUTTON_UP"), size("GFX_GUI_TOOLBAR_BUTTON_DOWN"));
+        let hit = |s: (u32, u32), top: f32| lx >= 0.0 && lx < s.0 as f32 && ly >= top && ly < top + s.1 as f32;
+        if hit(up, 1.0) {
+            Some(-1)
+        } else if hit(down, BAR_H - 10.0 - 1.0) {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    /// `SHORTUCT_BAR_ROW_n` (`FUN_100d85fb`) / the up and down buttons: row `n` becomes the visible one.
+    pub(super) fn set_row(&mut self, gui: &mut Gui, n: usize) {
+        if n >= ROWS || n == self.row {
+            return;
+        }
+        self.press = None;
+        let shown = std::mem::take(&mut self.slots);
+        self.rows[self.row] = shown;
+        self.slots = std::mem::take(&mut self.rows[n]);
+        self.row = n;
+        self.timers = [None; SLOTS];
+        self.paint(gui);
+    }
+
+    #[cfg(test)]
+    pub(super) fn row(&self) -> usize {
+        self.row
+    }
+
+    /// `FUN_100d8047` for an item dragged from the Actions window: the special action `instance` goes to the slot under the point.
+    /// `true` when the drop landed on this bar.
+    pub(super) fn drop_special(&mut self, gui: &mut Gui, instance: u32, x: f32, y: f32) -> bool {
+        let Some(to) = self.slot_at(gui, x, y) else { return false };
+        self.slots[to] = self.icon_slot(gui, instance);
+        self.paint(gui);
+        true
     }
 
     fn begin_drag(&mut self, gui: &mut Gui, from: usize, x: f32, y: f32) {

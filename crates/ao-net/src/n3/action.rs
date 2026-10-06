@@ -29,6 +29,14 @@ pub mod id {
     pub const START_CAMPING: i32 = 0x78;
     /// `N3Msg_StopCamping` [GC 0x1001cada].
     pub const STOP_CAMPING: i32 = 0x79;
+    /// `N3Msg_TryEnterSneakMode` [GC 0x293c0] (special action 0x13).
+    pub const SNEAK: i32 = 0xa3;
+    /// `N3Msg_Forage` [GC 0x297e3] (special action 0x89).
+    pub const FORAGE: i32 = 0xca;
+    /// Search (`FUN_1003fa2c` [GC], special action 0x86).
+    pub const SEARCH: i32 = 0x42;
+    /// Reload (`FUN_1006949a` [GC], special action 0x6e).
+    pub const RELOAD: i32 = 0xd2;
 }
 
 /// Stat ids read by the sit logic (`docs/zone/actions.md` §3).
@@ -642,6 +650,13 @@ pub fn start_camping(c: &CampInput) -> Result<Vec<Outgoing>, CampRefusal> {
     Ok(out)
 }
 
+/// The argument-less own-character actions of the special-action list (Sneak, Forage, Search, Reload): `FUN_1007253f(hdr, {0,0}, 0, action, {0,0}, "")`,
+/// the pushes read from the decompilation of each sender (see [`id`]).
+pub fn plain_action(action: i32) -> Outgoing {
+    let none = Identity::default();
+    Outgoing::Action(simple(action, none, none))
+}
+
 /// `N3Msg_StopCamping` [GC 0x1001cada].
 pub fn stop_camping() -> Outgoing {
     let none = Identity::default();
@@ -692,6 +707,14 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 22);
+    }
+
+    #[test]
+    fn plain_actions_carry_zero_identities() {
+        for a in [id::SNEAK, id::FORAGE, id::SEARCH, id::RELOAD] {
+            let Outgoing::Action(c) = plain_action(a) else { panic!() };
+            assert_eq!((c.action, c.param, c.identity_a, c.identity_b, c.text.as_str()), (a, 0, Identity::default(), Identity::default(), ""));
+        }
     }
 
     #[test]

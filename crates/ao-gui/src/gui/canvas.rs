@@ -54,7 +54,13 @@ impl Gui {
     }
 
     pub(super) fn draw_canvas(&self, out: &mut Vec<DrawCmd>, c: &CanvasData, rect: Rect, alpha: f32) {
-        out.push(DrawCmd::Clip(Some([rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1])));
+        // the renderer keeps one scissor: inside a `ScrollView` (itself a clip) the canvas clips to the intersection and restores the outer one
+        let outer = out.iter().rev().find_map(|c| if let DrawCmd::Clip(c) = c { Some(*c) } else { None }).flatten();
+        let mut own = [rect.l as i32, rect.t as i32, rect.r as i32 + 1, rect.b as i32 + 1];
+        if let Some(o) = outer {
+            own = [own[0].max(o[0]), own[1].max(o[1]), own[2].min(o[2]).max(own[0].max(o[0])), own[3].min(o[3]).max(own[1].max(o[1]))];
+        }
+        out.push(DrawCmd::Clip(Some(own)));
         for item in &c.items {
             match *item {
                 CanvasItem::Image { id, src, dst, alpha: a } => {
@@ -71,7 +77,7 @@ impl Gui {
                 }
             }
         }
-        out.push(DrawCmd::Clip(None));
+        out.push(DrawCmd::Clip(outer));
     }
 
     pub(super) fn canvas_down(&mut self, v: ViewId, x: f32, y: f32) {

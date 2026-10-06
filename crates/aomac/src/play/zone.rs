@@ -115,6 +115,9 @@ pub struct Zone {
     /// The fight controller target of every dynel (`SimpleChar+0x1d4`, `+0x4c/+0x50`, set by the relayed `AttackIIR_t`, cleared by
     /// `StopFightIIR_t`; `N3Msg_GetTargetTarget` GC 0x1001641d reads it): fighter → its target instance id.
     pub fight_target: HashMap<i32, i32>,
+    /// `(action, duration)` of the own relayed `CharacterActionIIR_t` actions `0x14` (the recharge feed, `identity_b = {action, duration}`;
+    /// [GC 0x1005e2cd]); `Hud::update` drains it into the special-action list.
+    pub recharge_feed: Vec<(i32, i32)>,
     /// The own pet list (`dynel+0x1d8` -> `+0x1c`, `AddPetIIR_c` / `RemovePetIIR_c`; docs/zone/pets.md): service towers included.
     pub pets: Vec<Identity>,
     /// The spells currently running on the own character (`FullCharacterIIR_t` list, `ApplySpellsIIR_t`): their stat bonuses are the buffs of
@@ -333,6 +336,9 @@ impl Zone {
                 self.own_events.push(OwnEvent::Follow { mode: f.mode, target: (f.target.kind == CHAR_KIND && f.target.instance != 0).then_some(f.target.instance), pos: v(&f.pos), path: f.path.iter().map(v).collect() });
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                if a.action == 0x14 {
+                    self.recharge_feed.push((a.identity_b.kind, a.identity_b.instance));
+                }
                 self.own_events.push(OwnEvent::Action(a.action));
             }
             // `CharInPlayIIR_t::Activate` [GC 0x1007264d] on the own dynel: `SetStat(0xC2, 1)` and the `AliveMessage` event
