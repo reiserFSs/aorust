@@ -183,6 +183,8 @@ pub enum ChatCmd {
     Tell { to: u32, text: String },
     /// 0x41 `GSD` (kind 0xE -> private group message 0x39 `ISD`).
     Group { group: GroupId, text: String },
+    /// A group message with an extras block (`/voice`: `BBBSS(1, breed, sex, fx, sound)`, GUI `FUN_10089163`) in the data field `D`.
+    GroupVoice { group: GroupId, text: String, extras: Vec<u8> },
     /// 0x28 `ID` / 0x29 `I`: buddy list. `D` is one byte: 1 = "add to buddy list" (menu action `user_id`, GUI 0x100a6940 via 0x100a7e73 / 0x100a6210),
     /// 0 = the temporary entry the client creates when it opens a tell window (0x100a5e7a) to follow the character's online state.
     BuddyAdd { id: u32, permanent: bool },
@@ -261,6 +263,18 @@ pub fn encode(cmd: &ChatCmd) -> Option<Vec<u8>> {
             put_s(&mut w, text.as_bytes());
             put_s(&mut w, NO_DATA);
             0x41
+        }
+        ChatCmd::GroupVoice { group, text, extras } => {
+            let t = if group.kind == KIND_PRIVATE_GROUP {
+                w.u32(group.id);
+                0x39
+            } else {
+                put_group(&mut w, *group);
+                0x41
+            };
+            put_s(&mut w, text.as_bytes());
+            put_s(&mut w, extras);
+            t
         }
         ChatCmd::BuddyAdd { id, permanent } => {
             w.u32(*id);
@@ -549,6 +563,9 @@ mod tests {
         let g = GroupId { kind: 3, id: 5 };
         let b = encode(&ChatCmd::Group { group: g, text: "a".into() }).unwrap();
         assert_eq!(b, [0, 0x41, 0, 10, 3, 0, 0, 0, 5, 0, 1, b'a', 0, 0]); // D = (NULL, 0)
+        // `/voice` into a group: the same message with the extras block as `D`
+        let b = encode(&ChatCmd::GroupVoice { group: g, text: "a".into(), extras: vec![1, 2, 3] }).unwrap();
+        assert_eq!(b, [0, 0x41, 0, 13, 3, 0, 0, 0, 5, 0, 1, b'a', 0, 3, 1, 2, 3]);
         let b = encode(&ChatCmd::Tell { to: 1, text: "a".into() }).unwrap();
         assert_eq!(b, [0, 0x1e, 0, 10, 0, 0, 0, 1, 0, 1, b'a', 0, 1, 0]); // D = one kind byte 0
         assert_eq!(encode(&ChatCmd::BuddyAdd { id: 1, permanent: true }).unwrap(), [0, 0x28, 0, 7, 0, 0, 0, 1, 0, 1, 1]);

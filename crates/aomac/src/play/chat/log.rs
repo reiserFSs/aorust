@@ -498,24 +498,17 @@ fn remote_span(text: &dyn Fn(u32, u32) -> Option<String>, s: &[u8]) -> Option<(S
 
 // ------------------------------------------------------------------------------------------------ context
 
-/// `ChatFilterEnabled` / `ChatFilterRules` (`/chatfilter`, `FUN_100b8d4e` [GUI]); `FUN_10084f9e` [GUI 0x10084f9e] drops a line when any rule
-/// matches its text with the client's `RegExp` (Utils.dll, not ported: `is_match` decides; the default is a case-sensitive substring test,
-/// `[GUESS]` for the regular-expression dialect).
+/// `ChatFilterEnabled` / `ChatFilterRules` (`/filter`, `FUN_100b8d4e` [GUI]); `FUN_10084f9e` [GUI 0x10084f9e] drops a line when any rule
+/// matches its text with the client's `RegExp` (Utils.dll, Spencer V8 regexp: `filter::matches`). The persistent state is `filter::FilterState`.
+#[derive(Default)]
 pub struct ChatFilter {
     pub enabled: bool,
     pub rules: Vec<String>,
-    pub is_match: fn(&str, &str) -> bool,
-}
-
-impl Default for ChatFilter {
-    fn default() -> Self {
-        Self { enabled: false, rules: Vec::new(), is_match: |rule, text| text.contains(rule) }
-    }
 }
 
 impl ChatFilter {
     pub fn drops(&self, text: &str) -> bool {
-        self.enabled && self.rules.iter().any(|r| (self.is_match)(r, text))
+        self.enabled && self.rules.iter().any(|r| super::filter::matches(r, text))
     }
 }
 
@@ -1375,7 +1368,7 @@ mod tests {
     #[test]
     fn chat_filter_drops_matching_lines() {
         let Some(()) = with_ctx(1, &[2], |ctx| {
-            let f = ChatFilter { enabled: true, rules: vec!["Snake".into()], ..Default::default() };
+            let f = ChatFilter { enabled: true, rules: vec!["Snake".into()] };
             let ctx2 = LogCtx { own: ctx.own, name: ctx.name, text: ctx.text, is_npc: ctx.is_npc, is_own_pet: ctx.is_own_pet, nano_name: ctx.nano_name, stat: ctx.stat, filter: &f };
             let ev = LogEvent::Hit { attacker: id(2), victim: id(1), damage: 5, mode: 3 };
             assert_eq!(classify(&ev, ctx).len(), 1);

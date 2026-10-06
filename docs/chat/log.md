@@ -192,8 +192,8 @@ used for the old value of `Stat` and the damage-type stats 0x153 `DamageOverride
 * Class subscription: which window shows a class is the window's group list (win owner).
 * `/chatfilter [list|del|add|enable|disable|clear]` [GUI `FUN_100b8d4e`]: preferences `ChatFilterRules` (a message of `"<index>" -> rule string`) and
   `ChatFilterEnabled` (bool). `FUN_10084f9e` [GUI 0x10084f9e], on the path of §1, drops the line when any rule matches its text with the client's `RegExp`
-  (Utils.dll `RegExp::Compare`). **Unresolved guess:** the regular-expression dialect is not ported; `ChatFilter::is_match` defaults to a substring test and
-  can be replaced.
+  (Utils.dll `RegExp::Compare`). `RegExp` is Spencer's V8 `regexp(3)`, ported as `filter::V8Regex` (docs/chat/dialogs.md §6); `ChatFilter::drops` uses it. The hub's own state is `filter::FilterState`
+  (the combat-log path of this module still gets the default, disabled filter: it is not one of the 5 callers of `FUN_10084f9e`).
 * There is no per-colour or per-event "show combat text" switch on this path other than the class subscription (searched the GUI.dll strings
   `ChatFilter*`, `ShowTimestamps`, `ChatShow*`, `ChatWindowMenu_*`; no combat-text option found).
 

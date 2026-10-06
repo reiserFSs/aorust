@@ -78,7 +78,7 @@ pub struct CmdCtx<'a> {
     pub text: &'a dyn Fn(&str) -> String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatAction {
     /// Local line (`FUN_1009b37f`), already wrapped like the original.
     Feedback(ChatLine),
@@ -153,6 +153,24 @@ pub enum ChatAction {
     /// `/option` `/setoption` `/dvalue` `/chardist` `/viewdist` `/char&viewdist`: the tokens (command word first), run by the flow on the
     /// DValue store (`play/dvalue.rs`, docs/chat/dvalue.md).
     DValue(Vec<String>),
+    /// `/petition` (0x100b58ad): DValue `petition_window` = true -> `BrowserWindow_c` type 3 with the petition page.
+    Petition,
+    /// `/voice <sound>` (0x100b82c2): the hub checks stat 0x185 bit 0 and the installed voice files, then sends the vicinity message.
+    Voice { cmd: String, sound: Option<String> },
+    /// `/macro <name> <command>` (0x100b8693): `GlobalSignals+0x1a0(name, command)` = `TextMacroSystem_t::CreateMacro` + a drag of the new macro.
+    Macro { name: String, command: String },
+    /// `/filter <sub> [rule]` (0x100b8d4e): the tokens `["/filter", sub, rest]`.
+    Filter(Vec<String>),
+    /// `/waypoint x z playfield` (0x100b9377): `GlobalSignals+0x158(Identity{0,0}, Vector3(x,0,z), pf)` = the map marker.
+    Waypoint { x: f32, z: f32, pf: i32 },
+    /// `/rp` (0x100b21dd): `N3Msg_EventFeedback(0x46, {0,0}, {0, VisualFlags ^ 0x200})`.
+    Rp,
+    /// `/reclaim` (0x100b21ca): `N3Msg_ToggleReclaim(false)`.
+    Reclaim,
+    /// `/selectself` (0x100b593a): `AFCM::Send(0x1e, 0x126, own id)`.
+    SelectSelf,
+    /// `/bug <text>` (0x100b5a2a): `AFCM::Send(10, 0x121, ExpandChatTextArgs(line))` = the bug report dialog; the text is the whole expanded line.
+    Bug(String),
 }
 
 /// `/open` `/close` `/toggle` (`FUN_100b77b6`): the sense the shared handler gets (0 open, 1 close, 2 toggle).
@@ -247,6 +265,15 @@ enum Kind {
     Quit,
     Start,
     Window(WindowOp),
+    Petition,
+    Voice,
+    Macro,
+    Filter,
+    Waypoint,
+    Rp,
+    Reclaim,
+    SelectSelf,
+    Bug,
 }
 
 struct Cmd {
@@ -287,9 +314,9 @@ const GLOBAL_CMDS: &[Cmd] = &[
     // FUN_100badf1
     c("/fxscript", 3, Kind::Client),
     c("/help", 2, Kind::Help),
-    c("/selectself", 1, Kind::Client),
+    c("/selectself", 1, Kind::SelectSelf),
     c("/funcom", 1, Kind::Funcom),
-    c("/bug", 2, Kind::Client),
+    c("/bug", 2, Kind::Bug),
     c("/showfile", 2, Kind::ShowFile),
     c("/tipoftheday", 2, Kind::Tip),
     c("/option", 3, Kind::DValue),
@@ -312,19 +339,19 @@ const GLOBAL_CMDS: &[Cmd] = &[
     c("/tell", 3, Kind::Tell),
     c("/reply", 2, Kind::Reply),
     c("/r", 2, Kind::Reply),
-    c("/petition", 2, Kind::Client),
+    c("/petition", 2, Kind::Petition),
     c("/name", 2, Kind::Name),
     c("/invite", 2, Kind::Invite),
     c("/kick", 2, Kind::Kick),
     c("/leave", 2, Kind::Leave),
     c("/ignore", 2, Kind::Ignore),
-    c("/voice", 2, Kind::Client),
-    c("/macro", 3, Kind::Client),
+    c("/voice", 2, Kind::Voice),
+    c("/macro", 3, Kind::Macro),
     c("/petduel", 2, Kind::Client),
     c("/duel", 2, Kind::Client),
     c("/lft", 2, Kind::Lft),
-    c("/filter", 3, Kind::Client),
-    c("/waypoint", 4, Kind::Client),
+    c("/filter", 3, Kind::Filter),
+    c("/waypoint", 4, Kind::Waypoint),
     // FUN_100b24e4: forwarded with FUN_100b2278 (argc -1)
     c("/played", 1, Kind::Played),
     c("/version", -1, Kind::Forward),
@@ -349,9 +376,9 @@ const GLOBAL_CMDS: &[Cmd] = &[
     gm("/joycamacc", -1, Kind::Forward),
     gm("/spelllocal", -1, Kind::Forward),
     gm("/resetskill", -1, Kind::Forward),
-    c("/rp", 1, Kind::Client),
+    c("/rp", 1, Kind::Rp),
     c("/inspect", 2, Kind::Inspect),
-    c("/reclaim", 1, Kind::Client),
+    c("/reclaim", 1, Kind::Reclaim),
     // FUN_100b2e87
     c("/anim", 2, Kind::Anim),
     c("/emote", 2, Kind::Emote),
@@ -562,6 +589,32 @@ fn usage(ctx: &CmdCtx, tok0: &str, rest: &str) -> Vec<ChatAction> {
 /// What Shift+R (`TextInputModule_t::StartChatReplyMessage`, GUI 0x10021fd0 -> 0x1009494e) puts into the opened input line.
 pub fn reply_prefill(ctx: &CmdCtx) -> String {
     ctx.last_tell_from.map_or(String::new(), |n| format!("/tell {n} "))
+}
+
+/// C `atoi` (blanks, sign, digits).
+pub(super) fn atoi(s: &str) -> i32 {
+    let s = s.trim_start();
+    let (neg, d) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let n = d.bytes().take_while(u8::is_ascii_digit).fold(0i32, |a, b| a.wrapping_mul(10).wrapping_add(i32::from(b - b'0')));
+    if neg {
+        n.wrapping_neg()
+    } else {
+        n
+    }
+}
+
+/// C `atof`: the longest prefix of the blank-stripped text that is a decimal number (no `inf` / `nan`), 0 when none.
+pub(super) fn atof(s: &str) -> f64 {
+    let s = s.trim_start();
+    (0..=s.len())
+        .rev()
+        .filter(|&n| s.is_char_boundary(n) && !s[..n].contains(['n', 'N', 'i', 'I']))
+        .find_map(|n| s[..n].parse::<f64>().ok())
+        .unwrap_or(0.0)
 }
 
 fn strip_quotes(s: &str) -> &str {
@@ -867,6 +920,43 @@ fn run(cmd: &Cmd, line: &str, t: &[String], ctx: &CmdCtx) -> Vec<ChatAction> {
         }
         Kind::Client => vec![ChatAction::ClientCommand(line.to_string())],
         Kind::DValue => vec![ChatAction::DValue(t.to_vec())],
+        Kind::Petition => vec![ChatAction::Petition],
+        Kind::SelectSelf => vec![ChatAction::SelectSelf],
+        Kind::Rp => vec![ChatAction::Rp],
+        Kind::Reclaim => vec![ChatAction::Reclaim],
+        // FUN_100b5a2a: needs at least 20 characters in the whole line (the check is on the raw line string, "/bug " included)
+        Kind::Bug => {
+            if n < 2 || line.len() < 20 {
+                vec![err(ctx, "Bug description to short. Should be at least 20 characters.")]
+            } else {
+                vec![ChatAction::Bug(expand(line, ctx))]
+            }
+        }
+        // FUN_100b82c2 (the stat gate is the hub's)
+        Kind::Voice => vec![ChatAction::Voice { cmd: t[0].clone(), sound: t.get(1).cloned() }],
+        // FUN_100b8693 (colour 0x51; the usage text has the unclosed `&ltcommand&gt;` of the original)
+        Kind::Macro => {
+            if n < 3 {
+                usage(ctx, &t[0], " &lt;name&gt; &ltcommand&gt;")
+            } else {
+                vec![ChatAction::Macro { name: t[1].clone(), command: t[2].clone() }]
+            }
+        }
+        Kind::Filter => {
+            if n < 2 {
+                vec![info(ctx, &format!("Usage: {} [list|del|add|enable|disable|clear]", t[0]))]
+            } else {
+                vec![ChatAction::Filter(t.to_vec())]
+            }
+        }
+        // FUN_100b9377 (colour 0x52): x, z = atof, playfield = atoi of the rest of the line
+        Kind::Waypoint => {
+            if n < 4 {
+                vec![info(ctx, &format!("Usage: {} x z playfield", t[0]))]
+            } else {
+                vec![ChatAction::Waypoint { x: atof(&t[1]) as f32, z: atof(&t[2]) as f32, pf: atoi(&t[3]) }]
+            }
+        }
         // FUN_100b6e66
         Kind::ShowFile => {
             if n < 2 {

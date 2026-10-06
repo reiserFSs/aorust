@@ -75,7 +75,7 @@ Your Pets `41000000`, Other Pets `41000001`, Me hit by nano `42000002`, Your pet
 Me hit by monster `42000006`, Me hit by player `42000007`, You hit other `42000008`, Your pet hit by other `42000009`, Other hit by other `4200000a`, Me got XP `4200000b`,
 Me got SK `4200000c`, Me hit by environment `42000001`, Your pet hit by monster `42000011`, Your misses `42000012`, Other misses `42000013`, You gave health `42000014`,
 Me got health `42000015`, Me got nano `42000016`, You gave nano `42000017`, Team Loot Messages `4200001a`, Vicinity Loot Messages `4200001b`, Me Cast Nano `42000018`
-(`win.rs::LOCAL_GROUPS`). `MutedChatGroups` (CharPrefs archive) and `ChatFilterEnabled`/`ChatFilterRules` (MainPrefs, regex over the text, default off) filter in `FUN_10084f9e`: **not ported**.
+(`win.rs::LOCAL_GROUPS`). `MutedChatGroups` (CharPrefs archive) and `ChatFilterEnabled`/`ChatFilterRules` (MainPrefs, V8 regexp over the text, default off) filter in `FUN_10084f9e`: ported (`filter.rs`, `/filter`, docs/chat/dialogs.md §6); `MutedChatGroups`: **not ported**.
 Chat-server groups: `(type << 32) | id` (hub), type byte = `hi & 0xff`.
 
 **Message routing in the handlers** (`HandleVicinityMessage` 0x10086728): data byte 4 → group `0x41000000`, 5 → `0x41000001`, 6 → `0x4200001b`, 7 → `0x4200001a`, otherwise

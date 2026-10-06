@@ -14,6 +14,8 @@ pub enum Kind {
     OrgDisband,
     /// Bare `/afk` (`FUN_10082a6f`): OK / Enter / the 30 s timeout (0) with the typed text, Esc (-1).
     Afk,
+    /// `/bug` (`FlowControlModule_t::SetBugReportStringMessage` 0x1002aa28, dialog "BugReport"): OK (0) sends the report.
+    BugReport,
 }
 
 /// A decided dialog.
@@ -81,8 +83,9 @@ fn xml(spec: &Spec) -> String {
         format!("<TextView name=\"{name}\" feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP\" min_size=\"Point({w},-1)\" max_size=\"Point({w},16000)\" layout_borders=\"{borders}\"/>")
     };
     match spec.kind {
+        // (the bug report is a `DialogBox_c` with the text and two buttons, 0x1002aa28)
         // `DialogBoxView_c` 0x1012aa23: text borders (15, 5, 15, 20) = `_DAT_101b00e0 / _DAT_101a8b98 / _DAT_101b00e0 / _DAT_101b4e08`
-        Kind::MessageBox | Kind::OrgLeave | Kind::OrgDisband => {
+        Kind::MessageBox | Kind::OrgLeave | Kind::OrgDisband | Kind::BugReport => {
             format!("<root><View view_layout=\"vertical\">{}{}</View></root>", text("text", "Rect(15,5,15,20)"), button_row(&spec.buttons))
         }
         // `FUN_10082a6f`: form borders (15, 10, 15, 15) (`_DAT_101b00e0 / _DAT_101a98e4`), body bottom border 10, countdown, input

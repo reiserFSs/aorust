@@ -99,7 +99,8 @@ Global map (`FUN_100badf1` 0x100badf1..0x100bbc30; handler address in the 2nd co
 | `/<emote>` (70 names, `EMOTES`) | 1 | 0x100b2aba | same; with argc 1 the token is the whole line so `/wave now` does nothing (faithful quirk) |
 | `/anon /stuck /list /shop /teleport /tp /monster /npc /spawn /reload /weather /perks /perk /gethash /item /dumphash /framerate /lazyreload /spawnacgentrance /spawnquest /syncdisplay /teleportdynel /getfull` | 2 | 0x100b30cf | `Fanatic::ClientInterface_c::Command(window, target, line without slash)` = `FanaticIIR_t` (not `N3Msg_TextCommand`; line NOT expanded) |
 | `/tower` | 2 | 0x100b314f | `create` (and `terminate` on a tower target) -> Fanatic; everything else `N3Msg_TextCommand(line)` (unexpanded) |
-| `/command /gfx /terminate /reloadgfxtweak /togglegroundlightingfix /rp /reclaim` | | 0x100b379b / 0x100b3258 / 0x100b345e / 0x100b3317 / 0x100b30ad / 0x100b21dd / 0x100b21ca | GUI-local (dialogs, reloads); not decoded -> `ClientCommand` |
+| `/command /gfx /terminate /reloadgfxtweak /togglegroundlightingfix` | | 0x100b379b / 0x100b3258 / 0x100b345e / 0x100b3317 / 0x100b30ad | developer tools (§5 of dialogs.md): not implemented -> `ClientCommand` |
+| `/rp` `/reclaim` | | 0x100b21dd / 0x100b21ca | `ChatAction::Rp` / `Reclaim`: `CharacterActionIIR_t` 0xa6 / 0x6d,0x6e (docs/chat/dialogs.md §6) |
 
 ### `/g` `/group` `/ch` group matching (`FUN_10083814`)
 

@@ -37,7 +37,9 @@ fn vicinity_msg(from_id: u32, from_name: String, text: String, data: &[u8]) -> C
         7 => 0x4200_001a,
         _ => 0x4000_0002,
     };
-    ChatMsg { group, from_id, from_name, text, kind, ..Default::default() }
+    // the TLV list after the kind byte (`FUN_10085b4a`): flags + the voice block
+    let (voice, flags) = super::voice::parse_block(data.get(1..).unwrap_or_default());
+    ChatMsg { group, from_id, from_name, text, kind, flags, voice, ..Default::default() }
 }
 
 pub fn group_key(g: GroupId) -> u64 {
@@ -237,8 +239,11 @@ impl ChatNet {
             }
             ChatEvent::GroupMessage { group, from, text, data } => {
                 let key = group_key(group);
+                let (voice, flags) = super::voice::parse_block(&data);
                 out.push(Out::Msg(ChatMsg {
                     group: key,
+                    voice,
+                    flags,
                     group_name: self.groups.get(&key).cloned().unwrap_or_default(),
                     from_id: from,
                     from_name: self.name_of(from).unwrap_or_default().to_owned(),
@@ -330,6 +335,17 @@ impl ChatNet {
     }
 
     /// Group key of a channel name (case-insensitive exact match).
+    /// `/voice` into a chat-server group: the message with the extras block in `D`.
+    pub fn say_voice(&mut self, group: u64, text: &str, extras: Vec<u8>) -> bool {
+        match (&self.session, self.logged_in) {
+            (Some(s), true) => {
+                s.send(ChatCmd::GroupVoice { group: group_of(group), text: text.to_owned(), extras });
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn group_by_name(&self, name: &str) -> Option<u64> {
         self.groups.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|(k, _)| *k)
     }

@@ -9,7 +9,7 @@ use ao_formats::screens::TextDb;
 use ao_net::chat::ChatCmd;
 use ao_net::frame::Frame;
 use ao_net::msg::Identity;
-use ao_net::n3::action::social_action;
+use ao_net::n3::action::{character_action, simple, social_action};
 use ao_net::n3::outgoing::n3_frame;
 use ao_net::n3::textcmd::{self, Feedback, Local, TextResult, TextState};
 
@@ -53,6 +53,11 @@ pub struct ZoneCmdCtx<'a> {
     pub game_time: (u32, u32),
     /// Engine state `/pet`, `/tower`, `/follow` read (`PetState::move_mode` is taken from [`Self::move_mode`]).
     pub pet: textcmd::PetState<'a>,
+    /// Own stat `VisualFlags` (0x2a1), `/rp` toggles bit 9 of it.
+    pub visual_flags: i32,
+    /// The reclaim container (`Identity{0xDEAE, ..}` of `BankCorpseIIR_t`) is registered with the client (`FUN_1003f03e`).
+    /// [UNRESOLVED] the port does not track that container yet; the hub passes false, i.e. `/reclaim` always switches reclaim on.
+    pub reclaim_open: bool,
 }
 
 /// A chat-server request that needs the character id of a name first (lookup 0x15, the original's `Action_t` classes 2/3/4/5/9).
@@ -123,6 +128,8 @@ pub fn handles(a: &ChatAction) -> bool {
             | ChatAction::IgnoreByName(_)
             | ChatAction::Lft { .. }
             | ChatAction::NameRequest(_)
+            | ChatAction::Rp
+            | ChatAction::Reclaim
     )
 }
 
@@ -139,7 +146,7 @@ fn db(texts: &TextDb, cat: u32, key: &str) -> String {
 }
 
 /// `FUN_1009b37f(text, 0x52)`.
-fn info_line(text: &str) -> ChatLine {
+pub(super) fn info_line(text: &str) -> ChatLine {
     ChatLine::new(ChatKind::Other("CCChatCmdFeedbackInfo"), format!("<div><font color=CCChatCmdFeedbackInfo>{text}</font></div>"))
 }
 /// `FUN_1009b37f(text, 0x51)`.
@@ -283,6 +290,24 @@ fn social(out: &mut ZoneOut, ctx: &ZoneCmdCtx, anim: i32) {
     }
 }
 
+/// `/rp` (GUI 0x100b21dd -> `N3Msg_EventFeedback(0x46, {0,0}, {0, flags ^ 0x200})`, Gamecode 0x1001cbb4): event 0x46 compares bit 5 of the
+/// stat 0x2a1 values (equal for `^ 0x200`, so the "can't do this while fighting" branch is never taken), and a changed value sends a
+/// `CharacterActionIIR_t` of action `0xa6` (`FUN_1007253f`, param 0, identity a `{0,0}`, identity b `{0, new flags}`, empty text).
+pub fn rp(char_id: i32, visual_flags: i32) -> Vec<u8> {
+    character_action(char_id, &simple(0xa6, Identity::default(), Identity { kind: 0, instance: visual_flags ^ 0x200 }))
+}
+
+/// `N3Msg_ToggleReclaim(param)` (Gamecode 0x1001dcf9): reclaim container not registered: `param == false` sends action `0x6d` (on), `true`
+/// sends nothing; registered: always `0x6e` (off).
+pub fn toggle_reclaim(char_id: i32, open: bool, param: bool) -> Option<Vec<u8>> {
+    let action = match (open, param) {
+        (true, _) => 0x6e,
+        (false, false) => 0x6d,
+        (false, true) => return None,
+    };
+    Some(character_action(char_id, &simple(action, Identity::default(), Identity::default())))
+}
+
 /// Perform one action of [`handles`]; other actions give an empty [`ZoneOut`].
 pub fn perform(a: &ChatAction, ctx: &ZoneCmdCtx) -> ZoneOut {
     let mut out = ZoneOut::default();
@@ -305,6 +330,12 @@ pub fn perform(a: &ChatAction, ctx: &ZoneCmdCtx) -> ZoneOut {
             Some(anim) => social(&mut out, ctx, anim),
             None => out.lines.push(error_line(&format!("Error: No animation named '{name}'."))),
         },
+        ChatAction::Rp => push_payload(&mut out, ctx, rp(ctx.char_id as i32, ctx.visual_flags)),
+        ChatAction::Reclaim => {
+            if let Some(p) = toggle_reclaim(ctx.char_id as i32, ctx.reclaim_open, false) {
+                push_payload(&mut out, ctx, p);
+            }
+        }
         ChatAction::Inspect(id) => {
             push_payload(&mut out, ctx, textcmd::inspect(ctx.char_id as i32, Identity { kind: 50000, instance: *id as i32 }));
         }
@@ -390,6 +421,8 @@ mod tests {
             tz_offset_min: 0,
             game_time: (0, 0),
             pet: Default::default(),
+            visual_flags: 0x20,
+            reclaim_open: false,
         }
     }
 
@@ -522,5 +555,32 @@ mod tests {
         assert_eq!(r[0], Resolved::Chat(ChatCmd::Tell { to: 9, text: "Zed".into() }));
         let Resolved::Line(l) = &r[1] else { panic!() };
         assert!(l.text.contains("Sending name change request."));
+    }
+
+    #[test]
+    fn rp_and_reclaim_wire_layout() {
+        // CharacterActionIIR_t: key, header identity {0xC350, char}, passed-on 0, action, param, identity a, identity b, i16 len
+        let p = rp(0x1234, 0x20);
+        let (h, a) = parse_character_action(&p).unwrap();
+        assert_eq!((h.target.instance, a.action, a.param), (0x1234, 0xa6, 0));
+        assert_eq!((a.identity_a, a.identity_b), (Identity::default(), Identity { kind: 0, instance: 0x220 }));
+        assert!(a.text.is_empty());
+        // toggling back clears bit 9 again
+        let (_, b) = parse_character_action(&rp(0x1234, 0x220)).unwrap();
+        assert_eq!(b.identity_b.instance, 0x20);
+        let on = toggle_reclaim(7, false, false).unwrap();
+        assert_eq!(parse_character_action(&on).unwrap().1.action, 0x6d);
+        let off = toggle_reclaim(7, true, false).unwrap();
+        assert_eq!(parse_character_action(&off).unwrap().1.action, 0x6e);
+        assert!(toggle_reclaim(7, false, true).is_none());
+    }
+
+    #[test]
+    fn rp_reclaim_actions_become_frames() {
+        let Some(t) = db() else { return };
+        let c = ctx(&t);
+        let o = perform(&ChatAction::Rp, &c);
+        assert_eq!(o.frames.len(), 1);
+        assert_eq!(perform(&ChatAction::Reclaim, &c).frames.len(), 1);
     }
 }

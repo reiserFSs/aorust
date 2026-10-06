@@ -59,4 +59,6 @@ pub struct ChatMsg {
     pub flags: u8,
     /// Incoming tell (`HandlePrivateMessage`): `group` is 0 and the window is the sender's tell window.
     pub tell: bool,
+    /// The data block's voice extras (`TextMacro_t` of `/voice`, `FUN_10085b4a` tag 1): played by the hub.
+    pub voice: Option<super::voice::Voice>,
 }

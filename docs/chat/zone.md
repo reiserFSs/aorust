@@ -143,8 +143,8 @@ target**: it goes to whoever is selected; (b) no NUL is counted or sent; `len` i
 (all return `None` for text over 1024 bytes).
 
 **Unresolved / guesses**
-* The extras block (`BBBSS`) is only present when the queued message's `TextMacro` has a second string; no producer found that sets it for plain typing,
-  so it is never emitted. Meaning of `a`, `b`, `S1`, `S2` unknown.
+* The extras block (`BBBSS`) is present when the queued message's `TextMacro` has a second string. Producer found: `/voice` (`FUN_100b82c2`): `a` = breed (stat 4),
+  `b` = sex (stat 0x3b), `S1` = voice fx type ("simple" / "distunguished" / "cool" / "military"), `S2` = sound name (docs/chat/dialogs.md §6, `voice::extras`); plain typing never sets it.
 * Text encoding of the typed text: Latin-1 when every char fits else UTF-8 (`zone::text_bytes`) -- [GUESS]; the original passes the bytes of a `std::string`.
 * `/script` is registered on the same handler `FUN_1009caf6` (kind stays 0); whether another handler consumes it first was not checked.
 * What typing plain text in a non-vicinity window does (group message to the chat server) is the lead's `net.rs` path (`type = 1`), not covered here.
