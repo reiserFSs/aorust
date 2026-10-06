@@ -713,7 +713,6 @@ impl Collision {
                 side(b, &mut hit_b, p);
             }
             let hit_c = self.line(*p, q);
-            let dist = |x: &Option<Hit>| x.map_or(10000.0, |x| len2(sub(x.p, *p)));
             if hit_a.is_none() && hit_b.is_none() && hit_c.is_none() {
                 // nothing within reach: fly towards q, `r` short of it
                 if *p == q {
@@ -727,13 +726,13 @@ impl Collision {
                 q = add(*p, scale(dir, AIM));
                 continue;
             }
-            let (da, db, dc) = (dist(&hit_a), dist(&hit_b), dist(&hit_c));
-            let obstacle = if db <= da || dc <= da {
-                if dc <= db { hit_c } else { hit_b }
-            } else {
-                hit_a
-            }
-            .expect("a hit was found");
+            // the nearest of the hits that exist (ties: centre, then B, then A; the original's 10000 sentinel for "no hit" is not a
+            // distance: a non-finite or very far hit must still win over nothing)
+            let obstacle = [hit_c, hit_b, hit_a]
+                .into_iter()
+                .flatten()
+                .min_by(|x, y| len2(sub(x.p, *p)).total_cmp(&len2(sub(y.p, *p))))
+                .expect("a hit was found");
             let (hp, n0) = (obstacle.p, obstacle.n);
             let (mut n, mut reff) = (n0, r);
             if d[1] > 0.0 && n0[1] < slope {
