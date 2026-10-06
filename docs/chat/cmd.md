@@ -196,8 +196,15 @@ Dispatch (`FUN_1003fba6`, `std::string::compare`, case-sensitive): `pet` 0x10041
 `Feedback_YouHaveNoServiceTower`; `strlen(line) > 4`, else `Feedback_InvalidPetcommand` / `Feedback_InvalidTowerCommand`; then `FUN_10053d69(line + 4 | line + 6, own identity,
 list<Identity>* out)` returns the command entry `{code, arg, char* text}` (12 bytes, `FUN_10053d17`) or NULL (-> the Invalid feedback). Byte offsets 4 / 6 are fixed, so a bare
 `tower` (5 chars) reads past the terminator in the original [UNDEFINED; we treat it as no words]. `code 0x11` (`script`) sends nothing: `sprintf("scripts/%s", text)` +
-`FUN_10052230(path, pets, flag = 1 for tower)` queue a pet script (`Local::PetScript`; **UNRESOLVED**: script runner `FUN_10055681` not ported, the hub logs it). Otherwise
+`FUN_10052230(path, pets, flag = 1 for tower)` queue a pet script (`Local::PetScript` -> `ao_net::n3::textcmd::PetScript`, `Chat::pet_scripts`; runner decoded below). Otherwise
 `PetCommandIIR_c` ctor 0x10076260 `(window, own identity, entry, pets, tower_byte)` is sent via `SendIIRToObservers` (pass-on flag 0: ctor ends `this[0xc] = 0`).
+
+**Pet script runner** (`FUN_10052230` -> ctor `FUN_10055681`, update `FUN_1005555f` called per frame from `NpcHolder_t`'s update `FUN_100522c9` with the frame time `Timer+0x68`; finished scripts are deleted).
+File: `scripts/<text>` opened relative to the client directory (`FUN_10055eac` = `ifstream(path, in)`; no extension added, no feedback when the file is missing: the script is empty and dies on its first update). Text mode: CRLF read as LF.
+Lines (`ws`-skipped, `getline` buffer 0x200 bytes: a longer line stops the read): first byte `#` = comment; `delay <n>` (`_strnicmp`, 6 bytes; `atof(rest)`) adds to a pending delay; anything else goes through the same `FUN_10053d69` parser
+as `/pet` **without** a pet list (pet names in the line are ignored: the pets are those named in `/pet <names> script <file>`), an invalid line is skipped, a valid one is queued as `(pending delay, entry)` and the pending delay is reset to 0 (a trailing delay is dropped).
+Update: front step `(delay, entry)`: `elapsed <= delay` -> `elapsed += dt`; else `PetCommandIIR_c(window 0, own identity, entry, the script's pets, tower flag)` is sent via `SendIIRToObservers`, the step is popped, `elapsed = 0`. One command per frame at most. Several scripts can run at once.
+Port: `PetScript::parse` / `step` (test `pet_script_runs_commands_with_delays_one_per_frame`). A `script` line inside a script is sent with code 0x11 like any other entry (the receiving reader accepts 1..=0x10 only). No sample script ships with the client (`client/scripts` holds only python launcher patches).
 
 `FUN_10053d69` (the parser; maps built on first use at 0x10053da5..0x100541e1, `std::map<std::string,int>`, lookups case-sensitive [INFERENCE: default `std::less`]):
 
@@ -305,7 +312,7 @@ The earlier `ChatCmd::PrivJoin/PrivPart` ids (0x33/0x34) were wrong and are corr
 
 ## Gaps / guesses
 
-* The GM debug commands, `/petition`, `/rp`, `/reclaim`, `/terminate`, `/command`, `/gfx` are not decoded (see the tables). `/pet`, `/tower`, `/follow` are decoded; open inputs: pet script runner, district fight-mode level, vehicle `vtbl[0x90]`, `rename` default target (see their sections).
+* The GM debug commands, `/terminate`, `/command`, `/gfx` are not decoded (see the tables). `/pet`, `/tower`, `/follow` are decoded; open inputs: pet script runner, district fight-mode level, vehicle `vtbl[0x90]`, `rename` default target (see their sections).
 * The engine target used by `OrgClientIIR_c` (`+0x5c`) is taken to be the GUI target; the colour of `Feedback_*` lines (code 0 through GlobalSignals+0x17c); case-insensitivity of the
   org/raid sub-word maps; the key/value roles of the `/cc info` forward map.
 * The `/<cmd> help` redirect condition and the keys marked `*` in `HELP_TOPICS` (org, pet, chat, team, misc, list, perk, raid share their string with another literal; inferred from chatcommands.html).

@@ -862,7 +862,6 @@ impl Frontend for Play {
                     c.escape(&mut self.gui, &self.zone, &self.text);
                 }
             }
-            (Screen::InWorld, InputEvent::Key { key: Key::Escape, pressed: true, .. }) => host.quit = true,
             (Screen::CharSelect, InputEvent::Key { key: Key::Up, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(-1, host),
             (Screen::CharSelect, InputEvent::Key { key: Key::Down, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(1, host),
             _ => {}
@@ -1068,7 +1067,7 @@ impl Frontend for Play {
         // `/quit` and `/open` `/close` `/toggle` of the chat input (docs/chat/dialogs.md §3)
         let (wins, quit) = self.chat.as_mut().map(|c| (c.take_windows(), c.take_quit())).unwrap_or_default();
         if quit {
-            host.quit = true;
+            self.quit_cmd(host);
         }
         if let Some(h) = self.hud.as_mut() {
             use super::chat::WindowOp;

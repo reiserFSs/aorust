@@ -57,6 +57,8 @@ pub(super) struct Chat {
     ignored: HashSet<u32>,
     /// Zone frames queued by input lines (the flow drains them into the session).
     outbox: Vec<Frame>,
+    /// Running pet scripts (`NpcHolder_t::m_pScripts`, Gamecode 0x10052230 / 0x100522c9); each frame advances them.
+    pet_scripts: Vec<ao_net::n3::textcmd::PetScript>,
     /// Actions of the game layer (`/<emote>`, `/assist`): taken by the flow ([`Chat::take_game`]).
     game: Vec<GameAction>,
     /// Text event to drop: the character of the key that opened the input bar.
@@ -101,7 +103,7 @@ impl Chat {
     pub fn new() -> Self {
         let mut net = net::ChatNet::default();
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
-        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], dvalue_cmds: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default() }
+        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], pet_scripts: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], dvalue_cmds: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default(), filter: filter::FilterState::load(), macros: macros::TextMacros::open(), voice_prefs: VoicePrefs::default(), voice_throttle: voice::Throttle::default(), expansion: 0, last_out_group: None, bug: None, requests: Requests::default() }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
@@ -181,6 +183,13 @@ impl Chat {
     /// `TeleportStartedMessage` / `TeleportEndedMessage` emit it with code 12 `CCRed`, docs/zone/world.md §10.2).
     pub fn system_line(&mut self, gui: &mut Gui, text: &str, code: u32) {
         self.line_to(gui, ChatLine::new(ChatKind::System, log::window_html(log::color_name(code), text)), Some("System"));
+    }
+
+    /// `FlowControlModule_t` logout texts (LDB category 200 `ClosingClient` / `LogoutStarted` (fed 30) / `TimedLogoutAborted`): GlobalSignals+0x17c, code 12.
+    pub fn logout_line(&mut self, gui: &mut Gui, key: &str, secs: Option<i32>, texts: &TextDb) {
+        let t = texts.by_key(200, key).unwrap_or_default();
+        let t = log::ldb_format(&t, &secs.map(log::Arg::N).into_iter().collect::<Vec<_>>());
+        self.system_line(gui, &t, 12);
     }
 
     /// Live-test hook: drop the chat-server connection (see [`net::ChatNet::drop_connection`]).
@@ -292,6 +301,13 @@ impl Chat {
 
     /// Per frame: chat-server events into the windows, window fades.
     pub fn update(&mut self, gui: &mut Gui, dt: f32, texts: &TextDb) {
+        self.pet_scripts.retain_mut(|s| match s.step(dt, self.own_id as i32) {
+            Some(frame) => {
+                self.outbox.extend(frame.map(|p| ao_net::n3::outgoing::n3_frame(0, self.own_id, p)));
+                true
+            }
+            None => false,
+        });
         for o in self.net.update(dt) {
             match o {
                 Out::Msg(m) => {
@@ -610,6 +626,11 @@ impl Chat {
                 ao_net::n3::textcmd::Local::OrgLeaveDialog => {
                     let body = texts.by_key(10000, "ReallyLeaveOrg").unwrap_or_default();
                     self.dialog(gui, dialog::Kind::OrgLeave, body, Self::yes_no(texts), None);
+                }
+                // `FUN_10052230(path, pets, tower)`: the file is opened relative to the client directory; an unreadable file is an empty script
+                ao_net::n3::textcmd::Local::PetScript { path, pets, tower } => {
+                    let src = std::fs::read(ao_gui::client_dir().join(path)).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+                    self.pet_scripts.push(ao_net::n3::textcmd::PetScript::parse(&src, pets, tower));
                 }
                 ao_net::n3::textcmd::Local::OrgDisbandDialog => {
                     let body = texts.by_key(501, "Org_ConfirmDisband").unwrap_or_default();

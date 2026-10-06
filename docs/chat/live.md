@@ -44,11 +44,11 @@ Timestamps (s since test start, `AOMAC_LIVE_STEPS=wait=20,chatdrop,wait=14,say=/
 |---|---|
 | 6.1 / 6.5 | first `connect attempt 0`, `logged in` |
 | 33.4 | `disconnected: closed` |
-| 37.5 | `connect attempt 1` (**4.1 s** = `1 << (0 + 12)` ms, the client's first back-off, GUI 0x10089dfc) |
+| 37.5 | `connect attempt 1` after **4.1 s** (measured before the pacing fix below: our own `backoff(0) = 1 << 12` ms) |
 | 37.8 | `logged in` (attempts reset to 0) |
 
 After the reconnect the chat server replays the MOTD (shown again in the Default Window) and our `/say` is echoed (`0x22`). Later back-offs 8.2 s / 16.4 s / 32.8 s are covered by `backoff_matches_client` only.
-The bound of 10 attempts is our own (the client's loop is unbounded in the decompile read so far).
+Correction from the full decompile of the loop (docs/chat/net.md): the client's first attempt after a drop is **immediate** (`attempts == 0`), the waits are 8.2 / 16.4 / 32.8 s from the second attempt on, and the loop has no attempt bound (the old 10-attempt limit is gone). The table above predates this fix; the new pacing is covered by `backoff_matches_client` and `retries_are_unbounded_and_every_16th_attempt_switches_server` and was not re-run live.
 
 ## Social layer re-run 2026-10-06 (buddy list, LFT, private group requests)
 

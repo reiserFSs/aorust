@@ -199,7 +199,7 @@ pub enum Local {
     OrgLeaveDialog,
     OrgDisbandDialog,
     /// `/pet script <name>` / `/tower script <name>`: `FUN_10052230("scripts/<name>", pets, tower)` queues a pet script on the
-    /// engine; no `PetCommandIIR_c` is sent. [UNRESOLVED] the script runner (`FUN_10055681`) is not ported.
+    /// engine ([`PetScript`]); no `PetCommandIIR_c` is sent by the command itself.
     PetScript { path: String, pets: Vec<Identity>, tower: bool },
 }
 
@@ -332,6 +332,64 @@ pub fn pet_command(char_id: i32, window: i32, code: i32, arg: i32, pets: &[Ident
     w.i32(t.len() as i32);
     w.bytes(t);
     w.0
+}
+
+/// A running pet script: the object built by `FUN_10055681` and advanced by `FUN_1005555f` (called every frame by the `NpcHolder_t` update
+/// `FUN_100522c9` with the frame time). Lines are read as `<command>` lines of `/pet` (`FUN_10053d69` with no pet list: pet names in the
+/// line are ignored, the pets are the ones addressed by `/pet <names> script <file>`), `delay <seconds>` and `#` comments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PetScript {
+    /// `(delay before the command, entry)`, in file order (the deque at `this+8`).
+    steps: std::collections::VecDeque<(f32, PetEntry)>,
+    /// Seconds waited for the front step (`this+0xc`).
+    elapsed: f32,
+    pets: Vec<Identity>,
+    tower: bool,
+}
+
+impl PetScript {
+    /// `FUN_10055681`. `getline` reads at most 511 bytes per line (`0x200` buffer; a longer line sets failbit and ends the read); blank
+    /// space before a line is skipped (`>> ws`); a line whose first byte is `#` is a comment; `delay ` (`_strnicmp`, 6 bytes) adds
+    /// `atof(rest)` to the pending delay; any other line is parsed, an invalid one is skipped, a valid one is queued with the pending
+    /// delay, which is then reset to 0. A trailing delay without a command is dropped.
+    pub fn parse(src: &str, pets: Vec<Identity>, tower: bool) -> Self {
+        let (mut steps, mut pending) = (std::collections::VecDeque::new(), 0f32);
+        for line in src.lines() {
+            let line = line.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            if line.len() >= 0x200 {
+                break;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.as_bytes().get(..6).is_some_and(|h| h.eq_ignore_ascii_case(b"delay ")) {
+                pending += atof(&line[6..]);
+            } else if let Some(e) = pet_entry(&mut pet_words(line.as_bytes())) {
+                steps.push_back((pending, e));
+                pending = 0.0;
+            }
+        }
+        Self { steps, elapsed: 0.0, pets, tower }
+    }
+
+    /// `FUN_1005555f(dt)`: `None` = the script is finished (queue empty; the owner deletes it). While `elapsed <= delay` of the front
+    /// step the time accumulates; otherwise the step is sent (`PetCommandIIR_c`, window 0, the script's pets) and popped, `elapsed` = 0.
+    pub fn step(&mut self, dt: f32, char_id: i32) -> Option<Option<Vec<u8>>> {
+        let (delay, _) = self.steps.front()?;
+        if self.elapsed <= *delay {
+            self.elapsed += dt;
+            return Some(None);
+        }
+        let (_, e) = self.steps.pop_front()?;
+        self.elapsed = 0.0;
+        Some(Some(pet_command(char_id, 0, e.code, e.arg, &self.pets, self.tower, &e.text)))
+    }
+}
+
+/// C `atof`: the longest numeric prefix after leading blanks (0 when there is none).
+fn atof(s: &str) -> f32 {
+    let s = s.trim_start();
+    (1..=s.len()).rev().filter(|&n| s.is_char_boundary(n)).find_map(|n| s[..n].parse::<f32>().ok().filter(|_| !s[..n].ends_with(['e', 'E']))).unwrap_or(0.0)
 }
 
 /// `FollowTargetIIR_c` as `/follow` builds it (ctor Gamecode 0x100734f8 called at 0x1004206b, write 0x10073030): header = own dynel,
@@ -576,20 +634,17 @@ fn eq_nocase(a: &str, b: &str) -> bool {
     up(a) == up(b)
 }
 
-/// `/pet` and `/tower` (Gamecode 0x10041ca8 / 0x10041df4): `text` = the line after `"pet "` / `"tower "` (byte offsets 4 / 6),
-/// `FUN_10053d69` parses it into `{code, arg, text}` plus the list of the addressed pets.
-fn pet_cmd(tower: bool, line: &str, st: &TextState) -> TextResult {
-    let invalid = || TextResult::Handled(TextOut { feedback: vec![fb(if tower { "Feedback_InvalidTowerCommand" } else { "Feedback_InvalidPetcommand" })], ..Default::default() });
-    let p = &st.pet;
-    if p.pets.is_empty() {
-        return TextResult::Handled(TextOut { feedback: vec![fb(if tower { "Feedback_YouHaveNoServiceTower" } else { "Feedback_YouHaveNoPet" })], ..Default::default() });
-    }
-    // strlen > 4 (also for "tower": a bare "tower" then reads past the terminator in the original [UNDEFINED]: treated as empty)
-    if line.len() <= 4 {
-        return invalid();
-    }
-    let mut words = pet_words(line.as_bytes().get(if tower { 6 } else { 4 }..).unwrap_or_default());
-    let Some(last) = words.last().cloned() else { return invalid() };
+/// The command entry `{code, arg, text}` of `FUN_10053d69` (12 bytes, `FUN_10053d17`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PetEntry {
+    pub code: i32,
+    pub arg: i32,
+    pub text: String,
+}
+
+/// Command part of `FUN_10053d69`: pops the command (and its argument word) off `words`, leaving the pet names. `None` = invalid (NULL).
+fn pet_entry(words: &mut Vec<Vec<u8>>) -> Option<PetEntry> {
+    let last = words.last().cloned()?;
     let (mut code, mut arg, mut text) = (pet_code1(&last).unwrap_or(0), 0, String::new());
     if code == 0 && words.len() >= 2 {
         words.pop();
@@ -613,9 +668,23 @@ fn pet_cmd(tower: bool, line: &str, st: &TextState) -> TextResult {
         }
     }
     words.pop();
-    if code == 0 {
+    (code != 0).then_some(PetEntry { code, arg, text })
+}
+
+/// `/pet` and `/tower` (Gamecode 0x10041ca8 / 0x10041df4): `text` = the line after `"pet "` / `"tower "` (byte offsets 4 / 6),
+/// `FUN_10053d69` parses it into `{code, arg, text}` plus the list of the addressed pets.
+fn pet_cmd(tower: bool, line: &str, st: &TextState) -> TextResult {
+    let invalid = || TextResult::Handled(TextOut { feedback: vec![fb(if tower { "Feedback_InvalidTowerCommand" } else { "Feedback_InvalidPetcommand" })], ..Default::default() });
+    let p = &st.pet;
+    if p.pets.is_empty() {
+        return TextResult::Handled(TextOut { feedback: vec![fb(if tower { "Feedback_YouHaveNoServiceTower" } else { "Feedback_YouHaveNoPet" })], ..Default::default() });
+    }
+    // strlen > 4 (also for "tower": a bare "tower" then reads past the terminator in the original [UNDEFINED]: treated as empty)
+    if line.len() <= 4 {
         return invalid();
     }
+    let mut words = pet_words(line.as_bytes().get(if tower { 6 } else { 4 }..).unwrap_or_default());
+    let Some(PetEntry { code, arg, text }) = pet_entry(&mut words) else { return invalid() };
     let names: Vec<String> = words.iter().map(|w| String::from_utf8_lossy(w).into_owned()).collect();
     let mut ids = Vec::new();
     match names.first() {
@@ -960,6 +1029,24 @@ mod pet_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn pet_script_runs_commands_with_delays_one_per_frame() {
+        let src = "# a comment\n  attack\r\nDELAY 0.5\ndelay 0.25\nRex cycle aggressive\nbogus line\ndelay 9\n";
+        let mut s = PetScript::parse(src, vec![id(DYNEL_CHAR, 500)], false);
+        assert_eq!(s.steps.iter().map(|(d, e)| (*d, e.code, e.arg)).collect::<Vec<_>>(), [(0.0, 7, 0), (0.75, 5, 1)]);
+        let mut sent = |dt| s.step(dt, 0x1234).map(|o| o.map(|b| (b[13..17].to_vec(), b[17..21].to_vec())));
+        // front delay 0: the first frame accumulates (0 <= 0), the second sends attack (window 0, code 7)
+        assert_eq!(sent(0.1), Some(None));
+        assert_eq!(sent(0.1), Some(Some((vec![0, 0, 0, 0], vec![0, 0, 0, 7]))));
+        // cycle waits 0.75 s: 0.5 + 0.25 accumulate, the frame after sends it, then the queue is empty (the trailing delay is dropped)
+        assert_eq!(sent(0.5), Some(None));
+        assert_eq!(sent(0.25), Some(None));
+        assert_eq!(sent(0.01), Some(None));
+        assert_eq!(sent(0.01), Some(Some((vec![0, 0, 0, 0], vec![0, 0, 0, 5]))));
+        assert_eq!(sent(0.1), None);
+        assert_eq!((atof("  1.5abc"), atof("x"), atof("2e")), (1.5, 0.0, 2.0));
     }
 
     #[test]

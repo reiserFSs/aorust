@@ -47,16 +47,26 @@ fn group_of(key: u64) -> GroupId {
     GroupId { kind: (key >> 32) as u8, id: key as u32 }
 }
 
-/// Reconnect pacing (GUI 0x10089dfc): `1 << (attempt + 12)` ms, capped at 0x8000, for at most 10 attempts.
-fn backoff(attempt: u32) -> f32 {
-    (if attempt < 3 { 1u32 << (attempt + 12) } else { 0x8000 }) as f32 / 1000.0
+/// Reconnect pacing (`ChatGUIModule_c` update, GUI 0x10089dfc), `tries` = connection attempts since the last login: the first attempt is
+/// immediate, then `1 << (tries + 12)` ms for `tries < 3`, else 0x8000 ms. There is **no upper bound** on the number of attempts.
+fn backoff(tries: u32) -> f32 {
+    match tries {
+        0 => 0.0,
+        1..=2 => (1u32 << (tries + 12)) as f32 / 1000.0,
+        _ => 0x8000 as f32 / 1000.0,
+    }
 }
-const MAX_ATTEMPTS: u32 = 10;
+
+/// With several entries in the 0x43 list the client switches to the next one every 16th attempt (`tries > 0 && tries.is_multiple_of(16)`, GUI 0x10089dfc).
+fn rotates(tries: u32, entries: usize) -> bool {
+    tries > 0 && tries.is_multiple_of(16) && entries > 1
+}
 
 #[derive(Default)]
 pub struct ChatNet {
     session: Option<ChatSession>,
-    server: Option<(String, u16)>,
+    /// The 0x43 server list (`ChatGUIModule_c+0x20`, 0x24-byte entries); the front entry is the one in use.
+    servers: std::collections::VecDeque<(String, u16)>,
     user: String,
     password: String,
     char_id: u32,
@@ -102,9 +112,12 @@ impl ChatNet {
             return;
         }
         let Some(list) = chat::parse_server_list(&f.payload) else { return };
-        // more than one entry -> a selection runs in the client (FUN_1008b3b9/1008bba5, untraced): first entry wins here
-        let Some(s) = list.first() else { return };
-        self.server = Some((s.host.clone(), s.port));
+        // `ChatGUIModule_c` keeps the whole list (vector of 0x24-byte entries) and connects to the front entry (FUN_1008b3b9 = erase(begin),
+        // FUN_1008bba5 = push_back: the used entry moves to the back); see `connect` / `rotates`
+        if list.is_empty() {
+            return;
+        }
+        self.servers = list.into_iter().map(|s| (s.host, s.port)).collect();
         self.char_id = char_id;
         if self.session.is_none() && self.retry_in.is_none() {
             self.retry_in = Some(0.0);
@@ -122,8 +135,12 @@ impl ChatNet {
     }
 
     fn connect(&mut self) -> Option<Out> {
-        let (host, port) = self.server.clone()?;
+        if rotates(self.attempts, self.servers.len()) {
+            self.servers.rotate_left(1);
+        }
+        let (host, port) = self.servers.front().cloned()?;
         eprintln!("chat: connect attempt {} to {host}:{port}", self.attempts);
+        self.attempts += 1;
         let tap = self.tap.clone().map(ao_net::conn::record_tap);
         match ChatSession::connect((host.as_str(), port), tap) {
             Ok(s) => {
@@ -142,8 +159,7 @@ impl ChatNet {
     fn schedule_retry(&mut self) {
         self.session = None;
         self.logged_in = false;
-        self.retry_in = (self.attempts < MAX_ATTEMPTS).then(|| backoff(self.attempts));
-        self.attempts += 1;
+        self.retry_in = Some(backoff(self.attempts));
     }
 
     /// Poll the session; call every frame.
@@ -346,7 +362,24 @@ mod tests {
 
     #[test]
     fn backoff_matches_client() {
-        assert_eq!([backoff(0), backoff(1), backoff(2), backoff(3), backoff(9)], [4.096, 8.192, 16.384, 32.768, 32.768]);
+        assert_eq!([backoff(0), backoff(1), backoff(2), backoff(3), backoff(9), backoff(1000)], [0.0, 8.192, 16.384, 32.768, 32.768, 32.768]);
+    }
+
+    #[test]
+    fn retries_are_unbounded_and_every_16th_attempt_switches_server() {
+        let mut n = ChatNet::default();
+        for tries in [0, 1, 9, 10, 11, 1000] {
+            n.attempts = tries;
+            n.schedule_retry();
+            assert_eq!(n.retry_in, Some(backoff(tries)), "no attempt bound (the client counts forever)");
+        }
+        assert!(!rotates(15, 2) && rotates(16, 2) && rotates(32, 2) && !rotates(16, 1) && !rotates(0, 2));
+        n.servers = [("a".to_string(), 1), ("b".to_string(), 2)].into();
+        n.attempts = 16;
+        if rotates(n.attempts, n.servers.len()) {
+            n.servers.rotate_left(1);
+        }
+        assert_eq!(n.servers.front().unwrap().0, "b");
     }
 
     /// Replay of a live session (docs/captures/chat_session_ithaca.rec): groups, MOTD, own group message echo, tell to an offline friend.

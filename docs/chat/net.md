@@ -12,8 +12,12 @@ Captures: `docs/captures/chat_login_ithaca.rec` (live login of "Aomacvolk", user
   So the **chat login uses the same account name and password as the login server**, kept in the exported globals `cPlayerName`/`cPlayerPasswd`.
 * `ppj::Client_c` is statically linked into GUI.dll (0x1016c000..0x10173bff, with GMP, `rand()`-seeded). Socket calls are WinSock ordinals
   (23 socket, 4 connect, 16 recv, 19 send, 10 ioctlsocket FIONBIO). Non-blocking; poll function `FUN_1016f6cb`.
-* Reconnect pacing in `ChatGUIModule_c` [0x10089dfc]: wait `1 << (attempt + 12)` ms (attempt < 3, else 0x8000 ms) between attempts; "Lost connection to chat
-  server. Attempts to reconnect... (GM msg only)" is only printed for GMs (`InputConfig_t::CheckMode(0x38)`). `ChatNet` copies the pacing (max 10 attempts is our own bound).
+* Reconnect loop in `ChatGUIModule_c` [0x10089dfc] (per frame; `this+0x20` = vector of 0x24-byte server entries from 0x43, `+0x30` = the `ppj::Client_c`, `+8` = attempts, `+0xc` = time of the last attempt, `+0x10` = was connected):
+  1. no client yet and entries non-empty and own id valid: copy entry 0; with > 1 entries `FUN_1008b3b9` (= `vector::erase(begin)`) + `FUN_1008bba5` (= `push_back`, 0x24-byte elements) move it to the back (so the next client uses the next entry); create the client (0x160 bytes) for the copy.
+  2. flags (`FUN_1016f6cb`) without `0x100` (not connected): `wait = attempts < 3 ? 1 << (attempts + 12) : 0x8000` ms; if `attempts > 0 && attempts % 16 == 0 && entries > 1` the client is deleted (the next frame creates one for the next entry; the original never advances `attempts` on this path, so with several entries it would rebuild the client every frame [BUG in the original, never hit: the list has one entry]; the port switches server and proceeds);
+     else if `attempts == 0 || last + wait < now`: (GM-only text when `was connected || attempts > 9`: "Lost connection to chat server. Attempts to reconnect... (GM msg only)" / "Attempts to reconnect to chat server: %d (GM msg only)", gated by `InputConfig_t::CheckMode(0x38)`), `Connect` (`FUN_1016d36a`), `attempts++`, `last = now`.
+  3. flags with `0x200` (logged in): `was connected = 1`, GM-only "Got connected to chat server. (GM msg only)" when `attempts > 0`, **`attempts = 0`**.
+  **There is no attempt bound and no "giving up" path**: the `> 9` only gates the GM text. The first attempt after a drop is immediate (`attempts == 0`), then 8.192 s, 16.384 s, 32.768 s, 32.768 s ... forever. Port: `play/chat/net.rs` (`backoff`, `rotates`, the list is a `VecDeque`; the former `MAX_ATTEMPTS = 10` is removed; the GM texts are not shown, we have no GM mode).
 * Keep-alive [0x1016f6cb]: > 59 s without receive -> send ping (type 100, `D` = `{2}`) every 30 s; > 299 s without receive -> drop.
 
 ## Framing and field codes
