@@ -204,15 +204,23 @@ impl ActorRig {
         self.model.meshes[0].vertices.iter().map(|v| v.pos[1]).fold(0.0, f32::max) + if self.head.is_some() { 0.25 } else { 0.0 }
     }
 
+    /// Position (cat frame: x, y up, z not mirrored; metres, unscaled) of `Attractor01_head` in the pose of `clip` (bind pose
+    /// without one): the world matrix translation `VisualCATMesh_t::GetAttractorMatrix` hands to the camera look target
+    /// (`FUN_10020af1` @N3 0x10020af1, docs/zone/camera.md §3). `None` for models without a head attractor.
+    pub fn head_attractor(&self, clip: Option<(&CatAnim, f32)>) -> Option<[f32; 3]> {
+        let att = self.cat.attractors.iter().find(|a| a.name.ends_with("_head"))?;
+        let b = att.bone as usize;
+        let bone = match clip.filter(|(a, _)| a.signature == self.cat.signature) {
+            Some((a, ms)) => self.world(Some((a, if a.duration > 0.0 { ms.rem_euclid(a.duration) } else { 0.0 })))[b],
+            None => self.bind[b].or_else(|| self.nearest_frame(&self.bind, b))?,
+        };
+        Some(bone.mul(&Xf::from_qt(att.rot, att.pos)).t)
+    }
+
     /// Height (metres above the feet, bind pose, unscaled) of the name tag / indicator anchor: `Attractor01_head` + 0.5 m
     /// (`VisualCATMesh_t::GetIndicatorPosition`, docs/zone/motion.md §6); models without a head attractor: body height + 0.3.
     pub fn indicator_height(&self) -> f32 {
-        let anchor = self.cat.attractors.iter().position(|a| a.name.ends_with("_head")).and_then(|i| {
-            let att = &self.cat.attractors[i];
-            let bone = self.bind[att.bone as usize].or_else(|| self.nearest_frame(&self.bind, att.bone as usize))?;
-            Some(bone.mul(&Xf::from_qt(att.rot, att.pos)).t[1] + 0.5)
-        });
-        anchor.unwrap_or_else(|| self.height() + 0.3)
+        self.head_attractor(None).map_or_else(|| self.height() + 0.3, |p| p[1] + 0.5)
     }
 
     /// World frame of every bone in the pose (`FUN_100540a5`).

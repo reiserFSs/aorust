@@ -7,7 +7,7 @@
 //! Evidence for the field meanings: docs/zone/dynel.md §1, docs/zone/npc.md, docs/zone/motion.md.
 
 use anyhow::Context;
-use ao_formats::character::actor::{attractor_list, npc_part_textures, ActorAssets, ActorRig, PlayerLook};
+use ao_formats::character::actor::{attractor_list, npc_part_layers, npc_part_textures, ActorAssets, ActorRig, PlayerLook};
 use ao_formats::dynel_visual::{blob_stats, corpse_visual, default_mesh, effective_stats, item_template, placed_dynels, static_instance, visual, PlacedDynel};
 use ao_formats::character::{load_cat_mesh, CatAnim, ClothPart, CrtRand, Equipment, NpcRecord, TextureOverride, CHAR_MESH_TYPE};
 use ao_gui::Gui;
@@ -56,15 +56,15 @@ pub struct CharLook {
     pub head: Option<i32>,
     /// Stat `MonsterData` (0x167): rdb 1040023 NPC record id.
     pub monster_data: i32,
-    /// `TextureData_t`: (material name, rdb 1010004 texture).
-    pub textures: Vec<(String, i32)>,
+    /// `TextureData_t`: (material name, rdb 1010004 texture, env texture [layer 3], alpha mode).
+    pub textures: Vec<(String, i32, i32, i32)>,
     /// `ClothData_t` page 0: (part, rdb 1010004 texture).
     pub cloth: Vec<(i32, i32)>,
     /// `AttractorMeshData_t`: (place, rdb 1010001 mesh).
     pub attractors: Vec<(u8, i32)>,
-}
     /// Message flag bit 2 (`SET_DYNEL_800`): `FUN_10077e13` skips the whole attractor block (head included).
     pub skip_attractors: bool,
+}
 
 impl CharLook {
     pub fn from_update(u: &SimpleCharFullUpdate) -> Self {
@@ -76,11 +76,11 @@ impl CharLook {
             fatness: u.fatness,
             head: u.head_mesh,
             monster_data: u.monster_data,
-            textures: u.textures.iter().map(|t| (t.material.clone(), t.texture)).collect(),
+            textures: u.textures.iter().map(|t| (t.material.clone(), t.texture, t.field_24, t.flag)).collect(),
             cloth: u.cloth.iter().filter(|c| c.page == 0).map(|c| (c.part(), c.texture)).collect(),
             attractors: u.attractors.iter().map(|a| (a.place, a.mesh)).collect(),
-        }
             skip_attractors: u.flags & ao_net::n3::dynel::flag::SET_DYNEL_800 != 0,
+        }
     }
 }
 
@@ -266,7 +266,7 @@ fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::
             let v = visual(&eff, default_mesh(&assets.names)?);
             match (v.cat_mesh, v.mesh) {
                 (Some(cat), _) => {
-                    let rig = ActorRig::new(store, cat, None, &Default::default(), &[])?;
+                    let rig = ActorRig::new(store, cat, None, &Default::default(), &Default::default(), &[])?;
                     let held = rig.pose(None);
                     Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), ..plain(Default::default(), v.visible) })
                 }
@@ -310,7 +310,7 @@ fn build_corpse(store: &RecordStore, assets: &mut ActorAssets, c: &CorpseLook) -
             let cat = load_cat_mesh(store, CHAR_MESH_TYPE, c.cat_mesh)?;
             let list: Vec<TextureOverride> = c.textures.iter().map(|(m, t)| TextureOverride { material: m, texture: *t, env_texture: 0, alpha_mode: 0 }).collect();
             let cloth: Vec<(ClothPart, u32)> = c.cloth.iter().filter(|c| c.1 > 0).filter_map(|&(p, t)| Some((*ClothPart::ALL.get(p as usize)?, t))).collect();
-            ActorRig::new(store, c.cat_mesh, c.head, &npc_part_textures(store, &cat, &list, &cloth), &[])?
+            ActorRig::new(store, c.cat_mesh, c.head, &npc_part_textures(store, &cat, &list, &cloth), &npc_part_layers(&cat, &list), &[])?
         }
     };
     let held = rig.pose(None);
@@ -404,10 +404,10 @@ fn npc_rig(store: &RecordStore, look: &CharLook, head: Option<u32>, attachments:
     let rec = NpcRecord::load(store, look.monster_data as u32)?;
     let model = rec.mesh().context("NPC record has no mesh")?;
     let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model)?;
-    let list: Vec<TextureOverride> = look.textures.iter().map(|(m, t)| TextureOverride { material: m, texture: *t as u32, env_texture: 0, alpha_mode: 0 }).collect();
+    let list: Vec<TextureOverride> = look.textures.iter().map(|(m, t, env, alpha)| TextureOverride { material: m, texture: *t as u32, env_texture: *env as u32, alpha_mode: *alpha as u32 }).collect();
     let cloth: Vec<(ClothPart, u32)> = look.cloth.iter().filter(|c| c.1 > 0).filter_map(|&(p, t)| Some((*ClothPart::ALL.get(p as usize)?, t as u32))).collect();
     let overrides = npc_part_textures(store, &cat, &list, &cloth);
-    let rig = ActorRig::new(store, model, head, &overrides, attachments)?;
+    let rig = ActorRig::new(store, model, head, &overrides, &npc_part_layers(&cat, &list), attachments)?;
     Ok((rig, rec))
 }
 
@@ -423,7 +423,6 @@ enum Special {
     Die(u32),
 }
 
-/// One character/NPC dynel.
 /// The clip variant of a character, rolled when its clip starts (`FUN_1004570c`: `rand() % count`, no RNG call for a single
 /// value) and kept while it loops: every start of a clip goes through the holder's resolver `FUN_1003c8b7` again (state change
 /// `FUN_1006c065` -> `FUN_1006be27`, attack / emote start, revive `FUN_1003ea0d`), loops are infinite (loop count -1).
@@ -444,6 +443,7 @@ impl Roll {
     }
 }
 
+/// One character/NPC dynel.
 pub struct Char {
     pub name: String,
     pub npc: bool,
@@ -466,8 +466,8 @@ pub struct Char {
     /// Mount transforms of the last pose.
     parts: Vec<[[f32; 4]; 4]>,
     features_set: bool,
-}
     roll: Roll,
+}
 
 /// A corpse, vending machine, door, ... (everything that is not a `SimpleChar`): a fixed model at a fixed place.
 struct Prop {
@@ -516,15 +516,14 @@ pub struct Dynels {
     pub show_all_names: bool,
     /// Lens of the playfield scene (projection of the name tags).
     pub lens: Lens,
-}
     /// The tag sprites held by the renderer and the 2 s nametag listing (`play/tags.rs`).
     tags: TagLayer,
     listing: Listing,
     /// The CRT's `rand()` the variant picks consume (`srand(time)` when the zone starts, [GUESS] for the exact call site).
+    rng: CrtRand,
     /// `PlayGameSound` calls of doors since the last [`Dynels::take_sounds`].
     sounds: Vec<GameSound>,
 }
-    rng: CrtRand,
 
 impl Default for Dynels {
     fn default() -> Self {
@@ -547,12 +546,11 @@ impl Default for Dynels {
             asked: HashSet::new(),
             show_all_names: std::env::var_os("AOMAC_SHOW_ALL_NAMES").is_some(),
             lens: Lens::default(),
-        }
             tags: TagLayer::default(),
-            sounds: vec![],
-        }
             listing: Listing::default(),
             rng: CrtRand::new(1),
+            sounds: vec![],
+        }
     }
 }
 
@@ -586,8 +584,8 @@ impl Dynels {
     /// Starts the model builder for the client at `dir`; `own` = the player's own instance id (drawn by the avatar code).
     pub fn start(&mut self, dir: PathBuf, own: i32) {
         self.own = own;
-        self.dir = Some(dir);
         self.rng = CrtRand::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
+        self.dir = Some(dir);
     }
 
     /// Forgets every dynel (a playfield change, `Zone::reset_world`).
@@ -643,6 +641,8 @@ impl Dynels {
         }
         self.props.insert((kind, instance), Prop { id, key: look.key(), pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default() });
         self.pending.push(look);
+    }
+
     /// A message for the door `who` (queued while its model is still being built; unknown doors ignore it, like the client's `GetDynel`).
     fn door_command(&mut self, who: ao_net::msg::Identity, c: Cmd) {
         let Some(p) = self.props.get_mut(&(who.kind, who.instance)) else { return };
@@ -658,8 +658,6 @@ impl Dynels {
         std::mem::take(&mut self.sounds)
     }
 
-    }
-
     pub fn on_message(&mut self, m: &Message) {
         let who = m.header.target;
         match &m.body {
@@ -669,6 +667,8 @@ impl Dynels {
                 let scale = stat_scale(&stats);
                 if let Some(pos) = v.base.position {
                     self.add_prop(who.kind, who.instance, Look::Item { template, stats }, pos, v.base.rotation, scale);
+                }
+            }
             N3::World(World::DoorStatus(d)) if DOOR_KINDS.contains(&who.kind) => self.door_command(who, Cmd::Status(d.locked, d.open, d.value_c3, d.flag_1a)),
             N3::World(World::Door(d)) if DOOR_KINDS.contains(&who.kind) && !self.props.contains_key(&(who.kind, who.instance)) => {
                 // `FUN_1009faaf`: nothing happens when the dynel exists; a new one opens at once when `Flags` bit 0x80 is set
@@ -680,8 +680,6 @@ impl Dynels {
                     if open {
                         self.door_command(who, Cmd::Open);
                     }
-                }
-            }
                 }
             }
             N3::World(World::Corpse(c)) => {
@@ -765,13 +763,19 @@ impl Dynels {
                         submitted: false,
                         parts: vec![],
                         features_set: !u.is_npc(),
-                    },
                         roll: Roll::default(),
+                    },
                 );
             }
             N3::Dynel(Dynel::CharDCMove(mv)) => {
                 if let Some(c) = self.chars.get_mut(&who.instance) {
                     c.mover.on_char_dc_move(mv);
+                }
+            }
+            // `n3TeleportIIR_t::Activate` in-playfield branch for another character (zone changes only concern the own dynel)
+            N3::Teleport(t) if !t.is_zone_change() => {
+                if let Some(c) = self.chars.get_mut(&who.instance) {
+                    c.mover.on_teleport(t.pos, &t.rot);
                 }
             }
             N3::Dynel(Dynel::SetWantedDirection(d)) => {
@@ -818,12 +822,6 @@ impl Dynels {
         }
         for (holder, slot, template, stats) in std::mem::take(&mut self.pending_weapons) {
             let _ = worker.tx.send(Req::Weapon { holder, slot, template, stats });
-            // `n3TeleportIIR_t::Activate` in-playfield branch for another character (zone changes only concern the own dynel)
-            N3::Teleport(t) if !t.is_zone_change() => {
-                if let Some(c) = self.chars.get_mut(&who.instance) {
-                    c.mover.on_teleport(t.pos, &t.rot);
-                }
-            }
         }
         let mut placed = vec![];
         while let Ok(r) = worker.rx.try_recv() {
@@ -881,11 +879,11 @@ impl Dynels {
         for p in self.props.values_mut() {
             let Some(Model::Ready { built, uploaded }) = self.models.get_mut(&p.key) else { continue };
             if !built.visible {
+                continue;
+            }
             // the clock runs for every prop, drawn or not (`SimpleItem_t` update)
             if let Some(item) = &built.item {
                 p.anim.step(dt, item);
-            }
-                continue;
             }
             if !*uploaded {
                 host.actor_models.push((p.key, built.model.clone()));
@@ -970,9 +968,9 @@ impl Dynels {
                     (id, a, rate)
                 }
             };
-            if key != c.anim {
             // the variant is rolled when the clip starts, not while it loops
             let clip = list.filter(|l| !l.is_empty()).map(|l| &l[c.roll.pick((key, matches!(c.special, Special::None).then_some(state)), l.len(), &mut self.rng)]);
+            if key != c.anim {
                 c.anim = key;
                 c.clip_ms = 0.0;
                 c.pose_in = 0.0;
@@ -1120,6 +1118,50 @@ mod tests {
         d.join("cd_image/rdb.db").exists().then_some(d)
     }
 
+    #[test]
+    fn tags_follow_the_original_rules() {
+        let mut z = Zone::new(25988);
+        for f in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            z.on_frame(&f);
+        }
+        let own_pos = scene_pos(z.own().unwrap().pos);
+        let w = &mut z.world;
+        for k in w.chars.values().map(|c| c.key).collect::<Vec<_>>() {
+            w.models.insert(k, Model::Ready { built: plain(Default::default(), true), uploaded: true });
+        }
+        // pref off: nothing without indicators
+        w.show_all_names = false;
+        assert!(w.collect_tags(0.016, own_pos, &[]).is_empty());
+        // pref on: the characters within 30 m, nearest first, never the client character
+        w.own = 25988;
+        w.show_all_names = true;
+        let tags = w.collect_tags(0.016, own_pos, &[]);
+        assert!(tags.len() > 3, "{} tags", tags.len());
+        assert!(tags.len() > 3 && tags.iter().all(|t| t.kind == IndicatorKind::Nametag && t.bar.is_none() && t.id != 25988));
+        let d = |id: i32| {
+            let p = scene_pos(w.chars[&id].pose.pos);
+            (0..3).map(|i| (p[i] - own_pos[i]).powi(2)).sum::<f32>().sqrt()
+        };
+        assert!(tags.iter().all(|t| d(t.id) <= NAME_TAG_RADIUS) && tags.windows(2).all(|p| d(p[0].id) <= d(p[1].id)));
+        // the set is rebuilt only every 2 s: walking away keeps it, 2 s later it is empty
+        let far = [own_pos[0] + 500.0, own_pos[1], own_pos[2]];
+        assert_eq!(w.collect_tags(0.016, far, &[]).len(), tags.len());
+        assert!(w.collect_tags(2.1, far, &[]).is_empty());
+        // indicators: the selected dynel gets a plate + bar tag first and no plain tag; flags bit 0x400 suppresses the selection one
+        w.collect_tags(2.1, own_pos, &[]);
+        let id = w.collect_tags(0.016, own_pos, &[])[0].id;
+        let sel = Indicator { id, kind: IndicatorKind::Selection, bar: Some(((30, 60), 0x00ff00)) };
+        let t = w.collect_tags(0.016, own_pos, &[sel]);
+        assert_eq!((t[0].id, t[0].kind, t[0].bar), (id, IndicatorKind::Selection, Some((32, 0x00ff00))));
+        assert_eq!(t.iter().filter(|t| t.id == id).count(), 1);
+        w.chars.get_mut(&id).unwrap().flags = 0x400;
+        let t = w.collect_tags(0.016, own_pos, &[sel]);
+        assert!(t.iter().all(|t| t.kind == IndicatorKind::Nametag) && t.iter().any(|t| t.id == id));
+        // an unplaced dynel (server x <= 0) shows nothing
+        w.chars.get_mut(&id).unwrap().pose.pos[0] = 0.0;
+        assert!(w.collect_tags(0.016, own_pos, &[]).iter().all(|t| t.id != id));
+    }
+
     /// A door of playfield 4582 (`{0xC748, 0xC00011E6}`, mesh 245910 with 7 animated nodes) follows `DoorStatusUpdate`: it slides open over
     /// the animation's 1.67 s and parks, then slides shut and returns to the rest vertices; each plays its sound from the template.
     #[test]
@@ -1245,50 +1287,6 @@ mod tests {
         eprintln!("{} models ready, {failed} failed, {} actors, {} props", models.len(), actors.len(), z.world.props.len());
         assert!(!actors.is_empty());
         if let Ok(out) = std::env::var("AOMAC_DYNEL_SHOT") {
-    #[test]
-    fn tags_follow_the_original_rules() {
-        let mut z = Zone::new(25988);
-        for f in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
-            z.on_frame(&f);
-        }
-        let own_pos = scene_pos(z.own().unwrap().pos);
-        let w = &mut z.world;
-        for k in w.chars.values().map(|c| c.key).collect::<Vec<_>>() {
-            w.models.insert(k, Model::Ready { built: plain(Default::default(), true), uploaded: true });
-        }
-        // pref off: nothing without indicators
-        w.show_all_names = false;
-        assert!(w.collect_tags(0.016, own_pos, &[]).is_empty());
-        // pref on: the characters within 30 m, nearest first, never the client character
-        w.own = 25988;
-        w.show_all_names = true;
-        let tags = w.collect_tags(0.016, own_pos, &[]);
-        assert!(tags.len() > 3, "{} tags", tags.len());
-        assert!(tags.len() > 3 && tags.iter().all(|t| t.kind == IndicatorKind::Nametag && t.bar.is_none() && t.id != 25988));
-        let d = |id: i32| {
-            let p = scene_pos(w.chars[&id].pose.pos);
-            (0..3).map(|i| (p[i] - own_pos[i]).powi(2)).sum::<f32>().sqrt()
-        };
-        assert!(tags.iter().all(|t| d(t.id) <= NAME_TAG_RADIUS) && tags.windows(2).all(|p| d(p[0].id) <= d(p[1].id)));
-        // the set is rebuilt only every 2 s: walking away keeps it, 2 s later it is empty
-        let far = [own_pos[0] + 500.0, own_pos[1], own_pos[2]];
-        assert_eq!(w.collect_tags(0.016, far, &[]).len(), tags.len());
-        assert!(w.collect_tags(2.1, far, &[]).is_empty());
-        // indicators: the selected dynel gets a plate + bar tag first and no plain tag; flags bit 0x400 suppresses the selection one
-        w.collect_tags(2.1, own_pos, &[]);
-        let id = w.collect_tags(0.016, own_pos, &[])[0].id;
-        let sel = Indicator { id, kind: IndicatorKind::Selection, bar: Some(((30, 60), 0x00ff00)) };
-        let t = w.collect_tags(0.016, own_pos, &[sel]);
-        assert_eq!((t[0].id, t[0].kind, t[0].bar), (id, IndicatorKind::Selection, Some((32, 0x00ff00))));
-        assert_eq!(t.iter().filter(|t| t.id == id).count(), 1);
-        w.chars.get_mut(&id).unwrap().flags = 0x400;
-        let t = w.collect_tags(0.016, own_pos, &[sel]);
-        assert!(t.iter().all(|t| t.kind == IndicatorKind::Nametag) && t.iter().any(|t| t.id == id));
-        // an unplaced dynel (server x <= 0) shows nothing
-        w.chars.get_mut(&id).unwrap().pose.pos[0] = 0.0;
-        assert!(w.collect_tags(0.016, own_pos, &[]).iter().all(|t| t.id != id));
-    }
-
             let scene = ao_formats::playfield::load_playfield_at(&RecordStore::open(&dir).unwrap(), &dir, 4582, ao_formats::playfield::DEFAULT_DAY_TIME).unwrap();
             // AOMAC_DYNEL_LOOK=<kind hex like c76a | npc | player>: camera 4 m from the first such dynel instead of the player's view
             let (mut cam, mut at) = ([eye[0], eye[1] + 1.7, eye[2]], [eye[0] + fwd[0], eye[1] + 1.5 + fwd[1], eye[2] + fwd[2]]);
