@@ -4,10 +4,11 @@
 
 use super::avatar::{self, Avatar, AvatarPose};
 use super::camera::{self, Camera3p};
-use super::camera_views::Views;
+use super::camera_views::{door_closed, Sight, Views};
+use super::fightmode::{FightLevels, DEFAULT_LEVEL};
 use super::controls::{CamCmd, Cmd, ControlPrefs, Controls};
 use super::movement::{id as mv, mode, Movement, World};
-use super::zone::{scene_pos, scene_yaw, OwnEvent, Zone};
+use super::zone::{scene_pos, scene_yaw, OwnEvent, Zone, IN_PLAY_STAT};
 use ao_formats::character::Role;
 use ao_formats::playfield::{camera_views, zone_locator};
 use ao_formats::playfield::collision::{Aligned, Body, Collision, SurfaceState, FOOT_CLEARANCE};
@@ -20,7 +21,6 @@ use ao_render::{GameInput, Host};
 use std::path::Path;
 
 /// District fight-mode level of the own zone (`FUN_1003e1d0` [GC]); the original returns 2 without `PlayfieldDistrictInfo` data. [UNRESOLVED] not read.
-const DISTRICT_FIGHT_LEVEL: i32 = 2;
 
 /// Length of the jump's ceiling ray (f32 100.0 @ GC 0x10155eb0).
 const JUMP_CEILING_RAY: f32 = 100.0;
@@ -65,13 +65,19 @@ pub(super) struct Player {
     clock: f32,
     model_sent: bool,
     lens_set: bool,
+    /// `ViewDistance` pref (0..1, docs/chat/dvalue.md): the lens' far plane is [`camera::far_plane`] of it.
+    view_distance: f32,
     /// The left/right press that went to the GUI: its release must not reach the controls.
     gui_press: [bool; 2],
     game: Vec<Cmd>,
+    /// World clicks `Controls` accepted (movement <= 0.02), for the interaction layer (`interact_play.rs`).
+    clicks: Vec<ao_gui::MouseButton>,
     /// A one-shot clip over the movement pose (emote, attack swing, death): the role and whether it holds its last frame.
     transient: Option<(Role, bool)>,
     /// The character is in a fight (`idle-unarmed` stance while standing).
     pub fighting: bool,
+    /// District fight-mode data of the playfield (`fightmode.rs`).
+    fight: Option<FightLevels>,
 }
 
 impl Player {
@@ -97,6 +103,7 @@ impl Player {
                 (Err(e), _) | (_, Err(e)) => eprintln!("camera views {playfield}: {e:#}"),
                 _ => {}
             }
+            let fight = FightLevels::load(&store, playfield);
             let controls = Controls::from_char_prefs(prefs, &prefs_xml);
             Ok(Self {
                 store,
@@ -110,13 +117,24 @@ impl Player {
                 clock: 0.0,
                 model_sent: false,
                 lens_set: false,
+                view_distance: camera::VIEW_DISTANCE,
                 gui_press: [false; 2],
                 game: Vec::new(),
+                clicks: Vec::new(),
                 transient: None,
                 fighting: false,
+                fight,
             })
         })();
         built.map_err(|e| eprintln!("player: {e:#}")).ok()
+    }
+
+    /// The `ViewDistance` pref changed (`FUN_1001fc91` replaces the camera's far plane at once): the next frame sends the lens again.
+    pub fn set_view_distance(&mut self, vd: f32) {
+        if vd != self.view_distance {
+            self.view_distance = vd;
+            self.lens_set = false;
+        }
     }
 
     pub fn serial(&self) -> u32 {
@@ -138,6 +156,28 @@ impl Player {
         self.transient.as_ref().is_some_and(|t| t.1)
     }
 
+    /// `FUN_100585ee` [GC], run every frame by the control dynel's `Run` (`FUN_1005b016`): the feet position inside the teleportal of its zone
+    /// (`n3Zone_t::IsPosInTeleportal` [N3 0x1001a86a], [`Collision::in_teleportal`]) and the gate `FUN_1005859d` open ->
+    /// `n3EngineClientAnarchy_t::StartTeleportTry` [GC 0x10018f9a]: `N3Msg_MovementChanged(0x16)` (a position sync, no FSM transition), the
+    /// `TeleportTrier_t` (`Zone::start_teleport_try`, which the flow turns into `TeleportStartedMessage`) and `StartTryingTeleport`'s
+    /// `FUN_10059ae5(1)` (full stop while moving). The trier then runs for 30 s waiting for the server's `n3TeleportIIR_t`.
+    fn teleport_try(&mut self, dt: f32, zone: &mut Zone) {
+        if zone.trier.is_none() && self.teleport_gate(zone) && self.collision.as_ref().is_some_and(|c| c.in_teleportal(flip(self.movement.pos()))) {
+            self.movement.action(mv::SYNC, self.clock);
+            zone.start_teleport_try();
+            self.movement.stop_if_moving();
+        }
+        zone.run_trier(dt);
+    }
+
+    /// `FUN_1005859d` [GC]: a player character (`+0x21c` clear) that is not dying (`+0x80`), has stat `InPlay` (0xC2) set and not the dead
+    /// flag 0x20 (set by `CharDie_t`, docs/zone/combat-anim.md). [UNRESOLVED] The test of dynel flag bit 17 (0x20000, `+0x138`) has no writer
+    /// in Gamecode.dll (a `PUSH 0x20000` scan finds two readers that mask `Features` bit 2 and one clear in the NPC initialiser), so it is
+    /// taken as clear.
+    fn teleport_gate(&self, zone: &Zone) -> bool {
+        zone.stat(IN_PLAY_STAT).is_some_and(|v| v != 0) && !self.holding()
+    }
+
     /// Ends a held clip (resurrection).
     pub fn stand(&mut self) {
         self.transient = None;
@@ -151,6 +191,11 @@ impl Player {
     /// CTRL / ALT held (mouse clicks do not carry modifiers).
     pub fn attack_modifier(&self) -> bool {
         self.controls.attack_modifier()
+    }
+
+    /// Mouse clicks (no look / drag) since the last call.
+    pub fn take_clicks(&mut self) -> Vec<ao_gui::MouseButton> {
+        std::mem::take(&mut self.clicks)
     }
 
     /// Commands for the combat layer collected since the last call.
@@ -175,7 +220,8 @@ impl Player {
                 // selection clicks are the HUD's (`Hud::input`); item pick-up / screenshot have no consumer yet
                 // attack / sit / special attacks belong to the combat layer (`combat::Module`, run by the flow)
                 Cmd::Attack | Cmd::SwitchTarget | Cmd::Sit | Cmd::Special(_) => self.game.push(c),
-                Cmd::Click(_) | Cmd::PickupItem | Cmd::Screenshot => {}
+                Cmd::Click(b) => self.clicks.push(b),
+                Cmd::PickupItem | Cmd::Screenshot => {}
             }
         }
     }
@@ -249,6 +295,7 @@ impl Player {
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
         }
+        self.teleport_try(dt, zone);
         let world = Ground(self.collision.as_ref());
         let out: Vec<Frame> = self.movement.update(dt, &world).iter().map(|m| n3_frame(0, self.char_id, char_dc_move(self.char_id as i32, m))).collect();
         for (id, v) in self.movement.take_stat_writes() {
@@ -283,10 +330,14 @@ impl Player {
         }
         let col = self.collision.as_ref();
         let clear = |a: [f32; 3], b: [f32; 3]| col.is_none_or(|c| segment_clear(c, a, b));
-        host.camera = self.camera.update_with(scene_pos(pos), yaw, dt, &clear);
+        let closed = |a: [f32; 3], b: [f32; 3]| col.is_some_and(|c| door_closed(c, a, b));
+        let ground = |p: [f32; 3]| col.and_then(|c| c.ground(p));
+        host.camera = self.camera.update_with(scene_pos(pos), yaw, dt, &Sight { clear: &clear, door_closed: &closed, ground: &ground });
         if !self.lens_set {
-            // FOV 90 degrees horizontal, near 0.2 (`VisualCamera_t`, docs/zone/camera.md); far stays the playfield's
-            host.lens = Some(camera::lens(host.lens.unwrap_or(zone.world.lens)));
+            // FOV 90 degrees horizontal, near 0.2 (`VisualCamera_t`, docs/zone/camera.md); far = `ViewDistance` * 1000 m (`FUN_1001fc91`)
+            let mut lens = camera::lens(host.lens.unwrap_or(zone.world.lens));
+            lens.far = Some(camera::far_plane(self.view_distance));
+            host.lens = Some(lens);
             self.lens_set = true;
         }
         if !self.model_sent {
@@ -358,8 +409,28 @@ impl Player {
                     _ => {}
                 },
                 OwnEvent::Resurrected => {}
+                OwnEvent::Spells { spells, apply } => {
+                    for sp in &spells {
+                        self.movement.apply_spell(sp, apply);
+                    }
+                }
+                OwnEvent::Relocated { pos, .. } => {
+                    if let Some(p) = pos {
+                        self.movement.set_pos(p, false);
+                    }
+                }
+                OwnEvent::FightMode(u) => {
+                    if let Some(f) = &mut self.fight {
+                        f.update(&u);
+                    }
+                }
             }
         }
+    }
+
+    /// `FUN_1003e1d0`: the district fight-mode level at `pos` (2 without district data).
+    fn fight_level(&self, pos: [f32; 3]) -> i32 {
+        self.fight.as_ref().map_or(DEFAULT_LEVEL, |f| f.level(pos))
     }
 
     /// `FUN_100732e3` gate for a `FollowTargetIIR_c` on the own dynel: dropped when Features bit 0 or `0x4000000` is set or the district
@@ -367,7 +438,7 @@ impl Player {
     /// here: [UNRESOLVED] the original's no-data default 2 is used, i.e. the follow part is always dropped (the placement is not).
     fn follow_gated(&self) -> bool {
         let f = self.movement.stats().features;
-        f & 1 != 0 || f & 0x400_0000 != 0 || DISTRICT_FIGHT_LEVEL > 1
+        f & 1 != 0 || f & 0x400_0000 != 0 || self.fight_level(self.movement.pos()) > 1
     }
 
     /// `SlotMovementWalkToggle` / special actions 0x11 / 0x12: `MovementChanged(0x18 / 0x19)`.
@@ -378,6 +449,11 @@ impl Player {
     /// FSM `vtable[3](0x1e)`: the sit transition is allowed (`N3Msg_StartCamping`).
     pub fn can_sit(&self) -> bool {
         self.movement.fsm().allowed(0x1e)
+    }
+
+    /// `Fsm::last_speed_mode == WALK` (the `+0x30 == 2` test of `FUN_1006d196`, hud_special.rs).
+    pub fn last_speed_walk(&self) -> bool {
+        self.movement.fsm().last_speed_mode == mode::WALK
     }
 }
 

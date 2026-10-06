@@ -3,8 +3,11 @@
 
 use ao_net::frame::Frame;
 use ao_net::msg::Identity;
-use ao_net::n3::{self, dynel::Dynel, misc::Misc, pet::PetList, world::World, N3};
+use ao_net::n3::{self, dynel::Dynel, misc::Misc, pet::PetList, server_move, world::World, N3};
 use std::collections::{BTreeMap, HashMap};
+
+/// `InPlay` stat id (0xc2): gates `FUN_1005859d` (the teleportal test) and is set by the full update and the `CharInPlay` echo.
+pub const IN_PLAY_STAT: u32 = 0xC2;
 
 /// `CurrentNano` stat id (0xd6): the second value `ResurrectIIR_t` sets.
 const NANO_STAT: u32 = 0xD6;
@@ -39,6 +42,9 @@ pub enum ZoneEvent {
     /// `n3TeleportIIR_t` for the own character with a destination playfield (`n3EngineClient_t::StartTeleport`): the old playfield
     /// is stopped and `PlayfieldAnarchy_t::Run` posts `TeleportStarted` (docs/zone/world.md §10.2).
     Teleport,
+    /// `CharInPlayIIR_t` relayed for the own character (the server's echo of our `CharInPlay`): `Activate` [GC 0x1007264d] sets stat
+    /// `InPlay` and posts event `0xa5` = `FlowControlModule_t::AliveMessage` [GUI 0x10028543] (docs/zone/world.md §10.2).
+    Alive,
     None,
 }
 
@@ -59,7 +65,27 @@ pub enum OwnEvent {
     Action(i32),
     /// `ResurrectIIR_t` [GC 0x100769bd]: Health / CurrentNano are in the stat table, the vehicle recalculates.
     Resurrected,
+    /// `ApplySpellsIIR_t` [GC 0x101288f2] whose target is the own character: `apply` runs the spells, otherwise undoes them (docs/zone/movement.md §10.1).
+    Spells { spells: Vec<ao_net::n3::spells::Spell>, apply: bool },
+    /// `RelocateDynelsIIR_t` [GC 0x1003a364] listing the own character: it becomes a child of `parent` at the parent's origin (`NullPos`), `pos`
+    /// = that origin when the parent's position is known.
+    Relocated { parent: Identity, pos: Option<[f32; 3]> },
+    /// `FightModeUpdate_t` [GC 0x10124b70] for the current playfield (the district table is the player's, `fightmode.rs`).
+    FightMode(ao_net::n3::server_move::FightModeUpdate),
 }
+
+/// Events of the client-initiated teleport path (`n3EngineClientAnarchy_t::StartTeleportTry` / `TeleportTrier_t`, docs/zone/world.md §10.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeleportEvent {
+    /// `TeleportTrier_t::StartTryingTeleport` [GC 0x10037d48]: GUI event 5 = `FlowControlModule_t::TeleportStartedMessage`.
+    Started,
+    /// `TeleportTrier_t::TeleportFailed` [GC 0x10037db7]: GUI event 6 = `TeleportEndedMessage`, then `Feedback_AreaChangeNotInitiated`.
+    Failed,
+}
+
+/// Seconds a `TeleportTrier_t` waits for the server before `TeleportFailed` (`TeleportTrier_t(_DAT_10157500)` in `StartTeleportTry`; the f32
+/// at GC 0x10157500 is also the 30 m radius of `N3Msg_GetDynelsInVicinity`).
+pub const TELEPORT_TIMEOUT: f32 = 30.0;
 
 #[derive(Default)]
 pub struct Zone {
@@ -91,8 +117,20 @@ pub struct Zone {
     pub fight_target: HashMap<i32, i32>,
     /// The own pet list (`dynel+0x1d8` -> `+0x1c`, `AddPetIIR_c` / `RemovePetIIR_c`; docs/zone/pets.md): service towers included.
     pub pets: Vec<Identity>,
+    /// The spells currently running on the own character (`FullCharacterIIR_t` list, `ApplySpellsIIR_t`): their stat bonuses are the buffs of
+    /// `GetSkill(stat, 2)` (`play/hud_stats/buffs.rs`, docs/gui.md §11.10).
+    pub active_spells: Vec<ao_net::n3::spells::Spell>,
     /// Pending [`OwnEvent`]s (drained by the player each frame).
     pub own_events: Vec<OwnEvent>,
+    /// `RelocateDynelsIIR_t`: `(child, parent)` links (`n3Dynel_t::RelocateDynel`), cleared with the playfield.
+    pub parents: Vec<(Identity, Identity)>,
+    /// The own nano programs and timed nano effects (`own_nanos.rs`, the Programs / NCU windows).
+    pub nanos: super::own_nanos::OwnNanos,
+    /// The `TeleportTrier_t` [GC 0x10037d05] of a client-initiated teleport try (a child of the playfield, so it survives the own dynel being
+    /// placed again and dies with the playfield): seconds elapsed since `StartTryingTeleport`. `None`: no try is running.
+    pub trier: Option<f32>,
+    /// What the try did since the flow last looked (`Player::frame` posts them, the flow drains them).
+    pub teleport_events: Vec<TeleportEvent>,
 }
 
 impl Zone {
@@ -124,8 +162,32 @@ impl Zone {
     /// `GameTime_t::RunFunction` [GC 0x1000b214]: the clock runs `TimeSpeed` (15) game seconds per real second, i.e. one
     /// `GameDayTime` second per real second.
     pub fn tick(&mut self, dt: f32) {
+        self.nanos.tick(dt);
         if let Some(t) = &mut self.clock {
             *t = (*t + dt).rem_euclid(GAME_DAY_SECS / TIME_SPEED);
+        }
+    }
+
+    /// `n3EngineClientAnarchy_t::StartTeleportTry` [GC 0x10018f9a] after the movement sync: creates the `TeleportTrier_t` (its constructor gets
+    /// [`TELEPORT_TIMEOUT`]) and runs `StartTryingTeleport` (GUI event 5). Returns `false` and does nothing while a trier exists.
+    pub fn start_teleport_try(&mut self) -> bool {
+        if self.trier.is_some() {
+            return false;
+        }
+        self.trier = Some(0.0);
+        self.teleport_events.push(TeleportEvent::Started);
+        true
+    }
+
+    /// `TeleportTrier_t::RunFunction` [GC 0x10037e29]: adds the frame time; past [`TELEPORT_TIMEOUT`] it runs `TeleportFailed` (GUI event 6,
+    /// the trier dies: `n3Fobj_t::Die` [N3 0x1000105c], `Run` [N3 0x10007e07] then drops it).
+    pub fn run_trier(&mut self, dt: f32) {
+        if let Some(t) = self.trier.as_mut() {
+            *t += dt;
+            if *t > TELEPORT_TIMEOUT {
+                self.trier = None;
+                self.teleport_events.push(TeleportEvent::Failed);
+            }
         }
     }
 
@@ -136,7 +198,11 @@ impl Zone {
         self.dynels.clear();
         self.fight_target.clear();
         self.own_events.clear();
+        self.parents.clear();
         self.in_play_sent = false;
+        // `n3Playfield_t::StopPlayfield` kills every child of the playfield, the `TeleportTrier_t` among them
+        self.trier = None;
+        self.teleport_events.clear();
     }
 
     pub fn on_frame(&mut self, f: &Frame) -> ZoneEvent {
@@ -154,6 +220,7 @@ impl Zone {
         *self.counts.entry(m.header.msg_type).or_default() += 1;
         let who = m.header.target;
         self.world.on_message(&m);
+        self.nanos.on_message(who, Identity { kind: CHAR_KIND, instance: self.char_id as i32 }, &m.body);
         match m.body {
             N3::World(World::Playfield(p)) => {
                 let id = p.rdb_playfield().map_or(p.playfield_id, |i| i.instance) as u32;
@@ -174,7 +241,10 @@ impl Zone {
                 self.apply_stats(c.stat_map.iter().map(|s| (s.0 as u32, s.1)));
                 // `FUN_1002aeca` replaces the character's inventory vector by the message's elements
                 self.inventory = c.inventory.iter().map(|e| (e.slot, *e)).collect();
+                self.set_effects(&c.spells);
             }
+            // server item moves of the own inventory (`play/hud_stats/zone_inv.rs`, docs/gui.md §11.12)
+            N3::Inventory(m) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => self.apply_inventory(&m),
             N3::Dynel(Dynel::Stat(u)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 self.apply_stats(u.stats.iter().map(|s| (s.0 as u32, s.1)));
             }
@@ -195,6 +265,8 @@ impl Zone {
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if who.kind == CHAR_KIND => {
                 if who.instance == self.char_id as i32 {
                     self.own_update = Some(u.clone());
+                    // `FUN_10077af2` [GC]: stat `InPlay` (0xC2) = `VisualFlags >> 1 & 1`
+                    self.stats.insert(IN_PLAY_STAT, i32::from(u.visual_flags >> 1 & 1));
                     self.own_serial += 1;
                 }
                 self.dynels.insert(
@@ -225,6 +297,14 @@ impl Zone {
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 self.own_events.push(OwnEvent::Action(a.action));
+            }
+            // `CharInPlayIIR_t::Activate` [GC 0x1007264d] on the own dynel: `SetStat(0xC2, 1)` and the `AliveMessage` event
+            N3::Misc(Misc::CharInPlay) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                self.stats.insert(IN_PLAY_STAT, 1);
+                return ZoneEvent::Alive;
+            }
+            N3::Unknown(body) if matches!(m.header.msg_type, ao_net::n3::spells::APPLY_SPELLS | server_move::RELOCATE | server_move::FIGHT_MODE_UPDATE) => {
+                self.on_world_message(m.header.msg_type, who, &body)
             }
             N3::Unknown(body) if who.kind == CHAR_KIND => self.on_unknown(m.header.msg_type, who.instance, &body),
             // `n3TeleportIIR_t::Activate` [N3 0x10029f87]: a destination playfield only matters for the own character
@@ -265,6 +345,50 @@ impl Zone {
             _ => {}
         }
         ZoneEvent::None
+    }
+
+    /// `ApplySpellsIIR_t`, `RelocateDynelsIIR_t`, `FightModeUpdate_t` (docs/zone/movement.md §10.1 / §10.2): the apply of each runs on the dynel the body names.
+    fn on_world_message(&mut self, msg: u32, who: Identity, body: &[u8]) {
+        let own = Identity { kind: CHAR_KIND, instance: self.char_id as i32 };
+        match msg {
+            ao_net::n3::spells::APPLY_SPELLS => match ao_net::n3::spells::parse(body) {
+                Ok(a) if a.target == own => {
+                    self.apply_effects(&a.spells, a.apply);
+                    self.own_events.push(OwnEvent::Spells { spells: a.spells, apply: a.apply });
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("zone: ApplySpells: {e:#}"),
+            },
+            server_move::RELOCATE => match server_move::parse_relocate(body) {
+                // `FUN_1003a27c`: the header must be a live character
+                Ok(r) if who.kind == CHAR_KIND && self.dynels.contains_key(&who.instance) => {
+                    let origin = (r.parent.kind == CHAR_KIND).then(|| self.dynels.get(&r.parent.instance).map(|d| d.pos)).flatten();
+                    for c in r.children {
+                        self.parents.retain(|l| l.0 != c);
+                        self.parents.push((c, r.parent));
+                        if c.kind != CHAR_KIND {
+                            continue;
+                        }
+                        if let Some(pos) = origin {
+                            if let Some(d) = self.dynels.get_mut(&c.instance) {
+                                d.pos = pos;
+                            }
+                        }
+                        if c == own {
+                            self.own_events.push(OwnEvent::Relocated { parent: r.parent, pos: origin });
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("zone: Relocate: {e:#}"),
+            },
+            server_move::FIGHT_MODE_UPDATE => match server_move::parse_fight_mode_update(body) {
+                Ok(u) if Some(u.playfield.instance as u32) == self.playfield => self.own_events.push(OwnEvent::FightMode(u)),
+                Ok(_) => {}
+                Err(e) => eprintln!("zone: FightModeUpdate: {e:#}"),
+            },
+            _ => {}
+        }
     }
 
     /// `SetPosIIR_c`, `ImpulseIIR_c`, `ResurrectIIR_t` (docs/zone/movement.md §10): own character -> [`OwnEvent`], others -> their placed position / health.
@@ -370,6 +494,34 @@ mod tests {
         z.tick(2005.0);
         assert!((z.day_time() - 3.0).abs() < 1e-2, "{}", z.day_time());
         assert_eq!(day_time_of(97_200.0 + 15.0), 1.0);
+    }
+
+    /// `StartTeleportTry` runs once while the trier lives; the trier fails after 30 s (`RunFunction`), and the playfield change kills it.
+    #[test]
+    fn teleport_trier_runs_once_and_times_out() {
+        let mut z = Zone::new(1);
+        assert!(z.start_teleport_try() && !z.start_teleport_try());
+        z.run_trier(29.0);
+        assert!(z.trier.is_some());
+        z.run_trier(1.5);
+        assert!(z.trier.is_none());
+        assert_eq!(z.teleport_events, [TeleportEvent::Started, TeleportEvent::Failed]);
+        z.teleport_events.clear();
+        assert!(z.start_teleport_try(), "a new try may start once the old one failed");
+        z.reset_world();
+        assert!(z.trier.is_none() && z.teleport_events.is_empty(), "StopPlayfield kills the trier");
+    }
+
+    /// The server's relay of our own `CharInPlayIIR_t` (live capture, 104 ms after we sent it) is `AliveMessage`; the relays for other characters are not.
+    #[test]
+    fn own_char_in_play_relay_is_the_alive_event() {
+        let mut z = Zone::new(0x82e8);
+        let ev: Vec<_> = frames(include_str!("../../../../docs/captures/zone_enter_ithaca.rec")).iter().map(|f| z.on_frame(f)).collect();
+        assert_eq!(ev.iter().filter(|e| **e == ZoneEvent::Alive).count(), 1);
+        assert_eq!(z.stat(IN_PLAY_STAT), Some(1));
+        let mut z = Zone::new(25988);
+        let ev: Vec<_> = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter().map(|f| z.on_frame(f)).collect();
+        assert!(!ev.contains(&ZoneEvent::Alive), "the capture holds only relays for other characters");
     }
 
     #[test]

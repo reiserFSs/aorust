@@ -10,17 +10,40 @@ mod combat;
 mod controls;
 mod create;
 mod delete;
+mod dvalue;
 mod dynels;
 mod dynels_doors;
+mod fightmode;
 mod flow;
 mod hud;
 mod hud_aggdef;
+mod hud_actions;
 mod hud_bar;
 mod hud_compass;
+mod hud_dialog;
+mod hud_faction;
+mod hud_perks;
+mod hud_team;
+mod hud_winb;
+mod hud_cursor;
+mod hud_pick;
 mod hud_map;
+mod hud_listview;
+mod hud_nano;
+mod hud_keys;
+mod hud_nanodb;
+mod hud_ncu;
+mod hud_pools;
+mod hud_rollup;
+mod hud_special;
 mod hud_stats;
 mod hud_target;
 mod hud_use;
+mod interact;
+mod interact_chat;
+mod interact_play;
+mod logout;
+mod own_nanos;
 mod movement;
 mod player;
 mod prefs;
@@ -66,6 +89,9 @@ enum Bg {
     /// The top-down ground image of playfield `id` for the Map window (`Report::ground` rendered by `topdown::render` from the scene
     /// the loader just built; `bool`: dungeon rooms), sent just before its [`Bg::World`].
     Ground(u32, Option<Box<(ao_formats::topdown::GroundMap, bool)>>),
+    /// Layout and audio of playfield `id`, sent just before its [`Bg::World`]: `Report::dungeon` (`N3Msg_IsDungeon`) and the playfield's
+    /// district music / ambience / emitters (`None` without sound data), handed to `Audio::set_playfield` when the world appears.
+    Info(u32, bool, Option<Box<ao_audio::PlayfieldAudio>>),
     /// The character-creation world (`charactercreation_*.abiff` + connectors), decoded in the background.
     CcWorld(Result<Box<CcWorld>, String>),
 }
@@ -142,6 +168,13 @@ struct Play {
     /// `FlowControlModule_t::m_isTeleporting` [GUI 0x102635d8] while in the world: set by `TeleportStarted`, cleared by `TeleportEnded`
     /// (the new world appeared). The HUD and chat stay; the 3D world is hidden (docs/zone/world.md §10.2).
     teleporting: bool,
+    /// `InputConfig_t+0x18` (`isUserInputStopped`) and `DisplaySystem+0x44 = 0` (3D viewport off): both set by `TeleportStartedMessage`, both
+    /// cleared by `AliveMessage`, i.e. by the server's echo of our `CharInPlay` (docs/zone/world.md §10.2).
+    awaiting_alive: bool,
+    /// `Report::dungeon` of the current playfield (`N3Msg_IsDungeon`).
+    dungeon: bool,
+    /// District music / ambience of the loading playfield (`Bg::Info`), switched in when the world appears.
+    world_audio: Option<(u32, Box<ao_audio::PlayfieldAudio>)>,
     /// State of the current zone connection (`ZoneHandoff` .. disconnect).
     zone: zone::Zone,
     /// Frames drawn since the world appeared; `CharInPlay` is sent after [`flow::IN_PLAY_FRAMES`].
@@ -170,6 +203,8 @@ struct Play {
     loading_name: &'static str,
     /// The in-world interface (`ControlCenterModule_c`), created when the world appears.
     hud: Option<hud::Hud>,
+    /// Zone frames for the HUD (`Hud::wants_zone_frame`) that arrived before it existed (the own perk map comes with the world load).
+    hud_pending: Vec<ao_net::frame::Frame>,
     /// Chat hub (`ChatGUIModule_c`), created at the zone hand-off; the windows open with the world.
     chat: Option<chat::Chat>,
     /// The own character in the world (movement, avatar, camera, controls); `None` outside the world.
@@ -178,6 +213,10 @@ struct Play {
     fight: Option<combat::module::Module>,
     /// Seconds since a successful `N3Msg_StartCamping` (the logout countdown, `hud_use.rs`).
     camp: Option<f32>,
+    /// `/camp` / `/quit` state (`m_eLoggingOutTimed`, `m_nQuitToSystemTime`; logout.rs).
+    logout: logout::Logout,
+    /// NPC dialogue / object use (`interact.rs`), created at the zone hand-off.
+    interact: Option<interact::Interact>,
     /// Account name and password of the login, for the chat-server login only (the original keeps `cPlayerName`/`cPlayerPasswd`).
     login_cred: Option<(String, String)>,
 }
@@ -241,6 +280,9 @@ impl Play {
             fade: Fade::In(0.0),
             world_ready: false,
             teleporting: false,
+            awaiting_alive: false,
+            dungeon: false,
+            world_audio: None,
             zone: zone::Zone::default(),
             world_frames: 0,
             in_world_msg: String::new(),
@@ -259,10 +301,13 @@ impl Play {
             welcome_image: false,
             loading_name: "",
             hud: None,
+            hud_pending: vec![],
             chat: None,
             player: None,
             fight: None,
             camp: None,
+            logout: Default::default(),
+            interact: None,
             login_cred: None,
             text,
             gui,
