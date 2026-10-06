@@ -152,9 +152,22 @@ pub enum ChatCmd {
     /// 0x28 `ID` / 0x29 `I`: buddy list.
     BuddyAdd(u32),
     BuddyRemove(u32),
-    /// 0x33 `I` join / 0x34 `I` leave / 0x35 `I` ... private group (sent by 0x1016c962/97c/996).
+    /// Private chat group (`/invite`, `/kick`, accept an invite, `/leave`): 0x32 `I` invite, 0x33 `I` kick (the player's id),
+    /// 0x34 `I` join (the group = its owner's id) [GUI 0x1016c96e; caller 0x100a6e0c = accepting an invite], 0x35 `I` part
+    /// [GUI 0x1016c988; `/leave <nick>`, declining]. Senders: 0x1016d57d (invite; class 3 of the action switch GUI 0x1008a5e0),
+    /// 0x1016c954 (class 4), 0x1016c988 (class 5); docs/chat/cmd.md.
+    PrivInvite(u32),
+    PrivKick(u32),
     PrivJoin(u32),
     PrivPart(u32),
+    /// 0x78 `sI`: `/cc <args..>` — the argument strings after `/cc` (each `ExpandChatTextArgs`'d) and the window id [GUI 0x1016cadf].
+    Cc { args: Vec<String>, window: u32 },
+    /// 0x6e `IM`: forward data to a character [GUI 0x1016cac2]. `/cc info <name>` sends `{"commane": "ccinfo", "destination": "chatserver"}`
+    /// (GUI 0x1008947b branch type 1; which string is key and which value is inferred from the names).
+    Forward { to: u32, entries: Vec<(String, String)> },
+    /// 0x5dc `S`: looking-for-team ON with the team description [GUI 0x1016cafc]; 0x5dd (no fields): OFF [GUI 0x1016cb22].
+    LftOn(String),
+    LftOff,
     /// 0x40 `GID`: set group flags (mute etc.).
     GroupFlags { group: GroupId, flags: u32 },
     Quit,
@@ -214,14 +227,49 @@ pub fn encode(cmd: &ChatCmd) -> Option<Vec<u8>> {
             w.u32(*id);
             0x29
         }
-        ChatCmd::PrivJoin(id) => {
+        ChatCmd::PrivInvite(id) => {
+            w.u32(*id);
+            0x32
+        }
+        ChatCmd::PrivKick(id) => {
             w.u32(*id);
             0x33
         }
-        ChatCmd::PrivPart(id) => {
+        ChatCmd::PrivJoin(id) => {
             w.u32(*id);
             0x34
         }
+        ChatCmd::PrivPart(id) => {
+            w.u32(*id);
+            0x35
+        }
+        ChatCmd::Cc { args, window } => {
+            // pack code `s` (GUI 0x1017161f): u16 count, then `S` strings
+            w.u16(args.len().min(0xFFFF) as u16);
+            for a in args.iter().take(0xFFFF) {
+                put_s(&mut w, a.as_bytes());
+            }
+            w.u32(*window);
+            0x78
+        }
+        ChatCmd::Forward { to, entries } => {
+            // pack code `M`: u8 count, per entry `u8 (keylen << 4 | len >> 8), u8 len, key, value` (keys <= 16 bytes, values <= 0x1000)
+            w.u32(*to);
+            let ok: Vec<_> = entries.iter().filter(|(k, v)| k.len() <= 0x10 && v.len() <= 0x1000).take(0xFF).collect();
+            w.u8(ok.len() as u8);
+            for (k, v) in ok {
+                w.u8((k.len() << 4) as u8 | (v.len() >> 8) as u8);
+                w.u8(v.len() as u8);
+                w.bytes(k.as_bytes());
+                w.bytes(v.as_bytes());
+            }
+            0x6e
+        }
+        ChatCmd::LftOn(text) => {
+            put_s(&mut w, text.as_bytes());
+            0x5dc
+        }
+        ChatCmd::LftOff => 0x5dd,
         ChatCmd::GroupFlags { group, flags } => {
             put_group(&mut w, *group);
             w.u32(*flags);
@@ -443,6 +491,21 @@ mod tests {
         assert_eq!(b, [0, 0x41, 0, 11, 3, 0, 0, 0, 5, 0, 1, b'a', 0, 1, 0]);
         let b = encode(&ChatCmd::Tell { to: 1, text: "a".into() }).unwrap();
         assert_eq!(b, [0, 0x1e, 0, 10, 0, 0, 0, 1, 0, 1, b'a', 0, 1, 0]);
+    }
+
+    /// Field codes `I`/`s`/`M` (pack function GUI 0x1017161f) and the private-group request ids (GUI 0x1016c8c9..).
+    #[test]
+    fn encodes_private_group_cc_forward_lft() {
+        assert_eq!(encode(&ChatCmd::PrivInvite(5)).unwrap(), [0, 0x32, 0, 4, 0, 0, 0, 5]);
+        assert_eq!(encode(&ChatCmd::PrivKick(5)).unwrap(), [0, 0x33, 0, 4, 0, 0, 0, 5]);
+        assert_eq!(encode(&ChatCmd::PrivJoin(5)).unwrap(), [0, 0x34, 0, 4, 0, 0, 0, 5]);
+        assert_eq!(encode(&ChatCmd::PrivPart(5)).unwrap(), [0, 0x35, 0, 4, 0, 0, 0, 5]);
+        let cc = encode(&ChatCmd::Cc { args: vec!["addbuddy".into(), "Bob".into()], window: 2 }).unwrap();
+        assert_eq!(cc, [0, 0x78, 0, 21, 0, 2, 0, 8, b'a', b'd', b'd', b'b', b'u', b'd', b'd', b'y', 0, 3, b'B', b'o', b'b', 0, 0, 0, 2]);
+        let f = encode(&ChatCmd::Forward { to: 9, entries: vec![("ab".into(), "xyz".into())] }).unwrap();
+        assert_eq!(f, [0, 0x6e, 0, 12, 0, 0, 0, 9, 1, 0x20, 3, b'a', b'b', b'x', b'y', b'z']);
+        assert_eq!(encode(&ChatCmd::LftOn("hi".into())).unwrap(), [0x05, 0xdc, 0, 4, 0, 2, b'h', b'i']);
+        assert_eq!(encode(&ChatCmd::LftOff).unwrap(), [0x05, 0xdd, 0, 0]);
     }
 
     /// Live capture (Ithaca, 2026-10-05): challenge, login, OK, own name, the three MOTD lines as anonymous vicinity messages.
