@@ -16,7 +16,13 @@ use crate::xml;
 
 mod cc;
 mod canvas;
+mod frame;
+mod popup;
+mod select;
 mod tooltip;
+
+pub use frame::{clamp_outer, dragged_rect, hit_item, insert_index};
+pub use popup::MenuItem;
 
 /// `GUIColors.xml` / `GUIConfig_c::GUIConfig_c` 0x1012f342 defaults: Default, Selected, Hover, Text,
 /// TextSelected, TextHover.
@@ -69,6 +75,8 @@ struct Window {
     alpha: f32,
     /// Stacking layer: -1 backmost (window flag 0x200), 0 normal, 1 frontmost (flag 0x100); creation order inside a layer.
     layer: i8,
+    /// Frame interaction set by the application (`gui/frame.rs`).
+    fx: frame::WinFx,
 }
 
 /// Seconds between the presses of a double click on a `CanvasView` (Windows' default `GetDoubleClickTime`; UNRESOLVED: the client's own value).
@@ -113,6 +121,8 @@ pub struct Gui {
     scroll_drag: Option<(ViewId, f32)>,
     /// Window whose frame close button is held down.
     frame_press: Option<WindowId>,
+    /// Frame drag / tab drag / popup menu / text selection state (`gui/{frame,popup,select}.rs`).
+    ix: frame::Ix,
     /// Last mouse press on a `CanvasView` (view, button, time, position) for double-click detection.
     canvas_press: Option<(ViewId, MouseButton, f32, Point)>,
     /// Roots of `add_view` instances.
@@ -179,6 +189,7 @@ impl Gui {
             popup: None,
             scroll_drag: None,
             frame_press: None,
+            ix: Default::default(),
             canvas_press: None,
             items: Default::default(),
             extras: Vec::new(),
@@ -220,7 +231,7 @@ impl Gui {
         let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
         let root = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{name}: cannot build root"))?;
         self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{name}: {w}")));
-        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false, title: None, alpha: 1.0, layer: 0 }));
+        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false, title: None, alpha: 1.0, layer: 0, fx: Default::default() }));
         let id = self.windows.len() - 1;
         self.resize_window(id, size);
         Ok(id)
@@ -770,6 +781,7 @@ impl Gui {
 
     fn push_gfx(&self, out: &mut Vec<DrawCmd>, id: GfxId, dst: Rect, tint: [u8; 3], alpha: f32) {
         let (w, h) = self.gfx.size(id);
+        self.sel_autoscroll(dt);
         if w == 0 || dst.r < dst.l || dst.b < dst.t {
             return;
         }
@@ -782,6 +794,8 @@ impl Gui {
             let (w, h) = self.gfx.size(g);
             (w as f32, h as f32)
         });
+        self.draw_tab_ghost(&mut out.cmds);
+        self.draw_menu(&mut out.cmds);
         let [tl, tr, bl, br, left, top, right, bottom, bg] = *gfx;
         let (stl, str_, sbl, sbr) = (sz(tl), sz(tr), sz(bl), sz(br));
         // corner dst rects (inclusive); a missing corner is the degenerate Rect(l,t,l-1,t-1)
@@ -1047,6 +1061,12 @@ impl Gui {
                     let c = if run.link { mul(tint, rgb(0x2299ff)) } else { c };
                     let c = if is_shadow { [0; 3] } else { c };
                     pen += self.draw_string(out, t.font, &run.text, pen + dx, y + dy, c, alpha, pw);
+        // selection of a read-only text (`_RenderString`: `Clear(rect, 0xc0c0c0)` behind the glyphs)
+        if !editable {
+            for q in self.sel_rects(id, &layout, r.l, r.t, fill_dy, r.width() as i32 + 1, t.font) {
+                out.push(DrawCmd::Solid { dst: q, color: [0xc0; 3], alpha });
+            }
+        }
                 }
             }
         }
@@ -1137,7 +1157,7 @@ impl Gui {
         let i = self.frame_gfx(["GFX_GUI_TAB_BORDER_TL", "GFX_GUI_TAB_BORDER_TR", "GFX_GUI_TAB_BORDER_BL", "GFX_GUI_TAB_BORDER_BR", "GFX_GUI_TAB_BORDER_LEFT", "GFX_GUI_TAB_BORDER_TOP", "GFX_GUI_TAB_BORDER_RIGHT", "GFX_GUI_TAB_BORDER_BOTTOM", "GFX_GUI_TAB_BACKGROUND"]);
         let col = self.map_color(0x1000000);
         if let Some(title) = title {
-            self.draw_tab_strip(&i, outer, title, col, out);
+            self.draw_tab_strip(&i, outer, root, title, col, out);
         } else {
             // DoSetFrame 0x10159888: inner border view = client frame grown by 1 on every side
             let client = Rect::new(pos.0 as f32 - 1.0, pos.1 as f32 - 1.0, pos.0 as f32 + f.width() + 1.0, pos.1 as f32 + f.height() + 1.0);
@@ -1160,22 +1180,31 @@ impl Gui {
     /// the 18 px strip; the selected tab (`GFX_GUI_TAB_ACTIVE_LEFT/MIDDLE/RIGHT`, 17 rows, layer-2 alpha, `Tab::SetSelected` 0x10146110 text colour 0xffffff,
     /// font NORMAL) sits 20 px from the left edge with the title 5 px inside; its width is the title width + 1 + 5 + 16 (`FUN_101461dc`).
     /// UNRESOLVED: the title's vertical offset inside the tab (drawn at the tab top like any `TextView`) and +-1 px of the strip height.
-    fn draw_tab_strip(&mut self, box_gfx: &[Option<GfxId>; 9], outer: Rect, title: &str, col: [u8; 3], out: &mut Vec<DrawCmd>) {
+    fn draw_tab_strip(&mut self, box_gfx: &[Option<GfxId>; 9], outer: Rect, root: ViewId, title: &str, col: [u8; 3], out: &mut Vec<DrawCmd>) {
         let tv = outer.resize(3.0, 7.0, -3.0, -3.0);
         let top = Rect::new(tv.l, tv.t + TAB_BOX_TOP, tv.r, tv.b);
         self.draw_border(out, box_gfx, top, col, BUTTON_ALPHA);
-        let text_w: i32 = title.chars().map(|c| self.fonts.font(FontId::Normal).advance(c)).sum();
-        let w = text_w as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
-        let l = tv.l + TAB_LEFT_MARGIN;
-        let tab = Rect::new(l, tv.t, l + w - 1.0, tv.t + TAB_H - 1.0);
-        let tab_gfx = ["GFX_GUI_TAB_ACTIVE_LEFT", "GFX_GUI_TAB_ACTIVE_MIDDLE", "GFX_GUI_TAB_ACTIVE_RIGHT"].map(|n| self.gfx.id(n));
-        if let [Some(gl), Some(gm), Some(gr)] = tab_gfx {
-            let (wl, wr) = (self.gfx.size(gl).0 as f32, self.gfx.size(gr).0 as f32);
-            self.push_gfx(out, gm, Rect::new(tab.l + wl, tab.t, tab.r - wr, tab.b), col, BUTTON_ALPHA);
-            self.push_gfx(out, gl, Rect::new(tab.l, tab.t, tab.l + wl - 1.0, tab.b), col, BUTTON_ALPHA);
-            self.push_gfx(out, gr, Rect::new(tab.r - wr + 1.0, tab.t, tab.r, tab.b), col, BUTTON_ALPHA);
+        // several tabs (`Window::InsertTab`, `set_window_tabs`): side by side, the selected one with the active art
+        let (tabs, sel) = match self.windows.iter().flatten().find(|w| w.root == root) {
+            Some(w) if !w.fx.tabs.is_empty() => (w.fx.tabs.clone(), w.fx.sel),
+            _ => (vec![title.to_string()], 0),
+        };
+        let mut l = tv.l + TAB_LEFT_MARGIN;
+        let mut drawn = vec![];
+        for (i, t) in tabs.iter().enumerate() {
+            let text_w: i32 = t.chars().map(|c| self.fonts.font(FontId::Normal).advance(c)).sum();
+            let w = text_w as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
+            let tab = Rect::new(l, tv.t, l + w - 1.0, tv.t + TAB_H - 1.0);
+            l += w;
+            if i == sel {
+                drawn.push((t, tab));
+            } else {
+                self.draw_tab(out, tab, t, false, col, 1.0);
+            }
         }
-        self.draw_string(out, FontId::Normal, title, (tab.l + TAB_PAD_L) as i32, tab.t as i32, [255; 3], 1.0, false);
+        for (t, tab) in drawn {
+            self.draw_tab(out, tab, t, true, col, 1.0);
+        }
     }
 
     fn draw_popup(&mut self, out: &mut Vec<DrawCmd>) {
@@ -1282,7 +1311,11 @@ impl Gui {
                 self.mouse = Point::new(x, y);
                 self.update_hover();
                 self.tip_update(true);
-                self.mouse_down(x, y);
+                if self.ix.menu.is_some() {
+                    self.menu_mouse_down(x, y);
+                } else {
+                    self.mouse_down(x, y);
+                }
             }
             InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
                 self.mouse = Point::new(x, y);
@@ -1294,6 +1327,9 @@ impl Gui {
                 self.update_hover();
                 self.tip_update(true);
                 self.canvas_right_down(x, y);
+                self.frame_mouse_move(x, y);
+                self.sel_drag(x, y);
+                self.menu_mouse_move(x, y);
             }
             InputEvent::Wheel { x, y, dy } => self.wheel(x, y, dy),
             InputEvent::Key { key, pressed: true, mods } => self.key_down(key, mods),
@@ -1305,6 +1341,8 @@ impl Gui {
     }
 
     fn windows_top_down(&self) -> Vec<(WindowId, ViewId, (i32, i32))> {
+                self.frame_mouse_up();
+                self.sel_end();
         let mut v: Vec<(i8, WindowId, ViewId, (i32, i32))> = self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (w.layer, i, w.root, w.pos))).collect();
         v.sort_by_key(|k| (k.0, k.1));
         v.into_iter().rev().map(|(_, i, r, p)| (i, r, p)).collect()
@@ -1312,6 +1350,11 @@ impl Gui {
 
     /// Topmost interactive view under the mouse, with its window.
     fn hit(&self, x: f32, y: f32) -> Option<(WindowId, ViewId)> {
+                if self.ix.menu.is_some() {
+                    self.menu_mouse_down(x, y);
+                } else {
+                    self.frame_right_down(x, y);
+                }
         for (wid, root, pos) in self.windows_top_down() {
             let (lx, ly) = (x - pos.0 as f32, y - pos.1 as f32);
             if let Some(v) = self.hit_view(root, lx, ly, true, 0.0, 0.0, None) {
@@ -1423,6 +1466,8 @@ impl Gui {
                         t.anchor = None;
                     }
                 }
+        // `BeginSelection` of any renderer clears the others; a press elsewhere ends the selection (**GUESS**: `SlotGlobalMouseDown` 0x1016083d only drops focus)
+        self.ix.sel = None;
                 let name = self.tree.views[p.combo].name.clone();
                 self.events.push(Event::ComboChanged { window: p.window, view: name, index: i, text });
             }
@@ -1459,6 +1504,9 @@ impl Gui {
             Kind::Text(t) if t.tvf & tvf::ACCEPT_TXT_INPUT != 0 => {
                 // click inside a ComboBox editor opens the popup (ComboBox_c::MouseDown 0x10001ec0)
                 let combo = self.combo_of(v);
+        if self.frame_mouse_down(x, y) {
+            return;
+        }
                 self.focus = Some(v);
                 self.caret_epoch = self.time;
                 let idx = self.char_at(v, x);
@@ -1495,6 +1543,9 @@ impl Gui {
             cur = p;
         }
         None
+                } else if t.tvf & tvf::ALLOW_TEXT_SELECTION != 0 && t.tvf & tvf::ACCEPT_MOUSE_INPUT != 0 {
+                    // `TextRenderer_c::MouseDown` 0x101637ef: left press on text = `BeginSelection` + mouse capture
+                    self.sel_begin(v, x, y);
     }
 
     fn set_combo_arrow(&mut self, combo: ViewId, open: bool) {
@@ -1730,6 +1781,13 @@ impl Gui {
                 let next = match cur {
                     Some(i) => {
                         if mods.shift {
+        if key == Key::Escape && self.ix.menu.take().is_some() {
+            return;
+        }
+        // Ctrl+C with a selection in a read-only text (`CopyActiveSelectionToClipboard` 0x10160f84)
+        if mods.ctrl && key == Key::Letter('c') && self.ix.sel.is_some() && self.sel_copy() {
+            return;
+        }
                             (i + n - 1) % n
                         } else {
                             (i + 1) % n

@@ -70,6 +70,8 @@ pub struct TextLine {
     pub width: i32,
     pub align: Align,
     pub runs: Vec<TextRun>,
+    /// The line ends at a real line break (`<br>` / `\n`), not at a word wrap (text selection copies a `\n` only here).
+    pub hard_break: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -280,10 +282,10 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
     let mut cur_w = 0;
     let mut cur_align = Align::Left;
     let mut y = 0;
-    let flush = |layout: &mut TextLayout, runs: &mut Vec<TextRun>, w: &mut i32, align: Align, y: &mut i32| {
+    let flush = |layout: &mut TextLayout, runs: &mut Vec<TextRun>, w: &mut i32, align: Align, y: &mut i32, hard: bool| {
         // trailing space of the last word does not count towards the line width (`GetStringSize`-style trim)
         layout.max_width = layout.max_width.max(*w);
-        layout.lines.push(TextLine { y: *y, width: *w, align, runs: std::mem::take(runs) });
+        layout.lines.push(TextLine { y: *y, width: *w, align, runs: std::mem::take(runs), hard_break: hard });
         *y += line_h;
         *w = 0;
     };
@@ -292,7 +294,7 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
         if let Some(l) = limit {
             let trimmed = wd.w - if wd.text.ends_with(' ') { fonts.font(font).advance(' ') } else { 0 };
             if cur_w > 0 && cur_w + trimmed > l {
-                flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y);
+                flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y, false);
             }
         }
         cur_align = wd.align;
@@ -304,11 +306,11 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
             }
         }
         if wd.hard_break_after && n < nwords {
-            flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y);
+            flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y, true);
         }
     }
     if !cur_runs.is_empty() || layout.lines.is_empty() {
-        flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y);
+        flush(&mut layout, &mut cur_runs, &mut cur_w, cur_align, &mut y, false);
     }
     layout.height = y;
     // a trailing break leaves an empty last line only when text is non-empty; empty text keeps one line

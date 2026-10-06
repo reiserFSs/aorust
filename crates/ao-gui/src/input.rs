@@ -79,4 +79,18 @@ pub enum Event {
     CanvasClick { window: WindowId, view: String, x: f32, y: f32 },
     /// Mouse wheel over a `CanvasView` (`dy` notches, positive = up; `x`,`y` relative to the view).
     CanvasWheel { window: WindowId, view: String, dy: f32, x: f32, y: f32 },
+    /// The left button went down on the icon button of a style-0 frame that is movable (`WndBorder::SlotIconButton` 0x1015a74e opens the window's
+    /// icon menu; `x`,`y` = the button's bottom-left, where the menu goes).
+    FrameIcon { window: WindowId, x: i32, y: i32 },
+    /// A tab of a style-0 frame was pressed (`TabView` selection): the engine already switched `Gui::window_tabs`'s selected index.
+    TabSelected { window: WindowId, index: usize },
+    /// A tab dragged beyond 4 px (**GUESS** threshold) was released: `target` = the tab strip of a (possibly the same) window under the pointer with the
+    /// insert index, else `None` (dropped outside every strip; `FUN_10097d0b` tears the tab out into a new window).
+    TabDropped { window: WindowId, tab: usize, x: i32, y: i32, target: Option<(WindowId, usize)> },
+    /// The user moved or resized a style-0 frame (`WndBorder::MouseMove` 0x10159c27 -> `DoSetFrame` 0x10159888); read it with `Gui::window_outer_frame`.
+    WindowFrame { window: WindowId },
+    /// Right button went down in a window marked with `Gui::set_window_context` (`ChatView_c::MouseDown` 0x1008f5dd button 2); `link` = the `<a href>` under the pointer.
+    ContextMenu { window: WindowId, x: i32, y: i32, link: Option<String> },
+    /// An entry of the popup menu opened with `Gui::open_menu` was chosen.
+    MenuPicked { id: u32 },
 }
