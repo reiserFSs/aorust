@@ -453,8 +453,9 @@ impl Chat {
                     self.focus_text(gui, &format!("/tell {to} "));
                 } else {
                     self.net.tell(&to, &text);
-                    // [GUESS] outgoing tell echo format ("To [name]: text"); the original prints it through the tell window (FUN_10084f9e)
-                    self.line(gui, ChatLine::new(ChatKind::TellOut, format!("To {to}: {text}")));
+                    // outgoing tell echo: text-db template "To [%s]: " (cat 10001 key ChatTellMsgToField, text.mdb line 6574) + text
+                    let head = texts.by_key(10001, "ChatTellMsgToField").unwrap_or_else(|| "To [%s]: ".into()).replacen("%s", &to, 1);
+                    self.line(gui, ChatLine::new(ChatKind::TellOut, format!("{head}{text}")));
                 }
             }
             ChatAction::Vicinity(t) => self.speak(zone, texts, zone::Speech::Say, &t),
