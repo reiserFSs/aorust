@@ -8,6 +8,7 @@ mod log;
 mod net;
 pub(super) mod win;
 mod zone;
+mod zonecmd;
 
 use super::zone::Zone;
 use ao_formats::screens::TextDb;
@@ -51,6 +52,9 @@ pub(super) struct Chat {
     game: Vec<GameAction>,
     /// Text event to drop: the character of the key that opened the input bar.
     swallow: Option<String>,
+    /// `s_nCommandRefCntr` of the social commands sent.
+    social_counter: i32,
+    own_id: u32,
 }
 
 enum Back {
@@ -69,7 +73,7 @@ impl Chat {
     pub fn new() -> Self {
         let mut net = net::ChatNet::default();
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
-        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None }
+        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0 }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
@@ -153,6 +157,7 @@ impl Chat {
 
     /// One zone frame: 0x43 (chat server list) connects; N3 chat messages become lines.
     pub fn on_zone_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &Zone, texts: &TextDb) {
+        self.own_id = zone.char_id;
         match f.ptype {
             PT_SYSTEM => self.net.on_system_frame(f, zone.char_id),
             PT_N3 => {
@@ -221,6 +226,7 @@ impl Chat {
                     let t = log::ldb_format(&texts.by_id(20000, text_id).unwrap_or_default(), &a);
                     self.line(gui, ChatLine::new(ChatKind::System, t));
                 }
+                Out::NameOp { op, id, name } => self.name_op(gui, op, id, &name, texts),
                 Out::GroupAdd { group, name, .. } => self.group(group, name),
                 Out::GroupRemove { group, .. } => self.ungroup(group),
             }
@@ -244,7 +250,7 @@ impl Chat {
         if gui.focused_view().is_some() || self.win.is_none() {
             return false;
         }
-        let mut open = |this: &mut Self, gui: &mut Gui, prefill: Option<String>, swallow: &str| {
+        let open = |this: &mut Self, gui: &mut Gui, prefill: Option<String>, swallow: &str| {
             match prefill {
                 Some(p) => this.focus_text(gui, &p),
                 None => {
@@ -345,6 +351,75 @@ impl Chat {
         }
     }
 
+    /// Actions that leave the chat module (`zonecmd`): game commands, socials, `/played`, `/help`, chat-server requests.
+    fn zone_action(&mut self, gui: &mut Gui, a: &ChatAction, zone: &Zone, texts: &TextDb) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        let ignored: Vec<(u32, String)> = self.ignored.iter().map(|&i| (i, self.net.name_of(i).unwrap_or_default().to_owned())).collect();
+        let secs = (zone.day_time() * 15.0) as u32;
+        let ctx = zonecmd::ZoneCmdCtx {
+            texts,
+            char_id: zone.char_id,
+            window: 0,
+            target: Self::target_identity(zone),
+            target_is_tower: false,
+            gm: false,
+            in_team: false,
+            team_leader: false,
+            stat_id: &|n| ao_formats::stats::id_of(n).map(|i| i as i32),
+            anim_by_name: &|_| None,
+            move_mode: 0,
+            vehicle_equipped: false,
+            social_counter: self.social_counter,
+            ignored: &ignored,
+            now_unix: now,
+            tz_offset_min: zonecmd::local_offset_minutes(now),
+            game_time: (secs / 3600, secs / 60 % 60),
+        };
+        let out = zonecmd::perform(a, &ctx);
+        self.outbox.extend(out.frames);
+        for l in out.lines {
+            self.line(gui, l);
+        }
+        for r in out.chat {
+            match r {
+                zonecmd::ChatReq::Send(c) => self.net.send(c),
+                zonecmd::ChatReq::ByName { name, op } => self.net.lookup_op(&name, op),
+            }
+        }
+        if let Some(f) = out.help_file {
+            // the help pages open in the InfoView (not ported): say where the page is
+            self.line(gui, ChatLine::new(ChatKind::CmdFeedback, format!("Help: text/help/{f}")));
+        }
+        if out.social_sent {
+            self.social_counter += 1;
+        }
+        for u in out.unsupported {
+            eprintln!("chat: text command not implemented: {u}");
+        }
+        for l in out.local {
+            eprintln!("chat: local effect not implemented: {l:?}");
+        }
+    }
+
+    fn name_op(&mut self, gui: &mut Gui, op: zonecmd::NameOp, id: u32, name: &str, texts: &TextDb) {
+        let own = self.own_id;
+        if id == u32::MAX {
+            self.line(gui, ChatLine::new(ChatKind::Error, format!("Unknown user {name}"))); // [GUESS] text
+            return;
+        }
+        for r in zonecmd::resolve(op, id, own, texts) {
+            match r {
+                zonecmd::Resolved::Chat(c) => self.net.send(c),
+                zonecmd::Resolved::Line(l) => self.line(gui, l),
+                zonecmd::Resolved::IgnoreToggle(i) => {
+                    if !self.ignored.remove(&i) {
+                        self.ignored.insert(i);
+                    }
+                }
+            }
+        }
+    }
+
     fn focus_text(&mut self, gui: &mut Gui, t: &str) {
         if let Some(w) = &mut self.win {
             w.focus_input_text(gui, t);
@@ -403,6 +478,7 @@ impl Chat {
             }
             ChatAction::Social(id) => self.game.push(GameAction::Social(id)),
             ChatAction::ClientCommand(c) if c.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/assist")) => self.game.push(GameAction::Assist),
+            a if zonecmd::handles(&a) => self.zone_action(gui, &a, zone, texts),
             other => eprintln!("chat: action not implemented: {other:?}"),
         }
     }

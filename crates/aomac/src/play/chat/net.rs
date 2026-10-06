@@ -3,6 +3,7 @@
 //! Protocol and evidence: docs/chat/net.md.
 
 use super::line::{ChatKind, ChatLine, ChatMsg};
+use super::zonecmd::NameOp;
 use ao_net::chat::{self, ChatCmd, ChatEvent, ChatSession, GroupId};
 use ao_net::frame::{Frame, PT_SYSTEM};
 use std::collections::{BTreeMap, HashMap};
@@ -16,6 +17,8 @@ pub enum Out {
     GroupAdd { group: u64, name: String, flags: u32 },
     /// S2C_SYS_MESSAGE_LOCAL_FMT: text id of category 20000 with its arguments (formatted by the hub with the text db).
     SystemFmt { sender: u32, kind: u32, text_id: u32, args: Vec<ao_net::chat::FmtArg> },
+    /// A name lookup requested with [`ChatNet::lookup_op`] finished (`id == u32::MAX`: unknown name).
+    NameOp { op: NameOp, id: u32, name: String },
     /// S2C_GROUP_PART (`RemoveGroup` 0x1008603d).
     GroupRemove { group: u64, name: String },
 }
@@ -49,6 +52,8 @@ pub struct ChatNet {
     pub groups: BTreeMap<u64, String>,
     /// Tells waiting for their name lookup (lower-case name -> texts).
     pending: Vec<(String, String)>,
+    /// Lookups waiting for a [`NameOp`] (lower-case name).
+    ops: Vec<(String, NameOp)>,
     tap: Option<std::path::PathBuf>,
 }
 
@@ -150,6 +155,10 @@ impl ChatNet {
                     self.learn(id, name.clone());
                 }
                 self.finish_tells(&name, id, out);
+                let key = name.to_lowercase();
+                let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ops).into_iter().partition(|(n, _)| *n == key);
+                self.ops = rest;
+                out.extend(mine.into_iter().map(|(_, op)| Out::NameOp { op, id, name: name.clone() }));
             }
             ChatEvent::Tell { from, text, data } => out.push(Out::Msg(ChatMsg {
                 from_id: from,
@@ -226,6 +235,21 @@ impl ChatNet {
                 self.pending.push((name.to_lowercase(), text.to_owned()));
                 s.send(ChatCmd::Lookup(name.to_owned()));
             }
+        }
+    }
+
+    /// A raw chat-server request (needs the login to have finished).
+    pub fn send(&self, c: ChatCmd) {
+        if let (Some(s), true) = (&self.session, self.logged_in) {
+            s.send(c);
+        }
+    }
+
+    /// Look a name up (0x15), then report [`Out::NameOp`].
+    pub fn lookup_op(&mut self, name: &str, op: NameOp) {
+        if let Some(s) = &self.session {
+            self.ops.push((name.to_lowercase(), op));
+            s.send(ChatCmd::Lookup(name.to_owned()));
         }
     }
 
