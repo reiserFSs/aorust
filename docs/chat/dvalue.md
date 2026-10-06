@@ -27,7 +27,7 @@ client's `prefs/` (the install is read-only). `SaveUserConfig` 0x10067f57 saves 
 * Load order (`LoadMainConfig`): defaults `cd_image/gui/Default/Variables.xml` (cat 0), `MainPrefs.xml` (1), `LoginPrefs.xml` (2), `CharPrefs.xml` (3) with
   `LoadConfig(path, cat, true)` = `AddVariable` (overwrite, with `min=` / `max=` / `keep_default=`), then the user files with `LoadConfig(path, cat, false)`:
   `<Value>` → `SetDValue` (variables that do not exist are ignored); `<Archive>` → the user's `Message` gets every field of the default archive it lacks,
-  then `SetDValue` (`KeyBindings` is exempt from the merge). `LoadConfig` 0x10003172.
+  then `SetDValue` (`KeyBindings` is exempt from the merge; edited by the options window's "Key bindings" page, docs/gui.md "Hot key pages"). `LoadConfig` 0x10003172.
 * `SaveConfig(path, cat)` 0x10003805: root `<Root>`; for each variable of the category with the persistent flag: `<Value name= value=/>` (`Variant::SaveToString`)
   or `<Archive name=…>` (`Message::DumpToXML`); written by TinyXML (shipped file: `<Value name="…" value="…" />`, quote char `'` when the value contains `"`).
 * `SetDValue(name, v)` 0x25a7: unknown name → nothing; below min → min, else above max → max; stored only when the value or its type differs, then the
@@ -55,7 +55,7 @@ client's `prefs/` (the install is read-only). `SaveUserConfig` 0x10067f57 saves 
 * Defaults: `SetDefaultLoginPrefs` `[GUI 0x10124b33]` (operands read from the PUSH sequence, floats from 0x101a959c…): `WasCharacterCreated 1 (0..1)`, `CCSelectedBreed 0 (0..7)`, `CCSelectedHeight/Size 0 (0..3)`,
   `CCSelectedHead 0 (0..300)`, `CCSelectedProfession 0 (0..14)`, string `CCSelectedName ""`, `PreferredCamPosX/Y/Z 0 / 0.316 / −0.948 (±200)`, `PreferredCamDist 5 (0..347)`, `PreferredCameraMode 3 (0..3)`,
   `UseNoBobCamera 0`, `AspectRation 1.3333 (0..999999)`, `IsChatHidden 0`, 24 more 0/1 switches (all 1 except `MouseLookInverted` 0), `FogMode 3 (0..3)`, `GroundRendering 3 (0..3)`,
-  **`ViewDistance 0.8 (0..1)`**; then one `InitDefaultInt(key, default, 0, 999999999)` per `InputConfig_t` key binding (not ported). `SetDefaultCharPrefs` `[GUI 0x1012447a]`: `IsFirstTime 1`,
+  **`ViewDistance 0.8 (0..1)`**; then one `InitDefaultInt(key, default, 0, 999999999)` per `InputConfig_t` hot key that has a `KEY_` id (28, `options/keys.rs` `FIXED`; ported, `Login.cfg` ints `KEY_NAME <key|mods>`, applied by `LoadKeyboard` 0x1012488b; docs/gui.md "Hot key pages"). `SetDefaultCharPrefs` `[GUI 0x1012447a]`: `IsFirstTime 1`,
   `ShowDropItemDialog 1`, `IsOrgNameShownOverHead 1`, `IsSpaceShipsShown 1`, `BuildMenuX/Y 0 (0..9999)`, `BuildMenuCX/CY 0 (0..1000)`, `IsFactionTitleShown 1`, `WaitForVertSync 0`, `MouseLagFix 0`,
   `UseOffscreenSurfaceTechnology 0`, `FadeCharacter 1`, floats `FadeCharacterStartDist 1.5 (0.1..10)`, `FadeCharacterEndDist 0.7 (0.1..10)`, `FadeCharacterEndAlpha 0.15 (0..1)`.
 

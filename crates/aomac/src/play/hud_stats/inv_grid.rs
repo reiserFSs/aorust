@@ -77,6 +77,16 @@ impl PositionMap {
             }
         }
     }
+
+    /// The grid got `cols` columns: the items keep their reading order (row, column) and refill the rows (the original's `MultiListView_c` re-lays its items on a
+    /// column count change; the exact rule is UNRESOLVED).
+    pub fn reflow(&mut self, cols: usize) {
+        let mut items: Vec<_> = self.cells.iter().map(|(s, (c, r))| (*r, *c, *s)).collect();
+        items.sort_unstable();
+        for (i, (_, _, s)) in items.into_iter().enumerate() {
+            self.cells.insert(s, (i % cols.max(1), i / cols.max(1)));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,5 +125,15 @@ mod tests {
         assert_eq!((m.get(0x43), m.at((2, 0))), (Some((1, 2)), None));
         m.move_cell((0, 0), (1, 2));
         assert_eq!((m.get(0x40), m.get(0x43)), (Some((1, 2)), Some((0, 0))));
+    }
+
+    #[test]
+    fn reflow_keeps_reading_order() {
+        let mut m = PositionMap::default();
+        m.sync(&[0x40, 0x41, 0x43, 0x44], 3, &mut None);
+        m.reflow(2);
+        assert_eq!((m.get(0x40), m.get(0x41), m.get(0x43), m.get(0x44)), (Some((0, 0)), Some((1, 0)), Some((0, 1)), Some((1, 1))));
+        m.reflow(5);
+        assert_eq!((m.get(0x43), m.get(0x44)), (Some((2, 0)), Some((3, 0))));
     }
 }

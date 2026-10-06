@@ -25,6 +25,7 @@ mod hud_dialog;
 mod hud_faction;
 mod hud_perks;
 mod hud_team;
+mod hud_wincfg;
 mod hud_winb;
 mod hud_cursor;
 mod hud_pick;

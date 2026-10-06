@@ -72,6 +72,12 @@ pub const MIN_PIVOT_HEIGHT: f32 = 0.3;
 /// the old value (`_DAT_1003d9c4`) and takes 0.2 (`_DAT_1003ce50`); first person takes 0.999 and keeps 0.0001.
 const HEAD_BLEND_3RD: f32 = 0.2;
 const HEAD_BLEND_1ST: f32 = 0.999;
+/// `UseNoBobCamera` branch of `FUN_10020bdb`: the target only moves once it is `_DAT_1003e2b4` (0.01 m) off the head attractor; it starts following
+/// beyond `_DAT_1003e2b0` (0.25 m) and then keeps following (`DAT_1005c87c` latched) until it is within 0.01 m again, each frame
+/// `0.99 * old + 0.01 * new` (`_DAT_1003e2ac`, `_DAT_1003d618`).
+const NO_BOB_MIN: f32 = 0.01;
+const NO_BOB_START: f32 = 0.25;
+const NO_BOB_KEEP: f32 = 0.99;
 
 /// `Vehicle_t` steering of the camera dynel (Vehicle.dll `SteeringArrive` @0x1000ab28, integrator `FUN_1000e3d3`). Mass,
 /// top speed and brake distance are `FUN_1001faa1` / `UpdateMotionConstraints` @N3 0x1001e602 for an avatar that runs
@@ -337,6 +343,8 @@ pub struct Camera3p {
     pivot: Vec3,
     /// Seconds the camera has been blind (`n3Camera_t +0x178`).
     blind_time: f32,
+    /// `DAT_1005c87c` of `FUN_10020bdb`: the no-bob camera is following the head.
+    no_bob_following: bool,
 }
 
 impl Camera3p {
@@ -368,6 +376,7 @@ impl Camera3p {
             prev_view: false,
             pivot: Vec3::ZERO,
             blind_time: 0.0,
+            no_bob_following: false,
         }
     }
 
@@ -560,6 +569,17 @@ impl Camera3p {
 
     /// `FUN_10020bdb`: the look target height follows the animated head attractor, blended per frame (60 Hz equivalent).
     fn follow_head(&mut self, dt: f32) {
+        if self.prefs.no_bob_camera {
+            let d = (self.head - self.pivot_height).abs();
+            if d < NO_BOB_MIN {
+                self.no_bob_following = false;
+            } else if self.no_bob_following || d > NO_BOB_START {
+                self.no_bob_following = true;
+                let a = 1.0 - NO_BOB_KEEP.powf(dt * 60.0);
+                self.pivot_height = (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
+            }
+            return;
+        }
         let keep = if self.first_person { 1.0 - HEAD_BLEND_1ST } else { 1.0 - HEAD_BLEND_3RD };
         let a = 1.0 - keep.powf(dt * 60.0);
         self.pivot_height = (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
@@ -849,6 +869,31 @@ mod tests {
         // never below 0.3 m
         c.set_head(0.0);
         assert!(near(c.head, MIN_PIVOT_HEIGHT));
+    }
+
+    /// `UseNoBobCamera` (`FUN_10020bdb`): head bobbing under 0.25 m is ignored, a bigger move is followed 1 % per frame until within 0.01 m.
+    #[test]
+    fn no_bob_camera_ignores_small_head_motion() {
+        let mut c = Camera3p::new(&ControlPrefs { no_bob_camera: true, ..Default::default() }, 1.5);
+        for i in 0..120 {
+            c.set_head(1.5 + if i % 2 == 0 { 0.015 } else { -0.015 });
+            c.update([0.0; 3], 0.0, 1.0 / 60.0);
+        }
+        assert!(near(c.pivot_height, 1.5), "bobbing ignored: {}", c.pivot_height);
+        // a crouch of 0.5 m: starts following (0.99 * old + 0.01 * new per frame) ...
+        c.set_head(1.0);
+        c.update([0.0; 3], 0.0, 1.0 / 60.0);
+        assert!(near(c.pivot_height, 1.5 - 0.005), "{}", c.pivot_height);
+        // ... and keeps following until it is within 0.01 m
+        for _ in 0..1000 {
+            c.update([0.0; 3], 0.0, 1.0 / 60.0);
+        }
+        assert!((c.pivot_height - 1.0).abs() < 0.0101 && !c.no_bob_following, "{}", c.pivot_height);
+        // the default camera follows at once
+        let mut d = cam();
+        d.set_head(1.515);
+        d.update([0.0; 3], 0.0, 1.0 / 60.0);
+        assert!(d.pivot_height > 1.5 && !near(d.pivot_height, 1.5));
     }
 
     #[test]

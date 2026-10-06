@@ -208,6 +208,7 @@ impl TagLayer {
                 parts: vec![],
                 skin: None,
                 always: false,
+                alpha: 1.0,
             });
         }
     }

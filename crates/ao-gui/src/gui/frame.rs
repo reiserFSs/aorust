@@ -16,9 +16,16 @@ const TAB_DRAG_START: f32 = 4.0;
 const MOVE_ZONE_BOTTOM: f32 = 18.0;
 /// Style-0 `WndBorder` border (3, 7, 3, 3) (`UpdateBorderSizes` 0x10159f98).
 const BORDER: (f32, f32, f32, f32) = (3.0, 7.0, 3.0, 3.0);
-/// Unselected tabs: `Tab::SetSelected` 0x10146110 draws the inactive art at alpha × `_DAT_101c4978` (= 2.0, a multiplier we cannot apply to 0.85:
-/// **GUESS**: the inactive art is drawn at half the layer alpha).
-pub(super) const INACTIVE_TAB_ALPHA: f32 = BUTTON_ALPHA * 0.5;
+/// Unselected tabs: `Tab::SetSelected` 0x10146110 sets the view alpha to layer-2 alpha × `_DAT_101c4978` (= 2.0) = 1.7. Nothing clamps it there:
+/// `View::_CallRender` 0x1014d2e3 passes `view alpha * parent alpha` (the tab text child inherits it) down the tree and only
+/// `ViewArea_c::_Render` 0x1015291a clamps the final vertex alpha to 0..255. So the tab is `min(1.7 * window fade, 1)`: opaque while the window is
+/// fully lit, 0.51 at the inactive-window alpha 0.3.
+pub(super) const INACTIVE_TAB_ALPHA: f32 = BUTTON_ALPHA * 2.0;
+
+/// Effective alpha of a tab (art and title) under an inherited window alpha `fade`.
+fn tab_alpha(selected: bool, fade: f32) -> f32 {
+    ((if selected { BUTTON_ALPHA } else { INACTIVE_TAB_ALPHA }) * fade).min(1.0)
+}
 
 /// Per-window frame state set by the application.
 #[derive(Clone, Default)]
@@ -241,6 +248,16 @@ impl Gui {
         matches!(self.windows.get(w), Some(Some(win)) if win.framed && win.title.is_some())
     }
 
+    /// Ids of the open windows (a module that opens its own window is found by diffing this around the call).
+    pub fn window_ids(&self) -> Vec<WindowId> {
+        self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().map(|_| i)).collect()
+    }
+
+    /// True for a style-0 frame with a tab strip (`open_tabbed_window*`).
+    pub fn window_tabbed(&self, w: WindowId) -> bool {
+        self.is_tabbed(w)
+    }
+
     /// Left press on the frame of a tabbed window. True = consumed.
     pub(super) fn frame_mouse_down(&mut self, x: f32, y: f32) -> bool {
         let p = Point::new(x, y);
@@ -374,12 +391,12 @@ impl Gui {
 
     /// One tab: 3-slice art (active / inactive) and the title (`Tab::SetSelected` 0x10146110: selected text white, unselected colour 0).
     pub(super) fn draw_tab(&mut self, out: &mut Vec<DrawCmd>, tab: Rect, title: &str, selected: bool, col: [u8; 3], fade: f32) {
-        let (names, alpha) = if selected {
-            (["GFX_GUI_TAB_ACTIVE_LEFT", "GFX_GUI_TAB_ACTIVE_MIDDLE", "GFX_GUI_TAB_ACTIVE_RIGHT"], BUTTON_ALPHA)
+        let names = if selected {
+            ["GFX_GUI_TAB_ACTIVE_LEFT", "GFX_GUI_TAB_ACTIVE_MIDDLE", "GFX_GUI_TAB_ACTIVE_RIGHT"]
         } else {
-            (["GFX_GUI_TAB_INACTIVE_LEFT", "GFX_GUI_TAB_INACTIVE_MIDDLE", "GFX_GUI_TAB_INACTIVE_RIGHT"], INACTIVE_TAB_ALPHA)
+            ["GFX_GUI_TAB_INACTIVE_LEFT", "GFX_GUI_TAB_INACTIVE_MIDDLE", "GFX_GUI_TAB_INACTIVE_RIGHT"]
         };
-        let alpha = alpha * fade;
+        let alpha = tab_alpha(selected, fade);
         if let [Some(gl), Some(gm), Some(gr)] = names.map(|n| self.gfx.id(n)) {
             let (wl, wr) = (self.gfx.size(gl).0 as f32, self.gfx.size(gr).0 as f32);
             self.push_gfx(out, gm, Rect::new(tab.l + wl, tab.t, tab.r - wr, tab.b), col, alpha);
@@ -392,7 +409,7 @@ impl Gui {
         let mut pen = (tab.l + TAB_PAD_L) as i32;
         for run in runs {
             let c = run.color.map_or(text, rgb);
-            pen += self.draw_string(out, FontId::Normal, &run.text, pen, tab.t as i32, c, fade, false);
+            pen += self.draw_string(out, FontId::Normal, &run.text, pen, tab.t as i32, c, alpha, false);
         }
     }
 
@@ -416,6 +433,14 @@ mod tests {
 
     fn outer() -> Rect {
         Rect::new(100.0, 200.0, 399.0, 349.0) // 300 x 150 px
+    }
+
+    #[test]
+    fn inactive_tabs_run_at_double_layer_alpha_clamped_at_the_vertex() {
+        assert_eq!(tab_alpha(true, 1.0), 0.85);
+        assert_eq!(tab_alpha(false, 1.0), 1.0); // 1.7 clamped (`ViewArea_c::_Render` 0x1015291a)
+        assert!((tab_alpha(false, 0.3) - 0.51).abs() < 1e-6); // 1.7 x the inactive-window alpha
+        assert!((tab_alpha(true, 0.3) - 0.255).abs() < 1e-6);
     }
 
     #[test]

@@ -123,8 +123,22 @@ Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), co
   `ao-gui` `layout_text` now follows this, docs/zone/interact.md §2).
   Shadow = a clone of the text surface with colour 0 (black), alpha 1, behind the text (`_AllocateBitmap` 0x1016095b, only with flag 0x1000 = `ChatView::shadow`, `+0x1ba`, default **off**,
   setter `FUN_1008e04f`; offset from pref `ChatTextShadowOffset`: 0 → 0, 1 → 1, 2 → 2, else 1; shipped value 1).
-* The `<div indent=wrapped>` hanging indent of wrapped lines (10 px, `_AddLineDesc` 0x10161b44) is ported (docs/zone/interact.md §2). **Not ported**: per-line fading (`is_message_fading_enabled`, prefs `ChatTextFadeDelay`/`ChatTextFadeTime`, `FUN_1008f432`
-  → `FUN_1009349d`; shipped false, prefs absent from CharPrefs/MainPrefs; the menu entry only stores the flag). Text selection/copy, right-click menus, window drag/resize and tabs: §10-§13.
+* The `<div indent=wrapped>` hanging indent of wrapped lines (10 px, `_AddLineDesc` 0x10161b44) is ported (docs/zone/interact.md §2). Text selection/copy, right-click menus, window drag/resize and tabs: §10-§13.
+
+### 5.1 Message fading (`is_message_fading_enabled`, `ChatTextFadeDelay` 8.0 s, `ChatTextFadeTime` 0.3 s) — ported, `ao-gui` `gui/textfade.rs`
+The chat text area (`FUN_100925ff`, 0x170 bytes, around the `TextView` at `+0x128`) owns a queue of fade lines (`+0x12c`, count `+0x130`, delay `+0x158`, time `+0x160`, both 64-bit µs).
+* **Switch**: `FUN_1008fb36(enabled)` (window option): on → `FUN_1008f432` reads `ChatTextFadeDelay` / `ChatTextFadeTime` (`AsDouble * _DAT_101ae2f8` = 1e6, truncated) and observes both DValues, so a pref change applies at once;
+  off → `FUN_1009349d(0, 0)`. `FUN_1009349d(delay, time)`: both 0 → timer stopped, queue deleted, text view shown + scrolled to the bottom; otherwise the text view (scrollbar with it) is **hidden**,
+  the frame timer starts, and with an empty queue and a non-empty text view `FUN_10092f69` makes one fade line out of the *whole* old text. Port: `ChatWindows::update` (`Win::fade`),
+  `Gui::set_text_fade(w, scroll, Some((delay, time)), existing_html)` hides the `ScrollView`.
+* **New line** (`FUN_100935ba`, the add-text path): the text view always gets the line; with fading on `FUN_10092f69(html)` also creates a `TextRenderer_c` (flags `0xa60`, view flag `0x80`), laid out at the
+  bounds width, bottom-aligned on the bounds bottom; every older line moves up by `height + 1 - shadow_y` (shadow offset Point of `FUN_1008d673` = `ChatTextShadowOffset`, shipped 1 → exactly the line height);
+  front lines whose bottom is above the bounds top are deleted. Port: `Gui::add_fade_line`, called by `ChatWindows::fill`.
+* **Per frame** (`FUN_10092241`, timer handler registered in `FUN_100925ff`): front lines with `now > born + delay + time` are deleted; every line gets `View::SetAlpha((born + delay - now + time) / time)` while that is
+  < 1 → opaque for 8 s, then a linear 0.3 s fade. View flag `0x80` makes `View::_CallRender` reset the inherited alpha to 1.0, so the window transparency (0.3 inactive) does **not** dim the lines: this is what makes the
+  option useful with transparent windows. Port: `Gui::tick_text_fades` / `draw_fade_lines`, lines are drawn with their own alpha only.
+* Shipped default: off (`is_message_fading_enabled` false); menu *Style_FadeMessages* toggles it. Not ported: the `ChatView` shadow flag (`this[0x16c]` → `RENDER_SHADOW` on the lines; the shipped client never sets it, §5), the
+  timer period (we tick every frame; `StartFrameTimer`). Tests: `cargo test --release -p ao-gui --test textfade`, `cargo test --release -p aomac chat::win::tests::message_fading`.
 
 ## 6. Input bar, links, activation
 
@@ -195,7 +209,7 @@ Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot 
 ## 11. Tabs (`Window::InsertTab`)
 
 * A `ChatWindow_c` holds several `GroupChatView_c` tabs, each one window document (`Chat/Windows/WindowN`). `FUN_100974b5` (`Window::InsertTab(index, FUN_100ab980 title, view)`) inserts before the first tab with a
-  greater `tab_index` (document `+0x1e8`) and selects it. **Title** = `FUN_100ab980`: `name` (wrapped in `<font color=red>` when document flag `+0x160`, **UNRESOLVED** meaning, not ported) +, when
+  greater `tab_index` (document `+0x1e8`) and selects it. **Title** = `FUN_100ab980`: `name` (wrapped in `<font color=red>` when document flag `+0x160` = **unread**: `FUN_100989fa(bool)` (a setter that emits its signal) is called with 1 by `FUN_1009b37f` / `FUN_1009b4cf` when a line is added while `View::IsVisible(view +0xd0)` is false, i.e. the tab is not the selected one, and with 0 by `FUN_1009adae` (view created visible) and `FUN_100aac81(selected)` (tab selection); ported as `Win::unread`, `ChatWindows::title`, cleared in `select_tab`) +, when
   the DValue `ChatShowOGrpInTitleBar` (shipped default **true**) is on and the output group exists (`FUN_1009a26c`), ` <font color=green>[<group name>]</font>`; the title is HTML (`green` = 0x008000 of
   TextColors.xml): the retail "Default Window [Clan OOC]" tab. Port: `ChatWindows::title`, re-evaluated every frame (`sync_decor`), tab widths measure the visible text (`Gui::tab_title_width`), runs with an explicit
   colour keep it (`Tab::SetSelected` only sets the *default* text colour). Tab press = `TabView` selection; `FUN_10096b23` takes the alpha of the selected tab's window.
@@ -271,8 +285,8 @@ Defects found and fixed (all verified against the decompiles above):
 **Live settings.** `ChatShowOGrpInTitleBar`, `ChatShowOGrpInInputBar`, `ChatFontName`, `ChatFontStyle`, `ChatFontSize` (tenths of a point; `lfHeight = size / 10`, default 140 = 14 px) are read from the HUD's
 `DValues` every frame (`WinPrefs::from_dvalues`, `flow.rs` → `Chat::set_window_prefs` → `ChatWindows::set_prefs`); a change re-titles the tabs / shows or hides the prompt next frame, a font change rebuilds the windows
 (input bar height = line height + margins). Defaults equal the client's (tested against the shipped templates). `window_transparency_active/inactive`, `show_timestamps` and `visual_mode` are per-window document settings
-(Config.xml, the Window menu) and apply immediately (`alpha_of`, `deliver`). `ChatTextShadowOffset` / `ChatTextFadeDelay` / `ChatTextFadeTime`: the shadow is off in the shipped client (`ChatView::shadow` false, §5) and the
-message fade stays **not ported** (`is_message_fading_enabled` default false; `FUN_1008f432` / `FUN_1009349d` not traced).
+(Config.xml, the Window menu) and apply immediately (`alpha_of`, `deliver`). `ChatTextShadowOffset`: the shadow is off in the shipped client (`ChatView::shadow` false, §5). `ChatTextFadeDelay` / `ChatTextFadeTime` are read from the DValues every frame for windows with
+`is_message_fading_enabled` (§5.1).
 
 **Verification.** `cargo test --release -p ao-gui --test frame` (tab title width, chat font, hint) and `cargo test --release -p aomac chat::win` (titles, mode XML, prompt, alpha rules, prefs defaults).
 Shots with a world-like backdrop (sky gradient over mottled pavement): `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- chat_win_shot chat_frame_shot` → `chat-inactive.png` / `chat-active.png`

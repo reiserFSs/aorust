@@ -23,6 +23,8 @@ pub struct Host {
     repose: Option<Scene>,
     /// Lens for the next frame (per-frame FOV changes of camera paths); `None` keeps the scene's lens.
     pub lens: Option<ao_scene::Lens>,
+    /// Fog density multiplier of the `FogMode` pref ([`ao_scene::fog_mode_density_scale`]); `None` leaves it as it is; drained by the viewer.
+    pub fog_density_scale: Option<f32>,
     /// Frontend request: capture the cursor and deliver [`GameInput::MouseMotion`] (mouse-look); applied after each frame/input.
     pub look: bool,
     /// Actor models to upload before the next frame (`key`, model scene), see [`Renderer::add_actor_model`]; drained by the viewer.
@@ -55,7 +57,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false }
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -372,6 +374,9 @@ impl State {
         if let Some(lens) = g.host.lens.take() {
             self.renderer.set_lens(lens);
         }
+        if let Some(s) = g.host.fog_density_scale.take() {
+            self.renderer.set_fog_density_scale(s);
+        }
         g.host.apply_actors(&mut self.renderer);
         (Some(list), g.host.quit)
     }
@@ -612,6 +617,9 @@ impl Offscreen {
         }
         if let Some(lens) = self.host.lens.take() {
             self.r.set_lens(lens);
+        }
+        if let Some(s) = self.host.fog_density_scale.take() {
+            self.r.set_fog_density_scale(s);
         }
         self.host.apply_actors(&mut self.r);
         list

@@ -14,6 +14,7 @@
 //! list's entry under `GetObjectUnderColLine` is "the object under the mouse" (`InputConfig_t::CheckObjectUnderMouse` 0x10019f00
 //! decides the pointer from it, `hud_cursor.rs`).
 
+use super::options::keys::FixedKeys;
 use super::zone::{DynelState, Zone};
 use ao_formats::stats;
 use ao_gui::{Gui, InputEvent, MouseButton, WindowId, WindowSize};
@@ -473,13 +474,21 @@ impl HudTarget {
         }
     }
 
-    /// Tab / Shift+Tab / Ctrl+Tab (`COMMAND_NEXT_HOSTILE_TARGET` … in GUI.dll's default hotkeys: `TAB`, `SHIFT + TAB`,
-    /// `CTRL + TAB`, `CTRL + SHIFT + TAB`).
-    pub(super) fn key(&mut self, zone: &mut Zone, key: ao_gui::Key, mods: ao_gui::Modifiers) -> bool {
-        if key != ao_gui::Key::Tab {
-            return false;
-        }
-        if let Some(id) = cycle(zone, !mods.ctrl, !mods.shift) {
+    /// The target keys `KEY_NEXT_HOSTILE_TARGET` (Tab), `KEY_PREV_HOSTILE_TARGET` (Shift+Tab), `KEY_NEXT_FRIENDLY_TARGET` (Ctrl+Tab),
+    /// `KEY_PREV_FRIENDLY_TARGET` (Ctrl+Shift+Tab): the fixed keys of GUI.dll's hot key table, read from [`FixedKeys`] (the `Login.cfg` `KEY_*` ints).
+    pub(super) fn key(&mut self, zone: &mut Zone, key: ao_gui::Key, mods: ao_gui::Modifiers, fixed: &FixedKeys) -> bool {
+        let Some(kid) = gui_key_id(key) else { return false };
+        let input = super::options::keys::key_input(kid, mods);
+        let step = [
+            ("KEY_NEXT_HOSTILE_TARGET", true, true),
+            ("KEY_PREV_HOSTILE_TARGET", true, false),
+            ("KEY_NEXT_FRIENDLY_TARGET", false, true),
+            ("KEY_PREV_FRIENDLY_TARGET", false, false),
+        ]
+        .into_iter()
+        .find(|(n, ..)| fixed.get(n) == input);
+        let Some((_, hostile, next)) = step else { return false };
+        if let Some(id) = cycle(zone, hostile, next) {
             self.select(zone, Some(id));
         }
         true
@@ -594,6 +603,26 @@ fn bar_items(width: i32, ratio: f32, out: &mut Vec<ao_gui::view::CanvasItem>) {
         out.push(ao_gui::view::CanvasItem::Image { id: GfxId(HB_SLIDER), src: [0.0, 0.0, tw, h], dst: [l + x, 0.0, l + x + tw, h], alpha: 1.0 });
         x += 16.0;
     }
+}
+
+/// The client key id of a key the GUI layer reports (`InputConfig_t` key table, `controls::key_id`).
+pub(super) fn gui_key_id(key: ao_gui::Key) -> Option<u32> {
+    use ao_gui::Key::*;
+    Some(match key {
+        Escape => 14,
+        Tab => 15,
+        Enter => 24,
+        Backspace => 25,
+        Delete => 27,
+        Home => 28,
+        End => 29,
+        Left => 32,
+        Right => 33,
+        Up => 34,
+        Down => 35,
+        Letter('/') => 118,
+        Letter(c) => super::controls::char_key_id(c)?,
+    })
 }
 
 #[cfg(test)]

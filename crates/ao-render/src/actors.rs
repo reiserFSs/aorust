@@ -36,6 +36,8 @@ struct Item {
     model: u64,
     mesh: usize,
     dist: f32,
+    /// `ActorFrame::alpha < 1`: opaque / alpha-tested draws use the [`FADE_PIPE`] variants.
+    faded: bool,
 }
 
 #[derive(Default)]
@@ -173,6 +175,10 @@ impl Renderer {
         layer.items.clear();
         let mut xf: Vec<[[f32; 4]; 4]> = vec![];
         for f in &layer.frames {
+            // `RVisual_t::Rasterize` (randy31 0x1004d84a) draws nothing at a transparency <= 1e-5 (`_DAT_10095a08`)
+            if f.alpha <= 1e-5 {
+                continue;
+            }
             let Some(model) = layer.models.get(&f.model) else { continue };
             let base = Mat4::from_cols_array_2d(&f.transform);
             let scale = base.x_axis.truncate().length().max(base.y_axis.truncate().length()).max(base.z_axis.truncate().length());
@@ -185,8 +191,11 @@ impl Renderer {
                 if !f.always && !planes.iter().all(|p| p.dot(c.extend(1.0)) >= -r) {
                     continue;
                 }
-                layer.items.push(Item { actor: f.id, model: f.model, mesh: mi, dist: (c - cam).length() });
-                xf.push(m.to_cols_array_2d());
+                layer.items.push(Item { actor: f.id, model: f.model, mesh: mi, dist: (c - cam).length(), faded: f.alpha < 1.0 });
+                // m0.w carries `alpha - 1` to the shader (the affine matrix' unused column element)
+                let mut a = m.to_cols_array_2d();
+                a[0][3] = f.alpha.min(1.0) - 1.0;
+                xf.push(a);
             }
         }
         if xf.len() > layer.cap || layer.bufs.is_empty() {
@@ -231,7 +240,8 @@ impl Renderer {
                     pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
                     bound = true;
                 }
-                pass.set_pipeline(&self.pipes[d.pipe]);
+                let pipe = if it.faded && d.pipe < SKY_PIPE && d.pipe / 2 < 2 { FADE_PIPE + d.pipe } else { d.pipe };
+                pass.set_pipeline(&self.pipes[pipe]);
                 pass.set_bind_group(1, &model.mats[d.mat], &[]);
                 pass.draw_indexed(d.first_index..d.first_index + d.count, 0, 0..1);
                 calls += 1;
@@ -255,7 +265,7 @@ fn env_pipe(blend: Blend, two_sided: bool) -> usize {
 
 /// Whether a draw belongs to the blended actor phase (client render list 6) rather than the opaque one (list 3).
 fn blended_pipe(pipe: usize) -> bool {
-    matches!(pipe / 2, 2 | 3) || pipe >= ENV_BLEND_PIPE
+    matches!(pipe / 2, 2 | 3) && pipe < SKY_PIPE || (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&pipe)
 }
 
 #[cfg(test)]

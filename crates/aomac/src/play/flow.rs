@@ -937,7 +937,15 @@ impl Frontend for Play {
             (Screen::CharSelect, InputEvent::Key { key: Key::Down, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(1, host),
             _ => {}
         }
-        if self.screen == Screen::InWorld && self.chat.as_mut().is_some_and(|c| c.input(&mut self.gui, &ev, &self.zone, &self.text)) {
+        let default_keys;
+        let fixed = match self.hud.as_ref() {
+            Some(h) => h.key_tables().1,
+            None => {
+                default_keys = super::options::keys::FixedKeys::default();
+                &default_keys
+            }
+        };
+        if self.screen == Screen::InWorld && self.chat.as_mut().is_some_and(|c| c.input(&mut self.gui, &ev, &self.zone, &self.text, fixed)) {
             return;
         }
         if let Some(h) = self.hud.as_mut() {
@@ -973,8 +981,24 @@ impl Frontend for Play {
         }
     }
 
-    fn game_input(&mut self, ev: ao_render::GameInput, _host: &mut Host) {
+    fn game_input(&mut self, ev: ao_render::GameInput, host: &mut Host) {
         let open = self.game_input_open();
+        // the window / hotbar hot keys and the options window's key capture read the physical key (any key can be bound, `options/keys.rs`)
+        if let (Screen::InWorld, ao_render::GameInput::Key { code, pressed: true, repeat }, Some(h)) = (self.screen, ev, self.hud.as_mut()) {
+            if let Some(key) = super::controls::key_id(code) {
+                if open && !repeat && h.key_press(&mut self.gui, key, host.mods) {
+                    return; // captured for a binding: the key does not act
+                }
+                // `KEY_COMMAND_CHAT_HISTORY_PAGE_UP / DOWN` (`RepeatMode`, also while typing): a page through the chat history
+                let input = super::options::keys::key_input(key, host.mods);
+                let (up, down) = (h.key_tables().1.get("KEY_COMMAND_CHAT_HISTORY_PAGE_UP"), h.key_tables().1.get("KEY_COMMAND_CHAT_HISTORY_PAGE_DOWN"));
+                if input == up || input == down {
+                    if let Some(c) = self.chat.as_mut() {
+                        c.scroll_history(&mut self.gui, input == down);
+                    }
+                }
+            }
+        }
         if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
             if open || matches!(ev, ao_render::GameInput::Key { pressed: false, .. }) {
                 p.game_input(ev);
@@ -1063,6 +1087,7 @@ impl Frontend for Play {
                         // `LoadUserConfig` (GUI 0x1006bacd): the account's / character's prefs files over the template defaults
                         if let (Some(h), Some(d), Some(a)) = (self.hud.as_mut(), super::prefs::dir(), self.prefs.accounts.get(self.prefs.selected_account)) {
                             h.dvalues.open_user(&d, a, self.zone.char_id);
+                            h.prefs_loaded(&mut self.gui);
                         }
                     }
                     if let (Some(h), Some((id, g))) = (self.hud.as_mut(), self.world_ground.take()) {
@@ -1114,12 +1139,18 @@ impl Frontend for Play {
                 self.player = player::Player::new(&self.dir, &self.zone, self.zone.playfield.unwrap_or(0));
             }
             // `ViewDistance` / `DisplayCharViewDistance` (docs/chat/dvalue.md): far plane + fog + statel LOD, characters' draw distance
-            if let Some(h) = self.hud.as_ref() {
+            if let Some(h) = self.hud.as_mut() {
+                h.sync_keys();
                 if let Some(p) = self.player.as_mut() {
+                    let (b, f) = h.key_tables();
+                    p.set_keys(b, f);
                     p.set_view_distance(h.dvalues.view_distance());
                     p.set_control_prefs(&super::controls::ControlPrefs::from_dvalues(&h.dvalues));
+                    p.set_fade(super::avatar::Fade::from_prefs(&h.dvalues.prefs));
                 }
                 self.zone.world.char_view_distance = h.dvalues.char_view_distance();
+                // `FogMode` (VisualFog_t::SetFogMode 0x10058409): mode 0 scales the fog density by 0.1
+                host.fog_density_scale = Some(ao_scene::fog_mode_density_scale(h.dvalues.prefs.get_int("FogMode", super::dvalue::Kind::Login).unwrap_or(3)));
             }
             if let Some(p) = self.player.as_mut() {
                 for f in p.frame(dt, host, &mut self.zone, self.gui.text_focused()) {

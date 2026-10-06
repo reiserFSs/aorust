@@ -235,6 +235,11 @@ pub struct ActorFrame {
     pub skin: Option<Vec<Vertex>>,
     /// Skip frustum culling (the own avatar).
     pub always: bool,
+    /// Opacity of the whole actor, 1 = normal (`RRefFrame_t::SetTransparency`, randy31 0x100453ed: the value is the diffuse alpha
+    /// `RVisual_t::RenderWithTransparency` 0x1004d2d8 gives the material while it switches ALPHABLENDENABLE on). Below 1 the opaque and
+    /// alpha-tested submeshes blend with it (depth write kept), blended ones multiply it into their alpha; `<= 1e-5` draws nothing
+    /// (`RVisual_t::Rasterize` 0x1004d84a skips the visual).
+    pub alpha: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -351,6 +356,13 @@ impl FogModel {
     /// Fog at camera position `p`: `(linear RGB, fog end in metres)`. `AddFog` keeps a weighted mean
     /// `new = (d * c_new + D * c_old) / (d + D)` and the density `D = max(D, d)`; volumes are added in file order.
     pub fn at(&self, p: [f32; 3]) -> ([f32; 3], f32) {
+        self.at_scaled(p, 1.0)
+    }
+
+    /// [`FogModel::at`] with the accumulated density multiplied by `density_scale` before the fog end is derived: `VisualFog_t::process`
+    /// (DisplaySystem 0x10058443) starts with `D *= this+0x30`, which `SetFogMode` (0x10058409, the `FogMode` pref) sets to 0.1 for
+    /// mode 0 and 1.0 otherwise ([`fog_mode_density_scale`]).
+    pub fn at_scaled(&self, p: [f32; 3], density_scale: f32) -> ([f32; 3], f32) {
         let (mut c, mut dens) = (self.base_color, self.base_density);
         let room = self.camera_room(p);
         for v in self.volumes.iter().filter(|v| v.room.is_none_or(|r| Some(r as usize) == room)) {
@@ -364,9 +376,16 @@ impl FogModel {
                 dens = dens.max(d);
             }
         }
+        let dens = dens * density_scale;
         let end = if self.far - self.near > 5.0 { self.far - (self.far - self.near - 5.0) * dens } else { self.far };
         (c.map(|v| v.powf(2.2)), end)
     }
+}
+
+/// `VisualFog_t::SetFogMode(mode)` (DisplaySystem 0x10058409) stores `0.1` (`_DAT_10089e50`) at `+0x30` for the `FogMode` pref 0 ("Off" in the
+/// options window) and `1.0` for 1..3; `process` multiplies the accumulated fog density by it.
+pub fn fog_mode_density_scale(mode: i32) -> f32 {
+    if mode == 0 { 0.1 } else { 1.0 }
 }
 
 /// `e_ScaleVisibleFarAway` (`FUN_1005c124` @0x1005c124): an object between 950 and 5000 m from the camera is pulled to 950 m
@@ -424,6 +443,19 @@ mod tests {
 
     fn model() -> FogModel {
         FogModel { base_color: [0.2; 3], base_density: 0.1, near: 0.5, far: 800.0, volumes: vec![FogVolume { pos: [0.0; 3], color: [1.0, 0.0, 0.0], density: 0.9, radius: 100.0, room: None }], rooms: None }
+    }
+
+    /// `FogMode` pref 0 multiplies the accumulated density by 0.1 (`VisualFog_t::SetFogMode` 0x10058409 / `process` 0x10058443), 1..3 leave it.
+    #[test]
+    fn fog_mode_zero_scales_the_density() {
+        let m = model();
+        let p = [200.0, 0.0, 0.0];
+        let full = m.at(p).1;
+        assert_eq!(m.at_scaled(p, fog_mode_density_scale(3)).1, full);
+        assert_eq!(m.at_scaled(p, fog_mode_density_scale(1)).1, full);
+        let off = m.at_scaled(p, fog_mode_density_scale(0)).1;
+        assert!((off - (800.0 - (800.0 - 0.5 - 5.0) * 0.01)).abs() < 1e-3, "{off}");
+        assert!(off > full);
     }
 
     #[test]

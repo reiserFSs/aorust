@@ -19,6 +19,8 @@ const COL_GAP: f32 = 5.0;
 const ICON_GAP: f32 = 5.0;
 /// Selected-row `ViewSurface_c` colour (`FUN_100f15ef`).
 const ROW_SEL: u32 = 0x88aadd;
+/// HTML `aqua` (the key texts of the options window's "Fixed keys" page: `KeyListItemView_c`'s `<font color=aqua>`).
+const AQUA: [u8; 3] = [0, 255, 255];
 /// Icon blink half period (`EventTimer_c::Start(500000)` of `FUN_10144aab`).
 const FLASH_HALF: f32 = 0.5;
 /// Edge zone of a header cell that starts a resize (`_DAT_101a8b90` = 2) and drag distance (`_DAT_101a96d4` = 3).
@@ -389,7 +391,7 @@ impl Gui {
             let icon = list_icon(it);
             let (iw, ih) = if it.icon > 0 { self.gfx.size(GfxId(it.icon)) } else { (0, 0) };
             let _ = icon;
-            let tw = self.fonts.font(FontId::Normal).text_width(&it.label) as f32;
+            let tw = if it.label.contains('<') { self.tab_title_width(&it.label) as f32 } else { self.fonts.font(FontId::Normal).text_width(&it.label) as f32 };
             let gap = if it.icon > 0 { ICON_GAP } else { 0.0 };
             let size = Point::new(iw as f32 + gap + tw - 1.0, (fh - 1.0).max(if ih > 0 { ih as f32 - 1.0 } else { 0.0 }));
             l.items[i].size = size;
@@ -399,6 +401,10 @@ impl Gui {
         let mut ch = 0.0f32;
         for r in &rows {
             cw = cw.max(r.x + l.items[r.item].size.x + 1.0);
+            let it = &l.items[r.item];
+            if !it.aux.is_empty() {
+                cw = cw.max(it.aux_x + self.fonts.font(FontId::Normal).text_width(&it.aux) as f32 + 1.0);
+            }
             ch = ch.max(r.y + l.items[r.item].size.y + 1.0);
         }
         l.content = Point::new(cw, ch);
@@ -586,7 +592,10 @@ impl Gui {
                 }
             }
             let c = if !it.selectable || it.selected { it.color_a } else { it.color_b };
-            self.draw_string(out, FontId::Normal, &it.label, tx as i32, y as i32, mul(tint, rgb_(c)), alpha, false);
+            self.draw_markup(out, &it.label, tx as i32, y as i32, mul(tint, rgb_(c)), alpha);
+            if !it.aux.is_empty() {
+                self.draw_string(out, FontId::Normal, &it.aux, (rect.l + it.aux_x) as i32, y as i32, mul(tint, AQUA), alpha, false);
+            }
         }
     }
 
@@ -975,6 +984,19 @@ impl Gui {
         s
     }
 
+    /// Text with `<font color=..>` runs (the colours of `TextColors.xml`); plain text is a single string.
+    fn draw_markup(&mut self, out: &mut Vec<DrawCmd>, text: &str, x: i32, y: i32, tint: [u8; 3], alpha: f32) {
+        if !text.contains('<') {
+            self.draw_string(out, FontId::Normal, text, x, y, tint, alpha, false);
+            return;
+        }
+        let mut pen = x;
+        for run in self.tab_runs(text) {
+            let c = run.color.map_or(tint, |c| mul(tint, rgb_(c)));
+            pen += self.draw_string(out, FontId::Normal, &run.text, pen, y, c, alpha, false);
+        }
+    }
+
     /// `LayoutList` + `StringListColView_c` rows (`FUN_100f171e`): a text cell per visible column, a selected row has the 0x88aadd `ViewSurface_c` behind it.
     pub(super) fn draw_multi(&mut self, out: &mut Vec<DrawCmd>, m: &MultiData, rect: Rect, tint: [u8; 3], alpha: f32) {
         let cols = Self::multi_cols(m);
@@ -986,8 +1008,13 @@ impl Gui {
             }
             for (ci, x, cw) in &cols {
                 if let Some(c) = r.cells.get(*ci) {
-                    let t = self.fit_text(&c.text, *cw);
-                    self.draw_string(out, FontId::Normal, &t, (rect.l + x) as i32, y as i32, tint, alpha, false);
+                    if c.text.contains('<') {
+                        // the item's text view renders the HTML subset (`<font color=aqua>` keys, `<font color=red>NONE</font>` of the key-bindings page)
+                        self.draw_markup(out, &c.text, (rect.l + x) as i32, y as i32, tint, alpha);
+                    } else {
+                        let t = self.fit_text(&c.text, *cw);
+                        self.draw_string(out, FontId::Normal, &t, (rect.l + x) as i32, y as i32, tint, alpha, false);
+                    }
                 }
             }
         }

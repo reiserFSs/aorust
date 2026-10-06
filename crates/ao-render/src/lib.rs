@@ -147,6 +147,9 @@ const SKY_PIPE: usize = 8;
 /// 14..16 (the same pipelines) in the blended actor phase, so an env layer follows the phase of its submesh.
 const ENV_PIPE: usize = 12;
 const ENV_BLEND_PIPE: usize = 14;
+/// Actors drawn with `ActorFrame::alpha < 1`: the opaque / alpha-tested submeshes (blend x cull = 16..20) blend with the frame's alpha but keep
+/// the depth write (`RVisual_t::RenderWithTransparency` randy31 0x1004d2d8 only switches ALPHABLENDENABLE on); they stay in the opaque phase.
+const FADE_PIPE: usize = 16;
 /// Lights kept per grid cell (strongest first) and the minimum cell edge in metres.
 const CELL_LIGHTS: usize = 16;
 const MIN_CELL: f32 = 8.0;
@@ -370,6 +373,8 @@ pub struct Renderer {
     lens: ao_scene::Lens,
     /// Camera dependent fog (statel fog volumes), see `Scene::fog_model`.
     fog: Option<ao_scene::FogModel>,
+    /// Multiplier of the accumulated fog density, see [`ao_scene::fog_mode_density_scale`] (`FogMode` pref).
+    fog_density_scale: f32,
     /// Statel distance LOD state, see `Scene::statel_lod`.
     lod: Option<LodState>,
     /// Light storage buffer plus its pristine contents and the statel zone of each light (distance gating).
@@ -512,9 +517,11 @@ impl Renderer {
         let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let one_one = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool| {
+        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool| {
             let (fs, state, depth_write) = match blend {
                 _ if env => ("fs_env", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
+                Blend::Opaque if fade => ("fs_fade_opaque", Some(wgpu::BlendState::ALPHA_BLENDING), true),
+                Blend::AlphaTest if fade => ("fs_fade_test", Some(wgpu::BlendState::ALPHA_BLENDING), true),
                 Blend::Opaque => ("fs_opaque", None, true),
                 Blend::AlphaTest => ("fs_test", None, true),
                 Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
@@ -564,7 +571,9 @@ impl Renderer {
             .flat_map(|b| [false, true].map(|two| (b, two, false, false)))
             .chain([Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive].map(|b| (b, true, true, false)))
             .chain([false, true, false, true].map(|two| (Blend::Opaque, two, false, true)))
-            .map(|(b, two, sky, env)| mk(b, two, sky, env))
+            .map(|(b, two, sky, env)| (b, two, sky, env, false))
+            .chain([Blend::Opaque, Blend::AlphaTest].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, true))))
+            .map(|(b, two, sky, env, fade)| mk(b, two, sky, env, fade))
             .collect();
         let mut r = Self {
             device,
@@ -588,6 +597,7 @@ impl Renderer {
             env: default_environment(100.0),
             lens: ao_scene::Lens::default(),
             fog: None,
+            fog_density_scale: 1.0,
             lod: None,
             light_buf,
             light_base: vec![],
@@ -945,6 +955,11 @@ impl Renderer {
         st.levels = levels;
     }
 
+    /// The `FogMode` pref's density multiplier (`VisualFog_t::SetFogMode`, [`ao_scene::fog_mode_density_scale`]).
+    pub fn set_fog_density_scale(&mut self, scale: f32) {
+        self.fog_density_scale = scale;
+    }
+
     /// Replaces the lens of the loaded scene (a camera path that changes the field of view every frame, the player camera's `ViewDistance`).
     /// A far plane also moves the fog end and the statel LOD's view length: the client's `VisualFog_t::AddClipPlanes(near, far)` and
     /// `VisualCamera_t::GetLengthOfViewcone` (far - near) both come from the camera's planes (docs/chat/dvalue.md).
@@ -1027,7 +1042,7 @@ impl Renderer {
         self.step_movers();
         self.pose_far_away(cam.pos);
         let mut env = self.env;
-        if let Some((color, end)) = self.fog.as_ref().map(|m| m.at(cam.pos.to_array())) {
+        if let Some((color, end)) = self.fog.as_ref().map(|m| m.at_scaled(cam.pos.to_array(), self.fog_density_scale)) {
             if env.sky_color == env.fog_color {
                 env.sky_color = color;
             }
@@ -1437,7 +1452,7 @@ mod sky_tests {
         };
         let model = Scene { meshes: vec![quad(0.0, [1.0, 0.0, 0.0, 1.0]), quad(0.0, [1.0, 0.0, 0.0, 1.0])], ..Default::default() };
         let at = |x: f32, z: f32| [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [x, 0.0, z, 1.0]];
-        let frame = |transform, parts: Vec<[[f32; 4]; 4]>, skin: Option<Vec<Vertex>>, always| ao_scene::ActorFrame { id: 1, model: 7, transform, parts, skin, always };
+        let frame = |transform, parts: Vec<[[f32; 4]; 4]>, skin: Option<Vec<Vertex>>, always| ao_scene::ActorFrame { id: 1, model: 7, transform, parts, skin, always, alpha: 1.0 };
         let shot = |f: ao_scene::ActorFrame, name: &str| -> Option<u8> {
             let path = std::env::temp_dir().join(format!("ao-render-actor-{}-{name}.png", std::process::id()));
             render_to_png_actors(&Scene::default(), &[(7, model.clone())], vec![f], [0.0; 3], [0.0, 0.0, -1.0], 64, 64, &path, 0.0).ok()?;
@@ -1460,9 +1475,14 @@ mod sky_tests {
 
     /// RGB of the centre pixel of an actors-only render (`None` without a GPU adapter).
     fn actor_shot(world: &Scene, model: Scene, at: [f32; 3], name: &str) -> Option<[u8; 3]> {
+        actor_shot_alpha(world, model, at, 1.0, name)
+    }
+
+    /// [`actor_shot`] with `ActorFrame::alpha`.
+    fn actor_shot_alpha(world: &Scene, model: Scene, at: [f32; 3], alpha: f32, name: &str) -> Option<[u8; 3]> {
         let path = std::env::temp_dir().join(format!("ao-render-env-{}-{name}.png", std::process::id()));
         let t = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [at[0], at[1], at[2], 1.0]];
-        let f = ao_scene::ActorFrame { id: 1, model: 7, transform: t, parts: vec![], skin: None, always: false };
+        let f = ao_scene::ActorFrame { id: 1, model: 7, transform: t, parts: vec![], skin: None, always: false, alpha };
         render_to_png_actors(world, &[(7, model)], vec![f], [0.0; 3], [0.0, 0.0, -1.0], 64, 64, &path, 0.0).ok()?;
         let bytes = std::fs::read(&path).ok()?;
         let _ = std::fs::remove_file(&path);
@@ -1471,6 +1491,30 @@ mod sky_tests {
         let info = r.next_frame(&mut buf).unwrap();
         let o = (info.width as usize * (info.height as usize / 2) + info.width as usize / 2) * 4;
         Some([buf[o], buf[o + 1], buf[o + 2]])
+    }
+
+    /// `ActorFrame::alpha` (`RRefFrame_t::SetTransparency`): an opaque emissive quad blends with the frame's alpha over the world behind it
+    /// (and still depth-writes), alpha 0 draws nothing; alpha-blended and alpha-tested submeshes follow the same factor.
+    #[test]
+    fn actor_alpha_blends_opaque_and_tested_submeshes() {
+        let red = |blend| actor_quad([0.0, 0.0, 1.0], Submesh { blend, emissive: [1.0; 3], base_color: [1.0, 0.0, 0.0, 1.0], ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) });
+        // a white emissive wall behind the actor
+        let wall = {
+            let v = |x: f32, y: f32| Vertex { pos: [x, y, -9.0], normal: [0.0, 0.0, 1.0], ..Default::default() };
+            let sub = Submesh { two_sided: true, emissive: [1.0; 3], base_color: [1.0; 4], ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) };
+            let mut s = Scene::default();
+            s.meshes.push(Mesh { vertices: vec![v(-9.0, -9.0), v(9.0, -9.0), v(9.0, 9.0), v(-9.0, 9.0)], submeshes: vec![sub] });
+            s.instances.push(Instance { mesh: 0, transform: IDENTITY });
+            s
+        };
+        for blend in [ao_scene::Blend::Opaque, ao_scene::Blend::AlphaTest, ao_scene::Blend::AlphaBlend] {
+            let shot = |alpha, name: &str| actor_shot_alpha(&wall, red(blend), [0.0, 0.0, -5.0], alpha, &format!("{name}{}", blend as u32));
+            let Some(solid) = shot(1.0, "a1") else { return };
+            let (half, gone) = (shot(0.5, "a05").unwrap(), shot(0.0, "a0").unwrap());
+            assert!(solid[0] > 240 && solid[1] < 20, "{blend:?} solid red {solid:?}");
+            assert!(half[0] > 200 && (100..200).contains(&half[1]), "{blend:?} half red over the white wall {half:?}");
+            assert!(gone[0] > 240 && gone[1] > 240 && gone[2] > 240, "{blend:?} alpha 0 draws nothing {gone:?}");
+        }
     }
 
     /// A 1 m quad at the origin of model space facing +Z (one-sided = false) with per-vertex `normal`.

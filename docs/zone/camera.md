@@ -101,7 +101,7 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
   Implemented: `ActorRig::head_attractor(clip)` (cat-frame translation of `Attractor01_head` in the playing clip) →
   `Avatar::head_height()` (× body scale) → `Camera3p::set_head`, blended by `follow_head`. Solitus male (rdb 5900 family): **1.793 m idle**
   (body 1.871 m), bobbing ±1.5 cm while running; the old stand-in `DEFAULT_PIVOT_HEIGHT` 1.5 m is gone.
-  With `UseNoBobCamera` (`+0x1e0`, default 0, not implemented) the target follows only beyond 0.01 m of movement (`_DAT_1003e2b4`, 0.25 m hysteresis `_DAT_1003e2b0`).
+  **`UseNoBobCamera`** (Login pref, `n3Camera_t+0x1e0` set by the changed callback `FUN_100219d5` [N3 0x100219d5]; ported, `ControlPrefs::no_bob_camera`, `Camera3p::follow_head`, test `no_bob_camera_ignores_small_head_motion`): `FUN_10020bdb` then moves the target only when it is ≥ 0.01 m (`_DAT_1003e2b4`) off the head attractor: it starts following when the gap exceeds 0.25 m (`_DAT_1003e2b0`), latches (`DAT_1005c87c`) and each frame takes `0.99 · old + 0.01 · new` (`_DAT_1003e2ac`, `_DAT_1003d618`) until within 0.01 m again; the 0.3 m floor still applies. The x/z of the target are the first sample's (the gap is vertical only). Frame-rate normalised like the default blend.
 * **Position**: `target + direction · distance` with `direction` in the avatar frame (`RecalcOptimalPos` [N3 0x1001f371]); defaults
   `(0, 0.316, −0.948)` × 5.0 m: 5 m behind and 1.58 m above the target, elevation 18.4°. The camera looks at the target, is rigid
   (`SetRelPosRot` in `DecideSnap` [N3 0x1001f537], flag `+0x214`) and follows the avatar heading because the offset is avatar-relative.
@@ -176,7 +176,7 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
 
 ## 6. Not resolved
 
-* `UseNoBobCamera` smoothing, the horizontal part of the head attractor (x/z).
+* The horizontal part of the head attractor (x/z) of the look target.
 * Mode 1/2 wheel / key zoom: the client zooms them through `CameraVehicle_t::Forward` → `ZoomSteer` [N3 0x1001db64] (`SteeringSeek` along the line to the look target, stops at 0.7 m / 25 m)
   and a `ForcedUpdate` at the end; `Camera3p` stores the resulting chase distance directly [INFERENCE] (`zoom_in_by`). The `+0x1a4` direct control and the `Turn` / `Strafe` / `MoveUp` inputs
   (`CalcLateralSteering` [0x1001e0ae]) are never set by anything reachable (`+0x1a4` only ever 0; no caller of `Turn`/`Strafe`/`MoveUp` besides the n3Camera's own flags): not ported.

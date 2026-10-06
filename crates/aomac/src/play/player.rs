@@ -68,6 +68,9 @@ pub(super) struct Player {
     lens_set: bool,
     /// `ViewDistance` pref (0..1, docs/chat/dvalue.md): the lens' far plane is [`camera::far_plane`] of it.
     view_distance: f32,
+    /// `FadeCharacter*` prefs and the cached factor of `VisualCATMesh_t::RefreshAlpha` ([`avatar::Fade`]).
+    fade: avatar::Fade,
+    fader: avatar::Fader,
     /// The left/right press that went to the GUI: its release must not reach the controls.
     gui_press: [bool; 2],
     /// The zone's doors were handed to this collision world once ([`Player::door_rooms`]).
@@ -126,7 +129,7 @@ impl Player {
                 _ => {}
             }
             let fight = FightLevels::load(&store, playfield);
-            let controls = Controls::from_char_prefs(prefs, &prefs_xml);
+            let controls = Controls::new(prefs);
             Ok(Self {
                 store,
                 collision,
@@ -140,6 +143,8 @@ impl Player {
                 model_sent: false,
                 lens_set: false,
                 view_distance: camera::VIEW_DISTANCE,
+                fade: avatar::Fade::default(),
+                fader: avatar::Fader::default(),
                 gui_press: [false; 2],
                 doors_synced: false,
                 game: Vec::new(),
@@ -161,12 +166,22 @@ impl Player {
         self.camera.set_prefs(p);
     }
 
+    /// The shared key binding table (`options/keys.rs`) changed: movement, camera, combat and pick-up keys follow at once.
+    pub fn set_keys(&mut self, b: &super::options::keys::Bindings, f: &super::options::keys::FixedKeys) {
+        self.controls.set_keys(b, f);
+    }
+
     /// The `ViewDistance` pref changed (`FUN_1001fc91` replaces the camera's far plane at once): the next frame sends the lens again.
     pub fn set_view_distance(&mut self, vd: f32) {
         if vd != self.view_distance {
             self.view_distance = vd;
             self.lens_set = false;
         }
+    }
+
+    /// The `FadeCharacter*` Char prefs (read each frame, applied by the next [`Player::frame`] like the original's changed callbacks).
+    pub fn set_fade(&mut self, fade: avatar::Fade) {
+        self.fade = fade;
     }
 
     pub fn serial(&self) -> u32 {
@@ -418,8 +433,13 @@ impl Player {
             host.actor_models.push((avatar::MODEL_KEY, self.avatar.model().clone()));
             self.model_sent = true;
         }
+        // `VisualCATMesh_t::RunFunction` -> `RefreshAlpha`: opacity from the camera <-> head attractor distance (own character only)
+        let head_to_camera = self.avatar.head_position() - host.camera.pos;
+        let alpha = self.fader.step(&self.fade, head_to_camera.length_squared());
         if self.camera.show_avatar() {
-            host.actors.push(self.avatar.frame());
+            let mut frame = self.avatar.frame();
+            frame.alpha = alpha;
+            host.actors.push(frame);
         }
         out
     }

@@ -346,6 +346,13 @@ impl Chat {
         std::mem::take(&mut self.quit)
     }
 
+    /// `KEY_COMMAND_CHAT_HISTORY_PAGE_UP` / `..._DOWN`: one page through the active window's history.
+    pub fn scroll_history(&mut self, gui: &mut Gui, down: bool) {
+        if let Some(w) = self.win.as_mut() {
+            w.scroll_page(gui, down);
+        }
+    }
+
     /// True while a dialog box or the InfoView is open: Esc closes those first (`DialogBox_c::SlotEscPressed`, `esc_dialogs` / `esc_infoview` default true).
     pub fn esc_closes(&self) -> bool {
         self.dialogs.is_open() || self.info.window().is_some()
@@ -481,7 +488,7 @@ impl Chat {
 
     /// Keys that open the input bar while no text field has the keyboard (`TextInputModule_t::StartChatMessage` /
     /// `StartChatCmdMessage` "/" / `StartChatReplyMessage` Shift+R, GUI 0x10021f18 / 0x10021fd0). `true` = consumed.
-    pub fn input(&mut self, gui: &mut Gui, ev: &InputEvent, zone: &Zone, texts: &TextDb) -> bool {
+    pub fn input(&mut self, gui: &mut Gui, ev: &InputEvent, zone: &Zone, texts: &TextDb, fixed: &super::options::keys::FixedKeys) -> bool {
         if let (InputEvent::Text(t), Some(s)) = (ev, &self.swallow) {
             // the text of the key press that just opened the bar (the viewer may send the Key and then its Text)
             let hit = t == s;
@@ -509,15 +516,24 @@ impl Chat {
             let (groups, text) = (this.groups(), |k: &str| texts.by_key(10001, &format!("ChatCmdFeedback_{k}")).unwrap_or_default());
             cmd::reply_prefill(&this.cmd_ctx(zone, &groups, None, &text))
         };
-        match ev {
-            InputEvent::Key { key: ao_gui::Key::Enter, pressed: true, .. } => open(self, gui, None, ""),
-            InputEvent::Key { key: ao_gui::Key::Letter('/'), pressed: true, .. } => open(self, gui, Some("/".into()), "/"),
-            InputEvent::Text(t) if t == "/" => open(self, gui, Some("/".into()), ""),
-            InputEvent::Key { key: ao_gui::Key::Letter('r'), pressed: true, mods, .. } if mods.shift => {
+        // the start keys are `KEY_COMMAND_START_CHAT_INPUT` (ENTER; the SHIFT / ALT + ENTER variants have no `KEY_` id and stay), `..._CMD_INPUT` (SLASH; NUMPAD_DIV likewise
+        // fixed) and `..._REPLY_INPUT` (SHIFT + R): `Login.cfg` overrides apply. The key's text (`/`, `R`) that follows its press is swallowed or opens the bar.
+        let pressed = match ev {
+            InputEvent::Key { key, pressed: true, mods } => super::hud_target::gui_key_id(*key).map(|k| super::options::keys::key_input(k, *mods)),
+            _ => None,
+        };
+        let (start, cmd, rep) = (fixed.get("KEY_COMMAND_START_CHAT_INPUT"), fixed.get("KEY_COMMAND_START_CHAT_CMD_INPUT"), fixed.get("KEY_COMMAND_START_CHAT_REPLY_INPUT"));
+        let enter_variants = |k: u32| k == (24 | super::controls::id::SHIFT) || k == (24 | super::controls::id::ALT);
+        match (ev, pressed) {
+            (_, Some(k)) if k == start || enter_variants(k) => open(self, gui, None, ""),
+            (_, Some(k)) if k == cmd && cmd == 118 => open(self, gui, Some("/".into()), "/"),
+            (_, Some(k)) if k == cmd => open(self, gui, Some("/".into()), ""),
+            (InputEvent::Text(t), _) if t == "/" && cmd == 118 => open(self, gui, Some("/".into()), ""),
+            (_, Some(k)) if k == rep => {
                 let p = reply(self);
-                open(self, gui, Some(p), "R")
+                open(self, gui, Some(p), if rep == (super::controls::id::SHIFT | 99) { "R" } else { "" })
             }
-            InputEvent::Text(t) if t == "R" => {
+            (InputEvent::Text(t), _) if t == "R" && rep == (super::controls::id::SHIFT | 99) => {
                 let p = reply(self);
                 open(self, gui, Some(p), "")
             }
@@ -1002,6 +1018,51 @@ mod tests {
     use super::*;
 
     /// text.mdb 10001 `ChatTellMsgToField` is the client's own outgoing-tell template (pool offset 269621, preceded by " joined the group.").
+    /// The chat start keys are the fixed keys `KEY_COMMAND_START_CHAT_INPUT` / `_CMD_INPUT` / `_REPLY_INPUT`: the `Login.cfg` ints rebind them (the extra
+    /// SHIFT / ALT + ENTER lines have no `KEY_` id and stay).
+    #[test]
+    fn chat_start_keys_follow_the_fixed_key_prefs() {
+        use super::super::dvalue::{IndepPrefs, Kind};
+        use ao_gui::{Key, Modifiers};
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("aomac_chat_keys");
+        let _ = std::fs::remove_dir_all(&dir);
+        super::super::prefs::set_test_dir(&dir);
+        let mut gui = Gui::new(&client, None).unwrap();
+        let mut c = Chat::new();
+        c.open(&mut gui, (1280, 800)).unwrap();
+        let (zone, texts) = (Zone::default(), TextDb::load(&client).unwrap());
+        let press = |c: &mut Chat, gui: &mut Gui, key: Key, mods: Modifiers, f: &crate::play::options::keys::FixedKeys| {
+            gui.clear_focus();
+            c.input(gui, &InputEvent::Key { key, pressed: true, mods }, &zone, &texts, f);
+            gui.text_focused()
+        };
+        let none = Modifiers::default();
+        let shift = Modifiers { shift: true, ..none };
+        let def = crate::play::options::keys::FixedKeys::default();
+        assert!(press(&mut c, &mut gui, Key::Enter, none, &def));
+        assert!(press(&mut c, &mut gui, Key::Enter, shift, &def), "SHIFT + ENTER is its own (unnamed) line");
+        assert!(press(&mut c, &mut gui, Key::Letter('/'), none, &def));
+        assert!(press(&mut c, &mut gui, Key::Letter('r'), shift, &def));
+        assert!(!press(&mut c, &mut gui, Key::Letter('y'), none, &def));
+        let mut p = IndepPrefs::with_defaults();
+        p.set_int("KEY_COMMAND_START_CHAT_INPUT", 106, Kind::Login); // Y
+        p.set_int("KEY_COMMAND_START_CHAT_CMD_INPUT", 91, Kind::Login); // J
+        p.set_int("KEY_COMMAND_START_CHAT_REPLY_INPUT", 92 | 0x40000, Kind::Login); // Ctrl + K
+        let f = crate::play::options::keys::FixedKeys::from_prefs(&p);
+        assert!(press(&mut c, &mut gui, Key::Letter('y'), none, &f));
+        assert!(!press(&mut c, &mut gui, Key::Enter, none, &f), "plain Enter no longer starts the input");
+        assert!(press(&mut c, &mut gui, Key::Enter, shift, &f));
+        assert!(press(&mut c, &mut gui, Key::Letter('j'), none, &f));
+        assert!(!press(&mut c, &mut gui, Key::Letter('/'), none, &f));
+        assert!(press(&mut c, &mut gui, Key::Letter('k'), Modifiers { ctrl: true, ..none }, &f));
+        assert!(!press(&mut c, &mut gui, Key::Letter('r'), shift, &f));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn tell_template_key_is_in_the_real_db() {
         let Some(h) = std::env::var_os("HOME") else { return };

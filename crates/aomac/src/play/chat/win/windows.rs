@@ -67,7 +67,7 @@ impl ChatWindows {
         let n = self.next_n;
         self.next_n += 1;
         let alpha = alpha_of(&cfg, false);
-        self.wins.push(Win { cfg, id: usize::MAX, frame: usize::MAX, n, lines: VecDeque::new(), alpha, target: alpha, rate: 0.0, active: false, hint: String::new() });
+        self.wins.push(Win { cfg, id: usize::MAX, frame: usize::MAX, n, lines: VecDeque::new(), alpha, target: alpha, rate: 0.0, active: false, unread: false, fade: None, hint: String::new() });
         self.wins.len() - 1
     }
 
@@ -83,12 +83,14 @@ impl ChatWindows {
         Ok(fi)
     }
 
-    /// The tab title (`FUN_100ab980`): the window's `name` plus, with `ChatShowOGrpInTitleBar`, ` <font color=green>[<output group>]</font>`.
+    /// The tab title (`FUN_100ab980`): the window's `name` (in `<font color=red>` while unread, flag `+0x160`) plus, with `ChatShowOGrpInTitleBar`,
+    /// ` <font color=green>[<output group>]</font>`.
     pub(super) fn title(&self, d: usize) -> String {
-        let c = &self.wins[d].cfg;
+        let (c, unread) = (&self.wins[d].cfg, self.wins[d].unread);
+        let name = if unread { format!("<font color=red>{}</font>", c.name) } else { c.name.clone() };
         match self.group_name(c.output_group) {
-            g if self.pw.title_group && c.output_group != 0 && !g.is_empty() => format!("{} <font color=green>[{g}]</font>", c.name),
-            _ => c.name.clone(),
+            g if self.pw.title_group && c.output_group != 0 && !g.is_empty() => format!("{name} <font color=green>[{g}]</font>"),
+            _ => name,
         }
     }
 
@@ -171,6 +173,8 @@ impl ChatWindows {
         gui.set_text_shadow_offset(1, 1); // `ChatTextShadowOffset` pref default 1 (CharPrefs.xml), `FUN_1008d673`
         for (i, &d) in docs.iter().enumerate() {
             self.wins[d].id = id;
+            self.wins[d].fade = None; // new GUI views: `update` re-applies `is_message_fading_enabled`
+            self.wins[d].unread &= i != sel; // `FUN_1009adae`: the visible view starts read
             gui.show_collapsing(id, &self.wins[d].chat(), i == sel);
             self.refresh(gui, d);
         }
@@ -258,12 +262,20 @@ impl ChatWindows {
     }
 
     fn fill(&mut self, gui: &mut Gui, i: usize, html: &str) {
+        // `FUN_1009b4cf` -> `FUN_100989fa(1)`: a line for a view that is not visible (an unselected tab) marks the window unread
+        let visible = self.frames.get(self.wins[i].frame).is_some_and(|f| self.sel_doc(self.wins[i].frame) == i && f.id == self.wins[i].id);
         let w = &mut self.wins[i];
+        w.unread |= !visible;
         w.lines.push_back(html.to_string());
         while w.lines.len() > MAX_LINES {
             w.lines.pop_front();
         }
         self.refresh(gui, i);
+        // `FUN_100935ba`: the text view always takes the line; with fading on a fade line is spawned as well
+        let w = &self.wins[i];
+        if w.fade.is_some() {
+            gui.add_fade_line(w.id, &w.scroll(), html);
+        }
     }
 
     fn deliver(&mut self, gui: &mut Gui, group: u64, make: impl Fn(&str) -> String) {
@@ -417,6 +429,7 @@ impl ChatWindows {
             gui.show_collapsing(id, &self.wins[d].chat(), i == sel);
         }
         gui.set_window_alpha(id, self.wins[docs[sel]].alpha);
+        self.wins[docs[sel]].unread = false; // `FUN_100aac81(true)`: the tab became visible
         gui.clear_focus();
         self.dirty = true;
     }
@@ -537,6 +550,16 @@ impl ChatWindows {
         for i in 0..self.wins.len() {
             let selected = self.frames.get(self.wins[i].frame).is_some_and(|f| self.sel_doc(self.wins[i].frame) == i && f.id == self.wins[i].id);
             let w = &mut self.wins[i];
+            // `FUN_1008f432` / `FUN_1009349d`: both values 0 = no fading
+            let fade = (w.cfg.fading && self.pw.fade != (0.0, 0.0)).then_some(self.pw.fade);
+            if fade != w.fade {
+                w.fade = fade;
+                let all = w.lines.iter().map(String::as_str).collect::<Vec<_>>().join("<br>");
+                gui.set_text_fade(w.id, &w.scroll(), fade, &all);
+                if fade.is_none() {
+                    gui.scroll_to_bottom(w.id, &w.scroll());
+                }
+            }
             let active = focused.as_deref() == Some(w.input().as_str());
             if active != w.active {
                 w.active = active;
@@ -580,6 +603,15 @@ impl ChatWindows {
             let w = &self.wins[i];
             gui.focus(w.id, &w.input());
         }
+    }
+
+    /// `KEY_COMMAND_CHAT_HISTORY_PAGE_UP/DOWN`: scrolls the output of the active window by one page (its view height; the original's step is UNRESOLVED).
+    pub fn scroll_page(&mut self, gui: &mut Gui, down: bool) {
+        let Some(w) = self.active_win() else { return };
+        let (id, name) = (w.id, w.scroll());
+        let Some(r) = gui.view_rect(id, &name) else { return };
+        let (page, y) = (r.b - r.t, gui.scroll_offset(id, &name));
+        gui.set_scroll_offset(id, &name, if down { y + page } else { (y - page).max(0.0) });
     }
 
     fn active_win(&self) -> Option<&Win> {

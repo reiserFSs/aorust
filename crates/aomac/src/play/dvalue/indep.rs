@@ -111,6 +111,10 @@ impl IndepPrefs {
             p.init_float(n, d, lo, hi, Kind::Login);
         }
         p.set_string("CCSelectedName", "", Kind::Login);
+        // the tail of `SetDefaultLoginPrefs`: one `InitDefaultInt(KEY_*, key, 0, 999999999)` per `InputConfig_t` hot key with a `KEY_` id (options/keys.rs `FIXED`)
+        for &(n, key) in crate::play::options::keys::FIXED {
+            p.init_int(n, key as i32, 0, 999_999_999, Kind::Login);
+        }
         for &(n, d, lo, hi) in CHAR_INTS {
             p.init_int(n, d, lo, hi, Kind::Char);
         }

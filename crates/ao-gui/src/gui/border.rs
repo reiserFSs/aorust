@@ -16,9 +16,6 @@ const BTN_EXT: f32 = 14.0;
 const BTN_Y: f32 = 5.0;
 /// `Layout` spacing `_DAT_101a9da0` (the double 5.0) added before every button.
 const BTN_GAP: f32 = 5.0;
-/// **GUESS** from the retail screenshot: the button rows start 3 px inside the outer border (measured: icon and close sit 8 px from the outer edge =
-/// the 3 px `WndBorder` border + the 5 px gap; `Layout` works on a rectangle whose origin was not decompiled).
-const BTN_INSET: f32 = 3.0;
 /// `FadeTo` target of a window that lost the pointer (`_DAT_101ae0ec`) and the durations in microseconds (`0xf4240` = 1 s out, `0x30d40` = 0.2 s in).
 const FADE_OUT_ALPHA: f32 = 0.3;
 const FADE_OUT_SECS: f32 = 1.0;
@@ -68,11 +65,13 @@ impl Border {
 }
 
 /// Screen rectangles (inclusive) of the border buttons of a window whose outer rectangle is `o`, in `Layout` order: the icon at the left, then
-/// close, pin and `?` from the right edge inwards (`x = R - w - acc`, `acc += 5` before and `+= w - 1` after each button).
+/// close, pin and `?` from the right edge inwards (`x = R - w - acc`, `acc += 5` before and `+= w - 1` after each button; `w` = 14, the extent of the
+/// 15 px sprite, which is what makes the pitch 18 = the `n * 18` of `TabView::SetLeftMargin` in `AddBorderView` 0x1015aa95). `o` is the outer frame: the
+/// buttons are children of the `WndBorder` view whose bounds `View::GetBounds` 0x1014af45 returns as `(0, 0, w, h)` (`Layout` uses them without any border inset).
 pub(super) fn layout(o: Rect, pin: bool, help: bool) -> Vec<(Btn, Rect)> {
     let y = o.t + BTN_Y;
-    let mut v = vec![(Btn::Icon, Rect::new(o.l + BTN_INSET + BTN_GAP, y, o.l + BTN_INSET + BTN_GAP + BTN_EXT, y + BTN_EXT))];
-    let right = o.r - BTN_INSET;
+    let mut v = vec![(Btn::Icon, Rect::new(o.l + BTN_GAP, y, o.l + BTN_GAP + BTN_EXT, y + BTN_EXT))];
+    let right = o.r;
     let mut acc = 0.0;
     for b in [Some(Btn::Close), pin.then_some(Btn::Pin), help.then_some(Btn::Help)].into_iter().flatten() {
         acc += BTN_GAP;
@@ -266,9 +265,9 @@ mod tests {
         let o = Rect::new(100.0, 50.0, 399.0, 249.0);
         let v = layout(o, true, true);
         let r = |b: Btn| v.iter().find(|x| x.0 == b).unwrap().1;
-        // icon: 3 + 5 from the left; close: 3 + 5 from the right (box = 15 px); pin / help 18 px apart
-        assert_eq!((r(Btn::Icon).l, r(Btn::Icon).t), (108.0, 55.0));
-        assert_eq!(r(Btn::Close).r, 399.0 - 3.0 - 5.0);
+        // `Layout` 0x1015a1d9: icon 5 from the left edge of the WndBorder frame, close 5 from the right (box = 15 px); pin / help 18 px apart
+        assert_eq!((r(Btn::Icon).l, r(Btn::Icon).t), (105.0, 55.0));
+        assert_eq!(r(Btn::Close).r, 399.0 - 5.0);
         assert_eq!(r(Btn::Close).width() + 1.0, 15.0);
         assert_eq!(r(Btn::Close).l - r(Btn::Pin).l, 18.0);
         assert_eq!(r(Btn::Pin).l - r(Btn::Help).l, 18.0);

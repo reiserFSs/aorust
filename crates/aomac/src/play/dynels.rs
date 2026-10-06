@@ -1070,7 +1070,7 @@ impl Dynels {
             let skin = built.held.as_ref().filter(|_| !p.submitted).map(|h| h.0.clone()).or(moved);
             p.submitted = true;
             let parts = built.held.as_ref().map_or(vec![], |h| h.1.clone());
-            host.actors.push(ActorFrame { id: p.id, model: p.key, transform, parts, skin, always: false });
+            host.actors.push(ActorFrame { id: p.id, model: p.key, transform, parts, skin, always: false, alpha: 1.0 });
         }
         self.advance(dt);
         for (id, c) in &mut self.chars {
@@ -1175,7 +1175,7 @@ impl Dynels {
             let (s, cs) = scene_yaw(c.pose.yaw).sin_cos();
             let k = c.scale;
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [p[0], p[1], p[2], 1.0]];
-            host.actors.push(ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), skin, always: false });
+            host.actors.push(ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), skin, always: false, alpha: 1.0 });
         }
         self.worker = Some(worker);
     }

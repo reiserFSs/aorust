@@ -249,6 +249,12 @@ impl DValues {
         self.take_changed(); // loading the user's files is not a change to save
     }
 
+    /// The character's prefs directory (`<prefs>/<account>/Char<id>/`, where `Prefs.xml` and the `DockAreas/` files of the `DockingController_c` live);
+    /// `None` before [`DValues::open_user`].
+    pub fn char_dir(&self) -> Option<&Path> {
+        self.files.as_ref().and_then(|f| f.chr.parent())
+    }
+
     /// `ControlCenterModule_c::SaveUserConfig` / `SaveAllConfig` (GUI 0x10067f57 / 0x1006806c): the three XML files and the two `.cfg`
     /// files. No-op before [`DValues::open_user`].
     pub fn save_user(&self) {
@@ -386,7 +392,7 @@ fn quote(s: &str) -> String {
     if s.contains('"') { format!("'{esc}'") } else { format!("\"{esc}\"") }
 }
 
-fn element_xml(e: &Element) -> String {
+pub(super) fn element_xml(e: &Element) -> String {
     let mut s = format!("<{}", e.name);
     for (k, v) in &e.attrs {
         s += &format!(" {k}={}", quote(v));

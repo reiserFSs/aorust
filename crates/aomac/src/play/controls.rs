@@ -6,10 +6,11 @@
 //! * Key ids are the client's own (`InputConfig_t` key table, GUI.dll 0x10262e20: 127 `{name*, id}` pairs); a binding is
 //!   `id | modifier bits` (SHIFT 0x20000, CTRL 0x40000, ALT 0x80000) -> provider hash -> slot. The defaults in
 //!   [`DEFAULT_BINDINGS`] are the `KeyBindings` archive of `cd_image/gui/Default/CharPrefs.xml` (provider = boost
-//!   `hash_combine` of the provider name, see [`provider_hash`]); [`Controls::from_char_prefs`] reads a saved one.
+//!   `hash_combine` of the provider name, see [`provider_hash`]); [`Controls::set_keys`] applies the live table (`options/keys.rs`).
 //! * Slots call `N3Msg_MovementChanged(action)` with `b` = *released*: press = `Forward(false)` = action 1, release = 2.
 //! * While a mouse-look is active the turn actions are remapped to strafes (`N3Msg_MovementChanged` @GC 0x10018b5c).
 
+use super::options::keys::{Bindings, FixedKeys};
 use ao_gui::MouseButton;
 use ao_render::KeyCode;
 
@@ -202,7 +203,7 @@ pub fn provider_hash(name: &str) -> u32 {
 }
 
 /// Default `KeyBindings` (CharPrefs.xml `Version` 7) for the slots above; the mouse middle button is input 9.
-/// Only the numpad `AutoRun` key exists on a full keyboard -- laptops need [`Controls::from_char_prefs`].
+/// Only the numpad `AutoRun` key exists on a full keyboard -- laptops rebind it on the options window's "Key bindings" page.
 pub const DEFAULT_BINDINGS: &[(u32, Slot)] = &[
     (id::MIDDLE_PRESS, Slot::Forward),
     (104, Slot::Forward), // W
@@ -238,17 +239,10 @@ pub const DEFAULT_BINDINGS: &[(u32, Slot)] = &[
     (37, Slot::Special(0x79)),            // . Bow special attack
 ];
 
-/// Fixed camera keys (GUI.dll input table text, `KEY_COMMAND_*`): numpad 4/6/2/8 rotate, + / - zoom, 7 save, 5 reset.
-const FIXED_BINDINGS: &[(u32, Slot)] = &[
-    (74, Slot::CameraRotateLeft),
-    (76, Slot::CameraRotateRight),
-    (72, Slot::CameraRotateUp),
-    (78, Slot::CameraRotateDown),
-    (69, Slot::CameraZoomIn),
-    (68, Slot::CameraZoomOut),
-    (77, Slot::CameraSetPreferred),
-    (75, Slot::CameraReset),
-];
+/// The fixed camera keys of the GUI.dll key table ([`fixed_camera`] reads them from [`FixedKeys`]): numpad 4/6/2/8 rotate, + / - zoom, 7 save, 5 reset.
+fn default_fixed() -> Vec<(u32, Slot)> {
+    fixed_camera(&FixedKeys::default())
+}
 
 /// The client's control options (`LoginPrefs.xml` "Control" block + `IndependentPrefs`).
 #[derive(Clone, Debug, PartialEq)]
@@ -275,6 +269,8 @@ pub struct ControlPrefs {
     pub preferred_camera_mode: u8,
     /// `ShowMyCharacter`: draw the own avatar in first person.
     pub show_my_character: bool,
+    /// `UseNoBobCamera` (Login pref, default 0): the look target ignores the head attractor's bobbing (`FUN_10020bdb` N3 0x10020bdb, `n3Camera_t+0x1e0`).
+    pub no_bob_camera: bool,
 }
 
 impl Default for ControlPrefs {
@@ -292,6 +288,7 @@ impl Default for ControlPrefs {
             third_person: true,
             preferred_camera_mode: 3,
             show_my_character: false,
+            no_bob_camera: false,
         }
     }
 }
@@ -317,6 +314,7 @@ impl ControlPrefs {
         p.show_my_character = b("ShowMyCharacter", p.show_my_character);
         p.mouse_wheel = d.get_i64("MouseWheel").unwrap_or(0).clamp(0, 2) as u8;
         p.mouse_look_inverted = d.prefs.get_int("MouseLookInverted", Kind::Login).unwrap_or(0) != 0;
+        p.no_bob_camera = d.prefs.get_int("UseNoBobCamera", Kind::Login).unwrap_or(0) != 0;
         p
     }
 
@@ -470,7 +468,7 @@ impl Controls {
     /// Client defaults ([`DEFAULT_BINDINGS`] + fixed camera keys).
     pub fn new(prefs: ControlPrefs) -> Self {
         let mut bindings = DEFAULT_BINDINGS.to_vec();
-        bindings.extend_from_slice(FIXED_BINDINGS);
+        bindings.extend(default_fixed());
         Self {
             prefs,
             bindings,
@@ -487,16 +485,12 @@ impl Controls {
         }
     }
 
-    /// The `KeyBindings` archive of a (saved) CharPrefs.xml replaces the movement/camera bindings. Entries with unknown
-    /// providers are ignored; the fixed camera keys stay.
-    pub fn from_char_prefs(prefs: ControlPrefs, xml: &str) -> Self {
-        let mut c = Self::new(prefs);
-        let table: Vec<(u32, Slot)> = parse_key_bindings(xml);
-        if !table.is_empty() {
-            c.bindings = table;
-            c.bindings.extend_from_slice(FIXED_BINDINGS);
-        }
-        c
+    /// The shared binding table changed (the options window's "Key bindings" page, the `KeyBindings` archive) or the fixed keys did (`Login.cfg` `KEY_*`):
+    /// every consumer of a key reads [`Bindings`] / [`FixedKeys`], so a rebind acts on the next key press.
+    pub fn set_keys(&mut self, b: &Bindings, f: &FixedKeys) {
+        let mut table: Vec<(u32, Slot)> = b.pairs().filter_map(|(i, p)| Some((i, slot_of(p)?))).collect();
+        table.extend(fixed_camera(f));
+        self.bindings = table;
     }
 
     /// CTRL or ALT is down (the `& 0xc` qualifier of `ActionViewMouseHandler_c`'s release slot; which bit is which is unresolved).
@@ -518,8 +512,8 @@ impl Controls {
         (if self.shift { id::SHIFT } else { 0 }) | (if self.ctrl { id::CTRL } else { 0 }) | (if self.alt { id::ALT } else { 0 })
     }
 
-    fn lookup(&self, input: u32) -> Option<Slot> {
-        self.bindings.iter().find(|b| b.0 == input).map(|b| b.1)
+    fn lookup(&self, input: u32) -> Vec<Slot> {
+        self.bindings.iter().filter(|b| b.0 == input).map(|b| b.1).collect()
     }
 
     /// A physical key changed. Repeats (a press of a key already down) are ignored.
@@ -540,13 +534,19 @@ impl Controls {
         let Some(kid) = key_id(code) else { return vec![] };
         // The arrow slots test Ctrl/Alt themselves (FUN_10027e46), so their bindings must match with those held:
         // [INFERENCE] the bare key id is the fallback for them.
-        let slot = self.lookup(kid | self.mods()).or_else(|| self.lookup(kid).filter(|s| s.is_global()));
-        let Some(slot) = slot else { return vec![] };
-        let typing_ok = slot.is_fixed_camera() || (slot.is_global() && (self.ctrl || self.alt));
-        if self.text_input && !typing_ok {
-            return vec![];
+        let mut slots = self.lookup(kid | self.mods());
+        if slots.is_empty() {
+            slots = self.lookup(kid).into_iter().filter(|s| s.is_global()).collect();
         }
-        self.press(input, slot)
+        // a key may drive several providers (the original has no conflict check: `FUN_100180fe` calls every provider of the input)
+        let mut out = vec![];
+        for slot in slots {
+            let typing_ok = slot.is_fixed_camera() || (slot.is_global() && (self.ctrl || self.alt));
+            if !self.text_input || typing_ok {
+                out.extend(self.press(input, slot));
+            }
+        }
+        out
     }
 
     fn press(&mut self, input: Input, slot: Slot) -> Vec<Cmd> {
@@ -592,8 +592,15 @@ impl Controls {
     }
 
     fn release(&mut self, input: Input) -> Vec<Cmd> {
-        let Some(i) = self.held.iter().position(|h| h.input == input) else { return vec![] };
-        let h = self.held.remove(i);
+        let mut out = vec![];
+        while let Some(i) = self.held.iter().position(|h| h.input == input) {
+            let h = self.held.remove(i);
+            out.extend(self.release_one(h));
+        }
+        out
+    }
+
+    fn release_one(&mut self, h: Held) -> Vec<Cmd> {
         match (h.slot, h.started) {
             (_, Some(a)) => vec![Cmd::Move(stop_of(a))],
             (Slot::CameraRotateLeft, _) => vec![cam_key(CamKey::RotateLeft, false)],
@@ -609,10 +616,14 @@ impl Controls {
     /// Mouse button press/release. Left/right drive mouse-look and clicks; the middle button is binding input 9.
     pub fn on_mouse_button(&mut self, button: MouseButton, pressed: bool) -> Vec<Cmd> {
         match (button, pressed) {
-            (MouseButton::Middle, true) => match self.lookup(id::MIDDLE_PRESS | self.mods()) {
-                Some(slot) if !self.held.iter().any(|h| h.input == Input::Middle) => self.press(Input::Middle, slot),
-                _ => vec![],
-            },
+            (MouseButton::Middle, true) if !self.held.iter().any(|h| h.input == Input::Middle) => {
+                let mut out = vec![];
+                for slot in self.lookup(id::MIDDLE_PRESS | self.mods()) {
+                    out.extend(self.press(Input::Middle, slot));
+                }
+                out
+            }
+            (MouseButton::Middle, true) => vec![],
             (MouseButton::Middle, false) => self.release(Input::Middle),
             (MouseButton::Left, true) => {
                 if self.prefs.lmb_mouse_look {
@@ -763,24 +774,28 @@ fn stop_of(start: u8) -> u8 {
     }
 }
 
-/// `Input`/`Provider` pairs of a CharPrefs.xml `KeyBindings` archive, restricted to the providers we know.
-fn parse_key_bindings(xml: &str) -> Vec<(u32, Slot)> {
-    let mut out = vec![];
-    let Some(start) = xml.find("name=\"KeyBindings\"") else { return out };
-    let mut input: Option<u32> = None;
-    for tag in xml[start..].split('<').skip(1) {
-        if tag.starts_with("Int32 name=\"Input\"") {
-            input = attr(tag, "value").and_then(|v| v.parse().ok());
-        } else if tag.starts_with("Int64 name=\"Provider\"") {
-            let (Some(i), Some(p)) = (input, attr(tag, "value").and_then(|v| v.parse::<u64>().ok())) else { continue };
-            if let Some(&(_, slot)) = PROVIDERS.iter().find(|(n, _)| u64::from(provider_hash(n)) == p) {
-                out.push((i, slot));
-            }
-        } else if tag.starts_with("/Array") {
-            break;
-        }
-    }
-    out
+/// The slot a provider hash drives (`FlowControlModule_t` registers these; the other providers belong to the HUD, `hud_keys.rs`).
+fn slot_of(hash: u32) -> Option<Slot> {
+    PROVIDERS.iter().find(|(n, _)| provider_hash(n) == hash).map(|&(_, s)| s)
+}
+
+/// The fixed camera keys (`KEY_COMMAND_*` of the GUI.dll hot key table, key = the `Login.cfg` int of that name, [`FixedKeys`]); the `_RELEASE` keys (`~ KEY`)
+/// are the key-up of the same key here.
+fn fixed_camera(f: &FixedKeys) -> Vec<(u32, Slot)> {
+    [
+        ("KEY_COMMAND_ROTATE_CAMERA_LEFT", Slot::CameraRotateLeft),
+        ("KEY_COMMAND_ROTATE_CAMERA_RIGHT", Slot::CameraRotateRight),
+        ("KEY_COMMAND_ROTATE_CAMERA_UP", Slot::CameraRotateUp),
+        ("KEY_COMMAND_ROTATE_CAMERA_DOWN", Slot::CameraRotateDown),
+        ("KEY_COMMAND_ZOOM_CAMERA_IN", Slot::CameraZoomIn),
+        ("KEY_COMMAND_ZOOM_CAMERA_OUT", Slot::CameraZoomOut),
+        ("KEY_COMMAND_CAMERA_SET_PREFERRED_POS", Slot::CameraSetPreferred),
+        ("KEY_COMMAND_CAMERA_RESET", Slot::CameraReset),
+    ]
+    .into_iter()
+    .filter(|(n, _)| f.get(n) != 0)
+    .map(|(n, s)| (f.get(n), s))
+    .collect()
 }
 
 #[cfg(test)]
@@ -821,7 +836,7 @@ mod tests {
     #[test]
     fn default_table_equals_client_char_prefs() {
         let Some(xml) = client_file("cd_image/gui/Default/CharPrefs.xml") else { return };
-        let mut parsed = parse_key_bindings(&xml);
+        let mut parsed: Vec<(u32, Slot)> = Bindings::from_archive(&xml).pairs().filter_map(|(i, p)| Some((i, slot_of(p)?))).collect();
         let mut ours = DEFAULT_BINDINGS.to_vec();
         parsed.sort_by_key(|b| b.0);
         ours.sort_by_key(|b| b.0);
@@ -987,10 +1002,29 @@ mod tests {
             r#"<Archive name="KeyBindings"><Array name="Bind"><Archive code="0"><Int32 name="Input" value="87" /><Int64 name="Provider" value="{}" /></Archive></Array></Archive>"#,
             provider_hash("MOVEMENT_JUMP")
         );
-        let mut c = Controls::from_char_prefs(ControlPrefs::default(), &xml);
+        let mut c = ctl();
+        c.set_keys(&Bindings::from_archive(&xml), &FixedKeys::default());
         assert_eq!(c.on_key(KeyW, true), vec![]); // 87 is 'F' in the client table, W is no longer bound
         assert_eq!(c.on_key(KeyF, true), vec![Cmd::Move(0xF)]);
         assert_eq!(c.on_key(Numpad5, true), vec![Cmd::Camera(CamCmd::Reset)]);
+    }
+
+    /// One key may drive several providers (no conflict rule in the original); a rebound fixed camera key (`KEY_*` login pref) moves the camera command.
+    #[test]
+    fn one_key_drives_every_provider_and_fixed_keys_follow_the_prefs() {
+        let mut b = Bindings::default();
+        b.add(87, provider_hash("MOVEMENT_JUMP"));
+        b.add(87, provider_hash("ACTION_SIT"));
+        let mut c = ctl();
+        c.set_keys(&b, &FixedKeys::default());
+        assert_eq!(c.on_key(KeyF, true), vec![Cmd::Move(0xF), Cmd::Sit]);
+        let mut p = crate::play::dvalue::IndepPrefs::with_defaults();
+        p.set_int("KEY_COMMAND_CAMERA_RESET", 87 | id::CTRL as i32, crate::play::dvalue::Kind::Login);
+        c.set_keys(&b, &FixedKeys::from_prefs(&p));
+        assert_eq!(c.on_key(Numpad5, true), vec![]);
+        assert_eq!(c.on_key(ControlLeft, true), vec![]);
+        assert_eq!(c.on_key(KeyF, false), vec![]);
+        assert_eq!(c.on_key(KeyF, true), vec![Cmd::Camera(CamCmd::Reset)]);
     }
 
     #[test]

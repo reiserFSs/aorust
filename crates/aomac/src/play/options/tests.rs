@@ -103,7 +103,7 @@ impl Rig {
 
 #[test]
 fn config_archive_round_trips_and_reads_the_shipped_template() {
-    let c = Config { frame: [10.0, 20.0, 460.0, 500.0], folders: vec!["GUI".into(), "Video".into()], selected: "GUIControl Center".into(), tab: 1, scroll: 3.5 };
+    let c = Config { hotkeys: Default::default(), frame: [10.0, 20.0, 460.0, 500.0], folders: vec!["GUI".into(), "Video".into()], selected: "GUIControl Center".into(), tab: 1, scroll: 3.5 };
     assert_eq!(Config::parse(&c.archive()), Some(c.clone()));
     // the shape of `prefs/NewChar/Prefs.xml` (TinyXML single-quoted strings)
     let t = r#"<Archive name="OptionWindowConfig" code="0"><Rect name="WindowFrame" value="Rect(200.000000,200.000000,651.000000,670.000000)" /><Bool name="WindowPinButtonState" value="false" /><String name="open_panel_folders" value='&quot;GUI&quot;' /><String name="selected_panel" value='&quot;GUIControl Center&quot;' /><Int32 name="selected_tab" value="0" /></Archive>"#;
@@ -365,4 +365,244 @@ fn esc_closes_only_windows_whose_option_was_set_when_they_opened() {
     o.arm_esc(K::Options, &d);
     o.disarm_esc(K::Options);
     assert_eq!(o.take_esc(), [K::Inventory]);
+}
+
+// ------------------------------------------------------------------------------------------------ Fixed keys / Key bindings tabs
+
+const FX: &str = "<font color=green>Fixed keys</font>";
+
+fn fx(path: &str) -> String {
+    format!("{FX}/{path}")
+}
+
+impl Rig {
+    fn select_tab(&mut self, i: usize) {
+        let id = self.win();
+        let (tabs, _) = self.gui.window_tabs(id);
+        self.gui.set_window_tabs(id, &tabs, i);
+        let e = Event::TabSelected { window: id, index: i };
+        self.opt.event(&mut self.gui, &e, &mut self.d);
+        self.tick();
+    }
+
+    fn rows(&self) -> Vec<(keypage::Row, Vec<String>)> {
+        let id = self.win();
+        let ids = self.gui.multi_row_ids(id, keypage::BINDS);
+        assert_eq!(ids.len(), self.opt.keypages.rows().len());
+        self.opt.keypages.rows().iter().map(|r| (*r, vec![])).collect()
+    }
+
+    fn row_of(&self, provider: &str, input: u32) -> usize {
+        let h = keys::provider_hash(provider);
+        self.opt.keypages.rows().iter().position(|r| r.provider == h && r.input == input).unwrap_or_else(|| panic!("no row {provider} {input}"))
+    }
+
+    fn bindings(&self) -> keys::Bindings {
+        match self.d.get("KeyBindings") {
+            Some(Variant::Archive(t)) => keys::Bindings::from_archive(t),
+            _ => panic!("no KeyBindings"),
+        }
+    }
+
+    /// Clicks a button of the open "Bind Key" dialog (0 = OK, 1 = Cancel).
+    fn dialog(&mut self, button: usize) {
+        let w = self.opt.keypages.dialog_windows()[0];
+        let r = self.gui.view_rect(w, &format!("btn{button}")).unwrap();
+        let (x, y) = (r.l + 3.0, r.t + 3.0);
+        self.send(InputEvent::MouseMove { x, y });
+        self.send(InputEvent::MouseDown { x, y, button: MouseButton::Left });
+        self.send(InputEvent::MouseUp { x, y, button: MouseButton::Left });
+    }
+
+    fn press_key(&mut self, input: u32) {
+        let (gui, d) = (&mut self.gui, &mut self.d);
+        self.opt.capture(gui, d, input);
+    }
+}
+
+#[test]
+fn window_has_the_three_tabs_and_both_key_pages_list_the_client_data() {
+    let Some(r) = Rig::new() else { return };
+    let id = r.win();
+    assert_eq!(r.gui.window_tabs(id).0, ["Preferences", "Fixed keys", "Key bindings"]);
+    // Fixed keys: HotKeys.xml -> 3 folders, 4 + 4 + 8 rows; the key column reads the table
+    assert_eq!(r.opt.keypages.fixed_rows(), 16);
+    // the outer `#FixedKeys` group (`mode="fixed"`) holds the three groups; ids chain the labels (`FUN_100bf37c`)
+    let item = |name: &str| r.gui.list_item(id, keypage::FIXED, &fx(name)).cloned();
+    assert!(r.gui.list_item(id, keypage::FIXED, FX).is_some_and(|f| f.folder && !f.selectable && !f.open), "closed by default");
+    let all: Vec<String> = ["Chat", "Targeting", "Camera keys 3rd person"].iter().filter_map(|n| item(n).map(|i| i.label)).collect();
+    assert_eq!(all.len(), 3, "{all:?}");
+    // Key bindings: one row per provider key; rows start with the lowest provider hash
+    let rows = r.rows();
+    let n_keys: usize = keys::registry(&|_: &str| String::new()).iter().map(|p| keys::Bindings::default().inputs(p.hash).len().max(1)).sum();
+    assert!(rows.len() > n_keys, "defaults give some providers several keys: {} rows", rows.len());
+    assert!(rows.windows(2).all(|w| w[0].0.provider <= w[1].0.provider));
+    let jump = r.row_of("MOVEMENT_JUMP", 23);
+    assert_eq!(jump, r.rows().iter().position(|(x, _)| x.provider == keys::provider_hash("MOVEMENT_JUMP")).unwrap());
+}
+
+/// The whole path: Change -> "Bind Key" dialog -> press a key -> OK writes the `KeyBindings` archive, the controls obey the new key at once.
+#[test]
+fn rebinding_in_the_page_changes_the_key_the_controls_react_to() {
+    use crate::play::controls::{Cmd, Controls, ControlPrefs};
+    use ao_render::KeyCode::*;
+    let Some(mut r) = Rig::new() else { return };
+    r.select_tab(2);
+    let row = r.row_of("MOVEMENT_JUMP", 23);
+    r.opt.keypages.select_row(&mut r.gui, row);
+    r.click("kb_change");
+    assert!(r.opt.capturing(), "the Bind Key dialog is open");
+    // Esc is not a key to bind; F5 is
+    r.press_key(43);
+    r.dialog(0);
+    assert!(!r.opt.capturing());
+    let b = r.bindings();
+    let jump = keys::provider_hash("MOVEMENT_JUMP");
+    assert_eq!(b.inputs(jump), [43], "Space is replaced by F5");
+    let mut c = Controls::new(ControlPrefs::default());
+    assert_eq!(c.on_key(Space, true), vec![Cmd::Move(0xF)], "defaults");
+    c.set_keys(&b, &keys::FixedKeys::default());
+    assert_eq!(c.on_key(F5, true), vec![Cmd::Move(0xF)]);
+    assert_eq!(c.on_key(Space, true), vec![]);
+    // the row shows the key
+    assert!(r.opt.keypages.rows().iter().any(|x| x.provider == jump && x.input == 43));
+    // Cancel changes nothing
+    let row = r.row_of("MOVEMENT_JUMP", 43);
+    r.opt.keypages.select_row(&mut r.gui, row);
+    r.click("kb_change");
+    r.press_key(44);
+    r.dialog(1);
+    assert_eq!(r.bindings().inputs(jump), [43]);
+}
+
+#[test]
+fn add_clear_and_reset_all() {
+    let Some(mut r) = Rig::new() else { return };
+    r.select_tab(2);
+    let inv = keys::provider_hash("WINDOW_INVENTORY");
+    // Add: a second key for a function that has one -> a second row
+    let row = r.row_of("WINDOW_INVENTORY", 90);
+    r.opt.keypages.select_row(&mut r.gui, row);
+    r.click("kb_add");
+    r.press_key(43 | crate::play::controls::id::SHIFT);
+    r.dialog(0);
+    assert_eq!(r.bindings().inputs(inv), [90, 43 | 0x20000]);
+    // the same key twice is not added again
+    let row = r.row_of("WINDOW_INVENTORY", 90);
+    r.opt.keypages.select_row(&mut r.gui, row);
+    r.click("kb_add");
+    r.press_key(43 | crate::play::controls::id::SHIFT);
+    r.dialog(0);
+    assert_eq!(r.bindings().inputs(inv), [90, 43 | 0x20000]);
+    // Clear removes the selected key; with another one left its row disappears ...
+    let row = r.row_of("WINDOW_INVENTORY", 90);
+    r.opt.keypages.select_row(&mut r.gui, row);
+    r.click("kb_clear");
+    assert_eq!(r.bindings().inputs(inv), [43 | 0x20000]);
+    // ... the last key leaves the function unbound (a row with input 0)
+    let row = r.row_of("WINDOW_INVENTORY", 43 | 0x20000);
+    r.opt.keypages.select_row(&mut r.gui, row);
+    r.click("kb_clear");
+    assert!(r.bindings().inputs(inv).is_empty());
+    r.row_of("WINDOW_INVENTORY", 0);
+    // Reset All restores the shipped table
+    r.click("kb_reset");
+    assert_eq!(r.bindings().inputs(inv), [90]);
+    let shipped = std::fs::read_to_string(ao_gui::client_dir().join("cd_image/gui/Default/CharPrefs.xml")).unwrap();
+    assert_eq!(r.bindings(), keys::Bindings::from_archive(&shipped));
+}
+
+#[test]
+fn fixed_keys_follow_login_cfg_and_the_hotkey_config_persists() {
+    let Some(mut r) = Rig::new() else { return };
+    let id = r.win();
+    r.select_tab(1);
+    assert_eq!(r.gui.list_item(id, keypage::FIXED, &fx("Chat/Scroll chat up")).map(|i| i.aux.clone()), Some("PGUP".into()));
+    r.d.prefs.set_int("KEY_COMMAND_CHAT_HISTORY_PAGE_UP", 30 | 0x40000, Kind::Login);
+    r.tick();
+    assert_eq!(r.gui.list_item(id, keypage::FIXED, &fx("Chat/Scroll chat up")).map(|i| i.aux.clone()), Some("CTRL+PGUP".into()));
+    // folder state and the tab survive a close
+    r.gui.list_open_folder(id, keypage::FIXED, FX, true);
+    r.gui.list_open_folder(id, keypage::FIXED, &fx("Chat"), true);
+    let (gui, d) = (&mut r.gui, &mut r.d);
+    r.opt.close(gui, d);
+    let Some(Variant::Archive(a)) = r.d.get(CONFIG) else { panic!() };
+    assert!(a.contains("open_hotkey_folders"), "{a}");
+    assert_eq!(Config::parse(a).unwrap().hotkeys.folders, [FX.to_string(), fx("Chat")]);
+    assert_eq!(Config::parse(a).unwrap().tab, 1);
+}
+
+#[test]
+fn key_page_shots() {
+    let Some(mut r) = Rig::new() else { return };
+    let size = (900, 740);
+    let mut off = Offscreen::new(&r, size).unwrap();
+    r.opt.set_screen(size);
+    let id = r.win();
+    r.gui.list_open_folder(id, keypage::FIXED, FX, true);
+    r.gui.list_open_folder(id, keypage::FIXED, &fx("Chat"), true);
+    r.gui.list_open_folder(id, keypage::FIXED, &fx("Targeting"), true);
+    r.gui.list_open_folder(id, keypage::FIXED, &fx("Camera keys 3rd person"), true);
+    let mut snap = |r: &mut Rig, name: &str| {
+        let mut list = DrawList::default();
+        for _ in 0..3 {
+            list = off.frame(r, 0.016);
+        }
+        if let Some(dir) = std::env::var_os("AOMAC_SHOT_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            off.png(r, &list, &std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
+        }
+    };
+    r.select_tab(1);
+    snap(&mut r, "options_fixed_keys");
+    r.select_tab(2);
+    snap(&mut r, "options_key_bindings");
+    let row = r.row_of("MOVEMENT_JUMP", 23);
+    r.opt.keypages.select_row(&mut r.gui, row);
+    r.click("kb_change");
+    r.press_key(43 | crate::play::controls::id::CTRL);
+    snap(&mut r, "options_bind_key");
+}
+
+/// The rebinding is saved in the character prefs like the original (`KeyBindings` archive of `Prefs.xml`) and survives a restart, also with every key cleared.
+#[test]
+fn key_bindings_persist_in_the_char_prefs() {
+    let Some(mut r) = Rig::new() else { return };
+    let dir = ao_gui::client_dir();
+    let mut b = r.bindings();
+    let jump = keys::provider_hash("MOVEMENT_JUMP");
+    b.remove(23, jump);
+    b.add(43, jump);
+    r.d.set("KeyBindings", Variant::Archive(b.archive()));
+    let saved = r.d.save_config(super::super::dvalue::CAT_CHAR);
+    assert!(saved.contains("name=\"KeyBindings\""), "{saved}");
+    let mut fresh = DValues::new(&dir);
+    fresh.load_config(&saved, super::super::dvalue::CAT_CHAR, false);
+    let Some(Variant::Archive(t)) = fresh.get("KeyBindings") else { panic!() };
+    assert_eq!(keys::Bindings::from_archive(t), b);
+    // everything cleared: the saved empty table does not get the defaults back
+    let empty = keys::Bindings::default();
+    r.d.set("KeyBindings", Variant::Archive(empty.archive()));
+    let saved = r.d.save_config(super::super::dvalue::CAT_CHAR);
+    let mut fresh = DValues::new(&dir);
+    fresh.load_config(&saved, super::super::dvalue::CAT_CHAR, false);
+    let Some(Variant::Archive(t)) = fresh.get("KeyBindings") else { panic!() };
+    assert_eq!(keys::Bindings::from_archive(t).pairs().count(), 0);
+}
+
+/// OK without a pressed key commits input 0 (`FUN_100bc229` has no guard): Change unbinds the key, the row shows `NoKey`.
+#[test]
+fn ok_without_a_key_binds_input_zero() {
+    let Some(mut r) = Rig::new() else { return };
+    r.select_tab(2);
+    let jump = keys::provider_hash("MOVEMENT_JUMP");
+    let row = r.row_of("MOVEMENT_JUMP", 23);
+    r.opt.keypages.select_row(&mut r.gui, row);
+    r.click("kb_change");
+    r.dialog(0);
+    assert_eq!(r.bindings().inputs(jump), [0]);
+    r.row_of("MOVEMENT_JUMP", 0);
+    let mut c = crate::play::controls::Controls::new(Default::default());
+    c.set_keys(&r.bindings(), &keys::FixedKeys::default());
+    assert_eq!(c.on_key(ao_render::KeyCode::Space, true), vec![]);
 }

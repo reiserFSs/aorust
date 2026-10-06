@@ -6,6 +6,8 @@
 //! archive (`LoadWndConfig`). The Preferences tab is an `OptionCategoryPanel_c` (`FUN_100c1053`: the category tree and the two buttons `Quit2Windows` / `Quit2Login`) next to a
 //! `ViewSelector_c` holding one page per `ScrollView` of `OptionPanel/Root.xml` (`FUN_100c3691`); every control is bound to its variable ([`model`]).
 
+mod keypage;
+pub(super) mod keys;
 mod live;
 mod model;
 
@@ -23,6 +25,8 @@ const DEFAULT_FRAME: [f32; 4] = [200.0, 200.0, 600.0, 400.0];
 const CONFIG: &str = "OptionWindowConfig";
 const TREE: &str = "tree";
 const PAGES: &str = "pages";
+/// The `ViewSelector` holding the three tab views (`Window::AppendTab`).
+const TABS: &str = "tabs";
 /// Style-0 frame insets (docs/gui.md §6.1): client = outer - (10, 31).
 const CHROME: (u32, u32) = (10, 31);
 /// `Slider_c` art: `GFX_GUI_CONTROLCENTER_AGGDEF_SLIDER_BACKGROUND` (id 0x92) and the knob `..._SLIDER` (0x91, 11 x 18, tinted DEFAULT) -- docs/gui.md §10.
@@ -48,11 +52,13 @@ struct Config {
     selected: String,
     tab: i32,
     scroll: f32,
+    /// The `hotkey_config` sub-archive (`FUN_100bd921`): the Fixed keys list.
+    hotkeys: keypage::HotkeyConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { frame: DEFAULT_FRAME, folders: vec![], selected: String::new(), tab: 0, scroll: 0.0 }
+        Config { frame: DEFAULT_FRAME, folders: vec![], selected: String::new(), tab: 0, scroll: 0.0, hotkeys: Default::default() }
     }
 }
 
@@ -88,6 +94,17 @@ impl Config {
                 _ => {}
             }
         }
+        if let Some(h) = a.children.iter().find(|e| e.name == "Archive" && e.attr("name") == Some("hotkey_config")) {
+            for e in &h.children {
+                let (Some(name), Some(v)) = (e.attr("name"), e.attr("value")) else { continue };
+                match (e.name.as_str(), name) {
+                    ("String", "open_hotkey_folders") => c.hotkeys.folders.push(unq(v)),
+                    ("String", "selected_hotkey") => c.hotkeys.selected = unq(v),
+                    ("Float", "list_scroll_offset") => c.hotkeys.scroll = v.trim().parse().unwrap_or(0.0),
+                    _ => {}
+                }
+            }
+        }
         Some(c)
     }
 
@@ -102,7 +119,14 @@ impl Config {
         s += &format!("<String name=\"selected_panel\" value={} />", string_attr(&self.selected));
         s += &format!("<Int32 name=\"selected_tab\" value=\"{}\" />", self.tab);
         s += &format!("<Float name=\"panel_list_scroll_offset\" value=\"{:.6}\" />", self.scroll);
-        s += "<Archive code=\"0\" name=\"hotkey_config\"><Float name=\"list_scroll_offset\" value=\"0.000000\" /></Archive></Archive>";
+        s += "<Archive code=\"0\" name=\"hotkey_config\">";
+        for f in &self.hotkeys.folders {
+            s += &format!("<String name=\"open_hotkey_folders\" value={} />", string_attr(f));
+        }
+        if !self.hotkeys.selected.is_empty() {
+            s += &format!("<String name=\"selected_hotkey\" value={} />", string_attr(&self.hotkeys.selected));
+        }
+        s += &format!("<Float name=\"list_scroll_offset\" value=\"{:.6}\" /></Archive></Archive>", self.hotkeys.scroll);
         s
     }
 }
@@ -155,6 +179,8 @@ pub(super) struct HudOptions {
     live: live::Live,
     dir: std::path::PathBuf,
     esc: Vec<super::hud::WindowKind>,
+    /// The "Fixed keys" and "Key bindings" tabs ([`keypage`]).
+    keypages: keypage::KeyPages,
 }
 
 fn borders(b: &str) -> String {
@@ -224,11 +250,24 @@ impl HudOptions {
             let a = r.children.iter().find(|c| c.name == "Archive" && c.attr("name") == Some(CONFIG))?;
             Config::parse(&xml_text(a))
         });
-        Ok(Self { pages: model::parse(&root), texts: TextDb::load(dir)?, template, screen, win: None, closed: false, actions: vec![], live: live::Live::default(), dir: dir.to_path_buf(), esc: vec![] })
+        let texts = TextDb::load(dir)?;
+        let keypages = keypage::KeyPages::new(dir, &texts, screen);
+        Ok(Self { pages: model::parse(&root), texts, template, screen, win: None, closed: false, actions: vec![], live: live::Live::default(), dir: dir.to_path_buf(), esc: vec![], keypages })
     }
 
     pub(super) fn set_screen(&mut self, screen: (u32, u32)) {
         self.screen = screen;
+        self.keypages.set_screen(screen);
+    }
+
+    /// The "Bind Key" dialog is open: key presses are captured for the binding ([`Self::capture`]).
+    pub(super) fn capturing(&self) -> bool {
+        self.keypages.capturing()
+    }
+
+    /// A key (`key id | modifiers`) pressed while the "Bind Key" dialog is open.
+    pub(super) fn capture(&mut self, gui: &mut Gui, _d: &mut DValues, input: u32) {
+        self.keypages.capture(gui, input);
     }
 
     pub(super) fn take_closed(&mut self) -> bool {
@@ -299,8 +338,11 @@ impl HudOptions {
             pages_xml += &page_xml(p, i, &mut n);
         }
         let (quit_win, quit_login) = ["Quit2Windows", "Quit2Login"].map(|k| self.texts.by_key(CAT_GUI, k).unwrap_or_else(|| k.to_string())).into();
+        let has_fixed = self.keypages.has_fixed();
+        let (fixed_tab, bind_tab) = self.keypages.xml();
+        let fixed_tab = if has_fixed { fixed_tab } else { String::new() };
         let src = format!(
-            "<root><View view_layout=\"horizontal\" h_alignment=\"left\">\
+            "<root><ViewSelector name=\"{TABS}\"><View view_layout=\"horizontal\" h_alignment=\"left\">\
              <View view_layout=\"vertical\" layout_borders=\"Rect(10,10,0,10)\">\
              <BorderView layout_borders=\"Rect(0,0,5,10)\"><View layout_borders=\"Rect(5,5,5,5)\"><StringListView name=\"{TREE}\" v_scrollbar_mode=\"auto\" max_size=\"Point(16000,16000)\"/></View></BorderView>\
              <View view_layout=\"horizontal\"><HLayoutSpacer/><View view_layout=\"vertical\">\
@@ -308,7 +350,7 @@ impl HudOptions {
              <Button name=\"b2\" label=\"{}\" layout_borders=\"Rect(5,10,5,0)\" width_group=\"QuitButtons\"/>\
              </View><HLayoutSpacer/></View></View>\
              <BorderView layout_borders=\"Rect(5,10,10,10)\"><View layout_borders=\"Rect(5,5,5,5)\"><ViewSelector name=\"{PAGES}\">{pages_xml}</ViewSelector></View></BorderView>\
-             </View></root>",
+             </View>{fixed_tab}{bind_tab}</ViewSelector></root>",
             esc(&quit_win),
             esc(&quit_login)
         );
@@ -368,6 +410,24 @@ impl HudOptions {
             gui.list_select(id, TREE, &leaf, true, false);
         }
         gui.select_child(id, PAGES, Some(selected));
+        // `AppendTab("Preferences")`, `AppendTab("Fixed keys")` (only when HotKeys.xml loaded), `AppendTab("Key bindings")`
+        let mut tabs = vec!["Preferences".to_string()];
+        if has_fixed {
+            tabs.push("Fixed keys".into());
+            self.keypages.populate_fixed(gui, id, &keys::FixedKeys::from_prefs(&d.prefs), &cfg.hotkeys, &self.texts);
+        }
+        tabs.push("Key bindings".into());
+        let table = match d.get("KeyBindings") {
+            Some(Variant::Archive(t)) => keys::Bindings::from_archive(t),
+            _ => keys::Bindings::default(),
+        };
+        self.keypages.populate_binds(gui, id, &table, &self.texts);
+        let sel = (cfg.tab.max(0) as usize).min(tabs.len() - 1);
+        gui.set_window_tabs(id, &tabs, sel);
+        gui.select_child(id, TABS, Some(sel));
+        if let Some(w) = self.win.as_mut() {
+            w.tab = sel as i32;
+        }
     }
 
     /// `OptionWindow_c` dtor: the frame, open folders and selection go into `OptionWindowConfig` (the flow saves the DValue files).
@@ -379,6 +439,8 @@ impl HudOptions {
         }
         cfg.folders = w.folders.iter().filter(|f| gui.list_item(w.id, TREE, f).is_some_and(|i| i.open)).cloned().collect();
         cfg.selected = w.leaves.get(w.selected).cloned().unwrap_or_default();
+        cfg.hotkeys = self.keypages.save_fixed(gui, &self.texts);
+        self.keypages.close(gui);
         gui.close_window(w.id);
         d.set(CONFIG, Variant::Archive(cfg.archive()));
     }
@@ -388,6 +450,8 @@ impl HudOptions {
     pub(super) fn update(&mut self, gui: &mut Gui, d: &DValues, res: &dyn Fn(&str, &str) -> Option<i64>) {
         let Some(w) = self.win.as_mut() else { return };
         let id = w.id;
+        self.keypages.sync(gui, d, &self.texts);
+        self.keypages.refresh_fixed(gui, &keys::FixedKeys::from_prefs(&d.prefs));
         let dragging = w.grab.map(|g| g.0);
         for (i, c) in w.controls.iter_mut().enumerate() {
             let on = c.opt.enable.is_empty() || ao_gui::expr::truthy(&c.opt.enable, res);
@@ -430,7 +494,15 @@ impl HudOptions {
     /// Handles the window's events; true when consumed.
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, d: &mut DValues) -> bool {
         let Some(w) = self.win.as_mut() else { return false };
+        if self.keypages.event(gui, ev, d, &self.texts) {
+            return true;
+        }
         match ev {
+            Event::TabSelected { window, index } if *window == w.id => {
+                w.tab = *index as i32;
+                gui.select_child(w.id, TABS, Some(*index));
+                true
+            }
             Event::CloseRequested { window } if *window == w.id => {
                 self.closed = true;
                 true
@@ -470,6 +542,8 @@ impl HudOptions {
     pub(super) fn input(&mut self, gui: &mut Gui, d: &mut DValues, ev: &InputEvent) {
         let Some(w) = self.win.as_mut() else { return };
         match *ev {
+            // the bind dialog takes the middle button as a key (`FUN_100bc58e`: input 9)
+            InputEvent::MouseDown { button: MouseButton::Middle, .. } if self.keypages.capturing() => self.keypages.capture_mouse(gui, 9),
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
                 let page = w.selected;
                 let viewport = gui.view_rect(w.id, &format!("pg{page}"));

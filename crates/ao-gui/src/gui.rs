@@ -25,6 +25,7 @@ mod hscroll;
 mod listview;
 mod popup;
 mod select;
+mod textfade;
 mod tooltip;
 
 pub use frame::{clamp_outer, dragged_rect, hit_item, insert_index};
@@ -147,6 +148,8 @@ pub struct Gui {
     tip: tooltip::TipState,
     /// `FadeGroupController_c` (`gui/fade.rs`).
     fade: fade::FadeCtl,
+    /// Chat text areas with message fading on (`gui/textfade.rs`), keyed by the hidden `ScrollView`.
+    text_fades: HashMap<ViewId, textfade::TextFade>,
 }
 
 fn px(r: Rect) -> [f32; 4] {
@@ -214,6 +217,7 @@ impl Gui {
             warnings: Vec::new(),
             tip: Default::default(),
             fade: Default::default(),
+            text_fades: HashMap::new(),
         })
     }
 
@@ -630,6 +634,10 @@ impl Gui {
             self.relayout_window(w);
         }
     }
+    /// `View::IsVisible` of the named view (false when it does not exist).
+    pub fn is_visible(&self, w: WindowId, name: &str) -> bool {
+        self.find(w, name).is_some_and(|v| self.tree.views[v].visible)
+    }
     /// `View::IsEnabled` of the named view (false when it does not exist).
     pub fn is_enabled(&self, w: WindowId, name: &str) -> bool {
         self.find(w, name).is_some_and(|v| self.tree.views[v].enabled)
@@ -849,6 +857,7 @@ impl Gui {
         self.tick_fade_groups(dt);
         self.sel_autoscroll(dt);
         self.tick_window_fades(dt);
+        self.tick_text_fades();
         let mut out = DrawList::default();
         let mut order: Vec<(WindowId, &Window)> = self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (i, w))).collect();
         order.sort_by_key(|(_, w)| w.layer); // stable: creation order inside a layer
@@ -946,6 +955,9 @@ impl Gui {
 
     #[allow(clippy::too_many_arguments)]
     fn draw_view(&mut self, id: ViewId, ox: f32, oy: f32, parent_tint: [u8; 3], parent_alpha: f32, is_root: bool, out: &mut Vec<DrawCmd>) {
+        if !is_root && self.text_fades.contains_key(&id) {
+            return self.draw_fade_lines(id, ox, oy, parent_tint, out); // the text area is hidden; its fade lines ignore `parent_alpha`
+        }
         let v = self.tree.views[id].clone();
         if !v.visible {
             return;

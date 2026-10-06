@@ -186,6 +186,80 @@ fn phase(a: &CatAnim, ms: f32) -> f32 {
     ((clip_time(a, ms, false) - s) / (e - s)).clamp(0.0, 1.0)
 }
 
+/// The own-character fade (`FadeCharacter*` Char prefs). Consumer: `VisualCATMesh_t::RefreshAlpha` (DisplaySystem 0x10073b7f, run every frame by
+/// `VisualCATMesh_t::RunFunction` 0x10074bb4); the prefs reach it through the changed callbacks `FUN_10072c3c/4d/5b/69` (registered with fire-now
+/// in the constructor 0x100745e8) into `DAT_1015082c`, `DAT_100af880` (start), `DAT_100af884` (end) and `DAT_100af888` = `1 - endAlpha`.
+/// Only the own character's mesh has the fade flag (`n3VisualDynel_t::SetCatMesh` N3 0x10019fb2 sets `VisualCATMesh_t+0x98` from
+/// `n3Dynel_t::IsClientChar`, the constructor 0x10019365 stores it at `+0xc8`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fade {
+    pub on: bool,
+    pub start: f32,
+    pub end: f32,
+    pub end_alpha: f32,
+}
+
+impl Default for Fade {
+    /// The registered defaults (`SetDefaultCharPrefs` GUI 0x1012447a): on, 1.5 m, 0.7 m, 0.15.
+    fn default() -> Self {
+        Self { on: true, start: 1.5, end: 0.7, end_alpha: 0.15 }
+    }
+}
+
+/// The threshold `RefreshAlpha` compares the new factor against before it calls `SetAlpha` (`_DAT_10090a50`, the double 0.01).
+const FADE_EPSILON: f32 = 0.01;
+
+impl Fade {
+    /// The current pref values.
+    pub fn from_prefs(p: &super::dvalue::IndepPrefs) -> Self {
+        use super::dvalue::Kind::Char;
+        let d = Self::default();
+        Self {
+            on: p.get_int("FadeCharacter", Char).map_or(d.on, |v| v != 0),
+            start: p.get_float("FadeCharacterStartDist", Char).unwrap_or(d.start),
+            end: p.get_float("FadeCharacterEndDist", Char).unwrap_or(d.end),
+            end_alpha: p.get_float("FadeCharacterEndAlpha", Char).unwrap_or(d.end_alpha),
+        }
+    }
+
+    /// The opacity factor of `RefreshAlpha` for a squared distance between the head attractor and the camera: 1 beyond `start`; inside it
+    /// a linear ramp in the distance down to `1 - endAlpha` at `min(end, start)`, which is kept closer than that. (At `endAlpha` 0.15 the
+    /// character is never more than 15 % transparent; the option is called "Max transparency level".)
+    pub fn factor(&self, dist_sq: f32) -> f32 {
+        if !self.on || dist_sq >= self.start * self.start {
+            return 1.0;
+        }
+        let k = 1.0 - self.end_alpha;
+        let end = self.end.min(self.start);
+        if dist_sq > end * end {
+            (1.0 - k) * ((dist_sq.sqrt() - end) / (self.start - end)) + k
+        } else {
+            k
+        }
+    }
+}
+
+/// The cached factor of `VisualCATMesh_t+0x94` (starts at 1): `RefreshAlpha(false)` takes a new value only when it moved by more than 0.01.
+#[derive(Clone, Copy, Debug)]
+pub struct Fader(f32);
+
+impl Default for Fader {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl Fader {
+    /// One `RunFunction`: returns the opacity to draw with.
+    pub fn step(&mut self, fade: &Fade, dist_sq: f32) -> f32 {
+        let f = fade.factor(dist_sq);
+        if (f - self.0).abs() > FADE_EPSILON {
+            self.0 = f;
+        }
+        self.0
+    }
+}
+
 pub struct Avatar {
     id: u32,
     rig: ActorRig,
@@ -288,7 +362,7 @@ impl Avatar {
     pub fn frame(&self) -> ActorFrame {
         let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
         let (skin, parts) = self.rig.pose(clip);
-        ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, skin: Some(skin), always: true }
+        ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, skin: Some(skin), always: true, alpha: 1.0 }
     }
 
     /// `n3Dynel_t::GetBodyCollSphereRadi` (N3 0x10004dd3): the model's torso sphere radius (`VisualCATMesh_t::GetTorsoSphereRadi`), 0.5 when
@@ -309,6 +383,14 @@ impl Avatar {
     pub fn head_height(&self) -> Option<f32> {
         let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
         self.rig.head_attractor(clip).map(|p| p[1] * self.scale)
+    }
+
+    /// Scene position of the head attractor (`Attractor01_head`) in the current pose, the point `RefreshAlpha` measures the camera distance
+    /// from (attractor translation x body scale, through the CAT frame's world matrix); the feet for a model without one (the identity
+    /// attractor matrix `RefreshAlpha` starts from).
+    pub fn head_position(&self) -> Vec3 {
+        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
+        self.transform.transform_point3(self.rig.head_attractor(clip).map_or(Vec3::ZERO, Vec3::from))
     }
 }
 
@@ -408,6 +490,82 @@ mod tests {
     fn client() -> Option<std::path::PathBuf> {
         let d = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
         d.join("cd_image/rdb.db").exists().then_some(d)
+    }
+
+    /// `RefreshAlpha` (DisplaySystem 0x10073b7f): 1 beyond the start distance, linear ramp to `1 - endAlpha` at the end distance, constant inside;
+    /// the end distance is clamped to the start; off = 1; the cached factor only follows moves above 0.01.
+    #[test]
+    fn fade_factor_curve_matches_refresh_alpha() {
+        let f = Fade::default();
+        let at = |d: f32| f.factor(d * d);
+        assert_eq!(at(5.0), 1.0);
+        assert_eq!(at(1.5), 1.0, "d^2 < start^2 is strict");
+        assert!((at(1.1) - (0.15 * (1.1 - 0.7) / 0.8 + 0.85)).abs() < 1e-6);
+        assert!((at(1.49) - 1.0).abs() < 0.01);
+        assert!((at(0.7) - 0.85).abs() < 1e-6 && (at(0.3) - 0.85).abs() < 1e-6 && at(0.0) == 0.85);
+        assert_eq!(Fade { on: false, ..f }.factor(0.0), 1.0);
+        // end beyond start behaves as end == start: a step to 1 - endAlpha at the start distance
+        let s = Fade { end: 3.0, ..f };
+        assert_eq!((s.factor(1.4 * 1.4), s.factor(1.6 * 1.6)), (0.85, 1.0));
+        let full = Fade { end_alpha: 1.0, ..f };
+        assert_eq!(full.factor(0.0), 0.0, "100 % max transparency");
+        // hysteresis
+        let mut r = Fader::default();
+        assert_eq!(r.step(&f, 0.0), 0.85);
+        assert_eq!(r.step(&f, 0.75 * 0.75), 0.85, "0.85 -> 0.8625 is below 0.01");
+        assert!((r.step(&f, 0.9 * 0.9) - (0.15 * 0.2 / 0.8 + 0.85)).abs() < 1e-6);
+    }
+
+    /// The prefs reach the curve: defaults of `SetDefaultCharPrefs`, a changed Char pref is read back.
+    #[test]
+    fn fade_reads_the_char_prefs() {
+        use super::super::dvalue::{IndepPrefs, Kind};
+        let mut p = IndepPrefs::with_defaults();
+        assert_eq!(Fade::from_prefs(&p), Fade::default());
+        p.set_int("FadeCharacter", 0, Kind::Char);
+        p.set_float("FadeCharacterStartDist", 4.0, Kind::Char);
+        p.set_float("FadeCharacterEndDist", 2.0, Kind::Char);
+        p.set_float("FadeCharacterEndAlpha", 0.5, Kind::Char);
+        assert_eq!(Fade::from_prefs(&p), Fade { on: false, start: 4.0, end: 2.0, end_alpha: 0.5 });
+    }
+
+    /// The head attractor world position is the feet + head height straight up (idle), in the actor's frame.
+    #[test]
+    fn head_position_agrees_with_head_height() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        a.set_transform([10.0, 20.0, 30.0], 0.0);
+        let p = a.head_position();
+        assert!((p.y - 20.0 - a.head_height().unwrap()).abs() < 1e-4, "{p:?}");
+        assert!((p.x - 10.0).hypot(p.z - 30.0) < 1.0, "{p:?}");
+    }
+
+    /// Screenshots of the own avatar at several camera distances with the fade applied: `AVATAR_FADE_SHOT=<dir>` writes
+    /// `fade_<prefs>_<d>.png` (default prefs and a 100 % `FadeCharacterEndAlpha`; `d` = camera distance from the head attractor).
+    #[test]
+    fn fade_screenshots() {
+        let (Some(dir), Some(out)) = (client(), std::env::var_os("AVATAR_FADE_SHOT")) else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let u = own_update();
+        let mut a = Avatar::new(&store, &dir, 7, &u).unwrap();
+        let pos = super::super::zone::scene_pos(u.pos);
+        let yaw = super::super::zone::scene_yaw(u.yaw().unwrap_or(0.0));
+        a.set_transform(pos, yaw);
+        let scene = ao_formats::playfield::load_playfield(&store, &dir, 4604).unwrap();
+        let head = a.head_position();
+        let f = super::super::zone::scene_forward(u.yaw().unwrap_or(0.0));
+        for (name, fade) in [("off", Fade { on: false, ..Fade::default() }), ("default", Fade::default()), ("full", Fade { end_alpha: 1.0, ..Fade::default() })] {
+            for d in [2.0f32, 1.2, 0.9, 0.5] {
+                let eye = [head.x + f[0] * d, head.y + 0.1, head.z + f[2] * d];
+                let dist_sq = (Vec3::from(eye) - head).length_squared();
+                let mut frame = a.frame();
+                frame.alpha = Fader::default().step(&fade, dist_sq);
+                eprintln!("{name} d={d} alpha={:.3}", frame.alpha);
+                let png = std::path::Path::new(&out).join(format!("fade_{name}_{d}.png"));
+                ao_render::render_to_png_actors(&scene, &[(MODEL_KEY, a.model().clone())], vec![frame], eye, [head.x, head.y - 0.2, head.z], 500, 400, &png, 0.0).unwrap();
+            }
+        }
     }
 
     /// The camera look target: the head attractor of the solitus male is at the face, bobs while running, and scales with the body.

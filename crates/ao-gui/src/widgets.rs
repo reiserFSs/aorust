@@ -41,6 +41,10 @@ pub struct ListItem {
     pub hide_icon: bool,
     /// `+0x58`: the indent the *children* of this item get (`_DAT_101b00e0` = 15).
     pub indent: f32,
+    /// A second text drawn in aqua at `aux_x` (pixels from the list's left edge): the key of a `HotKeyListItem_c` row (the options window's "Fixed keys" page,
+    /// `KeyListItemView_c` `<font color=aqua>..</font>` text). Empty = none.
+    pub aux: String,
+    pub aux_x: f32,
     /// Item extent (`+0x48`, `+0x4c`: width, height as inclusive extents), set from the item view's preferred size (`SetSize`).
     pub size: Point,
     pub parent: Option<usize>,
@@ -65,6 +69,8 @@ impl ListItem {
             hide_icon: false,
             indent: 15.0,
             size: Point::new(0.0, 0.0),
+            aux: String::new(),
+            aux_x: 0.0,
             parent: None,
             children: vec![],
         }

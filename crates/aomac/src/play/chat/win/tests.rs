@@ -609,3 +609,78 @@ fn framed_windows_never_fade_but_borderless_ones_follow_the_transparency() {
     }
     assert_eq!(gui.window_alpha(ch.frames[0].id), 0.8);
 }
+
+#[test]
+fn unread_tab_is_red_until_it_is_selected() {
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    ch.test_pick(&mut gui, 0, OP_MODE, 0);
+    ch.test_pick(&mut gui, 1, OP_MODE, 0);
+    let (from, to) = (tab_at(&ch, 1, 0, 10.0), tab_at(&ch, 0, 0, 5.0));
+    drag(&mut gui, &mut ch, from, to); // tabs: Combat (selected), Default Window
+    let id = ch.frames[0].id;
+    // `FUN_100ab980`: the name is wrapped in red while the document flag +0x160 is set
+    ch.push_msg(&mut gui, &msg(G_VICINITY, "", "Bob", "hi", 0)); // reaches the hidden Default Window tab (FUN_1009b4cf -> FUN_100989fa(1))
+    ch.update(&mut gui, 0.0);
+    assert_eq!(gui.window_tabs(id).0, vec!["Combat".to_string(), "<font color=red>Default Window</font> <font color=green>[Vicinity]</font>".to_string()]);
+    // a line for the visible tab does not mark it
+    ch.push(&mut gui, &ChatLine::new(ChatKind::Other("CCMeGotXPColor"), "You received 120 xp."), Some("Me got XP"));
+    ch.update(&mut gui, 0.0);
+    assert_eq!(gui.window_tabs(id).0[0], "Combat");
+    // selecting the tab clears the flag (`FUN_100aac81(true)`)
+    ch.select_tab(&mut gui, 0, 1);
+    ch.update(&mut gui, 0.0);
+    assert_eq!(gui.window_tabs(id).0[1], "Default Window <font color=green>[Vicinity]</font>");
+    let _ = std::fs::remove_dir_all(test_dir());
+}
+
+#[test]
+fn message_fading_follows_the_window_option_and_the_prefs() {
+    assert_eq!(WinPrefs::default().fade, (8.0, 0.3)); // `ChatTextFadeDelay` / `ChatTextFadeTime` of MainPrefs.xml
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    sample(&mut gui, &mut ch);
+    let (id, scroll) = (ch.wins[0].id, ch.wins[0].scroll());
+    ch.update(&mut gui, 0.0);
+    assert_eq!(gui.fade_line_count(id, &scroll), 0);
+    // option on: the existing text becomes the first fade line, new lines add one each
+    ch.wins[0].cfg.fading = true;
+    ch.update(&mut gui, 0.0);
+    assert_eq!(gui.fade_line_count(id, &scroll), 1);
+    ch.push(&mut gui, &ChatLine::new(ChatKind::System, "fading line"), None);
+    assert_eq!(gui.fade_line_count(id, &scroll), 2);
+    assert_eq!(gui.text(id, "text_0").matches("fading line").count(), 1); // the text view still receives it
+    // both prefs 0 = no fading (`FUN_1009349d(0,0,0,0)`)
+    ch.pw.fade = (0.0, 0.0);
+    ch.update(&mut gui, 0.0);
+    assert_eq!(gui.fade_line_count(id, &scroll), 0);
+    // lines age out after delay + time
+    ch.pw.fade = (1.0, 0.5);
+    ch.update(&mut gui, 0.0);
+    assert_eq!(gui.fade_line_count(id, &scroll), 1);
+    gui.frame(1.6);
+    assert_eq!(gui.fade_line_count(id, &scroll), 0);
+    // option off again
+    ch.wins[0].cfg.fading = false;
+    ch.update(&mut gui, 0.0);
+    ch.push(&mut gui, &ChatLine::new(ChatKind::System, "plain"), None);
+    assert_eq!(gui.fade_line_count(id, &scroll), 0);
+    let _ = std::fs::remove_dir_all(test_dir());
+}
+
+/// `KEY_COMMAND_CHAT_HISTORY_PAGE_UP / DOWN` scroll the active window's output by a page.
+#[test]
+fn history_page_keys_scroll_the_output() {
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    for i in 0..90 {
+        ch.push(&mut gui, &ChatLine::new(ChatKind::System, format!("line {i}")), None);
+    }
+    let (w, v) = (ch.wins[0].id, ch.wins[0].scroll());
+    gui.scroll_to_bottom(w, &v);
+    let bottom = gui.scroll_offset(w, &v);
+    assert!(bottom > 0.0);
+    ch.scroll_page(&mut gui, false);
+    let up = gui.scroll_offset(w, &v);
+    assert!(up < bottom, "{up} < {bottom}");
+    ch.scroll_page(&mut gui, true);
+    assert!(gui.scroll_offset(w, &v) > up);
+    let _ = std::fs::remove_dir_all(test_dir());
+}

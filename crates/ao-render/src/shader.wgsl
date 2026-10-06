@@ -49,10 +49,12 @@ struct VOut {
     @location(5) dlight: vec3<f32>,
     @location(6) spec: vec3<f32>,
     @location(7) tint: vec3<f32>,
+    @location(8) fade: f32,
 }
 
 fn vtx(v: VIn) -> VOut {
-    let model = mat4x4<f32>(v.m0, v.m1, v.m2, v.m3);
+    // The instance matrix is affine: its m0.w is not part of the transform and carries `ActorFrame::alpha - 1` (0 for everything else).
+    let model = mat4x4<f32>(vec4<f32>(v.m0.xyz, 0.0), v.m1, v.m2, v.m3);
     let wp = model * vec4<f32>(v.pos, 1.0);
     var o: VOut;
     o.clip = g.vp * wp;
@@ -60,6 +62,7 @@ fn vtx(v: VIn) -> VOut {
     o.n = (model * vec4<f32>(v.normal, 0.0)).xyz;
     o.uv = v.uv;
     o.color = v.color;
+    o.fade = 1.0 + v.m0.w;
     return o;
 }
 
@@ -180,10 +183,13 @@ fn light_vertex(p: vec3<f32>, n_in: vec3<f32>) -> Lit {
     return o;
 }
 
-// mode: 0 opaque, 1 alpha test, 2 alpha blend, 3 additive
-fn shade(i: VOut, mode: u32) -> vec4<f32> {
+// mode: 0 opaque, 1 alpha test, 2 alpha blend, 3 additive; 4 / 5 = opaque / alpha test of an actor with alpha < 1 (`ActorFrame::alpha`: alpha blended
+// with the material alpha = the frame's transparency, `RVisual_t::RenderWithTransparency`; the opaque texture alpha is not used)
+fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
+    let faded = fade_mode >= 4u;
+    let mode = select(fade_mode, fade_mode - 4u, faded);
     let t = textureSample(tex, samp, i.uv + mat.scroll.xy * g.fog.z);
-    let alpha = t.a * i.color.a * mat.color.a;
+    let alpha = t.a * i.color.a * mat.color.a * i.fade;
     if mode == 1u && alpha < 0.5 {
         discard;
     }
@@ -203,7 +209,10 @@ fn shade(i: VOut, mode: u32) -> vec4<f32> {
     // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
     let add = mode == 3u;
     let rgb = select(mix(lit, g.fog_g.rgb, f), lit, add);
-    let a = select(select(1.0, alpha, mode == 2u), alpha * (1.0 - f), add);
+    var a = select(select(1.0, alpha, mode == 2u), alpha * (1.0 - f), add);
+    if faded {
+        a = select(i.fade, alpha, mode == 1u);
+    }
     return vec4<f32>(srgb_dec(rgb), a);
 }
 
@@ -226,6 +235,10 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
 
 @fragment
 fn fs_opaque(i: VOut) -> @location(0) vec4<f32> { return shade(i, 0u); }
+@fragment
+fn fs_fade_opaque(i: VOut) -> @location(0) vec4<f32> { return shade(i, 4u); }
+@fragment
+fn fs_fade_test(i: VOut) -> @location(0) vec4<f32> { return shade(i, 5u); }
 @fragment
 fn fs_test(i: VOut) -> @location(0) vec4<f32> { return shade(i, 1u); }
 @fragment

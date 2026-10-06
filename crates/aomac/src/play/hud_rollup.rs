@@ -67,6 +67,8 @@ pub struct Rollup {
     screen: (u32, u32),
     /// Scroll offset in px (`scroll_offset` of the config, 0 at the first login).
     scroll: f32,
+    /// The dock config changed since [`Rollup::take_dirty`].
+    dirty: bool,
 }
 
 /// Strips the quotes around a dvalue string (`value='"wear_window"'`).
@@ -93,10 +95,17 @@ pub fn read_config(src: &str) -> Vec<PageConfig> {
         .collect()
 }
 
+/// `scroll_offset` of a `RollupArea.xml` dock config.
+pub fn read_scroll(src: &str) -> Option<f32> {
+    let root = ao_gui::xml::parse(src).ok()?;
+    let dock = root.children.iter().find(|c| c.attr("name") == Some("dock_config"))?;
+    dock.children.iter().find(|c| c.attr("name") == Some("scroll_offset"))?.attr("value")?.parse().ok()
+}
+
 impl Rollup {
     pub fn new(dir: &Path, screen: (u32, u32)) -> Self {
         let config = std::fs::read_to_string(dir.join("prefs/NewChar/DockAreas/RollupArea.xml")).map(|s| read_config(&s)).unwrap_or_default();
-        Self { config, pages: vec![], screen, scroll: 0.0 }
+        Self { config, pages: vec![], screen, scroll: 0.0, dirty: false }
     }
 
     pub fn set_screen(&mut self, gui: &mut Gui, screen: (u32, u32)) {
@@ -113,7 +122,16 @@ impl Rollup {
     /// Docks a view: `view_xml` is the XML root (`<root>..</root>`) of the view's content, laid out in a body of `page_height` px
     /// (`dock_node_configs`, or the view's own height when unlisted). Returns the page's window; named views inside it are reached through it as usual.
     pub fn open_page(&mut self, gui: &mut Gui, key: &str, title: &str, view_xml: &str, own_height: f32) -> anyhow::Result<WindowId> {
-        let cfg = self.config.iter().find(|c| c.key == key).cloned().unwrap_or(PageConfig { key: key.to_string(), height: own_height, expanded: true });
+        let cfg = match self.config.iter().find(|c| c.key == key) {
+            Some(c) => c.clone(),
+            None => {
+                // a view the dock did not list yet is docked now (`DockArea_c` appends it to `docked_view_identities`)
+                let c = PageConfig { key: key.to_string(), height: own_height, expanded: true };
+                self.config.push(c.clone());
+                self.dirty = true;
+                c
+            }
+        };
         let size = |gui: &Gui, n: &str| gui.gfx_id(n).map_or((15, 15), |g| gui.gfx().size(GfxId(g)));
         let (icon, arrow, close) = (size(gui, ICON), size(gui, EXPAND), size(gui, CLOSE));
         // `PageHeaderView_c`: icon button (borders 2, 2, 0, 2), title (8, 2, 0, 2), spacer, arrow (2, 2, 0, 2), close (2, 2, 2, 2)
@@ -203,6 +221,21 @@ impl Rollup {
         }
     }
 
+    /// `PageHeaderView_c` arrow: expands / collapses a page (`is_page_expanded`).
+    fn set_expanded(&mut self, gui: &mut Gui, i: usize, on: bool, size: (u32, u32)) {
+        let mut p = self.pages.remove(i);
+        p.expanded = on;
+        gui.show_collapsing(p.window, "body", on);
+        gui.resize_window(p.window, WindowSize::Preferred);
+        self.paint_arrow(gui, &mut p, size);
+        if let Some(c) = self.config.iter_mut().find(|c| c.key == p.key) {
+            c.expanded = on;
+        }
+        self.pages.insert(i, p);
+        self.layout(gui);
+        self.dirty = true;
+    }
+
     /// Header clicks and the wheel over the area.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event) -> Option<RollupEvent> {
         let Event::CanvasClick { window, view, .. } = ev else { return None };
@@ -210,13 +243,8 @@ impl Rollup {
         match view.as_str() {
             "arrow" => {
                 let size = gui.gfx_id(EXPAND).map_or((15, 15), |g| gui.gfx().size(GfxId(g)));
-                let mut p = self.pages.remove(i);
-                p.expanded = !p.expanded;
-                gui.show_collapsing(p.window, "body", p.expanded);
-                gui.resize_window(p.window, WindowSize::Preferred);
-                self.paint_arrow(gui, &mut p, size);
-                self.pages.insert(i, p);
-                self.layout(gui);
+                let on = !self.pages[i].expanded;
+                self.set_expanded(gui, i, on, size);
                 Some(RollupEvent::Handled)
             }
             "close" => Some(RollupEvent::Closed(self.pages[i].key.clone())),
@@ -231,8 +259,53 @@ impl Rollup {
             if x >= left as f32 && y >= top as f32 && y < bottom as f32 && !self.pages.is_empty() {
                 self.scroll -= dy * WHEEL_STEP;
                 self.layout(gui);
+                self.dirty = true;
             }
         }
+    }
+
+    /// `RollupController_c` dtor / `DockingController_c` 0x1003a0a1: the dock's `dock_config` (`dock_node_configs` = `page_height` + `is_page_expanded` per view in
+    /// dock order, `docked_view_identities`, `scroll_offset`) as the `DockAreas/RollupArea.xml` file of the shipped template.
+    pub fn config_xml(&self) -> String {
+        let mut nodes = String::new();
+        let mut ids = String::new();
+        for c in &self.config {
+            nodes += &format!("<Archive code=\"0\"><Float name=\"page_height\" value=\"{:.6}\" /><Bool name=\"is_page_expanded\" value=\"{}\" /></Archive>", c.height, c.expanded);
+            ids += &format!("<String value='&quot;{}&quot;' />", c.key);
+        }
+        format!(
+            "<Archive code=\"0\"><Archive code=\"0\" name=\"dock_config\"><Array name=\"dock_node_configs\">{nodes}</Array><Array name=\"docked_view_identities\">{ids}</Array>\
+             <Float name=\"scroll_offset\" value=\"{:.6}\" /></Archive><String name=\"dock_type\" value='&quot;RollupController&quot;' /><String name=\"dock_name\" value='&quot;RollupArea&quot;' /></Archive>",
+            self.scroll
+        )
+    }
+
+    /// The character's own `DockAreas/RollupArea.xml` (the HUD is built before the prefs are read): order, page state and scroll replace the template's.
+    pub fn load_user(&mut self, gui: &mut Gui, src: &str) {
+        let cfg = read_config(src);
+        if cfg.is_empty() {
+            return;
+        }
+        self.scroll = read_scroll(src).unwrap_or(0.0);
+        self.config = cfg;
+        let size = gui.gfx_id(EXPAND).map_or((15, 15), |g| gui.gfx().size(GfxId(g)));
+        for i in 0..self.pages.len() {
+            let want = self.config.iter().find(|c| c.key == self.pages[i].key).is_none_or(|c| c.expanded);
+            if want != self.pages[i].expanded {
+                self.set_expanded(gui, i, want, size);
+            }
+        }
+        let rank = |k: &str| self.config.iter().position(|c| c.key == k).unwrap_or(usize::MAX);
+        let mut pages = std::mem::take(&mut self.pages);
+        pages.sort_by_key(|p| rank(&p.key));
+        self.pages = pages;
+        self.layout(gui);
+        self.dirty = false;
+    }
+
+    /// The file text when something changed since the last call (a page expanded / collapsed / added, the column scrolled).
+    pub fn take_dirty(&mut self) -> Option<String> {
+        std::mem::take(&mut self.dirty).then(|| self.config_xml())
     }
 }
 

@@ -168,9 +168,19 @@ impl HudNano {
         }
         let mut xml = String::new();
         for r in &rows {
-            xml += &format!("<View view_layout=\"horizontal\" h_alignment=\"center\" min_size=\"Point(1,{BUTTON_H})\">");
-            for (page, label, wd) in r {
+            // retail: a row with several pills spreads them to both edges, a lone pill is centred (`ref.png` Programs page)
+            xml += &format!("<View view_layout=\"horizontal\" min_size=\"Point(1,{BUTTON_H})\" layout_borders=\"Rect(8,0,8,0)\">");
+            if r.len() == 1 {
+                xml += "<HLayoutSpacer min_size=\"0\" max_size=\"16000\"/>";
+            }
+            for (i, (page, label, wd)) in r.iter().enumerate() {
+                if i > 0 {
+                    xml += "<HLayoutSpacer min_size=\"0\" max_size=\"16000\"/>";
+                }
                 xml += &format!("<Button name=\"school{page}\" label=\"{}\" min_size=\"Point({wd},{BUTTON_H})\" layout_borders=\"Rect(1,0,1,0)\"/>", lv::esc(label));
+            }
+            if r.len() == 1 {
+                xml += "<HLayoutSpacer min_size=\"0\" max_size=\"16000\"/>";
             }
             xml += "</View>";
         }

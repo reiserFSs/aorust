@@ -42,7 +42,8 @@ fn xml(body: &str, buttons: &[String]) -> String {
     }
     row += "</View>";
     format!(
-        "<root><View view_layout=\"vertical\"><TextView name=\"text\" feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP\" min_size=\"Point({w},-1)\" max_size=\"Point({w},16000)\" layout_borders=\"Rect(15,5,15,20)\"/>{row}</View></root>"
+        "<root><View view_layout=\"vertical\"><TextView name=\"text\" feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP\" value=\"{}\" min_size=\"Point({w},-1)\" max_size=\"Point({w},-1)\" layout_borders=\"Rect(15,5,15,20)\"/>{row}</View></root>",
+        escape(body)
     )
 }
 
@@ -65,6 +66,13 @@ impl<T: Copy> Dialogs<T> {
     #[cfg(test)]
     pub(super) fn windows(&self) -> Vec<WindowId> {
         self.open.iter().map(|o| o.win).collect()
+    }
+
+    /// Replaces the body text of the open dialogs (`DialogBox_c` text view; the bind dialog shows the pressed key).
+    pub(super) fn set_body(&self, gui: &mut Gui, body: &str) {
+        for o in &self.open {
+            gui.set_text(o.win, "text", body);
+        }
     }
 
     pub(super) fn close_all(&mut self, gui: &mut Gui) {

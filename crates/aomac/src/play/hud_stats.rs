@@ -198,6 +198,26 @@ impl HudStats {
         self.screen = size;
     }
 
+    /// The inventory grid after the frame changed: column count and spacing from the client width (`MultiListView_c::RecalcCellCount` 0x101349f6, as in
+    /// [`HudStats::open_inventory`]); the items keep their order and refill the new rows.
+    pub(super) fn reflow_inventory(&mut self, gui: &Gui) {
+        let Some(inv) = self.inventory.as_mut() else { return };
+        let view_w = gui.window_size(inv.window).0.saturating_sub(SCROLLBAR).max(1) as f32;
+        if view_w == inv.view_w {
+            return;
+        }
+        let (cols, gap_x) = inv_grid::columns(view_w - 1.0);
+        if cols != inv.cols {
+            inv.positions.reflow(cols);
+        }
+        (inv.view_w, inv.cols, inv.gap.0, inv.drawn) = (view_w, cols, gap_x, vec![(u32::MAX, 0)]);
+    }
+
+    #[cfg(test)]
+    pub(super) fn inventory_cols(&self) -> Option<usize> {
+        self.inventory.as_ref().map(|i| i.cols)
+    }
+
     pub(super) fn is_open(&self, kind: WindowKind) -> bool {
         match kind {
             WindowKind::Skills => self.skills.is_some(),
@@ -687,7 +707,7 @@ impl HudStats {
 
     fn open_inventory(&mut self, gui: &mut Gui) -> anyhow::Result<()> {
         let (x, y, ow, oh) = self.inventory_frame;
-        let xml = "<root><View view_layout=\"vertical\"><ScrollView name=\"scrollview\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\"><ScrollViewChild view_layout=\"vertical\" name=\"scroller\">\
+        let xml = "<root><View view_layout=\"vertical\"><ScrollView name=\"scrollview\" max_size=\"Point(16000,16000)\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\"><ScrollViewChild view_layout=\"vertical\" name=\"scroller\">\
                    <View view_layout=\"vertical\" name=\"content\"/></ScrollViewChild></ScrollView></View></root>";
         // `DockTabbedWindow` = a style-0 window (client insets 5, 26, 5, 5, docs §6.1) whose only tab is titled `GetText(10000, "Inventory")`
         // (`FUN_100c9fb7`, string at GUI 0x101bb518; retail screenshot: tab "Inventory" with the "i" icon, pin and close buttons).
@@ -833,6 +853,11 @@ impl HudStats {
             return true;
         }
         match ev {
+            // `MultiListView_c::SetFrame` -> `RecalcCellCount`: the grid follows the frame the user dragged
+            Event::WindowFrame { window } if self.inventory.as_ref().is_some_and(|i| i.window == *window) => {
+                self.reflow_inventory(gui);
+                true
+            }
             // the wear and stat windows are rollup pages: their close button is the page header's (`Rollup::event`)
             Event::CloseRequested { window } if self.inventory.as_ref().is_some_and(|i| i.window == *window) => {
                 self.close_inventory(gui);

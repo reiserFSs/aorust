@@ -17,6 +17,7 @@ use super::hud_actions::HudActions;
 use super::hud_special::SpecialList;
 use super::hud_actionwin::HudActionWin;
 use super::hud_keys::{HudKey, KeyMap};
+use super::options::keys::{Bindings, FixedKeys};
 use super::hud_pools;
 use super::hud_compass::Compass;
 use super::hud_target::HudTarget;
@@ -288,6 +289,9 @@ pub(super) struct Hud {
     /// Hot keys from the `KeyBindings` archive (`hud_keys.rs`) and the archive text they were built from.
     keys: KeyMap,
     keys_src: String,
+    /// The shared key binding table and the fixed keys the HUD and the game's controls read (`options/keys.rs`).
+    bindings: Bindings,
+    fixed: FixedKeys,
     /// The compass window (`hud_compass.rs`).
     compass: Option<Compass>,
     /// The AGG/DEF slider of the right control-centre bar (`hud_aggdef.rs`).
@@ -298,6 +302,8 @@ pub(super) struct Hud {
     uses: Vec<SlotUse>,
     /// The character a plain world click selected this frame ([`Hud::take_click`]).
     click: Option<i32>,
+    /// Saved places of the movable windows (`hud_wincfg.rs`).
+    wincfg: super::hud_wincfg::WinCfgs,
 }
 
 impl Hud {
@@ -315,7 +321,7 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, pools: hud_pools::Pools::new(dir), menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, options: HudOptions::new(dir, size)?, help_urls: vec![], mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
+        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, pools: hud_pools::Pools::new(dir), menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, options: HudOptions::new(dir, size)?, help_urls: vec![], mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), bindings: Bindings::default(), fixed: FixedKeys::default(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None, wincfg: super::hud_wincfg::WinCfgs::new(dir) };
         hud.target.targets_target = hud.dvalues.flag("Targetstarget");
         hud.fill_docks(gui);
         hud.create_bars(gui);
@@ -406,6 +412,8 @@ impl Hud {
         let f = |n: &str, d: f32| self.dvalues.get_f32(n).unwrap_or(d);
         gui.set_fade_params(f("CCFadeLow", 0.33), f("CCFadeHigh", 0.85), f("CCFadeDelay", 2.0));
         gui.set_backdrop(self.cc, "RollupArea", f("cc_rollup_controller_fade_level", 0.0));
+        // `cc_rollup_panel` (CharPrefs, default true; `RollupController_c` sets it when a page is added) = the rollup column is shown
+        gui.set_visible(self.cc, "RollupArea", !self.dvalues.exists("cc_rollup_panel") || self.dvalues.flag("cc_rollup_panel"));
     }
 
     /// `CharBarWindow_c` windows (0x1006d7c7) created by `SlotPlayerCharacterAlive` (GUI 0x1006afed) at the points it passes in: health (0, 0), nano
@@ -689,6 +697,19 @@ impl Hud {
             s.update(gui, _dt, &self.actions.list, &changes, locked, timers);
         }
         self.actwin.update(gui, &self.actions.list, _dt, timers.0);
+        self.wincfg.update(gui, &mut self.dvalues);
+        self.save_rollup();
+    }
+
+    /// The rollup column's `DockAreas/RollupArea.xml` (a page expanded / collapsed / docked, the column scrolled).
+    fn save_rollup(&mut self) {
+        let Some(chr) = self.dvalues.char_dir().map(Path::to_path_buf) else { return };
+        if let Some(xml) = self.rollup.take_dirty() {
+            let _ = std::fs::create_dir_all(chr.join("DockAreas"));
+            if let Err(e) = std::fs::write(chr.join("DockAreas/RollupArea.xml"), xml) {
+                eprintln!("prefs: RollupArea.xml: {e}");
+            }
+        }
     }
 
     /// Mouse-down outside an open sub menu closes it (the original's popup menus lose focus).
@@ -729,14 +750,10 @@ impl Hud {
         }
         if let InputEvent::Key { key, pressed: true, mods } = ev {
             if gui.focused_view().is_none() {
-                self.target.key(zone, *key, *mods);
+                self.target.key(zone, *key, *mods, &self.fixed);
             }
         }
-        // window / hotbar hot keys from the `KeyBindings` archive (hud_keys.rs); the viewer sends one press per key stroke, `! TextInputMode`: a focused
-        // text field swallows them
-        if let (InputEvent::Key { key: ao_gui::Key::Letter(c), pressed: true, mods }, false) = (ev, gui.text_focused()) {
-            self.hot_key(gui, *c, *mods);
-        }
+        // the window / hotbar hot keys are driven by `hot_input` from the physical key stream (`Play::game_input`): any key can be bound
         if let (Some(p), InputEvent::MouseDown { x, y, button: MouseButton::Left }) = (&self.popup, ev) {
             let pos = gui.window_pos(p.window);
             let (w, h) = gui.window_size(p.window);
@@ -748,16 +765,54 @@ impl Hud {
         }
     }
 
-    /// A character key press: every provider the `KeyBindings` archive binds to it (`hud_keys.rs`). The map is rebuilt when the archive in the
-    /// DValue store changed (the saved character prefs are loaded after the HUD is created).
-    fn hot_key(&mut self, gui: &mut Gui, c: char, mods: ao_gui::Modifiers) {
-        if let Some(super::dvalue::Variant::Archive(text)) = self.dvalues.get("KeyBindings") {
-            if *text != self.keys_src {
-                self.keys = KeyMap::from_archive(text);
-                self.keys_src = text.clone();
+    /// Reloads the shared key tables when the `KeyBindings` archive (character prefs) or a `KEY_*` login pref changed (the saved prefs are loaded after the
+    /// HUD is created; the options window's "Key bindings" page writes the archive).
+    pub(super) fn sync_keys(&mut self) {
+        let stale = match self.dvalues.get("KeyBindings") {
+            Some(super::dvalue::Variant::Archive(t)) => *t != self.keys_src,
+            _ => false,
+        };
+        let fixed = FixedKeys::from_prefs(&self.dvalues.prefs);
+        if stale || fixed != self.fixed {
+            if let Some(super::dvalue::Variant::Archive(t)) = self.dvalues.get("KeyBindings") {
+                self.keys_src = t.clone();
+                self.bindings = Bindings::from_archive(t);
             }
+            self.fixed = fixed;
+            self.keys = KeyMap::new(&self.bindings, &self.fixed);
         }
-        for k in self.keys.lookup(c, mods) {
+    }
+
+    /// A physical key press: captured by the options window's "Bind Key" dialog when it is open (true: the key does nothing else), else the HUD hot keys.
+    pub(super) fn key_press(&mut self, gui: &mut Gui, key: u32, mods: ao_gui::Modifiers) -> bool {
+        let input = super::options::keys::key_input(key, mods);
+        if self.options.capturing() {
+            self.options.capture(gui, &mut self.dvalues, input);
+            return true;
+        }
+        self.hot_input(gui, input);
+        false
+    }
+
+    /// The tables every key consumer reads (`options/keys.rs`).
+    pub(super) fn key_tables(&self) -> (&Bindings, &FixedKeys) {
+        (&self.bindings, &self.fixed)
+    }
+
+    /// A key press (`key id | modifier bits`): every HUD provider the binding table binds to it (`hud_keys.rs`), unless a text field has the keyboard
+    /// (`! TextInputMode`) or the options window is capturing a key for a binding.
+    pub(super) fn hot_input(&mut self, gui: &mut Gui, input: u32) {
+        self.sync_keys();
+        if gui.text_focused() || self.options.capturing() {
+            return;
+        }
+        // `KEY_TOGGLE_CONTROL_CENTER` (Shift + `|`, `! TextInputMode`): `SwitchLayoutMessage` 0x10067e7e flips `cc_rollup_panel` -- the command -> message link is
+        // [INFERENCE] (names; the message table holds no readable reference to the handler)
+        if input == self.fixed.get("KEY_TOGGLE_CONTROL_CENTER") {
+            let on = self.dvalues.flag("cc_rollup_panel");
+            self.dvalues.set("cc_rollup_panel", super::dvalue::Variant::Bool(!on));
+        }
+        for k in self.keys.lookup(input) {
             match k {
                 HudKey::Window(kind) => self.toggle(gui, kind),
                 HudKey::BarActive(n) => {
@@ -921,6 +976,7 @@ impl Hud {
     }
 
     pub(super) fn open(&mut self, gui: &mut Gui, kind: WindowKind) {
+        let before = gui.window_ids();
         self.dvalues.set_i64(kind.dvalue(), 1);
         gui.set_cc_active(self.cc, kind.dvalue(), true);
         self.stats.open(gui, &mut self.rollup, kind);
@@ -945,10 +1001,19 @@ impl Hud {
             self.open.push(kind);
             self.options.arm_esc(kind, &self.dvalues);
         }
+        // `Window::LoadWndConfig` of the window the module just made (hud_wincfg.rs)
+        let made: Vec<WindowId> = gui.window_ids().into_iter().filter(|id| !before.contains(id) && gui.window_tabbed(*id)).collect();
+        for id in made {
+            self.wincfg.attach(gui, &self.dvalues, kind, id, self.size);
+        }
+        if kind == WindowKind::Inventory {
+            self.stats.reflow_inventory(gui);
+        }
     }
 
     pub(super) fn close_kind(&mut self, gui: &mut Gui, kind: WindowKind) {
         self.dvalues.set_i64(kind.dvalue(), 0);
+        self.wincfg.detach(gui, &mut self.dvalues, kind);
         gui.set_cc_active(self.cc, kind.dvalue(), false);
         self.stats.close(gui, &mut self.rollup, kind);
         if HudNano::handles(kind) {
@@ -1021,8 +1086,31 @@ impl Hud {
         }
     }
 
+    /// `LoadUserConfig` ran (the HUD is built before the character's prefs are read): the windows take their saved places (`Window::LoadWndConfig`), the
+    /// rollup column its saved order / page state / scroll (`DockAreas/RollupArea.xml`), and a returning character gets the windows its dvalues say are open
+    /// (`wear_window` ... = 1) opened and the others closed; a first login keeps the NewChar template's set.
+    pub(super) fn prefs_loaded(&mut self, gui: &mut Gui) {
+        let Some(chr) = self.dvalues.char_dir().map(Path::to_path_buf) else { return };
+        if let Ok(src) = std::fs::read_to_string(chr.join("DockAreas/RollupArea.xml")) {
+            self.rollup.load_user(gui, &src);
+        }
+        if chr.join("Prefs.xml").exists() {
+            for k in WindowKind::ALL.into_iter().filter(|k| !matches!(k, WindowKind::Target | WindowKind::Friends | WindowKind::Options)) {
+                match (self.dvalues.flag(k.dvalue()), self.open.contains(&k)) {
+                    (true, false) => self.open(gui, k),
+                    (false, true) => self.close_kind(gui, k),
+                    _ => {}
+                }
+            }
+        }
+        self.wincfg.reload(gui, &self.dvalues, self.size);
+        self.stats.reflow_inventory(gui);
+    }
+
     /// Closes the HUD windows (leaving the world).
     pub(super) fn close(mut self, gui: &mut Gui) {
+        self.wincfg.detach_all(gui, &mut self.dvalues);
+        self.save_rollup();
         if let Some(p) = &self.popup {
             gui.close_window(p.window);
         }
@@ -1034,6 +1122,10 @@ impl Hud {
         self.nano.close(gui, &mut self.rollup);
         self.ncu.close(gui);
         self.options.close(gui, &mut self.dvalues);
+        // the windows' final states (`SaveWndConfig` of the dtors) reach the character's prefs files
+        if !self.dvalues.take_changed().is_empty() {
+            self.dvalues.save_user();
+        }
         self.actwin.close(gui, &mut self.rollup);
         self.mission.close(gui);
         self.map.close_all(gui, &mut self.rollup);
@@ -1105,6 +1197,13 @@ mod tests {
                 self.hud.event(&mut self.gui, &e, &self.zone);
             }
         }
+        fn game_input(&mut self, ev: ao_render::GameInput, host: &mut Host) {
+            if let ao_render::GameInput::Key { code, pressed: true, repeat: false } = ev {
+                if let Some(key) = super::super::controls::key_id(code) {
+                    self.hud.key_press(&mut self.gui, key, host.mods);
+                }
+            }
+        }
         fn frame(&mut self, dt: f32, size: (u32, u32), _host: &mut Host) -> DrawList {
             self.hud.resize(&mut self.gui, size);
             self.hud.update(&mut self.gui, &mut self.zone, dt);
@@ -1170,37 +1269,89 @@ mod tests {
     }
 
     /// Ctrl+6 = Map, P = Planet Map, Shift+P = Perks, I = Inventory (help texts / CharPrefs.xml); a focused text field swallows them.
+    /// The fixed keys are read from the `KEY_*` login ints: `KEY_TOGGLE_CONTROL_CENTER` flips `cc_rollup_panel` (the rollup column), the target keys cycle the target.
+    #[test]
+    fn fixed_keys_follow_the_login_prefs() {
+        use ao_render::KeyCode as K;
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        let shift = ao_gui::Modifiers { shift: true, ..Default::default() };
+        let ctrl = ao_gui::Modifiers { ctrl: true, ..Default::default() };
+        let mut press = |s: &mut Shot, code: K, mods: ao_gui::Modifiers| {
+            o.host.mods = mods;
+            s.game_input(ao_render::GameInput::Key { code, pressed: true, repeat: false }, &mut o.host);
+            s.hud.update(&mut s.gui, &mut s.zone, 0.016);
+        };
+        // Shift + `|` (PIPE 0x24)
+        assert!(s.gui.is_visible(s.hud.cc, "RollupArea") && s.hud.dvalues.flag("cc_rollup_panel"));
+        press(&mut s, K::Backslash, shift);
+        assert!(!s.hud.dvalues.flag("cc_rollup_panel") && !s.gui.is_visible(s.hud.cc, "RollupArea"));
+        press(&mut s, K::Backslash, shift);
+        assert!(s.gui.is_visible(s.hud.cc, "RollupArea"));
+        // a `Login.cfg` override moves it to Ctrl + K
+        s.hud.dvalues.prefs.set_int("KEY_TOGGLE_CONTROL_CENTER", 92 | 0x40000, super::super::dvalue::Kind::Login);
+        press(&mut s, K::Backslash, shift);
+        assert!(s.gui.is_visible(s.hud.cc, "RollupArea"), "the old key does nothing");
+        press(&mut s, K::KeyK, ctrl);
+        assert!(!s.gui.is_visible(s.hud.cc, "RollupArea"));
+        // the target keys: Tab by default, Y after the override (`KEY_NEXT_HOSTILE_TARGET`)
+        let mods = ao_gui::Modifiers::default();
+        let mut zone = Zone::default();
+        assert!(s.hud.target.key(&mut zone, ao_gui::Key::Tab, mods, &s.hud.fixed));
+        assert!(!s.hud.target.key(&mut zone, ao_gui::Key::Letter('y'), mods, &s.hud.fixed));
+        s.hud.dvalues.prefs.set_int("KEY_NEXT_HOSTILE_TARGET", 106, super::super::dvalue::Kind::Login);
+        s.hud.sync_keys();
+        assert!(!s.hud.target.key(&mut zone, ao_gui::Key::Tab, mods, &s.hud.fixed));
+        assert!(s.hud.target.key(&mut zone, ao_gui::Key::Letter('y'), mods, &s.hud.fixed));
+        // KEY_OPEN_PERK_WINDOW (Shift + P) follows too
+        s.hud.dvalues.prefs.set_int("KEY_OPEN_PERK_WINDOW", 106, super::super::dvalue::Kind::Login);
+        press(&mut s, K::KeyP, shift);
+        assert!(!s.hud.is_open(WindowKind::Perks));
+        press(&mut s, K::KeyY, mods);
+        assert!(s.hud.is_open(WindowKind::Perks));
+    }
+
     #[test]
     fn window_hotkeys_toggle_and_respect_text_input() {
         let Some((mut s, mut o)) = shot((1280, 800)) else { return };
-        let key = |c: char, mods: ao_gui::Modifiers| InputEvent::Key { key: ao_gui::Key::Letter(c), pressed: true, mods };
+        use ao_render::KeyCode as K;
+        // the physical key stream (`Play::game_input`): any key can be bound, so the hot keys read key ids, not characters
+        let code = |c: char| match c {
+            '6' => K::Digit6,
+            '9' => K::Digit9,
+            'p' => K::KeyP,
+            _ => K::KeyI,
+        };
         let ctrl = ao_gui::Modifiers { ctrl: true, ..Default::default() };
         let none = ao_gui::Modifiers::default();
-        s.input(key('6', ctrl), &mut o.host);
+        fn press(s: &mut Shot, o: &mut Offscreen, code: ao_render::KeyCode, mods: ao_gui::Modifiers) {
+            o.host.mods = mods;
+            s.game_input(ao_render::GameInput::Key { code, pressed: true, repeat: false }, &mut o.host);
+        }
+        press(&mut s, &mut o, code('6'), ctrl);
         assert!(s.hud.is_open(WindowKind::Map));
-        s.input(key('6', ctrl), &mut o.host);
+        press(&mut s, &mut o, code('6'), ctrl);
         assert!(!s.hud.is_open(WindowKind::Map));
         // Ctrl+9 = `WINDOW_STAT`: the stat window is open from the start (NewChar template), so the first press closes it
         assert!(s.hud.is_open(WindowKind::Stat));
-        s.input(key('9', ctrl), &mut o.host);
+        press(&mut s, &mut o, code('9'), ctrl);
         assert!(!s.hud.is_open(WindowKind::Stat));
-        s.input(key('9', ctrl), &mut o.host);
+        press(&mut s, &mut o, code('9'), ctrl);
         assert!(s.hud.is_open(WindowKind::Stat));
-        s.input(key('p', none), &mut o.host);
+        press(&mut s, &mut o, code('p'), none);
         assert!(s.hud.is_open(WindowKind::PlanetMap) && !s.hud.is_open(WindowKind::Perks));
-        s.input(key('p', ao_gui::Modifiers { shift: true, ..none }), &mut o.host);
+        press(&mut s, &mut o, code('p'), ao_gui::Modifiers { shift: true, ..none });
         assert!(s.hud.is_open(WindowKind::Perks));
-        s.input(key('i', none), &mut o.host);
+        press(&mut s, &mut o, code('i'), none);
         assert!(s.hud.is_open(WindowKind::Inventory));
         // typing a name into a text field must not open windows
         let w = s.gui.open_window("LoginWindow", (0, 0), WindowSize::Preferred).unwrap();
         s.gui.focus(w, "username");
         assert!(s.gui.text_focused());
-        s.input(key('p', none), &mut o.host);
-        s.input(key('6', ctrl), &mut o.host);
+        press(&mut s, &mut o, code('p'), none);
+        press(&mut s, &mut o, code('6'), ctrl);
         assert!(!s.hud.is_open(WindowKind::Map) && s.hud.is_open(WindowKind::PlanetMap));
         s.gui.clear_focus();
-        s.input(key('p', none), &mut o.host);
+        press(&mut s, &mut o, code('p'), none);
         assert!(!s.hud.is_open(WindowKind::PlanetMap));
     }
 
@@ -1392,6 +1543,97 @@ mod tests {
         // closing removes the page
         s.hud.close_kind(&mut s.gui, WindowKind::Actions);
         assert!(s.hud.actwin.shown().is_empty());
+    }
+
+    /// The windows the retail capture shows side by side (`ref.png`, docs/gui.md §6.4): inventory with its scrollbar, the NCU and Programs pages, the Actions page.
+    /// `hud-compare-*.png` in `AOMAC_SHOT_DIR`.
+    #[test]
+    fn retail_comparison_shots() {
+        let size = (1667, 916);
+        let Some((mut s, mut o)) = shot(size) else { return };
+        for k in [WindowKind::Character, WindowKind::Stat, WindowKind::Team] {
+            s.hud.close_kind(&mut s.gui, k);
+        }
+        for k in [WindowKind::Character, WindowKind::Ncu, WindowKind::Nano, WindowKind::Inventory, WindowKind::Skills] {
+            s.hud.open(&mut s.gui, k);
+        }
+        png(&mut s, &mut o, "hud-compare-1667");
+        s.hud.close_kind(&mut s.gui, WindowKind::Nano);
+        s.hud.open(&mut s.gui, WindowKind::Actions);
+        png(&mut s, &mut o, "hud-compare-actions");
+    }
+
+    /// Drags the frame of `w` by its title strip (right of the tab, below the top border) by `(dx, dy)`.
+    fn drag_strip(s: &mut Shot, w: WindowId, dx: f32, dy: f32) {
+        let (x, y, ow, _) = s.gui.window_outer_frame(w).unwrap();
+        let (px, py) = (x as f32 + ow as f32 * 0.6, y as f32 + 12.0);
+        send(s, InputEvent::MouseDown { x: px, y: py, button: MouseButton::Left });
+        send(s, InputEvent::MouseMove { x: px + dx, y: py + dy });
+        send(s, InputEvent::MouseUp { x: px + dx, y: py + dy, button: MouseButton::Left });
+    }
+
+    /// `Window::SaveWndConfig` / `LoadWndConfig` (docs/gui.md §6.5): the inventory (a dock window: `DockAreas/DockArea0.xml`) and the skills window
+    /// (`SkillConfig`) are dragged, the inventory is resized (its grid reflows) and pinned; a second login restores frames and pin, opens the windows its dvalues
+    /// say are open, and the NCU window takes the template's pin state.
+    #[test]
+    fn dragged_windows_are_saved_and_restored() {
+        let tmp = std::env::temp_dir().join(format!("aomac-hud-wincfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let size = (1280, 800);
+        let Some((mut s, mut o)) = shot(size) else { return };
+        s.hud.dvalues.open_user(&tmp, "acct", 7);
+        s.hud.prefs_loaded(&mut s.gui);
+        for k in [WindowKind::Inventory, WindowKind::Skills, WindowKind::Ncu] {
+            s.hud.open(&mut s.gui, k);
+        }
+        s.frame(0.016, size, &mut o.host);
+        let inv = s.hud.stats_window(WindowKind::Inventory).unwrap();
+        let skills = s.hud.stats_window(WindowKind::Skills).unwrap();
+        let ncu = s.hud.ncu.window().unwrap();
+        // the template's DockArea2 pins the NCU window (`WindowPinButtonState` true); nothing is written for an untouched layout
+        assert!(s.gui.window_pinned(ncu) && !s.gui.window_pinned(inv));
+        assert!(!tmp.join("acct/Char7/DockAreas/DockArea0.xml").exists());
+        let (x0, y0, w0, h0) = s.gui.window_outer_frame(inv).unwrap();
+        let cols0 = s.hud.stats.inventory_cols().unwrap();
+        // drag by the strip, then the right edge, then pin
+        drag_strip(&mut s, inv, -150.0, -200.0);
+        let (x1, y1, ..) = s.gui.window_outer_frame(inv).unwrap();
+        assert_eq!((x1, y1), (x0 - 150, y0 - 200));
+        let (px, py) = ((x1 + w0 as i32 - 2) as f32, (y1 + h0 as i32 / 2) as f32);
+        send(&mut s, InputEvent::MouseDown { x: px, y: py, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseMove { x: px + 120.0, y: py });
+        send(&mut s, InputEvent::MouseUp { x: px + 120.0, y: py, button: MouseButton::Left });
+        let frame = s.gui.window_outer_frame(inv).unwrap();
+        assert_eq!(frame.2, w0 + 120, "the right edge resizes the inventory");
+        let cols1 = s.hud.stats.inventory_cols().unwrap();
+        assert!(cols1 > cols0, "the grid reflows to more columns ({cols0} -> {cols1})");
+        s.gui.set_window_pinned(inv, true);
+        drag_strip(&mut s, skills, 25.0, 10.0);
+        let sk = s.gui.window_outer_frame(skills).unwrap();
+        s.frame(0.016, size, &mut o.host);
+        s.hud.dvalues.save_user();
+        let dock = std::fs::read_to_string(tmp.join("acct/Char7/DockAreas/DockArea0.xml")).expect("the dock file of the inventory");
+        let cfg = super::super::hud_wincfg::Cfg::parse(&xml::parse(&dock).unwrap());
+        let (x, y, w, h) = frame;
+        assert_eq!(cfg.frame, Some([x as f32, y as f32, (x + w as i32 - 1) as f32, (y + h as i32 - 1) as f32]));
+        // `selected_tab` -1 is the template's value for the inventory dock, kept as read
+        assert_eq!((cfg.pin, cfg.tab), (Some(true), Some(-1)));
+        assert!(dock.contains("inventory_window") && dock.contains("DockTabbedWindow"));
+        let prefs = std::fs::read_to_string(tmp.join("acct/Char7/Prefs.xml")).unwrap();
+        assert!(prefs.contains("SkillConfig") && prefs.contains("WindowFrame"));
+        // the next login: a fresh HUD reads the files
+        drop((s, o));
+        let Some((mut s, mut o)) = shot(size) else { return };
+        s.hud.dvalues.open_user(&tmp, "acct", 7);
+        s.hud.prefs_loaded(&mut s.gui);
+        s.frame(0.016, size, &mut o.host);
+        assert!(s.hud.is_open(WindowKind::Inventory) && s.hud.is_open(WindowKind::Skills), "the open flags come back");
+        let inv = s.hud.stats_window(WindowKind::Inventory).unwrap();
+        assert_eq!(s.gui.window_outer_frame(inv), Some(frame));
+        assert!(s.gui.window_pinned(inv));
+        assert_eq!(s.hud.stats.inventory_cols(), Some(cols1));
+        assert_eq!(s.gui.window_outer_frame(s.hud.stats_window(WindowKind::Skills).unwrap()), Some(sk));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The first-login hotbar: Start Combat / Walk / Sit / Suspended Animation icons from rdb 1010008, the Follow macro, use,

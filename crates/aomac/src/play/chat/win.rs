@@ -429,6 +429,11 @@ struct Win {
     /// Alpha change per second of the running fade.
     rate: f32,
     active: bool,
+    /// Document flag `+0x160` (`FUN_100989fa`): a line arrived while the tab was not visible and it was not selected since; `FUN_100ab980` then wraps the
+    /// tab name in `<font color=red>`.
+    unread: bool,
+    /// Message-fade parameters currently applied to the GUI view (`FUN_1009349d`: delay, time in seconds); `None` = fading off. Reset when the GUI window is rebuilt.
+    fade: Option<(f32, f32)>,
     /// Prompt text currently set on the input bar (the output group's name while the editor is empty, `InputBar_c`), to avoid re-setting it every frame.
     hint: String,
 }
@@ -466,11 +471,13 @@ pub struct WinPrefs {
     pub input_group: bool,
     /// `ChatFontName` / `ChatFontStyle` / `ChatFontSize` (tenths of a point; defaults Verdana / Regular / 140).
     pub font: (String, String, i32),
+    /// `ChatTextFadeDelay` / `ChatTextFadeTime` seconds (`FUN_1008f432`; defaults 8.0 / 0.3 of `MainPrefs.xml`): used by windows with `is_message_fading_enabled`.
+    pub fade: (f32, f32),
 }
 
 impl Default for WinPrefs {
     fn default() -> Self {
-        WinPrefs { title_group: true, input_group: true, font: ("Verdana".into(), "Regular".into(), 140) }
+        WinPrefs { title_group: true, input_group: true, font: ("Verdana".into(), "Regular".into(), 140), fade: (8.0, 0.3) }
     }
 }
 
@@ -489,7 +496,10 @@ impl WinPrefs {
             Some(Variant::Float(v)) => *v as i32,
             _ => base.font.2,
         };
+        // `FUN_1008f432`: `AsDouble * 1e6` (`_DAT_101ae2f8`) truncated to whole microseconds
+        let secs = |n: &str, def: f32| d.get_f32(n).map_or(def, |v| ((v as f64 * 1e6).trunc() / 1e6) as f32);
         WinPrefs {
+            fade: (secs("ChatTextFadeDelay", base.fade.0), secs("ChatTextFadeTime", base.fade.1)),
             title_group: flag("ChatShowOGrpInTitleBar", base.title_group),
             input_group: flag("ChatShowOGrpInInputBar", base.input_group),
             font: (text("ChatFontName", base.font.0), text("ChatFontStyle", base.font.1), size),

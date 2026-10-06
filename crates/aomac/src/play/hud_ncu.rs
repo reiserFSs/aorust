@@ -255,6 +255,10 @@ impl HudNcu {
     pub(super) fn title(&self) -> &str {
         &self.title
     }
+
+    pub(super) fn window(&self) -> Option<ao_gui::WindowId> {
+        self.win.as_ref().map(|w| w.win)
+    }
 }
 
 #[cfg(test)]

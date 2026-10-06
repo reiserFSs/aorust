@@ -23,7 +23,7 @@ fn open(g: &mut Gui, pos: (i32, i32)) -> usize {
 fn pin_help_and_close_buttons_act_on_release() {
     let Some(mut g) = gui() else { return };
     let w = open(&mut g, (100, 100));
-    // outer (100,100)..(409,280): close box x 387..401, pin 369..383, `?` 351..365 (y 105..119)
+    // outer (100,100)..(409,280): close box x 390..404, pin 372..386, `?` 354..368 (y 105..119)
     assert_eq!(g.window_outer_frame(w), Some((100, 100, 310, 181)));
     assert!(click(&mut g, 375.0, 112.0).contains(&Event::FramePin { window: w, pinned: true }));
     assert!(g.window_pinned(w));
