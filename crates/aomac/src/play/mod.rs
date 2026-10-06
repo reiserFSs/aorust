@@ -344,7 +344,11 @@ impl Play {
 }
 
 pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String>) -> Result<()> {
-    let audio = Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok();
+    let audio = Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok().inspect(|a| {
+        if std::env::var_os("AOMAC_AUDIO_MUTE").is_some() {
+            a.set_output_gain(0.0);
+        }
+    });
     let p = Play::new(dir.clone(), fake_charlist, server_arg, audio)?;
     p.start_backdrop();
     if fake_charlist.is_none() {

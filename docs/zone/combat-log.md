@@ -93,9 +93,9 @@ The wire has no damage type; the old port fed `0` (→ `0x5a`) for every hit. Th
   `f0` and `f1` are not modelled — stat 436 is not among the interpolated stats as far as `FUN_100cba71` was read, [INFERENCE]).
 
 ### 2.2 `SpecialAttackInfoIIR_t` → `FUN_1006a9c5(slot, damage, value_28, target, special, unk_30)` [GC 0x1006a9c5] (`this` = attacker controller)
-Target must resolve. Name `%s` = `GetText(0x7d3 = 2003, special)` (the localized stat name, 142 → "Brawling"; **not** `fStatToString`). Type: attacker is the client char → `0x32`; else the target is → `0x30`;
+Target must resolve; then `FUN_1006a239(slot,1)` starts the special swing **before** feedback (fresh decompile of GC 0x1006a9c5). Name `%s` = `GetText(0x7d3 = 2003, special)` (localized stat name, 142 → "Brawling"; **not** `fStatToString`). Type: attacker is client char → `0x32`; else target is → `0x30`;
 else `0x31` (`0x33` for flagged PvP). `FUN_10012bd5(type, target, damage, attacker, name, 0, 0, 0)`; `Health(target) -= damage`; `unk_30 != 0` → `FUN_1005ae91(unk_30)` on the target (immediately);
-`FUN_10068320(slot, value_28)` (weapon slot stat 0x1a); `FUN_1006a239(slot, 1)` (special animation).
+`FUN_10068320(slot,value_28)` (weapon slot stat 0x1a); `FUN_1005548b` at GC 0x1006abed clears the complete pending deque. `FUN_1006855a` reads the deque's front via `FUN_100553f8` (begin) and `FUN_1006af02` (dereference), not the result message's special stat.
 
 ### 2.3 `MissedAttackInfoIIR_t` → `FUN_1006ae50(slot, value_1c, &source, &target, stat)` [GC 0x1006ae50]
 `source` (`+0x20`) = **B**, the one that missed; `target` (`+0x28`) = **A**, the one missed (apply [GC 0x100a0b20] passes `&+0x20, &+0x28` in this order; the formatter's own rules agree: B client → "You tried to hit A, but missed!").
@@ -104,7 +104,7 @@ Live: 11 messages, all `stat == 0`, none involves the capturing player → the f
 
 ### 2.4 `CharSecSpecAttackIIR_t` → `FUN_10068790(ctrl; target, special)` [GC 0x10068790]
 If `ctrl+0x9c == 0` and `special` is not yet queued (`FUN_10063be4` linear search) → append to the controller's deque (`FUN_1006b582`); otherwise `FUN_10058816(special)`/`FUN_1003f065(special)` (special-attack
-action activation in the GUI). Port: `pending_specials` queue + `SpecialAttack` event. [UNRESOLVED] what consumes the queue.
+action activation in the GUI). Port: an empty `pending_specials` deque accepts the queue message without animation; `SpecialAttackInfo` starts its front's swing before log/health/death processing, then clears the deque. Empty queue results play the ordinary attack list (`FUN_10069acb`). `StopFight` also clears it (`FUN_1005548b` at GC 0x10068c93). Captured order is covered for observer and fighting-player views by `captured_specials_queue_until_the_result_for_own_and_observer`.
 
 ## 3. `FUN_10012bd5` — the feedback formatter [GC 0x10012bd5] (`log::render`)
 Called as `FUN_10012a1e(type, A, value, B, extra, stat, hit, ident)` (`FUN_10012a1e` is only the singleton getter; the eight stack arguments are consumed by `FUN_10012bd5`, `ret 0x20`).

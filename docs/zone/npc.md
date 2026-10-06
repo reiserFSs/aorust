@@ -72,6 +72,8 @@ transitions `FUN_1006d196 d5d0 d69c d821 d9e8 dd0c de93 df81 eb63 ecf0`) starts 
 an **infinite loop**, so an idle never re-rolls at the loop end and there is no chance rule or blend between idle variants; the next roll happens at the next state change (also `FUN_1003ea0d` revive,
 `FUN_1006fcfa` end of a waypoint path, `FUN_1003cc15`/`FUN_1003cad0` stance idle, `FUN_1006a239` attack, `FUN_100a4dcc` emote). Implemented per character in `dynels::Roll` (rolled when the clip key or movement state changes), all variants are loaded into `Built::clips`.
 
+After movement-state Play, `FUN_1006be27` calls `FUN_1006fb56` even for idle: speed zero means vehicle maximum velocity (`Vehicle_t+0x3c`), not stationary playback. Calibration × inverse MonsterScale × maximum/reference velocity is set once on the new handle; ordinary idle is not unconditionally rate 1.0. Direct stance idle Play (`FUN_1003cc15`/`FUN_1003cad0`) remains authored-rate playback; see the clock distinction in `avatar.md`.
+
 | key → parent | |
 |---|---|
 | 0x3fc→0x3f2, 0x3fd→0x3f3, 0x3fe→0x3f4, 0x3ff→0x3f5 | rifle start/idle/stop/shot → smallarms |
@@ -177,7 +179,7 @@ of the same triangles in the submesh's own phase, depth `LESS_EQUAL`). The CAT r
   The runtime head change `FUN_10059376` removes/adds place 0. `CharLook::from_update` retains the
   full-update head before `actor::attractor_list` orders the wire bookkeeping list.
 * **MonsterScale** (stat 0x168 = 360; wire percent): `FUN_1005bea6` ends with `n3VisualDynel_t::SetBodyScale(stat(0x168, kind 3) / 100.0)` (`_DAT_10158670` = 100.0);
-  the stat setter clamps to **≥ 20** (`FUN_10059e6a`: `0x168` → 0x14) and `CharRadius` (0x1a5) = `MonsterScale × value / 100` (same function). Uniform scale of the whole model.
+  the stat setter clamps to **≥ 20** (`FUN_10059e6a`: `0x168` → 0x14) and `CharRadius` (0x1a5) = `MonsterScale × value / 100` (same function). Uniform scale of the whole model; `Dynels` applies the same minimum to full-update body scale.
 * **Visibility**: `DisableVisibility` = `n3VisualDynel+0xc9 = 0` (N3 @0x1001954a; Enable sets 1; the VisualCATMesh has its own `+0x70`). `FUN_10077e13` calls it for
   every non-own dynel when stat `InPlay` (0xC2) is 0; the update `FUN_10077af2` writes stat 0xC2 = `VisualFlags >> 1 & 1`, 0xDF = bit 3, 0x159 = bit 0x1c, and sets Features
   bits `0x800` (flag bit 2) and `0x800000` (bit 0x12). VisualFlags bit 0 = NPC (branch that also sets stat 0x21 `Side`, 0x1c7/0x1d2/0x200/0x184).

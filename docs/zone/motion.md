@@ -127,8 +127,7 @@ The animation of a status is chosen by `FUN_1006be27` (stationary/moving), `FUN_
 | frozen | Idle |
 | attack / die | set by the application from combat messages (ids 0x3e8.. weapon sets, die 0x1f4..0x1f9, 0x1770 `die-pain`) |
 
-`SetWantedDirection` (§4) turns a standing NPC with the turn clips. Animation speed: `FUN_1006fb56` scales the clip by `anim_calibration · (vehicle speed)/(+0x170 reference speed)` (the reference is the mode's base speed 1.5/5/3/7/1) and by stat 0x168 MonsterScale (`100/scale`);
-not implemented (`Pose.speed` is provided).
+`SetWantedDirection` (§4) turns a standing NPC with the turn clips. Animation speed: `FUN_1006fb56` scales a newly started movement-state clip (idle included) by `anim_calibration · (vehicle maximum speed)/(+0x170 reference speed)` and by stat 0x168 MonsterScale (`100/scale`); `Dynels` implements this clip-start clock through `avatar::anim_rate` and `Calibration` (see `avatar.md`). Direct stance idles retain authored playback.
 
 Complete client id → clip name table (`FUN_100c01c9`; 197 entries; ids 0x79-0x7b, 0x95 and a few others are not set there):
 

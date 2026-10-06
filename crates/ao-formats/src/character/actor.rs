@@ -159,6 +159,8 @@ struct Mount {
     attractor: usize,
     /// Index into `ActorRig::model().meshes`.
     mesh: usize,
+    /// Static weapon connector in the attachment's AO frame, resolved once at load.
+    muzzle: Option<Xf>,
 }
 
 pub struct ActorRig {
@@ -195,7 +197,7 @@ impl ActorRig {
         if let Some(h) = head {
             let att = cat.attractors.iter().position(|a| a.name.ends_with("_head")).context("model has no head attractor")?;
             if let Some(mesh) = crate::mesh::decode_mesh_into(store, h, &mut model)? {
-                mounts.push(Mount { attractor: att, mesh });
+                mounts.push(Mount { attractor: att, mesh, muzzle: None });
                 head_att = Some(att);
             }
         }
@@ -203,16 +205,21 @@ impl ActorRig {
             let prefix = format!("Attractor{:02}", place as u32 + 1);
             let Some(att) = cat.attractors.iter().position(|a| a.name.starts_with(&prefix)) else { continue };
             if let Some(mesh) = crate::mesh::decode_mesh_into(store, id, &mut model)? {
-                mounts.push(Mount { attractor: att, mesh });
+                let connectors = crate::mesh::decode_mesh_connectors(store, crate::mesh::MESH_TYPE, id)?;
+                let muzzle = ["Attractor01_weaponfire", "Attractor01", "Attractor02", "Attractor01_weaponfire01", "Attractor01_weaponfire02", "Attractor01_weaponfire03", "Attractor01_weaponfire04", "Attractor01_weaponfire05", "Attractor01_weaponfire06"]
+                    .iter().find_map(|name| connectors.iter().find(|(n, _)| n.as_str() == *name).map(|(_, m)| Xf {
+                        r: std::array::from_fn(|r| std::array::from_fn(|c| m[c][r])),
+                        t: [m[3][0], m[3][1], m[3][2]],
+                    }));
+                mounts.push(Mount { attractor: att, mesh, muzzle });
             }
         }
         // Unweighted attractor bones still have local transforms. Using their
         // nearest weighted ancestor directly buries Atrox heads in the torso.
         // Match character::build, resolving the rest clip once, never per pose.
-        if mounts.iter().any(|m| bind[cat.attractors[m.attractor].bone as usize].is_none()) {
+        if cat.attractors.iter().any(|a| bind[a.bone as usize].is_none()) {
             let rest = assets.rest(store, model_id, &cat, &bind)?;
-            for mount in &mounts {
-                let bone = cat.attractors[mount.attractor].bone as usize;
+            for bone in cat.bone_order() {
                 if bind[bone].is_none() {
                     bind[bone] = Some(derived_bind_frame(&cat, &bind, &rest, bone));
                 }
@@ -258,6 +265,45 @@ impl ActorRig {
             None => self.bind[b].or_else(|| self.nearest_frame(&self.bind, b))?,
         };
         Some(bone.mul(&Xf::from_qt(att.rot, att.pos)).t)
+    }
+
+    /// Retail effect binding (GC 0x10105917), column-major model scene matrix.
+    /// Missing authored geometry is not replaced with an invented offset.
+    pub fn effect_anchor(&self, id: i32, clip: Option<(&CatAnim, f32)>) -> Option<[[f32; 4]; 4]> {
+        const BONES: [&str; 19] = ["Bip01 Pelvis_ac", "Bip01 Spine_ac", "Bip01 Spine1_ac", "Bip01 Spine2_ac", "Bip01 Spine3_ac", "Bip01 Neck_ac", "Bip01 Head_ac", "Bip01 L UpperArm_ac", "Bip01 R UpperArm_ac", "Bip01 L Forearm_ac", "Bip01 R Forearm_ac", "Bip01 L Thigh_ac", "Bip01 R Thigh_ac", "Bip01 L Calf_ac", "Bip01 R Calf_ac", "Bip01 L Foot_ac", "Bip01 R Foot_ac", "Bip01 L Hand_ac", "Bip01 R Hand_ac"];
+        const ATTRACTORS: [&str; 24] = ["Attractor02_righthand", "Attractor03_lefthand", "Attractor01_head", "Attractor06_back", "Attractor05_leftshoulder", "Attractor04_rightshoulder", "Attractor07_special", "Attractor08_special", "Attractor09_special", "Attractor10_special", "Attractor11_special", "Attractor12_attack1", "Attractor13_attack2", "Attractor14_destroyed", "Attractor15_flare1_flash", "Attractor16_flare2_flash", "Attractor17_smoke75", "Attractor18_smoke50", "Attractor19_smoke25", "Attractor20_sparks50", "Attractor21_flames15", "Attractor22_flare1", "Attractor23_flare2", "Attractor30_beam"];
+        if id == 0 { return Some(IDENTITY) }
+        if id == 3000 { return self.weapon_effect_anchor(1, clip) }
+        let w = if let Some(name) = id.checked_sub(1000).and_then(|n| usize::try_from(n).ok()).and_then(|n| BONES.get(n)) {
+            self.cat.bones.iter().position(|b| b.name == *name).and_then(|bone| self.effect_bone(bone, clip))
+                .or_else(|| self.effect_attractor("Attractor01_head", clip))?
+        } else {
+            let name = id.checked_sub(2000).and_then(|n| usize::try_from(n).ok()).and_then(|n| ATTRACTORS.get(n))?;
+            self.effect_attractor(name, clip).or_else(|| self.effect_attractor("Attractor01_head", clip))?
+        };
+        Some(effect_matrix(w))
+    }
+
+    fn effect_attractor(&self, name: &str, clip: Option<(&CatAnim, f32)>) -> Option<Xf> {
+        let att = self.cat.attractors.iter().find(|a| a.name == name)?;
+        Some(self.effect_bone(att.bone as usize, clip)?.mul(&Xf::from_qt(att.rot, att.pos)))
+    }
+
+    /// Weapon connector composed through its animated hand attachment (GC 0x1009bded).
+    /// `place` is the wire attachment place: 1 right hand, 2 left hand.
+    pub fn weapon_effect_anchor(&self, place: u8, clip: Option<(&CatAnim, f32)>) -> Option<[[f32; 4]; 4]> {
+        let name = match place { 1 => "Attractor02_righthand", 2 => "Attractor03_lefthand", _ => return None };
+        let mount = self.mounts.iter().find(|m| self.cat.attractors[m.attractor].name == name && m.muzzle.is_some())?;
+        let att = &self.cat.attractors[mount.attractor];
+        let w = self.effect_bone(att.bone as usize, clip)?.mul(&Xf::from_qt(att.rot, att.pos)).mul(&mount.muzzle?);
+        Some(effect_matrix(w))
+    }
+
+    fn effect_bone(&self, bone: usize, clip: Option<(&CatAnim, f32)>) -> Option<Xf> {
+        let Some((a, ms)) = clip.filter(|(a, _)| a.signature == self.cat.signature) else { return self.bind[bone] };
+        let (q, t) = a.sample(bone, ms).unwrap_or(([0.0, 0.0, 0.0, 1.0], [0.0; 3]));
+        let local = Xf::from_qt(q, t.map(|c| c * self.scale[bone]));
+        Some(match self.parents[bone] { Some(parent) => self.effect_bone(parent, clip)?.mul(&local), None => local })
     }
 
     /// Height (metres above the feet, bind pose, unscaled) of the name tag / indicator anchor: `Attractor01_head` + 0.5 m
@@ -337,6 +383,18 @@ impl ActorRig {
     }
 }
 
+/// Conjugate an AO frame by the scene Z mirror, as for rendered attachment parts.
+fn effect_matrix(w: Xf) -> [[f32; 4]; 4] {
+    let mut m = IDENTITY;
+    for (c, col) in m.iter_mut().enumerate().take(3) {
+        for (r, x) in col.iter_mut().enumerate().take(3) {
+            *x = w.r[r][c] * if (r == 2) != (c == 2) { -1.0 } else { 1.0 };
+        }
+    }
+    m[3] = [w.t[0], w.t[1], -w.t[2], 1.0];
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +402,37 @@ mod tests {
     fn store() -> Option<RecordStore> {
         let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
         RecordStore::open(&dir).ok()
+    }
+
+    #[test]
+    fn real_rifle_effect_anchor_uses_authored_muzzle_and_animated_hand() {
+        let Some(store) = store() else { return };
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let look = PlayerLook { breed: Breed::Solitus, gender: Gender::Male, skin: Skin::Caucasian, build: 1, head: None, equipment: Equipment::default() };
+        for (weapon, expected) in [(15839, [0.002563557, 0.02921438, 0.8932234]), (262556, [0.08988604, 0.13462976, 1.0123588])] {
+            let rig = ActorRig::player(&store, &assets, &look, &[(1, weapon)]).unwrap();
+            let mount = &rig.mounts[0];
+            let muzzle = mount.muzzle.expect("actual rifle connector");
+            for (actual, expected) in muzzle.t.into_iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-5, "weapon {weapon}: {actual} != {expected}");
+            }
+            let clip = assets.role(&store, rig.model_id, &Role::Clip("idle-stand".into())).unwrap().expect("player idle clip");
+            for ms in [0.0, 300.0, clip.duration] {
+                let pose = Some((&*clip, ms));
+                let hand = rig.effect_anchor(2000, pose).unwrap();
+                let local = effect_matrix(muzzle);
+                let expected: [[f32; 4]; 4] = std::array::from_fn(|c| std::array::from_fn(|r| (0..4).map(|k| hand[k][r] * local[c][k]).sum()));
+                let actual = rig.effect_anchor(3000, pose).unwrap();
+                for (actual, expected) in actual.iter().flatten().zip(expected.iter().flatten()) {
+                    assert!((actual - expected).abs() < 1e-5);
+                }
+                assert_ne!(actual[3], hand[3], "muzzle must not be the hand or camera");
+                for id in 1000..=1007 { assert!(rig.effect_anchor(id, pose).is_some(), "bone anchor {id}"); }
+            }
+            assert!(rig.effect_anchor(2001, None).is_some());
+            assert!(rig.weapon_effect_anchor(2, None).is_none());
+            assert!(rig.effect_anchor(999, None).is_none());
+        }
     }
 
     #[test]

@@ -198,6 +198,15 @@ pub fn parse_item_template(rec: &[u8]) -> Result<ItemTemplate> {
 /// of rdb 1000020 give at most one such match (none two) and 16 049 of the 17 298 weapon records one; the ids of those resolve in the sbf
 /// (`ao_audio` test `weapon_sounds_resolve`). Anything that is not a valid multimap is skipped, an empty one is no map.
 pub fn sound_map(rec: &[u8]) -> Vec<(u32, Vec<u32>)> {
+    item_multimap(rec, 0x14, None)
+}
+
+/// Item animation lists, element `{0xe, 0x13}` (`FUN_1004570c`).
+pub fn animation_map(rec: &[u8]) -> Vec<(u32, Vec<u32>)> {
+    item_multimap(rec, 0xe, Some(0x13))
+}
+
+fn item_multimap(rec: &[u8], element: u32, subtype: Option<u32>) -> Vec<(u32, Vec<u32>)> {
     let word = |at: usize| rec.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     // `(w / 0x3F1) - 1` of a size word, as the readers do (`w % 0x3F1 != 0` or an implausible count aborts the element)
     let count = |at: usize| word(at).filter(|&w| w >= 0x3F1 && w % 0x3F1 == 0).map(|w| (w / 0x3F1 - 1) as usize).filter(|&n| n <= 30000);
@@ -220,7 +229,7 @@ pub fn sound_map(rec: &[u8]) -> Vec<(u32, Vec<u32>)> {
         Some(map)
     };
     (8..rec.len().saturating_sub(12))
-        .filter(|&at| word(at) == Some(0x14) && word(at + 4).is_some_and(|sub| sub <= 0x36))
+        .filter(|&at| word(at) == Some(element) && word(at + 4).is_some_and(|sub| subtype.map_or(sub <= 0x36, |expected| sub == expected)))
         .find_map(|at| multimap(at + 8).filter(|m| !m.is_empty()))
         .unwrap_or_default()
 }
@@ -512,6 +521,7 @@ mod tests {
         assert_eq!((t.kind, t.name.as_deref()), (0xC74A, Some("Martial Arts Item")));
         assert_eq!(t.sounds, [(0xb, vec![0xc1080179]), (0x1f, vec![0x7199b60d]), (0x73, vec![0x01d88720]), (0x74, vec![0xc1080179])]);
         assert_eq!(sound_map(&rec), t.sounds);
+        assert_eq!(animation_map(&rec), [(0xb, vec![1034, 1035, 1037, 1033])]);
         // the animation multimap `{0xe}` has the same layout but is not the sound element; a record without a `{0x14}` element has none
         let mut anim_only = rec.clone();
         let at = rec.windows(8).position(|w| w == [0x14, 0, 0, 0, 5, 0, 0, 0]).unwrap();
@@ -519,6 +529,7 @@ mod tests {
         assert!(sound_map(&anim_only).is_empty());
         for n in 0..rec.len() {
             let _ = sound_map(&rec[..n]);
+            let _ = animation_map(&rec[..n]);
         }
     }
 

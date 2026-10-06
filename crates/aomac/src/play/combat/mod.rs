@@ -2,6 +2,7 @@ pub mod actions;
 pub mod anim;
 pub mod arms;
 pub mod duel;
+pub mod effects;
 pub mod glue;
 pub mod log;
 pub mod module;

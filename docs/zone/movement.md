@@ -278,7 +278,7 @@ JumpStart. Terminal speed ±50 m/s.
 JumpForward}` from the FSM (the original picks anim ids in the Apply functions: 0x86/0x87 strafe left/right in every mode, 0xC4/0xC5 turn in place
 (no `Role`, mapped to Idle), 0x9C jump standing / 0x9D jump moving, 0xB9/0xBA/0xBB landings, 0x85 swim, 0x67 crawl, 0x88 walk back, 0xDE run back).
 `anim_scale()`: `FUN_1006fb56`: `max_vel / ref_speed` (ref = the base speed of the mode: walk 1.5, run 5 / reverse 3, swim 3, fly 7, crawl 1) ×
-`100/MonsterScale(0x168)`, capped at 1.3 when `max_vel > 4` (consts [GC 0x10160a8c 0x10160a88]); the animation-calibration control (`FUN_100017f7`) is not modelled.
+`100/MonsterScale(0x168)`, capped at 1.3 when `max_vel > 4` (consts [GC 0x10160a8c 0x10160a88]); the animation-calibration control (`FUN_100017f7`) is implemented by `avatar::Calibration`. `Dynels` snapshots this rate at movement-state Play (`FUN_1006be27`), rather than changing it every frame.
 
 ## 9. Unresolved / approximated (labelled GUESS in the code)
 

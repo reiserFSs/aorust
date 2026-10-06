@@ -289,6 +289,8 @@ pub struct Avatar {
     clip: Option<Arc<CatAnim>>,
     /// rdb 1010003 id of `clip`.
     clip_id: u32,
+    /// AbstractAnimID passed to calibration (GC 0x1006fb56), not the RDB clip id.
+    calibration_id: u32,
     /// Playback rate of the current clip ([`anim_rate`]).
     rate: f32,
     /// `ItemDelay` of the weapon of the swing clip that plays ([`Avatar::set_swing_delay`]).
@@ -315,7 +317,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, look: l.look, attachments: l.attachments, assets, scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, clip_id: 0, rate: 1.0, swing_delay: None, swinging: false, clip_scale: None, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, look: l.look, attachments: l.attachments, assets, scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, clip_id: 0, calibration_id: 0, rate: 1.0, swing_delay: None, swinging: false, clip_scale: None, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -350,6 +352,12 @@ impl Avatar {
         Ok(true)
     }
 
+    /// A different one-shot list can resolve to the same role; restart its clock and notes explicitly.
+    pub fn restart_clip(&mut self) {
+        self.ms = 0.0;
+        self.note_fired = 0;
+    }
+
     /// Switches the clip when the role changes; a change between locomotion clips keeps the gait phase, any other restarts.
     pub fn set_pose(&mut self, store: &RecordStore, pose: AvatarPose) -> Result<()> {
         if pose.role != self.pose.role || self.clip.is_none() {
@@ -357,14 +365,15 @@ impl Avatar {
             let clips = self.assets.clips(store, self.rig.model_id)?;
             // a wielder: the weapon's stance clip over the movement clip while the model's set has it, else the plain role
             let mut stance = self.stance.and_then(|set| stance_clip(set, &pose.role)).filter(|n| clips.iter().any(|c| c.0 == *n));
-            let (clip, id) = loop {
+            let (clip, id, calibration_id) = loop {
                 let name = stance.take().unwrap_or_else(|| role.clip_name());
                 if let Some(&(_, id)) = clips.iter().find(|c| c.0 == name) {
-                    break (Some(self.assets.anim(store, id)?), id);
+                    let abstract_id = super::combat::anim::ANIMS.iter().find(|a| a.1 == name).map_or(0, |a| u32::from(a.0));
+                    break (Some(self.assets.anim(store, id)?), id, abstract_id);
                 }
                 match fallback(&role) {
                     Some(r) => role = r,
-                    None => break (None, 0),
+                    None => break (None, 0, 0),
                 }
             };
             self.ms = match (&self.clip, &clip) {
@@ -376,9 +385,10 @@ impl Avatar {
             };
             self.clip = clip;
             self.clip_id = id;
+            self.calibration_id = calibration_id;
             self.note_fired = 0;
         }
-        self.rate = anim_rate(self.calibration.get(self.rig.model_id, self.clip_id), self.scale * 100.0, pose.speed, pose.ref_speed, false);
+        self.rate = anim_rate(self.calibration.get(self.rig.model_id, self.calibration_id), self.scale * 100.0, pose.speed, pose.ref_speed, false);
         // `FUN_1006a239`: a weapon swing is sped up so its first note lands within the weapon's ItemDelay
         if let (Some(d), Some(a)) = (self.swing_delay, &self.clip) {
             self.rate *= super::combat::anim::swing_speed_scale(a.events.first().map_or(0.0, |e| e.0 as f32), d);
@@ -448,6 +458,17 @@ impl Avatar {
         let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
         let (skin, parts) = self.rig.pose(clip);
         ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, skin: Some(skin), always: true, alpha: 1.0 }
+    }
+
+    /// Current effect anchor in world scene space, including heading and body scale.
+    pub fn effect_anchor(&self, id: i32) -> Option<[[f32; 4]; 4]> {
+        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
+        self.rig.effect_anchor(id, clip).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
+    }
+
+    pub fn weapon_effect_anchor(&self, place: u8) -> Option<[[f32; 4]; 4]> {
+        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
+        self.rig.weapon_effect_anchor(place, clip).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
     }
 
     /// `n3Dynel_t::GetBodyCollSphereRadi` (N3 0x10004dd3): the model's torso sphere radius (`VisualCATMesh_t::GetTorsoSphereRadi`), 0.5 when
@@ -669,20 +690,21 @@ mod tests {
     }
 
     #[test]
-    fn retail_authored_gait_durations_use_milliseconds_and_calibration() {
+    fn retail_authored_gait_durations_use_milliseconds_and_abstract_calibration_keys() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
         let mut assets = ActorAssets::new(&store).unwrap();
         let calibration = Calibration::load(&dir);
-        for (id, duration, start, end, speed, reference, factor) in [
-            (10191, 2433.0, 733.0, 1733.0, 1.5, 1.5, 0.90),
-            (10194, 4000.0, 1166.0, 1933.0, 5.0, 5.0, 1.15),
+        for (id, abstract_id, duration, start, end, speed, reference, factor) in [
+            (10191, 0x64, 2433.0, 733.0, 1733.0, 1.5, 1.5, 0.90),
+            (10194, 0x65, 4000.0, 1166.0, 1933.0, 5.0, 5.0, 1.15),
         ] {
             let clip = assets.anim(&store, id).unwrap();
             assert_eq!(clip.duration, duration);
             assert_eq!(loop_span(&clip), Some((start, end)));
             assert_eq!(calibration.get(5907, id), factor);
-            let rate = anim_rate(factor, 100.0, speed, reference, false);
+            assert_eq!(calibration.get(5907, abstract_id), 1.0, "retail loader does not remap RDB keys");
+            let rate = anim_rate(calibration.get(5907, abstract_id), 100.0, speed, reference, false);
             let seconds_per_cycle = (end - start) / (1000.0 * rate);
             assert!((clip_time(&clip, start + seconds_per_cycle * 1000.0 * rate, false) - start).abs() < 0.001);
             eprintln!("CAT {id}: authored {duration}ms, loop {start}..{end}, rate {rate}, cycle {seconds_per_cycle:.6}s, stride {:.6}m", speed * seconds_per_cycle);

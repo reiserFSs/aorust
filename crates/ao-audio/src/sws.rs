@@ -33,6 +33,8 @@ pub struct Sample {
     /// File stem; file = `<music/env>/<layer dir>/<name>.{wav,mp3,ogg}`.
     pub name: String,
     pub end_ms: u32,
+    /// `totoffms`: default overlap when a forced transition uses this sample's authored fade.
+    pub overlap_ms: u32,
     /// `entflg`: may be chosen as the first sample of a layer.
     pub entry: bool,
     pub vol: f32,
@@ -236,6 +238,7 @@ impl Project {
                 layer: g("lid") as usize,
                 name: a.strs(m, "name").into_iter().next().unwrap_or_default(),
                 end_ms: g("endmtime"),
+                overlap_ms: g("totoffms"),
                 entry: a.bytes(m, "entflg").first().is_some_and(|&b| b != 0),
                 vol: a.f32s(m, "vol").first().copied().unwrap_or(1.0),
                 trans: trans(a.u32s(m, "trans"))?,

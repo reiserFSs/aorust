@@ -40,7 +40,13 @@ pub fn valid_slot(s: i32) -> bool {
 pub struct Item {
     pub dtype: i32,
     pub sounds: Vec<(u32, Vec<u32>)>,
+    pub animations: Vec<(u32, Vec<u32>)>,
+    /// Authored muzzle, hit/tracer and successful-hit impact bindings (item event 10).
+    pub effects: Vec<super::effects::Binding>,
+    pub effect_type: i32,
+    pub impact_effect_type: i32,
     pub ammo: i32,
+    pub delay: i32,
     pub wielded: bool,
 }
 
@@ -120,7 +126,10 @@ impl Armory {
     fn item(&self, template: Option<u32>, msg: &[(u32, i32)], wielded: bool) -> Item {
         let tpl = template.zip(self.store.as_ref()).and_then(|(t, s)| item_template(s, t).ok().flatten());
         let stats = effective_stats(tpl.as_ref(), msg);
-        Item { dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), wielded }
+        let record = template.zip(self.store.as_ref()).and_then(|(t, s)| s.get(ao_formats::dynel_visual::ITEM_TEMPLATE_TYPE, t).ok().flatten());
+        let animations = record.as_ref().map(|r| ao_formats::dynel_visual::animation_map(r)).unwrap_or_default();
+        let effects = record.as_ref().and_then(|r| super::super::chat::item_template_spells(r, 10).ok()).map(|s| super::effects::bindings(&s)).unwrap_or_default();
+        Item { dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), delay: get(&stats, 0x126).unwrap_or(200), effect_type: get(&stats, 413).unwrap_or(0), impact_effect_type: get(&stats, 414).unwrap_or(49999), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), animations, effects, wielded }
     }
 
     /// `holder` wields weapon dynel `item` in body `slot` (`WeaponItemFullUpdateIIR_t`).
@@ -196,6 +205,23 @@ impl Armory {
     /// The item behind `holder`'s body `slot` (`FUN_10068072` [GC 0x10068072]): what the attack notes read (`FUN_100688f9`).
     pub fn slot_item(&self, holder: i32, slot: i32) -> Option<&Item> {
         self.by.get(&holder)?.slots.get(&slot)
+    }
+
+    pub fn special_item(&self, holder: i32, special: i32) -> Option<&Item> {
+        self.by.get(&holder)?.specials.get(&special)
+    }
+
+    /// Lists of the special's own item, or the bare-hands item for an ordinary unarmed attack.
+    pub fn item_animation(&self, holder: i32, special: i32, key: u16, pick: u32) -> Option<u16> {
+        let a = self.by.get(&holder)?;
+        let item = if special == 0 { a.slots.get(&0)? } else { a.specials.get(&special)? };
+        let values = &item.animations.iter().find(|e| e.0 == u32::from(key)).or_else(|| item.animations.iter().find(|e| e.0 == 0xb))?.1;
+        u16::try_from(*values.get(pick as usize % values.len().max(1))?).ok()
+    }
+
+    pub fn swing_delay(&self, holder: i32) -> Option<i32> {
+        let a = self.by.get(&holder)?;
+        [6, 8, 0].iter().find_map(|s| a.slots.get(s)).map(|i| i.delay)
     }
 }
 
@@ -274,8 +300,11 @@ mod tests {
         }
         let mut a = Armory::open(&dir);
         // unarmed: the martial-arts item (record 43712 has no stat 436: the item default); its special-attack siblings alike
-        a.list(1, false, &[(43712, 100), (43713, 144)]);
+        a.list(1, false, &[(43712, 100), (42033, 144), (70292, 142)]);
         assert_eq!((a.damage_type(1, 0, 0), a.damage_type(1, 0, 144)), (Some(MELEE), Some(MELEE)));
+        assert_eq!(a.item_animation(1, 144, 0x24, 0), Some(163));
+        assert_eq!(a.item_animation(1, 142, 0x23, 0), Some(1036));
+        assert_eq!((0..4).map(|n| a.item_animation(1, 0, 0xb, n).unwrap()).collect::<Vec<_>>(), [1034, 1035, 1037, 1033]);
         // right hand: Solar-Powered Pistol (projectile); left hand: Dull E-Blade (a 2H blade that deals energy damage)
         a.wield(1, 500, 6, Some(121567), &[]);
         a.wield(1, 501, 8, Some(122159), &[]);
@@ -284,6 +313,14 @@ mod tests {
         eprintln!("bare hands {bare:?}\npistol {pistol:?}");
         assert!(bare.is_none(), "the pistol replaced the bare hands (slot 0)");
         assert!(pistol.wielded && !pistol.sounds.is_empty() && pistol.sounds.iter().any(|s| s.0 == 0xb), "the wielded weapon's record sounds: swing / shot 0xb");
+        assert_eq!(pistol.effects, [
+            super::super::effects::Binding { group: 0, attractor: 0, effect: 2000, note: 0, color: 0xffffffd7 },
+            super::super::effects::Binding { group: 1, attractor: 0, effect: 2601, note: 0, color: 0xffffffd7 },
+            super::super::effects::Binding { group: 2, attractor: 0, effect: 62002, note: 0, color: 0xffffffd7 },
+        ]);
+        a.wield(3, 504, 6, Some(121569), &[]);
+        let rifle = a.slot_item(3, 6).unwrap();
+        assert_eq!(rifle.effects.iter().map(|b| (b.group, b.effect)).collect::<Vec<_>>(), [(0,2005), (1,2750), (2,62002)]);
         let mut b = Armory::open(&dir);
         b.list(1, false, &[(43712, 100)]);
         let m = b.slot_item(1, 0).unwrap();
@@ -293,9 +330,10 @@ mod tests {
         a.wield(2, 502, 6, Some(121564), &[]);
         a.wield(2, 503, 8, Some(121564), &[(STAT_DAMAGE_TYPE, ENERGY)]);
         assert_eq!((a.damage_type(2, 6, 0), a.damage_type(2, 8, 0)), (Some(MELEE), Some(ENERGY)));
-        // the creatures' innate attacks: "Monster Melee Primary Wpn" / "Generic Monster Distance Weapon"
-        a.list(3, true, &[(56180, 1), (44007, 2)]);
-        assert_eq!((a.damage_type(3, 0, 0), a.damage_type(3, 1, 0)), (Some(MELEE), Some(PROJECTILE)));
+        // A separate creature has no wielded rifle occupying a slot before its innate attack list.
+        // "Monster Melee Primary Wpn" / "Generic Monster Distance Weapon"
+        a.list(4, true, &[(56180, 1), (44007, 2)]);
+        assert_eq!((a.damage_type(4, 0, 0), a.damage_type(4, 1, 0)), (Some(MELEE), Some(PROJECTILE)));
     }
 
     /// The capture: 117 of the 134 `AttackInfo` find a slot object (12 have no target, the rest arrive before the attacker's

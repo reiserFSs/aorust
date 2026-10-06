@@ -530,7 +530,8 @@ pub struct Char {
     anim: u32,
     special: Special,
     clip_ms: f32,
-    pose_in: f32,
+    clip_rate: f32,
+    terminal_pose: bool,
     submitted: bool,
     /// Mount transforms of the last pose.
     parts: Vec<[[f32; 4]; 4]>,
@@ -542,6 +543,14 @@ pub struct Char {
     swing_ttl: f32,
     /// Bit `i` = event `i` of the playing clip has fired its note (`piVar7[0xd]` of the holder's clip entry, `FUN_1003c036`).
     note_fired: u32,
+}
+
+/// GC 0x1006fb56 sets speed at Play; DS 0x10072fde advances absolute milliseconds.
+fn advance_clip_clock(ms: &mut f32, rate: &mut f32, dt: f32, start_rate: impl FnOnce() -> f32) {
+    if *ms == 0.0 {
+        *rate = start_rate();
+    }
+    *ms += (dt * 1000.0 * *rate).abs();
 }
 
 /// A corpse, vending machine, door, ... (everything that is not a `SimpleChar`): a fixed model at a fixed place.
@@ -601,6 +610,7 @@ pub struct Dynels {
     pub arms: super::combat::arms::Armory,
     /// (swing clip, `ItemDelay`) of the last [`Dynels::pick_swing`] of a character: the clip plays sped up by [`canim::swing_speed_scale`].
     swing_delay: HashMap<i32, (u32, i32)>,
+    swing_keys: HashMap<i32, u16>,
     /// (clip, playback rate) of the last [`Dynels::react_to_hit`] of a character.
     once_rate: HashMap<i32, (u32, f32)>,
     /// Weapon dynel instance -> (holder, hand index).
@@ -636,6 +646,11 @@ pub struct Dynels {
     notes: Vec<(i32, u32)>,
     /// The last `AttackInfo` of every attacker (what the attack notes read from the slot object, `FUN_1006a8f3`).
     last_hit: HashMap<i32, super::combat::notes::HitCtx>,
+    effects: Option<super::combat::effects::Renderer>,
+    /// Retail effect category bits: muzzle=8, tracers/hits=2.
+    pub weapon_effect_categories: u32,
+    special_hit: HashMap<i32, (i32, i32, i32, i32)>,
+    impact_locations: HashMap<i32, i32>,
     /// Camera position of the last [`Dynels::update`] (scene space).
     cam: [f32; 3],
 }
@@ -655,6 +670,7 @@ impl Default for Dynels {
             wielded: vec![],
             arms: Default::default(),
             swing_delay: HashMap::new(),
+            swing_keys: HashMap::new(),
             once_rate: HashMap::new(),
             weapons: HashMap::new(),
             pending_weapons: vec![],
@@ -676,6 +692,10 @@ impl Default for Dynels {
             later: vec![],
             notes: vec![],
             last_hit: HashMap::new(),
+            effects: None,
+            weapon_effect_categories: 10,
+            special_hit: HashMap::new(),
+            impact_locations: HashMap::new(),
             cam: [0.0; 3],
         }
     }
@@ -726,6 +746,10 @@ impl Dynels {
         self.rng = CrtRand::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
         self.arms = super::combat::arms::Armory::open(&dir);
         self.calibration = super::avatar::Calibration::load(&dir);
+        self.effects = match super::combat::effects::Renderer::open(&dir) {
+            Ok(renderer) => Some(renderer),
+            Err(error) => { eprintln!("weapon effects: {error:#}"); None }
+        };
         self.dir = Some(dir);
     }
 
@@ -735,6 +759,10 @@ impl Dynels {
         self.last_hit.clear();
         self.later.clear();
         self.arms.clear();
+        self.special_hit.clear();
+        self.impact_locations.clear();
+        if let Some(effects) = &mut self.effects { effects.clear(); }
+        self.swing_keys.clear();
         self.props.clear();
         self.weapons.clear();
         self.wield.clear();
@@ -802,6 +830,7 @@ impl Dynels {
     /// on the worker the first time (NPC record table, or the player set's file name via `combat::anim::resolve_clip`).
     pub fn play_once(&mut self, id: i32, anim_id: u32) {
         let Some(c) = self.chars.get_mut(&id).filter(|c| c.special == Special::None) else { return };
+        self.swing_keys.remove(&id);
         let Look::Char(look) = &c.look else { return };
         if let Some(Model::Ready { built, .. }) = self.models.get(&c.key) {
             if built.clips.contains_key(&anim_id) {
@@ -811,6 +840,32 @@ impl Dynels {
             }
         }
         self.pending_clips.push((c.key, look.clone(), anim_id, id));
+    }
+
+    /// A playing list key is suppressed; a different special list replaces the swing even if its clip is identical.
+    /// `None` selects the preloaded fallback attack; an explicit clip (even ATTACK_KEY) keeps its authored one-shot path.
+    pub fn play_swing(&mut self, id: i32, anim: Option<u32>, key: u16) {
+        let Some(c) = self.chars.get_mut(&id) else { return };
+        if matches!(c.special, Special::Die(_)) || (c.special != Special::None && self.swing_keys.get(&id) == Some(&key)) {
+            return;
+        }
+        c.special = Special::None;
+        c.note_fired = 0;
+        self.pending_clips.retain(|p| p.3 != id);
+        self.replay.retain(|p| p.0 != id);
+        if let Some(anim) = anim {
+            self.play_once(id, anim);
+        } else {
+            self.attack(id);
+        }
+        self.swing_keys.insert(id, key);
+    }
+
+    pub fn pick_item_swing(&mut self, id: i32, special: i32, key: u16) -> Option<(u16, i32)> {
+        let anim = self.arms.item_animation(id, special, key, self.rng.rand())?;
+        let delay = self.arms.swing_delay(id).unwrap_or(0);
+        self.swing_delay.insert(id, (u32::from(anim), delay));
+        Some((anim, delay))
     }
 
     /// The weapon swing of `id` (`FUN_10069acb` [GC 0x10069acb] + `FUN_1003c594`): a random value of list `key` of the `AnimSet` lists of the
@@ -841,6 +896,7 @@ impl Dynels {
     /// is not already playing, at rate 1 for hit kind 4 (a crit), else `_DAT_1015d0a4` = 0.5. Returns the clip id and the rate.
     pub fn react_to_hit(&mut self, id: i32, flags: i32) -> (u16, f32) {
         let anim = self.impact_anim();
+        self.set_impact_location(id, anim);
         let rate = if flags == 4 { 1.0 } else { 0.5 };
         self.once_rate.insert(id, (u32::from(anim), rate));
         self.play_once(id, u32::from(anim));
@@ -942,6 +998,69 @@ impl Dynels {
     /// `FUN_1006a8f3` [GC 0x1006a8f3] stores the damage and the hit kind of an `AttackInfo` in the attacker's slot object (and the victim is its target).
     pub fn hit_seen(&mut self, attacker: i32, ctx: super::combat::notes::HitCtx) {
         self.last_hit.insert(attacker, ctx);
+        self.special_hit.remove(&attacker);
+    }
+
+    /// Special result has a real slot/damage but no wire hit-kind/crit flag.
+    pub fn special_hit_seen(&mut self, who: i32, victim: i32, slot: i32, damage: i32, special: i32) {
+        self.last_hit.remove(&who);
+        self.special_hit.insert(who, (victim, slot, damage, special));
+    }
+
+    pub fn set_impact_location(&mut self, victim: i32, anim: u16) {
+        let anchor = match anim { 0x7f => 1001, 0x81 => 1007, 0x82 => 1008, 0x84 => 1000, _ => 1006 };
+        self.impact_locations.insert(victim, anchor);
+    }
+
+    fn effect_anchor(&self, who: i32, anchor: i32, slot: i32) -> Option<glam::Mat4> {
+        let c = self.chars.get(&who)?;
+        let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
+        let rig = built.rig.as_ref()?;
+        let clip = built.clips.get(&c.anim).and_then(|clips| clips.get(c.roll.variant % clips.len().max(1))).map(|a| (&**a, super::avatar::clip_time(a, c.clip_ms, c.special != Special::None)));
+        let matrix = if anchor == 3000 { rig.weapon_effect_anchor(if slot == 8 { 2 } else { 1 }, clip) } else { rig.effect_anchor(anchor, clip) }?;
+        let local = glam::Mat4::from_cols_array_2d(&matrix);
+        let world = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(c.scale), glam::Quat::from_rotation_y(scene_yaw(c.pose.yaw)), glam::Vec3::from(scene_pos(c.pose.pos)));
+        Some(world * local)
+    }
+
+    /// Visual effects use the actor's actual animated connector, never `char_pos`'s
+    /// own-character sound/camera shortcut.
+    pub fn note_effects(&mut self, who: i32, note: u32, mut own_anchor: impl FnMut(i32, i32) -> Option<[[f32; 4]; 4]>) {
+        use super::combat::{effects::Binding, notes::id};
+        if !matches!(note, id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) { return; }
+        let (victim, slot, special, hit) = if let Some(h) = self.last_hit.get(&who) {
+            (h.victim, h.slot, 0, h.flags > 1)
+        } else if let Some(&(victim, slot, damage, special)) = self.special_hit.get(&who) {
+            (victim, slot, special, damage > 0)
+        } else { return };
+        let item = if special != 0 && canim::special_swing(special).is_some_and(|s| s.own_item) {
+            self.arms.special_item(who, special)
+        } else { self.arms.slot_item(who, slot) };
+        let Some(item) = item else { return };
+        let mut bindings = item.effects.clone();
+        if hit && !bindings.iter().any(|b| b.group == 2) {
+            bindings.push(Binding { group: 2, attractor: 0, effect: 62002, note: 0, color: 0 });
+        }
+        let Some(mut renderer) = self.effects.take() else { return };
+        let mut anchor = |id, a, slot| {
+            if id == self.own { own_anchor(a, slot).map(|m| glam::Mat4::from_cols_array_2d(&m)) }
+            else { self.effect_anchor(id, a, slot) }
+        };
+        for binding in bindings.into_iter().filter(|b| b.fires(note as i32, hit)) {
+            let category = if binding.group == 0 { 8 } else { 2 };
+            if self.weapon_effect_categories & category == 0 { continue; }
+            let source_anchor = if binding.group == 0 {
+                renderer.attractor(binding.effect, binding.attractor).unwrap_or(0)
+            } else if binding.attractor != 0 { binding.attractor } else { 2000+i32::from(slot == 8) };
+            let Some(source) = anchor(who, source_anchor, slot) else { continue };
+            let target_anchor = self.impact_locations.get(&victim).copied().unwrap_or(1000);
+            let target = anchor(victim, target_anchor, 0);
+            if binding.group != 0 && target.is_none() { continue; }
+            let position = target.map_or(source.w_axis.truncate(), |m| m.w_axis.truncate());
+            let origin = if binding.group == 2 { target.unwrap_or(source) } else { source };
+            if let Err(error) = renderer.spawn(binding, origin, position) { eprintln!("weapon effects: {error:#}"); }
+        }
+        self.effects = Some(renderer);
     }
 
     /// One animation note of `who`'s swing clip (`FUN_10045069` [GC 0x10045069], `combat::notes`).
@@ -1302,7 +1421,7 @@ impl Dynels {
                         look,
                         key,
                         mover,
-                        scale: if u.monster_scale > 0 { u.monster_scale as f32 / 100.0 } else { 1.0 },
+                        scale: u.monster_scale.max(20) as f32 / 100.0,
                         side: u.side,
                         flags: u.flags2 as i32,
                         visual_flags: u.visual_flags as i32,
@@ -1311,8 +1430,9 @@ impl Dynels {
                         pose,
                         anim: 0x78,
                         special: if u.max_health > 0 && u.health <= 0 { Special::Die(DIE_KEY) } else { Special::None },
-                        clip_ms: (who.instance as u32 % 1000) as f32 * 3.0,
-                        pose_in: 0.0,
+                        clip_ms: 0.0,
+                        clip_rate: 1.0,
+                        terminal_pose: false,
                         submitted: false,
                         parts: vec![],
                         features_set: !u.is_npc(),
@@ -1398,10 +1518,11 @@ impl Dynels {
     }
 
     /// Advances the dynels and hands the visible ones to the renderer. `cam` = camera position in scene space, `fwd` = its view direction.
-    pub fn update(&mut self, dt: f32, cam: [f32; 3], fwd: [f32; 3], host: &mut Host) {
+    pub fn update(&mut self, dt: f32, cam: [f32; 3], _fwd: [f32; 3], host: &mut Host) {
         self.sync_scene(host);
         self.cam = cam;
         self.tick_sounds(dt);
+        if let Some(effects) = &mut self.effects { effects.frame(dt, host); }
         let Some(dir) = self.dir.clone() else { return };
         let worker = self.worker.take().unwrap_or_else(|| Worker::start(dir));
         if let Some(pf) = self.want_placed.take() {
@@ -1532,12 +1653,9 @@ impl Dynels {
             let p = scene_pos(c.pose.pos);
             let (dx, dz) = (p[0] - cam[0], p[2] - cam[2]);
             let dist = (dx * dx + (p[1] - cam[1]).powi(2) + dz * dz).sqrt();
-            if dist > self.char_view_distance {
-                c.submitted = false;
-                continue;
-            }
             // clip: death / attack override the movement state; walking and running scale the clip with the real speed
             let state = c.pose.anim;
+            let mut movement_rate = c.special == Special::None;
             let (key, list, rate) = match c.special {
                 Special::Die(k) => match built.clips.get(&k).or_else(|| built.clips.get(&DIE_KEY)) {
                     Some(a) => (k, Some(a), 1.0),
@@ -1566,36 +1684,44 @@ impl Dynels {
                     let set = self.wield.get(id_ref).and_then(|w| w.iter().flatten().next().map(|w| w.set));
                     let sid = stance_id(set, state, self.fighting.contains(id_ref));
                     let stance = sid.and_then(|sid| built.clips.get(&(sid as u32)).map(|a| (sid as u32, a)));
+                    // Direct stance idle Play retains its authored 1.0 (GC 0x1003cc15 / 0x1003cad0).
+                    if stance.is_some() && !c.mover.status().is_moving() {
+                        movement_rate = false;
+                    }
                     let (id, a) = stance.map_or((id, a), |(i, a)| (i, Some(a)));
                     (id, a, 1.0)
                 }
             };
             // the variant is rolled when the clip starts, not while it loops
-            let clip = list.filter(|l| !l.is_empty()).map(|l| &l[c.roll.pick((key, matches!(c.special, Special::None).then_some(state)), l.len(), &mut self.rng)]);
-            let rate = if c.special == Special::None && c.mover.status().is_moving() {
-                let status = c.mover.status();
-                let reference = match status.mode {
-                    Mode::Run if status.forward < 0 => 3.0,
-                    Mode::Run => 5.0,
-                    Mode::Swim => 3.0,
-                    Mode::Fly => 7.0,
-                    _ => 1.5,
-                };
-                super::avatar::anim_rate(
-                    self.calibration.get(rig.model_id, clip.map_or(0, |a| a.source_id)),
-                    c.scale * 100.0,
-                    max_speed(status.mode, status.forward < 0, c.mover.skill()),
-                    reference,
-                    false,
-                )
-            } else { rate };
-            if key != c.anim {
+            let roll_key = (key, matches!(c.special, Special::None).then_some(state));
+            let started = c.roll.key != Some(roll_key);
+            let clip = list.filter(|l| !l.is_empty()).map(|l| &l[c.roll.pick(roll_key, l.len(), &mut self.rng)]);
+            if key != c.anim || started {
                 c.anim = key;
                 c.clip_ms = 0.0;
-                c.pose_in = 0.0;
                 c.note_fired = 0;
+                c.terminal_pose = false;
             }
-            c.clip_ms += dt * 1000.0 * rate;
+            // GC 0x1006be27 / 0x1006fb56 set the rate once after Play, including idle.
+            advance_clip_clock(&mut c.clip_ms, &mut c.clip_rate, dt, || {
+                if movement_rate {
+                    let status = c.mover.status();
+                    let reference = match status.mode {
+                        Mode::Run if status.forward < 0 => 3.0,
+                        Mode::Run => 5.0,
+                        Mode::Swim => 3.0,
+                        Mode::Fly => 7.0,
+                        _ => 1.5,
+                    };
+                    super::avatar::anim_rate(
+                        self.calibration.get(rig.model_id, key),
+                        c.scale * 100.0,
+                        max_speed(status.mode, status.forward < 0, c.mover.skill()),
+                        reference,
+                        false,
+                    )
+                } else { rate }
+            });
             // the notes of a swing clip (`FUN_1003c036`): the weapon / swish sounds start when the clip reaches them
             c.swing_ttl = (c.swing_ttl - dt).max(0.0);
             if let (Some(a), true) = (clip, c.swing_ttl > 0.0 && matches!(c.special, Special::Once(_) | Special::Attack)) {
@@ -1616,13 +1742,14 @@ impl Dynels {
             if let Some(a) = clip.filter(|a| c.special == Special::None && a.duration > 0.0 && c.clip_ms > 4.0 * a.duration) {
                 c.clip_ms = super::avatar::clip_time(a, c.clip_ms, false);
             }
-            c.pose_in -= dt;
-            // skinning is the cost: skip it behind the camera, slow it down with distance, never repeat a held frame
-            let facing = dx * fwd[0] + dz * fwd[2] > -0.3 * dist;
+            // DS 0x10074bb4 samples the CAT clock each frame, not a distance-selected Hz.
+            if dist > self.char_view_distance {
+                c.submitted = false;
+                continue;
+            }
             let terminal = dead && clip.is_some_and(|a| c.clip_ms >= a.duration);
-            let held = terminal && c.submitted && c.pose_in.is_infinite();
-            let skin = if (!c.submitted || (!held && (terminal || c.pose_in <= 0.0))) && (facing || dist < 6.0) {
-                c.pose_in = if terminal { f32::INFINITY } else if dist < 30.0 { 1.0 / 25.0 } else if dist < 80.0 { 0.1 } else { 0.25 };
+            let skin = if !terminal || !c.terminal_pose || !c.submitted {
+                c.terminal_pose = terminal;
                 Some(rig.pose(clip.map(|a| (&**a, super::avatar::clip_time(a, c.clip_ms, c.special != Special::None)))))
             } else {
                 None
@@ -1749,6 +1876,20 @@ impl Dynels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn npc_clock_keeps_clip_start_rate_and_uses_absolute_milliseconds() {
+        let (mut ms, mut rate) = (0.0, 1.0);
+        // Idle uses the vehicle maximum too (GC 0x1006be27), not zero velocity.
+        advance_clip_clock(&mut ms, &mut rate, 0.2, || super::super::avatar::anim_rate(0.9, 50.0, 1.5, 1.5, false));
+        assert!((ms - 360.0).abs() < 0.001);
+        advance_clip_clock(&mut ms, &mut rate, 0.2, || panic!("not reset until Play"));
+        assert!((ms - 720.0).abs() < 0.001);
+        ms = 0.0;
+        advance_clip_clock(&mut ms, &mut rate, -0.1, || 0.5);
+        assert_eq!(ms, 50.0);
+        assert_eq!(rate, 0.5);
+    }
 
     #[test]
     fn scene_replacement_invalidates_every_cached_model_even_after_zone_upload() {
@@ -2119,6 +2260,35 @@ mod tests {
             })
             .count();
         assert!(off * 10 <= z.world.chars.len(), "{off} of {} dynels are more than 3 m off the server polyline", z.world.chars.len());
+    }
+
+    #[test]
+    fn distinct_swing_lists_replace_a_busy_identical_clip() {
+        let mut z = Zone::new(25988);
+        for l in include_str!("../../../../docs/captures/zone_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            if dir != "<" { continue; }
+            let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2*i..2*i+2], 16).unwrap()).collect();
+            if let Some((f, _)) = Frame::decode_with(&bytes, false).unwrap() { z.on_frame(&f); }
+            if !z.world.chars.is_empty() { break; }
+        }
+        let who = *z.world.chars.keys().next().unwrap();
+        let c = z.world.chars.get_mut(&who).unwrap();
+        c.special = Special::Once(1034);
+        c.clip_ms = 100.0;
+        z.world.swing_keys.insert(who, canim::list::ATTACK);
+        z.world.play_swing(who, Some(1034), canim::list::ATTACK);
+        assert_eq!(z.world.chars[&who].clip_ms, 100.0, "same active list must not restart");
+        z.world.play_swing(who, Some(1034), canim::list::FLING_SHOT);
+        assert_eq!(z.world.swing_keys[&who], canim::list::FLING_SHOT);
+        assert!(z.world.pending_clips.iter().any(|p| p.2 == 1034 && p.3 == who), "distinct key is not dropped while busy");
+        z.world.play_swing(who, None, canim::list::ATTACK);
+        assert_eq!(z.world.chars[&who].special, Special::Attack, "fallback uses the preloaded record attack");
+        assert!(z.world.pending_clips.iter().all(|p| p.3 != who), "fallback replaces pending special clips");
+        z.world.chars.get_mut(&who).unwrap().clip_ms = 100.0;
+        z.world.play_swing(who, None, canim::list::ATTACK);
+        assert_eq!(z.world.chars[&who].clip_ms, 100.0, "same fallback list must not restart");
     }
 }
 
@@ -2504,10 +2674,19 @@ mod variant_tests {
         assert!(matches!(z.world.chars[&leet].special, Special::Die(503)));
         let mut host = Host::headless();
         let (eye, fwd) = (crate::play::zone::scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            z.world.update(0.0, eye, fwd, &mut host);
+            host.actors.clear();
+            let c = &z.world.chars[&leet];
+            if matches!(z.world.models.get(&c.key), Some(Model::Ready { .. })) { break; }
+            assert!(std::time::Instant::now() < deadline, "death model did not become ready");
+            std::thread::yield_now();
+        }
+        // Advance the same thirty simulated seconds only after the async model is available.
         for _ in 0..600 {
             z.world.update(0.05, eye, fwd, &mut host);
             host.actors.clear();
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let c = &z.world.chars[&leet];
         let Some(Model::Ready { built, .. }) = z.world.models.get(&c.key) else { panic!("model not ready") };
@@ -2562,9 +2741,22 @@ mod variant_tests {
         let player = *players.first()?;
         let mut host = Host::headless();
         let (eye, fwd) = (scene_pos(z.own()?.pos), [0.0, 0.0, -1.0]);
-        for _ in 0..400 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
             z.world.update(0.05, eye, fwd, &mut host);
             host.actors.clear();
+            let pending: Vec<_> = [player, leet].into_iter().filter_map(|id| {
+                let c = &z.world.chars[&id];
+                match z.world.models.get(&c.key) {
+                    Some(Model::Ready { .. }) => None,
+                    Some(Model::Loading) => Some((id, c.name.as_str(), c.key, "loading")),
+                    Some(Model::Failed) => Some((id, c.name.as_str(), c.key, "failed")),
+                    None => Some((id, c.name.as_str(), c.key, "not queued")),
+                }
+            }).collect();
+            if pending.is_empty() { break; }
+            assert!(!pending.iter().any(|p| p.3 == "failed"), "fight fixture target model failed: {pending:?}");
+            assert!(std::time::Instant::now() < deadline, "fight fixture target models not ready after 30s: {pending:?}");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         Some((z, player, leet))
@@ -2718,14 +2910,14 @@ mod variant_tests {
         assert_eq!(rate, 0.5);
         let mut host = Host::headless();
         let (eye, fwd) = (scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
-        let mut played = false;
-        for _ in 0..60 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
             z.world.update(0.05, eye, fwd, &mut host);
             host.actors.clear();
-            played |= matches!(z.world.chars[&leet].special, Special::Once(k) if k == u32::from(anim));
+            if matches!(z.world.chars[&leet].special, Special::Once(k) if k == u32::from(anim)) { break; }
+            assert!(std::time::Instant::now() < deadline, "imp clip {anim:#x} did not start; pending replay {:?}", z.world.replay);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(played, "imp clip {anim:#x} resolved through the creature's record");
         assert_eq!(z.world.react_to_hit(leet, 4).1, 1.0);
     }
 }

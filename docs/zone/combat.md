@@ -40,6 +40,8 @@ The district layer is selected at the next district evaluation (≤1 s; SandyInt
 Verified `cargo test --release -p aomac kill_and_stop_fight_restore_district_music_from_live_stats` (pass, clean and integrated snapshots) and `cargo test --release -p ao-audio combat::tests` (11 pass).
 Live muted `AOMAC_AUDIO_LOG=1 AOMAC_COMBAT_LOG=1`, Aomacrceg in ICC beach: `goto=hunt,Q=0.1,wait=45,fight,audio,wait=25,audio` killed Beach Leet 1031952, relayed own `FightStopped` and target `Died`, and printed `attacking=false`. After the kill the active samples were `MN08.wav` then `MN05.wav`, both shipped under `sound/music/env/mountain/night/`, rather than a battle layer.
 
+Real-window audio diagnostics use `AOMAC_AUDIO_MUTE=1 AOMAC_AUDIO_LOG=1`: the normal `aomac play` mixer remains active while its output gain is zero. Without `AOMAC_AUDIO_MUTE`, normal play remains audible. `Audio::update` logs combat-state and requested-layer transitions, with the actual current sample separately, so a requested district layer is not mistaken for an audible battle-track exit.
+
 
 ## Controls (CharPrefs.xml `KeyBindings`, provider = `provider_hash(name)`)
 

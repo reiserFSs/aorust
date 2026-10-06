@@ -84,6 +84,7 @@ pub(super) struct Player {
     swing_delay: Option<i32>,
     /// `transient` is a weapon swing (its notes start the attack sounds, `combat::notes`).
     swinging: bool,
+    swing_key: Option<u16>,
     /// Playback rate factor of the hit reaction in `transient`.
     clip_scale: Option<f32>,
     /// The pose the movement role showed last frame (`None` before the first update).
@@ -158,6 +159,7 @@ impl Player {
                 transient: None,
                 swing_delay: None,
                 swinging: false,
+                swing_key: None,
                 clip_scale: None,
                 pose: None,
                 fighting: false,
@@ -200,6 +202,14 @@ impl Player {
         self.fade = fade;
     }
 
+    pub fn effect_anchor(&self, id: i32) -> Option<[[f32; 4]; 4]> {
+        self.avatar.effect_anchor(id)
+    }
+
+    pub fn weapon_effect_anchor(&self, place: u8) -> Option<[[f32; 4]; 4]> {
+        self.avatar.weapon_effect_anchor(place)
+    }
+
     pub fn serial(&self) -> u32 {
         self.serial
     }
@@ -214,6 +224,7 @@ impl Player {
         self.transient = Some((role, hold));
         self.swing_delay = None;
         self.swinging = false;
+        self.swing_key = None;
         self.clip_scale = None;
     }
 
@@ -231,6 +242,16 @@ impl Player {
         self.play(role, false);
         self.swing_delay = item_delay;
         self.swinging = true;
+    }
+
+    /// Retail suppresses a list key already playing, not a different key resolving to the same clip.
+    pub fn swing_list(&mut self, role: Role, item_delay: Option<i32>, key: u16) {
+        if self.transient.is_some() && !self.avatar.finished() && self.swing_key == Some(key) {
+            return;
+        }
+        self.swing(role, item_delay);
+        self.swing_key = Some(key);
+        self.avatar.restart_clip();
     }
 
     /// The notes the own swing clip reached since the last call (`combat::notes` ids).

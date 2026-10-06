@@ -536,7 +536,7 @@ pub fn special_swing(stat: i32) -> Option<SpecialSwing> {
         167 => s(list::FULL_AUTO, Some("Full Auto!\n"), None, false),
         142 => s(list::BRAWL, Some("Brawl!\n"), Some(sound::BRAWL), true),
         144 => s(list::DIMACH, Some("Dimach!\n"), Some(sound::DIMACH), true),
-        489 => s(list::BACKSTAB, Some("Backstab!\n"), None, true),
+        489 => s(list::BACKSTAB, Some("Backstab!\n"), None, false),
         121 => s(list::BOW_SPECIAL, None, None, true),
         _ => None,
     }
@@ -712,6 +712,10 @@ mod tests {
         assert_eq!(anim_name(UNARMED_RSWING).map(|a| a.0), Some("unarmed-rswing"));
         assert_eq!(special_swing(148).unwrap().list, 0x16);
         assert_eq!(special_swing(144).unwrap().sound, Some(sound::DIMACH));
+        assert!(!special_swing(489).unwrap().own_item, "1003c594 Backstab uses the wielded weapon");
+        assert!(special_swing(121).unwrap().own_item);
+        assert_eq!(weapon_list(0, false, false, list::BURST), [0x3f6]);
+        assert_eq!(weapon_list(0, false, false, list::FLING_SHOT), [0x3f5]);
         assert!(special_swing(1).is_none());
         assert_eq!(weapon_list(0, false, false, list::FULL_AUTO), [0x3f7]);
     }

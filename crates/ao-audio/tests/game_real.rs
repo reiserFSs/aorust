@@ -186,35 +186,17 @@ fn weather_slot_prefs_and_keepalive() {
     assert_eq!(levels[79], 0, "gone after the keep-alive expired");
 }
 
-/// Live day -> night at 566 (`desert\Day` -> `desert\Night`): the authored data has no Day -> Night transition, so the
-/// request waits (SIM `FUN_10008d2e`, force 0); the Day track's pause clock (94 bpm, 188 beats = 120 s) runs from the
-/// start of Day and is not restarted by the request, so the music falls silent at ~120 s, and a request that arrives in
-/// that silence starts the requested layer's entry sample at once (`SignalEvent` -> `Play(NULL, true)`).
+/// Sandy defaults to forced transitions even when the graph has no Day -> Night edge.
 #[test]
-fn day_to_night_follows_the_authored_pause_clock() {
+fn day_to_night_uses_default_forced_transition() {
     let Some(dir) = client() else { return };
     let a = Audio::offline(&dir, 44100);
     assert!(a.set_music_layer(Some("desert\\Day")));
-    let mut buf = vec![0f32; 4410 * 2];
-    let mut silent_at = None;
-    for i in 0..1500 {
-        let t = i as f32 * 0.1;
-        if i == 300 {
-            assert!(a.set_music_layer(Some("desert\\Night"))); // 30 s into Day
-        }
-        a.update(0.1, [0.0; 3], 3240.0);
-        a.render(&mut buf);
-        match a.now_playing() {
-            Some(n) if silent_at.is_none() => assert!(n.to_ascii_lowercase().starts_with("dday"), "{t}: {n}"),
-            None if silent_at.is_none() && t > 5.0 => silent_at = Some(t),
-            _ => {}
-        }
-    }
-    let s = silent_at.expect("Day span ends");
-    assert!((118.0..130.0).contains(&s), "silence ~120 s after Day started (not 120 s after the request): {s}");
-    assert!(a.now_playing().is_none(), "still silent at 150 s");
-    assert!(a.set_music_layer(Some("desert\\Day")));
-    assert!(a.now_playing().unwrap().to_ascii_lowercase().starts_with("dday"));
+    let first = a.now_playing().unwrap();
+    assert!(a.set_music_layer(Some("desert\\Night")));
+    assert_eq!(a.now_playing().as_deref(), Some(first.as_str()), "request does not hard-cut");
+    run(&a, 90.0, [0.0; 3], 3240.0);
+    assert!(a.now_playing().is_some_and(|n| n.to_ascii_lowercase().starts_with("dn")), "night entry reached without an authored edge");
 }
 
 /// All 16 combat table layers exist in the real `anarchy.sws`, and the state overrides / restores the district layer.

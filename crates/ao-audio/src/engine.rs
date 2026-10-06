@@ -264,7 +264,14 @@ impl Audio {
     /// Per frame: `cam` = camera = listener position (scene space), `day_time` = the viewer clock (0..6480 s).
     pub fn update(&self, dt: f32, cam: [f32; 3], day_time: f32) {
         if let Some(rt) = self.rt().as_mut() {
+            static LOG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("AOMAC_AUDIO_LOG").is_some());
+            let log = *LOG;
+            let before = (rt.combat.state(), rt.music.layer());
             rt.update(&self.sh, dt, cam, day_time);
+            let after = (rt.combat.state(), rt.music.layer());
+            if log && before != after {
+                eprintln!("audio combat={} layer={:?} sample={:?}", after.0, after.1.map(|l| &rt.music.project().layers[l].name), rt.music.now_playing);
+            }
         }
     }
 

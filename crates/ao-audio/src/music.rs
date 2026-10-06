@@ -37,6 +37,8 @@ struct Playing {
 
 enum State {
     Idle,
+    /// SIM state 6: an exhausted sample waits for a changed layer request (Sandy deduplicates `PlayMusic`).
+    Exhausted,
     Playing(Playing),
     /// Closing sample of a pause transition (`ptrans`) fading the layer out; silence follows.
     Ending { voice: u64, left: f32, pause: f32 },
@@ -51,6 +53,8 @@ pub struct MusicPlayer {
     /// `Total_Music` (master x music volume x mutes).
     pub volume: f32,
     layer: Option<usize>,
+    /// Sandy ctor sets force mode 1 (authored sample fades), not mode 0.
+    force: bool,
     state: State,
     /// Seconds played in the current pause track node, and the node index.
     played: f32,
@@ -71,7 +75,7 @@ pub struct MusicPlayer {
 impl MusicPlayer {
     pub(crate) fn new(sh: Arc<Shared>, proj: Arc<Project>, seed: u64) -> Self {
         let dir = sh.root.join("music/env");
-        MusicPlayer { sh, proj, dir, volume: 1.0, layer: None, state: State::Idle, played: 0.0, node: 0, pause_layer: None, resume: None, streams: Vec::new(), weights: HashMap::new(), rng: Rng(seed | 1), now_playing: None }
+        MusicPlayer { sh, proj, dir, volume: 1.0, layer: None, state: State::Idle, force: true, played: 0.0, node: 0, pause_layer: None, resume: None, streams: Vec::new(), weights: HashMap::new(), rng: Rng(seed | 1), now_playing: None }
     }
 
     pub fn layer(&self) -> Option<usize> {
@@ -82,11 +86,11 @@ impl MusicPlayer {
         &self.proj
     }
 
-    /// `SandyInterface_t::PlayMusic` -> `SIMPlayer::SignalEvent(layer, force = 0, 2000)` (SIM @0x1000a599): the request is
-    /// only stored. The playing layer keeps going until its current sample has an authored transition into the new
-    /// layer ahead of the playhead (the transition's own `fot`/`ftime` cross-fade is used; `force` is 0 outside the
-    /// debug toggle, so the 2000 ms synthetic cross-fade of forced transitions never applies); the transition is
-    /// re-evaluated once now (`SignalEvent` state 2 -> 1) and again whenever a new sample starts, never per frame. A silent
+    /// `SandyInterface_t::PlayMusic` -> `SIMPlayer::SignalEvent(layer, force = 1, 2000)` (SIM @0x1000a599).
+    /// Authored transitions into the requested layer win; otherwise the default force mode creates a transition
+    /// at the current sample's end minus the target's authored `totoffms`, using that overlap as the fade duration.
+    /// The 2000 ms / 75%-length bound decides whether enough time remains to force; it does not replace mode-1 fades.
+    /// Selection runs once at the request and whenever a sample starts, never per frame. A silent
     /// player (idle, pause track silence, closing sample) starts the new layer's entry sample immediately, and so does
     /// a previously stopped player (`PlayMusic`: `Play(NULL, true)` after the signal, which `Stop(true)`s every stream).
     /// `None` (`Stop(false, true)`) lets the current sample play to its end without a fade. The pause clock is *not*
@@ -166,6 +170,10 @@ impl MusicPlayer {
             self.reset_clock(self.proj.samples[s].layer);
         }
         self.now_playing = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        static LOG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("AOMAC_AUDIO_LOG").is_some());
+        if *LOG {
+            eprintln!("audio playing layer={:?} sample={:?}", self.proj.layers[self.proj.samples[s].layer].name, self.now_playing);
+        }
         let next = self.pick_next(s, 0.0);
         self.state = State::Playing(Playing { sample: s, voice, t: 0.0, next });
         true
@@ -186,11 +194,11 @@ impl MusicPlayer {
     }
 
     /// `FUN_10008d2e` + `FUN_10008c7e`: candidates are the transitions of `s` that start ahead of the playhead `t`
-    /// (`fot - 10 ms > pos`) and whose sample exists. With a pending request for another layer the earliest
+    /// (`fot - 10 ms > pos`). With a pending request for another layer the earliest
     /// transitions into it win; otherwise the ones that stay in the sample's own layer.
     fn pick_next(&mut self, s: usize, t: f32) -> Option<Transition> {
         let own = self.proj.samples[s].layer;
-        let ahead: Vec<Transition> = self.proj.samples[s].trans.iter().filter(|x| x.fot_ms as f32 / 1000.0 - 0.01 > t && self.sample_path(x.to).is_some()).cloned().collect();
+        let ahead: Vec<Transition> = self.proj.samples[s].trans.iter().filter(|x| x.fot_ms as f32 / 1000.0 - 0.01 > t).cloned().collect();
         let proj = &self.proj;
         let into = |l: usize| ahead.iter().filter(|x| proj.samples[x.to].layer == l).cloned().collect::<Vec<_>>();
         let mut cands = match self.layer {
@@ -201,6 +209,26 @@ impl MusicPlayer {
             }
             _ => Vec::new(),
         };
+        if cands.is_empty() && self.force {
+            if let Some(target) = self.layer.filter(|&l| l != own) {
+                let all = &self.proj.layers[target].samples;
+                let entries: Vec<_> = all.iter().copied().filter(|&i| self.proj.samples[i].entry).collect();
+                // `GetEntrySample(target, false)` does not fall back to unflagged samples.
+                if entries.is_empty() {
+                    return None;
+                }
+                {
+                    let to = entries[self.rng.next() as usize % entries.len()];
+                    let end = self.proj.samples[s].end_ms;
+                    let target_sample = &self.proj.samples[to];
+                    let bound = |n: u32| (n - (n >> 2)).saturating_sub(10);
+                    let limit = 2000.min(bound(end)).min(bound(target_sample.end_ms));
+                    if t * 1000.0 < end.saturating_sub(limit).saturating_sub(10) as f32 {
+                        return Some(Transition { to, pri: 0, fot_ms: end.saturating_sub(target_sample.overlap_ms), fit_ms: 0, ftime_ms: target_sample.overlap_ms });
+                    }
+                }
+            }
+        }
         if cands.is_empty() {
             cands = into(own);
         }
@@ -256,6 +284,7 @@ impl MusicPlayer {
         match std::mem::replace(&mut self.state, State::Idle) {
             // nothing started yet (a missing file at signal time): retry (`FUN_1000a552`)
             State::Idle => self.start_entry(layer, 0.0, true),
+            State::Exhausted => self.state = State::Exhausted,
             State::Paused { left } if left - dt <= 0.0 => {
                 // `Play(saved, false)`: the pending transition's target, else the requested layer's entry; the clock keeps running
                 let fade = self.node_fade_in();
@@ -280,9 +309,12 @@ impl MusicPlayer {
         let end = sample.end_ms as f32 / 1000.0;
         let Some((pause_secs, fade)) = self.pause_due() else {
             let Some(next) = p.next.clone() else {
-                // no successor: the sample plays out, then the layer restarts from an entry sample
-                if p.t <= end + 0.5 {
+                // `FUN_10009acd` state 5 -> `FUN_10009529` state 6: no automatic entry restart.
+                if p.t < end {
                     self.state = State::Playing(p);
+                } else {
+                    self.now_playing = None;
+                    self.state = State::Exhausted;
                 }
                 return;
             };
@@ -384,7 +416,7 @@ mod tests {
     }
 
     fn sample(layer: usize, name: &str, entry: bool, trans: Vec<Transition>) -> Sample {
-        Sample { layer, name: name.into(), end_ms: 4000, entry, vol: 1.0, trans, ptrans: Vec::new() }
+        Sample { layer, name: name.into(), end_ms: 4000, overlap_ms: 1000, entry, vol: 1.0, trans, ptrans: Vec::new() }
     }
 
     /// Layers `A` (a1, a2; pause track: 30 s of music, 30 s of silence) and `B` (b1). No authored transition A -> B.
@@ -419,7 +451,9 @@ mod tests {
             pauses: vec![PauseTrack { bpm: 60.0, loopto: 0, nodes: vec![PauseNode { play_beats: 30, pause_beats: 30, ptype: 1, fade_in_ms: 0, fade_out_ms: 1000 }] }],
         };
         let sh = Shared::new(root, 44100);
-        (MusicPlayer::new(sh.clone(), Arc::new(proj), 7), sh)
+        let mut mp = MusicPlayer::new(sh.clone(), Arc::new(proj), 7);
+        mp.force = false; // explicitly exercise retail mode 0, not Sandy's default mode 1
+        (mp, sh)
     }
 
     /// `secs` of 10 ms ticks, draining the mixer like the audio callback does.
@@ -490,5 +524,76 @@ mod tests {
         assert!(sh.mixer().is_playing(p.voice), "old stream not faded out");
         drop(hold);
         let _ = std::fs::remove_dir_all(&sh.root);
+    }
+
+    /// Real victory stingers have no successor: state 6 waits for a changed Sandy request.
+    #[test]
+    fn real_victory_sample_exhausts_without_restarting_requested_district() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let root = PathBuf::from(home).join("Games/ProjectRubiKa/client/cd_image/sound");
+        let Ok(bytes) = std::fs::read(root.join("music/env/anarchy.sws")) else { return };
+        let proj = Arc::new(Project::parse(&bytes).unwrap());
+        let victory = proj.find_layer("battle\\NeutralVictory").unwrap();
+        let district = proj.find_layer("desert\\Day").unwrap();
+        let s = proj.layers[victory].samples.iter().copied().find(|&s| proj.samples[s].name.eq_ignore_ascii_case("NeutralVictory02")).unwrap();
+        assert!(proj.samples[s].trans.is_empty(), "retail stinger has no exits");
+        let sh = Shared::new(root, 44100);
+        let mut mp = MusicPlayer::new(sh.clone(), proj, 7);
+        mp.force = false;
+        mp.layer = Some(victory);
+        assert!(mp.start(s, 0.0, true));
+        mp.signal(Some(district));
+        assert_eq!(mp.layer(), Some(district));
+        assert!(mp.now_playing.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("NeutralVictory02.wav")));
+        let end = mp.proj.samples[s].end_ms as f32 / 1000.0;
+        run(&mut mp, &sh, end + 1.0);
+        assert!(matches!(mp.state, State::Exhausted));
+        assert!(mp.now_playing.is_none());
+        mp.signal(Some(district));
+        run(&mut mp, &sh, 2.0);
+        assert!(mp.now_playing.is_none(), "unchanged Sandy request cannot restart state 6");
+        mp.signal(Some(victory));
+        assert!(mp.now_playing.is_some(), "a changed request starts the entry sample");
+    }
+
+    #[test]
+    fn transition_selection_does_not_filter_missing_files() {
+        let (mut mp, sh) = player("missing");
+        Arc::get_mut(&mut mp.proj).unwrap().samples[0].trans = vec![tr(1)];
+        std::fs::remove_file(sh.root.join("music/env/A/a2.wav")).unwrap();
+        mp.layer = Some(0);
+        assert_eq!(mp.pick_next(0, 0.0).unwrap().to, 1);
+        let _ = std::fs::remove_dir_all(&sh.root);
+    }
+
+    #[test]
+    fn real_battle_returns_to_requested_district_with_default_force() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let root = PathBuf::from(home).join("Games/ProjectRubiKa/client/cd_image/sound");
+        let Ok(bytes) = std::fs::read(root.join("music/env/anarchy.sws")) else { return };
+        let proj = Arc::new(Project::parse(&bytes).unwrap());
+        let battle = proj.find_layer("battle\\Neutral").unwrap();
+        let district = proj.find_layer("desert\\Day").unwrap();
+        let s = proj.layers[battle].samples[0];
+        assert!(proj.samples[s].trans.iter().all(|t| proj.samples[t.to].layer != district));
+        let sh = Shared::new(root, 44100);
+        let mut mp = MusicPlayer::new(sh.clone(), proj, 7);
+        assert!(mp.force, "Sandy default is mode 1");
+        mp.layer = Some(battle);
+        assert!(mp.start(s, 0.0, true));
+        let old = mp.now_playing.clone();
+        mp.signal(Some(district));
+        assert_eq!(mp.layer(), Some(district));
+        assert_eq!(mp.now_playing, old, "requested and playing layers are initially different");
+        let State::Playing(p) = &mp.state else { panic!("playing battle") };
+        let next = p.next.as_ref().unwrap();
+        assert_eq!(mp.proj.samples[next.to].layer, district);
+        assert_eq!(next.ftime_ms, mp.proj.samples[next.to].overlap_ms);
+        assert_eq!(next.fot_ms + next.ftime_ms, mp.proj.samples[s].end_ms);
+        let until = next.fot_ms as f32 / 1000.0 + 0.2;
+        run(&mut mp, &sh, until);
+        let State::Playing(p) = &mp.state else { panic!("playing district") };
+        assert_eq!(mp.proj.samples[p.sample].layer, district);
+        assert!(mp.now_playing.as_deref().is_some_and(|n| n.to_ascii_lowercase().starts_with("dday")));
     }
 }

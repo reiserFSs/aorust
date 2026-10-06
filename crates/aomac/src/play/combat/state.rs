@@ -114,8 +114,8 @@ pub enum CombatEvent {
     Hit { attacker: i32, victim: i32, damage: i32, slot: i32, flags: i32 },
     /// An attack missed (`FUN_1006ae50`).
     Miss { attacker: i32, target: i32, slot: i32 },
-    /// `CharSecSpecAttack`: `who` performs special attack `special` on `target`.
-    SpecialAttack { who: i32, target: Identity, special: i32 },
+    /// `SpecialAttackInfo`: the queued special now performs its swing on `target`.
+    SpecialAttack { who: i32, target: Identity, special: i32, slot: i32, damage: i32 },
     /// A floating number above `dynel` (HUD space for the client char, world space otherwise).
     Floating { dynel: i32, amount: i32, category: u32, number: FloatingNumber },
     /// A chat/combat-log line.
@@ -298,18 +298,17 @@ impl Combat {
                 }
             }
             N3::Misc(Misc::SpecialAttackInfo(a)) if h.kind == CHAR_KIND && self.chars.contains_key(&h.instance) => {
-                self.special_hit(h.instance, a.damage, a.target, a.special, a.unk_30, &mut ev);
+                self.special_hit(h.instance, &a, &mut ev);
             }
             N3::Misc(Misc::MissedAttackInfo(a)) if h.kind == CHAR_KIND && self.chars.contains_key(&h.instance) => {
                 self.miss(a.slot, a.source, a.target, a.stat, &mut ev);
             }
             N3::Misc(Misc::CharSecSpecAttack(a)) if h.kind == CHAR_KIND => {
                 if let Some(c) = self.chars.get_mut(&h.instance) {
-                    // FUN_10068790: queue the special unless it is already queued (`FUN_10063be4`)
-                    if !c.fight.pending_specials.contains(&a.special) {
+                    // FUN_10068790: only an empty deque accepts a special; otherwise retail activates its GUI action.
+                    if c.fight.pending_specials.is_empty() {
                         c.fight.pending_specials.push(a.special);
                     }
-                    ev.push(CombatEvent::SpecialAttack { who: h.instance, target: a.target, special: a.special });
                 }
             }
             N3::Misc(Misc::ToClientQuit) if h.kind == CHAR_KIND => {
@@ -371,6 +370,7 @@ impl Combat {
     /// `FUN_10068b7f(1, 0)` stop fight.
     pub fn stop_fight(&mut self, att: i32, ev: &mut Vec<CombatEvent>) {
         let Some(c) = self.chars.get_mut(&att) else { return };
+        c.fight.pending_specials.clear(); // FUN_1005548b at 10068c93.
         if att == self.own {
             ev.push(CombatEvent::GuiFight { started: false, target: None });
             ev.push(CombatEvent::CombatMusic(false));
@@ -509,8 +509,15 @@ impl Combat {
     }
 
     /// `SpecialAttackInfoIIR_t`: `FUN_1006a9c5`.
-    pub fn special_hit(&mut self, att: i32, damage: i32, target: Identity, special: i32, death_cause: i32, ev: &mut Vec<CombatEvent>) {
+    pub fn special_hit(&mut self, att: i32, a: &n3::misc::SpecialAttackInfo, ev: &mut Vec<CombatEvent>) {
+        let (slot, damage, target, special, death_cause) = (a.slot, a.damage, a.target, a.special, a.unk_30);
         let Some(t) = self.known(target) else { return };
+        // FUN_1006a9c5 starts the swing before feedback; FUN_1006855a reads the deque's front, not the result's stat.
+        if let Some(queued) = self.chars.get(&att).and_then(|c| c.fight.pending_specials.first()).copied() {
+            ev.push(CombatEvent::SpecialAttack { who: att, target, special: queued, slot, damage });
+        } else {
+            ev.push(CombatEvent::SpecialAttack { who: att, target, special: 0, slot, damage });
+        }
         let name = self.texts.stat_name(special as u32).unwrap_or_default();
         let ty = if att == self.own {
             log::ty::SPECIAL_YOU_HIT
@@ -527,6 +534,10 @@ impl Combat {
         self.set_health(t, h - damage, ev);
         if death_cause != 0 {
             self.die(t, death_cause, ev);
+        }
+        // FUN_1005548b at 1006abed clears the entire deque after applying the result.
+        if let Some(c) = self.chars.get_mut(&att) {
+            c.fight.pending_specials.clear();
         }
     }
 
@@ -757,9 +768,20 @@ mod tests {
         c.miss(0, ch(1), ch(2), 142, &mut ev);
         assert!(matches!(&ev[0], CombatEvent::Log(l) if l.text == "You try to attack Junkbot with Brawl, but you miss!"));
         ev.clear();
-        c.special_hit(1, 20, ch(2), 142, 0, &mut ev);
-        assert!(matches!(&ev[0], CombatEvent::Log(l) if l.text == "You hit Junkbot for 20 points of Brawling damage."));
+        c.special_hit(1, &SpecialAttackInfo { slot: 0, damage: 20, target: ch(2), special: 142, value_28: -1, unk_30: 0 }, &mut ev);
+        assert!(ev.iter().any(|e| matches!(e, CombatEvent::Log(l) if l.text == "You hit Junkbot for 20 points of Brawling damage.")));
         assert_eq!(c.char(2).map(|c| (c.health(), c.max_health())), Some((30, 50)));
+        assert_eq!(ev[0], CombatEvent::SpecialAttack { who: 1, target: ch(2), special: 0, slot: 0, damage: 20 });
+    }
+
+    #[test]
+    fn special_result_uses_queue_front_then_clears_the_deque() {
+        let mut c = setup();
+        c.chars.get_mut(&1).unwrap().fight.pending_specials = vec![142, 144];
+        let mut ev = Vec::new();
+        c.special_hit(1, &SpecialAttackInfo { slot: 6, damage: 1, target: ch(2), special: 144, value_28: -1, unk_30: 0 }, &mut ev);
+        assert_eq!(ev[0], CombatEvent::SpecialAttack { who: 1, target: ch(2), special: 142, slot: 6, damage: 1 });
+        assert!(c.fight(1).unwrap().pending_specials.is_empty());
     }
 
     #[test]
@@ -817,6 +839,33 @@ mod tests {
     fn replay(texts: Box<dyn Texts>) -> Vec<CombatEvent> {
         let mut c = Combat::new(texts);
         frames().iter().flat_map(|f| c.on_frame(f, OWN)).collect()
+    }
+
+    #[test]
+    fn captured_specials_queue_until_the_result_for_own_and_observer() {
+        for own in [OWN, 33402] {
+            let mut c = Combat::new(Box::new(Fixed::new()));
+            let mut results = 0;
+            for f in frames() {
+                let Ok(m) = n3::decode(&f) else { continue };
+                let who = m.header.target.instance;
+                let queued = matches!(&m.body, N3::Misc(Misc::CharSecSpecAttack(_)));
+                let result = match &m.body {
+                    N3::Misc(Misc::SpecialAttackInfo(a)) => Some(a.special),
+                    _ => None,
+                };
+                let ev = c.on_frame(&f, own);
+                if queued {
+                    assert!(!ev.iter().any(|e| matches!(e, CombatEvent::SpecialAttack { .. })));
+                }
+                if let Some(special) = result {
+                    assert!(ev.iter().any(|e| matches!(e, CombatEvent::SpecialAttack { who: w, special: s, .. } if *w == who && *s == special)));
+                    assert!(!c.fight(who).unwrap().pending_specials.contains(&special));
+                    results += 1;
+                }
+            }
+            assert_eq!(results, 3);
+        }
     }
 
     fn real_texts() -> Option<ao_formats::screens::TextDb> {

@@ -62,15 +62,16 @@ Every `Hit` / `Miss` / `SpecialAttack` event of any character (a miss runs `FUN_
    `AnimSet` 0x161 and `ItemDelay` 0x126 from the item template under the message stats) -> `weapon_list(AnimSet, left, crawl = false, key)`
    (`key` = `0xb`, or the special's list key, else `0xb` when the weapon has no such key) -> random value (the CRT-rand stream of `Dynels`)
    -> AbstractAnimID -> the own avatar plays `Role::Clip(anim_name(id))` (`Player::swing`, rate x `swing_speed_scale(first event time, ItemDelay)`,
-   `Avatar::set_swing_delay`), every other character `Dynels::play_once(id, anim)` (NPC record table or the set's file name through
+   `Avatar::set_swing_delay`), every other character `Dynels::play_swing(id,anim,key)` (NPC record table or the set's file name through
    `resolve_clip`, same speed scale in `Dynels::update`). [DATA] all weapon attack ids exist as clips for male / female / athrox (test `fight_clips_exist_in_the_data`).
-2. **No weapon list** (nothing wielded, `AnimSet` 4/5/other, or a special whose list lives on its own item: Brawl, Dimach, Backstab, bow special): creatures
-   play key `0x40a` = `UNARMED_RSWING` (1034) of their NPC record (`Dynels::attack`; the earlier code used 1033 = `unarmed-kick`/`0x409`, which is the
-   *spray* clip of creature records, npc.md section 3), the own player plays `unarmed-rswing`. **[UNRESOLVED]** the original's bare-hand / martial-arts list lives in the
-   special's / template item record (`+0xe4`, `UnarmedTemplateInstance`), whose layout is not decoded; `unarmed-rswing` is the creature path of the same function, not a verified
-   player choice. The crawl lists (`crawl = true`) are not used: stat 0x1ae is not tracked per dynel.
+2. **Item lists**: Brawl, Dimach and bow special resolve the list on the special item's record (`FUN_100686d0(stat)+0xe4`).
+   Bare hands resolve the martial-arts item delivered under key 100. `dynel_visual::animation_map` decodes element `{0xe,0x13}` using the same validated multimap size words as the sound parser.
+   The martial-arts fixture (rdb 1000020:43712) asserts list `0xb = [1034,1035,1037,1033]`; Dimach 42033 has `0xb=[163]`, Brawl 70292 has `0xb=[1036]` (element offsets 203 and 184). Special keys missing on their own item fall back to its `0xb` (`FUN_1003c594`). Missing lists retain the creature-path `0x40a` fallback;
+   this missing-player-list fallback remains **[UNRESOLVED]**, not a fabricated special clip. The crawl lists (`crawl = true`) are not used: stat 0x1ae is not tracked per dynel.
 3. **Text above the character** for special attacks (`FUN_10011108(char, "Burst!\n", 0xd)`): `Module::on_frame` pushes a world-space `Number` (category 0xd = colour
    `0x00f000`, effect `0x2f5a` path, `combat-log.md` section 6) with the text without its trailing newline. The sound of Brawl / Dimach is in section 6.
+* `CharSecSpecAttack` queues only when empty; `SpecialAttackInfo` starts the front's swing before feedback and clears the deque afterward (`FUN_1006a9c5`, `FUN_1005548b`). Active list keys are suppressed (`FUN_1003bfd2`, its list node `+0xc` comparison), not clip names:
+  distinct special keys resolving to the same clip restart the own avatar clock/notes and replace a busy dynel swing. Social and reaction `play_once` calls retain their busy gate.
 * A 0/1/2 "height" variant (`param_3` of `FUN_1003c8b7`) is computed for `AnimSet == 0` weapons from the muzzle attractor
   (`AttractorMesh::GetName(0)`) vs the target's height and distance < 6 m (`_DAT_1015d0a0`; < 3 m `_DAT_1015d69c`); what it selects inside
   `FUN_1003c802` is **[UNRESOLVED]** (not modelled).
@@ -92,10 +93,9 @@ Built when a weapon is wielded: `(list key -> AbstractAnimID)` multimap, selecte
 
 [DATA] Weapons whose **record carries its own multimap** use key 0xb directly: 119 540 item records (rdb 1000020) were scanned for
 `{key 0xb, (n+1)*1009, values}`: martial-arts items list `{1034, 1035, 1037, 1033}` (unarmed-rswing / uppercut / lswing / kick; e.g. records
-43712, 43713), many single-entry `{1034}` / `{1033}` records (45605, 56180, 100237, 120637...). The item-record layout is **not decoded**.
-Unarmed fists: the char's `UnarmedTemplateInstance` (stat 418) is 0 for the own char in the capture, so which list a bare-handed
-player uses is **[UNRESOLVED]** (by the code: empty list -> id 0 -> the `wave` fallback above, which cannot be intended; the entry `+0x10` of
-the slot holds the `DummyWeapon_t` of the martial-arts item the `SpecialAttackWeaponIIR` list delivers under key 100 (docs/zone/combat-log.md §2.1.1; record 43712 etc.), not a client-made item; its animation multimap layout is still undecoded).
+43712, 43713), many single-entry `{1034}` / `{1033}` records (45605, 56180, 100237, 120637...). The item-record animation multimap is now decoded as `{0xe,0x13}`.
+Unarmed fists use the `DummyWeapon_t` martial-arts item delivered by `SpecialAttackWeaponIIR` under key 100 (docs/zone/combat-log.md §2.1.1), not a client-made item.
+The char's `UnarmedTemplateInstance` (stat 418) is 0 for the own char in the capture.
 
 ### 3.2 Special attacks (`special_swing`, `FUN_1003c594` [GC 0x1003c594])
 `FUN_1006855a` (queued special's skill stat) -> list key; the key is looked up on the weapon (`FUN_1004570c(key)`, else 0xb):
@@ -109,7 +109,7 @@ the slot holds the `DummyWeapon_t` of the martial-arts item the `SpecialAttackWe
 | 144 | Dimach | 0x24 | `Dimach!` | `SM_Sandy_Game_Dimach` (`+0x44`) |
 | 489 | Backstab | 0x89 | `Backstab!` | |
 | 121 | Bow special | 0x87 | | |
-(Brawl, Dimach, Backstab, Bow special look the key up on the special attack's own item `FUN_100686d0(stat)+0xe4`.)
+(Brawl, Dimach and Bow special look the key up on the special attack's own item `FUN_100686d0(stat)+0xe4`. A fresh decompile of `FUN_1003c594` corrects the earlier Backstab claim: its `0x89` branch does **not** set the own-item flag, so it uses the wielded weapon.)
 
 ## 4. Idle / fight stance, hit, miss
 * **AnimHolder stance entry points** (traced with Ghidra xrefs over Gamecode; `FUN_1003c930` / `FUN_1003c9b2` are only reachable through the vtable
@@ -288,10 +288,109 @@ The corpse holds the resulting death pose, rather than bind pose; corrected fiel
 * **Health boundary [CODE]**: computed combat health/death-cause (`FUN_1005ae91`) is not itself the `CharDie` flag transition.
   The renderer's death state responds to server action99 or explicit health-zero stat/full updates; no extra computed-hit-to-animation bridge is invented.
 
+### 7.1 Effect geometry anchors
+
+* Numeric dispatch is **Gamecode `FUN_10105917`**, not the similarly named DisplaySystem API.
+  Table `0x102c53a8` maps 1000–1018 to `Bip01 Pelvis_ac`, Spine, Spine1, Spine2, Spine3,
+  Neck, Head, L/R UpperArm, L/R Forearm, L/R Thigh, L/R Calf, L/R Foot, L/R Hand
+  (all names carry `_ac`). In particular 1000–1007 end at **L UpperArm**, not a generic torso.
+  Table `0x102c53f8` maps 2000/2001 to `Attractor02_righthand`/`Attractor03_lefthand`,
+  2002 to head, 2003 back, 2004 left shoulder, 2005 right shoulder; the remaining entries
+  are named special/attack/destruction/flare/smoke/sparks/flames/beam attractors.
+  Both valid numeric ranges explicitly retry authored `Attractor01_head` if the requested geometry
+  is absent. Unknown IDs return no anchor; no guessed position is introduced.
+* 3000 is **weapon-object muzzle world geometry**: `FUN_10105917` casts to WeaponItem and
+  calls `FUN_1009bded`. That follows the parent character, selects hand place 1 (slot 6)
+  or 2 (slot 8), finds the stat-209 WeaponMesh child, and asks `VisualMesh_t::GetAttrMatrix(0)`.
+  3001 is the equivalent attractor of a plain static visual mesh. `FUN_1010603b` treats
+  these two results as already world-space; other anchors compose with the actor world frame.
+* DisplaySystem `VisualMesh_t::GetAttrMatrix` **0x1006c475** searches graph connectors in the
+  exact table order at `0x100af3a4`: `Attractor01_weaponfire`, `Attractor01`, `Attractor02`,
+  `Attractor01_weaponfire01` through `06`, then null. CAT's named lookup
+  `GetAttractorMatrix` **0x10072b4e** delegates to `RCATMesh_t::GetAttractor`.
+  The static archive connector's `originator` references its frame; every ancestor's
+  `anim_matrix * local` must be composed, not just its local translation.
+* Actual rdb **1010001/15839** rifle and **262556** guard rifle contain
+  `Attractor01_weaponfire`; **7796** shotgun contains `Attractor01_weaponfire01`.
+  Read-only archive inspection gives composed AO muzzle translations respectively
+  `(0.002563557, 0.02921438, 0.8932234)`, `(0.08988604, 0.13462976, 1.0123588)`,
+  `(0.0001522300, 0.05340150, 0.2358599)`.
+* `ActorRig::effect_anchor` returns column-major **model scene-space** matrices;
+  Avatar/Player passthroughs compose heading/position/body scale to **world scene-space**.
+  `weapon_effect_anchor(place)` explicitly composes the cached graph connector through the
+  currently animated hand attachment, then mirrors Z exactly like rendered mount parts.
+  Rig/Avatar/Player `effect_anchor(3000)` is the right-hand convenience; consumers resolving
+  a weapon identity must use the explicit place method for its actual slot.
+  Missing weapon connectors return `None`, not a sound-camera position or arbitrary offset.
+  The existing static-mesh caller owns 3001; a CAT actor does not invent one.
+* Regression `real_rifle_effect_anchor_uses_authored_muzzle_and_animated_hand` checks both actual
+  rifle records, numeric bone/hand anchors and animated mount composition including the terminal clip
+  time. Added, **not executed** in this assignment; Main owns build/test/live verification.
+
+### 7.2 Authored weapon visuals
+
+* `FUN_1009ad7d` consumes three four-tuple tables, **not stat 413/414 as direct
+  script IDs**. Event-10 item `WeaponEffect` spells `0xcf49`, `0xcf53`, `0xcf54`
+  supply `(attractor=stat86, effect=87, note=73, color=89)` via `FUN_100a761f`,
+  `100a7803`, `100a7863` and `1009ad2c`. Repeated notes replace their tuple.
+  Stat 413 is the weapon category (`1009dd32`, including grenade 9); stat 414
+  defaults to 49999 (`10085bf8`/`1009b913`). It is not substituted for those tables.
+* The groups are muzzle, tracer and **successful-hit impact**, not critical-only:
+  `1009b4ac` calls `1009ad7d(..., 1 < hit_kind)`. Empty impact tables use 62002;
+  legacy tuple effect 2710 is likewise mapped to 62002. Misses still render firing
+  and tracers. Muzzle's note-zero default means attack 0xb; the other defaults
+  match each qualifying attack note. `GetImpactAnim` maps 0x7f/81/82/84/default
+  to target attractors 1001/1007/1008/1000/1006 respectively.
+* `Setupf/gfxtweak.bin` is a bounded little-endian count followed by
+  `(id,class,payload-word-count,payload)` CMSBlocks (`10106be2`): actual file
+  333132 bytes, 2687 records. The renderer reads authored flare class1005 and
+  moving-cord class1025, not generated generic flashes. Material metadata comes
+  from the complete 102-entry `10106f39::GetMaterial` switch; `10106e2e` resolves
+  its texture names as type1010004 through NameTable.
+* Actual Solar-Powered Assault Rifle item121569 binds muzzle2005,
+  cord2750 and impact2710→62002. Muzzle2005 is `x_smoke.png`, 64 sprites,
+  radius0.1 and lifetime0.1; cord2750 is `s_bullet.png`, speed25, length1.25,
+  width0.0625. Impact62002 uses the same bullet texture for 128 authored streaks,
+  lifetime0.01..0.2 and radius0.01. These values were read from the installed
+  table, not fitted from screenshots.
+* `100dcd93` derives paired sprite endpoint velocities, angular ranges,
+  lifetime, radius and ARGB interpolation from payloads. DisplaySystem
+  `GfxVisualFlareType0::NewSprite`/`ProcessSprites` uses radius directly (not half),
+  P/Q-aligned quads and SRCALPHA/ONE additive blending. Material atlas modulo
+  columns / division rows is retained as observed in `1001379b`/`100137aa`.
+  `10100104` advances cords and clamps their ends to the actual hit location.
+* Integration: real `AttackInfo`/`SpecialAttackInfo` slot context, animation notes,
+  actual actor/weapon geometry (§7.1), dynamic actor model/frame upload, and
+  existing `MuzzleFlashFX` (category8) / `TracersFX` (category2) preferences.
+  Special results preserve their own item/slot/damage; no stale normal-hit context
+  or camera-position effect anchor is used. Zone reset clears active effects.
+* Added bounded-parser, tuple replacement/miss-hit gating, real rifle-art,
+  projectile-parameter and real item-binding regressions. **Not executed** here;
+  Main owns builds, tests and live screenshot verification.
+
+* Fallback swings use the preloaded `ATTACK_KEY` NPC record variants
+  (`dynels::build_char`, `anim_key_variants`) through `Special::Attack`;
+  `play_swing` retains same-list suppression and replaces pending distinct-list
+  clips. The regression `distinct_swing_lists_replace_a_busy_identical_clip`
+  checks this path as well. `arms::real_records` uses a separate creature holder
+  for innate attacks: reusing the rifle holder already fills one slot, so
+  `FUN_1006ac03` / `FUN_10067fbe` allocate its innate entries at 1 and 2,
+  not 0 and 1. Melee/projectile assertions remain unchanged. These repairs have
+  not been executed here.
+  The fallback is selected explicitly by `play_swing(None)`, not by comparing
+  numeric clip IDs: authored clip 1034 shares `ATTACK_KEY` and must retain its
+  normal one-shot path. The death replay fixture awaits `Model::Ready` with a
+  bounded deadline before advancing its unchanged thirty-second simulation;
+  all death selector, phase and sound assertions remain intact.
+
 ## 8. Not found / open
 * The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
-* Weapon firing/impact **effects** (effect scripts `CreateEffect2(EffectType 413 / ImpactEffectType 414)`, `FUN_1009ad7d`): visual, unresolved. Their **sounds** are resolved (section 6.1). `PlaySoundIIR_c` (0x455D2938),
-  `GfxTriggerIIR_t` (0x7A222202) and `HealthDamageIIR_t` (0x3710256C) are registered message ids that never occur in the capture - server-driven sounds/effects may arrive through them.
+* Other authored effect classes (including class1006 star/burst effects used by
+  pistol2000/2601), live emission-rate effects and server `GfxTriggerIIR_t`
+  (0x7A222202)/`HealthDamageIIR_t` (0x3710256C) remain outside the current
+  flare1005/cord1025 renderer; unsupported classes report their actual ID/class,
+  never fabricated generic artwork. `PlaySoundIIR_c` (0x455D2938) also never
+  occurs in the capture. Weapon firing/impact sounds are resolved in §6.1.
 * Sound-map keys 0x15 0x16 0x17 0x1c 0x1d 0x50 0x87 of the weapon records (no consumer found), wield / unwield / grenade sounds (keys 8 / 9 / 0x31, found, not wired), the `0x2c` empty-weapon click.
 * `FUN_1005d0d8` case 0x5b also calls `vtable+0x40` of the stat system and, for a non-control char, `FUN_100523c3` (purpose not read); `FUN_10012a1e(..)` before every `PlayGameSound` is only the lazy creation of the `SandyInterfaceModule` singleton (`DAT_102e063c`), not a sound step.
 * The own character's `Dying` default animation when no action 99 arrived (death computed by `FUN_1005ae91`): 503 is a **guess** (`DEFAULT_DEATH_ANIM`).
