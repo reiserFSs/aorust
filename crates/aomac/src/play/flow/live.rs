@@ -229,7 +229,7 @@ fn live_walk() {
             "approach" => {
                 // `approach=x:z` walks to a point instead
                 let fixed = v.split_once(':').map(|(x, z)| (x.parse::<f32>().unwrap(), z.parse::<f32>().unwrap()));
-                let id: i32 = v.parse().unwrap_or(0);
+                let id: i32 = if v == "target" { l.p.zone.target.unwrap() } else { v.parse().unwrap_or(0) };
                 let goal = |l: &Live| fixed.map_or_else(|| (l.p.zone.dynels[&id].pos[0], l.p.zone.dynels[&id].pos[2]), |f| f);
                 let dist = |l: &Live| {
                     let (a, b) = (l.p.zone.own().unwrap().pos, goal(l));
@@ -301,6 +301,16 @@ fn live_walk() {
                 let mut v: Vec<_> = l.p.zone.stats.iter().collect();
                 v.sort();
                 eprintln!("stats {}", v.iter().map(|(k, x)| format!("{k}={x}")).collect::<Vec<_>>().join(" "));
+            }
+            // `selname=<name>`: select the nearest dynel with that name
+            "selname" => {
+                let me = l.p.zone.own().unwrap().pos;
+                let best = l.p.zone.dynels.iter().filter(|(_, d)| d.name == v).min_by(|a, b| {
+                    let dd = |d: &crate::play::zone::DynelState| (d.pos[0] - me[0]).powi(2) + (d.pos[2] - me[2]).powi(2);
+                    dd(a.1).total_cmp(&dd(b.1))
+                });
+                l.p.zone.target = best.map(|b| *b.0);
+                eprintln!("target {:?}", l.p.zone.target);
             }
             "sel" => l.p.zone.target = Some(v.parse().unwrap()),
             "fight" => {

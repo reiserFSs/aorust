@@ -42,6 +42,18 @@ pub fn attack(char_id: i32, target: Identity, flag: i8) -> Vec<u8> {
     })
 }
 
+/// `LookAtIIR_t` 0x2252445F: the client's target selection (`FUN_1003b73e` [GC 0x1003b73e] for a character, mode 1;
+/// `FUN_1003b0db` for anything else / no target, mode 0), sent by `FUN_1003fb35` [GC] whenever the selection changes.
+/// Ctor `FUN_10074f69` [GC] (`this[0xc] = 0`), write `FUN_10074f41`: `Identity target`, `i32 mode`. 25 bytes.
+pub const LOOK_AT: u32 = 0x2252_445F;
+
+pub fn look_at(char_id: i32, target: Identity, mode: i32) -> Vec<u8> {
+    header(LOOK_AT, char_id, |w| {
+        target.write(w);
+        w.i32(mode);
+    })
+}
+
 /// `N3Msg_StopAttack` [GC 0x10027f55] -> `StopFightIIR_t(char identity, 1)`. The body is written with
 /// `BinaryStream::operator<<(uint)` of the stored byte, i.e. a big-endian `i32 1` (captured relays: `00 00 00 01`). 17 bytes.
 pub fn stop_fight(char_id: i32) -> Vec<u8> {
@@ -366,6 +378,15 @@ mod tests {
 
     /// The server relays the client's messages with the same class layout and `to_be_passed_on = 0`, so the
     /// encoders must reproduce every captured relay byte-for-byte.
+    #[test]
+    fn look_at_layout() {
+        let t = Identity { kind: DYNEL_CHAR, instance: 0x1234 };
+        let b = look_at(7, t, 1);
+        assert_eq!(b.len(), 25);
+        assert_eq!(&b[..4], &[0x22, 0x52, 0x44, 0x5f]);
+        assert_eq!(&b[b.len() - 12..], &[0, 0, 0xc3, 0x50, 0, 0, 0x12, 0x34, 0, 0, 0, 1]);
+    }
+
     #[test]
     fn encoders_reproduce_captured_relays() {
         let (mut a, mut s, mut c) = (0, 0, 0);

@@ -6,6 +6,7 @@ use super::log::Space;
 use super::state::CombatEvent;
 use super::module::{Command, Module};
 use crate::play::chat::GameAction;
+use crate::play::dynels::NAME_TAG_RADIUS;
 use crate::play::controls::Cmd;
 use crate::play::Play;
 use ao_formats::character::Role;
@@ -134,15 +135,24 @@ impl Play {
     /// Floating damage numbers (`DamageTextMessage` for the own character, the effect `0x2f5a` billboard for everybody else).
     pub(in crate::play) fn fight_draw(&mut self, host: &Host, list: &mut DrawList) {
         let Some(m) = self.fight.as_ref() else { return };
-        let h = self.size.1 as f32;
+        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
         for n in m.numbers() {
             let rgb = n.spec.color & 0x00ff_ffff;
             let (x, y) = match n.spec.space {
                 // [UNRESOLVED] `DAT_102761c0` (the HUD number's reference y) is not identified: the lower third of the screen.
                 Space::Hud => (n.jitter, h * 0.66 - 20.0 - n.rise()),
+                // A billboard effect of the 3D scene: only what the camera sees (on screen, within the locality radius of the tags,
+                // not behind terrain / walls) is drawn. [GUESS] the radius: the effect's own range was not traced.
                 Space::World => match self.zone.world.head_point(n.dynel, &host.camera, self.size, n.rise()) {
-                    Some(p) => p,
-                    None => continue,
+                    Some((x, y, at))
+                        if (0.0..w).contains(&x)
+                            && (0.0..self.size.1 as f32).contains(&y)
+                            && (at - host.camera.pos).length() <= NAME_TAG_RADIUS
+                            && self.player.as_ref().is_none_or(|p| p.line_clear(host.camera.pos.to_array(), at.to_array())) =>
+                    {
+                        (x, y)
+                    }
+                    _ => continue,
                 },
             };
             let tw = self.gui.text_width(FontId::Shell, &n.text);

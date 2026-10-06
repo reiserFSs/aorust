@@ -1084,7 +1084,7 @@ impl Dynels {
 
     /// Screen position (GUI pixels) of the point `rise` metres above the head anchor of `id` (floating combat numbers rise 0.4 m/s,
     /// docs/zone/combat-log.md §6); `None` while the dynel has no model yet or is behind the camera.
-    pub fn head_point(&self, id: i32, cam: &Camera, size: (u32, u32), rise: f32) -> Option<(f32, f32)> {
+    pub fn head_point(&self, id: i32, cam: &Camera, size: (u32, u32), rise: f32) -> Option<(f32, f32, ao_render::Vec3)> {
         let c = self.chars.get(&id)?;
         let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return None };
         let p = scene_pos(c.pose.pos);
@@ -1095,7 +1095,7 @@ impl Dynels {
         if z < 0.3 {
             return None;
         }
-        Some(((0.5 + 0.5 * d.dot(cam.right()) / (z * tan * w / h)) * w, (0.5 - 0.5 * d.dot(cam.up()) / (z * tan)) * h))
+        Some(((0.5 + 0.5 * d.dot(cam.right()) / (z * tan * w / h)) * w, (0.5 - 0.5 * d.dot(cam.up()) / (z * tan)) * h, cam.pos + d))
     }
 }
 

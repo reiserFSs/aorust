@@ -64,6 +64,8 @@ pub struct Module {
     rng: u32,
     /// `s_nCommandRefCntr` [GC]: counter of the `n3Command_t`s the client sent (`SocialActionCmd_t.counter`).
     counter: i32,
+    /// The selection last announced to the server with `LookAtIIR_t`.
+    announced: Option<i32>,
     /// `identity_b.instance` of the own `CharacterAction` 99: the death animation the server asked for.
     death_anim: Option<u16>,
     /// Events of the last received frames for the HUD / sounds (taken by [`Module::take_events`]).
@@ -126,6 +128,7 @@ impl Module {
             swings: Vec::new(),
             rng: 0x2545_F491 ^ own,
             counter: 0,
+            announced: None,
             death_anim: None,
             events: Vec::new(),
             pose_events: Vec::new(),
@@ -226,6 +229,7 @@ impl Module {
 
     /// Per frame: ages the numbers, feeds the combat music (`FUN_10059736` for every character), runs the own death timer.
     pub fn update(&mut self, dt: f32, zone: &Zone, audio: Option<&Audio>) {
+        self.announce(zone);
         for n in &mut self.numbers {
             n.age += dt;
         }
@@ -257,6 +261,20 @@ impl Module {
             };
             a.set_combat_char(&info);
         }
+    }
+
+    /// `FUN_1003fb35` -> `FUN_1003b73e` / `FUN_1003b0db`: every change of the selection is announced with `LookAtIIR_t`
+    /// (before any attack that uses it).
+    fn announce(&mut self, zone: &Zone) {
+        if self.announced != zone.target && self.own_known(zone) {
+            let (t, mode) = zone.target.map_or((Identity::default(), 0), |t| (Identity { kind: DYNEL_CHAR, instance: t }, 1));
+            self.send(net::look_at(self.own, t, mode));
+            self.announced = zone.target;
+        }
+    }
+
+    fn own_known(&self, zone: &Zone) -> bool {
+        zone.dynels.contains_key(&self.own)
     }
 
     fn attacker(&self, zone: &Zone, mode: u32) -> Attacker {
@@ -341,6 +359,7 @@ impl Module {
 
     /// Run a player command. `mode` = movement FSM mode of the own character (4 = swimming).
     pub fn command(&mut self, cmd: Command, zone: &Zone, mode: u32) {
+        self.announce(zone);
         match cmd {
             Command::Attack => self.default_attack(zone, mode, zone.target, false),
             Command::SwitchTarget(id) => self.default_attack(zone, mode, Some(id), true),
