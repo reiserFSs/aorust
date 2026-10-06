@@ -922,7 +922,7 @@ mod tests {
             v = c.update([0.0, 0.0, -8.0], 0.0, 1.0 / 60.0);
         }
         let pivot = Vec3::new(0.0, 1.5, -8.0);
-        assert!(((v.pos - pivot).length() - CHASE_DEFAULT_DISTANCE).abs() < 0.02, "{}", (v.pos - pivot).length());
+        assert!(((v.pos - pivot).length() - CHASE_DEFAULT_DISTANCE).abs() < 0.11, "{}", (v.pos - pivot).length()); // `SteeringArrive` stops within 0.1 m (d2 < 0.01)
         assert!((v.forward() - (pivot - v.pos).normalize()).length() < 1e-3);
         // a target inside 0.9 m is not pushed out any more (`Update` only runs on input): the distance stays what it was
         let mut d = chase();
@@ -1077,8 +1077,9 @@ mod tests {
         }
         let frame = cut.expect("the camera was cut");
         assert!((88..=93).contains(&frame), "cut after {frame} frames");
-        // the avatar faces -Z (scene): the camera now sits beyond the target, above it, at the halved distance
-        assert!(c.vehicle.pos.z < pivot.z && c.vehicle.pos.y > pivot.y, "{:?}", c.vehicle.pos);
+        // every try that does not see the target halves the distance and swings on from the previous spot (the loop reuses
+        // `pos'`), so with nothing visible it ends 0.625 m from the target, above it
+        assert!(c.vehicle.pos.y > pivot.y && near((c.vehicle.pos - pivot).length(), 0.625), "{:?}", c.vehicle.pos);
         assert!(c.vehicle.dist <= CUT_MIN_DISTANCE, "{}", c.vehicle.dist);
     }
 

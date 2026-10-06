@@ -23,7 +23,8 @@ impl Sight<'static> {
 }
 
 impl<'a> Sight<'a> {
-    /// Only the line of sight is known.
+    /// Only the line of sight is known (tests).
+    #[cfg(test)]
     pub fn with_clear(clear: &'a dyn Fn([f32; 3], [f32; 3]) -> bool) -> Self {
         Sight { clear, ..Sight::OPEN }
     }
