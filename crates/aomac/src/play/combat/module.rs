@@ -272,6 +272,9 @@ impl Module {
             if d.tick(dt) == Some(DieEvent::SendDeathDone) {
                 let none = Identity::default();
                 let a = simple(ACTION_DEATH_DONE, none, none);
+                if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
+                    eprintln!("combat: CharDie_t wait over, sending CharacterAction {ACTION_DEATH_DONE:#x}");
+                }
                 self.outbox.push(n3_frame(0, self.own as u32, action::character_action(self.own, &a)));
             }
         }
@@ -752,6 +755,36 @@ mod death_tests {
             _ => None,
         }).collect();
         assert_eq!(done, [ACTION_DEATH_DONE], "sent exactly once");
+    }
+
+    /// Live death of Aomacvolk (lvl 2, 40 HP) against a Fresh Engineer in Borealis (`docs/captures/zone_death_borealis.rec`, redacted excerpt of the
+    /// frames addressed to the two characters): the exchange of blows, the health dropping below 0, the music switch and the server's `CharacterAction` 99.
+    #[test]
+    fn live_death_capture() {
+        let own = 0x82e8;
+        let mut m = Module::with_texts(Box::new(Fixed::new()), own);
+        let (mut hits_on_own, mut min_health, mut music_off, mut death_music, mut died, mut started) = (0, i32::MAX, false, false, false, false);
+        for l in include_str!("../../../../../docs/captures/zone_death_borealis.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            if dir == ">" {
+                continue;
+            }
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            m.on_frame(&Frame::decode_with(&b, false).unwrap().unwrap().0);
+            for e in m.take_events() {
+                match e {
+                    CombatEvent::Hit { victim, .. } if victim == own as i32 => hits_on_own += 1,
+                    CombatEvent::Health { dynel, health, .. } if dynel == own as i32 => min_health = min_health.min(health),
+                    CombatEvent::FightStarted { who, .. } if who == own as i32 => started = true,
+                    CombatEvent::CombatMusic(false) => music_off = true,
+                    CombatEvent::DeathMusic(true) => death_music = true,
+                    CombatEvent::Died { dynel, cause: 0 } if dynel == own as i32 => died = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(started && hits_on_own >= 2 && min_health < 0 && music_off && death_music && died, "{started} {hits_on_own} {min_health} {music_off} {death_music} {died}");
     }
 
     /// Another character's action 0xd1 is a hit-sound cue when both identity instances are positive, nothing otherwise.

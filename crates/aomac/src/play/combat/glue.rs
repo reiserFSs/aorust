@@ -108,6 +108,15 @@ impl Play {
                 }
             }
         }
+        if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
+            for e in &events {
+                match e {
+                    CombatEvent::Hit { .. } | CombatEvent::Miss { .. } | CombatEvent::Died { .. } | CombatEvent::FightStarted { .. } | CombatEvent::FightStopped { .. } | CombatEvent::CombatMusic(_) | CombatEvent::DeathMusic(_) => eprintln!("combat: {e:?}"),
+                    CombatEvent::Health { dynel, .. } if *dynel == own => eprintln!("combat: {e:?}"),
+                    _ => {}
+                }
+            }
+        }
         // swings (`FUN_1006a239` [GC 0x1006a239], docs/zone/combat-anim.md §3): every hit and special attack of every character
         for e in &events {
             match e {

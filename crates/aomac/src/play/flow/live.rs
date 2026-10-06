@@ -245,7 +245,12 @@ fn live_walk() {
     let want = std::env::var("AOMAC_LIVE_CHAR").unwrap_or_else(|_| "Aomacvolk".into());
     std::env::set_var("AOMAC_PREFS_DIR", std::env::temp_dir().join("aomac-live-prefs"));
     // `AOMAC_AUDIO_LOG=1`: the real audio engine runs in the harness and `audio` steps print its status (combat music, voices)
-    let audio = std::env::var_os("AOMAC_AUDIO_LOG").and_then(|_| ao_audio::Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok());
+    let audio = std::env::var_os("AOMAC_AUDIO_LOG").and_then(|_| ao_audio::Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok()).inspect(|a| {
+        // muted to the speakers unless `AOMAC_AUDIO_UNMUTE` is set (voices / RMS are still logged)
+        if std::env::var_os("AOMAC_AUDIO_UNMUTE").is_none() {
+            a.set_output_gain(0.0);
+        }
+    });
     let mut p = Play::new(dir, None, Some("Ithaca".into()), audio).unwrap();
     p.servers = Some(ao_net::client::fetch_servers().map_err(|e| e.to_string()));
     let o = Offscreen::new(&p, (1280, 800)).unwrap();

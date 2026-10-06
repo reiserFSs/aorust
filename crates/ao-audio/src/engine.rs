@@ -175,6 +175,11 @@ impl Audio {
         self.sh.mixer().render(out);
     }
 
+    /// Device output gain after the level statistics (0 = silent run that still reports voices / RMS).
+    pub fn set_output_gain(&self, g: f32) {
+        self.sh.mixer().output = g;
+    }
+
     pub fn stats(&self) -> Arc<Stats> {
         self.sh.mixer().stats.clone()
     }

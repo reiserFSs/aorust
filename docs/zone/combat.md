@@ -80,3 +80,21 @@ from the cliff top above the beach (the server did not deal hits at 15 m height 
 sound calls (`game sound <id> ...: N voice(s)`) appeared. **Not re-run:** the kill of a Beach Leet with own swing / hit sound / corpse / XP in this build,
 because the saved character position kept being moved by other sessions (beach reachable only by a ~1000 m swim and a ledge, then the position
 was moved to another playfield); the previous capture above remains the evidence for kill, corpse and XP.
+
+## Live: own death in Borealis (pf 800, lvl 2 Aomacvolk, 40 HP, vs Fresh Engineer lvl 7 / 160 HP)
+
+Capture `docs/captures/zone_death_borealis.rec` (redacted excerpt: only frames addressed to the two characters; test `live_death_capture`). Harness
+run with `AOMAC_COMBAT_LOG=1` (prints the fight events), `AOMAC_AUDIO_LOG=1` (real audio engine, **muted** unless `AOMAC_AUDIO_UNMUTE` is set:
+`Mixer::output` is applied after the level statistics, so voices / RMS are still logged), window shots inspected:
+* `Q` -> `LookAt` + `Attack`; `CombatMusic(true)`, the music switched `MN03.wav` -> `MN10.wav` -> `MN08.wav` while fighting (`audio` step).
+* Lines: "You hit Fresh Engineer for 3 points of projectile damage.", "You tried to hit Fresh Engineer, but missed!", red "Fresh Engineer hit you for 11 / 12 / 17 points ...";
+  world damage number "3" above the target; the own avatar plays its swing between the engineer's hits (shots a3..a6).
+* Health 8 -> -4 (`Health` -12): `FightStopped`, `CombatMusic(false)`, `DeathMusic(true)`, then `Died { cause: 0 }` (server `CharacterAction` 99): the
+  death sound plays at the camera (1 voice), the avatar lies on the ground holding the death clip (shot a8), the stats window shows the unsigned
+  `4294967292 / 40` (`FUN_1007f8c4` formats `%u`, stat_view.rs: the original behaviour as read, the bar is full).
+* ~2 s after the death the server sends "This XP was added to the pool of unsaved experience points ...", "Locating next playfield server", a zone
+  redirection and "NEW LOC: 679.6 72.8 476.7 / Entering 'Borealis'": the respawn at the playfield's start with 4 -> 10 HP (regen +3 per tick). The
+  client's own `CharDie_t` timer (3 s, action 0x98) had not elapsed when the zone changed, so no 0x98 was sent (the `own_death...` unit test covers
+  the timer).
+* **Not confirmed live**: own kill, corpse, XP and loot. A lvl 2 character does 3 damage per hit against 160 HP mobs (the lowest attackable mob in
+  reach; Uncle Pumpkin-Head 332 HP), and the engineer kills it in ~4 rounds. The kill / corpse / XP evidence remains `zone_fight_ithaca.rec`.

@@ -69,6 +69,8 @@ pub struct Stats {
 pub struct Mixer {
     pub rate: u32,
     pub master: f32,
+    /// Gain applied to the device output after the level statistics are taken (0 = muted harness runs that still log voices / RMS).
+    pub output: f32,
     voices: Vec<Voice>,
     next_id: u64,
     pub stats: Arc<Stats>,
@@ -76,7 +78,7 @@ pub struct Mixer {
 
 impl Mixer {
     pub fn new(rate: u32) -> Self {
-        Mixer { rate, master: 1.0, voices: Vec::new(), next_id: 1, stats: Arc::default() }
+        Mixer { rate, master: 1.0, output: 1.0, voices: Vec::new(), next_id: 1, stats: Arc::default() }
     }
 
     pub fn voice_count(&self) -> usize {
@@ -196,6 +198,7 @@ impl Mixer {
             *s = (*s * self.master).clamp(-1.0, 1.0);
             sq += (*s as f64) * (*s as f64);
             peak = peak.max(s.abs());
+            *s *= self.output;
         }
         let rms = if out.is_empty() { 0.0 } else { (sq / out.len() as f64).sqrt() as f32 };
         self.stats.callbacks.fetch_add(1, Relaxed);
