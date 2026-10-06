@@ -280,6 +280,13 @@ impl Avatar {
         ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, skin: Some(skin), always: true }
     }
 
+    /// `n3Dynel_t::GetBodyCollSphereRadi` (N3 0x10004dd3): the model's torso sphere radius (`VisualCATMesh_t::GetTorsoSphereRadi`), 0.5 when
+    /// negative, times the body scale (`n3VisualDynel_t::UpdateCollision` N3 0x19be4).
+    pub fn body_radius(&self) -> f32 {
+        let r = self.rig.cat().torso_sphere.radius;
+        (if r < 0.0 { ao_formats::playfield::collision::DEFAULT_BODY_RADIUS } else { r }) * self.scale
+    }
+
     /// Body height in metres including `monster_scale` (eye height / name tag).
     pub fn height(&self) -> f32 {
         self.rig.height() * self.scale

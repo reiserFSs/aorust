@@ -471,6 +471,8 @@ pub struct Char {
     /// Mount transforms of the last pose.
     parts: Vec<[[f32; 4]; 4]>,
     features_set: bool,
+    /// Model-space box of the last pose's skinned body vertices (`RCATMesh_t+0x1fc/+0x208`, hud_pick.rs); `None` until posed.
+    bounds: Option<([f32; 3], [f32; 3])>,
     roll: Roll,
 }
 
@@ -519,11 +521,11 @@ pub struct Dynels {
     asked: HashSet<u64>,
     /// Pref `ShowAllNames` (default off, docs/zone/motion.md §6): name tags over every dynel within [`NAME_TAG_RADIUS`].
     pub show_all_names: bool,
-    /// Lens of the playfield scene (projection of the name tags).
-    pub lens: Lens,
     /// `DisplayCharViewDistance` in metres (default 80, `FUN_1001f964` N3 0x1001f964; docs/chat/dvalue.md): characters farther from the
     /// viewer are not drawn (`n3VisualDynel_t::Run`, N3 0x100196bd: squared distance to the controlled dynel on ground playfields).
     pub char_view_distance: f32,
+    /// Lens of the playfield scene (projection of the name tags).
+    pub lens: Lens,
     /// The tag sprites held by the renderer and the 2 s nametag listing (`play/tags.rs`).
     tags: TagLayer,
     listing: Listing,
@@ -553,9 +555,9 @@ impl Default for Dynels {
             models: HashMap::new(),
             asked: HashSet::new(),
             show_all_names: std::env::var_os("AOMAC_SHOW_ALL_NAMES").is_some(),
+            char_view_distance: 80.0,
             lens: Lens::default(),
             tags: TagLayer::default(),
-            char_view_distance: 80.0,
             listing: Listing::default(),
             rng: CrtRand::new(1),
             sounds: vec![],
@@ -667,6 +669,17 @@ impl Dynels {
         std::mem::take(&mut self.sounds)
     }
 
+    /// Doors whose room link state changed since the last call: `(scene position, open, passable)` (`n3RoomMonitor_t::DoorOpened/Closed`,
+    /// `Door_t::CanPass`, see [`PropAnim::take_room_state`]); the caller maps the position to the link (`Collision::door_link_from_pos`).
+    pub fn take_door_rooms(&mut self) -> Vec<([f32; 3], bool, bool)> {
+        self.props.values_mut().filter_map(|p| p.anim.take_room_state().map(|(open, pass)| (scene_pos(p.pos), open, pass))).collect()
+    }
+
+    /// Every door hands its room link state out again (the caller built a new collision world).
+    pub fn resync_doors(&mut self) {
+        self.props.values_mut().for_each(|p| p.anim.resync());
+    }
+
     pub fn on_message(&mut self, m: &Message) {
         let who = m.header.target;
         match &m.body {
@@ -771,6 +784,7 @@ impl Dynels {
                         submitted: false,
                         parts: vec![],
                         features_set: !u.is_npc(),
+                        bounds: None,
                         roll: Roll::default(),
                     },
                 );
@@ -1009,6 +1023,7 @@ impl Dynels {
             c.submitted = true;
             let skin = skin.map(|(v, parts)| {
                 c.parts = parts;
+                c.bounds = super::hud_pick::bounds_of(v.iter().map(|x| &x.pos));
                 v
             });
             let (s, cs) = scene_yaw(c.pose.yaw).sin_cos();
@@ -1085,6 +1100,26 @@ impl Dynels {
     pub fn name_tags(&mut self, dt: f32, gui: &mut Gui, host: &mut Host, own_pos: [f32; 3], indicators: &[Indicator]) {
         let tags = self.collect_tags(dt, own_pos, indicators);
         self.tags.frame(gui, host, &tags);
+    }
+
+    /// The characters the camera's selection line can hit (`FUN_10020a3c`): every dynel but the client character, with the
+    /// box of its last pose ([`super::hud_pick`]); dynels not posed yet have no box and are skipped.
+    pub fn pick_bodies(&self, own: i32) -> Vec<super::hud_pick::PickBody> {
+        self.chars
+            .iter()
+            .filter(|(id, _)| **id != own)
+            .filter_map(|(id, c)| Some(super::hud_pick::PickBody { id: *id, bounds: c.bounds?, pos: scene_pos(c.pose.pos), yaw: scene_yaw(c.pose.yaw), scale: c.scale }))
+            .collect()
+    }
+
+    /// `(Flags (stat 0), Features (stat 0xe0) of the NPC record)` of `id`: what `InputConfig_t::CheckObjectUnderMouse` reads for the pointer.
+    pub fn pointer_stats(&self, id: i32) -> Option<(i32, Option<i32>)> {
+        let c = self.chars.get(&id)?;
+        let features = match self.models.get(&c.key) {
+            Some(Model::Ready { built, .. }) => built.features,
+            _ => None,
+        };
+        Some((c.flags, features))
     }
 
     /// Screen position (GUI pixels) of the point `rise` metres above the head anchor of `id` (floating combat numbers rise 0.4 m/s,
@@ -1377,6 +1412,12 @@ mod tests {
 #[cfg(test)]
 mod variant_tests {
     use super::*;
+    use crate::play::zone::Zone;
+
+    fn client() -> Option<PathBuf> {
+        let d = PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
+        d.join("cd_image/rdb.db").exists().then_some(d)
+    }
 
     /// The variant is rolled when a clip starts (key or state change), not on every frame of its loop, and a single clip never
     /// consumes the RNG (`FUN_1004570c`).
@@ -1419,5 +1460,48 @@ mod variant_tests {
         let held = built.held.expect("held pose");
         assert!(built.clips.is_empty());
         assert_eq!(held.0, built.model.meshes[0].vertices);
+    }
+
+    /// The kill of `zone_fight_ithaca.rec` (`CharacterAction` 99 with death animation 503 on a Beach Leet): the NPC plays its death clip and holds it.
+    #[test]
+    fn replayed_kill_plays_the_death_clip() {
+        let Some(dir) = client() else { return };
+        let mut z = Zone::new(33512);
+        z.world.start(dir, 33512);
+        let rec = include_str!("../../../../docs/captures/zone_fight_ithaca.rec");
+        let (mut host, mut last_ms) = (Host::headless(), 0u32);
+        let mut dead_seen = false;
+        let eye = [0.0; 3];
+        for l in rec.lines() {
+            let mut p = l.split(' ');
+            let (ms, dir, hex) = (p.next().unwrap().parse::<u32>().unwrap(), p.next().unwrap(), p.next().unwrap());
+            if dir != "<" {
+                continue;
+            }
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            while last_ms + 50 <= ms {
+                z.world.update(0.05, eye, [0.0, 0.0, -1.0], &mut host);
+                host.actors.clear();
+                last_ms += 50;
+                if last_ms < 26000 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            let Some((f, _)) = ao_net::frame::Frame::decode_with(&b, false).ok().flatten() else { continue };
+            z.on_frame(&f);
+            dead_seen |= matches!(z.world.chars.get(&1037993).map(|c| c.special), Some(Special::Die(_)));
+        }
+        assert!(dead_seen, "the death action reaches the NPC");
+        // let the worker finish the model, then run the clock past the clip
+        for _ in 0..400 {
+            z.world.update(0.05, eye, [0.0, 0.0, -1.0], &mut host);
+            host.actors.clear();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let c = &z.world.chars[&1037993];
+        let Some(Model::Ready { built, .. }) = z.world.models.get(&c.key) else { panic!("model not ready") };
+        eprintln!("kill: special {:?} anim {} clips {:?}", c.special, c.anim, built.clips.keys().collect::<Vec<_>>());
+        assert!(matches!(c.special, Special::Die(_)));
+        assert!(c.anim == 503 || c.anim == DIE_KEY, "playing a death clip, not idle: {}", c.anim);
     }
 }

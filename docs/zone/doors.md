@@ -85,9 +85,9 @@ level by distance only (docs/formats.md audio): `Audio::play_game_sound(id, pos,
 
 * **Room doors of dungeons**: `n3RoomMonitor_t::DoorOpened/DoorClosed` (N3 0x10013561 / 0x10013910, called by `FUN_1007ef56` / `FUN_1007ef90` with the door's room link `+0x1d0`) → `n3Playfield_t::ChangeRoomStatus` and
   `IsDoorOpenBetweenRooms` (N3 0x1000d1e9) decide whether a character may pass between two rooms (docs/zone/collision.md §3: "every transition is allowed" stays **[GUESS]**). The link comes from `Door_t::LinkDoorToRooms`
-  (`n3Room_t::GetDoorLinkFromPos` N3 0x100105f9 on the door position; unresolved doors are "killed") which is not traced. `Effect::RoomOpened/RoomClosed` are produced and ignored.
+  (`n3Room_t::GetDoorLinkFromPos` N3 0x100105f9 on the door position; unresolved doors are "killed") which is not traced. `Effect::RoomOpened/RoomClosed` are wired: `PropAnim::take_room_state` -> `Player::door_rooms` -> `door_link_from_pos` -> `set_door_open` / `set_door_passable` (docs/zone/collision.md §5).
   Consumer on the camera side (done, docs/zone/camera.md §7): `IsDoorOpenBetweenRooms` hides a scripted-view attractor in another room while the link's door is not open (`Collision::door_open_between`, fed by `Collision::set_door_open`,
-  which nothing calls yet: **every link counts as closed for the camera** until `RoomOpened` / `RoomClosed` are wired to it).
+  now called from `RoomOpened` / `RoomClosed`; a link whose door never reports stays closed for the camera).
 * **Door collision**: doors "want collision information" (`TellCollision`) and their mesh has animated `FAFCollisionSphere` nodes (the sphere follows the panel), but the client's dynel-vs-dynel collision is not ported for any prop.
 * The door state machine (rdb 1000015) is not interpreted beyond the animation spell above; `value_c3`, `flag_1a` (`+0x1d5`) and `DoorFullUpdate.value_78` are stored/ignored.
 * `StateAction`/`Flags` are kept in `Door` but nothing reads them besides the open / locked tests; a locked door does not block anything client side.

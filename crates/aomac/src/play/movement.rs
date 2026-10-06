@@ -576,6 +576,12 @@ pub struct Movement {
     ballistic: Option<Ballistic>,
     /// `FollowTargetIIR_c` waypoints (`Vehicle +0x190`, zero-terminated): the vehicle steers to the first one (`FUN_10070fee`).
     follow: Vec<[f32; 3]>,
+    /// The follow-target dynel (`Vehicle +0x180`, a char instance) and its last known position (`n3Dynel_t::GetRelPos`, fed by the caller each
+    /// frame through [`Movement::set_chase_pos`]): with a target set the vehicle steers to a point 4 m short of it (`FUN_10070185`).
+    chase: Option<i32>,
+    chase_pos: Option<[f32; 3]>,
+    /// Position at the start of the previous sub-step (`Vehicle +0xd0 / +0xd8`), for the crossing test of `SteeringDirArrive`.
+    prev_pos: [f32; 3],
     /// `DummyVehicle_t::Enable/DisableSurfaceCollision` (stat `Flags` bit 0x80000000).
     surface_collision: bool,
     /// Stats written locally by transition `Apply`s, handed to the stat holder by [`Movement::take_stat_writes`].
@@ -655,6 +661,9 @@ impl Movement {
             surface: SurfaceState::default(),
             ballistic: None,
             follow: Vec::new(),
+            chase: None,
+            chase_pos: None,
+            prev_pos: pos,
             surface_collision: true,
             stat_writes: Vec::new(),
             fx: fx::Fx::default(),
@@ -889,6 +898,11 @@ impl Movement {
         false
     }
 
+    /// `n3Dynel_t::GetBodyCollSphereRadi` of the own dynel (`SurfaceState::radius`), fed by the avatar model's torso sphere.
+    pub fn set_body_radius(&mut self, r: f32) {
+        self.surface.radius = r;
+    }
+
     /// Place the character (spawn, teleport, playfield change): velocity and inputs are cleared.
     pub fn teleport(&mut self, pos: [f32; 3], yaw: f32) {
         // any running Impulse flight / FollowTarget path ends with the placement
@@ -903,7 +917,7 @@ impl Movement {
         self.airborne = false;
         self.launch_y = pos[1];
         // `Vehicle +0x120` (the liquid callback flag) survives a placement: the FSM mode (swimming) does too
-        self.surface = SurfaceState { in_liquid: self.surface.in_liquid, ..SurfaceState::default() };
+        self.surface = SurfaceState { in_liquid: self.surface.in_liquid, radius: self.surface.radius, ..SurfaceState::default() };
         self.jump_ready = true;
         self.fsm = Fsm { last_speed_mode: self.fsm.last_speed_mode, mode: self.fsm.mode, ..Fsm::new() };
         self.in_fwd = 0.0;
@@ -946,18 +960,45 @@ impl Movement {
     }
 
     /// `FollowTargetIIR_c` apply part 2 (after the caller's Features / district gate): dropped in FSM modes 1, 8, 9, 0xB, 0xC; else the FSM runs
-    /// `Transition(mode)` (live ids 21 FullStop, 24 Walk, 25 Run) and `FUN_1006fe02` stores the waypoints (at most 30, up to the first
-    /// all-zero entry). The vehicle then steers to the first waypoint; a manual movement action cancels the path.
-    pub fn follow_target(&mut self, mv: u8, path: &[[f32; 3]]) -> bool {
+    /// `Transition(mode)` (live ids 21 FullStop, 24 Walk, 25 Run) and `FUN_1006fe02` stores the target dynel (`chase`, a char instance) and
+    /// the waypoints (at most 30, up to the first all-zero entry). The vehicle then steers to the target, or without one to the first
+    /// waypoint; a manual movement action cancels both.
+    pub fn follow_target(&mut self, mv: u8, path: &[[f32; 3]], target: Option<i32>) -> bool {
         if matches!(self.fsm.mode, 1 | 8 | 9 | 0xB | 0xC) {
             return false;
         }
         self.transition(mv);
+        self.chase = target;
+        self.chase_pos = None;
         self.follow = path.iter().take(FOLLOW_MAX).take_while(|p| **p != [0.0; 3]).copied().collect();
-        if !self.follow.is_empty() && self.fsm.fwd == 1 {
+        if self.following() && self.fsm.fwd == 1 {
             self.transition(id::FORWARD_START);
         }
         true
+    }
+
+    /// The follow-target dynel the caller has to keep fed with [`Movement::set_chase_pos`].
+    pub fn chase_target(&self) -> Option<i32> {
+        self.chase
+    }
+
+    /// `n3Dynel_t::GetRelPos` of the follow target; `None` (the dynel is gone) drops the target (`FUN_1006fe02(0, ..)`).
+    pub fn set_chase_pos(&mut self, p: Option<[f32; 3]>) {
+        self.chase_pos = p;
+        if p.is_none() {
+            self.chase = None;
+        }
+    }
+
+    /// `FUN_1006fe02(0, 2.0, 0)` without a path: the target is cleared (the per-frame Features / district gate of `FUN_10070fee`).
+    pub fn drop_chase(&mut self) {
+        self.chase = None;
+        self.chase_pos = None;
+    }
+
+    /// A follow target or waypoint path steers the vehicle (`FUN_1006ef82` or the waypoint list).
+    fn following(&self) -> bool {
+        self.chase.is_some() || !self.follow.is_empty()
     }
 
     /// `Vehicle_t::Impulse(delta, time)` [VH 0x1000cd61]: a ballistic flight from the current position to `pos + (dx, 0, dz)` lasting `time`
@@ -1066,6 +1107,8 @@ impl Movement {
                 self.pos[1] = g + FOOT_CLEARANCE;
             }
         }
+        // `Vehicle_t::Run` (Vehicle.dll @0x1000e849) reads the speed `+0xcc` before the frame (an `Impact` does not touch it)
+        let still = self.vel == [0.0, 0.0] && self.vy == 0.0;
         if let Some(h) = self.jump_pending.take() {
             self.launch_jump(h, world);
         }
@@ -1074,11 +1117,16 @@ impl Movement {
                 self.run_ballistic(dt, world);
             }
         } else if dt > 0.0 && dt <= MAX_DT {
+            let free = !self.following();
             let mut left = dt;
             while left > 0.0 {
                 let h = left.min(MAX_SUBSTEP);
                 self.step(h, world);
                 left -= h;
+            }
+            // ... and, in the free-roam branch (`+0x108 == 0`), runs the vtable `+0x70` callback when it went from 0 to > 0
+            if still && free && (self.vel != [0.0, 0.0] || self.vy != 0.0) {
+                self.start_moving_callback();
             }
         }
         // FUN_1005a5d6: two frames after a zone change a sync is sent.
@@ -1151,9 +1199,10 @@ impl Movement {
         let feat = self.stats.features;
         if action != id::JUMP_START && action != id::SYNC {
             // FUN_1006b84b: a movement action cancels the FollowTarget path (the sync exemption is a [GUESS]: CheckMotionUpdate would cancel it every 5 s)
-            if !self.follow.is_empty() {
+            if self.following() {
                 // [GUESS] the ForwardStart the path began with is ended with it
                 self.follow.clear();
+                self.drop_chase();
                 self.transition(id::FORWARD_STOP);
             }
         }
@@ -1257,6 +1306,12 @@ impl Movement {
     /// `Vehicle_t::Halt`.
     fn halt(&mut self) {
         self.vel = [0.0; 2];
+    }
+
+    /// Player vehicle vtable `+0x70` = `FUN_1006ef34` [GC]: the vehicle began to move (walked off an edge, jumped from a standstill): FSM
+    /// transition ForwardStart (1), ReverseStart (3) when `Vehicle_t::GetDir` is negative, through the permission table.
+    fn start_moving_callback(&mut self) {
+        self.transition(if self.dir < 0 { id::REVERSE_START } else { id::FORWARD_START });
     }
 
     fn enable_falling(&mut self) {
@@ -1442,22 +1497,65 @@ impl Movement {
         }
     }
 
-    /// `FUN_10070fee` path branch (`SteeringDirArrive` towards the first waypoint): the velocity points at it with the arrival ramp
-    /// `min(vmax, d / (vmax / 4) * vmax)`; a reached waypoint is popped and the end of the path runs ForwardStop
-    /// (`FUN_10070c00`). The arrival radius `max(vmax / 4, 0.5)` is a [GUESS] (the original reads it from an unresolved virtual, docs/zone/motion.md §4).
-    fn steer_follow(&mut self, w: [f32; 3]) {
-        let (dx, dz) = (w[0] - self.pos[0], w[2] - self.pos[2]);
-        let d = (dx * dx + dz * dz).sqrt();
-        let ramp = self.max_vel * 0.25;
-        if d < ramp.max(0.5) {
-            self.follow.remove(0);
-            if self.follow.is_empty() {
-                self.transition(id::FORWARD_STOP);
+    /// `FUN_10070fee` target branch: `FUN_1007022d(1)` picks the steering point, `Vehicle_t::SteeringDirArrive` turns it into a force.
+    /// * Target dynel (`FUN_10070185`): the point is `pos + n * (|d| - 4)` along `d = target - pos` (`DAT_10160a90` = 4.0), `pos` itself when
+    ///   `|d|^2 <= 16` (`DAT_10160a98`).
+    /// * Waypoints (`FUN_10070019`): a first waypoint closer than 1.0 m horizontally (`FUN_1006fd91`) is popped, repeatedly; an emptied list
+    ///   runs ForwardStop (`FUN_10070c00`).
+    ///
+    /// `SteeringDirArrive` [VH 0x1000ac8c]: halt when the point was crossed since the previous step (`(p - prev) . (p - cur) < 0`, xz),
+    /// else `SteeringArrive(radius 0.2)` [VH 0x1000ab28]: halt below 0.2 m (or d^2 < 0.01), else the desired velocity `d / |d| *
+    /// min(|d| / (maxVel / 4) * maxVel, maxVel)` and the force `(desired - v) * mass * 4`, truncated to the maximum force and integrated
+    /// as `v += F / mass * dt` (`FUN_1000e3d3`). [GUESS] the brake distance `this+0x40` is `maxVel / 4` (`FUN_1006f36f`'s caller was not
+    /// traced); the vertical force component is dropped (`vy` is owned by gravity / ground following).
+    fn steer_follow(&mut self, h: f32) {
+        /// f32 0.2 @ Vehicle.dll 0x10012298, passed by `SteeringDirArrive`.
+        const ARRIVE_RADIUS: f32 = 0.2;
+        let pos = self.pos;
+        let point = if self.chase.is_some() {
+            match self.chase_pos {
+                Some(t) => {
+                    let d = [t[0] - pos[0], t[1] - pos[1], t[2] - pos[2]];
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                    if d2 > 16.0 {
+                        let k = (d2.sqrt() - 4.0) / d2.sqrt();
+                        [pos[0] + d[0] * k, pos[1] + d[1] * k, pos[2] + d[2] * k]
+                    } else {
+                        pos
+                    }
+                }
+                None => pos,
             }
+        } else {
+            while let Some(&w) = self.follow.first() {
+                let (dx, dz) = (w[0] - pos[0], w[2] - pos[2]);
+                if dx * dx + dz * dz >= 1.0 {
+                    break;
+                }
+                self.follow.remove(0);
+            }
+            match self.follow.first() {
+                Some(&w) => w,
+                None => {
+                    self.transition(id::FORWARD_STOP);
+                    return;
+                }
+            }
+        };
+        let prev = self.prev_pos;
+        let crossed = (point[0] - prev[0]) * (point[0] - pos[0]) + (point[2] - prev[2]) * (point[2] - pos[2]) < 0.0;
+        let to = [point[0] - pos[0], point[1] - pos[1], point[2] - pos[2]];
+        let d2 = to[0] * to[0] + to[1] * to[1] + to[2] * to[2];
+        if crossed || d2 < ARRIVE_RADIUS * ARRIVE_RADIUS || d2 < 0.01 {
+            self.halt();
             return;
         }
-        let v = (d / ramp * self.max_vel).min(self.max_vel);
-        self.vel = [dx / d * v, dz / d * v];
+        let d = d2.sqrt();
+        let brake = self.max_vel * 0.25;
+        let k = (d / brake * self.max_vel).min(self.max_vel) / d;
+        let steer = [(to[0] * k - self.vel[0]) * MASS * 4.0, (to[2] * k - self.vel[1]) * MASS * 4.0];
+        let f = truncate(steer, self.force);
+        self.vel = truncate([self.vel[0] + f[0] / MASS * h, self.vel[1] + f[1] / MASS * h], self.max_vel);
     }
 
     /// `Vehicle_t::SetDirection`: a direction change halts.
@@ -1490,16 +1588,16 @@ impl Movement {
     fn step(&mut self, h: f32, world: &dyn World) {
         let old = self.pos;
         let mode = self.fsm.mode;
-        // `FUN_10070fee` path branch: steer to the first FollowTarget waypoint (not in modes 1, 8, 9)
-        if let Some(&w) = self.follow.first().filter(|_| !matches!(mode, 1 | 8 | 9)) {
-            self.steer_follow(w);
+        // `FUN_10070fee` target / path branch (not in modes 1, 8, 9)
+        if self.following() && !matches!(mode, 1 | 8 | 9) {
+            self.steer_follow(h);
         }
         // gravity
         if self.airborne {
             self.vy = (self.vy + GRAVITY * h).clamp(-VY_LIMIT, VY_LIMIT);
         }
         // CalcSteering (PlayerVehicle vtbl[0x13]): forward / reverse thrust along the body forward.
-        let steer = !matches!(mode, 1 | 8 | 9) && self.in_fwd != 0.0 && self.follow.is_empty();
+        let steer = !matches!(mode, 1 | 8 | 9) && self.in_fwd != 0.0 && !self.following();
         if steer || self.airborne {
             if steer {
                 let f = self.forward();
@@ -1548,6 +1646,7 @@ impl Movement {
             }
         }
         self.align(old, world);
+        self.prev_pos = old;
         // OrientationMode 0 (FUN_1000c616): the body faces the velocity (away from it while reversing).
         if self.vel != [0.0, 0.0] {
             let sg = if self.dir < 0 { -1.0 } else { 1.0 };
@@ -1975,13 +2074,13 @@ mod tests {
         let w = Flat(0.0);
         let mut m = Movement::new([0.0; 3], 0.0, 0);
         // mode 25 = run, path to (0, 0, 20): the vehicle steers to it without keys and returns to idle
-        assert!(m.follow_target(25, &[[0.0, 0.0, 20.0]]));
+        assert!(m.follow_target(25, &[[0.0, 0.0, 20.0]], None));
         assert_eq!(m.fsm().mode, mode::RUN);
         run(&mut m, &w, 6.0);
         assert!((m.pos()[2] - 20.0).abs() < 1.5 && m.pos()[0].abs() < 0.2, "{:?}", m.pos());
         assert_eq!(m.fsm().fwd, 1, "ForwardStop at the end of the path");
         // the first waypoint is zero-terminated, a key press cancels the path
-        assert!(m.follow_target(24, &[[0.0, 0.0, 40.0], [0.0; 3], [9.0, 9.0, 9.0]]));
+        assert!(m.follow_target(24, &[[0.0, 0.0, 40.0], [0.0; 3], [9.0, 9.0, 9.0]], None));
         m.action(id::STRAFE_LEFT_START, 7.0);
         let z = m.pos()[2];
         run(&mut m, &w, 1.0);
@@ -1989,7 +2088,7 @@ mod tests {
         // dropped in sit / sleep / lounge / frozen
         m.transition(id::FULL_STOP);
         assert!(m.transition(id::SWITCH_SIT_GROUND));
-        assert!(!m.follow_target(25, &[[1.0, 0.0, 1.0]]));
+        assert!(!m.follow_target(25, &[[1.0, 0.0, 1.0]], None));
         // the placement part runs before any gate
         m.follow_place([5.0, 0.0, 5.0]);
         assert_eq!(m.pos(), [5.0, 0.0, 5.0]);
@@ -2107,5 +2206,34 @@ mod tests {
         let out = m.update(0.016, &w);
         assert_eq!(out.iter().map(|o| o.action).collect::<Vec<_>>(), vec![0x16]);
         assert!(m.update(0.016, &w).is_empty());
+    }
+
+    /// `FUN_1006ef34` (vehicle vtable `+0x70`): a body that goes from rest to moving without a key (walking off an edge, jumping on the spot)
+    /// runs ForwardStart, or ReverseStart while `GetDir` is negative; one that stands on the ground does not.
+    #[test]
+    fn starting_to_fall_from_rest_runs_forward_or_reverse_start() {
+        let mut m = Movement::new([0.0, 0.0, 0.0], 0.0, 0);
+        run(&mut m, &Flat(0.0), 0.5);
+        assert_eq!((m.fsm().fwd, m.fsm().fwd_dir), (1, 0), "standing on the ground: nothing starts");
+        let mut m = Movement::new([0.0, 5.0, 0.0], 0.0, 0);
+        run(&mut m, &Flat(0.0), 0.1);
+        assert_eq!((m.fsm().fwd, m.fsm().fwd_dir), (2, 1), "walk-off: ForwardStart");
+        let mut m = Movement::new([0.0, 5.0, 0.0], 0.0, 0);
+        m.dir = -1;
+        run(&mut m, &Flat(0.0), 0.1);
+        assert_eq!((m.fsm().fwd, m.fsm().fwd_dir), (2, 2), "walk-off while reversing: ReverseStart");
+        let mut m = Movement::new([0.0, 0.0, 0.0], 0.0, 0);
+        m.jump_impulse(2.0);
+        run(&mut m, &Flat(0.0), 0.1);
+        assert_eq!(m.fsm().fwd, 2, "a jump from a standstill fires the callback");
+    }
+
+    #[test]
+    fn the_body_radius_survives_a_placement() {
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        assert_eq!(m.surface.radius, 0.5);
+        m.set_body_radius(0.8);
+        m.teleport([1.0, 0.0, 1.0], 0.0);
+        assert_eq!(m.surface.radius, 0.8);
     }
 }

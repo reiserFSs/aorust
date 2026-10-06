@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn wire_layers_per_part() {
         let part = |n: &str| Part { name: n.into(), texture: 1, env_texture: 2, alpha_aux: 0 };
-        let cat = CatMesh { root: String::new(), parts: vec![part("arms"), part("body")], signature: 0, materials: vec![], spheres: vec![], bones: vec![], submeshes: vec![], col_spheres: vec![], attractors: vec![] };
+        let cat = CatMesh { root: String::new(), parts: vec![part("arms"), part("body")], signature: 0, materials: vec![], spheres: vec![], bones: vec![], submeshes: vec![], col_spheres: vec![], attractors: vec![], torso_sphere: ColSphere { center: [0.0; 3], radius: 1.0, bone: 0 } };
         let t = |material, texture, env_texture, alpha_mode| TextureOverride { material, texture, env_texture, alpha_mode };
         let l = npc_part_layers(&cat, &[t("body", 7, 0, 5), t("arms", 0, 9, 0), t("none", 1, 1, 1)]);
         assert_eq!(l["body"], PartLayer { env_texture: 0, alpha_mode: Some(5) });

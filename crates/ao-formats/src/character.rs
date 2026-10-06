@@ -607,7 +607,7 @@ mod tests {
         for x in [7, 0, 0] {
             u(&mut v, x);
         }
-        u(&mut v, 0x05010500); // unidentified word
+        u(&mut v, 0x05010500); // packed torso sphere
         for x in [4, 0x104, 0xdead_beef] {
             u(&mut v, x);
         }
@@ -760,6 +760,10 @@ mod tests {
         assert_eq!(m.submeshes[0].vertices[2].bind, [2.0, 0.0, 0.0]);
         assert_eq!(m.submeshes[0].indices, [0, 1, 2]);
         assert_eq!((m.col_spheres.len(), m.attractors[0].name.as_str(), m.attractors[0].bone), (1, "Attractor01_head", 1));
+        // 0x05010500 = bytes 0, 5, 1, 5: `0.05 c + 6e-6 c^3` each
+        let t = &m.torso_sphere;
+        assert_eq!((t.center[0], t.radius), (0.0, 0.25 + 6.0e-6 * 125.0));
+        assert!((t.center[1] - t.radius).abs() < 1e-6 && (t.center[2] - 0.050006).abs() < 1e-6);
     }
 
     #[test]

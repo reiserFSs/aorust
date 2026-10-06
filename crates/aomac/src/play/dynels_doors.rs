@@ -263,6 +263,8 @@ pub struct PropAnim {
     /// Pose the renderer has (`None` = the rest vertices).
     sent: Option<f32>,
     skin: Vec<Vertex>,
+    /// The door's room link state changed since [`PropAnim::take_room_state`] (`n3RoomMonitor_t::DoorOpened/DoorClosed`).
+    dirty: bool,
 }
 
 /// `FUN_1004570c` (@0x1004570c): a random sound of the first key with a list (the client's `rand() % count`).
@@ -278,6 +280,7 @@ impl PropAnim {
         match (&mut self.door, item) {
             (Some(d), Some(item)) => {
                 let fx = d.apply(c);
+                self.dirty |= fx.iter().any(|e| matches!(e, Effect::RoomOpened | Effect::RoomClosed));
                 Self::sounds(&fx, &item.sounds, at, rng, out);
             }
             _ => {
@@ -298,14 +301,30 @@ impl PropAnim {
 
     /// One frame of the clock: creates the state when the model arrives (queued messages replay silently), then advances it by `dt`.
     pub fn step(&mut self, dt: f32, item: &ItemRig) {
+        let dirty = &mut self.dirty;
         let door = self.door.get_or_insert_with(|| {
             let mut d = Door::new(item.flags, item.stat_103, Some(ItemAnim::new(item.rig.total_time(), item.pos, item.play)));
             for c in self.early.drain(..) {
                 d.apply(c);
             }
+            *dirty = true; // `Door_t::LinkDoorToRooms` registers the new door with the state it starts in
             d
         });
         door.step(dt);
+    }
+
+    /// `(open, passable)` of the door's room link when it changed: `n3RoomMonitor_t::DoorOpened / DoorClosed` (open flag, `Flags` bit
+    /// 0x80) and `Door_t::CanPass` for the own character. `FUN_1007f74d` / `FUN_1007f58e` [GC]: an unlocked door (vtable `+0xfc` =
+    /// `IsLocked`, `Flags` bit 0x40) lets the character through, open or not; the locked rest (a lock-difficulty of 0 passes,
+    /// stat 0x103 bit 0x10 refuses, keys / owned buildings) is ported as "refused".
+    pub fn take_room_state(&mut self) -> Option<(bool, bool)> {
+        let d = self.door.as_ref().filter(|_| std::mem::take(&mut self.dirty))?;
+        Some((d.is_open(), d.flags & FLAG_LOCKED == 0))
+    }
+
+    /// The room link state is handed out again (a new collision world was built).
+    pub fn resync(&mut self) {
+        self.dirty = self.door.is_some();
     }
 
     /// The vertex set to hand to the renderer when the pose differs from the one it holds (`resubmit`: the renderer forgot the actor, it
@@ -396,6 +415,25 @@ mod tests {
         assert!(d.flags & FLAG_LOCKED != 0 && !d.is_open());
         d.status(false, false, 0, true);
         assert!(d.flags & FLAG_LOCKED == 0 && d.flag_1d5);
+    }
+
+    #[test]
+    fn room_state_follows_open_and_lock_and_is_taken_once() {
+        let mut p = PropAnim::default();
+        assert_eq!(p.take_room_state(), None);
+        p.door = Some(door(0.6));
+        p.dirty = true;
+        assert_eq!(p.take_room_state(), Some((false, true)));
+        assert_eq!(p.take_room_state(), None);
+        p.door.as_mut().unwrap().status(false, true, 0, false);
+        p.dirty = true;
+        assert_eq!(p.take_room_state(), Some((true, true)));
+        p.door.as_mut().unwrap().status(true, false, 0, false); // locked: closed, and CanPass refuses
+        p.dirty = true;
+        assert_eq!(p.take_room_state(), Some((false, false)));
+        assert_eq!(p.take_room_state(), None);
+        p.resync();
+        assert_eq!(p.take_room_state(), Some((false, false)));
     }
 
     #[test]

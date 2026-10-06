@@ -212,7 +212,7 @@ camera's current spot (dot > 0.9); + 50 when that spot is in the clear and the c
 `n3Playfield_t::DoorOpened` / `DoorClosed` [vtable `+0x3c` / `+0x40`, 0x1000d2bf / 0x1000d2e8] → `ChangeRoomStatus` [0x1000d17e], called through `n3RoomMonitor_t::DoorOpened/DoorClosed` [0x10013561 / 0x10013910] by
 `Door_t`'s open / close (`FUN_1007ef56` / `FUN_1007ef90`, [GC], the door's room link `+0x1d0`). This is **not** `Door_t::CanPass` (movement, `Collision::set_door_passable`): `Collision::set_door_open` /
 `door_open_between` / `pos_to_room` carry it (`camera_views::door_closed`, `Sight::door_closed`). **A dungeon link without a registered door stays closed for the camera forever** (nothing else writes the flag).
-`dynels_doors::Effect::RoomOpened/RoomClosed` must call `set_door_open` (the caller's job, next to `set_door_passable`).
+`dynels_doors::Effect::RoomOpened/RoomClosed` call `set_door_open` through `Player::door_rooms` (next to `set_door_passable`, docs/zone/collision.md §5).
 With no index (-1) and none selected for `+0x224` = 1.2 s since the last automatic pick (`+0x220` starts at 20 s) `FUN_10021921` selects entry 0 on its own (an empty list drops the attractor). `Views::tick`, `Views::prev`.
 
 **Data.** Playfield record (rdb 1000001), per zone / room: `u32 n` (< 1000), n × { vec3 pos, quat rot, vec3 target (version ≥ 6, else = pos), f32 range } =

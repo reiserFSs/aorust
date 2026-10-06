@@ -98,6 +98,16 @@ pub struct CatMesh {
     pub submeshes: Vec<SubMesh>,
     pub col_spheres: Vec<ColSphere>,
     pub attractors: Vec<Attractor>,
+    /// The torso collision sphere the resource wrapper `FUN_10071ae2` packs into one `u32` after the part table (`FUN_1006aab4`: four
+    /// signed bytes `c`, each `0.05 c + 6e-6 c^3` (`FUN_1006aa89`); byte 0..2 = x, y, z, byte 3 = radius): `n3VisualDynel_t::UpdateCollision`
+    /// (N3 0x19be4) takes it as the body sphere (`VisualCATMesh_t::GetTorsoSphereRadi` DisplaySystem 0x72c22).
+    pub torso_sphere: ColSphere,
+}
+
+/// `FUN_1006aa89` (DisplaySystem 0x1006aa89): one signed byte of a packed sphere.
+fn unpack_sphere_byte(b: u8) -> f32 {
+    let c = b as i8 as f32;
+    c * 0.05 + 6.0e-6 * c * c * c
 }
 
 const PART_STRIDE_MAGIC: u32 = 1009;
@@ -123,7 +133,8 @@ impl CatMesh {
             let name = r.name32()?;
             parts.push(Part { name, texture: r.u32()?, env_texture: r.u32()?, alpha_aux: r.u32()? });
         }
-        r.u32()?; // unidentified word between the table and the stream (varies per record, ignored by the reader)
+        let w = r.u32()?.to_le_bytes().map(unpack_sphere_byte);
+        let torso_sphere = ColSphere { center: [w[0], w[1], w[2]], radius: w[3], bone: 0 };
         ensure!(r.u32()? == 4, "file is not a CATMesh");
         let version = r.u32()?;
         if version != 0x104 {
@@ -206,7 +217,7 @@ impl CatMesh {
         }
         // What follows is either 12 zero bytes or a progressive-mesh table (`vertex_reorder`, `indices`,
         // `neighbours`, `splits`, `catindices`) used for LOD only; the full-detail mesh above is complete.
-        let me = Self { root, parts, signature, materials, spheres, bones, submeshes, col_spheres, attractors };
+        let me = Self { root, parts, signature, materials, spheres, bones, submeshes, col_spheres, attractors, torso_sphere };
         me.check().context("inconsistent CATMesh")?;
         Ok(me)
     }

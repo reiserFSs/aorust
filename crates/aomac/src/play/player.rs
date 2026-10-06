@@ -69,6 +69,8 @@ pub(super) struct Player {
     view_distance: f32,
     /// The left/right press that went to the GUI: its release must not reach the controls.
     gui_press: [bool; 2],
+    /// The zone's doors were handed to this collision world once ([`Player::door_rooms`]).
+    doors_synced: bool,
     game: Vec<Cmd>,
     /// World clicks `Controls` accepted (movement <= 0.02), for the interaction layer (`interact_play.rs`).
     clicks: Vec<ao_gui::MouseButton>,
@@ -80,6 +82,14 @@ pub(super) struct Player {
     fight: Option<FightLevels>,
 }
 
+/// The state of the door at scene position `pos` into its room link (nothing for a door that links no rooms, `0xffff` = leads nowhere).
+fn set_door(c: &mut Collision, pos: [f32; 3], open: bool, passable: bool) {
+    if let Some((a, b)) = c.door_link_from_pos(pos).filter(|&(_, b)| b != 0xffff) {
+        c.set_door_open(a, b, open);
+        c.set_door_passable(a, b, passable);
+    }
+}
+
 impl Player {
     /// `None` until the zone knows the own `SimpleCharFullUpdate`.
     pub fn new(dir: &Path, zone: &Zone, playfield: u32) -> Option<Self> {
@@ -89,6 +99,7 @@ impl Player {
             let avatar = Avatar::new(&store, dir, zone.char_id, u)?;
             let collision = Collision::load(&store, playfield).map_err(|e| eprintln!("collision {playfield}: {e:#}")).ok();
             let mut movement = Movement::new(u.pos, u.yaw().unwrap_or(0.0), u.run_speed);
+            movement.set_body_radius(avatar.body_radius());
             if let Some(c) = &collision {
                 if let Some(g) = c.ground(flip(u.pos)) {
                     movement.teleport([u.pos[0], g + FOOT_CLEARANCE, u.pos[2]], u.yaw().unwrap_or(0.0));
@@ -119,6 +130,7 @@ impl Player {
                 lens_set: false,
                 view_distance: camera::VIEW_DISTANCE,
                 gui_press: [false; 2],
+                doors_synced: false,
                 game: Vec::new(),
                 clicks: Vec::new(),
                 transient: None,
@@ -154,6 +166,19 @@ impl Player {
     /// A held clip (death) is playing.
     pub fn holding(&self) -> bool {
         self.transient.as_ref().is_some_and(|t| t.1)
+    }
+
+    /// `Door_t` open / close and lock changes of the zone's doors into the collision world: the door's room link
+    /// (`n3Room_t::GetDoorLinkFromPos` through `Door_t::LinkDoorToRooms`) gets the open flag (`n3RoomMonitor_t::DoorOpened/Closed`, read by the
+    /// camera's attractor test) and the pass flag (`Door_t::CanPass`, read by `VetoRoomTransition`).
+    fn door_rooms(&mut self, zone: &mut Zone) {
+        if !std::mem::replace(&mut self.doors_synced, true) {
+            zone.world.resync_doors(); // doors that changed before this collision world existed
+        }
+        let Some(c) = self.collision.as_mut() else { return };
+        for (pos, open, passable) in zone.world.take_door_rooms() {
+            set_door(c, pos, open, passable);
+        }
     }
 
     /// `FUN_100585ee` [GC], run every frame by the control dynel's `Run` (`FUN_1005b016`): the feet position inside the teleportal of its zone
@@ -295,6 +320,7 @@ impl Player {
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
         }
+        self.door_rooms(zone);
         self.teleport_try(dt, zone);
         let world = Ground(self.collision.as_ref());
         let out: Vec<Frame> = self.movement.update(dt, &world).iter().map(|m| n3_frame(0, self.char_id, char_dc_move(self.char_id as i32, m))).collect();
@@ -380,10 +406,10 @@ impl Player {
                 }
                 OwnEvent::SetPos { pos, stop } => self.movement.set_pos(pos, stop),
                 OwnEvent::Impulse { delta, time } => self.movement.impulse(delta, time),
-                OwnEvent::Follow { mode: m, pos, path } => {
+                OwnEvent::Follow { mode: m, target, pos, path } => {
                     self.movement.follow_place(pos);
                     if !self.follow_gated() {
-                        self.movement.follow_target(m, &path);
+                        self.movement.follow_target(m, &path, target);
                     }
                 }
                 OwnEvent::Action(a) => match a {
@@ -465,4 +491,31 @@ fn segment_clear(c: &Collision, a: [f32; 3], b: [f32; 3]) -> bool {
         let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
         c.sphere_hit(p, 0.2).is_none()
     }) && c.ground([b[0], b[1] + 3.0, b[2]]).is_none_or(|g| g < b[1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real data (skips without the client): the door of ICC Holodeck Alien Training (6131) found by its position opens / locks its room link.
+    #[test]
+    fn a_door_position_sets_its_room_link() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() {
+            return;
+        }
+        let store = RecordStore::open(&dir).unwrap();
+        let mut c = Collision::load(&store, 6131).unwrap();
+        let s = ao_formats::playfield::load_playfield(&store, &dir, 6131).unwrap().spawn.unwrap();
+        let (pos, (a, b)) = (-300..=300)
+            .flat_map(|x| (-300..=300).map(move |z| [s[0] + x as f32, s[1], s[2] + z as f32]))
+            .find_map(|p| c.door_link_from_pos(p).filter(|l| l.1 != 0xffff).map(|l| (p, l)))
+            .expect("the playfield has a door");
+        let (au, bu) = (a as usize, b as usize);
+        assert!(!c.door_open_between(au, bu) && c.room_transition_allowed(a as i32, b as i32));
+        set_door(&mut c, pos, true, false); // an open door the character may not pass (locked)
+        assert!(c.door_open_between(au, bu) && !c.room_transition_allowed(a as i32, b as i32));
+        set_door(&mut c, pos, false, true);
+        assert!(!c.door_open_between(au, bu) && c.room_transition_allowed(b as i32, a as i32));
+    }
 }
