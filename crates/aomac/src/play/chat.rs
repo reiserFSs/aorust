@@ -484,3 +484,16 @@ impl Chat {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// text.mdb 10001 `ChatTellMsgToField` is the client's own outgoing-tell template (pool offset 269621, preceded by " joined the group.").
+    #[test]
+    fn tell_template_key_is_in_the_real_db() {
+        let Some(h) = std::env::var_os("HOME") else { return };
+        let Ok(db) = TextDb::load(&std::path::Path::new(&h).join("Games/ProjectRubiKa/client")) else { return };
+        assert_eq!(db.by_key(10001, "ChatTellMsgToField").as_deref(), Some("To [%s]: "));
+    }
+}
