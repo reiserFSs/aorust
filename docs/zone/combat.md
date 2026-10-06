@@ -52,3 +52,16 @@ Key ids were computed from the shipped CharPrefs.xml (`provider_hash` of each `A
   GUI `Shell` font at the lower third of the screen (own) / above the head (others), colours and life/rise speed from the client.
 * Combat music `flag` input (`dynel+0x21c`, writer unknown) is fed as false; stat 421 as 0 (stored, never read by a decision).
 * Hit reaction (`imp-*`) and miss/dodge animations: selector not found (combat-anim.md §8).
+
+## Live result (Ithaca, Testy lvl 1, playfield 4582 beach; headless `live_walk` steps, no desktop capture)
+
+* TAB selects the nearest hostile (Surf Lizard 1026757, `side 3`), Q sends `AttackIIR_t` (22 B, `28494070 0000c350 00006584 00 | 0000c350 000faac5 00`,
+  byte-identical to `combat::attack`); the Surf Lizard, Shore Snake, Surf Lizard and Beach Leet were tried: the server answers every time with
+  `CharacterAction` 0x93 (FormatFeedback case 0x31) and 0x76 with `identity_a.instance = 6`; the jump table at 0x1005f0e7 maps that to
+  `Feedback_PvpNotAllowedInThisDistrict` (the doc's earlier address-order guess for 11 was wrong; the table is now read out in `module.rs`).
+  The client clears the `+0x79` guard and prints both texts. Capture: `docs/captures/zone_attack_refused_ithaca.rec` (test `live_refusal_capture`).
+  So no fight of our own character could be started on this beach (district rule of the server, not the client); the NPC-vs-NPC fights all around
+  (hundreds of Attack / AttackInfo / StopFight relays) did drive the fight state, floating numbers and the swing clips.
+* The Arrival Hall (Aomacvolk, pf 4604) has only friendly NPCs.
+* [UNRESOLVED] Whether a different district (the junkbot area) accepts the attack: the autopilot route to the junkbots left the walkable
+  area, so it was not exercised. Everything after a started fight (echo, StopFight, swing, music) is covered by replays only.

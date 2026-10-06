@@ -507,6 +507,28 @@ mod tests {
         assert_eq!(sent(&mut m).len(), 1, "the guard is clear again");
     }
 
+    /// The first live attack (docs/captures/zone_attack_refused_ithaca.rec, Testy on a Surf Lizard): our encoder reproduces the
+    /// client frame byte for byte and the server's 0x93 / 0x76 answer yields the original's two texts.
+    #[test]
+    fn live_refusal_capture() {
+        let rec = include_str!("../../../../../docs/captures/zone_attack_refused_ithaca.rec");
+        let (mut sent_n, mut m) = (0, Module::with_texts(Box::new(Fixed::new()), 25988));
+        for l in rec.lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            let f = Frame::decode_with(&b, false).unwrap().unwrap().0;
+            if dir == ">" {
+                sent_n += 1;
+                assert_eq!(f.payload, net::attack(25988, Identity { kind: DYNEL_CHAR, instance: 0xfaac5 }, 0));
+            } else {
+                m.on_frame(&f);
+            }
+        }
+        assert_eq!(sent_n, 1);
+        assert_eq!(m.take_feedback(), vec!["Feedback_StartingAttackFailed", "Feedback_PvpNotAllowedInThisDistrict"]);
+    }
+
     #[test]
     fn attack_without_target_is_refused() {
         let (mut m, mut z, _) = primed();
