@@ -236,6 +236,10 @@ nothing but arm the double click), so the original's `SetTarget` on an item (`N3
 `use_object(identity)` (the raw `GenericCmd` 3, used after Yes), `Interact::can_of(&zone, identity) -> Option<i32>`, `take_feedback()` (refusal keys; `Play::interact_frame` prints them from chat category 110),
 `take_outbox()`, and (`cfg(test)`) `loot_dump(&mut gui)`. `interact_use::decide(can)` / `CAN_PICK_UP` / `CAN_USE` / `CAN_CONFIRM`.
 
+### 8.7 An item released over a world object (`FUN_100cb081` [GUI], `N3Msg_UseItemOnItem` [GC 0x100267e0] / `UseItemOnCharacter` [GC 0x100268af])
+Object under the pointer when a carried bag item is released (`InputConfig_t+0xb0`): ground (`0x9c47`) -> `N3Msg_DropItem`; a character (50000) -> `GenericCmd_t` cmd 0x20; any other object -> cmd 5, both with
+`UseItemOnItemActionData_t{flag 0, actor = own, item, target}`. Ours: `Play::interact_mouse` stores the pick, `hud_stats/item_ui.rs` `Action::UseOn`. [LIVE] works (§12.1).
+
 ## 9. The container (loot) window of corpses
 Code: `interact_loot.rs`, `interact_use.rs::{watch_objects, use_out}`. Test: `interact_use::tests::corpse_loot_window_opens_with_the_flag_and_a_double_click_takes_an_item`, `interact_loot::tests`.
 
@@ -375,3 +379,29 @@ Code: `interact_trade.rs` (window + flow), `interact_chat.rs` (bar, dock slots),
   credits)`, `trade_decline(gui, zone)`; non-test: `trade_drop`, `trade_wants`, `take_cash_delta`, `take_info_urls`. Tests: `interact_trade::tests` (flow with synthetic Knubot frames, wire frames, drops, double click,
   Cash clamp, windows closed with the dialogue), `interact_chat::tests` (bar art ids, enable flags, clicks, splitter drag through real pointer events and the clamp), `n3::knubot::tests::trade_wire_layout`.
   `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac npc_dialogue_render` writes `npc_answers.png` (bullets, green answers, 10 px hanging indent, bar below, splitter line) and `npc_trade.png`.
+
+## 12. Live results (PRK "Ithaca", Aomacvolk, 2026-10-06) [LIVE]
+
+Harness steps (`flow/live.rs`): `props=<r>`, `use=` / `ruse=<kind>:<inst>` (default action / right click), `useon=<slot hex>:<kind>:<inst>`, `talk`, `answer`, `btn=<i>`, `tadd=slot:<hex>`, `taccept`, `loottake=<cell>`, `lootid=`, `grid`, `inv`.
+Captures (login traffic excluded): `docs/captures/zone_npc_dialogue_ithaca.rec`, `zone_npc_trade_ithaca.rec`, `zone_use_object_ithaca.rec`; replay tests `crates/ao-net/tests/interact_captures.rs`.
+
+### 12.1 Off the ICC beach (pf 4582 -> 4833 -> pf 800 Borealis)
+1. Plateau door (`Door_t` 0xC748, Can 1032, (936.1, 47.6, 888.4)): right click = `UseItem` (echo), walking through it enters **pf 4833 "ICC Shuttleport"** (its door at (185, 6.1, 144) leads back).
+2. Dialogues: Teleporter Technician (4833, instance 1001786) "use it on the portal to Borealis"; Travis Molen -> recruiters / Neutral Observer; Neutral Observer "use this access card to activate the teleporter".
+3. The card is the starting-bag **key item 249721** (slot 0x44). Released over a teleporter prop (0xC73D, pf 4833) it is `UseItemOnItem` (GenericCmd cmd 5, §8.7). Wrong teleporter: `FormatFeedback`
+   "This is not the correct key"; wrong item: "You can not use this item on the teleporter"; the right one (instance -1073474847, (189.5, 6.3, 190.6)) redirects to **pf 800 (Borealis)** at (679.6, 72.8, 476.7). ICC cannot be re-entered.
+   Newland is not offered to a level-1 character; Borealis is (three faction recruiters).
+4. Other 0xC73D objects are billboards (echo only); 0xC773 is a mail terminal (chat line "Unknown entity used: MailTerminal").
+
+### 12.2 NPC dialogue and trade
+* Server Knubot frames carry header flag byte 1, the client's own 0 (`encode` writes 0; the replay tests patch the byte).
+* `Open` flags: Technician, Travis, Observer, Clan Recruiter b20=b21=false; vendors Antonio Stacklund (plateau) and Aleksei Innokenti (Borealis) b21=true (trade button). b20 never set.
+* Trade button -> `StartTrade` (empty text) -> server `StartTrade{1, "Place your items in the trade window."}` -> trade window (screenshot checked). Add item `Trade{op 0, zero, item}`; accept `FinishTrade{flag 0, value 0}`;
+  Aleksei answers `RejectedItems{[({low,low}, 3, 1234567890)], 0}` + "I don't think you have anything I want.".
+* Walking away: `Close{5, "You are too far away from <npc> to continue this conversation."}`.
+
+### 12.3 Objects
+* Vending machine (0xC75B): echo, then `ShopUpdateIIR_t` (key 58362220, item list) and a `TradeIIR_t` op-2 pair with the machine (buy UI: see the shop section if present).
+* Corpse (0xC76A, "Remains of Uncle Pumpkin-Head"): echo + `InventoryUpdateIIR_t` (flag set) -> loot window (screenshot checked). Double click sends `MoveItemToInventory({0x6a, cell}, any)`; the server ignored it and
+  the `entry.id` identity for a corpse another player killed. [UNRESOLVED] taking from our own kill is untested (no kill was reachable).
+* Grid terminal / whompah: none in pf 4582/4833/800, `GridDestinationSelect` never received [UNRESOLVED-live]. Player trade needs a second player [UNRESOLVED-live].
