@@ -650,6 +650,10 @@ impl Movement {
     pub fn speed(&self) -> f32 {
         (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt()
     }
+    /// `Vehicle +0x170` reference speed of the current mode (m/s), the clip rate divisor.
+    pub fn ref_speed(&self) -> f32 {
+        self.ref_speed
+    }
     /// `Vehicle +0x3C` maximum speed of the current mode (m/s).
     pub fn max_speed(&self) -> f32 {
         self.max_vel
