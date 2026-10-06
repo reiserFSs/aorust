@@ -175,6 +175,24 @@ impl Chat {
         std::mem::take(&mut self.swin.closed)
     }
 
+    /// Live harness hook (`buddyadd=<name>`, `buddyrm=<name>`, `lftsearch=<side>:<profession>:<location>` with the dropdown item ids,
+    /// 7 / 0x10 = any): the same `Req`s the Friends / Team Search windows emit. `false` = the name's id is not known yet (a 0x15 lookup was sent).
+    #[cfg(test)]
+    pub fn live_social(&mut self, gui: &mut Gui, step: &str, arg: &str, zone: &Zone, texts: &TextDb) -> bool {
+        let req = match step {
+            "buddyadd" | "buddyrm" => {
+                let Some(id) = self.net.lookup_open(arg) else { return false };
+                if step == "buddyadd" { Req::Befriend(id) } else { Req::RemoveFriend(id) }
+            }
+            _ => {
+                let n: Vec<u32> = arg.split(':').map(|x| x.parse().expect("side:profession:location")).collect();
+                Req::LftSearch { side: n[0], profession: n[1], location: n[2] }
+            }
+        };
+        self.social_req(gui, req, zone, texts);
+        true
+    }
+
     #[cfg(test)]
     pub(super) fn social_ui_event_for_test(&mut self, gui: &mut Gui, ev: &Event, texts: &TextDb) -> bool {
         let zone = Zone::default();

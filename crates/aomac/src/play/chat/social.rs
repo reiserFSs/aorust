@@ -406,11 +406,13 @@ impl Lft {
         self.cooldown = (self.cooldown - dt).max(0.0);
     }
 
-    /// `HandleLFTMessage` 0x10087069.
+    /// `HandleLFTMessage` 0x10087069 + the slot `FUN_100efe4b`: status 0 raises the candidate signal with the packet's fields, status 2 raises it with id 0;
+    /// the slot clears `busy` (`+0x7c`) for id 0 and adds a row otherwise. **Live (Ithaca 2026-10-06)**: an empty search is answered by ONE status-0 packet with
+    /// every field zero (id 0, empty strings), i.e. status 0 / id 0 is the end marker too (docs/chat/live.md).
     pub fn on_reply(&mut self, r: &LftReply) {
         match r.status {
+            0 | 2 if r.id == 0 || r.status == 2 => self.busy = false,
             0 => self.results.push(r.clone()),
-            2 => self.busy = false,
             _ => {}
         }
     }
@@ -568,6 +570,69 @@ mod tests {
         assert_eq!(l.set(true, "raid"), ChatCmd::LftOn("raid".into()));
         assert_eq!(l.set(false, "ignored"), ChatCmd::LftOff);
         assert_eq!(lft_professions().count(), 14);
+    }
+
+    /// Live capture (Ithaca 2026-10-06, docs/captures/chat_social_ithaca.rec, two sessions): sent frames re-encode byte for byte,
+    /// received ones decode and drive the buddy folders / the LFT state like the real server's answers did.
+    #[test]
+    fn live_social_capture_replay() {
+        let name = |id: u32| match id {
+            0x6584 => "Testy",
+            0x7dfe => "Beinrangel",
+            0x7bf4 => "Battle",
+            _ => "",
+        };
+        let names = |id: u32| name(id).to_owned();
+        let e = env(&names, &text, &no, InviteAction::Dialog);
+        let (mut s, mut evs, mut sent) = (Social::default(), vec![], vec![]);
+        for l in include_str!("../../../../../docs/captures/chat_social_ithaca.rec").lines().filter(|l| !l.starts_with('#')) {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next(), p.next().unwrap(), p.next().unwrap());
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            assert_eq!(b.len(), 4 + u16::from_be_bytes([b[2], b[3]]) as usize);
+            if dir == "<" {
+                evs.push(ao_net::chat::decode(u16::from_be_bytes([b[0], b[1]]), &b[4..]).unwrap());
+            } else {
+                sent.push(hex.to_owned());
+            }
+        }
+        // C2S layouts as the client sends them (permanent add `D = {1}`, remove, invite / kick / leave, LFT on / off / query)
+        let enc = |c: ChatCmd| ao_net::chat::encode(&c).unwrap().iter().map(|x| format!("{x:02x}")).collect::<String>();
+        for (c, n) in [
+            (ChatCmd::BuddyAdd { id: 0x6584, permanent: true }, 1),
+            (ChatCmd::BuddyRemove(0x6584), 1),
+            (ChatCmd::LftOn("aomac test".into()), 1),
+            (ChatCmd::LftOff, 1),
+            (ChatCmd::LftQuery { side: u32::MAX, professions: u32::MAX, location: 2 }, 2),
+            (ChatCmd::LftQuery { side: 1, professions: 1 << 6, location: 1 }, 1),
+            (ChatCmd::PrivInvite(0x6584), 1),
+            (ChatCmd::PrivKick(0x6584), 1),
+            (ChatCmd::PrivPart(0x6584), 1),
+        ] {
+            let h = enc(c.clone());
+            assert_eq!(sent.iter().filter(|x| **x == h).count(), n, "{c:?}");
+        }
+        // the server echoes S2C_ADD_BUDDY with an EMPTY data block (we sent `{1}`) and the real online flag; no reply for ourselves
+        let adds: Vec<_> = evs.iter().filter_map(|e| if let ChatEvent::BuddyAdd { id, online, data } = e { Some((*id, *online, data.clone())) } else { None }).collect();
+        assert_eq!(adds, [(0x6584, 0, vec![]), (0x7dfe, 1, vec![]), (0x7bf4, 1, vec![])]);
+        let rems: Vec<_> = evs.iter().filter_map(|e| if let ChatEvent::BuddyRemove(i) = e { Some(*i) } else { None }).collect();
+        assert_eq!(rems, [0x6584, 0x82e8, 0x7dfe, 0x7bf4]);
+        for e2 in evs.iter().filter(|e| matches!(e, ChatEvent::BuddyAdd { .. })).take(3) {
+            s.on_event(e2, &e);
+        }
+        assert_eq!((s.nodes[&0x6584].folder(), s.nodes[&0x7dfe].folder(), s.nodes[&0x7bf4].folder()), (Folder::Offline, Folder::Online, Folder::Online));
+        assert_eq!((s.nodes[&0x6584].icon(), s.nodes[&0x7dfe].icon()), (0xd8, 0xd7));
+        // an empty search answer = one status-0 packet with id 0 and all fields empty: no row, the search ends
+        let lft: Vec<_> = evs.iter().filter_map(|e| if let ChatEvent::LftReply(r) = e { Some(r.clone()) } else { None }).collect();
+        assert_eq!(lft.len(), 3);
+        let mut l = Lft::default();
+        for r in &lft {
+            assert_eq!(*r, LftReply { status: 0, id: 0, name: String::new(), level: 0, playfield: 0, side: 0, profession: 0, description: String::new() });
+            assert!(l.search(7, 0x10, 2, true).is_some());
+            l.on_reply(r);
+            assert!(!l.busy && l.results.is_empty());
+            l.tick(3.1);
+        }
     }
 
     /// The strings above are the real text.mdb ones; the dropdown / column labels come from categories 2003..2005 and 100.

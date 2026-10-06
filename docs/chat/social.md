@@ -27,8 +27,8 @@ element `0xd` words) and, when it changed (`Client_c+0x138` flag, poll bit 0x800
 
 | S2C | name (client string) | fields | notes |
 |---|---|---|---|
-| 0x28 | S2C_ADD_BUDDY | `I D` id, data | known id: only `Buddy_t+0x20` (online flag, `I` is the second field of the packet) is updated; unknown id: appended (`FUN_1016ddc3`). Sets the dirty flag. |
-| 0x29 | S2C_REM_BUDDY | `I` | removes the entry |
+| 0x28 | S2C_ADD_BUDDY | `I D` id, data | known id: only `Buddy_t+0x20` (online flag, `I` is the second field of the packet) is updated; unknown id: appended (`FUN_1016ddc3`). Sets the dirty flag. **Live**: `id u32, online u32, data = u16 len + bytes`; the server's answer to a permanent add (`D = {1}`) carries an EMPTY data block (`0028 000a 00006584 00000000 0000`), online = 0 / 1 as the character's real state. |
+| 0x29 | S2C_REM_BUDDY | `I` | removes the entry. **Live**: echoed as `0029 0004 <id>` right after our `0x29 I` (also for an id that never had an add reply) |
 | 0x32 | PRIVGRP_INVITED | `I` | `PrivateGroupAction{0, id, name(id), id, name}` |
 | 0x33 | PRIVGRP_KICKED | `I` | PGA(1) + `GroupAction(part, 0xE:id)` + `GroupMessage` text `LeftPrivateGroup` (+ name) |
 | 0x37 | PRIVGRP_JOINED | `I I` group, who | who == own id: `GroupAction(join, 0xE:group, name(group), flag 1)` + text `YouJoinedPrivateChat` + name; else text name + `JoinedGroup` |
@@ -97,8 +97,9 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
   `anywhere(1)`, `Rubi-Ka(2, default)`, `Shadowlands(3)` (literals); Profession ids 1..15 without 13 (category 2004) + `any` (0x10, text `GetText(100,"any")`, default).
 * **Search** (`FUN_100ef912`): ignored while busy (`+0x7c`) or while the 3 s `EventTimer` (`Start(3000000)`) runs; clears the list; with a chat client: busy = true, timer, `0x5de IIII`
   = (side item id, 7 -> -1; `1 << profession id`, 0x10 -> -1; Location *selected index*; -1). Busy ends with the status-2 reply.
-* Reply (`HandleLFTMessage`): status 0 -> candidate signal (GlobalSignals+0x1f0): id, name, level, profession (`byte +0x35`), playfield, side (`byte +0x34`), description; status 2 -> end marker (id 0:
-  clears busy); other statuses ignored. Handler `FUN_100efe4b` builds `LFTCandidateItem_c` (`FUN_100f1456`): name, level, `GetText(2005, side)`, `GetText(2004, profession)`,
+* Reply (`HandleLFTMessage`): status 0 -> candidate signal (GlobalSignals+0x1f0): id, name, level, profession (`byte +0x35`), playfield, side (`byte +0x34`), description; status 2 -> the same
+  signal with id 0 and empty fields; other statuses ignored. The slot `FUN_100efe4b` clears busy (`+0x7c`) when **id == 0** and adds a row otherwise (so status 0 / id 0 ends the search too;
+  live, section 9: an empty search is answered by exactly one status-0 packet, every field zero; fixed in `Lft::on_reply`, before the fix the port showed an empty row and stayed busy). Handler `FUN_100efe4b` builds `LFTCandidateItem_c` (`FUN_100f1456`): name, level, `GetText(2005, side)`, `GetText(2004, profession)`,
   `N3Msg_GetPFName(playfield)` ("Not found"), description.
 * **Invite** (`FUN_100eff95`): `N3Msg_TeamJoinRequest(Identity(50000, id), false)` then the line `JoinTeamRequestSentTo` + name (category 100) as System text; the button is disabled
   when in a team and not its leader (`FUN_100efb0a`). **Tell** (`FUN_100efa55`): `OpenTellWindow(name, id)`.
@@ -123,6 +124,30 @@ private group texts, LFT search / reply rules, real text db strings; GUI tests s
 ## 9. Live check (Ithaca, 2026-10-06, offscreen harness, `say=/tell Testy` = empty tell)
 
 `> 0015 0007 "Testy"` lookup, `< 0015 {0x6584, "Testy"}`, then `> 0028 0007 00006584 0001 00` = **S2C-visible C2S buddy add with D = {0}** (the temporary entry, bytes exactly as `ChatCmd::BuddyAdd{permanent:false}`); the server answered
-no `0x28` within the 10 s that followed (the character is offline / the server does not echo temporary entries to us: **UNRESOLVED**, no permanent add was sent, so the real `S2C_ADD_BUDDY` layout is
-still only confirmed by the client's own parser `FUN_1016dd..`, not by a live capture). The in-world screenshot shows the tell window "Testy" (tab title, text area, input bar) at its default position.
-`LftQuery` / private-group requests were not sent live (no UI step in the harness).
+no `0x28` (temporary entries are not echoed; the permanent add of 9.1 is, so the `S2C_ADD_BUDDY` layout is confirmed live). The in-world screenshot shows the tell window "Testy" (tab title, text area, input bar) at its default position.
+
+### 9.1 Confirmation run (2026-10-06, steps `buddyadd` `buddyrm` `lftsearch` `friendswin` `lftwin` `say=/lft ..` `say=/invite ..`, two sessions of ~55 s)
+
+Capture (social frames only, no credentials): `docs/captures/chat_social_ithaca.rec`; replay test `play::chat::social::tests::live_social_capture_replay` (re-encodes every sent frame, decodes every
+received one, feeds `Social` / `Lft`). Observed (ms since start; `>` sent, `<` received):
+
+| step | frames | result |
+|---|---|---|
+| `buddyadd=Testy` (offline), after the temporary add (`D = {0}`) of section 9 | `> 0028 0007 00006584 0001 01`, `< 0028 000a 00006584 00000000 0000` | online 0, data empty -> "Offline Friends (1)", red icon 0xd8. The earlier temporary add (`D={0}`) never got an answer. |
+| `buddyadd=Beinrangel` / `Battle` (online players of the name table) | `< 0028 000a 00007dfe 00000001 0000`, `< ... 00007bf4 00000001 0000` | online 1 -> "Online Friends (2)", green icons 0xd7, sorted by name (Battle, Beinrangel) |
+| `buddyadd=Aomacvolk` (own id 0x82e8) | `> 0028 0007 000082e8 0001 01` | **no answer** for the 26 s until the session's next step, no list entry; the following remove was still echoed |
+| `buddyrm=<id>` | `> 0029 0004 <id>`, `< 0029 0004 <id>` (~110 ms) | entry removed, folder counts back to 0 |
+| `say=/lft aomac test` / `say=/lft` | `> 05dc 000c 000a "aomac test"`, `> 05dd 0000` | **no server reply** to either; local lines `Looking for team: ON` / `OFF` (screenshot) |
+| `lftsearch=7:16:2` (any, any, Rubi-Ka) | `> 05de 0010 ffffffff ffffffff 00000002 ffffffff` | `< 05dd 0013 00 00000000 0000 00000000 00000000 00 00 0000`: **one** status-0 packet, id 0, empty name / description = no candidates (nobody else was LFT) |
+| `lftsearch=1:6:1` (clan, Adventurer, "anywhere") | `> 05de 0010 00000001 00000040 00000001 ffffffff` | the same single empty reply |
+| `say=/invite Testy` (offline) / `/kick Testy` / `/leave Testy` | `> 0032 0004 00006584`, `> 0033 0004 ...`, `> 0035 0004 ...` | no reply of any kind (no 0x32..0x3a, no system text) within 3 s each; `/invite Aomacvolk` (own name) is rejected locally (`CantInviteYourself`), nothing is sent |
+
+Screenshots (offscreen harness, inspected): the Friends window (169x215, title tab "Friends", the four folders with counts, the entries with red / green icons) and the Team Search window (labels, three
+dropdowns, Search button, column headers, `Invite to team` / `Send tell` buttons, "Looking for team" check box + description field) match the layouts of section 3 / 6. Before the end-marker fix the empty reply
+produced one bogus row (`0 neutral ... Not found`) and left the Search button greyed; after it the list stays empty and the button is enabled again.
+
+**Not verifiable with one account** (documented, not guessed): the S2C private group packets (0x32 invited / 0x33 kicked / 0x37 joined / 0x38 parted / 0x39 message / 0x3a declined) need a second
+online character; the server sent none for an offline target, and inviting a stranger was not done (rude, and a stranger's accept would not be controllable). Their layouts stay as read from the client's dispatcher
+(`FUN_1016d6dc`) with the unit tests of `ao_net::chat`. A non-empty LFT result row (levels / playfield / side / profession bytes) was likewise not seen because no other character had LFT on; the
+`BISIIBBS` row decoding stays covered by the client's format string and the `ao_net` byte test. The data block of a permanent buddy is empty on the server's side, so `Buddy_t.data == {0}` as the
+temporary marker is only ever produced by the server for the temporary add we send (which it did not answer at all).

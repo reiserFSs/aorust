@@ -33,7 +33,7 @@ Note: a plain line (no `/say`) from `run_line` without a window output group sen
 
 * Vicinity/shout/whisper from other players arrive on the chat server as 0x22/0x23 (decoded, group routing per GUI 0x10086728); the zone N3 text classes (`ChatTextIIR_t` …) did not occur in the session.
 * Outgoing-tell echo text, tell windows (per-sender windows) and the reply list: tells are routed to the "Tell Messages" group.
-* Private groups (`/invite` …), buddy list, `/cc`, LFT: decoders exist (`ao_net::chat`), no UI.
+* Private groups (`/invite` …), buddy list, LFT: UI exists (docs/chat/social.md); live results in section 9.1 there. Only the S2C private group packets and non-empty LFT rows are not live-verified (need a second character), `/cc` is not verified.
 
 ## Reconnect after a dropped connection (live, 2026-10-06)
 
@@ -49,3 +49,9 @@ Timestamps (s since test start, `AOMAC_LIVE_STEPS=wait=20,chatdrop,wait=14,say=/
 
 After the reconnect the chat server replays the MOTD (shown again in the Default Window) and our `/say` is echoed (`0x22`). Later back-offs 8.2 s / 16.4 s / 32.8 s are covered by `backoff_matches_client` only.
 The bound of 10 attempts is our own (the client's loop is unbounded in the decompile read so far).
+
+## Social layer re-run 2026-10-06 (buddy list, LFT, private group requests)
+
+Live steps `buddyadd=<name>`, `buddyrm=<name>`, `lftsearch=<side>:<profession>:<location>`, `friendswin=on|off`, `lftwin=on|off` (plus `say=/lft ..`, `say=/invite|kick|leave ..`) drive the same `Req`s / command lines as the windows.
+Capture `docs/captures/chat_social_ithaca.rec`, test `play::chat::social::tests::live_social_capture_replay`, details and the table of observed frames: docs/chat/social.md section 9.1.
+Findings: S2C 0x28 = `id, online, empty data`; 0x29 echoes; /lft on / off get no reply; an empty LFT search is one all-zero status-0 0x5dd (id 0 = end marker, decoder logic fixed).
