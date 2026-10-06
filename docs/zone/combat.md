@@ -129,3 +129,9 @@ position on a hit (hit kind 3 / 4), only the swish (`SM_Sandy_Swish_punch`) on a
 * **Rifle fight vs Fresh Engineer**: lines "You hit Fresh Engineer for 4 points of **projectile** damage." (weapon stat 0x1b4 = 0x5a; bare hands print melee), own `combat: note 0xb` + `game sound 3130317467 ... 2 voice(s)`
   (the weapon's attack sound) per shot and the victim impact `game sound 2934702682 ... (material 7, size 1|2)` 0.4 s after a hit. The character died again (lvl 2, 40 HP vs a lvl 7 engineer).
 * Bare-hands sounds (`0xc1080179` swing sound, swish notes) were not re-run live after the wiring; rifle shots were.
+
+## Live: creation straight into the world, draw / holster (2026-10-06)
+* **Post-create flow fixed** (docs/screens.md §7): `ZoneHandoff` was swallowed by the creation module so `Zone::new` never ran, and `show_loading` discarded the loaded world. Live: `AOMAC_LIVE_NEW=Aomacmtfa:2:4` (Solitus Soldier) created and reached "in world" (Arrival Hall 205.2, 1.0, 255.8) in 20 s;
+  `AOMAC_LIVE_CHAR=Aomacvktq` (Atrox Enforcer, created earlier with sex 1) logs in, 60 / 60 HP, Atrox model in the Arrival Hall (frame inspected). After a session the login server answers error 106 for a few minutes (wait ~4 min).
+* **Wield stance** (live frames): out of a fight the worn rifle hangs at the side (`idle-2h`, 0x41e), unwearing returns to the plain idle with empty hands; draw / holster (`rifle-start/stop` lists 0x1a/0x1b) belong to fight start / stop (docs/zone/combat-anim.md §4), too short to catch at the harness frame rate.
+* **Other characters' `AppearanceUpdate`** (weapons, cloth, heads) now rebuild their model (docs/zone/avatar.md §5); only headless tests (`other_player_wields_and_unwields_live`).

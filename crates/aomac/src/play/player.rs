@@ -88,7 +88,8 @@ pub(super) struct Player {
     clip_scale: Option<f32>,
     /// The pose the movement role showed last frame (`None` before the first update).
     pose: Option<Pose>,
-    /// The character is in a fight (`idle-unarmed` stance while standing).
+    /// The AnimHolder's fight idle is on (`combat/glue.rs::stance`: set by the draw of a fight start, cleared by the holster of a fight stop); the
+    /// character then stands in the weapon's fight idle, bare-handed in the fighting stance.
     pub fighting: bool,
     /// District fight-mode data of the playfield (`fightmode.rs`).
     fight: Option<FightLevels>,

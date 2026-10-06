@@ -7,8 +7,8 @@ tests skip without the client). Labels: **[CODE]** read in the Ghidra decompile 
 ## 1. Pipeline: AbstractAnimID -> clip
 
 1. The game code never names clips. It asks for an **`AbstractAnimID_e`** (a small int) and the animation holder
-   (`AnimHolder_t`, `SimpleChar+0x1dc`; ctor `FUN_1003c525` [GC 0x1003c525], vtable 0x1015d580: `[1]` idle update `FUN_1003cad0`,
-   `[2]` `FUN_1003cc15`, `[3]`/`[4]` start/stop stance `FUN_1003c930`/`FUN_1003c9b2`, `[5]` **Play** `FUN_1003ca30`, `[6]` `FUN_1003c392`)
+   (`AnimHolder_t`, `SimpleChar+0x1dc`; ctor `FUN_1003c525` [GC 0x1003c525], vtable 0x1015d580: `[1]` idle update / fight start `FUN_1003cad0` (lists 0x10, 0x1a),
+   `[2]` fight stop `FUN_1003cc15` (list 0x1b), `[3]` wield pair `FUN_1003c930`, `[4]` `FUN_1003c9b2` (never called), `[5]` **Play** `FUN_1003ca30`, `[6]` `FUN_1003c392`; section 4)
    turns it into a clip with `FUN_1003c8b7` -> `FUN_1003c802` [GC 0x1003c802]:
    * loop `id -> FUN_10010ad1(id) -> ...` (stops on a cycle), at every step first **`FUN_1004570c(id)`** on the character's own
      anim multimap (NPC records: `NpcRecord.anims`, `docs/zone/npc.md`; random variant), then - only if `sex != 0 && breed != 6`
@@ -112,13 +112,45 @@ the slot holds the `DummyWeapon_t` of the martial-arts item the `SpecialAttackWe
 (Brawl, Dimach, Backstab, Bow special look the key up on the special attack's own item `FUN_100686d0(stat)+0xe4`.)
 
 ## 4. Idle / fight stance, hit, miss
-* Idle clip of a wielding char: AnimHolder vt[1] `FUN_1003cad0`: first present of the weapon slots 6, 8, 0 -> list **0x10** (random), else 0x78;
-  skipped unless `FUN_10059ac4()` is false; the clip is started at a time offset derived from the length of the list-0x1a clip. Stance start/stop (`FUN_1003c930`/`c9b2`): lists 0x1a/0x1b
-  (draw / holster; `FUN_1003c930`/`c9b2` take two ids each: play the first once, start the second). Walk/run with a 2H stance: lists 0x2a/0x2b (rifle/bazooka).
+* **AnimHolder stance entry points** (traced with Ghidra xrefs over Gamecode; `FUN_1003c930` / `FUN_1003c9b2` are only reachable through the vtable
+  0x1015d580 slots `[3]` / `[4]`, and a scan of every `CALL [reg+0xc]` / `[reg+0x10]` finds **one** caller function of `[3]` (`FUN_1009c858`, three call sites) and **none** of `[4]`
+  (`FUN_1003c9b2` is dead code); the lists 0x1a / 0x1b belong to the *other* two slots, which is what draws and holsters):
+  | slot | function | list | called by |
+  |---|---|---|---|
+  | `[1]` idle update | `FUN_1003cad0` | 0x10 idle, **0x1a start** | `CharFight_t` ctor `FUN_1007b816` (a character enters fight state 10, unconditionally), `FUN_1006a700` / `FUN_1006a772` (a weapon is wielded / unwielded while `WeaponHolder+0x44 != 1`, i.e. fighting) |
+  | `[2]` | `FUN_1003cc15` | **0x1b stop** | `FUN_10068b7f` (stop fight, state 2 -> 1, when `char+0x80 == 0` and `FUN_10059ac4()` is false) |
+  | `[3]` | `FUN_1003c930(first, second)` | 0x27 + 0x29, or 0x28 + 0x78 | `FUN_1009c858` = `WeaponItem_t` attach (`param_3 == 0`: only when `char+0x1d4 +0x44 == 1` (not fighting), char state not 4) and detach (always, char state not 4) |
+  `+0x44` of the fight controller is 1 = not fighting, 2 = fighting (`FUN_10069c68` sets 2, `FUN_10068b7f` 1). `FUN_1009c858` is run by `WeaponItem_t` vtable `+0xa4` =
+  `FUN_1009e301` (wield: `FUN_10047873` on a `WeaponItemFullUpdate` for slot 6 / 8 / 0x3d / 0x3f with stat 0x37 in {1, 0xe}; `FUN_1006ad94` = `CharacterAction` 0x83)
+  and `+0xa8` = `FUN_1009ce50` (unwield: `FUN_1006a857` = action 0x61, and the first step of a second wield) and by the `AppearanceUpdate` apply `FUN_10071679` for the
+  holster slots 0x3d / 0x3f.
+* **Fight start** (`CharFight_t` ctor -> `[1]`): if the weapon's list 0x10 clip is not already the AnimHolder's current idle (`+0x34`; the bazooka's is), the clip of list **0x1a**
+  (`idle-stand` 0x78 when absent) plays **once** (`FUN_1003bc11(clip, 1, 1, 0)` + `FUN_1003c216` = `SetAnimation` count 1, layer 0) and the idle (list 0x10, else 0x78) is started
+  with `VisualCATMesh_t::SetAnimationDelay(handle, GetDuration(draw clip))`, so it takes over when the draw ends. The weapon is the first present of body slots 6, 8, 0. A target switch
+  (`FUN_10069c68` while fighting) calls `FUN_10068b7f` first and then sets state 2 again without a new ctor: **holster clip, no new draw** (the idle that follows is the
+  equip routine's, [INFERENCE] from the code order; unverified live).
+* **Fight stop** (`FUN_10068b7f` -> `[2]`): list **0x1b** of the weapon plays once, then the AnimHolder idle (`+0x10`: the equip routine's idle, `+0x18` while crawling) starts delayed by its duration.
+* **Idle out of a fight = `FUN_1009c858`** (weapon attach, `param_3 == 0`): for **AnimSet 3 only** the AnimHolder run (`+4`) = 0x422 and walk (`+0xc`) = 0x421 (constants, **lists 0x2a / 0x2b are
+  never read**: a scan of every `FUN_1004570c(imm)` caller finds keys 0x10, 0x1a, 0x1b, 0x27, 0x28, 0x29 only), and for AnimSets 3 and 8 the idle (`FUN_1003cd3d`, `+0x10` / `+0x34`) = list **0x29**
+  (rifle idle-2h 0x41e, bazooka 0x424); every other weapon keeps `idle-stand` 0x78. The detach restores run 0x65, walk 100, idle 0x78. So a pistol / blade / bow wielder out of a fight stands
+  in plain `idle-stand`; the weapon's list-0x10 idle is a **fight** idle (`combat::anim::{peace_idle, fight_idle, wield_walk_run}`; the earlier port used list 0x10 for every idle and lists
+  0x2a / 0x2b for walk / run of the bazooka as well: a deviation, fixed).
+* **Wear / unwear while not fighting** (`[3]`, `FUN_1003c930(first, second)`): `first` = `c8b7` of the weapon's list 0x27 (rifle 0x41f, bow 0xb5), `second` = list 0x29 (rifle 0x41e, bow 0xb6, bazooka
+  0x424); without list 0x29 `(list 0x28, 0x78)`, which for a pistol / blade is `(none, idle-stand)`. `first` plays once (count 1, layer 0) and `second` is started **in the same call** as a loop on the
+  idle's own layer (also 0) with no delay. `VisualCATMesh_t::SetAnimation` [DS 0x10073f23] keeps one active animation per layer (`CATAnimBlend_t` anim1 / anim2, new clip fades in over 200..300 ms,
+  floats at DS 0x100af89c / 0x100af8a0), so the draw clip of `[3]` is replaced within the frame; **[INFERENCE]** it is never seen (the delayed idle of `[1]` exists precisely to show the draw), unverified
+  live. The unwear's `[3]` (list 0x28 `rifle-stop-2h` 0x420 then 0x78) is replaced the same way. Nothing is played for them.
+* **Wield gesture 0x6d**: `FUN_1006a857` (action 0x61) calls `FUN_10081e74(char, 3)` after the unwield (the character's own anim list 3, else 0x6d = the first `wield` entry, `<set>_wield_01_01.ani`;
+  `Play(id, 1.0, count 1, layer 0)`); a fight then runs `[1]` through `FUN_1006a772`, which replaces it in the same frame. Out of a fight the gesture is the only thing the unwear shows
+  (`combat/module.rs`: `Module::take_anims`, queued only for an occupied hand slot of a character that is not fighting). `FUN_1006ad94` (action 0x83, the same wear / unwear moment,
+  `identity_b` = the slot) plays it as well, but the wield that follows (`FUN_1009e301`: unwield if wielded, then attach) overwrites it on a wear; on an unwear (`identity_b` = bag slot 0x41) the attach
+  returns early for a slot above 0x2f unless bit 5 of stat 0x2a1 is set, so [INFERENCE] the gesture of the 0x83 stays (a restart of the same clip within the same millisecond).
+  **Wired**: `Module::on_frame` (0x61 -> gesture 0x6d), `glue.rs::stance` (`FightStarted` / `FightStopped` -> `draw_clip` / `holster_clip` + the fight idle flag: `Dynels::set_fighting`, `Player::fighting`;
+  a weapon that resolves during a fight runs the draw again: `Dynels::take_wielded`), `combat::anim::{peace_idle, fight_idle, wield_walk_run, draw_clip, holster_clip}`, `Avatar::set_stance`
+  (own: idle / fight idle / walk / run), `Dynels::update` (others, same). Not wired: the martial-arts item's lists 0x1a / 0x1b / 0x10 (bare hands; record layout not decoded, §3.1), the crawl
+  variants, char state 4 / 8 / 9 gates and `char+0x80` / `FUN_10059ac4` (assumed 0 / false for a live character).
   Stance ids per weapon type: section 3.1 (`blade-start/idle-blade/blade-stop` 1000-1002, `smallarms` 1010-1012, `rifle` 1020-1022,
-  `unarmed` 1030-1032, `2h` 1055/1054/1056, `bow` 0xb5-0xb8). **There is no separate "fight stance" clip**: being in `CharFight_t` only keeps the weapon
-  idle (list 0x10); a character that is not fighting plays plain 0x78/walk/run.
-  **Own character**: `Avatar::set_stance(Dynels::wielded_set(own))` (`Player::frame`) gives idle / fight idle / walk / run the same weapon clips as `Dynels::update` gives other wielders (idle 0x10, walk 0x2a, run 0x2b, first value of the list; AnimSet 4/5 have none) while the model's set has the clip; the wield itself is the own `WeaponItemFullUpdate` and ends with `CharacterAction` 0x61 for the slot (docs/zone/avatar.md §6). Start / stop (draw / holster) clips on the wear / unwear are **[UNRESOLVED]**: the callers of `FUN_1003c930` / `FUN_1003c9b2` were not traced, nothing is played.
+  `unarmed` 1030-1032, `2h` 1055/1054/1056, `bow` 0xb5-0xb8).
 * **Being hit** (`CharacterActionIIR_t` action **0xd1**, `FUN_1005d0d8` case 0x5b [GC 0x1005eada]): if `identity_a.instance` and `identity_b.instance` (the handler's two `Identity*` arguments; `param` is not read) are both `> 0`, play the hit sound at the
   victim's position (section 6).
 * **Hit reaction** [CODE] (`FUN_1009b4ac` [GC 0x1009b4ac], run by the swing's `attack` note, section 6.1): hit kind (`AttackInfo::unk_30`) > 1, the victim's holder is not already playing a list-`0x1f` clip and

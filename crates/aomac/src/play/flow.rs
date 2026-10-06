@@ -480,9 +480,6 @@ impl Play {
         }
         self.screen = Screen::Loading;
         self.fade = Fade::In(0.0);
-        self.world_ready = false;
-        self.world_scene = None;
-        self.world_ground = None;
         host.fly = false;
         // `ServerLogin3DModule_t::SetLoadingScreen(n)`: after a creation `welcome_to_rubika.jpg` (docs/screens.md §7)
         let image = if std::mem::take(&mut self.welcome_image) { "welcome_to_rubika.jpg" } else { "ai_loading_login.png" };
@@ -726,6 +723,8 @@ impl Play {
                 LoginEvent::ZoneHandoff { zone_ip, zone_port, character_id } => {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
                     self.zone = zone::Zone::new(character_id);
+                    // a fresh session: nothing of an earlier world; the playfield may finish loading while the creation cinematic still runs
+                    (self.world_ready, self.world_scene, self.world_ground) = (false, None, None);
                     self.awaiting_alive = false;
                     self.fight_reset();
                     self.interact_reset();
@@ -736,7 +735,10 @@ impl Play {
                     self.chat = Some(chat);
                     self.zone.world.start(self.dir.clone(), character_id as i32);
                     self.world_frames = 0;
-                    self.start_loading(host);
+                    // creating a character: the exit cinematic runs first, `exit_done` opens the loading screen (docs/screens.md §12)
+                    if self.screen != Screen::Create {
+                        self.start_loading(host);
+                    }
                 }
                 LoginEvent::ZoneFrame(f) => {
                     if let Some(c) = self.chat.as_mut() {

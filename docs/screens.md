@@ -457,6 +457,7 @@ Registered AFCM message module 0x1b / program 5. `LoginModule_c::SlotLoginReply(
   reset to 0 by `ShutdownMessage`) selects `gfx/welcome_to_rubika.jpg` (1024×768 JPEG) when `n ∈ {1,2}`; the only caller is character
   creation (`NameScene_t::SetState(0x1008)`: `SetLoadingScreen(rand() % 3)` – after creating a new character the welcome image is used 2/3 of
   the time). If the file cannot be loaded the fallback is gui texture id 0x19 = `GFX_GUI_AO_LOGO`. `gfx/loadingimage_fullscreen.jpg` is never loaded.
+  After a creation the zone session (`ZoneInfo` → `Zone`, chat, playfield load) is independent of the cinematic: `ZoneHandoff` sets it up at once and the zone burst / playfield load run during the exit cinematic; only the loading screen waits for `exit_done` (regression test `character_created_and_handoff_reach_the_world`).
   Placement: sprite size = image size, `RenderWindow_t::ScaleToResolution(1024, 768)` [0x10020b71] ⇒ scale = `(displayW/1024, displayH/768)`
   (stretched, **non-uniform** if the aspect ≠ 4:3), `UseFilter(true)` (bilinear), `ReposCenterInPercent(0.5, 0.5)` ⇒ centred on the display. Depth 100001.
 * **Black full-screen sprite** (16×16 black sprite stretched to the display, depth 100000, behind the image): stays opaque while the image/text fade **in**

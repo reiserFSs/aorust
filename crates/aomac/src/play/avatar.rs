@@ -140,17 +140,19 @@ fn one_shot(r: &Role) -> bool {
     matches!(r, Role::JumpStand | Role::JumpForward | Role::Emote(_) | Role::Clip(_))
 }
 
-/// The clip name of the weapon stance of `AnimSet` `set` for movement role `r` (AnimHolder idle update `FUN_1003cad0`: list 0x10; 2H walk / run:
-/// lists 0x2a / 0x2b, docs/zone/combat-anim.md §4); the first value of the list, like `Dynels::update` takes it.
+/// The clip name of the weapon stance of `AnimSet` `set` for movement role `r`: the idle while not fighting is the equip routine's (`FUN_1009c858`:
+/// rifle / bazooka list 0x29, others `idle-stand`), the fight idle is list 0x10 (`FUN_1003cad0`), walk / run are the rifle's constants 0x421 / 0x422
+/// (`combat::anim::{peace_idle, fight_idle, wield_walk_run}`, docs/zone/combat-anim.md §4).
 fn stance_clip(set: i32, r: &Role) -> Option<String> {
-    use super::combat::anim::{anim_name, list, weapon_list};
-    let key = match r {
-        Role::Idle | Role::IdleCombat => list::IDLE,
-        Role::Walk => list::WALK_2H,
-        Role::Run => list::RUN_2H,
+    use super::combat::anim::{anim_name, fight_idle, peace_idle, wield_walk_run};
+    let id = match r {
+        Role::Idle => peace_idle(Some(set)),
+        Role::IdleCombat => fight_idle(Some(set))?,
+        Role::Walk => wield_walk_run(Some(set))?.0,
+        Role::Run => wield_walk_run(Some(set))?.1,
         _ => return None,
     };
-    weapon_list(set, false, false, key).first().and_then(|&id| anim_name(id)).map(|(n, _)| n.to_string())
+    anim_name(id).map(|(n, _)| n.to_string())
 }
 
 /// Locomotion clips share a gait cycle: switching between them keeps the phase instead of restarting.
@@ -703,16 +705,20 @@ mod tests {
         }
     }
 
-    /// Stance lists of the AnimSets (docs/zone/combat-anim.md §3.1): idle 0x10, walk 0x2a, run 0x2b; other roles and sets without lists: none.
+    /// Stance clips of the AnimSets (docs/zone/combat-anim.md §4): the idle out of a fight is the equip routine's (rifle `idle-2h`, bazooka list 0x29,
+    /// else `idle-stand`), the fight idle list 0x10, walk / run only the rifle's 0x421 / 0x422; other roles and sets without lists: none.
     #[test]
     fn stance_clip_names() {
         use super::super::combat::anim::anim_name;
-        assert_eq!(stance_clip(3, &Role::Idle).as_deref(), Some("idle-rifle"));
+        assert_eq!(stance_clip(3, &Role::Idle).as_deref(), Some("idle-2h"));
         assert_eq!(stance_clip(3, &Role::IdleCombat).as_deref(), Some("idle-rifle"));
         assert_eq!(stance_clip(3, &Role::Walk), anim_name(0x421).map(|n| n.0.to_string()));
         assert_eq!(stance_clip(3, &Role::Run), anim_name(0x422).map(|n| n.0.to_string()));
         assert_eq!(stance_clip(3, &Role::Sneak), None);
-        assert_eq!(stance_clip(4, &Role::Idle), None, "AnimSet 4: the lists live in the item record");
+        assert_eq!(stance_clip(1, &Role::Idle).as_deref(), Some("idle-stand"), "a blade keeps the plain idle out of a fight");
+        assert_eq!(stance_clip(1, &Role::IdleCombat).as_deref(), Some("idle-blade"));
+        assert_eq!((stance_clip(1, &Role::Walk), stance_clip(8, &Role::Run)), (None, None), "only the rifle overrides walk / run");
+        assert_eq!(stance_clip(4, &Role::IdleCombat), None, "AnimSet 4: the lists live in the item record");
     }
 
     /// `AppearanceUpdateIIR_c` of a wear (docs/captures/zone_wear_rifle_borealis.rec: attractors `{0, head}` + `{1, 0x3ddf}`) mounts the weapon mesh
@@ -734,12 +740,22 @@ mod tests {
         a.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
         let clips = a.assets.clips(&store, a.rig.model_id).unwrap();
         let named = |n: &str| clips.iter().find(|c| c.0 == n).map(|c| c.1);
-        assert_eq!(Some(a.clip_id), named("idle-rifle"));
-        assert_ne!(a.clip_id, idle);
-        // fighting with a weapon plays the weapon idle, not the raised fists
+        // out of a fight a rifle wielder stands in `idle-2h` (list 0x29, `FUN_1009c858`) when the model's set has it, else plain
+        assert_eq!(Some(a.clip_id), named("idle-2h").or(Some(idle)));
+        // fighting with a weapon plays the weapon idle (list 0x10), not the raised fists
         a.set_pose(&store, AvatarPose::still(Role::IdleCombat)).unwrap();
         assert_eq!(Some(a.clip_id), named("idle-rifle"));
-        // 2H walk: the model's clip of list 0x2a when its set has it, else the plain walk
+        assert_ne!(a.clip_id, idle);
+        // the fight start's draw (list 0x1a), the fight stop's holster (list 0x1b) and the unwear's gesture (0x6d) are clips of the model's set that play once
+        for n in ["rifle-start", "rifle-stop", "wield"] {
+            a.set_pose(&store, AvatarPose::still(Role::Clip(n.into()))).unwrap();
+            assert_eq!(Some(a.clip_id), named(n), "{n}");
+            assert!(!a.finished(), "{n}");
+            a.update(30.0);
+            assert!(a.finished(), "{n} plays once");
+        }
+        a.set_pose(&store, AvatarPose::still(Role::IdleCombat)).unwrap();
+        // the rifle's walk constant 0x421 when the model's set has it, else the plain walk
         let walk = stance_clip(3, &Role::Walk).and_then(|n| named(&n));
         a.set_pose(&store, AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 }).unwrap();
         assert_eq!(Some(a.clip_id), walk.or(named("walk")));

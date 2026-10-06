@@ -374,7 +374,7 @@ Rows without a note are UI / GlobalSignals plumbing of another feature (team, co
 | `0x54` | 0x1005d70f | UI / GlobalSignals plumbing | not driven, not fight state |
 | `0x56` | 0x1005d723 | sit relay | combat/actions.rs + player.rs |
 | `0x57` | 0x1005d72f | stand up | combat/actions.rs + player.rs |
-| `0x61` | 0x1005d790 | unwield of body slot `identity_b.instance` of the header char (`FUN_1006a857` -> `FUN_1006a772`, stats 0x112/0x2b2); live: the rifle's unwear, `identity_b = {0, 6}`, 1 ms before the weapon's `WeaponItemFullUpdate` names the bag slot 0x41 | **wired**: `Armory::unwield_slot`, `Dynels::unwield_slot` (docs/zone/avatar.md §6) |
+| `0x61` | 0x1005d790 | unwield of body slot `identity_b.instance` of the header char (`FUN_1006a857` -> `FUN_1006a772`, stats 0x112/0x2b2), then `FUN_10081e74(char, 3)` = the wield gesture 0x6d; live: the rifle's unwear, `identity_b = {0, 6}`, 1 ms before the weapon's `WeaponItemFullUpdate` names the bag slot 0x41 | **wired**: `Armory::unwield_slot`, `Dynels::unwield_slot` (docs/zone/avatar.md §6); the gesture: `Module::on_frame` -> `take_anims` (docs/zone/combat-anim.md §4) |
 | `0x62` | 0x1005d7de | buff/effect entry add (`FUN_100512af`) | not fight state; not driven |
 | `0x63` | 0x1005d827 | death: flag 0x10, stat 0x183 | combat/state.rs + player.rs; sound CwSound |
 | `0x64` | 0x1005d873 | anim holder id := `identity_b.instance` | **wired**: `Module::take_anims` -> glue |
@@ -392,7 +392,7 @@ Rows without a note are UI / GlobalSignals plumbing of another feature (team, co
 | `0x7b` | 0x1005db15 | PvP confirmation, clears +0x79 | **wired**: duel.rs `PvpPrompt`, dialog, `Module::start_pvp` |
 | `0x81` | 0x1005dc31 | combat-log line | chat/log.rs |
 | `0x82` | 0x1005dc12 | combat-log line | chat/log.rs |
-| `0x83` | 0x1005d7b7 | weapon slot map (`FUN_1006ad94`); live: right after every wear / unwear, `identity_a` = the weapon item `{0xC74A, id}`, `identity_b = {0, slot}` (6 on the wear, the bag slot 0x41 on the unwear) | **not implemented**: the `WeaponItemFullUpdate` of the same moment already carries what the slot tables need (a bag slot is no valid weapon slot) |
+| `0x83` | 0x1005d7b7 | weapon slot map (`FUN_1006ad94`: `FUN_10081e74(char, 3)` gesture 0x6d, then `WeaponItem_t` vtable `+0xa4` = `FUN_1009e301` wield); live: right after every wear / unwear, `identity_a` = the weapon item `{0xC74A, id}`, `identity_b = {0, slot}` (6 on the wear, the bag slot 0x41 on the unwear) | **not implemented**: the `WeaponItemFullUpdate` of the same moment already carries what the slot tables need (a bag slot is no valid weapon slot); its repeat of the wield / gesture is invisible ([INFERENCE], combat-anim.md §4) |
 | `0x84` | 0x1005ddbc | special action locked "Unable to perform action, able in hh:mm:ss" | **wired** chat/log.rs (perk branch: perk name unresolved, not printed) |
 | `0x89` | 0x1005d248 | UI / GlobalSignals plumbing | not driven, not fight state |
 | `0x8a` | 0x1005dc77 | combat-log line | chat/log.rs |

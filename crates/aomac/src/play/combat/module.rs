@@ -5,7 +5,8 @@
 //! combat-log.md, combat-anim.md, actions.md.
 
 use super::actions::{Actions, Event as ActionEvent};
-use super::anim::{plays_hit_sound, special_swing, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM};
+use super::anim::{plays_hit_sound, special_swing, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM, WIELD_GESTURE};
+use super::arms::ACTION_UNWIELD;
 use super::log::{floating_number, FloatingNumber, Space, HUD_X, HUD_X_JITTER};
 use super::state::{Combat, CombatEvent, ACTION_PLAY_ANIM, FIGHT_IDLE};
 use crate::play::zone::Zone;
@@ -153,6 +154,11 @@ impl Module {
         self.combat.is_fighting(self.own)
     }
 
+    /// Character `id`'s fight controller is in state 2 (`SimpleChar+0x1d4 +0x44`).
+    pub fn is_fighting(&self, id: i32) -> bool {
+        self.combat.is_fighting(id)
+    }
+
     /// Frames to send to the zone server.
     pub fn take_outbox(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.outbox)
@@ -230,6 +236,14 @@ impl Module {
                 }
                 if a.action == ACTION_PLAY_ANIM && m.header.target.kind == DYNEL_CHAR && a.identity_b.instance > 0 {
                     self.anims.push((m.header.target.instance, a.identity_b.instance as u16));
+                }
+                // `FUN_1006a857` (action 0x61): after the unwield `FUN_10081e74(char, 3)` plays the wield gesture 0x6d once; a fight (`+0x44` != 1) then runs
+                // the idle update `FUN_1006a772` -> `FUN_1003cad0`, which starts the idle clip over it in the same frame (docs/zone/combat-anim.md §4)
+                if a.action == ACTION_UNWIELD && m.header.target.kind == DYNEL_CHAR {
+                    let who = m.header.target.instance;
+                    if self.combat.arms.slot_item(who, a.identity_b.instance).is_some() && !self.combat.is_fighting(who) {
+                        self.anims.push((who, WIELD_GESTURE));
+                    }
                 }
             }
         }
@@ -578,6 +592,26 @@ mod tests {
         assert!(m.attacking(), "the fight state changes only when the server echoes");
         m.on_frame(&n3_frame(0, OWN, net::stop_fight(OWN as i32)));
         assert!(!m.attacking());
+    }
+
+    /// The unwield action (0x61, `FUN_1006a857`) of an occupied hand slot plays the wield gesture 0x6d (`FUN_10081e74(char, 3)`) unless the holder fights
+    /// (the idle update of `FUN_1006a772` then starts the idle clip over it); an empty slot does nothing.
+    #[test]
+    fn unwield_queues_the_wield_gesture_out_of_a_fight() {
+        let (mut m, _z, t) = primed();
+        let own = OWN as i32;
+        let unwield = |m: &mut Module| m.on_frame(&n3_frame(0, OWN, action::character_action(own, &simple(ACTION_UNWIELD, Identity::default(), Identity { kind: 0, instance: 6 }))));
+        assert!(!m.attacking());
+        unwield(&mut m);
+        assert!(m.take_anims().is_empty(), "nothing in the hand");
+        m.combat.arms.wield(own, 901, 6, None, &[(0x1b4, 0x5a)]);
+        unwield(&mut m);
+        assert_eq!(m.take_anims(), vec![(own, WIELD_GESTURE)]);
+        m.combat.arms.wield(own, 901, 6, None, &[(0x1b4, 0x5a)]);
+        m.on_frame(&n3_frame(0, OWN, net::attack(own, Identity { kind: DYNEL_CHAR, instance: t }, 0)));
+        assert!(m.is_fighting(own));
+        unwield(&mut m);
+        assert!(m.take_anims().is_empty(), "in a fight the idle update replaces the gesture");
     }
 
     #[test]

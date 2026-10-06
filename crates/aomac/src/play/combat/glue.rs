@@ -2,7 +2,7 @@
 
 use super::actions::Event as ActionEvent;
 use super::actions::Pose;
-use super::anim::{anim_name, list, npc_sound, special_swing, UNARMED_RSWING};
+use super::anim::{anim_name, draw_clip, holster_clip, list, npc_sound, special_swing, UNARMED_RSWING};
 use super::log::{Space, HUD_Y_FROM_REF};
 use super::state::CombatEvent;
 use super::module::{Command, Module};
@@ -174,8 +174,9 @@ impl Play {
                 _ => {}
             }
         }
+        // AnimHolder stance clips (docs/zone/combat-anim.md §4): the fight idle, the draw and the holster follow the fight controller of every character
+        stance(&mut self.zone.world, self.player.as_mut(), own, &events, |id| m.is_fighting(id));
         if let Some(p) = self.player.as_mut() {
-            p.fighting = m.attacking();
             for e in events {
                 match e {
                     CombatEvent::Died { dynel, .. } if dynel == own => {
@@ -203,7 +204,7 @@ impl Play {
                 ActionEvent::Pose { .. } => {}
             }
         }
-        // `CharacterAction` 0x64: the server asks a character's animation holder to play an animation id (`FUN_1003c47c`)
+        // `CharacterAction` 0x64: the server asks a character's animation holder to play an animation id (`FUN_1003c47c`); the unwield (0x61) queues its gesture 0x6d here too
         for (dynel, id) in m.take_anims() {
             match (dynel == own, self.player.as_mut()) {
                 (true, Some(p)) => {
@@ -327,5 +328,50 @@ fn swing(world: &mut Dynels, player: Option<&mut Player>, who: i32, key: u16, ow
         }
         (false, Some((anim, _))) => world.play_once(who, anim as u32),
         (false, None) => world.attack(who),
+    }
+}
+
+/// Plays AbstractAnimID `id` once on `who`: the own avatar through [`Player::play`], every other character through [`Dynels::play_once`].
+fn play_anim(world: &mut Dynels, player: &mut Option<&mut Player>, own: i32, who: i32, id: u16) {
+    if who != own {
+        world.play_once(who, u32::from(id));
+    } else if let (Some(p), Some((name, _))) = (player.as_deref_mut(), anim_name(id)) {
+        p.play(Role::Clip(name.into()), false);
+    }
+}
+
+/// The AnimHolder's fight idle of `who` goes on / off ([`Dynels::set_fighting`], the own [`Player::fighting`]) and plays its one-shot clip:
+/// on = idle update `FUN_1003cad0` [GC 0x1003cad0] (the weapon's list 0x1a, then the weapon idle), off = `FUN_1003cc15` (list 0x1b, then the idle of
+/// the equip routine); `play` = false skips the clip (a dying character goes straight to its death clip).
+fn fight_idle(world: &mut Dynels, player: &mut Option<&mut Player>, own: i32, who: i32, on: bool, play: bool) {
+    world.set_fighting(who, on);
+    if who == own {
+        if let Some(p) = player.as_deref_mut() {
+            p.fighting = on;
+        }
+    }
+    let set = world.wielded_set(who);
+    if let Some(id) = if on { draw_clip(set) } else { holster_clip(set) }.filter(|_| play) {
+        play_anim(world, player, own, who, id);
+    }
+}
+
+/// What the fight controller does to the AnimHolder (docs/zone/combat-anim.md §4): `CharFight_t` ctor `FUN_1007b816` runs the idle update when a
+/// character starts fighting (not when it only switches target: `FUN_10069c68` stops the old fight first, `FUN_10068b7f` -> `FUN_1003cc15` plays the
+/// holster, and the fight state stays 2 without a new draw), `FUN_10068b7f` the holster when a fight stops, `FUN_1006a700` the idle update when a weapon
+/// is wielded while the holder fights (`fighting`).
+fn stance(world: &mut Dynels, mut player: Option<&mut Player>, own: i32, events: &[CombatEvent], fighting: impl Fn(i32) -> bool) {
+    let died = |who: i32| events.iter().any(|e| matches!(e, CombatEvent::Died { dynel, .. } if *dynel == who));
+    for e in events {
+        match e {
+            CombatEvent::FightStarted { who, switched: false, .. } => fight_idle(world, &mut player, own, *who, true, true),
+            CombatEvent::FightStopped { who } => fight_idle(world, &mut player, own, *who, false, !died(*who)),
+            _ => {}
+        }
+    }
+    for who in world.take_wielded() {
+        if fighting(who) {
+            fight_idle(world, &mut player, own, who, true, true);
+        }
     }
 }

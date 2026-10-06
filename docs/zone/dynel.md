@@ -202,6 +202,8 @@ source if its id equals the client's own character id (`SetCellMonitorSource`/`S
 `SetBodyScale(MonsterScale/100)` and finally `DisableVisibility` for a non-own dynel when a stat read (arguments not recovered, [GC 0x100783a1]: stat 0xC2 `InPlay`, kind 2) is 0. The own dynel (`IsClientChar`) uses the PC branch
 with fewer stats written (the `n3Dynel_t+0x21c` flag).
 
+**Live changes** (`AppearanceUpdateIIR_c`, [GC 0x10071679], docs/zone/world.md §7): applied to any `SimpleChar_t` of identity kind 50000, NPCs included (no NPC special case): cloth entries by `(page*5 + part)` (`FUN_100480fc`, only changed textures written, 0 clears), `VisualFlags` stat 0x2A1, and the attractor list replaced wholesale (`ClearAttractors` + `AddAttractors`). `Dynels::on_message` edits the `CharLook` (`CharLook::apply_appearance`) and rebuilds the model through `Req::Model`; details and evidence in docs/zone/avatar.md §5.
+
 **Unresolved:** `field_108`, `mode`, the blob (28/42 bytes live: `00×12, 03, 01, 0001 0001 0001 0001, 0000, 0002|0003, …`; a stat update in the capture sets
 `CurrentMovementMode` (0xAD) = 3 and the blob has a `03` at byte 12, **[GUESS]** movement state), the exact meaning of `AttractorMeshData` byte/int, `target`
 (`+0xbc`), `path`, `list_190`, `effects`, bits 2/18/21/22 consumers, the MonsterData → model mapping, the sign of the heading, and the PC `extra`/`name_parts` strings

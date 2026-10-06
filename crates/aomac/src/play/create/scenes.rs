@@ -852,7 +852,7 @@ impl Play {
                     self.cc_stop(&mut c, 0x65);
                     c.st = St::Active;
                 }
-                true
+                false // the zone session state (`Zone`, chat, world load) is set up by the flow at once; only the loading screen waits
             }
             _ => false,
         };
@@ -904,6 +904,11 @@ impl Play {
         if let Some(sess) = &self.session {
             sess.create_character(req);
         }
+        // the request is what the Name scene (the last one) sends: the module is in that scene when `LoginOKMessage` arrives, so its
+        // `StopScene(0x65)` leads to the exit cinematic (`cc_scene_done`: scene index + 1 > 3), not to another scene
+        c.cur = Some(Sc::Name);
+        c.st = St::Active;
+        c.stop = None;
         self.cc = Some(c);
         true
     }

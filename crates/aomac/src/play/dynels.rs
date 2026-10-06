@@ -47,8 +47,8 @@ const ATTACK_KEY: u32 = canim::UNARMED_RSWING as u32;
 const STAT_ANIM_SET: u32 = 353;
 /// Weapon item stat `ItemDelay` (0x126, centiseconds): the swing is sped up to land within it (`FUN_1006a239`).
 const STAT_ITEM_DELAY: u32 = 294;
-/// Weapon stance clips loaded with every character model: idle (list 0x10) of the anim sets 0/1/3/6/7/8 and walk/run of a 2H stance.
-const STANCE_IDS: &[u16] = &[0x3f3, 0x3e9, 0x3fd, 0xb6, 0xcb, 0x424, 0x421, 0x422];
+/// Weapon stance clips loaded with every character model: the fight idle (list 0x10) of the anim sets 0/1/3/6/7/8, the rifle's idle-2h (list 0x29) and its walk/run.
+const STANCE_IDS: &[u16] = &[0x3f3, 0x3e9, 0x3fd, 0xb6, 0xcb, 0x424, 0x41e, 0x421, 0x422];
 
 /// Everything of a `SimpleCharFullUpdate` that decides what the model looks like; equal looks share one model.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -86,6 +86,25 @@ impl CharLook {
             attractors: u.attractors.iter().map(|a| (a.place, a.mesh)).collect(),
             skip_attractors: u.flags & ao_net::n3::dynel::flag::SET_DYNEL_800 != 0,
         }
+    }
+}
+
+impl CharLook {
+    /// `AppearanceUpdateIIR_c::Activate` [GC 0x10071679] on a character's look, any `SimpleChar_t` (NPCs too, no kind test beyond the identity):
+    /// the cloth entries are written by `FUN_100480fc` at index `page * 5 + part` (only page 0 is drawn; an entry whose texture is unchanged is
+    /// left alone, one with texture 0 clears the part, parts the message does not name stay), then `VisualCATMesh_t::ClearAttractors` +
+    /// `CharacterMesh::AddAttractors(list)`: the mounted set is exactly the wire list (head = its place 0), unconditionally (the `SET_DYNEL_800`
+    /// flag only skips the full update's block). `cloth` is kept sorted so equal looks share a model whatever order the updates came in.
+    pub fn apply_appearance(&mut self, a: &ao_net::n3::world::AppearanceUpdate) {
+        for c in a.cloth.iter().filter(|c| c.c == 0) {
+            self.cloth.retain(|p| p.0 != c.id);
+            if c.b > 0 {
+                self.cloth.push((c.id, c.b));
+            }
+        }
+        self.cloth.sort_unstable();
+        self.attractors = a.attractors.iter().map(|t| (t.a, t.b)).collect();
+        self.skip_attractors = false;
     }
 }
 
@@ -474,6 +493,8 @@ pub struct Char {
     pub name: String,
     pub npc: bool,
     pub look: Look,
+    /// Key of the look in `look` while its model is still being built: `key` (the model drawn) switches to it when it is ready, so a wield does not make the character vanish for the build time.
+    next: Option<u64>,
     pub key: u64,
     pub mover: Mover,
     /// `MonsterScale / 100`.
@@ -545,6 +566,11 @@ pub struct Dynels {
     pending: Vec<Look>,
     /// `AnimSet` of the weapon in the right (slot 6) / left (slot 8) hand of a holder.
     wield: HashMap<i32, [Option<Wield>; 2]>,
+    /// Characters whose fight controller is in state 2 (`SimpleChar+0x1d4 +0x44`, fed by [`Dynels::set_fighting`]): they stand in the weapon's
+    /// fight idle (list 0x10), everyone else in the idle of the equip routine (`canim::peace_idle`).
+    fighting: HashSet<i32>,
+    /// Holders whose weapon resolved since the last [`Dynels::take_wielded`] (a weapon wielded during a fight runs the fight idle update again).
+    wielded: Vec<i32>,
     /// Weapon-slot tables of the characters: stat `DamageType` of the item behind an `AttackInfo` slot (the hit lines of the chat log).
     pub arms: super::combat::arms::Armory,
     /// (swing clip, `ItemDelay`) of the last [`Dynels::pick_swing`] of a character: the clip plays sped up by [`canim::swing_speed_scale`].
@@ -597,6 +623,8 @@ impl Default for Dynels {
             next_prop: PROP_ID_BASE,
             pending: vec![],
             wield: HashMap::new(),
+            fighting: HashSet::new(),
+            wielded: vec![],
             arms: Default::default(),
             swing_delay: HashMap::new(),
             once_rate: HashMap::new(),
@@ -620,6 +648,18 @@ impl Default for Dynels {
             last_hit: HashMap::new(),
             cam: [0.0; 3],
         }
+    }
+}
+
+/// The weapon stance clip (AbstractAnimID) of a wielder in `state`: the equip routine's idle out of a fight (`None` = the plain `idle-stand`), the
+/// weapon's list-0x10 idle in a fight, the rifle's constant walk / run (`canim::{peace_idle, fight_idle, wield_walk_run}`).
+fn stance_id(set: Option<i32>, state: AnimState, fighting: bool) -> Option<u16> {
+    match state {
+        AnimState::Idle if fighting => canim::fight_idle(set),
+        AnimState::Idle => Some(canim::peace_idle(set)).filter(|&i| i != canim::IDLE_STAND),
+        AnimState::Walk => canim::wield_walk_run(set).map(|w| w.0),
+        AnimState::Run => canim::wield_walk_run(set).map(|w| w.1),
+        _ => None,
     }
 }
 
@@ -667,6 +707,8 @@ impl Dynels {
         self.props.clear();
         self.weapons.clear();
         self.wield.clear();
+        self.fighting.clear();
+        self.wielded.clear();
         self.pending_weapons.clear();
     }
 
@@ -674,6 +716,22 @@ impl Dynels {
     /// (AnimHolder idle update `FUN_1003cad0`, docs/zone/combat-anim.md §4). `None`: nothing wielded or the item is not resolved yet.
     pub fn wielded_set(&self, id: i32) -> Option<i32> {
         self.wield.get(&id)?.iter().flatten().next().map(|w| w.set)
+    }
+
+    /// `id`'s fight controller changed state (`FUN_10069c68` start / `FUN_10068b7f` stop, `CombatEvent::FightStarted` / `FightStopped`): a
+    /// fighting wielder stands in the weapon's fight idle, a character out of a fight in the equip routine's idle.
+    pub fn set_fighting(&mut self, id: i32, fighting: bool) {
+        if fighting {
+            self.fighting.insert(id);
+        } else {
+            self.fighting.remove(&id);
+        }
+    }
+
+    /// Holders whose weapon finished resolving since the last call (the worker's `Resp::Weapon`): `FUN_1006a700` runs the AnimHolder idle update
+    /// (`FUN_1003cad0`, the draw) for a weapon wielded while the holder fights.
+    pub fn take_wielded(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.wielded)
     }
 
     /// `CharacterActionIIR_t` 0x61 (`FUN_1006a857` -> `FUN_1006a772`): body slot `slot` (6 right hand, 8 left) of `holder` is emptied. The weapon dynel
@@ -1097,6 +1155,18 @@ impl Dynels {
                     self.pending_weapons.push((w.parent.instance, hand, static_instance(&stats), stats));
                 }
             }
+            // `AppearanceUpdateIIR_c::Activate` for any character (`FUN_10058e36` only tests the identity kind 50000): cloth, stat 0x2A1 `VisualFlags`,
+            // attractors; the model is rebuilt through the worker (the look's key changes) and replaces the drawn one when it is ready
+            N3::World(World::Appearance(a)) if who.kind == CHAR_KIND => {
+                if let Some(c) = self.chars.get_mut(&who.instance) {
+                    if let Look::Char(l) = &mut c.look {
+                        l.apply_appearance(a);
+                        let key = c.look.key();
+                        c.next = Some(key).filter(|&k| k != c.key);
+                    }
+                    c.visual_flags = i32::from(a.visual_flags);
+                }
+            }
             _ if who.kind != CHAR_KIND => {
                 if let N3::Dynel(Dynel::Stat(s)) = &m.body {
                     self.set_stats(who, s.stats.iter().map(|x| (x.0 as u32, x.1)));
@@ -1148,6 +1218,7 @@ impl Dynels {
                         bounds: None,
                         roll: Roll::default(),
                         swing_ttl: 0.0,
+                        next: None,
                         note_fired: 0,
                     },
                 );
@@ -1232,6 +1303,9 @@ impl Dynels {
                 // an answer for a hand that was emptied meanwhile (unwield before the worker resolved the item) is stale
                 Resp::Weapon { holder, slot, wield } => {
                     if self.weapons.values().any(|&w| w == (holder, slot)) {
+                        if wield.is_some() {
+                            self.wielded.push(holder);
+                        }
                         self.wield.entry(holder).or_default()[slot] = wield;
                     }
                 }
@@ -1259,7 +1333,7 @@ impl Dynels {
         }
         let own = self.own;
         for (id, c) in &self.chars {
-            if *id != own && !self.asked.contains(&c.key) {
+            if *id != own && !self.asked.contains(&c.next.unwrap_or(c.key)) {
                 self.pending.push(c.look.clone());
             }
         }
@@ -1305,6 +1379,13 @@ impl Dynels {
                 continue;
             }
             let id_ref = id;
+            if let Some(k) = c.next {
+                match self.models.get(&k) {
+                    Some(Model::Ready { .. }) => (c.key, c.next) = (k, None),
+                    Some(Model::Failed) => c.next = None,
+                    _ => {}
+                }
+            }
             let Some(Model::Ready { built, uploaded }) = self.models.get_mut(&c.key) else { continue };
             let Some(rig) = built.rig.clone() else { continue };
             if !c.features_set {
@@ -1349,17 +1430,11 @@ impl Dynels {
                 },
                 Special::None => {
                     let (id, a) = clip_of(built, state).map_or((0x78, None), |(i, a)| (i, Some(a)));
-                    // a wielder: weapon idle (list 0x10 of the first weapon in slot 6, 8) and 2H walk/run (lists 0x2a / 0x2b)
+                    // a wielder: the idle of the equip routine (rifle / bazooka list 0x29) out of a fight, the weapon idle (list 0x10) in a fight, the
+                    // rifle's constant walk / run (`canim::{peace_idle, fight_idle, wield_walk_run}`, docs/zone/combat-anim.md §4)
                     let set = self.wield.get(id_ref).and_then(|w| w.iter().flatten().next().map(|w| w.set));
-                    let stance = set.and_then(|set| {
-                        let key = match state {
-                            AnimState::Idle => canim::list::IDLE,
-                            AnimState::Walk => canim::list::WALK_2H,
-                            AnimState::Run => canim::list::RUN_2H,
-                            _ => return None,
-                        };
-                        canim::weapon_list(set, false, false, key).first().and_then(|&sid| built.clips.get(&(sid as u32)).map(|a| (sid as u32, a)))
-                    });
+                    let sid = stance_id(set, state, self.fighting.contains(id_ref));
+                    let stance = sid.and_then(|sid| built.clips.get(&(sid as u32)).map(|a| (sid as u32, a)));
                     let (id, a) = stance.map_or((id, a), |(i, a)| (i, Some(a)));
                     let nominal = match state {
                         AnimState::Walk | AnimState::WalkBack => max_speed(Mode::Walk, state == AnimState::WalkBack, c.mover.skill()),
@@ -1853,6 +1928,23 @@ mod variant_tests {
         assert_eq!(d.pick_swing(8, canim::list::ATTACK), None);
     }
 
+    /// A rifle wielder out of a fight stands in `idle-2h`, in a fight in `idle-rifle`, and walks / runs with 0x421 / 0x422; a blade keeps the plain idle
+    /// out of a fight and has the blade idle in one (`FUN_1009c858`, `FUN_1003cad0`).
+    #[test]
+    fn wielder_stance_follows_the_fight_state() {
+        assert_eq!(stance_id(Some(3), AnimState::Idle, false), Some(0x41e));
+        assert_eq!(stance_id(Some(3), AnimState::Idle, true), Some(0x3fd));
+        assert_eq!((stance_id(Some(3), AnimState::Walk, false), stance_id(Some(3), AnimState::Run, true)), (Some(0x421), Some(0x422)));
+        assert_eq!((stance_id(Some(1), AnimState::Idle, false), stance_id(Some(1), AnimState::Idle, true)), (None, Some(0x3e9)));
+        assert_eq!((stance_id(Some(1), AnimState::Walk, false), stance_id(Some(8), AnimState::Run, false)), (None, None));
+        assert_eq!((stance_id(None, AnimState::Idle, true), stance_id(Some(4), AnimState::Idle, false)), (None, None));
+        let mut d = Dynels::default();
+        d.set_fighting(7, true);
+        assert!(d.fighting.contains(&7));
+        d.set_fighting(7, false);
+        assert!(d.fighting.is_empty());
+    }
+
     /// The wear capture (`zone_wear_rifle_borealis.rec`): the rifle (AnimSet 3, `ItemDelay` 100) in slot 6 is the own character's wield (swing list,
     /// stance set, damage type, the avatar's attractor list); the server's `CharacterAction` 0x61 for slot 6 (the unwear; the item lives on in the bag)
     /// empties it again, also when it comes before the worker resolved the item.
@@ -1884,7 +1976,7 @@ mod variant_tests {
         };
         let attractors = |z: &mut Zone| std::mem::take(&mut z.own_events).into_iter().filter_map(|e| if let OwnEvent::Attractors(l) = e { Some(l) } else { None }).collect::<Vec<_>>();
         let wear = |z: &mut Zone, i: usize| rec[2 * i..2 * i + 2].iter().for_each(|f| {
-            z.on_frame(f);
+            let _ = z.on_frame(f);
         });
         wear(&mut z, 0);
         assert!(pump(&mut z, 500, &|w| w.wielded_set(own) == Some(3)), "the rifle never resolved");
@@ -1892,8 +1984,10 @@ mod variant_tests {
         assert_eq!(z.world.arms.damage_type(own, 6, 0), Some(0x5a));
         let (anim, delay) = z.world.pick_swing(own, canim::list::ATTACK).unwrap();
         assert_eq!((anim, delay), (0x3ff, 100), "rifle shot");
+        // the resolved weapon is announced once (a weapon wielded during a fight runs the AnimHolder idle update, `combat/glue.rs::stance`)
+        assert_eq!((z.world.take_wielded(), z.world.take_wielded()), (vec![own], vec![]));
         unwield.iter().for_each(|f| {
-            z.on_frame(f);
+            let _ = z.on_frame(f);
         });
         assert_eq!((z.world.wielded_set(own), z.world.pick_swing(own, canim::list::ATTACK), z.world.arms.damage_type(own, 6, 0)), (None, None, None));
         wear(&mut z, 1);
@@ -1903,11 +1997,84 @@ mod variant_tests {
         wear(&mut z, 2);
         pump(&mut z, 1, &|_| false);
         unwield.iter().for_each(|f| {
-            z.on_frame(f);
+            let _ = z.on_frame(f);
         });
         assert!(!pump(&mut z, 100, &|w| w.wielded_set(own).is_some()));
         wear(&mut z, 2);
         assert!(pump(&mut z, 500, &|w| w.wielded_set(own) == Some(3)));
+    }
+
+    /// `AppearanceUpdateIIR_c::Activate` [GC 0x10071679] on a look: cloth by part (page 0 only; texture 0 clears, unnamed parts stay), the
+    /// attractor list replaces the old one wholesale (an empty list unmounts the head too), `SET_DYNEL_800` no longer skips it.
+    #[test]
+    fn appearance_update_edits_the_look() {
+        use ao_net::n3::world::{AppearanceUpdate, Attractor, ClothData};
+        let mut l = CharLook { npc: false, breed: 1, sex: 2, race: 1, fatness: 1, head: Some(9), monster_data: 0, textures: vec![], cloth: vec![(4, 50), (1, 100)], attractors: vec![(0, 9)], skip_attractors: true };
+        let cl = |id, b, c| ClothData { id, b, c, ..Default::default() };
+        let mut a = AppearanceUpdate { cloth: vec![cl(1, 0, 0), cl(2, 77, 0), cl(3, 9, 1)], attractors: vec![Attractor { a: 1, b: 0x3ddf, c: 0, d: 2 }, Attractor { a: 0, b: 7, c: 0, d: 4 }], visual_flags: 0x1f, extra: 0 };
+        l.apply_appearance(&a);
+        assert_eq!((l.cloth.as_slice(), l.attractors.as_slice(), l.skip_attractors), (&[(2, 77), (4, 50)][..], &[(1, 0x3ddf), (0, 7)][..], false));
+        a.cloth.clear();
+        a.attractors.clear();
+        l.apply_appearance(&a);
+        assert_eq!((l.cloth.len(), l.attractors.len()), (2, 0), "no cloth named = unchanged; no attractors = no head, no weapon");
+    }
+
+    /// The captured wear / unwear `AppearanceUpdate`s (zone_wear_rifle_borealis.rec, own character) retargeted to another player of
+    /// zone_ithaca.rec: his attractor list becomes the rifle (right hand) + head, then the head only, each time as a rebuilt model; the
+    /// old model stays drawn until the new one is ready.
+    #[test]
+    fn other_player_wields_and_unwields_live() {
+        let Some(dir) = client() else { return };
+        let own = 25988;
+        let mut z = Zone::new(own as u32);
+        z.world.start(dir, own);
+        for f in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            z.on_frame(&f);
+        }
+        let mut ids: Vec<i32> = z.world.chars.iter().filter(|(id, c)| **id != own && matches!(&c.look, Look::Char(l) if !l.npc)).map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        let id = ids[0];
+        let mut host = ao_render::Host::headless();
+        let mut settle = |w: &mut Dynels| {
+            for _ in 0..1000 {
+                w.update(0.02, [0.0; 3], [0.0, 0.0, -1.0], &mut host);
+                let c = &w.chars[&id];
+                if c.next.is_none() && matches!(w.models.get(&c.key), Some(Model::Ready { .. })) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("model never ready");
+        };
+        settle(&mut z.world);
+        let meshes = |w: &Dynels| match w.models.get(&w.chars[&id].key) {
+            Some(Model::Ready { built, .. }) => built.model.meshes.len(),
+            _ => panic!("no model"),
+        };
+        let plain = meshes(&z.world);
+        let mut wear: Vec<Message> = frames(include_str!("../../../../docs/captures/zone_wear_rifle_borealis.rec"))
+            .iter()
+            .filter_map(|f| ao_net::n3::decode(f).ok())
+            .filter(|m| matches!(m.body, N3::World(World::Appearance(_))))
+            .collect();
+        assert!(wear.len() >= 2);
+        wear.iter_mut().for_each(|m| m.header.target.instance = id);
+        // the wear: rifle (right hand 0x3ddf) + head; the old model stays drawn while the new one builds
+        let before = z.world.chars[&id].key;
+        z.world.on_message(&wear[0]);
+        let (look, next) = (z.world.chars[&id].look.clone(), z.world.chars[&id].next);
+        assert!(matches!(&look, Look::Char(l) if l.attractors.contains(&(1, 0x3ddf))), "{look:?}");
+        assert!(next.is_some_and(|k| k != before) && z.world.chars[&id].key == before);
+        settle(&mut z.world);
+        // this player carried a back item (place 5), the wear's list replaces it with the rifle: same mesh count; his captured cloth (all zero in
+        // the own character's message) is cleared like `FUN_100480fc` writes it
+        assert_eq!(meshes(&z.world), plain, "back item gone, rifle in");
+        assert!(matches!(&z.world.chars[&id].look, Look::Char(l) if l.cloth.is_empty()));
+        // the unwear: head only
+        z.world.on_message(&wear[1]);
+        settle(&mut z.world);
+        assert_eq!(meshes(&z.world), plain - 1, "the rifle is gone, nothing mounted but the head");
     }
 
     /// The variant is rolled when a clip starts (key or state change), not on every frame of its loop, and a single clip never

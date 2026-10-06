@@ -424,3 +424,30 @@ fn entering_text_of_a_dungeon_is_the_new_area_line() {
     r.p.dungeon = false;
     assert_eq!(r.p.entering_line(), r.p.text.by_key(110, "EnteringNewArea"), "no name: the same line");
 }
+
+/// Post-creation flow (live harness path): `CharacterCreated` + `ZoneHandoff` while the Name scene is up -> `StopScene(0x65)` -> the exit
+/// cinematic (docs/screens.md §12) -> loading screen; the zone frames of a new character's capture then bring the world (`Screen::InWorld`).
+#[test]
+fn character_created_and_handoff_reach_the_world() {
+    let Some(mut r) = rig() else { return };
+    r.p.show_characters(fake_list(), &mut r.host);
+    r.p.start_creation(&mut r.host);
+    let t = Instant::now();
+    while !r.p.live_create("Aomactest", 1, 1) {
+        assert!(t.elapsed() < Duration::from_secs(120), "creation module did not start");
+        r.p.frame(0.05, (1280, 800), &mut r.host);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    r.event(LoginEvent::CharacterCreated { character_id: 33512 });
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    // zone frames may arrive while the exit cinematic still runs
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    let t = Instant::now();
+    while r.p.screen == Screen::Create {
+        assert!(t.elapsed() < Duration::from_secs(60), "the exit cinematic never handed over");
+        r.p.frame(0.25, (1280, 800), &mut r.host);
+    }
+    assert!(r.p.screen == Screen::Loading && r.p.cc.is_none());
+    r.enter();
+    assert!(r.p.player.is_some());
+}

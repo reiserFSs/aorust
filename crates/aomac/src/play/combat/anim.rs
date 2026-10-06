@@ -376,7 +376,7 @@ pub mod list {
     pub const ATTACK: u16 = 0xb;
     /// Idle stance clip (AnimHolder idle update `FUN_1003cad0`: `FUN_1004570c(0x10)`).
     pub const IDLE: u16 = 0x10;
-    /// Stance start (draw) / stop (holster); the AnimHolder `Wield`/`Unwield` pair `FUN_1003c930`/`FUN_1003c9b2`.
+    /// Fight start (draw) / stop (holster) clips: AnimHolder vt[1] `FUN_1003cad0` reads 0x1a, vt[2] `FUN_1003cc15` 0x1b ([`super::draw_clip`], [`super::holster_clip`]).
     pub const START: u16 = 0x1a;
     pub const STOP: u16 = 0x1b;
     /// Special-attack swings (`FUN_1003c594` [GC 0x1003c594], see [`super::special_swing`]): Aimed Shot, Burst, Full Auto, Fast Attack,
@@ -461,6 +461,56 @@ pub fn weapon_anims(set: i32, left: bool, crawl: bool) -> Vec<(u16, u16)> {
 /// Values of one list key of [`weapon_anims`] (the client picks one at random: `FUN_1004570c` [GC 0x1004570c]).
 pub fn weapon_list(set: i32, left: bool, crawl: bool, key: u16) -> Vec<u16> {
     weapon_anims(set, left, crawl).into_iter().filter(|e| e.0 == key).map(|e| e.1).collect()
+}
+
+// ---------------------------------------------------------------- stance: draw / holster (AnimHolder)
+
+/// `idle-stand`, the AnimHolder's idle id (`+0x10`) until a weapon sets another (`FUN_1003c525`, `FUN_1009c858` unequip `FUN_1003cd3d(0x78)`).
+pub const IDLE_STAND: u16 = 0x78;
+
+/// `FUN_10081e74(char, 3)` [GC 0x10081e74] (unwield `FUN_1006a857`, wield-by-action `FUN_1006ad94`): the character's own anim list 3 (none for players), else
+/// `0x6d` (the first of the eight `wield` entries, whose clip is `<set>_wield_01_01.ani`), played once with count 1 on layer 0 through AnimHolder vt[5].
+pub const WIELD_GESTURE: u16 = 0x6d;
+
+/// The idle clip while the character is **not** fighting. The weapon equip routine `FUN_1009c858` [GC 0x1009c858] stores `FUN_1004570c(0x29)` into
+/// the AnimHolder idle (`FUN_1003cd3d`, `+0x10` / `+0x34`) for `AnimSet` 3 (rifle) and 8 (bazooka) only; every other weapon, and bare hands,
+/// keep `idle-stand`. The weapon's own idle (list 0x10) is only started by the fight idle update [`fight_idle`].
+pub fn peace_idle(set: Option<i32>) -> u16 {
+    match set {
+        Some(s @ (anim_set::RIFLE | anim_set::BAZOOKA)) => weapon_list(s, false, false, list::IDLE_2H).first().copied().unwrap_or(IDLE_STAND),
+        _ => IDLE_STAND,
+    }
+}
+
+/// Walk / run clips of a wielder: `FUN_1009c858` sets the AnimHolder walk (`+0xc`) = 0x421 and run (`+4`) = 0x422 as constants for `AnimSet` 3
+/// only (lists 0x2a / 0x2b are registered by `FUN_1009d41a` but no code reads them: scan of every `FUN_1004570c` caller).
+pub fn wield_walk_run(set: Option<i32>) -> Option<(u16, u16)> {
+    (set == Some(anim_set::RIFLE)).then_some((0x421, 0x422))
+}
+
+/// Idle clip of a fighting wielder: list 0x10 of the weapon (AnimHolder idle update `FUN_1003cad0`, run when the fight starts / a weapon is
+/// wielded during a fight). `None`: the weapon has no such list (the update then restarts `idle-stand`).
+pub fn fight_idle(set: Option<i32>) -> Option<u16> {
+    set.and_then(|s| weapon_list(s, false, false, list::IDLE).first().copied())
+}
+
+/// The clip the fight start plays once before the weapon idle ([`fight_idle`]) takes over (AnimHolder vt[1] `FUN_1003cad0` [GC 0x1003cad0]: list
+/// 0x1a of the first weapon in slot 6, 8, else the bare-hands item in slot 0; the idle clip is started with `SetAnimationDelay` = its duration).
+/// The update does nothing when the weapon's idle is already the current idle clip (bazooka: list 0x10 = list 0x29 = 0x424). With no weapon list
+/// 0x1a it plays `idle-stand` 0x78 once (not visible), so there is no clip then; bare hands: the martial-arts item's lists are not decoded
+/// (docs/zone/combat-anim.md §3.1), so nothing.
+pub fn draw_clip(set: Option<i32>) -> Option<u16> {
+    let idle = fight_idle(set);
+    if idle.unwrap_or(IDLE_STAND) == peace_idle(set) {
+        return None;
+    }
+    weapon_list(set?, false, false, list::START).first().copied()
+}
+
+/// The clip the fight stop plays once before the idle clip returns (AnimHolder vt[2] `FUN_1003cc15` [GC 0x1003cc15]: list 0x1b of the first
+/// weapon in slot 6, 8, else 0; the idle ([`peace_idle`], crawling: `+0x18`) starts delayed by its duration). Bare hands: nothing (see [`draw_clip`]).
+pub fn holster_clip(set: Option<i32>) -> Option<u16> {
+    weapon_list(set?, false, false, list::STOP).first().copied()
 }
 
 /// Result of `FUN_1003c594` [GC 0x1003c594] for a queued special attack (`FUN_1006855a` = its skill stat): which weapon list
@@ -726,6 +776,51 @@ mod tests {
                 .map(|w| format!("{w:#x}->{:#x}", resolve_clip(&names, set, *w, false).unwrap().1))
                 .collect();
             println!("{set}: ids resolved through the fallback chain: {via_fallback:?}");
+        }
+    }
+
+    /// What the AnimHolder plays on a fight start / stop and which idle it keeps in between (`FUN_1003cad0`, `FUN_1003cc15`, `FUN_1009c858`).
+    #[test]
+    fn draw_holster_and_idles_per_anim_set() {
+        // rifle: peace idle = list 0x29 (idle-2h 0x41e), walk / run constants, fight idle = list 0x10, draw = list 0x1a, holster = list 0x1b
+        assert_eq!((peace_idle(Some(3)), fight_idle(Some(3)), draw_clip(Some(3)), holster_clip(Some(3))), (0x41e, Some(0x3fd), Some(0x3fc), Some(0x3fe)));
+        assert_eq!(wield_walk_run(Some(3)), Some((0x421, 0x422)));
+        // pistol / 1H / 2H blade: the weapon idle is fight-only, the peace idle stays idle-stand
+        for (set, start, idle, stop) in [(0, 0x3f2, 0x3f3, 0x3f4), (1, 1000, 0x3e9, 0x3ea), (2, 1000, 0x3e9, 0x3ea)] {
+            assert_eq!((peace_idle(Some(set)), fight_idle(Some(set)), draw_clip(Some(set)), holster_clip(Some(set))), (IDLE_STAND, Some(idle), Some(start), Some(stop)), "set {set}");
+            assert_eq!(wield_walk_run(Some(set)), None);
+        }
+        // bow: list 0x29 exists, but only the rifle / bazooka equip stores it as the idle
+        assert_eq!((peace_idle(Some(6)), fight_idle(Some(6)), draw_clip(Some(6)), holster_clip(Some(6))), (IDLE_STAND, Some(0xb6), Some(0xb5), Some(0xb8)));
+        // bazooka: list 0x10 = list 0x29 = the current idle, so the fight start does nothing; no 0x1a / 0x1b lists
+        assert_eq!((peace_idle(Some(8)), fight_idle(Some(8)), draw_clip(Some(8)), holster_clip(Some(8))), (0x424, Some(0x424), None, None));
+        assert_eq!(wield_walk_run(Some(8)), None, "no walk / run override for the bazooka");
+        // tool: idle only; bare hands / unregistered AnimSets: nothing to play
+        assert_eq!((peace_idle(Some(7)), draw_clip(Some(7)), holster_clip(Some(7))), (IDLE_STAND, None, None));
+        for set in [None, Some(4), Some(5)] {
+            assert_eq!((peace_idle(set), fight_idle(set), draw_clip(set), holster_clip(set), wield_walk_run(set)), (IDLE_STAND, None, None, None, None));
+        }
+    }
+
+    /// Every clip of the draw / holster / stance table resolves for the three human sets, and the draw / holster clips have their own file
+    /// (no fallback to another stance).
+    #[test]
+    fn stance_clips_exist_in_the_data() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let names = NameTable::load(&store).unwrap();
+        for set in ["male", "female", "athrox"] {
+            for s in [0, 1, 2, 3, 6, 7, 8] {
+                for id in [Some(peace_idle(Some(s))), fight_idle(Some(s)), draw_clip(Some(s)), holster_clip(Some(s))].into_iter().flatten() {
+                    let r = resolve_clip(&names, set, id, false);
+                    assert!(r.is_some(), "{set} AnimSet {s}: {id:#x} {:?}", anim_name(id));
+                    if matches!(id, 0x3fc | 0x3fe | 0x3f2 | 0x3f4 | 1000 | 0x3ea | 0xb5 | 0xb8) {
+                        assert_eq!(r.map(|r| r.1), Some(id), "{set}: {id:#x} resolves through the fallback chain");
+                    }
+                }
+            }
+            let wield = resolve_clip(&names, set, 0x6d, false);
+            assert_eq!(wield.map(|r| r.1), Some(0x6d), "{set}: the wield gesture 0x6d");
         }
     }
 

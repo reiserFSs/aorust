@@ -23,7 +23,7 @@ pub const DEFAULT_DAMAGE_TYPE: i32 = 0x5b;
 /// The list key of the character's martial-arts / bare-hands item (`FUN_1006ac03` registers it as slot 0).
 const BARE_HANDS_KEY: i32 = 100;
 /// `CharacterActionIIR_t` id that empties a body slot (`identity_b.instance`).
-const ACTION_UNWIELD: i32 = 0x61;
+pub const ACTION_UNWIELD: i32 = 0x61;
 /// The `CharacterActionIIR_t` 0x61 of the rifle's unwear (header = the own character 0x82e8, `identity_b = {0, 6}`), as received live.
 #[cfg(test)]
 pub const UNWIELD_SLOT_6: &str = "011d000a0001003700000001000082e85e4777700000c350000082e8000000006100000000000000000000000000000000000000060000";
