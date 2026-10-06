@@ -11,7 +11,9 @@ pub mod misc;
 pub mod motion;
 pub mod nametag;
 pub mod outgoing;
+pub mod server_move;
 pub mod textcmd;
+pub mod teleport;
 pub mod world;
 
 use crate::msg::Identity;
@@ -48,6 +50,8 @@ pub enum N3 {
     Misc(misc::Misc),
     /// `ChatTextIIR_t` / `FeedbackIIR_t` / `FormatFeedbackIIR_t`.
     Chat(chat::N3Chat),
+    /// `n3TeleportIIR_t`: the server moves a dynel (in place or to another playfield).
+    Teleport(teleport::Teleport),
     /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
     Unknown(Vec<u8>),
 }
@@ -74,6 +78,8 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
         N3::Misc(m)
     } else if let Some(m) = chat::decode(&h, &mut r)? {
         N3::Chat(m)
+    } else if let Some(m) = teleport::decode(&h, &mut r)? {
+        N3::Teleport(m)
     } else {
         N3::Unknown(f.payload[13..].to_vec())
     };

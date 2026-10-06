@@ -668,6 +668,14 @@ impl Mover {
         }
     }
 
+    /// `n3TeleportIIR_t::Activate` [N3 0x10029f87], in-playfield branch: `SetRelPosRot(pos, rot)` (docs/zone/world.md §10.2). Unlike
+    /// `CharDCMove` nothing reconciles, so the drawn position snaps; that call does not touch a running path / follow.
+    pub fn on_teleport(&mut self, pos: [f32; 3], rot: &[f32; 4]) {
+        self.pos = pos;
+        self.recon = None;
+        self.yaw = quat_yaw(rot);
+    }
+
     /// `SetWantedDirectionIIR_t`: heading the dynel turns to (live: the direction of the travel that the next
     /// FollowTarget starts). **[GUESS]** semantics, see docs/zone/motion.md §4.
     pub fn on_wanted_direction(&mut self, dir: [f32; 3]) {
