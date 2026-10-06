@@ -26,14 +26,20 @@ Decompile dumps used (not committed): `ChatGUIModule_c::Initialize` 0x100872bd, 
 
 * **0 = Normal**: `Window::SetStyle(0, flags & 0x300)` (style 0: border Rect(3,7,3,3), tab strip with the window's title, docs/gui.md §6) and `FadeTo(1.0)`.
 * **1 / 2 = Border**: `Window::SetStyle(3, (flags & 0x300) | 0xc3c)` — style 3 has **no frame art**, flag 0x4 → no icon/close/pin buttons
-  (docs/screens.md §9); the window is a transparent borderless rectangle. **2 is the shipped default** (both default windows).
-  The art one sees is the ChatView's own: text area in a `BorderView_c` with `GFX_GUI_INSET_{TL,TR,BL,BR,LEFT,TOP,RIGHT,BOTTOM}` (ids
-  0xf9,0xfb,0xf4,0xf6,0xf7,0xfa,0xf8,0xf5, bg 0), client margin 5 (`_DAT_101a8b98`), when `ChatView::border` (`+0x1b9`, default **true**, setter
-  `FUN_1008daa0`); with border false: `GFX_GUI_WINDOW_BACKGROUND` (0x1bf) and margin 0. The input bar sits in the same kind of BorderView.
+  (docs/screens.md §9); the window is a borderless rectangle. **2 is the shipped default** (both default windows).
+  What it shows is decided by the *mode-dependent look of the `GroupChatView_c`* — `FUN_100aab08(mode)`, called from the mode setter (`FUN_10096ec5`) for a one-tab window:
+  mode 0: `BorderView_c::SetGfx(0 ×9)`, client borders 3 (`_DAT_101a96d4`), `ChatView::SetBorder(true)` (`FUN_1008daa0(1)`); mode 1: `SetGfx(0x1bc,0x1be,0x1b7,0x1b9,0x1ba,0x1bd,0x1bb,0x1b8,0x1bf)`
+  = `GFX_GUI_WINDOW3_BORDER_*` + `GFX_GUI_WINDOW_BACKGROUND`, client borders 3, `SetLocalAlpha(0.4)` (`_DAT_101b9e78`), `SetBorder(true)`; **mode 2: `SetGfx(0 ×9)`, client borders 0,
+  `SetBorder(false)`**; all three then call `FUN_1008e4f0(1)` (stores `+0x1b8`, forwards to the text view `FUN_100929ae`). `ChatView::SetBorder` (`FUN_1008daa0`, field `+0x1b9`, ctor default true) reconfigures
+  the text area's `BorderView_c` (`+0x1a0`) **and** the input bar's (`+0x1a4`): `true` → `GFX_GUI_INSET_{TL,TR,BL,BR,LEFT,TOP,RIGHT,BOTTOM}` (0xf9,0xfb,0xf4,0xf6,0xf7,0xfa,0xf8,0xf5, bg 0), client margin 5
+  (`_DAT_101a8b98`); `false` → **no border art, bg `GFX_GUI_WINDOW_BACKGROUND` (0x1bf, black), client margin 0**. So the shipped borderless windows are two black panels (text area, input bar)
+  that the window alpha (0.8 active / 0.3 inactive) fades together with the text; the port used to draw the inset outline without any fill there (the "transparent chat" of the live harness).
 * Window alpha (modes ≠ 0): `FUN_10096b23`: the selected tab's window is *active* (`+0xda`) → `Window::FadeTo(window_transparency_active, 0.2 s)`
   else `FadeTo(window_transparency_inactive, 1 s)` (200000 / 1000000 µs). Defaults 0.8 / 0.3 (`_DAT_101b8a54` = 0.8, `_DAT_101ae0ec` = 0.3);
   the menu's two sliders write them (`FUN_10096db3` / `FUN_10096de4`).
-  *Port*: `Gui::set_window_alpha` multiplies everything drawn in the window; active = the window's input bar has the keyboard focus.
+  *Port*: `Gui::set_window_alpha` multiplies everything drawn in the window; active = the window's input bar has the keyboard focus. The fade scope is the *whole* window, text included:
+  `Window::FadeTo` 0x10155856 stores the target, `Window::UpdateFadeLevel` 0x10155653 interpolates and calls `View::SetAlpha(rootView, base × level)` on the window's root view (and the tab views),
+  so an inactive default window really is 30 % text on a 30 % black panel (checked, not a port artefact). Mode 0 calls `FadeTo(1.0)` (no fade).
 * `is_frontmost` / `is_backmost` (chat_window_config) set window flags 0x100 / 0x200 (`FUN_10097ae3`): ported as `Gui::set_window_layer` (1 / -1), toggled by the menu entries *AlwaysOnTop* / *AlwaysBehind* (§12) and persisted.
 * Mode 0 (framed "Normal") is ported: a style-0 `ao_gui` window with the tab strip (docs/gui.md §6.1), movable / resizable by its frame, one tab per chat window (§10, §11). The Window menu's *Normal* entry switches to it.
 
@@ -124,8 +130,11 @@ Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), co
 
 * Enter in the editor → `ChatView` signal → the hub gets `WinOut::Submit { text, window_group }`; `deactivate_on_send` (default true) drops the focus afterwards; empty lines are not submitted.
   Commands `/ch /group /g /o /t /v /say /w /whisper /s /shout /me /script` are parsed by the window object (strings in `FUN_1009dc28` 0x1009dc28, e.g. `ChatCmdFeedback_*`, `ChatWarnWhenSpeakingToUnsubGroups`): hub's job.
-* Prompt overlay (`InputBar_c`, `ChatShowOGrpInInputBar`): output-group name in the output group's colour at alpha 0.6, shifted 4.0 px (`_DAT_101b0840`) right while the editor has focus. **Not ported** (pref default
-  unknown; `win.rs` exposes `active_output_group()` instead). `InputHistory.xml` (`TextLine text=…`, `cursor_pos`) per window: not ported.
+* Prompt overlay (`InputBar_c` ctor `FUN_100919ab`, updater `FUN_10090f0b`, DValue `ChatShowOGrpInInputBar`, shipped default **true**, LoginPrefs.xml): a second read-only `TextView` (flags 0x800, `View::SetAlpha(0.6)` =
+  `_DAT_101b83f0`) over the editor's bounds, visible while the DValue is on **and the editor is empty** (`*(editor + 0x15c) == 0`), moved 4.0 px (`_DAT_101b0840`) right while the editor has the keyboard focus. Its
+  text is the output group's name; the colour is the view default (white × 0.6 = the grey "Clan OOC" of the retail screenshot, so *not* the group colour as an earlier guess said). Port: `TextData::hint` +
+  `Gui::set_text_hint` (the hint is drawn by the empty editor itself instead of by a sibling view), set by `ChatWindows::sync_decor` every frame from the window's output group. **UNRESOLVED**: which function writes the
+  prompt text (we use the same group name as the title); `InputHistory.xml` (`TextLine text=…`, `cursor_pos`) per window: not ported.
 * Links: `FUN_1008e322` → `user://NAME` → signal +0x130 (→ `OpenTellWindow` 0x10085df8 = `FUN_100a6568` tell window), `chatgroup://ID` → signal +0x134 (sets that window's output group),
   anything else → `ChatGUIModule_c::ShowItemRefLink` 0x10085cb5 (`itemref://`, `charref://`, `chatcmd:///…`). Port: `ao_gui::Event::LinkClicked` (activation on mouse-down: confirmed, `TextRenderer_c::MouseDown` 0x101637ef, §13) →
   `WinOut::OpenTell` / output group change / `WinOut::LinkClicked`. Tell windows (`OpenTellWindow` 0x10085df8): docs/chat/social.md §4 (`WinOut::OpenTell` opens the tell window; per-user config files of `FUN_100a658b` are not ported).
@@ -186,7 +195,10 @@ Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot 
 ## 11. Tabs (`Window::InsertTab`)
 
 * A `ChatWindow_c` holds several `GroupChatView_c` tabs, each one window document (`Chat/Windows/WindowN`). `FUN_100974b5` (`Window::InsertTab(index, FUN_100ab980 title, view)`) inserts before the first tab with a
-  greater `tab_index` (document `+0x1e8`) and selects it; the title is the window's `name`. Tab press = `TabView` selection; `FUN_10096b23` takes the alpha of the selected tab's window.
+  greater `tab_index` (document `+0x1e8`) and selects it. **Title** = `FUN_100ab980`: `name` (wrapped in `<font color=red>` when document flag `+0x160`, **UNRESOLVED** meaning, not ported) +, when
+  the DValue `ChatShowOGrpInTitleBar` (shipped default **true**) is on and the output group exists (`FUN_1009a26c`), ` <font color=green>[<group name>]</font>`; the title is HTML (`green` = 0x008000 of
+  TextColors.xml): the retail "Default Window [Clan OOC]" tab. Port: `ChatWindows::title`, re-evaluated every frame (`sync_decor`), tab widths measure the visible text (`Gui::tab_title_width`), runs with an explicit
+  colour keep it (`Tab::SetSelected` only sets the *default* text colour). Tab press = `TabView` selection; `FUN_10096b23` takes the alpha of the selected tab's window.
 * **Drag**: `ChatWindow_c` connects `TabView` signals: `FUN_10097340` (drag start: `TabView::CreateDragImage`, `DragObject_c(mime "chat_gui/group_chat_view", Message{tab_index})`, `View::BeginDrag`),
   `FUN_10097881` (drop on a `ChatWindow`'s `TabView`, accepts only that mime: the dropped tab goes to the position the pointer is at in the target; every other document's `tab_index` ≥ the new index is incremented in
   the target and (`FUN_10097636`) decremented in the source; the source window closes when it has no tab left) and `FUN_10097d0b` (drop on nothing: with **fewer than 2 tabs** `DragObject_c::Cancel`; otherwise a
@@ -230,3 +242,38 @@ Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_win_shot 
 save/reload, border windows fixed, dock / tear-out / reload grouping, selection copy, right-click settings). Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac chat_frame_shot -- --nocapture` →
 `frame-tabs.png` (docked tabs "Combat" selected, "Default Window" inactive, icon and close buttons), `frame-selection.png` (grey `0xc0c0c0` highlight over lines of the bottom-filled text),
 `frame-menu.png` (right-click menu with the Visual sub-menu open).
+
+## 15. Retail comparison and live settings (GuiFidelity pass)
+
+**What the retail screenshot is.** `/tmp/GuiFidelity/ref.png` (an older retail build than 0.7.2, user supplied) shows the chat window in visual mode **0** (style-0 frame, `i` icon, tab strip with two tabs, pin + X).
+That is not a contradiction of the shipped data: the template windows say `visual_mode 2` (client/prefs/NewChar/Chat/Windows/Window{1,2}/Config.xml), the screenshot's user chose *Visual > Mode > Normal* and
+dragged the "Combat" tab onto the "Default Window" strip (§10, §11). The tab titles `Default Window [Clan OOC]` / `Combat [Atlantean Pact *AP*]` are `FUN_100ab980` with `ChatShowOGrpInTitleBar` = its shipped
+default **true** (LoginPrefs.xml line 8). So Normal mode is the thing to be pixel-faithful in, and the borderless default must be what `FUN_100aab08` / `FUN_1008daa0` / `Window::UpdateFadeLevel` say (§2).
+
+Defects found and fixed (all verified against the decompiles above):
+
+1. Borderless (mode 2) windows had no fill. `FUN_1008daa0(false)` gives the text area and the input bar `GFX_GUI_WINDOW_BACKGROUND` panels with margin 0; the port drew the inset outline of mode 0. Now `ChatWindows::doc_xml` builds per mode (0 inset, 1 window3 border α 0.4, 2 black panels).
+2. Framed (mode 0) windows were faded like borderless ones (the port set the window alpha 0.3 inactive for every mode): `FUN_10096ec5` mode 0 calls `FadeTo(1.0)`, so a framed window never fades (`alpha_of`).
+3. Tab titles were the bare window name: now `name` + ` <font color=green>[group]</font>` (HTML tab titles, `Gui::tab_title_width`, colour runs in `draw_tab`).
+4. The empty input bar had no prompt: now the grey group-name prompt (`TextData::hint`).
+5. The CHAT font ignored `ChatFontName/Style/Size`: now `Gui::set_chat_font` (face looked up in the host font dir like Verdana; an unknown face keeps the current font), applied on change.
+
+| aspect | retail screenshot (mode 0) | port, `frame-default.png` | notes |
+|---|---|---|---|
+| frame | style-0, 1 px light outline, `i` left, pin + X right, tab strip above the client | same structure; icons by the FrameButtons slice (docs/gui.md) | art colour = GUIColors DEFAULT cyan (0.7.2) vs the older build's grey |
+| tab strip | selected tab dark with white name + dim green `[group]`, unselected tab pale/translucent with its own colours | selected dark/white + `0x008000` group, unselected `GFX_GUI_TAB_INACTIVE_*` at half alpha, black name, green group | unselected art/text tint differs with the palette (older build); alpha ×2.0 of `Tab::SetSelected` is a GUESS (§11) |
+| background | dark blue, world visible through (~0.7-0.85) | `TAB_BACKGROUND` / `WINDOW_BACKGROUND` at the layer alphas of docs/gui.md §6, world visible through | visual comparison only: the reference crop has no known backdrop pixel values, so a numeric match was not made |
+| inset border | 1 px light inset around text and input | `GFX_GUI_INSET_*`, margin 5 | same ids as `FUN_1008daa0(true)` |
+| scrollbar | up/down arrows + thumb | `GFX_GUI_SCROLLBAR_GRAY_*` arrows + thumb | `SetVScrollBarMode(3)` |
+| input line | grey prompt "Clan OOC" while empty | grey (white × 0.6) group name | `FUN_10090f0b` |
+| fade | none (mode 0) | alpha 1.0 | `FUN_10096ec5` |
+
+**Live settings.** `ChatShowOGrpInTitleBar`, `ChatShowOGrpInInputBar`, `ChatFontName`, `ChatFontStyle`, `ChatFontSize` (tenths of a point; `lfHeight = size / 10`, default 140 = 14 px) are read from the HUD's
+`DValues` every frame (`WinPrefs::from_dvalues`, `flow.rs` → `Chat::set_window_prefs` → `ChatWindows::set_prefs`); a change re-titles the tabs / shows or hides the prompt next frame, a font change rebuilds the windows
+(input bar height = line height + margins). Defaults equal the client's (tested against the shipped templates). `window_transparency_active/inactive`, `show_timestamps` and `visual_mode` are per-window document settings
+(Config.xml, the Window menu) and apply immediately (`alpha_of`, `deliver`). `ChatTextShadowOffset` / `ChatTextFadeDelay` / `ChatTextFadeTime`: the shadow is off in the shipped client (`ChatView::shadow` false, §5) and the
+message fade stays **not ported** (`is_message_fading_enabled` default false; `FUN_1008f432` / `FUN_1009349d` not traced).
+
+**Verification.** `cargo test --release -p ao-gui --test frame` (tab title width, chat font, hint) and `cargo test --release -p aomac chat::win` (titles, mode XML, prompt, alpha rules, prefs defaults).
+Shots with a world-like backdrop (sky gradient over mottled pavement): `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- chat_win_shot chat_frame_shot` → `chat-inactive.png` / `chat-active.png`
+(shipped borderless: black panels, 0.3 / 0.8), `frame-tabs.png`, `frame-default.png` (Normal mode, tabs, prompt), `frame-selection.png`, `frame-menu.png`.

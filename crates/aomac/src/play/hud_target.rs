@@ -239,6 +239,8 @@ pub(super) struct HudTarget {
     /// The `Targetstarget` preference ("Show Target's Target", `LoginPrefs.xml`, default false): the hostile window shows the
     /// target-of-target button.
     pub(super) targets_target: bool,
+    /// `[friendly, hostile]` health bar windows allowed by their criteria (`dvalue:cc_section1 && dvalue:cc_friendly_health_bar` / `..._hostile_health_bar`, docs/gui.md §10).
+    pub(super) bars_enabled: [bool; 2],
     /// The target of the selected dynel as shown in that button (`CCTargetControl_c+0x13c`).
     tot: Option<i32>,
     /// The left press went down on the target-of-target button.
@@ -256,7 +258,7 @@ fn esc(s: &str) -> String {
 impl HudTarget {
     /// Creates the two health-bar windows (`CCFriendlyHealthBar` / `CCHostileHealthBar`) and fills the control-centre target docks.
     pub(super) fn new(gui: &mut Gui, cc: WindowId, size: (u32, u32)) -> anyhow::Result<Self> {
-        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (-1.0, -1.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false, attack: false, info: None };
+        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (-1.0, -1.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None };
         t.create_bars(gui)?;
         for (dock, d) in [("LeftTargetCtrlDock", &t.docks[0]), ("RightTargetCtrlDock", &t.docks[1])] {
             let src = format!(
@@ -512,7 +514,7 @@ impl HudTarget {
         }
         let sel = zone.target.and_then(|t| info(zone, t));
         for b in &mut self.bars {
-            let mine = sel.clone().filter(|i| i.hostile == b.hostile);
+            let mine = sel.clone().filter(|i| i.hostile == b.hostile && self.bars_enabled[usize::from(b.hostile)]);
             if mine != b.shown {
                 gui.set_window_visible(b.window, mine.is_some());
                 if let Some(i) = &mine {
@@ -862,7 +864,7 @@ mod tests {
     struct HudTargetLite(HudTarget);
     impl Default for HudTargetLite {
         fn default() -> Self {
-            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false, attack: false, info: None })
+            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None })
         }
     }
 }

@@ -400,6 +400,16 @@ fn place(frame: Option<[f32; 4]>, template: bool, screen: (u32, u32), reserved: 
     }
 }
 
+/// The window alpha a chat window rests at (`FUN_10096b23`, `FUN_10096ec5`): mode 0 (framed "Normal") calls `Window::FadeTo(1.0)` and never fades; modes 1/2
+/// fade to `window_transparency_active` while the window is active, else to `window_transparency_inactive`.
+fn alpha_of(c: &Cfg, active: bool) -> f32 {
+    match (c.visual_mode, active) {
+        (0, _) => 1.0,
+        (_, true) => c.alpha_active,
+        (_, false) => c.alpha_inactive,
+    }
+}
+
 // ----------------------------------------------------------------------------------------------------------- windows
 
 const MAX_LINES: usize = 100; // `FUN_10088e92` drops the oldest line when the window holds more than 100
@@ -419,6 +429,8 @@ struct Win {
     /// Alpha change per second of the running fade.
     rate: f32,
     active: bool,
+    /// Prompt text currently set on the input bar (the output group's name while the editor is empty, `InputBar_c`), to avoid re-setting it every frame.
+    hint: String,
 }
 
 impl Win {
@@ -444,6 +456,47 @@ struct Frame {
     placed: (i32, i32, u32, u32),
 }
 
+/// The chat DValues the windows follow live (`DistributedValue_c`, defaults of `LoginPrefs.xml` / `MainPrefs.xml`): the hub copies them in every frame
+/// ([`ChatWindows::set_prefs`]); a change re-titles the tabs, shows/hides the input prompt and swaps the CHAT font.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WinPrefs {
+    /// `ChatShowOGrpInTitleBar` (default true; read by `FUN_100ab980`): the tab title gets ` [<output group>]`.
+    pub title_group: bool,
+    /// `ChatShowOGrpInInputBar` (default true; read by `FUN_10090f0b`): the prompt overlay of an empty input bar.
+    pub input_group: bool,
+    /// `ChatFontName` / `ChatFontStyle` / `ChatFontSize` (tenths of a point; defaults Verdana / Regular / 140).
+    pub font: (String, String, i32),
+}
+
+impl Default for WinPrefs {
+    fn default() -> Self {
+        WinPrefs { title_group: true, input_group: true, font: ("Verdana".into(), "Regular".into(), 140) }
+    }
+}
+
+impl WinPrefs {
+    /// The values from the registry; a missing or mistyped variable keeps its default.
+    pub fn from_dvalues(d: &crate::play::dvalue::DValues) -> Self {
+        use crate::play::dvalue::Variant;
+        let base = WinPrefs::default();
+        let flag = |n: &str, def: bool| d.get_i64(n).map_or(def, |v| v != 0);
+        let text = |n: &str, def: String| match d.get(n) {
+            Some(Variant::Str(s)) if !s.is_empty() => s.clone(),
+            _ => def,
+        };
+        let size = match d.get("ChatFontSize") {
+            Some(Variant::Int(v)) => *v as i32,
+            Some(Variant::Float(v)) => *v as i32,
+            _ => base.font.2,
+        };
+        WinPrefs {
+            title_group: flag("ChatShowOGrpInTitleBar", base.title_group),
+            input_group: flag("ChatShowOGrpInInputBar", base.input_group),
+            font: (text("ChatFontName", base.font.0), text("ChatFontStyle", base.font.1), size),
+        }
+    }
+}
+
 pub struct ChatWindows {
     wins: Vec<Win>,
     frames: Vec<Frame>,
@@ -459,6 +512,8 @@ pub struct ChatWindows {
     dirty: bool,
     /// What the open popup menu acts on.
     menu: Option<menu::Ctx>,
+    /// Chat DValues in effect ([`WinPrefs`]).
+    pw: WinPrefs,
 }
 
 /// `ChatView_c` text view flags 0xe6c (`FUN_100925ff`): ENABLE_SHADOW | FILL_BOTTOM_UP | DISABLE_RC_MENU | WORD_WRAP | MULTILINE |

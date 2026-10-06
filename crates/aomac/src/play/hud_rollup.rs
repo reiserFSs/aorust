@@ -137,7 +137,8 @@ impl Rollup {
         let window = gui.open_window_xml(&format!("Rollup_{key}"), &src, (0, 0), WindowSize::Preferred)?;
         let image = |gui: &Gui, n: &str, dst: [f32; 4]| gui.gfx_id(n).map(GfxId).map(|g| {
             let (w, h) = gui.gfx().size(g);
-            CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst, alpha: 1.0 }
+            // `PageHeaderView_c` 0x1004a07d builds its buttons like `WndBorder`'s `BorderButton_c`: raised view in DEFAULT at the layer-2 alpha
+            CanvasItem::ImageTint { id: g, src: [0.0, 0.0, w as f32, h as f32], dst, color: 0x1000000, alpha: 0.85 }
         });
         // header: dark band, the icon / arrow / close art (the arrow is `ROLLUP_EXPAND_STATE1` when collapsed, `COLLAPSE_STATE1` when expanded)
         gui.set_canvas(window, "header_bg", vec![CanvasItem::Solid { dst: [0.0, 0.0, w as f32, header as f32], color: 0x000000, alpha: 0.85 }]);
@@ -166,7 +167,8 @@ impl Rollup {
         let art = if page.expanded { COLLAPSE } else { EXPAND };
         let items = gui.gfx_id(art).map(GfxId).map(|g| {
             let (w, h) = gui.gfx().size(g);
-            CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, size.0 as f32, size.1 as f32], alpha: 1.0 }
+            // a toggle button: the pressed view (SELECTED) while expanded, DEFAULT when collapsed (**GUESS** for the value; the retail shot shows the expanded pages' button cream)
+            CanvasItem::ImageTint { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, size.0 as f32, size.1 as f32], color: if page.expanded { 0x2000000 } else { 0x1000000 }, alpha: 0.85 }
         });
         gui.set_canvas(page.window, "arrow", items.into_iter().collect());
     }

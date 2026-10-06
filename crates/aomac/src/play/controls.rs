@@ -297,6 +297,29 @@ impl Default for ControlPrefs {
 }
 
 impl ControlPrefs {
+    /// The options window's values (docs/gui.md "Options window"): the DValues `MouseTurnSensitivity`, `ZoomSpeed`, `LMBMouseLook`, `RMBMouseLook1st/3rd`,
+    /// `ZoomTo1stPerson`, `ShowMyCharacter`, `MouseWheel` and the login pref `MouseLookInverted`; unknown ones keep the defaults.
+    pub fn from_dvalues(d: &super::dvalue::DValues) -> Self {
+        use super::dvalue::{Kind, Variant};
+        let mut p = Self::default();
+        let f = |n: &str, def: f32| match d.get(n) {
+            Some(Variant::Float(v)) => *v,
+            Some(Variant::Int(v)) => *v as f32,
+            _ => def,
+        };
+        p.mouse_turn_sensitivity = f("MouseTurnSensitivity", p.mouse_turn_sensitivity);
+        p.zoom_speed = f("ZoomSpeed", p.zoom_speed);
+        let b = |n: &str, def: bool| if d.exists(n) { d.flag(n) } else { def };
+        p.lmb_mouse_look = b("LMBMouseLook", p.lmb_mouse_look);
+        p.rmb_mouse_look_1st = b("RMBMouseLook1st", p.rmb_mouse_look_1st);
+        p.rmb_mouse_look_3rd = b("RMBMouseLook3rd", p.rmb_mouse_look_3rd);
+        p.zoom_to_1st_person = b("ZoomTo1stPerson", p.zoom_to_1st_person);
+        p.show_my_character = b("ShowMyCharacter", p.show_my_character);
+        p.mouse_wheel = d.get_i64("MouseWheel").unwrap_or(0).clamp(0, 2) as u8;
+        p.mouse_look_inverted = d.prefs.get_int("MouseLookInverted", Kind::Login).unwrap_or(0) != 0;
+        p
+    }
+
     /// Overrides the defaults with the `<Value name=".." value=".."/>` entries of a prefs XML.
     pub fn from_xml(xml: &str) -> Self {
         let mut p = Self::default();
@@ -439,6 +462,11 @@ pub struct Controls {
 }
 
 impl Controls {
+    /// The options changed (live from the DValues).
+    pub fn set_prefs(&mut self, prefs: ControlPrefs) {
+        self.prefs = prefs;
+    }
+
     /// Client defaults ([`DEFAULT_BINDINGS`] + fixed camera keys).
     pub fn new(prefs: ControlPrefs) -> Self {
         let mut bindings = DEFAULT_BINDINGS.to_vec();

@@ -19,6 +19,16 @@ pub enum DrawCmd {
     Clip(Option<[i32; 4]>),
 }
 
+impl DrawCmd {
+    /// Multiplies the command's alpha (a faded window's frame art is emitted first and scaled afterwards).
+    pub fn scale_alpha(&mut self, k: f32) {
+        match self {
+            DrawCmd::Gfx { alpha, .. } | DrawCmd::Glyph { alpha, .. } | DrawCmd::Solid { alpha, .. } => *alpha *= k,
+            DrawCmd::Clip(_) => {}
+        }
+    }
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct DrawList {
     pub cmds: Vec<DrawCmd>,

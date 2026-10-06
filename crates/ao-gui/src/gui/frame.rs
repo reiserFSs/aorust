@@ -229,8 +229,7 @@ impl Gui {
         let mut l = tv.l + TAB_LEFT_MARGIN;
         tabs.iter()
             .map(|t| {
-                let tw: i32 = t.chars().map(|c| self.fonts.font(FontId::Normal).advance(c)).sum();
-                let wd = tw as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
+                let wd = self.tab_title_width(t) as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
                 let r = Rect::new(l, tv.t, l + wd - 1.0, tv.t + TAB_H - 1.0);
                 l += wd;
                 r
@@ -366,8 +365,7 @@ impl Gui {
         let (wid, tab) = (d.window, d.tab);
         let (tabs, _) = self.window_tabs(wid);
         let Some(title) = tabs.get(tab).cloned() else { return };
-        let tw: i32 = title.chars().map(|c| self.fonts.font(FontId::Normal).advance(c)).sum();
-        let w = tw as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
+        let w = self.tab_title_width(&title) as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
         let m = self.mouse;
         let r = Rect::new(m.x - w * 0.5, m.y - TAB_H * 0.5, m.x + w * 0.5 - 1.0, m.y + TAB_H * 0.5 - 1.0);
         let col = self.map_color(0x1000000);
@@ -389,7 +387,26 @@ impl Gui {
             self.push_gfx(out, gr, Rect::new(tab.r - wr + 1.0, tab.t, tab.r, tab.b), col, alpha);
         }
         let text = if selected { [255; 3] } else { [0; 3] };
-        self.draw_string(out, FontId::Normal, title, (tab.l + TAB_PAD_L) as i32, tab.t as i32, text, fade, false);
+        // The title is a `TextView` (HTML subset): a `<font color=..>` run keeps its own colour, the rest uses the tab's text colour.
+        let runs = self.tab_runs(title);
+        let mut pen = (tab.l + TAB_PAD_L) as i32;
+        for run in runs {
+            let c = run.color.map_or(text, rgb);
+            pen += self.draw_string(out, FontId::Normal, &run.text, pen, tab.t as i32, c, fade, false);
+        }
+    }
+
+    /// Runs of a tab title (`FUN_100ab980` builds `name` + ` <font color=green>[group]</font>`; markup-free titles give one run).
+    pub(super) fn tab_runs(&mut self, title: &str) -> Vec<text::TextRun> {
+        let l = text::layout_text(&mut self.fonts, &self.colors, FontId::Normal, title, 0, None);
+        l.lines.into_iter().flat_map(|l| l.runs).collect()
+    }
+
+    /// Width of a tab title in pixels (sum of its run advances).
+    pub fn tab_title_width(&mut self, title: &str) -> i32 {
+        let runs = self.tab_runs(title);
+        let fnt = self.fonts.font(FontId::Normal);
+        runs.iter().map(|r| r.advance(fnt)).sum()
     }
 }
 

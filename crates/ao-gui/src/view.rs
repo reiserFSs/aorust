@@ -106,6 +106,8 @@ pub struct TextData {
     pub caret: usize,
     pub anchor: Option<usize>,
     pub scroll_x: f32,
+    /// `InputBar_c` prompt overlay (`FUN_100919ab`: a second read-only `TextView`, alpha 0.6, shown while the editor is empty): HTML drawn over an empty editable text.
+    pub hint: String,
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +289,9 @@ pub struct View {
     pub color: u32,
     /// `View::SetAlpha`.
     pub alpha: f32,
+    /// Black `ViewSurface_c` behind the view at this alpha (`View::AddRenderSurface`, colour 0; `RollupController_c` 0x10048346 keeps it at
+    /// `cc_rollup_controller_fade_level`); 0 = none.
+    pub backdrop: f32,
     pub tab_order: i32,
     /// `activate_criteria` / `criteria` expression (`docs/gui.md` §10): evaluated by `Gui::apply_criteria`.
     pub criteria: String,
@@ -295,6 +300,9 @@ pub struct View {
     /// `width_group` / `width_group_owner` (`View::SetWidthGroup`): all views of one group under the owner ancestor get the group's widest
     /// preferred width (docs/gui.md §11; Skills.xml).
     pub width_group: Option<(String, String)>,
+    /// `fade_group` (`View::SetFadeGroup` 0x1014ac6d): name of the `FadeGroupController_c` group this view belongs to; empty = none
+    /// (`gui/fade.rs`). The controller writes [`View::alpha`].
+    pub fade_group: String,
 }
 
 impl View {
@@ -319,10 +327,12 @@ impl View {
             enabled: true,
             color: 0xffffff,
             alpha: 1.0,
+            backdrop: 0.0,
             tab_order: -1,
             criteria: String::new(),
             tip: None,
             width_group: None,
+            fade_group: String::new(),
         }
     }
 }
@@ -459,6 +469,7 @@ fn apply_view_attrs(v: &mut View, e: &Element, default_flags: u32) {
     v.tab_order = e.attr("tab_order").and_then(parse_int).map_or(-1, |v| v as i32);
     v.width_group = e.attr("width_group").filter(|g| !g.is_empty()).map(|g| (g.to_string(), e.attr("width_group_owner").unwrap_or("").to_string()));
     v.criteria = e.attr("activate_criteria").or_else(|| e.attr("criteria")).unwrap_or("").to_string();
+    v.fade_group = e.attr("fade_group").unwrap_or("").to_string();
 }
 
 fn default_gfx(ctx: &BuildCtx, ids: [u32; 9]) -> [Option<GfxId>; 9] {
@@ -504,6 +515,7 @@ fn text_data(ctx: &BuildCtx, e: &Element) -> TextData {
         caret: 0,
         anchor: None,
         scroll_x: 0.0,
+        hint: String::new(),
     }
 }
 
@@ -834,7 +846,7 @@ fn build_dropdown(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> ViewId {
     border.min_size = Point::new(16.0, 21.0);
     let border_id = tree.add(border);
 
-    let mut label = View::new(Kind::Text(TextData { text: String::new(), font: FontId::Normal, tvf: 0, min_pref: Point::new(70.0, -1.0), max_pref: Point::new(70.0, -1.0), caret: 0, anchor: None, scroll_x: 0.0 }));
+    let mut label = View::new(Kind::Text(TextData { text: String::new(), font: FontId::Normal, tvf: 0, min_pref: Point::new(70.0, -1.0), max_pref: Point::new(70.0, -1.0), caret: 0, anchor: None, scroll_x: 0.0, hint: String::new() }));
     label.name = "_text".into();
     label.borders = Rect::new(6.0, 3.0, 6.0, 3.0);
     let label_id = tree.add(label);

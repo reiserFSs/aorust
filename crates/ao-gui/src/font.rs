@@ -125,6 +125,7 @@ impl Font {
 
 pub struct FontSystem {
     fonts: HashMap<FontId, Font>,
+    dir: PathBuf,
 }
 
 impl FontSystem {
@@ -162,10 +163,28 @@ impl FontSystem {
         ] {
             fonts.insert(id, tt("Verdana", h, b, i)?);
         }
-        Ok(Self { fonts })
+        Ok(Self { fonts, dir })
     }
     pub fn font(&mut self, id: FontId) -> &mut Font {
         self.fonts.get_mut(&id).expect("all FontIds are loaded")
+    }
+
+    /// Re-creates the CHAT font from the `ChatFontName` / `ChatFontStyle` / `ChatFontSize` prefs (`size` in tenths of a point = `lfHeight * 10`, so
+    /// 140 = the default 14 px). The face is looked up in the host font dir like Verdana; an unknown face or style leaves the font unchanged
+    /// (returns false). Returns whether the metrics changed.
+    pub fn set_chat(&mut self, family: &str, style: &str, size: i32) -> bool {
+        let (bold, italic) = match style.to_ascii_lowercase().as_str() {
+            "bold" => (true, false),
+            "italic" => (false, true),
+            "bold italic" | "bolditalic" => (true, true),
+            _ => (false, false),
+        };
+        let lf = (size / 10).clamp(5, 48);
+        let Ok(f) = TtFont::new(&self.dir, family, lf, bold, italic) else { return false };
+        let mut font = Font { height: f.cell_height, space: 0, kind: Kind::Tt(f), cache: HashMap::new() };
+        font.space = font.advance(' ');
+        self.fonts.insert(FontId::Chat, font);
+        true
     }
 }
 

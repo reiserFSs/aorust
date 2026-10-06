@@ -82,6 +82,11 @@ pub enum Event {
     /// The left button went down on the icon button of a style-0 frame that is movable (`WndBorder::SlotIconButton` 0x1015a74e opens the window's
     /// icon menu; `x`,`y` = the button's bottom-left, where the menu goes).
     FrameIcon { window: WindowId, x: i32, y: i32 },
+    /// The pin button of a frame was clicked (`BorderButton_c` created by `WndBorder::CreateBorderIcons` 0x1015aba4; a toggle without slot): `pinned` is the new
+    /// value read by `WndBorder::GetPinButtonState` 0x10158ea0 (`Window::_CanFade`, `SaveWndConfig`). The engine already applied it (a pinned window never fades).
+    FramePin { window: WindowId, pinned: bool },
+    /// The `?` button of a frame was released (`WndBorder::SlotHelpButton` 0x10159e22 emits `GlobalSignals+0x188("file://" + help file)`): `url` is that string.
+    FrameHelp { window: WindowId, url: String },
     /// A tab of a style-0 frame was pressed (`TabView` selection): the engine already switched `Gui::window_tabs`'s selected index.
     TabSelected { window: WindowId, index: usize },
     /// A tab dragged beyond 4 px (**GUESS** threshold) was released: `target` = the tab strip of a (possibly the same) window under the pointer with the

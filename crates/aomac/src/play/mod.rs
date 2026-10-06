@@ -51,6 +51,7 @@ mod interact_shop;
 mod interact_trade;
 mod interact_use;
 mod logout;
+mod options;
 mod own_nanos;
 mod movement;
 mod player;

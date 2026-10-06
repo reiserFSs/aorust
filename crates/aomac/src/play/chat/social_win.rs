@@ -463,6 +463,7 @@ impl SocialWin {
         let _ = (x, y);
         let (cw, ch) = (w - 10, h - 31); // client = outer minus the frame insets (5, 26, 5, 5)
         let Ok(win) = gui.open_tabbed_window("LFTView", &title, (0, 0), WindowSize::Fixed(cw, ch)) else { return };
+        gui.set_window_help(win, Some("The LFT Window.html")); // `FUN_100f03fb` (string 0x101c109c)
         let (ow, oh) = gui.outer_size(win);
         gui.set_window_pos(win, ((self.screen.0 as i32 - ow as i32) / 2 + 5, (self.screen.1 as i32 - oh as i32) / 2 + 26));
         let professions: Vec<u32> = social::lft_professions().chain([0x10]).collect();

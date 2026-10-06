@@ -191,9 +191,18 @@ impl IndepPrefs {
         self.changed.push(name.into());
     }
 
-    #[cfg(test)]
     pub fn get_int(&self, name: &str, k: Kind) -> Option<i32> {
         self.set_of(k).ints.get(name).map(|p| p.value)
+    }
+
+    /// `GetIntMinMaxValue` (0x10002ef6): the registered range of an int pref.
+    pub fn int_range(&self, name: &str, k: Kind) -> Option<(i32, i32)> {
+        self.set_of(k).ints.get(name).map(|p| (p.min, p.max))
+    }
+
+    /// `GetFloatMinMaxValue`.
+    pub fn float_range(&self, name: &str, k: Kind) -> Option<(f32, f32)> {
+        self.set_of(k).floats.get(name).map(|p| (p.min, p.max))
     }
 
     /// The int pref `name` of whichever set has it (login first), for readers outside the DValue code (`ShowNPCQuestions` of the NPC chat view).

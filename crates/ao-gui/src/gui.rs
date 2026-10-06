@@ -15,6 +15,8 @@ use crate::view::*;
 use crate::xml;
 
 mod cc;
+mod border;
+mod fade;
 mod button;
 mod checkbox;
 mod canvas;
@@ -81,6 +83,8 @@ struct Window {
     layer: i8,
     /// Frame interaction set by the application (`gui/frame.rs`).
     fx: frame::WinFx,
+    /// Border buttons / hover fade (`gui/border.rs`).
+    bd: border::Border,
 }
 
 /// Seconds between the presses of a double click on a `CanvasView` (Windows' default `GetDoubleClickTime`; UNRESOLVED: the client's own value).
@@ -124,7 +128,9 @@ pub struct Gui {
     popup: Option<Popup>,
     scroll_drag: Option<(ViewId, f32)>,
     /// Window whose frame close button is held down.
-    frame_press: Option<WindowId>,
+    frame_press: Option<(WindowId, border::Btn)>,
+    /// Window under the pointer for the `FadeWindows` hover fade (`gui/border.rs`).
+    border_hover: Option<WindowId>,
     /// Frame drag / tab drag / popup menu / text selection state (`gui/{frame,popup,select}.rs`).
     ix: frame::Ix,
     /// State of the list widgets (`gui/listview.rs`, `gui/hscroll.rs`).
@@ -139,6 +145,8 @@ pub struct Gui {
     /// Elements/attributes the engine could not honour while building views.
     pub warnings: Vec<String>,
     tip: tooltip::TipState,
+    /// `FadeGroupController_c` (`gui/fade.rs`).
+    fade: fade::FadeCtl,
 }
 
 fn px(r: Rect) -> [f32; 4] {
@@ -196,6 +204,7 @@ impl Gui {
             popup: None,
             scroll_drag: None,
             frame_press: None,
+            border_hover: None,
             ix: Default::default(),
             wx: Default::default(),
             canvas_press: None,
@@ -204,6 +213,7 @@ impl Gui {
             text_shadow: (1, 1),
             warnings: Vec::new(),
             tip: Default::default(),
+            fade: Default::default(),
         })
     }
 
@@ -243,7 +253,7 @@ impl Gui {
         let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
         let root = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{name}: cannot build root"))?;
         self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{name}: {w}")));
-        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false, title: None, alpha: 1.0, layer: 0, fx: Default::default() }));
+        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false, title: None, alpha: 1.0, layer: 0, fx: Default::default(), bd: Default::default() }));
         let id = self.windows.len() - 1;
         self.resize_window(id, size);
         Ok(id)
@@ -276,6 +286,9 @@ impl Gui {
         if let Some(Some(w)) = self.windows.get_mut(id) {
             w.framed = true;
             w.title = Some(title.to_string());
+            // `DockWindow_c` flags 0x1000 (0x800 clear): pin button, takes part in the hover fade
+            w.bd.pin = true;
+            w.bd.fade = true;
         }
     }
 
@@ -582,6 +595,28 @@ impl Gui {
         }
     }
 
+    /// Applies the `ChatFontName` / `ChatFontStyle` / `ChatFontSize` prefs to the CHAT font live ([`FontSystem::set_chat`](font::FontSystem::set_chat)) and
+    /// re-lays every window out. False (nothing changed) when the face is not available.
+    pub fn set_chat_font(&mut self, family: &str, style: &str, size: i32) -> bool {
+        if !self.fonts.set_chat(family, style, size) {
+            return false;
+        }
+        self.glyph_map.retain(|(f, _), _| *f != FontId::Chat);
+        for w in 0..self.windows.len() {
+            self.relayout_window(w);
+        }
+        true
+    }
+
+    /// Prompt text (HTML) drawn at alpha 0.6 over the named editable `TextView` while it is empty (`InputBar_c` prompt, docs/chat/gui.md §6).
+    pub fn set_text_hint(&mut self, w: WindowId, name: &str, html: &str) {
+        if let Some(e) = self.find(w, name).and_then(|v| self.editor_of(v)) {
+            if let Kind::Text(t) = &mut self.tree.views[e].kind {
+                t.hint = html.to_string();
+            }
+        }
+    }
+
     /// `TextView_c::SetText` / `TextInputView_c::SetText`; also sets button labels.
     pub fn set_text(&mut self, w: WindowId, name: &str, text: &str) {
         let Some(v) = self.find(w, name) else { return };
@@ -811,15 +846,21 @@ impl Gui {
         self.time += dt;
         self.widgets_sync();
         self.tick_cc_fades(dt);
+        self.tick_fade_groups(dt);
         self.sel_autoscroll(dt);
+        self.tick_window_fades(dt);
         let mut out = DrawList::default();
-        let mut order: Vec<&Window> = self.windows.iter().flatten().filter(|w| w.visible).collect();
-        order.sort_by_key(|w| w.layer); // stable: creation order inside a layer
-        type Job = (ViewId, (i32, i32), bool, f32, Option<String>);
-        let wins: Vec<Job> = order.into_iter().map(|w| (w.root, w.pos, w.framed, w.alpha, w.title.clone())).collect();
-        for (root, pos, framed, alpha, title) in wins {
+        let mut order: Vec<(WindowId, &Window)> = self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (i, w))).collect();
+        order.sort_by_key(|(_, w)| w.layer); // stable: creation order inside a layer
+        type Job = (WindowId, ViewId, (i32, i32), bool, f32, Option<String>);
+        let wins: Vec<Job> = order.into_iter().map(|(i, w)| (i, w.root, w.pos, w.framed, w.alpha * w.bd.cur, w.title.clone())).collect();
+        for (wid, root, pos, framed, alpha, title) in wins {
             if framed {
+                let first = out.cmds.len();
                 self.draw_frame(root, pos, title.as_deref(), &mut out.cmds);
+                self.draw_border_buttons(wid, &mut out.cmds);
+                // `Window::FadeTo` multiplies the frame art as well
+                out.cmds[first..].iter_mut().for_each(|c| c.scale_alpha(alpha));
             }
             self.draw_view(root, pos.0 as f32, pos.1 as f32, [255; 3], alpha, true, &mut out.cmds);
         }
@@ -914,6 +955,9 @@ impl Gui {
         let rect = Rect::new(x0, y0, x0 + v.frame.width(), y0 + v.frame.height());
         let tint = mul(parent_tint, self.map_color(v.color));
         let alpha = parent_alpha * v.alpha;
+        if v.backdrop > 0.0 {
+            out.push(DrawCmd::Solid { dst: [rect.l, rect.t, rect.r + 1.0, rect.b + 1.0], color: [0; 3], alpha: alpha * v.backdrop });
+        }
         match &v.kind {
             Kind::Border(b) => {
                 let t = mul(parent_tint, self.map_color(b.local_color));
@@ -942,14 +986,20 @@ impl Gui {
                 }
             }
             Kind::CheckBox { label, checked } => {
+                // a disabled control (`view_enable_expression`, `View::SlotUpdateEnabledState`) is drawn in the 0x909090 grey of `Button_c::StateChanged`
+                let tint = if v.enabled { tint } else { mul(tint, [0x90; 3]) };
                 let g = if *checked { "GFX_GUI_CHECKBOX_CHECKED" } else { "GFX_GUI_CHECKBOX_UNCHECKED" };
                 if let Some(id) = self.gfx.id(g) {
                     self.push_gfx(out, id, Rect::new(rect.l, rect.t, rect.l + 10.0, rect.t + 10.0), tint, alpha);
                 }
                 self.draw_string(out, FontId::Normal, &label.clone(), rect.l as i32 + 15, rect.t as i32, tint, alpha, false);
             }
-            Kind::RadioButton { label, .. } => {
-                if let Some(id) = self.gfx.id("GFX_GUI_RADIOBUTTON_UNCHECKED") {
+            Kind::RadioButton { label, value } => {
+                let tint = if v.enabled { tint } else { mul(tint, [0x90; 3]) };
+                // checked while its `RadioButtonGroup` holds this value
+                let on = v.parent.is_some_and(|p| matches!(self.tree.views[p].kind, Kind::RadioGroup { selected } if selected == *value));
+                let g = if on { "GFX_GUI_RADIOBUTTON_CHECKED" } else { "GFX_GUI_RADIOBUTTON_UNCHECKED" };
+                if let Some(id) = self.gfx.id(g) {
                     self.push_gfx(out, id, Rect::new(rect.l, rect.t, rect.l + 10.0, rect.t + 10.0), tint, alpha);
                 }
                 self.draw_string(out, FontId::Normal, &label.clone(), rect.l as i32 + 15, rect.t as i32, tint, alpha, false);
@@ -1135,6 +1185,15 @@ impl Gui {
                 }
             }
         }
+        // `InputBar_c` prompt overlay (`FUN_10090f0b`): visible while the editor is empty, moved right by `_DAT_101b0840` = 4 px while the editor has the focus.
+        if editable && t.text.is_empty() && !t.hint.is_empty() {
+            let hint = text::layout_text(&mut self.fonts, &self.colors, t.font, &t.hint, 0, None);
+            let mut pen = origin_x + if focused { 4 } else { 0 };
+            for run in hint.lines.iter().flat_map(|l| &l.runs) {
+                let c = run.color.map_or(tint, |c| mul(tint, rgb(c)));
+                pen += self.draw_string(out, t.font, &run.text, pen, r.t as i32, c, alpha * 0.6, false);
+            }
+        }
         if editable && focused {
             // caret: 1px line, blink 0.5s (UNRESOLVED: TextRenderer_c::SlotCursorTimer period/colour)
             let on = ((self.time - self.caret_epoch) * 2.0) as i64 % 2 == 0;
@@ -1200,13 +1259,11 @@ impl Gui {
         names.map(|n| self.gfx.id(n))
     }
 
-    /// `WndBorder::Layout` 0x1015a1d9: border icons are `GFX_GUI_WINDOW_*` 15x15 sprites (pref size 14x14 as
-    /// Rect r-l) at y = 5 from the window top; the icon button (BorderID 0) flush left, the close button
-    /// (BorderID 1) flush right (`x = bounds.r - w`).  Returns (icon, close) in screen px.
+    /// `WndBorder::Layout` 0x1015a1d9 (`gui/border.rs`): the icon button (list 0) at the left, the close button (list 1) first from the right.
+    /// Returns (icon, close) in screen px.
     fn frame_buttons(&self, root: ViewId, pos: (i32, i32), tabbed: bool) -> (Rect, Rect) {
-        let outer = self.outer_rect(root, pos, tabbed);
-        let t = outer.t + 5.0;
-        (Rect::new(outer.l, t, outer.l + 14.0, t + 14.0), Rect::new(outer.r - 14.0, t, outer.r, t + 14.0))
+        let v = border::layout(self.outer_rect(root, pos, tabbed), false, false);
+        (v[0].1, v[1].1)
     }
 
     /// Outer rectangle (inclusive) of a framed window whose client origin is `pos`.
@@ -1231,16 +1288,7 @@ impl Gui {
             let client = Rect::new(pos.0 as f32 - 1.0, pos.1 as f32 - 1.0, pos.0 as f32 + f.width() + 1.0, pos.1 as f32 + f.height() + 1.0);
             self.draw_border(out, &i, client, col, 1.0);
         }
-        let (icon, close) = self.frame_buttons(root, pos, title.is_some());
-        let over = |r: Rect, m: Point| m.x >= r.l && m.x <= r.r + 1.0 && m.y >= r.t && m.y <= r.b + 1.0;
-        let m = self.mouse;
-        let pressed_close = self.frame_press.is_some() && over(close, m);
-        let close_name = if pressed_close { "GFX_GUI_WINDOW_CLOSE_X_STATE3" } else if over(close, m) { "GFX_GUI_WINDOW_CLOSE_X_STATE2" } else { "GFX_GUI_WINDOW_CLOSE_X" };
-        for (name, r) in [("GFX_GUI_WINDOW_ICON_I", icon), (close_name, close)] {
-            if let Some(x) = self.gfx.id(name) {
-                self.push_gfx(out, x, r, [255; 3], 1.0);
-            }
-        }
+        // the border buttons are drawn by `draw_border_buttons` (called by `frame`)
     }
 
     /// Style-0 `TabView` (`SetRenderFlags(7)`, `LayoutBorders` 0x10145be5, `TopBorderView_c` ctor 0x10147935, `Tab` 0x10146785): the `TabView` fills the
@@ -1260,8 +1308,7 @@ impl Gui {
         let mut l = tv.l + TAB_LEFT_MARGIN;
         let mut drawn = vec![];
         for (i, t) in tabs.iter().enumerate() {
-            let text_w: i32 = t.chars().map(|c| self.fonts.font(FontId::Normal).advance(c)).sum();
-            let w = text_w as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
+            let w = self.tab_title_width(t) as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
             let tab = Rect::new(l, tv.t, l + w - 1.0, tv.t + TAB_H - 1.0);
             l += w;
             if i == sel {
@@ -1496,6 +1543,8 @@ impl Gui {
             }
             self.hover = h;
         }
+        self.fade_hover();
+        self.update_window_hover();
         // a pressed button is only "pressed" while the pointer is over it
         if let Some(p) = self.pressed {
             let over = self.hover == Some(p);
@@ -1557,14 +1606,8 @@ impl Gui {
                 return;
             }
         }
-        for (wid, root, pos) in self.windows_top_down() {
-            if self.windows[wid].as_ref().is_some_and(|w| w.framed) {
-                let c = self.frame_buttons(root, pos, self.windows[wid].as_ref().is_some_and(|w| w.title.is_some())).1;
-                if x >= c.l && x <= c.r + 1.0 && y >= c.t && y <= c.b + 1.0 {
-                    self.frame_press = Some(wid);
-                    return;
-                }
-            }
+        if self.border_press(x, y) {
+            return;
         }
         if self.frame_mouse_down(x, y) {
             return;
@@ -1574,7 +1617,7 @@ impl Gui {
             return;
         };
         match self.tree.views[v].kind.clone() {
-            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::CheckBox { .. } => {
+            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. } => {
                 self.pressed = Some(v);
                 match &mut self.tree.views[v].kind {
                     Kind::Button(b) => b.pressed = true,
@@ -1691,15 +1734,7 @@ impl Gui {
     }
 
     fn mouse_up(&mut self) {
-        if let Some(wid) = self.frame_press.take() {
-            if let Some((root, pos, tabbed)) = self.windows.get(wid).and_then(|w| w.as_ref()).map(|w| (w.root, w.pos, w.title.is_some())) {
-                let c = self.frame_buttons(root, pos, tabbed).1;
-                let m = self.mouse;
-                if m.x >= c.l && m.x <= c.r + 1.0 && m.y >= c.t && m.y <= c.b + 1.0 {
-                    self.events.push(Event::CloseRequested { window: wid });
-                }
-            }
-        }
+        self.border_release();
         if let Some(p) = self.pressed.take() {
             let over = self.hit(self.mouse.x, self.mouse.y).map(|h| h.1) == Some(p);
             self.canvas_release(p);
@@ -1721,8 +1756,14 @@ impl Gui {
                 if let Kind::CheckBox { checked, .. } = &mut self.tree.views[p].kind {
                     *checked = !*checked; // CheckBox_c: a click toggles; reported like a button press
                 }
+                // RadioButton_c: a click selects its value in the `RadioButtonGroup` (`GetValue` = the selected button's `value`)
+                if let (Kind::RadioButton { value, .. }, Some(g)) = (self.tree.views[p].kind.clone(), self.tree.views[p].parent) {
+                    if let Kind::RadioGroup { selected } = &mut self.tree.views[g].kind {
+                        *selected = value;
+                    }
+                }
             }
-            if over && matches!(self.tree.views[p].kind, Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::CheckBox { .. }) && self.tree.views[p].enabled {
+            if over && matches!(self.tree.views[p].kind, Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::CheckBox { .. } | Kind::RadioButton { .. }) && self.tree.views[p].enabled {
                 if let Some(w) = self.window_of(p) {
                     let view = self.tree.views[p].name.clone();
                     let item = self.item_of(p);

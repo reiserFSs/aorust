@@ -16,4 +16,21 @@ impl Gui {
             }
         }
     }
+
+    /// Value of the named `RadioButtonGroup` (`RadioButtonGroup_c::GetValue`: the `value` of the selected button; `None` if it is no group).
+    pub fn radio_value(&self, w: WindowId, name: &str) -> Option<i32> {
+        match self.find(w, name).map(|v| &self.tree.views[v].kind) {
+            Some(Kind::RadioGroup { selected }) => Some(*selected),
+            _ => None,
+        }
+    }
+
+    /// `RadioButtonGroup_c::SetValue`: selects the button with that `value`.
+    pub fn set_radio_value(&mut self, w: WindowId, name: &str, value: i32) {
+        if let Some(v) = self.find(w, name) {
+            if let Kind::RadioGroup { selected } = &mut self.tree.views[v].kind {
+                *selected = value;
+            }
+        }
+    }
 }

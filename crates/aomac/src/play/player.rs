@@ -155,6 +155,12 @@ impl Player {
         built.map_err(|e| eprintln!("player: {e:#}")).ok()
     }
 
+    /// The control options (`ControlPrefs::from_dvalues`) changed: mouse look, zoom, wheel, inversion, own avatar in first person.
+    pub fn set_control_prefs(&mut self, p: &ControlPrefs) {
+        self.controls.set_prefs(p.clone());
+        self.camera.set_prefs(p);
+    }
+
     /// The `ViewDistance` pref changed (`FUN_1001fc91` replaces the camera's far plane at once): the next frame sends the lens again.
     pub fn set_view_distance(&mut self, vd: f32) {
         if vd != self.view_distance {

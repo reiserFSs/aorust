@@ -340,6 +340,11 @@ pub struct Camera3p {
 }
 
 impl Camera3p {
+    /// The options changed (`LMBMouseLook`, `ZoomSpeed`, ... read live from the DValues, docs/gui.md "Options window"); camera state (mode, first person) stays.
+    pub fn set_prefs(&mut self, prefs: &ControlPrefs) {
+        self.prefs = ControlPrefs { third_person: self.prefs.third_person, preferred_camera_mode: self.prefs.preferred_camera_mode, ..prefs.clone() };
+    }
+
     /// `head_height`: height of the head attractor over the feet ([`MIN_PIVOT_HEIGHT`] without one).
     pub fn new(prefs: &ControlPrefs, head_height: f32) -> Self {
         let elev = DEFAULT_DIRECTION[1].asin();

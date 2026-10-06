@@ -311,6 +311,13 @@ impl Chat {
         self.voice_prefs = p;
     }
 
+    /// Chat window DValues (`ChatShowOGrpInTitleBar`, `ChatShowOGrpInInputBar`, `ChatFont*`) from the registry, applied live.
+    pub fn set_window_prefs(&mut self, gui: &mut Gui, p: &win::WinPrefs) {
+        if let Some(w) = &mut self.win {
+            w.set_prefs(gui, p);
+        }
+    }
+
     pub fn take_game(&mut self) -> Vec<GameAction> {
         std::mem::take(&mut self.game)
     }

@@ -288,7 +288,7 @@ impl State {
             present_mode: if std::env::var_os("AOMAC_NOVSYNC").is_some() { wgpu::PresentMode::AutoNoVsync } else { wgpu::PresentMode::AutoVsync },
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![],
+            view_formats: vec![renderer.format.remove_srgb_suffix()], // the GUI pass blends in display space (`GuiRenderer::view`)
         };
         surface.configure(&renderer.device, &config);
         let targets = Targets::new(&renderer, config.width, config.height);
@@ -439,7 +439,8 @@ impl State {
         self.renderer.render(&view, &self.targets, &self.cam);
         self.cpu += t0.elapsed().as_secs_f32();
         if let Some(list) = gui_out {
-            self.paint_gui(list, &view);
+            let gview = crate::GuiRenderer::view(&frame.texture);
+            self.paint_gui(list, &gview);
         }
         self.window.pre_present_notify();
         frame.present();
@@ -626,11 +627,11 @@ impl Offscreen {
             dimension: wgpu::TextureDimension::D2,
             format: self.r.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            view_formats: &[self.r.format.remove_srgb_suffix()],
         });
         let view = tex.create_view(&Default::default());
         self.r.render(&view, &self.targets, &self.host.camera);
-        self.gr.draw(&self.r, &view, self.size, 1, fe.gui(), list);
+        self.gr.draw(&self.r, &crate::GuiRenderer::view(&tex), self.size, 1, fe.gui(), list);
         crate::texture_to_png(&self.r, &tex, self.size.0, self.size.1, path)
     }
 }

@@ -161,3 +161,36 @@ fn popup_slider_item_reports_values_and_stays_open() {
     assert!(g.input(InputEvent::MouseUp { x: 400.0, y: 58.0, button: MouseButton::Left }).is_empty());
     assert!(g.menu_open());
 }
+
+#[test]
+fn tab_titles_are_html_and_size_by_their_visible_text() {
+    let Some(mut g) = gui() else { return };
+    // `FUN_100ab980`: name + ` <font color=green>[group]</font>`; the markup adds no width
+    let plain = g.tab_title_width("Default Window [Clan OOC]");
+    assert_eq!(g.tab_title_width("Default Window <font color=green>[Clan OOC]</font>"), plain);
+    assert!(plain > g.tab_title_width("Default Window"));
+}
+
+#[test]
+fn chat_font_follows_the_prefs_and_unknown_faces_are_refused() {
+    let Some(mut g) = gui() else { return };
+    let base = g.font_height(ao_gui::FontId::Chat);
+    assert!(g.set_chat_font("Verdana", "Bold", 200));
+    assert!(g.font_height(ao_gui::FontId::Chat) > base);
+    assert!(!g.set_chat_font("No Such Face", "Regular", 140), "unknown face keeps the current font");
+    assert!(g.set_chat_font("Verdana", "Regular", 140));
+    assert_eq!(g.font_height(ao_gui::FontId::Chat), base);
+}
+
+#[test]
+fn empty_input_shows_the_hint_until_text_is_typed() {
+    let Some(mut g) = gui() else { return };
+    let xml = r#"<root><View view_layout="vertical"><TextView name="i" font="CHAT" max_size="Point(16000,-1)" feature_flags="TVF_ACCEPT_TXT_INPUT"/></View></root>"#;
+    let w = g.open_window_xml("t", xml, (10, 10), WindowSize::Fixed(200, 30)).unwrap();
+    let glyphs = |g: &mut Gui| g.frame(0.0).cmds.iter().filter(|c| matches!(c, ao_gui::DrawCmd::Glyph { .. })).count();
+    assert_eq!(glyphs(&mut g), 0);
+    g.set_text_hint(w, "i", "Clan OOC");
+    assert_eq!(glyphs(&mut g), 7, "\"Clan OOC\" without the space");
+    g.set_text(w, "i", "x");
+    assert_eq!(glyphs(&mut g), 1, "typed text replaces the prompt");
+}

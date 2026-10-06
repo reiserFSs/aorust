@@ -97,3 +97,6 @@ it was **not** ported table by table. `dvalue/cmd.rs::parse_expr` recreates the 
 
 `InputConfig_t` key-binding int prefs of `SetDefaultLoginPrefs`; `ExpressionParser_c` contexts (`dvalue:` / `stat:` inside `/setoption` values); the `DistributedValue_c` observer lists beyond
 `DValues::take_changed` / `IndepPrefs::take_changed` polling; `ForgetAll` / `ResetToDefault` / `DeleteVariable` (no caller in the chat commands); `prefs/NewChar` consumer (docs/gui.md §10).
+
+## Options window cross-reference
+The options window (docs/gui.md "Options window") writes these DValues / IndependentPrefs live through `DValues::set` / `prefs.set_int|float`; the flow's `take_changed` saves them. `IndepPrefs::int_range/float_range` expose the registered ranges (`GetInt/FloatMinMaxValue`).

@@ -327,6 +327,7 @@ impl HudStats {
         // tab strip (docs/gui.md §6.1, client insets 5, 26, 5, 5) of the same outer size.
         let client = (SKILLS_OUTER.0 - 10, SKILLS_OUTER.1 - 31);
         let w = gui.open_tabbed_window("Skills", "Skills", SKILLS_POS, WindowSize::Fixed(client.0, client.1))?;
+        gui.set_window_help(w, Some("The Skill Window.html")); // `SkillWindow` ctor FUN_100fc18e: `Window::SetHelpFile` (string 0x101c2050)
         for g in &stats::SKILL_GROUPS {
             gui.set_text(w, g.prefix, &self.db.by_id(10010, g.label).unwrap_or_default());
             gui.show_collapsing(w, &format!("{}_view", g.prefix), false);

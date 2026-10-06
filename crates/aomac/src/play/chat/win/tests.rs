@@ -240,7 +240,8 @@ fn chat_win_shot() {
             ch.update(&mut fe.0, 0.016);
         }
         let mut o = ao_render::Offscreen::new(&fe, size).unwrap();
-        let list = o.frame(&mut fe, 0.016);
+        let mut list = o.frame(&mut fe, 0.016);
+        backdrop(&mut list, size);
         std::fs::create_dir_all(&out).unwrap();
         o.png(&fe, &list, &out.join(format!("chat-{variant}.png"))).unwrap();
         eprintln!("wrote chat-{variant}.png");
@@ -291,7 +292,7 @@ fn drag(gui: &mut Gui, ch: &mut ChatWindows, a: (f32, f32), b: (f32, f32)) -> Ve
 /// Midpoint of the move zone (the empty strip right of the tabs) of frame `fi`.
 fn strip(ch: &ChatWindows, fi: usize) -> (f32, f32) {
     let (x, y, w, _) = ch.frames[fi].placed;
-    ((x + w as i32 - 40) as f32, (y + 12) as f32)
+    ((x + w as i32 - 100) as f32, (y + 12) as f32) // right of the tabs, left of the pin / close buttons
 }
 
 /// A point inside the first tab of frame `fi` (tabs start 20 px right of the TabView edge, 3 px inside the window).
@@ -313,7 +314,7 @@ fn border_windows_are_fixed_and_the_menu_gives_a_draggable_frame() {
     // menu "Visual > Normal" (`FUN_100998bc` / `FUN_10096ec5`): style 0 with a tab strip, same outer rectangle
     ch.test_pick(&mut gui, 0, OP_MODE, 0);
     let id = ch.frames[0].id;
-    assert_eq!(gui.window_tabs(id), (vec!["Default Window".to_string()], 0));
+    assert_eq!(gui.window_tabs(id), (vec!["Default Window <font color=green>[Vicinity]</font>".to_string()], 0));
     assert_eq!(gui.window_outer_frame(id), Some(before));
     // drag the strip: the frame follows the pointer and the new rectangle is what `WindowFrame` saves
     let s = strip(&ch, 0);
@@ -351,7 +352,7 @@ fn tabs_dock_tear_out_and_reload() {
     drag(&mut gui, &mut ch, from, to);
     assert_eq!(ch.frames.len(), 1);
     let id = ch.frames[0].id;
-    assert_eq!(gui.window_tabs(id), (vec!["Combat".to_string(), "Default Window".to_string()], 0));
+    assert_eq!(gui.window_tabs(id), (vec!["Combat".to_string(), "Default Window <font color=green>[Vicinity]</font>".to_string()], 0));
     // each tab keeps its own text; the selected one is visible
     assert!(gui.text(id, "text_1").contains("hit you for 12") && gui.text(id, "text_0").contains("Jobe Cluster"));
     // tab_index follows the order
@@ -480,7 +481,8 @@ fn chat_frame_shot() {
             ch.update(&mut fe.0, 0.016);
         }
         let mut o = ao_render::Offscreen::new(fe, size).unwrap();
-        let list = o.frame(fe, 0.016);
+        let mut list = o.frame(fe, 0.016);
+        backdrop(&mut list, size);
         std::fs::create_dir_all(&out).unwrap();
         o.png(fe, &list, &out.join(name)).unwrap();
         eprintln!("wrote {name}");
@@ -501,4 +503,109 @@ fn chat_frame_shot() {
     }
     fe.0.input(InputEvent::MouseMove { x: at.0 + 20.0, y: at.1 + 8.0 });
     shoot(&mut fe, &mut ch, "frame-menu.png");
+    // the "Default Window" tab: lines, scrollbar, and the input bar with the prompt of its output group
+    fe.0.close_menu();
+    fe.0.input(InputEvent::MouseMove { x: 5.0, y: 5.0 });
+    ch.select_tab(&mut fe.0, 0, 1);
+    let (id, names) = (ch.frames[0].id, ch.titles(0));
+    fe.0.set_window_tabs(id, &names, 1);
+    shoot(&mut fe, &mut ch, "frame-default.png");
+}
+
+#[test]
+fn tab_title_names_the_output_group_when_the_dvalue_is_on() {
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    // Window1 "Default Window" talks to Vicinity, Window2 "Combat" to nothing
+    assert_eq!(ch.title(0), "Default Window <font color=green>[Vicinity]</font>");
+    assert_eq!(ch.title(1), "Combat");
+    ch.set_prefs(&mut gui, &WinPrefs { title_group: false, ..WinPrefs::default() });
+    assert_eq!(ch.title(0), "Default Window", "ChatShowOGrpInTitleBar off");
+    ch.set_prefs(&mut gui, &WinPrefs::default());
+    // mode 0: the strip carries the titles, a changed output group re-titles it on the next update
+    ch.test_pick(&mut gui, 0, OP_MODE, 0);
+    ch.set_output_group(3u64 << 32 | 1);
+    ch.add_group(3u64 << 32 | 1, "Clan OOC");
+    ch.update(&mut gui, 0.0);
+    let f = ch.frames[0].id;
+    assert_eq!(gui.window_tabs(f).0, ["Default Window <font color=green>[Clan OOC]</font>"]);
+}
+
+#[test]
+fn borderless_windows_are_black_panels_and_framed_ones_inset() {
+    let Some((_, ch)) = rig((1280, 800)) else { return };
+    let mut ch = ch;
+    // shipped mode 2 (`FUN_1008daa0(false)`): `GFX_GUI_WINDOW_BACKGROUND` panels, no client margin
+    let xml = ch.doc_xml(0, 14);
+    assert!(xml.contains(r#"bg_gfx="GFX_GUI_WINDOW_BACKGROUND""#) && xml.contains(r#"tl_gfx="none""#) && !xml.contains("Rect(5,5,5,5)"), "{xml}");
+    // mode 0: inset art (the parser default) with the 5 px client margin and the 3 px group border
+    ch.wins[0].cfg.visual_mode = 0;
+    let xml = ch.doc_xml(0, 14);
+    assert!(!xml.contains("bg_gfx") && xml.contains("Rect(5,5,5,5)") && xml.contains(r#"layout_borders="Rect(3,3,3,3)""#));
+    // mode 1 (`FUN_100aab08`): window3 border + background at local alpha 0.4 (`_DAT_101b9e78`)
+    ch.wins[0].cfg.visual_mode = 1;
+    assert!(ch.doc_xml(0, 14).contains(r#"alpha="0.4""#));
+}
+
+#[test]
+fn input_prompt_names_the_output_group_while_the_editor_is_empty() {
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    ch.update(&mut gui, 0.0);
+    assert_eq!(ch.wins[0].hint, "Vicinity");
+    assert_eq!(ch.wins[1].hint, "", "Combat has no input bar");
+    ch.set_prefs(&mut gui, &WinPrefs { input_group: false, ..WinPrefs::default() });
+    ch.update(&mut gui, 0.0);
+    assert_eq!(ch.wins[0].hint, "", "ChatShowOGrpInInputBar off");
+}
+
+#[test]
+fn prefs_default_to_the_client_values() {
+    let client = ao_gui::client_dir();
+    if !client.join("cd_image/gui").exists() {
+        return;
+    }
+    let d = crate::play::dvalue::DValues::new(&client);
+    assert_eq!(WinPrefs::from_dvalues(&d), WinPrefs::default());
+    assert_eq!(WinPrefs::default().font, ("Verdana".to_string(), "Regular".to_string(), 140));
+}
+
+/// Draws a world-like backdrop (sky gradient above a mottled pavement) under the GUI so transparency can be judged.
+fn backdrop(list: &mut ao_gui::DrawList, size: (u32, u32)) {
+    use ao_gui::DrawCmd;
+    let mut cmds = vec![];
+    for y in 0..size.1 / 8 {
+        let t = y as f32 / (size.1 / 8) as f32;
+        let c = if t < 0.45 { [(70.0 + 90.0 * t) as u8, (110.0 + 80.0 * t) as u8, (170.0 + 40.0 * t) as u8] } else { [110, 105, 95] };
+        cmds.push(DrawCmd::Solid { dst: [0.0, (y * 8) as f32, size.0 as f32, (y * 8 + 8) as f32], color: c, alpha: 1.0 });
+    }
+    let mut s = 12345u32;
+    for ty in (size.1 * 45 / 100 / 24)..(size.1 / 24 + 1) {
+        for tx in 0..size.0 / 24 + 1 {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let v = 70 + (s >> 24) as u8 / 3;
+            cmds.push(DrawCmd::Solid { dst: [(tx * 24) as f32, (ty * 24) as f32, (tx * 24 + 23) as f32, (ty * 24 + 23) as f32], color: [v, v - 5, v - 15], alpha: 1.0 });
+        }
+    }
+    cmds.append(&mut list.cmds);
+    list.cmds = cmds;
+}
+
+#[test]
+fn framed_windows_never_fade_but_borderless_ones_follow_the_transparency() {
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    // shipped mode 2: rests at `window_transparency_inactive` 0.3
+    assert_eq!(gui.window_alpha(ch.frames[0].id), 0.3);
+    // `FUN_10096ec5` mode 0: `FadeTo(1.0)`; focusing the input does not change that
+    ch.test_pick(&mut gui, 0, OP_MODE, 0);
+    ch.focus_input(&mut gui);
+    for _ in 0..100 {
+        ch.update(&mut gui, 0.016);
+    }
+    assert_eq!(gui.window_alpha(ch.frames[0].id), 1.0);
+    // back to borderless: active 0.8 while the input has the focus
+    ch.test_pick(&mut gui, 0, OP_MODE, 2);
+    ch.focus_input(&mut gui);
+    for _ in 0..100 {
+        ch.update(&mut gui, 0.016);
+    }
+    assert_eq!(gui.window_alpha(ch.frames[0].id), 0.8);
 }

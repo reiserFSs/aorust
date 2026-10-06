@@ -1117,6 +1117,7 @@ impl Frontend for Play {
             if let Some(h) = self.hud.as_ref() {
                 if let Some(p) = self.player.as_mut() {
                     p.set_view_distance(h.dvalues.view_distance());
+                    p.set_control_prefs(&super::controls::ControlPrefs::from_dvalues(&h.dvalues));
                 }
                 self.zone.world.char_view_distance = h.dvalues.char_view_distance();
             }
@@ -1156,6 +1157,10 @@ impl Frontend for Play {
             }
         }
         if let Some(a) = &self.audio {
+            // `SoundOptionsMonitor_c` (GUI 0x100c4cc9): master / FX / music volume, the on-off switches and `BattlemusicMode`, live from the options window
+            if let Some(h) = self.hud.as_ref() {
+                a.set_prefs(&super::options::audio_prefs(&h.dvalues));
+            }
             a.update(dt, host.camera.pos.to_array(), self.zone.day_time());
         }
         if let Some(c) = self.chat.as_mut() {
@@ -1171,6 +1176,13 @@ impl Frontend for Play {
         let (wins, quit) = self.chat.as_mut().map(|c| (c.take_windows(), c.take_quit())).unwrap_or_default();
         if quit {
             self.quit_cmd(host);
+        }
+        // the options window's `Quit2Windows` / `Quit2Login` buttons = AFCM 0x133 / 0x134, like `/quit` / `/camp`
+        for a in self.hud.as_mut().map(|h| h.take_option_actions()).unwrap_or_default() {
+            match a {
+                super::options::Action::Quit => self.quit_cmd(host),
+                super::options::Action::Camp => self.camp(),
+            }
         }
         if let Some(h) = self.hud.as_mut() {
             use super::chat::WindowOp;
@@ -1206,6 +1218,9 @@ impl Frontend for Play {
                 hear_team: d.flag("VoiceSndFxHearTeamOn"),
             });
         }
+        if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_ref()) {
+            c.set_window_prefs(&mut self.gui, &super::chat::win::WinPrefs::from_dvalues(&h.dvalues));
+        }
         if let Some(rq) = self.chat.as_mut().map(|c| c.take_requests()) {
             if let (Some(w), Some(h)) = (rq.waypoint, self.hud.as_mut()) {
                 h.set_mission(Some(w));
@@ -1214,8 +1229,10 @@ impl Frontend for Play {
                 h.begin_macro_drag(&mut self.gui, m.id, &m.name, &m.command);
             }
             if let Some(a) = &self.audio {
+                // `SetMasterPlayerFXMute` / `SetMasterPlayerFXVolume` (`VoiceSndFxOn` / `VoiceSndFxVolume`, SoundOptionsMonitor_c 0x100c487a / 0x100c489b)
+                let gain = self.hud.as_ref().map_or(1.0, |h| super::options::voice_gain(&h.dvalues));
                 for s in &rq.sounds {
-                    a.play_sfx(s, 1.0);
+                    a.play_sfx(s, gain);
                 }
             }
         }

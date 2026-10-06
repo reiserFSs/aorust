@@ -36,6 +36,7 @@ impl ChatWindows {
             reserved: Reserved::default(),
             dirty: false,
             menu: None,
+            pw: WinPrefs::default(),
         };
         s.last_active = cfgs.iter().find(|c| c.startup).or(cfgs.first()).map(|c| c.window_name.clone()).unwrap_or_default();
         for c in cfgs.into_iter().filter(|c| c.open) {
@@ -65,8 +66,8 @@ impl ChatWindows {
     fn add_doc(&mut self, cfg: Cfg) -> usize {
         let n = self.next_n;
         self.next_n += 1;
-        let alpha = cfg.alpha_inactive;
-        self.wins.push(Win { cfg, id: usize::MAX, frame: usize::MAX, n, lines: VecDeque::new(), alpha, target: alpha, rate: 0.0, active: false });
+        let alpha = alpha_of(&cfg, false);
+        self.wins.push(Win { cfg, id: usize::MAX, frame: usize::MAX, n, lines: VecDeque::new(), alpha, target: alpha, rate: 0.0, active: false, hint: String::new() });
         self.wins.len() - 1
     }
 
@@ -82,33 +83,69 @@ impl ChatWindows {
         Ok(fi)
     }
 
-    /// The view XML of one window's tab: `GroupChatView_c` (3 px border) around the text area and the input bar (`ChatView_c::FUN_1008d728`, input mode 1:
-    /// input bar at its preferred height = one text line in a 5 px border, the text frame ends 5 px above it).
-    fn doc_xml(&self, d: usize, line_h: u32) -> String {
+    /// The tab title (`FUN_100ab980`): the window's `name` plus, with `ChatShowOGrpInTitleBar`, ` <font color=green>[<output group>]</font>`.
+    pub(super) fn title(&self, d: usize) -> String {
+        let c = &self.wins[d].cfg;
+        match self.group_name(c.output_group) {
+            g if self.pw.title_group && c.output_group != 0 && !g.is_empty() => format!("{} <font color=green>[{g}]</font>", c.name),
+            _ => c.name.clone(),
+        }
+    }
+
+    /// The titles of the tabs of frame `fi`.
+    pub(super) fn titles(&self, fi: usize) -> Vec<String> {
+        self.frames[fi].docs.iter().map(|&d| self.title(d)).collect()
+    }
+
+    /// The view XML of one window's tab: `GroupChatView_c` around the text area and the input bar (`ChatView_c::FUN_1008d728`, input mode 1: input bar at its
+    /// preferred height = one text line plus its border, the text frame ends 5 px above it). The look depends on `visual_mode` (`FUN_100aab08`):
+    /// * 0: the group view has no art and a 3 px client border; the `ChatView` borders (`FUN_1008daa0(true)`) are the `GFX_GUI_INSET_*` set with a 5 px client margin;
+    /// * 1: the group view is a `GFX_GUI_WINDOW3_BORDER_*` + `GFX_GUI_WINDOW_BACKGROUND` frame at local alpha 0.4 (`_DAT_101b9e78`), 3 px border, inset `ChatView`;
+    /// * 2 (shipped default): no group border (client 0) and `FUN_1008daa0(false)`: both `ChatView` borders are *only* `GFX_GUI_WINDOW_BACKGROUND` (0x1bf) with
+    ///   no client margin, so the text area and the input bar are black panels (the window alpha 0.8 / 0.3 of `FUN_10096b23` fades them with the text).
+    ///
+    /// `none` names no art (the XML parser keeps the INSET default for an *empty* attribute).
+    pub(super) fn doc_xml(&self, d: usize, line_h: u32) -> String {
         let w = &self.wins[d];
         let n = w.n;
+        let mode = w.cfg.visual_mode;
+        let (art, margin) = if mode == 2 {
+            (r#"tl_gfx="none" tr_gfx="none" bl_gfx="none" br_gfx="none" left_gfx="none" top_gfx="none" right_gfx="none" bottom_gfx="none" bg_gfx="GFX_GUI_WINDOW_BACKGROUND""#, 0)
+        } else {
+            ("", 5)
+        };
+        let ih = line_h + 2 * margin as u32;
         let input = if w.cfg.textinput {
             format!(
-                r#"<BorderView name="input_border_{n}" layout_borders="Rect(0,5,0,0)" min_size="Point(-1,{ih})" max_size="Point(16000,{ih})">
-                     <TextView name="input_{n}" max_size="Point(16000,-1)" layout_borders="Rect(5,5,5,5)" font="CHAT" feature_flags="{INPUT_FLAGS}"/>
-                   </BorderView>"#,
-                ih = line_h + 10
+                r#"<BorderView name="input_border_{n}" {art} layout_borders="Rect(0,5,0,0)" min_size="Point(-1,{ih})" max_size="Point(16000,{ih})">
+                     <TextView name="input_{n}" max_size="Point(16000,-1)" layout_borders="Rect({margin},{margin},{margin},{margin})" font="CHAT" feature_flags="{INPUT_FLAGS}"/>
+                   </BorderView>"#
             )
         } else {
             String::new()
         };
-        format!(
-            r#"<View name="chat_{n}" view_layout="vertical" layout_borders="Rect(3,3,3,3)" max_size="Point(16000,16000)">
-                 <BorderView name="text_border_{n}" max_size="Point(16000,16000)">
-                   <ScrollView name="scroll_{n}" v_scrollbar_mode="always" layout_borders="Rect(5,5,5,5)" max_size="Point(16000,16000)">
+        let m = format!("Rect({margin},{margin},{margin},{margin})");
+        let body = format!(
+            r#"<BorderView name="text_border_{n}" {art} max_size="Point(16000,16000)">
+                   <ScrollView name="scroll_{n}" v_scrollbar_mode="always" layout_borders="{m}" max_size="Point(16000,16000)">
                      <ScrollViewChild view_layout="vertical" max_size="Point(16000,16000)">
                        <TextView name="text_{n}" max_size="Point(16000,-1)" font="CHAT" feature_flags="{TEXT_FLAGS}"/>
                      </ScrollViewChild>
                    </ScrollView>
                  </BorderView>
-                 {input}
-               </View>"#
-        )
+                 {input}"#
+        );
+        match mode {
+            2 => format!(r#"<View name="chat_{n}" view_layout="vertical" max_size="Point(16000,16000)">{body}</View>"#),
+            1 => format!(
+                r#"<View name="chat_{n}" view_layout="vertical" max_size="Point(16000,16000)">
+                     <BorderView tl_gfx="GFX_GUI_WINDOW3_BORDER_TL" tr_gfx="GFX_GUI_WINDOW3_BORDER_TR" bl_gfx="GFX_GUI_WINDOW3_BORDER_BL" br_gfx="GFX_GUI_WINDOW3_BORDER_BR" left_gfx="GFX_GUI_WINDOW3_BORDER_LEFT" top_gfx="GFX_GUI_WINDOW3_BORDER_TOP" right_gfx="GFX_GUI_WINDOW3_BORDER_RIGHT" bottom_gfx="GFX_GUI_WINDOW3_BORDER_BOTTOM" bg_gfx="GFX_GUI_WINDOW_BACKGROUND" alpha="0.4" view_layout="vertical" max_size="Point(16000,16000)">
+                       <View view_layout="vertical" layout_borders="Rect(3,3,3,3)" max_size="Point(16000,16000)">{body}</View>
+                     </BorderView>
+                   </View>"#
+            ),
+            _ => format!(r#"<View name="chat_{n}" view_layout="vertical" layout_borders="Rect(3,3,3,3)" max_size="Point(16000,16000)">{body}</View>"#),
+        }
     }
 
     /// Opens the GUI window of a frame: visual mode 0 = style-0 window with a tab strip (one tab per window, `Window::InsertTab`), else the borderless
@@ -120,8 +157,9 @@ impl ChatWindows {
         let src = format!(r#"<root><View name="chat_frame" view_layout="vertical">{views}</View></root>"#);
         let (x, y, w, h) = outer;
         let id = if self.wins[docs[0]].cfg.visual_mode == 0 {
-            let names: Vec<String> = docs.iter().map(|&d| self.wins[d].cfg.name.clone()).collect();
+            let names: Vec<String> = docs.iter().map(|&d| self.title(d)).collect();
             let id = gui.open_tabbed_window_xml("ChatWindow", &names[sel], &src, (x, y), WindowSize::Fixed(w.saturating_sub(10).max(1), h.saturating_sub(31).max(1)))?;
+            gui.set_window_fade(id, false); // chat windows run their own `FadeTo` rule (docs/chat/gui.md §3), not the generic hover fade
             gui.set_window_tabs(id, &names, sel);
             gui.set_window_frame(id, true, true);
             gui.set_window_size_limits(id, MIN_CLIENT, (0, 0));
@@ -136,8 +174,11 @@ impl ChatWindows {
             gui.show_collapsing(id, &self.wins[d].chat(), i == sel);
             self.refresh(gui, d);
         }
-        let s = &self.wins[docs[sel]];
-        gui.set_window_alpha(id, s.alpha);
+        let d = docs[sel];
+        let a = alpha_of(&self.wins[d].cfg, self.wins[d].active);
+        (self.wins[d].alpha, self.wins[d].target) = (a, a);
+        let s = &self.wins[d];
+        gui.set_window_alpha(id, a);
         // `is_backmost` / `is_frontmost` -> window flags 0x200 / 0x100 (`FUN_10097ae3`); default: normal stacking. **GUESS**: frontmost wins if both are set.
         gui.set_window_layer(id, if s.cfg.frontmost { 1 } else if s.cfg.backmost { -1 } else { 0 });
         Ok(id)
@@ -441,10 +482,56 @@ impl ChatWindows {
         }
     }
 
+    /// Applies the chat DValues ([`WinPrefs`]): a font change re-creates the CHAT font and rebuilds every frame (input bar height = line height), a
+    /// title/prompt change shows on the next [`update`](Self::update).
+    pub fn set_prefs(&mut self, gui: &mut Gui, p: &WinPrefs) {
+        if *p == self.pw {
+            return;
+        }
+        let font_changed = p.font != self.pw.font;
+        self.pw = p.clone();
+        if font_changed && gui.set_chat_font(&p.font.0, &p.font.1, p.font.2) {
+            for fi in 0..self.frames.len() {
+                self.rebuild_frame(gui, fi);
+            }
+            for w in &mut self.wins {
+                w.hint.clear();
+            }
+        }
+    }
+
+    /// What follows from the output groups and `ChatShowOGrpIn*`: the tab titles and the input prompt (`FUN_100ab980`, `FUN_10090f0b`).
+    fn sync_decor(&mut self, gui: &mut Gui) {
+        for fi in 0..self.frames.len() {
+            let id = self.frames[fi].id;
+            if self.wins[self.frames[fi].docs[0]].cfg.visual_mode == 0 {
+                let titles = self.titles(fi);
+                let (cur, sel) = gui.window_tabs(id);
+                if cur != titles {
+                    gui.set_window_tabs(id, &titles, sel);
+                }
+            }
+            for k in 0..self.frames[fi].docs.len() {
+                let d = self.frames[fi].docs[k];
+                let w = &self.wins[d];
+                if !w.cfg.textinput {
+                    continue;
+                }
+                let g = self.group_name(w.cfg.output_group);
+                let hint = if self.pw.input_group && w.cfg.output_group != 0 { g } else { String::new() };
+                if hint != w.hint {
+                    gui.set_text_hint(id, &w.input(), &hint);
+                    self.wins[d].hint = hint;
+                }
+            }
+        }
+    }
+
     /// Activation fades (`FUN_10096b23`): the window whose input bar has the keyboard focus is *active* (alpha
     /// `window_transparency_active`, fade 0.2 s), all others fade to `window_transparency_inactive` over 1 s. Pending changes are written once the
     /// pointer is idle (the original writes at shutdown, `FUN_10094a28`; the port has no shutdown hook).
     pub fn update(&mut self, gui: &mut Gui, dt: f32) {
+        self.sync_decor(gui);
         let focused = gui.focused_view();
         let hide = |w: &Win, active: bool| w.cfg.hide_input_when_inactive && !active;
         for i in 0..self.wins.len() {
@@ -453,7 +540,7 @@ impl ChatWindows {
             let active = focused.as_deref() == Some(w.input().as_str());
             if active != w.active {
                 w.active = active;
-                w.target = if active { w.cfg.alpha_active } else { w.cfg.alpha_inactive };
+                w.target = alpha_of(&w.cfg, active);
                 w.rate = (w.target - w.alpha).abs() / if active { FADE_IN } else { FADE_OUT };
                 if active {
                     self.last_active = w.cfg.window_name.clone();
@@ -486,7 +573,7 @@ impl ChatWindows {
             if let Some(pos) = self.frames[fi].docs.iter().position(|&d| d == i) {
                 if self.frames[fi].sel != pos {
                     self.select_tab(gui, fi, pos);
-                    let names: Vec<String> = self.frames[fi].docs.iter().map(|&d| self.wins[d].cfg.name.clone()).collect();
+                    let names = self.titles(fi);
                     gui.set_window_tabs(self.frames[fi].id, &names, pos);
                 }
             }

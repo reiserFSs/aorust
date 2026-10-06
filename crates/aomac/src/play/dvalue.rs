@@ -15,7 +15,7 @@ use ao_gui::xml::{self, Element};
 
 pub use cmd::Out;
 pub use indep::IndepPrefs;
-use indep::Kind;
+pub use indep::Kind;
 
 /// `DValueCategory_e` (valid range 0..5, `AddVariable` ignores others).
 pub const CAT_VARIABLES: u8 = 0;
@@ -178,6 +178,11 @@ impl DValues {
                 s.load_config(&t, cat, true);
             }
         }
+        // the three server-side flag options `MiscOptionsMonitor_c` (GUI 0x100bff11) creates with `DistributedValue_c(name)` and fills from the own stat
+        // `0x15d` bits 1 / 3 / 4 (the options window's check boxes: auto target monsters / players, disable XP gain); no template defines them [INFERENCE: not persisted]
+        for n in ["AutoTargetMOB", "AutoTargetPvP", "DisableXPGain"] {
+            s.add(n, Variant::Bool(false), false, CAT_VARIABLES, None, None, false);
+        }
         s
     }
 
@@ -322,6 +327,15 @@ impl DValues {
 
     pub fn flag(&self, name: &str) -> bool {
         self.get_i64(name).is_some_and(|v| v != 0)
+    }
+
+    /// Numbers as `f32` (`Variant::operator float`); strings, archives and unknown names give `None`.
+    pub fn get_f32(&self, name: &str) -> Option<f32> {
+        match self.get(name)? {
+            Variant::Float(f) => Some(*f),
+            v @ (Variant::Int(_) | Variant::Bool(_)) => Some(v.as_i64() as f32),
+            _ => None,
+        }
     }
 
     /// Sets a number / flag keeping the variable's type (a bool stays a bool); an unknown name becomes a temporary integer.

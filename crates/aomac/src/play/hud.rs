@@ -7,6 +7,7 @@ use super::hud_stats::HudStats;
 use super::hud_winb::HudWinB;
 use super::hud_nano::HudNano;
 use super::hud_ncu::HudNcu;
+use super::options::HudOptions;
 use super::hud_mission::HudMission;
 use super::hud_map::HudMap;
 pub(super) use super::hud_map::ground_map;
@@ -50,10 +51,12 @@ pub enum WindowKind {
     Stat,
     /// `specialaction_window` (`SpecialActionView_c`, tab "Actions", Ctrl+2)
     Actions,
+    /// `optionpanel_window` (`OptionPanelModule_c`, `options.rs`; the Windows menu entry "Settings")
+    Options,
 }
 
 impl WindowKind {
-    pub const ALL: [WindowKind; 15] = [
+    pub const ALL: [WindowKind; 16] = [
         WindowKind::Skills,
         WindowKind::Inventory,
         WindowKind::Character,
@@ -69,6 +72,7 @@ impl WindowKind {
         WindowKind::Faction,
         WindowKind::Actions,
         WindowKind::Stat,
+        WindowKind::Options,
     ];
 
     /// The dvalue / menu entry name (`ActionMenu/*.xml` `name=`).
@@ -89,6 +93,7 @@ impl WindowKind {
             WindowKind::Faction => "faction_window",
             WindowKind::Actions => "specialaction_window",
             WindowKind::Stat => "stat_window",
+            WindowKind::Options => "optionpanel_window",
         }
     }
 
@@ -260,6 +265,10 @@ pub(super) struct Hud {
     /// Programs and NCU windows (`hud_nano.rs`, `hud_ncu.rs`).
     nano: HudNano,
     ncu: HudNcu,
+    /// The options window (`options.rs`).
+    options: HudOptions,
+    /// `file://` pages the `?` buttons of window frames asked for (`WndBorder::SlotHelpButton`; the flow shows them in the InfoView).
+    help_urls: Vec<String>,
     /// The Mission window (`hud_mission.rs`).
     mission: HudMission,
     /// System-window lines the NCU window produced (the flow prints them).
@@ -306,7 +315,7 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, pools: hud_pools::Pools::new(dir), menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
+        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, pools: hud_pools::Pools::new(dir), menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, options: HudOptions::new(dir, size)?, help_urls: vec![], mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
         hud.target.targets_target = hud.dvalues.flag("Targetstarget");
         hud.fill_docks(gui);
         hud.create_bars(gui);
@@ -385,10 +394,18 @@ impl Hud {
         let h = (self.size.1 as i32 - 5 - (wing as i32 + 5) - (20 + 5)).max(0);
         gui.remove_children(self.cc, "RollupControllerDock");
         let w = super::hud_rollup::AREA_W;
-        let src = format!("<root><View min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></root>");
+        let src = format!("<root><View name=\"RollupArea\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></root>");
         if let Err(e) = gui.add_view_xml(self.cc, "RollupControllerDock", "RollupArea", &src) {
             eprintln!("hud: RollupControllerDock: {e:#}");
         }
+    }
+
+    /// The fade dvalues, applied live: `CCFadeLow` / `CCFadeHigh` / `CCFadeDelay` drive the `FadeGroupController_c` (gui/fade.rs, docs/gui.md
+    /// §10.8), `cc_rollup_controller_fade_level` the alpha of the black surface behind the rollup column (`RollupController_c` 0x10048346).
+    fn apply_fades(&self, gui: &mut Gui) {
+        let f = |n: &str, d: f32| self.dvalues.get_f32(n).unwrap_or(d);
+        gui.set_fade_params(f("CCFadeLow", 0.33), f("CCFadeHigh", 0.85), f("CCFadeDelay", 2.0));
+        gui.set_backdrop(self.cc, "RollupArea", f("cc_rollup_controller_fade_level", 0.0));
     }
 
     /// `CharBarWindow_c` windows (0x1006d7c7) created by `SlotPlayerCharacterAlive` (GUI 0x1006afed) at the points it passes in: health (0, 0), nano
@@ -428,6 +445,7 @@ impl Hud {
             self.winb.set_screen(size);
             self.nano.set_screen(size);
             self.ncu.set_screen(size);
+            self.options.set_screen(size);
             self.actwin.set_screen(size);
             self.mission.set_screen(size);
             gui.resize_window(self.cc, WindowSize::Fixed(size.0, size.1));
@@ -524,7 +542,9 @@ impl Hud {
 
     /// InfoView pages the Mission window asked for (`hud_mission.rs`).
     pub(super) fn take_info_urls(&mut self) -> Vec<String> {
-        self.mission.take_urls()
+        let mut v = self.mission.take_urls();
+        v.append(&mut self.help_urls);
+        v
     }
 
     /// The game's own mouse pointer over the world (`MousePointerModule_t`, hud_cursor.rs); appended to the frame's draw list.
@@ -539,11 +559,36 @@ impl Hud {
     }
 
     fn res<'a>(&'a self, zone: &'a Zone) -> impl Fn(&str, &str) -> Option<i64> + 'a {
-        move |kind, name| match kind {
-            "dvalue" => self.dvalues.get_i64(name),
-            // `s:` is the short form of `stat:` (CommandMenu.xml `s:npcnumpets!=0`)
-            "stat" | "s" => stats::id_of(name).and_then(|id| zone.stat(id)).map(i64::from),
-            _ => None,
+        resolver(&self.dvalues, zone)
+    }
+
+    /// `/quit` / `/camp` the options window's `Quit2Windows` / `Quit2Login` buttons asked for (the flow runs the chat commands' game actions).
+    pub(super) fn take_option_actions(&mut self) -> Vec<super::options::Action> {
+        self.options.take_actions()
+    }
+
+    /// Options the HUD reads live (docs/gui.md "Options window"): `Targetstarget`, the target bars' criteria (`cc_section1 && cc_friendly_health_bar` /
+    /// `cc_hostile_health_bar`) and `NumHotbars` (bars are created / closed to match, 1..=10).
+    fn sync_options(&mut self, gui: &mut Gui) {
+        let d = &self.dvalues;
+        self.target.targets_target = d.flag("Targetstarget");
+        let cc = d.flag("cc_section1");
+        self.target.bars_enabled = [cc && d.flag("cc_friendly_health_bar"), cc && d.flag("cc_hostile_health_bar")];
+        let want = hud_bar::default_count(d);
+        while self.shortcuts.len() > want {
+            if let Some(s) = self.shortcuts.pop() {
+                s.close(gui);
+            }
+        }
+        while self.shortcuts.len() < want {
+            let n = self.shortcuts.len();
+            match ShortcutBar::new(gui, self.options.dir(), n, self.size) {
+                Ok(b) => self.shortcuts.push(b),
+                Err(e) => {
+                    eprintln!("hud: shortcut bar {n}: {e:#}");
+                    break;
+                }
+            }
         }
     }
 
@@ -574,6 +619,10 @@ impl Hud {
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
         self.refresh(gui, zone);
+        self.options.apply(&mut self.dvalues, zone, &mut self.outbox);
+        self.options.update(gui, &self.dvalues, &resolver(&self.dvalues, zone));
+        self.sync_options(gui);
+        self.apply_fades(gui);
         self.pools.apply(zone);
         let st = |id: u32| zone.stat(id).unwrap_or(0);
         let xp = hud_pools::xp(st);
@@ -647,6 +696,13 @@ impl Hud {
         // item drag and drop between the wear window and the inventory (hud_stats/item_ui.rs)
         self.stats.input(gui, zone, ev);
         self.rollup.input(gui, ev);
+        self.options.input(gui, &mut self.dvalues, ev);
+        // Esc closes the windows whose `esc_*` option was set when they opened (`esc_inventory`, `esc_wear`, `esc_nano`, `esc_perkwindow`, `esc_planetmap`, `esc_optionpanel`)
+        if matches!(ev, InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, .. }) && !gui.text_focused() {
+            for k in self.options.take_esc() {
+                self.close_kind(gui, k);
+            }
+        }
         self.outbox.extend(self.stats.take_outbox());
         // the slider's release is `N3Msg_SetAggDef` -> `SetStat(0x33)`: applied to the own stats at once, then sent
         if let Some(v) = self.aggdef.input(gui, self.cc, ev) {
@@ -736,6 +792,10 @@ impl Hud {
 
     /// `true` when the event was consumed by the HUD.
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
+        if let Event::FrameHelp { url, .. } = ev {
+            self.help_urls.push(url.clone());
+            return true;
+        }
         if self.map.event(gui, ev, zone) {
             for k in self.map.take_closed() {
                 self.close_kind(gui, k);
@@ -768,6 +828,12 @@ impl Hud {
         if self.ncu.event(gui, ev, zone) {
             for k in self.ncu.take_closed() {
                 self.close_kind(gui, k);
+            }
+            return true;
+        }
+        if self.options.event(gui, ev, &mut self.dvalues) {
+            if self.options.take_closed() {
+                self.close_kind(gui, WindowKind::Options);
             }
             return true;
         }
@@ -858,6 +924,9 @@ impl Hud {
         if HudNcu::handles(kind) {
             self.ncu.open(gui);
         }
+        if HudOptions::handles(kind) {
+            self.options.open(gui, &self.dvalues);
+        }
         if HudActionWin::handles(kind) {
             self.actwin.open(gui, &mut self.rollup);
         }
@@ -868,6 +937,7 @@ impl Hud {
         self.winb.open(gui, kind);
         if !self.open.contains(&kind) {
             self.open.push(kind);
+            self.options.arm_esc(kind, &self.dvalues);
         }
     }
 
@@ -881,6 +951,9 @@ impl Hud {
         if HudNcu::handles(kind) {
             self.ncu.close(gui);
         }
+        if HudOptions::handles(kind) {
+            self.options.close(gui, &mut self.dvalues);
+        }
         if HudActionWin::handles(kind) {
             self.actwin.close(gui, &mut self.rollup);
         }
@@ -890,6 +963,7 @@ impl Hud {
         self.map.close(gui, &mut self.rollup, kind);
         self.winb.close(gui, kind);
         self.open.retain(|k| *k != kind);
+        self.options.disarm_esc(kind);
     }
 
     pub(super) fn toggle(&mut self, gui: &mut Gui, kind: WindowKind) {
@@ -953,6 +1027,7 @@ impl Hud {
         self.rollup.close_all(gui);
         self.nano.close(gui, &mut self.rollup);
         self.ncu.close(gui);
+        self.options.close(gui, &mut self.dvalues);
         self.actwin.close(gui, &mut self.rollup);
         self.mission.close(gui);
         self.map.close_all(gui, &mut self.rollup);
@@ -964,6 +1039,16 @@ impl Hud {
             c.close(gui);
         }
         gui.close_window(self.cc);
+    }
+}
+
+/// `ExpressionParser_c` name resolver of the criteria / enable expressions: `dvalue:` reads the DValue store, `stat:` / `s:` (the short form, CommandMenu.xml
+/// `s:npcnumpets!=0`) an own stat by name.
+fn resolver<'a>(d: &'a DValues, zone: &'a Zone) -> impl Fn(&str, &str) -> Option<i64> + 'a {
+    move |kind, name| match kind {
+        "dvalue" => d.get_i64(name),
+        "stat" | "s" => stats::id_of(name).and_then(|id| zone.stat(id)).map(i64::from),
+        _ => None,
     }
 }
 
@@ -1124,6 +1209,49 @@ mod tests {
             assert!(s.gui.has_view(s.hud.cc, "inventory_window") && s.gui.has_view(s.hud.cc, "friends_window"));
             png(&mut s, &mut o, &format!("hud-{tag}"));
         }
+    }
+
+    /// The control-centre fade groups (`CCFadeLow` 0.33 / `CCFadeHigh` 0.85 / `CCFadeDelay` 2 s of LoginPrefs.xml, docs/gui.md §10.8): every group
+    /// starts dim, the wing / menus of the hovered side brighten, dim again 2 s + 1 s after the pointer left, and the dvalues apply live.
+    /// `fade-dim.png` / `fade-hover-left.png` / `fade-live.png` in `AOMAC_SHOT_DIR`.
+    #[test]
+    fn fade_groups_follow_the_pointer_and_the_dvalues() {
+        use super::super::dvalue::Variant;
+        let size = (1280, 800);
+        let Some((mut s, mut o)) = shot(size) else { return };
+        let run = |s: &mut Shot, o: &mut Offscreen, secs: f32| {
+            for _ in 0..(secs / 0.05).round() as u32 {
+                s.frame(0.05, size, &mut o.host);
+            }
+        };
+        let a = |s: &Shot, g: &str| s.gui.fade_alpha(g).unwrap();
+        run(&mut s, &mut o, 0.1);
+        assert_eq!((a(&s, "cc_left_fade_group"), a(&s, "cc_right_fade_group")), (0.33, 0.33));
+        assert_eq!(s.gui.view_alpha(s.hud.cc, "LeftWingDock"), Some(0.33));
+        png(&mut s, &mut o, "fade-dim");
+        let r = s.gui.view_rect(s.hud.cc, "LeftWingDock").expect("left wing");
+        send(&mut s, InputEvent::MouseMove { x: (r.l + r.r) / 2.0, y: (r.t + r.b) / 2.0 });
+        run(&mut s, &mut o, 0.3);
+        assert_eq!((a(&s, "cc_left_fade_group"), a(&s, "cc_right_fade_group")), (0.85, 0.33));
+        assert_eq!(s.gui.view_alpha(s.hud.cc, "LeftWingDock"), Some(0.85));
+        png(&mut s, &mut o, "fade-hover-left");
+        // the pointer leaves: nothing changes for CCFadeDelay, then the group falls to CCFadeLow in 1 s
+        send(&mut s, InputEvent::MouseMove { x: 640.0, y: 300.0 });
+        run(&mut s, &mut o, 1.9);
+        assert_eq!(a(&s, "cc_left_fade_group"), 0.85);
+        run(&mut s, &mut o, 1.3);
+        assert_eq!(a(&s, "cc_left_fade_group"), 0.33);
+        // live: CCFadeLow / CCFadeHigh changes snap every group, the hot (here none) / other groups fall again after 2 s
+        assert!(s.hud.dvalues.set("CCFadeLow", Variant::Float(0.6)));
+        run(&mut s, &mut o, 0.1);
+        assert_eq!((a(&s, "cc_left_fade_group"), s.gui.view_alpha(s.hud.cc, "RightBarDock")), (0.6, Some(0.6)));
+        png(&mut s, &mut o, "fade-live");
+        // `cc_rollup_controller_fade_level`: a black surface behind the rollup column, default 0 = nothing
+        let area = s.gui.view_rect(s.hud.cc, "RollupArea").expect("rollup area");
+        let black = |l: &DrawList| l.cmds.iter().any(|c| matches!(c, ao_gui::DrawCmd::Solid { dst, color: [0, 0, 0], alpha } if *alpha == 0.5 && dst[0] == area.l && dst[1] == area.t));
+        assert!(!black(&s.frame(0.016, size, &mut o.host)));
+        assert!(s.hud.dvalues.set("cc_rollup_controller_fade_level", Variant::Float(0.5)));
+        assert!(black(&s.frame(0.016, size, &mut o.host)));
     }
 
     fn own(s: &mut Shot, yaw: f32, pos: [f32; 3]) {

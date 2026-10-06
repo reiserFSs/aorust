@@ -200,7 +200,7 @@ impl ChatWindows {
             OP_SLIDER_ACTIVE => w.cfg.alpha_active = value,
             _ => return,
         }
-        w.alpha = if w.active { w.cfg.alpha_active } else { w.cfg.alpha_inactive };
+        w.alpha = alpha_of(&w.cfg, w.active);
         w.target = w.alpha;
         gui.set_window_alpha(w.id, w.alpha);
         self.dirty = true;

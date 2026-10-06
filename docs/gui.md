@@ -82,13 +82,14 @@ Original: `Window(rect, title, name, style 1, flags)` → `WndBorder::SetStyle` 
   `Rect::Resize(-1,-1,+1,+1)`).
 * **Buttons** (`CreateBorderIcons` 0x1015aba4, only for styles 0/1/3 and `flags & 4 == 0`): icon button `GFX_GUI_WINDOW_ICON_I` (BorderID 0)
   and close button `GFX_GUI_WINDOW_CLOSE_X` / `_STATE2` / `_STATE3` (BorderID 1); the pin button only without flag 0x800 (not for the login flow).
-  `Layout` 0x1015a1d9: every border button is placed at **y = 5** from the window top, the left list from x = 0 (accumulating width), the right list
-  right-aligned (`x = bounds.r − width`); no extra margin. Sprites are 15×15. The icon button is created and added unconditionally (so it is drawn on
+  `Layout` 0x1015a1d9 (details and the corrections to this paragraph: §6.2): every border button is placed at **y = 5** from the window top; the left list
+  starts 5 px right of the border (x = acc, `acc += 5` before and `+= w − 1` after each button), the right list runs inwards from the right edge
+  (`x = R − w − acc`). Sprites are 15×15. The icon button is created and added unconditionally (so it is drawn on
   the login windows; `Window::SetIcon` 0x101542d9 is not called by them – callers are other windows), and its click only acts when an icon
   popup menu (`+0x208`) exists, i.e. never here.
 * **Close**: `SlotCloseButton` 0x10159705 posts message 0x98968b to the window. Engine: `Event::CloseRequested{window}` when the mouse is released
-  over the close button (the application decides: LoginWindow → quit, ProgressDialog → ignore). Hover shows `_STATE2`, pressed `_STATE3`
-  (**UNRESOLVED**: which `Button_c` state index maps hover/pressed; the three sprites are pixel-identical in this skin, so it is invisible).
+  over the close button (the application decides: LoginWindow → quit, ProgressDialog → ignore). The `Button_c` state mapping is resolved in §6.2
+  (state 1 = pressed art, state 2 = hover overlay; the old hover=`_STATE2` / pressed=`_STATE3` guess was reversed; the sprites are pixel-identical, only the tint differs).
 * `set_window_pos` / `open_framed_window` take the **outer** top-left; `outer_size`, `window_size` (client).
 * Hit-testing / dragging / resizing of style-0 frames: RE'd and ported for the chat windows (docs/chat/gui.md §10: `WndBorder::HitTest` 0x101593d6, `MouseMove` 0x10159c27, `DoSetFrame` 0x10159888; `Gui::set_window_frame`);
   style-1 frames are not draggable here (no caller needs it). The layer-1 alpha value is the
@@ -112,6 +113,62 @@ passes `""` (its tab title is set later, UNRESOLVED). **`#WindowMap` / `#WindowP
 * **UNRESOLVED**: the title's vertical offset inside the tab (we draw it at the tab top like every `TextView`), the left offset 5 (the `Rect(5,0,16,0)` field is only read in the preferred-size function), ±1 px of the strip
   height (`Point` extents vs counts in `FUN_10147c93` = tab height + 1, `LayoutBorders` +1), tab hover/drag, several tabs. No retail screenshot of a style-0 window was available to compare.
 * Used by: Planet Map, Playfield Map, Skills, Wear (`play/hud_*.rs`); the Inventory window keeps the style-1 frame until its title is known.
+
+### 6.2 Border buttons, pin, `?`, hover fade (`gui/border.rs`)
+Evidence (GUI.dll, decompiled this session):
+* `BorderButton_c(a, b, c)` 0x10159ed2 = `Button_c` whose `SetGfx(0, a)`, `SetGfx(1, b)`, `SetGfx(2, c)` give the **raised / pressed / highlight** art
+  (`Button_c::SetGfx` 0x10128270, `GetBorderView` 0x10128111: state 0 = `BorderView` +0x188 colour DEFAULT, **state 1 = +0x18c colour SELECTED (0xffffcc)**,
+  **state 2 = +0x190 colour HOVER (0xa5ffdb)**, each at the layer-2 alpha 0.85). `StateChanged` 0x10128338: value true (pressed or toggled on) hides the raised view and shows
+  the pressed one; `IsHighlighted` (pointer over) creates the highlight view *on top of* the raised one. So hover = `…_STATE3` overlay in HOVER colour, pressed/toggled =
+  `…_STATE2` in SELECTED colour; `View::SetLocalAlpha(layer 1)` of the constructor only touches the button's own (empty) surfaces. Our old code drew `_STATE2` on hover, `_STATE3`
+  pressed and everything at alpha 1.0; the three sprites are pixel-identical in this skin (md5 of the PNGs), so the visible effect is the tint and the 0.85 alpha.
+* `CreateBorderIcons` 0x1015aba4: nothing for style ≥ 4 or `flags & 4`; else the icon button (`0x1c5` ×3, toggle, list 0), the close button (`0x1c0..0x1c2`, list 1,
+  tooltip text 10000/0x2710), and, **only when window flag 0x800 is clear**, the pin button (`0x1cd..0x1cf` = `GFX_GUI_WINDOW_PIN*`, toggle, list 1, **no slot connected**).
+  `WndBorder::SetHelpFile` 0x1015ae58 (called by `Window::SetHelpFile` 0x1015491a) adds, on its first call, the `?` button (`0x1d0..0x1d2` = `GFX_GUI_WINDOW_QUESTIONMARK*`, list 1,
+  slot `SlotHelpButton` 0x10159e22) and stores the file name at `+0x1ec`; the click emits `GlobalSignals+0x188("file://" + file)` (the InfoView, docs/chat/dialogs.md).
+  List 1 is laid out right to left in insertion order: **close, pin, `?`** — exactly the retail order `? 📌 X`. `Window::SetHelpFile` callers (strings): Skills "The Skill Window.html"
+  (`FUN_100fc18e`), LFT "The LFT Window.html" (`FUN_100f03fb`), "The laser target window.html", "The Mech Select window.html", "The signup terminal window.html",
+  "The Research window.html", "The teleport target window.html"; only the files present in `cd_image/text/help` are wired (Skills, LFT).
+* `Layout` constants: `_DAT_101a8b98` = 5.0 (y), `_DAT_101a9da0` = double 5.0 (spacing), `_DAT_101a87e8` = 1.0. **GUESS (from the retail screenshot)**: the rows start 3 px inside the
+  outer border (icon and close sit 8 px from the outer edge in `ref.png`, after rescaling by its 0.937 capture scale); the decompile's origin rectangle was not resolved. Button pitch 18.
+* `WndBorder::GetPinButtonState` 0x10158ea0 / `SetPinButtonState` 0x1015af59 (sets the toggle, ticks the popup entry and `FadeTo(1.0, 0.2 s)`); used by `Window::_CanFade`
+  0x10154885 (`flags & 0x800 == 0 && !pinned`) and `SaveWndConfig` (the pin is persisted in the window config: **not ported**, the pin starts off).
+* **Hover fade** (`WindowController_c::HandleMouseMoved` 0x101583a0 → `FadeWindows` 0x1015803c): when the window under the pointer changes and no mouse button is held, the window
+  left fades to `_DAT_101ae0ec` = **0.3** over 1 s (`0xf4240` µs) and the window entered to **1.0** over 0.2 s (`0x30d40` µs), each only if `_CanFade` and not modal. (Windows of the same
+  `GetFadeGroup` skip it; no window sets one here.) Ported in `Gui::update_window_hover` / `tick_window_fades`; a window multiplies its frame art and content by the fade
+  (`Gui::window_fade`). `DockWindow_c` windows (flags 0x1000, 0x800 clear) = every `open_tabbed_window*` window have the pin and take part; the chat windows opt out
+  (`Gui::set_window_fade(w, false)`: they run their own `FadeTo` rule, docs/chat/gui.md §3). API: `set_window_pin_button`, `set_window_pinned`, `window_pinned`,
+  `set_window_help`, `set_window_fade`, events `FramePin`, `FrameHelp`. Tests: `crates/ao-gui/tests/border.rs`, unit tests in `gui/border.rs`.
+* `View::_CallRender` 0x1014d2e3 (alpha / colour model used throughout): the colour of a view's surfaces is `parent × MapColor(+0x190) × MapColor(+0x194)` channel-wise (`c·c'/255`),
+  its alpha is `(+0x188 × inherited) × +0x18c` (children inherit only `+0x188 × inherited`).
+
+### 6.3 Alpha blending space (`ao-render` `GuiRenderer`)
+D3D7 has no sRGB framebuffer, so every GUI `SRCALPHA / INVSRCALPHA` blend works on the stored 8-bit values. The renderer used to draw into the sRGB target (linear blending: a dark
+0.85-alpha window over a bright background came out much lighter than retail: our test body (25,49,65) used to be (47,71,93)). The GUI pass now renders through the non-sRGB twin
+view (`GuiRenderer::view`, textures / surface carry `format.remove_srgb_suffix()` in `view_formats`), blending straight alpha in display space. Verified numerically: art
+`GFX_GUI_TAB_BACKGROUND` (26,39,51) × DEFAULT (0x80e9f3) at 0.85 over the 0.33-black window (91,124,157) = (24.7,49,63.5); the shot pixel is (25,49,65).
+
+### 6.4 Retail reference comparison (`ref.png`, user-supplied capture of the original client)
+The capture is an **older retail build** than the installed 0.7.2 data (the skills window lists 10 groups instead of 11, the Wear window has four tabs "Weap/Cloth/Impl/Soci") rescaled by
+≈0.937 (Skills window 610 px instead of 651), so only geometry / state / blending are compared, not texts, art and absolute palette values.
+
+| Item | Retail | Ours | Verdict |
+|---|---|---|---|
+| Skills title strip icons | `i` left; `?`, pin, X right (pin cream = pressed) | only `i` and X | **fixed** (§6.2): `?` after `SetHelpFile`, pin unless flag 0x800, tint per state |
+| Rollup pages (Wear, NCU, Programs) | `i`, title, rollup button (cream), X | art untinted | **fixed**: tinted DEFAULT / SELECTED at 0.85 (`hud_rollup.rs`); the toggle value mapping is a GUESS |
+| Inventory / chat frames | `i` left, pin + X right | `i` + X | **fixed** (pin shown for every tabbed window; chat keeps its own fade) |
+| Border button inset | 8 px from the outer edge (scaled) | flush (0 px) | **fixed (GUESS** for the 3 px origin, §6.2) |
+| Button hover/pressed art | n/a in capture | hover/pressed state ids reversed, alpha 1.0 | **fixed** (§6.2) |
+| Window translucency | body ≈ 0.8 opaque over the world (≈ 0.2 of the background variance shows through) | linear-space blend, lighter | **fixed** (§6.3); the stack is outer `WINDOW_BACKGROUND` 0.33 then the tab box at 0.85 (effective 0.90) |
+| Windows dim when the pointer leaves | Inventory/Skills dim in retail when not hovered | never | **fixed** (§6.2 hover fade; defaults 0.3 / 1 s / 0.2 s are the client's) |
+| Pill buttons | black glossy pill, **silver outline, white label** | outline and label tinted cyan (`0x80e9f3`) | **version difference**: the 0.7.2 `GUIColors.xml` *and* `GUIConfig_c::GUIConfig_c` 0x1012f342 both hold `Default = 0x80e9f3`; `Button_c` colours its raised view and its label DEFAULT (`Initialize` 0x10128994, `StateChanged` 0x10128338), pressed SELECTED, highlight HOVER; `LoadGUIColors` 0x1006b859 is the only caller of `GUIConfig_c::SetColor` and nothing in prefs overrides the palette. The capture's skin art differs from ours (its outline pixel (186,214,223) is *brighter in G/B* than 0.7.2 `BORDER01_TOP` (190,196,203), which no multiplicative tint can produce), so the colour cannot be reproduced from this install; kept cyan |
+| Frame / tab lines | white-silver (inner border (177,185,191)) | cyan | **version difference** (same palette reason) |
+| Skills left list | 10 buttons, no scrollbar | 11 groups + "Reset all skills" overflow → scrollbar | **version difference** (`Skills.xml` / group set of 0.7.2) |
+| Wear tabs | 4 (Weap/Cloth/Impl/Soci) | 3 art strips + text tab | **version difference**; the fourth tab's art is UNRESOLVED (§11.4) |
+| Skill row colours | names blue, values green | names by cost level, values white / green / red by state | unchanged: `StatRow` colours are game-state driven (`hud_stats.rs` `cost_color`, `FUN_100fde49`); the capture just shows another character |
+| Inventory scrollbar | up/down arrows | `GFX_GUI_SCROLLBAR_GRAY_*` with arrows | unchanged |
+| Chat window | framed style 0, tab strip, pin + X, ≈0.8 dark body, scrollbar, grey prompt | chat slice | see docs/chat/gui.md |
+| Control-centre fade | dimmed wings | fade slice | see `gui/fade.rs` |
 
 ## 7. Widgets (`gui.rs`)
 
@@ -147,9 +204,10 @@ Events: `Clicked`, `TextChanged`, `EnterPressed`, `ComboChanged`, `Copy`, `Paste
 
 ## 9. UNRESOLVED (summary)
 
-Several tabs / tab vertical text offset (§6.1); frame hover/pressed state index; window drag/resize hit-testing; `PopupMenu_c` skin; `_AddLineDesc` line pitch;
+Several tabs / tab vertical text offset (§6.1); window drag/resize hit-testing; `PopupMenu_c` skin; `_AddLineDesc` line pitch;
 GDI dropout rules; layer-alpha values from `GUIColors.xml`/prefs (defaults used); tooltips (`View::SetToolTip` texts exist, not shown);
-double-click word selection; IME.
+double-click word selection; IME; border-button row origin (3 px inset is a retail-screenshot GUESS, §6.2); pin persistence (`SaveWndConfig`) and the rollup button's toggle value (§6.4);
+palette / skin of the older retail build (§6.4).
 
 ## 11. Stat tables and the skills / inventory / wear windows (`ao_formats::stats`, `play/hud_stats.rs`)
 
@@ -539,3 +597,67 @@ Wire (ao-net `n3/team.rs`, byte tests there): `TeamMemberIIR_t` 0x46312D2E (read
 **UNRESOLVED / GUESS (perks):** the `PerkNode`/`PerkGroupView` cell art and window size/position (we use text buttons: known 0x7dcc5e, trainable white, locked 0x888888, 440x320 centred), the line sort key, `MeetsPerkCriteria` (`FUN_10052904`, item requirement check; the server decides), the epoch of `LastPerkResetTime` (stat 0x241) for the timeout, how the server confirms a training (we only react to `PerkUpdateIIR`/full updates), DialogBox title ("Info").
 
 Tests: `cargo test --release -p ao-net team`, `-p aomac hud_team hud_perks hud_faction`. No live session / screenshots were taken (see yield notes).
+
+## 10.8 Control-centre fade groups and the rollup backdrop (`ao-gui` `gui/fade.rs`, `play/hud.rs::apply_fades`) — GuiFidelity.FadeGroups
+
+**Retail look:** the wings, bottom bars and the two menus are dimmed until the pointer is over their side (user reference screenshot: both sides dim).
+Defaults come from `LoginPrefs.xml`: `CCFadeHigh` 0.85, `CCFadeLow` 0.33, `CCFadeDelay` 2.0 s (options panel sliders `#ControlCenterLow/High/Fade`,
+`OptionPanel/Root.xml` 168-170). Nothing about the look is "fixed" to match the reference: the shipped defaults reproduce it.
+
+**XML.** `fade_group` is read by `View::View(TiXmlElement*)` 0x1014e21c (string at 0x101c83e4) and stored with `View::SetFadeGroup` 0x1014ac6d.
+`Views/ControlCenter.xml` sets `cc_left_fade_group` on `LeftWingDock`, `LeftBarDock` and the left `CCMenu`, `cc_right_fade_group` on `RightWingDock`,
+`RightBarDock` and the right `CCMenu` (never nested, so the alpha does not multiply twice). Engine: `View::fade_group` (parsed in `apply_view_attrs`).
+
+**`FadeGroupController_c`** (ctor 0x1012d4e9, singleton accessor 0x1012d6bf, `Looper` named `fade_group_controller`; created by the first
+`SetFadeGroup`, destroyed by `FUN_1012d41c` when the last member leaves). Group table = a `std::map<String, Group>` (`FUN_1012df8e` = `operator[]`).
+A `Group` (embedded at node +0x30) = member list, current / from / to alpha (+0xc / +0x10 / +0x14), duration in µs (+0x18, 64 bit), start time (+0x20, 64 bit).
+* **Initial state (not an inference):** the group constructor `FUN_1012d2fb` reads `CCFadeLow` into current, from and to (the decompile shows three
+  `GetDValue("CCFadeLow")`; the middle one could be a decompiler duplicate but all three are literal), duration 0. So **every group starts dim**; registering a member
+  (`FUN_1012d48d`) on an idle group sets a 1 µs fade to the current value so the new member receives it on the next frame.
+* **Per frame** (`FUN_1012cfbf` loops the groups -> `FUN_1012cf26`, then `Looper::FrameProcess`): a group with duration != 0 does nothing until
+  `now > start`, then `cur = from + (to - from) * elapsed / duration` (linear), and on `elapsed >= duration` `cur = from = to`, duration = 0; every member
+  gets `cur` through `vtable+0x2c` (= `View::SetAlpha`, ours `View::alpha`, multiplied down the tree in `draw_view`).
+* **Pointer** (mouse handler `FUN_1012cffb`): walk from the hovered view up the parents to the first non-empty fade group (none = ""). If it differs from the
+  hot group: the old hot group is faded with `FUN_1012cea2(CCFadeLow, delay = CCFadeDelay * 1e6 µs, duration 1e6 µs)` (asm 0x1012d0fa-0x1012d15b: the
+  `PUSH 0 / PUSH 0xf4240` before `AsDouble` are the duration arguments of the non-cleaning call), and the new hot group is poked
+  `from = cur, to = CCFadeHigh, duration = 200000 µs, start = now` (no delay).
+* **DValue observer** (`FUN_1012d1f4`, observes `CCFadeLow` / `CCFadeHigh`, ctor stores both in the controller): the changed value is stored, then for
+  **every** group `FUN_1012cea2(value, 0, 0, 0, 0)` snaps it to that value (all zeros = immediate set + apply to members, asm 0x1012d265-0x1012d275), then the
+  hot group fades to `CCFadeHigh` over 0.2 s from now and all others to `CCFadeLow` over 1 s starting **2 s** later (literal 0x1e8480 µs, not `CCFadeDelay`).
+  `CCFadeDelay` is not observed; it is read at every pointer change.
+* Engine: `gui/fade.rs` `FadeCtl` (pure logic, unit tests `hover_brightens_then_dims_after_delay`, `moving_between_groups_swaps_them`, `params_apply_live`)
+  driven by `Gui::frame` (`tick_fade_groups`) and `Gui::update_hover` (called on every mouse move/press: `fade_hover`). `Gui::set_fade_params(low, high, delay)`;
+  `Hud::apply_fades` feeds it from `Hud.dvalues` each frame, so changing the dvalues (`/option`, the options panel) applies at once (the `FadeCtl` runs the observer
+  only when low/high differ from the stored values). Tests: `cargo test --release -p ao-gui --test fade` (hover walk-up, 0.2 s rise, delay + 1 s fall, live
+  parameters), `cargo test --release -p aomac fade_groups` (HUD: dim at start, left side bright on hover, dims after 2 s + 1 s, dvalue change, rollup backdrop; PNGs
+  `fade-dim`, `fade-hover-left`, `fade-live` in `AOMAC_SHOT_DIR`).
+* **UNRESOLVED:** which view the mouse signal passes to `FUN_1012cffb` (its caller / hit test was not decompiled). We hit-test every visible view of the topmost
+  window with a view under the pointer, treating bare layout containers (`Kind::View` without a group) as transparent, because the control centre's screen-sized
+  splitter views would otherwise hide the docks. Whether the hover is re-evaluated when the layout changes under a still pointer (we only re-evaluate on input events,
+  like a mouse-move handler).
+
+**`cc_rollup_controller_fade_level`** (CharPrefs default 0.0, min 0 / max 1, options slider `#SidebarTranspa`, `OptionPanel/Root.xml` 217): string at 0x101b0d84,
+referenced only by the `RollupController_c` factory `FUN_10048346`: the controller owns a `DistributedValue_c` of that name (+0x1c0), creates a `ViewSurface_c`
+(+0x210, `Rect(0, 0, _DAT_101b0bcc, _DAT_101b0bcc)`), `SetColor(surface, 0)`, `View::AddRenderSurface(view, surface, true)`, and keeps its alpha at the dvalue: the
+slot `FUN_1004814c` (`ViewSurface_c::SetAlpha(+0x210, float)`) is called once with the current value and connected to the dvalue-changed signal
+(`FUN_10049dd7` / `FUN_10049e26`). I.e. a **black backdrop behind the whole rollup column (RollupArea) whose opacity is the "Sidebar transparency" option**;
+with the default 0.0 it is invisible. Engine: `View::backdrop` (black solid over the view's rect before its content, `draw_view`), `Gui::set_backdrop`, set by
+`Hud::apply_fades` on the `RollupArea` view of `fit_rollup_dock`. UNRESOLVED: the surface rect constant `_DAT_101b0bcc` (we paint exactly the area frame, 192 px x
+area height, and the pages are separate windows drawn above it); that surface colour 0 is black and the alpha is the only visible part (colour 0 with the original
+`ViewSurface_c` blend was not traced). The `MouseWheel` dvalue at +0x160 of the same controller is the wheel-scroll switch (`FUN_1004816f`), not a fade item.
+
+## Options window (`play/options.rs`, `options/{model,live}.rs`)
+
+* **Opened by** the Windows menu entry `optionpanel_window` (`ActionMenu/Windows.xml`, `label="#Setting"`) and `/open Settings` (`chat/cmd.rs` table): the dvalue toggles `WindowKind::Options`. Module `OptionPanelModule_c` ctor GUI 0x100c2c03 (module name `optionpanel_window`), `ModuleActivated` 0x100c2b7a builds `OptionWindow_c` (`FUN_100c3c44`): style-0 `Window(Rect(200,200,600,400), flags 0x1000)`, tabs "Preferences" / "Fixed keys" / "Key bindings", configured by the `OptionWindowConfig` archive (`WindowFrame`, `open_panel_folders`, `selected_panel`, `selected_tab`, `panel_list_scroll_offset`; the installer template `prefs/NewChar/Prefs.xml` has Rect(200,200,651,670), `GUIControl Center`). We save the archive on close; frame/folders/selection restore (test `closing_and_reopening_restores_selection_and_frame`).
+* **Layout**: `OptionCategoryPanel_c` `FUN_100c1053` = category tree (`StringListView`, folder icons 0xd5/0xd4, leaf 0xd8; level ids are the concatenated label segments, `FUN_100c3691`) + two buttons `Quit2Windows` / `Quit2Login` (text.mdb 10000; slots `LAB_100c1027/103d` = `AFCM::Send(10, 0x133 / 0x134)` = `/quit` / `/camp`) next to a `ViewSelector_c` with one page per `ScrollView` of `OptionPanel/Root.xml`. Labels `#Key` = text.mdb 700 (`FUN_100c22fc`), tooltips via `tooltip`/`tooltip_body`.
+* **Controls** (`OptionControl_c` `FUN_100c22fc`): `opt_type` int/float = `IndependentPrefs` (login or char set by `opt_category`), else DValue; `OptionCheckBox_c` `FUN_100c1be9` (toggle Button art 0x8b/0x8a, `opt_bitnum` sets one bit, `FUN_100c1ae6`), `OptionSlider_c` `FUN_100c0aa9` (label, value text `String::Format(value_fmt, v * value_scale)` `FUN_100c082a`, `Slider_c` ctor 0x1014448a with the variable's min/max, every move writes via `FUN_100c08c5` -> `FUN_100c2052`), `OptionRadioButtonGroup_c` `FUN_100c2fd5`. `view_enable_expression` = `View::SetEnableExpression` (frame timer): the control is *disabled* (0x909090), not hidden. The stored value is mirrored back every frame (original: `DistributedValue_c::Observe` / pref callbacks `FUN_100c0934`).
+* **Defaults** are the DValue/pref defaults (`DValues::new`); test `every_control_is_bound_to_a_real_variable_with_the_client_default` checks all 147 options exist. `AutoTargetMOB/PvP`, `DisableXPGain` are created by `MiscOptionsMonitor_c` (`FUN_100bff11`) [INFERENCE: DistributedValue_c(name) creates them; not persisted].
+* **Session consumers** (`options/live.rs`, `MiscOptionsMonitor_c`): `ToggleAllEffects` sets the 13 effect prefs (`FUN_100bfa27`); stat 0x15d bits 1/3/4 <-> AutoTargetMOB/PvP/DisableXPGain and stat 0x2a1 <-> VisualFlags/VisiblePVPTitle send `N3Msg_EventFeedback` 0x3c / 0x46 (Gamecode 0x1001cbb4: CharacterActionIIR actions 0xa5 / 0xa6). `SoundOptionsMonitor_c` (0x100c4cc9): master/FX/music/on-off/BattlemusicMode go to `Audio::set_prefs` each frame, voice on/volume scale `play_sfx` (0x100c487a/489b).
+* **Not ported / unresolved**: hotkey tabs (`HotKeys.xml`, rebinding); the "bit 5 while fighting -> Feedback_CantDoThisWhileFighting" refusal; `OpenNanoWindow` (observer `FUN_100bfeb6`, slot `FUN_100bfc98` on GlobalSignals+0x10c, emitter unknown); `VoiceSndFxHearFriendsOn` has no reader in the original either (string referenced nowhere in GUI.dll); ChatFontName/Style/Size are not in Root.xml (chat config window). Stored only, consumer not ported (feature absent here): video/texture/ground/fog/effect-quality prefs (renderer settings), `FadeCharacter*` (consumer = `VisualCATMesh_t` DisplaySystem 0x100745e8, statics 0x100af880/84/88 = start, end, 1-endAlpha; the render formula is not ported), `UseNoBobCamera`, `MouseLagFix`, `Advertisements/VideoAdds`, `ShowNanoTargetNCU/ShowFightTargetNCU`, `ShortcutNewNanos`, notification window options, `LockEquipment`, `LockRaidBars`, `ShowHelpButtonWindow`, `ShowIPPerkbutton`, `ItemDescriptionTooltips`, `ShortcutShortTooltips`, `ChatIndicator`, `ChatText*`, `ChatWarnWhenSpeakingToUnsubGroups`, `AutoAFK`, `AutoRejectMentorInvites`, `esc_*` / `AutoCloseWindows` (only the dialog/shop/trade Esc paths exist and use their defaults), `cc_friendly/hostile_health_bar` and `Targetstarget`/`NumHotbars` (read once at HUD creation, not live), camera/mouse prefs (`ControlPrefs` is read from the shipped CharPrefs.xml at player creation, not from the DValues: not live yet). These audits are from grep of `crates/` and `cd_image/gui` XML.
+* Screenshots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac -- options_shots` (options_first / cc / effects / audio / chat / mouse).
+
+### Options window: live consumers added later (supersedes the "not live" items above)
+* `ControlPrefs::from_dvalues` (controls.rs) feeds `Player::set_control_prefs` -> `Controls::set_prefs` / `Camera3p::set_prefs` every frame: `MouseTurnSensitivity`, `ZoomSpeed`, `LMBMouseLook`, `RMBMouseLook1st/3rd`, `ZoomTo1stPerson`, `ShowMyCharacter`, `MouseWheel`, `MouseLookInverted` (login pref). Camera mode state is untouched. Test `control_prefs_follow_the_dvalues`.
+* `Hud::sync_options`: `Targetstarget`, `NumHotbars` (shortcut bars are created / closed to match, 1..10) and the target bars' criteria `dvalue:cc_section1 && dvalue:cc_friendly_health_bar` / `..._hostile_health_bar` (docs §10; `HudTarget::bars_enabled`) are read each frame.
+* Esc: the window constructors read their `esc_*` DValue when the window is created (`FUN_100cc2ca` reads `esc_inventory` / `esc_chests` / `esc_backpacks`; the Root.xml note says open windows keep the old value) and then close on Esc. `HudOptions::arm_esc/take_esc` do this for inventory, wear, nano, perks, planet map and the options window (test `esc_closes_only_windows_whose_option_was_set_when_they_opened`). Other `esc_*` windows (backpacks, chests, corpses, city terminal, tradeskill, mission selection, tower build menu, research, vehicle, raid, lft, tips, npcchat, chatconfig) belong to windows this client does not have or owns elsewhere (dialogs/shops/trades use their own default-true paths); not wired.
+* `AutoCloseWindows`: the string occurs in no client DLL (grep of all `*.dll`/`*.exe`), so the original has no reader either. `ShowHelpButtonWindow`: only `HelpButtonWindow_c` (GUI 0x10072064/0x10072197) reads it, a window this client does not have. `LockEquipment`: read only by Gamecode `FUN_1002654d`, called from `N3Msg_IsItemPossibleToUnWear` (0x10026763) and `N3Msg_IsItemPossibleToWear` (0x10026adb) (true, or an identity in the `EquipmentLocks` archive, refuses): NOT wired into the wear window drops (hud_stats/item_ui.rs) yet. DLL grep for the other stored-only options: `LockRaidBars`, `ShowIPPerkbutton`, `ItemDescriptionTooltips`, `ShortcutShortTooltips`, `NotificationWindowVisibility`, `ChatTextFadeDelay`, `ChatWarnWhenSpeaking...`, `ChatIndicator`, `AutoAFK`, `ShowDropItemDialog`, `ShortcutNewNanos`, `ShowNanoTargetNCU` occur only in GUI.dll (their readers are in windows/features not ported); `FadeCharacter*`, `MouseLagFix`, `WaitForVertSync`, `UseOffscreenSurfaceTechnology`, `GroundRendering`, `DisplayCompressedTextures` in DisplaySystem.dll; `UseNoBobCamera`, `DisplayGroundQuality` in N3.dll; `GroundTextureQuality` in Interfaces.dll.

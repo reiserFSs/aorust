@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
         dimension: wgpu::TextureDimension::D2,
         format: r.format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
+        view_formats: &[r.format.remove_srgb_suffix()],
     });
     let view = tex.create_view(&Default::default());
     // background: dark blue-grey like the 3D backdrop behind the login windows (only so translucency is visible)
@@ -85,7 +85,7 @@ fn main() -> anyhow::Result<()> {
         gui.show_tooltip(t, b);
     }
     let list = gui.frame(0.0);
-    gr.draw(&r, &view, (w, h), 1, &gui, &list);
+    gr.draw(&r, &GuiRenderer::view(&tex), (w, h), 1, &gui, &list);
 
     let row = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let buf = r.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
