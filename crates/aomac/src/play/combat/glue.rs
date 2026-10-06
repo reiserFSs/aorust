@@ -68,6 +68,7 @@ impl Play {
                     }
                 }
                 GameAction::Camp => self.camp(),
+                GameAction::SelectSelf => self.zone.target = Some(self.zone.char_id as i32),
                 GameAction::Assist => match self.fight.as_ref().map(|m| m.assist(&self.zone)) {
                     Some(Ok(t)) => self.zone.target = Some(t),
                     Some(Err(key)) if !key.is_empty() => {
@@ -135,12 +136,14 @@ impl Play {
     /// Floating damage numbers (`DamageTextMessage` for the own character, the effect `0x2f5a` billboard for everybody else).
     pub(in crate::play) fn fight_draw(&mut self, host: &Host, list: &mut DrawList) {
         let Some(m) = self.fight.as_ref() else { return };
-        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        let w = self.size.0 as f32;
         for n in m.numbers() {
             let rgb = n.spec.color & 0x00ff_ffff;
             let (x, y) = match n.spec.space {
-                // [UNRESOLVED] `DAT_102761c0` (the HUD number's reference y) is not identified: the lower third of the screen.
-                Space::Hud => (n.jitter, h * 0.66 - 20.0 - n.rise()),
+                // `DamageTextMessage` [GUI 0x1004ae2f]: centre (50 + r, DAT_102761c0 - 20), text top = centre - font height / 2. `DAT_102761c0` is
+                // a .bss int with a single reader (code scan of GUI.dll: no writer, and its neighbour is the one-only text pointer), i.e.
+                // 0: the number starts above the screen and rises (y0 - 70 * t / 2.3), so the original never shows it on screen.
+                Space::Hud => (n.jitter, -20.0 - self.gui.font_height(FontId::Shell) as f32 / 2.0 - n.rise()),
                 // A billboard effect of the 3D scene: only what the camera sees (on screen, within the locality radius of the tags,
                 // not behind terrain / walls) is drawn. [GUESS] the radius: the effect's own range was not traced.
                 Space::World => match self.zone.world.head_point(n.dynel, &host.camera, self.size, n.rise()) {
