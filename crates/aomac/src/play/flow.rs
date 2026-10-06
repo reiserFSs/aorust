@@ -519,6 +519,7 @@ impl Play {
         self.player = None;
         host.look = false;
         self.zone.reset_world();
+        self.fight_reset();
         self.world_frames = 0;
         self.show_loading(host);
     }
@@ -640,6 +641,7 @@ impl Play {
                 LoginEvent::ZoneHandoff { zone_ip, zone_port, character_id } => {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
                     self.zone = zone::Zone::new(character_id);
+                    self.fight_reset();
                     let mut chat = chat::Chat::new();
                     if let Some((u, p)) = &self.login_cred {
                         chat.set_credentials(u, p);
@@ -652,6 +654,9 @@ impl Play {
                 LoginEvent::ZoneFrame(f) => match {
                     if let Some(c) = self.chat.as_mut() {
                         c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text);
+                    }
+                    if let Some(m) = self.fight.as_mut() {
+                        m.on_frame(&f);
                     }
                     self.zone.on_frame(&f)
                 } {
@@ -957,6 +962,7 @@ impl Frontend for Play {
                 }
             }
             self.zone.world.update(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host);
+            self.fight_frame(dt);
         }
         if let Some(a) = &self.audio {
             a.update(dt, host.camera.pos.to_array(), self.zone.day_time());
@@ -998,6 +1004,7 @@ impl Frontend for Play {
             self.zone.world.name_tags(&mut self.gui, &host.camera, self.size, own, &mut list);
             super::hud_target::selection_indicator(&mut self.gui, &self.zone, &host.camera, self.size, &mut list);
         }
+            self.fight_draw(host, &mut list);
         if self.screen == Screen::Create {
             list.cmds.splice(0..0, pre.cmds);
             list.cmds.extend(post.cmds);

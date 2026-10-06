@@ -167,6 +167,8 @@ struct Play {
     chat: Option<chat::Chat>,
     /// The own character in the world (movement, avatar, camera, controls); `None` outside the world.
     player: Option<player::Player>,
+    /// Combat / action layer of the zone connection (`combat/module.rs`).
+    fight: Option<combat::module::Module>,
     /// Account name and password of the login, for the chat-server login only (the original keeps `cPlayerName`/`cPlayerPasswd`).
     login_cred: Option<(String, String)>,
 }
@@ -249,6 +251,7 @@ impl Play {
             hud: None,
             chat: None,
             player: None,
+            fight: None,
             login_cred: None,
             text,
             gui,

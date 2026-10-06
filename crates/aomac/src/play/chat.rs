@@ -121,6 +121,14 @@ impl Chat {
         }
     }
 
+    /// `FUN_10058b00(key)` [GC 0x10058b00]: the `Feedback_*` text (category 110) of the client character as a plain System-window line
+    /// (`FUN_10012b05(0, text, 0)`: no colour code, so no `<font>`).
+    pub fn feedback(&mut self, gui: &mut Gui, key: &str, texts: &TextDb) {
+        if let Some(t) = texts.by_key(110, key) {
+            self.line_to(gui, ChatLine::new(ChatKind::System, log::window_html("", &t)), Some("System"));
+        }
+    }
+
     /// Frames to send to the zone server.
     pub fn take_outbox(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.outbox)

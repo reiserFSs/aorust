@@ -53,6 +53,7 @@ pub(super) struct Player {
     lens_set: bool,
     /// The left/right press that went to the GUI: its release must not reach the controls.
     gui_press: [bool; 2],
+    game: Vec<Cmd>,
 }
 
 impl Player {
@@ -86,6 +87,7 @@ impl Player {
                 model_sent: false,
                 lens_set: false,
                 gui_press: [false; 2],
+                game: Vec::new(),
             })
         })();
         built.map_err(|e| eprintln!("player: {e:#}")).ok()
@@ -103,6 +105,16 @@ impl Player {
         self.movement.yaw()
     }
 
+    /// Movement FSM mode (`FUN_100704e6`; 4 = swimming).
+    pub fn mode(&self) -> u32 {
+        u32::from(self.movement.fsm().mode)
+    }
+
+    /// Commands for the combat layer collected since the last call.
+    pub fn take_game(&mut self) -> Vec<Cmd> {
+        std::mem::take(&mut self.game)
+    }
+
     fn run(&mut self, cmds: Vec<Cmd>) {
         for c in cmds {
             match c {
@@ -118,6 +130,8 @@ impl Player {
                     }
                 }
                 // selection clicks are the HUD's (`Hud::input`); item pick-up / screenshot have no consumer yet
+                // attack / sit / special attacks belong to the combat layer (`combat::Module`, run by the flow)
+                Cmd::Attack | Cmd::SwitchTarget | Cmd::Sit | Cmd::Special(_) => self.game.push(c),
                 Cmd::Click(_) | Cmd::PickupItem | Cmd::Screenshot => {}
             }
         }
@@ -227,7 +241,6 @@ impl Player {
     }
 
     /// `N3Msg_SitToggle` result for the caller (a stand-up request needs `CharacterActionIIR_t` op 0x57).
-    #[allow(dead_code)]
     pub fn sit(&mut self) -> SitToggle {
         self.movement.sit_toggle(self.clock)
     }

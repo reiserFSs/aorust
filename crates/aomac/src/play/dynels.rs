@@ -909,6 +909,22 @@ impl Dynels {
         }
     }
 
+    /// Screen position (GUI pixels) of the point `rise` metres above the head anchor of `id` (floating combat numbers rise 0.4 m/s,
+    /// docs/zone/combat-log.md §6); `None` while the dynel has no model yet or is behind the camera.
+    pub fn head_point(&self, id: i32, cam: &Camera, size: (u32, u32), rise: f32) -> Option<(f32, f32)> {
+        let c = self.chars.get(&id)?;
+        let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return None };
+        let p = scene_pos(c.pose.pos);
+        let (w, h) = (size.0 as f32, size.1.max(1) as f32);
+        let tan = (self.lens.vertical_fov(w / h) * 0.5).tan();
+        let d = ao_render::Vec3::new(p[0], p[1] + built.tag_height * c.scale + rise, p[2]) - cam.pos;
+        let z = d.dot(cam.forward());
+        if z < 0.3 {
+            return None;
+        }
+        Some(((0.5 + 0.5 * d.dot(cam.right()) / (z * tan * w / h)) * w, (0.5 - 0.5 * d.dot(cam.up()) / (z * tan)) * h))
+    }
+
     /// Where the selection indicator (`Indicator_t`, docs/gui.md §13.2) of `id` goes: the head anchor of [`Self::name_tags`]
     /// projected to GUI pixels, and the tag line the indicator prints. `None` while the dynel has no model yet or is behind the camera.
     pub fn indicator_anchor(&self, id: i32, cam: &Camera, size: (u32, u32)) -> Option<(f32, f32, NameTag)> {

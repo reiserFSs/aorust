@@ -156,6 +156,11 @@ pub enum Slot {
     PrevCameraView,
     Screenshot,
     PickupItem,
+    /// `ACTION_ATTACK`, `ACTION_SWITCHTARGET`, `ACTION_SIT` and the special attacks (`ACTION_BRAWL` ...): `PerformSpecialAction` ids.
+    Attack,
+    SwitchTarget,
+    Sit,
+    Special(i32),
     CameraRotateLeft,
     CameraRotateRight,
     CameraRotateUp,
@@ -207,6 +212,18 @@ pub const PROVIDERS: &[(&str, Slot)] = &[
     ("CAMERA_PREVVIEW", Slot::PrevCameraView),
     ("CAMERA_SCREENSHOT", Slot::Screenshot),
     ("ACTION_PICKUPITEM", Slot::PickupItem),
+    ("ACTION_ATTACK", Slot::Attack),
+    ("ACTION_SWITCHTARGET", Slot::SwitchTarget),
+    ("ACTION_SIT", Slot::Sit),
+    ("ACTION_BRAWL", Slot::Special(0x8e)),
+    ("ACTION_DIMACH", Slot::Special(0x90)),
+    ("ACTION_SNEAKATTACK", Slot::Special(0x92)),
+    ("ACTION_FASTATTACK", Slot::Special(0x93)),
+    ("ACTION_BURST", Slot::Special(0x94)),
+    ("ACTION_FLINGSHOT", Slot::Special(0x96)),
+    ("ACTION_AIMEDSHOT", Slot::Special(0x97)),
+    ("ACTION_FULLAUTO", Slot::Special(0xa7)),
+    ("ACTION_BOWSPECIALATTACK", Slot::Special(0x79)),
 ];
 
 /// The provider key of the `KeyBindings` archive: `std::hash_combine` over the signed chars (GUI.dll 0x1001900a):
@@ -237,6 +254,19 @@ pub const DEFAULT_BINDINGS: &[(u32, Slot)] = &[
     (id::F8 | id::CTRL, Slot::NextCameraView),
     (id::F12, Slot::Screenshot),
     (99, Slot::PickupItem), // R
+    // CharPrefs.xml `KeyBindings`: the ACTION_* providers (hash of the provider name, `provider_hash`)
+    (98, Slot::Attack),                   // Q
+    (98 | id::SHIFT, Slot::SwitchTarget), // SHIFT+Q
+    (105, Slot::Sit),                     // X
+    (83, Slot::Special(0x8e)),            // B  Brawl
+    (92, Slot::Special(0x90)),            // K  Dimach
+    (91, Slot::Special(0x92)),            // J  Sneak attack
+    (95, Slot::Special(0x93)),            // N  Fast attack
+    (94, Slot::Special(0x94)),            // M  Burst
+    (93, Slot::Special(0x96)),            // L  Fling shot
+    (96, Slot::Special(0x97)),            // O  Aimed shot
+    (38, Slot::Special(0xa7)),            // , Full auto
+    (37, Slot::Special(0x79)),            // . Bow special attack
 ];
 
 /// Fixed camera keys (GUI.dll input table text, `KEY_COMMAND_*`): numpad 4/6/2/8 rotate, + / - zoom, 7 save, 5 reset.
@@ -374,6 +404,14 @@ pub enum Cmd {
     Camera(CamCmd),
     /// `SlotPickupItem`: `N3Msg_GetItem(object under the mouse)`.
     PickupItem,
+    /// `ACTION_ATTACK`: `FUN_1004256c(0xb)` on the selected target.
+    Attack,
+    /// `ACTION_SWITCHTARGET`: attack the selected target even when fighting another one.
+    SwitchTarget,
+    /// `ACTION_SIT` (`N3Msg_SitToggle`).
+    Sit,
+    /// Special attack `Stat_e` (`N3Msg_SecondarySpecialAttack`).
+    Special(i32),
     Screenshot,
     /// A mouse button was released without dragging (`ActionViewMouseHandler_c` release): left = select the object under
     /// the cursor, right = its default action.
@@ -530,6 +568,10 @@ impl Controls {
             Slot::PrevCameraView => out.push(Cmd::Camera(CamCmd::PrevView)),
             Slot::Screenshot => out.push(Cmd::Screenshot),
             Slot::PickupItem => out.push(Cmd::PickupItem),
+            Slot::Attack => out.push(Cmd::Attack),
+            Slot::SwitchTarget => out.push(Cmd::SwitchTarget),
+            Slot::Sit => out.push(Cmd::Sit),
+            Slot::Special(s) => out.push(Cmd::Special(s)),
             Slot::CameraRotateLeft => out.push(cam_key(CamKey::RotateLeft, true)),
             Slot::CameraRotateRight => out.push(cam_key(CamKey::RotateRight, true)),
             Slot::CameraRotateUp => out.push(cam_key(CamKey::RotateUp, true)),
