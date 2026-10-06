@@ -211,4 +211,29 @@ mod tests {
         let atlas = Atlas::pack(&set, 2048).unwrap();
         assert!(atlas.entry(set.id("GFX_GUI_TAB_BORDER_TL").unwrap()).is_some());
     }
+
+    /// The table is the full-name list read from AFCM.dll 0x10016060 (an earlier copy was cut at 40
+    /// characters, which made 0x93..0x98 and 0xab/0xac collide).
+    #[test]
+    fn id_names_are_unique_and_arrows_resolve() {
+        let names: Vec<&str> = BUILTIN_IDS.lines().collect();
+        let uniq: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(uniq.len(), names.len());
+        // GUI.dll CCTargetControl_c: left arrow 0x93/0x95/0x94, right 0x96/0x98/0x97, button 0xaa/0xac/0xab.
+        assert_eq!(names[0x93], "GFX_GUI_CONTROLCENTER_BIGARROW_LEFT_STATE1");
+        assert_eq!(names[0x94], "GFX_GUI_CONTROLCENTER_BIGARROW_LEFT_STATE2");
+        assert_eq!(names[0x95], "GFX_GUI_CONTROLCENTER_BIGARROW_LEFT_STATE3");
+        assert_eq!(names[0x98], "GFX_GUI_CONTROLCENTER_BIGARROW_RIGHT_STATE3");
+        assert_eq!(names[0xab], "GFX_GUI_CONTROLCENTER_TARGET_BUTTON_STATE2");
+        let dir = crate::client_dir().join("cd_image/gui/Default");
+        if !dir.join("Graphics.uvgi").exists() {
+            return;
+        }
+        let set = GfxSet::load(&dir).unwrap();
+        assert_eq!(set.len(), 790);
+        for id in [0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0xaa, 0xab, 0xac, 0x92, 0x9c, 0x9e, 0xa0] {
+            assert_ne!(set.size(GfxId(id)), (0, 0), "id {id:#x}");
+        }
+        assert_eq!(set.size(GfxId(0x93)), (8, 41));
+    }
 }

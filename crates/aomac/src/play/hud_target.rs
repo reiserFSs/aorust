@@ -25,6 +25,10 @@ use std::collections::HashMap;
 pub const CAPSULE_HEIGHT: f32 = 1.8;
 /// Pick capsule radius (m). UNRESOLVED GUESS, slightly generous so that a click on the body always hits.
 pub const CAPSULE_RADIUS: f32 = 0.5;
+/// Pointer path length (px) up to which a press and release on the world still is a click: `ActionViewMouseHandler_c`
+/// accumulates the mouse-look movement in `+0x1c` and `FUN_1002c469` requires it `< 0.02` (GUI `_DAT_101aeaf4`) in the units of
+/// `InputConfig_t::FrameProcess` (raw counts / 1000), i.e. 20 counts; counts and GUI pixels are taken as equal.
+const CLICK_PATH: f32 = 20.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Ray {
@@ -64,16 +68,46 @@ pub fn capsule(d: &DynelState) -> (Vec3, Vec3) {
     (foot + Vec3::Y * CAPSULE_RADIUS, foot + Vec3::Y * (CAPSULE_HEIGHT - CAPSULE_RADIUS))
 }
 
-/// The nearest dynel hit by `ray` (instance id).
-pub fn pick(ray: &Ray, dynels: &HashMap<i32, DynelState>) -> Option<i32> {
-    dynels
+/// Every dynel hit by `ray`, nearest first (instance ids): the list `n3Camera_t` keeps at `+0x244` and refills on every
+/// `SetMousePos` through its `n3CameraCollLine_t` (the order of the original's list is [INFERENCE]: by distance along the line).
+pub fn pick_all(ray: &Ray, dynels: &HashMap<i32, DynelState>) -> Vec<i32> {
+    let mut hits: Vec<(f32, i32)> = dynels
         .iter()
         .filter_map(|(id, d)| {
             let (a, b) = capsule(d);
             ray_capsule(ray, a, b, CAPSULE_RADIUS).map(|s| (s, *id))
         })
-        .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)))
-        .map(|p| p.1)
+        .collect();
+    hits.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+    hits.into_iter().map(|h| h.1).collect()
+}
+
+/// What a plain left click selects: `n3Camera_t::GetNextTarget` (N3 0x10020723) on the hit list, `ActionViewMouseHandler_c`'s release
+/// slot `FUN_1002c469` (GUI 0x1002c469) sends it as `SetTargetMessage`. The object after the current target in the list (wrapping)
+/// or, when the current target is not in it, the first one: clicking again on a stack of overlapping dynels walks through them.
+/// An empty list gives `None` (the original's reference is void and the handler does nothing: **no click on the ground deselects**).
+pub fn click_target(list: &[i32], current: Option<i32>) -> Option<i32> {
+    match current.and_then(|c| list.iter().position(|i| *i == c)) {
+        Some(i) => Some(list[(i + 1) % list.len()]),
+        None => list.first().copied(),
+    }
+}
+
+/// Stat `PetMaster` (196 = 0xc4) and `TowerType` (388 = 0x184), read by `N3Msg_CanClickTargetTarget`.
+const PET_MASTER: u32 = 0xc4;
+const TOWER_TYPE: u32 = 0x184;
+
+/// `N3Msg_CanClickTargetTarget(target, targetsTarget)` (Gamecode 0x10016451): both dynels must exist. A dynel with `char+0x21c` set
+/// (the client character: its record has "fewer stats", docs/zone/dynel.md §2) is *plain* when it has a `PetMaster`, every other one
+/// is plain; the click is refused when both are plain, otherwise allowed unless the target has a non-zero `TowerType`. Only the own
+/// character's stats are known, the others' stats count as absent. [INFERENCE] for what `+0x21c` stands for.
+pub fn can_click_target_target(zone: &Zone, target: i32, targets_target: i32) -> bool {
+    let me = zone.char_id as i32;
+    if !zone.dynels.contains_key(&target) || !zone.dynels.contains_key(&targets_target) {
+        return false;
+    }
+    let plain = |id: i32| id != me || zone.stat(PET_MASTER).is_some();
+    !(plain(target) && plain(targets_target)) && (target != me || zone.stat(TOWER_TYPE).unwrap_or(0) == 0)
 }
 
 /// What the target controls show about the selected dynel (`N3Msg_GetName` / `GetSkill` of the target).
@@ -114,35 +148,43 @@ pub fn info(zone: &Zone, id: i32) -> Option<TargetInfo> {
     })
 }
 
-/// `N3Msg_GetCloseTarget(current, friendly, forward)` (Gamecode, used by `TargetingModule_t::Get{Next,Prev}{Friendly,Hostile}
-/// TargetMessage` 0x10025a52…): [INFERENCE] the candidates are ordered by distance from the own character, the next / previous one
-/// after the current target wraps around.
+/// Radius of the `N3Msg_GetCloseTarget` candidate query (`(**(playfield+0x58)+0x4c)(ownPos, 100.0, …)`, `_DAT_10155eb0`).
+const CLOSE_TARGET_RADIUS: f32 = 100.0;
+/// `_DAT_10157870` (1000.0): added to a negative / tied distance delta so that the farther candidates come first.
+const CLOSE_TARGET_WRAP: f32 = 1000.0;
+
+/// `N3Msg_GetCloseTarget(current, friendly, forward)` (Gamecode 0x1001c411, called by `TargetingModule_t::Get{Next,Prev}{Friendly,
+/// Hostile}TargetMessage` 0x10025a52…, bound to Tab and the dock arrows). Candidates: dynels within 100 m of the own character
+/// except it and the current target; *hostile* = a `Side` (stat 0x21) different from the own one, *friendly* = the same (players
+/// of the own team and pets of the own team count as friendly: team state not modelled; the `InPlay` stat 0xc2 test is skipped).
+/// Ordering: `m = d² − d²(current)` (0 without a current target), `+1000` when negative, and `+1000` when 0 for a candidate listed
+/// before the current one; `forward` takes the smallest `m`, backward the largest (starting at `f32::MIN_POSITIVE`, so `m = 0`
+/// never wins backwards). The original's list order (the locality query's) is unknown: candidates are listed by id.
 pub fn cycle(zone: &Zone, hostile: bool, forward: bool) -> Option<i32> {
     let me = zone.own()?;
-    let dist = |d: &DynelState| {
-        let (a, b) = (Vec3::from(d.pos), Vec3::from(me.pos));
-        a.distance(b)
-    };
-    let mut cands: Vec<(f32, i32)> = zone
-        .dynels
-        .iter()
-        .filter(|(id, _)| **id != zone.char_id as i32)
-        .filter(|(id, _)| info(zone, **id).is_some_and(|i| i.hostile == hostile))
-        .map(|(id, d)| (dist(d), *id))
-        .collect();
-    cands.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let n = cands.len();
-    if n == 0 {
-        return None;
+    let my_id = zone.char_id as i32;
+    let own_side = zone.stat(stats::SIDE).map_or(me.side, |s| s as u8);
+    let d2 = |d: &DynelState| Vec3::from(d.pos).distance_squared(Vec3::from(me.pos));
+    let cur = zone.target.filter(|t| *t != my_id && zone.dynels.contains_key(t));
+    let base = cur.map_or(0.0, |t| d2(&zone.dynels[&t]));
+    let mut ids: Vec<i32> = zone.dynels.keys().copied().collect();
+    ids.sort_unstable();
+    let cur_at = cur.and_then(|t| ids.iter().position(|i| *i == t)).unwrap_or(0);
+    let mut best = (None, if forward { f32::MAX } else { f32::MIN_POSITIVE });
+    for (n, id) in ids.iter().enumerate() {
+        let d = &zone.dynels[id];
+        if *id == my_id || Some(*id) == cur || d2(d) > CLOSE_TARGET_RADIUS * CLOSE_TARGET_RADIUS || (d.side != own_side) != hostile {
+            continue;
+        }
+        let mut m = d2(d) - base;
+        if m < 0.0 || (m == 0.0 && n < cur_at) {
+            m += CLOSE_TARGET_WRAP;
+        }
+        if if forward { m < best.1 } else { best.1 < m } {
+            best = (Some(*id), m);
+        }
     }
-    let cur = zone.target.and_then(|t| cands.iter().position(|c| c.1 == t));
-    let i = match (cur, forward) {
-        (Some(i), true) => (i + 1) % n,
-        (Some(i), false) => (i + n - 1) % n,
-        (None, true) => 0,
-        (None, false) => n - 1,
-    };
-    Some(cands[i].1)
+    best.0
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -207,8 +249,16 @@ pub(super) struct HudTarget {
     last: Option<i32>,
     mouse: (f32, f32),
     pressed: Option<(bool, Part)>,
-    /// Left button went down on the world (not on the GUI) at this position: a click is a press + release close together.
-    world_down: Option<(f32, f32)>,
+    /// A left press on the world (not on the GUI) is pending: `(accumulated pointer path length, last position)`; the release
+    /// is a click while the path is within [`CLICK_PATH`] (`ActionViewMouseHandler_c` `+0x1c`).
+    world_down: Option<(f32, (f32, f32))>,
+    /// The `Targetstarget` preference ("Show Target's Target", `LoginPrefs.xml`, default false): the hostile window shows the
+    /// target-of-target button.
+    pub(super) targets_target: bool,
+    /// The target of the selected dynel as shown in that button (`CCTargetControl_c+0x13c`).
+    tot: Option<i32>,
+    /// The left press went down on the target-of-target button.
+    tot_down: bool,
 }
 
 fn esc(s: &str) -> String {
@@ -218,7 +268,7 @@ fn esc(s: &str) -> String {
 impl HudTarget {
     /// Creates the two health-bar windows (`CCFriendlyHealthBar` / `CCHostileHealthBar`) and fills the control-centre target docks.
     pub(super) fn new(gui: &mut Gui, cc: WindowId, size: (u32, u32)) -> anyhow::Result<Self> {
-        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None };
+        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false };
         t.create_bars(gui)?;
         for (dock, d) in [("LeftTargetCtrlDock", &t.docks[0]), ("RightTargetCtrlDock", &t.docks[1])] {
             let src = format!(
@@ -246,8 +296,19 @@ impl HudTarget {
         // colour DEFAULT, a bold title and the name below. Its width is the widest of the four captions.
         let cap = ["Selection", "Nano Target", "Fighting Target", "Nano / Fighting"].iter().map(|c| gui.text_width(ao_gui::FontId::Bold, c)).max().unwrap_or(0);
         for hostile in [false, true] {
+            // `TargetTargetButton_c` (`FUN_10075342`), first child of the hostile window: a corner `BorderView` (the header's frame
+            // gfx, colour 0x7fffff) with the caption "Fighting Target:" and the target's target name, borders 3 px, 5 px below.
+            let tot = if hostile {
+                "<BorderView name=\"tot\" view_layout=\"vertical\" tl_gfx=\"GFX_GUI_CC_TARGET_FRAME_TL\" tr_gfx=\"GFX_GUI_CC_TARGET_FRAME_TR\" \
+                 bl_gfx=\"GFX_GUI_CC_TARGET_FRAME_BL\" br_gfx=\"GFX_GUI_CC_TARGET_FRAME_BR\" left_gfx=\"\" top_gfx=\"\" right_gfx=\"\" bottom_gfx=\"\" color=\"0x7fffff\" layout_borders=\"Rect(0,0,0,5)\">\
+                 <TextView name=\"tot_caption\" font=\"NORMAL\" value=\"Fighting Target:\" layout_borders=\"Rect(3,3,3,0)\"/>\
+                 <TextView name=\"tot_name\" font=\"NORMAL\" value=\"\" layout_borders=\"Rect(3,0,3,3)\"/>\
+                 </BorderView>"
+            } else {
+                ""
+            };
             let src = format!(
-                "<root><View view_layout=\"vertical\">\
+                "<root><View view_layout=\"vertical\">{tot}\
                  <CanvasView name=\"bar\" min_size=\"Point({bw},10)\" max_size=\"Point({bw},10)\"/>\
                  <BorderView name=\"header\" view_layout=\"vertical\" min_size=\"Point({hw},0)\" tl_gfx=\"GFX_GUI_CC_TARGET_FRAME_TL\" tr_gfx=\"GFX_GUI_CC_TARGET_FRAME_TR\" \
                  bl_gfx=\"GFX_GUI_CC_TARGET_FRAME_BL\" br_gfx=\"GFX_GUI_CC_TARGET_FRAME_BR\" left_gfx=\"\" top_gfx=\"\" right_gfx=\"\" bottom_gfx=\"\" color=\"DEFAULT\" layout_borders=\"Rect(0,0,0,10)\">\
@@ -260,6 +321,9 @@ impl HudTarget {
             );
             let name = if hostile { "CCHostileHealthBar" } else { "CCFriendlyHealthBar" };
             let window = gui.open_window_xml(name, &src, (0, 5), WindowSize::Preferred)?;
+            if hostile {
+                gui.set_visible(window, "tot", false);
+            }
             gui.set_window_visible(window, false);
             self.bars.push(Bar { window, hostile, width: w, shown: None });
         }
@@ -311,13 +375,17 @@ impl HudTarget {
         }
     }
 
-    /// A left click on the world (not on the GUI): the dynel under the mouse becomes the target. A click on empty ground leaves
-    /// the selection alone: nothing in `TargetingModule_t` removes it except `FrameProcess` (dynel gone) and `RemoveTarget`
-    /// (UNRESOLVED: the original's click-to-deselect, if any, was not found; the input bindings of GUI.dll's default
-    /// hotkeys list contain no mouse command for it).
+    /// A plain left click on the world (not on the GUI), `ActionViewMouseHandler_c`'s release slot `FUN_1002c469` (GUI 0x1002c469):
+    /// the hit list under the pointer is [`pick_all`]; [`click_target`] chooses, and the choice becomes the target (`Send(0x1e,
+    /// 0x126)` → `TargetingModule_t::SetTargetMessage`). No hit = nothing happens (no deselect). The handler's other branches need the
+    /// modifier keys, which the frontend does not report with mouse events yet: Shift+click opens the character / item info page
+    /// (`InfoViewModule_c::ShowURL("charid://50000/<id>")`, no selection), Ctrl+click on a character selects it and then calls
+    /// `N3Msg_SwitchTarget` = `DefaultAttack(target, true)`; a right-button release runs `N3Msg_DefaultActionOnDynel` (characters) /
+    /// `N3Msg_UseItem` (anything else), and a left double click does the former when `DoubleclickAction` (default true).
     pub(super) fn world_click(&mut self, zone: &mut Zone, cam: &Camera, lens: &Lens, vp: (u32, u32), mouse: (f32, f32)) -> bool {
         let ray = pick_ray(cam, lens, (vp.0 as f32, vp.1 as f32), mouse);
-        match pick(&ray, &zone.dynels) {
+        let list = pick_all(&ray, &zone.dynels);
+        match click_target(&list, zone.target) {
             Some(id) => {
                 self.select(zone, Some(id));
                 true
@@ -327,14 +395,22 @@ impl HudTarget {
     }
 
     /// Raw mouse input before the GUI: dock buttons (hit-tested on their canvases) and world clicks. Returns `Some(pos)` when a
-    /// world click (press and release at nearly the same pixel, the pointer not over the GUI) completed.
+    /// world click completed: the left press was on the world (the pointer not over the GUI) and the pointer travelled at most
+    /// [`CLICK_PATH`] up to the release.
     pub(super) fn input(&mut self, gui: &Gui, zone: &mut Zone, ev: &InputEvent) -> Option<(f32, f32)> {
         match *ev {
-            InputEvent::MouseMove { x, y } => self.mouse = (x, y),
+            InputEvent::MouseMove { x, y } => {
+                self.mouse = (x, y);
+                if let Some((path, last)) = &mut self.world_down {
+                    *path += ((x - last.0).powi(2) + (y - last.1).powi(2)).sqrt();
+                    *last = (x, y);
+                }
+            }
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
                 self.mouse = (x, y);
                 self.pressed = self.dock_at(gui, x, y);
-                self.world_down = (self.pressed.is_none() && !gui.wants_mouse(x, y)).then_some((x, y));
+                self.tot_down = self.tot_at(gui, x, y);
+                self.world_down = (self.pressed.is_none() && !self.tot_down && !gui.wants_mouse(x, y)).then_some((0.0, (x, y)));
             }
             InputEvent::MouseUp { x, y, button: MouseButton::Left } => {
                 self.mouse = (x, y);
@@ -343,8 +419,12 @@ impl HudTarget {
                     self.dock_click(zone, hostile, part);
                     return None;
                 }
-                if let Some((dx, dy)) = self.world_down.take() {
-                    if (dx - x).abs() <= 4.0 && (dy - y).abs() <= 4.0 && !gui.wants_mouse(x, y) {
+                if std::mem::take(&mut self.tot_down) && self.tot_at(gui, x, y) {
+                    self.tot_click(zone);
+                    return None;
+                }
+                if let Some((path, _)) = self.world_down.take() {
+                    if path <= CLICK_PATH && !gui.wants_mouse(x, y) {
                         return Some((x, y));
                     }
                 }
@@ -352,6 +432,21 @@ impl HudTarget {
             _ => {}
         }
         None
+    }
+
+    /// The pointer is over the visible target-of-target button of the hostile window.
+    fn tot_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        self.tot.is_some() && self.bars.iter().filter(|b| b.hostile).any(|b| gui.view_rect(b.window, "tot").is_some_and(|r| x >= r.l && x <= r.r + 1.0 && y >= r.t && y <= r.b + 1.0))
+    }
+
+    /// Click handler of `TargetTargetButton_c` (`LAB_10073554`): when `N3Msg_CanClickTargetTarget(target, targetsTarget)` the
+    /// target's target is selected (`Send(0x1e, 0x126)`).
+    fn tot_click(&mut self, zone: &mut Zone) {
+        if let (Some(cur), Some(tot)) = (zone.target, self.tot) {
+            if can_click_target_target(zone, cur, tot) {
+                self.select(zone, Some(tot));
+            }
+        }
     }
 
     fn dock_at(&self, gui: &Gui, x: f32, y: f32) -> Option<(bool, Part)> {
@@ -366,9 +461,11 @@ impl HudTarget {
         None
     }
 
-    /// Arrows: previous / next friendly or hostile target (the four `TargetingModule_t::Get{Next,Prev}…TargetMessage` handlers;
-    /// [INFERENCE] bound to the dock arrows). Friendly button: `SelectSelf`. Hostile button: UNRESOLVED (`FUN_1007303d` only toggles
-    /// its enabled state with a `GlobalSignals` value).
+    /// The dock handlers (`LAB_10072fcb` / `LAB_10072ff1` / `LAB_10073017`, GUI): the arrows send `GetPrev{Friendly,Hostile}Target`
+    /// (AFCM 0x1e, 0x105 / 0x106) and `GetNext…` (0xe8 / 0xe9), i.e. [`cycle`]; the friendly button is `TargetingModule_t::
+    /// SelectSelf`; the hostile button is the Attack button, `N3Msg_PerformSpecialAction(0xb)` = `DefaultAttack(target, false)`
+    /// (docs/zone/combat-net.md §5.3; the attack send is not wired into the HUD yet). None of these views has a tooltip: the
+    /// `CCTargetControl_c` constructor `FUN_100746ec` and `TargetHealthBar_c` / `TargetHeader_c` never call `View::SetToolTip`.
     fn dock_click(&mut self, zone: &mut Zone, hostile: bool, part: Part) {
         match part {
             Part::Prev | Part::Next => {
@@ -415,6 +512,23 @@ impl HudTarget {
             }
             gui.set_canvas(b.window, "bar", items);
         }
+        // `FUN_10073b9e`: the target-of-target button of the shown hostile window (pref `Targetstarget`, `N3Msg_GetTargetTarget`)
+        let tot = self
+            .targets_target
+            .then(|| zone.target.and_then(|t| zone.fight_target.get(&t).copied()))
+            .flatten()
+            .filter(|t| zone.dynels.contains_key(t))
+            .filter(|_| self.bars.iter().any(|b| b.hostile && b.shown.is_some()));
+        if tot != self.tot {
+            self.tot = tot;
+            if let Some(w) = self.bars.iter().find(|b| b.hostile).map(|b| b.window) {
+                gui.set_visible(w, "tot", tot.is_some());
+                if let Some(t) = tot {
+                    gui.set_text(w, "tot_name", &format!("<font color=0xffffff>{}</font>", clean(&zone.dynels[&t].name)));
+                }
+                gui.relayout_window(w);
+            }
+        }
         let hover = self.dock_at(gui, self.mouse.0, self.mouse.1);
         for d in &self.docks {
             for p in [Part::Prev, Part::Button, Part::Next] {
@@ -440,6 +554,42 @@ impl HudTarget {
             }
         }
     }
+}
+
+/// `GFX_GUI_INDICATOR_SELECTED` (0xe6, 128×32, colour-keyed corner brackets); `GFX_GUI_INDICATOR_ATTACKING` is 0xe5 (used by the
+/// fight-target indicator `FightingTargetMessage` 0x10025947 creates, not drawn here).
+const INDICATOR_SELECTED: u32 = 0xe6;
+
+/// The selection `Indicator_t` of `TargetingModule_t::SetTarget` (`FUN_100255be`, rebuilt by `FUN_10024e14`, GUI): a 32 px high
+/// plate, 128 px wide (256 when the text is wider than 128 px), made of the left and the right half of the corner-bracket art
+/// at its ends, the tag line (font 2 = `FontGameShell12`) centred at the top and a 64×4 health bar at y 14..18 (`FUN_10024c03`:
+/// `ftol(ratio·64)` px in the bar colour, the rest 0x333333; shown for selection indicators only). The original draws the plate
+/// as a world-space billboard (`VisualSprite_t(width/128, 0.3, "[3] TargetIndicatorMat")`, priority 6) at the head anchor
+/// `GetIndicatorPosition`; here it is drawn 1:1 in GUI pixels, centred on the projected anchor ([INFERENCE]: sprite origin =
+/// centre), because glyphs cannot be scaled in a draw list. UNRESOLVED: the bar colour (`+0x28`, a `Consider` gradient for
+/// `Consider_e == 3`, else 0xffffff, which is used) and the clan line.
+fn draw_indicator(gui: &mut Gui, text: &str, rgb: u32, x: f32, y: f32, health: f32, list: &mut ao_gui::DrawList) {
+    use ao_gui::{DrawCmd, FontId, GfxId};
+    let tw = gui.text_width(FontId::Shell, text);
+    let w = if tw <= 128 { 128.0 } else { 256.0 };
+    let (x0, y0) = ((x - w / 2.0).floor(), (y - 16.0).floor());
+    let half = 64.0;
+    for (src_x, dst_x) in [(0.0, x0), (half, x0 + w - half)] {
+        list.cmds.push(DrawCmd::Gfx { id: GfxId(INDICATOR_SELECTED), src: [src_x, 0.0, half, 32.0], dst: [dst_x, y0, dst_x + half, y0 + 32.0], tint: [255; 3], alpha: 1.0 });
+    }
+    gui.text_cmds(FontId::Shell, text, (x0 + (w - tw as f32) / 2.0) as i32, y0 as i32 + 1, rgb, 1.0, list);
+    let bx = x0 + (w - 64.0) / 2.0;
+    let fill = (health.clamp(0.0, 1.0) * 64.0).floor();
+    list.cmds.push(DrawCmd::Solid { dst: [bx, y0 + 14.0, bx + fill, y0 + 18.0], color: [255; 3], alpha: 1.0 });
+    list.cmds.push(DrawCmd::Solid { dst: [bx + fill, y0 + 14.0, bx + 64.0, y0 + 18.0], color: [0x33; 3], alpha: 1.0 });
+}
+
+/// Draws the selection indicator of the target over its head (`TargetingModule_t` keeps one `Indicator_t` for the target unless the
+/// target has skill flag 0x400; the dynel must have a model for its head anchor).
+pub(super) fn selection_indicator(gui: &mut Gui, zone: &Zone, cam: &Camera, size: (u32, u32), list: &mut ao_gui::DrawList) {
+    let Some(id) = zone.target else { return };
+    let Some((x, y, tag)) = zone.world.indicator_anchor(id, cam, size) else { return };
+    draw_indicator(gui, &tag.text, tag.rgb(), x, y, info(zone, id).map_or(0.0, |i| i.health), list);
 }
 
 /// `TargetHealthBar_c` surfaces (`FUN_10073598`, `FUN_10072ead`): caps at both ends tinted DEFAULT, the background between them
@@ -502,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_takes_the_nearest_and_world_click_selects() {
+    fn clicks_walk_through_the_hit_list_and_ground_keeps_the_target() {
         let mut z = Zone::new(1);
         // server z is mirrored: scene z = -server z, so these stand at scene z = -5 and z = -12
         z.dynels.insert(1, dyn_at("Me", [20.0, 0.0, 0.0], false, 1));
@@ -511,10 +661,24 @@ mod tests {
         let cam = Camera::look_at(Vec3::new(0.0, 1.2, 1.0), Vec3::new(0.0, 1.2, -10.0));
         let lens = Lens::default();
         let ray = pick_ray(&cam, &lens, (800.0, 600.0), (400.0, 300.0));
-        assert_eq!(pick(&ray, &z.dynels), Some(2));
+        assert_eq!(pick_all(&ray, &z.dynels), vec![2, 3]);
         // a click at the far left of the screen misses everything
         let ray = pick_ray(&cam, &lens, (800.0, 600.0), (5.0, 300.0));
-        assert_eq!(pick(&ray, &z.dynels), None);
+        assert!(pick_all(&ray, &z.dynels).is_empty());
+        // `n3Camera_t::GetNextTarget`: first hit, then the one after the current target, wrapping; a stranger restarts the list
+        assert_eq!(click_target(&[2, 3], None), Some(2));
+        assert_eq!(click_target(&[2, 3], Some(2)), Some(3));
+        assert_eq!(click_target(&[2, 3], Some(3)), Some(2));
+        assert_eq!(click_target(&[2, 3], Some(9)), Some(2));
+        assert_eq!(click_target(&[], Some(2)), None);
+        // through `world_click`: the first click selects the near one, the second the far one, the ground changes nothing
+        let mut h = HudTargetLite::default();
+        assert!(h.0.world_click(&mut z, &cam, &lens, (800, 600), (400.0, 300.0)));
+        assert_eq!(z.target, Some(2));
+        assert!(h.0.world_click(&mut z, &cam, &lens, (800, 600), (400.0, 300.0)));
+        assert_eq!(z.target, Some(3));
+        assert!(!h.0.world_click(&mut z, &cam, &lens, (800, 600), (5.0, 300.0)));
+        assert_eq!(z.target, Some(3));
     }
 
     #[test]
@@ -537,6 +701,44 @@ mod tests {
         assert_eq!(cycle(&z, false, true), Some(4));
     }
 
+    /// `N3Msg_GetCloseTarget`: `d² − d²(current)`, `+1000` when negative, only within 100 m, any other-side character is hostile.
+    #[test]
+    fn close_target_order_follows_the_original_metric() {
+        let mut z = Zone::new(1);
+        z.stats.insert(stats::SIDE, 1);
+        z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
+        z.dynels.insert(2, dyn_at("A", [0.0, 0.0, 5.0], true, 0));
+        z.dynels.insert(3, dyn_at("B", [0.0, 0.0, 9.0], true, 0));
+        z.dynels.insert(5, dyn_at("C", [0.0, 0.0, 40.0], true, 0));
+        z.dynels.insert(6, dyn_at("Out of range", [0.0, 0.0, 150.0], true, 0));
+        z.dynels.insert(7, dyn_at("Omni player", [0.0, 0.0, 20.0], false, 2));
+        // nothing selected: forward = nearest, backward = farthest in range
+        assert_eq!(cycle(&z, true, true), Some(2));
+        assert_eq!(cycle(&z, true, false), Some(5));
+        // the next farther one (the player of the other side is hostile too)
+        z.target = Some(3);
+        assert_eq!(cycle(&z, true, true), Some(7));
+        assert_eq!(cycle(&z, true, false), Some(5), "backwards takes the largest metric: the nearer ones wrapped by +1000 lose to C (1519)");
+        // from the farthest the wrap (+1000 once) keeps the nearer ones negative: the smallest is the nearest
+        z.target = Some(5);
+        assert_eq!(cycle(&z, true, true), Some(2));
+    }
+
+    #[test]
+    fn target_of_target_click_rule() {
+        let mut z = Zone::new(1);
+        for (id, name) in [(1, "Me"), (2, "Wolf"), (3, "Boar")] {
+            z.dynels.insert(id, dyn_at(name, [0.0; 3], id > 1, 0));
+        }
+        assert!(!can_click_target_target(&z, 2, 3), "two plain dynels");
+        assert!(can_click_target_target(&z, 2, 1), "the own character is not plain");
+        assert!(can_click_target_target(&z, 1, 2));
+        z.stats.insert(TOWER_TYPE, 1);
+        assert!(!can_click_target_target(&z, 1, 2), "a TowerType on the own character refuses");
+        assert!(can_click_target_target(&z, 2, 1));
+        assert!(!can_click_target_target(&z, 2, 9), "unknown dynel");
+    }
+
     #[test]
     fn select_self_toggles_back() {
         let mut z = Zone::new(1);
@@ -549,6 +751,7 @@ mod tests {
         gui_less.0.select_self(&mut z);
         assert_eq!(z.target, Some(2));
     }
+
 
 
     /// The target controls over the control centre, rendered through `ao_render::Offscreen` (client install only;
@@ -614,6 +817,29 @@ mod tests {
         assert!(!fe.gui.window_visible(fe.ht.bars[1].window));
     }
 
+    /// `FUN_10073b9e` / `LAB_10073554`: the button needs the `Targetstarget` pref and a shown hostile window; a click selects the
+    /// target's target when `CanClickTargetTarget` holds (here the own character).
+    #[test]
+    fn target_of_target_button_follows_the_pref_and_selects() {
+        let Some(mut fe) = fe((1280, 800)) else { return };
+        fe.zone.target = Some(2);
+        fe.zone.fight_target.insert(2, 1);
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert_eq!(fe.ht.tot, None, "Targetstarget defaults to false");
+        fe.ht.targets_target = true;
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert_eq!(fe.ht.tot, Some(1));
+        let r = fe.gui.view_rect(fe.ht.bars[1].window, "tot").unwrap();
+        assert!(r.r > r.l && r.b > r.t);
+        let (x, y) = ((r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
+        for ev in [InputEvent::MouseDown { x, y, button: MouseButton::Left }, InputEvent::MouseUp { x, y, button: MouseButton::Left }] {
+            assert_eq!(fe.ht.input(&fe.gui, &mut fe.zone, &ev), None, "not a world click");
+        }
+        assert_eq!(fe.zone.target, Some(1));
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert_eq!(fe.ht.tot, None, "the hostile window is gone with its target");
+    }
+
     #[test]
     fn target_screenshot() {
         let Some(out) = std::env::var_os("AOMAC_SHOT_DIR").map(std::path::PathBuf::from) else { return };
@@ -633,7 +859,7 @@ mod tests {
     struct HudTargetLite(HudTarget);
     impl Default for HudTargetLite {
         fn default() -> Self {
-            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None })
+            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false })
         }
     }
 }

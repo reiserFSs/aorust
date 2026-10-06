@@ -629,6 +629,13 @@ impl Dynels {
         }
     }
 
+    /// Integrates the movement of every character by `dt` seconds (the drawn pose and animation state).
+    pub fn advance(&mut self, dt: f32) {
+        for c in self.chars.values_mut() {
+            c.pose = c.mover.advance(dt);
+        }
+    }
+
     /// Advances the dynels and hands the visible ones to the renderer. `cam` = camera position in scene space, `fwd` = its view direction.
     pub fn update(&mut self, dt: f32, cam: [f32; 3], fwd: [f32; 3], host: &mut Host) {
         let Some(dir) = self.dir.clone() else { return };
@@ -698,8 +705,8 @@ impl Dynels {
             let parts = built.held.as_ref().map_or(vec![], |h| h.1.clone());
             host.actors.push(ActorFrame { id: p.id, model: p.key, transform, parts, skin, always: false });
         }
+        self.advance(dt);
         for (id, c) in &mut self.chars {
-            c.pose = c.mover.advance(dt);
             if *id == own {
                 continue;
             }
@@ -926,5 +933,65 @@ mod tests {
             }
             ao_render::render_to_png_actors(&scene, &models, actors, cam, at, 1200, 700, std::path::Path::new(&out), 0.0).unwrap();
         }
+    }
+
+    /// The capture replayed with its timestamps: moving NPCs walk (their animation state follows the movement FSM) and their drawn
+    /// position stays within a few metres of what the server last told.
+    #[test]
+    fn replayed_npcs_move_and_play_walk_clips() {
+        let mut z = Zone::new(25988);
+        z.world.start(PathBuf::new(), 25988);
+        let rec = include_str!("../../../../docs/captures/zone_ithaca.rec");
+        let mut last_ms = 0u32;
+        let (mut walked, mut ran) = (HashSet::new(), HashSet::new());
+        let mut known: HashMap<i32, Vec<[f32; 3]>> = HashMap::new();
+        for l in rec.lines() {
+            let mut p = l.split(' ');
+            let (ms, dir, hex) = (p.next().unwrap().parse::<u32>().unwrap(), p.next().unwrap(), p.next().unwrap());
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            if dir != "<" {
+                continue;
+            }
+            // advance the clock to the frame's time in 1/30 s steps
+            while last_ms + 33 <= ms {
+                z.world.advance(1.0 / 30.0);
+                last_ms += 33;
+                for (id, c) in &z.world.chars {
+                    match c.pose.anim {
+                        AnimState::Walk => walked.insert(*id),
+                        AnimState::Run => ran.insert(*id),
+                        _ => false,
+                    };
+                }
+            }
+            let Some((f, _)) = Frame::decode_with(&b, false).ok().flatten() else { continue };
+            if let Ok(m) = ao_net::n3::decode(&f) {
+                match &m.body {
+                    N3::Dynel(Dynel::CharDCMove(mv)) => known.entry(m.header.target.instance).or_default().push(mv.pos),
+                    N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => known.entry(m.header.target.instance).or_default().push(u.pos),
+                    N3::Misc(Misc::FollowTarget(t)) => known.entry(m.header.target.instance).or_default().extend(t.path.iter().map(|v| [v.x, v.y, v.z])),
+                    _ => {}
+                }
+                z.on_frame(&f);
+            }
+        }
+        assert!(walked.len() + ran.len() >= 5, "walking {} running {}", walked.len(), ran.len());
+        // every dynel is drawn on the polyline of the positions and waypoints the server sent (within 3 m)
+        let seg = |p: [f32; 3], a: [f32; 3], b: [f32; 3]| {
+            let ab: [f32; 3] = std::array::from_fn(|i| b[i] - a[i]);
+            let l2: f32 = ab.iter().map(|x| x * x).sum();
+            let t = if l2 > 0.0 { ((0..3).map(|i| (p[i] - a[i]) * ab[i]).sum::<f32>() / l2).clamp(0.0, 1.0) } else { 0.0 };
+            (0..3).map(|i| (p[i] - a[i] - t * ab[i]).powi(2)).sum::<f32>().sqrt()
+        };
+        let off = z
+            .world
+            .chars
+            .iter()
+            .filter(|(id, c)| {
+                let pts = &known[*id];
+                pts.len() == 1 && seg(c.pose.pos, pts[0], pts[0]) > 3.0 || pts.windows(2).map(|w| seg(c.pose.pos, w[0], w[1])).fold(f32::MAX, f32::min) > 3.0 && pts.len() > 1
+            })
+            .count();
+        assert!(off * 10 <= z.world.chars.len(), "{off} of {} dynels are more than 3 m off the server polyline", z.world.chars.len());
     }
 }

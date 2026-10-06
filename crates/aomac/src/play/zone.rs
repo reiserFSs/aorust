@@ -51,10 +51,18 @@ pub struct Zone {
     /// The own character's stats: `FullCharacterIIR_t` (stats_a, stats_b, u8, i16, map groups) then every own `StatIIR_t`
     /// (docs/zone/world.md §2; the interface reads them like `N3Msg_GetSkill`). [`ao_formats::stats`] names the ids.
     pub stats: HashMap<u32, i32>,
+    /// The own inventory by slot (`FullCharacterIIR_t` inventory; slots 0..0x3f equipment pages, 0x40.. bag; docs/gui.md §11.5).
+    pub inventory: HashMap<u32, ao_net::n3::world::InventoryEntry>,
     /// Other players / NPCs as renderer actors (`play/dynels.rs`).
     pub world: super::dynels::Dynels,
     /// The selected target (`InputConfig_t+0xc0`, set by `TargetingModule_t::SetTarget` GUI 0x100257b0): the dynel instance id.
     pub target: Option<i32>,
+    /// The own dynel's last `SimpleCharFullUpdateIIR_t` (the avatar's appearance) and how many arrived (a new one = placed again).
+    pub own_update: Option<Box<ao_net::n3::dynel::SimpleCharFullUpdate>>,
+    pub own_serial: u32,
+    /// The fight controller target of every dynel (`SimpleChar+0x1d4`, `+0x4c/+0x50`, set by the relayed `AttackIIR_t`, cleared by
+    /// `StopFightIIR_t`; `N3Msg_GetTargetTarget` GC 0x1001641d reads it): fighter → its target instance id.
+    pub fight_target: HashMap<i32, i32>,
 }
 
 impl Zone {
@@ -96,6 +104,7 @@ impl Zone {
     pub fn reset_world(&mut self) {
         self.world.clear();
         self.dynels.clear();
+        self.fight_target.clear();
         self.in_play_sent = false;
     }
 
@@ -132,6 +141,8 @@ impl Zone {
                 self.apply_stats(c.stats_u8.iter().map(|s| (s.0 as u32, s.1 as i32)));
                 self.apply_stats(c.stats_i16.iter().map(|s| (s.0 as u32, s.1 as i32)));
                 self.apply_stats(c.stat_map.iter().map(|s| (s.0 as u32, s.1)));
+                // `FUN_1002aeca` replaces the character's inventory vector by the message's elements
+                self.inventory = c.inventory.iter().map(|e| (e.slot, *e)).collect();
             }
             N3::Dynel(Dynel::Stat(u)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 self.apply_stats(u.stats.iter().map(|s| (s.0 as u32, s.1)));
@@ -151,6 +162,10 @@ impl Zone {
                 }
             }
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if who.kind == CHAR_KIND => {
+                if who.instance == self.char_id as i32 {
+                    self.own_update = Some(Box::new(u.clone()));
+                    self.own_serial += 1;
+                }
                 self.dynels.insert(
                     who.instance,
                     DynelState {
@@ -165,7 +180,8 @@ impl Zone {
                     },
                 );
             }
-            N3::Dynel(Dynel::CharDCMove(mv)) if who.kind == CHAR_KIND => {
+            // the original ignores every CharDCMove for the own dynel (`FUN_1006bcc6`, docs/zone/movement.md)
+            N3::Dynel(Dynel::CharDCMove(mv)) if who.kind == CHAR_KIND && who.instance != self.char_id as i32 => {
                 if let Some(d) = self.dynels.get_mut(&who.instance) {
                     d.pos = mv.pos;
                     d.yaw = Some(mv.yaw());
@@ -173,6 +189,13 @@ impl Zone {
             }
             N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => {
                 self.dynels.remove(&who.instance);
+                self.fight_target.remove(&who.instance);
+            }
+            N3::Misc(Misc::Attack(a)) if who.kind == CHAR_KIND && a.target.kind == CHAR_KIND => {
+                self.fight_target.insert(who.instance, a.target.instance);
+            }
+            N3::Misc(Misc::StopFight(_)) if who.kind == CHAR_KIND => {
+                self.fight_target.remove(&who.instance);
             }
             _ => {}
         }

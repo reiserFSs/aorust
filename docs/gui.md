@@ -14,9 +14,12 @@ Reproduce renders: `cargo run --release -p ao-gui --example dump_view -- LoginWi
 
 * `cd_image/gui/Default/Graphics.uvgi`: text; line 1 = entry count, then `name offset length`. `Graphics.uvga` = concatenated PNGs
   (Interfaces.dll `GuiResourceManager_t::ParseFile` 0x1000b86d).
-* Ids: AFCM.dll `DynamicID_t` static table @0x10016060; the id of a `GFX_*` name is its index in the 487-name built-in list
-  (`crates/ao-gui/data/gfx_ids.txt`, line number − 1); names only present in the uvgi are appended. GUI.dll hard-codes numeric ids
-  (e.g. `Button_c::Initialize` 0x10128994: 0x1e..0x26 = `GFX_GUI_BORDER01_*`).
+* Ids: AFCM.dll `DynamicID_t` static table @0x10016060 (a table of `char*` pointing at the full names); the id of a `GFX_*` name is
+  its index in the 487-name built-in list (`crates/ao-gui/data/gfx_ids.txt`, line number − 1, read from that table in full: an earlier
+  copy cut at 40 characters gave 13 wrong names, e.g. 0x93–0x98 `…BIGARROW_{LEFT,RIGHT}_STATE1..3` were identical and their
+  images unreachable; also 0x92 `AGGDEF_SLIDER_BACKGROUND`, the golden button slices 0x9e/0xa0/0xa7/0xa9 (`BUTTON01/03_MIDDLE/RIGHT_GOLD`)
+  and 0xab/0xac `TARGET_BUTTON_STATE2/3`; test `gfx::tests::id_names_are_unique_and_arrows_resolve`); names only present in the uvgi are appended.
+  GUI.dll hard-codes numeric ids (e.g. `Button_c::Initialize` 0x10128994: 0x1e..0x26 = `GFX_GUI_BORDER01_*`).
 * Colour key: pure green `0x00FF00` → transparent, every other pixel opaque (DisplaySystem.dll `SpriteInfo_t::ConvertImage` 0x1007b8e2).
   PNGs may be RGB or RGBA.
 
@@ -205,7 +208,7 @@ Word-wrapped text sizes itself from its current frame, so the skills window is l
 Evidence (GUI.dll, project copy of `/tmp/aomac-ghidra/dsky/gui`):
 * `ControlCenterModule_c` ctor 0x1006c64d; `LoadMainConfig` 0x1006c371 loads `Variables.xml`, `MainPrefs.xml`, `LoginPrefs.xml`, `CharPrefs.xml` (defaults of every `dvalue:cc_*`: all true except `cc_mini_toolbar`; `NumHotbars` 1; windows false) then the user prefs. `SlotPlayerCharacterAlive` 0x1006afed creates the bars once the character is alive.
 * `FUN_1006f098` (`ControlCenterWindow_c`) loads `Views/ControlCenter.xml`, finds the docks by name and fills them: Left/RightWingDock = `CollapsingBitmapView_c` (`GFX_GUI_CONTROLCENTER_WING_LEFT` 0xb5 / `_RIGHT`), LeftBarDock = `LeftBarView_c` 0x1006f7c5 (bg `BOTTOM_LEFT` 0x99, HLayout `NCU`, `used/max` = stats 0xb4/0xb5, spacer, `CRED`, cash = stat 0x3d via `FormatNumeric`), RightBarDock = `RightBarView_c` 0x1006ff09 (`BOTTOM_RIGHT` 0x9a, `DEF`, `Slider_c` AGGDEF −100..100, `AGG`), Left/RightTargetCtrlDock = `CCTargetControl_c` 0x100746ec (HudTarget), RollupControllerDock = `RollupArea` `DockArea_c` (`InitialiseMessage` 0x1006a968: Rect(W−225, 20, W, H−191)). `FUN_1006ee1e` shows each view whose `activate_criteria` holds (`View::Show(CriteriaMonitor_c::Evaluate())`) → `Gui::apply_criteria` + `ao_gui::expr` (`dvalue:`, `stat:`/`s:`, `id:`, `&& || ! == != < > <= >= & | + -`).
-* Bars: `CharacterBar_c` 0x10066af6 = `PowerbarView_c(bg, full, left cap, right cap, Direction 3 = up)` in a style-3 `CharBarWindow_c` 0x1006d7c7; art `GFX_GUI_ACTIONVIEW_{HEALTH,NANO,XP,ALIENXP}BAR[_BACKGROUND|_LEFT|_RIGHT]` (11×107 + 9 px caps = 11×125, matching the saved frames 10×124 inclusive). Values: health stat 27/1 (0x100666b6), nano 214/221 (0x100667a8), XP (stat 0x34 − 0x39)/(0x15e − 0x39), level ≥200 uses 0x23d/0x240 (0x100668aa), alien XP 0x28/0xb2 (0x100669f7, created only if stat 0x185 (Expansion) & 0x18). Tooltip `View::SetToolTip(LDB text (cat 0x2710, key at 0x101b4300…), "%d / %d")` (key strings not resolved: UNRESOLVED, no tooltip set).
+* Bars: `CharacterBar_c` 0x10066af6 = `PowerbarView_c(bg, full, left cap, right cap, Direction 3 = up)` in a style-3 `CharBarWindow_c` 0x1006d7c7; art `GFX_GUI_ACTIONVIEW_{HEALTH,NANO,XP,ALIENXP}BAR[_BACKGROUND|_LEFT|_RIGHT]` (11×107 + 9 px caps = 11×125, matching the saved frames 10×124 inclusive). Values: health stat 27/1 (0x100666b6), nano 214/221 (0x100667a8), XP (stat 0x34 − 0x39)/(0x15e − 0x39), level ≥200 uses 0x23d/0x240 (0x100668aa), alien XP 0x28/0xb2 (0x100669f7, created only if stat 0x185 (Expansion) & 0x18). Tooltip `View::SetToolTip(LDBface::GetText(0x2710, key), "<tvoptions wordwrap=\"no\">%d&nbsp;/&nbsp;%d")` with the keys `Health` (0x101b4300), `Nano` (0x101b4334), `Experience` (0x101af930, shared literal, referenced at 0x100669a4) and `AlienExperience` (0x101b433c, referenced at 0x10066aa5) = text.mdb category 10000 `by_key` → "Health", "Nano", "Experience", "Alien Experience" (`Hud::bar_titles`, test `bar_titles_come_from_the_text_db`).
 * Menus: `CCMenu` → `ControlMenu_c` 0x10071524, entries `CCMenuEntry_c` 0x100660f2 (attrs `label bgicon invoke active_value criteria button_mode golden_button tooltip tooltip_body sub_script`); entries are stacked vertically, pitch = height + 4 (0x1007086f), invisible (criteria) entries skipped. Sub menus open in a style-3 window (flags 0xd3c) placed by 0x100653b6 (right of the button unless its centre is in the right half, bottom 7 px above the button bottom). Entry = `Button_c` with 3-slice art raised `BUTTON01_*` (0x9b/9d/9f, golden 0x9c/9e/a0), pressed `BUTTON03_*`, hover `BUTTON02_*` (0x10065b4e); `bgicon` 48×22 at layer alpha 0.85; `UpdateBgIconFade` 0x10127bdd: icon tint = 0x20 + (1−fade)·223, label shown when fade > 0.8, fade ±0.075 per `SlotFadeTimer`.
 * Shortcut bar: `ShortcutBarWindow_c` 0x100d94e9 / `ShortcutBarView_c` 0x100d8c12: radio (0x159/0x15a) + `TOOLBAR_CONTROL_H` 32×38 with up/down buttons + 10×1 `MultiListView` of `SLOT_32_CLOSED` (38×38, pitch 36) = 403×38. Config path `…/Containers/ShortcutBar_<n>.xml`.
 * `prefs/NewChar/*` (CCHealthBarConfig frames, ShortcutBar frames, DockAreas, Chat windows) is the install's new-character template; **no DLL contains the string `NewChar`** (searched all DLL/EXE, ASCII and UTF-16), so its consumer is UNRESOLVED; we use its `WindowFrame`s (clamped like `Window::MoveInsideScreen` 0x10154abc) as the first-login layout. Bars at (1075/1085, 794) sit right of the hotbar (662..1064, y 1017), consistent with a coherent default.
@@ -253,15 +256,46 @@ tests). The timer runs on `Gui::frame(dt)`; `input()` feeds `UpdateToolTip`. Tes
   not for targets with skill-flag 0x400) + the tip events `OnSelecting` / `OnSelectingNPC` / `OnSelectingPlayer`. **Nothing is sent to the server.**
   `FrameProcess` 0x10025fa4 drops the target when the dynel disappeared (`N3Msg_GetPos` fails or `N3Msg_GetParent` ≠ 0) unless it was forced; `RemoveTarget` 0x2598b remembers it
   as `m_cLastTarget`; `SelectSelf` 0x100259b1: no target → self; target is self → previous target; else remember + self.
-* Keys (GUI.dll default hotkeys, `InputConfig_t::SetDefaultHotkeys` 0x1001ad88 text): `TAB` next hostile, `SHIFT+TAB` previous hostile, `CTRL+TAB` next friendly,
-  `CTRL+SHIFT+TAB` previous friendly (`COMMAND_{NEXT,PREV}_{HOSTILE,FRIENDLY}_TARGET` → `N3Msg_GetCloseTarget(current, friendly, forward)`; the ordering is [INFERENCE]: by distance).
-* The pick: `InputConverterModule_t::InputGameSubmodeActionViewONMessage` 0x1001bcae → `N3Msg_SetMousePos` (Gamecode 0x1001613b) → `n3Camera_t::SetMousePos` (N3 0x10020571:
-  ray `(tan(fov/2)·x, tan(fov/2)/aspect·y, 1)` through the camera matrix, scaled by `VisualCamera_t::GetLengthOfViewcone`, cast into the collision world) → identity under the
-  mouse → `InputConfig_t::CheckObjectUnderMouse` 0x10019f00 picks the mouse pointer (`Pointer_e` 1–5 by `GetSkill(0x1e)` flags / NPC / `CanAttack`; cursor art not ported).
-  The mouse *click* → `SetTarget` dispatch itself was not found (the default hotkey list has no mouse command except debug ones; `HandleMouseDown` only emits `GlobalSignals`), so
-  UNRESOLVED: which signal turns a left click into `SetTargetMessage`, and any click-on-ground deselect. We select on a left click without drag, and a click on empty ground keeps the target.
-  We have no collision meshes of the dynels: `hud_target::pick` intersects the ray with one capsule per dynel ([`CAPSULE_HEIGHT`] 1.8 m, [`CAPSULE_RADIUS`] 0.5 m, UNRESOLVED GUESS).
-* The ground **selection indicator** and the hover pointer change need renderer support (ground decal / cursor art) and are not implemented.
+* Keys (GUI.dll default hotkeys, `InputConfig_t::SetDefaultHotkeys` 0x1001ad88 text, `ParseFile` 0x1001ac19 parses the built-in table, the file name `hotkeys.txt` is not read): `TAB` next hostile,
+  `SHIFT+TAB` previous hostile, `CTRL+TAB` next friendly, `CTRL+SHIFT+TAB` previous friendly → `TargetingModule_t::Get{Next,Prev}{Hostile,Friendly}TargetMessage` 0x10025adc… →
+  `N3Msg_GetCloseTarget(current, friendly, forward)` (Gamecode 0x1001c411) → `SetTarget(id, false)`. **Order** (decompiled): candidates = dynels within **100 m** (`_DAT_10155eb0`) of the own
+  character except it and the current target, visible, stat `InPlay` (0xc2) ≠ 0; class = `Side` (0x21, `0x29c` in a battle station), players in the own team and pets (stat `PetMaster` 0xc4) of
+  the own team count as the own class; *friendly* = same class, *hostile* = different. Metric `m = d² − d²(current)` (`FUN_10023a81` is the squared length; 0 without a current character
+  target), `+1000` (`_DAT_10157870`) once if negative or if 0 for a candidate listed before the current one; next = the smallest `m` (start `FLT_MAX`), previous = the largest (start
+  `FLT_MIN`). So Tab walks outwards by distance and wraps. `hud_target::cycle`; not modelled: team/pet exceptions, `InPlay`, the list order of the locality query (ids are used).
+* **The click** (found): `ActionViewMouseHandler_c` (ctor `FUN_1002c66b`, GUI) connects `WindowController_c` mouse signals: press `FUN_1002c2ee(Point, button, clicks)`, release
+  `FUN_1002c469(Point, button)` and `FUN_1002c14d` (ends the look, `FUN_1002c0e5`), and `GlobalSignals` mouse-move `FUN_1002c17b` (accumulates the pointer path in `+0x1c` while a look is
+  active, `MouseTurnSensitivity`). Release, with no drag object and `(look inactive || path < 0.02)` (`_DAT_101aeaf4`; units raw counts / 1000 = 20 counts; `play/controls.rs` has the same rule):
+  the object under the mouse is `InputConfig_t+0xb0` (set by `CheckObjectUnderMouse`); void (`0x9c47`, `0x9c52`, 0) = **nothing happens (no click-on-ground deselect exists)**. Left button, no
+  Ctrl-on-a-character: no Shift → `Send(0x1e, 0x126, N3Msg_GetNextTarget(current target))` (= `n3Camera_t::GetNextTarget` N3 0x10020723: the object after the current target in the camera's
+  hit list `+0x244`, wrapping; the first one if the current target is not in it; void → the hovered object), Shift → `InfoViewModule_c::ShowURL("charid://50000/<id>")` / `itemid://` (no
+  selection); Ctrl on a character → `Send(0x1e, 0x126, id)` + `N3Msg_SwitchTarget(id)` (= `DefaultAttack(id, true)`). Right button: character → `N3Msg_DefaultActionOnDynel` (Gamecode
+  0x100291da: item/corpse pickup, trade, use), else `N3Msg_UseItem`. Press: a left **double click** on an object other than the own character runs `DefaultActionOnDynel` when
+  `DoubleclickAction` (LoginPrefs, default true); with `LMBMouseLook` (default true) the left press arms the camera look. Message 0x126 on module 0x1e = `TargetingModule_t::SetTargetMessage`
+  (`SetTarget(id, false)`: only if `N3Msg_isIDOnGround(id)`). The deselect `SetTarget(0,0)` (`RemoveTarget` 0x2598b) comes from `FrameProcess` (dynel gone) and from the AFCM messages 0x112/0x113, which
+  `FlowControlModule_t::StopAllActionsMessage` (GUI 0x10027de4), `TeleportStartedMessage` (0x1002910e) and Gamecode (`FUN_1006880d`, `FUN_1002f009`, `FUN_1005cb6a`) send; no mouse path.
+  `hud_target::{pick_all, click_target, world_click}`; the modifier branches and right/double click need modifier state in mouse events (not reported yet) and the combat sends: not wired.
+* The pick: `InputConverterModule_t::InputGameSubmodeActionViewONMessage` 0x1001bcae (every frame) → `N3Msg_SetMousePos` (Gamecode 0x1001613b) → `n3Camera_t::SetMousePos` (N3 0x10020571:
+  ray `(tan(fov/2)·x, tan(fov/2)/aspect·y, 1)` through the camera matrix, scaled by `VisualCamera_t::GetLengthOfViewcone`) → its `n3CameraCollLine_t` (`+0x180`) collides with every visible
+  `n3VisualDynel_t` (`FUN_10020a3c`: `vtable+0x94(line, BoundingBoxTargeting, …)`, pref **`BoundingBoxTargeting` default true** = the dynels' bounding boxes, the client character excluded
+  unless the camera is third-person) → the hit list `+0x244`; `GetObjectUnderColLine` = the current target if it is in the list, else the first entry. The mouse world position is the
+  line's hit (`+0x190`). We have no bounding volumes of the dynels: `hud_target::pick_all` intersects the ray with one capsule per dynel ([`CAPSULE_HEIGHT`] 1.8 m, [`CAPSULE_RADIUS`] 0.5 m,
+  UNRESOLVED GUESS) and orders the hits by distance ([INFERENCE]).
+* **Hover pointer** (`InputConfig_t::CheckObjectUnderMouse` 0x10019f00 → `MousePointerModule_t::SetMousePointer(Pointer_e, DetailLeft, DetailRight)`, drawn by the software cursor
+  `MousePointerModule_t::FrameProcess` 0x100202dd / `FUN_10020120` at `InputConfig_t+0x118`, honouring `MouseCursorMode` 2 detailed / 1 simple / 0 none): the sprite table @0x10263178
+  (`GFX_GUI_POINTER_STANDARD` 0x135, `_BLUE` 0x136, `_GRAY` 0x137, `_PURPLE` 0x138, `_YELLOW` 0x139, `_GREEN` 0x13a, `_RED` 0x13b, `4WAY_DRAG` 0x13c … `WAIT` 0x143), details @0x102632a8
+  (`POINTERDETAIL_` OPERATE 0x144, DENIED 0x145, ATTACK 0x146, PICKUP 0x147, LOOKAT 0x148, QUESTION 0x149, TALK 0x14a, TRADE 0x14b), overlays @0x1026313c (`POINTEROVERLAY_LEFTCLICK/RIGHTCLICK/
+  BOTHCLICK` 0x14c–0x14e); table rows are `{hotspot a, colour 0xffffff, gfx id, sprite, hotspot b}`. `CheckObjectUnderMouse` runs every frame on the object under the mouse: type `0x9c47` sets a flag
+  and leaves; `0x9c52` / 0 leave; a character (50000): the own character → `SetMousePointer(2, -1, -1)`, others → `Pointer_e` 1…5 and details 6 / 7 chosen from `IsNpc`, `GetSkill(0xe0)`
+  flags (0x20000000 / 0x4000001), `HasVulnerableFightMode`, the `Side` comparison (stat 0x21) and the own-team test, the right detail 7 only with `DoubleclickAction`, cleared by Ctrl; any other
+  object (items, doors): by its skill 0x1e flags (bits 0 / 3 / 0x100000 → `Pointer_e` 1 with a detail or a `Send(0x1e, 0x126)`, see the click). The exact `Pointer_e` → colour sprite and detail → art
+  mapping was not traced (UNRESOLVED). **Not implemented**: this client uses the OS cursor on every screen and `ao_render::Host` has no way to hide it for a software cursor.
+* The **selection indicator** (found): not a ground decal. `SetTarget` creates `Indicator_t(id, attacking = 0, health = 1)` (`FUN_100255be`, vftable 0x101ae0d4) unless the target has skill flag
+  0x400: a world billboard `VisualSprite_t(width/128, 0.3, "[3] TargetIndicatorMat")` (priority 6) over the head anchor `N3Msg_GetIndicatorPosition` (same anchor and text rules as the name tags,
+  docs/zone/motion.md §6) showing a 128×32 (256 wide for long text) plate: the left and right half of `GFX_GUI_INDICATOR_SELECTED` (0xe6, corner brackets; 0xe5 `…_ATTACKING` for the attacked
+  dynel) at its ends, the tag line (`FUN_10024e14`: `** name **` for GM flags, `= name =`, titles, breed, colour by flags / `Consider`) in font 2, and the 64×4 health bar of `FUN_10024c03`
+  (y 14..18, `ftol(Health/MaxHealth·64)` px, rest 0x333333). Implemented as `hud_target::selection_indicator` (called from `flow.rs` after the name tags): drawn 1:1 in GUI pixels centred on the
+  projected anchor, not perspective-scaled; bar colour white (UNRESOLVED `Consider` gradient); no clan line; the attacking indicator needs the fight state.
 
 ### 13.3 Target controls (`CCTargetControl_c`, GUI 0x100746ec; `play/hud_target.rs`)
 * `ControlCenterModule_c::CreateTargetMenus` 0x1006a0d4 builds two controls (friendly = `0x154` flag 0, hostile = 1) twice: the **dock** version (`LeftTargetCtrlDock` /
@@ -275,13 +309,26 @@ tests). The timer runs on `Gui::frame(dt)`; `input()` feeds `UpdateToolTip`. Tes
   `<center>Selection</center>` — the other captions "Nano Target", "Fighting Target", "Nano / Fighting Target" belong to the NCU/fight variants — and the target's name in white, from
   `N3Msg_GetName` + `String::StripSpecialChars`). `FUN_10072e49` tints the caps `0xff2222` when `+0x161`/`+0x162` is set (writers not identified: UNRESOLVED, caps stay DEFAULT).
 * Which control shows a target: attackable → hostile, otherwise friendly. Attackable (`FUN_100744ae`): NPC and `Side` (stat 0x21) differs from the own side; a player needs
-  `N3Msg_CanAttack` (not modelled). The dock arrows are bound to `TargetingModule_t::Get{Next,Prev}{Friendly,Hostile}TargetMessage` ([INFERENCE]), the friendly button to `SelectSelf`;
-  the hostile button's action (`FUN_1007303d`) and the target-of-target button (`FUN_10075342`, "Fighting Target:" in 0xff4444, `N3Msg_GetTargetTarget`), the NCU windows
-  (`NanoTargetNCUWindowConfig`, `FightTargetNCUWindowConfig`) are not implemented (UNRESOLVED).
-* Data: `Zone.target` (instance id), `DynelState { side, level, health, max_health }` (from `SimpleCharFullUpdate` and other characters' `StatIIR_t`). Tests in
-  `hud_target.rs` (ray math, capsule pick, cycling, `SelectSelf`, windows follow the selection, `AOMAC_SHOT_DIR` screenshots `target-hostile.png`, `target-friendly.png`).
+  `N3Msg_CanAttack` (not modelled).
+* **Dock handlers** (disassembled, GUI): left arrow `LAB_10072fcb` = `AFCM::Send(0x1e, flag ? 0x106 : 0x105)` (`GetPrev{Hostile,Friendly}TargetMessage`), right arrow
+  `LAB_10072ff1` = `Send(0x1e, flag ? 0xe9 : 0xe8)` (`GetNext…`), target button `LAB_10073017` = flag ? `N3Msg_PerformSpecialAction(0xb)` (**Attack**,
+  docs/zone/combat-net.md §5.3; the HUD does not send it yet) : `TargetingModule_t::SelectSelf`. (`FUN_1007303d` only sets the button's toggle value from a `GlobalSignals` int.)
+  `hud_target::cycle` is `N3Msg_GetCloseTarget` (Gamecode 0x1001c411, see §13.2).
+* **No tooltips**: `FUN_100746ec` (`CCTargetControl_c`), `FUN_10073598` (`TargetHealthBar_c`), `FUN_10073884` (`TargetHeader_c`) and `FUN_10075342` (`TargetTargetButton_c`) never call
+  `View::SetToolTip` (searched every decompiled function 0x10072000–0x10075fff: the only `SetToolTip` is `ToolbarButton_c` `FUN_10072b33`), so the target windows show none.
+* **Target-of-target button** (`TargetTargetButton_c`, `FUN_10075342`; first child of the *hostile* bar window, `View` flags 0x100): `BorderView` with the header's frame gfx
+  (0x88/0x89/0x86/0x87), `SetColor(0x7fffff)`, a vertical layout, caption `"Fighting Target:"` (`TextView`, borders 3,3,3,0) and the name (borders 3,0,3,3), window border 5 below.
+  `FUN_10073b9e(show)`: only when the pref `Targetstarget` (`LoginPrefs.xml`, "Show Target's Target", default **false**) is set and `N3Msg_GetTargetTarget(target)` (the fight
+  controller target of the selected dynel, `SimpleChar+0x1d4` `+0x4c/0x50`; Gamecode 0x1001641d) is non-zero: name = `N3Msg_GetName`, button shown with the window. Click `LAB_10073554`:
+  if `N3Msg_CanClickTargetTarget(target, targetsTarget)` (Gamecode 0x10016451, `hud_target::can_click_target_target`) → `Send(0x1e, 0x126, targetsTarget)` = select it. Implemented
+  (`HudTarget::targets_target`, `tot`, `Zone::fight_target` from the relayed `AttackIIR_t` / `StopFightIIR_t`). Caption colour: the `0xff4444` of `FUN_10073d0f` belongs to the
+  selection/fight header logic of the whole `CCTargetControl_c` (UNRESOLVED), the button's caption keeps the default text colour.
+* NOT implemented: the NCU windows (`NanoTargetNCUWindowConfig`, `FightTargetNCUWindowConfig`), the fight-target variant of the bar windows (`FUN_10073d0f`: the second bar/header pair
+  `+0x130/+0x134`, captions "Fighting Target", "Nano Target", red caps), the attack send of the hostile button.
+* Data: `Zone.target` (instance id), `Zone.fight_target`, `DynelState { side, level, health, max_health }` (from `SimpleCharFullUpdate` and other characters' `StatIIR_t`). Tests in
+  `hud_target.rs` (ray math, capsule pick, hit-list click cycling, close-target metric, `SelectSelf`, target-of-target, windows follow the selection, `AOMAC_SHOT_DIR` screenshots
+  `target-hostile.png`, `target-friendly.png`; the dock arrows are drawn since the id table fix, §1).
 
-**Known gap (13.3)**: the dock arrows are not visible. `gfx_ids.txt` holds the AFCM `DynamicID_t` names truncated to 40 characters, so ids 0x93–0x95 / 0x96–0x98 (`…BIGARROW_{LEFT,RIGHT}_STATE1..3`) have three identical names and `GfxSet::size(GfxId(0x93))` is (0,0); the full uvgi names only exist under appended ids. Fix for the GuiEngine owner: map the n-th table id of a truncated duplicate to the n-th full uvgi name in sorted order (STATE1, STATE2, STATE3; consistent with `SetGfx(1, …STATE3 = pressed, 2, …STATE2 = hover)`). The target button, icons and health bars use unaffected ids.
 
 ## 12. Map windows (`play/hud_map.rs`, `ao_formats::{planetmap, topdown, landcontrol}`, `ao-gui` `CanvasView`)
 

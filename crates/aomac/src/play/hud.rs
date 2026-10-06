@@ -224,19 +224,21 @@ fn template_frames(dir: &Path) -> HashMap<String, [f32; 4]> {
     out
 }
 
-/// `<Value name= value=>` defaults of `cd_image/gui/Default/CharPrefs.xml` (booleans and numbers only).
+/// `<Value name= value=>` defaults of `cd_image/gui/Default/CharPrefs.xml` and `LoginPrefs.xml` (booleans and numbers only).
 fn default_dvalues(dir: &Path) -> HashMap<String, i64> {
     let mut out = HashMap::new();
-    let Some(root) = std::fs::read_to_string(dir.join("cd_image/gui/Default/CharPrefs.xml")).ok().and_then(|t| xml::parse(&t).ok()) else { return out };
-    for v in root.children.iter().filter(|c| c.name == "Value") {
-        if let (Some(n), Some(val)) = (v.attr("name"), v.attr("value")) {
-            let x = match val.to_ascii_lowercase().as_str() {
-                "true" => Some(1),
-                "false" => Some(0),
-                o => o.parse::<i64>().ok(),
-            };
-            if let Some(x) = x {
-                out.insert(n.to_string(), x);
+    for file in ["CharPrefs.xml", "LoginPrefs.xml"] {
+        let Some(root) = std::fs::read_to_string(dir.join("cd_image/gui/Default").join(file)).ok().and_then(|t| xml::parse(&t).ok()) else { continue };
+        for v in root.children.iter().filter(|c| c.name == "Value") {
+            if let (Some(n), Some(val)) = (v.attr("name"), v.attr("value")) {
+                let x = match val.to_ascii_lowercase().as_str() {
+                    "true" => Some(1),
+                    "false" => Some(0),
+                    o => o.parse::<i64>().ok(),
+                };
+                if let Some(x) = x {
+                    out.entry(n.to_string()).or_insert(x);
+                }
             }
         }
     }
@@ -259,6 +261,8 @@ pub(super) struct Hud {
     cc: WindowId,
     size: (u32, u32),
     dvalues: HashMap<String, i64>,
+    /// Tooltip titles of the health / nano / XP / alien XP bars (text.mdb category 0x2710).
+    bar_titles: [String; 4],
     bars: Vec<Bar>,
     menu_roots: Vec<MenuNode>,
     popup: Option<Popup>,
@@ -285,7 +289,10 @@ impl Hud {
             })
             .collect();
         let target = HudTarget::new(gui, cc, size)?;
-        let mut hud = Hud { cc, size, dvalues: default_dvalues(dir), bars: vec![], menu_roots, popup: None, open: vec![], stats: HudStats::new(dir)?, map: HudMap::new(dir), target, shortcuts: vec![] };
+        let texts = ao_formats::screens::TextDb::load(dir)?;
+        let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
+        let mut hud = Hud { cc, size, dvalues: default_dvalues(dir), bars: vec![], bar_titles, menu_roots, popup: None, open: vec![], stats: HudStats::new(dir)?, map: HudMap::new(dir), target, shortcuts: vec![] };
+        hud.target.targets_target = hud.dvalues.get("Targetstarget").is_some_and(|v| *v != 0);
         hud.fill_docks(gui);
         hud.create_bars(gui, dir);
         for n in 0..hud_bar::default_count(&hud.dvalues) {
@@ -441,13 +448,14 @@ impl Hud {
         for (b, v) in self.bars.iter().zip(values) {
             gui.set_progress(b.window, "bar", v);
         }
-        // `View::SetToolTip(LDB text, "%d / %d")` (0x100666b6 …); titles "Health"/"Nano" are the LDB keys at 0x101b4300/0x101b4334,
-        // the XP / alien keys (0x101af930 / 0x101b433c) were not read: UNRESOLVED, "XP" / "Alien XP" are guesses.
+        // `View::SetToolTip(LDBface::GetText(0x2710, key), "%d / %d")` (`FUN_100666b6` / `FUN_100667a8` / `FUN_100668aa` /
+        // `FUN_100669f7`); the keys are the strings at GUI 0x101b4300 "Health", 0x101b4334 "Nano", 0x101af930 "Experience" and
+        // 0x101b433c "AlienExperience" (resolved once in `new`).
         let tips = [
-            ("Health", st(sid::HEALTH), st(sid::MAX_HEALTH)),
-            ("Nano", st(sid::NANO), st(sid::MAX_NANO)),
-            ("XP", st(sid::XP) - xp_base, st(sid::XP_NEXT) - xp_base),
-            ("Alien XP", st(sid::ALIEN_XP), st(sid::ALIEN_XP_NEXT)),
+            (&self.bar_titles[0], st(sid::HEALTH), st(sid::MAX_HEALTH)),
+            (&self.bar_titles[1], st(sid::NANO), st(sid::MAX_NANO)),
+            (&self.bar_titles[2], st(sid::XP) - xp_base, st(sid::XP_NEXT) - xp_base),
+            (&self.bar_titles[3], st(sid::ALIEN_XP), st(sid::ALIEN_XP_NEXT)),
         ];
         for (b, (t, cur, max)) in self.bars.iter().zip(tips) {
             gui.set_tooltip(b.window, "bar", t, &format!("<tvoptions wordwrap=\"no\">{cur}&nbsp;/&nbsp;{max}"));
@@ -468,6 +476,12 @@ impl Hud {
         if let InputEvent::Key { key, pressed: true, mods } = ev {
             if gui.focused_view().is_none() {
                 self.target.key(zone, *key, *mods);
+            }
+        }
+        // window hotkeys (controls::WINDOW_BINDINGS); the viewer sends one press per key stroke, `! TextInputMode`: a focused text field swallows them
+        if let (InputEvent::Key { key: ao_gui::Key::Letter(c), pressed: true, mods }, false) = (ev, gui.text_focused()) {
+            if let Some(kind) = super::controls::window_for_key(*c, *mods) {
+                self.toggle(gui, kind);
             }
         }
         if let (Some(p), InputEvent::MouseDown { x, y, button: MouseButton::Left }) = (&self.popup, ev) {
@@ -581,6 +595,11 @@ impl Hud {
         self.toggle_dvalue(gui, kind.dvalue());
     }
 
+    #[cfg(test)]
+    pub(super) fn stats_window(&self, kind: WindowKind) -> Option<WindowId> {
+        self.stats.window(kind)
+    }
+
     pub(super) fn is_open(&self, kind: WindowKind) -> bool {
         self.open.contains(&kind)
     }
@@ -684,6 +703,44 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             o.png(s, &list, &std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
         }
+    }
+
+    /// The bar tooltip titles are `LDBface::GetText(0x2710, key)` of the keys in `FUN_100666b6`…`FUN_100669f7`, `Targetstarget` is read from `LoginPrefs.xml`.
+    #[test]
+    fn bar_titles_come_from_the_text_db() {
+        let Some((s, _)) = shot((1280, 800)) else { return };
+        assert_eq!(s.hud.bar_titles, ["Health", "Nano", "Experience", "Alien Experience"]);
+        assert_eq!(s.hud.dvalues.get("Targetstarget"), Some(&0));
+        assert!(!s.hud.target.targets_target);
+    }
+
+    /// Ctrl+6 = Map, P = Planet Map, Shift+P = Perks, I = Inventory (help texts / CharPrefs.xml); a focused text field swallows them.
+    #[test]
+    fn window_hotkeys_toggle_and_respect_text_input() {
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        let key = |c: char, mods: ao_gui::Modifiers| InputEvent::Key { key: ao_gui::Key::Letter(c), pressed: true, mods };
+        let ctrl = ao_gui::Modifiers { ctrl: true, ..Default::default() };
+        let none = ao_gui::Modifiers::default();
+        s.input(key('6', ctrl), &mut o.host);
+        assert!(s.hud.is_open(WindowKind::Map));
+        s.input(key('6', ctrl), &mut o.host);
+        assert!(!s.hud.is_open(WindowKind::Map));
+        s.input(key('p', none), &mut o.host);
+        assert!(s.hud.is_open(WindowKind::PlanetMap) && !s.hud.is_open(WindowKind::Perks));
+        s.input(key('p', ao_gui::Modifiers { shift: true, ..none }), &mut o.host);
+        assert!(s.hud.is_open(WindowKind::Perks));
+        s.input(key('i', none), &mut o.host);
+        assert!(s.hud.is_open(WindowKind::Inventory));
+        // typing a name into a text field must not open windows
+        let w = s.gui.open_window("LoginWindow", (0, 0), WindowSize::Preferred).unwrap();
+        s.gui.focus(w, "username");
+        assert!(s.gui.text_focused());
+        s.input(key('p', none), &mut o.host);
+        s.input(key('6', ctrl), &mut o.host);
+        assert!(!s.hud.is_open(WindowKind::Map) && s.hud.is_open(WindowKind::PlanetMap));
+        s.gui.clear_focus();
+        s.input(key('p', none), &mut o.host);
+        assert!(!s.hud.is_open(WindowKind::PlanetMap));
     }
 
     #[test]

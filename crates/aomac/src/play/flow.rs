@@ -177,6 +177,7 @@ impl Play {
         };
         eprintln!("connecting to {} ({}:{}, {} online)", server.name, server.ip, server.port, server.players);
         self.pending_user = user.clone();
+        self.login_cred = Some((user.clone(), pass.clone()));
         self.gui.set_text(w, "password", ""); // ResetConnectionAndConfig clears name/password
         self.show_progress(CONNECT_TIMEOUT, false, host);
         let (tx, gen) = (self.tx.clone(), self.conn_gen);
@@ -514,6 +515,8 @@ impl Play {
         if let Some(h) = self.hud.take() {
             h.close(&mut self.gui);
         }
+        self.player = None;
+        host.look = false;
         self.zone.reset_world();
         self.world_frames = 0;
         self.show_loading(host);
@@ -642,7 +645,12 @@ impl Play {
                     self.world_frames = 0;
                     self.start_loading(host);
                 }
-                LoginEvent::ZoneFrame(f) => match self.zone.on_frame(&f) {
+                LoginEvent::ZoneFrame(f) => match {
+                    if let Some(c) = self.chat.as_mut() {
+                        c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text);
+                    }
+                    self.zone.on_frame(&f)
+                } {
                     zone::ZoneEvent::Playfield(id) => {
                         eprintln!("zone: playfield {id}");
                         if self.screen == Screen::InWorld {
@@ -790,6 +798,11 @@ impl Frontend for Play {
     }
 
     fn input(&mut self, ev: InputEvent, host: &mut Host) {
+        if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
+            if let InputEvent::MouseDown { x, y, .. } | InputEvent::MouseUp { x, y, .. } | InputEvent::Wheel { x, y, .. } = ev {
+                p.mouse(&ev, self.gui.wants_mouse(x, y));
+            }
+        }
         match (self.screen, &ev) {
             (Screen::Loading, _) => return, // full-screen InvisibleButton swallows input
             (Screen::Create, _) if self.create_input(&ev, host) => return,
@@ -804,14 +817,26 @@ impl Frontend for Play {
             (Screen::CharSelect, InputEvent::Key { key: Key::Down, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(1, host),
             _ => {}
         }
+        if self.screen == Screen::InWorld && self.chat.as_mut().is_some_and(|c| c.input(&mut self.gui, &ev, &self.zone, &self.text)) {
+            return;
+        }
         if let Some(h) = self.hud.as_mut() {
             h.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default());
         }
         for e in self.gui.input(ev) {
+            if self.chat.as_mut().is_some_and(|c| c.event(&mut self.gui, &e, &self.zone, &self.text)) {
+                continue;
+            }
             if self.hud.as_mut().is_some_and(|h| h.event(&mut self.gui, &e, &self.zone)) {
                 continue;
             }
             self.handle(e, host);
+        }
+    }
+
+    fn game_input(&mut self, ev: ao_render::GameInput, _host: &mut Host) {
+        if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
+            p.game_input(ev);
         }
     }
 
@@ -878,6 +903,14 @@ impl Frontend for Play {
                         Ok(h) => self.hud = Some(h),
                         Err(e) => eprintln!("hud: {e:#}"),
                     }
+                    // after the HUD: the chat windows draw above its bar windows (as in the original, whose bar windows are backmost)
+                    if let Some(c) = self.chat.as_mut() {
+                        if let Err(e) = c.open(&mut self.gui, self.size) {
+                            eprintln!("chat: {e:#}");
+                        }
+                    }
+                    self.player = player::Player::new(&self.dir, &self.zone, self.zone.playfield.unwrap_or(0));
+                    host.fly = false;
                     self.fade = Fade::Out(0.0);
                 }
             }
@@ -885,7 +918,7 @@ impl Frontend for Play {
                 let t = t + dt;
                 if t >= FADE_OUT {
                     self.fade = Fade::Hold;
-                    host.fly = true;
+                    host.fly = self.player.is_none(); // free-fly only when the avatar could not be built
                 } else {
                     self.fade = Fade::Out(t);
                 }
@@ -905,10 +938,30 @@ impl Frontend for Play {
             }
         }
         if self.screen == Screen::InWorld {
+            if self.player.as_ref().is_some_and(|p| p.serial() != self.zone.own_serial) {
+                // the server placed the own character again (teleport within the playfield)
+                self.player = player::Player::new(&self.dir, &self.zone, self.zone.playfield.unwrap_or(0));
+            }
+            if let Some(p) = self.player.as_mut() {
+                for f in p.frame(dt, host, &mut self.zone, self.gui.text_focused()) {
+                    if let Some(s) = &self.session {
+                        s.send_zone(f);
+                    }
+                }
+            }
             self.zone.world.update(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host);
         }
         if let Some(a) = &self.audio {
             a.update(dt, host.camera.pos.to_array(), self.zone.day_time());
+        }
+        if let Some(c) = self.chat.as_mut() {
+            c.resize(&mut self.gui, size);
+            c.update(&mut self.gui, dt, &self.text);
+            if let Some(s) = &self.session {
+                for f in c.take_outbox() {
+                    s.send_zone(f);
+                }
+            }
         }
         if let Some(h) = self.hud.as_mut() {
             h.resize(&mut self.gui, size);
@@ -919,6 +972,7 @@ impl Frontend for Play {
         if self.screen == Screen::InWorld {
             let own = self.zone.own().map_or(host.camera.pos.to_array(), |d| zone::scene_pos(d.pos));
             self.zone.world.name_tags(&mut self.gui, &host.camera, self.size, own, &mut list);
+            super::hud_target::selection_indicator(&mut self.gui, &self.zone, &host.camera, self.size, &mut list);
         }
         if self.screen == Screen::Create {
             list.cmds.splice(0..0, pre.cmds);
