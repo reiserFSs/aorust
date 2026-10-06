@@ -77,16 +77,25 @@ while it is behind the camera; held poses (corpses, dead characters at the end o
 
 Name tags and the target indicators are the original's world-space billboards (`play/tags.rs`, details and addresses in docs/zone/motion.md §6):
 `Dynels::name_tags(dt, gui, host, own_pos, indicators)` composes the 32 px sprite (name line `FontGameShell12` at y = 1, organisation line at
-y = 19, plate 0xe6 / 0xe5 and the 64×4 health bar for indicators), uploads it as a four-vertex alpha-test emissive model and pushes one camera-facing
-`ActorFrame` per tag, `width/128 × 0.3` m big, centred on the head anchor, so it shrinks with perspective. Which tags exist: the selected
+y = 19, plate 0xe6 / 0xe5 and the 64×4 health bar for indicators), uploads it as a four-vertex emissive alpha-tested/blended sprite and pushes one camera-facing
+`ActorFrame` per tag, `(width/128) m` wide and `0.3 m` high, centred on the head anchor, so it shrinks with perspective. Filtered edges retain their alpha (strict cutoff `>30/255`, depth writes), matching `[3] TargetIndicatorMat` plus `RSprite` states; see motion.md §6 for the formerly opaque-edge root cause. Which tags exist: the selected
 target's indicator (unless its `Flags` has bit 0x400), the attacked dynel's indicator (`Zone::fight_target` of the own character), and with the
-pref `ShowAllNames` (off by default, here `Dynels::show_all_names`, env `AOMAC_SHOW_ALL_NAMES` for testing) the nametags of the characters within
+pref `ShowAllNames` (retail IndependentPrefs default 1, read through the HUD DValue from `Login.cfg`; no environment override) the nametags of the characters within
 30 m of the player, rebuilt every 2 s. Colours: white, green/blue by `Flags`, red for stat 345 / hostile battle-station players; the original has
 no faction / con / team tint of the name (motion.md §6), the con colour only fills the health bar. There is no hover tag in the original (the
-object under the mouse only picks the pointer). Not modelled: ignored-character icon, `InPlay`/visibility/parent tests, org line (needs `IsOrgNameShownOverHead`
-and the clan string, not decoded), more than 96 tags at once.
+object under the mouse only picks the pointer). InPlay is retained from full-update flag bit 1, stat 0xC2 changes and CharInPlay relays;
+listing requires it, and drawing requires visibility, a position and no parent (GUI 0x10024d5b).
+Not modelled: ignored-character icon, org line (needs `IsOrgNameShownOverHead` and the clan string, not decoded), more than 96 tags at once.
 
 Live regression (2026-10-06, `live_walk`, audio muted): Aomacfixr selected the Helpful Colonist in Arrival Hall (4604), walked `goto=193:157`, then entered ICC Shuttleport (4582) in the same session. After `zc=8,drag=left:314:0,wait=1`, the inspected offscreen frame showed NPC models and nameplates; `clickdyn=Surf Lizard` picked instance 1042513 at pixel (452,216), and the next frame showed its selection plate/bar. The harness passed in 69.16 s. This exercises the renderer scene replacement between the two sets of dynel/tag uploads; the cache regressions separately require every cached model and unchanged sprite to upload again on a new scene generation.
+
+Captured screenshot helper: `captured_dynels_become_actors` now selects the screenshot camera before its final actor submission,
+normalizes its culling direction and forces fresh pose payloads for the new offscreen renderer. The benchmark's Testy-centred
+actor list must not be reused for a distant guard camera; test assertions require a nonempty camera-local submission.
+Fix8World's isolated check (2026-10-06), `AOMAC_DYNEL_LOOK=monster:254118 AOMAC_DYNEL_SHOT=<png>` with
+`captured_dynels_become_actors`, passed in 33.77 s: 18 models, 0 failed, 36 actors, 6 props.
+The inspected screenshot now showed two humanoid guards in the ramp foreground (back view), not empty terrain.
+This proves the camera-local submission fix, not front-view hand-colour acceptance.
 
 ## 5. Open items
 

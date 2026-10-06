@@ -96,23 +96,20 @@ impl Play {
         }
     }
 
-    /// `N3Msg_UseItem(target, false)` [GC 0x286f8] for a character target (kind 50000): not on self, sent as `GenericCmd` 3 (`Interact::use_object`).
-    /// Without a target the original sends the empty identity; nothing is sent here. Items and world objects cannot be selected (`Zone::target` holds
-    /// character ids only), so the item branches of the function (wear, bank, corpse, `Feedback_Items*`) have no input.
+    /// `N3Msg_UseItem(target, false)` [GC 0x286f8]: selected world objects use the same confirmation and use path as right clicks.
     fn use_target(&mut self) {
-        let Some(t) = self.zone.target.filter(|&t| t != self.zone.char_id as i32) else { return };
+        let Some(id) = self.zone.selected_target() else { return };
         if let Some(i) = self.interact.as_mut() {
-            i.use_object(ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: t });
+            i.use_item(&self.zone, id, false);
         }
     }
 
     /// `N3Msg_GetItem(target)` [GC 0x27beb]: `Feedback_InventoryFull` when no bag slot (`0x40..0x5e`) is free, else `ClientGetItemIIR_t`.
     fn pick_up(&mut self) {
-        let Some(t) = self.zone.target else { return };
+        let Some(item) = self.zone.selected_target() else { return };
         if (0x40..0x5e).all(|s| self.zone.inventory.contains_key(&s)) {
             return self.feedback("Feedback_InventoryFull");
         }
-        let item = ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: t };
         let payload = ao_net::n3::inventory::get_item(self.zone.char_id as i32, item);
         if let Some(m) = self.fight.as_mut() {
             m.push(payload);

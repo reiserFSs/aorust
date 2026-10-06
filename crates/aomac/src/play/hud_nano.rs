@@ -246,8 +246,8 @@ impl HudNano {
         let info = self.db.info(gui, id);
         let needs_target = info.is_some_and(|i| i.stat(stat::FLAGS).unwrap_or(0) & 0x8000 != 0);
         let name = info.map(|i| i.name.clone());
-        let target = match zone.target {
-            Some(t) => Identity { kind: outgoing::DYNEL_CHAR, instance: t },
+        let target = match zone.selected_target() {
+            Some(t) => t,
             None if !needs_target => own,
             // `FUN_1004f6a0` then refuses ("Feedback_UnableToExecuteOnThisTarget"): nothing is sent
             None => return,

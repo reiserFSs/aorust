@@ -152,6 +152,8 @@ The constructor also pre-sets `CanChangeClothes 223 = 1`, `HeadMesh 64 = -1`, `D
 owner id (equal to the `owner` identity: asserted for all 7), `CATMesh`, `MonsterScale`, `Breed 4 = 6`, `Sex 59 = 1`, `Race 89 = 1`,
 `Cash 61`, `DeadTimer 34 = 600`, `TimeExist 8 = 18000/180000`, `CanChangeClothes 223 = 0`. There is **no `Mesh` stat and no template**
 (StaticInstance 0), so only `CATMesh` selects the model and the pickup box is not used.
+`Dynels` retains the corpse's NUL-trimmed `DynelBase` name blob (`+0x6c`) on the instance, not the shared model.
+`world.name_of` therefore returns the captured `Remains of …` caption even after the owner is removed and before model loading completes.
 
 Captured (`docs/captures/zone_ithaca.rec`, playfield 4582):
 

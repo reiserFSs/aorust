@@ -523,6 +523,9 @@ pub struct Char {
     /// Stat `Flags` (0) and `VisualFlags` (0x2A1), name tag inputs.
     flags: i32,
     visual_flags: i32,
+    /// Full-update InPlay and attachment state (GC 0x10077af2 / GUI 0x10024d5b).
+    in_play: bool,
+    parent: Option<ao_net::msg::Identity>,
     pose: ao_net::n3::motion::Pose,
     anim: u32,
     special: Special,
@@ -547,6 +550,8 @@ struct Prop {
     id: u32,
     key: u64,
     parent: Option<ao_net::msg::Identity>,
+    /// Per-instance wire name (`DynelBase+0x6c`), independent of shared appearance.
+    name: Option<String>,
     pos: [f32; 3],
     /// Server heading.
     yaw: f32,
@@ -660,7 +665,7 @@ impl Default for Dynels {
             models: HashMap::new(),
             asked: HashSet::new(),
             scene_generation: 0,
-            show_all_names: std::env::var_os("AOMAC_SHOW_ALL_NAMES").is_some(),
+            show_all_names: false,
             char_view_distance: 80.0,
             lens: Lens::default(),
             tags: TagLayer::default(),
@@ -1045,7 +1050,7 @@ impl Dynels {
             Look::Corpse(_) => vec![(CAN_STAT, CORPSE_CAN)],
             Look::Char(_) => vec![],
         };
-        self.props.insert((kind, instance), Prop { id, key: look.key(), parent: None, pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default(), stats });
+        self.props.insert((kind, instance), Prop { id, key: look.key(), parent: None, name: None, pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default(), stats });
         self.pending.push(look);
     }
     /// Message stats of the known prop `who` (a corpse's, a `StatIIR_t`'s): they replace earlier values.
@@ -1085,10 +1090,17 @@ impl Dynels {
             _ => None,
         })
     }
+    /// `N3Msg_isIDOnGround`: an existing unparented world item.
+    pub fn on_ground(&self, who: ao_net::msg::Identity) -> bool {
+        self.props.get(&(who.kind, who.instance)).is_some_and(|p| p.parent.is_none())
+    }
 
-    /// A parented item's character name, otherwise its template display name once built.
+    /// Wire instance name, otherwise a parent character's or the built template's name.
     pub fn name_of(&self, kind: i32, instance: i32) -> Option<&str> {
         let p = self.props.get(&(kind, instance))?;
+        if let Some(name) = p.name.as_deref() {
+            return Some(name);
+        }
         if let Some(parent) = p.parent.filter(|p| p.kind == CHAR_KIND) {
             if let Some(c) = self.chars.get(&parent.instance).filter(|c| !c.name.is_empty()) {
                 return Some(&c.name);
@@ -1203,6 +1215,8 @@ impl Dynels {
                         if let Some(pos) = c.base.position {
                             self.add_prop(who.kind, who.instance, look, pos, c.base.rotation, v.scale);
                             self.set_stats(who, stats.iter().copied());
+                            let name = c.base.name();
+                            self.props.get_mut(&(who.kind, who.instance)).unwrap().name = (!name.is_empty()).then_some(name);
                             // A corpse replaces its character even when the full update beats the quit.
                             self.chars.remove(&c.owner.instance);
                         }
@@ -1236,6 +1250,20 @@ impl Dynels {
                         c.next = Some(key).filter(|&k| k != c.key);
                     }
                     c.visual_flags = i32::from(a.visual_flags);
+                }
+            }
+            N3::Unknown(body) if m.header.msg_type == ao_net::n3::server_move::RELOCATE && who.kind == CHAR_KIND && self.chars.contains_key(&who.instance) => {
+                if let Ok(r) = ao_net::n3::server_move::parse_relocate(body) {
+                    let parent = (r.parent != ao_net::msg::Identity::default()).then_some(r.parent);
+                    for child in r.children {
+                        if child.kind == CHAR_KIND {
+                            if let Some(c) = self.chars.get_mut(&child.instance) {
+                                c.parent = parent;
+                            }
+                        } else if let Some(p) = self.props.get_mut(&(child.kind, child.instance)) {
+                            p.parent = parent;
+                        }
+                    }
                 }
             }
             _ if who.kind != CHAR_KIND => {
@@ -1278,6 +1306,8 @@ impl Dynels {
                         side: u.side,
                         flags: u.flags2 as i32,
                         visual_flags: u.visual_flags as i32,
+                        in_play: u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0,
+                        parent: u.parent.filter(|p| *p != ao_net::msg::Identity::default()),
                         pose,
                         anim: 0x78,
                         special: if u.max_health > 0 && u.health <= 0 { Special::Die(DIE_KEY) } else { Special::None },
@@ -1314,10 +1344,18 @@ impl Dynels {
                 if let Some(c) = self.chars.get_mut(&who.instance) {
                     for &(stat, value) in &s.stats {
                         c.mover.on_stat(stat, value);
+                        if stat == super::zone::IN_PLAY_STAT as i32 {
+                            c.in_play = value != 0;
+                        }
                     }
                 }
                 if s.stats.iter().any(|&(stat, value)| stat == 0x1b && value <= 0) && self.chars.get(&who.instance).is_some_and(|c| !matches!(c.special, Special::Die(_))) {
                     self.die(who.instance, DIE_KEY);
+                }
+            }
+            N3::Misc(Misc::CharInPlay) => {
+                if let Some(c) = self.chars.get_mut(&who.instance) {
+                    c.in_play = true;
                 }
             }
             N3::Misc(Misc::FollowTarget(f)) => {
@@ -1609,7 +1647,7 @@ impl Dynels {
     fn tag_of(&self, id: i32, kind: IndicatorKind, bar: Option<((i32, i32), u32)>) -> Option<Tag> {
         let c = self.chars.get(&id)?;
         let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return None };
-        if !tag_anchor_visible(c.pose.pos[0]) {
+        if !c.in_play || !built.visible || c.parent.is_some() || !tag_anchor_visible(c.pose.pos[0]) {
             return None;
         }
         let t = name_tag(&NameTagInput { name: &c.name, is_npc: c.npc, flags: c.flags, features: INVALID_STAT, visual_flags: c.visual_flags, side: c.side as i32, ..Default::default() });
@@ -1654,7 +1692,7 @@ impl Dynels {
                     Some(Model::Ready { built, .. }) => nametag_listed(built.features),
                     _ => true,
                 };
-                chars.iter().filter(|(id, c)| **id != own && !marked(**id) && near(c) && ok(c)).map(|(id, _)| *id).collect()
+                chars.iter().filter(|(id, c)| **id != own && c.in_play && !marked(**id) && near(c) && ok(c)).map(|(id, _)| *id).collect()
             },
             |id| chars.contains_key(&id),
         );
@@ -1752,6 +1790,9 @@ mod tests {
         assert_eq!(world.item_class_of(id.kind, id.instance), Some(0xdac1));
         assert!(world.props.contains_key(&(id.kind, id.instance)));
         assert_eq!(world.item_class_of(0xdac1, id.instance), None);
+        assert!(world.on_ground(id));
+        world.props.get_mut(&(id.kind, id.instance)).unwrap().parent = Some(ao_net::msg::Identity { kind: CHAR_KIND, instance: 1 });
+        assert!(!world.on_ground(id));
     }
     use crate::play::zone::{scene_forward, Zone};
     use ao_net::frame::Frame;
@@ -1811,6 +1852,30 @@ mod tests {
         w.chars.get_mut(&id).unwrap().flags = 0x400;
         let t = w.collect_tags(0.016, own_pos, &[sel]);
         assert!(t.iter().all(|t| t.kind == IndicatorKind::Nametag) && t.iter().any(|t| t.id == id));
+        w.chars.get_mut(&id).unwrap().in_play = false;
+        assert!(w.collect_tags(0.016, own_pos, &[sel]).iter().all(|t| t.id != id));
+        w.chars.get_mut(&id).unwrap().in_play = true;
+        let child = ao_net::msg::Identity { kind: CHAR_KIND, instance: id };
+        let prop = ao_net::msg::Identity { kind: 0xc76a, instance: -1 };
+        w.test_prop(prop, vec![]);
+        let header = ao_net::n3::N3Header { msg_type: ao_net::n3::server_move::RELOCATE, target: child, flag: 0 };
+        let relocate = |w: &mut Dynels, parent| {
+            let payload = ao_net::n3::server_move::relocate(child, &ao_net::n3::server_move::Relocate { parent, children: vec![child, prop] });
+            w.on_message(&Message { header, sender: 1, body: N3::Unknown(payload[13..].to_vec()) });
+        };
+        relocate(w, ao_net::msg::Identity { kind: CHAR_KIND, instance: 25988 });
+        assert!(!w.on_ground(prop));
+        assert!(w.collect_tags(0.016, own_pos, &[sel]).iter().all(|t| t.id != id));
+        relocate(w, ao_net::msg::Identity::default());
+        assert!(w.on_ground(prop));
+        let key = w.chars[&id].key;
+        if let Some(Model::Ready { built, .. }) = w.models.get_mut(&key) {
+            built.visible = false;
+        }
+        assert!(w.collect_tags(0.016, own_pos, &[sel]).iter().all(|t| t.id != id));
+        if let Some(Model::Ready { built, .. }) = w.models.get_mut(&key) {
+            built.visible = true;
+        }
         // an unplaced dynel (server x <= 0) shows nothing
         w.chars.get_mut(&id).unwrap().pose.pos[0] = 0.0;
         assert!(w.collect_tags(0.016, own_pos, &[]).iter().all(|t| t.id != id));
@@ -1904,6 +1969,9 @@ mod tests {
         assert!(z.world.chars.len() > 50, "{}", z.world.chars.len());
         // 7 corpses arrive, the server removes some of them again within the capture
         assert!(z.world.props.keys().filter(|k| k.0 == 0xC76A).count() >= 2, "corpses");
+        for &(kind, id) in z.world.props.keys().filter(|k| k.0 == 0xC76A) {
+            assert!(z.world.name_of(kind, id).is_some_and(|n| n.starts_with("Remains of ")), "corpse name survives its owner's removal before model loading");
+        }
         assert_eq!(z.world.props.keys().filter(|k| k.0 == 0xC75B).count(), 1, "vending machine");
         let looks: HashSet<u64> = z.world.chars.values().map(|c| c.key).collect();
         let keys = |z: &Zone| z.world.chars.values().map(|c| c.key).chain(z.world.props.values().map(|p| p.key)).collect::<Vec<_>>();
@@ -1958,16 +2026,36 @@ mod tests {
             let scene = ao_formats::playfield::load_playfield_at(&RecordStore::open(&dir).unwrap(), &dir, 4582, ao_formats::playfield::DEFAULT_DAY_TIME).unwrap();
             // AOMAC_DYNEL_LOOK=<kind hex like c76a | npc | player>: camera 4 m from the first such dynel instead of the player's view
             let (mut cam, mut at) = ([eye[0], eye[1] + 1.7, eye[2]], [eye[0] + fwd[0], eye[1] + 1.5 + fwd[1], eye[2] + fwd[2]]);
+            let mut target_actor = None;
             if let Ok(what) = std::env::var("AOMAC_DYNEL_LOOK") {
                 let target = match what.as_str() {
-                    "npc" => z.world.chars.values().find(|c| c.npc).map(|c| c.pose.pos),
-                    m if m.starts_with("monster:") => z.world.chars.values().find(|c| matches!(&c.look, Look::Char(l) if l.monster_data.to_string() == m[8..])).map(|c| c.pose.pos),
-                    "player" => z.world.chars.values().find(|c| !c.npc && c.name != "Testy").map(|c| c.pose.pos),
-                    k => z.world.props.iter().find(|(key, _)| format!("{:x}", key.0) == k).map(|(_, p)| p.pos),
+                    "npc" => z.world.chars.iter().find(|(_, c)| c.npc).map(|(id, c)| (*id as u32, c.pose.pos)),
+                    m if m.starts_with("monster:") => z.world.chars.iter().find(|(_, c)| matches!(&c.look, Look::Char(l) if l.monster_data.to_string() == m[8..])).map(|(id, c)| (*id as u32, c.pose.pos)),
+                    "player" => z.world.chars.iter().find(|(_, c)| !c.npc && c.name != "Testy").map(|(id, c)| (*id as u32, c.pose.pos)),
+                    k => z.world.props.iter().find(|(key, _)| format!("{:x}", key.0) == k).map(|(_, p)| (p.id, p.pos)),
                 };
-                let t = scene_pos(target.expect("no such dynel"));
+                let (id, pos) = target.expect("no such dynel");
+                target_actor = Some(id);
+                let t = scene_pos(pos);
                 cam = [t[0] + 2.5, t[1] + 1.8, t[2] + 2.5];
                 at = [t[0], t[1] + 0.8, t[2]];
+            }
+            // Submit the current poses against the camera actually used by the screenshot:
+            // the earlier actor list was culled around Testy and predates the benchmark.
+            host.actors.clear();
+            for c in z.world.chars.values_mut() {
+                c.submitted = false;
+            }
+            let direction = ao_render::Vec3::new(at[0] - cam[0], at[1] - cam[1], at[2] - cam[2]).normalize();
+            z.world.update(0.0, cam, [direction.x, direction.y, direction.z], &mut host);
+            models.append(&mut host.actor_models);
+            actors = std::mem::take(&mut host.actors);
+            assert!(!actors.is_empty(), "screenshot camera must submit nearby dynels");
+            if let Some(id) = target_actor {
+                let actor = actors.iter().find(|a| a.id == id).expect("screenshot target was culled");
+                if z.world.chars.contains_key(&(id as i32)) {
+                    assert!(actor.skin.is_some(), "new screenshot renderer requires the target's current pose");
+                }
             }
             ao_render::render_to_png_actors(&scene, &models, actors, cam, at, 1200, 700, std::path::Path::new(&out), 0.0).unwrap();
         }

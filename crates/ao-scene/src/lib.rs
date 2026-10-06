@@ -56,6 +56,9 @@ pub struct Submesh {
     /// Key into [`Scene::textures`]; `None` draws `base_color` only.
     pub texture: Option<TextureKey>,
     pub blend: Blend,
+    /// RSprite: alpha blend with alpha > 30/255 and depth writes (randy31 0x10013575).
+    /// Only applies to `Blend::AlphaBlend`; other materials keep their normal states.
+    pub sprite_alpha_test: bool,
     /// Linear RGBA tint multiplied with the texture (and the vertex colour). Archive meshes and CAT models always carry white RGB +
     /// `opac`: `RViewPort_t::SetMaterial` (randy31 @0x1004b199) never copies the material's `diff`/`ambi` RGB into the
     /// `_D3DMATERIAL7`, whose diffuse and ambient stay white (`SetDefaultMaterial` @0x1004b61e).
@@ -105,6 +108,7 @@ impl Submesh {
             indices,
             texture,
             blend: Blend::Opaque,
+            sprite_alpha_test: false,
             base_color: WHITE,
             two_sided: false,
             emissive: [0.0; 3],

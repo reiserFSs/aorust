@@ -836,6 +836,7 @@ impl Hud {
             match self.target.world_click(zone, cam, lens, self.size, pos, mods) {
                 Some(super::hud_target::WorldClick::Select(id)) => self.click = Some(id),
                 Some(super::hud_target::WorldClick::Info(id)) => self.target.info = Some(id),
+                Some(super::hud_target::WorldClick::ObjectInfo(id)) => self.help_urls.push(format!("itemid://{}/{}", id.kind, id.instance)),
                 None => {}
             }
         }

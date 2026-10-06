@@ -403,6 +403,22 @@ The native creation path now seeds that same `CharacterViewer.xml` cache when lo
 then writes its actual head mesh, breed/sex and build-resolved body mesh under the acknowledged id, preserving other entries.
 Previously no native writer existed: a successfully created non-default head therefore fell through to head index 0 on selection.
 The preview lookup also uses `CharacterEntry.id`, not the nested `CharacterInfo.id`, matching `CharacterData_t::ReadBlobStream` [0x100011c5].
+The live world now also performs the retail `UpdateCache` → `SaveCache` sequence: `CharacterViewerModule_c::SlotShuttingDown`
+[GUI 0x10006aad], `SlotConfigurationSaved` [0x10006ac4], `UpdateCache` [0x100069ed], and destructor [0x100063b1].
+Native `Play::save_viewer_cache` runs before zone teardown, returning to login (including completed camp/server loss), after
+configuration writes, and on `Play` destruction (window shutdown). It snapshots the latest own full update plus merged appearance
+deltas, the visible cloth slots (including empty slots), and attractor meshes; stat 12 supplies the body when present, otherwise
+the same breed/sex/build model resolver as the live avatar. MechData/MonsterData exclude transformed appearances rather than
+overwriting the normal cache (`GetData` exclusion above; mech stat 0x296 and morph stat 0x167, docs/zone/npc.md).
+This fixes existing-character sessions with legacy v3 list info: the observed Aomacchvq live HeadMesh stat 64 = 40099 no longer
+falls back to the first Atrox head after shutdown. `live_existing_head_and_equipment_replace_creation_cache` checks persisted
+40099, cloth removal, attachment flags and preservation of another cache entry using captured full-update data; the live
+`AOMAC_LIVE_SELECT_AFTER` hook drops the world **before** loading the cache and asserts equality with the session's stat 64.
+Live verification (Fix8World, clean `origin/main` plus world patch): muted offscreen
+`AOMAC_LIVE_CHAR=Aomacchvq AOMAC_LIVE_SELECT_AFTER=1 cargo test --release -p aomac live_walk -- --ignored --nocapture`
+passed in 31.28 s. The server supplied stat 64 = 40099; after dropping `Play`, the persisted cache had `HeadID=40099`.
+The inspected `select-after.png` showed swept/full dark hair rather than the default mohawk. This proves the offscreen
+frontend/cache path, not a real-window visual check: the workstation session was locked.
 `CharacterInfo` versions >3 do carry head/height/width; v3 omits them (`msg.rs::CharacterEntry::read`), so absence is not universal and those fields
 are not a replacement for the viewer cache. Native selection additionally uses a positive list head when no cache exists, as explicitly requested
 for server-supplied appearance; this extends the historical retail fallback above, without overriding cached equipment. Regression:

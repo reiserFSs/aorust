@@ -225,8 +225,8 @@ corpse / vending machine have Can 8, pick boxes, a ray at a corpse hits it).
 * **Left button, second click** (`FUN_1002c2ee`, press with click count 2, the pref `DoubleclickAction`, LoginPrefs default true): `N3Msg_DefaultActionOnDynel(id)` for every object except
   the own character (`InputConfig_t+0xd8` = own identity), including non-characters. [CODE] Ours: the second release on the same object within `DOUBLE_CLICK_TIME`
   (`Interact::double_click`, keyed by identity).
-* The keybind "Use" (hotbar special action 3, `FUN_1004256c`) is `N3Msg_UseItem(target, false)` on the current target (`hud_use.rs::use_target`); targets are characters here, so only the
-  character branch of `UseItem` is reachable that way. Objects are not selectable (`Zone::target` holds character ids), see 8.5.
+* The keybind "Use" (hotbar special action 3, `FUN_1004256c`) is `N3Msg_UseItem(target, false)` on the complete current target identity (`hud_use.rs::use_target`).
+  Characters and selected world objects share `Interact::use_item`, including the object's confirmation gate; Pick-Up likewise retains the selected identity.
 
 ### 8.2 `N3Msg_DefaultActionOnDynel` for a non-character [GC 0x100291da, CODE]
 `FUN_10058e36(id)` is "kind == 50000 and the dynel exists"; otherwise `FUN_1008720e(id)` = `GetDynel` cast to `SimpleItem_t` (all of corpses, vending machines, doors, terminals, ground items;
@@ -266,13 +266,32 @@ ids are from the code, whether the live LDB has category 0x2715 / key `Item_Conf
 `Dynels::pick_props` gives the visible, built props (corpses, vending machines, doors and terminals placed by rdb 1000026, items) a `hud_pick::PickBody`: the box over the vertices of the built model
 (`Built::held` for CAT models, else the mesh) with the prop's `ActorFrame` transform. [INFERENCE] The original tests plain `VisualMesh_t` bodies against a bounding sphere and their
 triangles (`FUN_1006bb2a`, docs/gui.md §13.2); the box stands in for it (the box of a door that has swung open is its closed box). `interact_use::pick_objects` merges them with the characters
-(one `hud_pick::hits` list, nearest first) and maps the ids back to identities. **Selection is not extended:** `Zone::target` and the target bars stay character-only (a left click on an object does
-nothing but arm the double click), so the original's `SetTarget` on an item (`N3Msg_isIDOnGround`) is not reproduced.
+(one `hud_pick::hits` list, nearest first) and maps the ids back to identities. Plain left release now cycles that merged identity list (`N3Msg_GetNextTarget`, GUI `FUN_1002c469`)
+and stores the entire identity via `Zone::set_target`; the old `target` field is only the character projection for character-only combat/skill consumers.
+`SetTarget` [GUI 0x100257b0] refuses a non-forced identity unless `N3Msg_isIDOnGround` succeeds; selection is cleared when the dynel disappears or gains a parent
+(`FrameProcess` 0x10025fa4). Empty world hits do not deselect. Shift requests `itemid://kind/instance` without changing the selection; Ctrl/Alt attack applies only to characters.
+Retail `FUN_100744ae` marks non-characters nonattackable, and `FUN_10073d0f` uses the friendly control caption **Selection**, not **Nano Target**; the object name is white,
+the health slider's default tint is white (`FUN_1007313a`, `Consider != 3`), and MaxHealth/Health come from the selected object's stats. A simultaneous character fight remains
+on the hostile control; complete identities are compared, so equal instance numbers in different kinds never merge. `SelectSelf` restores the complete previous object identity.
+`LookAtIIR_t` announces non-character selections with mode 0 (`FUN_1003fb35` → `FUN_1003b0db`, docs/zone/combat.md).
+Regression checks: `hud_target::tests::object_selection_keeps_identity_and_uses_the_retail_selection_header` and
+`combat::module::tests::object_selection_announces_complete_identity_with_mode_zero`. The existing renderer's missing ground-ring/non-character overhead indicator remains
+outside the target-window implementation (GUI 0x100257b0 still creates that original `Indicator_t`; docs/zone/motion.md §6).
+
+[LIVE, 2026-10-06, Fix8World] Offscreen `cargo test --release -p aomac live_walk -- --ignored --nocapture`, Aomacfixr with
+`AOMAC_LIVE_STEPS='approach=corpse,S=1,clickcorpse,shot=corpse-selected'`, passed (51.78 s). Corpse identity `51050:11930` was on-ground;
+release hits contained that same identity and selection remained `Some(51050:11930)` both immediately after release and after the next frame.
+Fix8World inspected the frame: friendly dock caption **Selection** and **Remains of Redevefoot the Agitated Wreck**, not **Nano Target**.
+An earlier harness run clicked the first edge pixel but ticked the settling camera between mouse events and missed at release; the harness now dispatches ordinary
+move/down/up against the camera/pose used for the pick in one frame. No production fallback, forced selection or retry was added.
 
 ### 8.6 Harness API (`Interact`)
 `default_action_on(&zone, identity) -> Action` (`None / Talk / Get / Use / Trade / Abort / Confirm / Refused(key)`), `use_item(&zone, identity, confirmed)`, `get_item(&zone, identity)`,
 `use_object(identity)` (the raw `GenericCmd` 3, used after Yes), `Interact::can_of(&zone, identity) -> Option<i32>`, `take_feedback()` (refusal keys; `Play::interact_frame` prints them from chat category 110),
 `take_outbox()`, and (`cfg(test)`) `loot_dump(&mut gui)`. `interact_use::decide(can)` / `CAN_PICK_UP` / `CAN_USE` / `CAN_CONFIRM`.
+The live harness also accepts `clickobj=<kind>:<instance>` and `rightobj=<kind>:<instance>` (decimal identity components): it finds an unobstructed on-screen point
+whose merged pick list starts with that identity, then sends the ordinary mouse events through `Play::input`; diagnostics print the complete clicked and selected identities.
+`approach=corpse` walks toward the nearest existing corpse's x/z via the existing approach servo, without starting combat; `clickcorpse` then exercises its real left-click selection.
 
 ### 8.7 An item released over a world object (`FUN_100cb081` [GUI], `N3Msg_UseItemOnItem` [GC 0x100267e0] / `UseItemOnCharacter` [GC 0x100268af])
 Object under the pointer when a carried bag item is released (`InputConfig_t+0xb0`): ground (`0x9c47`) -> `N3Msg_DropItem`; a character (50000) -> `GenericCmd_t` cmd 0x20; any other object -> cmd 5, both with

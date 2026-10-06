@@ -21,8 +21,8 @@
 //! * Not ported, UNRESOLVED: an early-out sphere before the box (`RCATMesh_t` +0x1cc / +0x1d0 and the mesh data's `+0x5c→+0x14`
 //!   radius; the writers of those fields were not traced, it only rejects rays that miss a sphere around the feet) and the 0.1 s
 //!   refresh (the list here is built at the click / hover). Items, doors and corpses are `VisualMesh_t` / other `Vehicle_t` bodies that
-//!   `Zone::dynels` does not hold (they cannot become the target here); the use clicks pick them separately (`Dynels::pick_props`,
-//!   `interact_use::pick_objects`, docs/zone/interact.md §8.5), the target / hover pick (`hud_target::pick_all`) stays character-only.
+//!   `Zone::dynels` does not hold; `interact_use::pick_objects` merges their `Dynels::pick_props` boxes with character boxes for
+//!   selection, use clicks and hover (docs/zone/interact.md §8.5).
 
 use ao_render::Vec3;
 

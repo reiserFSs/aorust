@@ -437,9 +437,9 @@ tests). The timer runs on `Gui::frame(dt)`; `input()` feeds `UpdateToolTip`. Tes
 * The **selection indicator** (found): not a ground decal. `SetTarget` creates `Indicator_t(id, attacking = 0, health = 1)` (`FUN_100255be`, vftable 0x101ae0d4) unless the target has skill flag
   0x400: a world billboard `VisualSprite_t(width/128, 0.3, "[3] TargetIndicatorMat")` (priority 6) over the head anchor `N3Msg_GetIndicatorPosition` (same anchor and text rules as the name tags,
   docs/zone/motion.md §6) showing a 128×32 (256 wide for long text) plate: the left and right half of `GFX_GUI_INDICATOR_SELECTED` (0xe6, corner brackets; 0xe5 `…_ATTACKING` for the attacked
-  dynel) at its ends, the tag line (`FUN_10024e14`: `** name **` for GM flags, `= name =`, titles, breed, colour by flags / `Consider`) in font 2, and the 64×4 health bar of `FUN_10024c03`
-  (y 14..18, `ftol(Health/MaxHealth·64)` px, rest 0x333333). Implemented as `hud_target::selection_indicator` (called from `flow.rs` after the name tags): drawn 1:1 in GUI pixels centred on the
-  projected anchor, not perspective-scaled; bar colour white (UNRESOLVED `Consider` gradient); no clan line; the attacking indicator needs the fight state.
+  dynel) at its ends, the tag line (`FUN_10024e14`: `** name **` for GM flags, `= name =`, titles, breed, colour by flags) in font 2, and the 64×4 health bar of `FUN_10024c03`
+  (y 14..18, `ftol(Health/MaxHealth·64)` px, rest 0x333333). Implemented by `play/tags.rs` through `Dynels::name_tags`: world-space camera-facing actors, perspective-scaled,
+  with the `Consider` colour on the bar only. Selection and attacking indicators share this path; no extra projected-GUI label is drawn. Org line data remains unavailable.
 
 ### 13.3 Target controls (`CCTargetControl_c`, GUI 0x100746ec; `play/hud_target.rs`)
 * `ControlCenterModule_c::CreateTargetMenus` 0x1006a0d4 builds two controls (friendly = `0x154` flag 0, hostile = 1) twice: the **dock** version (`LeftTargetCtrlDock` /
@@ -459,7 +459,7 @@ tests). The timer runs on `Gui::frame(dt)`; `input()` feeds `UpdateToolTip`. Tes
 * Which control shows a target: attackable → hostile, otherwise friendly. Attackable (`FUN_100744ae`): NPC and `Side` (stat 0x21) differs from the own side; a player needs
   `N3Msg_CanAttack` (not modelled).
 * `FUN_10073d0f`, `FUN_100744ae`, `FUN_1007460c`: friendly control shows a nonattackable selection only if it differs from fight target. Hostile control shows fight target plus a distinct attackable selection.
-  Equal selection/fight merges into `"Nano / Fighting<br>Target"`; otherwise captions are `"Nano Target"` and `"Fighting Target"`. Fight name is red `0xff4444`, selection name white. Hostile top constructor swaps the two row pointers, placing fight first.
+  Equal character selection/fight merges into `"Nano / Fighting<br>Target"`; otherwise character captions are `"Nano Target"` and `"Fighting Target"`. Non-character selection uses `"Selection"` on the friendly control (`FUN_10073d0f`, kind != 50000; `FUN_100744ae` clears attackability). Fight name is red `0xff4444`, selection name white. Object bar tint remains white (`FUN_1007313a`, `Consider != 3`); its MaxHealth/Health use object stats. Hostile top constructor swaps the two row pointers, placing fight first.
 * **Dock handlers** (disassembled, GUI): left arrow `LAB_10072fcb` = `AFCM::Send(0x1e, flag ? 0x106 : 0x105)` (`GetPrev{Hostile,Friendly}TargetMessage`), right arrow
   `LAB_10072ff1` = `Send(0x1e, flag ? 0xe9 : 0xe8)` (`GetNext…`), target button `LAB_10073017` = flag ? `N3Msg_PerformSpecialAction(0xb)` (**Attack**,
   docs/zone/combat-net.md §5.3; routed by `Hud::take_slot_use`) : `TargetingModule_t::SelectSelf`. (`FUN_1007303d` only sets the button's toggle value from a `GlobalSignals` int.)

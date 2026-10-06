@@ -89,6 +89,58 @@ fn remember_created_in(dir: &std::path::Path, id: i32, req: &ao_net::msg::Create
     Ok(())
 }
 
+/// `SlotShuttingDown` / `SlotConfigurationSaved`: update the active live visuals, then save the global cache.
+impl super::Play {
+    pub(super) fn save_viewer_cache(&self) {
+        let Some(u) = self.zone.own_update.as_deref() else { return };
+        // `GetData` refuses mech/morph visuals rather than overwriting the normal appearance.
+        if self.zone.stat(0x296).unwrap_or(0) != 0 || self.zone.stat(0x167).unwrap_or(u.monster_data) != 0 { return; }
+        let result = (|| -> anyhow::Result<()> {
+            let dir = super::prefs::dir().ok_or_else(|| anyhow::anyhow!("preferences directory unavailable"))?;
+            let mesh = match self.zone.stat(12).filter(|&m| m > 0) {
+                Some(mesh) => mesh,
+                None => {
+                    let store = RecordStore::open(&self.dir)?;
+                    let (breed, gender) = screens::wire_breed_sex(u.breed as i32, u.sex as i32)?;
+                    let build = if u.fatness == 0 { 0 } else if u.fatness == 2 { 2 } else { 1 };
+                    character::player_model_build(&store, breed, gender, build)? as i32
+                }
+            };
+            remember_live_in(&dir, self.zone.char_id as i32, u, mesh)?;
+            Ok(())
+        })();
+        if let Err(e) = result { eprintln!("live character appearance cache: {e:#}"); }
+    }
+}
+
+impl Drop for super::Play {
+    fn drop(&mut self) {
+        self.save_viewer_cache();
+    }
+}
+
+fn remember_live_in(dir: &std::path::Path, id: i32, u: &ao_net::n3::dynel::SimpleCharFullUpdate, mesh_id: i32) -> anyhow::Result<()> {
+    let look = super::avatar::AvatarLook::from_update(u, |_| character::Skin::Caucasian)?;
+    let mut c = character::CachedCharacter {
+        id,
+        time: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().min(i32::MAX as u64) as i32,
+        mesh_id,
+        head_id: look.look.head.map_or(0, |h| h as i32),
+        breed: u.breed as i32,
+        sex: u.sex as i32,
+        fatness: u.fatness as i32,
+        side: u.side as i32,
+        meshes: u.attractors.iter().filter(|_| u.flags & ao_net::n3::dynel::flag::SET_DYNEL_800 == 0)
+            .map(|a| character::MeshEntry { attractor: a.place as i8, flags: a.byte as i8, mesh_id: a.mesh, texture_id: a.field }).collect(),
+        ..Default::default()
+    };
+    c.set_equipment(&look.look.equipment);
+    let mut cache = character::ViewerCache::load(dir);
+    cache.update(c);
+    cache.save(dir)?;
+    Ok(())
+}
+
 fn listed_appearance(id: i32, breed: i32, sex: i32, mesh_id: i32, head: i32) -> Option<character::CachedCharacter> {
     (head > 0).then_some(character::CachedCharacter { id, mesh_id, head_id: head, breed, sex, fatness: 1, ..Default::default() })
 }
@@ -155,6 +207,39 @@ fn run(dir: &std::path::Path, breed: i32, sex: i32, char_id: i32, head: i32, req
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_existing_head_and_equipment_replace_creation_cache() {
+        let mut u = include_str!("../../../../docs/captures/zone_newchar_ithaca.rec").lines().filter_map(|line| {
+            let mut p = line.split(' ');
+            let (_, direction, hex) = (p.next()?, p.next()?, p.next()?);
+            if direction != "<" { return None; }
+            let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+            let (frame, _) = ao_net::frame::Frame::decode_with(&bytes, false).ok()??;
+            match ao_net::n3::decode(&frame).ok()?.body {
+                ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(u)) if u.name == "Aomacvolk" => Some(*u),
+                _ => None,
+            }
+        }).next().expect("captured own update");
+        let dir = std::env::temp_dir().join(format!("aomac-live-preview-{}", std::process::id()));
+        remember_created_in(&dir, 17, &ao_net::msg::CreateCharacterRequest { head: 40682, ..Default::default() }, 5907).unwrap();
+        u.flags &= !ao_net::n3::dynel::flag::SET_DYNEL_800;
+        u.head_mesh = Some(40099);
+        u.attractors = vec![ao_net::n3::dynel::AttractorMesh { place: 0, mesh: 40099, field: 0, byte: 4 },
+            ao_net::n3::dynel::AttractorMesh { place: 1, mesh: 7796, field: 0, byte: 2 }];
+        u.cloth.push(ao_net::n3::dynel::ClothData { raw: 1, texture: 154207, page: 0, extra: None });
+        remember_live_in(&dir, 18, &u, 5900).unwrap();
+        let cache = character::ViewerCache::load(&dir);
+        assert_eq!(cache.0[&17].head_mesh(), 40682);
+        let c = &cache.0[&18];
+        assert_eq!((c.head_id, c.head_mesh(), c.mesh_id), (40099, 40099, 5900));
+        assert_eq!(c.equipment().0[1], Some(154207));
+        assert!(c.meshes.iter().any(|m| m.attractor == 1 && m.mesh_id == 7796 && m.flags == 2));
+        u.cloth.clear();
+        remember_live_in(&dir, 18, &u, 5900).unwrap();
+        assert!(character::ViewerCache::load(&dir).0[&18].equipment().0.iter().all(Option::is_none));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn created_head_survives_reload_under_acknowledged_identity() {

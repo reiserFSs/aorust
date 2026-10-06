@@ -127,8 +127,10 @@ pub struct Zone {
     pub containers: HashMap<(i32, i32), (i32, Vec<ao_net::n3::world::InventoryEntry>)>,
     /// Other players / NPCs as renderer actors (`play/dynels.rs`).
     pub world: super::dynels::Dynels,
-    /// The selected target (`InputConfig_t+0xc0`, set by `TargetingModule_t::SetTarget` GUI 0x100257b0): the dynel instance id.
+    /// Character projection of `InputConfig_t+0xc0`; character-only combat/skill consumers use this.
     pub target: Option<i32>,
+    /// Non-character projection of the same selection; only one projection is populated.
+    object_target: Option<Identity>,
     /// The own dynel's last `SimpleCharFullUpdateIIR_t` (the avatar's appearance) and how many arrived (a new one = placed again).
     pub own_update: Option<Box<ao_net::n3::dynel::SimpleCharFullUpdate>>,
     pub own_serial: u32,
@@ -191,6 +193,27 @@ impl Zone {
     /// The player's own dynel once its `SimpleCharFullUpdateIIR_t` arrived.
     pub fn own(&self) -> Option<&DynelState> {
         self.dynels.get(&(self.char_id as i32))
+    }
+
+    pub fn selected_target(&self) -> Option<Identity> {
+        self.target.map(|instance| Identity { kind: CHAR_KIND, instance }).or(self.object_target)
+    }
+
+    /// `TargetingModule_t::SetTarget` GUI 0x100257b0 stores the complete identity.
+    pub fn set_target(&mut self, target: Option<Identity>) {
+        self.target = target.filter(|id| id.kind == CHAR_KIND).map(|id| id.instance);
+        self.object_target = target.filter(|id| id.kind != CHAR_KIND);
+    }
+
+    pub fn target_on_ground(&self, id: Identity) -> bool {
+        if self.parents.iter().any(|(child, parent)| *child == id && *parent != Identity::default()) {
+            return false;
+        }
+        if id.kind == CHAR_KIND {
+            self.dynels.contains_key(&id.instance)
+        } else {
+            self.world.on_ground(id)
+        }
     }
 
     /// An own stat (`INVALID` markers are never stored).
@@ -273,6 +296,7 @@ impl Zone {
     /// burst re-announces the dynels, and `CharInPlay` is owed again after the new world appears (docs/zone/outgoing.md §3).
     pub fn reset_world(&mut self) {
         self.world.clear();
+        self.set_target(None);
         self.containers.clear();
         self.dynels.clear();
         self.character_stats.clear();
@@ -312,7 +336,7 @@ impl Zone {
             _ => None,
         };
         if removed.is_some_and(|id| self.target == Some(id)) {
-            self.target = None;
+            self.set_target(None);
         }
         if let N3::World(World::Corpse(c)) = &m.body {
             if c.owner.kind == CHAR_KIND {

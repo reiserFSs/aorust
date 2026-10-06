@@ -373,7 +373,7 @@ impl HudTeam {
         }
         if let Some(id) = self.select.take() {
             if zone.dynels.contains_key(&id) || id == zone.char_id as i32 {
-                zone.target = Some(id);
+                zone.set_target(Some(ao_net::msg::Identity { kind: 50000, instance: id }));
             }
         }
         let Some(mut w) = self.win.take() else { return };

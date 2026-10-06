@@ -150,6 +150,11 @@ const ENV_BLEND_PIPE: usize = 14;
 /// Actors drawn with `ActorFrame::alpha < 1`: the opaque / alpha-tested submeshes (blend x cull = 16..20) blend with the frame's alpha but keep
 /// the depth write (`RVisual_t::RenderWithTransparency` randy31 0x1004d2d8 only switches ALPHABLENDENABLE on); they stay in the opaque phase.
 const FADE_PIPE: usize = 16;
+const SPRITE_PIPE: usize = 20;
+
+fn material_pipe(s: &ao_scene::Submesh) -> usize {
+    if s.blend == Blend::AlphaBlend && s.sprite_alpha_test { SPRITE_PIPE + s.two_sided as usize } else { s.blend as usize * 2 + s.two_sided as usize }
+}
 /// Lights kept per grid cell (strongest first) and the minimum cell edge in metres.
 const CELL_LIGHTS: usize = 16;
 const MIN_CELL: f32 = 8.0;
@@ -517,9 +522,10 @@ impl Renderer {
         let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let one_one = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool| {
+        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool, sprite: bool| {
             let (fs, state, depth_write) = match blend {
                 _ if env => ("fs_env", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
+                _ if sprite => ("fs_sprite", Some(wgpu::BlendState::ALPHA_BLENDING), true),
                 Blend::Opaque if fade => ("fs_fade_opaque", Some(wgpu::BlendState::ALPHA_BLENDING), true),
                 Blend::AlphaTest if fade => ("fs_fade_test", Some(wgpu::BlendState::ALPHA_BLENDING), true),
                 Blend::Opaque => ("fs_opaque", None, true),
@@ -573,7 +579,9 @@ impl Renderer {
             .chain([false, true, false, true].map(|two| (Blend::Opaque, two, false, true)))
             .map(|(b, two, sky, env)| (b, two, sky, env, false))
             .chain([Blend::Opaque, Blend::AlphaTest].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, true))))
-            .map(|(b, two, sky, env, fade)| mk(b, two, sky, env, fade))
+            .map(|(b, two, sky, env, fade)| (b, two, sky, env, fade, false))
+            .chain([false, true].map(|two| (Blend::AlphaBlend, two, false, false, false, true)))
+            .map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite))
             .collect();
         let mut r = Self {
             device,
@@ -740,7 +748,7 @@ impl Renderer {
                 if count > 0 {
                     let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
                     let mat = material(self, view, s);
-                    let d = Draw { mesh: mi, first_index: first, count, mat, pipe: s.blend as usize * 2 + s.two_sided as usize };
+                    let d = Draw { mesh: mi, first_index: first, count, mat, pipe: material_pipe(s) };
                     if s.liquid {
                         liquid.push(d)
                     } else if matches!(s.blend, Blend::AlphaBlend | Blend::Additive) {
@@ -1514,6 +1522,27 @@ mod sky_tests {
             assert!(solid[0] > 240 && solid[1] < 20, "{blend:?} solid red {solid:?}");
             assert!(half[0] > 200 && (100..200).contains(&half[1]), "{blend:?} half red over the white wall {half:?}");
             assert!(gone[0] > 240 && gone[1] > 240 && gone[2] > 240, "{blend:?} alpha 0 draws nothing {gone:?}");
+        }
+    }
+
+    #[test]
+    fn sprite_cutout_retains_edge_alpha_at_near_and_far_distances() {
+        let model = |alpha: u8| {
+            let key = TextureKey { rdb_type: 0, id: 1 };
+            let sub = Submesh { blend: Blend::AlphaBlend, sprite_alpha_test: true, emissive: [1.0; 3], ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key)) };
+            assert_eq!(material_pipe(&sub), SPRITE_PIPE);
+            let mut scene = actor_quad([0.0, 0.0, 1.0], sub);
+            scene.textures.insert(key, Texture { width: 1, height: 1, rgba: vec![255, 0, 0, alpha] });
+            scene
+        };
+        for distance in [2.0, 12.0] {
+            let shot = |alpha| actor_shot(&Scene::default(), model(alpha), [0.0, 0.0, -distance], &format!("sprite-{distance}-{alpha}"));
+            let Some(keyed) = shot(0) else { return };
+            assert_eq!(shot(30).unwrap(), keyed, "ALPHAFUNC greater rejects the boundary");
+            let edge = shot(128).unwrap();
+            let solid = shot(255).unwrap();
+            assert!(edge[0] > keyed[0] && edge[0] < solid[0], "filtered alpha must blend, not become opaque: {keyed:?}, {edge:?}, {solid:?}");
+            assert_ne!(shot(31).unwrap(), keyed, "coverage above ALPHAREF survives");
         }
     }
 

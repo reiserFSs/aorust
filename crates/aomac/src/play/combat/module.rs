@@ -67,7 +67,7 @@ pub struct Module {
     /// `s_nCommandRefCntr` [GC]: counter of the `n3Command_t`s the client sent (`SocialActionCmd_t.counter`).
     counter: i32,
     /// The selection last announced to the server with `LookAtIIR_t`.
-    announced: Option<i32>,
+    announced: Option<Identity>,
     /// Characters hit by an `0xd1` `CharacterAction` (sound cue, [`Module::take_struck`]).
     struck: Vec<i32>,
     /// `CharacterAction` 0x64: `(dynel, AbstractAnimID)` the server asks to play ([`Module::take_anims`]).
@@ -330,10 +330,11 @@ impl Module {
     /// `FUN_1003fb35` -> `FUN_1003b73e` / `FUN_1003b0db`: every change of the selection is announced with `LookAtIIR_t`
     /// (before any attack that uses it).
     fn announce(&mut self, zone: &Zone) {
-        if self.announced != zone.target && self.own_known(zone) {
-            let (t, mode) = zone.target.map_or((Identity::default(), 0), |t| (Identity { kind: DYNEL_CHAR, instance: t }, 1));
-            self.send(net::look_at(self.own, t, mode));
-            self.announced = zone.target;
+        let selected = zone.selected_target();
+        if self.announced != selected && self.own_known(zone) {
+            let t = selected.unwrap_or_default();
+            self.send(net::look_at(self.own, t, i32::from(t.kind == DYNEL_CHAR)));
+            self.announced = selected;
         }
     }
 
@@ -619,6 +620,23 @@ mod tests {
         m.take_outbox().iter().filter_map(misc).collect()
     }
 
+
+    #[test]
+    fn object_selection_announces_complete_identity_with_mode_zero() {
+        let (mut m, mut z, _) = primed();
+        m.take_outbox();
+        let object = Identity { kind: 0xc76a, instance: 2 };
+        z.set_target(Some(object));
+        m.announce(&z);
+        let out = m.take_outbox();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload, net::look_at(OWN as i32, object, 0));
+        m.announce(&z);
+        assert!(m.take_outbox().is_empty(), "unchanged object selection is not retransmitted");
+        z.set_target(None);
+        m.announce(&z);
+        assert_eq!(m.take_outbox()[0].payload, net::look_at(OWN as i32, Identity::default(), 0));
+    }
     /// Attack key: AttackIIR out, second press while the server has not answered is refused (`+0x79`), the server's echo starts the
     /// fight, the next press sends StopFight, its echo ends the fight.
     #[test]

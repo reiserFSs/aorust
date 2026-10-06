@@ -98,8 +98,7 @@ impl Play {
     /// current target when it is under the pointer, else the nearest hit (characters and objects, [`pick_objects`]).
     /// * Right button (`ActionViewMouseHandler_c` release `FUN_1002c469` [GUI]): a character -> `N3Msg_DefaultActionOnDynel`, anything else ->
     ///   `N3Msg_UseItem(id, false)`.
-    /// * Left button on an object that is not a character (characters are the HUD's selection, [`Play::interact_left_click`]): the second click on it within
-    ///   the double-click time runs `N3Msg_DefaultActionOnDynel` (`FUN_1002c2ee`, not on the own character).
+    /// * Left button: the HUD selects from the same merged hit list; a second click on a non-character runs its default action.
     pub(super) fn interact_mouse(&mut self, ev: &InputEvent, host: &Host) {
         if let Some(i) = self.interact.as_mut() {
             i.shop.quick = host.mods.shift || host.mods.ctrl;
@@ -126,7 +125,7 @@ impl Play {
         }
         let ray = pick_ray(&host.camera, &host.lens.unwrap_or_default(), (self.size.0 as f32, self.size.1 as f32), (x, y));
         let list = pick_objects(&ray, &self.zone);
-        let target = self.zone.target.map(|t| Identity { kind: DYNEL_CHAR, instance: t });
+        let target = self.zone.selected_target();
         let Some(id) = target.filter(|t| list.contains(t)).or_else(|| list.first().copied()) else { return };
         let (now, zone) = (self.time, &self.zone);
         let Some(i) = self.interact.as_mut() else { return };
@@ -137,7 +136,7 @@ impl Play {
             MouseButton::Right => {
                 i.use_item(zone, id, false);
             }
-            _ if id.kind != DYNEL_CHAR && i.double_click(id, now) => {
+            _ if !host.mods.shift && id.kind != DYNEL_CHAR && i.double_click(id, now) => {
                 i.default_action_on(zone, id);
             }
             _ => {}

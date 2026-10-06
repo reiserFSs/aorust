@@ -111,7 +111,7 @@ impl Renderer {
                     })
                 };
                 let mat = bind(view, mat_uniform(s));
-                draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe: s.blend as usize * 2 + s.two_sided as usize });
+                draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe: material_pipe(s) });
                 // the env layer redraws the same triangles right after them, in the same phase (`FUN_10056ed6`)
                 if let Some(ev) = s.env_texture.and_then(|k| view_of.get(&k).copied()) {
                     let mat = bind(ev, [0.0; 20]);
@@ -265,7 +265,7 @@ fn env_pipe(blend: Blend, two_sided: bool) -> usize {
 
 /// Whether a draw belongs to the blended actor phase (client render list 6) rather than the opaque one (list 3).
 fn blended_pipe(pipe: usize) -> bool {
-    matches!(pipe / 2, 2 | 3) && pipe < SKY_PIPE || (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&pipe)
+    matches!(pipe / 2, 2 | 3) && pipe < SKY_PIPE || (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&pipe) || (SPRITE_PIPE..SPRITE_PIPE + 2).contains(&pipe)
 }
 
 #[cfg(test)]
@@ -283,5 +283,17 @@ mod tests {
             }
         }
         assert_eq!(env_pipe(Blend::Opaque, true) - env_pipe(Blend::Opaque, false), 1, "two-sided pipeline follows the one-sided one");
+    }
+    #[test]
+    fn sprite_pipelines_are_blended_without_changing_existing_indices() {
+        for two_sided in [false, true] {
+            let mut s = ao_scene::Submesh::new(vec![], None);
+            s.blend = Blend::AlphaBlend;
+            s.two_sided = two_sided;
+            assert_eq!(material_pipe(&s), 4 + two_sided as usize);
+            s.sprite_alpha_test = true;
+            assert_eq!(material_pipe(&s), SPRITE_PIPE + two_sided as usize);
+            assert!(blended_pipe(material_pipe(&s)));
+        }
     }
 }

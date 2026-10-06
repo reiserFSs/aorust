@@ -1,10 +1,11 @@
 //! World-space name tags and target indicators (`Indicator_t`, docs/zone/motion.md §6): every tag is a 32 px high sprite (name line,
 //! optional organisation line, plate and health bar for selection/attack indicators) drawn into an RGBA image exactly like
-//! `FUN_10024e14` / `FUN_10024c03` (GUI.dll), shown as a camera-facing quad of `width/128 × 0.3` m centred on the head anchor
-//! (`VisualSprite_t`, material `TargetIndicatorMat`: white, alpha tested, depth tested/written: randy31 `RSprite` 0x10013575 sets
-//! render states ZWRITE 1, ALPHATEST 1, ALPHAFUNC greater, ALPHAREF 30, texture × diffuse). The quad goes through the renderer's
-//! actor layer (`ActorFrame` + a four-vertex model per tag with an emissive alpha-test material), so perspective shrinks it with
-//! distance like in the original.
+//! `FUN_10024e14` / `FUN_10024c03` (GUI.dll), shown as a camera-facing quad `(width/128) m` wide and `0.3 m` high.
+//! `[3] TargetIndicatorMat` enables alpha blending (randy31 material 0x10040645); `RSprite` 0x10013575 adds
+//! alpha testing `>30/255` and depth writes without disabling that blending. Filtered edge alpha is retained,
+//! not inflated into an opaque cutout. Perspective shrinks the actor-layer quad with distance.
+//! Size is not a screen-space font clamp: GUI 0x10024e14 passes these dimensions to DisplaySystem 0x1006ec9b,
+//! which forwards them unchanged to `RSprite(..., SpriteMode 1)`; randy31 0x10013ab2 replaces only the rotation.
 
 use super::zone::Zone;
 use ao_formats::stats;
@@ -26,8 +27,6 @@ const MODEL_BASE: u64 = 0x4000_0000_0000_0000 | 0x007a_6700;
 const ACTOR_BASE: u32 = 0x8000_0000;
 /// Tags the renderer holds at a time (nearest first beyond that; the original has no limit).
 const SLOTS: usize = 96;
-/// `ALPHAREF` of the sprite (`FUN_10013575`: render state 0x18 = 0x1e, with ALPHAFUNC greater).
-const ALPHA_REF: f32 = 30.0;
 
 /// What one tag shows. `centre` is the quad centre in scene space.
 #[derive(Clone, Debug, PartialEq)]
@@ -89,7 +88,7 @@ type Glyph = (i32, i32, i32, Vec<u8>);
 
 /// Draws one tag into a `width × 32` RGBA image: transparent (keyed) background, plate halves at both ends, the text lines
 /// (`lines`: x, y, 0xRRGGBB, text), then the health bar (`bar`: filled px, fill colour) over the plate. Pixels are copied, not blended
-/// (the original's surface is colour keyed): text pixels take `rgb · coverage`. Keyed pixels are alpha 0 but carry the colour of the
+/// (format-2 `SpriteInfo::Copy` 0x1007ae11): every nonkeyed bitmap pixel takes the full tint, not `rgb · intensity`. Keyed pixels are alpha 0 but carry the colour of the
 /// first line, so that mip levels / bilinear filtering do not darken the edges of the text.
 pub fn raster(layout: &nt::TagLayout, lines: &[(i32, i32, u32, &str)], glyph: &mut dyn FnMut(char) -> Glyph, plate: Option<(u32, u32, &[u8])>, bar: Option<(u32, u32)>) -> Vec<u8> {
     let w = layout.width as usize;
@@ -121,10 +120,8 @@ pub fn raster(layout: &nt::TagLayout, lines: &[(i32, i32, u32, &str)], glyph: &m
             let (adv, gw, gh, bits) = glyph(ch);
             for gy in 0..gh {
                 for gx in 0..gw {
-                    let c = bits[(gy * gw + gx) as usize] as u32;
-                    if c != 0 {
-                        let c = if c == 1 { 255 } else { c };
-                        put(pen + gx, y0 + gy, [0, 8, 16].map(|s| (((rgb >> (16 - s)) & 0xff) * c / 255) as u8));
+                    if bits[(gy * gw + gx) as usize] != 0 {
+                        put(pen + gx, y0 + gy, [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]);
                     }
                 }
             }
@@ -143,18 +140,16 @@ pub fn raster(layout: &nt::TagLayout, lines: &[(i32, i32, u32, &str)], glyph: &m
 }
 
 /// Four-vertex quad model of a `width_px` tag (corners as [`nt::billboard_corners`] with the unit camera axes, upright texture) with
-/// the unlit alpha-tested material of `TargetIndicatorMat`.
+/// the unlit alpha-tested/blended, depth-writing material of `[3] TargetIndicatorMat`.
 fn quad_model(width_px: u32, rgba: Vec<u8>) -> Scene {
     let key = TextureKey { rdb_type: 0, id: 0x7a67 };
     let corners = nt::billboard_corners([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], width_px);
     let vertices = [(0, [0.0, 0.0]), (1, [1.0, 0.0]), (2, [0.0, 1.0]), (3, [1.0, 1.0])].map(|(i, uv)| Vertex { pos: corners[i], normal: [0.0, 0.0, 1.0], uv, ..Default::default() });
     let mut sub = Submesh::new(vec![0, 2, 3, 0, 3, 1], Some(key));
-    sub.blend = Blend::AlphaTest;
+    sub.blend = Blend::AlphaBlend;
+    sub.sprite_alpha_test = true;
     sub.two_sided = true;
     sub.emissive = [1.0; 3];
-    // the engine's alpha test is `alpha > 30/255` (`ALPHAREF 0x1e`), the renderer's cutout is 0.5: scale the alpha to match, so that text
-    // thinned by minification stays visible like in the original
-    sub.base_color = [1.0, 1.0, 1.0, 0.5 * 255.0 / ALPHA_REF];
     let mut scene = Scene::default();
     scene.textures.insert(key, Texture { width: width_px, height: SPRITE_H as u32, rgba });
     scene.meshes.push(Mesh { vertices: vertices.to_vec(), submeshes: vec![sub] });
@@ -294,9 +289,9 @@ mod tests {
         assert_eq!(px(&img, w, 42, 14), [0x33, 0x33, 0x33, 255]);
         assert_eq!(px(&img, w, 95, 17), [0x33, 0x33, 0x33, 255]);
         assert_eq!((px(&img, w, 96, 14)[3], px(&img, w, 32, 18)[3]), (0, 0));
-        // grey coverage tints the colour
+        // Format-2 bitmap Copy tests the source opacity bit, not its grey intensity.
         let g = raster(&layout, &[(0, 0, 0xffffff, "g")], &mut glyph, None, None);
-        assert_eq!(px(&g, w, 0, 0), [128, 128, 128, 255]);
+        assert_eq!(px(&g, w, 0, 0), [255, 255, 255, 255]);
     }
 
     #[test]
@@ -331,12 +326,14 @@ mod tests {
     fn quad_model_is_an_alpha_tested_unlit_billboard() {
         let m = quad_model(256, vec![0; 256 * SPRITE_H * 4]);
         let s = &m.meshes[0].submeshes[0];
-        assert!(s.blend == Blend::AlphaTest && s.emissive == [1.0; 3] && s.two_sided);
-        // the renderer's 0.5 cutout scaled to the engine's alpha > 30/255
-        assert!((s.base_color[3] * 30.0 / 255.0 - 0.5).abs() < 1e-6);
+        assert!(s.blend == Blend::AlphaBlend && s.sprite_alpha_test && s.emissive == [1.0; 3] && s.two_sided);
+        assert_eq!(s.base_color[3], 1.0, "filtered sprite alpha must remain unscaled for blending");
         let v = &m.meshes[0].vertices;
         assert_eq!((v[1].pos[0] - v[0].pos[0], v[0].pos[1] - v[2].pos[1]), (2.0, 0.3));
         assert_eq!((v[0].uv, v[3].uv), ([0.0, 0.0], [1.0, 1.0]));
+        let small = quad_model(128, vec![0; 128 * SPRITE_H * 4]);
+        let v = &small.meshes[0].vertices;
+        assert_eq!((v[1].pos[0] - v[0].pos[0], v[0].pos[1] - v[2].pos[1]), (1.0, 0.3));
     }
     #[test]
     fn indicators_of_target_and_attacked_dynel() {

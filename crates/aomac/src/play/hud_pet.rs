@@ -74,7 +74,7 @@ impl HudPet {
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, dt: f32) {
         for nanos in self.nanos.values_mut() { nanos.tick(dt); }
-        if let Some(id) = self.select.take() { zone.target = Some(id); }
+        if let Some(id) = self.select.take() { zone.set_target(Some(ao_net::msg::Identity { kind: 50000, instance: id })); }
         let Some(w) = self.window else { return; };
         self.elapsed += dt;
         if self.elapsed < 0.5 && self.pets == zone.pets { return; }

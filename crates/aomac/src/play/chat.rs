@@ -795,7 +795,11 @@ impl Chat {
             output_group: out_name,
             afk: self.afk.as_deref(),
             last_tell_from: self.last_tell_from.as_deref(),
-            target: zone.target.and_then(|t| zone.dynels.get(&t).map(|d| Target { kind: CHAR_KIND as u32, id: t as u32, name: d.name.clone() })),
+            target: zone.selected_target().map(|id| Target {
+                kind: id.kind as u32,
+                id: id.instance as u32,
+                name: if id.kind == CHAR_KIND { zone.dynels.get(&id.instance).map(|d| d.name.clone()).unwrap_or_default() } else { zone.world.name_of(id.kind, id.instance).unwrap_or_default().to_owned() },
+            }),
             fight_target: None,
             gm_level: 0,
             warn_unsub: true,
@@ -945,7 +949,7 @@ impl Chat {
     }
 
     fn target_identity(zone: &Zone) -> Identity {
-        zone.target.map_or(Identity { kind: 0, instance: 0 }, |t| Identity { kind: CHAR_KIND, instance: t })
+        zone.selected_target().unwrap_or_default()
     }
 
     fn speak(&mut self, zone: &Zone, texts: &TextDb, speech: zone::Speech, text: &str) {

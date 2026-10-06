@@ -71,14 +71,14 @@ impl Play {
                     }
                 }
                 GameAction::Camp => self.camp(),
-                GameAction::SelectSelf => self.zone.target = Some(self.zone.char_id as i32),
+                GameAction::SelectSelf => self.zone.set_target(Some(ao_net::msg::Identity { kind: 50000, instance: self.zone.char_id as i32 })),
                 GameAction::BankClose => {
                     if let Some(interact) = self.interact.as_mut() {
                         interact.bank_close(&mut self.gui);
                     }
                 }
                 GameAction::Assist => match self.fight.as_ref().map(|m| m.assist(&self.zone)) {
-                    Some(Ok(t)) => self.zone.target = Some(t),
+                    Some(Ok(t)) => self.zone.set_target(Some(ao_net::msg::Identity { kind: 50000, instance: t })),
                     Some(Err(key)) if !key.is_empty() => {
                         if let Some(c) = self.chat.as_mut() {
                             c.feedback(&mut self.gui, key, &self.text);

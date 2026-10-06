@@ -434,8 +434,18 @@ fn live_walk() {
             // `approach=<instance>`: servo the heading with A/D and walk with W until 2.5 m from the dynel (the conventions of the yaw
             // and of the turn keys are detected on the fly: the distance must shrink while walking, the error while turning)
             "approach" => {
-                // `approach=x:z` walks to a point instead
-                let fixed = v.split_once(':').map(|(x, z)| (x.parse::<f32>().unwrap(), z.parse::<f32>().unwrap()));
+                // `approach=x:z` walks to a point; `approach=corpse` uses the nearest existing corpse without combat.
+                let fixed = if v == "corpse" {
+                    let me = l.p.zone.own().expect("approach requires an own dynel").pos;
+                    let corpse = l.p.zone.world.prop_list().into_iter().filter(|p| p.0 == 0xc76a).min_by(|a, b| {
+                        let dist = |p: [f32; 3]| (p[0] - me[0]).powi(2) + (p[2] - me[2]).powi(2);
+                        dist(a.2).total_cmp(&dist(b.2))
+                    }).expect("no corpse");
+                    eprintln!("approaching corpse {}:{} at {},{}", corpse.0, corpse.1, corpse.2[0], corpse.2[2]);
+                    Some((corpse.2[0], corpse.2[2]))
+                } else {
+                    v.split_once(':').map(|(x, z)| (x.parse::<f32>().unwrap(), z.parse::<f32>().unwrap()))
+                };
                 let id: i32 = if v == "target" { l.p.zone.target.unwrap() } else { v.parse().unwrap_or(0) };
                 let dist = |pos: [f32; 3], goal: (f32, f32)| ((goal.0 - pos[0]).powi(2) + (goal.1 - pos[2]).powi(2)).sqrt();
                 let wrap = |a: f32| (a + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
@@ -535,10 +545,11 @@ fn live_walk() {
                     let dd = |d: &crate::play::zone::DynelState| (d.pos[0] - me[0]).powi(2) + (d.pos[2] - me[2]).powi(2);
                     dd(a.1).total_cmp(&dd(b.1))
                 });
-                l.p.zone.target = best.map(|b| *b.0);
-                eprintln!("target {:?}", l.p.zone.target);
+                let target = best.map(|b| ao_net::msg::Identity { kind: 50000, instance: *b.0 });
+                l.p.zone.set_target(target);
+                eprintln!("target {:?}", l.p.zone.selected_target());
             }
-            "sel" => l.p.zone.target = Some(v.parse().unwrap()),
+            "sel" => l.p.zone.set_target(Some(ao_net::msg::Identity { kind: 50000, instance: v.parse().unwrap() })),
             "fight" => {
                 let m = l.p.fight.as_ref().unwrap();
                 eprintln!("fight: attacking={} numbers={:?}", m.attacking(), m.numbers().iter().map(|n| n.text.as_str()).collect::<Vec<_>>());
@@ -563,7 +574,7 @@ fn live_walk() {
                     *id
                 });
                 if let Some(id) = hunted {
-                    l.p.zone.target = Some(id);
+                    l.p.zone.set_target(Some(ao_net::msg::Identity { kind: 50000, instance: id }));
                 }
                 let hunted_s = hunted.map(|i| i.to_string());
                 let v = hunted_s.as_deref().unwrap_or(v);
@@ -664,7 +675,8 @@ fn live_walk() {
             // `clickdyn=[shift+|ctrl+]<instance>` / `hoverdyn=…`: left-click / hover the first screen point whose pick ray hits the dynel's box
             // with those modifiers held; `hoverdyn` prints the pointer sprites (GFX_GUI_POINTER* 0x135..0x14e) of the frame
             // `clickcorpse` / `rightcorpse`: real mouse click at a visible pick point of the nearest corpse (no direct use command).
-            "clickdyn" | "rightdyn" | "doubledyn" | "hoverdyn" | "clickcorpse" | "rightcorpse" => {
+            // `clickobj=<kind>:<instance>` / `rightobj=…`: same real mouse path for any visible world-object identity.
+            "clickdyn" | "rightdyn" | "doubledyn" | "hoverdyn" | "clickcorpse" | "rightcorpse" | "clickobj" | "rightobj" => {
                 let corpse = k.ends_with("corpse").then(|| {
                     let me = l.p.zone.own().unwrap().pos;
                     l.p.zone.world.prop_list().into_iter().filter(|p| p.0 == 0xC76A).min_by(|a, b| {
@@ -672,14 +684,20 @@ fn live_walk() {
                         dist(a.2).total_cmp(&dist(b.2))
                     }).map(|p| ao_net::msg::Identity { kind: p.0, instance: p.1 }).expect("no corpse")
                 });
-                let id: i32 = corpse.map_or_else(|| {
-                    let value = v.rsplit('+').next().unwrap();
-                    value.parse().unwrap_or_else(|_| {
+                let value = v.rsplit('+').next().unwrap();
+                let id = if let Some(corpse) = corpse {
+                    corpse
+                } else if k.ends_with("obj") {
+                    let (kind, instance) = value.split_once(':').expect("object identity must be kind:instance");
+                    ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: instance.parse().unwrap() }
+                } else {
+                    let instance = value.parse().unwrap_or_else(|_| {
                         let me = l.p.zone.own().unwrap().pos;
                         let dist = |d: &crate::play::zone::DynelState| (d.pos[0] - me[0]).powi(2) + (d.pos[2] - me[2]).powi(2);
                         *l.p.zone.dynels.iter().filter(|(_, d)| d.name == value).min_by(|a, b| dist(a.1).total_cmp(&dist(b.1))).expect("no such dynel").0
-                    })
-                }, |c| c.instance);
+                    });
+                    ao_net::msg::Identity { kind: 50000, instance }
+                };
                 let (cam, lens) = (l.o.host.camera, l.o.host.lens.unwrap_or_default());
                 let mut hit = None;
                 'g: for y in (0..800).step_by(4) {
@@ -688,7 +706,8 @@ fn live_walk() {
                             continue;
                         }
                         let ray = crate::play::hud_target::pick_ray(&cam, &lens, (1280.0, 800.0), (x as f32, y as f32));
-                        let picked = corpse.map_or_else(|| crate::play::hud_target::pick_all(&ray, &l.p.zone).contains(&id), |c| crate::play::interact_use::pick_objects(&ray, &l.p.zone).first() == Some(&c));
+                        let hits = crate::play::interact_use::pick_objects(&ray, &l.p.zone);
+                        let picked = if id.kind == 50000 { hits.contains(&id) } else { hits.first() == Some(&id) };
                         if picked {
                             hit = Some((x as f32, y as f32));
                             break 'g;
@@ -696,7 +715,7 @@ fn live_walk() {
                     }
                 }
                 let (x, y) = hit.expect("dynel not on screen");
-                eprintln!("{k} {id} at {x},{y}");
+                eprintln!("{k} {id:?} at {x},{y} on_ground={}", l.p.zone.target_on_ground(id));
                 l.o.host.mods = ao_gui::Modifiers { shift: v.contains("shift+"), ctrl: v.contains("ctrl+"), ..Default::default() };
                 if k == "hoverdyn" {
                     l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
@@ -705,15 +724,20 @@ fn live_walk() {
                     let sprites: Vec<String> = list.cmds.iter().filter_map(|c| if let ao_gui::DrawCmd::Gfx { id, dst, .. } = c { (0x135..=0x14e).contains(&id.0).then(|| format!("{:#x}@{},{}", id.0, dst[0], dst[1])) } else { None }).collect();
                     eprintln!("pointer sprites {sprites:?} hide_os_cursor {}", l.o.host.hide_cursor);
                 } else {
-                    let button = if k == "rightcorpse" || k == "rightdyn" { ao_gui::MouseButton::Right } else { ao_gui::MouseButton::Left };
+                    let button = if k.starts_with("right") { ao_gui::MouseButton::Right } else { ao_gui::MouseButton::Left };
+                    // Dispatch against the camera/pose just picked: ticking between events moves a settling camera off thin corpse-edge hits.
                     for _ in 0..if k == "doubledyn" { 2 } else { 1 } {
                         for ev in [ao_gui::InputEvent::MouseMove { x, y }, ao_gui::InputEvent::MouseDown { x, y, button }, ao_gui::InputEvent::MouseUp { x, y, button }] {
-                            l.tick();
+                            if matches!(ev, ao_gui::InputEvent::MouseUp { .. }) {
+                                let ray = crate::play::hud_target::pick_ray(&l.o.host.camera, &l.o.host.lens.unwrap_or_default(), (1280.0, 800.0), (x, y));
+                                eprintln!("release hits {:?}", crate::play::interact_use::pick_objects(&ray, &l.p.zone));
+                            }
                             l.p.input(ev, &mut l.o.host);
                         }
                     }
+                    eprintln!("target after release {:?}", l.p.zone.selected_target());
                     l.tick();
-                    eprintln!("target {:?}", l.p.zone.target);
+                    eprintln!("target {:?}", l.p.zone.selected_target());
                 }
                 l.o.host.mods = Default::default();
             }
@@ -1006,23 +1030,27 @@ fn live_walk() {
     if std::env::var_os("AOMAC_LIVE_SELECT_AFTER").is_some() {
         let id = l.p.zone.char_id as i32;
         let dir = super::super::prefs::dir().expect("preferences directory");
+        let live_head = l.p.zone.stat(64).expect("live HeadMesh stat");
+        let created_head = cc_name.as_ref().map(|_| l.p.prefs.cc.head as usize);
+        let shots = l.shots.clone();
+        let client = l.p.dir.clone();
+        drop(l); // Exercise SlotShuttingDown/SaveCache before the next selection loads it.
         let cache = ao_formats::character::ViewerCache::load(&dir);
-        let appearance = cache.0.get(&id).expect("created appearance was persisted");
-        let store = ao_rdb::RecordStore::open(&l.p.dir).unwrap();
+        let appearance = cache.0.get(&id).expect("live appearance was persisted");
+        assert_eq!(appearance.head_mesh(), live_head as u32, "cached head must match the live HeadMesh stat");
+        let store = ao_rdb::RecordStore::open(&client).unwrap();
         let (breed, sex) = ao_formats::screens::wire_breed_sex(appearance.breed, appearance.sex).unwrap();
         let heads = ao_formats::character::head_table(&store, breed, sex, 2).unwrap();
-        if cc_name.is_some() {
-            assert_eq!(appearance.head_mesh(), heads[l.p.prefs.cc.head as usize].mesh);
+        if let Some(head) = created_head {
+            assert_eq!(appearance.head_mesh(), heads[head].mesh);
+            assert_ne!(appearance.head_mesh(), heads[0].mesh, "live creation must choose a non-default head");
         }
-        assert_ne!(appearance.head_mesh(), heads[0].mesh, "live creation must choose a non-default head");
+        if want == "Aomacchvq" { assert_eq!(appearance.head_mesh(), 40099); }
         let entry = CharacterEntry {
             id, created: true, status: 1,
             info: ao_net::msg::CharacterInfo { id: 0, breed: appearance.breed, gender: appearance.sex, name: cc_name.unwrap_or_else(|| want.clone()), ..Default::default() },
             ..Default::default()
         };
-        let shots = l.shots.clone();
-        let client = l.p.dir.clone();
-        drop(l);
         cached_select_shot(client, entry, shots);
     }
 }

@@ -103,6 +103,7 @@ impl Play {
 
     /// `LoginModule_c::Show(0)` + `LoginWindow_c::Focus`.
     pub(super) fn show_login(&mut self, host: &mut Host) {
+        self.save_viewer_cache();
         self.close_all();
         self.conn_gen += 1; // a connect still in flight is stale now (Bg::Connected is dropped)
         self.session = None; // dropping the session closes the connection (ResetConnectionAndConfig)
@@ -532,6 +533,7 @@ impl Play {
         if !std::mem::take(&mut self.world_ready) {
             return;
         }
+        self.save_viewer_cache();
         self.player = None;
         host.fly = false;
         self.zone.reset_world();
@@ -553,7 +555,7 @@ impl Play {
         if let (Some(c), Some(t)) = (self.chat.as_mut(), self.text.by_key(110, "ChangingArea")) {
             c.system_line(&mut self.gui, &t, 12);
         }
-        self.zone.target = None;
+        self.zone.set_target(None);
         self.awaiting_alive = true;
         host.look = false;
     }
@@ -1169,6 +1171,7 @@ impl Frontend for Play {
                     p.set_fade(super::avatar::Fade::from_prefs(&h.dvalues.prefs));
                 }
                 self.zone.world.char_view_distance = h.dvalues.char_view_distance();
+                self.zone.world.show_all_names = h.dvalues.flag("ShowAllNames");
                 // `FogMode` (VisualFog_t::SetFogMode 0x10058409): mode 0 scales the fog density by 0.1
                 host.fog_density_scale = Some(ao_scene::fog_mode_density_scale(h.dvalues.prefs.get_int("FogMode", super::dvalue::Kind::Login).unwrap_or(3)));
             }
@@ -1254,6 +1257,7 @@ impl Frontend for Play {
             }
         }
         // `/option` `/setoption` `/dvalue` `/chardist` `/viewdist` `/char&viewdist` (docs/chat/dvalue.md): the store lives in the HUD
+        let mut config_saved = false;
         if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_mut()) {
             for t in c.take_dvalue_cmds() {
                 if let Some(outs) = h.dvalues.command(&t) {
@@ -1263,8 +1267,10 @@ impl Frontend for Play {
             // the original saves on a timer (`SlotConfigSaveTimer`); here a change writes the files at once
             if !h.dvalues.take_changed().is_empty() {
                 h.dvalues.save_user();
+                config_saved = true;
             }
         }
+        if config_saved { self.save_viewer_cache(); }
         // `/waypoint` (map marker, `GlobalSignals+0x158`), heard voice messages (`PlayPlayerFX`), `/macro` (docs/chat/dialogs.md §6)
         if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_ref()) {
             let d = &h.dvalues;

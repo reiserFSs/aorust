@@ -186,10 +186,14 @@ fn light_vertex(p: vec3<f32>, n_in: vec3<f32>) -> Lit {
 // mode: 0 opaque, 1 alpha test, 2 alpha blend, 3 additive; 4 / 5 = opaque / alpha test of an actor with alpha < 1 (`ActorFrame::alpha`: alpha blended
 // with the material alpha = the frame's transparency, `RVisual_t::RenderWithTransparency`; the opaque texture alpha is not used)
 fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
-    let faded = fade_mode >= 4u;
-    let mode = select(fade_mode, fade_mode - 4u, faded);
+    let sprite = fade_mode == 6u;
+    let faded = fade_mode >= 4u && !sprite;
+    let mode = select(select(fade_mode, fade_mode - 4u, faded), 2u, sprite);
     let t = textureSample(tex, samp, i.uv + mat.scroll.xy * g.fog.z);
     let alpha = t.a * i.color.a * mat.color.a * i.fade;
+    if sprite && alpha <= 30.0 / 255.0 {
+        discard;
+    }
     if mode == 1u && alpha < 0.5 {
         discard;
     }
@@ -243,6 +247,8 @@ fn fs_fade_test(i: VOut) -> @location(0) vec4<f32> { return shade(i, 5u); }
 fn fs_test(i: VOut) -> @location(0) vec4<f32> { return shade(i, 1u); }
 @fragment
 fn fs_blend(i: VOut) -> @location(0) vec4<f32> { return shade(i, 2u); }
+@fragment
+fn fs_sprite(i: VOut) -> @location(0) vec4<f32> { return shade(i, 6u); }
 @fragment
 fn fs_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u); }
 @fragment

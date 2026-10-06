@@ -4,8 +4,8 @@
 //! `InputConfig_t+0xc0` (`SetCurrentTarget` 0x10019df0), broadcasts it on the AFCM bus (`Send(0x13, 0x126, id)`; `N3InterfaceModule_t::
 //! SetTargetMessage` Interfaces 0x1000907a forwards it to `n3EngineClientAnarchy_t::N3Msg_SelectedTarget`, which only points the
 //! camera's `SetSelectedTarget`), creates the selection `Indicator_t` (a ground marker unless the target has skill-flag 0x400) and
-//! raises the `OnSelecting*` tips. **No message is sent to the server** on selection (no outgoing `TargetMessage` exists in
-//! `docs/zone/outgoing.md`). `TargetingModule_t::FrameProcess` 0x10025fa4 drops the target when the dynel is gone
+//! raises the `OnSelecting*` tips. The combat consumer announces this identity with `LookAtIIR_t` (`FUN_1003fb35`, mode 1 for
+//! characters, 0 otherwise; docs/zone/combat.md). `TargetingModule_t::FrameProcess` 0x10025fa4 drops the target when the dynel is gone
 //! (`N3Msg_GetPos` fails or it has a parent) unless it was forced.
 //!
 //! The pick: the GUI hands the normalised mouse position to `N3Msg_SetMousePos` (Gamecode 0x1001613b) → `n3Camera_t::SetMousePos`
@@ -20,6 +20,8 @@ use ao_formats::stats;
 use ao_gui::{Gui, InputEvent, MouseButton, WindowId, WindowSize};
 use ao_render::{Camera, Vec3};
 use ao_scene::Lens;
+use ao_net::msg::Identity;
+use ao_net::n3::outgoing::DYNEL_CHAR;
 
 /// `GetLengthOfViewcone` (far − near) at the default view distance: 800 − 0.5 m (docs/formats.md, statel LOD).
 const VIEW_LENGTH: f32 = 799.5;
@@ -46,15 +48,8 @@ pub fn pick_ray(cam: &Camera, lens: &Lens, vp: (f32, f32), mouse: (f32, f32)) ->
     Ray { origin: cam.pos, dir: dir.normalize(), len: lens.far.map_or(VIEW_LENGTH, |f| f - lens.near) }
 }
 
-/// Every character hit by the selection line, nearest first (instance ids): the list `n3Camera_t` keeps at `+0x244` and refills
-/// through its `n3CameraCollLine_t`, the bounding boxes and the order of [`super::hud_pick`].
-pub fn pick_all(ray: &Ray, zone: &Zone) -> Vec<i32> {
-    let bodies = zone.world.pick_bodies(zone.char_id as i32);
-    super::hud_pick::hits(&bodies, ray.origin, ray.dir, ray.len)
-}
-
 /// `GetObjectUnderColLine` (N3 0x1002069c): the current target when it is in the hit list, else the first entry (void without hits).
-pub fn object_under(list: &[i32], current: Option<i32>) -> Option<i32> {
+pub fn object_under<T: Copy + PartialEq>(list: &[T], current: Option<T>) -> Option<T> {
     current.filter(|c| list.contains(c)).or_else(|| list.first().copied())
 }
 
@@ -62,7 +57,7 @@ pub fn object_under(list: &[i32], current: Option<i32>) -> Option<i32> {
 /// slot `FUN_1002c469` (GUI 0x1002c469) sends it as `SetTargetMessage`. The object after the current target in the list (wrapping)
 /// or, when the current target is not in it, the first one: clicking again on a stack of overlapping dynels walks through them.
 /// An empty list gives `None` (the original's reference is void and the handler does nothing: **no click on the ground deselects**).
-pub fn click_target(list: &[i32], current: Option<i32>) -> Option<i32> {
+pub fn click_target<T: Copy + PartialEq>(list: &[T], current: Option<T>) -> Option<T> {
     match current.and_then(|c| list.iter().position(|i| *i == c)) {
         Some(i) => Some(list[(i + 1) % list.len()]),
         None => list.first().copied(),
@@ -76,6 +71,7 @@ pub(super) enum WorldClick {
     Select(i32),
     /// Shift + click: the info page of the character was requested; the selection is unchanged.
     Info(i32),
+    ObjectInfo(Identity),
 }
 
 /// Stat `PetMaster` (196 = 0xc4) and `TowerType` (388 = 0x184), read by `N3Msg_CanClickTargetTarget`.
@@ -99,6 +95,7 @@ pub fn can_click_target_target(zone: &Zone, target: i32, targets_target: i32) ->
 #[derive(Clone, Debug, PartialEq)]
 pub struct TargetInfo {
     pub id: i32,
+    pub kind: i32,
     pub name: String,
     pub level: i32,
     /// `Health / MaxHealth`, 0..1.
@@ -131,6 +128,7 @@ pub fn info(zone: &Zone, id: i32) -> Option<TargetInfo> {
     let [r, g, b, _] = ao_net::n3::nametag::con_color(ao_net::n3::nametag::consider_ratio(level, own_level, range));
     Some(TargetInfo {
         id,
+        kind: DYNEL_CHAR,
         name: clean(&d.name),
         level,
         health: if max > 0 { (health as f32 / max as f32).clamp(0.0, 1.0) } else { 0.0 },
@@ -138,6 +136,26 @@ pub fn info(zone: &Zone, id: i32) -> Option<TargetInfo> {
         max_health: max,
         hostile: d.npc && !is_self && side != own_side,
         is_self,
+    })
+}
+
+fn selected_info(zone: &Zone) -> Option<TargetInfo> {
+    let id = zone.selected_target()?;
+    if id.kind == DYNEL_CHAR {
+        return info(zone, id.instance);
+    }
+    let max = zone.world.stat_of(id.kind, id.instance, stats::LIFE).unwrap_or(0);
+    let health = zone.world.stat_of(id.kind, id.instance, stats::HEALTH).unwrap_or(0);
+    Some(TargetInfo {
+        id: id.instance,
+        kind: id.kind,
+        name: clean(zone.world.name_of(id.kind, id.instance).unwrap_or_default()),
+        level: zone.world.stat_of(id.kind, id.instance, stats::LEVEL).unwrap_or(0),
+        health: if max > 0 { (health as f32 / max as f32).clamp(0.0, 1.0) } else { 0.0 },
+        color: 0xffffff,
+        max_health: max,
+        hostile: false,
+        is_self: false,
     })
 }
 
@@ -220,7 +238,7 @@ fn health_bar_width(max_width: f32, max_health: i32) -> f32 {
 /// `FUN_10073d0f`: selection is a nano target for characters; fight always lives on the hostile control.
 fn control_targets(selection: Option<&TargetInfo>, fight: Option<&TargetInfo>, hostile: bool) -> [Option<(i32, &'static str, bool)>; 2] {
     if !hostile {
-        return [selection.filter(|s| !s.hostile && fight.is_none_or(|f| f.id != s.id)).map(|s| (s.id, "Nano Target", false)), None];
+        return [selection.filter(|s| !s.hostile && fight.is_none_or(|f| f.id != s.id || f.kind != s.kind)).map(|s| (s.id, if s.kind == DYNEL_CHAR { "Nano Target" } else { "Selection" }, false)), None];
     }
     let nano = selection.filter(|s| s.hostile);
     match (nano, fight) {
@@ -260,7 +278,7 @@ pub(super) struct HudTarget {
     bars: Vec<Bar>,
     docks: [Dock; 2],
     /// `m_cLastTarget` of `TargetingModule_t` (restored by a second `SelectSelf`).
-    last: Option<i32>,
+    last: Option<Identity>,
     mouse: (f32, f32),
     pressed: Option<(bool, Part)>,
     /// A left press on the world (not on the GUI) is pending: `(accumulated pointer path length, last position)`; the release
@@ -384,11 +402,15 @@ impl HudTarget {
 
     /// `SetTarget`: remembers the previous selection for `SelectSelf` and stores the new one.
     pub(super) fn select(&mut self, zone: &mut Zone, id: Option<i32>) {
-        if zone.target != id {
-            if let Some(old) = zone.target {
+        self.select_identity(zone, id.map(|instance| Identity { kind: DYNEL_CHAR, instance }));
+    }
+
+    fn select_identity(&mut self, zone: &mut Zone, id: Option<Identity>) {
+        if zone.selected_target() != id && id.is_none_or(|id| zone.target_on_ground(id)) {
+            if let Some(old) = zone.selected_target() {
                 self.last = Some(old);
             }
-            zone.target = id;
+            zone.set_target(id);
         }
     }
 
@@ -398,35 +420,43 @@ impl HudTarget {
         match zone.target {
             None => self.select(zone, Some(me)),
             Some(t) if t == me => {
-                let back = self.last.filter(|l| zone.dynels.contains_key(l) && *l != me);
-                self.select(zone, back);
+                let back = self.last.filter(|id| zone.target_on_ground(*id) && *id != Identity { kind: DYNEL_CHAR, instance: me });
+                self.select_identity(zone, back);
             }
             Some(_) => self.select(zone, Some(me)),
         }
     }
 
     /// A left click on the world (not on the GUI), `ActionViewMouseHandler_c`'s release slot `FUN_1002c469` (GUI 0x1002c469): the hit
-    /// list under the pointer is [`pick_all`] (no hit = nothing happens, no deselect). Plain click: [`click_target`] chooses and the
+    /// list under the pointer merges characters and props via [`super::interact_use::pick_objects`] (no hit = nothing happens, no deselect). Plain click: [`click_target`] chooses and the
     /// choice becomes the target (`Send(0x1e, 0x126)` → `TargetingModule_t::SetTargetMessage`). **Shift**: the object under the pointer
-    /// ([`object_under`]) is not selected, its info page is requested (`InfoViewModule_c::ShowURL("charid://50000/<id>")`) →
-    /// [`WorldClick::Info`]. **Ctrl / Alt** (the `& 0xc` qualifier, which bit is which is unresolved) on a character: that object
+    /// ([`object_under`]) is not selected, its info page is requested (`charid://50000/id` for characters, `itemid://kind/id` otherwise).
+    /// **Ctrl / Alt** (the `& 0xc` qualifier, which bit is which is unresolved) on a character: that object
     /// itself is selected, not the next one in the list, and the caller attacks it (`N3Msg_SwitchTarget` = `DefaultAttack(target,
     /// true)`, `flow.rs` via `Hud::take_click`). The right button and the double click (`N3Msg_DefaultActionOnDynel`) are
     /// `interact_play.rs`.
     pub(super) fn world_click(&mut self, zone: &mut Zone, cam: &Camera, lens: &Lens, vp: (u32, u32), mouse: (f32, f32), mods: ao_gui::Modifiers) -> Option<WorldClick> {
         let ray = pick_ray(cam, lens, (vp.0 as f32, vp.1 as f32), mouse);
-        let list = pick_all(&ray, zone);
-        self.click_list(zone, &list, mods)
+        let list = super::interact_use::pick_objects(&ray, zone);
+        self.click_identities(zone, &list, mods)
     }
 
     /// [`HudTarget::world_click`] on a given hit list.
-    fn click_list(&mut self, zone: &mut Zone, list: &[i32], mods: ao_gui::Modifiers) -> Option<WorldClick> {
+    fn click_identities(&mut self, zone: &mut Zone, list: &[Identity], mods: ao_gui::Modifiers) -> Option<WorldClick> {
+        let current = zone.selected_target();
+        let under = object_under(list, current)?;
         if mods.shift {
-            return object_under(list, zone.target).map(WorldClick::Info);
+            return Some(if under.kind == DYNEL_CHAR { WorldClick::Info(under.instance) } else { WorldClick::ObjectInfo(under) });
         }
-        let id = if mods.ctrl || mods.alt { object_under(list, zone.target) } else { click_target(list, zone.target) }?;
-        self.select(zone, Some(id));
-        Some(WorldClick::Select(id))
+        let id = if (mods.ctrl || mods.alt) && under.kind == DYNEL_CHAR { under } else { click_target(list, current)? };
+        self.select_identity(zone, Some(id));
+        (id.kind == DYNEL_CHAR).then_some(WorldClick::Select(id.instance))
+    }
+
+    #[cfg(test)]
+    fn click_list(&mut self, zone: &mut Zone, list: &[i32], mods: ao_gui::Modifiers) -> Option<WorldClick> {
+        let ids: Vec<_> = list.iter().map(|&instance| Identity { kind: DYNEL_CHAR, instance }).collect();
+        self.click_identities(zone, &ids, mods)
     }
 
     /// Raw mouse input before the GUI: dock buttons (hit-tested on their canvases) and world clicks. Returns `Some(pos)` when a
@@ -546,7 +576,7 @@ impl HudTarget {
         }
         let ray = pick_ray(&host.camera, &host.lens.unwrap_or_default(), (vp.0 as f32, vp.1 as f32), (x, y));
         let hits = super::interact_use::pick_objects(&ray, zone);
-        let target = zone.target.map(|instance| ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance });
+        let target = zone.selected_target();
         let mouse = target.filter(|id| hits.contains(id)).or_else(|| hits.first().copied()).and_then(|id| {
             if id.kind != ao_net::n3::outgoing::DYNEL_CHAR {
                 let can = super::interact::Interact::can_of(zone, id)?;
@@ -566,15 +596,18 @@ impl HudTarget {
 
     /// `TargetingModule_t::FrameProcess`: the target goes away with its dynel; then the controls follow the selection.
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
-        if zone.target.is_some_and(|t| !zone.dynels.contains_key(&t)) {
-            zone.target = None;
+        if zone.selected_target().is_some_and(|id| !zone.target_on_ground(id)) {
+            zone.set_target(None);
         }
-        let sel = zone.target.and_then(|t| info(zone, t));
+        let sel = selected_info(zone);
         let fight = zone.fight_target.get(&(zone.char_id as i32)).and_then(|t| info(zone, *t));
         let mut layout_changed = false;
         for b in &mut self.bars {
             let targets = control_targets(sel.as_ref(), fight.as_ref(), b.hostile)
-                .map(|t| t.and_then(|(id, caption, attacking)| info(zone, id).map(|i| (i, caption, attacking))));
+                .map(|t| t.and_then(|(id, caption, attacking)| {
+                    let value = if !attacking { sel.as_ref().filter(|s| s.id == id).cloned() } else { info(zone, id) };
+                    value.map(|i| (i, caption, attacking))
+                }));
             let prefix = if b.hostile { "ht" } else { "ft" };
             let enabled = self.bars_enabled[usize::from(b.hostile)];
             b.shown = targets[0].as_ref().map(|(i, _, _)| i.clone()).filter(|_| enabled);
@@ -752,7 +785,7 @@ mod tests {
         PickBody { id, bounds: ([-0.4, 0.0, -0.3], [0.4, 1.8, 0.3]), pos: [0.0, 0.0, scene_z], yaw: 0.0, scale: 1.0 }
     }
 
-    /// The hit list of the ray through pixel `mouse` against `bodies` (what `pick_all` does with the zone's dynels).
+    /// The ray/box primitive used by the merged `interact_use::pick_objects` selection path.
     fn list(cam: &Camera, lens: &Lens, bodies: &[PickBody], mouse: (f32, f32)) -> Vec<i32> {
         let ray = pick_ray(cam, lens, (800.0, 600.0), mouse);
         hud_pick::hits(bodies, ray.origin, ray.dir, ray.len)
@@ -809,6 +842,40 @@ mod tests {
         assert_eq!(h.0.click_list(&mut z, &[2, 3], ctrl), Some(WorldClick::Select(2)));
         assert_eq!(h.0.click_list(&mut z, &[3], Modifiers { alt: true, ..Default::default() }), Some(WorldClick::Select(3)));
         assert_eq!(z.target, Some(3));
+    }
+
+    #[test]
+    fn object_selection_keeps_identity_and_uses_the_retail_selection_header() {
+        let mut z = Zone::new(1);
+        z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
+        z.dynels.insert(2, dyn_at("Fighter", [0.0; 3], true, 0));
+        let corpse = Identity { kind: 0xc76a, instance: 2 };
+        let item = Identity { kind: 0xc748, instance: 3 };
+        for id in [corpse, item] {
+            z.world.test_prop(id, vec![(stats::LIFE, 10), (stats::HEALTH, 3)]);
+        }
+        let mut h = HudTargetLite::default();
+        for id in [corpse, item] {
+            assert_eq!(h.0.click_identities(&mut z, &[id], Default::default()), None);
+            assert_eq!(z.selected_target(), Some(id));
+            assert_eq!(z.target, None, "objects must never enter character combat consumers");
+            let selected = selected_info(&z).unwrap();
+            assert_eq!((selected.kind, selected.health, selected.color), (id.kind, 0.3, 0xffffff));
+            let fighting = info(&z, 2).unwrap();
+            assert_eq!(control_targets(Some(&selected), Some(&fighting), false), [Some((id.instance, "Selection", false)), None]);
+            assert_eq!(control_targets(Some(&selected), Some(&fighting), true), [Some((2, "Fighting Target", true)), None]);
+            assert_eq!(h.0.click_identities(&mut z, &[], Default::default()), None);
+            assert_eq!(z.selected_target(), Some(id), "ground clicks keep the object selected");
+            assert_eq!(h.0.click_identities(&mut z, &[id], ao_gui::Modifiers { shift: true, ..Default::default() }), Some(WorldClick::ObjectInfo(id)));
+            h.0.select_self(&mut z);
+            assert_eq!(z.target, Some(1));
+            h.0.select_self(&mut z);
+            assert_eq!(z.selected_target(), Some(id), "select-self restores complete object identity");
+        }
+        assert_eq!(h.0.click_identities(&mut z, &[item, corpse], Default::default()), None);
+        assert_eq!(z.selected_target(), Some(corpse), "overlapping objects cycle in merged hit order");
+        z.reset_world();
+        assert_eq!(z.selected_target(), None);
     }
 
     #[test]
@@ -952,6 +1019,17 @@ mod tests {
         fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
         assert_eq!(fe.zone.target, None);
         assert!(!fe.gui.window_visible(fe.ht.bars[1].window));
+        let corpse = Identity { kind: 0xc76a, instance: 2 };
+        fe.zone.world.test_prop(corpse, vec![(stats::LIFE, 10), (stats::HEALTH, 0)]);
+        fe.zone.set_target(Some(corpse));
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert_eq!(fe.ht.bars[0].rows[0].as_ref().map(|(i, caption, _)| (i.kind, *caption, i.color)), Some((corpse.kind, "Selection", 0xffffff)));
+        assert!(fe.gui.window_visible(fe.ht.bars[0].window));
+        assert!(!fe.gui.window_visible(fe.ht.bars[1].window));
+        fe.zone.world.clear();
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert_eq!(fe.zone.selected_target(), None);
+        assert!(!fe.gui.window_visible(fe.ht.bars[0].window));
     }
 
     /// `FUN_10073b9e` / `LAB_10073554`: the button needs the `Targetstarget` pref and a shown hostile window; a click selects the
