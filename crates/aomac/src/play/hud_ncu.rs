@@ -13,7 +13,7 @@
 //! how the original learns that an effect ended (the server's action 0x1b / 0x66 paths, `FUN_1004f504`): an effect ends here when its `TimeExist` has run out.
 
 use super::hud::WindowKind;
-use super::hud_listview::{self as lv, Column, Hit, ListView, ListWindow, MenuTexts, Mode, Row};
+use super::hud_listview::{self as lv, Column, Hit, ListView, ListWindow, MenuTexts, Mode, Row, Spec};
 use super::hud_nano::HudNano;
 use super::hud_nanodb::{stat, NanoDb};
 use super::zone::Zone;
@@ -122,7 +122,7 @@ impl HudNcu {
         let cols = lv::grid_cols_for(client.0 as f32, lv::ICON_32);
         let view = ListView::new(Mode::Grid, all.clone(), cols, 3, (12, false));
         let texts = MenuTexts { list_mode: self.text("ListMode"), auto_arrange: self.text("AutoArrange") };
-        match ListWindow::open(gui, "NCUView", "NCU", (x, y), client, "", 0.0, view, all, texts, MENU_BASE, self.screen, None) {
+        match ListWindow::open(gui, Spec { name: "NCUView", title: "NCU", pos: (x, y), client, top_xml: "", top_h: 0.0, texts, menu_base: MENU_BASE, screen: self.screen }, view, all, None) {
             Ok(w) => {
                 self.win = Some(w);
                 self.built = None;
@@ -139,10 +139,10 @@ impl HudNcu {
         self.built = None;
     }
 
-    /// `FUN_100d6d14`: "NCU (used/max)" from the text `NCU_usage_x/y`.
+    /// `FUN_100d6d14`: "NCU (used/max)" from the text `NCU_usage_x/y` ("NCU (%u/%u)").
     pub(super) fn title_for(texts: &TextDb, used: i32, max: i32) -> String {
         let fmt = texts.by_key(CAT_GUI, "NCU_usage_x/y").unwrap_or_default();
-        fmt.replacen("%d", &used.to_string(), 1).replacen("%d", &max.to_string(), 1)
+        fmt.replacen("%u", &used.to_string(), 1).replacen("%u", &max.to_string(), 1)
     }
 
     /// Remaining time of an effect in 1/100 s (`FUN_1004eb5a`: start + total - now).

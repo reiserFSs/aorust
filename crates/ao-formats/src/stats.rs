@@ -2,6 +2,7 @@
 //! (`GUI.dll` `SkillWindow`), display names / descriptions (`text.mdb`) and `data/ipdist.xml`.
 //! Evidence: `docs/gui.md` §11.
 
+pub mod buffs;
 pub mod pools;
 pub mod skills;
 

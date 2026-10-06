@@ -1,7 +1,7 @@
 //! IP bookkeeping of the skill window without any UI: the `StatRow` arithmetic (`FUN_100fde49`, `FUN_100f90ef`, `FUN_100f908e`, `FUN_100fe478`),
 //! the window's IP slot (`FUN_100fa185`) and the "Suggested IP distribution" spend loop (`FUN_100fac49`). Evidence: docs/gui.md §11.8 / §11.10.
 
-use ao_formats::stats::{self, skills::{Character, SkillTables}, DistProfession};
+use ao_formats::stats::{self, buffs::{self, Modifiers}, skills::{Character, SkillTables}, DistProfession};
 use std::collections::{BTreeMap, HashMap};
 
 /// Own stat lookup (`Zone::stat`).
@@ -18,8 +18,10 @@ pub struct Row {
     /// `GetSkill(stat, 0)`: the stored value.
     pub raw: i32,
     pub pending: i32,
-    /// `GetSkill(stat, 1)` + trickle-down of the abilities including pending ability points (`SetSkillTmp`); buffs are UNRESOLVED (docs §11.8).
+    /// `GetSkill(stat, 1)`: the stat with its percent boost plus the trickle-down of the buffed abilities including pending ability points (`SetSkillTmp`).
     pub base: i32,
+    /// `GetSkill(stat, 2)` (`StatRow+0x1a8`): [`Row::base`] plus the bonus of the active spells (docs §11.10 "Buffed values").
+    pub value: i32,
     /// `GetSkillMax`.
     pub max: i32,
 }
@@ -27,7 +29,11 @@ pub struct Row {
 impl Row {
     /// Text of the value view: `FUN_100fde49` prints `pending + value`.
     pub fn shown(&self) -> i32 {
-        self.base + self.pending
+        self.value + self.pending
+    }
+    /// Colour of the value text (`FUN_100fde49`: `GetSkill(stat, 2)` against `GetSkill(stat, 1)`).
+    pub fn color(&self) -> u32 {
+        buffs::value_color(self.value, self.base)
     }
     /// `PowerbarView` value `(raw + pending) / max` (float division, the original does not clamp or guard max = 0).
     pub fn fraction(&self) -> f32 {
@@ -52,6 +58,8 @@ pub struct Model {
     pending: HashMap<u32, i32>,
     /// `StatRow+0x1b8`: the IP price of the pending points as last reported to the window.
     cost: HashMap<u32, i32>,
+    /// The bonus / percent maps of the active spells (`SimpleChar+0x1bc`), see [`Model::refresh_buffs`].
+    mods: Modifiers,
 }
 
 impl Model {
@@ -61,10 +69,6 @@ impl Model {
 
     pub fn pending(&self, stat: u32) -> i32 {
         self.pending.get(&stat).copied().unwrap_or(0)
-    }
-
-    pub fn any_pending(&self) -> bool {
-        self.pending.values().any(|&p| p != 0)
     }
 
     /// `FUN_100f91d7` + the rows' reset: forget every pending point.
@@ -87,10 +91,24 @@ impl Model {
         get(stats::IP).unwrap_or(0) - self.cost.values().sum::<i32>()
     }
 
+    /// Rebuilds the modifier maps from the spells running on the own character (`hud_stats/buffs.rs`); the window calls it every update.
+    pub fn refresh_buffs(&mut self, get: Get, active: &[ao_net::n3::spells::Spell]) {
+        let (ch, lock) = (Character::from_stats(get), get(buffs::LOCK_STAT).unwrap_or(0));
+        let tables = &self.tables;
+        let current = |stat: u32, m: &Modifiers| buffs::skill_value(tables, stat, get(stat).unwrap_or(0), &ch, m, lock);
+        self.mods = super::buffs::modifiers(active, get(stats::LEVEL).unwrap_or(0), &current);
+    }
+
     pub fn row(&self, get: Get, stat: u32) -> Row {
         let ch = self.character(get);
-        let raw = get(stat).unwrap_or(0);
-        Row { raw, pending: self.pending(stat), base: self.tables.skill_base(stat, raw, &ch), max: self.tables.skill_max(stat, &ch) }
+        let (raw, lock) = (get(stat).unwrap_or(0), get(buffs::LOCK_STAT).unwrap_or(0));
+        Row {
+            raw,
+            pending: self.pending(stat),
+            base: buffs::skill_base(&self.tables, stat, raw, &ch, &self.mods, lock),
+            value: buffs::skill_value(&self.tables, stat, raw, &ch, &self.mods, lock),
+            max: self.tables.skill_max(stat, &ch),
+        }
     }
 
     /// `FUN_100f908e`: one more point is allowed (not disabled, `raw + pending + 1 <= max`).
@@ -221,6 +239,6 @@ mod tests {
         assert_eq!(m.remaining(&get), 2);
         assert_eq!(m.save_map(&get), BTreeMap::from([(16, 5 + 1)]));
         m.clear();
-        assert_eq!((m.remaining(&get), m.pending(16), m.any_pending()), (3, 0, false));
+        assert_eq!((m.remaining(&get), m.pending(16)), (3, 0));
     }
 }

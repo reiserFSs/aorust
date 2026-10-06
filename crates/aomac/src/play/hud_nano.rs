@@ -12,7 +12,7 @@
 //! `selected_school` / `listview_mode` persistence (the prefs store is not wired for window configs).
 
 use super::hud::WindowKind;
-use super::hud_listview::{self as lv, Column, Hit, ListView, ListWindow, MenuTexts, Mode, Row};
+use super::hud_listview::{self as lv, Column, Hit, ListView, ListWindow, MenuTexts, Mode, Row, Spec};
 use super::hud_nanodb::{stat, NanoDb, NanoInfo};
 use super::zone::Zone;
 use ao_formats::screens::{TextDb, CAT_GUI};
@@ -141,7 +141,7 @@ impl HudNano {
         let view = ListView::new(Mode::Grid, all.clone(), lv::grid_cols_for(cw, lv::ICON_32), ROWS, (1, false));
         let texts = MenuTexts { list_mode: self.text("ListMode"), auto_arrange: self.text("AutoArrange") };
         let title = self.text("Programs");
-        let w = ListWindow::open(gui, "NanoView", &title, (0, 0), client, &selector, selector_h, view, all, texts, MENU_BASE, self.screen, Some((rollup, KEY)))?;
+        let w = ListWindow::open(gui, Spec { name: "NanoView", title: &title, pos: (0, 0), client, top_xml: &selector, top_h: selector_h, texts, menu_base: MENU_BASE, screen: self.screen }, view, all, Some((rollup, KEY)))?;
         Ok(Win { w })
     }
 

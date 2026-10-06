@@ -79,6 +79,8 @@ pub struct Report {
     /// Local fog volumes of the whole playfield (also in `Scene::fog_model`).
     pub fogs: Vec<FogVolume>,
     pub terrain_cells: usize,
+    /// World size of one terrain cell (`AnarchyGround_t +0x8264`, metres); 0 for a dungeon. The playfield map draws 4 px per cell (docs/gui.md §12).
+    pub cell_size: f32,
     /// Scene instances of the terrain / dungeon room shells / water (after the sky objects, before every statel); the playfield
     /// map draws only these.
     pub ground: std::ops::Range<usize>,
@@ -156,6 +158,7 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
         let d = store.get(TILEMAP, rec.tilemap)?.ok_or_else(|| anyhow!("playfield {id}: no tilemap {}", rec.tilemap))?;
         let tm = ground::parse(&d).with_context(|| format!("tilemap {}", rec.tilemap))?;
         report.terrain_cells = tm.cells_x * tm.cells_z;
+        report.cell_size = tm.cell_size;
         report.ground.start = scene.instances.len();
         terrain::build(store, id, &tm, &mut scene, day_time)?;
         terrain = Some(tm);

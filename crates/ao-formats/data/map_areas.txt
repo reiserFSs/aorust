@@ -1,0 +1,130 @@
+# Gamecode.dll map ownership table: playfield id <TAB> area index (-1 = always owned) <TAB> area name
+# filled by FUN_100324d2 [GC 0x100324d2] into the std::map at 0x102e2730 (asm 0x10033c51..0x10034c3f: key = [EBP-0x10] at the CALL 0x100c1bb6, index = PUSH/POP ECX, MOV ECX,[EBP-0x18] or OR ECX,EBX (EBX = -1), name = MOV ECX,imm / MOV [EAX+4],ECX); docs/gui.md section 12.2
+760	-1	4 Holes
+585	-1	Aegean
+550	-1	Athen Shire
+545	-1	Athen West
+505	-1	Avalon
+605	-1	Belial Forest
+665	-1	Broken Shores
+590	-1	Central Artery Valley
+595	-1	Deep Artery Valley
+620	-1	Eastern Fouls Plains
+695	-1	Lush Fields
+625	-1	Milky Way
+560	-1	Mort
+565	-1	Newland Desert
+716	-1	Omni Forest
+705	-1	Omni-1 Entertainment
+570	-1	Perpetual Wastelands
+630	-1	Pleasant Meadows
+610	-1	Southern Artery Valley
+615	-1	Southern Fouls Hills
+635	-1	Stret East Bank
+795	-1	The Longest Road
+640	-1	Tir
+646	-1	Tir County
+650	-1	Upper Stret East Bank
+600	-1	Varmint Woods
+655	-1	Andromeda
+540	-1	Old Athen
+660	-1	Bay of Rome
+670	-1	Clondyke
+696	-1	Mutant Domain
+700	-1	Omni-1 HQ
+710	-1	Omni-1 Trade
+575	-1	Plains of Salt
+735	-1	Rome Blue district
+740	-1	Rome Green district
+730	-1	Rome Red district
+790	-1	Stret West Bank
+750	-1	The Reck
+755	-1	The Spur
+580	-1	Three Craters
+510	-1	Broken Crest
+800	-1	Borealis City
+566	-1	Newland City
+765	-1	Gangly Mountains
+685	-1	Galway County
+647	-1	Greater Tir County
+717	-1	Greater Omni Forest
+687	-1	Galway Shire
+791	-1	Holes In the Wall
+696	-1	Mutant Domain
+567	-1	Newland
+551	-1	Wailing Wastes
+586	-1	Wartorn Valley
+4530	64	Jobe Platform
+4531	65	the Harbor
+4532	66	the Market
+4533	67	the Plaza
+4534	68	a Hanging Garden condo
+4560	69	the Shadowlands portal
+4561	70	a shop in Jobe
+4540	71	South Elysium
+4541	72	West Elysium
+4542	73	Elysium
+4543	74	Eastern Elysium
+4544	75	Northern Elysium
+4545	76	Elysium Trial
+4005	77	Burning Marshes
+4605	78	Inferno
+4001	79	Jobe Research
+4310	80	Nascense Frontier
+4311	81	Nascense Wilds
+4312	82	Nascense Swamp
+4313	83	the research and training biosphere
+4006	84	Penumbra Forest
+4320	85	Penumbra Hollows
+4321	86	Penumbra Valley
+4880	87	Upper Scheol
+4881	88	Lower Scheol
+4872	89	Adonis City
+4873	90	Adonis Abyss
+4676	91	The Garden of Aban
+4677	92	The Garden of Thrak
+4678	93	The Garden of Enel
+4679	94	Enel's Sanctuary
+4680	95	The Garden of Shere
+4681	96	Shere's Sanctuary
+4682	97	The Garden of Ocra
+4683	98	The Garden of Roch
+4684	99	The Garden of Gilthar
+4685	100	Gilthar's Sanctuary
+4686	101	The Garden of Dalja
+4687	102	Dalja's Sanctuary
+4688	103	The Garden of Cama
+4689	104	Cama's Sanctuary
+4690	105	The Garden of Vanya
+4691	106	Vanya's Sanctuary
+4692	107	The Garden of Lord Galahad
+4693	108	Lord Galahad's Sanctuary
+4694	109	The Garden of Lord Mordeth
+4695	110	Lord Mordeth's Sanctuary
+4698	111	Ocra's Sanctuary
+556	-1	Coast of Peace
+656	-1	Coast of Tranquility
+4699	114	Roch's Sanctuary
+4696	115	Dante's Sanctuary
+4697	115	Macciavelli's Sanctuary
+4328	115	Caina
+4329	115	Antenora
+4330	115	Ptolemea
+4331	115	Judecca
+6101	-1	Three Craters West
+6102	-1	Three Craters East
+4367	-1	Sector 35
+4366	-1	Sector 28
+4365	-1	Sector 13
+6015	-1	Elder Hall
+6010	-1	Serenity Islands
+5001	-1	Playa del Desierto
+5002	-1	Montroyal
+4389	-1	Pandemonium
+4391	-1	Beast Lair
+8020	-1	The Pyramid of Home
+8030	-1	The Gate
+8050	-1	Foundry of Nightmares
+9042	-1	Xan Reliquary
+7001	-1	Arbiter's Hall
+8060	-1	Abandoned Research Facility

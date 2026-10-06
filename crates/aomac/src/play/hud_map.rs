@@ -10,12 +10,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use ao_formats::map_areas;
 use ao_formats::planetmap::PlanetMap;
 use ao_formats::screens::TextDb;
 use ao_formats::topdown::{self, GroundMap, NO_OWNER};
 use ao_gui::{CanvasItem, CanvasTip, Event, GfxId, Gui, MouseButton, WindowId, WindowSize};
 
 use super::hud::WindowKind;
+use super::hud_rollup::Rollup;
 use super::zone::Zone;
 
 /// Default client size of the Planet Map window (`Rect(0,0,_DAT_101b183c,_DAT_101b1840)` in `PlanetMapView_c` 0x1004d26a).
@@ -24,19 +26,23 @@ const PLANET_SIZE: (u32, u32) = (300, 400);
 const PLANET_POS: (i32, i32) = (100, 100);
 /// Default client size of the playfield map (`Rect(0,0,_DAT_101c0bcc,_DAT_101c0bd0)` in `PlayfieldMapView_c` 0x100eb905).
 const PF_SIZE: (u32, u32) = (179, 199);
-/// UNRESOLVED: the playfield window's first-time frame (only `PFMapWindowConfig`/`ShowButtons` is read by the ctor).
-const PF_POS: (i32, i32) = (140, 140);
+// First-time placement: `DockableView_c::LoadConfig` (`FUN_10038c98`, GUI 0x10038c98, called by the ctor with `"RollupArea"`) docks the view into the named dock via
+// `FUN_1003a26f` (dock lookup by name) when it exists; the centred screen rect it computes is only the fallback of a newly created dock. So the map is a rollup page.
 /// Height of the button row (the 27 px `GFX_GUI_PLANETMAP_*` buttons).
 const BUTTONS_H: u32 = 27;
 /// Longest side of the playfield map image.
 const PF_MAX_PX: u32 = 2048;
-/// UNRESOLVED: screen pixels per metre of the playfield map (the renderer's scale, `FUN_100e923a`, was not decoded).
-const PF_SCALE: f32 = 1.0;
+/// Screen pixels per terrain cell: `MapData_c::FUN_10042996` sets the content rect to `cells * pt - 1` (`pt` = 4 `_DAT_101b0840` when its first argument, `+8`, is set, else
+/// 2 `_DAT_101ae17c`) and `PFMapRenderer_c`'s ctor / `FUN_100e9729` scales the view by `_DAT_101b36b0 / pt` = 4 / pt, so one terrain cell is 4 px either way
+/// (cell size in metres: `AnarchyGround_t +0x8264`, [`ao_formats::playfield::Report::cell_size`]).
+const PF_PX_PER_CELL: f32 = 4.0;
+/// UNRESOLVED: the screen scale of a dungeon's room map (no terrain, `MapData_c +0xb0` = 0 so the content rect is never set).
+const PF_SCALE_ROOMS: f32 = 1.0;
 /// `N3Msg_GetMapCharacters(range 500)` in `FUN_100425eb`: dots are drawn for characters within this distance.
 const DOT_RANGE: f32 = 500.0;
 /// New planet map tiles decoded per frame.
 const TILES_PER_FRAME: usize = 6;
-/// Stat `MapNavigation` (140): UNRESOLVED guess for what makes `GetMapCharacters` succeed (the map upgrades of the help text).
+/// Stat `MapNavigation` (140): UNRESOLVED guess for what turns the own dot into the heading arrow (the map upgrades of the help text).
 const STAT_MAP_NAVIGATION: u32 = 140;
 
 const RUBIKA_INDEX: &str = "Normal/PlanetMapIndexNormal.txt";
@@ -83,12 +89,19 @@ struct Pf {
     center: [f32; 2],
     followed: Option<[f32; 2]>,
     arrows: HashMap<u8, GfxId>,
+    /// The own character owns the map of the playfield ([`map_areas::owns_map`]): `MapData_c +0x80` = `N3Msg_GetMapCharacters` succeeded.
+    owns: bool,
+    /// The map is shown; otherwise the "Map Not Available" text (`FUN_100eacda`: `!owns && !(land-control view on && land-control bitmap)`; the land-control
+    /// toggle (`RenderLandControlData` button of `MapControlView_c`, hidden by default) is not implemented, so it is `owns`).
+    available: bool,
 }
 
 struct Ground {
     map: GroundMap,
     /// Dungeon: rooms are lit by exploration.
     rooms: bool,
+    /// Screen pixels per metre.
+    scale: f32,
     visited: HashSet<u16>,
     current: u16,
     /// The image of the current (`current`, `visited.len()`) state.
@@ -101,16 +114,17 @@ pub(super) struct HudMap {
     planet: Option<Planet>,
     pf: Option<Pf>,
     closed: Vec<WindowKind>,
-    /// The ground image of the loaded playfield, built by the world loader from the scene it just decoded (`Report::ground`, [`ground_map`]).
-    ground_in: Option<(u32, GroundMap, bool)>,
+    /// The ground image of the loaded playfield, built by the world loader from the scene it just decoded (`Report::ground`, [`ground_map`]); the
+    /// `Option` is the terrain cell size in metres (`None`: a dungeon, rooms lit by exploration).
+    ground_in: Option<(u32, GroundMap, Option<f32>)>,
     /// The active mission's marker (playfield, world X/Z): `GlobalSignals+0x158` of `InventoryGUIModule_c::SlotGotNewMission` 0x100c69e2
     /// (`N3Msg_GetQuestWorldPos`), handler `FUN_1004b9c9`. UNRESOLVED: nothing feeds it yet (`QuestFullUpdateIIR_t` is not decoded).
     mission: Option<(u32, [f32; 2])>,
 }
 
-/// The playfield map's ground image: the `Report::ground` instances of the just-built `scene`, rendered from above; the flag is "dungeon rooms".
-pub(in crate::play) fn ground_map(scene: &ao_scene::Scene, report: &ao_formats::playfield::Report) -> Option<(GroundMap, bool)> {
-    topdown::render(scene, report.ground.clone(), PF_MAX_PX).map(|m| (m, report.terrain_cells == 0))
+/// The playfield map's ground image: the `Report::ground` instances of the just-built `scene`, rendered from above, and the terrain cell size (`None`: dungeon rooms).
+pub(in crate::play) fn ground_map(scene: &ao_scene::Scene, report: &ao_formats::playfield::Report) -> Option<(GroundMap, Option<f32>)> {
+    topdown::render(scene, report.ground.clone(), PF_MAX_PX).map(|m| (m, (report.terrain_cells != 0).then_some(report.cell_size)))
 }
 
 fn canvas_xml(name: &str, size: (u32, u32)) -> String {
@@ -123,8 +137,8 @@ impl HudMap {
     }
 
     /// The loader's ground image of playfield `pf` (replaces the one of an earlier playfield).
-    pub(super) fn provide_ground(&mut self, pf: u32, map: GroundMap, rooms: bool) {
-        self.ground_in = Some((pf, map, rooms));
+    pub(super) fn provide_ground(&mut self, pf: u32, map: GroundMap, cell: Option<f32>) {
+        self.ground_in = Some((pf, map, cell));
         if let Some(p) = self.pf.as_mut() {
             p.playfield = 0; // taken again by the next update
         }
@@ -133,10 +147,6 @@ impl HudMap {
     /// The mission marker (`FUN_1004b9c9`): a world position in a playfield, `None` when the mission ends (`FUN_1004bfbf`).
     pub(super) fn set_mission(&mut self, marker: Option<(u32, [f32; 2])>) {
         self.mission = marker;
-    }
-
-    pub(super) fn handles(kind: WindowKind) -> bool {
-        matches!(kind, WindowKind::Map | WindowKind::PlanetMap)
     }
 
     pub(super) fn is_open(&self, kind: WindowKind) -> bool {
@@ -152,7 +162,7 @@ impl HudMap {
         std::mem::take(&mut self.closed)
     }
 
-    pub(super) fn open(&mut self, gui: &mut Gui, kind: WindowKind) {
+    pub(super) fn open(&mut self, gui: &mut Gui, rollup: &mut Rollup, kind: WindowKind) {
         if self.is_open(kind) {
             return;
         }
@@ -181,10 +191,15 @@ impl HudMap {
                 }
             }
             WindowKind::Map => {
-                let xml = format!("<root><View view_layout=\"vertical\">{}</View></root>", canvas_xml("map", PF_SIZE));
-                match gui.open_tabbed_window_xml("PlayfieldMapView", PF_TITLE, &xml, PF_POS, WindowSize::Fixed(PF_SIZE.0, PF_SIZE.1)) {
+                let xml = format!(
+                    "<root><ViewSelector name=\"sel\">{}<TextView name=\"na\" value=\"&lt;center&gt;Map&amp;nbsp;Not&lt;br&gt;Available&lt;/center&gt;\" feature_flags=\"TVF_MULTILINE\" h_alignment=\"center\" v_alignment=\"center\"/></ViewSelector></root>",
+                    canvas_xml("map", PF_SIZE)
+                );
+                // `FUN_10038c98` (`DockableViewDockName` default "RollupArea"): a page of the rollup dock, not a free window
+                match rollup.open_page(gui, kind.dvalue(), PF_TITLE, &xml, PF_SIZE.1 as f32) {
                     Ok(window) => {
-                        self.pf = Some(Pf { window, playfield: 0, ground: None, center: [0.0; 2], followed: None, arrows: HashMap::new() })
+                        gui.select_child(window, "sel", Some(0));
+                        self.pf = Some(Pf { window, playfield: 0, ground: None, center: [0.0; 2], followed: None, arrows: HashMap::new(), owns: true, available: true })
                     }
                     Err(e) => eprintln!("playfield map: {e:#}"),
                 }
@@ -193,32 +208,30 @@ impl HudMap {
         }
     }
 
-    pub(super) fn close(&mut self, gui: &mut Gui, kind: WindowKind) {
+    fn close_planet(&mut self, gui: &mut Gui) {
+        if let Some(p) = self.planet.take() {
+            gui.close_window(p.window);
+        }
+    }
+
+    pub(super) fn close(&mut self, gui: &mut Gui, rollup: &mut Rollup, kind: WindowKind) {
         match kind {
-            WindowKind::PlanetMap => {
-                if let Some(p) = self.planet.take() {
-                    gui.close_window(p.window);
-                }
-            }
-            WindowKind::Map => {
-                if let Some(p) = self.pf.take() {
-                    gui.close_window(p.window);
-                }
-            }
+            WindowKind::PlanetMap => self.close_planet(gui),
+            WindowKind::Map if self.pf.take().is_some() => rollup.close_page(gui, kind.dvalue()),
             _ => {}
         }
     }
 
-    pub(super) fn close_all(&mut self, gui: &mut Gui) {
-        self.close(gui, WindowKind::PlanetMap);
-        self.close(gui, WindowKind::Map);
+    pub(super) fn close_all(&mut self, gui: &mut Gui, rollup: &mut Rollup) {
+        self.close(gui, rollup, WindowKind::PlanetMap);
+        self.close(gui, rollup, WindowKind::Map);
     }
 
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, _zone: &Zone) -> bool {
         if let Some(p) = self.planet.as_mut() {
             match ev {
                 Event::CloseRequested { window } if *window == p.window => {
-                    self.close(gui, WindowKind::PlanetMap);
+                    self.close_planet(gui);
                     self.closed.push(WindowKind::PlanetMap);
                     return true;
                 }
@@ -276,17 +289,12 @@ impl HudMap {
             }
         }
         if let Some(p) = self.pf.as_mut() {
-            match ev {
-                Event::CloseRequested { window } if *window == p.window => {
-                    self.close(gui, WindowKind::Map);
-                    self.closed.push(WindowKind::Map);
+            if let Event::CanvasDrag { window, view, dx, dy, .. } = ev {
+                if *window == p.window && view == "map" {
+                    let scale = p.ground.as_ref().map_or(PF_SCALE_ROOMS, |g| g.scale);
+                    p.center = [p.center[0] - dx / scale, p.center[1] + dy / scale];
                     return true;
                 }
-                Event::CanvasDrag { window, view, dx, dy, .. } if *window == p.window && view == "map" => {
-                    p.center = [p.center[0] - dx / PF_SCALE, p.center[1] + dy / PF_SCALE];
-                    return true;
-                }
-                _ => {}
             }
         }
         false
@@ -399,9 +407,19 @@ impl HudMap {
             p.followed = None;
         }
         if p.ground.is_none() && self.ground_in.as_ref().is_some_and(|g| Some(g.0) == zone.playfield) {
-            if let Some((_, map, rooms)) = self.ground_in.take() {
-                p.ground = Some(Ground { map, rooms, visited: HashSet::new(), current: NO_OWNER, shown: None });
+            if let Some((_, map, cell)) = self.ground_in.take() {
+                let scale = cell.filter(|&c| c > 0.0).map_or(PF_SCALE_ROOMS, |c| PF_PX_PER_CELL / c);
+                p.ground = Some(Ground { map, rooms: cell.is_none(), scale, visited: HashSet::new(), current: NO_OWNER, shown: None });
             }
+        }
+        // `MapData_c::FUN_100425eb`: `owns` = `N3Msg_GetMapCharacters` result (= `FUN_10057ca5`); `FUN_100eacda` swaps the map for the "Map Not Available" text
+        p.owns = map_areas::owns_map(zone.playfield, |s| zone.stat(s).unwrap_or(0));
+        if p.owns != p.available {
+            p.available = p.owns;
+            gui.select_child(p.window, "sel", Some(if p.available { 0 } else { 1 }));
+        }
+        if !p.available {
+            return;
         }
         let own = zone.own().map(|d| (d.pos, d.yaw));
         let here = own.map(|(pos, _)| [pos[0], pos[2]]);
@@ -414,7 +432,8 @@ impl HudMap {
         let (cw, ch) = gui.canvas_size(p.window, "map");
         let (cw, ch) = (cw as f32, ch as f32);
         let center = p.center;
-        let to_screen = |x: f32, z: f32| [cw / 2.0 + (x - center[0]) * PF_SCALE, ch / 2.0 - (z - center[1]) * PF_SCALE];
+        let scale = p.ground.as_ref().map_or(PF_SCALE_ROOMS, |g| g.scale);
+        let to_screen = |x: f32, z: f32| [cw / 2.0 + (x - center[0]) * scale, ch / 2.0 - (z - center[1]) * scale];
         let mut items = Vec::new();
         if let Some(g) = p.ground.as_mut() {
             if let Some(h) = here {
@@ -438,40 +457,39 @@ impl HudMap {
                 }
             };
             let a = to_screen(g.map.origin[0], g.map.origin[1]);
-            let (w, h) = (g.map.width as f32 * g.map.mpp * PF_SCALE, g.map.height as f32 * g.map.mpp * PF_SCALE);
+            let (w, h) = (g.map.width as f32 * g.map.mpp * scale, g.map.height as f32 * g.map.mpp * scale);
             items.push(CanvasItem::Image { id, src: [0.0, 0.0, g.map.width as f32, g.map.height as f32], dst: [a[0], a[1], a[0] + w, a[1] + h], alpha: 1.0 });
         }
         if let Some((pos, yaw)) = own {
-            let upgraded = zone.stat(STAT_MAP_NAVIGATION).is_some_and(|v| v != 0);
-            if upgraded {
-                // other characters nearby as 4x4 squares (`MapSquare` art), `FUN_100425eb` range 500
-                for (id, d) in &zone.dynels {
-                    if *id == zone.char_id as i32 {
-                        continue;
-                    }
-                    let (dx, dz) = (d.pos[0] - pos[0], d.pos[2] - pos[2]);
-                    if dx * dx + dz * dz > DOT_RANGE * DOT_RANGE {
-                        continue;
-                    }
-                    // UNRESOLVED: the original's choice among MAPSQUARE_CLAN/OMNI/NEUTRAL/MONSTER/TEAMMEMBER/SHOP (by art name and `Side`)
-                    let name = match (d.npc, d.side) {
-                        (true, _) => "GFX_GUI_MAPSQUARE_MONSTER",
-                        (_, 1) => "GFX_GUI_MAPSQUARE_CLAN",
-                        (_, 2) => "GFX_GUI_MAPSQUARE_OMNI",
-                        _ => "GFX_GUI_MAPSQUARE_NEUTRAL",
-                    };
-                    if let Some(g) = gui.gfx().id(name) {
-                        let s = to_screen(d.pos[0], d.pos[2]);
-                        items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, 4.0, 4.0], dst: [s[0].floor() - 2.0, s[1].floor() - 2.0, s[0].floor() + 2.0, s[1].floor() + 2.0], alpha: 1.0 });
-                    }
+            // other characters (`FUN_100425eb` list, drawn by `FUN_100ea626` only when `GetMapCharacters` succeeded = `owns`, true here): 4x4 squares (`MapSquare` art), range 500
+            for (id, d) in &zone.dynels {
+                if *id == zone.char_id as i32 {
+                    continue;
                 }
-                let s = to_screen(pos[0], pos[2]);
+                let (dx, dz) = (d.pos[0] - pos[0], d.pos[2] - pos[2]);
+                if dx * dx + dz * dz > DOT_RANGE * DOT_RANGE {
+                    continue;
+                }
+                // UNRESOLVED: the original's choice among MAPSQUARE_CLAN/OMNI/NEUTRAL/MONSTER/TEAMMEMBER/SHOP (by art name and `Side`)
+                let name = match (d.npc, d.side) {
+                    (true, _) => "GFX_GUI_MAPSQUARE_MONSTER",
+                    (_, 1) => "GFX_GUI_MAPSQUARE_CLAN",
+                    (_, 2) => "GFX_GUI_MAPSQUARE_OMNI",
+                    _ => "GFX_GUI_MAPSQUARE_NEUTRAL",
+                };
+                if let Some(g) = gui.gfx().id(name) {
+                    let s = to_screen(d.pos[0], d.pos[2]);
+                    items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, 4.0, 4.0], dst: [s[0].floor() - 2.0, s[1].floor() - 2.0, s[0].floor() + 2.0, s[1].floor() + 2.0], alpha: 1.0 });
+                }
+            }
+            let s = to_screen(pos[0], pos[2]);
+            // UNRESOLVED: what turns the own marker from the yellow dot (help text *The Map Window*) into the arrow: the own-marker draw of `PFMapRenderer_c` was not
+            // found (`FUN_100ea626` draws the list entries, type 9 = ?); we keep the guess that map upgrades (stat MapNavigation) do
+            if zone.stat(STAT_MAP_NAVIGATION).is_some_and(|v| v != 0) {
                 if let Some(id) = p.arrow(gui, yaw.unwrap_or(0.0)) {
                     items.push(CanvasItem::Image { id, src: [0.0, 0.0, 16.0, 16.0], dst: [s[0].floor() - 8.0, s[1].floor() - 8.0, s[0].floor() + 8.0, s[1].floor() + 8.0], alpha: 1.0 });
                 }
             } else {
-                // "You are represented by a yellow dot on the map" (help text *The Map Window*)
-                let s = to_screen(pos[0], pos[2]);
                 items.push(CanvasItem::Solid { dst: [s[0].floor() - 2.0, s[1].floor() - 2.0, s[0].floor() + 2.0, s[1].floor() + 2.0], color: 0xffff00, alpha: 1.0 });
             }
         }
@@ -570,7 +588,7 @@ fn lit(g: &Ground) -> Vec<u8> {
     if !g.rooms {
         return rgba;
     }
-    for (px, o) in rgba.chunks_exact_mut(4).zip(&g.map.owner) {
+    for (px, o) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(&g.map.owner) {
         if *o == NO_OWNER {
             continue;
         }
@@ -613,6 +631,7 @@ mod tests {
     struct Shot {
         gui: Gui,
         map: HudMap,
+        rollup: Rollup,
         zone: Zone,
     }
 
@@ -639,7 +658,7 @@ mod tests {
         }
         let labels = TextDb::load(&dir).unwrap();
         let gui = Gui::new(&dir, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
-        let s = Shot { gui, map: HudMap::new(&dir), zone: Zone::default() };
+        let s = Shot { gui, map: HudMap::new(&dir), rollup: Rollup::new(&dir, (640, 600)), zone: Zone::default() };
         let o = Offscreen::new(&s, (640, 600)).unwrap();
         Some((s, o))
     }
@@ -666,8 +685,8 @@ mod tests {
         let dir = ao_gui::client_dir();
         let store = ao_rdb::RecordStore::open(&dir).unwrap();
         let (scene, report) = ao_formats::playfield::load_playfield_report(&store, &dir, pf).unwrap();
-        let (map, rooms) = ground_map(&scene, &report).expect("no ground map");
-        s.map.provide_ground(pf, map, rooms);
+        let (map, cell) = ground_map(&scene, &report).expect("no ground map");
+        s.map.provide_ground(pf, map, cell);
     }
 
     /// Plays frames until the map window took the ground image.
@@ -682,7 +701,7 @@ mod tests {
     fn some_floor(s: &Shot) -> [f32; 3] {
         let g = &s.map.pf.as_ref().unwrap().ground.as_ref().expect("no ground map").map;
         let (mut sx, mut sy, mut n) = (0u64, 0u64, 0u64);
-        for (i, a) in g.rgba.chunks_exact(4).enumerate() {
+        for (i, a) in g.rgba.as_chunks::<4>().0.iter().enumerate() {
             if a[3] != 0 {
                 sx += i as u64 % g.width as u64;
                 sy += i as u64 / g.width as u64;
@@ -691,7 +710,7 @@ mod tests {
         }
         // the opaque pixel closest to the centroid
         let (cx, cy) = ((sx / n) as i64, (sy / n) as i64);
-        let best = g.rgba.chunks_exact(4).enumerate().filter(|(_, a)| a[3] != 0).map(|(i, _)| (i as i64 % g.width as i64, i as i64 / g.width as i64)).min_by_key(|&(x, y)| (x - cx).pow(2) + (y - cy).pow(2)).unwrap();
+        let best = g.rgba.as_chunks::<4>().0.iter().enumerate().filter(|(_, a)| a[3] != 0).map(|(i, _)| (i as i64 % g.width as i64, i as i64 / g.width as i64)).min_by_key(|&(x, y)| (x - cx).pow(2) + (y - cy).pow(2)).unwrap();
         [g.origin[0] + (best.0 as f32 + 0.5) * g.mpp, 0.0, g.origin[1] - (best.1 as f32 + 0.5) * g.mpp]
     }
 
@@ -699,10 +718,13 @@ mod tests {
     fn playfield_maps() {
         for (pf, tag) in [(4604u32, "arrival-hall"), (4582, "icc-shuttleport"), (566, "newland-city")] {
             let Some((mut s, mut o)) = shot() else { return };
-            s.map.open(&mut s.gui, WindowKind::Map);
+            s.map.open(&mut s.gui, &mut s.rollup, WindowKind::Map);
             provide_ground(&mut s, pf);
             own_at(&mut s, pf, [0.0; 3], 0.0);
             wait_ground(&mut s, &mut o);
+            let g = s.map.pf.as_ref().unwrap().ground.as_ref().unwrap();
+            // 4 px per 4 m terrain cell of Newland City; the dungeons keep the unresolved room scale
+            assert_eq!(g.scale, if pf == 566 { 1.0 } else { PF_SCALE_ROOMS }, "{tag}");
             let pos = some_floor(&s);
             own_at(&mut s, pf, pos, 0.6);
             png(&mut s, &mut o, &format!("map-{tag}"));
@@ -712,10 +734,23 @@ mod tests {
         }
     }
 
+    /// `FUN_100eacda`: a map the character does not own is replaced by the "Map Not Available" text (area 79 = bit 15 of `MapAreaPart3`).
+    #[test]
+    fn unowned_map_shows_not_available() {
+        let Some((mut s, mut o)) = shot() else { return };
+        s.map.open(&mut s.gui, &mut s.rollup, WindowKind::Map);
+        own_at(&mut s, 4001, [10.0, 0.0, 10.0], 0.0);
+        png(&mut s, &mut o, "map-not-available");
+        assert!(!s.map.pf.as_ref().unwrap().available);
+        s.zone.stats.insert(585, 1 << 15);
+        png(&mut s, &mut o, "map-owned-by-area-bit");
+        assert!(s.map.pf.as_ref().unwrap().available);
+    }
+
     #[test]
     fn planet_map_follows_the_character_and_zooms() {
         let Some((mut s, mut o)) = shot() else { return };
-        s.map.open(&mut s.gui, WindowKind::PlanetMap);
+        s.map.open(&mut s.gui, &mut s.rollup, WindowKind::PlanetMap);
         // Newland City, 100 m east of its origin
         own_at(&mut s, 566, [100.0, 0.0, 200.0], 0.0);
         png(&mut s, &mut o, "planet-566-level0");
@@ -766,7 +801,7 @@ mod tests {
     #[test]
     fn planet_map_buttons_tooltips_pressed_art_double_click_and_mission() {
         let Some((mut s, mut o)) = shot() else { return };
-        s.map.open(&mut s.gui, WindowKind::PlanetMap);
+        s.map.open(&mut s.gui, &mut s.rollup, WindowKind::PlanetMap);
         s.gui.set_screen_size(640, 600);
         own_at(&mut s, 566, [100.0, 0.0, 200.0], 0.0);
         png(&mut s, &mut o, "planet-window-title");

@@ -286,7 +286,7 @@ impl Gui {
                     pen += (r.width() as i32 + 1 - line.width) / 2;
                 }
                 for run in &line.runs {
-                    let c = run.color.map_or(text_col, |c| rgb(c));
+                    let c = run.color.map_or(text_col, rgb);
                     pen += self.draw_string(out, FONT, &run.text, pen, (vy + r.t) as i32 + line.y, c, 1.0, false);
                 }
             }

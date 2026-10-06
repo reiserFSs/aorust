@@ -47,15 +47,6 @@ pub fn template_of(action: u32) -> Option<u32> {
     ACTION_TEMPLATES.iter().find(|t| t.0 == action).map(|t| t.1).filter(|&i| i != 0)
 }
 
-/// The action whose template is `instance` (inverse of [`template_of`]; the `N3Msg_GetCorrectActionID` loop over the map `FUN_1003f1c0`).
-pub fn action_of_template(instance: u32) -> Option<u32> {
-    ACTION_TEMPLATES.iter().find(|t| t.1 == instance && instance != 0).map(|t| t.0)
-}
-
-/// Stat 588 of a template record = its menu category (`special_action_category` of `ActionMenu/CommandMenu.xml`; the constants
-/// `AM_CATEGORY_PERKS` 1, `AM_CATEGORY_NORMAL` 2, `AM_CATEGORY_ATTACK` 3 are registered by `ControlCenterModule_c::InitialiseMessage` GUI 0x1006a968).
-pub const STAT_CATEGORY: u32 = 588;
-
 /// `ItemIconView_c` timer text (`FUN_1003eebe`, formats at GUI 0x101b03a4 / 0x101b03ac): `"%2ds"` up to 60 s, else `"%2dm"` of `secs / 60`.
 pub fn timer_text(remaining_secs: i32) -> String {
     if remaining_secs < 0x3d { format!("{remaining_secs:2}s") } else { format!("{:2}m", remaining_secs / 60) }
@@ -141,11 +132,6 @@ impl SpecialList {
         }
     }
 
-    /// The list in creation order (what the Actions window and `GetSpecialActionList` give).
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
-    }
-
     /// `FUN_10042da4(x)`: the entry that has `x` as key or alt (the last one found) shows its other action; the change is queued.
     pub fn show_other(&mut self, x: u32) {
         let Some(e) = self.entries.iter_mut().rev().find(|e| e.key == x || e.alt == x) else { return };
@@ -187,13 +173,6 @@ impl SpecialList {
         self.show_other(if s.mode == mode::CRAWL { 0x14 } else { 0x8d });
         self.show_other(if s.fighting { 0xb } else { 0x4e });
         self.show_other(if s.camping { 0x51 } else { 0x52 });
-    }
-
-    /// `N3Msg_GetCorrectActionID` [GC 0x1002733c] / `FUN_1003f1c0`: the template a slot holding `instance` has to show now (the entry whose
-    /// key or alt is that template's action; unchanged when there is none).
-    pub fn correct_template(&self, instance: u32) -> u32 {
-        let Some(a) = action_of_template(instance) else { return instance };
-        self.entries.iter().rev().find(|e| e.key == a || e.alt == a).and_then(|e| template_of(e.shown)).unwrap_or(instance)
     }
 
     /// `FUN_1003f121(identity)`: the entry currently showing template `instance`.
@@ -247,12 +226,6 @@ impl SpecialList {
         self.recharge.retain(|r| r.remaining > 0.0);
     }
 
-    /// `N3Msg_GetSpecialActionState` [GC 0x100272b2] / `FUN_1003f156`: the action is unavailable (the slot is greyed with the timer) while
-    /// it has a recharge record; unknown identities are available (`FUN_1004af3b` path, not modelled).
-    pub fn unavailable(&self, instance: u32) -> bool {
-        self.find(instance).is_some_and(|e| self.progress(e.shown).is_some())
-    }
-
     /// `N3Msg_GetActionProgress` [GC 0x100275f7]: `(remaining / total, remaining seconds)` while recharging.
     pub fn progress(&self, action: u32) -> Option<(f32, i32)> {
         self.recharge.iter().find(|r| r.action == action).map(|r| (r.remaining / r.total, r.remaining.ceil() as i32))
@@ -264,7 +237,7 @@ mod tests {
     use super::*;
 
     fn shown(l: &SpecialList) -> Vec<u32> {
-        l.entries().iter().map(|e| e.shown).collect()
+        l.entries.iter().map(|e| e.shown).collect()
     }
 
     /// Initial list (`FUN_10043005` + the seven `FUN_10042da4` calls): every toggle shows its first action.
@@ -272,27 +245,23 @@ mod tests {
     fn initial_list_shows_the_first_action_of_each_toggle() {
         let l = SpecialList::new();
         assert_eq!(shown(&l), [3, 1, 0xb, 0x4c, 0x11, 0x13, 0x51, 0x14, 0x86]);
-        assert_eq!(l.entries()[2], Entry { key: 0xb, alt: 0x4e, shown: 0xb });
+        assert_eq!(l.entries[2], Entry { key: 0xb, alt: 0x4e, shown: 0xb });
     }
 
-    /// Sit shows Stand, release shows Sit; a hotbar slot holding Sit follows (`N3Msg_GetCorrectActionID`) and the change is queued once.
+    /// Sit shows Stand, release shows Sit; a hotbar slot holding Sit follows the queued change and the change is queued once.
     #[test]
     fn toggles_follow_the_state_and_are_found_by_template() {
         let mut l = SpecialList::new();
-        assert_eq!(l.correct_template(0xc1a8), 0xc1a8);
         l.show_other(0x4c); // sitting
         assert_eq!(l.take_changes(), [(0xc1a8, 0xc1a6)]);
-        assert_eq!(l.correct_template(0xc1a8), 0xc1a6, "the Sit slot now shows Stand");
-        assert_eq!(l.correct_template(0xc1a6), 0xc1a6);
         assert_eq!(l.find(0xc1a6).map(|e| e.key), Some(0x4c));
         assert!(l.find(0xc1a8).is_none(), "the identity of Sit is no longer listed (PerformSpecialAction would be ActionIsNotAvailable)");
         l.show_other(0x4d);
-        assert_eq!(l.correct_template(0xc1a6), 0xc1a8);
         l.show_other(0x4d);
-        assert!(l.take_changes().len() == 1, "a repeated state is not a change");
+        assert_eq!(l.take_changes(), [(0xc1a6, 0xc1a8)], "a repeated state is not a change");
         // camping: StartCamping -> FUN_10042da4(0x51) shows 0x52
         l.show_other(0x51);
-        assert_eq!(l.correct_template(0x14124), 0x1412b);
+        assert!(l.find(0x1412b).is_some());
     }
 
     /// The map `Action_e` -> template is a bijection on the filled entries (the hotbar derives `Action_e` from it).
@@ -300,7 +269,6 @@ mod tests {
     fn action_template_map_round_trips() {
         for (a, t) in ACTION_TEMPLATES {
             if t != 0 {
-                assert_eq!(action_of_template(t), Some(a), "{a:#x}");
                 assert_eq!(template_of(a), Some(t));
             }
         }
@@ -312,14 +280,14 @@ mod tests {
     fn equipment_adds_the_weapon_specials() {
         let mut l = SpecialList::new();
         l.sync_equipment(&[(0x800 | 0x1000, 5)], 0);
-        let keys: Vec<u32> = l.entries().iter().map(|e| e.key).collect();
+        let keys: Vec<u32> = l.entries.iter().map(|e| e.key).collect();
         assert_eq!(&keys[9..], [0x94, 0x96, 0x6e]);
         l.sync_equipment(&[(0x20000, -1)], 0);
-        assert_eq!(l.entries().iter().map(|e| e.key).skip(9).collect::<Vec<_>>(), [0x92]);
+        assert_eq!(l.entries.iter().map(|e| e.key).skip(9).collect::<Vec<_>>(), [0x92]);
         l.sync_equipment(&[(0x20000, -1)], CHAR_FLAG_BACKSTAB);
-        assert!(l.entries().iter().any(|e| e.key == 0x1e9));
+        assert!(l.entries.iter().any(|e| e.key == 0x1e9));
         l.sync_equipment(&[], 0);
-        assert_eq!(l.entries().len(), 9);
+        assert_eq!(l.entries.len(), 9);
     }
 
     /// Recharge: unavailable while a record exists, progress is `remaining / total`, the icon timer text is seconds below a minute.
@@ -327,15 +295,13 @@ mod tests {
     fn recharge_greys_the_slot_and_counts_down() {
         let mut l = SpecialList::new();
         l.sync_equipment(&[(0x800, -1)], 0);
-        let burst = 0x14123;
-        assert!(!l.unavailable(burst));
+        assert_eq!(l.progress(0x94), None);
         l.set_recharge(0x94, 20.0, 15.0);
-        assert!(l.unavailable(burst));
         assert_eq!(l.progress(0x94), Some((0.75, 15)));
         l.tick(10.0);
         assert_eq!(l.progress(0x94), Some((0.25, 5)));
         l.tick(6.0);
-        assert!(!l.unavailable(burst));
+        assert_eq!(l.progress(0x94), None);
         assert_eq!(timer_text(5), " 5s");
         assert_eq!(timer_text(60), "60s");
         assert_eq!(timer_text(61), " 1m");

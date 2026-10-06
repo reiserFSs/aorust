@@ -203,16 +203,6 @@ impl HudPerks {
         self.screen = screen;
     }
 
-    #[cfg(test)]
-    pub(super) fn is_open(&self) -> bool {
-        self.win.is_some()
-    }
-
-    #[cfg(test)]
-    pub(super) fn window(&self) -> Option<WindowId> {
-        self.win.as_ref().map(|w| w.window)
-    }
-
     pub(super) fn take_closed(&mut self) -> bool {
         std::mem::take(&mut self.closed)
     }

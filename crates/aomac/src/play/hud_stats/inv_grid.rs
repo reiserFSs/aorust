@@ -77,13 +77,6 @@ impl PositionMap {
             }
         }
     }
-
-    /// An item changes its bag slot (server `ContainerAddItemIIR_t`): its cell follows the identity of the new slot.
-    pub fn rename(&mut self, from: u32, to: u32) {
-        if let Some(c) = self.cells.remove(&from) {
-            self.cells.insert(to, c);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -122,7 +115,5 @@ mod tests {
         assert_eq!((m.get(0x43), m.at((2, 0))), (Some((1, 2)), None));
         m.move_cell((0, 0), (1, 2));
         assert_eq!((m.get(0x40), m.get(0x43)), (Some((1, 2)), Some((0, 0))));
-        m.rename(0x40, 0x50);
-        assert_eq!((m.get(0x40), m.get(0x50)), (None, Some((1, 2))));
     }
 }

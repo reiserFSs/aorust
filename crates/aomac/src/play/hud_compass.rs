@@ -71,7 +71,7 @@ fn marker_x(heading: f32, bearing: f32, tex: f32) -> f32 {
 /// Screen position of the window (`FUN_1006d433`: `MoveTo(floor(screenW * 0.73 - width / 2), 5)`, then `MoveInsideScreen`).
 pub(super) fn origin(screen: (u32, u32)) -> (i32, i32) {
     let x = (screen.0 as f32 * X_FACTOR - (W - 1.0) * 0.5).floor() as i32;
-    (x.clamp(0, screen.0.saturating_sub(W as u32).max(0) as i32), Y)
+    (x.clamp(0, screen.0.saturating_sub(W as u32) as i32), Y)
 }
 
 impl Compass {

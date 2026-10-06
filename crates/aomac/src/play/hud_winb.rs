@@ -6,8 +6,6 @@ use super::hud_perks::HudPerks;
 use super::hud_team::HudTeam;
 use super::zone::Zone;
 use ao_gui::{Event, Gui};
-#[cfg(test)]
-use ao_gui::WindowId;
 use ao_net::frame::Frame;
 use std::path::Path;
 
@@ -49,16 +47,6 @@ impl HudWinB {
     pub(super) fn close_all(&mut self, gui: &mut Gui) {
         for k in [WindowKind::Team, WindowKind::Perks, WindowKind::Faction] {
             self.close(gui, k);
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn window(&self, kind: WindowKind) -> Option<WindowId> {
-        match kind {
-            WindowKind::Team => self.team.window(),
-            WindowKind::Perks => self.perks.window(),
-            WindowKind::Faction => self.faction.window(),
-            _ => None,
         }
     }
 

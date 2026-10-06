@@ -53,7 +53,7 @@ pub struct RewardBox {
 }
 
 /// `Quest_t` as streamed (`FUN_100ab951`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Quest {
     /// The identity the list element starts with (kind 0xDAC3: `N3Msg_GetName` returns the quest's name buffer).
     pub id: Identity,
@@ -259,6 +259,64 @@ pub fn quest_list(r: &mut Reader, count: usize) -> Result<Vec<Quest>> {
         .collect()
 }
 
+/// `QuestIIR_t` [GC 0x1000e360] (`N3Msg_RemoveQuest` [GC 0x10019e5a], built by `FUN_1007662b`; Write `FUN_100765ad`: `i32` version `DAT_101c0364` = 1, `i32`, quest `Identity`, `Identity`).
+pub const QUEST_IIR: u32 = 0x212C_487A;
+/// `GiveQuestToMembersIIR_t` [GC 0x1000dcc6] (`N3Msg_UpdateNearbyTeamMembers` [GC 0x10017dfb]; Write `FUN_100ac9a3`: the quest's instance `u32`).
+pub const GIVE_QUEST_TO_MEMBERS: u32 = 0x7723_0927;
+/// `Identity_t` kind of a quest (`FUN_100ac89e`: only kind 0xdac3 with a non-zero instance is accepted).
+pub const QUEST_KIND: i32 = 0xDAC3;
+/// `Quest_t+0xa4` bit 8: `N3Msg_IsTeamMission` [GC 0x1001740d].
+const FLAG_TEAM: i32 = 1 << 8;
+/// `Quest_t+0xa4` bit 10: the quest cannot be removed (`N3Msg_RemoveQuest` sends nothing, it emits a feedback text).
+const FLAG_KEEP: i32 = 1 << 10;
+
+fn iir(key: u32, char_id: i32, body: impl FnOnce(&mut crate::wire::Writer)) -> Vec<u8> {
+    let mut w = crate::wire::Writer::default();
+    w.u32(key);
+    Identity { kind: super::outgoing::DYNEL_CHAR, instance: char_id }.write(&mut w);
+    w.u8(0);
+    body(&mut w);
+    w.0
+}
+
+/// `N3Msg_RemoveQuest(quest)`: deletes a mission.
+pub fn remove_quest(char_id: i32, quest: Identity) -> Vec<u8> {
+    iir(QUEST_IIR, char_id, |w| {
+        w.i32(1);
+        w.i32(0);
+        quest.write(w);
+        Identity::default().write(w);
+    })
+}
+
+/// `N3Msg_UpdateNearbyTeamMembers(quest)`: gives the mission to the nearby team members.
+pub fn give_quest_to_members(char_id: i32, quest: Identity) -> Vec<u8> {
+    iir(GIVE_QUEST_TO_MEMBERS, char_id, |w| w.u32(quest.instance as u32))
+}
+
+impl Quest {
+    /// `N3Msg_IsTeamMission`.
+    pub fn is_team(&self) -> bool {
+        self.value_a4 & FLAG_TEAM != 0
+    }
+
+    /// `N3Msg_RemoveQuest`'s guard: a quest with bit 10 set is kept.
+    pub fn removable(&self) -> bool {
+        self.value_a4 & FLAG_KEEP == 0
+    }
+
+    /// `N3Msg_QuestRemainingTime` (Interfaces 0x1000a874): for every action whose deadline (`+0x5c`, server time in seconds) is set and not past, the seconds left
+    /// (the last such action wins); `None` when there is none (the original returns -1).
+    pub fn remaining_secs(&self, server_now: u32) -> Option<u32> {
+        self.actions.iter().filter_map(|a| u32::try_from(a.ints[0]).ok().filter(|&t| t != 0 && server_now <= t)).next_back().map(|t| t - server_now)
+    }
+
+    /// `N3Msg_GetQuestWorldPos` [GC 0x1001ab61]: the first action's position, when it has a playfield.
+    pub fn world_pos(&self) -> Option<&WorldPos> {
+        self.actions.first().map(|a| &a.pos).filter(|p| p.playfield.kind != 0 || p.playfield.instance != 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +445,31 @@ mod tests {
         assert_eq!((a.id, a.floats[4], a.pos.playfield.instance, a.pos.x, a.pos.local), (9, 5.0, 4605, 1500, [10.0, 20.0, 30.0]));
         assert_eq!((q.list_60.as_slice(), q.value_a8, q.value_4c, q.value_b0, q.value_d4), (&[7][..], 5, 40, 50, 90));
         assert_eq!((q.identity_b4.kind, q.values_bc, q.list_c8.len(), q.factions.clone()), (9, [60, 61], 1, vec![(1, 2)]));
+    }
+
+    #[test]
+    fn remove_and_share_frames() {
+        let q = Identity { kind: QUEST_KIND, instance: 77 };
+        let b = remove_quest(5, q);
+        assert_eq!(b[..4], QUEST_IIR.to_be_bytes());
+        let mut r = Reader::new(&b[4..]);
+        assert_eq!((Identity::read(&mut r).unwrap(), r.u8().unwrap(), r.i32().unwrap(), r.i32().unwrap()), (Identity { kind: 0xC350, instance: 5 }, 0, 1, 0));
+        assert_eq!((Identity::read(&mut r).unwrap(), Identity::read(&mut r).unwrap(), r.remaining()), (q, Identity::default(), 0));
+        let b = give_quest_to_members(5, q);
+        assert_eq!((b[..4].to_vec(), b[b.len() - 4..].to_vec()), (GIVE_QUEST_TO_MEMBERS.to_be_bytes().to_vec(), 77u32.to_be_bytes().to_vec()));
+    }
+
+    #[test]
+    fn remaining_time_and_flags() {
+        let bytes = sample(15, "Rat Hunt", 1);
+        let mut q = quest_list(&mut Reader::new(&bytes), 1).unwrap().remove(0);
+        assert_eq!(q.remaining_secs(0), Some(31));
+        assert_eq!((q.remaining_secs(31), q.remaining_secs(32)), (Some(0), None));
+        q.value_a4 = 1 << 8;
+        assert!(q.is_team() && q.removable());
+        q.value_a4 = 1 << 10;
+        assert!(!q.is_team() && !q.removable());
+        assert_eq!(q.world_pos().map(|p| p.playfield.instance), Some(4605));
     }
 
     #[test]

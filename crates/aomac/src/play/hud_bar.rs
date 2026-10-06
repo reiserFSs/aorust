@@ -4,7 +4,7 @@
 //! Slot contents, icons and interaction: docs/gui.md §10 "Shortcut bar".
 
 use ao_gui::view::CanvasItem;
-use super::hud_special::{action_of_template, SpecialList};
+use super::hud_special::SpecialList;
 use ao_gui::{Gui, GfxId, InputEvent, MouseButton, WindowId, WindowSize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -69,8 +69,6 @@ pub(super) struct Slot {
     icon: Option<(GfxId, u32, u32)>,
     /// Macro text (`TextMacro_t+0x24`).
     text: String,
-    /// `Action_e` of a special action.
-    action: Option<u32>,
 }
 
 struct Drag {
@@ -142,16 +140,16 @@ fn first_login(gui: &mut Gui, store: Option<&ao_rdb::RecordStore>) -> [Option<Sl
 /// A text macro slot `{0xc789, id}`: `FUN_1003eb30(7)` icon GFX_GUI_ICON_MACRO (0xe3), the macro name as label, the command as use text.
 fn macro_slot(gui: &mut Gui, id: u32, name: &str, command: &str) -> Slot {
     let icon = gui.gfx_id("GFX_GUI_ICON_MACRO").map(GfxId).map(|g| (g, gui.gfx().size(g).0, gui.gfx().size(g).1));
-    Slot { kind: KIND_MACRO, instance: id, name: name.to_string(), icon, text: command.to_string(), action: None }
+    Slot { kind: KIND_MACRO, instance: id, name: name.to_string(), icon, text: command.to_string() }
 }
 
 /// `N3Msg_GetName` + stat `Icon` of the rdb 1000020 record `{0xF4254, instance}` (`GetItemByTemplate` maps kind 0xdeb0 to the item
 /// template type, GC 0x17aae), icon image from rdb 1010008. The `Action_e` is the key of the template in `FUN_100428ad`'s map
-/// ([`action_of_template`]; the records' stat 59 is only right for the base actions, the perk / skill templates 0x14120.. all hold the default 0x11).
+/// (the list entry showing it, [`SpecialList::find`], names the `Action_e`; the records' stat 59 is only right for the base actions, the perk / skill templates 0x14120.. all hold the default 0x11).
 pub(super) fn special_action(gui: &mut Gui, store: &ao_rdb::RecordStore, instance: u32) -> Option<Slot> {
     let t = ao_formats::dynel_visual::item_template(store, instance).ok()??;
     let icon = t.stat(STAT_ICON).filter(|&i| i > 0).and_then(|i| icon_image(gui, store, i as u32));
-    Some(Slot { kind: KIND_SPECIAL_ACTION, instance, name: t.name.unwrap_or_default(), icon, text: String::new(), action: action_of_template(instance) })
+    Some(Slot { kind: KIND_SPECIAL_ACTION, instance, name: t.name.unwrap_or_default(), icon, text: String::new() })
 }
 
 /// rdb 1010008 PNG as a GUI texture (`Format_e 2`: pure green is the colour key, `SpriteInfo_t::ConvertImage` [DS 0x1007b8e2]).
@@ -160,7 +158,7 @@ pub(super) fn icon_image(gui: &mut Gui, store: &ao_rdb::RecordStore, id: u32) ->
     let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
     let mut rgba = img.into_raw();
-    for p in rgba.chunks_exact_mut(4) {
+    for p in rgba.as_chunks_mut::<4>().0 {
         if p[..3] == [0, 255, 0] {
             p[3] = 0;
         }
@@ -243,7 +241,7 @@ impl ShortcutBar {
     fn slot_at(&self, gui: &Gui, x: f32, y: f32) -> Option<usize> {
         let (px, py) = gui.window_pos(self.window);
         let (lx, ly) = (x - px as f32 - CHROME_W, y - py as f32);
-        (lx >= 0.0 && ly >= 0.0 && ly < BAR_H && lx < PITCH * SLOTS as f32).then(|| (lx / PITCH) as usize)
+        ((0.0..PITCH * SLOTS as f32).contains(&lx) && (0.0..BAR_H).contains(&ly)).then(|| (lx / PITCH) as usize)
     }
 
     /// Use of a slot (`FUN_100d79c9`): a special action is looked up by its identity in the character's list (`FUN_1004256c` via
@@ -436,8 +434,6 @@ mod tests {
     #[test]
     fn first_login_layout_and_actions() {
         assert_eq!(FIRST_LOGIN.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0, 1, 2, 3, 9]);
-        assert_eq!(action_of_template(0x14124), Some(0x51));
-        assert_eq!(action_of_template(0xc1a8), Some(0x4c));
     }
 
     /// The first-login slots carry the `Action_e` of their rdb templates: Start Combat 0xb, Walk 0x11, Sit 0x4c, Suspended Animation camp 0x51.
@@ -450,7 +446,8 @@ mod tests {
         let mut gui = Gui::new(&dir, None).unwrap();
         let store = ao_rdb::RecordStore::open(&dir).ok();
         let slots = first_login(&mut gui, store.as_ref());
-        let actions: Vec<_> = slots.iter().flatten().map(|s| s.action).collect();
+        let list = SpecialList::new();
+        let actions: Vec<_> = slots.iter().flatten().map(|s| list.find(s.instance).filter(|_| s.kind == KIND_SPECIAL_ACTION).map(|e| e.shown)).collect();
         assert_eq!(actions, [Some(0xb), Some(0x11), Some(0x4c), None, Some(0x51)]);
     }
 

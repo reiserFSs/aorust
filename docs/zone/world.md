@@ -391,14 +391,61 @@ the corpse to the dead character's relative position when closer than a threshol
   (the 3D viewport is off; black is [INFERENCE]). The HUD and chat stay. The new playfield loads in the background (a result for a
   replaced playfield is dropped); when it is ready the scene/sky/camera are replaced, `Hud::provide_ground` refreshes the map, the player is
   rebuilt from the new own `SimpleCharFullUpdate`, a red `EnteringPF` / `EnteringNewArea` line is printed, `teleporting` clears and the
-  `CharInPlay` countdown (> 10 frames) starts. Without `AliveMessage` plumbing the input is unlocked at that point, not at the echo.
+  `CharInPlay` countdown (> 10 frames) starts. The viewport / input stay off until the echo (`AliveMessage`, below).
   Tests: `flow::tests::{second_playfield_keeps_the_interface_and_hides_the_world, zone_redirect_starts_the_teleport,
   teleport_iir_starts_the_zone_change_only_with_a_destination}`, `ao_net::n3::teleport::tests`.
-* **Not implemented** (reasons): (1) the client-initiated path, i.e. the teleportal test (`IsPosInTeleportal` [N3 0x1001a86a] on the
-  own vehicle position each frame, gate `FUN_1005859d`, `MovementChanged(0x16)`, the `TeleportTrier_t` timeout and the
-  `Feedback_AreaChangeNotInitiated` text; the portal polygons are decoded in `collision/kd.rs` but unused): the live run (docs/play.md)
-  shows the server changes the playfield from the movement stream anyway, so the app only reacts to what the server sends; (2) no
-  dungeon test for `EnteringNewArea` (the `Layout` of the loaded playfield is not carried to the flow); (3) in-world audio is not wired to
-  playfields yet (`Audio::set_playfield` is only used by the offline viewer, `main.rs`), so the zone-change music/ambience switch of the
-  original has no app counterpart; (4) `SaveAllPrefs` and the two `ParseList`/present passes are not reproduced (no effect on state/visuals
-  we draw).
+* **Client-initiated path (RE, N3.dll / Gamecode.dll / GUI.dll)** — implemented (`Player::teleport_try`, `Zone::{start_teleport_try, run_trier}`,
+  `Collision::in_teleportal`, `Play::{teleport_started, teleport_ended}`):
+  * **Teleportal data**: `n3SurfaceResource_t::ReadVersion4/5` [N3 0x10015e17 / 0x10015fc1] read an optional `PortalArea_t` (+0x34: polygon of
+    `Vector3_t`, `FUN_1001b3e6` / `FUN_1001b473`) and the destination bits (+0x40: low 16 bits = playfield, +0x38; localizer type
+    `0x186a1` at +0x3c). `GetTeleportalSurface` (+0x30, a KD tree) is never written by either reader. `n3Zone_t::IsPosInTeleportal`
+    [N3 0x1001a86a] asks the zone's polygon (`FUN_1001b21a` [N3 0x1001b21a]: crossing parity of the +x ray in the x/z plane, `y` ignored; an
+    edge counts when `(z0-z)*(z1-z) < 0`, `|dz| >= 1e-6` [f32 @0x1003da14] and its x at `z` exceeds `p.x`). The client never uses the
+    destination bits for the try: the server decides the target. Survey (`cargo run --release -p ao-formats --example portal_survey`): 8948
+    of 234349 surface records carry a polygon (4 to 6 corners; the same polygon is stored in every zone it overlaps), in playfields
+    505..800 (49 of them), 4001/4005/4006, 4310-4312/4320/4321, 4504/4505/4540-4544, 4605, 4872/4873, 6101/6102 and 6550/6551.
+    **None in Newland City 4582 / 4604**: the Newland whompahs (and the grid) are click-used dynels, not teleportals, so they are not part of
+    this path (a click-use goes through the dynel use interaction, not through the movement stream).
+    `Collision::in_teleportal(scene_pos)` picks the zone (`n3Dynel_t::GetZone`: zone grid outdoors via `zone::grid_zone`, `PosToRoom` or 0 in
+    a dungeon) and runs the same parity test. Tests: `collision::portal::tests`, `tests/collision_real.rs::collision_teleportal_of_real_polygons`.
+  * **Per frame** (`FUN_1005b016` [GC], the own dynel's `Run`, calls `FUN_100585ee` [GC 0x100585ee]): `IsPosInTeleportal(vehicle global pos)`
+    then the gate `FUN_1005859d` [GC 0x1005859d]: not an NPC (`+0x21c`), dynel flag bit 17 (`0x20000`) clear, not dying (`+0x80`), stat
+    `InPlay` (0xC2) != 0 and dead flag `0x20` clear (set by `CharDie_t`). [UNRESOLVED] bit 17 has no writer in Gamecode.dll (a `PUSH 0x20000`
+    scan finds two readers masking `Features` bit 2 in `FUN_10044842` / `FUN_10044a07` and one clear in `FUN_1005bea6`): taken as clear.
+    Stat `InPlay` comes from the own `SimpleCharFullUpdate` (`FUN_10077af2`: `VisualFlags >> 1 & 1`) and the `CharInPlay` echo.
+  * **`StartTeleportTry`** [GC 0x10018f9a] (when the playfield exists and no `TeleportTrier_t` lives): `N3Msg_MovementChanged(0x16, 0, 0, true)`
+    (our `Movement::action(SYNC)`, a position sync without FSM transition), `new TeleportTrier_t(30.0)` (f32 @GC 0x10157500) added to the
+    playfield, `StartTryingTeleport` [GC 0x10037d48]: elapsed := 0, GUI event 5 (= `TeleportStartedMessage`) and, with a control dynel,
+    `FUN_10059ae5(1)` (full stop while moving). The playfield **keeps running** (no `StopPlayfield`): the app's `teleport_started` prints
+    `ChangingArea`, clears the target, stops the input and hides the viewport, the old world stays loaded.
+  * **`TeleportTrier_t::RunFunction`** [GC 0x10037e29] adds the frame time (`n3EngineClient_t+0x68`) and past 30 s runs `TeleportFailed`
+    [GC 0x10037db7]: `n3Fobj_t::Die` (`+0x14 := 1`; `n3Fobj_t::Run` [N3 0x10007e07] then removes the child), GUI event 6 (=
+    `TeleportEndedMessage`: `m_isTeleporting := false`, `Entering ...` line, `CharInPlay` countdown re-armed) and, for the control dynel,
+    `FUN_10058b00("Feedback_AreaChangeNotInitiated")` (category 110, System window line, no colour). A still-standing character starts a new try
+    in the next frame (the original loops the same way every 30 s). `StartTeleportConfirmed` / `StartTeleportFailed` [GC 0x10016aa4 /
+    0x10016a8e] (`TeleportProceeding` / `TeleportFailed` from outside) have **no caller** in any client DLL (exports only), so a try ends by the
+    timeout or by the playfield being stopped (`Zone::reset_world` drops the trier like `StopPlayfield` kills its children). The live run
+    (docs/play.md) shows the server changes the playfield from the movement stream; with a try pending that is the `n3TeleportIIR_t` path above.
+  * Tests: `zone::tests::teleport_trier_runs_once_and_times_out`; the player/flow glue needs the client's data (`flow::tests`).
+* **`AliveMessage` / input unlock** (`Play::alive`, `Zone::on_frame` -> `ZoneEvent::Alive`): the server relays our own `CharInPlayIIR_t` back
+  (live capture `docs/captures/zone_enter_ithaca.rec`: sent at 39975, relayed at 40079, sender = receiver = own id). `CharInPlayIIR_t::Activate`
+  [GC 0x1007264d]: `EnableVisibility`, `SetStat(0xC2, 1)`, and for the control dynel GUI event `0xa5` = `AliveMessage` [GUI 0x10028543]:
+  `InputConfig_t::m_isAlive := true`, closes module `0x1b` if active, `SetStaticInputMode(8)`, `Activate3DViewPort`,
+  `InputConfig_t::EnableUserInput` [GUI 0x10019ce8] (`+0x18 := 0`, key states reset, idle timer started), countdown flag `DAT_102760cd := 0`.
+  The lock side: `TeleportStartedMessage` sets `InputConfig+0x18 := 1` (`isUserInputStopped`) and `DisplaySystem+0x44 := 0`;
+  `WaitingToStartGame` [GUI 0x10027d73] clears static input mode `0x3a` (set by `CharCreateModule_t::InitialiseMessage` [GUI 0x1011ba81]
+  with `EnableUserInput`) after `N3Msg_SendInPlayMessage` succeeded. **No timeout** on the echo exists in the original (the 120 s of
+  `WaitingToStartGame` only bound the *send*), so after a zone change the viewport stays off and the input stopped until the echo arrives; the
+  port replicates that. App: `Play::awaiting_alive` (= `+0x18` and the viewport; set by `teleport_started`, cleared by `alive`) and
+  `Play::login_input_mode` (= mode `0x3a`; set at the zone hand-off, cleared when `CharInPlay` is sent); `Play::game_input_open` gates the
+  game keys / mouse of the `Player` (releases always pass: the port's stand-in for `EnableUserInput` resetting the key states); the black
+  quad follows `awaiting_alive`. [UNRESOLVED] what static mode `0x3a` itself changes in `InputConfig_t::CheckMode` consumers (the
+  consumer of the mode bytes was not traced; the port locks the game input like `+0x18`). Test: `zone::tests::own_char_in_play_relay_is_the_alive_event`.
+* **Zone-change audio**: `PlayfieldInit` [GC 0x10016e2c] -> `SandyInterfaceModule_t::ActivateGameZone`: when the new world appears the loader
+  thread's `ao_audio::PlayfieldAudio::load(store, id, Report::sounds)` is handed to `Audio::set_playfield` (`Bg::Info`, `Play::frame`'s
+  world-ready block; `None` leaves the playfield), which stops the old ambience and follows the new districts / emitters through the existing
+  `Audio::update(dt, camera, zone clock)`. Not wired in-world: the weather driver of the offline viewer (`audio.set_weather` / rain, wind
+  levels), see docs/formats.md §audio.
+* **`EnteringNewArea`**: `Report::dungeon` (`Layout::Dungeon`: the playfield record's tilemap id differs from its own id) travels through `Bg::Info`
+  to `Play::dungeon`; a dungeon always says `EnteringNewArea` like `N3Msg_IsDungeon`, also when `pfnrmap.dat` names it.
+* **Not implemented**: `SaveAllPrefs` and the two `ParseList`/present passes of `TeleportStartedMessage` (no effect on state/visuals we draw).

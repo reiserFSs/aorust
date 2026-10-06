@@ -10,21 +10,18 @@
 //!
 //! The pick: the GUI hands the normalised mouse position to `N3Msg_SetMousePos` (Gamecode 0x1001613b) → `n3Camera_t::SetMousePos`
 //! (N3 0x10020571): ray direction `(tan(fov/2)·x, tan(fov/2)/aspect·y, 1)` rotated by the camera, length `VisualCamera_t::
-//! GetLengthOfViewcone`, cast into the collision world; the hit's identity is "the object under the mouse"
-//! (`InputConfig_t::CheckObjectUnderMouse` 0x10019f00 decides the pointer from it). The collision meshes of the dynels are not
-//! available here, so [`pick`] intersects the ray with one capsule per dynel (UNRESOLVED GUESS: [`CAPSULE_HEIGHT`], [`CAPSULE_RADIUS`]).
+//! GetLengthOfViewcone`, cast against the dynels' bounding boxes (`hud_pick.rs`: `n3VisualDynel_t::FineCollisionCheck`); the hit
+//! list's entry under `GetObjectUnderColLine` is "the object under the mouse" (`InputConfig_t::CheckObjectUnderMouse` 0x10019f00
+//! decides the pointer from it, `hud_cursor.rs`).
 
-use super::zone::{scene_pos, DynelState, Zone};
+use super::zone::{DynelState, Zone};
 use ao_formats::stats;
 use ao_gui::{Gui, InputEvent, MouseButton, WindowId, WindowSize};
 use ao_render::{Camera, Vec3};
 use ao_scene::Lens;
-use std::collections::HashMap;
 
-/// Pick capsule of a character: feet to head (m). UNRESOLVED GUESS (the original ray-casts the collision mesh).
-pub const CAPSULE_HEIGHT: f32 = 1.8;
-/// Pick capsule radius (m). UNRESOLVED GUESS, slightly generous so that a click on the body always hits.
-pub const CAPSULE_RADIUS: f32 = 0.5;
+/// `GetLengthOfViewcone` (far − near) at the default view distance: 800 − 0.5 m (docs/formats.md, statel LOD).
+const VIEW_LENGTH: f32 = 799.5;
 /// Pointer path length (px) up to which a press and release on the world still is a click: `ActionViewMouseHandler_c`
 /// accumulates the mouse-look movement in `+0x1c` and `FUN_1002c469` requires it `< 0.02` (GUI `_DAT_101aeaf4`) in the units of
 /// `InputConfig_t::FrameProcess` (raw counts / 1000), i.e. 20 counts; counts and GUI pixels are taken as equal.
@@ -34,6 +31,8 @@ const CLICK_PATH: f32 = 20.0;
 pub struct Ray {
     pub origin: Vec3,
     pub dir: Vec3,
+    /// Length of the line: `VisualCamera_t::GetLengthOfViewcone` = far − near.
+    pub len: f32,
 }
 
 /// `n3Camera_t::SetMousePos` 0x10020571: the ray through pixel `mouse` of a `vp` sized viewport. `Lens::fov` is the horizontal
@@ -43,43 +42,19 @@ pub fn pick_ray(cam: &Camera, lens: &Lens, vp: (f32, f32), mouse: (f32, f32)) ->
     let (nx, ny) = (mouse.0 / vp.0 * 2.0 - 1.0, 1.0 - mouse.1 / vp.1 * 2.0);
     let half_w = if lens.horizontal { (lens.fov * 0.5).tan() } else { (lens.fov * 0.5).tan() * aspect };
     let dir = cam.forward() + cam.right() * (half_w * nx) + cam.up() * (half_w / aspect * ny);
-    Ray { origin: cam.pos, dir: dir.normalize() }
+    Ray { origin: cam.pos, dir: dir.normalize(), len: lens.far.map_or(VIEW_LENGTH, |f| f - lens.near) }
 }
 
-/// Distance along the ray (`dir` normalised) to the capsule `a`–`b` of `radius`, if it is hit in front of the origin.
-pub fn ray_capsule(ray: &Ray, a: Vec3, b: Vec3, radius: f32) -> Option<f32> {
-    let (u, v, w0) = (ray.dir, b - a, ray.origin - a);
-    let (bb, c, d, e) = (u.dot(v), v.dot(v), u.dot(w0), v.dot(w0));
-    let denom = c - bb * bb;
-    // closest points of the ray (s >= 0) and the segment (t in 0..=1)
-    let mut t = if denom > 1e-6 { ((e - bb * d) / denom).clamp(0.0, 1.0) } else { 0.0 };
-    let mut s = (t * bb - d).max(0.0);
-    if c > 1e-9 {
-        t = ((e + s * bb) / c).clamp(0.0, 1.0);
-        s = (t * bb - d).max(0.0);
-    }
-    let dist = (ray.origin + u * s - (a + v * t)).length();
-    (dist <= radius).then_some(s)
+/// Every character hit by the selection line, nearest first (instance ids): the list `n3Camera_t` keeps at `+0x244` and refills
+/// through its `n3CameraCollLine_t`, the bounding boxes and the order of [`super::hud_pick`].
+pub fn pick_all(ray: &Ray, zone: &Zone) -> Vec<i32> {
+    let bodies = zone.world.pick_bodies(zone.char_id as i32);
+    super::hud_pick::hits(&bodies, ray.origin, ray.dir, ray.len)
 }
 
-/// Capsule (feet, head) of a dynel in scene space.
-pub fn capsule(d: &DynelState) -> (Vec3, Vec3) {
-    let foot = Vec3::from(scene_pos(d.pos));
-    (foot + Vec3::Y * CAPSULE_RADIUS, foot + Vec3::Y * (CAPSULE_HEIGHT - CAPSULE_RADIUS))
-}
-
-/// Every dynel hit by `ray`, nearest first (instance ids): the list `n3Camera_t` keeps at `+0x244` and refills on every
-/// `SetMousePos` through its `n3CameraCollLine_t` (the order of the original's list is [INFERENCE]: by distance along the line).
-pub fn pick_all(ray: &Ray, dynels: &HashMap<i32, DynelState>) -> Vec<i32> {
-    let mut hits: Vec<(f32, i32)> = dynels
-        .iter()
-        .filter_map(|(id, d)| {
-            let (a, b) = capsule(d);
-            ray_capsule(ray, a, b, CAPSULE_RADIUS).map(|s| (s, *id))
-        })
-        .collect();
-    hits.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
-    hits.into_iter().map(|h| h.1).collect()
+/// `GetObjectUnderColLine` (N3 0x1002069c): the current target when it is in the hit list, else the first entry (void without hits).
+pub fn object_under(list: &[i32], current: Option<i32>) -> Option<i32> {
+    current.filter(|c| list.contains(c)).or_else(|| list.first().copied())
 }
 
 /// What a plain left click selects: `n3Camera_t::GetNextTarget` (N3 0x10020723) on the hit list, `ActionViewMouseHandler_c`'s release
@@ -91,6 +66,15 @@ pub fn click_target(list: &[i32], current: Option<i32>) -> Option<i32> {
         Some(i) => Some(list[(i + 1) % list.len()]),
         None => list.first().copied(),
     }
+}
+
+/// What a world click did ([`HudTarget::world_click`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorldClick {
+    /// The character became the target.
+    Select(i32),
+    /// Shift + click: the info page of the character was requested; the selection is unchanged.
+    Info(i32),
 }
 
 /// Stat `PetMaster` (196 = 0xc4) and `TowerType` (388 = 0x184), read by `N3Msg_CanClickTargetTarget`.
@@ -261,6 +245,8 @@ pub(super) struct HudTarget {
     tot_down: bool,
     /// The hostile dock's Attack button was clicked (`PerformSpecialAction(0xb)`), taken by the HUD.
     pub(super) attack: bool,
+    /// A Shift + click asked the info page of this character (`InfoViewModule_c::ShowURL("charid://50000/<id>")`), taken by the HUD.
+    pub(super) info: Option<i32>,
 }
 
 fn esc(s: &str) -> String {
@@ -270,7 +256,7 @@ fn esc(s: &str) -> String {
 impl HudTarget {
     /// Creates the two health-bar windows (`CCFriendlyHealthBar` / `CCHostileHealthBar`) and fills the control-centre target docks.
     pub(super) fn new(gui: &mut Gui, cc: WindowId, size: (u32, u32)) -> anyhow::Result<Self> {
-        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false, attack: false };
+        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (-1.0, -1.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false, attack: false, info: None };
         t.create_bars(gui)?;
         for (dock, d) in [("LeftTargetCtrlDock", &t.docks[0]), ("RightTargetCtrlDock", &t.docks[1])] {
             let src = format!(
@@ -377,23 +363,28 @@ impl HudTarget {
         }
     }
 
-    /// A plain left click on the world (not on the GUI), `ActionViewMouseHandler_c`'s release slot `FUN_1002c469` (GUI 0x1002c469):
-    /// the hit list under the pointer is [`pick_all`]; [`click_target`] chooses, and the choice becomes the target (`Send(0x1e,
-    /// 0x126)` → `TargetingModule_t::SetTargetMessage`). No hit = nothing happens (no deselect). The handler's other branches need the
-    /// modifier keys, which the frontend does not report with mouse events yet: Shift+click opens the character / item info page
-    /// (`InfoViewModule_c::ShowURL("charid://50000/<id>")`, no selection), Ctrl+click on a character selects it and then calls
-    /// `N3Msg_SwitchTarget` = `DefaultAttack(target, true)`; a right-button release runs `N3Msg_DefaultActionOnDynel` (characters) /
-    /// `N3Msg_UseItem` (anything else), and a left double click does the former when `DoubleclickAction` (default true).
-    pub(super) fn world_click(&mut self, zone: &mut Zone, cam: &Camera, lens: &Lens, vp: (u32, u32), mouse: (f32, f32)) -> bool {
+    /// A left click on the world (not on the GUI), `ActionViewMouseHandler_c`'s release slot `FUN_1002c469` (GUI 0x1002c469): the hit
+    /// list under the pointer is [`pick_all`] (no hit = nothing happens, no deselect). Plain click: [`click_target`] chooses and the
+    /// choice becomes the target (`Send(0x1e, 0x126)` → `TargetingModule_t::SetTargetMessage`). **Shift**: the object under the pointer
+    /// ([`object_under`]) is not selected, its info page is requested (`InfoViewModule_c::ShowURL("charid://50000/<id>")`) →
+    /// [`WorldClick::Info`]. **Ctrl / Alt** (the `& 0xc` qualifier, which bit is which is unresolved) on a character: that object
+    /// itself is selected, not the next one in the list, and the caller attacks it (`N3Msg_SwitchTarget` = `DefaultAttack(target,
+    /// true)`, `flow.rs` via `Hud::take_click`). The right button and the double click (`N3Msg_DefaultActionOnDynel`) are
+    /// `interact_play.rs`.
+    pub(super) fn world_click(&mut self, zone: &mut Zone, cam: &Camera, lens: &Lens, vp: (u32, u32), mouse: (f32, f32), mods: ao_gui::Modifiers) -> Option<WorldClick> {
         let ray = pick_ray(cam, lens, (vp.0 as f32, vp.1 as f32), mouse);
-        let list = pick_all(&ray, &zone.dynels);
-        match click_target(&list, zone.target) {
-            Some(id) => {
-                self.select(zone, Some(id));
-                true
-            }
-            None => false,
+        let list = pick_all(&ray, zone);
+        self.click_list(zone, &list, mods)
+    }
+
+    /// [`HudTarget::world_click`] on a given hit list.
+    fn click_list(&mut self, zone: &mut Zone, list: &[i32], mods: ao_gui::Modifiers) -> Option<WorldClick> {
+        if mods.shift {
+            return object_under(list, zone.target).map(WorldClick::Info);
         }
+        let id = if mods.ctrl || mods.alt { object_under(list, zone.target) } else { click_target(list, zone.target) }?;
+        self.select(zone, Some(id));
+        Some(WorldClick::Select(id))
     }
 
     /// Raw mouse input before the GUI: dock buttons (hit-tested on their canvases) and world clicks. Returns `Some(pos)` when a
@@ -490,6 +481,28 @@ impl HudTarget {
             self.select(zone, Some(id));
         }
         true
+    }
+
+    /// `MousePointerModule_t` for this frame: the pointer sprites for the dynel under the mouse ([`object_under`] of the hit list,
+    /// `CheckObjectUnderMouse`), appended to `list`, and the request to hide the OS cursor. The pointer is the game's own only over
+    /// the world (not while the camera looks and not over a GUI window), where the OS cursor stays hidden.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw_cursor(&self, gui: &Gui, zone: &Zone, host: &mut ao_render::Host, list: &mut ao_gui::DrawList, vp: (u32, u32), mode: i64, dblclick: bool) {
+        let (x, y) = self.mouse;
+        host.hide_cursor = false;
+        if x < 0.0 || y < 0.0 || host.look || gui.wants_mouse(x, y) {
+            return;
+        }
+        let ray = pick_ray(&host.camera, &host.lens.unwrap_or_default(), (vp.0 as f32, vp.1 as f32), (x, y));
+        let mouse = object_under(&pick_all(&ray, zone), zone.target).and_then(|id| {
+            let d = zone.dynels.get(&id)?;
+            let (flags, features) = zone.world.pointer_stats(id)?;
+            let own_side = zone.own().map_or(0, |o| o.side as i32);
+            let hover = super::hud_cursor::Hover { npc: d.npc, flags, features, side: d.side as i32, own_side, team: None, own_team: zone.stat(6).unwrap_or(0), vulnerable: false };
+            Some(super::hud_cursor::choose(&hover, host.mods.shift, host.mods.ctrl || host.mods.alt, dblclick))
+        });
+        super::hud_cursor::draw(|g| gui.gfx().size(g), mode, (x, y), mouse.unwrap_or_default(), list);
+        host.hide_cursor = true;
     }
 
     /// `TargetingModule_t::FrameProcess`: the target goes away with its dynel; then the controls follow the selection.
@@ -605,45 +618,69 @@ mod tests {
         assert!((up - 0.75).abs() < 1e-4, "{up}");
     }
 
-    #[test]
-    fn capsule_hits_and_misses() {
-        let ray = Ray { origin: Vec3::new(0.0, 1.0, 10.0), dir: Vec3::new(0.0, 0.0, -1.0) };
-        let (a, b) = (Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, 1.3, 0.0));
-        assert!((ray_capsule(&ray, a, b, 0.5).unwrap() - 10.0).abs() < 1e-4);
-        assert!(ray_capsule(&Ray { origin: Vec3::new(0.7, 1.0, 10.0), ..ray }, a, b, 0.5).is_none());
-        // behind the origin
-        assert!(ray_capsule(&Ray { dir: Vec3::new(0.0, 0.0, 1.0), ..ray }, a, b, 0.5).is_none());
-        // above the capsule top
-        assert!(ray_capsule(&Ray { origin: Vec3::new(0.0, 2.5, 10.0), ..ray }, a, b, 0.5).is_none());
+    use super::super::hud_pick::{self, PickBody};
+    use ao_gui::Modifiers;
+
+    fn body(id: i32, scene_z: f32) -> PickBody {
+        PickBody { id, bounds: ([-0.4, 0.0, -0.3], [0.4, 1.8, 0.3]), pos: [0.0, 0.0, scene_z], yaw: 0.0, scale: 1.0 }
+    }
+
+    /// The hit list of the ray through pixel `mouse` against `bodies` (what `pick_all` does with the zone's dynels).
+    fn list(cam: &Camera, lens: &Lens, bodies: &[PickBody], mouse: (f32, f32)) -> Vec<i32> {
+        let ray = pick_ray(cam, lens, (800.0, 600.0), mouse);
+        hud_pick::hits(bodies, ray.origin, ray.dir, ray.len)
     }
 
     #[test]
     fn clicks_walk_through_the_hit_list_and_ground_keeps_the_target() {
         let mut z = Zone::new(1);
-        // server z is mirrored: scene z = -server z, so these stand at scene z = -5 and z = -12
-        z.dynels.insert(1, dyn_at("Me", [20.0, 0.0, 0.0], false, 1));
         z.dynels.insert(2, dyn_at("Near", [0.0, 0.0, 5.0], true, 2));
         z.dynels.insert(3, dyn_at("Far", [0.0, 0.0, 12.0], true, 2));
+        let bodies = [body(3, -12.0), body(2, -5.0)];
         let cam = Camera::look_at(Vec3::new(0.0, 1.2, 1.0), Vec3::new(0.0, 1.2, -10.0));
         let lens = Lens::default();
-        let ray = pick_ray(&cam, &lens, (800.0, 600.0), (400.0, 300.0));
-        assert_eq!(pick_all(&ray, &z.dynels), vec![2, 3]);
+        let centre = list(&cam, &lens, &bodies, (400.0, 300.0));
+        assert_eq!(centre, vec![2, 3], "nearest box first");
         // a click at the far left of the screen misses everything
-        let ray = pick_ray(&cam, &lens, (800.0, 600.0), (5.0, 300.0));
-        assert!(pick_all(&ray, &z.dynels).is_empty());
+        let ground = list(&cam, &lens, &bodies, (5.0, 300.0));
+        assert!(ground.is_empty());
         // `n3Camera_t::GetNextTarget`: first hit, then the one after the current target, wrapping; a stranger restarts the list
         assert_eq!(click_target(&[2, 3], None), Some(2));
         assert_eq!(click_target(&[2, 3], Some(2)), Some(3));
         assert_eq!(click_target(&[2, 3], Some(3)), Some(2));
         assert_eq!(click_target(&[2, 3], Some(9)), Some(2));
         assert_eq!(click_target(&[], Some(2)), None);
-        // through `world_click`: the first click selects the near one, the second the far one, the ground changes nothing
+        // `GetObjectUnderColLine`: the current target when it is hit, else the first entry
+        assert_eq!(object_under(&[2, 3], Some(3)), Some(3));
+        assert_eq!(object_under(&[2, 3], Some(9)), Some(2));
+        assert_eq!(object_under(&[], Some(2)), None);
+        // the first click selects the near one, the second the far one, the ground changes nothing
         let mut h = HudTargetLite::default();
-        assert!(h.0.world_click(&mut z, &cam, &lens, (800, 600), (400.0, 300.0)));
+        let none = Modifiers::default();
+        assert_eq!(h.0.click_list(&mut z, &centre, none), Some(WorldClick::Select(2)));
         assert_eq!(z.target, Some(2));
-        assert!(h.0.world_click(&mut z, &cam, &lens, (800, 600), (400.0, 300.0)));
+        assert_eq!(h.0.click_list(&mut z, &centre, none), Some(WorldClick::Select(3)));
         assert_eq!(z.target, Some(3));
-        assert!(!h.0.world_click(&mut z, &cam, &lens, (800, 600), (5.0, 300.0)));
+        assert_eq!(h.0.click_list(&mut z, &ground, none), None);
+        assert_eq!(z.target, Some(3));
+    }
+
+    #[test]
+    fn modifier_clicks_follow_the_release_handler() {
+        let mut z = Zone::new(1);
+        z.dynels.insert(2, dyn_at("Near", [0.0, 0.0, 5.0], true, 2));
+        z.dynels.insert(3, dyn_at("Far", [0.0, 0.0, 12.0], true, 2));
+        let mut h = HudTargetLite::default();
+        z.target = Some(2);
+        // Shift: the info page of the object under the pointer (the current target if it is hit); the selection stays
+        assert_eq!(h.0.click_list(&mut z, &[2, 3], Modifiers { shift: true, ..Default::default() }), Some(WorldClick::Info(2)));
+        assert_eq!(h.0.click_list(&mut z, &[3], Modifiers { shift: true, ..Default::default() }), Some(WorldClick::Info(3)));
+        assert_eq!(h.0.click_list(&mut z, &[], Modifiers { shift: true, ..Default::default() }), None);
+        assert_eq!(z.target, Some(2));
+        // Ctrl / Alt: that object itself (not the next one), the caller attacks it
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(h.0.click_list(&mut z, &[2, 3], ctrl), Some(WorldClick::Select(2)));
+        assert_eq!(h.0.click_list(&mut z, &[3], Modifiers { alt: true, ..Default::default() }), Some(WorldClick::Select(3)));
         assert_eq!(z.target, Some(3));
     }
 
@@ -825,7 +862,7 @@ mod tests {
     struct HudTargetLite(HudTarget);
     impl Default for HudTargetLite {
         fn default() -> Self {
-            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false, attack: false })
+            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false, attack: false, info: None })
         }
     }
 }

@@ -111,7 +111,6 @@ pub struct Dnd {
 }
 
 pub struct Drag {
-    pub from: Place,
     pub slot: u32,
     pub ghost: WindowId,
 }

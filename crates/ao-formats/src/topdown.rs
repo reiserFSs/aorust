@@ -57,7 +57,7 @@ pub fn render(scene: &Scene, ground: std::ops::Range<usize>, max_px: u32) -> Opt
             if sm.sky_fog || !matches!(sm.blend, Blend::Opaque | Blend::AlphaTest) {
                 continue;
             }
-            for t in sm.indices.chunks_exact(3) {
+            for t in sm.indices.as_chunks::<3>().0 {
                 let ix = [t[0] as usize, t[1] as usize, t[2] as usize];
                 if ix.iter().any(|&i| i >= world.len()) {
                     continue;
@@ -115,14 +115,14 @@ pub fn render(scene: &Scene, ground: std::ops::Range<usize>, max_px: u32) -> Opt
                     if tx.rgba[o + 3] < 128 && sm.blend == Blend::AlphaTest {
                         continue;
                     }
-                    for k in 0..3 {
-                        c[k] *= tx.rgba[o + k] as f32 / 255.0;
+                    for (k, ck) in c.iter_mut().enumerate().take(3) {
+                        *ck *= tx.rgba[o + k] as f32 / 255.0;
                     }
                 }
                 depth[di] = height;
                 map.owner[di] = t.owner;
-                for k in 0..3 {
-                    map.rgba[di * 4 + k] = (c[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                for (k, ck) in c.iter().enumerate().take(3) {
+                    map.rgba[di * 4 + k] = (ck.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 }
                 map.rgba[di * 4 + 3] = 255;
             }
@@ -152,9 +152,11 @@ mod tests {
     #[test]
     fn floor_shows_ceiling_does_not() {
         // floor at y=0 (red), ceiling above it with the opposite winding (green): only the floor is visible
-        let mut s = Scene::default();
-        s.meshes = vec![quad(0.0, true, [1.0, 0.0, 0.0, 1.0]), quad(3.0, false, [0.0, 1.0, 0.0, 1.0])];
-        s.instances = vec![Instance { mesh: 0, transform: IDENTITY }, Instance { mesh: 1, transform: IDENTITY }];
+        let s = Scene {
+            meshes: vec![quad(0.0, true, [1.0, 0.0, 0.0, 1.0]), quad(3.0, false, [0.0, 1.0, 0.0, 1.0])],
+            instances: vec![Instance { mesh: 0, transform: IDENTITY }, Instance { mesh: 1, transform: IDENTITY }],
+            ..Scene::default()
+        };
         let m = render(&s, 0..usize::MAX, 10).unwrap();
         assert_eq!((m.width, m.height), (10, 10));
         assert_eq!(&m.rgba[(5 * 10 + 5) * 4..][..4], &[255, 0, 0, 255]);

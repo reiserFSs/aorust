@@ -7,6 +7,7 @@ pub mod character;
 pub mod create;
 pub mod dynel_visual;
 pub mod landcontrol;
+pub mod map_areas;
 pub mod mesh;
 pub mod playfield;
 pub mod planetmap;

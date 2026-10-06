@@ -93,16 +93,6 @@ impl HudFaction {
         self.screen = screen;
     }
 
-    #[cfg(test)]
-    pub(super) fn is_open(&self) -> bool {
-        self.window.is_some()
-    }
-
-    #[cfg(test)]
-    pub(super) fn window(&self) -> Option<WindowId> {
-        self.window.as_ref().map(|w| w.0)
-    }
-
     pub(super) fn take_closed(&mut self) -> bool {
         std::mem::take(&mut self.closed)
     }
@@ -220,7 +210,7 @@ mod tests {
         // negative values are mirrored
         assert!((fraction(&b, -1000) - 1.0).abs() < 1e-6);
         assert_eq!(value_text(&b, 500, false), "<font color=#ffff88>500</font>");
-        assert_eq!(value_text(&b, 500, true), "<font color=#ffff88>Neutral</font>");
+        assert_eq!(value_text(&b, 500, true), "<font color=#ffff88>Enemy</font>"); // third band of this 4-band fixture; the real list puts 0 in band 7 (Neutral)
     }
 
     #[test]

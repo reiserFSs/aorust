@@ -19,11 +19,6 @@ const CMD_USE_ITEM: i32 = 3;
 const STAT_DECK: u32 = 0x2d;
 
 impl HudStats {
-    /// The cell of `slot` for a bag item (the client side position map).
-    fn bag_place_of(&self, slot: u32) -> Option<Place> {
-        self.inventory.as_ref()?.positions.get(slot).map(|cell| Place::Bag { cell })
-    }
-
     /// Inventory slot of a place (`None` for an empty grid cell).
     pub(super) fn slot_of(&self, p: Place) -> Option<u32> {
         match p {
@@ -121,7 +116,7 @@ impl HudStats {
             gui.set_canvas(ghost, "icon", vec![CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, GHOST, GHOST], alpha: 1.0 }]);
         }
         self.dnd.press = None;
-        self.dnd.drag = Some(Drag { from, slot, ghost });
+        self.dnd.drag = Some(Drag { slot, ghost });
     }
 
     /// What dropping the item of inventory slot `slot` on `dest` asks for; `None` = refused (the drop is cancelled).

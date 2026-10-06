@@ -7,6 +7,7 @@ use super::hud_stats::HudStats;
 use super::hud_winb::HudWinB;
 use super::hud_nano::HudNano;
 use super::hud_ncu::HudNcu;
+use super::hud_mission::HudMission;
 use super::hud_map::HudMap;
 pub(super) use super::hud_map::ground_map;
 use super::hud_aggdef::{self, AggDef};
@@ -257,6 +258,8 @@ pub(super) struct Hud {
     /// Programs and NCU windows (`hud_nano.rs`, `hud_ncu.rs`).
     nano: HudNano,
     ncu: HudNcu,
+    /// The Mission window (`hud_mission.rs`).
+    mission: HudMission,
     /// System-window lines the NCU window produced (the flow prints them).
     system_lines: Vec<String>,
     /// Playfield map and planet map windows (`hud_map.rs`).
@@ -299,7 +302,7 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, pools: hud_pools::Pools::new(dir), menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), keys: KeyMap::default(), keys_src: String::new(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
+        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, pools: hud_pools::Pools::new(dir), menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), keys: KeyMap::default(), keys_src: String::new(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
         hud.target.targets_target = hud.dvalues.flag("Targetstarget");
         hud.fill_docks(gui);
         hud.create_bars(gui);
@@ -421,6 +424,7 @@ impl Hud {
             self.winb.set_screen(size);
             self.nano.set_screen(size);
             self.ncu.set_screen(size);
+            self.mission.set_screen(size);
             gui.resize_window(self.cc, WindowSize::Fixed(size.0, size.1));
             for s in &mut self.shortcuts {
                 s.resize(gui, size);
@@ -447,12 +451,13 @@ impl Hud {
 
     /// The zone frames [`Hud::on_zone_frame`] reads (the flow keeps them until the HUD exists).
     pub(super) fn wants_zone_frame(f: &Frame) -> bool {
-        super::hud_winb::wants(f)
+        super::hud_winb::wants(f) || super::hud_mission::wants(f)
     }
 
     /// Every zone frame: team members / invitations, the own perk map and perk updates (`hud_winb.rs`).
     pub(super) fn on_zone_frame(&mut self, f: &Frame, own: i32) {
         self.winb.on_zone_frame(f, own);
+        self.mission.on_frame(f, own);
     }
 
     /// Zone frames produced by the HUD since the last call.
@@ -469,6 +474,11 @@ impl Hud {
     /// The character a Shift + click asked the info page of since the last call (`ShowURL("charid://50000/<id>")`, hud_target.rs).
     pub(super) fn take_info(&mut self) -> Option<i32> {
         self.target.info.take()
+    }
+
+    /// InfoView pages the Mission window asked for (`hud_mission.rs`).
+    pub(super) fn take_info_urls(&mut self) -> Vec<String> {
+        self.mission.take_urls()
     }
 
     /// The game's own mouse pointer over the world (`MousePointerModule_t`, hud_cursor.rs); appended to the frame's draw list.
@@ -520,7 +530,7 @@ impl Hud {
         self.refresh(gui, zone);
         self.pools.apply(zone);
         let st = |id: u32| zone.stat(id).unwrap_or(0);
-        let xp = hud_pools::xp(|id| st(id));
+        let xp = hud_pools::xp(st);
         let values = [
             hud_pools::ratio(st(sid::HEALTH), st(sid::MAX_HEALTH)),
             hud_pools::ratio(st(sid::NANO), st(sid::MAX_NANO)),
@@ -550,6 +560,11 @@ impl Hud {
         self.outbox.extend(self.nano.take_outbox());
         self.outbox.extend(self.ncu.take_outbox());
         self.system_lines.extend(self.ncu.take_lines());
+        self.mission.update(gui, _dt);
+        self.outbox.extend(self.mission.take_outbox());
+        if let Some(m) = self.mission.take_marker() {
+            self.set_mission(Some(m));
+        }
         self.map.update(gui, zone, _dt);
         self.winb.update(gui, zone, _dt);
         self.outbox.extend(self.winb.take_outbox());
@@ -698,6 +713,12 @@ impl Hud {
             }
             return true;
         }
+        if self.mission.event(gui, ev, zone) {
+            for k in self.mission.take_closed() {
+                self.close_kind(gui, k);
+            }
+            return true;
+        }
         let mut closed = vec![];
         if self.winb.event(gui, ev, zone, &mut closed) || !closed.is_empty() {
             for k in closed {
@@ -779,7 +800,10 @@ impl Hud {
         if HudNcu::handles(kind) {
             self.ncu.open(gui);
         }
-        self.map.open(gui, kind);
+        if HudMission::handles(kind) {
+            self.mission.open(gui);
+        }
+        self.map.open(gui, &mut self.rollup, kind);
         self.winb.open(gui, kind);
         if !self.open.contains(&kind) {
             self.open.push(kind);
@@ -796,7 +820,10 @@ impl Hud {
         if HudNcu::handles(kind) {
             self.ncu.close(gui);
         }
-        self.map.close(gui, kind);
+        if HudMission::handles(kind) {
+            self.mission.close(gui);
+        }
+        self.map.close(gui, &mut self.rollup, kind);
         self.winb.close(gui, kind);
         self.open.retain(|k| *k != kind);
     }
@@ -806,14 +833,17 @@ impl Hud {
     }
 
     /// The Map window's ground image from the world loader (`hud_map::ground_map`).
-    pub(super) fn provide_ground(&mut self, playfield: u32, map: ao_formats::topdown::GroundMap, rooms: bool) {
-        self.map.provide_ground(playfield, map, rooms);
+    pub(super) fn provide_ground(&mut self, playfield: u32, map: ao_formats::topdown::GroundMap, cell_size: Option<f32>) {
+        self.map.provide_ground(playfield, map, cell_size);
     }
 
-    /// The active mission's marker for the Planet Map's mission button (`hud_map::HudMap::set_mission`).
-    #[allow(dead_code)] // no producer yet: the quest messages are not decoded (docs/gui.md 12)
+    /// The `/waypoint` marker (`GlobalSignals+0x158`): the Planet Map's mission button (`hud_map::HudMap::set_mission`) and the compass marker
+    /// (`FUN_100670f8`) read the same value.
     pub(super) fn set_mission(&mut self, marker: Option<(u32, [f32; 2])>) {
         self.map.set_mission(marker);
+        if let Some(c) = &mut self.compass {
+            c.set_waypoint(marker.map(|(playfield, [x, z])| super::hud_compass::Waypoint { playfield, pos: [x, 0.0, z] }));
+        }
     }
 
     #[cfg(test)]
@@ -821,6 +851,7 @@ impl Hud {
         self.stats.window(kind)
     }
 
+    #[cfg(test)]
     pub(super) fn is_open(&self, kind: WindowKind) -> bool {
         self.open.contains(&kind)
     }
@@ -828,6 +859,12 @@ impl Hud {
     /// A dvalue of the control centre menus as a flag (`friends_window`, `lft_window`: windows the chat module owns).
     pub(super) fn dvalue(&self, name: &str) -> bool {
         self.dvalues.flag(name)
+    }
+
+    /// Screen rect of the AGG/DEF slider (live harness `agg` step).
+    #[cfg(test)]
+    pub(super) fn aggdef_rect(&self, gui: &Gui) -> Option<ao_gui::Rect> {
+        gui.view_rect(self.cc, hud_aggdef::VIEW)
     }
 
     pub(super) fn set_dvalue(&mut self, gui: &mut Gui, name: &str, on: bool) {
@@ -852,7 +889,8 @@ impl Hud {
         self.rollup.close_all(gui);
         self.nano.close(gui, &mut self.rollup);
         self.ncu.close(gui);
-        self.map.close_all(gui);
+        self.mission.close(gui);
+        self.map.close_all(gui, &mut self.rollup);
         self.winb.close_all(gui);
         for s in self.shortcuts {
             s.close(gui);
@@ -869,7 +907,7 @@ fn group(n: i32) -> String {
     let s = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -1117,13 +1155,15 @@ mod tests {
         let (wx, wy) = s.gui.window_pos(win);
         let at = |i: usize| (wx as f32 + 43.0 + 36.0 * i as f32 + 17.0, wy as f32 + 19.0);
         // use fires on the release of a short press (`FUN_10040a17`), never on the press; empty slots do nothing
+        let mut uses = vec![];
         for i in [0, 3, 5] {
             let (x, y) = at(i);
             send(&mut s, InputEvent::MouseDown { x, y, button: MouseButton::Left });
             assert!(s.hud.take_uses().is_empty(), "no use on the press");
             send(&mut s, InputEvent::MouseUp { x, y, button: MouseButton::Left });
+            uses.extend(s.hud.take_uses());
         }
-        assert_eq!(s.hud.take_uses(), vec![SlotUse::SpecialAction(0xb), SlotUse::Macro("/follow".into())]);
+        assert_eq!(uses, vec![SlotUse::SpecialAction(0xb), SlotUse::Macro("/follow".into())]);
         // a slot held for 0.3 s is dragged without moving and its release is no use
         let (x0, y0) = at(0);
         send(&mut s, InputEvent::MouseDown { x: x0, y: y0, button: MouseButton::Left });
@@ -1163,7 +1203,9 @@ mod tests {
         send(&mut s, InputEvent::MouseUp { x: x6, y, button: MouseButton::Left });
         assert_eq!(s.hud.shortcuts[0].slot_names()[6], "Hi");
         assert_eq!(s.hud.shortcuts[0].icon_count(), 6, "the macro shows GFX_GUI_ICON_MACRO");
-        s.hud.event(&mut s.gui, &Event::CanvasClick { window: win, view: "slot6".into(), x: 1.0, y: 1.0 }, &s.zone);
+        // use fires on the release of a short press on the slot (`FUN_10040a17`)
+        send(&mut s, InputEvent::MouseDown { x: x6, y, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseUp { x: x6, y, button: MouseButton::Left });
         assert_eq!(s.hud.take_uses(), vec![SlotUse::Macro("/say hi".into())]);
         // dropped outside the bar: discarded, the bar is unchanged
         s.hud.begin_macro_drag(&mut s.gui, 8, "Gone", "/x");

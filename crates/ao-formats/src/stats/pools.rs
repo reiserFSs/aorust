@@ -42,7 +42,7 @@ pub struct PoolTables {
 impl PoolTables {
     pub fn load(store: &RecordStore) -> Result<Self> {
         let mut t = Self::default();
-        let ints = |b: Vec<u8>| -> Vec<i32> { b.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+        let ints = |b: Vec<u8>| -> Vec<i32> { b.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect() };
         for breed in 1..6 {
             if let Some(v) = store.get(1_000_203, breed)?.map(ints).filter(|v| v.len() >= 6) {
                 t.breed.insert(breed as i32, std::array::from_fn(|i| v[i]));

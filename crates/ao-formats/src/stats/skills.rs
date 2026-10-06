@@ -13,8 +13,8 @@
 //! | 1000027 (`0xf425b`) | breed 1..4 | breed, 6 base abilities, 6 ability caps | `FUN_100c5c6a` → `FUN_100c5afd` |
 //! | 1000210 (`0xf4312`) | breed 1..5 | ability cost class, stream order Str, Int, Agi, Sen, Sta, Psy | `FUN_100bfddc` |
 //!
-//! Not modelled (UNRESOLVED, docs/gui.md §11.8): the modifier containers (`FUN_1006460b`'s per-stat bonus map, `FUN_10063d39`'s percent boost
-//! map, `FUN_1008a3e8` in `FUN_10064ac2` mask 4); they are empty until buff messages are decoded, so buffed value = base value.
+//! The modifier containers (`FUN_1006460b`'s per-stat bonus map, `FUN_10063d39`'s percent boost map) are in [`super::buffs`] (`GetSkill` modes 1 and 2);
+//! the `FUN_10064ac2` mask-4 term (`FUN_1008a3e8` on a third map) is not modelled (only `GetSkillMax` mode 4 reads it).
 
 use super::{BREED, LEVEL, PROFESSION};
 use anyhow::Result;
@@ -75,8 +75,18 @@ pub struct SkillTables {
     ability_class: HashMap<i32, [i32; 6]>,
 }
 
+#[cfg(test)]
+impl SkillTables {
+    /// A table whose only trickle row is `stat` (tests of [`super::buffs`]).
+    pub(crate) fn test_trickle(stat: u32, pct: [i32; 6]) -> Self {
+        let mut t = Self::default();
+        t.trickle.insert(stat, pct);
+        t
+    }
+}
+
 fn ints(b: &[u8]) -> Vec<i32> {
-    b.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect()
 }
 
 /// Truncation toward zero, `FUN_1013ecf0` (rounds to nearest, then corrects by the sign of the remainder = `(int)x`).
@@ -159,7 +169,7 @@ impl SkillTables {
         (1..=7).contains(&tl).then(|| s[tl as usize - 1])
     }
 
-    /// `FUN_10064ac2(stat, mask)` trickle-down: `0.25 * Σ pct[k] * ability[k] / 100` (abilities raw: modifiers not modelled).
+    /// `FUN_10064ac2(stat, mask)` trickle-down: `0.25 * Σ pct[k] * ability[k] / 100` over the abilities the caller passes (buffed ones for `GetSkill`, [`super::buffs`]).
     pub fn trickle(&self, stat: u32, ab: [i32; 6]) -> f32 {
         let Some(p) = self.trickle.get(&stat) else { return 0.0 };
         let d = |k: usize| f64::from(p[k]) * f64::from(ab[k]) / 100.0;
@@ -167,11 +177,6 @@ impl SkillTables {
         let five = d(0) + d(1) + d(2) + d(3) + d(4);
         let last = (p[5] as f32 * ab[5] as f32) / 100.0;
         (last + five as f32) * 0.25
-    }
-
-    /// `N3Msg_GetSkill(stat, 1)` = `FUN_100654e1`: the stat's own value plus the truncated trickle-down (percent boosts not modelled).
-    pub fn skill_base(&self, stat: u32, raw: i32, ch: &Character) -> i32 {
-        raw + ftol(self.trickle(stat, ch.abilities))
     }
 
     /// `FUN_100626d8`: maximum of ability `stat` (16..=21) – `min(base + 3·level, cap)` below level 200, `(level-200)·k + cap` from 200
@@ -338,7 +343,7 @@ mod tests {
         assert_eq!(t.ability_max(16, &Character { level: 205, ..ch }), 5 * 15 + 472);
         // trickle: 0.25 * (50*6/100 + 50*6/100) = 1.5 -> truncated 1
         assert!((t.trickle(152, ch.abilities) - 1.5).abs() < 1e-6);
-        assert_eq!(t.skill_base(152, 5, &ch), 6);
+        assert_eq!(super::super::buffs::skill_base(&t, 152, 5, &ch, &Default::default(), 0), 6);
         assert_eq!(t.cost(16, 6, &ch), 12.0);
     }
 

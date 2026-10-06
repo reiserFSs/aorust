@@ -315,24 +315,23 @@ const MENU_SORT_ASC: u32 = 2;
 const MENU_SORT_DESC: u32 = 3;
 const MENU_COLUMN: u32 = 0x10;
 
+/// How a [`ListWindow`] is opened: `top_xml` = children of the vertical client view above the scroll view (`top_h` px high), `client` = the client size.
+pub(super) struct Spec<'a> {
+    pub name: &'a str,
+    pub title: &'a str,
+    pub pos: (i32, i32),
+    pub client: (u32, u32),
+    pub top_xml: &'a str,
+    pub top_h: f32,
+    pub texts: MenuTexts,
+    pub menu_base: u32,
+    pub screen: (u32, u32),
+}
+
 impl ListWindow {
-    /// Opens the window: `top_xml` (children of the vertical client view above the scroll view, `top_h` px high), `client` = the client size.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open(
-        gui: &mut Gui,
-        name: &str,
-        title: &str,
-        pos: (i32, i32),
-        client: (u32, u32),
-        top_xml: &str,
-        top_h: f32,
-        view: ListView,
-        all: Vec<Column>,
-        texts: MenuTexts,
-        menu_base: u32,
-        screen: (u32, u32),
-        dock: Option<(&mut super::hud_rollup::Rollup, &str)>,
-    ) -> anyhow::Result<Self> {
+    /// Opens the window described by `spec`; `dock` = the rollup page to be built instead of a free window.
+    pub fn open(gui: &mut Gui, spec: Spec, view: ListView, all: Vec<Column>, dock: Option<(&mut super::hud_rollup::Rollup, &str)>) -> anyhow::Result<Self> {
+        let Spec { name, title, pos, client, top_xml, top_h, texts, menu_base, screen } = spec;
         let xml = format!(
             "<root><View view_layout=\"vertical\" h_alignment=\"left\">{top_xml}{}</View></root>",
             scroll_xml(client.1 as f32 - top_h, client.0 as f32)

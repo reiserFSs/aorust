@@ -258,16 +258,6 @@ impl HudTeam {
         self.texts.as_ref().and_then(|t| t.by_key(10000, key)).unwrap_or_else(|| key.to_string())
     }
 
-    #[cfg(test)]
-    pub(super) fn is_open(&self) -> bool {
-        self.win.is_some()
-    }
-
-    #[cfg(test)]
-    pub(super) fn window(&self) -> Option<WindowId> {
-        self.win.as_ref().map(|w| w.window)
-    }
-
     pub(super) fn take_closed(&mut self) -> bool {
         std::mem::take(&mut self.closed)
     }

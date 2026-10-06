@@ -81,7 +81,7 @@ pub struct FightModeUpdate {
 /// `FUN_1002b8b6` / `FUN_101251cf` size word: `(n+1)*0x3f1` with `n < 0x7531`.
 fn counted(r: &mut Reader) -> Result<usize> {
     let w = r.u32()?;
-    if w == 0 || w % 0x3F1 != 0 || w / 0x3F1 - 1 >= 0x7531 {
+    if w == 0 || w % 0x3F1 != 0 || w / 0x3F1 > 0x7531 {
         bail!("container size word {w:#x} is not (n+1)*0x3f1 with n < 0x7531");
     }
     Ok((w / 0x3F1 - 1) as usize)

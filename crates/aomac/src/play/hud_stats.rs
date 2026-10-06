@@ -195,10 +195,6 @@ impl HudStats {
         self.screen = size;
     }
 
-    pub(super) fn handles(kind: WindowKind) -> bool {
-        matches!(kind, WindowKind::Skills | WindowKind::Inventory | WindowKind::Character | WindowKind::Stat)
-    }
-
     pub(super) fn is_open(&self, kind: WindowKind) -> bool {
         match kind {
             WindowKind::Skills => self.skills.is_some(),
@@ -273,11 +269,7 @@ impl HudStats {
                     rollup.close_page(gui, WEAR_KEY);
                 }
             }
-            WindowKind::Stat => {
-                if self.stat.take().is_some() {
-                    rollup.close_page(gui, stat_view::KEY);
-                }
-            }
+            WindowKind::Stat if self.stat.take().is_some() => rollup.close_page(gui, stat_view::KEY),
             _ => {}
         }
     }
@@ -1037,7 +1029,7 @@ mod tests {
         let out = s.hud.take_outbox();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].payload, ao_net::n3::outgoing::skill_ip_adjust(33512, &std::collections::BTreeMap::from([(16, 9)])));
-        assert!(!s.hud.model.any_pending());
+        assert_eq!(s.hud.model.pending(16), 0);
         // "Reset all skills (1)" asks for confirmation, cancel sends nothing, OK sends `N3Msg_ResetSkill(0)`
         click(&mut s, &mut o, w, "resetAll");
         let dlg = s.hud.skills.as_ref().unwrap().confirm.unwrap().0;
@@ -1230,18 +1222,18 @@ mod tests {
         s.zone.apply_inventory(&inv::InventoryMsg::ContainerAdd { item: inv::item_identity(0x13), container: mine, slot: inv::ANY_BAG_SLOT });
         o.frame(&mut s, 0.016);
         assert_eq!(s.hud.inventory.as_ref().unwrap().positions.get(0x40), Some((2, 1)));
-        // inside the bag only the client side cell changes: no frame
-        dnd!(s, o, bag_xy(&s, (2, 1)), bag_xy(&s, (0, 2)));
+        // inside the bag only the client side cell changes: no frame (the default window shows rows 0 and 1; row 2 is scrolled out of the viewport)
+        dnd!(s, o, bag_xy(&s, (2, 1)), bag_xy(&s, (0, 1)));
         assert!(payload(&mut s).is_empty());
-        assert_eq!(s.hud.inventory.as_ref().unwrap().positions.get(0x40), Some((0, 2)));
+        assert_eq!(s.hud.inventory.as_ref().unwrap().positions.get(0x40), Some((0, 1)));
         // a double click wears it at its `DefaultPos`
-        let p = bag_xy(&s, (0, 2));
+        let p = bag_xy(&s, (0, 1));
         click_at(&mut s, &mut o, p.0, p.1);
         click_at(&mut s, &mut o, p.0, p.1);
         assert_eq!(payload(&mut s), [inv::move_item_to_inventory(me, inv::item_identity(0x40), 0x13)]);
-        // released over the world: `DropTemplateIIR_t`
+        // released over the world: `DropTemplateIIR_t` at the player's position
         dnd!(s, o, bag_xy(&s, (1, 0)), (20.0, 300.0));
-        assert_eq!(payload(&mut s), [inv::drop_item(me, inv::item_identity(0x41), [0.0; 3])]);
+        assert_eq!(payload(&mut s), [inv::drop_item(me, inv::item_identity(0x41), s.zone.own().map_or([0.0; 3], |d| d.pos))]);
     }
 
     /// The real `Hud`: the menu toggles open the windows, the frame close button (and `Close`) clears the menu state again; the NewChar template's
@@ -1253,7 +1245,7 @@ mod tests {
         assert!(hud.is_open(WindowKind::Character) && hud.is_open(WindowKind::Stat) && !hud.is_open(WindowKind::Skills));
         for k in [WindowKind::Skills, WindowKind::Inventory] {
             hud.toggle(&mut s.gui, k);
-            assert!(hud.is_open(k) && s.hud.is_open(k) == false, "{k:?}");
+            assert!(hud.is_open(k) && !s.hud.is_open(k), "{k:?}");
         }
         hud.update(&mut s.gui, &mut s.zone, 0.016);
         o.frame(&mut s, 0.016);
@@ -1265,7 +1257,8 @@ mod tests {
         hud.toggle(&mut s.gui, WindowKind::Inventory);
         assert!(!hud.is_open(WindowKind::Inventory));
         let stat = hud.stats_window(WindowKind::Stat).unwrap();
-        assert!(hud.event(&mut s.gui, &Event::CloseRequested { window: stat }, &s.zone));
+        // the stat window is a frameless rollup page: its close button is the page header's canvas `close`
+        assert!(hud.event(&mut s.gui, &Event::CanvasClick { window: stat, view: "close".into(), x: 5.0, y: 5.0 }, &s.zone));
         assert!(!hud.is_open(WindowKind::Stat) && hud.stats_window(WindowKind::Stat).is_none());
         hud.toggle(&mut s.gui, WindowKind::Stat);
         assert!(hud.is_open(WindowKind::Stat));

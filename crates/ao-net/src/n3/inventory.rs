@@ -296,7 +296,7 @@ mod tests {
             Some(InventoryMsg::ItemReplaced { slot: 0x11, old: AcgItem { low_id: 16, high_id: 16, level: 25 }, new: AcgItem { low_id: 32, high_id: 32, level: 0xff } })
         );
         assert_eq!(parse(&hex("485e7202 0000c350 00006584 00 00000005")).unwrap(), Some(InventoryMsg::Updated(5)));
-        assert_eq!(parse(&hex("485e7202 0000c350 00006584 00 00000005")[..16]).is_err(), true);
+        assert!(parse(&hex("485e7202 0000c350 00006584 00 00000005")[..16]).is_err());
         // InventoryUpdateIIR_t: capacity, kind, list (size word (n+1)*0x3f1: one element), container, word, flag
         let b = hex(
             "4e536976 0000c750 00000001 00  00000015 00000002  000007e2  00000041 0001 0003 00000068 00000041  00000010 00000011 00000019 00000000  0000c750 00000001 00000007 00000001",

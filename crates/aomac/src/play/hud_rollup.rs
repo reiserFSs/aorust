@@ -51,8 +51,6 @@ struct Page {
     key: String,
     window: WindowId,
     expanded: bool,
-    /// Height of the whole page window when expanded / collapsed (set at open, from the header height).
-    header: u32,
 }
 
 pub enum RollupEvent {
@@ -112,14 +110,6 @@ impl Rollup {
     }
 
     /// The configured page height of a view (`page_height`); `fallback` for views the template does not list.
-    pub fn page_height(&self, key: &str, fallback: f32) -> f32 {
-        self.config.iter().find(|c| c.key == key).map_or(fallback, |c| c.height)
-    }
-
-    pub fn is_docked(&self, key: &str) -> bool {
-        self.pages.iter().any(|p| p.key == key)
-    }
-
     /// Docks a view: `view_xml` is the XML root (`<root>..</root>`) of the view's content, laid out in a body of `page_height` px
     /// (`dock_node_configs`, or the view's own height when unlisted). Returns the page's window; named views inside it are reached through it as usual.
     pub fn open_page(&mut self, gui: &mut Gui, key: &str, title: &str, view_xml: &str, own_height: f32) -> anyhow::Result<WindowId> {
@@ -158,7 +148,7 @@ impl Rollup {
         let mut bg = vec![CanvasItem::Solid { dst: [0.0, 0.0, w as f32, bh], color: 0x404040, alpha: 1.0 }];
         bg.extend(image(gui, BG, [0.0, 0.0, w as f32, bh]));
         gui.set_canvas(window, "body_bg", bg);
-        let mut page = Page { key: key.to_string(), window, expanded: cfg.expanded, header };
+        let mut page = Page { key: key.to_string(), window, expanded: cfg.expanded };
         self.paint_arrow(gui, &mut page, arrow);
         if !cfg.expanded {
             gui.show_collapsing(window, "body", false);
@@ -241,11 +231,6 @@ impl Rollup {
                 self.layout(gui);
             }
         }
-    }
-
-    #[cfg(test)]
-    pub fn window(&self, key: &str) -> Option<WindowId> {
-        self.pages.iter().find(|p| p.key == key).map(|p| p.window)
     }
 }
 
