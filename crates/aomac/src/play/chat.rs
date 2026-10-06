@@ -179,6 +179,11 @@ impl Chat {
         self.line_to(gui, ChatLine::new(ChatKind::System, log::window_html(log::color_name(code), text)), Some("System"));
     }
 
+    /// Live-test hook: drop the chat-server connection (see [`net::ChatNet::drop_connection`]).
+    pub fn drop_connection(&self) {
+        self.net.drop_connection();
+    }
+
     pub fn take_game(&mut self) -> Vec<GameAction> {
         std::mem::take(&mut self.game)
     }

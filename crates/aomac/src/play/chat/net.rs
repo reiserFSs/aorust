@@ -21,6 +21,10 @@ pub enum Out {
     NameOp { op: NameOp, id: u32, name: String },
     /// S2C_GROUP_PART (`RemoveGroup` 0x1008603d).
     GroupRemove { group: u64, name: String },
+    /// Buddy / private group / LFT events for [`super::social::Social`].
+    Social(ChatEvent),
+    /// A name lookup requested with [`ChatNet::lookup_open`] finished: open that character's tell window (`id == u32::MAX`: unknown).
+    OpenTell { id: u32, name: String },
 }
 
 /// `HandleVicinityMessage` [GUI 0x10086728]: data byte kind 4..7 pick fixed window groups, everything else is "vicinity".
@@ -67,6 +71,8 @@ pub struct ChatNet {
     pending: Vec<(String, String)>,
     /// Lookups waiting for a [`NameOp`] (lower-case name).
     ops: Vec<(String, NameOp)>,
+    /// Lookups waiting to open a tell window (lower-case name).
+    opens: Vec<String>,
     tap: Option<std::path::PathBuf>,
 }
 
@@ -106,8 +112,17 @@ impl ChatNet {
         }
     }
 
+    /// Live-test hook (`AOMAC_LIVE_STEPS=chatdrop`): close our end of the chat socket; the session thread reports `Disconnected("closed")`
+    /// and the normal retry pacing takes over.
+    pub fn drop_connection(&self) {
+        if let Some(s) = &self.session {
+            s.send(ChatCmd::Quit);
+        }
+    }
+
     fn connect(&mut self) -> Option<Out> {
         let (host, port) = self.server.clone()?;
+        eprintln!("chat: connect attempt {} to {host}:{port}", self.attempts);
         let tap = self.tap.clone().map(ao_net::conn::record_tap);
         match ChatSession::connect((host.as_str(), port), tap) {
             Ok(s) => {
@@ -149,6 +164,7 @@ impl ChatNet {
     fn on_event(&mut self, e: ChatEvent, out: &mut Vec<Out>) {
         match e {
             ChatEvent::LoggedIn => {
+                eprintln!("chat: logged in");
                 self.logged_in = true;
                 self.attempts = 0;
             }
@@ -169,6 +185,10 @@ impl ChatNet {
                 }
                 self.finish_tells(&name, id, out);
                 let key = name.to_lowercase();
+                if self.opens.contains(&key) {
+                    self.opens.retain(|n| *n != key);
+                    out.push(Out::OpenTell { id, name: name.clone() });
+                }
                 let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.ops).into_iter().partition(|(n, _)| *n == key);
                 self.ops = rest;
                 out.extend(mine.into_iter().map(|(_, op)| Out::NameOp { op, id, name: name.clone() }));
@@ -210,6 +230,16 @@ impl ChatNet {
                     ..Default::default()
                 }));
             }
+            // buddy list, private groups, LFT: the hub's social layer decides (social.rs, it has the text db and prefs)
+            e @ (ChatEvent::BuddyAdd { .. }
+            | ChatEvent::BuddyRemove(_)
+            | ChatEvent::PrivInvited(_)
+            | ChatEvent::PrivKicked(_)
+            | ChatEvent::PrivJoined { .. }
+            | ChatEvent::PrivParted { .. }
+            | ChatEvent::PrivMessage { .. }
+            | ChatEvent::PrivDeclined { .. }
+            | ChatEvent::LftReply(_)) => out.push(Out::Social(e)),
             other => eprintln!("chat: unhandled {other:?}"),
         }
     }
@@ -259,6 +289,18 @@ impl ChatNet {
         }
     }
 
+    /// Id of a character by name: known ids answer at once, else the name is looked up (0x15) and [`Out::OpenTell`] follows.
+    pub fn lookup_open(&mut self, name: &str) -> Option<u32> {
+        if let Some(&id) = self.ids.get(&name.to_lowercase()) {
+            return Some(id);
+        }
+        if let Some(s) = &self.session {
+            self.opens.push(name.to_lowercase());
+            s.send(ChatCmd::Lookup(name.to_owned()));
+        }
+        None
+    }
+
     /// Say something in a chat-server channel by its group key; `false` if not connected.
     pub fn say(&mut self, group: u64, text: &str) -> bool {
         match (&self.session, self.logged_in) {
@@ -273,6 +315,19 @@ impl ChatNet {
     /// Group key of a channel name (case-insensitive exact match).
     pub fn group_by_name(&self, name: &str) -> Option<u64> {
         self.groups.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|(k, _)| *k)
+    }
+
+    /// A private chat group the character joined / left (`AddGroup` of the 0x37 handler): it is a group like the announced channels, so
+    /// `/g <name>`, window selection and [`ChatNet::say`] (type 0x39 for kind 0xE) work on it.
+    pub fn set_group(&mut self, key: u64, name: Option<&str>) {
+        match name {
+            Some(n) => {
+                self.groups.insert(key, n.to_owned());
+            }
+            None => {
+                self.groups.remove(&key);
+            }
+        }
     }
 }
 

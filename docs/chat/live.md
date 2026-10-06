@@ -34,4 +34,18 @@ Note: a plain line (no `/say`) from `run_line` without a window output group sen
 * Vicinity/shout/whisper from other players arrive on the chat server as 0x22/0x23 (decoded, group routing per GUI 0x10086728); the zone N3 text classes (`ChatTextIIR_t` …) did not occur in the session.
 * Outgoing-tell echo text, tell windows (per-sender windows) and the reply list: tells are routed to the "Tell Messages" group.
 * Private groups (`/invite` …), buddy list, `/cc`, LFT: decoders exist (`ao_net::chat`), no UI.
-* Reconnect after a dropped chat connection: pacing implemented (`ChatNet`), not exercised live.
+
+## Reconnect after a dropped connection (live, 2026-10-06)
+
+Live step `chatdrop` closes our end of the chat socket (`ChatNet::drop_connection`, `Quit` to the session thread; the thread reports `Disconnected("closed")`).
+Timestamps (s since test start, `AOMAC_LIVE_STEPS=wait=20,chatdrop,wait=14,say=/say after reconnect,wait=10,shot=recon`):
+
+| t | event |
+|---|---|
+| 6.1 / 6.5 | first `connect attempt 0`, `logged in` |
+| 33.4 | `disconnected: closed` |
+| 37.5 | `connect attempt 1` (**4.1 s** = `1 << (0 + 12)` ms, the client's first back-off, GUI 0x10089dfc) |
+| 37.8 | `logged in` (attempts reset to 0) |
+
+After the reconnect the chat server replays the MOTD (shown again in the Default Window) and our `/say` is echoed (`0x22`). Later back-offs 8.2 s / 16.4 s / 32.8 s are covered by `backoff_matches_client` only.
+The bound of 10 attempts is our own (the client's loop is unbounded in the decompile read so far).

@@ -270,6 +270,7 @@ fn live_walk() {
                 eprintln!("approached {id} to {:.1} m: {}", dist(&l), l.pos());
             }
             // chat: `say=<line>` runs the line as if typed in the chat bar (`/g Global hi`, `/tell X hi`, plain = vicinity)
+            "chatdrop" => l.p.chat.as_ref().expect("chat hub").drop_connection(),
             "say" => {
                 let p = &mut l.p;
                 p.chat.as_mut().expect("chat hub").run_line(&mut p.gui, v, &p.zone, &p.text);
