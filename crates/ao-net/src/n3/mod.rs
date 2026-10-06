@@ -18,6 +18,7 @@ pub mod outgoing;
 pub mod pet;
 pub mod quest;
 pub mod server_move;
+pub mod shop;
 pub mod spells;
 pub mod team;
 pub mod textcmd;
@@ -71,6 +72,8 @@ pub enum N3 {
     Grid(grid::Grid),
     /// `TradeIIR_t`: the player-to-player trade (docs/zone/interact.md, "Player trade").
     Trade(trade::Trade),
+    /// `ShopUpdateIIR_t`: the stock of a vending machine (docs/zone/interact.md, "Vending machines / shops").
+    Shop(shop::ShopUpdate),
     /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
     Unknown(Vec<u8>),
 }
@@ -109,6 +112,8 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
         N3::Grid(m)
     } else if let Some(m) = trade::decode(&h, &mut r)? {
         N3::Trade(m)
+    } else if let Some(m) = shop::decode(&h, &mut r)? {
+        N3::Shop(m)
     } else {
         N3::Unknown(f.payload[13..].to_vec())
     };

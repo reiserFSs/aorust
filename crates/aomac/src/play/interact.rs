@@ -8,6 +8,7 @@
 use super::interact_chat::NpcChat;
 use super::interact_grid::GridUi;
 use super::interact_ptrade::PTradeUi;
+use super::interact_shop::ShopUi;
 use super::interact_trade::TradeUi;
 use super::interact_use::UseUi;
 use super::zone::Zone;
@@ -43,6 +44,8 @@ pub struct Interact {
     pub(super) use_ui: UseUi,
     /// The player-to-player trade (`interact_ptrade.rs`).
     pub(super) ptrade: PTradeUi,
+    /// The vending machine buy window (`interact_shop.rs`).
+    pub(super) shop: ShopUi,
     outbox: Vec<Frame>,
     /// Text of `KnubotCloseChatWindow` for the chat window ([INFERENCE]: the `+0xf0` slot's consumer was not located; the live server sends the reason, e.g. "You are too far away from <npc> to continue this conversation.").
     notices: Vec<String>,
@@ -87,6 +90,7 @@ impl Interact {
     pub fn close_all(&mut self, gui: &mut Gui) {
         self.use_ui.close_all(gui);
         self.ptrade.close_all(gui);
+        self.shop_close_all(gui);
         self.grid.close_all(gui);
         if let Some(c) = self.chat.take() {
             c.close(gui);
@@ -110,6 +114,7 @@ impl Interact {
         let Ok(m) = n3::decode(f) else { return };
         let who = m.header.target;
         self.watch_objects(gui, &m);
+        self.shop_watch(&m);
         match m.body {
             N3::Dynel(Dynel::Stat(s)) if who.kind == DYNEL_CHAR => {
                 for (stat, v) in s.stats {
@@ -179,7 +184,7 @@ impl Interact {
             self.use_out(zone, out);
             return true;
         }
-        if self.ptrade_event(gui, ev, zone) {
+        if self.ptrade_event(gui, ev, zone) || self.shop_event(gui, ev) {
             return true;
         }
         if let Some(out) = self.grid.event(gui, ev, me) {

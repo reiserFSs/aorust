@@ -506,6 +506,11 @@ impl Hud {
         self.stats.item_info(gui, low_id)
     }
 
+    /// Name, count and price of an item template (`HudStats::shop_info`).
+    pub(super) fn shop_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<(String, i32, i32)> {
+        self.stats.shop_info(gui, low_id)
+    }
+
     /// Hotbar slots activated since the last call (`FUN_100d79c9`).
     /// The character a world click selected since the last call (CTRL/ALT + click also attacks it: `FUN_1002c469`).
     pub(super) fn take_click(&mut self) -> Option<i32> {

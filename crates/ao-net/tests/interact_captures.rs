@@ -109,3 +109,33 @@ fn npc_trade_with_aleksei_innokenti() {
     let rej = seen.iter().find_map(|k| if let Knubot::RejectedItems { items, value, .. } = k { Some((items.clone(), *value)) } else { None }).unwrap();
     assert_eq!(rej, (vec![(Identity { kind: 116697, instance: 116697 }, 3, 1234567890)], 0));
 }
+
+/// The vending machine of `zone_use_object_ithaca.rec` (Borealis, `{0xC75B, 0x4b}`): `ShopUpdateIIR_t` with the stock, then the `TradeIIR_t` pair that
+/// starts the shop trade (op 0 with a non-zero `b`, docs/zone/interact.md "Vending machines / shops").
+#[test]
+fn vending_machine_stock_and_trade_start() {
+    use ao_net::n3::shop::ShopUpdate;
+    let machine = Identity { kind: 0xC75B, instance: 0x4b };
+    let own = Identity { kind: 50000, instance: OWN };
+    let session = Identity { kind: 0xC767, instance: 0x116f_7753 };
+    let mut stock = None;
+    let mut starts = vec![];
+    for (_, from_server, f) in load(include_str!("../../../docs/captures/zone_use_object_ithaca.rec")) {
+        match n3::decode(&f).unwrap() {
+            m @ n3::Message { body: N3::Shop(_), .. } => {
+                let N3::Shop(s) = m.body else { unreachable!() };
+                assert_eq!((from_server, m.header.target), (true, machine));
+                // the codec writes back exactly the captured bytes (the server's header flag is 0 as well)
+                assert_eq!(s.encode(machine), f.payload);
+                stock = Some(s);
+            }
+            n3::Message { body: N3::Trade(t), header, .. } => starts.push((header.target, t)),
+            _ => {}
+        }
+    }
+    let ShopUpdate { items } = stock.expect("the ShopUpdateIIR_t");
+    assert_eq!(items.len(), 36);
+    assert_eq!((items[0].low_id, items[0].high_id, items[0].level), (0x469bb, 0x469bb, 1));
+    assert_eq!((items[2].low_id, items[2].level), (0x419f9, 150));
+    assert_eq!(starts, [(own, Trade { op: 0, a: machine, b: session }), (machine, Trade { op: 0, a: own, b: session })]);
+}

@@ -61,6 +61,7 @@ impl Play {
         }
         self.interact_trade_frame();
         self.interact_ptrade_frame();
+        self.interact_shop_frame();
     }
 
     /// A plain left click that selected character `id`: the second one on the same dynel within [`ao_gui::DOUBLE_CLICK_TIME`] is a double click,
@@ -82,8 +83,11 @@ impl Play {
     /// * Left button on an object that is not a character (characters are the HUD's selection, [`Play::interact_left_click`]): the second click on it within
     ///   the double-click time runs `N3Msg_DefaultActionOnDynel` (`FUN_1002c2ee`, not on the own character).
     pub(super) fn interact_mouse(&mut self, ev: &InputEvent, host: &Host) {
-        if let (InputEvent::MouseMove { x, y }, Some(i)) = (ev, self.interact.as_mut()) {
-            i.trade.mouse = (*x, *y);
+        if let Some(i) = self.interact.as_mut() {
+            i.shop.quick = host.mods.shift || host.mods.ctrl;
+            if let InputEvent::MouseMove { x, y } = ev {
+                i.trade.mouse = (*x, *y);
+            }
         }
         // an inventory item released over the world (`FUN_100cb081` [GUI], docs/zone/interact.md §8.6): the object under the pointer is what it is used on
         if let InputEvent::MouseUp { x, y, button: MouseButton::Left } = *ev {

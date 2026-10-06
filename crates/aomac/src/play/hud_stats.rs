@@ -253,6 +253,11 @@ impl HudStats {
         self.items.info(gui, low_id).map(|i| (i.name.clone(), i.icon))
     }
 
+    /// Name, `MultipleCount` and `Value` (stat 0x4a, the shop price column) of the item template `low_id` (`interact_shop.rs`).
+    pub(in crate::play) fn shop_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<(String, i32, i32)> {
+        self.items.info(gui, low_id).map(|i| (i.name.clone(), i.count, i.stat(0x4a).unwrap_or(0)))
+    }
+
     pub(super) fn open(&mut self, gui: &mut Gui, rollup: &mut Rollup, kind: WindowKind) {
         if self.is_open(kind) {
             return;

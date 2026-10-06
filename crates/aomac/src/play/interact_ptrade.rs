@@ -235,6 +235,9 @@ impl Interact {
     /// The `TradeIIR_t` the server sent; `who` is its header identity (the character the state belongs to). Handlers: `FUN_100674ab` [GC] and what it calls.
     pub(super) fn on_trade(&mut self, gui: &mut Gui, t: Trade, who: Identity, zone: &Zone) {
         let me = self.own_id();
+        if self.shop_trade(gui, &t, who, self.ptrade.trade.is_some() || self.ptrade.pending.is_some()) {
+            return;
+        }
         let ui = &mut self.ptrade;
         ui.log.push(format!("{who:?} {t:?}"));
         match t.op {

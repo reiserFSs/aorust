@@ -722,6 +722,27 @@ fn live_walk() {
                 eprintln!("gridsel {v}: {}", p.interact.as_mut().unwrap().grid_select(&mut p.gui, v.parse().unwrap()));
                 l.wait(6.0);
             }
+            // vending machine window (docs/zone/interact.md "Vending machines / shops"): `shop` prints it, `shopbuy=<i>` is the plain double click on stock item i
+            // (`MoveItemToInventory({0x6f, i})`), `shopadd=<i>` the Shift double click (`TradeAddItem`), `shoprm=<i>` removes bought item i, `shopaccept` / `shopdecline`
+            "shop" => {
+                let p = &l.p;
+                eprintln!("{}", p.interact.as_ref().unwrap().shop_dump(&p.gui));
+            }
+            "shopbuy" | "shopadd" | "shoprm" | "shopaccept" | "shopdecline" => {
+                let p = &mut l.p;
+                let (i, gui) = (p.interact.as_mut().unwrap(), &mut p.gui);
+                let n = v.parse().unwrap_or(0);
+                let ok = match k {
+                    "shopbuy" => i.shop_buy(gui, n),
+                    "shopadd" => i.shop_add(gui, n),
+                    "shoprm" => i.shop_remove(gui, n),
+                    other => i.shop_press(gui, other == "shopaccept"),
+                };
+                eprintln!("{step} {v}: {ok}");
+                l.wait(4.0);
+                let p = &l.p;
+                eprintln!("{}", p.interact.as_ref().unwrap().shop_dump(&p.gui));
+            }
             // `useq=<kind>:<instance>`: `N3Msg_UseItem` (`GenericCmd` 3) without any wait (follow it with `zc=secs` to watch what the server does)
             "useq" => {
                 let (kind, inst) = v.split_once(':').unwrap();
