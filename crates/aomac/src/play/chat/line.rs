@@ -6,17 +6,8 @@
 pub enum ChatKind {
     Error,
     System,
-    CmdFeedback,
     /// Outgoing tell (we sent it).
     TellOut,
-    /// Incoming tell.
-    TellIn,
-    Vicinity,
-    Shout,
-    Whisper,
-    /// Public/private chat-server group by its group name (OOC, Newbie Help, Clan, Team, ...).
-    Group(String),
-    Emote,
     /// Combat log / feedback classes (`CCMeHitOtherColor` ...), named by their TextColors entry.
     Other(&'static str),
 }
@@ -27,14 +18,7 @@ impl ChatKind {
         match self {
             ChatKind::Error => "ct_error",
             ChatKind::System => "ct_system",
-            ChatKind::CmdFeedback => "ct_cmd_feedback",
             ChatKind::TellOut => "ct_otell",
-            ChatKind::TellIn => "ct_itell",
-            ChatKind::Vicinity => "ctch_vicinity",
-            ChatKind::Shout => "ctch_shout",
-            ChatKind::Whisper => "ctch_whisper",
-            ChatKind::Emote => "ctch_emote",
-            ChatKind::Group(_) => "ctch_misc", // refined by the Gui owner: per-group colour table of ChatGUIModule_c
             ChatKind::Other(n) => n,
         }
     }

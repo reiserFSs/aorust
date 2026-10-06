@@ -21,8 +21,6 @@ pub enum GroupKind {
     Vicinity,
     Org,
     Team,
-    /// A private conversation window's group (messages go out as a tell to `GroupInfo::name`).
-    Tell,
     /// Public/private chat-server group (OOC, Newbie Help, ...): `Group{..}` on the chat server.
     Other,
 }
@@ -556,18 +554,10 @@ fn usage(ctx: &CmdCtx, tok0: &str, rest: &str) -> Vec<ChatAction> {
     vec![err(ctx, &format!("Usage: {tok0}{rest}"))]
 }
 
-/// Feedback of the `/ignore` toggle once the hub knows the new state (`FUN_100ba9fc`).
-pub fn ignore_feedback(now_ignored: bool, name: &str, ctx: &CmdCtx) -> ChatAction {
-    let k = if now_ignored { "Ignore_IgnoringCharacter" } else { "Ignore_UnignoringCharacter" };
-    info(ctx, &fmt(&key(ctx, k), &[name]))
-}
-
 /// What Shift+R (`TextInputModule_t::StartChatReplyMessage`, GUI 0x10021fd0 -> 0x1009494e) puts into the opened input line.
 pub fn reply_prefill(ctx: &CmdCtx) -> String {
     ctx.last_tell_from.map_or(String::new(), |n| format!("/tell {n} "))
 }
-/// `StartChatCmdMessage` (GUI 0x10021f18) opens the input line with this text.
-pub const CMD_PREFILL: &str = "/";
 
 fn strip_quotes(s: &str) -> &str {
     s.trim_end_matches('"').trim_start_matches('"')
@@ -623,7 +613,6 @@ fn send(ctx: &CmdCtx, g: &GroupInfo, text: String, mode: u8) -> ChatAction {
             3 => ChatAction::Emote(text),
             _ => ChatAction::Vicinity(text),
         },
-        GroupKind::Tell => ChatAction::Tell { to: g.name.clone(), text },
         _ => ChatAction::Group { group: g.name.clone(), text },
     }
 }
@@ -1230,7 +1219,6 @@ mod tests {
         assert_eq!(parse("/ignore", &c), [ChatAction::IgnoreToggle { id: 9, name: Some("Bob".into()) }]);
         c.target = Some(Target { kind: 51000, id: 9, name: "Mob".into() });
         assert!(fb(&parse("/ignore", &c)[0]).contains("Can only ignore"));
-        assert!(fb(&ignore_feedback(true, "Bob", &c)).contains("Ignoring character \"Bob\"."));
     }
 
     #[test]

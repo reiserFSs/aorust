@@ -528,11 +528,13 @@ pub fn routed(msg: &N3Chat, ctx: &ZoneChatCtx) -> Vec<ZoneText> {
     vec![ZoneText { channel, line: ChatLine::new(ChatKind::Other(color_code_name(color)), text) }]
 }
 
+#[cfg(test)]
 /// [`routed`] without the routing id.
 pub fn lines(msg: &N3Chat, ctx: &ZoneChatCtx) -> Vec<ChatLine> {
     routed(msg, ctx).into_iter().map(|z| z.line).collect()
 }
 
+#[cfg(test)]
 /// Text of a message the original shows on screen rather than in a chat window (AFCM `0x19` -> `RenderTextModule_t`, or the
 /// `GlobalSignals_c` `+0x1d8` signal for `FormatFeedbackIIR_t` mode 1). Layout/duration of that overlay are not part of the chat work.
 pub fn screen_text(msg: &N3Chat, ctx: &ZoneChatCtx) -> Option<String> {
@@ -561,6 +563,7 @@ pub enum Speech {
 }
 
 impl Speech {
+    #[cfg(test)]
     /// Slash command -> speech type (`String::CompareNoCase`, as `FUN_1009caf6` tests them).
     pub fn from_command(cmd: &str) -> Option<Speech> {
         Some(match cmd.to_ascii_lowercase().as_str() {
@@ -595,14 +598,17 @@ pub fn frame(seq: u16, char_id: u32, speech: Speech, text: &str, target: Identit
     Some(text_frame(seq, char_id, text_payload(kind, target, &buf)))
 }
 
+#[cfg(test)]
 pub fn vicinity_frame(seq: u16, char_id: u32, text: &str, target: Identity) -> Option<Frame> {
     frame(seq, char_id, Speech::Say, text, target)
 }
 
+#[cfg(test)]
 pub fn shout_frame(seq: u16, char_id: u32, text: &str, target: Identity) -> Option<Frame> {
     frame(seq, char_id, Speech::Shout, text, target)
 }
 
+#[cfg(test)]
 pub fn whisper_frame(seq: u16, char_id: u32, text: &str, target: Identity) -> Option<Frame> {
     frame(seq, char_id, Speech::Whisper, text, target)
 }

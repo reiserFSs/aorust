@@ -114,6 +114,7 @@ impl ChatNet {
 
     /// Live-test hook (`AOMAC_LIVE_STEPS=chatdrop`): close our end of the chat socket; the session thread reports `Disconnected("closed")`
     /// and the normal retry pacing takes over.
+    #[cfg(test)]
     pub fn drop_connection(&self) {
         if let Some(s) = &self.session {
             s.send(ChatCmd::Quit);

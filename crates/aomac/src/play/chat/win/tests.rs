@@ -120,7 +120,7 @@ fn sample(gui: &mut Gui, ch: &mut ChatWindows) {
     let l = |k: ChatKind, t: &str| ChatLine::new(k, t);
     ch.push(gui, &l(ChatKind::System, "Welcome to Project Rubi-Ka! Type /help for a list of chat commands."), None);
     ch.push(gui, &l(ChatKind::Error, "Error: Unknown command."), None);
-    ch.push(gui, &l(ChatKind::CmdFeedback, "You are now AFK."), None);
+    ch.push(gui, &l(ChatKind::System, "You are now AFK."), None);
     ch.push_msg(gui, &msg(G_VICINITY, "", "Reiserfs", "Anyone selling a Jobe Cluster?", 0));
     ch.push_msg(gui, &msg(G_VICINITY, "", "Nanogirl", "psst, over here", 1));
     ch.push_msg(gui, &msg(G_VICINITY, "", "Vhab", "WTB INFERNO", 2));

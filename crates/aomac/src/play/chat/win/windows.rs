@@ -201,17 +201,6 @@ impl ChatWindows {
         }
     }
 
-    /// Hides/shows every chat window (the whole interface hidden, e.g. cutscenes); text keeps accumulating.
-    pub fn set_visible(&mut self, gui: &mut Gui, visible: bool) {
-        for f in &self.frames {
-            gui.set_window_visible(f.id, visible);
-        }
-        if !visible {
-            gui.clear_focus();
-            gui.close_menu();
-        }
-    }
-
     /// `ChatGUIModule_c::AddGroup` (0x10085f91): a group the chat server announced (windows that do not exclude it show it).
     pub fn add_group(&mut self, id: u64, name: &str) {
         self.groups.insert(id, name.to_string());
@@ -264,17 +253,12 @@ impl ChatWindows {
     }
 
     /// A line the client itself generates (errors, command feedback, system, combat feedback).
-    /// `group_hint` = a group name (`Other` combat lines name their group, `ChatKind::Group` its channel).
+    /// `group_hint` = a group name (`Other` combat lines name their group).
     pub fn push(&mut self, gui: &mut Gui, line: &ChatLine, group_hint: Option<&str>) {
         let by_name = |n: &str| self.groups.iter().find(|(_, g)| g.eq_ignore_ascii_case(n)).map(|(i, _)| *i);
         let (group, color) = match &line.kind {
-            ChatKind::Error | ChatKind::System | ChatKind::CmdFeedback => (G_SYSTEM, line.kind.color_name().to_string()),
-            ChatKind::TellOut | ChatKind::TellIn => (G_TELL, line.kind.color_name().to_string()),
-            ChatKind::Vicinity | ChatKind::Shout | ChatKind::Whisper | ChatKind::Emote => (G_VICINITY, line.kind.color_name().to_string()),
-            ChatKind::Group(n) => {
-                let id = group_hint.and_then(by_name).or_else(|| by_name(n)).unwrap_or(0);
-                (id, group_color(id, 0).to_string())
-            }
+            ChatKind::Error | ChatKind::System => (G_SYSTEM, line.kind.color_name().to_string()),
+            ChatKind::TellOut => (G_TELL, line.kind.color_name().to_string()),
             ChatKind::Other(c) => (group_hint.and_then(by_name).unwrap_or(G_SYSTEM), c.to_string()),
         };
         self.deliver(gui, group, |stamp| format!("<div indent=wrapped><font color={color}>{stamp}{}</font></div>", line.text));
@@ -524,15 +508,11 @@ impl ChatWindows {
         }
     }
 
-    /// `#%016x#` of the output group of the window that has (or last had) the focus: where a plain line without `/` goes.
+    /// `#%016x#` of the output group of the window that has (or last had) the focus.
+    #[cfg(test)]
     pub fn active_output_group(&self) -> Option<String> {
         let w = self.active_win()?;
         (w.cfg.output_group != 0).then(|| group_ident(w.cfg.output_group))
-    }
-
-    /// Id form of [`active_output_group`](Self::active_output_group).
-    pub fn active_output_id(&self) -> Option<u64> {
-        self.active_win().map(|w| w.cfg.output_group).filter(|g| *g != 0)
     }
 
     /// `/ch <group>` (`FUN_1009a06f`): the active window's output group becomes `id`.

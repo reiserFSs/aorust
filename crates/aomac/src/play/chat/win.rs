@@ -114,28 +114,9 @@ pub fn group_color(id: u64, kind: u8) -> &'static str {
 
 /// Local time `(%H:%M) ` (`strftime` in `FUN_1009b4cf`).
 fn timestamp() -> String {
-    #[repr(C)]
-    struct Tm {
-        sec: i32,
-        min: i32,
-        hour: i32,
-        mday: i32,
-        mon: i32,
-        year: i32,
-        wday: i32,
-        yday: i32,
-        isdst: i32,
-        gmtoff: i64,
-        zone: *const u8,
-    }
-    extern "C" {
-        fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
-    }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let mut tm = Tm { sec: 0, min: 0, hour: 0, mday: 0, mon: 0, year: 0, wday: 0, yday: 0, isdst: 0, gmtoff: 0, zone: std::ptr::null() };
-    // SAFETY: localtime_r fills the caller-provided struct (layout of macOS `struct tm`).
-    unsafe { localtime_r(&now, &mut tm) };
-    format!("({:02}:{:02}) ", tm.hour, tm.min)
+    let (h, m, _) = super::zonecmd::local_time(now).unwrap_or_default();
+    format!("({h:02}:{m:02}) ")
 }
 
 fn user_link(name: &str, gm: bool) -> String {

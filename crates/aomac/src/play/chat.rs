@@ -182,6 +182,7 @@ impl Chat {
     }
 
     /// Live-test hook: drop the chat-server connection (see [`net::ChatNet::drop_connection`]).
+    #[cfg(test)]
     pub fn drop_connection(&self) {
         self.net.drop_connection();
     }

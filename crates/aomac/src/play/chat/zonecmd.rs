@@ -181,8 +181,8 @@ pub fn played_line(now_unix: i64, tz_offset_min: i32, game: (u32, u32)) -> Strin
     )
 }
 
-/// UTC offset of the local time zone in minutes (`_localtime64` of the original), 0 where unavailable.
-pub fn local_offset_minutes(now_unix: i64) -> i32 {
+/// Local wall clock `(hour, minute, UTC offset in minutes)` of a unix time (`_localtime64` / `strftime` of the original); `None` where unavailable.
+pub fn local_time(now_unix: i64) -> Option<(u32, u32, i32)> {
     #[cfg(unix)]
     {
         #[repr(C)]
@@ -206,16 +206,22 @@ pub fn local_offset_minutes(now_unix: i64) -> i32 {
         // SAFETY: `localtime_r` fills the caller-provided struct (BSD/glibc layout with `tm_gmtoff`) and returns null on failure.
         unsafe {
             if localtime_r(&now_unix, tm.as_mut_ptr()).is_null() {
-                return 0;
+                return None;
             }
-            (tm.assume_init().gmtoff / 60) as i32
+            let tm = tm.assume_init();
+            Some((tm.hour as u32, tm.min as u32, (tm.gmtoff / 60) as i32))
         }
     }
     #[cfg(not(unix))]
     {
         let _ = now_unix;
-        0
+        None
     }
+}
+
+/// UTC offset of the local time zone in minutes, 0 where unavailable.
+pub fn local_offset_minutes(now_unix: i64) -> i32 {
+    local_time(now_unix).map_or(0, |t| t.2)
 }
 
 fn text_state<'a>(ctx: &'a ZoneCmdCtx) -> TextState<'a> {
