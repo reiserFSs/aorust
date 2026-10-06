@@ -345,6 +345,17 @@ impl Audio {
         }
     }
 
+    /// `SandyInterfaceModule_t::PlayGameSound(sound id, position)`: a one-shot of the sound definition `id` at `pos`, heard from `listener`
+    /// (both in scene space; the level only depends on the distance, `game::attenuation`). Returns the voices started.
+    pub fn play_game_sound(&self, id: u32, pos: [f32; 3], listener: [f32; 3]) -> Vec<u64> {
+        let mut g = self.rt();
+        let Some(rt) = g.as_mut() else { return Vec::new() };
+        let db = rt.lib.sounds.clone();
+        let Some(def) = db.get(id) else { return Vec::new() };
+        let d = (0..3).map(|i| (pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt();
+        rt.play_at(&self.sh, def, d)
+    }
+
     /// Plays a file below `cd_image/sound` (e.g. `sfx/gui/click`) once, centred. Returns the voice id (0 = not played).
     pub fn play_sfx(&self, rel: &str, gain: f32) -> u64 {
         match self.sh.resolve(rel) {

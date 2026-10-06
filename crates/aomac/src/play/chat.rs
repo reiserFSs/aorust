@@ -146,6 +146,12 @@ impl Chat {
         }
     }
 
+    /// `GlobalSignals+0x17c (0, text, colorCode)` [GC `FUN_10012b05`]: a coloured line of the System window (`FlowControlModule_t`
+    /// `TeleportStartedMessage` / `TeleportEndedMessage` emit it with code 12 `CCRed`, docs/zone/world.md §10.2).
+    pub fn system_line(&mut self, gui: &mut Gui, text: &str, code: u32) {
+        self.line_to(gui, ChatLine::new(ChatKind::System, log::window_html(log::color_name(code), text)), Some("System"));
+    }
+
     pub fn take_game(&mut self) -> Vec<GameAction> {
         std::mem::take(&mut self.game)
     }

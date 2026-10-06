@@ -10,6 +10,7 @@ mod controls;
 mod create;
 mod delete;
 mod dynels;
+mod dynels_doors;
 mod flow;
 mod hud;
 mod hud_aggdef;
@@ -137,6 +138,9 @@ struct Play {
     loading_img: Option<(GfxId, u32, u32)>,
     fade: Fade,
     world_ready: bool,
+    /// `FlowControlModule_t::m_isTeleporting` [GUI 0x102635d8] while in the world: set by `TeleportStarted`, cleared by `TeleportEnded`
+    /// (the new world appeared). The HUD and chat stay; the 3D world is hidden (docs/zone/world.md §10.2).
+    teleporting: bool,
     /// State of the current zone connection (`ZoneHandoff` .. disconnect).
     zone: zone::Zone,
     /// Frames drawn since the world appeared; `CharInPlay` is sent after [`flow::IN_PLAY_FRAMES`].
@@ -233,6 +237,7 @@ impl Play {
             loading_img: None,
             fade: Fade::In(0.0),
             world_ready: false,
+            teleporting: false,
             zone: zone::Zone::default(),
             world_frames: 0,
             in_world_msg: String::new(),

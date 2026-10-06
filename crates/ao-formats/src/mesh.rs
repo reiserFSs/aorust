@@ -12,6 +12,9 @@ use ao_rdb::RecordStore;
 use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, Texture, TextureKey, Vertex, IDENTITY};
 use std::collections::HashMap;
 
+mod rig;
+pub use rig::NodeRig;
+
 /// Primary static-mesh record type (full detail).
 pub const MESH_TYPE: u32 = 1010001;
 /// Second mesh record type sharing the ids of a subset of [`MESH_TYPE`] with fewer triangles.
@@ -129,9 +132,8 @@ fn mul(a: &Mat, b: &Mat) -> Mat {
     o
 }
 
-/// `RRefFrame_t::UpdateWorldMatrix` local part: quaternion rows, uniform scale, translation, then
-/// `anim_matrix * local` when an animation matrix is present.
-fn local_matrix(n: &Object) -> Mat {
+/// `RRefFrame_t::UpdateWorldMatrix` local part without the animation matrix: quaternion rows, uniform scale, translation.
+fn base_matrix(n: &Object) -> Mat {
     let [x, y, z, w] = n.f32s::<4>("local_rot").unwrap_or([0.0, 0.0, 0.0, 1.0]);
     let s = n.f32s::<1>("scale").map_or(1.0, |s| s[0]);
     let p = n.f32s::<3>("local_pos").unwrap_or([0.0; 3]);
@@ -146,6 +148,12 @@ fn local_matrix(n: &Object) -> Mat {
             *v *= s;
         }
     }
+    m
+}
+
+/// [`base_matrix`], then `anim_matrix * local` when an animation matrix is present.
+fn local_matrix(n: &Object) -> Mat {
+    let m = base_matrix(n);
     match n.f32s::<16>("anim_matrix") {
         Some(a) => mul(&[[a[0], a[1], a[2], a[3]], [a[4], a[5], a[6], a[7]], [a[8], a[9], a[10], a[11]], [a[12], a[13], a[14], a[15]]], &m),
         None => m,

@@ -21,6 +21,8 @@ pub const QUEST_FULL_UPDATE: u32 = 0x465A_4061; // QuestFullUpdateIIR_t
 pub const APPEARANCE_UPDATE: u32 = 0x4162_4F0D; // AppearanceUpdateIIR_c
 pub const CHARACTER_ACTION: u32 = 0x5E47_7770; // CharacterActionIIR_t
 pub const CORPSE_FULL_UPDATE: u32 = 0x4F47_4E05; // CorpseFullUpdateIIR_t
+pub const DOOR_FULL_UPDATE: u32 = 0x365A_5071; // DoorFullUpdateIIR_t
+pub const DOOR_STATUS_UPDATE: u32 = 0x4C7D_403B; // DoorStatusUpdateIIR_t
 
 /// Container size words are `(count + 1) * 0x3F1` (`x / 0x3f1 - 1` everywhere in Gamecode.dll).
 const UNIT: u32 = 0x3F1;
@@ -38,6 +40,8 @@ pub enum World {
     Appearance(AppearanceUpdate),
     CharacterAction(CharacterAction),
     Corpse(Corpse),
+    Door(Door),
+    DoorStatus(DoorStatus),
 }
 
 /// Decode one of this module's messages; `Ok(None)` for any other message type.
@@ -52,6 +56,8 @@ pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<World>> {
         APPEARANCE_UPDATE => World::Appearance(AppearanceUpdate::read(r)?),
         CHARACTER_ACTION => World::CharacterAction(CharacterAction::read(r)?),
         CORPSE_FULL_UPDATE => World::Corpse(Corpse::read(r)?),
+        DOOR_FULL_UPDATE => World::Door(Door::read(r)?),
+        DOOR_STATUS_UPDATE => World::DoorStatus(DoorStatus::read(r)?),
         _ => return Ok(None),
     }))
 }
@@ -412,6 +418,12 @@ pub struct DynelBase {
 
 impl DynelBase {
     fn read(r: &mut Reader) -> Result<Self> {
+        Self::read_with(r, 3)
+    }
+
+    /// The chain up to `version3`, which the subclass fixes (`DAT_101c0f80` = 3 for the vending machine and the corpse,
+    /// `DAT_101c0ff8` = 2 for the door).
+    fn read_with(r: &mut Reader, version3: u32) -> Result<Self> {
         let mut b = Self { version: r.u32()?, ..Self::default() };
         if b.version != 11 {
             bail!("dynel base version {} (client expects 11)", b.version);
@@ -436,8 +448,8 @@ impl DynelBase {
         b.x4ac = r.i32()?;
         b.list_74 = identities(r)?;
         b.version3 = r.u32()?;
-        if b.version3 != 3 {
-            bail!("dynel base version3 {} (client expects 3)", b.version3);
+        if b.version3 != version3 {
+            bail!("dynel base version3 {} (client expects {version3})", b.version3);
         }
         Ok(b)
     }
@@ -453,6 +465,53 @@ impl DynelBase {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VendingMachine {
     pub base: DynelBase,
+}
+
+/// `DoorFullUpdateIIR_t` [GC vtable 0x10166aac, slot 7 = `FUN_1009fa37`]: the dynel base chain (`FUN_100a0730`, `FUN_100a110a`) with
+/// `version3` = 2, then one `i32` stored at `this+0x78` (`FUN_1009fa81` writes it back). The client creates the dynel from it
+/// (`FUN_1009faaf`, slot 2) only when the header identity kind is a door's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Door {
+    pub base: DynelBase,
+    /// `this+0x78`. **[UNRESOLVED]** meaning (nothing in the apply path reads it).
+    pub value_78: i32,
+}
+
+impl Door {
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(Self { base: DynelBase::read_with(r, 2)?, value_78: r.i32()? })
+    }
+}
+
+/// `DoorStatusUpdateIIR_t` [GC vtable 0x10166ae0; slot 7 = `FUN_1009fde6` reads, slot 8 = `FUN_1009fcb8` writes, slot 2 = the apply
+/// `FUN_1009fc10`]: `u32 version` (= 2, `DAT_101c1020`), three `u8` (`== 1` is true), `i32`, one more `u8`, then a stat list
+/// (`FUN_1002d8bd`: `(n + 1) * 0x3F1` size word, `n` pairs) that the apply path does not read. The header identity is the door.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoorStatus {
+    /// `this+0x18`: lock the door (`Flags` bit 0x40; a locked open door closes first).
+    pub locked: bool,
+    /// `this+0x19`: open (true) or close (false) the door.
+    pub open: bool,
+    /// `this+0x1c`: stored with `SetStat(0xC3, value)` (stat 195, unnamed in the client table).
+    pub value_c3: i32,
+    /// `this+0x1a`: sets the door's byte `+0x1d5` (`FUN_1007ed64` sets the same byte and calls vtable `+0xac`).
+    pub flag_1a: bool,
+    /// `this+0x20`.
+    pub stats: Vec<(u32, i32)>,
+}
+
+impl DoorStatus {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let version = r.u32()?;
+        if version != 2 {
+            bail!("DoorStatusUpdate version {version} (client expects 2)");
+        }
+        let locked = r.u8()? == 1;
+        let open = r.u8()? == 1;
+        let value_c3 = r.i32()?;
+        let flag_1a = r.u8()? == 1;
+        Ok(Self { locked, open, value_c3, flag_1a, stats: id_pairs(r)? })
+    }
 }
 
 /// One `GameData::SpellData_t` of a corpse (`SpellFormats_c::ReadBinary` [GD 0x1000f4a6]): header
@@ -719,6 +778,8 @@ mod tests {
         assert_eq!(key("AppearanceUpdateIIR_c"), APPEARANCE_UPDATE);
         assert_eq!(key("CharacterActionIIR_t"), CHARACTER_ACTION);
         assert_eq!(key("CorpseFullUpdateIIR_t"), CORPSE_FULL_UPDATE);
+        assert_eq!(key("DoorFullUpdateIIR_t"), DOOR_FULL_UPDATE);
+        assert_eq!(key("DoorStatusUpdateIIR_t"), DOOR_STATUS_UPDATE);
     }
 
     #[test]
@@ -808,6 +869,55 @@ mod tests {
         let mut bad = body[..4].to_vec();
         bad.extend((1000 * UNIT).to_be_bytes());
         assert!(FullCharacter::read(&mut Reader::new(&bad)).is_err());
+    }
+
+    /// `DoorStatusUpdateIIR_t` body as `FUN_1009fcb8` writes it: version 2, locked, open, `value_c3`, flag, an (empty) stat list.
+    fn door_status_body(locked: u8, open: u8, value: i32, flag: u8, stats: &[(u32, i32)]) -> Vec<u8> {
+        let mut b = 2u32.to_be_bytes().to_vec();
+        b.extend([locked, open]);
+        b.extend(value.to_be_bytes());
+        b.push(flag);
+        b.extend(((stats.len() as u32 + 1) * UNIT).to_be_bytes());
+        for (s, v) in stats {
+            b.extend(s.to_be_bytes());
+            b.extend(v.to_be_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn door_status_update() {
+        let d = DoorStatus::read(&mut Reader::new(&door_status_body(0, 1, 7, 1, &[(0x62, 100)]))).unwrap();
+        assert_eq!(d, DoorStatus { locked: false, open: true, value_c3: 7, flag_1a: true, stats: vec![(0x62, 100)] });
+        // the client's `FUN_1009fbee` reads `== 1`: any other byte is false
+        let d = DoorStatus::read(&mut Reader::new(&door_status_body(1, 2, -1, 0, &[]))).unwrap();
+        assert_eq!((d.locked, d.open, d.value_c3, d.flag_1a), (true, false, -1, false));
+        let b = door_status_body(0, 0, 0, 0, &[]);
+        for n in 0..b.len() {
+            assert!(DoorStatus::read(&mut Reader::new(&b[..n])).is_err(), "{n} bytes");
+        }
+        let mut bad = b.clone();
+        bad[3] = 3;
+        assert!(DoorStatus::read(&mut Reader::new(&bad)).is_err());
+        let mut huge = b[..11].to_vec();
+        huge.extend((60_000 * UNIT).to_be_bytes());
+        assert!(DoorStatus::read(&mut Reader::new(&huge)).is_err());
+    }
+
+    /// A door update is the dynel base chain with `version3` 2 and one more `i32` (the captured vending machine's chain, edited).
+    #[test]
+    fn door_full_update() {
+        let f = capture_n3().into_iter().find(|f| f.payload[..4] == VENDING_MACHINE_FULL_UPDATE.to_be_bytes()).unwrap();
+        let mut body = f.payload[13..].to_vec();
+        let n = body.len();
+        body[n - 4..].copy_from_slice(&2u32.to_be_bytes());
+        body.extend(9i32.to_be_bytes());
+        let d = Door::read(&mut Reader::new(&body)).unwrap();
+        let v = DynelBase::read(&mut Reader::new(&f.payload[13..])).unwrap();
+        assert_eq!((d.value_78, d.base.version3, d.base.stats.len()), (9, 2, v.stats.len()));
+        assert_eq!((d.base.position, d.base.template), (v.position, v.template));
+        // a vending machine's `version3` (3) is not a door's
+        assert!(Door::read(&mut Reader::new(&f.payload[13..])).is_err());
     }
 
     #[test]

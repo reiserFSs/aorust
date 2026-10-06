@@ -340,23 +340,65 @@ the corpse to the dead character's relative position when closer than a threshol
   `ZoneInfo` (protocol.md §5), keeps the wire tap and reports `LoginEvent::ZoneRedirect { zone_ip, zone_port }`; every following
   frame (`PlayfieldAnarchyF`, own character, `GameTime`, ...) is a `ZoneFrame` of the new connection. Test
   `zone_redirection_reconnects_with_the_same_cookies` (loopback servers). The original does this inside `Client_t` without the UI.
-* **Teleport UI** (`FlowControlModule_t`, GUI.dll): `TeleportStartedMessage` [GUI 0x1002910e] (registered at [GUI 0x1002ad2c]) sets `m_isTeleporting`, emits the `GlobalSignals_c` text signal with LDB text `0x6e` and
-  `+0x48`, clears `DisplaySystem+0x44`, sets `InputConfig+0x18 = 1` (input locked), stops `InputConfig+0x1a8` timer, sends
-  `AFCM::Send(0x1e, 0x112)` and saves the preferences; `TeleportEndedMessage` [GUI 0x100292ce] (also the `CharInPlay` countdown, docs/zone/outgoing.md §3)
-  clears the flag, reads `N3Msg_GetPosAndPF`, signals the new playfield (`BugReport_t::SetPFProxyInfo`, `N3Msg_GetPFName` /
-  `N3Msg_IsDungeon` text). `ServerLogin3DModule_t` [GUI 0x100175f0] (program 5, module 0x1b) is the only loading-screen module;
-  `AFCM::Send(.., 0x135)` (`StartClosingLoadscreen`) is called only from `ServerLogin3DModule_t`'s own setup [GUI 0x1001765c] and
-  `FlowControlModule_t::AliveMessage` [GUI 0x10028543]; `cd_image/gui/Default/gfx` holds only `ai_loading_login.png`, `welcome_to_rubika.jpg`
-  and the unused `loadingimage_fullscreen.jpg`: there is **no per-playfield loading image**.
-* **UNRESOLVED [GUESS]**: whether the original shows `ServerLogin3DModule_t` (program 5) again for a teleport (the receiver of
-  `AFCM (0x1e, 0x112)` and the sender of a second `AddProgram(5)` were not located: `Imm` scans of GUI.dll for 0x112 / 0x1e / 0x135
-  find only the send sites above, no registration). The app shows the same loading screen (`ai_loading_login.png`, black + image fade
-  in over `FADE_IN`, text "..Anarchy Online is loading..") without `PlayStartupMusic` (that is `CharacterLoggedInMessage`, the
-  login only).
-* **App** (`Play::begin_zone_change`): a `ZoneEvent::Playfield` or `LoginEvent::ZoneRedirect` while `Screen::InWorld` closes the
-  in-world interface, drops the dynels / actors (`Zone::reset_world`), clears `in_play_sent`/`world_frames` and shows the
-  loading screen again (`host.fly = false`); the new playfield is loaded in the background (a result for a playfield the server
-  has since replaced is dropped), the player is placed from the new own `SimpleCharFullUpdate` when the screen dissolves
-  and `CharInPlay` is sent after the same countdown (>= 11 frames) as the first time ([INFERENCE] from `SetMainDynel` -> event 6
-  -> `TeleportEndedMessage` running again, docs/zone/outgoing.md §3). Tests: `flow::tests::second_playfield_shows_the_loading_screen_again`
-  (captures `zone_newchar_ithaca.rec` then `zone_ithaca.rec`), `zone_redirect_shows_the_loading_screen`.
+* **What starts a zone change (RE, N3.dll / Gamecode.dll / GUI.dll, Ghidra decompile + asm):**
+  * **`n3TeleportIIR_t` 0x43197D22** (S→C; `IsAllowedFromClient` false; `ao_net::n3::teleport`). `ReadSubClass` [N3 0x10029e7f]:
+    `f32 x3 pos` (`+0x18`), `f32 x4 rot` (`+0x24`, x y z w), `PlayfieldProxy_t` (`+0x34`: `u8 'a'`, `Identity playfield`, `i32 attribute`,
+    `i32 exit_door`, `Identity exit_door_id`, `FUN_10038402`), `Identity` (`+0x4c`), `Identity` (`+0x54`), `i32 len` (> 1000 fails) +
+    `len` bytes (kept in the message's own stream, unused). `Activate` [N3 0x10029f87] on the header's dynel:
+    `exit_door_id.instance` (`+0x48`) **== 0** → `n3Dynel_t::UpdateLastAllowedPosition(-1, pos)` + `SetRelPosRot(pos, rot)` (a placement
+    inside the playfield; for the own character also `FUN_10022b2d(engine+0x7c)` and the engine's vtable `+0x48`, the controller reset);
+    **!= 0** → for the own character `n3EngineClient_t::StartTeleport` [N3 0x100076ad] (= `n3Playfield_t::StopPlayfield` [N3 0x1000ccbd]:
+    every child dynel `Die`s, `playfield+0x64 = 1`; then `n3Engine_t::SetTeleportStatus(true)`), other dynels ignore it. App:
+    `Zone::on_frame` → `ZoneEvent::Teleport` (own, destination) / `DynelState` + `Mover::on_teleport` (others) / the own in-place
+    placement goes to `Movement::teleport` through the own-event queue.
+  * `PlayfieldAnarchy_t::Run` [GC 0x101225b3] posts GUI event **5** every frame while `playfield+0x64` is set; `FUN_1000482e` [GC] maps
+    event 5 → AFCM `0x145` = `FlowControlModule_t::TeleportStartedMessage` and event 6 → `0x144` = `TeleportEndedMessage`.
+    Event 5 is also posted by `TeleportTrier_t::StartTryingTeleport` [GC 0x10037d48] (the **client-initiated** path:
+    `n3EngineClientAnarchy_t::StartTeleportTry` [GC 0x10018f9a] runs when the own dynel is in a teleportal, `FUN_100585ee` /
+    `n3Zone_t::IsPosInTeleportal` [GC], or on the own-character callbacks `FUN_100a4d7d` / `FUN_100a7510` / `FUN_100a7a7f` / `FUN_1007eec3`;
+    it sends `MovementChanged(0x16)`, creates a `TeleportTrier_t` that fails after a timeout (`RunFunction`, `TeleportFailed` posts event 6
+    and `Feedback_AreaChangeNotInitiated`)), and by `FUN_100a94ce` (own `SimpleChar_t`). Event 6 is posted by
+    `n3EngineClientAnarchy_t::SetMainDynel` [GC 0x10019f77] (the own dynel appeared in the new playfield), `TeleportFailed` and `FUN_1005c0f3`.
+  * `m_isTeleporting` [GUI 0x102635d8] is **initialised true** by `FlowControlModule_t::InitialiseMessage` [GUI 0x10027739], so the very
+    first login is a "teleport" ended by the first `SetMainDynel`; both handlers are guarded by it (`Started` runs only when false,
+    `Ended` only when true); `TargetingModule_t::FrameProcess` [GUI 0x10025fa4] does nothing while it is set.
+* **`TeleportStartedMessage` [GUI 0x1002910e]** (registered at [GUI 0x1002ad2c] as message `0x145`): `m_isTeleporting = true`; emits
+  `GlobalSignals+0x17c (0, LDB text (110, "ChangingArea") = "Changing area. Please wait.", 0xc)` = a **red** (`CCRed`) line in the System
+  window (docs/chat/zone.md §1); `SpriteList_t::ParseList` + `DisplaySystem` vtable `+0x14` (render + present a frame) **twice**;
+  `DisplaySystem+0x44 = 0` (the 3D viewport flag set by `Activate3DViewPort` [DisplaySystem 0x10078c02], tested by the frame function
+  [DisplaySystem 0x10079a2e]: `RViewPort_t::Process` of the 3D root is skipped, the sprites/GUI are still drawn); `InputConfig+0x18 = 1`
+  and the `InputConfig+0x1a8` timer stopped; `AFCM::Send(0x1e, 0x112)` = `TargetingModule_t::RemoveTargetMessage` (registered with 0x112
+  in the `TargetingModule_t` ctor [GUI 0x10026322]); `Preferences_t::SaveAllPrefs`.
+* **`TeleportEndedMessage` [GUI 0x100292ce]** (`0x144`): `m_isTeleporting = false`; `N3Msg_GetPosAndPF`, `BugReport_t::SetPFProxyInfo`;
+  signal `+0x17c (0, text, 0xc)` with (110, `EnteringPF`) = `Entering '%s'` formatted with `N3Msg_GetPFName` (`FUN_1003676c(pf id)`, else
+  the playfield's own name), or (110, `EnteringNewArea`) = `Entering new area.` for `N3Msg_IsDungeon` / no name; then arms the
+  `CharInPlay` countdown (`DAT_102760cd = 1`, `DAT_102760d8 = 120.0`, `DAT_102760dc = 10`; docs/zone/outgoing.md §3). The server echoes our
+  `CharInPlayIIR_t` for the own character: its `Activate` [GC 0x1007264d] posts event `0xa5` = `FlowControlModule_t::AliveMessage`
+  [GUI 0x10028543]: closes the loading screen if module `0x1b` is active (it is not after a teleport), `SetStaticInputMode(8)`,
+  `Activate3DViewPort` (the world is drawn again), `EnableUserInput`, clears the countdown flag.
+* **Loading screen: none for a teleport.** `ServerLogin3DModule_t` (program 5, module `0x1b`) is added only by
+  `CharCreateDoneMessage` [GUI 0x100278f9] (the `AddProgram` scan of GUI.dll finds no other `PUSH 5`) and is closed by message `0x135`
+  from `AliveMessage`; `SetLoadingScreen(n)` only picks `welcome_to_rubika.jpg` after character creation (docs/screens.md §7);
+  `cd_image/gui/Default/gfx` has no per-playfield image. Messages `0x136` / `0x13b` (`ActionView_t` frame processor [GUI 0x100249a0]:
+  `Activate3DViewPort` / `DisplaySystem+0x44 = 0`) have no sender in GUI.dll or Gamecode.dll. The window layer is never torn down: the
+  HUD, chat windows and bars are GUI windows that read `N3Msg_*` state, nothing in these handlers closes or recreates them. No fade,
+  no `PlayStartupMusic` (only `CharacterLoggedInMessage`, the login); the playfield's ambience / district music follow
+  `PlayfieldInit` [GC 0x10016e2c] → `SandyInterfaceModule_t::ActivateGameZone` (docs/formats.md §audio).
+* **App** (`Play::begin_zone_change` = `TeleportStarted`, `Play::entering_text` + the world-ready block of `frame` = `TeleportEnded`):
+  `ZoneEvent::Teleport`, `ZoneEvent::Playfield` or `LoginEvent::ZoneRedirect` while `Screen::InWorld` (idempotent through
+  `Play::teleporting`, also when the server sends no `n3TeleportIIR_t`): red `ChangingArea` line, target cleared, `Player` dropped (input
+  locked), old dynels/actors dropped (`Zone::reset_world`), `CharInPlay` owed again, and a black full-screen quad under the GUI
+  (the 3D viewport is off; black is [INFERENCE]). The HUD and chat stay. The new playfield loads in the background (a result for a
+  replaced playfield is dropped); when it is ready the scene/sky/camera are replaced, `Hud::provide_ground` refreshes the map, the player is
+  rebuilt from the new own `SimpleCharFullUpdate`, a red `EnteringPF` / `EnteringNewArea` line is printed, `teleporting` clears and the
+  `CharInPlay` countdown (> 10 frames) starts. Without `AliveMessage` plumbing the input is unlocked at that point, not at the echo.
+  Tests: `flow::tests::{second_playfield_keeps_the_interface_and_hides_the_world, zone_redirect_starts_the_teleport,
+  teleport_iir_starts_the_zone_change_only_with_a_destination}`, `ao_net::n3::teleport::tests`.
+* **Not implemented** (reasons): (1) the client-initiated path, i.e. the teleportal test (`IsPosInTeleportal` [N3 0x1001a86a] on the
+  own vehicle position each frame, gate `FUN_1005859d`, `MovementChanged(0x16)`, the `TeleportTrier_t` timeout and the
+  `Feedback_AreaChangeNotInitiated` text; the portal polygons are decoded in `collision/kd.rs` but unused): the live run (docs/play.md)
+  shows the server changes the playfield from the movement stream anyway, so the app only reacts to what the server sends; (2) no
+  dungeon test for `EnteringNewArea` (the `Layout` of the loaded playfield is not carried to the flow); (3) in-world audio is not wired to
+  playfields yet (`Audio::set_playfield` is only used by the offline viewer, `main.rs`), so the zone-change music/ambience switch of the
+  original has no app counterpart; (4) `SaveAllPrefs` and the two `ParseList`/present passes are not reproduced (no effect on state/visuals
+  we draw).

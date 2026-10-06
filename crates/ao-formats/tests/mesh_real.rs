@@ -73,3 +73,46 @@ fn glow_and_emissive_fields_are_emitted() {
     }
     assert!(glow > 100 && emissive > 100, "glow {glow}, emissive {emissive}");
 }
+
+/// The animation matrix of every node at time 0 is the `anim_matrix` the static decode bakes in (doors: docs/zone/doors.md §3):
+/// the rig posed at 0 reproduces the static vertices, and the door meshes move when posed at their total time. The one exception is
+/// mesh 224248, whose node 1 repeats its `local_rot` in its rotation key: `M(t) * R(local_rot)` (the engine's formula, randy31
+/// `UpdateWorldMatrix` @0x10044fa2) applies it twice once the animation runs.
+#[test]
+fn door_meshes_pose_to_the_static_decode_at_time_zero() {
+    let Some(store) = store() else { return };
+    let mut meshes = std::collections::BTreeSet::new();
+    for pf in store.ids(1000026).unwrap() {
+        for d in ao_formats::dynel_visual::placed_dynels(&store, pf).unwrap() {
+            if !matches!(d.kind, 0xC748 | 0xDAC6 | 0xC73A) || d.template == 0 {
+                continue;
+            }
+            let tpl = ao_formats::dynel_visual::item_template(&store, d.template).unwrap();
+            let stats = ao_formats::dynel_visual::effective_stats(tpl.as_ref(), &ao_formats::dynel_visual::blob_stats(&d.blob).unwrap_or_default());
+            if let Some(m) = ao_formats::dynel_visual::get(&stats, 12).filter(|&m| m > 0) {
+                meshes.insert(m as u32);
+            }
+        }
+    }
+    assert!(meshes.len() > 50, "{} door meshes", meshes.len());
+    let (mut animated, mut mismatched) = (0, vec![]);
+    for id in meshes {
+        let Some(rig) = ao_formats::mesh::NodeRig::load(&store, id).unwrap() else { continue };
+        let mut scene = ao_scene::Scene::default();
+        if ao_formats::mesh::decode_mesh_into(&store, id, &mut scene).unwrap().is_none() {
+            continue;
+        }
+        let rest = scene.meshes[0].vertices.clone();
+        assert_eq!(rig.vertex_count(), rest.len(), "mesh {id}");
+        let mut posed = rest.clone();
+        rig.pose(0.0, &mut posed);
+        if rest.iter().zip(&posed).any(|(a, b)| (0..3).any(|k| (a.pos[k] - b.pos[k]).abs() > 2e-3)) {
+            mismatched.push(id);
+            continue;
+        }
+        rig.pose(rig.total_time(), &mut posed);
+        animated += usize::from(rest.iter().zip(&posed).any(|(a, b)| (0..3).any(|k| (a.pos[k] - b.pos[k]).abs() > 0.05)));
+    }
+    assert!(animated > 20, "{animated} door meshes move");
+    assert_eq!(mismatched, [224248]);
+}

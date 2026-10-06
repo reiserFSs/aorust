@@ -136,3 +136,29 @@ fn every_item_template_and_placed_dynel_parses() {
     assert_eq!((total, no_ribosome), (12_509, 29));
     assert!(unknown <= 34);
 }
+
+/// Door templates carry the open / close sound lists (keys 0x83 / 0x84, fallbacks 0x64 / 0x66), docs/zone/doors.md §5.
+#[test]
+fn door_templates_have_open_and_close_sounds() {
+    let Some(dir) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/ProjectRubiKa/client")).filter(|d| d.join("cd_image/rdb.db").exists()) else { return };
+    let store = ao_rdb::RecordStore::open(&dir).unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for pf in store.ids(1000026).unwrap() {
+        for d in ao_formats::dynel_visual::placed_dynels(&store, pf).unwrap() {
+            if matches!(d.kind, 0xC748 | 0xDAC6 | 0xC73A) && d.template != 0 {
+                seen.insert(d.template);
+            }
+        }
+    }
+    let (mut open, mut close, mut keys) = (0, 0, std::collections::BTreeMap::<u32, usize>::new());
+    for t in &seen {
+        let Some(t) = ao_formats::dynel_visual::item_template(&store, *t).unwrap() else { continue };
+        open += usize::from(t.sounds.iter().any(|s| s.0 == 0x83 || s.0 == 0x64));
+        close += usize::from(t.sounds.iter().any(|s| s.0 == 0x84 || s.0 == 0x66));
+        for s in &t.sounds {
+            *keys.entry(s.0).or_default() += 1;
+        }
+    }
+    eprintln!("{} door templates, {open} with an open sound, {close} with a close sound, keys {keys:?}", seen.len());
+    assert!(open > 10 && close > 10);
+}

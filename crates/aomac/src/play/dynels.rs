@@ -772,6 +772,12 @@ impl Dynels {
         }
         for (holder, slot, template, stats) in std::mem::take(&mut self.pending_weapons) {
             let _ = worker.tx.send(Req::Weapon { holder, slot, template, stats });
+            // `n3TeleportIIR_t::Activate` in-playfield branch for another character (zone changes only concern the own dynel)
+            N3::Teleport(t) if !t.is_zone_change() => {
+                if let Some(c) = self.chars.get_mut(&who.instance) {
+                    c.mover.on_teleport(t.pos, &t.rot);
+                }
+            }
         }
         let mut placed = vec![];
         while let Ok(r) = worker.rx.try_recv() {

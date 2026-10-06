@@ -26,7 +26,7 @@ SimpleItem, TrapItem, VendingMachine, WeaponItem, WearableItem, CityTerminal (fo
 search over Gamecode). `Corpse_t` overrides `+0x7c` (`FUN_1007e7e2`), `+0x50`, `+0x58`, `+0xac`, `+0xb4`.
 
 The registered `*FullUpdate` classes (`docs/zone/outgoing.md` registry) in this family: Corpse, Vending
-Machine, WeaponItem (decoded) and `SimpleItem`, `Door`, `Chest`, `TrapItem`, `Mine`, `CentralController`
+Machine, WeaponItem, Door (decoded; the door's messages and animation: docs/zone/doors.md) and `SimpleItem`, `Chest`, `TrapItem`, `Mine`, `CentralController`
 `FullUpdate` (not decoded: they share the `DynelBase` chain and the apply path below, so their stat list
 is all the look needs).
 
@@ -198,7 +198,7 @@ them and the corpse owner identity (`{0xC350, CorpseInstance}`) provably starts 
 MultipleCount 412 = 1, AnimPlay 501 = 2, AnimPos 500 = 0, Mesh 12 = 93117`. Template rdb 1000020:248371 (kind 0xC75B, "Newcomer's Nano
 Programs") has the same `Mesh 93117` and `AnimPlay 2`. Result: **static mesh rdb 1010001:93117 `shop_neutral_nano_general.abiff`**, scale 1, visible
 (Flags bit 0), at `position`/`rotation` of the message (940.23, 47.21, 875.34; quaternion y/w = 0.7133/−0.7009). `item_visual` returns it.
-`AnimPlay`/`AnimPos` (stats 501/500 stored at dynel +0x1b0 by `FUN_10088d80`) are not interpreted: **[UNRESOLVED]** what they animate.
+`AnimPlay`/`AnimPos` (stats 501/500, stored at dynel +0x1b0 by `FUN_10088d80`) drive the item's mesh animation clock `FUN_10088426` (`AnimPlay` 2 = play forward forever; docs/zone/doors.md §4); `dynels_doors::ItemAnim` runs it for every item whose mesh has node keyframes.
 
 ## 7. Dynels the playfield creates itself (doors, terminals, shops)
 

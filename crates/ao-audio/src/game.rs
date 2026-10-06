@@ -207,6 +207,17 @@ impl Runtime {
         play_def(sh, &db, def, self.fx, &mut self.rng)
     }
 
+    /// A positional one-shot (`PlayGameSound(id, pos, ...)` of doors): the definition once at `Total_FX` times the distance level of
+    /// `attenuation` for the listener `d` metres away; nothing beyond the definition's maximum distance.
+    pub fn play_at(&mut self, sh: &Shared, def: &SoundDef, d: f32) -> Vec<u64> {
+        let level = attenuation(d, def.min_dist, def.max_dist, None);
+        if level <= 0.0 {
+            return Vec::new();
+        }
+        let db = self.lib.sounds.clone();
+        play_def(sh, &db, def, self.fx * level, &mut self.rng)
+    }
+
     /// `PlaySample` keep-alive (`SM_Sandy_CC_Ambience`, ...): each call sets the level and re-arms the sound to
     /// `fade_out + duration`; `update` ends it `T` seconds after the last call, fading linearly over its last
     /// `fade_out` seconds (`FrameProcessSound` @SI 0x10003b70).

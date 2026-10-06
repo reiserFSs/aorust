@@ -254,3 +254,18 @@ fn combat_music_overrides_the_district_layer() {
     assert_eq!(a.combat_state(), 0);
     assert_eq!(a.music_layer().as_deref(), Some("desert\\Day"));
 }
+
+/// `PlayGameSound` of a door's open sound (`Door` template 41565 of 4582: 0xcfde8382): audible next to the door, silent beyond the
+/// definition's maximum distance.
+#[test]
+fn game_sound_is_positional_by_distance_only() {
+    let Some(dir) = client() else { return };
+    let a = Audio::offline(&dir, 44100);
+    let pos = [10.0, 2.0, -5.0];
+    assert!(!a.play_game_sound(0xcfde8382, pos, [10.0, 2.0, -3.0]).is_empty());
+    let mut buf = vec![0f32; 44100 / 2];
+    a.render(&mut buf);
+    assert!(buf.iter().any(|s| s.abs() > 0.001), "the door sound is audible next to the door");
+    assert!(a.play_game_sound(0xcfde8382, pos, [500.0, 2.0, -5.0]).is_empty(), "nothing beyond the maximum distance");
+    assert!(a.play_game_sound(0x1234_5678, pos, pos).is_empty(), "unknown ids are ignored");
+}

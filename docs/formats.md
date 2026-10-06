@@ -72,7 +72,7 @@ Member `type` codes seen (self-describing; matches `fun::Message_c::Add*` in the
 | `FAFTexture_t` → `AnarchyTexCreator_t` | `creator` ref → `type` (rdb type, 1010004) + `inst` (rdb id) | texture record |
 | `TriList` | `triangles` = `u32 byte_len` + u16 triples | triangle list, 16-bit indices |
 | `BVolume_t` | `sph_pos`, `sph_radius`, `min_pos`, `max_pos` | bounds, ignored |
-| `FAFAnim_t` | `name`, `tot_time`, `loop`, `rot_keys`, `trans_keys`, `vis_keys`, `uv_keys` | keyframes, ignored |
+| `FAFAnim_t` | `name`, `tot_time`, `loop`, `rot_keys` (`u32` byte length, then `{x, y, z, w, time}` ×20 bytes), `trans_keys` (`{x, y, z, time}` ×16), `vis_keys` (8), `uv_keys` | node keyframes: the static decode bakes the `anim_matrix` (= the pose at time 0) and ignores them; `mesh::NodeRig` evaluates them (doors, animated items: docs/zone/doors.md §4) |
 
 `vb_desc` = `{u32 16, u32 0x10000, u32 FVF, u32 vertex_count}`; FVF is **0x112** (D3DFVF_XYZ | NORMAL | TEX1) in all 50 159 SimpleMeshes → 32-byte vertices `pos[3] normal[3] uv[2]` (f32). `vertices` = `u32 byte_len` + `vertex_count * 32` bytes. The loader also understands diffuse/specular/extra UV sets generally from the FVF bits.
 

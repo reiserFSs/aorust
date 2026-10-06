@@ -507,21 +507,46 @@ impl Play {
         }
     }
 
-    /// The server moves us to another playfield while we are in the world (`PlayfieldAnarchyFIIR_t` again, or a zone
-    /// redirection first): the old world's interface and dynels go, the loading screen comes back and the same wait for
-    /// `CharInPlay` restarts once the new world appears. [GUESS] the loading screen of a teleport is `ai_loading_login.png`
-    /// again without the startup music: `FlowControlModule_t::TeleportStartedMessage` [GUI 0x1002910e] only locks the input and
-    /// sends AFCM (0x1e, 0x112), the GUI has no other loading image (docs/zone/world.md §10).
+    /// The server moves us to another playfield while we are in the world (`n3TeleportIIR_t` with a destination, a second
+    /// `PlayfieldAnarchyFIIR_t`, or a zone redirection): `FlowControlModule_t::TeleportStartedMessage` [GUI 0x1002910e], posted
+    /// every frame while the old playfield is stopped (`PlayfieldAnarchy_t::Run` [GC 0x101225b3] -> event 5 -> AFCM 0x145) and
+    /// guarded by `m_isTeleporting`. There is **no loading screen** (program 5 is only added at login / character creation) and
+    /// the HUD and chat windows stay: it prints `ChangingArea` in red, removes the target (AFCM 0x1e/0x112), hides the 3D
+    /// world (`DisplaySystem+0x44 = 0`, the GUI stays; black behind it is [INFERENCE]) and locks the input. The old dynels die
+    /// (`n3Playfield_t::StopPlayfield`); `CharInPlay` is owed again after `TeleportEnded` (docs/zone/world.md §10.2).
     fn begin_zone_change(&mut self, host: &mut Host) {
-        if let Some(h) = self.hud.take() {
-            h.close(&mut self.gui);
+        if std::mem::replace(&mut self.teleporting, true) {
+            return;
         }
+        if let (Some(c), Some(t)) = (self.chat.as_mut(), self.text.by_key(110, "ChangingArea")) {
+            c.system_line(&mut self.gui, &t, 12);
+        }
+        self.zone.target = None;
         self.player = None;
         host.look = false;
+        host.fly = false;
         self.zone.reset_world();
         self.fight_reset();
         self.world_frames = 0;
-        self.show_loading(host);
+        self.world_ready = false;
+        self.world_scene = None;
+        self.world_ground = None;
+        self.fade = Fade::Hold;
+    }
+
+    /// `TeleportEndedMessage`: `EnteringPF` ("Entering '%s'") with the playfield name (`N3Msg_GetPFName`), or `EnteringNewArea` when the
+    /// playfield has no name or `N3Msg_IsDungeon`, as a red System line. The name comes from `pfnrmap.dat` like the character list's
+    /// (`FUN_1003676c`, the lookup `GetPFName` tries first, then the playfield's own name); [GUESS] no dungeon test, a named dungeon
+    /// says `EnteringPF`.
+    fn entering_text(&mut self) {
+        let name = self.zone.playfield.and_then(|p| self.pf_names.get(&p));
+        let line = match name {
+            Some(n) => self.text.by_key(110, "EnteringPF").map(|t| t.replace("%s", n)),
+            None => self.text.by_key(110, "EnteringNewArea"),
+        };
+        if let (Some(c), Some(t)) = (self.chat.as_mut(), line) {
+            c.system_line(&mut self.gui, &t, 12);
+        }
     }
 
     pub(super) fn loading_overlay(&mut self, list: &mut DrawList) {
@@ -666,6 +691,12 @@ impl Play {
                             self.begin_zone_change(host);
                         }
                         self.start_world_load(id);
+                    }
+                    // `n3TeleportIIR_t` (own, destination playfield): `StartTeleport` -> `TeleportStarted`, before the new playfield arrives
+                    zone::ZoneEvent::Teleport => {
+                        if self.screen == Screen::InWorld {
+                            self.begin_zone_change(host);
+                        }
                     }
                     // `GameTime_t::Update`: the clock jumps to the server's; the loading world already used the older one
                     zone::ZoneEvent::Time => host.sky_clock = Some(self.zone.day_time()),
@@ -912,23 +943,33 @@ impl Frontend for Play {
                     host.live_sky = Some(sky.map(|mut c| ao_render::LiveSky { start: self.zone.day_time(), scale: 1.0, source: Box::new(move |t| c.at(t)) }));
                     host.camera = Camera::look_at(eye, at);
                     self.screen = Screen::InWorld;
-                    match hud::Hud::new(&mut self.gui, &self.dir, self.size) {
-                        Ok(h) => self.hud = Some(h),
-                        Err(e) => eprintln!("hud: {e:#}"),
+                    // `TeleportEndedMessage` [GUI 0x100292ce]: the flag clears and the countdown to `CharInPlay` starts again; the HUD and
+                    // chat windows of the old world are still there (docs/zone/world.md §10.2)
+                    let teleported = std::mem::take(&mut self.teleporting);
+                    if self.hud.is_none() {
+                        match hud::Hud::new(&mut self.gui, &self.dir, self.size) {
+                            Ok(h) => self.hud = Some(h),
+                            Err(e) => eprintln!("hud: {e:#}"),
+                        }
                     }
                     if let (Some(h), Some((id, g))) = (self.hud.as_mut(), self.world_ground.take()) {
                         h.provide_ground(id, g.0, g.1);
                     }
                     // after the HUD: the chat windows draw above its bar windows (as in the original, whose bar windows are backmost)
-                    if let Some(c) = self.chat.as_mut() {
+                    if let (Some(c), false) = (self.chat.as_mut(), teleported) {
                         if let Err(e) = c.open(&mut self.gui, self.size) {
                             eprintln!("chat: {e:#}");
                         }
                     }
-                    self.gui.clear_focus(); // the login window's password field kept the keyboard focus
+                    if teleported {
+                        self.entering_text();
+                    }
+                    if !teleported {
+                        self.gui.clear_focus(); // the login window's password field kept the keyboard focus
+                    }
                     self.player = player::Player::new(&self.dir, &self.zone, self.zone.playfield.unwrap_or(0));
-                    host.fly = false;
-                    self.fade = Fade::Out(0.0);
+                    host.fly = teleported && self.player.is_none();
+                    self.fade = if teleported { Fade::Hold } else { Fade::Out(0.0) };
                 }
             }
             Fade::Out(t) => {
@@ -942,7 +983,7 @@ impl Frontend for Play {
             }
             _ => {}
         }
-        if self.screen == Screen::InWorld && !self.zone.in_play_sent {
+        if self.screen == Screen::InWorld && !self.zone.in_play_sent && !self.teleporting {
             self.world_frames += 1;
             if self.world_frames > IN_PLAY_FRAMES {
                 // WaitingToStartGame (GUI 0x10027d73): after the TeleportEnded countdown the client sends CharInPlayIIR_t once
@@ -1017,9 +1058,20 @@ impl Frontend for Play {
 }
 
 /// `ERRORURL` of `cd_image/data/launcher/AnarchyLauncher.url` (`KEY=value` lines, `#` comments, keys case-insensitive).
+            // `Door_t` open / close: `PlayGameSound(id, door position)` (docs/zone/doors.md §5)
+            for s in self.zone.world.take_sounds() {
+                if let Some(a) = &self.audio {
+                    a.play_game_sound(s.id, s.pos, host.camera.pos.to_array());
+                }
+            }
 fn errorurl(dir: &std::path::Path) -> Option<String> {
     let t = std::fs::read_to_string(dir.join("cd_image/data/launcher/AnarchyLauncher.url")).ok()?;
     t.lines()
+        if self.teleporting {
+            // `DisplaySystem+0x44 == 0`: the 3D world is not drawn, the GUI is (black behind it: [INFERENCE])
+            let dst = [0.0, 0.0, self.size.0 as f32, self.size.1 as f32];
+            list.cmds.splice(0..0, [DrawCmd::Clip(None), DrawCmd::Solid { dst, color: [0, 0, 0], alpha: 1.0 }]);
+        }
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| l.split_once('='))
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("errorurl"))

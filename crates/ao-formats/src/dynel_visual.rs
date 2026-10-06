@@ -81,6 +81,9 @@ pub struct ItemTemplate {
     pub kind: u32,
     pub stats: Vec<(u32, i32)>,
     pub name: Option<String>,
+    /// The sound multimap (element type `0x14`, `FUN_1007d6d5` [GC], the NPC record's format, `character::npc`): key -> Sandy sound ids,
+    /// in file order (doors: key `0x83` open, `0x84` close). Elements after one the walk does not know are not seen.
+    pub sounds: Vec<(u32, Vec<u32>)>,
 }
 
 impl ItemTemplate {
@@ -112,16 +115,46 @@ pub fn parse_item_template(rec: &[u8]) -> Result<ItemTemplate> {
         let (id, v) = (u32_at(&mut at)?, u32_at(&mut at)?);
         stats.push((id, v as i32));
     }
-    // optional name element {0x15, 0x21}: u16 name length, u16 description length, name, description
-    let name = (|| {
-        if elements < 2 || rec.get(at..at + 8)? != [0x15, 0, 0, 0, 0x21, 0, 0, 0] {
-            return None;
+    // the elements after the stat list that are understood: name {0x15, 0x21}: u16 name length, u16 description length, name, description;
+    // sound multimap {0x14, *}
+    let mut name = None;
+    let mut sounds = vec![];
+    let size_word = |at: &mut usize| -> Option<usize> {
+        let w = rec.get(*at..*at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))?;
+        *at += 4;
+        (w >= 0x3F1 && w % 0x3F1 == 0).then(|| (w / 0x3F1 - 1) as usize)
+    };
+    'elements: for _ in 1..elements {
+        let (Some(ty), Some(_)) = (rec.get(at..at + 4), rec.get(at + 4..at + 8)) else { break };
+        let (ty, sub) = (u32::from_le_bytes(ty.try_into().unwrap()), u32::from_le_bytes(rec[at + 4..at + 8].try_into().unwrap()));
+        at += 8;
+        match (ty, sub) {
+            (0x15, 0x21) => {
+                let (Some(l), Some(_)) = (rec.get(at..at + 2), rec.get(at + 2..at + 4)) else { break };
+                let (len, dlen) = (u16::from_le_bytes(l.try_into().unwrap()) as usize, u16::from_le_bytes(rec[at + 2..at + 4].try_into().unwrap()) as usize);
+                let Some(text) = rec.get(at + 4..at + 4 + len + dlen) else { break };
+                name = Some(String::from_utf8_lossy(&text[..len]).into_owned());
+                at += 4 + len + dlen;
+            }
+            (0x14, _) => {
+                let Some(n) = size_word(&mut at).filter(|&n| n <= 30000) else { break };
+                for _ in 0..n {
+                    let key = rec.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                    at += 4;
+                    let (Some(key), Some(m)) = (key, size_word(&mut at).filter(|&m| m <= 30000)) else { break 'elements };
+                    let Some(vals) = rec.get(at..at + 4 * m) else { break 'elements };
+                    at += 4 * m;
+                    let vals = vals.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b));
+                    match sounds.iter_mut().find(|e: &&mut (u32, Vec<u32>)| e.0 == key) {
+                        Some(e) => e.1.extend(vals),
+                        None => sounds.push((key, vals.collect())),
+                    }
+                }
+            }
+            _ => break,
         }
-        let len = u16::from_le_bytes(rec.get(at + 8..at + 10)?.try_into().ok()?) as usize;
-        let s = rec.get(at + 12..at + 12 + len)?;
-        Some(String::from_utf8_lossy(s).into_owned())
-    })();
-    Ok(ItemTemplate { kind, stats, name })
+    }
+    Ok(ItemTemplate { kind, stats, name, sounds })
 }
 
 /// `None` when rdb 1000020 has no record for `static_instance`.
@@ -377,6 +410,32 @@ pub fn placed_dynels(store: &RecordStore, playfield: u32) -> Result<Vec<PlacedDy
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rdb 1000020:41565, the door of playfield 4582 (`Door`, 230 bytes): stats, name, then the sound multimap `0x83 -> 0xcfde8382`,
+    /// `0x84 -> 0xc16f0487`.
+    const DOOR_TEMPLATE: &str = "48c70000030000000f00000017000000\
+        4c2f0000 4c000000 00000000 1e000000 08040000 00000000 01140880 2a010000 00000000 58000000 00000000 01000000 10270000 02000000 \
+        0f270000 0c000000 46a30000 36000000 01000000 26010000 01000000 c2010000 01000000 \
+        15000000 21000000 04003a00 446f6f72 54686973 20697320 6120646f 6f722e20 5472792077616c6b696e672074 68726f7567 6820746f 20736565 20776865 72652069 74206c65 6164732e \
+        14000000 05000000 d30b0000 83000000 e2070000 8283decf 84000000 e2070000 87046fc1 000000000000000000000000";
+
+    fn hex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn the_door_template_has_a_sound_multimap() {
+        let t = parse_item_template(&hex(DOOR_TEMPLATE)).unwrap();
+        assert_eq!((t.kind, t.stats.len()), (0xC748, 11));
+        assert_eq!(t.name.as_deref(), Some("Door"));
+        assert_eq!(t.sounds, [(0x83, vec![0xcfde8382]), (0x84, vec![0xc16f0487])]);
+        // truncated sound lists are dropped, not a panic
+        let rec = hex(DOOR_TEMPLATE);
+        for n in 0..rec.len() {
+            let _ = parse_item_template(&rec[..n]);
+        }
+    }
 
     fn record(kind: u32, stats: &[(u32, i32)], name: &str) -> Vec<u8> {
         let mut v = Vec::new();

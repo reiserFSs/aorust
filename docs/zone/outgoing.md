@@ -252,7 +252,7 @@ Note on names: the id of the 4 ids first not matched by an `IIR_t` string scan w
 | `35505644` | `TemplateActionIIR_t` | ? | [GC 0x10010458] | [GC 0x1000ce29] |  |  |
 | `36284F6E` | `TradeIIR_t` | C→S | [GC 0x1000e87e] | [GC 0x1000bf71] |  | `N3Msg_TradeAccept` 0x10015bfd, `N3Msg_TradeConfirm` 0x10015c66, `N3Msg_TradeAbort` 0x10015ccf (+4) |
 | `36510078` | `n3ToClientQuitIIR_t` | S→C | [N3 0x1000ae82] | - | 27 |  |
-| `365A5071` | `DoorFullUpdateIIR_t` | ? | [GC 0x1000f02e] | [GC 0x1000c391] |  |  |
+| `365A5071` | `DoorFullUpdateIIR_t` | S→C | [GC 0x1000f02e] | [GC 0x1000c391] |  | decoded `world::Door`, docs/zone/doors.md §2 |
 | `365E555B` | `CityAdvantagesIIR_t` | ? | [GC 0x1000eeb6] | [GC 0x1000c2c6] |  |  |
 | `3710256C` | `HealthDamageIIR_t` | ? | [GC 0x1000f494] | [GC 0x1000c5ec] |  |  |
 | `371D0542` | `FightModeUpdate_t` | ? | [GC 0x1000dbac] | [GC 0x1000b86b] |  |  |
@@ -290,7 +290,7 @@ Note on names: the id of the 4 ids first not matched by an `IIR_t` string scan w
 | `49222612` | `VisibilityIIR_t` | ? | [GC 0x1001062e] | [GC 0x1000cf29] |  |  |
 | `4A41203E` | `StopFightIIR_t` | both | [GC 0x1000e70c] | [GC 0x1000be9c] | 128 | `N3Msg_StopAttack` 0x10027f55 |
 | `4B062919` | `BattleOverIIR_t` | ? | [GC 0x1000d97e] | [GC 0x1000b73f] |  |  |
-| `4C7D403B` | `DoorStatusUpdateIIR_t` | ? | [GC 0x1000f08c] | [GC 0x1000c3c3] |  |  |
+| `4C7D403B` | `DoorStatusUpdateIIR_t` | S→C | [GC 0x1000f08c] | [GC 0x1000c3c3] |  | decoded `world::DoorStatus`, docs/zone/doors.md §2 |
 | `4D2A313B` | `TeamInviteIIR_t` | ? | [GC 0x1000e822] | [GC 0x1000bf3f] |  |  |
 | `4D38242E` | `InfoPacketIIR_t` | ? | [GC 0x1000f4f2] | [GC 0x1000c61e] |  |  |
 | `4D450114` | `SpellListIIR_t` | ? | [GC 0x100102e2] | [GC 0x1000cd61] |  |  |
