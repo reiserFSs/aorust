@@ -6,11 +6,17 @@
 //! * Inventory: `InventoryView_c` (`FUN_100cc2ca`): a `MultiListView` slot grid / list, 30 slots for the character's own inventory.
 //! * Stat: `StatView_c` (`FUN_1007ff6e`), [`stat_view`].
 
+mod buffs;
 mod items;
 mod skill_model;
 mod stat_view;
+mod zone_inv;
+mod inv_grid;
+mod item_dnd;
+mod item_ui;
 
 use super::hud::WindowKind;
+use super::hud_rollup::Rollup;
 use super::zone::Zone;
 use ao_formats::{screens::TextDb, stats};
 use ao_gui::{CanvasItem, CanvasTip, Event, Gui, ViewHandle, WindowId, WindowSize};
@@ -36,17 +42,17 @@ const WEAR_TABS: [(&str, &str, i32, i32); 4] = [
     ("social", "GFX_GUI_WEARVIEW_CLOTHING", 0, 0),
 ];
 const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
-/// Columns and gap of the inventory grid. UNRESOLVED GUESS: the inventory view itself never calls `SetViewCellCounts` / `SetGridIconSpacing` (only the
-/// wear grids do: 3 x 5 cells, 11 x 9 px); the template's saved frame (187 px wide) is 3 · 54 + 2 · 11 + 3, so the wear grid's 3 columns and gap are used.
-const INVENTORY_COLS: usize = 3;
-const INVENTORY_GAP: (f32, f32) = (11.0, 9.0);
+const SLOT_OPEN_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_OPEN";
+/// UNRESOLVED GUESS: the vertical gap of the inventory grid. `RecalcCellCount` spaces the rows by `(height + 1 - borders - rows * 48) / (rows - 1)` of the
+/// scrolled client view, a value that depends on the view's own content height (circular, not derivable); the wear grids use `SetGridIconSpacing(11, 9)`, so 9.
+/// The horizontal count / gap come from [`inv_grid::columns`] (verified).
+const INVENTORY_GAP_Y: f32 = 9.0;
 /// Width of a `ScrollView` scrollbar (`SCROLLBAR_W`) the inventory's grid leaves room for.
 const SCROLLBAR: u32 = 13;
 /// The saved frame of the inventory (`prefs/NewChar/DockAreas/DockArea0.xml`, a `DockTabbedWindow`): 187 x 176 inclusive, used as the outer size.
 const INVENTORY_FALLBACK: (i32, i32, u32, u32) = (300, 150, 188, 177);
-/// The rollup column of the control centre: 225 px wide from y = 20 (`InitialiseMessage` 0x1006a968).
-const ROLLUP_W: i32 = 225;
-const ROLLUP_Y: i32 = 20;
+/// Dock identity of the wear view (`WearViewConfig` `DockableViewDockName = "RollupArea"`, page `wear_window` of `RollupArea.xml`).
+const WEAR_KEY: &str = "wear_window";
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -68,6 +74,8 @@ struct SkillRow {
     stat: u32,
     h: ViewHandle,
     shown: i32,
+    /// Colour last given to the value text (`FUN_100fde49`: white / green / red, [`skill_model::Row::color`]).
+    color: u32,
     pending: i32,
     frac: f32,
 }
@@ -104,6 +112,12 @@ struct Inventory {
     list: bool,
     drawn: Vec<(u32, i32)>,
     cols: usize,
+    /// Grid cell gaps (x from [`inv_grid::columns`], y [`INVENTORY_GAP_Y`]) and the grid view's width in px.
+    gap: (f32, f32),
+    view_w: f32,
+    /// Client side cells of the bag items (`item_position_map`) and the cell the last item dropped from outside was released on.
+    positions: inv_grid::PositionMap,
+    pending_drop: Option<(usize, usize)>,
 }
 
 pub(super) struct HudStats {
@@ -124,6 +138,9 @@ pub(super) struct HudStats {
     inventory_frame: (i32, i32, u32, u32),
     /// Feedback line of the skill window (`status` view): `Skill_LackIP`.
     status: String,
+    /// Pointer state of the item drag and drop, and the sequence number of our `GenericCmd_t`s (docs/gui.md §11.12).
+    dnd: item_dnd::Dnd,
+    use_seq: i32,
 }
 
 /// Value of the first `<Bool name=NAME value=..>` below `e`.
@@ -169,6 +186,8 @@ impl HudStats {
             inventory_list,
             inventory_frame,
             status: String::new(),
+            dnd: Default::default(),
+            use_seq: 0,
         })
     }
 
@@ -211,15 +230,15 @@ impl HudStats {
         std::mem::take(&mut self.outbox)
     }
 
-    pub(super) fn open(&mut self, gui: &mut Gui, kind: WindowKind) {
+    pub(super) fn open(&mut self, gui: &mut Gui, rollup: &mut Rollup, kind: WindowKind) {
         if self.is_open(kind) {
             return;
         }
         let r = match kind {
             WindowKind::Skills => self.open_skills(gui),
             WindowKind::Inventory => self.open_inventory(gui),
-            WindowKind::Character => self.open_wear(gui),
-            WindowKind::Stat => self.open_stat(gui),
+            WindowKind::Character => self.open_wear(gui, rollup),
+            WindowKind::Stat => self.open_stat(gui, rollup),
             _ => return,
         };
         if let Err(e) = r {
@@ -227,51 +246,53 @@ impl HudStats {
         }
     }
 
-    pub(super) fn close(&mut self, gui: &mut Gui, kind: WindowKind) {
+    /// Closes the skills window (own style-0 frame).
+    fn close_skills(&mut self, gui: &mut Gui) {
+        if let Some(s) = self.skills.take() {
+            if let Some((c, _)) = s.confirm {
+                gui.close_window(c);
+            }
+            gui.close_window(s.window);
+            // leaving the window drops the unsaved points (`FUN_100f91d7` runs at save; closing destroys the rows)
+            self.model.clear();
+        }
+    }
+
+    fn close_inventory(&mut self, gui: &mut Gui) {
+        if let Some(i) = self.inventory.take() {
+            gui.close_window(i.window);
+        }
+    }
+
+    pub(super) fn close(&mut self, gui: &mut Gui, rollup: &mut Rollup, kind: WindowKind) {
         match kind {
-            WindowKind::Skills => {
-                if let Some(s) = self.skills.take() {
-                    if let Some((c, _)) = s.confirm {
-                        gui.close_window(c);
-                    }
-                    gui.close_window(s.window);
-                    // leaving the window drops the unsaved points (`FUN_100f91d7` runs at save; closing destroys the rows)
-                    self.model.clear();
-                }
-            }
-            WindowKind::Inventory => {
-                if let Some(i) = self.inventory.take() {
-                    gui.close_window(i.window);
-                }
-            }
+            WindowKind::Skills => self.close_skills(gui),
+            WindowKind::Inventory => self.close_inventory(gui),
             WindowKind::Character => {
-                if let Some(w) = self.wear.take() {
-                    gui.close_window(w.window);
+                if self.wear.take().is_some() {
+                    rollup.close_page(gui, WEAR_KEY);
                 }
             }
             WindowKind::Stat => {
-                if let Some(s) = self.stat.take() {
-                    gui.close_window(s.window);
+                if self.stat.take().is_some() {
+                    rollup.close_page(gui, stat_view::KEY);
                 }
             }
             _ => {}
         }
     }
 
-    pub(super) fn close_all(&mut self, gui: &mut Gui) {
+    pub(super) fn close_all(&mut self, gui: &mut Gui, rollup: &mut Rollup) {
         for k in [WindowKind::Skills, WindowKind::Inventory, WindowKind::Character, WindowKind::Stat] {
-            self.close(gui, k);
+            self.close(gui, rollup, k);
         }
     }
 
     // ------------------------------------------------------------------------------------------------------------ stat
 
-    /// `stat_window` (`StatView_c`): docked in the rollup column of the control centre in the NewChar template (4th page); the dock is not implemented
-    /// (UNRESOLVED, docs/gui.md §10), so the window stands at the top of that column, below the wear window when that is open.
-    fn open_stat(&mut self, gui: &mut Gui) -> anyhow::Result<()> {
-        let x = self.screen.0 as i32 - ROLLUP_W;
-        let y = self.wear.as_ref().map_or(ROLLUP_Y, |w| gui.window_pos(w.window).1 + gui.outer_size(w.window).1 as i32 + 4);
-        self.stat = Some(StatView::open(gui, &self.db, (x, y))?);
+    /// `stat_window` (`StatView_c`): docked in the rollup column (`StatViewConfig` `DockableViewDockName = "RollupArea"`, 4th page of the template, 279 px).
+    fn open_stat(&mut self, gui: &mut Gui, rollup: &mut Rollup) -> anyhow::Result<()> {
+        self.stat = Some(StatView::open(gui, &self.db, rollup)?);
         Ok(())
     }
 
@@ -334,7 +355,7 @@ impl HudStats {
                     bw = dw + s.arrows[2].1,
                 );
                 let h = gui.add_view_xml(w, &format!("{}_group", g.prefix), "StatRow", &xml)?;
-                r.push(SkillRow { stat: st, h, shown: i32::MIN, pending: i32::MIN, frac: -1.0 });
+                r.push(SkillRow { stat: st, h, shown: i32::MIN, color: u32::MAX, pending: i32::MIN, frac: -1.0 });
             }
             s.rows.push(r);
         }
@@ -398,7 +419,7 @@ impl HudStats {
         }
         match ev {
             Event::CloseRequested { window } if *window == s.window => {
-                self.close(gui, WindowKind::Skills);
+                self.close_skills(gui);
                 self.closed.push(WindowKind::Skills);
                 true
             }
@@ -453,7 +474,7 @@ impl HudStats {
                         self.ask_reset(gui, st);
                     }
                 } else if view == "Quit" {
-                    self.close(gui, WindowKind::Skills);
+                    self.close_skills(gui);
                     self.closed.push(WindowKind::Skills);
                 } else {
                     return false;
@@ -492,6 +513,7 @@ impl HudStats {
         }
         let Some(s) = self.skills.as_mut() else { return };
         let get = |id: u32| zone.stat(id);
+        self.model.refresh_buffs(&get, &zone.active_spells);
         // "Suggested IP distribution" is available until level 20 (inittext).
         gui.set_enabled(s.window, "suggest_ip", zone.stat(stats::LEVEL).unwrap_or(0) < 20);
         // `FUN_100fa45c`: "Reset all skills (n)", n = (stat 0x15c bit 2 clear) + FullIPRPoints (0x2b3); enabled when n >= 1
@@ -519,6 +541,10 @@ impl HudStats {
                 r.shown = row.shown();
                 gui.set_text_in(r.h, "value", &r.shown.to_string());
             }
+            if row.color() != r.color {
+                r.color = row.color();
+                gui.set_color_in(r.h, "value", r.color);
+            }
             let (frac, changed) = (row.fraction(), row.pending != 0);
             if frac != r.frac {
                 r.frac = frac;
@@ -544,7 +570,7 @@ impl HudStats {
                 gui.set_text(s.window, "statName", &format!("<center>{}</center>", stats::long_name(&self.db, stat)));
                 gui.set_text(s.window, "statdesc", &stats::description(&self.db, stat).unwrap_or_default());
                 gui.set_text(s.window, "base", &format!("<div align=\"right\">{}</div>", row.base + row.pending));
-                // UNRESOLVED: the buffed value is `N3Msg_GetSkill(stat, 2)` (stat modifiers, SimpleChar+0x1bc, not decoded) -> equal to the base value.
+                // `buffed` = `StatRow+0x1a8` (`GetSkill(stat, 2)`) + pending, `base` = `GetSkill(stat, 1)` + pending (`Row::value` / `Row::base`)
                 gui.set_text(s.window, "buffed", &format!("<div align=\"right\">{}</div>", row.shown()));
                 gui.set_text(s.window, "maxskill", &format!("<div align=\"right\">{}</div>", row.base + (row.max - row.raw)));
                 gui.set_text(s.window, "pointdelta", &format!("<div align=\"right\">{}</div>", row.pending));
@@ -565,9 +591,9 @@ impl HudStats {
 
     // ---------------------------------------------------------------------------------------------------------- wear / inventory
 
-    fn open_wear(&mut self, gui: &mut Gui) -> anyhow::Result<()> {
+    fn open_wear(&mut self, gui: &mut Gui, rollup: &mut Rollup) -> anyhow::Result<()> {
         let (aw, ah) = WEAR_ART;
-        let mut xml = String::from("<root><View view_layout=\"vertical\" h_alignment=\"left\" layout_borders=\"Rect(5,5,5,5)\">");
+        let mut xml = String::from("<root><View view_layout=\"vertical\" h_alignment=\"left\">");
         xml += &format!("<View view_layout=\"stacked\" min_size=\"Point({aw},{ah})\" max_size=\"Point({aw},{ah})\">");
         for (name, gfx, ..) in WEAR_TABS.iter().take(3) {
             xml += &format!("<BitmapView name=\"{name}\" bitmap_id=\"{gfx}\"/>");
@@ -584,9 +610,8 @@ impl HudStats {
         xml += "<HLayoutSpacer/></View></View>";
         xml += "<View view_layout=\"horizontal\" h_alignment=\"left\"><TextButton name=\"tab_social\" text=\"Social\" color=\"0xFFFFFF\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" layout_borders=\"Rect(4,3,4,0)\"/></View>";
         xml += "</View></root>";
-        // `WearView_c` (`FUN_100e1bc9`) is a `DockableView_c` titled `GetText(10000, "Wear")`; first-login place: the rollup column (WearViewConfig docks into it)
-        let pos = (self.screen.0 as i32 - ROLLUP_W, ROLLUP_Y);
-        let w = gui.open_tabbed_window_xml("WearView", &self.db.by_key(10000, "Wear").unwrap_or_default(), &xml, pos, WindowSize::Preferred)?;
+        // `WearView_c` (`FUN_100e1bc9`) is a `DockableView_c` titled `GetText(10000, "Wear")`, docked in the rollup column (`WearViewConfig`: `DockableViewDockName = "RollupArea"`, page 317 px)
+        let w = rollup.open_page(gui, WEAR_KEY, &self.db.by_key(10000, "Wear").unwrap_or_default(), &xml, ah as f32)?;
         self.wear = Some(Tabbed { window: w, tab: 0, drawn: vec![(u32::MAX, 0)] });
         self.select_wear_tab(gui, 0);
         Ok(())
@@ -604,19 +629,30 @@ impl HudStats {
     /// The item layer of the wear window: the picture of every worn item in the cell of its slot (the frames and labels are in the art).
     fn update_wear(&mut self, gui: &mut Gui, zone: &Zone) {
         let Some(t) = self.wear.as_mut() else { return };
-        let sig = signature(zone);
+        let mut sig = signature(zone);
+        sig.push((u32::MAX - 2, hover_code(self.dnd.hover)));
         if t.drawn == sig {
             return;
+        }
+        for e in zone.inventory.values() {
+            self.items.info(gui, e.item.low_id);
         }
         let (mut cmds, mut tips) = (vec![], vec![]);
         for cell in 0..15 {
             let Some(slot) = items::wear_slot(t.tab, cell) else { continue };
-            let Some(e) = zone.inventory.get(&slot) else { continue };
             let (c, r) = items::wear_cell(t.tab, cell);
             let (x, y) = items::wear_origin(c, r);
-            cmds.extend(self.items.picture(gui, e, x, y));
-            if let Some(i) = self.items.info(gui, e.item.low_id) {
-                tips.push(CanvasTip { rect: [x, y, x + items::SLOT, y + items::SLOT], title: i.name.clone(), body: String::new() });
+            if let Some(e) = zone.inventory.get(&slot) {
+                cmds.extend(self.items.picture(gui, e, x, y));
+                if let Some(i) = self.items.info(gui, e.item.low_id) {
+                    tips.push(CanvasTip { rect: [x, y, x + items::SLOT, y + items::SLOT], title: i.name.clone(), body: String::new() });
+                }
+            }
+            // drop target under the dragged item (UNRESOLVED GUESS: the original's highlight was not located; a light veil over the accepting cell)
+            if let Some((item_dnd::Place::Wear { tab, slot: hs, .. }, true)) = self.dnd.hover {
+                if tab == t.tab && hs == slot {
+                    cmds.push(CanvasItem::Solid { dst: [x, y, x + items::SLOT, y + items::SLOT], color: 0xFFFFFF, alpha: 0.3 });
+                }
             }
         }
         gui.set_canvas(t.window, "items", cmds);
@@ -625,19 +661,30 @@ impl HudStats {
     }
 
     fn open_inventory(&mut self, gui: &mut Gui) -> anyhow::Result<()> {
-        let (x, y, _, oh) = self.inventory_frame;
-        let xml = "<root><View view_layout=\"vertical\"><ScrollView v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\"><ScrollViewChild view_layout=\"vertical\" name=\"scroller\">\
+        let (x, y, ow, oh) = self.inventory_frame;
+        let xml = "<root><View view_layout=\"vertical\"><ScrollView name=\"scrollview\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\"><ScrollViewChild view_layout=\"vertical\" name=\"scroller\">\
                    <View view_layout=\"vertical\" name=\"content\"/></ScrollViewChild></ScrollView></View></root>";
-        let w = gui.open_framed_window_xml("InventoryView", xml, (x, y), WindowSize::Fixed(100, 100))?;
-        // the saved frame gives the height (outer, inclusive); the width is the 3-column grid plus a scrollbar (see [`INVENTORY_COLS`])
-        let (_, fh) = gui.outer_size(w);
-        let grid_w = INVENTORY_COLS as f32 * items::SLOT + (INVENTORY_COLS - 1) as f32 * INVENTORY_GAP.0;
-        gui.resize_window(w, WindowSize::Fixed(grid_w as u32 + SCROLLBAR, oh.saturating_sub(fh - 100).max(40)));
+        // `DockTabbedWindow` = a style-0 window (client insets 5, 26, 5, 5, docs §6.1) whose only tab is titled `GetText(10000, "Inventory")`
+        // (`FUN_100c9fb7`, string at GUI 0x101bb518; retail screenshot: tab "Inventory" with the "i" icon, pin and close buttons).
+        let title = self.db.by_key(10000, "Inventory").unwrap_or_default();
+        // the grid view is the frame's client width; its column count and spacing follow `RecalcCellCount` (`Rect::Width` = inclusive width - 1);
+        // the scrollbar is added beside it (UNRESOLVED: the original's scrollbar / grid width interplay; retail shows 3 columns next to the scrollbar)
+        let view_w = ow as f32 - 10.0;
+        let (cols, gap_x) = inv_grid::columns(view_w - 1.0);
+        let w = gui.open_tabbed_window_xml("InventoryView", &title, xml, (x, y), WindowSize::Fixed(view_w as u32 + SCROLLBAR, oh.saturating_sub(31).max(40)))?;
         // `Window::MoveInsideScreen`: the saved frame comes from a bigger screen
         let (ow, oh) = gui.outer_size(w);
         gui.set_window_pos(w, (x.min(self.screen.0.saturating_sub(ow) as i32).max(0), y.min(self.screen.1.saturating_sub(oh) as i32).max(0)));
-        let cols = INVENTORY_COLS;
-        self.inventory = Some(Inventory { window: w, list: self.inventory_list, drawn: vec![(u32::MAX, 0)], cols });
+        self.inventory = Some(Inventory {
+            window: w,
+            list: self.inventory_list,
+            drawn: vec![(u32::MAX, 0)],
+            cols,
+            gap: (gap_x, INVENTORY_GAP_Y),
+            view_w,
+            positions: Default::default(),
+            pending_drop: None,
+        });
         Ok(())
     }
 
@@ -654,12 +701,21 @@ impl HudStats {
     /// (columns `AddColumn` 0 "Icon" 16 px, 1 "Name" 200 px, 2 "Count" 30 px, 4 "Quality" 100 px of the template's `listview_config`).
     fn update_inventory(&mut self, gui: &mut Gui, zone: &Zone) {
         let Some(inv) = self.inventory.as_mut() else { return };
+        let mut slots: Vec<u32> = zone.inventory.keys().copied().filter(|s| (items::BAG_FIRST..items::BAG_FIRST + items::BAG_SLOTS).contains(s)).collect();
+        slots.sort_unstable();
+        inv.positions.sync(&slots, inv.cols, &mut inv.pending_drop);
         let mut sig = signature(zone);
         sig.push((u32::MAX - 1, i32::from(inv.list)));
+        sig.push((u32::MAX - 2, hover_code(self.dnd.hover)));
+        sig.extend(slots.iter().filter_map(|&s| inv.positions.get(s).map(|c| (0x8000_0000 | s, (c.0 * 100 + c.1) as i32))));
         if inv.drawn == sig {
             return;
         }
+        for e in zone.inventory.values() {
+            self.items.info(gui, e.item.low_id);
+        }
         let slot_gfx = gui.gfx_id(SLOT_GFX).map(ao_gui::GfxId);
+        let open_gfx = gui.gfx_id(SLOT_OPEN_GFX).map(ao_gui::GfxId);
         let w = inv.window;
         if inv.list {
             gui.remove_children(w, "content");
@@ -692,20 +748,33 @@ impl HudStats {
             }
         } else {
             gui.remove_children(w, "content");
-            let (cols, rows) = (inv.cols, (items::BAG_SLOTS as usize).div_ceil(inv.cols));
-            let (px, py) = (items::SLOT + INVENTORY_GAP.0, items::SLOT + INVENTORY_GAP.1);
-            let (cw, ch) = (cols as f32 * px - INVENTORY_GAP.0, rows as f32 * py - INVENTORY_GAP.1);
+            let (cols, rows) = (inv.cols, inv_grid::MAX_ITEMS.div_ceil(inv.cols));
+            let gap = inv.gap;
+            let (cw, ch) = (inv.view_w, 2.0 * inv_grid::BORDER + rows as f32 * (inv_grid::ICON + 1.0) + (rows - 1) as f32 * gap.1);
             let (mut cmds, mut tips) = (vec![], vec![]);
-            for i in 0..items::BAG_SLOTS as usize {
-                let (x, y) = ((i % cols) as f32 * px, (i / cols) as f32 * py);
-                if let Some(g) = slot_gfx {
+            let veil = match self.dnd.hover {
+                Some((item_dnd::Place::Bag { cell }, true)) => Some(cell),
+                _ => None,
+            };
+            for n in 0..inv_grid::MAX_ITEMS {
+                let cell = (n % cols, n / cols);
+                let (ox, oy) = inv_grid::cell_origin(cell.0, cell.1, gap);
+                // the 54 px slot art is centred on the 48 px cell
+                let (x, y) = (ox - (items::SLOT - inv_grid::ICON - 1.0) / 2.0, oy - (items::SLOT - inv_grid::ICON - 1.0) / 2.0);
+                let item = inv.positions.at(cell).and_then(|s| zone.inventory.get(&s));
+                // `UpdateBackgroundSurfaces` (GUI 0x10134023) picks `0x11d + (max items != 0)`, i.e. SLOT_48_OPEN (a keyed, hollow frame) for a bounded
+                // container, but the retail screenshot shows every slot as the filled SLOT_48_CLOSED art, which we follow (UNRESOLVED: id numbering off by one?)
+                if let Some(g) = slot_gfx.or(open_gfx) {
                     cmds.push(CanvasItem::Image { id: g, src: [0.0, 0.0, items::SLOT, items::SLOT], dst: [x, y, x + items::SLOT, y + items::SLOT], alpha: 1.0 });
                 }
-                if let Some(e) = zone.inventory.get(&(items::BAG_FIRST + i as u32)) {
+                if let Some(e) = item {
                     cmds.extend(self.items.picture(gui, e, x, y));
                     if let Some(info) = self.items.info(gui, e.item.low_id) {
                         tips.push(CanvasTip { rect: [x, y, x + items::SLOT, y + items::SLOT], title: info.name.clone(), body: String::new() });
                     }
+                }
+                if veil == Some(cell) {
+                    cmds.push(CanvasItem::Solid { dst: [x, y, x + items::SLOT, y + items::SLOT], color: 0xFFFFFF, alpha: 0.3 });
                 }
             }
             let xml = format!("<root><CanvasView name=\"grid\" min_size=\"Point({0},{1})\" max_size=\"Point({0},{1})\"/></root>", cw as u32, ch as u32);
@@ -724,6 +793,7 @@ impl HudStats {
     // ------------------------------------------------------------------------------------------------------------ dispatch
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone, _dt: f32) {
+        self.dnd.clock += _dt;
         self.update_skills(gui, zone);
         self.update_wear(gui, zone);
         self.update_inventory(gui, zone);
@@ -738,19 +808,10 @@ impl HudStats {
             return true;
         }
         match ev {
-            Event::CloseRequested { window } if self.wear.as_ref().is_some_and(|t| t.window == *window) => {
-                self.close(gui, WindowKind::Character);
-                self.closed.push(WindowKind::Character);
-                true
-            }
+            // the wear and stat windows are rollup pages: their close button is the page header's (`Rollup::event`)
             Event::CloseRequested { window } if self.inventory.as_ref().is_some_and(|i| i.window == *window) => {
-                self.close(gui, WindowKind::Inventory);
+                self.close_inventory(gui);
                 self.closed.push(WindowKind::Inventory);
-                true
-            }
-            Event::CloseRequested { window } if self.stat.as_ref().is_some_and(|s| s.window == *window) => {
-                self.close(gui, WindowKind::Stat);
-                self.closed.push(WindowKind::Stat);
                 true
             }
             Event::Clicked { window, view, .. } if self.wear.as_ref().is_some_and(|t| t.window == *window) => {
@@ -759,8 +820,24 @@ impl HudStats {
                 }
                 true
             }
+            Event::CanvasClick { window, view, x, y } if (view == "items" && self.wear.as_ref().is_some_and(|t| t.window == *window)) || (view == "grid" && self.inventory.as_ref().is_some_and(|i| i.window == *window)) => {
+                let place = if view == "items" { self.wear.as_ref().and_then(|t| self.wear_cell_at(t.tab, *x, *y)) } else { self.bag_cell_at(*x, *y) };
+                if let Some(p) = place {
+                    self.item_click(zone, p);
+                }
+                true
+            }
             _ => false,
         }
+    }
+}
+
+/// Integer form of the drop target (and whether it would be accepted) for the repaint signatures of the item layers.
+fn hover_code(h: Option<(item_dnd::Place, bool)>) -> i32 {
+    match h {
+        None => 0,
+        Some((item_dnd::Place::Wear { slot, .. }, ok)) => 1 + slot as i32 * 2 + i32::from(ok),
+        Some((item_dnd::Place::Bag { cell }, ok)) => 10_000 + (cell.0 * 64 + cell.1) as i32 * 2 + i32::from(ok),
     }
 }
 
@@ -783,6 +860,7 @@ mod tests {
         gui: Gui,
         hud: HudStats,
         zone: Zone,
+        rollup: Rollup,
     }
 
     impl Frontend for Shot {
@@ -790,7 +868,10 @@ mod tests {
             &self.gui
         }
         fn input(&mut self, ev: InputEvent, _host: &mut Host) {
+            self.hud.input(&mut self.gui, &self.zone, &ev);
+            self.rollup.input(&mut self.gui, &ev);
             for e in self.gui.input(ev) {
+                self.rollup.event(&mut self.gui, &e);
                 self.hud.event(&mut self.gui, &e, &self.zone);
             }
         }
@@ -823,7 +904,8 @@ mod tests {
             }
         }
         let hud = HudStats::new(&dir, SIZE).unwrap();
-        let shot = Shot { gui, hud, zone };
+        let rollup = Rollup::new(&dir, SIZE);
+        let shot = Shot { gui, hud, zone, rollup };
         let off = Offscreen::new(&shot, SIZE).unwrap();
         Some((shot, off))
     }
@@ -888,7 +970,7 @@ mod tests {
     #[test]
     fn skills_window_shows_stats_and_follows_stat_deltas() {
         let Some((mut s, mut o)) = shot() else { return };
-        s.hud.open(&mut s.gui, WindowKind::Skills);
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Skills);
         let w = s.hud.skills.as_ref().unwrap().window;
         o.frame(&mut s, 0.016);
         assert!(s.gui.warnings.is_empty(), "{:?}", s.gui.warnings);
@@ -911,7 +993,7 @@ mod tests {
         // the Nano group and a skill
         click(&mut s, &mut o, w, "nanocast");
         png(&mut s, &mut o, "skills-3-nano");
-        s.hud.close(&mut s.gui, WindowKind::Skills);
+        s.hud.close(&mut s.gui, &mut s.rollup, WindowKind::Skills);
         assert!(!s.hud.is_open(WindowKind::Skills));
     }
 
@@ -919,7 +1001,7 @@ mod tests {
     #[test]
     fn skills_pending_points_save_and_reset() {
         let Some((mut s, mut o)) = shot() else { return };
-        s.hud.open(&mut s.gui, WindowKind::Skills);
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Skills);
         let w = s.hud.skills.as_ref().unwrap().window;
         o.frame(&mut s, 0.016);
         click(&mut s, &mut o, w, "abilities");
@@ -974,7 +1056,7 @@ mod tests {
     #[test]
     fn suggested_ip_distribution_spends_by_priority() {
         let Some((mut s, mut o)) = shot() else { return };
-        s.hud.open(&mut s.gui, WindowKind::Skills);
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Skills);
         let w = s.hud.skills.as_ref().unwrap().window;
         o.frame(&mut s, 0.016);
         click(&mut s, &mut o, w, "suggest_ip");
@@ -997,7 +1079,7 @@ mod tests {
     #[test]
     fn stat_window_follows_the_own_stats() {
         let Some((mut s, mut o)) = shot() else { return };
-        s.hud.open(&mut s.gui, WindowKind::Stat);
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Stat);
         assert!(s.hud.is_open(WindowKind::Stat));
         o.frame(&mut s, 0.016);
         let w = s.hud.window(WindowKind::Stat).unwrap();
@@ -1013,7 +1095,7 @@ mod tests {
         assert!(s.gui.text(w, "value0").contains("77"), "AMS row: {}", s.gui.text(w, "value0"));
         png(&mut s, &mut o, "stat-1-hurt");
         assert!(s.hud.window(WindowKind::Stat).is_some());
-        s.hud.close(&mut s.gui, WindowKind::Stat);
+        s.hud.close(&mut s.gui, &mut s.rollup, WindowKind::Stat);
         assert!(!s.hud.is_open(WindowKind::Stat));
     }
 
@@ -1033,8 +1115,8 @@ mod tests {
         s.zone.inventory.insert(0x31, item(0x31, 0xc1a5, 1)); // social Neck
         s.zone.inventory.insert(0x40, item(0x40, 0xc1a2, 3));
         s.zone.inventory.insert(0x41, item(0x41, 0xc1a8, 7));
-        s.hud.open(&mut s.gui, WindowKind::Character);
-        s.hud.open(&mut s.gui, WindowKind::Inventory);
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Character);
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Inventory);
         let w = s.hud.window(WindowKind::Character).unwrap();
         o.frame(&mut s, 0.016);
         assert!(s.gui.warnings.is_empty(), "{:?}", s.gui.warnings);
@@ -1067,6 +1149,99 @@ mod tests {
         s.hud.set_inventory_list(false);
         o.frame(&mut s, 0.016);
         assert_eq!(s.gui.canvas_items(iw, "grid").len(), 32);
+    }
+
+    /// Press, drag over the windows, release.
+    fn drag(s: &mut Shot, o: &mut Offscreen, from: (f32, f32), to: (f32, f32)) {
+        let mid = ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+        for ev in [
+            InputEvent::MouseMove { x: from.0, y: from.1 },
+            InputEvent::MouseDown { x: from.0, y: from.1, button: ao_gui::MouseButton::Left },
+            InputEvent::MouseMove { x: mid.0, y: mid.1 },
+            InputEvent::MouseMove { x: to.0, y: to.1 },
+        ] {
+            s.input(ev, &mut Host::headless());
+            o.frame(s, 0.016);
+        }
+        s.input(InputEvent::MouseUp { x: to.0, y: to.1, button: ao_gui::MouseButton::Left }, &mut Host::headless());
+        o.frame(s, 0.016);
+    }
+
+    /// `drag` with both end points computed from the shot first (they borrow it).
+    macro_rules! dnd {
+        ($s:ident, $o:ident, $from:expr, $to:expr) => {{
+            let (f, t) = ($from, $to);
+            drag(&mut $s, &mut $o, f, t)
+        }};
+    }
+
+    /// Screen centre of a bag grid cell / a wear cell.
+    fn bag_xy(s: &Shot, cell: (usize, usize)) -> (f32, f32) {
+        let iw = s.hud.window(WindowKind::Inventory).unwrap();
+        let (r, i) = (s.gui.view_rect(iw, "grid").unwrap(), s.hud.inventory.as_ref().unwrap());
+        let (ox, oy) = inv_grid::cell_origin(cell.0, cell.1, i.gap);
+        (r.l + ox + 24.0, r.t + oy + 24.0)
+    }
+    fn wear_xy(s: &Shot, tab: usize, id: u32) -> (f32, f32) {
+        let w = s.hud.window(WindowKind::Character).unwrap();
+        let r = s.gui.view_rect(w, "items").unwrap();
+        let cell = (0..15).find(|&c| items::wear_slot(tab, c).is_some_and(|sl| sl % 16 == id)).unwrap();
+        let (c, row) = items::wear_cell(tab, cell);
+        let (ox, oy) = items::wear_origin(c, row);
+        (r.l + ox + 27.0, r.t + oy + 27.0)
+    }
+
+    /// Drag and drop with real item templates (rdb 1000020: 21797 "Augmented Nano Armor Cloak" = class 2, `Placement` bit 3 (Back), `DefaultPos` 3;
+    /// 31837 "Floating Torch" = class 1): equip, refuse, unequip, double click, drop on the ground; the server's answers move the items.
+    #[test]
+    fn items_move_by_drag_and_drop() {
+        use ao_net::n3::inventory as inv;
+        let Some((mut s, mut o)) = shot() else { return };
+        if ao_rdb::RecordStore::open(&ao_gui::client_dir()).is_err() {
+            return;
+        }
+        let me = s.zone.char_id as i32;
+        let mine = Identity { kind: 0xC350, instance: me };
+        s.zone.inventory.insert(0x40, item(0x40, 21797, 1));
+        s.zone.inventory.insert(0x41, item(0x41, 31837, 1));
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Character);
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Inventory);
+        let w = s.hud.window(WindowKind::Character).unwrap();
+        o.frame(&mut s, 0.016);
+        click(&mut s, &mut o, w, "tab_clothes");
+        o.frame(&mut s, 0.016);
+        let payload = |s: &mut Shot| s.hud.take_outbox().into_iter().map(|f| f.payload).collect::<Vec<_>>();
+
+        // the cloak onto the Back slot of the clothes tab: a `ClientMoveItemToInventoryIIR_t` to slot 0x10 + 3, nothing changes locally
+        dnd!(s, o, bag_xy(&s, (0, 0)), wear_xy(&s, 1, 3));
+        assert_eq!(payload(&mut s), [inv::move_item_to_inventory(me, inv::item_identity(0x40), 0x13)]);
+        assert!(s.zone.inventory.contains_key(&0x40) && !s.zone.inventory.contains_key(&0x13));
+        // the torch (class 1) is refused by the clothes tab, and by a slot it does not fit
+        dnd!(s, o, bag_xy(&s, (1, 0)), wear_xy(&s, 1, 3));
+        assert!(payload(&mut s).is_empty());
+        // the server answers: the cloak is worn
+        s.zone.apply_inventory(&inv::InventoryMsg::ContainerAdd { item: inv::item_identity(0x40), container: mine, slot: 0x13 });
+        o.frame(&mut s, 0.016);
+        assert_eq!((s.gui.canvas_items(w, "items").len(), s.hud.inventory.as_ref().unwrap().positions.get(0x40)), (1, None));
+        png(&mut s, &mut o, "dnd-worn");
+        // the worn cloak onto the bag cell (2, 1): unequip to "any free slot", the item appears in the cell it was dropped on
+        dnd!(s, o, wear_xy(&s, 1, 3), bag_xy(&s, (2, 1)));
+        assert_eq!(payload(&mut s), [inv::move_item_to_inventory(me, inv::item_identity(0x13), inv::ANY_BAG_SLOT)]);
+        s.zone.apply_inventory(&inv::InventoryMsg::ContainerAdd { item: inv::item_identity(0x13), container: mine, slot: inv::ANY_BAG_SLOT });
+        o.frame(&mut s, 0.016);
+        assert_eq!(s.hud.inventory.as_ref().unwrap().positions.get(0x40), Some((2, 1)));
+        // inside the bag only the client side cell changes: no frame
+        dnd!(s, o, bag_xy(&s, (2, 1)), bag_xy(&s, (0, 2)));
+        assert!(payload(&mut s).is_empty());
+        assert_eq!(s.hud.inventory.as_ref().unwrap().positions.get(0x40), Some((0, 2)));
+        // a double click wears it at its `DefaultPos`
+        let p = bag_xy(&s, (0, 2));
+        click_at(&mut s, &mut o, p.0, p.1);
+        click_at(&mut s, &mut o, p.0, p.1);
+        assert_eq!(payload(&mut s), [inv::move_item_to_inventory(me, inv::item_identity(0x40), 0x13)]);
+        // released over the world: `DropTemplateIIR_t`
+        dnd!(s, o, bag_xy(&s, (1, 0)), (20.0, 300.0));
+        assert_eq!(payload(&mut s), [inv::drop_item(me, inv::item_identity(0x41), [0.0; 3])]);
     }
 
     /// The real `Hud`: the menu toggles open the windows, the frame close button (and `Close`) clears the menu state again; the NewChar template's

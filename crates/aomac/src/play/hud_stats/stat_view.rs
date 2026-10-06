@@ -5,6 +5,7 @@
 //! (borders 3,2,3,0; `PowerbarView_c(bg 0xdb, full, dir right)` with a centred "cur / max" label), then an `HLayout` of two `VLayout`s
 //! (labels left-aligned, borders 3,0,0,0 | spacer | values right-aligned, borders 0,0,3,0).
 
+use super::super::hud_rollup::Rollup;
 use super::super::zone::Zone;
 use ao_formats::{screens::TextDb, stats};
 use ao_gui::{Gui, WindowId, WindowSize};
@@ -12,6 +13,9 @@ use std::collections::HashMap;
 
 /// The nine rows, in the order of the ctor's `GetText(0x7d3, stat)` pushes: 22 `AMS`, then 91 / 90 / 92 / 96 / 93 / 94 / 95 / 97 (Melee, Projectile,
 /// Energy, Poison, Chemical, Radiation, Cold, Fire armour classes). The values are `N3Msg_GetSkill(stat, 2)` (handlers `FUN_1007fa7a`, `FUN_1007fad8`).
+/// Dock identity of the view (`DockableViewDockName`, `docked_view_identities` of `RollupArea.xml`).
+pub(super) const KEY: &str = "stat_window";
+
 pub(super) const ROWS: [u32; 9] = [22, 91, 90, 92, 96, 93, 94, 95, 97];
 
 /// One power bar: view name, fill art (`GFX_GUI_HOR_BAR_*`, ids 0xdd 0xda 0xde 0xdc 0xdf), tooltip key in text.mdb 10000.
@@ -63,7 +67,8 @@ pub(super) struct StatView {
 }
 
 impl StatView {
-    pub(super) fn open(gui: &mut Gui, db: &TextDb, pos: (i32, i32)) -> anyhow::Result<Self> {
+    /// Docks the view in the rollup column (`StatViewConfig` `DockableViewDockName = "RollupArea"`, page `stat_window` of `RollupArea.xml`); tab title "Stats".
+    pub(super) fn open(gui: &mut Gui, db: &TextDb, rollup: &mut Rollup) -> anyhow::Result<Self> {
         let mut xml = String::from("<root><View view_layout=\"vertical\" name=\"StatView\">");
         xml += "<View view_layout=\"horizontal\"><TextView name=\"name\" layout_borders=\"Rect(3,3,3,3)\"/><HLayoutSpacer name=\"spacer\"/>";
         xml += "<TextView name=\"level\" layout_borders=\"Rect(0,3,3,0)\"/></View>";
@@ -87,7 +92,7 @@ impl StatView {
             xml += &format!("<TextView name=\"value{i}\" layout_borders=\"Rect(0,0,3,0)\"/>");
         }
         xml += "</View></View></View></root>";
-        let window = gui.open_framed_window_xml("StatView", &xml, pos, WindowSize::Preferred)?;
+        let window = rollup.open_page(gui, KEY, "Stats", &xml, 279.0)?;
         for b in &BARS {
             if let Some(t) = db.by_key(10000, b.tip) {
                 gui.set_tooltip(window, b.name, &t, "");
