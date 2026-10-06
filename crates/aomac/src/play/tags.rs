@@ -22,7 +22,7 @@ const SPRITE_H: usize = nt::NAME_TAG_SPRITE_HEIGHT_PX as usize;
 /// Renderer model key / actor id of slot `n` of [`TagLayer`]: the model key carries a `0x7a67` marker in bits 8..24 next to bit 62 (dynel
 /// models are 64-bit hashes, a collision is as unlikely as between two of them), the actor id has bit 31 set (characters stay far
 /// below, props start at 0x4000_0000).
-const MODEL_BASE: u64 = 0x4000_0000_0000_0000 | 0x7a67_00;
+const MODEL_BASE: u64 = 0x4000_0000_0000_0000 | 0x007a_6700;
 const ACTOR_BASE: u32 = 0x8000_0000;
 /// Tags the renderer holds at a time (nearest first beyond that; the original has no limit).
 const SLOTS: usize = 96;
@@ -62,6 +62,7 @@ pub struct Listing {
 
 impl Listing {
     /// A rebuild is due now (`ShowAllNamesCallback` / `ShowOrgNamesCallback` set the timer to 100).
+    #[cfg(test)]
     pub fn force(&mut self) {
         self.timer = f32::MAX;
     }
@@ -301,7 +302,7 @@ mod tests {
         // 2.0 s after the rebuild a new set replaces the old one
         assert!(l.update(0.2, || vec![3], |_| true).contains(&3));
         l.clear();
-        assert!(l.update(0.0, || vec![], |_| true).is_empty());
+        assert!(l.update(0.0, Vec::new, |_| true).is_empty());
     }
 
     #[test]

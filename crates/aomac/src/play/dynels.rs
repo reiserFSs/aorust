@@ -126,17 +126,22 @@ pub struct Built {
     /// Name tag anchor height, metres above the feet at scale 1.
     pub tag_height: f32,
     /// Corpses and static CAT props: the fixed pose (body vertices, mount transforms).
-    pub held: Option<(Vec<ao_scene::Vertex>, Vec<[[f32; 4]; 4]>)>,
+    pub held: Option<HeldPose>,
     /// `Flags` bit 0 of an item-family dynel (`DisableVisibility` otherwise).
     pub visible: bool,
     /// Items whose mesh has node keyframes (doors, vending machines): the animation data (docs/zone/doors.md).
     pub item: Option<ItemRig>,
 }
 
+/// A skinned pose held for good: vertices and mount transforms.
+type HeldPose = (Vec<ao_scene::Vertex>, Vec<[[f32; 4]; 4]>);
+/// A weapon to resolve: (holder, hand slot, template, message stats).
+type PendingWeapon = (i32, usize, Option<u32>, Vec<(u32, i32)>);
+
 enum Model {
     Loading,
     Failed,
-    Ready { built: Built, uploaded: bool },
+    Ready { built: Box<Built>, uploaded: bool },
 }
 
 enum Req {
@@ -150,7 +155,7 @@ enum Req {
 }
 
 enum Resp {
-    Model { key: u64, result: Result<Built, String> },
+    Model { key: u64, result: Result<Box<Built>, String> },
     Placed(u32, Vec<PlacedDynel>),
     Weapon { holder: i32, slot: usize, set: Option<i32> },
     Clip { key: u64, id: u32, anims: Vec<Arc<CatAnim>> },
@@ -176,7 +181,7 @@ impl Worker {
             };
             for r in req_rx {
                 let resp = match r {
-                    Req::Model { key, look } => Resp::Model { key, result: build(&store, &mut assets, &look).map_err(|e| format!("{e:#}")) },
+                    Req::Model { key, look } => Resp::Model { key, result: build(&store, &mut assets, &look).map(Box::new).map_err(|e| format!("{e:#}")) },
                     Req::Clip { key, look, id } => {
                         // the record's variants of the key (`FUN_10010ebe`), every one loaded; the character rolls one when the clip starts
                         let ids: Vec<u32> = if look.npc {
@@ -453,7 +458,6 @@ pub struct Char {
     /// `MonsterScale / 100`.
     pub scale: f32,
     pub side: u8,
-    pub level: i16,
     /// Stat `Flags` (0) and `VisualFlags` (0x2A1), name tag inputs.
     flags: i32,
     visual_flags: i32,
@@ -506,7 +510,7 @@ pub struct Dynels {
     pending_clips: Vec<(u64, CharLook, u32, i32)>,
     /// (character, clip) waiting for the worker's answer; started once it is in.
     replay: Vec<(i32, u32)>,
-    pending_weapons: Vec<(i32, usize, Option<u32>, Vec<(u32, i32)>)>,
+    pending_weapons: Vec<PendingWeapon>,
     /// The playfield whose placed dynels (rdb 1000026) are still to be requested.
     want_placed: Option<u32>,
     playfield: Option<u32>,
@@ -752,7 +756,6 @@ impl Dynels {
                         mover,
                         scale: if u.monster_scale > 0 { u.monster_scale as f32 / 100.0 } else { 1.0 },
                         side: u.side,
-                        level: u.level,
                         flags: u.flags2 as i32,
                         visual_flags: u.visual_flags as i32,
                         pose,
@@ -1127,7 +1130,7 @@ mod tests {
         let own_pos = scene_pos(z.own().unwrap().pos);
         let w = &mut z.world;
         for k in w.chars.values().map(|c| c.key).collect::<Vec<_>>() {
-            w.models.insert(k, Model::Ready { built: plain(Default::default(), true), uploaded: true });
+            w.models.insert(k, Model::Ready { built: Box::new(plain(Default::default(), true)), uploaded: true });
         }
         // pref off: nothing without indicators
         w.show_all_names = false;
