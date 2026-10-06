@@ -38,6 +38,8 @@ pub(super) struct Chat {
     ignored: HashSet<u32>,
     /// Zone frames queued by input lines (the flow drains them into the session).
     outbox: Vec<Frame>,
+    /// Text event to drop: the character of the key that opened the input bar.
+    swallow: Option<String>,
 }
 
 enum Back {
@@ -56,7 +58,7 @@ impl Chat {
     pub fn new() -> Self {
         let mut net = net::ChatNet::default();
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
-        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![] }
+        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], swallow: None }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
@@ -216,26 +218,44 @@ impl Chat {
     /// Keys that open the input bar while no text field has the keyboard (`TextInputModule_t::StartChatMessage` /
     /// `StartChatCmdMessage` "/" / `StartChatReplyMessage` Shift+R, GUI 0x10021f18 / 0x10021fd0). `true` = consumed.
     pub fn input(&mut self, gui: &mut Gui, ev: &InputEvent, zone: &Zone, texts: &TextDb) -> bool {
+        if let (InputEvent::Text(t), Some(s)) = (ev, &self.swallow) {
+            // the text of the key press that just opened the bar (the viewer may send the Key and then its Text)
+            let hit = t == s;
+            self.swallow = None;
+            if hit {
+                return true;
+            }
+        }
         if gui.focused_view().is_some() || self.win.is_none() {
             return false;
         }
+        let mut open = |this: &mut Self, gui: &mut Gui, prefill: Option<String>, swallow: &str| {
+            match prefill {
+                Some(p) => this.focus_text(gui, &p),
+                None => {
+                    if let Some(w) = &mut this.win {
+                        w.focus_input(gui);
+                    }
+                }
+            }
+            this.swallow = (!swallow.is_empty()).then(|| swallow.to_owned());
+            true
+        };
+        let reply = |this: &Self| {
+            let (groups, text) = (this.groups(), |k: &str| texts.by_key(10001, &format!("ChatCmdFeedback_{k}")).unwrap_or_default());
+            cmd::reply_prefill(&this.cmd_ctx(zone, &groups, None, &text))
+        };
         match ev {
-            InputEvent::Key { key: ao_gui::Key::Enter, pressed: true, .. } => {
-                self.win.as_mut().map(|w| w.focus_input(gui));
-                true
+            InputEvent::Key { key: ao_gui::Key::Enter, pressed: true, .. } => open(self, gui, None, ""),
+            InputEvent::Key { key: ao_gui::Key::Letter('/'), pressed: true, .. } => open(self, gui, Some("/".into()), "/"),
+            InputEvent::Text(t) if t == "/" => open(self, gui, Some("/".into()), ""),
+            InputEvent::Key { key: ao_gui::Key::Letter('r'), pressed: true, mods, .. } if mods.shift => {
+                let p = reply(self);
+                open(self, gui, Some(p), "R")
             }
-            InputEvent::Text(t) if t == "/" => {
-                self.focus_text(gui, "/");
-                true
-            }
-            // Shift+R arrives as the text "R" (the viewer sends text, not a key, for printable keys)
             InputEvent::Text(t) if t == "R" => {
-                let prefill = {
-                    let (groups, text) = (self.groups(), |k: &str| texts.by_key(10001, &format!("ChatCmdFeedback_{k}")).unwrap_or_default());
-                    cmd::reply_prefill(&self.cmd_ctx(zone, &groups, None, &text))
-                };
-                self.focus_text(gui, &prefill);
-                true
+                let p = reply(self);
+                open(self, gui, Some(p), "")
             }
             _ => false,
         }
