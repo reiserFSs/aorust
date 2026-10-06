@@ -646,7 +646,7 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             apply_view_attrs(&mut v, e, 0);
             tree.add(v)
         }
-        "TextInputView" | "ComboBox" => build_input(tree, ctx, e, e.name == "ComboBox"),
+        "TextInputView" | "ComboBox" | "DropdownMenu" => build_input(tree, ctx, e, e.name != "TextInputView"), // DropdownMenu_c (LFTView.xml): drawn like the ComboBox (GUESS, DropdownMenu_c not traced)
         "ScrollView" => {
             let mode = |k: &str| match e.attr(k).map(str::to_ascii_lowercase).as_deref() {
                 Some("auto") => ScrollMode::Auto,

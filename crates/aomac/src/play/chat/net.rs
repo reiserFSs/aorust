@@ -317,6 +317,14 @@ impl ChatNet {
         self.groups.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|(k, _)| *k)
     }
 
+    /// Test hook: feeds one decoded event as if it came from the session.
+    #[cfg(test)]
+    pub(super) fn inject(&mut self, e: ChatEvent) -> Vec<Out> {
+        let mut out = vec![];
+        self.on_event(e, &mut out);
+        out
+    }
+
     /// A private chat group the character joined / left (`AddGroup` of the 0x37 handler): it is a group like the announced channels, so
     /// `/g <name>`, window selection and [`ChatNet::say`] (type 0x39 for kind 0xE) work on it.
     pub fn set_group(&mut self, key: u64, name: Option<&str>) {
@@ -366,6 +374,36 @@ mod tests {
         assert!(msgs.iter().any(|m| m.text.starts_with("Welcome to Project Rubi-Ka!") && m.group == 0x4000_0002));
         // our own vicinity message comes back as 0x22 with our id
         assert!(msgs.iter().any(|m| m.group == 0x4000_0002 && m.from_name == "Aomacvolk" && m.text == "aomac client test"), "{msgs:?}");
+    }
+
+    /// Raw packets of the social layer (types 0x28 / 0x32 / 0x37 / 0x39 / 0x5dd) decode and reach the hub as [`Out::Social`].
+    #[test]
+    fn social_packets_are_routed() {
+        let mut n = ChatNet::default();
+        let s = |x: &str| [&(x.len() as u16).to_be_bytes()[..], x.as_bytes()].concat();
+        let pkts: Vec<(u16, Vec<u8>)> = vec![
+            (0x28, [&7u32.to_be_bytes()[..], &1u32.to_be_bytes(), &s("\u{1}")].concat()),
+            (0x32, 9u32.to_be_bytes().to_vec()),
+            (0x37, [&9u32.to_be_bytes()[..], &1u32.to_be_bytes()].concat()),
+            (0x39, [&9u32.to_be_bytes()[..], &7u32.to_be_bytes(), &s("hi"), &s("")].concat()),
+            (0x5dd, [&[2u8][..], &0u32.to_be_bytes(), &s(""), &0u32.to_be_bytes(), &0u32.to_be_bytes(), &[0, 0], &s("")].concat()),
+        ];
+        let mut got = vec![];
+        for (t, p) in pkts {
+            got.extend(n.inject(ao_net::chat::decode(t, &p).unwrap()));
+        }
+        assert_eq!(got.len(), 5);
+        assert!(matches!(&got[0], Out::Social(ChatEvent::BuddyAdd { id: 7, online: 1, data }) if data == &[1]));
+        assert!(matches!(&got[1], Out::Social(ChatEvent::PrivInvited(9))));
+        assert!(matches!(&got[2], Out::Social(ChatEvent::PrivJoined { group: 9, who: 1 })));
+        assert!(matches!(&got[3], Out::Social(ChatEvent::PrivMessage { group: 9, from: 7, .. })));
+        assert!(matches!(&got[4], Out::Social(ChatEvent::LftReply(r)) if r.status == 2));
+        // a looked-up tell target opens its window when the answer arrives
+        let o = n.inject(ChatEvent::Lookup { id: 5, name: "Bob".into() });
+        assert!(o.iter().all(|o| !matches!(o, Out::OpenTell { .. })));
+        n.opens.push("bob".into());
+        assert_eq!(n.inject(ChatEvent::Lookup { id: 5, name: "Bob".into() }), [Out::OpenTell { id: 5, name: "Bob".into() }]);
+        assert_eq!(n.lookup_open("bob"), Some(5));
     }
 
     #[test]

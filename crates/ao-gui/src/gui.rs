@@ -1521,7 +1521,7 @@ impl Gui {
             return;
         };
         match self.tree.views[v].kind.clone() {
-            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) => {
+            Kind::Button(_) | Kind::CcEntry(_) | Kind::TextButton(_) | Kind::CheckBox { .. } => {
                 self.pressed = Some(v);
                 match &mut self.tree.views[v].kind {
                     Kind::Button(b) => b.pressed = true,

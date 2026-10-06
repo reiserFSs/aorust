@@ -558,6 +558,12 @@ impl ChatWindows {
         true
     }
 
+    /// `(window_name, name)` of every chat window: the Friends window's "Chat Windows" folder lists the names, the private-group invite dialog
+    /// offers a check box per window and subscribes by `window_name` ([`subscribe_group`](Self::subscribe_group)).
+    pub fn window_list(&self) -> Vec<(String, String)> {
+        self.wins.iter().map(|w| (w.cfg.window_name.clone(), w.cfg.name.clone())).collect()
+    }
+
     /// Writes every window's `Config.xml` under `<prefs dir>/Chat/Windows/<window_name>/` (`FUN_10094a28`, at shutdown).
     pub fn save(&self) -> std::io::Result<()> {
         let Some(dir) = &self.prefs else { return Ok(()) };

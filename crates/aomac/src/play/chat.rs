@@ -79,6 +79,8 @@ pub(super) struct Chat {
     swin: social_win::SocialWin,
     /// Lines of each tell partner's window (kept while it is closed).
     tell_log: std::collections::HashMap<u32, Vec<String>>,
+    /// Chat windows ticked in the invitation dialog, by group owner id (applied when the group joins).
+    pg_windows: std::collections::HashMap<u32, Vec<String>>,
 }
 
 enum Back {
@@ -97,7 +99,7 @@ impl Chat {
     pub fn new() -> Self {
         let mut net = net::ChatNet::default();
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
-        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default() }
+        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default() }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
@@ -491,7 +493,7 @@ impl Chat {
             gm_level: 0,
             warn_unsub: true,
             chat_connected: self.net.logged_in(),
-            lft_on: false,
+            lft_on: self.social.lft.on,
             script_exists: None,
             text,
         }
@@ -562,6 +564,13 @@ impl Chat {
             },
         };
         let out = zonecmd::perform(a, &ctx);
+        if let (Some(on), ChatAction::Lft { text, .. }) = (out.lft, a) {
+            // `/lft` shares `DAT_10276620` and `TeamDesc` with the LFT window (`FUN_100f01a3`)
+            self.social.lft.on = on;
+            if on {
+                self.social.lft.description = text.clone();
+            }
+        }
         self.outbox.extend(out.frames);
         for l in out.lines {
             self.line(gui, l);

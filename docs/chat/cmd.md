@@ -300,7 +300,7 @@ performs it. Names are resolved by lookup 0x15 first (`ChatCmdFeedback_UnknownUs
 | – | `/cc <args..>` (`FUN_100ba105` -> 0x1016cadf) | 0x1016cadf | 0x78 `sI`: argument strings (pack code `s`: u16 count + `S`s), window id | `Cc` |
 
 The earlier `ChatCmd::PrivJoin/PrivPart` ids (0x33/0x34) were wrong and are corrected, with `PrivInvite`/`PrivKick` added. `LFTWindowConfig.TeamDesc` (a DValue) is stored locally by
-`FUN_100f01a3`; not ported.
+`FUN_100f01a3`: `/lft` and the LFT window share the flag and description (`Social::lft`, docs/chat/social.md §6).
 
 ## Gaps / guesses
 

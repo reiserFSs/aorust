@@ -64,14 +64,14 @@ Field codes (pack `FUN_1017161f`, unpack `FUN_10171ae5`):
 | 0x41 | S2C_GROUP_MESSAGE | `GISD` group, sender, text, data |
 | 0x64 | S2C_PONG | `D` |
 | 0x6e | S2C_FORWARD_DATA | `IM` |
-| 0x44c, 0x5dd | LFT query / reply | not decoded |
-| 0x3f2.. | S2C_ADM_MUX_INFO | `BISIIBBS` not decoded |
+| 0x5dd | S2C_LFT_QUERY_RESULT | `BISIIBBS` status, id, name, level, playfield, side, profession, description (decoded: `ChatEvent::LftReply`, docs/chat/social.md §6) |
+| 0x44c | S2C_ADM_MUX_INFO | three lists (format 0x101ca0d8), not decoded; (`BISIIBBS` belongs to 0x5dd, not to the MUX info) |
 
 ## Client -> server (senders GUI 0x1016c8c9..0x1016cdab)
 
-`0x15 S` lookup name; `0x1e ISD` tell; `0x28 ID` / `0x29 I` buddy add / remove; `0x33 I` / `0x34 I` / `0x35 I` private group join / leave / …;
+`0x15 S` lookup name; `0x1e ISD` tell; `0x28 ID` / `0x29 I` buddy add / remove; `0x32 I` invite, `0x33 I` kick, `0x34 I` join, `0x35 I` part (private group, docs/chat/social.md §5);
 `0x39 ISD` private group message; `0x40 GID` group flags; `0x41 GSD` group message (`FUN_1016c9f4` picks 0x39 when the group kind is 0xE);
-`0x46 IG`, `0x47 IIII`, `0x578 IS`, `0x579 S`, `0x5dc S`, `0x5dd (empty)`, `0x5de IIII`, `0x3e9..0x406` (LFT / mail / misc, not implemented).
+`0x46 IG`, `0x47 IIII`, `0x578 IS`, `0x579 S`, `0x5dc S` LFT on, `0x5dd (empty)` LFT off, `0x5de IIII` LFT query (`ChatCmd::LftQuery`: side, profession mask, location index, -1), `0x3e9..0x406` (mail / misc, not implemented).
 `D` of outgoing requests (RE of the GUI callers, GUI.dll, 2026-10):
 * tell 0x1e [`0x1008947b` -> `0x10089c00` -> `FUN_1016c8c9`]: `D = buf[0..n+1]`, `buf[0] = request.kind` (0 for a typed tell), `buf[1..] = FUN_10089163(attachment)`; the attachment serializer returns 0 when the message has no link attachment, so **D = `00`** (1 byte).
 * group 0x41 / private group 0x39 [`0x1008a400..0x1008a436` -> `FUN_1016c9f4`]: `n = FUN_10089163(att, buf, 0x10000)`, `D = (n > 0 ? buf : NULL, n)`: **empty block (u16 0)** without attachment. (An item-link attachment would be `pack("BBBSS", 1, b0, b1, s1, s2)`, the same TLV tag 1 `BBSS` the receiver parses in `FUN_10085b4a`; not produced by the port, which has no item-link macros.)

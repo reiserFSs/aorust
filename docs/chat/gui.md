@@ -126,7 +126,7 @@ Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), co
   unknown; `win.rs` exposes `active_output_group()` instead). `InputHistory.xml` (`TextLine text=…`, `cursor_pos`) per window: not ported.
 * Links: `FUN_1008e322` → `user://NAME` → signal +0x130 (→ `OpenTellWindow` 0x10085df8 = `FUN_100a6568` tell window), `chatgroup://ID` → signal +0x134 (sets that window's output group),
   anything else → `ChatGUIModule_c::ShowItemRefLink` 0x10085cb5 (`itemref://`, `charref://`, `chatcmd:///…`). Port: `ao_gui::Event::LinkClicked` (activation on mouse-down: confirmed, `TextRenderer_c::MouseDown` 0x101637ef, §13) →
-  `WinOut::OpenTell` / output group change / `WinOut::LinkClicked`. Tell windows themselves (`FUN_100a658b`, per-user config files) are not ported: the hub opens/routes them.
+  `WinOut::OpenTell` / output group change / `WinOut::LinkClicked`. Tell windows (`OpenTellWindow` 0x10085df8): docs/chat/social.md §4 (`WinOut::OpenTell` opens the tell window; per-user config files of `FUN_100a658b` are not ported).
 * Activation: `SlotGroupWindowActivated` 0x10086fb0; `StartChatCmdMessage` 0x10021f18 / `StartChatReplyMessage` 0x10021fd0 (Enter / reply keys) → `focus_input()` focuses the last active window's editor.
 
 ## 7. Persistence and screen placement
