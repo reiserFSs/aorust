@@ -126,10 +126,10 @@ impl HudStats {
     // ------------------------------------------------------------------------------------------------------------ skills
 
     fn open_skills(&mut self, gui: &mut Gui) -> anyhow::Result<()> {
-        // The original window is `Window(Rect(200,180,850,700), style 0, flags 0x1000)` with one tab "Skills"; the style-0 frame (3,7,3,3 + tab
-        // strip) is not reproduced: UNRESOLVED, the style-1 frame (docs/gui.md §6) of the same outer size is used.
-        let client = (SKILLS_OUTER.0 - 6, SKILLS_OUTER.1 - 27);
-        let w = gui.open_framed_window("Skills", SKILLS_POS, WindowSize::Fixed(client.0, client.1))?;
+        // The original window is `Window(Rect(200,180,850,700), "", "Skills", style 0, flags 0x1000)` with one tab "Skills": the style-0 frame with the
+        // tab strip (docs/gui.md §6.1, client insets 5, 26, 5, 5) of the same outer size.
+        let client = (SKILLS_OUTER.0 - 10, SKILLS_OUTER.1 - 31);
+        let w = gui.open_tabbed_window("Skills", "Skills", SKILLS_POS, WindowSize::Fixed(client.0, client.1))?;
         for g in &stats::SKILL_GROUPS {
             gui.set_text(w, g.prefix, &self.db.by_id(10010, g.label).unwrap_or_default());
             gui.show_collapsing(w, &format!("{}_view", g.prefix), false);
@@ -249,7 +249,8 @@ impl HudStats {
             xml += &format!("<TextButton name=\"tab_{name}\" text=\"\" min_size=\"Point({},17)\" max_size=\"Point({},17)\"/>", r - l, r - l);
         }
         xml += "<HLayoutSpacer/></View></View></View></root>";
-        let w = gui.open_framed_window_xml("WearView", &xml, (30, 150), WindowSize::Preferred)?;
+        // `WearView_c` (`FUN_100e1bc9`) is a `DockableView_c` titled `GetText(10000, "Wear")`
+        let w = gui.open_tabbed_window_xml("WearView", &self.db.by_key(10000, "Wear").unwrap_or_default(), &xml, (30, 150), WindowSize::Preferred)?;
         self.wear = Some(Tabbed { window: w, tab: 0 });
         self.select_wear_tab(gui, 0);
         Ok(())

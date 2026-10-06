@@ -755,7 +755,8 @@ impl Gui {
         let mut out = DrawList::default();
         let mut order: Vec<&Window> = self.windows.iter().flatten().filter(|w| w.visible).collect();
         order.sort_by_key(|w| w.layer); // stable: creation order inside a layer
-        let wins: Vec<(ViewId, (i32, i32), bool, f32, Option<String>)> = order.into_iter().map(|w| (w.root, w.pos, w.framed, w.alpha, w.title.clone())).collect();
+        type Job = (ViewId, (i32, i32), bool, f32, Option<String>);
+        let wins: Vec<Job> = order.into_iter().map(|w| (w.root, w.pos, w.framed, w.alpha, w.title.clone())).collect();
         for (root, pos, framed, alpha, title) in wins {
             if framed {
                 self.draw_frame(root, pos, title.as_deref(), &mut out.cmds);
