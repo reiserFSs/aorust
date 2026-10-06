@@ -554,6 +554,8 @@ mod tests {
     fn live_fight_capture() {
         let own = 0x82e8;
         let mut m = Module::with_texts(Box::new(Fixed::new()), own);
+        // the capture's own `FullCharacter` registers the player; the leet's `SimpleCharFullUpdate` is not in the excerpt
+        m.combat.add_test_char(0xfd6a9, "Beach Leet", true, 12);
         let (mut sent, mut hits, mut stopped, mut started) = (vec![], 0, false, false);
         for l in include_str!("../../../../../docs/captures/zone_fight_ithaca.rec").lines() {
             let mut p = l.split(' ');

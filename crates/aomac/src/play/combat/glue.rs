@@ -86,9 +86,18 @@ impl Play {
             self.zone.world.attack(id);
         }
         let own = self.zone.char_id as i32;
+        // `AttackInfo` / `StatIIR` / death change the own `Health` (27) stat in place (docs/zone/combat-log.md §3): the interface reads that one store
+        let events = m.take_events();
+        for e in &events {
+            if let CombatEvent::Health { dynel, health, .. } = e {
+                if *dynel == own {
+                    self.zone.stats.insert(ao_formats::stats::HEALTH, *health);
+                }
+            }
+        }
         if let Some(p) = self.player.as_mut() {
             p.fighting = m.attacking();
-            for e in m.take_events() {
+            for e in events {
                 match e {
                     // `FUN_1006a8f3` swing of the own character: [GUESS] the unarmed swing (weapon swing lists: combat-anim.md §3)
                     CombatEvent::Hit { attacker, .. } | CombatEvent::SpecialAttack { who: attacker, .. } if attacker == own => {
@@ -102,8 +111,6 @@ impl Play {
                     _ => {}
                 }
             }
-        } else {
-            m.take_events();
         }
         for e in m.take_pose_events() {
             if let ActionEvent::Emote { dynel, id, clip, .. } = e {

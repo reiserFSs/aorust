@@ -156,6 +156,13 @@ impl Combat {
         Self { texts, chars: HashMap::new(), own: 0, area_features: 0 }
     }
 
+    /// Registers a character the way its `SimpleCharFullUpdate` would (for replays whose capture lacks that frame).
+    #[cfg(test)]
+    pub fn add_test_char(&mut self, id: i32, name: &str, npc: bool, health: i32) {
+        let stats = [(STAT_HEALTH, health), (STAT_MAX_HEALTH, health), (STAT_LEVEL, 1)].into();
+        self.chars.insert(id, Char { name: name.into(), npc, stats, ..Char::default() });
+    }
+
     pub fn char(&self, instance: i32) -> Option<&Char> {
         self.chars.get(&instance)
     }
