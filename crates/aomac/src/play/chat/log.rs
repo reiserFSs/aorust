@@ -156,7 +156,7 @@ fn ldb_tokens(t: &[u8]) -> Vec<(usize, String)> {
             if at(b) == 0 {
                 b = b.wrapping_sub(1);
             }
-            let s = if b >= a { &t[a..=b.min(t.len() - 1)] } else { &[][..] };
+            let s = t.get(a..=b.min(t.len().saturating_sub(1))).unwrap_or(&[]);
             toks.push((idx, s.iter().map(|&c| c as char).collect()));
         }
     };
