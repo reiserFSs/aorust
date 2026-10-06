@@ -68,7 +68,7 @@ With the announce: Aomacvolk (lvl 1) vs a Beach Leet (12 HP), capture `docs/capt
 `> LookAt(leet,1)`, `> Attack(leet,0)`, `< Attack` echo (fight starts), AttackInfo hits of 4 / 4 / 5 (crit, unk_30 = 4) and one miss, the leet hits
 back (7), `< StopFight`, `< StatIIR` 0x34 (XP) = 145 ("You received 145 xp." and the yellow 145), "You can loot these remains." (corpse), then
 the deselect `> LookAt(none,0)`. Window captures inspected: world damage number above the target, own HUD numbers at the left edge, the combat
-log lines ("You hit Beach Leet for 4 points of projectile damage", "You tried to hit Beach Leet, but missed!"), the XP bar filling.
+log lines ("You hit Beach Leet for 4 points of projectile damage" — that was the old hard-coded type, the original prints the slot item's type, bare hands = melee: docs/zone/combat-log.md §2.1.1; "You tried to hit Beach Leet, but missed!"), the XP bar filling.
 Observed gaps of that capture, status after the wiring pass: the maximum health was `1` because the own `FullCharacter` carries `Life` (1) = 1 and
 `Combat` stored it over the header's value (now skipped, `state.rs` test `full_character_life_does_not_replace_the_header_max_health`; the Hud bar
 shows `40 / 40` for the lvl 2 Aomacvolk live, the maximum itself is computed by `hud_pools`); the dead leet standing drawn with the selection box:
@@ -87,7 +87,7 @@ Capture `docs/captures/zone_death_borealis.rec` (redacted excerpt: only frames a
 run with `AOMAC_COMBAT_LOG=1` (prints the fight events), `AOMAC_AUDIO_LOG=1` (real audio engine, **muted** unless `AOMAC_AUDIO_UNMUTE` is set:
 `Mixer::output` is applied after the level statistics, so voices / RMS are still logged), window shots inspected:
 * `Q` -> `LookAt` + `Attack`; `CombatMusic(true)`, the music switched `MN03.wav` -> `MN10.wav` -> `MN08.wav` while fighting (`audio` step).
-* Lines: "You hit Fresh Engineer for 3 points of projectile damage.", "You tried to hit Fresh Engineer, but missed!", red "Fresh Engineer hit you for 11 / 12 / 17 points ...";
+* Lines: "You hit Fresh Engineer for 3 points of projectile damage." (old hard-coded type, now melee for bare hands), "You tried to hit Fresh Engineer, but missed!", red "Fresh Engineer hit you for 11 / 12 / 17 points ...";
   world damage number "3" above the target; the own avatar plays its swing between the engineer's hits (shots a3..a6).
 * Health 8 -> -4 (`Health` -12): `FightStopped`, `CombatMusic(false)`, `DeathMusic(true)`, then `Died { cause: 0 }` (server `CharacterAction` 99): the
   death sound plays at the camera (1 voice), the avatar lies on the ground holding the death clip (shot a8), the stats window shows the unsigned
@@ -98,3 +98,17 @@ run with `AOMAC_COMBAT_LOG=1` (prints the fight events), `AOMAC_AUDIO_LOG=1` (re
   the timer).
 * **Not confirmed live**: own kill, corpse, XP and loot. A lvl 2 character does 3 damage per hit against 160 HP mobs (the lowest attackable mob in
   reach; Uncle Pumpkin-Head 332 HP), and the engineer kills it in ~4 rounds. The kill / corpse / XP evidence remains `zone_fight_ithaca.rec`.
+
+## Live: own kill on the ICC beach (new character Aomacrceg, lvl 1 Solitus Soldier, bare hands)
+Harness: `AOMAC_LIVE_NEW=<name>:<CC breed>:<CC profession>` creates a character (the creation module's request, `create/scenes.rs::live_create`; Atrox (CC breed 7) is
+refused by PRK with login code 7 `CharacterProblem`, Solitus male Soldier is accepted), `goto=193:157` leaves the Arrival Hall (pf 4604) through the shuttleport tunnel
+into pf 4582 at (931, 20.6, 729), `goto=hunt` walks to the weakest hostile (Beach Leet first) and selects it, `Q` attacks, `ruse=corpse` / `lootid=` / `loottake=` loot.
+Frames inspected (`/tmp` shots, deleted): own avatar mid-swing with the arm raised (f5), the target frame and its yellow health bar, the leet's death: the selection box and the standing
+model are gone at once, the corpse lies at the feet; chat lines "You hit Beach Leet for 5 points of **melee** damage." (bare hands = slot 0, melee: docs/zone/combat-log.md §2.1.1),
+"You received 145 xp." (XP bar 145 / 1450, second kill 290), "You can loot these remains."; the second kill gave the same. Music `MN01/MN03/MN09` switched on `CombatMusic(true)`
+and `LosingMed10` when the fight ended. Muted run: the voices (1-3) and the death sound at the camera are logged (`game sound ...: 1 voice(s)`).
+Bare hands hit chance is low (about 1 hit in 3) and the character died three times against lvl 1 mobs (death flow as in Borealis, respawn at the beach start with
+low health); two kills were made with the sit-rest between fights (`X`).
+Capture `docs/captures/zone_kill_ithaca.rec`, test `module::death_tests::live_kill_capture`.
+**Loot**: the corpse opens (2 items + Cash +1) but every `MoveItemToInventory` variant is ignored (`docs/captures/zone_loot_own_kill_ithaca.rec`, docs/zone/interact.md §9, §12.3): open.
+**Weapons**: a new character has an empty inventory (no starter items), so wielding / unwielding and the weapon swing lists could not be tried live.

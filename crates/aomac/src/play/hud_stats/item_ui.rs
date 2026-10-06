@@ -229,6 +229,11 @@ impl HudStats {
             return;
         }
         let Some(slot) = self.slot_of(place) else { return };
+        self.use_slot(zone, slot);
+    }
+
+    /// The double click on the item in inventory slot `slot` (worn: to the bag; bag: worn at its `DefaultPos` or used).
+    fn use_slot(&mut self, zone: &Zone, slot: u32) {
         let Some(e) = zone.inventory.get(&slot) else { return };
         let item = inv::item_identity(slot);
         let action = if slot < inv::BAG_FIRST {
@@ -246,5 +251,13 @@ impl HudStats {
         if let Some(a) = action {
             self.run(zone, a, None);
         }
+    }
+}
+
+#[cfg(test)]
+impl HudStats {
+    /// Live harness: double click on the item of inventory slot `slot` (wear / unwear / use).
+    pub(in crate::play) fn live_double_click(&mut self, zone: &Zone, slot: u32) {
+        self.use_slot(zone, slot);
     }
 }

@@ -117,7 +117,9 @@ impl Module {
                 Box::new(NoTexts)
             }
         };
-        Self::with_texts(texts, own)
+        let mut m = Self::with_texts(texts, own);
+        m.combat.arms = super::arms::Armory::open(dir);
+        m
     }
 
     pub fn with_texts(texts: Box<dyn super::log::Texts>, own: u32) -> Self {
@@ -755,6 +757,41 @@ mod death_tests {
             _ => None,
         }).collect();
         assert_eq!(done, [ACTION_DEATH_DONE], "sent exactly once");
+    }
+
+    /// Live kill of Aomacrceg (lvl 1 Solitus Soldier, bare hands) on a Beach Leet (12 HP) on the ICC beach (`docs/captures/zone_kill_ithaca.rec`, redacted
+    /// excerpt: only frames addressed to the two characters and the corpse): own hits of 5 / 6 / 5 (bare hands = slot 0), the leet's hits, the
+    /// kill (`CharacterAction` 99 -> `Died`), the XP number 145 and the corpse update.
+    #[test]
+    fn live_kill_capture() {
+        let own = 0x830e;
+        let leet = 1015682;
+        let mut m = Module::with_texts(Box::new(Fixed::new()), own);
+        let (mut dealt, mut died, mut stopped, mut started) = (0, false, false, false);
+        for l in include_str!("../../../../../docs/captures/zone_kill_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            if dir == ">" {
+                continue;
+            }
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            m.on_frame(&Frame::decode_with(&b, false).unwrap().unwrap().0);
+            for e in m.take_events() {
+                match e {
+                    CombatEvent::Hit { attacker, victim, damage, slot, .. } if attacker == own as i32 && victim == leet => {
+                        assert_eq!(slot, 0, "bare hands");
+                        dealt += damage;
+                    }
+                    CombatEvent::FightStarted { who, .. } if who == own as i32 => started = true,
+                    CombatEvent::FightStopped { who } if who == own as i32 => stopped = true,
+                    CombatEvent::Died { dynel, cause: 0 } if dynel == leet => died = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(started && stopped && died, "{started} {stopped} {died}");
+        assert!(dealt >= 12, "the leet has 12 HP: {dealt}");
+        assert!(m.numbers().iter().any(|n| n.text == "145"), "the XP number");
     }
 
     /// Live death of Aomacvolk (lvl 2, 40 HP) against a Fresh Engineer in Borealis (`docs/captures/zone_death_borealis.rec`, redacted excerpt of the

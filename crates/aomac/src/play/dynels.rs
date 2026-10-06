@@ -530,6 +530,8 @@ pub struct Dynels {
     pending: Vec<Look>,
     /// `AnimSet` of the weapon in the right (slot 6) / left (slot 8) hand of a holder.
     wield: HashMap<i32, [Option<Wield>; 2]>,
+    /// Weapon-slot tables of the characters: stat `DamageType` of the item behind an `AttackInfo` slot (the hit lines of the chat log).
+    pub arms: super::combat::arms::Armory,
     /// (swing clip, `ItemDelay`) of the last [`Dynels::pick_swing`] of a character: the clip plays sped up by [`canim::swing_speed_scale`].
     swing_delay: HashMap<i32, (u32, i32)>,
     /// Weapon dynel instance -> (holder, hand index).
@@ -572,6 +574,7 @@ impl Default for Dynels {
             next_prop: PROP_ID_BASE,
             pending: vec![],
             wield: HashMap::new(),
+            arms: Default::default(),
             swing_delay: HashMap::new(),
             weapons: HashMap::new(),
             pending_weapons: vec![],
@@ -624,12 +627,14 @@ impl Dynels {
     pub fn start(&mut self, dir: PathBuf, own: i32) {
         self.own = own;
         self.rng = CrtRand::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
+        self.arms = super::combat::arms::Armory::open(&dir);
         self.dir = Some(dir);
     }
 
     /// Forgets every dynel (a playfield change, `Zone::reset_world`).
     pub fn clear(&mut self) {
         self.chars.clear();
+        self.arms.clear();
         self.props.clear();
     }
 
@@ -813,6 +818,7 @@ impl Dynels {
 
     pub fn on_message(&mut self, m: &Message) {
         let who = m.header.target;
+        self.arms.on_message(m, self.chars.get(&who.instance).is_some_and(|c| c.npc));
         match &m.body {
             N3::World(World::VendingMachine(v)) => {
                 let stats = v.base.stats.iter().map(|&(i, x)| (i, x)).collect::<Vec<_>>();

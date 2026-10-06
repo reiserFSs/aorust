@@ -794,18 +794,7 @@ impl Play {
             return self.cc_message(c, &t, None);
         }
         c.name_locked = true;
-        let (breed, gender) = cc_breed_to_gc(c.breed).unwrap_or((1, 3));
-        let head = c.heads.get(c.head).map(|h| h.mesh as i32); // `GetHeadMeshID(CCSelectedHead)`: the rdb 1010001 id
-        let req = CreateCharacterRequest {
-            breed,
-            gender,
-            profession: cc_prof_to_gc(c.prof),
-            head: head.unwrap_or(0),
-            height: height_percent(c.height),
-            width: c.size,
-            name,
-            starter_area: 0,
-        };
+        let req = cc_request(c, name);
         eprintln!("create character: {req:?}");
         if self.fake {
             // `--fake-charlist`: an in-process fake login server — "Taken" is in use, anything else is created and handed off
@@ -883,5 +872,39 @@ impl Play {
                 }
             }
         }
+    }
+}
+
+/// `NameScene_t::SetState(0x1006)`: the `CreateCharacterRequest` of the module's selections.
+fn cc_request(c: &Create, name: String) -> CreateCharacterRequest {
+    let (breed, gender) = cc_breed_to_gc(c.breed).unwrap_or((1, 3));
+    let head = c.heads.get(c.head).map(|h| h.mesh as i32); // `GetHeadMeshID(CCSelectedHead)`: the rdb 1010001 id
+    CreateCharacterRequest { breed, gender, profession: cc_prof_to_gc(c.prof), head: head.unwrap_or(0), height: height_percent(c.height), width: c.size, name, starter_area: 0 }
+}
+
+#[cfg(test)]
+impl Play {
+    /// Live harness: the creation module with the given CC breed / profession selections (the scenes' clicks are not driven) sends the
+    /// request `NameScene_t::StartServerCreation` would. The module must be initialised (`cc_try_init`), the selections are set like the picks.
+    pub(in crate::play) fn live_create(&mut self, name: &str, breed: i32, prof: i32) -> bool {
+        let Some(mut c) = self.cc.take() else { return false };
+        if c.actors.is_empty() {
+            self.cc = Some(c);
+            return false;
+        }
+        c.breed = breed;
+        c.prof = prof;
+        c.head = 0;
+        let (b, s, _) = CC_BREEDS[(breed - 1).clamp(0, 6) as usize];
+        if let Some((breed, gender)) = super::gc_breed(b, s) {
+            c.heads = super::head_table(&self.dir, breed, gender);
+        }
+        let req = cc_request(&c, name.to_string());
+        eprintln!("create character: {req:?}");
+        if let Some(sess) = &self.session {
+            sess.create_character(req);
+        }
+        self.cc = Some(c);
+        true
     }
 }

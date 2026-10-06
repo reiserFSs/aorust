@@ -499,6 +499,12 @@ impl Hud {
         self.outbox.extend(self.stats.take_outbox());
     }
 
+    #[cfg(test)]
+    pub(super) fn live_double_click(&mut self, zone: &Zone, slot: u32) {
+        self.stats.live_double_click(zone, slot);
+        self.outbox.extend(self.stats.take_outbox());
+    }
+
     /// True while the pointer carries an inventory item.
     pub(super) fn item_dragging(&self) -> bool {
         self.stats.dragging_item()

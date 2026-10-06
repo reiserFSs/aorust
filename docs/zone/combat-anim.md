@@ -95,7 +95,7 @@ Built when a weapon is wielded: `(list key -> AbstractAnimID)` multimap, selecte
 43712, 43713), many single-entry `{1034}` / `{1033}` records (45605, 56180, 100237, 120637...). The item-record layout is **not decoded**.
 Unarmed fists: the char's `UnarmedTemplateInstance` (stat 418) is 0 for the own char in the capture, so which list a bare-handed
 player uses is **[UNRESOLVED]** (by the code: empty list -> id 0 -> the `wave` fallback above, which cannot be intended; the entry `+0x10` of
-the slot probably holds a client-made template item).
+the slot holds the `DummyWeapon_t` of the martial-arts item the `SpecialAttackWeaponIIR` list delivers under key 100 (docs/zone/combat-log.md §2.1.1; record 43712 etc.), not a client-made item; its animation multimap layout is still undecoded).
 
 ### 3.2 Special attacks (`special_swing`, `FUN_1003c594` [GC 0x1003c594])
 `FUN_1006855a` (queued special's skill stat) -> list key; the key is looked up on the weapon (`FUN_1004570c(key)`, else 0xb):

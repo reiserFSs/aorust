@@ -13,9 +13,10 @@
 
 use super::anim::{death_anim_from_action, STAT_DEATH_ANIM};
 use super::log::{self, render, Feedback, FloatingNumber, Space, Texts, Who};
+use super::arms::{valid_slot, Armory, DEFAULT_DAMAGE_TYPE};
 use ao_net::frame::Frame;
 use ao_net::msg::Identity;
-use ao_net::n3::{self, dynel::Dynel, misc::Misc, world::World, N3};
+use ao_net::n3::{self, dynel::Dynel, misc::{AttackInfo, Misc}, world::World, N3};
 use std::collections::{BTreeMap, HashMap};
 
 /// Identity kind of character / NPC dynels (`SimpleChar_t`).
@@ -140,11 +141,6 @@ pub fn death_key(cause: u32) -> Option<&'static str> {
     })
 }
 
-/// `FUN_10068072` [GC 0x10068072] accepts weapon slots `0..=15`, `0x3d`, `0x3f` only.
-fn valid_slot(slot: i32) -> bool {
-    (0..0x10).contains(&slot) || slot == 0x3d || slot == 0x3f
-}
-
 pub struct Combat {
     texts: Box<dyn Texts>,
     chars: HashMap<i32, Char>,
@@ -152,11 +148,13 @@ pub struct Combat {
     /// Stat `Features` (0xe0) of the playfield area (`FUN_10044b6e` [GC 0x10044b6e]); bit 0x800000 makes the client print the
     /// attacker's name for player hits (type 0x1d instead of 0x1e). [UNRESOLVED] source, 0 until the playfield layer sets it.
     pub area_features: i32,
+    /// The weapon-slot tables (stat `DamageType` of the items), filled from the same messages.
+    pub arms: Armory,
 }
 
 impl Combat {
     pub fn new(texts: Box<dyn Texts>) -> Self {
-        Self { texts, chars: HashMap::new(), own: 0, area_features: 0 }
+        Self { texts, chars: HashMap::new(), own: 0, area_features: 0, arms: Armory::default() }
     }
 
     /// Registers a character the way its `SimpleCharFullUpdate` would (for replays whose capture lacks that frame).
@@ -192,6 +190,7 @@ impl Combat {
         self.own = own_id as i32;
         let Ok(m) = n3::decode(f) else { return ev };
         let h = m.header.target;
+        self.arms.on_message(&m, self.chars.get(&h.instance).is_some_and(|c| c.npc));
         match m.body {
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if h.kind == CHAR_KIND => {
                 let c = self.chars.entry(h.instance).or_default();
@@ -266,7 +265,7 @@ impl Combat {
             N3::Misc(Misc::StopFight(_)) if h.kind == CHAR_KIND => self.stop_fight(h.instance, &mut ev),
             N3::Misc(Misc::AttackInfo(a)) => {
                 if h.kind == CHAR_KIND && self.chars.contains_key(&h.instance) {
-                    self.hit(h.instance, a.slot, a.damage, a.unk_2c, a.unk_30, &mut ev);
+                    self.hit(h.instance, &a, &mut ev);
                 } else if self.known(a.other) == Some(self.own) {
                     self.unattributed_hit(a.damage, a.unk_2c, &mut ev);
                 }
@@ -421,12 +420,14 @@ impl Combat {
         }
     }
 
-    /// `AttackInfoIIR_t` with a known header `att`: `FUN_1006a8f3(slot, damage, _, death cause, hit flags)`.
+    /// `AttackInfoIIR_t` with a known header `att`: `FUN_1006a8f3(slot, damage, _, death cause, hit flags, special key)`.
     /// The victim is the controller target of `att` (`FUN_100676bd` = `GetDynel(ctrl+0x4c)`), NOT the message's `other`
-    /// identity; the weapon-slot object lookup `FUN_10068072` is assumed to succeed for a valid slot ([UNRESOLVED]: creation of
-    /// those objects was not traced). Quirk kept from the client: the death cause of this message is stored at the victim
-    /// controller `+0x7c` *after* `FUN_1009b170` ran, so a cause is acted on after the next hit on that victim.
-    pub fn hit(&mut self, att: i32, slot: i32, damage: i32, death_cause: i32, flags: i32, ev: &mut Vec<CombatEvent>) {
+    /// identity. The damage type is stat `0x1b4` of the item behind the weapon slot ([`Armory::damage_type`]); a slot the table does
+    /// not know (the original skips the hit then) is printed with the item default ([`DEFAULT_DAMAGE_TYPE`], [GUESS]). Quirk kept from the
+    /// client: the death cause of this message is stored at the victim controller `+0x7c` *after* `FUN_1009b170` ran, so a cause is
+    /// acted on after the next hit on that victim.
+    pub fn hit(&mut self, att: i32, a: &AttackInfo, ev: &mut Vec<CombatEvent>) {
+        let (slot, damage, death_cause, flags) = (a.slot, a.damage, a.unk_2c, a.unk_30);
         if !valid_slot(slot) {
             return;
         }
@@ -447,7 +448,10 @@ impl Combat {
         };
         let mut f = Feedback::new(ty, self.who(v), damage);
         f.b = Some(self.who(att));
-        f.stat = log::weapon_damage_type(0); // [UNRESOLVED] weapon stat 0x1b4 of the slot object: 0 -> projectile
+        // `FUN_1009b170`: a valid stat `0x153` of the attacker (nano) overrides the weapon's `FUN_1009afde`
+        let over = Some(self.chars[&att].stat(0x153)).filter(|&v| v != 0 && log::weapon_damage_type(v) == v);
+        let weapon = self.arms.damage_type(att, slot, a.unk_34).unwrap_or(DEFAULT_DAMAGE_TYPE);
+        f.stat = over.unwrap_or_else(|| log::weapon_damage_type(weapon));
         f.hit = flags;
         self.feedback(ev, &f, v);
         ev.push(CombatEvent::Hit { attacker: att, victim: v, damage, slot, flags });
@@ -611,6 +615,39 @@ mod tests {
         assert!(ev.is_empty() && !c.is_fighting(1));
     }
 
+    fn atk(slot: i32, damage: i32, death: i32, flags: i32) -> AttackInfo {
+        AttackInfo { damage, value_20: -1, slot, other: ch(0), unk_2c: death, unk_30: flags, unk_34: 0 }
+    }
+
+    /// The damage type of a hit line is stat `0x1b4` of the item behind the `AttackInfo` slot (`FUN_1009afde`), the nano stat `0x153` of the
+    /// attacker overriding it; the old hard-coded 0x5a ("projectile") for every unarmed / melee hit is gone.
+    #[test]
+    fn hit_line_damage_type_comes_from_the_slot_item() {
+        let line = |c: &mut Combat, att: i32, a: AttackInfo| {
+            let mut ev = Vec::new();
+            c.hit(att, &a, &mut ev);
+            match &ev[0] {
+                CombatEvent::Log(l) => l.text.clone(),
+                e => panic!("{e:?}"),
+            }
+        };
+        let mut c = setup();
+        c.start_fight(1, ch(2), &mut Vec::new());
+        c.arms.list(1, false, &[(43712, 100)]);
+        assert_eq!(line(&mut c, 1, atk(0, 3, 0, 3)), "You hit Junkbot for 3 points of melee damage.");
+        // a pistol in the right hand, an energy weapon in the left
+        c.arms.wield(1, 901, 6, None, &[(0x1b4, 0x5a)]);
+        c.arms.wield(1, 902, 8, None, &[(0x1b4, 0x5c)]);
+        assert_eq!(line(&mut c, 1, atk(6, 3, 0, 3)), "You hit Junkbot for 3 points of projectile damage.");
+        assert_eq!(line(&mut c, 1, atk(8, 3, 0, 3)), "You hit Junkbot for 3 points of energy damage.");
+        // a stat 0x1b4 outside 0x5a..=0x61 / 0xa8 is the 0x5a default of `FUN_1009afde`
+        c.arms.wield(1, 903, 5, None, &[(0x1b4, 0x1234)]);
+        assert_eq!(line(&mut c, 1, atk(5, 3, 0, 3)), "You hit Junkbot for 3 points of projectile damage.");
+        // the attacker's nano stat 0x153 overrides the weapon
+        c.chars.get_mut(&1).unwrap().stats.insert(0x153, 0x5d);
+        assert_eq!(line(&mut c, 1, atk(6, 3, 0, 3)), "You hit Junkbot for 3 points of chemical damage.");
+    }
+
     #[test]
     fn npc_attacks_you_text_number_health() {
         let mut c = setup();
@@ -618,7 +655,8 @@ mod tests {
         c.start_fight(2, ch(1), &mut ev);
         assert!(matches!(&ev[0], CombatEvent::Log(l) if l.text == "Attacked by Junkbot!" && l.category == 0xc));
         ev.clear();
-        c.hit(2, 2, 17, 0, 3, &mut ev);
+        c.arms.wield(2, 900, 2, None, &[(0x1b4, 0x5a)]);
+        c.hit(2, &atk(2, 17, 0, 3), &mut ev);
         let CombatEvent::Log(l) = &ev[0] else { panic!("{ev:?}") };
         assert_eq!((l.text.as_str(), l.category, l.style), ("Junkbot hit you for 17 points of projectile damage.", 0x17, 0x4200_0006));
         let CombatEvent::Floating { dynel, amount, category, number } = &ev[1] else { panic!() };
@@ -634,15 +672,17 @@ mod tests {
         let mut ev = Vec::new();
         c.start_fight(1, ch(2), &mut ev);
         ev.clear();
-        c.hit(1, 0, 8, 0, 4, &mut ev);
+        c.arms.list(1, false, &[(43712, 100), (43713, 144)]);
+        c.hit(1, &atk(0, 8, 0, 4), &mut ev);
         let CombatEvent::Log(l) = &ev[0] else { panic!() };
-        assert_eq!(l.text, "You hit Junkbot for 8 points of projectile damage. Critical hit!");
+        // bare hands: slot 0 = the martial-arts item, whose record has no stat 0x1b4 -> the item default 0x5b
+        assert_eq!(l.text, "You hit Junkbot for 8 points of melee damage. Critical hit!");
         let CombatEvent::Floating { dynel, number, .. } = &ev[1] else { panic!() };
         assert_eq!((*dynel, number.space, number.life), (2, Space::World, 1.3));
         assert_eq!(c.char(2).map(|c| (c.health(), c.max_health())), Some((42, 50)));
         // invalid slot: ignored
         ev.clear();
-        c.hit(1, 20, 8, 0, 3, &mut ev);
+        c.hit(1, &atk(20, 8, 0, 3), &mut ev);
         assert!(ev.is_empty());
     }
 
@@ -651,11 +691,11 @@ mod tests {
         let mut c = setup();
         let mut ev = Vec::new();
         c.start_fight(1, ch(2), &mut ev);
-        c.hit(1, 0, 50, 4, 3, &mut ev);
+        c.hit(1, &atk(0, 50, 4, 3), &mut ev);
         assert_eq!(c.fight(2).unwrap().death_cause, 4);
         assert_eq!(c.char(2).map(|c| (c.health(), c.max_health())), Some((0, 50)));
         ev.clear();
-        c.hit(1, 0, 1, 0, 3, &mut ev);
+        c.hit(1, &atk(0, 1, 0, 3), &mut ev);
         assert!(ev.iter().any(|e| matches!(e, CombatEvent::Died { dynel: 2, cause: 4 })), "{ev:?}");
         assert_eq!(c.char(2).map(|c| (c.health(), c.max_health())), Some((0, 50)));
     }
@@ -827,9 +867,17 @@ mod tests {
     #[test]
     fn replay_with_the_real_texts() {
         let Some(db) = real_texts() else { return };
-        let ev = replay(Box::new(db));
+        let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("Games/ProjectRubiKa/client");
+        let mut c = Combat::new(Box::new(db));
+        c.arms = Armory::open(&dir);
+        let ev: Vec<_> = frames().iter().flat_map(|f| c.on_frame(f, OWN)).collect();
         let l = lines(&ev);
-        assert_eq!(l[0], "Scout - Jaax'Sinuh hit ICC Shuttle Guard for 17 points of projectile damage.");
+        // the first AttackInfo of the capture (slot 2 of a guard) arrives before the guard's `SpecialAttackWeapon` list: the original finds no
+        // slot object and drops the hit, the port prints it with the item default (melee, see `Combat::hit`)
+        assert_eq!(l[0], "Scout - Jaax'Sinuh hit ICC Shuttle Guard for 17 points of melee damage.");
+        // the damage types come from the items behind the slots (rdb stat 436): the guards' rifle attacks are projectile, their innate melee melee
+        let kind = |w: &str| l.iter().filter(|t| t.contains(&format!(" points of {w} damage."))).count();
+        assert!(kind("projectile") > 0 && kind("melee") > 0, "{l:?}");
         assert!(l.iter().all(|t| !t.contains('%')), "every conversion of the captured hits is fed: {:?}", l.iter().find(|t| t.contains('%')));
         // AttackInfo unk_30 == 4 occurs 3x on the wire, one of them in a dropped message (header without target)
         let crits = ev.iter().filter(|e| matches!(e, CombatEvent::Hit { flags: 4, .. })).count();

@@ -265,10 +265,23 @@ fn live_walk() {
     l.p.gui.set_text(w, "password", &pass);
     l.p.handle(Event::Clicked { window: w, view: "login_btn".into(), item: None }, &mut l.o.host);
     l.until("character list", 60, |p| p.screen == Screen::CharSelect);
-    let i = l.p.chars.iter().position(|c| c.info.name == want).expect("character not on the account");
-    l.p.select_row(i, &mut l.o.host);
     let cw = l.p.char_w.unwrap();
-    l.p.handle(Event::Clicked { window: cw, view: "login_btn".into(), item: None }, &mut l.o.host);
+    // `AOMAC_LIVE_NEW=<name>:<CC breed 1..7>:<CC profession 1..14>`: New Character, the creation module sends its request (no scene clicks),
+    // the login server's `CharacterCreated` + `ZoneHandoff` take the app into the world
+    if let Ok(spec) = std::env::var("AOMAC_LIVE_NEW") {
+        let mut it = spec.split(':');
+        let (name, breed, prof) = (it.next().unwrap().to_string(), it.next().unwrap().parse().unwrap(), it.next().unwrap().parse().unwrap());
+        l.p.handle(Event::Clicked { window: cw, view: "create_btn".into(), item: None }, &mut l.o.host);
+        let t = Instant::now();
+        while !l.p.live_create(&name, breed, prof) {
+            assert!(t.elapsed() < Duration::from_secs(120), "creation module did not start");
+            l.tick();
+        }
+    } else {
+        let i = l.p.chars.iter().position(|c| c.info.name == want).expect("character not on the account");
+        l.p.select_row(i, &mut l.o.host);
+        l.p.handle(Event::Clicked { window: cw, view: "login_btn".into(), item: None }, &mut l.o.host);
+    }
     l.until("world", 120, |p| p.screen == Screen::InWorld && matches!(p.fade, Fade::Hold));
     eprintln!("in world: {} (player built: {}, focus {:?})", l.pos(), l.p.player.is_some(), l.p.gui.focused_view());
     for step in std::env::var("AOMAC_LIVE_STEPS").unwrap_or_else(|_| "wait=2,shot=enter".into()).split(',') {
@@ -389,6 +402,19 @@ fn live_walk() {
                 // autopilot along a collision route: W/S/C/Z by the offset to the next waypoint (the heading stays put)
                 // `goto=<instance>` walks to the dynel (2 m short of it is close enough: the route ends on its cell)
                 let resolved;
+                // `goto=hunt`: a Beach Leet first, else the weakest (lowest max health, then nearest) living hostile (side 3) NPC of level <= 2 within 60 m, selected first
+                let hunted = (v == "hunt").then(|| {
+                    let me = l.p.zone.own().unwrap().pos;
+                    let d = |d: &crate::play::zone::DynelState| (d.pos[0] - me[0]).powi(2) + (d.pos[2] - me[2]).powi(2);
+                    let (id, t) = l.p.zone.dynels.iter().filter(|(_, x)| x.npc && x.side == 3 && x.level <= 2 && x.health > 0 && d(x) < 3600.0).min_by(|a, b| (!a.1.name.contains("Leet"), a.1.max_health, d(a.1)).partial_cmp(&(!b.1.name.contains("Leet"), b.1.max_health, d(b.1))).unwrap()).expect("no hostile low-level NPC near");
+                    eprintln!("hunt: {id} {:?} lvl {} hp {}/{}", t.name, t.level, t.health, t.max_health);
+                    *id
+                });
+                if let Some(id) = hunted {
+                    l.p.zone.target = Some(id);
+                }
+                let hunted_s = hunted.map(|i| i.to_string());
+                let v = hunted_s.as_deref().unwrap_or(v);
                 let v = match v.parse::<i32>() {
                     Ok(id) => {
                         let d = &l.p.zone.dynels[&id];
@@ -664,9 +690,17 @@ fn live_walk() {
                 eprintln!("{}", p.interact.as_ref().unwrap().trade_dump(&p.gui));
             }
             // `ruse=<kind>:<instance>`: the right click on a world object (`FUN_1002c469`: `N3Msg_UseItem(id, false)` whatever its `Can`)
+            // `ruse=<kind>:<instance>` (right click use) or `ruse=corpse` (the nearest corpse prop, kind 0xC76A)
             "ruse" => {
-                let (kind, inst) = v.split_once(':').unwrap();
-                let id = ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() };
+                let id = if v == "corpse" {
+                    let me = l.p.zone.own().unwrap().pos;
+                    let d = |p: [f32; 3]| (p[0] - me[0]).powi(2) + (p[2] - me[2]).powi(2);
+                    let c = l.p.zone.world.prop_list().into_iter().filter(|e| e.0 == 0xC76A).min_by(|a, b| d(a.2).total_cmp(&d(b.2))).expect("no corpse prop");
+                    ao_net::msg::Identity { kind: c.0, instance: c.1 }
+                } else {
+                    let (kind, inst) = v.split_once(':').unwrap();
+                    ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() }
+                };
                 let p = &mut l.p;
                 eprintln!("ruse {v}: {:?}", p.interact.as_mut().unwrap().use_item(&p.zone, id, false));
                 l.wait(5.0);
@@ -681,6 +715,13 @@ fn live_walk() {
                 l.wait(5.0);
             }
             // `useon=<slot>:<kind>:<instance>`: the bag item in `slot` released over the world object (`N3Msg_UseItemOnItem` / `UseItemOnCharacter`)
+            // `dclick=<slot hex>`: the double click on the item of an inventory slot (bag item: wear / use, worn item: back to the bag)
+            "dclick" => {
+                let slot = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+                let p = &mut l.p;
+                p.hud.as_mut().unwrap().live_double_click(&p.zone, slot);
+                l.wait(3.0);
+            }
             "useon" => {
                 let mut it = v.split(':');
                 let slot = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();

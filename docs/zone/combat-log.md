@@ -56,19 +56,41 @@ else if other is the client char:  FUN_100693a3(ECX = other.ctrl)(damage); if un
 independent field. Replay of the capture: for all 122 `AttackInfo` whose header controller has a target, `other` equals that target (122/122, test
 `replay_counts` is built on it); `other` is only used by the fallback branch (header unknown → `other` = the hit client char).
 
-`FUN_1006a8f3` [GC 0x1006a8f3] (`this` = attacker controller): weapon-slot object `FUN_10068072(slot)` (null → whole routine skipped; creation of those objects was not traced, the
-port assumes a valid slot has one); if the object's item has stat `0x1a` ≥ 0 it is set to `value_20` (always -1 live → never) and `FUN_10012a1e(0x65, slot, 0, 0)`
+`FUN_1006a8f3` [GC 0x1006a8f3] (`this` = attacker controller): weapon-slot object `FUN_10068072(slot)` (null → whole routine skipped, i.e. no line, no health change; when `unk_34 != 0`
+the object is `FUN_100686d0(unk_34)->+0xe4` instead, §2.1.1); if the object's item has stat `0x1a` ≥ 0 it is set to `value_20` (always -1 live → never) and `FUN_10012a1e(0x65, slot, 0, 0)`
 → signal `GlobalSignals+0x90`; stores `+0x30 = damage`, `+0x2c = unk_30` in the slot object; **`FUN_1009b170(victim, attacker, damage, unk_30)`**; `FUN_1006a239(slot, 0)` (hit animation, combat-anim.md);
 finally `victim.ctrl+0x7c = unk_2c`.
 
-`FUN_1009b170` [GC 0x1009b170] (`this` = slot object): damage type `FUN_1009afde` [GC 0x1009afde] = weapon stat `0x1b4` if in `0x5a..=0x61` or `0xa8`, else `0x5a` (`log::weapon_damage_type`;
-a nano item with stat `0x153` overrides); feedback type: victim is the client char → `0x1e` (player attacker: `attacker+0x21c == 0` and `FUN_10058a05` [GC 0x10058a05] = area `Features` bit `0x800000` clear) else `0x1d`;
+`FUN_1009b170` [GC 0x1009b170] (`this` = slot object): damage type `FUN_1009afde` [GC 0x1009afde] = stat `0x1b4` (`GetStat(0x1b4, 2)`) of `slotobj+0x14` (the wielded `WeaponItem_t`), else of
+`slotobj+0x10` (the `DummyWeapon_t` of the item list, §2.1.1), if in `0x5a..=0x61` or `0xa8`, else `0x5a` (`log::weapon_damage_type`; a valid stat `0x153` of the *attacker* char overrides); feedback type: victim is the client char → `0x1e` (player attacker: `attacker+0x21c == 0` and `FUN_10058a05` [GC 0x10058a05] = area `Features` bit `0x800000` clear) else `0x1d`;
 attacker is the client char → `0x1f`; otherwise `0x20` (`0x21` when a flagged PvP pair, `FUN_100523c3`, not ported); call `FUN_10012bd5(type, victim, damage, attacker, 0, damageType, unk_30, 0)`
 (§3); **victim `Health` (27) := Health − damage** (`FUN_10062349` [GC 0x10062349] = set stat); then if `victim.ctrl+0x7c != 0` → `FUN_1005ae91(+0x7c)`.
 Quirk reproduced by the port: `+0x7c` is read here *before* `FUN_1006a8f3` stores this message's `unk_2c`, so a death cause takes effect with the **next** hit on that victim.
 A `SimpleItem_t` victim (`param_1` not a char): type `0x2f`, `FUN_10014e3d` (not ported).
 
 `unk_30` = hit flags (live 3 ×131, 4 ×3): 4 → " Critical hit!" appended (`Feedback_CriticalHit`), 2 → " Glancing hit." (`Feedback_GlancingHit`), see §3. `unk_2c` = death cause (live 0 / 4).
+
+### 2.1.1 Which item's stat `0x1b4` (root cause of the old "projectile" lines) — `combat/arms.rs`
+The wire has no damage type; the old port fed `0` (→ `0x5a`) for every hit. The client reads it off the **item behind the slot**, and every item class presets `0x5b` (melee):
+* `DummyWeapon_t` ctor `FUN_10082512` [GC 0x10082512]: `SetStat(0x1b4, 0x5b)`, `0x162 = 0x5b`, `0x1b8 = 0x76`, `0x126/0xd2/0xd3 = 200`, `0x1b = 10` …, then `FUN_10080169` [GC 0x10080169] loads the rdb 1000020 record
+  over those defaults (`(vt+0x70)(stream)`), then the message stats; `WeaponItem_t` ctor `FUN_1009c0ca` → `FUN_1009b913` [GC 0x1009b913]: `SetStat(0x1b4, 0x5b)` (also `0x161 AnimSet = 0`, `0x1b8 = 0x77`), record + message stats on top.
+  So a record without stat 436 = `DamageType` stays **melee** (martial-arts items 43712/144745: no stat 436; 296 of the 17 282 `0xc74a` item records lack it); weapons carry it (`Polished Eliminator` 0x3ca19 / `Ofab Shark Mk 5` 265090: 0x5a;
+  `Baseball Bat` 121564: 0x5b; `Dull E-Blade` 122159: 0x5c; creature items `Monster Melee Primary Wpn` 56180 / `Generic Innate Weapon` 45605: 0x5b, `Generic Monster Distance Weapon` 44007: 0x5a, `BileswarmSpit_001`: 0x5d …).
+* The **slot object** (0x68 bytes, ctors `FUN_1009b37e` [GC 0x1009b37e] for `DummyWeapon_t`, `FUN_1009b415` [GC 0x1009b415] for `WeaponItem_t`): `+0x10` = the `DummyWeapon_t` itself (`+0x14 = 0`), resp. `+0x10 = 0`, `+0x14` = the `WeaponItem_t`.
+  Stored in the controller's map (`FUN_1006a0d1(slot, obj)` [GC 0x1006a0d1], slots `0..=15`, `0x3d`, `0x3f`) by exactly these paths:
+  * **wield** (`FUN_10047873` [GC 0x10047873] on stat `0xdc`/`WeaponItemFullUpdate` apply → `FUN_1006a700` [GC 0x1006a700], `FUN_1006ad94`): `map[slot] = weapon.+0x1f4 obj`; with dynel flag `0x800` clear (CharacterAction `0xa7`, never set live) `map[0]` is dropped;
+    unwield (`FUN_1006a857` → `FUN_1006a772`): `map[slot] = 0` and, when no slot `< 16` is left (`FUN_10067fbe`), `map[0] = item(key 100)->+0xe4` again;
+  * **`SpecialAttackWeaponIIR_t` apply `FUN_1007989a` [GC 0x1007989a]** (only when the controller's list is still empty, `FUN_10067c2b`): `FUN_1006ac03` [GC 0x1006ac03] builds, per list entry `(lowid=f0, highid=f1, key=f3)`, an
+    `ACGItem_t(f0, f1, ql = min(char Level, 0x1ff))` → `FUN_100cc04a` [GC 0x100cc04a] = a `DummyWeapon_t` of rdb record `f0` (kind `0xc74a`; `FUN_100cba71` interpolates the `0x36`-dependent stats towards `f1`), registers it under key `f3`
+    in the `ctrl+0x10` map (`FUN_10069c1d`, first one wins) and in the slot map: **players** (`+0x21c == 0`): only key **100** (the martial-arts item, `43712` for the own char of the capture) → `map[0]`, iff nothing is wielded (or `map[0]` exists);
+    the other entries (keys 144, 142, 1 = Brawl, Dimach …) stay special-attack items. **Creatures** (`+0x21c != 0`): entry *n* → `map[FUN_10067fbe()]`, i.e. the next free slot below 16 in list order (a wielded rifle in slot 6 counts).
+  * `ctrl+0x38` (set by `FUN_10068587` from `FUN_100750fd` / `FUN_1005b016`, a weapon mounted through stat `0x296`) answers slot 6 only; not ported.
+* Result for an `AttackInfo`: own char bare-handed (`slot 0`) = the martial-arts item = **melee**; wielded weapons = their record's stat 436 per hand (`slot 6` right, `8` left); a creature's `slot n` = its n-th list item (the ICC Shuttle Guards of the capture:
+  `{1: projectile, 2: melee, 3: projectile, 4: melee, 5: melee, 6: rifle = projectile}`); `unk_34 != 0` = the list item with that key. In the capture 117 of the 134 `AttackInfo` find their slot object (12 have no target; the other 5 arrive *before* the
+  attacker's list, which the original drops silently), with four different types (projectile / melee / chemical / radiation).
+* Port: `combat::arms::Armory` (slot tables fed by `WeaponItemFullUpdate`, `SpecialAttackWeapon`, `ToClientQuit`; item stat = rdb record under the message stats, default `0x5b`), used by `combat::state::Combat::hit` and, for the chat lines, `chat::log` (`LogCtx::weapon` ←
+  `Zone::world.arms`). **[GUESS]** deliberate divergence: a slot the table does not know is printed with the item default `0x5b` instead of being dropped (the port cannot prove its table complete: flag `0x800`, `ctrl+0x38`, list entries interpolated between
+  `f0` and `f1` are not modelled — stat 436 is not among the interpolated stats as far as `FUN_100cba71` was read, [INFERENCE]).
 
 ### 2.2 `SpecialAttackInfoIIR_t` → `FUN_1006a9c5(slot, damage, value_28, target, special, unk_30)` [GC 0x1006a9c5] (`this` = attacker controller)
 Target must resolve. Name `%s` = `GetText(0x7d3 = 2003, special)` (the localized stat name, 142 → "Brawling"; **not** `fStatToString`). Type: attacker is the client char → `0x32`; else the target is → `0x30`;
@@ -151,19 +173,20 @@ Exposed as data: `log::HUD_NUMBER`, `log::WORLD_NUMBER`, `floating_number(space,
 
 ## 7. Tables
 * Damage type names `FUN_10036adf` (map built [GC 0x10033a76..0x10033ba7]): `0x5a` projectile, `0x5b` melee, `0x5c` energy, `0x5d` chemical, `0x5e` radiation, `0x5f` cold, `0x60` poison, `0x61` fire, `0xa8` nano, `0x1b` "unknown"; else `Missing damagetype: N`.
-  The hit message carries no damage type: it comes from the attacker's weapon slot object (stat `0x1b4`, default `0x5a`). The port uses `0x5a` ("projectile") because the weapon stats are not tracked — **[UNRESOLVED]** (every hit line of the capture says "projectile").
+  The hit message carries no damage type: it comes from stat `0x1b4` of the item behind the attacker's weapon slot (§2.1.1; item default `0x5b` melee, `FUN_1009afde` maps anything else outside the table to `0x5a`).
 * `fStatToString` = `stat_names.rs` (520 ids, `FUN_1002f009` [GC 0x1002f009]; 142 "Brawl", 0x1b "Health", 1 "Life").
 * Stat ids used: `Health` 27, `MaxHealth` 1, `Level` 0x36, `XP` 0x34, `AlienXP` 0x28, `AlienLevel` 0xa9, `ShadowKnowledge` 0x23d, `VisualFlags` 0x2a1.
 
 ## 8. Capture check (`state.rs` tests)
 Observer view (own char 25988 "Testy" does not fight): 134 `AttackInfo` → **122 hits** (12 have a header whose controller has no target at that time: the `Attack`/full-update start was refused by `CanAttack`
 because the target dynel had not been announced yet, or no `Attack` was sent; the client behaves the same and prints nothing), 11 misses (no text: bystanders), 3 special hits, 3 `CharSecSpecAttack`,
-127 starts / 118 stops of a fight (some starts are target switches), 15 deaths (`CharacterAction` 99). Lines with the real `text.mdb` strings, e.g. `Scout - Jaax'Sinuh hit ICC Shuttle Guard for 17 points of projectile damage.`
+127 starts / 118 stops of a fight (some starts are target switches), 15 deaths (`CharacterAction` 99). Lines with the real `text.mdb` strings, e.g. `Scout - Jaax'Sinuh hit ICC Shuttle Guard for 17 points of melee damage.` (this first hit arrives before the guard's `SpecialAttackWeapon` list, so the port prints the item default; the original drops it)
 (type `0x20`: B = the attacker named, style `0x4200000a`, category `0x1a`), two `... Critical hit!` lines (the third `unk_30 == 4` AttackInfo is one of the 12 dropped), three `Bergdoktor hit <NPC> for N points of Brawling damage.`
-Replayed as player 33402 ("Bergdoktor", who attacks in the stream) the client-char paths fire: combat music, `Attacking %s...`, `You hit %s for %u points of projectile damage.`, HUD numbers.
+Replayed as player 33402 ("Bergdoktor", who attacks in the stream) the client-char paths fire: combat music, `Attacking %s...`, `You hit %s for %u points of <type> damage.` (type from the slot item), HUD numbers.
 
 ## 9. Unresolved
 * Height / locator of the world number above the head; material 40 texture; what `DAT_102761c0` is (HUD number anchor y) and `DAT_102e0640`.
 * Meaning of the first chat-signal argument `0x42000001..0x18` (`GlobalSignals+0x17c` receiver in GUI.dll not traced).
-* Creation of the weapon-slot objects (`ctrl+0x38`, map `+0x1c`); damage type of a hit (weapon stat `0x1b4`); PvP-flag helper `FUN_100523c3`; `Features` flag `0x800000` source.
+* The `ctrl+0x38` mounted-weapon override and the dynel flag `0x800` (CharacterAction `0xa7`, not tracked); whether the original really drops hits whose slot object is missing live (the port prints them with the melee default);
+  PvP-flag helper `FUN_100523c3`; `Features` flag `0x800000` source. (The weapon-slot objects and the damage type of a hit are resolved, §2.1.1.)
 * Consumer of the `CharSecSpecAttack` queue; `Feedback_GotPVPScore` (stats `0x2aa..0x2ac`), types of the formatter not reachable from these messages.

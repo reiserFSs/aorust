@@ -415,6 +415,7 @@ impl Chat {
             is_own_pet: &|_| false,
             nano_name: &|_| None,
             stat: &|id, st| (id == own).then(|| zone.stat(st as u32)).flatten(),
+            weapon: &|id, slot, special| (id.kind == CHAR_KIND).then(|| zone.world.arms.damage_type(id.instance, slot, special)).flatten(),
             filter: &filter,
         };
         for l in events.iter().flat_map(|ev| log::classify(ev, &ctx)) {

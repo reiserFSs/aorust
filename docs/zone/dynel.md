@@ -298,7 +298,7 @@ vftable [GC 0x10166e5c]; ReadSubClass [GC 0x100a2754] → base reader [GC 0x100a
 
 vftable [GC 0x101615d0]; ReadSubClass [GC 0x10079a83]; WriteSubClass [GC 0x100799fc]; apply [GC 0x1007989a]. Body: list (count × 4 `i32`, read `[0] [1] [3] [2]`, `FUN_10065687`),
 then 5 × `i32` → stats `CloseCombatInitiative` (0x76), `DistanceWeaponInitiative` (0x77), `PhysicalProwessInitiative` (0x78), `NanoProwessInitiative` (0x95), `AggDef` (0x33)
-(each `SetStat` + `FUN_10064916(stat, 0)`); apply also calls `FUN_1006aef6/FUN_1006ac03/FUN_1006a5c7` first. The N3 `flag` byte is 1 for every instance.
+(each `SetStat` + `FUN_10064916(stat, 0)`); apply also calls `FUN_1006aef6/FUN_1006ac03/FUN_1006a5c7` first. Entry fields (port `SpecialAttackEntry`): `f0` low-QL / `f1` high-QL item template (rdb 1000020, kind `0xc74a`), `f3` = list key (`piVar5[5]`; 100 = the player's martial-arts item, 144/142/1 = specials, a 4-char code for NPCs), `f2` = its text code. The list becomes the `DummyWeapon_t` items behind the `AttackInfo` weapon slots: docs/zone/combat-log.md §2.1.1. The N3 `flag` byte is 1 for every instance.
 
 Live: 58 messages with 1, 3, 4 or 5 entries (counts `1×3, 3×26, 4×6, 5×23`). The player's own (first message, sender 25988): entries `(43712, 144745, f3=100, f2='MAAT')`,
 `(42033, 42032, 144, 'DIIT')`, `(70292, 70293, 142, 'BRAW')`, `(207779, 207779, 1, 'NBCK')`, stats `(6, 6, 6, 6, 100)`. Example (player, 101 payload bytes):

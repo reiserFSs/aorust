@@ -95,7 +95,7 @@ Per category (`d` = dynel `[0xc]`, `o` = other `[0x14]`, `T` = damage-type name;
 
 (0x23 only sets colour 28, no text; 0x2f is the `SimpleItem_t` variant `FUN_10014e3d` called from `FUN_1009b170`, not ported.)
 Example, template + live capture: `%s hit %s for %u points of %s damage.` with the first `AttackInfoIIR_t` of `zone_ithaca.rec` ->
-`npcfa8d7 hit npcf4a4c for 17 points of projectile damage.` (test `captured_combat_messages`).
+`npcfa8d7 hit npcf4a4c for 17 points of melee damage.` (test `captured_combat_messages`; the item default, the guard's slot table is not known yet at that hit — docs/zone/combat-log.md §2.1.1).
 
 ## 3. Events and which category they use
 
@@ -184,8 +184,8 @@ It is also run on the chat-server vicinity text by `HandleVicinityMessage` [GUI 
 
 `own` (the client's character identity), `name(id)` (dynel name or `None` = not in world), `text(cat, id)` (`TextDb::by_id`), `is_npc(id)` (`+0x21c`),
 `is_own_pet(id)` (`+0x21c && stat flag 0x8000000 && FUN_100523c3`), `nano_name(instance)` (RDB nano record name), `stat(id, stat)` (current stat,
-used for the old value of `Stat` and the damage-type stats 0x153 `DamageOverrideType` / 0x1b4 `DamageType` of the attacker, valid values 90..97 and 168 via
-`FUN_1009a709`; default 90 = `FUN_1009afde`), and the `ChatFilter`. The hub applies the stat changes itself (Health `-= damage`, `FUN_10062349`).
+used for the old value of `Stat` and the nano damage-type override 0x153 `DamageOverrideType` of the attacker, valid values 90..97 and 168 via
+`FUN_1009a709`), `weapon(attacker, slot, special)` (stat 0x1b4 `DamageType` of the item behind the `AttackInfo` weapon slot, `combat::arms::Armory`; `FUN_1009afde`), and the `ChatFilter`. The hub applies the stat changes itself (Health `-= damage`, `FUN_10062349`).
 
 ## 7. Filters
 
@@ -202,7 +202,7 @@ used for the old value of `Stat` and the damage-type stats 0x153 `DamageOverride
 * `unk_30` of `AttackInfo` as the mode: 3 normal, 4 critical, 2 glancing is derived from the `mode == 4` / `mode == 2` comparisons in `FUN_10012bd5`;
   live values are only 3 and 4 (4 = critical presumed, never seen with text).
 * Victim/attacker direction of `AttackInfo` (§3): derived from `FUN_1009ed0d` and `FUN_1009b170`; the live capture has no message involving the client.
-* Damage type of a hit: `FUN_1009afde` reads stat 0x1b4 of an unresolved object (`ECX` at the call), approximated by the attacker's stat 0x1b4; `FUN_10058a05`
+* Damage type of a hit: `FUN_1009afde` reads stat 0x1b4 of the item behind the attacker's weapon slot (resolved, docs/zone/combat-log.md §2.1.1); `FUN_10058a05`
   (pvp flag in the 0x1e/0x1d choice) is treated as false.
 * `Stat` 0x28 (AlienXP) has a second branch using stats 0xa9/0xb2 that is not modelled (diff only).
 * CharacterAction 0xa4: the id given to `GetText(2002, ..)` is `b.instance` (register pattern identical to the Stuck cases, not proven).

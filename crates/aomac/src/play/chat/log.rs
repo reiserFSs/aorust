@@ -8,6 +8,7 @@
 //! The window wraps a line as `<div><font color=NAME>text</font></div>` (`FUN_1009b37f` [GUI], [`window_html`]).
 
 use super::line::{ChatKind, ChatLine};
+use super::super::combat::arms::DEFAULT_DAMAGE_TYPE;
 use ao_formats::screens::elf_hash;
 use ao_net::msg::Identity;
 use ao_net::n3::{dynel::Dynel, misc::Misc, world::World, Message, N3};
@@ -517,8 +518,10 @@ pub struct LogCtx<'a> {
     pub is_own_pet: &'a dyn Fn(Identity) -> bool,
     /// Nano record name by nano instance id (`FUN_10082998` object, vtable +0x34).
     pub nano_name: &'a dyn Fn(i32) -> Option<String>,
-    /// Current stat of a dynel (`GetStat(stat, ..)`), used for old values and the damage-type stats 0x153 / 0x1b4.
+    /// Current stat of a dynel (`GetStat(stat, ..)`), used for old values and the nano damage-type override 0x153.
     pub stat: &'a dyn Fn(Identity, i32) -> Option<i32>,
+    /// Stat `0x1b4` of the item behind an `AttackInfo` (attacker, `slot`, special key): [`super::super::combat::arms::Armory::damage_type`].
+    pub weapon: &'a dyn Fn(Identity, i32, i32) -> Option<i32>,
     pub filter: &'a ChatFilter,
 }
 
@@ -566,8 +569,9 @@ pub fn damage_type_name(d: i32) -> String {
 /// Game events that produce log lines. Built by [`from_n3`] (or by [`super::super::chat::Chat::cast_nano`] for the local [`LogEvent::CastNano`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogEvent {
-    /// `AttackInfoIIR_t` 46002F16: `attacker` = frame header dynel, `victim` = `other`. `mode` = `unk_30` (3 normal, 4 critical, 2 glancing).
-    Hit { attacker: Identity, victim: Identity, damage: i32, mode: i32 },
+    /// `AttackInfoIIR_t` 46002F16: `attacker` = frame header dynel, `victim` = `other`. `mode` = `unk_30` (3 normal, 4 critical, 2 glancing);
+    /// `slot` / `special` = `slot` / `unk_34`, which select the weapon item whose stat 0x1b4 is the damage type.
+    Hit { attacker: Identity, victim: Identity, damage: i32, mode: i32, slot: i32, special: i32 },
     /// `MissedAttackInfoIIR_t` 5C654B28: `attacker` = header = `source`; `stat` 0 = none else `Stat_e` of the special attack.
     Miss { attacker: Identity, victim: Identity, stat: i32 },
     /// `SpecialAttackInfoIIR_t` 754F1115.
@@ -625,7 +629,7 @@ const FORMAT_FEEDBACK: u32 = 0x206B_4B73;
 pub fn from_n3(m: &Message) -> Option<LogEvent> {
     let who = m.header.target;
     match &m.body {
-        N3::Misc(Misc::AttackInfo(a)) => Some(LogEvent::Hit { attacker: who, victim: a.other, damage: a.damage, mode: a.unk_30 }),
+        N3::Misc(Misc::AttackInfo(a)) => Some(LogEvent::Hit { attacker: who, victim: a.other, damage: a.damage, mode: a.unk_30, slot: a.slot, special: a.unk_34 }),
         N3::Misc(Misc::MissedAttackInfo(a)) => Some(LogEvent::Miss { attacker: a.source, victim: a.target, stat: a.stat }),
         N3::Misc(Misc::SpecialAttackInfo(a)) => Some(LogEvent::SpecialHit { attacker: who, victim: a.target, damage: a.damage, special: a.special }),
         N3::World(World::CharacterAction(c)) => {
@@ -950,14 +954,16 @@ fn direct(group: i32, color: u32, text: String, out: &mut Vec<LogLine>) {
 pub fn classify(ev: &LogEvent, ctx: &LogCtx) -> Vec<LogLine> {
     let mut out = Vec::new();
     match ev {
-        LogEvent::Hit { attacker, victim, damage, mode } => {
+        LogEvent::Hit { attacker, victim, damage, mode, slot, special } => {
             // AttackInfoIIR apply [GC 0x1009ed0d] -> FUN_1006a8f3 -> FUN_1009b170 [GC 0x1009b170]
             if !ctx.known(*victim) || !ctx.known(*attacker) {
                 return out;
             }
             let over = (ctx.stat)(*attacker, 0x153).filter(|&v| v != 0 && valid_dtype(v));
-            let weapon = (ctx.stat)(*attacker, 0x1b4).filter(|&v| v > 0x59 && (v < 0x62 || v == 0xa8));
-            let dtype = over.or(weapon).unwrap_or(0x5a);
+            // `FUN_1009afde`: stat 0x1b4 of the item behind the slot; every item class presets 0x5b (melee), a slot table the port never saw filled
+            // is read as that default ([GUESS]; the original would skip the hit)
+            let weapon = (ctx.weapon)(*attacker, *slot, *special).unwrap_or(DEFAULT_DAMAGE_TYPE);
+            let dtype = over.unwrap_or_else(|| super::super::combat::log::weapon_damage_type(weapon));
             let cat = if ctx.is_own(*victim) {
                 // `[0x21c] == 0 && FUN_10058a05() == 0`: FUN_10058a05's input is unresolved ([GUESS] false)
                 if !(ctx.is_npc)(*attacker) {
@@ -1260,6 +1266,12 @@ mod tests {
             is_own_pet: &|i| i.instance == 5,
             nano_name: &|i| Some(format!("Nano#{i}")),
             stat: &|_, _| None,
+            // Bob (3) carries a pistol in slot 6, Testy (1) too; everyone else fights bare-handed (the martial-arts / creature items: melee)
+            weapon: &|a, slot, _| match (a.instance, slot) {
+                (3 | 1, 6) => Some(0x5a),
+                (1..=2, 0) => Some(0x5b),
+                _ => None,
+            },
             filter: &filter,
         };
         Some(f(&ctx))
@@ -1309,22 +1321,28 @@ mod tests {
     fn combat_lines_from_the_originals_templates() {
         let Some(()) = with_ctx(1, &[2], |ctx| {
             // Testy (own) hit by player Bob for 17, critical
-            let l = texts(classify(&LogEvent::Hit { attacker: id(3), victim: id(1), damage: 17, mode: 4 }, ctx));
+            let l = texts(classify(&LogEvent::Hit { attacker: id(3), victim: id(1), damage: 17, mode: 4, slot: 6, special: 0 }, ctx));
             assert_eq!(l, vec![(class::ME_HIT_BY_PLAYER, "CCPlayerHitMeColor", "Player Bob hit you for 17 points of projectile damage. Critical hit!".into())]);
-            // Testy hit by monster Snake for 5
-            let l = texts(classify(&LogEvent::Hit { attacker: id(2), victim: id(1), damage: 5, mode: 3 }, ctx));
-            assert_eq!(l, vec![(class::ME_HIT_BY_MONSTER, "CCMonsterHitMeColor", "Snake hit you for 5 points of projectile damage.".into())]);
-            // Testy hits Snake, glancing
-            let l = texts(classify(&LogEvent::Hit { attacker: id(1), victim: id(2), damage: 9, mode: 2 }, ctx));
-            assert_eq!(l, vec![(class::YOU_HIT_OTHER, "CCMeHitOtherColor", "You hit Snake for 9 points of projectile damage. Glancing hit.".into())]);
+            // Testy hit by monster Snake for 5: a creature's bare attack is melee
+            let l = texts(classify(&LogEvent::Hit { attacker: id(2), victim: id(1), damage: 5, mode: 3, slot: 0, special: 0 }, ctx));
+            assert_eq!(l, vec![(class::ME_HIT_BY_MONSTER, "CCMonsterHitMeColor", "Snake hit you for 5 points of melee damage.".into())]);
+            // Testy hits Snake bare-handed, glancing: melee, not projectile
+            let l = texts(classify(&LogEvent::Hit { attacker: id(1), victim: id(2), damage: 9, mode: 2, slot: 0, special: 0 }, ctx));
+            assert_eq!(l, vec![(class::YOU_HIT_OTHER, "CCMeHitOtherColor", "You hit Snake for 9 points of melee damage. Glancing hit.".into())]);
+            // Testy's pistol in the right hand (slot 6) is projectile
+            let l = texts(classify(&LogEvent::Hit { attacker: id(1), victim: id(2), damage: 9, mode: 3, slot: 6, special: 0 }, ctx));
+            assert_eq!(l[0].2, "You hit Snake for 9 points of projectile damage.");
+            // an unknown slot table reads as the item default, melee
+            let l = texts(classify(&LogEvent::Hit { attacker: id(4), victim: id(2), damage: 9, mode: 3, slot: 3, special: 0 }, ctx));
+            assert_eq!(l[0].2, "Alice hit Snake for 9 points of melee damage.");
             // Bob hits Alice; Bob hits Rex (Rex is our pet)
-            let l = texts(classify(&LogEvent::Hit { attacker: id(3), victim: id(4), damage: 3, mode: 3 }, ctx));
+            let l = texts(classify(&LogEvent::Hit { attacker: id(3), victim: id(4), damage: 3, mode: 3, slot: 6, special: 0 }, ctx));
             assert_eq!(l[0].0, class::OTHER_HIT_BY_OTHER);
             assert_eq!(l[0].2, "Bob hit Alice for 3 points of projectile damage.");
-            let l = texts(classify(&LogEvent::Hit { attacker: id(3), victim: id(5), damage: 3, mode: 3 }, ctx));
+            let l = texts(classify(&LogEvent::Hit { attacker: id(3), victim: id(5), damage: 3, mode: 3, slot: 6, special: 0 }, ctx));
             assert_eq!((l[0].0, l[0].1), (class::YOUR_PET_HIT_BY_OTHER, "CCOtherHitOtherMyPetColor"));
             // zero damage prints nothing
-            assert!(classify(&LogEvent::Hit { attacker: id(3), victim: id(4), damage: 0, mode: 3 }, ctx).is_empty());
+            assert!(classify(&LogEvent::Hit { attacker: id(3), victim: id(4), damage: 0, mode: 3, slot: 6, special: 0 }, ctx).is_empty());
             // misses
             let l = texts(classify(&LogEvent::Miss { attacker: id(1), victim: id(2), stat: 0 }, ctx));
             assert_eq!(l, vec![(class::YOUR_MISSES, "", "You tried to hit Snake, but missed!".into())]);
@@ -1382,8 +1400,8 @@ mod tests {
     fn chat_filter_drops_matching_lines() {
         let Some(()) = with_ctx(1, &[2], |ctx| {
             let f = ChatFilter { enabled: true, rules: vec!["Snake".into()] };
-            let ctx2 = LogCtx { own: ctx.own, name: ctx.name, text: ctx.text, is_npc: ctx.is_npc, is_own_pet: ctx.is_own_pet, nano_name: ctx.nano_name, stat: ctx.stat, filter: &f };
-            let ev = LogEvent::Hit { attacker: id(2), victim: id(1), damage: 5, mode: 3 };
+            let ctx2 = LogCtx { own: ctx.own, name: ctx.name, text: ctx.text, is_npc: ctx.is_npc, is_own_pet: ctx.is_own_pet, nano_name: ctx.nano_name, stat: ctx.stat, weapon: ctx.weapon, filter: &f };
+            let ev = LogEvent::Hit { attacker: id(2), victim: id(1), damage: 5, mode: 3, slot: 0, special: 0 };
             assert_eq!(classify(&ev, ctx).len(), 1);
             assert!(classify(&ev, &ctx2).is_empty());
         }) else {
@@ -1417,9 +1435,21 @@ mod tests {
         let spec = evs.iter().filter(|e| matches!(e, LogEvent::SpecialHit { .. })).count();
         assert_eq!((hits, miss, spec), (134, 11, 3));
         // first AttackInfo of the capture: header 0xfa8d7 hits 0xf4a4c for 17 (docs/zone/misc.md §4)
-        assert_eq!(evs.iter().find(|e| matches!(e, LogEvent::Hit { .. })), Some(&LogEvent::Hit { attacker: id(0xfa8d7), victim: id(0xf4a4c), damage: 17, mode: 3 }));
+        assert!(matches!(evs.iter().find(|e| matches!(e, LogEvent::Hit { .. })), Some(LogEvent::Hit { attacker, victim, damage: 17, mode: 3, .. }) if *attacker == id(0xfa8d7) && *victim == id(0xf4a4c)));
         // every one of them formats against a world where all combatants are known NPCs
         let filter = ChatFilter::default();
+        // the slot tables as the first AttackInfo of the capture finds them
+        let mut arms = crate::play::combat::arms::Armory::default();
+        let mut npcs = std::collections::HashSet::new();
+        let first_hit = msgs.iter().position(|m| matches!(m.body, N3::Misc(Misc::AttackInfo(_)))).unwrap();
+        for m in &msgs[..first_hit] {
+            if let N3::Dynel(Dynel::SimpleCharFullUpdate(u)) = &m.body {
+                if u.is_npc() {
+                    npcs.insert(m.header.target.instance);
+                }
+            }
+            arms.on_message(m, npcs.contains(&m.header.target.instance));
+        }
         let ctx = LogCtx {
             own: id(0x6584),
             name: &|i| Some(format!("npc{:x}", i.instance)),
@@ -1428,16 +1458,39 @@ mod tests {
             is_own_pet: &|_| false,
             nano_name: &|_| None,
             stat: &|_, _| None,
+            weapon: &|a, slot, sp| arms.damage_type(a.instance, slot, sp),
             filter: &filter,
         };
         let first = classify(evs.iter().find(|e| matches!(e, LogEvent::Hit { .. })).unwrap(), &ctx);
-        assert_eq!(first[0].line.text, "npcfa8d7 hit npcf4a4c for 17 points of projectile damage.");
+        // the guard's list had not arrived yet (the original drops the hit): the item default
+        assert_eq!(first[0].line.text, "npcfa8d7 hit npcf4a4c for 17 points of melee damage.");
         assert_eq!(first[0].class, class::OTHER_HIT_BY_OTHER);
         let special = evs.iter().find(|e| matches!(e, LogEvent::SpecialHit { .. })).unwrap();
         assert_eq!(classify(special, &ctx)[0].line.text, "npc827a hit npcfa8ea for 5 points of Brawling damage.");
         for e in evs.iter().filter(|e| matches!(e, LogEvent::Hit { damage, .. } if *damage != 0)) {
             assert_eq!(classify(e, &ctx).len(), 1, "{e:?}");
         }
+        // with the slot tables as the capture builds them (items from the real rdb): the lines carry the types of the items behind the slots
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("Games/ProjectRubiKa/client");
+        let all = std::cell::RefCell::new(crate::play::combat::arms::Armory::open(&home));
+        let live = LogCtx { weapon: &|a, slot, sp| all.borrow().damage_type(a.instance, slot, sp), ..ctx };
+        let mut npcs = std::collections::HashSet::new();
+        let mut printed = std::collections::BTreeSet::new();
+        for m in &msgs {
+            if let N3::Dynel(Dynel::SimpleCharFullUpdate(u)) = &m.body {
+                if u.is_npc() {
+                    npcs.insert(m.header.target.instance);
+                }
+            }
+            all.borrow_mut().on_message(m, npcs.contains(&m.header.target.instance));
+            if let Some(e @ LogEvent::Hit { .. }) = from_n3(m) {
+                for l in classify(&e, &live) {
+                    printed.insert(l.line.text.rsplit(" points of ").next().unwrap().to_string());
+                }
+            }
+        }
+        assert!(printed.iter().any(|t| t.starts_with("projectile")) && printed.iter().any(|t| t.starts_with("melee")), "{printed:?}");
+        let ctx = live;
         // the captured CharacterActions (0xA7, 0x63, 0x62, 0xAD) print nothing; StatIIRs expand to per-stat events
         let acts = evs.iter().filter(|e| matches!(e, LogEvent::Action { .. })).count();
         assert_eq!(acts, msgs.iter().filter(|m| matches!(m.body, N3::World(World::CharacterAction(_)))).count());
