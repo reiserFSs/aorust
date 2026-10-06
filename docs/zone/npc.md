@@ -120,14 +120,44 @@ if tex2 != 0: SetCATTexture(name, material=-1, tex2, layer 3,                   
 
 * The **element has the layout of a `CatMesh` part-table entry** (`name32, texture, env_texture, alpha_aux` = `Part`): wire `name` ↔ `Part::name`/`Material::name`
   (`RCATMesh_t::GetMaterialIndex(name)`, exact byte compare; material = `-1` is resolved through the name), `tex` ↔ `Part::texture` (rdb 1010004, layer 1 = diffuse),
-  `tex2` ↔ `Part::env_texture` (layer 3 = environment/second texture). `alpha` (stored as 5 when the wire int ≠ 0) is passed as `AlphaMode`; its effect is **not resolved**
-  (compare `Part::alpha_aux`). A later entry for the same (name, layer) updates the first (`FUN_100700e9` searches the list at `+0x28` and replaces the texture).
+  `tex2` ↔ `Part::env_texture` (layer 3 = environment texture). `alpha` is the `AlphaMode` of the layer-1 texture (the GameData reader stores 5 for any non-zero wire int,
+  0 otherwise; see *AlphaMode* below). A later entry for the same (name, layer) updates the first (`FUN_100700e9` searches the list at `+0x28` and replaces texture and alpha).
+  The mesh's own part table goes through the same function (`FUN_100704b8` → `FUN_10070247(list at CATMesh +0x28)`), the wire list after it replaces matching entries.
   Entries whose name matches no material are stored but never used.
 * Evidence: NPC 22794's wire texture `lizard_green` → 22768 (`lizard_brown.png`); mesh 22773's only part is `lizard_green` with default texture 22774 (`lizard_green.png`);
   humanoid parts are `arms/feet/hands/legs/body` (`ClothData_t::GetName(0..4)`, 5 parts in `FUN_10070439` = `SetSkinData`, which writes layer 0 = naked skin per part).
   Layer 0 = skin base, 1 = diffuse, 3 = environment [CODE: constants 0/1/3 in the three call sites].
 * `ao_formats::character::texture_overrides(&CatMesh, &[TextureOverride])` returns `(part index, TextureOverride)`; a texture of 0 keeps the part's own.
   (The `[0x10150828]` compare in `FUN_10070247` — substitute id 0x440aa/alpha 5 when `tex` equals a global — is a zero in the static image; treated as never true.)
+
+**AlphaMode** (resolved, randy31 + DisplaySystem). `FUN_10070247` calls `FUN_100700e9(name, -1, tex, layer, alpha, flag)`; the node (`FUN_1006fc70`: name, material, RTexture, tex id, layer, alpha) is applied by
+`FUN_1006fdae` as `FUN_10073e4f(material, tex, layer)` (**layer 3 → `RMaterial_t::SetEnvTexture`** @0x10040e5f on the mesh's substitute material, `RCATMesh::CreateSubstMaterial`; layers 0/1/2 → texture slots
+of a record, composited by `FUN_1007457f`) and `FUN_10073dd8(material, alpha, layer)` (`FUN_10072818`: the alpha is kept only for layer 1 (`+0x1c`) and 2 (`+0x20`)). `FUN_10074b03` then runs
+`RMaterial_t::SetTexture(mat, tex, 0, alpha)` (@0x10040bec, which for stage 0 calls `FUN_10040645` = **`SetAlphaMode`**). Its table (D3D7 ids decoded; `has alpha` = texture `+0xb4` bit 0 = the file carries an alpha channel):
+
+| mode | state set by `FUN_10040645` | scene |
+|---|---|---|
+| 0 | needs `has alpha`: `UseAlphaAsTransparency`, `ALPHABLENDENABLE` on | `AlphaBlend` (0/255-only alpha drawn as cutout, the contract has no blend+z-write) |
+| 1 | `ALPHATESTENABLE`, `ALPHAFUNC GREATER`, `ALPHAREF 0x80`, no blend | `AlphaTest` |
+| 2 | blend + alpha test (ref 0x1e), z-write off | `AlphaTest` [GUESS: no blend+test in the contract; `mesh.rs` makes the same choice] |
+| 3 | blend, z-write off | `AlphaBlend` |
+| 4 | `ONE, ONE`, z-write off, fog colour black, stage 0 `SELECTARG1` | `Additive` |
+| 5 | needs `has alpha`: stage 0 `COLOROP ADD`, `COLORARG1 TEXTURE\|ALPHAREPLICATE`, stage 1 `MODULATE` with the same texture | opaque + `glow_mask` (`tex * saturate(lighting + alpha)`) |
+| other | returns without a change | opaque |
+
+The `RMaterial_t` constructor itself calls `SetTexture(tex, 0, -1)` (@0x10041128; `-1` = the `mode < 0` branch of `FUN_10040645`): for a textured material with `has alpha`, `UseAlphaAsTransparency`
+(`!(flags >> 3 & 1)`) → mode 0, else (≥ 2 texture stages) mode 5. This is `ao_formats::character::{alpha_mode_blend, default_alpha_mode}`; a wire entry with `texture ≠ 0` replaces the mode of that part
+(`PartLayer::alpha_mode`), every other part keeps the default. **Evidence**: the survey of all 770 models (716 materials with `flags & 8`) has 115 textures whose alpha is < 128 on ≥ 90 % of the texels
+(e.g. model 15263 `head`, 97.9 %); drawn as glow mask the head is a body with a cyan glowing visor (screenshot `view char 15263`), alpha-tested it would vanish and ignored (the previous behaviour for `flags & 8`) it
+is a flat texture. `Part::alpha_aux` is 0/1 only (1 = 747 of 3 738 parts, 96 % of them `flags & 8`); its use as a mode is contradicted by the data above, so it is **not** applied [GUESS: the exporter's copy of
+`flags & 8`]; searched: `FUN_100704b8`/`FUN_10070247` call chain (the wire/part alpha reaches only layer 1).
+
+**Environment layer** (`Part::env_texture` 127 parts / wire `tex2`, layer 3). `RMaterial_t +0x5c` (`GetEnvTexture` @0x10040afb). `FUN_10056ed6` (the CAT render, randy31 @0x10056ed6) draws every submesh, then if the
+material has an env texture redraws the same triangles with the state blob `RCATMesh +0x224` (`FUN_10055a3e`): stage 0 `TEXCOORDINDEX = CAMERASPACENORMAL`, 2 coords, `COLOROP SELECTARG1` /
+`COLORARG1 TEXTURE`, `SRCBLEND = DESTBLEND = ONE`, `ALPHABLENDENABLE` on (no fog colour override, so fog tints it), texture matrix `scale(0.5, 0.5, 1)` + translation `(0.5, 0.5, 0)` (`_DAT_1008a5d8` = 0.5f, doubles
+@0x1009fd98 = 0.5, @0x1009fde8 = 0): `uv = (0.5 nx + 0.5, 0.5 ny + 0.5)` of the camera-space normal, no v flip. Implemented as `Submesh::env_texture` (`ao_scene::env_uv`, `shader.wgsl::vs_env/fs_env`, additive second draw
+of the same triangles in the submesh's own phase, depth `LESS_EQUAL`). The CAT render also splits submeshes into two passes by the material's transparent flag (`+0xbd`: 0 first, then 1), and ends with
+`SetRenderPriority(3)` (opaque) or `SetRenderPriority(6)` (frame opacity < 1 or colour modifiers): see dynels.md §1 for the list order.
 
 ## 6. Cloth, attractors, scale, visibility on monsters
 
@@ -167,5 +197,5 @@ The 32 signature mismatches are 3 records: 257292 `unicorn lander` (mesh 257288 
 
 * Marker pairs (`0x0f,0x17` …), the 13 trailing bytes, the fourth list: Gamecode `FUN_1004d919` ignores them; no other reader exists (`0xfde97` occurs only in `FUN_1004dc30`, searched all DLLs for the 4-byte constant and the decimal 1040023: only Gamecode 0x1004dc4c).
 * Consumer of the record's other stats (Flags 0x4000, VolumeMass, Features, 0xc5, 0x165, CharRadius): the only direct readers found are `FUN_1004d8e6(stat)` callers `FUN_10058078`, `FUN_1006fb56`, `FUN_1009b4ac`; likely folded into the dynel's stat object (vtable `+0x3c` GetStat) [GUESS].
-* Cloth table → textures for morphed chars; `AlphaMode` 5; the global compared in `FUN_10070247`; sound key names; the stat-0x167 → `this+8` setter (`thunk_FUN_10152f70` @0x10152f70 decompiles to garbage); `FUN_10057b41` return (monster id when Features & 0x800).
+* Cloth table → textures for morphed chars; the global compared in `FUN_10070247`; sound key names; the stat-0x167 → `this+8` setter (`thunk_FUN_10152f70` @0x10152f70 decompiles to garbage); `FUN_10057b41` return (monster id when Features & 0x800); the meaning of `Part::alpha_aux` (see AlphaMode).
 * `AbstractAnimID_e` enumerator names (no symbols; derived from clip names above); the effect-driven `srand` calls (`ProcessStuff`) that reseed the real `rand()` stream; the exact call moment of `FUN_1011bb4a`'s `srand(time)` ([GUESS]: zone start).

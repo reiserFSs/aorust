@@ -146,6 +146,7 @@ fn build_mesh(waters: &[Water], tex: &mut dyn FnMut(&str) -> Option<TextureKey>)
         let l = liquid(key << 1).expect("kind drawn above");
         let mut s = Submesh::new(indices, tex(l.texture));
         s.two_sided = true;
+        s.liquid = true; // `VisualLiquid_t` render list 4
         s.uv_scroll = l.scroll;
         let c = argb_to_linear(l.argb);
         match key {
@@ -157,6 +158,7 @@ fn build_mesh(waters: &[Water], tex: &mut dyn FnMut(&str) -> Option<TextureKey>)
                 let mut crust = Submesh::new(std::mem::take(&mut crust), tex(CRUST_TEX));
                 crust.blend = Blend::AlphaBlend;
                 crust.two_sided = true;
+                crust.liquid = true;
                 crust.prelit = true;
                 crust.base_color = [1.0, 1.0, 1.0, CRUST_ALPHA];
                 mesh.submeshes.push(crust);
@@ -211,6 +213,7 @@ mod tests {
         assert_eq!(m.submeshes[0].blend, Blend::Opaque);
         assert_eq!(m.submeshes[0].base_color, [1.0, 0.0, 0.0, 1.0]); // lava = red
         assert_eq!(m.submeshes[1].blend, Blend::AlphaBlend);
+        assert!(m.submeshes.iter().all(|s| s.liquid), "every liquid submesh is in render list 4");
         assert_eq!(m.submeshes[1].indices, vec![3, 4, 5]);
     }
 

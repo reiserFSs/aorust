@@ -99,15 +99,6 @@ pub struct PlayerLook {
     pub equipment: Equipment,
 }
 
-struct Mount {
-    /// Index into `CatMesh::attractors`.
-    attractor: usize,
-    /// Index into `ActorRig::model().meshes`.
-    mesh: usize,
-}
-
-pub struct ActorRig {
-    cat: CatMesh,
 /// The attractor meshes `(place, rdb 1010001 mesh)` a character carries after the client applied its full update
 /// (`FUN_10077e13` [GC 0x10077e13], only when message flag bit 2 `SET_DYNEL_800` is clear):
 /// `CharacterMesh::AddAttractorMesh(0, HeadMesh)`, then **`CharacterMesh::ClearAttractors`** [DS 0x10071dd0] (deletes every node of
@@ -132,6 +123,15 @@ pub fn attractor_list(head: Option<u32>, wire: &[(u8, u32)]) -> Vec<(u8, u32)> {
     list
 }
 
+struct Mount {
+    /// Index into `CatMesh::attractors`.
+    attractor: usize,
+    /// Index into `ActorRig::model().meshes`.
+    mesh: usize,
+}
+
+pub struct ActorRig {
+    cat: CatMesh,
     parents: Vec<Option<usize>>,
     scale: Vec<f32>,
     order: Vec<usize>,

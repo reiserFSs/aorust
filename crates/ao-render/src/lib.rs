@@ -128,6 +128,7 @@ struct Globals {
     sun_g: [f32; 4],
     ambient_g: [f32; 4],
     fog_g: [f32; 4],
+    view: [[f32; 4]; 4],
 }
 
 /// One submesh draw. `pipe` = `blend as usize * 2 + two_sided as usize`; sky draws use `SKY_PIPE + blend`.
@@ -142,6 +143,10 @@ struct Draw {
 
 /// Pipelines 0..8 are scene (blend x cull); 8..12 are sky (per blend, two-sided, no depth).
 const SKY_PIPE: usize = 8;
+/// Actor environment-map pipelines (`ao_scene::Submesh::env_texture`), one/two-sided each: 12..14 draw in the opaque actor phase,
+/// 14..16 (the same pipelines) in the blended actor phase, so an env layer follows the phase of its submesh.
+const ENV_PIPE: usize = 12;
+const ENV_BLEND_PIPE: usize = 14;
 /// Lights kept per grid cell (strongest first) and the minimum cell edge in metres.
 const CELL_LIGHTS: usize = 16;
 const MIN_CELL: f32 = 8.0;
@@ -275,6 +280,7 @@ struct Gpu {
     mats: Vec<wgpu::BindGroup>, // [0] = untextured white
     opaque: Vec<Draw>,          // Opaque + AlphaTest, sorted by pipeline/mesh/material
     blended: Vec<Draw>,         // AlphaBlend + Additive, drawn per visible instance, far to near
+    liquid: Vec<Draw>,          // `Submesh::liquid` (render list 4): opaque kinds first, then blended; after the opaque phase + actors
     insts: Vec<Inst>,           // grouped by mesh
     mesh_range: Vec<std::ops::Range<usize>>,
     radius: f32,
@@ -505,8 +511,10 @@ impl Renderer {
         let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
         let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let mk = |blend: Blend, two_sided: bool, sky: bool| {
+        let one_one = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool| {
             let (fs, state, depth_write) = match blend {
+                _ if env => ("fs_env", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
                 Blend::Opaque => ("fs_opaque", None, true),
                 Blend::AlphaTest => ("fs_test", None, true),
                 Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
@@ -519,7 +527,7 @@ impl Renderer {
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some(if sky { "vs_sky" } else { "vs" }),
+                    entry_point: Some(if sky { "vs_sky" } else if env { "vs_env" } else { "vs" }),
                     compilation_options: Default::default(),
                     buffers: &[
                         wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
@@ -540,10 +548,11 @@ impl Renderer {
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH,
                     depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(if sky { wgpu::CompareFunction::Always } else { wgpu::CompareFunction::Less }),
+                    // the env pass redraws the very triangles of the base pass: D3D's default ZFUNC LESSEQUAL
+                    depth_compare: Some(if sky { wgpu::CompareFunction::Always } else if env { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }),
                     stencil: Default::default(),
                     // Blended overlays are often coplanar with the opaque surface below them.
-                    bias: if depth_write { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
+                    bias: if depth_write || env { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
                 }),
                 multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
                 multiview_mask: None,
@@ -552,9 +561,10 @@ impl Renderer {
         };
         let pipes = [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive]
             .into_iter()
-            .flat_map(|b| [false, true].map(|two| (b, two, false)))
-            .chain([Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive].map(|b| (b, true, true)))
-            .map(|(b, two, sky)| mk(b, two, sky))
+            .flat_map(|b| [false, true].map(|two| (b, two, false, false)))
+            .chain([Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive].map(|b| (b, true, true, false)))
+            .chain([false, true, false, true].map(|two| (Blend::Opaque, two, false, true)))
+            .map(|(b, two, sky, env)| mk(b, two, sky, env))
             .collect();
         let mut r = Self {
             device,
@@ -574,7 +584,7 @@ impl Renderer {
             pipes,
             sky: SkyGpu::default(),
             sky_views: HashMap::new(),
-            gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
+            gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], liquid: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
             env: default_environment(100.0),
             lens: ao_scene::Lens::default(),
             fog: None,
@@ -689,7 +699,7 @@ impl Renderer {
         }
 
         let (mut insts, mut mesh_range, mut meshes) = (vec![], vec![], vec![]);
-        let (mut opaque, mut blended) = (vec![], vec![]);
+        let (mut opaque, mut blended, mut liquid) = (vec![], vec![], vec![]);
         for (mi, mesh) in scene.meshes.iter().enumerate() {
             let list = std::mem::take(&mut by_mesh[mi]);
             let range = insts.len()..insts.len() + list.len();
@@ -721,7 +731,13 @@ impl Renderer {
                     let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
                     let mat = material(self, view, s);
                     let d = Draw { mesh: mi, first_index: first, count, mat, pipe: s.blend as usize * 2 + s.two_sided as usize };
-                    if matches!(s.blend, Blend::AlphaBlend | Blend::Additive) { blended.push(d) } else { opaque.push(d) }
+                    if s.liquid {
+                        liquid.push(d)
+                    } else if matches!(s.blend, Blend::AlphaBlend | Blend::Additive) {
+                        blended.push(d)
+                    } else {
+                        opaque.push(d)
+                    }
                 }
             }
             let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -779,7 +795,8 @@ impl Renderer {
         self.light_zones = grid.zones.clone();
         self.light_base = grid.lights.clone();
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
-        self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, insts, mesh_range, radius, grid };
+        liquid.sort_by_key(|d| d.pipe / 2 >= 2); // stable: opaque kinds (lava) before the blended ones
+        self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, liquid, insts, mesh_range, radius, grid };
     }
 
     /// Replaces only the sky backdrop (`scene.sky` instances of `scene.meshes`) and, when given, the environment (sun, ambient,
@@ -1025,6 +1042,7 @@ impl Renderer {
             sun_g: g4(env.sun_color, env.sun_specular),
             ambient_g: g4(env.ambient, 0.0),
             fog_g: g4(env.fog_color, 1.0),
+            view: Mat4::look_to_rh(cam.pos, cam.forward(), cam.up()).to_cols_array_2d(),
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 
@@ -1103,7 +1121,7 @@ impl Renderer {
         }
         self.sorted.sort_by(|a, b| b.0.total_cmp(&a.0)); // stable: ties keep submesh order
 
-        let mut calls = 0;
+        let calls = std::cell::Cell::new(0usize);
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1127,24 +1145,24 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            let (mut pipe, mut mesh, mut mat) = (usize::MAX, (false, usize::MAX), (false, usize::MAX));
-            let mut draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
-                if pipe != d.pipe {
+            let (pipe, mesh, mat) = (std::cell::Cell::new(usize::MAX), std::cell::Cell::new((false, usize::MAX)), std::cell::Cell::new((false, usize::MAX)));
+            let draw = |pass: &mut wgpu::RenderPass, d: &Draw, insts: std::ops::Range<u32>, sky: bool| {
+                if pipe.get() != d.pipe {
                     pass.set_pipeline(&self.pipes[d.pipe]);
-                    pipe = d.pipe;
+                    pipe.set(d.pipe);
                 }
-                if mesh != (sky, d.mesh) {
+                if mesh.get() != (sky, d.mesh) {
                     let (vb, ib) = if sky { &self.sky.meshes } else { &self.gpu.meshes }[d.mesh].as_ref().unwrap();
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    mesh = (sky, d.mesh);
+                    mesh.set((sky, d.mesh));
                 }
-                if mat != (sky, d.mat) {
+                if mat.get() != (sky, d.mat) {
                     pass.set_bind_group(1, &if sky { &self.sky.mats } else { &self.gpu.mats }[d.mat], &[]);
-                    mat = (sky, d.mat);
+                    mat.set((sky, d.mat));
                 }
                 pass.draw_indexed(d.first_index..d.first_index + d.count, 0, insts);
-                calls += 1;
+                calls.set(calls.get() + 1);
             };
             if let Some(sky) = sky_buf {
                 pass.set_vertex_buffer(1, sky.slice(..));
@@ -1152,9 +1170,26 @@ impl Renderer {
                     draw(&mut pass, d, *k..*k + 1, true);
                 }
             }
+            // Order of `DisplaySystem_t::Render` @0x100793b8: sky, the opaque lists 3 + 4 (list 3 = world meshes and the actors'
+            // opaque parts; list 4 = liquids, `VisualLiquid_t` ctor @0x10067385 `SetRenderPriority(4)`), then the blended lists
+            // 5 (blended meshes) and 6 (actors' blended parts, effects), each far to near.
             if let Some(inst) = inst_buf {
                 pass.set_vertex_buffer(1, inst.slice(..));
                 for d in &self.gpu.opaque {
+                    let r = self.vis_range[d.mesh].clone();
+                    if !r.is_empty() {
+                        draw(&mut pass, d, r, false);
+                    }
+                }
+            }
+            calls.set(calls.get() + self.draw_actors(&mut pass, false));
+            // the actor pass rebinds pipeline, buffers and material: forget the cached state
+            pipe.set(usize::MAX);
+            mesh.set((false, usize::MAX));
+            mat.set((false, usize::MAX));
+            if let Some(inst) = inst_buf {
+                pass.set_vertex_buffer(1, inst.slice(..));
+                for d in &self.gpu.liquid {
                     let r = self.vis_range[d.mesh].clone();
                     if !r.is_empty() {
                         draw(&mut pass, d, r, false);
@@ -1164,9 +1199,9 @@ impl Renderer {
                     draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1, false);
                 }
             }
-            calls += self.draw_actors(&mut pass);
+            calls.set(calls.get() + self.draw_actors(&mut pass, true));
         }
-        self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls };
+        self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };
         self.queue.submit([enc.finish()]);
     }
 }
@@ -1410,6 +1445,75 @@ mod sky_tests {
         assert!(shot(frame(at(50.0, -5.0), vec![IDENTITY, at(-50.0, 0.0)], None, false), "mount").unwrap() > 240);
         // behind the camera: not visible
         assert!(shot(frame(at(0.0, 5.0), vec![IDENTITY, away], None, false), "behind").unwrap() < 240);
+    }
+
+    /// RGB of the centre pixel of an actors-only render (`None` without a GPU adapter).
+    fn actor_shot(world: &Scene, model: Scene, at: [f32; 3], name: &str) -> Option<[u8; 3]> {
+        let path = std::env::temp_dir().join(format!("ao-render-env-{}-{name}.png", std::process::id()));
+        let t = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [at[0], at[1], at[2], 1.0]];
+        let f = ao_scene::ActorFrame { id: 1, model: 7, transform: t, parts: vec![], skin: None, always: false };
+        render_to_png_actors(world, &[(7, model)], vec![f], [0.0; 3], [0.0, 0.0, -1.0], 64, 64, &path, 0.0).ok()?;
+        let bytes = std::fs::read(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        let mut r = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut buf = vec![0; r.output_buffer_size()];
+        let info = r.next_frame(&mut buf).unwrap();
+        let o = (info.width as usize * (info.height as usize / 2) + info.width as usize / 2) * 4;
+        Some([buf[o], buf[o + 1], buf[o + 2]])
+    }
+
+    /// A 1 m quad at the origin of model space facing +Z (one-sided = false) with per-vertex `normal`.
+    fn actor_quad(normal: [f32; 3], sub: Submesh) -> Scene {
+        let vertices = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)].iter().map(|&(x, y)| Vertex { pos: [x, y, 0.0], normal, ..Default::default() }).collect();
+        Scene { meshes: vec![Mesh { vertices, submeshes: vec![Submesh { two_sided: true, ..sub }] }], ..Default::default() }
+    }
+
+    /// `Submesh::env_texture`: a black (unlit) CAT material gets the env texture added in a second pass (`SRC = DEST = ONE`, no
+    /// lighting), its uv generated from the camera-space normal with no v flip (`ao_scene::env_uv`).
+    #[test]
+    fn env_layer_is_an_additive_camera_normal_sphere_map() {
+        let env = TextureKey { rdb_type: 2, id: 2 };
+        let mut model_tex = Scene::default();
+        // 2x2: top-left red, top-right green, bottom-left blue, bottom-right white
+        model_tex.textures.insert(env, Texture { width: 2, height: 2, rgba: vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255] });
+        let black = || Submesh { base_color: [0.0, 0.0, 0.0, 1.0], ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) };
+        let model = |normal: [f32; 3], with_env: bool| {
+            let mut m = actor_quad(normal, Submesh { env_texture: with_env.then_some(env), ..black() });
+            m.textures = model_tex.textures.clone();
+            m
+        };
+        let n = [0.5, -0.5, 0.7]; // view-space normal pointing right and down: uv = (0.75, 0.25) = the top-right texel
+        let Some(plain) = actor_shot(&Scene::default(), model(n, false), [0.0, 0.0, -5.0], "plain") else { return };
+        assert_eq!(plain, [0, 0, 0], "black material, no light: nothing to see");
+        let with = actor_shot(&Scene::default(), model(n, true), [0.0, 0.0, -5.0], "env").unwrap();
+        assert!(with[1] > 200 && with[0] < 40 && with[2] < 40, "top-right (green) texel: {with:?}");
+        // up-left normal -> bottom row would be v > 0.5: a +y normal samples the *bottom* texels (no flip), here bottom-left blue
+        let up_left = actor_shot(&Scene::default(), model([-0.5, 0.5, 0.7], true), [0.0, 0.0, -5.0], "up_left").unwrap();
+        assert!(up_left[2] > 200 && up_left[0] < 40 && up_left[1] < 40, "bottom-left (blue) texel: {up_left:?}");
+    }
+
+    /// Render list order (`DisplaySystem_t::Render` @0x100793b8): a liquid (list 4) is drawn after an opaque actor (list 3) even though
+    /// it is part of the world, so water in front of an actor tints it; an actor in front of the water stays opaque.
+    #[test]
+    fn liquid_is_drawn_after_opaque_actors() {
+        let water = |z: f32| {
+            let v = |x: f32, y: f32| Vertex { pos: [x, y, z], normal: [0.0, 0.0, 1.0], ..Default::default() };
+            let sub = Submesh { two_sided: true, blend: ao_scene::Blend::AlphaBlend, base_color: [0.0, 0.0, 1.0, 0.5], emissive: [1.0; 3], liquid: true, ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) };
+            let mut s = Scene::default();
+            s.meshes.push(Mesh { vertices: vec![v(-5.0, -5.0), v(5.0, -5.0), v(5.0, 5.0), v(-5.0, 5.0)], submeshes: vec![sub] });
+            s.instances.push(Instance { mesh: 0, transform: IDENTITY });
+            s
+        };
+        let red = || actor_quad([0.0, 0.0, 1.0], Submesh { emissive: [1.0; 3], ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) });
+        let mut red = red();
+        red.meshes[0].vertices.iter_mut().for_each(|v| v.color = [1.0, 0.0, 0.0, 1.0]);
+        // water at z = -3 in front of the actor at z = -5: the actor shows through half transparent blue
+        let Some(behind) = actor_shot(&water(-3.0), red.clone(), [0.0, 0.0, -5.0], "water_front") else { return };
+        // half red + half blue blended in the sRGB target (linear 0.5 = 188 per channel)
+        assert!((150..230).contains(&behind[0]) && (150..230).contains(&behind[2]), "red actor under half-transparent blue water: {behind:?}");
+        // water at z = -8 behind the actor: depth test hides it, the actor is pure red
+        let front = actor_shot(&water(-8.0), red, [0.0, 0.0, -5.0], "water_back").unwrap();
+        assert!(front[0] > 240 && front[2] < 20, "actor in front of the water: {front:?}");
     }
 
     /// A `half`-metre wide quad facing the camera at z = -10 (normal +Z), lit by one white D3D light and nothing else.

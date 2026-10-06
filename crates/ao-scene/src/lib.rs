@@ -90,6 +90,13 @@ pub struct Submesh {
     pub specular: [f32; 3],
     /// `_D3DMATERIAL7.power` (`shin`).
     pub shininess: f32,
+    /// Environment (sphere) map layer of a CAT material (`RMaterial_t::SetEnvTexture`, randy31 @0x10040e5f; DisplaySystem layer 3 of
+    /// `SetCATTexture`). Actors only: after the submesh the renderer draws the same triangles again, additive (`SRC = DEST = ONE`,
+    /// stage 0 `SELECTARG1` texture, no lighting) with the uv generated from the camera-space normal ([`env_uv`], `FUN_10056ed6`).
+    pub env_texture: Option<TextureKey>,
+    /// Liquid surface (`VisualLiquid_t`, render list 4): drawn after the opaque phase **including the actors' opaque parts** and
+    /// before the blended world (list 5) and the actors' blended parts (list 6), `DisplaySystem_t::Render` @0x100793b8.
+    pub liquid: bool,
 }
 
 impl Submesh {
@@ -109,6 +116,8 @@ impl Submesh {
             sun_flicker: false,
             specular: [0.0; 3],
             shininess: 0.0,
+            env_texture: None,
+            liquid: false,
         }
     }
 }
@@ -384,9 +393,25 @@ pub const IDENTITY: [[f32; 4]; 4] = [
     [0.0, 0.0, 0.0, 1.0],
 ];
 
+/// Environment-map texture coordinate of a camera-space unit normal: `D3DTSS_TCI_CAMERASPACENORMAL` through the texture matrix
+/// the CAT render builds for the env pass (`FUN_10056ed6` @0x10056ed6, `FUN_1004d18a` @0x1004d18a): `scale(0.5, 0.5, 1)` with the
+/// translation row `(+0.5, +0.5, +0)` (doubles @0x1009fd98 / @0x1009fde8 in randy31) applied to `(nx, ny, nz, 1)`, two components:
+/// `uv = (0.5 nx + 0.5, 0.5 ny + 0.5)`. No v flip (D3D v grows downwards like the texture rows). `ao-render`'s `shader.wgsl::vs_env`
+/// computes the same.
+pub fn env_uv(view_normal: [f32; 3]) -> [f32; 2] {
+    [0.5 * view_normal[0] + 0.5, 0.5 * view_normal[1] + 0.5]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_uv_is_the_camera_space_sphere_map() {
+        assert_eq!(env_uv([0.0, 0.0, 1.0]), [0.5, 0.5]); // facing the camera: centre
+        assert_eq!(env_uv([1.0, 0.0, 0.0]), [1.0, 0.5]); // right silhouette
+        assert_eq!(env_uv([0.0, -1.0, 0.0]), [0.5, 0.0]); // down: v = 0 (no flip)
+    }
 
     #[test]
     fn horizontal_fov_shrinks_the_vertical_angle_with_the_aspect() {

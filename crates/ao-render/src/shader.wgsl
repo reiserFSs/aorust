@@ -12,6 +12,7 @@ struct G {
     sun_g: vec4<f32>,      // rgb = sun colour in D3D (gamma) space, w = SpecularLightIntensity
     ambient_g: vec4<f32>,  // device ambient, gamma space
     fog_g: vec4<f32>,      // fog colour, gamma space
+    view: mat4x4<f32>,     // world -> camera space (env map texgen)
 }
 struct Mat {
     color: vec4<f32>,
@@ -239,3 +240,22 @@ fn fs_sky_test(i: VOut) -> @location(0) vec4<f32> { return shade_sky(i, 1u); }
 fn fs_sky_blend(i: VOut) -> @location(0) vec4<f32> { return shade_sky(i, 2u); }
 @fragment
 fn fs_sky_add(i: VOut) -> @location(0) vec4<f32> { return shade_sky(i, 3u); }
+
+// CAT environment-map pass (randy31 `FUN_10056ed6`, mirrors `ao_scene::env_uv`): the uv is generated from the camera-space normal
+// (D3DTSS_TCI_CAMERASPACENORMAL) through scale(0.5, 0.5) + translation (0.5, 0.5).
+@vertex
+fn vs_env(v: VIn) -> VOut {
+    var o = vtx(v);
+    let nv = normalize((g.view * vec4<f32>(o.n, 0.0)).xyz);
+    o.uv = 0.5 * nv.xy + vec2<f32>(0.5);
+    return o;
+}
+
+// Stage 0 SELECTARG1 texture (no lighting, no vertex colour), blend `ONE, ONE`; the fixed-function fog still blends the colour
+// towards the fog colour before the add (the env state blob @RCATMesh+0x224 sets no fog colour, `FUN_10055a3e`).
+@fragment
+fn fs_env(i: VOut) -> @location(0) vec4<f32> {
+    let t = textureSample(tex, samp, i.uv);
+    let f = clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+    return vec4<f32>(srgb_dec(mix(srgb_enc(t.rgb), g.fog_g.rgb, f)), 1.0);
+}

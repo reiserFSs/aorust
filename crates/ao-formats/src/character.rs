@@ -327,19 +327,72 @@ fn linear(c: f32) -> f32 {
     c.max(0.0).powf(2.2)
 }
 
-/// Renderer material for one CAT material: blend from opacity and the texture's alpha channel
-/// (`flags & 8` = alpha is not transparency), flat colour only when untextured.
-fn submesh_for(mat: &Material, tex: Option<(TextureKey, &ao_scene::Texture)>) -> Submesh {
+/// What `RMaterial_t::SetAlphaMode` (randy31 `FUN_10040645` @0x10040645, run by `RMaterial_t::SetTexture(tex, stage 0, mode)`
+/// @0x10040bec) does to a material, as scene state `(blend, glow_mask)`. D3D7 ids decoded: 0x1b ALPHABLENDENABLE, 0xf ALPHATESTENABLE,
+/// 0xe ZWRITEENABLE, 0x18/0x19 ALPHAREF/ALPHAFUNC, 0x13/0x14 SRC/DESTBLEND; texture-stage types 1 COLOROP, 2 COLORARG1, 3 COLORARG2.
+/// `has_alpha` = the texture carries an alpha channel (`FUN_1004761a`: texture `+0xb4` bit 0). Modes 0 and 5 do nothing without it.
+/// * 0: alpha blend (`ALPHABLENDENABLE` on, alpha used as transparency). The scene contract cannot blend with depth writes, the
+///   one thing mode 0 does differently from [`Blend::AlphaBlend`]; [`submesh_for`] draws a texture whose alpha is only 0/255 as a cutout.
+/// * 1: alpha test, `ALPHAFUNC GREATER`, `ALPHAREF` 0x80, no blend.
+/// * 2: alpha blend + alpha test (ref 0x1e), z-write off. [GUESS] drawn as `AlphaTest`: the contract has no blend+test (`mesh.rs`
+///   makes the same choice for archive meshes).
+/// * 3: alpha blend, z-write off.
+/// * 4: additive (`ONE, ONE`), z-write off, fog colour black, stage 0 `SELECTARG1` texture (unlit).
+/// * 5: the texture alpha is a glow mask: stage 0 `COLOROP ADD`, `COLORARG1 TEXTURE|ALPHAREPLICATE`, `COLORARG2 DIFFUSE`, stage 1
+///   `MODULATE` with the texture again = `tex * saturate(lighting + alpha)` (`Submesh::glow_mask`), opaque.
+/// * other values leave the material as it is (opaque).
+pub fn alpha_mode_blend(mode: u32, has_alpha: bool) -> (Blend, bool) {
+    match mode {
+        0 if has_alpha => (Blend::AlphaBlend, false),
+        1 | 2 => (Blend::AlphaTest, false),
+        3 => (Blend::AlphaBlend, false),
+        4 => (Blend::Additive, false),
+        5 if has_alpha => (Blend::Opaque, true),
+        _ => (Blend::Opaque, false),
+    }
+}
+
+/// The mode `RMaterial_t`'s constructor applies (`SetTexture(tex, 0, -1)` @0x10041128 → the `mode < 0` branch of `FUN_10040645`):
+/// a textured material whose alpha is used as transparency (`flags & 8 == 0`, `UseAlphaAsTransparency`) gets mode 0, otherwise
+/// (two texture stages available) mode 5, the glow mask.
+pub fn default_alpha_mode(material_flags: u32) -> u32 {
+    if material_flags & 8 == 0 { 0 } else { 5 }
+}
+
+/// What a wire `TextureData_t` adds to a part (DisplaySystem `SetCATTextures` `FUN_10070247`): its env texture (layer 3, replaces
+/// the part table's `env_texture`; 0 = keep) and the `AlphaMode` that goes with its layer-1 texture (`None` = not overridden: the
+/// material keeps [`default_alpha_mode`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PartLayer {
+    pub env_texture: u32,
+    pub alpha_mode: Option<u32>,
+}
+
+/// Per material (part) name, see [`PartLayer`].
+pub type PartLayers = HashMap<String, PartLayer>;
+
+/// Renderer material for one CAT material: the [`alpha_mode_blend`] of `mode` (default [`default_alpha_mode`]) from the texture's
+/// alpha channel, opacity below 1 blends, flat colour only when untextured.
+fn submesh_for(mat: &Material, tex: Option<(TextureKey, &ao_scene::Texture)>, mode: Option<u32>) -> Submesh {
     let mut s = Submesh::new(vec![], tex.map(|t| t.0));
-    let alpha_is_transparency = mat.flags & 8 == 0;
     let (mut cut, mut soft) = (false, false);
-    if let (true, Some((_, t))) = (alpha_is_transparency, tex) {
+    if let Some((_, t)) = tex {
         for a in t.rgba.iter().skip(3).step_by(4) {
             cut |= *a == 0;
             soft |= *a != 0 && *a != 255;
         }
     }
-    s.blend = if mat.opacity < 1.0 || soft { Blend::AlphaBlend } else if cut { Blend::AlphaTest } else { Blend::Opaque };
+    let mode = mode.unwrap_or_else(|| default_alpha_mode(mat.flags));
+    let (mut blend, mut glow) = alpha_mode_blend(mode, cut || soft);
+    if mode == 0 && blend == Blend::AlphaBlend && !soft {
+        blend = Blend::AlphaTest;
+    }
+    if mat.opacity < 1.0 && matches!(blend, Blend::Opaque | Blend::AlphaTest) {
+        blend = Blend::AlphaBlend;
+    }
+    glow &= blend == Blend::Opaque;
+    s.blend = blend;
+    s.glow_mask = glow;
     // `RViewPort_t::SetMaterial` (randy31 @0x1004b199) copies only opac, emis, spec * shin_str and shin into the `_D3DMATERIAL7`: its
     // diffuse / ambient RGB stay white (`SetDefaultMaterial` @0x1004b61e), so `diffuse` / `ambient` tint nothing (they only reach D3D
     // through `InitD3DMaterial` @0x100409c6 for per-frame material modifiers); EMISSIVEMATERIALSOURCE is the device default MATERIAL.
@@ -354,9 +407,19 @@ fn submesh_for(mat: &Material, tex: Option<(TextureKey, &ao_scene::Texture)>) ->
     s
 }
 
+/// Loads rdb 1010004 texture `id` into `scene` once (`None` = id 0 or not in the rdb).
+fn ensure_texture(store: &RecordStore, scene: &mut Scene, cache: &mut HashMap<u32, Option<TextureKey>>, id: u32) -> Option<TextureKey> {
+    *cache.entry(id).or_insert_with(|| {
+        let key = TextureKey { rdb_type: TEXTURE_TYPE, id };
+        let tex = (id != 0).then(|| load_texture(store, key).ok().flatten()).flatten()?;
+        scene.textures.insert(key, tex);
+        Some(key)
+    })
+}
+
 /// `with_head`: a head mesh is mounted, so the body's own `head` part (a one-triangle stub textured with
 /// the green `head_*_default.png` placeholder on Atrox) is left out.
-fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned, overrides: &PartTextures, with_head: bool) -> (Scene, [f32; 3], [f32; 3]) {
+fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned, overrides: &PartTextures, layers: &PartLayers, with_head: bool) -> (Scene, [f32; 3], [f32; 3]) {
     let mut scene = Scene::default();
     let mut out = Mesh::default();
     let mut textures: HashMap<u32, Option<TextureKey>> = HashMap::new();
@@ -380,14 +443,13 @@ fn assemble(store: &RecordStore, mesh: &CatMesh, skin: &Skinned, overrides: &Par
                     scene.textures.insert(*key, tex.clone());
                     Some(*key)
                 }
-                None => *textures.entry(part.texture).or_insert_with(|| {
-                    let key = TextureKey { rdb_type: TEXTURE_TYPE, id: part.texture };
-                    let tex = (part.texture != 0).then(|| load_texture(store, key).ok().flatten()).flatten()?;
-                    scene.textures.insert(key, tex);
-                    Some(key)
-                }),
+                None => ensure_texture(store, &mut scene, &mut textures, part.texture),
             };
-            out.submeshes.push(submesh_for(&mesh.materials[sm.material as usize], key.map(|k| (k, &scene.textures[&k]))));
+            let layer = layers.get(&part.name).copied().unwrap_or_default();
+            let mut sub = submesh_for(&mesh.materials[sm.material as usize], key.map(|k| (k, &scene.textures[&k])), layer.alpha_mode);
+            // layer 3: the wire env texture, else the part table's (`FUN_10070247` / `FUN_100704b8`)
+            sub.env_texture = ensure_texture(store, &mut scene, &mut textures, if layer.env_texture != 0 { layer.env_texture } else { part.env_texture });
+            out.submeshes.push(sub);
             out.submeshes.len() - 1
         });
         // mirroring Z turns the clockwise-front triangles counter-clockwise only if the winding is reversed
@@ -464,7 +526,7 @@ fn build(store: &RecordStore, rdb_type: u32, id: u32, pose: Option<(u32, f32)>, 
             (skin_pose(&mesh, &world), world.into_iter().map(Some).collect())
         }
     };
-    let (mut scene, lo, mut hi) = assemble(store, &mesh, &skin, overrides, head.is_some());
+    let (mut scene, lo, mut hi) = assemble(store, &mesh, &skin, overrides, &PartLayers::new(), head.is_some());
     if let Some(head) = head {
         let att = mesh.attractors.iter().find(|a| a.name.ends_with("_head")).context("model has no head attractor")?;
         let bone = match frames[att.bone as usize] {
@@ -754,14 +816,50 @@ mod tests {
         let mut m = CatMesh::parse(&mesh_record()).unwrap().materials.remove(0);
         let key = TextureKey { rdb_type: TEXTURE_TYPE, id: 1 };
         let tex = |alphas: &[u8]| ao_scene::Texture { width: alphas.len() as u32, height: 1, rgba: alphas.iter().flat_map(|&a| [9, 9, 9, a]).collect() };
-        let blend = |m: &Material, t: &ao_scene::Texture| submesh_for(m, Some((key, t))).blend;
-        assert_eq!(blend(&m, &tex(&[0, 255])), Blend::Opaque, "flags & 8: alpha is not transparency");
+        let sub = |m: &Material, t: &ao_scene::Texture| submesh_for(m, Some((key, t)), None);
+        let blend = |m: &Material, t: &ao_scene::Texture| sub(m, t).blend;
+        // flags & 8 (alpha is not transparency): the constructor's mode 5, the texture alpha is a glow mask, opaque
+        assert!(m.flags & 8 != 0);
+        assert_eq!((blend(&m, &tex(&[0, 255])), sub(&m, &tex(&[0, 255])).glow_mask), (Blend::Opaque, true));
+        assert!(!sub(&m, &tex(&[255])).glow_mask, "no alpha channel content: nothing to glow");
         m.flags = 0;
         assert_eq!(blend(&m, &tex(&[0, 255])), Blend::AlphaTest);
         assert_eq!(blend(&m, &tex(&[0, 128])), Blend::AlphaBlend);
         assert_eq!(blend(&m, &tex(&[255])), Blend::Opaque);
         m.opacity = 0.5;
         assert_eq!(blend(&m, &tex(&[255])), Blend::AlphaBlend);
-        assert_eq!(submesh_for(&m, None).base_color[3], 0.5);
+        assert_eq!(submesh_for(&m, None, None).base_color[3], 0.5);
+    }
+
+    /// `FUN_10040645` (randy31 @0x10040645): every `AlphaMode` of a wire `TextureData_t`.
+    #[test]
+    fn alpha_modes_map_to_scene_state() {
+        let all = [
+            (0, true, (Blend::AlphaBlend, false)),
+            (0, false, (Blend::Opaque, false)), // mode 0 and 5 need the texture's alpha channel
+            (1, false, (Blend::AlphaTest, false)),
+            (2, true, (Blend::AlphaTest, false)),
+            (3, false, (Blend::AlphaBlend, false)),
+            (4, false, (Blend::Additive, false)),
+            (5, true, (Blend::Opaque, true)),
+            (5, false, (Blend::Opaque, false)),
+            (6, true, (Blend::Opaque, false)), // unknown modes change nothing
+        ];
+        for (mode, has_alpha, want) in all {
+            assert_eq!(alpha_mode_blend(mode, has_alpha), want, "mode {mode} alpha {has_alpha}");
+        }
+        assert_eq!((default_alpha_mode(0), default_alpha_mode(8), default_alpha_mode(2)), (0, 5, 0));
+    }
+
+    #[test]
+    fn explicit_alpha_mode_overrides_the_material_default() {
+        let m = CatMesh::parse(&mesh_record()).unwrap().materials.remove(0); // flags & 8: default glow
+        let key = TextureKey { rdb_type: TEXTURE_TYPE, id: 1 };
+        let t = ao_scene::Texture { width: 2, height: 1, rgba: vec![9, 9, 9, 0, 9, 9, 9, 255] };
+        let s = |mode| submesh_for(&m, Some((key, &t)), mode);
+        assert!(s(None).glow_mask);
+        assert_eq!(s(Some(4)).blend, Blend::Additive);
+        assert!(!s(Some(4)).glow_mask);
+        assert_eq!(s(Some(1)).blend, Blend::AlphaTest);
     }
 }

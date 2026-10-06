@@ -83,7 +83,7 @@ and the clan string, not decoded), more than 96 tags at once.
 
 * A server-sent `CorpseAnimKey` 1..99 (never captured) would start a social clip on the corpse (static.md §5).
 * `Features` of players is an inference (bit 4); NPC `Features` come from their record.
-* Environment-map layer (`TextureData.env_texture`), `AlphaMode` 5. Heads/attachments: the mounted set is exactly the message's attractor list (`CharacterMesh::ClearAttractors` drops the `HeadMesh` entry added before it, `actor::attractor_list`, docs/zone/npc.md §6); a flag-bit-2 message mounts none.
+* Corpse `TextureData` env texture / alpha mode are passed as 0 (the corpse path takes `(material, texture)` pairs; both are 0 in every capture). `ClearAttractors` vs. the head mesh: the mounted set is exactly the message's attractor list (`CharacterMesh::ClearAttractors` drops the `HeadMesh` entry added before it, `actor::attractor_list`, docs/zone/npc.md §6); a flag-bit-2 message mounts none.
 * Weapon attractor orientation: the mesh is mounted with the attractor's frame as is; no weapon-specific rotation was found.
 * Indicators over non-character dynels (corpses, props); the ignored-character icon on the tag plate (§4).
 * Doors do not animate (open/close state is server driven and no door message is decoded).
