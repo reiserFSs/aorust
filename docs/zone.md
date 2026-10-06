@@ -61,7 +61,7 @@ No ptype 5 (text) frame was received: server chat arrives as N3. Nothing is unde
 2. `Zone::on_frame` decodes each N3 frame, tracks all announced dynels (name, position, yaw; removed on `n3ToClientQuit`).
 3. `PlayfieldAnarchyF` → background load of that playfield (replaces the old "use the character list's playfield" logic; correct for freshly created characters too).
 4. When the loading screen dissolves the camera is put at the **own dynel's server position** (eye 1.7 m above the feet, facing the server heading); the old density-based
-   spawn is only a fallback. Free-fly (WASD/right mouse) is then active as before.
+   spawn is only a fallback. The own character (`play/player.rs`, docs/play.md) takes over from there.
 5. After 10 world frames the app sends `CharInPlayIIR_t` once (`ptype 0xA`, sender = charId, receiver 2, payload `570c2039 0000c350 <charId> 01`), like
    `WaitingToStartGame` (GUI 0x10027d73) after the `TeleportEnded` countdown (docs/zone/outgoing.md §3). The server answers by relaying `CharInPlay` to observers; it kept streaming and
    pinging afterwards.
@@ -83,6 +83,7 @@ Movement of other dynels, animation roles and name tags: [zone/motion.md](zone/m
 | HUD / stats | `FullCharacter` stats (Health 34, Level 1, Cash, IP, abilities) + `StatIIR_t` deltas → HUD bars/windows; names via the client's own stat table (GC 0x10027483 / 0x1002f009, 524 ids) | docs/zone/world.md §2, docs/zone/dynel.md §3 |
 | target / selection | client-local (`TargetingModule_t::SetTarget` GUI 0x100257b0, nothing sent to the server): `Zone.target`, `Zone.fight_target` (AttackIIR/StopFight relays), left-click release selects the next dynel of the camera ray hit list (`ActionViewMouseHandler_c` `FUN_1002c469`; no ground deselect), Tab / dock arrows = `N3Msg_GetCloseTarget` (by squared distance, 100 m), target bars, target-of-target button, selection indicator plate (`play/hud_target.rs`) | docs/gui.md §13.2–13.3 |
 | combat | `Attack/AttackInfo/StopFight/MissedAttackInfo/SpecialAttack*` decoders exist; effects/animations need the character animation state machine | docs/zone/misc.md §3–11 |
+| combat glue (module, keys, numbers, music feed, own avatar) | `play/combat/{module,glue}.rs`: commands → frames, `CombatEvent` → dynel/avatar clips, floating numbers, `Audio::set_combat_char`; live fight | [zone/combat.md](zone/combat.md) |
 | combat input / outgoing | `combat::{attack, stop_fight, sec_spec_attack}` encoders (flag byte 0), `can_attack`, `AttackGate` (`+0x79` guard), `default_attack`; keys/clicks → N3Msg chain | docs/zone/combat-net.md |
 | combat state / log / numbers | fight controller per dynel (`Combat::on_frame` → `CombatEvent`), health bookkeeping, the client's feedback formatter (`FUN_10012bd5`) with the real `text.mdb` strings, HUD / world floating numbers (colour, life, rise) | [zone/combat-log.md](zone/combat-log.md) (`play/combat/{state,log,stat_names}.rs`) |
 | time of day | `GameTimeIIR_t.time` (67170.0) → sky clock (`GameDayTime` wraps at 6480 s; 67170 mod 6480 = 2370) | docs/zone/world.md §4 |

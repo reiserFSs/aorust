@@ -14,7 +14,7 @@
    `~/Library/Application Support/aomac/prefs.txt` (stand-in for `prefs/Prefs.xml` `LauncherConfig`; combo box + Remove work).
 4. Pick a character (click, Up/Down; the 3D preview follows), **Play** or Enter. After `ZoneHandoff` the loading screen fades in,
    the zone connection is made, the playfield is loaded and the loading screen dissolves into it. Esc quits in the world;
-   WASD/right-mouse free-fly as in the viewer.
+   The own character is controlled with the client's key bindings (see "Controls"); free-fly is used only when the avatar could not be built (the original has no free camera).
 
 Errors: `ShowError(code, arg)` opens `<ERRORURL><code>[-<arg>].html` (ERRORURL from `AnarchyLauncher.url`) in the default browser
 (`open`), the login window stays up (docs/screens.md §3.6). Connect failure → 1; login refused (0x0d) / rejected (0x21) → type + detail;
@@ -22,6 +22,24 @@ login connection lost → 3 ([INFERENCE]). Non-login notices (character slots ex
 ProgressDialog-based box with "OK".
 
 Clipboard: Cmd+C/X/V/A in text fields use the OS clipboard (`arboard`); the password field never copies/cuts (`tvf::PASSWORD`).
+
+## Own character in the world (`play/player.rs`)
+
+`Player` glues `controls.rs` (client key bindings, mouse-look), `movement.rs` (the client's movement FSM; docs/zone/movement.md), the playfield `Collision`
+(ao-formats, docs/zone/collision.md), `avatar.rs` (own model on the actor layer, docs/zone/avatar.md) and `camera.rs` (third-person camera, docs/zone/camera.md).
+It is built when the world appears (and again whenever the server announces the own dynel again, e.g. after a teleport) from the own
+`SimpleCharFullUpdateIIR_t` (`Zone::own_update`), starts at its position/heading (snapped to the collision ground) and takes the stats from `Zone::stats`.
+Every frame: keys -> `Movement::action`, `Movement::update` -> `CharDCMoveIIR_t` frames on the zone connection (exactly the messages the FSM emits: key
+actions, a sync every 5 s while moving, ...), avatar pose from the FSM state, camera behind the avatar. `CharDCMove`s the server relays for the own
+dynel are ignored, as in the original (`FUN_1006bcc6`). The login window's text focus is cleared when the world appears (it blocked every key).
+`Frontend::game_input` (ao-render) delivers physical keys and mouse-look deltas, `Host::look` captures the cursor.
+
+Live (Ithaca, 2026-10-06, Aomacvolk): `cargo test --release -p aomac live_walk -- --ignored --nocapture` (stdin: user, password; `AOMAC_LIVE_STEPS`, see
+`play/flow/live.rs`) drives the real `Play` offscreen through `ao_render::Offscreen` (no window; needed because a locked screen never renders windows): login, character
+pick, zone, then key steps and a collision-route autopilot (`goto=x:z`). Results: the server accepted every move (positions persist across relogs: the next login started
+exactly where the previous run stopped); walking from the Arrival Hall start (205.2, 1.0, 255.8) around the exhibits and through the central ICC shuttleport tunnel
+(x ~ 193, z ~ 157) made the server send `PlayfieldAnarchyF` 4582 (Newland City, start at 931, 20, 729) -> the loading screen -> the new world with terrain following and jumping.
+Headless equivalents: `flow::tests::{own_character_walks_from_the_keyboard, autopilot_crosses_the_arrival_hall}`.
 
 ## In the world (M3 step 1)
 
@@ -50,7 +68,6 @@ games category, macOS ≥ 12). The client is found from `$HOME/Games/ProjectRubi
 * Preview lighting/FOV convention: UNRESOLVED (renderer default; `docs/screens.md` §11).
 * The startup music cue plays at the zone hand-off; the original starts it on `CharacterLoggedInMessage` (0x26), a local AFCM message after the zone TCP connect
   (docs/protocol.md §8 "Zone hand-off timing"), which is within a second of our hand-off + 4 s delay.
-* In the world only the camera is placed (own dynel position/heading, free-fly afterwards); the player's model, other dynels, chat and HUD are not rendered yet
   (state is tracked in `play/zone.rs`, plan in docs/zone.md §6).
 
 ## Debug flags (hidden)

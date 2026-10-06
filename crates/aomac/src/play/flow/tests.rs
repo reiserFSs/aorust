@@ -219,3 +219,53 @@ fn zone_redirect_shows_the_loading_screen() {
     r.event(LoginEvent::ZoneRedirect { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 2 });
     assert!(r.p.screen == Screen::Loading && r.p.zone.dynels.is_empty() && !r.p.zone.in_play_sent);
 }
+
+/// The own character on the captured Arrival Hall start: the avatar is built, the login window's focus is gone (it blocked every key),
+/// holding W walks it along its heading at about the client's run speed, and the position is the movement state's, not the server's.
+#[test]
+fn own_character_walks_from_the_keyboard() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    assert!(r.p.player.is_some() && !r.p.gui.text_focused());
+    let (p0, yaw) = {
+        let d = r.p.zone.own().unwrap();
+        (d.pos, d.yaw.unwrap_or(0.0))
+    };
+    let key = |r: &mut Rig, pressed| r.p.game_input(ao_render::GameInput::Key { code: ao_render::KeyCode::KeyW, pressed, repeat: false }, &mut r.host);
+    key(&mut r, true);
+    for _ in 0..125 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    key(&mut r, false);
+    let p1 = r.p.zone.own().unwrap().pos;
+    let d = ((p1[0] - p0[0]).powi(2) + (p1[2] - p0[2]).powi(2)).sqrt();
+    assert!(d > 4.0 && d < 12.0, "walked {d} m in 2 s");
+    let along = (p1[0] - p0[0]) * yaw.sin() + (p1[2] - p0[2]) * yaw.cos();
+    assert!(along > 0.9 * d, "moved along the heading {yaw}: {along} of {d}");
+}
+
+/// The route autopilot of the live harness, headless: Arrival Hall start -> the northernmost reachable spot of the collision grid
+/// (collision + movement + avatar glue; fails when the character gets stuck on geometry the route calls free).
+#[test]
+fn autopilot_crosses_the_arrival_hall() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    let col = ao_formats::playfield::collision::Collision::load(&ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap(), 4604).unwrap();
+    let path = live::route(&col, r.p.zone.own().unwrap().pos, (193.0, 157.0));
+    eprintln!("path {} {:?}", path.len(), &path[..path.len().min(12)]);
+    let mut pilot = live::Pilot::new(path);
+    let mut frames = 0;
+    while !pilot.step(&mut r.p, &mut r.host) {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+        frames += 1;
+        if frames % 30 == 0 && frames < 400 {
+            eprintln!("f{frames} {:?} held {:?} i {}", r.p.zone.own().unwrap().pos, pilot.held(), pilot.idx());
+        }
+        assert!(frames < 6000, "stuck at {:?}", r.p.zone.own().unwrap().pos);
+    }
+    eprintln!("arrived after {frames} frames at {:?}", r.p.zone.own().unwrap().pos);
+}

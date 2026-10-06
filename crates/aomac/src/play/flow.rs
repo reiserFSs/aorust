@@ -921,6 +921,7 @@ impl Frontend for Play {
                             eprintln!("chat: {e:#}");
                         }
                     }
+                    self.gui.clear_focus(); // the login window's password field kept the keyboard focus
                     self.player = player::Player::new(&self.dir, &self.zone, self.zone.playfield.unwrap_or(0));
                     host.fly = false;
                     self.fade = Fade::Out(0.0);
@@ -961,8 +962,8 @@ impl Frontend for Play {
                     }
                 }
             }
-            self.zone.world.update(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host);
             self.fight_frame(dt);
+            self.zone.world.update(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host);
         }
         if let Some(a) = &self.audio {
             a.update(dt, host.camera.pos.to_array(), self.zone.day_time());
@@ -985,15 +986,15 @@ impl Frontend for Play {
                 }
             }
         }
-        let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
         self.hud_uses();
+        let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
         let mut list = self.gui.frame(dt);
         if self.screen == Screen::InWorld {
             let own = self.zone.own().map_or(host.camera.pos.to_array(), |d| zone::scene_pos(d.pos));
             self.zone.world.name_tags(&mut self.gui, &host.camera, self.size, own, &mut list);
             super::hud_target::selection_indicator(&mut self.gui, &self.zone, &host.camera, self.size, &mut list);
-        }
             self.fight_draw(host, &mut list);
+        }
         if self.screen == Screen::Create {
             list.cmds.splice(0..0, pre.cmds);
             list.cmds.extend(post.cmds);
