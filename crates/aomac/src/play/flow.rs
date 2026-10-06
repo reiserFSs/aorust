@@ -527,6 +527,7 @@ impl Play {
         host.fly = false;
         self.zone.reset_world();
         self.fight_reset();
+        self.interact_reset();
         self.world_frames = 0;
         self.world_ready = false;
         self.world_scene = None;
@@ -667,6 +668,7 @@ impl Play {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
                     self.zone = zone::Zone::new(character_id);
                     self.fight_reset();
+                    self.interact_reset();
                     let mut chat = chat::Chat::new();
                     if let Some((u, p)) = &self.login_cred {
                         chat.set_credentials(u, p);
@@ -683,6 +685,7 @@ impl Play {
                     if let Some(m) = self.fight.as_mut() {
                         m.on_frame(&f);
                     }
+                    self.interact_zone_frame(&f);
                     self.zone.on_frame(&f)
                 } {
                     zone::ZoneEvent::Playfield(id) => {
@@ -843,6 +846,7 @@ impl Frontend for Play {
                 p.mouse(&ev, self.gui.wants_mouse(x, y));
             }
         }
+        self.interact_mouse(&ev, host);
         match (self.screen, &ev) {
             (Screen::Loading, _) => return, // full-screen InvisibleButton swallows input
             (Screen::Create, _) if self.create_input(&ev, host) => return,
@@ -869,12 +873,16 @@ impl Frontend for Play {
         if let Some(h) = self.hud.as_mut() {
             h.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default());
             // CTRL / ALT + left click on a character: select (done) and `N3Msg_SwitchTarget` (`FUN_1002c469`)
-            if let (Some(id), Some(p)) = (h.take_click(), self.player.as_ref()) {
+            let clicked = h.take_click();
+            if let (Some(id), Some(p)) = (clicked, self.player.as_ref()) {
                 if p.attack_modifier() && self.zone.dynels.contains_key(&id) {
                     if let Some(m) = self.fight.as_mut() {
                         m.command(combat::module::Command::SwitchTarget(id), &self.zone, p.mode());
                     }
                 }
+            }
+            if let Some(id) = clicked {
+                self.interact_left_click(id);
             }
             // TAB cycles the target (`COMMAND_NEXT_HOSTILE_TARGET`, only outside text input): it must not also move the GUI focus into the chat input
             if matches!(ev, InputEvent::Key { key: Key::Tab, .. }) && self.screen == Screen::InWorld && !self.gui.text_focused() {
@@ -886,6 +894,9 @@ impl Frontend for Play {
                 continue;
             }
             if self.hud.as_mut().is_some_and(|h| h.event(&mut self.gui, &e, &self.zone)) {
+                continue;
+            }
+            if self.interact_event(&e) {
                 continue;
             }
             self.handle(e, host);
@@ -1100,6 +1111,7 @@ impl Frontend for Play {
             }
         }
         self.hud_uses();
+        self.interact_frame();
         let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
         let mut list = self.gui.frame(dt);
         if self.screen == Screen::InWorld {

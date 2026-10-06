@@ -435,6 +435,37 @@ fn live_walk() {
                 d.sort();
                 eprintln!("watch: {}", d.join(" "));
             }
+            // interaction steps (docs/zone/interact.md): `npcs` lists the dynels flagged talkable, `talk=<instance>` / `talkname=<name>` is the right click
+            // (`N3Msg_DefaultActionOnDynel`), `dlg` prints the dialogue window, `answer=<n>` clicks an answer link, `useobj=<kind>:<instance>` `N3Msg_UseItem`
+            "npcs" => {
+                let i = l.p.interact.as_ref().unwrap();
+                for (id, v) in i.flagged() {
+                    let d = l.p.zone.dynels.get(&id);
+                    eprintln!("npc {id} stat0x300={v} {:?} at {:?}", d.map(|d| d.name.as_str()), d.map(|d| d.pos));
+                }
+            }
+            "talk" | "talkname" => {
+                let id = if k == "talk" {
+                    v.parse().unwrap()
+                } else {
+                    let me = l.p.zone.own().unwrap().pos;
+                    let d = |d: &crate::play::zone::DynelState| (d.pos[0] - me[0]).powi(2) + (d.pos[2] - me[2]).powi(2);
+                    *l.p.zone.dynels.iter().filter(|(_, x)| x.name == v).min_by(|a, b| d(a.1).total_cmp(&d(b.1))).expect("no such dynel").0
+                };
+                eprintln!("talk {id}: {:?}", l.p.interact.as_mut().unwrap().default_action(id));
+                l.wait(3.0);
+            }
+            "dlg" => eprintln!("{}", l.p.interact.as_ref().unwrap().dump(&l.p.gui)),
+            "answer" => {
+                let p = &mut l.p;
+                eprintln!("answer {v}: {}", p.interact.as_mut().unwrap().answer(&mut p.gui, &p.zone, v.parse().unwrap()));
+                l.wait(3.0);
+            }
+            "useobj" => {
+                let (kind, inst) = v.split_once(':').unwrap();
+                l.p.interact.as_mut().unwrap().use_object(ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() });
+                l.wait(3.0);
+            }
             "cam" => {
                 let c = l.o.host.camera;
                 eprintln!("camera pos {:.2} {:.2} {:.2} yaw {:.2} pitch {:.2} lens {:?}", c.pos.x, c.pos.y, c.pos.z, c.yaw, c.pitch, l.o.host.lens);
