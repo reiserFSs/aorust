@@ -640,8 +640,13 @@ fn live_walk() {
             }
             "tadd" => {
                 let (kind, inst) = v.split_once(':').unwrap();
+                let item = if kind == "slot" {
+                    ao_net::n3::inventory::item_identity(u32::from_str_radix(inst.trim_start_matches("0x"), 16).unwrap())
+                } else {
+                    ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() }
+                };
                 let p = &mut l.p;
-                eprintln!("tadd {v}: {}", p.interact.as_mut().unwrap().trade_add(&mut p.gui, ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() }));
+                eprintln!("tadd {v}: {}", p.interact.as_mut().unwrap().trade_add(&mut p.gui, item));
                 l.wait(3.0);
             }
             "taccept" | "tdecline" => {

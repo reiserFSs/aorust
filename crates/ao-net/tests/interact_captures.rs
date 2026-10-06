@@ -82,3 +82,30 @@ fn use_key_on_teleporter_and_machine_and_corpse() {
     let take = frames.iter().find(|(_, _, f)| f.payload[..4] == 0x5469373fu32.to_be_bytes()).unwrap();
     assert_eq!(take.2.payload, inventory::move_item_to_inventory(OWN, Identity { kind: 0x6a, instance: 0 }, 0x6f));
 }
+
+#[test]
+fn npc_trade_with_aleksei_innokenti() {
+    use ao_net::n3::knubot as kb;
+    let (npc, own) = (Identity { kind: 50000, instance: 1003065 }, Identity { kind: 50000, instance: OWN });
+    let mut seen = vec![];
+    for (_, from_server, f) in load(include_str!("../../../docs/captures/zone_npc_trade_ithaca.rec")) {
+        if !from_server {
+            // the client's messages (the client never reads them, so they are compared with the senders: `NPCChatStartTrade` has an empty text)
+            let sent = [kb::open_chat_window(own, npc), kb::start_trade(own, npc), kb::trade_item(own, npc, 0, inventory::item_identity(0x46)), kb::end_trade(own, npc, 0, true)];
+            assert!(sent.contains(&f.payload), "{:02x?}", f.payload);
+            continue;
+        }
+        let m = n3::decode(&f).unwrap();
+        let N3::Knubot(k) = m.body else { panic!("{:?}", m.body) };
+        assert_eq!(k.npc(), npc);
+        let mut again = k.encode(m.header.target);
+        again[12] = m.header.flag;
+        assert_eq!(again, f.payload, "{k:?}");
+        seen.push(k);
+    }
+    // the server's side: the trade button is enabled by `b21`, `StartTrade` text, the NPC refuses the item (`RejectedItems`)
+    assert!(seen.iter().any(|k| matches!(k, Knubot::Open { b21: true, .. })));
+    assert!(seen.iter().any(|k| matches!(k, Knubot::StartTrade { text, value: 1, .. } if text == "Place your items in the trade window.")));
+    let rej = seen.iter().find_map(|k| if let Knubot::RejectedItems { items, value, .. } = k { Some((items.clone(), *value)) } else { None }).unwrap();
+    assert_eq!(rej, (vec![(Identity { kind: 116697, instance: 116697 }, 3, 1234567890)], 0));
+}
