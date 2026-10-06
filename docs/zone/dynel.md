@@ -137,6 +137,65 @@ is a page index: `FUN_100480fc` [GC] stores entry `e` at `dynel->cloth[(e.page *
 the DisplaySystem strings `Attractor01_head`, `Attractor02_righthand`, `Attractor03_lefthand`, … (place = number − 1) in all captured cases; the last
 `u8` (4 head, 2 weapon, 0 light) is unresolved.
 
+#### ICC pink-appearance investigation (2026-10-06)
+
+The reported target is not identified by the retained capture: NpcChatLinks observed an
+unidentified humanoid 5–10 m ahead-left of the ICC 4582 shuttle wreck, facing southwest,
+with vivid magenta oval/circular clusters along its left forearm/side. Right-click returned
+the player-trade range refusal. Its owned screenshots were inspected then deleted; no
+target identity, position, or appearance packet was retained. This observation is a
+rendering mismatch report, **not evidence that a particular texture is missing**, and no
+colour substitution is justified from it.
+
+A read-only wire/RDB survey decoded the cloth/texture/attractor portions of **144**
+`SimpleCharFullUpdate` packets: `zone_ithaca.rec` 81, `zone_enter_ithaca.rec` 22,
+`zone_newchar_ithaca.rec` 21, `zone_kill_ithaca.rec` 14, `zone_death_borealis.rec` 4,
+`zone_fight_ithaca.rec` 1, and `zone_antonio_shop_ithaca.rec` 1. All **93** distinct positive
+wire texture IDs resolve in installed `rdb_1010004`; all **33** distinct positive attractor
+mesh IDs resolve in `rdb_1010001`. Separately delivered head 223820 is not in that attractor
+set. The 33 attachment archives contain **36** distinct image-resource creator references;
+all resolve (all use type 1010004). This rules out absent records for these retained
+wire/attachment references, not for an uncaptured player.
+
+Wire texture IDs (cloth and NPC named overrides):
+`8743,8813,9402,9407,9450,9602,9604,9607,9610,9611,9615,9616,9619,9622,14027,14034,14045,14050,21820,21825,21832,22543,22553,22555,22571,22582,22584,22595,22613,22626,22639,22640,22641,22768,23354,27422,30828,30839,30846,30862,30868,30877,30879,30885,30886,37030,37032,40903,40907,40913,40925,40946,42235,42255,81907,81912,82112,82113,82114,82115,85939,87439,95857,120625,120626,120627,155943,155944,155946,155947,155953,155954,155956,155957,156739,162142,213751,213807,215294,215295,215296,245161,248372,265517,265519,265521,265523,265525,286225,286226,286227,286228,286229`.
+
+Attractor mesh IDs:
+`7777,7796,20091,20110,26163,40103,40116,40117,40118,40130,40158,40247,40267,40624,40627,40628,40629,40637,40639,40648,40660,40666,40681,40687,40700,40710,45772,151995,223940,262556,265793,268617,286446`.
+
+Attachment image creator IDs:
+`5949,10772,16558,16609,16622,17077,17080,17085,17185,17191,17237,17238,17293,17930,17933,17936,18002,40104,40123,40159,40248,40268,40299,40323,40325,40384,41647,45746,99687,99688,149900,223941,264684,265788,268616,286447`.
+
+Extracted Bergdoktor records 27422 (arms), 9402 (hands), and 248372 (body) were inspected:
+the authored art is brown/olive armor with green chroma-key regions, not magenta.
+Renderer missing-texture bindings use white, not a magenta error texture
+(`ao-render/src/lib.rs::Renderer::upload`, `ao-render/src/actors.rs`); the skin/cloth
+compositor uses the retail green key described above. No root cause for the uncaptured
+target has yet been demonstrated. Regression `captured_appearance_resources_resolve_and_decode`
+retains the seven-capture resource audit and checks image decoding plus mounted-mesh
+texture references, including separately delivered heads. It has not been run during this
+investigation; parent verification owns checks and the live reproduction.
+
+The full installed CAT part-table survey found **701** distinct positive base/environment
+image IDs and four absent type-1010004 records: **93022** `piraya_env.png` on model
+93019 `piranha.cir`; **163215** `unicorn_env2.png` on model 246884
+`solitus_male_unicorn-stormtrooper_hooded.cir`; unnamed **8770** on the `hands`
+part of model 264173 `Upgrade_recon_mech_solitus_male.cir`; and unnamed **8773**
+on the `hands` part of hoverbike models 270811, 270853–270857, and 287277.
+These absent records are retained as unresolved resource references, not replaced by
+invented art. No ordinary player body model uses them. The regression also inspects
+the selected captured player/NPC CAT models' base/environment texture references.
+The 144 captured characters select **21** distinct CAT body models
+(`5900,5907,5914,5927,5941,15222,17530,17532,17534,17899,17917,17919,17921,22773,23353,23366,23377,25733,45857,247037,247278`),
+whose **36** distinct positive base/environment image references all resolve.
+A decoded-texel survey (`R > 170`, `B > 170`, `G < 90`, nonzero alpha) found no
+magenta texels in those body images. The same survey of wire and attachment images
+found only eight such texels in head image 40268 `head_opifexmale017.png`, not
+forearm/cloth artwork. All surveyed images decoded after applying the already-supported
+broken PNG prefix repair. This colour threshold is an investigative filter, not a
+rendering rule or replacement heuristic.
+
+
 Full-update head omission is real: `zone_enter_ithaca.rec` contains **Xantarr**, breed 1 / sex 2,
 flags `0x4ac2`, `HeadMesh = 223820`, and an empty attractor list. Do not treat this as a headless
 character. The two retail clear methods differ: `CharacterMesh::ClearAttractors` [DS `0x10071dd0`]

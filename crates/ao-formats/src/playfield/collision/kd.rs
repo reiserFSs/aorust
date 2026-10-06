@@ -58,7 +58,13 @@ struct Rc<'a> {
 
 impl<'a> Rc<'a> {
     fn new(d: &'a [u8]) -> Self {
-        Rc { d, p: 0, range: 1, code: 0, bad: false }
+        Rc {
+            d,
+            p: 0,
+            range: 1,
+            code: 0,
+            bad: false,
+        }
     }
     fn norm(&mut self) {
         if self.range == 0 {
@@ -163,8 +169,16 @@ fn decode_mesh(rc: &mut Rc, min: Q, max: Q) -> Result<Decoded> {
         size[a] = rc.freq((max[a] - org[a] + 1) as u32)? as i32 + 1;
     }
     let to_f = |q: Q, off: i32| [0, 1, 2].map(|a| ((q[a] + off) as f32 + 0.5) * STEP);
-    let (bmin, bmax) = (to_f(org, 0), to_f([0, 1, 2].map(|a| org[a] + size[a] - 1), 0));
-    let mut m = MeshDec { idx: Vec::new(), verts: Vec::new(), org, size };
+    let (bmin, bmax) = (
+        to_f(org, 0),
+        to_f([0, 1, 2].map(|a| org[a] + size[a] - 1), 0),
+    );
+    let mut m = MeshDec {
+        idx: Vec::new(),
+        verts: Vec::new(),
+        org,
+        size,
+    };
     let sparse = rc.bit(3, 2);
     let mut nv = 0usize; // vertices allocated so far (M[10])
     let mut queue: Vec<(u32, u32)> = Vec::new();
@@ -183,7 +197,7 @@ fn decode_mesh(rc: &mut Rc, min: Q, max: Q) -> Result<Decoded> {
         }
         while !queue.is_empty() {
             let e = queue.remove(0);
-                    if sparse != 0 && rc.bit(2, 6) == 0 {
+            if sparse != 0 && rc.bit(2, 6) == 0 {
                 continue;
             }
             let prev = queue.iter().position(|n| n.1 == e.0);
@@ -215,7 +229,9 @@ fn decode_mesh(rc: &mut Rc, min: Q, max: Q) -> Result<Decoded> {
                         m.idx.extend([pi.1 as u16, pi.0 as u16, e.1 as u16]);
                         // remove the larger index first
                         let (hi, lo) = if p > n { (p, n) } else { (n, p) };
-                        if p == n { bail!("degenerate close"); }
+                        if p == n {
+                            bail!("degenerate close");
+                        }
                         queue.remove(hi);
                         queue.remove(lo);
                     }
@@ -238,7 +254,10 @@ fn decode_mesh(rc: &mut Rc, min: Q, max: Q) -> Result<Decoded> {
             let v = m.idx[slot] as u32;
             queue.push((e.0, v));
             queue.push((v, e.1));
-            ensure!(m.idx.len() < 3 * MAX_VOLUME_TRIS && queue.len() < 1 << 16 && !rc.bad, "runaway mesh stream");
+            ensure!(
+                m.idx.len() < 3 * MAX_VOLUME_TRIS && queue.len() < 1 << 16 && !rc.bad,
+                "runaway mesh stream"
+            );
         }
         if rc.bit(0x18, 1) == 0 {
             break;
@@ -257,7 +276,13 @@ fn ctx(m: &MeshDec, a: Option<(u32, u32)>, b: Option<(u32, u32)>) -> u32 {
     let v = |i: u32| m.verts.get(i as usize).copied().unwrap_or([0; 3]);
     let (ab, aa, bb) = (v(a.1), v(a.0), v(b.1));
     // 32 bit wrapping arithmetic like the x86 code (cells up to hundreds of metres overflow it)
-    let d: i32 = (0..3).fold(0i32, |s, k| s.wrapping_add(bb[k].wrapping_sub(ab[k]).wrapping_mul(aa[k].wrapping_sub(ab[k]))));
+    let d: i32 = (0..3).fold(0i32, |s, k| {
+        s.wrapping_add(
+            bb[k]
+                .wrapping_sub(ab[k])
+                .wrapping_mul(aa[k].wrapping_sub(ab[k])),
+        )
+    });
     match d {
         0 => 0x61,
         d if d > 0 => 0xa7,
@@ -266,8 +291,19 @@ fn ctx(m: &MeshDec, a: Option<(u32, u32)>, b: Option<(u32, u32)>) -> u32 {
 }
 
 /// Cursor over the node section (`FUN_1002eefc`): the tree is only validated.
-fn read_nodes(rc: &mut Rc, nvol: u32, min: Q, max: Q, count: &mut usize, budget: usize, depth: usize) -> Result<()> {
-    ensure!(*count < budget && depth < MAX_DEPTH && !rc.bad, "more BSP nodes than announced");
+fn read_nodes(
+    rc: &mut Rc,
+    nvol: u32,
+    min: Q,
+    max: Q,
+    count: &mut usize,
+    budget: usize,
+    depth: usize,
+) -> Result<()> {
+    ensure!(
+        *count < budget && depth < MAX_DEPTH && !rc.bad,
+        "more BSP nodes than announced"
+    );
     *count += 1;
     if rc.bit(1, 1) == 0 {
         let axis = rc.freq(3)? as usize;
@@ -299,25 +335,51 @@ fn read_nodes(rc: &mut Rc, nvol: u32, min: Q, max: Q, count: &mut usize, budget:
 pub fn parse_v5(d: &[u8]) -> Result<Surface> {
     let mut rc = Rc::new(d);
     rc.freq(0xf)?;
-    let count = |rc: &mut Rc| -> Result<u32> { Ok(if rc.bit(1, 1) == 0 { rc.freq(100)? } else { rc.freq(1_000_000)? + 100 }) };
+    let count = |rc: &mut Rc| -> Result<u32> {
+        Ok(if rc.bit(1, 1) == 0 {
+            rc.freq(100)?
+        } else {
+            rc.freq(1_000_000)? + 100
+        })
+    };
     let nvol = count(&mut rc)?;
     let mut s = Surface::default();
     if nvol != 0 {
         let nnodes = count(&mut rc)?;
         // the largest record of the client has 4165 volumes / 8051 nodes
-        ensure!(nvol <= 1 << 16 && nnodes <= 1 << 17, "implausible surface size {nvol}/{nnodes}");
+        ensure!(
+            nvol <= 1 << 16 && nnodes <= 1 << 17,
+            "implausible surface size {nvol}/{nnodes}"
+        );
         let mut b = [0i32; 6];
         for v in &mut b {
             *v = rc.freq(0x100_0000)? as i32 - 0x80_0000;
         }
         let (min, max) = ([b[0], b[1], b[2]], [b[3], b[4], b[5]]);
-            let mut budget = 2_000_000usize;
+        let mut budget = 2_000_000usize;
         for _ in 0..nvol {
             let (idx, verts, bmin, bmax) = decode_mesh(&mut rc, min, max)?;
-            budget = budget.checked_sub(idx.len() / 3).context("implausible triangle count")?;
+            budget = budget
+                .checked_sub(idx.len() / 3)
+                .context("implausible triangle count")?;
             let nv = idx.iter().map(|&i| i as usize + 1).max().unwrap_or(0);
-            ensure!(nv <= verts.len() && idx.len() % 3 == 0 && idx.len() / 3 < 1000, "bad volume ({} idx, {} verts)", idx.len(), verts.len());
-            s.volumes.push(Volume { min: bmin, max: bmax, verts: verts[..nv].to_vec(), tris: idx.as_chunks::<3>().0.iter().map(|t| t.map(u32::from)).collect() });
+            ensure!(
+                nv <= verts.len() && idx.len() % 3 == 0 && idx.len() / 3 < 1000,
+                "bad volume ({} idx, {} verts)",
+                idx.len(),
+                verts.len()
+            );
+            s.volumes.push(Volume {
+                min: bmin,
+                max: bmax,
+                verts: verts[..nv].to_vec(),
+                tris: idx
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|t| t.map(u32::from))
+                    .collect(),
+            });
         }
         ensure!(rc.freq(0xff)? == 0x5a, "KD tree marker 0x5a missing");
         let mut n = 0;
@@ -340,7 +402,10 @@ pub fn parse_v5(d: &[u8]) -> Result<Surface> {
         let lo = rc.freq(0x10000)?;
         s.portal_dest = Some(hi << 16 | lo);
     }
-    ensure!(rc.freq(0xfe)? == 0x79 && !rc.bad, "KD record end marker 0x79 missing");
+    ensure!(
+        rc.freq(0xfe)? == 0x79 && !rc.bad,
+        "KD record end marker 0x79 missing"
+    );
     Ok(s)
 }
 
@@ -370,12 +435,26 @@ impl Cur<'_> {
 fn kd_file(c: &mut Cur) -> Result<Vec<Volume>> {
     // `BinaryStream >> char*`: NUL terminated
     let start = c.o;
-    let name_len = c.d[start..].iter().position(|&b| b == 0).context("KD name")?;
-    ensure!(&c.d[start..start + name_len] == b"KDTreeFile", "not a KDTreeFile");
+    let name_len = c.d[start..]
+        .iter()
+        .position(|&b| b == 0)
+        .context("KD name")?;
+    ensure!(
+        &c.d[start..start + name_len] == b"KDTreeFile",
+        "not a KDTreeFile"
+    );
     c.o += name_len + 1;
-    let (nvol, nnodes, version, nverts) = (c.u32()? as usize, c.u32()? as usize, c.u32()?, c.u32()? as usize);
+    let (nvol, nnodes, version, nverts) = (
+        c.u32()? as usize,
+        c.u32()? as usize,
+        c.u32()?,
+        c.u32()? as usize,
+    );
     ensure!(version == 3, "KDTreeFile version {version}");
-    ensure!(nvol < 1 << 20 && nverts < 1 << 24 && nnodes < 1 << 22, "implausible KD sizes");
+    ensure!(
+        nvol < 1 << 20 && nverts < 1 << 24 && nnodes < 1 << 22,
+        "implausible KD sizes"
+    );
     let first = c.f32()?;
     let mut v = vec![[0f32; 3]; nverts];
     // `_DAT_100413d4` (-99999.0) as the first float marks raw float vertices (axis-major arrays), otherwise it is the
@@ -414,7 +493,12 @@ fn kd_file(c: &mut Cur) -> Result<Vec<Volume>> {
             idx.push(i);
         }
         tris.extend(idx.as_chunks::<3>().0.iter().copied());
-        vols.push(Volume { min, max, verts: Vec::new(), tris });
+        vols.push(Volume {
+            min,
+            max,
+            verts: Vec::new(),
+            tris,
+        });
     }
     // volumes address the shared vertex array: localise
     for vol in &mut vols {
@@ -441,7 +525,13 @@ fn kd_file(c: &mut Cur) -> Result<Vec<Volume>> {
             walk(c, nvol, nodes, depth + 1)?;
             walk(c, nvol, nodes, depth + 1)
         } else {
-            let w = if nvol < 0x100 { 1 } else if nvol < 0x10000 { 2 } else { 4 };
+            let w = if nvol < 0x100 {
+                1
+            } else if nvol < 0x10000 {
+                2
+            } else {
+                4
+            };
             c.take(cnt * w).map(|_| ())
         }
     }
@@ -459,7 +549,8 @@ pub fn parse_v4(d: &[u8]) -> Result<Surface> {
     let size = u32::from_le_bytes(d[..4].try_into().unwrap()) as usize;
     ensure!(size <= 4_000_000, "KD record too large");
     let mut raw = Vec::with_capacity(size);
-    std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&d[4..]), &mut raw).context("inflating KD record")?;
+    std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&d[4..]), &mut raw)
+        .context("inflating KD record")?;
     ensure!(raw.len() == size, "inflated size {} != {size}", raw.len());
     let mut c = Cur { d: &raw, o: 0 };
     let a = c.u32()?;
@@ -494,7 +585,9 @@ mod tests {
     use super::*;
 
     fn hex(s: &str) -> Vec<u8> {
-        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
     }
 
     /// Real version 4 record 296486101 (playfield 4524 zone 1237): one volume, 5 vertices, 6 triangles.
@@ -507,8 +600,14 @@ mod tests {
         assert_eq!((v.verts.len(), v.tris.len()), (5, 6));
         assert_eq!(v.tris[0], [0, 1, 2]);
         assert!((v.verts[0][0] - 1882.352).abs() < 1e-2 && (v.verts[4][1] - 54.538).abs() < 1e-2);
-        assert!(v.verts.iter().all(|p| (0..3).all(|k| p[k] >= v.min[k] - 1e-2 && p[k] <= v.max[k] + 1e-2)));
-        assert!(parse(4, &d[..d.len() - 20]).is_err(), "a truncated record is an error");
+        assert!(v
+            .verts
+            .iter()
+            .all(|p| (0..3).all(|k| p[k] >= v.min[k] - 1e-2 && p[k] <= v.max[k] + 1e-2)));
+        assert!(
+            parse(4, &d[..d.len() - 20]).is_err(),
+            "a truncated record is an error"
+        );
     }
 
     /// Real version 5 record 33095760 (playfield 505 zone 80): one volume, 6 triangles; the end markers 0x5a / 0x79 and the
@@ -520,12 +619,22 @@ mod tests {
         assert_eq!((s.volumes.len(), s.nodes), (1, 1));
         let v = &s.volumes[0];
         assert_eq!(v.tris.len(), 6);
-        assert!(v.tris.iter().flatten().all(|&i| (i as usize) < v.verts.len()));
-        assert!(v.verts.iter().all(|p| (0..3).all(|k| p[k] >= v.min[k] - 1e-2 && p[k] <= v.max[k] + 1e-2)));
+        assert!(v
+            .tris
+            .iter()
+            .flatten()
+            .all(|&i| (i as usize) < v.verts.len()));
+        assert!(v
+            .verts
+            .iter()
+            .all(|p| (0..3).all(|k| p[k] >= v.min[k] - 1e-2 && p[k] <= v.max[k] + 1e-2)));
         // a flipped byte desynchronises the stream: an error or a different mesh, never the same one
         let mut bad = d.clone();
         bad[3] ^= 0x40;
-        assert!(parse(5, &bad).map_or(true, |b| b.volumes.first().is_none_or(|w| w.verts != v.verts)));
+        assert!(parse(5, &bad).map_or(true, |b| b
+            .volumes
+            .first()
+            .is_none_or(|w| w.verts != v.verts)));
     }
 
     /// Arbitrary bytes never panic (malformed records are `Err`).
@@ -533,7 +642,9 @@ mod tests {
     fn kd_garbage_never_panics() {
         // arbitrary bytes must never panic: either an Err or a (meaningless) Ok
         for seed in 0u32..200 {
-            let d: Vec<u8> = (0..64).map(|i| (seed.wrapping_mul(2654435761).wrapping_add(i * 40503) >> 7) as u8).collect();
+            let d: Vec<u8> = (0..64)
+                .map(|i| (seed.wrapping_mul(2654435761).wrapping_add(i * 40503) >> 7) as u8)
+                .collect();
             let _ = parse_v5(&d);
             let _ = parse_v4(&d);
         }

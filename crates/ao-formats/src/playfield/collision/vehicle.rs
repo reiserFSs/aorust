@@ -51,7 +51,12 @@ pub struct Body {
 
 impl Body {
     /// A walking character standing on the ground.
-    pub const WALKING: Body = Body { falling_enabled: true, airborne: false, vy: 0.0, teleport: false };
+    pub const WALKING: Body = Body {
+        falling_enabled: true,
+        airborne: false,
+        vy: 0.0,
+        teleport: false,
+    };
 }
 
 /// What the liquid medium state machine asks the vehicle's owner to do (`Vehicle_t` vtable `+0x80` / `+0x84`): the player
@@ -169,7 +174,13 @@ const SUBMERGE: f32 = 0.1;
 /// (`st.medium`): returns the feet height, or `None` when the whole step is undone (modes 1 and 3 refuse the liquid).
 /// `level` is the liquid surface of the closest-point query (`m_vLiquidHeight`), `ground` its height; `depth = level - ground`
 /// is the water over the ground, `deep` means above `Vehicle+0x100`. The owner's callbacks are reported through `st.event`.
-pub(super) fn medium(st: &mut SurfaceState, body: &Body, feet: f32, level: f32, ground: f32) -> Option<f32> {
+pub(super) fn medium(
+    st: &mut SurfaceState,
+    body: &Body,
+    feet: f32,
+    level: f32,
+    ground: f32,
+) -> Option<f32> {
     let depth = level - ground;
     let deep = depth > st.wade_depth;
     let falling = body.falling_enabled;
@@ -196,7 +207,11 @@ pub(super) fn medium(st: &mut SurfaceState, body: &Body, feet: f32, level: f32, 
             if !deep {
                 leave(st);
                 // wading: stay on the ground under the water
-                Some(if body.vy <= LAND_VY && falling { level - depth + FOOT_CLEARANCE } else { feet })
+                Some(if body.vy <= LAND_VY && falling {
+                    level - depth + FOOT_CLEARANCE
+                } else {
+                    feet
+                })
             } else {
                 swim(st);
                 Some(feet.max(level - FLOAT_OFFSET))
@@ -279,14 +294,30 @@ impl Terrain {
         let c = tm.cell_size;
         let (x0, z0) = (ix as f32 * c, iz as f32 * c);
         let h = |dx: usize, dz: usize| tm.height(ix + dx, iz + dz);
-        let p = [[x0, h(0, 0), z0], [x0 + c, h(1, 0), z0], [x0 + c, h(1, 1), z0 + c], [x0, h(0, 1), z0 + c]];
-        let sel = if ((!iz) ^ ix) & 1 == 0 { [[1, 2, 3], [0, 1, 3]] } else { [[0, 2, 3], [0, 1, 2]] };
+        let p = [
+            [x0, h(0, 0), z0],
+            [x0 + c, h(1, 0), z0],
+            [x0 + c, h(1, 1), z0 + c],
+            [x0, h(0, 1), z0 + c],
+        ];
+        let sel = if ((!iz) ^ ix) & 1 == 0 {
+            [[1, 2, 3], [0, 1, 3]]
+        } else {
+            [[0, 2, 3], [0, 1, 2]]
+        };
         sel.map(|[i, j, k]| {
             let mut n = cross(sub(p[k], p[i]), sub(p[j], p[i]));
             if n[1] < 0.0 {
                 n = neg(n);
             }
-            Tri { a: p[i], b: p[j], c: p[k], n: norm(n), floor: 0, zone: 0 }
+            Tri {
+                a: p[i],
+                b: p[j],
+                c: p[k],
+                n: norm(n),
+                floor: 0,
+                zone: 0,
+            }
         })
     }
 
@@ -296,7 +327,10 @@ impl Terrain {
         let tm = &self.tm;
         let c = tm.cell_size;
         let (w, h) = (tm.cells_x as f32 * c, tm.cells_z as f32 * c);
-        let (lo, hi) = ([a[0].min(b[0]), a[2].min(b[2])], [a[0].max(b[0]), a[2].max(b[2])]);
+        let (lo, hi) = (
+            [a[0].min(b[0]), a[2].min(b[2])],
+            [a[0].max(b[0]), a[2].max(b[2])],
+        );
         if hi[0] < 0.0 || hi[1] < 0.0 || lo[0] >= w || lo[1] >= h {
             return None;
         }
@@ -322,7 +356,12 @@ impl Collision {
     /// limits the KD triangles to the one surface of that zone / room (`tri.zone`); untagged triangles always count.
     fn nearest(&self, a: V, b: V, floors: bool, zone: u32) -> Option<(f32, Hit)> {
         let mut best: Option<(f32, Hit)> = None;
-        for t in self.near_aabb(a[0].min(b[0]), a[2].min(b[2]), a[0].max(b[0]), a[2].max(b[2])) {
+        for t in self.near_aabb(
+            a[0].min(b[0]),
+            a[2].min(b[2]),
+            a[0].max(b[0]),
+            a[2].max(b[2]),
+        ) {
             if (t.floor != 0 && !floors) || (zone != 0 && t.zone != 0 && t.zone != zone) {
                 continue;
             }
@@ -346,7 +385,8 @@ impl Collision {
         let kd = self.nearest(a, b, true, 0);
         let terrain = self.terrain.as_ref().and_then(|t| {
             let w = |p: V| [p[0], p[1], -p[2]];
-            t.seg_hit(w(a), w(b)).map(|(s, p, n)| (s, Hit { p: w(p), n: w(n) }))
+            t.seg_hit(w(a), w(b))
+                .map(|(s, p, n)| (s, Hit { p: w(p), n: w(n) }))
         });
         match (terrain, kd) {
             (Some(t), Some(k)) => Some(if t.0 <= k.0 { t.1 } else { k.1 }),
@@ -371,8 +411,16 @@ impl Collision {
             let dy = p[1] - h;
             if dy >= 0.0 {
                 // `GetSurfaceForCell(GetCellIdFromPos(p))`: only the KD surface of the zone holding the point (first non-null of the cell)
-                let zone = zone::grid_zone(t.tm.cell_size, self.zone_size, t.tm.cells_x, t.tm.cells_z, p) as u32 + 1;
-                if let Some((_, k)) = self.nearest(p, [p[0], p[1] - (dy + 0.3), p[2]], false, zone) {
+                let zone = zone::grid_zone(
+                    t.tm.cell_size,
+                    self.zone_size,
+                    t.tm.cells_x,
+                    t.tm.cells_z,
+                    p,
+                ) as u32
+                    + 1;
+                if let Some((_, k)) = self.nearest(p, [p[0], p[1] - (dy + 0.3), p[2]], false, zone)
+                {
                     if k.p[1] > h {
                         out = (k.p, k.n);
                     }
@@ -384,12 +432,20 @@ impl Collision {
             let (_, k) = self.nearest(p, [p[0], p[1] - 100.0, p[2]], true, 0)?;
             (k.p, k.n)
         } else {
-            let Some(room) = room else { return Some(Closest { pos: [p[0], 0.0, p[2]], normal: [0.0; 3], liquid: NO_LIQUID }) };
+            let Some(room) = room else {
+                return Some(Closest {
+                    pos: [p[0], 0.0, p[2]],
+                    normal: [0.0; 3],
+                    liquid: NO_LIQUID,
+                });
+            };
             let (fy, fnorm) = self.tile_floor(room, p)?;
             // FUN_1002e48e: a KD miss answers y = 0, a room without KD surface leaves -1000
             let kd = match self.nearest(p, [p[0], p[1] - 1.0, p[2]], false, room as u32 + 1) {
                 Some((_, k)) => Some((k.p, k.n)),
-                None if self.kd_zones.contains(&(room as u32 + 1)) => Some(([p[0], 0.0, p[2]], [0.0, 1.0, 0.0])),
+                None if self.kd_zones.contains(&(room as u32 + 1)) => {
+                    Some(([p[0], 0.0, p[2]], [0.0, 1.0, 0.0]))
+                }
                 None => None,
             };
             match kd {
@@ -407,12 +463,18 @@ impl Collision {
         if self.rooms.is_some() {
             pos[1] = pos[1].clamp(0.001, 1999.9);
         }
-        Some(Closest { pos, normal, liquid: level })
+        Some(Closest {
+            pos,
+            normal,
+            liquid: level,
+        })
     }
 
     /// Dungeon tile floor plane of `room` under `p` (the ray from `y + 100` down onto the two tile triangles).
     fn tile_floor(&self, room: usize, p: V) -> Option<(f32, V)> {
-        self.near(p[0], p[2]).find(|t| t.floor as usize == room + 1 && t.contains_xz(p[0], p[2])).map(|t| (t.y_at(p[0], p[2]), t.n))
+        self.near(p[0], p[2])
+            .find(|t| t.floor as usize == room + 1 && t.contains_xz(p[0], p[2]))
+            .map(|t| (t.y_at(p[0], p[2]), t.n))
     }
 
     /// `PlayfieldAnarchy_t::IsDynelRoomTransitionAllowed` (Gamecode @0x10122371, playfield vtable +0x38) for a character
@@ -428,7 +490,14 @@ impl Collision {
             return false;
         }
         let key = |a: i32, b: i32| (a.min(b) as u16, a.max(b) as u16);
-        let doors = |i: i32| r.rooms[i as usize].0.door_zones.iter().map(|&z| z as i16 as i32).filter(move |&z| z >= 0 && z != i && (z as usize) < r.rooms.len());
+        let doors = |i: i32| {
+            r.rooms[i as usize]
+                .0
+                .door_zones
+                .iter()
+                .map(|&z| z as i16 as i32)
+                .filter(move |&z| z >= 0 && z != i && (z as usize) < r.rooms.len())
+        };
         let mut path: Vec<(u16, u16)> = Vec::new();
         if r.links.contains(&key(from, to)) {
             path.push(key(from, to));
@@ -472,7 +541,13 @@ impl Collision {
         let frac = |v: f32| {
             let f = (v as f64).floor();
             let v = v as f64;
-            if v < f + 0.01 { (f + 0.01) as f32 } else if f + 0.99 < v { (f + 0.99) as f32 } else { v as f32 }
+            if v < f + 0.01 {
+                (f + 0.01) as f32
+            } else if f + 0.99 < v {
+                (f + 0.99) as f32
+            } else {
+                v as f32
+            }
         };
         p[0] = frac(p[0]).clamp(0.1, 7999.9);
         p[2] = -frac(-p[2]).clamp(0.1, 7999.9);
@@ -493,7 +568,11 @@ impl Collision {
             // back to the last allowed position, pushed `0.1 * R / 2` away from the wall: along `last - p` (normalised), from a
             // standstill along the body's backwards vector (scene z is mirrored); a nudge that leaves every room goes the other way
             let to_last = sub(st.last, *p);
-            let dir = if is_zero(to_last) { [-st.heading.sin(), 0.0, st.heading.cos()] } else { norm(to_last) };
+            let dir = if is_zero(to_last) {
+                [-st.heading.sin(), 0.0, st.heading.cos()]
+            } else {
+                norm(to_last)
+            };
             let nudge = scale([dir[0] * 0.1, 0.0, dir[2] * 0.1], st.radius / 2.0);
             *p = add(st.last, nudge);
             if self.room_at(*p, -1).is_none() {
@@ -513,7 +592,14 @@ impl Collision {
     /// `n3Playfield_t::CreatePlayfieldFromResource` (@0x1000e006) from the resource's `+0x4c`, which `RDBPlayfield_t` zeroes in its
     /// constructor (@0x1001bf0e) and `ReadBlob` never writes: room 0. Not the last allowed position. See [`room_safe_pos`].
     fn safe_pos(&self) -> V {
-        self.rooms.as_ref().and_then(|r| r.rooms.first().map(|(room, min_floor)| super::room_safe_pos(&r.gnda, room, *min_floor))).unwrap_or([0.0; 3])
+        self.rooms
+            .as_ref()
+            .and_then(|r| {
+                r.rooms
+                    .first()
+                    .map(|(room, min_floor)| super::room_safe_pos(&r.gnda, room, *min_floor))
+            })
+            .unwrap_or([0.0; 3])
     }
 
     /// `Vehicle_t::EnsureSurfaceAlignment` (Vehicle.dll @0x1000d1aa) for one integration step `old -> new` (feet positions):
@@ -524,7 +610,11 @@ impl Collision {
     /// orientation modes 1/3/4 (body tilt), `Vehicle+0x13c` (steep slopes allowed, 0 for characters).
     pub fn align(&self, old: V, new: V, body: &Body, st: &mut SurfaceState) -> Aligned {
         st.event = None;
-        let flag = if !body.falling_enabled || body.airborne || body.teleport { 1.0 } else { 0.0 };
+        let flag = if !body.falling_enabled || body.airborne || body.teleport {
+            1.0
+        } else {
+            0.0
+        };
         // veto loop: back off along the step in tenths until the position is accepted
         let mut cur = new;
         let step = scale(sub(cur, old), 0.1);
@@ -545,11 +635,33 @@ impl Collision {
                 c = add([delta[0], delta[1] * flag, delta[2]], c);
             } else {
                 let mut h = hlen(delta);
-                let mut t = if flag <= 0.0 && h >= 1e-6 { 10000.0 } else { len2(delta).sqrt() };
+                let mut t = if flag <= 0.0 && h >= 1e-6 {
+                    10000.0
+                } else {
+                    len2(delta).sqrt()
+                };
                 let mut dir = [delta[0], delta[1] * flag, delta[2]];
-                dir = if is_zero(dir) { [0.0, -1.0, 0.0] } else { norm(dir) };
-                let slope = if body.falling_enabled { super::MIN_FLOOR_NY } else { -1.0 };
-                self.sweep(&mut c, RADIUS, dir, &mut h, &mut t, &mut max_y, if body.falling_enabled { 3 } else { 1 }, ITERATIONS, slope);
+                dir = if is_zero(dir) {
+                    [0.0, -1.0, 0.0]
+                } else {
+                    norm(dir)
+                };
+                let slope = if body.falling_enabled {
+                    super::MIN_FLOOR_NY
+                } else {
+                    -1.0
+                };
+                self.sweep(
+                    &mut c,
+                    RADIUS,
+                    dir,
+                    &mut h,
+                    &mut t,
+                    &mut max_y,
+                    if body.falling_enabled { 3 } else { 1 },
+                    ITERATIONS,
+                    slope,
+                );
             }
         }
         if max_y < c[1] {
@@ -557,26 +669,49 @@ impl Collision {
         }
         let (x, z) = (c[0], c[2]);
         let mut feet = c[1] - super::RAY_LIFT;
-        let cp = self.closest([x, feet, z], st.room).unwrap_or(Closest { pos: [0.0; 3], normal: [0.0; 3], liquid: NO_LIQUID });
+        let cp = self.closest([x, feet, z], st.room).unwrap_or(Closest {
+            pos: [0.0; 3],
+            normal: [0.0; 3],
+            liquid: NO_LIQUID,
+        });
         // mode 4 (hover) keeps 0.25 m (f64 @0x100127e8) instead of 0.01 over the closest point
-        let clearance = if st.medium == 4 { HOVER_CLEARANCE } else { FOOT_CLEARANCE };
+        let clearance = if st.medium == 4 {
+            HOVER_CLEARANCE
+        } else {
+            FOOT_CLEARANCE
+        };
         if feet < cp.pos[1] + clearance {
             feet = cp.pos[1] + clearance;
         }
-        max_y = if body.teleport { feet + 1.0 } else { max_y.max(feet) };
+        max_y = if body.teleport {
+            feet + 1.0
+        } else {
+            max_y.max(feet)
+        };
         let mut tol = super::STEP_HEIGHT;
         if body.falling_enabled && !body.airborne && !body.teleport {
             tol = (hlen(delta) * STEP_TOL_SLOPE + 0.48).min(max_y);
         }
         // three ground rays, 0.04 m apart, from the highest point of the sweep (+0.4 m while falling is enabled) down to y = 0
-        let from_y = max_y + if body.falling_enabled { super::RAY_LIFT } else { 0.0 };
+        let from_y = max_y
+            + if body.falling_enabled {
+                super::RAY_LIFT
+            } else {
+                0.0
+            };
         let s2 = std::f32::consts::FRAC_1_SQRT_2;
         let mut pts = [[0.0; 3]; 3];
-        for (pt, d) in pts.iter_mut().zip([[1.0, 0.0, 0.0], [-s2, 0.0, s2], [-s2, 0.0, -s2]]) {
+        for (pt, d) in pts
+            .iter_mut()
+            .zip([[1.0, 0.0, 0.0], [-s2, 0.0, s2], [-s2, 0.0, -s2]])
+        {
             let (dx, dz) = (d[0] * RAY_SPREAD, d[2] * RAY_SPREAD);
-            *pt = self.line([x + dx, from_y, z + dz], [x + dx, 0.0, z + dz]).map_or([x + dx, 0.0, z + dz], |h| h.p);
+            *pt = self
+                .line([x + dx, from_y, z + dz], [x + dx, 0.0, z + dz])
+                .map_or([x + dx, 0.0, z + dz], |h| h.p);
         }
-        let mut normal = unit(cross(sub(pts[1], pts[0]), sub(pts[2], pts[0]))).unwrap_or([0.0, 1.0, 0.0]);
+        let mut normal =
+            unit(cross(sub(pts[1], pts[0]), sub(pts[2], pts[0]))).unwrap_or([0.0, 1.0, 0.0]);
         if normal[1] < 0.0 {
             normal = neg(normal);
         }
@@ -611,13 +746,22 @@ impl Collision {
         }
         let mut pos = [x, feet, z];
         self.veto(&mut pos, st);
-        Aligned { pos, airborne, normal, liquid: cp.liquid }
+        Aligned {
+            pos,
+            airborne,
+            normal,
+            liquid: cp.liquid,
+        }
     }
 
     /// A walking step on the ground: [`Collision::align`] with a standing [`Body`] and fresh state seeded with the room of
     /// `from` (tests and the autopilot; the movement code keeps its own state).
     pub fn walk(&self, from: V, to: V) -> Aligned {
-        let mut st = SurfaceState { room: self.room_at(from, -1).map_or(-1, |i| i as i32), last: from, ..SurfaceState::default() };
+        let mut st = SurfaceState {
+            room: self.room_at(from, -1).map_or(-1, |i| i as i32),
+            last: from,
+            ..SurfaceState::default()
+        };
         self.align(from, to, &Body::WALKING, &mut st)
     }
 
@@ -634,7 +778,18 @@ impl Collision {
     /// 5. unless the contact is head-on (or reversed), the new heading is the tangent `(nc x n) x n` of the contact normal
     ///    `nc = normalize(p - hp)`, kept only if it still points along `dir`.
     #[allow(clippy::too_many_arguments)]
-    fn sweep(&self, p: &mut V, r: f32, dir: V, h: &mut f32, t: &mut f32, max_y: &mut f32, mode: u8, mut iters: u32, slope: f32) {
+    fn sweep(
+        &self,
+        p: &mut V,
+        r: f32,
+        dir: V,
+        h: &mut f32,
+        t: &mut f32,
+        max_y: &mut f32,
+        mode: u8,
+        mut iters: u32,
+        slope: f32,
+    ) {
         let mut q = add(*p, scale(dir, AIM));
         // moves `p` by `mv` within the budgets; `false` when a budget ran out (the sweep ends)
         let advance = |p: &mut V, mv: V, h: &mut f32, t: &mut f32, max_y: &mut f32| -> bool {
@@ -701,13 +856,18 @@ impl Collision {
                     if is_zero(off) {
                         return;
                     }
-                    let Some(x) = self.line(add(*p, off), add(q, off)) else { return };
+                    let Some(x) = self.line(add(*p, off), add(q, off)) else {
+                        return;
+                    };
                     let dn = dot(d, x.n);
                     if dot(norm(off), x.n) > 0.0 || dn == 0.0 {
                         return;
                     }
                     let t = dot(sub(x.p, *p), x.n) / dn;
-                    *hit = Some(Hit { p: add(*p, scale(d, t)), n: x.n });
+                    *hit = Some(Hit {
+                        p: add(*p, scale(d, t)),
+                        n: x.n,
+                    });
                 };
                 side(a, &mut hit_a, p);
                 side(b, &mut hit_b, p);
@@ -737,7 +897,10 @@ impl Collision {
             let (mut n, mut reff) = (n0, r);
             if d[1] > 0.0 && n0[1] < slope {
                 reff = n0[1] * n0[1] * r + r;
-                n = if n0[1] <= -0.99 || len2(n0) <= 0.001 || (n0[0].abs() <= 0.001 && n0[2].abs() <= 0.001) {
+                n = if n0[1] <= -0.99
+                    || len2(n0) <= 0.001
+                    || (n0[0].abs() <= 0.001 && n0[2].abs() <= 0.001)
+                {
                     neg(d)
                 } else {
                     norm([n0[0], 0.0, n0[2]])
@@ -747,10 +910,18 @@ impl Collision {
             let cos = dot(back, n).abs();
             let to_hit = len2(sub(hp, *p));
             let target = if cos <= 0.0 {
-                if to_hit > r * r { add(hp, scale(back, r)) } else { *p }
+                if to_hit > r * r {
+                    add(hp, scale(back, r))
+                } else {
+                    *p
+                }
             } else {
                 let tt = reff / cos;
-                if tt * tt <= to_hit { add(hp, scale(back, tt)) } else { *p }
+                if tt * tt <= to_hit {
+                    add(hp, scale(back, tt))
+                } else {
+                    *p
+                }
             };
             if target != *p && !advance(p, sub(target, *p), h, t, max_y) {
                 return;

@@ -102,6 +102,8 @@ enum Bg {
     World(u32, Result<Box<Scene>, String>),
     /// The live sky source of playfield `id` (`None`: indoor / no tweak script), sent just before its [`Bg::World`].
     Sky(u32, Option<ao_formats::playfield::SkyClock>),
+    /// Per-frame effect wind, loaded independently of the audio device.
+    Weather(u32, Box<ao_formats::weather::Weather>),
     /// The top-down ground image of playfield `id` for the Map window (`Report::ground` rendered by `topdown::render` from the scene
     /// the loader just built; `bool`: dungeon rooms), sent just before its [`Bg::World`].
     Ground(u32, Option<Box<WorldGround>>),
@@ -207,6 +209,7 @@ struct Play {
     world_ground: Option<(u32, Box<WorldGround>)>,
     /// Live sky of the loading/loaded playfield, installed in the viewer when the world appears.
     world_sky: Option<ao_formats::playfield::SkyClock>,
+    world_weather: Option<ao_formats::weather::Weather>,
     time: f32,
     // character creation / deletion
     /// The delete window kept open below its `MatchError` box (the original's `DialogBox_c::Go` is modal on top of it).
@@ -312,6 +315,7 @@ impl Play {
             world_scene: None,
             world_ground: None,
             world_sky: None,
+            world_weather: None,
             time: 0.0,
             cc: None,
             cc_world: None,

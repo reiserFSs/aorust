@@ -20,7 +20,9 @@ impl Portals {
     /// `n3Zone_t::IsPosInTeleportal` for the zone `zone` and the AO world position `p` (`GetTeleportalArea` then `FUN_1001b21a`).
     /// A zone without a portal answers false.
     pub fn contains(&self, zone: u32, p: [f32; 3]) -> bool {
-        self.zones.get(&zone).is_some_and(|poly| polygon_contains(poly, p))
+        self.zones
+            .get(&zone)
+            .is_some_and(|poly| polygon_contains(poly, p))
     }
 }
 
@@ -46,7 +48,12 @@ mod tests {
     use super::*;
 
     fn quad() -> Vec<[f32; 3]> {
-        vec![[0.0, 5.0, 0.0], [10.0, 5.0, 0.0], [10.0, 5.0, 10.0], [0.0, 5.0, 10.0]]
+        vec![
+            [0.0, 5.0, 0.0],
+            [10.0, 5.0, 0.0],
+            [10.0, 5.0, 10.0],
+            [0.0, 5.0, 10.0],
+        ]
     }
 
     #[test]
@@ -54,7 +61,10 @@ mod tests {
         let q = quad();
         assert!(polygon_contains(&q, [5.0, -100.0, 5.0]));
         assert!(polygon_contains(&q, [0.5, 0.0, 9.5]));
-        assert!(!polygon_contains(&q, [11.0, 5.0, 5.0]), "right of the polygon: no crossing at greater x");
+        assert!(
+            !polygon_contains(&q, [11.0, 5.0, 5.0]),
+            "right of the polygon: no crossing at greater x"
+        );
         assert!(!polygon_contains(&q, [5.0, 5.0, 10.5]));
         assert!(!polygon_contains(&q, [5.0, 5.0, -0.5]));
         assert!(!polygon_contains(&[], [0.0, 0.0, 0.0]));
@@ -63,7 +73,16 @@ mod tests {
     #[test]
     fn concave_polygon_counts_both_arms() {
         // U shape opening towards +z: the notch (x 4..6, z 4..10) is outside
-        let u = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 10.0], [6.0, 0.0, 10.0], [6.0, 0.0, 4.0], [4.0, 0.0, 4.0], [4.0, 0.0, 10.0], [0.0, 0.0, 10.0]];
+        let u = vec![
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [10.0, 0.0, 10.0],
+            [6.0, 0.0, 10.0],
+            [6.0, 0.0, 4.0],
+            [4.0, 0.0, 4.0],
+            [4.0, 0.0, 10.0],
+            [0.0, 0.0, 10.0],
+        ];
         assert!(polygon_contains(&u, [2.0, 0.0, 8.0]));
         assert!(polygon_contains(&u, [8.0, 0.0, 8.0]));
         assert!(!polygon_contains(&u, [5.0, 0.0, 8.0]));
