@@ -33,7 +33,8 @@ use super::zone::{scene_pos, scene_yaw};
 
 /// Identity kind of character / NPC dynels (`SimpleChar_t`).
 const CHAR_KIND: i32 = 0xC350;
-/// Characters farther than this (metres) are not drawn (about the fog distance of the outdoor playfields).
+/// Props (non-character dynels) farther than this (metres) are not drawn (about the fog distance of the outdoor playfields; a guess:
+/// the client draws them up to the far plane). Characters use `Dynels::char_view_distance`.
 pub const DRAW_DISTANCE: f32 = 250.0;
 /// `ShowAllNames` name tags exist for dynels within this radius of the player (`GetDynelsInVicinity`, docs/zone/motion.md §6).
 pub const NAME_TAG_RADIUS: f32 = 30.0;
@@ -520,6 +521,9 @@ pub struct Dynels {
     pub show_all_names: bool,
     /// Lens of the playfield scene (projection of the name tags).
     pub lens: Lens,
+    /// `DisplayCharViewDistance` in metres (default 80, `FUN_1001f964` N3 0x1001f964; docs/chat/dvalue.md): characters farther from the
+    /// viewer are not drawn (`n3VisualDynel_t::Run`, N3 0x100196bd: squared distance to the controlled dynel on ground playfields).
+    pub char_view_distance: f32,
     /// The tag sprites held by the renderer and the 2 s nametag listing (`play/tags.rs`).
     tags: TagLayer,
     listing: Listing,
@@ -551,6 +555,7 @@ impl Default for Dynels {
             show_all_names: std::env::var_os("AOMAC_SHOW_ALL_NAMES").is_some(),
             lens: Lens::default(),
             tags: TagLayer::default(),
+            char_view_distance: 80.0,
             listing: Listing::default(),
             rng: CrtRand::new(1),
             sounds: vec![],
@@ -929,7 +934,7 @@ impl Dynels {
             let p = scene_pos(c.pose.pos);
             let (dx, dz) = (p[0] - cam[0], p[2] - cam[2]);
             let dist = (dx * dx + (p[1] - cam[1]).powi(2) + dz * dz).sqrt();
-            if dist > DRAW_DISTANCE {
+            if dist > self.char_view_distance {
                 c.submitted = false;
                 continue;
             }

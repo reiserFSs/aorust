@@ -965,6 +965,10 @@ impl Frontend for Play {
                             Ok(h) => self.hud = Some(h),
                             Err(e) => eprintln!("hud: {e:#}"),
                         }
+                        // `LoadUserConfig` (GUI 0x1006bacd): the account's / character's prefs files over the template defaults
+                        if let (Some(h), Some(d), Some(a)) = (self.hud.as_mut(), super::prefs::dir(), self.prefs.accounts.get(self.prefs.selected_account)) {
+                            h.dvalues.open_user(&d, a, self.zone.char_id);
+                        }
                     }
                     if let (Some(h), Some((id, g))) = (self.hud.as_mut(), self.world_ground.take()) {
                         h.provide_ground(id, g.0, g.1);
@@ -1014,6 +1018,13 @@ impl Frontend for Play {
                 // the server placed the own character again (teleport within the playfield)
                 self.player = player::Player::new(&self.dir, &self.zone, self.zone.playfield.unwrap_or(0));
             }
+            // `ViewDistance` / `DisplayCharViewDistance` (docs/chat/dvalue.md): far plane + fog + statel LOD, characters' draw distance
+            if let Some(h) = self.hud.as_ref() {
+                if let Some(p) = self.player.as_mut() {
+                    p.set_view_distance(h.dvalues.view_distance());
+                }
+                self.zone.world.char_view_distance = h.dvalues.char_view_distance();
+            }
             if let Some(p) = self.player.as_mut() {
                 for f in p.frame(dt, host, &mut self.zone, self.gui.text_focused()) {
                     if let Some(s) = &self.session {
@@ -1058,6 +1069,18 @@ impl Frontend for Play {
                         WindowOp::Toggle => h.toggle(&mut self.gui, k),
                     }
                 }
+            }
+        }
+        // `/option` `/setoption` `/dvalue` `/chardist` `/viewdist` `/char&viewdist` (docs/chat/dvalue.md): the store lives in the HUD
+        if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_mut()) {
+            for t in c.take_dvalue_cmds() {
+                if let Some(outs) = h.dvalues.command(&t) {
+                    c.dvalue_feedback(&mut self.gui, outs);
+                }
+            }
+            // the original saves on a timer (`SlotConfigSaveTimer`); here a change writes the files at once
+            if !h.dvalues.take_changed().is_empty() {
+                h.dvalues.save_user();
             }
         }
         // Friends / Team Search windows follow the HUD's `friends_window` / `lft_window` dvalues (docs/chat/social.md)

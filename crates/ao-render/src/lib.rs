@@ -945,8 +945,19 @@ impl Renderer {
         st.levels = levels;
     }
 
-    /// Replaces the lens of the loaded scene (a camera path that changes the field of view every frame).
+    /// Replaces the lens of the loaded scene (a camera path that changes the field of view every frame, the player camera's `ViewDistance`).
+    /// A far plane also moves the fog end and the statel LOD's view length: the client's `VisualFog_t::AddClipPlanes(near, far)` and
+    /// `VisualCamera_t::GetLengthOfViewcone` (far - near) both come from the camera's planes (docs/chat/dvalue.md).
     pub fn set_lens(&mut self, lens: ao_scene::Lens) {
+        if let Some(far) = lens.far {
+            let near = self.fog.as_ref().map_or(lens.near, |f| f.near);
+            if let Some(f) = &mut self.fog {
+                f.far = far;
+            }
+            if let Some(l) = &mut self.lod {
+                l.lod.view_length = far - near;
+            }
+        }
         self.lens = lens;
     }
 

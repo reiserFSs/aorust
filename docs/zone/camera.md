@@ -131,7 +131,8 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
   passes them to `VisualCamera_t::VisualCamera_t(fov, aspect, near, far)` (stored at `+0x150/+0x154/+0x168/+0x16c`). The `ViewDistance`
   callback (`FUN_1001fc91`, registered with the fire-now flag) replaces far at once by `max(ViewDistance·1000, near + 50)` (pref default 0.8 →
   800 m) and calls `VisualFog_t::AddClipPlanes(near, far)`; the camera is rebuilt with the old pose. `camera::NEAR`, `far_plane`,
-  `camera::lens(base)`; `Player::frame` sets the lens once (near 0.2; far stays the playfield lens' 800 m, which is that formula). The fog
+  `camera::lens(base)`; `Player::frame` sends the lens with `far = far_plane(ViewDistance)` (`/viewdist`, the option panel pref: `Player::set_view_distance`
+  re-sends it; `Renderer::set_lens` moves the fog end and the statel LOD view length with it, docs/chat/dvalue.md §5). The fog
   start `environment::NEAR` (0.5, docs/formats.md) is the fog agent's and is untouched.
 * **Free camera**: the original has none for players. There are GM-only debug cameras (`COMMAND_DEBUG_TOGGLE_CAMERAMODE` = Ctrl+Alt+C, `DEBUG_CAM_*`,
   `[GMLevel1Mode]`) and `COMMAND_TOGGLE_FLYING_MODE_DEBUG` = F7 (GM level). Free-fly in play mode is therefore a debug feature only.

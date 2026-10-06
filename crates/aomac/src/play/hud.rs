@@ -14,6 +14,7 @@ use ao_formats::stats;
 use ao_net::frame::Frame;
 use ao_gui::xml::{self, Element};
 use ao_gui::{Event, Gui, InputEvent, MouseButton, WindowId, WindowSize};
+use super::dvalue::DValues;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -232,27 +233,6 @@ fn template_frames(dir: &Path) -> HashMap<String, [f32; 4]> {
     out
 }
 
-/// `<Value name= value=>` defaults of `cd_image/gui/Default/CharPrefs.xml` and `LoginPrefs.xml` (booleans and numbers only).
-fn default_dvalues(dir: &Path) -> HashMap<String, i64> {
-    let mut out = HashMap::new();
-    for file in ["CharPrefs.xml", "LoginPrefs.xml"] {
-        let Some(root) = std::fs::read_to_string(dir.join("cd_image/gui/Default").join(file)).ok().and_then(|t| xml::parse(&t).ok()) else { continue };
-        for v in root.children.iter().filter(|c| c.name == "Value") {
-            if let (Some(n), Some(val)) = (v.attr("name"), v.attr("value")) {
-                let x = match val.to_ascii_lowercase().as_str() {
-                    "true" => Some(1),
-                    "false" => Some(0),
-                    o => o.parse::<i64>().ok(),
-                };
-                if let Some(x) = x {
-                    out.entry(n.to_string()).or_insert(x);
-                }
-            }
-        }
-    }
-    out
-}
-
 struct Bar {
     window: WindowId,
     spec: &'static BarSpec,
@@ -268,7 +248,8 @@ pub(super) struct Hud {
     /// The full-screen `ControlCenter.xml` window.
     cc: WindowId,
     size: (u32, u32),
-    dvalues: HashMap<String, i64>,
+    /// The distributed-value store (`play/dvalue.rs`): window flags, prefs, `/option` `/dvalue` (docs/chat/dvalue.md).
+    pub(super) dvalues: DValues,
     /// Tooltip titles of the health / nano / XP / alien XP bars (text.mdb category 0x2710).
     bar_titles: [String; 4],
     bars: Vec<Bar>,
@@ -310,8 +291,8 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: default_dvalues(dir), bars: vec![], bar_titles, menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, map: HudMap::new(dir), target, shortcuts: vec![], compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
-        hud.target.targets_target = hud.dvalues.get("Targetstarget").is_some_and(|v| *v != 0);
+        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, map: HudMap::new(dir), target, shortcuts: vec![], compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
+        hud.target.targets_target = hud.dvalues.flag("Targetstarget");
         hud.fill_docks(gui);
         hud.create_bars(gui, dir);
         for n in 0..hud_bar::default_count(&hud.dvalues) {
@@ -463,7 +444,7 @@ impl Hud {
 
     fn res<'a>(&'a self, zone: &'a Zone) -> impl Fn(&str, &str) -> Option<i64> + 'a {
         move |kind, name| match kind {
-            "dvalue" => self.dvalues.get(name).copied(),
+            "dvalue" => self.dvalues.get_i64(name),
             // `s:` is the short form of `stat:` (CommandMenu.xml `s:npcnumpets!=0`)
             "stat" | "s" => stats::id_of(name).and_then(|id| zone.stat(id)).map(i64::from),
             _ => None,
@@ -486,7 +467,7 @@ impl Hud {
         if let Some(c) = &mut self.compass {
             c.set_visible(gui, show);
         }
-        let active: Vec<(String, bool)> = self.dvalues.iter().map(|(k, v)| (k.clone(), *v != 0)).collect();
+        let active: Vec<(String, bool)> = self.dvalues.iter_i64().map(|(k, v)| (k.to_string(), v != 0)).collect();
         for (n, a) in active {
             gui.set_cc_active(self.cc, &n, a);
             if let Some(p) = &self.popup {
@@ -536,7 +517,7 @@ impl Hud {
 
     /// Mouse-down outside an open sub menu closes it (the original's popup menus lose focus).
     pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, ev: &InputEvent, cam: &ao_render::Camera, lens: &ao_scene::Lens) {
-        let locked = self.dvalues.get("LockHotbars").is_some_and(|v| *v != 0);
+        let locked = self.dvalues.flag("LockHotbars");
         for s in &mut self.shortcuts {
             s.input(gui, ev, locked);
         }
@@ -625,8 +606,8 @@ impl Hud {
     }
 
     fn toggle_dvalue(&mut self, gui: &mut Gui, name: &str) {
-        let v = self.dvalues.get(name).copied().unwrap_or(0) == 0;
-        self.dvalues.insert(name.to_string(), v as i64);
+        let v = self.dvalues.get_i64(name).unwrap_or(0) == 0;
+        self.dvalues.set_i64(name, v as i64);
         gui.set_cc_active(self.cc, name, v);
         if let Some(k) = WindowKind::from_dvalue(name) {
             if v {
@@ -666,7 +647,7 @@ impl Hud {
     }
 
     pub(super) fn open(&mut self, gui: &mut Gui, kind: WindowKind) {
-        self.dvalues.insert(kind.dvalue().to_string(), 1);
+        self.dvalues.set_i64(kind.dvalue(), 1);
         gui.set_cc_active(self.cc, kind.dvalue(), true);
         self.stats.open(gui, kind);
         self.map.open(gui, kind);
@@ -676,7 +657,7 @@ impl Hud {
     }
 
     pub(super) fn close_kind(&mut self, gui: &mut Gui, kind: WindowKind) {
-        self.dvalues.insert(kind.dvalue().to_string(), 0);
+        self.dvalues.set_i64(kind.dvalue(), 0);
         gui.set_cc_active(self.cc, kind.dvalue(), false);
         self.stats.close(gui, kind);
         self.map.close(gui, kind);
@@ -816,7 +797,7 @@ mod tests {
     fn bar_titles_come_from_the_text_db() {
         let Some((s, _)) = shot((1280, 800)) else { return };
         assert_eq!(s.hud.bar_titles, ["Health", "Nano", "Experience", "Alien Experience"]);
-        assert_eq!(s.hud.dvalues.get("Targetstarget"), Some(&0));
+        assert_eq!(s.hud.dvalues.get_i64("Targetstarget"), Some(0));
         assert!(!s.hud.target.targets_target);
     }
 

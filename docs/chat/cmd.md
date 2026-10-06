@@ -88,7 +88,8 @@ Global map (`FUN_100badf1` 0x100badf1..0x100bbc30; handler address in the 2nd co
 | `/cc` | -1 | 0x100ba105 | `info <name>` (exactly 3 tokens) -> action; `< 2` tokens "Invalid syntax"; chat server down "Error: Not connected to chat-server."; else all tokens expanded and handed to `Client_c` (0x1016cadf) |
 | `/lft` | 2 | 0x100b69b0 | `FUN_100f01a3(on, text)`: with text on, bare toggles |
 | `/help` | 2 | 0x100b6d56 | topic map lookup -> `file://<file>` in the InfoView (docs/chat/dialogs.md §1); none: "Error: no help topic named 'X'."; no argument: `helpcommands.html` |
-| `/petition /fxscript /selectself /funcom /bug /showfile /tipoftheday /option /setoption /dvalue /open /toggle /close /messagebox /assist /text /start /camp /quit /chardist /viewdist /char&viewdist /voice /macro /petduel /duel /filter /waypoint /rp /reclaim` | see `GLOBAL_CMDS` | GUI-local | `ChatAction::ClientCommand(line)` (not chat) |
+| `/petition /fxscript /selectself /funcom /bug /showfile /tipoftheday /open /toggle /close /messagebox /assist /text /start /camp /quit /voice /macro /petduel /duel /filter /waypoint /rp /reclaim` | see `GLOBAL_CMDS` | GUI-local | `ChatAction::ClientCommand(line)` (not chat) |
+| `/option /setoption /dvalue /chardist /viewdist /char&viewdist` | 3 / 3 / 3 / 2 / 2 / 3 | 0x100b5adc / 0x100b7127 / 0x100b62ed / 0x100b63b8 / 0x100b6465 | `ChatAction::DValue(tokens)` → flow → `DValues::command` (docs/chat/dvalue.md) |
 | `/played` | 1 | 0x100b2321 | prints "Time: %02d:%02d local (%02d:%02d GMT), %02d:%02d game<br>" + "Date: ..." then `N3Msg_TextCommand("played")` |
 | `/version /bank /team /org /born /pet /follow /items /raid` | -1 | 0x100b2278 | `N3Msg_TextCommand(window, Expand(line[1..]), target)` (Interfaces 0x10008a72 -> Gamecode 0x176db -> FUN_1003fba6) |
 | `/chr /getlocal /setlocal /getlocalfull /monsterdata /clearunique /tplocal` | -1 | 0x100b2278 | forwarded as above (no GUI gate; `FUN_1003fba6` itself checks GmLevel, see §Zone commands) |

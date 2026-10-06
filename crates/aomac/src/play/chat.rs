@@ -72,6 +72,8 @@ pub(super) struct Chat {
     tip: i32,
     /// `/open` `/close` `/toggle` of the HUD windows: taken by the flow ([`Chat::take_windows`]).
     windows: Vec<(&'static str, cmd::WindowOp)>,
+    /// `/option` `/dvalue` `/viewdist` ... token lists, run by the flow on the DValue store ([`Chat::take_dvalue_cmds`]).
+    dvalue_cmds: Vec<Vec<String>>,
     quit: bool,
     screen: (u32, u32),
     /// Buddy list, tell windows, private groups, LFT (docs/chat/social.md).
@@ -99,7 +101,7 @@ impl Chat {
     pub fn new() -> Self {
         let mut net = net::ChatNet::default();
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
-        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default() }
+        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], dvalue_cmds: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default() }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
@@ -194,6 +196,20 @@ impl Chat {
     /// `/open` `/close` `/toggle` requests for the HUD windows: `(DValue name, op)`, applied by the flow (`WindowKind::from_dvalue`).
     pub fn take_windows(&mut self) -> Vec<(&'static str, cmd::WindowOp)> {
         std::mem::take(&mut self.windows)
+    }
+
+    /// Token lists of `/option` `/setoption` `/dvalue` `/chardist` `/viewdist` `/char&viewdist`: the flow runs them on the HUD's
+    /// [`DValues`](super::dvalue::DValues) and answers with [`Chat::dvalue_feedback`].
+    pub fn take_dvalue_cmds(&mut self) -> Vec<Vec<String>> {
+        std::mem::take(&mut self.dvalue_cmds)
+    }
+
+    /// The feedback lines of those commands (`FUN_1009b37f(text, 0x51 | 0x52)`): the texts are the binary's HTML.
+    pub fn dvalue_feedback(&mut self, gui: &mut Gui, outs: Vec<super::dvalue::Out>) {
+        for o in outs {
+            let name = if o.error { "CCChatCmdFeedbackError" } else { "CCChatCmdFeedbackInfo" };
+            self.line(gui, ChatLine::new(ChatKind::Other(name), format!("<div><font color={name}>{}</font></div>", o.text)));
+        }
     }
 
     /// `/quit` (`StartQuitToSystemMessage`, GUI 0x10029a0d): taken by the flow, which ends the session.
@@ -681,6 +697,7 @@ impl Chat {
                 let _ = (now, name); // feedback text needs the TextDb: see IgnoreList; persistence is not ported
             }
             ChatAction::Social(id) => self.game.push(GameAction::Social(id)),
+            ChatAction::DValue(t) => self.dvalue_cmds.push(t),
             ChatAction::ClientCommand(c) if c.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/assist")) => self.game.push(GameAction::Assist),
             ChatAction::ShowUrl(u) => {
                 let outs = self.info.show_url(gui, self.screen, &u, true);

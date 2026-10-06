@@ -11,6 +11,7 @@ mod controls;
 mod create;
 mod delete;
 mod dvalue;
+mod dvalue;
 mod dynels;
 mod dynels_doors;
 mod fightmode;

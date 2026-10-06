@@ -150,6 +150,9 @@ pub enum ChatAction {
     Tower(String),
     /// A GUI-local command that is not chat (`/camp`, `/quit`, `/open`, `/option` ...): the unmodified line.
     ClientCommand(String),
+    /// `/option` `/setoption` `/dvalue` `/chardist` `/viewdist` `/char&viewdist`: the tokens (command word first), run by the flow on the
+    /// DValue store (`play/dvalue.rs`, docs/chat/dvalue.md).
+    DValue(Vec<String>),
 }
 
 /// `/open` `/close` `/toggle` (`FUN_100b77b6`): the sense the shared handler gets (0 open, 1 close, 2 toggle).
@@ -232,6 +235,8 @@ enum Kind {
     Client,
     /// `/showfile`
     ShowFile,
+    /// The distributed-value commands.
+    DValue,
     Tip,
     MessageBox,
     /// `/text`: local info line.
@@ -287,9 +292,9 @@ const GLOBAL_CMDS: &[Cmd] = &[
     c("/bug", 2, Kind::Client),
     c("/showfile", 2, Kind::ShowFile),
     c("/tipoftheday", 2, Kind::Tip),
-    c("/option", 3, Kind::Client),
-    c("/setoption", 3, Kind::Client),
-    c("/dvalue", 3, Kind::Client),
+    c("/option", 3, Kind::DValue),
+    c("/setoption", 3, Kind::DValue),
+    c("/dvalue", 3, Kind::DValue),
     c("/open", 2, Kind::Window(WindowOp::Open)),
     c("/toggle", 2, Kind::Window(WindowOp::Toggle)),
     c("/close", 2, Kind::Window(WindowOp::Close)),
@@ -299,9 +304,9 @@ const GLOBAL_CMDS: &[Cmd] = &[
     c("/start", 2, Kind::Start),
     c("/camp", 1, Kind::Camp),
     c("/quit", 1, Kind::Quit),
-    c("/chardist", 2, Kind::Client),
-    c("/viewdist", 2, Kind::Client),
-    c("/char&viewdist", 3, Kind::Client),
+    c("/chardist", 2, Kind::DValue),
+    c("/viewdist", 2, Kind::DValue),
+    c("/char&viewdist", 3, Kind::DValue),
     c("/cc", -1, Kind::Cc),
     c("/afk", 2, Kind::Afk),
     c("/tell", 3, Kind::Tell),
@@ -861,6 +866,7 @@ fn run(cmd: &Cmd, line: &str, t: &[String], ctx: &CmdCtx) -> Vec<ChatAction> {
             }
         }
         Kind::Client => vec![ChatAction::ClientCommand(line.to_string())],
+        Kind::DValue => vec![ChatAction::DValue(t.to_vec())],
         // FUN_100b6e66
         Kind::ShowFile => {
             if n < 2 {
@@ -1140,6 +1146,22 @@ mod tests {
         assert_eq!(parse("hello", &c), []);
         c.output_group = None;
         assert_eq!(parse("hello", &c), []);
+    }
+
+    #[test]
+    fn option_commands_become_dvalue_actions() {
+        let gs = groups();
+        let c = ctx(&gs, &txt);
+        let toks = |l: &str| match parse(l, &c).as_slice() {
+            [ChatAction::DValue(t)] => t.clone(),
+            a => panic!("{l}: {a:?}"),
+        };
+        assert_eq!(toks("/option NumHotbars 3"), ["/option", "NumHotbars", "3"]);
+        assert_eq!(toks("/setoption ChatFontName \"Courier New\""), ["/setoption", "ChatFontName", "\"Courier New\""]);
+        assert_eq!(toks("/DVALUE Foo 1 + 2"), ["/DVALUE", "Foo", "1 + 2"], "the third token is the rest of the line");
+        assert_eq!(toks("/viewdist 50"), ["/viewdist", "50"]);
+        assert_eq!(toks("/char&viewdist 40 60"), ["/char&viewdist", "40", "60"]);
+        assert_eq!(toks("/chardist"), ["/chardist"]);
     }
 
     #[test]
