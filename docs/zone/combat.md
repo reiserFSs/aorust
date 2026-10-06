@@ -28,6 +28,17 @@ The fight state of every dynel changes **only when the server's relay arrives** 
 the attack key sends `AttackIIR_t`, the echo starts the fight, the next press sends `StopFightIIR_t`, its echo ends it. `AttackGate` is the
 `+0x79` "please wait until previous action" guard (no timer in the client, so an attack the server never answers blocks later ones).
 
+### Combat music stat ownership
+
+`Module::music_char`, shared by the per-frame audio feed, reads Health / MaxHealth from `Combat::Char` when known; the zone announcement is only the fallback before that character is known.
+Evidence: Gamecode `FUN_10059736` samples the same dynel stat store modified by `FUN_1009b170` (`AttackInfo`, Health subtraction) and `FUN_1005ae91` (Health = 0).
+Previously the feed combined the live fight controller with `Zone::dynels`' older health snapshot, so a killed opponent could still be sampled as alive until another stat announcement.
+`StopFightIIR_t` still goes through `Combat::stop_fight` (`FUN_10079d75` → `FUN_10068b7f`), clearing state and target; no synthetic stop or change to the SandyInterface music FSM is needed.
+Nonlocal samples retain the retail requirement: fighting, and targeting the local character or Health exactly zero (`ao_audio::combat::char_sample`).
+Regression `kill_and_stop_fight_restore_district_music_from_live_stats` starts both controllers, applies an `AttackInfo` hit while the zone snapshot stays at 50 HP, checks audio sees zero, relays both stops, and checks music state 0 / no combat layer after the victory lock.
+The district layer is selected at the next district evaluation (≤1 s; SandyInterface `SetupENVSounds` @0x1000657d). This regression has been added but not executed in this editing pass.
+
+
 ## Controls (CharPrefs.xml `KeyBindings`, provider = `provider_hash(name)`)
 
 | key | provider | action |

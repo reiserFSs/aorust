@@ -9,7 +9,7 @@ use super::anim::{plays_hit_sound, special_swing, DieEvent, Dying, ACTION_DEATH_
 use super::arms::ACTION_UNWIELD;
 use super::log::{floating_number, FloatingNumber, Space, HUD_X, HUD_X_JITTER};
 use super::state::{Combat, CombatEvent, ACTION_PLAY_ANIM, FIGHT_IDLE};
-use crate::play::zone::Zone;
+use crate::play::zone::{DynelState, Zone};
 use ao_audio::combat::CharInfo;
 use ao_audio::Audio;
 use ao_formats::screens::TextDb;
@@ -305,20 +305,25 @@ impl Module {
         }
         let Some(a) = audio else { return };
         for (&id, d) in &zone.dynels {
-            let fight = self.combat.fight(id);
-            let info = CharInfo {
-                is_local: id == self.own,
-                life: d.health,
-                max_health: d.max_health,
-                fighting: fight.is_some_and(|f| f.state != FIGHT_IDLE),
-                target_is_local: fight.and_then(|f| f.target).is_some_and(|t| t.kind == DYNEL_CHAR && t.instance == self.own),
-                side: i32::from(d.side),
-                id,
-                flag: false, // dynel+0x21c: writer unknown (docs/formats.md Combat music)
-                level: d.level,
-                metric: 0, // stat 421: stored, never read by a decision
-            };
-            a.set_combat_char(&info);
+            a.set_combat_char(&self.music_char(id, d));
+        }
+    }
+
+    /// `FUN_10059736` reads the same character stats as the hit handlers, not the zone's announcement snapshot.
+    fn music_char(&self, id: i32, d: &DynelState) -> CharInfo {
+        let c = self.combat.char(id);
+        let fight = self.combat.fight(id);
+        CharInfo {
+            is_local: id == self.own,
+            life: c.map_or(d.health, |c| c.health()),
+            max_health: c.map_or(d.max_health, |c| c.max_health()),
+            fighting: fight.is_some_and(|f| f.state != FIGHT_IDLE),
+            target_is_local: fight.and_then(|f| f.target).is_some_and(|t| t.kind == DYNEL_CHAR && t.instance == self.own),
+            side: i32::from(d.side),
+            id,
+            flag: false, // dynel+0x21c: writer unknown (docs/formats.md Combat music)
+            level: d.level,
+            metric: 0, // stat 421: stored, never read by a decision
         }
     }
 
@@ -572,6 +577,42 @@ mod tests {
         }
         z.target = Some(t);
         (m, z, t)
+    }
+
+    #[test]
+    fn kill_and_stop_fight_restore_district_music_from_live_stats() {
+        use ao_audio::combat::{char_sample, CombatMusic};
+        use ao_net::n3::misc::AttackInfo;
+        let (mut m, z, target) = primed();
+        let own = OWN as i32;
+        m.combat.stats(own, &[(27, 50), (1, 50)], &mut Vec::new());
+        m.combat.stats(target, &[(27, 50), (1, 50)], &mut Vec::new());
+        m.on_frame(&n3_frame(0, OWN, net::attack(own, Identity { kind: DYNEL_CHAR, instance: target }, 0)));
+        m.on_frame(&n3_frame(0, target as u32, net::attack(target, Identity { kind: DYNEL_CHAR, instance: own }, 0)));
+        let mut music = CombatMusic::new(3);
+        let feed = |m: &Module, music: &mut CombatMusic, dt| {
+            for (&id, d) in &z.dynels {
+                if let Some(sample) = char_sample(&m.music_char(id, d)) {
+                    music.combat_update(&sample);
+                }
+            }
+            music.update(dt);
+        };
+        feed(&m, &mut music, 0.016);
+        assert_ne!(music.state(), 0, "the opponent starts battle music");
+        m.combat.hit(own, &AttackInfo { slot: 0, damage: 50, value_20: -1, other: Identity { kind: DYNEL_CHAR, instance: target }, unk_2c: 0, unk_30: 3, unk_34: 0 }, &mut Vec::new());
+        assert_eq!(z.dynels[&target].health, 50, "the zone announcement remains stale");
+        assert_eq!(m.music_char(target, &z.dynels[&target]).life, 0, "audio reads the hit-updated stat");
+        feed(&m, &mut music, 0.016);
+        m.on_frame(&n3_frame(0, OWN, net::stop_fight(own)));
+        m.on_frame(&n3_frame(0, target as u32, net::stop_fight(target)));
+        assert!(!m.music_char(target, &z.dynels[&target]).fighting);
+        assert!(char_sample(&m.music_char(target, &z.dynels[&target])).is_none());
+        for _ in 0..20 {
+            feed(&m, &mut music, 1.0);
+        }
+        assert_eq!(music.state(), 0, "district music resumes after the retail victory lock");
+        assert_eq!(music.layer_name(), None);
     }
 
     fn sent(m: &mut Module) -> Vec<Misc> {
