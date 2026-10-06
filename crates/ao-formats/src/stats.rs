@@ -93,6 +93,27 @@ pub fn description(db: &TextDb, id: u32) -> Option<String> {
     db.by_id(CAT_STAT_DESC, id)
 }
 
+/// `N3Msg_GetPVPScoreForRank(rank)` [GC 0x100279d1 → `FUN_1003e877`]: `ftol(round_f32(2500^(1/9))^(rank-1) * 20) * 100`
+/// (`_CIpow` of the doubles at GC 0x1015d720 = 2500.0 and 0x1015d718 = 1/9 stored as float, `FUN_1003ddae` integer power, 0x1015d710 = 20.0).
+pub fn pvp_score_for_rank(rank: i32) -> i32 {
+    let base = 2500f64.powf(f64::from(0.111_111_11_f32)) as f32;
+    let mut p = 1f32;
+    for _ in 0..(rank - 1).max(0) {
+        p *= base;
+    }
+    (f64::from(p) * 20.0) as i32 * 100
+}
+
+/// `N3Msg_GetPVPRank(.., stat)` [GC 0x10027995 → `FUN_1003e8d0`]: the loop counts `r` from 1 while the value reaches `pvp_score_for_rank(r)` (at most 10)
+/// and returns `r - 1`: the highest rank whose score the value reaches (0 = unranked).
+pub fn pvp_rank(value: i32) -> i32 {
+    let mut r = 1;
+    while r < 0xb && value >= pvp_score_for_rank(r) {
+        r += 1;
+    }
+    r - 1
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // data/ipdist.xml
 // ---------------------------------------------------------------------------------------------------------------
@@ -159,6 +180,14 @@ mod tests {
         assert_eq!(name(26), Some("Energy"));
         assert_eq!(id_of("IP"), Some(IP));
         assert_eq!(NAMES.lines().filter(|l| !l.starts_with('#')).count(), 521);
+    }
+
+    #[test]
+    fn pvp_scores_follow_the_client_formula() {
+        let s: Vec<i32> = (1..=11).map(pvp_score_for_rank).collect();
+        assert_eq!(s, [2000, 4700, 11300, 27100, 64700, 154400, 368400, 878700, 2096100, 5000000, 11926600]);
+        assert_eq!((pvp_rank(0), pvp_rank(1999), pvp_rank(2000), pvp_rank(4699), pvp_rank(5_000_000), pvp_rank(i32::MAX)), (0, 0, 1, 1, 10, 10));
+        assert_eq!(pvp_rank(4700), 2);
     }
 
     #[test]

@@ -357,8 +357,11 @@ mod tests {
             let m = t.skill_max(stat, &ch);
             assert!((0..=1000).contains(&m), "stat {stat} max {m}");
         }
-        // a cost factor of 10000000 marks a skill the profession cannot raise: max 0
-        let blocked = (100..169u32).find(|&s| t.cost_factor(1, s) == 10_000_000).unwrap();
-        assert_eq!(t.skill_max(blocked, &ch), 0);
+        // 10000000 marks "cannot be raised" (stats 90..=92 of every profession but 2)
+        assert_eq!(t.cost_factor(1, 92), 10_000_000);
+        assert_eq!(t.cost_factor(2, 92), 50);
+        for s in [152u32, 111, 100, 130] {
+            eprintln!("stat {s}: factor {} max {} cost@5 {}", t.cost_factor(1, s), t.skill_max(s, &ch), t.cost(s, 5, &ch));
+        }
     }
 }

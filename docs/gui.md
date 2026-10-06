@@ -90,9 +90,27 @@ Original: `Window(rect, title, name, style 1, flags)` → `WndBorder::SetStyle` 
   over the close button (the application decides: LoginWindow → quit, ProgressDialog → ignore). Hover shows `_STATE2`, pressed `_STATE3`
   (**UNRESOLVED**: which `Button_c` state index maps hover/pressed; the three sprites are pixel-identical in this skin, so it is invisible).
 * `set_window_pos` / `open_framed_window` take the **outer** top-left; `outer_size`, `window_size` (client).
-* **UNRESOLVED**: the window title text (TabView tab strip, only drawn when a title is set; the login-flow windows have an empty title);
-  hit-testing/dragging/resizing (`HitTest` 0x101593d6 flags 0x10/0x20/0x8 → not resizable / not movable); the layer-1 alpha value is the
-  0.33 default (`GUIConfig_c`), not read from prefs.
+* **UNRESOLVED**: hit-testing/dragging/resizing (`HitTest` 0x101593d6 flags 0x10/0x20/0x8 → not resizable / not movable); the layer-1 alpha value is the
+  0.33 default (`GUIConfig_c`), not read from prefs. The window title text is §6.1 (style 0).
+
+### 6.1 Style-0 window with a tab strip (`Gui::open_tabbed_window[_xml]`)
+The in-world windows are `DockWindow_c` (`FUN_1003bdd4`: `Window(Rect(), "", "", style 0, flags 0x1000)`), and a `DockableView_c` (`FUN_10038b47`) is a *tab*: `Window::InsertTab(index,
+title, view)` with `title` = the `DockableView_c` constructor argument (`FUN_100389bd`). `Window::SetTitle` (0x1015427b) only stores a string, nothing draws it. The title texts are therefore
+the constructor literals: `"Planet Map"` (`PlanetMapView_c` 0x1004d26a), `"PF Map"` (`PlayfieldMapView_c` 0x100eb905), `"Skills"` (`SkillWindow` Window ctor), `"Stats"`, `"Friends"`, `"Knowledge"`, `"Missions"`, `"NCU"`,
+`"Actions"`, `"Faction"`, `"Trade"`, `"Tradeskill Kit"`, `"Info"`, `"Tips"`; `GetText(10000, "Wear")` (`WearView_c` 0x100e1bc9, string at 0x101b59ac), `"Inspect"` for the inspect variant; the inventory
+passes `""` (its tab title is set later, UNRESOLVED). **`#WindowMap` / `#WindowPlanetMap` of `ControlCenterModule_c::SetupProviders` 0x10068c38 are not titles**: the four strings of each provider
+(`FUN_10018788`) are dvalue name, key-binding option label (`#WindowPlanetMap`), group (`#Window`) and the provider key (`WINDOW_PLANETMAP`, §12.1).
+* Style 0 (`WndBorder::SetBorderGfx` 0x1015a82d): the same outer `GFX_GUI_WINDOW3_BORDER_*` art as style 1 (alpha 0.33) but `TabView::SetRenderFlags(7)` and no inner `top_level_border`. Outer border
+  `Rect(3, _DAT_101b6e54 = 7, 3, 3)` (`UpdateBorderSizes` 0x10159f98) + `TabView` borders `(2, strip + 1, 2, 2)` (`LayoutBorders` 0x10145be5: `+= _DAT_101a8b90 = 2.0` on all four, then the top is `+0x158` =
+  tab-bar height + 1) → **client insets (5, 26, 5, 5)** (strip = 17 px tab + 1). The `TabView` is the outer rect minus the outer border.
+* Tab strip (`TopBorderView_c` ctor `FUN_10147935`, flags 7, layer-2 alpha 0.85): the tabs sit in a container starting `TabView::SetLeftMargin(_DAT_101b4e08 = 20)` from the left edge (the 15 px icon button fills the margin); the box
+  `GFX_GUI_TAB_BORDER_*` + `GFX_GUI_TAB_BACKGROUND` (the same 9 pieces as style 1's inner border) starts at strip row 16 so its 2 px top line (`TAB_BORDER_TOP/TL/TR`, `FUN_10146e94`) is the strip's last two rows.
+* `Tab` (ctor `FUN_10146785`): `BorderView_c::SetGfx(l, m, r)` (3-slice, `0x195/0x196/0x197` = `GFX_GUI_TAB_ACTIVE_LEFT/MIDDLE/RIGHT` 6/16/21 × 17 selected; `0x1a1..0x1a3` inactive) over a `TextView_c(font NORMAL)`;
+  `FUN_101461dc` preferred width = title width + 1 + `Rect(5,0,16,0)` at `Tab+0x1e4` (5 + 16), height = art height; `Tab::SetSelected` `FUN_10146110`: selected = active art, alpha = layer 2, text colour `0xffffff`; unselected = inactive art
+  at alpha × `_DAT_101c4978`, colour 0. Only the selected tab is used (one tab per window).
+* **UNRESOLVED**: the title's vertical offset inside the tab (we draw it at the tab top like every `TextView`), the left offset 5 (the `Rect(5,0,16,0)` field is only read in the preferred-size function), ±1 px of the strip
+  height (`Point` extents vs counts in `FUN_10147c93` = tab height + 1, `LayoutBorders` +1), tab hover/drag, several tabs. No retail screenshot of a style-0 window was available to compare.
+* Used by: Planet Map, Playfield Map, Skills, Wear (`play/hud_*.rs`); the Inventory window keeps the style-1 frame until its title is known.
 
 ## 7. Widgets (`gui.rs`)
 
@@ -128,7 +146,7 @@ Events: `Clicked`, `TextChanged`, `EnterPressed`, `ComboChanged`, `Copy`, `Paste
 
 ## 9. UNRESOLVED (summary)
 
-Title text of framed windows; frame hover/pressed state index; window drag/resize hit-testing; `PopupMenu_c` skin; `_AddLineDesc` line pitch;
+Several tabs / tab vertical text offset (§6.1); frame hover/pressed state index; window drag/resize hit-testing; `PopupMenu_c` skin; `_AddLineDesc` line pitch;
 GDI dropout rules; layer-alpha values from `GUIColors.xml`/prefs (defaults used); tooltips (`View::SetToolTip` texts exist, not shown);
 double-click word selection; IME.
 
@@ -358,3 +376,12 @@ Both windows are built in code in GUI.dll (no `Views/*.xml`): `ControlCenterModu
 **Implemented**: CanvasView-based windows, planet tiles/zoom/pan/recentre/markers/Shadowlands pick, playfield ground image (top-down raster, worker thread) with exploration lighting, yellow dot / heading arrow (when stat `MapNavigation`≠0) and nearby-character squares. Tests: `cargo test --release -p aomac hud_map` (+`AOMAC_SHOT_DIR`: `map-arrival-hall*.png`, `map-icc-shuttleport*.png`, `map-newland-city*.png`, `planet-566-level0/1.png`, `planet-shadowlands.png` inspected: tiles/outlines line up, marker at Newland, buttons row, dark exploration shading in the dungeon).
 **UNRESOLVED GUESSES**: playfield map screen scale (1 px/m; renderer scale `FUN_100e923a` not decoded); PF window first-time position; whether `MapNavigation` (140) is what makes `GetMapCharacters` succeed; rule for owning an outdoor map (MapAreaPart1–4 stats vs rdb 1000008) — outdoor maps are always shown, so "Map Not Available" is unreachable; planet buttons: pressed art, tooltips ("Zoom in" text.mdb 10000 key 31206174 / body 193692387; "Zoom out" 230869204 / 159921171) and double-click zoom not wired; `Quest`/shop centring needs mission data; window title text; ShowButtons default (shown here); wheel zoom is our addition.
 **Engine additions**: `<CanvasView>` / `Kind::Canvas` / `Gui::set_canvas` / `canvas_size` / `open_framed_window_xml`, events `CanvasDrag`, `CanvasWheel`, `CanvasClick` (`gui/canvas.rs`).
+
+## 11.8 Skill rules (`ao_formats::stats::skills`, tested against the client's rdb) — HudStats2
+`GetSkillMax` `FUN_100651b5`, `GetSkillCost` `FUN_10061fdb`, `GetSkillCostLevel` `FUN_10062398`, ability max `FUN_100626d8`, trickle-down `FUN_10064ac2`, `N3Msg_GetSkill` mode 1 `FUN_100654e1` [GC] are ported; the float math is read from the asm (`FUN_1013ecf0` = truncation). Tables (little-endian i32 streams, loaders `FUN_100c646d` dispatch): rdb 1000206[prof] = 77 cost factors in the stat order `COST_ORDER` (`FUN_100c4afd`); 1000209[class 1..5] = `T1..T7`, `B`; 1000200[prof] = title-level start levels `s[4(t-1)]` = 1,15,50,100,150,190,205; 1000204[stat 100..168] = 6 trickle percentages; 1000027[breed] = base/cap abilities; 1000210[breed] = ability cost class (stream order Str,Int,Agi,Sen,Sta,Psy). Cost of one more point from value n: skills `trunc(f·n/10)`, abilities `class·n` (`FUN_100f90ef`). Max skill = min of the T/B/title-level terms, `8·trickle`, … (see code). **UNRESOLVED**: modifier/buff containers (`FUN_1006460b`, `FUN_10063d39`, mask-4 map `FUN_1008a3e8`) – buffed = base.
+* **Save Changes** (`FUN_100fa5dd`) → `N3Msg_ClientIPAdjust` [GC 0x10026e7e] → `SkillIIR_t` `3E205660`, pass-on byte 0, body `i32 n; (i32 stat, i32 pending+raw)*` ascending: `ao_net::n3::outgoing::skill_ip_adjust` (byte test). **Reset**: "Reset all skills" opens dialog `SkillResetAll`, accept (`FUN_100f9203`, index 0) → `N3Msg_ResetSkill(0)`; "Reset this skill" (`FUN_100f9220`) → `N3Msg_ResetSkill(stat)` = `CharacterActionIIR_t` action `0x9a` [GC 0x1001cdae]; param placement (`{0,stat}`) not verified, encoder not added.
+* **Suggested IP distribution** (`FUN_100fac49`): rows grouped by `ipdist.xml` `pri` (`ip_priorities`; pri 0 bucket skipped, ascending: Soldier pri 1 = Str/Agi/Sta/BodyDev/Assault Rifle…), round-robin +1 per row (`FUN_100fde49(1)`, allowed iff `raw+pending+1 ≤ max` and IP left) until IP is out. Row UI (power bar `0xe0/0xe1`, `GFX_GUI_INC_SKILL[_CHANGED]`/`DEC`, value green/red when pending) traced (`FUN_100fe956`, `FUN_100fde49`) but **not wired into the window yet**.
+
+## 11.9 Stat window `stat_window` (`StatView_c` `FUN_1007ff6e`) and inventory data — HudStats2
+Menu `CommandMenu.xml` entry `stat_window` (SetValue toggle), key Ctrl+9 (`WINDOW_STAT`); NewChar template: open, docked 4th page (279 px) of `RollupArea`. Layout/handlers decoded in `play/hud_stats/stat_view.rs` (header "Name:/Level:", bars health 27/1, nano 214/221, XP, alien XP 40/178 if Expansion&0x18, PvP 684/682/683 with `pvp_score_for_rank`, rows 22,91,90,92,96,93,94,95,97); the file is **written but not wired into `HudStats`/`WindowKind::Stat` and not built or screenshot-tested**.
+Inventory: `FullCharacter` inventory is now decoded (`InventoryEntry{slot,a,b,id,AcgItem{low,high,level}}`, `Zone.inventory`; layout from `FUN_1002a41a/1002a04a`, `GameData::operator>>(ACGItem_t)` 0x1000e9d7; no capture has items → synthetic-bytes test). Slots: 0..0x3f equipment pages, bag from 0x40 (30 slots); cell id→slot: weapons `id` (Right/Left hand 6/8), armor `0x10+id`, implants `0x20+id` (loop 0x20..0x2f `FUN_10046e35`), social `0x30+id` (hands 13/15 → 0x3d/0x3f, `FUN_10047873`). Wear tab tables (corrects §11.4): weapons = order `1,15,2,3..14`, armor `1..15`, implants `1..13`, social `1..15`. Item icon = rdb 1000020[low_id] stat `Icon` (79) → rdb 1010008 PNG (48×48/32×32). Not done: icon drawing, list mode, Social tab, inventory columns, window positions (NewChar: inventory DockArea0 Rect(1196,636,1382,811); wear/stat in RollupArea).
