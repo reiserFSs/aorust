@@ -138,12 +138,15 @@ enum Req {
     Placed(u32),
     /// A wielded weapon: its `AnimSet` (stat 353) from the template record under the message stats.
     Weapon { holder: i32, slot: usize, template: Option<u32>, stats: Vec<(u32, i32)> },
+    /// Clip `id` (AbstractAnimID) for the model `key` of a character look.
+    Clip { key: u64, look: CharLook, id: u32 },
 }
 
 enum Resp {
     Model { key: u64, result: Result<Built, String> },
     Placed(u32, Vec<PlacedDynel>),
     Weapon { holder: i32, slot: usize, set: Option<i32> },
+    Clip { key: u64, id: u32, anim: Option<Arc<CatAnim>> },
 }
 
 /// Background builder: reads the rdb and composes textures off the UI thread.
@@ -167,6 +170,14 @@ impl Worker {
             for r in req_rx {
                 let resp = match r {
                     Req::Model { key, look } => Resp::Model { key, result: build(&store, &mut assets, &look).map_err(|e| format!("{e:#}")) },
+                    Req::Clip { key, look, id } => {
+                        let clip = if look.npc {
+                            NpcRecord::load(&store, look.monster_data as u32).ok().and_then(|r| ao_formats::character::anim_key(&r, id))
+                        } else {
+                            canim::resolve_clip(&assets.names, canim::clip_set(look.breed, look.sex), id as u16, false).map(|c| c.0)
+                        };
+                        Resp::Clip { key, id, anim: clip.and_then(|c| assets.anim(&store, c).ok()) }
+                    }
                     Req::Weapon { holder, slot, template, stats } => {
                         let tpl = template.and_then(|t| item_template(&store, t).ok().flatten());
                         let set = effective_stats(tpl.as_ref(), &stats).iter().find(|s| s.0 == STAT_ANIM_SET).map(|s| s.1);
@@ -400,6 +411,8 @@ enum Special {
     None,
     /// The attack clip plays once.
     Attack,
+    /// Clip `AbstractAnimID` plays once (emotes, swings).
+    Once(u32),
     /// The death clip (client animation id) plays once and holds its last frame.
     Die(u32),
 }
@@ -458,6 +471,9 @@ pub struct Dynels {
     wield: HashMap<i32, [Option<i32>; 2]>,
     /// Weapon dynel instance -> (holder, hand index).
     weapons: HashMap<i32, (i32, usize)>,
+    pending_clips: Vec<(u64, CharLook, u32, i32)>,
+    /// (character, clip) waiting for the worker's answer; started once it is in.
+    replay: Vec<(i32, u32)>,
     pending_weapons: Vec<(i32, usize, Option<u32>, Vec<(u32, i32)>)>,
     /// The playfield whose placed dynels (rdb 1000026) are still to be requested.
     want_placed: Option<u32>,
@@ -483,6 +499,8 @@ impl Default for Dynels {
             wield: HashMap::new(),
             weapons: HashMap::new(),
             pending_weapons: vec![],
+            pending_clips: vec![],
+            replay: vec![],
             want_placed: None,
             playfield: None,
             models: HashMap::new(),
@@ -546,6 +564,21 @@ impl Dynels {
             c.special = Special::Attack;
             c.clip_ms = 0.0;
         }
+    }
+
+    /// Plays clip `anim_id` (client AbstractAnimID, social ids 1..=0x46 are emotes) once on `id` if it is not busy. The clip is resolved
+    /// on the worker the first time (NPC record table, or the player set's file name via `combat::anim::resolve_clip`).
+    pub fn play_once(&mut self, id: i32, anim_id: u32) {
+        let Some(c) = self.chars.get_mut(&id).filter(|c| c.special == Special::None) else { return };
+        let Look::Char(look) = &c.look else { return };
+        if let Some(Model::Ready { built, .. }) = self.models.get(&c.key) {
+            if built.clips.contains_key(&anim_id) {
+                c.special = Special::Once(anim_id);
+                c.clip_ms = 0.0;
+                return;
+            }
+        }
+        self.pending_clips.push((c.key, look.clone(), anim_id, id));
     }
 
     /// `id` dies: the death clip `anim` (client animation id, `CharacterAction` 99's `identity_b.instance`; any other value =
@@ -704,12 +737,30 @@ impl Dynels {
         if let Some(pf) = self.want_placed.take() {
             let _ = worker.tx.send(Req::Placed(pf));
         }
+        for (key, look, id, who) in std::mem::take(&mut self.pending_clips) {
+            let _ = worker.tx.send(Req::Clip { key, look, id });
+            self.replay.push((who, id));
+        }
         for (holder, slot, template, stats) in std::mem::take(&mut self.pending_weapons) {
             let _ = worker.tx.send(Req::Weapon { holder, slot, template, stats });
         }
         let mut placed = vec![];
         while let Ok(r) = worker.rx.try_recv() {
             match r {
+                Resp::Clip { key, id, anim } => {
+                    if let (Some(a), Some(Model::Ready { built, .. })) = (anim, self.models.get_mut(&key)) {
+                        built.clips.insert(id, a);
+                    }
+                    for (who, _) in self.replay.iter().filter(|r| r.1 == id) {
+                        if let Some(c) = self.chars.get_mut(who).filter(|c| c.key == key && c.special == Special::None) {
+                            if matches!(self.models.get(&key), Some(Model::Ready { built, .. }) if built.clips.contains_key(&id)) {
+                                c.special = Special::Once(id);
+                                c.clip_ms = 0.0;
+                            }
+                        }
+                    }
+                    self.replay.retain(|r| r.1 != id);
+                }
                 Resp::Weapon { holder, slot, set } => self.wield.entry(holder).or_default()[slot] = set,
                 Resp::Model { key, result: Ok(built) } => {
                     self.models.insert(key, Model::Ready { built, uploaded: false });
@@ -802,6 +853,10 @@ impl Dynels {
                     Some(a) => (k, Some(a), 1.0),
                     None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
                 },
+                Special::Once(k) => match built.clips.get(&k) {
+                    Some(a) => (k, Some(a), 1.0),
+                    None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
+                },
                 Special::Attack => match built.clips.get(&ATTACK_KEY) {
                     Some(a) => (ATTACK_KEY, Some(a), 1.0),
                     None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
@@ -839,7 +894,7 @@ impl Dynels {
             if let Some(a) = clip.filter(|_| c.special != Special::None) {
                 // one-shot clips: Attack returns to the movement state at the end, Die holds the last frame
                 if c.clip_ms >= a.duration {
-                    if c.special == Special::Attack {
+                    if matches!(c.special, Special::Attack | Special::Once(_)) {
                         c.special = Special::None;
                         c.clip_ms = 0.0;
                     } else {
