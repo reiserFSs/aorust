@@ -209,7 +209,7 @@ Stat 430 is **`WaitState`** (not a movement mode; `stat_names.txt`). Values the 
 
 1. no client char -> nothing.
 2. fight state `char+0x1d4 -> +0x44 != 1` -> `N3Msg_StopAttack` (always, before anything else).
-3. `char+0x50` virtual `+0x9c` true -> return **[UNRESOLVED]** what it tests (probably "movement disabled"; `Vehicle_t` vtable symbol not found).
+3. `char+0x50` virtual `+0x9c` true -> return: **resolved**, it is the movement FSM's `IsMoving` (vehicle vtable slot 39 `FUN_1006efe1` -> `fsm.vtable[7]`, docs/zone/movement.md §10); `SitInput::blocked` = `Movement::sit_input`.
 4. `WaitState` in {0xf, 0x10} -> `CharacterAction 0x57` (all identities zero), done.
 5. selected item (`FUN_1008720e(FUN_10058816()+0x5c)`: the identity stored in the targeting singleton `ecx+0x1d0` at `+0x5c`, cast to `SimpleItem_t`; **[INFERENCE]** it is the current target) whose stat `Can` (0x1e)
    has bit value 2 [INFERENCE: "can sit"]: if `WaitState == 1` -> `0x57` else -> `0x55` with `identity_a` = the item's identity (`item+0xc4`); done.

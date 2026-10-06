@@ -4,6 +4,9 @@ use super::hud_bar::SlotUse;
 use crate::play::Play;
 use ao_net::n3::action::{self, CampInput, Outgoing};
 
+/// Logout countdown of the camp timer bar (`LDBformat::Feed(0x1e)` in `CampStartedMessage`).
+const CAMP_SECONDS: f32 = 30.0;
+
 impl Play {
     /// Runs the uses the HUD queued this frame.
     pub(in crate::play) fn hud_uses(&mut self) {
@@ -36,8 +39,28 @@ impl Play {
                 }
             }
             0x51 => self.start_camping(),
-            0x52 => self.send_outgoing(vec![action::stop_camping()]),
+            0x52 => {
+                self.camp = None; // `CancelCampMessage` [GUI 0x10029c26] deletes the timer bar
+                self.send_outgoing(vec![action::stop_camping()]);
+            }
             _ => eprintln!("hud: special action {a:#x} has no consumer yet"),
+        }
+    }
+
+    /// `/camp` / `StartQuitToLoginMessage` [GUI 0x10027c74]: `N3Msg_StartCamping`, the logout countdown starts when it succeeds.
+    pub(in crate::play) fn camp(&mut self) {
+        self.start_camping();
+    }
+
+    /// The camp countdown (`FlowControlModule_t::m_pcCampTimer`, 30 s): at its end the game returns to the login (`ActivateGameClosing(2)`
+    /// [GUI 0x10028194]: config saved, screen cleared, then login). [INFERENCE] the 30 s expiry itself is the server's: `StartLogoutIIR_t` /
+    /// `StopLogoutIIR_t` have no client apply [GC 0x10079c53 / 0x10079e6c]; the timer bar widget and its text are not drawn.
+    pub(in crate::play) fn camp_frame(&mut self, dt: f32, host: &mut ao_render::Host) {
+        let Some(t) = self.camp.as_mut() else { return };
+        *t += dt;
+        if *t >= CAMP_SECONDS {
+            self.camp = None;
+            self.show_login(host);
         }
     }
 
@@ -53,7 +76,10 @@ impl Play {
             attacking: m.attacking(),
         };
         match action::start_camping(&c) {
-            Ok(out) => self.send_outgoing(out),
+            Ok(out) => {
+                self.send_outgoing(out);
+                self.camp = Some(0.0); // `CampStartedMessage` [GUI 0x10029d38]: timer 40000 "Logout", LDB text 0xc8 with 30
+            }
             Err(r) => {
                 if let Some(c) = self.chat.as_mut() {
                     c.feedback(&mut self.gui, r.key(), &self.text);

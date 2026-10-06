@@ -862,6 +862,14 @@ impl Frontend for Play {
         }
         if let Some(h) = self.hud.as_mut() {
             h.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default());
+            // CTRL / ALT + left click on a character: select (done) and `N3Msg_SwitchTarget` (`FUN_1002c469`)
+            if let (Some(id), Some(p)) = (h.take_click(), self.player.as_ref()) {
+                if p.attack_modifier() && self.zone.dynels.contains_key(&id) {
+                    if let Some(m) = self.fight.as_mut() {
+                        m.command(combat::module::Command::SwitchTarget(id), &self.zone, p.mode());
+                    }
+                }
+            }
             // TAB cycles the target (`COMMAND_NEXT_HOSTILE_TARGET`, only outside text input): it must not also move the GUI focus into the chat input
             if matches!(ev, InputEvent::Key { key: Key::Tab, .. }) && self.screen == Screen::InWorld && !self.gui.text_focused() {
                 return;
@@ -1008,7 +1016,14 @@ impl Frontend for Play {
                 }
             }
             self.fight_frame(dt);
+            self.camp_frame(dt, host);
             self.zone.world.update(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host);
+            // `Door_t` open / close: `PlayGameSound(id, door position)` (docs/zone/doors.md §5)
+            for s in self.zone.world.take_sounds() {
+                if let Some(a) = &self.audio {
+                    a.play_game_sound(s.id, s.pos, host.camera.pos.to_array());
+                }
+            }
         }
         if let Some(a) = &self.audio {
             a.update(dt, host.camera.pos.to_array(), self.zone.day_time());
@@ -1053,25 +1068,19 @@ impl Frontend for Play {
         if self.screen == Screen::Loading || fading_out {
             self.loading_overlay(&mut list);
         }
-        list
-    }
-}
-
-/// `ERRORURL` of `cd_image/data/launcher/AnarchyLauncher.url` (`KEY=value` lines, `#` comments, keys case-insensitive).
-            // `Door_t` open / close: `PlayGameSound(id, door position)` (docs/zone/doors.md §5)
-            for s in self.zone.world.take_sounds() {
-                if let Some(a) = &self.audio {
-                    a.play_game_sound(s.id, s.pos, host.camera.pos.to_array());
-                }
-            }
-fn errorurl(dir: &std::path::Path) -> Option<String> {
-    let t = std::fs::read_to_string(dir.join("cd_image/data/launcher/AnarchyLauncher.url")).ok()?;
-    t.lines()
         if self.teleporting {
             // `DisplaySystem+0x44 == 0`: the 3D world is not drawn, the GUI is (black behind it: [INFERENCE])
             let dst = [0.0, 0.0, self.size.0 as f32, self.size.1 as f32];
             list.cmds.splice(0..0, [DrawCmd::Clip(None), DrawCmd::Solid { dst, color: [0, 0, 0], alpha: 1.0 }]);
         }
+        list
+    }
+}
+
+/// `ERRORURL` of `cd_image/data/launcher/AnarchyLauncher.url` (`KEY=value` lines, `#` comments, keys case-insensitive).
+fn errorurl(dir: &std::path::Path) -> Option<String> {
+    let t = std::fs::read_to_string(dir.join("cd_image/data/launcher/AnarchyLauncher.url")).ok()?;
+    t.lines()
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| l.split_once('='))
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("errorurl"))

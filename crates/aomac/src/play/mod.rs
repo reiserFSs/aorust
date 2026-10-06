@@ -4,6 +4,7 @@
 
 mod avatar;
 mod camera;
+mod camera_views;
 mod chat;
 mod combat;
 mod controls;
@@ -24,8 +25,8 @@ mod movement;
 mod player;
 mod prefs;
 mod preview;
-mod zone;
 mod tags;
+mod zone;
 
 use anyhow::Result;
 use ao_audio::Audio;
@@ -175,6 +176,8 @@ struct Play {
     player: Option<player::Player>,
     /// Combat / action layer of the zone connection (`combat/module.rs`).
     fight: Option<combat::module::Module>,
+    /// Seconds since a successful `N3Msg_StartCamping` (the logout countdown, `hud_use.rs`).
+    camp: Option<f32>,
     /// Account name and password of the login, for the chat-server login only (the original keeps `cPlayerName`/`cPlayerPasswd`).
     login_cred: Option<(String, String)>,
 }
@@ -259,6 +262,7 @@ impl Play {
             chat: None,
             player: None,
             fight: None,
+            camp: None,
             login_cred: None,
             text,
             gui,

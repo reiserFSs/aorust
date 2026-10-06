@@ -245,7 +245,7 @@ JumpForward}` from the FSM (the original picks anim ids in the Apply functions: 
 
 ## 9. Unresolved / approximated (labelled GUESS in the code)
 
-* `EnsureSurfaceAlignment` is reduced to the `World` trait: wall slide, support below with a step tolerance `0.48 + 2·step` (consts [VH 0x100127e0,
+* `EnsureSurfaceAlignment` is ported in docs/zone/collision.md §3.4 (`World::align`); older note: wall slide, support below with a step tolerance `0.48 + 1.1547·step` (corrected, docs/zone/collision.md §3.4) (consts [VH 0x100127e0,
   0x100127d8], rays from `y + 0.4` [VH 0x100127f8]), fall when no support, landing when `vy ≤ 0` and `y ≤ ground`. The real function casts three rays per
   step, aligns the body to the surface normal (OrientationMode 1/3/4), checks the slope (`a4 < 0.5` [VH 0x10012134]) and wades through
   `LiquidMediumData_t::m_vLiquidHeight`; the body sphere radius is `n3Dynel_t::GetBodyCollSphereRadi` (per dynel).
@@ -253,7 +253,48 @@ JumpForward}` from the FSM (the original picks anim ids in the Apply functions: 
   (`dynel+0x2c8`, `FUN_1002e347`), mode 9 (`FUN_10070fee` and `N3Msg_StartCamping` test it), the pitch half of `VehicleForwardUpdate` (first person
   only), the jump ceiling clamp, the fly vertical limits.
 * Features bits: only bits 2 and 4 are read here (4 = may act, 2 = may turn); names of the other bits unknown. The default in `Stats` is 4.
-* Sit: `N3Msg_SitToggle` when already sitting (or WaitState 0xF/0x10) sends `CharacterActionIIR_t` op 0x57 instead of a move (layout not decoded
-  here); `Movement::sit_toggle` returns `StandRequest` for the caller.
-* Server messages that really change the own mode (WaitState stat changes, `CharacterActionIIR_t`) are not traced; `Movement::transition(id)` runs
-  the FSM without sending.
+* Sit / server-driven mode and position changes are traced in §10; what stays open is listed there.
+
+## 10. Sit / stand and server-driven own movement (RE: Gamecode.dll, Vehicle.dll, GUI.dll)
+
+Code: `Movement::{sit_input, set_pos, impulse, follow_place, follow_target, stop_if_moving, take_stat_writes}`, `Player::{sit, sit_ground, apply_own_events}`,
+`Zone::own_events` (`OwnEvent`), `ao_net::n3::server_move` (decoders). Tests: `cargo test --release -p aomac movement` / `own_server_moves`, `-p ao-net server_move`.
+No capture contains any of these messages (checked `docs/captures/*.rec`), so the tests use hand-built frames.
+
+**Sit / stand.** Triggers: key `ACTION_SIT` (`Cmd::Sit`), hotbar special actions 0x4c / 0x4d (`FUN_1004256c`), camping 0x51 (`N3Msg_StartCamping`); the client has no `/sit`
+text command (only `/camp` is in GUI.dll's command strings; emotes `sleep` / `lounge` need sitting). `N3Msg_SitToggle` = `action::sit_toggle(Movement::sit_input())`:
+the gate `char+0x50` virtual `+0x9c` is **FSM `IsMoving`** (vehicle vtable slot 39 `FUN_1006efe1` -> `fsm.vtable[7]`; resolves the earlier [UNRESOLVED]), so a moving
+character cannot sit. Sit sends `CharDCMove` 0x1e (applied locally at once, `FUN_1006b84b`); standing up sends `CharacterActionIIR_t` 0x57 and waits for the server's copy
+(`OwnEvent::Action(0x57)`: LeaveSleep / LeaveLounge / LeaveSit by WaitState 0xF / 0x10 / else, [GC 0x1005d72f]); `0x56` relays a sit (`SwitchToSitGround`). The item branch (`0x55`
+with the selected item's identity) needs the targeted `SimpleItem`, which the client does not track: `SitInput::item` stays `None`.
+Keys while sitting: forward / back / strafe slots only emit the tip event `OnMovementWhileSitting` (`MovementWhileSittingMessage` [GUI 0x10027d5b], AFCM 0xE3); the permission
+table refuses the move, the character stays sat.
+Transition `Apply`s write stats locally (`SetStat`, `dynel+0xe8 vtbl[0x10]`): SwitchToSitGround [GC 0x1006e2be] RestModifier (0x1a9) 25 + WaitState (0x1ae) 2; LeaveSit
+[0x1006e372] 100 + 0; ToCrawl [0x1006e646] WaitState 0xE; LeaveCrawl [0x1006e3ff] 100 + 0; ToSleep [0x1006e6ff] 0xF; LeaveSleep [0x1006e79f] 100 + 0 (mode becomes 8);
+ToLounge [0x1006e8a9] 0x10; LeaveLounge [0x1006e949] 100 + **2**. `Movement` records them (`take_stat_writes`), `Player::frame` stores them in `Zone::stats`, so `WaitState`
+is the single source for the next toggle. Not ported: sit's "stop fighting" (`FUN_10068b7f(1,0)`; the key path does it through `Module::before_sit`) and the GUI signals
+0x4c / 0x4d (`FUN_10042da4`).
+
+**Messages that move the own dynel** (apply = vtable slot 2; `CharDCMoveIIR_t` is dropped for it, §3.1):
+
+| message (id) | vtable / apply | effect on the own character |
+|---|---|---|
+| `SetPosIIR_c` 195E496E | [GC 0x101612e0] / `FUN_10076e5a`, read `FUN_10076df2` | body `Vec3 pos, u8, i32, u8`. `UpdateReconcilePos`; i32 != 0 on the client char -> `Feedback_CrowdLimiting` (text not shown); u8 `+0x24` -> `UpdateLastAllowedPosition` (anti-cheat bookkeeping, not needed); u8 `+0x2c` -> `FUN_10059ae5(1)` = FullStop if `IsMoving`; then vehicle vtable `+0x60` = `FUN_1006eed0` (`+0x174 = +0xd4 = y`, `LandNow(y)`) and `SetRelPosRot(pos, current rot)`. -> `Movement::set_pos` (rotation and velocity kept, airborne ends, landing callback). |
+| `n3TeleportIIR_t` 43197D22 | [N3 0x1003e68c] / `Activate` 0x10029f87 | in-playfield (`exit_door_id == 0`): `UpdateLastAllowedPosition`, `SetRelPosRot(pos, rot)`; own -> `OwnEvent::Place { full_reset }` -> `Movement::teleport` (zone change: docs/zone/world.md §10.2). |
+| `ImpulseIIR_c` 5F4A4C6C | [GC 0x10160fe0] / `FUN_100745bb`, read `FUN_10074731` | body `i32 n`, n x `{Identity, Vec3, f32}`; per element whose dynel exists `Vehicle_t::Impulse(vec3, f32)` [VH 0x1000cd61]: a `BallisticPath_t` (ctor `FUN_100011fb`) from the vehicle position to `pos + (dx, 0, dz)` (the y of the vector is overwritten by the vehicle's y) in `time` seconds, gravity **-9.81** (f32 @ VH 0x10012798, not the integrator's -20), `v0 = (dest - start)/T - g T/2`, eval `FUN_10001294` (`pos(t) = start + v0 t + g t²/2`, `t` clamped to `T`, returns `t <= T`). `FUN_1000c41a` installs it at `Vehicle+0x108` (replaces/deletes the old one, `+0xac = 0`, first path: saves the falling flag to `+0x150`, `DisableFalling`). `Vehicle_t::Run` [VH 0x1000e849] then skips the integrator: each call sets `pos` from the path, runs `EnsureSurfaceAlignment`, and aborts (position restored) when it moved the body >= 0.5 (f32 @ VH 0x10012134); at the end: delete, `+0x108 = 0`, vtable `+0x68`, `EnableFalling` if saved. While `+0x108 != 0` `FUN_10070fd0` (vtable 0x24) refuses every movement action. -> `Movement::impulse` / `run_ballistic` (alignment reduced to `World::align` + never below the support). A non-positive time is ignored (the original divides by it). |
+| `FollowTargetIIR_c` 260F3671 | [GC 0x10160f18] / `FUN_100732e3` | header = own dynel: (1) a non-zero `pos` is set with the current rotation **first** (`SetRelPosRot`; `FUN_1006fe02` repeats it as `SetRelPosIgnoreCollision`) - `Movement::follow_place`; (2) gate: dropped if Features bit 0 or `0x4000000` of the client char, or district fight-mode level (`FUN_1003e228` -> `FUN_1003e1d0`, default **2** without `PlayfieldDistrictInfo` data) > 1; (3) dropped in FSM modes 1, 8, 9, 0xB, 0xC; (4) else `fsm.vtable[6](mode)` (21 FullStop / 24 Walk / 25 Run) and `FUN_1006fe02` stores the follow target and <= 30 waypoints (`Vehicle+0x190`). The player vehicle's `CalcSteering` `FUN_10070fee` steers to the first waypoint (`SteeringDirArrive`) and clears the path through `FUN_1006fe02(0, ..)` when the same gate fires. -> `Player::follow_gated`, `Movement::follow_target`, `steer_follow`. A movement action cancels the path (`FUN_1006b84b`). |
+| `CharacterActionIIR_t` 0x63 (death), 0xAD | `FUN_1005d0d8` | 0x63: `FUN_10059ae5(1)` = FullStop while `IsMoving` (`Movement::stop_if_moving`; vehicle vtable `+0x98` = `FUN_100713a7` -> `FUN_1006f008` -> `Transition(0x15)`); 0xAD: LeaveSneak when mode 6. Movement is **not** blocked by death in the movement code (the only locks are `Vehicle+0x108`, dynel `+0x21d`, Features); the death clip is the combat layer's. |
+| `ResurrectIIR_t` 445F2A0B | [GC 0x10161290] / `FUN_100769bd` | body `i32 health, i32 nano`: `SetStat(Health 0x1b)`, `SetStat(CurrentNano 0xd6)` (-> `Zone::stats`), then `FUN_1003ea0d` (feedback texts, vehicle recalc `FUN_1006f963(0)`). |
+| `RelocateDynelsIIR_t` 264B514B | [GC 0x1015d484] / `FUN_1003a364` | re-parents the listed dynels to the header dynel (`n3Dynel_t::RelocateDynel(parent, child, null pos/rot)`); not decoded (vehicles / transports). |
+
+**Stat hook** `FUN_10059e6a(stat, value)` (the character's `SetStat`), what it does to the vehicle: stat 0 `Flags`: `0x20000000` -> `DisableFalling` else `EnableFalling`, `0x80000000` ->
+`DisableSurfaceCollision` else enable (`Movement::set_stats`: `Stats::flags`); `RunSpeed` 0x9c and `Health` 0x1b (in mode 3, when crossing the 15 % threshold) -> `FUN_1006f963` = speed
+recalculation (`recalc`, run every frame here); `MechData` 0x296 -> 0 clears a vehicle object. `WaitState` 0x1ae, `Features` 0xe0 and `CurrentMovementMode` 0xad have **no hook** (they are
+only read). `FUN_10044842 / 10044a07` (Features bit counters used by the status machine of fear / charm effects) call `Transition(0x17)` Frozen when bit 4 changes - the trigger is the
+nano-effect pipeline (`FUN_100a8161`: "Feedback_FearActivated", swaps the `PlayerVehicle_t` for an `NPCVehicle_t` and sets dynel `+0x21d` = input lock via `FUN_10058d6c`), which is not
+implemented: **[UNRESOLVED]** root / snare / fear / charm need `ApplySpellsIIR_t` and the spell effect table.
+
+**Camping / logout** (`/camp` = AFCM 0x134 `StartQuitToLoginMessage` [GUI 0x10027c74] -> `N3Msg_StartCamping`): `CampStartedMessage` [GUI 0x10029d38] creates the timer bar 40000 "Logout" with
+LDB text 0xc8 fed with 30 and emits signal `+0x17c`; `CancelCampMessage` [0x10029c26] (AFCM 0x20) deletes it; `QuitGameToLoginMessage` -> `ActivateGameClosing(2)` [0x10028194]: save config,
+clear the screen, 9 frames, login. `StartLogoutIIR_t` / `StopLogoutIIR_t` have no client apply (validity + read only), so the 30 s expiry is the server's [INFERENCE]; `Play::camp` /
+`camp_frame` return to the login after 30 s unless special action 0x52 cancels. The timer bar and its text are not drawn.
