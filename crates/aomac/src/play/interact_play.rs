@@ -30,6 +30,11 @@ impl Play {
     pub(super) fn interact_frame(&mut self) {
         let Some(i) = self.interact.as_mut() else { return };
         i.resize(self.size);
+        for t in i.take_notices() {
+            if let Some(c) = self.chat.as_mut() {
+                c.system_line(&mut self.gui, &t, 12);
+            }
+        }
         for f in i.take_outbox() {
             if let Some(s) = &self.session {
                 s.send_zone(f);

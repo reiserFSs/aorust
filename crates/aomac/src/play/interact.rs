@@ -31,6 +31,8 @@ pub struct Interact {
     talk: HashMap<i32, i32>,
     chat: Option<NpcChat>,
     outbox: Vec<Frame>,
+    /// Text of `KnubotCloseChatWindow` for the chat window ([INFERENCE]: the `+0xf0` slot's consumer was not located; the live server sends the reason, e.g. "You are too far away from <npc> to continue this conversation.").
+    notices: Vec<String>,
     /// `n3Command_t` sequence numbers of the commands we sent.
     seq: i32,
     /// Screen size for centring the window.
@@ -73,6 +75,10 @@ impl Interact {
         if let Some(c) = self.chat.take() {
             c.close(gui);
         }
+    }
+
+    pub fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
     }
 
     pub fn take_outbox(&mut self) -> Vec<Frame> {
@@ -131,7 +137,10 @@ impl Interact {
                 }
             }
             // the server closed the window: the destructor does not answer (`this[0x98]` set)
-            Knubot::Close { npc, .. } => {
+            Knubot::Close { npc, text, .. } => {
+                if !text.is_empty() {
+                    self.notices.push(text);
+                }
                 if let Some(c) = self.chat.take_if(|c| c.npc == npc) {
                     c.close(gui);
                 }
