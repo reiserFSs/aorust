@@ -179,7 +179,7 @@ pub(super) fn route(c: &ao_formats::playfield::collision::Collision, from: [f32;
                     let w = c.walk(p, want);
                     p = w.pos;
                     !w.airborne && (p[0] - want[0]).abs() + (p[2] - want[2]).abs() < 0.03
-                }) && (p[1] - a[1]).abs() <= ao_formats::playfield::collision::STEP_HEIGHT + 0.12;
+                }) && (p[1] - a[1]).abs() <= ao_formats::playfield::collision::STEP_HEIGHT + 0.12 + if c.liquid_at(p).is_some() { 1.2 } else { 0.0 };
                 if !walked {
                     let w = c.walk(a, [b[0], a[1], b[2]]);
                     let open = (w.pos[0] - b[0]).abs() + (w.pos[2] - b[2]).abs() < 0.03;
@@ -395,7 +395,7 @@ fn live_walk() {
                 let col = ao_formats::playfield::collision::Collision::load(&ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap(), l.p.zone.playfield.unwrap()).unwrap();
                 let path = route(&col, l.p.zone.own().unwrap().pos, (x.parse().unwrap(), z.parse().unwrap()));
                 eprintln!("route of {} cells", path.len());
-                let route_len = path.len();
+                let (route_len, pf0) = (path.len(), l.p.zone.playfield);
                 let mut pilot = Pilot::new(path);
                 let t = Instant::now();
                 l.dt_cap = 0.1;
@@ -410,7 +410,7 @@ fn live_walk() {
                             l.shot(&format!("goto{logs}"));
                         }
                     }
-                    if pilot.step(&mut l.p, &mut l.o.host) || t.elapsed().as_secs() > 240 {
+                    if pilot.step(&mut l.p, &mut l.o.host) || t.elapsed().as_secs() > 240 || l.p.zone.playfield != pf0 {
                         break;
                     }
                 }
@@ -582,20 +582,24 @@ fn live_walk() {
                     eprintln!("inv slot {slot:#x}: {e:?}");
                 }
             }
-            // `zc=secs`: runs frames for that long and prints the zone change state every 0.5 s (playfield, teleporting, awaiting the CharInPlay
-            // echo, world ready, screen fade, own position) and writes a frame `zc<n>` every second
+            // `zc=secs`: runs frames for that long and prints the zone change state whenever it changes and every 0.5 s (playfield, teleporting, awaiting
+            // the CharInPlay echo, world ready, own position, dynel count) and writes a frame at every change (`zc<n>`, at most 14)
             "zc" => {
-                let (t, mut n) = (Instant::now(), 0);
+                let (t, mut n, mut shots, mut prev) = (Instant::now(), 0, 0, String::new());
                 while t.elapsed().as_secs_f32() < v.parse().unwrap() {
                     let list = l.tick();
-                    if t.elapsed().as_secs_f32() >= n as f32 * 0.5 {
+                    let state = format!("pf {:?} teleporting {} awaiting_alive {} world_ready {} in_play_sent {} player {} input_open {} dynels {}", l.p.zone.playfield, l.p.teleporting, l.p.awaiting_alive, l.p.world_ready, l.p.zone.in_play_sent, l.p.player.is_some(), l.p.game_input_open(), l.p.zone.dynels.len());
+                    let changed = state != prev;
+                    if changed || t.elapsed().as_secs_f32() >= n as f32 * 0.5 {
                         n += 1;
-                        eprintln!("zc {:.1}s: pf {:?} teleporting {} awaiting_alive {} world_ready {} in_play_sent {} player {} dynels {} {}", t.elapsed().as_secs_f32(), l.p.zone.playfield, l.p.teleporting, l.p.awaiting_alive, l.p.world_ready, l.p.zone.in_play_sent, l.p.player.is_some(), l.p.zone.dynels.len(), l.pos());
-                        if n % 2 == 1 {
+                        eprintln!("zc {:.2}s{}: {state} {}", t.elapsed().as_secs_f32(), if changed { " CHANGE" } else { "" }, l.pos());
+                        if changed && shots < 14 {
+                            shots += 1;
                             if let Some(dir) = &l.shots {
-                                l.o.png(&l.p, &list, &dir.join(format!("zc{}.png", n / 2))).unwrap();
+                                l.o.png(&l.p, &list, &dir.join(format!("zc{shots}.png"))).unwrap();
                             }
                         }
+                        prev = state;
                     }
                 }
             }
@@ -627,6 +631,11 @@ fn live_walk() {
                 let p = &mut l.p;
                 eprintln!("gridsel {v}: {}", p.interact.as_mut().unwrap().grid_select(&mut p.gui, v.parse().unwrap()));
                 l.wait(6.0);
+            }
+            // `useq=<kind>:<instance>`: `N3Msg_UseItem` (`GenericCmd` 3) without any wait (follow it with `zc=secs` to watch what the server does)
+            "useq" => {
+                let (kind, inst) = v.split_once(':').unwrap();
+                l.p.interact.as_mut().unwrap().use_object(ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() });
             }
             "cam" => {
                 let c = l.o.host.camera;
