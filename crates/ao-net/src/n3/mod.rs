@@ -7,6 +7,7 @@ pub mod action;
 pub mod combat;
 pub mod chat;
 pub mod dynel;
+pub mod grid;
 pub mod inventory;
 pub mod knubot;
 pub mod misc;
@@ -65,6 +66,8 @@ pub enum N3 {
     Inventory(inventory::InventoryMsg),
     /// `Knubot*IIR_c`: NPC dialogue and NPC trade (docs/zone/interact.md).
     Knubot(knubot::Knubot),
+    /// `GridDestinationSelectIIR_t` / `GridSelectedIIR_t`: grid terminal / whompah / shuttle destinations (docs/zone/interact.md).
+    Grid(grid::Grid),
     /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
     Unknown(Vec<u8>),
 }
@@ -99,6 +102,8 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
         N3::Inventory(m)
     } else if let Some(m) = knubot::decode(&h, &mut r)? {
         N3::Knubot(m)
+    } else if let Some(m) = grid::decode(&h, &mut r)? {
+        N3::Grid(m)
     } else {
         N3::Unknown(f.payload[13..].to_vec())
     };

@@ -43,6 +43,7 @@ mod hud_target;
 mod hud_use;
 mod interact;
 mod interact_chat;
+mod interact_grid;
 mod interact_play;
 mod logout;
 mod own_nanos;

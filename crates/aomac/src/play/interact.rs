@@ -6,10 +6,12 @@
 //! * Everything the player does in a dialogue goes out through [`Interact::take_outbox`].
 
 use super::interact_chat::{ChatOut, NpcChat};
+use super::interact_grid::GridUi;
 use super::zone::Zone;
 use ao_gui::{Event, Gui};
 use ao_net::frame::Frame;
 use ao_net::msg::Identity;
+use ao_net::n3::grid::Grid;
 use ao_net::n3::knubot::{self, Knubot};
 use ao_net::n3::misc::{GenericArgs, GenericCmd, Misc};
 use ao_net::n3::outgoing::{n3_frame, DYNEL_CHAR};
@@ -30,6 +32,8 @@ pub struct Interact {
     /// Last value of stat `0x300` per dynel.
     talk: HashMap<i32, i32>,
     chat: Option<NpcChat>,
+    /// Grid / whompah / shuttle destination window (`interact_grid.rs`).
+    grid: GridUi,
     outbox: Vec<Frame>,
     /// Text of `KnubotCloseChatWindow` for the chat window ([INFERENCE]: the `+0xf0` slot's consumer was not located; the live server sends the reason, e.g. "You are too far away from <npc> to continue this conversation.").
     notices: Vec<String>,
@@ -72,6 +76,7 @@ impl Interact {
 
     /// The zone changes or the connection ends: the dialogue window goes away without a word to the server.
     pub fn close_all(&mut self, gui: &mut Gui) {
+        self.grid.close_all(gui);
         if let Some(c) = self.chat.take() {
             c.close(gui);
         }
@@ -102,6 +107,7 @@ impl Interact {
                 }
             }
             N3::Knubot(k) => self.on_knubot(gui, k, zone),
+            N3::Grid(Grid::DestinationSelect { destinations, token }) => self.grid.activate(gui, self.screen, zone, who, destinations, token),
             _ => {}
         }
     }
@@ -151,6 +157,11 @@ impl Interact {
 
     /// GUI events of the NPC chat window; `true` when consumed.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
+        let me = self.own_id();
+        if let Some(out) = self.grid.event(gui, ev, me) {
+            out.into_iter().for_each(|p| self.send(p));
+            return true;
+        }
         let own = Self::own_name(zone);
         let Some(c) = self.chat.as_mut() else { return false };
         let npc = c.npc;
@@ -233,6 +244,19 @@ impl Interact {
                 self.log
             ),
         }
+    }
+
+    /// The grid window's rows as shown (`interact_grid.rs`).
+    pub fn grid_dump(&self, gui: &Gui) -> String {
+        self.grid.dump(gui)
+    }
+
+    /// Select list entry `index` in the grid window and press Go; false when there is no such entry.
+    pub fn grid_select(&mut self, gui: &mut Gui, index: usize) -> bool {
+        let me = self.own_id();
+        let Some(out) = self.grid.select(gui, me, index) else { return false };
+        out.into_iter().for_each(|p| self.send(p));
+        true
     }
 
     /// `(instance, stat 0x300)` of every dynel the server flagged.
