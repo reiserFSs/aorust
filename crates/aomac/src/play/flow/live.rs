@@ -599,6 +599,35 @@ fn live_walk() {
                     }
                 }
             }
+            // `props=<radius>`: the world objects (doors, terminals, vending machines, corpses, items) near the character, with their `Can` stat
+            "props" => {
+                let me = l.p.zone.own().unwrap().pos;
+                let mut v: Vec<_> = l.p.zone.world.prop_list().into_iter().map(|(k, i, p, c)| (((p[0] - me[0]).powi(2) + (p[2] - me[2]).powi(2)).sqrt(), k, i, p, c)).filter(|e| e.0 < v.parse().unwrap_or(30.0)).collect();
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for (d, k, i, p, c) in v {
+                    eprintln!("prop {k}:{i} kind={k:#x} can={c:?} dist={d:.1} at {:.1},{:.1},{:.1}", p[0], p[1], p[2]);
+                }
+            }
+            // `use=<kind>:<instance>`: `N3Msg_DefaultActionOnDynel` on a world object (`Can` bit 0 get, bit 3 use), then what the UI shows
+            "use" => {
+                let (kind, inst) = v.split_once(':').unwrap();
+                let id = ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() };
+                let p = &mut l.p;
+                eprintln!("use {v}: can={:?} -> {:?}", crate::play::interact::Interact::can_of(&p.zone, id), p.interact.as_mut().unwrap().default_action_on(&p.zone, id));
+                l.wait(4.0);
+                let p = &mut l.p;
+                let i = p.interact.as_mut().unwrap();
+                eprintln!("feedback {:?}\ngrid: {}\nloot: {:?}\n{}", i.take_feedback(), i.grid_dump(&p.gui), i.loot_dump(&mut p.gui), i.dump(&p.gui));
+            }
+            "grid" => {
+                let p = &l.p;
+                eprintln!("grid: {}", p.interact.as_ref().unwrap().grid_dump(&p.gui));
+            }
+            "gridsel" => {
+                let p = &mut l.p;
+                eprintln!("gridsel {v}: {}", p.interact.as_mut().unwrap().grid_select(&mut p.gui, v.parse().unwrap()));
+                l.wait(6.0);
+            }
             "cam" => {
                 let c = l.o.host.camera;
                 eprintln!("camera pos {:.2} {:.2} {:.2} yaw {:.2} pitch {:.2} lens {:?}", c.pos.x, c.pos.y, c.pos.z, c.yaw, c.pitch, l.o.host.lens);

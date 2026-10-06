@@ -779,6 +779,12 @@ impl Dynels {
             .collect()
     }
 
+    /// Live harness: `(kind, instance, server position, can stat)` of every prop.
+    #[cfg(test)]
+    pub fn prop_list(&self) -> Vec<(i32, i32, [f32; 3], Option<i32>)> {
+        self.props.iter().map(|(&(k, i), p)| (k, i, p.pos, self.stat_of(k, i, CAN_STAT))).collect()
+    }
+
     /// A message for the door `who` (queued while its model is still being built; unknown doors ignore it, like the client's `GetDynel`).
     fn door_command(&mut self, who: ao_net::msg::Identity, c: Cmd) {
         let Some(p) = self.props.get_mut(&(who.kind, who.instance)) else { return };
