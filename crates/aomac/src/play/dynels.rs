@@ -1413,6 +1413,18 @@ mod tests {
 mod variant_tests {
     use super::*;
     use crate::play::zone::Zone;
+    use ao_net::frame::Frame;
+
+    fn frames(rec: &str) -> Vec<Frame> {
+        rec.lines()
+            .filter_map(|l| {
+                let mut p = l.split(' ');
+                let (_, dir, hex) = (p.next()?, p.next()?, p.next()?);
+                let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+                (dir == "<").then(|| Frame::decode_with(&b, false).ok().flatten().map(|(f, _)| f)).flatten()
+            })
+            .collect()
+    }
 
     fn client() -> Option<PathBuf> {
         let d = PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
@@ -1462,46 +1474,45 @@ mod variant_tests {
         assert_eq!(held.0, built.model.meshes[0].vertices);
     }
 
-    /// The kill of `zone_fight_ithaca.rec` (`CharacterAction` 99 with death animation 503 on a Beach Leet): the NPC plays its death clip and holds it.
+    /// The kill of `zone_fight_ithaca.rec` (`CharacterAction` 99, death animation 503, on a Beach Leet) applied to a Beach Leet of
+    /// `zone_ithaca.rec` (the fight capture starts after the NPC was announced): it plays its death clip and holds the last frame.
     #[test]
     fn replayed_kill_plays_the_death_clip() {
         let Some(dir) = client() else { return };
-        let mut z = Zone::new(33512);
-        z.world.start(dir, 33512);
-        let rec = include_str!("../../../../docs/captures/zone_fight_ithaca.rec");
-        let (mut host, mut last_ms) = (Host::headless(), 0u32);
-        let mut dead_seen = false;
-        let eye = [0.0; 3];
-        for l in rec.lines() {
-            let mut p = l.split(' ');
-            let (ms, dir, hex) = (p.next().unwrap().parse::<u32>().unwrap(), p.next().unwrap(), p.next().unwrap());
-            if dir != "<" {
-                continue;
-            }
-            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
-            while last_ms + 50 <= ms {
-                z.world.update(0.05, eye, [0.0, 0.0, -1.0], &mut host);
-                host.actors.clear();
-                last_ms += 50;
-                if last_ms < 26000 {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut z = Zone::new(25988);
+        z.world.start(dir, 25988);
+        for f in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            z.on_frame(&f);
+        }
+        let mut kill = None;
+        for f in frames(include_str!("../../../../docs/captures/zone_fight_ithaca.rec")) {
+            if let Ok(m) = ao_net::n3::decode(&f) {
+                if matches!(&m.body, N3::World(World::CharacterAction(a)) if a.action == 99) {
+                    kill = Some(m);
                 }
             }
-            let Some((f, _)) = ao_net::frame::Frame::decode_with(&b, false).ok().flatten() else { continue };
-            z.on_frame(&f);
-            dead_seen |= matches!(z.world.chars.get(&1037993).map(|c| c.special), Some(Special::Die(_)));
         }
-        assert!(dead_seen, "the death action reaches the NPC");
-        // let the worker finish the model, then run the clock past the clip
-        for _ in 0..400 {
-            z.world.update(0.05, eye, [0.0, 0.0, -1.0], &mut host);
+        let mut kill = kill.expect("the capture holds the kill");
+        let leet = *z.world.chars.iter().find(|(_, c)| c.name == "Beach Leet").expect("a Beach Leet in the zone capture").0;
+        kill.header.target.instance = leet;
+        z.world.on_message(&kill);
+        assert!(matches!(z.world.chars[&leet].special, Special::Die(503)));
+        let mut host = Host::headless();
+        let (eye, fwd) = (crate::play::zone::scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
+        for _ in 0..600 {
+            z.world.update(0.05, eye, fwd, &mut host);
             host.actors.clear();
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let c = &z.world.chars[&1037993];
+        let c = &z.world.chars[&leet];
         let Some(Model::Ready { built, .. }) = z.world.models.get(&c.key) else { panic!("model not ready") };
         eprintln!("kill: special {:?} anim {} clips {:?}", c.special, c.anim, built.clips.keys().collect::<Vec<_>>());
         assert!(matches!(c.special, Special::Die(_)));
         assert!(c.anim == 503 || c.anim == DIE_KEY, "playing a death clip, not idle: {}", c.anim);
+        // the server removes the dynel ~3 s later (`n3ToClientQuit`): the NPC is gone
+        let mut quit = kill.clone();
+        quit.body = N3::Misc(Misc::ToClientQuit);
+        z.world.on_message(&quit);
+        assert!(!z.world.chars.contains_key(&leet));
     }
 }

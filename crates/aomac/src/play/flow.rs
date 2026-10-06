@@ -103,6 +103,10 @@ impl Play {
         self.close_all();
         self.conn_gen += 1; // a connect still in flight is stale now (Bg::Connected is dropped)
         self.session = None; // dropping the session closes the connection (ResetConnectionAndConfig)
+        self.hud_pending.clear();
+        if let Some(h) = self.hud.take() {
+            h.close(&mut self.gui); // leaving the world
+        }
         if self.cc.is_some() {
             self.cc_close_windows();
             self.cc = None;
@@ -515,6 +519,26 @@ impl Play {
     /// world (`DisplaySystem+0x44 = 0`, the GUI stays; black behind it is [INFERENCE]) and locks the input. The old dynels die
     /// (`n3Playfield_t::StopPlayfield`); `CharInPlay` is owed again after `TeleportEnded` (docs/zone/world.md §10.2).
     fn begin_zone_change(&mut self, host: &mut Host) {
+        self.teleport_started(host);
+        // `StopPlayfield` runs once per playfield: a second event before the new world exists finds nothing left to stop
+        if !std::mem::take(&mut self.world_ready) {
+            return;
+        }
+        self.player = None;
+        host.fly = false;
+        self.zone.reset_world();
+        self.fight_reset();
+        self.interact_reset();
+        self.world_frames = 0;
+        self.world_scene = None;
+        self.world_ground = None;
+        self.fade = Fade::Hold;
+    }
+
+    /// `FlowControlModule_t::TeleportStartedMessage` (GUI event 5), also posted by `TeleportTrier_t::StartTryingTeleport` of the client-initiated
+    /// path while the playfield keeps running: guarded by `m_isTeleporting`; prints `ChangingArea`, drops the target, stops the user input
+    /// (`InputConfig+0x18`) and switches the 3D viewport off until `AliveMessage` ([`Play::alive`]).
+    fn teleport_started(&mut self, host: &mut Host) {
         if std::mem::replace(&mut self.teleporting, true) {
             return;
         }
@@ -522,31 +546,53 @@ impl Play {
             c.system_line(&mut self.gui, &t, 12);
         }
         self.zone.target = None;
-        self.player = None;
+        self.awaiting_alive = true;
         host.look = false;
-        host.fly = false;
-        self.zone.reset_world();
-        self.fight_reset();
-        self.interact_reset();
+    }
+
+    /// `TeleportEndedMessage` (GUI event 6) when no new world follows (`TeleportTrier_t::TeleportFailed`): guarded by `m_isTeleporting`; the
+    /// `Entering ...` line and the `CharInPlay` countdown start again (the viewport and the input wait for `AliveMessage` as ever).
+    fn teleport_ended(&mut self) {
+        if !std::mem::take(&mut self.teleporting) {
+            return;
+        }
+        self.entering_text();
         self.world_frames = 0;
-        self.world_ready = false;
-        self.world_scene = None;
-        self.world_ground = None;
-        self.fade = Fade::Hold;
+        self.zone.in_play_sent = false;
+    }
+
+    /// `FlowControlModule_t::AliveMessage` [GUI 0x10028543], posted by the server's echo of our `CharInPlayIIR_t` for the own character
+    /// (`CharInPlayIIR_t::Activate` [GC 0x1007264d]): `SetStaticInputMode(8)`, `Activate3DViewPort` (the world is drawn again),
+    /// `EnableUserInput`, and the `CharInPlay` countdown flag (`DAT_102760cd`) clears. The original has no timeout: without the echo the
+    /// viewport stays off and the input stopped after a teleport.
+    fn alive(&mut self) {
+        self.awaiting_alive = false;
+        self.zone.in_play_sent = true;
+    }
+
+    /// Whether the game keys / mouse reach the [`Player`](player::Player): `InputConfig+0x18` (`isUserInputStopped`, = `awaiting_alive`) is
+    /// clear. `InputConfig_t::FrameProcess` [GUI 0x1001ae14] drops the whole input queue while it is set (except events `0x8002a` /
+    /// `0xe002f`), the GUI's included; the port keeps the GUI input alive (a missing echo must not lock the window) and holds back only the
+    /// game input. Releases always pass: `EnableUserInput` resets the key states, which the port replaces by never dropping a release.
+    fn game_input_open(&self) -> bool {
+        !self.awaiting_alive
     }
 
     /// `TeleportEndedMessage`: `EnteringPF` ("Entering '%s'") with the playfield name (`N3Msg_GetPFName`), or `EnteringNewArea` when the
-    /// playfield has no name or `N3Msg_IsDungeon`, as a red System line. The name comes from `pfnrmap.dat` like the character list's
-    /// (`FUN_1003676c`, the lookup `GetPFName` tries first, then the playfield's own name); [GUESS] no dungeon test, a named dungeon
-    /// says `EnteringPF`.
+    /// playfield has no name or `N3Msg_IsDungeon` (`Report::dungeon`), as a red System line. The name comes from `pfnrmap.dat` like the
+    /// character list's (`FUN_1003676c`, the lookup `GetPFName` tries first, then the playfield's own name).
     fn entering_text(&mut self) {
-        let name = self.zone.playfield.and_then(|p| self.pf_names.get(&p));
-        let line = match name {
-            Some(n) => self.text.by_key(110, "EnteringPF").map(|t| t.replace("%s", n)),
-            None => self.text.by_key(110, "EnteringNewArea"),
-        };
+        let line = self.entering_line();
         if let (Some(c), Some(t)) = (self.chat.as_mut(), line) {
             c.system_line(&mut self.gui, &t, 12);
+        }
+    }
+
+    /// The text of [`Play::entering_text`].
+    fn entering_line(&self) -> Option<String> {
+        match self.zone.playfield.and_then(|p| self.pf_names.get(&p)).filter(|_| !self.dungeon) {
+            Some(n) => self.text.by_key(110, "EnteringPF").map(|t| t.replace("%s", n)),
+            None => self.text.by_key(110, "EnteringNewArea"),
         }
     }
 
@@ -573,15 +619,23 @@ impl Play {
     /// `PlayfieldAnarchyFIIR_t` arrived: load that playfield in the background (the loading screen stays up until it is ready).
     fn start_world_load(&mut self, id: u32) {
         self.world_sky = None;
-        let (dir, tx) = (self.dir.clone(), self.tx.clone());
+        let (dir, tx, want_audio) = (self.dir.clone(), self.tx.clone(), self.audio.is_some());
         // the zone clock and game day (`GameTimeIIR_t`) when the burst reached the playfield message; later `GameTime`s resync the live sky
         let (day_time, day) = (self.zone.day_time(), self.zone.game_day as u32);
         std::thread::spawn(move || {
-            let r = RecordStore::open(&dir).and_then(|store| ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day));
+            let mut r = RecordStore::open(&dir).and_then(|store| {
+                let (scene, report) = ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day)?;
+                // `PlayfieldInit` [GC 0x10016e2c] -> `SandyInterfaceModule_t::ActivateGameZone`: district music, ambience and statel emitters
+                let audio = want_audio.then(|| ao_audio::PlayfieldAudio::load(&store, id, &report.sounds).map_err(|e| eprintln!("playfield audio {id}: {e:#}")).ok()).flatten();
+                Ok((scene, report, audio))
+            });
             // the Map window's ground image comes from the scene just built (`Report::ground`), not from a second load (docs/gui.md 12)
-            let ground = r.as_ref().ok().and_then(|(scene, report)| hud::ground_map(scene, report));
+            let ground = r.as_ref().ok().and_then(|(scene, report, _)| hud::ground_map(scene, report));
             let _ = tx.send(Bg::Ground(id, ground.map(Box::new)));
-            let r = r.map(|(scene, _)| Box::new(scene)).map_err(|e| format!("{e:#}"));
+            if let Ok((_, report, audio)) = &mut r {
+                let _ = tx.send(Bg::Info(id, report.dungeon, audio.take().map(Box::new)));
+            }
+            let r = r.map(|(scene, ..)| Box::new(scene)).map_err(|e| format!("{e:#}"));
             match ao_formats::playfield::SkyClock::open(&dir, id) {
                 Ok(c) => drop(tx.send(Bg::Sky(id, c))),
                 Err(e) => eprintln!("live sky of playfield {id}: {e:#}"),
@@ -622,6 +676,11 @@ impl Play {
                 Bg::Sky(..) => {}
                 Bg::Ground(id, g) if Some(id) == self.zone.playfield => self.world_ground = g.map(|g| (id, g)),
                 Bg::Ground(..) => {}
+                Bg::Info(id, dungeon, audio) if Some(id) == self.zone.playfield => {
+                    self.dungeon = dungeon;
+                    self.world_audio = audio.map(|a| (id, a));
+                }
+                Bg::Info(..) => {}
                 // a load that the server has since replaced by another playfield is dropped
                 Bg::World(id, _) if Some(id) != self.zone.playfield => {}
                 Bg::World(id, Ok(scene)) => {
@@ -667,6 +726,7 @@ impl Play {
                 LoginEvent::ZoneHandoff { zone_ip, zone_port, character_id } => {
                     eprintln!("zone hand-off to {zone_ip}:{zone_port}");
                     self.zone = zone::Zone::new(character_id);
+                    self.awaiting_alive = false;
                     self.fight_reset();
                     self.interact_reset();
                     let mut chat = chat::Chat::new();
@@ -678,7 +738,7 @@ impl Play {
                     self.world_frames = 0;
                     self.start_loading(host);
                 }
-                LoginEvent::ZoneFrame(f) => match {
+                LoginEvent::ZoneFrame(f) => {
                     if let Some(c) = self.chat.as_mut() {
                         c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text);
                     }
@@ -686,25 +746,33 @@ impl Play {
                         m.on_frame(&f);
                     }
                     self.interact_zone_frame(&f);
-                    self.zone.on_frame(&f)
-                } {
-                    zone::ZoneEvent::Playfield(id) => {
-                        eprintln!("zone: playfield {id}");
-                        if self.screen == Screen::InWorld {
-                            self.begin_zone_change(host);
-                        }
-                        self.start_world_load(id);
-                    }
-                    // `n3TeleportIIR_t` (own, destination playfield): `StartTeleport` -> `TeleportStarted`, before the new playfield arrives
-                    zone::ZoneEvent::Teleport => {
-                        if self.screen == Screen::InWorld {
-                            self.begin_zone_change(host);
+                    if hud::Hud::wants_zone_frame(&f) {
+                        match self.hud.as_mut() {
+                            Some(h) => h.on_zone_frame(&f, self.zone.char_id as i32),
+                            None => self.hud_pending.push(f.clone()),
                         }
                     }
-                    // `GameTime_t::Update`: the clock jumps to the server's; the loading world already used the older one
-                    zone::ZoneEvent::Time => host.sky_clock = Some(self.zone.day_time()),
-                    zone::ZoneEvent::None => {}
-                },
+                    match self.zone.on_frame(&f) {
+                        zone::ZoneEvent::Playfield(id) => {
+                            eprintln!("zone: playfield {id}");
+                            if self.screen == Screen::InWorld {
+                                self.begin_zone_change(host);
+                            }
+                            self.start_world_load(id);
+                        }
+                        // `n3TeleportIIR_t` (own, destination playfield): `StartTeleport` -> `TeleportStarted`, before the new playfield arrives
+                        zone::ZoneEvent::Teleport => {
+                            if self.screen == Screen::InWorld {
+                                self.begin_zone_change(host);
+                            }
+                        }
+                        // the server's echo of our `CharInPlay`: `AliveMessage`
+                        zone::ZoneEvent::Alive => self.alive(),
+                        // `GameTime_t::Update`: the clock jumps to the server's; the loading world already used the older one
+                        zone::ZoneEvent::Time => host.sky_clock = Some(self.zone.day_time()),
+                        zone::ZoneEvent::None => {}
+                    }
+                }
                 LoginEvent::ZoneRedirect { zone_ip, zone_port } => {
                     // the session thread has reconnected (system message 0x3C); the new server's burst follows
                     eprintln!("zone redirection to {zone_ip}:{zone_port}");
@@ -841,9 +909,12 @@ impl Frontend for Play {
     }
 
     fn input(&mut self, ev: InputEvent, host: &mut Host) {
+        let open = self.game_input_open();
         if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
             if let InputEvent::MouseDown { x, y, .. } | InputEvent::MouseUp { x, y, .. } | InputEvent::Wheel { x, y, .. } = ev {
-                p.mouse(&ev, self.gui.wants_mouse(x, y));
+                if open || matches!(ev, InputEvent::MouseUp { .. }) {
+                    p.mouse(&ev, self.gui.wants_mouse(x, y));
+                }
             }
         }
         self.interact_mouse(&ev, host);
@@ -870,7 +941,7 @@ impl Frontend for Play {
             return;
         }
         if let Some(h) = self.hud.as_mut() {
-            h.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default());
+            h.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default(), host.mods);
             // CTRL / ALT + left click on a character: select (done) and `N3Msg_SwitchTarget` (`FUN_1002c469`)
             let clicked = h.take_click();
             if let (Some(id), Some(p)) = (clicked, self.player.as_ref()) {
@@ -903,8 +974,11 @@ impl Frontend for Play {
     }
 
     fn game_input(&mut self, ev: ao_render::GameInput, _host: &mut Host) {
+        let open = self.game_input_open();
         if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
-            p.game_input(ev);
+            if open || matches!(ev, ao_render::GameInput::Key { pressed: false, .. }) {
+                p.game_input(ev);
+            }
         }
     }
 
@@ -966,6 +1040,12 @@ impl Frontend for Play {
                     let sky = self.world_sky.take().map(|c| c.on_day(self.zone.game_day as u32));
                     host.live_sky = Some(sky.map(|mut c| ao_render::LiveSky { start: self.zone.day_time(), scale: 1.0, source: Box::new(move |t| c.at(t)) }));
                     host.camera = Camera::look_at(eye, at);
+                    // `PlayfieldInit` -> `SandyInterfaceModule_t::ActivateGameZone`: the district music / ambience / emitters of the new playfield
+                    // replace the old ones (none: leave the playfield, nothing keeps playing from the previous zone)
+                    let pf_audio = self.world_audio.take().map(|(_, p)| *p);
+                    if let Some(a) = &self.audio {
+                        a.set_playfield(pf_audio);
+                    }
                     self.screen = Screen::InWorld;
                     // `TeleportEndedMessage` [GUI 0x100292ce]: the flag clears and the countdown to `CharInPlay` starts again; the HUD and
                     // chat windows of the old world are still there (docs/zone/world.md §10.2)
@@ -974,6 +1054,11 @@ impl Frontend for Play {
                         match hud::Hud::new(&mut self.gui, &self.dir, self.size) {
                             Ok(h) => self.hud = Some(h),
                             Err(e) => eprintln!("hud: {e:#}"),
+                        }
+                        if let Some(h) = self.hud.as_mut() {
+                            for f in std::mem::take(&mut self.hud_pending) {
+                                h.on_zone_frame(&f, self.zone.char_id as i32);
+                            }
                         }
                         // `LoadUserConfig` (GUI 0x1006bacd): the account's / character's prefs files over the template defaults
                         if let (Some(h), Some(d), Some(a)) = (self.hud.as_mut(), super::prefs::dir(), self.prefs.accounts.get(self.prefs.selected_account)) {
@@ -1042,6 +1127,21 @@ impl Frontend for Play {
                     }
                 }
             }
+            // `TeleportTrier_t` of the client-initiated path: `StartTryingTeleport` posts event 5, `TeleportFailed` event 6 and the feedback line
+            for ev in std::mem::take(&mut self.zone.teleport_events) {
+                match ev {
+                    zone::TeleportEvent::Started => self.teleport_started(host),
+                    zone::TeleportEvent::Failed => {
+                        self.teleport_ended();
+                        if let Some(c) = self.chat.as_mut() {
+                            c.feedback(&mut self.gui, "Feedback_AreaChangeNotInitiated", &self.text);
+                        }
+                    }
+                }
+            }
+            if self.awaiting_alive {
+                host.look = false; // `InputConfig+0x18`: the mouse look is stopped with the rest of the user input
+            }
             self.fight_frame(dt);
             self.camp_frame(dt, host);
             self.zone.world.update(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host);
@@ -1093,6 +1193,29 @@ impl Frontend for Play {
                 h.dvalues.save_user();
             }
         }
+        // `/waypoint` (map marker, `GlobalSignals+0x158`), heard voice messages (`PlayPlayerFX`), `/macro` (docs/chat/dialogs.md §6)
+        if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_ref()) {
+            let d = &h.dvalues;
+            c.set_voice_prefs(super::chat::VoicePrefs {
+                fx_type: d.get_i64("VoiceSndFxType").unwrap_or(0) as i32,
+                hear_vicinity: d.flag("VoiceSndFxHearVicinityOn"),
+                hear_guild: d.flag("VoiceSndFxHearGuildOn"),
+                hear_team: d.flag("VoiceSndFxHearTeamOn"),
+            });
+        }
+        if let Some(rq) = self.chat.as_mut().map(|c| c.take_requests()) {
+            if let (Some(w), Some(h)) = (rq.waypoint, self.hud.as_mut()) {
+                h.set_mission(Some(w));
+            }
+            if let (Some(m), Some(h)) = (&rq.macro_drag, self.hud.as_mut()) {
+                h.begin_macro_drag(&mut self.gui, m.id, &m.name, &m.command);
+            }
+            if let Some(a) = &self.audio {
+                for s in &rq.sounds {
+                    a.play_sfx(s, 1.0);
+                }
+            }
+        }
         // Friends / Team Search windows follow the HUD's `friends_window` / `lft_window` dvalues (docs/chat/social.md)
         if let (Some(c), Some(h)) = (self.chat.as_mut(), self.hud.as_mut()) {
             c.sync_windows(&mut self.gui, h.dvalue("friends_window"), h.dvalue("lft_window"), &self.text);
@@ -1109,15 +1232,31 @@ impl Frontend for Play {
                 }
             }
         }
+        // the NCU / team windows' System-window lines, and the Shift + click character info page (`ShowURL("charid://50000/<id>")`)
+        if let (Some(h), Some(c)) = (self.hud.as_mut(), self.chat.as_mut()) {
+            for l in h.take_system_lines() {
+                c.system_line(&mut self.gui, &l, 12);
+            }
+            if let Some(id) = h.take_info() {
+                c.show_url(&mut self.gui, &self.zone, &self.text, &format!("charid://50000/{id}"));
+            }
+            for u in h.take_info_urls() {
+                c.show_url(&mut self.gui, &self.zone, &self.text, &u);
+            }
+        }
         self.hud_uses();
         self.interact_frame();
         let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
         let mut list = self.gui.frame(dt);
+        host.hide_cursor = false;
         if self.screen == Screen::InWorld {
             let own = self.zone.own().map_or(host.camera.pos.to_array(), |d| zone::scene_pos(d.pos));
             let indicators = super::tags::indicators(&self.zone);
             self.zone.world.name_tags(dt, &mut self.gui, host, own, &indicators);
             self.fight_draw(host, &mut list);
+            if let Some(h) = self.hud.as_mut() {
+                h.draw_cursor(&self.gui, &self.zone, host, &mut list);
+            }
         }
         if self.screen == Screen::Create {
             list.cmds.splice(0..0, pre.cmds);
@@ -1132,7 +1271,7 @@ impl Frontend for Play {
         if self.screen == Screen::Loading || fading_out {
             self.loading_overlay(&mut list);
         }
-        if self.teleporting {
+        if self.awaiting_alive {
             // `DisplaySystem+0x44 == 0`: the 3D world is not drawn, the GUI is (black behind it: [INFERENCE])
             let dst = [0.0, 0.0, self.size.0 as f32, self.size.1 as f32];
             list.cmds.splice(0..0, [DrawCmd::Clip(None), DrawCmd::Solid { dst, color: [0, 0, 0], alpha: 1.0 }]);

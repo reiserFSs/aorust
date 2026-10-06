@@ -35,6 +35,10 @@ pub struct Host {
     pub live_sky: Option<Option<LiveSky>>,
     /// Set the live sky clock (game day time, seconds) of the running [`LiveSky`] (a server time resync); drained by the viewer.
     pub sky_clock: Option<f32>,
+    /// Keyboard modifiers as of the last input event (what the original's `InputConfig_t::IsShiftDown` / `IsCtrlDown` read for mouse clicks).
+    pub mods: ao_gui::Modifiers,
+    /// Frontend request: hide the OS cursor because the frontend draws the game's own pointer in its draw list; applied after each frame/input.
+    pub hide_cursor: bool,
 }
 
 impl Host {
@@ -51,7 +55,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None }
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, lens: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -213,6 +217,7 @@ struct State {
     keys: HashSet<KeyCode>,
     speed: f32,
     looking: bool,
+    cursor_hidden: bool,
     last: Instant,
     stat_t: Instant,
     stat_frames: u32,
@@ -308,6 +313,7 @@ impl State {
             keys: HashSet::new(),
             speed,
             looking: false,
+            cursor_hidden: false,
             last: now,
             stat_t: now,
             stat_frames: 0,
@@ -331,7 +337,16 @@ impl State {
         } else {
             let _ = self.window.set_cursor_grab(CursorGrabMode::None);
         }
-        self.window.set_cursor_visible(!on);
+        self.sync_cursor();
+    }
+
+    /// The OS cursor is hidden while the mouse looks and while the frontend draws its own pointer ([`Host::hide_cursor`]).
+    fn sync_cursor(&mut self) {
+        let hide = self.looking || self.gui.as_ref().is_some_and(|g| g.host.hide_cursor);
+        if hide != self.cursor_hidden {
+            self.cursor_hidden = hide;
+            self.window.set_cursor_visible(!hide);
+        }
     }
 
     /// Runs the frontend; returns its draw list (`None` without a frontend). True in `.1` = quit.
@@ -406,6 +421,7 @@ impl State {
                 self.set_look(want);
             }
         }
+        self.sync_cursor();
         if let Some(h) = self.hook.as_mut() {
             h(self.cam.pos, dt);
         }
@@ -464,7 +480,9 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
         let Some(s) = &mut self.state else { return };
         if let Some(g) = &mut s.gui {
-            if let Some(ie) = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale) {
+            let gi = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale);
+            g.host.mods = g.mods;
+            if let Some(ie) = gi {
                 // a key that types a character also presses that key first: hotkeys (docs/gui.md 12.1) read the key, text fields the text.
                 // The OS key repeat only repeats the text: hotkeys act on the press.
                 let repeat = matches!(&ev, WindowEvent::KeyboardInput { event, .. } if event.repeat);
@@ -497,6 +515,7 @@ impl ApplicationHandler for App {
                 s.set_look(want);
             }
         }
+        s.sync_cursor();
         match ev {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::KeyboardInput { event, .. } if fly || s.gui.is_none() => {

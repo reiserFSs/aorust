@@ -80,6 +80,9 @@ const IN_PLAY_FRAMES: u32 = 10;
 /// Camera height above the player's feet; [GUESS] same eye height as the playfield spawn heuristic (1.7 m), the client's player camera is not ported yet.
 const EYE_HEIGHT: f32 = 1.7;
 
+/// The playfield map's ground image and the terrain cell size in metres (`None`: dungeon), see `hud_map::ground_map`.
+type WorldGround = (ao_formats::topdown::GroundMap, Option<f32>);
+
 enum Bg {
     Servers(Result<Vec<ServerEntry>, String>),
     Connected(u32, Result<LoginSession, String>),
@@ -89,7 +92,7 @@ enum Bg {
     Sky(u32, Option<ao_formats::playfield::SkyClock>),
     /// The top-down ground image of playfield `id` for the Map window (`Report::ground` rendered by `topdown::render` from the scene
     /// the loader just built; `bool`: dungeon rooms), sent just before its [`Bg::World`].
-    Ground(u32, Option<Box<(ao_formats::topdown::GroundMap, bool)>>),
+    Ground(u32, Option<Box<WorldGround>>),
     /// Layout and audio of playfield `id`, sent just before its [`Bg::World`]: `Report::dungeon` (`N3Msg_IsDungeon`) and the playfield's
     /// district music / ambience / emitters (`None` without sound data), handed to `Audio::set_playfield` when the world appears.
     Info(u32, bool, Option<Box<ao_audio::PlayfieldAudio>>),
@@ -189,7 +192,7 @@ struct Play {
     pending_user: String,
     world_scene: Option<Box<Scene>>,
     /// Ground image of the loading playfield for the Map window, handed to the HUD with the world.
-    world_ground: Option<(u32, Box<(ao_formats::topdown::GroundMap, bool)>)>,
+    world_ground: Option<(u32, Box<WorldGround>)>,
     /// Live sky of the loading/loaded playfield, installed in the viewer when the world appears.
     world_sky: Option<ao_formats::playfield::SkyClock>,
     time: f32,

@@ -1005,7 +1005,7 @@ impl Movement {
     /// seconds replaces any path (`FUN_1000c41a`: the old one is deleted, `+0xac = 0`; the first path saves the falling flag and disables
     /// falling). Movement actions are refused until it ends. A non-positive `time` is ignored (the original divides by it).
     pub fn impulse(&mut self, delta: [f32; 3], time: f32) {
-        if !(time > 0.0) || !time.is_finite() || delta.iter().any(|d| !d.is_finite()) {
+        if time.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || !time.is_finite() || delta.iter().any(|d| !d.is_finite()) {
             return;
         }
         let restore_falling = self.ballistic.as_ref().map_or(self.falling_enabled, |b| b.restore_falling);

@@ -230,7 +230,7 @@ fn live_walk() {
                 // `approach=x:z` walks to a point instead
                 let fixed = v.split_once(':').map(|(x, z)| (x.parse::<f32>().unwrap(), z.parse::<f32>().unwrap()));
                 let id: i32 = if v == "target" { l.p.zone.target.unwrap() } else { v.parse().unwrap_or(0) };
-                let goal = |l: &Live| fixed.map_or_else(|| (l.p.zone.dynels[&id].pos[0], l.p.zone.dynels[&id].pos[2]), |f| f);
+                let goal = |l: &Live| fixed.unwrap_or_else(|| (l.p.zone.dynels[&id].pos[0], l.p.zone.dynels[&id].pos[2]));
                 let dist = |l: &Live| {
                     let (a, b) = (l.p.zone.own().unwrap().pos, goal(l));
                     ((b.0 - a[0]).powi(2) + (b.1 - a[2]).powi(2)).sqrt()
@@ -301,6 +301,10 @@ fn live_walk() {
                 let mut v: Vec<_> = l.p.zone.stats.iter().collect();
                 v.sort();
                 eprintln!("stats {}", v.iter().map(|(k, x)| format!("{k}={x}")).collect::<Vec<_>>().join(" "));
+            }
+            // the spells running on the own character (docs/gui.md §11.14) and the maps they fill
+            "spells" => {
+                eprintln!("spells {}", l.p.zone.active_spells.iter().map(|s| format!("{:#x}(stat {} amount {} target {})", s.function, s.stat(0), s.stat(0x27), s.stat(0x20))).collect::<Vec<_>>().join(" "));
             }
             // `selname=<name>`: select the nearest dynel with that name
             "selname" => {
@@ -393,27 +397,39 @@ fn live_walk() {
                 }
                 l.tick();
             }
-            "clickdyn" => {
-                let id: i32 = v.parse().unwrap();
+            // `clickdyn=[shift+|ctrl+]<instance>` / `hoverdyn=…`: left-click / hover the first screen point whose pick ray hits the dynel's box
+            // with those modifiers held; `hoverdyn` prints the pointer sprites (GFX_GUI_POINTER* 0x135..0x14e) of the frame
+            "clickdyn" | "hoverdyn" => {
+                let id: i32 = v.rsplit('+').next().unwrap().parse().unwrap();
                 let (cam, lens) = (l.o.host.camera, l.o.host.lens.unwrap_or_default());
                 let mut hit = None;
-                'g: for y in (0..800).step_by(8) {
-                    for x in (0..1280).step_by(8) {
+                'g: for y in (0..800).step_by(4) {
+                    for x in (0..1280).step_by(4) {
                         let ray = crate::play::hud_target::pick_ray(&cam, &lens, (1280.0, 800.0), (x as f32, y as f32));
-                        if crate::play::hud_target::pick_all(&ray, &l.p.zone.dynels).contains(&id) {
+                        if crate::play::hud_target::pick_all(&ray, &l.p.zone).contains(&id) {
                             hit = Some((x as f32, y as f32));
                             break 'g;
                         }
                     }
                 }
                 let (x, y) = hit.expect("dynel not on screen");
-                eprintln!("clickdyn {id} at {x},{y}");
-                for ev in [ao_gui::InputEvent::MouseMove { x, y }, ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
+                eprintln!("{k} {id} at {x},{y}");
+                l.o.host.mods = ao_gui::Modifiers { shift: v.contains("shift+"), ctrl: v.contains("ctrl+"), ..Default::default() };
+                if k == "hoverdyn" {
+                    l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
                     l.tick();
-                    l.p.input(ev, &mut l.o.host);
+                    let list = l.tick();
+                    let sprites: Vec<String> = list.cmds.iter().filter_map(|c| if let ao_gui::DrawCmd::Gfx { id, dst, .. } = c { (0x135..=0x14e).contains(&id.0).then(|| format!("{:#x}@{},{}", id.0, dst[0], dst[1])) } else { None }).collect();
+                    eprintln!("pointer sprites {sprites:?} hide_os_cursor {}", l.o.host.hide_cursor);
+                } else {
+                    for ev in [ao_gui::InputEvent::MouseMove { x, y }, ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }] {
+                        l.tick();
+                        l.p.input(ev, &mut l.o.host);
+                    }
+                    l.tick();
+                    eprintln!("target {:?}", l.p.zone.target);
                 }
-                l.tick();
-                eprintln!("target {:?}", l.p.zone.target);
+                l.o.host.mods = Default::default();
             }
             // `mdrag=x1:y1:x2:y2` GUI left drag (slider knob, windows) in 10 steps; `watch=secs` prints every own stat that changed meanwhile
             "mdrag" => {
@@ -427,6 +443,28 @@ fn live_walk() {
                 }
                 l.p.input(ao_gui::InputEvent::MouseUp { x: c[2], y: c[3], button: ao_gui::MouseButton::Left }, &mut l.o.host);
                 l.tick();
+            }
+            // `agg=<v>`: drags the AGG/DEF knob (-100..=100) with the mouse, then deletes the locally applied stat 0x33 and waits 4 s for the server's
+            // own `StatIIR` echo (docs/gui.md 10.6); prints the stat before / after
+            "agg" => {
+                let want: f32 = v.parse().unwrap();
+                let r = l.p.hud.as_ref().unwrap().aggdef_rect(&l.p.gui).expect("slider");
+                let cur = l.p.zone.stat(0x33).unwrap_or(0) as f32;
+                // knob left edge = floor((v + 100) * 117 / 200); the grab point is 5 px inside the knob, the release lands on the exact value
+                let (from, to) = (r.l + ((cur + 100.0) * 117.0 / 200.0).floor() + 5.0, r.l + (want + 100.0) * 117.0 / 200.0 + 5.01);
+                let y = r.t + 9.0;
+                l.p.input(ao_gui::InputEvent::MouseMove { x: from, y }, &mut l.o.host);
+                l.p.input(ao_gui::InputEvent::MouseDown { x: from, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                for i in 1..=10 {
+                    l.tick();
+                    l.p.input(ao_gui::InputEvent::MouseMove { x: from + (to - from) * i as f32 / 10.0, y }, &mut l.o.host);
+                }
+                l.p.input(ao_gui::InputEvent::MouseUp { x: to, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                l.tick();
+                eprintln!("agg: after drag local stat 0x33 = {:?}", l.p.zone.stat(0x33));
+                l.p.zone.stats.remove(&0x33);
+                l.wait(4.0);
+                eprintln!("agg: 4 s after the local value was removed, stat 0x33 = {:?}", l.p.zone.stat(0x33));
             }
             "watch" => {
                 let before = l.p.zone.stats.clone();

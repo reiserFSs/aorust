@@ -634,7 +634,7 @@ mod tests {
         assert!(z.stats.len() > 240, "{}", z.stats.len());
         assert!(!z.stats.values().any(|&v| v == st::INVALID));
         // other dynels' StatIIR must not leak into the own stats
-        assert!(health.windows(2).any(|w| w[0] != w[1]) || health.len() >= 1);
+        assert!(health.windows(2).any(|w| w[0] != w[1]) || !health.is_empty());
     }
 
     /// Moving NPCs (move types 1/2 = forward start/stop) travel along `scene_forward(yaw)`: the heading handedness.

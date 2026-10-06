@@ -191,7 +191,7 @@ fn second_playfield_keeps_the_interface_and_hides_the_world() {
         r.p.frame(0.016, (1280, 800), &mut r.host);
     }
     assert!(r.p.zone.in_play_sent && !r.p.zone.dynels.is_empty());
-    assert!(matches!(r.host.live_sky, Some(_)), "the world installed its live sky");
+    assert!(r.host.live_sky.is_some(), "the world installed its live sky");
     r.host.live_sky = None;
 
     // the clock runs with the frames
@@ -357,4 +357,70 @@ fn first_person_and_mouse_look_from_the_input_events() {
     }
     let turned = (r.p.zone.own().unwrap().yaw.unwrap_or(0.0) - yaw0 + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
     assert!(turned.abs() > 0.5 && turned.abs() < 1.5, "turned {turned} rad");
+}
+
+/// The client-initiated teleport try in the flow (docs/zone/world.md §10.2): `StartTryingTeleport` = `TeleportStarted` while the playfield keeps
+/// running (black viewport, game input stopped), the 30 s timeout = `TeleportFailed` = `TeleportEnded` (countdown restarts), and only the server's
+/// echo of our `CharInPlay` (`AliveMessage`) brings the viewport and the input back.
+#[test]
+fn teleport_try_stops_the_input_until_the_char_in_play_echo() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    let frames = |r: &mut Rig, n: u32| (0..n).for_each(|_| drop(r.p.frame(0.016, (1280, 800), &mut r.host)));
+    frames(&mut r, IN_PLAY_FRAMES + 2);
+    assert!(r.p.zone.in_play_sent && !r.p.awaiting_alive && r.p.player.is_some());
+    let key = |r: &mut Rig, pressed| r.p.game_input(ao_render::GameInput::Key { code: ao_render::KeyCode::KeyW, pressed, repeat: false }, &mut r.host);
+    let walked = |r: &mut Rig| {
+        let p0 = r.p.zone.own().unwrap().pos;
+        key(r, true);
+        frames(r, 60);
+        key(r, false);
+        let p1 = r.p.zone.own().unwrap().pos;
+        ((p1[0] - p0[0]).powi(2) + (p1[2] - p0[2]).powi(2)).sqrt()
+    };
+    assert!(walked(&mut r) > 1.0, "the input is live before the try");
+
+    // `StartTeleportTry` (`Player::teleport_try` found the own position in a teleportal): the old world stays, black under the GUI, input stopped
+    assert!(r.p.zone.start_teleport_try());
+    frames(&mut r, 1);
+    assert!(r.p.teleporting && r.p.awaiting_alive && r.p.world_ready && r.p.player.is_some() && r.p.zone.trier.is_some());
+    let list = r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(matches!(list.cmds.get(1), Some(DrawCmd::Solid { color: [0, 0, 0], alpha, .. }) if *alpha == 1.0), "viewport off: black under the GUI");
+    assert!(walked(&mut r) < 0.05, "InputConfig+0x18: the game keys are dropped");
+
+    // no answer within 30 s: `TeleportFailed` posts `TeleportEnded`, the countdown for `CharInPlay` starts again, the input stays stopped
+    r.p.zone.run_trier(31.0);
+    frames(&mut r, 1);
+    assert!(r.p.zone.trier.is_none() && !r.p.teleporting && r.p.awaiting_alive && !r.p.zone.in_play_sent);
+    assert!(r.p.text.by_key(110, "Feedback_AreaChangeNotInitiated").is_some());
+    frames(&mut r, IN_PLAY_FRAMES + 2);
+    assert!(r.p.zone.in_play_sent && r.p.awaiting_alive, "CharInPlay is sent again, the echo is still missing");
+    assert!(walked(&mut r) < 0.05);
+
+    // the server relays our own `CharInPlayIIR_t`: `AliveMessage` (another character's relay does nothing)
+    let echo = |id: u32| LoginEvent::ZoneFrame(ao_net::n3::outgoing::n3_frame(0, id, ao_net::n3::outgoing::char_in_play(id as i32)));
+    r.event(echo(33401));
+    assert!(r.p.awaiting_alive);
+    r.event(echo(33512));
+    assert!(!r.p.awaiting_alive);
+    let list = r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(!matches!(list.cmds.get(1), Some(DrawCmd::Solid { color: [0, 0, 0], alpha, .. }) if *alpha == 1.0), "the viewport is back");
+    assert!(walked(&mut r) > 1.0, "EnableUserInput");
+}
+
+/// `N3Msg_IsDungeon` (`Report::dungeon`): a dungeon always says `EnteringNewArea`, a named outdoor playfield `EnteringPF` with its name.
+#[test]
+fn entering_text_of_a_dungeon_is_the_new_area_line() {
+    let Some(mut r) = rig() else { return };
+    r.p.zone.playfield = Some(4582);
+    r.p.pf_names.insert(4582, "Newland City".into());
+    assert_eq!(r.p.entering_line().as_deref(), Some("Entering 'Newland City'"));
+    r.p.dungeon = true;
+    assert_eq!(r.p.entering_line(), r.p.text.by_key(110, "EnteringNewArea"));
+    assert_ne!(r.p.entering_line().as_deref(), Some("Entering 'Newland City'"));
+    r.p.pf_names.clear();
+    r.p.dungeon = false;
+    assert_eq!(r.p.entering_line(), r.p.text.by_key(110, "EnteringNewArea"), "no name: the same line");
 }
