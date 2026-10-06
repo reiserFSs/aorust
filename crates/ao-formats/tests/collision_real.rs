@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use ao_formats::playfield::collision::{kd, Collision, RAY_LIFT, STEP_HEIGHT};
+use ao_formats::playfield::collision::{kd, Collision, STEP_HEIGHT};
 use ao_formats::playfield::{floor_below, load_playfield};
 use ao_rdb::RecordStore;
 
@@ -15,11 +15,11 @@ type Cell = (i32, i32);
 /// Visited lattice cell -> (parent cell, position on the ground).
 type Seen = HashMap<Cell, (Option<Cell>, [f32; 3])>;
 
-/// Breadth first walk on a 0.5 m lattice with the same primitives the movement code uses (`slide` + `ground` from a ray
-/// lifted by `RAY_LIFT`); returns the parent map.
-fn flood(c: &Collision, start: [f32; 3], radius: f32, height: f32, limit: usize) -> (Seen, Cell) {
+/// Breadth first walk on a 0.5 m lattice with the movement code's primitive (`Collision::walk` = one
+/// `EnsureSurfaceAlignment` step with a standing body); returns the parent map.
+fn flood(c: &Collision, start: [f32; 3], limit: usize) -> (Seen, Cell) {
     let key = |x: f32, z: f32| ((x / 0.5).round() as i32, (z / 0.5).round() as i32);
-    let y0 = c.ground([start[0], start[1] + RAY_LIFT, start[2]]).expect("spawn has ground");
+    let y0 = c.ground(start).expect("spawn has ground") + 0.01;
     let s = key(start[0], start[2]);
     let mut seen = HashMap::from([(s, (None, [start[0], y0, start[2]]))]);
     let mut q = VecDeque::from([s]);
@@ -30,17 +30,17 @@ fn flood(c: &Collision, start: [f32; 3], radius: f32, height: f32, limit: usize)
         }
         for (dx, dz) in [(0.5, 0.0), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)] {
             let to = [p[0] + dx, p[1], p[2] + dz];
-            let s = c.slide(p, to, radius, height);
+            let w = c.walk(p, to);
+            let s = w.pos;
             if (s[0] - to[0]).abs() > 0.02 || (s[2] - to[2]).abs() > 0.02 {
                 continue; // blocked by a wall
             }
-            let Some(g) = c.ground([s[0], p[1] + RAY_LIFT, s[2]]) else { continue };
-            if (g - p[1]).abs() > STEP_HEIGHT + 0.12 {
-                continue; // a step too high (or a fall)
+            if w.airborne || (s[1] - p[1]).abs() > STEP_HEIGHT + 0.12 {
+                continue; // nothing carries the character, a step too high (or a fall)
             }
             let nk = key(s[0], s[2]);
             if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(nk) {
-                e.insert((Some(k), [s[0], g, s[2]]));
+                e.insert((Some(k), s));
                 q.push_back(nk);
             }
         }
@@ -55,9 +55,9 @@ fn collision_arrival_hall_walk_out_is_continuous() {
     assert!(c.triangle_count() > 10_000, "KD volumes and tile floors loaded");
     // server spawn (205.2, 1.0, 255.8) -> scene (205.2, 1.0, -255.8)
     let spawn = [205.2, 1.0, -255.8];
-    let floor = c.ground([spawn[0], spawn[1] + RAY_LIFT, spawn[2]]).expect("floor under the spawn");
+    let floor = c.ground(spawn).expect("floor under the spawn");
     assert!((floor - spawn[1]).abs() < 0.5, "spawn stands on the floor: {floor}");
-    let (seen, start) = flood(&c, spawn, 0.35, 1.8, 60_000);
+    let (seen, start) = flood(&c, spawn, 60_000);
     assert!(seen.len() > 5000, "the hall is walkable ({} cells)", seen.len());
     // both ends of the hall: the exit corridor at the south (scene z -262) and the north end (z -152)
     let south = *seen.keys().min_by_key(|k| k.1).unwrap();
@@ -70,7 +70,7 @@ fn collision_arrival_hall_walk_out_is_continuous() {
     while let (Some(parent), p) = seen[&k] {
         let q = seen[&parent].1;
         assert!((p[1] - q[1]).abs() <= STEP_HEIGHT + 0.12 + 1e-4, "height jump {q:?} -> {p:?}");
-        assert!(c.ground([p[0], p[1] + RAY_LIFT, p[2]]).is_some());
+        assert!(c.ground(p).is_some());
         k = parent;
         steps += 1;
     }
@@ -83,13 +83,84 @@ fn collision_arrival_hall_walls_stop_the_character() {
     let Some((store, _)) = setup() else { return };
     let c = Collision::load(&store, 4604).unwrap();
     // from the middle of the corridor walk straight into the side: the x extent of the reachable corridor is bounded
-    let (seen, _) = flood(&c, [205.2, 1.0, -255.8], 0.35, 1.8, 60_000);
+    let (seen, _) = flood(&c, [205.2, 1.0, -255.8], 60_000);
     let xs: Vec<f32> = seen.keys().filter(|k| (k.1 as f32 * 0.5 + 256.0).abs() < 1.0).map(|k| k.0 as f32 * 0.5).collect();
     let (lo, hi) = (xs.iter().cloned().fold(f32::MAX, f32::min), xs.iter().cloned().fold(f32::MIN, f32::max));
     assert!(hi - lo > 3.0 && hi - lo < 40.0, "corridor width {lo}..{hi}");
     // pushing far outside never leaves the walkable area
-    let p = c.slide([205.2, 1.0, -255.8], [205.2 + 40.0, 1.0, -255.8], 0.35, 1.8);
+    let p = c.walk([205.2, 1.0, -255.8], [205.2 + 40.0, 1.0, -255.8]).pos;
     assert!(p[0] < hi + 1.0, "{p:?} beyond the corridor wall {hi}");
+}
+
+/// One frame steps (0.1 m) with the movement code's body state across lattice points of 4582: wherever the character is
+/// carried the feet follow the ground (`ground + 0.01`), and on the open land around the spawn it is carried almost always.
+#[test]
+fn collision_vehicle_walks_the_newbie_plain() {
+    use ao_formats::playfield::collision::{Body, SurfaceState};
+    let Some((store, dir)) = setup() else { return };
+    let c = Collision::load(&store, 4582).unwrap();
+    let spawn = load_playfield(&store, &dir, 4582).unwrap().spawn.unwrap();
+    let (mut steps, mut airborne, mut walks, mut far) = (0, 0, 0, 0);
+    for gx in -6..=6 {
+        for gz in -6..=6 {
+            let at = [spawn[0] + gx as f32 * 12.0, spawn[1], spawn[2] + gz as f32 * 12.0];
+            let Some(g) = c.ground(at) else { continue };
+            let mut p = [at[0], g + 0.01, at[2]];
+            let mut st = SurfaceState::default();
+            walks += 1;
+            for _ in 0..50 {
+                let w = c.align(p, [p[0] + 0.1, p[1], p[2]], &Body::WALKING, &mut st);
+                steps += 1;
+                airborne += usize::from(w.airborne);
+                if !w.airborne {
+                    let ground = c.ground(w.pos).unwrap();
+                    assert!((w.pos[1] - ground - 0.01).abs() < 0.2, "feet {:?} ground {ground}", w.pos);
+                }
+                far += usize::from((w.pos[0] - p[0] - 0.1).abs() < 1e-3);
+                p = w.pos;
+            }
+        }
+    }
+    eprintln!("4582: {walks} walks, {steps} steps, {airborne} airborne, {far} unobstructed");
+    assert!(walks > 100 && airborne * 5 < steps && far * 2 > steps, "{airborne}/{steps} airborne, {far} unobstructed");
+}
+
+/// The KD faces are one sided with the normal `(b - a) x (c - a)`; the data volumes are wound so that this normal is the outward one
+/// (positive signed volume), which is what the client's walls (hit from outside) require.
+#[test]
+fn collision_kd_faces_point_outwards() {
+    let Some((store, _)) = setup() else { return };
+    let (v, d) = store.get_versioned(kd::SURFACE_TYPE, 301_727_744).unwrap().unwrap();
+    let s = kd::parse(v, &d).unwrap();
+    let (mut pos, mut neg) = (0, 0);
+    for vol in &s.volumes {
+        let mut volume = 0.0f64;
+        for t in &vol.tris {
+            let [a, b, c] = t.map(|i| vol.verts[i as usize].map(f64::from));
+            volume += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+        }
+        if volume > 0.0 { pos += 1 } else { neg += 1 }
+    }
+    eprintln!("KD volumes: {pos} wound outward, {neg} inward");
+    assert!(pos > neg, "outward {pos} inward {neg}");
+}
+
+/// Door rules of the Arrival Hall: leaving "no room" is free, every link is crossable until a door blocks it.
+#[test]
+fn collision_arrival_hall_rooms_and_doors() {
+    let Some((store, _)) = setup() else { return };
+    let mut c = Collision::load(&store, 4604).unwrap();
+    let links = c.room_links();
+    eprintln!("4604 links {links:?}, spawn room {:?}", c.room_of([205.2, 1.0, -255.8]));
+    assert!(c.room_transition_allowed(-1, 0) && !c.room_transition_allowed(0, -1));
+    assert!(c.room_of([205.2, 1.0, -255.8]).is_some());
+    if let Some(&(a, b)) = links.first() {
+        assert!(c.room_transition_allowed(a as i32, b as i32) && c.room_transition_allowed(b as i32, a as i32));
+        c.set_door_passable(a, b, false);
+        assert!(!c.room_transition_allowed(a as i32, b as i32));
+        c.set_door_passable(b, a, true);
+        assert!(c.room_transition_allowed(a as i32, b as i32));
+    }
 }
 
 #[test]

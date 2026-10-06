@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn room_is_placed_like_statels_and_mirrored() {
         let g = parse_gnda(&fixture(&[])).unwrap();
-        let room = Room { rot: 1, rect: [1, 1, 4, 4], pos: [100.0, 5.0, 200.0], name: None, lightmap: None };
+        let room = Room { rot: 1, rect: [1, 1, 4, 4], pos: [100.0, 5.0, 200.0], name: None, lightmap: None, door_zones: Vec::new() };
         let floor = Rc::new(floor_piece());
         let mut piece = |id: u16| (id == 7).then(|| floor.clone());
         let mut texture = |i: u8| Some(TextureKey { rdb_type: 1, id: i as u32 });

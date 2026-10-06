@@ -2,7 +2,8 @@
 //! `printf 'user\npass\n' | AOMAC_LIVE_CHAR=Aomacvolk AOMAC_LIVE_SHOTS=/tmp/x AOMAC_LIVE_STEPS='wait=2,shot=a,W=3,shot=b' \
 //!  cargo test --release -p aomac live_walk -- --ignored --nocapture`.
 //! Credentials come from stdin only. Steps (comma separated): `KEY=secs` holds a letter/arrow/space key (`W A S D Z C SPACE UP LEFT`),
-//! `wait=secs`, `shot=name` (PNG into AOMAC_LIVE_SHOTS), `pos` prints the own position.
+//! `wait=secs`, `shot=name` (PNG into AOMAC_LIVE_SHOTS), `pos` prints the own position, `press=F8|CTRL+F8|SHIFT+F8` taps keys (camera),
+//! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens.
 use super::*;
 use ao_render::{GameInput, KeyCode, Offscreen};
 use std::io::BufRead;
@@ -109,7 +110,7 @@ impl Pilot {
     }
 }
 
-/// Axis-aligned route over the 0.5 m cells the collision lets a 0.35 m capsule cross (server x, z): `(x, z)` waypoints.
+/// Axis-aligned route over the 0.5 m cells the collision lets the character (`Collision::walk`) cross (server x, z): `(x, z)` waypoints.
 pub(super) fn route(c: &ao_formats::playfield::collision::Collision, from: [f32; 3], to: (f32, f32)) -> Vec<(f32, f32)> {
     use std::collections::{HashMap, VecDeque};
     let cell = 0.5f32;
@@ -125,15 +126,16 @@ pub(super) fn route(c: &ao_formats::playfield::collision::Collision, from: [f32;
         for d in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
             let m = (n.0 + d.0, n.1 + d.1);
             let (a, b) = (pos(n), pos(m));
-            if prev.contains_key(&m) || c.ground([b[0], b[1] + 0.4, b[2]]).is_none() {
+            if prev.contains_key(&m) || c.ground(b).is_none() {
                 continue;
             }
             let mut p = a;
             let ok = (1..=5).all(|i| {
                 let t = i as f32 / 5.0;
-                let want = [a[0] + (b[0] - a[0]) * t, a[1], a[2] + (b[2] - a[2]) * t];
-                p = c.slide(p, want, 0.35, 1.8);
-                (p[0] - want[0]).abs() + (p[2] - want[2]).abs() < 0.03
+                let want = [a[0] + (b[0] - a[0]) * t, p[1], a[2] + (b[2] - a[2]) * t];
+                let w = c.walk(p, want);
+                p = w.pos;
+                !w.airborne && (p[0] - want[0]).abs() + (p[2] - want[2]).abs() < 0.03
             });
             if ok {
                 prev.insert(m, n);
@@ -168,6 +170,11 @@ fn code(name: &str) -> KeyCode {
         "Q" => KeyCode::KeyQ,
         "X" => KeyCode::KeyX,
         "B" => KeyCode::KeyB,
+        "F8" => KeyCode::F8,
+        "SHIFT" => KeyCode::ShiftLeft,
+        "CTRL" => KeyCode::ControlLeft,
+        "NUMPAD8" => KeyCode::Numpad8,
+        "NUMPAD5" => KeyCode::Numpad5,
         n => panic!("unknown key {n}"),
     }
 }
@@ -216,9 +223,65 @@ fn live_walk() {
                     eprintln!("near {i} {:?} npc={} lvl={} hp={}/{} side={} dist={dist:.1}", d.name, d.npc, d.level, d.health, d.max_health, d.side);
                 }
             }
+            // `approach=<instance>`: servo the heading with A/D and walk with W until 2.5 m from the dynel (the conventions of the yaw
+            // and of the turn keys are detected on the fly: the distance must shrink while walking, the error while turning)
+            "approach" => {
+                // `approach=x:z` walks to a point instead
+                let fixed = v.split_once(':').map(|(x, z)| (x.parse::<f32>().unwrap(), z.parse::<f32>().unwrap()));
+                let id: i32 = v.parse().unwrap_or(0);
+                let goal = |l: &Live| fixed.map_or_else(|| (l.p.zone.dynels[&id].pos[0], l.p.zone.dynels[&id].pos[2]), |f| f);
+                let dist = |l: &Live| {
+                    let (a, b) = (l.p.zone.own().unwrap().pos, goal(l));
+                    ((b.0 - a[0]).powi(2) + (b.1 - a[2]).powi(2)).sqrt()
+                };
+                let wrap = |a: f32| (a + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
+                let (mut sign, mut turn_left_is_pos) = (1.0f32, true);
+                let (t0, mut held): (Instant, Option<&str>) = (Instant::now(), None);
+                let (mut last_chk, mut last_err, mut last_dist) = (Instant::now(), 0.0f32, dist(&l));
+                while t0.elapsed().as_secs() < 60 && dist(&l) > 2.5 {
+                    l.tick();
+                    let (me, to) = (l.p.zone.own().unwrap().clone(), goal(&l));
+                    let want = (sign * (to.0 - me.pos[0])).atan2(to.1 - me.pos[2]);
+                    let err = wrap(want - me.yaw.unwrap_or(0.0));
+                    let key = if err.abs() > 0.12 { Some(if (err > 0.0) == turn_left_is_pos { "A" } else { "D" }) } else { Some("W") };
+                    if key != held {
+                        if let Some(k) = held {
+                            l.key(code(k), false);
+                        }
+                        if let Some(k) = key {
+                            l.key(code(k), true);
+                        }
+                        held = key;
+                    }
+                    if last_chk.elapsed().as_secs_f32() > 0.7 {
+                        if held == Some("W") {
+                            if dist(&l) > last_dist + 0.3 {
+                                sign = -sign; // walking away: the heading convention is mirrored
+                            }
+                        } else if err.abs() > last_err.abs() + 0.05 {
+                            turn_left_is_pos = !turn_left_is_pos;
+                        }
+                        (last_chk, last_err, last_dist) = (Instant::now(), err, dist(&l));
+                    }
+                }
+                if let Some(k) = held {
+                    l.key(code(k), false);
+                }
+                eprintln!("approached {id} to {:.1} m: {}", dist(&l), l.pos());
+            }
+            // chat: `say=<line>` runs the line as if typed in the chat bar (`/g Global hi`, `/tell X hi`, plain = vicinity)
+            "say" => {
+                let p = &mut l.p;
+                p.chat.as_mut().expect("chat hub").run_line(&mut p.gui, v, &p.zone, &p.text);
+            }
             "tab" => {
                 l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Tab, pressed: true, mods: ao_gui::Modifiers::default() }, &mut l.o.host);
                 eprintln!("target {:?}", l.p.zone.target);
+            }
+            "stats" => {
+                let mut v: Vec<_> = l.p.zone.stats.iter().collect();
+                v.sort();
+                eprintln!("stats {}", v.iter().map(|(k, x)| format!("{k}={x}")).collect::<Vec<_>>().join(" "));
             }
             "sel" => l.p.zone.target = Some(v.parse().unwrap()),
             "fight" => {
@@ -251,6 +314,40 @@ fn live_walk() {
                 }
                 pilot.release(&mut l.p, &mut l.o.host);
                 eprintln!("after goto {v}: {}", l.pos());
+            }
+            // `press=F8` / `press=CTRL+F8` / `press=SHIFT+F8`: modifiers down, tap the last key, release (F8 = first/third person,
+            // Ctrl+F8 cycles the camera vehicle, Shift+F8 steps the scripted views)
+            "press" => {
+                let keys: Vec<KeyCode> = v.split('+').map(code).collect();
+                for &c in &keys {
+                    l.key(c, true);
+                    l.tick();
+                }
+                for &c in keys.iter().rev() {
+                    l.key(c, false);
+                    l.tick();
+                }
+            }
+            // `drag=right:dx:dy` / `drag=left:dx:dy`: button down at the screen centre, `dx`/`dy` raw mouse counts spread over 8
+            // frames (the cursor-captured `GameInput::MouseMotion` stream), button up (right: turn the character and pitch, left: orbit the camera)
+            "drag" => {
+                let mut it = v.split(':');
+                let button = if it.next() == Some("left") { ao_gui::MouseButton::Left } else { ao_gui::MouseButton::Right };
+                let (dx, dy): (f32, f32) = (it.next().unwrap().parse().unwrap(), it.next().unwrap().parse().unwrap());
+                let (x, y) = (640.0, 400.0);
+                l.p.input(ao_gui::InputEvent::MouseDown { x, y, button }, &mut l.o.host);
+                for _ in 0..8 {
+                    l.tick();
+                    l.p.game_input(GameInput::MouseMotion { dx: dx / 8.0, dy: dy / 8.0 }, &mut l.o.host);
+                }
+                l.tick();
+                l.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut l.o.host);
+                l.tick();
+                eprintln!("after {step}: {}", l.pos());
+            }
+            "cam" => {
+                let c = l.o.host.camera;
+                eprintln!("camera pos {:.2} {:.2} {:.2} yaw {:.2} pitch {:.2} lens {:?}", c.pos.x, c.pos.y, c.pos.z, c.yaw, c.pitch, l.o.host.lens);
             }
             key => {
                 let c = code(key);

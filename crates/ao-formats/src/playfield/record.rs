@@ -57,6 +57,33 @@ pub struct Room {
     pub name: Option<String>,
     /// Baked vertex lighting: vertex count and the zlib stream (`n3Room_t::DepackLightmap`, see `dungeon`).
     pub lightmap: Option<(u32, Vec<u8>)>,
+    /// Rooms behind this room's doors, one entry per door (`u16` zone index, `0xffff` = none; `n3Room_t::GetDoorConnectZone`
+    /// @0x10010990 reads the first `u16` of each 4 byte entry, the second one is `tile << 2 | orientation`, `RegisterDoorPosition`
+    /// @0x1001037e).
+    pub door_zones: Vec<u16>,
+}
+
+/// A scripted camera position of a zone/room (`PointCameraAttractor_t`, N3 vtable 0x1003e4f4, built by `FUN_10023bbb` from the
+/// playfield blob, `RDBPlayfield_t::ReadBlob` @0x1001c115): the camera is steered to `pos` and keeps looking at the player.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraAttractor {
+    /// World position (`+0x04`).
+    pub pos: [f32; 3],
+    /// Orientation quaternion x, y, z, w (`+0x10`).
+    pub rot: [f32; 4],
+    /// Point the original authored view looks at (`+0x20`; version < 6 records have `target = pos`).
+    pub target: [f32; 3],
+    /// Range (`+0x2c`): a part of the score and, at >= 2.0 ([`Self::DISABLED_AT`]), the "never visible" flag (`+0x30`).
+    pub range: f32,
+}
+
+impl CameraAttractor {
+    /// `fVar4 >= _DAT_1003c968` (2.0) sets the disabled byte `+0x30`; `FUN_10023bfc` then reports the attractor as not visible.
+    pub const DISABLED_AT: f32 = 2.0;
+
+    pub fn disabled(&self) -> bool {
+        self.range >= Self::DISABLED_AT
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +98,8 @@ pub struct Record {
     /// Number of zones (outdoor) or rooms (dungeon) = number of offsets in the statel file.
     pub count: u32,
     pub rooms: Vec<Room>,
+    /// Camera attractors per zone (outdoor) or room (dungeon), indexed like the statel zones (`n3Zone_t::GetCameraAttractorList`).
+    pub attractors: Vec<Vec<CameraAttractor>>,
     /// Byte offset of the `RDBPlayfieldAnarchy_t` tail (liquid polygons, environment; see `water`/`environment`).
     pub tail: usize,
 }
@@ -94,29 +123,50 @@ pub fn parse(d: &[u8]) -> Result<Record> {
         r.skip(5 * 4 + 0x18)?;
     }
     let mut rooms = Vec::new();
+    let mut attractors = Vec::new();
     if tilemap != id {
         ensure!(count < 50_000, "playfield {id}: implausible room count {count}");
         for _ in 0..count {
-            rooms.push(room(&mut r, version)?);
+            rooms.push(room(&mut r, version, &mut attractors)?);
         }
     } else {
         // per zone: u32 n, n x camera attractor (vec3 + quat + vec3 + f32), see `RDBPlayfield_t::ReadBlob` @0x1001c115
         for _ in 0..count {
-            let n = r.u32()? as usize;
-            r.skip(n * (12 + 16 + 12 + 4))?;
+            attractors.push(camera_attractors(&mut r, version)?);
         }
     }
-    Ok(Record { version, id, name, tilemap, zone_size, count, rooms, tail: r.o })
+    Ok(Record { version, id, name, tilemap, zone_size, count, rooms, attractors, tail: r.o })
 }
 
-fn room(r: &mut Rd, version: u32) -> Result<Room> {
+/// `u32 n` (client limit: `n < 1000`), n x { pos, quat, target (version >= 6, else = pos), range }; version <= 4 has none.
+fn camera_attractors(r: &mut Rd, version: u32) -> Result<Vec<CameraAttractor>> {
+    if version <= 4 {
+        return Ok(Vec::new());
+    }
+    let n = r.u32()? as usize;
+    ensure!(n < 1000, "too many camera attractors ({n})");
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        let pos = r.vec3()?;
+        let rot = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
+        let target = if version >= 6 { r.vec3()? } else { pos };
+        v.push(CameraAttractor { pos, rot, target, range: r.f32()? });
+    }
+    Ok(v)
+}
+
+fn room(r: &mut Rd, version: u32, attractors: &mut Vec<Vec<CameraAttractor>>) -> Result<Room> {
     let flags = r.u8()?;
     r.u8()?;
     let rect = [r.u16()?, r.u16()?, r.u16()?, r.u16()?];
     ensure!(rect[0] < rect[2] && rect[1] < rect[3], "invalid room tile rectangle {rect:?}");
     let pos = r.vec3()?;
     let doors = r.u16()? as usize;
-    r.skip(doors * 4)?; // (u16 door tile x, u16 door tile z) pairs, not needed for geometry
+    let mut door_zones = Vec::with_capacity(doors);
+    for _ in 0..doors {
+        door_zones.push(r.u16()?);
+        r.u16()?;
+    }
     let name = if flags & 0x80 != 0 { Some(cstr(r.take(32)?)) } else { None };
     // lightmap: i32 zlib size + 4, i32 vertex count, zlib bytes
     let lm = r.u32()?;
@@ -133,11 +183,8 @@ fn room(r: &mut Rd, version: u32) -> Result<Room> {
             r.skip(n2 * 6)?;
         }
     }
-    if version > 4 {
-        let n = r.u32()? as usize;
-        r.skip(n * (12 + 16 + if version >= 6 { 12 } else { 0 } + 4))?; // camera attractors
-    }
-    Ok(Room { rot: flags & 3, rect, pos, name, lightmap })
+    attractors.push(camera_attractors(r, version)?);
+    Ok(Room { rot: flags & 3, rect, pos, name, lightmap, door_zones })
 }
 
 #[cfg(test)]

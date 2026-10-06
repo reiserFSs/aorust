@@ -126,57 +126,89 @@ World placement of an atlas point: `pos + Ry(rot) (atlas - rect.origin*2 - (W'+1
 (`CalcGlobalFromLocalPos` @0x109b6, `W' = ((x2-x1-1) & !1) + 1`; same frame as `room_contains`). **[DATA]** In 4604 the KD volumes
 of the hall contain no floor at the spawn (rays hit only the hull top at y 54 and the ceiling at 9.56): the floor is the tile surface.
 
-### 3.3 Dungeon walls = room membership
-`n3RoomSurface_t::VetoPosition` @0x10015587 → `VetoRoomTransition` @0x1001462f: a position outside every room (`PosToRoom == null`:
-outside the room rectangle, on an empty `DCGA` tile, or outside the tile's height window) is rejected and the dynel returns to its
-last allowed position (`n3Dynel_t::GetLastAllowedGlobalPositionInZone`). Moving from one room to another additionally asks
-the playfield (`playfield vtable +0x38`, the door rules) **[GUESS: not ported, every transition is allowed]**. These tile boundaries
-(plus the KD volumes of statels in the rooms) are the walls; `Collision::inside`.
+### 3.3 Dungeon walls = room membership, door rule
+`n3RoomSurface_t::VetoPosition` @0x10015587 keeps the fractional part of x / z inside `[0.01, 0.99]` (f64 @0x1003d628 / @0x1003d368), clamps to
+`[0.1, 7999.9]` / y `[0.01, 1999.9]`, then `VetoRoomTransition` @0x1001462f: `cur = PosToRoom(pos)` (-1 outside every room: empty `DCGA` tile, outside the
+rectangle or the tile's height window). With `last = n3Dynel_t::GetLastAllowedZoneInst`:
+`cur == last`: `-1` is refused (position := `PlayfieldAnarchy_t::GetSafePos` @0x10121815), otherwise accepted and remembered
+(`UpdateLastAllowedPosition`); `cur != last`: playfield vtable `+0x38` = `PlayfieldAnarchy_t::IsDynelRoomTransitionAllowed` (Gamecode @0x10122371, base
+`n3Playfield_t` @0x1000c4d1 = `from == -1`) decides; refused moves put the dynel at the last allowed position nudged by `0.1 * radius / 2` away from the
+wall. The rule for a character: the rooms must be joined by a door link (`n3Room_t::GetDoorConnectZone` @0x10010990 = first `u16` of each 4 byte door
+entry of the room record; the link map is built in `n3Playfield_t::InitializeSpace`, key `(min, max)`), directly or through one intermediate room; every
+registered `Door_t` on the way must satisfy `Door_t::CanPass` (Gamecode `FUN_1007f74d`: feature bit 0x80 / `FUN_1007f58e`); a link without a registered door
+is free; `to == -1` is always refused. Ported: `Collision::veto`, `room_transition_allowed`, `set_door_passable` (the `Door_t` state is the caller's:
+nothing calls it yet). **[DATA]** 4604 has three rooms but no door entries at all; the whole hall, corridor and shuttle tunnel are room 2.
+
+### 3.4 `Vehicle_t::EnsureSurfaceAlignment` (Vehicle.dll @0x1000d1aa) and its sweep `FUN_1000b2e5` (@0x1000b2e5)
+Port: `collision/vehicle.rs` (`Collision::align`, `sweep`, `line`, `closest`, `veto`). Vehicle.dll was imported into a private Ghidra project;
+`this+0x50` is *falling enabled*, `+0x52` airborne, `+0x54` vertical speed, `+0x13c` steep slopes allowed (0 for characters), `+0xb0` orientation mode (0).
+
+**Body sphere.** One sphere for every vehicle, radius **0.4** (f32 @0x100127a0, the `param_2` of the sweep), centre 0.4 above the feet (f64 @0x100127f8). There is no
+head sphere or capsule height, and no scaling by monster scale. `n3Dynel_t::GetBodyCollSphereRadi` (@0x10004dd3, `CollPrim_t` radius at dynel+0x5c+0x18)
+and `GetBodyCollSphereDisplacement` only feed the dynel against dynel test `CheckBodyCollision` (@0x1000483b).
+
+**Surface queries** (`Surface_i` vtable): `+0x10` `GetLineIntersection(from, to, hit, normal, flag, source)`: nearest hit, one sided (a face is hit when `n . (to - from) < 0`,
+`FUN_10031c6a`: `t` in `[-eps, 1 + eps]`, point inside the three edge planes, eps = FLT_EPSILON; KD data winding verified outward on all 228 volumes of record
+301727744). Outdoor `FUN_10018b72`: terrain cells (`Intersect_Tile`, two triangles per cell, hit from above) against the cell KD surfaces, terrain wins ties; dungeon
+`FUN_10015018`: only when start or end is in a room, tile floor triangles + the room KD volume. `+0x04` `CalculateClosestPoint` (3.1, 3.2); `+0x20` `VetoPosition` (3.1, 3.3).
+
+**Step** (`Run` calls it with `param_2 = false`; `true` = teleport, no sweep):
+1. veto loop: `cur = new`; while `VetoPosition(cur)` refuses, `cur = old + (new - old) * 0.1 * n` for `n = 10 .. 1`.
+2. `flag = !fallingEnabled || airborne || teleport`; `delta = cur - old`; budgets `H = |delta.xz|`, `T = flag ? |delta| : (H < 1e-6 ? |delta| : 10000)`;
+   heading `dir = normalize(delta.x, delta.y * flag, delta.z)` (`(0,-1,0)` when zero); slope limit 0.5 when falling is enabled (f32 @0x10012134), else none.
+3. `FUN_1000b2e5(centre = old + 0.4 up, r = 0.4, dir, &H, &T, &maxY, mode = fallingEnabled ? 3 : 1, 10 iterations, slope)`; per iteration, aiming at `q = p + 10 dir`
+   (f32 @0x10012790): mode 3 first casts two side probes of length `r` (`dir x up`), shortens them to walls, moves the centre to their midpoint when the lengths
+   differ, halves them and casts two rays parallel to the heading from `p +- side`, whose hits are projected onto the centre line through the hit plane (back faces,
+   `side . n > 0`, and `d . n == 0` ignored); then the centre ray `p -> q`. The nearest of the three (ties: centre, then B, then A) is the obstacle `(hp, n)`; none:
+   fly `|q - p| - r` along `d` within the budgets. When moving up (`d.y > 0`) into `n.y < slope` the face is treated as a vertical wall (`n = normalize(n.x, 0, n.z)`,
+   head-on / `n.y <= -0.99`: `-d`; effective radius `r (1 + n.y^2)`). The sphere moves to the plane (`hp - d r_eff / |d . n|`, or stays when already closer),
+   spending `H` by the horizontal part and `T` by the full length (a budget that runs out ends the sweep). The new heading is the tangent `((nc x n) x n)` with
+   `nc = normalize(p - hp)`, only when `1e-5 <= |nc - n|^2 <= 3.99999` (head-on contact stops) and `dir . tangent > 0`; a vertical wall (`n.y == 0`) keeps `q.y = p.y`.
+   Measured on synthetic geometry: a 1.97 m diagonal step into a wall reaches it after 1.65 m and slides the remaining 0.31 m (test `walks_head_on_into_a_wall_and_slides_along_it`).
+4. feet := `centre.y - 0.4`; `CalculateClosestPoint(x, feet, z)`; `feet = max(feet, closest.y + 0.01)` (f64 @0x100124e0); `maxY = max(maxY, feet)`.
+5. tolerance `tol = 0.48` (f32 @0x100127e0), while walking on the ground `min(|delta.xz| * 1.1547005 + 0.48, maxY)` (f64 @0x100127d8 / @0x100127d0; the *Avatar.Movement* RE
+   read the first as the f32 `2.0`, the instruction is `FMUL double ptr`, so `docs/zone/movement.md` §9 "2 * step" was wrong).
+6. three ground rays at offsets `0.04 * (1,0,0), (-1,0,1)/sqrt2, (-1,0,-1)/sqrt2` (f32 @0x100127cc) from `maxY (+0.4 when falling is enabled)` straight down to y = 0
+   (miss: y = 0); their points give the ground normal `(b - a) x (c - a)` (flipped up) and `ray_y = max y`.
+7. supported when `feet - tol <= max(ray_y, liquid level)`; then, with `vy <= 0.1` (f64 @0x100127c0) and falling enabled, `feet = max(ray_y, closest.y) + 0.01`; the
+   ground normal must be `>= 0.5` and `vy <= 0.1` to count as ground (`airborne = false`, the caller lands a falling body: `LandNow`), otherwise the body is airborne (the caller starts a
+   fall: `FUN_1000a1a7`). Hover guard: same height, `vy <= -0.1`, five frames in a row -> counted as ground (`Vehicle+0x138`).
+8. final `VetoPosition` on `(x, feet, z)`.
+Sliding up a single steep plane is therefore possible for one step, but the body is not supported there (normal < 0.5) and falls back down.
 
 ## 4. API (`ao_formats::playfield::collision`, scene coordinates)
 
-* `Collision::load(&RecordStore, playfield) -> Result<Collision>`: heightfield (outdoor) or room tile floors + room list
-  (dungeon), the KD volumes of every zone/room, the liquid polygons of the record tail. 4604: 3 ms, 4582: 41 ms, 566: 8 ms.
-* `Collision::from_scene(&Scene)`: **fallback** (documented deviation): only the identity-placed meshes (terrain, room shells), no statels.
-* `support(p) -> Option<Support{y, normal}>` / `ground(p) -> Option<f32>`: highest walkable surface (`normal.y >= 0.5`) at or
-  below `p.y` (+1 mm) under `(p.x, p.z)`: heightfield (also when `p` is under it: the client clamps up to the terrain) and every walkable
-  KD / tile triangle. The caller lifts the ray start (the client starts 0.4 m above the old position, `RAY_LIFT`).
-  200k queries take 35 ms (grid of 4 m cells, big triangles in an always-tested list).
-* `wading_ground(p)`: `max(ground, liquid level - 1.2)`; `liquid_at(p) -> Option<Liquid{level, kind}>`: highest liquid polygon above
-  `p`. Outdoor polygons only (room liquids of the dungeon record are skipped by `record.rs`; **[GUESS/gap]**).
-* `slide(from, to, radius, height) -> [f32; 3]`: horizontal move of a vertical capsule: sub-steps of one radius, each pushed out
-  of wall triangles (`|normal.y| < 0.5`) by spheres from `STEP_HEIGHT` above the feet to the head, per sub-step `can_stand`
-  (never into a room-less dungeon position, never onto ground steeper than `MIN_FLOOR_NY` that climbs), falling back to single-axis
-  moves. `to.y` is kept. `sphere_hit(centre, radius)` is `GetSphereIntersection`'s contract (contact point, normal, depth).
-* `inside(p)`: dungeon room membership (always true outdoors), `triangle_count()`.
-* `kd::parse(version, bytes) -> Surface{volumes, nodes, portal, portal_dest}`: the decoder of section 2; `Surface::portal` /
-  `portal_dest` are the teleport portal polygon and destination bits (playfield-change data for the world flow, not used here).
-
-Constants (`pub const`): `MIN_FLOOR_NY = 0.5` (Vehicle.dll f32 @0x10012134, `Avatar.Movement` RE: below it ground is non-walkable),
-`STEP_HEIGHT = 0.48` (Vehicle.dll f32 @0x100127e0; the client adds `2 * step length` while walking: the caller does),
-`RAY_LIFT = 0.4` (Vehicle.dll f64 @0x100127f8), `WADE_DEPTH = 1.2` (N3 f64 @0x1003d370).
+* `Collision::load(&RecordStore, playfield) -> Result<Collision>`: heightfield (outdoor) or room tile floors + room list with door links (dungeon), the KD volumes of every
+  zone / room, the liquid polygons of the record tail. 4604: 3 ms, 4582: 41 ms, 566: 8 ms. `Collision::from_scene(&Scene)`: **fallback** (documented deviation): only the
+  identity-placed meshes (terrain, room shells), no statels; `closest` then uses the nearest face within 100 m below.
+* `align(old, new, &Body, &mut SurfaceState) -> Aligned{pos, airborne, normal, liquid}`: 3.4. `walk(from, to) -> Aligned`: the same with a standing body and fresh state
+  (tests, autopilot). `Body::WALKING`, `RADIUS = 0.4`, `FOOT_CLEARANCE = 0.01`.
+* `line(a, b) -> Option<Hit{p, n}>` (`GetLineIntersection`), `closest(feet, room_hint)`, `veto(&mut p, &mut SurfaceState) -> bool`, `ground(feet) -> Option<f32>` (= closest point
+  height; replaces the "highest surface at or below" query, the KD ray is limited to terrain delta + 0.3 m outdoors and 1 m in dungeons, dungeon tile floors are cast from the plane),
+  `liquid_at`, `inside`, `room_of`, `room_links`, `room_transition_allowed`, `set_door_passable`, `sphere_hit` (camera boom only), `triangle_count`.
+* `kd::parse(version, bytes) -> Surface{volumes, nodes, portal, portal_dest}`: the decoder of section 2.
+* Removed with the cutover: `support`, `wading_ground`, `slide(from, to, radius, height)` (capsule push-out). `MIN_FLOOR_NY` (0.5), `STEP_HEIGHT` (0.48, the base tolerance), `RAY_LIFT` (0.4), `WADE_DEPTH` (1.2).
 
 ## 5. Deviations / unresolved
 
-* **`slide` is not the client's algorithm.** The client resolves movement in `Vehicle_t` (Vehicle.dll `EnsureSurfaceAlignment`
-  @0x1000d1aa) with the body collision sphere (`n3Dynel_t::GetBodyCollSphereRadi`, per dynel `CollPrim_t`) against
-  `GetSphereIntersection` / `GetLineIntersection` of the surface; the radius is not a constant, the caller passes it. Our
-  push-out of spheres against walls reproduces the contract, not the iteration. **[GUESS]**
-* `support` returns the highest surface at or below the point; the client's KD query is a ray of limited length
-  (terrain delta + 0.3 m outdoors, 1.0 m in dungeons) and dungeon tile floors are cast from +100 m. Equivalent when the
-  position is on the ground, different for deep falls onto statels.
-* Dungeon room-to-room door permission and per-room liquids are not ported; the tile-word diagonal bit is assumed 0.
-* v4 invisible surfaces are treated like visible ones; teleport portals are decoded but not interpreted here.
-* Not found: any `.cim` / PathFinder navmesh for the player (PathFinder.dll only `GraphPathFinder_t`/`VisibilityGraph_t`).
+* Dungeon `line` uses exact triangle tests; the client marches the clipped segment in 1 m steps over tile triangles and falls back to `CalculateClosestPoint(end)` when the end lies under the floor. Same
+  result unless the floor is missing under the end point.
+* `closest` outdoors asks the KD triangles of all zones; the client asks only the first KD surface of the position's cell (`GetSurfaceForCell`). KD miss: the client writes y = 0, which can
+  never beat the terrain (heights are unsigned) so it is not reproduced. Dungeon KD miss with a KD surface present writes y = 0 and loses against any floor above 0.
+* Not ported: the liquid medium state machine of `Vehicle+0xfc` (wading/swimming callbacks, feet offsets of its modes, `Vehicle+0x10c`), orientation modes 1/3/4 (extra rays, body tilt,
+  blended up vector `Vehicle+0x12c`), `Vehicle+0x13c`. Room liquids (dungeon record) are still skipped by `record.rs` (`liquid_at` knows outdoor polygons only): **gap**.
+* `VetoRoomTransition`: the nudge radius (`dynel->vtbl[+0x10]()`) is unresolved (0.4 used); `GetSafePos` room index (`playfield+0x44`) unresolved (last allowed position, else room 0). The `Door_t` state
+  is not fed by any caller (every link passable). The tile-word diagonal bit `0x4000` is assumed 0.
+* The dynel flags `+0x74` / `+0x78` (skip the transition check) are assumed 0.
+* v4 invisible surfaces are treated like visible ones; teleport portals are decoded but not interpreted here. Not found: any navmesh for the player.
 
 ## 6. Verification (commands, observed)
 
-* `cargo test --release -p ao-formats collision`: unit tests (`kd_version4_record`, `kd_version5_record`, `kd_garbage_never_panics`,
-  synthetic floor / wall / step / platform, terrain parity, closest point) and `tests/collision_real.rs` (skip without the client):
-  * 4604 Arrival Hall: spawn (server 205.2, 1.0, 255.8) → floor within 0.5 m; a flood fill on a 0.5 m lattice with `slide` + `ground`
-    (capsule 0.35 x 1.8) reaches both ends of the hall (corridor end at server z 261.8, north end at z 157.3, 11 936 cells), the path
-    back to the spawn never jumps more than `STEP_HEIGHT + 0.12` and always has ground (no fall through); a 40 m push to +x from
-    the corridor stops at its wall (tile boundary 213.5).
-  * 4582: collision ground within 3 m of the rendered terrain around the spawn, ground under the spawn eye, none far outside.
-  * records of both versions decode; `liquid_at` is well defined.
+* `cargo test --release -p ao-formats collision`: unit tests (KD decoders, one sided line, wall head-on / diagonal slide numbers of 3.4, 0.3 m step passes and 0.6 m blocks, 30 degree
+  ramp carries / 70 degree ramp does not support, edge fall, closest-point ray limits with terrain, outdoor veto) and `tests/collision_real.rs` (skip without the client):
+  * 4604 Arrival Hall: flood fill with `walk` on a 0.5 m lattice reaches both ends of the hall, no height jump above `STEP_HEIGHT + 0.12`, a 40 m push stops at the corridor wall;
+    all of it is room 2, no door links;
+  * 4582: one frame steps across 169 lattice walks: feet = ground + 0.01 wherever supported, 8% of steps airborne (slopes), 87% unobstructed; KD volumes wound outward (228/228);
+  * door rule on the link graph (`room_transition_allowed`).
+* `cargo test --release -p aomac autopilot_crosses_the_arrival_hall`: the route over `walk` cells drives the headless character through the hall.
 * `cargo test --release -p ao-formats --test collision_real -- --ignored` (about 15 s): all 234 349 records decode with their markers.
