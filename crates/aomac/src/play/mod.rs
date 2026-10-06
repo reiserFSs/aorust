@@ -28,6 +28,7 @@ mod hud_winb;
 mod hud_cursor;
 mod hud_pick;
 mod hud_map;
+mod hud_mission;
 mod hud_listview;
 mod hud_nano;
 mod hud_keys;
@@ -213,6 +214,8 @@ struct Play {
     fight: Option<combat::module::Module>,
     /// Seconds since a successful `N3Msg_StartCamping` (the logout countdown, `hud_use.rs`).
     camp: Option<f32>,
+    /// The "Logout" timer bar of the camp countdown (`FlowControlModule_t::m_pcCampTimer`, `hud_use.rs`).
+    camp_bar: Option<ao_gui::WindowId>,
     /// `/camp` / `/quit` state (`m_eLoggingOutTimed`, `m_nQuitToSystemTime`; logout.rs).
     logout: logout::Logout,
     /// NPC dialogue / object use (`interact.rs`), created at the zone hand-off.
@@ -306,6 +309,7 @@ impl Play {
             player: None,
             fight: None,
             camp: None,
+            camp_bar: None,
             logout: Default::default(),
             interact: None,
             login_cred: None,

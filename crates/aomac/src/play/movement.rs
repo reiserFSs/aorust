@@ -2096,6 +2096,31 @@ mod tests {
         assert_eq!(m.pos(), [5.0, 0.0, 5.0], "a zero position places nothing");
     }
 
+    /// `FUN_10070185` + `SteeringDirArrive`: a follow target is approached to 4 m short of it and the vehicle halts there; a target that moves
+    /// away is followed again; a vanished target drops the chase.
+    #[test]
+    fn follow_target_dynel_stops_four_metres_short() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        assert!(m.follow_target(25, &[], Some(7)));
+        assert_eq!(m.chase_target(), Some(7));
+        m.set_chase_pos(Some([0.0, 0.0, 20.0]));
+        run(&mut m, &w, 8.0);
+        let z = m.pos()[2];
+        assert!((z - 16.0).abs() < 0.5 && m.pos()[0].abs() < 0.2, "{:?}", m.pos());
+        assert!(m.speed() < 0.1, "halted: {}", m.speed());
+        // inside 4 m (3-D distance) nothing moves
+        m.set_chase_pos(Some([0.0, 0.0, 18.0]));
+        run(&mut m, &w, 1.0);
+        assert!((m.pos()[2] - z).abs() < 0.05);
+        // the target walks off: followed again
+        m.set_chase_pos(Some([0.0, 0.0, 40.0]));
+        run(&mut m, &w, 3.0);
+        assert!(m.pos()[2] > z + 5.0, "{:?}", m.pos());
+        m.set_chase_pos(None);
+        assert_eq!(m.chase_target(), None);
+    }
+
     #[test]
     fn flags_stat_switches_falling_and_surface_collision() {
         let w = Flat(0.0);

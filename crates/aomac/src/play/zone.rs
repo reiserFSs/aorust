@@ -60,7 +60,7 @@ pub enum OwnEvent {
     /// `ImpulseIIR_c` element for the own dynel: `Vehicle_t::Impulse(delta, time)`.
     Impulse { delta: [f32; 3], time: f32 },
     /// `FollowTargetIIR_c` [GC 0x100732e3] with the own dynel as header.
-    Follow { mode: u8, pos: [f32; 3], path: Vec<[f32; 3]> },
+    Follow { mode: u8, target: Option<i32>, pos: [f32; 3], path: Vec<[f32; 3]> },
     /// `CharacterActionIIR_t` action id of the own dynel (`0x56` sit relay, `0x57` stand up, `0x63` death, `0xAD`).
     Action(i32),
     /// `ResurrectIIR_t` [GC 0x100769bd]: Health / CurrentNano are in the stat table, the vehicle recalculates.
@@ -122,8 +122,13 @@ pub struct Zone {
     pub active_spells: Vec<ao_net::n3::spells::Spell>,
     /// Pending [`OwnEvent`]s (drained by the player each frame).
     pub own_events: Vec<OwnEvent>,
+    /// District fight-mode level of the own character (`FUN_1003e1d0`, `fightmode.rs`), written by the player each frame; `None` until then
+    /// (the original's no-data default is [`super::fightmode::DEFAULT_LEVEL`]). `/follow` reads it.
+    pub fight_level: Option<i32>,
     /// `RelocateDynelsIIR_t`: `(child, parent)` links (`n3Dynel_t::RelocateDynel`), cleared with the playfield.
     pub parents: Vec<(Identity, Identity)>,
+    /// Position and heading of each parented character relative to its parent (the vehicle's `+0x58` / `+0x80`).
+    child_rel: HashMap<i32, ([f32; 3], f32)>,
     /// The own nano programs and timed nano effects (`own_nanos.rs`, the Programs / NCU windows).
     pub nanos: super::own_nanos::OwnNanos,
     /// The `TeleportTrier_t` [GC 0x10037d05] of a client-initiated teleport try (a child of the playfield, so it survives the own dynel being
@@ -136,6 +141,26 @@ pub struct Zone {
 impl Zone {
     pub fn new(char_id: u32) -> Self {
         Self { char_id, ..Self::default() }
+    }
+
+    /// Global position and heading of a child at `rel` / `rel_yaw` relative to the character `parent` (`None` when it is unknown).
+    fn compose(&self, parent: i32, rel: [f32; 3], rel_yaw: f32) -> Option<([f32; 3], f32)> {
+        let p = self.dynels.get(&parent)?;
+        let py = p.yaw.unwrap_or(0.0);
+        let (s, c) = py.sin_cos();
+        Some(([p.pos[0] + rel[0] * c + rel[2] * s, p.pos[1] + rel[1], p.pos[2] - rel[0] * s + rel[2] * c], py + rel_yaw))
+    }
+
+    /// The parent `parent` moved: its parented characters follow (`Vehicle_t::UpdateListeners`).
+    fn place_children(&mut self, parent: i32) {
+        let kids: Vec<i32> = self.parents.iter().filter(|l| l.1.kind == CHAR_KIND && l.1.instance == parent && l.0.kind == CHAR_KIND).map(|l| l.0.instance).collect();
+        for k in kids {
+            let Some(&(rel, ryaw)) = self.child_rel.get(&k) else { continue };
+            if let (Some((pos, yaw)), Some(d)) = (self.compose(parent, rel, ryaw), self.dynels.get_mut(&k)) {
+                d.pos = pos;
+                d.yaw = Some(yaw);
+            }
+        }
     }
 
     /// The player's own dynel once its `SimpleCharFullUpdateIIR_t` arrived.
@@ -199,6 +224,7 @@ impl Zone {
         self.fight_target.clear();
         self.own_events.clear();
         self.parents.clear();
+        self.child_rel.clear();
         self.in_play_sent = false;
         // `n3Playfield_t::StopPlayfield` kills every child of the playfield, the `TeleportTrier_t` among them
         self.trier = None;
@@ -285,15 +311,26 @@ impl Zone {
             }
             // the original ignores every CharDCMove for the own dynel (`FUN_1006bcc6`, docs/zone/movement.md)
             N3::Dynel(Dynel::CharDCMove(mv)) if who.kind == CHAR_KIND && who.instance != self.char_id as i32 => {
+                // a child of a `RelocateDynelsIIR_t` parent moves relative to it (`Vehicle +0x58` is the relative position, `UpdateListeners`
+                // [VH 0x1000d0a2]: global = parent global + parent rotation * relative)
+                let rel = (mv.pos, mv.yaw());
+                let parent = self.parents.iter().find(|l| l.0 == who && l.1.kind == CHAR_KIND).map(|l| l.1.instance);
+                let placed = parent
+                    .and_then(|p| {
+                        self.child_rel.insert(who.instance, rel);
+                        self.compose(p, rel.0, rel.1)
+                    })
+                    .unwrap_or(rel);
                 if let Some(d) = self.dynels.get_mut(&who.instance) {
-                    d.pos = mv.pos;
-                    d.yaw = Some(mv.yaw());
+                    d.pos = placed.0;
+                    d.yaw = Some(placed.1);
                 }
+                self.place_children(who.instance);
             }
             // server messages that place / push / reconfigure the own character (the original applies them to its vehicle, §10)
             N3::Misc(Misc::FollowTarget(f)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 let v = |p: &ao_net::n3::misc::Vec3| [p.x, p.y, p.z];
-                self.own_events.push(OwnEvent::Follow { mode: f.mode, pos: v(&f.pos), path: f.path.iter().map(v).collect() });
+                self.own_events.push(OwnEvent::Follow { mode: f.mode, target: (f.target.kind == CHAR_KIND && f.target.instance != 0).then_some(f.target.instance), pos: v(&f.pos), path: f.path.iter().map(v).collect() });
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 self.own_events.push(OwnEvent::Action(a.action));
@@ -369,9 +406,14 @@ impl Zone {
                         if c.kind != CHAR_KIND {
                             continue;
                         }
-                        if let Some(pos) = origin {
+                        // `SetParentVehicle(parent, NullPos)` + `NullRot`: the child sits at the parent's origin, facing as the parent
+                        self.child_rel.insert(c.instance, ([0.0; 3], 0.0));
+                        if let Some((pos, yaw)) = (r.parent.kind == CHAR_KIND).then(|| self.compose(r.parent.instance, [0.0; 3], 0.0)).flatten() {
                             if let Some(d) = self.dynels.get_mut(&c.instance) {
                                 d.pos = pos;
+                                if c != own {
+                                    d.yaw = Some(yaw);
+                                }
                             }
                         }
                         if c == own {
@@ -538,6 +580,29 @@ mod tests {
         assert_eq!(own.name, "Testy");
         assert!(own.yaw.is_some());
         assert!(z.dynels.len() > 10, "{}", z.dynels.len());
+    }
+
+    /// `UpdateListeners` [VH 0x1000d0a2] / `GetGlobalRot`: a parented character's global position is `parent + R_y(parent heading) * relative`, its
+    /// heading the parent's plus its own. One level (a parent that is itself parented keeps the last global it was given).
+    #[test]
+    fn children_move_with_their_parent() {
+        let d = |pos, yaw| DynelState { name: String::new(), pos, yaw: Some(yaw), npc: false, side: 0, level: 1, health: 1, max_health: 1 };
+        let mut z = Zone::new(1);
+        let (p, c) = (Identity { kind: CHAR_KIND, instance: 10 }, Identity { kind: CHAR_KIND, instance: 20 });
+        z.dynels.insert(10, d([100.0, 5.0, 50.0], std::f32::consts::FRAC_PI_2));
+        z.dynels.insert(20, d([0.0; 3], 0.0));
+        z.parents.push((c, p));
+        z.child_rel.insert(20, ([1.0, 0.5, 2.0], 0.25));
+        // heading +90 degrees about Y: (x, z) = (1, 2) -> (x cos + z sin, -x sin + z cos) = (2, -1)
+        let (pos, yaw) = z.compose(10, [1.0, 0.5, 2.0], 0.25).unwrap();
+        assert!((pos[0] - 102.0).abs() < 1e-4 && (pos[1] - 5.5).abs() < 1e-5 && (pos[2] - 49.0).abs() < 1e-4, "{pos:?}");
+        assert!((yaw - (std::f32::consts::FRAC_PI_2 + 0.25)).abs() < 1e-6);
+        // the parent moving carries the child
+        z.dynels.get_mut(&10).unwrap().pos = [200.0, 0.0, 0.0];
+        z.place_children(10);
+        let ch = &z.dynels[&20];
+        assert!((ch.pos[0] - 202.0).abs() < 1e-4 && (ch.pos[2] + 1.0).abs() < 1e-4, "{:?}", ch.pos);
+        assert!(z.compose(99, [0.0; 3], 0.0).is_none(), "unknown parent");
     }
 
     #[test]

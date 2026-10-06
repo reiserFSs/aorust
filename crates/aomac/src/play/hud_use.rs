@@ -26,6 +26,11 @@ impl Play {
                 }
                 // type 6: `N3Msg_PerformSpecialAction(Action_e)` -> `FUN_1004256c` (docs/zone/combat-net.md §5.3)
                 SlotUse::SpecialAction(a) => self.special_action(a),
+                SlotUse::Unavailable => {
+                    if let Some(c) = self.chat.as_mut() {
+                        c.feedback(&mut self.gui, "Feedback_ActionIsNotAvailable", &self.text);
+                    }
+                }
             }
         }
     }
@@ -82,8 +87,10 @@ impl Play {
         self.logout.state = State::System;
     }
 
-    /// `CancelCampMessage` [GUI 0x10029c26]: the timer bar is deleted, text `TimedLogoutAborted` (code 12), state 0, quit time 0.
+    /// `CancelCampMessage` [GUI 0x10029c26]: the timer bar is deleted (`TimerSystemModule_t::DeleteTimer`), text `TimedLogoutAborted`
+    /// (code 12), state 0, quit time 0.
     fn cancel_camp(&mut self) {
+        self.camp_bar_close();
         self.camp = None;
         self.logout.cancel();
         if let Some(c) = self.chat.as_mut() {
@@ -91,15 +98,51 @@ impl Play {
         }
     }
 
+    /// `TimerSystemModule_t::CreateTimer(40000, 0:0, "Logout", 0xffffff)` [GUI 0x100518f0] -> `TimerBar_c` (ctor 0x100512ae): a `RenderWindow_t`
+    /// holding a `PowerBar_t(gfx 0x1a8 `GFX_GUI_TIMERBAR_EMPTY` / 0x1a9 `GFX_GUI_TIMERBAR_FULL`)` sized to the art and a `TextLine_t` with the
+    /// name; `CampStartedMessage` fixes the time at 30.0 s, direction 1 (`FUN_1002ba93`: the bar drains) and centres it,
+    /// `((display - size) / 2)` per axis. 40000 is the `RenderWindow_t` / `PowerBar_t` id argument, not a duration. [UNRESOLVED] the text
+    /// colour (`TextLine_t::SetDefaultColor(0)`: palette entry 0) and font; the frame-less window stands in for the `RenderWindow_t` layer 7.
+    fn camp_bar_open(&mut self) {
+        self.camp_bar_close();
+        let (bw, bh) = self.gui.gfx_id("GFX_GUI_TIMERBAR_EMPTY").map(ao_gui::GfxId).map_or((128, 16), |g| self.gui.gfx().size(g));
+        let xml = format!(
+            "<root><View view_layout=\"stacked\" name=\"camp_timer\" min_size=\"Point({bw},{bh})\" max_size=\"Point({bw},{bh})\">\
+             <PowerBar name=\"camp_bar\" bg_gfx=\"GFX_GUI_TIMERBAR_EMPTY\" full_gfx=\"GFX_GUI_TIMERBAR_FULL\" direction=\"right\"/>\
+             <TextView name=\"camp_label\" h_alignment=\"center\" v_alignment=\"center\"/></View></root>"
+        );
+        match self.gui.open_window_xml("TimerBar", &xml, (0, 0), ao_gui::WindowSize::Fixed(bw, bh)) {
+            Ok(w) => {
+                self.gui.set_text(w, "camp_label", "Logout");
+                let (ow, oh) = self.gui.outer_size(w);
+                self.gui.set_window_pos(w, ((self.size.0 as i32 - ow as i32) / 2, (self.size.1 as i32 - oh as i32) / 2));
+                self.camp_bar = Some(w);
+            }
+            Err(e) => eprintln!("hud: logout timer bar: {e:#}"),
+        }
+    }
+
+    fn camp_bar_close(&mut self) {
+        if let Some(w) = self.camp_bar.take() {
+            self.gui.close_window(w);
+        }
+    }
+
     /// The camp countdown (`FlowControlModule_t::m_pcCampTimer`, 30 s): its end is the server dropping the connection, and
     /// `ServerLostMessage` [GUI 0x10028d50] runs `ActivateGameClosing(state)`: state 1 quits the game, state 2 returns to the login (config
     /// saved, screen cleared, then login [GUI 0x10028194]). [INFERENCE] the 30 s expiry itself is the server's: `StartLogoutIIR_t` /
-    /// `StopLogoutIIR_t` have no client apply [GC 0x10079c53 / 0x10079e6c]; the timer bar widget is not drawn.
+    /// `StopLogoutIIR_t` have no client apply [GC 0x10079c53 / 0x10079e6c]. The timer bar's level is `remaining / total`
+    /// (`TimerBar_c` vtable slot 0 [GUI 0x100514d5], direction 1).
     pub(in crate::play) fn camp_frame(&mut self, dt: f32, host: &mut ao_render::Host) {
         let Some(t) = self.camp.as_mut() else { return };
         *t += dt;
-        if *t >= CAMP_SECONDS {
+        let t = *t;
+        if let Some(w) = self.camp_bar {
+            self.gui.set_progress(w, "camp_bar", (1.0 - t / CAMP_SECONDS).max(0.0));
+        }
+        if t >= CAMP_SECONDS {
             self.camp = None;
+            self.camp_bar_close();
             match self.logout.expired() {
                 Some(super::logout::Closing::System) => host.quit = true,
                 _ => self.show_login(host),
@@ -124,6 +167,7 @@ impl Play {
                 self.send_outgoing(out);
                 // `CampStartedMessage` [GUI 0x10029d38]: timer 40000 "Logout", state 0 -> 1, text `LogoutStarted` fed 30 (code 12)
                 self.camp = Some(0.0);
+                self.camp_bar_open();
                 self.logout.camp_started();
                 if let Some(c) = self.chat.as_mut() {
                     c.logout_line(&mut self.gui, "LogoutStarted", Some(CAMP_SECONDS as i32), &self.text);
@@ -134,6 +178,7 @@ impl Play {
                 if let Some(c) = self.chat.as_mut() {
                     c.feedback(&mut self.gui, r.key(), &self.text);
                 }
+                false
             }
         }
     }

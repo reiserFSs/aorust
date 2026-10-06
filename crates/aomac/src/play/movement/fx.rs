@@ -260,7 +260,7 @@ mod tests {
         assert_eq!((m.stats().features & 4, m.fsm().mode), (0, mode::FROZEN));
         // the next grant makes it 1: bit set, `Transition(0x26)` leaves Frozen
         m.features_grant(bits::MOVE);
-        assert_eq!((m.stats().features & 4, m.fsm().mode), (4, mode::RUN));
+        assert_eq!((m.stats().features & 4, m.fsm().mode), (4, mode::WALK), "LeaveFrozen returns to the last speed mode (a fresh character walks)");
         // the Flags bit 0x20000 vetoes bit 4 (the grant clears it again)
         m.set_stats(|s| s.flags |= FLAG_NO_FREEZE);
         m.features_revoke(bits::MOVE);
@@ -292,12 +292,21 @@ mod tests {
         assert_eq!(m.stats().features & 2, 0, "-2 revoked");
         m.action(id::FORWARD_START, 0.0);
         assert!(m.take_outgoing().is_empty(), "no key reaches the locked character");
-        // a repeated fear does nothing, control (5) is refused while fear (1) holds? no: 5 > 1 releases fear first
+        // a repeated fear does nothing; `FUN_100458fa(5)` only ends states ABOVE 5 (`new < state`), so control is refused while fear holds
         assert!(m.apply_spell(&fear, true));
         assert_eq!(m.crowd_state(), 1);
+        m.apply_spell(&spell(function::CONTROL, &[]), true);
+        assert_eq!((m.crowd_state(), m.stats().features & 0x500), (1, 0x500));
+        assert!(m.apply_spell(&fear, false));
+        assert_eq!((m.crowd_state(), m.input_locked(), m.npc_vehicle(), m.stats().features & 0x500), (0, false, false, 0));
+        // control (5) holds; a fear request (1 < 5) ends it first (`FUN_10045821`), then starts the fear
         assert!(m.apply_spell(&spell(function::CONTROL, &[]), true));
-        assert_eq!((m.crowd_state(), m.stats().features & 0x500), (5, 0), "release(5) ended the fear: -0x500, the lock stays");
-        assert!(m.input_locked() && m.npc_vehicle());
+        assert_eq!((m.crowd_state(), m.input_locked(), m.npc_vehicle(), m.stats().features & 0x500), (5, true, true, 0));
+        assert!(m.apply_spell(&fear, true));
+        assert_eq!((m.crowd_state(), m.input_locked(), m.stats().features & 0x500), (1, true, 0x500));
+        assert!(m.apply_spell(&fear, false));
+        assert!(m.apply_spell(&spell(function::CONTROL, &[]), true));
+        assert_eq!(m.crowd_state(), 5);
         assert!(m.apply_spell(&spell(function::CONTROL, &[]), false));
         assert_eq!((m.crowd_state(), m.input_locked(), m.npc_vehicle()), (0, false, false));
         m.action(id::FORWARD_START, 1.0);

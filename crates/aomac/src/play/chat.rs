@@ -4,14 +4,17 @@
 
 mod cmd;
 mod dialog;
+mod filter;
 mod info;
 mod line;
+mod macros;
 mod log;
 mod net;
 mod social;
 mod social_hub;
 mod social_win;
 pub(super) mod win;
+mod voice;
 mod zone;
 mod zonecmd;
 
@@ -30,6 +33,10 @@ use net::Out;
 use std::collections::HashSet;
 use win::{ChatWindows, WinOut, G_VICINITY, LOCAL_GROUPS};
 
+/// Home page of `BrowserWindow_c` mode 3 ("Petition"): GUI.dll's URL table 0x101c32c8.. lists shop, market, **report.project-rk.com** (mode 3), daily login in
+/// the order of the modes 1..4 (docs/chat/dialogs.md §6).
+const PETITION_URL: &str = "https://report.project-rk.com/";
+
 /// Identity kind of characters (`SimpleChar_t`).
 const CHAR_KIND: i32 = 0xC350;
 
@@ -42,6 +49,35 @@ pub(super) enum GameAction {
     Assist,
     /// `/camp`: AFCM 0x134 (`StartQuitToLoginMessage`, GUI 0x10027c74): camp, then back to the login screen.
     Camp,
+    /// `/selectself`: AFCM 0x1e / 0x126 with the own id (`TargetingModule_t::SetTargetMessage`: `SetTarget(own, false)`).
+    SelectSelf,
+}
+
+/// Results of chat commands that other layers apply (taken once per frame by the flow with [`Chat::take_requests`]).
+#[derive(Default)]
+pub(super) struct Requests {
+    /// `/waypoint`: playfield and world X/Z of the map marker (`GlobalSignals+0x158`, `HudMap::set_mission`).
+    pub waypoint: Option<(u32, [f32; 2])>,
+    /// Heard voice messages: sound file below `cd_image/sound` (`PlayPlayerFX`).
+    pub sounds: Vec<String>,
+    /// `/macro`: the macro just created; the shortcut bar starts dragging it (`FUN_100d82d4`).
+    pub macro_drag: Option<macros::Macro>,
+}
+
+/// DValues of the voice effects (`VoiceSndFx*`, defaults of `LoginPrefs.xml` / `CharPrefs.xml`); the generic DValue registry sets them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct VoicePrefs {
+    /// `VoiceSndFxType` 0..=3.
+    pub fx_type: i32,
+    pub hear_vicinity: bool,
+    pub hear_guild: bool,
+    pub hear_team: bool,
+}
+
+impl Default for VoicePrefs {
+    fn default() -> Self {
+        Self { fx_type: 0, hear_vicinity: false, hear_guild: false, hear_team: true }
+    }
 }
 
 pub(super) struct Chat {
@@ -85,6 +121,19 @@ pub(super) struct Chat {
     tell_log: std::collections::HashMap<u32, Vec<String>>,
     /// Chat windows ticked in the invitation dialog, by group owner id (applied when the group joins).
     pg_windows: std::collections::HashMap<u32, Vec<String>>,
+    /// `ChatFilterEnabled` / `ChatFilterRules` (`/filter`).
+    filter: filter::FilterState,
+    /// `TextMacroSystem_t` (`TextMacro.bin`).
+    macros: macros::TextMacros,
+    voice_prefs: VoicePrefs,
+    voice_throttle: voice::Throttle,
+    /// Own stat `Expansion` (0x185), kept from the zone frames (the voice feature needs bit 0).
+    expansion: i32,
+    /// Output group of the window the last line was typed in (`FUN_1009a26c`).
+    last_out_group: Option<u64>,
+    /// Text of the open bug report dialog.
+    bug: Option<String>,
+    requests: Requests,
 }
 
 enum Back {
@@ -140,6 +189,10 @@ impl Chat {
         LOCAL_GROUPS.iter().find(|g| g.0 == class).map(|g| g.1.to_owned()).or_else(|| self.net.groups.get(&class).cloned())
     }
     fn msg(&mut self, gui: &mut Gui, m: line::ChatMsg) {
+        // `FUN_10084f9e`: a message matching a rule of an enabled filter never reaches the windows
+        if self.filter.drops(&m.text) {
+            return;
+        }
         match &mut self.win {
             Some(w) => w.push_msg(gui, &m),
             None => self.backlog.push(Back::Msg(m)),
@@ -196,6 +249,16 @@ impl Chat {
     #[cfg(test)]
     pub fn drop_connection(&self) {
         self.net.drop_connection();
+    }
+
+    /// `/waypoint`, heard voices, `/macro` results for the flow.
+    pub fn take_requests(&mut self) -> Requests {
+        std::mem::take(&mut self.requests)
+    }
+
+    /// Voice DValues from the registry.
+    pub fn set_voice_prefs(&mut self, p: VoicePrefs) {
+        self.voice_prefs = p;
     }
 
     pub fn take_game(&mut self) -> Vec<GameAction> {
@@ -255,6 +318,7 @@ impl Chat {
     /// One zone frame: 0x43 (chat server list) connects; N3 chat messages become lines.
     pub fn on_zone_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &Zone, texts: &TextDb) {
         self.own_id = zone.char_id;
+        self.expansion = zone.stat(0x185).unwrap_or(0);
         match f.ptype {
             PT_SYSTEM => self.net.on_system_frame(f, zone.char_id),
             PT_N3 => {
@@ -315,6 +379,7 @@ impl Chat {
                         self.last_tell_from = Some(m.from_name.clone());
                         self.social_tell_in(gui, m.from_id, &m.from_name, &m.text, m.flags & 1 != 0, texts);
                     }
+                    self.hear_voice(&m);
                     self.msg(gui, m);
                 }
                 Out::Line(l) => self.line(gui, l),
@@ -436,6 +501,12 @@ impl Chat {
         handled
     }
 
+    /// `InfoViewModule_c::ShowURL(url)` (also Shift+click `charid://` / `itemid://` links).
+    pub fn show_url(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb, url: &str) {
+        let outs = self.info.show_url(gui, self.screen, url, true);
+        self.info_out(gui, outs, zone, texts);
+    }
+
     fn info_out(&mut self, gui: &mut Gui, outs: Vec<info::InfoOut>, zone: &Zone, texts: &TextDb) {
         for o in outs {
             match o {
@@ -467,11 +538,86 @@ impl Chat {
                     self.afk = Some(text);
                 }
             }
+            // `FlowControlModule_t::SendBugReportResult` 0x1002a028: OK (0) sends, everything else is "cancelled"
+            (dialog::Kind::BugReport, button) => {
+                let text = self.bug.take().unwrap_or_default();
+                let key = if button == 0 && !text.is_empty() {
+                    if Self::send_bug_report(&text) { "BugReport_Sent" } else { "BugReport_SendFailed" }
+                } else {
+                    "BugReport_SendCancelled"
+                };
+                let t = texts.by_key(5000, key).unwrap_or_default();
+                self.system_line(gui, &t, 0);
+            }
             (dialog::Kind::Afk, _) => {
                 self.afk = None;
                 self.system_line(gui, "AFK off.", 0);
             }
             _ => {}
+        }
+    }
+
+    /// `BugReport_t::SendUserMadeBugReport` (Interfaces 0x1000f931) mails the report over SMTP to `ingamebugs@anarchy-online.com` through
+    /// `bugreport.funcom.com:7501` (Funcom's server, not Project Rubi-Ka's). The port deliberately does not transmit the text (and the system
+    /// report `GenerateReport` adds) to that third party: it reports the failure path of the original. Reports for PRK go to report.project-rk.com.
+    fn send_bug_report(_text: &str) -> bool {
+        false
+    }
+
+    fn open_url(&self, url: &str) {
+        if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
+            eprintln!("chat: open {url}: {e}");
+        }
+    }
+
+    /// `/voice <sound>` (GUI 0x100b82c2).
+    fn voice_cmd(&mut self, gui: &mut Gui, zone: &Zone, cmd: &str, sound: Option<String>) {
+        let err = |t: &str| ChatLine::new(ChatKind::Other("CCChatCmdFeedbackError"), format!("<div><font color=CCChatCmdFeedbackError>{t}</font></div>"));
+        // stat 0x185 (Expansion) bit 0; the required name `FUN_1016c316` joins is not decoded: [GUESS] "Notum Wars" (bit 0 of the expansion flags)
+        if zone.stat(0x185).unwrap_or(0) & 1 == 0 {
+            return self.line(gui, err("This function requires Notum Wars."));
+        }
+        let Some(sound) = sound else { return self.line(gui, err(&format!("Usage: {cmd} &lt;sound name&gt;"))) };
+        let own = zone.own().map_or(String::new(), |d| d.name.clone());
+        let v = voice::Voice { breed: zone.stat(4).unwrap_or(0), sex: zone.stat(0x3b).unwrap_or(0), fx: voice::fx_name(self.voice_prefs.fx_type).into(), sound };
+        let cd = ao_gui::client_dir().join("cd_image");
+        let cands = voice::candidates(&own, &v);
+        if !voice::installed(&cd, &cands) {
+            return self.line(gui, err("You do not have that voice effect installed."));
+        }
+        // `[T]` / `[M]` flags (team-view flash / `GlobalSignals+0x150`) are consumed; only the text is sent
+        let (text, _flags) = voice::strip_flags(&voice::spoken_text(&cd, &cands));
+        let text = text.trim_end_matches(['\r', '\n']).to_owned();
+        let group = self.last_out_group.unwrap_or(G_VICINITY);
+        let extras = voice::extras(&v);
+        if group == G_VICINITY {
+            let tx = zone::text_bytes(&text);
+            if let Some(buf) = ao_net::n3::chat::chat_buffer(&tx, zone::Speech::Say as u8) {
+                let buf = [buf, extras].concat();
+                let p = ao_net::n3::outgoing::text_payload(ao_net::n3::outgoing::TextKind::Vicinity, Self::target_identity(zone), &buf);
+                self.outbox.push(ao_net::n3::outgoing::text_frame(0, zone.char_id, p));
+            }
+        } else if !self.net.say_voice(group, &text, extras) {
+            self.line(gui, err(&format!("Error: Chat group {} is currently not available.", self.group_name(group))));
+        }
+    }
+
+    /// `FUN_1008c953` after `HandleVicinityMessage` / `HandleGroupMessage`: plays the voice of a heard message.
+    fn hear_voice(&mut self, m: &line::ChatMsg) {
+        let Some(v) = &m.voice else { return };
+        let on = match m.group >> 32 {
+            0 => self.voice_prefs.hear_vicinity,
+            3 => self.voice_prefs.hear_guild,
+            0x82 => self.voice_prefs.hear_team,
+            _ => false,
+        };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        if !on || v.sound.is_empty() || self.expansion & 1 == 0 || !self.voice_throttle.allow(&m.from_name, now) {
+            return;
+        }
+        let cd = ao_gui::client_dir().join("cd_image");
+        if let Some(rel) = voice::wav_rel(&cd, &voice::candidates(&m.from_name, v)) {
+            self.requests.sounds.push(rel);
         }
     }
 
@@ -551,6 +697,7 @@ impl Chat {
         let out_name = out_group.map(|g| self.group_name(g));
         let ctx = self.cmd_ctx(zone, &groups, out_name.as_deref(), &tx);
         let actions = cmd::parse(text, &ctx);
+        self.last_out_group = out_group;
         for a in actions {
             self.perform(gui, a, zone, texts);
         }
@@ -587,14 +734,16 @@ impl Chat {
                 // `FUN_10044b6e`: stat `Features` (0xE0); only the own one is tracked, the target's stats are not kept
                 own_features: zone.stat(0xE0).unwrap_or(0) as u32,
                 target_features: 0,
-                // [UNRESOLVED] `FUN_1003e1d0` needs `PlayfieldDistrictInfo`/`FightModeHandler`: the original's no-data default 2, as
-                // `Player::follow_gated` (so `/follow` answers `Feedback_CantFollow` until the district level is read)
-                own_fight_level: 2,
-                target_fight_level: 2,
+                // `FUN_1003e1d0` ([`Zone::fight_level`]); [INFERENCE] both `FUN_1003e228` calls of the `/follow` gate take no explicit dynel in
+                // the decompile, so the target uses the same district level
+                own_fight_level: zone.fight_level.unwrap_or(super::fightmode::DEFAULT_LEVEL),
+                target_fight_level: zone.fight_level.unwrap_or(super::fightmode::DEFAULT_LEVEL),
                 // [UNRESOLVED] `vtbl[0x90]` of the own vehicle (docs/chat/cmd.md §/follow): a controllable avatar
                 can_move: true,
                 move_mode: 0,
             },
+            visual_flags: zone.stat(0x2a1).unwrap_or(0),
+            reclaim_open: false,
         };
         let out = zonecmd::perform(a, &ctx);
         if let (Some(on), ChatAction::Lft { text, .. }) = (out.lft, a) {
@@ -720,10 +869,7 @@ impl Chat {
             ChatAction::Social(id) => self.game.push(GameAction::Social(id)),
             ChatAction::DValue(t) => self.dvalue_cmds.push(t),
             ChatAction::ClientCommand(c) if c.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/assist")) => self.game.push(GameAction::Assist),
-            ChatAction::ShowUrl(u) => {
-                let outs = self.info.show_url(gui, self.screen, &u, true);
-                self.info_out(gui, outs, zone, texts);
-            }
+            ChatAction::ShowUrl(u) => self.show_url(gui, zone, texts, &u),
             // FUN_100b6f0d: only from level 4 on (stat 0x36 > 3); `prev` steps back, anything else forward, never below 0
             ChatAction::TipOfTheDay { prev } => {
                 if zone.stat(0x36).unwrap_or(0) > 3 {
@@ -739,6 +885,28 @@ impl Chat {
             }
             ChatAction::AfkPrompt { default, body } => self.dialog(gui, dialog::Kind::Afk, body, vec!["Ok".into()], Some(default)),
             ChatAction::Camp => self.game.push(GameAction::Camp),
+            ChatAction::SelectSelf => self.game.push(GameAction::SelectSelf),
+            // `BrowserWindow_c` type 3 ("Petition", an embedded browser) opens `https://report.project-rk.com/` (docs/chat/dialogs.md §6);
+            // the system browser stands in for the embedded Awesomium view
+            ChatAction::Petition => self.open_url(PETITION_URL),
+            ChatAction::Waypoint { x, z, pf } => self.requests.waypoint = Some((pf as u32, [x, z])),
+            ChatAction::Filter(t) => {
+                for l in self.filter.command(&t) {
+                    self.line(gui, zonecmd::info_line(&l));
+                }
+            }
+            ChatAction::Macro { name, command } => {
+                let id = self.macros.create(&name, &command, 0, true);
+                self.requests.macro_drag = self.macros.get(id).cloned();
+            }
+            ChatAction::Bug(text) => {
+                let head = texts.by_key(5000, "BugReport_ReportMsgH").unwrap_or_default();
+                let ok = texts.by_key(10000, "MsgBox_OK").unwrap_or_else(|| "OK".into());
+                let cancel = texts.by_key(10000, "MsgBox_Cancel").unwrap_or_else(|| "Cancel".into());
+                self.bug = Some(text.clone());
+                self.dialog(gui, dialog::Kind::BugReport, format!("{head}{text}"), vec![ok, cancel], None);
+            }
+            ChatAction::Voice { cmd, sound } => self.voice_cmd(gui, zone, &cmd, sound),
             ChatAction::Quit => self.quit = true,
             // FUN_100b94e0: `ShellExecuteA("open", url)`; the macOS equivalent (`Play::show_error` does the same for the login error pages)
             ChatAction::Start(u) => {

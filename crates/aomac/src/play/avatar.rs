@@ -288,6 +288,7 @@ impl Avatar {
     }
 
     /// Body height in metres including `monster_scale` (eye height / name tag).
+    #[cfg(test)]
     pub fn height(&self) -> f32 {
         self.rig.height() * self.scale
     }

@@ -87,7 +87,15 @@ fn header_at(d: &[u8], p: usize, ver: u16) -> Option<(District, usize)> {
     };
     let mut music = [0u16; 8];
     music.copy_from_slice(&ids[1..]);
-    let fight_mode = d.get(end + 5).copied().unwrap_or(0);
+    // the reader's own range checks (GD `operator>>` @0x100049be): level ranges `a <= b <= 0x400`, respawn chance <= 100, respawn time >= -1,
+    // fight mode < 5; they also reject the printable-looking byte runs inside the other records the header scan could stop at
+    if [npc, lc].iter().any(|&(a, b)| a > b || b > 0x400) || *d.get(end)? > 100 || i32::from_le_bytes(d.get(end + 1..end + 5)?.try_into().ok()?) < -1 {
+        return None;
+    }
+    let fight_mode = *d.get(end + 5)?;
+    if fight_mode > 4 {
+        return None;
+    }
     Some((District { name, sound_id: ids[0], music, npc_lvl: npc, lc_lvl: lc, centre: [f(0)?, f(4)?, f(8)?], fight_mode }, end))
 }
 

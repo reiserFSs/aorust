@@ -20,8 +20,6 @@ use ao_rdb::RecordStore;
 use ao_render::{GameInput, Host};
 use std::path::Path;
 
-/// District fight-mode level of the own zone (`FUN_1003e1d0` [GC]); the original returns 2 without `PlayfieldDistrictInfo` data. [UNRESOLVED] not read.
-
 /// Length of the jump's ceiling ray (f32 100.0 @ GC 0x10155eb0).
 const JUMP_CEILING_RAY: f32 = 100.0;
 
@@ -317,6 +315,16 @@ impl Player {
             }
         });
         self.apply_own_events(zone);
+        zone.fight_level = Some(self.fight_level(self.movement.pos()));
+        // `FUN_10070fee`: the target branch re-runs the Features / district gate every frame and reads the target's `GetRelPos`
+        if let Some(t) = self.movement.chase_target() {
+            if self.follow_gated() {
+                self.movement.drop_chase();
+            } else {
+                let p = if t == self.char_id as i32 { Some(self.movement.pos()) } else { zone.dynels.get(&t).map(|d| d.pos) };
+                self.movement.set_chase_pos(p);
+            }
+        }
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
         }
