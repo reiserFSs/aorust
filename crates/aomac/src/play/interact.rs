@@ -11,6 +11,7 @@ use ao_gui::{Event, Gui};
 use ao_net::frame::Frame;
 use ao_net::msg::Identity;
 use ao_net::n3::knubot::{self, Knubot};
+#[cfg(test)]
 use ao_net::n3::misc::{GenericArgs, GenericCmd, Misc};
 use ao_net::n3::outgoing::{n3_frame, DYNEL_CHAR};
 use ao_net::n3::{self, dynel::Dynel, N3};
@@ -20,6 +21,7 @@ use std::collections::HashMap;
 /// `HasStat(0x300)` and `GetStat(0x300, 2) & 1`). The server sends it as a `StatIIR_t` pair per NPC (docs/zone/dynel.md §3).
 pub const STAT_TALK: i32 = 0x300;
 /// `GenericCmd_t` command of `N3Msg_UseItem` for a world object: `FUN_1007c95c(actor, ItemActionData, 3)` [GC 0x100286f8].
+#[cfg(test)]
 const CMD_USE_ITEM: i32 = 3;
 
 #[derive(Default)]
@@ -32,6 +34,7 @@ pub struct Interact {
     chat: Option<NpcChat>,
     outbox: Vec<Frame>,
     /// `n3Command_t` sequence numbers of the commands we sent.
+    #[cfg(test)]
     seq: i32,
     /// Screen size for centring the window.
     screen: (u32, u32),
@@ -75,10 +78,6 @@ impl Interact {
         }
     }
 
-    pub fn chat_window(&self) -> Option<ao_gui::WindowId> {
-        self.chat.as_ref().map(|c| c.win)
-    }
-
     pub fn take_outbox(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.outbox)
     }
@@ -110,14 +109,14 @@ impl Interact {
         let own = Self::own_name(zone);
         match k {
             // `FUN_1002d36x`: an open window is deleted first (its destructor sends `NPCChatCloseWindow`), then a new one is built
-            Knubot::Open { npc, b20, b21 } => {
+            Knubot::Open { npc, .. } => {
                 if let Some(old) = self.chat.take() {
                     let (n, id) = (old.npc, self.own_id());
                     old.close(gui);
                     self.send(knubot::close_window(id, n));
                 }
                 let name = zone.dynels.get(&npc.instance).map(|d| d.name.clone()).unwrap_or_default();
-                match NpcChat::open(gui, self.screen, npc, &name, b20, b21) {
+                match NpcChat::open(gui, self.screen, npc, &name) {
                     Ok(c) => self.chat = Some(c),
                     Err(e) => eprintln!("interact: NPC chat window: {e:#}"),
                 }
@@ -136,10 +135,8 @@ impl Interact {
             }
             // the server closed the window: the destructor does not answer (`this[0x98]` set)
             Knubot::Close { npc, .. } => {
-                if self.chat.as_ref().is_some_and(|c| c.npc == npc) {
-                    if let Some(c) = self.chat.take() {
-                        c.close(gui);
-                    }
+                if let Some(c) = self.chat.take_if(|c| c.npc == npc) {
+                    c.close(gui);
                 }
             }
             _ => {}
@@ -167,6 +164,7 @@ impl Interact {
     }
 
     /// Click an answer link of the open dialogue by its index (the live harness / tests; the window's link event does the same).
+    #[cfg(test)]
     pub fn answer(&mut self, gui: &mut Gui, zone: &Zone, index: usize) -> bool {
         let own = Self::own_name(zone);
         let Some(c) = self.chat.as_mut() else { return false };
@@ -197,6 +195,7 @@ impl Interact {
     }
 
     /// `N3Msg_UseItem` [GC 0x100286f8] on a world object: `GenericCmd_t(state 0, seq, cmd 3, ItemActionData{actor = own, item})`.
+    #[cfg(test)]
     pub fn use_object(&mut self, item: Identity) {
         self.seq += 1;
         let cmd = GenericCmd { state: 0, seq: self.seq, cmd: CMD_USE_ITEM, args: GenericArgs::Item { flag: 0, actor: self.own_id(), item } };
@@ -221,11 +220,9 @@ impl Interact {
         match &self.chat {
             None => "dialogue: no window".into(),
             Some(c) => format!(
-                "dialogue with {:?} ({:?}): buttons desc={} trade={}\n  text: {}\n  answers: {:?}\n  shown: {:?}",
+                "dialogue with {:?} ({:?})\n  text: {}\n  answers: {:?}\n  shown: {:?}",
                 c.name,
                 c.npc,
-                c.b20,
-                c.b21,
                 gui.text(c.win, "npc_text"),
                 c.answers,
                 self.log

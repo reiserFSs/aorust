@@ -146,18 +146,15 @@ pub struct NpcChat {
     pub text: Composer,
     /// `view+0x16c`: the answers of the last `KnubotAnswerList` (emptied by a click).
     pub answers: Vec<String>,
-    /// Enable flags of the button bar's description / trade buttons (`KnubotOpenChatWindow` body).
-    pub b20: bool,
-    pub b21: bool,
 }
 
 impl NpcChat {
     /// `FUN_10059e8a`: the window is centred (`Window::MoveToCenter`) and shown.
-    pub fn open(gui: &mut Gui, screen: (u32, u32), npc: ao_net::msg::Identity, name: &str, b20: bool, b21: bool) -> anyhow::Result<Self> {
+    pub fn open(gui: &mut Gui, screen: (u32, u32), npc: ao_net::msg::Identity, name: &str) -> anyhow::Result<Self> {
         let (w, h) = CLIENT;
         let pos = ((screen.0 as i32 - w as i32) / 2, (screen.1 as i32 - h as i32) / 2);
         let win = gui.open_tabbed_window_xml("NPCChatWindow", name, &view_xml(h), pos, WindowSize::Fixed(w, h))?;
-        Ok(NpcChat { win, npc, name: name.to_owned(), text: Composer::default(), answers: vec![], b20, b21 })
+        Ok(NpcChat { win, npc, name: name.to_owned(), text: Composer::default(), answers: vec![] })
     }
 
     /// `KnubotAppendText` -> `FUN_100586fd`.
@@ -243,7 +240,7 @@ mod tests {
     fn window_shows_text_and_a_click_on_an_answer_is_sent() {
         let Some(mut gui) = rig() else { return };
         let npc = ao_net::msg::Identity { kind: 0xC350, instance: 9 };
-        let mut w = NpcChat::open(&mut gui, (1280, 800), npc, "Guard", true, false).unwrap();
+        let mut w = NpcChat::open(&mut gui, (1280, 800), npc, "Guard").unwrap();
         w.append(&mut gui, "Welcome\\nstranger", kind::SPEECH, "Me");
         w.set_answers(&mut gui, vec!["Where am I?".into(), "Bye".into()]);
         assert!(gui.text(w.win, "npc_text").contains("Welcome"));

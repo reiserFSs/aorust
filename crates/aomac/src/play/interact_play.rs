@@ -57,7 +57,7 @@ impl Play {
         }
         let ray = pick_ray(&host.camera, &host.lens.unwrap_or_default(), (self.size.0 as f32, self.size.1 as f32), (x, y));
         // `GetObjectUnderColLine`: the current target when it is under the pointer, else the nearest hit
-        let list = pick_all(&ray, &self.zone.dynels);
+        let list = pick_all(&ray, &self.zone);
         let id = self.zone.target.filter(|t| list.contains(t)).or_else(|| list.first().copied());
         if let (Some(id), Some(i)) = (id, self.interact.as_mut()) {
             i.default_action(id);
