@@ -14,9 +14,9 @@
 //! The API is in **scene coordinates** (the AO world mirrored in z, `playfield` module docs); queries run on a uniform grid.
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashSet;
 use ao_rdb::RecordStore;
 use ao_scene::{Scene, IDENTITY};
-use std::collections::HashSet;
 
 use super::dungeon::{floor_min, parse_gnda, Gnda};
 use super::record::{self, Rd, Room};
@@ -26,10 +26,7 @@ use super::{ground, water, RECORD, TILEMAP};
 pub mod kd;
 mod portal;
 mod vehicle;
-pub use vehicle::{
-    Aligned, Body, Closest, Hit, LiquidEvent, SurfaceState, DEFAULT_BODY_RADIUS, FOOT_CLEARANCE,
-    RADIUS, SWIM_DEPTH,
-};
+pub use vehicle::{Aligned, Body, Closest, Hit, DEFAULT_BODY_RADIUS, LiquidEvent, SurfaceState, FOOT_CLEARANCE, RADIUS, SWIM_DEPTH};
 
 /// A surface triangle is walkable ground when its normal's y is at least this (Vehicle.dll `EnsureSurfaceAlignment`
 /// @0x1000d1aa, f32 @0x10012134, found by the `Avatar.Movement` RE); steeper faces are walls.
@@ -125,11 +122,7 @@ fn scale_v(a: [f32; 3], k: f32) -> [f32; 3] {
     [a[0] * k, a[1] * k, a[2] * k]
 }
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
@@ -142,14 +135,7 @@ fn unit(v: [f32; 3]) -> Option<[f32; 3]> {
 impl Tri {
     /// Scene-space triangle with an explicit unit normal.
     fn with_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3], n: [f32; 3]) -> Option<Tri> {
-        Some(Tri {
-            a,
-            b,
-            c,
-            n: unit(n)?,
-            floor: 0,
-            zone: 0,
-        })
+        Some(Tri { a, b, c, n: unit(n)?, floor: 0, zone: 0 })
     }
     /// AO world triangle (left handed, outward normal `(b-a) x (c-a)`, see `kd`) mirrored into scene space.
     fn from_world(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Option<Tri> {
@@ -198,8 +184,7 @@ impl Tri {
             return b;
         }
         let vc = d1 * d4 - d3 * d2;
-        let at =
-            |t: f32, u: [f32; 3], o: [f32; 3]| [o[0] + t * u[0], o[1] + t * u[1], o[2] + t * u[2]];
+        let at = |t: f32, u: [f32; 3], o: [f32; 3]| [o[0] + t * u[0], o[1] + t * u[1], o[2] + t * u[2]];
         if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
             return at(d1 / (d1 - d3), ab, a);
         }
@@ -218,11 +203,7 @@ impl Tri {
         }
         let s = 1.0 / (va + vb + vc);
         let (v, w) = (vb * s, vc * s);
-        [
-            a[0] + ab[0] * v + ac[0] * w,
-            a[1] + ab[1] * v + ac[1] * w,
-            a[2] + ab[2] * v + ac[2] * w,
-        ]
+        [a[0] + ab[0] * v + ac[0] * w, a[1] + ab[1] * v + ac[1] * w, a[2] + ab[2] * v + ac[2] * w]
     }
 }
 
@@ -231,36 +212,18 @@ impl Terrain {
     /// else along `(x+1,z)-(x,z+1)`; the point lies in one of the two triangles (`FUN_10017800` @0x10017800).
     fn at(&self, x: f32, z: f32) -> Option<(f32, [f32; 3])> {
         let tm = &self.tm;
-        if x < 0.0
-            || z < 0.0
-            || x >= tm.cells_x as f32 * tm.cell_size
-            || z >= tm.cells_z as f32 * tm.cell_size
-        {
+        if x < 0.0 || z < 0.0 || x >= tm.cells_x as f32 * tm.cell_size || z >= tm.cells_z as f32 * tm.cell_size {
             return None;
         }
         let (fx, fz) = (x / tm.cell_size, z / tm.cell_size);
         let (ix, iz) = (fx as usize, fz as usize);
         let c = tm.cell_size;
         let (x0, z0) = (ix as f32 * c, iz as f32 * c);
-        let h = [
-            tm.height(ix, iz),
-            tm.height(ix + 1, iz),
-            tm.height(ix + 1, iz + 1),
-            tm.height(ix, iz + 1),
-        ];
-        let p = [
-            [x0, h[0], z0],
-            [x0 + c, h[1], z0],
-            [x0 + c, h[2], z0 + c],
-            [x0, h[3], z0 + c],
-        ];
+        let h = [tm.height(ix, iz), tm.height(ix + 1, iz), tm.height(ix + 1, iz + 1), tm.height(ix, iz + 1)];
+        let p = [[x0, h[0], z0], [x0 + c, h[1], z0], [x0 + c, h[2], z0 + c], [x0, h[3], z0 + c]];
         let (dx, dz) = (x - x0, z - z0);
         let t = if ((!iz) ^ ix) & 1 == 0 {
-            if dx + dz > c {
-                [p[1], p[2], p[3]]
-            } else {
-                [p[0], p[1], p[3]]
-            }
+            if dx + dz > c { [p[1], p[2], p[3]] } else { [p[0], p[1], p[3]] }
         } else if dx <= dz {
             [p[0], p[2], p[3]]
         } else {
@@ -276,12 +239,7 @@ impl Terrain {
 }
 
 impl Collision {
-    fn build(
-        tris: Vec<Tri>,
-        terrain: Option<Terrain>,
-        rooms: Option<Rooms>,
-        liquids: Vec<(Tri, u32)>,
-    ) -> Collision {
+    fn build(tris: Vec<Tri>, terrain: Option<Terrain>, rooms: Option<Rooms>, liquids: Vec<(Tri, u32)>) -> Collision {
         let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
         for t in &tris {
             let (a, b) = t.bounds();
@@ -296,18 +254,11 @@ impl Collision {
         while ((hi[0] - lo[0]) / cell + 1.0) * ((hi[1] - lo[1]) / cell + 1.0) > 4.0e6 {
             cell *= 2.0;
         }
-        let dims = [
-            ((hi[0] - lo[0]) / cell) as usize + 1,
-            ((hi[1] - lo[1]) / cell) as usize + 1,
-        ];
+        let dims = [((hi[0] - lo[0]) / cell) as usize + 1, ((hi[1] - lo[1]) / cell) as usize + 1];
         let span = |t: &Tri| {
             let (a, b) = t.bounds();
-            let c =
-                |v: f32, o: f32, n: usize| (((v - o) / cell).floor().max(0.0) as usize).min(n - 1);
-            (
-                [c(a[0], lo[0], dims[0]), c(a[2], lo[1], dims[1])],
-                [c(b[0], lo[0], dims[0]), c(b[2], lo[1], dims[1])],
-            )
+            let c = |v: f32, o: f32, n: usize| (((v - o) / cell).floor().max(0.0) as usize).min(n - 1);
+            ([c(a[0], lo[0], dims[0]), c(a[2], lo[1], dims[1])], [c(b[0], lo[0], dims[0]), c(b[2], lo[1], dims[1])])
         };
         let mut count = vec![0u32; dims[0] * dims[1] + 1];
         let mut big = Vec::new();
@@ -340,21 +291,7 @@ impl Collision {
                 }
             }
         }
-        Collision {
-            tris,
-            origin: lo,
-            dims,
-            cell,
-            start,
-            items,
-            big,
-            terrain,
-            rooms,
-            liquids,
-            portals: portal::Portals::default(),
-            zone_size: 1,
-            kd_zones: HashSet::new(),
-        }
+        Collision { tris, origin: lo, dims, cell, start, items, big, terrain, rooms, liquids, portals: portal::Portals::default(), zone_size: 1, kd_zones: HashSet::new() }
     }
 
     /// Collision of the loaded scene's identity-placed meshes (terrain, room shells): the documented fallback when the
@@ -378,68 +315,40 @@ impl Collision {
     /// Loads the collision of playfield `id`: heightfield or dungeon tile floors, the KD surfaces of every zone / room and
     /// the liquid polygons.
     pub fn load(store: &RecordStore, id: u32) -> Result<Collision> {
-        let raw = store
-            .get(RECORD, id)?
-            .ok_or_else(|| anyhow!("no playfield {id}"))?;
+        let raw = store.get(RECORD, id)?.ok_or_else(|| anyhow!("no playfield {id}"))?;
         let rec = record::parse(&raw)?;
         let mut tris = Vec::new();
         let mut terrain = None;
         let mut rooms = None;
-        let d = store
-            .get(TILEMAP, rec.tilemap)?
-            .ok_or_else(|| anyhow!("playfield {id}: no tilemap {}", rec.tilemap))?;
+        let d = store.get(TILEMAP, rec.tilemap)?.ok_or_else(|| anyhow!("playfield {id}: no tilemap {}", rec.tilemap))?;
         if rec.is_outdoor() {
-            terrain = Some(Terrain {
-                tm: ground::parse(&d).with_context(|| format!("tilemap {}", rec.tilemap))?,
-            });
+            terrain = Some(Terrain { tm: ground::parse(&d).with_context(|| format!("tilemap {}", rec.tilemap))? });
         } else {
             let g = parse_gnda(&d).with_context(|| format!("dungeon tilemap {}", rec.tilemap))?;
             for (i, room) in rec.rooms.iter().enumerate() {
                 room_floor(&g, room, i as u16 + 1, &mut tris);
             }
-            let list: Vec<(Room, f32)> = rec
-                .rooms
-                .iter()
-                .map(|r| (r.clone(), floor_min(&g, r).unwrap_or(65536.0)))
-                .collect();
+            let list: Vec<(Room, f32)> = rec.rooms.iter().map(|r| (r.clone(), floor_min(&g, r).unwrap_or(65536.0))).collect();
             let mut links = HashSet::new();
             for (i, room) in rec.rooms.iter().enumerate() {
-                for &z in room
-                    .door_zones
-                    .iter()
-                    .filter(|&&z| z != 0xffff && z as usize != i)
-                {
+                for &z in room.door_zones.iter().filter(|&&z| z != 0xffff && z as usize != i) {
                     links.insert(((i as u16).min(z), (i as u16).max(z)));
                 }
             }
-            rooms = Some(Rooms {
-                gnda: Box::new(g),
-                rooms: list,
-                links,
-                blocked: HashSet::new(),
-                open: HashSet::new(),
-            });
+            rooms = Some(Rooms { gnda: Box::new(g), rooms: list, links, blocked: HashSet::new(), open: HashSet::new() });
         }
         let mut portals = portal::Portals::default();
         let mut kd_zones = HashSet::new();
         for zone in 0..rec.count {
-            let Some((version, data)) = store.get_versioned(kd::SURFACE_TYPE, id << 16 | zone)?
-            else {
-                continue;
-            };
-            let mut s = kd::parse(version, &data)
-                .with_context(|| format!("collision surface {id}:{zone}"))?;
+            let Some((version, data)) = store.get_versioned(kd::SURFACE_TYPE, id << 16 | zone)? else { continue };
+            let mut s = kd::parse(version, &data).with_context(|| format!("collision surface {id}:{zone}"))?;
             if !s.portal.is_empty() {
                 portals.zones.insert(zone, std::mem::take(&mut s.portal));
             }
             kd_zones.insert(zone + 1);
             for v in &s.volumes {
                 for t in &v.tris {
-                    if let Some(mut tri) = Tri::from_world(
-                        v.verts[t[0] as usize],
-                        v.verts[t[1] as usize],
-                        v.verts[t[2] as usize],
-                    ) {
+                    if let Some(mut tri) = Tri::from_world(v.verts[t[0] as usize], v.verts[t[1] as usize], v.verts[t[2] as usize]) {
                         tri.zone = zone + 1;
                         tris.push(tri);
                     }
@@ -482,12 +391,8 @@ impl Collision {
     }
 
     fn cell_of(&self, x: f32, z: f32) -> Option<usize> {
-        let (cx, cz) = (
-            (x - self.origin[0]) / self.cell,
-            (z - self.origin[1]) / self.cell,
-        );
-        (cx >= 0.0 && cz >= 0.0 && (cx as usize) < self.dims[0] && (cz as usize) < self.dims[1])
-            .then(|| cz as usize * self.dims[0] + cx as usize)
+        let (cx, cz) = ((x - self.origin[0]) / self.cell, (z - self.origin[1]) / self.cell);
+        (cx >= 0.0 && cz >= 0.0 && (cx as usize) < self.dims[0] && (cz as usize) < self.dims[1]).then(|| cz as usize * self.dims[0] + cx as usize)
     }
 
     /// Triangles that may touch the grid cell holding `(x, z)`.
@@ -495,10 +400,7 @@ impl Collision {
         let cell = self.cell_of(x, z);
         let a = cell.map_or(0, |c| self.start[c] as usize);
         let b = cell.map_or(0, |c| self.start[c + 1] as usize);
-        self.items[a..b]
-            .iter()
-            .chain(&self.big)
-            .map(|&i| &self.tris[i as usize])
+        self.items[a..b].iter().chain(&self.big).map(|&i| &self.tris[i as usize])
     }
 
     /// Triangles that may touch the xz square `[x - r, x + r] x [z - r, z + r]`.
@@ -508,33 +410,21 @@ impl Collision {
 
     /// Triangles that may touch the xz box `[x0, x1] x [z0, z1]`.
     fn near_aabb(&self, x0: f32, z0: f32, x1: f32, z1: f32) -> Vec<&Tri> {
-        let c =
-            |v: f32, o: f32, n: usize| (((v - o) / self.cell).floor().max(0.0) as usize).min(n - 1);
-        let (x0, x1) = (
-            c(x0, self.origin[0], self.dims[0]),
-            c(x1, self.origin[0], self.dims[0]),
-        );
-        let (z0, z1) = (
-            c(z0, self.origin[1], self.dims[1]),
-            c(z1, self.origin[1], self.dims[1]),
-        );
+        let c = |v: f32, o: f32, n: usize| (((v - o) / self.cell).floor().max(0.0) as usize).min(n - 1);
+        let (x0, x1) = (c(x0, self.origin[0], self.dims[0]), c(x1, self.origin[0], self.dims[0]));
+        let (z0, z1) = (c(z0, self.origin[1], self.dims[1]), c(z1, self.origin[1], self.dims[1]));
         let mut seen: Vec<u32> = Vec::new();
         if !self.items.is_empty() {
             for cz in z0..=z1 {
                 for cx in x0..=x1 {
                     let i = cz * self.dims[0] + cx;
-                    seen.extend_from_slice(
-                        &self.items[self.start[i] as usize..self.start[i + 1] as usize],
-                    );
+                    seen.extend_from_slice(&self.items[self.start[i] as usize..self.start[i + 1] as usize]);
                 }
             }
         }
         seen.sort_unstable();
         seen.dedup();
-        seen.iter()
-            .chain(&self.big)
-            .map(|&i| &self.tris[i as usize])
-            .collect()
+        seen.iter().chain(&self.big).map(|&i| &self.tris[i as usize]).collect()
     }
 
     /// Ground height under the FEET position `p` (`Surface_i::CalculateClosestPoint`, [`Collision::closest`]): the heightfield
@@ -546,11 +436,7 @@ impl Collision {
 
     /// Liquid at the ground point `p` (`liquid_probe` with the point itself as the probed height).
     pub fn liquid_at(&self, p: [f32; 3]) -> Option<Liquid> {
-        self.liquid_probe(
-            p,
-            p[1],
-            self.rooms.as_ref().and_then(|_| self.room_at(p, -1)),
-        )
+        self.liquid_probe(p, p[1], self.rooms.as_ref().and_then(|_| self.room_at(p, -1)))
     }
 
     /// Liquid test of a closest-point query: `ground` is the closest point found, `y` the queried height, `room` the dungeon room.
@@ -573,11 +459,7 @@ impl Collision {
                     if level - oy <= 0.0 {
                         continue;
                     }
-                    let depth = if kind >> 5 == 0 {
-                        100_000.0
-                    } else {
-                        (kind >> 5) as f32 / 10.0
-                    };
+                    let depth = if kind >> 5 == 0 { 100_000.0 } else { (kind >> 5) as f32 / 10.0 };
                     return (level - depth < y).then_some(Liquid { level, kind: *kind });
                 }
             }
@@ -622,8 +504,7 @@ impl Collision {
     /// first room that contains it; [`room_contains`]).
     fn room_at(&self, p: [f32; 3], hint: i32) -> Option<usize> {
         let r = self.rooms.as_ref()?;
-        let has =
-            |i: usize| room_contains(&r.gnda, &r.rooms[i].0, r.rooms[i].1, [p[0], p[1], -p[2]]);
+        let has = |i: usize| room_contains(&r.gnda, &r.rooms[i].0, r.rooms[i].1, [p[0], p[1], -p[2]]);
         if hint >= 0 && (hint as usize) < r.rooms.len() && has(hint as usize) {
             return Some(hint as usize);
         }
@@ -647,13 +528,7 @@ impl Collision {
     /// x/z. Zones without a portal never answer. [`Collision::from_scene`] has none.
     pub fn in_teleportal(&self, p: [f32; 3]) -> bool {
         let zone = match (&self.terrain, &self.rooms) {
-            (Some(t), _) => zone::grid_zone(
-                t.tm.cell_size,
-                self.zone_size,
-                t.tm.cells_x,
-                t.tm.cells_z,
-                p,
-            ),
+            (Some(t), _) => zone::grid_zone(t.tm.cell_size, self.zone_size, t.tm.cells_x, t.tm.cells_z, p),
             (None, Some(_)) => self.room_at(p, -1).unwrap_or(0),
             (None, None) => return false,
         };
@@ -662,11 +537,7 @@ impl Collision {
 
     /// Dungeon: the door links `(a, b)`, `a < b`, sorted.
     pub fn room_links(&self) -> Vec<(u16, u16)> {
-        let mut v: Vec<_> = self
-            .rooms
-            .iter()
-            .flat_map(|r| r.links.iter().copied())
-            .collect();
+        let mut v: Vec<_> = self.rooms.iter().flat_map(|r| r.links.iter().copied()).collect();
         v.sort_unstable();
         v
     }
@@ -704,9 +575,7 @@ impl Collision {
     /// `n3Playfield_t::IsDoorOpenBetweenRooms` @0x1000d1e9: the link's flag is 1 (`-1` rooms and unlinked pairs: closed).
     pub fn door_open_between(&self, a: usize, b: usize) -> bool {
         let (a, b) = (a.min(b), a.max(b));
-        self.rooms
-            .as_ref()
-            .is_some_and(|r| r.open.contains(&(a as u16, b as u16)))
+        self.rooms.as_ref().is_some_and(|r| r.open.contains(&(a as u16, b as u16)))
     }
 
     /// `n3Playfield_t::PosToRoom(p, hint)` @0x1000c8aa for a scene position: the `hint` room first when it holds `p`, else the
@@ -727,10 +596,7 @@ impl Collision {
         let r = self.rooms.as_ref()?;
         let (px, pz) = (p[0], -p[2]); // AO world
         for (i, (room, _)) in r.rooms.iter().enumerate() {
-            let (w, h) = (
-                room.rect[2].saturating_sub(room.rect[0]) as i32,
-                room.rect[3].saturating_sub(room.rect[1]) as i32,
-            );
+            let (w, h) = (room.rect[2].saturating_sub(room.rect[0]) as i32, room.rect[3].saturating_sub(room.rect[1]) as i32);
             if w == 0 {
                 continue;
             }
@@ -738,10 +604,7 @@ impl Collision {
             let (c, s) = [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)][room.rot as usize & 3];
             for (&zone, &word) in room.door_zones.iter().zip(&room.door_tiles) {
                 let tile = (word >> 2) as i32;
-                let (mut x, mut z) = (
-                    (tile % w) as f32 * r.gnda.cell - half(w),
-                    (tile / w) as f32 * r.gnda.cell - half(h),
-                );
+                let (mut x, mut z) = ((tile % w) as f32 * r.gnda.cell - half(w), (tile / w) as f32 * r.gnda.cell - half(h));
                 match word & 3 {
                     0 => z += NUDGE,
                     1 => x += NUDGE,
@@ -749,9 +612,7 @@ impl Collision {
                     _ => x -= NUDGE,
                 }
                 let (gx, gz) = (room.pos[0] + x * c + z * s, room.pos[2] - x * s + z * c);
-                if (px - TOLERANCE..px + TOLERANCE).contains(&gx)
-                    && (pz - TOLERANCE..pz + TOLERANCE).contains(&gz)
-                {
+                if (px - TOLERANCE..px + TOLERANCE).contains(&gx) && (pz - TOLERANCE..pz + TOLERANCE).contains(&gz) {
                     return Some((i as u16, zone));
                 }
             }
@@ -772,34 +633,22 @@ fn room_floor(g: &super::dungeon::Gnda, room: &Room, id: u16, out: &mut Vec<Tri>
         return;
     }
     let min_floor = floor_min(g, room).unwrap_or(0.0);
-    let (wp, hp) = (
-        (((x2 - x1 - 1) & !1) + 1) as f32,
-        (((z2 - z1 - 1) & !1) + 1) as f32,
-    );
+    let (wp, hp) = ((((x2 - x1 - 1) & !1) + 1) as f32, (((z2 - z1 - 1) & !1) + 1) as f32);
     let (c, s) = [(1.0f32, 0.0f32), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)][(room.rot & 3) as usize];
     let hs = g.height_scale;
     let h = |x: i32, z: i32| {
-        let (x, z) = (
-            x.max(0).min(g.w as i32 - 1) as usize,
-            z.max(0).min(g.h as i32 - 1) as usize,
-        );
+        let (x, z) = (x.max(0).min(g.w as i32 - 1) as usize, z.max(0).min(g.h as i32 - 1) as usize);
         g.floor[z * g.w + x] as f32 * hs - min_floor + room.pos[1]
     };
     // atlas (metres) -> AO world xz -> scene
     let world = |ax: f32, ay: f32, az: f32| {
-        let (dx, dz) = (
-            ax - x1 as f32 * 2.0 - (wp + 1.0),
-            az - z1 as f32 * 2.0 - (hp + 1.0),
-        );
+        let (dx, dz) = (ax - x1 as f32 * 2.0 - (wp + 1.0), az - z1 as f32 * 2.0 - (hp + 1.0));
         let (rx, rz) = (dx * c + dz * s, -dx * s + dz * c);
         [room.pos[0] + rx, ay, -(room.pos[2] + rz)]
     };
     for tz in z1..z2 {
         for tx in x1..x2 {
-            if tx as usize >= g.w
-                || tz as usize >= g.h
-                || g.ty[tz as usize * g.w + tx as usize] & 0x7f == 0
-            {
+            if tx as usize >= g.w || tz as usize >= g.h || g.ty[tz as usize * g.w + tx as usize] & 0x7f == 0 {
                 continue;
             }
             let (px, pz) = (tx as f32 * 2.0, tz as f32 * 2.0);
@@ -828,45 +677,21 @@ fn room_safe_pos(g: &Gnda, room: &Room, min_floor: f32) -> [f32; 3] {
     let [x1, z1, x2, z2] = room.rect.map(|v| v as i32);
     let (wp, hp) = ((((x2 - x1 - 1) & !1) + 1), (((z2 - z1 - 1) & !1) + 1));
     let h = |x: i32, z: i32| {
-        let (x, z) = (
-            x.max(0).min(g.w as i32 - 1) as usize,
-            z.max(0).min(g.h as i32 - 1) as usize,
-        );
+        let (x, z) = (x.max(0).min(g.w as i32 - 1) as usize, z.max(0).min(g.h as i32 - 1) as usize);
         g.floor[z * g.w + x] as f32 * g.height_scale - min_floor + room.pos[1]
     };
-    let walkable = |tx: i32, tz: i32| {
-        tx >= 0
-            && tz >= 0
-            && (tx as usize) < g.w
-            && (tz as usize) < g.h
-            && g.ty[tz as usize * g.w + tx as usize] & 0x7f != 0
-    };
-    let top = |tx: i32, tz: i32| {
-        h(tx, tz)
-            .max(h(tx - 1, tz))
-            .max(h(tx - 1, tz - 1))
-            .max(h(tx, tz - 1))
-    };
+    let walkable = |tx: i32, tz: i32| tx >= 0 && tz >= 0 && (tx as usize) < g.w && (tz as usize) < g.h && g.ty[tz as usize * g.w + tx as usize] & 0x7f != 0;
+    let top = |tx: i32, tz: i32| h(tx, tz).max(h(tx - 1, tz)).max(h(tx - 1, tz - 1)).max(h(tx, tz - 1));
     let (c, s) = [(1.0f32, 0.0f32), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)][(room.rot & 3) as usize];
-    let (ctx, ctz) = (
-        (x1 * 2 + wp + 1).div_euclid(2),
-        (z1 * 2 + hp + 1).div_euclid(2),
-    );
+    let (ctx, ctz) = ((x1 * 2 + wp + 1).div_euclid(2), (z1 * 2 + hp + 1).div_euclid(2));
     if walkable(ctx, ctz) {
         return [room.pos[0], top(ctx, ctz), -room.pos[2]];
     }
     for tx in x1..x2 {
         for tz in z1..z2 {
             if walkable(tx, tz) {
-                let (dx, dz) = (
-                    tx as f32 * 2.0 + 1.0 - x1 as f32 * 2.0 - (wp + 1) as f32,
-                    tz as f32 * 2.0 + 1.0 - z1 as f32 * 2.0 - (hp + 1) as f32,
-                );
-                return [
-                    room.pos[0] + dx * c + dz * s,
-                    top(tx, tz),
-                    -(room.pos[2] - dx * s + dz * c),
-                ];
+                let (dx, dz) = (tx as f32 * 2.0 + 1.0 - x1 as f32 * 2.0 - (wp + 1) as f32, tz as f32 * 2.0 + 1.0 - z1 as f32 * 2.0 - (hp + 1) as f32);
+                return [room.pos[0] + dx * c + dz * s, top(tx, tz), -(room.pos[2] - dx * s + dz * c)];
             }
         }
     }
@@ -879,41 +704,27 @@ mod tests {
 
     fn quad(y: f32, x0: f32, x1: f32, z0: f32, z1: f32) -> Vec<Tri> {
         let v = |x, z| [x, y, z];
-        [
-            (v(x0, z0), v(x0, z1), v(x1, z1)),
-            (v(x0, z0), v(x1, z1), v(x1, z0)),
-        ]
-        .into_iter()
-        .filter_map(|(a, b, c)| {
-            let mut n = cross(sub(b, a), sub(c, a));
-            if n[1] < 0.0 {
-                n = [-n[0], -n[1], -n[2]];
-            }
-            Tri::with_normal(a, b, c, n)
-        })
-        .collect()
+        [(v(x0, z0), v(x0, z1), v(x1, z1)), (v(x0, z0), v(x1, z1), v(x1, z0))]
+            .into_iter()
+            .filter_map(|(a, b, c)| {
+                let mut n = cross(sub(b, a), sub(c, a));
+                if n[1] < 0.0 {
+                    n = [-n[0], -n[1], -n[2]];
+                }
+                Tri::with_normal(a, b, c, n)
+            })
+            .collect()
     }
 
     /// A wall `x = 5` spanning z in -10..10, y in 0..3 (two triangles facing -x).
     fn wall() -> Vec<Tri> {
-        let (a, b, c, d) = (
-            [5.0, 0.0, -10.0],
-            [5.0, 3.0, -10.0],
-            [5.0, 3.0, 10.0],
-            [5.0, 0.0, 10.0],
-        );
-        [(a, b, c), (a, c, d)]
-            .into_iter()
-            .filter_map(|(p, q, r)| Tri::with_normal(p, q, r, [-1.0, 0.0, 0.0]))
-            .collect()
+        let (a, b, c, d) = ([5.0, 0.0, -10.0], [5.0, 3.0, -10.0], [5.0, 3.0, 10.0], [5.0, 0.0, 10.0]);
+        [(a, b, c), (a, c, d)].into_iter().filter_map(|(p, q, r)| Tri::with_normal(p, q, r, [-1.0, 0.0, 0.0])).collect()
     }
 
     /// Two triangles `a b c d` (a quad) facing `n`.
     fn panel(a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3], n: [f32; 3]) -> Vec<Tri> {
-        [(a, b, c), (a, c, d)]
-            .into_iter()
-            .filter_map(|(p, q, r)| Tri::with_normal(p, q, r, n))
-            .collect()
+        [(a, b, c), (a, c, d)].into_iter().filter_map(|(p, q, r)| Tri::with_normal(p, q, r, n)).collect()
     }
 
     fn flat_world(extra: Vec<Tri>) -> Collision {
@@ -929,14 +740,8 @@ mod tests {
         let h = c.line([11.0, 5.0, 0.0], [11.0, 0.0, 0.0]).unwrap();
         assert!((h.p[1] - 3.0).abs() < 1e-5 && h.n[1] > 0.99);
         assert!((c.line([5.0, 5.0, 0.0], [5.0, 0.0, 0.0]).unwrap().p[1] - 1.0).abs() < 1e-5);
-        assert!(
-            c.line([5.0, -5.0, 0.0], [5.0, 0.5, 0.0]).is_none(),
-            "faces are hit from their front only"
-        );
-        assert!(
-            c.line([5.0, 5.0, 0.0], [5.0, 1.5, 0.0]).is_none(),
-            "the segment ends above the floor"
-        );
+        assert!(c.line([5.0, -5.0, 0.0], [5.0, 0.5, 0.0]).is_none(), "faces are hit from their front only");
+        assert!(c.line([5.0, 5.0, 0.0], [5.0, 1.5, 0.0]).is_none(), "the segment ends above the floor");
         assert!(c.line([30.0, 5.0, 0.0], [30.0, 0.0, 0.0]).is_none());
     }
 
@@ -944,43 +749,22 @@ mod tests {
     fn walks_head_on_into_a_wall_and_slides_along_it() {
         let c = flat_world(wall());
         let w = c.walk([3.0, 1.0, 0.0], [4.9, 1.0, 0.0]);
-        assert!(
-            (w.pos[0] - 4.6).abs() < 0.02,
-            "stops one radius from the wall: {w:?}"
-        );
+        assert!((w.pos[0] - 4.6).abs() < 0.02, "stops one radius from the wall: {w:?}");
         assert!((w.pos[1] - 1.01).abs() < 1e-4 && !w.airborne, "{w:?}");
         // diagonal: the horizontal budget (|step| = 1.965 m) is kept; 1.655 m reach the wall, the rest 0.31 m slides along it
         let w = c.walk([3.0, 1.0, 0.0], [4.9, 1.0, 0.5]);
-        assert!(
-            (w.pos[0] - 4.6).abs() < 0.02 && (w.pos[2] - 0.731).abs() < 0.02,
-            "{w:?}"
-        );
+        assert!((w.pos[0] - 4.6).abs() < 0.02 && (w.pos[2] - 0.731).abs() < 0.02, "{w:?}");
         // open ground is untouched
         let w = c.walk([0.0, 1.0, 0.0], [1.0, 1.0, 1.0]);
-        assert!(
-            (w.pos[0] - 1.0).abs() < 1e-3 && (w.pos[2] - 1.0).abs() < 1e-3,
-            "{w:?}"
-        );
+        assert!((w.pos[0] - 1.0).abs() < 1e-3 && (w.pos[2] - 1.0).abs() < 1e-3, "{w:?}");
     }
 
     #[test]
     fn low_obstacles_are_stepped_over_tall_ones_block() {
         // the sphere centre rides 0.4 m above the feet: a 0.3 m riser passes under every ray, 0.6 m does not
-        let low = flat_world(panel(
-            [5.0, 1.0, -10.0],
-            [5.0, 1.3, -10.0],
-            [5.0, 1.3, 10.0],
-            [5.0, 1.0, 10.0],
-            [-1.0, 0.0, 0.0],
-        ));
+        let low = flat_world(panel([5.0, 1.0, -10.0], [5.0, 1.3, -10.0], [5.0, 1.3, 10.0], [5.0, 1.0, 10.0], [-1.0, 0.0, 0.0]));
         assert!((low.walk([3.0, 1.0, 0.0], [5.1, 1.0, 0.0]).pos[0] - 5.1).abs() < 1e-3);
-        let tall = flat_world(panel(
-            [5.0, 1.0, -10.0],
-            [5.0, 1.6, -10.0],
-            [5.0, 1.6, 10.0],
-            [5.0, 1.0, 10.0],
-            [-1.0, 0.0, 0.0],
-        ));
+        let tall = flat_world(panel([5.0, 1.0, -10.0], [5.0, 1.6, -10.0], [5.0, 1.6, 10.0], [5.0, 1.0, 10.0], [-1.0, 0.0, 0.0]));
         assert!((tall.walk([3.0, 1.0, 0.0], [5.1, 1.0, 0.0]).pos[0] - 4.6).abs() < 0.02);
     }
 
@@ -988,30 +772,16 @@ mod tests {
     fn ramps_carry_below_sixty_degrees_and_do_not_support_above() {
         let ramp = |rise: f32| {
             let n = unit([-rise, 4.0, 0.0]).unwrap();
-            flat_world(panel(
-                [5.0, 1.0, -10.0],
-                [9.0, 1.0 + rise, -10.0],
-                [9.0, 1.0 + rise, 10.0],
-                [5.0, 1.0, 10.0],
-                n,
-            ))
+            flat_world(panel([5.0, 1.0, -10.0], [9.0, 1.0 + rise, -10.0], [9.0, 1.0 + rise, 10.0], [5.0, 1.0, 10.0], n))
         };
         // 30 degrees (rise 2.31 over 4 m): the walker follows the ramp, the horizontal budget is spent horizontally
         let w = ramp(2.31).walk([4.5, 1.01, 0.0], [5.5, 1.01, 0.0]);
-        assert!(
-            (w.pos[0] - 5.5).abs() < 0.05
-                && (w.pos[1] - (1.0 + 0.5 * 0.5775 + 0.01)).abs() < 0.05
-                && !w.airborne,
-            "{w:?}"
-        );
+        assert!((w.pos[0] - 5.5).abs() < 0.05 && (w.pos[1] - (1.0 + 0.5 * 0.5775 + 0.01)).abs() < 0.05 && !w.airborne, "{w:?}");
         // 70 degrees (rise 10.99 over 4 m): the sweep still glides up the single plane, but the ground normal of the three
         // rays is below 0.5 (`a4 < 0.5`, Vehicle.dll f32 @0x10012134): nothing carries the character, it keeps falling
         let steep = ramp(10.99);
         let mut w = steep.walk([4.5, 1.01, 0.0], [4.8, 1.01, 0.0]);
-        assert!(
-            !w.airborne,
-            "the flat ground in front of the ramp carries: {w:?}"
-        );
+        assert!(!w.airborne, "the flat ground in front of the ramp carries: {w:?}");
         for _ in 0..4 {
             w = steep.walk(w.pos, [w.pos[0] + 0.3, w.pos[1], w.pos[2]]);
         }
@@ -1030,44 +800,18 @@ mod tests {
     #[test]
     fn closest_point_rays_are_limited_to_the_terrain_delta_plus_0_3() {
         use super::ground::Tilemap;
-        let tm = Tilemap {
-            cells_x: 4,
-            cells_z: 4,
-            cell_size: 4.0,
-            height_scale: 256.0,
-            tile_texture: vec![],
-            verts_x: 5,
-            verts_z: 5,
-            heights: vec![0; 25],
-            tiles: vec![0; 16],
-            tile_mask: 0xff,
-        };
+        let tm = Tilemap { cells_x: 4, cells_z: 4, cell_size: 4.0, height_scale: 256.0, tile_texture: vec![], verts_x: 5, verts_z: 5, heights: vec![0; 25], tiles: vec![0; 16], tile_mask: 0xff };
         let mut kd = quad(3.0, 4.0, 8.0, -8.0, -4.0); // a platform 3 m over the terrain
         kd.extend(quad(-0.5, 8.0, 12.0, -8.0, -4.0)); // a slab 0.5 m under it
         kd.extend(quad(0.2, 0.0, 3.0, -3.0, 0.0)); // a step 0.2 m high
         let c = Collision::build(kd, Some(Terrain { tm }), None, Vec::new());
         let g = |x: f32, y: f32, z: f32| c.ground([x, y, z]).unwrap();
-        assert!(
-            (g(6.0, 3.2, -6.0) - 3.0).abs() < 1e-5,
-            "standing on the platform"
-        );
-        assert!(
-            (g(6.0, 10.0, -6.0) - 3.0).abs() < 1e-5,
-            "the ray reaches down from a fall"
-        );
-        assert!(
-            g(6.0, 2.0, -6.0).abs() < 1e-5,
-            "under the platform the terrain carries"
-        );
-        assert!(
-            g(10.0, 1.0, -6.0).abs() < 1e-5,
-            "a slab below the terrain is never found"
-        );
+        assert!((g(6.0, 3.2, -6.0) - 3.0).abs() < 1e-5, "standing on the platform");
+        assert!((g(6.0, 10.0, -6.0) - 3.0).abs() < 1e-5, "the ray reaches down from a fall");
+        assert!(g(6.0, 2.0, -6.0).abs() < 1e-5, "under the platform the terrain carries");
+        assert!(g(10.0, 1.0, -6.0).abs() < 1e-5, "a slab below the terrain is never found");
         assert!((g(1.0, 0.5, -1.0) - 0.2).abs() < 1e-5, "the step");
-        assert!(
-            g(1.0, 0.1, -1.0).abs() < 1e-5,
-            "below the step top the ray starts under it"
-        );
+        assert!(g(1.0, 0.1, -1.0).abs() < 1e-5, "below the step top the ray starts under it");
         assert!(c.ground([-1.0, 1.0, -1.0]).is_none(), "outside the map");
         // the retry loop of `EnsureSurfaceAlignment`: a step out of the map is refused and clamped
         let mut p = [-5.0, 1.0, -1.0];
@@ -1080,18 +824,7 @@ mod tests {
     fn terrain_parity_split() {
         use super::ground::Tilemap;
         // 2x2 cells of 4 m, heights chosen so that each parity yields a different plane for the same point
-        let mut tm = Tilemap {
-            cells_x: 2,
-            cells_z: 2,
-            cell_size: 4.0,
-            height_scale: 256.0,
-            tile_texture: vec![],
-            verts_x: 3,
-            verts_z: 3,
-            heights: vec![0; 9],
-            tiles: vec![0; 4],
-            tile_mask: 0xff,
-        };
+        let mut tm = Tilemap { cells_x: 2, cells_z: 2, cell_size: 4.0, height_scale: 256.0, tile_texture: vec![], verts_x: 3, verts_z: 3, heights: vec![0; 9], tiles: vec![0; 4], tile_mask: 0xff };
         tm.heights[3 + 1] = 4; // vertex (1,1): 4 m (height = value * scale / 256)
         let t = Terrain { tm };
         // cell (0,0): same parity -> diagonal (0,0)-(1,1); point (3,1) is below the diagonal (dx > dz): triangle (P0,P1,P2)
@@ -1106,13 +839,7 @@ mod tests {
 
     #[test]
     fn closest_point_on_triangle() {
-        let t = Tri::with_normal(
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-        )
-        .unwrap();
+        let t = Tri::with_normal([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]).unwrap();
         let m = t.closest([0.2, 0.2, 5.0]);
         assert!((m[0] - 0.2).abs() < 1e-6 && (m[1] - 0.2).abs() < 1e-6 && m[2] == 0.0);
         assert_eq!(t.closest([-1.0, -1.0, 0.0]), [0.0, 0.0, 0.0]);
@@ -1133,54 +860,33 @@ mod tests {
         assert!(st.event.is_none() && !st.in_liquid);
         // deep (ground 2 m under the surface, the closest point stops at 1.2 m): feet float 1 cm under the surface, Enter once
         assert_eq!(medium(&mut st, &body, -0.19, 1.0, -0.2), Some(0.99));
-        assert_eq!(
-            (st.event.take(), st.in_liquid),
-            (Some(LiquidEvent::Enter), true)
-        );
+        assert_eq!((st.event.take(), st.in_liquid), (Some(LiquidEvent::Enter), true));
         assert_eq!(medium(&mut st, &body, 0.99, 1.0, -0.2), Some(0.99));
         assert!(st.event.is_none(), "still swimming");
         // back to shallow water: Leave, feet on the ground again
         assert_eq!(medium(&mut st, &body, 0.3, 1.0, 0.5), Some(0.51));
-        assert_eq!(
-            (st.event.take(), st.in_liquid),
-            (Some(LiquidEvent::Leave), false)
-        );
+        assert_eq!((st.event.take(), st.in_liquid), (Some(LiquidEvent::Leave), false));
         // out of the water (feet >= level + 0.1): nothing, the submersion marker is cleared
         st.submersion = 0.5;
         assert_eq!(medium(&mut st, &body, 1.2, 1.0, 0.5), Some(1.2));
         assert_eq!(st.submersion, -9999.0);
         // without falling the enter callback never fires
-        let flying = Body {
-            falling_enabled: false,
-            ..body
-        };
+        let flying = Body { falling_enabled: false, ..body };
         assert_eq!(medium(&mut st, &flying, 0.0, 1.0, -0.2), Some(0.99));
         assert!(st.event.is_none() && !st.in_liquid);
         // mode 1 refuses deep water (the step is undone), shallow water and dry land pass
-        let mut st1 = SurfaceState {
-            medium: 1,
-            ..SurfaceState::default()
-        };
+        let mut st1 = SurfaceState { medium: 1, ..SurfaceState::default() };
         assert_eq!(medium(&mut st1, &body, 0.0, 1.0, -0.2), None);
         assert_eq!(medium(&mut st1, &body, 0.2, 1.0, 0.5), Some(0.2));
         assert_eq!(medium(&mut st1, &body, 2.0, 1.0, -0.2), Some(2.0));
         // mode 3 only allows deep water, held at most 0.1 m under the surface; mode 4 hovers 0.25 m above it
-        let mut st3 = SurfaceState {
-            medium: 3,
-            ..SurfaceState::default()
-        };
+        let mut st3 = SurfaceState { medium: 3, ..SurfaceState::default() };
         assert_eq!(medium(&mut st3, &body, 2.0, 1.0, -0.2), Some(0.9));
         assert_eq!(medium(&mut st3, &body, 0.0, 1.0, 0.95), None);
-        let mut st4 = SurfaceState {
-            medium: 4,
-            ..SurfaceState::default()
-        };
+        let mut st4 = SurfaceState { medium: 4, ..SurfaceState::default() };
         assert_eq!(medium(&mut st4, &body, 0.0, 1.0, -0.2), Some(1.25));
         // mode 2: callbacks only, the feet are never moved
-        let mut st2 = SurfaceState {
-            medium: 2,
-            ..SurfaceState::default()
-        };
+        let mut st2 = SurfaceState { medium: 2, ..SurfaceState::default() };
         assert_eq!(medium(&mut st2, &body, 0.0, 1.0, -0.2), Some(0.0));
         assert_eq!(st2.event.take(), Some(LiquidEvent::Enter));
     }
@@ -1188,16 +894,7 @@ mod tests {
     /// A step into a deep pool through `align`: the character ends up floating, the event is reported once.
     #[test]
     fn align_floats_in_deep_water() {
-        let pool = vec![(
-            Tri::with_normal(
-                [-20.0, 13.0, -20.0],
-                [-20.0, 13.0, 20.0],
-                [20.0, 13.0, 20.0],
-                [0.0, 1.0, 0.0],
-            )
-            .unwrap(),
-            0,
-        )];
+        let pool = vec![(Tri::with_normal([-20.0, 13.0, -20.0], [-20.0, 13.0, 20.0], [20.0, 13.0, 20.0], [0.0, 1.0, 0.0]).unwrap(), 0)];
         let c = Collision::build(quad(10.0, -20.0, 20.0, -20.0, 20.0), None, None, pool);
         let mut st = SurfaceState::default();
         let a = c.align([0.0, 10.1, 5.0], [0.5, 10.1, 5.0], &Body::WALKING, &mut st);
@@ -1205,9 +902,6 @@ mod tests {
         assert_eq!(st.event, Some(LiquidEvent::Enter));
         assert!((st.submersion - 0.01).abs() < 1e-5, "{}", st.submersion);
         let b = c.align(a.pos, [1.0, a.pos[1], 5.0], &Body::WALKING, &mut st);
-        assert!(
-            st.event.is_none() && (b.pos[1] - 12.99).abs() < 1e-4,
-            "{b:?}"
-        );
+        assert!(st.event.is_none() && (b.pos[1] - 12.99).abs() < 1e-4, "{b:?}");
     }
 }

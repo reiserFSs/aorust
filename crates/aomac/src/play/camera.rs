@@ -5,6 +5,7 @@
 //! The scene frame is the renderer's (Y up, forward = (sin yaw, 0, -cos yaw)); `avatar_yaw` is the heading of the
 //! avatar in that convention (the integration layer converts the server heading).
 
+
 use super::camera_views::{Sight, Views};
 use super::controls::{CamCmd, CamKey, ControlPrefs};
 use ao_render::{Camera, Vec3};
@@ -28,12 +29,7 @@ pub fn far_plane(view_distance: f32) -> f32 {
 /// The lens of the player camera over the playfield's `base` (far plane: the client's [`far_plane`] of the default view
 /// distance, which is the fog distance the playfield lens already carries).
 pub fn lens(base: Lens) -> Lens {
-    Lens {
-        fov: FOV_HORIZONTAL,
-        horizontal: true,
-        near: NEAR,
-        ..base
-    }
+    Lens { fov: FOV_HORIZONTAL, horizontal: true, near: NEAR, ..base }
 }
 
 /// `PreferredCamPosY` / `PreferredCamPosZ` defaults (GUI `SetDefaultLoginPrefs` @0x10124b33): the unit direction from the
@@ -152,15 +148,7 @@ struct Vehicle {
 
 impl Default for Vehicle {
     fn default() -> Self {
-        Self {
-            pos: Vec3::ZERO,
-            vel: Vec3::ZERO,
-            dist: CHASE_DEFAULT_DISTANCE,
-            sees: false,
-            steer: Vec3::ZERO,
-            blind: false,
-            frame_avg: None,
-        }
+        Self { pos: Vec3::ZERO, vel: Vec3::ZERO, dist: CHASE_DEFAULT_DISTANCE, sees: false, steer: Vec3::ZERO, blind: false, frame_avg: None }
     }
 }
 
@@ -168,11 +156,7 @@ impl Vehicle {
     /// A new `CameraVehicle_t` at `pos` (`n3Camera_t` swaps the vehicle on a mode change, FUN_10021859 @N3 0x10021859); the
     /// substep average is a function static and survives.
     fn replaced(&self) -> Self {
-        Self {
-            pos: self.pos,
-            frame_avg: self.frame_avg,
-            ..Self::default()
-        }
+        Self { pos: self.pos, frame_avg: self.frame_avg, ..Self::default() }
     }
 
     /// `Vehicle_t::Run`'s substep loop (`FUN_1000e3d3`): `step(vehicle, h)` once per substep `h <= VEHICLE_STEP`.
@@ -199,8 +183,7 @@ impl Vehicle {
         }
         let d = d2.sqrt();
         let desired = to / d * (d / VEHICLE_BRAKE * VEHICLE_MAX_SPEED).min(VEHICLE_MAX_SPEED);
-        let force =
-            ((desired - self.vel) * (VEHICLE_MASS * 4.0)).clamp_length_max(VEHICLE_MAX_FORCE);
+        let force = ((desired - self.vel) * (VEHICLE_MASS * 4.0)).clamp_length_max(VEHICLE_MAX_FORCE);
         self.vel = (self.vel + force * h / VEHICLE_MASS).clamp_length_max(VEHICLE_MAX_SPEED);
         self.pos += self.vel * h;
     }
@@ -220,20 +203,13 @@ impl Vehicle {
         }
         self.frame_avg = Some(avg * 0.5 + h * 0.5);
         let (to_look, to_target) = (ao(look - self.pos), ao(target - self.pos));
-        let (l, t) = (
-            Vec3::new(to_look.x, 0.0, to_look.z),
-            Vec3::new(to_target.x, 0.0, to_target.z),
-        );
+        let (l, t) = (Vec3::new(to_look.x, 0.0, to_look.z), Vec3::new(to_target.x, 0.0, to_target.z));
         let mut target = target;
         if l != Vec3::ZERO && t != Vec3::ZERO {
             let (c, d) = (l.length(), t.length());
             let (ul, ut) = (l / c, t / d);
             let cross_y = ul.z * ut.x - ul.x * ut.z; // (ul x ut).y
-            if c < d
-                && d > SIDESTEP_MIN_DISTANCE
-                && cross_y.abs() < SIDESTEP_MAX_SINE
-                && ut.dot(ul) > 0.0
-            {
+            if c < d && d > SIDESTEP_MIN_DISTANCE && cross_y.abs() < SIDESTEP_MAX_SINE && ut.dot(ul) > 0.0 {
                 let side = Vec3::new(l.z, 0.0, -l.x) * if cross_y < 0.0 { -1.0 } else { 1.0 };
                 target = look + ao(side * SIDESTEP);
             }
@@ -254,15 +230,9 @@ impl Vehicle {
     fn calc_steering(&self, look: Vec3, sight: &Sight) -> Vec3 {
         let off = look - self.pos;
         let len = off.length();
-        let mut want = if len > 0.0 {
-            look - off / len * self.dist
-        } else {
-            look
-        };
+        let mut want = if len > 0.0 { look - off / len * self.dist } else { look };
         if self.sees {
-            if (sight.ground)(self.pos.to_array())
-                .is_some_and(|g| (self.pos.y - g).abs() < CHASE_LIFT)
-            {
+            if (sight.ground)(self.pos.to_array()).is_some_and(|g| (self.pos.y - g).abs() < CHASE_LIFT) {
                 want.y += CHASE_LIFT;
             }
         } else {
@@ -294,11 +264,7 @@ impl Vehicle {
         self.steer = Vec3::ZERO;
         self.blind = false;
         let mut fwd = ao(look - self.pos).normalize_or_zero();
-        let base = if fwd.x == 0.0 && fwd.z == 0.0 {
-            Vec3::Z
-        } else {
-            Vec3::Y
-        };
+        let base = if fwd.x == 0.0 && fwd.z == 0.0 { Vec3::Z } else { Vec3::Y };
         if fwd == Vec3::ZERO {
             fwd = Vec3::Z;
         }
@@ -308,9 +274,7 @@ impl Vehicle {
         for step in SENSOR_STEPS {
             for dir in dirs {
                 let p = self.pos + dir * step;
-                if clear((p - dir * SENSOR_MARGIN).to_array(), look.to_array())
-                    && clear(self.pos.to_array(), p.to_array())
-                {
+                if clear((p - dir * SENSOR_MARGIN).to_array(), look.to_array()) && clear(self.pos.to_array(), p.to_array()) {
                     self.steer = dir;
                     return;
                 }
@@ -322,12 +286,7 @@ impl Vehicle {
     /// `CameraVehicle_t::ReposCutOnAxis(0)` @N3 0x1001e27e (no attractor, zero axis): halt and put the camera on the far side
     /// of the look target (the line from the camera through it, swung 31 degrees about the vertical to the side `facing`
     /// crosses it, always above it), `dist` away; while that spot does not see the target the distance halves.
-    fn cut_on_axis(
-        &mut self,
-        look: Vec3,
-        facing: Vec3,
-        clear: &dyn Fn([f32; 3], [f32; 3]) -> bool,
-    ) {
+    fn cut_on_axis(&mut self, look: Vec3, facing: Vec3, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) {
         self.vel = Vec3::ZERO;
         let (look_ao, facing) = (ao(look), ao(facing));
         let mut p = ao(self.pos);
@@ -336,11 +295,7 @@ impl Vehicle {
                 self.dist *= 0.5;
             }
             let to = look_ao - p;
-            let angle = if facing.cross(to).y < 0.0 {
-                CUT_ANGLE
-            } else {
-                -CUT_ANGLE
-            };
+            let angle = if facing.cross(to).y < 0.0 { CUT_ANGLE } else { -CUT_ANGLE };
             let ahead = Vec3::new(to.x * 2.0, (to.y * 2.0).abs(), to.z * 2.0);
             let v = if ahead != Vec3::ZERO {
                 Quat::from_axis_angle(Vec3::Y, angle) * (ahead.normalize() * self.dist)
@@ -349,10 +304,7 @@ impl Vehicle {
             };
             p = look_ao + v;
             let probe = p + v.normalize_or_zero();
-            if clear(look.to_array(), ao(probe).to_array())
-                || i > 9
-                || self.dist <= CUT_MIN_DISTANCE
-            {
+            if clear(look.to_array(), ao(probe).to_array()) || i > 9 || self.dist <= CUT_MIN_DISTANCE {
                 break;
             }
         }
@@ -398,11 +350,7 @@ pub struct Camera3p {
 impl Camera3p {
     /// The options changed (`LMBMouseLook`, `ZoomSpeed`, ... read live from the DValues, docs/gui.md "Options window"); camera state (mode, first person) stays.
     pub fn set_prefs(&mut self, prefs: &ControlPrefs) {
-        self.prefs = ControlPrefs {
-            third_person: self.prefs.third_person,
-            preferred_camera_mode: self.prefs.preferred_camera_mode,
-            ..prefs.clone()
-        };
+        self.prefs = ControlPrefs { third_person: self.prefs.third_person, preferred_camera_mode: self.prefs.preferred_camera_mode, ..prefs.clone() };
     }
 
     /// `head_height`: height of the head attractor over the feet ([`MIN_PIVOT_HEIGHT`] without one).
@@ -444,9 +392,7 @@ impl Camera3p {
 
     /// Direct CameraMenu selection (CameraCoordinator GUI 0x10064387): 0 first-person, 1/2/3 third-person vehicle.
     pub fn select_mode(&mut self, mode: u8) {
-        if mode > 3 {
-            return;
-        }
+        if mode > 3 { return; }
         self.first_person = mode == 0;
         if mode != 0 && self.mode != mode {
             self.mode = mode;
@@ -456,11 +402,7 @@ impl Camera3p {
     }
 
     pub fn selected_mode(&self) -> u8 {
-        if self.first_person {
-            0
-        } else {
-            self.mode
-        }
+        if self.first_person { 0 } else { self.mode }
     }
 
     /// `PreferredCameraMode` in use (1, 2 or 3).
@@ -503,11 +445,7 @@ impl Camera3p {
         match *cmd {
             CamCmd::Orbit { dx, dy } => self.rotate(dx, dy),
             CamCmd::Pitch { dy } => {
-                let allowed = if self.first_person {
-                    self.prefs.rmb_mouse_look_1st
-                } else {
-                    self.prefs.rmb_mouse_look_3rd
-                };
+                let allowed = if self.first_person { self.prefs.rmb_mouse_look_1st } else { self.prefs.rmb_mouse_look_3rd };
                 if allowed {
                     self.rotate(0.0, dy);
                 }
@@ -577,11 +515,7 @@ impl Camera3p {
         if len <= 0.0 {
             return;
         }
-        let dy = if (off.y / len + dy).abs() > MAX_ELEVATION_SIN {
-            0.0
-        } else {
-            dy
-        };
+        let dy = if (off.y / len + dy).abs() > MAX_ELEVATION_SIN { 0.0 } else { dy };
         let el = (off.y / len).asin() + dy;
         let (c, s) = (dx.cos(), dx.sin());
         let (x, z) = (off.x * c - off.z * s, off.x * s + off.z * c);
@@ -628,14 +562,9 @@ impl Camera3p {
     fn step_keys_and_zoom(&mut self, dt: f32) {
         let k = |c: CamKey| self.keys[c as usize];
         let turn = KEY_ROTATE * self.prefs.mouse_turn_sensitivity * dt * 60.0;
-        let dx = if k(CamKey::RotateLeft) { turn } else { 0.0 }
-            - if k(CamKey::RotateRight) { turn } else { 0.0 };
-        let dy = if k(CamKey::RotateDown) { turn } else { 0.0 }
-            - if k(CamKey::RotateUp) { turn } else { 0.0 };
-        let zoom = (if k(CamKey::ZoomIn) { 1.0 } else { 0.0 }
-            - if k(CamKey::ZoomOut) { 1.0 } else { 0.0 })
-            * dt
-            * self.prefs.zoom_speed;
+        let dx = if k(CamKey::RotateLeft) { turn } else { 0.0 } - if k(CamKey::RotateRight) { turn } else { 0.0 };
+        let dy = if k(CamKey::RotateDown) { turn } else { 0.0 } - if k(CamKey::RotateUp) { turn } else { 0.0 };
+        let zoom = (if k(CamKey::ZoomIn) { 1.0 } else { 0.0 } - if k(CamKey::ZoomOut) { 1.0 } else { 0.0 }) * dt * self.prefs.zoom_speed;
         if dx != 0.0 || dy != 0.0 {
             self.rotate(dx, dy);
         }
@@ -644,11 +573,7 @@ impl Camera3p {
         }
         if !self.first_person && self.pending_zoom != 0.0 {
             let p = self.pending_zoom;
-            let step = if p.abs() >= 1.0 {
-                dt * p * ZOOM_RATE
-            } else {
-                dt * ZOOM_RATE * p.signum()
-            };
+            let step = if p.abs() >= 1.0 { dt * p * ZOOM_RATE } else { dt * ZOOM_RATE * p.signum() };
             self.pending_zoom = p - step;
             if self.pending_zoom * p <= 0.0 || self.pending_zoom.abs() < ZOOM_STOP {
                 self.pending_zoom = 0.0;
@@ -666,30 +591,19 @@ impl Camera3p {
             } else if self.no_bob_following || d > NO_BOB_START {
                 self.no_bob_following = true;
                 let a = 1.0 - NO_BOB_KEEP.powf(dt * 60.0);
-                self.pivot_height =
-                    (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
+                self.pivot_height = (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
             }
             return;
         }
-        let keep = if self.first_person {
-            1.0 - HEAD_BLEND_1ST
-        } else {
-            1.0 - HEAD_BLEND_3RD
-        };
+        let keep = if self.first_person { 1.0 - HEAD_BLEND_1ST } else { 1.0 - HEAD_BLEND_3RD };
         let a = 1.0 - keep.powf(dt * 60.0);
-        self.pivot_height =
-            (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
+        self.pivot_height = (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
     }
+
 
     /// One frame. `sight` answers what the camera asks of the world: line of sight (free of terrain/statels), closed doors
     /// between rooms and the ground under a point (scene frame).
-    pub fn update_with(
-        &mut self,
-        avatar_pos: [f32; 3],
-        avatar_yaw: f32,
-        dt: f32,
-        sight: &Sight,
-    ) -> Camera {
+    pub fn update_with(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32, sight: &Sight) -> Camera {
         let clear = sight.clear;
         self.step_keys_and_zoom(dt);
         self.follow_head(dt);
@@ -697,19 +611,10 @@ impl Camera3p {
         let pivot = feet + Vec3::Y * self.pivot_height;
         self.pivot = pivot;
         if self.first_person {
-            return Camera {
-                pos: pivot,
-                yaw: avatar_yaw + self.fp_yaw,
-                pitch: -self.fp_pitch,
-                roll: 0.0,
-            };
+            return Camera { pos: pivot, yaw: avatar_yaw + self.fp_yaw, pitch: -self.fp_pitch, roll: 0.0 };
         }
         // scripted views: ranked every 10th frame and Shift+F8 steps them
-        let guide = self
-            .views
-            .as_ref()
-            .and_then(Views::selected)
-            .map_or(self.vehicle.pos, |v| v.pos);
+        let guide = self.views.as_ref().and_then(Views::selected).map_or(self.vehicle.pos, |v| v.pos);
         if let Some(v) = &mut self.views {
             v.tick(dt, feet, guide, sight);
             if std::mem::take(&mut self.prev_view) {
@@ -735,8 +640,7 @@ impl Camera3p {
             }
             // CameraVehicleFixedThird_t(damped): `SteeringCamArrive(optimal, 0.01)`
             2 => {
-                self.vehicle
-                    .run(dt, |v, h| v.cam_arrive_step(optimal, pivot, h));
+                self.vehicle.run(dt, |v, h| v.cam_arrive_step(optimal, pivot, h));
                 self.vehicle.pos
             }
             // CameraVehicle_t (`CalcSteering` @N3 0x1001e797), with the sensors and the blind-camera cut of `FUN_10022345`
@@ -831,10 +735,7 @@ mod tests {
         assert!(near((v.pos - pivot).length(), 5.0));
         assert!(near(v.pos.x, 10.0) && v.pos.z > -3.0);
         assert!(near(v.pos.y - pivot.y, 5.0 * 0.316));
-        assert!(near(
-            v.pos.z - pivot.z,
-            5.0 * (1.0 - 0.316f32 * 0.316).sqrt()
-        ));
+        assert!(near(v.pos.z - pivot.z, 5.0 * (1.0 - 0.316f32 * 0.316).sqrt()));
         // it looks at the pivot: forward points from the camera to it
         assert!((v.forward() - (pivot - v.pos).normalize()).length() < 1e-3);
     }
@@ -891,11 +792,7 @@ mod tests {
             d_prev = c.distance();
         }
         // the tail below 0.3 m is dropped
-        assert!(
-            c.distance() > 3.0 && c.distance() < 3.35,
-            "{}",
-            c.distance()
-        );
+        assert!(c.distance() > 3.0 && c.distance() < 3.35, "{}", c.distance());
         // far out: capped at 25 m
         for _ in 0..40 {
             c.apply(&CamCmd::Zoom(-10.0));
@@ -913,10 +810,7 @@ mod tests {
     #[test]
     fn zooming_in_to_the_limit_switches_to_first_person_and_back() {
         let mut c = cam();
-        c.apply(&CamCmd::Key {
-            key: CamKey::ZoomIn,
-            down: true,
-        });
+        c.apply(&CamCmd::Key { key: CamKey::ZoomIn, down: true });
         for _ in 0..120 {
             c.update([0.0; 3], 0.0, 0.016);
         }
@@ -925,27 +819,15 @@ mod tests {
         let v = c.update([1.0, 0.0, 2.0], 0.7, 0.016);
         assert!(near(v.pos.y, 1.5) && near(v.pos.x, 1.0) && near(v.yaw, 0.7));
         // wheel out returns to third person at the old distance
-        c.apply(&CamCmd::Key {
-            key: CamKey::ZoomIn,
-            down: false,
-        });
+        c.apply(&CamCmd::Key { key: CamKey::ZoomIn, down: false });
         c.apply(&CamCmd::Zoom(-1.0));
         assert!(!c.is_first_person() && c.show_avatar());
     }
 
     #[test]
     fn zoom_to_first_person_pref_off_clamps_instead() {
-        let mut c = Camera3p::new(
-            &ControlPrefs {
-                zoom_to_1st_person: false,
-                ..Default::default()
-            },
-            1.5,
-        );
-        c.apply(&CamCmd::Key {
-            key: CamKey::ZoomIn,
-            down: true,
-        });
+        let mut c = Camera3p::new(&ControlPrefs { zoom_to_1st_person: false, ..Default::default() }, 1.5);
+        c.apply(&CamCmd::Key { key: CamKey::ZoomIn, down: true });
         for _ in 0..120 {
             c.update([0.0; 3], 0.0, 0.016);
         }
@@ -954,13 +836,7 @@ mod tests {
 
     #[test]
     fn first_person_look_and_heading_sync() {
-        let mut c = Camera3p::new(
-            &ControlPrefs {
-                third_person: false,
-                ..Default::default()
-            },
-            1.5,
-        );
+        let mut c = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, 1.5);
         assert!(c.is_first_person());
         c.apply(&CamCmd::Orbit { dx: 0.4, dy: 5.0 });
         let v = c.update([0.0; 3], 0.0, 0.016);
@@ -978,13 +854,7 @@ mod tests {
         let e = c.orbit().1;
         c.apply(&CamCmd::Pitch { dy: 0.2 });
         assert!(near(c.orbit().1, e + 0.2));
-        let mut c = Camera3p::new(
-            &ControlPrefs {
-                rmb_mouse_look_3rd: false,
-                ..Default::default()
-            },
-            1.5,
-        );
+        let mut c = Camera3p::new(&ControlPrefs { rmb_mouse_look_3rd: false, ..Default::default() }, 1.5);
         c.apply(&CamCmd::Pitch { dy: 0.2 });
         assert!(near(c.orbit().1, DEFAULT_DIRECTION[1].asin()));
     }
@@ -994,10 +864,7 @@ mod tests {
         let wall = |_: [f32; 3], to: [f32; 3]| to[0] <= 4.8001 + COLLISION_RADIUS;
         let eye = occlude(Vec3::ZERO, Vec3::X * 10.0, Vec3::X, &wall);
         assert!(eye.x > 4.8001 && eye.x < 4.81, "{eye:?}");
-        assert!(!wall(
-            [0.0; 3],
-            (eye + Vec3::X * COLLISION_RADIUS).to_array()
-        ));
+        assert!(!wall([0.0; 3], (eye + Vec3::X * COLLISION_RADIUS).to_array()));
     }
 
     #[test]
@@ -1006,16 +873,8 @@ mod tests {
         // a wall 2 m behind the pivot (z >= -3 + 2 for an avatar at z = -3 facing -Z): nothing beyond z = pivot.z + 2 is reachable
         let wall = |_: [f32; 3], to: [f32; 3]| to[2] < -1.0;
         let v = c.update_with([0.0, 0.0, -3.0], 0.0, 0.016, &Sight::with_clear(&wall));
-        assert!(
-            v.pos.z <= -1.0 - COLLISION_RADIUS * 0.948 + 0.01,
-            "{}",
-            v.pos.z
-        );
-        assert!(
-            v.pos.z > -3.0 + 1.5,
-            "still pulled out of the avatar: {}",
-            v.pos.z
-        );
+        assert!(v.pos.z <= -1.0 - COLLISION_RADIUS * 0.948 + 0.01, "{}", v.pos.z);
+        assert!(v.pos.z > -3.0 + 1.5, "still pulled out of the avatar: {}", v.pos.z);
         // an unobstructed view keeps the full distance
         let v = c.update_with([0.0, 0.0, -3.0], 0.0, 0.016, &Sight::OPEN);
         assert!(near((v.pos - Vec3::new(0.0, 1.5, -3.0)).length(), 5.0));
@@ -1025,14 +884,8 @@ mod tests {
     fn numpad_rotation_is_frame_rate_independent() {
         let mut a = cam();
         let mut b = cam();
-        a.apply(&CamCmd::Key {
-            key: CamKey::RotateLeft,
-            down: true,
-        });
-        b.apply(&CamCmd::Key {
-            key: CamKey::RotateLeft,
-            down: true,
-        });
+        a.apply(&CamCmd::Key { key: CamKey::RotateLeft, down: true });
+        b.apply(&CamCmd::Key { key: CamKey::RotateLeft, down: true });
         for _ in 0..60 {
             a.update([0.0; 3], 0.0, 1.0 / 60.0);
         }
@@ -1056,13 +909,7 @@ mod tests {
         }
         assert!(near(c.pivot_height, 1.7));
         // first person tracks (almost) at once
-        let mut f = Camera3p::new(
-            &ControlPrefs {
-                third_person: false,
-                ..Default::default()
-            },
-            1.5,
-        );
+        let mut f = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, 1.5);
         f.set_head(1.7);
         assert!(near(f.update([0.0; 3], 0.0, 1.0 / 60.0).pos.y, 1.7));
         // never below 0.3 m
@@ -1073,22 +920,12 @@ mod tests {
     /// `UseNoBobCamera` (`FUN_10020bdb`): head bobbing under 0.25 m is ignored, a bigger move is followed 1 % per frame until within 0.01 m.
     #[test]
     fn no_bob_camera_ignores_small_head_motion() {
-        let mut c = Camera3p::new(
-            &ControlPrefs {
-                no_bob_camera: true,
-                ..Default::default()
-            },
-            1.5,
-        );
+        let mut c = Camera3p::new(&ControlPrefs { no_bob_camera: true, ..Default::default() }, 1.5);
         for i in 0..120 {
             c.set_head(1.5 + if i % 2 == 0 { 0.015 } else { -0.015 });
             c.update([0.0; 3], 0.0, 1.0 / 60.0);
         }
-        assert!(
-            near(c.pivot_height, 1.5),
-            "bobbing ignored: {}",
-            c.pivot_height
-        );
+        assert!(near(c.pivot_height, 1.5), "bobbing ignored: {}", c.pivot_height);
         // a crouch of 0.5 m: starts following (0.99 * old + 0.01 * new per frame) ...
         c.set_head(1.0);
         c.update([0.0; 3], 0.0, 1.0 / 60.0);
@@ -1097,11 +934,7 @@ mod tests {
         for _ in 0..1000 {
             c.update([0.0; 3], 0.0, 1.0 / 60.0);
         }
-        assert!(
-            (c.pivot_height - 1.0).abs() < 0.0101 && !c.no_bob_following,
-            "{}",
-            c.pivot_height
-        );
+        assert!((c.pivot_height - 1.0).abs() < 0.0101 && !c.no_bob_following, "{}", c.pivot_height);
         // the default camera follows at once
         let mut d = cam();
         d.set_head(1.515);
@@ -1114,16 +947,8 @@ mod tests {
         assert_eq!(NEAR, 0.2);
         assert_eq!(far_plane(VIEW_DISTANCE), 800.0);
         assert_eq!(far_plane(0.0), NEAR + 50.0);
-        let l = lens(Lens {
-            fov: 1.0,
-            horizontal: false,
-            near: 0.5,
-            far: Some(900.0),
-        });
-        assert_eq!(
-            (l.fov, l.horizontal, l.near, l.far),
-            (FOV_HORIZONTAL, true, 0.2, Some(900.0))
-        );
+        let l = lens(Lens { fov: 1.0, horizontal: false, near: 0.5, far: Some(900.0) });
+        assert_eq!((l.fov, l.horizontal, l.near, l.far), (FOV_HORIZONTAL, true, 0.2, Some(900.0)));
     }
 
     #[test]
@@ -1135,37 +960,13 @@ mod tests {
             assert_eq!(c.mode(), want);
         }
         // first person: only the attractor is dropped
-        let mut f = Camera3p::new(
-            &ControlPrefs {
-                third_person: false,
-                ..Default::default()
-            },
-            1.5,
-        );
+        let mut f = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, 1.5);
         f.apply(&CamCmd::NextView);
         assert_eq!(f.mode(), 3);
         // the pref picks the start mode, 0 maps to 1
-        assert_eq!(
-            ControlPrefs::from_xml(r#"<Value name="PreferredCameraMode" value="1"/>"#)
-                .preferred_camera_mode,
-            1
-        );
-        assert_eq!(
-            ControlPrefs::from_xml(r#"<Value name="PreferredCameraMode" value="0"/>"#)
-                .preferred_camera_mode,
-            1
-        );
-        assert_eq!(
-            Camera3p::new(
-                &ControlPrefs {
-                    preferred_camera_mode: 2,
-                    ..Default::default()
-                },
-                1.5
-            )
-            .mode(),
-            2
-        );
+        assert_eq!(ControlPrefs::from_xml(r#"<Value name="PreferredCameraMode" value="1"/>"#).preferred_camera_mode, 1);
+        assert_eq!(ControlPrefs::from_xml(r#"<Value name="PreferredCameraMode" value="0"/>"#).preferred_camera_mode, 1);
+        assert_eq!(Camera3p::new(&ControlPrefs { preferred_camera_mode: 2, ..Default::default() }, 1.5).mode(), 2);
     }
 
     #[test]
@@ -1175,7 +976,7 @@ mod tests {
         let mut c = cam();
         c.update([0.0; 3], 0.0, 0.016);
         c.apply(&CamCmd::NextView); // 2
-                                    // the avatar steps 10 m: the camera trails and then settles on the rigid spot
+        // the avatar steps 10 m: the camera trails and then settles on the rigid spot
         let first = c.update([10.0, 0.0, 0.0], 0.0, 1.0 / 60.0).pos;
         let rigid_now = rigid.update([10.0, 0.0, 0.0], 0.0, 1.0 / 60.0).pos;
         assert!((first - rigid_now).length() > 5.0, "lags behind the avatar");
@@ -1210,20 +1011,12 @@ mod tests {
             v = c.update([0.0, 0.0, -8.0], 0.0, 1.0 / 60.0);
         }
         let pivot = Vec3::new(0.0, 1.5, -8.0);
-        assert!(
-            ((v.pos - pivot).length() - CHASE_DEFAULT_DISTANCE).abs() < 0.11,
-            "{}",
-            (v.pos - pivot).length()
-        ); // `SteeringArrive` stops within 0.1 m (d2 < 0.01)
+        assert!(((v.pos - pivot).length() - CHASE_DEFAULT_DISTANCE).abs() < 0.11, "{}", (v.pos - pivot).length()); // `SteeringArrive` stops within 0.1 m (d2 < 0.01)
         assert!((v.forward() - (pivot - v.pos).normalize()).length() < 1e-3);
         // a target inside 0.9 m is not pushed out any more (`Update` only runs on input): the distance stays what it was
         let mut d = chase();
         for _ in 0..600 {
-            d.update(
-                [d.vehicle.pos.x, -0.4, d.vehicle.pos.z + 0.2],
-                0.0,
-                1.0 / 60.0,
-            );
+            d.update([d.vehicle.pos.x, -0.4, d.vehicle.pos.z + 0.2], 0.0, 1.0 / 60.0);
         }
         assert!(d.vehicle.pos.is_finite());
     }
@@ -1239,10 +1032,7 @@ mod tests {
         c.apply(&CamCmd::Orbit { dx: 0.5, dy: 0.0 });
         let after = c.vehicle.pos - c.pivot;
         assert!(near(after.length(), before.length()) && near(c.vehicle.dist, before.length()));
-        assert!(
-            after.x < before.x - 1.0,
-            "+dx swings the camera to -X like the rigid modes: {before:?} -> {after:?}"
-        );
+        assert!(after.x < before.x - 1.0, "+dx swings the camera to -X like the rigid modes: {before:?} -> {after:?}");
         assert!(near(after.y, before.y));
         // wheel zoom changes the distance it keeps
         c.apply(&CamCmd::Zoom(1.0));
@@ -1259,9 +1049,7 @@ mod tests {
         v.run(0.12, |_, h| hs.push(h));
         assert_eq!(hs.len(), 3);
         assert!(near(hs[0], 0.05) && near(hs[1], 0.05) && near(hs[2], 0.02));
-        v.run(5.0, |_, _| {
-            panic!("frames over 4 s are not run (`_DAT_10012804`)")
-        });
+        v.run(5.0, |_, _| panic!("frames over 4 s are not run (`_DAT_10012804`)"));
     }
 
     #[test]
@@ -1271,11 +1059,7 @@ mod tests {
         let mut v = Vehicle::default();
         v.cam_arrive_step(Vec3::new(0.0, 0.0, -6.0), look, 0.016);
         // heads for (1, 0, -2): half the distance to the look target to the side (cross y = 0: the + side)
-        assert!(
-            v.vel.x > 0.0 && v.vel.z < 0.0 && near(v.vel.x / v.vel.z, -0.5),
-            "{:?}",
-            v.vel
-        );
+        assert!(v.vel.x > 0.0 && v.vel.z < 0.0 && near(v.vel.x / v.vel.z, -0.5), "{:?}", v.vel);
         // a wanted spot nearer than the look target goes straight there
         let mut w = Vehicle::default();
         w.cam_arrive_step(Vec3::new(0.0, 0.0, -1.0), look, 0.016);
@@ -1318,31 +1102,19 @@ mod tests {
         // camera 5 m behind the look target (-Z is ahead), a wall in between: right and left are blocked at 0.5 and 2 m,
         // at 8 m the right-hand probe sees the target past the wall's edge
         let look = Vec3::ZERO;
-        let mut v = Vehicle {
-            pos: Vec3::new(0.0, 0.0, 5.0),
-            ..Vehicle::default()
-        };
+        let mut v = Vehicle { pos: Vec3::new(0.0, 0.0, 5.0), ..Vehicle::default() };
         v.update_sensors(look, &wall);
         assert!(!v.sees && !v.blind);
         assert_eq!(v.steer, Vec3::X);
         // CalcSteering adds the unit steer direction to the wanted spot while the target is out of view
         let want = v.calc_steering(look, &Sight::OPEN);
-        assert!(
-            (want - Vec3::new(1.0, 0.0, 5.0)).length() < 1e-4,
-            "{want:?}"
-        );
+        assert!((want - Vec3::new(1.0, 0.0, 5.0)).length() < 1e-4, "{want:?}");
         // in the clear the sensor reports a view and no steer applies
-        let mut c = Vehicle {
-            pos: Vec3::new(3.0, 0.0, 5.0),
-            ..Vehicle::default()
-        };
+        let mut c = Vehicle { pos: Vec3::new(3.0, 0.0, 5.0), ..Vehicle::default() };
         c.update_sensors(look, &wall);
         assert!(c.sees && !c.blind && c.steer == Vec3::ZERO);
         // nothing sees it: blind
-        let mut b = Vehicle {
-            pos: Vec3::new(0.0, 0.0, 5.0),
-            ..Vehicle::default()
-        };
+        let mut b = Vehicle { pos: Vec3::new(0.0, 0.0, 5.0), ..Vehicle::default() };
         b.update_sensors(look, &|_, _| false);
         assert!(b.blind && !b.sees && b.steer == Vec3::ZERO);
     }
@@ -1358,10 +1130,7 @@ mod tests {
             let x = a[0] + (b[0] - a[0]) * (2.5 - a[2]) / (b[2] - a[2]);
             !(-1.0..9.0).contains(&x)
         };
-        let mut v = Vehicle {
-            pos: Vec3::new(0.0, 0.0, 5.0),
-            ..Vehicle::default()
-        };
+        let mut v = Vehicle { pos: Vec3::new(0.0, 0.0, 5.0), ..Vehicle::default() };
         v.update_sensors(Vec3::ZERO, &wide);
         assert_eq!(v.steer, -Vec3::X);
     }
@@ -1369,43 +1138,16 @@ mod tests {
     #[test]
     fn in_the_clear_the_camera_is_lifted_off_the_ground_and_below_the_target() {
         let look = Vec3::new(0.0, 1.5, 0.0);
-        let v = Vehicle {
-            pos: Vec3::new(0.0, 3.0, 5.0),
-            sees: true,
-            ..Vehicle::default()
-        };
+        let v = Vehicle { pos: Vec3::new(0.0, 3.0, 5.0), sees: true, ..Vehicle::default() };
         let plain = v.calc_steering(look, &Sight::OPEN);
-        let near_ground = Sight {
-            ground: &|_| Some(2.9),
-            ..Sight::OPEN
-        };
-        assert!(near(
-            v.calc_steering(look, &near_ground).y,
-            plain.y + CHASE_LIFT
-        ));
-        let high = Sight {
-            ground: &|_| Some(2.0),
-            ..Sight::OPEN
-        };
+        let near_ground = Sight { ground: &|_| Some(2.9), ..Sight::OPEN };
+        assert!(near(v.calc_steering(look, &near_ground).y, plain.y + CHASE_LIFT));
+        let high = Sight { ground: &|_| Some(2.0), ..Sight::OPEN };
         assert!(near(v.calc_steering(look, &high).y, plain.y));
         // below the look target: lifted as well, both lifts add up
-        let low = Vehicle {
-            pos: Vec3::new(0.0, 1.0, 5.0),
-            sees: true,
-            ..Vehicle::default()
-        };
+        let low = Vehicle { pos: Vec3::new(0.0, 1.0, 5.0), sees: true, ..Vehicle::default() };
         let base = low.calc_steering(look, &Sight::OPEN).y;
-        assert!(near(
-            low.calc_steering(
-                look,
-                &Sight {
-                    ground: &|_| Some(0.9),
-                    ..Sight::OPEN
-                }
-            )
-            .y,
-            base + CHASE_LIFT
-        ));
+        assert!(near(low.calc_steering(look, &Sight { ground: &|_| Some(0.9), ..Sight::OPEN }).y, base + CHASE_LIFT));
     }
 
     #[test]
@@ -1426,57 +1168,30 @@ mod tests {
         assert!((88..=93).contains(&frame), "cut after {frame} frames");
         // every try that does not see the target halves the distance and swings on from the previous spot (the loop reuses
         // `pos'`), so with nothing visible it ends 0.625 m from the target, above it
-        assert!(
-            c.vehicle.pos.y > pivot.y && near((c.vehicle.pos - pivot).length(), 0.625),
-            "{:?}",
-            c.vehicle.pos
-        );
+        assert!(c.vehicle.pos.y > pivot.y && near((c.vehicle.pos - pivot).length(), 0.625), "{:?}", c.vehicle.pos);
         assert!(c.vehicle.dist <= CUT_MIN_DISTANCE, "{}", c.vehicle.dist);
     }
 
     #[test]
     fn the_cut_picks_the_side_the_character_faces_away_from() {
         let look = Vec3::new(0.0, 1.5, 0.0);
-        let mut a = Vehicle {
-            pos: Vec3::new(2.0, 3.0, 3.0),
-            ..Vehicle::default()
-        };
+        let mut a = Vehicle { pos: Vec3::new(2.0, 3.0, 3.0), ..Vehicle::default() };
         a.cut_on_axis(look, Vec3::new(0.0, 0.0, -1.0), &|_, _| true);
-        let mut b = Vehicle {
-            pos: Vec3::new(-2.0, 3.0, 3.0),
-            ..Vehicle::default()
-        };
+        let mut b = Vehicle { pos: Vec3::new(-2.0, 3.0, 3.0), ..Vehicle::default() };
         b.cut_on_axis(look, Vec3::new(0.0, 0.0, -1.0), &|_, _| true);
         // with a free line the first try stands: distance 5 from the target, beyond it, above it, mirrored left/right
         for v in [&a, &b] {
-            assert!(
-                near((v.pos - look).length(), 5.0) && v.pos.z < look.z && v.pos.y > look.y,
-                "{:?}",
-                v.pos
-            );
+            assert!(near((v.pos - look).length(), 5.0) && v.pos.z < look.z && v.pos.y > look.y, "{:?}", v.pos);
         }
-        assert!(
-            a.pos.x * b.pos.x < 0.0 || near(a.pos.x + b.pos.x, 0.0),
-            "{:?} {:?}",
-            a.pos,
-            b.pos
-        );
+        assert!(a.pos.x * b.pos.x < 0.0 || near(a.pos.x + b.pos.x, 0.0), "{:?} {:?}", a.pos, b.pos);
     }
 
     #[test]
     fn previous_view_selects_an_attractor_that_steers_mode_one() {
         use ao_formats::playfield::{CameraAttractor, CameraViews};
-        let a = CameraAttractor {
-            pos: [10.0, 5.0, 0.0],
-            rot: [0.0, 0.0, 0.0, 1.0],
-            target: [10.0, 1.5, 1.0],
-            range: 1.0,
-        };
+        let a = CameraAttractor { pos: [10.0, 5.0, 0.0], rot: [0.0, 0.0, 0.0, 1.0], target: [10.0, 1.5, 1.0], range: 1.0 };
         let mut c = cam();
-        c.set_views(Views::new(
-            CameraViews::new(vec![vec![a]], None, vec![]),
-            Box::new(|_| 0),
-        ));
+        c.set_views(Views::new(CameraViews::new(vec![vec![a]], None, vec![]), Box::new(|_| 0)));
         // mode 3 ignores attractors
         c.apply(&CamCmd::PrevView);
         let v = c.update([10.0, 0.0, -1.0], 0.0, 0.016);
@@ -1490,11 +1205,7 @@ mod tests {
         for _ in 0..600 {
             v = c.update([10.0, 0.0, -1.0], 0.0, 1.0 / 60.0);
         }
-        assert!(
-            (v.pos - Vec3::new(10.0, 5.0, 0.0)).length() < 0.2,
-            "{:?}",
-            v.pos
-        );
+        assert!((v.pos - Vec3::new(10.0, 5.0, 0.0)).length() < 0.2, "{:?}", v.pos);
         // Ctrl+F8 drops it again
         c.apply(&CamCmd::NextView);
         assert!(c.views.as_ref().unwrap().selected().is_none());

@@ -5,15 +5,15 @@
 use super::avatar::{self, Avatar, AvatarPose};
 use super::camera::{self, Camera3p};
 use super::camera_views::{door_closed, Sight, Views};
-use super::combat::actions::Pose;
-use super::combat::anim::anim_name;
-use super::controls::{CamCmd, Cmd, ControlPrefs, Controls};
 use super::fightmode::{FightLevels, DEFAULT_LEVEL};
+use super::controls::{CamCmd, Cmd, ControlPrefs, Controls};
 use super::movement::{id as mv, mode, Movement, World};
 use super::zone::{scene_pos, scene_yaw, OwnEvent, Zone, IN_PLAY_STAT};
+use super::combat::actions::Pose;
+use super::combat::anim::anim_name;
 use ao_formats::character::Role;
-use ao_formats::playfield::collision::{Aligned, Body, Collision, SurfaceState, FOOT_CLEARANCE};
 use ao_formats::playfield::{camera_views, zone_locator, ZoneLocator};
+use ao_formats::playfield::collision::{Aligned, Body, Collision, SurfaceState, FOOT_CLEARANCE};
 use ao_gui::{InputEvent, MouseButton};
 use ao_net::frame::Frame;
 use ao_net::n3::action::{sit_toggle, Outgoing};
@@ -38,9 +38,7 @@ impl World for Ground<'_> {
         self.0?.ground(flip(p))
     }
     fn ceiling(&self, p: [f32; 3]) -> Option<f32> {
-        self.0?
-            .line(flip(p), flip([p[0], p[1] + JUMP_CEILING_RAY, p[2]]))
-            .map(|h| h.p[1])
+        self.0?.line(flip(p), flip([p[0], p[1] + JUMP_CEILING_RAY, p[2]])).map(|h| h.p[1])
     }
     fn align(&self, old: [f32; 3], new: [f32; 3], body: &Body, st: &mut SurfaceState) -> Aligned {
         match self.0 {
@@ -50,12 +48,7 @@ impl World for Ground<'_> {
                 r
             }
             // no collision records: a free walk at the old height (nothing to land on)
-            None => Aligned {
-                pos: [new[0], old[1], new[2]],
-                airborne: false,
-                normal: [0.0, 1.0, 0.0],
-                liquid: -9999.0,
-            },
+            None => Aligned { pos: [new[0], old[1], new[2]], airborne: false, normal: [0.0, 1.0, 0.0], liquid: -9999.0 },
         }
     }
 }
@@ -120,32 +113,20 @@ impl Player {
         let built = (|| -> anyhow::Result<Self> {
             let store = RecordStore::open(dir)?;
             let avatar = Avatar::new(&store, dir, zone.char_id, u)?;
-            let collision = Collision::load(&store, playfield)
-                .map_err(|e| eprintln!("collision {playfield}: {e:#}"))
-                .ok();
+            let collision = Collision::load(&store, playfield).map_err(|e| eprintln!("collision {playfield}: {e:#}")).ok();
             let mut movement = Movement::new(u.pos, u.yaw().unwrap_or(0.0), u.run_speed);
             movement.set_body_radius(avatar.body_radius());
             if let Some(c) = &collision {
                 if let Some(g) = c.ground(flip(u.pos)) {
-                    movement.teleport(
-                        [u.pos[0], g + FOOT_CLEARANCE, u.pos[2]],
-                        u.yaw().unwrap_or(0.0),
-                    );
+                    movement.teleport([u.pos[0], g + FOOT_CLEARANCE, u.pos[2]], u.yaw().unwrap_or(0.0));
                 }
             }
             movement.restore_blob(&u.blob);
-            let prefs_xml = std::fs::read_to_string(dir.join("cd_image/gui/Default/CharPrefs.xml"))
-                .unwrap_or_default();
+            let prefs_xml = std::fs::read_to_string(dir.join("cd_image/gui/Default/CharPrefs.xml")).unwrap_or_default();
             let prefs = ControlPrefs::from_xml(&prefs_xml);
-            let mut camera = Camera3p::new(
-                &prefs,
-                avatar.head_height().unwrap_or(camera::MIN_PIVOT_HEIGHT),
-            );
+            let mut camera = Camera3p::new(&prefs, avatar.head_height().unwrap_or(camera::MIN_PIVOT_HEIGHT));
             // scripted views (Shift/Ctrl+F8): only playfields that have camera attractors need the zone locator
-            let zones = zone_locator(&store, playfield)
-                .map_err(|e| eprintln!("zone locator {playfield}: {e:#}"))
-                .ok()
-                .map(Rc::new);
+            let zones = zone_locator(&store, playfield).map_err(|e| eprintln!("zone locator {playfield}: {e:#}")).ok().map(Rc::new);
             match (camera_views(&store, playfield), &zones) {
                 (Ok(v), Some(l)) if !v.is_empty() => {
                     let l = l.clone();
@@ -204,11 +185,7 @@ impl Player {
     }
 
     /// The shared key binding table (`options/keys.rs`) changed: movement, camera, combat and pick-up keys follow at once.
-    pub fn set_keys(
-        &mut self,
-        b: &super::options::keys::Bindings,
-        f: &super::options::keys::FixedKeys,
-    ) {
+    pub fn set_keys(&mut self, b: &super::options::keys::Bindings, f: &super::options::keys::FixedKeys) {
         self.controls.set_keys(b, f);
     }
 
@@ -294,9 +271,7 @@ impl Player {
         if !std::mem::replace(&mut self.doors_synced, true) {
             zone.world.resync_doors(); // doors that changed before this collision world existed
         }
-        let Some(c) = self.collision.as_mut() else {
-            return;
-        };
+        let Some(c) = self.collision.as_mut() else { return };
         for (pos, open, passable) in zone.world.take_door_rooms() {
             set_door(c, pos, open, passable);
         }
@@ -308,13 +283,7 @@ impl Player {
     /// `TeleportTrier_t` (`Zone::start_teleport_try`, which the flow turns into `TeleportStartedMessage`) and `StartTryingTeleport`'s
     /// `FUN_10059ae5(1)` (full stop while moving). The trier then runs for 30 s waiting for the server's `n3TeleportIIR_t`.
     fn teleport_try(&mut self, dt: f32, zone: &mut Zone) {
-        if zone.trier.is_none()
-            && self.teleport_gate(zone)
-            && self
-                .collision
-                .as_ref()
-                .is_some_and(|c| c.in_teleportal(flip(self.movement.pos())))
-        {
+        if zone.trier.is_none() && self.teleport_gate(zone) && self.collision.as_ref().is_some_and(|c| c.in_teleportal(flip(self.movement.pos()))) {
             self.movement.action(mv::SYNC, self.clock);
             zone.start_teleport_try();
             self.movement.stop_if_moving();
@@ -337,9 +306,7 @@ impl Player {
 
     /// The point `to` is visible from `from` (no collision geometry in between): effects of occluded dynels are hidden by the depth test.
     pub fn line_clear(&self, from: [f32; 3], to: [f32; 3]) -> bool {
-        self.collision
-            .as_ref()
-            .is_none_or(|c| segment_clear(c, from, to))
+        self.collision.as_ref().is_none_or(|c| segment_clear(c, from, to))
     }
 
     /// CTRL / ALT held (mouse clicks do not carry modifiers).
@@ -419,13 +386,7 @@ impl Player {
     }
 
     /// One frame: advance the movement, return the `CharDCMove` frames to send, place avatar + camera.
-    pub fn frame(
-        &mut self,
-        dt: f32,
-        host: &mut Host,
-        zone: &mut Zone,
-        text_input: bool,
-    ) -> Vec<Frame> {
+    pub fn frame(&mut self, dt: f32, host: &mut Host, zone: &mut Zone, text_input: bool) -> Vec<Frame> {
         self.clock += dt;
         self.controls.set_text_input(text_input);
         host.look = self.controls.mouse_capture();
@@ -458,33 +419,20 @@ impl Player {
             if self.follow_gated() {
                 self.movement.drop_chase();
             } else {
-                let p = if t == self.char_id as i32 {
-                    Some(self.movement.pos())
-                } else {
-                    zone.dynels.get(&t).map(|d| d.pos)
-                };
+                let p = if t == self.char_id as i32 { Some(self.movement.pos()) } else { zone.dynels.get(&t).map(|d| d.pos) };
                 self.movement.set_chase_pos(p);
             }
         }
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
         }
-        if let Some(z) = self
-            .zones
-            .as_ref()
-            .and_then(|l| l.zone_at(flip(self.movement.pos())))
-        {
+        if let Some(z) = self.zones.as_ref().and_then(|l| l.zone_at(flip(self.movement.pos()))) {
             self.movement.zone_instance(z as u32);
         }
         self.door_rooms(zone);
         self.teleport_try(dt, zone);
         let world = Ground(self.collision.as_ref());
-        let out: Vec<Frame> = self
-            .movement
-            .update(dt, &world)
-            .iter()
-            .map(|m| n3_frame(0, self.char_id, char_dc_move(self.char_id as i32, m)))
-            .collect();
+        let out: Vec<Frame> = self.movement.update(dt, &world).iter().map(|m| n3_frame(0, self.char_id, char_dc_move(self.char_id as i32, m))).collect();
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
         }
@@ -504,31 +452,19 @@ impl Player {
             }
         }
         // emotes and swings end with their clip or when the character moves; a death clip holds until `stand`
-        if self
-            .transient
-            .as_ref()
-            .is_some_and(|(_, hold)| !hold && (moving || self.avatar.finished()))
-        {
+        if self.transient.as_ref().is_some_and(|(_, hold)| !hold && (moving || self.avatar.finished())) {
             self.transient = None;
         }
         let pose = match &self.transient {
             Some((r, _)) => AvatarPose::still(r.clone()),
-            None if moving => AvatarPose {
-                role,
-                speed: self.movement.max_speed(),
-                ref_speed: self.movement.ref_speed(),
-            },
+            None if moving => AvatarPose { role, speed: self.movement.max_speed(), ref_speed: self.movement.ref_speed() },
             None if self.fighting && role == Role::Idle => AvatarPose::still(Role::IdleCombat),
             None => AvatarPose::still(role),
         };
-        self.avatar
-            .set_stance(zone.world.wielded_set(self.char_id as i32));
-        self.avatar
-            .set_swing_delay(self.transient.as_ref().and(self.swing_delay));
-        self.avatar
-            .set_swinging(self.transient.is_some() && self.swinging);
-        self.avatar
-            .set_clip_scale(self.transient.as_ref().and(self.clip_scale));
+        self.avatar.set_stance(zone.world.wielded_set(self.char_id as i32));
+        self.avatar.set_swing_delay(self.transient.as_ref().and(self.swing_delay));
+        self.avatar.set_swinging(self.transient.is_some() && self.swinging);
+        self.avatar.set_clip_scale(self.transient.as_ref().and(self.clip_scale));
         if let Err(e) = self.avatar.set_pose(&self.store, pose) {
             eprintln!("avatar pose: {e:#}");
         }
@@ -542,16 +478,7 @@ impl Player {
         let clear = |a: [f32; 3], b: [f32; 3]| col.is_none_or(|c| segment_clear(c, a, b));
         let closed = |a: [f32; 3], b: [f32; 3]| col.is_some_and(|c| door_closed(c, a, b));
         let ground = |p: [f32; 3]| col.and_then(|c| c.ground(p));
-        host.camera = self.camera.update_with(
-            scene_pos(pos),
-            yaw,
-            dt,
-            &Sight {
-                clear: &clear,
-                door_closed: &closed,
-                ground: &ground,
-            },
-        );
+        host.camera = self.camera.update_with(scene_pos(pos), yaw, dt, &Sight { clear: &clear, door_closed: &closed, ground: &ground });
         if !self.lens_set {
             // FOV 90 degrees horizontal, near 0.2 (`VisualCamera_t`, docs/zone/camera.md); far = `ViewDistance` * 1000 m (`FUN_1001fc91`)
             let mut lens = camera::lens(host.lens.unwrap_or(zone.world.lens));
@@ -560,8 +487,7 @@ impl Player {
             self.lens_set = true;
         }
         if !self.model_sent {
-            host.actor_models
-                .push((avatar::MODEL_KEY, self.avatar.model().clone()));
+            host.actor_models.push((avatar::MODEL_KEY, self.avatar.model().clone()));
             self.model_sent = true;
         }
         // `VisualCATMesh_t::RunFunction` -> `RefreshAlpha`: opacity from the camera <-> head attractor distance (own character only)
@@ -596,11 +522,7 @@ impl Player {
     fn apply_own_events(&mut self, zone: &mut Zone) {
         for e in std::mem::take(&mut zone.own_events) {
             match e {
-                OwnEvent::Place {
-                    pos,
-                    yaw,
-                    full_reset,
-                } => {
+                OwnEvent::Place { pos, yaw, full_reset } => {
                     if full_reset {
                         self.movement.teleport(pos, yaw);
                     } else {
@@ -609,12 +531,7 @@ impl Player {
                 }
                 OwnEvent::SetPos { pos, stop } => self.movement.set_pos(pos, stop),
                 OwnEvent::Impulse { delta, time } => self.movement.impulse(delta, time),
-                OwnEvent::Follow {
-                    mode: m,
-                    target,
-                    pos,
-                    path,
-                } => {
+                OwnEvent::Follow { mode: m, target, pos, path } => {
                     self.movement.follow_place(pos);
                     if !self.follow_gated() {
                         self.movement.follow_target(m, &path, target);
@@ -658,12 +575,10 @@ impl Player {
                         f.update(&u);
                     }
                 }
-                OwnEvent::Appearance(appearance) => {
-                    match self.avatar.set_appearance(&self.store, &appearance) {
-                        Ok(changed) => self.model_sent &= !changed, // the next frame uploads the rebuilt model again
-                        Err(e) => eprintln!("avatar appearance: {e:#}"),
-                    }
-                }
+                OwnEvent::Appearance(appearance) => match self.avatar.set_appearance(&self.store, &appearance) {
+                    Ok(changed) => self.model_sent &= !changed, // the next frame uploads the rebuilt model again
+                    Err(e) => eprintln!("avatar appearance: {e:#}"),
+                },
             }
         }
     }
@@ -710,11 +625,7 @@ impl Player {
 /// `n3Playfield_t::LineOfSight` (N3 0x1000d34c) tests both directions against
 /// front-face surface lines, including sloping rock faces, floors and ceilings.
 fn segment_clear(c: &Collision, a: [f32; 3], b: [f32; 3]) -> bool {
-    c.inside(a)
-        && c.inside(b)
-        && !door_closed(c, a, b)
-        && c.line(a, b).is_none()
-        && c.line(b, a).is_none()
+    c.inside(a) && c.inside(b) && !door_closed(c, a, b) && c.line(a, b).is_none() && c.line(b, a).is_none()
 }
 
 #[cfg(test)]
@@ -727,55 +638,28 @@ mod tests {
         // An overhanging rock face has |normal.y| > 0.5: the old sampled wall
         // spheres skip it, and the endpoint ground check never considers ceilings.
         let vertices = [[-3.0, 0.0, 2.8], [3.0, 0.0, 2.8], [0.0, 6.0, -3.2]]
-            .map(|pos| Vertex {
-                pos,
-                ..Default::default()
-            })
-            .to_vec();
+            .map(|pos| Vertex { pos, ..Default::default() }).to_vec();
         let scene = Scene {
-            meshes: vec![Mesh {
-                vertices,
-                submeshes: vec![Submesh::new(vec![0, 2, 1], None)],
-            }],
-            instances: vec![Instance {
-                mesh: 0,
-                transform: IDENTITY,
-            }],
+            meshes: vec![Mesh { vertices, submeshes: vec![Submesh::new(vec![0, 2, 1], None)] }],
+            instances: vec![Instance { mesh: 0, transform: IDENTITY }],
             ..Default::default()
         };
         let collision = Collision::from_scene(&scene);
         let clear = |a, b| segment_clear(&collision, a, b);
         assert!(!clear([0.0, 1.5, 0.0], [0.0, 3.1, 4.8]));
-        assert!(
-            !clear([0.0, 3.1, 4.8], [0.0, 1.5, 0.0]),
-            "visibility must test the reverse ray too"
-        );
+        assert!(!clear([0.0, 3.1, 4.8], [0.0, 1.5, 0.0]), "visibility must test the reverse ray too");
         let mut camera = camera::Camera3p::new(&Default::default(), 1.5);
         let feet = [0.0; 3];
         let pivot = glam::Vec3::new(0.0, 1.5, 0.0);
-        let open = camera.update_with(
-            feet,
-            std::f32::consts::PI,
-            0.016,
-            &Sight::with_clear(&clear),
-        );
+        let open = camera.update_with(feet, std::f32::consts::PI, 0.016, &Sight::with_clear(&clear));
         assert!((open.pos - pivot).length() > 4.99);
         for yaw in [-0.2, 0.0, 0.2] {
             let view = camera.update_with(feet, yaw, 0.016, &Sight::with_clear(&clear));
             assert!((view.pos - pivot).length() < 2.0, "{:?}", view.pos);
             let dir = (view.pos - pivot).normalize();
-            assert!(clear(
-                pivot.to_array(),
-                (view.pos + dir * (camera::COLLISION_RADIUS - camera::DEFAULT_DISTANCE * 0.001))
-                    .to_array()
-            ));
+            assert!(clear(pivot.to_array(), (view.pos + dir * (camera::COLLISION_RADIUS - camera::DEFAULT_DISTANCE * 0.001)).to_array()));
         }
-        let restored = camera.update_with(
-            feet,
-            std::f32::consts::PI,
-            0.016,
-            &Sight::with_clear(&clear),
-        );
+        let restored = camera.update_with(feet, std::f32::consts::PI, 0.016, &Sight::with_clear(&clear));
         assert!((restored.pos - pivot).length() > 4.99);
     }
 
@@ -783,28 +667,14 @@ mod tests {
     #[test]
     #[ignore = "requires a measured ICC rock position and an output directory"]
     fn icc_rock_camera_turn_frames() {
-        let pos: Vec<f32> = std::env::var("AOMAC_CAMERA_ROCK_POS")
-            .expect("server x,y,z position")
-            .split(',')
-            .map(|v| v.parse::<f32>().unwrap())
-            .collect();
-        assert!(
-            pos.len() == 3 && pos.iter().all(|v| v.is_finite()),
-            "server x,y,z position"
-        );
-        let out = std::path::PathBuf::from(
-            std::env::var("AOMAC_CAMERA_ROCK_SHOTS").expect("frame output directory"),
-        );
+        let pos: Vec<f32> = std::env::var("AOMAC_CAMERA_ROCK_POS").expect("server x,y,z position")
+            .split(',').map(|v| v.parse::<f32>().unwrap()).collect();
+        assert!(pos.len() == 3 && pos.iter().all(|v| v.is_finite()), "server x,y,z position");
+        let out = std::path::PathBuf::from(std::env::var("AOMAC_CAMERA_ROCK_SHOTS").expect("frame output directory"));
         std::fs::create_dir_all(&out).unwrap();
         let dir = ao_gui::client_dir();
         let store = RecordStore::open(&dir).unwrap();
-        let scene = ao_formats::playfield::load_playfield_at(
-            &store,
-            &dir,
-            4582,
-            ao_formats::playfield::DEFAULT_DAY_TIME,
-        )
-        .unwrap();
+        let scene = ao_formats::playfield::load_playfield_at(&store, &dir, 4582, ao_formats::playfield::DEFAULT_DAY_TIME).unwrap();
         let collision = Collision::load(&store, 4582).unwrap();
         let feet = [pos[0], pos[1], -pos[2]];
         let pivot = glam::Vec3::from(feet) + glam::Vec3::Y * 1.5;
@@ -817,33 +687,11 @@ mod tests {
             let distance = (view.pos - pivot).length();
             pulled += usize::from(distance < camera::DEFAULT_DISTANCE - 0.01);
             let dir = (view.pos - pivot).normalize();
-            assert!(
-                clear(
-                    pivot.to_array(),
-                    (view.pos
-                        + dir * (camera::COLLISION_RADIUS - camera::DEFAULT_DISTANCE * 0.001))
-                        .to_array()
-                ),
-                "heading {i}: pivot or boom is blocked beyond the original bisection tolerance"
-            );
-            eprintln!(
-                "ICC camera heading {i}: eye {:?}, boom {distance:.4}",
-                view.pos
-            );
-            ao_render::render_to_png(
-                &scene,
-                view.pos.to_array(),
-                pivot.to_array(),
-                1200,
-                700,
-                &out.join(format!("icc-rock-{i:02}.png")),
-            )
-            .unwrap();
+            assert!(clear(pivot.to_array(), (view.pos + dir * (camera::COLLISION_RADIUS - camera::DEFAULT_DISTANCE * 0.001)).to_array()), "heading {i}: pivot or boom is blocked beyond the original bisection tolerance");
+            eprintln!("ICC camera heading {i}: eye {:?}, boom {distance:.4}", view.pos);
+            ao_render::render_to_png(&scene, view.pos.to_array(), pivot.to_array(), 1200, 700, &out.join(format!("icc-rock-{i:02}.png"))).unwrap();
         }
-        assert!(
-            pulled > 0,
-            "the supplied ICC position never exercises collision pull-in"
-        );
+        assert!(pulled > 0, "the supplied ICC position never exercises collision pull-in");
     }
 
     /// Real data (skips without the client): the door of ICC Holodeck Alien Training (6131) found by its position opens / locks its room link.
@@ -855,17 +703,10 @@ mod tests {
         }
         let store = RecordStore::open(&dir).unwrap();
         let mut c = Collision::load(&store, 6131).unwrap();
-        let s = ao_formats::playfield::load_playfield(&store, &dir, 6131)
-            .unwrap()
-            .spawn
-            .unwrap();
+        let s = ao_formats::playfield::load_playfield(&store, &dir, 6131).unwrap().spawn.unwrap();
         let (pos, (a, b)) = (-300..=300)
             .flat_map(|x| (-300..=300).map(move |z| [s[0] + x as f32, s[1], s[2] + z as f32]))
-            .find_map(|p| {
-                c.door_link_from_pos(p)
-                    .filter(|l| l.1 != 0xffff)
-                    .map(|l| (p, l))
-            })
+            .find_map(|p| c.door_link_from_pos(p).filter(|l| l.1 != 0xffff).map(|l| (p, l)))
             .expect("the playfield has a door");
         let (au, bu) = (a as usize, b as usize);
         assert!(!c.door_open_between(au, bu) && c.room_transition_allowed(a as i32, b as i32));
