@@ -686,8 +686,8 @@ impl HudTarget {
 }
 
 /// `TargetHealthBar_c` surfaces (`FUN_10073598`, `FUN_10072ead`): caps at both ends tinted DEFAULT, the background between them
-/// (DEFAULT) and the slider over the background up to `ratio` of its width; the slider texture (16 px) repeats along the bar (its
-/// source frame is the destination size). Red caps require attacking `+0x161` and in-attack-range `+0x162`,
+/// (DEFAULT) and the slider over the background up to `ratio` of its width. Both 16×11 textures tile (Load flag 0x10);
+/// source rectangles must stay inside each atlas entry. Red caps require attacking `+0x161` and in-attack-range `+0x162`,
 /// delivered by `FUN_1007353f` from `GlobalSignals+0x64` (GC 0x10068969 / 0x100679c1).
 /// The port lacks the slot's effective attack range and both retail collision radii; caps retain DEFAULT rather than guessing.
 fn bar_items(width: i32, ratio: f32, color: u32, out: &mut Vec<ao_gui::view::CanvasItem>) {
@@ -699,13 +699,38 @@ fn bar_items(width: i32, ratio: f32, color: u32, out: &mut Vec<ao_gui::view::Can
     out.push(ImageTint { id: GfxId(HB_LEFT), src: [0.0, 0.0, cap_w, h], dst: [0.0, 0.0, cap_w, h], color: default, alpha: 1.0 });
     out.push(ImageTint { id: GfxId(HB_RIGHT), src: [0.0, 0.0, cap_w, h], dst: [w - cap_w, 0.0, w, h], color: default, alpha: 1.0 });
     let (l, r) = (cap_w + 1.0, w - cap_w - 1.0);
-    out.push(ImageTint { id: GfxId(HB_BACKGROUND), src: [0.0, 0.0, r - l, h], dst: [l, 0.0, r, h], color: default, alpha: 1.0 });
-    let fill = (r - l) * ratio;
-    let mut x = 0.0;
-    while x < fill {
-        let tw = (fill - x).min(16.0);
-        out.push(ImageTint { id: GfxId(HB_SLIDER), src: [0.0, 0.0, tw, h], dst: [l + x, 0.0, l + x + tw, h], color, alpha: 1.0 });
-        x += 16.0;
+    for (id, length, tint) in [(HB_BACKGROUND, r - l, default), (HB_SLIDER, (r - l) * ratio, color)] {
+        let mut x = 0.0;
+        while x < length {
+            let tw = (length - x).min(16.0);
+            out.push(ImageTint { id: GfxId(id), src: [0.0, 0.0, tw, h], dst: [l + x, 0.0, l + x + tw, h], color: tint, alpha: 1.0 });
+            x += 16.0;
+        }
+    }
+}
+
+#[test]
+fn health_bar_tiles_stay_inside_the_atlas_entry() {
+    use ao_gui::view::CanvasItem::ImageTint;
+    for ratio in [1.0, 0.5, 0.1, 0.0] {
+        let mut items = Vec::new();
+        bar_items(100, ratio, 0xffffff, &mut items);
+        for (id, length) in [(HB_BACKGROUND, 80.0), (HB_SLIDER, 80.0 * ratio)] {
+            let mut edge = 10.0;
+            for item in &items {
+                if let ImageTint { id: gfx, src, dst, .. } = item {
+                    if gfx.0 == id {
+                        assert_eq!(src[0..2], [0.0, 0.0]);
+                        assert!(src[2] > 0.0 && src[2] <= 16.0);
+                        assert_eq!(src[3], 11.0);
+                        assert_eq!(dst[0], edge, "tiles must meet without gaps");
+                        assert_eq!(dst[2] - dst[0], src[2]);
+                        edge = dst[2];
+                    }
+                }
+            }
+            assert_eq!(edge, 10.0 + length);
+        }
     }
 }
 
