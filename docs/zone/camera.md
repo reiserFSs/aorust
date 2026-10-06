@@ -176,9 +176,10 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
 
 ## 6. Not resolved
 
-* `UseNoBobCamera` smoothing, the horizontal part of the head attractor (x/z), `CameraVehicle_t` sensor steering (`UpdateSensors`,
-  `CalculateSensorSteerDir`, `FUN_1002046f`), the lateral avoidance branch of `SteeringCamArrive` and the second chase branch of
-  `CameraVehicle_t::CalcSteering` (flags `+0x1cc/+0x1cd`, never found set), `Vehicle_t`'s integration substep (`+0x104`).
+* `UseNoBobCamera` smoothing, the horizontal part of the head attractor (x/z).
+* Mode 1/2 wheel / key zoom: the client zooms them through `CameraVehicle_t::Forward` → `ZoomSteer` [N3 0x1001db64] (`SteeringSeek` along the line to the look target, stops at 0.7 m / 25 m)
+  and a `ForcedUpdate` at the end; `Camera3p` stores the resulting chase distance directly [INFERENCE] (`zoom_in_by`). The `+0x1a4` direct control and the `Turn` / `Strafe` / `MoveUp` inputs
+  (`CalcLateralSteering` [0x1001e0ae]) are never set by anything reachable (`+0x1a4` only ever 0; no caller of `Turn`/`Strafe`/`MoveUp` besides the n3Camera's own flags): not ported.
 * The movement-state values 3/4/7/8 used by `N3Msg_MouseMovement` (3 = turning left, 4 = turning right by the keys, 7 = jump, 8 = sitting; from the branch
   structure), `N3Msg_EndMouseLook`, `FUN_1006ed98`/`FUN_10070506` (movement controller state getters, Gamecode).
 
@@ -192,15 +193,27 @@ attractor), `+0x204 = 0` (drop the pending wheel zoom) and, unless first person 
 index 0 wraps to the last) and calls `CameraVehicle_t::SetCameraAttractor(list[i])`; an empty list clears it. **The attractor only steers
 mode 1**: `CameraVehicle_t::CalcSteering` [N3 0x1001e797] branches on `+0x1a0` (`attractor->vtbl[1]` = `FUN_10023ab1` = `SteeringArrive(attractor.pos, 0.1)`), while
 `CameraVehicleFixedThird_t::CalcSteering` [0x1001f752] (modes 2, 3) never reads it. The camera keeps looking at the look target (`SetEyeTargetLocalPos`).
-When the index is -1 (after a list change) the code would index at -2: `Views::prev` steps from "none" like from index 0 [INFERENCE].
+**From no selection** (index `-1`, set whenever the list changes until the automatic pick of `FUN_10021921` runs) the client decrements to `-2` and reads `list[-2]`, i.e. 24 bytes before the
+vector's storage: undefined. `Views::prev` answers like the automatic pick (entry 0, the best one) so the key works from nothing selected, then steps back with the wrap as above;
+without a list entry it clears the attractor like the client. Ctrl+F8 drops the attractor but keeps the index, so Shift+F8 afterwards steps from the old index (as in the client).
 
 **The list** (`FUN_100220bb`, rebuilt every 10th frame by `FUN_10022345` unless `+0x228`): the attractors of the character's zone and its
-neighbours (`CellSpaceBase_t::GenerateNeighborList(zone, out, 1)`, a virtual of the playfield's cell space; implemented as the 8-neighbourhood / door-connected
-rooms [INFERENCE], `CameraViews::neighbours`) whose score (`PointCameraAttractor_t` vtbl+0xc `FUN_10023c8a`, from the character's feet + 1 m) is below 100000, sorted ascending.
+neighbours (**`CellSpaceBase_t::GenerateNeighborList(zone, out, 1)` [Vehicle.dll 0x10002d9f] is a thunk to the cell space's vtable `+0x8c`, resolved [RE]**:
+outdoors `GridSpace_t` (built by `PlayfieldAnarchy_t::InitialiseOutdoorSpace` [GC 0x10121b4f], width = `GetNumZonesInX`) `MakeNeighborList` [VEH 0x10003f69]: `zone < nx · ny`, the rectangle
+of zones within `radius` = 1 of `(col, row)` clamped to the grid, row-major, at most 49 entries; in a dungeon `n3RoomSpace_t` : `RoomSpace_t::MakeNeighborList` [VEH 0x10007968] (radius ignored): the room's
+own list (its door-connected rooms `GetDoorConnectZone` plus itself, sorted: `n3Playfield_t::UpdateRoomSpace` [N3 0x1000d9d8] → `RoomSpace_t::AddRoom` [VEH 0x10007acf]) and, for every
+entry, that entry's list, sorted and made unique, at most 49; a room outside the table gives nothing. `CameraViews::neighbours`, tests `grid_neighbours_stay_inside_the_map`,
+`room_neighbours_are_the_door_rooms_and_theirs`, real-data `real_neighbour_lists_follow_the_cell_space`) whose score (`PointCameraAttractor_t` vtbl+0xc `FUN_10023c8a`, from the character's feet + 1 m) is below 100000, sorted ascending.
 Score = distance; 10000 when < 0.5 m horizontally away; + 1000 per metre the authored target is beyond `range`; + 100 when the attractor lies in the direction of the
 camera's current spot (dot > 0.9); + 50 when that spot is in the clear and the character lies beyond it; + 10000 below y = 0.1. Not a candidate: disabled
-(`range ≥ 2.0` sets byte `+0x30`, `FUN_10023bbb`), line of sight attractor → character blocked (`FUN_10023bfc`; its closed-door room test is not applied: doors count as open).
-With no index (-1) and none selected for `+0x224` = 1.2 s since the last automatic pick (`+0x220` starts at 20 s) `FUN_10021921` selects entry 0 on its own. `Views::tick`, `Views::prev`.
+(`range ≥ 2.0` sets byte `+0x30`, `FUN_10023bbb`), or `FUN_10023bfc` [N3 0x10023bfc] says no: **closed door** (`PosToRoom(attractor.pos, -1)` = room `a`, `PosToRoom(point, a)` = room `b`; `a != b` and
+`n3Playfield_t::IsDoorOpenBetweenRooms(a, b)` [0x1000d1e9] false; either room missing, e.g. outdoors, skips the test) or a line of sight attractor → character that is blocked.
+`IsDoorOpenBetweenRooms` reads the flag byte (`+4`) of the entry in the playfield's room-link map (`+0x2c`, key `(min, max)`; entries are created closed by `UpdateRoomSpace`); it is set by
+`n3Playfield_t::DoorOpened` / `DoorClosed` [vtable `+0x3c` / `+0x40`, 0x1000d2bf / 0x1000d2e8] → `ChangeRoomStatus` [0x1000d17e], called through `n3RoomMonitor_t::DoorOpened/DoorClosed` [0x10013561 / 0x10013910] by
+`Door_t`'s open / close (`FUN_1007ef56` / `FUN_1007ef90`, [GC], the door's room link `+0x1d0`). This is **not** `Door_t::CanPass` (movement, `Collision::set_door_passable`): `Collision::set_door_open` /
+`door_open_between` / `pos_to_room` carry it (`camera_views::door_closed`, `Sight::door_closed`). **A dungeon link without a registered door stays closed for the camera forever** (nothing else writes the flag).
+`dynels_doors::Effect::RoomOpened/RoomClosed` must call `set_door_open` (the caller's job, next to `set_door_passable`).
+With no index (-1) and none selected for `+0x224` = 1.2 s since the last automatic pick (`+0x220` starts at 20 s) `FUN_10021921` selects entry 0 on its own (an empty list drops the attractor). `Views::tick`, `Views::prev`.
 
 **Data.** Playfield record (rdb 1000001), per zone / room: `u32 n` (< 1000), n × { vec3 pos, quat rot, vec3 target (version ≥ 6, else = pos), f32 range } =
 `PointCameraAttractor_t` (`+4`, `+0x10`, `+0x20`, `+0x2c`; `RDBPlayfield_t::ReadBlob` [N3 0x1001c115], `n3Room_t` reader 0x10012803), world coordinates.
@@ -209,7 +222,35 @@ pinned by a real-data test; so in retail the scripted views exist in two zones, 
 
 **Vehicle model** (modes 1, 2; `Vehicle_t::SteeringArrive` Vehicle.dll 0x1000ab28, integrator `FUN_1000e3d3`, `UpdateMotionConstraints` [N3 0x1001e602]): mass 20, top speed
 16 (= `min(16, 6 · avatar speed)`, ≥ 2), force limit `mass · v / 0.3`, brake distance `0.3 · v`; desired velocity = towards the target at `min(v, distance / brake · v)`,
-steering force `(desired − velocity) · mass · 4`, stop inside the radius. Mode 3 snaps the vehicle to the optimal spot every frame (`DecideSnap`), mode 2 arrives at it
-(radius 0.01), mode 1 (`CameraVehicle_t`): without an attractor `CalcSteering`'s first branch asks for `target − unit(target − pos) · max(|target − pos|, 0.9)` (`+0x198`, `_DAT_1003e04c`) plus 0.4 m
-while the camera is below the target, i.e. **the camera stays where it is, watches the character, is pushed out to 0.9 m and lifted to the target's height** [RE of the
-branch as decompiled; the sensor steering and the second branch are unresolved, so mode 1 may follow in the retail client in cases not modelled here].
+steering force `(desired − velocity) · mass · 4`, stop inside the radius. **Substep [RE, resolved]**: the `CameraVehicle_t` constructor stores `_DAT_1003df54` = 0.05 in `Vehicle +0x104`; `FUN_1000e3d3`
+integrates in substeps `min(left, 0.05)` and evaluates `CalcSteering` once per substep with `s_vDeltaTimeNow` = the substep (frames over 4 s, `_DAT_10012804`, are skipped). Mode 3 snaps the vehicle to the optimal
+spot every frame (`DecideSnap`), mode 2 arrives at it through `SteeringCamArrive` (radius 0.01).
+
+**`SteeringCamArrive`** [N3 0x1001dc46, modes 1 and 2; ported `Vehicle::cam_arrive_step`, tests `a_hitch_in_the_frame_time_halts_the_camera`,
+`a_wanted_spot_behind_the_look_target_is_swapped_for_one_beside_it`] [RE, resolved]: a function-static running average `a` of the substep time (first call: the substep): a substep
+`h > 10 · a` (`_DAT_1003d140`) halts the camera (`SteeringHalt`); otherwise `a = a/2 + h/2`. With `l` = horizontal vector camera → look target and `t` = horizontal vector camera → wanted spot (both non-zero), `c = |l|`, `d = |t|`:
+if `c < d`, `d > 1`, `|sin| = |(l̂ × t̂).y| < 0.4` (`_DAT_1003d9d0`) and `l̂ · t̂ > 0` (the wanted spot lies behind the character as seen from the camera) the wanted spot is replaced by
+`look + 0.5 · (l.z, 0, −l.x) · (−1 if (l̂ × t̂).y < 0 else 1)` (`_DAT_1003cb20`), a point beside the look target at the character's height, half the camera's horizontal distance away; then `SteeringArrive(spot, 0.01)`.
+(The cross products are those of the client's world, z negated against the scene: the port converts with `ao()`.)
+
+**`CameraVehicle_t::CalcSteering` for mode 1** [N3 0x1001e797, ported `Vehicle::calc_steering`]: **the camera is a chase camera that keeps `+0x198` from the look target**, not "stays put". `+0x198` is 5.0 in the constructor
+(`_DAT_1003d2e8`, every mode swap makes a new vehicle: `FUN_10021859`), set to `|target − pos|` (at least 0.9, `_DAT_1003d3a8`/`_DAT_1003e04c`) by `Update` [0x1001e54f] and to the exact distance by `ForcedUpdate` [0x1001e5ac];
+those run only on events (a never-placed vehicle at x = z = 0 is placed at the camera's own spot in `FUN_10022345`; an orbit `FUN_1002118c` when the vehicle is at rest, speed < 0.02; the end of a zoom; `StopRotate*` / `StopZoom*`;
+`n3Camera_t` first-person `SetRotAngles`), **not every frame**. Order inside `CalcSteering`: attractor (`+0x1a0`) → `SteeringArrive(attractor, 0.1)`; zoom (`+0x1b8`) → `ZoomSteer`; `DoDirectControl` (`+0x1a4`, never non-zero);
+then the wanted spot `look − unit(look − pos) · dist` (the second branch, taken when `+0x1cd` (secondary target set by `SetSecondaryTarget`) **and** `+0x1cc` (two-shot mode), is **dead code**: `FUN_10022345`
+calls `CameraVehicle_t::SetTwoShotMode(false)` every frame [N3 0x100223b2], and nothing else in N3, Gamecode or GUI imports or calls `SetTwoShotMode`; the stay-behind branch at the end (`+0x1e8`, `SetStayBehind` [0x10013cdd], no caller) is cleared
+every frame likewise [0x100223c3]); `UpdateSensors` [0x1001e71f] has run before (mode 1 only, `FUN_10022345` @0x1002245b): **line of sight camera → look target blocked** (`+0x1bc` = 0): the sensor's steer direction `+0x1c0..0x1c8`
+is added to the spot; **clear** (`+0x1bc` = 1): `GetSurface()` (the playfield's `Surface_i`, `VetoPosition` + `CalculateClosestPoint`, docs/zone/collision.md §3) gives the ground below the camera and a camera less than 0.4 m above it
+(`_DAT_1003d9d0`) lifts the spot by 0.4 (`ground` of `Sight`); in every case a camera below the look target lifts the spot by another 0.4. Then `SteeringCamArrive(spot, 0.01)`.
+
+**Sensor steering** [N3 0x1001d955 `CalculateSensorSteerDir`, 0x1001d8c6 `CanSeeFlexedPos`; ported `Vehicle::steer_to_view`, tests `the_sensors_steer_round_an_obstacle_to_the_nearest_view`,
+`the_left_probe_wins_when_only_it_sees_the_target`] [RE, resolved]: when blocked, for the distances `f` = 0.5, 2, 8, 32 m (`(1 << i) · 0.5`, i = 0, 2, 4, 6) and in this order the directions right, left, up, down, forward, back
+(of the camera: forward = `VetoForward` = unit(look − pos), up = `VetoUpAlignment` = world up with the forward component removed, right = up × forward in the client's world; the camera's rotation is the one it is steered to) the first
+direction `d` for which `CanSeeFlexedPos` holds becomes the steer vector (unit length, **not** scaled by `f`): the probe point `P = pos + d · f` and the segment `P − 0.5 · d → look target` is clear **and** `pos → P` is clear.
+No direction at any distance: `+0x1e9` (`IsBlind`) = 1 and the steer is 0.
+
+**Blind camera** [`FUN_10022345` @0x100224ca…, `ReposCutOnAxis` N3 0x1001e27e; ported `Camera3p::update_with` + `Vehicle::cut_on_axis`, tests `a_camera_blind_for_1_5_s_is_cut_to_the_far_side_of_the_target`,
+`the_cut_picks_the_side_the_character_faces_away_from`]: `n3Camera_t +0x178` counts the seconds with `+0x1e9` set (frames < 0.3 s only); above 1.5 s (`_DAT_1003caf8`) `ReposCutOnAxis(0)` runs and the counter resets. With no attractor and a
+zero axis it halts the camera and places it at `look + R · unit(w) · dist`, `w = (2 tx, |2 ty|, 2 tz)` with `t = look − pos` (the line through the character, always above it), `R` the rotation about the vertical by ±0.541 rad (`_DAT_1003e048`,
++ when `(facing × t).y < 0`, `facing` = the character's forward) and tries up to 10 times: the spot is accepted when the line `look → spot + unit(v)` is clear; else `dist` halves, and the loop also ends when `dist ≤ 0.8` (`_DAT_1003e038`).
+(`w = 0` uses `unit(0, 1, −1.3)`, `_DAT_1003e040`.) A mode swap calls `ReposCutOnAxis(n3Camera + 0x1f4)`, i.e. the new vehicle appears at look target + the stored offset (= where the old camera was).

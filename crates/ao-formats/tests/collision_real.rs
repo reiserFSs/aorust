@@ -199,14 +199,16 @@ fn collision_door_links_are_found_by_door_position() {
     for x in -300..=300 {
         for z in -300..=300 {
             if let Some((a, b)) = c.door_link_from_pos([s[0] + x as f32, s[1], s[2] + z as f32]) {
-                found.insert((a.min(b), a.max(b)));
                 hits += 1;
+                if b != 0xffff {
+                    found.insert((a.min(b), a.max(b))); // a door entry may lead nowhere (0xffff)
+                }
             }
         }
     }
     eprintln!("6131 door links found {found:?} ({hits} lattice hits), links {:?}", c.room_links());
     let links: std::collections::BTreeSet<_> = c.room_links().into_iter().collect();
-    assert!(!found.is_empty() && found.is_subset(&links), "found {found:?} links {links:?}");
+    assert!(found == links, "found {found:?} links {links:?}");
     assert!(hits < 600 * 600 / 50, "doors are small: {hits} of the lattice points match");
 }
 

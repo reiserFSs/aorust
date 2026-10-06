@@ -1,9 +1,41 @@
 //! Scripted camera views: the playfield's `PointCameraAttractor_t` list as the client ranks, selects and steps through it
 //! (`n3Camera_t` @N3 0x10020faa / 0x10021921 / `FUN_100220bb`, `PointCameraAttractor_t` vtable 0x1003e4f4). Everything is in
-//! scene space (z negated); evidence and the unresolved parts: docs/zone/camera.md §6.
+//! scene space (z negated); evidence and the unresolved parts: docs/zone/camera.md §7.
 
+use ao_formats::playfield::collision::Collision;
 use ao_formats::playfield::{CameraAttractor, CameraViews};
 use ao_render::Vec3;
+
+/// What the camera asks of the world (scene space). `clear` is `n3Playfield_t::LineOfSight`, `door_closed` the room test of
+/// `PointCameraAttractor_t::IsVisible` (`FUN_10023bfc` @N3 0x10023bfc), `ground` the height the surface reports under a point
+/// (`Surface_i::VetoPosition` + `CalculateClosestPoint`, the `GetSurface` queries of `CameraVehicle_t::CalcSteering`).
+#[derive(Clone, Copy)]
+pub struct Sight<'a> {
+    pub clear: &'a dyn Fn([f32; 3], [f32; 3]) -> bool,
+    /// `(attractor, point)`: the two lie in different rooms whose connecting door is not open.
+    pub door_closed: &'a dyn Fn([f32; 3], [f32; 3]) -> bool,
+    pub ground: &'a dyn Fn([f32; 3]) -> Option<f32>,
+}
+
+impl Sight<'static> {
+    /// Nothing in the way, no rooms, no ground.
+    pub const OPEN: Sight<'static> = Sight { clear: &|_, _| true, door_closed: &|_, _| false, ground: &|_| None };
+}
+
+impl<'a> Sight<'a> {
+    /// Only the line of sight is known.
+    pub fn with_clear(clear: &'a dyn Fn([f32; 3], [f32; 3]) -> bool) -> Self {
+        Sight { clear, ..Sight::OPEN }
+    }
+}
+
+/// `FUN_10023bfc` room part: `PosToRoom(attractor, -1)`, `PosToRoom(point, room)`; different rooms need an open door
+/// (`IsDoorOpenBetweenRooms`). No room for either (outdoors, outside every room) = no door test.
+pub fn door_closed(c: &Collision, attractor: [f32; 3], p: [f32; 3]) -> bool {
+    let Some(a) = c.pos_to_room(attractor, None) else { return false };
+    let Some(b) = c.pos_to_room(p, Some(a)) else { return false };
+    a != b && !c.door_open_between(a, b)
+}
 
 /// The list is rebuilt every 10th frame (`DAT_1005c040` reset to 10 in `FUN_10022345` @N3 0x10022345); 60 Hz equivalent.
 const LIST_PERIOD: f32 = 10.0 / 60.0;
@@ -75,11 +107,12 @@ impl Views {
     /// better: the distance to the point, +10000 straight above/below it (< 0.5 m horizontally), +1000 per metre its authored
     /// target is farther than `range`, +100 when it lies in the direction of the camera's current spot (dot > 0.9), +50 when
     /// that spot is in the clear and the point lies beyond it, +10000 below y = 0.1.
-    fn score(a: &CameraAttractor, p: Vec3, guide: Vec3, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) -> Option<f32> {
-        // `+0x30`: disabled; the closed-door room test of `FUN_10023bfc` is not applied (doors count as open), the line of
-        // sight is: `Space_i +0xc` reports a collision.
+    fn score(a: &CameraAttractor, p: Vec3, guide: Vec3, sight: &Sight) -> Option<f32> {
+        // `+0x30`: disabled; then `FUN_10023bfc`: attractor and point in different rooms behind a closed door, or the line of
+        // sight is hit (`Space_i +0xc` reports a collision).
         let pos = flip(a.pos);
-        if a.disabled() || !clear(pos.to_array(), p.to_array()) {
+        let clear = sight.clear;
+        if a.disabled() || (sight.door_closed)(pos.to_array(), p.to_array()) || !clear(pos.to_array(), p.to_array()) {
             return None;
         }
         let d = (pos - p).length();
@@ -95,7 +128,7 @@ impl Views {
             if g.normalize().dot(to_player.normalize_or_zero()) > 0.9 {
                 s += 100.0;
             }
-            if clear(pos.to_array(), guide.to_array()) && (p - guide).dot(g) * g.dot(to_player) < 0.0 {
+            if (sight.clear)(pos.to_array(), guide.to_array()) && (p - guide).dot(g) * g.dot(to_player) < 0.0 {
                 s += 50.0;
             }
         }
@@ -106,12 +139,12 @@ impl Views {
     }
 
     /// `FUN_100220bb`: rank the attractors of the character's zone and its neighbours, best first.
-    fn refresh(&mut self, player: Vec3, guide: Vec3, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) {
+    fn refresh(&mut self, player: Vec3, guide: Vec3, sight: &Sight) {
         let p = player + Vec3::Y * EYE;
         let mut list = Vec::new();
         for zone in self.data.neighbours((self.zone_of)(player.to_array())) {
             for (index, a) in self.data.attractors.get(zone).into_iter().flatten().enumerate() {
-                if let Some(score) = Self::score(a, p, guide, clear).filter(|s| *s < MAX_SCORE) {
+                if let Some(score) = Self::score(a, p, guide, sight).filter(|s| *s < MAX_SCORE) {
                     list.push(Entry { zone, index, score });
                 }
             }
@@ -127,11 +160,13 @@ impl Views {
         }
     }
 
-    /// `FUN_10021921`: select the best entry. Returns whether the selection changed.
+    /// `FUN_10021921`: select the best entry (`list[0]`, index 0) or, with an empty list, drop the attractor. Returns what
+    /// `CameraVehicle_t::SetCameraAttractor` returns: whether the selection changed.
     fn select_first(&mut self) -> bool {
-        let Some(&e) = self.list.first() else { return false };
-        let v = self.view(e);
-        self.index = Some(0);
+        let v = self.list.first().and_then(|&e| self.view(e));
+        if v.is_some() {
+            self.index = Some(0);
+        }
         let changed = v != self.selected;
         self.selected = v;
         changed
@@ -139,7 +174,7 @@ impl Views {
 
     /// Per-frame part of `FUN_10022345`: every 10th frame rebuild the list and, while nothing is selected by index, pick the
     /// best entry once the wait is over. `player` = feet (scene), `guide` = where the camera is (`GetCameraAttractorGuidePos`).
-    pub fn tick(&mut self, dt: f32, player: Vec3, guide: Vec3, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) {
+    pub fn tick(&mut self, dt: f32, player: Vec3, guide: Vec3, sight: &Sight) {
         self.timer += dt;
         self.clock += dt;
         if self.clock < LIST_PERIOD {
@@ -147,7 +182,7 @@ impl Views {
         }
         self.clock -= LIST_PERIOD;
         if !self.hold {
-            self.refresh(player, guide, clear);
+            self.refresh(player, guide, sight);
         }
         if self.index.is_none() {
             if self.timer <= self.delay {
@@ -162,18 +197,21 @@ impl Views {
         }
     }
 
-    /// Shift+F8 (`n3Camera_t::GetPreviousVisibleAttractor`): step back through the list, wrapping from the first entry to the
-    /// last. An empty list clears the selection. [INFERENCE] "no index" (-1) steps like index 0: the client would index at -2.
-    pub fn prev(&mut self, player: Vec3, guide: Vec3, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) {
+    /// Shift+F8 (`n3Camera_t::GetPreviousVisibleAttractor` @0x10020faa): step the index back through the list, wrapping from
+    /// the first entry to the last; an empty list drops the attractor. With no index (-1, the list changed and the automatic
+    /// pick of `FUN_10021921` has not run yet) the client would read `list[-2]`, i.e. garbage before the vector; the port
+    /// answers like the automatic pick does (`select_first`: entry 0) so the key works from no selection.
+    pub fn prev(&mut self, player: Vec3, guide: Vec3, sight: &Sight) {
         if self.list.is_empty() {
-            self.refresh(player, guide, clear);
+            self.refresh(player, guide, sight);
         }
         let Some(last) = self.list.len().checked_sub(1) else {
             self.selected = None;
             return;
         };
         let i = match self.index {
-            None | Some(0) => last,
+            None => 0,
+            Some(0) => last,
             Some(i) => i - 1,
         };
         self.index = Some(i);
@@ -194,7 +232,7 @@ mod tests {
         Views::new(CameraViews::new(vec![list], None, vec![]), Box::new(|_| 0))
     }
 
-    const CLEAR: &dyn Fn([f32; 3], [f32; 3]) -> bool = &|_, _| true;
+    const CLEAR: &Sight<'static> = &Sight::OPEN;
     /// Scene position of a server position.
     fn at(x: f32, y: f32, z: f32) -> Vec3 {
         Vec3::new(x, y, -z)
@@ -228,24 +266,56 @@ mod tests {
     #[test]
     fn a_blocked_line_of_sight_hides_the_attractor() {
         let mut v = views(vec![att([10.0, 5.0, 0.0], [10.0, 5.0, 2.0], 1.0)]);
-        v.refresh(at(12.0, 0.0, 3.0), at(0.0, 5.0, 0.0), &|_, _| false);
+        v.refresh(at(12.0, 0.0, 3.0), at(0.0, 5.0, 0.0), &Sight::with_clear(&|_, _| false));
         assert!(v.list.is_empty());
+    }
+
+    #[test]
+    fn a_closed_door_between_the_rooms_hides_the_attractor() {
+        // `FUN_10023bfc`: the line of sight is free, but attractor and point are in rooms joined by a closed door
+        let mut v = views(vec![att([10.0, 5.0, 0.0], [10.0, 5.0, 2.0], 1.0)]);
+        let closed = Sight { door_closed: &|_, _| true, ..Sight::OPEN };
+        v.refresh(at(12.0, 0.0, 3.0), at(0.0, 5.0, 0.0), &closed);
+        assert!(v.list.is_empty());
+        v.refresh(at(12.0, 0.0, 3.0), at(0.0, 5.0, 0.0), CLEAR);
+        assert_eq!(v.list.len(), 1);
     }
 
     #[test]
     fn previous_steps_back_and_wraps() {
         let mut v = views(vec![att([10.0, 5.0, 0.0], [10.0, 5.0, 2.0], 1.0), att([14.0, 5.0, 0.0], [14.0, 5.0, 2.0], 1.0), att([30.0, 5.0, 0.0], [30.0, 5.0, 2.0], 1.0)]);
         let (p, g) = (at(12.0, 0.0, 3.0), at(0.0, 5.0, 0.0));
-        v.prev(p, g, CLEAR); // no index: the last of the list
+        v.prev(p, g, CLEAR); // no index: the best entry, like the automatic pick `FUN_10021921`
+        assert_eq!(v.index, Some(0));
+        let best = v.selected().unwrap().pos;
+        v.prev(p, g, CLEAR); // 0 wraps to the end
         assert_eq!(v.index, Some(2));
         assert_eq!(v.selected().unwrap().pos, at(30.0, 5.0, 0.0));
         v.prev(p, g, CLEAR);
         assert_eq!(v.index, Some(1));
         v.prev(p, g, CLEAR);
-        v.prev(p, g, CLEAR); // 0 wraps to the end
-        assert_eq!(v.index, Some(2));
+        assert_eq!((v.index, v.selected().unwrap().pos), (Some(0), best));
         v.clear();
         assert!(v.selected().is_none());
+    }
+
+    #[test]
+    fn previous_works_from_no_selection_before_any_tick() {
+        // Shift+F8 right after the zone loaded: no list, no index, nothing selected
+        let mut v = views(vec![att([10.0, 5.0, 0.0], [10.0, 5.0, 2.0], 1.0)]);
+        assert!(v.selected().is_none() && v.index.is_none());
+        v.prev(at(12.0, 0.0, 3.0), at(0.0, 5.0, 0.0), CLEAR);
+        assert_eq!(v.index, Some(0));
+        assert_eq!(v.selected().unwrap().pos, at(10.0, 5.0, 0.0));
+    }
+
+    #[test]
+    fn the_automatic_pick_with_an_empty_list_drops_the_attractor() {
+        let mut v = views(vec![]);
+        v.selected = Some(View { pos: Vec3::ZERO, target: Vec3::ZERO, range: 1.0 });
+        assert!(v.select_first(), "SetCameraAttractor(NULL) changes the selection");
+        assert!(v.selected().is_none() && v.index.is_none());
+        assert!(!v.select_first());
     }
 
     #[test]
@@ -270,5 +340,48 @@ mod tests {
         let before = v.index;
         v.tick(0.2, p, g, CLEAR);
         assert_eq!(v.index, before);
+    }
+
+    /// Real data (skips without the client): ICC Holodeck Alien Training (6131) has one door link; an attractor and the
+    /// character in the two rooms are hidden from each other until the link's door is open (`IsDoorOpenBetweenRooms`).
+    #[test]
+    fn a_closed_door_between_real_rooms_hides_the_attractor_until_it_opens() {
+        use ao_formats::playfield::load_playfield;
+        let Some(dir) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/ProjectRubiKa/client")) else { return };
+        if !dir.join("cd_image/rdb.db").exists() {
+            return;
+        }
+        let store = ao_rdb::RecordStore::open(&dir).unwrap();
+        let mut c = Collision::load(&store, 6131).unwrap();
+        let (a, b) = c.room_links()[0];
+        let s = load_playfield(&store, &dir, 6131).unwrap().spawn.unwrap();
+        let (mut in_a, mut in_b) = (None, None);
+        for x in (-150..=150).step_by(2) {
+            for z in (-150..=150).step_by(2) {
+                for y in [-4.0, -2.0, 0.0, 2.0, 4.0] {
+                    let p = [s[0] + x as f32, s[1] + y, s[2] + z as f32];
+                    match c.pos_to_room(p, None) {
+                        Some(r) if r == a as usize => in_a = in_a.or(Some(p)),
+                        Some(r) if r == b as usize => in_b = in_b.or(Some(p)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let (pa, pb) = (in_a.expect("a point in the first room"), in_b.expect("a point in the second room"));
+        assert_eq!(c.pos_to_room(pb, Some(a as usize)), Some(b as usize), "the hint room is only preferred when it holds the point");
+        assert!(door_closed(&c, pa, pb) && door_closed(&c, pb, pa), "every link starts closed");
+        assert!(!door_closed(&c, pa, pa), "the same room needs no door");
+        c.set_door_open(a, b, true);
+        assert!(!door_closed(&c, pa, pb));
+        c.set_door_open(b, a, false);
+        assert!(door_closed(&c, pa, pb));
+        // outside every room there is no door test
+        assert!(!door_closed(&c, pa, [s[0] + 1.0e5, s[1], s[2]]));
+        // and the ranking drops the attractor in room `a` for a character in room `b` while the door is shut
+        let mut v = Views::new(CameraViews::new(vec![vec![att([pa[0], pa[1] + 0.5, -pa[2]], [pa[0], pa[1], -pa[2]], 1.0)]], None, vec![]), Box::new(|_| 0));
+        let closed = |a: [f32; 3], b: [f32; 3]| door_closed(&c, a, b);
+        v.refresh(Vec3::from(pb) - Vec3::Y, Vec3::ZERO, &Sight { door_closed: &closed, ..Sight::OPEN });
+        assert!(v.list.is_empty());
     }
 }

@@ -187,6 +187,9 @@ Sliding up a single steep plane is therefore possible for one step, but the body
 * `line(a, b) -> Option<Hit{p, n}>` (`GetLineIntersection`), `closest(feet, room_hint)`, `veto(&mut p, &mut SurfaceState) -> bool`, `ground(feet) -> Option<f32>` (= closest point
   height; replaces the "highest surface at or below" query, the KD ray is limited to terrain delta + 0.3 m outdoors and 1 m in dungeons, dungeon tile floors are cast from the plane),
   `liquid_at`, `inside`, `room_of`, `pos_to_room`, `room_links`, `room_transition_allowed`, `set_door_passable`, `set_door_open`, `door_open_between`, `sphere_hit` (camera boom only), `triangle_count`,
+  `door_link_from_pos(scene_pos) -> Option<(u16, u16)>` (`n3Room_t::GetDoorLinkFromPos` @0x100105f9 over every room: the door entry `tile << 2 | orientation` word (2nd `u16` of the record's door entries, `Room::door_tiles`) -> the tile of the room rectangle
+  (row length `x2 - x1`, 2 m cells), pushed 0.99 m (f64 @0x1003d368) to the tile edge `orientation` (0 +z, 1 +x, 2 -z, 3 -x), room-local with the room centre as origin, turned `rot` quarter turns about +Y, plus the room position; a match is within 1.2 m (f64 @0x1003d370) in x and z, y is not tested;
+  result `(room, connected room)`, connected `0xffff` = the entry leads nowhere; real data: playfield 6131 finds exactly its one link),
   `in_teleportal(scene_pos)` (`n3Zone_t::IsPosInTeleportal` N3 0x1001a86a: the portal polygon of the zone holding the point, x/z parity test `FUN_1001b21a`, see docs/zone/world.md §10.2).
 * `kd::parse(version, bytes) -> Surface{volumes, nodes, portal, portal_dest}`: the decoder of section 2.
 * Removed with the cutover: `support`, `wading_ground`, `slide(from, to, radius, height)` (capsule push-out). `MIN_FLOOR_NY` (0.5), `STEP_HEIGHT` (0.48, the base tolerance), `RAY_LIFT` (0.4), `WADE_DEPTH` (1.2).

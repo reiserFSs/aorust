@@ -7,10 +7,11 @@
 
 #![allow(dead_code)] // documented constants and accessors for tests / the live harness
 
-use super::camera_views::Views;
+use super::camera_views::{Sight, Views};
 use super::controls::{CamCmd, CamKey, ControlPrefs};
 use ao_render::{Camera, Vec3};
 use ao_scene::Lens;
+use glam::Quat;
 use std::f32::consts::{FRAC_PI_2, PI};
 
 /// The world camera is created with `SetViewPlaneWindow(π/2, aspect)` (`n3Camera_t` ctor, N3 @0x10021a76 / `FUN_1002107a`
@@ -58,6 +59,10 @@ const MAX_ELEVATION_SIN: f32 = 0.9999;
 /// `ZOOM_RATE` m/s; the rest is dropped below `ZOOM_STOP` m (`_DAT_1003e29c`).
 const ZOOM_RATE: f32 = 3.0;
 const ZOOM_STOP: f32 = 0.3;
+/// A chase-camera orbit stores the new distance only while the vehicle is at rest below this speed (`_DAT_1003e2e0`), and
+/// `ZoomSteer` (@N3 0x1001db64) zooms in until the camera is 0.7 m away (`_DAT_1003e028` is the squared value 0.49).
+const ORBIT_REST_SPEED: f32 = 0.02;
+const ZOOM_STEER_MIN: f32 = 0.7;
 /// Numpad rotation: `0.02 * MouseTurnSensitivity` radians per frame in the original (frame-rate dependent); applied at
 /// the 60 Hz equivalent here.
 const KEY_ROTATE: f32 = 0.02;
@@ -84,48 +89,229 @@ const VEHICLE_MASS: f32 = 20.0;
 const VEHICLE_MAX_SPEED: f32 = 16.0;
 const VEHICLE_BRAKE: f32 = 0.3 * VEHICLE_MAX_SPEED;
 const VEHICLE_MAX_FORCE: f32 = VEHICLE_MASS * VEHICLE_MAX_SPEED / 0.3;
-/// Integration substep. [GUESS] the client limits it by `Vehicle_t +0x104` (not read).
-const VEHICLE_STEP: f32 = 1.0 / 60.0;
+/// Largest integration substep, `Vehicle +0x104`: `CameraVehicle_t`'s constructor stores `_DAT_1003df54` there (N3 @0x1001d440).
+/// `FUN_1000e3d3` runs `CalcSteering` once per substep `min(left, +0x104)` (and frames over 4 s, `_DAT_10012804`, not at all).
+const VEHICLE_STEP: f32 = 0.05;
+const VEHICLE_MAX_FRAME: f32 = 4.0;
 /// Arrival radius of the camera vehicle (`_DAT_1003d618`, `SteeringCamArrive`) and of an attractor (`_DAT_1003d61c`).
 const ARRIVE_RADIUS: f32 = 0.01;
 const ATTRACTOR_RADIUS: f32 = 0.1;
-/// Mode 1 pushes the camera out to this distance from the look target (`CameraVehicle_t::Update` @0x1001e54f, `_DAT_1003e04c`)
-/// and lifts it by `CHASE_LIFT` per frame while it is below the target (`_DAT_1003d9d0`).
-const CHASE_MIN_DISTANCE: f32 = 0.9;
+/// `CameraVehicle_t +0x198`, the distance the chase camera keeps from the look target: the constructor sets `_DAT_1003d2e8`
+/// (N3 @0x1001d440); `Update` @0x1001e54f sets `|target - pos|`, at least `_DAT_1003e04c` below `_DAT_1003d3a8`; `ForcedUpdate`
+/// @0x1001e5ac sets the exact distance.
+const CHASE_DEFAULT_DISTANCE: f32 = 5.0;
+/// `CalcSteering` lifts the wanted spot by this much while the camera is below the look target or less than this above the
+/// ground (`_DAT_1003d9d0`).
 const CHASE_LIFT: f32 = 0.4;
+/// `SteeringCamArrive` @N3 0x1001dc46: a substep longer than this many times its running average halts the camera
+/// (`_DAT_1003d140`); the average moves half way to every new substep (`_DAT_1003c868`).
+const HITCH_RATIO: f32 = 10.0;
+/// `SteeringCamArrive` sidestep: only when the wanted spot lies farther than this horizontally (`1.0`), within this sine of the
+/// direction to the look target (`_DAT_1003d9d0`); it is then moved sideways of the look target by this fraction of the
+/// camera's horizontal distance (`_DAT_1003cb20`).
+const SIDESTEP_MIN_DISTANCE: f32 = 1.0;
+const SIDESTEP_MAX_SINE: f32 = 0.4;
+const SIDESTEP: f32 = 0.5;
+/// `CalculateSensorSteerDir` @N3 0x1001d955: probe distances `(1 << i) * 0.5` for `i` = 0, 2, 4, 6 and the margin
+/// `CanSeeFlexedPos` @0x1001d8c6 steps back from the probe point (`_DAT_1003cb20`).
+const SENSOR_STEPS: [f32; 4] = [0.5, 2.0, 8.0, 32.0];
+const SENSOR_MARGIN: f32 = 0.5;
+/// `FUN_10022345`: the camera counts as blind (`+0x1e9`) while no probe direction sees the target; blind for more than this many
+/// seconds (`_DAT_1003caf8`, frames up to `_DAT_1003e29c` long only) it is cut to a new spot (`ReposCutOnAxis(0)`).
+const BLIND_CUT_AFTER: f32 = 1.5;
+const BLIND_MAX_FRAME: f32 = 0.3;
+/// `ReposCutOnAxis` @N3 0x1001e27e: swing about the vertical (`_DAT_1003e048`), the fallback direction (0, 1, `_DAT_1003e040`),
+/// the distance halves until the spot sees the target or this limit (`_DAT_1003e038`), at most 10 tries.
+const CUT_ANGLE: f32 = 0.541_052_04;
+const CUT_FALLBACK: [f32; 3] = [0.0, 1.0, -1.3];
+const CUT_MIN_DISTANCE: f32 = 0.8;
+
+/// Scene <-> AO world: the client's world has z negated. The steering code below runs in AO coordinates wherever it uses cross
+/// products or a rotation sense, so the decompiled formulas apply as read.
+fn ao(v: Vec3) -> Vec3 {
+    Vec3::new(v.x, v.y, -v.z)
+}
 
 /// The camera dynel as a steered vehicle (modes 1 and 2); mode 3 snaps it every frame.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Vehicle {
     pos: Vec3,
     vel: Vec3,
+    /// `CameraVehicle_t +0x198`, see [`CHASE_DEFAULT_DISTANCE`].
+    dist: f32,
+    /// `+0x1bc`: `UpdateSensors` found a clear line from the camera to the look target.
+    sees: bool,
+    /// `+0x1c0..0x1c8`: the direction `CalculateSensorSteerDir` found to get the target in view (scene space).
+    steer: Vec3,
+    /// `+0x1e9`: no probe direction sees the target.
+    blind: bool,
+    /// `SteeringCamArrive`'s function-static running average of the substep time (`_DAT_1005c864`, first call: that substep).
+    frame_avg: Option<f32>,
+}
+
+impl Default for Vehicle {
+    fn default() -> Self {
+        Self { pos: Vec3::ZERO, vel: Vec3::ZERO, dist: CHASE_DEFAULT_DISTANCE, sees: false, steer: Vec3::ZERO, blind: false, frame_avg: None }
+    }
 }
 
 impl Vehicle {
-    /// `SteeringArrive(target, radius)` + the integration over `dt`: desired velocity = towards the target at
-    /// `min(max_speed, distance / brake * max_speed)`, force = `(desired - vel) * mass * 4` limited to `max_force`.
-    fn arrive(&mut self, target: Vec3, radius: f32, dt: f32) {
+    /// A new `CameraVehicle_t` at `pos` (`n3Camera_t` swaps the vehicle on a mode change, FUN_10021859 @N3 0x10021859); the
+    /// substep average is a function static and survives.
+    fn replaced(&self) -> Self {
+        Self { pos: self.pos, frame_avg: self.frame_avg, ..Self::default() }
+    }
+
+    /// `Vehicle_t::Run`'s substep loop (`FUN_1000e3d3`): `step(vehicle, h)` once per substep `h <= VEHICLE_STEP`.
+    fn run(&mut self, dt: f32, mut step: impl FnMut(&mut Self, f32)) {
+        if dt > VEHICLE_MAX_FRAME {
+            return;
+        }
         let mut left = dt;
         while left > 0.0 {
             let h = left.min(VEHICLE_STEP);
             left -= h;
-            let to = target - self.pos;
-            let d2 = to.length_squared();
-            if d2 < radius * radius || d2 < 0.01 {
-                self.vel = Vec3::ZERO; // SteeringHalt
-                continue;
-            }
-            let d = d2.sqrt();
-            let desired = to / d * (d / VEHICLE_BRAKE * VEHICLE_MAX_SPEED).min(VEHICLE_MAX_SPEED);
-            let force = ((desired - self.vel) * (VEHICLE_MASS * 4.0)).clamp_length_max(VEHICLE_MAX_FORCE);
-            self.vel = (self.vel + force * h / VEHICLE_MASS).clamp_length_max(VEHICLE_MAX_SPEED);
-            self.pos += self.vel * h;
+            step(self, h);
         }
+    }
+
+    /// `SteeringArrive(target, radius)` + the integration over one substep: desired velocity = towards the target at
+    /// `min(max_speed, distance / brake * max_speed)`, force = `(desired - vel) * mass * 4` limited to `max_force`.
+    fn arrive_step(&mut self, target: Vec3, radius: f32, h: f32) {
+        let to = target - self.pos;
+        let d2 = to.length_squared();
+        if d2 < radius * radius || d2 < 0.01 {
+            self.vel = Vec3::ZERO; // SteeringHalt
+            return;
+        }
+        let d = d2.sqrt();
+        let desired = to / d * (d / VEHICLE_BRAKE * VEHICLE_MAX_SPEED).min(VEHICLE_MAX_SPEED);
+        let force = ((desired - self.vel) * (VEHICLE_MASS * 4.0)).clamp_length_max(VEHICLE_MAX_FORCE);
+        self.vel = (self.vel + force * h / VEHICLE_MASS).clamp_length_max(VEHICLE_MAX_SPEED);
+        self.pos += self.vel * h;
+    }
+
+    fn arrive(&mut self, target: Vec3, radius: f32, dt: f32) {
+        self.run(dt, |v, h| v.arrive_step(target, radius, h));
+    }
+
+    /// `CameraVehicle_t::SteeringCamArrive(target, force, 0.01)` @N3 0x1001dc46 for one substep: a hitch halts the camera;
+    /// a wanted spot farther away than the look target in about the same direction is swapped for a spot beside the look
+    /// target, so the camera swings round the character instead of flying through it.
+    fn cam_arrive_step(&mut self, target: Vec3, look: Vec3, h: f32) {
+        let avg = *self.frame_avg.get_or_insert(h);
+        if HITCH_RATIO * avg < h {
+            self.vel = Vec3::ZERO;
+            return;
+        }
+        self.frame_avg = Some(avg * 0.5 + h * 0.5);
+        let (to_look, to_target) = (ao(look - self.pos), ao(target - self.pos));
+        let (l, t) = (Vec3::new(to_look.x, 0.0, to_look.z), Vec3::new(to_target.x, 0.0, to_target.z));
+        let mut target = target;
+        if l != Vec3::ZERO && t != Vec3::ZERO {
+            let (c, d) = (l.length(), t.length());
+            let (ul, ut) = (l / c, t / d);
+            let cross_y = ul.z * ut.x - ul.x * ut.z; // (ul x ut).y
+            if c < d && d > SIDESTEP_MIN_DISTANCE && cross_y.abs() < SIDESTEP_MAX_SINE && ut.dot(ul) > 0.0 {
+                let side = Vec3::new(l.z, 0.0, -l.x) * if cross_y < 0.0 { -1.0 } else { 1.0 };
+                target = look + ao(side * SIDESTEP);
+            }
+        }
+        self.arrive_step(target, ARRIVE_RADIUS, h);
     }
 
     fn snap(&mut self, pos: Vec3) {
         self.pos = pos;
         self.vel = Vec3::ZERO;
+    }
+
+    /// `CameraVehicle_t::CalcSteering` @N3 0x1001e797 without an attractor, zoom or direct control (none of them is reachable
+    /// in mode 1: `+0x1a4` is only ever 0, the zoom is the n3Camera's) and with `+0x1cc` (two-shot) and `+0x1e8` (stay behind)
+    /// off, which `FUN_10022345` forces every frame (@0x100223b2, @0x100223c3): the camera wants to sit `dist` from the look
+    /// target along its current line to it; blocked, the sensor's steer direction is added, in the clear it is lifted off the
+    /// ground (< 0.4 m); below the look target it is lifted again.
+    fn calc_steering(&self, look: Vec3, sight: &Sight) -> Vec3 {
+        let off = look - self.pos;
+        let len = off.length();
+        let mut want = if len > 0.0 { look - off / len * self.dist } else { look };
+        if self.sees {
+            if (sight.ground)(self.pos.to_array()).is_some_and(|g| (self.pos.y - g).abs() < CHASE_LIFT) {
+                want.y += CHASE_LIFT;
+            }
+        } else {
+            want += self.steer;
+        }
+        if self.pos.y < look.y {
+            want.y += CHASE_LIFT;
+        }
+        want
+    }
+
+    /// `CameraVehicle_t::UpdateSensors` @N3 0x1001e71f (mode 1, every frame before the vehicle runs).
+    fn update_sensors(&mut self, look: Vec3, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) {
+        if clear(self.pos.to_array(), look.to_array()) {
+            self.blind = false;
+            self.sees = true;
+        } else {
+            self.sees = false;
+            self.steer_to_view(look, clear);
+        }
+    }
+
+    /// `CameraVehicle_t::CalculateSensorSteerDir` @N3 0x1001d955: with the probe distances 0.5, 2, 8, 32 m the first direction
+    /// of right, left, up, down, forward, back (of the camera, which faces the look target: `VetoForward` /
+    /// `VetoUpAlignment`) from which a point that far away sees the target (`CanSeeFlexedPos` @0x1001d8c6: the line from the
+    /// point `0.5 m` short of it to the target and the line to the point are clear) becomes the steer direction (unit length).
+    /// None: blind.
+    fn steer_to_view(&mut self, look: Vec3, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) {
+        self.steer = Vec3::ZERO;
+        self.blind = false;
+        let mut fwd = ao(look - self.pos).normalize_or_zero();
+        let base = if fwd.x == 0.0 && fwd.z == 0.0 { Vec3::Z } else { Vec3::Y };
+        if fwd == Vec3::ZERO {
+            fwd = Vec3::Z;
+        }
+        let up = (base - fwd * fwd.dot(base)).normalize_or_zero();
+        let (right, fwd) = (ao(up.cross(fwd)), ao(fwd));
+        let dirs = [right, -right, Vec3::Y, -Vec3::Y, fwd, -fwd];
+        for step in SENSOR_STEPS {
+            for dir in dirs {
+                let p = self.pos + dir * step;
+                if clear((p - dir * SENSOR_MARGIN).to_array(), look.to_array()) && clear(self.pos.to_array(), p.to_array()) {
+                    self.steer = dir;
+                    return;
+                }
+            }
+        }
+        self.blind = true;
+    }
+
+    /// `CameraVehicle_t::ReposCutOnAxis(0)` @N3 0x1001e27e (no attractor, zero axis): halt and put the camera on the far side
+    /// of the look target (the line from the camera through it, swung 31 degrees about the vertical to the side `facing`
+    /// crosses it, always above it), `dist` away; while that spot does not see the target the distance halves.
+    fn cut_on_axis(&mut self, look: Vec3, facing: Vec3, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) {
+        self.vel = Vec3::ZERO;
+        let (look_ao, facing) = (ao(look), ao(facing));
+        let mut p = ao(self.pos);
+        for i in 0.. {
+            if i > 0 {
+                self.dist *= 0.5;
+            }
+            let to = look_ao - p;
+            let angle = if facing.cross(to).y < 0.0 { CUT_ANGLE } else { -CUT_ANGLE };
+            let ahead = Vec3::new(to.x * 2.0, (to.y * 2.0).abs(), to.z * 2.0);
+            let v = if ahead != Vec3::ZERO {
+                Quat::from_axis_angle(Vec3::Y, angle) * (ahead.normalize() * self.dist)
+            } else {
+                Vec3::from(CUT_FALLBACK).normalize() * self.dist
+            };
+            p = look_ao + v;
+            let probe = p + v.normalize_or_zero();
+            if clear(look.to_array(), ao(probe).to_array()) || i > 9 || self.dist <= CUT_MIN_DISTANCE {
+                break;
+            }
+        }
+        self.pos = ao(p);
     }
 }
 
@@ -156,6 +342,10 @@ pub struct Camera3p {
     views: Option<Views>,
     /// Shift+F8 was pressed; handled in the next frame (it needs the character's position).
     prev_view: bool,
+    /// The look target of the last frame (what an orbit of the vehicle swings about).
+    pivot: Vec3,
+    /// Seconds the camera has been blind (`n3Camera_t +0x178`).
+    blind_time: f32,
 }
 
 impl Camera3p {
@@ -180,6 +370,8 @@ impl Camera3p {
             vehicle: Vehicle::default(),
             views: None,
             prev_view: false,
+            pivot: Vec3::ZERO,
+            blind_time: 0.0,
         }
     }
 
@@ -270,6 +462,8 @@ impl Camera3p {
                 3 => 2,
                 _ => 1,
             };
+            self.vehicle = self.vehicle.replaced();
+            self.blind_time = 0.0;
         }
     }
 
@@ -280,7 +474,31 @@ impl Camera3p {
         } else {
             self.yaw_off += dx;
             self.elev = (self.elev + dy).clamp(-MAX_ELEVATION_SIN.asin(), MAX_ELEVATION_SIN.asin());
+            if self.mode == 1 {
+                self.orbit_vehicle(dx, dy);
+            }
         }
+    }
+
+    /// `FUN_1002118c` @N3 0x1002118c for the plain chase camera (modes != 3 place the vehicle directly): the camera swings about
+    /// the look target by `dx` about the vertical and `dy` of elevation (refused when it would pass `|sin| > 0.9999`); when
+    /// the vehicle is (nearly) at rest (`< 0.02`, `_DAT_1003e2e0`) `Update` + `ForcedUpdate` then store the new distance.
+    fn orbit_vehicle(&mut self, dx: f32, dy: f32) {
+        let off = self.vehicle.pos - self.pivot;
+        let len = off.length();
+        if len <= 0.0 {
+            return;
+        }
+        let dy = if (off.y / len + dy).abs() > MAX_ELEVATION_SIN { 0.0 } else { dy };
+        let el = (off.y / len).asin() + dy;
+        let (c, s) = (dx.cos(), dx.sin());
+        let (x, z) = (off.x * c - off.z * s, off.x * s + off.z * c);
+        let h = x.hypot(z);
+        let k = if h > 0.0 { len * el.cos() / h } else { 0.0 };
+        if self.vehicle.vel.length() < ORBIT_REST_SPEED {
+            self.vehicle.dist = len;
+        }
+        self.vehicle.pos = self.pivot + Vec3::new(x * k, len * el.sin(), z * k);
     }
 
     /// `n3Camera_t` wheel handler (N3 @0x100200ef): `ZoomSpeed / 10` metres per notch, accumulated; scrolling the
@@ -300,6 +518,11 @@ impl Camera3p {
 
     /// Distance change request (positive = in); switches to first person when it runs into the minimum.
     fn zoom_in_by(&mut self, metres: f32) {
+        if self.mode == 1 {
+            // [INFERENCE] `ZoomSteer` (@0x1001db64: seek along the line to the look target, stop at 0.7 m / 25 m) followed by
+            // `ForcedUpdate` leaves the chase distance changed by the zoom: stored directly.
+            self.vehicle.dist = (self.vehicle.dist - metres).clamp(ZOOM_STEER_MIN, MAX_DISTANCE);
+        }
         self.dist -= metres;
         if self.dist <= FIRST_PERSON_BELOW && metres > 0.0 && self.prefs.zoom_to_1st_person {
             self.first_person = true;
@@ -342,24 +565,27 @@ impl Camera3p {
 
     /// One frame without occlusion testing.
     pub fn update(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32) -> Camera {
-        self.update_with(avatar_pos, avatar_yaw, dt, &|_, _| true)
+        self.update_with(avatar_pos, avatar_yaw, dt, &Sight::OPEN)
     }
 
-    /// One frame. `clear(from, to)` answers whether the segment is free of terrain/statels (scene frame).
-    pub fn update_with(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32, clear: &dyn Fn([f32; 3], [f32; 3]) -> bool) -> Camera {
+    /// One frame. `sight` answers what the camera asks of the world: line of sight (free of terrain/statels), closed doors
+    /// between rooms and the ground under a point (scene frame).
+    pub fn update_with(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32, sight: &Sight) -> Camera {
+        let clear = sight.clear;
         self.step_keys_and_zoom(dt);
         self.follow_head(dt);
         let feet = Vec3::from(avatar_pos);
         let pivot = feet + Vec3::Y * self.pivot_height;
+        self.pivot = pivot;
         if self.first_person {
             return Camera { pos: pivot, yaw: avatar_yaw + self.fp_yaw, pitch: -self.fp_pitch, roll: 0.0 };
         }
         // scripted views: ranked every 10th frame and Shift+F8 steps them
         let guide = self.views.as_ref().and_then(Views::selected).map_or(self.vehicle.pos, |v| v.pos);
         if let Some(v) = &mut self.views {
-            v.tick(dt, feet, guide, clear);
+            v.tick(dt, feet, guide, sight);
             if std::mem::take(&mut self.prev_view) {
-                v.prev(feet, guide, clear);
+                v.prev(feet, guide, sight);
             }
         }
         let h = avatar_yaw + self.yaw_off;
@@ -367,6 +593,12 @@ impl Camera3p {
         let dir = -fwd * self.elev.cos() + Vec3::Y * self.elev.sin();
         let want = pivot + dir * self.dist;
         let optimal = occlude(pivot, want, dir, clear);
+        if self.mode != 3 && self.vehicle.pos.x == 0.0 && self.vehicle.pos.z == 0.0 {
+            // `FUN_10022345`: a vehicle that was never placed starts at the camera's own spot and takes its distance
+            // (`SetRelPosIgnoreCollision`, `Update`, `ForcedUpdate(0)`)
+            self.vehicle.snap(optimal);
+            self.vehicle.dist = (pivot - optimal).length();
+        }
         let eye = match self.mode {
             // CameraVehicleFixedThird_t(rigid): `DecideSnap` places the camera on the optimal position every frame
             3 => {
@@ -375,22 +607,27 @@ impl Camera3p {
             }
             // CameraVehicleFixedThird_t(damped): `SteeringCamArrive(optimal, 0.01)`
             2 => {
-                self.vehicle.arrive(optimal, ARRIVE_RADIUS, dt);
+                self.vehicle.run(dt, |v, h| v.cam_arrive_step(optimal, pivot, h));
                 self.vehicle.pos
             }
-            // CameraVehicle_t (`CalcSteering` @N3 0x1001e797)
+            // CameraVehicle_t (`CalcSteering` @N3 0x1001e797), with the sensors and the blind-camera cut of `FUN_10022345`
             _ => {
+                self.vehicle.update_sensors(pivot, clear);
+                if !self.vehicle.blind {
+                    self.blind_time = 0.0;
+                } else if dt < BLIND_MAX_FRAME {
+                    self.blind_time += dt;
+                }
+                if self.blind_time > BLIND_CUT_AFTER {
+                    self.vehicle.cut_on_axis(pivot, fwd, clear);
+                    self.blind_time = 0.0;
+                }
                 match self.views.as_ref().and_then(Views::selected) {
                     Some(v) => self.vehicle.arrive(v.pos, ATTRACTOR_RADIUS, dt),
-                    None => {
-                        let off = pivot - self.vehicle.pos;
-                        let len = off.length().max(1e-4);
-                        let mut desired = pivot - off / len * len.max(CHASE_MIN_DISTANCE);
-                        if self.vehicle.pos.y < pivot.y {
-                            desired.y += CHASE_LIFT;
-                        }
-                        self.vehicle.arrive(desired, ARRIVE_RADIUS, dt);
-                    }
+                    None => self.vehicle.run(dt, |veh, h| {
+                        let want = veh.calc_steering(pivot, sight);
+                        veh.cam_arrive_step(want, pivot, h);
+                    }),
                 }
                 self.vehicle.pos
             }
@@ -570,11 +807,11 @@ mod tests {
         let mut c = cam();
         // a wall 2 m behind the pivot (z >= -3 + 2 for an avatar at z = -3 facing -Z): nothing beyond z = pivot.z + 2 is reachable
         let wall = |_: [f32; 3], to: [f32; 3]| to[2] < -1.0;
-        let v = c.update_with([0.0, 0.0, -3.0], 0.0, 0.016, &wall);
+        let v = c.update_with([0.0, 0.0, -3.0], 0.0, 0.016, &Sight::with_clear(&wall));
         assert!(v.pos.z <= -1.0 - COLLISION_RADIUS * 0.948 + 0.01, "{}", v.pos.z);
         assert!(v.pos.z > -3.0 + 1.5, "still pulled out of the avatar: {}", v.pos.z);
         // an unobstructed view keeps the full distance
-        let v = c.update_with([0.0, 0.0, -3.0], 0.0, 0.016, &|_, _| true);
+        let v = c.update_with([0.0, 0.0, -3.0], 0.0, 0.016, &Sight::OPEN);
         assert!(near((v.pos - Vec3::new(0.0, 1.5, -3.0)).length(), 5.0));
     }
 
@@ -663,26 +900,199 @@ mod tests {
         assert!(near(target.y, rigid_now.y));
     }
 
-    #[test]
-    fn chase_mode_stays_put_and_backs_off_a_close_target() {
+    /// A camera in mode 1 at its own spot (the way `n3Camera_t` swaps to `CameraVehicle_t`).
+    fn chase() -> Camera3p {
         let mut c = cam();
-        let p0 = c.update([0.0; 3], 0.0, 0.016).pos;
+        c.update([0.0; 3], 0.0, 0.016);
         c.apply(&CamCmd::NextView);
-        c.apply(&CamCmd::NextView); // mode 1
+        c.apply(&CamCmd::NextView);
         assert_eq!(c.mode(), 1);
-        // the avatar walks off: the camera is above the target already and does not follow, but keeps watching it
-        let v = c.update([0.0, 0.0, -8.0], 0.0, 1.0 / 60.0);
-        assert!((v.pos - p0).length() < 0.5);
-        assert!((v.forward() - (Vec3::new(0.0, 1.5, -8.0) - v.pos).normalize()).length() < 1e-3);
-        // a target inside 0.9 m is pushed out to 0.9 m
-        let mut d = cam();
-        d.update([0.0; 3], 0.0, 0.016);
-        d.apply(&CamCmd::NextView);
-        d.apply(&CamCmd::NextView);
+        c
+    }
+
+    #[test]
+    fn chase_mode_keeps_its_distance_from_the_look_target() {
+        // the swapped-in vehicle has the constructor's chase distance, 5 m (`+0x198`, `_DAT_1003d2e8`)
+        let mut c = chase();
+        assert_eq!(c.vehicle.dist, CHASE_DEFAULT_DISTANCE);
+        // the avatar walks off: the camera trails it at that distance, above the target, watching it
+        let mut v = c.update([0.0, 0.0, -8.0], 0.0, 1.0 / 60.0);
+        for _ in 0..600 {
+            v = c.update([0.0, 0.0, -8.0], 0.0, 1.0 / 60.0);
+        }
+        let pivot = Vec3::new(0.0, 1.5, -8.0);
+        assert!(((v.pos - pivot).length() - CHASE_DEFAULT_DISTANCE).abs() < 0.02, "{}", (v.pos - pivot).length());
+        assert!((v.forward() - (pivot - v.pos).normalize()).length() < 1e-3);
+        // a target inside 0.9 m is not pushed out any more (`Update` only runs on input): the distance stays what it was
+        let mut d = chase();
         for _ in 0..600 {
             d.update([d.vehicle.pos.x, -0.4, d.vehicle.pos.z + 0.2], 0.0, 1.0 / 60.0);
         }
         assert!(d.vehicle.pos.is_finite());
+    }
+
+    #[test]
+    fn the_chase_distance_follows_orbit_and_zoom_input() {
+        let mut c = chase();
+        for _ in 0..120 {
+            c.update([0.0; 3], 0.0, 1.0 / 60.0);
+        }
+        let before = c.vehicle.pos - c.pivot;
+        // at rest an orbit swings the camera about the target and stores the distance (`Update` + `ForcedUpdate`)
+        c.apply(&CamCmd::Orbit { dx: 0.5, dy: 0.0 });
+        let after = c.vehicle.pos - c.pivot;
+        assert!(near(after.length(), before.length()) && near(c.vehicle.dist, before.length()));
+        assert!(after.x < before.x - 1.0, "+dx swings the camera to -X like the rigid modes: {before:?} -> {after:?}");
+        assert!(near(after.y, before.y));
+        // wheel zoom changes the distance it keeps
+        c.apply(&CamCmd::Zoom(1.0));
+        for _ in 0..240 {
+            c.update([0.0; 3], 0.0, 1.0 / 60.0);
+        }
+        assert!(c.vehicle.dist < before.length() - 1.0, "{}", c.vehicle.dist);
+    }
+
+    #[test]
+    fn the_vehicle_runs_in_substeps_of_at_most_0_05_s() {
+        let mut v = Vehicle::default();
+        let mut hs = Vec::new();
+        v.run(0.12, |_, h| hs.push(h));
+        assert_eq!(hs.len(), 3);
+        assert!(near(hs[0], 0.05) && near(hs[1], 0.05) && near(hs[2], 0.02));
+        v.run(5.0, |_, _| panic!("frames over 4 s are not run (`_DAT_10012804`)"));
+    }
+
+    #[test]
+    fn a_wanted_spot_behind_the_look_target_is_swapped_for_one_beside_it() {
+        // `SteeringCamArrive`: the look target is 2 m ahead (-Z), the wanted spot 6 m ahead in the same direction
+        let look = Vec3::new(0.0, 0.0, -2.0);
+        let mut v = Vehicle::default();
+        v.cam_arrive_step(Vec3::new(0.0, 0.0, -6.0), look, 0.016);
+        // heads for (1, 0, -2): half the distance to the look target to the side (cross y = 0: the + side)
+        assert!(v.vel.x > 0.0 && v.vel.z < 0.0 && near(v.vel.x / v.vel.z, -0.5), "{:?}", v.vel);
+        // a wanted spot nearer than the look target goes straight there
+        let mut w = Vehicle::default();
+        w.cam_arrive_step(Vec3::new(0.0, 0.0, -1.0), look, 0.016);
+        assert!(near(w.vel.x, 0.0) && w.vel.z < 0.0);
+        // off to the side by more than the sine limit (0.4): straight there as well
+        let mut s = Vehicle::default();
+        s.cam_arrive_step(Vec3::new(6.0, 0.0, -6.0), look, 0.016);
+        assert!(near(s.vel.x, -s.vel.z), "{:?}", s.vel);
+    }
+
+    #[test]
+    fn a_hitch_in_the_frame_time_halts_the_camera() {
+        let mut v = Vehicle::default();
+        let far = Vec3::new(0.0, 0.0, -10.0);
+        for _ in 0..10 {
+            v.cam_arrive_step(far, far, 0.016);
+        }
+        assert!(v.vel.length() > 1.0);
+        // a substep more than 10 times the running average stops it dead
+        let p = v.pos;
+        v.cam_arrive_step(far, far, 0.2);
+        assert_eq!((v.vel, v.pos), (Vec3::ZERO, p));
+        // the average only moves half way: the next normal substep goes on
+        v.cam_arrive_step(far, far, 0.016);
+        assert!(v.vel.length() > 0.0);
+    }
+
+    /// A wall across z = 2.5 for |x| < 1 (any height): segments through it are blocked.
+    fn wall(a: [f32; 3], b: [f32; 3]) -> bool {
+        let (lo, hi) = (a[2].min(b[2]), a[2].max(b[2]));
+        if lo >= 2.5 || hi <= 2.5 {
+            return true;
+        }
+        let t = (2.5 - a[2]) / (b[2] - a[2]);
+        (a[0] + (b[0] - a[0]) * t).abs() >= 1.0
+    }
+
+    #[test]
+    fn the_sensors_steer_round_an_obstacle_to_the_nearest_view() {
+        // camera 5 m behind the look target (-Z is ahead), a wall in between: right and left are blocked at 0.5 and 2 m,
+        // at 8 m the right-hand probe sees the target past the wall's edge
+        let look = Vec3::ZERO;
+        let mut v = Vehicle { pos: Vec3::new(0.0, 0.0, 5.0), ..Vehicle::default() };
+        v.update_sensors(look, &wall);
+        assert!(!v.sees && !v.blind);
+        assert_eq!(v.steer, Vec3::X);
+        // CalcSteering adds the unit steer direction to the wanted spot while the target is out of view
+        let want = v.calc_steering(look, &Sight::OPEN);
+        assert!((want - Vec3::new(1.0, 0.0, 5.0)).length() < 1e-4, "{want:?}");
+        // in the clear the sensor reports a view and no steer applies
+        let mut c = Vehicle { pos: Vec3::new(3.0, 0.0, 5.0), ..Vehicle::default() };
+        c.update_sensors(look, &wall);
+        assert!(c.sees && !c.blind && c.steer == Vec3::ZERO);
+        // nothing sees it: blind
+        let mut b = Vehicle { pos: Vec3::new(0.0, 0.0, 5.0), ..Vehicle::default() };
+        b.update_sensors(look, &|_, _| false);
+        assert!(b.blind && !b.sees && b.steer == Vec3::ZERO);
+    }
+
+    #[test]
+    fn the_left_probe_wins_when_only_it_sees_the_target() {
+        // the wall reaches 9 m to the right: only the left-hand probes see past it
+        let wide = |a: [f32; 3], b: [f32; 3]| {
+            let (lo, hi) = (a[2].min(b[2]), a[2].max(b[2]));
+            if lo >= 2.5 || hi <= 2.5 {
+                return true;
+            }
+            let x = a[0] + (b[0] - a[0]) * (2.5 - a[2]) / (b[2] - a[2]);
+            !(-1.0..9.0).contains(&x)
+        };
+        let mut v = Vehicle { pos: Vec3::new(0.0, 0.0, 5.0), ..Vehicle::default() };
+        v.update_sensors(Vec3::ZERO, &wide);
+        assert_eq!(v.steer, -Vec3::X);
+    }
+
+    #[test]
+    fn in_the_clear_the_camera_is_lifted_off_the_ground_and_below_the_target() {
+        let look = Vec3::new(0.0, 1.5, 0.0);
+        let v = Vehicle { pos: Vec3::new(0.0, 3.0, 5.0), sees: true, ..Vehicle::default() };
+        let plain = v.calc_steering(look, &Sight::OPEN);
+        let near_ground = Sight { ground: &|_| Some(2.9), ..Sight::OPEN };
+        assert!(near(v.calc_steering(look, &near_ground).y, plain.y + CHASE_LIFT));
+        let high = Sight { ground: &|_| Some(2.0), ..Sight::OPEN };
+        assert!(near(v.calc_steering(look, &high).y, plain.y));
+        // below the look target: lifted as well, both lifts add up
+        let low = Vehicle { pos: Vec3::new(0.0, 1.0, 5.0), sees: true, ..Vehicle::default() };
+        let base = low.calc_steering(look, &Sight::OPEN).y;
+        assert!(near(low.calc_steering(look, &Sight { ground: &|_| Some(0.9), ..Sight::OPEN }).y, base + CHASE_LIFT));
+    }
+
+    #[test]
+    fn a_camera_blind_for_1_5_s_is_cut_to_the_far_side_of_the_target() {
+        let mut c = chase();
+        let blocked = Sight::with_clear(&|_, _| false);
+        let pivot = Vec3::new(0.0, 1.5, 0.0);
+        let mut last = c.vehicle.pos;
+        let mut cut = None;
+        for frame in 0..120 {
+            let v = c.update_with([0.0; 3], 0.0, 1.0 / 60.0, &blocked);
+            if (v.pos - last).length() > 1.0 && cut.is_none() {
+                cut = Some(frame);
+            }
+            last = v.pos;
+        }
+        let frame = cut.expect("the camera was cut");
+        assert!((88..=93).contains(&frame), "cut after {frame} frames");
+        // the avatar faces -Z (scene): the camera now sits beyond the target, above it, at the halved distance
+        assert!(c.vehicle.pos.z < pivot.z && c.vehicle.pos.y > pivot.y, "{:?}", c.vehicle.pos);
+        assert!(c.vehicle.dist <= CUT_MIN_DISTANCE, "{}", c.vehicle.dist);
+    }
+
+    #[test]
+    fn the_cut_picks_the_side_the_character_faces_away_from() {
+        let look = Vec3::new(0.0, 1.5, 0.0);
+        let mut a = Vehicle { pos: Vec3::new(2.0, 3.0, 3.0), ..Vehicle::default() };
+        a.cut_on_axis(look, Vec3::new(0.0, 0.0, -1.0), &|_, _| true);
+        let mut b = Vehicle { pos: Vec3::new(-2.0, 3.0, 3.0), ..Vehicle::default() };
+        b.cut_on_axis(look, Vec3::new(0.0, 0.0, -1.0), &|_, _| true);
+        // with a free line the first try stands: distance 5 from the target, beyond it, above it, mirrored left/right
+        for v in [&a, &b] {
+            assert!(near((v.pos - look).length(), 5.0) && v.pos.z < look.z && v.pos.y > look.y, "{:?}", v.pos);
+        }
+        assert!(a.pos.x * b.pos.x < 0.0 || near(a.pos.x + b.pos.x, 0.0), "{:?} {:?}", a.pos, b.pos);
     }
 
     #[test]
