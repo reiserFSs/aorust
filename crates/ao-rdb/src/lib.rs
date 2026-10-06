@@ -63,6 +63,17 @@ impl RecordStore {
             .with_context(|| format!("reading rdb record {rdb_type}:{id}"))
     }
 
+    /// Like [`RecordStore::get`] with the record's `version` column (the data format selector of the DbObject).
+    pub fn get_versioned(&self, rdb_type: u32, id: u32) -> Result<Option<(u32, Vec<u8>)>> {
+        if !self.has_type(rdb_type)? {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(&format!("SELECT version, data FROM rdb_{rdb_type} WHERE id = ?1"), [id], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .optional()
+            .with_context(|| format!("reading rdb record {rdb_type}:{id}"))
+    }
+
     fn has_type(&self, rdb_type: u32) -> Result<bool> {
         Ok(self
             .conn

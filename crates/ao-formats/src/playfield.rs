@@ -9,6 +9,7 @@
 //! AO world space is left-handed, Y up, 1 unit = 1 m, x east, z north-ish. Scene space is the
 //! right-handed mirror obtained by negating z (the convention of `mesh::decode_mesh_into`).
 
+pub mod collision;
 mod dungeon;
 mod environment;
 mod ground;
