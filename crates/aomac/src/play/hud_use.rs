@@ -67,7 +67,7 @@ impl Play {
             match o {
                 Outgoing::Move(action::mv::SWITCH_TO_SIT_GROUND) => {
                     if let Some(p) = self.player.as_mut() {
-                        p.sit();
+                        p.sit_ground();
                     }
                 }
                 Outgoing::Move(m) => eprintln!("hud: movement {m:#x} has no sender here"),

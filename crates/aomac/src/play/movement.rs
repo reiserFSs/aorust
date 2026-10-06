@@ -12,15 +12,18 @@
 #![allow(dead_code)] // the full original action/stat surface; play/flow.rs consumes the parts it needs
 
 use ao_formats::character::Role;
+use ao_formats::playfield::collision::{Aligned, Body, SurfaceState, FOOT_CLEARANCE};
+use ao_net::n3::action::SitInput;
 use ao_net::n3::{dynel::CharDCMove, outgoing::CharMove};
 
 /// Terrain / collision queries in SERVER coordinates.
 pub trait World {
-    /// Height of the highest walkable support at or below `p.y` (the caller passes a point 0.4 m above the feet,
-    /// Vehicle.dll `EnsureSurfaceAlignment` casts its rays from `y + 0.4`), `None` if there is none within reach.
+    /// Ground height under the FEET position `p` (`Surface_i::CalculateClosestPoint`: terrain / floor, raised by a short KD
+    /// ray), `None` outside the playfield.
     fn ground(&self, p: [f32; 3]) -> Option<f32>;
-    /// Horizontal collision: the position reached when moving `from -> to` (slides along walls; `y` is passed through).
-    fn slide(&self, from: [f32; 3], to: [f32; 3]) -> [f32; 3];
+    /// `Vehicle_t::EnsureSurfaceAlignment` for one integration step `old -> new` (feet positions): wall sweep, ground
+    /// following, support test (`docs/zone/collision.md` §3.4).
+    fn align(&self, old: [f32; 3], new: [f32; 3], body: &Body, st: &mut SurfaceState) -> Aligned;
 }
 
 /// `Movement_n::Mode_e` values (`CharMovementStatus_t + 4`).
@@ -441,11 +444,13 @@ pub struct Stats {
     pub monster_scale: i32,
     /// 0x1AE WaitState (0 none, 2 sit, 0xE crawl, 0xF sleep, 0x10 lounge) used by the crawl/sit toggles.
     pub wait_state: i32,
+    /// 0x0 Flags: bit 0x20000000 = `DisableFalling`, 0x80000000 = `DisableSurfaceCollision` (stat hook `FUN_10059e6a` [GC] stat 0).
+    pub flags: i32,
 }
 
 impl Stats {
     pub fn new(run_speed: i32) -> Self {
-        Stats { run_speed, health: 1, max_health: 1, turn_speed: 0, strength: 0, agility: 0, features: 4, mech_data: 0, gm_level: 0, monster_scale: 0, wait_state: 0 }
+        Stats { run_speed, health: 1, max_health: 1, turn_speed: 0, strength: 0, agility: 0, features: 4, mech_data: 0, gm_level: 0, monster_scale: 0, wait_state: 0, flags: 0 }
     }
 
     /// `FUN_1006edb3`: RunSpeed, reduced linearly once health drops below 15 % of Life
@@ -471,17 +476,24 @@ impl Stats {
     }
 }
 
-/// Result of [`Movement::sit_toggle`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SitToggle {
-    /// A `SwitchToSitGround` (0x1E) move was emitted.
-    Sat,
-    /// Already sitting (or WaitState sleep/lounge): the original sends `CharacterActionIIR_t` op 0x57 instead
-    /// (`N3Msg_SitToggle` Gamecode 0x10028e0a); the caller has to do that.
-    StandRequest,
-    /// Refused (moving).
-    Ignored,
+/// `Vehicle +0x108` path installed by `Vehicle_t::Impulse` (Vehicle.dll 0x1000cd61): a `BallisticPath_t` (ctor 0x100011fb, eval 0x10001294).
+struct Ballistic {
+    start: [f32; 3],
+    /// Initial velocity `(dest - start) / T - g T / 2`.
+    v0: [f32; 3],
+    dur: f32,
+    /// `Vehicle +0xac`: time since the impulse.
+    t: f32,
+    /// `Vehicle +0x150`: the "hugging" (falling enabled) flag saved by `FUN_1000c41a` and restored at the end.
+    restore_falling: bool,
 }
+
+/// Stat ids written by the transition `Apply` functions (`SetStat`, `dynel+0xe8 -> vtbl[0x10]`).
+pub const STAT_REST_MODIFIER: u32 = 0x1A9;
+pub const STAT_WAIT_STATE: u32 = 0x1AE;
+/// `Flags` stat bits the stat hook turns into vehicle switches.
+const FLAG_NO_FALL: i32 = 0x2000_0000;
+const FLAG_NO_SURFACE: i32 = i32::MIN;
 
 const GRAVITY: f32 = -20.0; // Vehicle_t::s_vGravityAccel [Vehicle.dll 0x1001938c]
 const VY_LIMIT: f32 = 50.0; // f64 @ Vehicle.dll 0x10012748
@@ -489,12 +501,16 @@ const MASS: f32 = 10.0; // default when Vehicle +0x34 == 0 [GC 0x1015f168]; the 
 const SPEED_EPS: f32 = 0.001; // f32 @ Vehicle.dll 0x1001270c
 const MAX_DT: f32 = 4.0; // f32 @ Vehicle.dll 0x10012804: longer frames skip the integration
 const MAX_SUBSTEP: f32 = 0.05; // [GUESS] Vehicle +0x104 is not initialised in the code read
-const STEP_UP: f32 = 0.4; // ray origin above the feet, f64 @ Vehicle.dll 0x100127f8
-const STEP_DOWN: f32 = 0.48; // f32 @ Vehicle.dll 0x100127e0 (+2 * step length while walking, f64 @ 0x100127d8)
 /// `CheckMotionUpdate`: idle timeout while moving and the rotation-change check [GC 0x101574fc, 0x101574f8, 0x101574f0].
 const SYNC_PERIOD: f32 = 5.0;
 const ROT_SYNC_MIN_AGE: f32 = 0.25;
 const ROT_SYNC_ANGLE: f32 = 0.17;
+/// `Ballistic` gravity: f32 -9.81 @ Vehicle.dll 0x10012798 (the steering integrator's `s_vGravityAccel` is -20, a different value).
+const BALLISTIC_G: f32 = -9.81;
+/// A ballistic flight ends when `EnsureSurfaceAlignment` moved the body at least this far from the path point (f32 0.5 @ VH 0x10012134).
+const BALLISTIC_ABORT: f32 = 0.5;
+/// `FollowTargetIIR_c` keeps at most 30 waypoints (`Vehicle +0x190`, 30 x 12 bytes).
+const FOLLOW_MAX: usize = 30;
 
 /// The own character's kinematic state and the movement message producers.
 pub struct Movement {
@@ -543,6 +559,16 @@ pub struct Movement {
     zone_counter: i32,
     zone_inst: u32,
     snap_pending: bool,
+    /// `EnsureSurfaceAlignment`'s memory (hover counter, last allowed dungeon room and position).
+    surface: SurfaceState,
+    /// Active `Impulse` flight (`Vehicle +0x108`): suspends all steering and refuses movement actions.
+    ballistic: Option<Ballistic>,
+    /// `FollowTargetIIR_c` waypoints (`Vehicle +0x190`, zero-terminated): the vehicle steers to the first one (`FUN_10070fee`).
+    follow: Vec<[f32; 3]>,
+    /// `DummyVehicle_t::Enable/DisableSurfaceCollision` (stat `Flags` bit 0x80000000).
+    surface_collision: bool,
+    /// Stats written locally by transition `Apply`s, handed to the stat holder by [`Movement::take_stat_writes`].
+    stat_writes: Vec<(u32, i32)>,
     outbox: Vec<CharMove>,
 }
 
@@ -612,6 +638,11 @@ impl Movement {
             zone_counter: -1,
             zone_inst: 0,
             snap_pending: false,
+            surface: SurfaceState::default(),
+            ballistic: None,
+            follow: Vec::new(),
+            surface_collision: true,
+            stat_writes: Vec::new(),
             outbox: Vec::new(),
         };
         m.recalc();
@@ -643,8 +674,21 @@ impl Movement {
     }
     /// Update stats (RunSpeed, health, Features, ...) from the stat stream; speeds are recomputed.
     pub fn set_stats(&mut self, f: impl FnOnce(&mut Stats)) {
+        let old = self.stats.flags;
         f(&mut self.stats);
         self.recalc();
+        // stat hook `FUN_10059e6a`, stat 0 (Flags): falling / surface collision switches
+        let changed = old ^ self.stats.flags;
+        if changed & FLAG_NO_FALL != 0 {
+            if self.stats.flags & FLAG_NO_FALL != 0 {
+                self.disable_falling();
+            } else if self.fsm.mode != mode::FLY {
+                self.enable_falling();
+            }
+        }
+        if changed & FLAG_NO_SURFACE != 0 {
+            self.surface_collision = self.stats.flags & FLAG_NO_SURFACE == 0;
+        }
     }
     /// Current horizontal speed in m/s.
     pub fn speed(&self) -> f32 {
@@ -795,16 +839,11 @@ impl Movement {
         self.action(a, now);
     }
 
-    /// `N3Msg_SitToggle` (Gamecode 0x10028e0a), movement part.
-    pub fn sit_toggle(&mut self, now: f32) -> SitToggle {
-        if self.fsm.is_moving() {
-            return SitToggle::Ignored;
-        }
-        if self.stats.wait_state == 0xF || self.stats.wait_state == 0x10 || self.fsm.mode == mode::SIT_GROUND {
-            return SitToggle::StandRequest;
-        }
-        self.action(id::SWITCH_SIT_GROUND, now);
-        SitToggle::Sat
+    /// The movement facts `N3Msg_SitToggle` (Gamecode 0x10028e0a) reads: `char+0x50` virtual `+0x9c` = FSM `IsMoving` (vehicle vtable slot 39 =
+    /// `FUN_1006efe1` -> `fsm.vtable[7]`) refuses the toggle, the WaitState stat and the FSM mode pick sit or stand-up.
+    /// `fighting` and the selected item are the caller's.
+    pub fn sit_input(&self, fighting: bool) -> SitInput {
+        SitInput { fighting, blocked: self.fsm.is_moving(), wait_state: self.stats.wait_state, fsm_mode: i32::from(self.fsm.mode), item: None }
     }
 
     /// `N3Msg_CrawlToggle` (Gamecode 0x278c9): no-op while swimming.
@@ -837,12 +876,18 @@ impl Movement {
 
     /// Place the character (spawn, teleport, playfield change): velocity and inputs are cleared.
     pub fn teleport(&mut self, pos: [f32; 3], yaw: f32) {
+        // any running Impulse flight / FollowTarget path ends with the placement
+        self.follow.clear();
+        if self.ballistic.take().is_some_and(|b| b.restore_falling) {
+            self.enable_falling();
+        }
         self.pos = pos;
         self.yaw = wrap(yaw);
         self.vel = [0.0; 2];
         self.vy = 0.0;
         self.airborne = false;
         self.launch_y = pos[1];
+        self.surface = SurfaceState::default();
         self.jump_ready = true;
         self.fsm = Fsm { last_speed_mode: self.fsm.last_speed_mode, mode: self.fsm.mode, ..Fsm::new() };
         self.in_fwd = 0.0;
@@ -854,6 +899,120 @@ impl Movement {
         self.last_rot = rot_of(self.yaw);
         self.last_msg_pos = pos;
         self.recalc();
+    }
+
+    /// `SetPosIIR_c` apply [GC 0x10076e5a] for the own dynel: `stop` (flag `+0x2c`) runs `FUN_10059ae5(1)` = FullStop while moving, then vehicle
+    /// vtable `+0x60` (`FUN_1006eed0`: `+0x174 = +0xd4 = y`, `LandNow(y)`: airborne ends, landing callback) and `SetRelPosRot(pos, current rot)`;
+    /// the velocity is kept. The alignment against the ground is the next step's.
+    pub fn set_pos(&mut self, pos: [f32; 3], stop: bool) {
+        if stop {
+            self.stop_if_moving();
+        }
+        self.pos = pos;
+        self.airborne = false;
+        self.vy = 0.0;
+        self.launch_y = pos[1];
+        self.on_land(pos[1]);
+    }
+
+    /// `FUN_10059ae5(1)`: while the vehicle `IsMoving` (vtable `+0x9c`) its vtable `+0x98` (`FUN_1006f008`) runs FSM `Transition(0x15)` FullStop.
+    /// Used by SetPos (flag), the death action `0x63`, `FUN_10044a07` (Features bit 4 cleared) and Resurrect.
+    pub fn stop_if_moving(&mut self) -> bool {
+        self.fsm.is_moving() && self.transition(id::FULL_STOP)
+    }
+
+    /// `FollowTargetIIR_c` apply [GC 0x100732e3] part 1: `pos` (non-zero) is set with the current rotation (`SetRelPosRot`, then again by
+    /// `FUN_1006fe02` as `SetRelPosIgnoreCollision`), before the gate and the mode check run.
+    pub fn follow_place(&mut self, pos: [f32; 3]) {
+        if pos != [0.0; 3] {
+            self.pos = pos;
+        }
+    }
+
+    /// `FollowTargetIIR_c` apply part 2 (after the caller's Features / district gate): dropped in FSM modes 1, 8, 9, 0xB, 0xC; else the FSM runs
+    /// `Transition(mode)` (live ids 21 FullStop, 24 Walk, 25 Run) and `FUN_1006fe02` stores the waypoints (at most 30, up to the first
+    /// all-zero entry). The vehicle then steers to the first waypoint; a manual movement action cancels the path.
+    pub fn follow_target(&mut self, mv: u8, path: &[[f32; 3]]) -> bool {
+        if matches!(self.fsm.mode, 1 | 8 | 9 | 0xB | 0xC) {
+            return false;
+        }
+        self.transition(mv);
+        self.follow = path.iter().take(FOLLOW_MAX).take_while(|p| **p != [0.0; 3]).copied().collect();
+        if !self.follow.is_empty() && self.fsm.fwd == 1 {
+            self.transition(id::FORWARD_START);
+        }
+        true
+    }
+
+    /// `Vehicle_t::Impulse(delta, time)` [VH 0x1000cd61]: a ballistic flight from the current position to `pos + (dx, 0, dz)` lasting `time`
+    /// seconds replaces any path (`FUN_1000c41a`: the old one is deleted, `+0xac = 0`; the first path saves the falling flag and disables
+    /// falling). Movement actions are refused until it ends. A non-positive `time` is ignored (the original divides by it).
+    pub fn impulse(&mut self, delta: [f32; 3], time: f32) {
+        if !(time > 0.0) || !time.is_finite() || delta.iter().any(|d| !d.is_finite()) {
+            return;
+        }
+        let restore_falling = self.ballistic.as_ref().map_or(self.falling_enabled, |b| b.restore_falling);
+        if self.ballistic.is_none() {
+            self.disable_falling();
+        }
+        let v0 = [delta[0] / time, -BALLISTIC_G * time * 0.5, delta[2] / time];
+        self.ballistic = Some(Ballistic { start: self.pos, v0, dur: time, t: 0.0, restore_falling });
+    }
+
+    /// An `Impulse` flight is running (`Vehicle +0x108 != 0`).
+    pub fn pushed(&self) -> bool {
+        self.ballistic.is_some()
+    }
+
+    /// Stats the transition `Apply`s wrote since the last call (WaitState, RestModifier): the caller stores them in the own stat table.
+    pub fn take_stat_writes(&mut self) -> Vec<(u32, i32)> {
+        std::mem::take(&mut self.stat_writes)
+    }
+
+    /// `SetStat` from an `Apply`: also mirrored into [`Stats`] where the FSM reads it back.
+    fn write_stat(&mut self, id: u32, v: i32) {
+        if id == STAT_WAIT_STATE {
+            self.stats.wait_state = v;
+        }
+        self.stat_writes.push((id, v));
+    }
+
+    /// `Apply` of the sit family: `RestModifier` (when the function writes it) and `WaitState`.
+    fn write_rest(&mut self, rest: Option<i32>, wait: i32) {
+        if let Some(r) = rest {
+            self.write_stat(STAT_REST_MODIFIER, r);
+        }
+        self.write_stat(STAT_WAIT_STATE, wait);
+    }
+
+    /// One `Vehicle_t::Run` while a `BallisticPath_t` is installed [VH 0x1000e849]: the body is set to the path position of `t`; while the flight
+    /// goes on `EnsureSurfaceAlignment` (reduced: wall slide, never below the support) runs and a deviation of 0.5 m or more from the path point
+    /// aborts it at the old position; at the end the path is deleted, the falling flag restored and the body lands.
+    fn run_ballistic(&mut self, dt: f32, world: &dyn World) {
+        let Some(b) = self.ballistic.as_mut() else { return };
+        b.t += dt;
+        let running = b.t <= b.dur;
+        let t = b.t.min(b.dur);
+        let g = [0.0, BALLISTIC_G, 0.0];
+        let p: [f32; 3] = std::array::from_fn(|i| b.start[i] + b.v0[i] * t + 0.5 * g[i] * t * t);
+        let old = self.pos;
+        self.pos = p;
+        let mut alive = running;
+        if running {
+            let body = Body { falling_enabled: self.falling_enabled, airborne: self.airborne, vy: self.vy, teleport: false };
+            self.pos = world.align(old, p, &body, &mut self.surface).pos;
+            let d = (0..3).map(|i| (self.pos[i] - p[i]).powi(2)).sum::<f32>().sqrt();
+            if d >= BALLISTIC_ABORT {
+                self.pos = old;
+                alive = false;
+            }
+        }
+        if !alive {
+            let restore = self.ballistic.take().is_some_and(|b| b.restore_falling);
+            if restore {
+                self.enable_falling();
+            }
+        }
     }
 
     /// `dynel + 0x220 / GetZoneInstanceID` changed (zone border crossed): arms the sync of `FUN_1005a5d6`.
@@ -883,11 +1042,15 @@ impl Movement {
         self.clock += dt.max(0.0) as f64;
         if self.snap_pending {
             self.snap_pending = false;
-            if let Some(g) = world.ground([self.pos[0], self.pos[1] + STEP_UP, self.pos[2]]) {
-                self.pos[1] = g;
+            if let Some(g) = world.ground(self.pos) {
+                self.pos[1] = g + FOOT_CLEARANCE;
             }
         }
-        if dt > 0.0 && dt <= MAX_DT {
+        if self.ballistic.is_some() {
+            if dt > 0.0 && dt <= MAX_DT {
+                self.run_ballistic(dt, world);
+            }
+        } else if dt > 0.0 && dt <= MAX_DT {
             let mut left = dt;
             while left > 0.0 {
                 let h = left.min(MAX_SUBSTEP);
@@ -922,7 +1085,7 @@ impl Movement {
             action = id::SYNC;
             local = true;
         }
-        if !self.controllable || !self.fsm.allowed(action) {
+        if !self.controllable || self.ballistic.is_some() || !self.fsm.allowed(action) {
             return;
         }
         if self.fsm.mode == mode::FLY && action == id::JUMP_START {
@@ -963,6 +1126,14 @@ impl Movement {
         self.last_rot = msg.rot;
         self.last_msg_pos = msg.pos;
         let feat = self.stats.features;
+        if action != id::JUMP_START && action != id::SYNC {
+            // FUN_1006b84b: a movement action cancels the FollowTarget path (the sync exemption is a [GUESS]: CheckMotionUpdate would cancel it every 5 s)
+            if !self.follow.is_empty() {
+                // [GUESS] the ForwardStart the path began with is ended with it
+                self.follow.clear();
+                self.transition(id::FORWARD_STOP);
+            }
+        }
         if feat & 6 != 0 && (feat & 4 != 0 || (8 < action && action < 15)) {
             // action 0x16: VehicleForwardUpdate(pos, rot, 0, 0) changes nothing for the own, already placed dynel.
             let gm_fly_ok = self.stats.gm_level & 1 != 0;
@@ -1179,7 +1350,11 @@ impl Movement {
                 self.leave_fly(old);
                 self.in_elev = 0.0;
             }
-            Act::LeaveSwim | Act::LeaveSit | Act::LeaveFrozen => self.recalc(),
+            Act::LeaveSwim | Act::LeaveFrozen => self.recalc(),
+            Act::LeaveSit => {
+                self.recalc();
+                self.write_rest(Some(100), 0);
+            }
             Act::ToSneak => {
                 if old.strafe == 2 {
                     let sign = if old.strafe_dir == 3 { -1.0 } else { 1.0 };
@@ -1202,9 +1377,18 @@ impl Movement {
             Act::ToSitGround => {
                 self.recalc();
                 self.halt();
+                self.write_rest(Some(25), 2);
             }
             Act::ToCrawl | Act::ToSleep | Act::ToLounge | Act::LeaveCrawl | Act::LeaveSleep | Act::LeaveLounge => {
                 self.recalc();
+                // WaitState / RestModifier writes of FUN_1006e646 / 1006e6ff / 1006e8a9 / 1006e3ff / 1006e79f / 1006e949
+                match act {
+                    Act::ToCrawl => self.write_rest(None, 0xE),
+                    Act::ToSleep => self.write_rest(None, 0xF),
+                    Act::ToLounge => self.write_rest(None, 0x10),
+                    Act::LeaveLounge => self.write_rest(Some(100), 2),
+                    _ => self.write_rest(Some(100), 0),
+                }
                 // CalculateGroundPoint + SetRelPos
                 self.snap_pending = true;
             }
@@ -1219,6 +1403,24 @@ impl Movement {
         }
     }
 
+    /// `FUN_10070fee` path branch (`SteeringDirArrive` towards the first waypoint): the velocity points at it with the arrival ramp
+    /// `min(vmax, d / (vmax / 4) * vmax)`; a reached waypoint is popped and the end of the path runs ForwardStop
+    /// (`FUN_10070c00`). The arrival radius `max(vmax / 4, 0.5)` is a [GUESS] (the original reads it from an unresolved virtual, docs/zone/motion.md §4).
+    fn steer_follow(&mut self, w: [f32; 3]) {
+        let (dx, dz) = (w[0] - self.pos[0], w[2] - self.pos[2]);
+        let d = (dx * dx + dz * dz).sqrt();
+        let ramp = self.max_vel * 0.25;
+        if d < ramp.max(0.5) {
+            self.follow.remove(0);
+            if self.follow.is_empty() {
+                self.transition(id::FORWARD_STOP);
+            }
+            return;
+        }
+        let v = (d / ramp * self.max_vel).min(self.max_vel);
+        self.vel = [dx / d * v, dz / d * v];
+    }
+
     /// `Vehicle_t::SetDirection`: a direction change halts.
     fn set_direction(&mut self, d: i32) {
         if d != self.dir {
@@ -1231,12 +1433,16 @@ impl Movement {
     fn step(&mut self, h: f32, world: &dyn World) {
         let old = self.pos;
         let mode = self.fsm.mode;
+        // `FUN_10070fee` path branch: steer to the first FollowTarget waypoint (not in modes 1, 8, 9)
+        if let Some(&w) = self.follow.first().filter(|_| !matches!(mode, 1 | 8 | 9)) {
+            self.steer_follow(w);
+        }
         // gravity
         if self.airborne {
             self.vy = (self.vy + GRAVITY * h).clamp(-VY_LIMIT, VY_LIMIT);
         }
         // CalcSteering (PlayerVehicle vtbl[0x13]): forward / reverse thrust along the body forward.
-        let steer = !matches!(mode, 1 | 8 | 9) && self.in_fwd != 0.0;
+        let steer = !matches!(mode, 1 | 8 | 9) && self.in_fwd != 0.0 && self.follow.is_empty();
         if steer || self.airborne {
             if steer {
                 let f = self.forward();
@@ -1292,45 +1498,33 @@ impl Movement {
         }
     }
 
-    /// `Vehicle_t::EnsureSurfaceAlignment`, reduced to what [`World`] offers: wall sliding, snapping to the support
-    /// below (step tolerance `0.48 + 2 * step length`), start of a fall and landing. The multi-ray slope / liquid /
-    /// normal-alignment handling of the original is not ported (see docs/zone/movement.md).
+    /// `Vehicle_t::EnsureSurfaceAlignment` through [`World::align`] (wall sweep, ground following, support test with the step
+    /// tolerance `0.48 + 1.1547 * step length`), then the fall bookkeeping of the original: nothing carries a walking body ->
+    /// `FUN_1000a1a7` starts a fall, ground under a falling body -> `LandNow`. The liquid medium transitions (`Vehicle +0xfc`)
+    /// are not ported (see docs/zone/collision.md).
     fn align(&mut self, old: [f32; 3], world: &dyn World) {
-        let target = self.pos;
-        let slid = world.slide(old, target);
-        self.pos = [slid[0], target[1], slid[2]];
-        let mode = self.fsm.mode;
-        if mode == mode::FLY {
-            if let Some(g) = world.ground([self.pos[0], self.pos[1] + STEP_UP, self.pos[2]]) {
-                self.pos[1] = self.pos[1].max(g + 0.1);
-            }
+        if !self.surface_collision {
+            self.airborne = false;
+            self.vy = 0.0;
             return;
         }
+        let body = Body { falling_enabled: self.falling_enabled, airborne: self.airborne, vy: self.vy, teleport: false };
+        let r = world.align(old, self.pos, &body, &mut self.surface);
+        self.pos = r.pos;
         if !self.falling_enabled {
             return;
         }
-        let hstep = ((self.pos[0] - old[0]).powi(2) + (self.pos[2] - old[2]).powi(2)).sqrt();
-        let ground = world.ground([self.pos[0], old[1].max(self.pos[1]) + STEP_UP, self.pos[2]]);
-        if self.airborne {
-            let floor = ground.unwrap_or(self.launch_y);
-            if self.vy <= 0.0 && self.pos[1] <= floor {
-                self.pos[1] = floor;
+        if r.airborne {
+            if !self.airborne {
+                // walked off an edge
+                self.airborne = true;
                 self.vy = 0.0;
-                self.airborne = false;
-                self.on_land(floor);
+                self.launch_y = old[1];
             }
-        } else {
-            match ground {
-                Some(g) if g >= old[1] - (STEP_DOWN + 2.0 * hstep) => self.pos[1] = g,
-                Some(_) => {
-                    // walked off an edge
-                    self.pos[1] = old[1];
-                    self.airborne = true;
-                    self.vy = 0.0;
-                    self.launch_y = old[1];
-                }
-                None => self.pos[1] = old[1],
-            }
+        } else if self.airborne {
+            self.vy = 0.0;
+            self.airborne = false;
+            self.on_land(self.pos[1]);
         }
     }
 }
@@ -1340,13 +1534,20 @@ mod tests {
     use super::*;
     use ao_net::n3::outgoing::{char_dc_move, parse_char_dc_move};
 
+    /// The support test of `EnsureSurfaceAlignment` on a floor at height `ground` (0.48 m tolerance, no sweep).
+    fn carried(ground: f32, new: [f32; 3], body: &Body) -> Aligned {
+        let on = new[1] - 0.48 <= ground && body.vy <= 0.1;
+        let y = if body.falling_enabled && on { ground } else { new[1].max(ground) };
+        Aligned { pos: [new[0], y, new[2]], airborne: !on, normal: [0.0, 1.0, 0.0], liquid: -9999.0 }
+    }
+
     struct Flat(f32);
     impl World for Flat {
         fn ground(&self, _p: [f32; 3]) -> Option<f32> {
             Some(self.0)
         }
-        fn slide(&self, _from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
-            to
+        fn align(&self, _old: [f32; 3], new: [f32; 3], body: &Body, _st: &mut SurfaceState) -> Aligned {
+            carried(self.0, new, body)
         }
     }
     /// Wall at x >= 10.
@@ -1355,9 +1556,9 @@ mod tests {
         fn ground(&self, _p: [f32; 3]) -> Option<f32> {
             Some(0.0)
         }
-        fn slide(&self, _from: [f32; 3], mut to: [f32; 3]) -> [f32; 3] {
-            to[0] = to[0].min(10.0);
-            to
+        fn align(&self, _old: [f32; 3], mut new: [f32; 3], body: &Body, _st: &mut SurfaceState) -> Aligned {
+            new[0] = new[0].min(10.0);
+            carried(0.0, new, body)
         }
     }
 
@@ -1459,7 +1660,8 @@ mod tests {
         }
         assert!((peak - 1.0).abs() < 0.05, "apex {peak}");
         let l = landed.unwrap();
-        assert!((l - 2.0 * 40f32.sqrt() / 20.0).abs() < 0.05, "air time {l}");
+        // the body lands once its feet are within the 0.48 m step tolerance of the ground (`EnsureSurfaceAlignment`)
+        assert!((l - (40f32.sqrt() + (40.0 - 40.0 * 0.48f32).sqrt()) / 20.0).abs() < 0.02, "air time {l}");
         assert_eq!(m.fsm().jump, 1, "landing runs JumpStop");
         assert_eq!(m.pos()[1], 0.0);
         // can jump again
@@ -1544,28 +1746,158 @@ mod tests {
         assert_eq!(st.build(id::TURN_LEFT_START, true).unwrap().0.elev, 2);
     }
 
+    /// `N3Msg_SitToggle` through the shared decision (`action::sit_toggle`) and the movement facts of [`Movement::sit_input`].
+    fn toggle_sit(m: &mut Movement, now: f32) -> Vec<ao_net::n3::action::Outgoing> {
+        let out = ao_net::n3::action::sit_toggle(&m.sit_input(false));
+        for o in &out {
+            if let ao_net::n3::action::Outgoing::Move(a) = o {
+                m.action(*a, now);
+            }
+        }
+        out
+    }
+
     #[test]
     fn sit_and_modes() {
+        use ao_net::n3::action::{id as act, Outgoing};
         let w = Flat(0.0);
         let mut m = Movement::new([0.0; 3], 0.0, 0);
-        assert_eq!(m.sit_toggle(0.0), SitToggle::Sat);
+        assert_eq!(toggle_sit(&mut m, 0.0), [Outgoing::Move(id::SWITCH_SIT_GROUND)]);
         assert_eq!(m.fsm().mode, mode::SIT_GROUND);
         assert_eq!(m.role(), Role::SitGround);
+        // Apply of SwitchToSitGround writes RestModifier 25 and WaitState 2 (FUN_1006e2be)
+        assert_eq!(m.take_stat_writes(), [(STAT_REST_MODIFIER, 25), (STAT_WAIT_STATE, 2)]);
+        assert_eq!(m.stats().wait_state, 2);
         m.action(id::FORWARD_START, 1.0); // refused while sitting
         assert_eq!(m.take_outgoing().len(), 1);
         assert_eq!(m.fsm().fwd, 1);
-        assert_eq!(m.sit_toggle(2.0), SitToggle::StandRequest);
+        // sitting: the toggle asks the server to stand up (CharacterActionIIR_t 0x57), no move
+        let stand = toggle_sit(&mut m, 2.0);
+        assert!(matches!(&stand[..], [Outgoing::Action(a)] if a.action == act::STAND_UP));
+        assert!(m.take_outgoing().is_empty());
+        // the server's 0x57 echo: WaitState 2 -> LeaveSit; RestModifier 100, WaitState 0
         assert!(m.transition(id::LEAVE_SIT));
+        assert_eq!(m.take_stat_writes(), [(STAT_REST_MODIFIER, 100), (STAT_WAIT_STATE, 0)]);
         assert_eq!(m.fsm().mode, mode::WALK, "returns to the last speed mode (ctor: walk)");
         run(&mut m, &w, 0.1);
-        // moving: sit refused
+        // moving: the toggle is refused (vehicle vtable +0x9c = IsMoving) and sends nothing
         m.action(id::FORWARD_START, 3.0);
-        assert_eq!(m.sit_toggle(3.0), SitToggle::Ignored);
+        assert!(toggle_sit(&mut m, 3.0).is_empty());
         // server messages for the own dynel are dropped by the original
         let mv = CharDCMove { move_type: 1, type_bit7: false, rot: [0.0, 0.0, 0.0, 1.0], pos: [1.0, 2.0, 3.0], time: 0, extra: [0.0; 2] };
         let p = m.pos();
         assert!(!m.server_move(&mv));
         assert_eq!(m.pos(), p);
+    }
+
+    #[test]
+    fn sleep_and_lounge_write_wait_state() {
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        assert!(m.transition(id::SWITCH_SIT_GROUND)); // sleep / lounge are entered from sitting (walk refuses 0x21 / 0x22)
+        m.take_stat_writes();
+        assert!(m.transition(id::SWITCH_SLEEP));
+        assert_eq!(m.take_stat_writes(), [(STAT_WAIT_STATE, 0xF)]);
+        // sleep -> stand up request (WaitState 0xF), the echo leaves sleep for sitting and writes WaitState 0
+        assert!(matches!(&ao_net::n3::action::sit_toggle(&m.sit_input(false))[..], [ao_net::n3::action::Outgoing::Action(_)]));
+        assert!(m.transition(id::LEAVE_SLEEP));
+        assert_eq!((m.fsm().mode, m.take_stat_writes()), (mode::SIT_GROUND, vec![(STAT_REST_MODIFIER, 100), (STAT_WAIT_STATE, 0)]));
+        assert!(m.transition(id::SWITCH_LOUNGE));
+        assert_eq!(m.take_stat_writes().last(), Some(&(STAT_WAIT_STATE, 0x10)));
+        assert!(m.transition(id::LEAVE_LOUNGE));
+        assert_eq!(m.take_stat_writes(), [(STAT_REST_MODIFIER, 100), (STAT_WAIT_STATE, 2)]);
+    }
+
+    #[test]
+    fn set_pos_places_keeps_rotation_and_stops() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 1.0, 0);
+        m.action(id::FORWARD_START, 0.0);
+        run(&mut m, &w, 0.5);
+        assert!(m.fsm().is_moving());
+        m.set_pos([50.0, 0.0, 60.0], true);
+        assert_eq!(m.pos(), [50.0, 0.0, 60.0]);
+        assert!((m.yaw() - 1.0).abs() < 1e-3, "SetPos keeps the rotation");
+        assert!(!m.fsm().is_moving(), "flag +0x2c: FullStop while moving");
+        // without the flag the movement goes on
+        m.action(id::FORWARD_START, 1.0);
+        m.set_pos([0.0; 3], false);
+        assert!(m.fsm().is_moving());
+    }
+
+    #[test]
+    fn impulse_flies_the_ballistic_arc_and_refuses_actions() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([10.0, 0.0, 10.0], 0.0, 0);
+        m.impulse([6.0, 5.0, -3.0], 1.0); // y of the delta is ignored
+        assert!(m.pushed());
+        m.action(id::FORWARD_START, 0.0);
+        assert_eq!(m.fsm().fwd, 1, "no movement action during the flight (Vehicle +0x108 != 0)");
+        // half way: x/z linear, y = v0 t + g t^2 / 2 with v0 = -g T / 2: the apex 9.81 / 8
+        run(&mut m, &w, 0.5);
+        let p = m.pos();
+        assert!((p[0] - 13.0).abs() < 0.2 && (p[2] - 8.5).abs() < 0.2, "{p:?}");
+        assert!((p[1] - 9.81 / 8.0).abs() < 0.05, "{p:?}");
+        run(&mut m, &w, 0.7);
+        assert!(!m.pushed(), "path deleted after T");
+        let p = m.pos();
+        assert!((p[0] - 16.0).abs() < 0.3 && (p[2] - 7.0).abs() < 0.3 && p[1].abs() < 0.2, "{p:?}");
+        m.action(id::FORWARD_START, 5.0);
+        assert_eq!(m.fsm().fwd, 2, "controllable again");
+        // a bad duration is ignored
+        m.impulse([1.0, 0.0, 1.0], 0.0);
+        assert!(!m.pushed());
+    }
+
+    #[test]
+    fn impulse_aborts_on_a_wall() {
+        let mut m = Movement::new([8.0, 0.0, 0.0], 0.0, 0);
+        m.impulse([10.0, 0.0, 0.0], 1.0);
+        run(&mut m, &Wall, 1.5);
+        assert!(!m.pushed());
+        assert!(m.pos()[0] <= 10.0 + 1e-3, "{:?}", m.pos());
+    }
+
+    #[test]
+    fn follow_target_modes_path_and_cancel() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        // mode 25 = run, path to (0, 0, 20): the vehicle steers to it without keys and returns to idle
+        assert!(m.follow_target(25, &[[0.0, 0.0, 20.0]]));
+        assert_eq!(m.fsm().mode, mode::RUN);
+        run(&mut m, &w, 6.0);
+        assert!((m.pos()[2] - 20.0).abs() < 1.5 && m.pos()[0].abs() < 0.2, "{:?}", m.pos());
+        assert_eq!(m.fsm().fwd, 1, "ForwardStop at the end of the path");
+        // the first waypoint is zero-terminated, a key press cancels the path
+        assert!(m.follow_target(24, &[[0.0, 0.0, 40.0], [0.0; 3], [9.0, 9.0, 9.0]]));
+        m.action(id::STRAFE_LEFT_START, 7.0);
+        let z = m.pos()[2];
+        run(&mut m, &w, 1.0);
+        assert!((m.pos()[2] - z).abs() < 0.1, "path cancelled");
+        // dropped in sit / sleep / lounge / frozen
+        m.transition(id::FULL_STOP);
+        assert!(m.transition(id::SWITCH_SIT_GROUND));
+        assert!(!m.follow_target(25, &[[1.0, 0.0, 1.0]]));
+        // the placement part runs before any gate
+        m.follow_place([5.0, 0.0, 5.0]);
+        assert_eq!(m.pos(), [5.0, 0.0, 5.0]);
+        m.follow_place([0.0; 3]);
+        assert_eq!(m.pos(), [5.0, 0.0, 5.0], "a zero position places nothing");
+    }
+
+    #[test]
+    fn flags_stat_switches_falling_and_surface_collision() {
+        let w = Flat(0.0);
+        let mut m = Movement::new([0.0, 5.0, 0.0], 0.0, 0);
+        m.set_stats(|s| s.flags = FLAG_NO_FALL);
+        run(&mut m, &w, 1.0);
+        assert_eq!(m.pos()[1], 5.0, "DisableFalling: no gravity");
+        m.set_stats(|s| s.flags = 0);
+        run(&mut m, &w, 2.0);
+        assert!(m.pos()[1] < 0.5, "falling again: {:?}", m.pos());
+        m.set_stats(|s| s.flags = FLAG_NO_SURFACE);
+        m.action(id::FORWARD_START, 0.0);
+        run(&mut m, &Wall, 8.0);
+        assert!(m.pos()[2] > 10.0 || m.pos()[0].abs() < 1e-3, "no surface collision: {:?}", m.pos());
     }
 
     #[test]
@@ -1639,8 +1971,8 @@ mod tests {
             fn ground(&self, p: [f32; 3]) -> Option<f32> {
                 Some(if p[2] > 2.0 { 0.3 } else { 0.0 })
             }
-            fn slide(&self, _f: [f32; 3], t: [f32; 3]) -> [f32; 3] {
-                t
+            fn align(&self, _o: [f32; 3], t: [f32; 3], body: &Body, _st: &mut SurfaceState) -> Aligned {
+                carried(if t[2] > 2.0 { 0.3 } else { 0.0 }, t, body)
             }
         }
         let mut m = Movement::new([0.0; 3], 0.0, 0);

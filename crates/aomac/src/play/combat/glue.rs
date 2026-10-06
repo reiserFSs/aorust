@@ -7,11 +7,9 @@ use super::state::CombatEvent;
 use super::module::{Command, Module};
 use crate::play::chat::GameAction;
 use crate::play::controls::Cmd;
-use crate::play::movement::SitToggle;
 use crate::play::Play;
 use ao_formats::character::Role;
 use ao_gui::{DrawList, FontId};
-use ao_net::msg::Identity;
 use ao_net::n3::action;
 use ao_render::Host;
 
@@ -26,10 +24,10 @@ impl Play {
     fn fight_sit(&mut self) {
         let (Some(m), Some(p)) = (self.fight.as_mut(), self.player.as_mut()) else { return };
         m.before_sit();
-        if p.sit() == SitToggle::StandRequest {
-            let none = Identity::default();
-            let a = action::simple(action::id::STAND_UP, none, none);
-            m.push(action::character_action(self.zone.char_id as i32, &a));
+        for o in p.sit() {
+            if let action::Outgoing::Action(a) = o {
+                m.push(action::character_action(self.zone.char_id as i32, &a));
+            }
         }
     }
 
@@ -41,14 +39,6 @@ impl Play {
         }
         let mode = self.player.as_ref().map_or(0, |p| p.mode());
         self.fight.as_mut().is_some_and(|m| m.special_action(id as i32, &self.zone, mode))
-    }
-
-    /// `N3Msg_SwitchTarget(id)` (CTRL / ALT + left click on a character).
-    pub(in crate::play) fn fight_switch(&mut self, id: i32) {
-        let mode = self.player.as_ref().map_or(0, |p| p.mode());
-        if let Some(m) = self.fight.as_mut() {
-            m.command(Command::SwitchTarget(id), &self.zone, mode);
-        }
     }
 
     /// Per frame while in the world: the player's combat keys, the layer's timers / music, outgoing frames, chat feedback.

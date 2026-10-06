@@ -5,6 +5,9 @@ use ao_net::frame::Frame;
 use ao_net::n3::{self, dynel::Dynel, misc::Misc, world::World, N3};
 use std::collections::{BTreeMap, HashMap};
 
+/// `CurrentNano` stat id (0xd6): the second value `ResurrectIIR_t` sets.
+const NANO_STAT: u32 = 0xD6;
+
 /// Identity kind of character / NPC dynels (`SimpleChar_t`).
 const CHAR_KIND: i32 = 0xC350;
 
@@ -38,6 +41,25 @@ pub enum ZoneEvent {
     None,
 }
 
+/// Server messages that act on the own character's movement, in arrival order; `Player::frame` drains them into `Movement`
+/// (the original applies each one to the control dynel's vehicle at once; docs/zone/movement.md §10).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnEvent {
+    /// Placed at `pos` (server coordinates), heading `yaw`; `full_reset` clears the velocity, inputs and FSM like a spawn
+    /// (`Movement::teleport`; the in-playfield `n3TeleportIIR_t`).
+    Place { pos: [f32; 3], yaw: f32, full_reset: bool },
+    /// `SetPosIIR_c` [GC 0x10076e5a]: `pos` with the current rotation; `stop` = full stop while moving.
+    SetPos { pos: [f32; 3], stop: bool },
+    /// `ImpulseIIR_c` element for the own dynel: `Vehicle_t::Impulse(delta, time)`.
+    Impulse { delta: [f32; 3], time: f32 },
+    /// `FollowTargetIIR_c` [GC 0x100732e3] with the own dynel as header.
+    Follow { mode: u8, pos: [f32; 3], path: Vec<[f32; 3]> },
+    /// `CharacterActionIIR_t` action id of the own dynel (`0x56` sit relay, `0x57` stand up, `0x63` death, `0xAD`).
+    Action(i32),
+    /// `ResurrectIIR_t` [GC 0x100769bd]: Health / CurrentNano are in the stat table, the vehicle recalculates.
+    Resurrected,
+}
+
 #[derive(Default)]
 pub struct Zone {
     pub char_id: u32,
@@ -66,6 +88,8 @@ pub struct Zone {
     /// The fight controller target of every dynel (`SimpleChar+0x1d4`, `+0x4c/+0x50`, set by the relayed `AttackIIR_t`, cleared by
     /// `StopFightIIR_t`; `N3Msg_GetTargetTarget` GC 0x1001641d reads it): fighter → its target instance id.
     pub fight_target: HashMap<i32, i32>,
+    /// Pending [`OwnEvent`]s (drained by the player each frame).
+    pub own_events: Vec<OwnEvent>,
 }
 
 impl Zone {
@@ -108,6 +132,7 @@ impl Zone {
         self.world.clear();
         self.dynels.clear();
         self.fight_target.clear();
+        self.own_events.clear();
         self.in_play_sent = false;
     }
 
@@ -190,16 +215,32 @@ impl Zone {
                     d.yaw = Some(mv.yaw());
                 }
             }
+            // server messages that place / push / reconfigure the own character (the original applies them to its vehicle, §10)
+            N3::Misc(Misc::FollowTarget(f)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                let v = |p: &ao_net::n3::misc::Vec3| [p.x, p.y, p.z];
+                self.own_events.push(OwnEvent::Follow { mode: f.mode, pos: v(&f.pos), path: f.path.iter().map(v).collect() });
+            }
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                self.own_events.push(OwnEvent::Action(a.action));
+            }
+            N3::Unknown(body) if who.kind == CHAR_KIND => self.on_unknown(m.header.msg_type, who.instance, &body),
             // `n3TeleportIIR_t::Activate` [N3 0x10029f87]: a destination playfield only matters for the own character
             // (`StartTeleport`); otherwise the dynel is placed (`SetRelPosRot`)
             N3::Teleport(t) if who.kind == CHAR_KIND => {
+                let own = who.instance == self.char_id as i32;
                 if t.is_zone_change() {
-                    if who.instance == self.char_id as i32 {
+                    if own {
                         return ZoneEvent::Teleport;
                     }
-                } else if let Some(d) = self.dynels.get_mut(&who.instance) {
-                    d.pos = t.pos;
-                    d.yaw = Some(ao_net::n3::dynel::yaw(&t.rot));
+                } else {
+                    let yaw = ao_net::n3::dynel::yaw(&t.rot);
+                    if own {
+                        self.own_events.push(OwnEvent::Place { pos: t.pos, yaw, full_reset: true });
+                    }
+                    if let Some(d) = self.dynels.get_mut(&who.instance) {
+                        d.pos = t.pos;
+                        d.yaw = Some(yaw);
+                    }
                 }
             }
             N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => {
@@ -215,6 +256,46 @@ impl Zone {
             _ => {}
         }
         ZoneEvent::None
+    }
+
+    /// `SetPosIIR_c`, `ImpulseIIR_c`, `ResurrectIIR_t` (docs/zone/movement.md §10): own character -> [`OwnEvent`], others -> their placed position / health.
+    fn on_unknown(&mut self, msg: u32, who: i32, body: &[u8]) {
+        use ao_net::n3::server_move as sm;
+        let own = who == self.char_id as i32;
+        match msg {
+            sm::SET_POS => match sm::parse_set_pos(body) {
+                Ok(p) if own => self.own_events.push(OwnEvent::SetPos { pos: p.pos, stop: p.stop }),
+                Ok(p) => {
+                    if let Some(d) = self.dynels.get_mut(&who) {
+                        d.pos = p.pos;
+                    }
+                }
+                Err(e) => eprintln!("zone: SetPos: {e:#}"),
+            },
+            sm::IMPULSE => match sm::parse_impulse(body) {
+                Ok(v) => {
+                    let own_id = ao_net::msg::Identity { kind: CHAR_KIND, instance: self.char_id as i32 };
+                    for p in v.into_iter().filter(|p| p.target == own_id) {
+                        self.own_events.push(OwnEvent::Impulse { delta: p.delta, time: p.time });
+                    }
+                }
+                Err(e) => eprintln!("zone: Impulse: {e:#}"),
+            },
+            sm::RESURRECT => match sm::parse_resurrect(body) {
+                Ok(r) if own => {
+                    self.stats.insert(ao_formats::stats::HEALTH, r.health);
+                    self.stats.insert(NANO_STAT, r.nano);
+                    self.own_events.push(OwnEvent::Resurrected);
+                }
+                Ok(r) => {
+                    if let Some(d) = self.dynels.get_mut(&who) {
+                        d.health = r.health;
+                    }
+                }
+                Err(e) => eprintln!("zone: Resurrect: {e:#}"),
+            },
+            _ => {}
+        }
     }
 }
 
@@ -359,5 +440,37 @@ mod tests {
         assert!(n >= 20, "{n} samples");
         assert!(good * 10 >= n * 9, "{good}/{n}");
         assert!(mirrored_good * 2 < n, "the mirrored handedness matches {mirrored_good}/{n}");
+    }
+
+    /// SetPos / Impulse / CharacterAction / Resurrect for the own dynel become [`OwnEvent`]s (hand-built frames, none are in the captures).
+    #[test]
+    fn own_server_moves_are_queued() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::{action, outgoing::n3_frame, server_move as sm};
+        let me = Identity { kind: CHAR_KIND, instance: 7 };
+        let other = Identity { kind: CHAR_KIND, instance: 8 };
+        let mut z = Zone::new(7);
+        z.dynels.insert(8, DynelState { name: String::new(), pos: [0.0; 3], yaw: None, npc: false, side: 0, level: 1, health: 5, max_health: 5 });
+        let f = |p| n3_frame(1, 0, p);
+        z.on_frame(&f(sm::set_pos(me, &sm::SetPos { pos: [1.0, 2.0, 3.0], last_allowed: false, crowd_limit: 0, stop: true })));
+        z.on_frame(&f(sm::set_pos(other, &sm::SetPos { pos: [9.0, 9.0, 9.0], last_allowed: false, crowd_limit: 0, stop: false })));
+        let push = |t, d| sm::Push { target: t, delta: d, time: 0.5 };
+        z.on_frame(&f(sm::impulse(me, &[push(other, [1.0; 3]), push(me, [2.0, 0.0, 4.0])])));
+        z.on_frame(&f(action::character_action(7, &action::simple(action::id::STAND_UP, Identity::default(), Identity::default()))));
+        z.on_frame(&f(action::character_action(8, &action::simple(action::id::STAND_UP, Identity::default(), Identity::default()))));
+        z.on_frame(&f(sm::resurrect(me, &sm::Resurrect { health: 77, nano: 33 })));
+        assert_eq!(
+            z.own_events,
+            [
+                OwnEvent::SetPos { pos: [1.0, 2.0, 3.0], stop: true },
+                OwnEvent::Impulse { delta: [2.0, 0.0, 4.0], time: 0.5 },
+                OwnEvent::Action(0x57),
+                OwnEvent::Resurrected
+            ]
+        );
+        assert_eq!((z.stat(ao_formats::stats::HEALTH), z.stat(0xD6)), (Some(77), Some(33)));
+        assert_eq!(z.dynels[&8].pos, [9.0, 9.0, 9.0], "another dynel is just placed");
+        z.reset_world();
+        assert!(z.own_events.is_empty());
     }
 }
