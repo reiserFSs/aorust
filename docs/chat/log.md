@@ -2,7 +2,7 @@
 
 How the original client turns game events (hits, misses, XP, heals, level-ups, server feedback ...) into chat-window lines other than
 player chat. Address tags: `[GC]` Gamecode.dll, `[GUI]` GUI.dll, `[LDB]` ldb.dll (the text database / `LDBformat` / `RemoteFormat` library,
-imported into the Ghidra copy for this work), image-base VAs. Code: `lines_for` / `classify` / `from_n3` / `events` in `log.rs`.
+imported into the Ghidra copy for this work), image-base VAs. Code: `classify` / `from_n3` / `events` in `log.rs`.
 
 ## 1. Pipeline
 

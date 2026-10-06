@@ -1240,6 +1240,9 @@ impl Frontend for Play {
             for l in h.take_system_lines() {
                 c.system_line(&mut self.gui, &l, 12);
             }
+            for n in h.take_casts() {
+                c.cast_nano(&mut self.gui, &self.zone, &self.text, n);
+            }
             if let Some(id) = h.take_info() {
                 c.show_url(&mut self.gui, &self.zone, &self.text, &format!("charid://50000/{id}"));
             }

@@ -9,12 +9,11 @@
 //! the captured relayed moves: displacement after a ForwardStart points along `atan2(dx,dz) == yaw`). A positive yaw
 //! step turns right (clockwise seen from above): ForwardStart at yaw 0 moves +Z, TurnRight raises yaw. In scene
 //! coordinates (`scene_pos(p) = (x, y, -z)`) the same heading is the `ao_render::Camera` yaw: `(sin yaw, 0, -cos yaw)`.
-#![allow(dead_code)] // the full original action/stat surface; play/flow.rs consumes the parts it needs
 
 use ao_formats::character::Role;
 use ao_formats::playfield::collision::{Aligned, Body, LiquidEvent, SurfaceState, FOOT_CLEARANCE};
 use ao_net::n3::action::SitInput;
-use ao_net::n3::{dynel::CharDCMove, outgoing::CharMove};
+use ao_net::n3::outgoing::CharMove;
 
 mod fx;
 
@@ -596,6 +595,7 @@ fn rot_of(yaw: f32) -> [f32; 4] {
 }
 
 /// Heading of a server quaternion (`2*atan2(y, w)`, in `(-pi, pi]` for `w >= 0`).
+#[cfg(test)]
 pub fn yaw_of(q: [f32; 4]) -> f32 {
     2.0 * q[1].atan2(q[3])
 }
@@ -726,19 +726,6 @@ impl Movement {
     pub fn max_speed(&self) -> f32 {
         self.max_vel
     }
-    /// Playback speed factor of the movement clips (`FUN_1006fb56`: `max_vel / ref_speed`, times `100 / MonsterScale`,
-    /// at most 1.3 when `max_vel > 4`). The animation-calibration control factor (`FUN_100017f7`) is not modelled.
-    pub fn anim_scale(&self) -> f32 {
-        let mut s = self.max_vel / self.ref_speed;
-        if self.stats.monster_scale != 0 {
-            s *= 100.0 / self.stats.monster_scale as f32;
-        }
-        if s > 1.3 && self.max_vel > 4.0 {
-            s = 1.3;
-        }
-        s
-    }
-
     /// Clip role for the current state. The original also plays turn-in-place clips (anim ids 0xC4/0xC5), which have no
     /// [`Role`]; those states map to idle. Strafing plays WalkLeft/WalkRight in every mode (anim ids 0x86/0x87).
     pub fn role(&self) -> Role {
@@ -891,13 +878,6 @@ impl Movement {
         true
     }
 
-    /// A `CharDCMoveIIR_t` received from the server for the own character. The original drops it
-    /// (`FUN_1006bcc6`: the control dynel only accepts messages it created itself, `ToBePassedOn == 1`), so this
-    /// changes nothing and returns `false`. Position corrections arrive as teleports ([`Movement::teleport`]).
-    pub fn server_move(&mut self, _mv: &CharDCMove) -> bool {
-        false
-    }
-
     /// `n3Dynel_t::GetBodyCollSphereRadi` of the own dynel (`SurfaceState::radius`), fed by the avatar model's torso sphere.
     pub fn set_body_radius(&mut self, r: f32) {
         self.surface.radius = r;
@@ -1017,6 +997,7 @@ impl Movement {
     }
 
     /// An `Impulse` flight is running (`Vehicle +0x108 != 0`).
+    #[cfg(test)]
     pub fn pushed(&self) -> bool {
         self.ballistic.is_some()
     }
@@ -1084,11 +1065,6 @@ impl Movement {
             }
             self.zone_inst = zone;
         }
-    }
-
-    /// Vehicle path-following / dead dynel: refuses all movement actions (`FUN_10070fd0`).
-    pub fn set_controllable(&mut self, c: bool) {
-        self.controllable = c;
     }
 
     /// Messages produced since the last call.
@@ -1995,11 +1971,6 @@ mod tests {
         // moving: the toggle is refused (vehicle vtable +0x9c = IsMoving) and sends nothing
         m.action(id::FORWARD_START, 3.0);
         assert!(toggle_sit(&mut m, 3.0).is_empty());
-        // server messages for the own dynel are dropped by the original
-        let mv = CharDCMove { move_type: 1, type_bit7: false, rot: [0.0, 0.0, 0.0, 1.0], pos: [1.0, 2.0, 3.0], time: 0, extra: [0.0; 2] };
-        let p = m.pos();
-        assert!(!m.server_move(&mv));
-        assert_eq!(m.pos(), p);
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! line is routed by (the table of `FUN_10083e53` [GUI], [`class`]), `ColorCode` selects the `TextColors.xml` colour
 //! ([`color_name`], `ChatGUIModule_c::ColorCodeToHTMLColor` [GUI 0x10087860]); code 0 means "no `<font>`" and is `ChatKind::Other("")`.
 //! The window wraps a line as `<div><font color=NAME>text</font></div>` (`FUN_1009b37f` [GUI], [`window_html`]).
-#![allow(dead_code)]
 
 use super::line::{ChatKind, ChatLine};
 use ao_formats::screens::elf_hash;
@@ -17,11 +16,6 @@ use ao_net::n3::{dynel::Dynel, misc::Misc, world::World, Message, N3};
 
 /// Chat-window message classes (`FUN_10083e53` [GUI 0x10083e53] registers `name -> id` pairs; shown in the chat-config window).
 pub mod class {
-    pub const SYSTEM: u32 = 0x4000_0001;
-    pub const VICINITY: u32 = 0x4000_0002;
-    pub const TELL: u32 = 0x4000_0003;
-    pub const YOUR_PETS: u32 = 0x4100_0000;
-    pub const OTHER_PETS: u32 = 0x4100_0001;
     pub const ME_HIT_BY_ENVIRONMENT: u32 = 0x4200_0001;
     pub const ME_HIT_BY_NANO: u32 = 0x4200_0002;
     pub const YOUR_PET_HIT_BY_NANO: u32 = 0x4200_0003;
@@ -42,9 +36,6 @@ pub mod class {
     pub const ME_GOT_NANO: u32 = 0x4200_0016;
     pub const YOU_GAVE_NANO: u32 = 0x4200_0017;
     pub const ME_CAST_NANO: u32 = 0x4200_0018;
-    pub const TEAM_LOOT: u32 = 0x4200_001a;
-    pub const VICINITY_LOOT: u32 = 0x4200_001b;
-    pub const RESEARCH: u32 = 0x4200_001c;
 }
 
 /// `ColorCode_e` -> `TextColors.xml` name: the `{index, name}` table at [GUI 0x10268d38] (index 0 = `CCNoneColor`).
@@ -572,7 +563,7 @@ pub fn damage_type_name(d: i32) -> String {
 
 // ------------------------------------------------------------------------------------------------ events
 
-/// Game events that produce log lines. Built by [`from_n3`] (or by the hub for local actions such as [`LogEvent::CastNano`]).
+/// Game events that produce log lines. Built by [`from_n3`] (or by [`super::super::chat::Chat::cast_nano`] for the local [`LogEvent::CastNano`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogEvent {
     /// `AttackInfoIIR_t` 46002F16: `attacker` = frame header dynel, `victim` = `other`. `mode` = `unk_30` (3 normal, 4 critical, 2 glancing).
@@ -608,7 +599,7 @@ pub enum LogEvent {
 /// One line with the chat-window class it is routed by.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogLine {
-    /// `class::*` (`FUN_10083898` falls back to [`class::SYSTEM`] when the class has no window; legacy ids < 0x40000000 select a window by number).
+    /// `class::*` (`FUN_10083898` falls back to [`super::win::G_SYSTEM`] when the class has no window; legacy ids < 0x40000000 select a window by number).
     pub class: u32,
     pub line: ChatLine,
 }
@@ -1235,11 +1226,6 @@ fn action_lines(ctx: &LogCtx, who: Identity, action: i32, param: i32, a: Identit
     }
 }
 
-/// Lines for one event as plain `ChatLine`s (colour in `ChatKind::Other(name)`, "" = no `<font>`), after the chat filter.
-pub fn lines_for(ev: &LogEvent, ctx: &LogCtx) -> Vec<ChatLine> {
-    classify(ev, ctx).into_iter().map(|l| l.line).collect()
-}
-
 // ------------------------------------------------------------------------------------------------ tests
 
 #[cfg(test)]
@@ -1373,7 +1359,7 @@ mod tests {
             assert_eq!(l, vec![(class::ME_CAST_NANO, "CCMeCastNano", "Executing Nano Program: Heal I.".into())]);
             // character actions
             let act = |action, param, a, b| LogEvent::Action { who: id(1), action, param, a, b };
-            let l = texts(classify(&act(0x9c, class::SYSTEM as i32, id(2), id(25)), ctx));
+            let l = texts(classify(&act(0x9c, super::super::win::G_SYSTEM as i32, id(2), id(25)), ctx));
             assert_eq!(l[0].2, "You were drained for 25 points of nano energy by Snake.");
             let l = texts(classify(&act(0x9b, 0x4000_0001, id(2), Identity::default()), ctx));
             assert_eq!((l[0].1, l[0].2.as_str()), ("CCRed", "You have been detected by Snake!"));

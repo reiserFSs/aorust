@@ -389,28 +389,37 @@ impl Chat {
                     return;
                 }
                 // combat / stat / level feedback lines (docs/chat/log.md); evaluated before `zone.on_frame` applies the stat change
-                let own = Identity { kind: CHAR_KIND, instance: zone.char_id as i32 };
-                let dyn_of = |id: Identity| (id.kind == CHAR_KIND).then(|| zone.dynels.get(&id.instance)).flatten();
-                let filter = log::ChatFilter::default();
-                let ctx = log::LogCtx {
-                    own,
-                    name: &|id| dyn_of(id).map(|d| d.name.clone()),
-                    text: &|c, i| texts.by_id(c, i),
-                    is_npc: &|id| dyn_of(id).is_some_and(|d| d.npc),
-                    is_own_pet: &|_| false,
-                    nano_name: &|_| None,
-                    stat: &|id, st| (id == own).then(|| zone.stat(st as u32)).flatten(),
-                    filter: &filter,
-                };
-                for ev in log::events(&m) {
-                    for l in log::classify(&ev, &ctx) {
-                        let hint = self.class_name(l.class as u64);
-                        self.line_to(gui, l.line, hint.as_deref());
-                    }
-                }
+                self.log_events(gui, &log::events(&m), zone, texts);
             }
             _ => {}
         }
+    }
+
+    /// The chat lines of game events (docs/chat/log.md).
+    fn log_events(&mut self, gui: &mut Gui, events: &[log::LogEvent], zone: &Zone, texts: &TextDb) {
+        let own = Identity { kind: CHAR_KIND, instance: zone.char_id as i32 };
+        let dyn_of = |id: Identity| (id.kind == CHAR_KIND).then(|| zone.dynels.get(&id.instance)).flatten();
+        let filter = log::ChatFilter::default();
+        let ctx = log::LogCtx {
+            own,
+            name: &|id| dyn_of(id).map(|d| d.name.clone()),
+            text: &|c, i| texts.by_id(c, i),
+            is_npc: &|id| dyn_of(id).is_some_and(|d| d.npc),
+            is_own_pet: &|_| false,
+            nano_name: &|_| None,
+            stat: &|id, st| (id == own).then(|| zone.stat(st as u32)).flatten(),
+            filter: &filter,
+        };
+        for l in events.iter().flat_map(|ev| log::classify(ev, &ctx)) {
+            let hint = self.class_name(l.class as u64);
+            self.line_to(gui, l.line, hint.as_deref());
+        }
+    }
+
+    /// `N3Msg_CastNanoSpell` of the own character: the "Executing Nano Program" line.
+    pub fn cast_nano(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb, nano_name: String) {
+        let who = Identity { kind: CHAR_KIND, instance: zone.char_id as i32 };
+        self.log_events(gui, &[log::LogEvent::CastNano { who, nano_name }], zone, texts);
     }
 
     /// Per frame: chat-server events into the windows, window fades.

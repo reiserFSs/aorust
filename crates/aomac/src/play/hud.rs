@@ -454,6 +454,11 @@ impl Hud {
         std::mem::take(&mut self.system_lines)
     }
 
+    /// Programs the nano window cast (`N3Msg_CastNanoSpell`): the chat prints their "Executing Nano Program" lines.
+    pub(super) fn take_casts(&mut self) -> Vec<String> {
+        self.nano.take_casts()
+    }
+
     /// The zone frames [`Hud::on_zone_frame`] reads (the flow keeps them until the HUD exists).
     pub(super) fn wants_zone_frame(f: &Frame) -> bool {
         super::hud_winb::wants(f) || super::hud_mission::wants(f)

@@ -12,7 +12,7 @@ use super::zone::{scene_pos, scene_yaw, OwnEvent, Zone, IN_PLAY_STAT};
 use super::combat::actions::Pose;
 use super::combat::anim::anim_name;
 use ao_formats::character::Role;
-use ao_formats::playfield::{camera_views, zone_locator};
+use ao_formats::playfield::{camera_views, zone_locator, ZoneLocator};
 use ao_formats::playfield::collision::{Aligned, Body, Collision, SurfaceState, FOOT_CLEARANCE};
 use ao_gui::{InputEvent, MouseButton};
 use ao_net::frame::Frame;
@@ -21,6 +21,7 @@ use ao_net::n3::outgoing::{char_dc_move, n3_frame};
 use ao_rdb::RecordStore;
 use ao_render::{GameInput, Host};
 use std::path::Path;
+use std::rc::Rc;
 
 /// Length of the jump's ceiling ray (f32 100.0 @ GC 0x10155eb0).
 const JUMP_CEILING_RAY: f32 = 100.0;
@@ -84,6 +85,8 @@ pub(super) struct Player {
     pub fighting: bool,
     /// District fight-mode data of the playfield (`fightmode.rs`).
     fight: Option<FightLevels>,
+    /// `n3Playfield_t::GetZoneInstance` of the playfield: the own dynel's zone instance feeds `Movement::zone_instance`.
+    zones: Option<Rc<ZoneLocator>>,
 }
 
 /// The state of the door at scene position `pos` into its room link (nothing for a door that links no rooms, `0xffff` = leads nowhere).
@@ -113,9 +116,13 @@ impl Player {
             let prefs = ControlPrefs::from_xml(&prefs_xml);
             let mut camera = Camera3p::new(&prefs, avatar.head_height().unwrap_or(camera::MIN_PIVOT_HEIGHT));
             // scripted views (Shift/Ctrl+F8): only playfields that have camera attractors need the zone locator
-            match (camera_views(&store, playfield), zone_locator(&store, playfield)) {
-                (Ok(v), Ok(l)) if !v.is_empty() => camera.set_views(Views::new(v, Box::new(move |p| l.zone_at(p).unwrap_or(0)))),
-                (Err(e), _) | (_, Err(e)) => eprintln!("camera views {playfield}: {e:#}"),
+            let zones = zone_locator(&store, playfield).map_err(|e| eprintln!("zone locator {playfield}: {e:#}")).ok().map(Rc::new);
+            match (camera_views(&store, playfield), &zones) {
+                (Ok(v), Some(l)) if !v.is_empty() => {
+                    let l = l.clone();
+                    camera.set_views(Views::new(v, Box::new(move |p| l.zone_at(p).unwrap_or(0))));
+                }
+                (Err(e), _) => eprintln!("camera views {playfield}: {e:#}"),
                 _ => {}
             }
             let fight = FightLevels::load(&store, playfield);
@@ -142,6 +149,7 @@ impl Player {
                 pose: None,
                 fighting: false,
                 fight,
+                zones,
             })
         })();
         built.map_err(|e| eprintln!("player: {e:#}")).ok()
@@ -342,6 +350,9 @@ impl Player {
         }
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
+        }
+        if let Some(z) = self.zones.as_ref().and_then(|l| l.zone_at(flip(self.movement.pos()))) {
+            self.movement.zone_instance(z as u32);
         }
         self.door_rooms(zone);
         self.teleport_try(dt, zone);

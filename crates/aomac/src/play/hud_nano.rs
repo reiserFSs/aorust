@@ -54,6 +54,8 @@ pub(super) struct HudNano {
     page: usize,
     closed: Vec<WindowKind>,
     outbox: Vec<Frame>,
+    /// Names of the programs cast since the last call (`N3Msg_CastNanoSpell`'s chat line, [`super::chat::Chat::cast_nano`]).
+    casts: Vec<String>,
     clock: f32,
     /// What the rows were built from: (own list serial, page, moved count, mode).
     built: Option<(u32, usize, usize, Mode, usize)>,
@@ -80,6 +82,7 @@ impl HudNano {
             page: DEFAULT_PAGE,
             closed: vec![],
             outbox: vec![],
+            casts: vec![],
             clock: 0.0,
             built: None,
             ctx: None,
@@ -103,6 +106,10 @@ impl HudNano {
 
     pub(super) fn take_outbox(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.outbox)
+    }
+
+    pub(super) fn take_casts(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.casts)
     }
 
     fn text(&self, key: &str) -> String {
@@ -226,7 +233,9 @@ impl HudNano {
     /// `target == {0,0} && flags & 0x8000 == 0` rewrite).
     fn cast(&mut self, gui: &mut Gui, zone: &Zone, id: i32) {
         let own = Identity { kind: outgoing::DYNEL_CHAR, instance: zone.char_id as i32 };
-        let needs_target = self.db.info(gui, id).is_some_and(|i| i.stat(stat::FLAGS).unwrap_or(0) & 0x8000 != 0);
+        let info = self.db.info(gui, id);
+        let needs_target = info.is_some_and(|i| i.stat(stat::FLAGS).unwrap_or(0) & 0x8000 != 0);
+        let name = info.map(|i| i.name.clone());
         let target = match zone.target {
             Some(t) => Identity { kind: outgoing::DYNEL_CHAR, instance: t },
             None if !needs_target => own,
@@ -235,6 +244,7 @@ impl HudNano {
         };
         let payload = nano::cast_nano(zone.char_id as i32, id, target);
         self.outbox.push(outgoing::n3_frame(0, zone.char_id, payload));
+        self.casts.extend(name);
     }
 
     /// `true` when the event belonged to this window.

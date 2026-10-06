@@ -107,6 +107,7 @@ impl Movement {
     }
 
     /// The own character's input is locked (fear, control).
+    #[cfg(test)]
     pub fn input_locked(&self) -> bool {
         !self.controllable
     }
@@ -136,11 +137,13 @@ impl Movement {
     }
 
     /// The vehicle is an `NPCVehicle_t` (the key inputs have no effect on it).
+    #[cfg(test)]
     pub fn npc_vehicle(&self) -> bool {
         self.fx.npc_vehicle
     }
 
     /// The crowd-control state (`char+0x1f0`).
+    #[cfg(test)]
     pub fn crowd_state(&self) -> u8 {
         self.fx.crowd
     }
