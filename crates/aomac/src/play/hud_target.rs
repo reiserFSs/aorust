@@ -259,6 +259,8 @@ pub(super) struct HudTarget {
     tot: Option<i32>,
     /// The left press went down on the target-of-target button.
     tot_down: bool,
+    /// The hostile dock's Attack button was clicked (`PerformSpecialAction(0xb)`), taken by the HUD.
+    pub(super) attack: bool,
 }
 
 fn esc(s: &str) -> String {
@@ -268,7 +270,7 @@ fn esc(s: &str) -> String {
 impl HudTarget {
     /// Creates the two health-bar windows (`CCFriendlyHealthBar` / `CCHostileHealthBar`) and fills the control-centre target docks.
     pub(super) fn new(gui: &mut Gui, cc: WindowId, size: (u32, u32)) -> anyhow::Result<Self> {
-        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false };
+        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false, attack: false };
         t.create_bars(gui)?;
         for (dock, d) in [("LeftTargetCtrlDock", &t.docks[0]), ("RightTargetCtrlDock", &t.docks[1])] {
             let src = format!(
@@ -464,7 +466,7 @@ impl HudTarget {
     /// The dock handlers (`LAB_10072fcb` / `LAB_10072ff1` / `LAB_10073017`, GUI): the arrows send `GetPrev{Friendly,Hostile}Target`
     /// (AFCM 0x1e, 0x105 / 0x106) and `GetNext…` (0xe8 / 0xe9), i.e. [`cycle`]; the friendly button is `TargetingModule_t::
     /// SelectSelf`; the hostile button is the Attack button, `N3Msg_PerformSpecialAction(0xb)` = `DefaultAttack(target, false)`
-    /// (docs/zone/combat-net.md §5.3; the attack send is not wired into the HUD yet). None of these views has a tooltip: the
+    /// (docs/zone/combat-net.md §5.3; queued in [`Self::attack`], the HUD turns it into a `SlotUse::SpecialAction`). None of these views has a tooltip: the
     /// `CCTargetControl_c` constructor `FUN_100746ec` and `TargetHealthBar_c` / `TargetHeader_c` never call `View::SetToolTip`.
     fn dock_click(&mut self, zone: &mut Zone, hostile: bool, part: Part) {
         match part {
@@ -474,7 +476,7 @@ impl HudTarget {
                 }
             }
             Part::Button if !hostile => self.select_self(zone),
-            Part::Button => {}
+            Part::Button => self.attack = true,
         }
     }
 
@@ -859,7 +861,7 @@ mod tests {
     struct HudTargetLite(HudTarget);
     impl Default for HudTargetLite {
         fn default() -> Self {
-            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false })
+            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, tot: None, tot_down: false, attack: false })
         }
     }
 }

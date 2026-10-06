@@ -18,6 +18,7 @@ mod hud_compass;
 mod hud_map;
 mod hud_stats;
 mod hud_target;
+mod hud_use;
 mod movement;
 mod player;
 mod prefs;

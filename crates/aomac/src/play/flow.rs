@@ -984,20 +984,9 @@ impl Frontend for Play {
                     s.send_zone(f);
                 }
             }
-            for u in h.take_uses() {
-                match u {
-                    // `FUN_100d79c9` type 7: the macro text runs as if typed into the chat input
-                    hud_bar::SlotUse::Macro(line) => {
-                        if let Some(c) = self.chat.as_mut() {
-                            c.run_line(&mut self.gui, &line, &self.zone, &self.text);
-                        }
-                    }
-                    // `N3Msg_PerformSpecialAction`: the movement / combat modules own the resulting messages (not wired here yet)
-                    hud_bar::SlotUse::SpecialAction(a) => eprintln!("hud: hotbar special action {a:#x} has no game-side handler yet"),
-                }
-            }
         }
         let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
+        self.hud_uses();
         let mut list = self.gui.frame(dt);
         if self.screen == Screen::InWorld {
             let own = self.zone.own().map_or(host.camera.pos.to_array(), |d| zone::scene_pos(d.pos));

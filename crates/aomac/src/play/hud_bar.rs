@@ -29,11 +29,13 @@ const DRAG_THRESHOLD: f32 = 3.0;
 /// `Identity_t` kinds of slot items (`FUN_100d78e5`): 6 = special action, 7 = text macro.
 const KIND_SPECIAL_ACTION: u32 = 0xdeb0;
 const KIND_MACRO: u32 = 0xc789;
-/// rdb 1000020 (item / action templates) and 1010008 (`e_RDB_Res_Icon`, `GuiResourceManager_t::GetRDBTexture` [IF 0x1000b6e7]).
-const ITEM_TYPE: u32 = 1_000_020;
+/// rdb 1010008 (`e_RDB_Res_Icon`, `GuiResourceManager_t::GetRDBTexture` [IF 0x1000b6e7]); the item / action templates are rdb 1000020
+/// (read by `ao_formats::dynel_visual::item_template`).
 const ICON_TYPE: u32 = 1_010_008;
 /// Stat `Icon` (0x4f): `FUN_1003eb30` reads it from the identity's template for every slot type except macros (GFX 0xe3).
 const STAT_ICON: u32 = 0x4f;
+/// Stat `Action` (59) of an action template: its `Action_e` (see [`special_action`]).
+const STAT_ACTION: u32 = 59;
 
 /// The first-login slots (`FUN_100d94e9` after `IsFirstTime`): `(slot, identity kind, instance)`; the macro instance is the id
 /// `TextMacroSystem_t::CreateMacro("Follow", "/follow", 0, true)` returns (the new-character template's `TextMacro.bin` holds
@@ -50,25 +52,18 @@ const FOLLOW_MACRO: (&str, &str) = ("Follow", "/follow");
 /// What activating a slot asks the game for (`FUN_100d79c9`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SlotUse {
-    /// `N3Msg_PerformSpecialAction(identity)` [GC 0x100272fd] -> `FUN_1004256c`: the `Action_e` the character's special-action list
-    /// maps the identity to ([`action_of`]).
+    /// `N3Msg_PerformSpecialAction(identity)` [GC 0x100272fd] -> `FUN_1004256c`: the `Action_e` of the slot's action template.
     SpecialAction(u32),
     /// A text macro: the macro text is emitted on GlobalSignals +0x180 and runs as if typed into the chat input.
     Macro(String),
 }
 
-/// `Action_e` of the first-login special actions. UNRESOLVED mapping: `FUN_1003f121` looks the identity up in the character's
-/// special-action list (`+0x84`, filled from the server) whose entries carry the `Action_e` at `+0x10`; that list is not in any
-/// capture, so the ids are taken from the action names (templates 51004: "Start Combat", "Walk", "Sit", "Suspended Animation")
-/// and the `FUN_1004256c` table (docs/zone/combat-net.md §5.3): 0x4e attack, 0x4f `MovementChanged(0x24)`, 0x4c sit, 0x51 camp.
-pub(super) fn action_of(instance: u32) -> Option<u32> {
-    match instance {
-        0xc1a5 => Some(0x4e),
-        0xc1a2 => Some(0x4f),
-        0xc1a8 => Some(0x4c),
-        0x14124 => Some(0x51),
-        _ => None,
-    }
+/// `Action_e` of the perk / skill special actions (templates 0x14120.. of rdb 1000020). Their stat 59 is the default 0x11 (shared by
+/// Fling Shot ... Tutor), i.e. not the action; the character's special-action list (`FUN_1003f121`, `+0x84`, server-filled, in no
+/// capture) carries the real `Action_e`. UNRESOLVED except by name: "Suspended Animation" is camping, `FUN_1004256c` `0x51`
+/// (docs/zone/combat-net.md §5.3).
+pub(super) fn perk_action(instance: u32) -> Option<u32> {
+    (instance == 0x14124).then_some(0x51)
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +75,8 @@ struct Slot {
     icon: Option<(GfxId, u32, u32)>,
     /// Macro text (`TextMacro_t+0x24`).
     text: String,
+    /// `Action_e` of a special action.
+    action: Option<u32>,
 }
 
 struct Drag {
@@ -109,14 +106,15 @@ fn template_origin(dir: &Path, n: usize) -> Option<(f32, f32)> {
 
 /// `window / slot` XML: the painted `bar` canvas under a row of 36 x 38 `slotN` canvases (clicks, tooltips) with a label view
 /// per slot for macro names.
-fn window_xml() -> String {
+fn window_xml(label_h: f32) -> String {
     let (w, h) = (BAR_W - 1.0, BAR_H - 1.0);
     let mut cells = String::new();
     for i in 0..SLOTS {
+        // a `TextView` draws from the top of its frame, so the label sits in a vertical layout that centres its line-high frame
         cells += &format!(
             "<View view_layout=\"stacked\" min_size=\"Point({p},{h})\" max_size=\"Point({p},{h})\">\
              <CanvasView name=\"slot{i}\" min_size=\"Point({p},{h})\" max_size=\"Point({p},{h})\"/>\
-             <TextView name=\"label{i}\" value=\"\" font=\"SMALL\" color=\"0xffff00\" h_alignment=\"center\" v_alignment=\"center\"/></View>",
+             <View view_layout=\"vertical\"><TextView name=\"label{i}\" value=\"\" font=\"SMALL\" color=\"0xffff00\" h_alignment=\"center\" min_size=\"Point(0,{label_h})\" max_size=\"Point({p},{label_h})\"/></View></View>",
             p = PITCH - 1.0,
             h = h,
         );
@@ -124,7 +122,8 @@ fn window_xml() -> String {
     format!(
         "<root><View view_layout=\"stacked\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\">\
          <CanvasView name=\"bar\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/>\
-         <View view_layout=\"horizontal\" layout_borders=\"Rect({CHROME_W},0,0,0)\" h_alignment=\"left\">{cells}</View></View></root>"
+         <View view_layout=\"horizontal\" h_alignment=\"left\"><View min_size=\"Point({sp},{h})\" max_size=\"Point({sp},{h})\"/>{cells}</View></View></root>",
+        sp = CHROME_W - 1.0,
     )
 }
 
@@ -141,6 +140,7 @@ fn first_login(gui: &mut Gui, dir: &Path) -> [Option<Slot>; SLOTS] {
                 // `FUN_1003eb30(7)`: GFX_GUI_ICON_MACRO (0xe3)
                 icon: gui.gfx_id("GFX_GUI_ICON_MACRO").map(GfxId).map(|g| (g, gui.gfx().size(g).0, gui.gfx().size(g).1)),
                 text: FOLLOW_MACRO.1.to_string(),
+                action: None,
             }),
             _ => store.as_ref().and_then(|s| special_action(gui, s, instance)),
         };
@@ -153,7 +153,10 @@ fn first_login(gui: &mut Gui, dir: &Path) -> [Option<Slot>; SLOTS] {
 fn special_action(gui: &mut Gui, store: &ao_rdb::RecordStore, instance: u32) -> Option<Slot> {
     let t = ao_formats::dynel_visual::item_template(store, instance).ok()??;
     let icon = t.stat(STAT_ICON).filter(|&i| i > 0).and_then(|i| icon_image(gui, store, i as u32));
-    Some(Slot { kind: KIND_SPECIAL_ACTION, instance, name: t.name.unwrap_or_default(), icon, text: String::new() })
+    // stat `Action` (59) of the base action templates is their `Action_e` (rdb 1000020: Use 3, Start/End Combat 0xb, Walk 0x11, Run 0x12,
+    // Sneak 0x13, Sit 0x4c, Trade 0x4b, Stand 0x4d); the skill/perk templates 0x14120.. all carry the default 0x11 and are mapped by [`perk_action`]
+    let action = perk_action(instance).or_else(|| t.stat(STAT_ACTION).and_then(|a| u32::try_from(a).ok()));
+    Some(Slot { kind: KIND_SPECIAL_ACTION, instance, name: t.name.unwrap_or_default(), icon, text: String::new(), action })
 }
 
 /// rdb 1010008 PNG as a GUI texture (`Format_e 2`: pure green is the colour key, `SpriteInfo_t::ConvertImage` [DS 0x1007b8e2]).
@@ -174,7 +177,8 @@ impl ShortcutBar {
     /// Bar `n` (the only default bar is bar 0, `NumHotbars` = 1 in `CharPrefs.xml`): primary; bar 0 gets the first-login contents
     /// (`IsFirstTime`, the block of `FUN_100d94e9` runs in the first constructed window).
     pub(super) fn new(gui: &mut Gui, dir: &Path, n: usize, screen: (u32, u32)) -> anyhow::Result<Self> {
-        let window = gui.open_window_xml("ShortcutBar", &window_xml(), (0, 0), WindowSize::Preferred)?;
+        let label_h = gui.font_height(ao_gui::FontId::Small) as f32;
+        let window = gui.open_window_xml("ShortcutBar", &window_xml(label_h), (0, 0), WindowSize::Preferred)?;
         let (x, y) = template_origin(dir, n).unwrap_or((20.0, 20.0));
         let slots = if n == 0 { first_login(gui, dir) } else { Default::default() };
         let mut bar = ShortcutBar { window, primary: n == 0, slots, press: None, drag: None, uses: vec![] };
@@ -241,7 +245,7 @@ impl ShortcutBar {
     fn activate(&mut self, i: usize) {
         let Some(s) = &self.slots[i] else { return };
         match s.kind {
-            KIND_SPECIAL_ACTION => self.uses.extend(action_of(s.instance).map(SlotUse::SpecialAction)),
+            KIND_SPECIAL_ACTION => self.uses.extend(s.action.map(SlotUse::SpecialAction)),
             KIND_MACRO => self.uses.push(SlotUse::Macro(s.text.clone())),
             _ => {}
         }
@@ -349,10 +353,40 @@ mod tests {
     #[test]
     fn first_login_layout_and_actions() {
         assert_eq!(FIRST_LOGIN.iter().map(|s| s.0).collect::<Vec<_>>(), vec![0, 1, 2, 3, 9]);
-        assert_eq!(action_of(0xc1a8), Some(0x4c));
-        assert_eq!(action_of(1), None);
+        assert_eq!(perk_action(0x14124), Some(0x51));
+        assert_eq!(perk_action(0xc1a8), None);
         assert_eq!(ShortcutBar::name_of("slot7"), Some(7));
         assert_eq!(ShortcutBar::name_of("slot10"), None);
         assert_eq!(ShortcutBar::name_of("bar"), None);
+    }
+
+    /// The first-login slots carry the `Action_e` of their rdb templates: Start Combat 0xb, Walk 0x11, Sit 0x4c, Suspended Animation camp 0x51.
+    #[test]
+    fn first_login_actions_come_from_the_templates() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() {
+            return;
+        }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let slots = first_login(&mut gui, &dir);
+        let actions: Vec<_> = slots.iter().flatten().map(|s| s.action).collect();
+        assert_eq!(actions, [Some(0xb), Some(0x11), Some(0x4c), None, Some(0x51)]);
+    }
+
+    /// The slot canvases sit on the painted 36 px grid (the same cells the icons are drawn in) and each macro label is centred in its
+    /// slot (the label is centred over the macro icon, `FUN_1003f8e4`).
+    #[test]
+    fn slot_views_follow_the_painted_grid() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() {
+            return;
+        }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let bar = ShortcutBar::new(&mut gui, &dir, 0, (1280, 800)).unwrap();
+        for i in 0..SLOTS {
+            let (s, l) = (gui.view_frame(bar.window, &format!("slot{i}")).unwrap(), gui.view_frame(bar.window, &format!("label{i}")).unwrap());
+            assert!((s.t + s.b - l.t - l.b).abs() <= 1.0 && (s.l + s.r - l.l - l.r).abs() <= 1.0, "label{i} {l:?} centred in slot{i} {s:?}");
+            assert_eq!(s.l, CHROME_W + i as f32 * PITCH, "slot{i} x");
+        }
     }
 }

@@ -524,6 +524,9 @@ impl Hud {
             if gui.focused_view().is_none() {
                 self.target.key(zone, *key, *mods);
             }
+        if std::mem::take(&mut self.target.attack) {
+            self.uses.push(SlotUse::SpecialAction(0xb));
+        }
         }
         // window hotkeys (controls::WINDOW_BINDINGS); the viewer sends one press per key stroke, `! TextInputMode`: a focused text field swallows them
         if let (InputEvent::Key { key: ao_gui::Key::Letter(c), pressed: true, mods }, false) = (ev, gui.text_focused()) {
@@ -921,7 +924,7 @@ mod tests {
         click(&mut s, "slot0");
         click(&mut s, "slot3");
         click(&mut s, "slot5");
-        assert_eq!(s.hud.take_uses(), vec![SlotUse::SpecialAction(0x4e), SlotUse::Macro("/follow".into())]);
+        assert_eq!(s.hud.take_uses(), vec![SlotUse::SpecialAction(0xb), SlotUse::Macro("/follow".into())]);
         // drag slot 1 onto slot 5, then slot 5 out of the bar
         let (wx, wy) = s.gui.window_pos(win);
         let at = |i: usize| (wx as f32 + 43.0 + 36.0 * i as f32 + 17.0, wy as f32 + 19.0);

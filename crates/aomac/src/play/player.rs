@@ -244,6 +244,16 @@ impl Player {
     pub fn sit(&mut self) -> SitToggle {
         self.movement.sit_toggle(self.clock)
     }
+
+    /// `SlotMovementWalkToggle` / special actions 0x11 / 0x12: `MovementChanged(0x18 / 0x19)`.
+    pub fn toggle_walk(&mut self) {
+        self.movement.toggle_run(self.clock);
+    }
+
+    /// FSM `vtable[3](0x1e)`: the sit transition is allowed (`N3Msg_StartCamping`).
+    pub fn can_sit(&self) -> bool {
+        self.movement.fsm().allowed(0x1e)
+    }
 }
 
 /// Free line of sight for the camera: no wall within 0.2 m of the segment and the end not below the terrain/floor.
