@@ -119,3 +119,10 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
 
 `cargo test --release -p ao-net chat::` (0x5de / 0x5dd layouts), `cargo test --release -p aomac chat::social` (buddy folders, temporary entries, tell nodes, invitation prefs,
 private group texts, LFT search / reply rules, real text db strings; GUI tests skip without the client).
+
+## 9. Live check (Ithaca, 2026-10-06, offscreen harness, `say=/tell Testy` = empty tell)
+
+`> 0015 0007 "Testy"` lookup, `< 0015 {0x6584, "Testy"}`, then `> 0028 0007 00006584 0001 00` = **S2C-visible C2S buddy add with D = {0}** (the temporary entry, bytes exactly as `ChatCmd::BuddyAdd{permanent:false}`); the server answered
+no `0x28` within the 10 s that followed (the character is offline / the server does not echo temporary entries to us: **UNRESOLVED**, no permanent add was sent, so the real `S2C_ADD_BUDDY` layout is
+still only confirmed by the client's own parser `FUN_1016dd..`, not by a live capture). The in-world screenshot shows the tell window "Testy" (tab title, text area, input bar) at its default position.
+`LftQuery` / private-group requests were not sent live (no UI step in the harness).
