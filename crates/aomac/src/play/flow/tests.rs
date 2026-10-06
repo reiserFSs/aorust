@@ -450,6 +450,7 @@ fn character_created_and_handoff_reach_the_world() {
     assert!(r.p.screen == Screen::Loading && r.p.cc.is_none());
     r.enter();
     assert!(r.p.player.is_some());
+}
 
 /// Leaving the world for the login screen (`/camp`, `ActivateGameClosing(2)`): the chat windows close and the chat/interact layers are
 /// dropped (their chat-server session ends), so nothing of the world stays over the login backdrop and a re-entry opens no duplicates.

@@ -108,7 +108,8 @@ impl Pilot {
 
     /// One frame's decision; true = arrived.
     pub(super) fn step(&mut self, p: &mut Play, host: &mut Host) -> bool {
-        let pos = p.zone.own().unwrap().pos;
+        // the own dynel is dropped while a zone change (teleport / door) runs: the route is over
+        let Some(pos) = p.zone.own().map(|d| d.pos) else { return true };
         let dist = |c: (f32, f32)| (c.0 - pos[0]).abs() + (c.1 - pos[2]).abs();
         // the nearest waypoint ahead, aiming three cells past it
         while self.i + 1 < self.path.len() && dist(self.path[self.i + 1]) <= dist(self.path[self.i]) {
