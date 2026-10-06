@@ -221,6 +221,16 @@ impl Runtime {
         play_def(sh, &db, def, self.fx * level, &mut self.rng, variant)
     }
 
+    /// SI PlaySoundCommand @100071ed: caller volume/radius/probability, material 0, size 1.
+    pub fn play_effect_at(&mut self, sh: &Shared, def: &SoundDef, d: f32, volume: f32, radius: f32, probability: i32) -> Vec<u64> {
+        if probability != 100 && (self.rng.next() % 200) as i32 >= probability { return Vec::new(); }
+        let level = attenuation(d, def.min_dist, def.max_dist, Some(radius)) * volume;
+        if level <= 0.0 { return Vec::new(); }
+        let db = self.lib.sounds.clone();
+        let variant = variant_of(def, 0, 1).and_then(|v| db.get(v));
+        play_def(sh, &db, def, self.fx * level, &mut self.rng, variant)
+    }
+
     /// `PlaySample` keep-alive (`SM_Sandy_CC_Ambience`, ...): each call sets the level and re-arms the sound to
     /// `fade_out + duration`; `update` ends it `T` seconds after the last call, fading linearly over its last
     /// `fade_out` seconds (`FrameProcessSound` @SI 0x10003b70).
@@ -577,6 +587,9 @@ mod tests {
         assert_eq!(attenuation(0.0, 0.0, 15.0, Some(40.0)), 1.0);
         assert!((attenuation(10.0, 0.0, 15.0, Some(40.0)) - 0.75).abs() < 1e-6);
         assert_eq!(attenuation(41.0, 0.0, 15.0, Some(40.0)), 0.0);
+        // Native impact71345 passes radius120, not the definition's ordinary15m.
+        assert_eq!(attenuation(60.0, 0.0, 15.0, Some(120.0)), 0.5);
+        assert_eq!(attenuation(121.0, 0.0, 15.0, Some(120.0)), 0.0);
         assert!((attenuation(7.5, 0.0, 15.0, None) - 0.5).abs() < 1e-6);
         // min >= max: full level inside the radius, silent beyond
         assert_eq!(attenuation(10.0, 15.0, 15.0, Some(20.0)), 1.0);

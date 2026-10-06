@@ -8,7 +8,7 @@ NPC records, texture/cloth/attractor rules), `docs/zone/motion.md` (movement FSM
 ## 1. Pipeline
 
 ```
-N3 frame ──Zone::on_frame──▶ Dynels::on_message ──▶ Char (Mover) / Prop      ──▶ Dynels::update ──▶ Host::actors (ActorFrame)
+N3 frame ──Zone::on_frame──▶ Dynels::on_message ──▶ Char (Mover) / Prop      ──▶ Dynels::update_with_collision ──▶ Host::actors (ActorFrame)
                                       │ Look (appearance)                                 ▲ Host::actor_models (model scene, once per Look)
                                       ▼
                          worker thread: build(Look) → Built { model: Scene, rig: ActorRig, clips, features, held pose }

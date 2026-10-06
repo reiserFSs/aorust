@@ -63,7 +63,7 @@ Every `Hit` / `Miss` / `SpecialAttack` event of any character (a miss runs `FUN_
    (`key` = `0xb`, or the special's list key, else `0xb` when the weapon has no such key) -> random value (the CRT-rand stream of `Dynels`)
    -> AbstractAnimID -> the own avatar plays `Role::Clip(anim_name(id))` (`Player::swing`, rate x `swing_speed_scale(first event time, ItemDelay)`,
    `Avatar::set_swing_delay`), every other character `Dynels::play_swing(id,anim,key)` (NPC record table or the set's file name through
-   `resolve_clip`, same speed scale in `Dynels::update`). [DATA] all weapon attack ids exist as clips for male / female / athrox (test `fight_clips_exist_in_the_data`).
+   `resolve_clip`, same speed scale in `Dynels::update_with_collision`). [DATA] all weapon attack ids exist as clips for male / female / athrox (test `fight_clips_exist_in_the_data`).
 2. **Item lists**: Brawl, Dimach and bow special resolve the list on the special item's record (`FUN_100686d0(stat)+0xe4`).
    Bare hands resolve the martial-arts item delivered under key 100. `dynel_visual::animation_map` decodes element `{0xe,0x13}` using the same validated multimap size words as the sound parser.
    The martial-arts fixture (rdb 1000020:43712) asserts list `0xb = [1034,1035,1037,1033]`; Dimach 42033 has `0xb=[163]`, Brawl 70292 has `0xb=[1036]` (element offsets 203 and 184). Special keys missing on their own item fall back to its `0xb` (`FUN_1003c594`). Missing lists retain the creature-path `0x40a` fallback;
@@ -147,7 +147,7 @@ The char's `UnarmedTemplateInstance` (stat 418) is 0 for the own char in the cap
   returns early for a slot above 0x2f unless bit 5 of stat 0x2a1 is set, so [INFERENCE] the gesture of the 0x83 stays (a restart of the same clip within the same millisecond).
   **Wired**: `Module::on_frame` (0x61 -> gesture 0x6d), `glue.rs::stance` (`FightStarted` / `FightStopped` -> `draw_clip` / `holster_clip` + the fight idle flag: `Dynels::set_fighting`, `Player::fighting`;
   a weapon that resolves during a fight runs the draw again: `Dynels::take_wielded`), `combat::anim::{peace_idle, fight_idle, wield_walk_run, draw_clip, holster_clip}`, `Avatar::set_stance`
-  (own: idle / fight idle / walk / run), `Dynels::update` (others, same). Not wired: the martial-arts item's lists 0x1a / 0x1b / 0x10 (bare hands; record layout not decoded, §3.1), the crawl
+  (own: idle / fight idle / walk / run), `Dynels::update_with_collision` (others, same). Not wired: the martial-arts item's lists 0x1a / 0x1b / 0x10 (bare hands; record layout not decoded, §3.1), the crawl
   variants, char state 4 / 8 / 9 gates and `char+0x80` / `FUN_10059ac4` (assumed 0 / false for a live character).
   Stance ids per weapon type: section 3.1 (`blade-start/idle-blade/blade-stop` 1000-1002, `smallarms` 1010-1012, `rifle` 1020-1022,
   `unarmed` 1030-1032, `2h` 1055/1054/1056, `bow` 0xb5-0xb8).
@@ -251,8 +251,8 @@ notes `aimedshot/burst/fullauto/flingshot/sneakattack`, which `FUN_10045069` ign
 to those offsets are `SimpleChar` fields): dead data of an earlier design, which is why most names are not in the .sbf.
 
 **Wired** (`combat/notes.rs`, `Dynels::{note_sounds, weapon_hit, swish, record_note}`): the avatar (own, `Avatar::take_notes` while `Player::swing` marks the clip as a swing, bare hands included) and the dynels
-(`Dynels::swing_mark` + the clip time in `update`) fire notes once per play; `glue.rs` hands them to `note_sounds` with the attacker's last `AttackInfo` / `MissedAttackInfo` (`hit_of`, `Dynels::hit_seen`: victim,
-slot, damage, hit kind) and the item behind that slot (`Armory::slot_item`: record sounds, `AmmoType`, wielded); sounds go through the `GameSound` queue (`material`, `size`, delayed ones through `Dynels::update`) to
+(`Dynels::swing_mark` + the clip time in `update_with_collision`) fire notes once per play; `glue.rs` hands them to `note_sounds` with the attacker's last `AttackInfo` / `MissedAttackInfo` (`hit_of`, `Dynels::hit_seen`: victim,
+slot, damage, hit kind) and the item behind that slot (`Armory::slot_item`: record sounds, `AmmoType`, wielded); sounds go through the `GameSound` queue (`material`, `size`, delayed ones through `Dynels::update_with_collision`) to
 `Audio::play_game_sound_with` (flow.rs logs `game sound <id> at <pos>: N voice(s) (material m, size s)` with `AOMAC_AUDIO_LOG=1`). Positions: the character; the own character at the camera.
 Tests: `notes::tests::*` (note ids, once-per-play firing, size / ammo / player-impact rules, real swing clips), `dynels::variant_tests::{a_bare_handed_hit_plays_the_weapon_swing_and_the_material_impact,
 swish_and_attack_start_notes, a_marked_swing_clip_reports_its_notes, creature_records_carry_a_fabric_type, a_struck_creature_plays_an_impact_clip}`, `arms::tests::real_records`, ao-formats
@@ -353,6 +353,32 @@ The corpse holds the resulting death pose, rather than bind pose; corrected fiel
   width0.0625. Impact62002 uses the same bullet texture for 128 authored streaks,
   lifetime0.01..0.2 and radius0.01. These values were read from the installed
   table, not fitted from screenshots.
+* Solar Pistol muzzle2000 is **class1006**, while tracer2601 is **class1013**;
+  they are not two instances of the same starburst class. The star's parameters
+  are loaded by `100dd9b8`, its bursts by `100de106`, and its empty-pool/repeat
+  timer by `100de9fb`. The flare family uses the authored emission rate and
+  sprite capacity, rather than emitting every sprite only at construction.
+* Cylinder2601 keeps material index −1 as the native untextured cylinder:
+  GC `100fd699`/`100fd754`/`100fd855`, DS `100109a4`/`10010472`. Its sixteen
+  radial segments, cap/open-tail flag and layers come from the native visual,
+  not a camera-facing substitute quad. DS uses ONE/INVSRCALPHA blending.
+* Cord4 class1024 uses three twenty-link ribbons (`100ff756`, `100ff811`,
+  `100ff525`; DS `1000e3e8`), including native phase/random evolution and
+  averaged ribbon joins. Class1026 uses Cord4 plus the native 64-slot Sprite3
+  pool (`1010073d`, `10100855`, `10100b27`; DS `10028966`, `100288f3`,
+  `10028b9c`). Its sprite geometry and atlas come from that separate visual.
+* Segmented flare class1019 uses `100fde5a`/`100fdfef`/`100fe2ef`/
+  `100fe4a3` and the native speed100 constant at `10155eb0`; its word10
+  is not projectile speed. PathBlur class1021 uses `100fe985`/`100feacd`,
+  DS `10031830`/`100311a8`/`10031253`, and texture1010004:8406 for its two
+  strips. Recursive tracer1022 is an authored child wrapper, not another quad.
+* Ballistic class1027 (`2780`/`2781`/`2782`) uses native ABIFF resources:
+  DS `100616e4` resolves selectors to type1010001 names, including rock01–07,
+  the authored gib/ice/slime families and shell/tower fragments. GC
+  `10101591`/`101016cb`/`101017b6` supplies the pool/emission/motion parameters;
+  DS `1001c4a6` bounds the visual pool to128 and `1001c435` updates rotations.
+  Native fractional random uses the shared R250 seed0xe6f1 (`10152aac`),
+  separately from the CRT random stream.
 * `100dcd93` derives paired sprite endpoint velocities, angular ranges,
   lifetime, radius and ARGB interpolation from payloads. DisplaySystem
   `GfxVisualFlareType0::NewSprite`/`ProcessSprites` uses radius directly (not half),
@@ -364,9 +390,31 @@ The corpse holds the resulting death pose, rather than bind pose; corrected fiel
   existing `MuzzleFlashFX` (category8) / `TracersFX` (category2) preferences.
   Special results preserve their own item/slot/damage; no stale normal-hit context
   or camera-position effect anchor is used. Zone reset clears active effects.
-* Added bounded-parser, tuple replacement/miss-hit gating, real rifle-art,
-  projectile-parameter and real item-binding regressions. **Not executed** here;
-  Main owns builds, tests and live screenshot verification.
+* Effect preference categories are the retail six-bit mask, not a shared
+  “nano/buff” toggle: Buffs=1, Tracers=2, NanoEffect=4, MuzzleFlash=8,
+  Environment=16, Others=32. Gamecode `100ce1fa` packs preference offsets
+  8–13; DisplaySystem `1005fd60` installs their callbacks. Cast visuals use
+  category4, while visual ApplySpells handlers use category32.
+* Bounded-parser, tuple replacement/miss-hit gating, real rifle-art,
+  projectile-parameter and real item-binding regressions are covered by the
+  release workspace checks: build, **1292 passing tests**, and
+  `cargo clippy --release --workspace --all-targets -- -D warnings`.
+* The renderer now uses an UNORM target and gamma-space shader output, so native
+  DisplaySystem blend factors operate in the same space as D3D. Offscreen
+  before/after captures preserve the two HUD fixtures byte-for-byte. Mean
+  absolute RGB-byte changes are 2.1446 for playfield566 daytime, 1.9849 at night,
+  0.1565 for dungeon127, 1.0374 for login and 0.9799 for character selection;
+  these comparisons include changed blended surfaces and MSAA edge resolves.
+  Geometry, layouts, textures and filtering remain unchanged. These are
+  offline comparisons, not a claim of retail/live-window equivalence.
+* Six installed-asset effect checks pass, including actual GPU frames for
+  starburst2000, cylinder2601, continuous flare6200, projectile2750, rock
+  resources2780–2782, rocket mesh71520, particle strips71512/71342, and
+  particle dependencies71516/71904–71906/71340/71341/71343. The mesh and
+  particle regressions compare rendered pixels with an empty pass, rather
+  than accepting a background-only screenshot. Rock captures follow actual
+  transformed resource bounds; particle captures retain authored transparent
+  birth frames and cover the later atlas/alpha rise. No live session was used.
 
 * Fallback swings use the preloaded `ATTACK_KEY` NPC record variants
   (`dynels::build_char`, `anim_key_variants`) through `Special::Attack`;
@@ -383,14 +431,97 @@ The corpse holds the resulting death pose, rather than bind pose; corrected fiel
   bounded deadline before advancing its unchanged thirty-second simulation;
   all death selector, phase and sound assertions remain intact.
 
+### 7.3 Nano visual controls
+
+* The two-dynel cast API `CreateEffect2` at GC `100d1de5` dispatches through
+  `100d11b1` to **class1010 `_GfxControlSpell1_t`**, constructor `100f3497`.
+  It does not dispatch to class1001. Parameters: `100f2234`; `NextState`:
+  `100f20c2`; source-child phases: `100f2495`/`100f2656`/`100f2711`;
+  traveling/impact phases: `100f280e`/`100f2b1b`/`100f290c`.
+  DS `10027df8`/`10028206`/`100282b6` draws its own authored-material sprite
+  strips with SRCALPHA/ONE, without depth writes.
+* Class1001 is the separate periodic body-profile FSM: dispatch `100d0102`,
+  constructor `100d3cce`, parameters `100d39ba`, process `100d3b0e`.
+  It emits the authored children in words10/11, uses source-identity shared
+  five-second throttling (`101601f8`) and random retry (`1016b338=1/16384`),
+  and preserves word21's −1/infinite, zero/no-emission distinction.
+* Class1002's orbiting children (`100d4f72`/`100d52dc`/`100d53e3`/
+  `100d57bb`/`100d4d6b`) use their actual class0 body-profile records
+  (20013/20018,42words), selected by Breed/Sex/BodyShape/MonsterScale,
+  rather than a generic character radius. Native signed angular subdivision
+  is0.45 radians (`10167f88`). Class1003 (`100d5b7d`/`100d5d22`/
+  `100d5dcb`/`100d5a02`/`100d6480`) uses the separate256-link Cord4
+  overwrite ring, newest-first ordering, local point/velocity updates and
+  authored link lifetime; DS `1000e9b7`/`1000df03`/`1000e99b`/`1000e9f9`.
+* Fire1004 (`100dc296`/`100dbedb`/`100dc044`), Nano0/1007
+  (`100e6e95`/`100e62a3`/`100e6bf1`), Nano1/1008
+  (`100e827a`/`100e750e`/`100e8421`), Smoke1009
+  (`100f09e6`/`100f0616`/`100eff68`) and Sprite1012
+  (`100f62a7`/`100f5f2e`/`100f67d6`) remain distinct native controls.
+  DS `100267c1` supplies their wind/update modes; Nano1's staged emissions
+  use raw authored bone matrices (`10105b22`), not one generic source point.
+  Sprite1012 selectors1/2 explicitly end in native `100f5f2e`; only0/3
+  construct visuals. Native invalid selectors are not remapped to valid ones.
+* Cast templates that omit their optional mode word33 retain the native zero
+  value: CMSBlock integer accessor `10106872` returns zero for a missing
+  parameter. This is an observed accessor default, not replacement artwork.
+* Tracer wrapper3026 (`10114717`/`10114932`/`10114622`/`101145f1`)
+  moves its real child at min(authored speed,distance×5), forwards the native
+  source matrix, and starts its real impact child on termination. Actual71001
+  references71520(class3025) and71004(class2007); the latter lists71340–71345.
+  Meta class2007 (`100e59b2`/`100e5a25`/`100e57f3`/`100e5799`) maintains
+  those actual child handles, including its native lifetime marker and cleanup.
+* Mesh child71520 is the authored `EP03_shoulder_rocket.abiff`, selector0,
+  scale2.5, not sprite artwork. Class3025 dispatch/loader/process:
+  `100ce4f7`/`1010c5a6`/`1010cf05`/`1010c94a`; its opacity envelope uses
+  `101161a1`/`1011634c`. Unimplemented vehicle/camera/oscillation variants
+  fail explicitly rather than using the rocket path for unrelated resources.
+* Class3020 mode0, used by71512/71342, is the separate TParticle visual:
+  GC `1011277c`/`101125fd`/`10112bb0`; DS `10029de9`/`10029c81`/
+  `1002a350`/`10029aa7`. Its crossed tapered strips, constructor random walk,
+  local Euler motion and packed piecewise colours come from that visual.
+  Other emission modes are not silently aliased to mode0.
+* BParticle2/3028 (`1010bf1f`/`1010ac44`/`1010ba11`/`1010af47`;
+  DS `1000b4fc`/`1000b1e2`) keeps its native burst/recycling and strict
+  colour-knot intervals (`1011623a`). Payloads with36/42/44words carry
+  zero/three/four knots respectively; absent CMS fields return native zero.
+  BParticle/3024 mode8, used by71343, is a different control/visual:
+  `1010a6ac`/`1010a0f0`/`1010a3b5`, DS `10009938`/`10008bce`/`1000a70f`.
+  Other3024 modes and3028 terrain/environment/body-scale branches remain
+  explicit unsupported errors, not aliases to these implemented paths.
+* Cast start loops the authored stat0x178/default203 at speed1 (`1007b084`);
+  release uses stat0x179/0x17a/default201/202 once. Timed and instant casts
+  both wait for actual release completion (`1007ac9a`/`1003c4d5`) before
+  target visuals. Repeated same-clip starts reset time to zero, matching
+  `1003ca30`→`1003c392`→`1003c216`→`1003bd7a`→`100108be`.
+  Own and foreign anchors refresh after their pose clocks, before effect draw.
+* GroundShake3032 is a camera control, not geometry: `1010ed0d`/
+  `1010eaa3`/`1010ebd8` computes signed R250 offsets and distance/envelope
+  attenuation. N3 `1001ff2f` runs on Camera+0xa4, reads its +0x130
+  (=Camera+0x1d4), adds that offset to VisualCamera position and preserves
+  rotation. This indirect consumer establishes eye-only shake; scanning only
+  direct Camera+0x1d4 references would incorrectly conclude it is unused.
+* Audio4000 (`100d3190`/`100d30c1`/`100d3012`) sends AFCM0x1a/0x103;
+  SandyInterface `100071ed` interprets volume/radius/duration/delay.
+  Actual71345 selects `SM_Sandy_Game_Explo_Med` from table102c3f28, index12,
+  with volume1,radius120,duration0,delay0,velocity0,probability100.
+  Nonzero timing/velocity variants remain explicit errors, not discarded
+  arguments. The implemented one-shot uses the real positional sound runtime.
+
 ## 8. Not found / open
 * The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
-* Other authored effect classes (including class1006 star/burst effects used by
-  pistol2000/2601), live emission-rate effects and server `GfxTriggerIIR_t`
-  (0x7A222202)/`HealthDamageIIR_t` (0x3710256C) remain outside the current
-  flare1005/cord1025 renderer; unsupported classes report their actual ID/class,
-  never fabricated generic artwork. `PlaySoundIIR_c` (0x455D2938) also never
-  occurs in the capture. Weapon firing/impact sounds are resolved in §6.1.
+* Unsupported authored classes still report their actual ID/class, never
+  fabricated artwork. A read-only installed-data census finds additional
+  weapon/nano roots in classes1018/1020/1029,2001/2002/2004/2005/2006/2011/
+  2013,3000/3001/3003/3004/3006/3017/3022/3029/3031/3038/5000.
+  This inventory is incomplete: the existing spell parser rejects9320 item
+  records and237 nano records, which are counted rather than silently treated
+  as supported. References to effect IDs71900/91000/91006/42161 have no
+  template in the installed gfxtweak table; no replacement is invented.
+* Server `GfxTriggerIIR_t` (0x7A222202)/`HealthDamageIIR_t` (0x3710256C)
+  visual dispatch remains separate from the authored weapon/nano paths.
+  `PlaySoundIIR_c` (0x455D2938) never occurs in the capture.
+  Weapon firing/impact sounds are resolved in §6.1.
 * Sound-map keys 0x15 0x16 0x17 0x1c 0x1d 0x50 0x87 of the weapon records (no consumer found), wield / unwield / grenade sounds (keys 8 / 9 / 0x31, found, not wired), the `0x2c` empty-weapon click.
 * `FUN_1005d0d8` case 0x5b also calls `vtable+0x40` of the stat system and, for a non-control char, `FUN_100523c3` (purpose not read); `FUN_10012a1e(..)` before every `PlayGameSound` is only the lazy creation of the `SandyInterfaceModule` singleton (`DAT_102e063c`), not a sound step.
 * The own character's `Dying` default animation when no action 99 arrived (death computed by `FUN_1005ae91`): 503 is a **guess** (`DEFAULT_DEATH_ANIM`).

@@ -80,6 +80,8 @@ pub(super) struct Player {
     clicks: Vec<ao_gui::MouseButton>,
     /// A one-shot clip over the movement pose (emote, attack swing, death): the role and whether it holds its last frame.
     transient: Option<(Role, bool)>,
+    cast_loop: Option<bool>,
+    cast_restart: bool,
     /// `ItemDelay` of the weapon of the swing in `transient`.
     swing_delay: Option<i32>,
     /// `transient` is a weapon swing (its notes start the attack sounds, `combat::notes`).
@@ -157,6 +159,8 @@ impl Player {
                 game: Vec::new(),
                 clicks: Vec::new(),
                 transient: None,
+                cast_loop: None,
+                cast_restart: false,
                 swing_delay: None,
                 swinging: false,
                 swing_key: None,
@@ -168,6 +172,11 @@ impl Player {
             })
         })();
         built.map_err(|e| eprintln!("player: {e:#}")).ok()
+    }
+
+    /// Loaded playfield surface used by authored effect collision queries (scene coordinates).
+    pub fn effect_surface(&self) -> Option<&Collision> {
+        self.collision.as_ref()
     }
 
     /// The control options (`ControlPrefs::from_dvalues`) changed: mouse look, zoom, wheel, inversion, own avatar in first person.
@@ -222,11 +231,29 @@ impl Player {
     /// Plays `role` once over the movement pose (`hold`: keep the last frame, for the death clip).
     pub fn play(&mut self, role: Role, hold: bool) {
         self.transient = Some((role, hold));
+        self.cast_loop = None;
+        self.cast_restart = false;
         self.swing_delay = None;
         self.swinging = false;
         self.swing_key = None;
         self.clip_scale = None;
     }
+    pub fn cast_animation(&mut self, animation: Option<(Role, bool)>) {
+        match animation {
+            Some((role, looping)) => {
+                self.play(role, false);
+                self.cast_loop = Some(looping);
+                self.cast_restart = true;
+            }
+            None if self.cast_loop.is_some() => {
+                self.transient = None;
+                self.cast_loop = None;
+                self.cast_restart = false;
+            }
+            None => {}
+        }
+    }
+
 
     /// Plays the hit reaction `role` once at `rate` times its speed (`FUN_1009b4ac`, `Dynels::react_to_hit`) unless one is playing.
     pub fn react(&mut self, role: Role, rate: f32) {
@@ -257,6 +284,11 @@ impl Player {
     /// The notes the own swing clip reached since the last call (`combat::notes` ids).
     pub fn take_notes(&mut self) -> Vec<u32> {
         self.avatar.take_notes()
+    }
+
+    /// Animation-holder completion used by the nano cast release state.
+    pub fn animation_finished(&self) -> bool {
+        self.transient.is_none() || self.avatar.finished()
     }
 
     /// A held clip (death) is playing.
@@ -302,6 +334,8 @@ impl Player {
     /// Ends a held clip (resurrection).
     pub fn stand(&mut self) {
         self.transient = None;
+        self.cast_loop = None;
+        self.cast_restart = false;
     }
 
     /// The point `to` is visible from `from` (no collision geometry in between): effects of occluded dynels are hidden by the depth test.
@@ -446,14 +480,15 @@ impl Player {
         let moving = self.movement.speed() > 0.01 && self.movement.grounded();
         // the new pose's enter / stop clip plays once over its idle clip (`Pose::transition_anim`, GC 0x1006d330)
         let now = Pose::from_role(&role);
-        if let Some(from) = self.pose.replace(now).filter(|&b| b != now) {
+        if let Some(from) = self.pose.replace(now).filter(|&b| b != now && self.cast_loop.is_none()) {
             if let Some((name, _)) = Pose::transition_anim(from, now).and_then(anim_name) {
                 self.play(Role::Clip(name.into()), false);
             }
         }
         // emotes and swings end with their clip or when the character moves; a death clip holds until `stand`
-        if self.transient.as_ref().is_some_and(|(_, hold)| !hold && (moving || self.avatar.finished())) {
+        if self.cast_loop != Some(true) && !self.cast_restart && self.transient.as_ref().is_some_and(|(_, hold)| !hold && (self.avatar.finished() || (self.cast_loop.is_none() && moving))) {
             self.transient = None;
+            self.cast_loop = None;
         }
         let pose = match &self.transient {
             Some((r, _)) => AvatarPose::still(r.clone()),
@@ -465,6 +500,8 @@ impl Player {
         self.avatar.set_swing_delay(self.transient.as_ref().and(self.swing_delay));
         self.avatar.set_swinging(self.transient.is_some() && self.swinging);
         self.avatar.set_clip_scale(self.transient.as_ref().and(self.clip_scale));
+        self.avatar.set_cast_loop(self.cast_loop == Some(true));
+        if std::mem::take(&mut self.cast_restart) { self.avatar.restart_cast_clip(); }
         if let Err(e) = self.avatar.set_pose(&self.store, pose) {
             eprintln!("avatar pose: {e:#}");
         }
@@ -628,9 +665,58 @@ fn segment_clear(c: &Collision, a: [f32; 3], b: [f32; 3]) -> bool {
     c.inside(a) && c.inside(b) && !door_closed(c, a, b) && c.line(a, b).is_none() && c.line(b, a).is_none()
 }
 
+/// Gamecode `FUN_100ad4bd`: ask the playfield surface for its closest point and
+/// normal, then raise only the supplied point's y. The native surface query
+/// includes terrain / room tiles, their KD collision volumes and liquid depth.
+pub(super) fn effect_collision(c: &Collision, p: ao_render::Vec3) -> Option<(ao_render::Vec3, ao_render::Vec3)> {
+    let mut point = p.to_array();
+    // A fresh room=-1 state reproduces the null-source veto: accept an existing
+    // room, or use GetSafePos outside rooms; no remembered dynel/door transition.
+    c.veto(&mut point, &mut SurfaceState::default());
+    let hit = c.closest(point, -1)?;
+    point[1] = point[1].max(hit.pos[1]);
+    Some((ao_render::Vec3::from_array(point), ao_render::Vec3::from_array(hit.normal)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effect_collision_uses_surface_normal_and_never_lowers_the_rock() {
+        use ao_scene::{Instance, Mesh, Scene, Submesh, Vertex, IDENTITY};
+        let vertices = [[0.0, 1.0, 0.0], [0.0, 1.0, -4.0], [4.0, 3.0, -4.0], [4.0, 3.0, 0.0]]
+            .map(|pos| Vertex { pos, ..Default::default() }).to_vec();
+        let collision = Collision::from_scene(&Scene {
+            meshes: vec![Mesh { vertices, submeshes: vec![Submesh::new(vec![0, 2, 1, 0, 3, 2], None)] }],
+            instances: vec![Instance { mesh: 0, transform: IDENTITY }],
+            ..Default::default()
+        });
+        let point = ao_render::Vec3::new(2.0, 5.0, -2.0);
+        let (corrected, normal) = effect_collision(&collision, point).unwrap();
+        assert_eq!(corrected, point, "the native helper raises y only");
+        assert!((normal - ao_render::Vec3::new(-0.5, 1.0, 0.0).normalize()).length() < 1e-5);
+        assert!(effect_collision(&collision, ao_render::Vec3::new(10.0, 5.0, -2.0)).is_none());
+    }
+
+    #[test]
+    fn effect_collision_routes_loaded_outdoor_and_dungeon_surfaces() {
+        let Ok(store) = RecordStore::open(&ao_gui::client_dir()) else { return };
+        for playfield in [4582, 6131] {
+            let collision = Collision::load(&store, playfield).unwrap();
+            let point = ao_render::Vec3::new(-1.0, -1.0, 1.0);
+            let mut vetoed = point.to_array();
+            collision.veto(&mut vetoed, &mut SurfaceState::default());
+            let closest = collision.closest(vetoed, -1).unwrap();
+            let (corrected, normal) = effect_collision(&collision, point).unwrap();
+            assert_ne!(corrected, point, "loaded surface {playfield} must correct the invalid point");
+            assert_eq!(corrected.x, vetoed[0]);
+            assert_eq!(corrected.z, vetoed[2]);
+            assert_eq!(corrected.y, vetoed[1].max(closest.pos[1]));
+            assert_eq!(normal.to_array(), closest.normal);
+            assert!((normal.length() - 1.0).abs() < 1e-4, "{playfield}: {normal:?}");
+        }
+    }
 
     #[test]
     fn turning_camera_pulls_in_at_a_sloping_rock_face() {

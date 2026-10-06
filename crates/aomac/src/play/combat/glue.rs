@@ -128,6 +128,9 @@ impl Play {
             if let CombatEvent::SpecialAttack { who, target, special, slot, damage } = e {
                 self.zone.world.special_hit_seen(*who, target.instance, *slot, *damage, *special);
             }
+            if let CombatEvent::Died { dynel, .. } = e {
+                self.zone.world.cancel_nano_visuals(*dynel);
+            }
         }
         // swings (`FUN_1006a239` [GC 0x1006a239], docs/zone/combat-anim.md §3): every hit, miss and special attack of every character
         for e in &events {
@@ -163,6 +166,22 @@ impl Play {
         self.zone.world.weapon_effect_categories = self.hud.as_ref().map_or(10, |h| {
             (u32::from(h.dvalues.flag("MuzzleFlashFX")) * 8) | (u32::from(h.dvalues.flag("TracersFX")) * 2)
         });
+        // DS 1005fd60 prefs offsets 10/13; GC 100ce1fa packs them as 4/32.
+        self.zone.world.nano_effect_categories = self.hud.as_ref().map_or(36, |h| {
+            (u32::from(h.dvalues.flag("NanoEffectFX")) * 4) | (u32::from(h.dvalues.flag("OthersFX")) * 32)
+        });
+        let player = self.player.as_ref();
+        let stats = &self.zone.stats;
+        let character_stats = &self.zone.character_stats;
+        self.zone.world.nano_visual_frame(dt, player.is_some_and(Player::animation_finished), |anchor| player?.effect_anchor(anchor), |who, stat| {
+            if who == own { stats.get(&stat).copied() } else { None }
+                .or_else(|| character_stats.get(&who)?.get(&stat).copied())
+        });
+        for animation in self.zone.world.take_nano_animations() {
+            if let Some(p) = self.player.as_mut() {
+                p.cast_animation(animation.and_then(|(id, looping)| anim_name(id as u16).map(|(name, _)| (Role::Clip(name.into()), looping))));
+            }
+        }
         for &(who, n) in &notes {
             if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
                 eprintln!("combat: note {n:#x} of {who}");

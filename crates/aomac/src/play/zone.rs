@@ -353,6 +353,7 @@ impl Zone {
                 N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
                     let s = self.character_stats.entry(who.instance).or_default();
                     s.extend([(0, u.flags2 as i32), (1, u.max_health), (4, u.breed as i32), (0x1b, u.health), (0x21, u.side as i32), (0x36, u.level as i32), (0x3b, u.sex as i32), (0x185, u.expansion as i32), (0x294, u.account_flags as i32), (0x2a1, u.visual_flags as i32)]);
+                    s.extend([(0x2f, i32::from(u.fatness)), (0x168, i32::from(u.monster_scale))]);
                     if let ao_net::n3::dynel::CharClass::Npc(n) = &u.class {
                         s.extend([(0x184, n.tower_type as i32), (0x1c7, n.npc_family as i32), (0x200, n.pet_type as i32)]);
                         // NPC-only dialogue flag (`SimpleChar+0x21c`, GC 0x1007850f–0x10078539).
@@ -605,11 +606,16 @@ impl Zone {
         let own = Identity { kind: CHAR_KIND, instance: self.char_id as i32 };
         match msg {
             ao_net::n3::spells::APPLY_SPELLS => match ao_net::n3::spells::parse(body) {
-                Ok(a) if a.target == own => {
-                    self.apply_effects(&a.spells, a.apply);
-                    self.own_events.push(OwnEvent::Spells { spells: a.spells, apply: a.apply });
+                Ok(a) => {
+                    let visuals: Vec<_> = a.spells.iter().filter(|s| matches!(s.function, 0xcf26 | 0xcf57 | 0xcfd4)).cloned().collect();
+                    if !visuals.is_empty() {
+                        self.world.apply_nano_visuals(ao_net::n3::spells::ApplySpells { target: a.target, apply: a.apply, spells: visuals });
+                    }
+                    if a.target == own {
+                        self.apply_effects(&a.spells, a.apply);
+                        self.own_events.push(OwnEvent::Spells { spells: a.spells, apply: a.apply });
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => eprintln!("zone: ApplySpells: {e:#}"),
             },
             server_move::RELOCATE => match server_move::parse_relocate(body) {

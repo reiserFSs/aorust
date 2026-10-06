@@ -58,6 +58,30 @@ Real-window audio diagnostics use `AOMAC_AUDIO_MUTE=1 AOMAC_AUDIO_LOG=1`: the no
 Key ids were computed from the shipped CharPrefs.xml (`provider_hash` of each `ACTION_*` name matched against the `KeyBindings` entries);
 `controls.rs` has the same table as `DEFAULT_BINDINGS`.
 
+## Native tracer mesh child 3025
+
+`effects_tracer_sprites.rs` uses the authored ABIFF mesh, despite its historical
+filename: Gamecode `CreateGfxControl` `100ce4f7` case `0xbd1` calls `1010d314`
+(`GfxControlEffectMesh_t`); the dynel/connector constructors are `1010d4bb` /
+`1010d598`. Loader `1010c5a6` reads selector word 10, translation/velocity/
+acceleration at 13/16/19, rotation axis/angle/angular velocity/angular acceleration
+at 22/25/26/27, scale and derivatives at 28/29/30, and the opacity curve at 32.
+`1010cf05` resolves selector 0 as `EP03_shoulder_rocket.abiff` using type 1010001,
+then creates a `VisualMesh_t`; it does not create a camera-facing quad.
+`1010c94a` advances position before velocity, angle before angular velocity, and
+scale before scale velocity. The curve sampler `1011634c` returns its last value
+outside the authored intervals (empty curves return 1).
+
+The installed `Setupf/gfxtweak.bin` record 71520 is class 3025, 37 words: flags 3,
+selector 0, duration 10, scale 2.5, and opacity points `(0,1)` / `(1,1)`. The other
+named tracer children are different classes: 71512 is 3020 (41 words);
+71516 / 71904 / 71905 are 3028 (42 words), and 71906 is 3028 (44 words).
+The ignored `authored_native_tracer_mesh_frames` test loads the real resource and
+renders ActorFrames offscreen; it has not been executed as part of this change.
+Vehicle visibility/body-scale, ground snapping, camera-facing variants, mesh
+animation and nonzero rendering-effect selectors remain outside the 71520 path;
+their native branches are in `1010c94a` and `1010cf05`, not approximated by sprites.
+
 ## Unresolved / not ported (honest list)
 
 * The weapon-specific parts of `N3Msg_SecondarySpecialAttack` (`FUN_10063be4` recharge, `FUN_100686fb` weapon slot availability,

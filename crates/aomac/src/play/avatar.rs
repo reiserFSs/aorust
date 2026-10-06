@@ -137,8 +137,8 @@ impl AvatarLook {
 
 /// Roles that play once and hold their last frame (the jump arcs, emotes, combat swings and death clips); every other clip
 /// loops. [GUESS]: derived from the clip names, the original's per-clip loop flags were not traced (docs/zone/avatar.md §4).
-fn one_shot(r: &Role) -> bool {
-    matches!(r, Role::JumpStand | Role::JumpForward | Role::Emote(_) | Role::Clip(_))
+fn one_shot(r: &Role, cast_loop: bool) -> bool {
+    !cast_loop && matches!(r, Role::JumpStand | Role::JumpForward | Role::Emote(_) | Role::Clip(_))
 }
 
 /// The clip name of the weapon stance of `AnimSet` `set` for movement role `r`: the idle while not fighting is the equip routine's (`FUN_1009c858`:
@@ -299,6 +299,7 @@ pub struct Avatar {
     swinging: bool,
     /// Playback rate factor of a hit-reaction clip ([`Avatar::set_clip_scale`]).
     clip_scale: Option<f32>,
+    cast_loop: bool,
     /// Bit `i` = event `i` of the clip has fired its note (cleared when a clip starts).
     note_fired: u32,
     notes: Vec<u32>,
@@ -317,7 +318,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, look: l.look, attachments: l.attachments, assets, scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, clip_id: 0, calibration_id: 0, rate: 1.0, swing_delay: None, swinging: false, clip_scale: None, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, look: l.look, attachments: l.attachments, assets, scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, clip_id: 0, calibration_id: 0, rate: 1.0, swing_delay: None, swinging: false, clip_scale: None, cast_loop: false, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -400,6 +401,20 @@ impl Avatar {
         Ok(())
     }
 
+    pub fn set_cast_loop(&mut self, looping: bool) {
+        self.cast_loop = looping;
+    }
+    /// Cast Play calls SetTime(0, total) even when its authored clip is unchanged (GC 100108be).
+    pub fn restart_cast_clip(&mut self) {
+        self.ms = 0.0;
+        self.note_fired = 0;
+    }
+
+
+    fn one_shot(&self) -> bool {
+        one_shot(&self.pose.role, self.cast_loop)
+    }
+
     /// Rate factor of the one-shot clip that plays (a hit reaction, `Dynels::react_to_hit`); set every frame before [`Avatar::set_pose`].
     pub fn set_clip_scale(&mut self, scale: Option<f32>) {
         self.clip_scale = scale;
@@ -431,7 +446,7 @@ impl Avatar {
 
     /// Whether a one-shot clip (jump) has played to its end.
     pub fn finished(&self) -> bool {
-        one_shot(&self.pose.role) && self.clip.as_ref().is_none_or(|a| self.ms >= a.duration)
+        self.one_shot() && self.clip.as_ref().is_none_or(|a| self.ms >= a.duration)
     }
 
     /// Scene position (feet) and rotation about +Y ([`super::zone::scene_yaw`] of the server heading).
@@ -447,7 +462,7 @@ impl Avatar {
         }
         // keep the counter bounded; looping clips wrap by themselves, one-shots stop at the end
         if let Some(a) = &self.clip {
-            if !one_shot(&self.pose.role) && a.duration > 0.0 && self.ms > 4.0 * a.duration {
+            if !self.one_shot() && a.duration > 0.0 && self.ms > 4.0 * a.duration {
                 self.ms = clip_time(a, self.ms, false);
             }
         }
@@ -455,19 +470,19 @@ impl Avatar {
 
     /// The actor to draw this frame (CPU-skinned pose, never frustum culled).
     pub fn frame(&self) -> ActorFrame {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
+        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
         let (skin, parts) = self.rig.pose(clip);
         ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, skin: Some(skin), always: true, alpha: 1.0 }
     }
 
     /// Current effect anchor in world scene space, including heading and body scale.
     pub fn effect_anchor(&self, id: i32) -> Option<[[f32; 4]; 4]> {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
+        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
         self.rig.effect_anchor(id, clip).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
     }
 
     pub fn weapon_effect_anchor(&self, place: u8) -> Option<[[f32; 4]; 4]> {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
+        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
         self.rig.weapon_effect_anchor(place, clip).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
     }
 
@@ -487,7 +502,7 @@ impl Avatar {
     /// Height of the head attractor over the feet in the current pose, times the body scale: the camera look target
     /// (`FUN_10020af1` N3, docs/zone/camera.md §3). `None` for models without a head attractor.
     pub fn head_height(&self) -> Option<f32> {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
+        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
         self.rig.head_attractor(clip).map(|p| p[1] * self.scale)
     }
 
@@ -495,7 +510,7 @@ impl Avatar {
     /// from (attractor translation x body scale, through the CAT frame's world matrix); the feet for a model without one (the identity
     /// attractor matrix `RefreshAlpha` starts from).
     pub fn head_position(&self) -> Vec3 {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, one_shot(&self.pose.role))));
+        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
         self.transform.transform_point3(self.rig.head_attractor(clip).map_or(Vec3::ZERO, Vec3::from))
     }
 }
@@ -635,6 +650,9 @@ mod tests {
 
     #[test]
     fn loop_markers_and_one_shots() {
+        let casting = Role::Clip("spell-sus".into());
+        assert!(!one_shot(&casting, true), "cast-start loop must not clamp at the last CAT frame");
+        assert!(one_shot(&casting, false), "release restores one-shot playback");
         let a = CatAnim { source_id: 0, root: String::new(), events: vec![(200, "loopstart".into())], version: 0, duration: 1000.0, signature: 0, param: 0.0, tracks: vec![] };
         assert_eq!(clip_time(&a, 500.0, false), 500.0);
         assert_eq!(clip_time(&a, 1100.0, false), 300.0, "wraps to loopstart, not 0");
@@ -823,6 +841,28 @@ mod tests {
         assert_eq!((stance_clip(1, &Role::Walk), stance_clip(8, &Role::Run)), (None, None), "only the rifle overrides walk / run");
         assert_eq!(stance_clip(4, &Role::IdleCombat), None, "AnimSet 4: the lists live in the item record");
     }
+    #[test]
+    fn nano_cast_loop_restarts_and_release_finishes() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let start = AvatarPose::still(Role::Clip("spell-sus".into()));
+        avatar.set_cast_loop(true);
+        avatar.set_pose(&store, start.clone()).unwrap();
+        assert!(avatar.clip.is_some(), "retail cast-start clip must resolve");
+        avatar.update(30.0);
+        assert!(!avatar.finished(), "cast-start remains a loop");
+        assert!(avatar.effect_anchor(2000).is_some(), "cast connector samples the loop pose");
+        avatar.restart_cast_clip();
+        avatar.set_pose(&store, start).unwrap();
+        assert_eq!(avatar.ms, 0.0, "a new Play restarts the same cast clip");
+        avatar.set_cast_loop(false);
+        avatar.set_pose(&store, AvatarPose::still(Role::Clip("spell-dir".into()))).unwrap();
+        assert!(avatar.clip.is_some(), "retail cast-release clip must resolve");
+        avatar.update(30.0);
+        assert!(avatar.finished(), "release plays once");
+    }
+
 
     /// `AppearanceUpdateIIR_c` of a wear (docs/captures/zone_wear_rifle_borealis.rec: attractors `{0, head}` + `{1, 0x3ddf}`) mounts the weapon mesh
     /// in the right hand, the unwear's list (head only) takes it away again; an identical list rebuilds nothing. A wielder's idle / walk / run use the

@@ -32,6 +32,23 @@ pub fn lens(base: Lens) -> Lens {
     Lens { fov: FOV_HORIZONTAL, horizontal: true, near: NEAR, ..base }
 }
 
+/// N3 1001ff2f (LocalityListener at camera+0xa4) adds camera+1d4 to the
+/// visual eye position and copies the unmodified rotation. Never alter movement.
+pub fn apply_ground_shake(camera: &mut Camera, offset: Vec3) {
+    camera.pos += offset;
+}
+
+#[cfg(test)]
+mod ground_shake_test {
+    #[test]
+    fn shake_changes_visual_eye_not_rotation() {
+        let mut camera = ao_render::Camera { pos: glam::Vec3::new(1.0, 2.0, 3.0), yaw: 0.4, pitch: 0.2, roll: 0.0 };
+        super::apply_ground_shake(&mut camera, glam::Vec3::new(0.1, 0.2, 0.3));
+        assert_eq!(camera.pos, glam::Vec3::new(1.1, 2.2, 3.3));
+        assert_eq!((camera.yaw, camera.pitch, camera.roll), (0.4, 0.2, 0.0));
+    }
+}
+
 /// `PreferredCamPosY` / `PreferredCamPosZ` defaults (GUI `SetDefaultLoginPrefs` @0x10124b33): the unit direction from the
 /// look target to the camera in avatar space (+y up, -z behind): elevation `asin(0.316)` = 18.4 degrees.
 pub const DEFAULT_DIRECTION: [f32; 3] = [0.0, 0.316, -0.948];

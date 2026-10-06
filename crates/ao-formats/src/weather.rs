@@ -615,6 +615,8 @@ pub struct Levels {
 pub struct State {
     pub fields: Fields,
     pub levels: Levels,
+    /// Full AO world-space wind (`FUN_100bf699`: wind object `+0xc/+0x10/+0x14`, base + A).
+    pub wind: [f32; 3],
     /// `GAME.HighAltitudeWindX/Z` increment of the last frame.
     pub high_altitude_wind: [f32; 2],
     /// The same wind per second (`0.004 · 0.5 · (C + D)`).
@@ -624,7 +626,7 @@ pub struct State {
 impl State {
     /// Clear sky, no wind (before any frame).
     pub const fn clear() -> State {
-        State { fields: [0.0; FIELDS], levels: Levels { rain: 0.0, wind: 0.0, sand_wind: 0.0, fallout_red_wind: 0.0, fallout_green_wind: 0.0, quake: 0.0 }, high_altitude_wind: [0.0; 2], high_altitude_wind_rate: [0.0; 2] }
+        State { fields: [0.0; FIELDS], levels: Levels { rain: 0.0, wind: 0.0, sand_wind: 0.0, fallout_red_wind: 0.0, fallout_green_wind: 0.0, quake: 0.0 }, wind: [0.0; 3], high_altitude_wind: [0.0; 2], high_altitude_wind_rate: [0.0; 2] }
     }
 
     /// `GAME.ThickCloudsIntensity` (`FUN_100ad5db`).
@@ -711,6 +713,11 @@ impl Wind {
         for k in 0..3 {
             self.d[k] += (self.b[k] - self.d[k]) / 1000.0;
         }
+    }
+
+    /// `FUN_100bf699`: copy C without cloud-scroll scaling, normalization, or axis conversion.
+    pub fn vector(&self) -> [f32; 3] {
+        self.c
     }
 
     /// Current `HighAltitudeWind` per second (`0.004 · 0.5 · (C + D)`, x and z).
@@ -806,7 +813,7 @@ impl Weather {
             fallout_green_wind: base * f[6],
             quake: self.quake_level,
         };
-        State { fields: f, levels, high_altitude_wind: self.haw, high_altitude_wind_rate: self.wind.rate() }
+        State { fields: f, levels, wind: self.wind.vector(), high_altitude_wind: self.haw, high_altitude_wind_rate: self.wind.rate() }
     }
 
 }
@@ -967,6 +974,19 @@ mod tests {
         assert!((d[18] - 1.0).abs() < 1e-6);
         blend(&mut d, &b, 1.0);
         assert_eq!(d, b);
+    }
+
+    #[test]
+    fn effect_wind_is_the_full_native_vector() {
+        let mut w = Weather::new(&env(), 0);
+        assert_eq!(w.state().wind, [0.0; 3]);
+        w.wind.c = [12.0, -3.0, 7.0];
+        w.wind.d = [90.0, 80.0, 70.0];
+        assert_eq!(w.state().wind, [12.0, -3.0, 7.0]);
+        w.update(0, 3000.0, 1.0 / 60.0);
+        assert_eq!(w.state().wind, w.wind.c);
+        assert_ne!(w.state().wind, [0.0; 3]);
+        assert_ne!(w.state().wind[0], w.state().high_altitude_wind_rate[0]);
     }
 
     #[test]

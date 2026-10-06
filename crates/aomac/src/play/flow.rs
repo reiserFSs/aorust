@@ -629,12 +629,15 @@ impl Play {
     /// `PlayfieldAnarchyFIIR_t` arrived: load that playfield in the background (the loading screen stays up until it is ready).
     fn start_world_load(&mut self, id: u32) {
         self.world_sky = None;
+        self.world_weather = None;
         let (dir, tx, want_audio) = (self.dir.clone(), self.tx.clone(), self.audio.is_some());
         // the zone clock and game day (`GameTimeIIR_t`) when the burst reached the playfield message; later `GameTime`s resync the live sky
         let (day_time, day) = (self.zone.day_time(), self.zone.game_day as u32);
         std::thread::spawn(move || {
             let mut r = RecordStore::open(&dir).and_then(|store| {
                 let (scene, report) = ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day)?;
+                let weather = ao_formats::playfield::open_weather(&store, id)?;
+                let _ = tx.send(Bg::Weather(id, Box::new(weather)));
                 // `PlayfieldInit` [GC 0x10016e2c] -> `SandyInterfaceModule_t::ActivateGameZone`: district music, ambience and statel emitters
                 let audio = want_audio.then(|| ao_audio::PlayfieldAudio::load(&store, id, &report.sounds).map_err(|e| eprintln!("playfield audio {id}: {e:#}")).ok()).flatten();
                 Ok((scene, report, audio))
@@ -684,6 +687,8 @@ impl Play {
                 }
                 Bg::Sky(id, c) if Some(id) == self.zone.playfield => self.world_sky = c,
                 Bg::Sky(..) => {}
+                Bg::Weather(id, w) if Some(id) == self.zone.playfield => self.world_weather = Some(*w),
+                Bg::Weather(..) => {}
                 Bg::Ground(id, g) if Some(id) == self.zone.playfield => self.world_ground = g.map(|g| (id, g)),
                 Bg::Ground(..) => {}
                 Bg::Info(id, dungeon, audio) if Some(id) == self.zone.playfield => {
@@ -1197,9 +1202,39 @@ impl Frontend for Play {
             if self.awaiting_alive {
                 host.look = false; // `InputConfig+0x18`: the mouse look is stopped with the rest of the user input
             }
+            if let Some(weather) = &mut self.world_weather {
+                weather.update(self.zone.game_day as u32, self.zone.day_time() as f64, dt);
+                host.effect_wind = weather.state().wind;
+            }
             self.fight_frame(dt);
             self.camp_frame(dt, host);
-            self.zone.world.update(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host);
+            let mut collision = self.player.as_ref().and_then(|p| p.effect_surface())
+                .map(|surface| move |p| super::player::effect_collision(surface, p));
+            let query = collision.as_mut().map(|query| query as &mut dyn FnMut(ao_render::Vec3) -> Option<(ao_render::Vec3, ao_render::Vec3)>);
+            let player = self.player.as_ref();
+            self.zone.world.update_with_collision(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host, query, |id| {
+                player?.effect_anchor(id).map(|matrix| glam::Mat4::from_cols_array_2d(&matrix))
+            });
+            match self.zone.world.effect_camera_offset(host.camera.pos) {
+                Ok(offset) => super::camera::apply_ground_shake(&mut host.camera, offset),
+                Err(error) => eprintln!("effect camera: {error:#}"),
+            }
+            for sound in self.zone.world.take_effect_sounds() {
+                if let Some(audio) = &self.audio {
+                    // SI100071ed rounds the authored radius with x87 round(radius - 0.49999).
+                    let radius = (sound.parameters[1] as f64 - 0.49999).round_ties_even() as u16;
+                    match audio.play_effect_sound(sound.id, sound.pos, host.camera.pos.to_array(), sound.parameters[0], radius as f32, sound.probability) {
+                        Ok(voices) => {
+                            if std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
+                                eprintln!("effect sound {:#x} at {:?}: {} voice(s), radius {}", sound.id, sound.pos, voices.len(), radius);
+                            }
+                        }
+                        Err(error) => eprintln!("effect sound: {error:#}"),
+                    }
+                } else {
+                    eprintln!("effect sound {:#x}: audio runtime unavailable", sound.id);
+                }
+            }
             // `Door_t` open / close: `PlayGameSound(id, door position)` (docs/zone/doors.md §5); the fight sounds (combat/notes.rs) go the same way
             for s in self.zone.world.take_sounds() {
                 if let Some(a) = &self.audio {

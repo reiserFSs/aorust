@@ -484,6 +484,8 @@ enum Special {
     Attack,
     /// Clip `AbstractAnimID` plays once (emotes, swings).
     Once(u32),
+    /// CharCastNano's stat 0x178 clip loops until release.
+    Cast(u32),
     /// The death clip (client animation id) plays once and holds its last frame.
     Die(u32),
 }
@@ -647,12 +649,62 @@ pub struct Dynels {
     /// The last `AttackInfo` of every attacker (what the attack notes read from the slot object, `FUN_1006a8f3`).
     last_hit: HashMap<i32, super::combat::notes::HitCtx>,
     effects: Option<super::combat::effects::Renderer>,
+    /// Visual spell applications wait until the own animated connectors are available.
+    nano_visuals: Vec<ao_net::n3::spells::ApplySpells>,
+    nano_handles: Vec<(i32, ao_net::n3::spells::Spell, u32)>,
+    nano_casts: Vec<(i32, ao_net::n3::dynel::CastNanoSpell)>,
+    casting: Vec<NanoCast>,
+    nano_animations: Vec<Option<(u32, bool)>>,
+    nano_store: Option<RecordStore>,
+    nano_templates: HashMap<i32, Arc<ao_formats::dynel_visual::ItemTemplate>>,
+    pub nano_effect_categories: u32,
     /// Retail effect category bits: muzzle=8, tracers/hits=2.
     pub weapon_effect_categories: u32,
     special_hit: HashMap<i32, (i32, i32, i32, i32)>,
     impact_locations: HashMap<i32, i32>,
-    /// Camera position of the last [`Dynels::update`] (scene space).
+    /// Camera position of the last [`Dynels::update_with_collision`] (scene space).
     cam: [f32; 3],
+}
+
+struct NanoCast {
+    who: i32,
+    spell: i32,
+    target: i32,
+    handle: u32,
+    remaining: f32,
+    finish: [i32; 2],
+    release_anim: u32,
+    released: bool,
+    release_seen: bool,
+    done: bool,
+    instant: bool,
+}
+
+/// GC 10050ed9 (asm 10050f85–10051064), in seconds.
+fn nano_cast_delay(delay: i32, minimum: i32, initiative: i32, agg_def: i32, flags: i32) -> f32 {
+    if flags & 0x80000 != 0 { return 0.0; }
+    let reduction = if initiative <= 1200 { initiative as f32 * 0.5 } else { (initiative - 1200) as f32 / 6.0 + 600.0 };
+    let duration = ((delay as f32 - reduction - agg_def as f32) / 100.0).max(0.0);
+    if minimum == 1_234_567_890 { duration } else { duration.max(minimum as f32 / 100.0) }
+}
+
+/// Argument conversion of GC 100a5083 / 100a78c6 / 100a8c03.
+fn nano_visual(spell: &ao_net::n3::spells::Spell) -> Option<(i32, i32, super::combat::effects::EffectConfig)> {
+    use super::combat::effects::EffectConfig;
+    let (effect, attractor, duration) = match spell.function {
+        0xcf26 => (spell.stat(0x27), 0, spell.stat(0x31)),
+        0xcf57 => (spell.stat(0x57), 0, spell.stat(0x19)),
+        0xcfd4 => (spell.stat(0x27), spell.stat(0x56), spell.stat(0x31)),
+        _ => return None,
+    };
+    let mut config = EffectConfig { duration: (duration != 0).then_some(duration as f32 / 100.0), ..Default::default() };
+    if spell.function == 0xcfd4 {
+        config.repetitions = Some(spell.stat(0xa1) as u32);
+        config.start_color = Some([0x99, 0x9a, 0x9b, 0x9c].map(|id| spell.stat(id) as f32 / 255.0));
+        config.stop_color = Some([0x9d, 0x9e, 0x9f, 0xa0].map(|id| spell.stat(id) as f32 / 255.0));
+        config.scale = Some(1.0 + spell.stat(0x32) as f32 / 100.0);
+    }
+    Some((effect, attractor, config))
 }
 
 impl Default for Dynels {
@@ -693,6 +745,14 @@ impl Default for Dynels {
             notes: vec![],
             last_hit: HashMap::new(),
             effects: None,
+            nano_visuals: vec![],
+            nano_handles: vec![],
+            nano_casts: vec![],
+            casting: vec![],
+            nano_animations: vec![],
+            nano_store: None,
+            nano_templates: HashMap::new(),
+            nano_effect_categories: 36,
             weapon_effect_categories: 10,
             special_hit: HashMap::new(),
             impact_locations: HashMap::new(),
@@ -746,6 +806,11 @@ impl Dynels {
         self.rng = CrtRand::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
         self.arms = super::combat::arms::Armory::open(&dir);
         self.calibration = super::avatar::Calibration::load(&dir);
+        self.nano_store = match RecordStore::open(&dir) {
+            Ok(store) => Some(store),
+            Err(error) => { eprintln!("nano templates: {error:#}"); None }
+        };
+        self.nano_templates.clear();
         self.effects = match super::combat::effects::Renderer::open(&dir) {
             Ok(renderer) => Some(renderer),
             Err(error) => { eprintln!("weapon effects: {error:#}"); None }
@@ -761,6 +826,11 @@ impl Dynels {
         self.arms.clear();
         self.special_hit.clear();
         self.impact_locations.clear();
+        self.nano_visuals.clear();
+        self.nano_handles.clear();
+        self.nano_casts.clear();
+        self.casting.clear();
+        self.nano_animations.clear();
         if let Some(effects) = &mut self.effects { effects.clear(); }
         self.swing_keys.clear();
         self.props.clear();
@@ -906,6 +976,7 @@ impl Dynels {
     /// `id` dies: the death clip `anim` (client animation id, `CharacterAction` 99's `identity_b.instance`; any other value =
     /// the generic death) plays once and holds.
     pub fn die(&mut self, id: i32, anim: u32) {
+        self.cancel_nano_visuals(id);
         if let Some(c) = self.chars.get_mut(&id) {
             if !matches!(c.special, Special::Die(_)) {
                 c.clip_ms = 0.0;
@@ -1016,11 +1087,195 @@ impl Dynels {
         let c = self.chars.get(&who)?;
         let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
         let rig = built.rig.as_ref()?;
-        let clip = built.clips.get(&c.anim).and_then(|clips| clips.get(c.roll.variant % clips.len().max(1))).map(|a| (&**a, super::avatar::clip_time(a, c.clip_ms, c.special != Special::None)));
+        let clip = built.clips.get(&c.anim).and_then(|clips| clips.get(c.roll.variant % clips.len().max(1))).map(|a| (&**a, super::avatar::clip_time(a, c.clip_ms, !matches!(c.special, Special::None | Special::Cast(_)))));
         let matrix = if anchor == 3000 { rig.weapon_effect_anchor(if slot == 8 { 2 } else { 1 }, clip) } else { rig.effect_anchor(anchor, clip) }?;
         let local = glam::Mat4::from_cols_array_2d(&matrix);
         let world = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(c.scale), glam::Quat::from_rotation_y(scene_yaw(c.pose.yaw)), glam::Vec3::from(scene_pos(c.pose.pos)));
         Some(world * local)
+    }
+
+    pub(in crate::play) fn cancel_nano_visuals(&mut self, who: i32) {
+        self.nano_casts.retain(|(caster, _)| *caster != who);
+        self.nano_visuals.retain(|application| application.target.instance != who);
+        if who == self.own { self.nano_animations.push(None); }
+        if let Some(c) = self.chars.get_mut(&who).filter(|c| matches!(c.special, Special::Cast(_))) {
+            c.special = Special::None;
+            c.clip_ms = 0.0;
+        }
+        let mut renderer = self.effects.take();
+        self.casting.retain(|cast| {
+            if cast.who != who && cast.target != who { return true; }
+            if cast.who == self.own { self.nano_animations.push(None); }
+            else if let Some(c) = self.chars.get_mut(&cast.who).filter(|c| matches!(c.special, Special::Cast(_)) || c.special == Special::Once(cast.release_anim)) {
+                c.special = Special::None;
+                c.clip_ms = 0.0;
+            }
+            if let Some(renderer) = &mut renderer { renderer.delete(cast.handle); }
+            false
+        });
+        self.nano_handles.retain(|(target, _, handle)| {
+            if *target != who { return true; }
+            if let Some(renderer) = &mut renderer { renderer.delete(*handle); }
+            false
+        });
+        self.effects = renderer;
+    }
+
+
+    /// GC 100a5083 / 100a78c6 / 100a8c03: spell visual handlers use category 0x20.
+    pub fn apply_nano_visuals(&mut self, application: ao_net::n3::spells::ApplySpells) {
+        if application.target.kind == CHAR_KIND {
+            self.nano_visuals.push(application);
+        }
+    }
+
+    pub fn take_nano_animations(&mut self) -> Vec<Option<(u32, bool)>> {
+        std::mem::take(&mut self.nano_animations)
+    }
+    pub fn refresh_effect_anchors(&mut self, mut own_anchor: impl FnMut(i32) -> Option<glam::Mat4>) {
+        let Some(mut renderer) = self.effects.take() else { return };
+        renderer.refresh_anchors(|identity, id| {
+            if identity.0 != CHAR_KIND as u32 { return None; }
+            if identity.1 as i32 == self.own { own_anchor(id) }
+            else { self.effect_anchor(identity.1 as i32, id, 0) }
+        });
+        self.effects = Some(renderer);
+    }
+
+
+    pub fn nano_visual_frame(&mut self, dt: f32, own_finished: bool, mut own_anchor: impl FnMut(i32) -> Option<[[f32; 4]; 4]>, mut stat: impl FnMut(i32, u32) -> Option<i32>) {
+        use super::combat::effects::{Binding, EffectConfig};
+        let Some(mut renderer) = self.effects.take() else { return };
+        let anchor = |world: &Self, who, id, own_anchor: &mut dyn FnMut(i32) -> Option<[[f32; 4]; 4]>| {
+            if who == world.own { own_anchor(id).map(|m| glam::Mat4::from_cols_array_2d(&m)) }
+            else { world.effect_anchor(who, id, 0) }
+        };
+        let appearance = |who, stat: &mut dyn FnMut(i32, u32) -> Option<i32>| -> Option<[i32; 4]> {
+            Some([stat(who, 4)?, stat(who, 59)?, stat(who, 47)?, stat(who, 360)?])
+        };
+        self.nano_handles.retain(|(_, _, handle)| renderer.is_active(*handle));
+        for (who, cast) in std::mem::take(&mut self.nano_casts) {
+            if !self.nano_templates.contains_key(&cast.spell) {
+                let Some(store) = &self.nano_store else { continue };
+                let result = (|| -> anyhow::Result<_> {
+                    let record = store.get(super::hud_nanodb::NANO_RDB_TYPE, u32::try_from(cast.spell)?)?.context("missing nano template")?;
+                    ao_formats::dynel_visual::parse_item_template(&record)
+                })();
+                match result {
+                    Ok(template) => { self.nano_templates.insert(cast.spell, Arc::new(template)); }
+                    Err(error) => { eprintln!("nano cast: {error:#}"); continue; }
+                }
+            }
+            let template = Arc::clone(&self.nano_templates[&cast.spell]);
+            let target = if cast.target.kind == 0 && cast.target.instance == 0 && template.stat(0).unwrap_or(0) & 0x8000 == 0 { who } else { cast.target.instance };
+            self.casting.retain(|old| { if old.who == who && old.spell == cast.spell { renderer.delete(old.handle); false } else { true } });
+            let remaining = nano_cast_delay(template.stat(0x126).unwrap_or(200), template.stat(0x20b).unwrap_or(1_234_567_890), stat(who, 0x95).unwrap_or(0), stat(who, 0x33).unwrap_or(0), template.stat(0).unwrap_or(1));
+            let instant = template.stat(0).unwrap_or(1) & 0x80000 != 0;
+            let effect = template.stat(0x1ac).unwrap_or(49999);
+            let attractor = renderer.attractor(effect, 0).unwrap_or(0);
+            let Some(source) = anchor(self, who, attractor, &mut own_anchor) else { continue };
+            let Some(destination) = anchor(self, target, 0, &mut own_anchor) else { continue };
+            let binding = Binding { group: 0, attractor, effect, note: 0, color: 0 };
+            let handle = if instant || self.nano_effect_categories & 4 == 0 || effect == 49999 { 0 } else {
+                renderer.prepare_anchors((CHAR_KIND as u32, who as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
+                if target != who {
+                    renderer.prepare_anchors((CHAR_KIND as u32, target as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
+                }
+                match renderer.spawn_configured(binding, source, destination.w_axis.truncate(), EffectConfig { duration: Some(6000.0), track_source: true, source_identity: Some((CHAR_KIND as u32, who as u32)), target_identity: Some((CHAR_KIND as u32, target as u32)), source_appearance: appearance(who, &mut stat), target_appearance: appearance(target, &mut stat), ..Default::default() }) {
+                    Ok(handle) => handle,
+                    Err(error) => { eprintln!("nano cast: {error:#}"); continue; }
+                }
+            };
+            let release_anim = template.stat(if target == who { 0x17a } else { 0x179 }).unwrap_or(if target == who { 202 } else { 201 }) as u32;
+            self.casting.push(NanoCast { who, spell: cast.spell, target, handle, remaining, release_anim, released: instant, release_seen: false, done: false, instant, finish: if !instant || cast.flag { [template.stat(0x19e).unwrap_or(49999), template.stat(0x169).unwrap_or(49999)] } else { [49999; 2] } });
+            if !instant {
+                let animation = template.stat(0x178).unwrap_or(203) as u32;
+                if who == self.own { self.nano_animations.push(Some((animation, true))); }
+                else {
+                    self.play_swing(who, Some(animation), animation as u16);
+                    if let Some(c) = self.chars.get_mut(&who).filter(|c| !matches!(c.special, Special::Die(_))) {
+                        c.special = Special::Cast(animation);
+                        c.clip_ms = 0.0;
+                        c.roll.key = None;
+                    }
+                }
+            }
+            else if who == self.own { self.nano_animations.push(Some((release_anim, false))); }
+            else { self.play_swing(who, Some(release_anim), release_anim as u16); }
+        }
+        let mut casting = std::mem::take(&mut self.casting);
+        for cast in &mut casting {
+            if !cast.released && !cast.instant {
+                cast.remaining -= dt;
+                if cast.remaining > 0.0 { continue; }
+                renderer.next_state(cast.handle);
+                cast.released = true;
+                if cast.who == self.own { self.nano_animations.push(Some((cast.release_anim, false))); }
+                else {
+                    self.play_swing(cast.who, Some(cast.release_anim), cast.release_anim as u16);
+                    cast.release_seen = self.chars.get(&cast.who).is_some_and(|c| c.special == Special::Once(cast.release_anim));
+                }
+                continue;
+            }
+            let finished = if cast.who == self.own {
+                !self.nano_animations.contains(&Some((cast.release_anim, false))) && own_finished
+            } else {
+                self.chars.get(&cast.who).is_some_and(|c| {
+                    if c.special == Special::Once(cast.release_anim) { cast.release_seen = true; }
+                    cast.release_seen && c.special == Special::None
+                })
+            };
+            if finished && !cast.done {
+                cast.done = true;
+                if self.nano_effect_categories & 4 != 0 {
+                    for effect in cast.finish.into_iter().filter(|&effect| effect != 0 && effect != 49999) {
+                        if let Some(attractor) = renderer.attractor(effect, 0) {
+                            if let Some(source) = anchor(self, cast.target, attractor, &mut own_anchor) {
+                                let binding = Binding { group: 0, attractor, effect, note: 0, color: 0 };
+                                let identity = Some((CHAR_KIND as u32, cast.target as u32));
+                                let profile = appearance(cast.target, &mut stat);
+                                let config = EffectConfig { track_source: true, source_identity: identity, target_identity: identity, source_appearance: profile, target_appearance: profile, ..Default::default() };
+                                renderer.prepare_anchors((CHAR_KIND as u32, cast.target as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
+                                if let Err(error) = renderer.spawn_configured(binding, source, source.w_axis.truncate(), config) { eprintln!("nano release: {error:#}"); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        casting.retain(|cast| !cast.done || renderer.is_active(cast.handle));
+        self.casting = casting;
+        for application in std::mem::take(&mut self.nano_visuals) {
+            let who = application.target.instance;
+            for spell in application.spells {
+                let Some((effect, explicit, mut config)) = nano_visual(&spell) else { continue };
+                // GC 100a78c6 rejects non-control characters (+0x140 == 0).
+                if spell.function == 0xcf57 && who != self.own { continue; }
+                if !application.apply {
+                    self.nano_handles.retain(|(target, original, handle)| {
+                        if *target == who && *original == spell { renderer.delete(*handle); false } else { true }
+                    });
+                    continue;
+                }
+                if self.nano_effect_categories & 32 == 0 { continue; }
+                let Some(attractor) = renderer.attractor(effect, explicit) else { continue };
+                let Some(source) = anchor(self, who, attractor, &mut own_anchor) else { continue };
+                let binding = Binding { group: 0, attractor, effect, note: 0, color: 0 };
+                config.source_identity = Some((CHAR_KIND as u32, who as u32));
+                config.track_source = true;
+                config.target_identity = config.source_identity;
+                config.source_appearance = appearance(who, &mut stat);
+                config.target_appearance = config.source_appearance;
+                renderer.prepare_anchors((CHAR_KIND as u32, who as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
+                match renderer.spawn_configured(binding, source, source.w_axis.truncate(), config) {
+                    Ok(handle) => {
+                        self.nano_handles.push((who, spell, handle));
+                    }
+                    Err(error) => eprintln!("nano effects: {error:#}"),
+                }
+            }
+        }
+        self.effects = Some(renderer);
     }
 
     /// Visual effects use the actor's actual animated connector, never `char_pos`'s
@@ -1278,6 +1533,14 @@ impl Dynels {
         std::mem::take(&mut self.sounds)
     }
 
+    pub fn take_effect_sounds(&mut self) -> impl Iterator<Item = super::combat::effects::AuxSound> + '_ {
+        self.effects.iter_mut().flat_map(|effects| effects.take_aux_sounds())
+    }
+
+    pub fn effect_camera_offset(&mut self, eye: glam::Vec3) -> anyhow::Result<glam::Vec3> {
+        self.effects.as_mut().map_or(Ok(glam::Vec3::ZERO), |effects| effects.camera_offset(eye))
+    }
+
     /// Doors whose room link state changed since the last call: `(scene position, open, passable)` (`n3RoomMonitor_t::DoorOpened/Closed`,
     /// `Door_t::CanPass`, see [`PropAnim::take_room_state`]); the caller maps the position to the link (`Collision::door_link_from_pos`).
     pub fn take_door_rooms(&mut self) -> Vec<([f32; 3], bool, bool)> {
@@ -1337,6 +1600,7 @@ impl Dynels {
                             let name = c.base.name();
                             self.props.get_mut(&(who.kind, who.instance)).unwrap().name = (!name.is_empty()).then_some(name);
                             // A corpse replaces its character even when the full update beats the quit.
+                            self.cancel_nano_visuals(c.owner.instance);
                             self.chars.remove(&c.owner.instance);
                         }
                     }
@@ -1347,6 +1611,7 @@ impl Dynels {
                 self.die(who.instance, a.identity_b.instance as u32)
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == ACTION_UNWIELD => self.unwield_slot(who.instance, a.identity_b.instance),
+            N3::Dynel(Dynel::CastNanoSpell(cast)) if who.kind == CHAR_KIND => self.nano_casts.push((who.instance, cast.clone())),
             N3::Dynel(Dynel::WeaponItemFullUpdate(w)) if w.parent.kind == CHAR_KIND => {
                 // body location 6 = right hand, 8 = left hand (docs/zone/static.md §4)
                 if let Some(hand) = match w.byte_71 {
@@ -1484,6 +1749,7 @@ impl Dynels {
                 }
             }
             N3::Misc(Misc::ToClientQuit) => {
+                self.cancel_nano_visuals(who.instance);
                 self.chars.remove(&who.instance);
                 self.swing_delay.remove(&who.instance);
                 self.once_rate.remove(&who.instance);
@@ -1518,12 +1784,20 @@ impl Dynels {
     }
 
     /// Advances the dynels and hands the visible ones to the renderer. `cam` = camera position in scene space, `fwd` = its view direction.
-    pub fn update(&mut self, dt: f32, cam: [f32; 3], _fwd: [f32; 3], host: &mut Host) {
+    /// The loaded playfield surface capability; absent geometry is not a no-hit query.
+    pub fn update_with_collision(
+        &mut self, dt: f32, cam: [f32; 3], _fwd: [f32; 3], host: &mut Host,
+        collision: Option<&mut dyn FnMut(ao_render::Vec3) -> Option<(ao_render::Vec3, ao_render::Vec3)>>,
+        own_anchor: impl FnMut(i32) -> Option<glam::Mat4>,
+    ) {
         self.sync_scene(host);
         self.cam = cam;
         self.tick_sounds(dt);
-        if let Some(effects) = &mut self.effects { effects.frame(dt, host); }
-        let Some(dir) = self.dir.clone() else { return };
+        let Some(dir) = self.dir.clone() else {
+            self.refresh_effect_anchors(own_anchor);
+            if let Some(effects) = &mut self.effects { effects.frame(dt, host, collision); }
+            return;
+        };
         let worker = self.worker.take().unwrap_or_else(|| Worker::start(dir));
         if let Some(pf) = self.want_placed.take() {
             let _ = worker.tx.send(Req::Placed(pf));
@@ -1657,6 +1931,7 @@ impl Dynels {
             let state = c.pose.anim;
             let mut movement_rate = c.special == Special::None;
             let (key, list, rate) = match c.special {
+                Special::Cast(k) => (k, built.clips.get(&k), 1.0),
                 Special::Die(k) => match built.clips.get(&k).or_else(|| built.clips.get(&DIE_KEY)) {
                     Some(a) => (k, Some(a), 1.0),
                     None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
@@ -1728,7 +2003,7 @@ impl Dynels {
                 self.notes.extend(super::combat::notes::fire(&a.events, c.clip_ms, &mut c.note_fired).into_iter().map(|n| (*id, n)));
             }
             let dead = matches!(c.special, Special::Die(_));
-            if let Some(a) = clip.filter(|_| c.special != Special::None) {
+            if let Some(a) = clip.filter(|_| !matches!(c.special, Special::None | Special::Cast(_))) {
                 // one-shot clips: Attack returns to the movement state at the end, Die holds the last frame
                 if c.clip_ms >= a.duration {
                     if matches!(c.special, Special::Attack | Special::Once(_)) {
@@ -1739,7 +2014,7 @@ impl Dynels {
                     }
                 }
             }
-            if let Some(a) = clip.filter(|a| c.special == Special::None && a.duration > 0.0 && c.clip_ms > 4.0 * a.duration) {
+            if let Some(a) = clip.filter(|a| matches!(c.special, Special::None | Special::Cast(_)) && a.duration > 0.0 && c.clip_ms > 4.0 * a.duration) {
                 c.clip_ms = super::avatar::clip_time(a, c.clip_ms, false);
             }
             // DS 0x10074bb4 samples the CAT clock each frame, not a distance-selected Hz.
@@ -1750,7 +2025,7 @@ impl Dynels {
             let terminal = dead && clip.is_some_and(|a| c.clip_ms >= a.duration);
             let skin = if !terminal || !c.terminal_pose || !c.submitted {
                 c.terminal_pose = terminal;
-                Some(rig.pose(clip.map(|a| (&**a, super::avatar::clip_time(a, c.clip_ms, c.special != Special::None)))))
+                Some(rig.pose(clip.map(|a| (&**a, super::avatar::clip_time(a, c.clip_ms, !matches!(c.special, Special::None | Special::Cast(_)))))))
             } else {
                 None
             };
@@ -1765,6 +2040,8 @@ impl Dynels {
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [p[0], p[1], p[2], 1.0]];
             host.actors.push(ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), skin, always: false, alpha: 1.0 });
         }
+        self.refresh_effect_anchors(own_anchor);
+        if let Some(effects) = &mut self.effects { effects.frame(dt, host, collision); }
         self.worker = Some(worker);
     }
 
@@ -1876,6 +2153,63 @@ impl Dynels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nano_visual_arguments_and_cast_timing_follow_retail() {
+        use ao_net::n3::spells::Spell;
+        let spell = Spell { function: 0xcfd4, stats: [(0x27, 62002), (0x57, 2000), (0x56, 1006), (0x31, 250), (0x32, 25), (0xa1, 3), (0x99, 255), (0x9c, 128)].into(), ..Default::default() };
+        let (effect, attractor, config) = nano_visual(&spell).unwrap();
+        assert_eq!((effect, attractor), (62002, 1006));
+        assert_eq!(config.duration, Some(2.5));
+        assert_eq!(config.scale, Some(1.25));
+        assert_eq!(config.repetitions, Some(3));
+        assert_eq!(config.start_color, Some([1.0, 0.0, 0.0, 128.0 / 255.0]));
+        let absent = 1_234_567_890;
+        assert_eq!(nano_cast_delay(500, absent, 600, 0, 0), 2.0);
+        assert_eq!(nano_cast_delay(1000, absent, 1800, 0, 0), 3.0);
+        assert_eq!(nano_cast_delay(500, 200, 1200, 0, 0), 2.0);
+        assert_eq!(nano_cast_delay(500, 200, 0, 0, 0x80000), 0.0);
+        let mut world = Dynels::default();
+        for who in [42, 43] {
+            world.apply_nano_visuals(ao_net::n3::spells::ApplySpells { target: ao_net::msg::Identity { kind: CHAR_KIND, instance: who }, spells: vec![spell.clone()], apply: true });
+            let identity = ao_net::msg::Identity { kind: CHAR_KIND, instance: who };
+            let cast = ao_net::n3::dynel::CastNanoSpell { spell: 163449, target: identity, flag: true, source: identity, rest: vec![] };
+            world.on_message(&Message { header: ao_net::n3::N3Header { msg_type: ao_net::n3::dynel::CAST_NANO_SPELL, target: identity, flag: 0 }, sender: who as u32, body: N3::Dynel(Dynel::CastNanoSpell(cast)) });
+        }
+        assert_eq!(world.nano_visuals.len(), 2);
+        assert_eq!(world.nano_casts.len(), 2);
+        world.own = 42;
+        world.casting.push(NanoCast { who: 42, spell: 163449, target: 43, handle: 0, remaining: 2.0, finish: [49999; 2], release_anim: 201, released: false, release_seen: false, done: false, instant: false });
+        world.cancel_nano_visuals(43);
+        assert!(world.casting.is_empty(), "target disappearance ends the caster's loop even without an effect renderer");
+        assert_eq!(world.take_nano_animations(), [None]);
+        world.clear();
+        assert!(world.nano_visuals.is_empty());
+        assert!(world.nano_casts.is_empty());
+    }
+
+    #[test]
+    fn zone_routes_foreign_nano_visuals_and_undo() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::{outgoing::n3_frame, spells};
+        let mut zone = super::super::zone::Zone::new(42);
+        let target = Identity { kind: CHAR_KIND, instance: 43 };
+        let spell = spells::spell(0xcf26, &[(0x27, 62002)]);
+        for apply in [true, false] {
+            let mut writer = ao_net::wire::Writer::default();
+            writer.u32(spells::APPLY_SPELLS);
+            target.write(&mut writer);
+            writer.u8(0);
+            writer.0.extend(spells::encode(target, std::slice::from_ref(&spell), apply).unwrap());
+            zone.on_frame(&n3_frame(0, 43, writer.0));
+        }
+        assert_eq!(zone.world.nano_visuals.len(), 2);
+        assert!(zone.world.nano_visuals[0].apply);
+        assert!(!zone.world.nano_visuals[1].apply);
+        assert!(zone.own_events.is_empty());
+        zone.world.cancel_nano_visuals(43);
+        assert!(zone.world.nano_visuals.is_empty());
+    }
 
     #[test]
     fn npc_clock_keeps_clip_start_rate_and_uses_absolute_milliseconds() {
@@ -2037,7 +2371,7 @@ mod tests {
         let mut host = Host::headless();
         let mut eye = [0.0; 3];
         let frame = |w: &mut Dynels, eye: [f32; 3], dt: f32, host: &mut Host| {
-            w.update(dt, eye, [0.0, 0.0, -1.0], host);
+            w.update_with_collision(dt, eye, [0.0, 0.0, -1.0], host, None, |_| None);
             let id = w.props.get(&(who.kind, who.instance)).map(|p| p.id);
             let skin = host.actors.iter().find(|a| Some(a.id) == id).map(|a| a.skin.clone());
             host.actors.clear();
@@ -2101,6 +2435,64 @@ mod tests {
         }
     }
 
+    /// Keep wire cloth/NPC overrides and mounted meshes tied to real client resources.
+    #[test]
+    fn captured_appearance_resources_resolve_and_decode() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let captures = [
+            include_str!("../../../../docs/captures/zone_ithaca.rec"),
+            include_str!("../../../../docs/captures/zone_enter_ithaca.rec"),
+            include_str!("../../../../docs/captures/zone_newchar_ithaca.rec"),
+            include_str!("../../../../docs/captures/zone_kill_ithaca.rec"),
+            include_str!("../../../../docs/captures/zone_death_borealis.rec"),
+            include_str!("../../../../docs/captures/zone_fight_ithaca.rec"),
+            include_str!("../../../../docs/captures/zone_antonio_shop_ithaca.rec"),
+        ];
+        let mut textures = std::collections::BTreeSet::new();
+        let mut meshes = std::collections::BTreeSet::new();
+        let mut bodies = std::collections::BTreeSet::new();
+        let mut characters = 0;
+        for rec in captures {
+            for frame in frames(rec) {
+                let Ok(Message { body: N3::Dynel(Dynel::SimpleCharFullUpdate(c)), .. }) = ao_net::n3::decode(&frame) else { continue };
+                characters += 1;
+                textures.extend(c.cloth.iter().filter(|c| c.texture > 0).map(|c| (1010004, c.texture as u32)));
+                textures.extend(c.textures.iter().filter(|t| t.texture > 0).map(|t| (1010004, t.texture as u32)));
+                meshes.extend(c.attractors.iter().filter(|a| a.mesh > 0).map(|a| a.mesh as u32));
+                meshes.extend(c.head_mesh.filter(|&h| h > 0).map(|h| h as u32));
+                let model = if c.is_npc() {
+                    NpcRecord::load(&store, c.monster_data as u32).unwrap().mesh().expect("captured NPC has a model")
+                } else {
+                    let (breed, gender) = ao_formats::screens::wire_breed_sex(c.breed as i32, c.sex as i32).unwrap();
+                    ao_formats::character::player_model_build(&store, breed, gender, c.fatness.min(2)).unwrap()
+                };
+                bodies.insert(model);
+            }
+        }
+        assert_eq!(characters, 144);
+        assert_eq!(textures.len(), 93);
+        for id in meshes {
+            let refs = ao_formats::mesh::texture_refs(&store, ao_formats::mesh::MESH_TYPE, id)
+                .unwrap_or_else(|e| panic!("attachment {id}: {e:#}")).expect("captured attachment exists");
+            textures.extend(refs.into_iter().map(|k| (k.rdb_type, k.id)));
+        }
+        for id in bodies {
+            let cat = load_cat_mesh(&store, CHAR_MESH_TYPE, id).unwrap();
+            for part in cat.parts {
+                textures.extend([part.texture, part.env_texture].into_iter().filter(|&id| id != 0).map(|id| (1010004, id)));
+            }
+        }
+        for (rdb_type, id) in textures {
+            let key = ao_scene::TextureKey { rdb_type, id };
+            let texture = ao_formats::texture::load_texture(&store, key)
+                .unwrap_or_else(|e| panic!("captured appearance texture {key:?}: {e:#}"))
+                .unwrap_or_else(|| panic!("missing captured appearance texture {key:?}"));
+            assert!(texture.width > 0 && texture.height > 0);
+            assert_eq!(texture.rgba.len(), (texture.width * texture.height * 4) as usize);
+        }
+    }
+
     #[test]
     fn captured_dynels_become_actors() {
         let mut z = Zone::new(25988);
@@ -2126,7 +2518,7 @@ mod tests {
         let mut models = vec![];
         let mut actors = vec![];
         for _ in 0..600 {
-            z.world.update(0.05, eye, fwd, &mut host);
+            z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             models.append(&mut host.actor_models);
             actors = std::mem::take(&mut host.actors);
             let pending = keys(&z).iter().any(|k| matches!(z.world.models.get(k), None | Some(Model::Loading))) || z.world.want_placed.is_some() || z.world.props.len() < 12 || z.world.wield.len() < 3;
@@ -2140,7 +2532,7 @@ mod tests {
         let n = 200;
         let mut pushed = 0;
         for _ in 0..n {
-            z.world.update(0.016, eye, fwd, &mut host);
+            z.world.update_with_collision(0.016, eye, fwd, &mut host, None, |_| None);
             pushed += host.actors.len();
             host.actors.clear();
             host.actor_models.clear();
@@ -2188,7 +2580,7 @@ mod tests {
                 c.submitted = false;
             }
             let direction = ao_render::Vec3::new(at[0] - cam[0], at[1] - cam[1], at[2] - cam[2]).normalize();
-            z.world.update(0.0, cam, [direction.x, direction.y, direction.z], &mut host);
+            z.world.update_with_collision(0.0, cam, [direction.x, direction.y, direction.z], &mut host, None, |_| None);
             models.append(&mut host.actor_models);
             actors = std::mem::take(&mut host.actors);
             assert!(!actors.is_empty(), "screenshot camera must submit nearby dynels");
@@ -2374,7 +2766,7 @@ mod variant_tests {
         let mut host = ao_render::Host::headless();
         let mut pump = |z: &mut Zone, n: usize, until: &dyn Fn(&Dynels) -> bool| {
             for _ in 0..n {
-                z.world.update(0.02, [0.0; 3], [0.0, 0.0, -1.0], &mut host);
+                z.world.update_with_collision(0.02, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
                 if until(&z.world) {
                     return true;
                 }
@@ -2517,7 +2909,7 @@ mod variant_tests {
         let mut host = ao_render::Host::headless();
         let mut settle = |w: &mut Dynels| {
             for _ in 0..1000 {
-                w.update(0.02, [0.0; 3], [0.0, 0.0, -1.0], &mut host);
+                w.update_with_collision(0.02, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
                 let c = &w.chars[&id];
                 if c.next.is_none() && matches!(w.models.get(&c.key), Some(Model::Ready { .. })) {
                     return;
@@ -2676,7 +3068,7 @@ mod variant_tests {
         let (eye, fwd) = (crate::play::zone::scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            z.world.update(0.0, eye, fwd, &mut host);
+            z.world.update_with_collision(0.0, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
             let c = &z.world.chars[&leet];
             if matches!(z.world.models.get(&c.key), Some(Model::Ready { .. })) { break; }
@@ -2685,7 +3077,7 @@ mod variant_tests {
         }
         // Advance the same thirty simulated seconds only after the async model is available.
         for _ in 0..600 {
-            z.world.update(0.05, eye, fwd, &mut host);
+            z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
         }
         let c = &z.world.chars[&leet];
@@ -2743,7 +3135,7 @@ mod variant_tests {
         let (eye, fwd) = (scene_pos(z.own()?.pos), [0.0, 0.0, -1.0]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            z.world.update(0.05, eye, fwd, &mut host);
+            z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
             let pending: Vec<_> = [player, leet].into_iter().filter_map(|id| {
                 let c = &z.world.chars[&id];
@@ -2790,9 +3182,9 @@ mod variant_tests {
         let mut host = Host::headless();
         let eye = scene_pos(z.own().unwrap().pos);
         let lpos = scene_pos(z.world.chars[&leet].pose.pos);
-        z.world.update(IMPACT_DELAY_S - 0.1, eye, [0.0, 0.0, -1.0], &mut host);
+        z.world.update_with_collision(IMPACT_DELAY_S - 0.1, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
         assert!(z.world.take_sounds().is_empty(), "the impact waits {IMPACT_DELAY_S} s");
-        z.world.update(0.2, eye, [0.0, 0.0, -1.0], &mut host);
+        z.world.update_with_collision(0.2, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
         let later = z.world.take_sounds();
         eprintln!("impact sounds on the leet: {later:?}");
         if (1..=17).contains(&fabric) {
@@ -2805,7 +3197,7 @@ mod variant_tests {
         z.world.hit_seen(att, HitCtx { victim: leet, slot: 0, damage: 20, flags: 1 });
         z.world.note_sounds(att, 0xb);
         assert!(z.world.take_sounds().is_empty() || z.world.take_sounds().is_empty(), "hit kind 1: the dummy weapon's b4ac part is skipped");
-        z.world.update(1.0, eye, [0.0, 0.0, -1.0], &mut host);
+        z.world.update_with_collision(1.0, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
         assert!(z.world.take_sounds().is_empty());
         // a player is struck: Male / FemaleGetsHit, material 7
         if victim != att {
@@ -2815,7 +3207,7 @@ mod variant_tests {
             z.world.note_sounds(att, 0xb);
             z.world.take_sounds();
             let vpos = scene_pos(z.world.chars[&victim].pose.pos);
-            z.world.update(0.5, eye, [0.0, 0.0, -1.0], &mut host);
+            z.world.update_with_collision(0.5, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
             let s = z.world.take_sounds();
             match crate::play::combat::notes::player_impact(breed, sex) {
                 Some((7, Some(name))) => assert_eq!(s, [GameSound { id: ao_audio::sbf::sound_id(name), pos: vpos, material: 7, size: 1 }]),
@@ -2859,7 +3251,7 @@ mod variant_tests {
         z.world.take_notes();
         z.world.attack(leet);
         for _ in 0..60 {
-            z.world.update(0.05, eye, fwd, &mut host);
+            z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
         }
         assert!(z.world.take_notes().is_empty(), "unmarked clip");
@@ -2867,7 +3259,7 @@ mod variant_tests {
         z.world.attack(leet);
         let mut notes = vec![];
         for _ in 0..80 {
-            z.world.update(0.05, eye, fwd, &mut host);
+            z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
             notes.extend(z.world.take_notes());
         }
@@ -2912,7 +3304,7 @@ mod variant_tests {
         let (eye, fwd) = (scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            z.world.update(0.05, eye, fwd, &mut host);
+            z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
             if matches!(z.world.chars[&leet].special, Special::Once(k) if k == u32::from(anim)) { break; }
             assert!(std::time::Instant::now() < deadline, "imp clip {anim:#x} did not start; pending replay {:?}", z.world.replay);

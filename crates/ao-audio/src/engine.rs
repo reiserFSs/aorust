@@ -373,6 +373,16 @@ impl Audio {
         rt.play_at(&self.sh, def, d, material, size)
     }
 
+    /// Authored GC class4000 / SI PlaySoundCommand @100071ed positional one-shot.
+    pub fn play_effect_sound(&self, id: u32, pos: [f32; 3], listener: [f32; 3], volume: f32, radius: f32, probability: i32) -> Result<Vec<u64>> {
+        let mut g = self.rt();
+        let rt = g.as_mut().context("effect audio runtime unavailable")?;
+        let db = rt.lib.sounds.clone();
+        let def = db.get(id).with_context(|| format!("missing authored effect sound {id:#x}"))?;
+        let d = if pos == [0.0; 3] { 0.0 } else { (0..3).map(|i| (pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt() };
+        Ok(rt.play_effect_at(&self.sh, def, d, volume, radius, probability))
+    }
+
     /// Plays a file below `cd_image/sound` (e.g. `sfx/gui/click`) once, centred. Returns the voice id (0 = not played).
     pub fn play_sfx(&self, rel: &str, gain: f32) -> u64 {
         match self.sh.resolve(rel) {

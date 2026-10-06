@@ -177,6 +177,12 @@ and `GetBodyCollSphereDisplacement` only feed the dynel against dynel test `Chec
 8. final `VetoPosition` on `(x, feet, z)`.
 Sliding up a single steep plane is therefore possible for one step, but the body is not supported there (normal < 0.5) and falls back down.
 
+### 3.5 Authored rock effects (class 1027)
+
+**[CODE]** Gamecode `FUN_101017b6` asks `FUN_100ad4bd` for the advanced rock point's correction and normal. `FUN_100af659` is the surface-wrapper singleton accessor, not another collision test. `FUN_100ad4bd` calls the playfield surface's `VetoPosition` (`+0x20`, null source arguments), then `CalculateClosestPoint` (`+0x04`), and raises only the veto-corrected point's y when the closest point is higher. The normal comes from that surface query; no invented horizontal plane or previous-to-current segment is involved. N3 `VetoRoomTransition` @0x1001462f accepts a null-source point inside a room and uses `GetSafePos` outside rooms; a fresh `SurfaceState` with room -1 reproduces this without remembered dynel or door transitions.
+
+Runtime: `Player`'s loaded `Collision` → `Flow`'s optional query capability → `Dynels::update_with_collision` → effect renderer. The query reuses `Collision::closest` for outdoor heightfield / dungeon tiles and their native KD volumes and liquid-depth rule. Geometry absence is an absent capability, not a successful no-hit answer. Regression: `player::tests::effect_collision_uses_surface_normal_and_never_lowers_the_rock` checks a sloped collision mesh's actual normal, preserved high point and off-mesh no hit.
+
 ## 4. API (`ao_formats::playfield::collision`, scene coordinates)
 
 * `Collision::load(&RecordStore, playfield) -> Result<Collision>`: heightfield (outdoor) or room tile floors + room list with door links (dungeon), the KD volumes of every

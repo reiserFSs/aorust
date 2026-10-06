@@ -1077,7 +1077,7 @@ mod tests {
         z.world.start(ao_gui::client_dir(), OWN as i32);
         let mut host = ao_render::Host::headless();
         for _ in 0..600 {
-            z.world.update(0.05, [0.0; 3], [0.0, 0.0, 1.0], &mut host);
+            z.world.update_with_collision(0.05, [0.0; 3], [0.0, 0.0, 1.0], &mut host, None, |_| None);
             if z.world.stat_of(machine.kind, machine.instance, 0x1ab).is_some() { break; }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -1116,7 +1116,7 @@ mod tests {
         z.world.start(ao_gui::client_dir(), own as i32);
         let mut host = ao_render::Host::headless();
         for _ in 0..600 {
-            z.world.update(0.05, [0.0; 3], [0.0, 0.0, 1.0], &mut host);
+            z.world.update_with_collision(0.05, [0.0; 3], [0.0, 0.0, 1.0], &mut host, None, |_| None);
             if z.world.stat_of(machine.kind, machine.instance, 0x1ab).is_some() { break; }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
