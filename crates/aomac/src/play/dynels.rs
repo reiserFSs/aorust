@@ -27,6 +27,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use super::combat::anim as canim;
+use super::dynels_doors::{Cmd, GameSound, ItemRig, PropAnim};
 use super::tags::{Indicator, Listing, Tag, TagLayer};
 use super::zone::{scene_pos, scene_yaw};
 
@@ -128,6 +129,8 @@ pub struct Built {
     pub held: Option<(Vec<ao_scene::Vertex>, Vec<[[f32; 4]; 4]>)>,
     /// `Flags` bit 0 of an item-family dynel (`DisableVisibility` otherwise).
     pub visible: bool,
+    /// Items whose mesh has node keyframes (doors, vending machines): the animation data (docs/zone/doors.md).
+    pub item: Option<ItemRig>,
 }
 
 enum Model {
@@ -250,7 +253,7 @@ fn static_model(store: &RecordStore, mesh: u32, override_texture: Option<u32>) -
 }
 
 fn plain(model: ao_scene::Scene, visible: bool) -> Built {
-    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible }
+    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None }
 }
 
 fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::Result<Built> {
@@ -259,14 +262,19 @@ fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::
         Look::Corpse(c) => build_corpse(store, assets, c),
         Look::Item { template, stats } => {
             let tpl = template.map(|t| item_template(store, t)).transpose()?.flatten();
-            let v = visual(&effective_stats(tpl.as_ref(), stats), default_mesh(&assets.names)?);
+            let eff = effective_stats(tpl.as_ref(), stats);
+            let v = visual(&eff, default_mesh(&assets.names)?);
             match (v.cat_mesh, v.mesh) {
                 (Some(cat), _) => {
                     let rig = ActorRig::new(store, cat, None, &Default::default(), &[])?;
                     let held = rig.pose(None);
                     Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), ..plain(Default::default(), v.visible) })
                 }
-                (None, Some(mesh)) => Ok(plain(static_model(store, mesh, v.override_texture)?, v.visible)),
+                (None, Some(mesh)) => {
+                    let model = static_model(store, mesh, v.override_texture)?;
+                    let item = ItemRig::new(store, mesh, &model, &eff, tpl.map(|t| t.sounds).unwrap_or_default());
+                    Ok(Built { item, ..plain(model, v.visible) })
+                }
                 (None, None) => anyhow::bail!("item dynel without a model"),
             }
         }
@@ -471,7 +479,12 @@ struct Prop {
     yaw: f32,
     scale: f32,
     submitted: bool,
+    /// Door / animated item state and the pose the renderer holds (docs/zone/doors.md).
+    anim: PropAnim,
 }
+
+/// Identity kinds of `Door_t` (`DoorRibosome_t`, docs/zone/static.md §3).
+const DOOR_KINDS: [i32; 3] = [0xC748, 0xDAC6, 0xC73A];
 
 /// First `ActorFrame::id` of props (character instances stay far below).
 const PROP_ID_BASE: u32 = 0x4000_0000;
@@ -508,6 +521,9 @@ pub struct Dynels {
     tags: TagLayer,
     listing: Listing,
     /// The CRT's `rand()` the variant picks consume (`srand(time)` when the zone starts, [GUESS] for the exact call site).
+    /// `PlayGameSound` calls of doors since the last [`Dynels::take_sounds`].
+    sounds: Vec<GameSound>,
+}
     rng: CrtRand,
 
 impl Default for Dynels {
@@ -533,6 +549,8 @@ impl Default for Dynels {
             lens: Lens::default(),
         }
             tags: TagLayer::default(),
+            sounds: vec![],
+        }
             listing: Listing::default(),
             rng: CrtRand::new(1),
     }
@@ -623,8 +641,23 @@ impl Dynels {
         if !replace {
             self.next_prop += 1;
         }
-        self.props.insert((kind, instance), Prop { id, key: look.key(), pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false });
+        self.props.insert((kind, instance), Prop { id, key: look.key(), pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default() });
         self.pending.push(look);
+    /// A message for the door `who` (queued while its model is still being built; unknown doors ignore it, like the client's `GetDynel`).
+    fn door_command(&mut self, who: ao_net::msg::Identity, c: Cmd) {
+        let Some(p) = self.props.get_mut(&(who.kind, who.instance)) else { return };
+        let item = match self.models.get(&p.key) {
+            Some(Model::Ready { built, .. }) => built.item.as_ref(),
+            _ => None,
+        };
+        p.anim.command(c, item, scene_pos(p.pos), &mut self.rng, &mut self.sounds);
+    }
+
+    /// Door sounds started since the last call (the app plays them: `SandyInterfaceModule_t::PlayGameSound`).
+    pub fn take_sounds(&mut self) -> Vec<GameSound> {
+        std::mem::take(&mut self.sounds)
+    }
+
     }
 
     pub fn on_message(&mut self, m: &Message) {
@@ -636,6 +669,19 @@ impl Dynels {
                 let scale = stat_scale(&stats);
                 if let Some(pos) = v.base.position {
                     self.add_prop(who.kind, who.instance, Look::Item { template, stats }, pos, v.base.rotation, scale);
+            N3::World(World::DoorStatus(d)) if DOOR_KINDS.contains(&who.kind) => self.door_command(who, Cmd::Status(d.locked, d.open, d.value_c3, d.flag_1a)),
+            N3::World(World::Door(d)) if DOOR_KINDS.contains(&who.kind) && !self.props.contains_key(&(who.kind, who.instance)) => {
+                // `FUN_1009faaf`: nothing happens when the dynel exists; a new one opens at once when `Flags` bit 0x80 is set
+                let stats = d.base.stats.clone();
+                if let Some(pos) = d.base.position {
+                    let open = ao_formats::dynel_visual::get(&stats, 0).is_some_and(|f| f as u32 & super::dynels_doors::FLAG_OPEN != 0);
+                    let (template, scale) = (static_instance(&stats), stat_scale(&stats));
+                    self.add_prop(who.kind, who.instance, Look::Item { template, stats }, pos, d.base.rotation, scale);
+                    if open {
+                        self.door_command(who, Cmd::Open);
+                    }
+                }
+            }
                 }
             }
             N3::World(World::Corpse(c)) => {
@@ -835,6 +881,10 @@ impl Dynels {
         for p in self.props.values_mut() {
             let Some(Model::Ready { built, uploaded }) = self.models.get_mut(&p.key) else { continue };
             if !built.visible {
+            // the clock runs for every prop, drawn or not (`SimpleItem_t` update)
+            if let Some(item) = &built.item {
+                p.anim.step(dt, item);
+            }
                 continue;
             }
             if !*uploaded {
@@ -851,7 +901,8 @@ impl Dynels {
             let k = p.scale;
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [q[0], q[1], q[2], 1.0]];
             // the renderer forgets actors that were not submitted: the held pose goes out again after an absence
-            let skin = built.held.as_ref().filter(|_| !p.submitted).map(|h| h.0.clone());
+            let moved = built.item.as_ref().and_then(|item| p.anim.pose(item, &built.model.meshes[0].vertices, !p.submitted));
+            let skin = built.held.as_ref().filter(|_| !p.submitted).map(|h| h.0.clone()).or(moved);
             p.submitted = true;
             let parts = built.held.as_ref().map_or(vec![], |h| h.1.clone());
             host.actors.push(ActorFrame { id: p.id, model: p.key, transform, parts, skin, always: false });
@@ -1067,6 +1118,85 @@ mod tests {
     fn client() -> Option<PathBuf> {
         let d = PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
         d.join("cd_image/rdb.db").exists().then_some(d)
+    }
+
+    /// A door of playfield 4582 (`{0xC748, 0xC00011E6}`, mesh 245910 with 7 animated nodes) follows `DoorStatusUpdate`: it slides open over
+    /// the animation's 1.67 s and parks, then slides shut and returns to the rest vertices; each plays its sound from the template.
+    #[test]
+    fn placed_door_animates_on_status_updates() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::world::{DoorStatus, DOOR_STATUS_UPDATE};
+        use ao_net::n3::N3Header;
+        let Some(dir) = client() else { return };
+        let mut w = Dynels::default();
+        w.start(dir.clone(), 1);
+        w.on_playfield(4582);
+        let who = Identity { kind: 0xC748, instance: 0xC00011E6u32 as i32 };
+        let mut host = Host::headless();
+        let mut eye = [0.0; 3];
+        let frame = |w: &mut Dynels, eye: [f32; 3], dt: f32, host: &mut Host| {
+            w.update(dt, eye, [0.0, 0.0, -1.0], host);
+            let id = w.props.get(&(who.kind, who.instance)).map(|p| p.id);
+            let skin = host.actors.iter().find(|a| Some(a.id) == id).map(|a| a.skin.clone());
+            host.actors.clear();
+            host.actor_models.clear();
+            skin
+        };
+        for _ in 0..600 {
+            if let Some(p) = w.props.get(&(who.kind, who.instance)) {
+                eye = scene_pos(p.pos);
+                eye[2] += 4.0;
+                if matches!(w.models.get(&p.key), Some(Model::Ready { built, .. }) if built.item.is_some()) {
+                    break;
+                }
+            }
+            frame(&mut w, eye, 0.05, &mut host);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let key = w.props[&(who.kind, who.instance)].key;
+        let Some(Model::Ready { built, .. }) = w.models.get(&key) else { panic!("door model not built") };
+        let rest = built.model.meshes[0].vertices.clone();
+        let item = built.item.as_ref().expect("the door mesh has animated nodes");
+        assert!((item.rig.total_time() - 1.6667).abs() < 1e-3);
+        // first sight: the actor goes out with the rest vertices (no skin)
+        assert_eq!(frame(&mut w, eye, 0.016, &mut host), Some(None));
+        let send = |w: &mut Dynels, open: bool| {
+            let header = N3Header { msg_type: DOOR_STATUS_UPDATE, target: who, flag: 0 };
+            let body = N3::World(World::DoorStatus(DoorStatus { locked: false, open, value_c3: 0, flag_1a: false, stats: vec![] }));
+            w.on_message(&Message { header, sender: 1, body });
+        };
+        let moved = |a: &[ao_scene::Vertex]| a.iter().zip(&rest).map(|(a, b)| (0..3).map(|k| (a.pos[k] - b.pos[k]).abs()).fold(0.0, f32::max)).fold(0.0, f32::max);
+        send(&mut w, true);
+        let mut last = None;
+        let mut mid = 0.0;
+        for i in 0..150 {
+            if let Some(Some(s)) = frame(&mut w, eye, 0.016, &mut host) {
+                if i == 50 {
+                    mid = moved(&s);
+                }
+                last = Some(s);
+            }
+        }
+        let open = moved(&last.expect("pose changed while opening"));
+        assert!(mid > 0.1 && open > mid && open > 1.0, "mid {mid:.2} open {open:.2}");
+        // parked: nothing new is sent while the door stays open
+        assert_eq!(frame(&mut w, eye, 0.016, &mut host), Some(None));
+        send(&mut w, false);
+        let mut closed = None;
+        for _ in 0..150 {
+            if let Some(Some(s)) = frame(&mut w, eye, 0.016, &mut host) {
+                closed = Some(s);
+            }
+        }
+        assert!(moved(&closed.expect("pose changed while closing")) < 1e-4, "the closed door shows the rest vertices again");
+        let sounds = w.take_sounds();
+        assert_eq!(sounds.iter().map(|s| s.id).collect::<Vec<_>>(), [0xcfde8382, 0xc16f0487]);
+        assert!(w.take_sounds().is_empty());
+        // the sound ids are Sandy sound definitions of the client's banks, with a sample of their own or children
+        let lib = ao_audio::Library::load(&dir.join("cd_image/sound")).unwrap();
+        for s in &sounds {
+            assert!(lib.sounds.get(s.id).is_some_and(|d| d.file.is_some() || !d.children.is_empty()), "sound {:#x}", s.id);
+        }
     }
 
     #[test]
