@@ -43,8 +43,11 @@ pub enum ChatEvent {
     UserFlags { id: u32, flags: u8 },
     /// S2C_MESSAGE (0x1e) `ISD`: a tell.
     Tell { from: u32, text: String, data: Vec<u8> },
-    /// S2C_VIS_MESSAGE_FMT (0x22, `anon` false) / S2C_VIS_ANON_MESSAGE (0x23) `SSD`.
-    Vicinity { anon: bool, name: String, text: String, data: Vec<u8> },
+    /// S2C_VIS_MESSAGE_FMT (0x22) `ISD` sender id, text, data: a character's vicinity/shout/whisper text (the server echoes our own
+    /// message back with our id; live, docs/chat/live.md).
+    Vicinity { from: u32, text: String, data: Vec<u8> },
+    /// S2C_VIS_ANON_MESSAGE (0x23) `SSD` name (empty in every capture), text, data: server notices (MOTD, "This player is currently offline").
+    VicinityAnon { name: String, text: String, data: Vec<u8> },
     /// S2C_SYS_MESSAGE (0x24) `S`.
     System(String),
     /// S2C_SYS_MESSAGE_LOCAL_FMT (0x25) `IIID` + arguments: text id `text_id` of category 20000 with `args`.
@@ -108,7 +111,8 @@ pub fn decode(ptype: u16, payload: &[u8]) -> Result<ChatEvent> {
         0x15 => ChatEvent::Lookup { id: r.u32()?, name: string(r)? },
         0x16 => ChatEvent::UserFlags { id: r.u32()?, flags: r.u8()? },
         0x1e => ChatEvent::Tell { from: r.u32()?, text: string(r)?, data: data(r)? },
-        0x22 | 0x23 => ChatEvent::Vicinity { anon: ptype == 0x23, name: string(r)?, text: string(r)?, data: data(r)? },
+        0x22 => ChatEvent::Vicinity { from: r.u32()?, text: string(r)?, data: data(r)? },
+        0x23 => ChatEvent::VicinityAnon { name: string(r)?, text: string(r)?, data: data(r)? },
         0x24 => ChatEvent::System(string(r)?),
         0x25 => {
             let (sender, kind, text_id) = (r.u32()?, r.u32()?, r.u32()?);
@@ -526,7 +530,7 @@ mod tests {
         assert_eq!(ev[0].0, 0);
         assert_eq!(ev[1].1, ChatEvent::LoggedIn);
         assert_eq!(ev[2].1, ChatEvent::UserName { id: 33512, name: "Aomacvolk".into() });
-        assert!(matches!(&ev[3].1, ChatEvent::Vicinity { anon: true, text, .. } if text.starts_with("Welcome to Project Rubi-Ka!")));
+        assert!(matches!(&ev[3].1, ChatEvent::VicinityAnon { text, .. } if text.starts_with("Welcome to Project Rubi-Ka!")));
         assert_eq!(ev.len(), 6);
     }
 

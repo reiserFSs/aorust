@@ -16,7 +16,7 @@ Replay tests: `ao_net::chat::tests::live_login_capture_decodes`, `play::chat::ne
 | others' messages | `0x41` GROUP_MESSAGE in `Global`; text carries HTML (`<a href="itemref://…">`), shown in the group colour with `[Global]` link prefix and sender link |
 | we say `/g Global aomac client test` | sent `0x41 GSD` (`05 00000014`, text, data `00 01 00`), the server **echoes it back to us** as a normal GROUP_MESSAGE from our own id (data block empty): `[Global] Aomacvolk: aomac client test` is shown from the echo, not drawn locally |
 | `/tell Testy aomac client test` | `0x15` lookup `Testy` -> `0x15 {id 0x6584, "Testy"}`, `0x1e ISD` tell, server answers with an anonymous 0x23 line "This player is currently offline and will not receive your message."; the local echo "To Testy: …" is our own line [GUESS format] |
-| vicinity `aomac client test` (ptype 5 kind 3, 52-byte frame, target `{0,0}`) | accepted (connection stays up), **no echo and no reply observed** with nobody else in the hall; whether other players see it was not verifiable with one session |
+| vicinity `aomac client test` (ptype 5 kind 3, 52-byte frame, target `{0,0}`) | accepted; ~7 s later the chat server echoes it as `0x22` (`ISD`, sender = our id, text, data `00 01 00`?) -- the first app build decoded 0x22 as `SSD` and dropped it, fixed; whether other players see it was not verifiable with one session |
 | Space key in the input bar | was dropped by `ao-render` (named key without text); fixed in `viewer.rs` |
 
 Outgoing ptype-5 frame as sent (hex, seq 4):

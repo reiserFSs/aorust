@@ -23,6 +23,19 @@ pub enum Out {
     GroupRemove { group: u64, name: String },
 }
 
+/// `HandleVicinityMessage` [GUI 0x10086728]: data byte kind 4..7 pick fixed window groups, everything else is "vicinity".
+fn vicinity_msg(from_id: u32, from_name: String, text: String, data: &[u8]) -> ChatMsg {
+    let kind = data.first().copied().unwrap_or(0);
+    let group = match kind {
+        4 => 0x4100_0000,
+        5 => 0x4100_0001,
+        6 => 0x4200_001b,
+        7 => 0x4200_001a,
+        _ => 0x4000_0002,
+    };
+    ChatMsg { group, from_id, from_name, text, kind, ..Default::default() }
+}
+
 pub fn group_key(g: GroupId) -> u64 {
     (g.kind as u64) << 32 | g.id as u64
 }
@@ -168,18 +181,11 @@ impl ChatNet {
                 tell: true,
                 ..Default::default()
             })),
-            ChatEvent::Vicinity { name, text, data, .. } => {
-                let kind = data.first().copied().unwrap_or(0);
-                // HandleVicinityMessage [GUI 0x10086728]: kind 4..7 pick fixed window groups, everything else is "vicinity"
-                let group = match kind {
-                    4 => 0x4100_0000,
-                    5 => 0x4100_0001,
-                    6 => 0x4200_001b,
-                    7 => 0x4200_001a,
-                    _ => 0x4000_0002,
-                };
-                out.push(Out::Msg(ChatMsg { group, from_name: name, text, kind, ..Default::default() }));
+            ChatEvent::Vicinity { from, text, data } => {
+                let from_name = self.name_of(from).unwrap_or_default().to_owned();
+                out.push(Out::Msg(vicinity_msg(from, from_name, text, &data)));
             }
+            ChatEvent::VicinityAnon { name, text, data } => out.push(Out::Msg(vicinity_msg(0, name, text, &data))),
             ChatEvent::SystemFmt { sender, kind, text_id, args } => out.push(Out::SystemFmt { sender, kind, text_id, args }),
             ChatEvent::System(text) => out.push(Out::Line(ChatLine::new(ChatKind::System, text))),
             ChatEvent::GroupJoin { group, name, flags, .. } => {
@@ -297,12 +303,14 @@ mod tests {
             }
         }
         let names: Vec<_> = n.groups.values().map(String::as_str).collect();
-        assert_eq!(names, ["Neutral", "Omni-Tek", "Clan", "Global", "Global Trade", "IRRK News Wire", "Server Announcements"].map(|x| x));
+        assert_eq!(names, ["Global", "IRRK News Wire", "Server Announcements", "Global Trade", "Neutral", "Clan", "Omni-Tek"]);
         assert_eq!(n.group_by_name("global"), Some(0x5_0000_0014));
         let msgs: Vec<&ChatMsg> = out.iter().filter_map(|o| if let Out::Msg(m) = o { Some(m) } else { None }).collect();
         assert!(msgs.iter().any(|m| m.group_name == "Global" && m.from_name == "Aomacvolk" && m.text == "aomac client test"), "{msgs:?}");
         assert!(msgs.iter().any(|m| m.text.starts_with("This player is currently offline")));
         assert!(msgs.iter().any(|m| m.text.starts_with("Welcome to Project Rubi-Ka!") && m.group == 0x4000_0002));
+        // our own vicinity message comes back as 0x22 with our id
+        assert!(msgs.iter().any(|m| m.group == 0x4000_0002 && m.from_name == "Aomacvolk" && m.text == "aomac client test"), "{msgs:?}");
     }
 
     #[test]

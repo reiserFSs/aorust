@@ -51,7 +51,8 @@ Field codes (pack `FUN_1017161f`, unpack `FUN_10171ae5`):
 | 0x15 | S2C_LOOKUP_NAME_RES | `IS` id (-1 unknown), name |
 | 0x16 | S2C_USER_FLAGS | `IB` |
 | 0x1e | S2C_MESSAGE (tell) | `ISD` sender, text, data |
-| 0x22 / 0x23 | S2C_VIS_MESSAGE_FMT / S2C_VIS_ANON_MESSAGE | `SSD` name, text, data (0x23: name dropped) |
+| 0x22 | S2C_VIS_MESSAGE_FMT | `ISD` sender id, text, data (**live**: the server echoes our own vicinity text back with our id, `docs/captures/chat_session_ithaca.rec`) |
+| 0x23 | S2C_VIS_ANON_MESSAGE | `SSD` name (empty), text, data (MOTD, "This player is currently offline …") |
 | 0x24 | S2C_SYS_MESSAGE | `S` |
 | 0x25 | S2C_SYS_MESSAGE_LOCAL_FMT | `IIID`: sender, kind, text id (LDB category 20000), type string (`I`/`S`/`l`) followed by the arguments in packet order; `l` = u32 text id |
 | 0x28 / 0x29 | S2C_ADD_BUDDY / S2C_REM_BUDDY | `IID` / `I` |
@@ -81,5 +82,5 @@ Field codes (pack `FUN_1017161f`, unpack `FUN_10171ae5`):
 
 ## Unresolved
 
-* Group announcements (0x3c) were **not** seen in the standalone login (12 s); expected once the character is in the zone (see live notes in docs/chat/live.md).
+* Group announcements (0x3c) did not come in the standalone probe login (12 s) but arrived ~35 s after the zone login in the app (docs/chat/live.md); the trigger is unknown (zone presence or time).
 * Exact content of the outgoing `D` block, and the reduction applied to incoming text (`RemoteFormat::ParseString`, `HTMLParser_c::ExtractText`).
