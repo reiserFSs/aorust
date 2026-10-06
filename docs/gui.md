@@ -165,8 +165,8 @@ Evidence (GUI.dll, decompiled this session):
 
 ### 6.3 Alpha blending space (`ao-render` `GuiRenderer`)
 D3D7 has no sRGB framebuffer, so every GUI `SRCALPHA / INVSRCALPHA` blend works on the stored 8-bit values. The renderer used to draw into the sRGB target (linear blending: a dark
-0.85-alpha window over a bright background came out much lighter than retail: our test body (25,49,65) used to be (47,71,93)). The GUI pass now renders through the non-sRGB twin
-view (`GuiRenderer::view`, textures / surface carry `format.remove_srgb_suffix()` in `view_formats`), blending straight alpha in display space. Verified numerically: art
+0.85-alpha window over a bright background came out much lighter than retail: our test body (25,49,65) used to be (47,71,93)). The GUI initially fixed this through a non-sRGB twin view.
+World and GUI now share the primary UNORM framebuffer (`GuiRenderer::view` returns its default view), preserving straight-alpha display-space GUI blending with no shader decode or extra view format. Previously verified numerically: art
 `GFX_GUI_TAB_BACKGROUND` (26,39,51) × DEFAULT (0x80e9f3) at 0.85 over the 0.33-black window (91,124,157) = (24.7,49,63.5); the shot pixel is (25,49,65).
 
 ### 6.4 Retail reference comparison (`ref.png`, user-supplied capture of the original client)

@@ -260,12 +260,12 @@ impl Renderer {
 /// Pipeline of the env layer of a submesh that draws with `blend`: the env pipelines live behind the scene/sky ones and come in
 /// an opaque-phase and a blended-phase set (same pipeline, different phase index).
 fn env_pipe(blend: Blend, two_sided: bool) -> usize {
-    (if matches!(blend, Blend::AlphaBlend | Blend::Additive) { ENV_BLEND_PIPE } else { ENV_PIPE }) + two_sided as usize
+    (if blended_material(blend) { ENV_BLEND_PIPE } else { ENV_PIPE }) + two_sided as usize
 }
 
 /// Whether a draw belongs to the blended actor phase (client render list 6) rather than the opaque one (list 3).
 fn blended_pipe(pipe: usize) -> bool {
-    matches!(pipe / 2, 2 | 3) && pipe < SKY_PIPE || (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&pipe) || (SPRITE_PIPE..SPRITE_PIPE + 2).contains(&pipe)
+    matches!(pipe / 2, 2 | 3) && pipe < SKY_PIPE || (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&pipe) || (SPRITE_PIPE..NATIVE_BLEND_PIPE + 6).contains(&pipe)
 }
 
 #[cfg(test)]
@@ -274,9 +274,9 @@ mod tests {
 
     #[test]
     fn env_layer_follows_the_phase_of_its_submesh() {
-        for (blend, blended) in [(Blend::Opaque, false), (Blend::AlphaTest, false), (Blend::AlphaBlend, true), (Blend::Additive, true)] {
+        for (blend, blended) in [(Blend::Opaque, false), (Blend::AlphaTest, false), (Blend::AlphaBlend, true), (Blend::Additive, true), (Blend::ZeroSourceColor, true), (Blend::DestinationColorSourceColor, true), (Blend::PremultipliedAlpha, true)] {
             for two in [false, true] {
-                let base = blend as usize * 2 + two as usize;
+                let base = material_pipe(&ao_scene::Submesh { blend, two_sided: two, ..ao_scene::Submesh::new(vec![], None) });
                 assert_eq!(blended_pipe(base), blended);
                 assert_eq!(blended_pipe(env_pipe(blend, two)), blended, "{blend:?}");
                 assert!(env_pipe(blend, two) >= ENV_PIPE && env_pipe(blend, two) < ENV_PIPE + 4);
@@ -294,6 +294,26 @@ mod tests {
             s.sprite_alpha_test = true;
             assert_eq!(material_pipe(&s), SPRITE_PIPE + two_sided as usize);
             assert!(blended_pipe(material_pipe(&s)));
+        }
+    }
+    #[test]
+    fn native_effect_factors_match_display_system_states() {
+        use wgpu::BlendFactor::*;
+        // Sprite3 0x100283ec: raw D3DBLEND 1/3 and 9/3; Cylinder 0x100109a4: 2/6.
+        for (blend, src, dst, pipe) in [
+            (Blend::ZeroSourceColor, Zero, Src, 22),
+            (Blend::DestinationColorSourceColor, Dst, Src, 24),
+            (Blend::PremultipliedAlpha, One, OneMinusSrcAlpha, 26),
+        ] {
+            let state = native_blend_state(blend);
+            assert_eq!((state.color.src_factor, state.color.dst_factor), (src, dst));
+            assert_eq!(state.alpha, state.color, "D3D7 uses the same factors for alpha");
+            assert_eq!(state.color.operation, wgpu::BlendOperation::Add);
+            for two_sided in [false, true] {
+                let sub = ao_scene::Submesh { blend, two_sided, ..ao_scene::Submesh::new(vec![], None) };
+                assert_eq!(material_pipe(&sub), pipe + two_sided as usize);
+                assert!(blended_pipe(material_pipe(&sub)));
+            }
         }
     }
 }

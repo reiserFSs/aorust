@@ -42,6 +42,8 @@ pub struct Host {
     pub mods: ao_gui::Modifiers,
     /// Frontend request: hide the OS cursor because the frontend draws the game's own pointer in its draw list; applied after each frame/input.
     pub hide_cursor: bool,
+    /// Current weather wind in AO world coordinates (`GCComputeWind`, Gamecode 0x100cd993).
+    pub effect_wind: [f32; 3],
 }
 
 impl Host {
@@ -58,7 +60,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false }
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3] }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -302,7 +304,7 @@ impl State {
             present_mode: if std::env::var_os("AOMAC_NOVSYNC").is_some() { wgpu::PresentMode::AutoNoVsync } else { wgpu::PresentMode::AutoVsync },
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![renderer.format.remove_srgb_suffix()], // the GUI pass blends in display space (`GuiRenderer::view`)
+            view_formats: vec![],
         };
         surface.configure(&renderer.device, &config);
         let targets = Targets::new(&renderer, config.width, config.height);
@@ -654,7 +656,7 @@ impl Offscreen {
             dimension: wgpu::TextureDimension::D2,
             format: self.r.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[self.r.format.remove_srgb_suffix()],
+            view_formats: &[],
         });
         let view = tex.create_view(&Default::default());
         self.r.render(&view, &self.targets, &self.host.camera);

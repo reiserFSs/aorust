@@ -47,6 +47,13 @@ pub enum Blend {
     AlphaBlend,
     /// Additive (src*alpha + dst), no depth write (glows, beams).
     Additive,
+    /// ZERO / SRCCOLOR (DisplaySystem Sprite3 0x100283ec, states 19=1, 20=3).
+    ZeroSourceColor,
+    /// DSTCOLOR / SRCCOLOR (DisplaySystem Sprite3 0x100283ec, states 19=9, 20=3).
+    DestinationColorSourceColor,
+    /// ONE / INVSRCALPHA (DisplaySystem Cylinder 0x100109a4, states 19=2, 20=6).
+    /// The source is already native shaded colour; do not premultiply it in the shader.
+    PremultipliedAlpha,
 }
 
 /// Triangle list sharing the parent mesh's vertex buffer.

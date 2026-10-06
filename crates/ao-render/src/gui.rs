@@ -5,9 +5,8 @@
 //! D3D7 default), colours are the authored display-space values.
 //!
 //! **Blending happens in display (gamma) space like the original**: D3D7 has no sRGB framebuffer (`D3DRS_SRGBWRITE` does not exist), so every
-//! `SRCALPHA / INVSRCALPHA` blend of the GUI works on the stored 8-bit values. The pass therefore renders through the non-sRGB twin view of the
-//! target ([`GuiRenderer::view`]; the textures / surface must list `format.remove_srgb_suffix()` in `view_formats`), which leaves the scene's bytes
-//! untouched and blends straight alpha over them (a linear-space blend made dark translucent windows noticeably lighter than retail).
+//! `SRCALPHA / INVSRCALPHA` blend of the GUI works on the stored 8-bit values. World and GUI now share the UNORM gamma-space
+//! target, so the GUI leaves scene bytes untouched and blends straight alpha over them, without an output conversion.
 
 use crate::Renderer;
 use ao_gui::{DrawCmd, DrawList, Gui};
@@ -27,8 +26,7 @@ struct Vertex {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Globals {
     screen: [f32; 2],
-    srgb: f32,
-    _pad: f32,
+    _pad: [f32; 2],
 }
 
 pub struct GuiRenderer {
@@ -49,10 +47,9 @@ pub struct GuiRenderer {
 type Batch = (Option<[i32; 4]>, Option<usize>, std::ops::Range<u32>);
 
 impl GuiRenderer {
-    /// The view of `tex` (created with `format.remove_srgb_suffix()` in its `view_formats`) the GUI pass must draw into: the non-sRGB twin, so
-    /// that blending runs in display space (see the module docs).
+    /// View of the shared UNORM gamma-space framebuffer.
     pub fn view(tex: &wgpu::Texture) -> wgpu::TextureView {
-        tex.create_view(&wgpu::TextureViewDescriptor { format: Some(tex.format().remove_srgb_suffix()), ..Default::default() })
+        tex.create_view(&Default::default())
     }
 
     /// Uploads the skin atlas of `gui` and builds the pipeline for `r.format`.
@@ -139,7 +136,7 @@ impl GuiRenderer {
                 module: &shader,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format: r.format.remove_srgb_suffix(), blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[Some(wgpu::ColorTargetState { format: r.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
             }),
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
             depth_stencil: None,
@@ -279,7 +276,7 @@ impl GuiRenderer {
         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("gui verts"), contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
         let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("gui globals"),
-            contents: bytemuck::bytes_of(&Globals { screen: [size.0 as f32, size.1 as f32], srgb: 0.0, _pad: 0.0 }),
+            contents: bytemuck::bytes_of(&Globals { screen: [size.0 as f32, size.1 as f32], _pad: [0.0; 2] }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let mk_bg = |extra: Option<usize>| {

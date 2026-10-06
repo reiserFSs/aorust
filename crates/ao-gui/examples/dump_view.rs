@@ -59,13 +59,14 @@ fn main() -> anyhow::Result<()> {
         dimension: wgpu::TextureDimension::D2,
         format: r.format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[r.format.remove_srgb_suffix()],
+        view_formats: &[],
     });
     let view = tex.create_view(&Default::default());
     // background: dark blue-grey like the 3D backdrop behind the login windows (only so translucency is visible)
     let mut enc = r.device.create_command_encoder(&Default::default());
     {
-        let bg = wgpu::Color { r: 0.02, g: 0.03, b: 0.05, a: 1.0 };
+        // Stored gamma bytes equivalent to the old sRGB-target clear of linear (0.02, 0.03, 0.05).
+        let bg = wgpu::Color { r: 0.15170372, g: 0.18974828, b: 0.24780053, a: 1.0 };
         let _ = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(bg), store: wgpu::StoreOp::Store } })],

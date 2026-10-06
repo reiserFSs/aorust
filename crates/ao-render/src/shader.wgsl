@@ -94,17 +94,14 @@ fn vs_sky(v: VIn) -> VOut {
 
 // The client computes in framebuffer (gamma) space: D3D7 fixed function lighting, the texture stage (`tex * vertex colour`), the
 // specular add, fog and the blend all operate on the 8 bit gamma values, textures are not decoded. The scene contract hands over
-// colours as `c^2.2` ("linear"), the render target is sRGB: so the whole surface is shaded in gamma space (colours recovered
-// with `to_g`, the texture re-encoded with the exact inverse of the hardware sRGB decode) and the result is decoded with
-// `srgb_dec`, which the sRGB target encodes back to the very 8 bit value the client would have written.
+// colours as `c^2.2` ("linear"); recover them with `to_g` and re-encode sampled sRGB textures. The UNORM framebuffer stores
+// these gamma values directly, so blending and MSAA resolve operate on the same values as D3D7.
+// Texture filtering remains the existing hardware sRGB-decode/filter/re-encode path (not D3D7 gamma-space filtering).
 fn to_g(v: vec3<f32>) -> vec3<f32> {
     return pow(max(v, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
 }
 fn srgb_enc(l: vec3<f32>) -> vec3<f32> {
     return select(1.055 * pow(l, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * l, l <= vec3<f32>(0.0031308));
-}
-fn srgb_dec(s: vec3<f32>) -> vec3<f32> {
-    return select(pow((s + 0.055) / 1.055, vec3<f32>(2.4)), s / 12.92, s <= vec3<f32>(0.04045));
 }
 
 // D3D7 fixed-function vertex lighting (`IDirect3DDevice7::DrawIndexedPrimitive` with LIGHTING = 1, SHADEMODE = GOURAUD): evaluated
@@ -217,7 +214,7 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     if faded {
         a = select(i.fade, alpha, mode == 1u);
     }
-    return vec4<f32>(srgb_dec(rgb), a);
+    return vec4<f32>(rgb, a);
 }
 
 // Sky: unlit, unfogged; opaque ignores alpha.
@@ -234,7 +231,8 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
         // atmosphere strip: fogged with the live fog at the camera (normal.x = its distance at the view distance)
         rgb = mix(rgb, g.fog_color.rgb, clamp((i.n.x - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0));
     }
-    return vec4<f32>(rgb, select(1.0, c.a, mode >= 2u));
+    // Preserve the sky's existing shading; only move the former target encoding before gamma-space blending.
+    return vec4<f32>(srgb_enc(rgb), select(1.0, c.a, mode >= 2u));
 }
 
 @fragment
@@ -276,5 +274,5 @@ fn vs_env(v: VIn) -> VOut {
 fn fs_env(i: VOut) -> @location(0) vec4<f32> {
     let t = textureSample(tex, samp, i.uv);
     let f = clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
-    return vec4<f32>(srgb_dec(mix(srgb_enc(t.rgb), g.fog_g.rgb, f)), 1.0);
+    return vec4<f32>(mix(srgb_enc(t.rgb), g.fog_g.rgb, f), 1.0);
 }

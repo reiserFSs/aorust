@@ -30,6 +30,13 @@ fn gamma(c: f32) -> f32 {
     c.max(0.0).powf(1.0 / 2.2)
 }
 
+fn framebuffer_clear(linear: [f32; 3]) -> wgpu::Color {
+    // Match the former sRGB render-target encoding, without letting blending decode the destination.
+    let encode = |c: f32| if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    let [r, g, b] = linear.map(encode);
+    wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }
+}
+
 /// Free-fly camera. Forward = (sin yaw·cos pitch, sin pitch, -cos yaw·cos pitch).
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
@@ -151,9 +158,33 @@ const ENV_BLEND_PIPE: usize = 14;
 /// the depth write (`RVisual_t::RenderWithTransparency` randy31 0x1004d2d8 only switches ALPHABLENDENABLE on); they stay in the opaque phase.
 const FADE_PIPE: usize = 16;
 const SPRITE_PIPE: usize = 20;
+const NATIVE_BLEND_PIPE: usize = 22;
+
+fn native_blend_state(blend: Blend) -> wgpu::BlendState {
+    use wgpu::BlendFactor::*;
+    // D3D7 has no separate alpha state: SRCCOLOR/DSTCOLOR use the alpha channels for alpha too.
+    let (src_factor, dst_factor) = match blend {
+        Blend::ZeroSourceColor => (Zero, Src),
+        Blend::DestinationColorSourceColor => (Dst, Src),
+        Blend::PremultipliedAlpha => (One, OneMinusSrcAlpha),
+        _ => unreachable!("not a native effect blend"),
+    };
+    let component = wgpu::BlendComponent { src_factor, dst_factor, operation: wgpu::BlendOperation::Add };
+    wgpu::BlendState { color: component, alpha: component }
+}
+
+fn blended_material(blend: Blend) -> bool {
+    !matches!(blend, Blend::Opaque | Blend::AlphaTest)
+}
 
 fn material_pipe(s: &ao_scene::Submesh) -> usize {
-    if s.blend == Blend::AlphaBlend && s.sprite_alpha_test { SPRITE_PIPE + s.two_sided as usize } else { s.blend as usize * 2 + s.two_sided as usize }
+    if s.blend == Blend::AlphaBlend && s.sprite_alpha_test {
+        SPRITE_PIPE + s.two_sided as usize
+    } else if s.blend as usize >= Blend::ZeroSourceColor as usize {
+        NATIVE_BLEND_PIPE + (s.blend as usize - Blend::ZeroSourceColor as usize) * 2 + s.two_sided as usize
+    } else {
+        s.blend as usize * 2 + s.two_sided as usize
+    }
 }
 /// Lights kept per grid cell (strongest first) and the minimum cell edge in metres.
 const CELL_LIGHTS: usize = 16;
@@ -448,9 +479,9 @@ impl Renderer {
         let format = match surface {
             Some(s) => {
                 let caps = s.get_capabilities(&adapter);
-                *caps.formats.iter().find(|f| f.is_srgb()).unwrap_or(&caps.formats[0])
+                *caps.formats.iter().find(|f| !f.is_srgb()).expect("surface requires a gamma-space UNORM format")
             }
-            None => wgpu::TextureFormat::Rgba8UnormSrgb,
+            None => wgpu::TextureFormat::Rgba8Unorm,
         };
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -532,8 +563,16 @@ impl Renderer {
                 Blend::AlphaTest => ("fs_test", None, true),
                 Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
                 Blend::Additive => ("fs_add", Some(wgpu::BlendState { color: add, alpha: wgpu::BlendComponent::OVER }), false),
+                Blend::ZeroSourceColor | Blend::DestinationColorSourceColor | Blend::PremultipliedAlpha => ("fs_blend", Some(native_blend_state(blend)), false),
             };
-            let fs = if sky { ["fs_sky_opaque", "fs_sky_test", "fs_sky_blend", "fs_sky_add"][blend as usize] } else { fs };
+            let fs = if sky {
+                match blend {
+                    Blend::Opaque => "fs_sky_opaque",
+                    Blend::AlphaTest => "fs_sky_test",
+                    Blend::Additive => "fs_sky_add",
+                    _ => "fs_sky_blend",
+                }
+            } else { fs };
             let depth_write = depth_write && !sky;
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
@@ -581,6 +620,7 @@ impl Renderer {
             .chain([Blend::Opaque, Blend::AlphaTest].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, true))))
             .map(|(b, two, sky, env, fade)| (b, two, sky, env, fade, false))
             .chain([false, true].map(|two| (Blend::AlphaBlend, two, false, false, false, true)))
+            .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false))))
             .map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite))
             .collect();
         let mut r = Self {
@@ -751,7 +791,7 @@ impl Renderer {
                     let d = Draw { mesh: mi, first_index: first, count, mat, pipe: material_pipe(s) };
                     if s.liquid {
                         liquid.push(d)
-                    } else if matches!(s.blend, Blend::AlphaBlend | Blend::Additive) {
+                    } else if blended_material(s.blend) {
                         blended.push(d)
                     } else {
                         opaque.push(d)
@@ -1165,7 +1205,7 @@ impl Renderer {
                     resolve_target: Some(resolve),
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: env.sky_color[0] as f64, g: env.sky_color[1] as f64, b: env.sky_color[2] as f64, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)),
                         store: wgpu::StoreOp::Discard,
                     },
                 })],
@@ -1384,6 +1424,14 @@ mod sky_tests {
     use super::*;
     use ao_scene::{Instance, Mesh, SkySpin, Submesh, Texture, TextureKey, Vertex, IDENTITY};
 
+    #[test]
+    fn framebuffer_clear_preserves_encoded_bytes() {
+        let c = framebuffer_clear([0.0, 0.5, 1.0]);
+        assert_eq!((c.r, c.a), (0.0, 1.0));
+        assert!((c.b - 1.0).abs() < 1e-6);
+        assert!((c.g - 0.73535698).abs() < 1e-6);
+    }
+
     fn pixels(scene: &Scene, time: f32, name: &str) -> Option<Vec<u8>> {
         let path = std::env::temp_dir().join(format!("ao-render-{}-{name}.png", std::process::id()));
         // no GPU adapter: skip
@@ -1593,8 +1641,8 @@ mod sky_tests {
         red.meshes[0].vertices.iter_mut().for_each(|v| v.color = [1.0, 0.0, 0.0, 1.0]);
         // water at z = -3 in front of the actor at z = -5: the actor shows through half transparent blue
         let Some(behind) = actor_shot(&water(-3.0), red.clone(), [0.0, 0.0, -5.0], "water_front") else { return };
-        // half red + half blue blended in the sRGB target (linear 0.5 = 188 per channel)
-        assert!((150..230).contains(&behind[0]) && (150..230).contains(&behind[2]), "red actor under half-transparent blue water: {behind:?}");
+        // D3D7 blends stored gamma bytes: half red + half blue is 128, not linear-space 188.
+        assert!((120..136).contains(&behind[0]) && (120..136).contains(&behind[2]), "red actor under half-transparent blue water: {behind:?}");
         // water at z = -8 behind the actor: depth test hides it, the actor is pure red
         let front = actor_shot(&water(-8.0), red, [0.0, 0.0, -5.0], "water_back").unwrap();
         assert!(front[0] > 240 && front[2] < 20, "actor in front of the water: {front:?}");
