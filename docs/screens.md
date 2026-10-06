@@ -437,6 +437,25 @@ The harness now calls the same `Play::start_backdrop` bootstrap as native `run`;
 `Play::new`-based harnesses could never display a selection preview. `tick_preview` also retains queued `First`/`Clip` output until that
 asynchronous backdrop exists, covered by `preview_first_waits_for_backdrop_instead_of_losing_upload`.
 
+**Parallel harness memory safety:** preference overrides stay thread-local (`prefs::set_test_dir`), and
+`preview::Worker::start` captures the caller's preference directory before spawning its loader.
+Screenshot creation skips the intro by changing its own creation state, not by setting process environment variables;
+the live harness likewise uses the local preference override. Native dependencies may read `getenv` on other threads,
+so mutating the process environment during parallel tests is unsafe even with Rust 2021's safe-signature `set_var`.
+`parallel_test_directories_leave_native_environment_unchanged` checks isolation without environment mutation;
+`ao-formats`' `concurrent_model_clips_and_actor_caches` stresses independent SQLite connections, clip loading,
+per-worker animation/rest caches and skinning on four synchronized threads.
+The macOS crash report `aomac-193ed793dfd6d465-2026-10-06-213002.ips` records an invalid free at
+`model_clips + 676` in a creation worker; attributing that particular heap corruption to the environment race
+is an inference, not a demonstrated allocator trace. The model/name loaders contain no custom unsafe code or global
+mutable caches; `RecordStore` and `ActorAssets` are not `Sync` and remain worker-owned.
+Parent verification (Fix8World, clean `origin/main` plus patch): `RUST_TEST_THREADS=16 AOMAC_SHOT_DIR=<scratch>/shots
+cargo test --release --workspace --no-fail-fast` passed **1,205 tests across 37 suites, 4 ignored**.
+Three further `cargo test --release -p ao-gui -p aomac --no-fail-fast` runs with the same thread count and screenshot
+setting plus `MallocScribble=1 MallocGuardEdges=1` passed every GUI suite and **619 aomac tests, 2 ignored** each
+(57.48 / 58.27 / 64.05 s). These concurrent stress passes exercise the fix and new regressions;
+they do not prove the causal attribution of the original nondeterministic allocator failure.
+
 **Observed verification (2026-10-06, CharVisuals integrated snapshot):** live creation of `Aomacchvq` succeeded with acknowledged id **33578**,
 submitted head **40099**, height **110**, build **2**. The saved cache contains `MeshID=23365, HeadID=40099, Breed=4, Sex=1, Fatness=2`.
 `cached_created_select_shot` passed in **0.44 s**, and the backdrop-race regression passed in **0.01 s**. Inspection of `select-after.png`

@@ -40,11 +40,10 @@ pub fn dir() -> Option<PathBuf> {
 #[cfg(test)]
 thread_local! { static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) }; }
 
-/// Test scratch dir: per test thread (tests run in parallel; the process-wide env var alone races), the env var stays for helper threads.
+/// Test scratch directory, isolated to the current test thread without mutating the process environment.
 #[cfg(test)]
 pub fn set_test_dir(d: impl Into<PathBuf>) {
     let d = d.into();
-    std::env::set_var("AOMAC_PREFS_DIR", &d);
     TEST_DIR.with(|t| *t.borrow_mut() = Some(d));
 }
 
@@ -105,3 +104,30 @@ impl Prefs {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_test_directories_leave_native_environment_unchanged() {
+        let before = std::env::var_os("AOMAC_PREFS_DIR");
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for i in 0..4 {
+                let before = &before;
+                let start = &start;
+                scope.spawn(move || {
+                    let scratch = std::env::temp_dir().join(format!("aomac-prefs-isolation-{i}"));
+                    start.wait();
+                    for _ in 0..100 {
+                        set_test_dir(&scratch);
+                        assert_eq!(dir(), Some(scratch.clone()));
+                        assert_eq!(std::env::var_os("AOMAC_PREFS_DIR"), *before);
+                    }
+                });
+            }
+        });
+    }
+}
+

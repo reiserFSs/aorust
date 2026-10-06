@@ -36,8 +36,7 @@ fn shots() {
     if !client.join("cd_image/gui").exists() {
         return eprintln!("skipping: no client");
     }
-    std::env::set_var("AOMAC_PREFS_DIR", out.join("prefs"));
-    std::env::set_var("AOMAC_CC_SKIP_INTRO", "1");
+    prefs::set_test_dir(out.join("prefs"));
     std::fs::create_dir_all(&out).unwrap();
 
     // login
@@ -65,6 +64,15 @@ fn shots() {
 
     // creation: every scene (intro skipped), then the next-scene transitions
     p.start_creation(&mut Host::headless());
+    // Skip the intro locally; process-wide environment mutation races native getenv readers.
+    let t = Instant::now();
+    while p.cc.as_ref().is_some_and(|c| c.actors.is_empty()) {
+        assert!(t.elapsed() < Duration::from_secs(20), "creation actors did not initialize");
+        steps(&mut p, &mut o, 1, 0.05);
+    }
+    let c = p.cc.as_mut().unwrap();
+    c.rig.jump(&[1, 1]);
+    c.st = St::Pick(Sc::Breed);
     let t = Instant::now();
     let _ = t;
     // drive the module with real mouse/keyboard input at window coordinates (the screens' own button rects)

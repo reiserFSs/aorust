@@ -33,8 +33,9 @@ impl Worker {
     pub fn start(dir: PathBuf, breed: i32, sex: i32, char_id: i32, head: i32) -> Worker {
         let (req, req_rx) = channel::<Option<usize>>();
         let (tx, rx) = channel();
+        let prefs = super::prefs::dir();
         std::thread::spawn(move || {
-            if let Err(e) = run(&dir, breed, sex, char_id, head, &req_rx, &tx) {
+            if let Err(e) = run(&dir, breed, sex, (char_id, head), prefs.as_deref(), &req_rx, &tx) {
                 let _ = tx.send(Out::Failed(format!("{e:#}")));
             }
         });
@@ -58,8 +59,8 @@ impl Worker {
 /// `CharacterViewerModule_c::GetData(charId)` without a live world (docs/screens.md §5.5): the appearance cache entry of the
 /// character if there is one — first aomac's `CharacterViewer.xml`, then the original client's `prefs/` — else `None`
 /// (= `CCCharacter_t::SetBreed`, the default character of the entry's breed/sex).
-fn cached(client: &std::path::Path, char_id: i32) -> Option<character::CachedCharacter> {
-    let mut dirs = vec![super::prefs::dir()?];
+fn cached(client: &std::path::Path, prefs: Option<&std::path::Path>, char_id: i32) -> Option<character::CachedCharacter> {
+    let mut dirs = vec![prefs?.to_path_buf()];
     dirs.push(client.join("prefs"));
     dirs.iter().find_map(|d| character::ViewerCache::load(d).0.remove(&char_id))
 }
@@ -168,10 +169,10 @@ fn frames(store: &RecordStore, look: &CharSelectLook, cache: Option<&character::
         .collect()
 }
 
-fn run(dir: &std::path::Path, breed: i32, sex: i32, char_id: i32, head: i32, req: &Receiver<Option<usize>>, tx: &Sender<Out>) -> anyhow::Result<()> {
+fn run(dir: &std::path::Path, breed: i32, sex: i32, (char_id, head): (i32, i32), prefs: Option<&std::path::Path>, req: &Receiver<Option<usize>>, tx: &Sender<Out>) -> anyhow::Result<()> {
     let store = RecordStore::open(dir)?;
     let look = screens::char_select_look(&store, breed, sex)?;
-    let cache = cached(dir, char_id).or_else(|| listed_appearance(char_id, breed, sex, look.model as i32, head));
+    let cache = cached(dir, prefs, char_id).or_else(|| listed_appearance(char_id, breed, sex, look.model as i32, head));
     if tx.send(Out::First(Box::new(scene(&store, &look, cache.as_ref(), (Role::Idle, 0.0))?))).is_err() {
         return Ok(());
     }

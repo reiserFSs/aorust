@@ -326,7 +326,7 @@ fn live_walk() {
     let (user, pass) = (lines.next().unwrap().unwrap(), lines.next().unwrap().unwrap());
     let want = std::env::var("AOMAC_LIVE_CHAR").unwrap_or_else(|_| "Aomacvolk".into());
     if std::env::var_os("AOMAC_PREFS_DIR").is_none() {
-        std::env::set_var("AOMAC_PREFS_DIR", std::env::temp_dir().join("aomac-live-prefs"));
+        super::super::prefs::set_test_dir(std::env::temp_dir().join("aomac-live-prefs"));
     }
     // `AOMAC_AUDIO_LOG=1`: the real audio engine runs in the harness and `audio` steps print its status (combat music, voices)
     let audio = std::env::var_os("AOMAC_AUDIO_LOG").and_then(|_| ao_audio::Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok()).inspect(|a| {

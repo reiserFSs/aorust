@@ -1,6 +1,7 @@
 //! Decodes real character records when the game client is installed; skips cleanly otherwise.
 
 use ao_formats::character::*;
+use ao_formats::character::actor::{ActorAssets, ActorRig};
 use ao_formats::texture::load_texture;
 use ao_rdb::RecordStore;
 use ao_scene::Scene;
@@ -136,6 +137,39 @@ fn player_tables_resolve_models_heads_and_clips() {
     assert_eq!(find(5934, Role::Idle), Some(10135)); // opifex women share the `female` set
     assert_eq!(find(5900, Role::Emote("backflip".into())), Some(9375));
     assert!(role_anim(&store, 5907, &Role::Emote("no-such-emote".into())).is_err());
+}
+
+#[test]
+fn concurrent_model_clips_and_actor_caches() {
+    let Some(probe) = store() else { return };
+    drop(probe);
+    let start = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                // Each loader owns its SQLite connection and non-Sync ActorAssets.
+                start.wait();
+                let store = store().unwrap();
+                let mut assets = ActorAssets::new(&store).unwrap();
+                for (model, head) in [(5900, 40098), (5914, 40250)] {
+                    let clips = model_clips(&store, model).unwrap();
+                    let cached = assets.clips(&store, model).unwrap();
+                    assert_eq!(*cached, clips);
+                    let rig = ActorRig::new(&store, &assets, model, Some(head), &Default::default(), &Default::default(), &[]).unwrap();
+                    for _ in 0..8 {
+                        assert_eq!(model_clips(&store, model).unwrap(), clips);
+                        assert!(std::sync::Arc::ptr_eq(&cached, &assets.clips(&store, model).unwrap()));
+                        let anim = assets.role(&store, model, &Role::Walk).unwrap().unwrap();
+                        assert_eq!(anim.source_id, clips.iter().find(|c| c.0 == "walk").unwrap().1);
+                        assert_eq!(anim.signature, rig.cat().signature);
+                        let (vertices, mounts) = rig.pose(Some((&anim, 0.6)));
+                        assert!(vertices.iter().all(|v| v.pos.iter().all(|n| n.is_finite())));
+                        assert!(mounts.iter().flatten().flatten().all(|n| n.is_finite()));
+                    }
+                }
+            });
+        }
+    });
 }
 
 const COMPOSITE: u32 = 0x4000_0000;
