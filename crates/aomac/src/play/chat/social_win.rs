@@ -4,7 +4,8 @@
 
 use super::social::{self, Folder, Lft, Node, Social, LFT_DEFAULT, LFT_LOCATIONS, LFT_SIDES};
 use ao_formats::screens::TextDb;
-use ao_gui::{Event, Gui, GfxId, MenuItem, WindowId, WindowSize};
+use ao_gui::view::{ListItem, MultiCell};
+use ao_gui::{Event, Gui, MenuItem, WindowId, WindowSize};
 use ao_net::chat::LftReply;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -96,29 +97,12 @@ const FRIENDS_SIZE: (u32, u32) = (169, 215);
 const FOLDERS: [&str; 4] = ["ChatWindows", "OnlineFriends", "OfflineFriends", "RecentMessages"];
 /// `is_chat_window_list_open`, `is_online_list_open`, `is_offline_list_open`, `is_recent_list_open` (all default true).
 const FOLDER_KEYS: [&str; 4] = ["is_chat_window_list_open", "is_online_list_open", "is_offline_list_open", "is_recent_list_open"];
-/// Label colour pair of a normal item (**GUESS**: `StringListViewItem` default) and of red ones (`SetLabelColor(0xff6666, 0xc04c4c)`).
-const LABEL: (u32, u32) = (0xc0c0c0, 0xffffff);
-const LABEL_RED: (u32, u32) = (0xff6666, 0xc04c4c);
 
 struct FriendsWin {
     win: WindowId,
     open: [bool; 4],
 }
 
-fn gfx_name(gui: &Gui, id: u32) -> String {
-    gui.gfx().name(GfxId(id)).unwrap_or("").to_owned()
-}
-
-fn row(gui: &Gui, name: &str, icon: u32, text: &str, colors: (u32, u32), indent: u32) -> String {
-    format!(
-        "<View view_layout=\"horizontal\" layout_borders=\"Rect({indent},0,0,0)\"><BitmapView name=\"ico_{name}\" bitmap_id=\"{}\"/><TextButton name=\"{name}\" text=\"{}\" color=\"{}\" hover_color=\"{}\" pressed_color=\"{}\" layout_borders=\"Rect(3,0,0,0)\"/></View>",
-        gfx_name(gui, icon),
-        esc(text),
-        colors.0,
-        colors.1,
-        colors.1
-    )
-}
 
 // ------------------------------------------------------------------------------------------------ tells
 
@@ -154,13 +138,8 @@ const LFT_FRAME: (i32, i32, u32, u32) = (200, 180, 650, 521);
 
 struct LftWin {
     win: WindowId,
-    side: usize,
-    location: usize,
-    profession: usize,
-    professions: Vec<u32>,
+    /// `lft.results` index of the selected candidate row (`MultiListViewItem_c::Select`).
     selected: Option<usize>,
-    /// `LFTCandidateItem_c` rows (the view of each row's cells).
-    rows: Vec<ao_gui::ViewHandle>,
 }
 
 #[derive(Default)]
@@ -175,7 +154,6 @@ pub struct SocialWin {
     folder_state: Option<[bool; 4]>,
     /// HUD dvalues of windows the user closed with the frame button (`friends_window`, `lft_window`): the HUD button pops out.
     pub closed: Vec<&'static str>,
-    flash: f32,
     /// `N3Msg_GetPFName` names (`pfnrmap.dat`), loaded with the LFT window.
     pf_names: std::collections::HashMap<u32, String>,
 }
@@ -189,17 +167,6 @@ enum Action {
     Unignore,
 }
 
-fn fit(gui: &mut Gui, text: &str, w: u32) -> String {
-    let font = ao_gui::FontId::Normal;
-    if gui.text_width(font, text) <= w as i32 {
-        return text.to_owned();
-    }
-    let mut s: String = text.to_owned();
-    while !s.is_empty() && gui.text_width(font, &s) > w as i32 {
-        s.pop();
-    }
-    s
-}
 
 impl SocialWin {
     pub fn new(screen: (u32, u32)) -> Self {
@@ -226,12 +193,11 @@ impl SocialWin {
             (true, false) => {
                 let cfg = read_cfg("FriendsWindowConfig.xml");
                 let open = FOLDER_KEYS.map(|k| cfg.iter().find(|(n, _)| n == k).is_none_or(|(_, v)| v == "true"));
-                let src = "<root><View view_layout=\"vertical\"><ScrollView name=\"scroll\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" max_size=\"Point(16000,16000)\"><ScrollViewChild view_layout=\"vertical\" max_size=\"Point(16000,16000)\"><View name=\"rows\" view_layout=\"vertical\" h_alignment=\"left\"/></ScrollViewChild></ScrollView></View></root>";
+                let src = "<root><View view_layout=\"vertical\"><StringListView name=\"list\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" max_size=\"Point(16000,16000)\"/></View></root>";
                 let Ok(win) = gui.open_tabbed_window_xml("Friends", "Friends", src, (0, 0), WindowSize::Fixed(FRIENDS_SIZE.0, FRIENDS_SIZE.1)) else { return };
                 // `Window::MoveToCenter` (no saved frame): GUESS, the position is not in the binary's defaults
                 let (w, h) = gui.outer_size(win);
                 gui.set_window_pos(win, ((self.screen.0 as i32 - w as i32) / 2, (self.screen.1 as i32 - h as i32) / 2));
-                gui.set_window_context(win, true);
                 self.friends = Some(FriendsWin { win, open });
                 self.refresh_friends(gui, soc, tx, chat_windows);
             }
@@ -251,11 +217,11 @@ impl SocialWin {
         self.folder_state = Some(f.open);
     }
 
-    /// Rebuilds the item rows: folders in list order, items sorted by name without case (`CompareNoCase`, `FUN_100a8141`).
+    /// Rebuilds the items: folders in list order, items sorted by name without case (`CompareNoCase`, `FUN_100a8141`).
     pub fn refresh_friends(&mut self, gui: &mut Gui, soc: &Social, tx: &Texts, chat_windows: &[String]) {
         let Some(f) = &self.friends else { return };
         let (win, open) = (f.win, f.open);
-        gui.remove_children(win, "rows");
+        gui.list_clear(win, "list");
         let mut by_folder: [Vec<&Node>; 3] = Default::default();
         for n in soc.nodes.values() {
             by_folder[match n.folder() {
@@ -272,40 +238,57 @@ impl SocialWin {
         cw.sort_by_key(|n| n.to_lowercase());
         for (i, key) in FOLDERS.iter().enumerate() {
             let count = if i == 0 { cw.len() } else { by_folder[i - 1].len() };
-            // folder icons 0xd5 / 0xd4 (`StringListViewItem(.., 0xd5, 0xd4)`); which is open is a GUESS (0xd4 open)
-            let head = row(gui, &format!("folder_{i}"), if open[i] { 0xd4 } else { 0xd5 }, &format!("{} ({count})", tx.social(key)), (0xffffff, 0xffffff), 0);
-            let _ = gui.add_view_xml(win, "rows", &format!("folder_row_{i}"), &format!("<root>{head}</root>"));
-            if !open[i] {
-                continue;
-            }
+            // `StringListViewItem_c(variant, text, 0xd5, 0xd4)` (open / closed icon), `SetIsFolder(true)`, `MakeSelectable(false)`, `OpenFolder(config)`
+            let mut head = ListItem::new(key, &format!("{} ({count})", tx.social(key)), 0xd5, 0xd4);
+            head.folder = true;
+            head.selectable = false;
+            head.open = open[i];
+            gui.list_add(win, "list", None, head);
             if i == 0 {
-                for (k, n) in cw.iter().enumerate() {
-                    let r = row(gui, &format!("cw_{k}"), 0xd8, n, LABEL, 14);
-                    let _ = gui.add_view_xml(win, "rows", &format!("cw_row_{k}"), &format!("<root>{r}</root>"));
+                for n in &cw {
+                    gui.list_add(win, "list", Some(key), ListItem::new(n, n, 0xd8, 0));
                 }
                 continue;
             }
             for n in &by_folder[i - 1] {
                 let name = if n.name.is_empty() { format!("#{}", n.id) } else { n.name.clone() };
-                let colors = if n.red() { LABEL_RED } else { LABEL };
-                let r = row(gui, &format!("fr_{}", n.id), n.icon(), &name, colors, 14);
-                let _ = gui.add_view_xml(win, "rows", &format!("fr_row_{}", n.id), &format!("<root>{r}</root>"));
+                let mut it = ListItem::new(&n.id.to_string(), &name, n.icon(), 0);
+                if n.red() {
+                    // `SetLabelColor(0xff6666, 0xc04c4c)`
+                    it.color_a = 0xff6666;
+                    it.color_b = 0xc04c4c;
+                }
+                it.flash = n.flashing();
+                gui.list_add(win, "list", Some(key), it);
             }
         }
     }
 
-    fn friends_event(&mut self, gui: &mut Gui, ev: &Event, soc: &Social, tx: &Texts, chat_windows: &[String]) -> Vec<Req> {
-        let Some(f) = &mut self.friends else { return vec![] };
-        let win = f.win;
+    fn friends_event(&mut self, gui: &mut Gui, ev: &Event, soc: &Social, tx: &Texts, _chat_windows: &[String]) -> Vec<Req> {
+        let Some(win) = self.friends.as_ref().map(|f| f.win) else { return vec![] };
         match ev {
-            Event::Clicked { window, view, .. } if *window == win => {
-                if let Some(i) = view.strip_prefix("folder_").and_then(|n| n.parse::<usize>().ok()) {
-                    f.open[i] = !f.open[i];
-                    self.refresh_friends(gui, soc, tx, chat_windows);
-                } else if let Some(id) = view.strip_prefix("fr_").and_then(|n| n.parse::<u32>().ok()) {
-                    // selecting a friend opens its tell window (`FriendListView_c` selection signal -> `OpenTellWindow`)
-                    let name = soc.nodes.get(&id).map(|n| n.name.clone()).unwrap_or_default();
-                    return vec![Req::OpenTell { id, name }];
+            // `FUN_100a9b4b` (the list's item-mouse signal): folders toggle inside the widget; a friend: left = show / close its tell window
+            // (`FUN_100a75e8(1 - is_open)`), right = the node menu (`FUN_100a930e`)
+            Event::ListItemMouse { window, id, button, x, y, .. } if *window == win => {
+                if let Some(i) = FOLDERS.iter().position(|k| k == id) {
+                    let open = gui.list_item(win, "list", id).is_some_and(|it| it.open);
+                    if let Some(f) = &mut self.friends {
+                        f.open[i] = open;
+                    }
+                    return vec![];
+                }
+                let Some(uid) = id.parse::<u32>().ok().filter(|u| soc.nodes.contains_key(u)) else { return vec![] };
+                match button {
+                    1 => {
+                        if let Some(p) = self.tells.iter().position(|t| t.id == uid) {
+                            let t = self.tells.remove(p);
+                            gui.close_window(t.win);
+                            return vec![];
+                        }
+                        let name = soc.nodes.get(&uid).map(|n| n.name.clone()).unwrap_or_default();
+                        return vec![Req::OpenTell { id: uid, name }];
+                    }
+                    _ => self.open_friend_menu(gui, soc, tx, uid, (*x, *y)),
                 }
                 vec![]
             }
@@ -315,13 +298,6 @@ impl SocialWin {
                     gui.close_window(f.win);
                 }
                 self.closed.push("friends_window");
-                vec![]
-            }
-            Event::ContextMenu { window, x, y, .. } if *window == win => {
-                let hit = soc.nodes.keys().copied().find(|id| gui.view_rect(win, &format!("fr_{id}")).is_some_and(|r| (*x as f32) >= r.l && (*x as f32) <= r.r && (*y as f32) >= r.t && (*y as f32) <= r.b));
-                if let Some(id) = hit {
-                    self.open_friend_menu(gui, soc, tx, id, (*x, *y));
-                }
                 vec![]
             }
             _ => vec![],
@@ -350,13 +326,14 @@ impl SocialWin {
         gui.open_menu(at, (self.screen.0 as i32, self.screen.1 as i32), items);
     }
 
-    /// `StringListViewItem_c::FlashIcon`: icons of nodes with unread messages / a pending invitation blink (**GUESS**: 0.5 s period).
-    pub fn update(&mut self, gui: &mut Gui, dt: f32, soc: &Social) {
-        self.flash += dt;
-        let on = ((self.flash / 0.5) as u32).is_multiple_of(2);
+    /// `StringListViewItem_c::FlashIcon`: icons of nodes with unread messages / a pending invitation blink (the list widget toggles them every 0.5 s).
+    pub fn update(&mut self, gui: &mut Gui, _dt: f32, soc: &Social) {
         let Some(f) = &self.friends else { return };
-        for n in soc.nodes.values().filter(|n| n.flashing()) {
-            gui.set_visible(f.win, &format!("ico_fr_{}", n.id), on);
+        for n in soc.nodes.values() {
+            let (id, flash) = (n.id.to_string(), n.flashing());
+            if gui.list_item(f.win, "list", &id).is_some_and(|it| it.flash != flash) {
+                gui.list_update(f.win, "list", &id, |it| it.flash = flash);
+            }
         }
     }
 
@@ -489,64 +466,62 @@ impl SocialWin {
         let (ow, oh) = gui.outer_size(win);
         gui.set_window_pos(win, ((self.screen.0 as i32 - ow as i32) / 2 + 5, (self.screen.1 as i32 - oh as i32) / 2 + 26));
         let professions: Vec<u32> = social::lft_professions().chain([0x10]).collect();
-        // dropdown contents (the original inserts every item at its id as index: the list order is the id order)
-        let sides: Vec<String> = LFT_SIDES.iter().map(|(_, t)| t.and_then(|t| tx.0.by_id(2005, t)).unwrap_or_else(|| "any".into())).collect();
-        let locs: Vec<String> = LFT_LOCATIONS.iter().map(|(_, n)| n.to_string()).collect();
-        let profs: Vec<String> = professions.iter().map(|p| if *p == 0x10 { tx.0.by_key(100, "any").unwrap_or_else(|| "any".into()) } else { tx.0.by_id(2004, *p).unwrap_or_default() }).collect();
-        gui.combo_set_items(win, "Side", sides.clone());
-        gui.combo_set_items(win, "Location", locs.clone());
-        gui.combo_set_items(win, "Profession", profs.clone());
-        let sel = |k: &str, default: u32, ids: &[u32]| -> usize {
-            let v = get(k).and_then(|v| v.parse::<u32>().ok()).unwrap_or(default);
-            ids.iter().position(|i| *i == v).or_else(|| ids.iter().position(|i| *i == default)).unwrap_or(0)
+        // `DropdownMenu_c::InsertItem(id, ...)`: every item goes in at its id as index; the resulting order is the id order
+        for (i, (id, t)) in LFT_SIDES.iter().enumerate() {
+            let text = t.and_then(|t| tx.0.by_id(2005, t)).unwrap_or_else(|| "any".into());
+            gui.dropdown_insert(win, "Side", i, *id as i64, &text);
+        }
+        for (i, (id, n)) in LFT_LOCATIONS.iter().enumerate() {
+            gui.dropdown_insert(win, "Location", i, *id as i64, n);
+        }
+        for (i, p) in professions.iter().enumerate() {
+            let text = if *p == 0x10 { tx.0.by_key(100, "any").unwrap_or_else(|| "any".into()) } else { tx.0.by_id(2004, *p).unwrap_or_default() };
+            gui.dropdown_insert(win, "Profession", i, *p as i64, &text);
+        }
+        // `LoadWndConfig`: `SelectByID(saved id, true)`; an unknown id falls back to the default
+        let restore = |gui: &mut Gui, name: &str, key: &str, default: u32, ids: &[u32]| {
+            let v = get(key).and_then(|v| v.parse::<u32>().ok()).filter(|v| ids.contains(v)).unwrap_or(default);
+            gui.dropdown_select_id(win, name, v as i64, true);
         };
-        let side = sel("SelectedSide", LFT_DEFAULT.0, &LFT_SIDES.map(|s| s.0));
-        let location = sel("SelectedLocation", LFT_DEFAULT.1, &LFT_LOCATIONS.map(|s| s.0));
-        let profession = sel("SelectedProfession", LFT_DEFAULT.2, &professions);
-        gui.set_text(win, "Side", &sides[side]);
-        gui.set_text(win, "Location", &locs[location]);
-        gui.set_text(win, "Profession", &profs[profession]);
+        restore(gui, "Side", "SelectedSide", LFT_DEFAULT.0, &LFT_SIDES.map(|s| s.0));
+        restore(gui, "Location", "SelectedLocation", LFT_DEFAULT.1, &LFT_LOCATIONS.map(|s| s.0));
+        restore(gui, "Profession", "SelectedProfession", LFT_DEFAULT.2, &professions);
         let desc = if lft.description.is_empty() { get("TeamDesc").unwrap_or_default() } else { lft.description.clone() };
         gui.set_text(win, "Description", &desc);
         gui.set_checked(win, "LFT", lft.on);
         gui.set_enabled(win, "Invite", !in_team_blocked);
-        // `CandidateView` holds the `MultiListView_c` (6 columns); ao-gui has none: header + rows of fixed-width cells (GUESS look)
-        let cols = [tx.0.by_key(100, "Name").unwrap_or_default(), tx.0.by_id(2003, 0x36).unwrap_or_default(), tx.0.by_id(2003, 0x21).unwrap_or_default(), tx.0.by_id(2003, 0x3c).unwrap_or_default(), tx.0.by_key(100, "Location").unwrap_or_default(), tx.0.by_key(100, "Description").unwrap_or_default()];
-        let mut head = String::new();
-        for (c, w) in cols.iter().zip(LFT_COLS) {
-            let _ = write!(head, "<TextView value=\"{}\" min_size=\"Point({w},-1)\" max_size=\"Point({w},-1)\"/>", esc(c));
+        // `CandidateView` holds the `MultiListView_c(Rect, 0x40, 0, 0)` in list mode (`SetLayoutMode(1)`) with 6 columns `AddColumn(id, label, width, 0xe)`
+        // (widths from the saved config, defaults `LFT_COLS`)
+        let _ = gui.add_view_xml(win, "CandidateView", "candidates_host", "<root><MultiListView name=\"candidates\" feature_flags=\"64\" max_size=\"Point(16000,16000)\"/></root>");
+        let heads = [
+            (tx.0.by_key(100, "Name"), "NameColWidth"),
+            (tx.0.by_id(2003, 0x36), "LevelColWidth"),
+            (tx.0.by_id(2003, 0x21), "SideColWidth"),
+            (tx.0.by_id(2003, 0x3c), "ProfColWidth"),
+            (tx.0.by_key(100, "Location"), "LocationColWidth"),
+            (tx.0.by_key(100, "Description"), "DescColWidth"),
+        ];
+        for (i, (label, key)) in heads.iter().enumerate() {
+            let width = get(key).and_then(|v| v.parse::<f32>().ok()).unwrap_or(LFT_COLS[i] as f32);
+            gui.multi_add_column(win, "candidates", i as i32, label.as_deref().unwrap_or_default(), width, 0xe);
         }
-        let list = format!(
-            "<root><View view_layout=\"vertical\" max_size=\"Point(16000,16000)\"><View view_layout=\"horizontal\">{head}</View><ScrollView name=\"cand_scroll\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" max_size=\"Point(16000,16000)\"><ScrollViewChild view_layout=\"vertical\" max_size=\"Point(16000,16000)\"><View name=\"cand_rows\" view_layout=\"vertical\" h_alignment=\"left\"/></ScrollViewChild></ScrollView></View></root>"
-        );
-        let _ = gui.add_view_xml(win, "CandidateView", "candidates", &list);
         gui.set_default_button(win, "Search");
         self.pf_names = ao_formats::screens::pfnr_names(&ao_gui::client_dir()).unwrap_or_default();
-        self.lft = Some(LftWin { win, side, location, profession, professions, selected: None, rows: vec![] });
+        self.lft = Some(LftWin { win, selected: None });
         self.lft_rows(gui, lft, tx);
     }
 
-    /// Candidate rows (`FUN_100efe4b` -> `LFTCandidateItem_c`: name, level, side, profession, playfield name, description).
+    /// Candidate rows (`FUN_100efe4b` -> `LFTCandidateItem_c`: name, level, side, profession, playfield name, description), added with `AddItem(.., sorted = true)`.
     pub fn lft_rows(&mut self, gui: &mut Gui, lft: &Lft, tx: &Texts) {
         let Some(l) = &mut self.lft else { return };
         let win = l.win;
-        gui.remove_children(win, "cand_rows");
-        l.rows.clear();
+        gui.multi_clear(win, "candidates");
         l.selected = None;
         for (i, r) in lft.results.iter().enumerate() {
-            let cells = lft_cells(r, tx, &self.pf_names);
-            let mut x = String::from("<View view_layout=\"horizontal\">");
-            for (c, (text, w)) in cells.iter().zip(LFT_COLS).enumerate() {
-                let t = fit(gui, text, w);
-                let _ = write!(x, "<TextButton name=\"cand_{i}_{c}\" text=\"{}\" color=\"{}\" hover_color=\"{}\" pressed_color=\"{}\" min_size=\"Point({w},-1)\" max_size=\"Point({w},-1)\"/>", esc(&t), LABEL.0, LABEL.1, LABEL.1);
-            }
-            x += "</View>";
-            if let Ok(h) = gui.add_view_xml(win, "cand_rows", &format!("cand_row_{i}"), &format!("<root>{x}</root>")) {
-                for c in 0..6 {
-                    gui.set_toggle_in(h, &format!("cand_{i}_{c}"), true, false);
-                }
-                l.rows.push(h);
-            }
+            let c = lft_cells(r, tx, &self.pf_names);
+            // compare (`FUN_100ef4a1`): columns 0, 2, 3, 4 `std::string::compare`, column 1 the level, column 5 none
+            let cells = vec![MultiCell::text(&c[0]), MultiCell::num(r.level as i64), MultiCell::text(&c[2]), MultiCell::text(&c[3]), MultiCell::text(&c[4]), MultiCell::unsorted(&c[5])];
+            gui.multi_add_row(win, "candidates", i as i64, cells, true);
         }
     }
 
@@ -554,40 +529,26 @@ impl SocialWin {
         let Some(l) = &mut self.lft else { return vec![] };
         let win = l.win;
         match ev {
-            Event::ComboChanged { window, view, index, .. } if *window == win => {
-                match view.as_str() {
-                    "Side" => l.side = *index,
-                    "Location" => l.location = *index,
-                    "Profession" => l.profession = *index,
-                    _ => {}
-                }
+            // `FUN_100efacd`, the slot on the list's mouse-down signal: `MultiListViewItem_c::Select(true, true)` of the row under the pointer
+            Event::MultiMouse { window, id: Some(i), .. } if *window == win => {
+                gui.multi_select(win, "candidates", *i, true, true);
+                l.selected = Some(*i as usize);
                 vec![]
             }
             Event::Clicked { window, view, .. } if *window == win => match view.as_str() {
-                "Search" => vec![Req::LftSearch { side: LFT_SIDES[l.side.min(3)].0, profession: l.professions[l.profession.min(l.professions.len() - 1)], location: LFT_LOCATIONS[l.location.min(3)].0 }],
+                // `FUN_100ef912` reads the dropdowns: side / profession item ids, the *selected index* of the location
+                "Search" => vec![Req::LftSearch {
+                    side: gui.dropdown_selected_id(win, "Side").unwrap_or(LFT_DEFAULT.0 as i64) as u32,
+                    profession: gui.dropdown_selected_id(win, "Profession").unwrap_or(LFT_DEFAULT.2 as i64) as u32,
+                    location: gui.dropdown_selected(win, "Location").unwrap_or(LFT_DEFAULT.1 as usize) as u32,
+                }],
                 "LFT" => vec![Req::LftSet { on: gui.checked(win, "LFT"), description: gui.text(win, "Description") }],
                 "Invite" | "Tell" => {
                     let Some(r) = l.selected.and_then(|i| lft.results.get(i)) else { return vec![] };
                     let (id, name) = (r.id, r.name.clone());
                     vec![if view == "Invite" { Req::LftInvite { id, name } } else { Req::OpenTell { id, name } }]
                 }
-                v => {
-                    // a cell of row i: select the row (`MultiListViewItem_c::Select`), pressed look = highlight
-                    if let Some(i) = v.strip_prefix("cand_").and_then(|r| r.split('_').next()).and_then(|n| n.parse::<usize>().ok()) {
-                        if let Some(old) = l.selected {
-                            for c in 0..6 {
-                                self.lft_cell_toggle(gui, old, c, false);
-                            }
-                        }
-                        for c in 0..6 {
-                            self.lft_cell_toggle(gui, i, c, true);
-                        }
-                        if let Some(l) = &mut self.lft {
-                            l.selected = Some(i);
-                        }
-                    }
-                    vec![]
-                }
+                _ => vec![],
             },
             Event::EnterPressed { window, view } if *window == win && view == "Description" => {
                 if gui.checked(win, "LFT") {
@@ -605,25 +566,23 @@ impl SocialWin {
         }
     }
 
-    fn lft_cell_toggle(&mut self, gui: &mut Gui, row: usize, col: usize, on: bool) {
-        let Some(h) = self.lft.as_ref().and_then(|l| l.rows.get(row).copied()) else { return };
-        gui.set_toggle_in(h, &format!("cand_{row}_{col}"), true, on);
-    }
-
     /// `~LFTWindow_c` (`FUN_100efb97`): saves `LFTWindowConfig` (selections, team description, column widths).
     pub fn close_lft(&mut self, gui: &mut Gui, _tx: &Texts) {
         let Some(l) = self.lft.take() else { return };
+        let id = |name: &str, d: u32| gui.dropdown_selected_id(l.win, name).unwrap_or(d as i64).to_string();
+        let cols = gui.multi_columns(l.win, "candidates");
+        let width = |i: usize| cols.iter().find(|c| c.0 == i as i32).map_or(LFT_COLS[i] as f32, |c| c.1).to_string();
         let items = [
-            ("Int32", "SelectedSide", LFT_SIDES[l.side.min(3)].0.to_string()),
-            ("Int32", "SelectedLocation", LFT_LOCATIONS[l.location.min(3)].0.to_string()),
-            ("Int32", "SelectedProfession", l.professions[l.profession.min(l.professions.len() - 1)].to_string()),
+            ("Int32", "SelectedSide", id("Side", LFT_DEFAULT.0)),
+            ("Int32", "SelectedLocation", id("Location", LFT_DEFAULT.1)),
+            ("Int32", "SelectedProfession", id("Profession", LFT_DEFAULT.2)),
             ("String", "TeamDesc", gui.text(l.win, "Description")),
-            ("Float", "NameColWidth", LFT_COLS[0].to_string()),
-            ("Float", "LevelColWidth", LFT_COLS[1].to_string()),
-            ("Float", "SideColWidth", LFT_COLS[2].to_string()),
-            ("Float", "ProfColWidth", LFT_COLS[3].to_string()),
-            ("Float", "LocationColWidth", LFT_COLS[4].to_string()),
-            ("Float", "DescColWidth", LFT_COLS[5].to_string()),
+            ("Float", "NameColWidth", width(0)),
+            ("Float", "LevelColWidth", width(1)),
+            ("Float", "SideColWidth", width(2)),
+            ("Float", "ProfColWidth", width(3)),
+            ("Float", "LocationColWidth", width(4)),
+            ("Float", "DescColWidth", width(5)),
         ];
         write_cfg("LFTWindowConfig.xml", &items);
         gui.close_window(l.win);
@@ -642,7 +601,8 @@ impl SocialWin {
         let window = match ev {
             Event::Clicked { window, .. }
             | Event::EnterPressed { window, .. }
-            | Event::ComboChanged { window, .. }
+            | Event::MultiMouse { window, .. }
+            | Event::ListItemMouse { window, .. }
             | Event::CloseRequested { window }
             | Event::Escape { window }
             | Event::ContextMenu { window, .. }
@@ -747,7 +707,7 @@ fn lft_cells(r: &LftReply, tx: &Texts, pf: &std::collections::HashMap<u32, Strin
 mod tests {
     use super::*;
     use crate::play::chat::social::{Env, InviteAction};
-    use ao_gui::{InputEvent, MouseButton};
+    use ao_gui::{GfxId, InputEvent, MouseButton};
 
     fn rig() -> Option<(Gui, TextDb)> {
         let client = ao_gui::client_dir();
@@ -758,7 +718,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("aomac-social-test-prefs"));
         let labels = TextDb::load(&client).ok()?;
         let db = TextDb::load(&client).ok()?;
-        Some((Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).ok()?, db))
+        let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).ok()?;
+        gui.set_screen_size(1280, 800);
+        Some((gui, db))
     }
 
     fn click(gui: &mut Gui, win: WindowId, view: &str) -> Vec<Event> {
@@ -789,6 +751,17 @@ mod tests {
         s
     }
 
+    /// Presses the left / right button on row `row` (13 px rows) of the list `name` and runs the produced events through the window.
+    fn row_press(w: &mut SocialWin, gui: &mut Gui, win: WindowId, row: usize, button: MouseButton, soc: &Social, tx: &Texts) -> Vec<Req> {
+        let r = gui.view_rect(win, "list").unwrap();
+        let (x, y) = (r.l + 40.0, r.t + row as f32 * 13.0 + 3.0);
+        gui.input(InputEvent::MouseMove { x, y });
+        let mut evs = gui.input(InputEvent::MouseDown { x, y, button });
+        evs.extend(gui.input(InputEvent::MouseUp { x, y, button }));
+        let lft = Lft::default();
+        evs.iter().flat_map(|e| w.event(gui, e, soc, &lft, tx, &[]).1).collect()
+    }
+
     #[test]
     fn friends_window_lists_folders_and_acts() {
         let Some((mut gui, db)) = rig() else { return };
@@ -797,31 +770,32 @@ mod tests {
         let mut w = SocialWin::new((1280, 800));
         w.set_friends(&mut gui, true, &soc, &tx, &["Default Window".into()]);
         let win = w.friends.as_ref().unwrap().win;
-        // folders in the original's order, entries inside their folder
-        for v in ["folder_0", "folder_1", "folder_2", "folder_3", "fr_5", "fr_6", "fr_7", "cw_0"] {
-            assert!(gui.has_view(win, v), "{v}");
+        // folders in the original's order, entries inside their folder (rows: folder, its entries, next folder, ...)
+        let ids = ["ChatWindows", "Default Window", "OnlineFriends", "5", "OfflineFriends", "6", "RecentMessages", "7"];
+        for id in ids {
+            assert!(gui.list_item(win, "list", id).is_some(), "{id}");
         }
         assert_eq!(tx.social("OnlineFriends"), "Online Friends");
-        let y = |n: &str| gui.view_rect(win, n).unwrap().t;
-        assert!(y("folder_0") < y("folder_1") && y("folder_1") < y("fr_5") && y("fr_5") < y("folder_2") && y("folder_2") < y("fr_6") && y("fr_6") < y("folder_3") && y("folder_3") < y("fr_7"));
-        // a click on a folder closes it (its entries disappear)
+        assert!(gui.list_item(win, "list", "OnlineFriends").unwrap().label.starts_with("Online Friends (1)"));
+        // folder icons `StringListViewItem(.., 0xd5, 0xd4)`: GFX_GUI_EXPAND_BUTTON_OPEN / CLOSED
+        assert_eq!(gui.gfx().name(GfxId(0xd5)), Some("GFX_GUI_EXPAND_BUTTON_OPEN"));
+        // a click on a folder closes it (its entries disappear), another opens it again
         let lft = Lft::default();
-        for e in click(&mut gui, win, "folder_1") {
-            w.event(&mut gui, &e, &soc, &lft, &tx, &[]);
-        }
-        assert!(!gui.has_view(win, "fr_5") && gui.has_view(win, "fr_6"));
-        for e in click(&mut gui, win, "folder_1") {
-            w.event(&mut gui, &e, &soc, &lft, &tx, &[]);
-        }
-        // a click on a friend opens its tell window
-        let mut reqs = vec![];
-        for e in click(&mut gui, win, "fr_6") {
-            reqs.extend(w.event(&mut gui, &e, &soc, &lft, &tx, &[]).1);
-        }
+        assert!(row_press(&mut w, &mut gui, win, 2, MouseButton::Left, &soc, &tx).is_empty());
+        assert!(!gui.list_item(win, "list", "OnlineFriends").unwrap().open);
+        assert_eq!(w.friends.as_ref().unwrap().open, [true, false, true, true]);
+        // rows now: 0 ChatWindows, 1 Default Window, 2 Online (closed), 3 Offline, 4 Eve
+        let reqs = row_press(&mut w, &mut gui, win, 4, MouseButton::Left, &soc, &tx);
         assert_eq!(reqs, [Req::OpenTell { id: 6, name: "Eve".into() }]);
+        // clicking the folder reopens: rows 3 Bob, 4 Offline, 5 Eve
+        row_press(&mut w, &mut gui, win, 2, MouseButton::Left, &soc, &tx);
+        assert_eq!(w.friends.as_ref().unwrap().open, [true, true, true, true]);
+        // the tell window exists now: a second click on the friend closes it (`FUN_100a75e8(0)`), no request
+        w.open_tell(&mut gui, 6, "Eve");
+        assert!(row_press(&mut w, &mut gui, win, 5, MouseButton::Left, &soc, &tx).is_empty());
+        assert!(!w.tell_is_open(6));
         // right click -> menu "Delete Eve" -> confirmation -> Yes removes the buddy
-        let r = gui.view_rect(win, "fr_6").unwrap();
-        w.event(&mut gui, &Event::ContextMenu { window: win, x: r.l as i32 + 3, y: r.t as i32 + 3, link: None }, &soc, &lft, &tx, &[]);
+        assert!(row_press(&mut w, &mut gui, win, 5, MouseButton::Right, &soc, &tx).is_empty());
         assert!(gui.menu_open());
         assert_eq!(w.menu.iter().map(|m| m.2).collect::<Vec<_>>(), [Action::Invite, Action::Delete, Action::Ignore]);
         let (_, r1) = w.event(&mut gui, &Event::MenuPicked { id: MENU_BASE + 1 }, &soc, &lft, &tx, &[]);
@@ -835,10 +809,11 @@ mod tests {
         }
         assert_eq!(reqs, [Req::RemoveFriend(6)]);
         // a recent entry also offers "Befriend"
-        let r = gui.view_rect(win, "fr_7").unwrap();
-        w.event(&mut gui, &Event::ContextMenu { window: win, x: r.l as i32 + 3, y: r.t as i32 + 3, link: None }, &soc, &lft, &tx, &[]);
+        gui.close_menu();
+        row_press(&mut w, &mut gui, win, 7, MouseButton::Right, &soc, &tx);
         assert_eq!(w.menu[0].2, Action::Befriend);
         // frame close button
+        gui.close_menu();
         let (hit, _) = w.event(&mut gui, &Event::CloseRequested { window: win }, &soc, &lft, &tx, &[]);
         assert!(hit && w.friends.is_none() && w.closed == ["friends_window"]);
     }
@@ -903,29 +878,56 @@ mod tests {
         w.open_lft(&mut gui, &lft, &tx, false);
         let win = w.lft.as_ref().unwrap().win;
         // the client's own LFTView.xml
-        for v in ["Side", "Location", "Profession", "Search", "Invite", "Tell", "LFT", "Description", "CandidateView"] {
+        for v in ["Side", "Location", "Profession", "Search", "Invite", "Tell", "LFT", "Description", "CandidateView", "candidates"] {
             assert!(gui.has_view(win, v), "{v}");
         }
-        assert_eq!((gui.text(win, "Side"), gui.text(win, "Location"), gui.text(win, "Profession")), ("any".into(), "Rubi-Ka".into(), "any".into()));
+        assert_eq!((gui.dropdown_text(win, "Side"), gui.dropdown_text(win, "Location"), gui.dropdown_text(win, "Profession")), ("any".into(), "Rubi-Ka".into(), "any".into()));
         // Search with the defaults: side any, profession any, location Rubi-Ka
         let mut reqs = vec![];
         for e in click(&mut gui, win, "Search") {
             reqs.extend(w.event(&mut gui, &e, &soc, &lft, &tx, &[]).1);
         }
         assert_eq!(reqs, [Req::LftSearch { side: 7, profession: 0x10, location: 2 }]);
+        // a real click on the Side dropdown opens its popup (entries neutral, clan, omni, any); picking "omni" changes the search
+        let r = gui.view_rect(win, "Side").unwrap();
+        click(&mut gui, win, "Side");
+        assert!(gui.menu_open());
+        let evs = {
+            let (x, y) = (r.l + 5.0 + 12.0, r.b + 1.0 + 2.0 + 15.0 * 2.0 + 7.0);
+            gui.input(InputEvent::MouseMove { x, y });
+            let mut e = gui.input(InputEvent::MouseDown { x, y, button: MouseButton::Left });
+            e.extend(gui.input(InputEvent::MouseUp { x, y, button: MouseButton::Left }));
+            e
+        };
+        assert!(evs.iter().any(|e| matches!(e, Event::DropdownChanged { id: 2, .. })), "{evs:?}");
+        assert_eq!(gui.dropdown_text(win, "Side"), "omni");
+        let mut reqs = vec![];
+        for e in click(&mut gui, win, "Search") {
+            reqs.extend(w.event(&mut gui, &e, &soc, &lft, &tx, &[]).1);
+        }
+        assert_eq!(reqs, [Req::LftSearch { side: 2, profession: 0x10, location: 2 }]);
         // two candidates arrive; the window shows name / level / side / profession / playfield / description
         for (id, name) in [(5, "Bob"), (6, "Eve")] {
             lft.on_reply(&LftReply { status: 0, id, name: name.into(), level: 100 + id, playfield: 4001, side: 2, profession: 6, description: "need heals".into() });
         }
         w.lft_rows(&mut gui, &lft, &tx);
-        assert!(gui.has_view(win, "cand_0_0") && gui.has_view(win, "cand_1_5") && !gui.has_view(win, "cand_2_0"));
+        // rows are kept sorted by the first sortable column (name, ascending): Bob (result 0) before Eve (result 1)
+        assert_eq!(gui.multi_row_ids(win, "candidates"), [0, 1]);
+        assert_eq!(gui.multi_sort_state(win, "candidates"), Some((0, false)));
         assert_eq!(lft_cells(&lft.results[1], &tx, &[(4001, "Newland".to_string())].into())[..], ["Eve", "106", "omni", "Adventurer", "Newland", "need heals"]);
         assert_eq!(lft_cells(&lft.results[0], &tx, &Default::default())[4], "Not found");
         // selecting a row enables Tell / Invite for it
         let mut reqs = vec![];
-        for e in click(&mut gui, win, "cand_1_0") {
+        let r = gui.view_rect(win, "candidates").unwrap();
+        // header 19 px + 1, rows 16 px high with a 3 px gap: the second row
+        let (x, y) = (r.l + 10.0, r.t + 20.0 + 19.0 + 3.0);
+        gui.input(InputEvent::MouseMove { x, y });
+        let mut evs = gui.input(InputEvent::MouseDown { x, y, button: MouseButton::Left });
+        evs.extend(gui.input(InputEvent::MouseUp { x, y, button: MouseButton::Left }));
+        for e in evs {
             reqs.extend(w.event(&mut gui, &e, &soc, &lft, &tx, &[]).1);
         }
+        assert_eq!(gui.multi_selected(win, "candidates"), [1]);
         for e in click(&mut gui, win, "Tell") {
             reqs.extend(w.event(&mut gui, &e, &soc, &lft, &tx, &[]).1);
         }
