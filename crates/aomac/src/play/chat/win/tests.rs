@@ -79,9 +79,13 @@ fn shipped_template_parses() {
 
 #[test]
 fn frames_are_placed_inside_the_screen() {
-    let (x, y, w, h) = place(Some([277.0, 1206.0, 1273.0, 1439.0]), (1280, 800));
+    let (x, y, w, h) = place(Some([277.0, 1206.0, 1273.0, 1439.0]), true, (1280, 800), Reserved { left: 190, right: 65, bottom: 38 });
     assert!(x >= 0 && y >= 0 && x as u32 + w <= 1280 && y as u32 + h <= 800);
-    assert_eq!(place(None, (1280, 800)), (440, 300, 400, 200));
+    assert_eq!(place(None, false, (1280, 800), Reserved::default()), (440, 300, 400, 200));
+    // saved frames: translated inside the screen, never resized (`MoveInsideScreen(false, true, true)`)
+    assert_eq!(place(Some([277.0, 1206.0, 1273.0, 1439.0]), false, (1280, 828), Reserved::default()), (277, 594, 997, 234));
+    assert_eq!(place(Some([-10.0, 100.0, 289.0, 199.0]), false, (1280, 828), Reserved::default()), (0, 100, 300, 100));
+    assert_eq!(place(Some([1200.0, 100.0, 1499.0, 199.0]), false, (1280, 828), Reserved::default()), (980, 100, 300, 100));
 }
 
 fn rig(screen: (u32, u32)) -> Option<(Gui, ChatWindows)> {
@@ -175,12 +179,29 @@ fn config_saved_in_prefs_dir_reloads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Offscreen render of the two default windows with a line of every colour class.
+/// Offscreen render of the two default windows over the HUD with a line of every colour class.
 #[test]
 fn chat_win_shot() {
+    use super::super::super::{hud::Hud, zone::Zone};
     let Some(out) = std::env::var_os("AOMAC_SHOT_DIR").map(PathBuf::from) else { return };
-    let size = (1280u32, 800u32);
-    let Some((gui, mut ch)) = rig(size) else { return };
+    let size = (1280u32, 828u32);
+    let client = ao_gui::client_dir();
+    if !client.join("cd_image/gui").exists() {
+        return eprintln!("skipping: no client");
+    }
+    std::env::set_var("AOMAC_PREFS_DIR", std::env::temp_dir().join("aomac-chatgui-shot-prefs"));
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("aomac-chatgui-shot-prefs"));
+    let labels = TextDb::load(&client).unwrap();
+    let mut gui = Gui::new(&client, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
+    let mut zone = Zone::default();
+    for (id, v) in [(1, 125), (27, 125), (221, 100), (214, 100), (54, 1), (52, 40), (57, 0), (350, 1500), (61, 1234), (180, 0), (181, 150)] {
+        zone.stats.insert(id, v);
+    }
+    let mut hud = Hud::new(&mut gui, &client, size).unwrap();
+    hud.update(&mut gui, &mut zone, 0.0);
+    // the chat windows are created after the HUD windows (normal stacking = creation order)
+    let mut ch = ChatWindows::new(&mut gui, size).unwrap();
+    ch.set_reserved(&mut gui, Reserved { left: 190, right: 65, bottom: 38 });
     struct Fe(Gui);
     impl ao_render::Frontend for Fe {
         fn gui(&self) -> &Gui {
@@ -215,7 +236,7 @@ fn chat_win_shot() {
 fn windows_open_at_their_frames() {
     let Some((gui, ch)) = rig((1280, 800)) else { return };
     for w in &ch.wins {
-        let (_, _, pw, ph) = place(w.cfg.frame, (1280, 800));
+        let (_, _, pw, ph) = place(w.cfg.frame, w.cfg.template, (1280, 800), Reserved::default());
         assert_eq!(gui.window_size(w.id), (pw, ph), "{}", w.cfg.name);
     }
 }

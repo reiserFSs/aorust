@@ -213,6 +213,8 @@ pub struct Cfg {
     pub set: Vec<u64>,
     /// `chat_window_config/WindowFrame` (l, t, r, b), inclusive.
     pub frame: Option<[f32; 4]>,
+    /// Loaded from the client template / code defaults, not from the character's own saved config (not serialized).
+    pub template: bool,
 }
 
 impl Cfg {
@@ -237,6 +239,7 @@ impl Cfg {
             visual_mode: 2,
             set: vec![],
             frame: None,
+            template: false,
         }
     }
 
@@ -354,22 +357,46 @@ fn read_windows(dir: &Path) -> Vec<Cfg> {
     v.into_iter().map(|x| x.1).collect()
 }
 
-/// Reference screen of the shipped window frames (the largest right edge in `prefs/NewChar` is 2303): **UNRESOLVED/guess** --
-/// `Window::LoadWndConfig` is not decompiled, we scale frames from this screen to ours and clamp them inside it.
+/// Reference screen of the shipped template frames (their largest right edge is 2303, bottom 1440): **GUESS**, only used for
+/// template-sourced windows (see [`place`]).
 const REF_SCREEN: (f32, f32) = (2304.0, 1440.0);
 
-fn place(frame: Option<[f32; 4]>, screen: (u32, u32)) -> (i32, i32, u32, u32) {
+/// Pixels of the screen the HUD covers at the left / right (wings) and the bottom (bar row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reserved {
+    pub left: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// Outer rectangle (x, y, w, h) of a window.
+///
+/// * Frame from the character's own saved config: `Window::LoadWndConfig` 0x10154d6e = `WndBorder::SetClientFrame(WindowFrame)` (absolute
+///   screen coordinates from the top-left, inclusive Rect; style 3 has no border so client = outer) followed by
+///   `Window::MoveInsideScreen(false, true, true)` 0x10154abc: **translate** (never resize) so the frame lies inside the screen
+///   (`WindowController_c` +0x80 = display size). There is no HUD/ControlCenter avoidance anywhere in the chat code.
+/// * Frame from the client's shipped template (`prefs/NewChar`, authored on a 2304x1440 screen): the same rule would stack the two
+///   windows on top of each other on smaller screens, so (**GUESS, no original evidence**) the template is scaled horizontally by
+///   `free width / 2304` (the screen minus the HUD's side wings), keeps its height and sits bottom-anchored above the HUD's bottom bar row.
+/// * No frame: `Window::MoveToCenter`, 400 x 200 (`_DAT_101b1840` / `_DAT_101a959c`, `FUN_10097ae3`).
+fn place(frame: Option<[f32; 4]>, template: bool, screen: (u32, u32), reserved: Reserved) -> (i32, i32, u32, u32) {
     let (sw, sh) = (screen.0 as f32, screen.1 as f32);
     match frame {
-        Some([l, t, r, b]) => {
-            let (kx, ky) = ((sw / REF_SCREEN.0).min(1.0), (sh / REF_SCREEN.1).min(1.0));
-            let w = (((r - l + 1.0) * kx).round().max(120.0)).min(sw);
-            let h = (((b - t + 1.0) * ky).round().max(60.0)).min(sh);
-            let x = (l * kx).round().clamp(0.0, sw - w);
-            let y = (t * ky).round().clamp(0.0, sh - h);
+        Some([l, t, r, b]) if template => {
+            let (x0, area_w) = (reserved.left as f32, (sw - (reserved.left + reserved.right) as f32).max(120.0));
+            let kx = (area_w / REF_SCREEN.0).min(1.0);
+            let w = ((r - l + 1.0) * kx).round().clamp(120.0, area_w);
+            let h = (b - t + 1.0).clamp(60.0, sh);
+            let x = (x0 + l * kx).round().clamp(x0, (x0 + area_w - w).max(x0));
+            let y = (sh - reserved.bottom as f32 - h).max(0.0);
             (x as i32, y as i32, w as u32, h as u32)
         }
-        // `Window::MoveToCenter`, size `_DAT_101b1840` x `_DAT_101a959c` = 400 x 200 (`FUN_10097ae3`)
+        Some([l, t, r, b]) => {
+            let (w, h) = (r - l + 1.0, b - t + 1.0);
+            let dx = if l < 0.0 { -l } else if r > sw - 1.0 { (sw - 1.0 - r).max(-l) } else { 0.0 };
+            let dy = if t < 0.0 { -t } else if b > sh - 1.0 { (sh - 1.0 - b).max(-t) } else { 0.0 };
+            ((l + dx) as i32, (t + dy) as i32, w as u32, h as u32)
+        }
         None => {
             let (w, h) = (400u32.min(screen.0), 200u32.min(screen.1));
             (((screen.0 - w) / 2) as i32, ((screen.1 - h) / 2) as i32, w, h)
@@ -390,6 +417,8 @@ struct Win {
     lines: VecDeque<String>,
     alpha: f32,
     target: f32,
+    /// Last placement (x, y, w, h): what `Window::SaveWndConfig` writes as `WindowFrame`.
+    placed: (i32, i32, u32, u32),
     /// Alpha change per second of the running fade.
     rate: f32,
     active: bool,
@@ -413,6 +442,7 @@ pub struct ChatWindows {
     /// `ChatLastActiveWindow` (`window_name`).
     last_active: String,
     next_n: usize,
+    reserved: Reserved,
 }
 
 /// `ChatView_c` text view flags 0xe6c (`FUN_100925ff`): ENABLE_SHADOW | FILL_BOTTOM_UP | DISABLE_RC_MENU | WORD_WRAP | MULTILINE |
@@ -430,9 +460,11 @@ impl ChatWindows {
         let mut cfgs = prefs.as_deref().map(read_windows).unwrap_or_default();
         if cfgs.is_empty() {
             cfgs = read_windows(&client.join("prefs/NewChar"));
+            cfgs.iter_mut().for_each(|c| c.template = true);
         }
         if cfgs.is_empty() {
             cfgs = code_defaults();
+            cfgs.iter_mut().for_each(|c| c.template = true);
         }
         let mut s = ChatWindows {
             wins: vec![],
@@ -442,6 +474,7 @@ impl ChatWindows {
             prefs,
             last_active: String::new(),
             next_n: 0,
+            reserved: Reserved::default(),
         };
         s.last_active = cfgs.iter().find(|c| c.startup).or(cfgs.first()).map(|c| c.window_name.clone()).unwrap_or_default();
         for c in cfgs.into_iter().filter(|c| c.open) {
@@ -453,7 +486,7 @@ impl ChatWindows {
     fn open(&mut self, gui: &mut Gui, cfg: Cfg) -> Result<usize> {
         let n = self.next_n;
         self.next_n += 1;
-        let (x, y, w, h) = place(cfg.frame, self.screen);
+        let (x, y, w, h) = place(cfg.frame, cfg.template, self.screen, self.reserved);
         let line_h = gui.font_height(ao_gui::FontId::Chat) as u32;
         // `ChatView_c::FUN_1008d728`, input mode 1: input bar at its preferred height (one text line in a 5 px border), the text
         // frame ends 5 px above it; the GroupChatView border is 3 px (`_DAT_101a96d4`).
@@ -483,7 +516,9 @@ impl ChatWindows {
         gui.set_text_shadow_offset(1, 1); // `ChatTextShadowOffset` pref default 1 (CharPrefs.xml), `FUN_1008d673`
         let alpha = cfg.alpha_inactive;
         gui.set_window_alpha(id, alpha);
-        self.wins.push(Win { cfg, id, n, lines: VecDeque::new(), alpha, target: alpha, rate: 0.0, active: false });
+        // `is_backmost` / `is_frontmost` → window flags 0x200 / 0x100 (`FUN_10097ae3`); default: normal stacking
+        gui.set_window_layer(id, 0);
+        self.wins.push(Win { cfg, id, n, placed: (x, y, w, h), lines: VecDeque::new(), alpha, target: alpha, rate: 0.0, active: false });
         Ok(self.wins.len() - 1)
     }
 
@@ -492,10 +527,34 @@ impl ChatWindows {
             return;
         }
         self.screen = screen;
-        for w in &self.wins {
-            let (x, y, ww, hh) = place(w.cfg.frame, screen);
+        self.replace_all(gui);
+    }
+
+    fn replace_all(&mut self, gui: &mut Gui) {
+        for w in &mut self.wins {
+            let (x, y, ww, hh) = place(w.cfg.frame, w.cfg.template, self.screen, self.reserved);
+            w.placed = (x, y, ww, hh);
             gui.set_window_pos(w.id, (x, y));
             gui.resize_window(w.id, WindowSize::Fixed(ww, hh));
+        }
+    }
+
+    /// The screen area the HUD's wings/bars cover; only the *template* default windows (first run) are kept clear of it (see [`place`]).
+    /// Windows with a saved frame are positioned as the original does and may overlap the HUD (they draw above it).
+    pub fn set_reserved(&mut self, gui: &mut Gui, reserved: Reserved) {
+        if reserved != self.reserved {
+            self.reserved = reserved;
+            self.replace_all(gui);
+        }
+    }
+
+    /// Hides/shows every chat window (the whole interface hidden, e.g. cutscenes); text keeps accumulating.
+    pub fn set_visible(&mut self, gui: &mut Gui, visible: bool) {
+        for w in &self.wins {
+            gui.set_window_visible(w.id, visible);
+        }
+        if !visible {
+            gui.clear_focus();
         }
     }
 
@@ -694,7 +753,10 @@ impl ChatWindows {
         for w in &self.wins {
             let d = dir.join("Chat/Windows").join(&w.cfg.window_name);
             std::fs::create_dir_all(&d)?;
-            std::fs::write(d.join("Config.xml"), w.cfg.to_xml(&|g| self.group_name(g)))?;
+            let mut cfg = w.cfg.clone();
+            let (x, y, ww, hh) = w.placed;
+            cfg.frame = Some([x as f32, y as f32, (x + ww as i32 - 1) as f32, (y + hh as i32 - 1) as f32]);
+            std::fs::write(d.join("Config.xml"), cfg.to_xml(&|g| self.group_name(g)))?;
         }
         Ok(())
     }

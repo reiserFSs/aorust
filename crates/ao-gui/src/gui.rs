@@ -21,10 +21,25 @@ mod tooltip;
 /// `GUIColors.xml` / `GUIConfig_c::GUIConfig_c` 0x1012f342 defaults: Default, Selected, Hover, Text,
 /// TextSelected, TextHover.
 const DEFAULT_PALETTE: [u32; 6] = [0x80e9f3, 0xffffcc, 0xa5ffdb, 0x99ccaa, 0x99ccaa, 0x99ccaa];
+/// Client insets of a style-1 window frame (`WndBorder::UpdateBorderSizes` 0x10159f98, docs/gui.md 6).
 const FRAME_L: i32 = 3;
 const FRAME_T: i32 = 24;
 const FRAME_R: i32 = 3;
 const FRAME_B: i32 = 3;
+/// Client insets of a style-0 window with a tab strip (`open_tabbed_window`, docs/gui.md 6.1): the outer `WndBorder` border (3, 7, 3, 3)
+/// (0x101a96d4 / `_DAT_101b6e54` = 7) plus the `TabView` borders (2, strip + 1 = 19, 2, 2) of `TabView::LayoutBorders` 0x10145be5.
+const TAB_L: i32 = 5;
+const TAB_T: i32 = 26;
+const TAB_R: i32 = 5;
+const TAB_B: i32 = 5;
+/// Window-title tab height (`GFX_GUI_TAB_ACTIVE_*`, 17 rows), tab-strip height and the box top (strip - 2) below the `TabView` top.
+const TAB_H: f32 = 17.0;
+const TAB_BOX_TOP: f32 = 16.0;
+/// `WndBorder` ctor `TabView::SetLeftMargin(_DAT_101b4e08)`: the first tab starts 20 px right of the `TabView` edge.
+const TAB_LEFT_MARGIN: f32 = 20.0;
+/// `Tab` (GUI 0x10146785) padding added to the title width in `FUN_101461dc`: `Rect(5, 0, 16, 0)` at `Tab+0x1e4`.
+const TAB_PAD_L: f32 = 5.0;
+const TAB_PAD_R: f32 = 16.0;
 /// `GUIConfig_c` layer alpha: layer 2 (used by buttons) = 0.85.
 const BUTTON_ALPHA: f32 = 0.85;
 
@@ -46,10 +61,14 @@ struct Window {
     pos: (i32, i32),
     visible: bool,
     default_button: Option<ViewId>,
-    /// Drawn inside the style-1 window frame (`open_framed_window`).
+    /// Drawn inside the style-1 window frame (`open_framed_window`) or, with a title, the style-0 frame (`open_tabbed_window`).
     framed: bool,
+    /// Title of the single tab of a style-0 frame.
+    title: Option<String>,
     /// `Window::FadeTo` target: multiplies everything drawn in the window (chat windows, docs/chat/gui.md).
     alpha: f32,
+    /// Stacking layer: -1 backmost (window flag 0x200), 0 normal, 1 frontmost (flag 0x100); creation order inside a layer.
+    layer: i8,
 }
 
 /// First id handed out by `Gui::add_image` (above every skin id).
@@ -195,7 +214,7 @@ impl Gui {
         let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
         let root = build(&mut self.tree, &mut ctx, view_el).ok_or_else(|| anyhow!("{name}: cannot build root"))?;
         self.warnings.extend(ctx.warnings.into_iter().map(|w| format!("{name}: {w}")));
-        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false, alpha: 1.0 }));
+        self.windows.push(Some(Window { root, pos, visible: true, default_button: None, framed: false, title: None, alpha: 1.0, layer: 0 }));
         let id = self.windows.len() - 1;
         self.resize_window(id, size);
         Ok(id)
@@ -215,11 +234,39 @@ impl Gui {
         Ok(id)
     }
 
+    /// Like [`Gui::open_framed_window`] for a style-0 frame (`DockWindow_c`: `Window(Rect, "", "", style 0, flags 0x1000)`, one tab): the title
+    /// is the text of the tab in the strip above the client (`WndBorder::AppendTab` -> `TabView::InsertTab` 0x101469e7, `Tab` 0x10146785).
+    /// Client insets (5, 26, 5, 5); `pos` is the outer top-left, `size` the client size.
+    pub fn open_tabbed_window(&mut self, view_name: &str, title: &str, pos: (i32, i32), size: WindowSize) -> Result<WindowId> {
+        let id = self.open_window(view_name, (pos.0 + TAB_L, pos.1 + TAB_T), size)?;
+        self.frame_tabbed(id, title);
+        Ok(id)
+    }
+
+    pub(crate) fn frame_tabbed(&mut self, id: WindowId, title: &str) {
+        if let Some(Some(w)) = self.windows.get_mut(id) {
+            w.framed = true;
+            w.title = Some(title.to_string());
+        }
+    }
+
+    /// Client insets (left, top, right, bottom) of the frame of a window.
+    fn insets(&self, w: &Window) -> (i32, i32, i32, i32) {
+        if w.title.is_some() {
+            (TAB_L, TAB_T, TAB_R, TAB_B)
+        } else {
+            (FRAME_L, FRAME_T, FRAME_R, FRAME_B)
+        }
+    }
+
     /// Outer size (client + frame) of a window in pixels.
     pub fn outer_size(&self, w: WindowId) -> (u32, u32) {
         let (cw, ch) = self.window_size(w);
         match self.windows[w].as_ref() {
-            Some(win) if win.framed => (cw + (FRAME_L + FRAME_R) as u32, ch + (FRAME_T + FRAME_B) as u32),
+            Some(win) if win.framed => {
+                let i = self.insets(win);
+                (cw + (i.0 + i.2) as u32, ch + (i.1 + i.3) as u32)
+            }
             _ => (cw, ch),
         }
     }
@@ -235,8 +282,9 @@ impl Gui {
 
     /// `pos` is the outer top-left for framed windows (as in `open_framed_window`).
     pub fn set_window_pos(&mut self, w: WindowId, pos: (i32, i32)) {
+        let i = self.windows.get(w).and_then(|w| w.as_ref()).map_or((0, 0, 0, 0), |win| self.insets(win));
         if let Some(Some(win)) = self.windows.get_mut(w) {
-            win.pos = if win.framed { (pos.0 + FRAME_L, pos.1 + FRAME_T) } else { pos };
+            win.pos = if win.framed { (pos.0 + i.0, pos.1 + i.1) } else { pos };
         }
     }
     pub fn window_visible(&self, w: WindowId) -> bool {
@@ -558,6 +606,13 @@ impl Gui {
             win.alpha = alpha.clamp(0.0, 1.0);
         }
     }
+    /// `Window` flags 0x200 (backmost, -1) / 0x100 (frontmost, 1) of `SetStyle` (`ChatWindow_c` 0x10097ae3 from `is_backmost` / `is_frontmost`;
+    /// the control-centre bar windows use flags 0xe3c, i.e. backmost). Normal windows stack in creation order.
+    pub fn set_window_layer(&mut self, w: WindowId, layer: i8) {
+        if let Some(Some(win)) = self.windows.get_mut(w) {
+            win.layer = layer.clamp(-1, 1);
+        }
+    }
     pub fn window_alpha(&self, w: WindowId) -> f32 {
         self.windows.get(w).and_then(|w| w.as_ref()).map_or(1.0, |w| w.alpha)
     }
@@ -577,6 +632,10 @@ impl Gui {
     }
     pub fn focused_view(&self) -> Option<String> {
         self.focus.map(|f| self.outer_name(f))
+    }
+    /// A text field has the keyboard (the original's `TextInputMode`, which blocks the hotkeys).
+    pub fn text_focused(&self) -> bool {
+        self.focus.is_some_and(|f| matches!(self.tree.views[f].kind, Kind::Text(_)))
     }
     /// Replaces the ComboBox entries.
     pub fn combo_set_items(&mut self, w: WindowId, name: &str, items: Vec<String>) {
@@ -688,10 +747,12 @@ impl Gui {
         self.time += dt;
         self.tick_cc_fades(dt);
         let mut out = DrawList::default();
-        let wins: Vec<(ViewId, (i32, i32), bool, f32)> = self.windows.iter().flatten().filter(|w| w.visible).map(|w| (w.root, w.pos, w.framed, w.alpha)).collect();
-        for (root, pos, framed, alpha) in wins {
+        let mut order: Vec<&Window> = self.windows.iter().flatten().filter(|w| w.visible).collect();
+        order.sort_by_key(|w| w.layer); // stable: creation order inside a layer
+        let wins: Vec<(ViewId, (i32, i32), bool, f32, Option<String>)> = order.into_iter().map(|w| (w.root, w.pos, w.framed, w.alpha, w.title.clone())).collect();
+        for (root, pos, framed, alpha, title) in wins {
             if framed {
-                self.draw_frame(root, pos, &mut out.cmds);
+                self.draw_frame(root, pos, title.as_deref(), &mut out.cmds);
             }
             self.draw_view(root, pos.0 as f32, pos.1 as f32, [255; 3], alpha, true, &mut out.cmds);
         }
@@ -1047,25 +1108,35 @@ impl Gui {
     /// `WndBorder::Layout` 0x1015a1d9: border icons are `GFX_GUI_WINDOW_*` 15x15 sprites (pref size 14x14 as
     /// Rect r-l) at y = 5 from the window top; the icon button (BorderID 0) flush left, the close button
     /// (BorderID 1) flush right (`x = bounds.r - w`).  Returns (icon, close) in screen px.
-    fn frame_buttons(&self, root: ViewId, pos: (i32, i32)) -> (Rect, Rect) {
-        let f = self.tree.views[root].frame;
-        let outer = Rect::new((pos.0 - FRAME_L) as f32, (pos.1 - FRAME_T) as f32, pos.0 as f32 + f.width() + FRAME_R as f32, pos.1 as f32 + f.height() + FRAME_B as f32);
+    fn frame_buttons(&self, root: ViewId, pos: (i32, i32), tabbed: bool) -> (Rect, Rect) {
+        let outer = self.outer_rect(root, pos, tabbed);
         let t = outer.t + 5.0;
         (Rect::new(outer.l, t, outer.l + 14.0, t + 14.0), Rect::new(outer.r - 14.0, t, outer.r, t + 14.0))
     }
 
-    /// Outer + inner frame art of a style-1 window (`pos` = client origin).
-    fn draw_frame(&mut self, root: ViewId, pos: (i32, i32), out: &mut Vec<DrawCmd>) {
+    /// Outer rectangle (inclusive) of a framed window whose client origin is `pos`.
+    fn outer_rect(&self, root: ViewId, pos: (i32, i32), tabbed: bool) -> Rect {
         let f = self.tree.views[root].frame;
-        let outer = Rect::new((pos.0 - FRAME_L) as f32, (pos.1 - FRAME_T) as f32, pos.0 as f32 + f.width() + FRAME_R as f32, pos.1 as f32 + f.height() + FRAME_B as f32);
+        let (l, t, r, b) = if tabbed { (TAB_L, TAB_T, TAB_R, TAB_B) } else { (FRAME_L, FRAME_T, FRAME_R, FRAME_B) };
+        Rect::new((pos.0 - l) as f32, (pos.1 - t) as f32, pos.0 as f32 + f.width() + r as f32, pos.1 as f32 + f.height() + b as f32)
+    }
+
+    /// Outer + inner frame art of a style-1 window, or of a style-0 window with its tab strip (`title`); `pos` = client origin.
+    fn draw_frame(&mut self, root: ViewId, pos: (i32, i32), title: Option<&str>, out: &mut Vec<DrawCmd>) {
+        let f = self.tree.views[root].frame;
+        let outer = self.outer_rect(root, pos, title.is_some());
         let o = self.frame_gfx(["GFX_GUI_WINDOW3_BORDER_TL", "GFX_GUI_WINDOW3_BORDER_TR", "GFX_GUI_WINDOW3_BORDER_BL", "GFX_GUI_WINDOW3_BORDER_BR", "GFX_GUI_WINDOW3_BORDER_LEFT", "GFX_GUI_WINDOW3_BORDER_TOP", "GFX_GUI_WINDOW3_BORDER_RIGHT", "GFX_GUI_WINDOW3_BORDER_BOTTOM", "GFX_GUI_WINDOW_BACKGROUND"]);
         self.draw_border(out, &o, outer, [255; 3], 0.33);
         let i = self.frame_gfx(["GFX_GUI_TAB_BORDER_TL", "GFX_GUI_TAB_BORDER_TR", "GFX_GUI_TAB_BORDER_BL", "GFX_GUI_TAB_BORDER_BR", "GFX_GUI_TAB_BORDER_LEFT", "GFX_GUI_TAB_BORDER_TOP", "GFX_GUI_TAB_BORDER_RIGHT", "GFX_GUI_TAB_BORDER_BOTTOM", "GFX_GUI_TAB_BACKGROUND"]);
-        // DoSetFrame 0x10159888: inner border view = client frame grown by 1 on every side
-        let client = Rect::new(pos.0 as f32 - 1.0, pos.1 as f32 - 1.0, pos.0 as f32 + f.width() + 1.0, pos.1 as f32 + f.height() + 1.0);
         let col = self.map_color(0x1000000);
-        self.draw_border(out, &i, client, col, 1.0);
-        let (icon, close) = self.frame_buttons(root, pos);
+        if let Some(title) = title {
+            self.draw_tab_strip(&i, outer, title, col, out);
+        } else {
+            // DoSetFrame 0x10159888: inner border view = client frame grown by 1 on every side
+            let client = Rect::new(pos.0 as f32 - 1.0, pos.1 as f32 - 1.0, pos.0 as f32 + f.width() + 1.0, pos.1 as f32 + f.height() + 1.0);
+            self.draw_border(out, &i, client, col, 1.0);
+        }
+        let (icon, close) = self.frame_buttons(root, pos, title.is_some());
         let over = |r: Rect, m: Point| m.x >= r.l && m.x <= r.r + 1.0 && m.y >= r.t && m.y <= r.b + 1.0;
         let m = self.mouse;
         let pressed_close = self.frame_press.is_some() && over(close, m);
@@ -1075,6 +1146,29 @@ impl Gui {
                 self.push_gfx(out, x, r, [255; 3], 1.0);
             }
         }
+    }
+
+    /// Style-0 `TabView` (`SetRenderFlags(7)`, `LayoutBorders` 0x10145be5, `TopBorderView_c` ctor 0x10147935, `Tab` 0x10146785): the `TabView` fills the
+    /// outer rect minus the `WndBorder` border (3, 7, 3, 3); its tab-strip box (`GFX_GUI_TAB_BORDER_*` + `TAB_BACKGROUND`, layer-2 alpha) starts 2 px above the end of
+    /// the 18 px strip; the selected tab (`GFX_GUI_TAB_ACTIVE_LEFT/MIDDLE/RIGHT`, 17 rows, layer-2 alpha, `Tab::SetSelected` 0x10146110 text colour 0xffffff,
+    /// font NORMAL) sits 20 px from the left edge with the title 5 px inside; its width is the title width + 1 + 5 + 16 (`FUN_101461dc`).
+    /// UNRESOLVED: the title's vertical offset inside the tab (drawn at the tab top like any `TextView`) and +-1 px of the strip height.
+    fn draw_tab_strip(&mut self, box_gfx: &[Option<GfxId>; 9], outer: Rect, title: &str, col: [u8; 3], out: &mut Vec<DrawCmd>) {
+        let tv = outer.resize(3.0, 7.0, -3.0, -3.0);
+        let top = Rect::new(tv.l, tv.t + TAB_BOX_TOP, tv.r, tv.b);
+        self.draw_border(out, box_gfx, top, col, BUTTON_ALPHA);
+        let text_w: i32 = title.chars().map(|c| self.fonts.font(FontId::Normal).advance(c)).sum();
+        let w = text_w as f32 + 1.0 + TAB_PAD_L + TAB_PAD_R;
+        let l = tv.l + TAB_LEFT_MARGIN;
+        let tab = Rect::new(l, tv.t, l + w - 1.0, tv.t + TAB_H - 1.0);
+        let tab_gfx = ["GFX_GUI_TAB_ACTIVE_LEFT", "GFX_GUI_TAB_ACTIVE_MIDDLE", "GFX_GUI_TAB_ACTIVE_RIGHT"].map(|n| self.gfx.id(n));
+        if let [Some(gl), Some(gm), Some(gr)] = tab_gfx {
+            let (wl, wr) = (self.gfx.size(gl).0 as f32, self.gfx.size(gr).0 as f32);
+            self.push_gfx(out, gm, Rect::new(tab.l + wl, tab.t, tab.r - wr, tab.b), col, BUTTON_ALPHA);
+            self.push_gfx(out, gl, Rect::new(tab.l, tab.t, tab.l + wl - 1.0, tab.b), col, BUTTON_ALPHA);
+            self.push_gfx(out, gr, Rect::new(tab.r - wr + 1.0, tab.t, tab.r, tab.b), col, BUTTON_ALPHA);
+        }
+        self.draw_string(out, FontId::Normal, title, (tab.l + TAB_PAD_L) as i32, tab.t as i32, [255; 3], 1.0, false);
     }
 
     fn draw_popup(&mut self, out: &mut Vec<DrawCmd>) {
@@ -1193,7 +1287,9 @@ impl Gui {
     }
 
     fn windows_top_down(&self) -> Vec<(WindowId, ViewId, (i32, i32))> {
-        self.windows.iter().enumerate().rev().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (i, w.root, w.pos))).collect()
+        let mut v: Vec<(i8, WindowId, ViewId, (i32, i32))> = self.windows.iter().enumerate().filter_map(|(i, w)| w.as_ref().filter(|w| w.visible).map(|w| (w.layer, i, w.root, w.pos))).collect();
+        v.sort_by_key(|k| (k.0, k.1));
+        v.into_iter().rev().map(|(_, i, r, p)| (i, r, p)).collect()
     }
 
     /// Topmost interactive view under the mouse, with its window.
@@ -1320,7 +1416,7 @@ impl Gui {
         }
         for (wid, root, pos) in self.windows_top_down() {
             if self.windows[wid].as_ref().is_some_and(|w| w.framed) {
-                let c = self.frame_buttons(root, pos).1;
+                let c = self.frame_buttons(root, pos, self.windows[wid].as_ref().is_some_and(|w| w.title.is_some())).1;
                 if x >= c.l && x <= c.r + 1.0 && y >= c.t && y <= c.b + 1.0 {
                     self.frame_press = Some(wid);
                     return;
@@ -1440,8 +1536,8 @@ impl Gui {
 
     fn mouse_up(&mut self) {
         if let Some(wid) = self.frame_press.take() {
-            if let Some((root, pos)) = self.windows.get(wid).and_then(|w| w.as_ref()).map(|w| (w.root, w.pos)) {
-                let c = self.frame_buttons(root, pos).1;
+            if let Some((root, pos, tabbed)) = self.windows.get(wid).and_then(|w| w.as_ref()).map(|w| (w.root, w.pos, w.title.is_some())) {
+                let c = self.frame_buttons(root, pos, tabbed).1;
                 let m = self.mouse;
                 if m.x >= c.l && m.x <= c.r + 1.0 && m.y >= c.t && m.y <= c.b + 1.0 {
                     self.events.push(Event::CloseRequested { window: wid });

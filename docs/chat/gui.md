@@ -136,12 +136,25 @@ Arguments: group node, sender name, text, kind (1 whisper, 2 shout, 3 emote), co
 and read by `FUN_10094c58` (directory scan; names are `sscanf("Window%d")`). Port: reads `<aomac prefs dir>/Chat/Windows/*/Config.xml` (stand-in for the character prefs dir, `AOMAC_PREFS_DIR`), else the client
 template above, else the code defaults; `ChatWindows::save()` writes the same schema (round-trip tested).
 
-**GUESS (UNRESOLVED)**: `Window::LoadWndConfig`/`SetFrame` clamping is not decompiled. The shipped frames assume a screen at least 2304×1440, so the port scales them by `min(screen/2304×1440, 1)` and clamps
-them inside the screen. Without a frame the window is centred, 400×200 (`FUN_10097ae3`).
+**Positioning (read from the binary).** `Window::LoadWndConfig` 0x10154d6e: `Message::FindRect("WindowFrame")` → `WndBorder::SetClientFrame(rect)` (absolute screen
+coordinates, top-left origin, inclusive `Rect`; style 3 has no border so client = outer), then `Window::MoveInsideScreen(false, true, true)` 0x10154abc: *translate* (never
+resize) so the frame lies inside `WindowController_c` +0x80 (the display size `Window::GetScreenSize` 0x10154850): if `left < 0` shift right, else if `right > screen` shift left (same for the
+vertical axis). `Window::SaveWndConfig` 0x1548a7 writes `GetFrame` back (`WindowFrame`, `WindowPinButtonState` unless flag 0x800). **No chat code avoids the ControlCenter/HUD**: the original places the windows
+exactly where the saved frame says, and the HUD bar windows are *backmost* (the control-centre bar windows are created with flags 0xe3c, whose 0x200 bit is the `SetStyle` backmost flag that `ChatWindow_c`
+reads from `is_backmost`), so chat windows draw above them. Port: `place()` (tested: `(277,1206)-(1273,1439)` on a 1280x828 screen → `(277,594)` 997x234; negative/overflowing frames are translated);
+`ao_gui::Gui::set_window_layer(w, -1|0|1)` (-1 backmost, 1 frontmost; draw and hit-test order, creation order inside a layer) — **the HUD must mark its ControlCenter/bar windows backmost (-1)** or create the
+chat windows after them (normal stacking = creation order).
+
+**GUESS (no original evidence)** for the *shipped template only* (`prefs/NewChar`, authored on a 2304x1440 screen; applying the rule above on a 1280-wide screen would pile Window2 on top of Window1 and put
+the input bar under the bottom HUD row): template frames are scaled horizontally by `free width / 2304` (free width = screen minus the HUD's wings, `Reserved{left,right}`), keep their height, and are
+bottom-anchored `Reserved.bottom` px above the screen bottom (`ChatWindows::set_reserved`, the hub passes the HUD's footprint; test screenshot used left 190 / right 65 / bottom 38 measured from the HUD art).
+Once saved (`ChatWindows::save` writes the *placed* rectangle) the windows load as ordinary absolute frames. Without a frame: centred, 400x200 (`FUN_10097ae3`).
+Window drag/resize is **not ported**: the original's borderless style-3 chat window has no frame handles (`HitTest` 0x101593d6 is the frame's; moving a visual_mode 2 window needs the frame/menu mode),
+ao-gui has no movable windows. `ChatWindows::set_visible(false/true)` hides/shows all windows (they keep collecting lines; focus is dropped) so HUD hide/show does not disturb them.
 
 ## 8. ao-gui additions (additive)
 
-`Gui::set_window_alpha/window_alpha` (`Window::FadeTo` target), `Gui::set_text_shadow_offset` + `TVF_RENDER_SHADOW` drawing (black copy behind), `TVF_FILL_BOTTOM_UP` (short content sits at the
+`Gui::set_window_alpha/window_alpha` (`Window::FadeTo` target), `Gui::set_window_layer` (backmost/frontmost), `Gui::set_text_shadow_offset` + `TVF_RENDER_SHADOW` drawing (black copy behind), `TVF_FILL_BOTTOM_UP` (short content sits at the
 bottom of its `ScrollView`), `Gui::scroll_to_bottom`, `Gui::clear_focus`, `Event::LinkClicked { window, view, href }` for read-only `TextView`s (`TextRun::href`).
 
 ## 9. Verification
