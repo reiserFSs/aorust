@@ -11,6 +11,7 @@ pub mod misc;
 pub mod motion;
 pub mod nametag;
 pub mod outgoing;
+pub mod textcmd;
 pub mod world;
 
 use crate::msg::Identity;
