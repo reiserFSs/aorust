@@ -20,12 +20,37 @@ impl Zone {
     /// * `ContainerAddItemIIR_t` with the own character as container and an item identity of the own pages (`FUN_10047d77(kind, from = item.instance,
     ///   to = slot)`): the item at `from` and the cell `to` swap places (`FUN_1002a200` swaps two vector cells), `to == 0x6f` means the first
     ///   free bag slot (`FUN_1002a1b0(0x40)`, nothing happens when the bag is full). The "has item" check `FUN_1002a82b(from)` makes a move of
-    ///   an empty cell a no-op. An item `{0x6b, word << 16 | slot}` of a corpse / chest list moves into the bag (`take_from_container`). Bank (`0x69`), trade (`0x6e`) and the other special kinds of `FUN_1004ad44` and the pick-up
-    ///   of a ground item (container `{0, 0}`, `FUN_10047eb2`: needs the item dynel's stats) are **not decoded** (UNRESOLVED): they leave the inventory unchanged.
+    ///   an empty cell a no-op. An item `{0x6b, word << 16 | slot}` of a corpse / chest list moves into the bag (`take_from_container`).
+    ///   A temporary trade/overflow item (`0x6e`, created by `TemplateActionIIR_t` action 0x57) transfers into the first free bag slot (`FUN_100475ae`).
+    ///   Picking up a ground item (container `{0, 0}`, `FUN_10047eb2`) still requires the item dynel's stats and is not decoded here.
     /// * `ItemReplacedIIR_c`: a worn slot (`< 0x40`) gets the new item when it differs from the current one (`FUN_1004cf08`).
     /// * `InventoryUpdateIIR_t` of a chest / corpse stores its list in [`Zone::containers`] (`FUN_100a040e`); `InventoryUpdatedIIR_t` is the signal only (`FUN_10074e49`).
     pub fn apply_inventory(&mut self, msg: &InventoryMsg) {
         match msg {
+            // GC 1004d148 action 0x57: create an actual server-described item in the temporary inventory.
+            InventoryMsg::TemplateAction { item, count, action: 0x57, .. } => {
+                let (_, entries) = self.containers.entry((inv::KIND_TRADE, self.char_id as i32)).or_default();
+                let slot = (0..=entries.len() as u32).find(|slot| !entries.iter().any(|e| e.slot == *slot)).unwrap();
+                entries.push(ao_net::n3::world::InventoryEntry {
+                    slot,
+                    a: 0x21,
+                    b: *count as i16,
+                    id: Identity { kind: inv::KIND_TRADE, instance: slot as i32 },
+                    item: *item,
+                });
+            }
+            InventoryMsg::ContainerAdd { item, container, .. }
+                if item.kind == inv::KIND_TRADE && container.kind == inv::KIND_TRADE && container.instance == self.char_id as i32 =>
+            {
+                // GC 100475ae: the wire destination is ignored; transfer the temporary item into the first free bag cell.
+                let Some(slot) = self.free_bag_slot() else { return };
+                let Some((_, entries)) = self.containers.get_mut(&(inv::KIND_TRADE, self.char_id as i32)) else { return };
+                let Some(at) = entries.iter().position(|e| e.slot as i32 == item.instance) else { return };
+                let mut entry = entries.remove(at);
+                entry.slot = slot;
+                entry.id = inv::item_identity(slot);
+                self.inventory.insert(slot, entry);
+            }
             InventoryMsg::Bank(entries) => {
                 self.containers.insert((0xdead, self.char_id as i32), (0, entries.clone()));
             }
@@ -103,7 +128,7 @@ impl Zone {
                 entries.sort_by_key(|e| e.slot);
                 self.containers.insert((u.container.kind, u.container.instance), (u.word, entries));
             }
-            InventoryMsg::Updated(_) | InventoryMsg::Update(_) => {}
+            InventoryMsg::Updated(_) | InventoryMsg::Update(_) | InventoryMsg::TemplateAction { .. } => {}
         }
     }
 }
@@ -148,6 +173,64 @@ mod tests {
 
     fn add(from: u32, to: i32) -> InventoryMsg {
         InventoryMsg::ContainerAdd { item: inv::item_identity(from), container: Identity { kind: 0xC350, instance: 7 }, slot: to }
+    }
+
+    #[test]
+    fn temporary_server_items_preserve_count_and_wait_for_bag_space() {
+        let mut z = Zone::new(7);
+        let item = AcgItem { low_id: 218395, high_id: 218395, level: 1 };
+        let create = InventoryMsg::TemplateAction { item, count: 3, action: 0x57, identity_a: Identity { kind: inv::KIND_TRADE, instance: 0 }, identity_b: Identity::default() };
+        z.apply_inventory(&create);
+        z.apply_inventory(&create);
+        let key = (inv::KIND_TRADE, 7);
+        assert_eq!(z.containers[&key].1.iter().map(|e| (e.slot, e.b)).collect::<Vec<_>>(), [(0, 3), (1, 3)]);
+        for slot in inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS { put(&mut z, slot, 100); }
+        let transfer = InventoryMsg::ContainerAdd { item: Identity { kind: inv::KIND_TRADE, instance: 0 }, container: Identity { kind: inv::KIND_TRADE, instance: 7 }, slot: inv::ANY_BAG_SLOT };
+        z.apply_inventory(&transfer);
+        assert_eq!(z.containers[&key].1.len(), 2, "full bag must retain the server item");
+        z.inventory.remove(&0x45);
+        z.apply_inventory(&transfer);
+        assert_eq!(z.inventory[&0x45], InventoryEntry { slot: 0x45, a: 0x21, b: 3, id: inv::item_identity(0x45), item });
+        assert_eq!(z.containers[&key].1[0].slot, 1);
+        z.apply_inventory(&transfer);
+        assert_eq!(z.inventory.len(), inv::BAG_SLOTS as usize, "repeating a transfer cannot duplicate an item");
+    }
+
+    #[test]
+    fn captured_cash_purchase_reconciles_item_before_trade_completion() {
+        use ao_net::n3::{self, N3};
+        let mut z = Zone::new(0x830e);
+        z.stats.insert(61, 1005);
+        for slot in 0x40..0x45 { put(&mut z, slot, 100); }
+        let mut transferred = false;
+        for line in include_str!("../../../../../docs/captures/zone_shop_cash_purchase_ithaca.rec").lines() {
+            let mut parts = line.split(' ');
+            let (_, dir, hex) = (parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap());
+            if dir != "<" { continue; }
+            let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+            let frame = ao_net::frame::Frame::decode_with(&bytes, false).unwrap().unwrap().0;
+            let message = n3::decode(&frame).unwrap();
+            z.on_frame(&frame);
+            match message.body {
+                N3::Inventory(InventoryMsg::TemplateAction { action: 0x57, .. }) => {
+                    assert_eq!(z.inventory.len(), 5, "template creation alone does not place a bag item");
+                    assert_eq!(z.containers[&(inv::KIND_TRADE, 0x830e)].1.len(), 1);
+                }
+                N3::Inventory(InventoryMsg::ContainerAdd { item, .. }) if item.kind == inv::KIND_TRADE => {
+                    assert_eq!(z.inventory[&0x45].item, AcgItem { low_id: 218395, high_id: 218395, level: 1 });
+                    assert_eq!(z.inventory[&0x45].b, 1);
+                    assert!(z.containers[&(inv::KIND_TRADE, 0x830e)].1.is_empty());
+                    transferred = true;
+                }
+                N3::Trade(t) if t.op == n3::trade::COMPLETE => {
+                    assert!(transferred, "actual server item transfer precedes completion");
+                    assert_eq!(z.inventory.len(), 6);
+                }
+                _ => {}
+            }
+        }
+        assert!(transferred);
+        assert_eq!(z.stat(61), Some(743));
     }
 
     #[test]

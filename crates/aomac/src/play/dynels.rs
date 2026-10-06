@@ -168,6 +168,8 @@ pub struct Built {
     pub item: Option<ItemRig>,
     /// Runtime item class selected by `CreateFromTemplate`, independent of the placed dynel identity.
     pub item_kind: Option<u32>,
+    /// Display name parsed from the item template, shared with the model.
+    pub name: Option<String>,
     /// The stats of an item-family dynel: its template's overlaid by the message's (`N3Msg_DefaultActionOnDynel` reads `Can`, interact.rs).
     pub stats: Vec<(u32, i32)>,
     /// The NPC record's sound multimap (`NpcRecord::sounds`: `AbstractAnimID_e` key -> sound ids; fight keys `combat::anim::npc_sound`).
@@ -309,7 +311,7 @@ fn static_model(store: &RecordStore, mesh: u32, override_texture: Option<u32>) -
 }
 
 fn plain(model: ao_scene::Scene, visible: bool) -> Built {
-    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None, item_kind: None, stats: Vec::new(), sounds: Vec::new(), fabric: 0 }
+    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None, item_kind: None, name: None, stats: Vec::new(), sounds: Vec::new(), fabric: 0 }
 }
 
 fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::Result<Built> {
@@ -317,20 +319,21 @@ fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::
         Look::Char(c) => build_char(store, assets, c),
         Look::Corpse(c) => build_corpse(store, assets, c),
         Look::Item { template, stats } => {
-            let tpl = template.map(|t| item_template(store, t)).transpose()?.flatten();
+            let mut tpl = template.map(|t| item_template(store, t)).transpose()?.flatten();
             let item_kind = tpl.as_ref().map(|t| t.kind);
+            let name = tpl.as_mut().and_then(|t| t.name.take());
             let eff = effective_stats(tpl.as_ref(), stats);
             let v = visual(&eff, default_mesh(&assets.names)?);
             match (v.cat_mesh, v.mesh) {
                 (Some(cat), _) => {
                     let rig = ActorRig::new(store, assets, cat, None, &Default::default(), &Default::default(), &[])?;
                     let held = rig.pose(None);
-                    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), item_kind, stats: eff, ..plain(Default::default(), v.visible) })
+                    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), item_kind, name, stats: eff, ..plain(Default::default(), v.visible) })
                 }
                 (None, Some(mesh)) => {
                     let model = static_model(store, mesh, v.override_texture)?;
                     let item = ItemRig::new(store, mesh, &model, &eff, tpl.map(|t| t.sounds).unwrap_or_default());
-                    Ok(Built { item, item_kind, stats: eff, ..plain(model, v.visible) })
+                    Ok(Built { item, item_kind, name, stats: eff, ..plain(model, v.visible) })
                 }
                 (None, None) => anyhow::bail!("item dynel without a model"),
             }
@@ -543,6 +546,7 @@ struct Prop {
     /// `ActorFrame::id`, disjoint from the character instance ids.
     id: u32,
     key: u64,
+    parent: Option<ao_net::msg::Identity>,
     pos: [f32; 3],
     /// Server heading.
     yaw: f32,
@@ -1041,7 +1045,7 @@ impl Dynels {
             Look::Corpse(_) => vec![(CAN_STAT, CORPSE_CAN)],
             Look::Char(_) => vec![],
         };
-        self.props.insert((kind, instance), Prop { id, key: look.key(), pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default(), stats });
+        self.props.insert((kind, instance), Prop { id, key: look.key(), parent: None, pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default(), stats });
         self.pending.push(look);
     }
     /// Message stats of the known prop `who` (a corpse's, a `StatIIR_t`'s): they replace earlier values.
@@ -1080,6 +1084,20 @@ impl Dynels {
             Some(Model::Ready { built, .. }) => ao_formats::dynel_visual::get(&built.stats, id),
             _ => None,
         })
+    }
+
+    /// A parented item's character name, otherwise its template display name once built.
+    pub fn name_of(&self, kind: i32, instance: i32) -> Option<&str> {
+        let p = self.props.get(&(kind, instance))?;
+        if let Some(parent) = p.parent.filter(|p| p.kind == CHAR_KIND) {
+            if let Some(c) = self.chars.get(&parent.instance).filter(|c| !c.name.is_empty()) {
+                return Some(&c.name);
+            }
+        }
+        match self.models.get(&p.key) {
+            Some(Model::Ready { built, .. }) => built.name.as_deref(),
+            _ => None,
+        }
     }
 
     /// Original use dispatch calls the item's runtime vtable, not its wire identity kind.
@@ -1148,9 +1166,10 @@ impl Dynels {
                 let stats = v.base.stats.iter().map(|&(i, x)| (i, x)).collect::<Vec<_>>();
                 let template = static_instance(&stats);
                 let scale = stat_scale(&stats);
-                if let Some(pos) = v.base.position {
-                    self.add_prop(who.kind, who.instance, Look::Item { template, stats }, pos, v.base.rotation, scale);
-                }
+                let parent = (v.base.parent.kind != 0).then_some(v.base.parent);
+                let pos = v.base.position.or_else(|| parent.and_then(|p| self.chars.get(&p.instance).map(|c| c.pose.pos))).unwrap_or([0.0; 3]);
+                self.add_prop(who.kind, who.instance, Look::Item { template, stats }, pos, v.base.rotation, scale);
+                self.props.get_mut(&(who.kind, who.instance)).unwrap().parent = parent;
             }
             N3::World(World::DoorStatus(d)) if DOOR_KINDS.contains(&who.kind) => self.door_command(who, Cmd::Status(d.locked, d.open, d.value_c3, d.flag_1a)),
             N3::World(World::Door(d)) if DOOR_KINDS.contains(&who.kind) && !self.props.contains_key(&(who.kind, who.instance)) => {

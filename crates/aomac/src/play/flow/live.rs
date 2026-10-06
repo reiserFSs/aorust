@@ -974,7 +974,7 @@ fn live_walk() {
                 let n = v.parse().unwrap_or(0);
                 let ok = match k {
                     "shopbuy" => i.shop_buy(gui, n),
-                    "shopadd" => i.shop_add(gui, n),
+                    "shopadd" => i.shop_add(gui, n, &p.zone),
                     "shoprm" => i.shop_remove(gui, n),
                     other => i.shop_press(gui, other == "shopaccept"),
                 };

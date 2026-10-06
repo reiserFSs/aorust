@@ -63,11 +63,14 @@ struct Shop {
     grid_keys: [Vec<i64>; 3],
     grid_width: f32,
     dock_registered: bool,
+    prices: Vec<Option<i32>>,
+    net_cost: Option<i64>,
 }
 
 #[derive(Default)]
 pub struct ShopUi {
     shop: Option<Shop>,
+    pending_start: Option<(Trade, Identity)>,
     config_loaded: bool,
     configs: [ListCfg; 3],
     pending_config: Option<Element>,
@@ -81,6 +84,7 @@ pub struct ShopUi {
     /// Names of the machines (`VendingMachineFullUpdateIIR_t`'s name blob).
     names: HashMap<(i32, i32), String>,
     feedback: Vec<&'static str>,
+    shortages: Vec<(i32, u32)>,
     /// Shift or Ctrl is held (`View::GetQualifiers() & 0xc` of `FUN_100ca1e7`; which bits are which keys is [INFERENCE]).
     pub quick: bool,
     /// Every step, for the live harness.
@@ -165,7 +169,7 @@ impl Shop {
         }
         gui.relayout_window(win);
         gui.set_window_context(win, true);
-        Ok(Shop { win, machine, stock, cash_shop, sold: vec![], bought: vec![], due: None, dirty: true, rows: Default::default(), literacy: 0, configs: Default::default(), grid_keys: Default::default(), grid_width: dw as f32 - 13.0, dock_registered: false })
+        Ok(Shop { win, machine, stock, cash_shop, sold: vec![], bought: vec![], due: None, dirty: true, rows: Default::default(), literacy: 0, configs: Default::default(), grid_keys: Default::default(), grid_width: dw as f32 - 13.0, dock_registered: false, prices: vec![], net_cost: None })
     }
 
     fn apply_modes(&mut self, gui: &mut Gui) {
@@ -271,6 +275,19 @@ fn sell_price(value: i32, factor: i32, literacy: i32) -> i32 {
 type Info<'a> = &'a mut dyn FnMut(&mut Gui, AcgItem) -> Option<(String, i32, i32, Option<GfxId>)>;
 
 impl Interact {
+    /// Effective dynel stats: streamed values override the retail template.
+    fn shop_refresh_pricing(&mut self, zone: &super::zone::Zone, machine: Identity) {
+        let stat = |id| zone.world.stat_of(machine.kind, machine.instance, id);
+        let Some(factor) = stat(0x1ab) else { return };
+        let shop_type = stat(0x9c).filter(|v| *v != 0).unwrap_or(0x3d);
+        let key = (machine.kind, machine.instance);
+        let changed = self.shop.pricing.insert(key, (shop_type, factor)) != Some((shop_type, factor));
+        let sell = stat(0x1aa).unwrap_or(0);
+        let changed = self.shop.sell_factors.insert(key, sell) != Some(sell) || changed;
+        if let Some(s) = self.shop.shop.as_mut().filter(|s| s.machine == machine) {
+            s.dirty |= changed;
+        }
+    }
     /// Every decoded zone frame: the machine's name and stock (`ShopUpdateIIR_t::Activate`, `FUN_100a0f2c`: only for a `VendingMachine_t` header).
     pub(super) fn shop_watch(&mut self, m: &Message) {
         let t = m.header.target;
@@ -278,10 +295,6 @@ impl Interact {
         match &m.body {
             N3::World(World::VendingMachine(v)) => {
                 let name = v.base.blob.split(|&b| b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
-                let stat = |id| v.base.stats.iter().rev().find(|(s, _)| *s == id).map_or(0, |(_, v)| *v);
-                let shop_type = stat(0x9c);
-                ui.pricing.insert((t.kind, t.instance), (if shop_type == 0 { 0x3d } else { shop_type }, stat(0x1ab)));
-                ui.sell_factors.insert((t.kind, t.instance), stat(0x1aa));
                 ui.names.insert((t.kind, t.instance), name);
             }
             N3::Shop(ShopUpdate { items }) if t.kind == VENDING_MACHINE => {
@@ -301,6 +314,23 @@ impl Interact {
 
     /// A `TradeIIR_t` of the shop trade; `true` when consumed (everything else is the player trade's).
     pub(super) fn shop_trade(&mut self, gui: &mut Gui, t: &Trade, who: Identity, ptrade_open: bool, zone: &super::zone::Zone) -> bool {
+        if t.op == trade::START && t.a.kind == VENDING_MACHINE && t.b != ZERO && who == self.own_id() && ptrade_open {
+            self.shop.feedback.push("Feedback_YouAreAlreadyInATrade");
+            return true;
+        }
+        if matches!(t.op, trade::ABORT | trade::COMPLETE)
+            && self.shop.pending_start.as_ref().is_some_and(|(start, own)| who == *own || who == start.a) {
+            self.shop.pending_start = None;
+            return true;
+        }
+        if t.op == trade::START && t.a.kind == VENDING_MACHINE {
+            self.shop_refresh_pricing(zone, t.a);
+        }
+        if t.op == trade::START && t.a.kind == VENDING_MACHINE && t.b != ZERO && who == self.own_id()
+            && !self.shop.pricing.contains_key(&(t.a.kind, t.a.instance)) {
+            self.shop.pending_start = Some((*t, who));
+            return true;
+        }
         let me = self.own_id();
         let Some(s) = self.shop.shop.as_mut() else {
             // `FUN_100663e4` -> type 2: the trade with a vending machine starts (`b` = the session identity); the machine's own copy (header = the machine) opens nothing
@@ -311,10 +341,11 @@ impl Interact {
                         self.shop.feedback.push("Feedback_YouAreAlreadyInATrade");
                     } else {
                         let key = (t.a.kind, t.a.instance);
-                        let name = self.shop.names.get(&key).cloned().unwrap_or_default();
+                        let name = self.shop.names.get(&key).filter(|n| !n.is_empty()).map(String::as_str)
+                            .or_else(|| zone.world.name_of(t.a.kind, t.a.instance)).unwrap_or_default();
                         let stock = self.shop.stocks.get(&key).cloned().unwrap_or_default();
                         let cash_shop = self.shop.pricing.get(&key).is_none_or(|p| p.0 == 0x3d);
-                        match Shop::open(gui, self.screen, t.a, &name, stock, cash_shop) {
+                        match Shop::open(gui, self.screen, t.a, name, stock, cash_shop) {
                             Ok(mut s) => { s.literacy = self.shop.literacy; s.configs = self.shop.configs.clone(); s.restore_config(gui); self.shop.shop = Some(s); }
                             Err(e) => eprintln!("interact: shop window: {e:#}"),
                         }
@@ -402,6 +433,7 @@ impl Interact {
 
     pub(super) fn shop_close_all(&mut self, gui: &mut Gui) {
         self.shop_close(gui);
+        self.shop.pending_start = None;
     }
 
     /// GUI events of the window; `true` when consumed.
@@ -448,7 +480,20 @@ impl Interact {
                         // `FUN_100ca1e7`: Shift / Ctrl + double click = `N3Msg_TradeAddItem(own, item)`, a plain double click = `MoveItemToInventory(item)`
                         "shop_items" if (id as usize) < s.stock.len() => {
                             let item = Identity { kind: SHOP_ITEM, instance: id as i32 };
-                            out.push(if quick { trade::add_item(me, item) } else { inventory::move_item_to_inventory(me.instance, item, ANY_BAG_SLOT) });
+                            if !quick {
+                                out.push(inventory::move_item_to_inventory(me.instance, item, ANY_BAG_SLOT));
+                            } else if !s.dirty {
+                                if let Some((net, price)) = s.net_cost.zip(s.prices.get(id as usize).copied().flatten()) {
+                                    let currency = self.shop.pricing.get(&(s.machine.kind, s.machine.instance)).unwrap().0 as u32;
+                                    // GC 100662b7: net basket cost + candidate price - own ShopType stat.
+                                    let shortage = net + price as i64 - zone.stat_of(me.instance, currency).unwrap_or(0) as i64;
+                                    if shortage > 0 {
+                                        self.shop.shortages.push((shortage.min(i32::MAX as i64) as i32, currency));
+                                    } else {
+                                        out.push(trade::add_item(me, item));
+                                    }
+                                }
+                            }
                         }
                         // `FUN_100df67e` (double click on a bought item): `N3Msg_TradeRemoveItem(own, item)` [INFERENCE: wired for this list]
                         "bought_items" => {
@@ -493,9 +538,11 @@ impl Interact {
     /// Fills lists and totals using the complete ACG item, including actual quality level.
     pub(super) fn shop_render(&mut self, gui: &mut Gui, info: Info) {
         let Some(s) = self.shop.shop.as_mut().filter(|s| s.dirty) else { return };
-        let (shop_type, factor) = self.shop.pricing.get(&(s.machine.kind, s.machine.instance)).copied().unwrap_or((0x3d, 0));
+        let Some(&(shop_type, factor)) = self.shop.pricing.get(&(s.machine.kind, s.machine.instance)) else { return };
         let literacy = s.literacy;
         s.dirty = false;
+        s.prices.clear();
+        s.net_cost = Some(0);
         let lists: [Vec<(i64, AcgItem)>; 2] = [
             s.stock.iter().enumerate().map(|(i, a)| (i as i64, *a)).collect(),
             s.bought.iter().enumerate().map(|(i, b)| (i as i64, s.item(*b).unwrap_or_default())).collect(),
@@ -508,6 +555,8 @@ impl Interact {
             let columns = gui.multi_columns(s.win, view);
             for (id, a) in list {
                 let inf = info(gui, a).map(|(name, count, value, icon)| (name, count, buy_price(value, factor, shop_type, literacy), icon));
+                if n == 0 { s.prices.push(inf.as_ref().map(|i| i.2)); }
+                if n == 1 && inf.is_none() { s.net_cost = None; }
                 if n == 1 {
                     due += inf.as_ref().map_or(0, |i| i.2 as i64 * i.1.max(1) as i64);
                 }
@@ -522,6 +571,7 @@ impl Interact {
             s.paint_grid(gui, view, &grid);
         }
         if s.cash_shop {
+            let mut complete = true;
             let sell_factor = self.shop.sell_factors.get(&(s.machine.kind, s.machine.instance)).copied().unwrap_or(0);
             let mut revenue = 0i64;
             gui.multi_clear(s.win, "sold_items");
@@ -533,9 +583,12 @@ impl Interact {
                         revenue += sell_price(value, sell_factor, literacy) as i64;
                         (name, count, 0, icon)
                     });
+                    complete &= inf.is_some();
                     if let Some((name, _, _, icon)) = &inf { grid.push((id as i64, *icon, name.clone())); }
                     let c = cells(&inf, a.level);
                     gui.multi_add_row(s.win, "sold_items", id as i64, ordered_cells(c, &columns), true);
+                } else {
+                    complete = false;
                 }
             }
             if let Some((1, order)) = s.configs[2].grid_sort {
@@ -543,11 +596,15 @@ impl Interact {
             }
             s.paint_grid(gui, "sold_items", &grid);
             let balance = (revenue - due).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            if !complete { s.net_cost = None; }
+            if s.net_cost.is_some() { s.net_cost = Some(due - revenue); }
             gui.set_text(s.win, "OurCashView", &group(balance));
             gui.set_text_color(s.win, "OurCashView", if balance < 0 { 0xdd4444 } else { 0x44dd44 });
         }
         // `FUN_100dfbf3` (`+0xd8`): the credits field shows the cost of the bought items (`FUN_10099d56`: price x count of every one); the machine's own figure wins
         gui.set_text(s.win, "PartnerCashView", &group(s.due.unwrap_or(due.min(i32::MAX as i64) as i32)));
+        if !s.cash_shop && s.net_cost.is_some() { s.net_cost = Some(due); }
+        s.dirty = s.net_cost.is_none() || s.prices.iter().any(Option::is_none);
     }
 }
 
@@ -556,6 +613,20 @@ impl super::Play {
     pub(super) fn interact_shop_frame(&mut self) {
         let Some(i) = self.interact.as_mut() else { return };
         i.shop.literacy = self.zone.skill_value(0xa1).unwrap_or(0).min(3000);
+        if let Some(machine) = i.shop.shop.as_ref().map(|s| s.machine) {
+            i.shop_refresh_pricing(&self.zone, machine);
+            if let Some(s) = i.shop.shop.as_ref() {
+                if let Some(name) = i.shop.names.get(&(machine.kind, machine.instance)).filter(|n| !n.is_empty()).map(String::as_str)
+                    .or_else(|| self.zone.world.name_of(machine.kind, machine.instance)) {
+                    if self.gui.text(s.win, "PartnerName") != name {
+                        self.gui.set_text(s.win, "PartnerName", name);
+                    }
+                }
+            }
+        }
+        if let Some((t, who)) = i.shop.pending_start.take() {
+            i.on_trade(&mut self.gui, t, who, &self.zone);
+        }
         if let Some(h) = self.hud.as_mut() {
             let first_config = !i.shop.config_loaded;
             i.shop.load_config(&h.dvalues);
@@ -577,6 +648,16 @@ impl super::Play {
         for key in std::mem::take(&mut i.shop.feedback) {
             if let Some(c) = self.chat.as_mut() {
                 c.feedback(&mut self.gui, key, &self.text);
+            }
+        }
+        for (shortage, currency) in std::mem::take(&mut i.shop.shortages) {
+            if let (Some(c), Some(template)) = (self.chat.as_mut(), self.text.by_key(super::combat::log::CAT_FEEDBACK, "CannotAffordThisItem")) {
+                // GC 100191f6: feed shortage, then fStatToString(ShopType).
+                let text = super::chat::log::ldb_format(&template, &[
+                    super::chat::log::Arg::N(shortage),
+                    super::chat::log::Arg::S(super::combat::log::stat_to_string(currency)),
+                ]);
+                c.system_line(&mut self.gui, &text, 0);
             }
         }
         for f in i.take_outbox() {
@@ -622,8 +703,10 @@ impl Interact {
     }
 
     /// Shift + double click on stock item `index` (`TradeAddItem(own, {0x6f, index})`, the server then confirms it into the bought list).
-    pub fn shop_add(&mut self, gui: &mut Gui, index: usize) -> bool {
-        self.shop.shop.as_ref().is_some_and(|s| index < s.stock.len()) && self.shop_double_click(gui, "shop_items", index, true)
+    pub fn shop_add(&mut self, gui: &mut Gui, index: usize, zone: &super::zone::Zone) -> bool {
+        let Some(win) = self.shop.shop.as_ref().filter(|s| index < s.stock.len()).map(|s| s.win) else { return false };
+        self.shop.quick = true;
+        self.shop_event(gui, &Event::MultiMouse { window: win, view: "shop_items".into(), id: Some(index as i64), button: 1, clicks: 2, x: 0, y: 0 }, zone)
     }
 
     /// Double click on bought item `index` (`TradeRemoveItem`).
@@ -755,6 +838,7 @@ mod tests {
         let item = inventory::item_identity(slot);
         z.inventory.insert(slot, ao_net::n3::world::InventoryEntry { slot, a: 0, b: 0, id: item, item: items()[0] });
         let mut i = Interact::new(OWN, (1280, 800));
+        i.shop.pricing.insert((MACHINE.kind, MACHINE.instance), (0x3d, 100));
         i.on_trade(&mut gui, Trade { op: trade::START, a: MACHINE, b: SESSION }, ME, &z);
         let win = i.shop.shop.as_ref().unwrap().win;
         for view in ["OurInventoryDock", "OurCashView", "sold_items"] { assert!(gui.has_view(win, view)); }
@@ -823,12 +907,13 @@ mod tests {
     #[test]
     fn double_clicks_buttons_and_server_confirmations() {
         let Some(mut gui) = rig() else { return };
-        let z = Zone::new(OWN);
+        let mut z = Zone::new(OWN);
+        z.character_stats.entry(OWN as i32).or_default().insert(0x3c, 100_000);
         let mut i = open(&mut gui, &z);
         // plain double click = MoveItemToInventory({0x6f, 1}, any bag), Shift = TradeAddItem(own, {0x6f, 1})
         assert!(i.shop_buy(&mut gui, 1));
         assert_eq!(sent(&mut i), [inventory::move_item_to_inventory(ME.instance, Identity { kind: SHOP_ITEM, instance: 1 }, ANY_BAG_SLOT)]);
-        assert!(i.shop_add(&mut gui, 1));
+        assert!(i.shop_add(&mut gui, 1, &z));
         let item = Identity { kind: SHOP_ITEM, instance: 1 };
         assert_eq!(sent(&mut i), [trade::add_item(ME, item)]);
         assert!(!i.shop_buy(&mut gui, 3), "no such stock item");
@@ -886,18 +971,46 @@ mod tests {
         assert!(i.shop_dump(&gui).contains("stock (1)"));
     }
 
+    #[test]
+    fn insufficient_actual_currency_blocks_add_not_accept_and_sales_fund_basket() {
+        let Some(mut gui) = rig() else { return };
+        let mut z = Zone::new(OWN);
+        z.character_stats.entry(OWN as i32).or_default().insert(0x3d, 100_000);
+        let mut i = open(&mut gui, &z);
+        let win = i.shop.shop.as_ref().unwrap().win;
+        assert!(i.shop_add(&mut gui, 1, &z));
+        assert!(sent(&mut i).is_empty(), "Cash does not fund a different ShopType");
+        assert_eq!(std::mem::take(&mut i.shop.shortages), [(2220, 0x3c)]);
+        assert!(gui.is_enabled(win, "AcceptButton"));
+        z.character_stats.entry(OWN as i32).or_default().insert(0x3c, 2220);
+        assert!(i.shop_add(&mut gui, 1, &z));
+        assert_eq!(sent(&mut i), [trade::add_item(ME, Identity { kind: SHOP_ITEM, instance: 1 })]);
+        i.shop.shop.as_mut().unwrap().cash_shop = true;
+        i.shop.pricing.insert((MACHINE.kind, MACHINE.instance), (0x3d, 100));
+        i.shop.shop.as_mut().unwrap().sold.push(super::super::interact_ptrade::Entry { item: Identity { kind: 0x68, instance: 1 }, acg: Some(items()[2]) });
+        i.shop.shop.as_mut().unwrap().dirty = true;
+        i.shop.sell_factors.insert((MACHINE.kind, MACHINE.instance), 100);
+        i.shop_render(&mut gui, &mut info);
+        z.character_stats.entry(OWN as i32).or_default().insert(0x3d, 0);
+        assert!(i.shop_add(&mut gui, 1, &z));
+        assert_eq!(sent(&mut i), [trade::add_item(ME, Identity { kind: SHOP_ITEM, instance: 1 })]);
+        assert!(i.shop_press(&mut gui, true));
+        assert_eq!(sent(&mut i), [trade::accept(ME)]);
+    }
+
     /// The replay of the live use of the vending machine (docs/captures/zone_use_object_ithaca.rec, frames 100825..100830): the window opens with the 36 items.
     #[test]
     fn live_capture_opens_the_window() {
         let Some(mut gui) = rig() else { return };
         let z = Zone::new(OWN);
         let mut i = Interact::new(OWN, (1280, 800));
+        // The sparse use capture has no FullUpdate; these are the ICC retail template factors.
+        i.shop.pricing.insert((MACHINE.kind, MACHINE.instance), (0x3d, 105));
+        i.shop.sell_factors.insert((MACHINE.kind, MACHINE.instance), 4);
         for l in include_str!("../../../../docs/captures/zone_use_object_ithaca.rec").lines() {
             let mut p = l.split(' ');
             let (idx, dir, hex) = (p.next().unwrap().parse::<u32>().unwrap(), p.next().unwrap(), p.next().unwrap());
-            if dir != "<" || !(100825..=100830).contains(&idx) {
-                continue;
-            }
+            if dir != "<" || !(100825..=100830).contains(&idx) { continue; }
             let b: Vec<u8> = (0..hex.len() / 2).map(|k| u8::from_str_radix(&hex[2 * k..2 * k + 2], 16).unwrap()).collect();
             i.on_frame(&mut gui, &Frame::decode_with(&b, false).unwrap().unwrap().0, &z);
         }
@@ -906,6 +1019,88 @@ mod tests {
         assert_eq!(s.stock[2], AcgItem { low_id: 0x419f9, high_id: 0x419f9, level: 150 });
         assert!(i.shop_buy(&mut gui, 35));
         assert_eq!(sent(&mut i), [inventory::move_item_to_inventory(ME.instance, Identity { kind: SHOP_ITEM, instance: 35 }, ANY_BAG_SLOT)]);
+    }
+
+    #[test]
+    fn captured_missing_pricing_resolves_retail_template_before_open() {
+        let Some(mut gui) = rig() else { return };
+        let mut z = Zone::new(OWN);
+        let machine = Identity { kind: VENDING_MACHINE, instance: 100 };
+        let mut captured_machine = false;
+        for l in include_str!("../../../../docs/captures/zone_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            if dir != "<" { continue; }
+            let b: Vec<u8> = (0..hex.len() / 2).map(|k| u8::from_str_radix(&hex[2 * k..2 * k + 2], 16).unwrap()).collect();
+            let frame = Frame::decode_with(&b, false).unwrap().unwrap().0;
+            if let Ok(Message { header, body: N3::World(World::VendingMachine(v)), .. }) = ao_net::n3::decode(&frame) {
+                if header.target == machine {
+                    captured_machine = true;
+                    assert!(v.base.stats.iter().all(|(id, _)| ![0x9c, 0x1aa, 0x1ab].contains(id)));
+                }
+            }
+            z.on_frame(&frame);
+        }
+        assert!(captured_machine);
+        let mut i = Interact::new(OWN, (1280, 800));
+        i.on_trade(&mut gui, Trade { op: trade::START, a: machine, b: SESSION }, ME, &z);
+        assert!(i.shop.shop.is_none(), "defer until effective pricing is ready");
+        z.world.start(ao_gui::client_dir(), OWN as i32);
+        let mut host = ao_render::Host::headless();
+        for _ in 0..600 {
+            z.world.update(0.05, [0.0; 3], [0.0, 0.0, 1.0], &mut host);
+            if z.world.stat_of(machine.kind, machine.instance, 0x1ab).is_some() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (t, who) = i.shop.pending_start.take().expect("deferred start");
+        i.on_trade(&mut gui, t, who, &z);
+        assert!(i.shop.shop.as_ref().unwrap().cash_shop);
+        assert_eq!(gui.text(i.shop.shop.as_ref().unwrap().win, "PartnerName"), "Newcomer's Nano Programs");
+        assert_eq!(i.shop.pricing[&(machine.kind, machine.instance)], (0x3d, 105));
+        assert_eq!(i.shop.sell_factors[&(machine.kind, machine.instance)], 4);
+        i.shop.names.insert((machine.kind, machine.instance), "Streamed machine name".into());
+        i.shop_refresh_pricing(&z, machine);
+        assert_eq!(i.shop.names[&(machine.kind, machine.instance)], "Streamed machine name");
+    }
+
+    #[test]
+    fn captured_parented_npc_shop_opens_without_absolute_position() {
+        let Some(mut gui) = rig() else { return };
+        let own = 0x830e;
+        let machine = Identity { kind: VENDING_MACHINE, instance: 15 };
+        let mut z = Zone::new(own);
+        let mut i = Interact::new(own, (1280, 800));
+        for l in include_str!("../../../../docs/captures/zone_antonio_shop_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            if dir != "<" { continue; }
+            let b: Vec<u8> = (0..hex.len() / 2).map(|k| u8::from_str_radix(&hex[2 * k..2 * k + 2], 16).unwrap()).collect();
+            let frame = Frame::decode_with(&b, false).unwrap().unwrap().0;
+            if let Ok(Message { body: N3::World(World::VendingMachine(v)), .. }) = ao_net::n3::decode(&frame) {
+                assert_eq!(v.base.position, None);
+                assert_eq!(v.base.parent, Identity { kind: 50000, instance: 0xf42fc });
+            }
+            z.on_frame(&frame);
+            i.on_frame(&mut gui, &frame, &z);
+        }
+        assert!(i.shop.shop.is_none());
+        z.world.start(ao_gui::client_dir(), own as i32);
+        let mut host = ao_render::Host::headless();
+        for _ in 0..600 {
+            z.world.update(0.05, [0.0; 3], [0.0, 0.0, 1.0], &mut host);
+            if z.world.stat_of(machine.kind, machine.instance, 0x1ab).is_some() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(z.world.stat_of(machine.kind, machine.instance, 12), Some(6546), "Mesh comes from retail template, not the streamed update");
+        let (t, who) = i.shop.pending_start.take().expect("deferred parented shop");
+        i.on_trade(&mut gui, t, who, &z);
+        let s = i.shop.shop.as_ref().expect("logical shop window");
+        assert!(s.cash_shop);
+        assert_eq!(s.stock.len(), 33);
+        assert_eq!(s.stock[0], AcgItem { low_id: 150922, high_id: 150922, level: 10 });
+        assert_eq!(gui.text(s.win, "PartnerName"), "Vendor Antonio Stacklund");
+        assert_eq!(i.shop.pricing[&(machine.kind, machine.instance)], (0x3d, 105));
+        assert_eq!(i.shop.sell_factors[&(machine.kind, machine.instance)], 4);
     }
 
     /// `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac shop_window_screenshot`: the live machine's 36 items (names are the fake templates').

@@ -33,6 +33,7 @@ pub const INVENTORY_UPDATE: u32 = 0x4E53_6976; // InventoryUpdateIIR_t
 pub const BANK: u32 = 0x343C_287F;
 pub const BANK_CORPSE: u32 = 0x5221_3420;
 pub const DROP_TEMPLATE: u32 = 0x3A24_3F41; // DropTemplateIIR_t
+pub const TEMPLATE_ACTION: u32 = 0x3550_5644; // TemplateActionIIR_t
 /// `MapToKey("ClientMoveItemToInventoryIIR_t")` (string at GC 0x10157380).
 pub const CLIENT_MOVE_ITEM: u32 = 0x5469_373F;
 /// `MapToKey("ClientContainerAddItemIIR_t")` (string at GC 0x10157300).
@@ -60,6 +61,8 @@ pub const KIND_BANK: i32 = 0x69;
 /// container's inventory. Built by `FUN_1007de99` [GC] (the list `N3Msg_GetContainerInventoryList` returns for a chest) and read back by `FUN_1004b80a`,
 /// `FUN_1004a7b3`, `FUN_10048829` (`instance >> 16` as signed short, `& 0xffff`).
 pub const KIND_IN_CONTAINER: i32 = 0x6b;
+/// An item in the character's trade / overflow inventory.
+pub const KIND_TRADE: i32 = 0x6e;
 
 /// The identity of the item in `slot` of the container whose last `InventoryUpdateIIR_t` carried `word` (`FUN_1007de99`).
 pub fn container_item_identity(word: i32, slot: u32) -> Identity {
@@ -202,6 +205,8 @@ pub enum InventoryMsg {
     ContainerAdd { item: Identity, container: Identity, slot: i32 },
     /// `ItemReplacedIIR_c`: the item at `slot` (< 0x40) became `new` (`FUN_1004cf08`; `old` is only compared).
     ItemReplaced { slot: i32, old: AcgItem, new: AcgItem },
+    /// `TemplateActionIIR_t` (GC 1007a424): ACG descriptor, count, action, two identities.
+    TemplateAction { item: AcgItem, count: i32, action: i32, identity_a: Identity, identity_b: Identity },
     /// `InventoryUpdatedIIR_t`: an `i32` the GUI is told about (`FUN_10074e49` emits it on the global inventory signal for the own dynel).
     Updated(i32),
     Update(InventoryUpdate),
@@ -213,16 +218,25 @@ pub enum InventoryMsg {
 
 /// `GameData::operator>>(ACGItem_t)` [GameData 0x1000e9d7], as in [`InventoryEntry`].
 pub(super) fn read_acg(r: &mut Reader) -> Result<AcgItem> {
-    let (low_id, high_id, mut level) = (r.i32()?, r.i32()?, r.i32()?);
-    r.i32()?;
+    Ok(read_acg_count(r)?.0)
+}
+
+fn read_acg_count(r: &mut Reader) -> Result<(AcgItem, i32)> {
+    let (low_id, high_id, mut level, count) = (r.i32()?, r.i32()?, r.i32()?, r.i32()?);
     if level > 0x1ff {
         level &= 0x1ff;
     }
-    Ok(AcgItem { low_id, high_id: if high_id == 0 { low_id } else { high_id }, level })
+    Ok((AcgItem { low_id, high_id: if high_id == 0 { low_id } else { high_id }, level }, count))
 }
 
 pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<InventoryMsg>> {
     Ok(match h.msg_type {
+        TEMPLATE_ACTION => {
+            let (item, count) = read_acg_count(r)?;
+            let (action, identity_a, identity_b) = (r.i32()?, Identity::read(r)?, Identity::read(r)?);
+            ensure!(r.remaining() == 0, "TemplateActionIIR_t: {} trailing bytes", r.remaining());
+            Some(InventoryMsg::TemplateAction { item, count, action, identity_a, identity_b })
+        }
         BANK | BANK_CORPSE => {
             let entries = super::world::read_inventory(r)?;
             let bank = if h.msg_type == BANK { InventoryMsg::Bank(entries) } else { InventoryMsg::Reclaim { entries, instance: r.i32()? } };
@@ -277,6 +291,7 @@ mod tests {
         assert_eq!(message_key("InventoryUpdatedIIR_t"), INVENTORY_UPDATED);
         assert_eq!(message_key("InventoryUpdateIIR_t"), INVENTORY_UPDATE);
         assert_eq!(message_key("DropTemplateIIR_t"), DROP_TEMPLATE);
+        assert_eq!(message_key("TemplateActionIIR_t"), TEMPLATE_ACTION);
     }
 
     #[test]
@@ -318,6 +333,20 @@ mod tests {
     fn parse(b: &[u8]) -> Result<Option<InventoryMsg>> {
         let (h, mut r) = N3Header::parse(b)?;
         decode(&h, &mut r)
+    }
+
+    #[test]
+    fn template_action_decodes_captured_shop_item_and_rejects_truncation() {
+        let b = hex("35505644 0000c350 0000830e 00 0003551b 0003551b 00000001 00000001 00000057 0000006e 00000000 00000000 00000000");
+        assert_eq!(parse(&b).unwrap(), Some(InventoryMsg::TemplateAction {
+            item: AcgItem { low_id: 218395, high_id: 218395, level: 1 },
+            count: 1,
+            action: 0x57,
+            identity_a: Identity { kind: KIND_TRADE, instance: 0 },
+            identity_b: Identity::default(),
+        }));
+        for n in 13..b.len() { assert!(parse(&b[..n]).is_err()); }
+        assert!(parse(&[b, vec![0]].concat()).is_err());
     }
 
     #[test]

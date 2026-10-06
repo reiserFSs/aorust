@@ -161,3 +161,49 @@ fn vending_machine_stock_and_trade_start() {
     assert_eq!((items[2].low_id, items[2].level), (0x419f9, 150));
     assert_eq!(starts, [(own, Trade { op: 0, a: machine, b: session }), (machine, Trade { op: 0, a: own, b: session })]);
 }
+
+/// Antonio's cart uses a vending dynel parented to the NPC, not an NPC trade.
+#[test]
+fn antonio_cart_is_parented_vending_shop() {
+    use ao_net::n3::world::World;
+    let frames = load(include_str!("../../../docs/captures/zone_antonio_shop_ithaca.rec"));
+    let machine = Identity { kind: 0xc75b, instance: 15 };
+    let own = Identity { kind: 50000, instance: 33550 };
+    let session = Identity { kind: 0xc767, instance: 0x116f7e02 };
+    let first = n3::decode(&frames[0].2).unwrap();
+    let N3::World(World::VendingMachine(v)) = first.body else { panic!("vending update") };
+    assert_eq!(first.header.target, machine);
+    assert_eq!(v.base.parent, Identity { kind: 50000, instance: 1000188 });
+    assert_eq!(v.base.position, None);
+    assert!(v.base.stats.contains(&(23, 248368)));
+    assert!(v.base.stats.iter().all(|(stat, _)| ![12, 156, 426, 427].contains(stat)));
+    let stock = n3::decode(&frames[1].2).unwrap();
+    let N3::Shop(s) = stock.body else { panic!("stock") };
+    assert_eq!(s.items.len(), 33);
+    assert_eq!(s.encode(machine), frames[1].2.payload);
+    for (frame, target, partner) in [(&frames[2].2, own, machine), (&frames[3].2, machine, own)] {
+        let msg = n3::decode(frame).unwrap();
+        assert_eq!(msg.header.target, target);
+        assert_eq!(msg.body, N3::Trade(Trade { op: 0, a: partner, b: session }));
+    }
+}
+
+#[test]
+fn cash_purchase_creates_then_transfers_real_trade_item_before_completion() {
+    use ao_net::n3::dynel::Dynel;
+    use ao_net::n3::world::AcgItem;
+    let own = Identity { kind: 50000, instance: 33550 };
+    let frames = load(include_str!("../../../docs/captures/zone_shop_cash_purchase_ithaca.rec"));
+    let messages: Vec<_> = frames.iter().map(|(_, _, f)| n3::decode(f).unwrap()).collect();
+    assert_eq!(messages[6].header.target, own);
+    assert_eq!(messages[6].body, N3::Inventory(InventoryMsg::TemplateAction {
+        item: AcgItem { low_id: 218395, high_id: 218395, level: 1 }, count: 1, action: 0x57,
+        identity_a: Identity { kind: 0x6e, instance: 0 }, identity_b: Identity { kind: 0, instance: 0 },
+    }));
+    assert_eq!(messages[7].body, N3::Inventory(InventoryMsg::ContainerAdd {
+        item: Identity { kind: 0x6e, instance: 0 }, container: Identity { kind: 0x6e, instance: own.instance }, slot: inventory::ANY_BAG_SLOT,
+    }));
+    assert!(matches!(messages[8].body, N3::Trade(Trade { op: 4, .. })));
+    let N3::Dynel(Dynel::Stat(s)) = &messages[10].body else { panic!("cash update") };
+    assert_eq!(s.stats, [(61, 743)]);
+}
