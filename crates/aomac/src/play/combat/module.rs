@@ -188,6 +188,12 @@ impl Module {
         std::mem::take(&mut self.anims)
     }
 
+    /// The own character is dead (`CharacterAction` 99 seen, not resurrected yet): the live harness ends a `goto` with it.
+    #[cfg(test)]
+    pub fn is_dying(&self) -> bool {
+        self.dying.is_some()
+    }
+
     /// Animation id of the own death: `CharacterAction` 99's `identity_b.instance` (stat 0x183), [`DEFAULT_DEATH_ANIM`] when the server sent none.
     pub fn death_anim(&self) -> u16 {
         self.dying.as_ref().map_or(DEFAULT_DEATH_ANIM, |d| d.anim)

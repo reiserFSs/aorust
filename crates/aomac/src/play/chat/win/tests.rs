@@ -138,6 +138,19 @@ fn sample(gui: &mut Gui, ch: &mut ChatWindows) {
     ch.push(gui, &ChatLine::new(ChatKind::Other("CCMeGotHealthColor"), "You were healed for 40 points."), Some("Me got health"));
 }
 
+/// A `FUN_1009b37f` line (`<div><font color=NAME>text</font></div>`: the camp / teleport / command feedback lines) is appended as it is: no `(HH:MM)` stamp of its
+/// own on a row above the text (the second `<div>` of the old double wrap), the plain lines keep theirs.
+#[test]
+fn finished_lines_get_no_second_wrapper_or_stamp() {
+    let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };
+    let done = ChatLine::new(ChatKind::System, crate::play::chat::log::window_html("CCRed", "Timed logout started. This will take 30 seconds."));
+    ch.push(&mut gui, &done, Some("System"));
+    ch.push(&mut gui, &ChatLine::new(ChatKind::System, "plain line"), None);
+    let lines: Vec<String> = ch.wins[0].lines.iter().cloned().collect();
+    assert_eq!(lines[lines.len() - 2], done.text);
+    assert!(lines[lines.len() - 1].contains("(") && lines[lines.len() - 1].ends_with("plain line</font></div>"), "{lines:?}");
+}
+
 #[test]
 fn windows_route_and_fade() {
     let Some((mut gui, mut ch)) = rig((1280, 800)) else { return };

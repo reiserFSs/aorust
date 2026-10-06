@@ -314,7 +314,10 @@ impl ChatWindows {
             ChatKind::TellOut => (G_TELL, line.kind.color_name().to_string()),
             ChatKind::Other(c) => (group_hint.and_then(by_name).unwrap_or(G_SYSTEM), c.to_string()),
         };
-        self.deliver(gui, group, |stamp| format!("<div indent=wrapped><font color={color}>{stamp}{}</font></div>", line.text));
+        // a line that is already `FUN_1009b37f`'s `<div><font color=NAME>text</font></div>` (docs/chat/log.md §1: no stamp, no second wrapper, a nested
+        // `<div>` would put the stamp on a row of its own) goes in as it is
+        let done = line.text.starts_with("<div>");
+        self.deliver(gui, group, |stamp| if done { line.text.clone() } else { format!("<div indent=wrapped><font color={color}>{stamp}{}</font></div>", line.text) });
     }
 
     /// The event comes from one of the chat windows (the app must not handle it again).

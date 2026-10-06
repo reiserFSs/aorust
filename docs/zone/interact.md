@@ -414,6 +414,7 @@ Captures (login traffic excluded): `docs/captures/zone_npc_dialogue_ithaca.rec`,
 * Vending machine (0xC75B): echo, then `ShopUpdateIIR_t` (key 58362220, 36 items) and a `TradeIIR_t` **op 0** (START, not op 2: version word `00000002`, op byte `00`) pair: header = own, `a` = the machine, `b` = `{0xC767, 0x116f7753}` (a session identity); then header = the machine, `a` = own, the same `b` (buy UI: section 13).
 * Corpse (0xC76A, "Remains of Uncle Pumpkin-Head"): echo + `InventoryUpdateIIR_t` (flag set) -> loot window (screenshot checked). The first double click sent `MoveItemToInventory({0x6a, cell}, any)`; the server ignored it, as it
   did `{0x6a,1}`, `{0xC76A,0}` and the entry id, also on our own kill (`zone_loot_own_kill_ithaca.rec`). The identity the original client builds is `{0x6b, update word << 16 | slot}` (section 9, step 4) [UNRESOLVED-live until re-run].
+* Borealis exit (movement.md §4.2): the door prop 0xC748 at (684, 74, 534) is a zone line to pf 790 "Stret West Bank" (walking into it), its gate door at (1273, 1, 2887) leads back; no Grid window opened.
 * Grid terminal / whompah: none in pf 4582/4833/800, `GridDestinationSelect` never received [UNRESOLVED-live]. Player trade needs a second player [UNRESOLVED-live].
 
 ## 13. Vending machines / shops

@@ -21,6 +21,9 @@ N3 IIR apply (AttackInfo, Missed, ...)  ->  FUN_10012bd5 [GC 0x10012bd5]  "comba
                                                                + "</font>" + "</div>"   -> appended to the window
 ```
 
+[LIVE fix] A `ChatLine` built with [`window_html`] (camp / teleport / feedback lines) is final: `win::ChatWindows::push` appends it as it is. It used to wrap it in a second `<div indent=wrapped><font>` with the window's `(HH:MM)` stamp, which
+put the stamp on a row of its own above the red text (seen live on the camp line and the teleport lines). Plain `ChatLine` texts (combat lines of `log.rs`) still get the wrapper.
+
 No timestamp, no "[class]" prefix and no link markup is added on this path (the `(%H:%M) ` stamp and `user://` links belong to
 `FUN_1009b4cf` [GUI 0x1009b4cf], the player-chat line builder). `ChatLine.text` produced by `log.rs` is the text *before* `ExpandChatTextArgs`;
 `ChatLine.kind = ChatKind::Other(NAME)` with NAME from `ColorCode` (`color_name`); **NAME is `""` for code 0 = no `<font>` at all**.

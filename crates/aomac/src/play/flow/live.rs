@@ -156,12 +156,34 @@ impl Pilot {
     }
 }
 
+/// Deep-water ground points around the server position `pos` (liquid surface >= 1.19 m above the ground: `Collision::ground` is never below
+/// level - 1.2, that is deep enough to swim), nearest first: `(distance, x, ground y, server z)`. A 151 x 151 lattice, 4 m apart or coarser for
+/// a larger `radius`. The collision space has the z axis flipped (`player::to_col`).
+fn deep_water(col: &ao_formats::playfield::collision::Collision, pos: [f32; 3], radius: f32) -> Vec<(f32, f32, f32, f32)> {
+    let step = (radius / 75.0).max(4.0);
+    let mut found = vec![];
+    for ix in -75..=75 {
+        for iz in -75..=75 {
+            let (x, z) = (pos[0] + ix as f32 * step, pos[2] + iz as f32 * step);
+            let Some(g) = col.ground([x, pos[1] + 50.0, -z]) else { continue };
+            if col.liquid_at([x, g, -z]).is_some_and(|w| w.level - g >= 1.19) {
+                found.push((((x - pos[0]).powi(2) + (z - pos[2]).powi(2)).sqrt(), x, g, z));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    found
+}
+
 /// Axis-aligned route over the 0.5 m cells the collision lets the character (`Collision::walk`) cross (server x, z): `(x, z)` waypoints.
-pub(super) fn route(c: &ao_formats::playfield::collision::Collision, from: [f32; 3], to: (f32, f32)) -> Vec<(f32, f32)> {
+/// `avoid` = hostile NPC positions: cells within `avoid_radius` metres of one are not crossed (except the neighbourhood of the start), so a walk past a
+/// camp does not wake it.
+pub(super) fn route(c: &ao_formats::playfield::collision::Collision, from: [f32; 3], to: (f32, f32), avoid: &[(f32, f32)], avoid_radius: f32) -> Vec<(f32, f32)> {
     use std::collections::{HashMap, VecDeque};
     let cell = 0.5f32;
     let at = |x: f32, z: f32| ((x / cell).round() as i32, (z / cell).round() as i32);
     let (start, goal) = (at(from[0], from[2]), at(to.0, to.1));
+    let direct = ((from[0] - to.0).powi(2) + (from[2] - to.1).powi(2)).sqrt();
     // Breadth first over the lattice; `fall` also accepts stepping off a ledge (down at most 12 m) when no walkable route reaches the goal
     // (a character standing on an isolated ledge can only leave it that way).
     let search = |fall: bool| {
@@ -178,7 +200,13 @@ pub(super) fn route(c: &ao_formats::playfield::collision::Collision, from: [f32;
                 let a = here[&n];
                 let b = [m.0 as f32 * cell, a[1], -(m.1 as f32 * cell)];
                 let Some(g) = c.ground(b) else { continue };
-                if prev.contains_key(&m) {
+                let near = |p: &(f32, f32), r: f32| (p.0 - b[0]).powi(2) + (p.1 + b[2]).powi(2) < r * r;
+                // an unreachable goal (a closed door) must not flood the whole playfield: stay inside an ellipse around start and goal
+                let d = |p: (f32, f32)| ((p.0 - b[0]).powi(2) + (p.1 + b[2]).powi(2)).sqrt();
+                if d((from[0], from[2])) + d(to) > 1.6 * direct + 40.0 {
+                    continue;
+                }
+                if prev.contains_key(&m) || (avoid.iter().any(|p| near(p, avoid_radius)) && !near(&(from[0], from[2]), 10.0)) {
                     continue;
                 }
                 let mut p = a;
@@ -310,9 +338,11 @@ fn live_walk() {
     l.until("character list", 60, |p| p.screen == Screen::CharSelect);
     let cw = l.p.char_w.unwrap();
     // `AOMAC_LIVE_CC=<name>`: New Character, then the four scenes with real clicks at window coordinates (the offline `create::shots` ones: Atrox,
-    // Tall/Heavy/head arrow, Soldier, the name typed), a `cc-<scene>` shot each (`AOMAC_LIVE_SHOTS`), nothing is sent; the close button's exit
-    // dialog is answered No and the session ends. The intro runs as in the game (`AOMAC_CC_SKIP_INTRO=1` skips it).
-    if let Ok(name) = std::env::var("AOMAC_LIVE_CC") {
+    // Tall/Heavy/head arrow, Soldier, the name typed), a `cc-<scene>` shot each (`AOMAC_LIVE_SHOTS`), Next on the first three and Finish on the
+    // name scene: the request goes to the login server for real (a NEW character, announce it), `CharacterCreated` + `ZoneHandoff` take the app
+    // through the exit cinematic into the world and `AOMAC_LIVE_STEPS` run there. The intro runs as in the game (`AOMAC_CC_SKIP_INTRO=1` skips it).
+    let cc_name = std::env::var("AOMAC_LIVE_CC").ok();
+    if let Some(name) = &cc_name {
         l.p.handle(Event::Clicked { window: cw, view: "create_btn".into(), item: None }, &mut l.o.host);
         let click = |l: &mut Live, x: f32, y: f32| {
             l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
@@ -338,19 +368,14 @@ fn live_walk() {
             }
             l.wait(1.5);
             l.shot(&format!("cc-{scene}"));
-            if scene < 3 {
-                click(&mut l, 1170.0, 760.0); // Next
-            }
+            click(&mut l, 1170.0, 760.0); // Next / Finish
         }
-        click(&mut l, 1247.0, 38.0); // close: AskExitMessage
-        l.shot("cc-exit-dialog");
-        l.p.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, mods: Default::default() }, &mut l.o.host);
-        l.wait(0.5);
-        return;
     }
     // `AOMAC_LIVE_NEW=<name>:<CC breed 1..7>:<CC profession 1..14>`: New Character, the creation module sends its request (no scene clicks),
     // the login server's `CharacterCreated` + `ZoneHandoff` take the app into the world
-    if let Ok(spec) = std::env::var("AOMAC_LIVE_NEW") {
+    if cc_name.is_some() {
+        // the creation module's Finish click sent the request: wait for the zone hand-off below
+    } else if let Ok(spec) = std::env::var("AOMAC_LIVE_NEW") {
         let mut it = spec.split(':');
         let (name, breed, prof) = (it.next().unwrap().to_string(), it.next().unwrap().parse().unwrap(), it.next().unwrap().parse().unwrap());
         l.p.handle(Event::Clicked { window: cw, view: "create_btn".into(), item: None }, &mut l.o.host);
@@ -433,6 +458,13 @@ fn live_walk() {
             }
             // chat: `say=<line>` runs the line as if typed in the chat bar (`/say hi`, `/g Global hi`, `/tell X hi`; a line without a leading `/` is dropped by `run_line`)
             "chatdrop" => l.p.chat.as_ref().expect("chat hub").drop_connection(),
+            // `login`: wait for the camp (`say=/camp`: the 40 s `Logout` timer) to end in the login screen; prints the open window count (the
+            // chat / interact / target layers are torn down by `show_login`)
+            "login" => {
+                l.until("login screen after camp", 120, |p| p.screen == Screen::Login);
+                l.wait(1.0);
+                eprintln!("login screen: {} gui windows, chat layer {}, session {}", l.p.gui.window_ids().len(), l.p.chat.is_some(), l.p.session.is_some());
+            }
             "say" => {
                 let p = &mut l.p;
                 p.chat.as_mut().expect("chat hub").run_line(&mut p.gui, v, &p.zone, &p.text);
@@ -482,22 +514,12 @@ fn live_walk() {
                 let m = l.p.fight.as_ref().unwrap();
                 eprintln!("fight: attacking={} numbers={:?}", m.attacking(), m.numbers().iter().map(|n| n.text.as_str()).collect::<Vec<_>>());
             }
-            // `water`: the nearest deep-water ground points (liquid surface > 0.5 m above the ground) within 300 m, for `goto=x:z` (swimming runs)
+            // `water`: the nearest deep-water ground points (liquid surface >= 1.19 m above the ground: `Collision::ground` is never below level - 1.2, that is deep enough to swim) within 300 m, for `goto=x:z` (swimming runs)
             "water" => {
                 let pos = l.p.zone.own().unwrap().pos;
                 let col = ao_formats::playfield::collision::Collision::load(&ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap(), l.p.zone.playfield.unwrap()).unwrap();
-                let mut found = vec![];
-                for ix in -75..=75 {
-                    for iz in -75..=75 {
-                        let (x, z) = (pos[0] + ix as f32 * 4.0, pos[2] + iz as f32 * 4.0);
-                        let Some(g) = col.ground([x, pos[1] + 50.0, z]) else { continue };
-                        if col.liquid_at([x, g, z]).is_some_and(|w| w.level - g > 0.5) {
-                            found.push((((x - pos[0]).powi(2) + (z - pos[2]).powi(2)).sqrt(), x, g, z));
-                        }
-                    }
-                }
-                found.sort_by(|a, b| a.0.total_cmp(&b.0));
-                eprintln!("water: {} cells; nearest {:?}", found.len(), &found[..found.len().min(5)]);
+                let found = deep_water(&col, pos, v.parse().unwrap_or(300.0));
+                eprintln!("water: {} cells; nearest (dist, x, ground, server z) {:?}", found.len(), &found[..found.len().min(5)]);
             }
             "goto" => {
                 // autopilot along a collision route: W/S/C/Z by the offset to the next waypoint (the heading stays put)
@@ -526,7 +548,10 @@ fn live_walk() {
                 };
                 let (x, z) = v.split_once(':').unwrap();
                 let col = ao_formats::playfield::collision::Collision::load(&ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap(), l.p.zone.playfield.unwrap()).unwrap();
-                let path = route(&col, l.p.zone.own().unwrap().pos, (x.parse().unwrap(), z.parse().unwrap()));
+                // `AOMAC_LIVE_AVOID=<metres>` (e.g. 15): `goto` walks around living hostile NPCs (side 3) of the dynel list by that distance
+                let avoid_radius: f32 = std::env::var("AOMAC_LIVE_AVOID").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                let avoid: Vec<(f32, f32)> = if avoid_radius > 0.0 { l.p.zone.dynels.values().filter(|d| d.npc && d.side == 3 && d.health > 0).map(|d| (d.pos[0], d.pos[2])).collect() } else { vec![] };
+                let path = route(&col, l.p.zone.own().unwrap().pos, (x.parse().unwrap(), z.parse().unwrap()), &avoid, avoid_radius);
                 eprintln!("route of {} cells", path.len());
                 let (route_len, pf0) = (path.len(), l.p.zone.playfield);
                 let mut pilot = Pilot::new(path);
@@ -543,7 +568,12 @@ fn live_walk() {
                             l.shot(&format!("goto{logs}"));
                         }
                     }
-                    if pilot.step(&mut l.p, &mut l.o.host) || t.elapsed().as_secs() > 240 || l.p.zone.playfield != pf0 {
+                    // dying on the way (hostiles on the route) ends the walk: the server respawns the character at the playfield start
+                    let died = l.p.fight.as_ref().is_some_and(|m| m.is_dying());
+                    if died {
+                        eprintln!("goto: the own character died at {}", l.pos());
+                    }
+                    if died || pilot.step(&mut l.p, &mut l.o.host) || t.elapsed().as_secs() > 240 || l.p.zone.playfield != pf0 {
                         break;
                     }
                 }
@@ -921,5 +951,19 @@ mod pilot_tests {
     fn one_cell_route_starts_at_the_last_cell() {
         assert_eq!(Pilot::new(vec![(1.0, 2.0)]).idx(), 0);
         assert_eq!(Pilot::new(vec![(1.0, 2.0), (2.0, 2.0), (3.0, 2.0)]).idx(), 1);
+    }
+}
+
+#[cfg(test)]
+mod water_tests {
+    /// The deep-water scan is in server coordinates (collision z flipped): Borealis' lake is where the swimming `goto` of the live runs expects it.
+    #[test]
+    fn borealis_lake_is_found_in_server_coordinates() {
+        let Ok(store) = ao_rdb::RecordStore::open(&ao_gui::client_dir()) else { return };
+        let Ok(col) = ao_formats::playfield::collision::Collision::load(&store, 800) else { return };
+        let found = super::deep_water(&col, [679.6, 72.8, 476.7], 700.0);
+        let n = found.first().expect("deep water within 700 m");
+        assert!(col.liquid_at([n.1, n.2, -n.3]).is_some_and(|w| w.level - n.2 >= 1.19), "{n:?}");
+        eprintln!("nearest deep water of Borealis: {n:?}");
     }
 }

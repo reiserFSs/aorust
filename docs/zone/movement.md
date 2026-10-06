@@ -157,6 +157,28 @@ Order of events inside (all must hold, otherwise nothing happens, **nothing is s
   entering a new zone a sync is sent**. It bypasses the permission checks of `N3Msg_MovementChanged`. (Also computes `VisualEnvFX_t::DisplaySyncPosition`.)
 * No other sender: `StartTeleportTry`, `EndCameraMouseLook` call `MovementChanged(0x16,…)` (outgoing.md §5.1).
 
+### 4.1 [LIVE] A same-playfield `ZoneRedirection` in the middle of a walk is the death respawn, not a movement rejection
+`AOMAC_NET_TRACE` of the Borealis `goto` walk (Aomacvolk, 1661-cell route; capture excerpt `docs/captures/zone_walk_death_borealis.rec`, test
+`ao-net/tests/walk_death_capture.rs`): ~218 s in, around (716, 32, 355) after 478 route cells, the session got "Locating next playfield server.", an `n3TeleportIIR_t`
+with a playfield proxy, "Located.", "NEW LOC: 679.6 72.8 476.7" and `ZoneRedirection` to the same zone server, then `CharInPlay` at the playfield start.
+Reading the frames before it: the hostile camp on the route (`FollowTarget` + `AttackIIR_t` / `StopFightIIR_t` from hostile dynels such as the Rollerrat 1003039) engaged the
+unarmed lvl 2 walker (4/40 HP after the previous respawn), `CharacterAction` 99 (`Died`) arrived 2.46 s before the redirection (the death flow of `docs/zone/combat.md`).
+Our `CharDCMove` stream (736 frames over the session) is within the client's rules:
+* only move ids 1..8 (forward / back / strafe / turn start+stop) and 0x16; elapsed-ms is the truncated gap, `look` = (0, 0), positions advance <= 13 m/s (no teleport-like step);
+* the 0x16 syncs (6 in the session) are the `FUN_1005a5d6` zone-border syncs two frames after `GetZoneInstanceID` changed (§4), never the 5 s idle sync (the walker sends
+  a start/stop pair every 0.1-0.4 s: the harness autopilot toggles W; a real player sends one per key change);
+* the only `n3TeleportIIR_t` of the whole session is the one of the respawn: the server never corrected a position.
+The speed/teleport/terrain-height checks are therefore not the cause; the walk simply has to avoid hostiles (`AOMAC_LIVE_AVOID=1` makes `goto` route around living
+side-3 NPCs by the given metres) and the harness now ends a `goto` when the own character dies (`Module::is_dying`).
+
+### 4.2 [LIVE] Zone line, swimming (Aomacvolk, Borealis pf 800, 2026-10-06)
+* **Borealis exit** (no whompah / Grid terminal in pf 800, as in 4582 / 4833): walking into the door prop 0xC748 at (684, 74, 534) (placed doors carry no destination: the zone
+  lines are the server's) gave "Locating next playfield server." + `n3TeleportIIR_t` + `ZoneRedirection` to **pf 790 "Stret West Bank"** at (1277.05, 0.12, 2891.71) (`NEW LOC` line). Walking
+  back into the "BOREALIS" gate door at (1273, 1, 2887) returned to pf 800 at (681.5, 72.8, 530.7). Both redirections kept the zone server (199.241.136.157:8502).
+* **Swimming**: the nearest deep water by a walkable route is the lake at (773, 8.8, 589) (the plateau's south-east foot; the nearer pools at (592, 89, 521) / (592, 59, 565) are not
+  reachable by the collision route). A 576-cell `goto` (`AOMAC_LIVE_AVOID=8`, around the Pumpkin-Head line) ended with the FSM in **mode 4 (Swim)** at y 9.99 (surface 10.0): the avatar holds the IdleSwim clip (0xc3, arms out, shot inspected; night 20:49 RKT, so the shot is dark).
+  The earlier harness `water` scan mixed the server and the collision z axis (`player::to_col` negates z) and pointed `goto=400:-147` at the wrong place; fixed with a test.
+
 ## 5. Mouse look (`N3Msg_MouseMovement(dx, dy)` [GC 0x1964b], `N3Msg_EndMouseMovement` [GC 0x19a38])
 
 * First event (`DAT_102e2588 == 0`): a key turn in progress is converted: left turn (dir 3, turn rate ≠ 0) → `MovementChanged(0xE)` then `(7)`; right → `(0xB)` then `(5)`. Then

@@ -297,7 +297,7 @@ fn autopilot_crosses_the_arrival_hall() {
     r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
     r.enter();
     let col = ao_formats::playfield::collision::Collision::load(&ao_rdb::RecordStore::open(&ao_gui::client_dir()).unwrap(), 4604).unwrap();
-    let path = live::route(&col, r.p.zone.own().unwrap().pos, (193.0, 157.0));
+    let path = live::route(&col, r.p.zone.own().unwrap().pos, (193.0, 157.0), &[], 0.0);
     eprintln!("path {} {:?}", path.len(), &path[..path.len().min(12)]);
     let mut pilot = live::Pilot::new(path);
     let mut frames = 0;
