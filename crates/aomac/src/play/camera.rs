@@ -619,7 +619,8 @@ impl Camera3p {
                     self.blind_time += dt;
                 }
                 if self.blind_time > BLIND_CUT_AFTER {
-                    self.vehicle.cut_on_axis(pivot, fwd, clear);
+                    let facing = Vec3::new(avatar_yaw.sin(), 0.0, -avatar_yaw.cos()); // the look target's rotation x `cReferenceForward`
+                    self.vehicle.cut_on_axis(pivot, facing, clear);
                     self.blind_time = 0.0;
                 }
                 match self.views.as_ref().and_then(Views::selected) {
