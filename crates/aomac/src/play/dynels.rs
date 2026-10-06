@@ -14,7 +14,7 @@ use ao_gui::Gui;
 use ao_net::n3::dynel::{Dynel, SimpleCharFullUpdate};
 use ao_net::n3::misc::Misc;
 use ao_net::n3::motion::{max_speed, AnimState, Mode, Mover, STAT_HEALTH};
-use ao_net::n3::nametag::{name_tag, name_tag_color, NameTag, NameTagInput, INVALID_STAT};
+use ao_net::n3::nametag::{health_bar_fill_px, name_tag, nametag_listed, selection_indicator_exists, tag_anchor_visible, IndicatorKind, NameTagInput, INVALID_STAT};
 use ao_net::n3::world::World;
 use ao_net::n3::{Message, N3};
 use ao_rdb::RecordStore;
@@ -27,6 +27,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use super::combat::anim as canim;
+use super::tags::{Indicator, Listing, Tag, TagLayer};
 use super::zone::{scene_pos, scene_yaw};
 
 /// Identity kind of character / NPC dynels (`SimpleChar_t`).
@@ -955,43 +956,72 @@ impl Dynels {
         self.worker = Some(worker);
     }
 
-    /// `ShowAllNames` tags (docs/zone/motion.md §6): the name of every dynel within [`NAME_TAG_RADIUS`] of the player, projected
-    /// above its head. `own_pos` = the player's scene position, `cam` the render camera, `size` the window in GUI pixels.
-    pub fn name_tags(&mut self, gui: &mut Gui, cam: &Camera, size: (u32, u32), own_pos: [f32; 3], list: &mut DrawList) {
+    /// The tag of `id` for `kind` (`FUN_10024e14` text and colours, `FUN_10024d5b` position): the text of [`name_tag`], centred on the head
+    /// anchor (`GetIndicatorPosition`: attractor 0 + 0.5 m, scaled with the dynel); `None` while the dynel has no model, or its anchor
+    /// fails the `x > 0` test of `FUN_10024d5b`. `bar` = health bar inputs `((health, max), colour)`.
+    fn tag_of(&self, id: i32, kind: IndicatorKind, bar: Option<((i32, i32), u32)>) -> Option<Tag> {
+        let c = self.chars.get(&id)?;
+        let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return None };
+        if !tag_anchor_visible(c.pose.pos[0]) {
+            return None;
+        }
+        let t = name_tag(&NameTagInput { name: &c.name, is_npc: c.npc, flags: c.flags, features: INVALID_STAT, visual_flags: c.visual_flags, side: c.side as i32, ..Default::default() });
+        let p = scene_pos(c.pose.pos);
+        Some(Tag {
+            id,
+            kind,
+            rgb: t.rgb(),
+            text: t.text,
+            org: t.org,
+            bar: bar.map(|((health, max), rgb)| (health_bar_fill_px(health, max), rgb)),
+            centre: [p[0], p[1] + built.tag_height * c.scale, p[2]],
+        })
+    }
+
+    /// The world-space tags of this frame (docs/zone/motion.md §6): the selection / attack `indicators` (the selection one only when the
+    /// target's `Flags` bit 0x400 is clear), then — with `ShowAllNames` — the nametag set: every character except the client character
+    /// within [`NAME_TAG_RADIUS`] of `own_pos` at the last 2 s rebuild (`HandleNametags`), except the dynels that carry an indicator,
+    /// nearest first.
+    fn collect_tags(&mut self, dt: f32, own_pos: [f32; 3], indicators: &[Indicator]) -> Vec<Tag> {
+        let mut tags: Vec<Tag> = indicators
+            .iter()
+            .filter(|i| i.kind != IndicatorKind::Selection || self.chars.get(&i.id).is_some_and(|c| selection_indicator_exists(c.flags)))
+            .filter_map(|i| self.tag_of(i.id, i.kind, i.bar))
+            .collect();
         if !self.show_all_names {
-            return;
+            self.listing.clear();
+            return tags;
         }
-        let (w, h) = (size.0 as f32, size.1.max(1) as f32);
-        let (fwd, right, up) = (cam.forward(), cam.right(), cam.up());
-        let tan = (self.lens.vertical_fov(w / h) * 0.5).tan();
-        for (id, c) in &self.chars {
-            if *id == self.own {
-                continue;
-            }
-            let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { continue };
+        let (chars, models, own) = (&self.chars, &self.models, self.own);
+        let dist2 = |c: &Char| {
             let p = scene_pos(c.pose.pos);
-            if (0..3).map(|i| (p[i] - own_pos[i]).powi(2)).sum::<f32>() > NAME_TAG_RADIUS * NAME_TAG_RADIUS {
-                continue;
-            }
-            let d = ao_render::Vec3::new(p[0], p[1] + built.tag_height * c.scale, p[2]) - cam.pos;
-            let z = d.dot(fwd);
-            if z < 0.3 {
-                continue;
-            }
-            let (x, y) = ((0.5 + 0.5 * d.dot(right) / (z * tan * w / h)) * w, (0.5 - 0.5 * d.dot(up) / (z * tan)) * h);
-            let tag = name_tag(&NameTagInput {
-                name: &c.name,
-                is_npc: c.npc,
-                flags: c.flags,
-                features: INVALID_STAT,
-                visual_flags: c.visual_flags,
-                side: c.side as i32,
-                ..Default::default()
-            });
-            let [r, g, b, _] = name_tag_color(&tag);
-            let (tw, fh) = (gui.text_width(FontId::Shell, &tag.text), gui.font_height(FontId::Shell));
-            gui.text_cmds(FontId::Shell, &tag.text, x as i32 - tw / 2, y as i32 - fh, u32::from_be_bytes([0, r, g, b]), 1.0, list);
-        }
+            (0..3).map(|i| (p[i] - own_pos[i]).powi(2)).sum::<f32>()
+        };
+        let with_indicator: HashSet<i32> = tags.iter().map(|t| t.id).collect();
+        let marked = |id: i32| with_indicator.contains(&id);
+        let listed = self.listing.update(
+            dt,
+            || {
+                let near = |c: &Char| dist2(c) <= NAME_TAG_RADIUS * NAME_TAG_RADIUS;
+                let ok = |c: &Char| match models.get(&c.key) {
+                    Some(Model::Ready { built, .. }) => nametag_listed(built.features),
+                    _ => true,
+                };
+                chars.iter().filter(|(id, c)| **id != own && !marked(**id) && near(c) && ok(c)).map(|(id, _)| *id).collect()
+            },
+            |id| chars.contains_key(&id),
+        );
+        let mut ids: Vec<(f32, i32)> = listed.iter().filter(|id| !marked(**id)).filter_map(|id| Some((dist2(chars.get(id)?), *id))).collect();
+        ids.sort_by(|a, b| a.0.total_cmp(&b.0));
+        tags.extend(ids.into_iter().filter_map(|(_, id)| self.tag_of(id, IndicatorKind::Nametag, None)));
+        tags
+    }
+
+    /// Adds the world-space tags of this frame to `host` (docs/zone/motion.md §6, `play/tags.rs`): `own_pos` = the player's scene
+    /// position, `indicators` from [`super::tags::indicators`].
+    pub fn name_tags(&mut self, dt: f32, gui: &mut Gui, host: &mut Host, own_pos: [f32; 3], indicators: &[Indicator]) {
+        let tags = self.collect_tags(dt, own_pos, indicators);
+        self.tags.frame(gui, host, &tags);
     }
 
     /// Screen position (GUI pixels) of the point `rise` metres above the head anchor of `id` (floating combat numbers rise 0.4 m/s,
@@ -1008,24 +1038,6 @@ impl Dynels {
             return None;
         }
         Some(((0.5 + 0.5 * d.dot(cam.right()) / (z * tan * w / h)) * w, (0.5 - 0.5 * d.dot(cam.up()) / (z * tan)) * h))
-    }
-
-    /// Where the selection indicator (`Indicator_t`, docs/gui.md §13.2) of `id` goes: the head anchor of [`Self::name_tags`]
-    /// projected to GUI pixels, and the tag line the indicator prints. `None` while the dynel has no model yet or is behind the camera.
-    pub fn indicator_anchor(&self, id: i32, cam: &Camera, size: (u32, u32)) -> Option<(f32, f32, NameTag)> {
-        let c = self.chars.get(&id)?;
-        let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return None };
-        let p = scene_pos(c.pose.pos);
-        let (w, h) = (size.0 as f32, size.1.max(1) as f32);
-        let tan = (self.lens.vertical_fov(w / h) * 0.5).tan();
-        let d = ao_render::Vec3::new(p[0], p[1] + built.tag_height * c.scale, p[2]) - cam.pos;
-        let z = d.dot(cam.forward());
-        if z < 0.3 {
-            return None;
-        }
-        let (x, y) = ((0.5 + 0.5 * d.dot(cam.right()) / (z * tan * w / h)) * w, (0.5 - 0.5 * d.dot(cam.up()) / (z * tan)) * h);
-        let tag = name_tag(&NameTagInput { name: &c.name, is_npc: c.npc, flags: c.flags, features: INVALID_STAT, visual_flags: c.visual_flags, side: c.side as i32, ..Default::default() });
-        Some((x, y, tag))
     }
 }
 
@@ -1097,6 +1109,50 @@ mod tests {
         eprintln!("{} models ready, {failed} failed, {} actors, {} props", models.len(), actors.len(), z.world.props.len());
         assert!(!actors.is_empty());
         if let Ok(out) = std::env::var("AOMAC_DYNEL_SHOT") {
+    #[test]
+    fn tags_follow_the_original_rules() {
+        let mut z = Zone::new(25988);
+        for f in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            z.on_frame(&f);
+        }
+        let own_pos = scene_pos(z.own().unwrap().pos);
+        let w = &mut z.world;
+        for k in w.chars.values().map(|c| c.key).collect::<Vec<_>>() {
+            w.models.insert(k, Model::Ready { built: plain(Default::default(), true), uploaded: true });
+        }
+        // pref off: nothing without indicators
+        w.show_all_names = false;
+        assert!(w.collect_tags(0.016, own_pos, &[]).is_empty());
+        // pref on: the characters within 30 m, nearest first, never the client character
+        w.own = 25988;
+        w.show_all_names = true;
+        let tags = w.collect_tags(0.016, own_pos, &[]);
+        assert!(tags.len() > 3, "{} tags", tags.len());
+        assert!(tags.len() > 3 && tags.iter().all(|t| t.kind == IndicatorKind::Nametag && t.bar.is_none() && t.id != 25988));
+        let d = |id: i32| {
+            let p = scene_pos(w.chars[&id].pose.pos);
+            (0..3).map(|i| (p[i] - own_pos[i]).powi(2)).sum::<f32>().sqrt()
+        };
+        assert!(tags.iter().all(|t| d(t.id) <= NAME_TAG_RADIUS) && tags.windows(2).all(|p| d(p[0].id) <= d(p[1].id)));
+        // the set is rebuilt only every 2 s: walking away keeps it, 2 s later it is empty
+        let far = [own_pos[0] + 500.0, own_pos[1], own_pos[2]];
+        assert_eq!(w.collect_tags(0.016, far, &[]).len(), tags.len());
+        assert!(w.collect_tags(2.1, far, &[]).is_empty());
+        // indicators: the selected dynel gets a plate + bar tag first and no plain tag; flags bit 0x400 suppresses the selection one
+        w.collect_tags(2.1, own_pos, &[]);
+        let id = w.collect_tags(0.016, own_pos, &[])[0].id;
+        let sel = Indicator { id, kind: IndicatorKind::Selection, bar: Some(((30, 60), 0x00ff00)) };
+        let t = w.collect_tags(0.016, own_pos, &[sel]);
+        assert_eq!((t[0].id, t[0].kind, t[0].bar), (id, IndicatorKind::Selection, Some((32, 0x00ff00))));
+        assert_eq!(t.iter().filter(|t| t.id == id).count(), 1);
+        w.chars.get_mut(&id).unwrap().flags = 0x400;
+        let t = w.collect_tags(0.016, own_pos, &[sel]);
+        assert!(t.iter().all(|t| t.kind == IndicatorKind::Nametag) && t.iter().any(|t| t.id == id));
+        // an unplaced dynel (server x <= 0) shows nothing
+        w.chars.get_mut(&id).unwrap().pose.pos[0] = 0.0;
+        assert!(w.collect_tags(0.016, own_pos, &[]).iter().all(|t| t.id != id));
+    }
+
             let scene = ao_formats::playfield::load_playfield_at(&RecordStore::open(&dir).unwrap(), &dir, 4582, ao_formats::playfield::DEFAULT_DAY_TIME).unwrap();
             // AOMAC_DYNEL_LOOK=<kind hex like c76a | npc | player>: camera 4 m from the first such dynel instead of the player's view
             let (mut cam, mut at) = ([eye[0], eye[1] + 1.7, eye[2]], [eye[0] + fwd[0], eye[1] + 1.5 + fwd[1], eye[2] + fwd[2]]);
