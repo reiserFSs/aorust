@@ -96,6 +96,9 @@ pub enum Action {
     Drop { item: Identity },
     /// A bag item is used (`GenericCmd_t`, `N3Msg_UseItem`).
     Use { item: Identity },
+    /// A bag item released over a world object (`FUN_100cb081` [GUI]): `N3Msg_UseItemOnCharacter` (`GenericCmd_t` 0x20) for a character,
+    /// `N3Msg_UseItemOnItem` (`GenericCmd_t` 5) for any other object.
+    UseOn { item: Identity, target: Identity },
 }
 
 /// Press / drag state.
@@ -110,6 +113,8 @@ pub struct Dnd {
     pub clock: f32,
     /// Items released over a window that is not an inventory place: `(slot, x, y)`, drained by [`super::HudStats::take_drops`].
     pub dropped: Vec<(u32, f32, f32)>,
+    /// The world object under the pointer when the button went up (`InputConfig_t+0xb0`, set by `Play::interact_mouse`); `None` = the ground.
+    pub world_under: Option<Identity>,
 }
 
 pub struct Drag {

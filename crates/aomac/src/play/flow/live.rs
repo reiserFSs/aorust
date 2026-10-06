@@ -226,6 +226,7 @@ fn code(name: &str) -> KeyCode {
         "Q" => KeyCode::KeyQ,
         "X" => KeyCode::KeyX,
         "B" => KeyCode::KeyB,
+        "I" => KeyCode::KeyI,
         "F8" => KeyCode::F8,
         "SHIFT" => KeyCode::ShiftLeft,
         "CTRL" => KeyCode::ControlLeft,
@@ -622,6 +623,73 @@ fn live_walk() {
                 let p = &mut l.p;
                 let i = p.interact.as_mut().unwrap();
                 eprintln!("feedback {:?}\ngrid: {}\nloot: {:?}\n{}", i.take_feedback(), i.grid_dump(&p.gui), i.loot_dump(&mut p.gui), i.dump(&p.gui));
+            }
+            // NPC window button bar / NPC trade / player trade (docs/zone/interact.md §2, §10, §11)
+            "btn" => {
+                let p = &mut l.p;
+                eprintln!("btn {v}: {}", p.interact.as_mut().unwrap().press_button(&mut p.gui, v.parse().unwrap()));
+                l.wait(4.0);
+                let p = &l.p;
+                let i = p.interact.as_ref().unwrap();
+                eprintln!("{}\n{}", i.dump(&p.gui), i.trade_dump(&p.gui));
+            }
+            "tdump" => {
+                let p = &l.p;
+                let i = p.interact.as_ref().unwrap();
+                eprintln!("{}\n{}\n{}", i.dump(&p.gui), i.trade_dump(&p.gui), i.ptrade_dump(&p.gui));
+            }
+            "tadd" => {
+                let (kind, inst) = v.split_once(':').unwrap();
+                let p = &mut l.p;
+                eprintln!("tadd {v}: {}", p.interact.as_mut().unwrap().trade_add(&mut p.gui, ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() }));
+                l.wait(3.0);
+            }
+            "taccept" | "tdecline" => {
+                let p = &mut l.p;
+                let i = p.interact.as_mut().unwrap();
+                let ok = if k == "taccept" { i.trade_accept(&mut p.gui, &p.zone, v.parse().unwrap_or(0)) } else { i.trade_decline(&mut p.gui, &p.zone) };
+                eprintln!("{k} {v}: {ok}");
+                l.wait(4.0);
+                let p = &l.p;
+                eprintln!("{}", p.interact.as_ref().unwrap().trade_dump(&p.gui));
+            }
+            // `ruse=<kind>:<instance>`: the right click on a world object (`FUN_1002c469`: `N3Msg_UseItem(id, false)` whatever its `Can`)
+            "ruse" => {
+                let (kind, inst) = v.split_once(':').unwrap();
+                let id = ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() };
+                let p = &mut l.p;
+                eprintln!("ruse {v}: {:?}", p.interact.as_mut().unwrap().use_item(&p.zone, id, false));
+                l.wait(5.0);
+                let p = &mut l.p;
+                let i = p.interact.as_mut().unwrap();
+                eprintln!("feedback {:?}\ngrid: {}\nloot: {:?}\n{}", i.take_feedback(), i.grid_dump(&p.gui), i.loot_dump(&mut p.gui), i.dump(&p.gui));
+            }
+            // `invuse=<slot>`: `N3Msg_UseItem` on the bag item in `slot` (0x40 ..): the double click of the inventory window
+            "invuse" => {
+                let slot = u32::from_str_radix(v.trim_start_matches("0x"), if v.starts_with("0x") { 16 } else { 10 }).unwrap();
+                l.p.interact.as_mut().unwrap().use_object(ao_net::n3::inventory::item_identity(slot));
+                l.wait(5.0);
+            }
+            // `useon=<slot>:<kind>:<instance>`: the bag item in `slot` released over the world object (`N3Msg_UseItemOnItem` / `UseItemOnCharacter`)
+            "useon" => {
+                let mut it = v.split(':');
+                let slot = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+                let (kind, inst) = (it.next().unwrap().parse().unwrap(), it.next().unwrap().parse().unwrap());
+                let p = &mut l.p;
+                p.hud.as_mut().unwrap().use_item_on(&p.zone, slot, ao_net::msg::Identity { kind, instance: inst });
+                l.wait(5.0);
+                let p = &mut l.p;
+                let i = p.interact.as_mut().unwrap();
+                eprintln!("feedback {:?}", i.take_feedback());
+            }
+            // `loottake=<cell>`: the double click on a cell of the open loot window (`FUN_100ca1e7` -> `MoveItemToInventory`)
+            "loottake" => {
+                let p = &mut l.p;
+                eprintln!("loottake {v}: {}", p.interact.as_mut().unwrap().loot_take(&mut p.gui, &p.zone, v.parse().unwrap()));
+                l.wait(4.0);
+                let p = &mut l.p;
+                let i = p.interact.as_mut().unwrap();
+                eprintln!("feedback {:?}\nloot: {:?}", i.take_feedback(), i.loot_dump(&mut p.gui));
             }
             "grid" => {
                 let p = &l.p;

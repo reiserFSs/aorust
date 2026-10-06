@@ -229,6 +229,16 @@ impl HudStats {
         std::mem::take(&mut self.outbox)
     }
 
+    /// True while an item is carried by the pointer.
+    pub(in crate::play) fn dragging_item(&self) -> bool {
+        self.dnd.drag.is_some()
+    }
+
+    /// The world object under the pointer, for an item released over the world (`InputConfig_t+0xb0`).
+    pub(in crate::play) fn set_world_under(&mut self, id: Option<ao_net::msg::Identity>) {
+        self.dnd.world_under = id;
+    }
+
     /// Inventory items dropped over a foreign window since the last call: `(slot, x, y)` (the NPC trade window takes them).
     pub(in crate::play) fn take_drops(&mut self) -> Vec<(u32, f32, f32)> {
         std::mem::take(&mut self.dnd.dropped)
@@ -1251,6 +1261,15 @@ mod tests {
         // released over the world: `DropTemplateIIR_t` at the player's position
         dnd!(s, o, bag_xy(&s, (1, 0)), (20.0, 300.0));
         assert_eq!(payload(&mut s), [inv::drop_item(me, inv::item_identity(0x41), s.zone.own().map_or([0.0; 3], |d| d.pos))]);
+        // released over a world object (`Play::interact_mouse` stores the pick): `UseItemOnItem` (`GenericCmd_t` 5), over a character `UseItemOnCharacter` (0x20)
+        for (target, cmd) in [(Identity { kind: 51005, instance: -1073474847 }, 5), (Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: 77 }, 0x20)] {
+            s.hud.set_world_under(Some(target));
+            dnd!(s, o, bag_xy(&s, (1, 0)), (20.0, 300.0));
+            let own = Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: me };
+            let seq = s.hud.use_seq;
+            let want = ao_net::n3::misc::GenericCmd { state: 0, seq, cmd, args: ao_net::n3::misc::GenericArgs::ItemOnItem { flag: 0, actor: own, item: inv::item_identity(0x41), target } };
+            assert_eq!(payload(&mut s), [ao_net::n3::misc::Misc::GenericCmd(want).encode(own, 1)]);
+        }
     }
 
     /// The real `Hud`: the menu toggles open the windows, the frame close button (and `Close`) clears the menu state again; the NewChar template's

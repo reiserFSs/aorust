@@ -239,6 +239,13 @@ impl Interact {
 /// Live-harness helpers (`flow/live.rs`).
 #[cfg(test)]
 impl Interact {
+    /// Double click on cell `n` of the open loot window: the item goes to the bag ([`Interact::use_out`]).
+    pub fn loot_take(&mut self, gui: &mut Gui, zone: &Zone, n: usize) -> bool {
+        let Some(item) = self.use_ui.loot.take(gui, n, self.use_ui.now) else { return false };
+        self.use_out(zone, UseOut::Take(item));
+        true
+    }
+
     /// The loot windows as shown: `(container, [(container slot, item low id, name)])`.
     pub fn loot_dump(&mut self, gui: &mut Gui) -> super::interact_loot::LootRows {
         self.use_ui.loot.dump(gui)

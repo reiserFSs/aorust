@@ -15,6 +15,10 @@ const DRAG_THRESHOLD: f32 = 3.0;
 const GHOST: f32 = 32.0;
 /// `GenericCmd_t` command of `N3Msg_UseItem` (GC 0x100286f8).
 const CMD_USE_ITEM: i32 = 3;
+/// `GenericCmd_t` command of `N3Msg_UseItemOnItem` [GC 0x100267e0].
+const CMD_USE_ITEM_ON_ITEM: i32 = 5;
+/// `GenericCmd_t` command of `N3Msg_UseItemOnCharacter` [GC 0x100268af].
+const CMD_USE_ITEM_ON_CHARACTER: i32 = 0x20;
 /// `ComputerLiteracy` (stat 0x2d): the deck weapons need it (`FUN_10046cbf`).
 const STAT_DECK: u32 = 0x2d;
 
@@ -95,7 +99,14 @@ impl HudStats {
                     let action = match dest {
                         Some(p) => self.drop_action(zone, d.slot, p),
                         // released over the world: `N3Msg_DropItem` (the position under the cursor is picked by the 3D view: UNRESOLVED, we drop at our feet)
-                        None if !gui.wants_mouse(x, y) => Some(Action::Drop { item: inv::item_identity(d.slot) }),
+                        // `FUN_100cb081`: over a character / another world object the item is used on it, over the ground it is dropped
+                        None if !gui.wants_mouse(x, y) => {
+                            let item = inv::item_identity(d.slot);
+                            Some(match self.dnd.world_under.take() {
+                                Some(target) => Action::UseOn { item, target },
+                                None => Action::Drop { item },
+                            })
+                        }
                         // released over another window (the NPC trade window, `play/interact_trade.rs`): the drop is reported to whoever owns that window
                         None => {
                             self.dnd.dropped.push((d.slot, x, y));
@@ -163,6 +174,12 @@ impl HudStats {
         }
     }
 
+    /// The drop of bag slot `slot` on world object `target` (live harness `useon`; the pointer release does the same).
+    #[cfg(test)]
+    pub(in crate::play) fn use_on(&mut self, zone: &Zone, slot: u32, target: Identity) {
+        self.run(zone, Action::UseOn { item: inv::item_identity(slot), target }, None);
+    }
+
     /// Performs an accepted drop / double click.
     fn run(&mut self, zone: &Zone, a: Action, dest: Option<Place>) {
         let char_id = zone.char_id as i32;
@@ -189,6 +206,13 @@ impl HudStats {
                 self.use_seq += 1;
                 let own = Identity { kind: DYNEL_CHAR, instance: char_id };
                 let cmd = GenericCmd { state: 0, seq: self.use_seq, cmd: CMD_USE_ITEM, args: GenericArgs::Item { flag: 0, actor: own, item } };
+                Misc::GenericCmd(cmd).encode(own, 1)
+            }
+            Action::UseOn { item, target } => {
+                self.use_seq += 1;
+                let own = Identity { kind: DYNEL_CHAR, instance: char_id };
+                let cmd = if target.kind == DYNEL_CHAR { CMD_USE_ITEM_ON_CHARACTER } else { CMD_USE_ITEM_ON_ITEM };
+                let cmd = GenericCmd { state: 0, seq: self.use_seq, cmd, args: GenericArgs::ItemOnItem { flag: 0, actor: own, item, target } };
                 Misc::GenericCmd(cmd).encode(own, 1)
             }
         };

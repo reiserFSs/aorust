@@ -85,6 +85,18 @@ impl Play {
         if let (InputEvent::MouseMove { x, y }, Some(i)) = (ev, self.interact.as_mut()) {
             i.trade.mouse = (*x, *y);
         }
+        // an inventory item released over the world (`FUN_100cb081` [GUI], docs/zone/interact.md §8.6): the object under the pointer is what it is used on
+        if let InputEvent::MouseUp { x, y, button: MouseButton::Left } = *ev {
+            if self.hud.as_ref().is_some_and(|h| h.item_dragging()) {
+                let under = (!self.gui.wants_mouse(x, y)).then(|| {
+                    let ray = pick_ray(&host.camera, &host.lens.unwrap_or_default(), (self.size.0 as f32, self.size.1 as f32), (x, y));
+                    pick_objects(&ray, &self.zone).first().copied()
+                });
+                if let Some(h) = self.hud.as_mut() {
+                    h.set_world_under(under.flatten());
+                }
+            }
+        }
         let InputEvent::MouseUp { x, y, button: button @ (MouseButton::Left | MouseButton::Right) } = *ev else { return };
         let clicked = self.player.as_mut().is_some_and(|p| p.take_clicks().contains(&button));
         if !clicked || self.gui.wants_mouse(x, y) {

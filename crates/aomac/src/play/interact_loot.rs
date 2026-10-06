@@ -128,6 +128,16 @@ impl LootUi {
         gui.set_canvas_tips(w, "grid", tips);
     }
 
+    /// The double click on cell `n` of the first window (live harness): the item to take.
+    #[cfg(test)]
+    pub fn take(&mut self, gui: &mut Gui, n: usize, now: f32) -> Option<Identity> {
+        let window = self.open.first()?.window;
+        let (x, y) = cell_origin(n % 3, n / 3, gap());
+        let click = Event::CanvasClick { window, view: "grid".into(), x: x + 2.0, y: y + 2.0 };
+        self.event(gui, &click, now);
+        self.event(gui, &click, now + 0.1).flatten()
+    }
+
     /// GUI events: `None` = not a loot window's, `Some(None)` = handled, `Some(Some(item))` = the second click on an item cell within the double-click
     /// time (`FUN_100ca1e7` -> `MoveItemToInventory(item)`): the item to take.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, now: f32) -> Option<Option<Identity>> {

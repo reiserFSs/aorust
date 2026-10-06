@@ -470,6 +470,22 @@ impl Hud {
         std::mem::take(&mut self.outbox)
     }
 
+    #[cfg(test)]
+    pub(super) fn use_item_on(&mut self, zone: &Zone, slot: u32, target: ao_net::msg::Identity) {
+        self.stats.use_on(zone, slot, target);
+        self.outbox.extend(self.stats.take_outbox());
+    }
+
+    /// True while the pointer carries an inventory item.
+    pub(super) fn item_dragging(&self) -> bool {
+        self.stats.dragging_item()
+    }
+
+    /// See [`HudStats::set_world_under`].
+    pub(super) fn set_world_under(&mut self, id: Option<ao_net::msg::Identity>) {
+        self.stats.set_world_under(id);
+    }
+
     /// Inventory items released over a foreign window since the last call (`HudStats::take_drops`).
     pub(super) fn take_item_drops(&mut self) -> Vec<(u32, f32, f32)> {
         self.stats.take_drops()
