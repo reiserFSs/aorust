@@ -326,9 +326,11 @@ Clip: `social-<name>` in the character clip set (`%s_%s_01_01.ani`, docs/formats
 * `SimpleCharFullUpdate`: status from the blob (`Status::from_blob`), Features from the full update's stat pairs else NPC 2 / player 4 **[INFERENCE]**.
 * `CharDCMove`: `Features & 4` drives every move type, `& 2` only the turn types 9..=14 (`FUN_1006b84b`), sit/leave guards need `& 4`.
 * `CharacterAction 0x56 / 0x57` (section 4); stat pairs `WaitState` (430) and `Features` (224); `SocialActionCmd_t` with state 0 or 1 -> `Event::Emote { clip: "social-<name>" }` plus, for the accepted copy (state 1), the sleep/lounge transition.
-* `Pose {Standing, SitGround, SitItem (SitGround while WaitState == 1), Sleeping, Lounging, Crawling}` with idle/enter/exit clip names from the client's id -> clip table (`idle-ground`, `ground-start`/`ground-stop`, `idle-chair`,
-  `chair-start`/`chair-stop`, `sleep-ground`, `idle-sleep-ground`, `lounging`, `idle-lounging`, `idle-crawl`, `crawl_start`/`crawl_stop`; the enter/exit pairing is **[INFERENCE]** from the names).
-* `Event::Pose { dynel, from, to }` only when the pose changes. The live capture produces no events (nobody sits).
+* `Pose {Standing, SitGround, SitItem (SitGround while WaitState == 1), Sleeping, Lounging, Crawling}`; `Pose::transition_anim(from, to)` = the one-shot enter / stop `AbstractAnimID` the original plays over the new pose's idle clip
+  (`ground-start` 0xd5, `ground-stop` 0xd6, `sleep-ground` 0xed, `lounging` 0xef, `crawl_start` 0x68, `crawl_stop` 0x69; read from the FSM entry handlers, `combat-anim.md` section 4: no chair clip, the
+  way out of sleep / lounge is **[UNRESOLVED]**); `Pose::from_role` maps the own avatar's movement `Role`. The idle clips (`idle-ground`, `idle-sleep-ground`, `idle-lounging`, `idle-crawl`) are the movement state's own.
+* `Event::Pose { dynel, from, to }` only when the pose changes (played on other dynels by `combat/glue.rs`; the own avatar does it from its movement role in `Player::update`). `ToClientQuit` of a character drops its tracked state.
+  The chat line `/<emote>` is parsed by the chat layer (`chat/cmd.rs::emote_id`), not here. The live capture produces no pose events (nobody sits).
 
 ## 7. Unresolved
 
@@ -336,3 +338,122 @@ Clip: `social-<name>` in the character clip set (`%s_%s_01_01.ani`, docs/formats
 * The `Vehicle_t` virtual `+0x9c` blocker in SitToggle; the exact object behind `FUN_10058816()+0x5c`; `Can` bit 2 = "sit" is inferred from use.
 * Meaning of live actions `0x62` (list at `char+0x1c0`), `0x63` (stat 0x183 = 503), the third emote field, the numbering of mode 9, and the command names of text commands 0x5c/0x24/0x7f/0x86/0x91.
 * A real `SocialActionCmd_t` capture (counter start value, server's relayed `state`).
+
+## 6. Duel / PetDuel (CwDuel; full evidence: docs/zone/combat-duel.md)
+
+Senders `n3EngineClientAnarchy_t::N3Msg_Duel_*` [GC 0x1001d2ac challenge, 0x1001d349 accept, 0x1001d467 refuse, 0x1001d585 stop, 0x1001d634 draw] and `N3Msg_PetDuel_*` [GC 0x1001cffa challenge,
+0x1001d09b accept, 0x1001d14e refuse, 0x1001d1fd stop] = `FUN_1007253f(client dynel + 0x14, identity_a, 0, action, identity_b, "")`; builders `action::duel`. Receivers: `FUN_1005b821` (0x106) and `FUN_1005c514` (0xef/0xf0/0xf3/0xf8).
+
+
+## 7. Every received id: who handles it (CwDuel walk)
+
+Rows without a note are UI / GlobalSignals plumbing of another feature (team, containers, perks, effect list, missions ...): the callee was read, there is no fight state in it and no consumer in this client. **wired** = added with the duel slice.
+
+| id | handler | what | ours |
+|---|---|---|---|
+| `0x1` | 0x1005d187 | text `KilledMissionTarget` | chat/log.rs |
+| `0x12` | 0x1005d1e4 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x14` | 0x1005e2cd | special-action recharge extend | zone.rs `recharge_feed` -> hud_special (HudFinish) |
+| `0x15` | 0x1005d284 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x18` | 0x1005d2a2 | team: leave | hud_team.rs |
+| `0x1a` | 0x1005d2ff | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x1b` | 0x1005d2b5 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x1e` | 0x1005d235 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x20` | 0x1005d348 | team: member left | hud_team.rs |
+| `0x23` | 0x1005d384 | team: leader | hud_team.rs |
+| `0x2b` | 0x1005d45c | text `RecievedTeamBonus` | chat/log.rs |
+| `0x2e` | 0x1005d4c3 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x2f` | 0x1005d4e5 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x34` | 0x1005d4f6 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x35` | 0x1005d50e | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x3b` | 0x1005d522 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x3c` | 0x1005d65c | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x49` | 0x1005d674 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x4f` | 0x1005d695 | text `YouAreInsured` | chat/log.rs |
+| `0x50` | 0x1005ebe7 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x54` | 0x1005d70f | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x56` | 0x1005d723 | sit relay | combat/actions.rs + player.rs |
+| `0x57` | 0x1005d72f | stand up | combat/actions.rs + player.rs |
+| `0x61` | 0x1005d790 | weapon slot map of the fight controller (`FUN_1006a857`, stats 0x112/0x2b2) | **not implemented** (slot objects untraced, state.rs `valid_slot`) |
+| `0x62` | 0x1005d7de | buff/effect entry add (`FUN_100512af`) | not fight state; not driven |
+| `0x63` | 0x1005d827 | death: flag 0x10, stat 0x183 | combat/state.rs + player.rs; sound CwSound |
+| `0x64` | 0x1005d873 | anim holder id := `identity_b.instance` | **wired**: `Module::take_anims` -> glue |
+| `0x66` | 0x1005d258 | nano cast out of range (effect entry + own text) | not driven (nano casting) |
+| `0x6a` | 0x1005d887 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x6b` | 0x1005d8bd | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x6c` | 0x1005d8d7 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x6d` | 0x1005d897 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x6e` | 0x1005d8ad | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x70` | 0x1005d8f1 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x75` | 0x1005d913 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x76` | 0x1005d92b | attack refused, clears +0x79 | combat/module.rs |
+| `0x77` | 0x1005da11 | text TeamMemberLinkdead | chat/log.rs |
+| `0x7a` | 0x1005dae8 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x7b` | 0x1005db15 | PvP confirmation, clears +0x79 | **wired**: duel.rs `PvpPrompt`, dialog, `Module::start_pvp` |
+| `0x81` | 0x1005dc31 | combat-log line | chat/log.rs |
+| `0x82` | 0x1005dc12 | combat-log line | chat/log.rs |
+| `0x83` | 0x1005d7b7 | weapon slot map (`FUN_1006ad94`) | **not implemented** (same) |
+| `0x84` | 0x1005ddbc | special action locked "Unable to perform action, able in hh:mm:ss" | **wired** chat/log.rs (perk branch: perk name unresolved, not printed) |
+| `0x89` | 0x1005d248 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x8a` | 0x1005dc77 | combat-log line | chat/log.rs |
+| `0x8b` | 0x1005dc50 | combat-log line | chat/log.rs |
+| `0x8c` | 0x1005dc96 | text IncreasedNanoPool | chat/log.rs |
+| `0x91` | 0x1005ddda | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x92` | 0x1005ddf3 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x93` | 0x1005de04 | attack failed, clears +0x79 | combat/module.rs |
+| `0x99` | 0x1005d861 | death cause `FUN_1005ae91` | **wired**: state.rs `ACTION_DEATH_CAUSE` |
+| `0x9b` | 0x1005de1a | text YouHaveBeenDetected | chat/log.rs |
+| `0x9c` | 0x1005dd18 | text YouWereDrained | chat/log.rs |
+| `0x9d` | 0x1005deef | version texts | chat/log.rs |
+| `0x9e` | 0x1005dfe0 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xa2` | 0x1005e006 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xa4` | 0x1005e016 | text SkillAvailable | chat/log.rs |
+| `0xa7` | 0x1005e3d2 | flag 0x800 of `dynel+0x138` | not tracked (reader only `FUN_10051f6e`) |
+| `0xa8` | 0x1005d320 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xa9` | 0x1005d334 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xaa` | 0x1005e350 | recharge entry insert-if-absent (`FUN_10064a6e`) | **not fed**; handed to HudFinish |
+| `0xab` | 0x1005e41e | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xac` | 0x1005e479 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xad` | 0x1005e489 | leave sneak | player.rs |
+| `0xb0` | 0x1005d213 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xb1` | 0x1005d7f5 | same as 0x62 | not fight state; not driven |
+| `0xb2` | 0x1005e2b4 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xb4` | 0x1005e49b | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xb5` | 0x1005e4dd | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xb6` | 0x1005e4bc | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xb9` | 0x1005e69c | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xba` | 0x1005e6b9 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xbb` | 0x1005e4f9 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xbc` | 0x1005e512 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xbd` | 0x1005e6cb | shadow knowledge dialog | not fight; not driven |
+| `0xbe` | 0x1005e6e5 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xc0` | 0x1005e738 | faction text (cat 101 id 9) | not fight; not printed |
+| `0xc1` | 0x1005e752 | faction text id 10 | not fight; not printed |
+| `0xc2` | 0x1005e76c | faction text id 11 | not fight; not printed |
+| `0xc3` | 0x1005e786 | faction text id 12 | not fight; not printed |
+| `0xc4` | 0x1005e52b | text StuckResolved | chat/log.rs |
+| `0xc5` | 0x1005e5db | text StuckAvailable | chat/log.rs |
+| `0xc6` | 0x1005e3fe | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xc7` | 0x1005e40e | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xc9` | 0x1005e7a0 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xcb` | 0x1005e7c6 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xcc` | 0x1005e7e6 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xcd` | 0x1005e846 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xce` | 0x1005e18a | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xcf` | 0x1005e297 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xd0` | 0x1005e8b5 | drain: `SetStat(identity_b)` + drainer line | **wired**: state.rs `ACTION_DRAIN`, zone.rs, chat/log.rs |
+| `0xd1` | 0x1005ea42 | struck: toxic number + hit sound | chat/log.rs, CwSound |
+| `0xdf` | 0x1005ec5a | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xe0` | 0x1005ec71 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xe1` | 0x1005ec88 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xe2` | 0x1005ec99 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xe3` | 0x1005ecb0 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xe4` | 0x1005eccb | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xef` | 0x1005eced | pet duel challenged | **wired** duel.rs |
+| `0xf0` | 0x1005eced | pet duel answer | **wired** |
+| `0xf1` | 0x1005eced | pet duel stop (no effect on receipt) | n/a, sent only |
+| `0xf3` | 0x1005eced | pet duel result | **wired** |
+| `0xf8` | 0x1005eced | pet duel announce | **wired** |
+| `0xfc` | 0x1005e7b3 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x105` | 0x1005ed1a | Inspect rejected text | chat (Inspect) |
+| `0x106` | 0x1005ed04 | duel | **wired** duel.rs |

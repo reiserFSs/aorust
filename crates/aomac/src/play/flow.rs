@@ -1148,7 +1148,10 @@ impl Frontend for Play {
             // `Door_t` open / close: `PlayGameSound(id, door position)` (docs/zone/doors.md §5)
             for s in self.zone.world.take_sounds() {
                 if let Some(a) = &self.audio {
-                    a.play_game_sound(s.id, s.pos, host.camera.pos.to_array());
+                    let voices = a.play_game_sound(s.id, s.pos, host.camera.pos.to_array());
+                    if std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
+                        eprintln!("game sound {} at {:?}: {} voice(s)", s.id, s.pos, voices.len());
+                    }
                 }
             }
         }

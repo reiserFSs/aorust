@@ -339,6 +339,10 @@ impl Zone {
                 if a.action == 0x14 {
                     self.recharge_feed.push((a.identity_b.kind, a.identity_b.instance));
                 }
+                // `FUN_1005d0d8` case 0x5a (action 0xd0, 0x1005e8b5): `SetStat(identity_b.kind, identity_b.instance)` on the drained character (Health / Nano)
+                if a.action == 0xd0 && a.identity_b.kind > 0 {
+                    self.stats.insert(a.identity_b.kind as u32, a.identity_b.instance);
+                }
                 self.own_events.push(OwnEvent::Action(a.action));
             }
             // `CharInPlayIIR_t::Activate` [GC 0x1007264d] on the own dynel: `SetStat(0xC2, 1)` and the `AliveMessage` event

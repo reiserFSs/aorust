@@ -1,12 +1,14 @@
 //! `impl Play` hooks of the combat layer (`module.rs`): player commands in, frames out, floating numbers on the draw list.
 
 use super::actions::Event as ActionEvent;
-use super::anim::anim_name;
-use super::log::Space;
+use super::actions::Pose;
+use super::anim::{anim_name, list, npc_sound, special_swing, UNARMED_RSWING};
+use super::log::{Space, HUD_Y_FROM_REF};
 use super::state::CombatEvent;
 use super::module::{Command, Module};
 use crate::play::chat::GameAction;
-use crate::play::dynels::NAME_TAG_RADIUS;
+use crate::play::dynels::{Dynels, NAME_TAG_RADIUS};
+use crate::play::player::Player;
 use crate::play::controls::Cmd;
 use crate::play::Play;
 use ao_formats::character::Role;
@@ -78,13 +80,24 @@ impl Play {
                     }
                     _ => {}
                 },
+                // `/duel`, `/petduel` and the answers of the challenge dialogs (docs/zone/combat-duel.md)
+                GameAction::Duel { pet, op } => {
+                    if let Some(Err(text)) = self.fight.as_mut().map(|m| m.duel_command(&self.zone, pet, op)) {
+                        if let Some(c) = self.chat.as_mut() {
+                            c.cmd_error(&mut self.gui, text);
+                        }
+                    }
+                }
+                GameAction::StartPvp(target) => {
+                    if let Some(m) = self.fight.as_mut() {
+                        m.start_pvp(target);
+                    }
+                }
             }
         }
+        self.fight_duel();
         let Some(m) = self.fight.as_mut() else { return };
         m.update(dt, &self.zone, self.audio.as_ref());
-        for id in m.take_swings() {
-            self.zone.world.attack(id);
-        }
         let own = self.zone.char_id as i32;
         // `AttackInfo` / `StatIIR` / death change the own `Health` (27) stat in place (docs/zone/combat-log.md §3): the interface reads that one store
         let events = m.take_events();
@@ -95,14 +108,37 @@ impl Play {
                 }
             }
         }
+        // swings (`FUN_1006a239` [GC 0x1006a239], docs/zone/combat-anim.md §3): every hit and special attack of every character
+        for e in &events {
+            match e {
+                CombatEvent::Hit { attacker, .. } => swing(&mut self.zone.world, self.player.as_mut(), *attacker, list::ATTACK, false, own),
+                CombatEvent::SpecialAttack { who, special, .. } => {
+                    let s = special_swing(*special);
+                    swing(&mut self.zone.world, self.player.as_mut(), *who, s.map_or(list::ATTACK, |s| s.list), s.is_some_and(|s| s.own_item), own)
+                }
+                _ => {}
+            }
+        }
+        // fight sounds (docs/zone/combat-anim.md §6): played by the app next to the door sounds (`Dynels::take_sounds`, listener = camera)
+        for id in m.take_struck() {
+            self.zone.world.char_sound(id, npc_sound::HIT);
+        }
+        for e in &events {
+            match e {
+                // `CharDie_t` is the state of the server's action 99 (cause 0); a death the client computed itself does not start it
+                CombatEvent::Died { dynel, cause: 0 } => self.zone.world.char_sound(*dynel, npc_sound::DEATH),
+                CombatEvent::SpecialAttack { who, special, .. } => {
+                    if let Some(name) = special_swing(*special).and_then(|s| s.sound) {
+                        self.zone.world.sound_at(*who, name);
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(p) = self.player.as_mut() {
             p.fighting = m.attacking();
             for e in events {
                 match e {
-                    // `FUN_1006a8f3` swing of the own character: [GUESS] the unarmed swing (weapon swing lists: combat-anim.md §3)
-                    CombatEvent::Hit { attacker, .. } | CombatEvent::SpecialAttack { who: attacker, .. } if attacker == own => {
-                        p.play(Role::Clip("unarmed-rswing".into()), false)
-                    }
                     CombatEvent::Died { dynel, .. } if dynel == own => {
                         let name = anim_name(m.death_anim()).map_or("die-knees", |a| a.0);
                         p.play(Role::Clip(name.into()), true);
@@ -113,12 +149,31 @@ impl Play {
             }
         }
         for e in m.take_pose_events() {
-            if let ActionEvent::Emote { dynel, id, clip, .. } = e {
-                match (dynel == own, self.player.as_mut()) {
+            match e {
+                ActionEvent::Emote { dynel, id, clip, .. } => match (dynel == own, self.player.as_mut()) {
                     (true, Some(p)) => p.play(Role::Emote(clip.trim_start_matches("social-").to_string()), false),
                     (true, None) => {}
                     _ => self.zone.world.play_once(dynel, id as u32),
+                },
+                // the own avatar's enter / stop clips follow its movement role (`Player::update`); the others' pose changes come from the zone stream
+                ActionEvent::Pose { dynel, from, to } if dynel != own => {
+                    if let Some(id) = Pose::transition_anim(from, to) {
+                        self.zone.world.play_once(dynel, id as u32);
+                    }
                 }
+                ActionEvent::Pose { .. } => {}
+            }
+        }
+        // `CharacterAction` 0x64: the server asks a character's animation holder to play an animation id (`FUN_1003c47c`)
+        for (dynel, id) in m.take_anims() {
+            match (dynel == own, self.player.as_mut()) {
+                (true, Some(p)) => {
+                    if let Some((name, _)) = anim_name(id) {
+                        p.play(Role::Clip(name.into()), false);
+                    }
+                }
+                (true, None) => {}
+                _ => self.zone.world.play_once(dynel, u32::from(id)),
             }
         }
         for key in m.take_feedback() {
@@ -140,6 +195,43 @@ impl Play {
         }
     }
 
+    /// Received duel / pet-duel messages (`FUN_1005b821` / `FUN_1005c514`): System-window lines, the challenge dialogs, the `AutoRejectDuel` answer.
+    fn fight_duel(&mut self) {
+        use super::duel::{Event, Line};
+        let Some(events) = self.fight.as_mut().map(|m| m.take_duel()) else { return };
+        let name = |z: &crate::play::zone::Zone, who: i32| z.dynels.get(&who).map(|d| d.name.clone());
+        for e in events {
+            let Some(c) = self.chat.as_mut() else { return };
+            match e {
+                Event::Line(Line::Plain(key)) => c.feedback(&mut self.gui, key, &self.text),
+                Event::Line(Line::Named { key, who, otherwise }) => match (name(&self.zone, who), otherwise) {
+                    (Some(n), _) => c.feedback_named(&mut self.gui, key, &n, &self.text),
+                    (None, Some(k)) => c.feedback(&mut self.gui, k, &self.text),
+                    (None, None) => {}
+                },
+                // the challenger has to be a known character (`FUN_10058e36`); `AutoRejectDuel` answers before anything is shown
+                Event::Challenged(who) => {
+                    let Some(n) = name(&self.zone, who) else { continue };
+                    if self.hud.as_ref().is_some_and(|h| h.dvalues.flag("AutoRejectDuel")) {
+                        if let Some(m) = self.fight.as_mut() {
+                            m.duel_auto_refuse();
+                        }
+                    } else {
+                        c.feedback_named(&mut self.gui, "Feedback_DuelChallenge", &n, &self.text);
+                        c.duel_dialog(&mut self.gui, false, &n, &self.text);
+                    }
+                }
+                Event::ChallengeSent(who) => {
+                    if let Some(n) = name(&self.zone, who) {
+                        c.duel_dialog(&mut self.gui, true, &n, &self.text);
+                    }
+                }
+                Event::Close => c.close_duel_dialog(&mut self.gui),
+                Event::PvpPrompt { team, target } => c.pvp_dialog(&mut self.gui, team, target, &self.text),
+            }
+        }
+    }
+
     /// Floating damage numbers (`DamageTextMessage` for the own character, the effect `0x2f5a` billboard for everybody else).
     pub(in crate::play) fn fight_draw(&mut self, host: &Host, list: &mut DrawList) {
         let Some(m) = self.fight.as_ref() else { return };
@@ -150,7 +242,7 @@ impl Play {
                 // `DamageTextMessage` [GUI 0x1004ae2f]: centre (50 + r, DAT_102761c0 - 20), text top = centre - font height / 2. `DAT_102761c0` is
                 // a .bss int with a single reader (code scan of GUI.dll: no writer, and its neighbour is the one-only text pointer), i.e.
                 // 0: the number starts above the screen and rises (y0 - 70 * t / 2.3), so the original never shows it on screen.
-                Space::Hud => (n.jitter, -20.0 - self.gui.font_height(FontId::Shell) as f32 / 2.0 - n.rise()),
+                Space::Hud => (n.jitter, HUD_Y_FROM_REF as f32 - self.gui.font_height(FontId::Shell) as f32 / 2.0 - n.rise()),
                 // A billboard effect of the 3D scene: only what the camera sees (on screen, within the locality radius of the tags,
                 // not behind terrain / walls) is drawn. [GUESS] the radius: the effect's own range was not traced.
                 Space::World => match self.zone.world.head_point(n.dynel, &host.camera, self.size, n.rise()) {
@@ -169,5 +261,28 @@ impl Play {
             // neither path fades: the HUD text has flag 1 (move only), the effect keeps its constant colour (combat-log.md §6)
             self.gui.text_cmds(FontId::Shell, &n.text, x as i32 - tw / 2, y as i32, rgb, 1.0, list);
         }
+    }
+}
+
+/// One swing of `who` (`FUN_1006a239` [GC 0x1006a239]): the weapon's list `key` ([`Dynels::pick_swing`]) played as that character's clip, sped up
+/// for the weapon's `ItemDelay`. `own_item` specials (Brawl, Dimach, Backstab, bow special) look the key up on the special's own item
+/// (`FUN_100686d0(stat) + 0xe4`), whose record layout is not decoded: they play the bare-handed swing like a character without a weapon.
+/// **[UNRESOLVED]** that swing for bare hands is the creature path `0x40a` `unarmed-rswing` (the player's unarmed-template item list is not
+/// decoded, combat-anim.md §3.1); creatures (no weapon attractors) always use it.
+fn swing(world: &mut Dynels, player: Option<&mut Player>, who: i32, key: u16, own_item: bool, own: i32) {
+    let picked = if own_item { None } else { world.pick_swing(who, key) };
+    match (who == own, picked) {
+        (true, Some((anim, delay))) => {
+            if let (Some(p), Some((name, _))) = (player, anim_name(anim)) {
+                p.swing(Role::Clip(name.into()), delay);
+            }
+        }
+        (true, None) => {
+            if let (Some(p), Some((name, _))) = (player, anim_name(UNARMED_RSWING)) {
+                p.play(Role::Clip(name.into()), false);
+            }
+        }
+        (false, Some((anim, _))) => world.play_once(who, anim as u32),
+        (false, None) => world.attack(who),
     }
 }

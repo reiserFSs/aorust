@@ -16,6 +16,12 @@ pub enum Kind {
     Afk,
     /// `/bug` (`FlowControlModule_t::SetBugReportStringMessage` 0x1002aa28, dialog "BugReport"): OK (0) sends the report.
     BugReport,
+    /// "DuelChallenge" window of `GuiSystem_c::DuelChallengeReceived` (GUI 0x1002fd9c): Accept (0) -> `N3Msg_Duel_Accept`, anything else -> `_Refuse`.
+    DuelReceived,
+    /// "DuelChallenge" window of `GuiSystem_c::DuelChallengeSent` (GUI 0x1002ff80): its only button (Cancel) or Esc -> `N3Msg_Duel_Refuse`.
+    DuelSent,
+    /// "StartPvP" dialog of `GuiSystem_c::StartPvPFightDialogue` (GUI 0x1002fa8e, action 0x7b): Yes (0) -> `N3Msg_StartPvP(target)` (the dialog's identity).
+    StartPvp(ao_net::msg::Identity),
 }
 
 /// A decided dialog.
@@ -85,7 +91,7 @@ fn xml(spec: &Spec) -> String {
     match spec.kind {
         // (the bug report is a `DialogBox_c` with the text and two buttons, 0x1002aa28)
         // `DialogBoxView_c` 0x1012aa23: text borders (15, 5, 15, 20) = `_DAT_101b00e0 / _DAT_101a8b98 / _DAT_101b00e0 / _DAT_101b4e08`
-        Kind::MessageBox | Kind::OrgLeave | Kind::OrgDisband | Kind::BugReport => {
+        Kind::MessageBox | Kind::OrgLeave | Kind::OrgDisband | Kind::BugReport | Kind::DuelReceived | Kind::DuelSent | Kind::StartPvp(_) => {
             format!("<root><View view_layout=\"vertical\">{}{}</View></root>", text("text", "Rect(15,5,15,20)"), button_row(&spec.buttons))
         }
         // `FUN_10082a6f`: form borders (15, 10, 15, 15) (`_DAT_101b00e0 / _DAT_101a98e4`), body bottom border 10, countdown, input
@@ -104,6 +110,14 @@ impl Dialogs {
 
     pub fn windows(&self) -> impl Iterator<Item = WindowId> + '_ {
         self.open.iter().map(|o| o.win)
+    }
+
+    /// `GuiSystem_c::CloseDuelWindows` [GUI 0x1002f833]: `FindWindowName("DuelChallenge")` (the first of the received / sent dialogs) is closed
+    /// without an answer.
+    pub fn close_duel(&mut self, gui: &mut Gui) {
+        if let Some(i) = self.open.iter().position(|o| matches!(o.kind, Kind::DuelReceived | Kind::DuelSent)) {
+            gui.close_window(self.open.remove(i).win);
+        }
     }
 
     /// `DialogBox_c::Go` + `Window::MoveToCenter`.
@@ -209,6 +223,23 @@ mod tests {
         let w = d.open[0].win;
         let (_, a) = d.event(&mut gui, &Event::Escape { window: w });
         assert_eq!(a.map(|a| a.button), Some(-1));
+    }
+
+    /// The duel challenge dialogs (GUI 0x1002fd9c / 0x1002ff80): Accept = 0, Reject = 1, Esc = -1; `CloseDuelWindows` closes one without an answer.
+    #[test]
+    fn duel_dialogs_answer_and_close() {
+        let Some(mut gui) = rig() else { return };
+        let mut d = Dialogs::default();
+        d.go(&mut gui, (1280, 800), &spec(Kind::DuelReceived, &["Accept", "Reject"]));
+        let w = d.open[0].win;
+        let (_, a) = d.event(&mut gui, &Event::Clicked { window: w, view: "btn0".into(), item: None });
+        assert_eq!(a.map(|a| (a.kind, a.button)), Some((Kind::DuelReceived, 0)));
+        d.go(&mut gui, (1280, 800), &spec(Kind::DuelSent, &["Cancel"]));
+        d.go(&mut gui, (1280, 800), &spec(Kind::OrgLeave, &["Yes", "No"]));
+        d.close_duel(&mut gui);
+        assert_eq!(d.open.iter().map(|o| o.kind).collect::<Vec<_>>(), [Kind::OrgLeave]);
+        d.close_duel(&mut gui);
+        assert_eq!(d.open.len(), 1);
     }
 
     #[test]

@@ -198,6 +198,8 @@ pub struct Avatar {
     clip_id: u32,
     /// Playback rate of the current clip ([`anim_rate`]).
     rate: f32,
+    /// `ItemDelay` of the weapon of the swing clip that plays ([`Avatar::set_swing_delay`]).
+    swing_delay: Option<i32>,
     /// Milliseconds into the current clip.
     ms: f32,
     transform: Mat4,
@@ -211,7 +213,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, assets, scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, clip_id: 0, rate: 1.0, ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, assets, scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, clip_id: 0, rate: 1.0, swing_delay: None, ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -248,8 +250,17 @@ impl Avatar {
             self.clip_id = id;
         }
         self.rate = anim_rate(self.calibration.get(self.rig.model_id, self.clip_id), self.scale * 100.0, pose.speed, pose.ref_speed, false);
+        // `FUN_1006a239`: a weapon swing is sped up so its first note lands within the weapon's ItemDelay
+        if let (Some(d), Some(a)) = (self.swing_delay, &self.clip) {
+            self.rate *= super::combat::anim::swing_speed_scale(a.events.first().map_or(0.0, |e| e.0 as f32), d);
+        }
         self.pose = pose;
         Ok(())
+    }
+
+    /// `ItemDelay` (centiseconds) of the weapon whose swing clip is playing (`None`: no swing speed scale); set before [`Avatar::set_pose`].
+    pub fn set_swing_delay(&mut self, delay: Option<i32>) {
+        self.swing_delay = delay;
     }
 
     /// Whether a one-shot clip (jump) has played to its end.

@@ -11,8 +11,7 @@
 //! * `CharSecSpecAttackIIR_t` [GC 0x100727c8] -> `FUN_10068790` [GC 0x10068790],
 //! * `StatIIR_t` [GC 0x100a1aaf] ([`Combat::stats`]), `FUN_1005ae91` [GC 0x1005ae91] death ([`Combat::die`]).
 
-#![allow(dead_code)] // consumed by the combat renderer / HUD / flow
-
+use super::anim::{death_anim_from_action, STAT_DEATH_ANIM};
 use super::log::{self, render, Feedback, FloatingNumber, Space, Texts, Who};
 use ao_net::frame::Frame;
 use ao_net::msg::Identity;
@@ -21,6 +20,12 @@ use std::collections::{BTreeMap, HashMap};
 
 /// Identity kind of character / NPC dynels (`SimpleChar_t`).
 pub const CHAR_KIND: i32 = 0xC350;
+/// `CharacterActionIIR_t` action 0xd0: a drain set a stat (Health / Nano) of the receiving character: `identity_b = {stat, new value}`, `identity_a.kind` = the amount.
+pub const ACTION_DRAIN: i32 = 0xd0;
+/// `CharacterActionIIR_t` action 0x64: the server sets the animation id of a character's animation holder (`identity_b.instance`).
+pub const ACTION_PLAY_ANIM: i32 = 0x64;
+/// `CharacterActionIIR_t` action 0x99: the server announces the death cause (`identity_b.instance`, 1..=7) -> [`Combat::die`].
+pub const ACTION_DEATH_CAUSE: i32 = 0x99;
 /// `Stat_e`s used here (`fStatToString` table, [`super::stat_names`]).
 pub const STAT_MAX_HEALTH: i32 = 1;
 pub const STAT_HEALTH: i32 = 27;
@@ -34,8 +39,6 @@ const STAT_ALIEN_XP_BASE: i32 = 0xb2;
 /// Fight states of `controller+0x44`.
 pub const FIGHT_IDLE: u8 = 1;
 pub const FIGHT_FIGHTING: u8 = 2;
-/// `CharacterActionIIR_t` action of a dying character (`FUN_1005d0d8` case 0x19, docs/zone/combat-anim.md §5).
-pub const ACTION_DIE: i32 = 99;
 
 /// Fight controller (`SimpleChar_t+0x1d4`).
 #[derive(Clone, Debug, PartialEq)]
@@ -167,11 +170,6 @@ impl Combat {
         self.chars.get(&instance)
     }
 
-    /// `(health, max_health)` of a character.
-    pub fn health(&self, instance: i32) -> Option<(i32, i32)> {
-        self.chars.get(&instance).map(|c| (c.health(), c.max_health()))
-    }
-
     pub fn fight(&self, instance: i32) -> Option<&Fight> {
         self.chars.get(&instance).map(|c| &c.fight)
     }
@@ -214,25 +212,49 @@ impl Combat {
             }
             N3::World(World::FullCharacter(fc)) if h.kind == CHAR_KIND => {
                 let c = self.chars.entry(h.instance).or_default();
+                // PRK's `FullCharacter` carries `Life` (1) = 1: the client never uses it as the maximum (it computes the own one,
+                // `ao_formats::stats::pools`, and every other character's comes from the `SimpleCharFullUpdate` header), so the
+                // stat must not replace the header's `max_health`.
+                let mut put = |s: i32, v: i32| {
+                    if s != STAT_MAX_HEALTH {
+                        c.stats.insert(s, v);
+                    }
+                };
                 for &(s, v) in fc.stats_a.iter().chain(&fc.stats_b) {
-                    c.stats.insert(s as i32, v);
+                    put(s as i32, v);
                 }
                 for &(s, v) in &fc.stats_u8 {
-                    c.stats.insert(i32::from(s), i32::from(v));
+                    put(i32::from(s), i32::from(v));
                 }
                 for &(s, v) in &fc.stats_i16 {
-                    c.stats.insert(i32::from(s), i32::from(v));
+                    put(i32::from(s), i32::from(v));
                 }
                 for &(s, v) in &fc.stat_map {
-                    c.stats.insert(s, v);
+                    put(s, v);
                 }
                 ev.push(CombatEvent::Health { dynel: h.instance, health: c.health(), max_health: c.max_health(), delta: 0 });
             }
-            N3::World(World::CharacterAction(a)) if h.kind == CHAR_KIND && a.action == ACTION_DIE => {
+            N3::World(World::CharacterAction(a)) if h.kind == CHAR_KIND && death_anim_from_action(a.action, a.identity_b.instance as u32).is_some() => {
                 if let Some(c) = self.chars.get_mut(&h.instance) {
                     c.dead = true;
+                    // `FUN_1005d0d8` case 0x19: stat 0x183 := `identity_b.instance`, read by the `CharDie_t` ctor (`GetSkill(0x183)`)
+                    c.stats.insert(STAT_DEATH_ANIM as i32, a.identity_b.instance);
                     self.stop_fight(h.instance, &mut ev);
                     ev.push(CombatEvent::Died { dynel: h.instance, cause: 0 });
+                }
+            }
+            // `FUN_1005d0d8` case 0x32 (action 0x99, handler 0x1005d861): `FUN_1005ae91(identity_b.instance)` on the receiving character = the same
+            // death routine as the `AttackInfo` death cause (message for the client char, `Health = 0`, "items will be reclaimed")
+            N3::World(World::CharacterAction(a)) if h.kind == CHAR_KIND && a.action == ACTION_DEATH_CAUSE && self.chars.contains_key(&h.instance) => {
+                self.die(h.instance, a.identity_b.instance, &mut ev);
+            }
+            // `FUN_1005d0d8` case 0x5a (action 0xd0, handler 0x1005e8b5): `SetStat(identity_b.kind, identity_b.instance)` on the receiving (drained)
+            // character; the "You drained .." line is the chat log's (`chat/log.rs`)
+            N3::World(World::CharacterAction(a)) if h.kind == CHAR_KIND && a.action == ACTION_DRAIN && self.chars.contains_key(&h.instance) => {
+                if a.identity_b.kind == STAT_HEALTH {
+                    self.set_health(h.instance, a.identity_b.instance, &mut ev);
+                } else if let Some(c) = self.chars.get_mut(&h.instance) {
+                    c.stats.insert(a.identity_b.kind, a.identity_b.instance);
                 }
             }
             N3::Dynel(Dynel::Stat(s)) if h.kind == CHAR_KIND => self.stats(h.instance, &s.stats, &mut ev),
@@ -602,7 +624,7 @@ mod tests {
         let CombatEvent::Floating { dynel, amount, category, number } = &ev[1] else { panic!() };
         assert_eq!((*dynel, *amount, *category, number.space), (1, 17, 0x17, Space::Hud));
         assert_eq!(number.color, 0xff0000);
-        assert_eq!(c.health(1), Some((83, 100)));
+        assert_eq!(c.char(1).map(|c| (c.health(), c.max_health())), Some((83, 100)));
         assert!(ev.contains(&CombatEvent::Health { dynel: 1, health: 83, max_health: 100, delta: -17 }));
     }
 
@@ -617,7 +639,7 @@ mod tests {
         assert_eq!(l.text, "You hit Junkbot for 8 points of projectile damage. Critical hit!");
         let CombatEvent::Floating { dynel, number, .. } = &ev[1] else { panic!() };
         assert_eq!((*dynel, number.space, number.life), (2, Space::World, 1.3));
-        assert_eq!(c.health(2), Some((42, 50)));
+        assert_eq!(c.char(2).map(|c| (c.health(), c.max_health())), Some((42, 50)));
         // invalid slot: ignored
         ev.clear();
         c.hit(1, 20, 8, 0, 3, &mut ev);
@@ -631,11 +653,30 @@ mod tests {
         c.start_fight(1, ch(2), &mut ev);
         c.hit(1, 0, 50, 4, 3, &mut ev);
         assert_eq!(c.fight(2).unwrap().death_cause, 4);
-        assert_eq!(c.health(2), Some((0, 50)));
+        assert_eq!(c.char(2).map(|c| (c.health(), c.max_health())), Some((0, 50)));
         ev.clear();
         c.hit(1, 0, 1, 0, 3, &mut ev);
         assert!(ev.iter().any(|e| matches!(e, CombatEvent::Died { dynel: 2, cause: 4 })), "{ev:?}");
-        assert_eq!(c.health(2), Some((0, 50)));
+        assert_eq!(c.char(2).map(|c| (c.health(), c.max_health())), Some((0, 50)));
+    }
+
+    /// `CharacterActionIIR_t` 0x99 (handler 0x1005d861) runs `FUN_1005ae91(identity_b.instance)` on the receiving character.
+    #[test]
+    fn action_0x99_is_the_death_routine() {
+        use ao_net::n3::action::{character_action_for, simple};
+        let mut c = setup();
+        let frame = |who: i32, cause: i32| {
+            let a = simple(ACTION_DEATH_CAUSE, Identity::default(), Identity { kind: 0, instance: cause });
+            ao_net::n3::outgoing::n3_frame(0, 1, character_action_for(ch(who), &a))
+        };
+        let ev = c.on_frame(&frame(2, 4), 1);
+        assert!(ev.iter().any(|e| matches!(e, CombatEvent::Died { dynel: 2, cause: 4 })), "{ev:?}");
+        assert_eq!(c.char(2).map(|c| c.health()), Some(0));
+        // unknown characters are ignored
+        assert!(c.on_frame(&frame(99, 4), 1).is_empty());
+        let ev = c.on_frame(&frame(1, 6), 1);
+        assert!(ev.iter().any(|e| matches!(e, CombatEvent::Died { dynel: 1, cause: 6 })), "{ev:?}");
+        assert_eq!(c.char(1).map(|c| c.health()), Some(0));
     }
 
     #[test]
@@ -651,7 +692,7 @@ mod tests {
         ev.clear();
         c.special_hit(1, 20, ch(2), 142, 0, &mut ev);
         assert!(matches!(&ev[0], CombatEvent::Log(l) if l.text == "You hit Junkbot for 20 points of Brawling damage."));
-        assert_eq!(c.health(2), Some((30, 50)));
+        assert_eq!(c.char(2).map(|c| (c.health(), c.max_health())), Some((30, 50)));
     }
 
     #[test]
@@ -686,7 +727,7 @@ mod tests {
         let mut ev = Vec::new();
         c.unattributed_hit(12, 0, &mut ev);
         assert!(matches!(&ev[0], CombatEvent::Log(l) if l.text == "You were hit for 12 points of damage." && l.category == 0x17 && l.style == 0));
-        assert_eq!(c.health(1), Some((88, 100)));
+        assert_eq!(c.char(1).map(|c| (c.health(), c.max_health())), Some((88, 100)));
     }
 
     // ---- replay of the live capture (docs/captures/zone_ithaca.rec, own character 25988 "Testy") --------------
@@ -714,6 +755,25 @@ mod tests {
     fn real_texts() -> Option<ao_formats::screens::TextDb> {
         let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
         ao_formats::screens::TextDb::load(&dir).ok()
+    }
+
+    /// The own `FullCharacter` carries `Life` (1) = 1: the `SimpleCharFullUpdate` header's maximum health stays.
+    #[test]
+    fn full_character_life_does_not_replace_the_header_max_health() {
+        let mut c = Combat::new(Box::new(super::log::fake::Fixed::new()));
+        let (mut header, mut full) = (None, false);
+        for f in frames() {
+            if let Ok(m) = n3::decode(&f) {
+                match &m.body {
+                    N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if m.header.target.instance == OWN as i32 => header = Some(u.max_health),
+                    N3::World(World::FullCharacter(_)) if m.header.target.instance == OWN as i32 => full = true,
+                    _ => {}
+                }
+            }
+            c.on_frame(&f, OWN);
+        }
+        assert!(full && header.is_some(), "the capture has both frames of the own character");
+        assert_eq!(c.char(OWN as i32).map(Char::max_health), header);
     }
 
     fn count(ev: &[CombatEvent], p: fn(&CombatEvent) -> bool) -> usize {

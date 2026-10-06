@@ -5,9 +5,9 @@
 //! combat-log.md, combat-anim.md, actions.md.
 
 use super::actions::{Actions, Event as ActionEvent};
-use super::anim::{DieEvent, Dying, ACTION_DEATH_DONE};
-use super::log::{FloatingNumber, Space, HUD_X, HUD_X_JITTER};
-use super::state::{Combat, CombatEvent, FIGHT_IDLE};
+use super::anim::{plays_hit_sound, special_swing, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM};
+use super::log::{floating_number, FloatingNumber, Space, HUD_X, HUD_X_JITTER};
+use super::state::{Combat, CombatEvent, ACTION_PLAY_ANIM, FIGHT_IDLE};
 use crate::play::zone::Zone;
 use ao_audio::combat::CharInfo;
 use ao_audio::Audio;
@@ -18,6 +18,9 @@ use ao_net::n3::combat::{self as net, action as act, Attacker, AttackGate, CharT
 use ao_net::n3::outgoing::{n3_frame, DYNEL_CHAR};
 use ao_net::msg::Identity;
 use std::path::Path;
+
+/// `ColorCode_e` of the special-attack text above a character (`FUN_10011108(char, text, 0xd)` [GC 0x1003c594]).
+const SPECIAL_TEXT_CATEGORY: u32 = 0xd;
 
 /// What the player asked for (key bindings `ACTION_*`, hotbar special actions, mouse).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,18 +62,20 @@ pub struct Module {
     feedback: Vec<&'static str>,
     numbers: Vec<Number>,
     dying: Option<Dying>,
-    /// `Dynels` hooks for the next `drain`: (dynel that swung, dynel that died).
-    swings: Vec<i32>,
     rng: u32,
     /// `s_nCommandRefCntr` [GC]: counter of the `n3Command_t`s the client sent (`SocialActionCmd_t.counter`).
     counter: i32,
     /// The selection last announced to the server with `LookAtIIR_t`.
     announced: Option<i32>,
-    /// `identity_b.instance` of the own `CharacterAction` 99: the death animation the server asked for.
-    death_anim: Option<u16>,
+    /// Characters hit by an `0xd1` `CharacterAction` (sound cue, [`Module::take_struck`]).
+    struck: Vec<i32>,
+    /// `CharacterAction` 0x64: `(dynel, AbstractAnimID)` the server asks to play ([`Module::take_anims`]).
+    anims: Vec<(i32, u16)>,
     /// Events of the last received frames for the HUD / sounds (taken by [`Module::take_events`]).
     events: Vec<CombatEvent>,
     pose_events: Vec<ActionEvent>,
+    /// Duel / pet-duel reactions of the last received frames ([`Module::take_duel`]).
+    duel: Vec<super::duel::Event>,
 }
 
 /// `Feedback_*` texts of the server's attack refusal (`CharacterAction` 0x76, `FUN_1005d0d8` case 0x23 @ 0x1005d92b): the jump table at
@@ -125,13 +130,14 @@ impl Module {
             feedback: Vec::new(),
             numbers: Vec::new(),
             dying: None,
-            swings: Vec::new(),
             rng: 0x2545_F491 ^ own,
             counter: 0,
             announced: None,
-            death_anim: None,
+            struck: Vec::new(),
+            anims: Vec::new(),
             events: Vec::new(),
             pose_events: Vec::new(),
+            duel: Vec::new(),
         }
     }
 
@@ -163,14 +169,20 @@ impl Module {
         std::mem::take(&mut self.pose_events)
     }
 
-    /// Dynels whose attack clip should play (a hit of theirs landed or a special attack started).
-    /// Animation id of the own death (`CharacterAction` 99), 503 (`die-shot`, the only value in the capture) when the server sent none.
-    pub fn death_anim(&self) -> u16 {
-        self.death_anim.unwrap_or(503)
+    /// Characters struck by an `0xd1` `CharacterAction` since the last call (their hit sound plays).
+    pub fn take_struck(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.struck)
     }
 
-    pub fn take_swings(&mut self) -> Vec<i32> {
-        std::mem::take(&mut self.swings)
+    /// `FUN_1005d0d8` case 0x1a (action 0x64, handler 0x1005d873): `FUN_1003c47c(identity_b.instance)` = the animation holder (`char+0x1dc`) gets a new
+    /// animation id, which its idle update plays (the same setter as the emote path). 0 = nothing to play.
+    pub fn take_anims(&mut self) -> Vec<(i32, u16)> {
+        std::mem::take(&mut self.anims)
+    }
+
+    /// Animation id of the own death: `CharacterAction` 99's `identity_b.instance` (stat 0x183), [`DEFAULT_DEATH_ANIM`] when the server sent none.
+    pub fn death_anim(&self) -> u16 {
+        self.dying.as_ref().map_or(DEFAULT_DEATH_ANIM, |d| d.anim)
     }
 
     pub fn numbers(&self) -> &[Number] {
@@ -191,7 +203,6 @@ impl Module {
             if let ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(a)) = &m.body {
                 if m.header.target.instance == self.own {
                     match a.action {
-                        super::state::ACTION_DIE => self.death_anim = Some(a.identity_b.instance as u16),
                         // `FUN_1005d0d8` case 0x31 (action 0x93): "starting the attack failed", clears the `+0x79` guard
                         0x93 => self.feedback.extend(self.gate.on_format_feedback(0x31)),
                         // action 0x76: the server refused the attack; `identity_a.instance` selects the text (jump table 0x1005f0e7)
@@ -201,16 +212,35 @@ impl Module {
                                 self.feedback.push(k);
                             }
                         }
-                        _ => {}
+                        // action 0x7b (`FUN_1005d0d8` case 0x26): clears the `+0x79` guard of the char `identity_a` names, then asks the player (below)
+                        super::duel::PVP_ACTION => {
+                            if a.identity_a.kind == DYNEL_CHAR && a.identity_a.instance == self.own {
+                                self.gate.pending = false;
+                            }
+                            self.duel.extend(super::duel::on_action(a));
+                        }
+                        // duel / pet-duel messages (0x106, 0xef, 0xf0, 0xf3, 0xf8): lines and dialogs for the GUI
+                        _ => self.duel.extend(super::duel::on_action(a)),
                     }
+                }
+                if a.action == ACTION_HIT && plays_hit_sound(a.identity_a.instance, a.identity_b.instance) {
+                    self.struck.push(m.header.target.instance);
+                }
+                if a.action == ACTION_PLAY_ANIM && m.header.target.kind == DYNEL_CHAR && a.identity_b.instance > 0 {
+                    self.anims.push((m.header.target.instance, a.identity_b.instance as u16));
                 }
             }
         }
         let ev = self.combat.on_frame(f, self.own as u32);
         for e in ev {
             match &e {
-                CombatEvent::Hit { attacker, .. } => self.swings.push(*attacker),
-                CombatEvent::SpecialAttack { who, .. } => self.swings.push(*who),
+                // `FUN_1003c594` [GC 0x1003c594]: the special's name floats above the character (`FUN_10011108(char, text, 0xd)`, the world
+                // effect path; the client's "\n" ends the text)
+                CombatEvent::SpecialAttack { who, special, .. } => {
+                    if let Some(text) = special_swing(*special).and_then(|s| s.text) {
+                        self.numbers.push(Number { dynel: *who, text: text.trim_end().to_string(), spec: floating_number(Space::World, SPECIAL_TEXT_CATEGORY), age: 0.0, jitter: 0.0 });
+                    }
+                }
                 CombatEvent::Floating { dynel, amount, number, .. } => {
                     let jitter = if number.space == Space::Hud { HUD_X as f32 + (self.rand01() * 2.0 - 1.0) * HUD_X_JITTER as f32 } else { 0.0 };
                     self.numbers.push(Number { dynel: *dynel, text: amount.to_string(), spec: *number, age: 0.0, jitter });
@@ -219,7 +249,11 @@ impl Module {
                     // FUN_10069c68 cleared the controller's +0x79 guard after CanAttack(report = 0) passed
                     self.gate.on_attack_applied(true);
                 }
-                CombatEvent::Died { dynel, .. } if *dynel == self.own && self.dying.is_none() => self.dying = Some(Dying::new(0, true)),
+                CombatEvent::Died { dynel, .. } if *dynel == self.own && self.dying.is_none() => {
+                    // `CharDie_t` ctor: the animation is `GetSkill(0x183)` (set by the server's action 99; 0 for a death the client computed itself)
+                    let anim = self.combat.char(self.own).map_or(0, |c| c.stat(STAT_DEATH_ANIM as i32));
+                    self.dying = Some(Dying::new(if anim > 0 { anim as u16 } else { DEFAULT_DEATH_ANIM }, true));
+                }
                 _ => {}
             }
             self.events.push(e);
@@ -410,6 +444,56 @@ impl Module {
     /// Queue a raw frame built by another part of the layer (`CharacterActionIIR_t` for stand-up, emotes ...).
     pub fn push(&mut self, payload: Vec<u8>) {
         self.send(payload);
+    }
+
+    /// Duel / pet-duel reactions of the received frames (lines, dialogs; docs/zone/combat-duel.md).
+    pub fn take_duel(&mut self) -> Vec<super::duel::Event> {
+        std::mem::take(&mut self.duel)
+    }
+
+    /// `/duel [accept|reject|stop|draw]` (GUI 0x100b8a10) and `/petduel [accept|reject|stop]` (0x100b8789) after the chat parser: `Err(text)` is the red
+    /// chat line of the original. The challenge needs a target: `/duel` a character that is neither the own one nor an NPC (`N3Msg_IsNpc`), `/petduel`
+    /// any character; accepting / refusing a duel also emits the signals that close the challenge dialog (`Event::Close`).
+    pub fn duel_command(&mut self, zone: &Zone, pet: bool, op: super::duel::Op) -> Result<(), &'static str> {
+        use super::duel::Op;
+        use ao_net::n3::action::duel as d;
+        let own = self.own;
+        let payload = match (pet, op) {
+            (false, Op::Challenge) => match zone.target.filter(|&t| t != own && !zone.dynels.get(&t).is_some_and(|d| d.npc)) {
+                Some(t) => d::challenge(own, t),
+                None => return Err(super::duel::NEED_TARGET),
+            },
+            (true, Op::Challenge) => match zone.target {
+                Some(t) => d::pet_challenge(own, t),
+                None => return Err(super::duel::NEED_TARGET),
+            },
+            (false, op) => {
+                if matches!(op, Op::Accept | Op::Refuse) {
+                    self.duel.push(super::duel::Event::Close);
+                }
+                d::op(own, op)
+            }
+            (true, Op::Accept) => d::pet_answer(own, true),
+            (true, Op::Refuse) => d::pet_answer(own, false),
+            // `/petduel draw` is a usage error in the parser; `stop` is `N3Msg_PetDuel_Stop`
+            (true, _) => d::pet_stop(own),
+        };
+        self.send(payload);
+        Ok(())
+    }
+
+    /// `AutoRejectDuel` DValue set: `FUN_1005b821` answers a challenge with a refusal ({2, 1}) instead of asking the player.
+    pub fn duel_auto_refuse(&mut self) {
+        self.send(ao_net::n3::action::duel::auto_refuse(self.own));
+    }
+
+    /// `N3Msg_StartPvP(target)` [GC 0x10018276] (Yes in the PvP confirmation): `FUN_10067c34(target, 0)`, i.e. an `AttackIIR_t` with flag 0 behind the
+    /// `+0x79` guard, no `CanAttack` test.
+    pub fn start_pvp(&mut self, target: Identity) {
+        match self.gate.begin(false) {
+            Ok(()) => self.send(net::attack(self.own, target, 0)),
+            Err(fb) => self.feedback.push(fb),
+        }
     }
 }
 
@@ -628,5 +712,76 @@ mod tests {
             m.update(0.1, &z, None);
         }
         assert!(m.numbers().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod death_tests {
+    use super::*;
+    use crate::play::combat::log::fake::Fixed;
+    use ao_net::n3::{self, world::CharacterAction, N3};
+
+    fn action(who: i32, a: i32, b: Identity, act: i32) -> Frame {
+        let id = Identity { kind: DYNEL_CHAR, instance: who };
+        n3_frame(0, who as u32, action::character_action_for(id, &CharacterAction { action: act, param: 0, identity_a: a_id(a), identity_b: b, text: String::new() }))
+    }
+
+    fn a_id(instance: i32) -> Identity {
+        Identity { kind: 0, instance }
+    }
+
+    /// The own death (`CharacterAction` 99, `identity_b` = animation): stat 0x183 holds the animation (`CharDie_t` ctor), the death timer runs
+    /// 3 s (`FUN_1007b58c`) and then sends action 0x98 once.
+    #[test]
+    fn own_death_holds_the_animation_and_reports_after_three_seconds() {
+        let own = 0x82e8;
+        let mut m = Module::with_texts(Box::new(Fixed::new()), own);
+        m.combat.add_test_char(own as i32, "Aomacvolk", false, 100);
+        assert_eq!(m.death_anim(), DEFAULT_DEATH_ANIM);
+        m.on_frame(&action(own as i32, 0, a_id(500), 99));
+        assert_eq!(m.death_anim(), 500);
+        assert!(m.take_events().iter().any(|e| matches!(e, CombatEvent::Died { dynel, cause: 0 } if *dynel == own as i32)));
+        let z = Zone::new(own);
+        m.update(2.9, &z, None);
+        assert!(m.take_outbox().is_empty(), "the wait is 3 s");
+        m.update(0.2, &z, None);
+        m.update(1.0, &z, None);
+        let out = m.take_outbox();
+        let done: Vec<i32> = out.iter().filter_map(|f| match n3::decode(f).ok()?.body {
+            N3::World(ao_net::n3::world::World::CharacterAction(a)) => Some(a.action),
+            _ => None,
+        }).collect();
+        assert_eq!(done, [ACTION_DEATH_DONE], "sent exactly once");
+    }
+
+    /// Another character's action 0xd1 is a hit-sound cue when both identity instances are positive, nothing otherwise.
+    #[test]
+    fn action_d1_cues_the_hit_sound() {
+        let mut m = Module::with_texts(Box::new(Fixed::new()), 1);
+        m.on_frame(&action(77, 5, a_id(9), ACTION_HIT));
+        m.on_frame(&action(78, 0, a_id(9), ACTION_HIT));
+        m.on_frame(&action(79, 5, a_id(0), ACTION_HIT));
+        assert_eq!(m.take_struck(), [77]);
+    }
+
+    /// The Beach Leet kill of `zone_fight_ithaca.rec`: the fight controller marks it dead and stores the animation 503 (stat 0x183).
+    #[test]
+    fn captured_kill_stores_the_death_animation() {
+        let mut m = Module::with_texts(Box::new(Fixed::new()), 0x82e8);
+        m.combat.add_test_char(0xfd6a9, "Beach Leet", true, 12);
+        let mut died = false;
+        for l in include_str!("../../../../../docs/captures/zone_fight_ithaca.rec").lines() {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+            if dir == ">" {
+                continue;
+            }
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            m.on_frame(&Frame::decode_with(&b, false).unwrap().unwrap().0);
+            died |= m.take_events().iter().any(|e| matches!(e, CombatEvent::Died { dynel: 0xfd6a9, cause: 0 }));
+        }
+        let c = m.combat().char(0xfd6a9).expect("the capture holds no quit of the leet");
+        assert!(died && c.dead);
+        assert_eq!(c.stat(STAT_DEATH_ANIM as i32), 503);
     }
 }

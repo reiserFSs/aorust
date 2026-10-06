@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod anim;
+pub mod duel;
 pub mod glue;
 pub mod log;
 pub mod module;

@@ -7,16 +7,11 @@
 //! * [`weapon_anims`] = `FUN_1009d41a` [GC 0x1009d41a], the weapon item's action lists keyed by `stat AnimSet (0x161)`.
 //! * Death: `CharacterAction 99` + `CharDie_t` [GC 0x1007b2ba]; sounds `SM_Sandy_Game_{Male,Female}{Dies,GetsHit}`.
 
-#![allow(dead_code)] // consumed by the combat renderer / flow integration
 
 use ao_formats::character::{fallback_key, NameTable};
 
 /// rdb type of the animation clips (name table section 1010003).
 pub const CLIP_TYPE: u32 = 1_010_003;
-/// Skeleton hash of the human `Bip01_ac` skeleton: `FUN_1003c802` [GC 0x1003c802] only uses the `<set>_<name>_01_01.ani`
-/// name rule when the character's own `idle-stand` clip has this signature (`!= -0x426ba342` returns "no clip").
-pub const HUMAN_SKELETON: u32 = 0xbd94_5cbe;
-
 /// Blend layer of an animation (`Layer_e`, written by `FUN_10010c57` as `~kind & 3`): the table's second field 3 = layer 0
 /// (whole body), 2 = layer 1 (overlay: `op1h-button`, the eight `wield` entries, `opself-firstaid`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,69 +20,9 @@ pub enum Layer {
     Upper,
 }
 
-impl Layer {
-    /// `Layer_e` value handed to `VisualCATMesh_t::SetAnimation`.
-    pub fn index(self) -> u32 {
-        match self {
-            Layer::Body => 0,
-            Layer::Upper => 1,
-        }
-    }
-}
-
-/// `AbstractAnimID_e` values used by the fight code (names of [`ANIMS`]).
-pub mod id {
-    pub const WALK: u16 = 100;
-    pub const RUN: u16 = 101;
-    pub const IDLE_STAND: u16 = 0x78;
-    pub const IMP_BACK: u16 = 0x7e;
-    pub const IMP_CHEST: u16 = 0x7f;
-    pub const IMP_HEAD: u16 = 0x80;
-    pub const IMP_LARM: u16 = 0x81;
-    pub const IMP_RARM: u16 = 0x82;
-    pub const IMP_LEGS: u16 = 0x83;
-    pub const IMP_STOMACH: u16 = 0x84;
-    pub const DIE_KNEES: u16 = 500;
-    pub const DIE_PAIN: u16 = 501;
-    pub const DIE_POISON: u16 = 502;
-    /// The animation id the server sends in `CharacterAction 99` for every NPC death in the capture.
-    pub const DIE_SHOT: u16 = 503;
-    pub const DIE_GROUND: u16 = 504;
-    pub const DIE_FLOAT: u16 = 505;
-    pub const DIE_CRAWL: u16 = 0xcc;
-    /// Last fallback of every death animation (`FUN_10010ad1`).
-    pub const DIE_DEFAULT: u16 = 6000;
-    pub const BLADE_START: u16 = 1000;
-    pub const IDLE_BLADE: u16 = 1001;
-    pub const BLADE_STOP: u16 = 1002;
-    pub const BLADE1H_SLASH: u16 = 1003;
-    pub const BLADE1H_STAB: u16 = 1004;
-    pub const SMALLARMS_START: u16 = 1010;
-    pub const IDLE_SMALLARMS: u16 = 1011;
-    pub const SMALLARMS_STOP: u16 = 1012;
-    pub const SMALLARMS_SHOT: u16 = 1013;
-    pub const RIFLE_START: u16 = 1020;
-    pub const IDLE_RIFLE: u16 = 1021;
-    pub const RIFLE_STOP: u16 = 1022;
-    pub const RIFLE_SHOT: u16 = 1023;
-    pub const UNARMED_START: u16 = 1030;
-    pub const IDLE_UNARMED: u16 = 1031;
-    pub const UNARMED_STOP: u16 = 1032;
-    pub const UNARMED_KICK: u16 = 1033;
-    /// Attack animation of a creature without weapon attractors (`FUN_1006a239` [GC 0x1006a239]: `local_14 = 0x40a`).
-    pub const UNARMED_RSWING: u16 = 1034;
-    pub const UNARMED_UPPERCUT: u16 = 1035;
-    pub const UNARMED_TWOPUNCH: u16 = 1036;
-    pub const UNARMED_LSWING: u16 = 1037;
-    pub const BLADE2H_CHOP: u16 = 1050;
-    pub const IDLE_2H: u16 = 1054;
-    pub const BAZOOKA_SHOT: u16 = 1062;
-    pub const BOW_START: u16 = 0xb5;
-    pub const IDLE_BOW: u16 = 0xb6;
-    pub const BOW_SHOT: u16 = 0xb7;
-    pub const BOW_STOP: u16 = 0xb8;
-    pub const SPELL_SYS: u16 = 0xcb;
-}
+/// `AbstractAnimID_e` of the attack animation of a creature without weapon attractors (`FUN_1006a239` [GC 0x1006a239]:
+/// `local_14 = 0x40a`): `unarmed-rswing`, resolved through the NPC record's animation table.
+pub const UNARMED_RSWING: u16 = 1034;
 
 /// `AbstractAnimID_e` -> clip name and layer (`FUN_100c01c9` [GC 0x100c01c9], sorted by id). Several ids share a name
 /// (`wield` x8, `sneakcool` x2, `jump-forward` x2, `op1h-button`/`op2h-wheel` x2, `die-pain` x2): kept as in the DLL.
@@ -557,25 +492,6 @@ pub fn special_swing(stat: i32) -> Option<SpecialSwing> {
     }
 }
 
-/// Where the attack animation of a swing comes from (`FUN_10069acb` + `FUN_1006a239`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SwingSource {
-    /// The model has no weapon attractors (creatures; `VisualCATMesh_t::HasWeaponAttractors` false, `FUN_100679a0`):
-    /// the fixed id [`id::UNARMED_RSWING`] is looked up in the NPC record's animation table.
-    Creature,
-    /// A wielded weapon: values of list key [`list::ATTACK`] of [`weapon_anims`] (item stat `AnimSet`), or - for weapons
-    /// whose record carries its own multimap (martial-arts items: `{1034, 1035, 1037, 1033}`) - that record's key `0xb`.
-    Weapon { anim_set: i32, left: bool, crawl: bool },
-}
-
-/// Candidate AbstractAnimIDs of a swing; the client picks one at random.
-pub fn swing_candidates(src: SwingSource) -> Vec<u16> {
-    match src {
-        SwingSource::Creature => vec![id::UNARMED_RSWING],
-        SwingSource::Weapon { anim_set, left, crawl } => weapon_list(anim_set, left, crawl, list::ATTACK),
-    }
-}
-
 /// Swing speed scale (`FUN_1006a239`): `clamp(noteTime_ms / (ItemDelay * 10), 1.0, 2.0)` where `noteTime` is the clip's
 /// attack-note time (`VisualCATMesh_t::GetNoteTime`) and `ItemDelay` the weapon's stat 0x126 (centiseconds), constants
 /// `_DAT_101600f0 = 10.0` (double) and `_DAT_10158794 = 2.0f`. Only applied to characters with `char+0x21c == 0`; `1.0` = no scaling.
@@ -588,29 +504,6 @@ pub fn swing_speed_scale(note_time_ms: f32, item_delay_cs: i32) -> f32 {
     }
 }
 
-// ---------------------------------------------------------------- char state machine
-
-/// `CharStateBase_t` ids of the factory `FUN_1007be9f` [GC 0x1007be9f] (`SimpleChar+0x1c0` state object).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CharState {
-    /// `CharIdle_t` (ctor `FUN_1007bc6a`, update `FUN_1007b88a`).
-    Idle = 0,
-    /// `CharMove_t` (`FUN_1007bd3a`).
-    Move = 4,
-    /// `CharCastNano_t` (`FUN_1007b084`, update `FUN_1007ac9a`): plays nano animations `0x178/0x179/0x17a` of the spell.
-    CastNano = 5,
-    /// `CharTurn_t` (`FUN_1007c467`, update `FUN_1007c366`).
-    Turn = 7,
-    /// `CharFight_t` (`FUN_1007b816`, update `FUN_1007bb81`).
-    Fight = 10,
-    /// `CharDie_t` (`FUN_1007b2ba`, update `FUN_1007b58c`).
-    Die = 11,
-}
-
-/// Transition out of idle / fight to death: the dynel's stat-flag word (`SimpleChar+0x138`) has bit 4 (0x10) set
-/// (`FUN_1007bb81`, `FUN_1007b88a`, `FUN_1007ac9a`, `FUN_1007bc88` all test `flags >> 4 & 1`).
-pub const DEAD_FLAG: u32 = 0x10;
-
 // ---------------------------------------------------------------- death
 
 /// `CharacterActionIIR_t` action 99 (0x63): `FUN_1005d0d8` [GC 0x1005d0d8] case 0x19 sets stat flag 0x10
@@ -619,6 +512,11 @@ pub const DEAD_FLAG: u32 = 0x10;
 pub const ACTION_DIE: i32 = 0x63;
 /// Stat the dying character's animation id is stored in (`CharDie_t` ctor reads `GetSkill(0x183)`).
 pub const STAT_DEATH_ANIM: u32 = 0x183;
+/// Death animation of the own character when its stat 0x183 is 0 (a death the client computed itself, `FUN_1005ae91`, no server action 99):
+/// **[UNRESOLVED GUESS]** 503 (`die-shot`), the only value seen in the capture.
+pub const DEFAULT_DEATH_ANIM: u16 = 503;
+/// `CharacterActionIIR_t` action of a character being struck (`FUN_1005d0d8` case 0x5b).
+pub const ACTION_HIT: i32 = 0xd1;
 /// Seconds `CharDie_t` waits (`_DAT_1015d69c` = 3.0f): after that the control character sends `CharacterAction 0x98`
 /// and the state returns to idle. NPCs are removed earlier by the server's `n3ToClientQuit` (2.92 - 2.99 s after the action).
 pub const DIE_WAIT_S: f32 = 3.0;
@@ -661,11 +559,6 @@ impl Dying {
         }
         None
     }
-
-    /// Clip to hold on the last frame: the death animation, else its fallback chain (`500..=0x1f9`, `0xcc` -> 6000).
-    pub fn clip(&self, names: &NameTable, set: &str) -> Option<(u32, u16, Layer)> {
-        resolve_clip(names, set, self.anim, false)
-    }
 }
 
 // ---------------------------------------------------------------- sounds
@@ -681,22 +574,10 @@ pub mod sound {
     /// `FUN_1005d0d8` case 0x5b [GC 0x1005eada]: played at the hit character's position when both message values are > 0.
     pub const MALE_GETS_HIT: &str = "SM_Sandy_Game_MaleGetsHit";
     pub const FEMALE_GETS_HIT: &str = "SM_Sandy_Game_FemaleGetsHit";
-    /// Loaded by `AnimHolder_t` ctor [GC 0x1003c525] into members `+0x40` / `+0x44`; no reader of the ids was found.
+    /// Loaded by `AnimHolder_t` ctor [GC 0x1003c525] into members `+0x40` / `+0x44`; played at the character by the special swing
+    /// `FUN_1003c594` ([`special_swing`]).
     pub const BRAWL: &str = "SM_Sandy_Game_Brawl";
     pub const DIMACH: &str = "SM_Sandy_Game_Dimach";
-    /// Members `+0x74..+0x7c` of the weapon-item class built by `FUN_1009b913` [GC 0x1009b913]; no reader of the ids was
-    /// found, and the first five names below are **not defined in either .sbf** (`GetSoundID` returns nothing).
-    pub const FLAMETHROWER_FIRE: &str = "SM_Sandy_Game_FlameThrowerFire";
-    pub const PISTOL_SINGLE_HIT_FLESH: &str = "SM_Sandy_Game_PistolSingleShotHitFlesh";
-    pub const PISTOL_SINGLE_HIT_GROUND: &str = "SM_Sandy_Game_PistolSingleShotHitGround";
-    pub const PISTOL_MULTI_FIRE: &str = "SM_Sandy_Game_PistolMultiShotFire";
-    pub const PISTOL_SINGLE_FIRE: &str = "SM_Sandy_Game_PistolSingleShotFire";
-    pub const EXPLO_BIG: &str = "SM_Sandy_Game_Explo_Big";
-    /// Every name above, for data checks.
-    pub const ALL: &[&str] = &[
-        MALE_DIES, FEMALE_DIES, MALE_GETS_HIT, FEMALE_GETS_HIT, BRAWL, DIMACH, FLAMETHROWER_FIRE, PISTOL_SINGLE_HIT_FLESH,
-        PISTOL_SINGLE_HIT_GROUND, PISTOL_MULTI_FIRE, PISTOL_SINGLE_FIRE, EXPLO_BIG,
-    ];
 }
 
 /// NPC-record sound multimap keys used by the fight code (`FUN_1004570c(key)` on `record+0x24`, picks a random value).
@@ -725,68 +606,10 @@ pub fn hit_sound(sex: u8) -> &'static str {
     }
 }
 
-/// `FUN_1005d0d8` case 0x5b (`CharacterAction 0xd1`): the hit sound plays when both `param` values are positive.
+/// `FUN_1005d0d8` case 0x5b (`CharacterAction 0xd1`, GC 0x1005eada): the hit sound plays when `identity_a.instance` and `identity_b.instance`
+/// are both positive (the handler's two `Identity*` arguments, `+4` of each: `[ebp+0xc]` / `[ebp+0x14]`; `param` is not read there).
 pub fn plays_hit_sound(value_a: i32, value_b: i32) -> bool {
     value_a > 0 && value_b > 0
-}
-
-// ---------------------------------------------------------------- corpse
-
-/// Identity kind of corpse dynels (`Corpse_t`, header of `CorpseFullUpdateIIR_t`).
-pub const CORPSE_KIND: u32 = 0xC76A;
-/// Stat ids on a corpse dynel (`base.stats` of the update; names from the client's stat table).
-pub mod corpse_stat {
-    /// `CATMesh` (42): rdb 1010002 model the corpse is drawn with.
-    pub const CAT_MESH: u32 = 42;
-    /// `DeadTimer` (34): 600 in every captured corpse (units unresolved).
-    pub const DEAD_TIMER: u32 = 34;
-    /// `TimeExist` (8): 18000 or 180000 in the capture (units unresolved).
-    pub const TIME_EXIST: u32 = 8;
-    /// `CorpseType` (415) / `CorpseInstance` (416): identity of the dead character (50000, id).
-    pub const CORPSE_TYPE: u32 = 415;
-    pub const CORPSE_INSTANCE: u32 = 416;
-    /// `CorpseAnimKey` (417): absent from every captured corpse.
-    pub const CORPSE_ANIM_KEY: u32 = 417;
-    /// `Cash` (61): money on the corpse.
-    pub const CASH: u32 = 61;
-}
-
-/// What the app needs of a `CorpseFullUpdateIIR_t`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CorpseInfo {
-    /// Corpse dynel instance (header identity `{0xC76A, instance}`).
-    pub instance: i32,
-    /// Display name (`Remains of Cross-Wired Junkbot`), NUL stripped.
-    pub name: String,
-    /// The dead character `{kind, instance}`.
-    pub owner: ao_net::msg::Identity,
-    pub position: Option<[f32; 3]>,
-    pub rotation: Option<[f32; 4]>,
-    /// rdb 1010002 model id (stat `CATMesh`).
-    pub mesh: Option<u32>,
-    pub cash: i32,
-    pub dead_timer: i32,
-    pub time_exist: i32,
-    pub cloth_slots: usize,
-}
-
-impl CorpseInfo {
-    pub fn from_update(h: &ao_net::n3::N3Header, c: &ao_net::n3::world::Corpse) -> CorpseInfo {
-        let stat = |id: u32| c.base.stats.iter().find(|s| s.0 == id).map(|s| s.1);
-        let name = c.base.blob.split(|b| *b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
-        CorpseInfo {
-            instance: h.target.instance,
-            name,
-            owner: c.owner,
-            position: c.base.position,
-            rotation: c.base.rotation,
-            mesh: stat(corpse_stat::CAT_MESH).filter(|m| *m > 0).map(|m| m as u32),
-            cash: stat(corpse_stat::CASH).unwrap_or(0),
-            dead_timer: stat(corpse_stat::DEAD_TIMER).unwrap_or(0),
-            time_exist: stat(corpse_stat::TIME_EXIST).unwrap_or(0),
-            cloth_slots: c.cloth.len(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -836,7 +659,7 @@ mod tests {
         assert_eq!(weapon_list(6, false, false, list::ATTACK), [0xb7]);
         assert_eq!(weapon_list(8, false, false, list::ATTACK), [0x426]);
         assert!(weapon_anims(4, false, false).is_empty());
-        assert_eq!(swing_candidates(SwingSource::Creature), [1034]);
+        assert_eq!(anim_name(UNARMED_RSWING).map(|a| a.0), Some("unarmed-rswing"));
         assert_eq!(special_swing(148).unwrap().list, 0x16);
         assert_eq!(special_swing(144).unwrap().sound, Some(sound::DIMACH));
         assert!(special_swing(1).is_none());
@@ -853,7 +676,7 @@ mod tests {
 
     #[test]
     fn death_flow() {
-        assert_eq!(death_anim_from_action(99, 503), Some(id::DIE_SHOT));
+        assert_eq!(death_anim_from_action(99, 503), Some(503));
         assert_eq!(death_anim_from_action(98, 503), None);
         let mut d = Dying::new(503, true);
         assert_eq!(d.tick(2.9), None);
@@ -910,12 +733,12 @@ mod tests {
     fn sounds_exist_in_the_data() {
         let Some(dir) = client() else { return };
         let lib = ao_audio::Library::load(&dir.join("cd_image/sound")).unwrap();
-        // the five weapon-class names are loaded by the client but absent from both .sbf files (GetSoundID finds nothing)
-        let missing: Vec<_> = sound::ALL.iter().copied().filter(|n| lib.sounds.by_name(n).is_none()).collect();
-        assert_eq!(
-            missing,
-            [sound::FLAMETHROWER_FIRE, sound::PISTOL_SINGLE_HIT_FLESH, sound::PISTOL_SINGLE_HIT_GROUND, sound::PISTOL_MULTI_FIRE, sound::PISTOL_SINGLE_FIRE]
-        );
+        // the weapon-class names `FUN_1009b913` loads (members +0x74..+0x7c, no reader found) are absent from both .sbf files (GetSoundID finds
+        // nothing): there is nothing to play, so the code has no constants for them (docs/zone/combat-anim.md §6)
+        for n in ["FlameThrowerFire", "PistolSingleShotHitFlesh", "PistolSingleShotHitGround", "PistolMultiShotFire", "PistolSingleShotFire"] {
+            assert!(lib.sounds.by_name(&format!("SM_Sandy_Game_{n}")).is_none(), "{n}");
+        }
+        assert!(lib.sounds.by_name(sound::BRAWL).is_some() && lib.sounds.by_name(sound::DIMACH).is_some());
         let die = lib.sounds.by_name(sound::MALE_DIES).unwrap();
         assert_eq!(die.file.as_deref(), Some("sfx/breeds/male_die.wav"));
         assert!(!lib.sounds.by_name(sound::FEMALE_DIES).unwrap().children.is_empty());

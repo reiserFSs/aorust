@@ -4,11 +4,12 @@
 //! The movement FSM is the one of `ao_net::n3::motion` ([`Status`] / [`MoveType`]); this tracker only adds what the
 //! `CharacterActionIIR_t` and `SocialActionCmd_t` messages and the `WaitState` stat do to it.
 
-#![allow(dead_code)] // pure API; the Combat controller / renderer wire it in (nothing in the app calls it yet)
 
 use ao_net::frame::Frame;
-use ao_net::n3::action::{self, id, mv, stat, wait, Emote};
+use ao_formats::character::Role;
+use ao_net::n3::action::{self, id, mv, stat, wait};
 use ao_net::n3::dynel::Dynel;
+use ao_net::n3::misc::Misc;
 use ao_net::n3::motion::{Mode, MoveType, Status};
 use ao_net::n3::world::World;
 use ao_net::n3::{self, N3};
@@ -34,37 +35,37 @@ pub enum Pose {
 }
 
 impl Pose {
-    /// Looping clip while in the pose (names from the client's id -> clip table `FUN_100c01c9` [GC]; which transition plays which
-    /// start/stop clip is **[INFERENCE]** from the names, nothing was traced).
-    pub fn idle_clip(self) -> Option<&'static str> {
-        Some(match self {
-            Pose::Standing => return None,
-            Pose::SitGround => "idle-ground",
-            Pose::SitItem => "idle-chair",
-            Pose::Sleeping => "idle-sleep-ground",
-            Pose::Lounging => "idle-lounging",
-            Pose::Crawling => "idle-crawl",
-        })
+    /// The pose a movement role of the own avatar shows.
+    pub fn from_role(r: &Role) -> Pose {
+        match r {
+            Role::SitGround | Role::SitChair => Pose::SitGround,
+            Role::SleepGround => Pose::Sleeping,
+            Role::Lounge => Pose::Lounging,
+            Role::Crawl => Pose::Crawling,
+            _ => Pose::Standing,
+        }
     }
-    /// One-shot clip when the pose is entered (**[INFERENCE]**, see [`Pose::idle_clip`]).
-    pub fn enter_clip(self) -> Option<&'static str> {
-        Some(match self {
-            Pose::Standing => return None,
-            Pose::SitGround => "ground-start",
-            Pose::SitItem => "chair-start",
-            Pose::Sleeping => "sleep-ground",
-            Pose::Lounging => "lounging",
-            Pose::Crawling => "crawl_start",
-        })
-    }
-    /// One-shot clip when the pose is left (**[INFERENCE]**); sleep and lounge have none in the table.
-    pub fn exit_clip(self) -> Option<&'static str> {
-        Some(match self {
-            Pose::SitGround => "ground-stop",
-            Pose::SitItem => "chair-stop",
-            Pose::Crawling => "crawl_stop",
-            Pose::Standing | Pose::Sleeping | Pose::Lounging => return None,
-        })
+
+    /// The one-shot `AbstractAnimID` played over the idle clip of the new pose when the pose changes (the idle clips - `idle-ground`
+    /// 0xd7, `idle-sleep-ground` 0xee, `idle-lounging` 0xf0, `idle-crawl` 0x9a - are the movement state's own, `AnimState`).
+    /// [CODE] the FSM entry handlers push `(idle, enter)` pairs to `FUN_1006d330` [GC 0x1006d330] (plays `enter` once, starts `idle` when it
+    /// is nearly over): SwitchToSitGround `FUN_1006e2be` (0xd7, 0xd5 `ground-start`), LeaveSit `FUN_1006e372` (0xd6 `ground-stop`), sleep
+    /// `FUN_1006e6ff` (0xee, 0xed `sleep-ground`), lounge `FUN_1006e8a9` (0xf0, 0xef `lounging`), crawl enter `FUN_1006e646` (0x9a, 0x68
+    /// `crawl_start`), crawl leave `FUN_1006e3ff` (0x69 `crawl_stop`). Sitting on an item runs the same mode 8 handler: there is no chair clip
+    /// (`chair-start`/`idle-chair` are in the id table but no handler pushes 0xd8..0xda). **[UNRESOLVED]** leaving sleep / lounge to sitting
+    /// (`FUN_1006e79f` / `FUN_1006e949`) plays 0xed / 0xef with `Play` flag `param_5 = 1` (taken as backwards playback): not reproduced, the
+    /// avatar goes straight to `idle-ground`.
+    pub fn transition_anim(from: Pose, to: Pose) -> Option<u16> {
+        use Pose::*;
+        match (from, to) {
+            (Standing, SitGround | SitItem) => Some(0xd5),
+            (SitGround | SitItem, Standing) => Some(0xd6),
+            (SitGround | SitItem, Sleeping) => Some(0xed),
+            (SitGround | SitItem, Lounging) => Some(0xef),
+            (Standing, Crawling) => Some(0x68),
+            (Crawling, Standing) => Some(0x69),
+            _ => None,
+        }
     }
 }
 
@@ -122,10 +123,6 @@ impl Actions {
         self.dynels.get(&dynel).map_or(Pose::Standing, Tracked::pose)
     }
 
-    pub fn forget(&mut self, dynel: i32) {
-        self.dynels.remove(&dynel);
-    }
-
     /// Feed one received `ptype` 0xA frame; the events it causes (empty for everything not about actions).
     pub fn on_frame(&mut self, f: &Frame) -> Vec<Event> {
         let Ok(msg) = n3::decode(f) else { return vec![] };
@@ -144,6 +141,11 @@ impl Actions {
             N3::Dynel(Dynel::CharDCMove(m)) if is_char => self.on_move(dynel, m.move_type),
             N3::Dynel(Dynel::Stat(s)) if is_char => s.stats.iter().flat_map(|&(k, v)| self.on_stat(dynel, k, v)).collect(),
             N3::World(World::CharacterAction(a)) if is_char => self.on_action(dynel, a.action),
+            // the dynel is gone (`n3ToClientQuitIIR_t`): its tracked state goes with it
+            N3::Misc(Misc::ToClientQuit) if is_char => {
+                self.dynels.remove(&dynel);
+                vec![]
+            }
             N3::Unknown(body) if msg.header.msg_type == action::SOCIAL_ACTION_CMD => {
                 match action::parse_social_body(msg.header.target, &body) {
                     Ok(s) if is_char && matches!(s.state, 0 | 1) => self.on_emote(dynel, s.anim, s.state == 1),
@@ -226,14 +228,6 @@ impl Actions {
             vec![Event::Pose { dynel, from: before, to }]
         }
     }
-}
-
-/// The emote a `/<name>` or `/emote <name>` chat line names (`_stricmp` against the command column).
-pub fn parse_emote_command(line: &str) -> Option<Emote> {
-    let mut words = line.trim().strip_prefix('/')?.split_whitespace();
-    let first = words.next()?;
-    let name = if first.eq_ignore_ascii_case("emote") { words.next()? } else { first };
-    action::emote_by_name(name)
 }
 
 #[cfg(test)]
@@ -336,19 +330,34 @@ mod tests {
         assert_eq!(ev, [Event::Emote { dynel: 5, id: 0x3e, name: "wave", clip: "social-wave".into() }]);
         // a bad id is dropped
         assert!(a.on_frame(&n3_frame(1, 5, action::social_action(5, 1, 0x48))).is_empty());
-        assert_eq!(parse_emote_command("/wave").unwrap().id, 0x3e);
-        assert_eq!(parse_emote_command("  /EMOTE Bow ").unwrap().id, 9);
-        assert!(parse_emote_command("/emote").is_none());
-        assert!(parse_emote_command("wave").is_none());
-        assert!(parse_emote_command("/nosuch").is_none());
+    }
+
+    /// `n3ToClientQuitIIR_t` drops the tracked state of a character: a returning dynel starts standing again.
+    #[test]
+    fn quit_forgets_the_dynel() {
+        let mut a = Actions::new();
+        a.on_emote(4, action::SLEEP_EMOTE, true);
+        assert_eq!(a.pose(4), Pose::Sleeping);
+        let mut quit = ao_net::n3::misc::TO_CLIENT_QUIT.to_be_bytes().to_vec();
+        quit.extend([0, 0, 0xc3, 0x50, 0, 0, 0, 4, 0]);
+        assert!(a.on_frame(&n3_frame(1, 4, quit)).is_empty());
+        assert_eq!(a.pose(4), Pose::Standing);
     }
 
     #[test]
-    fn pose_clips_exist_for_every_pose() {
-        for p in [Pose::SitGround, Pose::SitItem, Pose::Sleeping, Pose::Lounging, Pose::Crawling] {
-            assert!(p.idle_clip().is_some() && p.enter_clip().is_some());
-        }
-        assert!(Pose::Standing.idle_clip().is_none());
-        assert_eq!(Pose::SitGround.exit_clip(), Some("ground-stop"));
+    fn pose_transitions_play_the_enter_and_stop_clips() {
+        use super::super::anim::anim_name;
+        let name = |from, to| Pose::transition_anim(from, to).and_then(anim_name).map(|a| a.0);
+        assert_eq!(name(Pose::Standing, Pose::SitGround), Some("ground-start"));
+        assert_eq!(name(Pose::Standing, Pose::SitItem), Some("ground-start"));
+        assert_eq!(name(Pose::SitGround, Pose::Standing), Some("ground-stop"));
+        assert_eq!(name(Pose::SitGround, Pose::Sleeping), Some("sleep-ground"));
+        assert_eq!(name(Pose::SitGround, Pose::Lounging), Some("lounging"));
+        assert_eq!(name(Pose::Standing, Pose::Crawling), Some("crawl_start"));
+        assert_eq!(name(Pose::Crawling, Pose::Standing), Some("crawl_stop"));
+        // the way out of sleep / lounge plays the enter clip backwards: not reproduced
+        assert_eq!(name(Pose::Sleeping, Pose::SitGround), None);
+        assert_eq!(Pose::from_role(&Role::SleepGround), Pose::Sleeping);
+        assert_eq!(Pose::from_role(&Role::Run), Pose::Standing);
     }
 }

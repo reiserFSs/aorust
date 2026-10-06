@@ -9,6 +9,8 @@ use super::fightmode::{FightLevels, DEFAULT_LEVEL};
 use super::controls::{CamCmd, Cmd, ControlPrefs, Controls};
 use super::movement::{id as mv, mode, Movement, World};
 use super::zone::{scene_pos, scene_yaw, OwnEvent, Zone, IN_PLAY_STAT};
+use super::combat::actions::Pose;
+use super::combat::anim::anim_name;
 use ao_formats::character::Role;
 use ao_formats::playfield::{camera_views, zone_locator};
 use ao_formats::playfield::collision::{Aligned, Body, Collision, SurfaceState, FOOT_CLEARANCE};
@@ -74,6 +76,10 @@ pub(super) struct Player {
     clicks: Vec<ao_gui::MouseButton>,
     /// A one-shot clip over the movement pose (emote, attack swing, death): the role and whether it holds its last frame.
     transient: Option<(Role, bool)>,
+    /// `ItemDelay` of the weapon of the swing in `transient`.
+    swing_delay: Option<i32>,
+    /// The pose the movement role showed last frame (`None` before the first update).
+    pose: Option<Pose>,
     /// The character is in a fight (`idle-unarmed` stance while standing).
     pub fighting: bool,
     /// District fight-mode data of the playfield (`fightmode.rs`).
@@ -132,6 +138,8 @@ impl Player {
                 game: Vec::new(),
                 clicks: Vec::new(),
                 transient: None,
+                swing_delay: None,
+                pose: None,
                 fighting: false,
                 fight,
             })
@@ -159,6 +167,13 @@ impl Player {
     /// Plays `role` once over the movement pose (`hold`: keep the last frame, for the death clip).
     pub fn play(&mut self, role: Role, hold: bool) {
         self.transient = Some((role, hold));
+        self.swing_delay = None;
+    }
+
+    /// Plays the weapon swing `role` once, sped up for the weapon's `ItemDelay` (centiseconds, `FUN_1006a239`).
+    pub fn swing(&mut self, role: Role, item_delay: i32) {
+        self.play(role, false);
+        self.swing_delay = Some(item_delay);
     }
 
     /// A held clip (death) is playing.
@@ -343,6 +358,13 @@ impl Player {
 
         let role = self.movement.role();
         let moving = self.movement.speed() > 0.01 && self.movement.grounded();
+        // the new pose's enter / stop clip plays once over its idle clip (`Pose::transition_anim`, GC 0x1006d330)
+        let now = Pose::from_role(&role);
+        if let Some(from) = self.pose.replace(now).filter(|&b| b != now) {
+            if let Some((name, _)) = Pose::transition_anim(from, now).and_then(anim_name) {
+                self.play(Role::Clip(name.into()), false);
+            }
+        }
         // emotes and swings end with their clip or when the character moves; a death clip holds until `stand`
         if self.transient.as_ref().is_some_and(|(_, hold)| !hold && (moving || self.avatar.finished())) {
             self.transient = None;
@@ -353,6 +375,7 @@ impl Player {
             None if self.fighting && role == Role::Idle => AvatarPose::still(Role::IdleCombat),
             None => AvatarPose::still(role),
         };
+        self.avatar.set_swing_delay(self.transient.as_ref().and(self.swing_delay));
         if let Err(e) = self.avatar.set_pose(&self.store, pose) {
             eprintln!("avatar pose: {e:#}");
         }

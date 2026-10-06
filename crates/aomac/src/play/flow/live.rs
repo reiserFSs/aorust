@@ -188,7 +188,9 @@ fn live_walk() {
     let (user, pass) = (lines.next().unwrap().unwrap(), lines.next().unwrap().unwrap());
     let want = std::env::var("AOMAC_LIVE_CHAR").unwrap_or_else(|_| "Aomacvolk".into());
     std::env::set_var("AOMAC_PREFS_DIR", std::env::temp_dir().join("aomac-live-prefs"));
-    let mut p = Play::new(dir, None, Some("Ithaca".into()), None).unwrap();
+    // `AOMAC_AUDIO_LOG=1`: the real audio engine runs in the harness and `audio` steps print its status (combat music, voices)
+    let audio = std::env::var_os("AOMAC_AUDIO_LOG").and_then(|_| ao_audio::Audio::start(&dir).map_err(|e| eprintln!("audio disabled: {e:#}")).ok());
+    let mut p = Play::new(dir, None, Some("Ithaca".into()), audio).unwrap();
     p.servers = Some(ao_net::client::fetch_servers().map_err(|e| e.to_string()));
     let o = Offscreen::new(&p, (1280, 800)).unwrap();
     let shots = std::env::var_os("AOMAC_LIVE_SHOTS").map(std::path::PathBuf::from);
@@ -214,11 +216,12 @@ fn live_walk() {
             "wait" => l.wait(v.parse().unwrap()),
             "shot" => l.shot(v),
             "pos" => eprintln!("{}", l.pos()),
+            "audio" => eprintln!("audio: {} music={:?}", l.p.audio.as_ref().map_or("off".into(), |a| a.status()), l.p.audio.as_ref().and_then(|a| a.now_playing())),
             // combat steps: `near` lists the dynels within 60 m, `tab` = TAB (next hostile target), `sel=<instance>` selects,
             // `fight` prints the combat layer's state (Q / X / B hold the keys: attack / sit / brawl)
             "near" => {
                 let me = l.p.zone.own().unwrap().pos;
-                let mut v: Vec<_> = l.p.zone.dynels.iter().map(|(i, d)| (((d.pos[0] - me[0]).powi(2) + (d.pos[2] - me[2]).powi(2)).sqrt(), *i, d.clone())).filter(|e| e.0 < 60.0).collect();
+                let mut v: Vec<_> = l.p.zone.dynels.iter().map(|(i, d)| (((d.pos[0] - me[0]).powi(2) + (d.pos[2] - me[2]).powi(2)).sqrt(), *i, d.clone())).filter(|e| e.0 < v.parse().unwrap_or(60.0)).collect();
                 v.sort_by(|a, b| a.0.total_cmp(&b.0));
                 for (dist, i, d) in v {
                     eprintln!("near {i} {:?} npc={} lvl={} hp={}/{} side={} dist={dist:.1} at {:.0},{:.1},{:.0}", d.name, d.npc, d.level, d.health, d.max_health, d.side, d.pos[0], d.pos[1], d.pos[2]);

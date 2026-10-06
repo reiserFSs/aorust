@@ -678,6 +678,70 @@ pub fn social_allowed(anim: i32, fsm_mode: i32, vehicle_equipped: bool) -> Resul
     Ok(())
 }
 
+/// Duel / PetDuel (`CharacterActionIIR_t` 0x106, 0xef..0xf1; docs/zone/actions.md §6). All are `FUN_1007253f(client dynel + 0x14, identity_a,
+/// param 0, action, identity_b, "")`.
+pub mod duel {
+    use super::{character_action, simple, DYNEL_CHAR};
+    use crate::msg::Identity;
+
+    /// `N3Msg_Duel_*` [GC 0x1001d2ac..0x1001d634]: the sub-op rides in `identity_b.kind`.
+    pub const DUEL: i32 = 0x106;
+    /// `N3Msg_PetDuel_Challenge` [GC 0x1001cffa]; also the received "challenged by a pet duel" id (`FUN_1005c514`).
+    pub const PET_CHALLENGE: i32 = 0xef;
+    /// `N3Msg_PetDuel_Accept` / `_Refuse` [GC 0x1001d09b / 0x1001d14e]: `identity_b.kind` 1 / 0; received: the answer (`identity_b.kind` 0..6).
+    pub const PET_ANSWER: i32 = 0xf0;
+    /// `N3Msg_PetDuel_Stop` [GC 0x1001d1fd] (never applied by the client).
+    pub const PET_STOP: i32 = 0xf1;
+    /// Received only: result of a pet duel (`identity_b.kind` 0 won, 1 lost, 2 opponent withdrew).
+    pub const PET_RESULT: i32 = 0xf3;
+    /// Received only: "X challenged Y to a pet duel" (`identity_a` = challenger).
+    pub const PET_ANNOUNCE: i32 = 0xf8;
+
+    /// Sub-ops of action 0x106 (`identity_b.kind`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Op {
+        Challenge = 0,
+        Accept = 1,
+        Refuse = 2,
+        Stop = 3,
+        Draw = 4,
+    }
+
+    fn send(char_id: i32, action: i32, a: Identity, b_kind: i32) -> Vec<u8> {
+        character_action(char_id, &simple(action, a, Identity { kind: b_kind, instance: 0 }))
+    }
+
+    /// `N3Msg_Duel_Challenge(target)` [GC 0x1001d2ac]: `identity_a` = the target's identity, `identity_b` = {0, 0}.
+    pub fn challenge(char_id: i32, target: i32) -> Vec<u8> {
+        send(char_id, DUEL, Identity { kind: DYNEL_CHAR, instance: target }, Op::Challenge as i32)
+    }
+
+    /// `N3Msg_Duel_Accept` / `_Refuse` / `_Stop` / `_Draw` [GC 0x1001d349 / 0x1001d467 / 0x1001d585 / 0x1001d634].
+    pub fn op(char_id: i32, op: Op) -> Vec<u8> {
+        send(char_id, DUEL, Identity::default(), op as i32)
+    }
+
+    /// The reply `FUN_1005b821` [GC 0x1005b821] sends on a challenge while the `AutoRejectDuel` DValue is set: refuse with `identity_b` = {2, 1}.
+    pub fn auto_refuse(char_id: i32) -> Vec<u8> {
+        character_action(char_id, &simple(DUEL, Identity::default(), Identity { kind: Op::Refuse as i32, instance: 1 }))
+    }
+
+    /// `N3Msg_PetDuel_Challenge(target)` [GC 0x1001cffa].
+    pub fn pet_challenge(char_id: i32, target: i32) -> Vec<u8> {
+        send(char_id, PET_CHALLENGE, Identity { kind: DYNEL_CHAR, instance: target }, 0)
+    }
+
+    /// `N3Msg_PetDuel_Accept` (`accept`) / `_Refuse` [GC 0x1001d09b / 0x1001d14e].
+    pub fn pet_answer(char_id: i32, accept: bool) -> Vec<u8> {
+        send(char_id, PET_ANSWER, Identity::default(), i32::from(accept))
+    }
+
+    /// `N3Msg_PetDuel_Stop` [GC 0x1001d1fd].
+    pub fn pet_stop(char_id: i32) -> Vec<u8> {
+        send(char_id, PET_STOP, Identity::default(), 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,5 +918,27 @@ mod tests {
         assert_eq!(social_allowed(SLEEP_EMOTE, 1, false), Err("Feedback_MustSitToLoungeOrSleep"));
         assert_eq!(social_allowed(LOUNGE_EMOTE, mode::SIT_GROUND, false), Ok(()));
         assert_eq!(social_allowed(LOUNGE_EMOTE, mode::SIT_GROUND, true), Err("Feedback_YouCanNotDoThisWithAVehicleEquipped"));
+    }
+
+    /// Duel / PetDuel senders: `identity_a` / `identity_b` of each `N3Msg_*` (disassembled pushes of `FUN_1007253f`, docs/zone/actions.md §6).
+    #[test]
+    fn duel_frames() {
+        let parse = |p: Vec<u8>| parse_character_action(&p).unwrap().1;
+        let a = parse(duel::challenge(0x6584, 77));
+        assert_eq!((a.action, a.identity_a, a.identity_b), (0x106, Identity { kind: 0xC350, instance: 77 }, Identity::default()));
+        for (op, k) in [(duel::Op::Accept, 1), (duel::Op::Refuse, 2), (duel::Op::Stop, 3), (duel::Op::Draw, 4)] {
+            let a = parse(duel::op(0x6584, op));
+            assert_eq!((a.action, a.identity_a, a.identity_b, a.param), (0x106, Identity::default(), Identity { kind: k, instance: 0 }, 0));
+        }
+        assert_eq!(parse(duel::auto_refuse(5)).identity_b, Identity { kind: 2, instance: 1 });
+        let a = parse(duel::pet_challenge(5, 9));
+        assert_eq!((a.action, a.identity_a.instance), (0xef, 9));
+        assert_eq!(parse(duel::pet_answer(5, true)).identity_b.kind, 1);
+        assert_eq!(parse(duel::pet_answer(5, false)).identity_b.kind, 0);
+        assert_eq!(parse(duel::pet_stop(5)).action, 0xf1);
+        // the frame is a `CharacterActionIIR_t` of the own character with pass-on byte 0
+        let p = duel::op(0x6584, duel::Op::Stop);
+        assert_eq!(&p[..4], &world::CHARACTER_ACTION.to_be_bytes());
+        assert_eq!(p[12], 0);
     }
 }

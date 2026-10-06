@@ -159,6 +159,8 @@ pub enum ChatAction {
     Voice { cmd: String, sound: Option<String> },
     /// `/macro <name> <command>` (0x100b8693): `GlobalSignals+0x1a0(name, command)` = `TextMacroSystem_t::CreateMacro` + a drag of the new macro.
     Macro { name: String, command: String },
+    /// `/duel`, `/petduel` (GUI 0x100b8a10 / 0x100b8789): `op` of the original's `N3Msg_Duel_*` / `N3Msg_PetDuel_*` (the target checks need the zone: the game layer's).
+    Duel { pet: bool, op: ao_net::n3::action::duel::Op },
     /// `/filter <sub> [rule]` (0x100b8d4e): the tokens `["/filter", sub, rest]`.
     Filter(Vec<String>),
     /// `/waypoint x z playfield` (0x100b9377): `GlobalSignals+0x158(Identity{0,0}, Vector3(x,0,z), pf)` = the map marker.
@@ -268,6 +270,8 @@ enum Kind {
     Petition,
     Voice,
     Macro,
+    Duel,
+    PetDuel,
     Filter,
     Waypoint,
     Rp,
@@ -347,8 +351,8 @@ const GLOBAL_CMDS: &[Cmd] = &[
     c("/ignore", 2, Kind::Ignore),
     c("/voice", 2, Kind::Voice),
     c("/macro", 3, Kind::Macro),
-    c("/petduel", 2, Kind::Client),
-    c("/duel", 2, Kind::Client),
+    c("/petduel", 2, Kind::PetDuel),
+    c("/duel", 2, Kind::Duel),
     c("/lft", 2, Kind::Lft),
     c("/filter", 3, Kind::Filter),
     c("/waypoint", 4, Kind::Waypoint),
@@ -584,6 +588,36 @@ fn key(ctx: &CmdCtx, k: &str) -> String {
 }
 fn usage(ctx: &CmdCtx, tok0: &str, rest: &str) -> Vec<ChatAction> {
     vec![err(ctx, &format!("Usage: {tok0}{rest}"))]
+}
+
+/// `FUN_100b8a10` (`/duel`) / `FUN_100b8789` (`/petduel`) [GUI]: no argument = challenge the target; `accept` / `reject` / `stop` (and `draw`, duel only) =
+/// the matching `N3Msg_*`; anything else prints the usage lines (colour 0x51; the continuation lines are indented by `DAT_101bbb60` = 4 spaces).
+fn duel_cmd(ctx: &CmdCtx, t: &[String], pet: bool) -> Vec<ChatAction> {
+    use ao_net::n3::action::duel::Op;
+    let word = if t.len() == 2 { t[1].to_ascii_lowercase() } else { String::new() };
+    let op = match (t.len(), word.as_str()) {
+        (1, _) => Some(Op::Challenge),
+        (2, "accept") => Some(Op::Accept),
+        (2, "reject") => Some(Op::Refuse),
+        (2, "stop") => Some(Op::Stop),
+        (2, "draw") if !pet => Some(Op::Draw),
+        _ => None,
+    };
+    if let Some(op) = op {
+        return vec![ChatAction::Duel { pet, op }];
+    }
+    let c = &t[0];
+    let stop = if pet { "stop -- stop current duel.." } else { "stop -- stop current duel." };
+    let mut lines = vec![
+        format!("Usage: {c} -- ask the target player if he wants to duel."),
+        format!("    {c} accept -- accept duel request from another player."),
+        format!("    {c} reject -- reject duel request from another player."),
+        format!("    {c} {stop}"),
+    ];
+    if !pet {
+        lines.push(format!("    {c} draw -- propose a draw."));
+    }
+    lines.iter().map(|l| err(ctx, l)).collect()
 }
 
 /// What Shift+R (`TextInputModule_t::StartChatReplyMessage`, GUI 0x10021fd0 -> 0x1009494e) puts into the opened input line.
@@ -934,6 +968,7 @@ fn run(cmd: &Cmd, line: &str, t: &[String], ctx: &CmdCtx) -> Vec<ChatAction> {
         }
         // FUN_100b82c2 (the stat gate is the hub's)
         Kind::Voice => vec![ChatAction::Voice { cmd: t[0].clone(), sound: t.get(1).cloned() }],
+        Kind::Duel | Kind::PetDuel => duel_cmd(ctx, t, cmd.kind == Kind::PetDuel),
         // FUN_100b8693 (colour 0x51; the usage text has the unclosed `&ltcommand&gt;` of the original)
         Kind::Macro => {
             if n < 3 {
@@ -1252,6 +1287,40 @@ mod tests {
         assert_eq!(toks("/viewdist 50"), ["/viewdist", "50"]);
         assert_eq!(toks("/char&viewdist 40 60"), ["/char&viewdist", "40", "60"]);
         assert_eq!(toks("/chardist"), ["/chardist"]);
+    }
+
+    /// `/duel` / `/petduel` (GUI 0x100b8a10 / 0x100b8789): argument-less = challenge, `accept|reject|stop|draw` (case-insensitive), else five / four usage lines.
+    #[test]
+    fn duel_commands() {
+        use ao_net::n3::action::duel::Op;
+        let gs = groups();
+        let c = ctx(&gs, &txt);
+        assert_eq!(parse("/duel", &c), [ChatAction::Duel { pet: false, op: Op::Challenge }]);
+        assert_eq!(parse("/duel ACCEPT", &c), [ChatAction::Duel { pet: false, op: Op::Accept }]);
+        assert_eq!(parse("/duel reject", &c), [ChatAction::Duel { pet: false, op: Op::Refuse }]);
+        assert_eq!(parse("/duel stop", &c), [ChatAction::Duel { pet: false, op: Op::Stop }]);
+        assert_eq!(parse("/duel draw", &c), [ChatAction::Duel { pet: false, op: Op::Draw }]);
+        assert_eq!(parse("/petduel", &c), [ChatAction::Duel { pet: true, op: Op::Challenge }]);
+        assert_eq!(parse("/petduel accept", &c), [ChatAction::Duel { pet: true, op: Op::Accept }]);
+        let line = |t: &str| format!("<div><font color=CCChatCmdFeedbackError>{t}</font></div>");
+        let acts = parse("/duel foo", &c);
+        let usage: Vec<&str> = acts.iter().map(fb).collect();
+        assert_eq!(
+            usage,
+            [
+                line("Usage: /duel -- ask the target player if he wants to duel."),
+                line("    /duel accept -- accept duel request from another player."),
+                line("    /duel reject -- reject duel request from another player."),
+                line("    /duel stop -- stop current duel."),
+                line("    /duel draw -- propose a draw."),
+            ]
+        );
+        // too many words, and `draw` is not a pet-duel word: the pet usage (no draw line, `stop` text with two dots)
+        assert_eq!(parse("/duel accept now", &c).len(), 5);
+        let acts = parse("/petduel draw", &c);
+        let pet: Vec<&str> = acts.iter().map(fb).collect();
+        assert_eq!(pet.len(), 4);
+        assert_eq!(pet[3], line("    /petduel stop -- stop current duel.."));
     }
 
     #[test]

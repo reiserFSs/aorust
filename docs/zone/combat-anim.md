@@ -37,6 +37,8 @@ Factory `FUN_1007be9f` [GC 0x1007be9f]: id 0 `CharIdle_t` (update `FUN_1007b88a`
 update `FUN_1007b58c`). Fight controller `SimpleChar+0x1d4`: `+0x44` fight state (1 = not fighting), `+0x4c/+0x50` target.
 Transition to death: any of idle / fight / nano / turn updates tests **dynel stat-flag word `+0x138` bit 4 (0x10)** -> state 0xb.
 Fighting and not dead -> 10 (`CharFight_t` ctor: with a target set while fight state is 1 it calls the start-fight routine `FUN_10069c68`, then the holder's idle update).
+The app has no per-character state objects, so the state ids (`CharState`), the dead flag mask (0x10) and the human skeleton hash (`0xbd945cbe`, section 1) are **not mirrored in code**
+(they were unused tables and are deleted): death is the `CharacterAction` 99 -> `Dynels::die` / `Dying` path (section 5), the clip names come from the name table of the model's own set.
 
 ## 3. Attack swing
 
@@ -49,8 +51,26 @@ Fighting and not dead -> 10 (`CharFight_t` ctor: with a target set while fight s
   playing (`FUN_1003bfd2`) are not restarted. If no clip is found and `char+0x21c == 0`: `FUN_10010d83(char, 0x3e, 1)` (the social
   `wave`!) [CODE, taken literally].
 * **Speed** (`swing_speed_scale`): if `char+0x21c == 0` and the mesh exists: `SetSpeedScale(clip, clamp(noteTime_ms / (ItemDelay*10), 1, 2))`
-  (`ItemDelay` = weapon stat 0x126, `_DAT_101600f0` = 10.0 double, cap `_DAT_10158794` = 2.0f): the swing is only ever sped up so
-  its "attack" note lands within the weapon delay.
+  (`ItemDelay` = weapon stat 0x126 = 294, `_DAT_101600f0` = 10.0 double, cap `_DAT_10158794` = 2.0f): the swing is only ever sped up so
+  its first note lands within the weapon delay. **[CODE, DisplaySystem.dll]** `VisualCATMesh_t::GetNoteTime(clip, 0)` [DS 0x10073386] returns
+  entry 0 of the clip's `AnimMetadata` (stride 0x28, float at +0x24; 0 when the clip has none); `SetSpeedScale` [DS 0x100737c2] stores the scale
+  at `AnimStruct+0x20`. The metadata entries are the CAT clip's named events (`CatAnim::events`, `(time ms, name)`), so entry 0 = the clip's first event.
+
+### 3.0 What the client runs (`combat/glue.rs::swing`, `Dynels::pick_swing`)
+Every `Hit` / `SpecialAttack` event of any character:
+1. **Weapon swing**: the holder's wielded weapon (`Dynels::wield`, the `WeaponItemFullUpdate` children in body slot 6 = right hand, 8 = left;
+   `AnimSet` 0x161 and `ItemDelay` 0x126 from the item template under the message stats) -> `weapon_list(AnimSet, left, crawl = false, key)`
+   (`key` = `0xb`, or the special's list key, else `0xb` when the weapon has no such key) -> random value (the CRT-rand stream of `Dynels`)
+   -> AbstractAnimID -> the own avatar plays `Role::Clip(anim_name(id))` (`Player::swing`, rate x `swing_speed_scale(first event time, ItemDelay)`,
+   `Avatar::set_swing_delay`), every other character `Dynels::play_once(id, anim)` (NPC record table or the set's file name through
+   `resolve_clip`, same speed scale in `Dynels::update`). [DATA] all weapon attack ids exist as clips for male / female / athrox (test `fight_clips_exist_in_the_data`).
+2. **No weapon list** (nothing wielded, `AnimSet` 4/5/other, or a special whose list lives on its own item: Brawl, Dimach, Backstab, bow special): creatures
+   play key `0x40a` = `UNARMED_RSWING` (1034) of their NPC record (`Dynels::attack`; the earlier code used 1033 = `unarmed-kick`/`0x409`, which is the
+   *spray* clip of creature records, npc.md section 3), the own player plays `unarmed-rswing`. **[UNRESOLVED]** the original's bare-hand / martial-arts list lives in the
+   special's / template item record (`+0xe4`, `UnarmedTemplateInstance`), whose layout is not decoded; `unarmed-rswing` is the creature path of the same function, not a verified
+   player choice. The crawl lists (`crawl = true`) are not used: stat 0x1ae is not tracked per dynel.
+3. **Text above the character** for special attacks (`FUN_10011108(char, "Burst!\n", 0xd)`): `Module::on_frame` pushes a world-space `Number` (category 0xd = colour
+   `0x00f000`, effect `0x2f5a` path, `combat-log.md` section 6) with the text without its trailing newline. The sound of Brawl / Dimach is in section 6.
 * A 0/1/2 "height" variant (`param_3` of `FUN_1003c8b7`) is computed for `AnimSet == 0` weapons from the muzzle attractor
   (`AttractorMesh::GetName(0)`) vs the target's height and distance < 6 m (`_DAT_1015d0a0`; < 3 m `_DAT_1015d69c`); what it selects inside
   `FUN_1003c802` is **[UNRESOLVED]** (not modelled).
@@ -98,11 +118,20 @@ the slot probably holds a client-made template item).
   Stance ids per weapon type: section 3.1 (`blade-start/idle-blade/blade-stop` 1000-1002, `smallarms` 1010-1012, `rifle` 1020-1022,
   `unarmed` 1030-1032, `2h` 1055/1054/1056, `bow` 0xb5-0xb8). **There is no separate "fight stance" clip**: being in `CharFight_t` only keeps the weapon
   idle (list 0x10); a character that is not fighting plays plain 0x78/walk/run.
-* **Being hit** (`CharacterActionIIR_t` action **0xd1**, `FUN_1005d0d8` case 0x5b [GC 0x1005eada]): if both `param` values are `> 0`, play the hit sound at the
+* **Being hit** (`CharacterActionIIR_t` action **0xd1**, `FUN_1005d0d8` case 0x5b [GC 0x1005eada]): if `identity_a.instance` and `identity_b.instance` (the handler's two `Identity*` arguments; `param` is not read) are both `> 0`, play the hit sound at the
   victim's position (section 6). **No hit-reaction animation was found**: the `imp-*` clips (0x7e..0x84) exist in the data and the engine
   has `n3VisualDynel_t::GetImpactAnim` (base returns 0, [N3 0x10007572]; Gamecode export thunk 0x10131f02) but the override that picks an
   `imp-*` id was not located. **[UNRESOLVED]** (searched: immediate-id scans of Gamecode.dll, callers of the thunk).
 * **Miss** (`MissedAttackInfoIIR_t`, apply `FUN_1006ae50`): combat-log text only; no dodge/miss animation or sound exists in the code paths read.
+* **Pose enter / stop clips** (sit, sleep, lounge, crawl; `actions::Pose::transition_anim`, glue `ActionEvent::Pose`, `Player::update`): the FSM entry handlers call
+  `FUN_1006d330(holder, idle, enter, ...)` [GC 0x1006d330] = store `idle` as the holder's current idle (`FUN_1003c4e1`), `Play(enter)` once, start the idle when the enter clip is nearly over:
+  SwitchToSitGround `FUN_1006e2be` (idle 0xd7 `idle-ground`, enter 0xd5 `ground-start`), LeaveSit `FUN_1006e372` (0xd6 `ground-stop`), sleep `FUN_1006e6ff`
+  (0xee, enter 0xed `sleep-ground`), lounge `FUN_1006e8a9` (0xf0, 0xef `lounging`), crawl enter `FUN_1006e646` (0x9a `idle-crawl`, 0x68 `crawl_start`), crawl leave `FUN_1006e3ff`
+  (0x69 `crawl_stop`); `FUN_1006c065` re-applies the idle per mode (7 / 8 / 5 / 0xb / 0xc). Sitting on an item uses the same mode-8 handler: the `chair-*` ids (0xd8..0xda)
+  are pushed by no handler (immediate scan of Gamecode.dll for 0xd8/0xd9/0xda), so there is no chair clip. The idle clips are the movement state's own (`AnimState` / the avatar's
+  `Role`), the enter / stop clip is played over them for other dynels (`Dynels::play_once`) and the own avatar (a `Role::Clip` transient). **[UNRESOLVED]** leaving sleep / lounge to
+  sitting (`FUN_1006e79f` / `FUN_1006e949`) calls the same helper with `param_5 = 1` and the *enter* clip (0xed / 0xef), taken as backwards playback: not reproduced (neither
+  `Dynels` nor `Avatar` plays a clip backwards), the character goes straight to `idle-ground`.
 
 ## 5. Death
 ### 5.1 NPCs and other characters (live, 15 of 15 in the capture)
@@ -116,7 +145,7 @@ with the char's global position); **animation** = AbstractAnimID `GetSkill(0x183
 503 = `die-shot` live; 500 knees, 501 pain, 502 poison, 504 ground, 505 float, 0xcc crawl; all fall back to 6000 `die-pain`); stat flag 0x20 set; effect
 `FUN_10002e6a(9)`. Update `FUN_1007b58c`: timer `+= dt`; when `> 3.0 s` (`_DAT_1015d69c`) and the char is the control char (`+0x140`) it sends
 `CharacterActionIIR_t` action **0x98** (empty text) and returns to idle; otherwise the char waits for the server's quit (2.92-2.99 s < 3.0 s, so the quit always wins for NPCs).
-`DIE_WAIT_S`, `ACTION_DEATH_DONE`, `Dying`, `die_sound`, `death_anim_from_action` implement exactly this.
+`DIE_WAIT_S`, `ACTION_DEATH_DONE`, `Dying` / `DieEvent` (own character, `Module::update`), `die_sound`, `death_anim_from_action` (also stores stat 0x183 in `Combat`, `STAT_DEATH_ANIM`, read back by `Module` when the own char dies; `Dynels::die` plays the clip) implement exactly this.
 (Other CharDie branches - effect 3000 `CreateEffect2`, `SetStat(Health, 1)` after the clip ends for chars with `+0x21c == 0` - are read but their purpose is **[UNRESOLVED]**.)
 
 ### 5.2 The own character
@@ -142,15 +171,20 @@ All through `SandyInterfaceModule_t::PlayGameSound(soundId, pos...)` [GC `FUN_10
 | `SM_Sandy_Game_FemaleGetsHit` | same, Sex == 3 | 4 children (`sfx/breeds/female_hit_01..04.wav` exist) |
 | `SM_Sandy_Game_Brawl` / `_Dimach` | special attack Brawl / Dimach | positional at the char |
 | creatures | death / hit | NPC-record sound multimap keys `0x1e` / `0x1f` (`npc_sound`), sound ids = `CreateSoundID` hashes |
-| `SM_Sandy_Game_FlameThrowerFire`, `PistolSingleShotHitFlesh/Ground`, `PistolMultiShotFire`, `PistolSingleShotFire` | loaded into `FUN_1009b913` members | **not defined in either .sbf**: the ids resolve to nothing, silent |
-| `SM_Sandy_Game_Explo_Big/Med/small` | explosions (`FUN_1009d182`, grenade) | `sfx/weapons/explotions/*` |
+| `SM_Sandy_Game_Explo_Big/Med/small` | explosions (`FUN_1009d182`, grenade) | `sfx/weapons/explotions/*` (defined; no caller in the combat code, grenade effect path unresolved) |
+
+**Wired** (`combat/glue.rs` -> `Dynels::char_sound` / `sound_at` -> `GameSound` queue -> `Audio::play_game_sound(id, pos, camera)`, the same path as the door sounds): death on `CharacterAction` 99
+(`CombatEvent::Died` cause 0), hit on `0xd1` (`Module::take_struck`), Brawl / Dimach from `CombatEvent::SpecialAttack` through `special_swing(stat).sound`. A creature (look with NPC record) plays a
+random value of `NpcRecord::sounds` key 0x1e / 0x1f (`FUN_1004570c`: `rand() % count`, no RNG call for one value; the multimap is decoded, docs/zone/npc.md §4); other characters the
+Male / Female name by the look's sex (3 = female). **[INFERENCE]** `FUN_10051f6e() != 0` is read as "has an NPC record" (look.npc). The own character plays at the camera (the avatar is not a dynel model here).
 
 Weapon firing / impact sounds of real weapons are **not** played by this combat code: they belong to effect scripts (`_EffectHandler_t::CreateEffect2(effectId)`, weapon stats
-`EffectType` 413 / `ImpactEffectType` 414 read in `FUN_1007ac9a`, FXS data) - **[UNRESOLVED]**, out of this slice. `sfx/weapons/{guns,swords,swish,impacts,missile}` hold the wavs.
+`EffectType` 413 / `ImpactEffectType` 414 read in `FUN_1007ac9a`) - **[UNRESOLVED]**, see §8. The five weapon-class names (`FlameThrowerFire`, `PistolSingle/MultiShot*`) have no constants in the code
+(not defined in either .sbf, nothing to play).
 **Correction to docs/formats.md ("168 `sfx/player/*.txt` unused")**: the files (`<breed>_<sex>_<cool|distunguished|military|simple>_<heal|help|inc|no|run|yes>_NN.wav` + subtitle `.txt`) are the
 **chat voice commands** (GUI.dll strings `sound/sfx/player/`, `VoiceSndFxType`, `VoiceSndFxHear{Team,Guild,Vicinity}On`, `Voicecommands.html`), not per-animation FX; no combat code uses them.
 
-## 7. Corpses (`CorpseInfo`)
+## 7. Corpses
 `CorpseFullUpdateIIR_t` (0x4F474E05, header kind **0xC76A**, decoder `ao_net::n3::world::Corpse`, reader `FUN_1009f502`, ctor `FUN_1009f7b0`, vtable 0x10166a5c): a **separate dynel**
 (`Corpse_t` : `Chest_t` : `SimpleItem_t` family [GC 0x101622d4, docs/zone/static.md §1]; its mesh / cloth / look resolution is `ao_formats::dynel_visual`, docs/zone/static.md; name `Remains of <owner name>`), created with stats `Flags`(0) 0x181805, `CATMesh`(42) = the model, `MonsterScale`(360), `Sex`, `Breed`, `Cash`(61) (loot money),
 **`DeadTimer`(34) = 600**, **`TimeExist`(8) = 18000 / 180000**, `CorpseType`(415) = 50000, `CorpseInstance`(416) = owner id, `MultipleCount`(412) = 1; 5 cloth slots, no textures
@@ -161,8 +195,22 @@ CAT mesh (bind pose), evidence in docs/zone/static.md §5 (not the owner's death
   (`CORPSE_INVENTORY`, `N3Msg_SetLootAccess`, `Feedback_NotAllowedToLoot`, team loot strings); `BankCorpseIIR_t`, `ReclaimBooth_t` (the "Reclaim" window) are the player-corpse side.
 * Despawn: server driven (`n3ToClientQuitIIR_t` for the corpse; live corpse 5163 left 40 s after it arrived while `TimeExist` = 180000). The units of `DeadTimer` / `TimeExist`
   are **[UNRESOLVED]** (no code reads stat 34 / 8 by number; `DeadTimer` appears only in the stat table).
+* **Implementation** (`Dynels::on_message`, `ao_formats::dynel_visual::corpse_visual`): the corpse dynel is a prop keyed `{0xC76A, instance}`, drawn unanimated. Nothing else of the update is
+  read by any client code found (no reader of `DeadTimer` / `TimeExist` / `CorpseType` / `CorpseInstance` by number, owner link unused), so the combat layer keeps **no** corpse record: the former `CorpseInfo` /
+  `corpse_stat` / `CORPSE_KIND` were deleted (no consumer). The dying NPC is removed by its own `n3ToClientQuit` (2.92-2.99 s after action 99, capture `zone_fight_ithaca.rec`), the corpse
+  appears 1 ms later as an independent dynel; nothing hides or links the owner's dynel.
+* Regression tests: `dynels::variant_tests::replayed_kill_plays_the_death_clip` (action 99 -> `Special::Die(503)` holds the clip, record sound at its position, quit removes the char),
+  `combat::module::death_tests::{captured_kill_stores_the_death_animation, own_death_holds_the_animation_and_reports_after_three_seconds}`. The selection leaves with the dynel
+  (`TargetingModule::update` clears `Zone::target` once `Zone::dynels` lost it; `Zone` drops it on `ToClientQuit`). The "dead leet stayed standing" sighting could not be reproduced from the capture:
+  the quit arrives after 2.92-2.99 s and the death clip is held until then.
 
 ## 8. Not found / open
 * The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
 * Weapon firing/impact FX + their sounds (effect scripts); `PlaySoundIIR_c` (0x455D2938), `GfxTriggerIIR_t` (0x7A222202) and `HealthDamageIIR_t` (0x3710256C) are registered
   message ids that never occur in the capture - server-driven sounds/effects may arrive through them.
+* Weapon sounds: `SM_Sandy_Game_*` definitions under `sfx/weapons/{guns 169, impacts 120, swish 42, explotions 32, lost_eden/*, missile 8, swords/*}` exist in the .sbf, but nothing in the
+  fight code reads a weapon -> sound id; the selector is the effect scripts of `EffectType` 413 / `ImpactEffectType` 414. Scanning every rdb record type for the effect ids `0x2f5a` / `0x2ced`
+  finds only records of types 1000046 / 1010001 with that number (1010001 = meshes; not effect scripts **[INFERENCE]**), `twk/` has no effect table, so the id -> script -> sound chain is
+  unresolved and the client port plays no weapon/impact sound yet.
+* `FUN_1005d0d8` case 0x5b also calls `vtable+0x40` of the stat system and, for a non-control char, `FUN_100523c3` (purpose not read); `FUN_10012a1e(soundId, pos)` runs just before `PlayGameSound` (not traced).
+* The own character's `Dying` default animation when no action 99 arrived (death computed by `FUN_1005ae91`): 503 is a **guess** (`DEFAULT_DEATH_ANIM`).

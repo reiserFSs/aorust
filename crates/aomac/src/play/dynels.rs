@@ -40,9 +40,11 @@ pub const DRAW_DISTANCE: f32 = 250.0;
 pub const NAME_TAG_RADIUS: f32 = 30.0;
 /// NPC record key of the generic death clip and of the first unarmed attack ([`ao_formats::character::NpcAnim`]).
 const DIE_KEY: u32 = 6000;
-const ATTACK_KEY: u32 = 1033;
+const ATTACK_KEY: u32 = canim::UNARMED_RSWING as u32;
 /// Weapon item stat `AnimSet` (0x161): selects the stance clips (docs/zone/combat-anim.md §3.1).
 const STAT_ANIM_SET: u32 = 353;
+/// Weapon item stat `ItemDelay` (0x126, centiseconds): the swing is sped up to land within it (`FUN_1006a239`).
+const STAT_ITEM_DELAY: u32 = 294;
 /// Weapon stance clips loaded with every character model: idle (list 0x10) of the anim sets 0/1/3/6/7/8 and walk/run of a 2H stance.
 const STANCE_IDS: &[u16] = &[0x3f3, 0x3e9, 0x3fd, 0xb6, 0xcb, 0x424, 0x421, 0x422];
 
@@ -134,12 +136,21 @@ pub struct Built {
     pub item: Option<ItemRig>,
     /// The stats of an item-family dynel: its template's overlaid by the message's (`N3Msg_DefaultActionOnDynel` reads `Can`, interact.rs).
     pub stats: Vec<(u32, i32)>,
+    /// The NPC record's sound multimap (`NpcRecord::sounds`: `AbstractAnimID_e` key -> sound ids; fight keys `combat::anim::npc_sound`).
+    pub sounds: Vec<(u32, Vec<u32>)>,
 }
 
 /// A skinned pose held for good: vertices and mount transforms.
 type HeldPose = (Vec<ao_scene::Vertex>, Vec<[[f32; 4]; 4]>);
 /// A weapon to resolve: (holder, hand slot, template, message stats).
 type PendingWeapon = (i32, usize, Option<u32>, Vec<(u32, i32)>);
+
+/// A wielded weapon: item stat `AnimSet` and `ItemDelay`.
+#[derive(Clone, Copy, Debug)]
+struct Wield {
+    set: i32,
+    delay: i32,
+}
 
 enum Model {
     Loading,
@@ -160,7 +171,7 @@ enum Req {
 enum Resp {
     Model { key: u64, result: Result<Box<Built>, String> },
     Placed(u32, Vec<PlacedDynel>),
-    Weapon { holder: i32, slot: usize, set: Option<i32> },
+    Weapon { holder: i32, slot: usize, wield: Option<Wield> },
     Clip { key: u64, id: u32, anims: Vec<Arc<CatAnim>> },
 }
 
@@ -196,8 +207,9 @@ impl Worker {
                     }
                     Req::Weapon { holder, slot, template, stats } => {
                         let tpl = template.and_then(|t| item_template(&store, t).ok().flatten());
-                        let set = effective_stats(tpl.as_ref(), &stats).iter().find(|s| s.0 == STAT_ANIM_SET).map(|s| s.1);
-                        Resp::Weapon { holder, slot, set }
+                        let stats = effective_stats(tpl.as_ref(), &stats);
+                        let stat = |id| stats.iter().find(|s| s.0 == id).map(|s| s.1);
+                        Resp::Weapon { holder, slot, wield: stat(STAT_ANIM_SET).map(|set| Wield { set, delay: stat(STAT_ITEM_DELAY).unwrap_or(0) }) }
                     }
                     Req::Placed(pf) => Resp::Placed(
                         pf,
@@ -261,7 +273,7 @@ fn static_model(store: &RecordStore, mesh: u32, override_texture: Option<u32>) -
 }
 
 fn plain(model: ao_scene::Scene, visible: bool) -> Built {
-    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None, stats: Vec::new() }
+    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None, stats: Vec::new(), sounds: Vec::new() }
 }
 
 fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::Result<Built> {
@@ -397,7 +409,8 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
     }
     let tag_height = rig.indicator_height();
     let features = rec.as_ref().and_then(|r| r.stat(ao_net::n3::motion::STAT_FEATURES as u32));
-    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), clips, features, tag_height, ..plain(Default::default(), true) })
+    let sounds = rec.map(|r| r.sounds).unwrap_or_default();
+    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), clips, features, tag_height, sounds, ..plain(Default::default(), true) })
 }
 
 fn named(store: &RecordStore, assets: &mut ActorAssets, model: u32, name: &str) -> anyhow::Result<Option<Arc<CatAnim>>> {
@@ -516,7 +529,9 @@ pub struct Dynels {
     /// Looks asked for before the worker existed.
     pending: Vec<Look>,
     /// `AnimSet` of the weapon in the right (slot 6) / left (slot 8) hand of a holder.
-    wield: HashMap<i32, [Option<i32>; 2]>,
+    wield: HashMap<i32, [Option<Wield>; 2]>,
+    /// (swing clip, `ItemDelay`) of the last [`Dynels::pick_swing`] of a character: the clip plays sped up by [`canim::swing_speed_scale`].
+    swing_delay: HashMap<i32, (u32, i32)>,
     /// Weapon dynel instance -> (holder, hand index).
     weapons: HashMap<i32, (i32, usize)>,
     pending_clips: Vec<(u64, CharLook, u32, i32)>,
@@ -540,8 +555,10 @@ pub struct Dynels {
     listing: Listing,
     /// The CRT's `rand()` the variant picks consume (`srand(time)` when the zone starts, [GUESS] for the exact call site).
     rng: CrtRand,
-    /// `PlayGameSound` calls of doors since the last [`Dynels::take_sounds`].
+    /// `PlayGameSound` calls of doors and characters (fight sounds) since the last [`Dynels::take_sounds`].
     sounds: Vec<GameSound>,
+    /// Camera position of the last [`Dynels::update`] (scene space).
+    cam: [f32; 3],
 }
 
 impl Default for Dynels {
@@ -555,6 +572,7 @@ impl Default for Dynels {
             next_prop: PROP_ID_BASE,
             pending: vec![],
             wield: HashMap::new(),
+            swing_delay: HashMap::new(),
             weapons: HashMap::new(),
             pending_weapons: vec![],
             pending_clips: vec![],
@@ -570,6 +588,7 @@ impl Default for Dynels {
             listing: Listing::default(),
             rng: CrtRand::new(1),
             sounds: vec![],
+            cam: [0.0; 3],
         }
     }
 }
@@ -645,6 +664,24 @@ impl Dynels {
         self.pending_clips.push((c.key, look.clone(), anim_id, id));
     }
 
+    /// The weapon swing of `id` (`FUN_10069acb` [GC 0x10069acb] + `FUN_1003c594`): a random value of list `key` of the `AnimSet` lists of the
+    /// weapon in its right hand (else left) - list 0xb when the weapon has no such key - and the weapon's `ItemDelay` (centiseconds), which
+    /// a following [`Dynels::play_once`] of that clip uses for the swing speed scale. `None`: nothing wielded, or an `AnimSet` whose lists live
+    /// in the item record (4, 5, martial arts; record layout not decoded, docs/zone/combat-anim.md §3.1): the caller plays the unarmed swing.
+    /// [GUESS] the wielder is never crawling (stat 0x1ae == 0xe is not tracked), so the crawl lists are not used.
+    pub fn pick_swing(&mut self, id: i32, key: u16) -> Option<(u16, i32)> {
+        let hands = self.wield.get(&id)?;
+        let hand = hands.iter().position(Option::is_some)?;
+        let w = hands[hand]?;
+        let mut list = canim::weapon_list(w.set, hand == 1, false, key);
+        if list.is_empty() {
+            list = canim::weapon_list(w.set, hand == 1, false, canim::list::ATTACK);
+        }
+        let anim = *list.get(self.rng.rand() as usize % list.len().max(1))?;
+        self.swing_delay.insert(id, (anim as u32, w.delay));
+        Some((anim, w.delay))
+    }
+
     /// `id` dies: the death clip `anim` (client animation id, `CharacterAction` 99's `identity_b.instance`; any other value =
     /// the generic death) plays once and holds.
     pub fn die(&mut self, id: i32, anim: u32) {
@@ -652,6 +689,37 @@ impl Dynels {
             c.special = Special::Die(anim);
             c.clip_ms = 0.0;
         }
+    }
+
+    /// `CharDie_t` ctor [GC 0x1007b2ba] / `FUN_1005d0d8` case 0x5b [GC 0x1005eada]: the death (`key` = [`canim::npc_sound::DEATH`]) or hit
+    /// (`HIT`) sound of character `id`, `PlayGameSound` at its position (docs/zone/combat-anim.md §6). A character with an NPC record plays a random
+    /// value of the record's sound list `key` (`FUN_1004570c`; nothing while the model is not built or the record has no such key), every other
+    /// one the male / female sound (Sex stat 3 = female). [INFERENCE] `FUN_10051f6e() != 0` = "the look has an NPC record".
+    /// The own character is not drawn here: its sound plays at the camera (the camera sits at the avatar).
+    pub fn char_sound(&mut self, id: i32, key: u32) {
+        let Some(c) = self.chars.get(&id) else { return };
+        let Look::Char(look) = &c.look else { return };
+        let sound = if look.npc {
+            let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return };
+            let ids = built.sounds.iter().find(|s| s.0 == key).map_or(&[][..], |s| &s.1[..]);
+            match ids.len() {
+                0 => return,
+                1 => ids[0],
+                n => ids[self.rng.rand() as usize % n],
+            }
+        } else {
+            let name = if key == canim::npc_sound::DEATH { canim::die_sound(look.sex) } else { canim::hit_sound(look.sex) };
+            ao_audio::sbf::sound_id(name)
+        };
+        let pos = if id == self.own { self.cam } else { scene_pos(c.pose.pos) };
+        self.sounds.push(GameSound { id: sound, pos });
+    }
+
+    /// A named fight sound (`SM_Sandy_Game_Brawl` / `_Dimach`, `FUN_1003c594`) at character `id`.
+    pub fn sound_at(&mut self, id: i32, name: &str) {
+        let Some(c) = self.chars.get(&id) else { return };
+        let pos = if id == self.own { self.cam } else { scene_pos(c.pose.pos) };
+        self.sounds.push(GameSound { id: ao_audio::sbf::sound_id(name), pos });
     }
 
     fn add_prop(&mut self, kind: i32, instance: i32, look: Look, pos: [f32; 3], rot: Option<[f32; 4]>, scale: f32) {
@@ -784,7 +852,9 @@ impl Dynels {
                     Err(e) => eprintln!("dynels: corpse {}: {e:#}", who.instance),
                 }
             }
-            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == 99 => self.die(who.instance, a.identity_b.instance as u32),
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && canim::death_anim_from_action(a.action, a.identity_b.instance as u32).is_some() => {
+                self.die(who.instance, a.identity_b.instance as u32)
+            }
             N3::Dynel(Dynel::WeaponItemFullUpdate(w)) if w.parent.kind == CHAR_KIND => {
                 // body location 6 = right hand, 8 = left hand (docs/zone/static.md §4)
                 if let Some(hand) = match w.byte_71 {
@@ -880,6 +950,7 @@ impl Dynels {
             }
             N3::Misc(Misc::ToClientQuit) => {
                 self.chars.remove(&who.instance);
+                self.swing_delay.remove(&who.instance);
             }
             _ => {}
         }
@@ -894,6 +965,7 @@ impl Dynels {
 
     /// Advances the dynels and hands the visible ones to the renderer. `cam` = camera position in scene space, `fwd` = its view direction.
     pub fn update(&mut self, dt: f32, cam: [f32; 3], fwd: [f32; 3], host: &mut Host) {
+        self.cam = cam;
         let Some(dir) = self.dir.clone() else { return };
         let worker = self.worker.take().unwrap_or_else(|| Worker::start(dir));
         if let Some(pf) = self.want_placed.take() {
@@ -923,7 +995,7 @@ impl Dynels {
                     }
                     self.replay.retain(|r| r.1 != id);
                 }
-                Resp::Weapon { holder, slot, set } => self.wield.entry(holder).or_default()[slot] = set,
+                Resp::Weapon { holder, slot, wield } => self.wield.entry(holder).or_default()[slot] = wield,
                 Resp::Model { key, result: Ok(built) } => {
                     self.models.insert(key, Model::Ready { built, uploaded: false });
                 }
@@ -1021,7 +1093,8 @@ impl Dynels {
                     None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
                 },
                 Special::Once(k) => match built.clips.get(&k) {
-                    Some(a) => (k, Some(a), 1.0),
+                    // `FUN_1006a239`: a weapon swing is sped up so its first note lands within the weapon's ItemDelay
+                    Some(a) => (k, Some(a), self.swing_delay.get(id_ref).filter(|s| s.0 == k).map_or(1.0, |s| canim::swing_speed_scale(a.first().and_then(|a| a.events.first()).map_or(0.0, |e| e.0 as f32), s.1))),
                     None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
                 },
                 Special::Attack => match built.clips.get(&ATTACK_KEY) {
@@ -1031,7 +1104,7 @@ impl Dynels {
                 Special::None => {
                     let (id, a) = clip_of(built, state).map_or((0x78, None), |(i, a)| (i, Some(a)));
                     // a wielder: weapon idle (list 0x10 of the first weapon in slot 6, 8) and 2H walk/run (lists 0x2a / 0x2b)
-                    let set = self.wield.get(id_ref).and_then(|w| w.iter().flatten().next().copied());
+                    let set = self.wield.get(id_ref).and_then(|w| w.iter().flatten().next().map(|w| w.set));
                     let stance = set.and_then(|set| {
                         let key = match state {
                             AnimState::Idle => canim::list::IDLE,
@@ -1506,6 +1579,28 @@ mod variant_tests {
         d.join("cd_image/rdb.db").exists().then_some(d)
     }
 
+    /// `FUN_10069acb`: the swing is a value of the wielded weapon's list (its `AnimSet`, the hand), a special key the weapon lacks falls back
+    /// to list 0xb; nothing wielded = no weapon swing.
+    #[test]
+    fn swing_comes_from_the_wielded_weapon() {
+        let mut d = Dynels::default();
+        assert_eq!(d.pick_swing(7, canim::list::ATTACK), None);
+        d.wield.entry(7).or_default()[0] = Some(Wield { set: 1, delay: 120 });
+        for _ in 0..20 {
+            let (a, delay) = d.pick_swing(7, canim::list::ATTACK).unwrap();
+            assert!([0x3eb, 0x3ec].contains(&a) && delay == 120, "{a:#x}");
+            assert!([0x3eb, 0x3ec].contains(&d.pick_swing(7, canim::list::BURST).unwrap().0), "a 1H blade has no burst: list 0xb");
+        }
+        assert_eq!(d.pick_swing(7, canim::list::SNEAK_ATTACK).unwrap().0, 0x3ec);
+        assert_eq!(d.swing_delay[&7], (0x3ec, 120));
+        // only the left hand holds a weapon
+        d.wield.get_mut(&7).unwrap().swap(0, 1);
+        assert!([0x3ee, 0x3ef].contains(&d.pick_swing(7, canim::list::ATTACK).unwrap().0));
+        // an AnimSet without lists (4, 5, martial arts): the caller plays the unarmed swing
+        d.wield.entry(8).or_default()[0] = Some(Wield { set: 4, delay: 100 });
+        assert_eq!(d.pick_swing(8, canim::list::ATTACK), None);
+    }
+
     /// The variant is rolled when a clip starts (key or state change), not on every frame of its loop, and a single clip never
     /// consumes the RNG (`FUN_1004570c`).
     #[test]
@@ -1584,10 +1679,37 @@ mod variant_tests {
         eprintln!("kill: special {:?} anim {} clips {:?}", c.special, c.anim, built.clips.keys().collect::<Vec<_>>());
         assert!(matches!(c.special, Special::Die(_)));
         assert!(c.anim == 503 || c.anim == DIE_KEY, "playing a death clip, not idle: {}", c.anim);
+        // the creature's death sound is a value of its record's key 0x1e list (`FUN_1004570c`), at the corpse-to-be's position
+        let want = built.sounds.iter().find(|s| s.0 == canim::npc_sound::DEATH).map(|s| s.1.clone()).unwrap_or_default();
+        let pos = crate::play::zone::scene_pos(c.pose.pos);
+        z.world.char_sound(leet, canim::npc_sound::DEATH);
+        let got = z.world.take_sounds();
+        assert_eq!(got.len(), usize::from(!want.is_empty()), "{want:?}");
+        assert!(got.iter().all(|s| want.contains(&s.id) && s.pos == pos));
         // the server removes the dynel ~3 s later (`n3ToClientQuit`): the NPC is gone
         let mut quit = kill.clone();
         quit.body = N3::Misc(Misc::ToClientQuit);
         z.world.on_message(&quit);
         assert!(!z.world.chars.contains_key(&leet));
+    }
+
+    /// `CharDie_t` / action 0xd1 sounds of a player (no NPC record): the male / female sound by the Sex stat, at the character.
+    #[test]
+    fn player_fight_sounds_follow_the_sex() {
+        let mut z = Zone::new(25988);
+        for f in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            z.on_frame(&f);
+        }
+        let (id, sex) = z.world.chars.iter().find_map(|(id, c)| match &c.look { Look::Char(l) if !l.npc => Some((*id, l.sex)), _ => None }).expect("a player in the capture");
+        z.world.char_sound(id, canim::npc_sound::DEATH);
+        z.world.char_sound(id, canim::npc_sound::HIT);
+        z.world.sound_at(id, canim::sound::BRAWL);
+        let s = z.world.take_sounds();
+        let ids: Vec<u32> = s.iter().map(|s| s.id).collect();
+        let sid = ao_audio::sbf::sound_id;
+        assert_eq!(ids, [sid(canim::die_sound(sex)), sid(canim::hit_sound(sex)), sid(canim::sound::BRAWL)]);
+        assert!(s.iter().all(|s| s.pos == scene_pos(z.world.chars[&id].pose.pos)));
+        z.world.char_sound(id + 1_000_000, canim::npc_sound::DEATH);
+        assert!(z.world.take_sounds().is_empty(), "unknown dynels are silent");
     }
 }

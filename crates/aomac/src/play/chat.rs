@@ -51,6 +51,10 @@ pub(super) enum GameAction {
     Camp,
     /// `/selectself`: AFCM 0x1e / 0x126 with the own id (`TargetingModule_t::SetTargetMessage`: `SetTarget(own, false)`).
     SelectSelf,
+    /// `/duel`, `/petduel` (GUI 0x100b8a10 / 0x100b8789) and the answers of the duel dialogs: run by the combat layer (`combat::duel`).
+    Duel { pet: bool, op: ao_net::n3::action::duel::Op },
+    /// Yes in the "StartPvP" dialog (`GuiSystem_c::StartPvPFightResult`, GUI 0x1002f789): `N3Msg_StartPvP(target)`.
+    StartPvp(ao_net::msg::Identity),
 }
 
 /// Results of chat commands that other layers apply (taken once per frame by the flow with [`Chat::take_requests`]).
@@ -235,6 +239,47 @@ impl Chat {
         if let Some(t) = texts.by_key(110, key) {
             self.line_to(gui, ChatLine::new(ChatKind::System, log::window_html("", &t)), Some("System"));
         }
+    }
+
+    /// `FUN_1009b37f(text, 0x51)`: a red `CCChatCmdFeedbackError` line of the chat window (usage / error text of a chat command, GUI 0x1009b37f).
+    pub fn cmd_error(&mut self, gui: &mut Gui, text: &str) {
+        self.line(gui, ChatLine::new(ChatKind::Other("CCChatCmdFeedbackError"), format!("<div><font color=CCChatCmdFeedbackError>{text}</font></div>")));
+    }
+
+    /// `LDBformat(GetText(110, key)).Feed(name).Dump()` + `FUN_10012b05(0, text, 0)` (the lines of `FUN_1005b821` / `FUN_1005c514`, e.g. `Feedback_DuelChallenge`):
+    /// a `Feedback_*` text with the name of a dynel fed in, as a plain System-window line.
+    pub fn feedback_named(&mut self, gui: &mut Gui, key: &str, name: &str, texts: &TextDb) {
+        if let Some(t) = texts.by_key(110, key) {
+            let t = log::ldb_format(&t, &[log::Arg::S(name.to_string())]);
+            self.line_to(gui, ChatLine::new(ChatKind::System, log::window_html("", &t)), Some("System"));
+        }
+    }
+
+    /// `GuiSystem_c::DuelChallengeReceived` / `DuelChallengeSent` [GUI 0x1002fd9c / 0x1002ff80]: the "Duel Challenge" dialog (text `Feedback_DuelChallenge`
+    /// / `Feedback_DuelChallengeSent` of category 110 fed with the name; buttons `MsgBox_Accept` + `MsgBox_Reject`, resp. `MsgBox_Cancel`, category 10000).
+    pub fn duel_dialog(&mut self, gui: &mut Gui, sent: bool, name: &str, texts: &TextDb) {
+        let (kind, key, buttons) = if sent {
+            (dialog::Kind::DuelSent, "Feedback_DuelChallengeSent", &["MsgBox_Cancel"][..])
+        } else {
+            (dialog::Kind::DuelReceived, "Feedback_DuelChallenge", &["MsgBox_Accept", "MsgBox_Reject"][..])
+        };
+        let body = log::ldb_format(&texts.by_key(110, key).unwrap_or_default(), &[log::Arg::S(name.to_string())]);
+        let buttons = buttons.iter().map(|b| texts.by_key(10000, b).unwrap_or_default()).collect();
+        self.dialog(gui, kind, body, buttons, None);
+    }
+
+    /// `GuiSystem_c::CloseDuelWindows` [GUI 0x1002f833].
+    pub fn close_duel_dialog(&mut self, gui: &mut Gui) {
+        self.dialogs.close_duel(gui);
+    }
+
+    /// `GuiSystem_c::StartPvPFightDialogue(text, target)` [GUI 0x1002fa8e] (action 0x7b): the "StartPvP" dialog with the server's question (`Combat_PvPTargetLvl`
+    /// / `Combat_PvPTargetLvlTeam`, LDB category 101, shown as it is) and the buttons `MsgBox_Yes` / `MsgBox_No` (category 10000).
+    pub fn pvp_dialog(&mut self, gui: &mut Gui, team: bool, target: ao_net::msg::Identity, texts: &TextDb) {
+        let key = if team { "Combat_PvPTargetLvlTeam" } else { "Combat_PvPTargetLvl" };
+        let body = texts.by_key(101, key).unwrap_or_default();
+        let buttons = ["MsgBox_Yes", "MsgBox_No"].iter().map(|b| texts.by_key(10000, b).unwrap_or_default()).collect();
+        self.dialog(gui, dialog::Kind::StartPvp(target), body, buttons, None);
     }
 
     /// `GlobalSignals+0x17c (0, text, colorCode)` [GC `FUN_10012b05`]: a coloured line of the System window (`FlowControlModule_t`
@@ -558,6 +603,14 @@ impl Chat {
                 self.afk = None;
                 self.system_line(gui, "AFK off.", 0);
             }
+            // `GuiSystem_c::DuelChallengeReceivedResult` [GUI 0x1002f802]: Accept (0) -> `N3Msg_Duel_Accept`, every other answer (Reject, Esc) -> `_Refuse`
+            (dialog::Kind::DuelReceived, button) => {
+                let op = if button == 0 { ao_net::n3::action::duel::Op::Accept } else { ao_net::n3::action::duel::Op::Refuse };
+                self.game.push(GameAction::Duel { pet: false, op });
+            }
+            // `DuelChallengeSentResult` [GUI 0x1002f825]: the Cancel button (or Esc) retracts with `N3Msg_Duel_Refuse`
+            (dialog::Kind::DuelSent, _) => self.game.push(GameAction::Duel { pet: false, op: ao_net::n3::action::duel::Op::Refuse }),
+            (dialog::Kind::StartPvp(target), 0) => self.game.push(GameAction::StartPvp(target)),
             _ => {}
         }
     }
@@ -891,6 +944,7 @@ impl Chat {
             ChatAction::AfkPrompt { default, body } => self.dialog(gui, dialog::Kind::Afk, body, vec!["Ok".into()], Some(default)),
             ChatAction::Camp => self.game.push(GameAction::Camp),
             ChatAction::SelectSelf => self.game.push(GameAction::SelectSelf),
+            ChatAction::Duel { pet, op } => self.game.push(GameAction::Duel { pet, op }),
             // `BrowserWindow_c` type 3 ("Petition", an embedded browser) opens `https://report.project-rk.com/` (docs/chat/dialogs.md §6);
             // the system browser stands in for the embedded Awesomium view
             ChatAction::Petition => self.open_url(PETITION_URL),

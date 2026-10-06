@@ -6,7 +6,6 @@
 //! * [`FloatingNumber`] constants are the damage-number draw parameters of the HUD path (`RenderTextModule_t::DamageTextMessage`
 //!   [GUI 0x1004ae2f]) and of the world path (`_GfxControlFont_t`, effect `0x2f5a` of `Setupf/gfxtweak.bin`).
 
-#![allow(dead_code)] // consumed by the combat renderer / HUD
 
 use super::stat_names;
 use ao_formats::screens::TextDb;
@@ -278,8 +277,6 @@ pub const WORLD_NUMBER: FloatingNumber = FloatingNumber {
     font: FloatingFont::Effect { effect_id: 0x2f5a, material: 40 },
     space: Space::World,
 };
-/// Billboard glyph size of the world number (`gfxtweak.bin` param 0x1c, `_GfxControlFont_t+0x2c`).
-pub const WORLD_CHAR_SIZE: f32 = 0.01;
 
 /// The draw parameters of a number in `category` for `space`.
 pub fn floating_number(space: Space, category: u32) -> FloatingNumber {

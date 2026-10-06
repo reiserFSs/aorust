@@ -1190,6 +1190,29 @@ fn action_lines(ctx: &LogCtx, who: Identity, action: i32, param: i32, a: Identit
                 direct(param, 0, ctx.key(200, "ClientServerVersMM"), out);
             }
         }
+        // `FUN_10064301` [GC 0x10064301] (case 0x2a, handler 0x1005ddbc): a special action / skill cannot be used for `identity_b.instance` more seconds; own
+        // character only. Template (LDB 1000) `UnableToPerformActionSkill` (skill `identity_b.kind` named by `GetText(2003, kind)`), `...Perk` (perk
+        // `identity_a.instance`) or `UnableToPerformAction`; fed (name,) hours, minutes, seconds.
+        // [UNRESOLVED port] the perk branch needs the perk name (`FUN_1005366e`, the perk records of the RDB): that line is not printed.
+        0x84 if own && !(b.kind == 0 && a.instance != 0) => {
+            let (h, secs) = (b.instance / 3600, b.instance);
+            let m = secs / 60 - h * 60;
+            let mut args = vec![];
+            let key = if b.kind != 0 {
+                args.push(s((ctx.text)(2003, b.kind as u32).unwrap_or_default()));
+                "UnableToPerformActionSkill"
+            } else {
+                "UnableToPerformAction"
+            };
+            args.extend([n(h), n(m), n(secs - (h * 60 + m) * 60)]);
+            direct(0, 0, ldb_format(&ctx.key(1000, key), &args), out);
+        }
+        // `FUN_1005d0d8` case 0x5a (0xd0, 0x1005e8b5): when `identity_a.instance` is the own character (the drainer) "You drained %d points of health / nano
+        // from the target." (amount = `identity_a.kind`; health when `identity_b.kind == 0x1b`)
+        0xd0 if a.instance == ctx.own.instance => {
+            let key = if b.kind == 0x1b { "Feedback_DrainedHealth" } else { "Feedback_DrainedNano" };
+            direct(param, 0, ldb_format(&ctx.fb(key), &[n(a.kind)]), out);
+        }
         // [GUESS] the id fed to GetText(2002, id) is identity_b.instance (the stat of the skill); the same register pattern as Stuck*
         0xa4 => direct(param, 30, ldb_format(&ctx.fb("Feedback_SkillAvailable"), &[s((ctx.text)(2002, b.instance as u32).unwrap_or_default())]), out),
         0xc4 => direct(param, 0, ldb_format(&ctx.fb("Feedback_StuckResolved"), &[n(b.instance)]), out),
@@ -1356,6 +1379,10 @@ mod tests {
             assert_eq!((l[0].1, l[0].2.as_str()), ("CCRed", "You have been detected by Snake!"));
             let l = texts(classify(&act(0x01, 0x4000_0001, Identity::default(), Identity::default()), ctx));
             assert_eq!(l[0].2, "You killed the mission target!..");
+            // special action recharge refusal (action 0x84): 3725 s = 1:02:05; perk branch (`identity_a.instance != 0`, no skill) prints nothing
+            let l = texts(classify(&act(0x84, 0, Identity::default(), Identity { kind: 0, instance: 3725 }), ctx));
+            assert_eq!(l[0].2, "Unable to perform action, able in 01:02:05");
+            assert!(classify(&act(0x84, 0, id(9), Identity { kind: 0, instance: 5 }), ctx).is_empty());
             // level up
             let nl = LogEvent::NewLevel { who: id(1), f: [12, 0, 0, 0, 0, 0, 0, 0] };
             assert_eq!(texts(classify(&nl, ctx))[0].2, "New Level: 12!");
