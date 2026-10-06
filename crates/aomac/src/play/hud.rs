@@ -4,10 +4,14 @@
 
 use super::hud_stats::HudStats;
 use super::hud_map::HudMap;
-use super::hud_bar::{self, ShortcutBar};
+pub(super) use super::hud_map::ground_map;
+use super::hud_aggdef::{self, AggDef};
+use super::hud_bar::{self, ShortcutBar, SlotUse};
+use super::hud_compass::Compass;
 use super::hud_target::HudTarget;
 use super::zone::Zone;
 use ao_formats::stats;
+use ao_net::frame::Frame;
 use ao_gui::xml::{self, Element};
 use ao_gui::{Event, Gui, InputEvent, MouseButton, WindowId, WindowSize};
 use std::collections::HashMap;
@@ -275,6 +279,14 @@ pub(super) struct Hud {
     target: HudTarget,
     /// Shortcut bars (`hud_bar.rs`).
     shortcuts: Vec<ShortcutBar>,
+    /// The compass window (`hud_compass.rs`).
+    compass: Option<Compass>,
+    /// The AGG/DEF slider of the right control-centre bar (`hud_aggdef.rs`).
+    aggdef: AggDef,
+    /// Zone frames produced by the HUD (the slider's `SetStatIIR_t`); the flow drains them.
+    outbox: Vec<Frame>,
+    /// Activated hotbar slots the game has to carry out (the flow drains them).
+    uses: Vec<SlotUse>,
 }
 
 impl Hud {
@@ -291,7 +303,8 @@ impl Hud {
         let target = HudTarget::new(gui, cc, size)?;
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
-        let mut hud = Hud { cc, size, dvalues: default_dvalues(dir), bars: vec![], bar_titles, menu_roots, popup: None, open: vec![], stats: HudStats::new(dir)?, map: HudMap::new(dir), target, shortcuts: vec![] };
+        let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
+        let mut hud = Hud { cc, size, dvalues: default_dvalues(dir), bars: vec![], bar_titles, menu_roots, popup: None, open: vec![], stats: HudStats::new(dir)?, map: HudMap::new(dir), target, shortcuts: vec![], compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![] };
         hud.target.targets_target = hud.dvalues.get("Targetstarget").is_some_and(|v| *v != 0);
         hud.fill_docks(gui);
         hud.create_bars(gui, dir);
@@ -325,10 +338,11 @@ impl Hud {
         );
         let right = bar(
             "GFX_GUI_CONTROLCENTER_BOTTOM_RIGHT",
-            "<TextView value=\"DEF\" color=\"0x1000000\" layout_borders=\"Rect(0,0,5,0)\"/>\
-             <BitmapView name=\"aggdef\" bitmap_id=\"GFX_GUI_CONTROLCENTER_AGGDEF_SLIDER_BACKGROUND\" view_layout=\"stacked\">\
-             <BitmapView name=\"aggdef_knob\" bitmap_id=\"GFX_GUI_CONTROLCENTER_AGGDEF_SLIDER\" h_alignment=\"left\" layout_borders=\"Rect(58,0,0,0)\"/></BitmapView>\
-             <TextView value=\"AGG\" color=\"0x1000000\" layout_borders=\"Rect(5,0,0,0)\"/>",
+            &format!(
+                "<TextView value=\"DEF\" color=\"0x1000000\" layout_borders=\"Rect(0,0,5,0)\"/>{}\
+                 <TextView value=\"AGG\" color=\"0x1000000\" layout_borders=\"Rect(5,0,0,0)\"/>",
+                hud_aggdef::view_xml()
+            ),
             "Rect(23,2,6,2)",
         );
         let docks = [
@@ -393,6 +407,9 @@ impl Hud {
                 s.resize(gui, size);
             }
             self.fit_rollup_dock(gui);
+            if let Some(c) = &mut self.compass {
+                c.resize(gui, size);
+            }
             self.target.resize(gui, size);
             for b in &self.bars {
                 let (w, h) = gui.window_size(b.window);
@@ -402,6 +419,16 @@ impl Hud {
                 gui.set_window_pos(b.window, (x, y));
             }
         }
+    }
+
+    /// Zone frames produced by the HUD since the last call.
+    pub(super) fn take_outbox(&mut self) -> Vec<Frame> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    /// Hotbar slots activated since the last call (`FUN_100d79c9`).
+    pub(super) fn take_uses(&mut self) -> Vec<SlotUse> {
+        std::mem::take(&mut self.uses)
     }
 
     fn res<'a>(&'a self, zone: &'a Zone) -> impl Fn(&str, &str) -> Option<i64> + 'a {
@@ -422,6 +449,12 @@ impl Hud {
             // the alien bar exists only for characters with expansion bits 0x18 (GUI 0x1006afed: `GetSkill(0x185) & 0x18`)
             let show = show && (b.spec.cfg != "CCAlienXPBarConfig" || zone.stat(sid::EXPANSION).unwrap_or(0) & 0x18 != 0);
             gui.set_window_visible(b.window, show);
+        }
+        // `CompassWindow_c` criteria (`FUN_1006d433`)
+        let show = ao_gui::expr::truthy("dvalue:cc_section1 && dvalue:cc_compass", &res);
+        drop(res);
+        if let Some(c) = &mut self.compass {
+            c.set_visible(gui, show);
         }
         let active: Vec<(String, bool)> = self.dvalues.iter().map(|(k, v)| (k.clone(), *v != 0)).collect();
         for (n, a) in active {
@@ -465,10 +498,24 @@ impl Hud {
         self.stats.update(gui, zone, _dt);
         self.map.update(gui, zone, _dt);
         self.target.update(gui, zone, _dt);
+        self.aggdef.update(gui, self.cc, zone.stat(ao_net::n3::outgoing::STAT_AGG_DEF as u32));
+        if let Some(c) = &mut self.compass {
+            c.update(gui, zone);
+        }
     }
 
     /// Mouse-down outside an open sub menu closes it (the original's popup menus lose focus).
     pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, ev: &InputEvent, cam: &ao_render::Camera, lens: &ao_scene::Lens) {
+        let locked = self.dvalues.get("LockHotbars").is_some_and(|v| *v != 0);
+        for s in &mut self.shortcuts {
+            s.input(gui, ev, locked);
+        }
+        // the slider's release is `N3Msg_SetAggDef` -> `SetStat(0x33)`: applied to the own stats at once, then sent
+        if let Some(v) = self.aggdef.input(gui, self.cc, ev) {
+            zone.stats.insert(ao_net::n3::outgoing::STAT_AGG_DEF as u32, v);
+            let payload = ao_net::n3::outgoing::set_stat(zone.char_id as i32, ao_net::n3::outgoing::STAT_AGG_DEF, v);
+            self.outbox.push(ao_net::n3::outgoing::n3_frame(0, zone.char_id, payload));
+        }
         // target docks, world click-to-select (hud_target.rs) and the Tab target keys
         if let Some(pos) = self.target.input(gui, zone, ev) {
             self.target.world_click(zone, cam, lens, self.size, pos);
@@ -508,6 +555,12 @@ impl Hud {
                 self.close_kind(gui, k);
             }
             return true;
+        }
+        for s in &mut self.shortcuts {
+            if s.event(ev) {
+                self.uses.extend(s.take_uses());
+                return true;
+            }
         }
         let Event::Clicked { window, view, .. } = ev else { return false };
         let popup = self.popup.as_ref().map(|p| p.window);
@@ -595,6 +648,17 @@ impl Hud {
         self.toggle_dvalue(gui, kind.dvalue());
     }
 
+    /// The Map window's ground image from the world loader (`hud_map::ground_map`).
+    pub(super) fn provide_ground(&mut self, playfield: u32, map: ao_formats::topdown::GroundMap, rooms: bool) {
+        self.map.provide_ground(playfield, map, rooms);
+    }
+
+    /// The active mission's marker for the Planet Map's mission button (`hud_map::HudMap::set_mission`).
+    #[allow(dead_code)] // no producer yet: the quest messages are not decoded (docs/gui.md 12)
+    pub(super) fn set_mission(&mut self, marker: Option<(u32, [f32; 2])>) {
+        self.map.set_mission(marker);
+    }
+
     #[cfg(test)]
     pub(super) fn stats_window(&self, kind: WindowKind) -> Option<WindowId> {
         self.stats.window(kind)
@@ -616,6 +680,9 @@ impl Hud {
         self.map.close_all(gui);
         for s in self.shortcuts {
             s.close(gui);
+        }
+        if let Some(c) = self.compass {
+            c.close(gui);
         }
         gui.close_window(self.cc);
     }
@@ -754,5 +821,122 @@ mod tests {
             assert!(s.gui.has_view(s.hud.cc, "inventory_window") && s.gui.has_view(s.hud.cc, "friends_window"));
             png(&mut s, &mut o, &format!("hud-{tag}"));
         }
+    }
+
+    fn own(s: &mut Shot, yaw: f32, pos: [f32; 3]) {
+        use crate::play::zone::DynelState;
+        s.zone.char_id = 25988;
+        s.zone.dynels.insert(25988, DynelState { name: "Testy".into(), pos, yaw: Some(yaw), npc: false, side: 0, level: 1, health: 125, max_health: 125 });
+    }
+
+    /// One input event through the HUD and the GUI, like `Shot::input`.
+    fn send(s: &mut Shot, ev: InputEvent) {
+        let cam = ao_render::Camera::look_at(glam::Vec3::ZERO, -glam::Vec3::Z);
+        s.hud.input(&mut s.gui, &mut s.zone, &ev, &cam, &ao_scene::Lens::default());
+        for e in s.gui.input(ev) {
+            s.hud.event(&mut s.gui, &e, &s.zone);
+        }
+    }
+
+    /// The compass window at four headings (north / east / south / west) and with a waypoint straight ahead, 90 degrees right and
+    /// behind: 4x crops of the HUD shots (`compass-*.png` in `AOMAC_SHOT_DIR`).
+    #[test]
+    fn compass_shots() {
+        use super::super::hud_compass::Waypoint;
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        let win = s.hud.compass.as_ref().expect("compass").window;
+        let (x, y) = s.gui.window_pos(win);
+        assert_eq!((x, y), ((1280.0f32 * 0.73 - 68.0).floor() as i32, 5));
+        let crop = |s: &mut Shot, o: &mut Offscreen, name: &str| {
+            png(s, o, name);
+            if let Some(dir) = std::env::var_os("AOMAC_SHOT_DIR") {
+                let p = std::path::Path::new(&dir).join(format!("{name}.png"));
+                let img = image::open(&p).unwrap().to_rgba8();
+                let sub = image::imageops::crop_imm(&img, x as u32 - 4, 0, 145, 36).to_image();
+                let big = image::imageops::resize(&sub, 145 * 4, 36 * 4, image::imageops::FilterType::Nearest);
+                big.save(p.with_file_name(format!("{}.png", name.replace("hud-", "")))).unwrap();
+                std::fs::remove_file(&p).unwrap();
+            }
+        };
+        for (yaw, tag) in [(0.0, "north"), (std::f32::consts::FRAC_PI_2, "east"), (std::f32::consts::PI, "south"), (-std::f32::consts::FRAC_PI_2, "west")] {
+            own(&mut s, yaw, [100.0, 0.0, 100.0]);
+            crop(&mut s, &mut o, &format!("hud-compass-{tag}"));
+        }
+        // waypoints of the current playfield: ahead (north), to the east (right), behind (south)
+        own(&mut s, 0.0, [100.0, 0.0, 100.0]);
+        s.zone.playfield = Some(567);
+        for (wp, tag) in [([100.0, 0.0, 200.0], "wp-ahead"), ([200.0, 0.0, 100.0], "wp-right"), ([100.0, 0.0, 0.0], "wp-behind")] {
+            s.hud.compass.as_mut().unwrap().set_waypoint(Some(Waypoint { playfield: 567, pos: wp }));
+            crop(&mut s, &mut o, &format!("hud-compass-{tag}"));
+        }
+        // another playfield's waypoint is not shown
+        s.hud.compass.as_mut().unwrap().set_waypoint(Some(Waypoint { playfield: 1, pos: [100.0, 0.0, 200.0] }));
+        crop(&mut s, &mut o, "hud-compass-wp-other-playfield");
+    }
+
+    /// Dragging the AGG/DEF knob sends `SetStatIIR_t(0x33)` on release only, floors the value while dragging and clamps to -100..100.
+    #[test]
+    fn aggdef_drag_sends_set_stat_on_release() {
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        own(&mut s, 0.0, [0.0; 3]);
+        s.zone.stats.insert(0x33, 0);
+        png(&mut s, &mut o, "hud-aggdef-0");
+        let r = s.gui.view_rect(s.hud.cc, "aggdef").expect("slider view");
+        let knob = r.l + 58.0 + 5.0;
+        send(&mut s, InputEvent::MouseDown { x: knob, y: r.t + 5.0, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseMove { x: knob + 30.0, y: r.t + 5.0 });
+        assert!(s.hud.take_outbox().is_empty(), "nothing is sent while dragging");
+        send(&mut s, InputEvent::MouseUp { x: knob + 30.0, y: r.t + 5.0, button: MouseButton::Left });
+        let out = s.hud.take_outbox();
+        assert_eq!(out.len(), 1);
+        // 58 + 30 px of the 117 px travel = 50.4 -> floor 50
+        assert_eq!(out[0].payload, ao_net::n3::outgoing::set_stat(25988, 0x33, 50));
+        assert_eq!(s.zone.stat(0x33), Some(50));
+        png(&mut s, &mut o, "hud-aggdef-50");
+        // a press beside the knob grabs nothing; a far-right drag clamps to 100
+        send(&mut s, InputEvent::MouseDown { x: r.l + 2.0, y: r.t + 5.0, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseUp { x: r.l + 2.0, y: r.t + 5.0, button: MouseButton::Left });
+        assert!(s.hud.take_outbox().is_empty());
+        let knob = r.l + (50.0f32 * 117.0 / 200.0 + 58.5).floor() + 5.0;
+        send(&mut s, InputEvent::MouseDown { x: knob, y: r.t + 5.0, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseMove { x: knob + 500.0, y: r.t + 5.0 });
+        send(&mut s, InputEvent::MouseUp { x: knob + 500.0, y: r.t + 5.0, button: MouseButton::Left });
+        assert_eq!(s.hud.take_outbox()[0].payload, ao_net::n3::outgoing::set_stat(25988, 0x33, 100));
+    }
+
+    /// The first-login hotbar: Start Combat / Walk / Sit / Suspended Animation icons from rdb 1010008, the Follow macro, use,
+    /// drag-and-drop between slots and removal by dropping outside.
+    #[test]
+    fn hotbar_first_login_and_interaction() {
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        let names = s.hud.shortcuts[0].slot_names();
+        assert_eq!(names, ["Start Combat", "Walk", "Sit", "Follow", "", "", "", "", "", "Suspended Animation"]);
+        assert_eq!(s.hud.shortcuts[0].icon_count(), 5, "four rdb icons and the macro icon");
+        png(&mut s, &mut o, "hud-hotbar");
+        let win = s.hud.shortcuts[0].window;
+        let mut click = |s: &mut Shot, v: &str| {
+            let e = Event::CanvasClick { window: win, view: v.into(), x: 1.0, y: 1.0 };
+            s.hud.event(&mut s.gui, &e, &s.zone);
+        };
+        click(&mut s, "slot0");
+        click(&mut s, "slot3");
+        click(&mut s, "slot5");
+        assert_eq!(s.hud.take_uses(), vec![SlotUse::SpecialAction(0x4e), SlotUse::Macro("/follow".into())]);
+        // drag slot 1 onto slot 5, then slot 5 out of the bar
+        let (wx, wy) = s.gui.window_pos(win);
+        let at = |i: usize| (wx as f32 + 43.0 + 36.0 * i as f32 + 17.0, wy as f32 + 19.0);
+        let ((x1, y), (x5, _)) = (at(1), at(5));
+        send(&mut s, InputEvent::MouseDown { x: x1, y, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseMove { x: x1 + 20.0, y });
+        send(&mut s, InputEvent::MouseMove { x: x5, y });
+        png(&mut s, &mut o, "hud-hotbar-dragging");
+        send(&mut s, InputEvent::MouseUp { x: x5, y, button: MouseButton::Left });
+        assert_eq!(s.hud.shortcuts[0].slot_names()[1], "");
+        assert_eq!(s.hud.shortcuts[0].slot_names()[5], "Walk");
+        send(&mut s, InputEvent::MouseDown { x: x5, y, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseMove { x: x5 + 10.0, y: y + 200.0 });
+        send(&mut s, InputEvent::MouseUp { x: x5 + 10.0, y: y + 200.0, button: MouseButton::Left });
+        assert_eq!(s.hud.shortcuts[0].slot_names()[5], "");
+        png(&mut s, &mut o, "hud-hotbar-after");
     }
 }

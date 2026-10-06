@@ -292,7 +292,8 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
             3 => ao_formats::character::Skin::Asian,
             _ => ao_formats::character::Skin::Caucasian,
         };
-        let head = look.head.or_else(|| look.attractors.iter().find(|a| a.0 == 0).map(|a| a.1)).map(|h| h as u32);
+        // the head is delivered as `HeadMesh` and as attractor place 0; the attractor wins (like `CachedCharacter::head_mesh`)
+        let head = look.attractors.iter().find(|a| a.0 == 0).map(|a| a.1).or(look.head).filter(|&h| h > 0).map(|h| h as u32);
         let mut equipment = Equipment::default();
         for &(part, tex) in &look.cloth {
             if let Some(p) = ClothPart::ALL.get(part as usize).filter(|_| tex > 0) {
@@ -924,6 +925,7 @@ mod tests {
             if let Ok(what) = std::env::var("AOMAC_DYNEL_LOOK") {
                 let target = match what.as_str() {
                     "npc" => z.world.chars.values().find(|c| c.npc).map(|c| c.pose.pos),
+                    m if m.starts_with("monster:") => z.world.chars.values().find(|c| matches!(&c.look, Look::Char(l) if l.monster_data.to_string() == m[8..])).map(|c| c.pose.pos),
                     "player" => z.world.chars.values().find(|c| !c.npc && c.name != "Testy").map(|c| c.pose.pos),
                     k => z.world.props.iter().find(|(key, _)| format!("{:x}", key.0) == k).map(|(_, p)| p.pos),
                 };

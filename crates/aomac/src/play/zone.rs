@@ -163,7 +163,7 @@ impl Zone {
             }
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if who.kind == CHAR_KIND => {
                 if who.instance == self.char_id as i32 {
-                    self.own_update = Some(Box::new(u.clone()));
+                    self.own_update = Some(u.clone());
                     self.own_serial += 1;
                 }
                 self.dynels.insert(

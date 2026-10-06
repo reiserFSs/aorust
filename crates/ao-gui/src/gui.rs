@@ -71,6 +71,9 @@ struct Window {
     layer: i8,
 }
 
+/// Seconds between the presses of a double click on a `CanvasView` (Windows' default `GetDoubleClickTime`; UNRESOLVED: the client's own value).
+pub const DOUBLE_CLICK_TIME: f32 = 0.5;
+
 /// First id handed out by `Gui::add_image` (above every skin id).
 pub const EXTRA_BASE: u32 = 0x10000;
 
@@ -110,6 +113,8 @@ pub struct Gui {
     scroll_drag: Option<(ViewId, f32)>,
     /// Window whose frame close button is held down.
     frame_press: Option<WindowId>,
+    /// Last mouse press on a `CanvasView` (view, button, time, position) for double-click detection.
+    canvas_press: Option<(ViewId, MouseButton, f32, Point)>,
     /// Roots of `add_view` instances.
     items: std::collections::HashSet<ViewId>,
     extras: Vec<ExtraImage>,
@@ -174,6 +179,7 @@ impl Gui {
             popup: None,
             scroll_drag: None,
             frame_press: None,
+            canvas_press: None,
             items: Default::default(),
             extras: Vec::new(),
             text_shadow: (1, 1),
@@ -1277,6 +1283,12 @@ impl Gui {
                 self.mouse_up();
                 self.tip_update(true);
             }
+            InputEvent::MouseDown { x, y, button: MouseButton::Right } => {
+                self.mouse = Point::new(x, y);
+                self.update_hover();
+                self.tip_update(true);
+                self.canvas_right_down(x, y);
+            }
             InputEvent::Wheel { x, y, dy } => self.wheel(x, y, dy),
             InputEvent::Key { key, pressed: true, mods } => self.key_down(key, mods),
             InputEvent::Text(s) => self.text_input(&s),
@@ -1546,6 +1558,7 @@ impl Gui {
         }
         if let Some(p) = self.pressed.take() {
             let over = self.hit(self.mouse.x, self.mouse.y).map(|h| h.1) == Some(p);
+            self.canvas_release(p);
             if over {
                 self.canvas_up(p);
             }

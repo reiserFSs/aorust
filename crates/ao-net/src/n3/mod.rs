@@ -3,9 +3,10 @@
 //! an [`Identity`], one flag byte, then the type-specific body (layouts: docs/zone.md).
 //! Fixtures come from the sanitized live capture `docs/captures/zone_ithaca.rec`.
 
+pub mod action;
 pub mod combat;
-pub mod dynel;
 pub mod chat;
+pub mod dynel;
 pub mod misc;
 pub mod motion;
 pub mod nametag;
@@ -44,9 +45,9 @@ pub enum N3 {
     World(world::World),
     Dynel(dynel::Dynel),
     Misc(misc::Misc),
-    /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
     /// `ChatTextIIR_t` / `FeedbackIIR_t` / `FormatFeedbackIIR_t`.
     Chat(chat::N3Chat),
+    /// Id not decoded by any module (name in [`outgoing::REGISTRY`]); the raw body is kept.
     Unknown(Vec<u8>),
 }
 
@@ -70,9 +71,9 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
         N3::Dynel(m)
     } else if let Some(m) = misc::decode(&h, &mut r)? {
         N3::Misc(m)
-    } else {
     } else if let Some(m) = chat::decode(&h, &mut r)? {
         N3::Chat(m)
+    } else {
         N3::Unknown(f.payload[13..].to_vec())
     };
     Ok(Message { header: h, sender: f.sender, body })

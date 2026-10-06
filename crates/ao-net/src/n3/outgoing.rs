@@ -30,6 +30,8 @@ pub fn message_key(class: &str) -> u32 {
 pub const CHAR_IN_PLAY: u32 = 0x570C2039;
 /// `CharDCMoveIIR_t`: movement/position update [GC 0x1006ba23].
 pub const CHAR_DC_MOVE: u32 = 0x54111123;
+/// `SetStatIIR_t`: a client-side stat change that is passed on to the server (see [`set_stat`]).
+pub const SET_STAT: u32 = 0x6E5F566E;
 
 /// N3 payload header common to every IIR the client writes. `to_be_passed_on` is `this+0xc == 1`; both client
 /// messages below set it (`CharInPlayIIR_t` ctor [GC 0x100726ce], `CharDCMoveIIRBase_t` ctor [GC 0x1006bb28]).
@@ -71,6 +73,42 @@ pub fn char_dc_move(char_id: i32, m: &CharMove) -> Vec<u8> {
         w.i32(m.elapsed_ms);
         m.look.iter().for_each(|&f| w.f32(f));
     })
+}
+
+/// `SetStatIIR_t` (vtable [GC 0x10161370]; ctor `FUN_1007737e`, `Write` slot 8 `FUN_1007730c`): body `i32 value, i32 stat`. Built by
+/// `n3EngineClientAnarchy_t::N3Msg_SetStat(value, stat)` [GC 0x10026c49], queued with `EnqueueSelfMessage`; `n3Engine_t::DoExternalInput`
+/// [N3 0x100065d1] applies it locally and, because the "to be passed on" byte is 1 (ctor default, [N3 0x10009860]), forwards it with
+/// `SendIIRToObservers` -> `SendIIRToServer`. The receiving side (`ReadSubClass` `FUN_1007732f`) rejects `stat == 0x33` outside -100..=100.
+/// The GUI's only sender is the AGG/DEF slider (`N3Msg_SetAggDef` [IF 0x10008797] = `N3Msg_SetStat(ftol(v), 0x33)`).
+pub fn set_stat(char_id: i32, stat: i32, value: i32) -> Vec<u8> {
+    iir(SET_STAT, Identity { kind: DYNEL_CHAR, instance: char_id }, |w| {
+        w.i32(value);
+        w.i32(stat);
+    })
+}
+
+/// Stat `AggDef` (0x33): the AGG/DEF slider, -100 (defensive) ..= 100 (aggressive).
+pub const STAT_AGG_DEF: i32 = 0x33;
+
+/// `SkillIIR_t`: the skill window's "Save Changes" (`FUN_100fa5dd` [GUI] -> `N3Msg_ClientIPAdjust` [GC 0x10026e7e]).
+pub const SKILL: u32 = 0x3E205660;
+
+/// `N3Msg_ClientIPAdjust(map<stat, new base value>)` [GC 0x10026e7e]: `FUN_10079545` builds `SkillIIR_t` (vtable [GC 0x1016153c], ctor
+/// identity = the control dynel `+0x14`, class string "SkillIIR_t") with the map copied to `+0x18`, the "to be passed on" byte `this+0xc`
+/// set to **0** (unlike [`iir`] messages), and `SendIIRToObservers` sends it. `Write` slot 8 `FUN_10079455` -> `FUN_10009ce3`: `i32 n`,
+/// then `i32 stat, i32 value` per `std::map` entry in ascending stat order. The value of each entry is `pending + base` of the skill row
+/// (`FUN_100fa5dd`: only rows with a non-zero pending change are included), i.e. the absolute new base value, not the delta.
+pub fn skill_ip_adjust(char_id: i32, skills: &std::collections::BTreeMap<i32, i32>) -> Vec<u8> {
+    let mut w = Writer(Vec::new());
+    w.u32(SKILL);
+    Identity { kind: DYNEL_CHAR, instance: char_id }.write(&mut w);
+    w.u8(0);
+    w.i32(skills.len() as i32);
+    for (&stat, &value) in skills {
+        w.i32(stat);
+        w.i32(value);
+    }
+    w.0
 }
 
 /// A ptype-10 frame carrying an N3 payload from character `char_id`.
@@ -382,5 +420,20 @@ mod tests {
         assert_eq!((f.ptype, f.receiver), (5, 2));
         assert_eq!(f.encode().unwrap().len(), 36);
         assert_eq!(TextKind::Whisper as u32 + TextKind::Shout as u32, 6);
+    }
+
+    #[test]
+    fn set_stat_bytes() {
+        assert_eq!(message_key("SetStatIIR_t"), SET_STAT);
+        // key, Identity{50000, 0x6584}, pass-on byte 1, value -37, stat 0x33
+        assert_eq!(set_stat(0x6584, STAT_AGG_DEF, -37), hex("6E5F566E 0000C350 00006584 01 FFFFFFDB 00000033"));
+    }
+
+    #[test]
+    fn skill_ip_adjust_bytes() {
+        assert_eq!(message_key("SkillIIR_t"), SKILL);
+        // key, Identity{50000, 0x6584}, pass-on byte 0, 2 entries (stat 16 -> 15, stat 0x98 -> 7) in map (key) order
+        let m = std::collections::BTreeMap::from([(0x98, 7), (16, 15)]);
+        assert_eq!(skill_ip_adjust(0x6584, &m), hex("3E205660 0000C350 00006584 00 00000002 00000010 0000000F 00000098 00000007"));
     }
 }

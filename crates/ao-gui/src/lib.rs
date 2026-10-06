@@ -15,9 +15,9 @@ pub use draw::{DrawCmd, DrawList, GlyphAtlas};
 pub use font::FontId;
 pub use geom::{Point, Rect};
 pub use gfx::{Atlas, AtlasEntry, GfxId, GfxSet};
-pub use gui::{ExtraImage, Gui, Localize, WindowSize, EXTRA_BASE};
+pub use gui::{ExtraImage, Gui, Localize, WindowSize, DOUBLE_CLICK_TIME, EXTRA_BASE};
 pub use input::{Event, InputEvent, Key, Modifiers, MouseButton, ViewHandle, WindowId};
-pub use view::{tvf, CanvasItem};
+pub use view::{tvf, CanvasItem, CanvasTip};
 
 use std::path::PathBuf;
 

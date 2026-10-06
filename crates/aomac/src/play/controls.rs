@@ -14,6 +14,8 @@
 use ao_gui::MouseButton;
 use ao_render::KeyCode;
 
+use super::hud::WindowKind;
+
 /// Client key-table ids (GUI.dll 0x10262e20) of the keys we map.
 pub mod id {
     pub const MIDDLE_PRESS: u32 = 9;
@@ -94,6 +96,42 @@ pub fn key_id(code: KeyCode) -> Option<u32> {
         Slash => 118,
         _ => return None,
     })
+}
+
+/// Key id of a character key (`Key::Letter`): `A`..`Z` = 82.., `1`..`9` = 108.., `0` = 117 (the same table as [`key_id`]).
+pub fn char_key_id(c: char) -> Option<u32> {
+    match c.to_ascii_lowercase() {
+        l @ 'a'..='z' => Some(82 + (l as u32 - 'a' as u32)),
+        d @ '1'..='9' => Some(108 + (d as u32 - '1' as u32)),
+        '0' => Some(117),
+        _ => None,
+    }
+}
+
+/// Window hotkeys: the `WINDOW_*` providers of `ControlCenterModule_c::SetupProviders` (GUI 0x10068c38) with their `KeyBindings`
+/// defaults of CharPrefs.xml (provider hashes matched with [`provider_hash`]: `WINDOW_PLANETMAP` = 97 (P), `WINDOW_INVENTORY` = 90 (I),
+/// `WINDOW_SKILLS` = 102 (U), `WINDOW_WEAR` 262252 = CTRL+1, `WINDOW_MISSION` CTRL+4, `WINDOW_TEAM` CTRL+5, `WINDOW_MAP` 262257 = CTRL+6,
+/// `WINDOW_FRIENDS` CTRL+7, `WINDOW_NANO` CTRL+8, `WINDOW_NCU` CTRL+0), plus the fixed `KEY_OPEN_PERK_WINDOW` = SHIFT+P (commands table in
+/// GUI.dll). They agree with the help texts (`text/help/The * Window.html`). Providers with no window of ours (`WINDOW_SPECIALACTION` CTRL+2,
+/// `WINDOW_KNOWLEDGE` CTRL+3, `WINDOW_STAT` CTRL+9, `WINDOW_RAID` SHIFT+CTRL+R, ...) are not listed. All of them are blocked by `TextInputMode`.
+pub const WINDOW_BINDINGS: &[(u32, WindowKind)] = &[
+    (90, WindowKind::Inventory),
+    (102, WindowKind::Skills),
+    (97, WindowKind::PlanetMap),
+    (97 | id::SHIFT, WindowKind::Perks),
+    (108 | id::CTRL, WindowKind::Character),
+    (111 | id::CTRL, WindowKind::Mission),
+    (112 | id::CTRL, WindowKind::Team),
+    (113 | id::CTRL, WindowKind::Map),
+    (114 | id::CTRL, WindowKind::Friends),
+    (115 | id::CTRL, WindowKind::Nano),
+    (117 | id::CTRL, WindowKind::Ncu),
+];
+
+/// The window a character key press with these modifiers toggles.
+pub fn window_for_key(c: char, mods: ao_gui::Modifiers) -> Option<WindowKind> {
+    let key = char_key_id(c)? | if mods.shift { id::SHIFT } else { 0 } | if mods.ctrl { id::CTRL } else { 0 } | if mods.alt { id::ALT } else { 0 };
+    WINDOW_BINDINGS.iter().find(|b| b.0 == key).map(|b| b.1)
 }
 
 /// What a binding triggers. The `*Global*` slots are the arrow keys (`SlotMovementGlobal*`), which keep working while
@@ -750,6 +788,43 @@ mod tests {
         // ... and the prefs XML gives the documented option defaults.
         let login = client_file("cd_image/gui/Default/LoginPrefs.xml").unwrap();
         assert_eq!(ControlPrefs::from_xml(&login), ControlPrefs::default());
+    }
+
+    #[test]
+    fn window_hotkeys_equal_client_char_prefs() {
+        let Some(xml) = client_file("cd_image/gui/Default/CharPrefs.xml") else { return };
+        // (provider, window): the default binding of the provider in CharPrefs.xml is the table entry of the window
+        let providers = [
+            ("WINDOW_INVENTORY", WindowKind::Inventory),
+            ("WINDOW_SKILLS", WindowKind::Skills),
+            ("WINDOW_PLANETMAP", WindowKind::PlanetMap),
+            ("WINDOW_WEAR", WindowKind::Character),
+            ("WINDOW_MISSION", WindowKind::Mission),
+            ("WINDOW_TEAM", WindowKind::Team),
+            ("WINDOW_MAP", WindowKind::Map),
+            ("WINDOW_FRIENDS", WindowKind::Friends),
+            ("WINDOW_NANO", WindowKind::Nano),
+            ("WINDOW_NCU", WindowKind::Ncu),
+        ];
+        let mut input = 0;
+        let mut found = 0;
+        for tag in xml.split('<') {
+            if tag.starts_with("Int32 name=\"Input\"") {
+                input = attr(tag, "value").and_then(|v| v.parse().ok()).unwrap_or(0);
+            } else if tag.starts_with("Int64 name=\"Provider\"") {
+                let p: u64 = attr(tag, "value").and_then(|v| v.parse().ok()).unwrap_or(0);
+                if let Some((n, w)) = providers.iter().find(|(n, _)| u64::from(provider_hash(n)) == p) {
+                    assert!(WINDOW_BINDINGS.contains(&(input, *w)), "{n}: {input}");
+                    found += 1;
+                }
+            }
+        }
+        assert_eq!(found, providers.len());
+        let ctrl = ao_gui::Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(window_for_key('6', ctrl), Some(WindowKind::Map));
+        assert_eq!(window_for_key('p', Default::default()), Some(WindowKind::PlanetMap));
+        assert_eq!(window_for_key('p', ao_gui::Modifiers { shift: true, ..Default::default() }), Some(WindowKind::Perks));
+        assert_eq!(window_for_key('6', Default::default()), None);
     }
 
     #[test]

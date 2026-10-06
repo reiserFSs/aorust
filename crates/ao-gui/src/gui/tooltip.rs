@@ -22,8 +22,8 @@ const WINDOW_BACKGROUND: GfxId = GfxId(0x1bf);
 
 #[derive(Default)]
 pub(super) struct TipState {
-    /// `WindowController_c+0xa0`: the view the pending / shown texts belong to.
-    view: Option<ViewId>,
+    /// `WindowController_c+0xa0`: the view (and, over a canvas, the 1-based index of its tip rectangle) the pending / shown texts belong to.
+    view: Option<(ViewId, usize)>,
     title: String,
     body: String,
     deadline: Option<f32>,
@@ -91,15 +91,18 @@ impl Gui {
         self.tip.shown.as_ref().map(|s| Rect::new(s.pos.0 as f32, s.pos.1 as f32, (s.pos.0 + s.m.size.0 - 1) as f32, (s.pos.1 + s.m.size.1 - 1) as f32))
     }
 
-    fn view_tip(&self, id: ViewId) -> Option<(String, String)> {
+    fn view_tip(&self, (id, region): (ViewId, usize)) -> Option<(String, String)> {
         let v = &self.tree.views[id];
+        if let (Kind::Canvas(c), true) = (&v.kind, region > 0) {
+            return c.tips.get(region - 1).map(|t| (t.title.clone(), t.body.clone()));
+        }
         let t = v.tip.clone().or_else(|| if let Kind::CcEntry(d) = &v.kind { d.tip.clone() } else { None })?;
         (!t.0.is_empty() || !t.1.is_empty()).then_some(t)
     }
 
     /// `FUN_10156d66`: deepest-first search for a view with tooltip texts under `(x, y)` (window-local).
     #[allow(clippy::too_many_arguments)]
-    fn tip_in(&self, id: ViewId, x: f32, y: f32, is_root: bool, ox: f32, oy: f32) -> Option<ViewId> {
+    fn tip_in(&self, id: ViewId, x: f32, y: f32, is_root: bool, ox: f32, oy: f32) -> Option<(ViewId, usize)> {
         let v = &self.tree.views[id];
         if !v.visible {
             return None;
@@ -121,12 +124,19 @@ impl Gui {
                 return Some(h);
             }
         }
-        self.view_tip(id).map(|_| id)
+        if let Kind::Canvas(c) = &v.kind {
+            // the rectangles stand for child controls of the original view: the topmost (last) one under the pointer
+            let (cx, cy) = (x - l, y - t);
+            if let Some(i) = c.tips.iter().rposition(|t| cx >= t.rect[0] && cx < t.rect[2] && cy >= t.rect[1] && cy < t.rect[3]) {
+                return Some((id, i + 1));
+            }
+        }
+        self.view_tip((id, 0)).map(|_| (id, 0))
     }
 
     /// Topmost window under the mouse decides (`UpdateToolTip` stops at the first window containing the pointer; a
     /// full-screen transparent window only counts where it has visible content, as for `wants_mouse`).
-    fn tip_view_at(&self, x: f32, y: f32) -> Option<ViewId> {
+    fn tip_view_at(&self, x: f32, y: f32) -> Option<(ViewId, usize)> {
         for (_, root, pos) in self.windows_top_down() {
             let (lx, ly) = (x - pos.0 as f32, y - pos.1 as f32);
             if let Some(v) = self.tip_in(root, lx, ly, true, 0.0, 0.0) {

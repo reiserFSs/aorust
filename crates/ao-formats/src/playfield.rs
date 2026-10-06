@@ -73,6 +73,9 @@ pub struct Report {
     /// Local fog volumes of the whole playfield (also in `Scene::fog_model`).
     pub fogs: Vec<FogVolume>,
     pub terrain_cells: usize,
+    /// Scene instances of the terrain / dungeon room shells / water (after the sky objects, before every statel); the playfield
+    /// map draws only these.
+    pub ground: std::ops::Range<usize>,
     pub statels: usize,
     pub unique_meshes: usize,
     /// Statels with mesh id 0: `FUN_1002777a` (N3 @0x1002777a) creates no object for them.
@@ -146,13 +149,16 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
         let d = store.get(TILEMAP, rec.tilemap)?.ok_or_else(|| anyhow!("playfield {id}: no tilemap {}", rec.tilemap))?;
         let tm = ground::parse(&d).with_context(|| format!("tilemap {}", rec.tilemap))?;
         report.terrain_cells = tm.cells_x * tm.cells_z;
+        report.ground.start = scene.instances.len();
         terrain::build(store, id, &tm, &mut scene, day_time)?;
         terrain = Some(tm);
     } else {
+        report.ground.start = scene.instances.len();
         grid = Some(dungeon::build(store, &rec, &mut scene)?);
     }
     water::emit(store, &waters, &mut scene);
     let fixed = scene.instances.len();
+    report.ground.end = fixed;
     if let Some(d) = store.get(STATELS, id)? {
         let layout = if rec.is_outdoor() { Layout::Outdoor } else { Layout::Dungeon };
         let file = statel::parse(&d, rec.count as usize, layout).with_context(|| format!("statels of playfield {id}"))?;

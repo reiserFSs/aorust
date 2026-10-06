@@ -9,11 +9,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver};
 
 use ao_formats::planetmap::PlanetMap;
+use ao_formats::screens::TextDb;
 use ao_formats::topdown::{self, GroundMap, NO_OWNER};
-use ao_gui::{CanvasItem, Event, GfxId, Gui, WindowId, WindowSize};
+use ao_gui::{CanvasItem, CanvasTip, Event, GfxId, Gui, MouseButton, WindowId, WindowSize};
 
 use super::hud::WindowKind;
 use super::zone::Zone;
@@ -42,12 +42,20 @@ const STAT_MAP_NAVIGATION: u32 = 140;
 const RUBIKA_INDEX: &str = "Normal/PlanetMapIndexNormal.txt";
 const SHADOWLANDS_INDEX: &str = "Shadowlands/ShadowlandsMap.txt";
 
-/// The four `Button_c`s of `PlanetMapView_c` (names from 0x1004d26a) with the skin art of the same name.
-const BUTTONS: [(&str, &str); 4] = [
-    ("ZoomIn", "GFX_GUI_PLANETMAP_ZOOM_IN"),
-    ("ZoomOut", "GFX_GUI_PLANETMAP_ZOOM_OUT"),
-    ("Character", "GFX_GUI_PLANETMAP_CENTER_PLAYER"),
-    ("Quest", "GFX_GUI_PLANETMAP_CENTER_MISSION"),
+/// Tab titles: the `title` argument of the `DockableView_c` constructor (`FUN_10038b47`, called with `"Planet Map"` by `PlanetMapView_c` 0x1004d26a and
+/// `"PF Map"` by `PlayfieldMapView_c` 0x100eb905) is what `DockWindow_c` puts into its tab (`FUN_100389bd` -> `Window::InsertTab`). The `#WindowMap` /
+/// `#WindowPlanetMap` strings of `ControlCenterModule_c::SetupProviders` 0x10068c38 are the labels of the key-binding providers, not window titles.
+const PLANET_TITLE: &str = "Planet Map";
+const PF_TITLE: &str = "PF Map";
+
+/// The four `Button_c`s of `PlanetMapView_c` (names from 0x1004d26a) with the skin art of the same name, the pressed art
+/// (UNRESOLVED: the pairing by name, the art is assigned outside the constructor) and the tooltip key (`View::SetToolTip(GetText(10000, key), "")`, ctor asm
+/// 0x1004de3c..0x1004df61: `Click2ZoomEtc` / `Click2ZoomOutEtc` / `CenterOnChar` / `CenterOnMission`).
+const BUTTONS: [(&str, &str, &str, &str); 4] = [
+    ("ZoomIn", "GFX_GUI_PLANETMAP_ZOOM_IN", "GFX_GUI_PLANETMAP_ZOOM_IN_PRESSED", "Click2ZoomEtc"),
+    ("ZoomOut", "GFX_GUI_PLANETMAP_ZOOM_OUT", "GFX_GUI_PLANETMAP_ZOOM_OUT_PRESSED", "Click2ZoomOutEtc"),
+    ("Character", "GFX_GUI_PLANETMAP_CENTER_PLAYER", "GFX_GUI_PLANETMAP_CENTER_PLAYER_PRESSED", "CenterOnChar"),
+    ("Quest", "GFX_GUI_PLANETMAP_CENTER_MISSION", "GFX_GUI_PLANETMAP_CENTER_MISSION_PRESSED", "CenterOnMission"),
 ];
 
 struct Planet {
@@ -61,12 +69,15 @@ struct Planet {
     /// Marker position the view last followed.
     followed: Option<[f32; 2]>,
     tiles: HashMap<(usize, u32, u32), GfxId>,
+    /// Button (index into [`BUTTONS`]) the left mouse button went down on, and whether the pointer is still over it.
+    pressed: Option<(usize, bool)>,
+    /// A double-click zoom placed the view: the next update keeps it instead of re-centring on the character.
+    hold: bool,
 }
 
 struct Pf {
     window: WindowId,
     playfield: u32,
-    job: Option<Receiver<Option<(GroundMap, bool)>>>,
     ground: Option<Ground>,
     /// World position (server `X`, `Z`) in the middle of the view.
     center: [f32; 2],
@@ -86,9 +97,20 @@ struct Ground {
 
 pub(super) struct HudMap {
     client: PathBuf,
+    texts: Option<TextDb>,
     planet: Option<Planet>,
     pf: Option<Pf>,
     closed: Vec<WindowKind>,
+    /// The ground image of the loaded playfield, built by the world loader from the scene it just decoded (`Report::ground`, [`ground_map`]).
+    ground_in: Option<(u32, GroundMap, bool)>,
+    /// The active mission's marker (playfield, world X/Z): `GlobalSignals+0x158` of `InventoryGUIModule_c::SlotGotNewMission` 0x100c69e2
+    /// (`N3Msg_GetQuestWorldPos`), handler `FUN_1004b9c9`. UNRESOLVED: nothing feeds it yet (`QuestFullUpdateIIR_t` is not decoded).
+    mission: Option<(u32, [f32; 2])>,
+}
+
+/// The playfield map's ground image: the `Report::ground` instances of the just-built `scene`, rendered from above; the flag is "dungeon rooms".
+pub(in crate::play) fn ground_map(scene: &ao_scene::Scene, report: &ao_formats::playfield::Report) -> Option<(GroundMap, bool)> {
+    topdown::render(scene, report.ground.clone(), PF_MAX_PX).map(|m| (m, report.terrain_cells == 0))
 }
 
 fn canvas_xml(name: &str, size: (u32, u32)) -> String {
@@ -97,7 +119,20 @@ fn canvas_xml(name: &str, size: (u32, u32)) -> String {
 
 impl HudMap {
     pub(super) fn new(client: &std::path::Path) -> Self {
-        HudMap { client: client.to_path_buf(), planet: None, pf: None, closed: vec![] }
+        HudMap { client: client.to_path_buf(), texts: TextDb::load(client).ok(), planet: None, pf: None, closed: vec![], ground_in: None, mission: None }
+    }
+
+    /// The loader's ground image of playfield `pf` (replaces the one of an earlier playfield).
+    pub(super) fn provide_ground(&mut self, pf: u32, map: GroundMap, rooms: bool) {
+        self.ground_in = Some((pf, map, rooms));
+        if let Some(p) = self.pf.as_mut() {
+            p.playfield = 0; // taken again by the next update
+        }
+    }
+
+    /// The mission marker (`FUN_1004b9c9`): a world position in a playfield, `None` when the mission ends (`FUN_1004bfbf`).
+    pub(super) fn set_mission(&mut self, marker: Option<(u32, [f32; 2])>) {
+        self.mission = marker;
     }
 
     pub(super) fn handles(kind: WindowKind) -> bool {
@@ -128,18 +163,28 @@ impl HudMap {
                     canvas_xml("map", (PLANET_SIZE.0, PLANET_SIZE.1 - BUTTONS_H)),
                     canvas_xml("buttons", (PLANET_SIZE.0, BUTTONS_H))
                 );
-                match gui.open_framed_window_xml("PlanetMapView", &xml, PLANET_POS, WindowSize::Fixed(PLANET_SIZE.0, PLANET_SIZE.1)) {
+                match gui.open_tabbed_window_xml("PlanetMapView", PLANET_TITLE, &xml, PLANET_POS, WindowSize::Fixed(PLANET_SIZE.0, PLANET_SIZE.1)) {
                     Ok(window) => {
-                        self.planet = Some(Planet { window, map: None, tried: None, level: 0, center: [0.0; 2], followed: None, tiles: HashMap::new() })
+                        let tips = BUTTONS
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, b)| {
+                                let title = self.texts.as_ref()?.by_key(ao_formats::screens::CAT_GUI, b.3)?;
+                                let (l, w) = button_rect(i);
+                                Some(CanvasTip { rect: [l, 0.0, l + w, BUTTONS_H as f32], title, body: String::new() })
+                            })
+                            .collect();
+                        gui.set_canvas_tips(window, "buttons", tips);
+                        self.planet = Some(Planet { window, map: None, tried: None, level: 0, center: [0.0; 2], followed: None, tiles: HashMap::new(), pressed: None, hold: false })
                     }
                     Err(e) => eprintln!("planet map: {e:#}"),
                 }
             }
             WindowKind::Map => {
                 let xml = format!("<root><View view_layout=\"vertical\">{}</View></root>", canvas_xml("map", PF_SIZE));
-                match gui.open_framed_window_xml("PlayfieldMapView", &xml, PF_POS, WindowSize::Fixed(PF_SIZE.0, PF_SIZE.1)) {
+                match gui.open_tabbed_window_xml("PlayfieldMapView", PF_TITLE, &xml, PF_POS, WindowSize::Fixed(PF_SIZE.0, PF_SIZE.1)) {
                     Ok(window) => {
-                        self.pf = Some(Pf { window, playfield: 0, job: None, ground: None, center: [0.0; 2], followed: None, arrows: HashMap::new() })
+                        self.pf = Some(Pf { window, playfield: 0, ground: None, center: [0.0; 2], followed: None, arrows: HashMap::new() })
                     }
                     Err(e) => eprintln!("playfield map: {e:#}"),
                 }
@@ -177,8 +222,31 @@ impl HudMap {
                     self.closed.push(WindowKind::PlanetMap);
                     return true;
                 }
-                Event::CanvasDrag { window, view, dx, dy } if *window == p.window && view == "map" => {
-                    p.center = [p.center[0] - dx, p.center[1] - dy];
+                Event::CanvasDrag { window, view, dx, dy, x, y } if *window == p.window => {
+                    match view.as_str() {
+                        "map" => p.center = [p.center[0] - dx, p.center[1] - dy],
+                        // the pressed `Button_c` shows its pressed art only while the pointer is over it
+                        _ => {
+                            if let Some((i, _)) = p.pressed {
+                                p.pressed = Some((i, button_index_at(*x, *y) == Some(i)));
+                            }
+                        }
+                    }
+                    return true;
+                }
+                Event::CanvasPress { window, view, x, y, button, clicks } if *window == p.window => {
+                    match (view.as_str(), button) {
+                        ("buttons", MouseButton::Left) => p.pressed = button_index_at(*x, *y).map(|i| (i, true)),
+                        // `BitmapTileView_c` signals (ctor of the view, `FUN_1004bc1f`): double click with the left button zooms in (`LAB_1004b447`),
+                        // with the right button out (`LAB_1004b468`), around the clicked point (`FUN_1004b422` stores it for `FUN_1004bc1f`)
+                        ("map", MouseButton::Left) if *clicks == 2 => p.zoom_at(1, gui.canvas_size(p.window, "map"), [*x, *y]),
+                        ("map", MouseButton::Right) if *clicks == 2 => p.zoom_at(-1, gui.canvas_size(p.window, "map"), [*x, *y]),
+                        _ => {}
+                    }
+                    return true;
+                }
+                Event::CanvasRelease { window, .. } if *window == p.window => {
+                    p.pressed = None;
                     return true;
                 }
                 Event::CanvasWheel { window, view, dy, .. } if *window == p.window && view == "map" => {
@@ -186,14 +254,20 @@ impl HudMap {
                     return true;
                 }
                 Event::CanvasClick { window, view, x, y } if *window == p.window && view == "buttons" => {
-                    if let Some(name) = button_at(*x, *y) {
-                        match name {
+                    if let Some(i) = button_index_at(*x, *y) {
+                        let marker = p.mission_marker(self.mission);
+                        match BUTTONS[i].0 {
                             "ZoomIn" => p.zoom(1),
                             "ZoomOut" => p.zoom(-1),
-                            // `Character`: centre on the own character again (the follow state is dropped)
+                            // `FUN_1004b6d4`: centre on the own character again (the follow state is dropped)
                             "Character" => p.followed = None,
-                            // `Quest`: UNRESOLVED — centres on the active mission's position, which needs mission data
-                            _ => {}
+                            // `FUN_1004b72b`: centre on the mission marker, if there is one (the button is enabled by `FUN_1004b9c9`)
+                            _ => {
+                                if let Some(m) = marker {
+                                    p.center = m;
+                                    p.hold = true;
+                                }
+                            }
                         }
                     }
                     return true;
@@ -208,7 +282,7 @@ impl HudMap {
                     self.closed.push(WindowKind::Map);
                     return true;
                 }
-                Event::CanvasDrag { window, view, dx, dy } if *window == p.window && view == "map" => {
+                Event::CanvasDrag { window, view, dx, dy, .. } if *window == p.window && view == "map" => {
                     p.center = [p.center[0] - dx / PF_SCALE, p.center[1] + dy / PF_SCALE];
                     return true;
                 }
@@ -243,7 +317,10 @@ impl HudMap {
         let lv = &map.index.levels[p.level];
         // the marker: `FUN_1004b81a` hides it when the playfield has no coordinates entry or the position is unknown
         let marker = zone.playfield.and_then(|pf| map.coords.get(&pf)).zip(zone.own()).map(|(c, d)| lv.locate(c, d.pos[0], d.pos[2]));
-        if p.followed != marker {
+        if std::mem::take(&mut p.hold) {
+            // a double-click zoom or the mission button placed the view (`FUN_1004b422` / `FUN_1004b72b` after `FUN_1004b6d4`)
+            p.followed = marker;
+        } else if p.followed != marker {
             // moving the character re-centres the view on it (help text *The PlanetMap Window*)
             if let Some(m) = marker {
                 p.center = m;
@@ -279,6 +356,12 @@ impl HudMap {
                 items.push(CanvasItem::Image { id, src: [0.0, 0.0, ts, ts], dst: [x, y, x + ts, y + ts], alpha: 1.0 });
             }
         }
+        let mission = p.mission_marker(self.mission);
+        if let (Some(m), Some(g)) = (mission, gui.gfx().id("GFX_GUI_PLANETMAP_MISSION_MARKER")) {
+            let (w, h) = gui.gfx().size(g);
+            let (x, y) = (m[0] - origin[0] - w as f32 / 2.0, m[1] - origin[1] - h as f32 / 2.0);
+            items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [x.floor(), y.floor(), x.floor() + w as f32, y.floor() + h as f32], alpha: 1.0 });
+        }
         if let (Some(m), Some(g)) = (marker, gui.gfx().id("GFX_GUI_PLANETMAP_PLAYER_MARKER")) {
             let (w, h) = gui.gfx().size(g);
             let (x, y) = (m[0] - origin[0] - w as f32 / 2.0, m[1] - origin[1] - h as f32 / 2.0);
@@ -288,16 +371,17 @@ impl HudMap {
         // button row: ZoomIn/ZoomOut left, Character/Quest right; the unusable ones are not drawn enabled
         let levels = map.index.levels.len();
         let mut row = Vec::new();
-        for (i, (name, gfx)) in BUTTONS.iter().enumerate() {
-            let Some(g) = gui.gfx().id(gfx) else { continue };
-            let (w, h) = gui.gfx().size(g);
-            let (x, _) = button_rect(i);
+        for (i, (name, gfx, gfx_pressed, _)) in BUTTONS.iter().enumerate() {
             let enabled = match *name {
                 "ZoomIn" => p.level + 1 < levels,
                 "ZoomOut" => p.level > 0,
                 "Character" => marker.is_some(),
-                _ => false,
+                _ => mission.is_some(),
             };
+            let down = enabled && p.pressed == Some((i, true));
+            let Some(g) = gui.gfx().id(if down { gfx_pressed } else { gfx }) else { continue };
+            let (w, h) = gui.gfx().size(g);
+            let (x, _) = button_rect(i);
             row.push(CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [x, 0.0, x + w as f32, h as f32], alpha: if enabled { 1.0 } else { 0.4 } });
         }
         gui.set_canvas(p.window, "buttons", row);
@@ -308,20 +392,16 @@ impl HudMap {
     fn update_pf(&mut self, gui: &mut Gui, zone: &Zone) {
         let Some(p) = self.pf.as_mut() else { return };
         if let Some(pf) = zone.playfield.filter(|&pf| pf != p.playfield) {
-            // a new playfield: the map is rebuilt (exploration starts again, "since you last entered")
+            // a new playfield: the map is rebuilt (exploration starts again, "since you last entered"); the image is the one the world loader
+            // made from the scene of this playfield ([`ground_map`] -> `provide_ground`), so nothing is decoded a second time here
             p.playfield = pf;
             p.ground = None;
             p.followed = None;
-            let (tx, rx) = channel();
-            let client = self.client.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(build_ground(&client, pf));
-            });
-            p.job = Some(rx);
         }
-        if let Some(Ok(done)) = p.job.as_ref().map(|j| j.try_recv()) {
-            p.job = None;
-            p.ground = done.map(|(map, rooms)| Ground { map, rooms, visited: HashSet::new(), current: NO_OWNER, shown: None });
+        if p.ground.is_none() && self.ground_in.as_ref().is_some_and(|g| Some(g.0) == zone.playfield) {
+            if let Some((_, map, rooms)) = self.ground_in.take() {
+                p.ground = Some(Ground { map, rooms, visited: HashSet::new(), current: NO_OWNER, shown: None });
+            }
         }
         let own = zone.own().map(|d| (d.pos, d.yaw));
         let here = own.map(|(pos, _)| [pos[0], pos[2]]);
@@ -409,14 +489,35 @@ fn button_rect(i: usize) -> (f32, f32) {
     }
 }
 
-fn button_at(x: f32, y: f32) -> Option<&'static str> {
+fn button_index_at(x: f32, y: f32) -> Option<usize> {
     (0..BUTTONS.len()).find(|&i| {
         let (l, w) = button_rect(i);
         x >= l && x < l + w && y >= 0.0 && y < BUTTONS_H as f32
-    }).map(|i| BUTTONS[i].0)
+    })
 }
 
 impl Planet {
+    /// The mission marker on the current level (`None`: no mission, or its playfield has no coordinates entry).
+    fn mission_marker(&self, mission: Option<(u32, [f32; 2])>) -> Option<[f32; 2]> {
+        let (pf, pos) = mission?;
+        let map = self.map.as_ref()?;
+        Some(map.index.levels[self.level].locate(map.coords.get(&pf)?, pos[0], pos[1]))
+    }
+
+    /// Double-click zoom: like [`Planet::zoom`], but the clicked point (`click` in canvas pixels of a view `size`) becomes the middle of the new level
+    /// (`FUN_1004b422` stores the point, `FUN_1004bc1f` scrolls to it after the zoom).
+    fn zoom_at(&mut self, by: i32, size: (u32, u32), click: [f32; 2]) {
+        let before = self.level;
+        let anchor = [self.center[0] + click[0] - size.0 as f32 / 2.0, self.center[1] + click[1] - size.1 as f32 / 2.0];
+        self.center = anchor;
+        self.zoom(by);
+        if self.level != before {
+            self.hold = true;
+        } else {
+            self.center = [anchor[0] - click[0] + size.0 as f32 / 2.0, anchor[1] - click[1] + size.1 as f32 / 2.0];
+        }
+    }
+
     /// ZoomIn / ZoomOut (`FUN_1004bc1f`): the level is clamped to `0..levels`; the shown map point stays in the middle.
     fn zoom(&mut self, by: i32) {
         let Some(map) = self.map.as_ref() else { return };
@@ -487,19 +588,6 @@ fn lit(g: &Ground) -> Vec<u8> {
     rgba
 }
 
-fn build_ground(client: &std::path::Path, pf: u32) -> Option<(GroundMap, bool)> {
-    let store = ao_rdb::RecordStore::open(client).ok()?;
-    let (scene, report) = match ao_formats::playfield::load_playfield_report(&store, client, pf) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("playfield map {pf}: {e:#}");
-            return None;
-        }
-    };
-    let map = topdown::render(&scene, report.ground.clone(), PF_MAX_PX)?;
-    Some((map, report.terrain_cells == 0))
-}
-
 /// Rubi-Ka map unless the playfield is only known to the Shadowlands coordinates (`Type Rubika|Shadowlands` of the index files;
 /// UNRESOLVED: the client's own switch between `PlanetMapIndexFile` and `ShadowlandMapIndexFile`).
 fn pick_planet_map(client: &std::path::Path, pf: Option<u32>) -> anyhow::Result<PlanetMap> {
@@ -519,10 +607,9 @@ mod tests {
     use super::*;
     use crate::play::zone::DynelState;
     use ao_formats::screens::TextDb;
-    use ao_gui::{DrawList, InputEvent, MouseButton};
+    use ao_gui::{DrawList, InputEvent};
     use ao_render::{Frontend, Host, Offscreen};
-    use std::time::{Duration, Instant};
-
+    
     struct Shot {
         gui: Gui,
         map: HudMap,
@@ -574,13 +661,21 @@ mod tests {
         s.zone.dynels.insert(7, DynelState { name: "Testy".into(), pos, yaw: Some(yaw), npc: false, side: 0, level: 1, health: 1, max_health: 1 });
     }
 
-    /// Plays frames until the playfield map's worker delivered the ground image.
+    /// What the world loader does (`Play::start_world_load`): decode the playfield once, render the ground image from that scene and hand it over.
+    fn provide_ground(s: &mut Shot, pf: u32) {
+        let dir = ao_gui::client_dir();
+        let store = ao_rdb::RecordStore::open(&dir).unwrap();
+        let (scene, report) = ao_formats::playfield::load_playfield_report(&store, &dir, pf).unwrap();
+        let (map, rooms) = ground_map(&scene, &report).expect("no ground map");
+        s.map.provide_ground(pf, map, rooms);
+    }
+
+    /// Plays frames until the map window took the ground image.
     fn wait_ground(s: &mut Shot, o: &mut Offscreen) {
-        let t = Instant::now();
-        while s.map.pf.as_ref().is_some_and(|p| p.ground.is_none()) && t.elapsed() < Duration::from_secs(60) {
+        for _ in 0..3 {
             o.frame(s, 0.016);
-            std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(s.map.pf.as_ref().is_some_and(|p| p.ground.is_some()), "ground image not taken");
     }
 
     /// World position of an opaque ground pixel near the middle of the opaque area.
@@ -605,6 +700,7 @@ mod tests {
         for (pf, tag) in [(4604u32, "arrival-hall"), (4582, "icc-shuttleport"), (566, "newland-city")] {
             let Some((mut s, mut o)) = shot() else { return };
             s.map.open(&mut s.gui, WindowKind::Map);
+            provide_ground(&mut s, pf);
             own_at(&mut s, pf, [0.0; 3], 0.0);
             wait_ground(&mut s, &mut o);
             let pos = some_floor(&s);
@@ -655,5 +751,89 @@ mod tests {
             png(&mut s, &mut o, "planet-shadowlands");
             assert_eq!(s.map.planet.as_ref().unwrap().map.as_ref().unwrap().index.kind, "Shadowlands");
         }
+    }
+
+    fn press(s: &mut Shot, o: &mut Offscreen, x: f32, y: f32, b: MouseButton) {
+        s.input(InputEvent::MouseMove { x, y }, &mut o.host);
+        s.input(InputEvent::MouseDown { x, y, button: b }, &mut o.host);
+    }
+
+    fn release(s: &mut Shot, o: &mut Offscreen, x: f32, y: f32) {
+        s.input(InputEvent::MouseUp { x, y, button: MouseButton::Left }, &mut o.host);
+    }
+
+    /// Tooltips, pressed art, double-click zoom and the mission button of the planet map window.
+    #[test]
+    fn planet_map_buttons_tooltips_pressed_art_double_click_and_mission() {
+        let Some((mut s, mut o)) = shot() else { return };
+        s.map.open(&mut s.gui, WindowKind::PlanetMap);
+        s.gui.set_screen_size(640, 600);
+        own_at(&mut s, 566, [100.0, 0.0, 200.0], 0.0);
+        png(&mut s, &mut o, "planet-window-title");
+        let w = s.map.planet.as_ref().unwrap().window;
+        let br = s.gui.view_rect(w, "buttons").unwrap();
+        let on_button = |i: usize| {
+            let (l, bw) = button_rect(i);
+            (br.l + l + bw / 2.0, br.t + 13.0)
+        };
+        // tooltips: texts.mdb 10000 `Click2ZoomEtc` .. `CenterOnMission`, shown after the pointer rests 500 ms
+        for (i, text) in [(0, "Click to zoom in or double click left button directly on map."), (1, "Click to zoom out or double click right button directly on map."), (2, "Center view on your character."), (3, "Center view on mission marker.")] {
+            let (x, y) = on_button(i);
+            s.input(InputEvent::MouseMove { x, y }, &mut o.host);
+            s.gui.frame(0.6);
+            assert_eq!(s.gui.tooltip_shown().map(|t| t.0.to_string()), Some(text.to_string()), "button {i}");
+        }
+        png(&mut s, &mut o, "planet-tooltip-mission");
+        // pressed art while the button is held (and the pointer over it), the normal art again after the release
+        let (zx, zy) = on_button(0);
+        let art = |s: &Shot, name: &str| s.gui.gfx().id(name).unwrap();
+        let has = |s: &mut Shot, o: &mut Offscreen, gfx: GfxId| {
+            o.frame(s, 0.016);
+            s.gui.canvas_items(w, "buttons").iter().any(|i| matches!(i, CanvasItem::Image { id, .. } if *id == gfx))
+        };
+        let (normal, down) = (art(&s, "GFX_GUI_PLANETMAP_ZOOM_IN"), art(&s, "GFX_GUI_PLANETMAP_ZOOM_IN_PRESSED"));
+        assert!(has(&mut s, &mut o, normal) && !has(&mut s, &mut o, down));
+        press(&mut s, &mut o, zx, zy, MouseButton::Left);
+        assert!(has(&mut s, &mut o, down) && !has(&mut s, &mut o, normal));
+        png(&mut s, &mut o, "planet-zoom-in-pressed");
+        // dragging off the button lifts it, the release ends the press
+        s.input(InputEvent::MouseMove { x: zx + 200.0, y: zy }, &mut o.host);
+        assert!(has(&mut s, &mut o, normal));
+        release(&mut s, &mut o, zx + 200.0, zy);
+        assert!(has(&mut s, &mut o, normal) && s.map.planet.as_ref().unwrap().pressed.is_none());
+        // double click on the map: left zooms in (around the clicked point), right zooms out
+        let mr = s.gui.view_rect(w, "map").unwrap();
+        let (x, y) = (mr.l + 60.0, mr.t + 50.0);
+        let level = |s: &Shot| s.map.planet.as_ref().unwrap().level;
+        let before = level(&s);
+        press(&mut s, &mut o, x, y, MouseButton::Left);
+        release(&mut s, &mut o, x, y);
+        assert_eq!(level(&s), before, "one click does not zoom");
+        press(&mut s, &mut o, x, y, MouseButton::Left);
+        release(&mut s, &mut o, x, y);
+        assert_eq!(level(&s), before + 1);
+        // the clicked map point is now in the middle of the view and the view stays there (no re-centring on the character)
+        let c = s.map.planet.as_ref().unwrap().center;
+        png(&mut s, &mut o, "planet-double-click-zoomed");
+        assert_eq!(s.map.planet.as_ref().unwrap().center, c);
+        s.gui.frame(1.0);
+        s.input(InputEvent::MouseDown { x, y, button: MouseButton::Right }, &mut o.host);
+        s.input(InputEvent::MouseDown { x, y, button: MouseButton::Right }, &mut o.host);
+        assert_eq!(level(&s), before);
+        // the mission button: disabled without a marker, centres on it once a mission is set
+        let mission = (566u32, [150.0f32, 260.0f32]);
+        s.map.set_mission(Some(mission));
+        o.frame(&mut s, 0.016);
+        let want = {
+            let p = s.map.planet.as_ref().unwrap();
+            let m = p.map.as_ref().unwrap();
+            m.index.levels[p.level].locate(&m.coords[&566], 150.0, 260.0)
+        };
+        let (qx, qy) = on_button(3);
+        press(&mut s, &mut o, qx, qy, MouseButton::Left);
+        release(&mut s, &mut o, qx, qy);
+        o.frame(&mut s, 0.016);
+        assert_eq!(s.map.planet.as_ref().unwrap().center, want);
+        png(&mut s, &mut o, "planet-mission-centred");
     }
 }

@@ -27,7 +27,8 @@ pub enum Key {
     Enter,
     Tab,
     Escape,
-    /// `A`..`Z` letters for Ctrl shortcuts (select all / copy / cut / paste).
+    /// The lower-case character of a character key (`a`..`z`, `0`..`9`): Ctrl shortcuts (select all / copy / cut / paste) and the window hotkeys.
+    /// A key that types text is delivered as `Key` (press) followed by `Text`.
     Letter(char),
 }
 
@@ -67,8 +68,13 @@ pub enum Event {
     CloseRequested { window: WindowId },
     /// A read-only `TextView` was clicked on an `<a href=..>` run (`TextRenderer_c::GetHyperLink` 0x10162c36); activation on mouse-down is a guess.
     LinkClicked { window: WindowId, view: String, href: String },
-    /// The left button was dragged over a `CanvasView` (mouse delta since the last step, pixels).
-    CanvasDrag { window: WindowId, view: String, dx: f32, dy: f32 },
+    /// The left button was dragged over a `CanvasView` (mouse delta since the last step, pixels; `x`,`y` = the mouse relative to the view).
+    CanvasDrag { window: WindowId, view: String, dx: f32, dy: f32, x: f32, y: f32 },
+    /// A mouse button went down on a `CanvasView` (`x`,`y` relative to the view); `clicks` is 2 for the second press of a double click
+    /// (same view and button, within [`crate::DOUBLE_CLICK_TIME`] seconds and 4 px; UNRESOLVED: the original's threshold).
+    CanvasPress { window: WindowId, view: String, x: f32, y: f32, button: MouseButton, clicks: u8 },
+    /// The left button that went down on a `CanvasView` was released (anywhere): the canvas's pressed state ends.
+    CanvasRelease { window: WindowId, view: String },
     /// Left click (press and release within 3 px) on a `CanvasView`; `x`,`y` relative to the view.
     CanvasClick { window: WindowId, view: String, x: f32, y: f32 },
     /// Mouse wheel over a `CanvasView` (`dy` notches, positive = up; `x`,`y` relative to the view).

@@ -285,6 +285,11 @@ impl Chat {
         }
     }
 
+    /// A line the GUI runs as if typed (hotbar text macros: the macro text is emitted on GlobalSignals +0x180, GUI `FUN_100d79c9`).
+    pub fn run_line(&mut self, gui: &mut Gui, text: &str, zone: &Zone, texts: &TextDb) {
+        self.submit(gui, text, None, zone, texts);
+    }
+
     fn submit(&mut self, gui: &mut Gui, text: &str, out_group: Option<u64>, zone: &Zone, texts: &TextDb) {
         let groups = self.groups();
         let tx = |k: &str| texts.by_key(10001, &format!("ChatCmdFeedback_{k}")).or_else(|| texts.by_key(10001, k)).unwrap_or_default();

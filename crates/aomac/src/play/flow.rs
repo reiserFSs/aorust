@@ -478,6 +478,7 @@ impl Play {
         self.fade = Fade::In(0.0);
         self.world_ready = false;
         self.world_scene = None;
+        self.world_ground = None;
         host.fly = false;
         // `ServerLogin3DModule_t::SetLoadingScreen(n)`: after a creation `welcome_to_rubika.jpg` (docs/screens.md §7)
         let image = if std::mem::take(&mut self.welcome_image) { "welcome_to_rubika.jpg" } else { "ai_loading_login.png" };
@@ -549,10 +550,11 @@ impl Play {
         // the zone clock and game day (`GameTimeIIR_t`) when the burst reached the playfield message; later `GameTime`s resync the live sky
         let (day_time, day) = (self.zone.day_time(), self.zone.game_day as u32);
         std::thread::spawn(move || {
-            let r = RecordStore::open(&dir)
-                .and_then(|store| ao_formats::playfield::load_playfield_on_day(&store, &dir, id, day_time, day))
-                .map(Box::new)
-                .map_err(|e| format!("{e:#}"));
+            let r = RecordStore::open(&dir).and_then(|store| ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day));
+            // the Map window's ground image comes from the scene just built (`Report::ground`), not from a second load (docs/gui.md 12)
+            let ground = r.as_ref().ok().and_then(|(scene, report)| hud::ground_map(scene, report));
+            let _ = tx.send(Bg::Ground(id, ground.map(Box::new)));
+            let r = r.map(|(scene, _)| Box::new(scene)).map_err(|e| format!("{e:#}"));
             match ao_formats::playfield::SkyClock::open(&dir, id) {
                 Ok(c) => drop(tx.send(Bg::Sky(id, c))),
                 Err(e) => eprintln!("live sky of playfield {id}: {e:#}"),
@@ -591,6 +593,8 @@ impl Play {
                 }
                 Bg::Sky(id, c) if Some(id) == self.zone.playfield => self.world_sky = c,
                 Bg::Sky(..) => {}
+                Bg::Ground(id, g) if Some(id) == self.zone.playfield => self.world_ground = g.map(|g| (id, g)),
+                Bg::Ground(..) => {}
                 // a load that the server has since replaced by another playfield is dropped
                 Bg::World(id, _) if Some(id) != self.zone.playfield => {}
                 Bg::World(id, Ok(scene)) => {
@@ -903,6 +907,9 @@ impl Frontend for Play {
                         Ok(h) => self.hud = Some(h),
                         Err(e) => eprintln!("hud: {e:#}"),
                     }
+                    if let (Some(h), Some((id, g))) = (self.hud.as_mut(), self.world_ground.take()) {
+                        h.provide_ground(id, g.0, g.1);
+                    }
                     // after the HUD: the chat windows draw above its bar windows (as in the original, whose bar windows are backmost)
                     if let Some(c) = self.chat.as_mut() {
                         if let Err(e) = c.open(&mut self.gui, self.size) {
@@ -966,6 +973,23 @@ impl Frontend for Play {
         if let Some(h) = self.hud.as_mut() {
             h.resize(&mut self.gui, size);
             h.update(&mut self.gui, &mut self.zone, dt);
+            if let Some(s) = &self.session {
+                for f in h.take_outbox() {
+                    s.send_zone(f);
+                }
+            }
+            for u in h.take_uses() {
+                match u {
+                    // `FUN_100d79c9` type 7: the macro text runs as if typed into the chat input
+                    hud_bar::SlotUse::Macro(line) => {
+                        if let Some(c) = self.chat.as_mut() {
+                            c.run_line(&mut self.gui, &line, &self.zone, &self.text);
+                        }
+                    }
+                    // `N3Msg_PerformSpecialAction`: the movement / combat modules own the resulting messages (not wired here yet)
+                    hud_bar::SlotUse::SpecialAction(a) => eprintln!("hud: hotbar special action {a:#x} has no game-side handler yet"),
+                }
+            }
         }
         let (pre, post) = if self.screen == Screen::Create { self.create_frame(dt, host) } else { Default::default() };
         let mut list = self.gui.frame(dt);
@@ -1003,3 +1027,6 @@ fn errorurl(dir: &std::path::Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod live;

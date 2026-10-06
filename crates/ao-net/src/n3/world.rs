@@ -236,10 +236,47 @@ pub struct EntryGroup {
     pub entries: Vec<GroupEntry>,
 }
 
+/// `GameData::ACGItem_t` as read by `operator>>` [GameData.dll 0x1000e9d7]: `i32 low_id; i32 high_id; i32 level; i32` (the fourth
+/// word is read into a local and dropped). `high_id == 0` is replaced by `low_id`; `level > 0x1ff` is masked with `0x1ff`.
+/// `low_id` / `high_id` are `StaticInstance` keys of rdb 1000020 item records (`GetTemplate(0/1)`), `level` is the quality level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AcgItem {
+    pub low_id: i32,
+    pub high_id: i32,
+    pub level: i32,
+}
+
+/// One inventory element of `FullCharacterIIR_t` (`FUN_1002a41a` [GC]): `u32 slot` (index into the character's inventory vector:
+/// 0..0x3f equipment pages, 0x40.. bag), then `FUN_1002a04a`: `i16; i16; Identity; ACGItem_t` (`a`/`b` are the first two members of
+/// the 0x28-byte slot object, meaning UNRESOLVED).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryEntry {
+    pub slot: u32,
+    pub a: i16,
+    pub b: i16,
+    pub id: Identity,
+    pub item: AcgItem,
+}
+
+impl InventoryEntry {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let slot = r.u32()?;
+        let (a, b, id) = (r.i16()?, r.i16()?, Identity::read(r)?);
+        let (low_id, high_id, mut level) = (r.i32()?, r.i32()?, r.i32()?);
+        r.i32()?;
+        if level > 0x1ff {
+            level &= 0x1ff;
+        }
+        Ok(Self { slot, a, b, id, item: AcgItem { low_id, high_id: if high_id == 0 { low_id } else { high_id }, level } })
+    }
+}
+
 /// `FullCharacterIIR_t::ReadSubClass` (GC 0x10073881). Reading stops (and `rest` holds the
 /// unread bytes, starting with the size word/flag that could not be decoded) at the first
-/// non-empty inventory, equipment block, spell list or perk map: their element layouts
-/// (`ACGItem_t`, `SpellData_t`, perk entries) are not decoded yet; every capture has them empty.
+/// non-empty equipment block, spell list or perk map: their element layouts (`SpellData_t`, perk
+/// entries, team blocks) are not decoded yet; every capture has them empty. The inventory
+/// (`InventoryEntry`) is decoded from the client code only: every capture has it empty
+/// (unit test on synthetic bytes).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FullCharacter {
     /// 26 (= `DAT_101c01ec`).
@@ -263,6 +300,8 @@ pub struct FullCharacter {
     pub equipment_flags: u32,
     /// `this+0x6C`: identity list (empty live).
     pub list_6c: Vec<Identity>,
+    /// `this+0x70`: inventory elements in wire order.
+    pub inventory: Vec<InventoryEntry>,
     pub rest: Vec<u8>,
 }
 
@@ -283,12 +322,10 @@ impl FullCharacter {
     }
 
     fn body(&mut self, r: &mut Reader) -> Result<()> {
-        // this+0x70: inventory slots `u32 slot; i16; i16; Identity; ACGItem_t` (FUN_1002a41a).
-        let (w, n) = counted(r)?;
-        if n != 0 {
-            self.rest = rest_after(w, r)?;
-            return Ok(());
-        }
+        // this+0x70: `FUN_1002a41a`: size word (n+1)*0x3f1, per element `u32 slot; i16; i16; Identity; ACGItem_t` (`FUN_1002a04a`).
+        let (_, n) = counted(r)?;
+        fits(n, 32, r)?;
+        self.inventory = (0..n).map(|_| InventoryEntry::read(r)).collect::<Result<_>>()?;
         let (_, n) = counted(r)?;
         fits(n, 4, r)?;
         self.list_18 = (0..n).map(|_| r.i32()).collect::<Result<_>>()?;
@@ -517,7 +554,7 @@ pub struct GameTime {
     pub time: f32,
     /// `this+0x1C` `DayPeriod_e` (arg 2; `Update` ignores it and recomputes the period).
     pub day_period: i32,
-    /// `this+0x20` -> `GameTime_t+0x4C`. [UNRESOLVED meaning]
+    /// `this+0x20` -> `GameTime_t+0x4C`: the game day number (incremented by the 27 h day carry in `RunFunction` [GC 0x1000b214], docs/zone/world.md §10.1).
     pub arg3: i32,
     /// `this+0x24`: server unix time (secs); `GameTime_t+0xC0`, and `+0xB8 = arg4 - local _time64()`.
     pub arg4: i32,
@@ -739,6 +776,38 @@ mod tests {
         assert_eq!(c.stats_a[0], (7, 0));
         assert_eq!(c.stats_b[0], (68, 0));
         assert_eq!(c.stats_b[1], (69, 0));
+    }
+
+    /// No capture has a non-empty inventory: the captured body with the empty inventory word replaced by two synthetic elements
+    /// (layout from `FUN_1002a41a` / `FUN_1002a04a` / `GameData::operator>>(ACGItem_t)`) must decode to the same character.
+    #[test]
+    fn full_character_inventory_layout() {
+        let f = capture_n3().into_iter().find(|f| N3Header::parse(&f.payload).unwrap().0.msg_type == FULL_CHARACTER).unwrap();
+        let (_, mut r) = N3Header::parse(&f.payload).unwrap();
+        let body = take_rest(&mut r).unwrap();
+        assert_eq!(&body[4..8], &UNIT.to_be_bytes(), "captured inventory is empty");
+        let mut b = body[..4].to_vec();
+        b.extend((3 * UNIT).to_be_bytes());
+        let mut elem = |slot: u32, a: i16, bb: i16, id: (u32, i32), item: [i32; 4]| {
+            b.extend(slot.to_be_bytes());
+            b.extend(a.to_be_bytes());
+            b.extend(bb.to_be_bytes());
+            b.extend(id.0.to_be_bytes());
+            b.extend(id.1.to_be_bytes());
+            item.iter().for_each(|v| b.extend(v.to_be_bytes()));
+        };
+        elem(0x40, 0, 1, (0xC74A, 7), [265_090, 0, 25, 99]);
+        elem(6, 2, 3, (0xC74A, 8), [248_345, 248_346, 0x2ff, 0]);
+        b.extend(&body[8..]);
+        let c = FullCharacter::read(&mut Reader::new(&b)).unwrap();
+        assert_eq!(c.inventory.len(), 2);
+        assert_eq!(c.inventory[0], InventoryEntry { slot: 0x40, a: 0, b: 1, id: Identity { kind: 0xC74A, instance: 7 }, item: AcgItem { low_id: 265_090, high_id: 265_090, level: 25 } });
+        assert_eq!(c.inventory[1].item, AcgItem { low_id: 248_345, high_id: 248_346, level: 0xff }); // 0x2ff masked with 0x1ff
+        assert_eq!((c.stat(54), c.stats_a.len(), c.rest.len()), (Some(1), 81, 0));
+        // a count that the bytes cannot satisfy is an error, not a panic
+        let mut bad = body[..4].to_vec();
+        bad.extend((1000 * UNIT).to_be_bytes());
+        assert!(FullCharacter::read(&mut Reader::new(&bad)).is_err());
     }
 
     #[test]

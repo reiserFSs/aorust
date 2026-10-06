@@ -12,12 +12,36 @@ impl Gui {
         Ok(id)
     }
 
+    /// [`Gui::open_tabbed_window`] for view XML text built by the application.
+    pub fn open_tabbed_window_xml(&mut self, name: &str, title: &str, src: &str, pos: (i32, i32), size: WindowSize) -> Result<WindowId> {
+        let id = self.open_window_xml(name, src, (pos.0 + TAB_L, pos.1 + TAB_T), size)?;
+        self.frame_tabbed(id, title);
+        Ok(id)
+    }
+
     /// Replaces what the `CanvasView` called `name` paints (coordinates relative to the view).
     pub fn set_canvas(&mut self, w: WindowId, name: &str, items: Vec<CanvasItem>) {
         if let Some(v) = self.find(w, name) {
             if let Kind::Canvas(c) = &mut self.tree.views[v].kind {
                 c.items = items;
             }
+        }
+    }
+
+    /// Tooltips over rectangles of the `CanvasView` called `name` (replaces the previous ones); texts follow `View::SetToolTip`.
+    pub fn set_canvas_tips(&mut self, w: WindowId, name: &str, tips: Vec<CanvasTip>) {
+        if let Some(v) = self.find(w, name) {
+            if let Kind::Canvas(c) = &mut self.tree.views[v].kind {
+                c.tips = tips;
+            }
+        }
+    }
+
+    /// What the `CanvasView` called `name` currently paints (for tests / inspection).
+    pub fn canvas_items(&self, w: WindowId, name: &str) -> &[CanvasItem] {
+        match self.find(w, name).map(|v| &self.tree.views[v].kind) {
+            Some(Kind::Canvas(c)) => &c.items,
+            _ => &[],
         }
     }
 
@@ -56,6 +80,37 @@ impl Gui {
             c.down = Point::new(x, y);
         }
         self.pressed = Some(v);
+        self.canvas_press(v, x, y, MouseButton::Left);
+    }
+
+    /// Right button over a canvas: `Event::CanvasPress` only (no drag / click semantics).
+    pub(super) fn canvas_right_down(&mut self, x: f32, y: f32) {
+        if let Some((_, v)) = self.hit(x, y).filter(|(_, v)| matches!(self.tree.views[*v].kind, Kind::Canvas(_))) {
+            self.canvas_press(v, x, y, MouseButton::Right);
+        }
+    }
+
+    fn canvas_press(&mut self, v: ViewId, x: f32, y: f32, button: MouseButton) {
+        let Some(window) = self.window_of(v) else { return };
+        let m = Point::new(x, y);
+        let double = self.canvas_press.is_some_and(|(pv, pb, t, p)| pv == v && pb == button && self.time - t <= DOUBLE_CLICK_TIME && (p.x - x).abs() <= 4.0 && (p.y - y).abs() <= 4.0);
+        // a double click is consumed: the third press starts a new one
+        self.canvas_press = if double { None } else { Some((v, button, self.time, m)) };
+        let o = self.origin(v);
+        let pos = self.windows[window].as_ref().map_or((0, 0), |w| w.pos);
+        let view = self.tree.views[v].name.clone();
+        self.events.push(Event::CanvasPress { window, view, x: x - o.0 - pos.0 as f32, y: y - o.1 - pos.1 as f32, button, clicks: 1 + double as u8 });
+    }
+
+    /// The pressed canvas lost the left button.
+    pub(super) fn canvas_release(&mut self, v: ViewId) {
+        if !matches!(self.tree.views[v].kind, Kind::Canvas(_)) {
+            return;
+        }
+        if let Some(window) = self.window_of(v) {
+            let view = self.tree.views[v].name.clone();
+            self.events.push(Event::CanvasRelease { window, view });
+        }
     }
 
     /// Left-drag over the pressed canvas: one `Event::CanvasDrag` per mouse step.
@@ -66,7 +121,9 @@ impl Gui {
         c.drag = Some(Point::new(x, y));
         if let Some(window) = self.window_of(v) {
             let view = self.tree.views[v].name.clone();
-            self.events.push(Event::CanvasDrag { window, view, dx: x - last.x, dy: y - last.y });
+            let o = self.origin(v);
+            let pos = self.windows[window].as_ref().map_or((0, 0), |w| w.pos);
+            self.events.push(Event::CanvasDrag { window, view, dx: x - last.x, dy: y - last.y, x: x - o.0 - pos.0 as f32, y: y - o.1 - pos.1 as f32 });
         }
     }
 

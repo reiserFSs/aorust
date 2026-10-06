@@ -190,9 +190,18 @@ pub enum CanvasItem {
     ImageTint { id: GfxId, src: [f32; 4], dst: [f32; 4], color: u32, alpha: f32 },
 }
 
+/// A tooltip over a rectangle of a [`Kind::Canvas`] (view-relative `[x0, y0, x1, y1)`); stands for `View::SetToolTip` of a child control.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasTip {
+    pub rect: [f32; 4],
+    pub title: String,
+    pub body: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CanvasData {
     pub items: Vec<CanvasItem>,
+    pub tips: Vec<CanvasTip>,
     /// Mouse position of the last drag step while the left button is held.
     pub drag: Option<Point>,
     /// Where the button went down (a release within 3 px is a click).

@@ -2,6 +2,8 @@
 //! (`GUI.dll` `SkillWindow`), display names / descriptions (`text.mdb`) and `data/ipdist.xml`.
 //! Evidence: `docs/gui.md` §11.
 
+pub mod skills;
+
 use crate::screens::TextDb;
 use anyhow::{Context, Result};
 use std::{collections::HashMap, path::Path, sync::LazyLock};

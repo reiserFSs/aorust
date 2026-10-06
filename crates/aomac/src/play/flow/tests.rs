@@ -131,3 +131,91 @@ fn login_flow_headless() {
     assert!(r.p.opened_urls.last().is_some_and(|u| u.ends_with("33-5.html")), "{:?}", r.p.opened_urls);
     assert!(r.p.screen == Screen::Login && r.p.cc.is_none() && r.login_visible());
 }
+
+/// Frames the server sent (`<`) in a capture of `docs/captures`.
+fn captured(rec: &str) -> Vec<ao_net::frame::Frame> {
+    rec.lines()
+        .filter_map(|l| {
+            let mut p = l.split(' ');
+            let (_, dir, hex) = (p.next()?, p.next()?, p.next()?);
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            (dir == "<").then(|| ao_net::frame::Frame::decode_with(&b, false).ok().flatten().map(|(f, _)| f)).flatten()
+        })
+        .collect()
+}
+
+impl Rig {
+    /// Frames until the loading screen has dissolved into the world (`Screen::InWorld`); the playfield loads in the background.
+    fn enter(&mut self) {
+        let t = Instant::now();
+        while self.p.screen != Screen::InWorld {
+            assert!(t.elapsed() < Duration::from_secs(120), "timeout waiting for the world");
+            self.p.frame(0.5, (1280, 800), &mut self.host);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    /// A burst of captured server frames, one `pump` per frame.
+    fn burst(&mut self, frames: &[ao_net::frame::Frame]) {
+        for f in frames {
+            self.event(LoginEvent::ZoneFrame(f.clone()));
+        }
+    }
+}
+
+/// A second `PlayfieldAnarchyFIIR_t` while in the world: loading screen again, dynels dropped, the new playfield loaded, `CharInPlay`
+/// owed again; `GameTimeIIR_t` drives the zone clock (docs/zone/world.md §10).
+#[test]
+fn second_playfield_shows_the_loading_screen_again() {
+    let Some(mut r) = rig() else { return };
+    let first = captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec"));
+    let second = captured(include_str!("../../../../../docs/captures/zone_ithaca.rec"));
+
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    assert!(r.p.screen == Screen::Loading && r.p.zone.day_time() == ao_formats::playfield::DEFAULT_DAY_TIME);
+    r.burst(&first);
+    assert_eq!(r.p.zone.playfield, Some(4604));
+    assert_eq!(r.p.zone.day_time(), 5229.0, "GameTimeIIR_t 78435 s of the 97200 s day, 15 game seconds per clock second");
+    r.enter();
+    assert!(r.p.world_ready || r.p.world_scene.is_none());
+    for _ in 0..IN_PLAY_FRAMES + 2 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    assert!(r.p.zone.in_play_sent && !r.p.zone.dynels.is_empty());
+    assert!(matches!(r.host.live_sky, Some(_)), "the world installed its live sky");
+    r.host.live_sky = None;
+
+    // the clock runs with the frames
+    let t0 = r.p.zone.day_time();
+    r.p.frame(2.0, (1280, 800), &mut r.host);
+    assert!((r.p.zone.day_time() - t0 - 2.0).abs() < 1e-3);
+
+    // the server sends another playfield: everything up to its `PlayfieldAnarchyF` frame is the old burst
+    let pf = second.iter().position(|f| matches!(ao_net::n3::decode(f), Ok(m) if matches!(m.body, ao_net::n3::N3::World(ao_net::n3::world::World::Playfield(_))))).unwrap();
+    r.burst(&second[..pf]);
+    assert!(r.p.screen == Screen::InWorld);
+    r.event(LoginEvent::ZoneFrame(second[pf].clone()));
+    assert!(r.p.screen == Screen::Loading, "the loading screen is shown again");
+    assert!(matches!(r.p.fade, Fade::In(_)) && !r.p.world_ready && r.p.hud.is_none());
+    assert!(r.p.zone.dynels.is_empty() && !r.p.zone.in_play_sent && r.p.zone.playfield == Some(4582));
+    r.burst(&second[pf + 1..]);
+    assert_eq!(r.p.zone.day_time(), 4478.0, "resynced by the new burst's GameTime (67170 s = 18:39:30)");
+    assert!(r.host.sky_clock.take().is_some(), "the live sky clock is resynced");
+    r.enter();
+    for _ in 0..IN_PLAY_FRAMES + 2 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    assert!(r.p.zone.in_play_sent, "CharInPlay is due again in the new world");
+    assert!(r.p.zone.own().is_none() && r.p.zone.dynels.len() > 10);
+    assert!(matches!(r.host.live_sky, Some(Some(_))), "4582 is outdoors: live sky");
+}
+
+/// `ZoneRedirection` (the session thread already reconnected): while in the world the loading screen comes back before the new burst.
+#[test]
+fn zone_redirect_shows_the_loading_screen() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    r.event(LoginEvent::ZoneRedirect { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 2 });
+    assert!(r.p.screen == Screen::Loading && r.p.zone.dynels.is_empty() && !r.p.zone.in_play_sent);
+}

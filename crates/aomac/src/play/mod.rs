@@ -12,11 +12,14 @@ mod delete;
 mod dynels;
 mod flow;
 mod hud;
+mod hud_aggdef;
 mod hud_bar;
+mod hud_compass;
 mod hud_map;
 mod hud_stats;
 mod hud_target;
 mod movement;
+mod player;
 mod prefs;
 mod preview;
 mod zone;
@@ -56,6 +59,9 @@ enum Bg {
     World(u32, Result<Box<Scene>, String>),
     /// The live sky source of playfield `id` (`None`: indoor / no tweak script), sent just before its [`Bg::World`].
     Sky(u32, Option<ao_formats::playfield::SkyClock>),
+    /// The top-down ground image of playfield `id` for the Map window (`Report::ground` rendered by `topdown::render` from the scene
+    /// the loader just built; `bool`: dungeon rooms), sent just before its [`Bg::World`].
+    Ground(u32, Option<Box<(ao_formats::topdown::GroundMap, bool)>>),
     /// The character-creation world (`charactercreation_*.abiff` + connectors), decoded in the background.
     CcWorld(Result<Box<CcWorld>, String>),
 }
@@ -141,6 +147,8 @@ struct Play {
     pending_fake: Option<usize>,
     pending_user: String,
     world_scene: Option<Box<Scene>>,
+    /// Ground image of the loading playfield for the Map window, handed to the HUD with the world.
+    world_ground: Option<(u32, Box<(ao_formats::topdown::GroundMap, bool)>)>,
     /// Live sky of the loading/loaded playfield, installed in the viewer when the world appears.
     world_sky: Option<ao_formats::playfield::SkyClock>,
     time: f32,
@@ -155,6 +163,12 @@ struct Play {
     loading_name: &'static str,
     /// The in-world interface (`ControlCenterModule_c`), created when the world appears.
     hud: Option<hud::Hud>,
+    /// Chat hub (`ChatGUIModule_c`), created at the zone hand-off; the windows open with the world.
+    chat: Option<chat::Chat>,
+    /// The own character in the world (movement, avatar, camera, controls); `None` outside the world.
+    player: Option<player::Player>,
+    /// Account name and password of the login, for the chat-server login only (the original keeps `cPlayerName`/`cPlayerPasswd`).
+    login_cred: Option<(String, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -224,6 +238,7 @@ impl Play {
             pending_fake: fake_charlist,
             pending_user: String::new(),
             world_scene: None,
+            world_ground: None,
             world_sky: None,
             time: 0.0,
             cc: None,
@@ -232,6 +247,9 @@ impl Play {
             welcome_image: false,
             loading_name: "",
             hud: None,
+            chat: None,
+            player: None,
+            login_cred: None,
             text,
             gui,
             dir,
