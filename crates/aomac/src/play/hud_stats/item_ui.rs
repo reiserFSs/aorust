@@ -23,6 +23,30 @@ const CMD_USE_ITEM_ON_CHARACTER: i32 = 0x20;
 const STAT_DECK: u32 = 0x2d;
 
 impl HudStats {
+    pub(in crate::play) fn take_info_urls(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.info_urls)
+    }
+
+    fn inspect_slot(&mut self, zone: &Zone, slot: u32) {
+        if zone.inventory.contains_key(&slot) {
+            let id = inv::item_identity(slot);
+            self.info_urls.push(format!("itemid://{}/{}", id.kind, id.instance));
+            self.dnd.last_click = None;
+        }
+    }
+
+    fn info_slot_at(&self, gui: &Gui, zone: &Zone, x: f32, y: f32) -> Option<u32> {
+        if let Some(slot) = self.place_at(gui, x, y).and_then(|p| self.slot_of(p)) {
+            return Some(slot);
+        }
+        let i = self.inventory.as_ref().filter(|i| i.list)?;
+        let vp = gui.view_rect(i.window, "scrollview")?;
+        if x < vp.l || x >= vp.r || y < vp.t || y >= vp.b { return None; }
+        zone.inventory.keys().copied().find(|slot| {
+            gui.view_rect(i.window, &format!("item{slot}")).is_some_and(|r| x >= r.l && x < r.r && y >= r.t && y < r.b)
+        })
+    }
+
     /// Inventory slot of a place (`None` for an empty grid cell).
     pub(super) fn slot_of(&self, p: Place) -> Option<u32> {
         match p {
@@ -48,6 +72,14 @@ impl HudStats {
                     if x >= g.l.max(vp.l) && x < g.r.min(vp.r) && y >= g.t.max(vp.t) && y < g.b.min(vp.b) {
                         return self.bag_cell_at(x - g.l, y - g.t);
                     }
+                }
+            } else if let Some(vp) = gui.view_rect(i.window, "scrollview") {
+                if x >= vp.l && x < vp.r && y >= vp.t && y < vp.b {
+                    return (inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS).find_map(|slot| {
+                        let row = gui.view_rect(i.window, &format!("item{slot}"))?;
+                        let cell = i.positions.get(slot)?;
+                        (x >= row.l && x < row.r && y >= row.t && y < row.b).then_some(Place::Bag { cell })
+                    });
                 }
             }
         }
@@ -75,10 +107,23 @@ impl HudStats {
     }
 
     /// Raw pointer events (`Hud::input`): press on an item, drag, drop.
-    pub(in crate::play) fn input(&mut self, gui: &mut Gui, zone: &Zone, ev: &InputEvent) {
+    pub(in crate::play) fn input(&mut self, gui: &mut Gui, zone: &Zone, ev: &InputEvent, mods: ao_gui::Modifiers) {
         match *ev {
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
+                self.info_click = mods.shift || mods.ctrl;
+                if self.info_click {
+                    self.dnd.press = None;
+                    if let Some(slot) = self.info_slot_at(gui, zone, x, y) {
+                        self.inspect_slot(zone, slot);
+                    }
+                    return;
+                }
                 self.dnd.press = self.place_at(gui, x, y).filter(|&p| self.slot_of(p).is_some_and(|s| zone.inventory.contains_key(&s))).map(|p| (p, x, y));
+            }
+            InputEvent::MouseDown { x, y, button: MouseButton::Right } => {
+                if let Some(slot) = self.info_slot_at(gui, zone, x, y) {
+                    self.inspect_slot(zone, slot);
+                }
             }
             InputEvent::MouseMove { x, y } => {
                 if let Some((ghost, slot)) = self.dnd.drag.as_ref().map(|d| (d.ghost, d.slot)) {
@@ -222,6 +267,9 @@ impl HudStats {
     /// A short click on an item cell (`Event::CanvasClick`): the second click on the same cell within [`DOUBLE_CLICK`] seconds uses the item
     /// (`FUN_100ca1e7` -> `N3Msg_UseItem`): a worn item goes to the bag, a bag item is worn at its `DefaultPos` or used.
     pub(super) fn item_click(&mut self, zone: &Zone, place: Place) {
+        if self.info_click {
+            return;
+        }
         let now = self.dnd.clock;
         let double = self.dnd.last_click.is_some_and(|(p, t)| p == place && now - t <= DOUBLE_CLICK);
         self.dnd.last_click = if double { None } else { Some((place, now)) };
@@ -230,6 +278,13 @@ impl HudStats {
         }
         let Some(slot) = self.slot_of(place) else { return };
         self.use_slot(zone, slot);
+    }
+
+    /// Activates a carried inventory item without interpreting a shortcut as an equip request.
+    pub(in crate::play) fn activate_item(&mut self, zone: &Zone, slot: u32) {
+        if zone.inventory.contains_key(&slot) {
+            self.run(zone, Action::Use { item: inv::item_identity(slot) }, None);
+        }
     }
 
     /// The double click on the item in inventory slot `slot` (worn: to the bag; bag: worn at its `DefaultPos` or used).
@@ -259,5 +314,37 @@ impl HudStats {
     /// Live harness: double click on the item of inventory slot `slot` (wear / unwear / use).
     pub(in crate::play) fn live_double_click(&mut self, zone: &Zone, slot: u32) {
         self.use_slot(zone, slot);
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    #[test]
+    fn activation_sends_use_and_waits_for_server_upload() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/text").exists() {
+            eprintln!("skipping: no client");
+            return;
+        }
+        let mut stats = HudStats::new(&dir, (800, 600)).unwrap();
+        let mut zone = Zone::new(7);
+        zone.inventory.insert(0x40, ao_net::n3::world::InventoryEntry {
+            slot: 0x40, a: 0, b: 0, id: Identity::default(),
+            item: ao_net::n3::world::AcgItem { low_id: 0, high_id: 0, level: 1 },
+        });
+        stats.activate_item(&zone, 0x40);
+        let out = stats.take_outbox();
+        assert_eq!(out.len(), 1);
+        let decoded = ao_net::n3::decode(&out[0]).unwrap();
+        let own = Identity { kind: DYNEL_CHAR, instance: 7 };
+        assert_eq!(decoded.header.target, own);
+        let ao_net::n3::N3::Misc(Misc::GenericCmd(cmd)) = decoded.body else { panic!("expected item use") };
+        assert_eq!(cmd.cmd, CMD_USE_ITEM);
+        assert_eq!(cmd.args, GenericArgs::Item { flag: 0, actor: own, item: inv::item_identity(0x40) });
+        assert!(zone.nanos.programs.is_empty(), "sending use must not fake a successful upload");
+        stats.activate_item(&zone, 0x41);
+        assert!(stats.take_outbox().is_empty(), "missing item cannot be activated");
     }
 }

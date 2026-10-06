@@ -130,7 +130,7 @@ mod tests {
     use super::*;
 
     fn info(stats: &[(u32, i32)]) -> Info {
-        Info { name: String::new(), count: 1, icon: None, stats: stats.to_vec() }
+        Info { name: String::new(), icon: None, stats: stats.to_vec() }
     }
 
     #[test]

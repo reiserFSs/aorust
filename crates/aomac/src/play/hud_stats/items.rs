@@ -13,8 +13,7 @@ use std::path::Path;
 
 /// Stat `Icon`.
 const STAT_ICON: u32 = 0x4f;
-/// Stat `MultipleCount` (212): the template's stack size, shown in the list mode's "Count" column (the instance count is not part of `ACGItem_t`,
-/// its `a` / `b` words are unresolved, docs/zone/world.md §2).
+/// Stat `MultipleCount` (212): template count for shop stock; owned inventory count is `InventoryEntry::b` (GC 0x1002a7d2).
 const STAT_COUNT: u32 = 212;
 
 /// Size of an item picture (`MultiListView_c` grid icon, 48 px) and of its slot art `GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED`.
@@ -23,7 +22,6 @@ pub const SLOT: f32 = 54.0;
 
 pub struct Info {
     pub name: String,
-    pub count: i32,
     pub icon: Option<(GfxId, u32, u32)>,
     /// The template's stats (rdb 1000020): `Can` (30), `ItemClass` (76), `DefaultPos` (88), `Placement` (298) decide how an item may be worn.
     pub stats: Vec<(u32, i32)>,
@@ -55,7 +53,7 @@ impl Items {
             let info = self.store.as_ref().and_then(|s| {
                 let t = item_template(s, u32::try_from(low_id).ok()?).ok()??;
                 let icon = t.stat(STAT_ICON).filter(|&i| i > 0).and_then(|i| icon_image(gui, s, i as u32));
-                Some(Info { name: t.name.clone().unwrap_or_default(), count: t.stat(STAT_COUNT).filter(|&c| c > 0).unwrap_or(1), icon, stats: t.stats.clone() })
+                Some(Info { name: t.name.clone().unwrap_or_default(), icon, stats: t.stats.clone() })
             });
             self.cache.insert(low_id, info);
         }

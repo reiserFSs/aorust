@@ -15,6 +15,38 @@ impl Zone {
         (inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS).find(|s| !self.inventory.contains_key(s))
     }
 
+    /// Server `CharacterActionIIR_t` 0x70: GC 0x1005d8f1 -> 0x1004a191.
+    /// `identity_b.kind > 0` consumes one stack unit; otherwise the whole item is deleted.
+    pub(in crate::play) fn delete_inventory_item(&mut self, item: Identity, one: bool) {
+        if item.kind == inv::KIND_BAG && item.instance >= inv::BAG_FIRST as i32 {
+            let slot = item.instance as u32;
+            if let Some(entry) = self.inventory.get_mut(&slot) {
+                if one && entry.b > 1 {
+                    entry.b -= 1;
+                } else {
+                    self.inventory.remove(&slot);
+                }
+            }
+            return;
+        }
+        let slot = if item.kind == inv::KIND_IN_CONTAINER { (item.instance & 0xffff) as u32 } else if item.instance >= 0 { item.instance as u32 } else { return };
+        let list = match item.kind {
+            inv::KIND_IN_CONTAINER => self.containers.values_mut().find(|(word, _)| i32::from(*word as i16) == item.instance >> 16),
+            inv::KIND_BANK => self.containers.get_mut(&(0xdead, self.char_id as i32)),
+            inv::KIND_TRADE => self.containers.get_mut(&(inv::KIND_TRADE, self.char_id as i32)),
+            _ => None, // worn pages (65/66/67/73) are refused by FUN_10047242
+        };
+        if let Some((_, entries)) = list {
+            if let Some(at) = entries.iter().position(|e| e.slot == slot) {
+                if one && entries[at].b > 1 {
+                    entries[at].b -= 1;
+                } else {
+                    entries.remove(at);
+                }
+            }
+        }
+    }
+
     /// Apply one server inventory message addressed to the own character.
     ///
     /// * `ContainerAddItemIIR_t` with the own character as container and an item identity of the own pages (`FUN_10047d77(kind, from = item.instance,
@@ -173,6 +205,29 @@ mod tests {
 
     fn add(from: u32, to: i32) -> InventoryMsg {
         InventoryMsg::ContainerAdd { item: inv::item_identity(from), container: Identity { kind: 0xC350, instance: 7 }, slot: to }
+    }
+
+    #[test]
+    fn server_delete_consumes_stack_or_removes_item_without_learning_a_nano() {
+        let mut z = Zone::new(7);
+        put(&mut z, 0x40, 100);
+        z.inventory.get_mut(&0x40).unwrap().b = 2;
+        put(&mut z, 0x11, 101);
+        let delete = |who, slot, one| ao_net::n3::outgoing::n3_frame(0, who as u32,
+            inv::delete_item(who, inv::item_identity(slot), Identity { kind: i32::from(one), instance: 0 }));
+        z.on_frame(&delete(8, 0x40, true));
+        assert_eq!(z.inventory[&0x40].b, 2, "another character's deletion is not ours");
+        z.on_frame(&delete(7, 0x11, false));
+        assert!(z.inventory.contains_key(&0x11), "worn items must be unequipped first");
+        z.on_frame(&delete(7, 0x40, true));
+        assert_eq!(z.inventory[&0x40].b, 1);
+        z.on_frame(&delete(7, 0x40, true));
+        assert!(!z.inventory.contains_key(&0x40));
+        put(&mut z, 0x40, 100);
+        z.inventory.get_mut(&0x40).unwrap().b = 3;
+        z.on_frame(&delete(7, 0x40, false));
+        assert!(!z.inventory.contains_key(&0x40), "zero extra kind deletes the entire stack");
+        assert!(z.nanos.programs.is_empty(), "consumption alone must not invent a learned nano");
     }
 
     #[test]

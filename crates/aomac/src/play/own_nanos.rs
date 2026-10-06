@@ -26,6 +26,8 @@ pub struct OwnNanos {
     /// The program list in server order.
     pub programs: Vec<i32>,
     pub buffs: Vec<Buff>,
+    /// Successful new uploads awaiting the GUI's retail learned-nano signal consumers.
+    learned: Vec<i32>,
     /// Seconds since the zone state was created (advanced by [`OwnNanos::tick`]); the clock of [`Buff::started`].
     pub time: f32,
     /// Incremented by every change of `programs` / `buffs`: the windows redraw when it moves.
@@ -35,6 +37,10 @@ pub struct OwnNanos {
 impl OwnNanos {
     pub fn tick(&mut self, dt: f32) {
         self.time += dt;
+    }
+
+    pub fn take_learned(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.learned)
     }
 
     /// Applies a message addressed to the own character (`header` identity == `own`).
@@ -51,6 +57,7 @@ impl OwnNanos {
                 // `FUN_1004fbbc`: only when not in the list yet; the record check (`FUN_100a45ba`) is the windows' (an unknown id has no row)
                 Some(ListChange::Learned(id)) if !self.programs.contains(&id) => {
                     self.programs.push(id);
+                    self.learned.push(id);
                     self.serial += 1;
                 }
                 Some(ListChange::Forgotten(id)) if self.programs.contains(&id) => {
@@ -101,9 +108,11 @@ mod tests {
         let fc = ao_net::n3::world::FullCharacter { list_18: vec![5, 6], ..Default::default() };
         n.on_message(me(), me(), &N3::World(World::FullCharacter(Box::new(fc))));
         assert_eq!(n.programs, [5, 6]);
+        assert!(n.take_learned().is_empty(), "login list is not an upload signal");
         n.on_message(me(), me(), &action(nano::action::LEARNED, 9));
         n.on_message(me(), me(), &action(nano::action::LEARNED, 9));
         assert_eq!(n.programs, [5, 6, 9]);
+        assert_eq!(n.take_learned(), [9], "duplicate replies do not repeat the GUI signal");
         n.on_message(me(), me(), &action(nano::action::FORGOTTEN, 5));
         assert_eq!(n.programs, [6, 9]);
         // somebody else's actions are not ours
