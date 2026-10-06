@@ -105,13 +105,18 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
   when in a team and not its leader (`FUN_100efb0a`). **Tell** (`FUN_100efa55`): `OpenTellWindow(name, id)`.
 * **LFT checkbox / team description** (`FUN_100f0313` -> `FUN_100f01a3(on, desc)`): off = request kind 0xb (`0x5dd`), on = kind 10 (`0x5dc S`) and `LFTWindowConfig.TeamDesc` updated; `DAT_10276620` = own flag
   (`/lft` toggles the same flag, docs/chat/cmd.md). `FUN_1007850a` (a Gamecode state reset) also calls `FUN_100f01a3(0, "")`: when exactly is unresolved, not ported.
-* Ported: the window from the client's own `LFTView.xml` (labels, layout, buttons, check box, input), dropdowns as ao-gui combo boxes, rows as fixed-width cells; persistence in
-  `<prefs dir>/LFTWindowConfig.xml` (same `Message` archive schema as the chat window configs).
+* Ported: the window from the client's own `LFTView.xml` (labels, layout, buttons, check box, input) with the **real widgets** (docs/gui.md §14): the three `DropdownMenu` (items
+  inserted at their id as index, `SelectByID(saved id, true)`, Search reads the selected item ids and the selected *index* of Location) and the `MultiListView` (list mode, flags
+  0x40, 6 columns `AddColumn(i, label, width, 0xe)`, rows `AddItem(.., sorted = true)` ordered by the Name column, compare per column as `FUN_100ef4a1`, header click re-sorts,
+  header drag resizes, selected row = `ViewSurface` 0x88aadd; the row is selected by the application slot `FUN_100efacd` = `Select(true, true)` on the mouse-down signal). Column
+  widths and the three selected ids persist in `<prefs dir>/LFTWindowConfig.xml` (same `Message` archive schema as the chat window configs).
 
 ## 7. Not faithful / unresolved (each labelled in code)
 
-* `MultiListView_c` / `ListViewBase_c` / `DropdownMenu_c` do not exist in ao-gui: rows are `TextButton`s with the original colours, the dropdown is the combo box (editable text, **GUESS**).
-  Selection highlight of a candidate row (white vs 0xc0c0c0 label) and the normal friend label colour are GUESSES; folder open / closed icon ids 0xd4 / 0xd5 order is a GUESS.
+* The list widgets are real now (docs/gui.md §14): the label colours (selected / not selectable `0xffffff`, selectable `0xc0c0c0`, red `0xff6666` / `0xc04c4c`), the folder icons
+  (`0xd5` open, `0xd4` closed), the 15 px indent and the 0.5 s icon blink come from `StringListViewItem_c` / `ListViewBaseItem_c`. A click on a friend toggles its tell window
+  (`FUN_100a9b4b`: `FUN_100a75e8(1 - is_open)`, 0 closes it); a click on a chat-window item (show / hide that chat window, `FUN_1009adae`, and its menu `FUN_100a83ac`) is not ported.
+  UNRESOLVED left in the widgets: the horizontal scroll-bar art, the popup menu skin (shared `PopupMenu_c`), `ResizeColumnToFit` (fits the widest cell), a sort marker in the header.
 * Friends window position (centred), tell window layout, tell routing preferences (section 4), the "Chat Windows" folder content (needs `ChatWindows` names), chat window
   assignment check boxes (section 5), `ChatPGInviteAction` pref store, Mail entry, LFT reset at `FUN_1007850a`, team state for the LFT Invite button (port has no team state yet).
 * Kick: the original queues `GroupAction(part)` before the "left private group" text (order delivered to a removed group is unknown); the port prints the text first.

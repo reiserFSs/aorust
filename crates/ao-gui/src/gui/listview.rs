@@ -562,7 +562,7 @@ impl Gui {
         let clicks = self.row_clicks(v, &id, button);
         if let Some(window) = self.window_of(v) {
             let view = self.owner_name(v);
-            self.events.push(Event::ListItemMouse { window, view, id, button, clicks });
+            self.events.push(Event::ListItemMouse { window, view, id, button, clicks, x: x as i32, y: y as i32 });
         }
     }
 
@@ -843,7 +843,7 @@ impl Gui {
         let clicks = self.row_clicks(v, &key, button);
         if let Some(window) = self.window_of(v) {
             let view = self.owner_name(v);
-            self.events.push(Event::MultiMouse { window, view, id, button, clicks });
+            self.events.push(Event::MultiMouse { window, view, id, button, clicks, x: x as i32, y: y as i32 });
         }
     }
 

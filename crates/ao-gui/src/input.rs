@@ -100,12 +100,12 @@ pub enum Event {
     /// `ListViewBase_c::ItemSelected` (signal `+0x148`): item id and its new state. `view` = name of the `StringListView`.
     ListSelected { window: WindowId, view: String, id: String, selected: bool },
     /// A mouse button went down on a row of a `StringListView` (`ListViewBase_c` signal `+0x14c`, after the folder toggle and the selection): `button` 1 left /
-    /// 2 right, `clicks` 2 for the second press of the same row within [`crate::DOUBLE_CLICK_TIME`].
-    ListItemMouse { window: WindowId, view: String, id: String, button: u8, clicks: u8 },
+    /// 2 right, `clicks` 2 for the second press of the same row within [`crate::DOUBLE_CLICK_TIME`]; `x`,`y` = the pointer (window-independent screen px).
+    ListItemMouse { window: WindowId, view: String, id: String, button: u8, clicks: u8, x: i32, y: i32 },
     /// `MultiListViewItem_c::Select(.., true)` on a row of a `MultiListView` (signal `+0x144`).
     MultiSelected { window: WindowId, view: String, id: i64, selected: bool },
     /// `MultiListView_c::MouseDown` signal: the row under the pointer (`None` = empty area) with the button (1 left, 2 right) and press count.
-    MultiMouse { window: WindowId, view: String, id: Option<i64>, button: u8, clicks: u8 },
+    MultiMouse { window: WindowId, view: String, id: Option<i64>, button: u8, clicks: u8, x: i32, y: i32 },
     /// A column header was resized (`SlotColumnResized`): the new width (for the window's saved config).
     MultiColumnResized { window: WindowId, view: String, col: i32, width: f32 },
 }
