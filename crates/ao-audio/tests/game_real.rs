@@ -269,3 +269,40 @@ fn game_sound_is_positional_by_distance_only() {
     assert!(a.play_game_sound(0xcfde8382, pos, [500.0, 2.0, -5.0]).is_empty(), "nothing beyond the maximum distance");
     assert!(a.play_game_sound(0x1234_5678, pos, pos).is_empty(), "unknown ids are ignored");
 }
+
+/// The sound multimaps of the weapon records (rdb 1000020, `WeaponItem` 0xC74A; docs/zone/combat-anim.md section 6): the ids resolve in the sbf, the
+/// martial-arts item of the bare-handed player has the swing / impact / swish sounds, and a variant sound plays for a creature material.
+#[test]
+fn weapon_sounds_resolve() {
+    let Some(dir) = client() else { return };
+    let store = RecordStore::open(&dir).unwrap();
+    let lib = ao_audio::Library::load(&dir.join("cd_image/sound")).unwrap();
+    let (mut weapons, mut with_sounds, mut ids, mut missing) = (0, 0, 0, 0);
+    let mut keys = std::collections::BTreeSet::new();
+    for id in store.ids(ao_formats::dynel_visual::ITEM_TEMPLATE_TYPE).unwrap() {
+        let Some(t) = ao_formats::dynel_visual::item_template(&store, id).ok().flatten().filter(|t| t.kind == 0xC74A) else { continue };
+        weapons += 1;
+        with_sounds += usize::from(!t.sounds.is_empty());
+        for (k, v) in &t.sounds {
+            keys.insert(*k);
+            for s in v {
+                ids += 1;
+                missing += usize::from(lib.sounds.get(*s).is_none());
+            }
+        }
+    }
+    eprintln!("weapon records {weapons}, with sounds {with_sounds}, sound ids {ids}, not in the sbf {missing}, keys {keys:?}");
+    assert!(with_sounds > 16000 && ids > 8000, "{with_sounds} / {ids}");
+    assert!(missing * 100 < ids, "{missing} of {ids} ids are not in the sbf");
+    for k in [0xb, 0x1f] {
+        assert!(keys.contains(&k), "key {k:#x}");
+    }
+    let martial = ao_formats::dynel_visual::item_template(&store, 43712).unwrap().unwrap();
+    for (k, v) in &martial.sounds {
+        assert!(v.iter().all(|s| lib.sounds.get(*s).is_some()), "key {k:#x}");
+    }
+    let a = Audio::offline(&dir, 44100);
+    let at = [0.0; 3];
+    // 0x7199b60d (martial-arts impact) only has variants: nothing without a material that has one, flesh (7) plays
+    assert!(!a.play_game_sound_with(0x7199b60d, at, at, 7, 1).is_empty(), "the flesh variant plays");
+}

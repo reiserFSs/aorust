@@ -30,9 +30,10 @@ pub const CC_MESHES: [&str; 6] = [
 pub const PROFESSION_MESHES: [usize; 4] = [1, 3, 4, 5];
 
 /// The 7 CC breeds in `SlotMeshReady`'s table (GUI 0x10272490: `Breed_e, BreedSex_e, connector`), CC breed id = index + 1.
-/// Breed 1 Solitus 2 Opifex 3 Nanomage 4 Atrox; sex 2 male 3 female.
+/// Breed 1 Solitus 2 Opifex 3 Nanomage 4 Atrox; sex 1 unisex 2 male 3 female. Atrox (CC 7) is `(4, 1)` unisex:
+/// `ConvertCCBreedToGCBreedAndSex` case 7 sets `*breed = 4; *sex = 1` (the live PRK server refuses `(4, 2)` with code 7).
 pub const CC_BREEDS: [(i32, i32, &str); 7] =
-    [(1, 3, "breed_0"), (1, 2, "breed_1"), (2, 3, "breed_2"), (2, 2, "breed_3"), (3, 3, "breed_4"), (3, 2, "breed_5"), (4, 2, "breed_6")];
+    [(1, 3, "breed_0"), (1, 2, "breed_1"), (2, 3, "breed_2"), (2, 2, "breed_3"), (3, 3, "breed_4"), (3, 2, "breed_5"), (4, 1, "breed_6")];
 
 /// `SceneBase_t::ConvertCCBreedToGCBreedAndSex` (GUI 0x101225f7): CC breed 1..7 → `(Breed_e, BreedSex_e)`.
 pub fn cc_breed_to_gc(cc: i32) -> Option<(i32, i32)> {
@@ -498,7 +499,10 @@ mod tests {
     #[test]
     fn breed_and_profession_tables() {
         assert_eq!(cc_breed_to_gc(1), Some((1, 3)));
-        assert_eq!(cc_breed_to_gc(7), Some((4, 2)));
+        assert_eq!(cc_breed_to_gc(7), Some((4, 1)));
+        // every case of GUI 0x101225f7 (decompiled): 1 (1,3) 2 (1,2) 3 (2,3) 4 (2,2) 5 (3,3) 6 (3,2) 7 (4,1)
+        let all: Vec<_> = (1..=7).map(|c| cc_breed_to_gc(c).unwrap()).collect();
+        assert_eq!(all, [(1, 3), (1, 2), (2, 3), (2, 2), (3, 3), (3, 2), (4, 1)]);
         assert_eq!(cc_breed_to_gc(0), None);
         assert_eq!(cc_prof_to_gc(4), 1);
         assert_eq!(cc_prof_to_gc(0), 13);

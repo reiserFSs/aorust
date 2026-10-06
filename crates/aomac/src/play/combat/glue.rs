@@ -6,6 +6,7 @@ use super::anim::{anim_name, list, npc_sound, special_swing, UNARMED_RSWING};
 use super::log::{Space, HUD_Y_FROM_REF};
 use super::state::CombatEvent;
 use super::module::{Command, Module};
+use super::notes::hit_of;
 use crate::play::chat::GameAction;
 use crate::play::dynels::{Dynels, NAME_TAG_RADIUS};
 use crate::play::player::Player;
@@ -117,10 +118,15 @@ impl Play {
                 }
             }
         }
-        // swings (`FUN_1006a239` [GC 0x1006a239], docs/zone/combat-anim.md §3): every hit and special attack of every character
+        // what the attack notes of a swing read from the attacker's slot object (`FUN_1006a8f3`); a miss runs the same routine with damage 0 and
+        // hit kind 1 (`FUN_1006ae50`: `FUN_1006a8f3(slot, 0, value_1c, 0, 1, 0)`)
+        for (attacker, ctx) in events.iter().filter_map(hit_of) {
+            self.zone.world.hit_seen(attacker, ctx);
+        }
+        // swings (`FUN_1006a239` [GC 0x1006a239], docs/zone/combat-anim.md §3): every hit, miss and special attack of every character
         for e in &events {
             match e {
-                CombatEvent::Hit { attacker, .. } => swing(&mut self.zone.world, self.player.as_mut(), *attacker, list::ATTACK, false, own),
+                CombatEvent::Hit { attacker, .. } | CombatEvent::Miss { attacker, .. } => swing(&mut self.zone.world, self.player.as_mut(), *attacker, list::ATTACK, false, own),
                 CombatEvent::SpecialAttack { who, special, .. } => {
                     let s = special_swing(*special);
                     swing(&mut self.zone.world, self.player.as_mut(), *who, s.map_or(list::ATTACK, |s| s.list), s.is_some_and(|s| s.own_item), own)
@@ -128,7 +134,31 @@ impl Play {
                 _ => {}
             }
         }
-        // fight sounds (docs/zone/combat-anim.md §6): played by the app next to the door sounds (`Dynels::take_sounds`, listener = camera)
+        // the struck character's reaction clip (`FUN_1009b4ac`, docs/zone/combat-anim.md §4): hit kind > 1, not while swimming (mode 4 / 8)
+        for e in &events {
+            let CombatEvent::Hit { victim, flags, .. } = e else { continue };
+            if *flags <= 1 {
+                continue;
+            }
+            if *victim != own {
+                self.zone.world.react_to_hit(*victim, *flags);
+            } else if let Some(p) = self.player.as_mut().filter(|p| !matches!(p.mode(), 4 | 8)) {
+                let anim = self.zone.world.impact_anim();
+                if let Some((name, _)) = anim_name(anim) {
+                    p.react(Role::Clip(name.into()), if *flags == 4 { 1.0 } else { 0.5 });
+                }
+            }
+        }
+        // fight sounds (docs/zone/combat-anim.md §6): played by the app next to the door sounds (`Dynels::take_sounds`, listener = camera).
+        // The weapon / swish / impact sounds belong to the animation notes of the swing clips (`FUN_1003c036` -> `FUN_10045069`, `notes`)
+        let own_notes = self.player.as_mut().map(|p| p.take_notes()).unwrap_or_default();
+        let notes: Vec<(i32, u32)> = own_notes.into_iter().map(|n| (own, n)).chain(self.zone.world.take_notes()).collect();
+        for &(who, n) in &notes {
+            if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
+                eprintln!("combat: note {n:#x} of {who}");
+            }
+            self.zone.world.note_sounds(who, n);
+        }
         for id in m.take_struck() {
             self.zone.world.char_sound(id, npc_sound::HIT);
         }
@@ -280,15 +310,19 @@ impl Play {
 /// decoded, combat-anim.md §3.1); creatures (no weapon attractors) always use it.
 fn swing(world: &mut Dynels, player: Option<&mut Player>, who: i32, key: u16, own_item: bool, own: i32) {
     let picked = if own_item { None } else { world.pick_swing(who, key) };
+    // the clip's notes (`attack`, `swish_*`) start the sounds: the own avatar and the dynels watch them while the clip plays
+    if who != own {
+        world.swing_mark(who);
+    }
     match (who == own, picked) {
         (true, Some((anim, delay))) => {
             if let (Some(p), Some((name, _))) = (player, anim_name(anim)) {
-                p.swing(Role::Clip(name.into()), delay);
+                p.swing(Role::Clip(name.into()), Some(delay));
             }
         }
         (true, None) => {
             if let (Some(p), Some((name, _))) = (player, anim_name(UNARMED_RSWING)) {
-                p.play(Role::Clip(name.into()), false);
+                p.swing(Role::Clip(name.into()), None);
             }
         }
         (false, Some((anim, _))) => world.play_once(who, anim as u32),

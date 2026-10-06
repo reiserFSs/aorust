@@ -72,6 +72,9 @@ pub enum OwnEvent {
     Relocated { parent: Identity, pos: Option<[f32; 3]> },
     /// `FightModeUpdate_t` [GC 0x10124b70] for the current playfield (the district table is the player's, `fightmode.rs`).
     FightMode(ao_net::n3::server_move::FightModeUpdate),
+    /// `AppearanceUpdateIIR_c` [GC 0x10071679] of the own dynel: its attractor meshes `(AttractorPlace_e, rdb 1010001 mesh)` replace the current ones
+    /// (wield / unwield of a weapon: the weapon mesh in a hand attractor, docs/zone/avatar.md §5).
+    Attractors(Vec<(u8, u32)>),
 }
 
 /// Events of the client-initiated teleport path (`n3EngineClientAnarchy_t::StartTeleportTry` / `TeleportTrier_t`, docs/zone/world.md §10.2).
@@ -338,6 +341,14 @@ impl Zone {
             N3::Misc(Misc::FollowTarget(f)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 let v = |p: &ao_net::n3::misc::Vec3| [p.x, p.y, p.z];
                 self.own_events.push(OwnEvent::Follow { mode: f.mode, target: (f.target.kind == CHAR_KIND && f.target.instance != 0).then_some(f.target.instance), pos: v(&f.pos), path: f.path.iter().map(v).collect() });
+            }
+            // `AppearanceUpdateIIR_c::Activate`: `ClearAttractors` + `AddAttractors(wire list)`; `own_update` follows so a rebuilt avatar keeps the weapon
+            N3::World(World::Appearance(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                let list: Vec<(u8, u32)> = a.attractors.iter().filter(|t| t.b > 0).map(|t| (t.a, t.b as u32)).collect();
+                if let Some(u) = self.own_update.as_mut() {
+                    u.attractors = a.attractors.iter().map(|t| ao_net::n3::dynel::AttractorMesh { place: t.a, mesh: t.b, field: t.c, byte: t.d }).collect();
+                }
+                self.own_events.push(OwnEvent::Attractors(list));
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 if a.action == 0x14 {

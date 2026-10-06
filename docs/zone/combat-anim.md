@@ -57,7 +57,7 @@ The app has no per-character state objects, so the state ids (`CharState`), the 
   at `AnimStruct+0x20`. The metadata entries are the CAT clip's named events (`CatAnim::events`, `(time ms, name)`), so entry 0 = the clip's first event.
 
 ### 3.0 What the client runs (`combat/glue.rs::swing`, `Dynels::pick_swing`)
-Every `Hit` / `SpecialAttack` event of any character:
+Every `Hit` / `Miss` / `SpecialAttack` event of any character (a miss runs `FUN_1006a8f3` with damage 0, section 4):
 1. **Weapon swing**: the holder's wielded weapon (`Dynels::wield`, the `WeaponItemFullUpdate` children in body slot 6 = right hand, 8 = left;
    `AnimSet` 0x161 and `ItemDelay` 0x126 from the item template under the message stats) -> `weapon_list(AnimSet, left, crawl = false, key)`
    (`key` = `0xb`, or the special's list key, else `0xb` when the weapon has no such key) -> random value (the CRT-rand stream of `Dynels`)
@@ -118,11 +118,18 @@ the slot holds the `DummyWeapon_t` of the martial-arts item the `SpecialAttackWe
   Stance ids per weapon type: section 3.1 (`blade-start/idle-blade/blade-stop` 1000-1002, `smallarms` 1010-1012, `rifle` 1020-1022,
   `unarmed` 1030-1032, `2h` 1055/1054/1056, `bow` 0xb5-0xb8). **There is no separate "fight stance" clip**: being in `CharFight_t` only keeps the weapon
   idle (list 0x10); a character that is not fighting plays plain 0x78/walk/run.
+  **Own character**: `Avatar::set_stance(Dynels::wielded_set(own))` (`Player::frame`) gives idle / fight idle / walk / run the same weapon clips as `Dynels::update` gives other wielders (idle 0x10, walk 0x2a, run 0x2b, first value of the list; AnimSet 4/5 have none) while the model's set has the clip; the wield itself is the own `WeaponItemFullUpdate` and ends with `CharacterAction` 0x61 for the slot (docs/zone/avatar.md §6). Start / stop (draw / holster) clips on the wear / unwear are **[UNRESOLVED]**: the callers of `FUN_1003c930` / `FUN_1003c9b2` were not traced, nothing is played.
 * **Being hit** (`CharacterActionIIR_t` action **0xd1**, `FUN_1005d0d8` case 0x5b [GC 0x1005eada]): if `identity_a.instance` and `identity_b.instance` (the handler's two `Identity*` arguments; `param` is not read) are both `> 0`, play the hit sound at the
-  victim's position (section 6). **No hit-reaction animation was found**: the `imp-*` clips (0x7e..0x84) exist in the data and the engine
-  has `n3VisualDynel_t::GetImpactAnim` (base returns 0, [N3 0x10007572]; Gamecode export thunk 0x10131f02) but the override that picks an
-  `imp-*` id was not located. **[UNRESOLVED]** (searched: immediate-id scans of Gamecode.dll, callers of the thunk).
-* **Miss** (`MissedAttackInfoIIR_t`, apply `FUN_1006ae50`): combat-log text only; no dodge/miss animation or sound exists in the code paths read.
+  victim's position (section 6).
+* **Hit reaction** [CODE] (`FUN_1009b4ac` [GC 0x1009b4ac], run by the swing's `attack` note, section 6.1): hit kind (`AttackInfo::unk_30`) > 1, the victim's holder is not already playing a list-`0x1f` clip and
+  the victim's movement mode is not 4 / 8: `Play(GetImpactAnim(victim), rate)`. `GetImpactAnim` is the `SimpleChar` vtable slot `+0x90` = `FUN_10058cfa` [GC 0x10058cfa] (vtable 0x1015fa94, the ctor
+  `FUN_1005cb6a` stores it): stat `0x1ae == 0xe` (crawling) -> `0xd0`, else `rand() % 5` of `{0x81, 0x82, 0x80, 0x84, 0x7f}` (the `imp-*` clips; creatures resolve them through their record's
+  parent chain `0x80..0x84 -> 0x7f`, npc.md section 3). Rate `1.0` when the hit kind is 4 (crit), else `_DAT_1015d0a4` = 0.5. The same `GetImpactAnim` id also picks the impact effect location (`0x3e9 / 0x3ef /
+  0x3f0 / 1000 / 0x3ee`, `FUN_1009ad7d`). **Wired**: `Dynels::impact_anim`, `Dynels::react_to_hit` (others), `Player::react` (own avatar, `Avatar::set_clip_scale`), from `combat/glue.rs`. The crawl case is not
+  tracked (stat 0x1ae); "already playing" is "the character is busy with another one-shot clip" (`play_once` / `Player::react` ignore the call); the movement mode 4 / 8 test is only done for the own character.
+* **Miss** (`MissedAttackInfoIIR_t`, apply `FUN_1006ae50`): the combat-log text **and the same swing as a hit**: `FUN_1006ae50` ends with `FUN_1006a8f3(slot, 0, value_1c, 0, 1, 0)` (damage 0, hit kind 1; a
+  zero amount prints no log line, `FUN_10012bd5` returns on it), i.e. `FUN_1006a239` starts the swing clip and its notes fire; with hit kind 1 `FUN_1009b4ac` stops before the reaction and the impact
+  sound, so a miss only plays the swing sounds of section 6.1 (**fixed**: the old note here said "no animation or sound"; `combat/notes.rs::hit_of`, `glue.rs` swings on `CombatEvent::Miss` too).
 * **Pose enter / stop clips** (sit, sleep, lounge, crawl; `actions::Pose::transition_anim`, glue `ActionEvent::Pose`, `Player::update`): the FSM entry handlers call
   `FUN_1006d330(holder, idle, enter, ...)` [GC 0x1006d330] = store `idle` as the holder's current idle (`FUN_1003c4e1`), `Play(enter)` once, start the idle when the enter clip is nearly over:
   SwitchToSitGround `FUN_1006e2be` (idle 0xd7 `idle-ground`, enter 0xd5 `ground-start`), LeaveSit `FUN_1006e372` (0xd6 `ground-stop`), sleep `FUN_1006e6ff`
@@ -178,9 +185,49 @@ All through `SandyInterfaceModule_t::PlayGameSound(soundId, pos...)` [GC `FUN_10
 random value of `NpcRecord::sounds` key 0x1e / 0x1f (`FUN_1004570c`: `rand() % count`, no RNG call for one value; the multimap is decoded, docs/zone/npc.md §4); other characters the
 Male / Female name by the look's sex (3 = female). **[INFERENCE]** `FUN_10051f6e() != 0` is read as "has an NPC record" (look.npc). The own character plays at the camera (the avatar is not a dynel model here).
 
-Weapon firing / impact sounds of real weapons are **not** played by this combat code: they belong to effect scripts (`_EffectHandler_t::CreateEffect2(effectId)`, weapon stats
-`EffectType` 413 / `ImpactEffectType` 414 read in `FUN_1007ac9a`) - **[UNRESOLVED]**, see §8. The five weapon-class names (`FlameThrowerFire`, `PistolSingle/MultiShot*`) have no constants in the code
-(not defined in either .sbf, nothing to play).
+### 6.1 Attack sounds: swing / shot, swish, impact (resolved)
+**The sounds are started by the animation notes of the swing clip, not by the `AttackInfo`.** [CODE] `FUN_1006a239` only `Play`s the clip with the attack slot (the 9th argument); every frame the
+holder (`FUN_1003c036` [GC 0x1003c036]) walks its playing clips and, for each metadata entry (stride 0x28: name, id `+0x20`, time `+0x24`; = `CatAnim::events`, `(ms, name)`) whose time was reached
+(`lo <= t <= hi` of the frame interval, once per play: bit mask `entry+0x34`), calls `FUN_1003bccb` -> `FUN_10045069` [GC 0x10045069] (`param_2` = note id, `param_3` = the clip's slot, `-1` for clips not
+started by a swing). The note id comes from the event **name** by DisplaySystem `FUN_10075c84` [DS 0x10075c84] (`strncmp` prefixes in this order; `combat/notes.rs::note_id`): `attack*` 0xb (after
+`attack_start_1..9` 0x77..0x7f and `attack_effect_1..4` 0x8e..0x91), `swish_punch/kick/whip/huge` 0x73..0x76, `step`/`stepfast`/`left`/`right` 0x26, `land` 0x85, `idle*` 0xf, `enter_combat` 0x80, ... (the data's
+`swich_kick` typo, 15 clips, matches nothing). [DATA] 53 of the 57 swing clips of the male / female / athrox sets (weapon `attack` lists + bare-hand 1033..1037) have an `attack` event (never at t = 0), 15 a `swish_*`.
+
+`FUN_10045069` for a swing: notes **0x73..0x76** play the holder's own ids `SM_Sandy_Swish_punch / kick / tail / huge` (`AnimHolder_t` ctor `FUN_10044702` members `+0x10..+0x1c`) when the character has no NPC
+record, else a value of the record's list `<note>`; **0x77..0x7f** the record's list `<note>` (creatures; nothing for players); both at the character, plain `PlayGameSound`. Notes **0xb and 0x8e..0x91** (slot >= 0)
+call `FUN_100688f9` [GC 0x100688f9] (`this` = the fight controller `char+0x1d4`): slot object `FUN_10068072(slot)` (`+0x14` the wielded `WeaponItem_t`, `+0x10` the `DummyWeapon_t` of the martial-arts / creature
+attack item, section 3.1), target `FUN_100676e0` (the fight target), then `FUN_1009b84b(key = note id, attacker, victim)`:
+1. `FUN_1009cd68` (wielded weapon only): the item's sound list `key` at the attacker (`PlayGameSound(id, pos, 0, 1.0, 0, 0, 100, 1)`). (Its `0x2c` "empty" branch needs item stat 0x1a == 0; `FUN_1006a8f3` has stored
+   `value_20` = -1 there first, so it is not reachable with the live data and is not modelled.)
+2. `FUN_1009b4ac` (item or dummy): the same list `key`, else `0xb`, at the attacker - **only when the hit kind > 1**; then, for damage > 0, the victim part below.
+3. `FUN_1009cc50` (`WeaponItem_t` vtable `+0x94`, wielded only): list `key` once more, and for `0xb` without a record sound the default of the item's `AmmoType` (stat 420; -1 -> `0x0148e160`, 1 `0x7634c942`, 2 `0x2d2cb134`,
+   4 `0x7a77a8dd`, 5 `0xdf8167d6`, 6 `0x4c790a5d`, 10 `0xba94da9b`, others none: `DAT_102e339c` is never written).
+Identical ids of the three calls start once (a sound that is still playing is not restarted, docs/formats.md `PlaySample` gating). Bare hands play **no weapon sound for a miss or a hit kind 1**; only the swish note. [DATA] The bare-hand clips: male `unarmed-rswing` (1034) `swish_punch` @33 ms, `attack` @266 ms; 1035 swish @133 / attack @233; 1036 (double punch) swish 33, attack 200, swish 400, attack 533 (**two** `attack` notes = two weapon-sound calls); 1037 133 / 233; kick 1033 `swish_kick` 533, attack 866 (female / athrox: other times, same names).
+
+**Victim part of `FUN_1009b4ac`** (damage > 0, hit kind > 1): size class `damage >= 60/10 -> 2`, `>= 60/20 -> 1`, else 0 (`SimpleChar+0x218`, only the ctor writes it: 60). Victim with an NPC record: material =
+record stat 41 `FabricType` (`FUN_1004d8e6(0x29)`), creature sound = record list `0x1f`; if the material is 1..=17 the **weapon's list `0x1f`** is played at the victim (material, size). Material 0 (players, and
+the 1341 of 1360 creature records without `FabricType`): Breed (stat 4) 1, 2, 3, 4 or 7 -> material 7 and `SM_Sandy_Game_MaleGetsHit` (Sex 1 / 2) / `FemaleGetsHit` (Sex 3). The record / player sound plays when the
+material is 1..=17: `PlayGameSound(id, victim pos, 0, 1.0, material, _DAT_101663d4 = 0.4 (a delay), 100, size)`: **0.4 s later**, with the material argument, see docs/formats.md `## audio` "material variants".
+So a hit on a player (the common case: creatures hitting the own character, own hits on other players) plays `Male/FemaleGetsHit`'s flesh variant 0.4 s after the swing sound.
+
+**Item sound multimaps** [DATA]: rdb 1000020 element `{0x14, sub}` (reader `FUN_1007d6d5`, the NPC record's format): `ao_formats::dynel_visual::sound_map` (the elements before it - spell / skill / event lists - are skipped by
+finding the header, no record has two candidates). 16 049 of the 17 298 `WeaponItem` records have one (31 843 ids, 75 not in the sbf): keys `0xb` swing / shot (2 795 ids, 63 distinct sounds), `0x1f` impact (4 059, 32 sounds,
+mostly `0x113cfb49`: no file, only material variants), `0x73` / `0x74`, and keys 0x15 0x16 0x17 0x1c 0x1d 0x50 0x87 whose consumer was not found (no reader in the weapon code; **[UNRESOLVED]**, they would be the special-attack
+notes `aimedshot/burst/fullauto/flingshot/sneakattack`, which `FUN_10045069` ignores: ids < 0x25 except 0xb/0xf return). Wield / unwield: `FUN_1009e301` (vtable `+0xa4`) plays list `8`, `FUN_1009ce50` list `9` at the wielder;
+`FUN_1009d182` (grenade) list `0x31`; found, **not wired** (the callers' flag arguments were not traced; the wielded-at-login case would play them for every wielder). The `WeaponItem_t` ctor's members
+`+0x1d0..+0x1ec` (`FlameThrowerFire`, `Female/MaleGetsHit`, `PistolSingleShotHitFlesh/Ground`, `PistolMultiShotFire`, `PistolSingleShotFire`, `Explo_Big`) have **no reader** in the weapon code (the only other accesses
+to those offsets are `SimpleChar` fields): dead data of an earlier design, which is why most names are not in the .sbf.
+
+**Wired** (`combat/notes.rs`, `Dynels::{note_sounds, weapon_hit, swish, record_note}`): the avatar (own, `Avatar::take_notes` while `Player::swing` marks the clip as a swing, bare hands included) and the dynels
+(`Dynels::swing_mark` + the clip time in `update`) fire notes once per play; `glue.rs` hands them to `note_sounds` with the attacker's last `AttackInfo` / `MissedAttackInfo` (`hit_of`, `Dynels::hit_seen`: victim,
+slot, damage, hit kind) and the item behind that slot (`Armory::slot_item`: record sounds, `AmmoType`, wielded); sounds go through the `GameSound` queue (`material`, `size`, delayed ones through `Dynels::update`) to
+`Audio::play_game_sound_with` (flow.rs logs `game sound <id> at <pos>: N voice(s) (material m, size s)` with `AOMAC_AUDIO_LOG=1`). Positions: the character; the own character at the camera.
+Tests: `notes::tests::*` (note ids, once-per-play firing, size / ammo / player-impact rules, real swing clips), `dynels::variant_tests::{a_bare_handed_hit_plays_the_weapon_swing_and_the_material_impact,
+swish_and_attack_start_notes, a_marked_swing_clip_reports_its_notes, creature_records_carry_a_fabric_type, a_struck_creature_plays_an_impact_clip}`, `arms::tests::real_records`, ao-formats
+`a_weapon_record_finds_its_sound_multimap_behind_the_unwalked_elements`, ao-audio `game_material_maps_to_a_variant_slot` and `weapon_sounds_resolve` (all 31 843 ids but 75 are in the sbf; the flesh variant plays).
+Deviations: the notes fire from the clip time of the swing, which restarts like the original's (not at the `AttackInfo`); the impact uses the attacker's target at the `AttackInfo` (the original reads the fight target at note
+time); unknown victims / items (no slot object, `FUN_10068072` null) are silent as in the original; creature impacts need the NPC model to be built.
+The `EffectType` 413 / `ImpactEffectType` 414 effect scripts (`FUN_1009ad7d`) are visual only and stay unresolved.
 **Correction to docs/formats.md ("168 `sfx/player/*.txt` unused")**: the files (`<breed>_<sex>_<cool|distunguished|military|simple>_<heal|help|inc|no|run|yes>_NN.wav` + subtitle `.txt`) are the
 **chat voice commands** (GUI.dll strings `sound/sfx/player/`, `VoiceSndFxType`, `VoiceSndFxHear{Team,Guild,Vicinity}On`, `Voicecommands.html`), not per-animation FX; no combat code uses them.
 
@@ -206,11 +253,8 @@ CAT mesh (bind pose), evidence in docs/zone/static.md §5 (not the owner's death
 
 ## 8. Not found / open
 * The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
-* Weapon firing/impact FX + their sounds (effect scripts); `PlaySoundIIR_c` (0x455D2938), `GfxTriggerIIR_t` (0x7A222202) and `HealthDamageIIR_t` (0x3710256C) are registered
-  message ids that never occur in the capture - server-driven sounds/effects may arrive through them.
-* Weapon sounds: `SM_Sandy_Game_*` definitions under `sfx/weapons/{guns 169, impacts 120, swish 42, explotions 32, lost_eden/*, missile 8, swords/*}` exist in the .sbf, but nothing in the
-  fight code reads a weapon -> sound id; the selector is the effect scripts of `EffectType` 413 / `ImpactEffectType` 414. Scanning every rdb record type for the effect ids `0x2f5a` / `0x2ced`
-  finds only records of types 1000046 / 1010001 with that number (1010001 = meshes; not effect scripts **[INFERENCE]**), `twk/` has no effect table, so the id -> script -> sound chain is
-  unresolved and the client port plays no weapon/impact sound yet.
-* `FUN_1005d0d8` case 0x5b also calls `vtable+0x40` of the stat system and, for a non-control char, `FUN_100523c3` (purpose not read); `FUN_10012a1e(soundId, pos)` runs just before `PlayGameSound` (not traced).
+* Weapon firing/impact **effects** (effect scripts `CreateEffect2(EffectType 413 / ImpactEffectType 414)`, `FUN_1009ad7d`): visual, unresolved. Their **sounds** are resolved (section 6.1). `PlaySoundIIR_c` (0x455D2938),
+  `GfxTriggerIIR_t` (0x7A222202) and `HealthDamageIIR_t` (0x3710256C) are registered message ids that never occur in the capture - server-driven sounds/effects may arrive through them.
+* Sound-map keys 0x15 0x16 0x17 0x1c 0x1d 0x50 0x87 of the weapon records (no consumer found), wield / unwield / grenade sounds (keys 8 / 9 / 0x31, found, not wired), the `0x2c` empty-weapon click.
+* `FUN_1005d0d8` case 0x5b also calls `vtable+0x40` of the stat system and, for a non-control char, `FUN_100523c3` (purpose not read); `FUN_10012a1e(..)` before every `PlayGameSound` is only the lazy creation of the `SandyInterfaceModule` singleton (`DAT_102e063c`), not a sound step.
 * The own character's `Dying` default animation when no action 99 arrived (death computed by `FUN_1005ae91`): 503 is a **guess** (`DEFAULT_DEATH_ANIM`).

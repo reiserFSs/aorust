@@ -273,6 +273,20 @@ impl HudStats {
         self.items.info(gui, low_id).map(|i| (i.name.clone(), i.icon))
     }
 
+    /// Live harness: name and the stats that decide wearing / weapons of item template `low_id` (`Can` 30, `ItemClass` 76, `DefaultPos` 88, `Placement` 298,
+    /// `AnimSet` 353, `DamageType` 436, `ItemDelay` 294).
+    #[cfg(test)]
+    pub(in crate::play) fn live_item_line(&mut self, gui: &mut Gui, low_id: i32) -> String {
+        match self.items.info(gui, low_id) {
+            Some(i) => {
+                let st = [("Can", 30), ("ItemClass", 76), ("DefaultPos", 88), ("Placement", 298), ("AnimSet", 353), ("DamageType", 436), ("Delay", 294)];
+                let v: Vec<String> = st.iter().map(|(n, id)| format!("{n}={:?}", i.stat(*id as u32))).collect();
+                format!("{low_id}: {:?} {}", i.name, v.join(" "))
+            }
+            None => format!("{low_id}: no template"),
+        }
+    }
+
     /// Name, `MultipleCount` and `Value` (stat 0x4a, the shop price column) of the item template `low_id` (`interact_shop.rs`).
     pub(in crate::play) fn shop_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<(String, i32, i32)> {
         self.items.info(gui, low_id).map(|i| (i.name.clone(), i.count, i.stat(0x4a).unwrap_or(0)))

@@ -226,11 +226,22 @@ impl Door {
     }
 }
 
-/// One `PlayGameSound` of a door: Sandy sound id and the scene position of the door.
+/// One `PlayGameSound` of a door or a fight: Sandy sound id and the scene position.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GameSound {
     pub id: u32,
     pub pos: [f32; 3],
+    /// The game material argument (`FabricType` of the struck creature, 7 = flesh of a player, 0 = none) and the impact size 0 / 1 / 2 (1 = plain),
+    /// which pick the sound's material variant (`ao_audio::game::variant_of`).
+    pub material: i32,
+    pub size: i32,
+}
+
+impl GameSound {
+    /// `PlayGameSound(id, pos, 0, 1.0, 0, 0, 100, 1)`: the plain one-shot of doors and weapon swings.
+    pub fn at(id: u32, pos: [f32; 3]) -> GameSound {
+        GameSound { id, pos, material: 0, size: 1 }
+    }
 }
 
 /// The animation data of an item model, built next to the model on the worker thread: the node keyframes (`None` when the mesh has none),
@@ -294,7 +305,7 @@ impl PropAnim {
     fn sounds(fx: &[Effect], list: &[(u32, Vec<u32>)], at: [f32; 3], rng: &mut CrtRand, out: &mut Vec<GameSound>) {
         for e in fx {
             if let Effect::Sound(keys) = e {
-                out.extend(pick(list, *keys, rng).map(|id| GameSound { id, pos: at }));
+                out.extend(pick(list, *keys, rng).map(|id| GameSound::at(id, at)));
             }
         }
     }

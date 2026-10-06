@@ -508,6 +508,11 @@ impl Hud {
     }
 
     #[cfg(test)]
+    pub(super) fn live_item_line(&mut self, gui: &mut Gui, low_id: i32) -> String {
+        self.stats.live_item_line(gui, low_id)
+    }
+
+    #[cfg(test)]
     pub(super) fn live_double_click(&mut self, zone: &Zone, slot: u32) {
         self.stats.live_double_click(zone, slot);
         self.outbox.extend(self.stats.take_outbox());

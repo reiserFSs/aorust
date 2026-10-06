@@ -82,6 +82,10 @@ pub(super) struct Player {
     transient: Option<(Role, bool)>,
     /// `ItemDelay` of the weapon of the swing in `transient`.
     swing_delay: Option<i32>,
+    /// `transient` is a weapon swing (its notes start the attack sounds, `combat::notes`).
+    swinging: bool,
+    /// Playback rate factor of the hit reaction in `transient`.
+    clip_scale: Option<f32>,
     /// The pose the movement role showed last frame (`None` before the first update).
     pose: Option<Pose>,
     /// The character is in a fight (`idle-unarmed` stance while standing).
@@ -151,6 +155,8 @@ impl Player {
                 clicks: Vec::new(),
                 transient: None,
                 swing_delay: None,
+                swinging: false,
+                clip_scale: None,
                 pose: None,
                 fighting: false,
                 fight,
@@ -197,12 +203,29 @@ impl Player {
     pub fn play(&mut self, role: Role, hold: bool) {
         self.transient = Some((role, hold));
         self.swing_delay = None;
+        self.swinging = false;
+        self.clip_scale = None;
     }
 
-    /// Plays the weapon swing `role` once, sped up for the weapon's `ItemDelay` (centiseconds, `FUN_1006a239`).
-    pub fn swing(&mut self, role: Role, item_delay: i32) {
+    /// Plays the hit reaction `role` once at `rate` times its speed (`FUN_1009b4ac`, `Dynels::react_to_hit`) unless one is playing.
+    pub fn react(&mut self, role: Role, rate: f32) {
+        if self.transient.is_none() {
+            self.play(role, false);
+            self.clip_scale = Some(rate);
+        }
+    }
+
+    /// Plays the swing `role` once (`FUN_1006a239`), sped up for the weapon's `ItemDelay` (centiseconds) when there is a weapon; its animation notes
+    /// start the attack sounds ([`Player::take_notes`]).
+    pub fn swing(&mut self, role: Role, item_delay: Option<i32>) {
         self.play(role, false);
-        self.swing_delay = Some(item_delay);
+        self.swing_delay = item_delay;
+        self.swinging = true;
+    }
+
+    /// The notes the own swing clip reached since the last call (`combat::notes` ids).
+    pub fn take_notes(&mut self) -> Vec<u32> {
+        self.avatar.take_notes()
     }
 
     /// A held clip (death) is playing.
@@ -407,7 +430,10 @@ impl Player {
             None if self.fighting && role == Role::Idle => AvatarPose::still(Role::IdleCombat),
             None => AvatarPose::still(role),
         };
+        self.avatar.set_stance(zone.world.wielded_set(self.char_id as i32));
         self.avatar.set_swing_delay(self.transient.as_ref().and(self.swing_delay));
+        self.avatar.set_swinging(self.transient.is_some() && self.swinging);
+        self.avatar.set_clip_scale(self.transient.as_ref().and(self.clip_scale));
         if let Err(e) = self.avatar.set_pose(&self.store, pose) {
             eprintln!("avatar pose: {e:#}");
         }
@@ -518,6 +544,10 @@ impl Player {
                         f.update(&u);
                     }
                 }
+                OwnEvent::Attractors(list) => match self.avatar.set_attractors(&self.store, &list) {
+                    Ok(changed) => self.model_sent &= !changed, // the next frame uploads the rebuilt model again
+                    Err(e) => eprintln!("avatar attractors: {e:#}"),
+                },
             }
         }
     }

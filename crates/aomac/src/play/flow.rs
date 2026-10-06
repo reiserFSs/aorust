@@ -1177,12 +1177,12 @@ impl Frontend for Play {
             self.fight_frame(dt);
             self.camp_frame(dt, host);
             self.zone.world.update(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host);
-            // `Door_t` open / close: `PlayGameSound(id, door position)` (docs/zone/doors.md §5)
+            // `Door_t` open / close: `PlayGameSound(id, door position)` (docs/zone/doors.md §5); the fight sounds (combat/notes.rs) go the same way
             for s in self.zone.world.take_sounds() {
                 if let Some(a) = &self.audio {
-                    let voices = a.play_game_sound(s.id, s.pos, host.camera.pos.to_array());
+                    let voices = a.play_game_sound_with(s.id, s.pos, host.camera.pos.to_array(), s.material, s.size);
                     if std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
-                        eprintln!("game sound {} at {:?}: {} voice(s)", s.id, s.pos, voices.len());
+                        eprintln!("game sound {} at {:?}: {} voice(s) (material {}, size {})", s.id, s.pos, voices.len(), s.material, s.size);
                     }
                 }
             }

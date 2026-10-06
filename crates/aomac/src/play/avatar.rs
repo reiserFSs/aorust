@@ -140,6 +140,19 @@ fn one_shot(r: &Role) -> bool {
     matches!(r, Role::JumpStand | Role::JumpForward | Role::Emote(_) | Role::Clip(_))
 }
 
+/// The clip name of the weapon stance of `AnimSet` `set` for movement role `r` (AnimHolder idle update `FUN_1003cad0`: list 0x10; 2H walk / run:
+/// lists 0x2a / 0x2b, docs/zone/combat-anim.md §4); the first value of the list, like `Dynels::update` takes it.
+fn stance_clip(set: i32, r: &Role) -> Option<String> {
+    use super::combat::anim::{anim_name, list, weapon_list};
+    let key = match r {
+        Role::Idle | Role::IdleCombat => list::IDLE,
+        Role::Walk => list::WALK_2H,
+        Role::Run => list::RUN_2H,
+        _ => return None,
+    };
+    weapon_list(set, false, false, key).first().and_then(|&id| anim_name(id)).map(|(n, _)| n.to_string())
+}
+
 /// Locomotion clips share a gait cycle: switching between them keeps the phase instead of restarting.
 fn locomotion(r: &Role) -> bool {
     matches!(r, Role::Walk | Role::WalkBack | Role::WalkLeft | Role::WalkRight | Role::Run | Role::RunBack | Role::Sneak)
@@ -263,6 +276,9 @@ impl Fader {
 pub struct Avatar {
     id: u32,
     rig: ActorRig,
+    /// What `rig` was built from (the look of the `SimpleCharFullUpdate`, later changed by [`Avatar::set_attractors`]).
+    look: PlayerLook,
+    attachments: Vec<(u8, u32)>,
     assets: ActorAssets,
     scale: f32,
     calibration: Calibration,
@@ -274,6 +290,15 @@ pub struct Avatar {
     rate: f32,
     /// `ItemDelay` of the weapon of the swing clip that plays ([`Avatar::set_swing_delay`]).
     swing_delay: Option<i32>,
+    /// The clip that plays is a weapon swing: its animation notes fire ([`Avatar::take_notes`]).
+    swinging: bool,
+    /// Playback rate factor of a hit-reaction clip ([`Avatar::set_clip_scale`]).
+    clip_scale: Option<f32>,
+    /// Bit `i` = event `i` of the clip has fired its note (cleared when a clip starts).
+    note_fired: u32,
+    notes: Vec<u32>,
+    /// `AnimSet` of the wielded weapon ([`Avatar::set_stance`]).
+    stance: Option<i32>,
     /// Milliseconds into the current clip.
     ms: f32,
     transform: Mat4,
@@ -287,7 +312,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, assets, scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, clip_id: 0, rate: 1.0, swing_delay: None, ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, look: l.look, attachments: l.attachments, assets, scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, clip_id: 0, rate: 1.0, swing_delay: None, swinging: false, clip_scale: None, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -298,13 +323,34 @@ impl Avatar {
         self.rig.model()
     }
 
+    /// `AppearanceUpdateIIR_c::Activate` [GC 0x10071679]: `ClearAttractors` + `AddAttractors(list)` (`(AttractorPlace_e, rdb 1010001 mesh)`, place 0 =
+    /// the head, [`attractor_list`](ao_formats::character::actor::attractor_list)). The rig is rebuilt only when the head or a hand / shoulder mesh changed;
+    /// true = a new model that the caller has to upload again (key [`MODEL_KEY`]). The current clip keeps playing (same body model).
+    pub fn set_attractors(&mut self, store: &RecordStore, list: &[(u8, u32)]) -> Result<bool> {
+        let head = list.iter().find(|a| a.0 == 0).map(|a| a.1);
+        let mut attachments: Vec<(u8, u32)> = list.iter().filter(|a| a.0 != 0).copied().collect();
+        attachments.sort_unstable();
+        let mut old = self.attachments.clone();
+        old.sort_unstable();
+        if head == self.look.head && attachments == old {
+            return Ok(false);
+        }
+        let look = PlayerLook { head, ..self.look.clone() };
+        self.rig = ActorRig::player(store, &self.assets, &look, &attachments)?;
+        self.look = look;
+        self.attachments = attachments;
+        Ok(true)
+    }
+
     /// Switches the clip when the role changes; a change between locomotion clips keeps the gait phase, any other restarts.
     pub fn set_pose(&mut self, store: &RecordStore, pose: AvatarPose) -> Result<()> {
         if pose.role != self.pose.role || self.clip.is_none() {
             let mut role = pose.role.clone();
             let clips = self.assets.clips(store, self.rig.model_id)?;
+            // a wielder: the weapon's stance clip over the movement clip while the model's set has it, else the plain role
+            let mut stance = self.stance.and_then(|set| stance_clip(set, &pose.role)).filter(|n| clips.iter().any(|c| c.0 == *n));
             let (clip, id) = loop {
-                let name = role.clip_name();
+                let name = stance.take().unwrap_or_else(|| role.clip_name());
                 if let Some(&(_, id)) = clips.iter().find(|c| c.0 == name) {
                     break (Some(self.assets.anim(store, id)?), id);
                 }
@@ -322,19 +368,47 @@ impl Avatar {
             };
             self.clip = clip;
             self.clip_id = id;
+            self.note_fired = 0;
         }
         self.rate = anim_rate(self.calibration.get(self.rig.model_id, self.clip_id), self.scale * 100.0, pose.speed, pose.ref_speed, false);
         // `FUN_1006a239`: a weapon swing is sped up so its first note lands within the weapon's ItemDelay
         if let (Some(d), Some(a)) = (self.swing_delay, &self.clip) {
             self.rate *= super::combat::anim::swing_speed_scale(a.events.first().map_or(0.0, |e| e.0 as f32), d);
         }
+        if let Some(k) = self.clip_scale {
+            self.rate *= k;
+        }
         self.pose = pose;
         Ok(())
+    }
+
+    /// Rate factor of the one-shot clip that plays (a hit reaction, `Dynels::react_to_hit`); set every frame before [`Avatar::set_pose`].
+    pub fn set_clip_scale(&mut self, scale: Option<f32>) {
+        self.clip_scale = scale;
     }
 
     /// `ItemDelay` (centiseconds) of the weapon whose swing clip is playing (`None`: no swing speed scale); set before [`Avatar::set_pose`].
     pub fn set_swing_delay(&mut self, delay: Option<i32>) {
         self.swing_delay = delay;
+    }
+
+    /// Whether the one-shot clip that plays is a weapon swing (set every frame before [`Avatar::set_pose`]).
+    pub fn set_swinging(&mut self, swinging: bool) {
+        self.swinging = swinging;
+    }
+
+    /// The notes (`combat::notes`) the swing clip reached since the last call.
+    pub fn take_notes(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.notes)
+    }
+
+    /// The weapon stance (`AnimSet` of the weapon in the first hand slot, `None` = nothing wielded): idle / walk / run play the weapon's lists
+    /// 0x10 / 0x2a / 0x2b ([`stance_clip`]) instead of the unarmed clips, the way [`Dynels`](super::dynels::Dynels) draws a wielding character.
+    pub fn set_stance(&mut self, set: Option<i32>) {
+        if set != self.stance {
+            self.stance = set;
+            self.clip = None; // the next `set_pose` picks the clip again
+        }
     }
 
     /// Whether a one-shot clip (jump) has played to its end.
@@ -350,6 +424,9 @@ impl Avatar {
     /// Advances the clip by `dt` seconds at the pose's speed.
     pub fn update(&mut self, dt: f32) {
         self.ms += dt * 1000.0 * self.rate;
+        if let (true, Some(a), Role::Clip(_)) = (self.swinging, &self.clip, &self.pose.role) {
+            self.notes.extend(super::combat::notes::fire(&a.events, self.ms.min(a.duration), &mut self.note_fired));
+        }
         // keep the counter bounded; looping clips wrap by themselves, one-shots stop at the end
         if let Some(a) = &self.clip {
             if !one_shot(&self.pose.role) && a.duration > 0.0 && self.ms > 4.0 * a.duration {
@@ -622,6 +699,67 @@ mod tests {
             let f = super::super::zone::scene_forward(yaw);
             let at = [pos[0], pos[1] + 1.0, pos[2]];
             let eye = [at[0] + f[0] * 3.0, at[1] + 0.3, at[2] + f[2] * 3.0];
+            ao_render::render_to_png_actors(&scene, &[(MODEL_KEY, a.model().clone())], vec![a.frame()], eye, at, 900, 600, std::path::Path::new(&png), 0.0).unwrap();
+        }
+    }
+
+    /// Stance lists of the AnimSets (docs/zone/combat-anim.md §3.1): idle 0x10, walk 0x2a, run 0x2b; other roles and sets without lists: none.
+    #[test]
+    fn stance_clip_names() {
+        use super::super::combat::anim::anim_name;
+        assert_eq!(stance_clip(3, &Role::Idle).as_deref(), Some("idle-rifle"));
+        assert_eq!(stance_clip(3, &Role::IdleCombat).as_deref(), Some("idle-rifle"));
+        assert_eq!(stance_clip(3, &Role::Walk), anim_name(0x421).map(|n| n.0.to_string()));
+        assert_eq!(stance_clip(3, &Role::Run), anim_name(0x422).map(|n| n.0.to_string()));
+        assert_eq!(stance_clip(3, &Role::Sneak), None);
+        assert_eq!(stance_clip(4, &Role::Idle), None, "AnimSet 4: the lists live in the item record");
+    }
+
+    /// `AppearanceUpdateIIR_c` of a wear (docs/captures/zone_wear_rifle_borealis.rec: attractors `{0, head}` + `{1, 0x3ddf}`) mounts the weapon mesh
+    /// in the right hand, the unwear's list (head only) takes it away again; an identical list rebuilds nothing. A wielder's idle / walk / run use the
+    /// weapon's stance clips (rifle: `idle-rifle` 0x3fd, 2H walk / run 0x421 / 0x422), and the plain ones return when it is gone.
+    #[test]
+    fn worn_weapon_mounts_its_mesh_and_switches_the_stance() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut a = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let head = a.look.head.unwrap();
+        let plain = (a.model().meshes.len(), a.frame().parts.len());
+        assert!(!a.set_attractors(&store, &[(0, head)]).unwrap(), "the login list is unchanged");
+        assert!(a.set_attractors(&store, &[(1, 0x3ddf), (0, head)]).unwrap());
+        assert_eq!((a.model().meshes.len(), a.frame().parts.len()), (plain.0 + 1, plain.1 + 1), "the rifle is one more mounted mesh");
+        assert!(!a.set_attractors(&store, &[(0, head), (1, 0x3ddf)]).unwrap(), "same set, other order");
+        let idle = a.clip_id;
+        a.set_stance(Some(3));
+        a.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
+        let clips = a.assets.clips(&store, a.rig.model_id).unwrap();
+        let named = |n: &str| clips.iter().find(|c| c.0 == n).map(|c| c.1);
+        assert_eq!(Some(a.clip_id), named("idle-rifle"));
+        assert_ne!(a.clip_id, idle);
+        // fighting with a weapon plays the weapon idle, not the raised fists
+        a.set_pose(&store, AvatarPose::still(Role::IdleCombat)).unwrap();
+        assert_eq!(Some(a.clip_id), named("idle-rifle"));
+        // 2H walk: the model's clip of list 0x2a when its set has it, else the plain walk
+        let walk = stance_clip(3, &Role::Walk).and_then(|n| named(&n));
+        a.set_pose(&store, AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 }).unwrap();
+        assert_eq!(Some(a.clip_id), walk.or(named("walk")));
+        a.set_stance(None);
+        a.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
+        assert_eq!(a.clip_id, idle);
+        assert!(a.set_attractors(&store, &[(0, head)]).unwrap());
+        assert_eq!((a.model().meshes.len(), a.frame().parts.len()), plain);
+        if let Some(png) = std::env::var_os("AVATAR_SHOT_RIFLE") {
+            a.set_attractors(&store, &[(1, 0x3ddf), (0, head)]).unwrap();
+            a.set_stance(Some(3));
+            a.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
+            a.update(0.3);
+            let u = own_update();
+            let (pos, yaw) = (super::super::zone::scene_pos(u.pos), super::super::zone::scene_yaw(u.yaw().unwrap_or(0.0)));
+            a.set_transform(pos, yaw);
+            let scene = ao_formats::playfield::load_playfield(&store, &dir, 4604).unwrap();
+            let f = super::super::zone::scene_forward(yaw);
+            let at = [pos[0], pos[1] + 1.0, pos[2]];
+            let eye = [at[0] + f[0] * 2.5, at[1] + 0.3, at[2] + f[2] * 2.5];
             ao_render::render_to_png_actors(&scene, &[(MODEL_KEY, a.model().clone())], vec![a.frame()], eye, at, 900, 600, std::path::Path::new(&png), 0.0).unwrap();
         }
     }

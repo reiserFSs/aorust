@@ -204,18 +204,21 @@ impl Runtime {
     /// Plays a definition once, non-positionally, at `Total_FX`.
     pub fn play(&mut self, sh: &Shared, def: &SoundDef) -> Vec<u64> {
         let db = self.lib.sounds.clone();
-        play_def(sh, &db, def, self.fx, &mut self.rng)
+        play_def(sh, &db, def, self.fx, &mut self.rng, None)
     }
 
-    /// A positional one-shot (`PlayGameSound(id, pos, ...)` of doors): the definition once at `Total_FX` times the distance level of
-    /// `attenuation` for the listener `d` metres away; nothing beyond the definition's maximum distance.
-    pub fn play_at(&mut self, sh: &Shared, def: &SoundDef, d: f32) -> Vec<u64> {
+    /// A positional one-shot (`PlayGameSound(id, pos, material, ..., size)`: doors, fight sounds): the definition once at `Total_FX` times the
+    /// distance level of `attenuation` for the listener `d` metres away; nothing beyond the definition's maximum distance. `material` is the game
+    /// material argument (`FabricType` of the struck creature, 7 = flesh of a player; 0 = none) and `size` the impact size 0 / 1 / 2 (1 = plain):
+    /// a definition with material variants also starts the one `PlaySample` picks ([`variant_of`]).
+    pub fn play_at(&mut self, sh: &Shared, def: &SoundDef, d: f32, material: i32, size: i32) -> Vec<u64> {
         let level = attenuation(d, def.min_dist, def.max_dist, None);
         if level <= 0.0 {
             return Vec::new();
         }
         let db = self.lib.sounds.clone();
-        play_def(sh, &db, def, self.fx * level, &mut self.rng)
+        let variant = variant_of(def, material, size).and_then(|v| db.get(v));
+        play_def(sh, &db, def, self.fx * level, &mut self.rng, variant)
     }
 
     /// `PlaySample` keep-alive (`SM_Sandy_CC_Ambience`, ...): each call sets the level and re-arms the sound to
@@ -477,14 +480,57 @@ impl Runtime {
     }
 }
 
+/// `SandyInterfaceModule_t::MapGameMaterialToSoundMaterial` [SI 0x10007490]: the game material (`FabricType` 1..=17, `ImpactEffectType`) to the sound
+/// material index of the 46 `SoundDef::variants`; 0 and everything above 17 is 3.
+pub fn sound_material(game: i32) -> i32 {
+    match game {
+        1..=11 => game,
+        12 => 15,
+        13 => 7,
+        14 => 5,
+        15 => 12,
+        16 => 13,
+        17 => 14,
+        _ => 3,
+    }
+}
+
+/// The variant sound `PlaySample` [SI 0x10002d98] starts next to a definition that has variants (`def+0x264`: any of the 46 ids non-zero): with
+/// `m = sound_material(material)`, a `size` of 0 / 2 first prefers `variants[m + 30]` / `variants[m + 15]` when that one exists (size 1 = plain, `m`);
+/// then `variants[m]`, else `variants[0]`, for `m` in 1..=45. `None`: no variants, `m` out of range or the slot empty.
+pub fn variant_of(def: &SoundDef, material: i32, size: i32) -> Option<u32> {
+    if def.variants.iter().all(|&v| v == 0) {
+        return None;
+    }
+    let mut m = sound_material(material) as usize;
+    if size != 1 && m != 0 {
+        let shifted = match size {
+            0 => m + 30,
+            2 => m + 15,
+            _ => m,
+        };
+        if def.variants.get(shifted).is_some_and(|&v| v != 0) {
+            m = shifted;
+        }
+    }
+    if !(1..=45).contains(&m) {
+        return None;
+    }
+    [def.variants[m], def.variants[0]].into_iter().find(|&v| v != 0)
+}
+
 /// A one-shot non-positional sound definition (UI, children): probability gate, randomised volume, the file and
 /// its children per the definition's flags (`play_all`, or one `random_child`).
-pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, fx: f32, rng: &mut Rng) -> Vec<u64> {
+pub(crate) fn play_def(sh: &Shared, db: &SoundDb, def: &SoundDef, fx: f32, rng: &mut Rng, variant: Option<&SoundDef>) -> Vec<u64> {
     if def.prob != 100 && rng.next() % 200 >= def.prob as u32 {
         return Vec::new();
     }
     let vol = (def.vol_min + rng.unit() * (def.vol_max - def.vol_min)) * fx;
     let mut out = Vec::new();
+    // `PlaySample` starts the material variant first, at the definition's level (`SandyInterface_t::PlaySample` @0x10002d98, section "variants")
+    if let Some(v) = variant {
+        out.extend(play_def(sh, db, v, vol, rng, None));
+    }
     let mut one = |d: &SoundDef| {
         if let Some(p) = d.file.as_deref().and_then(|f| sh.resolve(f)) {
             let id = sh.play_sample(&p, vol, false, d.priority);
@@ -534,6 +580,30 @@ mod tests {
         assert!((attenuation(7.5, 0.0, 15.0, None) - 0.5).abs() < 1e-6);
         // min >= max: full level inside the radius, silent beyond
         assert_eq!(attenuation(10.0, 15.0, 15.0, Some(20.0)), 1.0);
+    }
+
+    fn def_with_variants(v: &[(usize, u32)]) -> SoundDef {
+        let mut variants = vec![0; 46];
+        for &(i, id) in v {
+            variants[i] = id;
+        }
+        SoundDef { id: 1, flags: 1, file: None, vol_min: 0.5, vol_max: 0.5, min_dist: 0.0, max_dist: 15.0, fade_in: 0.0, fade_out: 0.0, duration_min: 0.0, duration_max: 0.0, prob: 100, children: vec![], interval_min: 0.0, interval_max: 0.0, play_all: false, sequential: false, random_child: false, priority: 1, variants }
+    }
+
+    /// `MapGameMaterialToSoundMaterial` [SI 0x10007490] (jump table @0x100074e3) and the variant choice of `PlaySample` [SI 0x10002d98].
+    #[test]
+    fn game_material_maps_to_a_variant_slot() {
+        let map: Vec<i32> = (0..=18).map(sound_material).collect();
+        assert_eq!(map, [3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 7, 5, 12, 13, 14, 3]);
+        let d = def_with_variants(&[(0, 100), (7, 107), (22, 122), (37, 137), (3, 103)]);
+        assert_eq!(variant_of(&d, 7, 1), Some(107), "size 1: variants[m]");
+        assert_eq!(variant_of(&d, 7, 2), Some(122), "size 2 prefers variants[m + 15]");
+        assert_eq!(variant_of(&d, 7, 0), Some(137), "size 0 prefers variants[m + 30]");
+        assert_eq!(variant_of(&d, 5, 2), Some(100), "no slot 20 / 5: variants[0]");
+        assert_eq!(variant_of(&d, 0, 1), Some(103), "material 0 is 3 for PlayGameSound");
+        assert_eq!(variant_of(&d, 99, 0), Some(103), "unknown materials are 3 too (size 0: slot 33 is empty)");
+        assert_eq!(variant_of(&def_with_variants(&[]), 7, 1), None, "a definition without variants plays alone");
+        assert_eq!(variant_of(&def_with_variants(&[(0, 100)]), 7, 1), Some(100));
     }
 
     fn client() -> Option<std::path::PathBuf> {

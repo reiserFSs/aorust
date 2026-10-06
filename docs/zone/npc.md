@@ -102,8 +102,7 @@ Key 0x78 is also what `FUN_1012b24c` (VisualCATMesh created for a spell/effect, 
   child-lists (random variant), 0xf/0x26/0x36 look like step/hit sets [GUESS]. Exposed raw as `NpcRecord::sounds`.
 * Stats (`NpcRecord::stat`, names from `data/stat_names.txt`): record-read by the client: **12 `Mesh`** (`FUN_10058078`: model override, 0 = keep the dynel's own `Mesh`; two
   records have 0: 163119 `molokh`, 205481 `lctower_supplymasters_control_tower`), **64 `HeadMesh`** (rdb 1010001; non-zero ⇒ `n3VisualDynel_t::SetCatMesh(mesh, true)` +
-  `VisualCATMesh_t::SetSkinData(breed, sex, race)` = the naked skin textures of the head's breed/race, `FUN_100c2c15`), **41 `FabricType`** (impact effect type 1..17,
-  `FUN_1009b4ac`). Present in the data: 0 (1326), 2 VolumeMass (1360), 12 (1360), 41 (1316), 64 (1157), 0xc5 (1324, unnamed), 0xe0 Features (1360), 0x165 (770, unnamed), 0x1a5 CharRadius (1360), 0x1c6
+  `VisualCATMesh_t::SetSkinData(breed, sex, race)` = the naked skin textures of the head's breed/race, `FUN_100c2c15`), **41 `FabricType`** (impact material 1..17, `FUN_1009b4ac`; [DATA] only 19 of the 1360 records carry one, always 1; sound path: combat-anim.md section 6.1). Present in the data: 0 (1326), 2 VolumeMass (1360), 12 (1360), 41 (1316), 64 (1157), 0xc5 (1324, unnamed), 0xe0 Features (1360), 0x165 (770, unnamed), 0x1a5 CharRadius (1360), 0x1c6
   ProximityRangeOutdoors (35). The consumer that copies the other stats (VolumeMass, CharRadius, Features, …) to the dynel was **not found** (not `FUN_100491f5`).
 
 ## 5. How the client skins a NPC (`TextureData_t`)

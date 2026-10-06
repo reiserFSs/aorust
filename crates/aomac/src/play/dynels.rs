@@ -38,6 +38,8 @@ const CHAR_KIND: i32 = 0xC350;
 pub const DRAW_DISTANCE: f32 = 250.0;
 /// `ShowAllNames` name tags exist for dynels within this radius of the player (`GetDynelsInVicinity`, docs/zone/motion.md §6).
 pub const NAME_TAG_RADIUS: f32 = 30.0;
+/// `CharacterActionIIR_t` id of the unwield of a body slot (`identity_b.instance`): `FUN_1005d0d8` case at 0x1005d790 -> `FUN_1006a857` (docs/zone/actions.md).
+const ACTION_UNWIELD: i32 = 0x61;
 /// NPC record key of the generic death clip and of the first unarmed attack ([`ao_formats::character::NpcAnim`]).
 const DIE_KEY: u32 = 6000;
 const ATTACK_KEY: u32 = canim::UNARMED_RSWING as u32;
@@ -138,6 +140,8 @@ pub struct Built {
     pub stats: Vec<(u32, i32)>,
     /// The NPC record's sound multimap (`NpcRecord::sounds`: `AbstractAnimID_e` key -> sound ids; fight keys `combat::anim::npc_sound`).
     pub sounds: Vec<(u32, Vec<u32>)>,
+    /// The NPC record's stat 41 `FabricType` (1..=17: the material of the impact sounds, `FUN_1009b4ac`); 0 without a record.
+    pub fabric: i32,
 }
 
 /// A skinned pose held for good: vertices and mount transforms.
@@ -273,7 +277,7 @@ fn static_model(store: &RecordStore, mesh: u32, override_texture: Option<u32>) -
 }
 
 fn plain(model: ao_scene::Scene, visible: bool) -> Built {
-    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None, stats: Vec::new(), sounds: Vec::new() }
+    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None, stats: Vec::new(), sounds: Vec::new(), fabric: 0 }
 }
 
 fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::Result<Built> {
@@ -409,8 +413,9 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
     }
     let tag_height = rig.indicator_height();
     let features = rec.as_ref().and_then(|r| r.stat(ao_net::n3::motion::STAT_FEATURES as u32));
+    let fabric = rec.as_ref().and_then(|r| r.stat(super::combat::notes::STAT_FABRIC_TYPE)).unwrap_or(0);
     let sounds = rec.map(|r| r.sounds).unwrap_or_default();
-    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), clips, features, tag_height, sounds, ..plain(Default::default(), true) })
+    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), clips, features, tag_height, sounds, fabric, ..plain(Default::default(), true) })
 }
 
 fn named(store: &RecordStore, assets: &mut ActorAssets, model: u32, name: &str) -> anyhow::Result<Option<Arc<CatAnim>>> {
@@ -489,6 +494,10 @@ pub struct Char {
     /// Model-space box of the last pose's skinned body vertices (`RCATMesh_t+0x1fc/+0x208`, hud_pick.rs); `None` until posed.
     bounds: Option<([f32; 3], [f32; 3])>,
     roll: Roll,
+    /// Seconds left of a swing mark ([`Dynels::swing_mark`]): while the character's one-shot clip is a weapon swing its animation notes fire.
+    swing_ttl: f32,
+    /// Bit `i` = event `i` of the playing clip has fired its note (`piVar7[0xd]` of the holder's clip entry, `FUN_1003c036`).
+    note_fired: u32,
 }
 
 /// A corpse, vending machine, door, ... (everything that is not a `SimpleChar`): a fixed model at a fixed place.
@@ -515,6 +524,12 @@ pub const CAN_STAT: u32 = 0x1e;
 /// `Corpse_t`'s constructor [GC 0x1007e652] pre-sets `Can` to 8 (`FUN_10088d80(0x1e, 8)`).
 const CORPSE_CAN: i32 = 8;
 
+/// A sound multimap: key -> Sandy sound ids.
+type SoundTable = Vec<(u32, Vec<u32>)>;
+
+/// Seconds a [`Dynels::swing_mark`] lasts.
+const SWING_MARK_S: f32 = 3.0;
+
 /// First `ActorFrame::id` of props (character instances stay far below).
 const PROP_ID_BASE: u32 = 0x4000_0000;
 
@@ -534,6 +549,8 @@ pub struct Dynels {
     pub arms: super::combat::arms::Armory,
     /// (swing clip, `ItemDelay`) of the last [`Dynels::pick_swing`] of a character: the clip plays sped up by [`canim::swing_speed_scale`].
     swing_delay: HashMap<i32, (u32, i32)>,
+    /// (clip, playback rate) of the last [`Dynels::react_to_hit`] of a character.
+    once_rate: HashMap<i32, (u32, f32)>,
     /// Weapon dynel instance -> (holder, hand index).
     weapons: HashMap<i32, (i32, usize)>,
     pending_clips: Vec<(u64, CharLook, u32, i32)>,
@@ -559,6 +576,12 @@ pub struct Dynels {
     rng: CrtRand,
     /// `PlayGameSound` calls of doors and characters (fight sounds) since the last [`Dynels::take_sounds`].
     sounds: Vec<GameSound>,
+    /// Sounds that wait for their delay (`PlayGameSound`'s delay argument, the material impact sounds): (seconds left, sound).
+    later: Vec<(f32, GameSound)>,
+    /// Animation notes fired by the swing clips of the other characters since the last [`Dynels::take_notes`]: (character, note id).
+    notes: Vec<(i32, u32)>,
+    /// The last `AttackInfo` of every attacker (what the attack notes read from the slot object, `FUN_1006a8f3`).
+    last_hit: HashMap<i32, super::combat::notes::HitCtx>,
     /// Camera position of the last [`Dynels::update`] (scene space).
     cam: [f32; 3],
 }
@@ -576,6 +599,7 @@ impl Default for Dynels {
             wield: HashMap::new(),
             arms: Default::default(),
             swing_delay: HashMap::new(),
+            once_rate: HashMap::new(),
             weapons: HashMap::new(),
             pending_weapons: vec![],
             pending_clips: vec![],
@@ -591,6 +615,9 @@ impl Default for Dynels {
             listing: Listing::default(),
             rng: CrtRand::new(1),
             sounds: vec![],
+            later: vec![],
+            notes: vec![],
+            last_hit: HashMap::new(),
             cam: [0.0; 3],
         }
     }
@@ -634,8 +661,36 @@ impl Dynels {
     /// Forgets every dynel (a playfield change, `Zone::reset_world`).
     pub fn clear(&mut self) {
         self.chars.clear();
+        self.last_hit.clear();
+        self.later.clear();
         self.arms.clear();
         self.props.clear();
+        self.weapons.clear();
+        self.wield.clear();
+        self.pending_weapons.clear();
+    }
+
+    /// `AnimSet` of the weapon a character wields, slot 6 (right hand) before 8 (left): the weapon whose lists the idle / walk / run stance uses
+    /// (AnimHolder idle update `FUN_1003cad0`, docs/zone/combat-anim.md §4). `None`: nothing wielded or the item is not resolved yet.
+    pub fn wielded_set(&self, id: i32) -> Option<i32> {
+        self.wield.get(&id)?.iter().flatten().next().map(|w| w.set)
+    }
+
+    /// `CharacterActionIIR_t` 0x61 (`FUN_1006a857` -> `FUN_1006a772`): body slot `slot` (6 right hand, 8 left) of `holder` is emptied. The weapon dynel
+    /// stays alive in the inventory (its `WeaponItemFullUpdate` then names the bag slot), so no `n3ToClientQuit` follows.
+    fn unwield_slot(&mut self, holder: i32, slot: i32) {
+        let Some(hand) = (match slot {
+            6 => Some(0),
+            8 => Some(1),
+            _ => None,
+        }) else {
+            return;
+        };
+        self.weapons.retain(|_, w| *w != (holder, hand));
+        self.pending_weapons.retain(|w| (w.0, w.1) != (holder, hand));
+        if let Some(w) = self.wield.get_mut(&holder) {
+            w[hand] = None;
+        }
     }
 
     /// A new playfield: every dynel of the old one is gone (models stay built); the dynels the playfield places itself
@@ -687,6 +742,22 @@ impl Dynels {
         Some((anim, w.delay))
     }
 
+    /// `SimpleChar::GetImpactAnim` (vtable `+0x90` = `FUN_10058cfa` [GC 0x10058cfa]): a crawling character (stat 0x1ae == 0xe, not tracked here) plays
+    /// 0xd0, everyone else a random one of `0x81, 0x82, 0x80, 0x84, 0x7f` (`rand() % 5`, the `imp-*` clips).
+    pub fn impact_anim(&mut self) -> u16 {
+        [0x81, 0x82, 0x80, 0x84, 0x7f][self.rng.rand() as usize % 5]
+    }
+
+    /// The struck character's reaction (`FUN_1009b4ac` [GC 0x1009b4ac] before its sounds): `Play(GetImpactAnim(), rate)` on `id` when its own `imp` clip
+    /// is not already playing, at rate 1 for hit kind 4 (a crit), else `_DAT_1015d0a4` = 0.5. Returns the clip id and the rate.
+    pub fn react_to_hit(&mut self, id: i32, flags: i32) -> (u16, f32) {
+        let anim = self.impact_anim();
+        let rate = if flags == 4 { 1.0 } else { 0.5 };
+        self.once_rate.insert(id, (u32::from(anim), rate));
+        self.play_once(id, u32::from(anim));
+        (anim, rate)
+    }
+
     /// `id` dies: the death clip `anim` (client animation id, `CharacterAction` 99's `identity_b.instance`; any other value =
     /// the generic death) plays once and holds.
     pub fn die(&mut self, id: i32, anim: u32) {
@@ -717,14 +788,160 @@ impl Dynels {
             ao_audio::sbf::sound_id(name)
         };
         let pos = if id == self.own { self.cam } else { scene_pos(c.pose.pos) };
-        self.sounds.push(GameSound { id: sound, pos });
+        self.sounds.push(GameSound::at(sound, pos));
     }
 
     /// A named fight sound (`SM_Sandy_Game_Brawl` / `_Dimach`, `FUN_1003c594`) at character `id`.
     pub fn sound_at(&mut self, id: i32, name: &str) {
         let Some(c) = self.chars.get(&id) else { return };
         let pos = if id == self.own { self.cam } else { scene_pos(c.pose.pos) };
-        self.sounds.push(GameSound { id: ao_audio::sbf::sound_id(name), pos });
+        self.sounds.push(GameSound::at(ao_audio::sbf::sound_id(name), pos));
+    }
+
+    /// Where a character's sounds play: the camera for the own character (the avatar is not a dynel model here), else its position.
+    fn char_pos(&self, id: i32) -> Option<[f32; 3]> {
+        let c = self.chars.get(&id)?;
+        Some(if id == self.own { self.cam } else { scene_pos(c.pose.pos) })
+    }
+
+    /// `FUN_1004570c(key)` (@0x1004570c) on a sound multimap: a random value of the key's list (a CRT `rand` only when there is a choice).
+    fn pick_of(&mut self, list: &[(u32, Vec<u32>)], key: u32) -> Option<u32> {
+        let l = list.iter().find(|s| s.0 == key).map(|s| &s.1).filter(|l| !l.is_empty())?;
+        Some(if l.len() > 1 { l[self.rng.rand() as usize % l.len()] } else { l[0] })
+    }
+
+    /// The NPC record of `id` as the fight sounds read it: `Some((sound table, FabricType))`; `None` for a player look, or while the model is not built.
+    fn record_of(&self, id: i32) -> Option<(SoundTable, i32)> {
+        let c = self.chars.get(&id)?;
+        let Look::Char(look) = &c.look else { return None };
+        let Some(Model::Ready { built, .. }) = self.models.get(&c.key).filter(|_| look.npc) else { return None };
+        Some((built.sounds.clone(), built.fabric))
+    }
+
+    /// Counts the delayed sounds down; the due ones join [`Dynels::take_sounds`].
+    fn tick_sounds(&mut self, dt: f32) {
+        let mut due = Vec::new();
+        self.later.retain_mut(|(t, s)| {
+            *t -= dt;
+            let keep = *t > 0.0;
+            if !keep {
+                due.push(*s);
+            }
+            keep
+        });
+        self.sounds.extend(due);
+    }
+
+    /// Marks the next one-shot clip of `id` as a weapon swing: its animation notes (`attack`, `swish_*`, ...) start the attack sounds
+    /// ([`Dynels::take_notes`], `combat::notes`). The mark lasts [`SWING_MARK_S`] (the clip may still have to load).
+    pub fn swing_mark(&mut self, id: i32) {
+        if let Some(c) = self.chars.get_mut(&id) {
+            c.swing_ttl = SWING_MARK_S;
+            if c.special == Special::None {
+                c.note_fired = 0;
+            }
+        }
+    }
+
+    /// `FUN_1006a8f3` [GC 0x1006a8f3] stores the damage and the hit kind of an `AttackInfo` in the attacker's slot object (and the victim is its target).
+    pub fn hit_seen(&mut self, attacker: i32, ctx: super::combat::notes::HitCtx) {
+        self.last_hit.insert(attacker, ctx);
+    }
+
+    /// One animation note of `who`'s swing clip (`FUN_10045069` [GC 0x10045069], `combat::notes`).
+    pub fn note_sounds(&mut self, who: i32, note: u32) {
+        use super::combat::notes::id;
+        match note {
+            id::SWISH_PUNCH..=id::SWISH_HUGE => self.swish(who, note),
+            id::ATTACK_START_1..=id::ATTACK_START_9 => self.record_note(who, note),
+            id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4 => {
+                if let Some(h) = self.last_hit.get(&who).copied() {
+                    self.weapon_hit(who, note, h);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The notes the swing clips of the other characters fired since the last call: (character, note id).
+    pub fn take_notes(&mut self) -> Vec<(i32, u32)> {
+        std::mem::take(&mut self.notes)
+    }
+
+    /// Notes `swish_punch` .. `swish_huge` (0x73..0x76, `FUN_10045069`): a player plays `SM_Sandy_Swish_*`, a creature a value of its record's list
+    /// `note`, at the character (material 0, plain size).
+    fn swish(&mut self, who: i32, note: u32) {
+        let (Some(at), Some(npc)) = (self.char_pos(who), self.chars.get(&who).map(|c| c.npc)) else { return };
+        let id = if npc {
+            self.record_of(who).and_then(|(sounds, _)| self.pick_of(&sounds, note))
+        } else {
+            super::combat::notes::swish_name(note).map(ao_audio::sbf::sound_id)
+        };
+        self.sounds.extend(id.map(|id| GameSound::at(id, at)));
+    }
+
+    /// Notes `attack_start_N` (0x77..0x7f): creature attack sounds, a value of the NPC record's list `note` at the character; players play nothing.
+    fn record_note(&mut self, who: i32, note: u32) {
+        let Some(at) = self.char_pos(who) else { return };
+        let id = self.record_of(who).and_then(|(sounds, _)| self.pick_of(&sounds, note));
+        self.sounds.extend(id.map(|id| GameSound::at(id, at)));
+    }
+
+    /// An `attack` / `attack_effect_N` note of `who`'s swing clip with `key` = the note id: `FUN_100688f9` [GC 0x100688f9] on the item behind the
+    /// attack slot ([`Armory::slot_item`](super::combat::arms::Armory::slot_item)), docs/zone/combat-anim.md section 6.
+    /// 1. The weapon's own sound at the attacker, plain `PlayGameSound`: `FUN_1009cd68` (wielded `WeaponItem_t` only: list `key`),
+    ///    `FUN_1009b4ac` (list `key`, else `0xb`; only when the hit kind `flags` is > 1) and `FUN_1009cc50` (wielded: list `key`, else for `0xb` the sound of
+    ///    the item's `AmmoType`). Identical ids start once (a sound that is already playing is not restarted).
+    /// 2. With damage and a hit kind > 1 (`FUN_1009b4ac`): at the victim, after 0.4 s, the sound the material selects. A creature (NPC record) plays
+    ///    the weapon's list `0x1f` (the weapon's impact sound, with the record's `FabricType` 1..=17 as the material) and its own record list `0x1f`;
+    ///    a player of breed 1, 2, 3, 4 or 7 plays `Male/FemaleGetsHit` as material 7. The impact size comes from the damage ([`notes::impact_size`]).
+    fn weapon_hit(&mut self, who: i32, key: u32, h: super::combat::notes::HitCtx) {
+        use super::combat::notes;
+        let Some(item) = self.arms.slot_item(who, h.slot).cloned() else { return };
+        let Some(at) = self.char_pos(who) else { return };
+        let mut ids: Vec<u32> = Vec::new();
+        if item.wielded {
+            ids.extend(self.pick_of(&item.sounds, key));
+        }
+        if h.flags > 1 {
+            let own = self.pick_of(&item.sounds, key);
+            ids.extend(own.or_else(|| if key == notes::id::ATTACK { None } else { self.pick_of(&item.sounds, notes::id::ATTACK) }));
+        }
+        if item.wielded {
+            let own = self.pick_of(&item.sounds, key);
+            ids.extend(own.or_else(|| if key == notes::id::ATTACK { notes::ammo_default(item.ammo) } else { None }));
+        }
+        for (i, id) in ids.iter().enumerate() {
+            if !ids[..i].contains(id) {
+                self.sounds.push(GameSound::at(*id, at));
+            }
+        }
+        if h.flags <= 1 || h.damage < 1 {
+            return;
+        }
+        let (Some(vpos), Some(v)) = (self.char_pos(h.victim), self.chars.get(&h.victim)) else { return };
+        let Look::Char(look) = &v.look else { return };
+        let (npc, breed, sex) = (look.npc, look.breed, look.sex);
+        let size = notes::impact_size(h.damage);
+        let (mut material, mut sound) = (0, 0u32);
+        if npc {
+            let Some((sounds, fabric)) = self.record_of(h.victim) else { return };
+            (material, sound) = (fabric, self.pick_of(&sounds, canim::npc_sound::HIT).unwrap_or(0));
+            if (1..=17).contains(&material) {
+                if let Some(w) = self.pick_of(&item.sounds, canim::npc_sound::HIT) {
+                    self.later.push((notes::IMPACT_DELAY_S, GameSound { id: w, pos: vpos, material, size }));
+                }
+            }
+        }
+        if material == 0 {
+            if let Some((m, name)) = notes::player_impact(breed, sex) {
+                material = m;
+                sound = name.map_or(sound, ao_audio::sbf::sound_id);
+            }
+        }
+        if sound != 0 && (1..=17).contains(&material) {
+            self.later.push((notes::IMPACT_DELAY_S, GameSound { id: sound, pos: vpos, material, size }));
+        }
     }
 
     fn add_prop(&mut self, kind: i32, instance: i32, look: Look, pos: [f32; 3], rot: Option<[f32; 4]>, scale: f32) {
@@ -867,6 +1084,7 @@ impl Dynels {
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && canim::death_anim_from_action(a.action, a.identity_b.instance as u32).is_some() => {
                 self.die(who.instance, a.identity_b.instance as u32)
             }
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == ACTION_UNWIELD => self.unwield_slot(who.instance, a.identity_b.instance),
             N3::Dynel(Dynel::WeaponItemFullUpdate(w)) if w.parent.kind == CHAR_KIND => {
                 // body location 6 = right hand, 8 = left hand (docs/zone/static.md §4)
                 if let Some(hand) = match w.byte_71 {
@@ -929,6 +1147,8 @@ impl Dynels {
                         features_set: !u.is_npc(),
                         bounds: None,
                         roll: Roll::default(),
+                        swing_ttl: 0.0,
+                        note_fired: 0,
                     },
                 );
             }
@@ -963,6 +1183,7 @@ impl Dynels {
             N3::Misc(Misc::ToClientQuit) => {
                 self.chars.remove(&who.instance);
                 self.swing_delay.remove(&who.instance);
+                self.once_rate.remove(&who.instance);
             }
             _ => {}
         }
@@ -978,6 +1199,7 @@ impl Dynels {
     /// Advances the dynels and hands the visible ones to the renderer. `cam` = camera position in scene space, `fwd` = its view direction.
     pub fn update(&mut self, dt: f32, cam: [f32; 3], fwd: [f32; 3], host: &mut Host) {
         self.cam = cam;
+        self.tick_sounds(dt);
         let Some(dir) = self.dir.clone() else { return };
         let worker = self.worker.take().unwrap_or_else(|| Worker::start(dir));
         if let Some(pf) = self.want_placed.take() {
@@ -1007,7 +1229,12 @@ impl Dynels {
                     }
                     self.replay.retain(|r| r.1 != id);
                 }
-                Resp::Weapon { holder, slot, wield } => self.wield.entry(holder).or_default()[slot] = wield,
+                // an answer for a hand that was emptied meanwhile (unwield before the worker resolved the item) is stale
+                Resp::Weapon { holder, slot, wield } => {
+                    if self.weapons.values().any(|&w| w == (holder, slot)) {
+                        self.wield.entry(holder).or_default()[slot] = wield;
+                    }
+                }
                 Resp::Model { key, result: Ok(built) } => {
                     self.models.insert(key, Model::Ready { built, uploaded: false });
                 }
@@ -1106,7 +1333,14 @@ impl Dynels {
                 },
                 Special::Once(k) => match built.clips.get(&k) {
                     // `FUN_1006a239`: a weapon swing is sped up so its first note lands within the weapon's ItemDelay
-                    Some(a) => (k, Some(a), self.swing_delay.get(id_ref).filter(|s| s.0 == k).map_or(1.0, |s| canim::swing_speed_scale(a.first().and_then(|a| a.events.first()).map_or(0.0, |e| e.0 as f32), s.1))),
+                    Some(a) => (
+                        k,
+                        Some(a),
+                        // a hit reaction plays at its own rate, a weapon swing is sped up for the weapon delay
+                        self.once_rate.get(id_ref).filter(|s| s.0 == k).map(|s| s.1).unwrap_or_else(|| {
+                            self.swing_delay.get(id_ref).filter(|s| s.0 == k).map_or(1.0, |s| canim::swing_speed_scale(a.first().and_then(|a| a.events.first()).map_or(0.0, |e| e.0 as f32), s.1))
+                        }),
+                    ),
                     None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
                 },
                 Special::Attack => match built.clips.get(&ATTACK_KEY) {
@@ -1142,8 +1376,14 @@ impl Dynels {
                 c.anim = key;
                 c.clip_ms = 0.0;
                 c.pose_in = 0.0;
+                c.note_fired = 0;
             }
             c.clip_ms += dt * 1000.0 * rate;
+            // the notes of a swing clip (`FUN_1003c036`): the weapon / swish sounds start when the clip reaches them
+            c.swing_ttl = (c.swing_ttl - dt).max(0.0);
+            if let (Some(a), true) = (clip, c.swing_ttl > 0.0 && matches!(c.special, Special::Once(_) | Special::Attack)) {
+                self.notes.extend(super::combat::notes::fire(&a.events, c.clip_ms, &mut c.note_fired).into_iter().map(|n| (*id, n)));
+            }
             let dead = matches!(c.special, Special::Die(_));
             if let Some(a) = clip.filter(|_| c.special != Special::None) {
                 // one-shot clips: Attack returns to the movement state at the end, Die holds the last frame
@@ -1613,6 +1853,63 @@ mod variant_tests {
         assert_eq!(d.pick_swing(8, canim::list::ATTACK), None);
     }
 
+    /// The wear capture (`zone_wear_rifle_borealis.rec`): the rifle (AnimSet 3, `ItemDelay` 100) in slot 6 is the own character's wield (swing list,
+    /// stance set, damage type, the avatar's attractor list); the server's `CharacterAction` 0x61 for slot 6 (the unwear; the item lives on in the bag)
+    /// empties it again, also when it comes before the worker resolved the item.
+    #[test]
+    fn own_wield_follows_the_captured_wear_and_unwear() {
+        use crate::play::combat::arms::UNWIELD_SLOT_6;
+        use crate::play::zone::OwnEvent;
+        let Some(dir) = client() else { return };
+        let own = 0x82e8;
+        let mut z = Zone::new(own as u32);
+        z.world.start(dir, own);
+        // the weapon update + appearance update of the wear, the unwear (bag slot 0x41) and the wear again (the capture's other frames do not matter here)
+        let rec: Vec<Frame> = frames(include_str!("../../../../docs/captures/zone_wear_rifle_borealis.rec"))
+            .into_iter()
+            .filter(|f| matches!(ao_net::n3::decode(f).map(|m| m.body), Ok(N3::Dynel(Dynel::WeaponItemFullUpdate(_)) | N3::World(World::Appearance(_)))))
+            .collect();
+        assert_eq!(rec.len(), 6);
+        let unwield = frames(&format!("0 < {UNWIELD_SLOT_6}"));
+        let mut host = ao_render::Host::headless();
+        let mut pump = |z: &mut Zone, n: usize, until: &dyn Fn(&Dynels) -> bool| {
+            for _ in 0..n {
+                z.world.update(0.02, [0.0; 3], [0.0, 0.0, -1.0], &mut host);
+                if until(&z.world) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        };
+        let attractors = |z: &mut Zone| std::mem::take(&mut z.own_events).into_iter().filter_map(|e| if let OwnEvent::Attractors(l) = e { Some(l) } else { None }).collect::<Vec<_>>();
+        let wear = |z: &mut Zone, i: usize| rec[2 * i..2 * i + 2].iter().for_each(|f| {
+            z.on_frame(f);
+        });
+        wear(&mut z, 0);
+        assert!(pump(&mut z, 500, &|w| w.wielded_set(own) == Some(3)), "the rifle never resolved");
+        assert_eq!(attractors(&mut z), [vec![(1, 0x3ddf), (0, 0x9ee9)]], "the rifle mesh in the right hand attractor, next to the head");
+        assert_eq!(z.world.arms.damage_type(own, 6, 0), Some(0x5a));
+        let (anim, delay) = z.world.pick_swing(own, canim::list::ATTACK).unwrap();
+        assert_eq!((anim, delay), (0x3ff, 100), "rifle shot");
+        unwield.iter().for_each(|f| {
+            z.on_frame(f);
+        });
+        assert_eq!((z.world.wielded_set(own), z.world.pick_swing(own, canim::list::ATTACK), z.world.arms.damage_type(own, 6, 0)), (None, None, None));
+        wear(&mut z, 1);
+        assert_eq!(attractors(&mut z), [vec![(0, 0x9ee9)]], "the unwear's list: the head only");
+        assert!(!pump(&mut z, 20, &|w| w.wielded_set(own).is_some()), "the bag slot 0x41 is no hand");
+        // wear again; unwield after the request went to the worker, before its answer is read: the stale answer is dropped
+        wear(&mut z, 2);
+        pump(&mut z, 1, &|_| false);
+        unwield.iter().for_each(|f| {
+            z.on_frame(f);
+        });
+        assert!(!pump(&mut z, 100, &|w| w.wielded_set(own).is_some()));
+        wear(&mut z, 2);
+        assert!(pump(&mut z, 500, &|w| w.wielded_set(own) == Some(3)));
+    }
+
     /// The variant is rolled when a clip starts (key or state change), not on every frame of its loop, and a single clip never
     /// consumes the RNG (`FUN_1004570c`).
     #[test]
@@ -1723,5 +2020,186 @@ mod variant_tests {
         assert!(s.iter().all(|s| s.pos == scene_pos(z.world.chars[&id].pose.pos)));
         z.world.char_sound(id + 1_000_000, canim::npc_sound::DEATH);
         assert!(z.world.take_sounds().is_empty(), "unknown dynels are silent");
+    }
+
+    /// A zone with the captured characters and every model built (`start` + frames + update ticks): (zone, a player, a Beach Leet).
+    fn fight_zone() -> Option<(Zone, i32, i32)> {
+        let dir = client()?;
+        let mut z = Zone::new(25988);
+        z.world.start(dir, 25988);
+        for f in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            z.on_frame(&f);
+        }
+        let leet = *z.world.chars.iter().find(|(_, c)| c.name == "Beach Leet")?.0;
+        let mut players: Vec<i32> = z.world.chars.iter().filter(|(id, c)| **id != z.world.own && matches!(&c.look, Look::Char(l) if !l.npc)).map(|(id, _)| *id).collect();
+        players.sort_unstable();
+        let player = *players.first()?;
+        let mut host = Host::headless();
+        let (eye, fwd) = (scene_pos(z.own()?.pos), [0.0, 0.0, -1.0]);
+        for _ in 0..400 {
+            z.world.update(0.05, eye, fwd, &mut host);
+            host.actors.clear();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Some((z, player, leet))
+    }
+
+    /// `FUN_10045069` + `FUN_1009b4ac` with real data (docs/zone/combat-anim.md section 6): a bare-handed player (martial-arts item 43712: swing `0xb` ->
+    /// `0xc1080179`, impact `0x1f` -> `0x7199b60d`) hits a Beach Leet and another player. The swing sound is immediate at the attacker; the impact
+    /// sounds come 0.4 s later at the victim, with the creature's `FabricType` / the flesh material 7 and the damage's size.
+    #[test]
+    fn a_bare_handed_hit_plays_the_weapon_swing_and_the_material_impact() {
+        use crate::play::combat::notes::{impact_size, HitCtx, IMPACT_DELAY_S};
+        let Some((mut z, att, leet)) = fight_zone() else { return };
+        let mut others: Vec<i32> = z.world.chars.iter().filter(|(id, c)| **id != att && **id != z.world.own && matches!(&c.look, Look::Char(l) if !l.npc)).map(|(id, _)| *id).collect();
+        others.sort_unstable();
+        let victim = others.first().copied().unwrap_or(att);
+        z.world.arms.clear();
+        z.world.arms.list(att, false, &[(43712, 100)]);
+        let apos = scene_pos(z.world.chars[&att].pose.pos);
+        let fabric = {
+            let c = &z.world.chars[&leet];
+            let Some(Model::Ready { built, .. }) = z.world.models.get(&c.key) else { panic!("leet model not ready") };
+            built.fabric
+        };
+        eprintln!("Beach Leet FabricType {fabric}");
+        // a hit on the leet: the swing sound now, the impact later
+        z.world.hit_seen(att, HitCtx { victim: leet, slot: 0, damage: 20, flags: 3 });
+        z.world.note_sounds(att, 0xb);
+        let now = z.world.take_sounds();
+        assert_eq!(now, [GameSound::at(0xc1080179, apos)], "the weapon's list 0xb at the attacker");
+        assert!(z.world.take_sounds().is_empty());
+        let mut host = Host::headless();
+        let eye = scene_pos(z.own().unwrap().pos);
+        let lpos = scene_pos(z.world.chars[&leet].pose.pos);
+        z.world.update(IMPACT_DELAY_S - 0.1, eye, [0.0, 0.0, -1.0], &mut host);
+        assert!(z.world.take_sounds().is_empty(), "the impact waits {IMPACT_DELAY_S} s");
+        z.world.update(0.2, eye, [0.0, 0.0, -1.0], &mut host);
+        let later = z.world.take_sounds();
+        eprintln!("impact sounds on the leet: {later:?}");
+        if (1..=17).contains(&fabric) {
+            assert!(!later.is_empty() && later.iter().all(|s| s.pos == lpos && s.material == fabric && s.size == impact_size(20)), "{later:?}");
+            assert!(later.iter().any(|s| s.id == 0x7199b60d), "the martial-arts impact list 0x1f");
+        } else {
+            assert!(later.is_empty(), "no FabricType, no impact: {later:?}");
+        }
+        // a hit that does no damage / a hit kind <= 1 plays the swing only (`FUN_1009b4ac` returns before the impact)
+        z.world.hit_seen(att, HitCtx { victim: leet, slot: 0, damage: 20, flags: 1 });
+        z.world.note_sounds(att, 0xb);
+        assert!(z.world.take_sounds().is_empty() || z.world.take_sounds().is_empty(), "hit kind 1: the dummy weapon's b4ac part is skipped");
+        z.world.update(1.0, eye, [0.0, 0.0, -1.0], &mut host);
+        assert!(z.world.take_sounds().is_empty());
+        // a player is struck: Male / FemaleGetsHit, material 7
+        if victim != att {
+            let Look::Char(l) = &z.world.chars[&victim].look else { unreachable!() };
+            let (breed, sex) = (l.breed, l.sex);
+            z.world.hit_seen(att, HitCtx { victim, slot: 0, damage: 4, flags: 4 });
+            z.world.note_sounds(att, 0xb);
+            z.world.take_sounds();
+            let vpos = scene_pos(z.world.chars[&victim].pose.pos);
+            z.world.update(0.5, eye, [0.0, 0.0, -1.0], &mut host);
+            let s = z.world.take_sounds();
+            match crate::play::combat::notes::player_impact(breed, sex) {
+                Some((7, Some(name))) => assert_eq!(s, [GameSound { id: ao_audio::sbf::sound_id(name), pos: vpos, material: 7, size: 1 }]),
+                _ => assert!(s.is_empty(), "{s:?}"),
+            }
+        }
+    }
+
+    /// Notes `swish_*` / `attack_start_N`: a player plays `SM_Sandy_Swish_*` (the holder's own ids), a creature the list of its record; the creature's
+    /// `attack_start` list is silent for players.
+    #[test]
+    fn swish_and_attack_start_notes() {
+        let Some((mut z, player, leet)) = fight_zone() else { return };
+        let (pp, lp) = (scene_pos(z.world.chars[&player].pose.pos), scene_pos(z.world.chars[&leet].pose.pos));
+        z.world.note_sounds(player, 0x73);
+        z.world.note_sounds(player, 0x75);
+        z.world.note_sounds(player, 0x77);
+        let sid = ao_audio::sbf::sound_id;
+        assert_eq!(z.world.take_sounds(), [GameSound::at(sid("SM_Sandy_Swish_punch"), pp), GameSound::at(sid("SM_Sandy_Swish_tail"), pp)]);
+        let rec = {
+            let c = &z.world.chars[&leet];
+            let Some(Model::Ready { built, .. }) = z.world.models.get(&c.key) else { panic!("leet model not ready") };
+            built.sounds.clone()
+        };
+        for note in [0x73u32, 0x77, 0x78] {
+            z.world.note_sounds(leet, note);
+            let got = z.world.take_sounds();
+            let want = rec.iter().find(|s| s.0 == note).map_or(&[][..], |s| &s.1[..]);
+            assert_eq!(got.len(), usize::from(!want.is_empty()), "note {note:#x}: {want:?}");
+            assert!(got.iter().all(|g| want.contains(&g.id) && g.pos == lp));
+        }
+    }
+
+    /// The swing clip of a creature fires its notes while it plays (`FUN_1003c036`): marked, the Beach Leet's attack clip reports its `attack` /
+    /// `attack_start` / `swish` notes once each; an unmarked clip (an emote) reports none.
+    #[test]
+    fn a_marked_swing_clip_reports_its_notes() {
+        let Some((mut z, _, leet)) = fight_zone() else { return };
+        let mut host = Host::headless();
+        let (eye, fwd) = (scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
+        z.world.take_notes();
+        z.world.attack(leet);
+        for _ in 0..60 {
+            z.world.update(0.05, eye, fwd, &mut host);
+            host.actors.clear();
+        }
+        assert!(z.world.take_notes().is_empty(), "unmarked clip");
+        z.world.swing_mark(leet);
+        z.world.attack(leet);
+        let mut notes = vec![];
+        for _ in 0..80 {
+            z.world.update(0.05, eye, fwd, &mut host);
+            host.actors.clear();
+            notes.extend(z.world.take_notes());
+        }
+        eprintln!("leet attack clip notes: {notes:?}");
+        let mut uniq = notes.clone();
+        uniq.dedup();
+        assert_eq!(notes.len(), uniq.len(), "every note fires once");
+        assert!(!notes.is_empty() && notes.iter().all(|n| n.0 == leet));
+    }
+
+    /// The `FabricType` (NPC record stat 41, the impact material `FUN_1004d8e6(0x29)`) is 0 for nearly every creature record: only a handful carry
+    /// a material, so a creature's own list-0x1f impact sound is rare and a hit on a player (material 7) is the common impact.
+    #[test]
+    fn creature_records_carry_a_fabric_type() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let (mut all, mut fabric, mut hist) = (0, 0, std::collections::BTreeMap::new());
+        for id in store.ids(ao_formats::character::NPC_TYPE).unwrap() {
+            let Ok(r) = NpcRecord::load(&store, id) else { continue };
+            all += 1;
+            let f = r.stat(super::super::combat::notes::STAT_FABRIC_TYPE).unwrap_or(0);
+            fabric += usize::from((1..=17).contains(&f));
+            *hist.entry(f).or_insert(0) += 1;
+        }
+        eprintln!("{all} creature records, {fabric} with a FabricType 1..=17: {hist:?}");
+        assert!(fabric > 0 && fabric * 20 < all, "{fabric} of {all}");
+    }
+
+    /// `FUN_10058cfa` (the `GetImpactAnim` override of `SimpleChar`): one of `0x81 0x82 0x80 0x84 0x7f`; the struck leet plays the `imp-*` clip once,
+    /// at half speed unless the hit kind is 4.
+    #[test]
+    fn a_struck_creature_plays_an_impact_clip() {
+        let Some((mut z, _, leet)) = fight_zone() else { return };
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            seen.insert(z.world.impact_anim());
+        }
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), [0x7f, 0x80, 0x81, 0x82, 0x84], "crawling (0xd0) is not tracked");
+        let (anim, rate) = z.world.react_to_hit(leet, 3);
+        assert_eq!(rate, 0.5);
+        let mut host = Host::headless();
+        let (eye, fwd) = (scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
+        let mut played = false;
+        for _ in 0..60 {
+            z.world.update(0.05, eye, fwd, &mut host);
+            host.actors.clear();
+            played |= matches!(z.world.chars[&leet].special, Special::Once(k) if k == u32::from(anim));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(played, "imp clip {anim:#x} resolved through the creature's record");
+        assert_eq!(z.world.react_to_hit(leet, 4).1, 1.0);
     }
 }

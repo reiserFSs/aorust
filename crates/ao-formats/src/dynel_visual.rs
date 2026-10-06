@@ -115,46 +115,61 @@ pub fn parse_item_template(rec: &[u8]) -> Result<ItemTemplate> {
         let (id, v) = (u32_at(&mut at)?, u32_at(&mut at)?);
         stats.push((id, v as i32));
     }
-    // the elements after the stat list that are understood: name {0x15, 0x21}: u16 name length, u16 description length, name, description;
-    // sound multimap {0x14, *}
+    // the name element {0x15, 0x21}: u16 name length, u16 description length, name, description. The walk stops at the first element it does not
+    // decode (spell / skill / event lists, `FUN_1002b297`); the sound multimap is found by [`sound_map`] instead.
     let mut name = None;
-    let mut sounds = vec![];
-    let size_word = |at: &mut usize| -> Option<usize> {
-        let w = rec.get(*at..*at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))?;
-        *at += 4;
-        (w >= 0x3F1 && w % 0x3F1 == 0).then(|| (w / 0x3F1 - 1) as usize)
-    };
-    'elements: for _ in 1..elements {
-        let (Some(ty), Some(_)) = (rec.get(at..at + 4), rec.get(at + 4..at + 8)) else { break };
-        let (ty, sub) = (u32::from_le_bytes(ty.try_into().unwrap()), u32::from_le_bytes(rec[at + 4..at + 8].try_into().unwrap()));
+    for _ in 1..elements {
+        let (Some(ty), Some(sub)) = (rec.get(at..at + 4), rec.get(at + 4..at + 8)) else { break };
+        let (ty, sub) = (u32::from_le_bytes(ty.try_into().unwrap()), u32::from_le_bytes(sub.try_into().unwrap()));
         at += 8;
-        match (ty, sub) {
-            (0x15, 0x21) => {
-                let (Some(l), Some(_)) = (rec.get(at..at + 2), rec.get(at + 2..at + 4)) else { break };
-                let (len, dlen) = (u16::from_le_bytes(l.try_into().unwrap()) as usize, u16::from_le_bytes(rec[at + 2..at + 4].try_into().unwrap()) as usize);
-                let Some(text) = rec.get(at + 4..at + 4 + len + dlen) else { break };
-                name = Some(String::from_utf8_lossy(&text[..len]).into_owned());
-                at += 4 + len + dlen;
-            }
-            (0x14, _) => {
-                let Some(n) = size_word(&mut at).filter(|&n| n <= 30000) else { break };
-                for _ in 0..n {
-                    let key = rec.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-                    at += 4;
-                    let (Some(key), Some(m)) = (key, size_word(&mut at).filter(|&m| m <= 30000)) else { break 'elements };
-                    let Some(vals) = rec.get(at..at + 4 * m) else { break 'elements };
-                    at += 4 * m;
-                    let vals = vals.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b));
-                    match sounds.iter_mut().find(|e: &&mut (u32, Vec<u32>)| e.0 == key) {
-                        Some(e) => e.1.extend(vals),
-                        None => sounds.push((key, vals.collect())),
-                    }
-                }
-            }
-            _ => break,
+        if (ty, sub) != (0x15, 0x21) {
+            break;
         }
+        let (Some(l), Some(d)) = (rec.get(at..at + 2), rec.get(at + 2..at + 4)) else { break };
+        let (len, dlen) = (u16::from_le_bytes(l.try_into().unwrap()) as usize, u16::from_le_bytes(d.try_into().unwrap()) as usize);
+        let Some(text) = rec.get(at + 4..at + 4 + len + dlen) else { break };
+        name = Some(String::from_utf8_lossy(&text[..len]).into_owned());
+        at += 4 + len + dlen;
     }
+    let sounds = sound_map(rec);
     Ok(ItemTemplate { kind, stats, name, sounds })
+}
+
+/// The sound multimap of an item / NPC-weapon record (element type `0x14`, reader `FUN_1007d6d5` [GC 0x1007d6d5], the format of the NPC record's
+/// sound table, `character::npc`): `u32 0x14, u32 sub (<= 0x36), size word (n + 1) * 0x3F1, n * { u32 key; size word (m + 1) * 0x3F1; m * u32 value }`.
+/// key -> Sandy sound ids in file order (equal keys are merged). Doors: `0x83` open / `0x84` close; weapons: `0xb` swing / shot, `0x1f` impact,
+/// `8` wield, `9` unwield, `0x2c` empty, `0x31` explosion (docs/zone/combat-anim.md section 6).
+///
+/// The elements before it are spell / skill / event lists whose readers (`FUN_1002b297`: `FUN_100a6c58` SpellData, `FUN_1002e123`, ...) are not
+/// ported, so the element is found by its header plus a multimap that parses with valid size words (not by walking). [DATA] All 119 540 records
+/// of rdb 1000020 give at most one such match (none two) and 16 049 of the 17 298 weapon records one; the ids of those resolve in the sbf
+/// (`ao_audio` test `weapon_sounds_resolve`). Anything that is not a valid multimap is skipped, an empty one is no map.
+pub fn sound_map(rec: &[u8]) -> Vec<(u32, Vec<u32>)> {
+    let word = |at: usize| rec.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    // `(w / 0x3F1) - 1` of a size word, as the readers do (`w % 0x3F1 != 0` or an implausible count aborts the element)
+    let count = |at: usize| word(at).filter(|&w| w >= 0x3F1 && w % 0x3F1 == 0).map(|w| (w / 0x3F1 - 1) as usize).filter(|&n| n <= 30000);
+    let multimap = |mut at: usize| -> Option<Vec<(u32, Vec<u32>)>> {
+        let n = count(at)?;
+        at += 4;
+        let mut map: Vec<(u32, Vec<u32>)> = Vec::new();
+        for _ in 0..n {
+            let key = word(at)?;
+            let m = count(at + 4)?;
+            at += 8;
+            let vals = rec.get(at..at.checked_add(4 * m)?)?;
+            at += 4 * m;
+            let vals = vals.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b));
+            match map.iter_mut().find(|e| e.0 == key) {
+                Some(e) => e.1.extend(vals),
+                None => map.push((key, vals.collect())),
+            }
+        }
+        Some(map)
+    };
+    (8..rec.len().saturating_sub(12))
+        .filter(|&at| word(at) == Some(0x14) && word(at + 4).is_some_and(|sub| sub <= 0x36))
+        .find_map(|at| multimap(at + 8).filter(|m| !m.is_empty()))
+        .unwrap_or_default()
 }
 
 /// `None` when rdb 1000020 has no record for `static_instance`.
@@ -422,6 +437,36 @@ mod tests {
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.split_whitespace().collect();
         (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// rdb 1000020:43712, the martial-arts item (`WeaponItem`, 398 bytes): the stat list, the name, an animation multimap (`{0xe, 0x13}`), two list
+    /// elements the walk does not decode, then the sound multimap `{0x14}`: swing `0xb`, impact `0x1f`, swish punch / kick `0x73` / `0x74` (values
+    /// resolve in `SM_Sandy_Game_Dummy.sbf`, `ao_audio` test `weapon_sounds_resolve`).
+    const MARTIAL_ARTS: &str = "4AC70000060000000F00000017000000014300004C000000010000001E0000000900006600000000010000802A010000\
+        00000000580000000000000002000000010000000C0000003523000036000000010000004F000000BC2D0000D2000000\
+        7D0000001C010000030000001D010000050000001E010000030000001F01000002000000260100007D000000B8010000\
+        780000001500000021000000110029004D61727469616C2041727473204974656D54686973206974656D206973207573\
+        656420746F206D616B65206D61727469616C20617274732E2E2E0E00000013000000E20700000B000000B51300000A04\
+        00000B0400000D040000090400000400000004000000D30B00000C000000E207000064000000640000000D000000E207\
+        00009B00000064000000060000001B000000D30B00000C000000000000000D000000000000001400000005000000B513\
+        00000B000000E2070000790108C11F000000E20700000DB6997173000000E20700002087D80174000000E20700007901\
+        08C1000000000000000000000000";
+
+    #[test]
+    fn a_weapon_record_finds_its_sound_multimap_behind_the_unwalked_elements() {
+        let rec = hex(MARTIAL_ARTS);
+        let t = parse_item_template(&rec).unwrap();
+        assert_eq!((t.kind, t.name.as_deref()), (0xC74A, Some("Martial Arts Item")));
+        assert_eq!(t.sounds, [(0xb, vec![0xc1080179]), (0x1f, vec![0x7199b60d]), (0x73, vec![0x01d88720]), (0x74, vec![0xc1080179])]);
+        assert_eq!(sound_map(&rec), t.sounds);
+        // the animation multimap `{0xe}` has the same layout but is not the sound element; a record without a `{0x14}` element has none
+        let mut anim_only = rec.clone();
+        let at = rec.windows(8).position(|w| w == [0x14, 0, 0, 0, 5, 0, 0, 0]).unwrap();
+        anim_only[at] = 0x15;
+        assert!(sound_map(&anim_only).is_empty());
+        for n in 0..rec.len() {
+            let _ = sound_map(&rec[..n]);
+        }
     }
 
     #[test]

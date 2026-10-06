@@ -9,29 +9,47 @@
 
 use super::state::CHAR_KIND;
 use ao_formats::dynel_visual::{effective_stats, get, item_template, static_instance};
-use ao_net::n3::{dynel::Dynel, misc::Misc, Message, N3};
+use ao_net::n3::{dynel::Dynel, misc::Misc, world::World, Message, N3};
 use ao_rdb::RecordStore;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// Stat `DamageType` (436).
 pub const STAT_DAMAGE_TYPE: u32 = 0x1b4;
+/// Stat `AmmoType` (420, `FUN_1009cc50` reads it as `0x1a4`).
+pub const STAT_AMMO_TYPE: u32 = 0x1a4;
 /// What `DummyWeapon_t` [GC 0x10082512] and `WeaponItem_t` [GC 0x1009b913] preset: 0x5b = "melee".
 pub const DEFAULT_DAMAGE_TYPE: i32 = 0x5b;
 /// The list key of the character's martial-arts / bare-hands item (`FUN_1006ac03` registers it as slot 0).
 const BARE_HANDS_KEY: i32 = 100;
+/// `CharacterActionIIR_t` id that empties a body slot (`identity_b.instance`).
+const ACTION_UNWIELD: i32 = 0x61;
+/// The `CharacterActionIIR_t` 0x61 of the rifle's unwear (header = the own character 0x82e8, `identity_b = {0, 6}`), as received live.
+#[cfg(test)]
+pub const UNWIELD_SLOT_6: &str = "011d000a0001003700000001000082e85e4777700000c350000082e8000000006100000000000000000000000000000000000000060000";
 
 /// Slots `FUN_10068072` answers: `0..=15`, `0x3d`, `0x3f`.
 pub fn valid_slot(s: i32) -> bool {
     (0..0x10).contains(&s) || s == 0x3d || s == 0x3f
 }
 
+/// What the fight code reads of the item behind a slot: stat `DamageType` (log line), and for the attack sounds (`FUN_1009b4ac`, `FUN_1009cd68`,
+/// `FUN_1009cc50`, docs/zone/combat-anim.md section 6) the record's sound multimap, stat `AmmoType` (420) and whether it is a wielded `WeaponItem_t`
+/// (`object+0x14`) rather than a `DummyWeapon_t` (`object+0x10`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Item {
+    pub dtype: i32,
+    pub sounds: Vec<(u32, Vec<u32>)>,
+    pub ammo: i32,
+    pub wielded: bool,
+}
+
 #[derive(Default)]
 struct Arms {
-    /// `ctrl+0x20` map: slot -> stat `0x1b4` of the item behind it.
-    slots: BTreeMap<i32, i32>,
+    /// `ctrl+0x20` map: slot -> the item behind it.
+    slots: BTreeMap<i32, Item>,
     /// `ctrl+0x10` map: special-attack key -> the same.
-    specials: HashMap<i32, i32>,
+    specials: HashMap<i32, Item>,
     /// `FUN_10067c2b`: the item list was applied once (`ctrl+0x30 != 0`); later lists are ignored.
     listed: bool,
 }
@@ -44,8 +62,8 @@ impl Arms {
 
     /// `FUN_1006a700` [GC 0x1006a700]: a wielded weapon takes its slot; with the `0x800` stat flag clear (it is never set live,
     /// CharacterAction 0xa7, docs/zone/actions.md) the bare-hands slot 0 is dropped.
-    fn wield(&mut self, slot: i32, dtype: i32) {
-        self.slots.insert(slot, dtype);
+    fn wield(&mut self, slot: i32, item: Item) {
+        self.slots.insert(slot, item);
         if slot != 0 {
             self.slots.remove(&0);
         }
@@ -55,23 +73,23 @@ impl Arms {
     fn unwield(&mut self, slot: i32) {
         self.slots.remove(&slot);
         if self.filled() == 0 {
-            if let Some(&t) = self.specials.get(&BARE_HANDS_KEY) {
-                self.slots.insert(0, t);
+            if let Some(t) = self.specials.get(&BARE_HANDS_KEY) {
+                self.slots.insert(0, t.clone());
             }
         }
     }
 
     /// `FUN_1006ac03` [GC 0x1006ac03] for one list entry `(key, stat 0x1b4 of its item)`; `npc` = `SimpleChar_t+0x21c`.
-    fn list_entry(&mut self, npc: bool, key: i32, dtype: i32) {
-        self.specials.entry(key).or_insert(dtype);
+    fn list_entry(&mut self, npc: bool, key: i32, item: Item) {
+        self.specials.entry(key).or_insert_with(|| item.clone());
         let filled = self.filled();
         if npc {
             // creatures: the entries take the next free slots in list order (`FUN_1006a0d1(FUN_10067fbe(), item)`)
             if valid_slot(filled as i32) {
-                self.slots.insert(filled as i32, dtype);
+                self.slots.insert(filled as i32, item);
             }
         } else if key == BARE_HANDS_KEY && (filled == 0 || self.slots.contains_key(&0)) {
-            self.slots.insert(0, dtype);
+            self.slots.insert(0, item);
         }
     }
 }
@@ -97,10 +115,12 @@ impl Armory {
         self.worn.clear();
     }
 
-    /// Stat `0x1b4` of an item: the rdb 1000020 record `template` under the message stats, else [`DEFAULT_DAMAGE_TYPE`].
-    fn item_type(&self, template: Option<u32>, msg: &[(u32, i32)]) -> i32 {
+    /// The item of the rdb 1000020 record `template` under the message stats: stat `0x1b4` else [`DEFAULT_DAMAGE_TYPE`], stat 420 else the
+    /// `WeaponItem_t` default -1 (`FUN_1009b913`), and the record's sounds.
+    fn item(&self, template: Option<u32>, msg: &[(u32, i32)], wielded: bool) -> Item {
         let tpl = template.zip(self.store.as_ref()).and_then(|(t, s)| item_template(s, t).ok().flatten());
-        get(&effective_stats(tpl.as_ref(), msg), STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE)
+        let stats = effective_stats(tpl.as_ref(), msg);
+        Item { dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), wielded }
     }
 
     /// `holder` wields weapon dynel `item` in body `slot` (`WeaponItemFullUpdateIIR_t`).
@@ -108,7 +128,7 @@ impl Armory {
         if !valid_slot(slot) {
             return;
         }
-        let t = self.item_type(template, msg);
+        let t = self.item(template, msg, true);
         self.by.entry(holder).or_default().wield(slot, t);
         self.worn.insert(item, (holder, slot));
     }
@@ -118,7 +138,7 @@ impl Armory {
         if items.is_empty() || self.by.get(&holder).is_some_and(|a| a.listed) {
             return;
         }
-        let types: Vec<i32> = items.iter().map(|&(t, _)| self.item_type(Some(t), &[])).collect();
+        let types: Vec<Item> = items.iter().map(|&(t, _)| self.item(Some(t), &[], false)).collect();
         let a = self.by.entry(holder).or_default();
         a.listed = true;
         for (&(_, key), t) in items.iter().zip(types) {
@@ -135,6 +155,15 @@ impl Armory {
         }
     }
 
+    /// `CharacterActionIIR_t` 0x61 (`FUN_1006a857` -> `FUN_1006a772`, docs/zone/actions.md): `holder`'s body `slot` is emptied. The weapon dynel stays
+    /// alive (it goes back to the bag: its `WeaponItemFullUpdate` then names the bag slot), so no `n3ToClientQuit` follows.
+    pub fn unwield_slot(&mut self, holder: i32, slot: i32) {
+        self.worn.retain(|_, w| *w != (holder, slot));
+        if let Some(a) = self.by.get_mut(&holder) {
+            a.unwield(slot);
+        }
+    }
+
     /// Applies the messages that change a slot table; `npc` = the header character is an NPC.
     pub fn on_message(&mut self, m: &Message, npc: bool) {
         let who = m.header.target;
@@ -148,6 +177,7 @@ impl Armory {
                 let items: Vec<(u32, i32)> = s.attacks.iter().map(|e| (e.f0 as u32, e.f3 as i32)).collect();
                 self.list(who.instance, npc, &items);
             }
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == ACTION_UNWIELD => self.unwield_slot(who.instance, a.identity_b.instance),
             N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => {
                 self.by.remove(&who.instance);
             }
@@ -160,7 +190,12 @@ impl Armory {
     /// object does not exist (the original then skips the hit entirely, this port cannot tell it from a table it never saw filled).
     pub fn damage_type(&self, holder: i32, slot: i32, special: i32) -> Option<i32> {
         let a = self.by.get(&holder)?;
-        if special != 0 { a.specials.get(&special) } else { a.slots.get(&slot) }.copied()
+        if special != 0 { a.specials.get(&special) } else { a.slots.get(&slot) }.map(|i| i.dtype)
+    }
+
+    /// The item behind `holder`'s body `slot` (`FUN_10068072` [GC 0x10068072]): what the attack notes read (`FUN_100688f9`).
+    pub fn slot_item(&self, holder: i32, slot: i32) -> Option<&Item> {
+        self.by.get(&holder)?.slots.get(&slot)
     }
 }
 
@@ -245,6 +280,15 @@ mod tests {
         a.wield(1, 500, 6, Some(121567), &[]);
         a.wield(1, 501, 8, Some(122159), &[]);
         assert_eq!((a.damage_type(1, 6, 0), a.damage_type(1, 8, 0)), (Some(PROJECTILE), Some(ENERGY)));
+        let (bare, pistol) = (a.slot_item(1, 0), a.slot_item(1, 6).unwrap());
+        eprintln!("bare hands {bare:?}\npistol {pistol:?}");
+        assert!(bare.is_none(), "the pistol replaced the bare hands (slot 0)");
+        assert!(pistol.wielded && !pistol.sounds.is_empty() && pistol.sounds.iter().any(|s| s.0 == 0xb), "the wielded weapon's record sounds: swing / shot 0xb");
+        let mut b = Armory::open(&dir);
+        b.list(1, false, &[(43712, 100)]);
+        let m = b.slot_item(1, 0).unwrap();
+        assert!(!m.wielded, "the martial-arts item is a DummyWeapon (`object+0x10`)");
+        assert_eq!(m.sounds, [(0xb, vec![0xc1080179]), (0x1f, vec![0x7199b60d]), (0x73, vec![0x01d88720]), (0x74, vec![0xc1080179])]);
         // a baseball bat is melee, unless the message carries its own stat
         a.wield(2, 502, 6, Some(121564), &[]);
         a.wield(2, 503, 8, Some(121564), &[(STAT_DAMAGE_TYPE, ENERGY)]);
@@ -296,5 +340,39 @@ mod tests {
         if a.store.is_some() {
             assert!(types.contains(&0x5a) && types.contains(&0x5b) && types.len() > 2, "{types:x?}");
         }
+    }
+
+    /// The newcomer rifle of the wear capture (`zone_wear_rifle_borealis.rec`: `WeaponItemFullUpdate` of item 121569 in body slot 6, projectile
+    /// 0x5a) takes the right hand; the unwear is the server's `CharacterAction` 0x61 for slot 6 (the weapon update that follows only names the bag
+    /// slot 0x41) and the bare hands (martial-arts item, melee) are slot 0 again.
+    #[test]
+    fn captured_wear_and_unwear_of_the_rifle() {
+        use ao_net::frame::{Frame, PT_N3};
+        let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/rdb.db").exists() {
+            return;
+        }
+        let decode = |hex: &str| {
+            let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+            let f = Frame::decode_with(&b, false).unwrap().unwrap().0;
+            assert_eq!(f.ptype, PT_N3);
+            ao_net::n3::decode(&f).unwrap()
+        };
+        let rec: Vec<&str> = include_str!("../../../../../docs/captures/zone_wear_rifle_borealis.rec").lines().filter(|l| l.split(' ').nth(1) == Some("<")).map(|l| l.split(' ').nth(2).unwrap()).collect();
+        let weapon_updates: Vec<Message> = rec.iter().map(|h| decode(h)).filter(|m| matches!(m.body, N3::Dynel(Dynel::WeaponItemFullUpdate(_)))).collect();
+        // wear (slot 6), unwear (bag slot 0x41), wear again
+        assert_eq!(weapon_updates.len(), 3);
+        let own = 0x82e8;
+        let mut a = Armory::open(&dir);
+        a.list(own, false, &[(43712, BARE_HANDS_KEY)]);
+        assert_eq!((a.damage_type(own, 0, 0), a.damage_type(own, 6, 0)), (Some(MELEE), None));
+        a.on_message(&weapon_updates[0], false);
+        assert_eq!((a.damage_type(own, 6, 0), a.damage_type(own, 0, 0)), (Some(PROJECTILE), None));
+        a.on_message(&decode(UNWIELD_SLOT_6), false);
+        assert_eq!((a.damage_type(own, 6, 0), a.damage_type(own, 0, 0)), (None, Some(MELEE)));
+        a.on_message(&weapon_updates[1], false);
+        assert_eq!(a.damage_type(own, 6, 0), None, "slot 0x41 is the bag, not a hand");
+        a.on_message(&weapon_updates[2], false);
+        assert_eq!(a.damage_type(own, 6, 0), Some(PROJECTILE));
     }
 }

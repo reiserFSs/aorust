@@ -610,6 +610,11 @@ fn live_walk() {
             "inv" => {
                 let mut v: Vec<_> = l.p.zone.inventory.iter().collect();
                 v.sort_by_key(|e| *e.0);
+                let items: Vec<(u32, i32)> = v.iter().map(|(s, e)| (**s, e.item.low_id)).collect();
+                for (slot, low) in items {
+                    let line = l.p.hud.as_mut().map(|h| h.live_item_line(&mut l.p.gui, low)).unwrap_or_default();
+                    eprintln!("inv item {slot:#x} {line}");
+                }
                 for (slot, e) in v {
                     eprintln!("inv slot {slot:#x}: {e:?}");
                 }

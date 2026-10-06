@@ -113,8 +113,19 @@ Capture `docs/captures/zone_kill_ithaca.rec`, test `module::death_tests::live_ki
 **Loot**: the corpse opens (2 items + Cash +1) but every `MoveItemToInventory` variant is ignored (`docs/captures/zone_loot_own_kill_ithaca.rec`, docs/zone/interact.md §9, §12.3): open.
 **Weapons**: a new character has an empty inventory (no starter items), so wielding / unwielding and the weapon swing lists could not be tried live.
 
-**Loot (fixed, live-verified)**: with the identity of the original (`{0x6b, word << 16 | slot}`, docs/zone/interact.md §9) the server answers the take with
-`ContainerAddItemIIR_t` (`docs/captures/zone_loot_take_ithaca.rec`) and the items land in the bag: "Perfectly Formed Seashell" and "Battered Light Combat Armor Pants" went to bag slots
-0x41 / 0x42, the loot window cells emptied one by one, a "Spinal Section" from an earlier kill was still in slot 0x40 after a relog. Two of the corpses opened were other players' kills
-(the server lets them be looted too); the own kill's loot worked the same way. Not tried live: wear / unwear (the pants were looted at the end of a session and not persisted by the
-server before the relog, `dclick=<slot hex>` harness step exists), weapons (none obtainable without the Borealis key item).
+## Attack sounds, hit reactions (offline-verified, live check pending)
+`docs/zone/combat-anim.md` sections 4 and 6.1: the swing / swish / impact sounds come from the animation notes of the swing clip (`combat/notes.rs`), a miss swings like a hit, a struck character
+plays an `imp-*` clip. Offline evidence: the unit tests listed there (real item records, real swing clips, the captured Beach Leet / player).
+**Live check** (muted, `AOMAC_AUDIO_LOG=1 AOMAC_COMBAT_LOG=1`, steps `goto=hunt`, `Q=0.1`, as in the kill run above): per swing the log must show `combat: note 0x77` / `0xb` (a creature's `attack_start_1`
+and `attack`, the own bare-hand `swish_punch` 0x73 and `attack` 0xb) and, for the own bare hands, `game sound 3238527353 at [..]: N voice(s)` (= `0xc1080179`, the martial-arts swing list 0xb) at the own
+position on a hit (hit kind 3 / 4), only the swish (`SM_Sandy_Swish_punch`) on a miss; 0.4 s after a creature's hit on the own character `game sound <MaleGetsHit / FemaleGetsHit id> at <camera>: N voice(s)
+(material 7, size <0/1/2>)` (size 2 from 6 damage, 1 from 3). A Beach Leet has no `FabricType`, so the own hits on it have no impact sound (a swing sound only); the own `0xd1` hit cue still plays
+`char_sound` without material.
+
+## Live: Atrox, equip, rifle fight, fight sounds (2026-10-06)
+* **Atrox**: the request carried sex 2; the original's `ConvertCCBreedToGCBreedAndSex` (GUI 0x101225f7) sends sex 1 (unisex) for Atrox. With `gender: 1` the server accepted `Aomacvktq` (Atrox Enforcer: `breed 4, gender 1, profession 9, head 40111`).
+* **Equip** (Aomacvolk, Borealis): `dclick=41` wore the "Solar-Powered Assault Rifle" (bag 0x41 -> right hand 6): `ContainerAddItem`, `WeaponItemFullUpdate`, an `AppearanceUpdate` with the rifle mesh; Wear window shows it, the avatar holds the rifle in the rifle stance;
+  `dclick=06` unwears (CharacterAction 0x61), `dclick=41` wears it again; capture `docs/captures/zone_wear_rifle_borealis.rec`.
+* **Rifle fight vs Fresh Engineer**: lines "You hit Fresh Engineer for 4 points of **projectile** damage." (weapon stat 0x1b4 = 0x5a; bare hands print melee), own `combat: note 0xb` + `game sound 3130317467 ... 2 voice(s)`
+  (the weapon's attack sound) per shot and the victim impact `game sound 2934702682 ... (material 7, size 1|2)` 0.4 s after a hit. The character died again (lvl 2, 40 HP vs a lvl 7 engineer).
+* Bare-hands sounds (`0xc1080179` swing sound, swish notes) were not re-run live after the wiring; rifle shots were.

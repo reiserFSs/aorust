@@ -5,5 +5,6 @@ pub mod duel;
 pub mod glue;
 pub mod log;
 pub mod module;
+pub mod notes;
 pub mod stat_names;
 pub mod state;
