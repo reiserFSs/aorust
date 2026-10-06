@@ -14,7 +14,7 @@ use ao_gui::{DrawList, FontId, Gui};
 use ao_net::n3::dynel::{Dynel, SimpleCharFullUpdate};
 use ao_net::n3::misc::Misc;
 use ao_net::n3::motion::{max_speed, AnimState, Mode, Mover, STAT_HEALTH};
-use ao_net::n3::nametag::{name_tag, name_tag_color, NameTagInput, INVALID_STAT};
+use ao_net::n3::nametag::{name_tag, name_tag_color, NameTag, NameTagInput, INVALID_STAT};
 use ao_net::n3::world::World;
 use ao_net::n3::{Message, N3};
 use ao_rdb::RecordStore;
@@ -663,7 +663,7 @@ impl Dynels {
         }
         let own = self.own;
         for (id, c) in &self.chars {
-            if *id != own {
+            if *id != own && !self.asked.contains(&c.key) {
                 self.pending.push(c.look.clone());
             }
         }
@@ -823,6 +823,24 @@ impl Dynels {
             gui.text_cmds(FontId::Shell, &tag.text, x as i32 - tw / 2, y as i32 - fh, u32::from_be_bytes([0, r, g, b]), 1.0, list);
         }
     }
+
+    /// Where the selection indicator (`Indicator_t`, docs/gui.md §13.2) of `id` goes: the head anchor of [`Self::name_tags`]
+    /// projected to GUI pixels, and the tag line the indicator prints. `None` while the dynel has no model yet or is behind the camera.
+    pub fn indicator_anchor(&self, id: i32, cam: &Camera, size: (u32, u32)) -> Option<(f32, f32, NameTag)> {
+        let c = self.chars.get(&id)?;
+        let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return None };
+        let p = scene_pos(c.pose.pos);
+        let (w, h) = (size.0 as f32, size.1.max(1) as f32);
+        let tan = (self.lens.vertical_fov(w / h) * 0.5).tan();
+        let d = ao_render::Vec3::new(p[0], p[1] + built.tag_height * c.scale, p[2]) - cam.pos;
+        let z = d.dot(cam.forward());
+        if z < 0.3 {
+            return None;
+        }
+        let (x, y) = ((0.5 + 0.5 * d.dot(cam.right()) / (z * tan * w / h)) * w, (0.5 - 0.5 * d.dot(cam.up()) / (z * tan)) * h);
+        let tag = name_tag(&NameTagInput { name: &c.name, is_npc: c.npc, flags: c.flags, features: INVALID_STAT, visual_flags: c.visual_flags, side: c.side as i32, ..Default::default() });
+        Some((x, y, tag))
+    }
 }
 
 #[cfg(test)]
@@ -878,6 +896,17 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        // frame cost of the dynel update with every captured dynel in view (skinning at most every 40 ms each)
+        let t = std::time::Instant::now();
+        let n = 200;
+        let mut pushed = 0;
+        for _ in 0..n {
+            z.world.update(0.016, eye, fwd, &mut host);
+            pushed += host.actors.len();
+            host.actors.clear();
+            host.actor_models.clear();
+        }
+        eprintln!("update: {:.3} ms/frame, {} actors/frame", t.elapsed().as_secs_f32() * 1000.0 / n as f32, pushed / n);
         let failed = z.world.models.values().filter(|m| matches!(m, Model::Failed)).count();
         eprintln!("{} models ready, {failed} failed, {} actors, {} props", models.len(), actors.len(), z.world.props.len());
         assert!(!actors.is_empty());
