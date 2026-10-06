@@ -26,7 +26,7 @@ use super::{ground, water, RECORD, TILEMAP};
 pub mod kd;
 mod portal;
 mod vehicle;
-pub use vehicle::{Aligned, Body, Closest, Hit, LiquidEvent, SurfaceState, FOOT_CLEARANCE, RADIUS, SWIM_DEPTH};
+pub use vehicle::{Aligned, Body, Closest, Hit, DEFAULT_BODY_RADIUS, LiquidEvent, SurfaceState, FOOT_CLEARANCE, RADIUS, SWIM_DEPTH};
 
 /// A surface triangle is walkable ground when its normal's y is at least this (Vehicle.dll `EnsureSurfaceAlignment`
 /// @0x1000d1aa, f32 @0x10012134, found by the `Avatar.Movement` RE); steeper faces are walls.

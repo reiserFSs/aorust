@@ -2,11 +2,18 @@
 //! with its dock views, the health / nano / XP bar windows, the window-opening menus (`ActionMenu/*.xml`) and the sub-windows
 //! the other Hud files own. Evidence and layout rules: docs/gui.md §10.
 
+use super::hud_rollup::{Rollup, RollupEvent};
 use super::hud_stats::HudStats;
+use super::hud_winb::HudWinB;
+use super::hud_nano::HudNano;
+use super::hud_ncu::HudNcu;
 use super::hud_map::HudMap;
 pub(super) use super::hud_map::ground_map;
 use super::hud_aggdef::{self, AggDef};
 use super::hud_bar::{self, ShortcutBar, SlotUse};
+use super::hud_actions::HudActions;
+use super::hud_keys::{HudKey, KeyMap};
+use super::hud_pools;
 use super::hud_compass::Compass;
 use super::hud_target::HudTarget;
 use super::zone::Zone;
@@ -38,10 +45,12 @@ pub enum WindowKind {
     Faction,
     /// `stat_window` (`StatView_c`)
     Stat,
+    /// `specialaction_window` (`SpecialActionView_c`, tab "Actions", Ctrl+2)
+    Actions,
 }
 
 impl WindowKind {
-    pub const ALL: [WindowKind; 14] = [
+    pub const ALL: [WindowKind; 15] = [
         WindowKind::Skills,
         WindowKind::Inventory,
         WindowKind::Character,
@@ -55,6 +64,7 @@ impl WindowKind {
         WindowKind::Team,
         WindowKind::Perks,
         WindowKind::Faction,
+        WindowKind::Actions,
         WindowKind::Stat,
     ];
 
@@ -74,6 +84,7 @@ impl WindowKind {
             WindowKind::Team => "team_view",
             WindowKind::Perks => "perk_window",
             WindowKind::Faction => "faction_window",
+            WindowKind::Actions => "specialaction_window",
             WindowKind::Stat => "stat_window",
         }
     }
@@ -205,10 +216,6 @@ mod sid {
     pub const HEALTH: u32 = 27;
     pub const MAX_NANO: u32 = 221;
     pub const NANO: u32 = 214;
-    pub const XP: u32 = 52;
-    pub const LEVEL: u32 = 54;
-    pub const XP_LEVEL_START: u32 = 57;
-    pub const XP_NEXT: u32 = 350;
     pub const ALIEN_XP: u32 = 40;
     pub const ALIEN_XP_NEXT: u32 = 178;
     pub const NCU_USED: u32 = 180;
@@ -217,21 +224,6 @@ mod sid {
     pub const EXPANSION: u32 = 389;
 }
 
-/// Window frames of `prefs/NewChar/Prefs.xml` (`Archive name=… / Rect name=WindowFrame`), the install's template for a new character.
-fn template_frames(dir: &Path) -> HashMap<String, [f32; 4]> {
-    let mut out = HashMap::new();
-    let Some(root) = std::fs::read_to_string(dir.join("prefs/NewChar/Prefs.xml")).ok().and_then(|t| xml::parse(&t).ok()) else { return out };
-    for a in root.children.iter().filter(|c| c.name == "Archive") {
-        let frame = a.children.iter().find(|c| c.name == "Rect" && c.attr("name") == Some("WindowFrame")).and_then(|r| r.attr("value"));
-        if let (Some(n), Some(v)) = (a.attr("name"), frame) {
-            let nums: Vec<f32> = v.trim_start_matches("Rect(").trim_end_matches(')').split(',').filter_map(|p| p.trim().parse().ok()).collect();
-            if nums.len() == 4 {
-                out.insert(n.to_string(), [nums[0], nums[1], nums[2], nums[3]]);
-            }
-        }
-    }
-    out
-}
 
 struct Bar {
     window: WindowId,
@@ -256,14 +248,30 @@ pub(super) struct Hud {
     menu_roots: Vec<MenuNode>,
     popup: Option<Popup>,
     open: Vec<WindowKind>,
+    /// `Life` / `MaxNanoEnergy` computed like `FUN_1006208d` (`hud_pools.rs`).
+    pools: hud_pools::Pools,
     /// Skills / inventory / wear windows (`hud_stats.rs`).
     stats: HudStats,
+    /// The `RollupArea` dock (docs/gui.md §11.13): the wear and stat windows are its pages; other windows dock with `Rollup::open_page`.
+    pub(super) rollup: Rollup,
+    /// Programs and NCU windows (`hud_nano.rs`, `hud_ncu.rs`).
+    nano: HudNano,
+    ncu: HudNcu,
+    /// System-window lines the NCU window produced (the flow prints them).
+    system_lines: Vec<String>,
     /// Playfield map and planet map windows (`hud_map.rs`).
     map: HudMap,
+    /// Team, Perks and Faction windows (`hud_winb.rs`).
+    winb: HudWinB,
     /// Target docks, health-bar windows and click-to-select (`hud_target.rs`).
     target: HudTarget,
     /// Shortcut bars (`hud_bar.rs`).
     shortcuts: Vec<ShortcutBar>,
+    /// The special-action list the hotbar slots and the Actions window show (`hud_actions.rs`).
+    pub(super) actions: HudActions,
+    /// Hot keys from the `KeyBindings` archive (`hud_keys.rs`) and the archive text they were built from.
+    keys: KeyMap,
+    keys_src: String,
     /// The compass window (`hud_compass.rs`).
     compass: Option<Compass>,
     /// The AGG/DEF slider of the right control-centre bar (`hud_aggdef.rs`).
@@ -291,10 +299,10 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, map: HudMap::new(dir), target, shortcuts: vec![], compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
+        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, pools: hud_pools::Pools::new(dir), menu_roots, popup: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), keys: KeyMap::default(), keys_src: String::new(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None };
         hud.target.targets_target = hud.dvalues.flag("Targetstarget");
         hud.fill_docks(gui);
-        hud.create_bars(gui, dir);
+        hud.create_bars(gui);
         for n in 0..hud_bar::default_count(&hud.dvalues) {
             match ShortcutBar::new(gui, dir, n, size) {
                 Ok(b) => hud.shortcuts.push(b),
@@ -302,16 +310,16 @@ impl Hud {
             }
         }
         hud.refresh(gui, &Zone::default());
-        Ok(hud)
-    }
         // the windows the NewChar template opens at the first login (`<Value name="wear_window" value="true">`, `stat_window`; the wear window first, the stat
         // window is placed below it); the other windows of the template (nano, ncu, team) are not implemented by this HUD
         let template = std::fs::read_to_string(dir.join("prefs/NewChar/Prefs.xml")).ok().and_then(|t| xml::parse(&t).ok());
-        for k in [WindowKind::Character, WindowKind::Stat] {
+        for k in [WindowKind::Character, WindowKind::Stat, WindowKind::Team] {
             if template.as_ref().is_some_and(|r| r.children.iter().any(|c| c.name == "Value" && c.attr("name") == Some(k.dvalue()) && c.attr("value") == Some("true"))) {
                 hud.open(gui, k);
             }
         }
+        Ok(hud)
+    }
 
     /// `FUN_1006f098` (0x1006f098): wings, bottom bars and menus go into the dock views of `ControlCenter.xml`.
     fn fill_docks(&mut self, gui: &mut Gui) {
@@ -361,42 +369,43 @@ impl Hud {
         }
     }
 
-    /// `RollupArea` (`DockArea_c`, `ControlCenterModule_c::InitialiseMessage` 0x1006a968): 225 px wide column from y = 20 down to
-    /// the right wing (Rect(W-225, 20, W, H-191)); the rollup dock view carries that size, which pushes the right wing and bar to the
-    /// bottom of the right column. The dock's page windows (friends, wear, nano, stat) are the DockArea windows of the other Hud files.
+    /// `RollupArea` (`DockArea_c`, `ControlCenterModule_c::InitialiseMessage` 0x1006a968): the area is `Rect(W-191, 20, W, H-225)` (asm 0x1006ab32..0x1006ab75: the
+    /// doubles 191 / 225 / the float 20 at 0x101b4e00 / 0x101b4e10 / 0x101b4e08), a 192 px wide column (earlier notes had the constants swapped); the rollup dock view
+    /// carries that width, which pushes the right wing and bar to the bottom of the right column. The dock's pages (friends, wear, nano, stat) are
+    /// `hud_rollup.rs` windows.
     fn fit_rollup_dock(&mut self, gui: &mut Gui) {
         let wing = gui.gfx_id("GFX_GUI_CONTROLCENTER_WING_RIGHT").map_or(194, |g| gui.gfx().size(ao_gui::GfxId(g)).1);
         let h = (self.size.1 as i32 - 5 - (wing as i32 + 5) - (20 + 5)).max(0);
         gui.remove_children(self.cc, "RollupControllerDock");
-        let src = format!("<root><View min_size=\"Point(225,{h})\" max_size=\"Point(225,{h})\"/></root>");
+        let w = super::hud_rollup::AREA_W;
+        let src = format!("<root><View min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></root>");
         if let Err(e) = gui.add_view_xml(self.cc, "RollupControllerDock", "RollupArea", &src) {
             eprintln!("hud: RollupControllerDock: {e:#}");
         }
     }
 
-    /// `CharBarWindow_c` windows (0x1006d7c7): positioned from the install's `prefs/NewChar` frame, then `Window::MoveInsideScreen`.
-    fn create_bars(&mut self, gui: &mut Gui, dir: &Path) {
-        let frames = template_frames(dir);
+    /// `CharBarWindow_c` windows (0x1006d7c7) created by `SlotPlayerCharacterAlive` (GUI 0x1006afed) at the points it passes in: health (0, 0), nano
+    /// (0, Height(health frame) + 20.0), XP (Width(health frame) + 3.0, 0), alien XP (Width(nano frame) + 3.0, Height(XP frame) + 20.0)
+    /// (`_DAT_101ae300` = 20.0, `_DAT_101a8a20` = 3.0, doubles); then `LoadWndConfig` (nothing saved on a first login) and `MoveInsideScreen`.
+    /// The install's `prefs/NewChar` frames are NOT used: they were authored on a 2304 x 1440 screen, no DLL reads that directory, and retail
+    /// screenshots show the pool bars at the left screen edge (docs/gui.md 10.4).
+    fn create_bars(&mut self, gui: &mut Gui) {
         for spec in BARS.iter() {
             let [bg, full, l, r] = spec.gfx;
             let src = format!("<root><PowerBar name=\"bar\" bg_gfx=\"{bg}\" full_gfx=\"{full}\" left_gfx=\"{l}\" right_gfx=\"{r}\" direction=\"up\"/></root>");
             match gui.open_window_xml(spec.cfg, &src, (0, 0), WindowSize::Preferred) {
                 Ok(window) => {
                     let (w, h) = gui.window_size(window);
-                    let (x, y) = match (frames.get(spec.cfg), self.bars.last()) {
-                        (Some(f), _) => (f[0], f[1]),
-                        // UNRESOLVED GUESS: the template has no `CCAlienXPBarConfig` frame and the factory's default is not decompiled; the bar
-                        // sits right of the XP bar (the health / nano bars are 10 px apart), left of it when that leaves the screen.
-                        (None, Some(xp)) => {
-                            let (px, py) = gui.window_pos(xp.window);
-                            let right = px + 10;
-                            ((if right as u32 + w <= self.size.0 { right } else { px - 10 }) as f32, py as f32)
-                        }
-                        (None, None) => (0.0, 0.0),
+                    let size = |cfg: &str| self.bars.iter().find(|b| b.spec.cfg == cfg).map(|b| gui.window_size(b.window)).unwrap_or((w, h));
+                    let (x, y) = match spec.cfg {
+                        "CCNanoBarConfig" => (0, size("CCHealthBarConfig").1 as i32 + 20),
+                        "CCXPBarConfig" => (size("CCHealthBarConfig").0 as i32 + 3, 0),
+                        "CCAlienXPBarConfig" => (size("CCNanoBarConfig").0 as i32 + 3, size("CCXPBarConfig").1 as i32 + 20),
+                        _ => (0, 0),
                     };
-                    let x = x.min(self.size.0.saturating_sub(w) as f32).max(0.0);
-                    let y = y.min(self.size.1.saturating_sub(h) as f32).max(0.0);
-                    gui.set_window_pos(window, (x as i32, y as i32));
+                    let x = x.min(self.size.0.saturating_sub(w) as i32).max(0);
+                    let y = y.min(self.size.1.saturating_sub(h) as i32).max(0);
+                    gui.set_window_pos(window, (x, y));
                     self.bars.push(Bar { window, spec });
                 }
                 Err(e) => eprintln!("hud: {}: {e:#}", spec.cfg),
@@ -407,9 +416,13 @@ impl Hud {
     pub(super) fn resize(&mut self, gui: &mut Gui, size: (u32, u32)) {
         if size != self.size {
             self.size = size;
+            self.stats.set_screen(size);
+            self.rollup.set_screen(gui, size);
+            self.winb.set_screen(size);
+            self.nano.set_screen(size);
+            self.ncu.set_screen(size);
             gui.resize_window(self.cc, WindowSize::Fixed(size.0, size.1));
             for s in &mut self.shortcuts {
-            self.stats.set_screen(size);
                 s.resize(gui, size);
             }
             self.fit_rollup_dock(gui);
@@ -427,6 +440,21 @@ impl Hud {
         }
     }
 
+    /// System-window lines to print (the NCU window's remove feedback, `GlobalSignals+0x17c`).
+    pub(super) fn take_system_lines(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.system_lines)
+    }
+
+    /// The zone frames [`Hud::on_zone_frame`] reads (the flow keeps them until the HUD exists).
+    pub(super) fn wants_zone_frame(f: &Frame) -> bool {
+        super::hud_winb::wants(f)
+    }
+
+    /// Every zone frame: team members / invitations, the own perk map and perk updates (`hud_winb.rs`).
+    pub(super) fn on_zone_frame(&mut self, f: &Frame, own: i32) {
+        self.winb.on_zone_frame(f, own);
+    }
+
     /// Zone frames produced by the HUD since the last call.
     pub(super) fn take_outbox(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.outbox)
@@ -436,6 +464,18 @@ impl Hud {
     /// The character a world click selected since the last call (CTRL/ALT + click also attacks it: `FUN_1002c469`).
     pub(super) fn take_click(&mut self) -> Option<i32> {
         self.click.take()
+    }
+
+    /// The character a Shift + click asked the info page of since the last call (`ShowURL("charid://50000/<id>")`, hud_target.rs).
+    pub(super) fn take_info(&mut self) -> Option<i32> {
+        self.target.info.take()
+    }
+
+    /// The game's own mouse pointer over the world (`MousePointerModule_t`, hud_cursor.rs); appended to the frame's draw list.
+    pub(super) fn draw_cursor(&mut self, gui: &Gui, zone: &Zone, host: &mut ao_render::Host, list: &mut ao_gui::DrawList) {
+        let mode = self.dvalues.get_i64("MouseCursorMode").unwrap_or(2);
+        let dblclick = self.dvalues.get_i64("DoubleclickAction").is_none_or(|v| v != 0);
+        self.target.draw_cursor(gui, zone, host, list, self.size, mode, dblclick);
     }
 
     pub(super) fn take_uses(&mut self) -> Vec<SlotUse> {
@@ -478,17 +518,15 @@ impl Hud {
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
         self.refresh(gui, zone);
+        self.pools.apply(zone);
         let st = |id: u32| zone.stat(id).unwrap_or(0);
-        let frac = |cur: i32, max: i32| if max <= 0 { 0.0 } else { (cur as f32 / max as f32).min(1.0) };
-        let level = st(sid::LEVEL);
-        let xp_base = st(sid::XP_LEVEL_START);
+        let xp = hud_pools::xp(|id| st(id));
         let values = [
-            frac(st(sid::HEALTH), st(sid::MAX_HEALTH)),
-            frac(st(sid::NANO), st(sid::MAX_NANO)),
-            frac(st(sid::XP) - xp_base, st(sid::XP_NEXT) - xp_base),
-            frac(st(sid::ALIEN_XP), st(sid::ALIEN_XP_NEXT)),
+            hud_pools::ratio(st(sid::HEALTH), st(sid::MAX_HEALTH)),
+            hud_pools::ratio(st(sid::NANO), st(sid::MAX_NANO)),
+            hud_pools::ratio(xp.0, xp.1),
+            hud_pools::ratio(st(sid::ALIEN_XP), st(sid::ALIEN_XP_NEXT)),
         ];
-        let _ = level;
         for (b, v) in self.bars.iter().zip(values) {
             gui.set_progress(b.window, "bar", v);
         }
@@ -498,7 +536,7 @@ impl Hud {
         let tips = [
             (&self.bar_titles[0], st(sid::HEALTH), st(sid::MAX_HEALTH)),
             (&self.bar_titles[1], st(sid::NANO), st(sid::MAX_NANO)),
-            (&self.bar_titles[2], st(sid::XP) - xp_base, st(sid::XP_NEXT) - xp_base),
+            (&self.bar_titles[2], xp.0, xp.1),
             (&self.bar_titles[3], st(sid::ALIEN_XP), st(sid::ALIEN_XP_NEXT)),
         ];
         for (b, (t, cur, max)) in self.bars.iter().zip(tips) {
@@ -507,20 +545,40 @@ impl Hud {
         gui.set_text(self.cc, "cash", &group(st(sid::CASH)));
         gui.set_text(self.cc, "ncu", &format!("{}/{}", st(sid::NCU_USED), st(sid::NCU_MAX)));
         self.stats.update(gui, zone, _dt);
+        self.nano.update(gui, zone, _dt);
+        self.ncu.update(gui, zone, _dt);
+        self.outbox.extend(self.nano.take_outbox());
+        self.outbox.extend(self.ncu.take_outbox());
+        self.system_lines.extend(self.ncu.take_lines());
         self.map.update(gui, zone, _dt);
+        self.winb.update(gui, zone, _dt);
+        self.outbox.extend(self.winb.take_outbox());
+        self.system_lines.extend(self.winb.take_lines());
         self.target.update(gui, zone, _dt);
         self.aggdef.update(gui, self.cc, zone.stat(ao_net::n3::outgoing::STAT_AGG_DEF as u32));
         if let Some(c) = &mut self.compass {
             c.update(gui, zone);
         }
+        // the special-action list (equipment, recharge) and the hotbar slots following it (`hud_actions.rs`, `hud_bar.rs`)
+        self.actions.update(zone, _dt);
+        let changes = self.actions.list.take_changes();
+        let locked = self.dvalues.flag("LockHotbars");
+        let timers = (self.dvalues.flag("IconTimers"), self.dvalues.flag("IconTimerText"));
+        for s in &mut self.shortcuts {
+            s.update(gui, _dt, &self.actions.list, &changes, locked, timers);
+        }
     }
 
     /// Mouse-down outside an open sub menu closes it (the original's popup menus lose focus).
-    pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, ev: &InputEvent, cam: &ao_render::Camera, lens: &ao_scene::Lens) {
-        let locked = self.dvalues.flag("LockHotbars");
+    pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, ev: &InputEvent, cam: &ao_render::Camera, lens: &ao_scene::Lens, mods: ao_gui::Modifiers) {
         for s in &mut self.shortcuts {
-            s.input(gui, ev, locked);
+            s.input(gui, ev, &self.actions.list, mods);
+            self.uses.extend(s.take_uses());
         }
+        // item drag and drop between the wear window and the inventory (hud_stats/item_ui.rs)
+        self.stats.input(gui, zone, ev);
+        self.rollup.input(gui, ev);
+        self.outbox.extend(self.stats.take_outbox());
         // the slider's release is `N3Msg_SetAggDef` -> `SetStat(0x33)`: applied to the own stats at once, then sent
         if let Some(v) = self.aggdef.input(gui, self.cc, ev) {
             zone.stats.insert(ao_net::n3::outgoing::STAT_AGG_DEF as u32, v);
@@ -529,8 +587,10 @@ impl Hud {
         }
         // target docks, world click-to-select (hud_target.rs) and the Tab target keys
         if let Some(pos) = self.target.input(gui, zone, ev) {
-            if self.target.world_click(zone, cam, lens, self.size, pos) {
-                self.click = zone.target;
+            match self.target.world_click(zone, cam, lens, self.size, pos, mods) {
+                Some(super::hud_target::WorldClick::Select(id)) => self.click = Some(id),
+                Some(super::hud_target::WorldClick::Info(id)) => self.target.info = Some(id),
+                None => {}
             }
         }
         if std::mem::take(&mut self.target.attack) {
@@ -540,15 +600,11 @@ impl Hud {
             if gui.focused_view().is_none() {
                 self.target.key(zone, *key, *mods);
             }
-        if std::mem::take(&mut self.target.attack) {
-            self.uses.push(SlotUse::SpecialAction(0xb));
         }
-        }
-        // window hotkeys (controls::WINDOW_BINDINGS); the viewer sends one press per key stroke, `! TextInputMode`: a focused text field swallows them
+        // window / hotbar hot keys from the `KeyBindings` archive (hud_keys.rs); the viewer sends one press per key stroke, `! TextInputMode`: a focused
+        // text field swallows them
         if let (InputEvent::Key { key: ao_gui::Key::Letter(c), pressed: true, mods }, false) = (ev, gui.text_focused()) {
-            if let Some(kind) = super::controls::window_for_key(*c, *mods) {
-                self.toggle(gui, kind);
-            }
+            self.hot_key(gui, *c, *mods);
         }
         if let (Some(p), InputEvent::MouseDown { x, y, button: MouseButton::Left }) = (&self.popup, ev) {
             let pos = gui.window_pos(p.window);
@@ -561,6 +617,50 @@ impl Hud {
         }
     }
 
+    /// A character key press: every provider the `KeyBindings` archive binds to it (`hud_keys.rs`). The map is rebuilt when the archive in the
+    /// DValue store changed (the saved character prefs are loaded after the HUD is created).
+    fn hot_key(&mut self, gui: &mut Gui, c: char, mods: ao_gui::Modifiers) {
+        if let Some(super::dvalue::Variant::Archive(text)) = self.dvalues.get("KeyBindings") {
+            if *text != self.keys_src {
+                self.keys = KeyMap::from_archive(text);
+                self.keys_src = text.clone();
+            }
+        }
+        for k in self.keys.lookup(c, mods) {
+            match k {
+                HudKey::Window(kind) => self.toggle(gui, kind),
+                HudKey::BarActive(n) => {
+                    if let Some(s) = self.shortcuts.iter_mut().find(|s| s.is_active()) {
+                        s.use_slot(n, &self.actions.list);
+                        self.uses.extend(s.take_uses());
+                    }
+                }
+                // `SHORTUCT_BAR_ROW_n` scrolls the bar's list view to row `n` (`FUN_100d85fb`): the bars have one row here (UNRESOLVED, docs/gui.md §10.5)
+                HudKey::BarRow(_) => {}
+                HudKey::BarSelect(n) => {
+                    if n < self.shortcuts.len() {
+                        for (i, s) in self.shortcuts.iter_mut().enumerate() {
+                            s.set_primary(gui, i == n);
+                        }
+                    }
+                }
+                HudKey::BarSlot(b, slot) => {
+                    if let Some(s) = self.shortcuts.get_mut(b) {
+                        s.use_slot(slot, &self.actions.list);
+                        self.uses.extend(s.take_uses());
+                    }
+                }
+            }
+        }
+    }
+
+    /// `/macro` (`GlobalSignals+0x1a0` -> `ShortcutBarWindow_c` `FUN_100d82d4`): the created macro `{0xc789, id}` is dragged by the first shortcut bar.
+    pub(super) fn begin_macro_drag(&mut self, gui: &mut Gui, id: i32, name: &str, command: &str) {
+        if let Some(s) = self.shortcuts.first_mut() {
+            s.begin_macro_drag(gui, id, name, command);
+        }
+    }
+
     /// `true` when the event was consumed by the HUD.
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
         if self.map.event(gui, ev, zone) {
@@ -569,20 +669,43 @@ impl Hud {
             }
             return true;
         }
+        match self.rollup.event(gui, ev) {
+            Some(RollupEvent::Closed(key)) => {
+                if let Some(k) = WindowKind::from_dvalue(&key) {
+                    self.close_kind(gui, k);
+                }
+                return true;
+            }
+            Some(RollupEvent::Handled) => return true,
+            None => {}
+        }
         if self.stats.event(gui, ev, zone) {
             for k in self.stats.take_closed() {
                 self.close_kind(gui, k);
             }
+            self.outbox.extend(self.stats.take_outbox());
             return true;
         }
-        for s in &mut self.shortcuts {
-            if s.event(ev) {
-                self.uses.extend(s.take_uses());
-                return true;
+        if self.nano.event(gui, ev, zone) {
+            for k in self.nano.take_closed() {
+                self.close_kind(gui, k);
             }
+            return true;
+        }
+        if self.ncu.event(gui, ev, zone) {
+            for k in self.ncu.take_closed() {
+                self.close_kind(gui, k);
+            }
+            return true;
+        }
+        let mut closed = vec![];
+        if self.winb.event(gui, ev, zone, &mut closed) || !closed.is_empty() {
+            for k in closed {
+                self.close_kind(gui, k);
+            }
+            return true;
         }
         let Event::Clicked { window, view, .. } = ev else { return false };
-            self.outbox.extend(self.stats.take_outbox());
         let popup = self.popup.as_ref().map(|p| p.window);
         if *window != self.cc && Some(*window) != popup {
             return false;
@@ -649,8 +772,15 @@ impl Hud {
     pub(super) fn open(&mut self, gui: &mut Gui, kind: WindowKind) {
         self.dvalues.set_i64(kind.dvalue(), 1);
         gui.set_cc_active(self.cc, kind.dvalue(), true);
-        self.stats.open(gui, kind);
+        self.stats.open(gui, &mut self.rollup, kind);
+        if HudNano::handles(kind) {
+            self.nano.open(gui, &mut self.rollup);
+        }
+        if HudNcu::handles(kind) {
+            self.ncu.open(gui);
+        }
         self.map.open(gui, kind);
+        self.winb.open(gui, kind);
         if !self.open.contains(&kind) {
             self.open.push(kind);
         }
@@ -659,8 +789,15 @@ impl Hud {
     pub(super) fn close_kind(&mut self, gui: &mut Gui, kind: WindowKind) {
         self.dvalues.set_i64(kind.dvalue(), 0);
         gui.set_cc_active(self.cc, kind.dvalue(), false);
-        self.stats.close(gui, kind);
+        self.stats.close(gui, &mut self.rollup, kind);
+        if HudNano::handles(kind) {
+            self.nano.close(gui, &mut self.rollup);
+        }
+        if HudNcu::handles(kind) {
+            self.ncu.close(gui);
+        }
         self.map.close(gui, kind);
+        self.winb.close(gui, kind);
         self.open.retain(|k| *k != kind);
     }
 
@@ -688,6 +825,21 @@ impl Hud {
         self.open.contains(&kind)
     }
 
+    /// A dvalue of the control centre menus as a flag (`friends_window`, `lft_window`: windows the chat module owns).
+    pub(super) fn dvalue(&self, name: &str) -> bool {
+        self.dvalues.flag(name)
+    }
+
+    pub(super) fn set_dvalue(&mut self, gui: &mut Gui, name: &str, on: bool) {
+        self.dvalues.set_i64(name, on as i64);
+        gui.set_cc_active(self.cc, name, on);
+        if let Some(k) = WindowKind::from_dvalue(name) {
+            if !on {
+                self.open.retain(|o| *o != k);
+            }
+        }
+    }
+
     /// Closes the HUD windows (leaving the world).
     pub(super) fn close(mut self, gui: &mut Gui) {
         if let Some(p) = &self.popup {
@@ -696,8 +848,12 @@ impl Hud {
         for b in &self.bars {
             gui.close_window(b.window);
         }
-        self.stats.close_all(gui);
+        self.stats.close_all(gui, &mut self.rollup);
+        self.rollup.close_all(gui);
+        self.nano.close(gui, &mut self.rollup);
+        self.ncu.close(gui);
         self.map.close_all(gui);
+        self.winb.close_all(gui);
         for s in self.shortcuts {
             s.close(gui);
         }
@@ -750,7 +906,7 @@ mod tests {
             &self.gui
         }
         fn input(&mut self, ev: InputEvent, host: &mut Host) {
-            self.hud.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default());
+            self.hud.input(&mut self.gui, &mut self.zone, &ev, &host.camera, &host.lens.unwrap_or_default(), host.mods);
             for e in self.gui.input(ev) {
                 self.hud.event(&mut self.gui, &e, &self.zone);
             }
@@ -801,19 +957,21 @@ mod tests {
         assert!(!s.hud.target.targets_target);
     }
 
-    /// `CCAlienXPBarConfig` has no saved frame in the NewChar template: the bar must not fall back to the screen corner (live 2026-10-06 showed it at 0,0),
-    /// it sits beside the XP bar and never on top of it, also when the XP frame had to be clamped.
+    /// `SlotPlayerCharacterAlive` (GUI 0x1006afed) points: health (0,0), nano (0, H+20), XP (W+3, 0), alien XP (W+3, H+20) for every screen size.
     #[test]
-    fn alien_bar_sits_beside_the_xp_bar() {
+    fn bars_sit_at_the_code_default_points() {
         for size in [(1280, 800), (1920, 1080)] {
             let Some((s, _)) = shot(size) else { return };
-            let pos = |cfg: &str| {
+            let at = |cfg: &str| {
                 let b = s.hud.bars.iter().find(|b| b.spec.cfg == cfg).unwrap();
-                s.gui.window_pos(b.window)
+                (s.gui.window_pos(b.window), s.gui.window_size(b.window))
             };
-            let (xp, alien) = (pos("CCXPBarConfig"), pos("CCAlienXPBarConfig"));
-            assert_eq!(alien.1, xp.1, "{size:?}");
-            assert_eq!((alien.0 - xp.0).abs(), 10, "{size:?}");
+            let (health, nano, xp, alien) = (at("CCHealthBarConfig"), at("CCNanoBarConfig"), at("CCXPBarConfig"), at("CCAlienXPBarConfig"));
+            let (w, h) = health.1;
+            assert_eq!(health.0, (0, 0), "{size:?}");
+            assert_eq!(nano.0, (0, h as i32 + 20), "{size:?}");
+            assert_eq!(xp.0, (w as i32 + 3, 0), "{size:?}");
+            assert_eq!(alien.0, (w as i32 + 3, h as i32 + 20), "{size:?}");
         }
     }
 
@@ -828,6 +986,12 @@ mod tests {
         assert!(s.hud.is_open(WindowKind::Map));
         s.input(key('6', ctrl), &mut o.host);
         assert!(!s.hud.is_open(WindowKind::Map));
+        // Ctrl+9 = `WINDOW_STAT`: the stat window is open from the start (NewChar template), so the first press closes it
+        assert!(s.hud.is_open(WindowKind::Stat));
+        s.input(key('9', ctrl), &mut o.host);
+        assert!(!s.hud.is_open(WindowKind::Stat));
+        s.input(key('9', ctrl), &mut o.host);
+        assert!(s.hud.is_open(WindowKind::Stat));
         s.input(key('p', none), &mut o.host);
         assert!(s.hud.is_open(WindowKind::PlanetMap) && !s.hud.is_open(WindowKind::Perks));
         s.input(key('p', ao_gui::Modifiers { shift: true, ..none }), &mut o.host);
@@ -837,12 +1001,6 @@ mod tests {
         // typing a name into a text field must not open windows
         let w = s.gui.open_window("LoginWindow", (0, 0), WindowSize::Preferred).unwrap();
         s.gui.focus(w, "username");
-        // Ctrl+9 = `WINDOW_STAT`: the stat window is open from the start (NewChar template), so the first press closes it
-        assert!(s.hud.is_open(WindowKind::Stat));
-        s.input(key('9', ctrl), &mut o.host);
-        assert!(!s.hud.is_open(WindowKind::Stat));
-        s.input(key('9', ctrl), &mut o.host);
-        assert!(s.hud.is_open(WindowKind::Stat));
         assert!(s.gui.text_focused());
         s.input(key('p', none), &mut o.host);
         s.input(key('6', ctrl), &mut o.host);
@@ -874,7 +1032,7 @@ mod tests {
     /// One input event through the HUD and the GUI, like `Shot::input`.
     fn send(s: &mut Shot, ev: InputEvent) {
         let cam = ao_render::Camera::look_at(glam::Vec3::ZERO, -glam::Vec3::Z);
-        s.hud.input(&mut s.gui, &mut s.zone, &ev, &cam, &ao_scene::Lens::default());
+        s.hud.input(&mut s.gui, &mut s.zone, &ev, &cam, &ao_scene::Lens::default(), Default::default());
         for e in s.gui.input(ev) {
             s.hud.event(&mut s.gui, &e, &s.zone);
         }
@@ -956,19 +1114,26 @@ mod tests {
         assert_eq!(s.hud.shortcuts[0].icon_count(), 5, "four rdb icons and the macro icon");
         png(&mut s, &mut o, "hud-hotbar");
         let win = s.hud.shortcuts[0].window;
-        let mut click = |s: &mut Shot, v: &str| {
-            let e = Event::CanvasClick { window: win, view: v.into(), x: 1.0, y: 1.0 };
-            s.hud.event(&mut s.gui, &e, &s.zone);
-        };
-        click(&mut s, "slot0");
-        click(&mut s, "slot3");
-        click(&mut s, "slot5");
-        assert_eq!(s.hud.take_uses(), vec![SlotUse::SpecialAction(0xb), SlotUse::Macro("/follow".into())]);
-        // drag slot 1 onto slot 5, then slot 5 out of the bar
         let (wx, wy) = s.gui.window_pos(win);
         let at = |i: usize| (wx as f32 + 43.0 + 36.0 * i as f32 + 17.0, wy as f32 + 19.0);
+        // use fires on the release of a short press (`FUN_10040a17`), never on the press; empty slots do nothing
+        for i in [0, 3, 5] {
+            let (x, y) = at(i);
+            send(&mut s, InputEvent::MouseDown { x, y, button: MouseButton::Left });
+            assert!(s.hud.take_uses().is_empty(), "no use on the press");
+            send(&mut s, InputEvent::MouseUp { x, y, button: MouseButton::Left });
+        }
+        assert_eq!(s.hud.take_uses(), vec![SlotUse::SpecialAction(0xb), SlotUse::Macro("/follow".into())]);
+        // a slot held for 0.3 s is dragged without moving and its release is no use
+        let (x0, y0) = at(0);
+        send(&mut s, InputEvent::MouseDown { x: x0, y: y0, button: MouseButton::Left });
+        s.hud.update(&mut s.gui, &mut s.zone, 0.4);
+        send(&mut s, InputEvent::MouseUp { x: x0, y: y0, button: MouseButton::Left });
+        assert!(s.hud.take_uses().is_empty());
+        // drag slot 1 onto slot 5, then slot 5 out of the bar
         let ((x1, y), (x5, _)) = (at(1), at(5));
         send(&mut s, InputEvent::MouseDown { x: x1, y, button: MouseButton::Left });
+        s.hud.update(&mut s.gui, &mut s.zone, 0.4);
         send(&mut s, InputEvent::MouseMove { x: x1 + 20.0, y });
         send(&mut s, InputEvent::MouseMove { x: x5, y });
         png(&mut s, &mut o, "hud-hotbar-dragging");
@@ -976,9 +1141,34 @@ mod tests {
         assert_eq!(s.hud.shortcuts[0].slot_names()[1], "");
         assert_eq!(s.hud.shortcuts[0].slot_names()[5], "Walk");
         send(&mut s, InputEvent::MouseDown { x: x5, y, button: MouseButton::Left });
+        s.hud.update(&mut s.gui, &mut s.zone, 0.4);
         send(&mut s, InputEvent::MouseMove { x: x5 + 10.0, y: y + 200.0 });
         send(&mut s, InputEvent::MouseUp { x: x5 + 10.0, y: y + 200.0, button: MouseButton::Left });
         assert_eq!(s.hud.shortcuts[0].slot_names()[5], "");
         png(&mut s, &mut o, "hud-hotbar-after");
+    }
+
+    /// `/macro`: the new macro is dragged with the macro icon, a drop on a slot stores `{0xc789, id}` (use runs the command), a drop outside the bar discards it.
+    #[test]
+    fn macro_drag_drops_on_slot_or_is_discarded() {
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        let win = s.hud.shortcuts[0].window;
+        let (wx, wy) = s.gui.window_pos(win);
+        let at = |i: usize| (wx as f32 + 43.0 + 36.0 * i as f32 + 17.0, wy as f32 + 19.0);
+        let (x6, y) = at(6);
+        send(&mut s, InputEvent::MouseMove { x: x6 - 50.0, y });
+        s.hud.begin_macro_drag(&mut s.gui, 7, "Hi", "/say hi");
+        send(&mut s, InputEvent::MouseMove { x: x6, y });
+        png(&mut s, &mut o, "hud-macro-drag");
+        send(&mut s, InputEvent::MouseUp { x: x6, y, button: MouseButton::Left });
+        assert_eq!(s.hud.shortcuts[0].slot_names()[6], "Hi");
+        assert_eq!(s.hud.shortcuts[0].icon_count(), 6, "the macro shows GFX_GUI_ICON_MACRO");
+        s.hud.event(&mut s.gui, &Event::CanvasClick { window: win, view: "slot6".into(), x: 1.0, y: 1.0 }, &s.zone);
+        assert_eq!(s.hud.take_uses(), vec![SlotUse::Macro("/say hi".into())]);
+        // dropped outside the bar: discarded, the bar is unchanged
+        s.hud.begin_macro_drag(&mut s.gui, 8, "Gone", "/x");
+        send(&mut s, InputEvent::MouseUp { x: x6, y: y + 300.0, button: MouseButton::Left });
+        assert!(!s.hud.shortcuts[0].slot_names().contains(&"Gone".to_string()));
+        assert_eq!(s.hud.shortcuts[0].slot_names()[6], "Hi");
     }
 }

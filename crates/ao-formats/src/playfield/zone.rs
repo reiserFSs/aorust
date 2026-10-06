@@ -27,15 +27,8 @@ enum Kind {
 impl ZoneLocator {
     /// Zone containing the scene-space point (scene z is the negated AO world z).
     pub fn zone_at(&self, scene_pos: [f32; 3]) -> Option<usize> {
-        let (x, z) = (scene_pos[0], -scene_pos[2]);
         match &self.kind {
-            Kind::Grid { cell, zs, w, h } => {
-                if x < 0.0 || z < 0.0 || x > *w as f32 * cell || z > *h as f32 * cell {
-                    return Some(0);
-                }
-                let (col, row) = (((x / cell).floor() as usize) / zs, ((z / cell).floor() as usize) / zs);
-                Some(row * (w / zs).max(1) + col)
-            }
+            Kind::Grid { cell, zs, w, h } => Some(grid_zone(*cell, *zs, *w, *h, scene_pos)),
             Kind::Rooms { .. } => Some(self.room_at(scene_pos).unwrap_or(0)),
         }
     }
@@ -50,6 +43,16 @@ impl ZoneLocator {
         let p = [scene_pos[0], scene_pos[1], -scene_pos[2]];
         rooms.iter().position(|(r, min_floor)| room_contains(gnda, r, *min_floor, p))
     }
+}
+
+/// Outdoor zone index of a scene-space point (`n3Playfield_t::GetZoneInstance`): the zone grid in statel file order, 0 outside the map.
+pub(super) fn grid_zone(cell: f32, zs: usize, w: usize, h: usize, scene_pos: [f32; 3]) -> usize {
+    let (x, z) = (scene_pos[0], -scene_pos[2]);
+    if x < 0.0 || z < 0.0 || x > w as f32 * cell || z > h as f32 * cell {
+        return 0;
+    }
+    let (col, row) = (((x / cell).floor() as usize) / zs, ((z / cell).floor() as usize) / zs);
+    row * (w / zs).max(1) + col
 }
 
 /// Rotation of the room frame by `rot` quarter turns about +Y (`FUN_1003afac` table): `x' = x cos + z sin`,

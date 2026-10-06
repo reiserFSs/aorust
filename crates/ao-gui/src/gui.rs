@@ -15,6 +15,7 @@ use crate::view::*;
 use crate::xml;
 
 mod cc;
+mod button;
 mod checkbox;
 mod canvas;
 mod frame;

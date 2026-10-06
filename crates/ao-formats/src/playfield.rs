@@ -71,6 +71,9 @@ pub struct SoundEmitter {
 /// What a load produced and what it had to skip.
 #[derive(Debug, Default, Clone)]
 pub struct Report {
+    /// The playfield's layout is `Layout::Dungeon` (no outdoor heightfield): `N3Msg_IsDungeon`, which turns the `Entering ...` line of
+    /// `TeleportEndedMessage` into `EnteringNewArea` (docs/zone/world.md §10.2).
+    pub dungeon: bool,
     /// Ambient sound sources of the whole playfield (global and per zone/room).
     pub sounds: Vec<SoundEmitter>,
     /// Local fog volumes of the whole playfield (also in `Scene::fog_model`).
@@ -141,7 +144,8 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
         sky::emit_distant(t, store, &mut scene, day_time);
     }
     scene.environment = Some(environment);
-    let mut report = Report::default();
+    let dungeon = !rec.is_outdoor();
+    let mut report = Report { dungeon, ..Report::default() };
     let mut spot = None;
     let mut terrain = None;
     let mut grid = None;

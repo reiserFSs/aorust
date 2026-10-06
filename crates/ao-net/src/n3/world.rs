@@ -7,7 +7,7 @@
 //! the body is the class's `ReadSubClass` (Gamecode.dll vtable slot 7).
 
 use super::dynel::{ClothData as WornCloth, TextureData};
-use super::N3Header;
+use super::{spells, N3Header};
 use crate::msg::Identity;
 use crate::wire::Reader;
 use anyhow::{bail, Result};
@@ -76,7 +76,7 @@ fn rest_after(word: u32, r: &mut Reader) -> Result<Vec<u8>> {
 }
 
 /// Read a `(count + 1) * 0x3F1` size word; returns the word and the count.
-fn counted(r: &mut Reader) -> Result<(u32, usize)> {
+pub(super) fn counted(r: &mut Reader) -> Result<(u32, usize)> {
     let w = r.u32()?;
     if w == 0 || w % UNIT != 0 {
         bail!("container size word {w:#x} is not (n+1)*0x3f1");
@@ -85,7 +85,7 @@ fn counted(r: &mut Reader) -> Result<(u32, usize)> {
 }
 
 /// A count read from the wire must be satisfiable by the bytes that are left.
-fn fits(n: usize, elem: usize, r: &Reader) -> Result<()> {
+pub(super) fn fits(n: usize, elem: usize, r: &Reader) -> Result<()> {
     if n.checked_mul(elem).is_none_or(|b| b > r.remaining()) {
         bail!("{n} elements of {elem} bytes do not fit in {} remaining bytes", r.remaining());
     }
@@ -98,7 +98,7 @@ fn id_pairs(r: &mut Reader) -> Result<Vec<(u32, i32)>> {
     (0..n).map(|_| Ok((r.u32()?, r.i32()?))).collect()
 }
 
-fn identities(r: &mut Reader) -> Result<Vec<Identity>> {
+pub(super) fn identities(r: &mut Reader) -> Result<Vec<Identity>> {
     let (_, n) = counted(r)?;
     fits(n, 8, r)?;
     (0..n).map(|_| Identity::read(r)).collect()
@@ -286,7 +286,7 @@ pub(crate) fn read_inventory(r: &mut Reader) -> Result<Vec<InventoryEntry>> {
 
 /// `FullCharacterIIR_t::ReadSubClass` (GC 0x10073881). Reading stops (and `rest` holds the
 /// unread bytes, starting with the size word/flag that could not be decoded) at the first
-/// non-empty equipment block, spell list or perk map: their element layouts (`SpellData_t`, perk
+/// non-empty equipment block, perk map or a spell list holding a spell kind that `spells::read_spell` cannot read: those layouts (perk
 /// entries, team blocks) are not decoded yet; every capture has them empty. The inventory
 /// (`InventoryEntry`) is decoded from the client code only: every capture has it empty
 /// (unit test on synthetic bytes).
@@ -315,6 +315,8 @@ pub struct FullCharacter {
     pub list_6c: Vec<Identity>,
     /// `this+0x70`: inventory elements in wire order.
     pub inventory: Vec<InventoryEntry>,
+    /// `this+0x78`: the active spells (empty in every capture).
+    pub spells: Vec<spells::Spell>,
     pub rest: Vec<u8>,
 }
 
@@ -379,13 +381,27 @@ impl FullCharacter {
             return Ok(());
         }
         self.list_6c = identities(r)?;
-        // this+0x78 spell list (GameData SpellData_t, type-tagged) and this+0x90 perk map.
-        for _ in 0..2 {
-            let (w, n) = counted(r)?;
-            if n != 0 {
-                self.rest = rest_after(w, r)?;
-                return Ok(());
+        // this+0x78 spell list (`FUN_100a6c58`: `GameData::SpellData_t` records, decoded by `super::spells::read_spell`). `FUN_10073a2f` runs it on the
+        // character after the stats (`vtable +0x30`, `FUN_100026d0`): the active effects whose bonuses `GetSkill(stat, 2)` adds. A list this decoder cannot
+        // read (a spell of the not decoded kinds) stays in `rest` like before.
+        let (w, n) = counted(r)?;
+        if n != 0 {
+            let mut probe = r.clone();
+            match (0..n).map(|_| spells::read_spell(&mut probe)).collect::<Result<Vec<_>>>() {
+                Ok(v) => {
+                    self.spells = v;
+                    *r = probe;
+                }
+                Err(_) => {
+                    self.rest = rest_after(w, r)?;
+                    return Ok(());
+                }
             }
+        }
+        // this+0x90 perk map
+        let (w, n) = counted(r)?;
+        if n != 0 {
+            self.rest = rest_after(w, r)?;
         }
         Ok(())
     }
@@ -639,11 +655,12 @@ pub struct OrgInfo {
 }
 
 /// `QuestFullUpdateIIR_t` (GC 0x100aca12): `QuestList` (`FUN_100abd64`: size word, per quest an
-/// `Identity` + body `FUN_100ab951`) then a `u8` flag. Quest bodies are not decoded: a
-/// non-empty list leaves everything after the size word in `rest` (`flag` is then 0).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Identity` + body `FUN_100ab951`) then a `u8` flag. The quests are decoded by [`super::quest`] (layout from the disassembly, no capture has a
+/// mission); when that fails the list stays undecoded: everything after the size word is in `rest` (`flag` is then 0, `quests` empty).
+#[derive(Debug, Clone, PartialEq)]
 pub struct QuestFullUpdate {
     pub quest_count: usize,
+    pub quests: Vec<super::quest::Quest>,
     pub flag: u8,
     pub rest: Vec<u8>,
 }
@@ -652,9 +669,14 @@ impl QuestFullUpdate {
     fn read(r: &mut Reader) -> Result<Self> {
         let (w, n) = counted(r)?;
         if n != 0 {
-            return Ok(Self { quest_count: n, flag: 0, rest: rest_after(w, r)? });
+            let saved = r.clone();
+            match super::quest::quest_list(r, n).and_then(|q| Ok((q, r.u8()?))) {
+                Ok((quests, flag)) => return Ok(Self { quest_count: n, quests, flag, rest: vec![] }),
+                Err(_) => *r = saved,
+            }
+            return Ok(Self { quest_count: n, quests: vec![], flag: 0, rest: rest_after(w, r)? });
         }
-        Ok(Self { quest_count: 0, flag: r.u8()?, rest: vec![] })
+        Ok(Self { quest_count: 0, quests: vec![], flag: r.u8()?, rest: vec![] })
     }
 }
 
@@ -874,6 +896,34 @@ mod tests {
         let mut bad = body[..4].to_vec();
         bad.extend((1000 * UNIT).to_be_bytes());
         assert!(FullCharacter::read(&mut Reader::new(&bad)).is_err());
+    }
+
+    /// No capture has an active spell: the captured body with its empty spell word (`this+0x78`, between the identity list and the perk map: the last two words)
+    /// replaced by two `ModifyStat` spells (the real words of rdb 1000020:101103 / :101105, Eye Implants) must decode to the same character plus the spells.
+    #[test]
+    fn full_character_spell_list() {
+        let f = capture_n3().into_iter().find(|f| N3Header::parse(&f.payload).unwrap().0.msg_type == FULL_CHARACTER).unwrap();
+        let (_, mut r) = N3Header::parse(&f.payload).unwrap();
+        let body = take_rest(&mut r).unwrap();
+        let n = body.len();
+        assert_eq!((&body[n - 8..n - 4], &body[n - 4..]), (&UNIT.to_be_bytes()[..], &UNIT.to_be_bytes()[..]), "captured spell list and perk map are empty");
+        let mut b = body[..n - 8].to_vec();
+        b.extend((3 * UNIT).to_be_bytes());
+        for words in [[53045i32, 0, 4, 0, 1, 0, 2, 9, 108, 2], [53045, 0, 4, 0, 1, 0, 2, 9, 101, 3]] {
+            words.iter().for_each(|w| b.extend(w.to_be_bytes()));
+        }
+        b.extend(UNIT.to_be_bytes());
+        let c = FullCharacter::read(&mut Reader::new(&b)).unwrap();
+        assert!(c.rest.is_empty());
+        let got: Vec<_> = c.spells.iter().map(|s| (s.function, s.stat(spells::stat::STAT), s.stat(spells::stat::VALUE))).collect();
+        assert_eq!(got, [(0xCF35, 108, 2), (0xCF35, 101, 3)]);
+        assert_eq!((c.stat(54), c.stats_a.len()), (Some(1), 81));
+        // an undecodable spell keeps the old behaviour: everything from the size word on is `rest`
+        let mut bad = body[..n - 8].to_vec();
+        bad.extend((2 * UNIT).to_be_bytes());
+        bad.extend([0u8; 12]);
+        let c = FullCharacter::read(&mut Reader::new(&bad)).unwrap();
+        assert!(c.spells.is_empty() && !c.rest.is_empty());
     }
 
     /// `DoorStatusUpdateIIR_t` body as `FUN_1009fcb8` writes it: version 2, locked, open, `value_c3`, flag, an (empty) stat list.

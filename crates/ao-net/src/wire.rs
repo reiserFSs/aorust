@@ -3,6 +3,7 @@
 
 use anyhow::{bail, Result};
 
+#[derive(Clone)]
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
