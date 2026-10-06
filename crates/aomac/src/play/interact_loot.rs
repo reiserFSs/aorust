@@ -128,6 +128,12 @@ impl LootUi {
         gui.set_canvas_tips(w, "grid", tips);
     }
 
+    /// `(container, entry.id)` of cell `n` of the first window (live harness).
+    #[cfg(test)]
+    pub fn entry_id(&self, n: usize) -> Option<Identity> {
+        self.open.first()?.entries.get(n).map(|e| e.id)
+    }
+
     /// The double click on cell `n` of the first window (live harness): the item to take.
     #[cfg(test)]
     pub fn take(&mut self, gui: &mut Gui, n: usize, now: f32) -> Option<Identity> {

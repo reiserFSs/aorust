@@ -691,6 +691,23 @@ fn live_walk() {
                 let i = p.interact.as_mut().unwrap();
                 eprintln!("feedback {:?}\nloot: {:?}", i.take_feedback(), i.loot_dump(&mut p.gui));
             }
+            // `lootid=<cell>[:<kind>:<instance>]`: `MoveItemToInventory` of a loot cell with its inventory entry id (or an explicit identity)
+            "lootid" => {
+                let mut it = v.split(':');
+                let n: usize = it.next().unwrap().parse().unwrap();
+                let p = &mut l.p;
+                let i = p.interact.as_mut().unwrap();
+                let item = match (it.next(), it.next()) {
+                    (Some(k), Some(x)) => ao_net::msg::Identity { kind: k.parse().unwrap(), instance: x.parse().unwrap() },
+                    _ => i.loot_entry_id(n).expect("no such cell"),
+                };
+                eprintln!("lootid {item:?}");
+                i.move_to_bag(item);
+                l.wait(4.0);
+                let p = &mut l.p;
+                let i = p.interact.as_mut().unwrap();
+                eprintln!("feedback {:?}\nloot: {:?}", i.take_feedback(), i.loot_dump(&mut p.gui));
+            }
             "grid" => {
                 let p = &l.p;
                 eprintln!("grid: {}", p.interact.as_ref().unwrap().grid_dump(&p.gui));

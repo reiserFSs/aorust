@@ -239,6 +239,17 @@ impl Interact {
 /// Live-harness helpers (`flow/live.rs`).
 #[cfg(test)]
 impl Interact {
+    /// `MoveItemToInventory(item)` to any bag slot with an arbitrary item identity (live probing of what the server accepts for a corpse item).
+    pub fn move_to_bag(&mut self, item: Identity) {
+        let p = inventory::move_item_to_inventory(self.own as i32, item, ANY_BAG_SLOT);
+        self.send(p);
+    }
+
+    /// The `id` of entry `n` of the first loot window.
+    pub fn loot_entry_id(&self, n: usize) -> Option<Identity> {
+        self.use_ui.loot.entry_id(n)
+    }
+
     /// Double click on cell `n` of the open loot window: the item goes to the bag ([`Interact::use_out`]).
     pub fn loot_take(&mut self, gui: &mut Gui, zone: &Zone, n: usize) -> bool {
         let Some(item) = self.use_ui.loot.take(gui, n, self.use_ui.now) else { return false };
