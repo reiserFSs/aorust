@@ -58,7 +58,7 @@ fn fields(function: u32) -> &'static [u16] {
     }
 }
 
-fn interpolate_spell(out: &mut Spell, low: &Spell, high: &Spell, aq: i32, bq: i32, q: i32) -> Result<()> {
+pub(super) fn interpolate_spell(out: &mut Spell, low: &Spell, high: &Spell, aq: i32, bq: i32, q: i32) -> Result<()> {
     // GC 100cb934: same criterion keys/count, interpolate values, retain selected operators.
     ensure!(low.criteria.len() == high.criteria.len() && out.criteria.len() == low.criteria.len(), "different spell criteria counts");
     for ((out, a), b) in out.criteria.iter_mut().zip(&low.criteria).zip(&high.criteria) {

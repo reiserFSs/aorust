@@ -152,6 +152,8 @@ fn escape(s: &str) -> String {
 pub enum ChatOut {
     /// Answer link `index` of the list (`FUN_10058d1a`): `N3Msg_SendNPCChatAnswer`.
     Answer(i32),
+    /// User-requested transcript links, dispatched through the shared chat URL handler.
+    Link(String),
     /// The window was closed by the player (`FUN_10059d7f` destructor sends `N3Msg_NPCChatCloseWindow` unless the server closed it).
     Closed,
     /// Button bar: `FUN_100584f1` -> `N3Msg_NPCChatRequestDescription`.
@@ -388,6 +390,7 @@ impl NpcChat {
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, own: &str) -> Option<Option<ChatOut>> {
         match ev {
             Event::LinkClicked { window, view, href } if *window == self.win && view == "npc_answers" => Some(self.link(gui, href, own)),
+            Event::LinkClicked { window, view, href } if *window == self.win && view == "npc_text" => Some(Some(ChatOut::Link(href.clone()))),
             Event::CloseRequested { window } if *window == self.win => Some(Some(ChatOut::Closed)),
             Event::Clicked { window, view, .. } if *window == self.bar => Some(BAR.iter().position(|b| b.0 == view).and_then(|i| self.press(i))),
             Event::CanvasPress { window, view, button: MouseButton::Left, .. } if *window == self.win && view == "npc_split" => {
@@ -482,10 +485,48 @@ mod tests {
         w.append(&mut gui, "Welcome\\nstranger", kind::SPEECH, "Me");
         w.set_answers(&mut gui, vec!["Where am I?".into(), "Bye".into()]);
         assert!(gui.text(w.win, "npc_text").contains("Welcome"));
-        assert_eq!(w.link(&mut gui, "1", "Me"), Some(ChatOut::Answer(1)));
+        let ev = click_rendered_link(&mut gui, w.win, "npc_answers", "1");
+        assert_eq!(w.event(&mut gui, &ev, "Me"), Some(Some(ChatOut::Answer(1))));
         assert!(w.answers.is_empty());
         assert_eq!(w.link(&mut gui, "1", "Me"), None, "the list is gone after an answer");
         gui.frame(0.0);
+    }
+
+    /// Hit rendered glyphs through GUI mouse input, rather than calling the link handler directly.
+    fn click_rendered_link(gui: &mut Gui, win: WindowId, view: &str, href: &str) -> Event {
+        let list = gui.frame(0.0);
+        let r = gui.view_rect(win, view).unwrap();
+        for cmd in list.cmds {
+            let ao_gui::DrawCmd::Glyph { src, dst, .. } = cmd else { continue };
+            let (x, y) = (dst[0] as f32 + src[2] as f32 / 2.0, dst[1] as f32 + src[3] as f32 / 2.0);
+            if x < r.l || x >= r.r || y < r.t || y >= r.b {
+                continue;
+            }
+            gui.input(InputEvent::MouseMove { x, y });
+            let events = gui.input(InputEvent::MouseDown { x, y, button: MouseButton::Left });
+            gui.input(InputEvent::MouseUp { x, y, button: MouseButton::Left });
+            if let Some(ev) = events.into_iter().find(|e| matches!(e, Event::LinkClicked { window, view: v, href: h } if *window == win && v == view && h == href)) {
+                return ev;
+            }
+        }
+        panic!("no rendered link hit for {view}: {href}");
+    }
+
+    #[test]
+    fn transcript_links_are_distinct_from_numeric_answers() {
+        let Some(mut gui) = rig() else { return };
+        let mut w = open_chat(&mut gui, BarFlags::default());
+        w.set_answers(&mut gui, vec!["Yes".into()]);
+        for href in [
+            "itemref://53019/53020/1", "itemid://51018/1", "charref://50000/9", "charid://50000/9",
+            "text://hello", "user://Guard", "chatgroup://1", "chatcmd:///help", "http://example.com",
+            "https://example.com", "0",
+        ] {
+            gui.set_text(w.win, "npc_text", &format!("<a href=\"{href}\">Reference</a>"));
+            let ev = click_rendered_link(&mut gui, w.win, "npc_text", href);
+            assert_eq!(w.event(&mut gui, &ev, "Me"), Some(Some(ChatOut::Link(href.into()))));
+            assert_eq!(w.answers, ["Yes"], "transcript links must not consume answers");
+        }
     }
 
     fn open_chat(gui: &mut Gui, flags: BarFlags) -> NpcChat {

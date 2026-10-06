@@ -19,6 +19,7 @@ mod zone;
 mod zonecmd;
 
 pub(super) use cmd::WindowOp;
+pub(crate) use info::item_template_spells;
 
 use super::zone::Zone;
 use ao_formats::screens::TextDb;
@@ -98,6 +99,8 @@ pub(super) struct Chat {
     ignored: HashSet<u32>,
     /// Zone frames queued by input lines (the flow drains them into the session).
     outbox: Vec<Frame>,
+    /// Shop references resolve against the interaction module's authoritative stock and prices.
+    shop_info_urls: Vec<(String, Identity, Identity)>,
     /// Running pet scripts (`NpcHolder_t::m_pScripts`, Gamecode 0x10052230 / 0x100522c9); each frame advances them.
     pet_scripts: Vec<ao_net::n3::textcmd::PetScript>,
     /// Actions of the game layer (`/<emote>`, `/assist`): taken by the flow ([`Chat::take_game`]).
@@ -157,7 +160,7 @@ impl Chat {
     pub fn new() -> Self {
         let mut net = net::ChatNet::default();
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
-        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], pet_scripts: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], dvalue_cmds: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default(), filter: filter::FilterState::load(), macros: macros::TextMacros::open(), voice_prefs: VoicePrefs::default(), voice_throttle: voice::Throttle::default(), expansion: 0, last_out_group: None, bug: None, requests: Requests::default() }
+        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], shop_info_urls: vec![], pet_scripts: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], dvalue_cmds: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default(), filter: filter::FilterState::load(), macros: macros::TextMacros::open(), voice_prefs: VoicePrefs::default(), voice_throttle: voice::Throttle::default(), expansion: 0, last_out_group: None, bug: None, requests: Requests::default() }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
@@ -595,17 +598,9 @@ impl Chat {
                 WinOut::OpenTell(name) => self.open_tell_named(gui, &name, texts),
                 // user-link menu "IgnoreUser" (`FUN_1008dd24`): the `/ignore <nick>` path
                 WinOut::IgnoreUser(name) => self.run_line(gui, &format!("/ignore {name}"), zone, texts),
-                // `FUN_1008e322` -> `ChatGUIModule_c::ShowItemRefLink` 0x10085cb5: itemref:// itemid:// charref:// text:// open in the InfoView;
-                // chatcmd:// runs the command (**GUESS**: the chat view's own handler is not decoded, the InfoView treats them the same way)
-                WinOut::LinkClicked(href) => {
-                    let lower = href.to_ascii_lowercase();
-                    if ["itemref://", "itemid://", "charref://", "text://", "chatcmd://"].iter().any(|p| lower.starts_with(p)) {
-                        let outs = self.info.show_url(gui, self.screen, &href, true);
-                        self.info_out(gui, outs, zone, texts);
-                    } else {
-                        eprintln!("chat: link {href} (no handler)");
-                    }
-                }
+                // Retail references use ShowItemRefLink (GUI 0x10085cb5). The requested command/browser
+                // links share the InfoView dispatcher and the existing /start platform opener.
+                WinOut::LinkClicked(href) => self.show_url(gui, zone, texts, &href),
             }
         }
         handled
@@ -616,11 +611,24 @@ impl Chat {
         let outs = self.info.show_url(gui, self.screen, url, true);
         self.info_out(gui, outs, zone, texts);
     }
+    pub fn take_shop_info_urls(&mut self) -> Vec<(String, Identity, Identity)> {
+        std::mem::take(&mut self.shop_info_urls)
+    }
+
+    pub fn shop_item_page(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb, url: &str, item: ao_net::n3::world::AcgItem, price: i32) {
+        match info::shop_item_html(zone, item, price, texts) {
+            Ok(Some(html)) => self.info.item_page(gui, url, html),
+            Ok(None) => {},
+            Err(error) => self.system_line(gui, &format!("Item info failed: {error:#}"), 12),
+        }
+    }
+
 
     fn info_out(&mut self, gui: &mut Gui, outs: Vec<info::InfoOut>, zone: &Zone, texts: &TextDb) {
         for o in outs {
             match o {
                 info::InfoOut::Command(c) => self.run_line(gui, &c, zone, texts),
+                info::InfoOut::ExternalUrl(url) => self.open_url(&url),
                 info::InfoOut::Character(target) => self.outbox.push(ao_net::n3::outgoing::n3_frame(0, zone.char_id, ao_net::n3::info::request(zone.char_id as i32, target))),
                 info::InfoOut::Quest(target) => {
                     match info::quest_html(zone, target, texts) {
@@ -629,6 +637,14 @@ impl Chat {
                         Err(error) => self.system_line(gui, &format!("Mission info failed: {error:#}"), 12),
                     }
                 }
+                info::InfoOut::Item { url, request: info::ItemRequest::Identity { id, shop: true, container } } => {
+                    self.shop_info_urls.push((url, id, container));
+                },
+                info::InfoOut::Item { url, request } => match info::item_html(zone, &request, texts) {
+                    Ok(Some(html)) => self.info.item_page(gui, &url, html),
+                    Ok(None) => {},
+                    Err(error) => self.system_line(gui, &format!("Item info failed: {error:#}"), 12),
+                },
                 // `GlobalSignals+0x17c(0, text, 0xc)`: red line in the System window
                 info::InfoOut::Error(t) => self.system_line(gui, &t, 12),
             }

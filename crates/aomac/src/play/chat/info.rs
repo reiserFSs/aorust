@@ -15,6 +15,42 @@ mod template_spells;
 mod tower_interpolation;
 #[path = "quest_info.rs"]
 mod quest;
+#[path = "item_info.rs"]
+mod item;
+#[path = "item_effects.rs"]
+mod item_effects;
+#[path = "item_info_combat.rs"]
+mod item_info_combat;
+#[path = "item_requirements.rs"]
+mod item_requirements;
+#[path = "item_info_building.rs"]
+mod item_info_building;
+#[path = "skill_info.rs"]
+mod skill;
+
+/// Arguments of the shared retail item/skill information dispatcher (GUI 100ee05c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemRequest {
+    Reference(ao_net::n3::world::AcgItem),
+    Identity { id: ao_net::msg::Identity, shop: bool, container: ao_net::msg::Identity },
+    Skill(u32),
+}
+
+pub fn item_html(zone: &crate::play::zone::Zone, request: &ItemRequest, texts: &ao_formats::screens::TextDb) -> anyhow::Result<Option<String>> {
+    match request {
+        ItemRequest::Skill(stat) => skill::html(zone, *stat, texts).map(Some),
+        _ => item::html(zone, request, texts),
+    }
+}
+
+pub fn shop_item_html(zone: &crate::play::zone::Zone, item: ao_net::n3::world::AcgItem, price: i32, texts: &ao_formats::screens::TextDb) -> anyhow::Result<Option<String>> {
+    item::html_for_reference(zone, item, Some(price), texts)
+}
+
+pub(crate) fn item_template_spells(record: &[u8], list: u32) -> anyhow::Result<Vec<ao_net::n3::spells::Spell>> {
+    template_spells::spells(record, list)
+}
+
 
 pub fn character_html(zone: &crate::play::zone::Zone, id: ao_net::msg::Identity, packet: &ao_net::n3::info::InfoPacket, texts: &ao_formats::screens::TextDb) -> anyhow::Result<String> {
     character::html(zone, id, packet, texts)
@@ -40,6 +76,10 @@ pub enum InfoOut {
     Character(ao_net::msg::Identity),
     /// Quest item information (`FUN_1003565d`), resolved synchronously from the zone's quest registry.
     Quest(ao_net::msg::Identity),
+    /// Synchronous item/skill page; the hub supplies the zone registry.
+    Item { url: String, request: ItemRequest },
+    /// Requested external-link extension; retail unknown schemes are no-ops (GUI 100ee05c).
+    ExternalUrl(String),
 }
 
 /// One visited page (`std::list` node: url at +8, html at +0x24, scroll location at +0x40).
@@ -168,6 +208,32 @@ fn character_url(s: &str) -> Option<(ao_net::msg::Identity, &str)> {
     Some((ao_net::msg::Identity { kind, instance }, parts.next().unwrap_or("")))
 }
 
+fn item_request(url: &str) -> Option<ItemRequest> {
+    let identity = |s: &str, shop| {
+        let mut p = s.split('/');
+        let id = ao_net::msg::Identity { kind: p.next()?.parse().ok()?, instance: p.next()?.parse().ok()? };
+        let container = if let Some(kind) = p.next() {
+            if shop { return None; }
+            let container = ao_net::msg::Identity { kind: kind.parse().ok()?, instance: p.next()?.parse().ok()? };
+            if p.next().is_some() { return None; }
+            container
+        } else { ao_net::msg::Identity::default() };
+        Some(ItemRequest::Identity { id, shop, container })
+    };
+    if let Some(s) = url.strip_prefix("itemref://") {
+        let mut p = s.split('/');
+        let item = ao_net::n3::world::AcgItem { low_id: p.next()?.parse().ok()?, high_id: p.next()?.parse().ok()?, level: p.next()?.parse().ok()? };
+        if p.next().is_some() { return None; }
+        Some(ItemRequest::Reference(item))
+    } else if let Some(s) = url.strip_prefix("shopitemid://") {
+        identity(s, true)
+    } else if let Some(s) = url.strip_prefix("itemid://") {
+        identity(s, false)
+    } else {
+        url.strip_prefix("skillid://")?.parse().ok().map(ItemRequest::Skill)
+    }
+}
+
 impl InfoView {
     pub fn new(client: &std::path::Path) -> Self {
         Self { text_dir: client.join("cd_image/text"), win: None, hist: History::default(), url: String::new() }
@@ -201,19 +267,19 @@ impl InfoView {
         let was_open = self.win.is_some();
         // `FUN_100384f3` generates item pages, not character pages.
         let lower = url.to_ascii_lowercase();
-        for p in ["shopitemid://", "itemref://", "skillid://"] {
-            if lower.starts_with(p) {
-                eprintln!("chat: InfoView {p} pages need the item/skill info generator (not ported)");
-                return vec![];
-            }
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return vec![InfoOut::ExternalUrl(url.to_owned())];
         }
-        let (key, body, out) = if lower.starts_with("itemid://") {
-            let Some((id, tail)) = character_url(&url[9..]) else { return vec![] };
-            if id.kind != ao_net::n3::quest::QUEST_KIND || !tail.is_empty() {
-                eprintln!("chat: InfoView itemid pages other than quests are not ported");
-                return vec![];
+        let (key, body, out) = if let Some(request) = item_request(&lower) {
+            if let ItemRequest::Identity { id, shop: false, container } = &request {
+                if id.kind == ao_net::n3::quest::QUEST_KIND && *container == ao_net::msg::Identity::default() {
+                    (url.to_owned(), Some(String::new()), vec![InfoOut::Quest(*id)])
+                } else {
+                    (url.to_owned(), Some(String::new()), vec![InfoOut::Item { url: url.to_owned(), request }])
+                }
+            } else {
+                (url.to_owned(), Some(String::new()), vec![InfoOut::Item { url: url.to_owned(), request }])
             }
-            (url.to_owned(), Some(String::new()), vec![InfoOut::Quest(id)])
         } else if lower.starts_with("charid://") {
             let Some((id, tail)) = character_url(&url[9..]) else { return vec![] };
             if !tail.is_empty() { return vec![]; }
@@ -262,6 +328,13 @@ impl InfoView {
 
     pub fn quest_page(&mut self, gui: &mut Gui, id: ao_net::msg::Identity, html: String) {
         self.identity_page(gui,"itemid://",id,html);
+    }
+
+    pub fn item_page(&mut self, gui: &mut Gui, url: &str, html: String) {
+        if self.win.is_none() || self.url != url { return; }
+        let scroll = self.win.map(|w| gui.scroll_offset(w, "BrowserView")).unwrap_or_default();
+        self.hist.visit(url, html, scroll);
+        self.show_current(gui);
     }
 
     fn identity_page(&mut self, gui: &mut Gui, scheme: &str, id: ao_net::msg::Identity, html: String) {
@@ -344,6 +417,31 @@ impl InfoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_urls_do_not_visit_or_open_an_info_page() {
+        let Some((mut gui, mut iv)) = rig() else { return };
+        for url in ["http://example.com/a", "HTTPS://example.com/b"] {
+            assert_eq!(iv.show_url(&mut gui, (1280, 800), url, true), [InfoOut::ExternalUrl(url.into())]);
+        }
+        assert!(iv.hist.e.is_empty());
+        assert!(iv.url.is_empty());
+        assert!(iv.window().is_none());
+    }
+
+    #[test]
+    fn item_urls_preserve_template_quality_and_container_identity() {
+        let item = ao_net::n3::world::AcgItem { low_id: 1, high_id: 2, level: 200 };
+        assert_eq!(item_request("itemref://1/2/200"), Some(ItemRequest::Reference(item)));
+        assert_eq!(item_request("skillid://152"), Some(ItemRequest::Skill(152)));
+        let id = ao_net::msg::Identity { kind: 104, instance: 64 };
+        let container = ao_net::msg::Identity { kind: 50000, instance: 42 };
+        assert_eq!(item_request("itemid://104/64/50000/42"), Some(ItemRequest::Identity { id, shop: false, container }));
+        assert_eq!(item_request("shopitemid://104/64"), Some(ItemRequest::Identity { id, shop: true, container: Default::default() }));
+        for bad in ["itemref://1/2", "itemref://1/2/3/4", "skillid://-1", "itemid://104/64/1", "shopitemid://104/64/1/2", "itemid://x/1"] {
+            assert!(item_request(bad).is_none(), "{bad}");
+        }
+    }
+
 
     #[test]
     fn character_identity_keeps_embedded_html_intact() {
@@ -403,6 +501,24 @@ mod tests {
             return None;
         }
         Some((Gui::new(&client, None).unwrap(), InfoView::new(&client)))
+    }
+
+    #[test]
+    fn item_pages_share_history_toggle_and_reject_stale_urls() {
+        let Some((mut gui, mut iv)) = rig() else { return };
+        let url = "itemref://1/2/200";
+        let request = ItemRequest::Reference(ao_net::n3::world::AcgItem { low_id: 1, high_id: 2, level: 200 });
+        assert_eq!(iv.show_url(&mut gui, (1280, 800), url, false), [InfoOut::Item { url: url.into(), request }]);
+        let w = iv.window().unwrap();
+        iv.item_page(&mut gui, url, "First item".into());
+        assert!(gui.text(w, "BrowserView").contains("First item"));
+        iv.show_url(&mut gui, (1280, 800), "skillid://152", false);
+        iv.item_page(&mut gui, url, "stale".into());
+        assert!(!gui.text(w, "BrowserView").contains("stale"));
+        iv.item_page(&mut gui, "skillid://152", "Skill".into());
+        assert_eq!(iv.hist.e.len(), 2);
+        assert!(iv.show_url(&mut gui, (1280, 800), "skillid://152", true).is_empty());
+        assert!(iv.window().is_none());
     }
 
     #[test]

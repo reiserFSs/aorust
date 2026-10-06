@@ -284,6 +284,11 @@ fn windows_route_and_fade() {
     assert!((gui.window_alpha(w1) - 0.3).abs() < 1e-6);
 
     // link activation
+    let npc = gui.open_window_xml("NPCChatWindow", r#"<root><TextView name="npc_answers"/></root>"#, (0, 0), ao_gui::WindowSize::Fixed(100, 100)).unwrap();
+    let answer = Event::LinkClicked { window: npc, view: "npc_answers".into(), href: "0".into() };
+    assert!(!ch.owns(&answer));
+    assert!(ch.event(&mut gui, &answer).is_empty(), "NPC answers must reach their own handler, not emit chat output");
+    gui.close_window(npc);
     assert_eq!(ch.event(&mut gui, &Event::LinkClicked { window: w1, view: "text_0".into(), href: "user://Bob".into() }), vec![WinOut::OpenTell("Bob".into())]);
     assert_eq!(ch.event(&mut gui, &Event::LinkClicked { window: w1, view: "text_0".into(), href: "chatcmd:///inspect 5".into() }), vec![WinOut::LinkClicked("chatcmd:///inspect 5".into())]);
     // keeps at most 100 lines

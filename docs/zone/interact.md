@@ -73,6 +73,7 @@ item), `N3Msg_NPCChatEndTrade` 0x10017fb1 (flag = `!param_4`), `N3Msg_SendNPCCha
   `<div indent=wrapped><img src=tdb://id:GFX_GUI_NPCCHAT_BULLET> <a href=%u style=text-decoration:none><font color=CCNPCChatQuestion>%s</font></a></div>` (`%u` = index,
   `%s` = `String::Escape(answer)`). The link slot `FUN_10058d1a`: `atol(href)`, in range -> adds the answer as a type-2 text, `N3Msg_SendNPCChatAnswer(own, npc, index)`,
   clears the answer view and the vector.
+  The constructor `FUN_10058ed8` binds the answer view's link signal through `FUN_10059579` to this numeric-answer handler; that trace does not establish transcript URL routing.
   The bullets and the hanging indent are the HTML parser's: `ao-gui` `text::layout_text` now implements them [CODE: `HTMLParser_c::_ParseTag` 0x1015c9ad, `FUN_1015ed05`, `TextRenderer_c::_ReWrap`
   0x10161ba4 / `_AddLineDesc` 0x10161b44 / `_RenderLine` 0x10161112]: `<img src=tdb://id:NAME>` (or `rdb://`; token 3, the sprite of `GuiResourceManager_t::GetGuiTexture`) is an inline sprite copied
   top-aligned at the pen (`SpriteInfo_t::Copy`), its width advances the pen and counts as a word; `<div>` / `<center>` are tokens 0xc / 0xd, `indent=wrapped` sets bit 1 of the div's attribute
@@ -80,6 +81,9 @@ item), `N3Msg_NPCChatEndTrade` 0x10017fb1 (flag = `!param_4`), `N3Msg_SendNPCCha
   its width). A div is a block (a line of its own); the chat window's `<br>` joins right behind a `</div>` add nothing, so the chat keeps its look. `<a href style=text-decoration:none>`:
   `_ParseTag` sets the attribute bits 6 (underline + link colour `+0x1c0` = 0x2299ff) **only when the style is absent or something else** -- with `text-decoration:none` the run keeps the
   font colour, which is why the answers are `CCNPCChatQuestion` green (0x4fd553) and not link blue. Tests: `ao-gui/tests/html_text.rs`.
+* **User-requested extension:** links clicked in `npc_text` emit `ChatOut::Link(href)` unchanged, enter the existing `trade.info_urls` queue, and reach `Chat::show_url` via `interact_trade_frame`.
+  This is requested transcript support, **not a claim of proven retail NPC transcript behavior**. `npc_answers` remains a separate numeric-index path, including its answer echo, answer-list clearing and wire message.
+  Regression coverage in `interact_chat::tests` clicks rendered glyphs with GUI mouse input for an answer and transcript URL schemes (including a numeric transcript href); `interact_trade::tests` covers queue routing without an answer packet.
 * The button bar (`ButtonBar_c`, `FUN_10059704`; ctor `BorderView_c(Rect, "", 0, 4)` + `HLayoutNode`): four `Button_c` (`Button_c(Rect, "", "", -1, 0, 0, 0, 0)`, `Button_c::SetGfx(state, id)`
   states 0 raised / 1 pressed / 2 hover = highlight art, `StateChanged` 0x10128338): description `GFX_GUI_BUTTON_DESC_NORMAL/PRESSED` (0x3f/0x40), info `INFO_*` (0x44/0x45), trade `GIVE_*` (0x42/0x43),
   use `SHOP_*` (0x49/0x4a) (37 x 31 px each, `SetBorders` (5,5,0,5) for the first three, (5,5,5,5) for the last), tooltips `LDBface::GetText(10000, key)` = `RequestNPCdescription`, `RequestNPCinfo`, `GiveItems`, `Shop`

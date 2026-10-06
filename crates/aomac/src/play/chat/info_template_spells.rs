@@ -15,12 +15,27 @@ fn count(r: &mut Reader<'_>, max: usize) -> Result<usize> {
 /// Decode the requested event, validating every element, including those after it.
 /// Unsupported elements and malformed lists are errors, never absent modifiers.
 pub(super) fn spells(record: &[u8], list: u32) -> Result<Vec<Spell>> {
+    Ok(data(record, list)?.spells)
+}
+
+type SkillPairs = Vec<(u32, i32)>;
+
+#[derive(Default, Clone)]
+pub(super) struct Data {
+    pub spells: Vec<Spell>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub pairs: Vec<(u32, u32, SkillPairs)>,
+    pub criteria: Vec<(u32, u32, Vec<[i32; 3]>)>,
+}
+
+pub(super) fn data(record: &[u8], list: u32) -> Result<Data> {
     let mut r = Reader::little_endian(record);
     let kind = r.u32()?;
     ensure!(kind >= 10000, "invalid item kind {kind}");
     let elements = r.i32()?;
     ensure!(elements > 0 && elements as usize <= r.remaining() / 8, "invalid item element count {elements}");
-    let mut result = Vec::new();
+    let mut result = Data::default();
     for index in 0..elements {
         let (ty, sub) = (r.u32()?, r.u32()?);
         ensure!(ty <= 0x32 && sub <= 0x36, "invalid item element ({ty}, {sub})");
@@ -32,7 +47,7 @@ pub(super) fn spells(record: &[u8], list: u32) -> Result<Vec<Spell>> {
                 ensure!(n <= r.remaining() / 32, "spell list does not fit item record");
                 for _ in 0..n {
                     let spell = read_spell(&mut r)?;
-                    if sub == list { result.push(spell); }
+                    if sub == list { result.spells.push(spell); }
                 }
             }
             4 | 19 => {
@@ -41,9 +56,12 @@ pub(super) fn spells(record: &[u8], list: u32) -> Result<Vec<Spell>> {
                     let max = r.remaining() / 8;
                     let n = count(&mut r, max)?;
                     for _ in 0..n {
-                        r.u32()?;
+                        let key = r.u32()?;
                         let m = count(&mut r, 10000)?;
-                        r.bytes(m * 8)?;
+                        let mut pairs = Vec::with_capacity(m);
+                        for _ in 0..m { pairs.push((r.u32()?, r.i32()?)); }
+                        result.pairs.retain(|entry|entry.1!=key);
+                        result.pairs.push((sub, key, pairs));
                     }
                 } else {
                     let n = count(&mut r, 10000)?;
@@ -63,7 +81,8 @@ pub(super) fn spells(record: &[u8], list: u32) -> Result<Vec<Spell>> {
             21 => {
                 let name = r.u16()? as usize;
                 let description = r.u16()? as usize;
-                r.bytes(name + description)?;
+                result.name = Some(r.bytes(name)?.iter().map(|&b| b as char).collect());
+                result.description = Some(r.bytes(description)?.iter().map(|&b| b as char).collect());
             }
             14 | 18 | 20 => {
                 // FUN_1007d59f / 1007d6d5: key -> sized integer list.
@@ -79,14 +98,18 @@ pub(super) fn spells(record: &[u8], list: u32) -> Result<Vec<Spell>> {
                 // FUN_1008a007: attribute key -> sized Criterion_t triples.
                 let n = count(&mut r, 998)?;
                 for _ in 0..n {
-                    r.u32()?;
+                    let key = r.u32()?;
                     let m = count(&mut r, 30000)?;
+                    let mut criteria = Vec::with_capacity(m);
                     for _ in 0..m {
-                        r.i32()?;
-                        r.i32()?;
+                        let stat = r.i32()?;
+                        let value = r.i32()?;
                         let op = r.u32()?;
                         ensure!(op < 0x91, "invalid item criterion operator {op}");
+                        criteria.push([stat, value, op as i32]);
                     }
+                    result.criteria.retain(|entry|entry.1!=key);
+                    result.criteria.push((sub, key, criteria));
                 }
             }
             3 => {} // FUN_1002b297 consumes no payload for this element.
@@ -128,6 +151,21 @@ mod tests {
             malformed[28..32].copy_from_slice(&word.to_le_bytes());
             assert!(spells(&malformed, 24).is_err());
         }
+    }
+
+    #[test]
+    fn item_metadata_keeps_description_pairs_and_criteria() {
+        let mut bytes: Vec<_> = [0xc73d_u32,4,15,23,1009,21,33].into_iter().flat_map(u32::to_le_bytes).collect();
+        bytes.extend(1u16.to_le_bytes());
+        bytes.extend(4u16.to_le_bytes());
+        bytes.extend([b'N',0xe9,b'\\',b'n',b'D']);
+        bytes.extend([4_u32,4,2018,12,2018,108,2,22,5,2018,0,2018,108,2,2].into_iter().flat_map(u32::to_le_bytes));
+        let parsed=data(&bytes,u32::MAX).unwrap();
+        assert_eq!(parsed.name.as_deref(),Some("N"));
+        assert_eq!(parsed.description.as_deref(),Some("é\\nD"));
+        assert_eq!(parsed.pairs,vec![(4,12,vec![(108,2)])]);
+        assert_eq!(parsed.criteria,vec![(5,0,vec![[108,2,2]])]);
+        for end in 0..bytes.len() { assert!(data(&bytes[..end],u32::MAX).is_err()); }
     }
 
     #[test]

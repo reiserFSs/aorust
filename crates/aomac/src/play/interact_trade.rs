@@ -259,6 +259,7 @@ impl Interact {
         let me = self.own_id();
         match out {
             ChatOut::Answer(i) => self.send(knubot::answer(me, npc, i)),
+            ChatOut::Link(url) => self.trade.info_urls.push(url),
             ChatOut::Closed => {
                 if let Some(c) = self.chat.take() {
                     c.close(gui);
@@ -376,6 +377,13 @@ impl Play {
         for u in i.take_info_urls() {
             if let Some(c) = self.chat.as_mut() {
                 c.show_url(&mut self.gui, &self.zone, &self.text, &u);
+            }
+        }
+        if let Some(c) = self.chat.as_mut() {
+            for (url, id, container) in c.take_shop_info_urls() {
+                if let Some((item, price)) = i.shop_info(id, container) {
+                    c.shop_item_page(&mut self.gui, &self.zone, &self.text, &url, item, price);
+                }
             }
         }
     }
@@ -509,6 +517,17 @@ mod tests {
         // the use button: GenericCmd 3 on the NPC (`N3Msg_UseItem`)
         let f = i.take_outbox();
         assert!(f.is_empty(), "use_object was already flushed with the first take: {f:?}");
+    }
+
+    #[test]
+    fn transcript_links_use_the_existing_info_queue_without_sending_an_answer() {
+        let Some(mut gui) = rig() else { return };
+        let z = zone();
+        let mut i = open(&mut gui, &z, true, false);
+        i.take_outbox();
+        i.chat_out(&mut gui, ChatOut::Link("itemref://53019/53020/1".into()));
+        assert_eq!(i.take_info_urls(), ["itemref://53019/53020/1"]);
+        assert!(i.take_outbox().is_empty());
     }
 
     #[test]

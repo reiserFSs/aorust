@@ -275,6 +275,14 @@ fn sell_price(value: i32, factor: i32, literacy: i32) -> i32 {
 type Info<'a> = &'a mut dyn FnMut(&mut Gui, AcgItem) -> Option<(String, i32, i32, Option<GfxId>)>;
 
 impl Interact {
+    /// Resolve a shopitemid only against the active stock and its rendered retail price.
+    pub fn shop_info(&self, id: Identity, container: Identity) -> Option<(AcgItem, i32)> {
+        let s = self.shop.shop.as_ref().filter(|s| s.machine == container && !s.dirty)?;
+        let item = s.item(id)?;
+        let price = s.prices.get(id.instance as usize).copied().flatten()?;
+        Some((item, price))
+    }
+
     /// Effective dynel stats: streamed values override the retail template.
     fn shop_refresh_pricing(&mut self, zone: &super::zone::Zone, machine: Identity) {
         let stat = |id| zone.world.stat_of(machine.kind, machine.instance, id);
@@ -828,6 +836,27 @@ mod tests {
         });
         assert_eq!(calls, 2);
         assert!(i.shop_dump(&gui).contains("credits: \"730\""));
+    }
+
+    #[test]
+    fn shop_info_requires_active_known_stock_and_computed_price() {
+        let Some(mut gui) = rig() else { return };
+        let z = Zone::new(OWN);
+        let mut i = open(&mut gui, &z);
+        let id = Identity { kind: SHOP_ITEM, instance: 1 };
+        assert_eq!(i.shop_info(id, MACHINE), Some((items()[1], 2220)));
+        assert_eq!(i.shop_info(id, SESSION), None);
+        assert_eq!(i.shop_info(Identity { kind: SHOP_ITEM, instance: -1 }, MACHINE), None);
+        assert_eq!(i.shop_info(Identity { kind: SHOP_ITEM, instance: 3 }, MACHINE), None);
+        assert_eq!(i.shop_info(ME, MACHINE), None);
+        i.shop.shop.as_mut().unwrap().prices[1] = None;
+        assert_eq!(i.shop_info(id, MACHINE), None);
+        i.shop.shop.as_mut().unwrap().prices[1] = Some(2220);
+        i.shop.shop.as_mut().unwrap().dirty = true;
+        assert_eq!(i.shop_info(id, MACHINE), None);
+        i.shop.shop = None;
+        assert!(i.shop.stocks.contains_key(&(MACHINE.kind, MACHINE.instance)));
+        assert_eq!(i.shop_info(id, MACHINE), None);
     }
 
     #[test]

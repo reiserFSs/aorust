@@ -372,6 +372,9 @@ impl ChatWindows {
     }
 
     pub fn event(&mut self, gui: &mut Gui, ev: &Event) -> Vec<WinOut> {
+        if !self.owns(ev) {
+            return vec![];
+        }
         let mut out = vec![];
         // Closing a frame hides all of its documents, retaining their channels/history for reopening.
         if let Event::CloseRequested { window } = ev {

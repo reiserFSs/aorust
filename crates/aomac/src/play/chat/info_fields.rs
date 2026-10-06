@@ -20,7 +20,7 @@ fn roman(mut value: i32) -> String {
 }
 
 /// GUI 0x10031694: TowerType gates this row, TowerLevel is rendered in Roman numerals.
-fn tower_type_row(kind: i32, level: i32, texts: &TextDb) -> String {
+pub(super) fn tower_type_row(kind: i32, level: i32, texts: &TextDb) -> String {
     let mut out = String::new();
     if kind == 0 || kind == 1_234_567_890 { return out; }
     let value = if level == 1_234_567_890 { texts.by_key(506,"NotSet").unwrap_or_default() } else { roman(level) };

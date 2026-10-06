@@ -4,6 +4,7 @@
 
 pub mod archive;
 pub mod character;
+pub mod city;
 pub mod create;
 pub mod dynel_visual;
 pub mod landcontrol;
