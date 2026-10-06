@@ -62,6 +62,10 @@ pub struct Module {
     /// `Dynels` hooks for the next `drain`: (dynel that swung, dynel that died).
     swings: Vec<i32>,
     rng: u32,
+    /// `s_nCommandRefCntr` [GC]: counter of the `n3Command_t`s the client sent (`SocialActionCmd_t.counter`).
+    counter: i32,
+    /// `identity_b.instance` of the own `CharacterAction` 99: the death animation the server asked for.
+    death_anim: Option<u16>,
     /// Events of the last received frames for the HUD / sounds (taken by [`Module::take_events`]).
     events: Vec<CombatEvent>,
     pose_events: Vec<ActionEvent>,
@@ -102,6 +106,8 @@ impl Module {
             dying: None,
             swings: Vec::new(),
             rng: 0x2545_F491 ^ own,
+            counter: 0,
+            death_anim: None,
             events: Vec::new(),
             pose_events: Vec::new(),
         }
@@ -139,6 +145,11 @@ impl Module {
     }
 
     /// Dynels whose attack clip should play (a hit of theirs landed or a special attack started).
+    /// Animation id of the own death (`CharacterAction` 99), 503 (`die-shot`, the only value in the capture) when the server sent none.
+    pub fn death_anim(&self) -> u16 {
+        self.death_anim.unwrap_or(503)
+    }
+
     pub fn take_swings(&mut self) -> Vec<i32> {
         std::mem::take(&mut self.swings)
     }
@@ -157,6 +168,13 @@ impl Module {
 
     /// One received frame (call before `Zone::on_frame` so the zone's stats are still the old ones, like the chat log).
     pub fn on_frame(&mut self, f: &Frame) {
+        if let Ok(m) = ao_net::n3::decode(f) {
+            if let ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(a)) = &m.body {
+                if m.header.target.instance == self.own && a.action == super::state::ACTION_DIE {
+                    self.death_anim = Some(a.identity_b.instance as u16);
+                }
+            }
+        }
         let ev = self.combat.on_frame(f, self.own as u32);
         for e in ev {
             match &e {
@@ -317,6 +335,30 @@ impl Module {
         true
     }
 
+    /// `N3Msg_DoSocialAction(anim)` [GC 0x100269d3] (`/wave`, `/emote bow`, ...): `mode` = movement FSM mode.
+    pub fn social(&mut self, anim: i32, mode: u32) {
+        match action::social_allowed(anim, mode as i32, false) {
+            Ok(()) => {
+                self.counter += 1;
+                self.send(action::social_action(self.own, self.counter, anim));
+            }
+            Err(key) => self.feedback.push(key),
+        }
+    }
+
+    /// `N3Msg_AssistFight` [GC 0x10027374] (`/assist`): selects the fight target of the selected character.
+    /// Returns the new selection or the refusal text. [UNRESOLVED] the PvP/side checks of the original (stat 0xc4 / 0x184 tests).
+    pub fn assist(&self, zone: &Zone) -> Result<i32, &'static str> {
+        let Some(t) = zone.target else { return Err("Feedback_NoTargetToAssist") };
+        if t == self.own {
+            return Err("Feedback_CantAssistYourself");
+        }
+        match self.combat.fight(t) {
+            Some(f) if f.state != FIGHT_IDLE => f.target.filter(|x| x.kind == DYNEL_CHAR && zone.dynels.contains_key(&x.instance)).map(|x| x.instance).ok_or(""),
+            _ => Err("Feedback_TargetIsNotInFight"),
+        }
+    }
+
     /// `N3Msg_SitToggle` pre-step: sitting stops the attack first (the rest is the movement layer's `sit_toggle`).
     pub fn before_sit(&mut self) {
         self.stop_attack();
@@ -404,6 +446,26 @@ mod tests {
         assert!(m.attacking(), "the fight state changes only when the server echoes");
         m.on_frame(&n3_frame(0, OWN, net::stop_fight(OWN as i32)));
         assert!(!m.attacking());
+    }
+
+    #[test]
+    fn social_action_and_assist() {
+        let (mut m, mut z, t) = primed();
+        m.social(62, 2); // /wave
+        let f = m.take_outbox();
+        let s = action::parse_social_action(&f[0].payload).unwrap();
+        assert_eq!((s.anim, s.counter, s.state), (62, 1, 0));
+        m.social(62, 4); // swimming
+        assert_eq!(m.take_feedback(), vec!["Feedback_CantDoSocialActionsWhileSwimming"]);
+        // /assist: the selected NPC is not fighting -> refused; once it fights `other`, `other` becomes the selection
+        assert_eq!(m.assist(&z), Err("Feedback_TargetIsNotInFight"));
+        z.dynels.insert(t + 1, z.dynels[&t].clone());
+        m.on_frame(&n3_frame(0, 0, net::attack(t, Identity { kind: DYNEL_CHAR, instance: t + 1 }, 0)));
+        let _ = m.assist(&z);
+        z.target = None;
+        assert_eq!(m.assist(&z), Err("Feedback_NoTargetToAssist"));
+        z.target = Some(OWN as i32);
+        assert_eq!(m.assist(&z), Err("Feedback_CantAssistYourself"));
     }
 
     #[test]

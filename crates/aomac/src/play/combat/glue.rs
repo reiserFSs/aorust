@@ -1,10 +1,15 @@
 //! `impl Play` hooks of the combat layer (`module.rs`): player commands in, frames out, floating numbers on the draw list.
 
+use super::actions::Event as ActionEvent;
+use super::anim::anim_name;
 use super::log::Space;
+use super::state::CombatEvent;
 use super::module::{Command, Module};
+use crate::play::chat::GameAction;
 use crate::play::controls::Cmd;
 use crate::play::movement::SitToggle;
 use crate::play::Play;
+use ao_formats::character::Role;
 use ao_gui::{DrawList, FontId};
 use ao_net::msg::Identity;
 use ao_net::n3::action;
@@ -63,14 +68,59 @@ impl Play {
                 _ => {}
             }
         }
+        let acts = self.chat.as_mut().map(|c| c.take_game()).unwrap_or_default();
+        for a in acts {
+            match a {
+                GameAction::Social(id) => {
+                    if let Some(m) = self.fight.as_mut() {
+                        m.social(id as i32, mode);
+                    }
+                }
+                GameAction::Assist => match self.fight.as_ref().map(|m| m.assist(&self.zone)) {
+                    Some(Ok(t)) => self.zone.target = Some(t),
+                    Some(Err(key)) if !key.is_empty() => {
+                        if let Some(c) = self.chat.as_mut() {
+                            c.feedback(&mut self.gui, key, &self.text);
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
         let Some(m) = self.fight.as_mut() else { return };
         m.update(dt, &self.zone, self.audio.as_ref());
         for id in m.take_swings() {
             self.zone.world.attack(id);
         }
-        // the HUD / sound / pose consumers take their events elsewhere; drop what nobody reads so the queues stay bounded
-        m.take_events();
-        m.take_pose_events();
+        let own = self.zone.char_id as i32;
+        if let Some(p) = self.player.as_mut() {
+            p.fighting = m.attacking();
+            for e in m.take_events() {
+                match e {
+                    // `FUN_1006a8f3` swing of the own character: [GUESS] the unarmed swing (weapon swing lists: combat-anim.md §3)
+                    CombatEvent::Hit { attacker, .. } | CombatEvent::SpecialAttack { who: attacker, .. } if attacker == own => {
+                        p.play(Role::Clip("unarmed-rswing".into()), false)
+                    }
+                    CombatEvent::Died { dynel, .. } if dynel == own => {
+                        let name = anim_name(m.death_anim()).map_or("die-knees", |a| a.0);
+                        p.play(Role::Clip(name.into()), true);
+                    }
+                    CombatEvent::Health { dynel, health, .. } if dynel == own && health > 0 && p.holding() => p.stand(),
+                    _ => {}
+                }
+            }
+        } else {
+            m.take_events();
+        }
+        for e in m.take_pose_events() {
+            if let ActionEvent::Emote { dynel, id, clip, .. } = e {
+                match (dynel == own, self.player.as_mut()) {
+                    (true, Some(p)) => p.play(Role::Emote(clip.trim_start_matches("social-").to_string()), false),
+                    (true, None) => {}
+                    _ => self.zone.world.play_once(dynel, id as u32),
+                }
+            }
+        }
         for key in m.take_feedback() {
             if let Some(c) = self.chat.as_mut() {
                 c.feedback(&mut self.gui, key, &self.text);

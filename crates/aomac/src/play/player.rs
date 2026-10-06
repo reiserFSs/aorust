@@ -7,6 +7,7 @@ use super::camera::{self, Camera3p};
 use super::controls::{CamCmd, Cmd, ControlPrefs, Controls};
 use super::movement::{Movement, SitToggle, World};
 use super::zone::{scene_pos, scene_yaw, Zone};
+use ao_formats::character::Role;
 use ao_formats::playfield::collision::Collision;
 use ao_gui::{InputEvent, MouseButton};
 use ao_net::frame::Frame;
@@ -54,6 +55,10 @@ pub(super) struct Player {
     /// The left/right press that went to the GUI: its release must not reach the controls.
     gui_press: [bool; 2],
     game: Vec<Cmd>,
+    /// A one-shot clip over the movement pose (emote, attack swing, death): the role and whether it holds its last frame.
+    transient: Option<(Role, bool)>,
+    /// The character is in a fight (`idle-unarmed` stance while standing).
+    pub fighting: bool,
 }
 
 impl Player {
@@ -88,6 +93,8 @@ impl Player {
                 lens_set: false,
                 gui_press: [false; 2],
                 game: Vec::new(),
+                transient: None,
+                fighting: false,
             })
         })();
         built.map_err(|e| eprintln!("player: {e:#}")).ok()
@@ -108,6 +115,21 @@ impl Player {
     /// Movement FSM mode (`FUN_100704e6`; 4 = swimming).
     pub fn mode(&self) -> u32 {
         u32::from(self.movement.fsm().mode)
+    }
+
+    /// Plays `role` once over the movement pose (`hold`: keep the last frame, for the death clip).
+    pub fn play(&mut self, role: Role, hold: bool) {
+        self.transient = Some((role, hold));
+    }
+
+    /// A held clip (death) is playing.
+    pub fn holding(&self) -> bool {
+        self.transient.as_ref().is_some_and(|t| t.1)
+    }
+
+    /// Ends a held clip (resurrection).
+    pub fn stand(&mut self) {
+        self.transient = None;
     }
 
     /// Commands for the combat layer collected since the last call.
@@ -210,10 +232,16 @@ impl Player {
         }
 
         let role = self.movement.role();
-        let pose = if self.movement.speed() > 0.01 && self.movement.grounded() {
-            AvatarPose { role, speed: self.movement.max_speed(), ref_speed: self.movement.ref_speed() }
-        } else {
-            AvatarPose::still(role)
+        let moving = self.movement.speed() > 0.01 && self.movement.grounded();
+        // emotes and swings end with their clip or when the character moves; a death clip holds until `stand`
+        if self.transient.as_ref().is_some_and(|(_, hold)| !hold && (moving || self.avatar.finished())) {
+            self.transient = None;
+        }
+        let pose = match &self.transient {
+            Some((r, _)) => AvatarPose::still(r.clone()),
+            None if moving => AvatarPose { role, speed: self.movement.max_speed(), ref_speed: self.movement.ref_speed() },
+            None if self.fighting && role == Role::Idle => AvatarPose::still(Role::IdleCombat),
+            None => AvatarPose::still(role),
         };
         if let Err(e) = self.avatar.set_pose(&self.store, pose) {
             eprintln!("avatar pose: {e:#}");

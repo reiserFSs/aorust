@@ -145,6 +145,8 @@ pub enum Role {
     Hover,
     /// `social-<name>` emote, e.g. `Emote("backflip")`.
     Emote(String),
+    /// Any clip of the model by its name (`unarmed-rswing`, `die-shot`): combat swings and death clips.
+    Clip(String),
 }
 
 const ROLE_NAMES: &[(Role, &str)] = &[
@@ -174,6 +176,7 @@ impl Role {
     pub fn clip_name(&self) -> String {
         match self {
             Role::Emote(e) => format!("social-{e}"),
+            Role::Clip(c) => c.clone(),
             r => ROLE_NAMES.iter().find(|(x, _)| x == r).unwrap().1.to_string(),
         }
     }

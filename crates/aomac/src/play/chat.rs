@@ -25,6 +25,15 @@ use win::{ChatWindows, WinOut, G_VICINITY, LOCAL_GROUPS};
 /// Identity kind of characters (`SimpleChar_t`).
 const CHAR_KIND: i32 = 0xC350;
 
+/// Chat commands that act on the game, not on the chat (run by the combat layer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GameAction {
+    /// `/<emote>`, `/emote <name>`: `N3Msg_DoSocialAction(id)`.
+    Social(u32),
+    /// `/assist`.
+    Assist,
+}
+
 pub(super) struct Chat {
     /// Opened when the world appears; everything that arrives earlier (the MOTD comes during loading) waits in `backlog`.
     win: Option<ChatWindows>,
@@ -38,6 +47,8 @@ pub(super) struct Chat {
     ignored: HashSet<u32>,
     /// Zone frames queued by input lines (the flow drains them into the session).
     outbox: Vec<Frame>,
+    /// Actions of the game layer (`/<emote>`, `/assist`): taken by the flow ([`Chat::take_game`]).
+    game: Vec<GameAction>,
     /// Text event to drop: the character of the key that opened the input bar.
     swallow: Option<String>,
 }
@@ -58,7 +69,7 @@ impl Chat {
     pub fn new() -> Self {
         let mut net = net::ChatNet::default();
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
-        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], swallow: None }
+        Self { win: None, backlog: vec![], net, afk: None, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], game: vec![], swallow: None }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
@@ -129,6 +140,10 @@ impl Chat {
         if let Some(t) = texts.by_key(110, key) {
             self.line_to(gui, ChatLine::new(ChatKind::System, log::window_html("", &t)), Some("System"));
         }
+    }
+
+    pub fn take_game(&mut self) -> Vec<GameAction> {
+        std::mem::take(&mut self.game)
     }
 
     /// Frames to send to the zone server.
@@ -386,6 +401,8 @@ impl Chat {
                 let now = self.ignored.insert(id) || !self.ignored.remove(&id);
                 let _ = (now, name); // feedback text needs the TextDb: see IgnoreList; persistence is not ported
             }
+            ChatAction::Social(id) => self.game.push(GameAction::Social(id)),
+            ChatAction::ClientCommand(c) if c.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/assist")) => self.game.push(GameAction::Assist),
             other => eprintln!("chat: action not implemented: {other:?}"),
         }
     }

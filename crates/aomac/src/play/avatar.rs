@@ -133,10 +133,10 @@ impl AvatarLook {
     }
 }
 
-/// Roles that play once and hold their last frame (the jump arcs); every other clip loops. [GUESS]: derived from the clip
-/// names, the original's per-clip loop flags were not traced (docs/zone/avatar.md §4).
+/// Roles that play once and hold their last frame (the jump arcs, emotes, combat swings and death clips); every other clip
+/// loops. [GUESS]: derived from the clip names, the original's per-clip loop flags were not traced (docs/zone/avatar.md §4).
 fn one_shot(r: &Role) -> bool {
-    matches!(r, Role::JumpStand | Role::JumpForward)
+    matches!(r, Role::JumpStand | Role::JumpForward | Role::Emote(_) | Role::Clip(_))
 }
 
 /// Locomotion clips share a gait cycle: switching between them keeps the phase instead of restarting.
