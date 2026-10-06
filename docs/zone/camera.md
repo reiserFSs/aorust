@@ -107,9 +107,28 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
   (`SetRelPosRot` in `DecideSnap` [N3 0x1001f537], flag `+0x214`) and follows the avatar heading because the offset is avatar-relative.
   **[INFERENCE]** the ctor flag `+0x214` is true for the player (rigid snap). **[RE, resolved]** `FUN_10020290` [N3 0x10020290] builds the vehicle from `PreferredCameraMode`: 0 first person, 1 plain `CameraVehicle_t` (`FUN_1001f9c9`), 2 `CameraVehicleFixedThird_t(false)` (damped: `CalcSteering` = `SteeringCamArrive(optimal pos, 0.01)`), 3 `CameraVehicleFixedThird_t(true)` (rigid `DecideSnap`, default). Modes 1/2 are §7.
 * **Occlusion** (`RecalcOptimalPos`): `LineOfSight(target, wanted + dir·radius)`; if blocked, bisect the fraction in `[0.01, 0.95]`
-  (`_DAT_1003d618`, `_DAT_1003e228`) up to 20 times until the bracket is ≤ 0.001 (`_DAT_1003e220`); the camera sits at the last clear
-  fraction. The camera dynel has a collision sphere of radius 0.35 (`_DAT_1003ce4c` in `CreateCamera`) → `COLLISION_RADIUS`, the margin
+  (`_DAT_1003d618`, `_DAT_1003e228`) up to 20 times until the bracket is ≤ 0.001 (`_DAT_1003e220`); the camera sits at the last **tested midpoint**
+  (`+0x208` written before each test, fresh decompile 2026-10-06), not the last-clear lower bound. The camera dynel has a collision sphere of radius 0.35 (`_DAT_1003ce4c` in `CreateCamera`) → `COLLISION_RADIUS`, the margin
   tested beyond the camera. `Camera3p::update_with(.., clear)` takes the line-of-sight test (scene raycast).
+  **Rock clipping root fix (2026-10-06):** the integration previously sampled eight `sphere_hit(..., 0.2)` points and only checked
+  ground at the endpoint. `sphere_hit` excludes every face with `|normal.y| >= 0.5`, so overhanging/sloping rocks and ceilings were
+  invisible to the boom; thin walls could also fall between samples. `player::segment_clear` now reuses `Collision::line` in
+  **both directions**, as `n3Playfield_t::LineOfSight` [N3 0x1000d34c] does: its surface vtable `+0x0c` call at 0x1000d34c's body
+  first tests `from -> to`, then `to -> from` only if the first ray misses. Surface triangle tests are front-face-only
+  (`FUN_10031c6a`); both directions are required, not a new collision tolerance. See `collision/vehicle.rs` for the shared terrain/KD line implementation.
+  `CanSeeFlexedPos` [N3 0x1001d8c6] calls `FUN_1002046f`, which calls this same playfield sight function with `ignoreDoors=false`.
+  Its `RoomCanSeeFromTo` gate [0x1000d265] requires both endpoints inside rooms in dungeons and an open connecting door if the rooms
+  differ; the shared integration query now applies that gate too. Outdoors there is no room gate.
+  `turning_camera_pulls_in_at_a_sloping_rock_face` uses an overhanging triangle, turns through three headings,
+  checks the radius-extended boom is clear within the original `0.001 * wanted distance` bisection tolerance, and checks full distance
+  is restored after turning away. `occlusion_keeps_the_original_final_midpoint` distinguishes the original midpoint from a last-clear
+  clamp. Added, **not run** by this worker.
+  Offline frame route (no credentials/window): set `AOMAC_CAMERA_ROCK_POS=x,y,z` to a **measured server-coordinate** position beside
+  an ICC rock and `AOMAC_CAMERA_ROCK_SHOTS=/tmp/icc-rock`, then run
+  `cargo test --release -p aomac icc_rock_camera_turn_frames -- --ignored --nocapture`.
+  It loads pf 4582's real terrain/KD collision, runs the production third-person camera through 36 headings, checks every radius-extended
+  boom is clear within the original bisection tolerance and at least one heading pulls in, and writes `icc-rock-00.png` … `icc-rock-35.png`. Frames use static scene geometry
+  (no own-avatar model); head pivot is explicitly 1.5 m. **Not exercised here; no proven ICC rock coordinate exists in current captures/docs.**
 * **Zoom**: wheel (`n3Camera_t::` handler [N3 0x100200ef]): `pending += ZoomSpeed/10 · notches` (a notch is `raw/120` [GUI 0x1001ae14]); a
   notch against the pending direction first clears it. Per frame (`FUN_10022345` [N3 0x10022345]): `|pending| ≥ 1` → step = `dt · pending · 3`,
   else `dt · 3` signed; distance −= step, pending −= step; pending is dropped when its sign flips or it is below 0.3 m. Distance clamps to
