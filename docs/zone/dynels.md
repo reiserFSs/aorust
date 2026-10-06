@@ -30,8 +30,8 @@ N3 frame ──Zone::on_frame──▶ Dynels::on_message ──▶ Char (Mover)
 | dynel | look | source |
 |---|---|---|
 | player (`F & 1 == 0`) | `ActorRig::player`: body of breed/sex/`Fatness` (thin/normal/fat), naked skin of the `Race` (1 caucasian, 2 african, 3 asian) with the worn cloth composited over it (green key), head mesh `HeadMesh`, attractor meshes (weapons: places 1/2 = right/left hand) | docs/zone/dynel.md §1.3, formats.md § Skin |
-| NPC (`F & 1`) | rdb 1040023 record `MonsterData` → `Mesh` (rdb 1010002), `HeadMesh` of the record if the message has none; `textures[]` replace the part textures by exact material name, `cloth[]` are composited over the part texture; `MonsterScale/100` uniform scale | docs/zone/npc.md |
-| corpse (kind 0xC76A) | `CATMesh` stat model + cloth/head/skin/`textures[]`, `MonsterScale`; **pose = last frame of the model's `die*` clip [GUESS]** (the original's corpse pose was not found, docs/zone/static.md §5) | docs/zone/static.md |
+| NPC (`F & 1`) | rdb 1040023 record `MonsterData` → `Mesh` (rdb 1010002); head/attachments = the message's attractor list only (the record's `HeadMesh` selects the skin, it mounts nothing, npc.md §6); `textures[]` replace the part textures by exact material name, `cloth[]` are composited over the part texture; `MonsterScale/100` uniform scale; clip variants rolled per clip start (npc.md §3) | docs/zone/npc.md |
+| corpse (kind 0xC76A) | `CATMesh` stat model + cloth/head/skin/`textures[]`, `MonsterScale`; **pose = the unanimated CAT mesh (bind pose)**: `Corpse_t` / `VisualCATMesh_t::SetMesh` never start a clip, the 0xCF27 spell plays social keys < 100 only and the captured key is 0 (docs/zone/static.md §5) | docs/zone/static.md |
 | vending machine (0xC75B) and other item-family dynels | `StaticInstance` template (rdb 1000020) stats overlaid by the message stats → `Mesh` (rdb 1010001; default `pickupbox_misc` 9013) / `CATMesh`, override texture, `Flags` bit 0 = visible | docs/zone/static.md §2 |
 | doors, billboards, terminals the playfield places itself | rdb 1000026 `PlacedDynel` (`CreateRDBDynels`) → same item path (template + blob stats); position/rotation as stored | docs/zone/static.md §6 |
 | held weapon items (0xC74A) | invisible (they have a parent); the weapon is the holder's attractor mesh | docs/zone/static.md §4 |
@@ -65,9 +65,9 @@ attack indicator over a targeted dynel belongs to the target window (`hud_target
 
 ## 5. Open items
 
-* Corpse pose (see §2); the corpse look for non-player models without a `die*` clip is the bind pose.
+* A server-sent `CorpseAnimKey` 1..99 (never captured) would start a social clip on the corpse (static.md §5).
 * `Features` of players is an inference (bit 4); NPC `Features` come from their record.
-* Environment-map layer (`TextureData.env_texture`), `AlphaMode` 5, `ClearAttractors` vs the head mesh (docs/zone/npc.md §8).
+* Environment-map layer (`TextureData.env_texture`), `AlphaMode` 5. Heads/attachments: the mounted set is exactly the message's attractor list (`CharacterMesh::ClearAttractors` drops the `HeadMesh` entry added before it, `actor::attractor_list`, docs/zone/npc.md §6); a flag-bit-2 message mounts none.
 * Weapon attractor orientation: the mesh is mounted with the attractor's frame as is; no weapon-specific rotation was found.
 * Name tag billboard scaling (§4); health bars / indicators over heads.
 * Doors do not animate (open/close state is server driven and no door message is decoded).

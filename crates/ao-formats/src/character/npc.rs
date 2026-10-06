@@ -169,12 +169,14 @@ impl NpcRecord {
     }
 }
 
-/// `FUN_10010ebe`: a clip of `key`, else of its fallback parent (`FUN_10010ad1`), …, else the first clip of the table.
-pub fn anim_key(rec: &NpcRecord, key: u32) -> Option<u32> {
+/// `FUN_10010ebe`: the clips of `key`, else of its fallback parent (`FUN_10010ad1`), …, else the first clip of the table.
+/// The client picks one of them ([`pick_variant`]); the last resort is the single first value of the first key.
+pub fn anim_key_variants(rec: &NpcRecord, key: u32) -> &[u32] {
     let mut k = key;
     loop {
-        if let Some(&a) = rec.anim_variants(k).first() {
-            return Some(a);
+        let v = rec.anim_variants(k);
+        if !v.is_empty() {
+            return v;
         }
         let next = fallback_key(k);
         if next == k || next == key || next == 0 {
@@ -182,7 +184,60 @@ pub fn anim_key(rec: &NpcRecord, key: u32) -> Option<u32> {
         }
         k = next;
     }
-    rec.anims.first().and_then(|e| e.1.first().copied())
+    rec.anims.first().and_then(|e| e.1.get(..1)).unwrap_or(&[])
+}
+
+/// `FUN_10010ebe` with the first variant (what `FUN_1004570c` returns when the key has one value).
+pub fn anim_key(rec: &NpcRecord, key: u32) -> Option<u32> {
+    anim_key_variants(rec, key).first().copied()
+}
+
+/// `FUN_1003c802` (the animation holder's resolver `FUN_1003c8b7`, reached by every state / stance / attack start): the clips of the
+/// first key of the parent chain that has any; unlike [`anim_key_variants`] it has no "first entry of the table" last resort
+/// and also stops at parent 0 (the name rule that follows it applies to human skeletons only).
+pub fn holder_variants(rec: &NpcRecord, key: u32) -> &[u32] {
+    let mut k = key;
+    loop {
+        let v = rec.anim_variants(k);
+        if !v.is_empty() {
+            return v;
+        }
+        let next = fallback_key(k);
+        if next == k || next == 0 || next == key {
+            return &[];
+        }
+        k = next;
+    }
+}
+
+/// `FUN_1004570c`: one value of a multimap key. A single value is returned without touching the RNG; several are
+/// `values[rand() % count]` (`rand` = the CRT's, [`CrtRand::rand`]).
+pub fn pick_variant(values: &[u32], rand: &mut impl FnMut() -> u32) -> Option<u32> {
+    match values {
+        [] => None,
+        [v] => Some(*v),
+        v => Some(v[rand() as usize % v.len()]),
+    }
+}
+
+/// The Visual C++ 2010 CRT `rand()` (`MSVCR100.dll`, which every client DLL imports - `FUN_1004570c` calls it): per-thread
+/// `holdrand = holdrand * 214013 + 2531011; (holdrand >> 16) & 0x7fff`. A thread that never called `srand` starts at 1.
+/// `srand` callers found: `FUN_1011bb4a` [GC] = `srand(_time64())` (an ID-range remapper that runs on a playfield load) and
+/// `GfxVisualNano2::ProcessStuff` [DS 0x1001975e] = `srand(0x2a)` / `srand(effect seed)` while a particle effect is generated
+/// (not modelled: it makes the real sequence depend on the visible effects).
+#[derive(Clone, Debug)]
+pub struct CrtRand(u32);
+
+impl CrtRand {
+    /// `srand(seed)`.
+    pub const fn new(seed: u32) -> Self {
+        Self(seed)
+    }
+
+    pub fn rand(&mut self) -> u32 {
+        self.0 = self.0.wrapping_mul(214013).wrapping_add(2531011);
+        (self.0 >> 16) & 0x7fff
+    }
 }
 
 /// `FUN_10010ad1`: the parent of an animation key (0 = none).
@@ -319,5 +374,52 @@ mod tests {
         let o = texture_overrides(&m, &[t("body", 7, 0, 5), t("nothing", 9, 9, 0), t("body", 0, 8, 0)]);
         assert_eq!(o.len(), 1);
         assert_eq!((o[0].0, o[0].1.texture, o[0].1.env_texture, o[0].1.alpha_mode), (1, 7, 8, 5));
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+
+    fn rec(anims: Vec<(u32, Vec<u32>)>) -> NpcRecord {
+        NpcRecord { stats: vec![], anims, sounds: vec![], pairs: vec![], name: String::new(), trailing: 0 }
+    }
+
+    /// The classic MSVC CRT sequence after `srand(1)` (also the state of a thread that never seeded).
+    #[test]
+    fn crt_rand_sequence() {
+        let mut r = CrtRand::new(1);
+        assert_eq!([r.rand(), r.rand(), r.rand(), r.rand()], [41, 18467, 6334, 26500]);
+    }
+
+    /// `FUN_1004570c`: one value never touches the RNG, several are `rand() % count`.
+    #[test]
+    fn pick_uses_rand_only_for_several_values() {
+        let calls = std::cell::Cell::new(0);
+        let mut rand = || {
+            calls.set(calls.get() + 1);
+            7
+        };
+        assert_eq!(pick_variant(&[], &mut rand), None);
+        assert_eq!(pick_variant(&[9], &mut rand), Some(9));
+        assert_eq!(calls.get(), 0);
+        assert_eq!(pick_variant(&[10, 11, 12], &mut rand), Some(11)); // 7 % 3 = 1
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// Both resolvers take the variants of the first key of the parent chain; only `FUN_10010ebe` falls back to the table's first value.
+    #[test]
+    fn chain_variants() {
+        // idle 0x78 has two variants, walk 100 one; imp-back 0x7e -> 0x7f is absent -> not in the chain of 0x78
+        let r = rec(vec![(100, vec![5]), (0x78, vec![1, 2]), (0xb2, vec![])]);
+        assert_eq!(holder_variants(&r, 0xb2), &[1, 2]); // hover idle -> idle-stand
+        assert_eq!(anim_key_variants(&r, 0xb2), &[1, 2]);
+        assert_eq!(holder_variants(&r, 0x7e), &[] as &[u32]); // no parent hit, no table fallback
+        assert_eq!(anim_key_variants(&r, 0x7e), &[5]); // first value of the first key (100)
+        assert_eq!(anim_key(&r, 0x78), Some(1));
+        let mut seq = [0, 1].into_iter();
+        let mut rand = || seq.next().unwrap();
+        assert_eq!(pick_variant(holder_variants(&r, 0x78), &mut rand), Some(1));
+        assert_eq!(pick_variant(holder_variants(&r, 0x78), &mut rand), Some(2));
     }
 }

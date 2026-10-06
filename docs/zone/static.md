@@ -160,11 +160,24 @@ All 7: 5 empty cloth entries (part 0..4, texture 0), no `TextureData`, a `HeadMe
 The cloth/texture lists of NPC corpses are therefore empty: the model's default skin/textures show. A **player** corpse would
 carry cloth textures and a head (not captured).
 
-**Pose / animation: [UNRESOLVED].** None of `Corpse_t`'s overrides (`FUN_1007e7e2`, `FUN_1007e8e1`, `FUN_1007e622/642`, `+0x50`
-returns 2) starts a clip, and `VisualCATMesh_t::SetMesh` [DS 0x100728b7] was not seen setting one; so the model is shown
-in whatever state the CAT mesh starts in. The "collapsed/lying" look, if the original has one, is produced by the death clip
-the `SimpleChar_t` played before it became a corpse (combat docs) or by the model's first clip: **not established**. Render the
-bind/first-frame pose and label it as such.
+**Pose / animation [CODE, resolved]: none, the corpse is drawn unanimated (bind pose).** `Corpse_t`'s overrides never start a clip:
+`FUN_1007e7e2` (visual init, vtable `+0x7c`) = cloth `SetCATTexture`, then (stat `HeadMesh` 0x40 != 0) `SetSkinData` +
+`AddAttractorMesh(0, head, 2, 0)` (no `ClearAttractors` here), then `SetBodyScale(MonsterScale/100)`; `FUN_1007e622` / `FUN_1007e642`
+(vtable `+0xc0` / `+0xc8`) set / clear the looter flag `+0x1f0` and call `FUN_1007e11e` / `FUN_1007e198` (register / unregister the looting
+character in its `+0x1d0` component via `FUN_10058816` + `FUN_1003f5b2` / `FUN_1003f3b2`, dynel flag 0x80 / stat 0x62, effects 0x12 / 0x13: no
+animation call); `FUN_1007e8e1` (slot `+0x6c`) = a clamped stat read (0..100000, else 100) and an `LDBformat` text feed; `+0x50` returns 2
+(`FUN_1007e61c`); `FUN_1007e072` = collision flags; the ctor `FUN_1007e652` only sets stats. `VisualCATMesh_t::SetMesh` [DS 0x100728b7] only
+issues the async load (`FUN_10070656`); its completion `FUN_100704b8` creates the `RCATMesh` / `CATRender_t::SetMesh` without an animation, and
+`VisualCATMesh_t::SetAnimation` [DS 0x10073f23] has no caller inside DisplaySystem (export only).
+The only Gamecode path that animates an item is the spell **0xCF27** (`FUN_100a59f5` case 0xcf0b / 0xcf27 / 0xcf2a -> `FUN_100a4dcc`; every
+captured corpse carries one): `stat 5 != 0` targets `GetDynel(stat5, stat6)`, else the executing dynel (= the corpse); for a `SimpleItem_t`
+target with `stat 0x2d == 0`: `key` = the item's stat 0x1a1 (`CorpseAnimKey`) unless it is -1, then the spell's stat 7; **only `key < 100`** runs
+`FUN_10010e36(item, key, 1)` = `FUN_10010c57(key)` name rule (social ids 1..0x46) -> `VisualCATMesh_t::SetAnimation`. The captured spell
+arguments `(5,6,7,0x2d,0x2f,0x30,0xb) = (1,0,0,0,0,0,0x1f7)` and the absent `CorpseAnimKey` give key 0 (no social name) or, if the 0x1f7 were
+stat 7, 503 (the die animation id, but >= 100): no clip in both readings. The pose is therefore what an unanimated `CATRender` shows: the
+vertices as stored (bind pose); `build_corpse` uses `ActorRig::pose(None)` (test `corpse_is_unanimated`). The earlier "last frame of the die
+clip" guess is removed. **[UNRESOLVED]** a server-sent `CorpseAnimKey` 1..99 (never captured): the social clip would start (meaning of the
+`SetTime(handle, 0.0, total)` arguments not traced).
 
 ### Spell record (`GameData::SpellData_t`, GC list reader `FUN_100a6c58`, GD `operator>>` 0x1000d686)
 
@@ -236,7 +249,7 @@ Render with `ao_formats::mesh::decode_mesh_into(store, mesh, &mut scene)` (stati
 
 ## Unresolved (explicit)
 
-* Corpse pose/animation (§5). Vending machine `AnimPlay`/`AnimPos` (§6). Weapon attractor place enum (§4, inferred).
+* Vending machine `AnimPlay`/`AnimPos` (§6). Weapon attractor place enum (§4, inferred). A server-sent `CorpseAnimKey` < 100 (§5).
 * The four trailing integers of a 0xCF27 spell (§5); spells of other types are not decoded (`Corpse::read` errors on them, `parse_item_template` never reads them).
 * Full walk of placed-dynel blobs (§7, scan instead). Position/rotation of placed dynels are as stored (Y up); the client's `AddChildDynel` transform to the
   scene axes was not checked against a render.

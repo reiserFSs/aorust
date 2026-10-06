@@ -7,10 +7,10 @@
 //! Evidence for the field meanings: docs/zone/dynel.md §1, docs/zone/npc.md, docs/zone/motion.md.
 
 use anyhow::Context;
-use ao_formats::character::actor::{npc_part_textures, ActorAssets, ActorRig, PlayerLook};
+use ao_formats::character::actor::{attractor_list, npc_part_textures, ActorAssets, ActorRig, PlayerLook};
 use ao_formats::dynel_visual::{blob_stats, corpse_visual, default_mesh, effective_stats, item_template, placed_dynels, static_instance, visual, PlacedDynel};
-use ao_formats::character::{load_cat_mesh, CatAnim, ClothPart, Equipment, NpcRecord, TextureOverride, CHAR_MESH_TYPE};
-use ao_gui::{DrawList, FontId, Gui};
+use ao_formats::character::{load_cat_mesh, CatAnim, ClothPart, CrtRand, Equipment, NpcRecord, TextureOverride, CHAR_MESH_TYPE};
+use ao_gui::Gui;
 use ao_net::n3::dynel::{Dynel, SimpleCharFullUpdate};
 use ao_net::n3::misc::Misc;
 use ao_net::n3::motion::{max_speed, AnimState, Mode, Mover, STAT_HEALTH};
@@ -61,6 +61,8 @@ pub struct CharLook {
     /// `AttractorMeshData_t`: (place, rdb 1010001 mesh).
     pub attractors: Vec<(u8, i32)>,
 }
+    /// Message flag bit 2 (`SET_DYNEL_800`): `FUN_10077e13` skips the whole attractor block (head included).
+    pub skip_attractors: bool,
 
 impl CharLook {
     pub fn from_update(u: &SimpleCharFullUpdate) -> Self {
@@ -76,6 +78,7 @@ impl CharLook {
             cloth: u.cloth.iter().filter(|c| c.page == 0).map(|c| (c.part(), c.texture)).collect(),
             attractors: u.attractors.iter().map(|a| (a.place, a.mesh)).collect(),
         }
+            skip_attractors: u.flags & ao_net::n3::dynel::flag::SET_DYNEL_800 != 0,
     }
 }
 
@@ -116,7 +119,7 @@ impl Look {
 pub struct Built {
     pub model: ao_scene::Scene,
     pub rig: Option<Arc<ActorRig>>,
-    pub clips: HashMap<u32, Arc<CatAnim>>,
+    pub clips: HashMap<u32, Vec<Arc<CatAnim>>>,
     pub features: Option<i32>,
     /// Name tag anchor height, metres above the feet at scale 1.
     pub tag_height: f32,
@@ -146,7 +149,7 @@ enum Resp {
     Model { key: u64, result: Result<Built, String> },
     Placed(u32, Vec<PlacedDynel>),
     Weapon { holder: i32, slot: usize, set: Option<i32> },
-    Clip { key: u64, id: u32, anim: Option<Arc<CatAnim>> },
+    Clip { key: u64, id: u32, anims: Vec<Arc<CatAnim>> },
 }
 
 /// Background builder: reads the rdb and composes textures off the UI thread.
@@ -171,12 +174,13 @@ impl Worker {
                 let resp = match r {
                     Req::Model { key, look } => Resp::Model { key, result: build(&store, &mut assets, &look).map_err(|e| format!("{e:#}")) },
                     Req::Clip { key, look, id } => {
-                        let clip = if look.npc {
-                            NpcRecord::load(&store, look.monster_data as u32).ok().and_then(|r| ao_formats::character::anim_key(&r, id))
+                        // the record's variants of the key (`FUN_10010ebe`), every one loaded; the character rolls one when the clip starts
+                        let ids: Vec<u32> = if look.npc {
+                            NpcRecord::load(&store, look.monster_data as u32).map(|r| ao_formats::character::anim_key_variants(&r, id).to_vec()).unwrap_or_default()
                         } else {
-                            canim::resolve_clip(&assets.names, canim::clip_set(look.breed, look.sex), id as u16, false).map(|c| c.0)
+                            canim::resolve_clip(&assets.names, canim::clip_set(look.breed, look.sex), id as u16, false).map(|c| c.0).into_iter().collect()
                         };
-                        Resp::Clip { key, id, anim: clip.and_then(|c| assets.anim(&store, c).ok()) }
+                        Resp::Clip { key, id, anims: ids.into_iter().filter_map(|c| assets.anim(&store, c).ok()).collect() }
                     }
                     Req::Weapon { holder, slot, template, stats } => {
                         let tpl = template.and_then(|t| item_template(&store, t).ok().flatten());
@@ -268,8 +272,11 @@ fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::
     }
 }
 
-/// A corpse: the dead character's model in the pose of its death clip's last frame **[GUESS]** (docs/zone/static.md §5: the
-/// original's corpse pose was not found).
+/// A corpse: the dead character's model in the CAT mesh's own pose. `Corpse_t` never starts an animation (its overrides
+/// `FUN_1007e7e2`, `FUN_1007e8e1`, `FUN_1007e622/642` set textures / skin / head / scale only, `VisualCATMesh_t::SetMesh` [DS 0x100728b7] and
+/// its async load `FUN_100704b8` create the render mesh without one, the only `SetAnimation` caller is the "play animation"
+/// spell 0xCF27 `FUN_100a4dcc` -> `FUN_10010e36`, which plays social ids < 100 only and gets key 0 on every captured corpse),
+/// so the model is drawn unanimated = the bind pose (docs/zone/static.md §5).
 fn build_corpse(store: &RecordStore, assets: &mut ActorAssets, c: &CorpseLook) -> anyhow::Result<Built> {
     let player = ao_formats::screens::wire_breed_sex(c.breed, c.sex).ok().and_then(|(b, g)| {
         let model = ao_formats::character::player_model_build(store, b, g, 1).ok()?;
@@ -297,16 +304,18 @@ fn build_corpse(store: &RecordStore, assets: &mut ActorAssets, c: &CorpseLook) -
             ActorRig::new(store, c.cat_mesh, c.head, &npc_part_textures(store, &cat, &list, &cloth), &[])?
         }
     };
-    let die = assets.clips(store, rig.model_id)?.iter().find(|n| n.0.contains("die")).map(|n| n.1);
-    let clip = die.map(|id| assets.anim(store, id)).transpose()?;
-    let held = rig.pose(clip.as_deref().map(|a| (a, a.duration - 1.0)));
+    let held = rig.pose(None);
     Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), ..plain(Default::default(), true) })
 }
 
 fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) -> anyhow::Result<Built> {
-    let attachments: Vec<(u8, u32)> = look.attractors.iter().filter(|a| a.0 != 0).map(|a| (a.0, a.1 as u32)).collect();
+    let wire: Vec<(u8, u32)> = look.attractors.iter().filter(|a| a.1 > 0).map(|a| (a.0, a.1 as u32)).collect();
+    // `FUN_10077e13`: AddAttractorMesh(0, HeadMesh), ClearAttractors, AddAttractors(wire): the head is the wire list's place 0
+    let mut mounted = if look.skip_attractors { vec![] } else { attractor_list(look.head.filter(|&h| h > 0).map(|h| h as u32), &wire) };
+    let head = mounted.iter().position(|a| a.0 == 0).map(|i| mounted.remove(i).1);
+    let attachments = mounted;
     let (rig, rec) = if look.npc {
-        let (rig, rec) = npc_rig(store, look, &attachments)?;
+        let (rig, rec) = npc_rig(store, look, head, &attachments)?;
         (rig, Some(rec))
     } else {
         let (breed, gender) = ao_formats::screens::wire_breed_sex(look.breed as i32, look.sex as i32)?;
@@ -316,8 +325,7 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
             3 => ao_formats::character::Skin::Asian,
             _ => ao_formats::character::Skin::Caucasian,
         };
-        // the head is delivered as `HeadMesh` and as attractor place 0; the attractor wins (like `CachedCharacter::head_mesh`)
-        let head = look.attractors.iter().find(|a| a.0 == 0).map(|a| a.1).or(look.head).filter(|&h| h > 0).map(|h| h as u32);
+        // the race selects the naked skin; the head mesh is the place-0 attractor (`attractor_list`)
         let mut equipment = Equipment::default();
         for &(part, tex) in &look.cloth {
             if let Some(p) = ClothPart::ALL.get(part as usize).filter(|_| tex > 0) {
@@ -328,18 +336,17 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
         (ActorRig::player(store, assets, &look, &attachments)?, None)
     };
     let sig = rig.cat().signature;
-    let mut clips = HashMap::new();
+    let mut clips: HashMap<u32, Vec<Arc<CatAnim>>> = HashMap::new();
     match &rec {
         // NPC: the record's table, keyed by the client animation id (`AbstractAnimID_e`)
         Some(rec) => {
             let keys = STATES.iter().filter_map(|s| s.anim_id()).chain([DIE_KEY, ATTACK_KEY]).chain(DEATH_KEYS.iter().copied());
             for key in keys {
-                let id = if key == DIE_KEY || key == ATTACK_KEY || DEATH_KEYS.contains(&key) { ao_formats::character::anim_key(rec, key) } else { rec.anim_variants(key).first().copied() };
-                if let Some(id) = id {
-                    let a = assets.anim(store, id)?;
-                    if a.signature == sig {
-                        clips.insert(key, a);
-                    }
+                let ids = if key == DIE_KEY || key == ATTACK_KEY || DEATH_KEYS.contains(&key) { ao_formats::character::anim_key_variants(rec, key) } else { ao_formats::character::holder_variants(rec, key) };
+                let anims = ids.iter().map(|&id| assets.anim(store, id)).collect::<anyhow::Result<Vec<_>>>()?;
+                let anims: Vec<_> = anims.into_iter().filter(|a| a.signature == sig).collect();
+                if !anims.is_empty() {
+                    clips.insert(key, anims);
                 }
             }
         }
@@ -348,37 +355,27 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
             for s in STATES {
                 if let (Some(name), Some(id)) = (s.clip_name(), s.anim_id()) {
                     if let Some(a) = named(store, assets, rig.model_id, name)? {
-                        clips.insert(id, a);
+                        clips.insert(id, vec![a]);
                     }
                 }
             }
             for (key, name) in [(DIE_KEY, "die-knees"), (ATTACK_KEY, "unarmed-rswing")] {
                 if let Some(a) = named(store, assets, rig.model_id, name)? {
-                    clips.insert(key, a);
+                    clips.insert(key, vec![a]);
                 }
             }
         }
     }
     // weapon stance clips: players resolve the id by file name in the model's set, NPCs through their record (parent chain only)
     for &id in STANCE_IDS {
-        let clip = match &rec {
-            Some(rec) => {
-                let mut k = id as u32;
-                loop {
-                    if let Some(&c) = rec.anim_variants(k).first() {
-                        break Some(c);
-                    }
-                    let next = ao_formats::character::fallback_key(k);
-                    if next == 0 || next == k {
-                        break None;
-                    }
-                    k = next;
-                }
-            }
-            None => canim::resolve_clip(&assets.names, canim::clip_set(look.breed, look.sex), id, false).map(|c| c.0),
+        let ids: Vec<u32> = match &rec {
+            Some(rec) => ao_formats::character::holder_variants(rec, id as u32).to_vec(),
+            None => canim::resolve_clip(&assets.names, canim::clip_set(look.breed, look.sex), id, false).map(|c| c.0).into_iter().collect(),
         };
-        if let Some(a) = clip.map(|c| assets.anim(store, c)).transpose()?.filter(|a| a.signature == sig) {
-            clips.insert(id as u32, a);
+        let anims = ids.iter().map(|&c| assets.anim(store, c)).collect::<anyhow::Result<Vec<_>>>()?;
+        let anims: Vec<_> = anims.into_iter().filter(|a| a.signature == sig).collect();
+        if !anims.is_empty() {
+            clips.insert(id as u32, anims);
         }
     }
     let tag_height = rig.indicator_height();
@@ -392,15 +389,15 @@ fn named(store: &RecordStore, assets: &mut ActorAssets, model: u32, name: &str) 
 }
 
 /// An NPC: the record's model (`MonsterData` -> rdb 1040023 `Mesh`), `textures[]` replacing the part textures (`SetCATTextures`),
-/// worn `cloth[]` composited over the part's texture like the player equipment, head and attachment meshes.
-fn npc_rig(store: &RecordStore, look: &CharLook, attachments: &[(u8, u32)]) -> anyhow::Result<(ActorRig, NpcRecord)> {
+/// worn `cloth[]` composited over the part's texture like the player equipment, `head` (the place-0 attractor) and attachment
+/// meshes. The record's own `HeadMesh` stat only selects the naked skin textures (`FUN_10058078`), it mounts nothing.
+fn npc_rig(store: &RecordStore, look: &CharLook, head: Option<u32>, attachments: &[(u8, u32)]) -> anyhow::Result<(ActorRig, NpcRecord)> {
     let rec = NpcRecord::load(store, look.monster_data as u32)?;
     let model = rec.mesh().context("NPC record has no mesh")?;
     let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model)?;
     let list: Vec<TextureOverride> = look.textures.iter().map(|(m, t)| TextureOverride { material: m, texture: *t as u32, env_texture: 0, alpha_mode: 0 }).collect();
     let cloth: Vec<(ClothPart, u32)> = look.cloth.iter().filter(|c| c.1 > 0).filter_map(|&(p, t)| Some((*ClothPart::ALL.get(p as usize)?, t as u32))).collect();
     let overrides = npc_part_textures(store, &cat, &list, &cloth);
-    let head = look.head.map(|h| h as u32).or_else(|| rec.head_mesh());
     let rig = ActorRig::new(store, model, head, &overrides, attachments)?;
     Ok((rig, rec))
 }
@@ -418,6 +415,26 @@ enum Special {
 }
 
 /// One character/NPC dynel.
+/// The clip variant of a character, rolled when its clip starts (`FUN_1004570c`: `rand() % count`, no RNG call for a single
+/// value) and kept while it loops: every start of a clip goes through the holder's resolver `FUN_1003c8b7` again (state change
+/// `FUN_1006c065` -> `FUN_1006be27`, attack / emote start, revive `FUN_1003ea0d`), loops are infinite (loop count -1).
+#[derive(Default)]
+struct Roll {
+    key: Option<(u32, Option<AnimState>)>,
+    variant: usize,
+}
+
+impl Roll {
+    /// Index of the variant for the clip `key` (anim id, and the movement state for the base clip) among `len`.
+    fn pick(&mut self, key: (u32, Option<AnimState>), len: usize, rng: &mut CrtRand) -> usize {
+        if self.key != Some(key) {
+            self.key = Some(key);
+            self.variant = if len > 1 { rng.rand() as usize % len } else { 0 };
+        }
+        self.variant % len.max(1)
+    }
+}
+
 pub struct Char {
     pub name: String,
     pub npc: bool,
@@ -441,6 +458,7 @@ pub struct Char {
     parts: Vec<[[f32; 4]; 4]>,
     features_set: bool,
 }
+    roll: Roll,
 
 /// A corpse, vending machine, door, ... (everything that is not a `SimpleChar`): a fixed model at a fixed place.
 struct Prop {
@@ -485,6 +503,11 @@ pub struct Dynels {
     /// Lens of the playfield scene (projection of the name tags).
     pub lens: Lens,
 }
+    /// The tag sprites held by the renderer and the 2 s nametag listing (`play/tags.rs`).
+    tags: TagLayer,
+    listing: Listing,
+    /// The CRT's `rand()` the variant picks consume (`srand(time)` when the zone starts, [GUESS] for the exact call site).
+    rng: CrtRand,
 
 impl Default for Dynels {
     fn default() -> Self {
@@ -508,11 +531,14 @@ impl Default for Dynels {
             show_all_names: std::env::var_os("AOMAC_SHOW_ALL_NAMES").is_some(),
             lens: Lens::default(),
         }
+            tags: TagLayer::default(),
+            listing: Listing::default(),
+            rng: CrtRand::new(1),
     }
 }
 
-/// Clip for `state`: its own, else the client's fallback chain, else idle.
-fn clip_of(built: &Built, mut state: AnimState) -> Option<(u32, &Arc<CatAnim>)> {
+/// Clip(s) for `state`: its own, else the client's fallback chain, else idle.
+fn clip_of(built: &Built, mut state: AnimState) -> Option<(u32, &Vec<Arc<CatAnim>>)> {
     loop {
         if let Some(id) = state.anim_id() {
             if let Some(a) = built.clips.get(&id) {
@@ -542,6 +568,7 @@ impl Dynels {
     pub fn start(&mut self, dir: PathBuf, own: i32) {
         self.own = own;
         self.dir = Some(dir);
+        self.rng = CrtRand::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
     }
 
     /// Forgets every dynel (a playfield change, `Zone::reset_world`).
@@ -692,6 +719,7 @@ impl Dynels {
                         parts: vec![],
                         features_set: !u.is_npc(),
                     },
+                        roll: Roll::default(),
                 );
             }
             N3::Dynel(Dynel::CharDCMove(mv)) => {
@@ -747,9 +775,9 @@ impl Dynels {
         let mut placed = vec![];
         while let Ok(r) = worker.rx.try_recv() {
             match r {
-                Resp::Clip { key, id, anim } => {
-                    if let (Some(a), Some(Model::Ready { built, .. })) = (anim, self.models.get_mut(&key)) {
-                        built.clips.insert(id, a);
+                Resp::Clip { key, id, anims } => {
+                    if let (false, Some(Model::Ready { built, .. })) = (anims.is_empty(), self.models.get_mut(&key)) {
+                        built.clips.insert(id, anims);
                     }
                     for (who, _) in self.replay.iter().filter(|r| r.1 == id) {
                         if let Some(c) = self.chars.get_mut(who).filter(|c| c.key == key && c.special == Special::None) {
@@ -848,7 +876,7 @@ impl Dynels {
             }
             // clip: death / attack override the movement state; walking and running scale the clip with the real speed
             let state = c.pose.anim;
-            let (key, clip, rate) = match c.special {
+            let (key, list, rate) = match c.special {
                 Special::Die(k) => match built.clips.get(&k).or_else(|| built.clips.get(&DIE_KEY)) {
                     Some(a) => (k, Some(a), 1.0),
                     None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
@@ -885,6 +913,8 @@ impl Dynels {
                 }
             };
             if key != c.anim {
+            // the variant is rolled when the clip starts, not while it loops
+            let clip = list.filter(|l| !l.is_empty()).map(|l| &l[c.roll.pick((key, matches!(c.special, Special::None).then_some(state)), l.len(), &mut self.rng)]);
                 c.anim = key;
                 c.clip_ms = 0.0;
                 c.pose_in = 0.0;
@@ -1143,5 +1173,53 @@ mod tests {
             })
             .count();
         assert!(off * 10 <= z.world.chars.len(), "{off} of {} dynels are more than 3 m off the server polyline", z.world.chars.len());
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+
+    /// The variant is rolled when a clip starts (key or state change), not on every frame of its loop, and a single clip never
+    /// consumes the RNG (`FUN_1004570c`).
+    #[test]
+    fn variant_rolled_per_clip_start() {
+        let mut rng = CrtRand::new(1); // rand(): 41, 18467, 6334, 26500
+        let mut r = Roll::default();
+        let idle = (0x78, Some(AnimState::Idle));
+        assert_eq!(r.pick(idle, 3, &mut rng), 41 % 3);
+        for _ in 0..50 {
+            assert_eq!(r.pick(idle, 3, &mut rng), 41 % 3, "looping idle keeps its variant");
+        }
+        // a single-variant clip does not touch the RNG ...
+        assert_eq!(r.pick((0x65, Some(AnimState::Walk)), 1, &mut rng), 0);
+        // ... and the next start of the idle clip rolls the next value
+        assert_eq!(r.pick(idle, 3, &mut rng), 18467 % 3);
+        // the same clip started again after a special (attack) is a new start
+        assert_eq!(r.pick((1033, None), 2, &mut rng), 6334 % 2);
+        assert_eq!(r.pick(idle, 3, &mut rng), 26500 % 3);
+    }
+
+    /// Real data: the client's NPC records do file several idle variants under one key, and `holder_variants` finds them all.
+    #[test]
+    fn real_npc_records_have_idle_variants() {
+        let Some(dir) = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Games/ProjectRubiKa/client")).filter(|d| d.join("cd_image/rdb.db").exists()) else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let multi = store.ids(ao_formats::character::NPC_TYPE).unwrap().into_iter().filter_map(|id| NpcRecord::load(&store, id).ok()).filter(|r| ao_formats::character::holder_variants(r, 0x78).len() > 1).count();
+        eprintln!("records with >1 idle-stand variants: {multi}");
+        assert!(multi > 0);
+    }
+
+    /// A corpse is drawn unanimated: its body vertices are the model's own (bind) vertices, whatever death clips the model has.
+    #[test]
+    fn corpse_is_unanimated() {
+        let Some(dir) = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Games/ProjectRubiKa/client")).filter(|d| d.join("cd_image/rdb.db").exists()) else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let c = CorpseLook { cat_mesh: 22773, head: None, breed: 6, sex: 1, race: 1, cloth: vec![], textures: vec![] };
+        let built = build_corpse(&store, &mut assets, &c).unwrap();
+        let held = built.held.expect("held pose");
+        assert!(built.clips.is_empty());
+        assert_eq!(held.0, built.model.meshes[0].vertices);
     }
 }

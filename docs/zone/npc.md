@@ -59,9 +59,18 @@ The key space is `AbstractAnimID_e` (`n3EngineClientAnarchy_t::N3Msg_DoSocialAct
 the client has **no names** for the enumerators (no PDB). Names below are the clips the client's *own* records file under each key [DATA] (survey of 114 730 table
 entries). `NpcAnim` exposes the useful subset.
 
-**Lookup** (`FUN_10010ebe(table, key)`, called as `FUN_1004d8f9(key)` on the record): take one value of `key` at random (`FUN_1004570c`: `rand() % count`;
-`NpcRecord::anim` takes the first), else follow the parent key `FUN_10010ad1` until a key hits, the parent is 0, equals itself, or loops back to the start; else the
-**first entry of the map** (smallest key, first value; `0` when the map is empty). Parent table `FUN_10010ad1` [CODE]:
+**Lookup** (`FUN_10010ebe(table, key)`, called as `FUN_1004d8f9(key)` on the record; `NpcRecord::anim` / `anim_key` return the first variant,
+`anim_key_variants` the candidate list): take one value of `key` (`FUN_1004570c`, below), else follow the parent key `FUN_10010ad1` until a key hits, the parent is 0, equals itself, or loops back to the start; else the
+**first entry of the map** (smallest key, first value; `0` when the map is empty). The holder's resolver `FUN_1003c8b7` -> `FUN_1003c802` [GC 0x1003c802] (every state / stance / attack clip start) walks the same chain
+with `FUN_1004570c` per key but **without** the first-entry last resort (`holder_variants`).
+
+**Variant pick** (`FUN_1004570c(key)` [GC 0x1004570c], `pick_variant`): `n = count(key)` (`FUN_100456ac`); `n == 0` -> 0; `n == 1` -> that value **without calling `rand`**; `n > 1` ->
+value `rand() % n` of the multimap's equal range (insertion = file order). `rand` = the MSVCR100 CRT's (`CrtRand`: `holdrand * 214013 + 2531011 >> 16 & 0x7fff`, a thread starts at 1);
+`srand` callers: `FUN_1011bb4a` [GC] `srand(_time64())` (reads the playfield; a playfield-load remapper) and `GfxVisualNano2::ProcessStuff` [DS 0x1001975e] `srand(0x2a)` / `srand(effect seed)`
+per particle effect (not modelled). **When it is rolled**: on every lookup, i.e. every clip *start*: the movement-state handler `FUN_1006c065` -> `FUN_1006be27` (callers: the state
+transitions `FUN_1006d196 d5d0 d69c d821 d9e8 dd0c de93 df81 eb63 ecf0`) starts the idle (key from `holder+0x10`, default 0x78) / walk / run clip with `AnimHolder::Play(clip, 1.0, loop -1 (0xffffffff), layer 2)`:
+an **infinite loop**, so an idle never re-rolls at the loop end and there is no chance rule or blend between idle variants; the next roll happens at the next state change (also `FUN_1003ea0d` revive,
+`FUN_1006fcfa` end of a waypoint path, `FUN_1003cc15`/`FUN_1003cad0` stance idle, `FUN_1006a239` attack, `FUN_100a4dcc` emote). Implemented per character in `dynels::Roll` (rolled when the clip key or movement state changes), all variants are loaded into `Built::clips`.
 
 | key → parent | |
 |---|---|
@@ -126,10 +135,13 @@ if tex2 != 0: SetCATTexture(name, material=-1, tex2, layer 3,                   
   slot = `page(+0x10) * 5 + part(+0)`; table record `{+0x14 = e[1], +0x18 = e[2], +0x1c = e[3]}` at `(slot*0xc) + this`, set `this+0x18c = 1` (dirty) when `e[1]` changed.
   The component is `dynel+0x1b8` (`FUN_10058078` sets the same flag). Which consumer turns the table into textures for a *morphed* NPC was not found: monster models never go through
   the player equipment path (`FUN_10058078`: when a record exists the breed/sex/equipment model selection `FUN_10057eb3/10057ff7` is skipped).
-* **Attractors**: `FUN_10077e13`, only when VisualFlags bit 2 is clear: `CharacterMesh::AddAttractorMesh(cm, place 0, headMesh(+0xac), 4, 0)`, then
-  `ClearAttractors`, then `AddAttractors(cm, vector<AttractorMeshData_t>)`; an attractor = (place, rdb 1010001 mesh, int, byte) mounted on the model's `AttractorNN_*` point
+* **Attractors**: `FUN_10077e13`, only when message flag bit 2 (`SET_DYNEL_800`) is clear: `CharacterMesh::AddAttractorMesh(cm, place 0, headMesh(+0xac), 4, 0)`, then
+  `CharacterMesh::ClearAttractors` [DS 0x10071dd0], then `AddAttractors(cm, vector<AttractorMeshData_t>)`; an attractor = (place, rdb 1010001 mesh, int, byte) mounted on the model's `AttractorNN_*` point
   (lizard mesh: `Attractor01_head`, `Attractor06_back`; 5907: head, left/right hand, shoulders, back). Same code for players and NPCs [CODE].
-  Whether ClearAttractors drops the head mesh added just before was not resolved.
+  **`CharacterMesh::ClearAttractors` walks the attractor list (`this+4`, the list `AddAttractorMesh` [DS 0x10071cce] inserts into, ordered by place, new node before the first node with place >= its own) and deletes
+  every node: the head added one call earlier is gone.** The mounted set is therefore exactly the wire list; the head is its place-0 entry (`HeadMesh` and the place-0 entry are equal in every capture), a list without place 0 shows no head,
+  and the `HeadMesh` stat of the NPC *record* only feeds `SetSkinData` (`FUN_10058078`). (`VisualCATMesh_t::ClearAttractors` [DS 0x10073d8a], called by the appearance update `FUN_10071679` before `AddAttractors`, is a separate method that also unmounts from the render mesh and sets `+0x78`.)
+  The runtime head change `FUN_10059376` = `RemoveAttractorMesh(0, old)` + `AddAttractorMesh(0, new, 4, ...)`. Implemented as `actor::attractor_list` (test `clear_attractors_drops_the_head_mesh`), used by `dynels::build_char`.
 * **MonsterScale** (stat 0x168 = 360; wire percent): `FUN_1005bea6` ends with `n3VisualDynel_t::SetBodyScale(stat(0x168, kind 3) / 100.0)` (`_DAT_10158670` = 100.0);
   the stat setter clamps to **≥ 20** (`FUN_10059e6a`: `0x168` → 0x14) and `CharRadius` (0x1a5) = `MonsterScale × value / 100` (same function). Uniform scale of the whole model.
 * **Visibility**: `DisableVisibility` = `n3VisualDynel+0xc9 = 0` (N3 @0x1001954a; Enable sets 1; the VisualCATMesh has its own `+0x70`). `FUN_10077e13` calls it for
@@ -155,5 +167,5 @@ The 32 signature mismatches are 3 records: 257292 `unicorn lander` (mesh 257288 
 
 * Marker pairs (`0x0f,0x17` …), the 13 trailing bytes, the fourth list: Gamecode `FUN_1004d919` ignores them; no other reader exists (`0xfde97` occurs only in `FUN_1004dc30`, searched all DLLs for the 4-byte constant and the decimal 1040023: only Gamecode 0x1004dc4c).
 * Consumer of the record's other stats (Flags 0x4000, VolumeMass, Features, 0xc5, 0x165, CharRadius): the only direct readers found are `FUN_1004d8e6(stat)` callers `FUN_10058078`, `FUN_1006fb56`, `FUN_1009b4ac`; likely folded into the dynel's stat object (vtable `+0x3c` GetStat) [GUESS].
-* Cloth table → textures for morphed chars; `AlphaMode` 5; what `ClearAttractors` removes; the global compared in `FUN_10070247`; sound key names; the stat-0x167 → `this+8` setter (`thunk_FUN_10152f70` @0x10152f70 decompiles to garbage); `FUN_10057b41` return (monster id when Features & 0x800).
-* `AbstractAnimID_e` enumerator names (no symbols; derived from clip names above); random pick among variants is the client behaviour, `NpcRecord::anim` returns the first.
+* Cloth table → textures for morphed chars; `AlphaMode` 5; the global compared in `FUN_10070247`; sound key names; the stat-0x167 → `this+8` setter (`thunk_FUN_10152f70` @0x10152f70 decompiles to garbage); `FUN_10057b41` return (monster id when Features & 0x800).
+* `AbstractAnimID_e` enumerator names (no symbols; derived from clip names above); the effect-driven `srand` calls (`ProcessStuff`) that reseed the real `rand()` stream; the exact call moment of `FUN_1011bb4a`'s `srand(time)` ([GUESS]: zone start).

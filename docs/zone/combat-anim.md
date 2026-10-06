@@ -155,14 +155,14 @@ Weapon firing / impact sounds of real weapons are **not** played by this combat 
 (`Corpse_t` : `Chest_t` : `SimpleItem_t` family [GC 0x101622d4, docs/zone/static.md §1]; its mesh / cloth / look resolution is `ao_formats::dynel_visual`, docs/zone/static.md; name `Remains of <owner name>`), created with stats `Flags`(0) 0x181805, `CATMesh`(42) = the model, `MonsterScale`(360), `Sex`, `Breed`, `Cash`(61) (loot money),
 **`DeadTimer`(34) = 600**, **`TimeExist`(8) = 18000 / 180000**, `CorpseType`(415) = 50000, `CorpseInstance`(416) = owner id, `MultipleCount`(412) = 1; 5 cloth slots, no textures
 [DATA: 7 corpses]. Position/rotation = the dead char's last position (live: identical to its `FollowTarget` position). The corpse has no animation key in the capture (`CorpseAnimKey` 417
-absent; code `FUN_100a4dcc` reads it only for the spell-effect "play animation on item" path, `FUN_10010e36(item, key < 100, 1)`), so the pose the corpse mesh takes is **[UNRESOLVED]**
-(no die-clip name for corpse models was found; candidate: the owner's death animation held on its last frame).
+absent; code `FUN_100a4dcc` reads it only for the spell-effect "play animation on item" path, `FUN_10010e36(item, key < 100, 1)`), so the corpse plays **no clip**: it is the unanimated
+CAT mesh (bind pose), evidence in docs/zone/static.md §5 (not the owner's death clip held on its last frame).
 * Looting: `GenericCmd_t` (state 1, cmd 3, `Item{actor = own, item = {0xC76A, id}}`) 1.1 s after the corpse appeared (capture, 44741 ms vs 43632 ms) is the loot request; **[INFERENCE]** it opens the corpse inventory
   (`CORPSE_INVENTORY`, `N3Msg_SetLootAccess`, `Feedback_NotAllowedToLoot`, team loot strings); `BankCorpseIIR_t`, `ReclaimBooth_t` (the "Reclaim" window) are the player-corpse side.
 * Despawn: server driven (`n3ToClientQuitIIR_t` for the corpse; live corpse 5163 left 40 s after it arrived while `TimeExist` = 180000). The units of `DeadTimer` / `TimeExist`
   are **[UNRESOLVED]** (no code reads stat 34 / 8 by number; `DeadTimer` appears only in the stat table).
 
 ## 8. Not found / open
-* The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); corpse pose (7); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
+* The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
 * Weapon firing/impact FX + their sounds (effect scripts); `PlaySoundIIR_c` (0x455D2938), `GfxTriggerIIR_t` (0x7A222202) and `HealthDamageIIR_t` (0x3710256C) are registered
   message ids that never occur in the capture - server-driven sounds/effects may arrive through them.

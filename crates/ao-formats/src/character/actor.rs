@@ -99,6 +99,30 @@ struct Mount {
 
 pub struct ActorRig {
     cat: CatMesh,
+/// The attractor meshes `(place, rdb 1010001 mesh)` a character carries after the client applied its full update
+/// (`FUN_10077e13` [GC 0x10077e13], only when message flag bit 2 `SET_DYNEL_800` is clear):
+/// `CharacterMesh::AddAttractorMesh(0, HeadMesh)`, then **`CharacterMesh::ClearAttractors`** [DS 0x10071dd0] (deletes every node of
+/// the attractor list, the head just added included), then `CharacterMesh::AddAttractors(wire list)` (per entry
+/// `AddAttractorMesh` [DS 0x10071cce]). So the wire `HeadMesh` stat never reaches the model by itself: the head is the place-0
+/// entry of the wire list (the later runtime head change `FUN_10059376` removes/adds place 0 the same way). The list is ordered
+/// by place; a new entry is inserted before the first node whose place is `>=` its own (equal places: the later one first).
+/// `head` is `HeadMesh` (non-zero only), `wire` the message's attractor list.
+pub fn attractor_list(head: Option<u32>, wire: &[(u8, u32)]) -> Vec<(u8, u32)> {
+    let mut list: Vec<(u8, u32)> = vec![];
+    let add = |list: &mut Vec<(u8, u32)>, e: (u8, u32)| {
+        let at = list.iter().position(|n| n.0 >= e.0).unwrap_or(list.len());
+        list.insert(at, e);
+    };
+    if let Some(h) = head {
+        add(&mut list, (0, h));
+    }
+    list.clear(); // ClearAttractors
+    for &e in wire {
+        add(&mut list, e);
+    }
+    list
+}
+
     parents: Vec<Option<usize>>,
     scale: Vec<f32>,
     order: Vec<usize>,
@@ -297,3 +321,12 @@ mod tests {
         assert!(rig.model().textures.contains_key(&TextureKey { rdb_type: TEXTURE_TYPE, id: 22768 }));
     }
 }
+
+    /// `ClearAttractors` drops the head `AddAttractorMesh(0, HeadMesh)` just added: only the wire list survives, ordered by place.
+    #[test]
+    fn clear_attractors_drops_the_head_mesh() {
+        assert_eq!(attractor_list(Some(40629), &[]), vec![]);
+        assert_eq!(attractor_list(Some(40629), &[(5, 26163), (0, 40103)]), vec![(0, 40103), (5, 26163)]);
+        // equal places: the later insert goes before the earlier one
+        assert_eq!(attractor_list(None, &[(1, 7), (1, 8), (0, 3)]), vec![(0, 3), (1, 8), (1, 7)]);
+    }
