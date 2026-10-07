@@ -570,7 +570,7 @@ impl Avatar {
     /// The actor to draw this frame (CPU-skinned pose, never frustum culled).
     pub fn frame(&self) -> ActorFrame {
         let (skin, parts) = self.rig.pose_composed(self.layers());
-        ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, skin: Some(skin), always: true, alpha: 1.0, ..Default::default() }
+        ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, part_attractors: self.rig.part_attractors(), skin: Some(skin), always: true, alpha: 1.0, ..Default::default() }
     }
 
     /// Current effect anchor in world scene space, including heading and body scale.
@@ -1085,6 +1085,10 @@ pub(super) mod tests {
         assert!(!a.set_appearance(&store, &appearance(&[(0, head)])).unwrap(), "the login list is unchanged");
         assert!(a.set_appearance(&store, &appearance(&[(1, 0x3ddf), (0, head)])).unwrap());
         assert_eq!((a.model().meshes.len(), a.frame().parts.len()), (plain.0 + 1, plain.1 + 1), "the rifle is one more mounted mesh");
+        let held_frame = a.frame();
+        assert_eq!(held_frame.part_attractors, a.rig.part_attractors(), "the frame preserves the rig's authored mount places");
+        assert_eq!(held_frame.part_attractors.len(), a.model().meshes.len());
+        assert_eq!(held_frame.part_attractors[0], None, "the root body is not an attractor child");
         assert!(!a.set_appearance(&store, &appearance(&[(0, head), (1, 0x3ddf)])).unwrap(), "same set, other order");
         let idle = a.clip_id;
         a.set_stance(Some(3));
@@ -1115,6 +1119,7 @@ pub(super) mod tests {
         assert_eq!(a.clip_id, idle);
         assert!(a.set_appearance(&store, &appearance(&[(0, head)])).unwrap());
         assert_eq!((a.model().meshes.len(), a.frame().parts.len()), plain);
+        assert_eq!(a.frame().part_attractors, a.rig.part_attractors(), "unwear removes the old held-part metadata");
         if let Some(png) = std::env::var_os("AVATAR_SHOT_RIFLE") {
             a.set_appearance(&store, &appearance(&[(1, 0x3ddf), (0, head)])).unwrap();
             a.set_stance(Some(3));

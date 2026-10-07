@@ -2344,7 +2344,7 @@ impl Dynels {
             let skin = built.held.as_ref().filter(|_| !p.submitted).map(|h| h.0.clone()).or(moved);
             p.submitted = true;
             let parts = built.held.as_ref().map_or(vec![], |h| h.1.clone());
-            let actor = ActorFrame { id: p.id, model: p.key, transform, parts, skin, always: false, alpha: 1.0, ..Default::default() };
+            let actor = ActorFrame { id: p.id, model: p.key, transform, parts, part_attractors: built.rig.as_ref().map_or_else(Vec::new, |rig| rig.part_attractors()), skin, always: false, alpha: 1.0, ..Default::default() };
             if let Some(effects) = &mut self.effects {
                 let identity = (kind as u32, instance as u32);
                 if effects.needs_source_mesh(identity) { effects.prepare_source_mesh(identity, &built.model, &actor); }
@@ -2490,7 +2490,7 @@ impl Dynels {
             let (s, cs) = scene_yaw(c.pose.yaw).sin_cos();
             let k = c.scale;
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [p[0], p[1], p[2], 1.0]];
-            let actor = ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), skin, always: false, alpha: 1.0, ..Default::default() };
+            let actor = ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), part_attractors: rig.part_attractors(), skin, always: false, alpha: 1.0, ..Default::default() };
             if let Some(effects) = &mut self.effects {
                 let identity = (CHAR_KIND as u32, *id as u32);
                 if effects.needs_source_mesh(identity) { effects.prepare_source_mesh(identity, &built.model, &actor); }
