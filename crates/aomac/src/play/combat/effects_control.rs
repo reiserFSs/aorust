@@ -45,6 +45,8 @@ impl Controller {
     }
 
     pub(super) fn cancel(&mut self, renderer: &mut Renderer) {
+        // BPHFSM100d385e/100d3a93 stops only the controller: emitted handles
+        // are not retained by100d3b0e and finish their authored lifetimes.
         if let Some(spell)=&mut self.spell { spell.cancel(renderer); }
         if !self.registered { return; }
         let key=self.config.source_identity.unwrap();
@@ -259,6 +261,30 @@ mod tests {
         assert!(Controller::new(&t,Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default()).is_err());
         let t=Template {kind:1001,words:vec![0;22]};
         assert!(Controller::new(&t,Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default()).is_err());
+    }
+    #[test]
+    fn body_boost_cancel_preserves_emitted_children() {
+        let dir=ao_gui::client_dir();
+        if !dir.join("Setupf/gfxtweak.bin").exists() || !dir.join("cd_image/rdb.db").exists() {return;}
+        let mut renderer=Renderer::open(&dir).unwrap();
+        let template=renderer.templates.by_id[&1070].clone();
+        assert_eq!(template.kind,1001);
+        assert_eq!([template.word(10).unwrap(),template.word(11).unwrap()],[20091,20096]);
+        assert_eq!(template.float(8).unwrap(),-1.0);
+        for id in [20091,20096] {
+            assert_eq!(renderer.templates.by_id[&id].float(8).unwrap(),1.5);
+        }
+        let identity=(50000,1);
+        let mut controller=Controller::new(&template,Mat4::IDENTITY,Vec3::ZERO,EffectConfig {source_identity:Some(identity),source_appearance:Some([1,1,0,100]),..EffectConfig::default()}).unwrap();
+        renderer.elapsed=6.0;
+        assert!(controller.frame(0.0,&mut renderer).unwrap());
+        let children:Vec<_>=renderer.active.iter().filter(|a|matches!(a.effect,20091|20096)).map(|a|a.actor).collect();
+        assert_eq!(children.len(),2);
+        controller.cancel(&mut renderer);
+        assert!(!renderer.bph_last.contains_key(&identity));
+        assert!(children.iter().all(|handle|renderer.active.iter().any(|a|a.actor==*handle)));
+        controller.cancel(&mut renderer);
+        assert!(children.iter().all(|handle|renderer.active.iter().any(|a|a.actor==*handle)));
     }
     #[test]
     fn cast_hands_and_target_refresh_independently() {

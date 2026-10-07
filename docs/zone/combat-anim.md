@@ -498,6 +498,19 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
   It emits the authored children in words10/11, uses source-identity shared
   five-second throttling (`101601f8`) and random retry (`1016b338=1/16384`),
   and preserves word21's −1/infinite, zero/no-emission distinction.
+  Cancellation (`100d385e`, vtable `1016b404` slot6) sets only `+0x14=1`.
+  Deleting destructor `100d4130` calls `100d3a93`, which frees the source
+  anchor (`+0x34`) and decrements/removes the source throttle entry; it never
+  deletes emitted effects. `100d3b0e` keeps child handles only in locals for
+  colour setters, not in controller fields. Thus Body Boost cancellation
+  stops future pulses but lets an already emitted pulse finish.
+  Authored `gfxtweak.bin`1070 (class1001, payload offset `0x588`) has
+  word8=−1, words10/11=20091/20096, word20=4, word21=−1. Both children
+  are class1002 with word8=1.5 seconds (payload offsets `0xad04`/`0xaf34`);
+  that finite visual tail is retail behavior, not a stuck buff controller.
+  Regression `body_boost_cancel_preserves_emitted_children` checks these
+  authored records and that cancellation releases the throttle without
+  deleting either emitted child.
 * Class1002's orbiting children (`100d4f72`/`100d52dc`/`100d53e3`/
   `100d57bb`/`100d4d6b`) use their actual class0 body-profile records
   (20013/20018,42words), selected by Breed/Sex/BodyShape/MonsterScale,
