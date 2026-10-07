@@ -187,7 +187,7 @@ fn best_rest_clip(store: &RecordStore, mesh: &CatMesh, frames: &[Option<Xf>]) ->
     let trace = |a: &Xf, b: &Xf| (0..3).map(|i| (0..3).map(|k| a.r[k][i] * b.r[k][i]).sum::<f32>()).sum::<f32>();
     let mut best: Option<(f32, CatAnim)> = None;
     for id in store.ids(CHAR_ANIM_TYPE)? {
-        let Some(a) = store.get(CHAR_ANIM_TYPE, id)?.and_then(|b| CatAnim::parse(&b).ok()).filter(|a| a.signature == mesh.signature) else { continue };
+        let Some(a) = store.get(CHAR_ANIM_TYPE, id)?.and_then(|b| CatAnim::parse_matching(&b, mesh.signature).ok().flatten()) else { continue };
         let world = bone_world(mesh, Some((&a, 0.0)));
         let score: f32 = frames.iter().zip(&world).filter_map(|(f, w)| f.map(|f| ((trace(&f, w) - 1.0) / 2.0).clamp(-1.0, 1.0).acos())).sum();
         if best.as_ref().is_none_or(|b| score < b.0) {
@@ -565,10 +565,8 @@ pub fn load_anim(store: &RecordStore, id: u32) -> Result<CatAnim> {
 pub fn compatible_animations(store: &RecordStore, mesh: &CatMesh) -> Result<Vec<(u32, f32)>> {
     let mut out = vec![];
     for id in store.ids(CHAR_ANIM_TYPE)? {
-        if let Some(a) = store.get(CHAR_ANIM_TYPE, id)?.and_then(|b| CatAnim::parse(&b).ok()) {
-            if a.signature == mesh.signature {
-                out.push((id, a.duration));
-            }
+        if let Some(a) = store.get(CHAR_ANIM_TYPE, id)?.and_then(|b| CatAnim::parse_matching(&b, mesh.signature).ok().flatten()) {
+            out.push((id, a.duration));
         }
     }
     Ok(out)

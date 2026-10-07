@@ -149,17 +149,19 @@ impl Delta {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static KEY_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl CatAnim {
     /// The skeleton hash of a record without decoding its keys (header fields of [`CatAnim::parse`]).
     pub fn signature_of(d: &[u8]) -> Result<u32> {
         let mut r = Rd::new(d);
-        r.name32()?;
+        r.bytes(32)?;
         let n_events = r.u32()? as usize;
         ensure!(n_events * 36 <= r.remaining(), "event table overruns record");
-        for _ in 0..n_events {
-            r.u32()?;
-            r.name32()?;
-        }
+        r.bytes(n_events * 36)?;
         ensure!(r.u32()? == 3, "file is not a CATAnim");
         let version = r.u32()? & !0x100_0000;
         r.u32()?; // duration (u32 or f32 by version)
@@ -167,7 +169,17 @@ impl CatAnim {
         r.u32()
     }
 
+    /// Reject a foreign skeleton before allocating or decompressing its key tracks.
+    pub(super) fn parse_matching(d: &[u8], signature: u32) -> Result<Option<Self>> {
+        if Self::signature_of(d)? != signature {
+            return Ok(None);
+        }
+        Self::parse(d).map(Some)
+    }
+
     pub fn parse(d: &[u8]) -> Result<Self> {
+        #[cfg(test)]
+        KEY_DECODES.with(|count| count.set(count.get() + 1));
         let mut r = Rd::new(d);
         let root = r.name32()?;
         let n_events = r.u32()? as usize;
@@ -284,6 +296,22 @@ fn slerp(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_skeletons_do_not_decode_keys() {
+        let mut record = vec![0; 32];
+        for word in [0u32, 3, 0x100_0106, 0, 7] {
+            record.extend_from_slice(&word.to_le_bytes());
+        }
+        // Deliberately no key payload: a matching record must attempt the full parser.
+        let before = KEY_DECODES.with(std::cell::Cell::get);
+        for signature in 8..108 {
+            assert!(CatAnim::parse_matching(&record, signature).unwrap().is_none());
+        }
+        assert_eq!(KEY_DECODES.with(std::cell::Cell::get), before, "foreign records must perform zero key decodes");
+        assert!(CatAnim::parse_matching(&record, 7).is_err());
+        assert_eq!(KEY_DECODES.with(std::cell::Cell::get), before + 1, "compatible records retain full validation");
+    }
 
     #[test]
     fn slerp_halfway_and_shortest_path() {

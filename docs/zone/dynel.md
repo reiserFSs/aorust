@@ -215,6 +215,12 @@ unweighted attractor bone, dropping that bone's local rotation and translation. 
 reuses `character::build`'s `best_rest_clip` / `derived_bind_frame` resolution once, outside the pose
 hot path. `atrox_unweighted_head_mount_matches_character_loader` compares the complete head
 transform for captured heads 40103 and 223940 with the existing character loader.
+Rest selection checks the CATAnim header skeleton signature before decoding key streams;
+foreign skeletons cannot affect the existing minimum bind-rotation score or tie ordering.
+This removes unrelated animation decompression from serial background model rebuilds,
+without changing head transforms, appearance materials, or effects. Deterministic work
+regressions `foreign_skeletons_do_not_decode_keys` and
+`rest_search_decodes_only_compatible_records` count full key-parser calls rather than wall time.
 `captured_remote_appearance_screenshots` renders front/back PNGs of the unmodified captured
 Xantarr, Stanko (dual shotguns), and Bergdoktor (cloth/back attachment) with `AOMAC_SHOT_DIR`.
 

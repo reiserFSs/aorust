@@ -511,6 +511,22 @@ mod tests {
     }
 
     #[test]
+    fn rest_search_decodes_only_compatible_records() {
+        let Some(store) = store() else { return };
+        let model = player_model_build(&store, Breed::Atrox, Gender::Male, 1).unwrap();
+        let cat = load_cat_mesh(&store, CHAR_MESH_TYPE, model).unwrap();
+        let ids = store.ids(CHAR_ANIM_TYPE).unwrap();
+        let compatible = ids.iter().filter(|&&id| {
+            store.get(CHAR_ANIM_TYPE, id).unwrap().is_some_and(|bytes| CatAnim::signature_of(&bytes).ok() == Some(cat.signature))
+        }).count();
+        assert!(compatible > 0 && compatible < ids.len(), "fixture includes compatible and foreign skeletons");
+        let before = super::super::anim::KEY_DECODES.with(std::cell::Cell::get);
+        let rest = best_rest_clip(&store, &cat, &bind_frames(&cat)).unwrap();
+        assert_eq!(rest.signature, cat.signature);
+        assert_eq!(super::super::anim::KEY_DECODES.with(std::cell::Cell::get) - before, compatible, "rest search must decode no foreign key streams");
+    }
+
+    #[test]
     fn atrox_unweighted_head_mount_matches_character_loader() {
         let Some(store) = store() else { return };
         let assets = ActorAssets::new(&store).unwrap();
