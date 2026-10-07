@@ -131,7 +131,9 @@ fn shots() {
     let mut o = Offscreen::new(&p, SIZE).unwrap();
     backdrop(&p);
     let t = Instant::now();
-    while !p.char_ready && t.elapsed() < Duration::from_secs(20) {
+    while !p.char_ready {
+        assert!(t.elapsed() < Duration::from_secs(300),
+            "character selection models did not load within 300s; check client assets and background loader");
         steps(&mut p, &mut o, 1, 0.05);
     }
     steps(&mut p, &mut o, 20, 0.05);
@@ -144,8 +146,9 @@ fn shots() {
     p.start_creation(&mut Host::headless());
     // Skip the intro locally; process-wide environment mutation races native getenv readers.
     let t = Instant::now();
-    while p.cc.as_ref().is_some_and(|c| c.actors.is_empty()) {
-        assert!(t.elapsed() < Duration::from_secs(20), "creation actors did not initialize");
+    while !p.cc.as_ref().is_some_and(|c| !c.actors.is_empty()) {
+        assert!(t.elapsed() < Duration::from_secs(300),
+            "creation actors did not initialize within 300s; check client assets and background loader");
         steps(&mut p, &mut o, 1, 0.05);
     }
     let c = p.cc.as_mut().unwrap();
@@ -194,8 +197,15 @@ fn click(p: &mut Play, o: &mut Offscreen, x: f32, y: f32) {
 fn wait_active(p: &mut Play, o: &mut Offscreen, scene: usize) {
     let t = Instant::now();
     while !p.cc.as_ref().is_some_and(|c| c.st == St::Active && c.cur == Some(Sc::from(scene))) {
-        assert!(t.elapsed() < Duration::from_secs(90), "scene {scene} never became active");
+        assert!(t.elapsed() < Duration::from_secs(300),
+            "creation scene {scene} never became active within 300s; check client assets and background loader");
         steps(p, o, 1, 0.05);
     }
-    steps(p, o, 150, 0.02); // the actors' background loads
+    // Wait for actual actor meshes/textures, not a fixed number of simulated frames.
+    let t = Instant::now();
+    while !p.cc.as_ref().is_some_and(|c| !c.actors.is_empty() && c.actors.iter().all(|a| a.first.is_some())) {
+        assert!(t.elapsed() < Duration::from_secs(300),
+            "creation scene {scene} actor models did not load within 300s; check client assets and background loader");
+        steps(p, o, 1, 0.05);
+    }
 }

@@ -1076,9 +1076,12 @@ mod tests {
         assert!(i.shop.shop.is_none(), "defer until effective pricing is ready");
         z.world.start(ao_gui::client_dir(), OWN as i32);
         let mut host = ao_render::Host::headless();
-        for _ in 0..600 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
             z.world.update_with_collision(0.05, [0.0; 3], [0.0, 0.0, 1.0], &mut host, None, |_| None);
             if z.world.stat_of(machine.kind, machine.instance, 0x1ab).is_some() { break; }
+            assert!(std::time::Instant::now() < deadline,
+                "captured machine {machine:?} retail pricing template did not load within 300s; check client assets and background loader");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let (t, who) = i.shop.pending_start.take().expect("deferred start");
@@ -1115,9 +1118,12 @@ mod tests {
         assert!(i.shop.shop.is_none());
         z.world.start(ao_gui::client_dir(), own as i32);
         let mut host = ao_render::Host::headless();
-        for _ in 0..600 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
             z.world.update_with_collision(0.05, [0.0; 3], [0.0, 0.0, 1.0], &mut host, None, |_| None);
             if z.world.stat_of(machine.kind, machine.instance, 0x1ab).is_some() { break; }
+            assert!(std::time::Instant::now() < deadline,
+                "captured parented shop {machine:?} retail pricing template did not load within 300s; check client assets and background loader");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert_eq!(z.world.stat_of(machine.kind, machine.instance, 12), Some(6546), "Mesh comes from retail template, not the streamed update");

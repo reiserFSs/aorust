@@ -49,6 +49,11 @@ N3 frame ──Zone::on_frame──▶ Dynels::on_message ──▶ Char (Mover)
 * Unweighted attachment bind frames use the same best-rest-clip selection as the character loader (`character.rs::best_rest_clip`);
   `ActorAssets` memoises successful selections by `(model id, skeleton signature)` across appearance rebuilds. Model id matters because
   the score uses that model's fitted bind frames; different models sharing a skeleton must not share the selected clip.
+* Test readiness follows the requested model key, not a fixed number of simulated frames. `Dynels::Worker::start` creates
+  one FIFO worker per world; captured props and HashMap-order character requests can precede a fixture's target, and
+  parallel fixtures have independent cold asset caches. The combat fixture queues its required player/creature looks
+  first without removing captured entities. Model-ready fixtures use a **300-second safety deadline** and report the
+  pending keys/states on failure; animation observation windows still use their authored simulated durations.
 
 ## 2. What is drawn and how
 

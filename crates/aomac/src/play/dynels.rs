@@ -2634,6 +2634,16 @@ impl Dynels {
 }
 
 #[cfg(test)]
+fn model_state(world: &Dynels, key: u64) -> &'static str {
+    match world.models.get(&key) {
+        Some(Model::Ready { .. }) => "ready",
+        Some(Model::Loading) => "loading",
+        Some(Model::Failed) => "failed",
+        None => "not queued",
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2932,7 +2942,8 @@ mod tests {
             host.actor_models.clear();
             skin
         };
-        for _ in 0..600 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
             if let Some(p) = w.props.get(&(who.kind, who.instance)) {
                 eye = scene_pos(p.pos);
                 eye[2] += 4.0;
@@ -2941,6 +2952,9 @@ mod tests {
                 }
             }
             frame(&mut w, eye, 0.05, &mut host);
+            let state = w.props.get(&(who.kind, who.instance)).map(|p| (p.key, model_state(&w, p.key)));
+            assert!(!state.is_some_and(|(_, state)| state == "failed"), "door {who:?} model failed: {state:?}");
+            assert!(std::time::Instant::now() < deadline, "door {who:?} model not ready after 300s: {state:?}");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let key = w.props[&(who.kind, who.instance)].key;
@@ -3061,9 +3075,15 @@ mod tests {
         }
         assert_eq!(z.world.props.keys().filter(|k| k.0 == 0xC75B).count(), 1, "vending machine");
         let looks: HashSet<u64> = z.world.chars.values().map(|c| c.key).collect();
-        let keys = |z: &Zone| z.world.chars.values().map(|c| c.key).chain(z.world.props.values().map(|p| p.key)).collect::<Vec<_>>();
+        // The own avatar has its own builder; Dynels only queues remote characters.
+        // An appearance update's next look is the requested model, not its old displayed key.
+        let keys = |z: &Zone| z.world.chars.iter().filter(|(id, _)| **id != z.world.own)
+            .map(|(_, c)| c.next.unwrap_or(c.key)).chain(z.world.props.values().map(|p| p.key)).collect::<Vec<_>>();
         assert!(looks.len() < z.world.chars.len(), "NPCs of one species share a model");
         let Some(dir) = client() else { return };
+        let playfield = z.world.playfield.expect("capture announces its playfield");
+        let placed: Vec<_> = placed_dynels(&RecordStore::open(&dir).unwrap(), playfield).unwrap().into_iter()
+            .filter(|d| d.template != 0).map(|d| (d.kind as i32, d.instance as i32)).collect();
         z.world.start(dir.clone(), 25988);
         let own = z.own().unwrap().clone();
         let eye = scene_pos(own.pos);
@@ -3071,14 +3091,25 @@ mod tests {
         let mut host = Host::headless();
         let mut models = vec![];
         let mut actors = vec![];
-        for _ in 0..600 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
             z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             models.append(&mut host.actor_models);
             actors = std::mem::take(&mut host.actors);
-            let pending = keys(&z).iter().any(|k| matches!(z.world.models.get(k), None | Some(Model::Loading))) || z.world.want_placed.is_some() || z.world.props.len() < 12 || z.world.wield.len() < 3;
+            let pending = keys(&z).iter().any(|k| !matches!(z.world.models.get(k), Some(Model::Ready { .. })))
+                || z.world.want_placed.is_some() || placed.iter().any(|id| !z.world.props.contains_key(id)) || z.world.wield.len() < 3;
             if !pending {
                 break;
             }
+            let waiting: Vec<_> = keys(&z).into_iter().filter_map(|key| {
+                let state = model_state(&z.world, key);
+                (state != "ready").then_some((key, state))
+            }).collect();
+            assert!(!waiting.iter().any(|(_, state)| *state == "failed"), "captured required model failed: {waiting:?}");
+            assert!(std::time::Instant::now() < deadline,
+                "captured zone not ready after 300s: models={waiting:?}, placed request={:?}, missing placed={:?}, props={}, wield={}",
+                z.world.want_placed, placed.iter().filter(|id| !z.world.props.contains_key(id)).collect::<Vec<_>>(),
+                z.world.props.len(), z.world.wield.len());
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // frame cost of the dynel update with every captured dynel in view (skinning at most every 40 ms each)
@@ -3477,22 +3508,29 @@ mod variant_tests {
         assert_eq!(rec.len(), 6);
         let unwield = frames(&format!("0 < {UNWIELD_SLOT_6}"));
         let mut host = ao_render::Host::headless();
-        let mut pump = |z: &mut Zone, n: usize, until: &dyn Fn(&Dynels) -> bool| {
-            for _ in 0..n {
+        // Positive readiness waits use the safety deadline; negative observations retain their frame windows.
+        let mut pump = |z: &mut Zone, frames: Option<usize>, until: &dyn Fn(&Dynels) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            let mut remaining = frames;
+            loop {
+                if remaining == Some(0) { return false; }
+                if let Some(n) = &mut remaining { *n -= 1; }
                 z.world.update_with_collision(0.02, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
                 if until(&z.world) {
                     return true;
                 }
+                assert!(std::time::Instant::now() < deadline,
+                    "own rifle {own} not resolved after 300s: wield={:?}, weapons={:?}, pending weapons={}",
+                    z.world.wield.get(&own), z.world.weapons, z.world.pending_weapons.len());
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            false
         };
         let attractors = |z: &mut Zone| std::mem::take(&mut z.own_events).into_iter().filter_map(|e| if let OwnEvent::Appearance(a) = e { Some(a.attractors.iter().filter(|t| t.b > 0).map(|t| (t.a, t.b as u32)).collect::<Vec<_>>()) } else { None }).collect::<Vec<_>>();
         let wear = |z: &mut Zone, i: usize| rec[2 * i..2 * i + 2].iter().for_each(|f| {
             let _ = z.on_frame(f);
         });
         wear(&mut z, 0);
-        assert!(pump(&mut z, 500, &|w| w.wielded_set(own) == Some(3)), "the rifle never resolved");
+        assert!(pump(&mut z, None, &|w| w.wielded_set(own) == Some(3)), "the rifle never resolved");
         assert_eq!(attractors(&mut z), [vec![(1, 0x3ddf), (0, 0x9ee9)]], "the rifle mesh in the right hand attractor, next to the head");
         assert_eq!(z.world.arms.damage_type(own, 6, 0), Some(0x5a));
         let (anim, delay, key) = z.world.pick_swing(own, canim::list::ATTACK).unwrap();
@@ -3505,16 +3543,16 @@ mod variant_tests {
         assert_eq!((z.world.wielded_set(own), z.world.pick_swing(own, canim::list::ATTACK), z.world.arms.damage_type(own, 6, 0)), (None, None, None));
         wear(&mut z, 1);
         assert_eq!(attractors(&mut z), [vec![(0, 0x9ee9)]], "the unwear's list: the head only");
-        assert!(!pump(&mut z, 20, &|w| w.wielded_set(own).is_some()), "the bag slot 0x41 is no hand");
+        assert!(!pump(&mut z, Some(20), &|w| w.wielded_set(own).is_some()), "the bag slot 0x41 is no hand");
         // wear again; unwield after the request went to the worker, before its answer is read: the stale answer is dropped
         wear(&mut z, 2);
-        pump(&mut z, 1, &|_| false);
+        pump(&mut z, Some(1), &|_| false);
         unwield.iter().for_each(|f| {
             let _ = z.on_frame(f);
         });
-        assert!(!pump(&mut z, 100, &|w| w.wielded_set(own).is_some()));
+        assert!(!pump(&mut z, Some(100), &|w| w.wielded_set(own).is_some()));
         wear(&mut z, 2);
-        assert!(pump(&mut z, 500, &|w| w.wielded_set(own) == Some(3)));
+        assert!(pump(&mut z, None, &|w| w.wielded_set(own) == Some(3)));
     }
 
     /// Opt-in real-renderer evidence of unmodified captured remote-player looks.
@@ -3606,7 +3644,7 @@ mod variant_tests {
 
     /// The captured wear / unwear `AppearanceUpdate`s (zone_wear_rifle_borealis.rec, own character) retargeted to another player of
     /// zone_ithaca.rec: his attractor list becomes the rifle (right hand) + head, then the head only, each time as a rebuilt model; the
-    /// old model stays drawn until the new one is ready. Asset readiness uses a wall-clock deadline, not a fixed frame budget.
+    /// old model stays drawn until the new one is ready. Asset readiness has only a 300s safety deadline, not a fixed frame budget.
     #[test]
     fn other_player_wields_and_unwields_live() {
         let Some(dir) = client() else { return };
@@ -3622,7 +3660,7 @@ mod variant_tests {
         let mut host = ao_render::Host::headless();
         let mut settle = |w: &mut Dynels| {
             let expected = w.chars[&id].next.unwrap_or(w.chars[&id].key);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             loop {
                 w.update_with_collision(0.0, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
                 host.actors.clear();
@@ -3638,7 +3676,7 @@ mod variant_tests {
                     return;
                 }
                 assert!(std::time::Instant::now() < deadline,
-                    "player {id} ({}) model {expected:016x} not ready after 60s: {state}; current={:016x}, next={:?}", c.name, c.key, c.next);
+                    "player {id} ({}) model {expected:016x} not ready after 300s: {state}; current={:016x}, next={:?}", c.name, c.key, c.next);
                 std::thread::yield_now();
             }
         };
@@ -3819,13 +3857,15 @@ mod variant_tests {
         assert!(matches!(z.world.chars[&leet].special, Special::Die(503)));
         let mut host = Host::headless();
         let (eye, fwd) = (crate::play::zone::scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
             z.world.update_with_collision(0.0, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
             let c = &z.world.chars[&leet];
             if matches!(z.world.models.get(&c.key), Some(Model::Ready { .. })) { break; }
-            assert!(std::time::Instant::now() < deadline, "death model did not become ready");
+            let state = model_state(&z.world, c.key);
+            assert_ne!(state, "failed", "death model {:016x} for {leet} failed", c.key);
+            assert!(std::time::Instant::now() < deadline, "death model {:016x} for {leet} not ready after 300s: {state}; next={:?}", c.key, c.next);
             std::thread::yield_now();
         }
         // Advance the same thirty simulated seconds only after the async model is available.
@@ -3872,7 +3912,7 @@ mod variant_tests {
         assert!(z.world.take_sounds().is_empty(), "unknown dynels are silent");
     }
 
-    /// A zone with the captured characters and every model built (`start` + frames + update ticks): (zone, a player, a Beach Leet).
+    /// A captured zone with the selected player's and Beach Leet's models ready: (zone, player, Beach Leet).
     fn fight_zone() -> Option<(Zone, i32, i32)> {
         let dir = client()?;
         let mut z = Zone::new(25988);
@@ -3884,9 +3924,12 @@ mod variant_tests {
         let mut players: Vec<i32> = z.world.chars.iter().filter(|(id, c)| **id != z.world.own && matches!(&c.look, Look::Char(l) if !l.npc)).map(|(id, _)| *id).collect();
         players.sort_unstable();
         let player = *players.first()?;
+        // The worker builds one FIFO queue; capture props and HashMap-ordered characters
+        // must not put unrelated models ahead of the two this fixture waits for.
+        z.world.pending.splice(0..0, [z.world.chars[&player].look.clone(), z.world.chars[&leet].look.clone()]);
         let mut host = Host::headless();
         let (eye, fwd) = (scene_pos(z.own()?.pos), [0.0, 0.0, -1.0]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
             z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
@@ -3901,7 +3944,7 @@ mod variant_tests {
             }).collect();
             if pending.is_empty() { break; }
             assert!(!pending.iter().any(|p| p.3 == "failed"), "fight fixture target model failed: {pending:?}");
-            assert!(std::time::Instant::now() < deadline, "fight fixture target models not ready after 30s: {pending:?}");
+            assert!(std::time::Instant::now() < deadline, "fight fixture target models not ready after 300s: {pending:?}");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         Some((z, player, leet))
@@ -4064,10 +4107,14 @@ mod variant_tests {
             let eye = point + glam::Vec3::new(0.0, 1.0, 4.0);
             let look = point + glam::Vec3::Y;
             host.camera = ao_render::Camera::look_at(ao_render::Vec3::from_array(eye.to_array()), ao_render::Vec3::from_array(look.to_array()));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             while zone.world.effect_anchor(target, 0, 0).is_none() {
                 zone.world.update_with_collision(0.0, eye.to_array(), [0.0, 0.0, -1.0], &mut host, None, |_| None);
-                assert!(std::time::Instant::now() < deadline, "captured target connector unavailable");
+                let c = &zone.world.chars[&target];
+                let state = model_state(&zone.world, c.next.unwrap_or(c.key));
+                assert_ne!(state, "failed", "captured target {target} model failed");
+                assert!(std::time::Instant::now() < deadline,
+                    "captured target {target} connector unavailable after 300s: model={:016x}, next={:?}, state={state}", c.key, c.next);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             zone.world.effects = Some(crate::play::combat::effects::Renderer::open(&ao_gui::client_dir()).unwrap());
@@ -4305,12 +4352,12 @@ mod variant_tests {
         assert_eq!(rate, 0.5);
         let mut host = Host::headless();
         let (eye, fwd) = (scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
             z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
             host.actors.clear();
             if matches!(z.world.chars[&leet].special, Special::Once(k) if k == u32::from(anim)) { break; }
-            assert!(std::time::Instant::now() < deadline, "imp clip {anim:#x} did not start; pending replay {:?}", z.world.replay);
+            assert!(std::time::Instant::now() < deadline, "imp clip {anim:#x} for {leet} did not start after 300s; model={:016x} ({}), pending replay {:?}", z.world.chars[&leet].key, model_state(&z.world, z.world.chars[&leet].key), z.world.replay);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(z.world.react_to_hit(leet, 4).1, 1.0);
