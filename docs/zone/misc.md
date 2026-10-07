@@ -237,6 +237,37 @@ Implementation: missing/unreadable nano metadata is reported with its record/loa
 real zero-valued families, and never used to infer cross-nano conflicts or an estimated NCU cost.
 Same-id refresh remains possible. Pet rows use the same runtime total/remaining timing and await server removal.
 
+Persistent visuals share this lifecycle for the controlled character and every foreign SimpleChar (including pets):
+`OwnNanos` emits add/remove events from its existing conflict comparator; `Dynels` owns the renderer handles.
+Replacement/refresh, login-list replacement, BuffIIR removal and dynel teardown terminate the old handle gracefully.
+No local zero-timer removal is generated. Model/connector delays retain the pending entry until its target anchors exist.
+CAT-bound native effects receive the actual source model topology plus the same CPU-skinned `ActorFrame` submitted
+for that character, before effect rendering; first-person hiding does not remove the own CAT geometry source.
+The feed is gated by native consumers, borrows existing model/pose data, and requests a fresh terminal pose only
+when a newly attached consumer needs it. No bind-pose substitution or fabricated body points are introduced.
+
+Retail add `100512af` sets effect-handler category **4** (`NanoEffectFX`, `10051544`) and calls the single-dynel
+`CreateEffect2@100d1b1c` with template **stat413**, affected dynel, and zero extra argument. Category suppression exempts
+class **1020 / 0x3fc**; `OthersFX` (32) is not the persistent-buff gate. Both source and target identities/anchors belong
+to the affected dynel, not the caster. `10051571..10051599` sets duration from the **unscaled unsigned wire centiseconds
+divided by 100 with integer truncation**; stat464 changes the NCU timer only.
+
+Missing stat413 is **1234567890 / 0x499602d2**, not authored no-effect sentinel 49999: template GetSkill vtable+0x3c
+dispatches through `10003d90` to stat-vector getter `1002e46a`; out-of-range `1002e47f` and vector expansion
+`1002e3ff..1002e40a` use that invalid value. An absent effect template creates no visual; no replacement art is used.
+Login `100516c8` copies an active entry and passes its remaining field **c / entry+0x10** to add `100512af`
+at `10051738`, clamped to 1 when nonpositive (`100516ed..100516f3`). The total **b** and start-time restoration
+remain independent; `100515ce..100515da` stores the resulting handle at entry+0x14.
+
+Regressions: `dynels::buffs::tests::captured_npc_shadow_touch_has_no_persistent_visual` replays the three real NPC
+Shadow Touch (nano163449) add/remove pairs from `zone_ithaca.rec`; its template has no stat413 and creates no handle.
+`real_body_boost_own_foreign_refresh_login_and_pending` uses real installed Body Boost template **29091**,
+stat413 **1070**, in an explicitly templated (not captured) add/refresh/login/remove replay, including model-delayed
+attachment and an authored renderer handle. It asserts the renderer's active set loses the previous Body Boost
+actor on refresh, login-list replacement, BuffIIR removal and death/teardown (native class1001 stops immediately),
+not merely that the lifecycle map loses its key. Conflict-event removal is covered by the shared lifecycle's
+`synthetic_conflict_priority_and_families`. These regressions require the installed client data.
+
 ```
 39343c68 0000c350 0000827a 00 | 0000 | 0000cf1b 00027e79      nano id 163449 (0x27E79) on character 33402; seen at 23920, 29898, 74495 ms
 ```
@@ -341,6 +372,138 @@ Live (4852 ms, sender 1, receiver 0x6584, message type 0x43, frame size 0x33):
 n=1        len=15   host               a=7005 (port)  b=0.0
 ```
 Host 199.241.136.157, `a` = 0x1B5D = 7005, `b` = 0.0. `[GUESS]` `a` is the TCP port (value is plausible; the connect call that consumes it was not traced) and `b` a load/weight value (always 0.0 here).
+
+## 16. Explicit remote cosmetics: GfxTriggerIIR_t / PlaySoundIIR_c
+
+Decoder: `crates/ao-net/src/n3/effects.rs`, dispatched as `N3::Effects`.
+These are independent server effect/sound requests, not item ids or equip/level state.
+No occurrence of either key (`7a222202`, `455d2938`, case-insensitive hex search)
+was found in any committed `docs/captures/*.rec` on 2026-10-07, including
+`zone_wear_rifle_borealis.rec`, fight, death and object-use traces. Therefore there
+is no grounded live example effect id, sound filename, sender or header identity.
+The parser fixtures are explicitly synthetic, derived from the retail readers/writers.
+
+### GfxTriggerIIR_t — 7A222202
+
+Registration [GC 0x1000f3da], factory [GC 0x1000c588] (these are **not** the
+constructor/writer); constructor [GC 0x10039685], vtable [GC 0x1015d3f4],
+reader [GC 0x100396bd], writer [GC 0x1003977b], apply [GC 0x1003982e].
+Body starts with `i32 form` (+0x18), `i32 effect` (+0x1c), followed by:
+
+| form | subsequent wire fields | apply |
+|---|---|---|
+| 1 | `Vec3 position` | `CreateEffect2(effect, position)` |
+| 2 | `Identity character; i32 argument` | `CreateEffect2(effect, character, argument)` |
+| 3 | `Vec3 source; Vec3 target` | `CreateEffect2(effect, source, target)` |
+| 4 | `Identity character; Vec3 source` | `CreateEffect2(effect, source, character)` |
+| 5 | `Identity character; Vec3 target; i32 argument` | `CreateEffect2(effect, character, target, argument)` |
+| 6 | `Identity source; Identity target; i32 argument` | retail resolves **source twice**, then `CreateEffect2(effect, source, source, argument)` |
+
+Identities occupy +0x20/+0x28, vectors +0x30/+0x3c, argument +0x48.
+The apply routine resolves body identities using `GetDynel` and dynamic-casts to
+`SimpleChar_t`; an absent/non-character dynel suppresses that request. It does not
+use the N3 header identity as placement. Form 6's second lookup really uses
++0x20 again in the decompile; do not silently replace retail behavior with the
+second decoded identity. Other form integers consume only the first eight bytes
+and apply nothing, preserved as `Placement::Unknown`, not guessed extra layouts.
+
+The overloads [GC 0x100d1a19 / 0x100d1b1c / 0x100d1cd4 / 0x100d1de5]
+pass placement/argument to `CreateGfxControl`, then `MakeHandle`. Effect **49999**
+returns no effect; category suppression applies unless descriptor class is 0x3fc.
+Fresh runnable Ghidra `-readOnly -noanalysis` trace on 2026-10-07 resolves the
+integer as a **connector attractor override**, not an item id or duration:
+BPHFSM constructor [GC 0x100d3cce] uses the nonzero argument, otherwise template
+parameter 7, when calling dynel locator [GC 0x1010668c]. Spell1 constructors
+[GC 0x100f2dc8 / 0x100f3497] use a nonzero argument for **both** source hands;
+zero selects 2001 and 2000. The dynel target remains connector 1003, falling
+back to 2002 with a +1 Y offset. Runtime `EffectConfig::source_attractor` preserves
+this override, including explicit connectors absent from the template census.
+
+The overload also determines eligible classes: vector/vector [GC 0x100d0eba]
+accepts 1011 or 3007; vector/dynel [GC 0x100d1018] accepts 1011;
+dynel/vector [GC 0x100d107c] and dynel/dynel [GC 0x100d11b1] accept only 1010.
+`dynels_actions.rs` applies these gates before the existing authored renderer;
+it queues `N3::Effects`, resolves body character identities, handles all six
+placements and drops missing-character/unknown-form requests. The own avatar's
+animated connectors are supplied by the frame hook, not substituted camera
+anchors. Form 6 deliberately performs source/source resolution.
+Form 4's class1011 target constructor [GC 0x100f45e2] uses the dynel locator
+[GC 0x1010668c] with authored parameters 1..7 and flags 0; its connector
+attractor is parameter 7, not a guessed head/root id. When authored flag bit 0
+enables dynel tracking, the runtime refresh updates this target even though
+the source is a vector and has no identity; failed locator resolution marks
+the parent terminated and deletes both owned child handles on its next process.
+Without that flag the original target connector is static. The renderer's
+native1011/3007 work queue initializes children only after resolving the cached
+target connector, forwards exact packed-color overrides, and deletes owned
+children during explicit deletion, zone clearing and native termination.
+Category predicate [GC 0x100cd9f4] returns true when next-category (+0x54) is
+zero; otherwise it consumes that category and intersects enabled bits (+0x58).
+GfxTrigger apply does not select a nano/weapon category, so the application
+does not invent such a mask. Regression
+`decoded_layout_application_source_twice_and_missing_actor` decodes all six
+layouts before application and covers both source lookups and missing actors.
+No builds, tests, checks or formatters were run by the application worker.
+
+### PlaySoundIIR_c — 455D2938
+
+Registration [GC 0x1000fa72], factory [GC 0x1000c912], constructor
+[GC 0x1003a12d], reader [GC 0x1003a155], writer [GC 0x1003a0e4],
+apply [GC 0x1003a04f]. Body: `i32 byte_count` in **1..=1000**,
+`byte_count` filename bytes, then `Identity` (+0x34).
+Writer emits string length + 1 and includes its NUL terminator (string must be
+shorter than 1000). Reader appends its own terminator and assigns using `strlen`
+([GC 0x10001c9a]), so embedded NUL ends the filename, and a missing wire NUL
+is accepted. Identity helper [GC 0x1013cda9] reads two BE i32.
+Invalid lengths reject; short filename/identity reads return `Err` in ao-net.
+
+Apply emits `GlobalSignals_c +0x190` with the filename string (+0x18) and body
+identity (+0x34); it does not directly call `PlayGameSound` or use the header
+identity. Fresh runnable Ghidra `-readOnly` research on 2026-10-07 found **no
+subscriber** in the searched original modules. Instruction-operand scans for
+0x190 (including LEA/add/displacements, without symbol-name filtering) examined
+Gamecode, GUI, Interfaces, N3, SandyInterface and AFCM. AFCM owns the signal:
+constructor [AFCM 0x100075e4] initializes +0x190 and destructor
+[AFCM 0x10006d26] destroys it. Gamecode's only corresponding signal use found
+was the message emitter above. Anarchy.exe/AnarchyOnline.exe were also scanned;
+DisplaySystem/Utils had no corresponding consumer.
+
+SandyInterface's constructor [SI 0x1000774d] instead registers **AFCM message
+0x103** with `PlaySoundCommand` [SI 0x100071ed], and has no GlobalSignals
+subscription. That command reads two Vec3, four floats and sound-id/integer
+arguments from AFCM, then calls `GetSoundPointer` → `PlaySample`: it is **not**
+the filename/Identity N3 signal. `InitialiseMessage` [SI 0x10007536] emits
+GlobalSignals +0x198, not +0x190. All literal 0x190 words in SandyInterface's
+code were unrelated sound-state initialization/frame processing
+[SI 0x10001121, 0x10003bdb, 0x10003be8, 0x10003bf7, 0x10003c08].
+`GetSoundID` [SI 0x100071ca] forwards names to `CreateSoundID`, but no connection
+from the N3 signal to that API was found. **[INFERENCE]** +0x190 may be a dormant
+legacy signal in this retail version; absence of a static subscriber is not a
+proved audible/spatial playback policy. Neither centered filename playback nor
+numeric sound-map interpretation is grounded by this trace.
+The application worker's final read-only byte survey covered all **57**
+installed root DLL/executable files: only AFCM.dll, AnarchyOnline.exe, GUI.dll,
+Gamecode.dll, Interfaces.dll, N3.dll and SandyInterface.dll contain
+`GlobalSignals` symbols. These are the seven modules already instruction-scanned;
+MessageProtocol/Connection and the other installed modules introduce no further
+named GlobalSignals dependency. This dependency survey is not an audible check.
+
+Application: `Dynels::on_message` queues `N3::Effects`; `flow.rs` calls
+`server_effect_frame` after `fight_frame`, before `update_with_collision` refreshes
+the live effect connectors. It preserves effect id and exact placement/argument,
+resolves only body character identities and honors missing-character suppression
+and form-6 retail behavior. The returned filename/body-identity pairs represent
+the emitted +0x190 signal; the frame hook drops them with no known subscriber,
+matching the traced no-listener path rather than inventing audible UI/file/numeric
+playback. Unknown Gfx forms intentionally produce no application request.
+`named_signal_preserves_decoded_body_identity_without_actor_or_renderer` covers
+the wire-to-message-queue-to-emission path, separate body/header identities,
+missing actors and single-drain behavior. Named-sound spatial policy remains
+unresolved after the module and constructor scans above; no audible playback
+verification is claimed.
+`retail_layouts_and_every_truncated_prefix` covers all six Gfx layouts, every
+truncated prefix, the NUL-bearing sound writer form and invalid sound lengths;
+no tests/builds/checks were run during this change.
 
 ## UNRESOLVED / guesses
 

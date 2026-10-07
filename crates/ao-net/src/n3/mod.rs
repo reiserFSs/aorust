@@ -7,6 +7,7 @@ pub mod action;
 pub mod combat;
 pub mod chat;
 pub mod dynel;
+pub mod effects;
 pub mod grid;
 pub mod info;
 pub mod inventory;
@@ -60,6 +61,8 @@ pub enum N3 {
     World(world::World),
     Dynel(dynel::Dynel),
     Misc(misc::Misc),
+    /// Explicit replicated effect placement / named sound requests.
+    Effects(effects::Effects),
     /// `ChatTextIIR_t` / `FeedbackIIR_t` / `FormatFeedbackIIR_t`.
     Chat(chat::N3Chat),
     /// `n3TeleportIIR_t`: the server moves a dynel (in place or to another playfield).
@@ -102,6 +105,8 @@ pub fn decode(f: &crate::frame::Frame) -> Result<Message> {
         N3::Dynel(m)
     } else if let Some(m) = misc::decode(&h, &mut r)? {
         N3::Misc(m)
+    } else if let Some(m) = effects::decode(&h, &mut r)? {
+        N3::Effects(m)
     } else if let Some(m) = chat::decode(&h, &mut r)? {
         N3::Chat(m)
     } else if let Some(m) = teleport::decode(&h, &mut r)? {

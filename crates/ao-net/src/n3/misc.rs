@@ -36,10 +36,10 @@ pub struct Vec3 {
 }
 
 impl Vec3 {
-    fn read(r: &mut Reader) -> Result<Self> {
+    pub(super) fn read(r: &mut Reader) -> Result<Self> {
         Ok(Self { x: r.f32()?, y: r.f32()?, z: r.f32()? })
     }
-    fn write(&self, w: &mut Writer) {
+    pub(super) fn write(&self, w: &mut Writer) {
         w.f32(self.x);
         w.f32(self.y);
         w.f32(self.z);
