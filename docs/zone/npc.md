@@ -35,6 +35,16 @@ runs the ordinary humanoid name resolver `FUN_10057eb3` / `FUN_10057ff7` using b
 `dynel+0x208`, and optional stat `0x378`. A failed nonzero-`0x378` variant retries without that suffix. There is no retry of
 MonsterData as an item template, direct mesh/CATMesh id, or arbitrary default creature [CODE].
 
+Initial creation supplies no hidden default CAT: Gamecode factory `0x10077a84` → SimpleChar constructor `0x1005cb6a` →
+N3 visual constructor `0x10019365` initializes the CAT pointer (`+0xc0`) to null. N3 `GetCatMesh` (`0x1001952f`) reads that
+pointer; `SetCatMesh` (`0x10019fb2`) creates a CAT visual only for a nonzero selected mesh. Thus a newly created
+non-humanoid with null resolved MonsterData has **no body**, rather than retaining a default creature. The unassigned Mesh
+stat is the StatHolder sentinel `0x499602d2`, not a default resource (`0x10009e29`, `0x1002e46a`, `0x10058e52`).
+Creation's initializers `0x10077af2` / `0x1005f4f0` and appearance application `0x10077e13` do not supply a substitute;
+cloth/head/attractor work is guarded by the existing CAT pointer [CODE]. This conclusion is conditional on null effective
+MonsterData and breed > 4; later independent appearance/stat messages, and the flag-driven 99902 morph, remain distinct.
+
+
 The selected mesh goes through N3 `0x10019fb2` → DisplaySystem `VisualCATMesh_t::SetMesh` (`0x100728b7`) →
 `FUN_10070656` → `ResourceManager::GetAsync({1010002,mesh},...)`. Wire textures remain attached to this visual; this
 downstream mesh load does not revisit MonsterData. Missing spell-animation records also leave the corpse's mesh intact
@@ -103,6 +113,13 @@ an **infinite loop**, so an idle never re-rolls at the loop end and there is no 
 `FUN_1006fcfa` end of a waypoint path, `FUN_1003cc15`/`FUN_1003cad0` stance idle, `FUN_1006a239` attack, `FUN_100a4dcc` emote). Implemented per character in `dynels::Roll` (rolled when the clip key or movement state changes), all variants are loaded into `Built::clips`.
 
 After movement-state Play, `FUN_1006be27` calls `FUN_1006fb56` even for idle: speed zero means vehicle maximum velocity (`Vehicle_t+0x3c`), not stationary playback. Calibration × inverse MonsterScale × maximum/reference velocity is set once on the new handle; ordinary idle is not unconditionally rate 1.0. Direct stance idle Play (`FUN_1003cc15`/`FUN_1003cad0`) remains authored-rate playback; see the clock distinction in `avatar.md`.
+
+The test-only live harness can inspect the sampled NPC clock without forcing movement:
+`selname=<NPC>,npcprobe=target,frames=npc-cycle:2` captures 120 fixed-60Hz frames and logs
+the selected abstract clip key, RDB source id, CAT root name, duration/loop markers,
+absolute clock, sampled pose time, rate, model, body scale and movement status per frame.
+Use a naturally walking NPC; holding the own avatar's W key does not drive that NPC.
+The CAT root name is skeleton metadata, not an asset filename.
 
 | key → parent | |
 |---|---|
@@ -210,6 +227,7 @@ of the same triangles in the submesh's own phase, depth `LESS_EQUAL`). The CAT r
   full-update head before `actor::attractor_list` orders the wire bookkeeping list.
 * **MonsterScale** (stat 0x168 = 360; wire percent): `FUN_1005bea6` ends with `n3VisualDynel_t::SetBodyScale(stat(0x168, kind 3) / 100.0)` (`_DAT_10158670` = 100.0);
   the stat setter clamps to **≥ 20** (`FUN_10059e6a`: `0x168` → 0x14) and `CharRadius` (0x1a5) = `MonsterScale × value / 100` (same function). Uniform scale of the whole model; `Dynels` applies the same minimum to full-update body scale.
+  The own-avatar constructor's zero-to-1.0 fallback and the animation formula's zero-to-1.0 inverse factor (`avatar.md` §3) do not prove that a received non-own full-update zero bypasses this stat-setter clamp. The clamp is therefore retained; changing it requires evidence from the full-update stat path, not a timing symptom.
 * **Visibility**: `DisableVisibility` = `n3VisualDynel+0xc9 = 0` (N3 @0x1001954a; Enable sets 1; the VisualCATMesh has its own `+0x70`). `FUN_10077e13` calls it for
   every non-own dynel when stat `InPlay` (0xC2) is 0; the update `FUN_10077af2` writes stat 0xC2 = `VisualFlags >> 1 & 1`, 0xDF = bit 3, 0x159 = bit 0x1c, and sets Features
   bits `0x800` (flag bit 2) and `0x800000` (bit 0x12). VisualFlags bit 0 = NPC (branch that also sets stat 0x21 `Side`, 0x1c7/0x1d2/0x200/0x184).
@@ -235,6 +253,10 @@ A fresh read-only survey of all **22** retained `.rec` files (1,869 server-direc
 SimpleCharFullUpdate messages, **124** NPC messages with **29** distinct MonsterData IDs. **All 29 resolve in 1040023**;
 each appears in no other RDB table. Thus **zero retained NPC messages/IDs** exercise the missing-record branch; the
 reported live 288560 is additional evidence, not one of those captures.
+No retained packet sets full-update flag bit 2, and all 20 captured players have MonsterData 0. Thus effective-record
+selection leaves this survey's IDs unchanged. Forced record **99902** itself exists and selects CAT **99894**, also present
+(`SELECT version,data FROM rdb_1040023 WHERE id=99902`; `SELECT 1 FROM rdb_1010002 WHERE id=99894`).
+
 
 IDs: `17655,22794,26080,26088,26090,30252,30365,45873,165178,165179,165180,165181,165182,165185,165186,165187,165191,165192,165193,165194,165195,165196,165212,204067,204985,220406,247041,251782,254118`.
 
