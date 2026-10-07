@@ -282,10 +282,15 @@ mod tests {
         let rig=ActorRig::player(&r.store,&assets,&look,&[(1,15839)])?;
         // Account for actor-only frames using the installed CAT and native gates.
         let (posed,_)=rig.pose(None);
-        assert!(posed.len()>1000,"installed CAT must exercise DS1001dc74 large-surface gate");
+        ensure!(!posed.is_empty(),"installed CAT has no posed vertices");
+        eprintln!("surface fixture CAT vertices: {}",posed.len());
         for id in [96111,72274,72275,72276] {
-            let effect=ShieldEffect::new(&r.templates.by_id[&id],EffectConfig::default())?;
-            assert!(effect.vertices(&posed,1.0).is_empty(),"Shield2 {id} native CAT gate");
+            let template=&r.templates.by_id[&id];
+            let effect=ShieldEffect::new(template,EffectConfig::default())?;
+            let gated=template.word(0)? & 0x40000!=0 && posed.len()>1000;
+            let vertices=effect.vertices(&posed,1.0);
+            assert_eq!(vertices.len(),if gated {0}else{posed.len()*effect.layer_count()},"Shield2 {id} measured CAT gate");
+            assert!(vertices.iter().all(|v|v.pos.iter().chain(v.color.iter()).all(|x|x.is_finite())),"Shield2 {id} invalid small-CAT geometry");
         }
         for (id,alpha) in [(43608,5.0/255.0),(43748,0.0)] {
             let mut effect=super::super::buff_shield::Shield::new(&r.templates.by_id[&id],Mat4::IDENTITY,EffectConfig {source_identity:Some((50000,1)),..Default::default()})?;
@@ -328,6 +333,18 @@ mod tests {
                 r.set_source_runtime(identity,if toggle && frame>30 {0.0}else{1.0},1,None,0,true);
                 let mut terrain=|p:Vec3|Some((Vec3::new(p.x,10.0,p.z),Vec3::Y));
                 r.frame(1.0/60.0,&mut host,Some(&mut terrain));
+                if frame==1 && [96111,72274,72275,72276].contains(&id) {
+                    let template=&r.templates.by_id[&id];
+                    let effect=ShieldEffect::new(template,EffectConfig::default())?;
+                    let gated=template.word(0)? & 0x40000!=0 && posed.len()>1000;
+                    let emitted=host.actors.iter().find(|actor|actor.id==handle);
+                    if gated {
+                        assert!(emitted.is_none(),"Shield2 {id} renderer bypassed native CAT gate");
+                    } else {
+                        let vertices=emitted.and_then(|actor|actor.skin.as_deref()).context("small-CAT Shield2 must emit its authored surface")?;
+                        assert_eq!(vertices.len(),posed.len()*effect.layer_count(),"Shield2 {id} renderer lost small-CAT surface");
+                    }
+                }
                 if id==25002 && frame==30 {
                     let source=host.actors.iter().find(|actor|actor.id==1).context("missing Meta source actor")?;
                     let emissive=source.emissive.context("Meta25002 child11502 must apply root material")?;

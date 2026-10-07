@@ -185,6 +185,21 @@ mod tests {
         assert_eq!(effect.particles.iter().filter(|p|p.remaining>0.0).count(),2*word(t,15) as usize);
         Ok(())
     }
+    #[test]
+    fn authored_held_life_colour_curve_waits_for_release()->Result<()> {
+        let templates=super::super::Templates::open(&ao_gui::client_dir())?;
+        let t=&templates.by_id[&72414];
+        assert_ne!(word(t,0)&0x200000,0);
+        let mut gc=R250::new(0xe6f1);let mut ds=R250::new(0xe6f1);let mut crt=CrtRand::new(1);
+        let mut effect=ParticleEffect::new(t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt)?;
+        let held=effect.vertices(0.01,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt,None)?.unwrap();
+        assert!(held.iter().flatten().all(|v|v.color[3]==0.0));
+        effect.terminate_gracefully();
+        let released=effect.vertices(0.02,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt,None)?.unwrap();
+        assert!(released.iter().flatten().any(|v|v.color[3]>0.0));
+        Ok(())
+    }
+
 
 
     #[test]
@@ -199,7 +214,11 @@ mod tests {
             let mut effect=ParticleEffect::new(t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt)?;
             effect.set_native_inputs(1.0,Some(ao_formats::playfield::DEFAULT_DAY_TIME));
             let mut visible=false;
-            for step in 1..=20 {
+            let steps=((float(t,25).max(float(t,26))+float(t,12).max(0.0)+0.02)*100.0).ceil() as usize;
+            for step in 1..=steps {
+                // Held-life particles only advance their authored colour curve after
+                // native graceful release (GC1010aa16 / GC1010af47).
+                if step==2 && word(t,0)&0x200000!=0 {effect.terminate_gracefully();}
                 let mut terrain=|p:Vec3|Some((Vec3::new(p.x,0.0,p.z),Vec3::Y));
                 if let Some(groups)=effect.vertices(step as f32*0.01,Vec3::Z*10.0,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt,Some(&mut terrain))? {
                     for v in groups.iter().flatten() {ensure!(v.pos.iter().chain(v.color.iter()).all(|x|x.is_finite()),"nonfinite particle {id}");visible|=v.color[3]>0.0;}
@@ -216,11 +235,14 @@ mod tests {
         for &id in &ids {
             renderer.clear();
             host.camera = ao_render::Camera::look_at(Vec3::new(2.0,2.0,5.0), Vec3::ZERO);
-            renderer.spawn(Binding { group:0, attractor:0, effect:id, note:0, color:0 },
+            let handle=renderer.spawn(Binding { group:0, attractor:0, effect:id, note:0, color:0 },
                 super::super::Creation::Vector,Mat4::IDENTITY, Vec3::X)?;
             let mut rendered = false;
-            for step in 1..=81 {
+            let t=&templates.by_id[&id];
+            let steps=((float(t,25).max(float(t,26))+float(t,12).max(0.0)+0.02)*100.0).ceil() as usize;
+            for step in 1..=steps {
                 host.actors.clear();
+                if step==2 && word(&templates.by_id[&id],0)&0x200000!=0 {renderer.terminate_gracefully(handle);}
                 let mut terrain=|p:Vec3|Some((Vec3::new(p.x,0.0,p.z),Vec3::Y));
                 renderer.frame(0.01, &mut host, Some(&mut terrain));
                 let vertices: Vec<_> = host.actors.iter().filter_map(|a| a.skin.as_ref())

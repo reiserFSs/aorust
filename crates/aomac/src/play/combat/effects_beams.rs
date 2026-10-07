@@ -44,7 +44,8 @@ impl Beam {
         ensure!(distance.is_finite() && distance >= 0.01, "degenerate tracer endpoints");
         let direction = delta / distance;
         let speed = (if template.kind==1019 { 100.0 } else { template.float(10)? }).min(distance * 5.0);
-        ensure!(speed > 0.0 && (template.kind==1019 || (template.float(12)? > 0.0 && template.float(11)? > 0.0)), "invalid tracer dimensions");
+        // GC100fd985/100fd855 permit stationary cylinders (installed70004 speed=0).
+        ensure!((speed > 0.0 || (template.kind==1013 && speed==0.0)) && (template.kind==1019 || (template.float(12)? > 0.0 && template.float(11)? > 0.0)), "invalid tracer dimensions");
         if template.kind == 1013 {
             ensure!(template.word(18)? <= template.word(17)? && template.word(17)? <= 7, "invalid cylinder layer range");
         }
@@ -346,6 +347,24 @@ fn ribbon(vertices:&mut Vec<Vertex>,positions:&[Vec3],width:f32,camera:Vec3,colo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn installed_70004_stationary_cylinder_keeps_authored_span_and_duration() {
+        let template = Template { kind:1013, words:vec![
+            2,0,0,0,0,0,0,0,1092616192,32,0,1120403456,1017370378,
+            1045220557,1045220557,1056964608,1065353216,0,0,0,
+        ] };
+        let mut beam = Beam::new(&template,Mat4::IDENTITY,Mat4::from_translation(Vec3::Y*10.0),0).unwrap();
+        assert_eq!(beam.speed,0.0);
+        let mut state=BeamState::default();
+        let first=beam.vertices(0.0,Vec3::ZERO,Vec3::X,Vec3::Y,&mut state).unwrap().unwrap();
+        let later=beam.vertices(10.0,Vec3::ZERO,Vec3::X,Vec3::Y,&mut state).unwrap().unwrap();
+        assert_eq!(first.len(),1);
+        assert_eq!(first[0].len(),70);
+        assert_eq!(first[0].iter().map(|v|v.pos).collect::<Vec<_>>(),later[0].iter().map(|v|v.pos).collect::<Vec<_>>());
+        assert!(first[0].iter().all(|v|v.pos.iter().all(|f|f.is_finite())));
+        assert!(first[0].iter().any(|v|v.pos[1]==10.0));
+        assert!(beam.vertices(10.01,Vec3::ZERO,Vec3::X,Vec3::Y,&mut state).unwrap().is_none());
+    }
     #[test]
     fn native_pistol_tracer_has_retail_cylinder_layers_and_endpoint_lifetime() {
         let mut words = vec![0;20];

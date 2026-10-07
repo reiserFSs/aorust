@@ -224,7 +224,7 @@ mod tests {
             let actor=ActorFrame {id:1,model:1,transform:source.to_cols_array_2d(),skin:Some(skin),parts,..Default::default()};
             r.prepare_source_mesh((50000,1),visual.model(),&actor);
             r.prepare_anchors((50000,1),|_,anchor|visual.rig.effect_anchor_composed(anchor,std::iter::empty()).map(|m|source*Mat4::from_cols_array_2d(&m)));
-            let handle=r.spawn_configured(Binding {group:0,attractor:0,effect:id,note:0,color:0},source,origin,EffectConfig {source_identity:Some((50000,1)),track_source:true,..Default::default()})?;
+            let handle=r.spawn_configured(Binding {group:0,attractor:0,effect:id,note:0,color:0},source,origin,EffectConfig {creation:super::super::Creation::Dynel,source_identity:Some((50000,1)),track_source:true,..Default::default()})?;
             ensure!(handle!=0,"authored native class did not spawn: {id}");
             for frame in 1..=240 {
                 host.actors.clear();

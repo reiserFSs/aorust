@@ -1377,16 +1377,163 @@ check was not run by its implementation worker.
 
 ### Observed verification boundary (2026-10-07)
 
-The final all-class `retail_authored_effect_census` and final integrated
-workspace gate have **not run**. Consequently there is no observed final
-per-class record/mode/reachability table to publish: the former rough
-unsupported-class and malformed-record counts are not retained as current
-coverage. The runnable census prints every installed gfxtweak record,
-all fifteen creation forms, native null versus construction/configuration
-failure, source bindings, deferred/impact/profile child reachability and
-native-rejected versus unresolved malformed source records:
-`cargo test --release -p aomac retail_authored_effect_census -- --ignored --nocapture`.
-Its synthetic constructor fixtures are not live-frame coverage.
+The parent's measured `retail_authored_effect_census` **passed** on clean
+snapshot `93f67d8` (artifact23891): 2,687 authored records, all fifteen
+synthetic creation fixtures, 1,563 distinct reachable installed IDs and
+nine distinct IDs with configuration errors. Strict clippy also passed
+before this census (parent report). The census took8.31s; it inventories
+constructors and configuration, not live-frame equivalence. Its command:
+`CARGO_TARGET_DIR=/tmp/FxClasses/target cargo test --release -p aomac retail_authored_effect_census -- --ignored --nocapture`.
+
+#### Authored class coverage (snapshot93f67d8)
+
+Counts below are distinct IDs, not creation attempts. Reachability is the
+union of weapon event10, nano visual, all item-effect spell and persistent
+stat413 roots, including deferred/destructor and authored mesh children.
+Dispatch `yes` means a renderer implementation exists, not that every
+configuration or frame passes. Factory modes are from the native matrix:
+N=Unlocated, V=Vector, M=Matrix, R=RConnector, I=HitLocation, D=Dynel,
+T=Tracer; paired modes denote source/target forms (VR=VectorConnector,
+DR=DynelConnector). Every omitted class/form is native null.
+
+| Class | Authored | Reachable | Failed IDs | Native creation modes | Dispatch |
+| --- | ---: | ---: | ---: | --- | --- |
+| 0 | 20 | 16 | 0 | none | native null |
+| 1000 | 1 | 0 | 0 | N | yes |
+| 1001 | 57 | 36 | 0 | D | yes |
+| 1002 | 20 | 16 | 0 | V/M/R/D | yes |
+| 1003 | 24 | 18 | 0 | V/M/R/D | yes |
+| 1004 | 17 | 7 | 0 | V/M/R/D | yes |
+| 1005 | 59 | 48 | 0 | V/M/R/I/D | yes |
+| 1006 | 5 | 5 | 0 | V/M/R/D | yes |
+| 1007 | 14 | 11 | 0 | V/M/R/D | yes |
+| 1008 | 1 | 1 | 0 | V/M/R/D | yes |
+| 1009 | 17 | 13 | 0 | V/M/R/D | yes |
+| 1010 | 180 | 156 | 0 | DV/DM/DR/DD | yes |
+| 1011 | 1 | 0 | 0 | VV/VM/VR/VD | yes |
+| 1012 | 16 | 9 | 0 | V/M/R/D | yes |
+| 1013 | 5 | 3 | 1 | I/T | yes |
+| 1014 | 1 | 0 | 0 | N | yes |
+| 1015 | 1 | 0 | 0 | N | yes |
+| 1017 | 1 | 0 | 0 | D | yes |
+| 1018 | 42 | 24 | 0 | V/M/R/I/D | yes |
+| 1019 | 7 | 0 | 0 | I/T | yes |
+| 1020 | 9 | 2 | 0 | N | yes |
+| 1021 | 3 | 3 | 3 | I/T | yes |
+| 1022 | 10 | 10 | 0 | I/T | yes |
+| 1023 | 1 | 0 | 0 | V/M/R/D | yes |
+| 1024 | 11 | 3 | 0 | I/T | yes |
+| 1025 | 13 | 3 | 0 | I/T | yes |
+| 1026 | 8 | 8 | 0 | I/T | yes |
+| 1027 | 3 | 3 | 0 | I/T | yes |
+| 1028 | 1 | 0 | 0 | V | yes |
+| 1029 | 11 | 7 | 0 | V/M/R/D | yes |
+| 2001 | 3 | 2 | 0 | V/D | yes |
+| 2002 | 6 | 3 | 0 | I | yes |
+| 2003 | 1 | 0 | 0 | none | native null |
+| 2004 | 877 | 504 | 0 | V/I/D | yes |
+| 2005 | 16 | 6 | 0 | I/D | yes |
+| 2006 | 21 | 12 | 0 | R/D | yes |
+| 2007 | 486 | 316 | 2 | V/R/I/D | yes |
+| 2008 | 1 | 0 | 0 | V/D | yes |
+| 2009 | 1 | 0 | 0 | V/M/D | yes |
+| 2010 | 4 | 3 | 0 | I | yes |
+| 2011 | 11 | 5 | 0 | D | yes |
+| 2012 | 1 | 0 | 0 | D | yes |
+| 2013 | 2 | 2 | 0 | I | yes |
+| 2014 | 1 | 0 | 0 | D | yes |
+| 2015 | 3 | 0 | 0 | V/R/D | yes |
+| 3000 | 11 | 7 | 0 | V/M/D | yes |
+| 3001 | 5 | 2 | 0 | D | yes |
+| 3002 | 6 | 0 | 0 | V/D | yes |
+| 3003 | 69 | 42 | 0 | D | yes |
+| 3004 | 118 | 58 | 0 | V/M/R/D | yes |
+| 3005 | 1 | 0 | 0 | V/M/R/D | yes |
+| 3006 | 18 | 3 | 0 | V/M/R/D | yes |
+| 3007 | 1 | 0 | 0 | VV/D | yes |
+| 3008 | 2 | 0 | 0 | D | yes |
+| 3009 | 11 | 6 | 0 | V/M/D | yes |
+| 3010 | 5 | 3 | 0 | V/M/D | yes |
+| 3012 | 9 | 4 | 0 | V/M/D | yes |
+| 3013 | 3 | 2 | 0 | V/D | yes |
+| 3014 | 9 | 0 | 0 | V/M/R/D | yes |
+| 3015 | 4 | 0 | 0 | V/M/R/I/D | yes |
+| 3016 | 4 | 1 | 0 | V/M/D | yes |
+| 3017 | 15 | 1 | 0 | M/R/I/D | yes |
+| 3018 | 3 | 0 | 0 | V/D | yes |
+| 3019 | 3 | 1 | 0 | V/M/R/I/D | yes |
+| 3020 | 78 | 22 | 0 | V/M/R/I/D | yes |
+| 3021 | 1 | 0 | 0 | R | yes |
+| 3022 | 36 | 30 | 0 | V/M/R/D | yes |
+| 3023 | 6 | 1 | 0 | V/M/R/D | yes |
+| 3024 | 33 | 12 | 0 | V/M/R/D | yes |
+| 3025 | 13 | 10 | 0 | V/M/R/D | yes |
+| 3026 | 6 | 5 | 0 | I/T | yes |
+| 3027 | 4 | 1 | 0 | V/M/R/D | yes |
+| 3028 | 66 | 26 | 1 | V/M/R/I/D | yes |
+| 3029 | 27 | 9 | 0 | V/M/R/D | yes |
+| 3030 | 11 | 6 | 0 | V/M/R/D | yes |
+| 3031 | 15 | 3 | 0 | V/M/R/D | yes |
+| 3032 | 5 | 3 | 0 | V/M/R/D | yes |
+| 3033 | 8 | 7 | 0 | V/M/R/D | yes |
+| 3034 | 47 | 17 | 2 | D | yes |
+| 3035 | 3 | 0 | 0 | V/M/R/D | yes |
+| 3036 | 5 | 4 | 0 | V/M/R/D | yes |
+| 3037 | 2 | 2 | 0 | N | yes |
+| 3038 | 13 | 6 | 0 | V/M/R/D | yes |
+| 3039 | 5 | 5 | 0 | V/M/R/D | yes |
+| 4000 | 12 | 8 | 0 | V/M/R/I/D | yes |
+| 5000 | 1 | 1 | 0 | R | yes |
+
+#### Exact configuration and source inventory boundaries
+
+| IDs / classes | Failing creation modes | Observed reason in artifact23891 |
+| --- | --- | --- |
+| 2620/2621/2622, class1021 | I/T | Snapshot93f67d8 rejected missing texture8406; native null-texture material behavior restored below, awaiting a new census. |
+| 70004, class1013; parent70002, class2007 | 70004 I/T; 70002 I | Snapshot93f67d8's invented positive-speed guard produced `invalid tracer dimensions`; corrected by the native audit below, awaiting a new census. This is not an unsupported native configuration. |
+| 71016, class2007 | V/R/I/D | Missing authored child effect71025. |
+| 71332/71333, class3034 | D | Missing mesh266808 under the synthetic source appearance fixture; not proof that every real source CAT fails. |
+| 92000, class3028 | V/M/R/I/D | Snapshot93f67d8 rejected missing texture279876; native null-texture material behavior restored below, awaiting a new census. |
+
+The subsequent70004 native audit proves speed0 is valid: GC `100fd699`
+loads speed+0x3c; `100fd985` only caps speed when distance×5<speed and has
+no positive-speed guard. `100fd754` allocates/enables the cylinder;
+`100fd855` computes tail=speed×time=0 and head=min(length+tail,distance),
+so the authored speed0/length100/width0.02/duration10 effect is stationary,
+not a native null or no-draw configuration. The constructor correction and
+exact70004 regression await the parent's rerun; the measured counts above
+must not be presented as post-audit coverage.
+
+The texture audit likewise restores native untextured geometry, not
+replacement artwork. GC `100fe985` accepts a null GetSync8406 result and
+still constructs ProjectileTrail; DS `10031692`→`100314be` creates its
+PathBlur RMaterial with that null texture and `10031253` renders the strip
+without a texture guard. GC3028 `1010ba11` uses MMGetMaterial and DS
+`1000b432` enables particles; GC `10106e2e` creates the material after
+null GetSync while retaining atlas dimensions. Genuine texture decode
+errors still propagate. The ignored
+`missing_sprite_textures_retain_native_material_geometry` regression for
+2620/2621/2622/92000 awaits the central gate. The two synthetic CAT mesh
+prerequisites71332/71333 are a different flow, not established port gaps.
+
+Eight reachable authored effect IDs are absent:
+16451,39606,39745,42161,71025,71900,91000,91006.
+The installed71123 selector1 name hole additionally prevents enumeration
+of any unavailable mesh's embedded children; it remains explicit inventory,
+not a substituted mesh or a silently complete mesh-child claim.
+Missing49999 is the native runtime meta sentinel, not missing artwork.
+
+| Root survey | Source records | Bindings | Native-rejected records | Unresolved parser failures |
+| --- | ---: | ---: | ---: | ---: |
+| Weapon event10 | 119540 | 28009 | 581 | 0 |
+| Nano visuals | 11160 | 20038 | 21 | 0 |
+| All item effect spells | 119540 | 30746 | 581 | 0 |
+| Persistent buff stat413 | 11160 | 6366 | 0 | 0 |
+
+The weapon/all-item rejection counts overlap; they are not additive distinct
+records. The earlier677 unresolved source failures (artifact23700) included
+duplicated root scans and missing native string-format fields; that failed
+census is superseded by23891, not reclassified wholesale as supported.
 
 #### Native creation modes and unsupported boundaries
 
@@ -1459,22 +1606,12 @@ Added, not run by implementation workers:
 `installed_71123_missing_heal_terminates_control`,
 `installed_mparticle_missing_heal_keeps_slots_and_lifetime`.
 
-Executable provenance matters: the available
-`/tmp/FxClasses/target/release/deps/aomac-193ed793dfd6d465` lists779 tests
-and lacks `retail_authored_effect_census` (listing artifact23504).
-Its older `retail_effect_census` was exercised against installed assets
-(artifact23507), but its parser/support mapping predates this integration;
-neither its failures nor its supported flags are final coverage facts.
-`aomac-102fbe89827e5220` is a CLI executable, not a libtest binary.
-After the parent integration gate rebuild, run
-`CARGO_TARGET_DIR=/tmp/FxClasses/target cargo test --release -p aomac retail_authored_effect_census -- --ignored --nocapture`.
-The `coverage:` rows count distinct authored IDs per class and distinct
-IDs reachable in the union of weapon event10, nano visuals, all item-effect
-spells and persistent stat413 roots, transitively including deferred and
-destructor children. A class's configuration failures count distinct IDs,
-not failed creation forms. Missing49999 is the native runtime meta sentinel,
-not missing artwork. These inventory counts do not certify frames, live
-dispatch or the workspace gates.
+The earlier779-test binary listing (artifact23504) and its older
+`retail_effect_census` output (23507) predated this integration.
+They are superseded by the rebuilt913-test libtest binary exercised
+in23891 (one selected test,912 filtered out). Neither the older support
+flags nor failures are current coverage evidence. The final constructor
+inventory still does not certify GPU frames or live dispatch.
 
 Separately, the parent's isolated class1029 gate reports workspace
 **1381 passing tests** (artifact23317), strict clippy (artifact23124),

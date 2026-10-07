@@ -804,15 +804,17 @@ impl Renderer {
             let mut vertices = Vec::new();
             let mut submeshes = Vec::new();
             for (group,((material, indices, n), blend)) in groups.into_iter().zip(blends).enumerate() {
-                let key = if let Some(key) = beam.as_ref().and_then(|b| b.texture_override(group)) { Some(key) }
+                let mut key = if let Some(key) = beam.as_ref().and_then(|b| b.texture_override(group)) { Some(key) }
                 else if let Some(material) = material {
                     let &(name,_,_,_,_) = materials::MATERIALS.get(material).context("unknown effect material")?;
-                    Some(TextureKey { rdb_type:1010004, id:self.names.id(1010004,name).with_context(|| format!("missing effect texture {name}"))? })
+                    self.names.id(1010004,name).map(|id|TextureKey {rdb_type:1010004,id})
                 } else { None };
-                if let Some(key) = key {
-                    if let std::collections::hash_map::Entry::Vacant(entry) = scene.textures.entry(key) {
-                        let texture = ao_formats::texture::load_texture(&self.store,key)?.with_context(|| format!("missing effect texture {}",key.id))?;
-                        entry.insert(texture);
+                if let Some(texture_key) = key.filter(|key|!scene.textures.contains_key(key)) {
+                    // GC10106e2e and PathBlur DS100314be construct materials with
+                    // null textures; keep geometry, but propagate genuine decode errors.
+                    match ao_formats::texture::load_texture(&self.store,texture_key)? {
+                        Some(texture)=>{scene.textures.insert(texture_key,texture);}
+                        None=>key=None,
                     }
                 }
                 let offset = vertices.len() as u32;
@@ -1463,6 +1465,24 @@ mod tests {
         for kind in [1001,1002,1029,2008,3010,3025] {
             assert!(uses_common_source_header(kind),"class {kind} initializes a source locator");
         }
+    }
+    #[test]
+    #[ignore = "installed authored texture resource holes"]
+    fn missing_sprite_textures_retain_native_material_geometry()->Result<()> {
+        let mut renderer=Renderer::open(&ao_gui::client_dir())?;
+        for id in [8406,279876] {
+            assert!(renderer.store.get(1010004,id)?.is_none());
+        }
+        for effect in [2620,2621,2622,92000] {
+            let creation=if effect==92000 {Creation::Vector}else{Creation::HitLocation};
+            renderer.spawn_configured(Binding {group:0,attractor:0,effect,note:0,color:0},Mat4::IDENTITY,Vec3::Z*10.0,EffectConfig {creation,hit_location:Some((Vec3::ZERO,Vec3::Z*10.0)),..Default::default()})?;
+            let scene=&renderer.models[&effect].scene;
+            assert!(scene.textures.is_empty());
+            assert!(!scene.meshes.is_empty());
+            assert!(scene.meshes.iter().flat_map(|mesh|&mesh.submeshes).all(|sub|sub.texture.is_none()));
+            assert!(scene.meshes.iter().flat_map(|mesh|&mesh.submeshes).any(|sub|!sub.indices.is_empty()));
+        }
+        Ok(())
     }
     #[test]
     #[ignore = "installed authored assets"]
