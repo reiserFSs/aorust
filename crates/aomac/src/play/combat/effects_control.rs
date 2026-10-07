@@ -50,6 +50,7 @@ impl Controller {
         if let Some(spell)=&mut self.spell { spell.cancel(renderer); }
         if !self.registered { return; }
         let key=self.config.source_identity.unwrap();
+        if std::env::var_os("AOMAC_COMBAT_LOG").is_some() { eprintln!("BPHFSM cancel source={key:?} elapsed={} clock={} remaining={}",self.elapsed,renderer.elapsed,self.remaining); }
         if let Some((count,_))=renderer.bph_last.get_mut(&key) {
             *count-=1;
             if *count==0 { renderer.bph_last.remove(&key); }
@@ -79,6 +80,7 @@ impl Controller {
             return Ok(true);
         }
         renderer.bph_last.get_mut(&key).unwrap().1=renderer.elapsed;
+        if std::env::var_os("AOMAC_COMBAT_LOG").is_some() { eprintln!("BPHFSM pulse source={key:?} elapsed={} clock={} remaining={} children={:?} origin={:?} appearance={:?}",self.elapsed,renderer.elapsed,self.remaining,&self.template.words[10..12],self.anchors[0].w_axis.truncate(),self.config.source_appearance); }
         self.delay=self.template.float(20)?;
         if self.remaining!=0 {
             let argb=|start:usize| -> Result<[f32;4]> { Ok([self.template.float(start+1)?,self.template.float(start+2)?,self.template.float(start+3)?,self.template.float(start)?]) };
