@@ -670,8 +670,12 @@ Both decoded files exist;272 uses
 source/listener scene positions, distance, FX gain and caller parameters;
 rejections distinguish missing runtime/definition, distance, decoding,
 empty sample, keepalive sample and mixer pool. Muting still acts only
-after mixer statistics. These are offline data/code findings, not a
-live voices/RMS verification.
+after mixer statistics. An instrumentation-only offscreen live capture on
+2026-10-07 logged120 own-character requests (33588), all refused:
+source `(930.0051,9.733654,-759.66864)`, listener
+`(932.2918,27.584023,-755.5124)`, distance18.469948m versus authored15m.
+Both269 and272 explicitly reported `reason=distance`; definitions and
+sample paths resolved. The own server/avatar height was24.21m.
 
 
 ### 7.5 Persistent buff selector census
