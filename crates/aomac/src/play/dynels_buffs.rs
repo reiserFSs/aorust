@@ -114,12 +114,12 @@ mod tests {
     use ao_net::{frame::Frame, msg::Identity};
     use ao_net::n3::{action::simple, nano};
 
-    /// Real wire route, with the own root connector's supported id0 world matrix.
+    /// Real wire route and the captured own avatar's authored body connectors.
     #[test]
     fn captured_body_boost_zone_route_emits_and_retires_visible_pulse() {
         let Some(dir)=installed() else {return};
         let mut zone=crate::play::zone::Zone::new(33588);
-        zone.world.start(dir,33588);
+        zone.world.start(dir.clone(),33588);
         let frames:Vec<_>=include_str!("../../../../docs/captures/body_boost_pulse.rec").lines().map(|line| {
             let hex=line.split_whitespace().nth(2).unwrap();
             let bytes:Vec<_>=(0..hex.len()/2).map(|i|u8::from_str_radix(&hex[i*2..i*2+2],16).unwrap()).collect();
@@ -130,15 +130,22 @@ mod tests {
         assert_eq!(zone.world.buff_visuals[&(33588,29091)].duration,1800.0);
         // Actual local-player world position recorded by pulse.log during cast.
         let origin=glam::Vec3::new(930.0051,24.21451,-759.66864);
-        let source=glam::Mat4::from_translation(origin);
-        // Player::effect_anchor(0) returns its world transform; unsupported ids
-        // deliberately do not get an invented connector in this replay.
-        let anchor=|id| (id==0).then_some(source);
+        let update=frames.iter().find_map(|frame| match ao_net::n3::decode(frame).unwrap().body {
+            N3::Dynel(Dynel::SimpleCharFullUpdate(update))=>Some(update),
+            _=>None,
+        }).expect("captured own avatar");
+        let store=ao_rdb::RecordStore::open(&dir).unwrap();
+        let mut avatar=crate::play::avatar::Avatar::new(&store,&dir,33588,&update).unwrap();
+        avatar.set_transform(origin.to_array(),0.0);
+        let anchor=|id|avatar.effect_anchor(id).map(|m|glam::Mat4::from_cols_array_2d(&m));
+        let spine=anchor(1004).expect("authored Spine3 connector").w_axis.truncate();
+        assert!((spine-origin).length()>0.5,"body connector must differ from root");
         let mut host=Host::headless();
         let eye=origin+glam::Vec3::new(0.0,3.0,5.0);
         let look=eye+glam::Vec3::new(0.0,-0.4,-1.0);
         host.camera=ao_render::Camera::look_at(eye,look);
         let mut visible=false;
+        let mut body_cord=false;
         for _ in 0..1080 {
             host.actors.clear();
             let stats=&zone.stats;
@@ -156,8 +163,15 @@ mod tests {
                     v.color[3]>0.0 && v.color[..3].iter().any(|&c|c>0.0) && (glam::Mat4::from_cols_array_2d(&a.transform).transform_point3(glam::Vec3::from_array(v.pos))-origin).length()<5.0
                 }))
             });
+            body_cord|=host.actors.iter().filter(|a|matches!(a.model as u32,20092|20097)).any(|a| {
+                a.skin.as_ref().is_some_and(|vertices|vertices.iter().any(|v| {
+                    v.color[3]>0.0 && v.color[..3].iter().any(|&c|c>0.0)
+                        && (glam::Vec3::from_array(v.pos)-spine).length()<0.5
+                }))
+            });
         }
         assert!(visible,"wire-owned Body Boost must submit nearby nontransparent flare/cord geometry");
+        assert!(body_cord,"wire-owned Body Boost cord must orbit the authored body connector, not the root");
         let handle=zone.world.buff_visuals[&(33588,29091)].handle.unwrap();
         zone.on_frame(&frames[3]);
         assert!(!zone.world.buff_visuals.contains_key(&(33588,29091)));

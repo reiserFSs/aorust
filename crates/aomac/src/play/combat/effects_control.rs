@@ -85,7 +85,7 @@ impl Controller {
         self.delay=self.template.float(20)?;
         if self.remaining!=0 {
             let argb=|start:usize| -> Result<[f32;4]> { Ok([self.template.float(start+1)?,self.template.float(start+2)?,self.template.float(start+3)?,self.template.float(start)?]) };
-            let config=EffectConfig { start_color:Some(self.config.start_color.unwrap_or(argb(12)?)), stop_color:Some(self.config.stop_color.unwrap_or(argb(16)?)),source_identity:self.config.source_identity,source_appearance:self.config.source_appearance,..EffectConfig::default() };
+            let config=EffectConfig { track_source:true,start_color:Some(self.config.start_color.unwrap_or(argb(12)?)), stop_color:Some(self.config.stop_color.unwrap_or(argb(16)?)),source_identity:self.config.source_identity,source_appearance:self.config.source_appearance,..EffectConfig::default() };
             for i in [10,11] {
                 let effect=self.template.word(i)? as i32;
                 if effect!=0 {
@@ -279,6 +279,9 @@ mod tests {
         }
         let identity=(50000,1);
         let origin=Vec3::new(930.0051,24.21451,-759.66864);
+        // Synthetic connector for this ownership-only regression; the captured
+        // Zone regression resolves the actual avatar's authored Spine3 matrix.
+        renderer.prepare_anchor(identity,1004,Some(Mat4::from_translation(origin)));
         let handle=renderer.spawn_configured(Binding {group:0,attractor:0,effect:1070,note:0,color:0},Mat4::from_translation(origin),origin,EffectConfig {source_identity:Some(identity),source_appearance:Some([1,2,1,100]),..EffectConfig::default()}).unwrap();
         renderer.elapsed=6.0;
         let mut host=ao_render::Host::headless();

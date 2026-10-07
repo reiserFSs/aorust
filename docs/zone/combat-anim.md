@@ -525,16 +525,25 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
   the renderer retains these instances until their process step ends them.
   `captured_body_boost_zone_route_emits_and_retires_visible_pulse` replays the
   four real frames in `docs/captures/body_boost_pulse.rec` through `Zone::on_frame`,
-  then the normal buff/anchor/renderer update route for18seconds. Its own-root
-  callback supplies the recorded local-player world matrix only for id0; it
-  requires nontransparent flare/cord geometry near that position, then expiry
-  following the actual BuffIIR removal. This is offline route evidence, not
-  real-window visibility evidence.
+  then the normal buff/anchor/renderer update route for18seconds. Its connector
+  callback uses the captured own avatar's authored rig, including Spine3/id1004,
+  rather than supplying only the root. It requires nontransparent cord geometry
+  near Spine3, then expiry following the actual BuffIIR removal. This is offline
+  route evidence, not real-window visibility evidence.
   The four bare-pulse GPU frames inspected on2026-10-07 at approximately
   0.05/0.2/0.5/1seconds show only tiny white dots/clusters on blue background,
   not an obvious orbit or cord. Nonzero vertex RGB alone does not establish
   perceptual visibility; these empty-world frames also omit avatar/world
   depth. The temporary GPU capture hook was removed after inspection.
+  Root cause: class1001's children and class1002's cord child carried the Dynel
+  identity but disabled source tracking, bypassing authored connector lookup
+  and placing the pulse at the root. GC `100d3b0e` calls CreateEffect2 with the
+  resolved Dynel and attractor0 for both children; `100d57bb` then selects
+  word7/id1004 and the body profile. `100d52dc` creates the flare from a world
+  vector but the cord from the Dynel. Tracking is now enabled only on those
+  Dynel routes; flare/vector placement and authored sizes remain unchanged.
+  Actual1070 profiles are20093/20098 (payloads `0xae1c`/`0xb04c`), with
+  breed1/male/shape1 radius0.20; flare6203 radius remains0.01–0.02.
 * Class1002's orbiting children (`100d4f72`/`100d52dc`/`100d53e3`/
   `100d57bb`/`100d4d6b`) use their actual class0 body-profile records
   (20013/20018,42words), selected by Breed/Sex/BodyShape/MonsterScale,
