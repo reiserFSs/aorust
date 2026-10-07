@@ -3,6 +3,10 @@
 mod actors;
 mod gui;
 mod viewer;
+mod screen;
+pub use screen::{ScreenLayer,ViewportDepthClear};
+mod native_fog;
+pub use native_fog::{NativeFog,SharedNativeFog,NativeFogControl};
 
 use anyhow::{anyhow, Context, Result};
 use ao_scene::{Blend, Environment, Scene, TextureKey};
@@ -159,6 +163,8 @@ const ENV_BLEND_PIPE: usize = 14;
 const FADE_PIPE: usize = 16;
 const SPRITE_PIPE: usize = 20;
 const NATIVE_BLEND_PIPE: usize = 22;
+const MESH_EFFECT_PIPE: usize = 28;
+const MESH_EFFECT_STRIDE: usize = 28;
 
 fn native_blend_state(blend: Blend) -> wgpu::BlendState {
     use wgpu::BlendFactor::*;
@@ -398,7 +404,9 @@ pub struct Renderer {
     globals_bg: wgpu::BindGroup,
     g_layout: wgpu::BindGroupLayout,
     tex_layout: wgpu::BindGroupLayout,
+    holo_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    clamp_sampler: std::sync::OnceLock<wgpu::Sampler>,
     pipes: Vec<wgpu::RenderPipeline>, // indexed by Draw::pipe
     actor_pipes: Vec<wgpu::RenderPipeline>, // same indices, actor-only instance layout
     gpu: Gpu,
@@ -434,6 +442,7 @@ pub struct Renderer {
     sorted: Vec<(f32, u32, u32)>, // (distance, blended draw, visible instance)
     /// Dynamic actors drawn after the world, see `actors.rs`.
     act: actors::ActorLayer,
+    screen: screen::ScreenPass,
 }
 
 fn default_environment(radius: f32) -> Environment {
@@ -544,6 +553,17 @@ impl Renderer {
             anisotropy_clamp: 16,
             ..Default::default()
         });
+        let holo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("native Holo textures"),
+            entries: &[0, 1].map(|binding| wgpu::BindGroupLayoutEntry {
+                binding, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                count: None,
+            }),
+        });
+        let holo_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("native Holo"), bind_group_layouts: &[Some(&g_layout), Some(&tex_layout), Some(&holo_layout)], immediate_size: 0,
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&g_layout), Some(&tex_layout)],
@@ -551,11 +571,11 @@ impl Renderer {
         });
         let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
         let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
-        let actor_attrs = [f4(0), f4(16), f4(32), f4(48), f4(64), f4(80), f4(96)];
+        let actor_attrs = [f4(0), f4(16), f4(32), f4(48), f4(64), f4(80), f4(96), f4(112)];
         let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let one_one = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool, sprite: bool, actor: bool| {
+        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool, sprite: bool, actor: bool, effect: u32| {
             let (fs, state, depth_write) = match blend {
                 _ if env => ("fs_env", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
                 _ if sprite => ("fs_sprite", Some(wgpu::BlendState::ALPHA_BLENDING), true),
@@ -576,12 +596,18 @@ impl Renderer {
                 }
             } else { fs };
             let depth_write = depth_write && !sky;
+            let (fs, state, depth_write) = match effect {
+                1 => ("fs_holo", Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::OVER }), false),
+                2 => (fs, state, true),
+                4..=6 => ("fs_mesh_add", Some(wgpu::BlendState { color: add, alpha: add }), false),
+                _ => (fs, state, depth_write),
+            };
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fs),
-                layout: Some(&layout),
+                layout: Some(if effect == 1 { &holo_pipeline_layout } else { &layout }),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some(if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
+                    entry_point: Some(if actor && matches!(effect, 1 | 2 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
                     compilation_options: Default::default(),
                     buffers: &[
                         wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
@@ -600,7 +626,7 @@ impl Renderer {
                 }),
                 primitive: wgpu::PrimitiveState {
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: (!two_sided && !sky).then_some(wgpu::Face::Back),
+                    cull_mode: (!two_sided && !sky && !matches!(effect, 1 | 4..=6)).then_some(wgpu::Face::Back),
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -610,7 +636,7 @@ impl Renderer {
                     depth_compare: Some(if sky { wgpu::CompareFunction::Always } else if env { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }),
                     stencil: Default::default(),
                     // Blended overlays are often coplanar with the opaque surface below them.
-                    bias: if depth_write || env { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
+                    bias: if effect == 7 { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else if effect != 0 || depth_write || env { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
                 }),
                 multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
                 multiview_mask: None,
@@ -627,8 +653,9 @@ impl Renderer {
             .map(|(b, two, sky, env, fade)| (b, two, sky, env, fade, false))
             .chain([false, true].map(|two| (Blend::AlphaBlend, two, false, false, false, true)))
             .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false))));
-        let pipes = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false)).collect();
-        let actor_pipes = pipe_specs.map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, true)).collect();
+        let pipes = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0)).collect();
+        let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().map(move |spec| (effect, spec)))
+            .map(|(effect, (b, two, sky, env, fade, sprite))| mk(b, two, sky, env, fade, sprite, true, effect)).collect();
         let mut r = Self {
             device,
             queue,
@@ -643,7 +670,9 @@ impl Renderer {
             globals_bg,
             g_layout,
             tex_layout,
+            holo_layout,
             sampler,
+            clamp_sampler: std::sync::OnceLock::new(),
             pipes,
             actor_pipes,
             sky: SkyGpu::default(),
@@ -663,6 +692,7 @@ impl Renderer {
             vis_range: vec![],
             sorted: vec![],
             act: Default::default(),
+            screen: Default::default(),
         };
         r.upload(&Scene::default());
         Ok(r)
@@ -707,6 +737,21 @@ impl Renderer {
         }
         tex.create_view(&Default::default())
     }
+    fn material_sampler(&self, clamp: bool) -> &wgpu::Sampler {
+        if !clamp { return &self.sampler; }
+        self.clamp_sampler.get_or_init(|| self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("native D3D texture clamp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 16,
+            ..Default::default()
+        }))
+    }
+
 
     /// Replaces the GPU-side scene.
     pub fn upload(&mut self, scene: &Scene) {
@@ -719,11 +764,11 @@ impl Renderer {
             }
         }
         // One bind group per distinct (texture, base colour, emissive, glow mask).
-        let mut mat_of: HashMap<(usize, [u32; 20]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, bool, [u32; 20]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh| {
             let u = mat_uniform(s);
-            *mat_of.entry((view, u.map(f32::to_bits))).or_insert_with(|| {
+            *mat_of.entry((view, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
                 let ub = dev.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: bytemuck::bytes_of(&u),
@@ -734,7 +779,7 @@ impl Renderer {
                     layout: &dev.tex_layout,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[view]) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&dev.sampler) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(dev.material_sampler(s.texture_clamp)) },
                         wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
                     ],
                 }));
@@ -875,7 +920,7 @@ impl Renderer {
         }
         let white = self.texture_view(&[255; 4], 1, 1);
         let mut sky = SkyGpu::default();
-        let mut mat_of: HashMap<(Option<TextureKey>, [u32; 20]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(Option<TextureKey>, bool, [u32; 20]), usize> = HashMap::new();
         for (mi, mesh) in scene.meshes.iter().enumerate() {
             let idx_total: usize = mesh.submeshes.iter().map(|s| s.indices.len()).sum();
             if mesh.vertices.is_empty() || idx_total == 0 || !scene.sky.iter().any(|s| s.mesh == mi) {
@@ -903,14 +948,14 @@ impl Renderer {
                 }
                 let key = s.texture.filter(|k| self.sky_views.contains_key(k));
                 let u = mat_uniform(s);
-                let mat = *mat_of.entry((key, u.map(f32::to_bits))).or_insert_with(|| {
+                let mat = *mat_of.entry((key, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
                     let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
                     sky.mats.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
                         layout: &self.tex_layout,
                         entries: &[
                             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(key.map_or(&white, |k| &self.sky_views[&k])) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(self.material_sampler(s.texture_clamp)) },
                             wgpu::BindGroupEntry { binding: 2, resource: ub.as_entire_binding() },
                         ],
                     }));
@@ -1091,13 +1136,23 @@ impl Renderer {
         self.gpu.radius
     }
 
+    pub fn set_screen_effects(&mut self,layers:Vec<ScreenLayer>,fog_disabled:bool) {
+        self.screen.layers=layers;
+        self.screen.fog_disabled=fog_disabled;
+    }
+    pub fn upload_screen_texture(&mut self,key:TextureKey,texture:&ao_scene::Texture) {
+        self.screen.upload(&self.device,&self.queue,key,texture);
+    }
+    pub fn set_viewport_depth_clears(&mut self,clears:Vec<ViewportDepthClear>) {self.screen.depth_clears=clears;}
+
     /// Draws one frame into `resolve` (a view of the output texture).
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) {
         self.update_lod(cam.pos.x, cam.pos.z);
         self.step_movers();
         self.pose_far_away(cam.pos);
         let mut env = self.env;
-        if let Some((color, end)) = self.fog.as_ref().map(|m| m.at_scaled(cam.pos.to_array(), self.fog_density_scale)) {
+        if self.screen.fog_disabled { env.fog_start=f32::MAX;env.fog_end=f32::MAX; }
+        if let Some((color, end)) = self.fog.as_ref().filter(|_|!self.screen.fog_disabled).map(|m| m.at_scaled(cam.pos.to_array(), self.fog_density_scale)) {
             if env.sky_color == env.fog_color {
                 env.sky_color = color;
             }
@@ -1204,6 +1259,7 @@ impl Renderer {
 
         let calls = std::cell::Cell::new(0usize);
         let mut enc = self.device.create_command_encoder(&Default::default());
+        self.screen.prepare(&self.device,&self.queue,self.format,t.size);
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -1213,12 +1269,12 @@ impl Renderer {
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)),
-                        store: wgpu::StoreOp::Discard,
+                        store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
@@ -1251,6 +1307,11 @@ impl Renderer {
                     draw(&mut pass, d, *k..*k + 1, true);
                 }
             }
+            drop(pass);
+            for priority in 0..=2 {calls.set(calls.get()+self.draw_actors(&mut enc,t,resolve,priority));}
+            let mut pass=screen::world_pass(&mut enc,t,resolve,false);
+            pass.set_bind_group(0,&self.globals_bg,&[]);
+            pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
             // Order of `DisplaySystem_t::Render` @0x100793b8: sky, the opaque lists 3 + 4 (list 3 = world meshes and the actors'
             // opaque parts; list 4 = liquids, `VisualLiquid_t` ctor @0x10067385 `SetRenderPriority(4)`), then the blended lists
             // 5 (blended meshes) and 6 (actors' blended parts, effects), each far to near.
@@ -1263,7 +1324,10 @@ impl Renderer {
                     }
                 }
             }
-            calls.set(calls.get() + self.draw_actors(&mut pass, false));
+            drop(pass);
+            calls.set(calls.get() + self.draw_actors(&mut enc,t,resolve,3));
+            let mut pass=screen::world_pass(&mut enc,t,resolve,false);
+            pass.set_bind_group(0,&self.globals_bg,&[]);
             // the actor pass rebinds pipeline, buffers and material: forget the cached state
             pipe.set(usize::MAX);
             mesh.set((false, usize::MAX));
@@ -1276,12 +1340,22 @@ impl Renderer {
                         draw(&mut pass, d, r, false);
                     }
                 }
+            }
+            drop(pass);
+            calls.set(calls.get()+self.draw_actors(&mut enc,t,resolve,4));
+            pass=screen::world_pass(&mut enc,t,resolve,false);
+            pass.set_bind_group(0,&self.globals_bg,&[]);
+            pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
+            if let Some(inst)=inst_buf {
+                pass.set_vertex_buffer(1,inst.slice(..));
                 for &(_, di, vi) in &self.sorted {
                     draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1, false);
                 }
             }
-            calls.set(calls.get() + self.draw_actors(&mut pass, true));
+            drop(pass);
+            for priority in [5,6,10,7] {calls.set(calls.get()+self.draw_actors(&mut enc,t,resolve,priority));}
         }
+        self.screen.draw(&mut enc,resolve);
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };
         self.queue.submit([enc.finish()]);
     }
@@ -1328,6 +1402,19 @@ pub fn render_to_png_at(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: 
 /// [`render_to_png_at`] with dynamic actors on top of the scene (`models` for [`Renderer::add_actor_model`], `actors` for [`Renderer::set_actors`]).
 #[allow(clippy::too_many_arguments)]
 pub fn render_to_png_actors(scene: &Scene, models: &[(u64, Scene)], actors: Vec<ao_scene::ActorFrame>, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32) -> Result<()> {
+    render_to_png_effects(scene,models,actors,eye,look_at,width,height,path,time,vec![],NativeFog::default())
+}
+
+/// Offscreen native viewport effects, also used by the installed configuration regression.
+pub fn render_to_png_screen(scene:&Scene,layers:Vec<ScreenLayer>,fog_disabled:bool,width:u32,height:u32,path:&Path)->Result<()> {
+    render_to_png_screen_fog(scene,layers,NativeFog{enabled:!fog_disabled,..Default::default()},width,height,path)
+}
+pub fn render_to_png_screen_fog(scene:&Scene,layers:Vec<ScreenLayer>,fog:NativeFog,width:u32,height:u32,path:&Path)->Result<()> {
+    render_to_png_effects(scene,&[],vec![],[0.0,0.0,5.0],[0.0;3],width,height,path,0.0,layers,fog)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_to_png_effects(scene: &Scene, models: &[(u64, Scene)], actors: Vec<ao_scene::ActorFrame>, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32,layers:Vec<ScreenLayer>,fog:NativeFog) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut r = Renderer::new(&instance, None)?;
     r.upload(scene);
@@ -1336,6 +1423,14 @@ pub fn render_to_png_actors(scene: &Scene, models: &[(u64, Scene)], actors: Vec<
     }
     r.set_actors(actors);
     r.seek(time);
+    r.set_fog_density_scale(fog.weight);
+    r.set_screen_effects(layers,!fog.enabled);
+    for layer in &r.screen.layers.clone() {
+        if let Some(key)=layer.texture {
+            let texture=scene.textures.get(&key).context("missing authored screen texture")?;
+            r.upload_screen_texture(key,texture);
+        }
+    }
     let targets = Targets::new(&r, width, height);
     let out = r.device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -1563,6 +1658,129 @@ mod sky_tests {
         let bytes = std::fs::read(&path).ok()?;
         let _ = std::fs::remove_file(&path);
         Some(bytes)
+    }
+    #[test]
+    fn native_texture_clamp_uses_distinct_cached_sampler_materials() {
+        let key=TextureKey {rdb_type:1,id:1};
+        // Both coplanar draws must execute: opaque depth writes would hide the second sampler.
+        let sub=Submesh {blend:Blend::AlphaBlend,emissive:[1.0;3],..Submesh::new(vec![0,1,2,0,2,3],Some(key))};
+        assert!(!sub.texture_clamp);
+        let mut model=actor_quad([0.0,0.0,1.0],sub);
+        model.textures.insert(key,Texture {width:2,height:1,rgba:vec![255,0,0,255,0,255,0,255]});
+        for v in &mut model.meshes[0].vertices {v.uv=[1.25,0.5];}
+        let world=Scene::default();
+        let wrap=actor_shot(&world,model.clone(),[0.0,0.0,-5.0],"sampler-wrap").expect("sampler regression requires GPU");
+        model.meshes[0].submeshes[0].texture_clamp=true;
+        let clamp=actor_shot(&world,model.clone(),[0.0,0.0,-5.0],"sampler-clamp").expect("sampler regression requires GPU");
+        assert!(wrap[0]>wrap[1],"WRAP samples the repeated red texel: {wrap:?}");
+        assert!(clamp[1]>clamp[0],"CLAMP samples the edge green texel: {clamp:?}");
+        let mut repeat=model.meshes[0].submeshes[0].clone();repeat.texture_clamp=false;
+        model.meshes[0].submeshes.insert(0,repeat);
+        let mixed=actor_shot(&world,model,[0.0,0.0,-5.0],"sampler-mixed").expect("sampler regression requires GPU");
+        assert_eq!(mixed,clamp,"same texture/uniform but distinct native address states must not share a bind group");
+    }
+
+
+    #[test]
+    fn actor_part_uv_transform_matches_authored_vertex_uvs() {
+        let key = TextureKey { rdb_type: 1, id: 1 };
+        let mut model = actor_quad([0.0, 0.0, 1.0], Submesh {
+            emissive: [1.0; 3], ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key))
+        });
+        model.textures.insert(key, Texture { width: 2, height: 2,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255] });
+        for (v, uv) in model.meshes[0].vertices.iter_mut().zip([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]) {
+            v.uv = uv;
+        }
+        let world = Scene::default();
+        let shot = |model, uvs, name| actor_frame_png(&world, model, [0.0, 0.0, -5.0],
+            ao_scene::ActorFrame { part_uvs: uvs, ..Default::default() }, name)
+            .expect("authored UV regression requires an offscreen GPU adapter");
+        let base = shot(model.clone(), vec![], "part-uv-default");
+        assert_eq!(base, shot(model.clone(), vec![[1.0, 1.0, 0.0, 0.0]], "part-uv-identity"));
+        let transform = [0.5, 0.75, 0.2, 0.1];
+        let actual = shot(model.clone(), vec![transform], "part-uv-instance");
+        let mut reference = model;
+        for v in &mut reference.meshes[0].vertices {
+            v.uv = [v.uv[0] * transform[0] + transform[2], v.uv[1] * transform[1] + transform[3]];
+        }
+        assert_ne!(base, actual, "authored UV animation changes the texture mapping");
+        assert_eq!(actual, shot(reference, vec![], "part-uv-reference"));
+    }
+
+    #[test]
+    fn native_holo_mesh_uses_two_textures_and_effect_local_timer() {
+        let world = Scene {
+            environment: Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 100.0, fog_end: 200.0, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 0.0, 1.0], sun_specular: 0.0 }),
+            ..Default::default()
+        };
+        let mut model = actor_quad([0.0, 0.0, 1.0], Submesh::new(vec![0, 1, 2, 0, 2, 3], None));
+        model.textures.insert(TextureKey { rdb_type: 1, id: 0x28022 }, Texture {
+            width: 1, height: 2, rgba: vec![32, 0, 0, 255, 128, 0, 0, 255],
+        });
+        model.textures.insert(TextureKey { rdb_type: 1, id: 0x28023 }, Texture {
+            width: 2, height: 1, rgba: vec![0, 32, 0, 255, 0, 128, 0, 255],
+        });
+        let shot = |elapsed| actor_shot_frame(&world, model.clone(), [0.0, 0.0, -5.0],
+            ao_scene::ActorFrame { rendering_effect: 1, rendering_effect_time: elapsed, ..Default::default() },
+            &format!("native-holo-{elapsed}")).expect("Holo regression requires an offscreen GPU adapter");
+        let a = shot(0.0);
+        let b = shot(2.5);
+        assert!(a[0] > 0 && a[1] > 0, "both native textures contribute: {a:?}");
+        assert_ne!(a, b, "effect-local timer scrolls the two texture stages");
+        assert_eq!(a, shot(0.0), "timer restart is deterministic");
+    }
+
+    #[test]
+    fn native_mesh_delta_states_render_lit_unlit_fog_and_material_preservation() {
+        let world = Scene {
+            environment: Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 0.0, fog_end: 1.0, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 0.0, 1.0], sun_specular: 0.0 }),
+            ..Default::default()
+        };
+        let model = actor_quad([0.0, 0.0, 1.0], Submesh {
+            emissive: [0.25_f32.powf(2.2); 3], two_sided: false,
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+        });
+        let shot = |effect| actor_shot_frame(&world, model.clone(), [0.0, 0.0, -5.0],
+            ao_scene::ActorFrame { rendering_effect: effect, alpha: 0.5, ..Default::default() },
+            &format!("native-mesh-{effect}")).expect("mesh mode regression requires an offscreen GPU adapter");
+        let base = shot(0);
+        assert_eq!(base, shot(3), "mode 3 clears depth, not the isolated mesh's material");
+        assert_eq!(base, shot(7), "ZBIAS must not change an isolated mesh's colour");
+        let lit = shot(4);
+        let unlit = shot(5);
+        assert!(lit[0] > base[0], "mode 4 disables fog: {base:?}, {lit:?}");
+        assert!(unlit[0] > lit[0] + 50, "mode 5 disables lighting: {lit:?}, {unlit:?}");
+        assert_eq!(unlit, shot(6), "native modes 5 and 6 own identical delta states");
+        assert!(shot(2)[0] > base[0], "Space retains lighting and disables fog");
+        let mut reversed = model.clone();
+        for triangle in reversed.meshes[0].submeshes[0].indices.as_chunks_mut::<3>().0 {
+            triangle.swap(1, 2);
+        }
+        let back = actor_shot_frame(&world, reversed, [0.0, 0.0, -5.0],
+            ao_scene::ActorFrame { rendering_effect: 5, alpha: 0.5, ..Default::default() },
+            "native-mesh-backface").unwrap();
+        assert_eq!(unlit, back, "native transparent modes disable face culling");
+    }
+
+    #[test]
+    fn native_mesh_zbias_and_clear_draw_over_existing_world_depth() {
+        let model = actor_quad([0.0, 0.0, 1.0], Submesh {
+            base_color: [0.0, 1.0, 0.0, 1.0], emissive: [1.0; 3],
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+        });
+        let mut world = model.clone();
+        world.meshes[0].submeshes[0].base_color = [1.0, 0.0, 0.0, 1.0];
+        world.environment = Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 100.0, fog_end: 200.0, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 0.0, 1.0], sun_specular: 0.0 });
+        let mut transform = IDENTITY;
+        transform[3][2] = -5.0;
+        world.instances.push(Instance { mesh: 0, transform });
+        let shot = |effect, z| actor_shot_frame(&world, model.clone(), [0.0, 0.0, z],
+            ao_scene::ActorFrame { rendering_effect: effect, ..Default::default() },
+            &format!("native-mesh-depth-{effect}")).expect("mesh depth regression requires an offscreen GPU adapter");
+        assert!(shot(0, -5.0)[0] > 240, "ordinary coplanar actor fails depth test");
+        assert!(shot(7, -5.0)[1] > 240, "native ZBIAS1 brings coplanar actor forward");
+        assert!(shot(3, -6.0)[1] > 240, "native mode 3 clears the preceding world depth");
     }
 
     #[test]

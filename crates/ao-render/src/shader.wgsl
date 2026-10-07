@@ -28,6 +28,8 @@ struct Mat {
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var samp: sampler;
 @group(1) @binding(2) var<uniform> mat: Mat;
+@group(2) @binding(0) var holo0: texture_2d<f32>;
+@group(2) @binding(1) var holo1: texture_2d<f32>;
 
 struct VIn {
     @location(0) pos: vec3<f32>,
@@ -50,6 +52,8 @@ struct VOut {
     @location(6) spec: vec3<f32>,
     @location(7) tint: vec3<f32>,
     @location(8) fade: f32,
+    @location(9) @interpolate(flat) effect: u32,
+    @location(10) @interpolate(flat) effect_time: f32,
 }
 
 fn vtx(v: VIn) -> VOut {
@@ -63,6 +67,8 @@ fn vtx(v: VIn) -> VOut {
     o.uv = v.uv;
     o.color = v.color;
     o.fade = 1.0 + v.m0.w;
+    o.effect = 0u;
+    o.effect_time = 0.0;
     return o;
 }
 
@@ -81,9 +87,12 @@ fn vs(v: VIn) -> VOut {
 
 // Actor overrides share the submesh's linear storage domain. Independent enable lanes preserve `None`, including power 0.
 @vertex
-fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec4<f32>, @location(10) power: vec4<f32>) -> VOut {
+fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec4<f32>, @location(10) power: vec4<f32>, @location(11) uv: vec4<f32>) -> VOut {
     var o = vtx(v);
-    let prelit = mat.emissive.w > 1.5;
+    o.uv = v.uv * uv.xy + uv.zw;
+    o.effect = u32(power.z);
+    o.effect_time = power.w;
+    let prelit = mat.emissive.w > 1.5 && (o.effect == 0u || o.effect == 3u || o.effect == 7u);
     let l = light_vertex(
         o.wpos, o.n,
         select(mat.emissive.rgb, emissive.rgb, emissive.w > 0.5),
@@ -93,6 +102,11 @@ fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec
     o.dlight = l.dlight;
     o.spec = l.spec;
     o.tint = to_g(mat.color.rgb * select(v.color.rgb, vec3<f32>(1.0), prelit));
+    if o.effect == 1u || o.effect == 5u || o.effect == 6u {
+        o.light = vec3<f32>(1.0);
+        o.dlight = vec3<f32>(0.0);
+        o.spec = vec3<f32>(0.0);
+    }
     return o;
 }
 
@@ -213,16 +227,16 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     let to_eye = g.eye.xyz - i.wpos;
     var light = i.light;
     var spec = i.spec;
-    if mat.emissive.w > 1.5 {
+    if mat.emissive.w > 1.5 && i.effect != 2u && i.effect != 4u && i.effect != 5u && i.effect != 6u {
         // prelit: vertex colour is additive light (engine: tex * saturate(lightmap + 0.8 * ambient + dlight))
         light = clamp(i.light + 0.8 * g.ambient_g.rgb + i.dlight, vec3<f32>(0.0), vec3<f32>(1.0));
         spec = vec3<f32>(0.0);
-    } else if mat.emissive.w > 0.5 {
+    } else if mat.emissive.w > 0.5 && (i.effect == 0u || i.effect == 3u || i.effect == 7u) {
         light = min(light + t.a, vec3<f32>(1.0)); // alpha = self-illumination mask (stage 0 ADD: saturate(a + lighting))
     }
     // texture stage MODULATE, then the specular add (both clamped to the framebuffer range), then fog: all in gamma space
     let lit = min(srgb_enc(t.rgb) * i.tint * light + spec, vec3<f32>(1.0));
-    let f = clamp((length(to_eye) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+    let f = select(clamp((length(to_eye) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0), 0.0, i.effect == 2u || (i.effect >= 4u && i.effect <= 6u));
     // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
     let add = mode == 3u;
     let rgb = select(mix(lit, g.fog_g.rgb, f), lit, add);
@@ -265,6 +279,19 @@ fn fs_blend(i: VOut) -> @location(0) vec4<f32> { return shade(i, 2u); }
 fn fs_sprite(i: VOut) -> @location(0) vec4<f32> { return shade(i, 6u); }
 @fragment
 fn fs_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u); }
+@fragment
+fn fs_mesh_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u); }
+
+// HoloDeltaState, DS1006c005: camera-space position transformed back through the camera's world
+// matrix, with X erased and Y scrolled. COUNT3 is not D3DTTFF_PROJECTED (no divide).
+@fragment
+fn fs_holo(i: VOut) -> @location(0) vec4<f32> {
+    let t0 = textureSample(holo0, samp, vec2<f32>(0.0, i.wpos.y + fract(0.2 * i.effect_time)));
+    let t1 = textureSample(holo1, samp, i.uv + vec2<f32>(fract(0.15 * i.effect_time), 0.0));
+    let rgb = min(srgb_enc(t0.rgb) + srgb_enc(t1.rgb), vec3<f32>(1.0));
+    let f = clamp((length(g.eye.xyz - i.wpos) - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+    return vec4<f32>(mix(rgb, g.fog_g.rgb, f), t0.a * i.color.a * mat.color.a * i.fade);
+}
 @fragment
 fn fs_sky_opaque(i: VOut) -> @location(0) vec4<f32> { return shade_sky(i, 0u); }
 @fragment

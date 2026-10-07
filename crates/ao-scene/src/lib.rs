@@ -57,11 +57,14 @@ pub enum Blend {
 }
 
 /// Triangle list sharing the parent mesh's vertex buffer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Submesh {
     pub indices: Vec<u32>,
     /// Key into [`Scene::textures`]; `None` draws `base_color` only.
     pub texture: Option<TextureKey>,
+    /// Native D3D texture ADDRESSU/V/W = 3 (CLAMP), rather than default 1 (WRAP).
+    /// Selects the GPU sampler; UVs are not modified. GroundGrid DS10016961 flag0x10000.
+    pub texture_clamp: bool,
     pub blend: Blend,
     /// RSprite: alpha blend with alpha > 30/255 and depth writes (randy31 0x10013575).
     /// Only applies to `Blend::AlphaBlend`; other materials keep their normal states.
@@ -114,6 +117,7 @@ impl Submesh {
         Self {
             indices,
             texture,
+            texture_clamp: false,
             blend: Blend::Opaque,
             sprite_alpha_test: false,
             base_color: WHITE,
@@ -226,6 +230,14 @@ impl Default for Lens {
     }
 }
 
+/// Material overrides of one rigid CAT attractor mesh.
+#[derive(Clone, Debug, Default)]
+pub struct ActorMaterialOverride {
+    pub alpha: Option<f32>,
+    pub emissive: Option<[f32; 3]>,
+    pub specular: Option<[f32; 3]>,
+}
+
 /// A dynamic character-like object (players, NPCs, corpses, weapons in hand) drawn on top of the world by the renderer.
 ///
 /// The renderer keeps one vertex buffer per (actor, model mesh) and the model's index buffers/materials/textures once per
@@ -241,6 +253,13 @@ pub struct ActorFrame {
     pub transform: [[f32; 4]; 4],
     /// Per model mesh: transform relative to `transform` (rigid mounts: head, weapons); missing entries = identity.
     pub parts: Vec<[[f32; 4]; 4]>,
+    /// Per-model-mesh authored UV scale and offset `[scale_u, scale_v, offset_u, offset_v]`.
+    /// Missing entries preserve the base UVs (identity transform).
+    pub part_uvs: Vec<[f32; 4]>,
+    /// Native attractor place for each mounted model mesh; body is `None`.
+    pub part_attractors: Vec<Option<u8>>,
+    /// Per-mesh overrides; missing entries preserve the actor/material values.
+    pub part_materials: Vec<ActorMaterialOverride>,
     /// New vertices of model mesh 0 (the skinned body pose); `None` keeps the last ones (the bind-pose vertices of the model
     /// at first sight).
     pub skin: Option<Vec<Vertex>>,
@@ -257,6 +276,19 @@ pub struct ActorFrame {
     pub specular: Option<[f32; 3]>,
     /// Per-actor material power override; `None` keeps [`Submesh::shininess`].
     pub specular_power: Option<f32>,
+    /// DisplaySystem mesh delta-state mode (`FUN_1006c61d`); 0 preserves authored materials.
+    pub rendering_effect: u32,
+    /// Seconds since the mesh effect's Holo timer started (`FUN_1006c005`).
+    pub rendering_effect_time: f32,
+    /// Native RVisual render-list override; `None` preserves the visual/material default.
+    /// Randy 0x1004d544 defaults to list 3; -1 disables the visual (0x1004cc35).
+    pub priority: Option<i32>,
+    /// Per-model-mesh render-list override; missing entries use `priority`.
+    /// Root-only suppression must not hide attached visuals.
+    pub part_priorities: Vec<Option<i32>>,
+    /// Explicit native render-list distance bucket; `None` computes it from the visual's world origin.
+    /// Native3015 screen-position mode uses bucket 100, not a 100-metre distance.
+    pub render_bucket: Option<i32>,
 }
 
 impl Default for ActorFrame {
@@ -266,12 +298,20 @@ impl Default for ActorFrame {
             model: 0,
             transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
             parts: Vec::new(),
+            part_uvs: Vec::new(),
             skin: None,
             always: false,
             alpha: 1.0,
             emissive: None,
             specular: None,
             specular_power: None,
+            part_attractors: Vec::new(),
+            part_materials: Vec::new(),
+            rendering_effect: 0,
+            rendering_effect_time: 0.0,
+            priority: None,
+            part_priorities: Vec::new(),
+            render_bucket: None,
         }
     }
 }

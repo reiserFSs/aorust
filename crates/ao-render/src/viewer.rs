@@ -30,6 +30,8 @@ pub struct Host {
     pub look: bool,
     /// Actor models to upload before the next frame (`key`, model scene), see [`Renderer::add_actor_model`]; drained by the viewer.
     pub actor_models: Vec<(u64, Scene)>,
+    /// Dynamic geometry replacements retaining previously uploaded textures; drained after model uploads.
+    pub actor_model_updates: Vec<(u64, Scene)>,
     /// Model keys to retire before uploads and actor frames; drained by the viewer. See [`Renderer::remove_actor_model`].
     pub actor_model_removals: Vec<u64>,
     /// The actors to draw this frame ([`ao_scene::ActorFrame`]); push every frame, the viewer drains it. Actors that are not pushed are forgotten.
@@ -46,9 +48,45 @@ pub struct Host {
     pub hide_cursor: bool,
     /// Current weather wind in AO world coordinates (`GCComputeWind`, Gamecode 0x100cd993).
     pub effect_wind: [f32; 3],
+    /// Current server-synchronized GameDayTime (0..6480 seconds); absent outside a game zone.
+    pub effect_day_time: Option<f32>,
+    /// Server-synchronized integer game seconds in the current day; absent until GameTime arrives.
+    pub effect_game_seconds: Option<i32>,
+    /// Actual active camera vehicle, not the preferred third-person setting.
+    pub effect_first_person: bool,
+    /// Native n3EngineClient +0x7c camera position, passed to VisualEnvFX +0x14.
+    pub effect_environment_center: Option<[f32; 3]>,
+    /// Native VisualEnvFX environment oscillator channels +0x90/+0x94, carried in X/Z.
+    pub effect_environment_wind: Option<[f32; 3]>,
+    /// RDB playfield resource tilemap id and flags, not the network playfield instance.
+    pub effect_playfield: Option<(u32, u32)>,
+    /// Native Light +0x104: ray direction, opposite the environment's vector towards the sun.
+    pub effect_sun_direction: Option<[f32; 3]>,
+    /// `n3Playfield_t::IsDungeon` from the loaded zone layout.
+    pub effect_dungeon: Option<bool>,
+    /// Native viewport sprites; submit each frame, drained with actors.
+    pub screen_layers: Vec<super::ScreenLayer>,
+    /// Authored textures for viewport layers; drained before screen rendering.
+    pub screen_textures: Vec<(ao_scene::TextureKey,ao_scene::Texture)>,
+    /// Ordered native depth-only clear visuals; submit each frame.
+    pub viewport_depth_clears:Vec<super::ViewportDepthClear>,
+    /// Shared native VisualFog state, also mutated by effect constructors/destructors.
+    pub native_fog: Option<super::SharedNativeFog>,
+    native_fog_preference: Option<i32>,
 }
 
 impl Host {
+    pub fn bind_native_fog(&mut self,state:super::SharedNativeFog) {
+        if self.native_fog.as_ref().is_some_and(|old|std::rc::Rc::ptr_eq(old,&state)){return;}
+        if let Some(mode)=self.native_fog_preference {let mut fog=state.get();fog.set_mode(mode);state.set(fog);}
+        self.native_fog=Some(state);
+    }
+    pub fn set_native_fog_preference(&mut self,mode:i32) {
+        if self.native_fog_preference==Some(mode){return;}
+        self.native_fog_preference=Some(mode);
+        if let Some(state)=&self.native_fog {let mut fog=state.get();fog.set_mode(mode);state.set(fog);}
+        else {self.fog_density_scale=Some(ao_scene::fog_mode_density_scale(mode));}
+    }
     /// Hands the queued actor models and the frame's actors to the renderer.
     fn apply_actors(&mut self, r: &mut Renderer) {
         if std::mem::take(&mut self.clear_actors) {
@@ -60,12 +98,20 @@ impl Host {
         for (key, scene) in self.actor_models.drain(..) {
             r.add_actor_model(key, &scene);
         }
+        for (key, scene) in self.actor_model_updates.drain(..) {
+            r.update_actor_model(key, &scene);
+        }
         r.set_actors(std::mem::take(&mut self.actors));
+        for (key,texture) in self.screen_textures.drain(..) {r.upload_screen_texture(key,&texture);}
+        let fog=self.native_fog.as_ref().map(|state|state.get());
+        if let Some(fog)=fog {r.set_fog_density_scale(fog.weight);}
+        r.set_screen_effects(std::mem::take(&mut self.screen_layers),fog.is_some_and(|fog|!fog.enabled));
+        r.set_viewport_depth_clears(std::mem::take(&mut self.viewport_depth_clears));
     }
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actor_model_removals: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3] }
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -80,12 +126,18 @@ impl Host {
 
     /// Replaces the rendered scene (uploaded before the next frame).
     pub fn set_scene(&mut self, scene: Scene) {
+        self.effect_sun_direction = scene.environment.map(|env| env.sun_dir.map(|v| -v));
+        self.effect_dungeon = None;
         self.scene_generation = self.scene_generation.wrapping_add(1);
         // Queued poses/models belong to the replaced topology, not the newly uploaded scene.
         self.repose = None;
         self.actor_models.clear();
+        self.actor_model_updates.clear();
         self.actor_model_removals.clear();
         self.actors.clear();
+        self.screen_layers.clear();
+        self.screen_textures.clear();
+        self.viewport_depth_clears.clear();
         self.clear_actors = true;
         self.scene = Some(scene);
     }
@@ -166,13 +218,15 @@ impl LiveRun {
         }
     }
 
-    fn advance(live: &mut Option<Self>, renderer: &mut Renderer, dt: f32) {
+    fn advance(live: &mut Option<Self>, renderer: &mut Renderer, dt: f32) -> Option<[f32; 3]> {
         if let Some(run) = live {
             renderer.day_time_rate = run.scale;
             if let Some(sky) = run.tick(dt) {
                 renderer.set_sky(&sky);
+                return sky.environment.map(|env| env.sun_dir.map(|v| -v));
             }
         }
+        None
     }
 }
 
@@ -340,7 +394,7 @@ impl State {
         let cam = Camera::look_at(eye, at);
         let gui = frontend.map(|frontend| {
             let renderer = crate::GuiRenderer::new(&renderer, frontend.gui());
-            Gui { renderer, frontend, host: Host { camera: cam, ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale: (window.scale_factor().round() as u32).max(1) }
+            Gui { renderer, frontend, host: Host { camera: cam, effect_sun_direction: scene.environment.map(|env| env.sun_dir.map(|v| -v)), ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale: (window.scale_factor().round() as u32).max(1) }
         });
         let now = Instant::now();
         Ok(Self {
@@ -427,7 +481,9 @@ impl State {
         self.last = now;
         self.clock += dt;
         self.renderer.time = self.clock;
-        LiveRun::advance(&mut self.live, &mut self.renderer, dt);
+        if let Some(sun) = LiveRun::advance(&mut self.live, &mut self.renderer, dt) {
+            if let Some(gui) = &mut self.gui { gui.host.effect_sun_direction = Some(sun); }
+        }
 
         // HiDPI/resize: follow the physical size every frame.
         let PhysicalSize { width, height } = self.window.inner_size();
@@ -644,7 +700,7 @@ impl Offscreen {
     /// One `Frontend::frame`, applying what it asked of the host.
     pub fn frame(&mut self, fe: &mut dyn Frontend, dt: f32) -> ao_gui::DrawList {
         self.r.time += dt;
-        LiveRun::advance(&mut self.live, &mut self.r, dt);
+        if let Some(sun) = LiveRun::advance(&mut self.live, &mut self.r, dt) { self.host.effect_sun_direction = Some(sun); }
         let list = fe.frame(dt, self.size, &mut self.host);
         if let Some(scene) = self.host.scene.take() {
             self.r.upload(&scene);
@@ -685,6 +741,19 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_shadow_sun_uses_the_loaded_environment_ray_direction() {
+        let mut host = Host::headless();
+        let mut env = super::super::default_environment(100.0);
+        env.sun_dir = [0.3, 0.8, -0.4];
+        host.set_scene(Scene { environment: Some(env), ..Scene::default() });
+        assert_eq!(host.effect_sun_direction, Some([-0.3, -0.8, 0.4]));
+        host.effect_dungeon = Some(true);
+        host.set_scene(Scene::default());
+        assert_eq!(host.effect_sun_direction, None);
+        assert_eq!(host.effect_dungeon, None);
+    }
+
 
     #[test]
     fn replacing_scene_discards_pending_old_topology_updates() {
