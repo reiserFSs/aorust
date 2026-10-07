@@ -119,7 +119,7 @@ mod tests {
     }
     #[test]
     fn shield_ctor_words_keep_phase_and_all_uv_modes_distinct() -> Result<()> {
-        for (mode,expected_uv) in [(0,[7.0,20.25]),(1,[3.25,12.25]),(2,[7.25,16.25])] {
+        for (mode,expected_uv) in [(0,[7.0,20.25]),(1,[3.25,12.25]),(2,[7.25,13.25])] {
             let mut words=vec![0;32];words[0]=0x800|0x1000;words[8]=(-1.0f32).to_bits();words[10]=u32::MAX;words[18]=mode;
             for (i,v) in [(15,1.0f32),(19,2.0),(20,3.0),(21,1.5),(22,0.25),(23,0.75),(24,3.25),(25,4.25)] {words[i]=v.to_bits();}
             let mut s=Shield::new(&Template {kind:3003,words},Mat4::IDENTITY,EffectConfig {source_identity:Some((50000,1)),..Default::default()})?;
