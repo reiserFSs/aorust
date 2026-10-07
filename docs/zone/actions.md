@@ -494,10 +494,16 @@ GC1009e301/1009ce50. Silent equip/unequip for this rifle is authored,
 not a muted/rejected voice; the0x3c/0x3f notes are visibility callbacks.
 
 The same round's level-up feasibility check logged Aomacrceg33550 at
-ICC4582 `(940,47.02,874.78)`, level2, XP1523, absolute next threshold
-5500 (stat53):3977 XP remain. Level-start1450 (stat57) plus per-level
-span4050 (stat350) equals5500;350 is not an absolute threshold.
-Aomacfixr33588 was also measured at level2, XP2115/5500:3385 remain.
+ICC4582 `(940,47.02,874.78)`, level2, XP1523 (stat52), IP5500 (stat53),
+LastXP1450 (stat57), and NextXP4050 (stat350).
+The stat IDs are defined in `crates/ao-formats/data/stat_names.txt`;
+`crates/aomac/src/play/hud_pools.rs::xp` (`FUN_100668aa`) computes the
+below-level200 bar as `XP - LastXP` of `NextXP - LastXP`, so stat350 is
+the absolute next threshold, not a per-level span. The earlier5500
+threshold claim confused IP with NextXP and incorrectly added LastXP.
+Aomacfixr33588 was also measured at level2, XP2115. Corrected gaps are
+**derived from those prior observations**, not a fresh live measurement:
+`4050 - 1523 = 2527` XP for rceg and `4050 - 2115 = 1935` for fixr.
 No living hostile level≤2 existed within rceg's60m `goto=hunt` filter;
 that helper rejected the attempt before attack. No kill, per-kill XP,
 level sound/animation or `got_ip` live PASS is claimed.
