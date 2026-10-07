@@ -895,6 +895,10 @@ impl Hud {
         self.options.input(gui, &mut self.dvalues, ev);
         // Esc closes the windows whose `esc_*` option was set when they opened (`esc_inventory`, `esc_wear`, `esc_nano`, `esc_perkwindow`, `esc_planetmap`, `esc_optionpanel`)
         if matches!(ev, InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, .. }) && !gui.text_focused() {
+            // EscapePressedMessage 0x1002899e broadcasts via GUIModule 0x1002bb28:
+            // StopAllActionsMessage 0x10027de4 sends RemoveTargetMessage (0x1e/0x112).
+            // Do not consume the signal: the armed window listeners below hear it too.
+            self.target.select(zone, None);
             for k in self.options.take_esc() {
                 self.close_kind(gui, k);
             }
@@ -1486,6 +1490,35 @@ mod tests {
         assert_eq!(group(0), "0");
         assert_eq!(group(1234567), "1,234,567");
         assert_eq!(group(-1000), "-1,000");
+    }
+
+    #[test]
+    fn escape_broadcast_removes_target_and_respects_wear_and_text_input() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = Hud::new(&mut gui, &dir, (1280, 800)).unwrap();
+        let mut zone = Zone::new(123);
+        let ev = InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, mods: ao_gui::Modifiers::default() };
+        let cam = ao_render::Camera::look_at(glam::Vec3::ZERO, -glam::Vec3::Z);
+        let lens = ao_scene::Lens::default();
+        for close in [true, false] {
+            hud.close_kind(&mut gui, WindowKind::Character);
+            hud.dvalues.set_i64("esc_wear", i64::from(close));
+            hud.open(&mut gui, WindowKind::Character);
+            zone.set_target(Some(ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: 456 }));
+            hud.input(&mut gui, &mut zone, &ev, &cam, &lens, ao_gui::Modifiers::default());
+            assert_eq!(zone.selected_target(), None);
+            assert_eq!(hud.is_open(WindowKind::Character), !close);
+        }
+        let w = gui.open_window_xml("escape_text", r#"<root><TextInputView name="editor"/></root>"#, (0, 0), ao_gui::WindowSize::Fixed(100, 30)).unwrap();
+        gui.focus(w, "editor");
+        assert!(gui.text_focused());
+        let selected = ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: 456 };
+        zone.set_target(Some(selected));
+        hud.input(&mut gui, &mut zone, &ev, &cam, &lens, ao_gui::Modifiers::default());
+        assert_eq!(zone.selected_target(), Some(selected));
+        assert!(hud.is_open(WindowKind::Character));
     }
 
     #[test]

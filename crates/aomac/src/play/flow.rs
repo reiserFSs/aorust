@@ -994,10 +994,16 @@ impl Frontend for Play {
                     c.esc();
                 }
             }
-            // a dialog box / the InfoView is open: Esc closes it first (`DialogBox_c::SlotEscPressed`; `esc_dialogs` / `esc_infoview` default true)
-            (Screen::InWorld, InputEvent::Key { key: Key::Escape, pressed: true, .. }) if self.chat.as_ref().is_some_and(|c| c.esc_closes()) => {
+            // TextInputMode suppresses the global hotkey. InfoViewMode uses CloseInfoSystem only;
+            // dialog listeners otherwise share the broadcast with target removal and HUD windows.
+            (Screen::InWorld, InputEvent::Key { key: Key::Escape, pressed: true, .. })
+                if !self.gui.text_focused() && self.chat.as_ref().is_some_and(|c| c.esc_closes() || c.info_view_open()) => {
                 if let Some(c) = self.chat.as_mut() {
+                    let info_mode = c.info_view_open();
                     c.escape(&mut self.gui, &self.zone, &self.text);
+                    if info_mode {
+                        return;
+                    }
                 }
             }
             (Screen::CharSelect, InputEvent::Key { key: Key::Up, pressed: true, .. }) if self.dialog_w.is_none() => return self.step_selection(-1, host),
@@ -1067,7 +1073,7 @@ impl Frontend for Play {
             }
         }
         if let (Screen::InWorld, Some(p)) = (self.screen, self.player.as_mut()) {
-            if open || matches!(ev, ao_render::GameInput::Key { pressed: false, .. }) {
+            if open || matches!(ev, ao_render::GameInput::Key { pressed: false, .. } | ao_render::GameInput::FocusLost) {
                 p.game_input(ev);
             }
         }

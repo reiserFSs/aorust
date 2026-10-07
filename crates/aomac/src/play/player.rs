@@ -390,7 +390,14 @@ impl Player {
     pub fn game_input(&mut self, ev: GameInput) {
         let cmds = match ev {
             GameInput::Key { code, pressed, .. } => self.controls.on_key(code, pressed),
-            GameInput::MouseMotion { dx, dy } => self.controls.on_mouse_motion(dx, dy),
+            GameInput::MouseMotion { dx, dy, dt } => {
+                self.movement.set_mouse_frame_dt(dt);
+                self.controls.on_mouse_motion(dx, dy)
+            }
+            GameInput::FocusLost => {
+                self.gui_press = [false; 2];
+                self.controls.on_focus_lost()
+            }
         };
         self.run(cmds);
     }

@@ -68,6 +68,35 @@ fn character_selection_expands_only_the_selected_row() {
 }
 
 #[test]
+fn escape_info_mode_is_close_only_text_suppresses_and_dialogs_broadcast() {
+    let Some(mut r) = rig() else { return };
+    r.p.screen = Screen::InWorld;
+    // Mirror the real first-world transition (Play::frame): login's editor no longer owns TextInputMode.
+    r.p.gui.clear_focus();
+    r.p.chat = Some(super::super::chat::Chat::new());
+    r.p.hud = Some(super::super::hud::Hud::new(&mut r.p.gui, &r.p.dir, (1280, 800)).unwrap());
+    let selected = ao_net::msg::Identity { kind: 50000, instance: 77 };
+    let esc = || InputEvent::Key { key: Key::Escape, pressed: true, mods: ao_gui::Modifiers::default() };
+    r.p.zone.set_target(Some(selected));
+    r.p.chat.as_mut().unwrap().show_url(&mut r.p.gui, &r.p.zone, &r.p.text, "charid://50000/77");
+    assert!(r.p.chat.as_ref().unwrap().info_view_open());
+    r.p.input(esc(), &mut r.host);
+    assert!(!r.p.chat.as_ref().unwrap().info_view_open());
+    assert_eq!(r.p.zone.selected_target(), Some(selected));
+    r.p.chat.as_mut().unwrap().duel_dialog(&mut r.p.gui, false, "test", &r.p.text);
+    assert!(r.p.chat.as_ref().unwrap().esc_closes());
+    let w = r.p.gui.open_window_xml("escape_editor", r#"<root><TextInputView name="editor"/></root>"#, (0, 0), ao_gui::WindowSize::Fixed(100, 30)).unwrap();
+    r.p.gui.focus(w, "editor");
+    r.p.input(esc(), &mut r.host);
+    assert_eq!(r.p.zone.selected_target(), Some(selected));
+    assert!(r.p.chat.as_ref().unwrap().esc_closes());
+    r.p.gui.close_window(w);
+    r.p.input(esc(), &mut r.host);
+    assert_eq!(r.p.zone.selected_target(), None);
+    assert!(!r.p.chat.as_ref().unwrap().esc_closes());
+}
+
+#[test]
 fn character_info_first_response_and_refresh_use_current_packet_stats() {
     let Some(mut r) = rig() else { return };
     r.p.zone = zone::Zone::new(42);
@@ -452,6 +481,46 @@ fn own_character_walks_from_the_keyboard() {
     assert!(along > 0.9 * d, "moved along the heading {yaw}: {along} of {d}");
 }
 
+#[test]
+fn focus_loss_resets_input_even_while_game_input_is_closed() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    let frames = |r: &mut Rig, n: u32| (0..n).for_each(|_| drop(r.p.frame(0.016, (1280, 800), &mut r.host)));
+    frames(&mut r, IN_PLAY_FRAMES + 2);
+    assert!(r.p.game_input_open());
+    let key = |r: &mut Rig, code| r.p.game_input(ao_render::GameInput::Key { code, pressed: true, repeat: false }, &mut r.host);
+    key(&mut r, ao_render::KeyCode::KeyW);
+    frames(&mut r, 10);
+    key(&mut r, ao_render::KeyCode::ControlLeft);
+    key(&mut r, ao_render::KeyCode::ShiftLeft);
+    r.p.player.as_mut().unwrap().mouse(
+        &ao_gui::InputEvent::MouseDown { x: 640.0, y: 400.0, button: ao_gui::MouseButton::Right },
+        false,
+    );
+    r.p.game_input(ao_render::GameInput::MouseMotion { dx: 10.0, dy: 0.0, dt: 0.016 }, &mut r.host);
+    frames(&mut r, 1);
+    assert!(r.host.look);
+    r.p.awaiting_alive = true;
+    assert!(!r.p.game_input_open());
+    r.host.look = false; // the viewer releases cursor capture before forwarding focus loss
+    r.p.game_input(ao_render::GameInput::FocusLost, &mut r.host);
+    frames(&mut r, 10);
+    assert!(!r.host.look, "the player's stale look must not recapture the cursor");
+    let stopped = r.p.zone.own().unwrap().pos;
+    frames(&mut r, 60);
+    let after = r.p.zone.own().unwrap().pos;
+    assert!((after[0] - stopped[0]).abs() < 0.05 && (after[2] - stopped[2]).abs() < 0.05, "held movement stopped");
+    r.p.awaiting_alive = false;
+    key(&mut r, ao_render::KeyCode::KeyW);
+    frames(&mut r, 60);
+    let resumed = r.p.zone.own().unwrap().pos;
+    let distance = ((resumed[0] - after[0]).powi(2) + (resumed[2] - after[2]).powi(2)).sqrt();
+    assert!(distance > 1.0, "a fresh unmodified W press moves after refocus: {distance}");
+    r.p.game_input(ao_render::GameInput::FocusLost, &mut r.host);
+}
+
 /// The route autopilot of the live harness, headless: Arrival Hall start -> the northernmost reachable spot of the collision grid
 /// (collision + movement + avatar glue; fails when the character gets stuck on geometry the route calls free).
 #[test]
@@ -512,7 +581,7 @@ fn first_person_and_mouse_look_from_the_input_events() {
     r.p.input(ao_gui::InputEvent::MouseDown { x, y, button }, &mut r.host);
     r.p.frame(0.016, (1280, 800), &mut r.host);
     for _ in 0..4 {
-        r.p.game_input(ao_render::GameInput::MouseMotion { dx: 25.0, dy: 0.0 }, &mut r.host);
+        r.p.game_input(ao_render::GameInput::MouseMotion { dx: 25.0, dy: 0.0, dt: 0.016 }, &mut r.host);
         r.p.frame(0.016, (1280, 800), &mut r.host);
     }
     r.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut r.host);

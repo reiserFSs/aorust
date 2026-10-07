@@ -390,6 +390,11 @@ impl Chat {
         self.dialogs.is_open() || self.info.window().is_some()
     }
 
+    /// `InfoViewMode` selects the close-only Escape command independently of the captured close option.
+    pub fn info_view_open(&self) -> bool {
+        self.info.window().is_some()
+    }
+
     /// Esc key: closes the topmost dialog / the InfoView; `true` when something was closed.
     pub fn escape(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb) -> bool {
         if let Some(w) = self.dialogs.windows().last() {

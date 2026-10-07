@@ -3,10 +3,13 @@
 //!  cargo test --release -p aomac live_walk -- --ignored --nocapture`.
 //! Credentials come from stdin only. Steps (comma separated): `KEY=secs` holds a letter/arrow/space key (`W A S D Z C SPACE UP LEFT`),
 //! `wait=secs`, `shot=name` (PNG into AOMAC_LIVE_SHOTS), `pos` prints the own position, `press=F8|CTRL+F8|SHIFT+F8` taps keys (camera),
-//! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens. HUD steps: `ui=u|ctrl+1` window hotkey,
+//! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens. HUD steps: `ui=u|ctrl+1` window hotkey (Ctrl+1 = Wear in shipped KeyBindings).
 //! `heading=server_yaw` rotates in place through right mouse input to the requested heading (radians), before idle/capture steps.
 //! `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
+//! `focuslost` cancels held game input as the host's window-focus-loss event does.
+//! Named GUI keys are delivered before physical game keys, as in the viewer; letters stay physical (no invented layout/IME text).
+//! `inputstate` prints target, Wear, text focus, host look, movement mode and camp state; `inputstate=clear` also asserts no target.
 //! Frame captures require `AOMAC_LIVE_SHOTS`: `arm=attack:1:note,down=Q,capturewait=30,up=Q` records the frame
 //! processing the next own attack note. `arm=burst:1:special,M=0.1,capturewait=30` selects SpecialAttack instead.
 //! (60 PNGs for one second, `attack-0000.png` onward). No event queue polling; the processing hook counts events.
@@ -21,6 +24,36 @@ use super::*;
 use ao_render::{GameInput, KeyCode, Offscreen};
 use std::io::BufRead;
 use std::time::{Duration, Instant};
+
+fn gui_key(code: KeyCode) -> Option<ao_gui::Key> {
+    use ao_gui::Key as K;
+    Some(match code {
+        KeyCode::Escape => K::Escape,
+        KeyCode::Enter | KeyCode::NumpadEnter => K::Enter,
+        KeyCode::Tab => K::Tab,
+        KeyCode::Backspace => K::Backspace,
+        KeyCode::Delete => K::Delete,
+        KeyCode::ArrowLeft => K::Left,
+        KeyCode::ArrowRight => K::Right,
+        KeyCode::ArrowUp => K::Up,
+        KeyCode::ArrowDown => K::Down,
+        KeyCode::Home => K::Home,
+        KeyCode::End => K::End,
+        // The viewer has no GUI key variants for Space / PageUp / PageDown.
+        // Keep their physical events without fabricating character text.
+        _ => return None,
+    })
+}
+
+#[test]
+fn live_named_gui_keys_do_not_invent_text() {
+    assert_eq!(gui_key(code("ESCAPE")), Some(ao_gui::Key::Escape));
+    assert_eq!(gui_key(code("ENTER")), Some(ao_gui::Key::Enter));
+    assert_eq!(gui_key(code("TAB")), Some(ao_gui::Key::Tab));
+    for key in [KeyCode::KeyW, KeyCode::Digit1, KeyCode::Space, KeyCode::PageUp, KeyCode::PageDown] {
+        assert_eq!(gui_key(key), None);
+    }
+}
 
 fn approach_state(zone: &super::super::zone::Zone, fixed: Option<(f32, f32)>, id: i32) -> Option<(&super::super::zone::DynelState, (f32, f32))> {
     let own = zone.own()?;
@@ -233,6 +266,9 @@ impl Live {
             KeyCode::ControlLeft => m.ctrl = pressed,
             KeyCode::AltLeft => m.alt = pressed,
             _ => {}
+        }
+        if let Some(key) = gui_key(code) {
+            self.p.input(ao_gui::InputEvent::Key { key, pressed, mods: self.o.host.mods }, &mut self.o.host);
         }
         self.p.game_input(GameInput::Key { code, pressed, repeat: false }, &mut self.o.host);
     }
@@ -477,6 +513,13 @@ fn code(name: &str) -> KeyCode {
         "Y" => KeyY,
         "ESCAPE" => Escape,
         "ENTER" => Enter,
+        "TAB" => Tab,
+        "DELETE" => Delete,
+        "DOWN" => ArrowDown,
+        "HOME" => Home,
+        "END" => End,
+        "PAGEUP" => PageUp,
+        "PAGEDOWN" => PageDown,
         n => panic!("unknown key {n}"),
     }
 }
@@ -611,6 +654,10 @@ fn live_walk() {
             }
             // Keep movement held across screenshots for gait/ground-speed comparisons.
             "down" | "up" => l.key(code(v), k == "down"),
+            "focuslost" => {
+                l.p.game_input(GameInput::FocusLost, &mut l.o.host);
+                l.tick();
+            }
             "resize" => {
                 let (w, h) = v.split_once('x').expect("resize=WxH");
                 l.o.resize((w.parse().unwrap(), h.parse().unwrap()));
@@ -618,6 +665,22 @@ fn live_walk() {
             }
             "shot" => l.shot(v),
             "pos" => eprintln!("{}", l.pos()),
+            "inputstate" => {
+                eprintln!("inputstate: target={:?} wear_open={} text_focus={} host_look={} mode={:?} camp={:?} logout={:?} world_message={:?}",
+                    l.p.zone.selected_target(), l.p.hud.as_ref().is_some_and(|h| h.is_open(super::super::hud::WindowKind::Character)),
+                    l.p.gui.text_focused(), l.o.host.look, l.p.player.as_ref().map(|p| p.mode()),
+                    l.p.camp, l.p.logout.state, l.p.in_world_msg);
+                if let Some(h) = &l.p.hud {
+                    let wear = super::super::options::keys::provider_hash("WINDOW_WEAR");
+                    let inputs: Vec<_> = h.key_tables().0.pairs().filter_map(|(input, provider)| (provider == wear).then_some(input)).collect();
+                    eprintln!("inputstate: effective Wear bindings={inputs:#x?} (shipped Ctrl+1=0x4006c)");
+                }
+                match v {
+                    "" => {}
+                    "clear" => assert!(l.p.zone.selected_target().is_none(), "inputstate expected the target to be cleared"),
+                    _ => panic!("inputstate accepts only clear or no value"),
+                }
+            }
             "audio" => eprintln!("audio: {} combat={:?} layer={:?} music={:?}", l.p.audio.as_ref().map_or("off".into(), |a| a.status()), l.p.audio.as_ref().map(|a| a.combat_state()), l.p.audio.as_ref().and_then(|a| a.music_layer()), l.p.audio.as_ref().and_then(|a| a.now_playing())),
             // combat steps: `near` lists the dynels within 60 m, `tab` = TAB (next hostile target), `sel=<instance>` selects,
             // `fight` prints the combat layer's state (Q / X / B hold the keys: attack / sit / brawl)
@@ -698,7 +761,14 @@ fn live_walk() {
             // `login`: wait for the camp (`say=/camp`: the 40 s `Logout` timer) to end in the login screen; prints the open window count (the
             // chat / interact / target layers are torn down by `show_login`)
             "login" => {
-                l.until("login screen after camp", 120, |p| p.screen == Screen::Login);
+                let start = Instant::now();
+                while l.p.screen != Screen::Login {
+                    assert!(start.elapsed().as_secs() < 120,
+                        "camp did not return to login: camp={:?} logout={:?} world_message={:?} text_focus={} host_look={}",
+                        l.p.camp, l.p.logout.state, l.p.in_world_msg, l.p.gui.text_focused(), l.o.host.look);
+                    l.tick();
+                }
+                eprintln!("camp returned to login: logout={:?} world_message={:?}", l.p.logout.state, l.p.in_world_msg);
                 l.wait(1.0);
                 eprintln!("login screen: {} gui windows, chat layer {}, session {}", l.p.gui.window_ids().len(), l.p.chat.is_some(), l.p.session.is_some());
             }
@@ -856,7 +926,7 @@ fn live_walk() {
                     if error.abs() <= 1e-5 {
                         break;
                     }
-                    l.p.game_input(GameInput::MouseMotion { dx: error * 1000.0 / sensitivity, dy: 0.0 }, &mut l.o.host);
+                    l.p.game_input(GameInput::MouseMotion { dx: error * 1000.0 / sensitivity, dy: 0.0, dt: CAPTURE_DT }, &mut l.o.host);
                 }
                 l.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut l.o.host);
                 l.tick();
@@ -875,7 +945,7 @@ fn live_walk() {
                 l.p.input(ao_gui::InputEvent::MouseDown { x, y, button }, &mut l.o.host);
                 for _ in 0..8 {
                     l.tick();
-                    l.p.game_input(GameInput::MouseMotion { dx: dx / 8.0, dy: dy / 8.0 }, &mut l.o.host);
+                    l.p.game_input(GameInput::MouseMotion { dx: dx / 8.0, dy: dy / 8.0, dt: CAPTURE_DT }, &mut l.o.host);
                 }
                 l.tick();
                 l.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut l.o.host);

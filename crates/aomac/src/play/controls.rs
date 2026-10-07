@@ -600,6 +600,19 @@ impl Controls {
         out
     }
 
+    /// Cancel input whose physical release may be delivered to another window.
+    pub fn on_focus_lost(&mut self) -> Vec<Cmd> {
+        let mut out = vec![];
+        while let Some(h) = self.held.pop() {
+            out.extend(self.release_one(h));
+        }
+        out.extend(self.end_look());
+        self.shift = false;
+        self.ctrl = false;
+        self.alt = false;
+        out
+    }
+
     fn release_one(&mut self, h: Held) -> Vec<Cmd> {
         match (h.slot, h.started) {
             (_, Some(a)) => vec![Cmd::Move(stop_of(a))],
@@ -818,6 +831,44 @@ mod tests {
 
     fn ctl() -> Controls {
         Controls::new(ControlPrefs::default())
+    }
+
+    #[test]
+    fn focus_loss_releases_movement_camera_and_modifiers() {
+        let mut c = ctl();
+        c.bindings.push((key_id(F1).unwrap(), Slot::CameraRotateLeft));
+        assert_eq!(c.on_key(KeyW, true), vec![Cmd::Move(1)]);
+        assert_eq!(c.on_key(F1, true), vec![cam_key(CamKey::RotateLeft, true)]);
+        c.on_key(ControlLeft, true);
+        c.on_key(ShiftLeft, true);
+        c.on_key(AltLeft, true);
+        c.on_mouse_button(MouseButton::Right, true);
+        c.on_mouse_motion(10.0, 0.0);
+        assert_eq!(c.on_focus_lost(), vec![cam_key(CamKey::RotateLeft, false), Cmd::Move(2), Cmd::Camera(CamCmd::EndLook)]);
+        assert!(!c.mouse_capture());
+        assert!(!c.attack_modifier());
+        assert_eq!(c.mods(), 0);
+        assert_eq!(c.on_mouse_motion(10.0, 0.0), vec![]);
+        assert_eq!(c.on_focus_lost(), vec![]);
+        assert_eq!(c.on_key(KeyW, true), vec![Cmd::Move(1)]);
+        assert_eq!(c.on_key(KeyW, false), vec![Cmd::Move(2)]);
+    }
+
+    #[test]
+    fn focus_loss_cancels_pending_look_and_releases_remapped_turn() {
+        let mut c = ctl();
+        c.on_mouse_button(MouseButton::Right, true);
+        assert_eq!(c.on_focus_lost(), vec![]);
+        assert!(!c.mouse_capture());
+        c.on_key(KeyD, true);
+        c.on_mouse_button(MouseButton::Right, true);
+        c.on_mouse_motion(10.0, 0.0);
+        assert_eq!(c.on_focus_lost(), vec![Cmd::Move(6)]);
+        assert_eq!(c.on_key(KeyD, true), vec![Cmd::Move(9)]);
+        assert_eq!(c.on_key(KeyD, false), vec![Cmd::Move(0xB)]);
+        c.set_text_input(true);
+        c.on_focus_lost();
+        assert_eq!(c.on_key(KeyW, true), vec![], "text focus is preserved");
     }
 
     fn client_file(rel: &str) -> Option<String> {

@@ -551,8 +551,8 @@ pub struct Movement {
     controllable: bool,
     /// `dynel + 0x2c8 != 0 && FUN_1002e347() != 0`: refuses the walk switch (unresolved condition).
     walk_locked: bool,
-    /// `n3EngineClientAnarchy_t + 0x68` factor of the TurnSpeed mouse clamp (unresolved, 1.0).
-    mouse_scale: f32,
+    /// Current mouse-input frame delta in seconds (`n3EngineClientAnarchy_t + 0x68`).
+    mouse_frame_dt: f32,
     // --- n3EngineClientAnarchy_t motion-message bookkeeping ---
     clock: f64,
     /// `+0xD8` time of the last motion message, `+0xE0` its rotation, `+0xF0` its position.
@@ -647,7 +647,7 @@ impl Movement {
             force: 0.0,
             controllable: true,
             walk_locked: false,
-            mouse_scale: 1.0,
+            mouse_frame_dt: 0.0,
             clock: 0.0,
             last_msg_time: 0.0,
             last_rot: rot_of(yaw),
@@ -834,6 +834,11 @@ impl Movement {
         self.movement_changed(action, 0.0, 0.0);
     }
 
+    /// Set the current host frame delta before dispatching its aggregated mouse input.
+    pub fn set_mouse_frame_dt(&mut self, dt: f32) {
+        self.mouse_frame_dt = dt;
+    }
+
     /// `N3Msg_MouseMovement(dx, dy)`: mouse-look yaw delta `dx` in radians (positive = right); `dy` only matters in
     /// first person and is not applied (the pitch half of `VehicleForwardUpdate` is not ported).
     pub fn mouse_turn(&mut self, dx: f32, dy: f32, now: f32) {
@@ -854,8 +859,8 @@ impl Movement {
         }
         let mut dx = dx;
         if self.stats.turn_speed != 0 {
-            // GetStat(0x10B): |dx| <= TurnSpeed / 100000 * (n3EngineClientAnarchy + 0x68, unresolved -> mouse_scale).
-            let lim = self.stats.turn_speed as f32 / 100000.0 * self.mouse_scale;
+            // GC10019943 FILD TurnSpeed;10019946 FDIV 100000;1001994c FMUL engine+68 (seconds).
+            let lim = self.stats.turn_speed as f32 / 100000.0 * self.mouse_frame_dt;
             dx = dx.clamp(-lim, lim);
         }
         let td = self.fsm.turn_dir;
@@ -2223,6 +2228,30 @@ mod tests {
         // standing still: nothing
         let mut m = Movement::new([0.0; 3], 0.0, 0);
         assert!(run(&mut m, &w, 8.0).is_empty());
+    }
+
+    #[test]
+    fn mouse_turn_clamp_uses_current_frame_seconds() {
+        for dt in [0.01, 0.04] {
+            for batches in [1, 8] {
+                let mut m = Movement::new([0.0; 3], 0.0, 0);
+                m.stats.turn_speed = 200000;
+                m.set_mouse_frame_dt(dt);
+                m.mouse_turn(0.0, 0.0, 0.0); // native start event drops its delta
+                // Device events are aggregated before the single gameplay dispatch.
+                let dx: f32 = (0..batches).map(|_| 1.0 / batches as f32).sum();
+                m.mouse_turn(dx, 0.0, 1.0);
+                assert!((m.yaw() - 200000.0 / 100000.0 * dt).abs() < 1e-6);
+                m.set_mouse_frame_dt(dt * 0.5);
+                m.mouse_turn(dx, 0.0, 1.0); // same clock, new frame delta must take effect
+                assert!((m.yaw() - 200000.0 / 100000.0 * dt * 1.5).abs() < 1e-6);
+            }
+        }
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.set_mouse_frame_dt(0.01);
+        m.mouse_turn(0.0, 0.0, 0.0);
+        m.mouse_turn(1.0, 0.0, 1.0);
+        assert!((m.yaw() - 1.0).abs() < 1e-6, "default TurnSpeed0 is unclamped");
     }
 
     #[test]

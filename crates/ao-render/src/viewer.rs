@@ -11,6 +11,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
+#[path = "raw_mouse.rs"]
+mod raw_mouse;
+
 /// What a [`Frontend`] can ask of the window/renderer between frames.
 pub struct Host {
     /// Camera used for the next frame. Written back from free-fly controls while `fly`.
@@ -147,8 +150,11 @@ impl Host {
 #[derive(Clone, Copy, Debug)]
 pub enum GameInput {
     Key { code: KeyCode, pressed: bool, repeat: bool },
-    /// Relative mouse movement in physical pixels, only while [`Host::look`] is set.
-    MouseMotion { dx: f32, dy: f32 },
+    /// Relative hardware mouse counts, summed once per frame while [`Host::look`] is set,
+    /// with that frame's delta in seconds (not the previous frontend frame's delta).
+    MouseMotion { dx: f32, dy: f32, dt: f32 },
+    /// The window lost focus; release game input even while new presses are disabled.
+    FocusLost,
 }
 
 /// The windowed GUI application: draws the original AO GUI (`ao_gui`) over the 3D scene.
@@ -311,6 +317,8 @@ struct State {
     keys: HashSet<KeyCode>,
     speed: f32,
     looking: bool,
+    focused: bool,
+    raw_mouse: raw_mouse::RawMouse,
     cursor_hidden: bool,
     last: Instant,
     stat_t: Instant,
@@ -397,6 +405,7 @@ impl State {
             Gui { renderer, frontend, host: Host { camera: cam, effect_sun_direction: scene.environment.map(|env| env.sun_dir.map(|v| -v)), ..Host::headless() }, cursor: (0.0, 0.0), mods: Default::default(), scale: (window.scale_factor().round() as u32).max(1) }
         });
         let now = Instant::now();
+        let focused = window.has_focus();
         Ok(Self {
             window,
             surface,
@@ -407,6 +416,8 @@ impl State {
             keys: HashSet::new(),
             speed,
             looking: false,
+            focused,
+            raw_mouse: raw_mouse::RawMouse::new(),
             cursor_hidden: false,
             last: now,
             stat_t: now,
@@ -425,7 +436,9 @@ impl State {
     }
 
     fn set_look(&mut self, on: bool) {
+        let on = on && self.focused;
         self.looking = on;
+        self.raw_mouse.set_active(on && !self.fly());
         if on {
             let _ = self.window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Confined));
         } else {
@@ -446,7 +459,11 @@ impl State {
     /// Runs the frontend; returns its draw list (`None` without a frontend). True in `.1` = quit.
     fn run_gui(&mut self, dt: f32) -> (Option<ao_gui::DrawList>, bool) {
         let Some(g) = &mut self.gui else { return (None, false) };
+        let (dx, dy) = self.raw_mouse.take();
         g.host.camera = self.cam;
+        if !g.host.fly && (dx != 0.0 || dy != 0.0) {
+            g.frontend.game_input(GameInput::MouseMotion { dx, dy, dt }, &mut g.host);
+        }
         let size = (self.config.width / g.scale, self.config.height / g.scale);
         let list = g.frontend.frame(dt, size, &mut g.host);
         self.cam = g.host.camera;
@@ -505,6 +522,7 @@ impl State {
             let c = &mut self.cam;
             c.pos += (c.forward() * (k(KeyCode::KeyW) - k(KeyCode::KeyS)) + c.right() * (k(KeyCode::KeyD) - k(KeyCode::KeyA)) + Vec3::Y * up) * step;
         }
+        self.raw_mouse.set_active(self.looking && self.focused && !self.fly());
         let (gui_out, quit) = self.run_gui(dt);
         if let Some(want) = self.gui.as_ref().filter(|_| !self.fly()).map(|g| g.host.look) {
             if want != self.looking {
@@ -570,6 +588,7 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, ev: WindowEvent) {
         let Some(s) = &mut self.state else { return };
+        if let WindowEvent::Focused(focused) = &ev { s.focused = *focused; }
         if let Some(g) = &mut s.gui {
             let gi = gui_input(&ev, &mut g.cursor, &mut g.mods, g.scale);
             g.host.mods = g.mods;
@@ -626,6 +645,11 @@ impl ApplicationHandler for App {
                 s.set_look(false);
                 if let Some(g) = &mut s.gui {
                     g.host.look = false;
+                    g.mods = ao_gui::Modifiers::default();
+                    g.host.mods = g.mods;
+                    g.host.camera = s.cam;
+                    g.frontend.game_input(GameInput::FocusLost, &mut g.host);
+                    s.cam = g.host.camera;
                 }
             }
             WindowEvent::MouseInput { button: MouseButton::Right, state, .. } if fly => s.set_look(state == ElementState::Pressed),
@@ -652,16 +676,11 @@ impl ApplicationHandler for App {
         if !s.looking {
             return;
         }
-        match s.gui.as_mut().filter(|g| !g.host.fly) {
-            Some(g) => {
-                g.host.camera = s.cam;
-                g.frontend.game_input(GameInput::MouseMotion { dx: dx as f32, dy: dy as f32 }, &mut g.host);
-                s.cam = g.host.camera;
-            }
-            None => {
-                s.cam.yaw += dx as f32 * 0.0025;
-                s.cam.pitch = (s.cam.pitch - dy as f32 * 0.0025).clamp(-1.55, 1.55);
-            }
+        if !s.fly() {
+            s.raw_mouse.push_winit(dx as f32, dy as f32);
+        } else {
+            s.cam.yaw += dx as f32 * 0.0025;
+            s.cam.pitch = (s.cam.pitch - dy as f32 * 0.0025).clamp(-1.55, 1.55);
         }
     }
 

@@ -85,6 +85,49 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
 
 `ControlPrefs::default()` equals this table; a test parses the installed `LoginPrefs.xml` and compares.
 
+### Native relative mouse reports
+
+**[RE]** `Anarchy.exe 0x00404a66` handles `WM_INPUT`: relative `RAWMOUSE.lLastX/lLastY`
+are copied into input state `+0x78`. `GUI 0x1001ae14` aggregates hardware reports per
+frame and divides counts by 1000; `GUI 0x1002c17b` applies `MouseTurnSensitivity`
+once. There is no pointer acceleration or Retina/pixel scaling in this path.
+
+The macOS winit 0.30 AppKit path reads `NSEvent.deltaX/deltaY`, which are
+system-scaled/accelerated and can be display-coalesced. Play look instead uses
+Apple's `GCMouseInput.mouseMovedHandler` (GameController, macOS 11+), accumulating
+unchanged hardware deltas until the next frontend frame. All connected mice are
+enumerated each frame, with handlers attached or removed on hotplug.
+Positive-up GameController Y is negated to the frontend's
+positive-down convention. Focus loss and ending capture clear both native and
+winit accumulators and backend liveness; the native handler never supplies buttons.
+A frame containing native reports dispatches only their sum and discards duplicate
+AppKit motion. Before the first native report in a capture, winit works immediately
+even with a connected but silent GCMouse. After native delivery begins, a 100 ms
+monotonic liveness grace retains the raw backend across short coalescing gaps and
+discards AppKit duplicates on subsequent frames. If native reports stay absent
+past that grace, the current winit frame is used; discarded frames are never replayed.
+This timeout is a platform backend-handoff policy, **not a retail sensitivity,
+acceleration or scale constant**, and does not claim correlated report timestamps.
+`AOMAC_PERF` logs the selected backend when it changes on moving frames.
+Other platforms retain winit counts; free-fly retains its existing winit controls.
+
+Primary API contract: Apple's macOS SDK `GameController.framework/Headers/GCMouseInput.h`
+lines 16–30 describes physical mouse raw movement, availability on macOS 11+, and
+both delta axes as “Not affected by mouse sensitivity settings”; line 33 declares
+the copied nullable `mouseMovedHandler`. `GCMouse.h` lines 72–76 declares
+`mouseInput` nullable, so a connected device without a profile is skipped rather
+than treated as usable raw input. See Apple's
+[GCMouseInput documentation](https://developer.apple.com/documentation/gamecontroller/gcmouseinput).
+
+API/platform evidence: [winit issue 4581](https://github.com/rust-windowing/winit/issues/4581)
+reports raw unaccelerated hardware-rate GCMouse motion without Input Monitoring
+or special Info.plist keys (including a trackpad check); [SDL implementation](https://github.com/libsdl-org/SDL/blob/main/src/video/cocoa/SDL_cocoamouse.m)
+uses `deltaX, -deltaY` and clears `mouseMovedHandler` on removal.
+Synthetic CGEvent drags need not reach GCMouse and are not proof of raw-input
+delivery. Runnable accumulator regression:
+`cargo test --release -p ao-render reports_sum_without_acceleration_and_clear_at_capture_boundaries`.
+
+
 ## 3. Third-person camera (mode 3, `CameraVehicleFixedThird_t`)
 
 * Created by `n3EngineClient_t::CreateCamera` [N3 0x10007842] → `n3Camera_t` ctor `FUN_10021a76` [N3 0x10021a76] → vehicle by

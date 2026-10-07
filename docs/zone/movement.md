@@ -196,7 +196,7 @@ side-3 NPCs by the given metres) and the harness now ends a `goto` when the own 
 
 * First event (`DAT_102e2588 == 0`): a key turn in progress is converted: left turn (dir 3, turn rate ≠ 0) → `MovementChanged(0xE)` then `(7)`; right → `(0xB)` then `(5)`. Then
   `DAT_102e2588 := 1`.
-* Needs Features bit 2 or 4. If TurnSpeed (stat 0x10B) ≠ 0: `|dx| ≤ TurnSpeed / 100000 [GC 0x101575d0] * (client+0x68)` (client+0x68 unresolved).
+* Needs Features bit 2 or 4. If TurnSpeed (stat 0x10B) ≠ 0: `|dx| ≤ TurnSpeed / 100000 * current-frame dt seconds`. GC **10019943** loads the integer stat, **10019946** divides by double100000 at **101575d0**, and **1001994c** multiplies by engine+0x68. N3 `N3GetDeltaTime` **1000159f**, `RunEngine` **100066ad**, Interfaces **10007f32**, and AFCM `Timer_t::FrameProcess` **100065d3** establish seconds (see avatar.md). The viewer sums hardware counts once per frame and supplies that same frame's dt in `GameInput::MouseMotion` before frontend frame processing; it does not use the player's previous frame clock. TurnSpeed0 bypasses the clamp.
 * `dx ≥ 0`: turn dir ∈ {0, 3} → `MovementChanged(0xA, 0, 0)` (the `dx` of that event is dropped); else (already turning right) → `MovementChanged(0x2B, dx, dy')`.
   `dx < 0`: turn dir ∈ {0, 4} → `(0xD)`; else `(0x2B, dx, dy')`. `dy' = 0` in third person, `s_nInverted*dy` in first person (mode ≠ 7).
 * `0x2B` = local yaw rotation by `dx` radians (positive = right = same sense as TurnRightStart), marks the dynel dirty for `CheckMotionUpdate`.
@@ -286,7 +286,7 @@ JumpForward}` from the FSM (the original picks anim ids in the Apply functions: 
   0x100127d8], rays from `y + 0.4` [VH 0x100127f8]), fall when no support, landing when `vy ≤ 0` and `y ≤ ground`. The real function casts three rays per
   step, aligns the body to the surface normal (OrientationMode 1/3/4), checks the slope (`a4 < 0.5` [VH 0x10012134]) and wades through
   `LiquidMediumData_t::m_vLiquidHeight`; the body sphere radius is `n3Dynel_t::GetBodyCollSphereRadi` (per dynel).
-* `MAX_SUBSTEP` (`Vehicle+0x104`), the mass source (`Vehicle+0x34`), the mouse clamp factor `client+0x68`, the walk lock condition
+* `MAX_SUBSTEP` (`Vehicle+0x104`), the mass source (`Vehicle+0x34`), the walk lock condition
   (`dynel+0x2c8`, `FUN_1002e347`), mode 9 (`FUN_10070fee` and `N3Msg_StartCamping` test it), the pitch half of `VehicleForwardUpdate` (first person
   only), the fly vertical limits (the jump ceiling clamp is ported, §7).
 * Features bits: only bits 2 and 4 are read here (4 = may act, 2 = may turn); names of the other bits unknown. The default in `Stats` is 4.
