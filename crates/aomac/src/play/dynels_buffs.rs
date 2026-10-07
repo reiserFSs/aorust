@@ -13,6 +13,7 @@ impl Dynels {
     pub fn apply_buff_visuals(&mut self, who: i32, events: impl IntoIterator<Item = VisualEvent>) {
         for event in events {
             let nano = match event { VisualEvent::Add { nano, .. } | VisualEvent::Remove { nano } => nano };
+            if std::env::var_os("AOMAC_COMBAT_LOG").is_some() { eprintln!("buff visual event owner={who} own={} nano={nano} event={event:?} mask={} renderer={}",self.own,self.nano_effect_categories,self.effects.is_some()); }
             if let Some(old) = self.buff_visuals.remove(&(who, nano)) {
                 if let (Some(renderer), Some(handle)) = (&mut self.effects, old.handle) {
                     renderer.terminate_gracefully(handle);
@@ -74,11 +75,13 @@ impl Dynels {
             if visual.handle.is_some() { continue; }
             if self.nano_effect_categories & 4 == 0 && renderer.effect_kind(visual.effect) != Some(1020) {
                 visual.handle = Some(0);
+                if std::env::var_os("AOMAC_COMBAT_LOG").is_some() { eprintln!("buff visual suppressed owner={who} own={} effect={} mask={}",self.own,visual.effect,self.nano_effect_categories); }
                 continue;
             }
             let Some(attractor) = renderer.attractor(visual.effect, 0) else {
                 // Retail template lookup failure creates no handle, not replacement art.
                 visual.handle = Some(0);
+                if std::env::var_os("AOMAC_COMBAT_LOG").is_some() { eprintln!("buff visual missing template owner={who} own={} effect={}",self.own,visual.effect); }
                 continue;
             };
             let mut anchor = |id| {
