@@ -203,6 +203,77 @@ mod tests {
 
 
     #[test]
+    #[ignore = "requires installed retail gfxtweak"]
+    fn retail_environment_particle_without_dynel_receives_zone_clock()->Result<()> {
+        use super::super::{Binding,Creation,Renderer};
+        let mut renderer=Renderer::open(&ao_gui::client_dir())?;
+        let handle=renderer.spawn_configured(
+            Binding {group:0,attractor:0,effect:72291,note:0,color:0},
+            Mat4::IDENTITY,Vec3::ZERO,
+            EffectConfig {creation:Creation::Vector,..Default::default()})?;
+        let mut host=ao_render::Host::headless();
+        let t=&renderer.templates.by_id[&72291];
+        assert_ne!(word(t,0)&0x400000,0,"retail resource must use VisualEnvFX");
+        // GC1010af47 emits after its authored interval and only renders that
+        // birth on the following process; the authored colour curve can start
+        // transparent too. Include a full lifetime, not just two startup ticks.
+        let steps=((float(t,25).max(float(t,26))+float(t,12).max(0.0)+0.03)*100.0).ceil() as usize;
+        host.effect_day_time=Some(3240.0);
+        let mut noon_alpha=0.0f32;
+        for _ in 0..=steps {
+            host.actors.clear();
+            renderer.frame(0.01,&mut host,None);
+            let active=renderer.active.iter().find(|a|a.actor==handle)
+                .context("standalone environment particle was removed")?;
+            assert!(active.config.source_identity.is_none());
+            assert_eq!(active.particle2.as_ref().unwrap().environment_time,Some(3240.0));
+            noon_alpha=host.actors.iter().filter_map(|a|a.skin.as_ref()).flatten()
+                .map(|v|v.color[3]).fold(0.0,f32::max);
+            if noon_alpha>4.0/255.0 {break;}
+        }
+        assert!(noon_alpha>4.0/255.0,"authored resource never reached visible noon alpha");
+        // Keep particle age fixed: only the native zone clock changes.
+        host.effect_day_time=Some(0.0);
+        host.actors.clear();
+        renderer.frame(0.0,&mut host,None);
+        let active=renderer.active.iter().find(|a|a.actor==handle)
+            .context("standalone environment particle was removed at midnight")?;
+        assert!(active.config.source_identity.is_none());
+        assert_eq!(active.particle2.as_ref().unwrap().environment_time,Some(0.0));
+        let midnight_alpha=host.actors.iter().filter_map(|a|a.skin.as_ref()).flatten()
+            .map(|v|v.color[3]).fold(0.0,f32::max);
+        assert!(midnight_alpha>0.0 && midnight_alpha<noon_alpha,
+            "native midnight fade must dim the same visible particles: noon={noon_alpha}, midnight={midnight_alpha}");
+        Ok(())
+    }
+
+    // The inspection camera can recede hundreds of metres for authored fog
+    // particles. A default empty world's fog ends at 300m and clips at 330m;
+    // those unrelated defaults must not hide the resource being inspected.
+    fn particle_inspection_scene(eye:Vec3,min:Vec3,max:Vec3)->ao_scene::Scene {
+        let far=(eye.distance((min+max)*0.5)+(max-min).length()).max(1.0);
+        ao_scene::Scene {
+            lens:Some(ao_scene::Lens {far:Some(far),..Default::default()}),
+            environment:Some(ao_scene::Environment {
+                sky_color:[0.0;3],fog_color:[0.0;3],fog_start:far,fog_end:far*2.0,
+                ambient:[0.0;3],sun_color:[0.0;3],sun_dir:[0.0,1.0,0.0],sun_specular:0.0,
+            }),..Default::default()
+        }
+    }
+    #[test]
+    fn large_particle_inspection_bounds_are_unfogged_and_unclipped() {
+        let min=Vec3::splat(-75.0);let max=Vec3::splat(75.0);
+        let eye=Vec3::new(2.0,2.0,5.0).normalize()*(max-min).length()*1.5;
+        let scene=particle_inspection_scene(eye,min,max);
+        let far=scene.lens.unwrap().far.unwrap();
+        assert!(eye.length()>330.0);
+        for x in [min.x,max.x] {for y in [min.y,max.y] {for z in [min.z,max.z] {
+            let distance=eye.distance(Vec3::new(x,y,z));
+            assert!(distance<far && distance<scene.environment.unwrap().fog_start);
+        }}}
+    }
+
+    #[test]
     #[ignore = "requires installed retail gfxtweak and offscreen GPU rendering"]
     fn retail_particle_dependency_frames()->Result<()> {
         use super::super::{Binding, Renderer, MODEL_BASE};
@@ -232,6 +303,7 @@ mod tests {
         std::fs::create_dir_all(&out)?;
         let mut renderer = Renderer::open(&ao_gui::client_dir())?;
         let mut host = ao_render::Host::headless();
+        host.effect_day_time=Some(ao_formats::playfield::DEFAULT_DAY_TIME);
         for &id in &ids {
             renderer.clear();
             host.camera = ao_render::Camera::look_at(Vec3::new(2.0,2.0,5.0), Vec3::ZERO);
@@ -264,20 +336,34 @@ mod tests {
                 let models: Vec<_> = renderer.models.iter()
                     .map(|(&id,m)| (MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
                 let time = (step-1) as f32*0.01;
-                let path = out.join(format!("particle3028_3024_{id}_{step}.png"));
-                let background = out.join(format!("particle_background_{id}_{step}.png"));
-                ao_render::render_to_png_actors(&ao_scene::Scene::default(), &models,
+                let checkpoint=[1,2,3,6,11,21,51,81].contains(&step) || step==steps;
+                // Probe every eligible birth frame, but overwrite one scratch pair
+                // rather than retaining thousands of identical zero-pixel images.
+                let path = out.join(if checkpoint {format!("particle3028_3024_{id}_{step}.png")}else{format!("particle_probe_{id}.png")});
+                let background = out.join(format!("particle_background_{id}.png"));
+                let scene=particle_inspection_scene(eye,min,max);
+                ao_render::render_to_png_actors(&scene, &models,
                     host.actors.clone(), eye.to_array(), center.to_array(), 640,480, &path,time)?;
-                ao_render::render_to_png_actors(&ao_scene::Scene::default(), &[], Vec::new(),
+                ao_render::render_to_png_actors(&scene, &[], Vec::new(),
                     eye.to_array(), center.to_array(), 640,480, &background,time)?;
                 let frame = image::open(&path)?.to_rgba8();
                 let blank = image::open(&background)?.to_rgba8();
                 let pixels = frame.pixels().zip(blank.pixels()).filter(|(a,b)| a!=b).count();
-                eprintln!("particle {id} frame {step} at {time:.2}s: {pixels} visible resource pixels, {}", path.display());
+                if pixels>0 && !checkpoint {
+                    let retained=out.join(format!("particle3028_3024_{id}_{step}.png"));
+                    std::fs::rename(&path,&retained)?;
+                    eprintln!("particle {id} frame {step} at {time:.2}s: {pixels} visible resource pixels, {}", retained.display());
+                }else if checkpoint {
+                    eprintln!("particle {id} frame {step} at {time:.2}s: {pixels} visible resource pixels, {}", path.display());
+                }
                 // Native atlas frame zero can be black under additive blending;
                 // 71341's retail alpha knots also stay zero until phase .15.
                 // Require actual GPU visibility over the authored timeline, not at birth.
                 rendered |= pixels > 0;
+            }
+            for name in [format!("particle_probe_{id}.png"),format!("particle_background_{id}.png")] {
+                let path=out.join(name);
+                if path.exists() {std::fs::remove_file(path)?;}
             }
             ensure!(rendered, "retail particle {id} produced no GPU frame");
         }

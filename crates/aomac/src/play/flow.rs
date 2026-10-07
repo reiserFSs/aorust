@@ -5,7 +5,7 @@ use ao_formats::screens::{ao_to_render, set_login_stage, LOGIN_CAMERA};
 use ao_net::msg::CharacterInfo;
 
 // GC100b0125..100b01b3: native environment channels, not weather wind.
-fn environment_channels(phase: &mut f32, dt: f32) -> [f32; 3] {
+pub(super) fn environment_channels(phase: &mut f32, dt: f32) -> [f32; 3] {
     *phase = ((*phase as f64 + dt as f64 * 50.0) as f32 as f64 % 360.0) as f32;
     let channel = |offset: f64| {
         let angle = ((*phase as f64 + offset) * 3.140_000_104_904_175 / 180.0) as f32;

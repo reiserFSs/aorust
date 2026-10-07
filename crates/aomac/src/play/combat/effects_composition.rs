@@ -335,6 +335,32 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn retail_meta_missing_child_keeps_parent_and_other_children() -> Result<()> {
+        use super::super::Creation;
+        let dir=ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("Setupf/gfxtweak.bin").exists() {return Ok(());}
+        let mut renderer=Renderer::open(&dir)?;
+        assert_eq!(meta_ids(&renderer.templates.by_id[&71016]),[0,71350,71025,71029,71102,0,71028,71045,0,0]);
+        assert!(!renderer.templates.by_id.contains_key(&71025));
+        let identity=(50000,1);
+        for creation in [Creation::Unlocated,Creation::Vector,Creation::Matrix,Creation::RConnector,Creation::Dynel,Creation::HitLocation,Creation::Tracer,
+            Creation::VectorVector,Creation::VectorMatrix,Creation::VectorConnector,Creation::VectorDynel,
+            Creation::DynelVector,Creation::DynelMatrix,Creation::DynelConnector,Creation::DynelDynel] {
+            renderer.clear();
+            renderer.prepare_anchors(identity,|_,_|Some(Mat4::IDENTITY));
+            let config=EffectConfig {creation,source_identity:Some(identity),resource_connector:Some(Mat4::IDENTITY),..Default::default()};
+            let missing=renderer.spawn_configured(Binding {group:0,attractor:0,effect:71025,note:0,color:0},Mat4::IDENTITY,Vec3::ZERO,config)?;
+            assert_eq!(missing,0,"native missing template returns null for {creation:?}");
+        }
+        let handle=renderer.spawn_configured(Binding {group:0,attractor:0,effect:71016,note:0,color:0},Mat4::IDENTITY,Vec3::ZERO,EffectConfig {creation:Creation::Vector,..Default::default()})?;
+        let composition=renderer.active.iter().find(|a|a.actor==handle).unwrap().composition.as_ref().unwrap();
+        assert_eq!(composition.children[2],0);
+        assert!(composition.children.iter().any(|&child|child!=0),"missing71025 must not cancel the other authored children");
+        renderer.delete(handle);
+        assert!(!renderer.is_active(handle));
+        Ok(())
+    }
     fn template(kind:i32,n:usize)->Template {Template {kind,words:vec![0;n]}}
     #[test]
     fn authored_ids_and_orbit_axes_are_not_substituted() {

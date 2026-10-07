@@ -53,6 +53,9 @@ impl ShockWave {
                         v.push(Vertex {pos:p.to_array(),normal:[0.0,1.0,0.0],uv,color:color(t.word(14+end).unwrap_or(0),t.word(18+end).unwrap_or(0),phase)});
                     }
                 }
+            } else {
+                // DS10016e84 skips inactive rings; keep the combined actor skin fixed-size.
+                v.resize((t.word(10).unwrap_or(0) as usize+1)*2,Vertex {pos:[0.0;3],normal:[0.0,1.0,0.0],uv:[0.0;2],color:[0.0;4]});
             }
             out.push(v);
         }
@@ -72,6 +75,9 @@ impl ShockWave {
                         v.push(Vertex {pos:p.to_array(),normal:[0.0,1.0,0.0],uv,color:c});
                     }
                 }
+            } else {
+                // DS1000bd0a skips expired cones without hiding the remaining rings.
+                v.resize((t.word(26).unwrap_or(0) as usize+1)*2,Vertex {pos:[0.0;3],normal:[0.0,1.0,0.0],uv:[0.0;2],color:[0.0;4]});
             }
             out.push(v);
         }
@@ -170,7 +176,22 @@ mod tests {
         assert_eq!(v[0].len(),82);assert_eq!(v[6].len(),22);
         // GC100ede77 word22 -> +0x5c; GC100edfd0 adds packed 0x3e570a3d (0.21), not 0.2.
         assert!((v[0][0].pos[1]-7.21).abs()<1e-6);
-        assert!(v[1].is_empty());s.terminate_gracefully();assert!(!s.frame(0.0).unwrap());
+        assert_eq!(v[1].len(),82);assert!(v[1].iter().all(|v|v.color==[0.0;4]));
+        let models=s.models();
+        // Birth, delayed rings, all-active window, expired cones, and final ring fade.
+        for elapsed in [0.0,0.2,1.0,2.2,2.5,4.0,5.5,6.0] {
+            s.elapsed=elapsed;
+            let groups=s.vertices(&mut ground).unwrap().unwrap();
+            assert_eq!(groups.len(),models.len());
+            for (group,model) in groups.iter().zip(&models) {assert_eq!(group.len(),model.2,"elapsed {elapsed}");}
+            assert_eq!(groups.iter().map(Vec::len).sum::<usize>(),models.iter().map(|m|m.2).sum::<usize>());
+            for (ring,group) in groups[..6].iter().enumerate() {
+                let phase=(elapsed-s.t.float(23).unwrap()*ring as f32)/s.t.float(8).unwrap();
+                if phase<=0.0 || phase>1.0 {assert!(group.iter().all(|v|v.color==[0.0;4]));}
+            }
+            if elapsed>=s.t.float(23).unwrap()*6.0 {assert!(groups[6..].iter().flatten().all(|v|v.color==[0.0;4]));}
+        }
+        s.terminate_gracefully();assert!(!s.frame(0.0).unwrap());
     }
     #[test]
     fn authored_31101_localized_attractor_deformation() {
@@ -215,6 +236,10 @@ mod tests {
         let origin=Vec3::new(5000.0,10.0,5000.0);let source=Mat4::from_translation(origin);
         let eye=origin+Vec3::new(15.0,12.0,20.0);
         let mut host=ao_render::Host::headless();host.camera=ao_render::Camera::look_at(eye,origin);
+        let raw=r.store.get(1_000_001,566)?.context("missing installed playfield566 resource")?;
+        let resource=ao_formats::playfield::parse_resource(&raw)?;
+        host.effect_playfield=Some((resource.tilemap,resource.flags));
+        let mut environment_phase=0.0;
         let ids:Vec<_>=r.templates.by_id.iter().filter_map(|(&id,t)|matches!(t.kind,3000|3001).then_some(id)).collect();
         ensure!(ids.len()==16,"authored native3000/3001 census changed");
         for id in ids {
@@ -234,6 +259,8 @@ mod tests {
                 r.prepare_anchors((50000,1),|_,anchor|visual.rig.effect_anchor_composed(anchor,std::iter::empty()).map(|m|source*Mat4::from_cols_array_2d(&m)));
                 host.actors.push(actor);
                 let mut ground=|p:Vec3|Some((Vec3::new(p.x,10.0,p.z),Vec3::Y));
+                host.effect_environment_center=Some(host.camera.pos.to_array());
+                host.effect_environment_wind=Some(crate::play::flow::environment_channels(&mut environment_phase,1.0/60.0));
                 r.frame(1.0/60.0,&mut host,Some(&mut ground));
                 if [1,6,15,30,60,120,210,240].contains(&frame) {
                     let mut models:Vec<_>=r.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();

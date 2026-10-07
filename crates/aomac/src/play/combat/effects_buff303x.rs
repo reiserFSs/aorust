@@ -269,6 +269,36 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore="installed authored missing mech resources"]
+    fn retail_shield_missing_mech_keeps_control_without_cat_fallback()->Result<()> {
+        let mut r=Renderer::open(&ao_gui::client_dir())?;
+        let id=r.names.id(ao_formats::mesh::MESH_TYPE,"EP03_scout_mech_upgraded_simple.abiff").unwrap();
+        assert_eq!(id,266808);
+        assert!(r.store.get(ao_formats::mesh::MESH_TYPE,id)?.is_none());
+        let mut host=ao_render::Host::headless();
+        for (effect,duration) in [(71332,16.0),(71333,1.0)] {
+            let template=&r.templates.by_id[&effect];
+            assert_eq!(template.kind,3034);
+            assert_eq!(template.word(20)?,6);
+            assert_eq!(template.float(8)?,duration);
+            let shield=ShieldEffect::new(template,EffectConfig::default())?;
+            assert_eq!(shield.mech_resource(),Some("EP03_scout_mech_upgraded_simple.abiff"));
+            let handle=r.spawn_configured(Binding {effect,group:0,attractor:0,note:0,color:0},Mat4::IDENTITY,Vec3::ZERO,EffectConfig {creation:super::super::Creation::Dynel,..Default::default()})?;
+            assert!(r.is_active(handle),"missing mesh must not reject its allocated control");
+            r.frame(1.0/60.0,&mut host,None);
+            assert!(r.is_active(handle));
+            assert!(!host.actors.iter().any(|actor|actor.id==handle),"missing authored mech must not substitute CAT geometry");
+            r.terminate_gracefully(handle);
+            // 71333 starts its automatic drain on the first frame (lifetime1);
+            // 71332 starts here. Graceful termination preserves an existing stop.
+            r.frame(2.0,&mut host,None);
+            assert!(r.is_active(handle),"native Shield2 drains through exactly two seconds");
+            r.frame(0.01,&mut host,None);
+            assert!(!r.is_active(handle),"missing mesh must retain native control teardown");
+        }
+        Ok(())
+    }
+    #[test]
     #[ignore="installed authored assets and offscreen GPU regression"]
     fn retail_surface_authored_modes_frames()->Result<()> {
         use anyhow::Context;
@@ -300,39 +330,65 @@ mod tests {
             assert!(vertices[0].iter().all(|v|(v.color[3]-alpha).abs()<1e-6),"Shield {id} authored sin-squared alpha cap");
         }
         let origin=Vec3::new(5000.0,10.0,5000.0);let eye=origin+Vec3::new(4.0,3.0,8.0);
+        // Directional Stars, tracers and FallSteam consume actual endpoints.
+        // A coincident target is a native zero-input gate, not visual evidence.
+        let target=origin+Vec3::new(3.0,1.0,-2.0);
         let identity=(50000,1);
         // Material isolation for Meta25002/Highlight11502, not retail lighting.
         let highlight_world=ao_scene::Scene {environment:Some(ao_scene::Environment {sky_color:[0.0;3],fog_color:[0.0;3],fog_start:100.0,fog_end:200.0,ambient:[0.0;3],sun_color:[0.0;3],sun_dir:[0.0,1.0,0.0],sun_specular:0.0}),..Default::default()};
-        let ids:Vec<_>=r.templates.by_id.iter().filter_map(|(&id,t)|matches!(t.kind,2004|2007|3003|3006|3007|3029|3032|3034|3036|3038|3039).then_some(id)).collect();
+        let ids:Vec<_>=r.templates.by_id.iter().filter_map(|(&id,t)|matches!(t.kind,2004|2007|3003|3006|3007|3029|3032|3034|3035|3036|3038|3039).then_some(id)).collect();
         ensure!(!ids.is_empty(),"missing authored surface effects");
         assert_eq!(ids.iter().filter(|id|r.templates.by_id[*id].kind==3036).count(),5,"installed Toggle frame coverage");
+        let playfields=r.store.ids(1_000_001)?.into_iter().map(|id| {
+            let raw=r.store.get(1_000_001,id)?.context("missing installed playfield resource")?;
+            ao_formats::playfield::parse_resource(&raw)
+        }).collect::<Result<Vec<_>>>()?;
+        let mut environment_phase=0.0;
         let mut host=ao_render::Host::headless();host.camera=ao_render::Camera::look_at(eye,origin+Vec3::Y);
-        for id in ids {
+        let cases=ids.into_iter().flat_map(|id| {
+            let mut cases=vec![(id,super::super::Creation::Dynel)];
+            if matches!(id,2630..=2632|25001) {cases.push((id,super::super::Creation::HitLocation));}
+            cases
+        });
+        for (id,creation) in cases {
             r.clear();
             let t=&r.templates.by_id[&id];
             let toggle=t.kind==3036;
-            host.effect_playfield=if toggle {
-                // Exercise the authored include/exclude and mask gates without
-                // changing the installed Toggle or its child template.
-                let listed=&t.words[5..5+t.word(4)? as usize];
-                let playfield=if t.words.first().copied().unwrap_or(0) & 0x800!=0 {
-                    (0..=listed.len() as u32).find(|id|!listed.contains(id)).context("Toggle excludes every playfield")?
-                } else {
-                    *listed.first().context("Toggle has no permitted playfield")?
-                };
-                Some((playfield,t.word(3)?))
-            } else {None};
+            let resource=playfields.iter().find(|resource| {
+                if !toggle {return true;}
+                let listed=t.words.get(5..).unwrap_or(&[]).iter().take(t.word(4).unwrap_or(0) as usize).any(|&id|id==resource.tilemap);
+                (t.word(3).unwrap_or(0)==0 || resource.flags&t.word(3).unwrap_or(0)!=0)
+                    && (listed != (t.word(0).unwrap_or(0)&0x800!=0))
+            }).context("no installed playfield resource permits authored effect")?;
+            host.effect_playfield=Some((resource.tilemap,resource.flags));
+            eprintln!("surface {id} native resource: rdb1000001:{} tilemap={} flags={:#x}",resource.id,resource.tilemap,resource.flags);
             r.prepare_anchors(identity,|_,id|rig.effect_anchor(id,None).map(|m|Mat4::from_translation(origin)*Mat4::from_cols_array_2d(&m)));
-            r.set_source_runtime(identity,1.0,1,None,0,true);
-            let handle=r.spawn_configured(Binding {group:0,attractor:0,effect:id,note:0,color:0},Mat4::from_translation(origin),origin,EffectConfig {source_identity:Some(identity),creation:super::super::Creation::Dynel,..Default::default()})?;
+            r.set_source_runtime(identity,1.0,1,Some(1.0),1,true);
+            let handle=r.spawn_configured(Binding {group:0,attractor:0,effect:id,note:0,color:0},Mat4::from_translation(origin),target,EffectConfig {source_identity:Some(identity),creation,hit_location:Some((origin,target)),..Default::default()})?;
+            let mut emitted_geometry=false;
             for frame in 1..=60 {
                 let (skin,parts)=rig.pose(None);
                 let actor=ao_scene::ActorFrame {id:1,model:1,transform:Mat4::from_translation(origin).to_cols_array_2d(),skin:Some(skin),parts,part_attractors:rig.part_attractors(),..Default::default()};
                 r.prepare_source_mesh(identity,rig.model(),&actor);host.actors.clear();host.actors.push(actor);
                 r.prepare_anchors(identity,|_,id|rig.effect_anchor(id,None).map(|m|Mat4::from_translation(origin)*Mat4::from_cols_array_2d(&m)));
-                r.set_source_runtime(identity,if toggle && frame>30 {0.0}else{1.0},1,None,0,true);
+                // GC1011202f samples Vehicle+cc and GetDir, not body scale.
+                r.set_source_runtime(identity,1.0,1,Some(if toggle && frame>30 {0.0}else{1.0}),1,true);
                 let mut terrain=|p:Vec3|Some((Vec3::new(p.x,10.0,p.z),Vec3::Y));
+                host.effect_environment_center=Some(host.camera.pos.to_array());
+                host.effect_environment_wind=Some(crate::play::flow::environment_channels(&mut environment_phase,1.0/60.0));
                 r.frame(1.0/60.0,&mut host,Some(&mut terrain));
+                for actor in host.actors.iter().filter(|actor|actor.id!=1) {
+                    if let Some(vertices)=&actor.skin {
+                        emitted_geometry|=!vertices.is_empty() && vertices.iter().any(|v|v.color[3]>0.0);
+                        assert!(vertices.iter().all(|v|v.pos.iter().chain(v.color.iter()).all(|x|x.is_finite())),"surface {id} {creation:?} frame {frame} nonfinite geometry");
+                    }
+                }
+                if frame==1 && ((toggle && (r.templates.by_id[&id].float(1)?<0.0 || r.templates.by_id[&id].float(1)?>=1.0/60.0)) || r.templates.by_id[&id].kind==3035) {
+                    assert!(r.is_active(handle),"authored control {id} silently died with installed native inputs");
+                    if r.templates.by_id[&id].kind==3035 {
+                        assert!(host.actors.iter().any(|actor|actor.id==handle),"AParticle {id} lost its native-camera geometry");
+                    }
+                }
                 if frame==1 && [96111,72274,72275,72276].contains(&id) {
                     let template=&r.templates.by_id[&id];
                     let effect=ShieldEffect::new(template,EffectConfig::default())?;
@@ -357,8 +413,12 @@ mod tests {
                     models.extend(r.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())));
                     models.extend(r.buff_models.iter().map(|(&id,m)|(0xfac2_0000_0000_0000|u64::from(id),m.scene.clone())));
                     let world=if id==25002 {&highlight_world}else{&ao_scene::Scene::default()};
-                    ao_render::render_to_png_actors(world,&models,host.actors.clone(),eye.to_array(),(origin+Vec3::Y).to_array(),640,480,&out.join(format!("surface_{id}_{frame}.png")),frame as f32/60.0)?;
+                    let suffix=if creation==super::super::Creation::Dynel {""}else{"_hitlocation"};
+                    ao_render::render_to_png_actors(world,&models,host.actors.clone(),eye.to_array(),(origin+Vec3::Y).to_array(),640,480,&out.join(format!("surface_{id}{suffix}_{frame}.png")),frame as f32/60.0)?;
                 }
+            }
+            if matches!(id,17921|17922|12600|36000) || (matches!(id,2630..=2632|25001) && creation==super::super::Creation::HitLocation) {
+                assert!(emitted_geometry,"surface {id} {creation:?} distinct native endpoints emitted no visible geometry");
             }
             r.delete(handle);assert!(!r.is_active(handle));
         }

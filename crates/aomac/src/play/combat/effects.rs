@@ -656,7 +656,9 @@ impl Renderer {
 
     fn spawn_inner(&mut self, binding: Binding, source: Mat4, target: Vec3, config: EffectConfig) -> Result<u32> {
         if binding.effect == 49999 { return Ok(0); }
-        let template = self.templates.by_id.get(&binding.effect).with_context(|| format!("missing effect {}", binding.effect))?;
+        // GC100ce4f7/100d0102 return null when CMS lookup10106b12 finds no template.
+        // A missing child is a zero handle, not failure of its owning composition.
+        let Some(template) = self.templates.by_id.get(&binding.effect) else { return Ok(0); };
         if !config.creation.constructs(template.kind) { return Ok(0); }
         if self.source_factory_rejects(template,config) {return Ok(0);}
         // These native dynel constructors do not initialize a visual after
@@ -787,8 +789,14 @@ impl Renderer {
             buff.prepare_morph(&self.store)?;
             if let Some(name)=buff.mech_resource() {
                 let id=self.names.id(ao_formats::mesh::MESH_TYPE,name).with_context(||format!("missing Shield2 mech {name}"))?;
-                let scene=ao_formats::mesh::load_mesh(&self.store,id)?;
-                buff.prepare_mech(&scene)?;
+                // GC10111326 starts VisualMesh's async load; DS1007174c/100713fe
+                // leave a missing record without a mesh callback, not a CAT fallback.
+                // Keep the allocated control's native lifetime and propagate decode errors.
+                let mut scene=Scene::default();
+                if let Some(mesh)=ao_formats::mesh::decode_mesh_into(&self.store,id,&mut scene)? {
+                    scene.instances.push(ao_scene::Instance {mesh,transform:IDENTITY});
+                    buff.prepare_mech(&scene)?;
+                }
             }
         }
         if let (Some(buff),Some(identity))=(&mut buff,config.source_identity) {
@@ -1209,8 +1217,9 @@ impl Renderer {
                 let Ok(Some(groups))=p.vertices(effect.elapsed,camera,right,up,&mut self.random,&mut self.display_random,&mut self.rng) else {return false;};
                 for group in groups {skin.extend(group);}
             } else if let Some(p)=&mut effect.particle2 {
+                // GC1010af47 reads VisualEnvFX independently of the source dynel.
+                p.set_native_inputs(runtime.map_or(1.0,|r|r.body_scale),host.effect_day_time);
                 if let Some(runtime)=runtime {
-                    p.set_native_inputs(runtime.body_scale,host.effect_day_time);
                     p.set_visible(runtime.visible,effect.elapsed);
                     if !runtime.visible {return true;}
                 }

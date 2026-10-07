@@ -18,8 +18,10 @@ pub(super) struct StarsParameters {
     pub offset: f32,
     pub size: f32,
     pub radius: f32,
-    pub lifetime_ms: u32,
-    pub count: u32,
+    // GC100f7a63 converts signed word30 at +0x16dc to seconds at +0x16cc.
+    pub lifetime_ms: i32,
+    // GC100f6d54 stores word31 at +0x16e0; Process uses signed FILD/FIMUL.
+    pub count: i32,
 }
 impl StarsParameters {
     pub(super) fn decode(t: &Template) -> Result<Self> {
@@ -33,7 +35,7 @@ impl StarsParameters {
             shape: std::array::from_fn(|i| float(11 + i)),
             colors: std::array::from_fn(|k| std::array::from_fn(|i| float(18 + k * 4 + i))),
             duration: float(26), offset: float(27), size: float(28), radius: float(29),
-            lifetime_ms: word(30), count: word(31),
+            lifetime_ms: word(30) as i32, count: word(31) as i32,
         };
         ensure!(p.shape.iter().chain(p.colors.iter().flatten()).chain([&p.duration, &p.offset, &p.size, &p.radius]).all(|v| v.is_finite()), "non-finite native Stars parameter");
         Ok(p)
@@ -232,7 +234,9 @@ impl StarsEffect {
         if m==25 {ensure!(self.ground.is_some(),"Stars mode25 requires native ground height");}
         if matches!(m,21|22) {ensure!(self.chain.iter().all(Option::is_some),"Stars connector chain is unavailable");}
         if m==13 {for _ in 0..7 {self.walk(r);self.head=(self.head+1)%128;self.a[self.head]=self.direction;}}
-        let mut budget=match m {1|3..=6|9|11|12|21=>2u32,10=>5,15|18|26|28=>10,16|17|19|20|27=>15,14|22|25=>n,_=>0};
+        // Native count budgets test != 0, not > 0: negative values emit
+        // every available slot. Widen before decrementing to avoid wrapping.
+        let mut budget=match m {1|3..=6|9|11|12|21=>2i64,10=>5,15|18|26|28=>10,16|17|19|20|27=>15,14|22|25=>i64::from(n),_=>0};
         let mut occupied=0u32;
         for i in 0..128 {
             if matches!(m,9|25)&&i%2!=0 {continue;}
@@ -257,7 +261,8 @@ impl StarsEffect {
             if self.expiry[i]+delay<=t {
                 self.stars[i].active=false;
                 if self.stop || (m==12&&i%4!=0) {continue;}
-                if m==23 {if occupied>=(q*n as f32) as u32 {continue;}}else if budget==0 {continue;}
+                // GC100fb1b3 FIMUL signed count; 100fb2c8 uses signed JGE.
+                if m==23 {if occupied as i32>=(q as f64*n as f64) as i32 {continue;}}else if budget==0 {continue;}
                 let mut expiration=t+life;
                 match m {
                     1|21=>{self.b[i]=Vec3::ZERO;self.c[i]=o+sprites::sphere_point(r);self.a[i]=Vec3::splat(2.);},
@@ -286,7 +291,7 @@ impl StarsEffect {
                     _=>unreachable!(),
                 }
                 if matches!(m,16..=20|22|26..=28) {self.b[i]=Vec3::ZERO;}
-                self.expiry[i]=expiration;budget=budget.saturating_sub(1);occupied+=1;continue;
+                self.expiry[i]=expiration;budget-=1;occupied+=1;continue;
             }
             let u=(t+life-self.expiry[i])/life;let mut width=s;let mut height=s;let mut frame=0;let mut color=self.color(u);let mut position=self.c[i];
             match m {
@@ -325,6 +330,85 @@ impl StarsEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn authored_43097_signed_force_keeps_particles_visible()->Result<()> {
+        let t=Template{kind:2004,words:vec![5,0,0,0,0,0,0,1000,3212836864,33,11,0,1056964608,1082130432,1077936128,1065353216,1077936128,1077936128,1065353216,1065353216,1045220557,1045220557,1061997773,1065185444,1057635697,0,1086324736,0,1072902963,1066192077,1200,4294967295]};
+        assert_eq!(StarsParameters::decode(&t)?.count,-1);
+        let mut gc=R250::new(1);let mut ds=R250::new(2);let mut crt=CrtRand::new(3);
+        let mut fx=StarsEffect::new(&t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt)?;
+        fx.process(0.,&mut crt)?;
+        let position=fx.c[0];let velocity=fx.b[0];
+        fx.process(0.1,&mut crt)?;
+        let expected_velocity=velocity+(-position)*-0.01;
+        assert!((fx.b[0]-expected_velocity).length()<1e-6);
+        assert!((fx.c[0]-(position+expected_velocity*0.1)).length()<1e-6);
+        for tick in 2..60 {
+            let vertices=fx.vertices(tick as f32*0.1,Vec3::ZERO,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt)?.expect("authored six-second duration");
+            assert!(vertices[0].iter().all(|v|v.pos.iter().chain(v.color.iter()).all(|v|v.is_finite())));
+            assert!(fx.stars.iter().any(|p|p.active&&p.width>0.));
+            assert!(fx.stars.iter().filter(|p|p.active).all(|p|p.position.length()<4.));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn negative_native_budgets_emit_without_unsigned_wrap()->Result<()> {
+        for mode in [14,22,25] {
+            for count in [-1,i32::MIN] {
+                let mut words=vec![0;32];
+                words[9]=33;words[10]=mode;words[26]=6f32.to_bits();words[28]=1f32.to_bits();
+                words[29]=1f32.to_bits();words[30]=1200;words[31]=count as u32;
+                let t=Template{kind:2004,words};
+                let mut gc=R250::new(1);let mut ds=R250::new(2);let mut crt=CrtRand::new(3);
+                let mut fx=StarsEffect::new(&t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt)?;
+                for bone in BONES {fx.set_attractor(bone,Vec3::Y);}
+                fx.set_ground_height(0.);
+                fx.process(0.,&mut crt)?;
+                assert_eq!(fx.expiry.iter().filter(|v|**v>0.).count(),if mode==25 {64}else{128});
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_phase_lifetime_and_occupancy_keep_signed_words()->Result<()> {
+        for mode in [7,8,23] {
+            let mut words=vec![0;32];
+            words[9]=33;words[10]=mode;words[26]=1f32.to_bits();words[28]=1f32.to_bits();
+            words[30]=u32::MAX;words[31]=u32::MAX;
+            let t=Template{kind:2004,words};
+            let mut gc=R250::new(1);let mut ds=R250::new(2);let mut crt=CrtRand::new(3);
+            let mut fx=StarsEffect::new(&t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt)?;
+            fx.process(0.25,&mut crt)?;
+            if mode==23 {
+                assert!(fx.expiry.iter().all(|v|*v==0.));
+                assert!(fx.stars.iter().all(|p|!p.active));
+            } else {
+                assert!((fx.stars[0].width-0.75f32.sqrt()).abs()<1e-6);
+                assert!((fx.stars[0].position-fx.a[0]*(-0.01*0.75f32.sqrt())).length()<1e-6);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn negative_native_lifetime_expires_instead_of_becoming_unsigned()->Result<()> {
+        let mut words=vec![0;32];
+        words[9]=33;words[10]=16;words[26]=1f32.to_bits();words[28]=1f32.to_bits();
+        words[30]=(-1000i32) as u32;words[31]=6;
+        let t=Template{kind:2004,words};
+        assert_eq!(StarsParameters::decode(&t)?.lifetime_ms,-1000);
+        let mut gc=R250::new(1);let mut ds=R250::new(2);let mut crt=CrtRand::new(3);
+        let mut fx=StarsEffect::new(&t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt)?;
+        fx.process(0.,&mut crt)?;
+        assert_eq!(&fx.expiry[..15],&[-1.;15]);
+        fx.terminate_gracefully();
+        fx.process(0.1,&mut crt)?;
+        assert!(!fx.alive);
+        assert!(fx.stars.iter().all(|p|!p.active));
+        Ok(())
+    }
+
     #[test]
     fn authored_17100_parameters_and_all_native_modes() -> Result<()> {
         let mut t = Template { kind: 2004, words: vec![5,0,0,0,0,0,0,1000,3212836864,33,16,1053609165,1041865114,1082130432,1077936128,1065353216,1077936128,1077936128,1065353216,1065353216,1050253722,1050253722,1065353216,1065353216,1050253722,1050253722,1065353216,0,1045220557,1053609165,300,6] };

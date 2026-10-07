@@ -24,7 +24,7 @@ mod water;
 mod zone;
 
 pub use camera::{camera_views, CameraViews};
-pub use record::CameraAttractor;
+pub use record::{parse as parse_resource, CameraAttractor, Record};
 pub use ao_scene::FogVolume;
 pub use sky::{open_weather, sun_dir, SkyClock, DEFAULT_DAY_TIME};
 pub use spawn::{floor_below, scene_bounds, support_below};
