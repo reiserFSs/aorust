@@ -275,16 +275,29 @@ mod tests {
             assert_eq!(renderer.templates.by_id[&id].float(8).unwrap(),1.5);
         }
         let identity=(50000,1);
-        let mut controller=Controller::new(&template,Mat4::IDENTITY,Vec3::ZERO,EffectConfig {source_identity:Some(identity),source_appearance:Some([1,1,0,100]),..EffectConfig::default()}).unwrap();
+        let handle=renderer.spawn_configured(Binding {group:0,attractor:0,effect:1070,note:0,color:0},Mat4::IDENTITY,Vec3::ZERO,EffectConfig {source_identity:Some(identity),source_appearance:Some([1,1,0,100]),..EffectConfig::default()}).unwrap();
         renderer.elapsed=6.0;
-        assert!(controller.frame(0.0,&mut renderer).unwrap());
+        let mut host=ao_render::Host::headless();
+        renderer.frame(0.0,&mut host,None);
         let children:Vec<_>=renderer.active.iter().filter(|a|matches!(a.effect,20091|20096)).map(|a|a.actor).collect();
         assert_eq!(children.len(),2);
-        controller.cancel(&mut renderer);
+        renderer.terminate_gracefully(handle);
+        assert!(!renderer.is_active(handle),"buff removal must retire the periodic controller immediately");
         assert!(!renderer.bph_last.contains_key(&identity));
         assert!(children.iter().all(|handle|renderer.active.iter().any(|a|a.actor==*handle)));
-        controller.cancel(&mut renderer);
+        renderer.terminate_gracefully(handle);
         assert!(children.iter().all(|handle|renderer.active.iter().any(|a|a.actor==*handle)));
+        for _ in 0..120 {
+            host.actors.clear();
+            renderer.frame(1.0/60.0,&mut host,None);
+        }
+        assert!(renderer.active.is_empty(),"orbit expiry must delete the owned flare and cord, not leave a twenty-second flare");
+        assert!(host.actors.is_empty(),"expired pulse must no longer submit visual actors");
+        for _ in 0..360 {
+            host.actors.clear();
+            renderer.frame(1.0/60.0,&mut host,None);
+        }
+        assert!(renderer.active.is_empty(),"cancelled controller must not emit another five-second pulse");
     }
     #[test]
     fn cast_hands_and_target_refresh_independently() {
