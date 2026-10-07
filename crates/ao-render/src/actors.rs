@@ -8,6 +8,16 @@ use ao_scene::ActorFrame;
 /// Extra radius around the bind-pose sphere of mesh 0: limbs reach out of it in animation.
 const POSE_MARGIN: f32 = 1.0;
 
+/// Affine transform (including the existing alpha lane), then independently enabled material overrides.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct ActorInstance {
+    transform: [[f32; 4]; 4],
+    emissive: [f32; 4],
+    specular: [f32; 4],
+    power: [f32; 4],
+}
+
 struct ModelMesh {
     vb: wgpu::Buffer,
     ib: wgpu::Buffer,
@@ -173,7 +183,7 @@ impl Renderer {
     pub(crate) fn prepare_actors(&mut self, cam: Vec3, planes: &[Vec4; 6]) {
         let layer = &mut self.act;
         layer.items.clear();
-        let mut xf: Vec<[[f32; 4]; 4]> = vec![];
+        let mut xf: Vec<ActorInstance> = vec![];
         for f in &layer.frames {
             // `RVisual_t::Rasterize` (randy31 0x1004d84a) draws nothing at a transparency <= 1e-5 (`_DAT_10095a08`)
             if f.alpha <= 1e-5 {
@@ -195,7 +205,16 @@ impl Renderer {
                 // m0.w carries `alpha - 1` to the shader (the affine matrix' unused column element)
                 let mut a = m.to_cols_array_2d();
                 a[0][3] = f.alpha.min(1.0) - 1.0;
-                xf.push(a);
+                let color = |value: Option<[f32; 3]>| {
+                    let rgb = value.unwrap_or([0.0; 3]);
+                    [rgb[0], rgb[1], rgb[2], if value.is_some() { 1.0 } else { 0.0 }]
+                };
+                xf.push(ActorInstance {
+                    transform: a,
+                    emissive: color(f.emissive),
+                    specular: color(f.specular),
+                    power: [f.specular_power.unwrap_or(0.0), if f.specular_power.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0],
+                });
             }
         }
         if xf.len() > layer.cap || layer.bufs.is_empty() {
@@ -204,7 +223,7 @@ impl Renderer {
                 .map(|_| {
                     self.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("actor instances"),
-                        size: (layer.cap * 64) as u64,
+                        size: (layer.cap * std::mem::size_of::<ActorInstance>()) as u64,
                         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     })
@@ -236,12 +255,13 @@ impl Renderer {
                 }
                 if !bound {
                     pass.set_vertex_buffer(0, own.unwrap_or(&mesh.vb).slice(..));
-                    pass.set_vertex_buffer(1, buf.slice(i as u64 * 64..(i as u64 + 1) * 64));
+                    let stride = std::mem::size_of::<ActorInstance>() as u64;
+                    pass.set_vertex_buffer(1, buf.slice(i as u64 * stride..(i as u64 + 1) * stride));
                     pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
                     bound = true;
                 }
                 let pipe = if it.faded && d.pipe < SKY_PIPE && d.pipe / 2 < 2 { FADE_PIPE + d.pipe } else { d.pipe };
-                pass.set_pipeline(&self.pipes[pipe]);
+                pass.set_pipeline(&self.actor_pipes[pipe]);
                 pass.set_bind_group(1, &model.mats[d.mat], &[]);
                 pass.draw_indexed(d.first_index..d.first_index + d.count, 0, 0..1);
                 calls += 1;

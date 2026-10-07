@@ -475,7 +475,7 @@ impl Avatar {
     pub fn frame(&self) -> ActorFrame {
         let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
         let (skin, parts) = self.rig.pose(clip);
-        ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, skin: Some(skin), always: true, alpha: 1.0 }
+        ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, skin: Some(skin), always: true, alpha: 1.0, ..Default::default() }
     }
 
     /// Current effect anchor in world scene space, including heading and body scale.

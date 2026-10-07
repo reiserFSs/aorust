@@ -251,6 +251,29 @@ pub struct ActorFrame {
     /// alpha-tested submeshes blend with it (depth write kept), blended ones multiply it into their alpha; `<= 1e-5` draws nothing
     /// (`RVisual_t::Rasterize` 0x1004d84a skips the visual).
     pub alpha: f32,
+    /// Per-actor emissive override, linear RGB like [`Submesh::emissive`]; `None` keeps each submesh's material.
+    pub emissive: Option<[f32; 3]>,
+    /// Per-actor specular override, linear RGB like [`Submesh::specular`]; `None` keeps each submesh's material.
+    pub specular: Option<[f32; 3]>,
+    /// Per-actor material power override; `None` keeps [`Submesh::shininess`].
+    pub specular_power: Option<f32>,
+}
+
+impl Default for ActorFrame {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            model: 0,
+            transform: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            parts: Vec::new(),
+            skin: None,
+            always: false,
+            alpha: 1.0,
+            emissive: None,
+            specular: None,
+            specular_power: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]

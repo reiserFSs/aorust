@@ -109,7 +109,7 @@ impl TracerMesh {
         let rotation = source_rotation * Quat::from_xyzw(self.axis.x*sine, self.axis.y*sine, self.axis.z*sine, cosine);
         let transform = Mat4::from_scale_rotation_translation(Vec3::splat(self.scale*self.config_scale), rotation, position+self.offset);
         let alpha = if self.elapsed > 0.0 && self.duration > 0.0 { envelope(&self.envelope, self.elapsed/self.duration) } else { 1.0 };
-        vec![ActorFrame { id: actor_base, model: model_base | u64::from(self.scenes[0].0), transform: transform.to_cols_array_2d(), parts: Vec::new(), skin: None, always: false, alpha }]
+        vec![ActorFrame { id: actor_base, model: model_base | u64::from(self.scenes[0].0), transform: transform.to_cols_array_2d(), parts: Vec::new(), skin: None, always: false, alpha, ..Default::default() }]
     }
 }
 

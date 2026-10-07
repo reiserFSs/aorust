@@ -209,6 +209,7 @@ impl TagLayer {
                 skin: None,
                 always: false,
                 alpha: 1.0,
+                ..Default::default()
             });
         }
     }

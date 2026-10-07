@@ -70,8 +70,25 @@ fn vtx(v: VIn) -> VOut {
 fn vs(v: VIn) -> VOut {
     var o = vtx(v);
     let prelit = mat.emissive.w > 1.5;
-    let l = light_vertex(o.wpos, o.n);
+    let l = light_vertex(o.wpos, o.n, mat.emissive.rgb, mat.spec.rgb, mat.spec.w);
     // prelit surfaces: the vertex colour is the baked additive light in D3D space (see `shade`)
+    o.light = select(l.light, v.color.rgb, prelit);
+    o.dlight = l.dlight;
+    o.spec = l.spec;
+    o.tint = to_g(mat.color.rgb * select(v.color.rgb, vec3<f32>(1.0), prelit));
+    return o;
+}
+
+// Actor overrides share the submesh's linear storage domain. Independent enable lanes preserve `None`, including power 0.
+@vertex
+fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec4<f32>, @location(10) power: vec4<f32>) -> VOut {
+    var o = vtx(v);
+    let prelit = mat.emissive.w > 1.5;
+    let l = light_vertex(
+        o.wpos, o.n,
+        select(mat.emissive.rgb, emissive.rgb, emissive.w > 0.5),
+        select(mat.spec.rgb, specular.rgb, specular.w > 0.5),
+        select(mat.spec.w, power.x, power.y > 0.5));
     o.light = select(l.light, v.color.rgb, prelit);
     o.dlight = l.dlight;
     o.spec = l.spec;
@@ -161,10 +178,9 @@ fn vertex_lights(p: vec3<f32>, n: vec3<f32>, power: f32) -> array<vec3<f32>, 2> 
     return array<vec3<f32>, 2>(diff, spec);
 }
 
-fn light_vertex(p: vec3<f32>, n_in: vec3<f32>) -> Lit {
+fn light_vertex(p: vec3<f32>, n_in: vec3<f32>, emissive: vec3<f32>, specular: vec3<f32>, power: f32) -> Lit {
     let nl = length(n_in);
     let n = select(vec3<f32>(0.0, 1.0, 0.0), n_in / nl, nl > 1e-6);
-    let power = mat.spec.w;
     let dl = vertex_lights(p, n, power);
     // the sun: a directional light, diffuse = GroundLightCurrent, specular = SpecularLightIntensity * GroundLightCurrent
     let s = g.sun_dir.xyz;
@@ -175,8 +191,8 @@ fn light_vertex(p: vec3<f32>, n_in: vec3<f32>) -> Lit {
     }
     var o: Lit;
     o.dlight = dl[0];
-    o.light = min(to_g(mat.emissive.rgb) + g.ambient_g.rgb + g.sun_g.rgb * max(sn, 0.0) + dl[0], vec3<f32>(1.0));
-    o.spec = min(to_g(mat.spec.rgb) * (dl[1] + sun_spec), vec3<f32>(1.0));
+    o.light = min(to_g(emissive) + g.ambient_g.rgb + g.sun_g.rgb * max(sn, 0.0) + dl[0], vec3<f32>(1.0));
+    o.spec = min(to_g(specular) * (dl[1] + sun_spec), vec3<f32>(1.0));
     return o;
 }
 

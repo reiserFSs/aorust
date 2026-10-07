@@ -618,7 +618,7 @@ impl Renderer {
                 if !alive && template.kind == 1005 && template.words[0]&0x200 != 0 { return false; }
             }
             // Dynamic world-space skin has no useful bind-pose sphere (actors.rs:191).
-            host.actors.push(ActorFrame { id: effect.actor, model: MODEL_BASE | effect.effect as u32 as u64, transform: IDENTITY, parts: vec![], skin: Some(skin), always: true, alpha: 1.0 });
+            host.actors.push(ActorFrame { id: effect.actor, model: MODEL_BASE | effect.effect as u32 as u64, transform: IDENTITY, parts: vec![], skin: Some(skin), always: true, alpha: 1.0, ..Default::default() });
             true
         });
     }

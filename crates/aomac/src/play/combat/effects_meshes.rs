@@ -161,6 +161,7 @@ impl MeshEffect {
             id: actor_base + index as u32, model: model_base | self.scenes[rock.group].0 as u64,
             transform: Mat4::from_rotation_translation(Quat::from_axis_angle(rock.axis, rock.angle), rock.position).to_cols_array_2d(),
             parts: Vec::new(), skin: None, always: false, alpha: 1.0,
+            ..Default::default()
         }).collect()
     }
 }

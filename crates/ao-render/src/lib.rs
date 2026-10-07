@@ -400,6 +400,7 @@ pub struct Renderer {
     tex_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     pipes: Vec<wgpu::RenderPipeline>, // indexed by Draw::pipe
+    actor_pipes: Vec<wgpu::RenderPipeline>, // same indices, actor-only instance layout
     gpu: Gpu,
     sky: SkyGpu,
     /// Sky textures by key; kept across [`Renderer::set_sky`] so a live sky only ships new textures.
@@ -550,10 +551,11 @@ impl Renderer {
         });
         let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
         let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
+        let actor_attrs = [f4(0), f4(16), f4(32), f4(48), f4(64), f4(80), f4(96)];
         let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
         let one_one = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool, sprite: bool| {
+        let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool, sprite: bool, actor: bool| {
             let (fs, state, depth_write) = match blend {
                 _ if env => ("fs_env", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
                 _ if sprite => ("fs_sprite", Some(wgpu::BlendState::ALPHA_BLENDING), true),
@@ -579,11 +581,15 @@ impl Renderer {
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some(if sky { "vs_sky" } else if env { "vs_env" } else { "vs" }),
+                    entry_point: Some(if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
                     compilation_options: Default::default(),
                     buffers: &[
                         wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
-                        wgpu::VertexBufferLayout { array_stride: 64, step_mode: wgpu::VertexStepMode::Instance, attributes: &inst_attrs },
+                        wgpu::VertexBufferLayout {
+                            array_stride: if actor { std::mem::size_of::<actors::ActorInstance>() as u64 } else { 64 },
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: if actor { &actor_attrs } else { &inst_attrs },
+                        },
                     ],
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -611,7 +617,7 @@ impl Renderer {
                 cache: None,
             })
         };
-        let pipes = [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive]
+        let pipe_specs = [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive]
             .into_iter()
             .flat_map(|b| [false, true].map(|two| (b, two, false, false)))
             .chain([Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive].map(|b| (b, true, true, false)))
@@ -620,9 +626,9 @@ impl Renderer {
             .chain([Blend::Opaque, Blend::AlphaTest].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, true))))
             .map(|(b, two, sky, env, fade)| (b, two, sky, env, fade, false))
             .chain([false, true].map(|two| (Blend::AlphaBlend, two, false, false, false, true)))
-            .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false))))
-            .map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite))
-            .collect();
+            .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha].into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false))));
+        let pipes = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false)).collect();
+        let actor_pipes = pipe_specs.map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, true)).collect();
         let mut r = Self {
             device,
             queue,
@@ -639,6 +645,7 @@ impl Renderer {
             tex_layout,
             sampler,
             pipes,
+            actor_pipes,
             sky: SkyGpu::default(),
             sky_views: HashMap::new(),
             gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], liquid: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
@@ -1508,7 +1515,7 @@ mod sky_tests {
         };
         let model = Scene { meshes: vec![quad(0.0, [1.0, 0.0, 0.0, 1.0]), quad(0.0, [1.0, 0.0, 0.0, 1.0])], ..Default::default() };
         let at = |x: f32, z: f32| [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [x, 0.0, z, 1.0]];
-        let frame = |transform, parts: Vec<[[f32; 4]; 4]>, skin: Option<Vec<Vertex>>, always| ao_scene::ActorFrame { id: 1, model: 7, transform, parts, skin, always, alpha: 1.0 };
+        let frame = |transform, parts: Vec<[[f32; 4]; 4]>, skin: Option<Vec<Vertex>>, always| ao_scene::ActorFrame { id: 1, model: 7, transform, parts, skin, always, alpha: 1.0, ..Default::default() };
         let shot = |f: ao_scene::ActorFrame, name: &str| -> Option<u8> {
             let path = std::env::temp_dir().join(format!("ao-render-actor-{}-{name}.png", std::process::id()));
             render_to_png_actors(&Scene::default(), &[(7, model.clone())], vec![f], [0.0; 3], [0.0, 0.0, -1.0], 64, 64, &path, 0.0).ok()?;
@@ -1536,17 +1543,63 @@ mod sky_tests {
 
     /// [`actor_shot`] with `ActorFrame::alpha`.
     fn actor_shot_alpha(world: &Scene, model: Scene, at: [f32; 3], alpha: f32, name: &str) -> Option<[u8; 3]> {
-        let path = std::env::temp_dir().join(format!("ao-render-env-{}-{name}.png", std::process::id()));
-        let t = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [at[0], at[1], at[2], 1.0]];
-        let f = ao_scene::ActorFrame { id: 1, model: 7, transform: t, parts: vec![], skin: None, always: false, alpha };
-        render_to_png_actors(world, &[(7, model)], vec![f], [0.0; 3], [0.0, 0.0, -1.0], 64, 64, &path, 0.0).ok()?;
-        let bytes = std::fs::read(&path).ok()?;
-        let _ = std::fs::remove_file(&path);
+        actor_shot_frame(world, model, at, ao_scene::ActorFrame { alpha, ..Default::default() }, name)
+    }
+
+    fn actor_shot_frame(world: &Scene, model: Scene, at: [f32; 3], frame: ao_scene::ActorFrame, name: &str) -> Option<[u8; 3]> {
+        let bytes = actor_frame_png(world, model, at, frame, name)?;
         let mut r = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
         let mut buf = vec![0; r.output_buffer_size()];
         let info = r.next_frame(&mut buf).unwrap();
         let o = (info.width as usize * (info.height as usize / 2) + info.width as usize / 2) * 4;
         Some([buf[o], buf[o + 1], buf[o + 2]])
+    }
+
+    fn actor_frame_png(world: &Scene, model: Scene, at: [f32; 3], frame: ao_scene::ActorFrame, name: &str) -> Option<Vec<u8>> {
+        let path = std::env::temp_dir().join(format!("ao-render-env-{}-{name}.png", std::process::id()));
+        let t = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [at[0], at[1], at[2], 1.0]];
+        let f = ao_scene::ActorFrame { id: 1, model: 7, transform: t, ..frame };
+        render_to_png_actors(world, &[(7, model)], vec![f], [0.0; 3], [0.0, 0.0, -1.0], 64, 64, &path, 0.0).ok()?;
+        let bytes = std::fs::read(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        Some(bytes)
+    }
+
+    #[test]
+    fn actor_material_overrides_preserve_base_and_emissive_gamma_space() {
+        let linear = |rgb: [f32; 3]| rgb.map(|c| c.powf(2.2));
+        let sub = Submesh {
+            emissive: linear([0.2, 0.3, 0.4]), specular: linear([0.1, 0.2, 0.3]), shininess: 8.0,
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+        };
+        let model = actor_quad([0.0, 0.0, 1.0], sub.clone());
+        let world = Scene {
+            environment: Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 100.0, fog_end: 200.0, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 0.0, 1.0], sun_specular: 0.0 }),
+            ..Default::default()
+        };
+        let shot = |frame, name| actor_shot_frame(&world, model.clone(), [0.0, 0.0, -5.0], frame, name);
+        let base = actor_frame_png(&world, model.clone(), [0.0, 0.0, -5.0], ao_scene::ActorFrame::default(), "material-none").expect("material regression requires an offscreen GPU adapter");
+        let explicit = ao_scene::ActorFrame {
+            emissive: Some(sub.emissive), specular: Some(sub.specular), specular_power: Some(sub.shininess),
+            ..Default::default()
+        };
+        assert_eq!(base, actor_frame_png(&world, model.clone(), [0.0, 0.0, -5.0], explicit, "material-base").unwrap(), "None must retain every pixel of the model material");
+        let mut static_world = world.clone();
+        static_world.meshes = model.meshes.clone();
+        let mut transform = IDENTITY;
+        transform[3][2] = -5.0;
+        static_world.instances.push(Instance { mesh: 0, transform });
+        let path = std::env::temp_dir().join(format!("ao-render-material-world-{}.png", std::process::id()));
+        render_to_png(&static_world, [0.0; 3], [0.0, 0.0, -1.0], 64, 64, &path).unwrap();
+        let static_png = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(base, static_png, "None must match every pixel of the unchanged world material shader");
+        let gamma = [0.25, 0.5, 0.75];
+        let override_frame = ao_scene::ActorFrame { emissive: Some(linear(gamma)), ..Default::default() };
+        let pixel = shot(override_frame, "material-emissive").unwrap();
+        for (actual, expected) in pixel.into_iter().zip(gamma) {
+            assert!((f32::from(actual) - expected * 255.0).abs() <= 2.0, "D3D7 gamma-space emissive: {pixel:?}");
+        }
     }
 
     /// `ActorFrame::alpha` (`RRefFrame_t::SetTransparency`): an opaque emissive quad blends with the frame's alpha over the world behind it
