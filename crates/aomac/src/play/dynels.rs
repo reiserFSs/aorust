@@ -236,10 +236,12 @@ impl Worker {
                     Req::Model { key, look } => Resp::Model { key, result: build(&store, &mut assets, &look).map(Box::new).map_err(|e| format!("{e:#}")) },
                     Req::Clip { key, look, id } => {
                         // the record's variants of the key (`FUN_10010ebe`), every one loaded; the character rolls one when the clip starts
-                        let ids: Vec<u32> = if look.npc {
-                            NpcRecord::load(&store, look.monster_data as u32).map(|r| ao_formats::character::anim_key_variants(&r, id).to_vec()).unwrap_or_default()
-                        } else {
-                            canim::resolve_clip(&assets.names, canim::clip_set(look.breed, look.sex), id as u16, false).map(|c| c.0).into_iter().collect()
+                        let ids = match clip_ids(&store, &assets, &look, id) {
+                            Ok(ids) => ids,
+                            Err(e) => {
+                                eprintln!("dynels: clip {id}: {e:#}");
+                                vec![]
+                            }
                         };
                         Resp::Clip { key, id, anims: ids.into_iter().filter_map(|c| assets.anim(&store, c).ok()).collect() }
                     }
@@ -370,11 +372,16 @@ fn build_corpse(store: &RecordStore, assets: &mut ActorAssets, c: &CorpseLook) -
             ActorRig::new(store, assets, c.cat_mesh, c.head, &npc_part_textures(store, &assets.names, &cat, c.head, &list, &cloth), &npc_part_layers(&cat, &list), &[])?
         }
     };
-    let animation = c.animation.map(|(record, key)| {
-        let record = NpcRecord::load(store, record)?;
-        let id = ao_formats::character::anim_key_variants(&record, key).first().copied().ok_or_else(|| anyhow::anyhow!("corpse animation key {key} absent from NPC record"))?;
-        assets.anim(store, id)
-    }).transpose()?;
+    let animation = match c.animation {
+        Some((record, key)) => match NpcRecord::lookup(store, record)? {
+            Some(record) => {
+                let id = ao_formats::character::anim_key_variants(&record, key).first().copied().ok_or_else(|| anyhow::anyhow!("corpse animation key {key} absent from NPC record"))?;
+                Some(assets.anim(store, id)?)
+            }
+            None => None,
+        },
+        None => None,
+    };
     let held = rig.pose(animation.as_ref().map(|a| (&**a, a.duration)));
     Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), ..plain(Default::default(), true) })
 }
@@ -385,9 +392,10 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
     let mut mounted = if look.skip_attractors { vec![] } else { attractor_list(look.head.filter(|&h| h > 0).map(|h| h as u32), &wire) };
     let head = mounted.iter().position(|a| a.0 == 0).map(|i| mounted.remove(i).1);
     let attachments = mounted;
-    let (rig, rec) = if look.npc {
-        let (rig, rec) = npc_rig(store, assets, look, head, &attachments)?;
-        (rig, Some(rec))
+    // GC 0x10058078: null MonsterData follows the normal breed/sex/build resolver.
+    let rec = monster_record(store, look)?;
+    let rig = if let Some(rec) = &rec {
+        npc_rig(store, assets, look, rec, head, &attachments)?
     } else {
         let (breed, gender) = ao_formats::screens::wire_breed_sex(look.breed as i32, look.sex as i32)?;
         // `BreedRace_e`: 1 caucasian, 2 african, 3 asian (docs/zone/dynel.md §1.3)
@@ -403,8 +411,9 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
                 equipment.wear(*p, tex as u32);
             }
         }
+        let textures: Vec<_> = look.textures.iter().map(|(m, t, env, alpha)| TextureOverride { material: m, texture: *t as u32, env_texture: *env as u32, alpha_mode: *alpha as u32 }).collect();
         let look = PlayerLook { breed, gender, skin, build: look.fatness.min(2), head, equipment };
-        (ActorRig::player(store, assets, &look, &attachments)?, None)
+        ActorRig::player_with_textures(store, assets, &look, &attachments, &textures)?
     };
     let sig = rig.cat().signature;
     let mut clips: HashMap<u32, Vec<Arc<CatAnim>>> = HashMap::new();
@@ -456,6 +465,20 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
     Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), clips, features, tag_height, sounds, fabric, ..plain(Default::default(), true) })
 }
 
+fn monster_record(store: &RecordStore, look: &CharLook) -> anyhow::Result<Option<NpcRecord>> {
+    // GC 0x10051f6e: Features 0x800 selects 99902 instead of the MonsterData stat.
+    let id = if look.skip_attractors { 99902 } else { look.monster_data };
+    if id > 0 { NpcRecord::lookup(store, id as u32) } else { Ok(None) }
+}
+
+fn clip_ids(store: &RecordStore, assets: &ActorAssets, look: &CharLook, id: u32) -> anyhow::Result<Vec<u32>> {
+    let rec = monster_record(store, look)?;
+    Ok(match rec {
+        Some(rec) => ao_formats::character::anim_key_variants(&rec, id).to_vec(),
+        None => canim::resolve_clip(&assets.names, canim::clip_set(look.breed, look.sex), id as u16, false).map(|c| c.0).into_iter().collect(),
+    })
+}
+
 fn named(store: &RecordStore, assets: &mut ActorAssets, model: u32, name: &str) -> anyhow::Result<Option<Arc<CatAnim>>> {
     let id = assets.clips(store, model)?.iter().find(|c| c.0 == name).map(|c| c.1);
     id.map(|id| assets.anim(store, id)).transpose()
@@ -464,8 +487,7 @@ fn named(store: &RecordStore, assets: &mut ActorAssets, model: u32, name: &str) 
 /// An NPC: the record's model (`MonsterData` -> rdb 1040023 `Mesh`), `textures[]` replacing the part textures (`SetCATTextures`),
 /// worn `cloth[]` composited over the part's texture like the player equipment, `head` (the place-0 attractor) and attachment
 /// meshes. The record's own `HeadMesh` stat only selects the naked skin textures (`FUN_10058078`), it mounts nothing.
-fn npc_rig(store: &RecordStore, assets: &ActorAssets, look: &CharLook, head: Option<u32>, attachments: &[(u8, u32)]) -> anyhow::Result<(ActorRig, NpcRecord)> {
-    let rec = NpcRecord::load(store, look.monster_data as u32)?;
+fn npc_rig(store: &RecordStore, assets: &ActorAssets, look: &CharLook, rec: &NpcRecord, head: Option<u32>, attachments: &[(u8, u32)]) -> anyhow::Result<ActorRig> {
     let model = rec.mesh().context("NPC record has no mesh")?;
     let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model)?;
     let list: Vec<TextureOverride> = look.textures.iter().map(|(m, t, env, alpha)| TextureOverride { material: m, texture: *t as u32, env_texture: *env as u32, alpha_mode: *alpha as u32 }).collect();
@@ -473,7 +495,7 @@ fn npc_rig(store: &RecordStore, assets: &ActorAssets, look: &CharLook, head: Opt
     let skin_head = rec.stat(64).filter(|&h| h > 0).map(|h| h as u32);
     let overrides = npc_part_textures(store, &assets.names, &cat, skin_head, &list, &cloth);
     let rig = ActorRig::new(store, assets, model, head, &overrides, &npc_part_layers(&cat, &list), attachments)?;
-    Ok((rig, rec))
+    Ok(rig)
 }
 
 /// What a character is doing besides moving.
@@ -1313,6 +1335,10 @@ impl Dynels {
             if binding.group != 0 && target.is_none() { continue; }
             let position = target.map_or(source.w_axis.truncate(), |m| m.w_axis.truncate());
             let origin = if binding.group == 2 { target.unwrap_or(source) } else { source };
+            #[cfg(test)]
+            if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
+                eprintln!("live weapon effect note={note:#x} who={who} victim={victim} slot={slot} special={special} effect={} group={} source_anchor={source_anchor} target_anchor={target_anchor} source={:?} origin={:?} target={position:?}", binding.effect, binding.group, source.w_axis.truncate(), origin.w_axis.truncate());
+            }
             if let Err(error) = renderer.spawn(binding, origin, position) { eprintln!("weapon effects: {error:#}"); }
         }
         self.effects = Some(renderer);
@@ -2461,8 +2487,8 @@ mod tests {
                 textures.extend(c.textures.iter().filter(|t| t.texture > 0).map(|t| (1010004, t.texture as u32)));
                 meshes.extend(c.attractors.iter().filter(|a| a.mesh > 0).map(|a| a.mesh as u32));
                 meshes.extend(c.head_mesh.filter(|&h| h > 0).map(|h| h as u32));
-                let model = if c.is_npc() {
-                    NpcRecord::load(&store, c.monster_data as u32).unwrap().mesh().expect("captured NPC has a model")
+                let model = if let Some(record) = monster_record(&store, &CharLook::from_update(&c)).unwrap() {
+                    record.mesh().expect("captured NPC has a model")
                 } else {
                     let (breed, gender) = ao_formats::screens::wire_breed_sex(c.breed as i32, c.sex as i32).unwrap();
                     ao_formats::character::player_model_build(&store, breed, gender, c.fatness.min(2)).unwrap()
@@ -2976,6 +3002,35 @@ mod variant_tests {
         let multi = store.ids(ao_formats::character::NPC_TYPE).unwrap().into_iter().filter_map(|id| NpcRecord::load(&store, id).ok()).filter(|r| ao_formats::character::holder_variants(r, 0x78).len() > 1).count();
         eprintln!("records with >1 idle-stand variants: {multi}");
         assert!(multi > 0);
+    }
+
+    /// 288560 is an item template, not MonsterData: retail resolves a normal humanoid.
+    #[test]
+    fn missing_monster_data_builds_humanoid_with_named_clips() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        assert!(NpcRecord::lookup(&store, 288560).unwrap().is_none());
+        assert!(NpcRecord::load(&store, 288560).is_err(), "surveys retain strict loading");
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let look = CharLook { npc: true, breed: 1, sex: 2, race: 1, fatness: 1, head: None, monster_data: 288560, textures: vec![], cloth: vec![], attractors: vec![], skip_attractors: false };
+        let built = build_char(&store, &mut assets, &look).unwrap();
+        let rig = built.rig.as_ref().unwrap();
+        let (breed, gender) = ao_formats::screens::wire_breed_sex(1, 2).unwrap();
+        assert_eq!(rig.model_id, ao_formats::character::player_model_build(&store, breed, gender, 1).unwrap());
+        assert!(!built.model.meshes.is_empty());
+        for key in [0x78, DIE_KEY, ATTACK_KEY] {
+            assert!(built.clips.get(&key).is_some_and(|clips| !clips.is_empty()), "named clip {key}");
+        }
+        let player = CharLook { npc: false, monster_data: 0, ..look.clone() };
+        let ids = clip_ids(&store, &assets, &look, 1033).unwrap();
+        assert!(!ids.is_empty());
+        assert_eq!(ids, clip_ids(&store, &assets, &player, 1033).unwrap());
+        for id in ids {
+            assert_eq!(assets.anim(&store, id).unwrap().signature, rig.cat().signature);
+        }
+        let corpse = CorpseLook { cat_mesh: rig.model_id, head: None, breed: 1, sex: 2, race: 1, cloth: vec![], textures: vec![], animation: Some((288560, 503)) };
+        let corpse = build_corpse(&store, &mut assets, &corpse).unwrap();
+        assert_eq!(corpse.held.unwrap().0, corpse.rig.unwrap().pose(None).0);
     }
 
     /// A captured corpse holds the terminal frame of its NPC-record death animation.

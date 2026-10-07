@@ -54,6 +54,8 @@ N3 frame ──Zone::on_frame──▶ Dynels::on_message ──▶ Char (Mover)
 | doors, billboards, terminals the playfield places itself | rdb 1000026 `PlacedDynel` (`CreateRDBDynels`) → same item path (template + blob stats); position/rotation as stored | docs/zone/static.md §6 |
 | held weapon items (0xC74A) | invisible (they have a parent); the weapon is the holder's attractor mesh | docs/zone/static.md §4 |
 
+Missing MonsterData is not a missing model error: Gamecode's null-record path uses the normal humanoid resolver for breed 1..4; breed > 4 leaves the previous visual unchanged. The NPC wire bit alone does not select a morphed rig. No other-record/direct-mesh/default-creature fallback exists (npc.md §1).
+
 Coordinates: scene = `(x, y, -z)` of the server position; a model faces -Z at rest, so the actor rotation is `scene_yaw(server_yaw)`
 (`play/zone.rs`, verified against NPC travel directions). Server `y` is trusted (the client never lets a dynel sink below terrain but does not
 snap it up either, docs/zone/motion.md §4d).

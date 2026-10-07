@@ -11,10 +11,40 @@ All addresses are in the 32-bit client DLLs (Ghidra projects `/tmp/aomac-ghidra/
   `std::map<id, MonsterData*>` (`FUN_1004db93`; cache flush = `MonsterData_t::RemoveMonsterData`, string @0x1015d1b0, called from `FUN_1003909f`).
   Lookup: `FUN_1004dd31(id)` (loads on demand, 0 = no record). The class name `MonsterData_t` appears only in that string [CODE].
 * The object is cached per SimpleChar: `FUN_10051d2d(this, id)` sets `this+8 = FUN_1004dd31(id)` (object `+0x10` = id); `FUN_10051f6e()` is the accessor
-  (`N3Msg_IsCharacterMorphed` @0x100187c0 = "accessor != 0", so a NPC is a *morphed character*). If stat `Features` (0xE0) bit `0x800` is set the id comes from
-  `FUN_10057b41` (decompile lost its return value), otherwise from `this+8` [CODE]. Stat `MonsterData` (0x167) is written by `FUN_10077af2` (SimpleChar update,
-  value `*(msg+0x8c)`) and `FUN_100a754c`; its stat-change handler is `FUN_10059e6a` (`iVar8 == 0x167`) [CODE]; the setter chain was not followed further
-  ([INFERENCE]: stat write → `FUN_10051d2d`).
+  (`N3Msg_IsCharacterMorphed` @0x100187c0 = "accessor != 0", so a NPC is a *morphed character*). If stat `Features` (0xE0) bit `0x800` is set,
+  `FUN_10051f6e` instead looks up **99902**: `FUN_10057b41` ends at `0x10057b60` with `MOV EAX,0x1863e; RET`, regardless of its preceding stat `0xa1` read [CODE].
+  Otherwise the accessor returns the holder's `this+8`. This flag-driven morph is not a fallback for a missing record.
+  Stat `MonsterData` (0x167) is written by `FUN_10077af2` (SimpleChar update, value `*(msg+0x8c)`) and `FUN_100a754c`.
+  Its stat-change handler `FUN_10059e6a` invokes `thunk_FUN_10152f70` when MechData (`0x296`) is zero; that reaches
+  `FUN_10052147` → `FUN_10051d2d` and marks the visual dirty (`dynel+0x2c4 = 1`) even when lookup returned null [CODE].
+  `FUN_10051d2d` stores a null lookup result, but retries on the next setter call because the holder remains null.
+
+### Missing MonsterData: no cross-type or default-creature fallback
+
+`FUN_1004dc30` asks **ResourceDatabase**, not ResourceManager, for `{1040023,id}`. A null binary stream destroys the temporary
+record and returns failure without inserting into the global cache; `FUN_1004dd31` returns null [CODE]. Consequently
+ResourceManager mesh fallbacks cannot rescue this lookup.
+The only `AddFallback` callsite found in the retail DLL scan is Interfaces `DatabaseInterfaceModule_t` constructor
+`0x1000b322`, call `0x1000b39c`: `ResourceManager::AddFallback(0xf696a,0xf6951,null)` (**1010026 → 1010001**).
+Its imported slot `0x10015c2c` has only that reference. It registers no 1040023 fallback [CODE].
+
+
+`FUN_10058078` first reads the dynel's Mesh (`0xc`) and HeadMesh (`0x40`). With a record, nonzero record overrides replace
+those values. **Without a record**, breed > 4 returns without changing the visual; breed ≤ 4 discards the initial Mesh and
+runs the ordinary humanoid name resolver `FUN_10057eb3` / `FUN_10057ff7` using breed, sex, stat `0x2f`, the build byte
+`dynel+0x208`, and optional stat `0x378`. A failed nonzero-`0x378` variant retries without that suffix. There is no retry of
+MonsterData as an item template, direct mesh/CATMesh id, or arbitrary default creature [CODE].
+
+The selected mesh goes through N3 `0x10019fb2` → DisplaySystem `VisualCATMesh_t::SetMesh` (`0x100728b7`) →
+`FUN_10070656` → `ResourceManager::GetAsync({1010002,mesh},...)`. Wire textures remain attached to this visual; this
+downstream mesh load does not revisit MonsterData. Missing spell-animation records also leave the corpse's mesh intact
+(`FUN_100a4dcc` returns when `FUN_1004dd31` is null).
+
+The reported **288560** is absent from installed `rdb_1040023`; an all-56-table read-only search finds it only in
+`rdb_1000020` (461 bytes), named **"Terrifying Leet Pet (Halloween Leet Series 2)"** [DATA]. That item-template identity is
+not a usable visual fallback. None of the retained captures includes MonsterData 288560, so its live breed/head/texture
+fields must be captured before claiming which humanoid model, or unchanged non-humanoid visual, retail selects.
+
 
 ## 2. Record layout (`FUN_1004d919`, all little-endian `i32`; verified by 1360/1360 real records)
 
@@ -199,9 +229,39 @@ The 32 signature mismatches are 3 records: 257292 `unicorn lander` (mesh 257288 
 (keys 0x409/0x40a/0x40d → `pre_order_fire.ani`), 260117 `mech - recon` (keys 0x3f6/0x3f7/0x401/0x40d → `recon_mesh_attack_stomp.ani`): data errors; the client's
 `CATRender_t::SetAnim` rejects them the same way.
 
+### Missing-record survey (2026-10-07)
+
+A fresh read-only survey of all **22** retained `.rec` files (1,869 server-direction frames) decoded **144**
+SimpleCharFullUpdate messages, **124** NPC messages with **29** distinct MonsterData IDs. **All 29 resolve in 1040023**;
+each appears in no other RDB table. Thus **zero retained NPC messages/IDs** exercise the missing-record branch; the
+reported live 288560 is additional evidence, not one of those captures.
+
+IDs: `17655,22794,26080,26088,26090,30252,30365,45873,165178,165179,165180,165181,165182,165185,165186,165187,165191,165192,165193,165194,165195,165196,165212,204067,204985,220406,247041,251782,254118`.
+
+All **1,360** installed NPC records parsed; the two zero-Mesh records are **163119** `molokh` and **205481**
+`lctower_supplymasters_control_tower`. Neither occurs in a retained capture; these are **present** records retaining the
+dynel's own Mesh, not missing-record humanoid fallbacks. The leading stat vectors of all **119,540** item templates parsed
+with zero errors and **zero stat-359 (MonsterData) references**; no captured StatIIR sets stat 359. This database is a
+resource collection, not a list of every server NPC appearance, so it cannot bound uncaptured missing IDs.
+
+Method: network big-endian SimpleCharFullUpdate decode through texture/cloth/attractor fields, using the existing
+`ao-net` layout; little-endian NPC/item leading stat-vector decode using `npc.rs` / `dynel_visual.rs`. SQLite opened with
+`mode=ro`; queries `SELECT id,data FROM rdb_1040023`, `SELECT id,data FROM rdb_1000020`, and
+`SELECT 1 FROM <table> WHERE id=?` over `sqlite_master`'s 56 tables. No game data was copied.
+
+The same fresh presence survey found all **93** positive wire texture IDs and **33** positive wire attractor IDs present;
+NPC-only subsets are **90** textures / **29** attractors, with all **20** selected NPC body CAT meshes present. All **241**
+cloth entries use page 0. This does not reproduce the unidentified pink character, but excludes absent positive wire assets
+in these captures. The prior decoded-texel/part-table survey remains in `dynel.md` §ICC pink-appearance investigation:
+four missing CAT image references belong to piranha/unicorn/mech/hoverbike models, not ordinary player bodies; only eight
+magenta-filter texels occur in head image 40268, none in captured body images. Missing GPU texture bindings are white,
+not magenta, and untextured mesh 9918's authored pink diffuse is intentionally not used by the retail material path.
+No colour substitution or invented pink fallback is warranted; the uncaptured forearm/side report remains unidentified.
+
+
 ## 8. Unresolved (addresses searched)
 
 * Marker pairs (`0x0f,0x17` …), the 13 trailing bytes, the fourth list: Gamecode `FUN_1004d919` ignores them; no other reader exists (`0xfde97` occurs only in `FUN_1004dc30`, searched all DLLs for the 4-byte constant and the decimal 1040023: only Gamecode 0x1004dc4c).
 * Consumer of the record's other stats (Flags 0x4000, VolumeMass, Features, 0xc5, 0x165, CharRadius): the only direct readers found are `FUN_1004d8e6(stat)` callers `FUN_10058078`, `FUN_1006fb56`, `FUN_1009b4ac`; likely folded into the dynel's stat object (vtable `+0x3c` GetStat) [GUESS].
-* Cloth table → textures for morphed chars; the global compared in `FUN_10070247`; sound key names; the stat-0x167 → `this+8` setter (`thunk_FUN_10152f70` @0x10152f70 decompiles to garbage); `FUN_10057b41` return (monster id when Features & 0x800); the meaning of `Part::alpha_aux` (see AlphaMode).
+* Cloth table → textures for morphed chars; the global compared in `FUN_10070247`; sound key names; the meaning of `Part::alpha_aux` (see AlphaMode).
 * `AbstractAnimID_e` enumerator names (no symbols; derived from clip names above); the effect-driven `srand` calls (`ProcessStuff`) that reseed the real `rand()` stream; the exact call moment of `FUN_1011bb4a`'s `srand(time)` ([GUESS]: zone start).

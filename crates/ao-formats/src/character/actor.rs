@@ -69,6 +69,10 @@ impl ActorAssets {
 /// Wire `textures[]` replaces layer 1, cloth replaces layer 2; either body overlay
 /// keys against naked skin, never against an already-composited default outfit.
 pub fn npc_part_textures(store: &RecordStore, names: &NameTable, cat: &CatMesh, skin_head: Option<u32>, list: &[TextureOverride], cloth: &[(ClothPart, u32)]) -> PartTextures {
+    humanoid_part_textures(store, names, cat, skin_head.and_then(|head| super::player::head_skin(names, head)), list, cloth)
+}
+
+fn humanoid_part_textures(store: &RecordStore, names: &NameTable, cat: &CatMesh, skin: Option<(Breed, Gender, Skin)>, list: &[TextureOverride], cloth: &[(ClothPart, u32)]) -> PartTextures {
     let load = |id: u32| {
         let key = TextureKey { rdb_type: TEXTURE_TYPE, id };
         load_texture(store, key).ok().flatten().map(|t| (key, t))
@@ -79,7 +83,7 @@ pub fn npc_part_textures(store: &RecordStore, names: &NameTable, cat: &CatMesh, 
             out.insert(cat.parts[i].name.clone(), t);
         }
     }
-    if let Some((breed, gender, skin)) = skin_head.and_then(|head| super::player::head_skin(names, head)) {
+    if let Some((breed, gender, skin)) = skin {
         for part in ClothPart::ALL {
             let Some(p) = cat.parts.iter().find(|p| p.name == part.name()) else { continue };
             let Some(id) = names.id(1010011, &skin_texture_name(breed, gender, skin, part)) else { continue };
@@ -234,10 +238,21 @@ impl ActorRig {
 
     /// A player: body of breed/sex/build, naked skin + worn cloth composite, head mesh, attachments.
     pub fn player(store: &RecordStore, assets: &ActorAssets, look: &PlayerLook, attachments: &[(u8, u32)]) -> Result<Self> {
+        Self::player_with_textures(store, assets, look, attachments, &[])
+    }
+
+    /// Normal humanoid resolver with the dynel's layer-1 diffuse / layer-3 environment overrides.
+    pub fn player_with_textures(store: &RecordStore, assets: &ActorAssets, look: &PlayerLook, attachments: &[(u8, u32)], list: &[TextureOverride]) -> Result<Self> {
         let model = player_model_build(store, look.breed, look.gender, look.build)?;
         let p = Player { breed: look.breed, gender: look.gender, skin: look.skin, head: None, equipment: look.equipment };
-        let overrides = part_textures(&assets.names, store, model, &p)?;
-        Self::new(store, assets, model, look.head, &overrides, &PartLayers::new(), attachments)
+        if list.is_empty() {
+            let overrides = part_textures(&assets.names, store, model, &p)?;
+            return Self::new(store, assets, model, look.head, &overrides, &PartLayers::new(), attachments);
+        }
+        let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model)?;
+        let cloth: Vec<_> = ClothPart::ALL.into_iter().filter_map(|part| look.equipment.0[part as usize].map(|id| (part, id))).collect();
+        let overrides = humanoid_part_textures(store, &assets.names, &cat, Some((look.breed, look.gender, look.skin)), list, &cloth);
+        Self::new(store, assets, model, look.head, &overrides, &npc_part_layers(&cat, list), attachments)
     }
 
     /// The textured model for `Renderer::add_actor_model`.

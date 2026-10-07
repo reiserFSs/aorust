@@ -5,7 +5,7 @@
 //! All counts are stored as `(n + 1) * 1009` (`0x3f1`).
 
 use super::{CatMesh, Rd};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use ao_rdb::RecordStore;
 
 /// rdb type of the record; the client requests `Identity{0xfde97, monster_data}`.
@@ -139,8 +139,12 @@ impl NpcRecord {
 
     /// Reads and decodes record `id`.
     pub fn load(store: &RecordStore, id: u32) -> Result<Self> {
-        let Some(b) = store.get(NPC_TYPE, id)? else { bail!("no NPC record {NPC_TYPE}/{id}") };
-        Self::parse(&b).with_context(|| format!("decoding NPC record {id}"))
+        Self::lookup(store, id)?.with_context(|| format!("no NPC record {NPC_TYPE}/{id}"))
+    }
+
+    /// Missing MonsterData is a null record in retail; malformed records remain errors.
+    pub fn lookup(store: &RecordStore, id: u32) -> Result<Option<Self>> {
+        store.get(NPC_TYPE, id)?.map(|b| Self::parse(&b).with_context(|| format!("decoding NPC record {id}"))).transpose()
     }
 
     /// Stat override (`FUN_1004d8e6`): the first entry of `stat`.
