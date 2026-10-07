@@ -111,6 +111,60 @@ mod tests {
     use ao_net::{frame::Frame, msg::Identity};
     use ao_net::n3::{action::simple, nano};
 
+    /// Real wire route, with the own root connector's supported id0 world matrix.
+    #[test]
+    fn captured_body_boost_zone_route_emits_and_retires_visible_pulse() {
+        let Some(dir)=installed() else {return};
+        let mut zone=crate::play::zone::Zone::new(33588);
+        zone.world.start(dir,33588);
+        let frames:Vec<_>=include_str!("../../../../docs/captures/body_boost_pulse.rec").lines().map(|line| {
+            let hex=line.split_whitespace().nth(2).unwrap();
+            let bytes:Vec<_>=(0..hex.len()/2).map(|i|u8::from_str_radix(&hex[i*2..i*2+2],16).unwrap()).collect();
+            Frame::decode_with(&bytes,false).unwrap().unwrap().0
+        }).collect();
+        for frame in &frames[..3] {zone.on_frame(frame);}
+        assert_eq!(zone.world.nano_effect_categories,36);
+        assert_eq!(zone.world.buff_visuals[&(33588,29091)].duration,1800.0);
+        // Actual local-player world position recorded by pulse.log during cast.
+        let origin=glam::Vec3::new(930.0051,24.21451,-759.66864);
+        let source=glam::Mat4::from_translation(origin);
+        // Player::effect_anchor(0) returns its world transform; unsupported ids
+        // deliberately do not get an invented connector in this replay.
+        let anchor=|id| (id==0).then_some(source);
+        let mut host=Host::headless();
+        let eye=origin+glam::Vec3::new(2.0,3.0,4.0);
+        host.camera=ao_render::Camera::look_at(eye,origin+glam::Vec3::Y);
+        let mut visible=false;
+        for _ in 0..1080 {
+            host.actors.clear();
+            let stats=&zone.stats;
+            let character_stats=&zone.character_stats;
+            zone.world.buff_visual_frame(1.0/60.0,|id|anchor(id).map(|m|m.to_cols_array_2d()),|who,stat| {
+                if who==33588 {stats.get(&stat).copied()} else {None}
+                    .or_else(||character_stats.get(&who)?.get(&stat).copied())
+            });
+            let handle=zone.world.buff_visuals[&(33588,29091)].handle.unwrap();
+            assert_ne!(handle,0);
+            zone.world.update_with_collision(1.0/60.0,eye.to_array(),[0.0,0.0,-1.0],&mut host,None,anchor);
+            assert!(zone.world.effects.as_ref().unwrap().is_active(handle));
+            visible|=host.actors.iter().filter(|a|matches!(a.model as u32,6203|20092|20097)).any(|a| {
+                a.skin.as_ref().is_some_and(|vertices|vertices.iter().any(|v| {
+                    v.color[3]>0.0 && (glam::Mat4::from_cols_array_2d(&a.transform).transform_point3(glam::Vec3::from_array(v.pos))-origin).length()<5.0
+                }))
+            });
+        }
+        assert!(visible,"wire-owned Body Boost must submit nearby nontransparent flare/cord geometry");
+        let handle=zone.world.buff_visuals[&(33588,29091)].handle.unwrap();
+        zone.on_frame(&frames[3]);
+        assert!(!zone.world.buff_visuals.contains_key(&(33588,29091)));
+        assert!(!zone.world.effects.as_ref().unwrap().is_active(handle));
+        for _ in 0..120 {
+            host.actors.clear();
+            zone.world.update_with_collision(1.0/60.0,eye.to_array(),[0.0,0.0,-1.0],&mut host,None,anchor);
+        }
+        assert!(!host.actors.iter().any(|a|matches!(a.model as u32,6203|20092|20097)));
+    }
+
     fn installed() -> Option<std::path::PathBuf> {
         let dir = ao_gui::client_dir();
         dir.join("cd_image/rdb.db").exists().then_some(dir)

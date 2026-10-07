@@ -523,6 +523,13 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
   cannot establish a1070 leak from red particles alone.
   Renderless controller/orbit `vertices=None` means no geometry, not expiry:
   the renderer retains these instances until their process step ends them.
+  `captured_body_boost_zone_route_emits_and_retires_visible_pulse` replays the
+  four real frames in `docs/captures/body_boost_pulse.rec` through `Zone::on_frame`,
+  then the normal buff/anchor/renderer update route for18seconds. Its own-root
+  callback supplies the recorded local-player world matrix only for id0; it
+  requires nontransparent flare/cord geometry near that position, then expiry
+  following the actual BuffIIR removal. This is offline route evidence, not
+  real-window visibility evidence.
 * Class1002's orbiting children (`100d4f72`/`100d52dc`/`100d53e3`/
   `100d57bb`/`100d4d6b`) use their actual class0 body-profile records
   (20013/20018,42words), selected by Breed/Sex/BodyShape/MonsterScale,
