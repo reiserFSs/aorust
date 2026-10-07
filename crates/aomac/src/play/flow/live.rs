@@ -4,6 +4,7 @@
 //! Credentials come from stdin only. Steps (comma separated): `KEY=secs` holds a letter/arrow/space key (`W A S D Z C SPACE UP LEFT`),
 //! `wait=secs`, `shot=name` (PNG into AOMAC_LIVE_SHOTS), `pos` prints the own position, `press=F8|CTRL+F8|SHIFT+F8` taps keys (camera),
 //! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens. HUD steps: `ui=u|ctrl+1` window hotkey,
+//! `heading=server_yaw` rotates in place through right mouse input to the requested heading (radians), before idle/capture steps.
 //! `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
 //! Frame captures require `AOMAC_LIVE_SHOTS`: `arm=attack:1:note,down=Q,capturewait=30,up=Q` records the frame
@@ -31,6 +32,17 @@ fn approach_state(zone: &super::super::zone::Zone, fixed: Option<(f32, f32)>, id
 }
 
 const CAPTURE_DT: f32 = 1.0 / 60.0;
+
+fn heading_error(target: f32, actual: f32) -> f32 {
+    (target - actual + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+#[test]
+fn live_heading_shortest_error() {
+    assert!((heading_error(0.01, std::f32::consts::TAU - 0.01) - 0.02).abs() < 1e-6);
+    assert!((heading_error(std::f32::consts::TAU - 0.01, 0.01) + 0.02).abs() < 1e-6);
+    assert_eq!(heading_error(0.98020107, 0.98020107), 0.0);
+}
 
 struct FrameCapture {
     name: String,
@@ -151,7 +163,14 @@ impl Live {
             if let Some(index) = capture.frame(self.p.live_attack_events) {
                 let path = self.shots.as_ref().expect("capture requires AOMAC_LIVE_SHOTS").join(format!("{}-{index:04}.png", capture.name));
                 self.o.png(&self.p, &list, &path).unwrap();
-                eprintln!("frame shot {} sim_offset={:.6}s events={:?}", path.display(), index as f32 * CAPTURE_DT, self.p.live_attack_events);
+                let camera = self.o.host.camera;
+                let own = self.p.zone.own();
+                eprintln!(
+                    "frame shot {} sim_offset={:.6}s events={:?} camera_eye=({:.6},{:.6},{:.6}) camera_yaw={:.6} camera_pitch={:.6} own_server_pos={:?} own_server_yaw={:?}",
+                    path.display(), index as f32 * CAPTURE_DT, self.p.live_attack_events,
+                    camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch,
+                    own.map(|d| d.pos), own.and_then(|d| d.yaw),
+                );
                 if let Some(id) = self.npc_probe {
                     match self.p.zone.world.npc_animation_probe(id) {
                         Some(probe) => eprintln!("npc frame={index:04} {probe}"),
@@ -819,6 +838,31 @@ fn live_walk() {
                     l.key(c, false);
                     l.tick();
                 }
+            }
+            "heading" => {
+                let target: f64 = v.parse().expect("heading requires server yaw in radians");
+                assert!(target.is_finite(), "heading must be finite");
+                let target = target.rem_euclid(std::f64::consts::TAU) as f32;
+                let prefs_xml = std::fs::read_to_string(l.p.dir.join("cd_image/gui/Default/CharPrefs.xml")).unwrap_or_default();
+                let sensitivity = super::super::controls::ControlPrefs::from_xml(&prefs_xml).mouse_turn_sensitivity;
+                assert!(sensitivity.is_finite() && sensitivity > 0.0, "heading requires positive finite mouse sensitivity");
+                let (x, y, button) = (640.0, 400.0, ao_gui::MouseButton::Right);
+                l.p.input(ao_gui::InputEvent::MouseDown { x, y, button }, &mut l.o.host);
+                for _ in 0..120 {
+                    l.tick();
+                    let yaw = l.p.zone.own().and_then(|own| own.yaw).expect("heading requires own server yaw");
+                    let error = heading_error(target, yaw);
+                    if error.abs() <= 1e-5 {
+                        break;
+                    }
+                    l.p.game_input(GameInput::MouseMotion { dx: error * 1000.0 / sensitivity, dy: 0.0 }, &mut l.o.host);
+                }
+                l.p.input(ao_gui::InputEvent::MouseUp { x, y, button }, &mut l.o.host);
+                l.tick();
+                let own = l.p.zone.own().expect("heading requires own avatar");
+                let yaw = own.yaw.expect("heading requires own server yaw");
+                eprintln!("after {step}: own_server_yaw={yaw:?} own_server_pos={:?}", own.pos);
+                assert!(heading_error(target, yaw).abs() <= 1e-4, "heading failed to converge: target={target:?} actual={yaw:?}");
             }
             // `drag=right:dx:dy` / `drag=left:dx:dy`: button down at the screen centre, `dx`/`dy` raw mouse counts spread over 8
             // frames (the cursor-captured `GameInput::MouseMotion` stream), button up (right: turn the character and pitch, left: orbit the camera)

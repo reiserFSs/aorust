@@ -604,22 +604,28 @@ impl Avatar {
         self.rig.height() * self.scale
     }
 
-    /// Height of the head attractor over the feet in the current pose, times the body scale: the camera look target
-    /// (`FUN_10020af1` N3, docs/zone/camera.md §3). `None` for models without a head attractor.
+    /// Scaled local head attractor (`N3 FUN_10020af1`), before the avatar heading.
+    pub fn head_local(&self) -> Option<Vec3> {
+        self.rig.head_attractor_composed(self.layers()).map(|p| Vec3::from(p) * self.scale)
+    }
+
+    /// Animated head height over the feet.
+    #[cfg(test)]
     pub fn head_height(&self) -> Option<f32> {
-        self.rig.head_attractor_composed(self.layers()).map(|p| p[1] * self.scale)
+        self.head_local().map(|p| p.y)
     }
 
     /// Scene position of the head attractor (`Attractor01_head`) in the current pose, the point `RefreshAlpha` measures the camera distance
     /// from (attractor translation x body scale, through the CAT frame's world matrix); the feet for a model without one (the identity
     /// attractor matrix `RefreshAlpha` starts from).
+    #[cfg(test)]
     pub fn head_position(&self) -> Vec3 {
         self.transform.transform_point3(self.rig.head_attractor_composed(self.layers()).map_or(Vec3::ZERO, Vec3::from))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use ao_net::{
         frame::Frame,
@@ -724,7 +730,7 @@ mod tests {
         assert_eq!(avatar.actions[0].layers, 2, "expiry does not reset the stored exclusion mask");
     }
 
-    fn own_update() -> SimpleCharFullUpdate {
+    pub(in crate::play) fn own_update() -> SimpleCharFullUpdate {
         let rec = include_str!("../../../../docs/captures/zone_newchar_ithaca.rec");
         rec.lines()
             .filter_map(|l| {

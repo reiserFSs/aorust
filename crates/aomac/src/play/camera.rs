@@ -85,15 +85,15 @@ const OCCLUSION_EPS: f32 = 0.001;
 /// The look target is never lower than this above the feet (`_DAT_1003e29c` clamp at the end of `FUN_10020bdb`, N3
 /// @0x10020bdb); it is also what a model without a head attractor gets (`FUN_10020af1` fails, the target stays at 0).
 pub const MIN_PIVOT_HEIGHT: f32 = 0.3;
-/// Per-frame blend of the look target height towards the animated head attractor (`FUN_10020bdb`): third person keeps 0.8 of
-/// the old value (`_DAT_1003d9c4`) and takes 0.2 (`_DAT_1003ce50`); first person takes 0.999 and keeps 0.0001.
+/// Per-call blend of the local target towards the animated head (`FUN_10020bdb`), with no delta-time normalization.
+/// Third person keeps 0.8 (`_DAT_1003d9c4`) and takes 0.2 (`_DAT_1003ce50`); first person keeps
+/// 0.000999987 (`_DAT_1003e2a8`) and takes 0.999 (`_DAT_1003e2a4`).
 const HEAD_BLEND_3RD: f32 = 0.2;
 const HEAD_BLEND_1ST: f32 = 0.999;
-/// `UseNoBobCamera` branch of `FUN_10020bdb`: the target only moves once it is `_DAT_1003e2b4` (0.01 m) off the head attractor; it starts following
-/// beyond `_DAT_1003e2b0` (0.25 m) and then keeps following (`DAT_1005c87c` latched) until it is within 0.01 m again, each frame
-/// `0.99 * old + 0.01 * new` (`_DAT_1003e2ac`, `_DAT_1003d618`).
-const NO_BOB_MIN: f32 = 0.01;
-const NO_BOB_START: f32 = 0.25;
+/// `FUN_10020bdb` calls squared vector norm `FUN_100013a9`: stop below 0.1 m, start above 0.5 m,
+/// retaining `DAT_1005c87c` between those thresholds. Cached local x/z do not animate, so only y differs.
+const NO_BOB_MIN_SQUARED: f32 = 0.010_000_001;
+const NO_BOB_START_SQUARED: f32 = 0.25;
 const NO_BOB_KEEP: f32 = 0.99;
 
 /// `Vehicle_t` steering of the camera dynel (Vehicle.dll `SteeringArrive` @0x1000ab28, integrator `FUN_1000e3d3`). Mass,
@@ -146,7 +146,7 @@ fn ao(v: Vec3) -> Vec3 {
     Vec3::new(v.x, v.y, -v.z)
 }
 
-/// The camera dynel as a steered vehicle (modes 1 and 2); mode 3 snaps it every frame.
+/// The camera dynel as a steered vehicle (modes 1 and 2); mode 3 snaps inward and blends outward radius.
 #[derive(Clone, Copy)]
 struct Vehicle {
     pos: Vec3,
@@ -337,6 +337,9 @@ pub struct Camera3p {
     mode: u8,
     /// Height of the look target over the feet now (blended towards `head`).
     pivot_height: f32,
+    /// First successful scaled local head sample; x/z remain fixed (`N3 FUN_10020af1`).
+    head_local: Vec3,
+    head_sampled: bool,
     /// Animated head attractor height the look target follows.
     head: f32,
     /// Camera heading relative to the avatar heading (0 = behind it), radians, +dx = looking right.
@@ -353,6 +356,7 @@ pub struct Camera3p {
     fp_yaw: f32,
     fp_pitch: f32,
     vehicle: Vehicle,
+    vehicle_placed: bool,
     views: Option<Views>,
     /// Shift+F8 was pressed; handled in the next frame (it needs the character's position).
     prev_view: bool,
@@ -370,15 +374,17 @@ impl Camera3p {
         self.prefs = ControlPrefs { third_person: self.prefs.third_person, preferred_camera_mode: self.prefs.preferred_camera_mode, ..prefs.clone() };
     }
 
-    /// `head_height`: height of the head attractor over the feet ([`MIN_PIVOT_HEIGHT`] without one).
-    pub fn new(prefs: &ControlPrefs, head_height: f32) -> Self {
+    /// Optional successful scaled head sample; `None` waits for the first live `set_head`.
+    pub fn new(prefs: &ControlPrefs, head_local: Option<Vec3>) -> Self {
         let elev = DEFAULT_DIRECTION[1].asin();
-        let head_height = head_height.max(MIN_PIVOT_HEIGHT);
+        let head_height = head_local.map_or(MIN_PIVOT_HEIGHT, |h| h.y.max(MIN_PIVOT_HEIGHT));
         Self {
             prefs: prefs.clone(),
             first_person: !prefs.third_person,
             mode: prefs.preferred_camera_mode.clamp(1, 3),
             pivot_height: head_height,
+            head_local: head_local.unwrap_or(Vec3::ZERO),
+            head_sampled: head_local.is_some(),
             head: head_height,
             yaw_off: 0.0,
             elev,
@@ -389,6 +395,7 @@ impl Camera3p {
             fp_yaw: 0.0,
             fp_pitch: 0.0,
             vehicle: Vehicle::default(),
+            vehicle_placed: false,
             views: None,
             prev_view: false,
             pivot: Vec3::ZERO,
@@ -397,9 +404,14 @@ impl Camera3p {
         }
     }
 
-    /// The animated head attractor height (feet-relative, body scale applied) the look target follows each frame.
-    pub fn set_head(&mut self, h: f32) {
-        self.head = h.max(MIN_PIVOT_HEIGHT);
+    /// Cache the first successful xyz sample, then follow animated y only (`N3 FUN_10020af1`).
+    pub fn set_head(&mut self, head_local: Vec3) {
+        if !self.head_sampled {
+            self.head_local = head_local;
+            self.pivot_height = head_local.y.max(MIN_PIVOT_HEIGHT);
+            self.head_sampled = true;
+        }
+        self.head = head_local.y.max(MIN_PIVOT_HEIGHT);
     }
 
     /// The playfield's scripted views (`n3Zone_t::GetCameraAttractorList`).
@@ -576,12 +588,13 @@ impl Camera3p {
         self.dist = self.dist.clamp(MIN_DISTANCE, MAX_DISTANCE);
     }
 
-    fn step_keys_and_zoom(&mut self, dt: f32) {
+    fn step_keys_and_zoom(&mut self, dt: f32) -> bool {
         let k = |c: CamKey| self.keys[c as usize];
         let turn = KEY_ROTATE * self.prefs.mouse_turn_sensitivity * dt * 60.0;
         let dx = if k(CamKey::RotateLeft) { turn } else { 0.0 } - if k(CamKey::RotateRight) { turn } else { 0.0 };
         let dy = if k(CamKey::RotateDown) { turn } else { 0.0 } - if k(CamKey::RotateUp) { turn } else { 0.0 };
         let zoom = (if k(CamKey::ZoomIn) { 1.0 } else { 0.0 } - if k(CamKey::ZoomOut) { 1.0 } else { 0.0 }) * dt * self.prefs.zoom_speed;
+        let distance_change = !self.first_person && (zoom != 0.0 || self.pending_zoom != 0.0);
         if dx != 0.0 || dy != 0.0 {
             self.rotate(dx, dy);
         }
@@ -597,24 +610,24 @@ impl Camera3p {
             }
             self.zoom_in_by(step);
         }
+        distance_change
     }
 
-    /// `FUN_10020bdb`: the look target height follows the animated head attractor, blended per frame (60 Hz equivalent).
-    fn follow_head(&mut self, dt: f32) {
+    /// `FUN_10020bdb`: blend once per call, independent of frame time.
+    fn follow_head(&mut self) {
         if self.prefs.no_bob_camera {
-            let d = (self.head - self.pivot_height).abs();
-            if d < NO_BOB_MIN {
+            let gap = self.head - self.pivot_height;
+            let squared_gap = gap * gap;
+            if squared_gap < NO_BOB_MIN_SQUARED {
                 self.no_bob_following = false;
-            } else if self.no_bob_following || d > NO_BOB_START {
+            } else if self.no_bob_following || squared_gap > NO_BOB_START_SQUARED {
                 self.no_bob_following = true;
-                let a = 1.0 - NO_BOB_KEEP.powf(dt * 60.0);
-                self.pivot_height = (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
+                self.pivot_height = (NO_BOB_KEEP * self.pivot_height + 0.01 * self.head).max(MIN_PIVOT_HEIGHT);
             }
             return;
         }
-        let keep = if self.first_person { 1.0 - HEAD_BLEND_1ST } else { 1.0 - HEAD_BLEND_3RD };
-        let a = 1.0 - keep.powf(dt * 60.0);
-        self.pivot_height = (self.pivot_height + (self.head - self.pivot_height) * a).max(MIN_PIVOT_HEIGHT);
+        let (keep, take) = if self.first_person { (0.000_999_987, HEAD_BLEND_1ST) } else { (0.8, HEAD_BLEND_3RD) };
+        self.pivot_height = (keep * self.pivot_height + take * self.head).max(MIN_PIVOT_HEIGHT);
     }
 
 
@@ -622,10 +635,11 @@ impl Camera3p {
     /// between rooms and the ground under a point (scene frame).
     pub fn update_with(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32, sight: &Sight) -> Camera {
         let clear = sight.clear;
-        self.step_keys_and_zoom(dt);
-        self.follow_head(dt);
+        let distance_change = self.step_keys_and_zoom(dt);
+        self.follow_head();
         let feet = Vec3::from(avatar_pos);
-        let pivot = feet + Vec3::Y * self.pivot_height;
+        let local = Vec3::new(self.head_local.x, self.pivot_height, self.head_local.z);
+        let pivot = feet + glam::Quat::from_rotation_y(super::zone::scene_yaw(avatar_yaw)) * local;
         self.pivot = pivot;
         if self.first_person {
             return Camera { pos: pivot, yaw: avatar_yaw + self.fp_yaw, pitch: -self.fp_pitch, roll: 0.0 };
@@ -643,6 +657,13 @@ impl Camera3p {
         let dir = -fwd * self.elev.cos() + Vec3::Y * self.elev.sin();
         let want = pivot + dir * self.dist;
         let optimal = occlude(pivot, want, dir, clear);
+        if self.mode == 3 && distance_change {
+            // `FUN_10022345` (between labels 0x100226bd and 0x100227e9): zoom places the wanted eye
+            // (`SetRelPos`, `Update`, `ForcedUpdate`) before `DecideSnap`.
+            // Key zoom `FUN_1002118c` likewise calls `SetRelPos` before `UpdateHeadingToPos`.
+            // Occlusion still snaps inward below; only passive radial return blends.
+            self.vehicle.snap(want);
+        }
         if self.mode != 3 && self.vehicle.pos.x == 0.0 && self.vehicle.pos.z == 0.0 {
             // `FUN_10022345`: a vehicle that was never placed starts at the camera's own spot and takes its distance
             // (`SetRelPosIgnoreCollision`, `Update`, `ForcedUpdate(0)`)
@@ -650,10 +671,22 @@ impl Camera3p {
             self.vehicle.dist = (pivot - optimal).length();
         }
         let eye = match self.mode {
-            // CameraVehicleFixedThird_t(rigid): `DecideSnap` places the camera on the optimal position every frame
+            // `DecideSnap` @N3 0x1001f537: inward immediate, outward 0.9 old + 0.1 candidate radius.
             3 => {
-                self.vehicle.snap(optimal);
-                optimal
+                let offset = optimal - pivot;
+                let radius = offset.length();
+                let current = (self.vehicle.pos - pivot).length();
+                // Preserve the existing initial placement until retail initialization is resolved:
+                // never blend an unplaced Vec3::ZERO eye across the world.
+                let eye = if self.vehicle_placed && radius > current {
+                    // Candidate direction, not current direction; no angular smoothing or dt normalization.
+                    // `_DAT_1003d3a8` / `_DAT_1003c890` are the f32 values 0.9 / 0.1 per call.
+                    pivot + offset / radius * (current * 0.9 + radius * 0.1)
+                } else {
+                    optimal
+                };
+                self.vehicle.snap(eye);
+                eye
             }
             // CameraVehicleFixedThird_t(damped): `SteeringCamArrive(optimal, 0.01)`
             2 => {
@@ -683,6 +716,7 @@ impl Camera3p {
                 self.vehicle.pos
             }
         };
+        self.vehicle_placed = true;
         Camera::look_at(eye, pivot)
     }
 }
@@ -716,11 +750,62 @@ mod tests {
     use super::*;
 
     fn cam() -> Camera3p {
-        Camera3p::new(&ControlPrefs::default(), 1.5)
+        Camera3p::new(&ControlPrefs::default(), Some(Vec3::Y * 1.5))
+    }
+
+    #[test]
+    fn zoom_out_places_requested_radius_before_radial_return() {
+        for wheel in [true, false] {
+            let mut c = cam();
+            c.update([0.0; 3], 0.0, 1.0 / 60.0);
+            if wheel {
+                c.apply(&CamCmd::Zoom(-1.0));
+            } else {
+                c.apply(&CamCmd::Key { key: CamKey::ZoomOut, down: true });
+            }
+            let eye = c.update([0.0; 3], 0.0, 1.0 / 60.0);
+            let requested = if wheel { 5.1 } else { 5.0 + 20.0 / 60.0 };
+            assert!(((eye.pos - c.pivot).length() - requested).abs() < 1e-5);
+            assert!((c.dist - requested).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn missing_initial_head_waits_for_successful_sample_in_both_views() {
+        for third_person in [true, false] {
+            let mut c = Camera3p::new(&ControlPrefs { third_person, ..Default::default() }, None);
+            c.update([0.0; 3], 0.0, 1.0 / 60.0);
+            assert!(!c.head_sampled);
+            assert!(near(c.pivot.y, MIN_PIVOT_HEIGHT));
+            c.set_head(Vec3::new(0.4, 1.8, -0.2));
+            c.update([0.0; 3], 0.0, 1.0 / 60.0);
+            assert!((c.pivot - Vec3::new(0.4, 1.8, -0.2)).length() < 1e-5);
+            c.set_head(Vec3::new(8.0, 1.8, 9.0));
+            c.update([0.0; 3], 0.0, 1.0 / 60.0);
+            assert!((c.pivot - Vec3::new(0.4, 1.8, -0.2)).length() < 1e-5);
+        }
     }
 
     fn near(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
+    }
+
+    #[test]
+    fn fixed_third_snaps_inward_and_blends_only_outward_radius_per_call() {
+        let feet = [1200.0, 50.0, -900.0];
+        let pivot = Vec3::from(feet) + Vec3::Y * 1.5;
+        let mut c = cam();
+        let initial = c.update(feet, 0.0, 0.016);
+        assert!(near((initial.pos - pivot).length(), 5.0), "initial eye is not blended from world zero");
+        c.dist = 2.0;
+        let inward = c.update(feet, 0.0, 0.016);
+        assert!(near((inward.pos - pivot).length(), 2.0));
+        c.dist = 5.0;
+        let outward = c.update(feet, FRAC_PI_2, 0.001);
+        let direction = Vec3::new(-c.elev.cos(), c.elev.sin(), 0.0);
+        assert!((outward.pos - (pivot + direction * 2.3)).length() < 1e-3, "new direction applies immediately");
+        let next = c.update(feet, FRAC_PI_2, 0.2);
+        assert!(near((next.pos - pivot).length(), 2.3 * 0.9 + 5.0 * 0.1), "blend is per call, not per second");
     }
 
     #[test]
@@ -843,7 +928,7 @@ mod tests {
 
     #[test]
     fn zoom_to_first_person_pref_off_clamps_instead() {
-        let mut c = Camera3p::new(&ControlPrefs { zoom_to_1st_person: false, ..Default::default() }, 1.5);
+        let mut c = Camera3p::new(&ControlPrefs { zoom_to_1st_person: false, ..Default::default() }, Some(Vec3::Y * 1.5));
         c.apply(&CamCmd::Key { key: CamKey::ZoomIn, down: true });
         for _ in 0..120 {
             c.update([0.0; 3], 0.0, 0.016);
@@ -853,7 +938,7 @@ mod tests {
 
     #[test]
     fn first_person_look_and_heading_sync() {
-        let mut c = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, 1.5);
+        let mut c = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, Some(Vec3::Y * 1.5));
         assert!(c.is_first_person());
         c.apply(&CamCmd::Orbit { dx: 0.4, dy: 5.0 });
         let v = c.update([0.0; 3], 0.0, 0.016);
@@ -871,7 +956,7 @@ mod tests {
         let e = c.orbit().1;
         c.apply(&CamCmd::Pitch { dy: 0.2 });
         assert!(near(c.orbit().1, e + 0.2));
-        let mut c = Camera3p::new(&ControlPrefs { rmb_mouse_look_3rd: false, ..Default::default() }, 1.5);
+        let mut c = Camera3p::new(&ControlPrefs { rmb_mouse_look_3rd: false, ..Default::default() }, Some(Vec3::Y * 1.5));
         c.apply(&CamCmd::Pitch { dy: 0.2 });
         assert!(near(c.orbit().1, DEFAULT_DIRECTION[1].asin()));
     }
@@ -892,9 +977,11 @@ mod tests {
         let v = c.update_with([0.0, 0.0, -3.0], 0.0, 0.016, &Sight::with_clear(&wall));
         assert!(v.pos.z <= -1.0 - COLLISION_RADIUS * 0.948 + 0.01, "{}", v.pos.z);
         assert!(v.pos.z > -3.0 + 1.5, "still pulled out of the avatar: {}", v.pos.z);
-        // an unobstructed view keeps the full distance
+        // An unobstructed view returns outward by 10% of the remaining radius per call.
+        let pivot = Vec3::new(0.0, 1.5, -3.0);
+        let old = (v.pos - pivot).length();
         let v = c.update_with([0.0, 0.0, -3.0], 0.0, 0.016, &Sight::OPEN);
-        assert!(near((v.pos - Vec3::new(0.0, 1.5, -3.0)).length(), 5.0));
+        assert!(near((v.pos - pivot).length(), old * 0.9 + 5.0 * 0.1));
     }
 
     #[test]
@@ -916,9 +1003,9 @@ mod tests {
     #[test]
     fn the_look_target_follows_the_head_attractor_with_a_blend() {
         let mut c = cam();
-        c.set_head(1.7);
+        c.set_head(Vec3::Y * (1.7));
         let v = c.update([0.0; 3], 0.0, 1.0 / 60.0);
-        // one 60 Hz frame of 0.2: 1.5 -> 1.54
+        // One call takes 0.2: 1.5 -> 1.54.
         assert!(near(Camera::look_at(v.pos, Vec3::ZERO).pos.y, v.pos.y));
         assert!(near(c.pivot_height, 1.5 + 0.2 * 0.2));
         for _ in 0..120 {
@@ -926,37 +1013,87 @@ mod tests {
         }
         assert!(near(c.pivot_height, 1.7));
         // first person tracks (almost) at once
-        let mut f = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, 1.5);
-        f.set_head(1.7);
-        assert!(near(f.update([0.0; 3], 0.0, 1.0 / 60.0).pos.y, 1.7));
+        let mut f = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, Some(Vec3::Y * 1.5));
+        f.set_head(Vec3::Y * (1.7));
+        assert!(near(f.update([0.0; 3], 0.0, 1.0 / 60.0).pos.y, 0.000_999_987 * 1.5 + 0.999 * 1.7));
         // never below 0.3 m
-        c.set_head(0.0);
+        c.set_head(Vec3::Y * (0.0));
         assert!(near(c.head, MIN_PIVOT_HEIGHT));
     }
 
-    /// `UseNoBobCamera` (`FUN_10020bdb`): head bobbing under 0.25 m is ignored, a bigger move is followed 1 % per frame until within 0.01 m.
+    /// `UseNoBobCamera`: motion under 0.5 m does not start following; the latch stops below 0.1 m.
     #[test]
     fn no_bob_camera_ignores_small_head_motion() {
-        let mut c = Camera3p::new(&ControlPrefs { no_bob_camera: true, ..Default::default() }, 1.5);
+        let mut c = Camera3p::new(&ControlPrefs { no_bob_camera: true, ..Default::default() }, Some(Vec3::Y * 1.5));
         for i in 0..120 {
-            c.set_head(1.5 + if i % 2 == 0 { 0.015 } else { -0.015 });
+            c.set_head(Vec3::Y * (1.5 + if i % 2 == 0 { 0.015 } else { -0.015 }));
             c.update([0.0; 3], 0.0, 1.0 / 60.0);
         }
         assert!(near(c.pivot_height, 1.5), "bobbing ignored: {}", c.pivot_height);
-        // a crouch of 0.5 m: starts following (0.99 * old + 0.01 * new per frame) ...
-        c.set_head(1.0);
+        // A crouch of 0.6 m starts following (0.99 * old + 0.01 * new per call).
+        c.set_head(Vec3::Y * 0.9);
         c.update([0.0; 3], 0.0, 1.0 / 60.0);
-        assert!(near(c.pivot_height, 1.5 - 0.005), "{}", c.pivot_height);
-        // ... and keeps following until it is within 0.01 m
+        assert!(near(c.pivot_height, 1.5 - 0.006), "{}", c.pivot_height);
+        // ... and keeps following until it is within 0.1 m.
         for _ in 0..1000 {
             c.update([0.0; 3], 0.0, 1.0 / 60.0);
         }
-        assert!((c.pivot_height - 1.0).abs() < 0.0101 && !c.no_bob_following, "{}", c.pivot_height);
+        assert!((c.pivot_height - 0.9).abs() < 0.1 && !c.no_bob_following, "{}", c.pivot_height);
         // the default camera follows at once
         let mut d = cam();
-        d.set_head(1.515);
+        d.set_head(Vec3::Y * (1.515));
         d.update([0.0; 3], 0.0, 1.0 / 60.0);
         assert!(d.pivot_height > 1.5 && !near(d.pivot_height, 1.5));
+    }
+
+    #[test]
+    fn no_bob_uses_squared_local_gap_and_strict_thresholds() {
+        for (gap, latched, follows) in [(0.05, true, false), (0.2, false, false), (0.2, true, true), (0.6, false, true)] {
+            let mut c = Camera3p::new(&ControlPrefs { no_bob_camera: true, ..Default::default() }, Some(Vec3::Y * 1.5));
+            c.no_bob_following = latched;
+            c.set_head(Vec3::new(100.0, 1.5 + gap, -100.0));
+            c.follow_head();
+            assert_eq!(c.no_bob_following, follows, "gap {gap}, initially latched {latched}");
+            assert!(near(c.pivot_height, if follows { 0.99 * 1.5 + 0.01 * (1.5 + gap) } else { 1.5 }));
+        }
+        // Exact f32 0.1 squared equals the retail lower threshold: equality must retain the latch.
+        let mut c = Camera3p::new(&ControlPrefs { no_bob_camera: true, ..Default::default() }, Some(Vec3::Y * 1.5));
+        c.pivot_height = 0.0;
+        c.head = 0.1;
+        c.no_bob_following = true;
+        assert_eq!(c.head * c.head, NO_BOB_MIN_SQUARED);
+        c.follow_head();
+        assert!(c.no_bob_following);
+        // Equality at the upper threshold does not start following.
+        c.pivot_height = 1.0;
+        c.head = 1.5;
+        c.no_bob_following = false;
+        c.follow_head();
+        assert!(!c.no_bob_following);
+        assert_eq!(c.pivot_height, 1.0);
+    }
+
+    #[test]
+    fn head_blends_are_per_call_not_delta_time_normalized() {
+        for prefs in [
+            ControlPrefs::default(),
+            ControlPrefs { third_person: false, ..Default::default() },
+            ControlPrefs { no_bob_camera: true, ..Default::default() },
+        ] {
+            let mut reference = None;
+            for dt in [0.0, 1.0 / 120.0, 1.0 / 60.0, 0.5] {
+                let mut c = Camera3p::new(&prefs, Some(Vec3::Y * 1.5));
+                c.set_head(Vec3::Y * 2.1);
+                for _ in 0..3 {
+                    c.update([0.0; 3], 0.0, dt);
+                }
+                if let Some(height) = reference {
+                    assert_eq!(c.pivot_height, height);
+                } else {
+                    reference = Some(c.pivot_height);
+                }
+            }
+        }
     }
 
     #[test]
@@ -977,13 +1114,25 @@ mod tests {
             assert_eq!(c.mode(), want);
         }
         // first person: only the attractor is dropped
-        let mut f = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, 1.5);
+        let mut f = Camera3p::new(&ControlPrefs { third_person: false, ..Default::default() }, Some(Vec3::Y * 1.5));
         f.apply(&CamCmd::NextView);
         assert_eq!(f.mode(), 3);
         // the pref picks the start mode, 0 maps to 1
         assert_eq!(ControlPrefs::from_xml(r#"<Value name="PreferredCameraMode" value="1"/>"#).preferred_camera_mode, 1);
         assert_eq!(ControlPrefs::from_xml(r#"<Value name="PreferredCameraMode" value="0"/>"#).preferred_camera_mode, 1);
-        assert_eq!(Camera3p::new(&ControlPrefs { preferred_camera_mode: 2, ..Default::default() }, 1.5).mode(), 2);
+        assert_eq!(Camera3p::new(&ControlPrefs { preferred_camera_mode: 2, ..Default::default() }, Some(Vec3::Y * 1.5)).mode(), 2);
+    }
+
+    #[test]
+    fn initial_head_offset_rotates_but_animation_only_changes_height() {
+        let feet = [10.0, 20.0, 30.0];
+        let mut c = Camera3p::new(&ControlPrefs::default(), Some(Vec3::new(0.4, 1.5, -0.2)));
+        c.update(feet, 0.0, 1.0 / 60.0);
+        assert!((c.pivot - Vec3::new(10.4, 21.5, 29.8)).length() < 1e-4);
+        c.set_head(Vec3::new(8.0, 1.7, 9.0));
+        c.update(feet, std::f32::consts::FRAC_PI_2, 1.0 / 60.0);
+        // Scene rotation is -server heading: (x, z) -> (-z, x).
+        assert!((c.pivot - Vec3::new(10.2, 21.54, 30.4)).length() < 1e-4);
     }
 
     #[test]

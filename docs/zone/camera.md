@@ -95,17 +95,41 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
   **Height [RE, resolved].** `FUN_10020af1` takes the translation of `VisualCATMesh_t::GetAttractorMatrix("Attractor31_camera")`, else of
   `Attractor01_head`, of the *animated* skeleton and multiplies it by `GetBodyScale`; `FUN_10020bdb` (every frame, also
   `UpdateTargetEye` [N3 0x10021187]) then blends the stored height towards it: third person keeps 0.8 of the old value and takes 0.2
-  (`_DAT_1003d9c4`, `_DAT_1003ce50`), first person takes 0.999 (`_DAT_1003e2a4`; the camera is on the head and bobs with it). Horizontal x/z come from the
-  first sample (`+0x234/+0x23c`) and are not followed [INFERENCE: ≈0, not measured: `Camera3p` uses the height only]. The result is
-  clamped to ≥ 0.3 m (`_DAT_1003e29c`); a model without either attractor leaves the target at the feet + 0.3.
-  Implemented: `ActorRig::head_attractor(clip)` (cat-frame translation of `Attractor01_head` in the playing clip) →
-  `Avatar::head_height()` (× body scale) → `Camera3p::set_head`, blended by `follow_head`. Solitus male (rdb 5900 family): **1.793 m idle**
-  (body 1.871 m), bobbing ±1.5 cm while running; the old stand-in `DEFAULT_PIVOT_HEIGHT` 1.5 m is gone.
-  **`UseNoBobCamera`** (Login pref, `n3Camera_t+0x1e0` set by the changed callback `FUN_100219d5` [N3 0x100219d5]; ported, `ControlPrefs::no_bob_camera`, `Camera3p::follow_head`, test `no_bob_camera_ignores_small_head_motion`): `FUN_10020bdb` then moves the target only when it is ≥ 0.01 m (`_DAT_1003e2b4`) off the head attractor: it starts following when the gap exceeds 0.25 m (`_DAT_1003e2b0`), latches (`DAT_1005c87c`) and each frame takes `0.99 · old + 0.01 · new` (`_DAT_1003e2ac`, `_DAT_1003d618`) until within 0.01 m again; the 0.3 m floor still applies. The x/z of the target are the first sample's (the gap is vertical only). Frame-rate normalised like the default blend.
+  (`_DAT_1003d9c4`, `_DAT_1003ce50`), first person keeps 0.000999987 (`_DAT_1003e2a8`) and takes 0.999
+  (`_DAT_1003e2a4`; the camera is on the head and bobs with it). These are per-call weights, without delta-time normalization. Horizontal x/z come from the
+  first successful scaled xyz sample (`+0x234/+0x238/+0x23c`) and are not followed thereafter [RE, `FUN_10020af1`].
+  The height is clamped to ≥ 0.3 m (`_DAT_1003e29c`); a model without either attractor leaves the target at the feet + 0.3.
+  `CameraVehicleFixedThird_t::SetEyeTargetLocalPos` [N3 0x1001f085] stores all three local coordinates.
+  `GetLookTargetPos` [N3 0x1001d890] returns target position (`+0x160`) plus the local eye target (`+0x180`)
+  rotated by target rotation (`+0x16c`); thus cached x/z rotate with the avatar, not the animated head.
+  Implemented: `ActorRig::head_attractor_composed` → `Avatar::head_local()` (× body scale) →
+  `Camera3p::new(prefs, None)` in Player initialization, then the first successful `set_head` caches xyz and seeds height.
+  This sample is taken in `Player::frame` after stance/animation update, not from `Avatar::new`'s default pose;
+  missing attractors retain the 0.3 m fallback without preventing a later successful sample. Later samples follow y only.
+  The pivot rotates cached x/z by `scene_yaw(server_heading)`. Player shares the one composed sample per frame with
+  the animated world head used for opacity; opacity still follows all animated coordinates.
+  Solitus male (rdb 5900 family): **1.793 m idle** (body 1.871 m), bobbing ±1.5 cm while running.
+  **`UseNoBobCamera`** (Login pref, `n3Camera_t+0x1e0` set by the changed callback `FUN_100219d5` [N3 0x100219d5]; ported, `ControlPrefs::no_bob_camera`, `Camera3p::follow_head`): `FUN_10020bdb` calls `FUN_100013a9`, the **squared** vector norm, on the local target gap. `_DAT_1003e2b4` = f32 0.010000001 and `_DAT_1003e2b0` = 0.25 are squared-distance thresholds: following starts only above **0.5 m**, latches (`DAT_1005c87c`), and stops only below **0.1 m**. At either equality the latch is retained. Each call takes `0.99 · old + 0.01 · new` (`_DAT_1003e2ac`, `_DAT_1003d618`), with no delta-time normalization; the 0.3 m floor still applies. Cached local x/z are unchanged, so only animated y contributes to the gap. Evidence: N3 0x10020bdb and 0x100013a9. Regressions cover 0.05/0.2/0.6 m gaps, strict threshold equality, and all three blends' per-call delta-time independence (`no_bob_uses_squared_local_gap_and_strict_thresholds`, `head_blends_are_per_call_not_delta_time_normalized`); exercised in the camera test run below.
 * **Position**: `target + direction · distance` with `direction` in the avatar frame (`RecalcOptimalPos` [N3 0x1001f371]); defaults
-  `(0, 0.316, −0.948)` × 5.0 m: 5 m behind and 1.58 m above the target, elevation 18.4°. The camera looks at the target, is rigid
-  (`SetRelPosRot` in `DecideSnap` [N3 0x1001f537], flag `+0x214`) and follows the avatar heading because the offset is avatar-relative.
-  **[INFERENCE]** the ctor flag `+0x214` is true for the player (rigid snap). **[RE, resolved]** `FUN_10020290` [N3 0x10020290] builds the vehicle from `PreferredCameraMode`: 0 first person, 1 plain `CameraVehicle_t` (`FUN_1001f9c9`), 2 `CameraVehicleFixedThird_t(false)` (damped: `CalcSteering` = `SteeringCamArrive(optimal pos, 0.01)`), 3 `CameraVehicleFixedThird_t(true)` (rigid `DecideSnap`, default). Modes 1/2 are §7.
+  `(0, 0.316, −0.948)` × 5.0 m: 5 m behind and 1.58 m above the target, elevation 18.4°. The camera looks at the target
+  and follows the avatar heading because the offset is avatar-relative.
+  **[RE, resolved]** `FUN_10020290` [N3 0x10020290] builds the vehicle from `PreferredCameraMode`: 0 first person, 1 plain `CameraVehicle_t` (`FUN_1001f9c9`), 2 `CameraVehicleFixedThird_t(false)` (damped: `CalcSteering` = `SteeringCamArrive(optimal pos, 0.01)`), 3 `CameraVehicleFixedThird_t(true)` (default). Modes 1/2 are §7.
+  **Radial return [RE, resolved, fresh decompile 2026-10-07]:** `DecideSnap` [N3 0x1001f537] measures the current eye's radius
+  from the look target (`+0x58`), selects the occluded candidate (`+0x208`) or, when zero, the unobstructed optimal (`+0x1ec`).
+  With `+0x214` true (mode 3), it normalizes **candidate − look target** using `FUN_1001f846` [N3 0x1001f846], retaining its radius.
+  An equal or smaller candidate radius places the eye immediately at the candidate; a larger radius places it at
+  `look target + normalized(candidate − look target) × (0.9 × current radius + 0.1 × candidate radius)`.
+  The constants are `_DAT_1003d3a8` = 0.8999999761581421 and `_DAT_1003c890` = 0.10000000149011612 (f32 0.9 and 0.1).
+  `SetRelPosRot` preserves the vehicle's body rotation. There is **no angular interpolation and no time normalization**:
+  the blend runs once per `DecideSnap` call and uses no delta time. With `+0x214` false (mode 2), this function does not place the eye.
+  **Initialization [remaining mismatch]:** the trace of `FUN_10022345` [N3 0x10022345] shows that all third-person vehicles with
+  zero x/z receive their first placement from the optimal position (`+0x1ec`). The port's explicit placed flag instead retains
+  immediate first placement at the collision candidate; it avoids blending from world zero, but is not full retail initialization equivalence.
+  **Idle update phase [remaining mismatch]:** `FUN_10022345` calls `FUN_1002118c` before the head blend;
+  `UpdateHeadingToPos(false)` reconstructs the stored optimal offset without unit normalization. After the head setter,
+  `CalcSteering` [N3 0x1001f752] recalculates the next optimal position. In clear stationary idle this telescopes to
+  the same head-follow trajectory with a one-call delay; the port currently applies the new head sample before its
+  placement query. No accumulating-feedback cause was established by this trace; geometry-edge phase equivalence remains unverified.
 * **Occlusion** (`RecalcOptimalPos`): `LineOfSight(target, wanted + dir·radius)`; if blocked, bisect the fraction in `[0.01, 0.95]`
   (`_DAT_1003d618`, `_DAT_1003e228`) up to 20 times until the bracket is ≤ 0.001 (`_DAT_1003e220`); the camera sits at the last **tested midpoint**
   (`+0x208` written before each test, fresh decompile 2026-10-06), not the last-clear lower bound. The camera dynel has a collision sphere of radius 0.35 (`_DAT_1003ce4c` in `CreateCamera`) → `COLLISION_RADIUS`, the margin
@@ -120,21 +144,77 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
   Its `RoomCanSeeFromTo` gate [0x1000d265] requires both endpoints inside rooms in dungeons and an open connecting door if the rooms
   differ; the shared integration query now applies that gate too. Outdoors there is no room gate.
   `turning_camera_pulls_in_at_a_sloping_rock_face` uses an overhanging triangle, turns through three headings,
-  checks the radius-extended boom is clear within the original `0.001 * wanted distance` bisection tolerance, and checks full distance
-  is restored after turning away. `occlusion_keeps_the_original_final_midpoint` distinguishes the original midpoint from a last-clear
-  clamp. Added, **not run** by this worker.
-  Offline frame route (no credentials/window): set `AOMAC_CAMERA_ROCK_POS=x,y,z` to a **measured server-coordinate** position beside
-  an ICC rock and `AOMAC_CAMERA_ROCK_SHOTS=/tmp/icc-rock`, then run
-  `cargo test --release -p aomac icc_rock_camera_turn_frames -- --ignored --nocapture`.
-  It loads pf 4582's real terrain/KD collision, runs the production third-person camera through 36 headings, checks every radius-extended
-  boom is clear within the original bisection tolerance and at least one heading pulls in, and writes `icc-rock-00.png` … `icc-rock-35.png`. Frames use static scene geometry
-  (no own-avatar model); head pivot is explicitly 1.5 m. **Not exercised here; no proven ICC rock coordinate exists in current captures/docs.**
+  checks the radius-extended boom is clear within the original `0.001 * wanted distance` bisection tolerance, and checks return
+  towards full distance after turning away using the per-call 0.9/0.1 radial blend, not an immediate jump to 5 m.
+  `occlusion_keeps_the_original_final_midpoint` distinguishes the original midpoint from a last-clear clamp.
+  The camera test run completed with **50 passed, 1 ignored**.
+
+  **Exact ICC idle reproduction (2026-10-07, offscreen):** pf 4582, server position
+  `[930.0051, 24.21451, 759.66864]`, server yaw `0.98020107` radians; own position/yaw stayed unchanged.
+  The initially rounded position `[930.01, 24.21, 759.67]` and yaw `0.98` mask this collision-edge case.
+  Before the fixes, 120 `live_walk` idle frames logged these scene-coordinate eyes:
+
+  | frame | eye x, y, z |
+  |---|---|
+  | 48 | 926.064880, 27.586578, −757.027039 |
+  | 49 | 927.242126, 27.114624, −757.816284 |
+  | 50 | 927.878723, 26.859455, −758.243042 |
+  | 101 | 927.415710, 27.045013, −757.932678 |
+  | 102 | 926.064880, 27.586651, −757.027039 |
+
+  The stationary avatar therefore had a recurring camera pull-in/return, changing the foreground rock/tree composition.
+  After caching the first scaled head x/z and rotating them by server heading, restoring outward radius with 0.9/0.1,
+  and correcting per-call head blends and squared NoBob thresholds, the offline real-animated route
+  (1800 warmup calls plus 120 measured calls at 60 Hz) had **all full and final booms clear** and radius
+  **4.999860 … 4.999913 m**. Frame 50 eye was `[926.0184, 27.587215, −756.977]`; frame 102 was
+  `[926.0183, 27.585472, −756.977]`. Inspected static-geometry frames 50/102 showed the same foreground rock/tree,
+  with no composition jump; the harness animates the head but does not draw the own-avatar model.
+
+  Reproduce without credentials or a window:
+
+  ```sh
+  AOMAC_CAMERA_ROCK_POS=930.0051,24.21451,759.66864 \
+  AOMAC_CAMERA_ROCK_IDLE_YAW=0.98020107 \
+  AOMAC_CAMERA_ROCK_ANIMATED=1 \
+  AOMAC_CAMERA_ROCK_SHOTS=/tmp/icc-rock \
+  cargo test --release -p aomac icc_rock_camera_turn_frames -- --ignored --nocapture
+  ```
+
+  `AOMAC_CAMERA_ROCK_IDLE_YAW` selects 120 fixed-heading frames instead of the default 36-heading turn route;
+  `AOMAC_CAMERA_ROCK_ANIMATED=1` selects the captured player's native idle animation instead of the static 1.5 m head.
+  Idle screenshots are written for frames 0, 50, 102 and 119. The regular regression
+  `icc_beach_animated_idle_camera_is_stable` asserts radius `5 ± 1e-3 m`, maximum eye delta `< 1e-3 m`,
+  and full-boom clearance using real pf 4582 collision and the animated player head across all 1920 calls,
+  including the 1800-call warmup; the final 120 calls are logged.
+
+  **Native idle verification (2026-10-07):** captured 120 muted, app-window-only stills from the owned client
+  (PID 71677), with no input during the sequence. All five contact sheets covering frames 0–119 and
+  full-size frames 50/102 were inspected: the foreground trunk, crates and Brandon remained in the same
+  composition, with no camera jump. The position matched the live logs, but a preceding test had changed heading;
+  an inverse A hold of 1.5 s restored approximately the original heading, without an exact yaw log.
+  This is a real-window wall-clock screenshot sequence, **not** the exact-yaw fixed-60-Hz regression above.
+  Proper camp reached login, the client exited with status 0, and the live lock was released.
+  The live harness additionally accepts `heading=<server_yaw>` to restore heading through production right-drag input
+  before a no-input capture, and logs full-precision own pose and camera eye on each captured frame.
+  The new heading step was unit-tested, but no new live authentication was attempted after the wrap instruction.
+  Final isolated-worktree gates on rebased `origin/main`: `cargo test --release --workspace` passed
+  **1418 tests** (19 ignored); `cargo clippy --release --workspace --all-targets -- -D warnings` passed.
 * **Zoom**: wheel (`n3Camera_t::` handler [N3 0x100200ef]): `pending += ZoomSpeed/10 · notches` (a notch is `raw/120` [GUI 0x1001ae14]); a
   notch against the pending direction first clears it. Per frame (`FUN_10022345` [N3 0x10022345]): `|pending| ≥ 1` → step = `dt · pending · 3`,
   else `dt · 3` signed; distance −= step, pending −= step; pending is dropped when its sign flips or it is below 0.3 m. Distance clamps to
   **0.78 … 25 m** (`_DAT_1003e48c`, `_DAT_1003e488`). Zooming in at < 0.8 m (`_DAT_1003e038`/`_DAT_1003e2f8`) with `ZoomTo1stPerson` sets
   `3rdPersonCamera = 0` (first person); a wheel notch outwards in first person sets it to 1 (third person again, at the previous offset).
+  **Zoom placement order [RE]:** mode-3 pending zoom uses the unobstructed optimal offset (`vehicle +0x1ec`) to compute
+  its new radius, calls `Vehicle_t::SetRelPos` between labels N3 0x100226bd and 0x100227e9, then `Update` and `ForcedUpdate(0)` before the later
+  `DecideSnap`. Active zoom therefore places the requested radius immediately in a clear scene; the 0.9/0.1 outward
+  blend is passive collision return, not extra wheel/key zoom damping. `zoom_out_places_requested_radius_before_radial_return`
+  distinguishes the requested wheel/key radius from a tenth-sized outward step. The port retains its existing boom
+  occlusion query after zoom placement; retail `SetRelPos`'s separate vehicle collision response is not modeled here.
   Numpad +/− (`StartZoomIn` 0x100 / `StartZoomOut` 0x80 flags): `±dt · ZoomSpeed` m per frame-time through `FUN_1002118c` [N3 0x1002118c].
+  Fresh decompile of `FUN_1002118c` confirms key zoom also calls `SetRelPos` before mode-3 `UpdateHeadingToPos`
+  and `ForcedUpdate(0)` (the latter conditional), so unobstructed key zoom is not damped by radial return either.
+  Its additional collision-response rejection and choice of current offset for outward zoom when already pulled in
+  remain outside the port's shared boom-query model; the regression above covers the clear-scene placement order.
 * **Orbit** (`FUN_1002118c`): the camera offset is rotated about the vertical by `dx` and about the camera's right axis by `dy` (radians);
   a pitch that would make `|dot(dir, up)| > 0.9999` (`_DAT_1003e300`) is refused. `Camera3p`: `yaw_off += dx` (view turns right),
   `elev += dy` (camera rises), clamped at asin(0.9999). The sign convention is fixed by the numpad: Numpad 4 (`ROTATE_LEFT`, flag 2) gives
@@ -195,7 +275,6 @@ hostile/friendly target, Shift+| = control center, Shift+P perks, Shift+V vehicl
 
 ## 6. Not resolved
 
-* The horizontal part of the head attractor (x/z) of the look target.
 * Mode 1/2 wheel / key zoom: the client zooms them through `CameraVehicle_t::Forward` → `ZoomSteer` [N3 0x1001db64] (`SteeringSeek` along the line to the look target, stops at 0.7 m / 25 m)
   and a `ForcedUpdate` at the end; `Camera3p` stores the resulting chase distance directly [INFERENCE] (`zoom_in_by`). The `+0x1a4` direct control and the `Turn` / `Strafe` / `MoveUp` inputs
   (`CalcLateralSteering` [0x1001e0ae]) are never set by anything reachable (`+0x1a4` only ever 0; no caller of `Turn`/`Strafe`/`MoveUp` besides the n3Camera's own flags): not ported.
@@ -242,8 +321,8 @@ pinned by a real-data test; so in retail the scripted views exist in two zones, 
 **Vehicle model** (modes 1, 2; `Vehicle_t::SteeringArrive` Vehicle.dll 0x1000ab28, integrator `FUN_1000e3d3`, `UpdateMotionConstraints` [N3 0x1001e602]): mass 20, top speed
 16 (= `min(16, 6 · avatar speed)`, ≥ 2), force limit `mass · v / 0.3`, brake distance `0.3 · v`; desired velocity = towards the target at `min(v, distance / brake · v)`,
 steering force `(desired − velocity) · mass · 4`, stop inside the radius. **Substep [RE, resolved]**: the `CameraVehicle_t` constructor stores `_DAT_1003df54` = 0.05 in `Vehicle +0x104`; `FUN_1000e3d3`
-integrates in substeps `min(left, 0.05)` and evaluates `CalcSteering` once per substep with `s_vDeltaTimeNow` = the substep (frames over 4 s, `_DAT_10012804`, are skipped). Mode 3 snaps the vehicle to the optimal
-spot every frame (`DecideSnap`), mode 2 arrives at it through `SteeringCamArrive` (radius 0.01).
+integrates in substeps `min(left, 0.05)` and evaluates `CalcSteering` once per substep with `s_vDeltaTimeNow` = the substep (frames over 4 s, `_DAT_10012804`, are skipped). Mode 3 snaps inward to the candidate
+spot and blends outward radius per call (`DecideSnap`, §3); mode 2 arrives through `SteeringCamArrive` (radius 0.01).
 
 **`SteeringCamArrive`** [N3 0x1001dc46, modes 1 and 2; ported `Vehicle::cam_arrive_step`, tests `a_hitch_in_the_frame_time_halts_the_camera`,
 `a_wanted_spot_behind_the_look_target_is_swapped_for_one_beside_it`] [RE, resolved]: a function-static running average `a` of the substep time (first call: the substep): a substep

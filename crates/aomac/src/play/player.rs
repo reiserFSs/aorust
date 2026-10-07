@@ -122,7 +122,7 @@ impl Player {
             movement.restore_blob(&u.blob);
             let prefs_xml = std::fs::read_to_string(dir.join("cd_image/gui/Default/CharPrefs.xml")).unwrap_or_default();
             let prefs = ControlPrefs::from_xml(&prefs_xml);
-            let mut camera = Camera3p::new(&prefs, avatar.head_height().unwrap_or(camera::MIN_PIVOT_HEIGHT));
+            let mut camera = Camera3p::new(&prefs, None);
             // scripted views (Shift/Ctrl+F8): only playfields that have camera attractors need the zone locator
             let zones = zone_locator(&store, playfield).map_err(|e| eprintln!("zone locator {playfield}: {e:#}")).ok().map(Rc::new);
             match (camera_views(&store, playfield), &zones) {
@@ -515,7 +515,8 @@ impl Player {
         self.avatar.set_transform(scene_pos(pos), scene_yaw(yaw));
         self.avatar.update(dt);
 
-        if let Some(h) = self.avatar.head_height() {
+        let head_local = self.avatar.head_local();
+        if let Some(h) = head_local {
             self.camera.set_head(h);
         }
         let collision = self.collision.as_ref().map(|c| c.borrow());
@@ -536,7 +537,8 @@ impl Player {
             self.model_sent = true;
         }
         // `VisualCATMesh_t::RunFunction` -> `RefreshAlpha`: opacity from the camera <-> head attractor distance (own character only)
-        let head_to_camera = self.avatar.head_position() - host.camera.pos;
+        let head_position = glam::Vec3::from(scene_pos(pos)) + glam::Quat::from_rotation_y(scene_yaw(yaw)) * head_local.unwrap_or(glam::Vec3::ZERO);
+        let head_to_camera = head_position - host.camera.pos;
         let alpha = self.fader.step(&self.fade, head_to_camera.length_squared());
         if self.camera.show_avatar() {
             let mut frame = self.avatar.frame();
@@ -765,19 +767,23 @@ mod tests {
         let clear = |a, b| segment_clear(&collision, a, b);
         assert!(!clear([0.0, 1.5, 0.0], [0.0, 3.1, 4.8]));
         assert!(!clear([0.0, 3.1, 4.8], [0.0, 1.5, 0.0]), "visibility must test the reverse ray too");
-        let mut camera = camera::Camera3p::new(&Default::default(), 1.5);
+        let mut camera = camera::Camera3p::new(&Default::default(), Some(glam::Vec3::Y * 1.5));
         let feet = [0.0; 3];
         let pivot = glam::Vec3::new(0.0, 1.5, 0.0);
         let open = camera.update_with(feet, std::f32::consts::PI, 0.016, &Sight::with_clear(&clear));
         assert!((open.pos - pivot).length() > 4.99);
+        let mut previous_radius = (open.pos - pivot).length();
         for yaw in [-0.2, 0.0, 0.2] {
             let view = camera.update_with(feet, yaw, 0.016, &Sight::with_clear(&clear));
             assert!((view.pos - pivot).length() < 2.0, "{:?}", view.pos);
+            previous_radius = (view.pos - pivot).length();
             let dir = (view.pos - pivot).normalize();
             assert!(clear(pivot.to_array(), (view.pos + dir * (camera::COLLISION_RADIUS - camera::DEFAULT_DISTANCE * 0.001)).to_array()));
         }
         let restored = camera.update_with(feet, std::f32::consts::PI, 0.016, &Sight::with_clear(&clear));
-        assert!((restored.pos - pivot).length() > 4.99);
+        let expected_radius = 0.9 * previous_radius + 0.1 * camera::DEFAULT_DISTANCE;
+        assert!(((restored.pos - pivot).length() - expected_radius).abs() < 1e-3,
+            "turning away must blend outward, not immediately restore the full boom");
     }
 
     /// Offline ICC geometry/camera frame route; no login, live session or window.
@@ -794,21 +800,141 @@ mod tests {
         let scene = ao_formats::playfield::load_playfield_at(&store, &dir, 4582, ao_formats::playfield::DEFAULT_DAY_TIME).unwrap();
         let collision = Collision::load(&store, 4582).unwrap();
         let feet = [pos[0], pos[1], -pos[2]];
-        let pivot = glam::Vec3::from(feet) + glam::Vec3::Y * 1.5;
         let clear = |a, b| segment_clear(&collision, a, b);
-        let mut camera = camera::Camera3p::new(&Default::default(), 1.5);
+        let mut animated = idle_camera_avatar(&store, &dir, std::env::var_os("AOMAC_CAMERA_ROCK_ANIMATED").is_some());
+        if let Some(avatar) = &mut animated {
+            avatar.update(1.0 / 60.0);
+        }
+        let initial_head = animated.as_ref().and_then(Avatar::head_local).unwrap_or(glam::Vec3::Y * 1.5);
+        let mut pivot_height = initial_head.y;
+        let mut camera = camera::Camera3p::new(&Default::default(), None);
+        camera.set_head(initial_head);
+        // Optional fixed server yaw (radians); absent keeps the 36-heading route.
+        let idle_yaw = std::env::var("AOMAC_CAMERA_ROCK_IDLE_YAW").ok().map(|v| {
+            let yaw = v.parse::<f32>().expect("fixed server yaw in radians");
+            assert!(yaw.is_finite(), "fixed server yaw must be finite");
+            yaw
+        });
+        if let (Some(avatar), Some(yaw)) = (&mut animated, idle_yaw) {
+            for _ in 0..1800 {
+                avatar.update(1.0 / 60.0);
+                let head = avatar.head_local().unwrap();
+                camera.set_head(head);
+                pivot_height += (head.y - pivot_height) * 0.2;
+                camera.update_with(feet, yaw, 1.0 / 60.0, &Sight::with_clear(&clear));
+            }
+        }
         let mut pulled = 0;
-        for i in 0..36 {
-            let yaw = i as f32 * std::f32::consts::TAU / 36.0;
+        for i in 0..if idle_yaw.is_some() { 120 } else { 36 } {
+            let yaw = idle_yaw.unwrap_or(i as f32 * std::f32::consts::TAU / 36.0);
+            let head = if let Some(avatar) = &mut animated {
+                avatar.update(1.0 / 60.0);
+                avatar.head_local().expect("captured player head attractor")
+            } else { initial_head };
+            let head_height = head.y;
+            camera.set_head(head);
+            // N3 FUN_10020bdb, default third-person blend; diagnostics only.
+            pivot_height += (head_height - pivot_height) * 0.2;
+            let pivot = glam::Vec3::from(feet) + glam::Quat::from_rotation_y(scene_yaw(yaw))
+                * glam::Vec3::new(initial_head.x, pivot_height, initial_head.z);
             let view = camera.update_with(feet, yaw, 1.0 / 60.0, &Sight::with_clear(&clear));
             let distance = (view.pos - pivot).length();
             pulled += usize::from(distance < camera::DEFAULT_DISTANCE - 0.01);
             let dir = (view.pos - pivot).normalize();
-            assert!(clear(pivot.to_array(), (view.pos + dir * (camera::COLLISION_RADIUS - camera::DEFAULT_DISTANCE * 0.001)).to_array()), "heading {i}: pivot or boom is blocked beyond the original bisection tolerance");
-            eprintln!("ICC camera heading {i}: eye {:?}, boom {distance:.4}", view.pos);
-            ao_render::render_to_png(&scene, view.pos.to_array(), pivot.to_array(), 1200, 700, &out.join(format!("icc-rock-{i:02}.png"))).unwrap();
+            let final_boom_blocked = !clear(pivot.to_array(),
+                (view.pos + dir * (camera::COLLISION_RADIUS - camera::DEFAULT_DISTANCE * 0.001)).to_array());
+            let full_boom = pivot + dir * (camera::DEFAULT_DISTANCE + camera::COLLISION_RADIUS);
+            let full_boom_blocked = !clear(pivot.to_array(), full_boom.to_array());
+            eprintln!("ICC camera frame {i}: heading {yaw:.6}, head_height {head_height:.6}, pivot {pivot:?}, eye {:?}, eye_distance {distance:.6}, full_boom_blocked {full_boom_blocked}, final_boom_blocked {final_boom_blocked}", view.pos);
+            if idle_yaw.is_none() {
+                assert!(!final_boom_blocked, "heading {i}: pivot or boom is blocked beyond the original bisection tolerance");
+            }
+            if idle_yaw.is_none() || matches!(i, 0 | 50 | 102 | 119) {
+                ao_render::render_to_png(&scene, view.pos.to_array(), pivot.to_array(), 1200, 700, &out.join(format!("icc-rock-{i:02}.png"))).unwrap();
+            }
         }
-        assert!(pulled > 0, "the supplied ICC position never exercises collision pull-in");
+        if idle_yaw.is_none() {
+            assert!(pulled > 0, "the supplied ICC position never exercises collision pull-in");
+        }
+    }
+
+    /// Opt-in captured player at animation time zero, before camera initialization.
+    fn idle_camera_avatar(store: &RecordStore, dir: &std::path::Path, animated: bool) -> Option<Avatar> {
+        if !animated {
+            return None;
+        }
+        let mut avatar = Avatar::new(store, dir, 7, &avatar::tests::own_update()).unwrap();
+        avatar.set_pose(store, AvatarPose::still(Role::Idle)).unwrap();
+        Some(avatar)
+    }
+
+    /// Exact captured ICC idle route with the real player's native idle clip.
+    #[test]
+    fn icc_beach_animated_idle_camera_is_stable() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() {
+            return;
+        }
+        let store = RecordStore::open(&dir).unwrap();
+        let collision = Collision::load(&store, 4582).unwrap();
+        let clear = |a, b| segment_clear(&collision, a, b);
+        let feet = [930.0051, 24.21451, -759.66864];
+        let yaw = 0.98020107;
+        let mut avatar = idle_camera_avatar(&store, &dir, true).unwrap();
+        avatar.update(1.0 / 60.0);
+        let initial_head = avatar.head_local().unwrap();
+        let mut height = initial_head.y;
+        let mut camera = camera::Camera3p::new(&Default::default(), None);
+        camera.set_head(initial_head);
+        let mut previous = None;
+        let mut max_displacement = 0.0_f32;
+        for frame in 0..1920 {
+            avatar.update(1.0 / 60.0);
+            let head_local = avatar.head_local().unwrap();
+            let head = head_local.y;
+            camera.set_head(head_local);
+            height += (head - height) * 0.2; // N3 default head blend, diagnostic pivot.
+            let pivot = glam::Vec3::from(feet) + glam::Quat::from_rotation_y(scene_yaw(yaw))
+                * glam::Vec3::new(initial_head.x, height, initial_head.z);
+            let view = camera.update_with(feet, yaw, 1.0 / 60.0, &Sight::with_clear(&clear));
+            let direction = (view.pos - pivot).normalize();
+            let blocked = !clear(pivot.to_array(),
+                (pivot + direction * (camera::DEFAULT_DISTANCE + camera::COLLISION_RADIUS)).to_array());
+            let displacement = previous.map_or(0.0, |eye: glam::Vec3| (view.pos - eye).length());
+            max_displacement = max_displacement.max(displacement);
+            if frame >= 1800 {
+                let measured_frame = frame - 1800;
+                eprintln!("ICC animated idle frame {measured_frame}: heading {yaw:.6}, head_height {head:.6}, pivot {pivot:?}, eye {:?}, eye_distance {:.6}, full_boom_blocked {blocked}, displacement {displacement:.6}", view.pos, (view.pos - pivot).length());
+            }
+            assert!(!blocked, "full boom unexpectedly blocked at frame {frame}");
+            assert!(((view.pos - pivot).length() - camera::DEFAULT_DISTANCE).abs() < 1e-3,
+                "idle boom pulled in at frame {frame}");
+            previous = Some(view.pos);
+        }
+        eprintln!("ICC animated idle maximum displacement {max_displacement:.6}");
+        assert!(max_displacement < 1e-3, "idle eye displacement exceeds float tolerance: {max_displacement}");
+    }
+
+    #[test]
+    fn armed_camera_caches_first_animated_head_sample() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() {
+            return;
+        }
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = idle_camera_avatar(&store, &dir, true).unwrap();
+        let mut camera = camera::Camera3p::new(&Default::default(), None);
+        avatar.set_stance(Some(3));
+        avatar.set_pose(&store, AvatarPose::still(Role::Idle)).unwrap();
+        avatar.update(1.0 / 60.0);
+        let head = avatar.head_local().unwrap();
+        camera.set_head(head);
+        let feet = [930.0051, 24.21451, -759.66864];
+        let yaw = 0.98020107;
+        let pivot = glam::Vec3::from(feet) + glam::Quat::from_rotation_y(scene_yaw(yaw)) * head;
+        let view = camera.update_with(feet, yaw, 1.0 / 60.0, &Sight::OPEN);
+        assert!(((view.pos - pivot).length() - camera::DEFAULT_DISTANCE).abs() < 1e-3,
+            "camera must initialize from the first armed animated sample");
     }
 
     /// Real data (skips without the client): the door of ICC Holodeck Alien Training (6131) found by its position opens / locks its room link.
