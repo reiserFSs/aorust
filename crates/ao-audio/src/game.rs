@@ -240,13 +240,18 @@ impl Runtime {
 
     /// [`Runtime::keepalive`] with the per-call volume of `PlaySample(handle, .., volume, ..)` (weather: rain/wind levels).
     pub fn keepalive_scaled(&mut self, sh: &Shared, def: &SoundDef, scale: f32) {
+        self.keepalive_duration(sh, def, scale, def.duration_max);
+    }
+
+    /// Native PlaySample positive duration override; returns the current looping voice.
+    pub fn keepalive_duration(&mut self, sh: &Shared, def: &SoundDef, scale: f32, duration: f32) -> u64 {
         let level = def.vol_max * self.fx * scale;
-        let t = def.fade_out + def.duration_max;
+        let t = def.fade_out + duration;
         if let Some(k) = self.keepalive.get_mut(&def.id) {
             if sh.mixer().is_playing(k.0) {
                 *k = (k.0, t, level, def.fade_out);
                 sh.mixer().set_gain(k.0, level);
-                return;
+                return k.0;
             }
         }
         if let Some(p) = def.file.as_deref().and_then(|f| sh.resolve(f)) {
@@ -254,7 +259,9 @@ impl Runtime {
             if voice != 0 {
                 self.keepalive.insert(def.id, (voice, t, level, def.fade_out));
             }
+            return voice;
         }
+        0
     }
 
     pub fn set_playfield(&mut self, sh: &Shared, pf: Option<PlayfieldAudio>) {
@@ -681,5 +688,30 @@ mod tests {
             sh.mixer().stop_all();
         }
         assert!(checked > 0, "some ambience child has an interval different from its parent's");
+    }
+
+    #[test]
+    fn nano_duration_refreshes_one_real_loop_and_expires_after_cancel() {
+        let Some(dir) = client() else { return };
+        let (sh, mut rt) = runtime(&dir);
+        let mut def = rt.lib.sounds.get(0x35a9ce7d).unwrap().clone();
+        def.duration_max = 9.0; // The caller override, not this authored duration, controls lifetime.
+        def.fade_out = 0.3;
+        let voice = rt.keepalive_duration(&sh, &def, 0.6, 0.2);
+        assert_ne!(voice, 0);
+        assert!((rt.keepalive[&def.id].1 - 0.5).abs() < 1e-6);
+        rt.update(&sh, 0.15, [0.0; 3], 0.0);
+        assert_eq!(rt.keepalive_duration(&sh, &def, 1.0, 0.2), voice);
+        assert!((rt.keepalive[&def.id].1 - 0.5).abs() < 1e-6);
+        let path = sh.resolve(def.file.as_deref().unwrap()).unwrap();
+        let frames = sh.load(&path).unwrap().frames();
+        let mut samples = vec![0.0; (frames + 44100) * 2];
+        sh.mixer().render(&mut samples);
+        assert!(sh.mixer().is_playing(voice), "the sample really loops past its end");
+        rt.update(&sh, 0.25, [0.0; 3], 0.0);
+        assert!(sh.mixer().is_playing(voice), "cancel leaves the authored fade tail");
+        rt.update(&sh, 0.26, [0.0; 3], 0.0);
+        assert!(!sh.mixer().is_playing(voice));
+        assert!(!rt.keepalive.contains_key(&def.id));
     }
 }

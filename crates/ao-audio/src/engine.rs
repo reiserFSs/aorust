@@ -369,8 +369,25 @@ impl Audio {
         let Some(rt) = g.as_mut() else { return Vec::new() };
         let db = rt.lib.sounds.clone();
         let Some(def) = db.get(id) else { return Vec::new() };
-        let d = (0..3).map(|i| (pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt();
+        let d = if pos == [0.0; 3] { 0.0 } else { (0..3).map(|i| (pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt() };
         rt.play_at(&self.sh, def, d, material, size)
+    }
+
+    /// CharCastNano's per-frame positional duration override (SI PlaySample 10002d98).
+    /// Positive durations re-arm the definition's looping voice; zero remains a one-shot.
+    pub fn play_game_sound_duration(&self, id: u32, pos: [f32; 3], listener: [f32; 3], duration: f32, volume: f32) -> Vec<u64> {
+        let mut g = self.rt();
+        let Some(rt) = g.as_mut() else { return Vec::new() };
+        let db = rt.lib.sounds.clone();
+        let Some(def) = db.get(id) else { return Vec::new() };
+        let d = if pos == [0.0; 3] { 0.0 } else { (0..3).map(|i| (pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt() };
+        if d > def.max_dist { return Vec::new(); } // SI10002d98 returns before re-arming an out-of-range source.
+        if duration <= 0.0 {
+            return rt.play_effect_at(&self.sh, def, d, volume, 0.0, 100);
+        }
+        let level = crate::game::attenuation(d, def.min_dist, def.max_dist, None) * volume;
+        let voice = rt.keepalive_duration(&self.sh, def, level, duration);
+        if voice == 0 { Vec::new() } else { vec![voice] }
     }
 
     /// Authored GC class4000 / SI PlaySoundCommand @100071ed positional one-shot.
@@ -419,5 +436,23 @@ fn write_frames<T: Copy + Default>(sh: &Shared, scratch: &mut Vec<f32>, out: &mu
         if ch > 1 {
             o[1] = conv(scratch[2 * i + 1]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_xyz_game_sound_is_non_positional_for_a_distant_listener() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/sound/SourceFiles/SM_Sandy_Game_Dummy.sbf").exists() { return; }
+        let audio = Audio::offline(&dir, 44100);
+        let listener = [1_000_000.0; 3];
+        assert!(!audio.play_game_sound_with(0x94bb7805, [0.0; 3], listener, 0, 1).is_empty());
+        assert!(audio.play_game_sound_with(0x94bb7805, [1.0, 0.0, 0.0], listener, 0, 1).is_empty());
+        assert!(audio.play_game_sound_duration(0x35a9ce7d, [1.0, 0.0, 0.0], listener, 0.2, 1.0).is_empty());
+        assert!(!audio.play_game_sound_duration(0x35a9ce7d, [0.0; 3], listener, 0.2, 1.0).is_empty());
     }
 }
