@@ -261,6 +261,16 @@ impl ActorRig {
         &self.model
     }
 
+    /// Native attractor place of each rigid mounted mesh (body is unmounted).
+    pub fn part_attractors(&self) -> Vec<Option<u8>> {
+        let mut out=vec![None;self.model.meshes.len()];
+        for mount in &self.mounts {
+            let name=&self.cat.attractors[mount.attractor].name;
+            out[mount.mesh]=name.strip_prefix("Attractor").and_then(|s|s.get(..2)).and_then(|s|s.parse::<u8>().ok()).and_then(|n|n.checked_sub(1));
+        }
+        out
+    }
+
     pub fn cat(&self) -> &CatMesh {
         &self.cat
     }

@@ -338,5 +338,9 @@ fn collision_room_liquids_are_found_in_dungeons() {
     let (p, cp) = found.expect("a room liquid of playfield 120 is reachable");
     assert!(cp.liquid > cp.pos[1] - 40.0 && cp.pos[1] >= cp.liquid - 1.2 - 1e-3, "{p:?} {cp:?}");
     assert_eq!(c.liquid_at(cp.pos).map(|l| l.level), Some(cp.liquid));
+    let liquid = cp.liquid_info.expect("closest query retains LiquidMediumData flags and direction");
+    assert_eq!(liquid, c.liquid_at(cp.pos).unwrap());
+    assert_eq!(liquid.kind & 0x1e, 2);
+    assert!((liquid.normal.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-5);
     assert!(c.liquid_at([p[0], p[1] + 5000.0, p[2]]).is_none(), "outside every room");
 }

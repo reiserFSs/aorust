@@ -14,6 +14,9 @@ use std::collections::HashMap;
 
 mod rig;
 pub use rig::NodeRig;
+#[path = "mesh_effects.rs"]
+mod effects;
+pub use effects::{mesh_effect_attrs, parse_effect_name, MeshEffectAttr};
 
 /// Primary static-mesh record type (full detail).
 pub const MESH_TYPE: u32 = 1010001;
@@ -42,6 +45,52 @@ pub fn load_mesh(store: &RecordStore, id: u32) -> Result<Scene> {
     let mesh = decode_mesh_into(store, id, &mut scene)?.with_context(|| format!("no mesh record {id}"))?;
     scene.instances.push(Instance { mesh, transform: IDENTITY });
     Ok(scene)
+}
+
+/// Loads a native animated ABIFF as rigid geometry frames rather than baking their hierarchy.
+/// Each mesh index is the corresponding entry of [`NodeRig::pose_parts`]; ancestor-only frames
+/// remain in the rig so their animation affects every descendant.
+pub fn load_animated_mesh(store: &RecordStore, id: u32) -> Result<Option<(Scene, NodeRig)>> {
+    let Some(bytes) = store.get(MESH_TYPE, id)? else { return Ok(None) };
+    let Some(mut rig) = NodeRig::parse(&bytes)? else { return Ok(None) };
+    let ar = Archive::parse(&bytes)?;
+    let mut scene = Scene::default();
+    let mut parts = Vec::new();
+    fn walk(ar: &Archive, index: usize, scene: &mut Scene, parts: &mut Vec<Option<usize>>, store: &RecordStore) -> Result<()> {
+        let node = &ar.objects[index]; // NodeRig has already validated the complete frame tree.
+        let part = if let Some(data) = node.ref1("data") {
+            let mut textures = |key| {
+                if let std::collections::hash_map::Entry::Vacant(entry) = scene.textures.entry(key) {
+                    if let Some(texture) = load_texture(store, key).ok().flatten() {
+                        entry.insert(texture);
+                    }
+                }
+                scene.textures.contains_key(&key)
+            };
+            let mut builder = Builder {
+                ar, mesh: Mesh::default(), groups: HashMap::new(), have_texture: &mut textures,
+                visited: vec![], object_space: true, overrides: &[], slot: 0,
+            };
+            let state = node.ref1("delta_state").and_then(|i| ar.objects.get(i));
+            for mesh in ar.objects[data].refs("mesh") {
+                builder.simple_mesh(state, &ar.objects[mesh], &IDENTITY_MAT)?;
+            }
+            builder.mesh.submeshes.retain(|s| !s.indices.is_empty());
+            let index = scene.meshes.len();
+            scene.meshes.push(builder.mesh);
+            Some(index)
+        } else {
+            None
+        };
+        parts.push(part);
+        for child in node.refs("chld") {
+            walk(ar, child, scene, parts, store)?;
+        }
+        Ok(())
+    }
+    walk(&ar, ar.root, &mut scene, &mut parts, store)?;
+    rig.set_parts(&parts);
+    Ok(Some((scene, rig)))
 }
 
 /// Appends mesh `id` (type [`MESH_TYPE`]) and its textures (deduped by [`TextureKey`]) to `scene`;

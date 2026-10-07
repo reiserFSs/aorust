@@ -103,6 +103,8 @@ pub struct Record {
     pub name: String,
     /// Tilemap record (rdb 1000009) id. Equal to `id` for outdoor playfields (own heightfield).
     pub tilemap: u32,
+    /// Native `RDBPlayfield_t +0x50` flags (version >8); constructor zero for older records.
+    pub flags: u32,
     /// Zone edge length in tiles.
     pub zone_size: u32,
     /// Number of zones (outdoor) or rooms (dungeon) = number of offsets in the statel file.
@@ -129,9 +131,11 @@ pub fn parse(d: &[u8]) -> Result<Record> {
     let zone_size = r.u32()?;
     let count = r.u32()?;
     ensure!(version >= 7, "playfield {id}: unsupported data format version {version}");
-    if version > 8 {
-        r.skip(5 * 4 + 0x18)?;
-    }
+    let flags = if version > 8 {
+        let flags = r.u32()?;
+        r.skip(4 * 4 + 0x18)?;
+        flags
+    } else { 0 };
     let mut rooms = Vec::new();
     let mut attractors = Vec::new();
     if tilemap != id {
@@ -145,7 +149,7 @@ pub fn parse(d: &[u8]) -> Result<Record> {
             attractors.push(camera_attractors(&mut r, version)?);
         }
     }
-    Ok(Record { version, id, name, tilemap, zone_size, count, rooms, attractors, tail: r.o })
+    Ok(Record { version, id, name, tilemap, flags, zone_size, count, rooms, attractors, tail: r.o })
 }
 
 /// `u32 n` (client limit: `n < 1000`), n x { pos, quat, target (version >= 6, else = pos), range }; version <= 4 has none.
@@ -233,6 +237,17 @@ mod tests {
         }
         d
     }
+    #[test]
+    fn native_effect_resource_keeps_tilemap_and_flags() {
+        let mut data = header(9, 5000, 153, 0);
+        data.extend(0x1234_5678u32.to_le_bytes());
+        data.extend([0u8; 4 * 4 + 0x18]);
+        let record = parse(&data).unwrap();
+        assert_eq!((record.id, record.tilemap, record.flags), (5000, 153, 0x1234_5678));
+        assert_eq!(record.tail, data.len());
+        assert_eq!(parse(&header(8, 566, 566, 0)).unwrap().flags, 0);
+    }
+
 
     #[test]
     fn outdoor_header() {

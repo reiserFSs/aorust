@@ -116,3 +116,65 @@ fn door_meshes_pose_to_the_static_decode_at_time_zero() {
     assert!(animated > 20, "{animated} door meshes move");
     assert_eq!(mismatched, [224248]);
 }
+
+#[test]
+fn authored_3025_rigid_frames_match_vertex_sampler_and_native_timing() {
+    let Some(store) = store() else { return };
+    let names = ao_formats::character::NameTable::load(&store).unwrap();
+    for name in ["hoverboard_c_fx01.abiff"] {
+        let id = names.id(MESH_TYPE, name).unwrap();
+        assert_eq!(id, 284022);
+        let Some((scene, mut rig)) = ao_formats::mesh::load_animated_mesh(&store, id).unwrap() else { panic!("{name}: missing authored frame animation") };
+        assert_eq!(rig.total_time().to_bits(), 0x3fd55558, "{name}/{id}");
+        let reference = ao_formats::mesh::NodeRig::load(&store, id).unwrap().unwrap();
+        let mut posed = load_mesh(&store, id).unwrap().meshes.remove(0).vertices;
+        let mut parts = Vec::new();
+        for fraction in [0.0, 0.25, 0.5, 0.75, 1.0, 1.25] {
+            let time = fraction * rig.total_time();
+            rig.pose_parts(time, &mut parts);
+            reference.pose(time, &mut posed);
+            assert_eq!(parts.len(), scene.meshes.len());
+            let mut index = 0;
+            for (mesh, matrix) in scene.meshes.iter().zip(&parts) {
+                for vertex in &mesh.vertices {
+                    for axis in 0..3 {
+                        let actual = (0..3).map(|k| vertex.pos[k] * matrix[k][axis]).sum::<f32>() + matrix[3][axis];
+                        assert!((actual - posed[index].pos[axis]).abs() < 2e-3, "{name}/{id} t={time} vertex={index} axis={axis}");
+                    }
+                    index += 1;
+                }
+            }
+            assert_eq!(index, posed.len());
+        }
+        rig.pose_parts(0.25 * rig.total_time(), &mut parts);
+        let first = parts.clone();
+        rig.pose_parts(1.25 * rig.total_time(), &mut parts);
+        for (a, b) in first.iter().flatten().flatten().zip(parts.iter().flatten().flatten()) {
+            assert!((a - b).abs() < 2e-4, "{name}/{id}: native time wrapping");
+        }
+    }
+}
+
+#[test]
+fn authored_3025_circle_and_shoulder_uv_keys_scroll_without_reallocating() {
+    let Some(store) = store() else { return };
+    for (id, total) in [(272411, 0.8), (271013, 0.8), (269941, 3.333333)] {
+        let (scene, mut rig) = ao_formats::mesh::load_animated_mesh(&store, id).unwrap().unwrap();
+        assert!((rig.total_time() - total).abs() < 1e-6, "record {id}");
+        let (mut uvs, mut visible, mut parts) = (Vec::new(), Vec::new(), Vec::new());
+        rig.pose_parts(0.0, &mut parts);
+        rig.pose_visuals(0.0, &mut uvs, &mut visible);
+        assert_eq!(uvs.len(), scene.meshes.len());
+        assert!(uvs.iter().all(|uv| *uv == [1.0, 1.0, 0.0, 0.0]));
+        assert!(visible.iter().all(|visible| *visible));
+        let pointers = (uvs.as_ptr(), visible.as_ptr(), parts.as_ptr());
+        rig.pose_visuals(total * 0.5, &mut uvs, &mut visible);
+        assert!(uvs.iter().any(|uv| (uv[2] - 0.5).abs() < 1e-3), "record {id}: no authored UV scroll");
+        for tick in 0..100 {
+            let time = tick as f32 * total / 100.0;
+            rig.pose_parts(time, &mut parts);
+            rig.pose_visuals(time, &mut uvs, &mut visible);
+            assert_eq!((uvs.as_ptr(), visible.as_ptr(), parts.as_ptr()), pointers);
+        }
+    }
+}

@@ -95,6 +95,8 @@ pub struct SurfaceState {
     /// `Vehicle+0x10c`: how far the feet are below the surface (set while `feet < level`; -9999 once the feet are above the
     /// surface in modes 0 and 2).
     pub submersion: f32,
+    /// Actual liquid flags and plane direction written by `CalculateClosestPoint` to Vehicle +0x110/+0x114.
+    pub liquid_info: Option<super::Liquid>,
     /// The callback this step fired, if any; the caller consumes it (`Option::take`).
     pub event: Option<LiquidEvent>,
     /// `n3Dynel_t::GetBodyCollSphereRadi` (`dynel->vtbl[+0x10]`, @0x10004dd3): radius of the dynel's torso `CollPrim_t`
@@ -122,6 +124,7 @@ impl Default for SurfaceState {
             wade_depth: SWIM_DEPTH,
             in_liquid: false,
             submersion: NO_LIQUID,
+            liquid_info: None,
             event: None,
             radius: DEFAULT_BODY_RADIUS,
             heading: 0.0,
@@ -158,6 +161,7 @@ pub struct Closest {
     pub normal: V,
     /// Liquid surface height at the point (-9999: none).
     pub liquid: f32,
+    pub liquid_info: Option<super::Liquid>,
 }
 
 const NO_LIQUID: f32 = -9999.0;
@@ -437,6 +441,7 @@ impl Collision {
                     pos: [p[0], 0.0, p[2]],
                     normal: [0.0; 3],
                     liquid: NO_LIQUID,
+                    liquid_info: None,
                 });
             };
             let (fy, fnorm) = self.tile_floor(room, p)?;
@@ -467,6 +472,7 @@ impl Collision {
             pos,
             normal,
             liquid: level,
+            liquid_info: liquid,
         })
     }
 
@@ -673,7 +679,9 @@ impl Collision {
             pos: [0.0; 3],
             normal: [0.0; 3],
             liquid: NO_LIQUID,
+            liquid_info: None,
         });
+        st.liquid_info = cp.liquid_info;
         // mode 4 (hover) keeps 0.25 m (f64 @0x100127e8) instead of 0.01 over the closest point
         let clearance = if st.medium == 4 {
             HOVER_CLEARANCE

@@ -50,6 +50,8 @@ pub struct Liquid {
     pub level: f32,
     /// `n3WaterData_t` kind (`kind >> 1` selects water / lava / slime / acid / mud, see `water.rs`).
     pub kind: u32,
+    /// Liquid collision plane normal, in scene space (`LiquidMediumData_t +8`).
+    pub normal: [f32; 3],
 }
 
 /// Ground found under a point.
@@ -95,6 +97,7 @@ pub struct Collision {
     zone_size: usize,
     /// Zones / rooms that own a KD surface record (`tri.zone` tags), also those without triangles.
     kd_zones: HashSet<u32>,
+    resource: Option<(u32, u32)>,
 }
 
 /// Dungeon rooms with the tilemap: a position is only valid inside one (`n3RoomSurface_t::VetoPosition` @0x10015587).
@@ -132,6 +135,32 @@ fn unit(v: [f32; 3]) -> Option<[f32; 3]> {
     (l > 1e-12).then(|| [v[0] / l, v[1] / l, v[2] / l])
 }
 
+/// DS `FUN_1003a3b4`: split cross-product magnitude > 10000 into four midpoint triangles,
+/// depth-first in corner A/B/C/centre order before appending collision infos.
+fn add_outdoor_liquid(p: [[f32; 3]; 3], kind: u32, out: &mut Vec<(Tri, u32)>) -> Result<()> {
+    let n = cross(sub(p[1], p[0]), sub(p[2], p[0]));
+    let area = dot(n, n).sqrt();
+    anyhow::ensure!(area.is_finite(), "non-finite liquid triangle");
+    anyhow::ensure!(out.len() < 1_000_000, "implausible liquid collision triangle count");
+    if area > 10_000.0 {
+        let [a, b, c] = p;
+        let midpoint = |a, b| scale_v(add_v(a, b), 0.5);
+        let (ab, bc, ca) = (midpoint(a, b), midpoint(b, c), midpoint(c, a));
+        for child in [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]] {
+            add_outdoor_liquid(child, kind, out)?;
+        }
+    } else if let Some(mut tri) = Tri::from_world(p[0], p[1], p[2]) {
+        // DS 0x1003a0d6 rejects centroids outside its 60×60, 100 m bucket index.
+        let x = ((p[1][0] + p[0][0] + p[2][0]) / 3.0) as f64 / 100.0;
+        let z = ((p[1][2] + p[0][2] + p[2][2]) / 3.0) as f64 / -100.0;
+        let bucket = (x as i64).wrapping_sub((z as i64).wrapping_mul(60)) as u64;
+        if bucket >= 3600 { return Ok(()); }
+        if tri.n[1] < 0.0 { tri.n = tri.n.map(|v| -v); }
+        out.push((tri, kind));
+    }
+    Ok(())
+}
+
 impl Tri {
     /// Scene-space triangle with an explicit unit normal.
     fn with_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3], n: [f32; 3]) -> Option<Tri> {
@@ -158,6 +187,12 @@ impl Tri {
         let l2 = ((c[2] - a[2]) * (x - c[0]) + (a[0] - c[0]) * (z - c[2])) / d;
         let e = -1e-4;
         l1 >= e && l2 >= e && 1.0 - l1 - l2 >= e
+    }
+    /// Native liquid tests exclude every edge (DS 0x10039d3c / N3 0x1000b498).
+    fn liquid_contains_xz(&self, x: f32, z: f32) -> bool {
+        let sides = [(self.a, self.b), (self.b, self.c), (self.c, self.a)]
+            .map(|(a, b)| (z - a[2]) * (b[0] - a[0]) - (x - a[0]) * (b[2] - a[2]));
+        sides.iter().all(|v| *v > 0.0) || sides.iter().all(|v| *v < 0.0)
     }
     fn bounds(&self) -> ([f32; 3], [f32; 3]) {
         let mut lo = self.a;
@@ -239,6 +274,9 @@ impl Terrain {
 }
 
 impl Collision {
+    /// Native playfield resource tilemap id (`+0x1c`) and flags (`+0x50`).
+    pub fn effect_resource(&self) -> Option<(u32, u32)> { self.resource }
+
     fn build(tris: Vec<Tri>, terrain: Option<Terrain>, rooms: Option<Rooms>, liquids: Vec<(Tri, u32)>) -> Collision {
         let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
         for t in &tris {
@@ -291,7 +329,7 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, origin: lo, dims, cell, start, items, big, terrain, rooms, liquids, portals: portal::Portals::default(), zone_size: 1, kd_zones: HashSet::new() }
+        Collision { tris, origin: lo, dims, cell, start, items, big, terrain, rooms, liquids, portals: portal::Portals::default(), zone_size: 1, kd_zones: HashSet::new(), resource: None }
     }
 
     /// Collision of the loaded scene's identity-placed meshes (terrain, room shells): the documented fallback when the
@@ -357,12 +395,10 @@ impl Collision {
         }
         let mut tail = Rd::new(&raw, rec.tail);
         let mut liquids = Vec::new();
-        for w in water::parse(&mut tail).with_context(|| format!("liquids of playfield {id}"))? {
+        for w in water::parse(&mut tail).with_context(|| format!("liquids of playfield {id}"))?.into_iter().filter(|w| w.kind & 1 == 0) {
             for t in &w.tris {
                 let p = t.map(|i| w.verts[i as usize]);
-                if let Some(tri) = Tri::from_world(p[0], p[1], p[2]) {
-                    liquids.push((tri, w.kind));
-                }
+                add_outdoor_liquid(p, w.kind, &mut liquids)?;
             }
         }
         // room liquids (`n3Room_t` reader N3 @0x10012803 -> `n3Zone_t::AddLiquidCollisionData` @0x1001a9c5): room-local
@@ -381,6 +417,7 @@ impl Collision {
         let mut c = Collision::build(tris, terrain, rooms, liquids);
         c.portals = portals;
         c.kd_zones = kd_zones;
+        c.resource = Some((rec.tilemap, rec.flags));
         c.zone_size = rec.zone_size.max(1) as usize;
         Ok(c)
     }
@@ -445,36 +482,37 @@ impl Collision {
     ///   triangle whose xz projection holds the point, with `ground.y <` the triangle's top and a plane height above the room origin
     ///   `> 0`, decides; it counts when `level - depth < y` with `depth = (kind >> 5) / 10` m (`kind >> 5 == 0`: 100 000 m, the
     ///   `n3WaterData_t` kind keeps the liquid type in bits 0..4, `FUN_1000b0d1`);
-    /// * outdoors: the highest surface at or above `ground.y` ([GUESS]: the zone's `VisualWaterInfo_t` list is walked in its own
-    ///   order by `WaterCollisionInfo_t::PerformCollisionTest` @DisplaySystem 0x10039d3c, same test as the room one; where those
-    ///   objects are built from the outdoor polygons was not traced).
+    /// * outdoors: collision infos are appended in authored triangle order by DS `0x1003a0d6`;
+    ///   GC `0x100b7f61` registers that list in each intersected zone. N3 `0x1001ab68` returns
+    ///   the first positive collision and stops even when that candidate fails authored depth.
     fn liquid_probe(&self, ground: [f32; 3], y: f32, room: Option<usize>) -> Option<Liquid> {
         if let Some(r) = &self.rooms {
             let tag = room? as u16 + 1;
             let oy = r.rooms[tag as usize - 1].0.pos[1];
             for (t, kind) in self.liquids.iter().filter(|(t, _)| t.floor == tag) {
                 let top = t.a[1].max(t.b[1]).max(t.c[1]);
-                if t.n[1].abs() > 1e-6 && ground[1] < top && t.contains_xz(ground[0], ground[2]) {
+                if t.n[1].abs() > 1e-6 && ground[1] < top && t.liquid_contains_xz(ground[0], ground[2]) {
                     let level = t.y_at(ground[0], ground[2]);
                     if level - oy <= 0.0 {
                         continue;
                     }
                     let depth = if kind >> 5 == 0 { 100_000.0 } else { (kind >> 5) as f32 / 10.0 };
-                    return (level - depth < y).then_some(Liquid { level, kind: *kind });
+                    return (level - depth < y).then_some(Liquid { level, kind: *kind & 0x1f, normal: t.n });
                 }
             }
             return None;
         }
-        let mut best: Option<Liquid> = None;
         for (t, kind) in &self.liquids {
-            if t.n[1].abs() > 1e-6 && t.contains_xz(ground[0], ground[2]) {
+            let top = t.a[1].max(t.b[1]).max(t.c[1]);
+            if t.n[1].abs() > 1e-6 && ground[1] < top && t.liquid_contains_xz(ground[0], ground[2]) {
                 let level = t.y_at(ground[0], ground[2]);
-                if level >= ground[1] && best.is_none_or(|b| level > b.level) {
-                    best = Some(Liquid { level, kind: *kind });
+                if level > 0.0 {
+                    let depth = if kind >> 5 == 0 { 100_000.0 } else { (kind >> 5) as f32 / 10.0 };
+                    return (level - depth < y).then_some(Liquid { level, kind: *kind & 0x1f, normal: t.n });
                 }
             }
         }
-        best
+        None
     }
 
     /// Deepest sphere overlap with a wall triangle (`KDTreeSurface_c::GetSphereIntersection`'s contract): contact point,
@@ -786,6 +824,22 @@ mod tests {
             w = steep.walk(w.pos, [w.pos[0] + 0.3, w.pos[1], w.pos[2]]);
         }
         assert!(w.airborne && w.normal[1] < 0.5, "{w:?}");
+    }
+
+    #[test]
+    fn outdoor_liquids_use_authored_order_depth_and_strict_edges() {
+        let mut c = Collision::build(Vec::new(), None, None, Vec::new());
+        let triangle = |height| [[0.0, height, 0.0], [10.0, height, 0.0], [0.0, height, 10.0]];
+        add_outdoor_liquid(triangle(2.0), 2 | (10 << 5), &mut c.liquids).unwrap();
+        add_outdoor_liquid(triangle(4.0), 4, &mut c.liquids).unwrap();
+        assert_eq!(c.liquid_at([1.0, 1.5, -1.0]).unwrap().level, 2.0, "first collision, not highest");
+        assert_eq!(c.liquid_at([1.0, 1.5, -1.0]).unwrap().kind, 2, "depth bits are not liquid flags");
+        assert!(c.liquid_at([1.0, 0.5, -1.0]).is_none(), "failed first depth does not select the next liquid");
+        assert!(c.liquid_at([0.0, 1.5, -1.0]).is_none(), "native boundary is strict");
+        let mut split = Vec::new();
+        add_outdoor_liquid([[0.0, 2.0, 0.0], [200.0, 2.0, 0.0], [0.0, 2.0, 200.0]], 2, &mut split).unwrap();
+        assert_eq!(split.len(), 4);
+        assert!(split.iter().all(|(t, _)| t.n[1] > 0.0));
     }
 
     #[test]

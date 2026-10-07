@@ -71,6 +71,36 @@ Door meshes (e.g. rdb 1010001:245910 `door_omni_med_blue2` as used in 4582): 7 n
 (`placed_door_animates_on_status_updates`); 41798: 0.6 s. Visibility / uv keys are not applied. `VisualMesh_t::RemoveDoorDir` (DS 0x1006bf24, called from the door's `MeshReady`, the `n3VisualDynel_t` sub-object vtable GC 0x10162444 slot +0x98 = `FUN_1007ef03`) only hides
 `RRefFrame_t`s named `door_dir` (no geometry).
 
+Native effect class 3025 uses the same ABIFF frame tree. Gamecode `FUN_1010c94a` tests flag
+`0x1000`, advances its `+0xbc` animation clock, queries DS `VisualMesh_t::GetAnimationTreeTotalTime`
+(`0x1006b907`, Randy tree maximum `0x10045728`), reduces the clock only when it exceeds that
+total, then calls DS `SetAnimationTime` (`0x1006b899`). `mesh::load_animated_mesh` keeps one
+object-space mesh per geometry frame; `NodeRig::pose_parts` composes all ancestor frames into
+the existing `ActorFrame.parts` matrices. Geometry and GPU vertex buffers remain shared and
+unchanged; the parent-matrix scratch and caller's part output retain capacity. Read-only installed
+RDB extraction identifies `hoverboard_c_fx01.abiff` as 1010001/284022: animation objects 2 and 12,
+both `tot_time = 1.6666669845581055`; rotation blob lengths 40/60 bytes, translation lengths 32/32.
+Both visibility blobs contain two true keys (0 and total); neither animation has UV keys.
+`hoverboard_a_fan.abiff` (272373) and `hoverboard_b_fan.abiff` (271761) contain no animation objects:
+the native total is zero, so class 3025 does not call `SetAnimationTime` for those resources.
+The actual 284022 hierarchy is covered by
+`authored_3025_rigid_frames_match_vertex_sampler_and_native_timing`, including endpoint/wrap
+timing and comparison with the full vertex hierarchy sampler.
+
+The authored class-3025 flag-1000 hoverbike circles are 1010001/272411 and /271013,
+`tot_time` float bits `0x3f4ccccd` (0.8 seconds). Their `uv_keys` blobs have two 24-byte keys:
+`{scale_u, scale_v, offset_u, offset_v, time, u32 interpolate_offset}`, from `[1,1,0,0]`
+at time zero to `[1,1,1,0]` at total. Record 269941 (`penumbra_shoulderpads_atrox.abiff`)
+has the same UV motion in animation object 12 (UV endpoint 3.333 seconds, tree total
+3.333333 seconds). Native constructor R `0x100295ab` loads these keys and starts at identity;
+evaluator R `0x10028fde` interpolates scales and, only when the current key's final word
+is nonzero, offsets. R `RVisual_t::Rasterize` `0x1004d84a` creates a COUNT2 texture
+matrix with scale on the diagonal and offset in row 2, applies it to stages 0 and 1:
+`uv' = uv * scale + offset`. `NodeRig::pose_visuals` exposes these values and visibility;
+the renderer consumes `ActorFrame.part_uvs` without altering shared vertex buffers.
+`authored_3025_circle_and_shoulder_uv_keys_scroll_without_reallocating` checks installed
+timings, half-cycle UV motion, true visibility and retained sampler/output storage.
+
 Rendering: `Built::item` (`ItemRig`: the `NodeRig` + the item's stats) is built next to the static model; per prop `PropAnim` creates the state when the model is in (messages that came earlier replay silently), steps the clock every frame
 (also out of view), and hands `ActorFrame::skin` the posed vertices (positions and normals; uv unchanged) when the pose changed, the rest vertices when the door is shut again, and re-sends them when the renderer forgot the actor.
 
