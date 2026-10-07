@@ -521,6 +521,8 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
   idle without DeleteEffect; destructor `1007b290`→`1007b27f` also does
   not delete that handle. Removing the buff soon after casting therefore
   cannot establish a1070 leak from red particles alone.
+  Renderless controller/orbit `vertices=None` means no geometry, not expiry:
+  the renderer retains these instances until their process step ends them.
 * Class1002's orbiting children (`100d4f72`/`100d52dc`/`100d53e3`/
   `100d57bb`/`100d4d6b`) use their actual class0 body-profile records
   (20013/20018,42words), selected by Breed/Sex/BodyShape/MonsterScale,

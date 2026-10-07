@@ -799,11 +799,11 @@ impl Renderer {
                 let Ok(Some(groups)) = s.vertices(effect.elapsed,camera,right,up,&mut self.random,&mut self.display_random,&mut self.rng) else { return false };
                 for group in groups { skin.extend(group); }
             } else if let Some(c) = &mut effect.control {
-                let Ok(Some(groups)) = c.vertices(effect.elapsed,camera,right,up) else { return false };
+                let groups = match c.vertices(effect.elapsed,camera,right,up) { Ok(Some(groups))=>groups,Ok(None)=>return true,Err(_)=>return false };
                 for group in groups { skin.extend(group); }
                 if skin.is_empty() { return true; }
             } else if let Some(c) = &mut effect.composition {
-                let Ok(Some(groups)) = c.vertices(effect.elapsed,camera,right,up) else { return false };
+                let groups = match c.vertices(effect.elapsed,camera,right,up) { Ok(Some(groups))=>groups,Ok(None)=>return true,Err(_)=>return false };
                 for group in groups { skin.extend(group); }
                 if skin.is_empty() { return true; }
             } else if let Some(native)=&mut effect.native_replicated {
