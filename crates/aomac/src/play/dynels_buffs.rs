@@ -1,7 +1,7 @@
 //! GC 100512af / 100515ce: active nano entries own target-attached category-4 effects.
 use super::*;
 use crate::play::own_nanos::VisualEvent;
-use crate::play::combat::effects::{Binding, EffectConfig};
+use crate::play::combat::effects::{Binding, Creation, EffectConfig};
 
 pub(super) struct BuffVisual {
     effect: i32,
@@ -88,7 +88,7 @@ impl Dynels {
                 if who == self.own { own_anchor(id).map(|m| glam::Mat4::from_cols_array_2d(&m)) }
                 else { self.effect_anchor(who, id, 0) }
             };
-            let Some(source) = anchor(attractor) else { continue };
+            let Some(source) = anchor(attractor).or_else(||anchor(0)) else { continue };
             let Some(target) = anchor(0) else { continue };
             let identity = (CHAR_KIND as u32, who as u32);
             renderer.prepare_anchors(identity, |_, id| anchor(id));
@@ -96,7 +96,7 @@ impl Dynels {
                 [Some(a), Some(b), Some(c), Some(d)] => Some([a, b, c, d]),
                 _ => None,
             };
-            let config = EffectConfig { duration: Some(visual.duration), track_source: true, source_identity: Some(identity), target_identity: Some(identity), source_appearance: appearance, target_appearance: appearance, ..Default::default() };
+            let config = EffectConfig { creation: Creation::Dynel, duration: Some(visual.duration), track_source: true, source_identity: Some(identity), target_identity: Some(identity), source_appearance: appearance, target_appearance: appearance, ..Default::default() };
             match renderer.spawn_configured(Binding { group: 0, attractor, effect: visual.effect, note: 0, color: 0 }, source, target.w_axis.truncate(), config) {
                 Ok(handle) => visual.handle = Some(handle),
                 Err(error) => { eprintln!("nano buff: {error:#}"); visual.handle = Some(0); }

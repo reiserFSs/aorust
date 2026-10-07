@@ -573,21 +573,21 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
 * Mesh child71520 is the authored `EP03_shoulder_rocket.abiff`, selector0,
   scale2.5, not sprite artwork. Class3025 dispatch/loader/process:
   `100ce4f7`/`1010c5a6`/`1010cf05`/`1010c94a`; its opacity envelope uses
-  `101161a1`/`1011634c`. Unimplemented vehicle/camera/oscillation variants
-  fail explicitly rather than using the rocket path for unrelated resources.
+  `101161a1`/`1011634c`. Native vehicle/camera/oscillation and rendering-state
+  variants are separately implemented, including actual ABIFF node animation under0x1000.
 * Class3020 mode0, used by71512/71342, is the separate TParticle visual:
   GC `1011277c`/`101125fd`/`10112bb0`; DS `10029de9`/`10029c81`/
   `1002a350`/`10029aa7`. Its crossed tapered strips, constructor random walk,
   local Euler motion and packed piecewise colours come from that visual.
-  Other emission modes are not silently aliased to mode0.
+  Modes1–3 now retain their own native endpoint/RNG behavior (§7.9).
 * BParticle2/3028 (`1010bf1f`/`1010ac44`/`1010ba11`/`1010af47`;
-  DS `1000b4fc`/`1000b1e2`) keeps its native burst/recycling and strict
+  DS constructor `1000b432`, draw `1000b4fc`) keeps its native burst/recycling and strict
   colour-knot intervals (`1011623a`). Payloads with36/42/44words carry
   zero/three/four knots respectively; absent CMS fields return native zero.
   BParticle/3024 mode8, used by71343, is a different control/visual:
   `1010a6ac`/`1010a0f0`/`1010a3b5`, DS `10009938`/`10008bce`/`1000a70f`.
-  Other3024 modes and3028 terrain/environment/body-scale branches remain
-  explicit unsupported errors, not aliases to these implemented paths.
+  The remaining3024 initialization modes0–12 and3028 terrain/environment/body-scale
+  branches now have separate native implementations; their addresses are recorded below.
 * Cast start loops the authored stat0x178/default203 at speed1 (`1007b084`);
   release uses stat0x179/0x17a/default201/202 once. Timed and instant casts
   both wait for actual release completion (`1007ac9a`/`1003c4d5`) before
@@ -604,8 +604,8 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
   SandyInterface `100071ed` interprets volume/radius/duration/delay.
   Actual71345 selects `SM_Sandy_Game_Explo_Med` from table102c3f28, index12,
   with volume1,radius120,duration0,delay0,velocity0,probability100.
-  Nonzero timing/velocity variants remain explicit errors, not discarded
-  arguments. The implemented one-shot uses the real positional sound runtime.
+  Duration, delay, sequence and radius now retain native SI behavior (§7.9),
+  rather than rejecting or discarding those arguments.
 
 ### 7.4 Template cast sounds
 
@@ -883,8 +883,8 @@ forms two crossed velocity-aligned strips with tail width divided by
 word33 (0.5), never camera-facing sprites. Native dispatch now reaches this
 separate implementation through the shared buff renderer and
 `Renderer::spawn_configured`; duration and identity/attractor remain caller inputs.
-Other environment flags and animated-atlas modes fail explicitly rather than
-silently reusing this authored crystal mode.
+The terrain, animated-atlas, UV and camera-facing-alpha branches are separately
+implemented from the same native process; see the additional evidence below.
 Inventory SimpleItem has no visual dynel: GC `1010668c` requires its
 `n3VisualDynel` cast before locator setup. Constructor `101143bb` marks failed
 initialization terminated but still returns the allocated control, so CF26
@@ -950,16 +950,497 @@ pixels respectively, showing the authored textured slime-gib tumbling.
 This is offscreen evidence with the harness floor, not a retail-reference
 comparison or a real-window/live-server pass.
 
+### 7.9 Additional native class and creation evidence
+
+The following records document implemented native branches, not a claim of
+retail-frame equivalence. New checks named here have not yet been exercised
+by the implementation workers; the parent owns the final verification evidence.
+GC means Gamecode.dll and DS means DisplaySystem.dll; all addresses are hexadecimal.
+
+#### Creation overloads and native nulls
+
+`effects_dispatch.rs::Creation` preserves the fifteen exported native factory
+forms, rather than attempting any class through whichever constructor happens
+to be implemented. Source: decompile artifact22586, `/tmp/BuffFxCoverage/base.c`
+and `/tmp/BuffFx200x.c`; lookup is GC `10106b12` and dispatch reads template+4.
+
+| Form | GC factory |
+| --- | --- |
+| Unlocated / vector / matrix / RConnector | `100ce3be` / `100ce4f7` / `100cefaa` / `100cf872` |
+| Hit-location integer / located dynel / tracer | `100d145c` / `100d0102` / `100d1218` |
+| Vector→vector / matrix / connector / dynel | `100d0eba` / `100d0f50` / `100d0fb4` / `100d1018` |
+| Dynel→vector / matrix / connector / dynel | `100d107c` / `100d10e3` / `100d114a` / `100d11b1` |
+
+An absent class/form case returns native null before implementation support is
+checked. A native-constructible but unimplemented case instead reports an
+implementation error. Class0's twenty body-profile records are inputs to
+class1002 (§7.3), not drawable controls: all fifteen factories return null.
+Class2003 likewise has no constructor case in any factory. Neither is an
+implementation gap. Classes1016/2000/3011 have native cases but no installed
+template. The RConnector factory additionally rejects a constructed control
+whose terminated byte+0x14 is set; dynel class1002 rejects before allocation
+when GC `100e2cb4` finds that identity in Highlight registry `102e988c`.
+Highlight ctor `100e2e10` inserts via `100ac37e`; destructor `100e2cf4`
+removes via `1002df93`. Duplicate Highlight ends at construction; Stars
+`100f751f` applies the registry rejection specifically to mode15.
+
+Key restrictions:1010 accepts only the four dynel→target forms;1011 only the
+four vector→target forms;3007 only vector→vector or dynel;1020 only unlocated;
+2002/2013 only hit-location;5000 only RConnector;3017 accepts matrix,
+RConnector, hit-location and dynel but not vector. Classes1013/1019/1021/
+1022/1024–1027/3026 accept hit-location or tracer only. Regression:
+`native_overload_cases_and_nulls` (not run here).
+
+Complete class/form cases below use N=unlocated,V=vector,M=matrix,
+R=RConnector,I=hit-location,D=dynel,T=tracer and two-letter source/target
+forms from the factory table. Every omitted pairing returns native null.
+
+| Classes | Native creation forms |
+| --- | --- |
+| 1000/1014/1015/1016/1020/3037 | N |
+| 1001/1017/2011/2012/2014/3001/3003/3008/3034 | D |
+| 1002/1003/1004/1006/1007/1008/1009/1012/1023/1029/3004/3005/3006/3014/3022/3023/3024/3025/3027/3029/3030/3031/3032/3033/3035/3036/3038/3039 | V/M/R/D |
+| 1005/1018/3015/3019/3020/3028/4000 | V/M/R/I/D |
+| 1010 | DV/DM/DR/DD |
+| 1011 | VV/VM/VR/VD |
+| 1013/1019/1021/1022/1024/1025/1026/1027/3026 | I/T |
+| 1028/2000 | V |
+| 2001/2008/3002/3013/3018 | V/D |
+| 2002/2010/2013 | I |
+| 2004/3011 | V/I/D |
+| 2005 | I/D |
+| 2006 | R/D |
+| 2007 | V/R/I/D |
+| 2009/3000/3009/3010/3012/3016 | V/M/D |
+| 2015 | V/R/D |
+| 3007 | VV/D |
+| 3017 | M/R/I/D |
+| 3021/5000 | R |
+| 0/2003 | None |
+
+
+Child creation retains its native form:1001 process `100d3b0e` uses dynel;
+1002 init `100d52dc` creates vector orbit and dynel cord children;1011 init
+`100f4053` and1022 init `100ff18c` use vector;3026 `10114793` creates its
+primary through matrix and destructor `101145f1` its impact through vector.
+Spell1 phases `100f2495`/`100f280e` use vector and `100f290c` dynel.
+Sequencer3004 `100ec640` forwards stored mode0/1/2/3 as vector/matrix/
+dynel/RConnector. Required hit-location and connector inputs are not invented.
+
+#### Global, geometry and particle controls
+
+| Class/family | Native implementation evidence |
+| --- | --- |
+| 1000 BlackOut | GC ctor `100d37ed`, loader `100d3667`, init `100d367e`, process `100d3494`, delete `100d3444`; record3100. |
+| 1014 WhiteIn /1015 WhiteOut | GC ctor `10104a94`/`10104d5c`, loader `101048d0`/`10104c09`, init `10104907`/`10104c30`, process `101046c8`/`10104b44`, delete `10104678`/`10104b05`; WhiteIn graceful `10104a78`. Records3200/3000 retain native missing-field zero accessor `10106893`. |
+| 3037 VisionTint | GC ctor `101158d8`, loader `10115741`, init `1011544e`, process `10115394`, delete/fog restore `10115311`; records71121/71122 use actual noise.PNG/fog_particle.png, three/five layers. DS `10023929` fullscreen repetition; `1002eec0` textured tint/UV scroll, flag0x400 jitter once,0x800 V-flip; priority7 `1002ece0`; WhiteIn DS `10023662` uses blend5/2. |
+| 1017 Nano2 | GC loader `100e8c4f`, init `100e8cf2`, process `100e88bb` queries actual rig anchors1006–1014/2001/2000/1000; words10–17 are inert. DS ctor `10018c08`, eighteen-block update `1001975e`, perspective ribbon joins `10018de7`; CRT reseeding and native point-buffer aliasing retained. Artifacts22818/22860/22892. |
+| 3000 ShockWave | GC vector/matrix/dynel ctors `100ee7f0`/`100ee8a6`/`100ee96b`, loader `100ede77`, init `100ee576`, process `100edfd0`, delete `100ee45e`; DS ring `10016e84`/`100172bd`, cone `1000bd0a`/`1000c0ec`. Delayed terrain-ring edges, UV flags and optional cones; records30101/30102,43100–43104/43106,45084,71226,97140. |
+| 3001 Deformer | Dynel ctor `100d7ed6`, loader `100d7ce7`, process `100d7752`, vertex callback `100d7217`, graceful `100d71ea`, delete `100d7bf5`. Record31101 moving attractor spheres;31201/43764/45057 spatial/time sin² normal deformation;12276 uses real CAT42886/animation42892 collapse/restore. Sources artifacts22612/22670/22725. |
+| 3024 BParticle | GC loader `1010a0f0`, visual construction `10109ebe`, process `1010a3b5`; DS ctor/process/draw `10009938`/`10008bce`/`1000a70f`, priority6 `100089f4`. Modes0–12, shared atlas-rate pingpong, pulse8 sentinel999, emissions9/11/12, geometry/size/spin, velocity/gravity, colour/width, distance alpha and terrain0x400. Assembly `10109f34`–`10109ffe` fixes width words31/33/35 versus heights32/34/36. Artifacts22594/22600. |
+| 3028 BParticle2 | Vector/dynel ctors `1010bf1f`/`1010c06b`, loader/init/process `1010ac44`/`1010ba11`/`1010af47`, graceful/delete `1010aa16`/`1010c277`. DS `1000b432`/`1000b4fc`: quad/triangle/asymmetric doubling; geometry>2 retains native degenerate fallthrough. Ground0x400/0x8000/0x10000, height0x800000 fade3–6, environment0x400000 raw day seconds/3240 folded2−f with minimum0.3, body0x1000000 scale² emitter; independent RNG streams. |
+| 3030 GroundGrid | Vector/dynel ctors `1010e86a`/`1010e96a`, loader/init/process `1010e66b`/`1010e3ff`/`1010e1b2`, duration `10102eb5`, graceful `100a719a`, delete `1010e7ea`. DS ctor/update/alpha/states/draw/colour `10016c68`/`100164b4`/`1001692d`/`10016961`/`10016b9e`/`10016e15`: fixed/moving terrain grid, native row strips, UV, radial/Manhattan attenuation and sine32 phase. Records71222,71230–71237,71303,71370; artifacts22594/22615. |
+| 3031 TParticle2 extensions | Vector/dynel ctors `10114265`/`101143bb`, delete `101145d2`, inherited graceful `100a719a`; §7.7 retains core addresses. Terrain/atlas branches,0x100/0x80000 UV and0x40000 camera-facing alpha; angular RNG still sampled although visual ignores angle. Sources22594/22600/22919/22691/22750, shared with3028. |
+
+Installed3024 record72340 uses mode13. DS `10009938` zeroes its state,
+switches only0–12 and has no default: mode13 consumes no mode RNG and
+draws no geometry, a native zero-state fallthrough rather than malformed
+authored data (artifact22600). Sprite1012 selectors1/2 similarly terminate
+in GC `100f5f2e`, not parser rejection (§7.3).
+
+Native30001 regression expectations, not runtime formulas, were corrected
+from RE: ShockWave30101 word22=`0.209999993` raises terrainY7 to7.21
+(`100ede77`/`100edfd0`). Deformer31101 callback `100d7217` mutates
+vertices sequentially with attractors as the outer loop: displacements
+0.03/0.0225/0.016875 total0.069375, not a summed0.09 (artifact22670).
+31201 graceful (`100d71ea`/`100d7752`) keeps native float elapsed:
+after0.05 then two0.5 steps fade age is0.99999994 and remains alive;
+the next0.01 ends it. No test execution is claimed by this documentation note.
+
+Shared curve cursor follows GC `101161a1`'s declared count/pairs, while
+CMS accessors `10106872`/`10106893` return zero beyond the record.
+Shield71320's40-word payload declares offset count9 at28 and therefore
+has an implicit zero tail, not malformed curves; compressed zero-tail
+storage bounds allocation. Shield71319 retains stop child71360 at39.
+Class1002 `100d52dc` asks `10105c2e` for the source dynel before cord
+creation: only a nonnull result creates its dynel child. Vector/matrix/
+RConnector parents retain the orbit child but do not invent a dynel cord
+identity (`100d52dc`/`100d53e3`/`100d57bb` constructor export).
+
+3028 GC `1010aa21`/`1010abc3`/`1010ac02` preserves actual source
+visibility: invisible controls bypass particle emission/lifetime processing,
+while base elapsed time advances, without catch-up on visibility restoration.
+BodyScale starts at native1 (`1010ae67`) and updates from the actual dynel.
+
+Runnable unit checks (not run here): `authored_global_fades`,
+`authored_tint_layers_and_uv_motion`, `authored_8012_nano2_trails`,
+`authored_30101_terrain_rings_and_cones`,
+`authored_31101_localized_attractor_deformation`,
+`authored_31201_envelope_and_callback`, `authored_12276_morph_phase`,
+`authored_bparticle_modes`, `authored_bparticle_native_branch_matrix`,
+`authored_bparticle2_modes_preserve_display_and_crt_streams`,
+`authored_crystal_73001_terrain_modes`,
+`authored_71230_radial_ground_strip_lifecycle`, `retail_groundgrid_authored_modes`.
+Ignored installed-asset frame checks require `AOMAC_EFFECT_FRAMES`:
+`retail_global_frames`, `authored_nano2_actor_frames`,
+`retail_native30001_authored_frames`, `authored_bparticle_offscreen`,
+`retail_particle_dependency_frames`, `retail_crystal_authored_modes_frames`,
+`retail_groundgrid_frames`. Their existence is not an observed frame result.
+
+#### Additional installed modes and surface controls
+
+| Class/family | Native implementation evidence |
+| --- | --- |
+| 1020 NightVision1 | GC ctor `100eaddd`, loader `100ea6a1`, init `100ea813`, process `100ea652`, duration `100ea694`, graceful `100a719a`, destructor/fog restore `100ea5c5`, scalar delete `100eae3b`. Up to three viewport layers with independent blend/repeat; DS priority7 `10023885`, fullscreen strip `10023929`. Optional distortion DS `10011597`/`1001165a` calls empty `10007a2f`: native no draw, not missing geometry. Nine records3400/3401/3410/3411/3422/3423/3430/43652/43733. |
+| 2001 Spiral | GC vector/dynel ctors `100f4ab6`/`100f4e53`, loader/init/process `100f499c`/`100f49f0`/`100f4760`, graceful/delete `100f488e`/`100f4f87`; DS `10021eb4`/`10021924`: two twelve-segment strips, native sweep/radius/pitch/UV, independent Y rotation, endpoint clipping. Records11200/43010/43011. |
+| 2002 Plasma | Hit-location-only ctor `100ec059` via `100d145c`, loader `100ebf73` (duration18 overrides8), init/process `100ebfcd`/`100ebd91`, hit endpoints `10104fa8`/`10104fde`, graceful/delete `100ebe66`/`100ec194`; DS `1001b8f7`/`1001bbf2`:75 segments, four sine-cubed waves and CRT phase perturbation, two-sided camera ribbon. Records11201/17500/17600/17912–17914; located creation of17600 is native null. Sources22557/22571/22592/22660/22744/22757. |
+| 2011 Highlight extensions | GC ctor/load/process/delete `100e2e10`/`100e286a`/`100e29a7`/`100e2bde`: modes1/3 use1−(2t/duration−1)²; mode3 updates only held VisualAttractorMesh place≠0, including specular, not CAT root. Records11507/11508; flag0x400 in61110/61112 sets root priority−1 (`100e292b`) and restores on deletion. Word11 suppresses restoration, but all installed records have0. |
+| 3015 LavaBall | GC ctor/load/init/process/graceful/delete `100e435c`/`100e4031`/`100e413e`/`100e3005`/`100e3f04`/`100e4cd9`; DS `10010d70`/`1001105e` and render bucket100 `100078c8` (not near clipping). Mode0 ballistic terrain/collision/audio, mode1 camera arc, other modes fixed camera hemisphere; two128-slot DiaBill pools, CRT wait/azimuth,64-frame atlas, per-frame fire velocity×0.8 and30-impact cap. Records12300/12301/12560/12580; artifacts22826/22935. |
+| 3018 SkyRise | GC vector/dynel ctors `100efd12`/`100efe2c`, loader/init/process `100efb10`/`100ef7a5`/`100ef462`; DS ctor/hemisphere/two-pass strips/flat height-colour/endpoints `100203c9`/`1001ff05`/`1002016d`/`1001f39d`/`1001fb2b`. Record12520 mode0;12521 mode1 flags5 radius+pulse;12522 mode1 flags3 radius+colour. |
+| 3019 Trail | GC ctors `101020db`/`101021ad`/`10102301`/`10102455`/`1010252d`, loader/init/process `10101f88`/`10102010`/`10101ddb`; graceful `10101e67` only writes field0x40. DS `1002b486`:50ms sampling,1000-slot ring,50 points, spatial2.5;12570 absent mode defaults0,71000/71003 mode1 four oriented strips. |
+| 3020 TParticle extensions | GC init/load/process `101125fd`/`1011277c`/`10112bb0`, DS `10029de9`/`10029c81`/`1002a350`: mode1 static box endpoints consumes three DS RNG samples; mode2 ring radius12, Y=random×600 and tangent+2 consumes two; mode3 zero endpoints/no rendering/no samples. Constants DS `1008b898`=600, `1008a128`=2; terrain0x400 snaps initial position only. Sources22594/22600. |
+| 3021 Buffer | RConnector-only ctor `1010c32c`, process `1010c296` uses live connector; record71012 has empty payload. DS `1000bc0b` invokes viewport depth-only clear; Randy `1004b75a` confirms D3DCLEAR_ZBUFFER2 with target=false. Ordered attachment clear preserves colour and resets depth1.0. |
+| 3023 Energy | GC ctors `1010dfa5`/`1010e01a`/`1010e08f`/`1010e107`, loader/init/process `1010d937`/`1010d7ed`/`1010dae7`; DS `100123c5`/`10012264`/`10011e31` draws three rotated quads per angular step; installed modes0/2. |
+| 3027 MParticle | GC ctors `1010fea9`/`1010ff76`/`10110046`/`10110119`, loader/init/process `1010f09d`/`1010fcd8`/`1010f3da`, selector `1010ef6f`, embedded mesh attributes `1010eeef`: one-shot0/continuous1, gravity/bounce/fade/scale/spin and CRT mesh choice. |
+| 3029 Scatter | GC loader/init/process/finish `101107b5`/`10110864`/`10110357`/`10110771`: mode1 is random XYZ×word9 plus progressive native Z word8/count, not a polar ring; mode0 random XYZ×word8. Terrain0x1000 precedes authored offset;0x2000 preserves source creation form, otherwise vector. Progress does not reset on repeat; graceful forwards to children and clears repeat0x400; delete destroys children. Records71305/71306/71310. |
+| 3034 Shield2 extensions | GC loader/init/process/ctor `10110f3a`/`10111326`/`10110bbf`/`101114fc`, CAT/mech callbacks `10111147`/`10110dc3`. Word20 selects actual EP03_*_simple.abiff0–9, not *_statel; CAT uses posed surface/source material under0x10000. DS `1001d569` provides cylindrical/source UV and sin² normal displacement. CAT Stop under0x20000 hides and emits actual child71319→71360; graceful is separately two seconds. Flag0x8000 priority3. |
+| 3038 VolGrid /3039 Trail2 | Grid GC loader/init/process `10115a3b`/`10115964`/`10115d41`, DS `1002f86d`/`1002f69e`: actual plane counts and five curves; words10–12 loaded but inert. Trail GC load/process `10114c39`/`101150b4`, DS `1002c918`: actual2006/2007 connector, fixed sample ring/cadence/four strips/thrust/fluctuation, immediate graceful finish. |
+
+Surface sources: artifacts22617/22621/22646 and
+`/tmp/FxClasses/surface-doc.txt`. Nano2 clarification: geometry consumes792
+DS R250 samples per process (XOR lag147/ring250, DS `100844df`);
+the CRT srand42/time calls are separate side effects, not geometry seeds.
+
+Additional runnable checks, not run here:
+`authored_nightvision_layers_and_native_lifetime`,
+`authored_43010_43011_spiral_lifecycle`, `authored_17500_plasma_hit_lifetime_and_rng`,
+`authored_11507_held_specular_has_parabolic_envelope`,
+`authored_71320_mech_cylindrical_uv_and_71319_stop_child`,
+`authored_modes_preserve_native_rng_and_motion`, `ground_flag_snaps_only_initial_position`,
+`all_authored_class3020_records`, `authored_lavaball_lifecycle_and_atlas`,
+`ground_collision_caps_native_impact_emission`,
+`authored_legacy302x_geometry_and_lifecycle`,
+`authored_12570_trail_missing_mode_defaults_to_zero`,
+`authored_71250_mesh_particle_reset_preserves_random_order`.
+Installed frame checks: `retail_nightvision_frames`, `retail_native2001_frames`,
+`retail_native2002_hit_frames`, `retail_highlight_held_authored_frames`,
+`retail_surface_authored_modes_frames`, `retail_class3020_frames`,
+`all_authored_lavaball_frames`; no frame outcome is inferred from these names.
+
+`retail_class3020_frames` now enumerates every installed class3020 record,
+including the newly supported endpoint modes, with a terrain callback.
+`retail_surface_authored_modes_frames` also enumerates class3036 Toggle:
+its harness supplies an authored-list-compatible playfield/mask context and
+a moving-to-stopped source transition, without rewriting templates or children.
+These additions have not been run or visually inspected.
+
+#### Legacy geometry, mesh and audio variants
+
+| Class/family | Native implementation evidence |
+| --- | --- |
+| 1023 Nano3 | Record8020, GC vector ctor `100e9d86` through dynel `100ea146`, loader/init/process `100e90d7`/`100e9ad7`/`100e9855`, emission `100e92a9`/`100e9583`: Sprite2 hundred-particle burst initialized before setters, mode0, alpha-blend0x800. |
+| 1028 Explosion | Record4000 vector ctor `100e564b`, loader/init/process `100e528c`/`100e54ad`/`100e52cf`; DS rock list `1001c435`:32 rocks, selectors(rand&7)+11, R250 velocity×15, spin8, gravity9.8, bounce0.5 and stop below0.5 speed; ctor overrides duration to−1. |
+| 2008 Cone | Record15400 vector/dynel ctors `100e2781`/`100e26ed`, loader/init/process `100e1ed9`/`100e2590`/`100e2069`; DS Cone `1000bd0a`: six staggered rings×four cones, actual terrain, packed growth/fade, radius1.4/spin. |
+| 2009 Drip | Record25318 vector/matrix/dynel ctors `100d8c5b`/`100d8d6d`/`100d8f04`, loader/init/process `100d8a2f`/`100d8aec`/`100d8661`; DS DiaBill `1001105e`: eight drops grow/fall/ground/shrink, acceleration0.01 per process, not delta-scaled. Graceful `100d8902` writes an unread field; expiry extends five seconds while visual exists. Sources22818/22860/22871/22902/22996. |
+| 3012 GroundRing | Vector/matrix/dynel ctors `100e1d53`/`100e1dc2`/`100e1e31`, loader/init/process/delete `100e1ba1`/`100e19cc`/`100e1729`/`100e1ce7`; DS `10016e84` ring strip, `10017051` SRCALPHA/ONE. Flag0x800 samples terrain only initially, otherwise per frame;0x1000 preserves locator loss. Material100000 is native null (`10106f39`), not a missing-texture substitute. |
+| 3013 Delay | Vector/dynel ctors `100d851e`/`100d857d`, loader/process/delete `100d8499`/`100d830b`/`100d82c5`, graceful `100d83ba` forwards only active child; duration `100d83d7` child duration+15. CRT15-bit/32768 delay, strict<0 spawn, vector child with captured dynel locator; setters forward only after spawn. |
+| 3014 Vein | GC ctors `10102cde`/`10102d53`/`10102dc8`/`10102e40`, loader/init/process/delete `10102ad0`/`101028c4`/`10102731`/`10102c39`; graceful `100a719a` immediate, duration `10102eb5` lifetime only. DS ctor/draw/geometry/second pass `1002e885`/`1002e6d1`/`1002def9`/`1002d79f`: nine animated controls, clamped order4 cubic basis (`10004328`/`100041ff`/`10004373`/`100043c3`), not linear interpolation. Cumulative growth `1002dd59`, packed curves `1002db0e`/`1002dc61`, native facing/log-distance alpha, V-scroll−3 `1016d1d0`, owned children28/29. Records12200–12203/12206,96002–96005; artifacts22826/22997/23001/23023/23043. |
+| 3016 Bubble | GC vector/matrix/dynel ctors `100d48d4`/`100d49fd`/`100d4bab`, loader/init/process/delete/graceful `100d46a0`/`100d476c`/`100d41f9`/`100d4cd7`/`100d4573`:25 slots, per-frame jitter, interval22/burst24, optional mode25 zero default, mode1 burst2 versus5; age atlas trunc(age×16)&7 mirrored, lifetime21 overrides8 plus5-second drain. DS `1001105e` uses2×2 UV. Sources22826/22861/23045. |
+| 3033 Spiral2 | GC vector/matrix/dynel/connector ctors `10111cec`/`10111d54`/`10111dbc`/`10111e7f`, loader/init/process/graceful/duration/delete `1011194c`/`10111a8a`/`101116ef`/`10111824`/`1011193f`/`10111bfc`; DS ctor/states/draw `1002270b`/`10022256`/`10022407`/`10022687`. Authored strip/segment/spin/acceleration/curves, random999 angle, one-second graceful fade/radius+1; dynel factor uses raw CAT sphere (`10072c22`/`1007494b`) divided by0.25075000524520874 times CAT scale. |
+| 3035 AParticle | GC loader/init/process/delete `1010829c`/`10108a48`/`101084f5`/`1010847a`, duration `10102eb5`: actual camera-centred wrapping cube, reseed, mode1/2 oscillation, per-particle size/frame/spin/frequency/amplitude, distance colour and atlas loop/clamp/pingpong; DS BParticle2 visual. Environment+0x90/+0x94 are oscillator channels, not weather wind. Camera source confirmed by GC `100b19e4`→`100b005c`, n3Camera+0x1ac–0x1b4. |
+| 3036 Toggle | GC loader/init/process/graceful/delete `10112109`/`101121c0`/`10112401`/`10111f72`/`10111f06`: actual TILEMAP resource+0x1c include/exclude0x800 and mask+0x50, unlocated override0x1000, movement edges0x2000/0x8000 (`1011202f`); owned child lifetime/termination/deletion. |
+| 3025 mesh variants | GC `1010c825` defaults, `1010c477` visibility, `1010c526` attractors, `1010c94a` process; oscillator assembly `1010cb4e`. Flags0x200 body scale,0x100 terrain,0x400 camera facing,0x800 first-person/distance opacity,0x2000 vehicle gain,0x4000 initial gain0,0x8000 breed4 scale1.45,0x10000 authored Atrox names. DS `1006ce7d`→`1006c61d`, callback `1006c005`/exit `1006b795`: Holo textures28022/28023 with local elapsed UV, lit/unlit/fog/depth-only clear/additive/z-bias states; no repeated mode6 draws. Flag0x1000 uses actual ABIFF animation as described below. |
+| 4000 Audio extensions | GC `100d3190`/`100d30c1`/`100d3012` forwards all nine AFCM0x103 words once. SI `100071ed` radius ROUND(r−0.49999), `10002d98` playback, `100025fc` duration loops, `10003b70` hold/fade expiry; delay `10003f61` restarts only first due entry per frame, resetting probability100/radius0/velocity0. Definition duration inheritance `10003520`; velocity affects Doppler, not position integration. Sequential children start index1/advance once per frame; random child avoids last after frame. |
+
+Exact authored boundary corrections: GroundRing60005 begins U at
+`15/16=0.9375` and ends at15 (DS `10016e84`, artifact22725);
+Bubble12400 emits only when elapsed is strictly greater than its
+word22 interval `0.899999976`, not0.81 (GC `100d41f9`, artifact22826).
+
+Mesh-animation0x1000 now uses the existing ABIFF `NodeRig` through
+`load_animated_mesh`/`pose_parts`, looping at authored total_time, with actual
+sampled object-space node matrices and per-part CPU poses. Initial velocity
+and acceleration transform once through the source matrix
+(`1010cf05`→`1010a9a0`). Mesh deletion `1010d759`→`1010c895`,
+position/matrix updates `1010c508`/`1010c517` and immediate graceful
+`100a719a` retain their separate native paths. Audio graceful `100d30b4`
+is empty: cancel preserves still-undispatched4000 audio; source setters
+`100d3085`/`100d309b` update its pending position.
+
+Mesh contexts use actual camera/source/body/vehicle values. Dynel-locator mesh
+controls terminate on deleted/missing dynels; non-dynel constructors retain
+native defaults (scale1/breed0/no vehicle/direction0/visible). No fake actor
+is supplied. Actor priority−1 suppression precedes alpha priority6 override
+(Randy `1004cc35`); native render-list ordering is `1004c9c2`/`1004bfff`,
+DS `100796d9`. These rendering contracts are described in dynels.md.
+
+Further checks, not exercised here:
+`authored_25318_drip_four_state_lifecycle`, `installed_legacy_authored_record_shapes`,
+`authored_60005_groundring_terrain_uv_envelope`,
+`authored_61101_groundring_null_material_frozen_terrain`,
+`authored_12400_bubble_emission_atlas_and_drain`,
+`authored_100385_bubble_mode_one_and_optional_mode_zero`,
+`authored_62010_delay_random_interval_and_capture`,
+`authored_12201_vein_cubic_periodicity_and_two_passes`,
+`authored_legacy303x_records_and_lifecycle`,
+`native_oscillation_and_vehicle_camera_gain`,
+`authored_class4000_sequence_and_delay_contract`.
+Ignored frame/PCM checks require `AOMAC_EFFECT_FRAMES`:
+`retail_legacy_sprite_authored_frames`, `retail_legacy301x_authored_frames`,
+`retail_vein3014_frames`, `retail_legacy302x_authored_frames`,
+`retail_legacy303x_frames`, `all_authored_mesh_modes_frames`,
+`authored_native_tracer_mesh_frames`, `authored_class4000_sustained_audio_frames`.
+
+#### GlobalSmoke, Beam and world controls
+
+| Class/family | Native implementation evidence |
+| --- | --- |
+| 3017 GlobalSmoke | GC resource/dynel ctors `100e066f`/`100e0835`, loader/init/process/graceful/delete `100e00ba`/`100e01e3`/`100df6e3`/`100dff8d`/`100e0b52`; DS ctor/draw `1002061d`/`10020836`, priority6, SRCALPHA/(mode5 INVSRCALPHA else ONE).64 sprites; all modes0–6, including92001 mode6 negative-up; mode1 terrain-steered five-sample trail, mode2 angled gravity, mode3 directional/80-unit camera-distance gate, mode4 gravity, mode5 authored rate/divisor. Graceful extends duration five seconds once native base expires. |
+| 3022 Beam | GC vector/matrix/dynel ctors `10109c7a`/`10109cf5`/`10109d70`, loader/init/process/graceful/delete `101092b7`/`10109199`/`101096b7`/`1010916d`/`1010953f`; DS ctor/states/vertices/draw `10007ef4`/`10007d2b`/`10008056`/`100087c1`. Authored crossed-diameter frustum facets from45° at180/n increments, optional cap39/height40, rise/hold/fall radius/ARGB, jitter/rotation, terrain/tracking, mode0 gravity−800, repeat delay41, atlas/UV/view-normal/horizontal flags. Graceful caps remaining/fall to three seconds. |
+| 2012 Fence | GC ctor `100db6f8`, singleton `102e9888`, loader/init/process/graceful `100dac76`/`100db3d4`/`100dadcd`/`100dab49`: actual type1000021 playfield polygons and destination flags&0x8000ffff, incremental nearest-edge squared distance,64 spark pool. |
+| 2014 Font | GC ctor/load/init/process/graceful `100df42d`/`100decc3`/`100dedc8`/`100deb04`/`100deba5`, SetText `100dee29`, metrics `102c4608`, mapping `100dede6`; DS DiaBill `1001105e`, priority7/material40; actual record12122 uses world text, not a GUI label substitute. |
+| 2015 Notum | GC vector/connector/dynel ctors `100eb368`/`100eb42d`/`100eb4a8`, loader/init/process/graceful `100eaeb9`/`100eb20e`/`100eaee9`/`100eaea2`. Empty payloads12120/12121/12123 retain native zero CMS fields; initial offset trunc(X×0.25) (`100eb227`–`100eb24c`), actual GameTime mod270 gives three-second cone pulse. DS `1000bd0a`/`1000c0ec`, eighteen strip vertices, material13/priority6/additive; graceful no-op is native. Sources22812/22862, installed table23207. |
+
+Unexercised checks: `authored_global_smoke_gravity_slots_and_graceful_extension`,
+`authored_beam_facets_cap_and_native_fade_termination`,
+`relative_smoke_births_follow_attractor_existing_particles_follow_root`,
+`installed_all_global_smoke_and_beam_modes`,
+`native_font_metrics_spacing_and_lifecycle`,
+`authored_notum_empty_payload_and_position_clock`,
+`native_boundary_destination_flags_and_truncation`.
+Ignored `authored_native3017_3022_frames` enumerates all51 installed templates;
+`retail_legacy_buffs_all_authored_frames` covers the world-control records.
+Both require `AOMAC_EFFECT_FRAMES`; neither was run by its implementation worker.
+
+Fence check `authored_11600_fence_pool_and_graceful_drain` uses actual11600
+words and playfield566's424-byte polygon record (one polygon,25 points);
+it was added but not run by its worker.
+
+#### Remaining native mesh and specialized factories
+
+| Class/family | Native implementation evidence |
+| --- | --- |
+| 3002 Splash | GC vector/dynel ctors `100f5707`/`100f587e`, loader/liquid init/process/delete `100f5081`/`100f5522`/`100f522e`/`100f5a05`: staggered parabolic cone strips; liquid kind2 or source above liquid suppresses output. All six34101–34103/34201–34203 records have unused duration word8=0xffffffff (NaN), not a substituted finite timer. |
+| 3005 WaterRipples | GC ctors `10103d0a`–`10103fe4`, loader/init/emission/process/graceful `10103c1c`/`10103bd4`/`10104162`/`101042de`/`10103bcc`; DS `100307b0`/`1003049f`/`100303d9`: actual liquid depth>0.01 and flags&0x1e≠2, speed-dependent minimum emission delay, expanding annular strips; record33000. |
+| 3008 Shadow | GC ctor/init/process/callback `100ece3a`/`100ecdb5`/`100eccc9`/`100ecee4`/`100ecb6b`; DS `1001f0e9`/`1001e556`/`1001e75d`/`1001e90e`: CAT every-fourth-vertex bounds, adaptive≤300 segments,50-unit camera cutoff, outdoor0x5f000000/dungeon0x2f000000 soft ellipse, actual terrain warp+0.02. Actual sun/collision projection is integrated from assembly `100ed0b1`–`100ed4a1` and terrain helper `100ed5a9`, not a guessed projection. |
+| 3009 CrazyCone | GC vector/matrix/dynel ctors `100d6fbf`/`100d703c`/`100d70b9`, loader/init/process/delete `100d6517`/`100d6e5a`/`100d6874`/`100d7165`:29-word staged accelerated cone geometry/UV and byte-colour pulse; eleven records. |
+| 3010 Mesh | GC vector/matrix/dynel ctors `100e50e2`/`100e5151`/`100e51c0`, loader/init/process/delete `100e4fad`/`100e4e96`/`100e4d9e`/`100e5232`: four actual tower_destroyed_* ABIFF selectors, rise/hold/fall transparency, Y rotation and terrain0x100; five records. Active `TowerMesh` dispatch caches/uploads authored resources, retains source/position and tracked-root setters, source-loss0x200 and actual terrain callback without generic-mesh substitution. Sources22865/23093. Added, not run here: `authored_tower_dispatch_resources_and_cached_root`, `native_tower_source_terrain_and_lifecycle`. |
+| 2013 Projectile | Only hit-location factory `100d145c`→ctor `100ec41a`, vtable `1016c824`, loader/init/process/graceful/delete `100ec307`/`100ec363`/`100ec273`/`100ec2ec`/`100ec218`→`100ec559`. Actual2693/2694 use arrow_short/arrow_long.abiff (names `102c4c20`), speed7; motion=start+delta×speed×elapsed/max(distance,1), expires strictly fraction>1. Base `100d2531` starts elapsed0, second delta caps0.033; no fabricated source/target for absent hit location. |
+| 5000 GroundImpact | Only RConnector factory `100cf872`→ctor `100e103e`, vtable `1016bffc`, loader/init/process/delete `100e0f3b`/`100e0fe1`/`100e0ec0`/`100e0f8f`→`100e12db`. Record90000's four floats are read then discarded natively. ForceSword setup `100e11e0`, DS init/draw `10015730`/`10015f21`: CRT%10+5 cross sections/five trails/jitter/history, actual material1 circle.png, priority6/additive/no fog/depth-write/cull. Connector validity/visibility remains live input; graceful base `100a719a` marks termination. Sources22586/22622. |
+
+Shadow uses real VisualEnvFX sun direction, twenty-metre upper/lower rays
+and native fallback ray selection; discrepancy>0.2 disables terrain warp.
+Dungeon uses−Y/direct ground plane without rays; degenerate projection
+normal yields no shadow. WaterRipples' unused light setter `10030917` has
+no GC caller: constructor `100307fd`–`1003080d` zeroes light direction,
+and palette `100303d9` retains native0x7e7e7e, not invented lighting.
+Additional unexercised unit check `native_shadow_ray_selection_and_dungeon_projection`;
+ignored `authored_legacy300x_surface_frames` covers3002/3005/3008/3009
+including outdoor/dungeon shadows and requires `AOMAC_EFFECT_FRAMES`.
+
+
+Special effects preserve hit registry GC `100cda79`/`101056b4`,
+ctor `10104dca`, start/end `10104fa8`/`10104fde`: misses lock target position
+minus nativeE2×10 (`1015f168`), connector override `101050a4`/`101050ba`,
+locator invalidation `1010603b` freezes the last position, and retention
+`10105621` uses strict10,000-clock-unit expiry excluding the newest entry.
+Weapon groups1/2 in `1009ad7d` use NewHitLocation/integer factory, while
+GroundImpact's stack/start list is `100d1ecf`.
+
+Unexercised checks: `authored_legacy300x_records`, `native_mesh_resource_names`,
+`native_mesh_alpha_envelope`, `authored_ground_impact_90000_uses_native_generated_mesh`,
+`authored_special_factory_payloads`. Ignored `authored_legacy300x_tower_frames`
+and `authored_special_effect_frames` require `AOMAC_EFFECT_FRAMES`;
+the latter uses actual2693/2694/90000. No visual equivalence is claimed here.
+
+Runtime environment inputs are also native-derived: GC `100b005c`/`100b061b`
+supplies GameTime `1000b44c` divided by constructor `1000af71`'s15 to DS
+`10062a66`, so3028 receives raw day time0–6480, not normalized weather.
+BodyScale is N3 `10019622`'s dynel+0xac, not inferred matrix length.
+3035 oscillator channels use GC `100b0125`–`100b01b3`, phase+=delta×50
+mod360,90°/180° offsets and native3.140000104904175/180 cosine factor.
+3036 resource TILEMAP/flags come from N3 blob reader `1001c115`, not zone
+instance. Sources22987/23022/23112/23188. Added, not run:
+`effect_inputs_retain_native_vehicle_direction_and_speed`,
+`environment_effect_inputs_follow_native_oscillator_not_weather`,
+`native_effect_resource_keeps_tilemap_and_flags`.
+
+Hit-registry clock is native truncated frame-delta×1000 milliseconds:
+GC `100d2202`–`100d2216`, double `10157870`=1000, then prune
+`10105621`; the strict retention boundary above is therefore ten seconds.
+Missing identities permanently change locator mode to0 but retain cached
+actual position; DeleteEffect does not delete registry entries. Additional
+unexercised checks:
+`native_miss_locks_target_forward_and_shared_connector_overrides`,
+`native_hits_track_and_missing_dynel_freezes_locator_until_registry_expiry`,
+`native_miss_zero_delta_does_not_lock_and_retention_boundary_is_strict`.
+
+#### Shared hit-meta, authored mesh children and fog
+
+Class2010 uses actual hit-location Meta, not a dynel fallback: ctor
+`100e5c3f`, shared process/load/delete `100e57f3`/`100e59b2`/`100e5799`.
+Words10/11 override the original shared hit locators via `101050a4`/
+`101050ba`, then `100e5cdc` creates all ten children through the integer
+factory with that same handle. Records17950–17953 reference actual17000/
+17600/17912–17914 and3001/1006/1003; wrapper has no geometry.
+Graceful forwards to children, deletion cancels all, NextState is no-op,
+and duration override adds15. Check `authored_hit_meta_children_and_locator_overrides`
+and ignored `authored_hit_meta_frames` were added, not run.
+
+Authored ABIFF `eff_` children use DS name parser `1006d49a`, tables
+`100af3d0`/`100af450` and effect-data32-byte getter `1006bb1a`/
+`1006bb02`. GC `1010eeef` attaches actual metadata; N3 `10007fe5`
+starts with handle0, enable `1000806d`→GC `100cdb89` creates through
+RConnector or enables retained handle, disable `10008085`→`100cdc3d`
+retains processing, destructor `10008021` deletes. No constructor-only
+child substitutes the authored enable lifecycle. Checks
+`native_mesh_effect_name_table`, `native_mesh_children_start_disabled_without_handles`,
+ignored `installed_effect_connector_metadata`/`authored_mesh_effect_children_frames`
+are unexercised here. Animated UV consumer Randy `1004d84a` applies
+scale/offset to stages0/1; DS ctor/evaluator `100295ab`/`10028fde`;
+renderer per-part UV matches that formula without copying vertex UVs.
+
+Native fog is shared logical state with capture/process/destructor restore,
+not an OR of active effect flags: DS GetFogMode `10058011`, NoFog
+`10058015`, SetFogMode `10058409` (input0 sets logical3/weight0.1),
+process `10058443`; Randy `10041876` re-enables linear fog and ignores
+the mode booleans. NightVision process `100ea652` reasserts mode0;
+VisionTint `10115394` reasserts NoFog while alive/visible. Deletes
+`100ea5c5`/`10115311` restore their last captured mode, not preferences.
+New `native_overlap_preference_and_destructor_order` and ignored
+`native_fog_mode_frames` were not run. Native ordering is now traced:
+GC playfield `10016e2c` appends EffectHandler before Environment;
+N3 `1000d02b`→`10007df4`→`1002999e` appends children, and
+`10007e07` runs them in that order. Environment `100b19e4`→
+`100b8ad7`→`100be767` runs DS fog `10058443` after effect processing,
+before EXE `0040383a`'s DS render. Normal initialized indoor/outdoor
+weather paths re-enable hardware fog; no ordinary missing-record
+exception is asserted. Source artifact23398 and native child-order exports.
+
+Caller fallback also preserves native null versus allocated terminated
+control: CF26/CFD4 GC `100a5083`/`100a8c03` try unlocated→dynel→
+hit-location only on zero, not on an error or a nonzero terminated handle.
+Their final hit-location uses source application dynel/controlled caster,
+attractors3001/1006 and hit=true; CF57 remains its separate dynel path.
+`spell_visual_fallback_only_retries_native_null` was added, not run.
+An absent visual does not universally imply factory null: Highlight2011
+waits, Stars2004 marks done;1023/2009 dynel ctors unconditionally
+initialize their visual after locator failure, and2009 can extend its drain.
+No synthetic actor position is supplied to hide those distinctions.
+
+GroundGrid native clamp flag0x10000 uses DS `10016961` texture-stage
+ADDRESSU/V/W=3; default1 is wrap. The renderer retains actual sampler
+state rather than CPU-clamping UVs. Checks
+`native_texture_clamp_uses_distinct_cached_sampler_materials` and
+`authored_groundgrid_clamp_material_state` were added, not run.
+Notum time is actual GameTime `100050a6` seconds in its27-hour day,
+from server clock×15, absent until a GameTime message; it is not epoch
+or effect elapsed time. The extended `game_time_sets_the_sky_clock`
+check was not run by its implementation worker.
+
 ## 8. Not found / open
+
+### Observed verification boundary (2026-10-07)
+
+The final all-class `retail_authored_effect_census` and final integrated
+workspace gate have **not run**. Consequently there is no observed final
+per-class record/mode/reachability table to publish: the former rough
+unsupported-class and malformed-record counts are not retained as current
+coverage. The runnable census prints every installed gfxtweak record,
+all fifteen creation forms, native null versus construction/configuration
+failure, source bindings, deferred/impact/profile child reachability and
+native-rejected versus unresolved malformed source records:
+`cargo test --release -p aomac retail_authored_effect_census -- --ignored --nocapture`.
+Its synthetic constructor fixtures are not live-frame coverage.
+
+#### Native creation modes and unsupported boundaries
+
+The creation-mode matrix in §7.9 is the exact native factory eligibility
+table (`effects_dispatch.rs`, GC `100ce3be`–`100d145c`), not an assertion
+that every mode drew a verified frame. The final census probes all fifteen
+forms independently; modes outside that matrix must return native null.
+
+| Class / mode boundary | Concrete reason | Coverage interpretation |
+| --- | --- | --- |
+| 0, all fifteen forms | Body-profile data; no native factory constructor. | Authored data can be reachable without a drawable control; not an unsupported port class. |
+| 2003, all fifteen forms | No constructor case in any native factory. | Native null, not a missing implementation. |
+| 1016, Unlocated | Native case exists, but no installed gfxtweak template and no renderer implementation. | Unsupported, asset-unexercisable class; no authored configuration can be surveyed. |
+| 2000, Vector | Native case exists, but no installed gfxtweak template and no renderer implementation. | Unsupported, asset-unexercisable class; no authored configuration can be surveyed. |
+| 3011, Vector / HitLocation / Dynel | Native cases exist, but no installed gfxtweak template and no renderer implementation. | Unsupported, asset-unexercisable class; no authored configuration can be surveyed. |
+| Any class in a form absent from §7.9's matrix | Native factory has no case for that class/form. | Native null, not a failed supported creation. |
+
+An installed class marked `supported=true` in the census means renderer
+dispatch exists. `constructed` means its synthetic constructor succeeded;
+neither flag certifies runtime animation, GPU output or live combat.
+
+Concrete installed-art gap (not an unsupported class): TowerMesh3010
+effect61042 selects nameID201713, `tower_destroyed_buff&debuff_LL.abiff`,
+whose installed payload is absent; sibling selector IDs201710/201714/
+201717 have payloads (observed counts1/0/1/1). GC `100e4e96` allocates
+VisualMesh before DS `SetMesh` `1006b623` / `AsyncMesh` `1007125c`:
+the missing asset preserves an allocated nondrawing control and its
+native timer, rather than factory failure or substitute geometry.
+
+Projectile2013 effect2693's `arrow_short` record27728 is likewise absent,
+but its native path is synchronous: GC `100ec363` asks ResourceManager
+GetSync; a null result leaves clone+0x48=0. Process `100ec273` advances
+base state but performs movement/distance expiry only with that clone,
+so the missing arrow retains a stationary nondrawing base control.
+TracerMesh3025 effect71123's absent `EP03_mech_heal_effect.abiff` instead
+uses GC `1010cf05`'s allocated VisualMesh/void SetMesh, pending callback
+`1010c526`, native controls and visibility. MParticle `1010fcd8` allocates
+every VisualMesh0xc0 before SetMesh/disable; missing payload registers
+`1010eeef` callback rather than deleting slots, and `1010f3da` processes
+the visual pointer. Its missing-heal regression changes actual71250's
+selector to the real absent resource; that is not an authored3027 census
+gap. Malformed present resources still propagate errors. GroundImpact
+`100e11e0` builds ForceSword geometry, not an absent mesh fallback.
+Added, not run by implementation workers:
+`installed_2693_missing_arrow_retains_stationary_control`,
+`installed_71123_missing_heal_retains_visual_control`,
+`installed_mparticle_missing_heal_keeps_slots_and_lifetime`.
+
+Executable provenance matters: the available
+`/tmp/FxClasses/target/release/deps/aomac-193ed793dfd6d465` lists779 tests
+and lacks `retail_authored_effect_census` (listing artifact23504).
+Its older `retail_effect_census` was exercised against installed assets
+(artifact23507), but its parser/support mapping predates this integration;
+neither its failures nor its supported flags are final coverage facts.
+`aomac-102fbe89827e5220` is a CLI executable, not a libtest binary.
+After the parent integration gate rebuild, run
+`CARGO_TARGET_DIR=/tmp/FxClasses/target cargo test --release -p aomac retail_authored_effect_census -- --ignored --nocapture`.
+The `coverage:` rows count distinct authored IDs per class and distinct
+IDs reachable in the union of weapon event10, nano visuals, all item-effect
+spells and persistent stat413 roots, transitively including deferred and
+destructor children. A class's configuration failures count distinct IDs,
+not failed creation forms. Missing49999 is the native runtime meta sentinel,
+not missing artwork. These inventory counts do not certify frames, live
+dispatch or the workspace gates.
+
+Separately, the parent's isolated class1029 gate reports workspace
+**1381 passing tests** (artifact23317), strict clippy (artifact23124),
+and all44 generated frames inspected (artifact23134); its first-class
+implementation was pushed as `48cc58d`. These are isolated1029 evidence,
+not a final all-class gate or retail/live equivalence claim. Live effect45083
+was **not verified**: the window closed without login. §7.8's native addresses
+and record values remain unchanged.
+
 * The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
-* Unsupported authored classes still report their actual ID/class, never
-  fabricated artwork. A read-only installed-data census finds additional
-  weapon/nano roots in classes1018/1020,2001/2002/2004/2005/2006/2011/
-  2013,3000/3001/3003/3004/3006/3017/3022/3029/3038/5000.
-  This inventory is incomplete: the existing spell parser rejects9320 item
-  records and237 nano records, which are counted rather than silently treated
-  as supported. References to effect IDs71900/91000/91006/42161 have no
-  template in the installed gfxtweak table; no replacement is invented.
+* Native nulls and implementation gaps are separate (§7.9): class0 body
+  profiles and class2003 cannot be constructed by any factory; missing
+  class/form cases are likewise native null, not missing port artwork.
+  Actual native-constructible failures retain their ID/class/configuration
+  error rather than substituting another visual.
+* Source-record rejection is also distinct from malformed parsing:
+  GC spell-element dispatcher `1002b297` has no type0x17 or0x25 branch.
+  The census retains those native-rejected records separately from unresolved
+  malformed records, rather than skipping their bytes as supported effects.
+  Parser boundary corrections use GD `1000fb0a` CF41 stat0/int39, native mapping45 (not46), and
+  TextureSpellFormat CF2F ctor/read/write/default
+  `10014440`/`1001474b`/`1001455d`/`100144f1`, vtable `10020c90`.
+  Sources: artifact22543 and the parser worker's native dispatcher export.
+  Added, not exercised here: `texture_and_chat_payload_boundaries`,
+  `installed_texture_and_chat_elements`, `native_unsupported_element_is_not_skipped`.
 * Server `GfxTriggerIIR_t` (0x7A222202)/`HealthDamageIIR_t` (0x3710256C)
   visual dispatch remains separate from the authored weapon/nano paths.
   `PlaySoundIIR_c` (0x455D2938) never occurs in the capture.

@@ -211,6 +211,8 @@ struct Play {
     /// Live sky of the loading/loaded playfield, installed in the viewer when the world appears.
     world_sky: Option<ao_formats::playfield::SkyClock>,
     world_weather: Option<ao_formats::weather::Weather>,
+    /// GC environment-manager +0xc oscillator phase; retained across playfield changes.
+    effect_environment_phase: f32,
     time: f32,
     // character creation / deletion
     /// The delete window kept open below its `MatchError` box (the original's `DialogBox_c::Go` is modal on top of it).
@@ -320,6 +322,7 @@ impl Play {
             world_ground: None,
             world_sky: None,
             world_weather: None,
+            effect_environment_phase: 0.0,
             time: 0.0,
             cc: None,
             cc_world: None,

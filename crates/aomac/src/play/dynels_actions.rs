@@ -1,6 +1,6 @@
 //! Server-requested authored effects; retail overloads are documented in misc.md §16.
 use super::{Dynels, CHAR_KIND, scene_pos};
-use crate::play::combat::effects::{Binding, EffectConfig};
+use crate::play::combat::effects::{Binding, Creation, EffectConfig};
 use ao_net::{msg::Identity, n3::effects::{Effects, GfxTrigger, Placement, PlaySound}};
 use glam::{Mat4, Vec3};
 
@@ -70,6 +70,7 @@ impl Dynels {
                 let who=who?; Some([stat(who.instance,4)?,stat(who.instance,59)?,stat(who.instance,47)?,stat(who.instance,360)?])
             };
             let config=EffectConfig {
+                creation: match applied.form {1=>Creation::Vector,2=>Creation::Dynel,3=>Creation::VectorVector,4=>Creation::VectorDynel,5=>Creation::DynelVector,6=>Creation::DynelDynel,_=>unreachable!()},
                 source_identity:applied.source_identity.map(identity),target_identity:applied.target_identity.map(identity),
                 source_attractor:(applied.argument!=0).then_some(applied.argument),
                 source_appearance:appearance(applied.source_identity,&mut stat),target_appearance:appearance(applied.target_identity,&mut stat),

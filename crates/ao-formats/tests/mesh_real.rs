@@ -137,7 +137,7 @@ fn authored_3025_rigid_frames_match_vertex_sampler_and_native_timing() {
             let mut index = 0;
             for (mesh, matrix) in scene.meshes.iter().zip(&parts) {
                 for vertex in &mesh.vertices {
-                    for (axis, expected) in posed[index].pos.iter().enumerate() {
+                    for (axis, &expected) in posed[index].pos.iter().enumerate() {
                         let actual = (0..3).map(|k| vertex.pos[k] * matrix[k][axis]).sum::<f32>() + matrix[3][axis];
                         assert!((actual - expected).abs() < 2e-3, "{name}/{id} t={time} vertex={index} axis={axis}");
                     }

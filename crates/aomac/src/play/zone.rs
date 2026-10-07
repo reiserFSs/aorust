@@ -261,6 +261,11 @@ impl Zone {
     pub fn day_time(&self) -> f32 {
         self.clock.unwrap_or(ao_formats::playfield::DEFAULT_DAY_TIME)
     }
+    /// `GameTime_t::GetCurrentTimeInSeconds` (GC 0x100050a6), within the 27-hour game day.
+    pub fn game_seconds(&self) -> Option<i32> {
+        self.clock.map(|time| (time * TIME_SPEED) as i32)
+    }
+
 
     /// `GameTime_t::RunFunction` [GC 0x1000b214]: the clock runs `TimeSpeed` (15) game seconds per real second, i.e. one
     /// `GameDayTime` second per real second.
@@ -850,14 +855,17 @@ mod tests {
     fn game_time_sets_the_sky_clock() {
         let mut z = Zone::new(25988);
         assert_eq!(z.day_time(), ao_formats::playfield::DEFAULT_DAY_TIME, "frozen default until the server sent a time");
+        assert_eq!(z.game_seconds(), None, "no invented integer clock before server time");
         z.tick(1.0);
         assert_eq!(z.day_time(), ao_formats::playfield::DEFAULT_DAY_TIME);
         let ev: Vec<_> = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter().map(|f| z.on_frame(f)).collect();
         assert_eq!(ev.iter().filter(|e| **e == ZoneEvent::Time).count(), 1);
         assert_eq!(z.day_time(), 4478.0);
+        assert_eq!(z.game_seconds(), Some(67_170));
         assert_eq!(z.game_day, 0x437C9);
         z.tick(2005.0);
         assert!((z.day_time() - 3.0).abs() < 1e-2, "{}", z.day_time());
+        assert_eq!(z.game_seconds(), Some(45), "native integer time wraps with the game day");
         assert_eq!(day_time_of(97_200.0 + 15.0), 1.0);
     }
 

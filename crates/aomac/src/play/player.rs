@@ -22,6 +22,7 @@ use ao_rdb::RecordStore;
 use ao_render::{GameInput, Host};
 use std::path::Path;
 use std::rc::Rc;
+use std::cell::RefCell;
 
 /// Length of the jump's ceiling ray (f32 100.0 @ GC 0x10155eb0).
 const JUMP_CEILING_RAY: f32 = 100.0;
@@ -55,7 +56,7 @@ impl World for Ground<'_> {
 
 pub(super) struct Player {
     store: RecordStore,
-    collision: Option<Collision>,
+    collision: Option<Rc<RefCell<Collision>>>,
     movement: Movement,
     avatar: Avatar,
     controls: Controls,
@@ -136,7 +137,7 @@ impl Player {
             let controls = Controls::new(prefs);
             Ok(Self {
                 store,
-                collision,
+                collision: collision.map(|collision| Rc::new(RefCell::new(collision))),
                 movement,
                 avatar,
                 controls,
@@ -167,8 +168,8 @@ impl Player {
     }
 
     /// Loaded playfield surface used by authored effect collision queries (scene coordinates).
-    pub fn effect_surface(&self) -> Option<&Collision> {
-        self.collision.as_ref()
+    pub fn effect_surface(&self) -> Option<Rc<RefCell<Collision>>> {
+        self.collision.clone()
     }
 
     /// The control options (`ControlPrefs::from_dvalues`) changed: mouse look, zoom, wheel, inversion, own avatar in first person.
@@ -310,9 +311,10 @@ impl Player {
         if !std::mem::replace(&mut self.doors_synced, true) {
             zone.world.resync_doors(); // doors that changed before this collision world existed
         }
-        let Some(c) = self.collision.as_mut() else { return };
+        let Some(c) = self.collision.as_ref() else { return };
+        let mut c = c.borrow_mut();
         for (pos, open, passable) in zone.world.take_door_rooms() {
-            set_door(c, pos, open, passable);
+            set_door(&mut c, pos, open, passable);
         }
     }
 
@@ -322,7 +324,7 @@ impl Player {
     /// `TeleportTrier_t` (`Zone::start_teleport_try`, which the flow turns into `TeleportStartedMessage`) and `StartTryingTeleport`'s
     /// `FUN_10059ae5(1)` (full stop while moving). The trier then runs for 30 s waiting for the server's `n3TeleportIIR_t`.
     fn teleport_try(&mut self, dt: f32, zone: &mut Zone) {
-        if zone.trier.is_none() && self.teleport_gate(zone) && self.collision.as_ref().is_some_and(|c| c.in_teleportal(flip(self.movement.pos()))) {
+        if zone.trier.is_none() && self.teleport_gate(zone) && self.collision.as_ref().is_some_and(|c| c.borrow().in_teleportal(flip(self.movement.pos()))) {
             self.movement.action(mv::SYNC, self.clock);
             zone.start_teleport_try();
             self.movement.stop_if_moving();
@@ -344,11 +346,6 @@ impl Player {
         self.transient = None;
         self.cast_loop = None;
         self.cast_restart = false;
-    }
-
-    /// The point `to` is visible from `from` (no collision geometry in between): effects of occluded dynels are hidden by the depth test.
-    pub fn line_clear(&self, from: [f32; 3], to: [f32; 3]) -> bool {
-        self.collision.as_ref().is_none_or(|c| segment_clear(c, from, to))
     }
 
     /// CTRL / ALT held (mouse clicks do not carry modifiers).
@@ -432,6 +429,7 @@ impl Player {
         self.clock += dt;
         self.controls.set_text_input(text_input);
         host.look = self.controls.mouse_capture();
+        host.effect_dungeon = self.zones.as_ref().map(|zones| zones.is_dungeon());
         let s = |id| zone.stat(id);
         self.movement.set_stats(|st| {
             // stat ids: RunSpeed 0x9C, Health 0x1B, Life 1, TurnSpeed 0x10B, Strength 0x10, Agility 0x11, Features 0xE0, ...
@@ -473,8 +471,11 @@ impl Player {
         }
         self.door_rooms(zone);
         self.teleport_try(dt, zone);
-        let world = Ground(self.collision.as_ref());
-        let out: Vec<Frame> = self.movement.update(dt, &world).iter().map(|m| n3_frame(0, self.char_id, char_dc_move(self.char_id as i32, m))).collect();
+        let out: Vec<Frame> = {
+            let collision = self.collision.as_ref().map(|c| c.borrow());
+            let world = Ground(collision.as_deref());
+            self.movement.update(dt, &world).iter().map(|m| n3_frame(0, self.char_id, char_dc_move(self.char_id as i32, m))).collect()
+        };
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
         }
@@ -517,7 +518,8 @@ impl Player {
         if let Some(h) = self.avatar.head_height() {
             self.camera.set_head(h);
         }
-        let col = self.collision.as_ref();
+        let collision = self.collision.as_ref().map(|c| c.borrow());
+        let col = collision.as_deref();
         let clear = |a: [f32; 3], b: [f32; 3]| col.is_none_or(|c| segment_clear(c, a, b));
         let closed = |a: [f32; 3], b: [f32; 3]| col.is_some_and(|c| door_closed(c, a, b));
         let ground = |p: [f32; 3]| col.and_then(|c| c.ground(p));
@@ -545,8 +547,14 @@ impl Player {
     }
 
     /// Native CAT-bound effects use the same posed geometry as the actual avatar submission.
-    pub fn prepare_effect_source(&self, world: &mut super::dynels::Dynels, host: &Host) {
+    pub fn prepare_effect_source(&self, world: &mut super::dynels::Dynels, host: &Host, breed: Option<i32>) {
         let identity = (super::dynels::CHAR_KIND as u32, self.char_id);
+        world.set_effect_source_torso_factor(identity, self.avatar.effect_torso_factor());
+        if let Some(breed) = breed {
+            world.set_effect_source_runtime(identity, self.avatar.body_scale(), breed, Some(self.movement.speed()), self.movement.vehicle_direction(), self.camera.show_avatar());
+        }
+        world.set_effect_source_head_height(identity, self.avatar.head_height());
+        world.set_effect_source_liquid(identity, self.movement.effect_liquid().map(|(depth, flags, direction)| (depth, flags, direction.into())));
         if !world.needs_effect_source_mesh(identity) { return; }
         if let Some(actor) = host.actors.iter().find(|actor| actor.id == self.char_id && actor.model == avatar::MODEL_KEY) {
             world.prepare_effect_source_mesh(identity, self.avatar.model(), actor);

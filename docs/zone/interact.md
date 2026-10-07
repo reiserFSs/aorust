@@ -272,6 +272,11 @@ ids are from the code, whether the live LDB has category 0x2715 / key `Item_Conf
 triangles (`FUN_1006bb2a`, docs/gui.md §13.2); the box stands in for it (the box of a door that has swung open is its closed box). `interact_use::pick_objects` merges them with the characters
 (one `hud_pick::hits` list, nearest first) and maps the ids back to identities. Plain left release now cycles that merged identity list (`N3Msg_GetNextTarget`, GUI `FUN_1002c469`)
 and stores the entire identity via `Zone::set_target`; the old `target` field is only the character projection for character-only combat/skill consumers.
+The captured `zone_ithaca.rec` actor regression must not assume its aimed corpse is the first collision:
+the observed overlapping ray returned character `50000:1026268` before corpse `51050:5628`.
+N3 `0x1000fc8d` → `0x1000f8e5` sorts by collision distance in model units (see `hud_pick.rs`), not aimed identity.
+`captured_dynels_become_actors` retains that ray and all candidates, checks the complete identity order against
+the individual body collision distances, and requires the aimed corpse exactly once.
 `SetTarget` [GUI 0x100257b0] refuses a non-forced identity unless `N3Msg_isIDOnGround` succeeds; selection is cleared when the dynel disappears or gains a parent
 (`FrameProcess` 0x10025fa4). Empty world hits do not deselect. Shift requests `itemid://kind/instance` without changing the selection; Ctrl/Alt attack applies only to characters.
 Retail `FUN_100744ae` marks non-characters nonattackable, and `FUN_10073d0f` uses the friendly control caption **Selection**, not **Nano Target**; the object name is white,

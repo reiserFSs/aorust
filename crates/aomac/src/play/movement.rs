@@ -700,6 +700,7 @@ impl Movement {
         self.recalc();
         self.vel = [float(0), float(8)];
         self.vy = float(4);
+        self.dir = if s.forward < 0 { -1 } else { 1 };
         if blob.len() >= 42 {
             self.in_fwd = float(26);
             self.in_strafe = float(30);
@@ -753,6 +754,13 @@ impl Movement {
     pub fn speed(&self) -> f32 {
         (self.vel[0] * self.vel[0] + self.vel[1] * self.vel[1]).sqrt()
     }
+    /// `Vehicle_t::GetDir`: the retained native direction, including while stopped.
+    pub fn vehicle_direction(&self) -> i32 { self.dir }
+    /// Native liquid state from the last surface-alignment query, not a render-time feet-depth estimate.
+    pub fn effect_liquid(&self) -> Option<(f32, u32, [f32; 3])> {
+        self.surface.liquid_info.map(|liquid| (self.surface.submersion, liquid.kind, liquid.normal))
+    }
+
     /// `Vehicle +0x170` reference speed of the current mode (m/s), the clip rate divisor.
     pub fn ref_speed(&self) -> f32 {
         self.ref_speed

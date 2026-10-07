@@ -138,7 +138,8 @@ impl Sequencer {
             if entry.child==0 {
                 if time<entry.start {finished=false;}
                 else if !entry.entered && (time<entry.end || entry.end<entry.start) {
-                    let config=EffectConfig {duration:(entry.end>0.0).then_some(entry.end-entry.start),source_identity:self.config.source_identity,source_attractor:self.config.source_attractor,source_appearance:self.config.source_appearance,track_source:self.config.track_source,..Default::default()};
+                    // GC100ec640 forwards its stored Vector/Matrix/Dynel/RConnector creation mode.
+                    let config=EffectConfig {creation:self.config.creation,resource_connector:self.config.resource_connector,duration:(entry.end>0.0).then_some(entry.end-entry.start),source_identity:self.config.source_identity,source_attractor:self.config.source_attractor,source_appearance:self.config.source_appearance,track_source:self.config.track_source,..Default::default()};
                     entry.child=r.spawn_configured(Binding {group:0,attractor:0,effect:entry.effect,note:0,color:0},self.source,self.target,config)?;
                     entry.entered=true;
                 }
@@ -156,6 +157,24 @@ impl Sequencer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retail_sequencer_nonvisual_preserves_dynel_child_form() -> Result<()> {
+        let dir=ao_gui::client_dir();
+        if !dir.join("rdb.db").exists() {return Ok(());}
+        let renderer=Renderer::open(&dir)?;
+        let config=EffectConfig {creation:super::super::Creation::Dynel,source_identity:Some((50000,1)),source_nonvisual:true,..Default::default()};
+        let mut count=0;
+        for template in renderer.templates.by_id.values().filter(|t|t.kind==3004) {
+            let sequencer=Sequencer::new(template,Mat4::IDENTITY,Vec3::ZERO,config)?;
+            assert_eq!(sequencer.config.creation,super::super::Creation::Dynel);
+            assert!(sequencer.config.source_nonvisual);
+            assert_eq!(sequencer.config.source_identity,config.source_identity);
+            assert!(sequencer.entries.iter().all(|entry|entry.child==0 && !entry.entered));
+            count+=1;
+        }
+        ensure!(count>0,"missing installed Sequencer records");
+        Ok(())
+    }
     #[test]
     fn authored_sequence_layout_and_immutable_anchor() {
         let t=Template {kind:3004,words:vec![0x400,1,14,1.0f32.to_bits(),3.0f32.to_bits()]};

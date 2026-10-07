@@ -8,7 +8,7 @@ use super::state::CombatEvent;
 use super::module::{Command, Module};
 use super::notes::hit_of;
 use crate::play::chat::GameAction;
-use crate::play::dynels::{Dynels, NAME_TAG_RADIUS};
+use crate::play::dynels::Dynels;
 use crate::play::player::Player;
 use crate::play::controls::Cmd;
 use crate::play::Play;
@@ -163,6 +163,15 @@ impl Play {
         let events = m.take_events();
         for e in &events {
             sync_stats(&mut self.zone, e);
+            let floating = match e {
+                CombatEvent::Floating { dynel, amount, number, .. } if number.space==Space::World => Some((*dynel,amount.to_string(),number.color)),
+                CombatEvent::SpecialAttack { who, special, .. } => special_swing(*special).and_then(|s|s.text).map(|text|(*who,text.trim_end().to_owned(),super::log::world_color(0xd))),
+                _=>None,
+            };
+            if let Some((who,text,color))=floating {
+                let player=self.player.as_ref();
+                if let Err(error)=self.zone.world.floating_text(who,&text,color,|anchor|player.and_then(|p|p.effect_anchor(anchor)).map(|m|glam::Mat4::from_cols_array_2d(&m))) {eprintln!("floating text: {error:#}");}
+            }
         }
         if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
             for e in &events {
@@ -429,29 +438,14 @@ impl Play {
     }
 
     /// Floating damage numbers (`DamageTextMessage` for the own character, the effect `0x2f5a` billboard for everybody else).
-    pub(in crate::play) fn fight_draw(&mut self, host: &Host, list: &mut DrawList) {
+    pub(in crate::play) fn fight_draw(&mut self, _host: &Host, list: &mut DrawList) {
         let Some(m) = self.fight.as_ref() else { return };
-        let w = self.size.0 as f32;
         for n in m.numbers() {
             let rgb = n.spec.color & 0x00ff_ffff;
-            let (x, y) = match n.spec.space {
-                // `DamageTextMessage` [GUI 0x1004ae2f]: centre (50 + r, DAT_102761c0 - 20), text top = centre - font height / 2. `DAT_102761c0` is
-                // a .bss int with a single reader (code scan of GUI.dll: no writer, and its neighbour is the one-only text pointer), i.e.
-                // 0: the number starts above the screen and rises (y0 - 70 * t / 2.3), so the original never shows it on screen.
-                Space::Hud => (n.jitter, HUD_Y_FROM_REF as f32 - self.gui.font_height(FontId::Shell) as f32 / 2.0 - n.rise()),
-                // A billboard effect of the 3D scene: only what the camera sees (on screen, within the locality radius of the tags,
-                // not behind terrain / walls) is drawn. [GUESS] the radius: the effect's own range was not traced.
-                Space::World => match self.zone.world.head_point(n.dynel, &host.camera, self.size, n.rise()) {
-                    Some((x, y, at))
-                        if (0.0..w).contains(&x)
-                            && (0.0..self.size.1 as f32).contains(&y)
-                            && (at - host.camera.pos).length() <= NAME_TAG_RADIUS
-                            && self.player.as_ref().is_none_or(|p| p.line_clear(host.camera.pos.to_array(), at.to_array())) =>
-                    {
-                        (x, y)
-                    }
-                    _ => continue,
-                },
+            let (x,y)=match n.spec.space {
+                // DamageTextMessage native HUD positioning is unchanged.
+                Space::Hud=>(n.jitter,HUD_Y_FROM_REF as f32-self.gui.font_height(FontId::Shell) as f32/2.0-n.rise()),
+                Space::World=>continue,
             };
             let tw = self.gui.text_width(FontId::Shell, &n.text);
             // neither path fades: the HUD text has flag 1 (move only), the effect keeps its constant colour (combat-log.md §6)

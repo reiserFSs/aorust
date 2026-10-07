@@ -85,7 +85,7 @@ impl Controller {
         self.delay=self.template.float(20)?;
         if self.remaining!=0 {
             let argb=|start:usize| -> Result<[f32;4]> { Ok([self.template.float(start+1)?,self.template.float(start+2)?,self.template.float(start+3)?,self.template.float(start)?]) };
-            let config=EffectConfig { track_source:true,start_color:Some(self.config.start_color.unwrap_or(argb(12)?)), stop_color:Some(self.config.stop_color.unwrap_or(argb(16)?)),source_identity:self.config.source_identity,source_appearance:self.config.source_appearance,..EffectConfig::default() };
+            let config=EffectConfig { creation:super::Creation::Dynel,track_source:true,start_color:Some(self.config.start_color.unwrap_or(argb(12)?)), stop_color:Some(self.config.stop_color.unwrap_or(argb(16)?)),source_identity:self.config.source_identity,source_appearance:self.config.source_appearance,..EffectConfig::default() };
             for i in [10,11] {
                 let effect=self.template.word(i)? as i32;
                 if effect!=0 {
@@ -164,7 +164,8 @@ impl Spell {
     }
 
     fn child(&self,index:usize,position:Vec3,identity:Option<(u32,u32)>,config:EffectConfig,r:&mut Renderer)->Result<u32> {
-        let config=EffectConfig {start_color:Some(config.start_color.unwrap_or(self.colors[0])),stop_color:Some(config.stop_color.unwrap_or(self.colors[1])),source_identity:identity,source_appearance:if identity.is_some() {config.target_appearance} else {None},..EffectConfig::default()};
+        // GC100f2495/100f280e use Vector; GC100f290c uses the target Dynel.
+        let config=EffectConfig {creation:if identity.is_some() {super::Creation::Dynel} else {super::Creation::Vector},track_source:identity.is_some(),start_color:Some(config.start_color.unwrap_or(self.colors[0])),stop_color:Some(config.stop_color.unwrap_or(self.colors[1])),source_identity:identity,source_appearance:if identity.is_some() {config.target_appearance} else {None},..EffectConfig::default()};
         r.spawn_configured(Binding {group:0,attractor:0,effect:self.ids[index],note:0,color:0},Mat4::from_translation(position),position,config)
     }
 

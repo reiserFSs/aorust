@@ -589,6 +589,15 @@ impl Avatar {
         (if r < 0.0 { ao_formats::playfield::collision::DEFAULT_BODY_RADIUS } else { r }) * self.scale
     }
 
+    /// The visual dynel's body scale (`N3 GetBodyScale`, 0x10019622, dynel +0xac).
+    pub fn body_scale(&self) -> f32 { self.scale }
+
+    /// GC Spiral2 dynel ctor 0x10111dbc; DS torso getter 0x10072c22.
+    /// Unlike collision radius this preserves the CAT's authored negative radius.
+    pub fn effect_torso_factor(&self) -> f32 {
+        (self.rig.cat().torso_sphere.radius as f64 / 0.25075000524520874 * self.scale as f64) as f32
+    }
+
     /// Body height in metres including `monster_scale` (eye height / name tag).
     #[cfg(test)]
     pub fn height(&self) -> f32 {
@@ -691,6 +700,10 @@ mod tests {
         let local = avatar.rig.effect_anchor_composed(2000, avatar.layers()).expect("retail hand attractor");
         let expected = (avatar.transform * Mat4::from_cols_array_2d(&local)).to_cols_array_2d();
         assert_eq!(avatar.effect_anchor(2000), Some(expected), "effect samples the rendered composition");
+        let root=avatar.transform.to_cols_array_2d();
+        assert!(avatar.effect_anchor(i32::MAX).is_none(),"raw connector lookup remains absent");
+        assert!(avatar.rig.weapon_effect_anchor_composed(1,avatar.layers()).is_none(),"unarmed fixture has no weapon geometry");
+        assert_eq!(avatar.weapon_effect_anchor(1).or_else(||avatar.effect_anchor(0)),Some(root),"missing weapon geometry locator uses the actual visual root");
         assert!(avatar.play_action(&store, 107, Some(0), -1).unwrap());
         assert_eq!(avatar.actions[0].layer, 0, "explicit override beats table upper layer");
         assert_eq!(avatar.actions[0].priority, -1);

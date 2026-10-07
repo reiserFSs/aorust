@@ -26,7 +26,7 @@ fn resource_name(selector: u32) -> Option<String> {
     })
 }
 
-fn load_resource(store: &RecordStore, names: &NameTable, selector: u32) -> Result<Scene> {
+pub(super) fn load_resource(store: &RecordStore, names: &NameTable, selector: u32) -> Result<Scene> {
     let name = resource_name(selector).with_context(|| format!("non-mesh rock selector {selector}"))?;
     let id = names.id(MESH_TYPE, &name).with_context(|| format!("missing rock resource {name}"))?;
     load_mesh(store, id).with_context(|| format!("rock selector {selector}: {name} ({id})"))
@@ -210,7 +210,7 @@ mod tests {
         let binding=super::super::Binding {group:0,attractor:0,effect:45083,note:0,color:0};
         let identity=(50000,1029);
         renderer.prepare_anchor(identity,3000,Some(Mat4::IDENTITY));
-        let config=super::super::EffectConfig {source_identity:Some(identity),track_source:true,..Default::default()};
+        let config=super::super::EffectConfig {creation:super::super::Creation::Dynel,source_identity:Some(identity),track_source:true,..Default::default()};
         let handle=renderer.spawn_configured(binding,Mat4::IDENTITY,Vec3::ZERO,config)?;
         let mut host=ao_render::Host::headless();
         let mut ground=|p:Vec3|Some((Vec3::new(p.x,0.0,p.z),Vec3::Y));

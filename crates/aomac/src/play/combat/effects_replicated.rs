@@ -55,7 +55,8 @@ impl ReplicatedEffect {
         if self.template.kind!=1011 {return Ok(());}
         self.point=self.initial_point()?;
         let color=|i|->Result<[f32;4]> {Ok([self.template.float(i+1)?,self.template.float(i+2)?,self.template.float(i+3)?,self.template.float(i)?])};
-        let config=EffectConfig {start_color:Some(self.config.start_color.unwrap_or(color(12)?)),stop_color:Some(self.config.stop_color.unwrap_or(color(16)?)),..Default::default()};
+        // GC100f4053 creates both children with the Vector overload.
+        let config=EffectConfig {creation:super::Creation::Vector,start_color:Some(self.config.start_color.unwrap_or(color(12)?)),stop_color:Some(self.config.stop_color.unwrap_or(color(16)?)),..Default::default()};
         for i in 0..2 {
             let id=self.template.word(10+i)? as i32;
             if id==0 {continue;}
@@ -125,7 +126,7 @@ mod tests {
         let mut renderer=Renderer::open(&dir)?;
         let binding=Binding {group:0,attractor:0,effect:9010,note:0,color:0};
         let identity=(50000,77);
-        let config=EffectConfig {target_identity:Some(identity),..Default::default()};
+        let config=EffectConfig {creation:super::super::Creation::VectorDynel,target_identity:Some(identity),..Default::default()};
         assert!(renderer.spawn_configured(binding,Mat4::IDENTITY,Vec3::Z*20.0,config).is_err());
         assert!(renderer.active.is_empty());
         renderer.prepare_anchor(identity,0,Some(Mat4::from_translation(Vec3::Z*20.0)));

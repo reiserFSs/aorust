@@ -4,6 +4,30 @@ use super::*;
 use ao_formats::screens::{ao_to_render, set_login_stage, LOGIN_CAMERA};
 use ao_net::msg::CharacterInfo;
 
+// GC100b0125..100b01b3: native environment channels, not weather wind.
+fn environment_channels(phase: &mut f32, dt: f32) -> [f32; 3] {
+    *phase = ((*phase as f64 + dt as f64 * 50.0) as f32 as f64 % 360.0) as f32;
+    let channel = |offset: f64| {
+        let angle = ((*phase as f64 + offset) * 3.140_000_104_904_175 / 180.0) as f32;
+        (0.5 + (angle as f64).cos() as f32 as f64 * 0.5) as f32
+    };
+    [channel(90.0), 0.0, channel(180.0)]
+}
+#[cfg(test)]
+#[test]
+fn environment_effect_inputs_follow_native_oscillator_not_weather() {
+    let mut phase = 0.0;
+    let initial = environment_channels(&mut phase, 0.0);
+    assert!((initial[0] - 0.500_398_16).abs() < 1e-6);
+    assert!(initial[2] < 0.000_001);
+    let advanced = environment_channels(&mut phase, 1.0);
+    assert_eq!(phase, 50.0);
+    assert!(advanced[0] < initial[0] && advanced[2] > initial[2]);
+    environment_channels(&mut phase, 7.0);
+    assert_eq!(phase, 40.0);
+}
+
+
 fn center(size: (u32, u32), outer: (u32, u32)) -> (i32, i32) {
     // `Window::MoveToCenter` [GUI 0x10154986]: floor(0.5 * screen - 0.5 * frame)
     (((size.0 as f32) * 0.5 - (outer.0 as f32) * 0.5).floor() as i32, ((size.1 as f32) * 0.5 - (outer.1 as f32) * 0.5).floor() as i32)
@@ -1046,7 +1070,11 @@ impl Frontend for Play {
                 }
             }
         }
+        if let Some(state)=self.zone.world.shared_native_fog(){host.bind_native_fog(state);}
+        if let Some(h)=&self.hud {host.set_native_fog_preference(h.dvalues.prefs.get_int("FogMode",super::dvalue::Kind::Login).unwrap_or(3));}
         self.pump(host);
+        // A zone load may replace the effects renderer during pump.
+        if let Some(state)=self.zone.world.shared_native_fog(){host.bind_native_fog(state);}
         if let (Screen::Progress { timeout, .. }, Some(w)) = (self.screen, self.progress_w) {
             self.progress_t += dt;
             self.gui.set_progress(w, "progress_bar", (self.progress_t / timeout).min(1.0));
@@ -1174,8 +1202,8 @@ impl Frontend for Play {
                 }
                 self.zone.world.char_view_distance = h.dvalues.char_view_distance();
                 self.zone.world.show_all_names = h.dvalues.flag("ShowAllNames");
-                // `FogMode` (VisualFog_t::SetFogMode 0x10058409): mode 0 scales the fog density by 0.1
-                host.fog_density_scale = Some(ao_scene::fog_mode_density_scale(h.dvalues.prefs.get_int("FogMode", super::dvalue::Kind::Login).unwrap_or(3)));
+                // Actual preference changes invoke native SetFogMode, not per-frame resets.
+                host.set_native_fog_preference(h.dvalues.prefs.get_int("FogMode", super::dvalue::Kind::Login).unwrap_or(3));
             }
             if let Some(p) = self.player.as_mut() {
                 for f in p.frame(dt, host, &mut self.zone, self.gui.text_focused()) {
@@ -1203,6 +1231,16 @@ impl Frontend for Play {
                 weather.update(self.zone.game_day as u32, self.zone.day_time() as f64, dt);
                 host.effect_wind = weather.state().wind;
             }
+            host.effect_day_time = Some(self.zone.day_time());
+            host.effect_game_seconds = self.zone.game_seconds();
+            host.effect_first_person = self.player.as_ref().is_some_and(|player| player.camera_mode() == 0);
+            host.effect_environment_wind = Some(environment_channels(&mut self.effect_environment_phase, dt));
+            host.effect_environment_center = self.player.as_ref().map(|_| host.camera.pos.to_array());
+            host.effect_playfield = self.player.as_ref().and_then(|player| player.effect_surface()).and_then(|surface| surface.borrow().effect_resource());
+            self.zone.world.set_effect_collision(self.player.as_ref().and_then(|player| player.effect_surface()));
+            self.zone.world.refresh_effect_source_runtime();
+            let breed = self.zone.stat(4);
+            if let Some(player) = self.player.as_ref() { player.prepare_effect_source(&mut self.zone.world, host, breed); }
             self.use_action_frame(dt);
             self.fight_frame(dt);
             {
@@ -1222,10 +1260,9 @@ impl Frontend for Play {
             }
             self.camp_frame(dt, host);
             let mut collision = self.player.as_ref().and_then(|p| p.effect_surface())
-                .map(|surface| move |p| super::player::effect_collision(surface, p));
+                .map(|surface| move |p| super::player::effect_collision(&surface.borrow(), p));
             let query = collision.as_mut().map(|query| query as &mut dyn FnMut(ao_render::Vec3) -> Option<(ao_render::Vec3, ao_render::Vec3)>);
             let player = self.player.as_ref();
-            if let Some(player) = player { player.prepare_effect_source(&mut self.zone.world, host); }
             self.zone.world.update_with_collision(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host, query, |id| {
                 player?.effect_anchor(id).map(|matrix| glam::Mat4::from_cols_array_2d(&matrix))
             });

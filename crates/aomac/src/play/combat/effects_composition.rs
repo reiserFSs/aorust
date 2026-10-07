@@ -3,7 +3,8 @@
 //! 1003 load/new/process/update 100d5b7d/100d5ec8/100d5a02/100d6480;
 //! 1022 load/new/process 100ff101/100ff18c/100ff1fe.
 //! 3026 load/new/process/finish 10114717/10114932/10114622/101145f1.
-//! Meta group (2007): 100e59b2/100e5a25/100e57f3, destructor 100e5799.
+//! Meta groups (2007/2010): load100e59b2/process100e57f3/delete100e5799;
+//! HitLocation ctor100e5c3f overrides shared locators101050a4/101050ba.
 use super::{Binding, EffectConfig, Renderer, Template};
 use anyhow::{ensure, Result};
 use ao_scene::{Blend, Vertex};
@@ -24,6 +25,7 @@ pub struct Composition {
     config: EffectConfig,
     children: [u32; 10],
     elapsed: f32,
+    ticks: u32,
     duration: f32,
     angle: f32,
     sampled_angle: f32,
@@ -67,14 +69,14 @@ fn meta_ids(t:&Template)->[i32;10] {
     ids
 }
 impl Composition {
-    pub fn supports(kind: i32) -> bool { matches!(kind, 1002 | 1003 | 1022 | 2007 | 3026) }
+    pub fn supports(kind: i32) -> bool { matches!(kind, 1002 | 1003 | 1022 | 2007 | 2010 | 3026) }
 
     pub fn new(t: &Template, source: Mat4, target: Vec3, config: EffectConfig) -> Result<Self> {
         ensure!(Self::supports(t.kind), "unsupported composition class {}", t.kind);
-        if t.kind==2007 {
+        if matches!(t.kind,2007|2010) {
             let duration=config.duration.map(|d|d+15.0).unwrap_or_else(||if t.words.get(9)==Some(&u32::MAX) {-1.0} else {90.0});
             let origin=source.w_axis.truncate();
-            return Ok(Self {template:t.clone(),source,target,config,children:[0;10],elapsed:0.0,duration,
+            return Ok(Self {template:t.clone(),source,target,config,children:[0;10],elapsed:0.0,ticks:0,duration,
                 angle:0.0,sampled_angle:0.0,stopped:false,links:VecDeque::new(),origin,head:origin,tracer_speed:0.0,finished:false});
         }
         let end = match t.kind { 1002 => 26, 1003 => 36, 3026=>14, _ => 15 };
@@ -98,7 +100,7 @@ impl Composition {
         let origin=source.w_axis.truncate();
         let tracer_speed=if t.kind==3026 {t.float(12)?.min((target-origin).length()*5.0)} else {0.0};
         let source=if t.kind==3026 {Mat4::from_translation(origin)} else {source};
-        Ok(Self { template:t.clone(), source, target, config, children:[0;10], elapsed:0.0,
+        Ok(Self { template:t.clone(), source, target, config, children:[0;10], elapsed:0.0,ticks:0,
             duration, angle, sampled_angle:angle, stopped:false, links:if t.kind==1003 {VecDeque::with_capacity(LINKS)} else {VecDeque::new()},
             origin,head:origin,tracer_speed,finished:false })
     }
@@ -122,32 +124,47 @@ impl Composition {
                 }
             }
         }
+        if self.template.kind==2010 {
+            // GC100e5c3f mutates the original hit location before spawning all
+            // ten children with that same handle. Missing CMS words read as zero.
+            if let Some(handle)=self.config.hit_location_handle {
+                let source=self.template.words.get(10).copied().unwrap_or(0) as i32;
+                let target=self.template.words.get(11).copied().unwrap_or(0) as i32;
+                if source!=0 {renderer.set_hit_location_source_attractor(handle,source);}
+                if target!=0 {renderer.set_hit_location_target_attractor(handle,target);}
+                self.config.hit_location=renderer.sample_hit_location(handle);
+            }
+        }
         let t=&self.template;
         let mut ids=[0;10];
         match t.kind {
             1002=> {ids[0]=t.word(10)? as i32;ids[1]=t.word(11)? as i32;}
             1022=>ids[0]=t.word(15)? as i32,
             3026=>ids[0]=t.word(11)? as i32,
-            2007=>ids=meta_ids(t),
+            2007|2010=>ids=meta_ids(t),
             _=>return Ok(()),
         }
         let start = if t.kind==1002 {self.config.start_color.unwrap_or(rgba(t,12)?)} else {[0.0;4]};
         let stop = if t.kind==1002 {self.config.stop_color.unwrap_or(rgba(t,16)?)} else {[0.0;4]};
         for (i,id) in ids.into_iter().enumerate() {
             if id==0 { continue; }
+            // GC100d52dc creates the Dynel cord only if locator10105c2e
+            // resolves a Dynel; vector/matrix/connector roots have none.
+            if t.kind==1002 && i==1 && self.config.source_identity.is_none() {continue;}
             let (source,config)=if t.kind==1022 {
                 let color=self.config.start_color.unwrap_or(rgba(t,11)?);
                 let mut stop=color;stop[3]=0.0;
-                (self.source,EffectConfig {start_color:Some(color),stop_color:Some(stop),..Default::default()})
+                (self.source,EffectConfig {creation:super::Creation::Vector,start_color:Some(color),stop_color:Some(stop),..Default::default()})
             } else if t.kind==3026 {
-                (self.source,EffectConfig {start_color:Some(self.config.start_color.unwrap_or([1.0;4])),stop_color:Some(self.config.stop_color.unwrap_or([0.0;4])),..Default::default()})
-            } else if t.kind==2007 {
+                (self.source,EffectConfig {creation:super::Creation::Matrix,start_color:Some(self.config.start_color.unwrap_or([1.0;4])),stop_color:Some(self.config.stop_color.unwrap_or([0.0;4])),..Default::default()})
+            } else if matches!(t.kind,2007|2010) {
                 // Meta preserves its overload: GC100e5a90 forwards the matrix,
                 // GC100e5b66 forwards the dynel and explicit connector unchanged.
                 (self.source,self.config)
             } else {
                 let source=if i==0 { Mat4::from_translation(self.orbit_position(self.angle,true)?) } else {self.source};
-                (source,EffectConfig {track_source:i==1,start_color:Some(start),stop_color:Some(stop),source_identity:if i==1 {self.config.source_identity} else {None},source_appearance:self.config.source_appearance,..Default::default()})
+                // GC100d52dc: orbit child uses Vector, cord child uses Dynel with attractor zero.
+                (source,EffectConfig {creation:if i==0 {super::Creation::Vector} else {super::Creation::Dynel},track_source:i==1,start_color:Some(start),stop_color:Some(stop),source_identity:if i==1 {self.config.source_identity} else {None},source_appearance:self.config.source_appearance,..Default::default()})
             };
             let binding=Binding {group:0,attractor:0,effect:id,note:0,color:0};
             match renderer.spawn_configured(binding,source,self.target,config) {
@@ -161,7 +178,7 @@ impl Composition {
     }
 
     pub fn forwarded_children(&self)->Option<[u32;10]> {
-        (self.template.kind==2007).then_some(self.children)
+        matches!(self.template.kind,2007|2010).then_some(self.children)
     }
 
     fn anchor(&self) -> Result<Mat4> {super::sprites::connector(&self.template,self.source)}
@@ -191,7 +208,7 @@ impl Composition {
     }
 
     pub fn next_state(&mut self) {
-        if self.template.kind==2007 {return;}
+        if matches!(self.template.kind,2007|2010) {return;}
         self.stopped=true;
         self.duration=if self.template.kind==1003 {self.elapsed+f32::from_bits(self.template.words[35])} else {self.elapsed};
     }
@@ -203,7 +220,7 @@ impl Composition {
             let id=self.template.word(14)? as i32;
             if id==0 {Ok(())} else {
                 renderer.spawn_configured(Binding {group:0,attractor:0,effect:id,note:0,color:0},
-                    Mat4::from_translation(self.head),self.head,EffectConfig::default()).map(|_|())
+                    Mat4::from_translation(self.head),self.head,EffectConfig {creation:super::Creation::Vector,..Default::default()}).map(|_|())
             }
         } else {Ok(())};
         for child in &mut self.children {if *child!=0 {renderer.delete(*child);*child=0;}}
@@ -212,10 +229,14 @@ impl Composition {
 
     pub fn frame(&mut self, dt:f32, renderer:&mut Renderer)->Result<bool> {
         ensure!(dt.is_finite() && dt>=0.0,"invalid composition delta");
-        self.elapsed+=dt;
-        if self.duration>=0.0 && self.elapsed>=self.duration {self.cancel(renderer)?;return Ok(false);}
+        let meta=matches!(self.template.kind,2007|2010);
+        self.elapsed+=if meta {match self.ticks {0=>0.0,1=>dt.min(0.033),_=>dt}} else {dt};
+        self.ticks=self.ticks.saturating_add(1);
+        if if meta {self.duration>0.0 && self.elapsed>self.duration} else {self.duration>=0.0 && self.elapsed>=self.duration} {
+            self.cancel(renderer)?;return Ok(false);
+        }
         match self.template.kind {
-            2007 => {
+            2007|2010 => {
                 if !self.children.iter().any(|&handle|handle!=0 && renderer.is_active(handle)) {self.cancel(renderer)?;return Ok(false);}
             }
             1002 => {
@@ -299,6 +320,21 @@ impl Composition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retail_placeholder_without_dynel_omits_cord_child() -> Result<()> {
+        let dir=ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("Setupf/gfxtweak.bin").exists() {return Ok(());}
+        let mut renderer=Renderer::open(&dir)?;
+        let binding=Binding {group:0,attractor:0,effect:20011,note:0,color:0};
+        for creation in [super::super::Creation::Vector,super::super::Creation::Matrix,super::super::Creation::RConnector] {
+            renderer.clear();
+            let handle=renderer.spawn_configured(binding,Mat4::IDENTITY,Vec3::ZERO,EffectConfig {creation,resource_connector:Some(Mat4::IDENTITY),..Default::default()})?;
+            let effect=renderer.active.iter().find(|a|a.actor==handle).unwrap().composition.as_ref().unwrap();
+            assert_ne!(effect.children[0],0);
+            assert_eq!(effect.children[1],0,"native locator has no Dynel for {creation:?}");
+        }
+        Ok(())
+    }
     fn template(kind:i32,n:usize)->Template {Template {kind,words:vec![0;n]}}
     #[test]
     fn authored_ids_and_orbit_axes_are_not_substituted() {
@@ -308,7 +344,11 @@ mod tests {
         assert_eq!(c.template.words[11],20012);
         assert!((c.orbit_position(c.angle,true).unwrap()+Vec3::Z*0.15).length()<1e-6);
         assert!((c.orbit_position(c.angle,false).unwrap()-Vec3::Y*0.15).length()<1e-6);
-        t.words.pop();assert!(Composition::new(&t,Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default()).is_err());
+        t.words.pop();
+        let short=Composition::new(&t,Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default()).unwrap();
+        assert_eq!(short.template.word(26).unwrap(),0,"native absent body-profile selector is zero");
+        t.words[21]=f32::NAN.to_bits();
+        assert!(Composition::new(&t,Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default()).is_err());
     }
     #[test]
     fn cord_updates_keep_native_pool_and_stop_tail() {
@@ -326,7 +366,9 @@ mod tests {
         assert_eq!(body_profile(&profile,[1,3,2,100]).unwrap(),Some((10.0,11.0)));
         assert_eq!(body_profile(&profile,[3,2,1,100]).unwrap(),Some((26.0,27.0)));
         assert_eq!(body_profile(&profile,[4,2,2,100]).unwrap(),Some((40.0,41.0)));
-        assert!(body_profile(&profile,[4,3,0,100]).is_err());
+        assert_eq!(body_profile(&profile,[4,3,0,100]).unwrap(),Some((0.0,0.0)),"native CMS floats42/43 default to zero");
+        profile.words[40]=f32::NAN.to_bits();
+        assert!(body_profile(&profile,[4,2,2,100]).is_err());
     }
     #[test]
     fn recursive_tracer_uses_authored_child_speed_and_native_basis() {
@@ -353,5 +395,58 @@ mod tests {
         let indefinite=Template {kind:2007,words:vec![12541,12542,12543,12544,0,0,0,0,0,u32::MAX]};
         assert_eq!(meta_ids(&indefinite)[9],0);
         assert_eq!(Composition::new(&indefinite,Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default()).unwrap().duration,-1.0);
+    }
+    #[test]
+    fn authored_hit_meta_children_and_locator_overrides() {
+        for child in [17600,17912,17913,17914] {
+            let t=Template {kind:2010,words:vec![17000,child,0,0,0,0,0,0,0,0,3001,if child==17600 {1006}else{1003}]};
+            assert_eq!(meta_ids(&t),[17000,child as i32,0,0,0,0,0,0,0,0]);
+            let config=EffectConfig {creation:super::super::Creation::HitLocation,duration:Some(2.0),..Default::default()};
+            let c=Composition::new(&t,Mat4::IDENTITY,Vec3::X,config).unwrap();
+            assert_eq!(c.duration,17.0);
+            assert_eq!(c.forwarded_children(),Some([0;10]));
+            assert_eq!(c.models().len(),0,"Meta owns child handles, not substitute geometry");
+        }
+    }
+    #[test]
+    #[ignore = "requires authored retail assets and offscreen renderer; AOMAC_EFFECT_FRAMES selects output"]
+    fn authored_hit_meta_frames() -> Result<()> {
+        use super::super::{Creation,HitLocationRequest,MODEL_BASE};
+        let mut renderer=Renderer::open(&ao_gui::client_dir())?;
+        let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/tmp/FxClasses/meta-frames".into());
+        std::fs::create_dir_all(&out)?;
+        let source=(50000,1);
+        let target=(50000,2);
+        let mut host=ao_render::Host::headless();
+        for id in [17950,17951,17952,17953] {
+            renderer.clear();
+            renderer.prepare_anchors(source,|_,_|Some(Mat4::IDENTITY));
+            renderer.prepare_anchors(target,|_,_|Some(Mat4::from_translation(Vec3::X*4.0)));
+            let hit=renderer.new_hit_location(HitLocationRequest {source,target,source_attractor:2000,target_attractor:1000,hit:true},
+                |identity,_|Some(Mat4::from_translation(if identity==target {Vec3::X*4.0}else{Vec3::ZERO}))).unwrap();
+            let config=EffectConfig {creation:Creation::HitLocation,hit_location_handle:Some(hit),hit_location:renderer.sample_hit_location(hit),
+                source_identity:Some(source),target_identity:Some(target),source_appearance:Some([1,2,0,100]),duration:Some(0.4),..Default::default()};
+            let handle=renderer.spawn_configured(Binding {group:1,attractor:0,effect:id,note:0,color:0},Mat4::IDENTITY,Vec3::X*4.0,config)?;
+            assert!(handle!=0);
+            let request=renderer.hit_locations.get(hit).unwrap().request();
+            assert_eq!(request.source_attractor,3001);
+            assert_eq!(request.target_attractor,if id==17950 {1006}else{1003});
+            let mut previous=0.0;
+            for time in [0.01,0.05,0.1,0.2] {
+                host.actors.clear();
+                renderer.frame(time-previous,&mut host,None);
+                previous=time;
+                assert!(renderer.is_active(handle));
+                assert!(!host.actors.is_empty(),"authored Meta children must render");
+                let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone()))
+                    .chain(renderer.buff_models.iter().map(|(&id,m)|(0xfac2_0000_0000_0000|u64::from(id),m.scene.clone()))).collect();
+                ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),
+                    [2.0,1.0,5.0],[2.0,0.0,0.0],640,480,&out.join(format!("{id}_{time:.2}.png")),time)?;
+            }
+            renderer.delete(handle);
+            assert!(!renderer.is_active(handle));
+        }
+        Ok(())
     }
 }

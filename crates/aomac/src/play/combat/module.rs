@@ -5,9 +5,9 @@
 //! combat-log.md, combat-anim.md, actions.md.
 
 use super::actions::{Actions, Event as ActionEvent};
-use super::anim::{plays_hit_sound, special_swing, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM};
+use super::anim::{plays_hit_sound, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM};
 use super::arms::{ACTION_UNWIELD, ACTION_WIELD};
-use super::log::{floating_number, FloatingNumber, Space, HUD_X, HUD_X_JITTER};
+use super::log::{FloatingNumber, Space, HUD_X, HUD_X_JITTER};
 use super::state::{Combat, CombatEvent, ACTION_PLAY_ANIM, FIGHT_IDLE};
 use crate::play::zone::{DynelState, Zone};
 use ao_audio::combat::CharInfo;
@@ -20,8 +20,6 @@ use ao_net::n3::outgoing::{n3_frame, DYNEL_CHAR};
 use ao_net::msg::Identity;
 use std::path::Path;
 
-/// `ColorCode_e` of the special-attack text above a character (`FUN_10011108(char, text, 0xd)` [GC 0x1003c594]).
-const SPECIAL_TEXT_CATEGORY: u32 = 0xd;
 
 /// What the player asked for (key bindings `ACTION_*`, hotbar special actions, mouse).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,15 +333,8 @@ impl Module {
         let ev = self.combat.on_frame(f, self.own as u32);
         for e in ev {
             match &e {
-                // `FUN_1003c594` [GC 0x1003c594]: the special's name floats above the character (`FUN_10011108(char, text, 0xd)`, the world
-                // effect path; the client's "\n" ends the text)
-                CombatEvent::SpecialAttack { who, special, .. } => {
-                    if let Some(text) = special_swing(*special).and_then(|s| s.text) {
-                        self.numbers.push(Number { dynel: *who, text: text.trim_end().to_string(), spec: floating_number(Space::World, SPECIAL_TEXT_CATEGORY), age: 0.0, jitter: 0.0 });
-                    }
-                }
-                CombatEvent::Floating { dynel, amount, number, .. } => {
-                    let jitter = if number.space == Space::Hud { HUD_X as f32 + (self.rand01() * 2.0 - 1.0) * HUD_X_JITTER as f32 } else { 0.0 };
+                CombatEvent::Floating { dynel, amount, number, .. } if number.space == Space::Hud => {
+                    let jitter = HUD_X as f32 + (self.rand01() * 2.0 - 1.0) * HUD_X_JITTER as f32;
                     self.numbers.push(Number { dynel: *dynel, text: amount.to_string(), spec: *number, age: 0.0, jitter });
                 }
                 CombatEvent::FightStarted { who, .. } if *who == self.own => {

@@ -1,4 +1,4 @@
-//! Class 3020: GC 10112e94/1011277c/10112bb0; DS 10029de9/10029c81/1002a350.
+//! Class 3020: GC 101125fd/1011277c/10112bb0; DS 10029de9/10029c81/1002a350.
 //! These are crossed, tapered local-space trails, not camera-facing sprites.
 use super::{materials, quad, EffectConfig, Template};
 use anyhow::{ensure, Context, Result};
@@ -6,7 +6,7 @@ use ao_formats::{character::CrtRand, weather::R250};
 use ao_scene::{Blend, Vertex};
 use glam::{Mat4, Vec3};
 
-struct Particle { position: Vec3, velocity: Vec3 }
+struct Particle { position: Vec3, velocity: Vec3, end: Vec3 }
 pub(super) struct ParticleEffect {
     template: Template,
     source: Mat4,
@@ -27,13 +27,20 @@ fn interpolate_color(a:u32,b:u32,t:f32)->[f32;4] {
 
 impl ParticleEffect {
     pub(super) fn supports(kind:i32)->bool {kind==3020}
-    pub(super) fn new(template:&Template,source:Mat4,_target:Mat4,_color:u32,_random:&mut R250,display:&mut R250,_crt:&mut CrtRand)->Result<Self> {
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(super) fn new(template:&Template,mut source:Mat4,_target:Mat4,_color:u32,_random:&mut R250,display:&mut R250,_crt:&mut CrtRand,terrain:Option<&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>>)->Result<Self> {
         ensure!(Self::supports(template.kind),"unsupported TParticle class {}",template.kind);
         template.word(40)?;
         for i in 0..=40 {
             if !matches!(i,0|7|9|10|11|13|14|23..=28|34) {template.float(i)?;}
         }
-        ensure!(template.word(10)?==0,"unsupported native TParticle emission mode");
+        let mode=template.word(10)?;
+        ensure!(mode<=3,"unknown native TParticle emission mode {mode}");
+        if template.word(0)?&0x400!=0 {
+            let terrain=terrain.context("TParticle ground flag requires terrain")?;
+            let (ground,_)=terrain(source.w_axis.truncate()).context("TParticle source has no ground")?;
+            source.w_axis.y=ground.y;
+        }
         let count=template.word(11)? as usize;
         ensure!(count<=u16::MAX as usize/8,"TParticle capacity exceeds native indices");
         ensure!(template.float(8)?!=0.0,"zero TParticle control lifetime");
@@ -41,16 +48,32 @@ impl ParticleEffect {
         let mut particles=Vec::with_capacity(count);
         for _ in 0..count {
             let uniform=|r:&mut R250|super::random_fraction(r);
-            let direction=Vec3::new(uniform(display)*2.0-1.0,uniform(display)*2.0-1.0,uniform(display)*2.0-1.0).normalize_or_zero();
-            let position=direction*(uniform(display)*template.float(12)?);
-            let velocity=Vec3::new(
-                template.float(17)?+(template.float(18)?-template.float(17)?)*uniform(display),
-                template.float(19)?+(template.float(20)?-template.float(19)?)*uniform(display),
-                template.float(21)?+(template.float(22)?-template.float(21)?)*uniform(display));
-            // DS initializes angular position and velocity even though this draw
-            // path does not use them; preserve the shared DisplaySystem RNG walk.
-            uniform(display);uniform(display);
-            particles.push(Particle {position,velocity});
+            let (position,velocity,end)=match mode {
+                0=>{
+                    let direction=Vec3::new(uniform(display)*2.0-1.0,uniform(display)*2.0-1.0,uniform(display)*2.0-1.0).normalize_or_zero();
+                    let position=direction*(uniform(display)*template.float(12)?);
+                    let velocity=Vec3::new(
+                        template.float(17)?+(template.float(18)?-template.float(17)?)*uniform(display),
+                        template.float(19)?+(template.float(20)?-template.float(19)?)*uniform(display),
+                        template.float(21)?+(template.float(22)?-template.float(21)?)*uniform(display));
+                    // Angular fields are unused by the crossed-strip renderer.
+                    uniform(display);uniform(display);
+                    (position,velocity,Vec3::ZERO)
+                },
+                1=>(Vec3::ZERO,Vec3::ZERO,Vec3::new(
+                    uniform(display)*2.0-1.0,uniform(display)*2.0-1.0,uniform(display)*2.0-1.0)*template.float(12)?),
+                2=>{
+                    // DS doubles 10089d30=0x401921fb60000000,
+                    // 1008b898=600, 1008a128=2 (radians, not PI).
+                    let angle=(uniform(display) as f64*f64::from_bits(0x401921fb60000000)) as f32;
+                    let position=Vec3::new(angle.sin()*template.float(12)?,uniform(display)*600.0,angle.cos()*template.float(12)?);
+                    let angle=angle+2.0;
+                    let velocity=Vec3::new(angle.sin()*template.float(18)?,template.float(20)?,angle.cos()*template.float(22)?);
+                    (position,velocity,Vec3::ZERO)
+                },
+                _=>(Vec3::ZERO,Vec3::Z,Vec3::ZERO),
+            };
+            particles.push(Particle {position,velocity,end});
         }
         Ok(Self {template:template.clone(),source,particles,previous_time:0.0,elapsed:0.0})
     }
@@ -90,9 +113,12 @@ impl ParticleEffect {
         let mut vertices=Vec::with_capacity(self.particles.len()*8);
         let v0=if self.template.words[0]&0x100!=0 {1.0}else{0.0};let v1=1.0-v0;
         for particle in &mut self.particles {
-            particle.position+=particle.velocity*dt;
-            particle.velocity.y+=gravity*dt;
-            let end=particle.position-particle.velocity*trail;
+            if matches!(self.template.words[10],0|2) {
+                particle.position+=particle.velocity*dt;
+                particle.velocity.y+=gravity*dt;
+                particle.end=particle.position-particle.velocity*trail;
+            }
+            let end=particle.end;
             let direction=(end-particle.position).normalize_or_zero();
             if direction==Vec3::ZERO {vertices.extend([Vertex {color:[0.0;4],..Vertex::default()};8]);continue;}
             let side=direction.cross(Vec3::Y).normalize_or_zero();
@@ -124,29 +150,86 @@ mod tests {
     fn crossed_trails_preserve_rng_capacity_and_control_lifecycle() {
         let mut gc=R250::new(0xe6f1);let mut ds=R250::new(0xe6f1);let mut crt=CrtRand::new(1);
         let mut expected=ds.clone();for _ in 0..180 {expected.next_u32();}
-        let mut effect=ParticleEffect::new(&template(),Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt).unwrap();
+        let mut effect=ParticleEffect::new(&template(),Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt,None).unwrap();
         assert_eq!(ds.next_u32(),expected.next_u32());
         assert_eq!(effect.models()[0].2,160);assert_eq!(effect.models()[0].1.len(),240);
         let vertices=effect.vertices(0.01,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt).unwrap().unwrap();
         assert_eq!(vertices[0].len(),160);assert!(vertices[0].iter().all(|v|v.pos.iter().all(|x|x.is_finite())));
         for frame in 2..=100 {effect.vertices(frame as f32/60.0,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt).unwrap();}
         assert!(effect.vertices(2.0,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt).unwrap().is_none());
-        let mut malformed=template();malformed.words.pop();
-        assert!(ParticleEffect::new(&malformed,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt).is_err());
+        let mut short=template();short.words.pop();
+        let effect=ParticleEffect::new(&short,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt,None).unwrap();
+        assert_eq!(short.float(40).unwrap(),0.0,"native absent final trail width defaults to zero");
+        assert_eq!(effect.models()[0].2,160);
+        short.words[39]=f32::NAN.to_bits();
+        assert!(ParticleEffect::new(&short,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt,None).is_err());
+    }
+    #[test]
+    fn authored_modes_preserve_native_rng_and_motion() {
+        // Installed records 71103, 71104, 71105 (class3020).
+        let records=[
+            vec![515,0,0,0,0,0,0,0,1065353216,55,1,20,1092616192,0,0,1045220557,3212836864,3259498496,1112014848,1084227584,1092616192,3259498496,1112014848,16777215,16777215,16777215,4294967295,16777215,16777215,0,1097859072,1112014848,1077936128,1045220557,0,1033476506,1033476506,1033476506,1033476506,1033476506,1033476506],
+            vec![515,0,0,0,0,0,0,2011,1065353216,55,2,20,1082130432,0,0,1053609165,0,3212836864,1073741824,3212836864,1073741824,3212836864,1073741824,16777215,16777215,16777215,4294967295,16777215,16777215,0,1097859072,1112014848,1077936128,1045220557,0,1033476506,1033476506,1033476506,1033476506,1033476506,1033476506],
+            vec![514,0,0,0,0,0,0,0,3212836864,56,3,20,1084227584,0,0,1045220557,3212836864,1036831949,1036831949,3212836864,3225419776,3212836864,1065353216,1621819306,1621819306,16777215,4294967295,16777215,16777215,0,1097859072,1112014848,1077936128,1045220557,0,1077936128,1077936128,1077936128,1077936128,1077936128,1077936128],
+        ];
+        for words in records {
+            let t=Template {kind:3020,words};let mode=t.words[10];
+            let mut gc=R250::new(0xe6f1);let mut ds=R250::new(0xe6f1);let mut crt=CrtRand::new(1);
+            let mut expected=ds.clone();
+            for _ in 0..t.words[11]*match mode {1=>3,2=>2,_=>0} {expected.next_u32();}
+            let mut effect=ParticleEffect::new(&t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt,None).unwrap();
+            assert_eq!(ds.next_u32(),expected.next_u32());
+            let position=effect.particles[0].position;let end=effect.particles[0].end;
+            if mode==2 {assert!((Vec3::new(position.x,0.0,position.z).length()-4.0).abs()<0.00001);assert!((0.0..600.0).contains(&position.y));}
+            let vertices=effect.vertices(0.02,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt).unwrap().unwrap();
+            if mode==2 {assert_ne!(effect.particles[0].position,position);}
+            else {assert_eq!(effect.particles[0].position,position);assert_eq!(effect.particles[0].end,end);}
+            if mode==3 {assert!(vertices[0].iter().all(|v|v.color==[0.0;4]));}
+        }
+    }
+    #[test]
+    fn ground_flag_snaps_only_initial_position() {
+        let mut t=template();t.words[0]|=0x400;
+        let mut gc=R250::new(1);let mut ds=R250::new(1);let mut crt=CrtRand::new(1);
+        let mut terrain=|p:Vec3|Some((Vec3::new(p.x,17.0,p.z),Vec3::Y));
+        let mut effect=ParticleEffect::new(&t,Mat4::from_translation(Vec3::ONE),Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt,Some(&mut terrain)).unwrap();
+        assert_eq!(effect.source.w_axis.y,17.0);
+        effect.update_source(Mat4::from_translation(Vec3::ONE));
+        assert_eq!(effect.source.w_axis.y,1.0);
+    }
+    #[test]
+    #[ignore="installed retail authored effect table"]
+    fn all_authored_class3020_records() {
+        let templates=super::super::Templates::open(&ao_gui::client_dir()).unwrap();
+        let mut count=0;let mut modes=[false;4];
+        for (id,t) in templates.by_id.iter().filter(|(_,t)|t.kind==3020) {
+            let mut gc=R250::new(0xe6f1);let mut ds=R250::new(0xe6f1);let mut crt=CrtRand::new(1);
+            let mut terrain=|p:Vec3|Some((Vec3::new(p.x,0.0,p.z),Vec3::Y));
+            let mut effect=ParticleEffect::new(t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt,Some(&mut terrain)).unwrap_or_else(|e|panic!("record {id}: {e:#}"));
+            modes[t.words[10] as usize]=true;count+=1;
+            let vertices=effect.vertices(1.0/60.0,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt).unwrap();
+            if let Some(vertices)=vertices {assert!(vertices[0].iter().all(|v|v.pos.iter().all(|x|x.is_finite())),"record {id}");}
+        }
+        assert!(count>0);assert_eq!(modes,[true;4]);
     }
     #[test]
     #[ignore="installed retail assets and offscreen Metal rendering"]
     fn retail_class3020_frames() {
-        use super::super::{Binding,Renderer,MODEL_BASE};
+        use super::super::{Binding,Creation,Renderer,MODEL_BASE};
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||"/tmp/FxRest/frames".into());
         std::fs::create_dir_all(&out).unwrap();
         let mut renderer=Renderer::open(&ao_gui::client_dir()).unwrap();
         let origin=Vec3::new(5000.0,10.0,5000.0);let eye=origin+Vec3::new(2.0,2.0,5.0);
         let mut host=ao_render::Host::headless();host.camera=ao_render::Camera::look_at(eye,origin);
-        for id in [71512,71342] {
-            renderer.clear();renderer.spawn(Binding {group:0,attractor:0,effect:id,note:0,color:0},Mat4::from_translation(origin),origin+Vec3::X).unwrap();
+        let mut ids:Vec<_>=renderer.templates.by_id.iter().filter_map(|(&id,t)|(t.kind==3020).then_some(id)).collect();
+        ids.sort_unstable();
+        assert!(!ids.is_empty(),"missing authored TParticle records");
+        for id in ids {
+            renderer.clear();renderer.spawn(Binding {group:0,attractor:0,effect:id,note:0,color:0},Creation::Matrix,Mat4::from_translation(origin),origin+Vec3::X).unwrap();
             for frame in 1..=60 {
-                host.actors.clear();renderer.frame(1.0/60.0,&mut host,None);
+                host.actors.clear();
+                let mut terrain=|p:Vec3|Some((Vec3::new(p.x,10.0,p.z),Vec3::Y));
+                renderer.frame(1.0/60.0,&mut host,Some(&mut terrain));
                 if [1,6,15,30,45].contains(&frame) {
                     let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
                     ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("particle3020_{id}_{frame}.png")),frame as f32/60.0).unwrap();

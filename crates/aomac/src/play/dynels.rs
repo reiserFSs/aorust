@@ -18,7 +18,9 @@ use ao_net::n3::nametag::{health_bar_fill_px, name_tag, nametag_listed, selectio
 use ao_net::n3::world::World;
 use ao_net::n3::{Message, N3};
 use ao_rdb::RecordStore;
-use ao_render::{Camera, Host};
+use ao_render::Host;
+#[cfg(test)]
+use ao_render::Camera;
 use ao_scene::{ActorFrame, Lens};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -794,14 +796,14 @@ fn nano_cast_delay(delay: i32, minimum: i32, initiative: i32, agg_def: i32, flag
 
 /// Argument conversion of GC 100a5083 / 100a78c6 / 100a8c03.
 fn nano_visual(spell: &ao_net::n3::spells::Spell) -> Option<(i32, i32, super::combat::effects::EffectConfig)> {
-    use super::combat::effects::EffectConfig;
+    use super::combat::effects::{Creation, EffectConfig};
     let (effect, attractor, duration) = match spell.function {
         0xcf26 => (spell.stat(0x27), 0, spell.stat(0x31)),
         0xcf57 => (spell.stat(0x57), 0, spell.stat(0x19)),
         0xcfd4 => (spell.stat(0x27), spell.stat(0x56), spell.stat(0x31)),
         _ => return None,
     };
-    let mut config = EffectConfig { duration: (duration != 0).then_some(duration as f32 / 100.0), ..Default::default() };
+    let mut config = EffectConfig { creation: Creation::Dynel, duration: (duration != 0).then_some(duration as f32 / 100.0), ..Default::default() };
     if spell.function == 0xcfd4 {
         config.repetitions = Some(spell.stat(0xa1) as u32);
         config.start_color = Some([0x99, 0x9a, 0x9b, 0x9c].map(|id| spell.stat(id) as f32 / 255.0));
@@ -809,6 +811,16 @@ fn nano_visual(spell: &ao_net::n3::spells::Spell) -> Option<(i32, i32, super::co
         config.scale = Some(1.0 + spell.stat(0x32) as f32 / 100.0);
     }
     Some((effect, attractor, config))
+}
+
+/// GC100a5083/100a8c03 retry another overload only for a native null.
+fn spawn_spell_visual(mut spawn: impl FnMut(super::combat::effects::Creation) -> anyhow::Result<u32>) -> anyhow::Result<u32> {
+    use super::combat::effects::Creation;
+    for creation in [Creation::Unlocated,Creation::Dynel,Creation::HitLocation] {
+        let handle=spawn(creation)?;
+        if handle!=0 {return Ok(handle);}
+    }
+    Ok(0)
 }
 
 impl Default for Dynels {
@@ -1282,21 +1294,24 @@ impl Dynels {
     fn effect_anchor(&self, who: i32, anchor: i32, slot: i32) -> Option<glam::Mat4> {
         let c = self.chars.get(&who)?;
         let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
-        let rig = built.rig.as_ref()?;
-        let layers = c.layers(built);
-        let matrix = if anchor == 3000 { rig.weapon_effect_anchor_composed(if slot == 8 { 2 } else { 1 }, layers) } else { rig.effect_anchor_composed(anchor, layers) }?;
-        let local = glam::Mat4::from_cols_array_2d(&matrix);
         let world = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(c.scale), glam::Quat::from_rotation_y(scene_yaw(c.pose.yaw)), glam::Vec3::from(scene_pos(c.pose.pos)));
-        Some(world * local)
+        if anchor==0 {return Some(world);}
+        let rig=built.rig.as_ref()?;
+        let layers = c.layers(built);
+        let matrix = if anchor == 3000 { rig.weapon_effect_anchor_composed(if slot == 8 { 2 } else { 1 }, layers) } else { rig.effect_anchor_composed(anchor, layers) };
+        matrix.map(|matrix| world * glam::Mat4::from_cols_array_2d(&matrix))
     }
 
-    /// GC 10105917: attractor zero is the dynel frame; character-only bones
-    /// and static-mesh connector 3001 are not interchangeable with it.
+    /// Raw geometry lookup; locator callers separately apply GC1010603b's actual-root fallback.
     fn item_effect_anchor(&self, identity: ao_net::msg::Identity, attractor: i32) -> Option<glam::Mat4> {
-        if attractor != 0 { return None; }
+        if attractor!=0 {return None;}
         let prop = self.props.get(&(identity.kind, identity.instance))?;
         let Model::Ready { .. } = self.models.get(&prop.key)? else { return None };
         Some(glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(prop.scale), glam::Quat::from_rotation_y(scene_yaw(prop.yaw)), glam::Vec3::from(scene_pos(prop.pos))))
+    }
+
+    fn item_effect_locator(&self, identity: ao_net::msg::Identity, attractor: i32) -> Option<glam::Mat4> {
+        self.item_effect_anchor(identity,attractor).or_else(||self.item_effect_anchor(identity,0))
     }
 
     pub(in crate::play) fn cancel_nano_visuals(&mut self, who: i32) {
@@ -1407,7 +1422,7 @@ impl Dynels {
 
 
     pub fn nano_visual_frame(&mut self, dt: f32, own_finished: bool, mut own_anchor: impl FnMut(i32) -> Option<[[f32; 4]; 4]>, mut stat: impl FnMut(i32, u32) -> Option<i32>) {
-        use super::combat::effects::{Binding, EffectConfig};
+        use super::combat::effects::{Binding, Creation, EffectConfig, HitLocationRequest};
         let own_pos = own_anchor(0).map(|m| glam::Mat4::from_cols_array_2d(&m).w_axis.truncate().to_array());
         let mut renderer = self.effects.take();
         let anchor = |world: &Self, who, id, own_anchor: &mut dyn FnMut(i32) -> Option<[[f32; 4]; 4]>| {
@@ -1452,10 +1467,10 @@ impl Dynels {
                 if let Some(r) = &mut renderer {
                     let effect = cast.start_effect;
                     let attractor = r.attractor(effect, 0).unwrap_or(0);
-                    if let (Some(source), Some(destination)) = (anchor(self, cast.who, attractor, &mut own_anchor), anchor(self, cast.target, 0, &mut own_anchor)) {
+                    if let (Some(source), Some(destination)) = (anchor(self, cast.who, attractor, &mut own_anchor).or_else(||anchor(self,cast.who,0,&mut own_anchor)), anchor(self, cast.target, 0, &mut own_anchor)) {
                         r.prepare_anchors((CHAR_KIND as u32, cast.who as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
                         r.prepare_anchors((CHAR_KIND as u32, cast.target as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
-                        match r.spawn_configured(Binding { group: 0, attractor, effect, note: 0, color: 0 }, source, destination.w_axis.truncate(), EffectConfig { duration: Some(6000.0), track_source: true, source_identity: Some((CHAR_KIND as u32, cast.who as u32)), target_identity: Some((CHAR_KIND as u32, cast.target as u32)), source_appearance: appearance(cast.who, &mut stat), target_appearance: appearance(cast.target, &mut stat), ..Default::default() }) {
+                        match r.spawn_configured(Binding { group: 0, attractor, effect, note: 0, color: 0 }, source, destination.w_axis.truncate(), EffectConfig { creation: super::combat::effects::Creation::Dynel, duration: Some(6000.0), track_source: true, source_identity: Some((CHAR_KIND as u32, cast.who as u32)), target_identity: Some((CHAR_KIND as u32, cast.target as u32)), source_appearance: appearance(cast.who, &mut stat), target_appearance: appearance(cast.target, &mut stat), ..Default::default() }) {
                             Ok(handle) => { cast.handle = handle; cast.start_effect = 49999; }
                             Err(error) => { eprintln!("nano cast: {error:#}"); cast.start_effect = 49999; }
                         }
@@ -1500,11 +1515,11 @@ impl Dynels {
                     for effect in &mut cast.finish {
                         if *effect == 0 || *effect == 49999 { continue; }
                         if let Some(attractor) = r.attractor(*effect, 0) {
-                            if let Some(source) = anchor(self, cast.target, attractor, &mut own_anchor) {
+                            if let Some(source) = anchor(self, cast.target, attractor, &mut own_anchor).or_else(||anchor(self,cast.target,0,&mut own_anchor)) {
                                 let binding = Binding { group: 0, attractor, effect: *effect, note: 0, color: 0 };
                                 let identity = Some((CHAR_KIND as u32, cast.target as u32));
                                 let profile = appearance(cast.target, &mut stat);
-                                let config = EffectConfig { track_source: true, source_identity: identity, target_identity: identity, source_appearance: profile, target_appearance: profile, ..Default::default() };
+                                let config = EffectConfig { creation: super::combat::effects::Creation::Dynel, track_source: true, source_identity: identity, target_identity: identity, source_appearance: profile, target_appearance: profile, ..Default::default() };
                                 r.prepare_anchors((CHAR_KIND as u32, cast.target as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
                                 if let Err(error) = r.spawn_configured(binding, source, source.w_axis.truncate(), config) { eprintln!("nano release: {error:#}"); }
                                 *effect = 49999;
@@ -1531,15 +1546,58 @@ impl Dynels {
                 }
                 if self.nano_effect_categories & 32 == 0 { continue; }
                 let Some(attractor) = renderer.attractor(effect, explicit) else { continue };
-                let Some(source) = (if application.target.kind == CHAR_KIND { anchor(self, who, attractor, &mut own_anchor) } else { self.item_effect_anchor(application.target, attractor) }) else { continue };
+                let source = if application.target.kind == CHAR_KIND { anchor(self, who, attractor, &mut own_anchor).or_else(||anchor(self,who,0,&mut own_anchor)) } else { self.item_effect_locator(application.target, attractor) };
                 let binding = Binding { group: 0, attractor, effect, note: 0, color: 0 };
                 config.source_identity = Some((application.target.kind as u32, who as u32));
                 config.track_source = true;
+                config.source_nonvisual = if application.target.kind == CHAR_KIND {anchor(self,who,0,&mut own_anchor).is_none()} else {self.item_effect_anchor(application.target,0).is_none()};
                 config.target_identity = config.source_identity;
                 config.source_appearance = (application.target.kind == CHAR_KIND).then(|| appearance(who, &mut stat)).flatten();
                 config.target_appearance = config.source_appearance;
                 renderer.prepare_anchors((application.target.kind as u32, who as u32), |identity, id| if identity.0 == CHAR_KIND as u32 { anchor(self, identity.1 as i32, id, &mut own_anchor) } else { self.item_effect_anchor(application.target, id) });
-                match renderer.spawn_configured(binding, source, source.w_axis.truncate(), config) {
+                let mut spawn = |creation| {
+                    let mut attempt=config;
+                    attempt.creation=creation;
+                    match creation {
+                        Creation::Unlocated => {
+                            attempt.track_source=false;
+                            attempt.source_nonvisual=false;
+                            attempt.source_identity=None;
+                            attempt.target_identity=None;
+                            // This overload has no position argument; the Rust matrix is unused.
+                            renderer.spawn_configured(binding,glam::Mat4::IDENTITY,glam::Vec3::ZERO,attempt)
+                        }
+                        Creation::Dynel => {
+                            // An actual nonvisual dynel still allocates its native control. Its
+                            // missing locator must not become a factory null or visible origin.
+                            let matrix=source.unwrap_or(glam::Mat4::IDENTITY);
+                            renderer.spawn_configured(binding,matrix,matrix.w_axis.truncate(),attempt)
+                        }
+                        Creation::HitLocation => {
+                            let caster=(CHAR_KIND as u32,self.own as u32);
+                            renderer.prepare_anchors(caster,|identity,id|anchor(self,identity.1 as i32,id,&mut own_anchor));
+                            let hit=renderer.new_hit_location(HitLocationRequest {
+                                source:(application.target.kind as u32,who as u32),target:caster,
+                                source_attractor:3001,target_attractor:1006,hit:true,
+                            },|identity,id| if identity==caster {anchor(self,self.own,id,&mut own_anchor)}
+                                else if identity.0==CHAR_KIND as u32 {anchor(self,identity.1 as i32,id,&mut own_anchor)}
+                                else {self.item_effect_anchor(application.target,id)});
+                            let Some(hit)=hit else {return Ok(0)};
+                            attempt.track_source=false;
+                            attempt.source_nonvisual=false;
+                            attempt.hit_location_handle=Some(hit);
+                            attempt.hit_location=renderer.sample_hit_location(hit);
+                            attempt.target_identity=Some(caster);
+                            attempt.target_appearance=appearance(self.own,&mut stat);
+                            let Some((start,end))=attempt.hit_location else {return Ok(0)};
+                            renderer.spawn_configured(binding,glam::Mat4::from_translation(start),end,attempt)
+                        }
+                        _ => unreachable!("spell factory overload"),
+                    }
+                };
+                let result=if spell.function==0xcf57 {spawn(Creation::Dynel)} else {spawn_spell_visual(spawn)};
+                match result {
+                    Ok(0) => {},
                     Ok(handle) => {
                         self.nano_handles.push((application.target, spell, handle));
                     }
@@ -1553,7 +1611,7 @@ impl Dynels {
     /// Visual effects use the actor's actual animated connector, never `char_pos`'s
     /// own-character sound/camera shortcut.
     pub fn note_effects(&mut self, who: i32, note: u32, slot: i32, mut own_anchor: impl FnMut(i32, i32) -> Option<[[f32; 4]; 4]>) {
-        use super::combat::{effects::Binding, notes::id};
+        use super::combat::{effects::{Binding, Creation, EffectConfig, HitLocationRequest}, notes::id};
         if !matches!(note, id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) { return; }
         let Some(h) = self.note_ctx(who, slot) else { return };
         let (victim, slot, hit) = (h.victim, h.slot, h.flags > 1);
@@ -1567,15 +1625,17 @@ impl Dynels {
             if id == self.own { own_anchor(a, slot).map(|m| glam::Mat4::from_cols_array_2d(&m)) }
             else { self.effect_anchor(id, a, slot) }
         };
+        renderer.prepare_anchors((CHAR_KIND as u32,who as u32),|identity,id| anchor(identity.1 as i32,id,slot));
+        renderer.prepare_anchors((CHAR_KIND as u32,victim as u32),|identity,id| anchor(identity.1 as i32,id,0));
         for binding in bindings.into_iter().filter(|b| b.fires(note as i32, hit)) {
             let category = if binding.group == 0 { 8 } else { 2 };
             if self.weapon_effect_categories & category == 0 { continue; }
             let source_anchor = if binding.group == 0 {
                 renderer.attractor(binding.effect, binding.attractor).unwrap_or(0)
             } else if binding.attractor != 0 { binding.attractor } else { 2000+i32::from(slot == 8) };
-            let Some(source) = anchor(who, source_anchor, slot) else { continue };
+            let Some(source) = anchor(who, source_anchor, slot).or_else(||anchor(who,0,slot)) else { continue };
             let target_anchor = self.impact_locations.get(&victim).copied().unwrap_or(1000);
-            let target = anchor(victim, target_anchor, 0);
+            let target = anchor(victim, target_anchor, 0).or_else(||anchor(victim,0,0));
             if binding.group != 0 && target.is_none() { continue; }
             let position = target.map_or(source.w_axis.truncate(), |m| m.w_axis.truncate());
             let origin = if binding.group == 2 { target.unwrap_or(source) } else { source };
@@ -1583,7 +1643,26 @@ impl Dynels {
             if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
                 eprintln!("live weapon effect note={note:#x} who={who} victim={victim} slot={slot} effect={} group={} source_anchor={source_anchor} target_anchor={target_anchor} source={:?} origin={:?} target={position:?}", binding.effect, binding.group, source.w_axis.truncate(), origin.w_axis.truncate());
             }
-            if let Err(error) = renderer.spawn(binding, origin, position) { eprintln!("weapon effects: {error:#}"); }
+            // GC1009ad7d: muzzle uses the dynel overload; tracer and impact both
+            // allocate NewHitLocation and use CreateEffect2(effect, hit_handle).
+            let hit_location_handle = if binding.group == 0 { None } else {
+                renderer.new_hit_location(HitLocationRequest {
+                    source:(CHAR_KIND as u32,who as u32),target:(CHAR_KIND as u32,victim as u32),
+                    source_attractor:source_anchor,target_attractor:target_anchor,hit,
+                },|identity,id| anchor(identity.1 as i32,id,if identity.1 as i32==who {slot}else{0}))
+            };
+            if binding.group != 0 && hit_location_handle.is_none() {continue;}
+            let config = EffectConfig {
+                creation: if binding.group == 0 { Creation::Dynel } else { Creation::HitLocation },
+                hit_location: hit_location_handle.and_then(|handle|renderer.sample_hit_location(handle)),
+                hit_location_handle,
+                source_identity: Some((CHAR_KIND as u32, who as u32)),
+                target_identity: Some((CHAR_KIND as u32, victim as u32)),
+                source_attractor: (binding.group == 0).then_some(binding.attractor),
+                track_source: binding.group == 0,
+                ..Default::default()
+            };
+            if let Err(error) = renderer.spawn_configured(binding, origin, position, config) { eprintln!("weapon effects: {error:#}"); }
         }
         self.effects = Some(renderer);
     }
@@ -1811,6 +1890,25 @@ impl Dynels {
     pub fn effect_camera_offset(&mut self, eye: glam::Vec3) -> anyhow::Result<glam::Vec3> {
         self.effects.as_mut().map_or(Ok(glam::Vec3::ZERO), |effects| effects.camera_offset(eye))
     }
+    /// GUI world feedback creates the authored Font control on the real dynel.
+    pub fn floating_text(&mut self, who:i32, text:&str, color:u32, mut own_anchor:impl FnMut(i32)->Option<glam::Mat4>) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use super::combat::effects::{Binding,Creation,EffectConfig};
+        let Some(mut renderer)=self.effects.take() else {return Ok(())};
+        let result=(|| {
+            let attractor=renderer.attractor(12122,0).context("missing floating text effect 12122")?;
+            let mut resolve=|_: (u32,u32),id| if who==self.own {own_anchor(id)}else{self.effect_anchor(who,id,0)};
+            let identity=(CHAR_KIND as u32,who as u32);
+            renderer.prepare_anchors(identity,&mut resolve);
+            let source=resolve(identity,attractor).or_else(||resolve(identity,0)).context("missing floating text visual dynel")?;
+            let [a,r,g,b]=color.to_be_bytes().map(|v|v as f32/255.0);
+            let handle=renderer.spawn_configured(Binding {group:0,attractor,effect:12122,note:0,color:0},source,source.w_axis.truncate(),EffectConfig {creation:Creation::Dynel,track_source:true,source_identity:Some(identity),start_color:Some([r,g,b,a]),stop_color:Some([r,g,b,a]),..Default::default()})?;
+            renderer.set_text(handle,text.as_bytes())
+        })();
+        self.effects=Some(renderer);
+        result
+    }
+
 
     /// Doors whose room link state changed since the last call: `(scene position, open, passable)` (`n3RoomMonitor_t::DoorOpened/Closed`,
     /// `Door_t::CanPass`, see [`PropAnim::take_room_state`]); the caller maps the position to the link (`Collision::door_link_from_pos`).
@@ -2085,6 +2183,46 @@ impl Dynels {
         }
     }
 
+    pub fn shared_native_fog(&self) -> Option<ao_render::SharedNativeFog> {
+        self.effects.as_ref().map(super::combat::effects::Renderer::shared_native_fog)
+    }
+
+    pub fn set_effect_source_runtime(&mut self, identity: (u32, u32), body_scale: f32, breed: i32, vehicle_speed: Option<f32>, vehicle_direction: i32, visible: bool) {
+        if let Some(renderer) = &mut self.effects {
+            renderer.set_source_runtime(identity, body_scale, breed, vehicle_speed, vehicle_direction, visible);
+        }
+    }
+    pub fn set_effect_source_head_height(&mut self, identity: (u32, u32), height: Option<f32>) {
+        if let Some(renderer) = &mut self.effects { renderer.set_source_native_head_height(identity, height); }
+    }
+    pub fn set_effect_source_liquid(&mut self, identity: (u32, u32), liquid: Option<(f32, u32, glam::Vec3)>) {
+        if let Some(renderer) = &mut self.effects { renderer.set_source_native_liquid(identity, liquid); }
+    }
+    pub fn set_effect_source_torso_factor(&mut self, identity: (u32, u32), factor: f32) {
+        if let Some(renderer) = &mut self.effects { renderer.set_source_torso_factor(identity, factor); }
+    }
+
+    pub fn set_effect_collision(&mut self, collision: Option<std::rc::Rc<std::cell::RefCell<ao_formats::playfield::collision::Collision>>>) {
+        if let Some(renderer) = &mut self.effects { renderer.set_collision(collision); }
+    }
+
+
+    pub fn refresh_effect_source_runtime(&mut self) {
+        let Some(renderer) = &mut self.effects else { return };
+        for (&id, c) in &self.chars {
+            if id == self.own { continue; }
+            let breed = match &c.look { Look::Char(look) => i32::from(look.breed), _ => 0 };
+            renderer.set_source_runtime((CHAR_KIND as u32, id as u32), c.scale, breed, Some(c.mover.vehicle_speed()), c.mover.vehicle_direction(), c.in_play);
+            if let Some(Model::Ready { built, .. }) = self.models.get(&c.key) {
+                if let Some(rig) = &built.rig {
+                    let factor = (rig.cat().torso_sphere.radius as f64 / 0.250_750_005_245_208_74 * c.scale as f64) as f32;
+                    renderer.set_source_torso_factor((CHAR_KIND as u32, id as u32), factor);
+                    renderer.set_source_native_head_height((CHAR_KIND as u32, id as u32), rig.head_attractor_composed(c.layers(built)).map(|p| p[1] * c.scale));
+                }
+            }
+        }
+    }
+
     /// Advances the dynels and hands the visible ones to the renderer. `cam` = camera position in scene space, `fwd` = its view direction.
     /// The loaded playfield surface capability; absent geometry is not a no-hit query.
     pub fn update_with_collision(
@@ -2095,6 +2233,7 @@ impl Dynels {
         self.sync_scene(host);
         self.cam = cam;
         self.tick_sounds(dt);
+        self.refresh_effect_source_runtime();
         let Some(dir) = self.dir.clone() else {
             self.refresh_effect_anchors(own_anchor);
             if let Some(effects) = &mut self.effects { effects.frame(dt, host, collision); }
@@ -2451,26 +2590,36 @@ impl Dynels {
         Some((c.flags, features))
     }
 
-    /// Screen position (GUI pixels) of the point `rise` metres above the head anchor of `id` (floating combat numbers rise 0.4 m/s,
-    /// docs/zone/combat-log.md §6); `None` while the dynel has no model yet or is behind the camera.
-    pub fn head_point(&self, id: i32, cam: &Camera, size: (u32, u32), rise: f32) -> Option<(f32, f32, ao_render::Vec3)> {
-        let c = self.chars.get(&id)?;
-        let Some(Model::Ready { built, .. }) = self.models.get(&c.key) else { return None };
-        let p = scene_pos(c.pose.pos);
-        let (w, h) = (size.0 as f32, size.1.max(1) as f32);
-        let tan = (self.lens.vertical_fov(w / h) * 0.5).tan();
-        let d = ao_render::Vec3::new(p[0], p[1] + built.tag_height * c.scale + rise, p[2]) - cam.pos;
-        let z = d.dot(cam.forward());
-        if z < 0.3 {
-            return None;
-        }
-        Some(((0.5 + 0.5 * d.dot(cam.right()) / (z * tan * w / h)) * w, (0.5 - 0.5 * d.dot(cam.up()) / (z * tan)) * h, cam.pos + d))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spell_visual_fallback_only_retries_native_null() {
+        use super::super::combat::effects::Creation;
+        let mut calls=Vec::new();
+        assert_eq!(spawn_spell_visual(|creation| {
+            calls.push(creation);
+            Ok(if creation==Creation::HitLocation {42}else{0})
+        }).unwrap(),42);
+        assert_eq!(calls,[Creation::Unlocated,Creation::Dynel,Creation::HitLocation]);
+        calls.clear();
+        assert_eq!(spawn_spell_visual(|creation| {
+            calls.push(creation);
+            // A nonzero, already-terminated control is still a constructed control.
+            Ok(if creation==Creation::Dynel {43}else{0})
+        }).unwrap(),43);
+        assert_eq!(calls,[Creation::Unlocated,Creation::Dynel]);
+        calls.clear();
+        assert!(spawn_spell_visual(|creation| {
+            calls.push(creation);
+            anyhow::bail!("real asset failure")
+        }).is_err());
+        assert_eq!(calls,[Creation::Unlocated]);
+        assert_eq!(spawn_spell_visual(|_|Ok(0)).unwrap(),0);
+    }
 
     #[test]
     fn nano_visual_arguments_and_cast_timing_follow_retail() {
@@ -2589,19 +2738,24 @@ mod tests {
     }
 
     #[test]
-    fn item_visual_queue_preserves_kind_and_rejects_character_anchor_substitution() {
+    fn item_visual_missing_connector_uses_actual_root_but_nonvisual_dynel_does_not() {
         let mut world = Zone::new(1).world;
         let item = ao_net::msg::Identity { kind: 0xc73d, instance: 1 };
         world.test_prop(item, vec![]);
+        world.props.get_mut(&(item.kind,item.instance)).unwrap().pos=[13.0,7.0,-4.0];
         let key = world.props[&(item.kind, item.instance)].key;
         world.models.insert(key, Model::Ready { built: Box::new(plain(Default::default(), true)), uploaded: false });
         let spell = ao_net::n3::spells::spell(0xcf26, &[(0x27, 71214)]);
         world.apply_nano_visuals(ao_net::n3::spells::ApplySpells { target: item, spells: vec![spell], apply: true });
         world.cancel_nano_visuals(1);
         assert_eq!(world.nano_visuals.len(), 1, "same-instance character teardown must not remove an item application");
-        assert!(world.item_effect_anchor(item, 0).is_some());
-        assert!(world.item_effect_anchor(item, 1000).is_none());
-        assert!(world.item_effect_anchor(item, 3001).is_none(), "mesh connector cannot be replaced by the item origin");
+        let root=world.item_effect_anchor(item,0).unwrap();
+        assert!(world.item_effect_anchor(item,1000).is_none(),"raw missing bone remains absent");
+        assert_eq!(world.item_effect_locator(item,1000),Some(root),"missing bone locator uses the actual item visual root");
+        assert_eq!(world.item_effect_locator(item,3001),Some(root),"missing mesh connector locator uses the actual item visual root");
+        world.models.remove(&key);
+        assert!(world.item_effect_anchor(item,0).is_none(),"a dynel identity without a visual has no root fallback");
+        assert!(world.item_effect_locator(item,3001).is_none(),"nonvisual dynels cannot synthesize an effect origin");
         world.clear();
         assert!(world.nano_visuals.is_empty());
     }
@@ -2901,7 +3055,7 @@ mod tests {
         eprintln!("{} models ready, {failed} failed, {} actors, {} props", models.len(), actors.len(), z.world.props.len());
         assert!(!actors.is_empty());
         // object use (docs/zone/interact.md §8): `Corpse_t`'s constructor sets Can 8, the vending machine's template has bit 3 (use);
-        // built props have a pick box and a ray at one of them hits it, nearest first
+        // built props have a pick box; the merged hit list sorts every intersecting body by model-space distance.
         let corpse = z.world.props.keys().find(|k| k.0 == 0xC76A).copied().unwrap();
         assert_eq!(z.world.stat_of(corpse.0, corpse.1, CAN_STAT), Some(8));
         let vending = z.world.props.keys().find(|k| k.0 == 0xC75B).copied().unwrap();
@@ -2913,7 +3067,19 @@ mod tests {
         let origin = ao_render::Vec3::new(mid[0] + 4.0, mid[1] + 0.5, mid[2] + 4.0);
         let toward = (ao_render::Vec3::new(mid[0], mid[1], mid[2]) - origin).normalize();
         let hit = crate::play::interact_use::pick_objects(&crate::play::hud_target::Ray { origin, dir: toward, len: 100.0 }, &z);
-        assert_eq!(hit.first(), Some(who), "{hit:?}");
+        // A ray aimed at a corpse can enter a captured character first (23557:
+        // 50000:1026268 before 51050:5628). N3 0x1000fc8d -> 0x1000f8e5
+        // sorts collision distance, not the identity whose centre we aimed at.
+        assert!(body.hit(origin, toward, 100.0).is_some(), "aimed corpse has a collision");
+        let characters = z.world.pick_bodies(z.char_id as i32);
+        let mut expected: Vec<_> = characters.iter()
+            .map(|b| (b, ao_net::msg::Identity { kind: CHAR_KIND, instance: b.id }))
+            .chain(picks.iter().map(|(b, id)| (b, *id)))
+            .filter_map(|(b, id)| b.hit(origin, toward, 100.0).map(|distance| (distance, b.id, id)))
+            .collect();
+        expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        assert_eq!(hit, expected.into_iter().map(|(_, _, id)| id).collect::<Vec<_>>(), "all intersecting identities in native distance order");
+        assert_eq!(hit.iter().filter(|id| *id == who).count(), 1, "aimed corpse retained exactly once");
         if let Ok(out) = std::env::var("AOMAC_DYNEL_SHOT") {
             let scene = ao_formats::playfield::load_playfield_at(&RecordStore::open(&dir).unwrap(), &dir, 4582, ao_formats::playfield::DEFAULT_DAY_TIME).unwrap();
             // AOMAC_DYNEL_LOOK=<kind hex like c76a | npc | player>: camera 4 m from the first such dynel instead of the player's view
