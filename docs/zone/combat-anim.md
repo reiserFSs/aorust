@@ -1395,15 +1395,16 @@ check was not run by its implementation worker.
 
 ### Observed verification boundary (2026-10-07)
 
-The parent's measured `retail_authored_effect_census` **passed** on clean
-snapshot `93f67d8` (artifact23891): 2,687 authored records, all fifteen
-synthetic creation fixtures, 1,563 distinct reachable installed IDs and
-nine distinct IDs with configuration errors. Strict clippy also passed
-before this census (parent report). The census took8.31s; it inventories
+The parent's measured `retail_authored_effect_census` **passed** on the
+current `/tmp/FxFinish/work` source (artifact24270): 2,687 authored records,
+all fifteen synthetic creation fixtures, 1,563 distinct reachable installed
+IDs and **zero configuration-error IDs**. The census took8.65s; it inventories
 constructors and configuration, not live-frame equivalence. Its command:
-`CARGO_TARGET_DIR=/tmp/FxClasses/target cargo test --release -p aomac retail_authored_effect_census -- --ignored --nocapture`.
+`CARGO_TARGET_DIR=/tmp/FxFinish/target cargo test --release -p aomac retail_authored_effect_census -- --ignored --nocapture`.
+The nine failures in snapshot93f67d8/artifact23891 are superseded, not
+classified as unsupported classes.
 
-#### Authored class coverage (snapshot93f67d8)
+#### Authored class coverage (artifact24270)
 
 Counts below are distinct IDs, not creation attempts. Reachability is the
 union of weapon event10, nano visual, all item-effect spell and persistent
@@ -1430,14 +1431,14 @@ DR=DynelConnector). Every omitted class/form is native null.
 | 1010 | 180 | 156 | 0 | DV/DM/DR/DD | yes |
 | 1011 | 1 | 0 | 0 | VV/VM/VR/VD | yes |
 | 1012 | 16 | 9 | 0 | V/M/R/D | yes |
-| 1013 | 5 | 3 | 1 | I/T | yes |
+| 1013 | 5 | 3 | 0 | I/T | yes |
 | 1014 | 1 | 0 | 0 | N | yes |
 | 1015 | 1 | 0 | 0 | N | yes |
 | 1017 | 1 | 0 | 0 | D | yes |
 | 1018 | 42 | 24 | 0 | V/M/R/I/D | yes |
 | 1019 | 7 | 0 | 0 | I/T | yes |
 | 1020 | 9 | 2 | 0 | N | yes |
-| 1021 | 3 | 3 | 3 | I/T | yes |
+| 1021 | 3 | 3 | 0 | I/T | yes |
 | 1022 | 10 | 10 | 0 | I/T | yes |
 | 1023 | 1 | 0 | 0 | V/M/R/D | yes |
 | 1024 | 11 | 3 | 0 | I/T | yes |
@@ -1452,7 +1453,7 @@ DR=DynelConnector). Every omitted class/form is native null.
 | 2004 | 877 | 504 | 0 | V/I/D | yes |
 | 2005 | 16 | 6 | 0 | I/D | yes |
 | 2006 | 21 | 12 | 0 | R/D | yes |
-| 2007 | 486 | 316 | 2 | V/R/I/D | yes |
+| 2007 | 486 | 316 | 0 | V/R/I/D | yes |
 | 2008 | 1 | 0 | 0 | V/D | yes |
 | 2009 | 1 | 0 | 0 | V/M/D | yes |
 | 2010 | 4 | 3 | 0 | I | yes |
@@ -1488,13 +1489,13 @@ DR=DynelConnector). Every omitted class/form is native null.
 | 3025 | 13 | 10 | 0 | V/M/R/D | yes |
 | 3026 | 6 | 5 | 0 | I/T | yes |
 | 3027 | 4 | 1 | 0 | V/M/R/D | yes |
-| 3028 | 66 | 26 | 1 | V/M/R/I/D | yes |
+| 3028 | 66 | 26 | 0 | V/M/R/I/D | yes |
 | 3029 | 27 | 9 | 0 | V/M/R/D | yes |
 | 3030 | 11 | 6 | 0 | V/M/R/D | yes |
 | 3031 | 15 | 3 | 0 | V/M/R/D | yes |
 | 3032 | 5 | 3 | 0 | V/M/R/D | yes |
 | 3033 | 8 | 7 | 0 | V/M/R/D | yes |
-| 3034 | 47 | 17 | 2 | D | yes |
+| 3034 | 47 | 17 | 0 | D | yes |
 | 3035 | 3 | 0 | 0 | V/M/R/D | yes |
 | 3036 | 5 | 4 | 0 | V/M/R/D | yes |
 | 3037 | 2 | 2 | 0 | N | yes |
@@ -1505,22 +1506,28 @@ DR=DynelConnector). Every omitted class/form is native null.
 
 #### Exact configuration and source inventory boundaries
 
-| IDs / classes | Failing creation modes | Observed reason in artifact23891 |
+| IDs / classes | Constructed creation modes | Current result in artifact24270 |
 | --- | --- | --- |
-| 2620/2621/2622, class1021 | I/T | Snapshot93f67d8 rejected missing texture8406; native null-texture material behavior restored below, awaiting a new census. |
-| 70004, class1013; parent70002, class2007 | 70004 I/T; 70002 I | Snapshot93f67d8's invented positive-speed guard produced `invalid tracer dimensions`; corrected by the native audit below, awaiting a new census. This is not an unsupported native configuration. |
-| 71016, class2007 | V/R/I/D | Missing authored child effect71025. |
-| 71332/71333, class3034 | D | Missing mesh266808 under the synthetic source appearance fixture; not proof that every real source CAT fails. |
-| 92000, class3028 | V/M/R/I/D | Snapshot93f67d8 rejected missing texture279876; native null-texture material behavior restored below, awaiting a new census. |
+| 2620/2621/2622, class1021 | I/T | All six eligible attempts construct without errors; absent texture8406 retains native untextured material geometry. |
+| 70004, class1013; parent70002, class2007 | 70004 I/T; 70002 V/R/I/D | All six eligible attempts construct without errors; speed0 is an authored stationary cylinder. |
+| 71016, class2007 | V/R/I/D | All four eligible attempts construct; missing child71025 returns native null without rejecting the parent. |
+| 71332/71333, class3034 | D | Both eligible attempts construct; missing authored mesh266808 retains allocated nondrawing controls, not CAT fallback. |
+| 92000, class3028 | V/M/R/I/D | All five eligible attempts construct without errors; absent texture279876 retains native untextured material geometry. |
+
+The shared missing-template path follows GC `100d0102`→CMS `10106b12`
+and `100ce4f7`: failed lookup returns a null child handle. Meta constructor
+`100e5b66` stores each of its ten CreateEffect2 results without rejecting
+the parent. Thus71016's absent71025 remains an artwork inventory hole,
+not an unsupported composition or fabricated substitute visual.
 
 The subsequent70004 native audit proves speed0 is valid: GC `100fd699`
 loads speed+0x3c; `100fd985` only caps speed when distance×5<speed and has
 no positive-speed guard. `100fd754` allocates/enables the cylinder;
 `100fd855` computes tail=speed×time=0 and head=min(length+tail,distance),
 so the authored speed0/length100/width0.02/duration10 effect is stationary,
-not a native null or no-draw configuration. The constructor correction and
-exact70004 regression await the parent's rerun; the measured counts above
-must not be presented as post-audit coverage.
+not a native null or no-draw configuration. The current census confirms
+construction in I/T and parent70002 in V/R/I/D; all other forms return
+native null as specified by the factory matrix.
 
 The texture audit likewise restores native untextured geometry, not
 replacement artwork. GC `100fe985` accepts a null GetSync8406 result and
@@ -1530,9 +1537,17 @@ without a texture guard. GC3028 `1010ba11` uses MMGetMaterial and DS
 `1000b432` enables particles; GC `10106e2e` creates the material after
 null GetSync while retaining atlas dimensions. Genuine texture decode
 errors still propagate. The ignored
-`missing_sprite_textures_retain_native_material_geometry` regression for
-2620/2621/2622/92000 awaits the central gate. The two synthetic CAT mesh
-prerequisites71332/71333 are a different flow, not established port gaps.
+`missing_sprite_textures_retain_native_material_geometry` regression covers
+2620/2621/2622/92000. The separate class3034 mesh266808 hole is also native
+nonfailure behavior: GC `10111326` terminates only for an unresolved name
+ID; a resolved name allocates VisualMesh and calls SetMesh, retaining
+callback `10110dc3`. DS `1006b623`→`1007174c` starts ResourceManager
+GetAsync, and `100713fe` continues the request when the resource is absent.
+GC `10110bbf` preserves control lifetime without the mesh. Thus71332/71333
+retain allocated nondrawing controls, not a synthetic CAT prerequisite or
+substitute actor geometry. Present malformed meshes still return errors;
+`retail_shield_missing_mech_keeps_control_without_cat_fallback` covers this
+installed payload hole.
 
 Eight reachable authored effect IDs are absent:
 16451,39606,39745,42161,71025,71900,91000,91006.
@@ -1551,7 +1566,7 @@ Missing49999 is the native runtime meta sentinel, not missing artwork.
 The weapon/all-item rejection counts overlap; they are not additive distinct
 records. The earlier677 unresolved source failures (artifact23700) included
 duplicated root scans and missing native string-format fields; that failed
-census is superseded by23891, not reclassified wholesale as supported.
+census is superseded by24270, not reclassified wholesale as supported.
 
 #### Native creation modes and unsupported boundaries
 
@@ -1578,8 +1593,8 @@ words/floats are zero, consistently in constructor, frame and configuration
 paths rather than guarded reads followed by unchecked indexing. This includes
 TParticle/sprite model, flags and colour inputs and LavaBall's wait value.
 Explicit packed-array bounds and nonfinite-value rejection remain errors.
-The new short-record regressions await the parent's integrated gate; this
-source correction is not yet a reported verification result.
+The parent's current workspace gate passed (artifact24270), including
+887 aomac tests with49 ignored; strict workspace all-target clippy passed.
 
 Further native frame corrections distinguish absent textures from absent
 geometry: GC `10106e2e` creates a material even when `the_wave.png` is
@@ -1587,12 +1602,13 @@ unavailable, retaining geometry with a null texture. BParticle3024
 effect72219's zero interval is legal: GC `1010af47` tests `>=0` and emits
 its quota once per process call. The source/anchor harness now supplies
 real birth-pose mesh inputs before native3000/3001 creation, including
-71226's missing-root fixture. Their regressions await the parent's gate.
+71226's missing-root fixture. The current native3000/3001 frame filter passed.
 The Vein3014 fixture likewise now provides required terrain for12203/12206
 flag0x4000 and fits the camera to the authored cubic-control hull and native
 logarithmic-distance growth. This repairs cropped/saturated test captures,
 not the native geometry or alpha; `vein_fixture_camera_contains_authored_geometry`
-and `retail_vein3014_frames` await the central gate.
+passed in the parent's workspace gate; `retail_vein3014_frames` was not rerun
+by this finishing task.
 
 Concrete installed-art gap (not an unsupported class): TowerMesh3010
 effect61042 selects nameID201713, `tower_destroyed_buff&debuff_LL.abiff`,
@@ -1624,10 +1640,117 @@ Added, not run by implementation workers:
 `installed_71123_missing_heal_terminates_control`,
 `installed_mparticle_missing_heal_keeps_slots_and_lifetime`.
 
+ShockWave3000 keeps each ring/cone's fixed skin vertex count while inactive:
+DS ring `10016e84` and cone `1000bd0a` skip the inactive group, not the
+whole control. Transparent degenerate vertices preserve the GPU model's
+cardinality instead of shortening the flattened skin upload and triggering
+`ao-render`'s actor count rejection. The
+`authored_30101_terrain_rings_and_cones` regression checks individual and
+flattened counts plus inactive transparency across authored phase boundaries.
+The standalone environment-clock particle path also reads VisualEnvFX
+independently of a source dynel (GC `1010af47`, `100b0125`–`100b01b3`);
+the renderer now supplies native global inputs outside the dynel-only branch.
+`retail_environment_particle_without_dynel_receives_zone_clock` covers
+standalone survival and noon/midnight updates. These are root corrections,
+not claims that old blank captures were valid.
+
+Stars2004 uses signed word31 (`CMS` loader `100f6d54`, destination+0x16e0).
+Native Process `100f7f3c` converts signed counts for modes5–12, retains
+negative nonzero decrement budgets for modes14/22/25, and mode23 uses
+signed `FIMUL` at `100fb1b3` plus signed occupancy comparison `100fb2c8`.
+The unsigned port interpretation of43097/43098/43099's authored-1 generated
+enormous offscreen mode11 forces; signed count/lifetime and budget handling
+are now restored with regressions, rather than weakening visibility checks.
+Word30 lifetime is likewise signed: Init `100f7a63` stores
+seconds+0x16cc=`(float)*(int*)(+0x16dc)/1000`; a negative authored lifetime
+expires immediately and gracefully drains, rather than becoming years-long.
+
+Shield3003 field mapping follows GC `100eda23`→DS constructor `1001ce93`:
+UV scroll+0x1d8/+0x1dc uses words24/25, phase+0x1e0 uses word21,
+distance+0x1e4 uses word22 and phase speed+0x1e8 uses word23.
+DS `1001c9ca`–`1001c9e8`, `1001caf0`/`1001caf9` and `1001cb89`
+confirm these accesses. Cylindrical mode1 intentionally scrolls both UV
+axes using word24 (`1001ca74`); modes0/2 use words24/25 separately.
+For installed43608/43748 at1second, authored alpha×sin²(capped phase)
+truncates to136/255 and29/255, not the erroneous swapped-map5/255 and0.
+The sentinel regression covers all UV modes, phase cap/lower clamp and
+signed negative distance without changing authored effect values.
+The32201–32204 boots/shins-only shell at1second is native radial behavior,
+not incomplete CAT coverage: flags0xc00, origin0 and words21/22=10/20
+produce phase=`10t−20|pos+normal×word11|`. DS `1001c94f`,
+`1001cbca`–`1001cc73` operates on posed local vertices, callback
+`1001cd09`; world drawing follows only at `1001c8a5`. The positive-alpha
+front advances0.5m/s, reaching only roughly0.49m at frame60, with radial
+rings repeating everyπ/20.
+
+#### Offscreen frame observations and limits (2026-10-07)
+
+The parent and frame scouts inspected all305 initial surface contact sheets,
+then389 sheets after the native-input fixture corrections. Representative
+observations were white/gold body sparks43048, rising cyan column43504,
+expanding foot-centered stars43568/43591/47294, golden tint43625,
+pink/cyan aura47175 and cyan crosses47260. Raw640×480 frames2/15/30/60
+of43421 show10–20 pale pink/red shoulder/torso/arm dots only2–4pixels wide
+and later red arm tint; reduced contact sheets hid them. Its class2004
+mode22 bone-chain geometry is not a missing target mesh.
+
+The final native3000/3001 inspection covered128 frames plus seven raw
+captures. All eleven ShockWave effects draw after the fixed-cardinality
+repair, including30101/30102/43104/45084;43101/43103 show beams at
+frames6/15, and30101 follows authored ring timing and colours.
+The small31101/31201 deformations and source-occluded12276 remain visually
+inconclusive at the distant fixture framing, not established mismatches.
+Final particle inspection covered310 selected frames from66 records:
+soft coloured smoke, wisps and starbursts, with72291's faint brown/orange
+dust now visible after the global clock correction.
+
+Null-texture2620/2621/2622/92000 geometry checks establish allocated,
+nonempty native untextured materials; the dedicated regression emits no
+PNG and is not screenshot evidence. The separate92000 particle captures
+show hard overlapping white/grey rectangles, consistent with the proven
+null-texture material rather than substitute artwork. Bright mech layers,
+VolGrid planes and Meta71120's additive saturation follow authored
+colours/sizes/layers; no retail screenshot establishes a mismatch.
+Actor-only72274/72275/72276 captures do not demonstrate a CAT gate:
+the fixture measured584 CAT vertices, while their authored20-second
+effect's alpha stays at or below2/255 during the captured first second.
+
+Fixture corrections supply installed playfield1000001 resource tilemaps/
+flags to Toggle's unchanged include/exclude/mask gates, actual host camera
+position to AParticle, native environment wind/oscillator inputs, and
+distinct source/target endpoints with HitLocation for directional children.
+The71351 inspection camera now derives clipping/fog distances from actual
+geometry bounds instead of hiding its authored large fog-particle volume
+behind default far330/fog300. These are fixture-input corrections, not
+changed authored dimensions or production fallback visuals.
+The final surface inventory contains9,360 PNGs for1,556 distinct IDs,
+including24 explicitly named HitLocation captures. The prior389 contact
+sheets were inspected in full; the504-frame changed-family set occupied
+another21 sheets. SignedStars43097/43098 now show wide pink/white
+foot-ring fields and glows at45–60 ticks, while43099 shows pale blue
+cross sparkles. Directional17921 shows an upward white dotted tracer,
+17922 a cyan S-wave tracer,12600 a drifting white dot and36000 a
+white/grey smoke plume. HitLocation2630/2631/2632 show a tiny white speck,
+blue/white blob and larger puff;25001 shows a cyan foot streak/starburst
+at frames1–2 and expires before15. No new mismatch was established in
+these changed Stars/endpoint captures. The actual corrected-Shield rerender
+was inspected across all21 changed-family sheets:12350–12354 now show
+white/tan/blue/rose/teal mottled shell rims at45–60 ticks;43608 shows a
+cyan wispy whole-body shell at30–60 and43748 a weak maroon tint.
+43609/43610 show cyan-white/green-cyan rims,43611 a faint shell,
+43631 a cyan rim,43743–43758 subtle coloured tints and43761 a bright
+blue halo at15/30/45 that expires by60.32201–32204's foot/shin-localized
+colour is explained by the native radial front above. No new mismatch
+was established. The earlier pre-mapping Shield captures are superseded.
+The complete current surface filter passed in1975.60s (artifact24270)
+without missing native-input control/vertex errors. No retail reference
+frames were available for these surveys; offscreen observations do not
+certify real-window dispatch or retail-frame parity.
+
 The earlier779-test binary listing (artifact23504) and its older
 `retail_effect_census` output (23507) predated this integration.
-They are superseded by the rebuilt913-test libtest binary exercised
-in23891 (one selected test,912 filtered out). Neither the older support
+They are superseded by the936-test libtest binary exercised in24270
+(one selected census test,935 filtered out). Neither the older support
 flags nor failures are current coverage evidence. The final constructor
 inventory still does not certify GPU frames or live dispatch.
 
