@@ -7,6 +7,15 @@ use ao_net::n3::action::{self, CampInput, Outgoing};
 /// Logout countdown of the camp timer bar (`LDBformat::Feed(0x1e)` in `CampStartedMessage`).
 const CAMP_SECONDS: f32 = 30.0;
 
+fn camp_timer_xml(bw: u32, bh: u32) -> String {
+    format!(
+        "<root><View view_layout=\"stacked\" name=\"camp_timer\" min_size=\"Point({bw},{bh})\" max_size=\"Point({bw},{bh})\">\
+         <PowerBar name=\"camp_bar\" bg_gfx=\"GFX_GUI_TIMERBAR_EMPTY\" full_gfx=\"GFX_GUI_TIMERBAR_FULL\" direction=\"right\"/>\
+         <View view_layout=\"vertical\" h_alignment=\"left\" v_alignment=\"top\"><TextView name=\"camp_label\" min_size=\"Point({bw},{lh})\" max_size=\"Point({bw},{lh})\" font=\"TOOLTIP\" h_alignment=\"left\" v_alignment=\"top\" layout_borders=\"Rect(0,1,0,0)\"/></View></View></root>",
+        lh = bh.saturating_sub(1)
+    )
+}
+
 impl Play {
     /// Runs the uses the HUD queued this frame.
     pub(in crate::play) fn hud_uses(&mut self) {
@@ -179,16 +188,12 @@ impl Play {
     /// `TimerSystemModule_t::CreateTimer(40000, 0:0, "Logout", 0xffffff)` [GUI 0x100518f0] -> `TimerBar_c` (ctor 0x100512ae): a `RenderWindow_t`
     /// holding a `PowerBar_t(gfx 0x1a8 `GFX_GUI_TIMERBAR_EMPTY` / 0x1a9 `GFX_GUI_TIMERBAR_FULL`)` sized to the art and a `TextLine_t` with the
     /// name; `CampStartedMessage` fixes the time at 30.0 s, direction 1 (`FUN_1002ba93`: the bar drains) and centres it,
-    /// `((display - size) / 2)` per axis. 40000 is the `RenderWindow_t` / `PowerBar_t` id argument, not a duration. [UNRESOLVED] the text
-    /// colour (`TextLine_t::SetDefaultColor(0)`: palette entry 0) and font; the frame-less window stands in for the `RenderWindow_t` layer 7.
+    /// `((display - size) / 2)` per axis. 40000 is the `RenderWindow_t` / `PowerBar_t` id argument, not a duration.
+    /// `TimerBar_c` uses font 1 (TOOLTIP) at local (0,1), not a centred NORMAL label; palette colour 0.
     fn camp_bar_open(&mut self) {
         self.camp_bar_close();
         let (bw, bh) = self.gui.gfx_id("GFX_GUI_TIMERBAR_EMPTY").map(ao_gui::GfxId).map_or((128, 16), |g| self.gui.gfx().size(g));
-        let xml = format!(
-            "<root><View view_layout=\"stacked\" name=\"camp_timer\" min_size=\"Point({bw},{bh})\" max_size=\"Point({bw},{bh})\">\
-             <PowerBar name=\"camp_bar\" bg_gfx=\"GFX_GUI_TIMERBAR_EMPTY\" full_gfx=\"GFX_GUI_TIMERBAR_FULL\" direction=\"right\"/>\
-             <TextView name=\"camp_label\" h_alignment=\"center\" v_alignment=\"center\"/></View></root>"
-        );
+        let xml = camp_timer_xml(bw, bh);
         match self.gui.open_window_xml("TimerBar", &xml, (0, 0), ao_gui::WindowSize::Fixed(bw, bh)) {
             Ok(w) => {
                 self.gui.set_text(w, "camp_label", "Logout");
@@ -282,5 +287,21 @@ impl Play {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn logout_label_uses_retail_font_and_local_origin() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = ao_gui::Gui::new(&dir, None).unwrap();
+        let w = gui.open_window_xml("TimerBar", &super::camp_timer_xml(128, 16), (0, 0), ao_gui::WindowSize::Fixed(128, 16)).unwrap();
+        gui.set_text(w, "camp_label", "Logout");
+        let r = gui.view_rect(w, "camp_label").unwrap();
+        let bar = gui.view_rect(w, "camp_bar").unwrap();
+        assert_eq!((r.l - bar.l, r.t - bar.t), (0.0, 1.0));
+        assert!(super::camp_timer_xml(128, 16).contains("font=\"TOOLTIP\""));
     }
 }

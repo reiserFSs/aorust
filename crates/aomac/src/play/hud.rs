@@ -382,6 +382,12 @@ pub(super) struct Hud {
 }
 
 impl Hud {
+    pub(super) fn set_attack_range(&mut self, in_range: Option<bool>) {
+        if let Some(in_range) = in_range {
+            self.target.in_attack_range = in_range;
+        }
+    }
+
     pub(super) fn new(gui: &mut Gui, dir: &Path, size: (u32, u32)) -> anyhow::Result<Self> {
         let cc = gui.open_window("ControlCenter", (0, 0), WindowSize::Fixed(size.0, size.1))?;
         let menus_dir: PathBuf = dir.join("cd_image/gui/Default/ActionMenu");
@@ -747,6 +753,7 @@ impl Hud {
         // `CompassWindow_c` criteria (`FUN_1006d433`)
         let show = ao_gui::expr::truthy("dvalue:cc_section1 && dvalue:cc_compass", &res);
         drop(res);
+        self.rollup.sync_dock(gui, self.cc);
         if let Some(c) = &mut self.compass {
             c.set_visible(gui, show);
         }
@@ -1640,6 +1647,13 @@ mod tests {
         let cc = hud.cc;
         click(&mut hud, &mut gui, cc, "command_menu");
         let command = hud.popup.as_ref().unwrap().window;
+        // Retail Actions capture and ControlMenu_c 0x10071524: individual pills, no enclosing backdrop/chrome.
+        assert_eq!(gui.outer_size(command), gui.window_size(command));
+        let (px, py) = gui.window_pos(command);
+        let (pw, ph) = gui.window_size(command);
+        let popup_rect = [px as f32, py as f32, px as f32 + pw as f32, py as f32 + ph as f32];
+        assert!(!gui.frame(0.0).cmds.iter().any(|cmd| matches!(cmd,
+            ao_gui::DrawCmd::Solid { dst, .. } if *dst == popup_rect)));
         let help = {
             let mut all = HashMap::new();
             for root in &hud.menu_roots { root.walk(&mut all); }

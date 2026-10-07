@@ -1,9 +1,9 @@
 //! The `RollupArea` dock of the control centre (`RollupController_c : DockArea_c`, GUI 0x100487df ctor/dtor, `RollupPage_c` 0x10049389,
 //! `PageHeaderView_c` 0x1004a07d, `RollupController_c` add-view 0x10049897, layout 0x10048232). Docs: docs/gui.md §11.13.
 //!
-//! The area is `Rect(W - 191, 20, W, H - 225)` (`InitialiseMessage` 0x1006a968: `FSUB double [0x101b4e00 = 191.0]` from the screen width for the left
+//! The initial area is `Rect(W - 191, 20, W, H - 225)` (`InitialiseMessage` 0x1006a968: `FSUB double [0x101b4e00 = 191.0]` from the screen width for the left
 //! edge, `[0x101b4e08 = 20.0]` top, `[0x101b4e10 = 225.0]` from the height for the bottom; asm 0x1006ab32..0x1006ab75), i.e. 192 px wide inclusive: the width of
-//! `GFX_GUI_WEARVIEW_*` (192 x 320). The docked views are stacked top to bottom in the order of `DockAreas/RollupArea.xml` (`docked_view_identities`:
+//! `GFX_GUI_WEARVIEW_*` (192 x 320). Its final top follows `ControlCenter.xml`'s optional mini-toolbar, not that initial rectangle. The docked views are stacked top to bottom in the order of `DockAreas/RollupArea.xml` (`docked_view_identities`:
 //! friends, wear, nano, stat); each is a `RollupPage_c` = header (`PageHeaderView_c`) + the view in a page of `page_height` px
 //! (`dock_node_configs`), expandable (`is_page_expanded`). A page is `header + (expanded ? page_height + 1 + 3 + 5 : 1)` high (`FUN_10047d99`:
 //! `+0x164` header height, `+0x168` page height, `+0x158` / `+0x160` page borders 3 / 5, `_DAT_101a87e8` = 1.0) and the pages are `1` px apart.
@@ -98,6 +98,8 @@ pub struct Rollup {
     config: Vec<PageConfig>,
     pages: Vec<Page>,
     screen: (u32, u32),
+    /// Laid-out ControlCenter.xml dock top, after the optional mini-toolbar.
+    dock_top: i32,
     /// Scroll offset in px (`scroll_offset` of the config, 0 at the first login).
     scroll: f32,
     /// The dock config changed since [`Rollup::take_dirty`].
@@ -140,7 +142,7 @@ pub fn read_scroll(src: &str) -> Option<f32> {
 impl Rollup {
     pub fn new(dir: &Path, screen: (u32, u32)) -> Self {
         let config = std::fs::read_to_string(dir.join("prefs/NewChar/DockAreas/RollupArea.xml")).map(|s| read_config(&s)).unwrap_or_default();
-        Self { config, pages: vec![], screen, scroll: 0.0, dirty: false, groups: vec![], drag: None }
+        Self { config, pages: vec![], screen, dock_top: AREA_TOP, scroll: 0.0, dirty: false, groups: vec![], drag: None }
     }
 
     pub fn set_screen(&mut self, gui: &mut Gui, screen: (u32, u32)) {
@@ -149,9 +151,21 @@ impl Rollup {
         self.layout(gui);
     }
 
-    /// The area's left edge and bottom for the screen (`Rect(W - 191, 20, W, H - 225)`).
+    /// The area's left edge, XML-laid-out top and bottom for the screen.
     pub fn area(&self) -> (i32, i32, i32) {
-        (self.screen.0 as i32 - (AREA_W as i32 - 1), AREA_TOP, self.screen.1 as i32 - AREA_BOTTOM)
+        (self.screen.0 as i32 - (AREA_W as i32 - 1), self.dock_top, self.screen.1 as i32 - AREA_BOTTOM)
+    }
+
+    /// ControlCenter.xml places the rollup directly after CCMiniToolbar (zero top borders).
+    /// The initial module rectangle is not the final dock position after XML layout.
+    pub fn sync_dock(&mut self, gui: &mut Gui, control_center: WindowId) {
+        if let Some(rect) = gui.view_rect(control_center, "RollupArea") {
+            let top = rect.t as i32;
+            if self.dock_top != top {
+                self.dock_top = top;
+                self.layout(gui);
+            }
+        }
     }
 
     /// The configured page height of a view (`page_height`); `fallback` for views the template does not list.
@@ -198,11 +212,7 @@ impl Rollup {
         gui.set_canvas(window, "header_bg", vec![CanvasItem::Solid { dst: [0.0, 0.0, w as f32, header as f32], color: 0x000000, alpha: 0.85 }]);
         gui.set_canvas(window, "icon", image(gui, ICON, [0.0, 0.0, icon.0 as f32, icon.1 as f32]).into_iter().collect());
         gui.set_canvas(window, "close", image(gui, CLOSE, [0.0, 0.0, close.0 as f32, close.1 as f32]).into_iter().collect());
-        // body: `RollupPage_c` renders `GFX_GUI_TAB_BACKGROUND` (0x198) over a 0x404040 surface
-        let bh = (body_h + BODY_TOP + BODY_BOTTOM) as f32;
-        let mut bg = vec![CanvasItem::Solid { dst: [0.0, 0.0, w as f32, bh], color: 0x404040, alpha: 1.0 }];
-        bg.extend(image(gui, BG, [0.0, 0.0, w as f32, bh]));
-        gui.set_canvas(window, "body_bg", bg);
+        self.paint_body_background(gui, window, "body_bg");
         let mut page = Page { key: key.to_string(), window, expanded: cfg.expanded, title: title.to_string(), docked: true, wrapped: false };
         self.paint_arrow(gui, &mut page, arrow);
         if !cfg.expanded {
@@ -242,6 +252,20 @@ impl Rollup {
         }
     }
 
+    /// RollupPage_c surface 0x198 covers the page; its 0x404040 surface
+    /// covers only the bottom border after the child (GUI 0x10049389/0x100490e4).
+    fn paint_body_background(&self, gui: &mut Gui, window: WindowId, name: &str) {
+        let (width, height) = gui.canvas_size(window, name);
+        let (w, h) = (width as f32, height as f32);
+        let mut items = vec![];
+        if let Some(id) = gui.gfx_id(BG).map(GfxId) {
+            let (iw, ih) = gui.gfx().size(id);
+            items.push(CanvasItem::ImageTint { id, src: [0.0, 0.0, iw as f32, ih as f32], dst: [0.0, 0.0, w, h], color: 0x1000000, alpha: 1.0 });
+        }
+        items.push(CanvasItem::Solid { dst: [0.0, (h - BODY_BOTTOM as f32).max(0.0), w, h], color: 0x404040, alpha: 1.0 });
+        gui.set_canvas(window, name, items);
+    }
+
     /// Size an owner wrapper from its page height, not its free-resize ceiling.
     fn resize_page(&self, gui: &mut Gui, page: &Page) {
         let width = if page.docked { AREA_W } else { gui.window_size(page.window).0 };
@@ -262,6 +286,9 @@ impl Rollup {
         }
         let height = gui.window_size(page.window).1;
         gui.resize_window(page.window, WindowSize::Fixed(width, height));
+        if page.docked {
+            self.paint_body_background(gui, page.window, if page.wrapped { "docked_body_bg" } else { "body_bg" });
+        }
     }
 
     /// Places the pages (`FUN_10048232`): top to bottom from the area top minus the scroll offset, [`GAP`] px apart.
@@ -375,6 +402,41 @@ fn inner_xml(src: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mini_toolbar_and_rollup_share_the_xml_boundary() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let size = (640, 600);
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let cc = gui.open_window("ControlCenter", (0, 0), WindowSize::Fixed(size.0, size.1)).unwrap();
+        fill_toolbar(&mut gui, cc).unwrap();
+        gui.add_view_xml(cc, "RollupControllerDock", "RollupArea", "<root><View name=\"RollupArea\" min_size=\"Point(192,600)\" max_size=\"Point(192,600)\"/></root>").unwrap();
+        // Compare hidden height to omission of the native XML row, not screen y=0:
+        // SpaceOut distributes residual space even when this fixture overfills the column.
+        let xml = std::fs::read_to_string(dir.join("cd_image/gui/Default/Views/ControlCenter.xml")).unwrap();
+        let without_toolbar = xml.lines().filter(|line| !line.contains("<CCMiniToolbar ")).collect::<Vec<_>>().join("\n");
+        let baseline = gui.open_window_xml("ControlCenterWithoutToolbar", &without_toolbar, (0, 0), WindowSize::Fixed(size.0, size.1)).unwrap();
+        gui.add_view_xml(baseline, "RollupControllerDock", "RollupArea", "<root><View name=\"RollupArea\" min_size=\"Point(192,600)\" max_size=\"Point(192,600)\"/></root>").unwrap();
+        gui.apply_criteria(baseline, &|_, _| Some(1));
+        let without_toolbar_top = gui.view_rect(baseline, "RollupArea").unwrap().t;
+        let mut rollup = Rollup::new(&dir, size);
+        let page = rollup.open_page(&mut gui, "wear_window", "Wear", "<root><View/></root>", 317.0).unwrap();
+        for toolbar in [true, false, true] {
+            gui.apply_criteria(cc, &|_, key| Some(i64::from(key != "cc_mini_toolbar" || toolbar)));
+            rollup.sync_dock(&mut gui, cc);
+            let dock = gui.view_rect(cc, "RollupArea").unwrap();
+            assert_eq!(gui.window_outer_frame(page).unwrap().1, dock.t as i32);
+            if toolbar {
+                let strip = gui.view_rect(cc, "CCMiniToolbar").unwrap();
+                assert_eq!(dock.t, strip.b + 1.0, "zero XML borders leave no toolbar-to-Wear gap");
+                assert_eq!(strip.t, 0.0);
+            } else {
+                assert!(!gui.is_visible(cc, "CCMiniToolbar"));
+                assert_eq!(dock.t, without_toolbar_top, "hidden toolbar consumes no layout height");
+            }
+        }
+    }
 
     struct ClipShot { gui: Gui }
 

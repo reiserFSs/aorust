@@ -11,8 +11,6 @@ use std::path::Path;
 
 /// The window shows six `TeamBar_c` rows (`FUN_100785f0` loop `< 6`, `FUN_10077bf2`).
 const ROWS: usize = 6;
-/// Row height of a `TeamBar_c`, inclusive pixels (UNRESOLVED guess: two 5 px bars + borders; the original size was not decoded).
-const ROW_H: u32 = 16;
 /// `SetDefaultColor`: leader `0x11eeaa`; otherwise `(!inTree - 1 & 0x777777) + 0x888888` = white when the character is known, grey when not (`FUN_100775ac`).
 const LEADER: u32 = 0x11eeaa;
 const KNOWN: u32 = 0xffffff;
@@ -302,22 +300,27 @@ impl HudTeam {
 
     /// `TeamView_c` ctor `FUN_100785f0`: header `BorderView` (client borders 4, 2, 4, 2), the button row (borders 0, 5, 0, 5), six `TeamBar_c`s.
     fn build(&mut self, gui: &mut Gui) -> anyhow::Result<Win> {
-        let xml = "<root><View view_layout=\"vertical\" name=\"team_root\">\
-                   <BorderView name=\"header_border\"><TextView name=\"header\" layout_borders=\"Rect(4,2,4,2)\" max_size=\"Point(16000,-1)\"/></BorderView>\
+        let xml = "<root><BorderView name=\"team_background\" bg_gfx=\"GFX_GUI_TAB_BACKGROUND\" tl_gfx=\"none\" tr_gfx=\"none\" bl_gfx=\"none\" br_gfx=\"none\" left_gfx=\"none\" top_gfx=\"none\" right_gfx=\"none\" bottom_gfx=\"none\" view_layout=\"vertical\"><View view_layout=\"vertical\" name=\"team_root\">\
+                   <View name=\"header_border\"><TextView name=\"header\" layout_borders=\"Rect(4,2,4,2)\" max_size=\"Point(16000,-1)\"/></View>\
                    <View name=\"buttons\" view_layout=\"horizontal\" layout_borders=\"Rect(0,5,0,5)\"/>\
-                   <View name=\"rows\" view_layout=\"vertical\"/></View></root>";
+                   <View name=\"rows\" view_layout=\"vertical\"/></View></BorderView></root>";
         let title = self.text("Team");
         let (x, y, fw, fh) = self.frame;
         let window = gui.open_tabbed_window_xml("TeamView", &title, xml, (x, y), WindowSize::Preferred)?;
+        gui.set_text(window, "header", &self.text("NoTeam"));
         let gfx = |id: u32| gui.gfx().name(ao_gui::GfxId(id)).unwrap_or_default().to_string();
         // `TeamBar_c` (`FUN_100791f7`): bars `PowerbarView_c(bounds, 0x1b, 0x1a, 0, 0, right)` (health) and `(0x1d, 0x1c)` (nano); separators `BitmapView_c(0xd6)`
         let (hp, hp_bg, nano, nano_bg, sep) = (gfx(0x1a), gfx(0x1b), gfx(0x1c), gfx(0x1d), gfx(0xd6));
+        // TeamBar's HLayout preferred height comes from its text and two bars,
+        // including the native 2 px top/bottom borders (GUI 0x100791f7).
+        let row_h = (gui.font_height(ao_gui::FontId::Normal) as u32 + 3)
+            .max(gui.gfx().size(ao_gui::GfxId(0x1b)).1 + gui.gfx().size(ao_gui::GfxId(0x1d)).1 + 3);
         let mut rows = vec![];
         for i in 0..ROWS {
             let top = if i == 0 { format!("<BitmapView bitmap_id=\"{sep}\" max_size=\"Point(16000,-1)\"/>") } else { String::new() };
             let src = format!(
                 "<root><View view_layout=\"vertical\" name=\"row{i}\">{top}\
-                 <View view_layout=\"stacked\" min_size=\"Point(-1,{ROW_H})\" max_size=\"Point(16000,{ROW_H})\"><CanvasView name=\"hl{i}\"/>\
+                 <View view_layout=\"stacked\" min_size=\"Point(-1,{row_h})\" max_size=\"Point(16000,{row_h})\"><CanvasView name=\"hl{i}\"/>\
                  <View view_layout=\"horizontal\"><TextView name=\"idx{i}\" value=\"{n}\" layout_borders=\"Rect(3,2,0,2)\"/><HLayoutSpacer/>\
                  <TextView name=\"name{i}\" value=\"\" layout_borders=\"Rect(5,2,5,2)\"/><HLayoutSpacer/>\
                  <View view_layout=\"vertical\" layout_borders=\"Rect(2,2,2,2)\">\
@@ -331,8 +334,7 @@ impl HudTeam {
         let mut w = Win { window, rows, buttons: (false, false) };
         self.build_buttons(gui, &mut w, true);
         // `LoadWndConfig` applies the saved `WindowFrame` (the template's size) and ends in `Window::MoveInsideScreen`: the origin comes from a bigger screen
-        // The template's height (157) is the client's own default; a stacked row has no layout node, so the rows carry `min_size`
-        // (UNRESOLVED: the original `TeamBar_c` height) and the window grows to hold six of them.
+        // The stacked highlight overlay reserves the native HLayout preferred height.
         gui.resize_window(w.window, WindowSize::Preferred);
         let fh = fh.max(gui.outer_size(w.window).1);
         let (px, py) = (x.min(self.screen.0.saturating_sub(fw) as i32).max(0), y.min(self.screen.1.saturating_sub(fh) as i32).max(0));
@@ -546,6 +548,29 @@ mod tests {
 
     fn member(id: Identity, name: &str) -> Vec<u8> {
         team_member(ME, &TeamMember { member: id, team: Identity { kind: TEAM_KIND, instance: 1 }, sub_team: 0, profession: 1, level: 30, name: name.into() })
+    }
+
+    #[test]
+    fn team_native_background_and_rows_stay_inside_client() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut h = HudTeam::new(&dir, (1280, 800));
+        h.open(&mut gui);
+        let w = h.win.as_ref().unwrap().window;
+        let background = gui.view_rect(w, "team_background").unwrap();
+        let header = gui.view_rect(w, "header").unwrap();
+        let first = gui.view_rect(w, "idx0").unwrap();
+        assert!(header.t >= background.t && first.t > header.b);
+        for i in 0..ROWS {
+            let hp = gui.view_rect(w, &format!("hp{i}")).unwrap();
+            let nano = gui.view_rect(w, &format!("nano{i}")).unwrap();
+            assert!(hp.t > header.b && nano.t > hp.b);
+            assert!(nano.b <= background.b);
+        }
+        assert!(gui.frame(0.0).cmds.iter().any(|cmd| matches!(cmd,
+            ao_gui::DrawCmd::Gfx { id: ao_gui::GfxId(0x198), dst, .. }
+            if dst[0] == background.l && dst[1] == background.t
+                && dst[2] == background.r + 1.0 && dst[3] == background.b + 1.0)));
     }
 
     #[test]

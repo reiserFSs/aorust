@@ -50,6 +50,8 @@ pub struct Item {
     pub impact_effect_type: i32,
     pub ammo: i32,
     pub delay: i32,
+    /// Effective `AttackRange` (287); ctor defaults are 20 wielded / 2 dummy.
+    pub attack_range: i32,
     pub wielded: bool,
 }
 
@@ -135,7 +137,7 @@ impl Armory {
         let record = template.zip(self.store.as_ref()).and_then(|(t, s)| s.get(ao_formats::dynel_visual::ITEM_TEMPLATE_TYPE, t).ok().flatten());
         let animations = record.as_ref().map(|r| ao_formats::dynel_visual::animation_map(r)).unwrap_or_default();
         let effects = record.as_ref().and_then(|r| super::super::chat::item_template_spells(r, 10).ok()).map(|s| super::effects::bindings(&s)).unwrap_or_default();
-        Item { item_class: get(&stats, 0x37).unwrap_or(0), dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), delay: get(&stats, 0x126).unwrap_or(200), effect_type: get(&stats, 413).unwrap_or(0), impact_effect_type: get(&stats, 414).unwrap_or(49999), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), animations, effects, wielded }
+        Item { item_class: get(&stats, 0x37).unwrap_or(0), dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), delay: get(&stats, 0x126).unwrap_or(200), attack_range: get(&stats, 0x11f).unwrap_or(if wielded { 20 } else { 2 }), effect_type: get(&stats, 413).unwrap_or(0), impact_effect_type: get(&stats, 414).unwrap_or(49999), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), animations, effects, wielded }
     }
 
     /// `holder` wields weapon dynel `item` in body `slot` (`WeaponItemFullUpdateIIR_t`).
@@ -226,6 +228,16 @@ impl Armory {
         self.by.get(&holder)?.slots.get(&slot)
     }
 
+    /// GC 0x10068969: hands 8/6, or bare hands 0 only when neither is occupied.
+    /// GC 0x1009a68e: percentage bonus, truncate to integer, upper limit 40.
+    pub fn in_attack_range(&self, holder: i32, distance: f32, bonus: i32) -> bool {
+        let slots = if self.slot_item(holder, 8).is_some() || self.slot_item(holder, 6).is_some() { &[8, 6][..] } else { &[0][..] };
+        slots.iter().filter_map(|&slot| self.slot_item(holder, slot)).any(|item| {
+            let range = (item.attack_range as f64 + item.attack_range as f64 * bonus as f64 * 0.01) as i32;
+            range.min(40) as f32 > distance
+        })
+    }
+
     /// Resolve an explicit wield notification against the replicated weapon dynel, not an outgoing inventory request.
     pub fn worn_item(&self, item: i32) -> Option<(i32, i32, &Item)> {
         let &(holder, slot) = self.worn.get(&item)?;
@@ -264,6 +276,24 @@ mod tests {
         let mut a = Armory::default();
         a.list(1, false, &[(43712, 100), (43713, 144), (43714, 142), (43715, 1)]);
         a
+    }
+
+    #[test]
+    fn attack_range_follows_hand_slots_bonus_and_strict_boundary() {
+        let mut a = player();
+        assert!(a.in_attack_range(1, 1.99, 0));
+        assert!(!a.in_attack_range(1, 2.0, 0));
+        a.wield(1, 500, 6, None, &[(0x11f, 10)]);
+        assert!(a.in_attack_range(1, 11.99, 20));
+        assert!(!a.in_attack_range(1, 12.0, 20));
+        assert!(!a.in_attack_range(1, 10.0, 9), "percentage result truncates to 10");
+        a.wield(1, 501, 8, None, &[(0x11f, 100)]);
+        assert!(a.in_attack_range(1, 39.99, 0));
+        assert!(!a.in_attack_range(1, 40.0, 0));
+        a.unwield_slot(1, 8);
+        a.unwield_slot(1, 6);
+        assert!(a.in_attack_range(1, 1.99, 0));
+        assert!(!a.in_attack_range(1, 2.0, 0));
     }
 
     #[test]

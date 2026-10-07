@@ -363,6 +363,21 @@ Evidence (GUI.dll, project copy of `/tmp/aomac-ghidra/dsky/gui`):
 * **Mini toolbar above Wear (bug 11):** retail `pasted-image-cf5fb9f9b633eadc.png` shows this icon strip, distinct from the Wear header in `pasted-image-ba7bc439cfc00e5e.png`. `Views/ControlCenter.xml:19` registers `CCMiniToolbar` with `cc_mini_toolbar && cc_rollup_panel && cc_section1`; `CharPrefs.xml:67` defaults the setting to false, so the capture is a nondefault setting. The unsupported XML element was an empty view in the port. It now keeps the native criteria and receives the native buttons.
   GUI.dll `MiniToolbar_c` ctor `0x100726b3` defines, in order, Wear (`wear_window`, SB_WEAR), Controls (`specialaction_window`, SB_ACTION), Knowledge (`knowledge_window`, SB_REF), Mission (`mission_window`, SB_MISSION), Team (`team_view`, SB_TEAM), Map (`map_window`, SB_MAP), Friends (`friends_window`, SB_FRIENDS), Programs (`nano_window`, SB_NANO), Stats (`stat_window`, SB_STAT), NCU (`ncu_window`, SB_NCU). Names in parentheses are exact DValues, and the displayed names are the constructor's tooltip strings (empty tooltip body). `ToolbarButton_c` `0x10072b33` binds the DValue, toggle value and tooltip; assembly `0x1007272b..0x10072743` passes raised `0x173` = SB_WEAR_OFF and pressed/hover `0x172` = SB_WEAR. Each entry uses its corresponding ON/OFF pair. Click callback `0x10072429` writes the bool DValue; `0x10072475` applies DValue changes back to the button. Layout `0x100724e8` places the first at (0,0), advances by inclusive Width+1, and reports summed width/max height; no invented spacing or icons.
   Existing `Hud::toggle_dvalue` opens/closes implemented windows; Friends remains chat-owned. Knowledge's exact DValue is toggled and reflected in the icon, but its window consumer is not implemented (existing feature gap, not a fabricated substitute). Regression `hud::tests::native_mini_toolbar_setting_order_and_window_toggles` covers disabled default, enabled strip, native icon widths/contiguous order, all ten DValue actions, implemented-window membership and rollup criteria. No builds/tests/live checks were run by this worker.
+* **Mini-toolbar/Wear gap (bug23):** `ControlCenter.xml:15–23` places
+  `CCMiniToolbar` immediately before `RollupControllerDock`, without a spacer
+  or intervening top borders. Fresh GUI.dll layout `0x100724e8` caches the
+  maximum button-frame height at `this+0x138`; preferred-size callback
+  `0x1007249f` returns the cached point when visible. `RollupController_c`
+  layout `0x10048232` begins pages at controller-local y=0. The port retained
+  the module's initial screen-space y=20 after XML layout. Rollup windows now
+  synchronize their top to the laid-out `RollupArea` after criteria refresh,
+  retaining scroll, clipping and bottom behavior.
+  `mini_toolbar_and_rollup_share_the_xml_boundary` covers toolbar enabled,
+  disabled and re-enabled states and contiguous inclusive boundaries.
+  The generic toolbar adapter also retained its icon height while hidden.
+  Native preferred-size callback `0x1007249f` returns a hidden-height sentinel;
+  the adapter now collapses its hidden row while the fixed-width adjacent
+  RollupControllerDock retains the column width.
 * **NewLevel notices** (`play/level_notice.rs`): fresh GUI.dll string xrefs resolve
   `got_ip` at `0x101aec6c`, `got_perk` at `0x101aec98`, and `got_tech` at
   `0x101aeca8` to `0x1002de8e`, `0x1002dfe7`, and `0x1002e140`.
@@ -386,6 +401,20 @@ Evidence (GUI.dll, project copy of `/tmp/aomac-ghidra/dsky/gui`):
   and `native_notice_assets_geometry_click_and_preference` cover independent
   dismissal, actual asset IDs/natural dimensions, borderless window sizing,
   native origins, click targets, and the disabled preference.
+
+**Notice palette / Actions backdrop (bugs 9/13):** `NotifyButton` `0x10052fa0`
+constructs a Button and sets states 0/1/2 to the same NEW_IP/PERK/TECH art.
+The generic icon-button renderer previously bypassed native surface styling,
+drawing white at alpha 1. It now follows `GetBorderView` `0x10128111` /
+`SetGfx` `0x10128270`: raised DEFAULT, pressed SELECTED, HOVER overlay,
+layer-2 alpha .85 (`GUIColors.xml:3–5`: 80e9f3/ffffcc/a5ffdb).
+`notice_art_uses_native_button_palette_and_hover_overlay` covers all states.
+Fresh `ControlMenu_c` `0x10071524` decompile constructs a View and borderless
+style-3 Window (flags 0xd3c), without a background surface; the `CCMenu`
+definitions in `Views/ControlCenter.xml:27,31` specify no background.
+No enclosing Actions backdrop is therefore added.
+`settings_nested_popup_and_pet_actions` asserts the borderless dimensions and
+absence of an enclosing solid backdrop.
   No tests, builds, or live checks were run by this worker.
 * `prefs/NewChar/*` is the install's new-character template; **no DLL contains the string `NewChar`** (searched all DLL/EXE, ASCII and UTF-16), so its consumer is UNRESOLVED. Its arbitrary bar/hotbar frames demonstrate saved custom positions, not a screen-independent first-login layout. Pool bars use the constructor positions from `SlotPlayerCharacterAlive` 0x1006afed, the compass uses 0x1006d433, and the hotbar starts at `(20,20)` from 0x100d94e9; character-owned `WindowFrame`s override those origins and are clamped by `MoveInsideScreen`.
 * **Item inspection (bug 7):** `hud_stats/item_ui.rs` routes Shift/Ctrl-left-click and right-click on filled wear/grid cells, and inventory list rows, through `Hud::take_info_urls` to the existing chat InfoView (`Views/InfoView.xml`, `BrowserView`, Back/Forward; docs/chat/dialogs.md §1). URLs carry the runtime inventory identity from GC `FUN_10046d8e(slot)`, not a template ID or the entry's unresolved `id` words. The qualified click never arms drag or enters double-click use; missing slots produce no URL. Shift/Ctrl info signals are evidenced by `MultiListView_c` handler `FUN_10040a17` (§10.5); direct right-click inspection is the requested interaction, while the complete retail item popup remains unresolved. The inventory tab's **“i”** is the window-icon menu (`WndBorder::SlotIconButton` 0x1015a74e; `Event::FrameIcon`), not an item-information button; it is intentionally not rebound to inspect an arbitrary item. Regression `item_inspection_does_not_use_or_drag_inventory_and_wear` covers filled wear/grid/list routes and absence of outbound use/move messages; not run during this edit.
@@ -534,9 +563,25 @@ tests). The timer runs on `Gui::frame(dt)`; `input()` feeds `UpdateToolTip`. Tes
   Slider tint is `N3Msg_Consider` at 0x1007313a, reusing `nametag::{consider_ratio,con_color}` (GUI 0x10024af1 / Gamecode 0x10017496). Background starts one pixel after the left cap and ends one pixel before the right cap (0x10073598).
   Default `Graphics.uvga` PNG IHDRs at offsets `1090174+16` (background) and `1090936+16` (slider) both encode 16×11. The port emits source-bounded tiles for both: an oversized background source rectangle sampled adjacent cap entries in the GUI atlas, producing false separated segments as the slider depleted. Regression: `health_bar_tiles_stay_inside_the_atlas_entry` checks full/half/low/empty fills and contiguous, ≤16-pixel source spans.
   `FUN_10072e49` tints caps `0xff2222` only when attacking flag `+0x161` and in-attack-range boolean `+0x162` are both true; 0x1007353f receives the latter from `GlobalSignals+0x64`.
-  Gamecode 0x10004711 / 0x100047a0 emit true/false; 0x10068969 tests occupied attack slots 8/6 (or bare-hand slot 0), via 0x100687e5 → 0x100679c1. This is **not a blink**.
-  0x100679c1 rejects self/different playfield and compares centre distance minus both actual collision radii (`SimpleChar+0x1ec → +0x30`) to slot-owner range.
+  Gamecode 0x10004711 / 0x100047a0 emit true/false; 0x10068969 tests occupied
+  attack slots 8/6 (bare-hand slot 0 only when neither is occupied), via
+  0x100687e5 → 0x100679c1. This is **not a blink**. The producer reads the
+  selected identity at targeting-controller +0x5c, not the fighting target;
+  absent selection leaves the global signal unchanged.
+  0x100679c1 rejects self/different playfield and compares centre distance
+  minus cached character radii strictly below slot-owner range (objects
+  subtract only the owner's radius). Cached radii (`SimpleChar+0x1ec → +0x30`)
+  begin at 1 metre (`0x10044702`) and are updated by `0x10044c46` /
+  `0x10059e6a` from integer CharRadius (421, mode2) times
+  max(MonsterScale (360, mode3), 1), divided by 100. They are not CAT torso
+  spheres. Wire stats override retained NPC template stats. Range changes
+  now repaint stationary bars as well as moving targets.
+  Missing CharRadius retains the constructor's cached 1-metre radius directly,
+  rather than inventing a backing-stat default and scaling it.
   Range helper 0x1009a68e reads item `AttackRange` 0x11f mode 2 and owner `RangeIncreaserWeapon` 0x17c mode 0; assembly 0x1009a6c8–0x1009a6e8 computes item range plus scaled percentage bonus, converts to integer, caps at 40.
+* **Logout label (bug6):** `TimerBar` constructor `0x100512ae` creates its
+  TextLine in font1 (TOOLTIP) at local IPoint(0,1), not a centered NORMAL
+  label. The port now follows that font/origin and retains the native art.
 * Which control shows a target: attackable → hostile, otherwise friendly. Attackable (`FUN_100744ae`): NPC and `Side` (stat 0x21) differs from the own side; a player needs
   `N3Msg_CanAttack` (not modelled).
 * `FUN_10073d0f`, `FUN_100744ae`, `FUN_1007460c`: friendly control shows a nonattackable selection only if it differs from fight target. Hostile control shows fight target plus a distinct attackable selection.
@@ -674,6 +719,38 @@ GUI.dll evidence (addresses = functions of GUI.dll, decompiled with Ghidra; XML 
 
 ### 14.5 Tests / screenshots
 `cargo test --release -p ao-gui --test listview` (real mouse events on the three widgets); `cargo test --release -p aomac social_win` (Friends window, LFT window); `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac social_win_shot` → `social.png`.
+
+**Missions/shared list layout (bug3):** The adapter's stacked header had no
+preferred height, placing row zero at the header origin. It now embeds a
+height-constrained native MultiListView header, reusing `ColumnHeaderView_c`
+paint (`0x1013a516`, `ColumnHeaderButton_c` `0x10139a17`: progress01 art
+0x14f..0x157, label borders 3). Rows use native extent 15, pitch 19 and
+column gap 5 (`LayoutList` `0x1013520e` / `AddItem` `0x10135b85`), retaining
+tooltip and press identities. `list_header_reserves_height_before_first_row_and_icon`
+covers header/row separation and native row spacing.
+
+**Team body (bug1):** `TeamView` constructor `0x100785f0` explicitly adds a
+stretched `GFX_GUI_TAB_BACKGROUND` surface (0x198) over `GetBounds`. The port
+omitted it. Its status `BorderView` has no `SetGfx`; the port's XML default
+inset border was unintended and is replaced by a plain layout wrapper.
+`TeamBar` `0x100791f7` derives HLayout height from text with 2-pixel vertical
+borders and two powerbars with 2-pixel outer borders. The port derives this
+preferred height from installed font/art rather than guessing 16.
+`team_native_background_and_rows_stay_inside_client` covers background and
+row containment.
+
+**Friends/docked-page body (bug22):** `FriendListView` `0x100a9c58` has no
+own background because its docked parent owns it. `register_window` omitted
+the `RollupPage` surfaces that `open_page` supplied. `RollupPage` constructor
+`0x10049389` loads stretched TAB_BACKGROUND (0x198) in DEFAULT colour without
+a local-alpha override, plus a solid 0x404040 surface. Layout `0x100490e4`
+places that solid after the child-client bottom: it fills the five-pixel
+bottom border, not the whole body. Registered docked pages now share this
+paint; free/restore transitions remove the dock-only surface, leaving the
+style-0 `DockWindow` frame (`0x1003bdd4`). `open_page` uses the same helper,
+removing its former whole-body solid and guessed .85 image alpha. Inherited
+window fade remains intact.
+`friends_wrapper_paints_native_body_only_while_docked` covers transitions.
 
 ## 11.12 HudWinA: Programs / NCU / Mission windows (`play/hud_nano.rs`, `hud_ncu.rs`, `hud_listview.rs`, `hud_nanodb.rs`, `own_nanos.rs`, `ao-net n3/{nano,quest}.rs`)
 Evidence: GUI.dll `NanoView_c` ctor `FUN_100d496c`, `NCUView_c` `FUN_100d6dd6`, `MissionView_c` `FUN_100d2c7e` (module slots `InventoryGUIModule_c::Slot*ViewActivated` 0x100c6d2a / 0x100c6f7d / 0x100c6da1); retail shots (ao-universe.com Basic GUI Guide: nanoprograms.jpg, ncuwindow.jpg, missions.jpg).

@@ -1223,9 +1223,12 @@ impl Gui {
         let disabled = if v.enabled { [255; 3] } else { [0x90; 3] }; // Button_c::StateChanged: 0xffffff / 0x909090
         let tint = mul(tint, disabled);
         if let Some([raised, down, hover]) = b.gfx_override {
-            // icon button: the art of the state (`StateChanged`: the hover art replaces the raised one under the pointer)
-            let id = if b.pressed { down } else if b.hover && v.enabled { hover } else { raised };
-            self.push_gfx(out, id, r, tint, alpha);
+            // SetGfx/GetBorderView (0x10128270/0x10128111) keeps the same palette/layer-2 alpha as bordered buttons.
+            let (id, col) = if b.pressed { (down, 0x2000000) } else { (raised, 0x1000000) };
+            self.push_gfx(out, id, r, mul(tint, self.map_color(col)), alpha * BUTTON_ALPHA);
+            if b.hover && v.enabled {
+                self.push_gfx(out, hover, r, mul(tint, self.map_color(0x3000000)), alpha * BUTTON_ALPHA);
+            }
             return;
         }
         let g = |ids: [u32; 9]| -> [Option<GfxId>; 9] {

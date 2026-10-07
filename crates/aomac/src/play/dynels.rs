@@ -486,8 +486,9 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
     let tag_height = rig.indicator_height();
     let features = rec.as_ref().and_then(|r| r.stat(ao_net::n3::motion::STAT_FEATURES as u32));
     let fabric = rec.as_ref().and_then(|r| r.stat(super::combat::notes::STAT_FABRIC_TYPE)).unwrap_or(0);
+    let stats = rec.as_ref().map(|r| r.stats.clone()).unwrap_or_default();
     let sounds = rec.map(|r| r.sounds).unwrap_or_default();
-    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), clips, features, tag_height, sounds, fabric, ..plain(Default::default(), true) })
+    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), clips, features, tag_height, sounds, fabric, stats, ..plain(Default::default(), true) })
 }
 
 fn monster_record(store: &RecordStore, look: &CharLook) -> anyhow::Result<Option<NpcRecord>> {
@@ -939,6 +940,16 @@ fn quat_yaw(q: &[f32; 4]) -> f32 {
 }
 
 impl Dynels {
+    pub fn character_template_stat(&self, id: i32, stat: u32) -> Option<i32> {
+        let c = self.chars.get(&id)?;
+        let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
+        ao_formats::dynel_visual::get(&built.stats, stat)
+    }
+
+    pub fn object_position(&self, id: ao_net::msg::Identity) -> Option<[f32; 3]> {
+        self.props.get(&(id.kind, id.instance)).map(|p| p.pos)
+    }
+
     #[cfg(test)]
     pub fn npc_movement_probe(&self, id: i32) -> Option<AnimState> {
         self.chars.get(&id).filter(|c| c.npc).map(|c| c.pose.anim)

@@ -4,7 +4,7 @@
 //!
 //! RE'd constants: grid icon `IconSize_e` 0 = 31 (+1) px, 1 = 47 (+1) px (the ctor default), 2 = 39 x 23, 3 = 19 x 11 (`SetGridIconSize` 0x10135719); the
 //! ctor's grid spacing is (10, 10) and its border sizes (6, 6, 6, 6) (`+0x188`, `+0x170`); the slot art behind an icon is `GFX_GUI_MULTILISTVIEW_SLOT_<size>_CLOSED`.
-//! UNRESOLVED GUESS: the list header's look (art not located in the draw code; a dark bar with the column names) and the colours of the row states.
+//! List headers reuse the engine's native `ColumnHeaderView_c` paint; row interaction remains in this adapter.
 
 use ao_gui::{CanvasItem, CanvasTip, GfxId, Gui, WindowId};
 
@@ -238,21 +238,16 @@ impl ListView {
     }
 
     fn paint_list(&self, gui: &mut Gui, w: WindowId, rebuild: bool) {
-        let text_h = gui.font_height(ao_gui::FontId::Normal) as f32;
+        // ColumnHeaderButton_c label borders are 3 px per side (GUI 0x10139a17).
+        let head_h = gui.font_height(ao_gui::FontId::Normal) as f32 - 1.0 + 6.0;
         if rebuild {
-        let cell = |text: &str, wd: f32, color: &str| {
-            format!("<TextView value=\"{}\" color=\"{color}\" min_size=\"Point({wd},-1)\" max_size=\"Point({wd},-1)\"/>", esc(text))
-        };
-        let mut head = format!("<View min_size=\"Point({ICON_COL},{text_h})\" max_size=\"Point({ICON_COL},{text_h})\"/>");
-        for c in &self.columns {
-            head += &cell(&c.label, c.width, "0xFFFFFF");
-        }
-        let mut xml = format!("<root><View view_layout=\"vertical\"><View view_layout=\"stacked\"><CanvasView name=\"lv_head\" min_size=\"Point(1,{text_h})\"/><View view_layout=\"horizontal\">{head}</View></View>");
+        let mut xml = format!("<root><View view_layout=\"vertical\"><MultiListView name=\"lv_head\" min_size=\"Point(1,{head_h})\" max_size=\"Point(16000,{head_h})\"/>");
         for (i, key) in self.order.iter().enumerate() {
             let Some(r) = self.row(*key) else { continue };
             let sel = self.selected == Some(r.key);
             let color = if sel { "TEXT_SELECTED" } else { "TEXT" };
-            let mut line = format!("<CanvasView name=\"lv_icon{i}\" min_size=\"Point({ICON_COL},{ROW_ICON})\" max_size=\"Point({ICON_COL},{ROW_ICON})\"/>");
+            let gap = "<View min_size=\"Point(4,0)\" max_size=\"Point(4,0)\"/>";
+            let mut line = format!("<CanvasView name=\"lv_icon{i}\" min_size=\"Point({ICON_COL},15)\" max_size=\"Point({ICON_COL},15)\"/>{gap}");
             for (n, c) in self.columns.iter().enumerate() {
                 let text = r.cells.get(n).map_or("", String::as_str);
                 if n == 0 {
@@ -265,16 +260,20 @@ impl ListView {
                 } else {
                     line += &format!("<TextView name=\"lv_cell{i}_{n}\" value=\"{}\" color=\"{color}\" min_size=\"Point({wd},-1)\" max_size=\"Point({wd},-1)\"/>", esc(text), wd = c.width);
                 }
+                line += gap;
             }
-            xml += &format!("<View view_layout=\"horizontal\" min_size=\"Point(1,{ROW_ICON})\">{line}</View>");
+            xml += &format!("<View name=\"lv_line{i}\" view_layout=\"horizontal\" min_size=\"Point(1,15)\" max_size=\"Point(16000,15)\">{line}</View><View min_size=\"Point(0,2)\" max_size=\"Point(16000,2)\"/>");
         }
         xml += "<VLayoutSpacer/></View></root>";
         if let Err(e) = gui.add_view_xml(w, "lv_content", "List", &xml) {
             eprintln!("hud: list rows: {e:#}");
             return;
         }
+        gui.multi_add_column(w, "lv_head", -1, "", ICON_COL, 0);
+        for c in &self.columns {
+            gui.multi_add_column(w, "lv_head", c.id as i32, &c.label, c.width, 4);
         }
-        gui.set_canvas(w, "lv_head", vec![CanvasItem::Solid { dst: [0.0, 0.0, 4000.0, text_h], color: 0x1a2a30, alpha: 0.9 }]);
+        }
         for (i, key) in self.order.iter().enumerate() {
             let Some(r) = self.row(*key) else { continue };
             let items = r.icon.map(|(g, gw, gh)| CanvasItem::Image { id: g, src: [0.0, 0.0, gw as f32, gh as f32], dst: [0.0, 0.0, ROW_ICON, ROW_ICON], alpha: 1.0 }).into_iter().collect();
@@ -300,7 +299,7 @@ impl ListView {
                 })
                 .and_then(|i| self.order.get(i).copied())
             }
-            Mode::List => (0..self.order.len()).find(|&i| gui.view_rect(w, &format!("lv_row{i}")).is_some_and(|r| y >= r.t && y <= r.b && x >= r.l - ICON_COL && x <= r.r + 1.0 + self.columns.iter().skip(1).map(|c| c.width).sum::<f32>())).map(|i| self.order[i]),
+            Mode::List => (0..self.order.len()).find(|&i| gui.view_rect(w, &format!("lv_line{i}")).is_some_and(|r| y >= r.t && y <= r.b && x >= r.l && x <= r.r)).map(|i| self.order[i]),
         }
     }
 
@@ -473,6 +472,26 @@ pub(super) fn hms(cs: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_header_reserves_height_before_first_row_and_icon() {
+        let Ok(mut gui) = Gui::new(&ao_gui::client_dir(), None) else { return };
+        let w = gui.open_window_xml("headers", &format!("<root>{}</root>", scroll_xml(150.0, 220.0)), (0, 0), ao_gui::WindowSize::Fixed(220, 150)).unwrap();
+        let mut list = ListView::new(Mode::List, vec![Column { id: 1, label: "Name".into(), width: 100.0 }, Column { id: 2, label: "Remaining".into(), width: 80.0 }], 1, 1, (1, false));
+        list.set_rows(vec![Row { key: 7, cells: vec!["Mission".into(), "01:00:00".into()], ..Default::default() }, Row { key: 8, cells: vec!["Second".into(), "02:00:00".into()], ..Default::default() }]);
+        list.paint(&mut gui, w, ICON_32);
+        let header = gui.view_rect(w, "lv_head").unwrap();
+        let row = gui.view_rect(w, "lv_row0").unwrap();
+        let icon = gui.view_rect(w, "lv_icon0").unwrap();
+        assert!(row.t > header.b);
+        assert!(icon.t > header.b);
+        assert_eq!(list.row_at(&gui, w, row.l, header.t, ICON_32), None);
+        assert_eq!(list.row_at(&gui, w, row.l, row.t, ICON_32), Some(7));
+        assert_eq!(list.row_at(&gui, w, icon.l, icon.t, ICON_32), Some(7));
+        assert_eq!(gui.view_rect(w, "lv_row1").unwrap().t - row.t, 19.0);
+        assert!(gui.frame(0.0).cmds.iter().any(|cmd| matches!(cmd,
+            ao_gui::DrawCmd::Gfx { id: GfxId(0x14f..=0x157), .. })));
+    }
 
     #[test]
     fn timer_updates_preserve_hover_and_press_identity() {

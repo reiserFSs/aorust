@@ -226,7 +226,35 @@ struct Bar {
     width: f32,
     shown: Option<TargetInfo>,
     rows: [Option<(TargetInfo, &'static str, bool)>; 2],
+    in_range: bool,
 }
+/// GC 0x10044c46 / 0x10059e6a: combat radius comes from CharRadius, not the CAT torso collision sphere.
+/// The cached radius starts at 1 metre (`FUN_10044702`, +0x30).
+fn range_radius(zone: &Zone, id: i32) -> Option<f32> {
+    zone.dynels.get(&id)?;
+    let Some(radius) = zone.stat_of(id, 0x1a5).or_else(|| zone.world.character_template_stat(id, 0x1a5)) else { return Some(1.0) };
+    let scale = zone.stat_of(id, 0x168).or_else(|| zone.world.character_template_stat(id, 0x168)).unwrap_or(100).max(1);
+    Some(radius.wrapping_mul(scale) as f32 / 100.0)
+}
+
+/// GC 0x10068969 reads the *selection* at targeting controller +0x5c; its signal is global, including distinct fight rows.
+/// GC 0x100679c1: reject self / another playfield; subtract both character collision radii, only the owner's for items.
+/// No selected dynel leaves the original signal unchanged.
+pub(super) fn in_attack_range(zone: &Zone) -> Option<bool> {
+    let own = zone.char_id as i32;
+    let target = zone.selected_target()?;
+    if target.kind == DYNEL_CHAR && target.instance == own { return Some(false); }
+    let a = zone.dynels.get(&own)?;
+    let ar = range_radius(zone, own)?;
+    let (pos, br) = if target.kind == DYNEL_CHAR {
+        (zone.dynels.get(&target.instance)?.pos, range_radius(zone, target.instance)?)
+    } else {
+        (zone.world.object_position(target)?, 0.0)
+    };
+    let distance = (Vec3::from(a.pos) - Vec3::from(pos)).length() - br - ar;
+    Some(zone.world.arms.in_attack_range(own, distance, zone.skill_value(0x17c).unwrap_or(0)))
+}
+
 
 /// `FUN_1007313a`: stat 1 feeds sqrt(2 * sqrt(MaxHealth)); 64 is `_DAT_101b5ebc`,
 /// 0.01 is the double `_DAT_101b5c60`. The screen-derived width is an upper bound, not the displayed width.
@@ -277,6 +305,7 @@ pub(super) struct HudTarget {
     size: (u32, u32),
     bars: Vec<Bar>,
     docks: [Dock; 2],
+    pub(super) in_attack_range: bool,
     /// `m_cLastTarget` of `TargetingModule_t` (restored by a second `SelectSelf`).
     last: Option<Identity>,
     mouse: (f32, f32),
@@ -306,7 +335,7 @@ fn esc(s: &str) -> String {
 impl HudTarget {
     /// Creates the two health-bar windows (`CCFriendlyHealthBar` / `CCHostileHealthBar`) and fills the control-centre target docks.
     pub(super) fn new(gui: &mut Gui, cc: WindowId, size: (u32, u32)) -> anyhow::Result<Self> {
-        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (-1.0, -1.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None };
+        let mut t = HudTarget { cc, size, bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (-1.0, -1.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None };
         t.create_bars(gui)?;
         // `TargetHeader_c` 0x10073884 measures all four captions before clearing the initial text.
         let cap = ["Selection", "Nano Target", "Fighting Target", "Nano / Fighting", "Target"]
@@ -369,7 +398,7 @@ impl HudTarget {
                 gui.set_visible(window, "tot", false);
             }
             gui.set_window_visible(window, false);
-            self.bars.push(Bar { window, hostile, width: w, shown: None, rows: [None, None] });
+            self.bars.push(Bar { window, hostile, width: w, shown: None, rows: [None, None], in_range: false });
         }
         self.place(gui);
         Ok(())
@@ -620,7 +649,7 @@ impl HudTarget {
             let enabled = self.bars_enabled[usize::from(b.hostile)];
             b.shown = targets[0].as_ref().map(|(i, _, _)| i.clone()).filter(|_| enabled);
             gui.set_window_visible(b.window, enabled && targets.iter().any(Option::is_some));
-            if targets == b.rows {
+            if targets == b.rows && b.in_range == self.in_attack_range {
                 continue;
             }
             layout_changed = true;
@@ -638,12 +667,13 @@ impl HudTarget {
                     gui.set_text(self.cc, &format!("{prefix}_title{dock_row}"), &format!("<center>{caption}</center>"));
                     let width = health_bar_width(b.width, i.max_health) + 18.0;
                     gui.set_view_pref_size(b.window, bar, (width - 1.0, 10.0), (width - 1.0, 10.0));
-                    bar_items(width as i32, i.health, i.color, &mut items);
+                    bar_items(width as i32, i.health, i.color, *attacking && self.in_attack_range, &mut items);
                 }
                 gui.set_canvas(b.window, bar, items);
             }
             gui.resize_window(b.window, WindowSize::Preferred);
             b.rows = targets;
+            b.in_range = self.in_attack_range;
         }
         if layout_changed {
             gui.relayout_window(self.cc);
@@ -693,19 +723,18 @@ impl HudTarget {
     }
 }
 
-/// `TargetHealthBar_c` surfaces (`FUN_10073598`, `FUN_10072ead`): caps at both ends tinted DEFAULT, the background between them
-/// (DEFAULT) and the slider over the background up to `ratio` of its width. Both 16×11 textures tile (Load flag 0x10);
-/// source rectangles must stay inside each atlas entry. Red caps require attacking `+0x161` and in-attack-range `+0x162`,
-/// delivered by `FUN_1007353f` from `GlobalSignals+0x64` (GC 0x10068969 / 0x100679c1).
-/// The port lacks the slot's effective attack range and both retail collision radii; caps retain DEFAULT rather than guessing.
-fn bar_items(width: i32, ratio: f32, color: u32, out: &mut Vec<ao_gui::view::CanvasItem>) {
+/// `TargetHealthBar_c` surfaces (`FUN_10073598`, `FUN_10072ead`): caps at both ends, DEFAULT background and considered slider.
+/// Both 16×11 textures tile (Load flag 0x10); source rectangles must stay inside each atlas entry.
+/// GUI 0x10072e49: caps are red only when attacking and in attack range, never blinking.
+fn bar_items(width: i32, ratio: f32, color: u32, red_caps: bool, out: &mut Vec<ao_gui::view::CanvasItem>) {
     use ao_gui::view::CanvasItem::ImageTint;
     use ao_gui::GfxId;
     let (cap_w, h) = (9.0, 11.0);
     let w = width as f32;
     let default = 0x1000000;
-    out.push(ImageTint { id: GfxId(HB_LEFT), src: [0.0, 0.0, cap_w, h], dst: [0.0, 0.0, cap_w, h], color: default, alpha: 1.0 });
-    out.push(ImageTint { id: GfxId(HB_RIGHT), src: [0.0, 0.0, cap_w, h], dst: [w - cap_w, 0.0, w, h], color: default, alpha: 1.0 });
+    let cap_color = if red_caps { 0xff2222 } else { default };
+    out.push(ImageTint { id: GfxId(HB_LEFT), src: [0.0, 0.0, cap_w, h], dst: [0.0, 0.0, cap_w, h], color: cap_color, alpha: 1.0 });
+    out.push(ImageTint { id: GfxId(HB_RIGHT), src: [0.0, 0.0, cap_w, h], dst: [w - cap_w, 0.0, w, h], color: cap_color, alpha: 1.0 });
     let (l, r) = (cap_w + 1.0, w - cap_w - 1.0);
     for (id, length, tint) in [(HB_BACKGROUND, r - l, default), (HB_SLIDER, (r - l) * ratio, color)] {
         let mut x = 0.0;
@@ -722,7 +751,7 @@ fn health_bar_tiles_stay_inside_the_atlas_entry() {
     use ao_gui::view::CanvasItem::ImageTint;
     for ratio in [1.0, 0.5, 0.1, 0.0] {
         let mut items = Vec::new();
-        bar_items(100, ratio, 0xffffff, &mut items);
+        bar_items(100, ratio, 0xffffff, false, &mut items);
         for (id, length) in [(HB_BACKGROUND, 80.0), (HB_SLIDER, 80.0 * ratio)] {
             let mut edge = 10.0;
             for item in &items {
@@ -785,10 +814,45 @@ mod tests {
         assert_eq!(health_bar_width(494.0, 10_000), 124.0);
         assert_eq!(health_bar_width(494.0, 100_000_000), 494.0);
         let mut items = Vec::new();
-        bar_items(100, selected.health, selected.color, &mut items);
+        bar_items(100, selected.health, selected.color, false, &mut items);
         assert!(items.iter().any(|i| matches!(i, ao_gui::view::CanvasItem::ImageTint { id, color: 0xfff000, .. } if id.0 == HB_SLIDER)));
         z.dynels.get_mut(&2).unwrap().health = 0;
         assert_eq!(info(&z, 2).unwrap().health, 0.0, "presentation consumes the central health projection");
+    }
+
+    #[test]
+    fn range_signal_uses_selection_not_fight_and_rejects_self() {
+        let mut z = Zone::new(1);
+        z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
+        z.dynels.insert(2, dyn_at("Fight", [0.0, 0.0, 5.0], true, 0));
+        z.fight_target.insert(1, 2);
+        assert_eq!(in_attack_range(&z), None, "no selection leaves the global signal unchanged");
+        z.target = Some(1);
+        assert_eq!(in_attack_range(&z), Some(false), "selecting self clears range even while fighting another target");
+    }
+
+    #[test]
+    fn range_radius_uses_character_stat_and_integer_scaled_product() {
+        let mut z = Zone::new(1);
+        z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
+        z.dynels.insert(2, dyn_at("Other", [0.0; 3], false, 1));
+        z.stats.insert(0x168, 200);
+        assert_eq!(range_radius(&z, 1), Some(1.0), "missing CharRadius retains the constructor's cached radius, not a scaled stat default");
+        z.stats.insert(0x1a5, 2);
+        z.stats.insert(0x168, 125);
+        assert_eq!(range_radius(&z, 1), Some(2.5));
+        z.stats.insert(0x168, 0);
+        assert_eq!(range_radius(&z, 1), Some(0.02));
+        z.character_stats.entry(2).or_default().insert(0x1a5, 4);
+        z.character_stats.entry(2).or_default().insert(0x168, 150);
+        assert_eq!(range_radius(&z, 2), Some(6.0));
+        z.target = Some(2);
+        z.world.arms.list(1, false, &[(43712, 100)]);
+        z.dynels.get_mut(&2).unwrap().pos = [10.0, 0.0, 0.0];
+        z.stats.insert(0x168, 125);
+        assert_eq!(in_attack_range(&z), Some(true));
+        z.dynels.get_mut(&2).unwrap().pos = [10.5, 0.0, 0.0];
+        assert_eq!(in_attack_range(&z), Some(false), "exact radius-adjusted range is excluded");
     }
     use ao_gui::{Gui, InputEvent, WindowSize};
 
@@ -1025,6 +1089,28 @@ mod tests {
     }
 
     #[test]
+    fn stationary_fight_bars_refresh_caps_when_range_signal_changes() {
+        let Some(mut fe) = fe((1280, 800)) else { return };
+        fe.zone.target = Some(2);
+        fe.zone.fight_target.insert(1, 2);
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert!(!fe.ht.bars[1].in_range);
+        fe.ht.in_attack_range = true;
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert!(fe.ht.bars[1].in_range, "range-only changes must not be skipped by the target-info cache");
+        for red in [false, true] {
+            let mut items = Vec::new();
+            bar_items(100, 0.5, 0xfff000, red, &mut items);
+            for item in &items[..2] {
+                assert!(matches!(item, ao_gui::view::CanvasItem::ImageTint { color, .. } if *color == if red { 0xff2222 } else { 0x1000000 }));
+            }
+        }
+        fe.ht.in_attack_range = false;
+        fe.ht.update(&mut fe.gui, &mut fe.zone, 0.0);
+        assert!(!fe.ht.bars[1].in_range);
+    }
+
+    #[test]
     fn moved_target_bars_survive_updates_and_resize() {
         let Some(mut fe) = fe((1280, 800)) else { return };
         let ids: Vec<_> = fe.ht.persistent_windows().map(|(id, _)| id).collect();
@@ -1144,7 +1230,7 @@ mod tests {
     struct HudTargetLite(HudTarget);
     impl Default for HudTargetLite {
         fn default() -> Self {
-            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None })
+            HudTargetLite(HudTarget { cc: 0, size: (0, 0), bars: vec![], docks: [Dock { hostile: false }, Dock { hostile: true }], in_attack_range: false, last: None, mouse: (0.0, 0.0), pressed: None, world_down: None, targets_target: false, bars_enabled: [true; 2], tot: None, tot_down: false, attack: false, info: None })
         }
     }
 }

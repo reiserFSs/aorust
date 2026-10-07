@@ -76,6 +76,33 @@ mod tests {
     }
 
     #[test]
+    fn notice_art_uses_native_button_palette_and_hover_overlay() {
+        use ao_gui::{DrawCmd, InputEvent, MouseButton};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        gui.set_screen_size(1280, 800);
+        let mut values = DValues::new(&dir);
+        values.set_i64("got_ip", 1);
+        let mut notices = LevelNotice::default();
+        notices.update(&mut gui, &mut values, (1280, 800));
+        let art = gui.gfx_id("GFX_GUI_NEW_IP").unwrap();
+        let layers = |gui: &mut Gui| gui.frame(0.0).cmds.into_iter().filter_map(|cmd| {
+            if let DrawCmd::Gfx { id, tint, alpha, .. } = cmd {
+                if id.0 == art { return Some((tint, alpha)); }
+            }
+            None
+        }).collect::<Vec<_>>();
+        assert_eq!(layers(&mut gui), vec![([0x80, 0xe9, 0xf3], 0.85)]);
+        let r = gui.view_rect(notices.windows[0].unwrap(), "notify").unwrap();
+        let (x, y) = (r.l + 5.0, r.t + 5.0);
+        gui.input(InputEvent::MouseMove { x, y });
+        assert_eq!(layers(&mut gui), vec![([0x80, 0xe9, 0xf3], 0.85), ([0xa5, 0xff, 0xdb], 0.85)]);
+        gui.input(InputEvent::MouseDown { x, y, button: MouseButton::Left });
+        assert_eq!(layers(&mut gui), vec![([0xff, 0xff, 0xcc], 0.85), ([0xa5, 0xff, 0xdb], 0.85)]);
+    }
+
+    #[test]
     fn opening_notice_target_clears_only_its_flag() {
         let mut values = DValues::new(std::path::Path::new("/nonexistent-aomac-client"));
         for &(flag, _, _, _) in &NOTICES { values.set_i64(flag, 1); }

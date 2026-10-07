@@ -53,7 +53,7 @@ impl Rollup {
             let (w,h) = gui.gfx_id(art).map_or((15,15), |g| gui.gfx().size(GfxId(g)));
             format!("<CanvasView name=\"{name}\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\" layout_borders=\"Rect(2,2,2,2)\"/>")
         };
-        let src = format!("<root><View view_layout=\"vertical\" h_alignment=\"left\"><View name=\"rollup_header\" view_layout=\"stacked\" min_size=\"Point(-1,19)\" max_size=\"Point(16000,19)\"><CanvasView name=\"header_bg\"/><View view_layout=\"horizontal\">{}<TextView name=\"title\" value=\"{}\" layout_borders=\"Rect(8,2,0,2)\"/><HLayoutSpacer/>{}{}</View></View><View name=\"body\" view_layout=\"stacked\" min_size=\"Point(0,{height})\" max_size=\"Point(16000,16000)\"/></View></root>", button("icon",ICON),esc(&title),button("arrow",COLLAPSE),button("close",CLOSE));
+        let src = format!("<root><View view_layout=\"vertical\" h_alignment=\"left\"><View name=\"rollup_header\" view_layout=\"stacked\" min_size=\"Point(-1,19)\" max_size=\"Point(16000,19)\"><CanvasView name=\"header_bg\"/><View view_layout=\"horizontal\">{}<TextView name=\"title\" value=\"{}\" layout_borders=\"Rect(8,2,0,2)\"/><HLayoutSpacer/>{}{}</View></View><View name=\"body\" view_layout=\"stacked\" min_size=\"Point(0,{height})\" max_size=\"Point(16000,16000)\"><CanvasView name=\"docked_body_bg\"/></View></View></root>", button("icon",ICON),esc(&title),button("arrow",COLLAPSE),button("close",CLOSE));
         gui.wrap_window_xml(window, &src, "body")?;
         for (name, art) in [("icon",ICON),("arrow",COLLAPSE),("close",CLOSE)] {
             if let Some(id) = gui.gfx_id(art) {
@@ -63,6 +63,9 @@ impl Rollup {
         }
         gui.set_canvas(window,"header_bg",vec![CanvasItem::Solid { dst:[0.0,0.0,AREA_W as f32,19.0],color:0,alpha:0.85 }]);
         gui.show_collapsing(window, "rollup_header", false);
+        // RollupPage_c owns the stretched 0x198 surface (GUI 0x10049389);
+        // FriendListView itself deliberately has no background.
+        gui.set_visible(window, "docked_body_bg", false);
         gui.relayout_window(window);
         if let Some(g) = self.groups.iter_mut().find(|g| g.keys.iter().any(|k| k == key)) {
             if g.frame.is_none() { g.frame = Some(frame); }
@@ -106,6 +109,7 @@ impl Rollup {
         let p = &self.pages[at];
         gui.show_collapsing(p.window, "rollup_header", false);
         gui.show_collapsing(p.window, "body", true);
+        gui.set_visible(p.window, "docked_body_bg", false);
         gui.set_window_dock_frame(p.window, Some(&p.title));
         self.resize_page(gui, p);
         gui.set_window_pos(p.window, (x, y));
@@ -125,6 +129,7 @@ impl Rollup {
         gui.set_window_dock_frame(p.window, None);
         gui.show_collapsing(p.window, "rollup_header", true);
         gui.show_collapsing(p.window, "body", p.expanded);
+        gui.set_visible(p.window, "docked_body_bg", true);
         self.resize_page(gui, &p);
         let at = self.pages.iter().position(|p| p.docked && gui.window_pos(p.window).1 + gui.window_size(p.window).1 as i32 / 2 > y).unwrap_or(self.pages.len());
         self.pages.insert(at, p);
@@ -318,10 +323,12 @@ impl Rollup {
                 gui.show_collapsing(p.window, "rollup_header", true);
                 p.expanded = self.config.iter().find(|c| c.key == p.key).is_none_or(|c| c.expanded);
                 gui.show_collapsing(p.window, "body", p.expanded);
+                gui.set_visible(p.window, "docked_body_bg", true);
                 self.resize_page(gui, &self.pages[i]);
             } else {
                 gui.show_collapsing(p.window, "rollup_header", false);
                 gui.show_collapsing(p.window, "body", true);
+                gui.set_visible(p.window, "docked_body_bg", false);
             }
         }
         let rank = |k:&str| self.config.iter().position(|c| c.key == k).unwrap_or(usize::MAX);
@@ -334,6 +341,28 @@ impl Rollup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn friends_wrapper_paints_native_body_only_while_docked() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut rollup = Rollup::new(&dir, (1280, 800));
+        let window = gui.open_tabbed_window_xml("Friends", "Friends", "<root><StringListView name=\"list\"/></root>", (100, 100), WindowSize::Fixed(169, 215)).unwrap();
+        rollup.register_window(&mut gui, "friends_window", window).unwrap();
+        for _ in 0..2 {
+            rollup.dock_page(&mut gui, "friends_window", AREA_TOP);
+            let bg = gui.view_rect(window, "docked_body_bg").unwrap();
+            let draw = gui.frame(0.0);
+            assert!(draw.cmds.iter().any(|cmd| matches!(cmd, ao_gui::DrawCmd::Gfx { id: GfxId(0x198), dst, alpha, .. }
+                if *dst == [bg.l, bg.t, bg.r + 1.0, bg.b + 1.0] && *alpha == 1.0)));
+            assert!(draw.cmds.iter().any(|cmd| matches!(cmd, ao_gui::DrawCmd::Solid { dst, color: [64,64,64], .. }
+                if *dst == [bg.l, bg.b + 1.0 - BODY_BOTTOM as f32, bg.r + 1.0, bg.b + 1.0])));
+            rollup.free_page(&mut gui, "friends_window", 100, 100);
+            let free = gui.view_rect(window, "docked_body_bg").unwrap();
+            assert!(!gui.frame(0.0).cmds.iter().any(|cmd| matches!(cmd, ao_gui::DrawCmd::Gfx { id: GfxId(0x198), dst, .. }
+                if *dst == [free.l, free.t, free.r + 1.0, free.b + 1.0])));
+        }
+    }
+
     #[test]
     fn wrapped_dock_toggle_keeps_column_width_and_owner_rows() {
         let dir = ao_gui::client_dir();

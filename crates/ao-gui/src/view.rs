@@ -686,7 +686,9 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
         "CCMiniToolbar" => {
             // The application supplies the native control-centre window toggles.
             let mut v = View::new(Kind::View);
-            apply_view_attrs(&mut v, e, 0);
+            // GUI.dll 0x1007249f returns the hidden-height sentinel for this view.
+            // Its fixed-width RollupControllerDock sibling retains the column width.
+            apply_view_attrs(&mut v, e, VF_COLLAPSE_WHEN_HIDDEN);
             v.name = "CCMiniToolbar".into();
             v.node = Node::H;
             tree.add(v)
