@@ -3532,7 +3532,7 @@ mod variant_tests {
 
     /// The captured wear / unwear `AppearanceUpdate`s (zone_wear_rifle_borealis.rec, own character) retargeted to another player of
     /// zone_ithaca.rec: his attractor list becomes the rifle (right hand) + head, then the head only, each time as a rebuilt model; the
-    /// old model stays drawn until the new one is ready.
+    /// old model stays drawn until the new one is ready. Asset readiness uses a wall-clock deadline, not a fixed frame budget.
     #[test]
     fn other_player_wields_and_unwields_live() {
         let Some(dir) = client() else { return };
@@ -3547,15 +3547,26 @@ mod variant_tests {
         let id = ids[0];
         let mut host = ao_render::Host::headless();
         let mut settle = |w: &mut Dynels| {
-            for _ in 0..1000 {
-                w.update_with_collision(0.02, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
+            let expected = w.chars[&id].next.unwrap_or(w.chars[&id].key);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                w.update_with_collision(0.0, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
+                host.actors.clear();
                 let c = &w.chars[&id];
-                if c.next.is_none() && matches!(w.models.get(&c.key), Some(Model::Ready { .. })) {
+                let state = match w.models.get(&expected) {
+                    Some(Model::Ready { .. }) => "ready",
+                    Some(Model::Loading) => "loading",
+                    Some(Model::Failed) => "failed",
+                    None => "not queued",
+                };
+                assert_ne!(state, "failed", "player {id} ({}) model {expected:016x} failed; current={:016x}, next={:?}", c.name, c.key, c.next);
+                if c.key == expected && c.next.is_none() && state == "ready" {
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                assert!(std::time::Instant::now() < deadline,
+                    "player {id} ({}) model {expected:016x} not ready after 60s: {state}; current={:016x}, next={:?}", c.name, c.key, c.next);
+                std::thread::yield_now();
             }
-            panic!("model never ready");
         };
         settle(&mut z.world);
         let meshes = |w: &Dynels| match w.models.get(&w.chars[&id].key) {
