@@ -390,14 +390,12 @@ impl Audio {
         if voice == 0 { Vec::new() } else { vec![voice] }
     }
 
-    /// Authored GC class4000 / SI PlaySoundCommand @100071ed positional one-shot.
-    pub fn play_effect_sound(&self, id: u32, pos: [f32; 3], listener: [f32; 3], volume: f32, radius: f32, probability: i32) -> Result<Vec<u64>> {
+    /// GC4000 / SI100071ed command, including native delay and duration overrides.
+    pub fn play_effect_sound(&self, id: u32, pos: [f32; 3], velocity: [f32; 3], listener: [f32; 3], parameters: [f32; 4], probability: i32) -> Result<Vec<u64>> {
+        anyhow::ensure!(pos.iter().chain(&velocity).chain(&parameters).all(|v| v.is_finite()), "nonfinite effect sound command");
         let mut g = self.rt();
         let rt = g.as_mut().context("effect audio runtime unavailable")?;
-        let db = rt.lib.sounds.clone();
-        let def = db.get(id).with_context(|| format!("missing authored effect sound {id:#x}"))?;
-        let d = if pos == [0.0; 3] { 0.0 } else { (0..3).map(|i| (pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt() };
-        Ok(rt.play_effect_at(&self.sh, def, d, volume, radius, probability))
+        rt.effect_sound(&self.sh, crate::game::EffectSound { id, pos, velocity, parameters, probability }, listener)
     }
 
     /// Plays a file below `cd_image/sound` (e.g. `sfx/gui/click`) once, centred. Returns the voice id (0 = not played).

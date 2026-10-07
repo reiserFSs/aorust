@@ -1,7 +1,7 @@
 //! The client's game audio rules driven from data (docs/formats.md `## audio`): district music selection, the
 //! day-period ambience layers, statel sound emitters and `.sbf` sound definitions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -188,12 +188,24 @@ pub(crate) struct Runtime {
     pub land_control: bool,
     /// Keep-alive UI sounds by sound id: (voice, seconds left, base level, fade-out).
     keepalive: HashMap<u32, (u64, f32, f32, f32)>,
+    effect_delays: VecDeque<(f32, EffectSound)>,
+    effect_children: HashMap<u32, (usize, bool)>,
+}
+
+/// AFCM103 parameters retained through SI's delayed-command queue.
+#[derive(Clone, Copy)]
+pub(crate) struct EffectSound {
+    pub id: u32,
+    pub pos: [f32; 3],
+    pub velocity: [f32; 3],
+    pub parameters: [f32; 4],
+    pub probability: i32,
 }
 
 impl Runtime {
     pub fn new(sh: &Arc<Shared>, lib: Library, seed: u64) -> Runtime {
         let music = MusicPlayer::new(sh.clone(), lib.project.clone(), seed);
-        Runtime { lib, music, combat: CombatMusic::new(3), pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), fx: 1.0, weather: [0.0; 7], land_control: false, keepalive: HashMap::new() }
+        Runtime { lib, music, combat: CombatMusic::new(3), pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), fx: 1.0, weather: [0.0; 7], land_control: false, keepalive: HashMap::new(), effect_delays: VecDeque::new(), effect_children: HashMap::new() }
     }
 
     /// Emitters currently inside the camera's radius (or in their 2 s hold).
@@ -230,6 +242,82 @@ impl Runtime {
         let variant = variant_of(def, 0, 1).and_then(|v| db.get(v));
         play_def(sh, &db, def, self.fx * level, &mut self.rng, variant)
     }
+    pub(crate) fn effect_sound(&mut self, sh: &Shared, sound: EffectSound, listener: [f32; 3]) -> Result<Vec<u64>> {
+        let [volume, radius, duration, delay] = sound.parameters;
+        let db = self.lib.sounds.clone();
+        let def = db.get(sound.id).with_context(|| format!("missing authored effect sound {:#x}", sound.id))?;
+        if delay != 0.0 {
+            // SI10003f61 delayed records contain only id/volume/pos/duration/material:
+            // replay resets probability=100, radius=0 and velocity=0.
+            // SI1000567d inserts before list.begin(): latest command is visited first.
+            self.effect_delays.push_front((delay, EffectSound {
+                parameters: [volume, 0.0, duration, 0.0], velocity: [0.0; 3], probability: 100, ..sound
+            }));
+            return Ok(Vec::new());
+        }
+        let distance = if sound.pos == [0.0; 3] { 0.0 } else {
+            (0..3).map(|i| (sound.pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt()
+        };
+        // SI100025fc only uses velocity for Doppler (byte7bit5); none of GC4000's
+        // fourteen authored root definitions enables that flag. Children receive zero.
+        let _velocity = sound.velocity;
+        if sound.probability != 100 && (self.rng.next() % 200) as i32 >= sound.probability { return Ok(Vec::new()); }
+        let level = attenuation(distance, def.min_dist, def.max_dist, Some(radius)) * volume;
+        if level <= 0.0 { return Ok(Vec::new()); }
+        self.effect_duration(sh, def, level, duration, 0)
+    }
+    fn effect_duration(&mut self, sh: &Shared, def: &SoundDef, level: f32, duration: f32, depth: usize) -> Result<Vec<u64>> {
+        anyhow::ensure!(depth < 64, "cyclic or overdeep authored sound graph");
+        if def.prob != 100 && self.rng.next() % 200 >= def.prob as u32 { return Ok(Vec::new()); }
+        let volume = if def.vol_min == def.vol_max { def.vol_max } else {
+            def.vol_min + (self.rng.next() & 255) as f32 / 255.0 * (def.vol_max - def.vol_min)
+        };
+        let gain = level * volume;
+        let hold = if duration != 0.0 { duration } else if def.duration_min == def.duration_max {
+            def.duration_max
+        } else {
+            def.duration_min + (self.rng.next() % 1000) as f32 / 1000.0 * (def.duration_max - def.duration_min)
+        };
+        let mut voices = Vec::new();
+        if let Some(path) = def.file.as_deref().and_then(|path| sh.resolve(path)) {
+            if hold > 0.0 {
+                let already = self.keepalive.contains_key(&def.id);
+                let voice = self.keepalive_duration(sh, def, if def.vol_max == 0.0 { 0.0 } else { gain / def.vol_max }, hold);
+                if voice != 0 {
+                    if !already && def.fade_in > 0.0 {
+                        sh.mixer().fade_from_zero(voice, def.fade_in);
+                    }
+                    voices.push(voice);
+                }
+            } else {
+                let voice = sh.play_sample(&path, self.fx * gain, false, def.priority);
+                if voice != 0 { voices.push(voice); }
+            }
+        }
+        let db = self.lib.sounds.clone();
+        let child_duration = if def.inherit_duration { duration } else { 0.0 };
+        let mut child = |runtime: &mut Self, id| -> Result<()> {
+            let child = db.get(id).with_context(|| format!("missing authored child sound {id:#x}"))?;
+            voices.extend(runtime.effect_duration(sh, child, gain, child_duration, depth + 1)?);
+            Ok(())
+        };
+        if let Some(id) = variant_of(def, 0, 1) { child(self, id)?; }
+        if def.play_all { for &id in &def.children { child(self, id)?; } }
+        else if def.sequential && !def.children.is_empty() {
+            let state = self.effect_children.entry(def.id).or_insert((0, false));
+            if !state.1 { state.0 = (state.0 + 1) % def.children.len(); state.1 = true; }
+            let id = def.children[state.0];
+            child(self, id)?;
+        }
+        else if def.random_child && !def.children.is_empty() {
+            let state = self.effect_children.entry(def.id).or_insert((0, false));
+            state.1 = true;
+            let id = def.children[state.0];
+            child(self, id)?;
+        }
+        Ok(voices)
+    }
+
 
     /// `PlaySample` keep-alive (`SM_Sandy_CC_Ambience`, ...): each call sets the level and re-arms the sound to
     /// `fade_out + duration`; `update` ends it `T` seconds after the last call, fading linearly over its last
@@ -310,7 +398,25 @@ impl Runtime {
             *hold > 0.0
         });
         self.tick_ambience(sh, dt, hours * HOUR);
+        for (id, state) in &mut self.effect_children {
+            if state.1 {
+                if let Some(def) = self.lib.sounds.get(*id).filter(|def| def.random_child && !def.children.is_empty()) {
+                    let next = self.rng.next() as usize % def.children.len();
+                    state.0 = if next == state.0 { (next + 1) % def.children.len() } else { next };
+                }
+            }
+            state.1 = false;
+        }
         self.tick_emitters(sh, dt, cam);
+        let mut index = 0;
+        while index < self.effect_delays.len() {
+            self.effect_delays[index].0 -= dt;
+            if self.effect_delays[index].0 <= 0.0 {
+                let (_, sound) = self.effect_delays.remove(index).unwrap();
+                if let Err(error) = self.effect_sound(sh, sound, cam) { eprintln!("delayed effect sound: {error:#}"); }
+                break; // Native Frameprocess consumes only the first due record each frame.
+            } else { index += 1; }
+        }
     }
 
     /// The 1 Hz music module (`FUN_100b6d67`): district of the camera's zone -> `music[DayPeriod]` layer.
@@ -607,7 +713,7 @@ mod tests {
         for &(i, id) in v {
             variants[i] = id;
         }
-        SoundDef { id: 1, flags: 1, file: None, vol_min: 0.5, vol_max: 0.5, min_dist: 0.0, max_dist: 15.0, fade_in: 0.0, fade_out: 0.0, duration_min: 0.0, duration_max: 0.0, prob: 100, children: vec![], interval_min: 0.0, interval_max: 0.0, play_all: false, sequential: false, random_child: false, priority: 1, variants }
+        SoundDef { id: 1, flags: 1, file: None, vol_min: 0.5, vol_max: 0.5, min_dist: 0.0, max_dist: 15.0, fade_in: 0.0, fade_out: 0.0, duration_min: 0.0, duration_max: 0.0, prob: 100, children: vec![], interval_min: 0.0, interval_max: 0.0, play_all: false, sequential: false, random_child: false, priority: 1, inherit_duration: false, variants }
     }
 
     /// `MapGameMaterialToSoundMaterial` [SI 0x10007490] (jump table @0x100074e3) and the variant choice of `PlaySample` [SI 0x10002d98].
@@ -688,6 +794,55 @@ mod tests {
             sh.mixer().stop_all();
         }
         assert!(checked > 0, "some ambience child has an interval different from its parent's");
+    }
+
+    #[test]
+    fn authored_class4000_sequence_and_delay_contract() {
+        let Some(dir) = client() else { return };
+        let (sh, mut rt) = runtime(&dir);
+        let id = sound_id("SM_Sandy_Game_Explo_Med");
+        let command = EffectSound { id, pos: [1.0, 0.0, 0.0], velocity: [9.0,0.0,0.0],
+            parameters: [1.0,120.0,0.0,0.2], probability: 0 };
+        assert!(rt.effect_sound(&sh, command, [0.0;3]).unwrap().is_empty());
+        assert_eq!(rt.effect_delays[0].1.parameters, [1.0,0.0,0.0,0.0]);
+        assert_eq!(rt.effect_delays[0].1.velocity, [0.0;3]);
+        assert_eq!(rt.effect_delays[0].1.probability, 100);
+        assert!(rt.effect_sound(&sh, command, [0.0;3]).unwrap().is_empty());
+        rt.update(&sh, 0.1, [0.0;3], 0.0);
+        assert_eq!(sh.mixer().voice_count(), 0);
+        rt.update(&sh, 0.11, [0.0;3], 0.0);
+        assert_eq!(rt.effect_delays.len(), 1, "native processes only first due command per frame");
+        assert!(sh.mixer().voice_count() > 0, "authored sequential explosion must select a real child");
+        assert_eq!(rt.effect_children[&id].0, 1);
+        rt.update(&sh, 0.11, [0.0;3], 0.0);
+        assert!(rt.effect_delays.is_empty());
+        assert_eq!(rt.effect_children[&id].0, 2);
+    }
+
+    #[test]
+    #[ignore = "retail audio samples, muted offline mixer regression"]
+    fn authored_class4000_sustained_audio_frames() {
+        let dir = client().expect("retail client assets");
+        let (sh, mut rt) = runtime(&dir);
+        let id = sound_id("SM_Sandy_Tower_Fire");
+        let def = rt.lib.sounds.get(id).unwrap().clone();
+        assert_eq!((def.duration_min,def.duration_max), (6.0,6.0));
+        let voices = rt.effect_sound(&sh, EffectSound { id, pos: [0.0;3], velocity: [8.0,0.0,0.0],
+            parameters: [1.0,120.0,0.2,0.0], probability: 100 }, [0.0;3]).unwrap();
+        assert_eq!(voices.len(), 1);
+        let path = sh.resolve(def.file.as_deref().unwrap()).unwrap();
+        let mut samples = vec![0.0; (sh.load(&path).unwrap().frames() + 44100) * 2];
+        sh.mixer().render(&mut samples);
+        assert!(samples.iter().any(|v| *v != 0.0));
+        assert!(sh.mixer().is_playing(voices[0]), "duration override must loop beyond sample end");
+        rt.update(&sh, 0.2 + def.fade_out + 0.01, [0.0;3], 0.0);
+        assert!(!sh.mixer().is_playing(voices[0]), "native hold+fade tail expires");
+        if let Some(out) = std::env::var_os("AOMAC_EFFECT_FRAMES") {
+            let out = std::path::PathBuf::from(out);
+            std::fs::create_dir_all(&out).unwrap();
+            let bytes: Vec<_> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(out.join("audio4000_tower_fire_f32le_stereo_44100.pcm"), bytes).unwrap();
+        }
     }
 
     #[test]

@@ -1237,7 +1237,8 @@ impl Frontend for Play {
                 if let Some(audio) = &self.audio {
                     // SI100071ed rounds the authored radius with x87 round(radius - 0.49999).
                     let radius = (sound.parameters[1] as f64 - 0.49999).round_ties_even() as u16;
-                    match audio.play_effect_sound(sound.id, sound.pos, host.camera.pos.to_array(), sound.parameters[0], radius as f32, sound.probability) {
+                    let parameters = [sound.parameters[0], radius as f32, sound.parameters[2], sound.parameters[3]];
+                    match audio.play_effect_sound(sound.id, sound.pos, sound.velocity, host.camera.pos.to_array(), parameters, sound.probability) {
                         Ok(voices) => {
                             if std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
                                 eprintln!("effect sound {:#x} at {:?}: {} voice(s), radius {}", sound.id, sound.pos, voices.len(), radius);

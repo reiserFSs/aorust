@@ -3,9 +3,8 @@
 //! audio ctor/load/process 100d3190/100d30c1/100d3012. Neither creates a DS quad.
 //! N3 1001ff2f consumes camera+1d4 through LocalityListener+130: visual eye
 //! translation only, no rotation or movement. SI 100071ed consumes the sound
-//! command as volume/radius/duration/delay, material0/size1. Impact71345 is the
-//! supported zero-duration/zero-delay/zero-velocity one-shot; other timing or
-//! velocity is explicitly rejected rather than silently discarded.
+//! command as volume/radius/duration/delay, material0/size1. Timing is owned by
+//! SandyInterface, not by the GC controller: dispatch exactly once on Process.
 use super::{EffectConfig, Template};
 use anyhow::{ensure, Result};
 use ao_formats::weather::R250;
@@ -70,9 +69,6 @@ impl AuxEffect {
             let name = SOUND_NAMES.get(selector).ok_or_else(|| anyhow::anyhow!("unknown native audio selector {selector}"))?;
             let velocity = [t.float(1)?, t.float(2)?, -t.float(3)?];
             let parameters = [t.float(4)?.clamp(0.0, 1.0), t.float(5)?, t.float(6)?, t.float(7)?];
-            // Only the one-shot contract is currently routed; never discard authored timing/velocity.
-            ensure!(velocity == [0.0; 3] && parameters[2] == 0.0 && parameters[3] == 0.0,
-                "audio effect requires unported duration/delay/velocity: {:?}, {:?}", parameters, velocity);
             ensure!((0.0..=65535.0).contains(&parameters[1]), "invalid authored audio radius");
             (0.0, Some(AuxSound { id: ao_audio::sbf::sound_id(name), pos: source.w_axis.truncate().to_array(), velocity, parameters, probability: t.word(8)? as i32 }))
         };
@@ -83,7 +79,10 @@ impl AuxEffect {
         self.source = source;
         if let Some(sound) = &mut self.sound { sound.pos = source.w_axis.truncate().to_array(); }
     }
-    pub fn next_state(&mut self) { self.stopped = true; self.sound = None; }
+    pub fn next_state(&mut self) {
+        // Audio's graceful virtual100d30b4 is empty; do not retract its queued command.
+        if self.template.kind == 3032 { self.stopped = true; self.sound = None; }
+    }
     pub fn advance(&mut self, dt: f32) -> bool {
         self.elapsed += dt;
         self.processed = true;
@@ -142,7 +141,15 @@ mod tests {
         assert_eq!(event.probability, 100);
         assert!(effect.take_sound().is_none());
         let mut delayed = sound; delayed.words[7] = 1.0f32.to_bits();
-        assert!(AuxEffect::parse(&delayed, Mat4::IDENTITY, EffectConfig::default()).is_err());
+        delayed.words[1] = 2.0f32.to_bits(); delayed.words[6] = 3.0f32.to_bits();
+        let mut delayed = AuxEffect::parse(&delayed, Mat4::IDENTITY, EffectConfig::default()).unwrap();
+        delayed.update_source(Mat4::from_translation(Vec3::new(4.0,5.0,6.0)));
+        delayed.next_state(); // Native4000 graceful termination is a no-op.
+        assert!(!delayed.advance(0.01));
+        let event = delayed.take_sound().unwrap();
+        assert_eq!(event.velocity, [2.0, 0.0, -0.0]);
+        assert_eq!(event.pos, [4.0,5.0,6.0]);
+        assert_eq!(event.parameters, [1.0, 120.0, 3.0, 1.0]);
         let mut truncated = shake; truncated.words.pop();
         assert!(AuxEffect::parse(&truncated, Mat4::IDENTITY, EffectConfig::default()).is_err());
     }
