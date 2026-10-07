@@ -138,12 +138,8 @@ mod tests {
         let eye=origin+glam::Vec3::new(0.0,3.0,5.0);
         let look=eye+glam::Vec3::new(0.0,-0.4,-1.0);
         host.camera=ao_render::Camera::look_at(eye,look);
-        let shots=std::env::var_os("AOMAC_BODY_BOOST_SHOTS").map(std::path::PathBuf::from);
-        let mut models=Vec::new();
-        let mut snapshots=Vec::new();
-        let mut first_pulse=None;
         let mut visible=false;
-        for frame in 0..1080 {
+        for _ in 0..1080 {
             host.actors.clear();
             let stats=&zone.stats;
             let character_stats=&zone.character_stats;
@@ -155,18 +151,6 @@ mod tests {
             assert_ne!(handle,0);
             zone.world.update_with_collision(1.0/60.0,eye.to_array(),[0.0,0.0,-1.0],&mut host,None,anchor);
             assert!(zone.world.effects.as_ref().unwrap().is_active(handle));
-            if shots.is_some() {
-                models.append(&mut host.actor_models);
-                if first_pulse.is_none() && host.actors.iter().any(|a|matches!(a.model as u32,6203|20092|20097) && a.skin.as_ref().is_some_and(|v|!v.is_empty())) {
-                    first_pulse=Some(frame);
-                }
-                if let Some(start)=first_pulse {
-                    let pulse_frame=frame-start;
-                    if [2,11,29,59].contains(&pulse_frame) {
-                        snapshots.push((pulse_frame,host.actors.clone()));
-                    }
-                }
-            }
             visible|=host.actors.iter().filter(|a|matches!(a.model as u32,6203|20092|20097)).any(|a| {
                 a.skin.as_ref().is_some_and(|vertices|vertices.iter().any(|v| {
                     v.color[3]>0.0 && v.color[..3].iter().any(|&c|c>0.0) && (glam::Mat4::from_cols_array_2d(&a.transform).transform_point3(glam::Vec3::from_array(v.pos))-origin).length()<5.0
@@ -174,18 +158,6 @@ mod tests {
             });
         }
         assert!(visible,"wire-owned Body Boost must submit nearby nontransparent flare/cord geometry");
-        if let Some(out)=shots {
-            std::fs::create_dir_all(&out).unwrap();
-            assert_eq!(snapshots.len(),4,"first pulse must supply all requested sample times");
-            for (frame,actors) in snapshots {
-                let time=(frame+1) as f32/60.0;
-                let skins=actors.iter().filter(|a|a.skin.as_ref().is_some_and(|v|!v.is_empty())).count();
-                let rgb=actors.iter().filter_map(|a|a.skin.as_ref()).flatten().any(|v|v.color[3]>0.0 && v.color[..3].iter().any(|&c|c>0.0));
-                let path=out.join(format!("body-boost-{frame:04}.png"));
-                eprintln!("captured BodyBoost first-pulse time={time:.3} actors={} skins={skins} models={} nontransparent_rgb={rgb} path={}",actors.len(),models.len(),path.display());
-                ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,actors,eye.to_array(),look.to_array(),640,480,&path,time).unwrap();
-            }
-        }
         let handle=zone.world.buff_visuals[&(33588,29091)].handle.unwrap();
         zone.on_frame(&frames[3]);
         assert!(!zone.world.buff_visuals.contains_key(&(33588,29091)));

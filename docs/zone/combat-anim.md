@@ -530,13 +530,11 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
   requires nontransparent flare/cord geometry near that position, then expiry
   following the actual BuffIIR removal. This is offline route evidence, not
   real-window visibility evidence.
-  Optional `AOMAC_BODY_BOOST_SHOTS=<output-directory>` on that same test saves
-  bare-pulse GPU PNGs at approximately0.05/0.2/0.5/1seconds after its first
-  submitted flare/cord geometry, using collected Host models and cloned actor
-  frames. It reports model/skin counts and actual nontransparent vertex RGB;
-  the route assertion also requires nonzero RGB. With no variable it does not
-  invoke the GPU renderer. The empty-world replay has no avatar or world depth:
-  these PNGs are not avatar/depth-occlusion or live-window visibility proof.
+  The four bare-pulse GPU frames inspected on2026-10-07 at approximately
+  0.05/0.2/0.5/1seconds show only tiny white dots/clusters on blue background,
+  not an obvious orbit or cord. Nonzero vertex RGB alone does not establish
+  perceptual visibility; these empty-world frames also omit avatar/world
+  depth. The temporary GPU capture hook was removed after inspection.
 * Class1002's orbiting children (`100d4f72`/`100d52dc`/`100d53e3`/
   `100d57bb`/`100d4d6b`) use their actual class0 body-profile records
   (20013/20018,42words), selected by Breed/Sex/BodyShape/MonsterScale,
