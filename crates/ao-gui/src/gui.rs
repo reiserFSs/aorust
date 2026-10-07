@@ -2298,6 +2298,57 @@ mod clip_tests {
     }
 
     #[test]
+    fn selected_character_details_fit_without_overlapping_labels_or_rows() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let w = gui.open_window("CharacterSelectionWindow", (0, 0), WindowSize::Fixed(1280, 800)).unwrap();
+        gui.set_layout_vertical(w, "characters_view", true);
+        let mut rows = Vec::new();
+        for i in 0..4 {
+            let h = gui.add_view(w, "characters_view", "CharacterSelectionItem").unwrap();
+            gui.set_text_in(h, "name_btn", &format!("Aomactest{i}"));
+            for (field, value) in [("level", "220"), ("gender", "Female"), ("breed", "Nanomage"), ("profession", "Meta-Physicist"), ("location", "Newland City (566)"), ("status", "Inactive")] {
+                gui.set_text_in(h, field, value);
+            }
+            gui.set_item_selected(h, false);
+            rows.push(h);
+        }
+        for selected in 0..rows.len() {
+            for (i, &h) in rows.iter().enumerate() {
+                gui.set_item_selected(h, i == selected);
+            }
+            for pair in rows.windows(2) {
+                let row_bounds = |h| {
+                    let o = gui.origin(h);
+                    let f = gui.tree.views[h].frame;
+                    Rect::new(o.0, o.1, o.0 + f.width(), o.1 + f.height())
+                };
+                let a = row_bounds(pair[0]);
+                let b = row_bounds(pair[1]);
+                assert!(a.b < b.t, "rows overlap: {a:?}, {b:?}");
+            }
+            let h = rows[selected];
+            let detail = gui.find_in(h, "detailed_view").unwrap();
+            let bounds = gui.frame_in(h, "detailed_view").unwrap();
+            let mut previous_bottom = bounds.t - 1.0;
+            for (field, value) in [("level", "220"), ("gender", "Female"), ("breed", "Nanomage"), ("profession", "Meta-Physicist"), ("location", "Newland City (566)"), ("status", "Inactive")] {
+                assert_eq!(gui.text_in(detail, field), value);
+                let label = gui.frame_in(detail, &format!("{field}_lbl")).unwrap();
+                let frame = gui.frame_in(detail, field).unwrap();
+                assert!(label.r < frame.l && label.t == frame.t, "{field}: {label:?}, {frame:?}");
+                assert!(frame.t > previous_bottom && frame.b <= bounds.b, "{field}: {frame:?}, {bounds:?}");
+                assert!(frame.l >= bounds.l && frame.r <= bounds.r);
+                let id = gui.find_in(detail, field).unwrap();
+                let Kind::Text(t) = &gui.tree.views[id].kind else { panic!("not a text value") };
+                let size = text::string_size(&mut gui.fonts, &gui.colors, t.font, value);
+                assert!(frame.width() + 1.0 >= size.x + 1.0 && frame.height() + 1.0 >= size.y + 1.0, "{field}: {frame:?}, {size:?}");
+                previous_bottom = frame.b;
+            }
+        }
+    }
+
+    #[test]
     fn unchanged_updates_and_moves_preserve_child_layout() {
         let dir = crate::client_dir();
         if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }

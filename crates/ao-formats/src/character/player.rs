@@ -526,16 +526,41 @@ fn build_player(store: &RecordStore, names: &NameTable, model: u32, head: u32, p
     load_character_head_skin(store, model, Some(head), pose, &part_textures(names, store, model, p)?)
 }
 
-/// The select-screen preview of a cached character (`CharacterViewer_c::Update` 0x100054cd with a `prefs/CharacterViewer.xml`
-/// entry): the cached body model, head mesh and worn cloth; the skin race is that of the head's entry in the creation head table
-/// (`FUN_1011d29b`; Caucasian when the head is not in the table). Attractor meshes other than the head are not mounted.
-pub fn load_cached_character(store: &RecordStore, c: &super::CachedCharacter, pose: Option<(Role, f32)>) -> Result<Scene> {
-    let names = NameTable::load(store)?;
+/// Build a cached selection appearance once; breed/sex/fatness resolve the body even for legacy MeshID 17530 entries.
+/// Head, cloth and attractor precedence match `CharacterViewer_c::Update` (GUI 0x100054cd).
+pub fn load_cached_character_rig(store: &RecordStore, assets: &super::actor::ActorAssets, c: &super::CachedCharacter) -> Result<(u32, super::actor::ActorRig)> {
     let (breed, gender) = crate::screens::wire_breed_sex(c.breed, c.sex)?;
     let head = c.head_mesh();
     let skin = head_table(store, breed, gender, 2)?.iter().find(|h| h.mesh == head).map_or(Skin::Caucasian, |h| h.skin);
     let p = Player { breed, gender, skin, head: None, equipment: c.equipment() };
-    build_player(store, &names, u32::try_from(c.mesh_id).context("negative model id")?, head, &p, pose)
+    let suffix = match c.fatness { 0 => "_thin", 2 => "_fat", _ => "" };
+    let name = format!("{}_{}{suffix}.cir", breed.model_race(), gender.name());
+    let model = assets.names.id(CHAR_MESH_TYPE, &name).with_context(|| format!("no player model {name}"))?;
+    let attachments: Vec<_> = c.meshes.iter().filter(|m| m.attractor > 0 && m.mesh_id > 0).map(|m| (m.attractor as u8, m.mesh_id as u32)).collect();
+    let rig = super::actor::ActorRig::new(store, assets, model, (head > 0).then_some(head), &part_textures(&assets.names, store, model, &p)?, &super::PartLayers::new(), &attachments)?;
+    Ok((model, rig))
+}
+
+/// Pose a prebuilt cached appearance; the caller resolves and loads the clip once, not once per frame.
+pub fn cached_character_scene(rig: &super::actor::ActorRig, clip: Option<(&super::CatAnim, f32)>) -> Scene {
+    let (vertices, mounts) = rig.pose(clip);
+    let mut scene = rig.model().clone();
+    scene.meshes[0].vertices = vertices;
+    scene.instances = mounts.into_iter().enumerate().map(|(mesh, transform)| ao_scene::Instance { mesh, transform }).collect();
+    scene
+}
+
+/// Static viewer wrapper around the same cached rig used by the selection worker.
+pub fn load_cached_character(store: &RecordStore, c: &super::CachedCharacter, pose: Option<(Role, f32)>) -> Result<Scene> {
+    let mut assets = super::actor::ActorAssets::new(store)?;
+    let (model, rig) = load_cached_character_rig(store, &assets, c)?;
+    let clip = pose.map(|(role, time)| {
+        let anim = assets.role(store, model, &role)?.with_context(|| format!("no clip {}", role.clip_name()))?;
+        anyhow::ensure!(anim.signature == rig.cat().signature, "animation does not fit cached model");
+        let ms = if anim.duration > 0.0 { (time * 1000.0).rem_euclid(anim.duration) } else { 0.0 };
+        Ok::<_, anyhow::Error>((anim, ms))
+    }).transpose()?;
+    Ok(cached_character_scene(&rig, clip.as_ref().map(|(anim, ms)| (&**anim, *ms))))
 }
 
 /// [`load_player`] with the default (caucasian) skin: the (breed, gender, head index) tuple of the

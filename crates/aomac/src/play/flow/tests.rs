@@ -30,6 +30,36 @@ fn rig() -> Option<Rig> {
 }
 
 #[test]
+fn character_selection_expands_only_the_selected_row() {
+    let Some(mut r) = rig() else { return };
+    r.p.prefs.selected_character = -1;
+    r.p.show_characters(fake_list(), &mut r.host);
+    let name_tops = |p: &Play| p.rows.iter().map(|row| p.gui.frame_in(row.handle, "name_btn").unwrap().t).collect::<Vec<_>>();
+    let collapsed = name_tops(&r.p);
+    let compact_height = collapsed[1] - collapsed[0];
+    for selected in 0..r.p.rows.len() {
+        r.p.select_row(selected, &mut r.host);
+        let tops = name_tops(&r.p);
+        for i in 0..tops.len() - 1 {
+            let height = tops[i + 1] - tops[i];
+            if i == selected {
+                assert!(height > compact_height, "selected row did not expand");
+            } else {
+                assert_eq!(height, compact_height, "unselected row reserves hidden details");
+            }
+        }
+        let row = r.p.rows[selected].handle;
+        let details = r.p.gui.frame_in(row, "detailed_view").unwrap();
+        for field in ["gender", "location"] {
+            let value = r.p.gui.frame_in(row, field).unwrap();
+            assert!(value.t >= details.t && value.b <= details.b);
+            assert!(!r.p.gui.text_in(row, field).is_empty());
+        }
+        assert_eq!(r.p.gui.text_in(row, "level"), r.p.chars[selected].info.level.to_string());
+    }
+}
+
+#[test]
 fn character_info_first_response_and_refresh_use_current_packet_stats() {
     let Some(mut r) = rig() else { return };
     r.p.zone = zone::Zone::new(42);

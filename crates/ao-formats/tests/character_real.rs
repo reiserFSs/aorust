@@ -1,7 +1,7 @@
 //! Decodes real character records when the game client is installed; skips cleanly otherwise.
 
 use ao_formats::character::*;
-use ao_formats::character::actor::{ActorAssets, ActorRig};
+use ao_formats::character::actor::{ActorAssets, ActorRig, PlayerLook};
 use ao_formats::texture::load_texture;
 use ao_rdb::RecordStore;
 use ao_scene::Scene;
@@ -245,6 +245,42 @@ fn cached_character_renders_with_its_cloth() {
     assert_eq!(s.instances.len(), 2);
     let (k, _) = slot(&s, &names, "legs_solitusmale_caucation_naked.png").unwrap();
     assert_eq!(k.id, names.id(1010004, "legs_mens-underwear3.png").unwrap());
+}
+
+#[test]
+fn cached_meshes_follow_the_rigs_head_hands_and_other_attractors() {
+    let Some(store) = store() else { return };
+    let assets = ActorAssets::new(&store).unwrap();
+    let mut c = CachedCharacter { mesh_id: 5907, head_id: 40629, breed: 1, sex: 2, fatness: 1, ..Default::default() };
+    // Head override and captured rifle / dual-shotgun flags (zone_wear_rifle_borealis.rec, dynel.md §1.3).
+    c.meshes = vec![
+        MeshEntry { attractor: 0, flags: 4, mesh_id: 40681, ..Default::default() },
+        MeshEntry { attractor: 1, flags: 2, mesh_id: 15839, ..Default::default() },
+        MeshEntry { attractor: 2, flags: 2, mesh_id: 7796, ..Default::default() },
+        MeshEntry { attractor: 5, flags: 0, mesh_id: 26163, ..Default::default() },
+        MeshEntry { attractor: -1, mesh_id: 15839, ..Default::default() },
+        MeshEntry { attractor: 1, mesh_id: 0, ..Default::default() },
+    ];
+    let saved = c.clone();
+    let look = PlayerLook { breed: Breed::Solitus, gender: Gender::Male, skin: Skin::Caucasian, build: 1, head: Some(40681), equipment: Equipment::default() };
+    let rig = ActorRig::player(&store, &assets, &look, &[(1, 15839), (2, 7796), (5, 26163)]).unwrap();
+    let anim = load_anim(&store, role_anim(&store, 5907, &Role::Walk).unwrap()).unwrap();
+    let mut poses = Vec::new();
+    for time in [0.0, 0.6] {
+        let s = load_cached_character(&store, &c, Some((Role::Walk, time))).unwrap();
+        let (vertices, mounts) = rig.pose(Some((&anim, (time * 1000.0).rem_euclid(anim.duration))));
+        assert_eq!(s.instances.len(), 5, "body, overridden head, both hands and non-hand equipment");
+        assert_eq!(s.meshes[0].vertices.iter().map(|v| v.pos).collect::<Vec<_>>(), vertices.iter().map(|v| v.pos).collect::<Vec<_>>());
+        for (i, instance) in s.instances.iter().enumerate() {
+            assert_eq!(instance.mesh, i);
+            assert_eq!(instance.transform, mounts[i], "mount {i} at {time}s");
+        }
+        poses.push(mounts);
+    }
+    assert_ne!(poses[0][2], poses[1][2], "weapon follows the animated hand");
+    let bind = load_cached_character(&store, &c, None).unwrap();
+    assert_eq!(bind.instances.iter().map(|i| i.transform).collect::<Vec<_>>(), rig.pose(None).1);
+    assert_eq!(c, saved, "head flags and cached appearance remain intact");
 }
 
 #[test]

@@ -300,8 +300,7 @@ impl Play {
             g.set_text_in(h, "breed", breed_name(i.breed));
             g.set_text_in(h, "profession", &prof);
             g.set_text_in(h, "location", &screens::location_text(&self.pf_names, c.proxy.playfield.instance as u32));
-            g.set_toggle_in(h, "name_btn", true, false);
-            g.set_visible_in(h, "detailed_view", false);
+            g.set_item_selected(h, false);
             let activated = Self::is_activated(c);
             if activated {
                 for v in ["status", "status_left", "status_right", "status_lbl"] {
@@ -330,10 +329,7 @@ impl Play {
     fn select_row(&mut self, i: usize, host: &mut Host) {
         let Some(win) = self.char_w else { return };
         for (k, r) in self.rows.iter().enumerate() {
-            let on = k == i;
-            self.gui.set_toggle_in(r.handle, "name_btn", true, on);
-            self.gui.set_visible_in(r.handle, "summary_view", !on);
-            self.gui.set_visible_in(r.handle, "detailed_view", on);
+            self.gui.set_item_selected(r.handle, k == i);
         }
         self.gui.relayout_window(win);
         self.gui.set_enabled(win, "login_btn", true);

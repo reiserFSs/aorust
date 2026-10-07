@@ -2,7 +2,7 @@
 //! character of the entry's breed/sex with its first head (or the cached appearance, worn cloth included), `idle-stand` played once, then after every finished clip
 //! `rand() % 115 < 23` picks one of the 23 socials, else idle again.
 //!
-//! Poses are CPU-skinned on a worker thread (`load_player` per frame sample); the UI plays the cached frames. Socials are
+//! Poses are CPU-skinned on a worker thread (cached appearances reuse one rig/assets); the UI plays the cached frames. Socials are
 //! built on demand: a clip that is not cached yet is requested and idle plays meanwhile (the original has no such delay).
 
 use ao_formats::character::{self, Player, Role};
@@ -60,18 +60,23 @@ impl Worker {
 /// character if there is one — first aomac's `CharacterViewer.xml`, then the original client's `prefs/` — else `None`
 /// (= `CCCharacter_t::SetBreed`, the default character of the entry's breed/sex).
 fn cached(client: &std::path::Path, prefs: Option<&std::path::Path>, char_id: i32) -> Option<character::CachedCharacter> {
-    let mut dirs = vec![prefs?.to_path_buf()];
-    dirs.push(client.join("prefs"));
-    dirs.iter().find_map(|d| character::ViewerCache::load(d).0.remove(&char_id))
+    let retail = client.join("prefs");
+    prefs.into_iter().chain(std::iter::once(retail.as_path()))
+        .find_map(|d| character::ViewerCache::load(d).0.remove(&char_id))
+}
+
+fn body_mesh(store: &RecordStore, breed: i32, sex: i32, fatness: i32) -> anyhow::Result<i32> {
+    let (breed, gender) = screens::wire_breed_sex(breed, sex)?;
+    let build = match fatness { 0 => 0, 2 => 2, _ => 1 };
+    Ok(character::player_model_build(store, breed, gender, build)? as i32)
 }
 
 /// The creation reply supplies the identity, not the appearance. Keep the submitted mesh ids in the existing viewer cache.
 pub(super) fn remember_created(client: &std::path::Path, id: i32, req: &ao_net::msg::CreateCharacterRequest) -> anyhow::Result<()> {
     let dir = super::prefs::dir().ok_or_else(|| anyhow::anyhow!("preferences directory unavailable"))?;
     let store = RecordStore::open(client)?;
-    let (breed, gender) = screens::wire_breed_sex(req.breed, req.gender)?;
-    let mesh = character::player_model_build(&store, breed, gender, req.width.clamp(0, 2) as u8)?;
-    remember_created_in(&dir, id, req, mesh as i32)
+    let mesh = body_mesh(&store, req.breed, req.gender, req.width.clamp(0, 2))?;
+    remember_created_in(&dir, id, req, mesh)
 }
 
 fn remember_created_in(dir: &std::path::Path, id: i32, req: &ao_net::msg::CreateCharacterRequest, mesh_id: i32) -> anyhow::Result<()> {
@@ -98,15 +103,8 @@ impl super::Play {
         if self.zone.stat(0x296).unwrap_or(0) != 0 || self.zone.stat(0x167).unwrap_or(u.monster_data) != 0 { return; }
         let result = (|| -> anyhow::Result<()> {
             let dir = super::prefs::dir().ok_or_else(|| anyhow::anyhow!("preferences directory unavailable"))?;
-            let mesh = match self.zone.stat(12).filter(|&m| m > 0) {
-                Some(mesh) => mesh,
-                None => {
-                    let store = RecordStore::open(&self.dir)?;
-                    let (breed, gender) = screens::wire_breed_sex(u.breed as i32, u.sex as i32)?;
-                    let build = if u.fatness == 0 { 0 } else if u.fatness == 2 { 2 } else { 1 };
-                    character::player_model_build(&store, breed, gender, build)? as i32
-                }
-            };
+            let store = RecordStore::open(&self.dir)?;
+            let mesh = body_mesh(&store, u.breed as i32, u.sex as i32, u.fatness as i32)?;
             remember_live_in(&dir, self.zone.char_id as i32, u, mesh)?;
             Ok(())
         })();
@@ -146,23 +144,17 @@ fn listed_appearance(id: i32, breed: i32, sex: i32, mesh_id: i32, head: i32) -> 
     (head > 0).then_some(character::CachedCharacter { id, mesh_id, head_id: head, breed, sex, fatness: 1, ..Default::default() })
 }
 
-fn scene(store: &RecordStore, look: &CharSelectLook, cache: Option<&character::CachedCharacter>, pose: (Role, f32)) -> anyhow::Result<Scene> {
-    match cache {
-        Some(c) => character::load_cached_character(store, c, Some(pose)),
-        None => character::load_player(store, &Player::new(look.breed, look.gender, look.skin, Some(look.head.0)), Some(pose)),
-    }
+fn scene(store: &RecordStore, look: &CharSelectLook, pose: (Role, f32)) -> anyhow::Result<Scene> {
+    character::load_player(store, &Player::new(look.breed, look.gender, look.skin, Some(look.head.0)), Some(pose))
 }
 
-fn frames(store: &RecordStore, look: &CharSelectLook, cache: Option<&character::CachedCharacter>, role: Role) -> anyhow::Result<Vec<Scene>> {
-    let model = match cache {
-        Some(c) => c.mesh_id as u32,
-        None => character::player_model(store, look.breed, look.gender)?,
-    };
+fn frames(store: &RecordStore, look: &CharSelectLook, role: Role) -> anyhow::Result<Vec<Scene>> {
+    let model = character::player_model(store, look.breed, look.gender)?;
     let anim = character::load_anim(store, character::role_anim(store, model, &role)?)?;
     let n = ((anim.duration / 1000.0 * FPS).round() as usize).max(1);
     (0..n)
         .map(|k| {
-            let mut s = scene(store, look, cache, (role.clone(), k as f32 / FPS))?;
+            let mut s = scene(store, look, (role.clone(), k as f32 / FPS))?;
             s.textures.clear();
             Ok(s)
         })
@@ -173,7 +165,16 @@ fn run(dir: &std::path::Path, breed: i32, sex: i32, (char_id, head): (i32, i32),
     let store = RecordStore::open(dir)?;
     let look = screens::char_select_look(&store, breed, sex)?;
     let cache = cached(dir, prefs, char_id).or_else(|| listed_appearance(char_id, breed, sex, look.model as i32, head));
-    if tx.send(Out::First(Box::new(scene(&store, &look, cache.as_ref(), (Role::Idle, 0.0))?))).is_err() {
+    let mut assets = cache.as_ref().map(|_| character::actor::ActorAssets::new(&store)).transpose()?;
+    let rig = cache.as_ref().map(|c| character::load_cached_character_rig(&store, assets.as_ref().unwrap(), c)).transpose()?;
+    let first = match rig.as_ref() {
+        Some((model, rig)) => {
+            let anim = assets.as_mut().unwrap().role(&store, *model, &Role::Idle)?.ok_or_else(|| anyhow::anyhow!("no idle clip"))?;
+            character::cached_character_scene(rig, Some((&anim, 0.0)))
+        }
+        None => scene(&store, &look, (Role::Idle, 0.0))?,
+    };
+    if tx.send(Out::First(Box::new(first))).is_err() {
         return Ok(());
     }
     let mut done = vec![];
@@ -195,7 +196,19 @@ fn run(dir: &std::path::Path, breed: i32, sex: i32, (char_id, head): (i32, i32),
         done.push(clip);
         let role = clip.map_or(Role::Idle, |i| Role::Emote(screens::SOCIALS[i].to_string()));
         let t0 = std::time::Instant::now();
-        let f = frames(&store, &look, cache.as_ref(), role)?;
+        let f = match rig.as_ref() {
+            Some((model, rig)) => {
+                let anim = assets.as_mut().unwrap().role(&store, *model, &role)?.ok_or_else(|| anyhow::anyhow!("no clip {}", role.clip_name()))?;
+                anyhow::ensure!(anim.signature == rig.cat().signature, "animation does not fit cached model");
+                let n = ((anim.duration / 1000.0 * FPS).round() as usize).max(1);
+                (0..n).map(|k| {
+                    let mut s = character::cached_character_scene(rig, Some((&anim, k as f32 * 1000.0 / FPS)));
+                    s.textures.clear();
+                    s
+                }).collect()
+            }
+            None => frames(&store, &look, role)?,
+        };
         if std::env::var_os("AOMAC_PERF").is_some() {
             eprintln!("preview clip {clip:?}: {} frames in {:.0} ms", f.len(), t0.elapsed().as_secs_f32() * 1000.0);
         }
@@ -208,6 +221,48 @@ fn run(dir: &std::path::Path, breed: i32, sex: i32, (char_id, head): (i32, i32),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poisoned_cached_bodies_resolve_per_character_without_changing_heads_or_equipment() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let client = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !client.join("cd_image/rdb.db").exists() { return; }
+        let store = RecordStore::open(&client).unwrap();
+        let dir = std::env::temp_dir().join(format!("aomac-body-preview-{}", std::process::id()));
+        let mut cache = character::ViewerCache::default();
+        for (id, breed, sex, fatness, head) in [(71, 1, 2, 0, 40681), (72, 1, 3, 1, 40803), (73, 4, 1, 2, 40099)] {
+            let mut c = character::CachedCharacter { id, breed, sex, fatness, mesh_id: 17530, head_id: head - 1, ..Default::default() };
+            c.meshes.push(character::MeshEntry { attractor: 0, mesh_id: head, ..Default::default() });
+            let mut equipment = character::Equipment::default();
+            equipment.wear(character::ClothPart::Body, 154207);
+            c.set_equipment(&equipment);
+            cache.update(c);
+        }
+        cache.save(&dir).unwrap();
+        let mut bodies = Vec::new();
+        for id in [71, 72, 73] {
+            let original = &cache.0[&id];
+            let expected = body_mesh(&store, original.breed, original.sex, original.fatness).unwrap();
+            let resolved = cached(&client, Some(&dir), id).unwrap();
+            assert_eq!(&resolved, original, "cache lookup preserves stored appearance");
+            let assets = character::actor::ActorAssets::new(&store).unwrap();
+            let (model, rig) = character::load_cached_character_rig(&store, &assets, &resolved).unwrap();
+            assert_eq!(model, expected as u32, "shared loader repairs legacy body");
+            assert_eq!(resolved.head_mesh(), original.head_mesh(), "attractor-0 head keeps precedence");
+            assert_ne!(model, 17530);
+            let anim = character::load_anim(&store, character::role_anim(&store, model, &Role::Idle).unwrap()).unwrap();
+            for ms in [0.0, 50.0] {
+                let scene = character::cached_character_scene(&rig, Some((&anim, ms)));
+                assert_eq!(scene.meshes.len(), rig.model().meshes.len());
+                assert_eq!(scene.instances.len(), scene.meshes.len());
+            }
+            bodies.push(model);
+        }
+        assert!(bodies[0] != bodies[1] && bodies[1] != bodies[2] && bodies[0] != bodies[2]);
+        assert!(cached(&client, Some(&dir), i32::MAX).is_none());
+        assert_eq!(character::ViewerCache::load(&dir).0, cache.0, "read repair does not rewrite other entries");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn live_existing_head_and_equipment_replace_creation_cache() {

@@ -341,7 +341,12 @@ View vertical, layout_borders Rect(0,0,0,10)
 
 `name_btn` is a **toggle** text button (`ButtonBase_c::SetToggleButton(true)`) whose text is the character name. The row shows
 `summary_view` while unselected and `detailed_view` while selected (`CharSelectItem_c::SetSelected` [0x1000cb1a] swaps them in the row
-container and sets the toggle). Field text (`SetupView` [0x1000e2ec], row data = `CharacterData_t`; wire fields = `ao_net::msg::CharacterInfo`):
+container and sets the toggle). `flow::show_characters` and `flow::select_row` use `Gui::set_item_selected`: the unused subtree has
+`VF_COLLAPSE_WHEN_HIDDEN` (`0x100`), so it contributes neither minimum nor maximum layout size. Merely hiding both XML subtrees
+leaves the hidden summary/details in the vertical preferred size, compressing the visible fields and pushing later rows out of
+the list viewport. The flow regression checks expansion belongs only to the selected row; the GUI regression checks all six
+detailed values, label/value separation, full text extents and non-overlapping rows against the shipped XML.
+Field text (`SetupView` [0x1000e2ec], row data = `CharacterData_t`; wire fields = `ao_net::msg::CharacterInfo`):
 
 * `name` = character name; `level` = `Format("%d", level)` (`DAT_101a99a4` = "%d").
 * `gender` = `GetSexStr(sex)` (lower case "male"/"female"/…), **first letter upper-cased** by the view code → "Male", "Female". The table (Gamecode, built at ~0x10032450) is map[0]="NONE" (0x1015ae74), map[1]="uni" (0x1015ae70), map[2]="male", map[3]="female", so sex 1 (the Atrox, `CreateCharacter` sends 1; live charlist: breed 4 gender 1) reads "Uni" (also text.mdb 1005/101); `flow::sex_name` follows it (test `flow::tests::sex_names_follow_the_get_sex_str_table`).
@@ -407,8 +412,15 @@ The live world now also performs the retail `UpdateCache` → `SaveCache` sequen
 [GUI 0x10006aad], `SlotConfigurationSaved` [0x10006ac4], `UpdateCache` [0x100069ed], and destructor [0x100063b1].
 Native `Play::save_viewer_cache` runs before zone teardown, returning to login (including completed camp/server loss), after
 configuration writes, and on `Play` destruction (window shutdown). It snapshots the latest own full update plus merged appearance
-deltas, the visible cloth slots (including empty slots), and attractor meshes; stat 12 supplies the body when present, otherwise
-the same breed/sex/build model resolver as the live avatar. MechData/MonsterData exclude transformed appearances rather than
+deltas, the visible cloth slots (including empty slots), and attractor meshes. The body always uses the live avatar's
+breed/sex/build model resolver, not stat 12: PRK supplies placeholder `17530` even for female Solitus (docs/zone/world.md §4).
+Retail `FUN_10058078` discards the initial Mesh for ordinary humanoids and invokes `FUN_10057eb3` / `FUN_10057ff7`
+(docs/zone/npc.md). The shared `load_cached_character_rig` resolves the same body before both scene and animation loading,
+including `view player --cache` and legacy poisoned entries, without rewriting entries or changing head/cloth/attachment precedence.
+The selection worker retains one `ActorAssets` and rig across idle/social frames: rest selection and attachment decoding happen
+once, and cached role/animation lookup happens once per clip rather than per 20-Hz pose sample. The static loader remains a wrapper.
+`poisoned_cached_bodies_resolve_per_character_without_changing_heads_or_equipment` covers male/female Solitus and fat
+Atrox, per-character isolation and attractor-0 head precedence. MechData/MonsterData exclude transformed appearances rather than
 overwriting the normal cache (`GetData` exclusion above; mech stat 0x296 and morph stat 0x167, docs/zone/npc.md).
 This fixes existing-character sessions with legacy v3 list info: the observed Aomacchvq live HeadMesh stat 64 = 40099 no longer
 falls back to the first Atrox head after shutdown. `live_existing_head_and_equipment_replace_creation_cache` checks persisted
@@ -419,6 +431,16 @@ Live verification (Fix8World, clean `origin/main` plus world patch): muted offsc
 passed in 31.28 s. The server supplied stat 64 = 40099; after dropping `Play`, the persisted cache had `HeadID=40099`.
 The inspected `select-after.png` showed swept/full dark hair rather than the default mohawk. This proves the offscreen
 frontend/cache path, not a real-window visual check: the workstation session was locked.
+Real-window verification (CharSelect, 2026-10-07; muted, live lock, PID-owned window): inspected Testy
+(Female Solitus), Aomacvolk (Male Solitus with rifle), Aomacfixr (Male Solitus), and Aomacvktq (Uni Atrox).
+Heads and resolved bodies matched; the selected row showed complete level/gender/breed/profession/location values
+without clipping or overlap, including `Borealis (800)` and `ICC Shuttleport (4582)`. After a fresh Aomacvolk
+world session and completed `/camp`, cache ID 33512 had MeshID 5907, HeadID 40681 and retained rifle attractor;
+re-login selection showed the rifle. Final clean-worktree window confirmed female/male/Atrox previews again.
+`AOMAC_PERF=1` measured cached male idle 76 frames / 3 ms and social 66 frames / 3 ms; sampled UI frames were
+about 4.4–5.2 ms. Workspace release tests: 1309 passed; strict clippy was blocked by unrelated upstream
+combat dead code, while `-D warnings -A dead-code` passed. A brighter backdrop after camp was separately
+assigned to the login-render-state reset fix, not hidden by the character preview changes.
 `CharacterInfo` versions >3 do carry head/height/width; v3 omits them (`msg.rs::CharacterEntry::read`), so absence is not universal and those fields
 are not a replacement for the viewer cache. Native selection additionally uses a positive list head when no cache exists, as explicitly requested
 for server-supplied appearance; this extends the historical retail fallback above, without overriding cached equipment. Regression:

@@ -41,7 +41,8 @@ pub struct CachedCharacter {
     pub id: i32,
     /// `_time64` of the capture; a newer entry wins when the file is merged.
     pub time: i32,
-    /// Stat 0xc: body model, rdb 1010002 (thin/fat/robe variants are distinct models).
+    /// Resolved body model, rdb 1010002 (thin/fat/robe variants are distinct models).
+    /// Ordinary humanoids resolve breed/sex/build rather than using PRK's placeholder Mesh stat 0xc.
     pub mesh_id: i32,
     /// Stat 0x40: head mesh, rdb 1010001.
     pub head_id: i32,
