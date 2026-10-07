@@ -1756,6 +1756,112 @@ mod tests {
         }
     }
 
+    /// Real GUI mouse events through Hud::input/event, including its outbox and window dvalue.
+    #[test]
+    fn skills_close_discards_pending_and_save_waits_for_server_confirmation() {
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        s.zone.char_id = 33512;
+        s.zone.stats.insert(53, 1500);
+        fn click_at(s: &mut Shot, o: &mut Offscreen, x: f32, y: f32) {
+            for ev in [
+                InputEvent::MouseMove { x, y },
+                InputEvent::MouseDown { x, y, button: MouseButton::Left },
+                InputEvent::MouseUp { x, y, button: MouseButton::Left },
+            ] {
+                send(s, ev);
+            }
+            o.frame(s, 0.016);
+        }
+        fn click_view(s: &mut Shot, o: &mut Offscreen, w: WindowId, view: &str) {
+            let r = s.gui.view_rect(w, view).unwrap();
+            click_at(s, o, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
+        }
+        fn pending(s: &mut Shot, o: &mut Offscreen) -> WindowId {
+            s.hud.open(&mut s.gui, WindowKind::Skills);
+            o.frame(s, 0.016);
+            let w = s.hud.stats_window(WindowKind::Skills).unwrap();
+            click_view(s, o, w, "abilities");
+            click_view(s, o, w, "name");
+            assert_eq!(s.gui.text(w, "pointdelta"), "<div align=\"right\">0</div>");
+            let r = s.gui.view_rect(w, "btn16").unwrap();
+            click_at(s, o, r.l + (r.r - r.l) * 0.75, (r.t + r.b) / 2.0);
+            assert_eq!(s.gui.text(w, "pointdelta"), "<div align=\"right\">1</div>");
+            assert_ne!(s.gui.text(w, "remaining_ip"), "1500");
+            assert!(s.hud.take_outbox().is_empty());
+            w
+        }
+        // OwnNewLevel's combat glue sets got_ip; exercise the actual notice mouse route.
+        s.hud.dvalues.set_i64("got_ip", 1);
+        s.hud.dvalues.prefs.set_int("ShowIPPerkbutton", 1, super::super::dvalue::Kind::Login);
+        o.frame(&mut s, 0.016);
+        let notice = s.gui.window_ids().into_iter().find(|&w| s.gui.view_rect(w, "notify").is_some()).unwrap();
+        click_view(&mut s, &mut o, notice, "notify");
+        assert!(s.hud.is_open(WindowKind::Skills));
+        assert!(!s.hud.dvalues.flag("got_ip"));
+        assert!(s.gui.window_outer_frame(notice).is_none());
+        s.hud.close_kind(&mut s.gui, WindowKind::Skills);
+        let original = s.zone.stats.clone();
+        // XML names Quit/Accept carry the retail labels Close/Save Changes, not Reject/Accept.
+        for frame_close in [false, true] {
+            let w = pending(&mut s, &mut o);
+            if frame_close {
+                let (x, y, width, _) = s.gui.window_outer_frame(w).unwrap();
+                // WndBorder::Layout: close is the rightmost 15px icon, inset 5px.
+                click_at(&mut s, &mut o, x as f32 + width as f32 - 13.0, y as f32 + 12.0);
+            } else {
+                click_view(&mut s, &mut o, w, "Quit");
+            }
+            assert!(!s.hud.is_open(WindowKind::Skills));
+            assert!(!s.hud.dvalues.flag("skill_window"));
+            assert!(s.gui.window_outer_frame(w).is_none());
+            assert!(s.hud.take_outbox().is_empty());
+            assert_eq!(s.zone.stats, original);
+        }
+        let w = pending(&mut s, &mut o);
+        click_view(&mut s, &mut o, w, "Accept");
+        let out = s.hud.take_outbox();
+        assert_eq!(out.len(), 1, "Save Changes must reach the full HUD outbox once");
+        assert_eq!(out[0].payload, ao_net::n3::outgoing::skill_ip_adjust(33512, &std::collections::BTreeMap::from([(16, 7)])));
+        assert_eq!(s.zone.stats, original, "saving does not predict server stats");
+        assert_eq!(s.gui.text(w, "pointdelta"), "<div align=\"right\">0</div>");
+        assert_eq!(s.gui.text(w, "base"), "<div align=\"right\">6</div>");
+        assert_eq!(s.gui.text(w, "remaining_ip"), "1500");
+        fn delta(id: u32, key: u32, pairs: &[(u32, i32)]) -> Frame {
+            let mut payload = Vec::new();
+            for value in [key, 0xC350, id] {
+                payload.extend(value.to_be_bytes());
+            }
+            payload.push(0);
+            payload.extend((pairs.len() as u32).to_be_bytes());
+            for &(stat, value) in pairs {
+                payload.extend(stat.to_be_bytes());
+                payload.extend(value.to_be_bytes());
+            }
+            Frame { seq: 0, ptype: ao_net::frame::PT_N3, sender: id, receiver: 0, payload }
+        }
+        // The live save response is SkillIIR_t, not StatIIR_t. Foreign updates stay foreign.
+        s.zone.on_frame(&delta(777, 0x3E205660, &[(16, 99), (53, 1), (999, ao_formats::stats::INVALID)]));
+        o.frame(&mut s, 0.016);
+        assert_eq!(s.zone.stats, original);
+        assert_eq!(s.zone.character_stats[&777][&16], 99);
+        assert_eq!(s.zone.character_stats[&777][&999], ao_formats::stats::INVALID);
+        s.zone.on_frame(&delta(33512, 0x3E205660, &[(16, 7), (53, 1490), (999, -99), (998, ao_formats::stats::INVALID)]));
+        o.frame(&mut s, 0.016);
+        assert_eq!(s.gui.text(w, "base"), "<div align=\"right\">7</div>");
+        assert_eq!(s.gui.text(w, "buffed"), "<div align=\"right\">7</div>");
+        assert_eq!(s.gui.text(w, "remaining_ip"), "1490");
+        assert_eq!(s.zone.stats[&999], -99);
+        assert_eq!(s.zone.stats[&998], ao_formats::stats::INVALID);
+        assert_eq!(s.zone.character_stats[&33512][&998], ao_formats::stats::INVALID);
+        // Subsequent own StatIIR deltas use the same displayed authoritative values.
+        s.zone.on_frame(&delta(33512, 0x2B333D6E, &[(16, 8), (53, 1480)]));
+        o.frame(&mut s, 0.016);
+        assert_eq!(s.gui.text(w, "base"), "<div align=\"right\">8</div>");
+        assert_eq!(s.gui.text(w, "buffed"), "<div align=\"right\">8</div>");
+        assert_eq!(s.gui.text(w, "remaining_ip"), "1480");
+        assert!(s.hud.take_outbox().is_empty());
+    }
+
     /// The bar tooltip titles are `LDBface::GetText(0x2710, key)` of the keys in `FUN_100666b6`…`FUN_100669f7`, `Targetstarget` is read from `LoginPrefs.xml`.
     #[test]
     fn bar_titles_come_from_the_text_db() {

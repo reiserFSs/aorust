@@ -109,7 +109,7 @@ pub struct Zone {
     pub stat_adjustments: HashMap<u32, i32>,
     /// Own `GetSkill(stat, 2)` projection, refreshed from raw stats and modifier maps before HUD consumers.
     pub skill_values: HashMap<u32, i32>,
-    /// Per-character skills received from full dynel updates and `StatIIR_t` (GC `N3Msg_GetSkill`).
+    /// Per-character skills received from full dynel updates, `StatIIR_t` and `SkillIIR_t` (GC `N3Msg_GetSkill`).
     pub character_stats: HashMap<i32, HashMap<u32, i32>>,
     /// Latest InfoPacket per character (`GC 0x1003e694` replaces the cached packet).
     pub info_packets: HashMap<Identity, ao_net::n3::info::InfoPacket>,
@@ -219,7 +219,7 @@ impl Zone {
         }
     }
 
-    /// An own stat (`INVALID` markers are never stored).
+    /// An own raw stat (FullCharacter/StatIIR skip `INVALID`; SkillIIR applies every signed value).
     pub fn stat(&self, id: u32) -> Option<i32> {
         // `FUN_10051fa2`: NPCNumPets is the pet list's size, not a stale received stat.
         if id == 0x1ca {
@@ -381,6 +381,10 @@ impl Zone {
                 N3::Dynel(Dynel::Stat(u)) => {
                     self.character_stats.entry(who.instance).or_default().extend(u.stats.iter().filter(|s| s.1 != ao_formats::stats::INVALID).map(|s| (s.0 as u32, s.1)));
                 }
+                N3::Dynel(Dynel::Skill(u)) => {
+                    // SkillIIR_t::Execute (GC 0x10079494) applies signed values directly.
+                    self.character_stats.entry(who.instance).or_default().extend(u.stats.iter().map(|s| (s.0 as u32, s.1)));
+                }
                 N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
                     let s = self.character_stats.entry(who.instance).or_default();
                     s.extend([(0, u.flags2 as i32), (1, u.max_health), (4, u.breed as i32), (0x1b, u.health), (0x21, u.side as i32), (0x36, u.level as i32), (0x3b, u.sex as i32), (0x185, u.expansion as i32), (0x294, u.account_flags as i32), (0x2a1, u.visual_flags as i32)]);
@@ -508,8 +512,14 @@ impl Zone {
             N3::Dynel(Dynel::Stat(u)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
                 self.apply_stats(u.stats.iter().map(|s| (s.0 as u32, s.1)));
             }
+            N3::Dynel(Dynel::Skill(u)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                for (id, value) in u.stats {
+                    self.stats.insert(id as u32, value);
+                    if id == 180 { self.skill_values.insert(id as u32, value); }
+                }
+            }
             // other characters: the stats the target window reads (`N3Msg_GetSkill` of the target; docs/zone/dynel.md §3)
-            N3::Dynel(Dynel::Stat(u)) if who.kind == CHAR_KIND => {
+            N3::Dynel(Dynel::Stat(u) | Dynel::Skill(u)) if who.kind == CHAR_KIND => {
                 if let Some(d) = self.dynels.get_mut(&who.instance) {
                     for (id, v) in &u.stats {
                         match *id as u32 {
@@ -786,6 +796,28 @@ mod tests {
                 (dir == "<").then(|| Frame::decode_with(&b, false).ok().flatten().map(|(f, _)| f)).flatten()
             })
             .collect()
+    }
+
+    #[test]
+    fn captured_skill_ip_echo_and_confirmation_are_authoritative() {
+        let replies = frames(include_str!("../../../../docs/captures/skill_ip_adjust_ithaca.rec"));
+        assert_eq!(replies.len(), 4);
+        let mut own = Zone::new(0x8334);
+        own.stats.extend([(16, 6), (17, 6), (53, 9500)]);
+        own.on_frame(&replies[0]);
+        assert_eq!((own.stat(16), own.stat(17), own.stat(53)), (Some(7), Some(7), Some(9500)));
+        own.on_frame(&replies[1]);
+        assert_eq!((own.stat(16), own.stat(17), own.stat(53)), (Some(7), Some(7), Some(9476)));
+        assert_eq!(own.character_stats[&0x8334][&53], 9476);
+        own.on_frame(&replies[2]);
+        assert_eq!((own.stat(16), own.stat(53)), (Some(8), Some(9476)));
+        own.on_frame(&replies[3]);
+        assert_eq!((own.stat(16), own.stat(17), own.stat(53)), (Some(8), Some(7), Some(9462)));
+        let mut foreign = Zone::new(777);
+        foreign.stats.extend([(16, 6), (17, 6), (53, 1500)]);
+        for reply in &replies { foreign.on_frame(reply); }
+        assert_eq!((foreign.stat(16), foreign.stat(17), foreign.stat(53)), (Some(6), Some(6), Some(1500)));
+        assert_eq!(foreign.character_stats[&0x8334][&53], 9462);
     }
 
     /// Actual capture: three nano-add/removal pairs on Bergdoktor, not the capturing player.

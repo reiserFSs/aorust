@@ -324,9 +324,13 @@ pub struct FullCharacter {
 
 impl FullCharacter {
     pub fn stat(&self, id: u32) -> Option<i32> {
-        let wide = self.stats_a.iter().chain(&self.stats_b).find(|s| s.0 == id).map(|s| s.1);
-        wide.or_else(|| self.stats_u8.iter().find(|s| s.0 as u32 == id).map(|s| s.1 as i32))
-            .or_else(|| self.stats_i16.iter().find(|s| s.0 as u32 == id).map(|s| s.1 as i32))
+        // FullCharacterIIR_t::Execute [GC 0x10073a2f] applies these groups in order,
+        // skipping INVALID; later entries replace earlier values.
+        self.stats_a.iter().chain(&self.stats_b).copied()
+            .chain(self.stats_u8.iter().map(|&(stat, value)| (stat as u32, value as i32)))
+            .chain(self.stats_i16.iter().map(|&(stat, value)| (stat as u32, value as i32)))
+            .rfind(|&(stat, value)| stat == id && value != 0x499602d2)
+            .map(|(_, value)| value)
     }
 
     fn read(r: &mut Reader) -> Result<Self> {
@@ -830,6 +834,22 @@ mod tests {
         assert_eq!((g.revision, g.marker, g.buildings.len()), (1, 1, 0));
         assert_eq!((p.world_x, p.world_z), (100_000, 100_000));
         assert!(p.rest.is_empty());
+    }
+
+    #[test]
+    fn full_character_stat_application_order() {
+        let c = FullCharacter {
+            stats_a: vec![(53, 1500), (16, 6), (17, 0x499602d2)],
+            stats_b: vec![(53, 1400), (53, 1300), (53, 0x499602d2), (16, 7)],
+            stats_u8: vec![(16, 8)],
+            stats_i16: vec![(16, 9), (18, -1)],
+            ..Default::default()
+        };
+        assert_eq!(c.stat(53), Some(1300), "IP is the last valid server value");
+        assert_eq!(c.stat(16), Some(9), "compact groups override wide skills");
+        assert_eq!(c.stat(17), None, "INVALID does not create a stat");
+        assert_eq!(c.stat(18), Some(-1), "compact signed values stay signed");
+        assert_eq!(c.stat(19), None);
     }
 
     #[test]

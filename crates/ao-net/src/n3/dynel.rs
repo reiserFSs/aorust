@@ -15,6 +15,7 @@ use anyhow::{ensure, Result};
 pub const SIMPLE_CHAR_FULL_UPDATE: u32 = 0x271B3A6B;
 pub const CHAR_DC_MOVE: u32 = 0x54111123;
 pub const STAT: u32 = 0x2B333D6E;
+pub const SKILL: u32 = 0x3E205660;
 pub const SET_WANTED_DIRECTION: u32 = 0x60201D0E;
 pub const WEAPON_ITEM_FULL_UPDATE: u32 = 0x3B1D2268;
 pub const SPECIAL_ATTACK_WEAPON: u32 = 0x1D3C0F1C;
@@ -83,6 +84,8 @@ pub enum Dynel {
     SimpleCharFullUpdate(Box<SimpleCharFullUpdate>),
     CharDCMove(CharDCMove),
     Stat(StatUpdate),
+    /// Absolute base skill/IP updates; unlike StatIIR, no health feedback.
+    Skill(StatUpdate),
     SetWantedDirection(SetWantedDirection),
     WeaponItemFullUpdate(WeaponItemFullUpdate),
     SpecialAttackWeapon(SpecialAttackWeapon),
@@ -95,6 +98,7 @@ pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<Dynel>> {
         SIMPLE_CHAR_FULL_UPDATE => Dynel::SimpleCharFullUpdate(Box::new(SimpleCharFullUpdate::read(r)?)),
         CHAR_DC_MOVE => Dynel::CharDCMove(CharDCMove::read(r)?),
         STAT => Dynel::Stat(StatUpdate::read(r)?),
+        SKILL => Dynel::Skill(StatUpdate::read(r)?),
         SET_WANTED_DIRECTION => Dynel::SetWantedDirection(SetWantedDirection::read(r)?),
         WEAPON_ITEM_FULL_UPDATE => Dynel::WeaponItemFullUpdate(WeaponItemFullUpdate::read(r)?),
         SPECIAL_ATTACK_WEAPON => Dynel::SpecialAttackWeapon(SpecialAttackWeapon::read(r)?),
@@ -212,6 +216,8 @@ pub fn yaw(q: &[f32; 4]) -> f32 {
 
 /// `StatIIR_t` 0x2B333D6E [GC 0x100a1a7c read]: `i32 n`, `n × (i32 stat, i32 value)`. The client sets each stat
 /// on the dynel and shows damage/heal numbers for Health (0x1b).
+/// Also the `SkillIIR_t` body [GC Write 0x10079455, Read 0x10079436]:
+/// Execute 0x10079494 writes each absolute value directly to the target's base stats.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatUpdate {
     pub stats: Vec<(i32, i32)>,
@@ -833,6 +839,7 @@ mod tests {
         assert_eq!(key("SimpleCharFullUpdateIIR_t"), SIMPLE_CHAR_FULL_UPDATE);
         assert_eq!(key("CharDCMoveIIR_t"), CHAR_DC_MOVE);
         assert_eq!(key("StatIIR_t"), STAT);
+        assert_eq!(key("SkillIIR_t"), SKILL);
         assert_eq!(key("SetWantedDirectionIIR_t"), SET_WANTED_DIRECTION);
         assert_eq!(key("WeaponItemFullUpdateIIR_t"), WEAPON_ITEM_FULL_UPDATE);
         assert_eq!(key("SpecialAttackWeaponIIR_t"), SPECIAL_ATTACK_WEAPON);
@@ -923,6 +930,28 @@ mod tests {
         let (f, (_, h, d)) = (capture_n3().into_iter().find(|f| f.payload[..4] == CHAR_DC_MOVE.to_be_bytes()).unwrap(), all(CHAR_DC_MOVE).remove(0));
         let Dynel::CharDCMove(m) = d else { unreachable!() };
         assert_eq!(m.encode(h.target, h.flag == 1), f.payload);
+    }
+
+    #[test]
+    fn skill_ip_reply_captured() {
+        // PRK /tmp/IpSpend/ip.rec, 112478 ms: request echo then authoritative
+        // response adds IP=9476 after Strength/Agility become 7.
+        for (bytes, expected) in [
+            ("3e2056600000c35000008334000000000200000010000000070000001100000007", vec![(16, 7), (17, 7)]),
+            ("3e2056600000c350000083340000000003000000100000000700000011000000070000003500002504", vec![(16, 7), (17, 7), (53, 9476)]),
+        ] {
+            let bytes: Vec<u8> = (0..bytes.len()).step_by(2)
+                .map(|i| u8::from_str_radix(&bytes[i..i + 2], 16).unwrap()).collect();
+            let (h, mut r) = N3Header::parse(&bytes).unwrap();
+            assert_eq!(h.target, Identity { kind: 50000, instance: 0x8334 });
+            assert_eq!(h.flag, 0);
+            let Some(Dynel::Skill(update)) = decode(&h, &mut r).unwrap() else { panic!("skill reply") };
+            assert_eq!(update.stats, expected);
+            assert!(update.rest.is_empty());
+            assert_eq!(r.remaining(), 0);
+            assert!(decode(&h, &mut Reader::new(&[0xff; 4])).is_err());
+            assert!(decode(&h, &mut Reader::new(&[0, 0, 0, 1])).is_err());
+        }
     }
 
     #[test]

@@ -435,5 +435,10 @@ mod tests {
         // key, Identity{50000, 0x6584}, pass-on byte 0, 2 entries (stat 16 -> 15, stat 0x98 -> 7) in map (key) order
         let m = std::collections::BTreeMap::from([(0x98, 7), (16, 15)]);
         assert_eq!(skill_ip_adjust(0x6584, &m), hex("3E205660 0000C350 00006584 00 00000002 00000010 0000000F 00000098 00000007"));
+        assert_eq!(skill_ip_adjust(0x6584, &std::collections::BTreeMap::new()),
+            hex("3E205660 0000C350 00006584 00 00000000"));
+        let m = std::collections::BTreeMap::from([(53, 1300), (16, -1)]);
+        assert_eq!(skill_ip_adjust(0x6584, &m),
+            hex("3E205660 0000C350 00006584 00 00000002 00000010 FFFFFFFF 00000035 00000514"));
     }
 }

@@ -138,14 +138,14 @@ impl Model {
     }
 
     pub fn row(&self, get: Get, stat: u32) -> Row {
-        let ch = self.character(get);
+        let ch = Character::from_stats(get);
         let (raw, lock) = (get(stat).unwrap_or(0), get(buffs::LOCK_STAT).unwrap_or(0));
         Row {
             raw,
             pending: self.pending(stat),
             base: buffs::skill_base(&self.tables, stat, raw, &ch, &self.mods, lock),
             value: buffs::skill_value(&self.tables, stat, raw, &ch, &self.mods, lock),
-            max: self.tables.skill_max(stat, &ch),
+            max: self.tables.skill_max(stat, &self.character(get)),
         }
     }
 
@@ -260,6 +260,23 @@ mod tests {
     /// Hand-made tables: a single skill (stat 152) costing `factor / 10 * n` IP, maximum 3 raw points at level 1.
     fn tiny() -> Model {
         Model::new(SkillTables::default(), vec![])
+    }
+
+    #[test]
+    fn pending_abilities_raise_maximum_without_changing_mode_one_or_two_values() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let tables = SkillTables::load(&ao_rdb::RecordStore::open(&dir).unwrap()).unwrap();
+        let get = stats_of(&[(stats::IP, 1000), (stats::BREED, 1), (stats::PROFESSION, 1), (stats::LEVEL, 10),
+            (stats::skills::TITLE_LEVEL, 1), (16, 6), (17, 6), (18, 6), (19, 6), (20, 6), (21, 6), (152, 5)]);
+        let mut m = Model::new(tables, vec![]);
+        let before = m.row(&get, 152);
+        assert_eq!(m.adjust(&get, 18, 4).applied, 4);
+        let after = m.row(&get, 152);
+        // Gamecode 10064ac2: mask 3 reads buffed actual abilities; only mask 4 adds SetSkillTmp.
+        assert_eq!((after.base, after.value), (before.base, before.value));
+        assert!(after.max > before.max, "GetSkillMax uses mask 4's pending stamina");
+        assert_eq!(after.value, m.value(&get, 152));
     }
 
     #[test]
