@@ -179,7 +179,6 @@ impl HudNcu {
             rows.push(Row { key: b.nano, icon: info.icon, cells, tip_title: info.name.clone(), tip_body: body });
         }
         let win = self.win.as_mut().expect("open");
-        win.view.invalidate();
         win.view.set_rows(rows);
         win.view.paint(gui, w, lv::ICON_32);
         self.built = Some(sig);

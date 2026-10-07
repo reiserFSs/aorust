@@ -643,6 +643,12 @@ impl Gui {
             self.tree.views[v].color = color;
         }
     }
+    /// `View::SetColor`, including palette ColorIDs, without replacing the view.
+    pub fn set_view_color(&mut self, w: WindowId, name: &str, color: u32) {
+        if let Some(v) = self.find(w, name) {
+            self.tree.views[v].color = color;
+        }
+    }
     /// Makes a `TextButton`/`Button` a toggle button and sets its state (`ButtonBase_c::SetToggleButton`/`SetValue`).
     pub fn set_toggle_in(&mut self, h: ViewHandle, name: &str, toggle: bool, on: bool) {
         for v in self.find_all_in(h, name) {

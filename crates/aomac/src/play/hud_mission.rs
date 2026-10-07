@@ -204,7 +204,6 @@ impl HudMission {
         }
         self.quests = quests;
         let win = self.win.as_mut().expect("open");
-        win.view.invalidate();
         win.view.set_rows(rows);
         win.view.paint(gui, w, lv::ICON_32);
         self.built = Some(sig);

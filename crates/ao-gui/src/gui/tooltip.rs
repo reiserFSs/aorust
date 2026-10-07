@@ -160,6 +160,9 @@ impl Gui {
             self.tip_hide();
         }
         if let Some((title, body)) = hit.and_then(|v| self.view_tip(v)) {
+            if self.tip.shown.is_some() && (title != self.tip.title || body != self.tip.body) {
+                self.tip.shown = Some(self.make_tip(&title, &body));
+            }
             self.tip.view = hit;
             self.tip.title = title;
             self.tip.body = body;
@@ -183,6 +186,21 @@ impl Gui {
 
     /// Timer expiry of `WindowController_c::Render` + drawing of the tooltip window (topmost, after every window).
     pub(super) fn tip_frame(&mut self, out: &mut Vec<DrawCmd>) {
+        // SetToolTip may change a hovered view's texts without changing its identity.
+        if let Some(view) = self.tip.view {
+            match self.view_tip(view) {
+                Some((title, body)) if title != self.tip.title || body != self.tip.body => {
+                    self.tip.title = title;
+                    self.tip.body = body;
+                    if self.tip.shown.is_some() {
+                        let (title, body) = (self.tip.title.clone(), self.tip.body.clone());
+                        self.tip.shown = Some(self.make_tip(&title, &body));
+                    }
+                }
+                None => self.tip_hide(),
+                _ => {}
+            }
+        }
         if self.tip.deadline.is_some_and(|d| self.time >= d) {
             self.tip.deadline = None;
             let (t, b) = (self.tip.title.clone(), self.tip.body.clone());

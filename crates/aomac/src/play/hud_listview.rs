@@ -54,6 +54,15 @@ pub(super) enum Hit {
     Context(i32, (i32, i32)),
 }
 
+struct PaintedLayout {
+    mode: Mode,
+    keys: Vec<i32>,
+    columns: Vec<Column>,
+    cols: usize,
+    min_rows: usize,
+    icon: f32,
+}
+
 pub(super) struct ListView {
     pub mode: Mode,
     pub columns: Vec<Column>,
@@ -71,8 +80,10 @@ pub(super) struct ListView {
     last_click: Option<(i32, f32)>,
     /// Recharge overlays of grid icons: `(row key, progress)` (see [`ListView::set_fades`]).
     fades: Vec<(i32, f32)>,
-    /// Painted state, to skip identical repaints.
-    painted: Option<(Mode, Vec<i32>, Option<i32>)>,
+    /// Layout identity; content updates never discard interactive views.
+    painted: Option<PaintedLayout>,
+    dirty: bool,
+    painted_selection: Option<i32>,
 }
 
 /// Columns of a grid that fits `client_w` px: `n` icons and `n - 1` spacings between the borders (`RecalcCellCount`).
@@ -95,7 +106,7 @@ pub(super) fn scroll_xml(min_h: f32, w: f32) -> String {
 
 impl ListView {
     pub fn new(mode: Mode, columns: Vec<Column>, cols: usize, min_rows: usize, sort: (u32, bool)) -> Self {
-        Self { mode, columns, cols, min_rows, selected: None, sort, rows: vec![], order: vec![], last_click: None, fades: vec![], painted: None }
+        Self { mode, columns, cols, min_rows, selected: None, sort, rows: vec![], order: vec![], last_click: None, fades: vec![], painted: None, dirty: true, painted_selection: None }
     }
 
     #[cfg(test)]
@@ -106,13 +117,13 @@ impl ListView {
     pub fn set_mode(&mut self, mode: Mode) {
         if self.mode != mode {
             self.mode = mode;
-            self.painted = None;
         }
     }
 
     /// Replaces the items. Grid: server order (`GetFirstFreePos` per arrival); list: sorted by [`ListView::sort`].
     pub fn set_rows(&mut self, rows: Vec<Row>) {
         self.rows = rows;
+        self.dirty = true;
         if self.mode == Mode::List {
             let Some(ci) = self.columns.iter().position(|c| c.id == self.sort.0) else { return };
             let desc = self.sort.1;
@@ -135,8 +146,8 @@ impl ListView {
     /// sides by `W * 0.5 * (1 - progress)`, `FUN_1003efe6`; the same as the hotbar's), progress = remaining / total. Repaints when it changed.
     pub fn set_fades(&mut self, fades: Vec<(i32, f32)>) {
         if self.fades != fades {
+            self.dirty = true;
             self.fades = fades;
-            self.painted = None;
         }
     }
 
@@ -154,35 +165,45 @@ impl ListView {
         self.rows.len().div_ceil(self.cols).max(self.min_rows) * self.cols
     }
 
-    /// Rebuilds the content of window `w` (grid canvas or rows) when the items, the mode or the selection changed.
+    /// Reuses interactive views while row identity and layout remain unchanged.
     pub fn paint(&mut self, gui: &mut Gui, w: WindowId, icon: f32) {
-        let sig = (self.mode, self.rows.iter().map(|r| r.key).collect::<Vec<_>>(), self.selected);
-        if self.painted.as_ref() == Some(&sig) {
+        let rebuild = !self.painted.as_ref().is_some_and(|p| {
+            p.mode == self.mode && p.keys.iter().copied().eq(self.rows.iter().map(|r| r.key))
+                && p.columns == self.columns && p.cols == self.cols && p.min_rows == self.min_rows && p.icon == icon
+        });
+        if !rebuild && !self.dirty && self.painted_selection == self.selected {
             return;
         }
-        self.order = sig.1.clone();
-        gui.remove_children(w, "lv_content");
-        match self.mode {
-            Mode::Grid => self.paint_grid(gui, w, icon),
-            Mode::List => self.paint_list(gui, w),
+        if rebuild {
+            self.order = self.rows.iter().map(|r| r.key).collect();
         }
-        gui.relayout_window(w);
-        self.painted = Some(sig);
+        if rebuild {
+            gui.remove_children(w, "lv_content");
+        }
+        match self.mode {
+            Mode::Grid => self.paint_grid(gui, w, icon, rebuild),
+            Mode::List => self.paint_list(gui, w, rebuild),
+        }
+        if rebuild {
+            gui.relayout_window(w);
+        }
+        if rebuild {
+            self.painted = Some(PaintedLayout { mode: self.mode, keys: self.order.clone(), columns: self.columns.clone(), cols: self.cols, min_rows: self.min_rows, icon });
+        }
+        self.painted_selection = self.selected;
+        self.dirty = false;
     }
 
-    /// Forces the next [`ListView::paint`] to rebuild (a row's text changed).
-    pub fn invalidate(&mut self) {
-        self.painted = None;
-    }
-
-    fn paint_grid(&self, gui: &mut Gui, w: WindowId, icon: f32) {
+    fn paint_grid(&self, gui: &mut Gui, w: WindowId, icon: f32, rebuild: bool) {
         let cells = self.cells();
         let rows = cells / self.cols;
         let (cw, ch) = (grid_width(self.cols, icon), 2.0 * BORDER + rows as f32 * icon + (rows as f32 - 1.0) * SPACING);
-        let xml = format!("<root><CanvasView name=\"grid\" min_size=\"Point({cw},{ch})\" max_size=\"Point({cw},{ch})\"/></root>");
-        if let Err(e) = gui.add_view_xml(w, "lv_content", "Grid", &xml) {
-            eprintln!("hud: list grid: {e:#}");
-            return;
+        if rebuild {
+            let xml = format!("<root><CanvasView name=\"grid\" min_size=\"Point({cw},{ch})\" max_size=\"Point({cw},{ch})\"/></root>");
+            if let Err(e) = gui.add_view_xml(w, "lv_content", "Grid", &xml) {
+                eprintln!("hud: list grid: {e:#}");
+                return;
+            }
         }
         let art = |gui: &Gui, n: &str| gui.gfx_id(n).map(GfxId).map(|g| (g, gui.gfx().size(g)));
         let slot = art(gui, SLOT_32);
@@ -216,8 +237,9 @@ impl ListView {
         gui.set_canvas_tips(w, "grid", tips);
     }
 
-    fn paint_list(&self, gui: &mut Gui, w: WindowId) {
+    fn paint_list(&self, gui: &mut Gui, w: WindowId, rebuild: bool) {
         let text_h = gui.font_height(ao_gui::FontId::Normal) as f32;
+        if rebuild {
         let cell = |text: &str, wd: f32, color: &str| {
             format!("<TextView value=\"{}\" color=\"{color}\" min_size=\"Point({wd},-1)\" max_size=\"Point({wd},-1)\"/>", esc(text))
         };
@@ -241,7 +263,7 @@ impl ListView {
                         wd = c.width
                     );
                 } else {
-                    line += &cell(text, c.width, color);
+                    line += &format!("<TextView name=\"lv_cell{i}_{n}\" value=\"{}\" color=\"{color}\" min_size=\"Point({wd},-1)\" max_size=\"Point({wd},-1)\"/>", esc(text), wd = c.width);
                 }
             }
             xml += &format!("<View view_layout=\"horizontal\" min_size=\"Point(1,{ROW_ICON})\">{line}</View>");
@@ -251,11 +273,16 @@ impl ListView {
             eprintln!("hud: list rows: {e:#}");
             return;
         }
+        }
         gui.set_canvas(w, "lv_head", vec![CanvasItem::Solid { dst: [0.0, 0.0, 4000.0, text_h], color: 0x1a2a30, alpha: 0.9 }]);
         for (i, key) in self.order.iter().enumerate() {
             let Some(r) = self.row(*key) else { continue };
-            if let Some((g, gw, gh)) = r.icon {
-                gui.set_canvas(w, &format!("lv_icon{i}"), vec![CanvasItem::Image { id: g, src: [0.0, 0.0, gw as f32, gh as f32], dst: [0.0, 0.0, ROW_ICON, ROW_ICON], alpha: 1.0 }]);
+            let items = r.icon.map(|(g, gw, gh)| CanvasItem::Image { id: g, src: [0.0, 0.0, gw as f32, gh as f32], dst: [0.0, 0.0, ROW_ICON, ROW_ICON], alpha: 1.0 }).into_iter().collect();
+            gui.set_canvas(w, &format!("lv_icon{i}"), items);
+            for n in 0..self.columns.len() {
+                let name = if n == 0 { format!("lv_row{i}") } else { format!("lv_cell{i}_{n}") };
+                gui.set_text(w, &name, r.cells.get(n).map_or("", String::as_str));
+                gui.set_view_color(w, &name, if self.selected == Some(r.key) { 0x5000000 } else { 0x4000000 });
             }
             gui.set_tooltip(w, &format!("lv_row{i}"), &r.tip_title, &r.tip_body);
         }
@@ -425,7 +452,6 @@ impl ListWindow {
             }
             _ => return false,
         }
-        self.view.invalidate();
         true
     }
 }
@@ -448,6 +474,48 @@ pub(super) fn hms(cs: i32) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn timer_updates_preserve_hover_and_press_identity() {
+        use ao_gui::{InputEvent, MouseButton, WindowSize};
+        let Ok(mut gui) = Gui::new(&ao_gui::client_dir(), None) else { return };
+        for mode in [Mode::Grid, Mode::List] {
+            let w = gui.open_window_xml("stable", &format!("<root>{}</root>", scroll_xml(150.0, 200.0)), (10, 10), WindowSize::Fixed(200, 150)).unwrap();
+            let mut list = ListView::new(mode, vec![Column { id: 1, label: "Name".into(), width: 100.0 }, Column { id: 2, label: "Time".into(), width: 50.0 }], 4, 1, (1, false));
+            let row = |time: &str| Row { key: 7, cells: vec!["Nano".into(), time.into()], tip_title: "Nano".into(), tip_body: time.into(), ..Default::default() };
+            list.set_rows(vec![row("10")]);
+            list.paint(&mut gui, w, ICON_32);
+            let name = if mode == Mode::Grid { "grid" } else { "lv_row0" };
+            let rect = gui.view_rect(w, name).unwrap();
+            let (x, y) = if mode == Mode::Grid { (rect.l + BORDER + 2.0, rect.t + BORDER + 2.0) } else { (rect.l + 2.0, rect.t + 2.0) };
+            gui.input(InputEvent::MouseMove { x, y });
+            gui.frame(1.0);
+            assert_eq!(gui.tooltip_shown(), Some(("Nano", "10")));
+            list.set_rows(vec![row("9")]);
+            list.paint(&mut gui, w, ICON_32);
+            gui.input(InputEvent::MouseMove { x: x + 1.0, y });
+            assert_eq!(gui.tooltip_shown(), Some(("Nano", "9")));
+            if mode == Mode::List {
+                gui.input(InputEvent::MouseDown { x, y, button: MouseButton::Left });
+                list.set_rows(vec![row("8")]);
+                list.paint(&mut gui, w, ICON_32);
+                let events = gui.input(InputEvent::MouseUp { x, y, button: MouseButton::Left });
+                let hits: Vec<_> = events.iter().filter_map(|e| list.event(&gui, w, e, 1.0, ICON_32)).collect();
+                assert_eq!(hits, vec![Hit::Click(7)]);
+                list.paint(&mut gui, w, ICON_32);
+                gui.input(InputEvent::MouseDown { x, y, button: MouseButton::Left });
+                list.set_rows(vec![row("7")]);
+                list.paint(&mut gui, w, ICON_32);
+                let events = gui.input(InputEvent::MouseUp { x, y, button: MouseButton::Left });
+                let hits: Vec<_> = events.iter().filter_map(|e| list.event(&gui, w, e, 1.1, ICON_32)).collect();
+                assert_eq!(hits, vec![Hit::Double(7)]);
+            }
+            list.set_rows(vec![]);
+            list.paint(&mut gui, w, ICON_32);
+            gui.input(InputEvent::MouseMove { x, y });
+            assert!(gui.tooltip_shown().is_none());
+            gui.close_window(w);
+        }
+    }
     #[test]
     fn grid_geometry_follows_the_ctor_constants() {
         // 4 icons of 32 px, 10 px spacing, 6 px borders

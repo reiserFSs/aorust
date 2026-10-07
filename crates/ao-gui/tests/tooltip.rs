@@ -47,6 +47,24 @@ fn tooltip_after_rest_and_close() {
 }
 
 #[test]
+fn hovered_tooltip_text_refreshes_without_losing_identity() {
+    let Ok(mut g) = Gui::new(&ao_gui::client_dir(), None) else { return };
+    let w = g.open_window_xml("t", XML, (10, 10), WindowSize::Fixed(400, 300)).unwrap();
+    let r = g.view_rect(w, "b").unwrap();
+    mv(&mut g, r.l + 2.0, r.t + 2.0);
+    g.frame(1.0);
+    assert!(g.tooltip_shown().is_some());
+    g.set_tooltip(w, "b", "Updated", "9 seconds");
+    g.frame(0.0);
+    assert_eq!(g.tooltip_shown(), Some(("Updated", "9 seconds")));
+    mv(&mut g, r.l + 3.0, r.t + 2.0);
+    assert_eq!(g.tooltip_shown(), Some(("Updated", "9 seconds")));
+    g.set_tooltip(w, "b", "", "");
+    g.frame(0.0);
+    assert!(g.tooltip_shown().is_none());
+}
+
+#[test]
 fn tooltip_flips_in_lower_right() {
     let Ok(mut g) = Gui::new(&ao_gui::client_dir(), None) else { return };
     g.set_screen_size(800, 600);
