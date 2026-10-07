@@ -70,6 +70,7 @@ impl Controller {
         if !self.registered {
             renderer.bph_last.entry(key).and_modify(|v|v.0+=1).or_insert((1,0.0));
             self.registered=true;
+            if std::env::var_os("AOMAC_COMBAT_LOG").is_some() { eprintln!("BPHFSM register source={key:?} duration={duration} clock={} throttle={:?} remaining={} children={:?} origin={:?} appearance={:?}",renderer.elapsed,renderer.bph_last[&key],self.remaining,&self.template.words[10..12],self.anchors[0].w_axis.truncate(),self.config.source_appearance); }
         }
         self.delay-=dt;
         if self.delay>0.0 { return Ok(true); }
