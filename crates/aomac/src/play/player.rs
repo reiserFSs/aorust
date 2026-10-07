@@ -555,7 +555,7 @@ impl Player {
         if let Some(breed) = breed {
             world.set_effect_source_runtime(identity, self.avatar.body_scale(), breed, Some(self.movement.speed()), self.movement.vehicle_direction(), self.camera.show_avatar());
         }
-        world.set_effect_source_head_height(identity, self.avatar.head_height());
+        world.set_effect_source_head_height(identity, self.avatar.head_local().map(|head| head.y));
         world.set_effect_source_liquid(identity, self.movement.effect_liquid().map(|(depth, flags, direction)| (depth, flags, direction.into())));
         if !world.needs_effect_source_mesh(identity) { return; }
         if let Some(actor) = host.actors.iter().find(|actor| actor.id == self.char_id && actor.model == avatar::MODEL_KEY) {
