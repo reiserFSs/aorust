@@ -124,6 +124,13 @@ returning `None`). **Direction (code wins over the earlier guess in docs/zone/mi
 subtracted from the fight target; `MissedAttackInfo.source` equals the header in all 11 captured messages). `log.rs` maps header -> attacker,
 `other` -> victim.
 
+### Received-frame health ordering
+
+`HealthDamageIIR_t::Apply` [GC 0x100a00c8] formats the packet's nominal delta, then writes its absolute Health before the next received IIR. `StatIIR_t::Apply` [GC 0x100a1aaf] therefore compares against that updated baseline, not the health from the beginning of the render tick. The incoming-only fixture `docs/captures/health_damage_stat_clamp.rec` preserves `clamp.rec` lines 1029–1031 (tick 20751): own `50000:33588`, HealthDamage Health=66/delta=+50, action 0xaa, then Stat Health=66. Starting at Health=46, this emits only the nominal 50-point heal; the following Stat difference is zero, not another 20-point heal. No login or credentials are retained.
+
+The port applies this absolute write inside `Zone::on_frame` to own stats, character stats and an existing dynel, including known foreign characters. The normal dispatch remains pre-apply for Stat/XP chat and post-apply for Info pages; nano removal's Life undo remains after `Zone::on_frame`. `captured_health_damage_applies_before_same_batch_stat_feedback` queues the actual captured incoming batch as `LoginEvent::ZoneFrame` events in one `Play::pump`, checks all health views and the single 50-point line, then checks that a later standalone Stat increase still emits its genuine difference. It also checks the known foreign-character path using the captured packet layout.
+
+
 ### 3.1 Wire layouts of the IIRs `ao_net` does not decode (after the 13-byte N3 header, big-endian `i32`, `Identity` = 2x`i32`)
 
 | class | `ReadSubClass` | layout |

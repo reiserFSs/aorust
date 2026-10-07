@@ -572,3 +572,13 @@ Captured removal, same-nano refresh, and SCFU-only authoritative-header
 restoration have separate regressions; the last keeps Health52 despite
 raw Life46, without relying on a following FullCharacter packet.
 
+The laboratory exposed a second ordering defect: HealthDamage supplied
+absolute Health66 and nominal heal50, then same-batch StatIIR repeated66.
+Deferring the first Health write until tick-end made chat print both50
+and20. Inline authoritative application now matches native GC100a00c8;
+the following GC100a1aaf-style comparison sees66−66=0.
+The final56.48s offscreen replay showed Health66/66 and exactly one
+“You were healed for50points.” line, no20-point duplicate. Ordinary
+3-point regeneration feedback remained visible. Solo/Team PvP bars
+(stats682/683) were the default two0/2000 rows, not broken XP bars.
+

@@ -344,6 +344,19 @@ impl Zone {
         };
         *self.counts.entry(m.header.msg_type).or_default() += 1;
         let who = m.header.target;
+        // HealthDamage Apply [GC 0x100a00c8] formats its nominal delta first
+        // (flow's pre-apply chat), then sets absolute Health before the next IIR.
+        if m.header.msg_type == 0x3710_256C && who.kind == CHAR_KIND && (who.instance == self.char_id as i32 || self.dynels.contains_key(&who.instance) || self.character_stats.contains_key(&who.instance)) {
+            if let Some(super::chat::log::LogEvent::HealthDamage { health, .. }) = super::chat::log::from_n3(&m) {
+                self.character_stats.entry(who.instance).or_default().insert(ao_formats::stats::HEALTH, health);
+                if who.instance == self.char_id as i32 {
+                    self.apply_stats([(ao_formats::stats::HEALTH, health)]);
+                }
+                if let Some(dynel) = self.dynels.get_mut(&who.instance) {
+                    dynel.health = health;
+                }
+            }
+        }
         self.world.on_message(&m);
         // Death and corpse replacement invalidate the living character selection even before its quit arrives.
         let removed = match &m.body {

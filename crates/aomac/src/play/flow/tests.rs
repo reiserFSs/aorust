@@ -128,6 +128,59 @@ fn stat_xp_feedback_uses_old_value_before_dispatch_applies_update() {
 }
 
 #[test]
+fn captured_health_damage_applies_before_same_batch_stat_feedback() {
+    let Some(mut r) = rig() else { return };
+    let own = 0x8334;
+    r.p.zone = zone::Zone::new(own);
+    r.p.zone.dynels.insert(own as i32, zone::DynelState {
+        name: "Captured heal fixture".into(), pos: [0.0; 3], yaw: None,
+        npc: false, side: 0, level: 1, health: 46, max_health: 66,
+    });
+    r.p.zone.stats.insert(27, 46);
+    r.p.zone.character_stats.entry(own as i32).or_default().insert(27, 46);
+    r.p.chat = Some(super::super::chat::Chat::new());
+    let frames = captured(include_str!("../../../../../docs/captures/health_damage_stat_clamp.rec"));
+    assert_eq!(frames.len(), 3);
+    // One pump consumes the entire real incoming batch, without a frame/tick sync.
+    r.p.fake_events.extend(frames.into_iter().map(LoginEvent::ZoneFrame));
+    r.p.pump(&mut r.host);
+    assert_eq!(r.p.zone.stat(27), Some(66));
+    assert_eq!(r.p.zone.character_stats[&(own as i32)][&27], 66);
+    assert_eq!(r.p.zone.dynels[&(own as i32)].health, 66);
+    let template = r.p.text.by_key(110, "Feedback_HealedForPoints").unwrap();
+    let expected = |amount| super::super::chat::log::ldb_format(&template, &[super::super::chat::log::Arg::N(amount)]);
+    let lines = r.p.chat.as_ref().unwrap().pending_log_lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].text.contains(&expected(50)), "{}", lines[0].text);
+    assert!(!lines[0].text.contains(&expected(20)));
+    // A genuine later Stat-only increase must still produce feedback.
+    let mut w = ao_net::Writer::default();
+    w.u32(ao_net::n3::dynel::STAT);
+    ao_net::msg::Identity { kind: 50000, instance: own as i32 }.write(&mut w);
+    w.u8(0);
+    for value in [1, 27, 73] { w.i32(value); }
+    r.event(LoginEvent::ZoneFrame(ao_net::n3::outgoing::n3_frame(0, own, w.0)));
+    let lines = r.p.chat.as_ref().unwrap().pending_log_lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[1].text.contains(&expected(7)), "{}", lines[1].text);
+    // The same absolute write also updates an announced foreign character.
+    let foreign: i32 = 77;
+    let mut dynel = r.p.zone.dynels[&(own as i32)].clone();
+    dynel.health = 46;
+    r.p.zone.dynels.insert(foreign, dynel);
+    r.p.zone.character_stats.entry(foreign).or_default().insert(27, 46);
+    let mut frames = captured(include_str!("../../../../../docs/captures/health_damage_stat_clamp.rec"));
+    for frame in &mut frames {
+        frame.payload[8..12].copy_from_slice(&foreign.to_be_bytes());
+    }
+    r.event(LoginEvent::ZoneFrame(frames[0].clone()));
+    assert_eq!(r.p.zone.stat_of(foreign, 27), Some(66));
+    assert_eq!(r.p.zone.dynels[&foreign].health, 66);
+    r.event(LoginEvent::ZoneFrame(frames[2].clone()));
+    assert_eq!(r.p.chat.as_ref().unwrap().pending_log_lines().count(), 2);
+}
+
+#[test]
 fn preview_first_waits_for_backdrop_instead_of_losing_upload() {
     let Some(mut r) = rig() else { return };
     r.p.backdrop = None;
