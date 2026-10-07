@@ -322,7 +322,8 @@ mod tests {
             assert_eq!(vertices.len(),if gated {0}else{posed.len()*effect.layer_count()},"Shield2 {id} measured CAT gate");
             assert!(vertices.iter().all(|v|v.pos.iter().chain(v.color.iter()).all(|x|x.is_finite())),"Shield2 {id} invalid small-CAT geometry");
         }
-        for (id,alpha) in [(43608,5.0/255.0),(43748,0.0)] {
+        // Native t=1: 43608 trunc(136*sin²(π/2)); 43748 trunc(85*sin²(f32::from_bits(0x3f212d7c))).
+        for (id,alpha) in [(43608,136.0/255.0),(43748,29.0/255.0)] {
             let mut effect=super::super::buff_shield::Shield::new(&r.templates.by_id[&id],Mat4::IDENTITY,EffectConfig {source_identity:Some((50000,1)),..Default::default()})?;
             effect.update_mesh(&posed,&[],None)?;effect.frame(0.0)?;effect.frame(1.0)?;
             let vertices=effect.vertices()?.context("installed Shield expired before sample")?;

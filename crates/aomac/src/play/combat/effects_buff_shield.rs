@@ -76,12 +76,14 @@ impl Shield {
             let input=Vec3::from_array(vertex.pos);let normal=Vec3::from_array(vertex.normal);
             let p=input+normal*t.float(11)?;
             let uv=match t.word(18)? {
-                0=>[(vertex.uv[0]+t.float(21)?*time)*t.float(19)?,(vertex.uv[1]+t.float(22)?*time)*t.float(20)?],
-                1=>[(-input.z).atan2(input.x)*t.float(19)?/std::f32::consts::TAU+t.float(21)?*time,input.y*t.float(20)?+t.float(21)?*time],
-                _=>[input.x*t.float(19)?+t.float(21)?*time,input.y*t.float(20)?+t.float(22)?*time],
+                0=>[(vertex.uv[0]+t.float(24)?*time)*t.float(19)?,(vertex.uv[1]+t.float(25)?*time)*t.float(20)?],
+                // DS1001ca74 deliberately reuses the U scroll for cylindrical V.
+                1=>[(-input.z).atan2(input.x)*t.float(19)?/std::f32::consts::TAU+t.float(24)?*time,input.y*t.float(20)?+t.float(24)?*time],
+                _=>[input.x*t.float(19)?+t.float(24)?*time,input.y*t.float(20)?+t.float(25)?*time],
             };
             let distance=if flags&0x800==0 {0.0}else if flags&0x1000!=0 {(p-origin).dot(direction)}else{(p-origin).length()};
-            let phase=(t.float(23)?*time-distance*t.float(24)?).max(0.0).min(t.float(25)?);
+            // GC100eda23 -> DS1001ce93: phase fields +1e0/+1e4/+1e8 = w21/w22/w23.
+            let phase=(t.float(21)?*time-distance*t.float(22)?).max(0.0).min(t.float(23)?);
             let mut a=((packed>>24) as f32*alpha*phase.sin().powi(2)).trunc() as u32&255;
             if flags&0x2000!=0 {
                 // DS1001ccac: native per-normal modulation, applied after the envelope.
@@ -107,12 +109,38 @@ mod tests {
     #[test]
     fn shield_uses_posed_normals_and_native_fade() {
         let mut words=vec![0;32];words[0]=0x400;words[8]=(-1.0f32).to_bits();words[9]=13;words[10]=u32::MAX;
-        for (i,v) in [(11,0.5),(19,1.0),(20,1.0),(23,1.0),(25,std::f32::consts::FRAC_PI_2),(30,1.0)] {words[i]=v.to_bits();}
+        for (i,v) in [(11,0.5),(19,1.0),(20,1.0),(21,1.0),(23,std::f32::consts::FRAC_PI_2),(30,1.0)] {words[i]=v.to_bits();}
         words[29]=1;
         let mut s=Shield::new(&Template {kind:3003,words},Mat4::IDENTITY,EffectConfig {source_identity:Some((50000,1)),..Default::default()}).unwrap();
         s.update_mesh(&[Vertex {pos:[1.0,2.0,3.0],normal:[0.0,1.0,0.0],uv:[0.0;2],color:[1.0;4]}],&[0,0,0],None).unwrap();
         s.frame(0.0).unwrap();s.frame(0.5).unwrap();
         assert_eq!(s.vertices().unwrap().unwrap()[0][0].pos,[1.0,2.5,3.0]);
         s.terminate_gracefully();assert!(s.frame(0.5).unwrap());assert!(!s.frame(0.5).unwrap());
+    }
+    #[test]
+    fn shield_ctor_words_keep_phase_and_all_uv_modes_distinct() -> Result<()> {
+        for (mode,expected_uv) in [(0,[7.0,20.25]),(1,[3.25,12.25]),(2,[7.25,16.25])] {
+            let mut words=vec![0;32];words[0]=0x800|0x1000;words[8]=(-1.0f32).to_bits();words[10]=u32::MAX;words[18]=mode;
+            for (i,v) in [(15,1.0f32),(19,2.0),(20,3.0),(21,1.5),(22,0.25),(23,0.75),(24,3.25),(25,4.25)] {words[i]=v.to_bits();}
+            let mut s=Shield::new(&Template {kind:3003,words},Mat4::IDENTITY,EffectConfig {source_identity:Some((50000,1)),..Default::default()})?;
+            s.update_mesh(&[Vertex {pos:[2.0,3.0,0.0],normal:[0.0;3],uv:[0.25,2.5],color:[1.0;4]}],&[],None)?;
+            s.frame(0.0)?;
+            assert_eq!(s.vertices()?.unwrap()[0][0].color[3],0.0,"negative phase clamps to zero");
+            s.frame(1.0)?;
+            let vertex=s.vertices()?.unwrap()[0][0];
+            assert_eq!(vertex.uv,expected_uv,"native UV mode {mode}");
+            // phase = min(1.5*time - signed_distance*0.25, 0.75).
+            assert_eq!(vertex.color[3],(255.0*0.75f32.sin().powi(2)).trunc()/255.0);
+            s.frame(0.5)?;
+            // Exercise the uncapped signed-distance envelope independently of UV.
+            s.template.words[23]=2.0f32.to_bits();
+            let vertex=s.vertices()?.unwrap()[0][0];
+            assert_eq!(vertex.color[3],(255.0*1.75f32.sin().powi(2)).trunc()/255.0);
+            s.template.words[23]=4.0f32.to_bits();
+            s.update_vertices(&[Vertex {pos:[-2.0,3.0,0.0],normal:[0.0;3],uv:[0.25,2.5],color:[1.0;4]}])?;
+            let vertex=s.vertices()?.unwrap()[0][0];
+            assert_eq!(vertex.color[3],(255.0*2.75f32.sin().powi(2)).trunc()/255.0,"negative signed distance increases phase");
+        }
+        Ok(())
     }
 }
