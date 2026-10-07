@@ -222,6 +222,8 @@ impl Buff {
             Native::ShockWave(n)=>n.update_source(source),
             Native::Stars(n)=>n.update_source(source)?,Native::Suns(n)=>n.update_source(source)?,Native::Electra(n)=>n.update_source(source)?,
             Native::Shield(n)=>n.update_source(source),Native::Sequencer(n)=>n.update_source(source),Native::SkyFlash(n)=>n.update_source(source)?,
+            // GC10110bbf follows the live CAT transform for the authored mech too.
+            Native::Shield2 {effect,transform,..} if effect.mech_resource().is_some()=>*transform=source,
             Native::Scatter(n)=>n.update_source(source),Native::Grid(n)=>n.update_source(source)?,Native::Trail(n)=>n.update_source(source)?,_=>{},
         } Ok(())
     }
@@ -397,6 +399,21 @@ mod tests {
         Ok(())
     }
     use super::*;
+    #[test]
+    fn authored_mech_shield_follows_live_source_transform() -> Result<()> {
+        let mut words=vec![0;27];words[8]=20.0f32.to_bits();words[12]=50;words[19]=1;words[20]=5;
+        words[21]=1;words[23]=u32::MAX;words[24]=1;
+        let (mut gc,mut ds,mut crt)=(R250::new(7),R250::new(8),CrtRand::new(1));
+        let mut buff=Buff::new(&Template {kind:3034,words},Mat4::IDENTITY,Vec3::ZERO,0,EffectConfig::default(),&mut gc,&mut ds,&mut crt,None,None)?;
+        let source=Mat4::from_scale_rotation_translation(Vec3::splat(2.0),glam::Quat::from_rotation_y(0.5),Vec3::new(3.0,4.0,5.0));
+        let mut scene=Scene::default();
+        scene.meshes.push(ao_scene::Mesh {vertices:vec![Vertex {pos:[1.0,0.0,0.0],..Default::default()}],submeshes:Vec::new()});
+        buff.prepare_mech(&scene)?;
+        buff.update_source(source)?;
+        let vertices=buff.vertices(0.0,Vec3::ZERO,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt,None,None,None)?.unwrap();
+        assert_eq!(vertices[0][0].pos,source.transform_point3(Vec3::X).to_array());
+        Ok(())
+    }
     #[test]
     fn authored_groundgrid_wrapper_terrain_and_stop() {
         let t=Template {kind:3030,words:vec![57859,0,0,0,0,0,0,0,1092616192,58,20,2,1077936128,1077936128,1073741824,1073741824,4286628095,4286628095,1073741824,1048576000,1084227584,1036831949,1036831949,1056964608,1056964608,0,0]};

@@ -24,7 +24,6 @@ pub(super) struct SkyFlash {
 impl SkyFlash {
     pub(super) fn new(t:&Template,source:Mat4)->Result<Self> {
         ensure!(t.kind==3006,"not a SkyFlash template");
-        t.word(29)?;
         for i in (1..=6).chain([8,11,12]).chain(15..=23) {t.float(i)?;}
         ensure!(t.word(13)?<=1024 && (1..=32766).contains(&t.word(14)?),"invalid SkyFlash geometry count");
         ensure!(t.float(11)?+t.float(12)?>0.0,"invalid SkyFlash cycle");
@@ -32,7 +31,7 @@ impl SkyFlash {
         Ok(Self {template:t.clone(),anchor,current_source:anchor,elapsed:0.0,duration:t.float(8)?,started:false,terminated:false})
     }
     pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {self.duration=d;}}
-    pub(super) fn requires_terrain(&self)->bool {self.template.words[0]&0x4000!=0}
+    pub(super) fn requires_terrain(&self)->bool {self.template.words.get(0).copied().unwrap_or(0)&0x4000!=0}
     pub(super) fn update_source(&mut self,source:Mat4)->Result<()> {self.current_source=super::sprites::connector(&self.template,source)?;Ok(())}
     pub(super) fn terminate_gracefully(&mut self) {self.terminated=true;}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {
@@ -42,14 +41,14 @@ impl SkyFlash {
     }
     pub(super) fn alive(&self)->bool {
         !self.terminated && !(self.duration>0.0 && self.elapsed>self.duration)
-            && self.elapsed<(self.template.words[10] as f32)*(f32::from_bits(self.template.words[11])+f32::from_bits(self.template.words[12]))
+            && self.elapsed<(self.template.words.get(10).copied().unwrap_or(0) as f32)*(f32::from_bits(self.template.words.get(11).copied().unwrap_or(0))+f32::from_bits(self.template.words.get(12).copied().unwrap_or(0)))
     }
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
-        let n=self.template.words[14];
+        let n=self.template.words.get(14).copied().unwrap_or(0);
         let indices=(0..n*2).flat_map(|i|if i&1==0 {[i,i+1,i+2]}else{[i+1,i,i+2]}).collect::<Vec<_>>();
-        (0..self.template.words[13]).map(|_|(Some(self.template.words[9] as usize),indices.clone(),(n as usize+1)*2)).collect()
+        (0..self.template.words.get(13).copied().unwrap_or(0)).map(|_|(Some(self.template.words.get(9).copied().unwrap_or(0) as usize),indices.clone(),(n as usize+1)*2)).collect()
     }
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words[0]&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend};self.template.words[13] as usize]}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words.get(0).copied().unwrap_or(0)&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend};self.template.words.get(13).copied().unwrap_or(0) as usize]}
     pub(super) fn vertices(&mut self,terrain:&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>)->Result<Option<Vec<Vec<Vertex>>>> {
         if !self.alive() {return Ok(None);}
         let t=&self.template;

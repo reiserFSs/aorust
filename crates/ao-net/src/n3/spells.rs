@@ -14,7 +14,7 @@
 //! @ 0x1000d3ba): function 0xcf17 reads one more criteria list (`(n+1)*0x3f1` + triples), function 0xcf20 an `ExpressionData_t` stream
 //! (not decoded: such a spell is an error). `SpellData_t::IsValid` (0xcf0a needs stat 2 or 0x25) is checked after the read.
 //!
-//! The format table is the constructor `SpellFormats_c::SpellFormats_c` @ 0x1000fb0a (130 formats, 231 function ids; an id without a format
+//! The format table is the constructor `SpellFormats_c::SpellFormats_c` @ 0x1000fb0a (130 formats, 234 function ids; an id without a format
 //! uses the empty default format `this+0x10`), extracted mechanically from its decompilation (`Add(ComplexType, SpellStat, default)` calls and the
 //! `map[function] = format` stores). Docs: docs/zone/movement.md §10.1.
 
@@ -291,10 +291,10 @@ static FORMATS: [&[Arg]; 130] = [
     &[(0, 58), (0, 56), (8, 8)],
     &[(0, 56), (8, 8)],
     &[(0, 56), (1, 0)],
-    &[],
+    &[(1, 0)],
+    &[(1, 0), (1, 1), (0, 39)],
     &[(1, 0), (0, 39)],
-    &[(0, 39)],
-    &[(0, 39), (0, 117)],
+    &[(1, 0), (0, 39), (0, 117)],
     &[(1, 0), (0, 66), (0, 67), (0, 68), (0, 69), (0, 78)],
     &[(0, 39), (0, 49), (0, 50), (0, 51), (0, 52), (0, 53), (0, 54)],
     &[(0, 39), (0, 49), (0, 50), (0, 153), (0, 154), (0, 155), (0, 156), (0, 157), (0, 158), (0, 159), (0, 160), (0, 161), (0, 86)],
@@ -310,7 +310,7 @@ static FORMATS: [&[Arg]; 130] = [
     &[(0, 119), (0, 127)],
     &[(0, 125)],
     &[(0, 39)],
-    &[(0, 39)],
+    &[(1, 0), (0, 39)],
     &[(0, 23)],
     &[(0, 87), (0, 73), (0, 25)],
     &[(0, 39)],
@@ -336,21 +336,21 @@ static FORMATS: [&[Arg]; 130] = [
     &[(0, 152), (0, 39)],
     &[(0, 127)],
     &[(0, 123)],
-    &[],
+    &[(1, 0)],
     &[(0, 39)],
     &[(0, 28), (0, 29), (0, 30), (0, 134), (0, 135), (0, 136), (0, 87), (0, 73), (11, 89)],
     &[(0, 39), (6, 77), (0, 84), (0, 88)],
     &[(0, 137)],
     &[(0, 39), (0, 138), (0, 139), (0, 140)],
     &[(2, 0), (0, 2), (0, 37), (0, 71), (0, 39)],
-    &[],
+    &[(1, 0)],
     &[(0, 39)],
     &[(0, 150)],
     &[(9, 44), (10, 7)],
     &[(0, 39)],
     &[(0, 28), (0, 29), (0, 30), (0, 39)],
     &[(0, 118)],
-    &[(0, 39)],
+    &[(1, 0), (0, 39)],
     &[(0, 162), (0, 48), (0, 47), (0, 73), (0, 163), (0, 164), (0, 165), (0, 166)],
     &[(6, 77), (0, 169), (0, 73)],
     &[(6, 77)],
@@ -366,25 +366,25 @@ static FORMATS: [&[Arg]; 130] = [
     &[(0, 47)],
     &[(0, 88)],
     &[(0, 43)],
-    &[(0, 72), (0, 62), (0, 95), (0, 73)],
-    &[(0, 11)],
+    &[(1, 0), (0, 72), (0, 62), (0, 95), (0, 73)],
+    &[(1, 0), (0, 11)],
     &[(2, 0)],
     &[(0, 1), (0, 39)],
     &[(0, 1), (0, 39)],
     &[(0, 73), (0, 39)],
     &[(0, 39)],
     &[(0, 39)],
-    &[(1, 1), (1, 2), (6, 77), (0, 84), (0, 161), (0, 66)],
+    &[(1, 0), (1, 1), (1, 2), (6, 77), (0, 84), (0, 161), (0, 66)],
     &[(0, 124), (0, 73)],
     &[(0, 39), (0, 73)],
 ];
 
-static IDS: [(u32, u8); 231] = [
+static IDS: [(u32, u8); 234] = [
     (0xcf0a, 2), (0xcf0b, 10), (0xcf0c, 22), (0xcf0d, 26), (0xcf0e, 27), (0xcf10, 28), (0xcf11, 30), (0xcf13, 31), (0xcf14, 9), (0xcf15, 29),
     (0xcf16, 32), (0xcf17, 33), (0xcf18, 36), (0xcf19, 37), (0xcf1a, 37), (0xcf1b, 38), (0xcf1f, 23), (0xcf20, 40), (0xcf21, 39), (0xcf22, 6),
     (0xcf23, 6), (0xcf24, 6), (0xcf25, 7), (0xcf26, 49), (0xcf27, 11), (0xcf28, 36), (0xcf29, 6), (0xcf2a, 10), (0xcf2b, 22), (0xcf2d, 22),
     (0xcf2e, 22), (0xcf2f, 0), (0xcf30, 8), (0xcf31, 8), (0xcf32, 51), (0xcf33, 24), (0xcf34, 48), (0xcf35, 4), (0xcf37, 3), (0xcf38, 44),
-    (0xcf3a, 107), (0xcf3b, 1), (0xcf3c, 41), (0xcf3d, 43), (0xcf3e, 44), (0xcf3f, 42), (0xcf40, 12), (0xcf41, 45), (0xcf43, 34), (0xcf44, 35),
+    (0xcf3a, 107), (0xcf3b, 1), (0xcf3c, 41), (0xcf3d, 43), (0xcf3e, 44), (0xcf3f, 42), (0xcf40, 12), (0xcf41, 46), (0xcf43, 34), (0xcf44, 35),
     (0xcf45, 25), (0xcf46, 52), (0xcf47, 14), (0xcf48, 19), (0xcf49, 54), (0xcf4a, 55), (0xcf4b, 57), (0xcf4c, 57), (0xcf4d, 107), (0xcf4e, 107),
     (0xcf50, 58), (0xcf51, 59), (0xcf53, 54), (0xcf54, 54), (0xcf55, 60), (0xcf56, 64), (0xcf57, 65), (0xcf58, 66), (0xcf59, 66), (0xcf5a, 67),
     (0xcf5b, 68), (0xcf5c, 36), (0xcf5d, 1), (0xcf5e, 107), (0xcf5f, 71), (0xcf60, 69), (0xcf61, 56), (0xcf62, 61), (0xcf63, 72), (0xcf64, 107),
@@ -403,7 +403,7 @@ static IDS: [(u32, u8); 231] = [
     (0xcfe4, 17), (0xcfe5, 108), (0xcfe6, 109), (0xcfe7, 109), (0xcfe8, 110), (0xcfe9, 107), (0xcfea, 105), (0xcfeb, 110), (0xcfec, 111),
     (0xcfed, 106), (0xcfee, 112), (0xcfef, 107), (0xcff0, 107), (0xcff1, 68), (0xcff2, 107), (0xcff3, 113), (0xcff4, 114), (0xcff5, 4),
     (0xcff6, 115), (0xcff7, 116), (0xcff8, 117), (0xcff9, 107), (0xcffa, 117), (0xcffb, 118), (0xcffc, 119), (0xcffd, 107), (0xcffe, 107),
-    (0xcfff, 120), (0xd000, 123), (0xd001, 124), (0xd002, 125), (0xd003, 126),
+    (0xcfff, 120), (0xd000, 123), (0xd001, 124), (0xd002, 125), (0xd003, 126), (0xd004, 127), (0xd005, 128), (0xd006, 129),
 ];
 
 #[cfg(test)]
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn table_matches_the_client() {
-        // 231 ids sorted for the binary search, every id maps to an existing format
+        // 234 ids sorted for the binary search, every id maps to an existing format
         assert!(IDS.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(IDS.iter().all(|e| (e.1 as usize) < FORMATS.len()));
         // FUN_100a59f5's switch handles these; the formats read from SpellFormats_c::SpellFormats_c
@@ -505,6 +505,92 @@ mod tests {
         assert_eq!(wire_reader.remaining(), 0);
         for end in 0..bytes.len() {
             assert!(read_spell(&mut Reader::little_endian(&bytes[..end])).is_err());
+        }
+    }
+
+    #[test]
+    fn native_string_overload_arguments_are_not_omitted() {
+        // GD 1000fb0a string-overload Add calls, artifact22543.
+        // 120802:354 authors CF8C "John\0","Doe\0",3.
+        // 257579:168 authors CF7B "Please enter your nickname:;/name\0",0,1.
+        // 284161:195 authors CF70 "{stock_pet_attack_accept}\0",1.
+        let cases: &[(u32, &[&str], &[(u8, u16)], &[i32])] = &[
+            (0xCF8C, &["John", "Doe"], &[(0, 39)], &[3]),
+            (0xCF8E, &["John", "Doe"], &[(0, 39)], &[3]),
+            (0xCF7B, &["Please enter your nickname:;/name"], &[(0, 39), (0, 117)], &[0, 1]),
+            (0xCF70, &["{stock_pet_attack_accept}"], &[(0, 39)], &[1]),
+            (0xCFD0, &["text"], &[], &[]),
+            (0xCFC4, &["text"], &[], &[]),
+            (0xCFDA, &["text"], &[(0, 39)], &[2]),
+            (0xCFDB, &["text"], &[(0, 39)], &[2]),
+            (0xCFFC, &["text"], &[(0, 72), (0, 62), (0, 95), (0, 73)], &[2, 3, 4, 5]),
+            (0xCFFF, &["text"], &[(0, 11)], &[2]),
+            (0xD004, &["one", "two", "three"], &[(6, 77), (0, 84), (0, 161), (0, 66)], &[2, 3, 4, 5]),
+        ];
+        for &(function, strings, integers, values) in cases {
+            let expected: Vec<_> = (0..strings.len()).map(|stat| (1, stat as u16))
+                .chain(integers.iter().copied()).collect();
+            assert_eq!(format_of(function), expected);
+            let mut record: Vec<_> = [function as i32, 0, 4, 0, 1, 0, 2, 9]
+                .into_iter().flat_map(i32::to_le_bytes).collect();
+            let mut wire: Vec<_> = [function as i32, 0, 4, 0, 1, 0, 2, 9]
+                .into_iter().flat_map(i32::to_be_bytes).collect();
+            for text in strings {
+                record.extend((text.len() as i32 + 1).to_le_bytes());
+                wire.extend((text.len() as i32 + 1).to_be_bytes());
+                for bytes in [&mut record, &mut wire] {
+                    bytes.extend(text.as_bytes());
+                    bytes.push(0);
+                }
+            }
+            record.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+            wire.extend(values.iter().flat_map(|value| value.to_be_bytes()));
+            let mut r = Reader::little_endian(&record);
+            let spell = read_spell(&mut r).unwrap();
+            assert_eq!(r.remaining(), 0);
+            for (stat, text) in strings.iter().enumerate() {
+                assert_eq!(spell.strings.get(&(stat as u16)).unwrap(), text);
+            }
+            let mut r = Reader::new(&wire);
+            assert_eq!(read_spell(&mut r).unwrap(), spell);
+            assert_eq!(r.remaining(), 0);
+            let mut encoded = Writer::default();
+            write_spell(&mut encoded, &spell).unwrap();
+            assert_eq!(encoded.0, wire);
+            for cut in 0..record.len() {
+                assert!(read_spell(&mut Reader::little_endian(&record[..cut])).is_err());
+                assert!(read_spell(&mut Reader::new(&wire[..cut])).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn installed_cf38_cf3e_string_boundaries() {
+        // GD 1000fb0a registers both ids with Add(1, stat0, "").
+        // RDB 1000020:40082 offsets 1739..1780: CF3E + "robe\0";
+        // the next CF35 begins at 1780. Same payload at 21797:1099
+        // and 231353:1471 precedes the next item element instead.
+        for function in [0xCF38, 0xCF3E] {
+            assert_eq!(format_of(function), &[(1, 0)]);
+            let prefix = [function as i32, 0, 4, 0, 1, 0, 2, 9, 5];
+            let mut record: Vec<_> = prefix.iter().flat_map(|word| word.to_le_bytes()).collect();
+            record.extend(b"robe\0");
+            let mut r = Reader::little_endian(&record);
+            let s = read_spell(&mut r).unwrap();
+            assert_eq!(r.remaining(), 0);
+            assert_eq!(s.strings.get(&0).unwrap(), "robe");
+            let mut wire: Vec<_> = prefix.iter().flat_map(|word| word.to_be_bytes()).collect();
+            wire.extend(b"robe\0");
+            let mut r = Reader::new(&wire);
+            assert_eq!(read_spell(&mut r).unwrap(), s);
+            assert_eq!(r.remaining(), 0);
+            let mut encoded = Writer::default();
+            write_spell(&mut encoded, &s).unwrap();
+            assert_eq!(encoded.0, wire);
+            for cut in 0..record.len() {
+                assert!(read_spell(&mut Reader::little_endian(&record[..cut])).is_err());
+                assert!(read_spell(&mut Reader::new(&wire[..cut])).is_err());
+            }
         }
     }
 

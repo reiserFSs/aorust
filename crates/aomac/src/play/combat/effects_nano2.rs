@@ -16,7 +16,7 @@ pub(super) struct Nano2 {
 }
 impl Nano2 {
     pub(super) fn new(template:&Template)->Result<Self> {
-        ensure!(template.kind==1017 && template.words.len()>=18,"short Nano2 template");
+        ensure!(template.kind==1017,"not Nano2 template");
         let material=template.word(9)? as usize;
         ensure!(material<super::materials::MATERIALS.len(),"invalid Nano2 material");
         for i in 10..18 { template.float(i)?; }
@@ -132,6 +132,11 @@ mod tests {
             let (skin,parts)=rig.pose(None);
             let actor=ao_scene::ActorFrame {id:1,model:1,transform:Mat4::from_translation(origin).to_cols_array_2d(),skin:Some(skin),parts,part_attractors:rig.part_attractors(),..Default::default()};
             r.prepare_source_mesh(identity,rig.model(),&actor);
+            r.refresh_anchors(|source,id| {
+                (source==identity).then(||rig.effect_anchor(id,None)).flatten()
+                    .map(|local|Mat4::from_translation(origin)*Mat4::from_cols_array_2d(&local))
+            });
+            assert!(r.anchors.get(&(identity,1000)).copied().flatten().is_some(),"Nano2 fixture needs the actual posed pelvis anchor");
             host.actors.clear();host.actors.push(actor);
             r.frame(1.0/60.0,&mut host,None);
             if [1,6,12,30,60].contains(&frame) {

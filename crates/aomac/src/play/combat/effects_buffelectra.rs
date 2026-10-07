@@ -27,7 +27,7 @@ pub(super) struct ElectraEffect {template:Template,source:Mat4,slots:[Slot;64],a
 impl ElectraEffect {
     pub(super) fn new(t:&Template,source:Mat4,_target:Mat4,_color:u32,_gc:&mut R250,_ds:&mut R250,_crt:&mut CrtRand)->Result<Self> {
         ensure!(t.kind==2006 && t.word(10)?<3,"invalid native Electra mode");
-        t.word(31)?;for i in (1..=6).chain(11..=29).filter(|&i|i!=30) {t.float(i)?;}
+        for i in (1..=6).chain(11..=29) {t.float(i)?;}
         ensure!(t.word(10)?!=0 || t.word(31)?<=6,"invalid Electra body segment");
         let life=t.word(30)? as i32 as f32/1000.0;ensure!(life>0.0,"invalid Electra lifetime");
         materials::MATERIALS.get(t.word(9)? as usize).context("unknown Electra material")?;
@@ -71,7 +71,7 @@ impl ElectraEffect {
                     let perpendicular=if mode==0 {Vec3::Y}else{perpendicular(s.point)};
                     let tangent=Quat::from_axis_angle(p,angle)*perpendicular;
                     s.basis=Mat3::from_cols(tangent,p,tangent.cross(p));
-                    if mode==0 {s.point=p;s.point.y=crt.rand() as f32/32768.0;s.segment=crt.rand() as usize%6;if self.template.words[31]!=6 {s.segment=self.template.words[31] as usize;}}
+                    if mode==0 {s.point=p;s.point.y=crt.rand() as f32/32768.0;s.segment=crt.rand() as usize%6;let segment=self.template.word(31)?;if segment!=6 {s.segment=segment as usize;}}
                 }
                 s.end=time+self.life;s.flip=crt.rand()&1==1;budget-=1;
                 // GC spawn branch does not draw until the next Process call.
@@ -79,7 +79,7 @@ impl ElectraEffect {
             }
             let phase=(self.life-(s.end-time))/self.life;
             let (center,mut a,b)=match mode {
-                0=>{let Some((start,length,basis))=segments[s.segment] else {continue;};let r=if self.template.words[31]==6 {self.radii[s.segment*2]+self.radii[s.segment*2+1]*s.point.y}else{width+radius*s.point.y}*length;let size=if r<=0.1 {r*3.0}else{0.3};(start+basis*Vec3::new(s.point.x*r,s.point.y*length,s.point.z*r),(basis*s.basis).x_axis*size,(basis*s.basis).z_axis*size)},
+                0=>{let Some((start,length,basis))=segments[s.segment] else {continue;};let r=if self.template.word(31)?==6 {self.radii[s.segment*2]+self.radii[s.segment*2+1]*s.point.y}else{width+radius*s.point.y}*length;let size=if r<=0.1 {r*3.0}else{0.3};(start+basis*Vec3::new(s.point.x*r,s.point.y*length,s.point.z*r),(basis*s.basis).x_axis*size,(basis*s.basis).z_axis*size)},
                 1=>(origin+s.point,s.basis.x_axis*width,s.basis.z_axis*width),
                 _=>{let a=-axes[2]*width;(origin-a*0.5,a,(axes[0]*s.point.y+axes[1]*s.point.z)*radius)}
             };
@@ -121,6 +121,14 @@ const RADII:[[f32;12];21]=[
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn absent_electra_segment_defaults_to_zero() -> Result<()> {
+        let mut words=vec![0;31];words[26]=(-1.0f32).to_bits();words[30]=500;
+        let mut gc=R250::new(1);let mut ds=R250::new(2);let mut crt=CrtRand::new(3);
+        let mut e=ElectraEffect::new(&Template {kind:2006,words},Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt)?;
+        e.vertices(0.04,Vec3::ZERO,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt)?;
+        assert!(e.slots.iter().filter(|s|s.end>0.04).all(|s|s.segment==0));
+        e.vertices(0.1,Vec3::ZERO,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt)?;Ok(())
+    }
     #[test] fn native_basis_and_drain() {
         assert_eq!(segment_basis(Vec3::Z,-Vec3::Y)*Vec3::Y,Vec3::Y);
         for mode in 0..3 {

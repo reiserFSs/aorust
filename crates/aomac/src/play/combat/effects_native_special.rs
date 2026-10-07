@@ -27,7 +27,7 @@ pub(super) struct ProjectileEffect {
 }
 impl ProjectileEffect {
     pub fn new(t: &Template, hit: Option<(Vec3, Vec3)>, store: &RecordStore, names: &NameTable, resources: &mut std::collections::HashMap<u32, Arc<Scene>>) -> Result<Self> {
-        ensure!(t.kind == 2013 && t.words.len() == 10, "invalid projectile template");
+        ensure!(t.kind == 2013, "invalid projectile template");
         let selector = t.word(8)? as i32;
         let selector = if (0..=2).contains(&selector) { selector } else { 0 };
         // The third native pointer102c4c28 is not a resource name (10171bd8).
@@ -94,7 +94,7 @@ pub(super) struct GroundImpactEffect {
 impl GroundImpactEffect {
     pub const MATERIAL: u32 = 1;
     pub fn new(t: &Template, connector: Option<Mat4>, rng: &mut CrtRand) -> Result<Self> {
-        ensure!(t.kind == 5000 && t.words.len() == 4, "invalid ground impact template");
+        ensure!(t.kind == 5000, "invalid ground impact template");
         for i in 0..4 { t.float(i)?; }
         let count = rng.rand() as usize % 10 + 5;
         let mut vertices = vec![Vertex::default(); count * 9];
@@ -217,7 +217,7 @@ mod tests {
         }
         let mut rng=CrtRand::new(1);
         let t=Template {kind:5000,words:vec![0x3f800000,0,0]};
-        assert!(GroundImpactEffect::new(&t,Some(Mat4::IDENTITY),&mut rng).is_err());
+        assert!(GroundImpactEffect::new(&t,Some(Mat4::IDENTITY),&mut rng).is_ok());
     }
     #[test]
     #[ignore = "requires installed retail assets"]

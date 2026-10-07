@@ -40,7 +40,7 @@ impl Suns {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(t: &Template, source: Mat4, target: Mat4, _color: u32, _gc: &mut R250, _ds: &mut R250, _crt: &mut CrtRand) -> Result<Self> {
         ensure!(Self::supports(t.kind), "not a native Suns template");
-        t.word(31)?; ensure!(t.word(10)? < 5, "invalid Suns mode");
+        ensure!(t.word(10)? < 5, "invalid Suns mode");
         materials::MATERIALS.get(t.word(9)? as usize).context("unknown Suns material")?;
         for i in (1..=6).chain(8..=8).chain(11..=29) { t.float(i)?; }
         let duration = t.float(26)?;
@@ -50,16 +50,21 @@ impl Suns {
     }
     pub(super) fn configure(&mut self, c: EffectConfig) -> Result<()> {
         if let Some(d) = c.duration { ensure!(d.is_finite(), "nonfinite Suns duration"); self.duration=d; }
-        if let Some(color)=c.start_color { for (i,v) in [19,20,21,18].into_iter().zip(color) {self.template.words[i]=v.to_bits();} }
-        if let Some(color)=c.stop_color { for (i,v) in [23,24,25,22].into_iter().zip(color) {self.template.words[i]=v.to_bits();} }
+        for (color,indices) in [(c.start_color,[19,20,21,18]),(c.stop_color,[23,24,25,22])] {
+            if let Some(color)=color {
+                ensure!(color.iter().all(|v|v.is_finite()),"nonfinite Suns color");
+                self.template.words.resize(self.template.words.len().max(indices.iter().copied().max().unwrap()+1),0);
+                for (i,v) in indices.into_iter().zip(color) {self.template.words[i]=v.to_bits();}
+            }
+        }
         Ok(())
     }
     pub(super) fn update_source(&mut self, source: Mat4) -> Result<()> {self.source=sprites::connector(&self.template,source)?;Ok(()) }
-    pub(super) fn required_attractors(&self) -> &'static [i32] {match self.template.words[10] {2=>&[1006,2000,2001],3=>&[1006],_=>&[]}}
+    pub(super) fn required_attractors(&self) -> &'static [i32] {match self.template.words.get(10).copied().unwrap_or(0) {2=>&[1006,2000,2001],3=>&[1006],_=>&[]}}
     pub(super) fn set_attractor(&mut self, id: i32, matrix: Option<Mat4>) { if let Some(i)=[1006,2000,2001].iter().position(|v|*v==id) {self.anchors[i]=matrix.map(|m|m.w_axis.truncate());} }
     pub(super) fn update_hit(&mut self, start:Vec3,end:Vec3) {self.hit=[start,end];}
     pub(super) fn terminate_gracefully(&mut self) {self.stop=true;}
-    pub(super) fn models(&self) -> Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.words[9] as usize),(0..32).flat_map(|i|[i*4,i*4+2,i*4+3,i*4,i*4+3,i*4+1]).collect(),128)]}
+    pub(super) fn models(&self) -> Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.words.get(9).copied().unwrap_or(0) as usize),(0..32).flat_map(|i|[i*4,i*4+2,i*4+3,i*4,i*4+3,i*4+1]).collect(),128)]}
     pub(super) fn blends(&self) -> Vec<Blend> {vec![Blend::Additive]}
     #[allow(clippy::too_many_arguments)]
     fn pair(&mut self,i:usize,position:Vec3,size:f32,angle:f32,second:f32,second_angle:f32,radius:f32,mask:u32) {
@@ -69,16 +74,16 @@ impl Suns {
     // The authored orbit uses GC double 1016b578 = 6.28000020980835, not TAU.
     #[allow(clippy::approx_constant)]
     fn simulate(&mut self,time:f32,crt:&mut CrtRand) {
-        let mode=self.template.words[10];let size=f32::from_bits(self.template.words[28]);let speed=f32::from_bits(self.template.words[29]);let p=time/self.duration;
+        let mode=self.template.words.get(10).copied().unwrap_or(0);let size=f32::from_bits(self.template.words.get(28).copied().unwrap_or(0));let speed=f32::from_bits(self.template.words.get(29).copied().unwrap_or(0));let p=time/self.duration;
         let centre=self.source.w_axis.truncate();
         match mode {
             0 => {let pulse=1.0-(2.0*p-1.0).powi(4);let pos=centre+Vec3::Y*2.0;for (i,color) in SUN.into_iter().enumerate() {self.sprites[i]=Sprite {position:pos,size:(i as f32*speed+size)*pulse,angle:time*0.5*(i as f32-4.0),radius:0.0,color:rgba(color&0xc0ffffff),frame:0,visible:true};}}
             1 => {
-                let reverse=self.template.words[30]!=0;let mut q=if reverse {1.0-p}else{p};let remain=1.0-q;
+                let reverse=self.template.words.get(30).copied().unwrap_or(0)!=0;let mut q=if reverse {1.0-p}else{p};let remain=1.0-q;
                 if reverse && q<0.2 {q=1.0-remain*(q*5.0).powi(27);}
                 let mask=((255.0*(1.0-q*q)) as u32)<<24|0xffffff;
                 let mut pulse=1.0-remain*remain;let mut a=size*pulse*0.9;let mut b=size*pulse*1.1;
-                if self.template.words[31]!=0 {let extra=size*(1.0-q).powi(8);a+=extra;b+=extra;pulse=pulse.max(0.3);}
+                if self.template.words.get(31).copied().unwrap_or(0)!=0 {let extra=size*(1.0-q).powi(8);a+=extra;b+=extra;pulse=pulse.max(0.3);}
                 for i in (0..18).step_by(2) {let angle=time*speed+i as f32*6.28*0.0555555;let pos=centre+Vec3::new(angle.sin(),(angle*3.0+time*4.0).sin()*0.1,-angle.cos())*pulse;self.pair(i,pos,a,time*2.0,b,time*(-1.5),pulse*0.05,mask);}
             }
             2 | 3 => {
@@ -88,7 +93,7 @@ impl Suns {
                 let a=size*pulse*0.9;let b=size*pulse*1.1;
                 for i in (0..4).step_by(2) {self.pair(i,pos,a,time*1.3*(i as f32-1.5),b,time*(-1.5)*(i as f32-2.5),a*0.05,u32::MAX);}
                 if mode==2 {
-                    let life=self.template.words[30] as f32/1000.0;
+                    let life=self.template.words.get(30).copied().unwrap_or(0) as f32/1000.0;
                     // GC truncates total emissions, caps catch-up at two hand pairs per frame.
                     let total=(time*12.0/life) as i32;let mut count=(total-self.emitted).min(2);self.emitted=total;
                     for i in (4..32).step_by(2) {
@@ -98,7 +103,7 @@ impl Suns {
                 }
             }
             4 => {
-                let life=self.template.words[30] as f32/1000.0;let mut emissions=3;let mut live=0;
+                let life=self.template.words.get(30).copied().unwrap_or(0) as f32/1000.0;let mut emissions=3;let mut live=0;
                 for i in 0..32 {
                     if self.deadlines[i]<=time {
                         if emissions>0 && !self.stop {let u=crt.rand() as f32/32768.0;self.origins[i]=self.hit[0].lerp(self.hit[1],u);self.deadlines[i]=time+life;emissions-=1;live+=1;}
@@ -115,7 +120,7 @@ impl Suns {
     pub(super) fn vertices(&mut self,time:f32,_camera:Vec3,right:Vec3,up:Vec3,_gc:&mut R250,_ds:&mut R250,crt:&mut CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
         if !self.alive || (self.duration>=0.0 && time>self.duration) {self.alive=false;return Ok(None);}
         self.simulate(time,crt);if !self.alive {return Ok(None);}
-        let material=materials::MATERIALS[self.template.words[9] as usize];let mut out=Vec::with_capacity(128);
+        let material=materials::MATERIALS[self.template.word(9)? as usize];let mut out=Vec::with_capacity(128);
         for s in &self.sprites {
             let (sin,cos)=(-s.angle).sin_cos();let x=(right*cos+up*sin)*(s.size*0.5);let y=(-right*sin+up*cos)*(s.size*0.5);let pos=s.position+right*s.radius;
             let u=s.frame.rem_euclid(material.1 as i32) as f32/material.1 as f32;let v=(s.frame/material.1 as i32) as f32/material.2 as f32;let du=1.0/material.1 as f32;let dv=1.0/material.2 as f32;
@@ -127,6 +132,17 @@ impl Suns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn short_suns_defaults_and_color_setters() -> Result<()> {
+        let mut gc=R250::new(1);let mut ds=R250::new(2);let mut crt=CrtRand::new(3);
+        let mut s=Suns::new(&Template {kind:2005,words:vec![]},Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt)?;
+        assert_eq!(s.duration,0.0);assert!(s.required_attractors().is_empty());assert_eq!(s.models()[0].0,Some(0));
+        s.configure(EffectConfig {duration:Some(2.0),..Default::default()})?;
+        s.simulate(1.0,&mut crt);assert!(s.sprites.iter().all(|p|p.size==0.0));
+        s.vertices(1.0,Vec3::ZERO,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt)?;
+        s.configure(EffectConfig {start_color:Some([1.0,0.5,0.25,0.75]),stop_color:Some([0.0;4]),..Default::default()})?;
+        assert_eq!(authored_color(&s.template,0.0),[1.0,0.5,0.25,0.75]);assert_eq!(s.template.float(28)?,0.0);
+        assert!(s.configure(EffectConfig {start_color:Some([f32::NAN;4]),..Default::default()}).is_err());Ok(())
+    }
     fn template(mode:u32)->Template {let mut words=vec![0;32];words[9]=8;words[10]=mode;words[26]=10f32.to_bits();words[28]=1f32.to_bits();words[29]=15f32.to_bits();words[30]=300;Template {kind:2005,words}}
     #[test] fn native_suns_parameters_and_graceful_drain() -> Result<()> {
         let mut gc=R250::new(1);let mut ds=R250::new(2);let mut crt=CrtRand::new(3);

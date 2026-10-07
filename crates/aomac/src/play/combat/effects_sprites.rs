@@ -92,7 +92,6 @@ impl SpriteEffect {
     pub(super) fn new_with_id(effect: i32, template: &Template, source: Mat4, _target: Mat4, color: u32, display_random:&mut R250) -> Result<Self> {
         ensure!(Self::supports(template.kind), "unsupported sprite class {}", template.kind);
         let last = match template.kind { 1004=>31,1007|1008|1023=>38,1009=>32,1018=>40,_=>26 };
-        template.word(last)?;
         for i in 8..=last {
             let integer=i==9 || (template.kind==1012 && matches!(i,10|24))
                 || (template.kind==1004 && matches!(i,29|31))
@@ -141,7 +140,7 @@ impl SpriteEffect {
     }
 
     fn emission_matrix(&self)->Result<Mat4> {
-        if self.template.words[0]&2!=0 {return Ok(Mat4::IDENTITY);}
+        if self.template.word(0).unwrap_or(0)&2!=0 {return Ok(Mat4::IDENTITY);}
         let mut matrix=self.source;
         if matches!(self.template.kind,1004|1009) {
             let offset=Vec3::new(self.template.float(1)?,self.template.float(2)?,-self.template.float(3)?);
@@ -151,7 +150,7 @@ impl SpriteEffect {
     }
 
     fn emission_position(&self)->Vec3 {
-        if self.template.words[0]&2!=0 {Vec3::ZERO}else{self.source.w_axis.truncate()}
+        if self.template.word(0).unwrap_or(0)&2!=0 {Vec3::ZERO}else{self.source.w_axis.truncate()}
     }
 
     /// GC 100db97d,100e6475/100e674f,100eff68 create different native particles.
@@ -197,7 +196,7 @@ impl SpriteEffect {
             position=matrix.transform_point3(local);
             // Fire repeats word 2 as an unrotated Y offset (GC 100dbedb/100db97d).
             position.y+=self.template.float(2)?;
-            let direction=if self.template.words[0]&0x100==0 {matrix.z_axis.truncate()}else{Vec3::Y};
+            let direction=if self.template.word(0).unwrap_or(0)&0x100==0 {matrix.z_axis.truncate()}else{Vec3::Y};
             velocity=direction*sphere.y.abs()*self.template.float(13)?/life;
         }
         let mut color=[self.template.float(color_index+1)?,self.template.float(color_index+2)?,self.template.float(color_index+3)?,self.template.float(color_index)?];
@@ -211,7 +210,7 @@ impl SpriteEffect {
         if let Some(c)=self.config.stop_color {stop=c;}
         let scale=if self.template.kind==1023 {1.0}else{self.config.scale.unwrap_or(1.0)};
         width*=scale; height*=scale; width_end*=scale; height_end*=scale;
-        let &(_,_,_,first,last)=&materials::MATERIALS[self.template.words[9] as usize];
+        let &(_,_,_,first,last)=&materials::MATERIALS[self.template.word(9).unwrap_or(0) as usize];
         let mode=self.template.word(if self.template.kind==1018 {38}else if nano{37}else{29})? as i32;
         ensure!((0..=7).contains(&mode),"unknown native sprite wind mode {mode}");
         let low=height_base.unwrap_or(position.y)+self.template.float(if self.template.kind==1018 {36}else if nano{35}else{27})?;
@@ -256,7 +255,7 @@ impl SpriteEffect {
                 // GC100e9855 consumes the ring-radius draw even with authored rate0.
                 let radius=if self.template.kind==1023 {super::random_fraction(random)+2.0}else{0.0};
                 for n in old..count {
-                    let mut at=if matches!(self.template.kind,1007|1023) && self.template.words[0]&2==0 {self.previous_source.lerp(self.emission_position(),(n-old+1) as f32/(count-old) as f32)}else{self.emission_position()};
+                    let mut at=if matches!(self.template.kind,1007|1023) && self.template.word(0).unwrap_or(0)&2==0 {self.previous_source.lerp(self.emission_position(),(n-old+1) as f32/(count-old) as f32)}else{self.emission_position()};
                     if self.template.kind==1023 {
                         let angle=super::random_fraction(random)*f32::from_bits(0x40c8f5c3);
                         at+=Vec3::new(angle.cos()*radius,1.0,-angle.sin()*radius);
@@ -286,14 +285,14 @@ impl SpriteEffect {
         }
         self.particles.retain(|p|p.remaining>=0.0);
         self.previous_time=time;self.previous_source=self.source.w_axis.truncate();
-        if self.particles.is_empty() && (!emitting || (nano && self.template.words[0]&0x200!=0)) {return Ok(None);}
-        let &(_,columns,rows,_,_)=&materials::MATERIALS[self.template.words[9] as usize];
+        if self.particles.is_empty() && (!emitting || (nano && self.template.word(0).unwrap_or(0)&0x200!=0)) {return Ok(None);}
+        let &(_,columns,rows,_,_)=&materials::MATERIALS[self.template.word(9).unwrap_or(0) as usize];
         let mut vertices=Vec::with_capacity(self.capacity*4);
         for p in &self.particles {
             let frame=p.frame as i32;
             let u=(frame%columns as i32) as f32/columns as f32;let v=(frame/rows as i32) as f32/rows as f32;
             let x=right*p.width*0.5;let y=up*p.height*0.5;
-            let center=if self.template.words[0]&2!=0 {self.source.transform_point3(p.position)}else{p.position};
+            let center=if self.template.word(0).unwrap_or(0)&2!=0 {self.source.transform_point3(p.position)}else{p.position};
             quad(&mut vertices,[center-x-y,center+x-y,center-x+y,center+x+y],[[u,v+1.0/rows as f32],[u+1.0/columns as f32,v+1.0/rows as f32],[u,v],[u+1.0/columns as f32,v]],render_color(p.color));
         }
         vertices.resize(self.capacity*4,Vertex::default());
@@ -302,13 +301,13 @@ impl SpriteEffect {
 
     pub(super) fn models(&self) -> Vec<(Option<usize>, Vec<u32>, usize)> {
         let n=self.capacity;
-        vec![(Some(self.template.words[9] as usize),(0..n as u32).flat_map(|i|[i*4,i*4+1,i*4+2,i*4+1,i*4+2,i*4+3]).collect(),n*4)]
+        vec![(Some(self.template.word(9).unwrap_or(0) as usize),(0..n as u32).flat_map(|i|[i*4,i*4+1,i*4+2,i*4+1,i*4+2,i*4+3]).collect(),n*4)]
     }
 
     pub(super) fn blends(&self) -> Vec<Blend> {
-        let flags = self.template.words[10];
+        let flags = self.template.word(10).unwrap_or(0);
         vec![if self.template.kind==1009 { if self.effect==80005 {Blend::Additive} else {Blend::AlphaBlend} }
-            else if matches!(self.template.kind,1007|1018|1023) && self.template.words[0]&0x800!=0 {Blend::AlphaBlend}
+            else if matches!(self.template.kind,1007|1018|1023) && self.template.word(0).unwrap_or(0)&0x800!=0 {Blend::AlphaBlend}
             else if self.template.kind!=1012 {Blend::Additive}
             else if flags&3==0 {
                 if flags&0x1000!=0 {Blend::Opaque}else if flags&4==0 {Blend::Additive}else{Blend::AlphaBlend}
@@ -317,7 +316,7 @@ impl SpriteEffect {
     }
 
     pub(super) fn update_source(&mut self, source: Mat4) {
-        if self.template.words[0]&1==0 || (self.template.kind==1012 && self.template.words[10]&0x10==0) {return;}
+        if self.template.word(0).unwrap_or(0)&1==0 || (self.template.kind==1012 && self.template.word(10).unwrap_or(0)&0x10==0) {return;}
         self.source=source;
     }
 
@@ -388,6 +387,23 @@ impl SpriteEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn absent_sprite_fields_remain_zero_through_frames() {
+        let mut gc=R250::new(1);let mut ds=R250::new(1);let mut crt=CrtRand::new(1);
+        for kind in [1004,1007,1008,1009,1012,1018,1023] {
+            let t=Template {kind,words:vec![]};
+            let mut e=SpriteEffect::new_with_id(1,&t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut ds).unwrap();
+            e.configure(EffectConfig::default());e.update_source(Mat4::from_translation(Vec3::ONE));
+            assert_eq!(e.models()[0].0,Some(0));e.blends();
+            assert_eq!(e.emission_position(),Vec3::ZERO);
+            assert_eq!(e.emission_matrix().unwrap(),Mat4::IDENTITY);
+            e.initialize_native(&mut gc,&mut crt).unwrap();
+            let groups=e.vertices(0.0,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt).unwrap();
+            if kind==1012 {
+                let vertices=groups.unwrap();assert!(vertices[0].iter().all(|v|v.pos==[0.0;3] && v.color==[0.0;4]));
+            }
+        }
+    }
     fn template() -> Template {
         let mut words = vec![0;27];
         words[10] = 0x100 | 0x80 | 0x20;

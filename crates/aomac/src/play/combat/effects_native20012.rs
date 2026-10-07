@@ -42,7 +42,7 @@ impl Spiral {
     pub(super) fn source_removed(&mut self) { self.duration = self.elapsed; }
     pub(super) fn graceful(&mut self) { self.duration = self.elapsed; }
     pub(super) fn models(&self) -> Vec<(Option<usize>, Vec<u32>, usize)> {
-        vec![(Some(self.template.words[9] as usize), (0..2u32).flat_map(|layer| (0..12u32).flat_map(move |i| {
+        vec![(Some(self.template.word(9).unwrap_or(0) as usize), (0..2u32).flat_map(|layer| (0..12u32).flat_map(move |i| {
             let a = layer * 26 + i * 2; [a, a + 1, a + 2, a + 2, a + 1, a + 3]
         })).collect(), 52)]
     }
@@ -122,7 +122,7 @@ impl Plasma {
     }
     pub(super) fn graceful(&mut self) { self.duration = 0.0; }
     pub(super) fn models(&self) -> Vec<(Option<usize>,Vec<u32>,usize)> {
-        vec![(Some(self.template.words[9] as usize),(0..75u32).flat_map(|i| {let a=i*2;[a,a+1,a+2,a+2,a+1,a+3]}).collect(),152)]
+        vec![(Some(self.template.word(9).unwrap_or(0) as usize),(0..75u32).flat_map(|i| {let a=i*2;[a,a+1,a+2,a+2,a+1,a+3]}).collect(),152)]
     }
     pub(super) fn blends(&self) -> Vec<Blend> { vec![Blend::Additive] }
     pub(super) fn vertices(&mut self,time:f32,forward:Vec3,crt:&mut ao_formats::character::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
@@ -221,6 +221,8 @@ mod tests {
                 let mut scene=Scene::default();
                 scene.textures.insert(key,texture.clone());
                 scene.meshes.push(Mesh {vertices:vertices.remove(0),submeshes:vec![sub]});
+                scene.instances.push(ao_scene::Instance {mesh:0,transform:Mat4::IDENTITY.to_cols_array_2d()});
+                assert_eq!(scene.instances.len(),scene.meshes.len(),"every Plasma fixture mesh must be drawable");
                 ao_render::render_to_png_actors(&scene,&[],Vec::<ActorFrame>::new(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("native2002_{id}_{frame}.png")),time)?;
             }
         }

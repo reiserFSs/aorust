@@ -49,7 +49,7 @@ impl Font {
     pub(super) fn update_source(&mut self,source:Mat4)->Result<()> {self.source=sprites::connector(&self.template,source)?;Ok(())}
     pub(super) fn set_color(&mut self,color:[f32;4]) {self.color=color;}
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
-    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.words[9] as usize),(0..self.letters.len() as u32).flat_map(|i|[i*4,i*4+2,i*4+3,i*4,i*4+3,i*4+1]).collect(),self.letters.len()*4)]}
+    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.word(9).unwrap_or(0) as usize),(0..self.letters.len() as u32).flat_map(|i|[i*4,i*4+2,i*4+3,i*4,i*4+3,i*4+1]).collect(),self.letters.len()*4)]}
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::AlphaBlend]}
     pub(super) fn vertices(&mut self,time:f32,right:Vec3,up:Vec3)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.stopped || (self.duration>=0.0 && time>self.duration) {return Ok(None);}
@@ -86,7 +86,7 @@ impl Fence {
     }
     pub(super) fn update_source(&mut self,m:Mat4)->Result<()> {self.source=sprites::connector(&self.template,m)?;Ok(())}
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
-    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.words[9] as usize),(0..64).flat_map(|i|[i*4,i*4+1,i*4+2,i*4+1,i*4+2,i*4+3]).collect(),256)]}
+    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.word(9).unwrap_or(0) as usize),(0..64).flat_map(|i|[i*4,i*4+1,i*4+2,i*4+1,i*4+2,i*4+3]).collect(),256)]}
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::Additive]}
     pub(super) fn vertices(&mut self,time:f32,crt:&mut ao_formats::character::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
         let life=self.template.float(18)?;let width=self.template.float(20)?;let centre=self.source.w_axis.truncate();
@@ -108,7 +108,7 @@ impl Fence {
                 let angle=(f64::from(crt.rand())/9990.2001953125) as f32;
                 let tangent=glam::Quat::from_axis_angle(normal,angle)*Vec3::Y;
                 s.basis=glam::Mat3::from_cols(tangent,normal,tangent.cross(normal));
-                s.flip=crt.rand()&1==0;s.color=[11,12,13,10].map(|j|f32::from_bits(self.template.words[j+if edge.solid {4}else{0}]));
+                s.flip=crt.rand()&1==0;s.color=[11,12,13,10].map(|j|f32::from_bits(self.template.word(j+if edge.solid {4}else{0}).unwrap_or(0)));
                 s.end=time+life;budget-=1;continue;
             }
             let phase=(life-(s.end-time))/life;let frame=(phase*16.0) as u32;
@@ -222,8 +222,20 @@ mod tests {
                 let texture=ao_formats::texture::load_texture(&renderer.store,key)?.context("legacy texture absent")?;
                 let mut sub=Submesh::new(models[0].1.clone(),Some(key));sub.blend=blend;sub.two_sided=true;sub.emissive=[1.0;3];
                 let mut scene=Scene::default();scene.textures.insert(key,texture);scene.meshes.push(Mesh {vertices:vertices.remove(0),submeshes:vec![sub]});
+                scene.instances.extend((0..scene.meshes.len()).map(|mesh|ao_scene::Instance {mesh,transform:Mat4::IDENTITY.to_cols_array_2d()}));
+                assert_eq!(scene.instances.len(),scene.meshes.len(),"every legacy buff fixture mesh must be drawable");
                 ao_render::render_to_png_actors(&scene,&[],Vec::<ActorFrame>::new(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy_{}_{id}_{frame}.png",t.kind)),frame as f32/60.0)?;
             }
         }Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn short_font_defaults_missing_fields_to_zero() {
+    let mut effect=Font::new(&Template {kind:2014,words:Vec::new()},Mat4::IDENTITY,EffectConfig::default()).unwrap();
+    effect.set_text(b"A").unwrap();
+    assert_eq!(effect.models()[0].0,Some(0));
+    assert_eq!(effect.scale,0.0);
+    assert_eq!(effect.color,[0.0;4]);
 }

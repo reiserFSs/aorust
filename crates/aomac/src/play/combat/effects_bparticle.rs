@@ -185,7 +185,22 @@ mod tests {
         let mut visible_pixels=0;
         for (&id,t) in &templates.by_id {
             if t.kind!=3024 {continue;}
-            renderer.clear();host.camera=ao_render::Camera::look_at(Vec3::new(2.0,2.0,5.0),Vec3::ZERO);
+            let width=[31,33,35].into_iter().map(|i|f(t,i).abs()).fold(0.0f32,f32::max);
+            let height=[32,34,36].into_iter().map(|i|f(t,i).abs()).fold(0.0f32,f32::max);
+            let geometry=if w(t,14)==2 {2.0}else{1.0};
+            let mut radius=f(t,12).abs()*3.0f32.sqrt()+width.hypot(height)*geometry;
+            if matches!(w(t,10),5|12) && w(t,13)==0 {
+                let velocity=Vec3::new(f(t,19).abs().max(f(t,20).abs()),f(t,21).abs().max(f(t,22).abs()),f(t,23).abs().max(f(t,24).abs())).length();
+                radius+=velocity*0.4+f(t,18).abs()*0.4*0.4*0.5;
+            }
+            if w(t,13)==1 || w(t,10)==7 {radius+=3.0f32.sqrt();}
+            radius+=Vec3::new(f(t,1),f(t,2),f(t,3)).length();
+            let mut distance=radius.max(1.0)*2.4;
+            // Distance-gated records must stay in their authored visibility
+            // interval, even when their geometry intentionally fills the view.
+            if f(t,28)<f(t,29) && f(t,29)<f(t,30) {distance=f(t,29);}
+            let eye=Vec3::new(2.0,2.0,5.0).normalize()*distance;
+            renderer.clear();host.camera=ao_render::Camera::look_at(eye,Vec3::ZERO);
             renderer.spawn(Binding {group:0,attractor:0,effect:id,note:0,color:0},Creation::Vector,Mat4::IDENTITY,Vec3::X)?;
             for step in 1..=40 {
                 let mut terrain=|p:Vec3|Some((Vec3::new(p.x,0.0,p.z),Vec3::Y));
@@ -195,8 +210,8 @@ mod tests {
                 let path=out.join(format!("bparticle3024_{id}_{step}.png"));
                 let blank=out.join(format!("bparticle3024_blank_{id}_{step}.png"));
                 let time=step as f32*0.01;
-                ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),[2.0,2.0,5.0],[0.0;3],640,480,&path,time)?;
-                ao_render::render_to_png_actors(&ao_scene::Scene::default(),&[],Vec::new(),[2.0,2.0,5.0],[0.0;3],640,480,&blank,time)?;
+                ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),[0.0;3],640,480,&path,time)?;
+                ao_render::render_to_png_actors(&ao_scene::Scene::default(),&[],Vec::new(),eye.to_array(),[0.0;3],640,480,&blank,time)?;
                 let image=image::open(&path)?.to_rgba8();let background=image::open(&blank)?.to_rgba8();
                 let pixels=image.pixels().zip(background.pixels()).filter(|(a,b)|a!=b).count();
                 visible_pixels+=pixels;

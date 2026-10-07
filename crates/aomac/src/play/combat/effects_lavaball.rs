@@ -18,7 +18,7 @@ pub(super) struct LavaBallEffect {
 }
 impl LavaBallEffect {
     pub(super) fn new(t:&Template,source:Mat4,relative:Vec3,c:EffectConfig)->Result<Self> {
-        ensure!(t.kind==3015,"unsupported LavaBall class {}",t.kind);t.word(27)?;
+        ensure!(t.kind==3015,"unsupported LavaBall class {}",t.kind);
         for i in [8,14,15,16,17,18,19,26,27] {t.float(i)?;}
         for i in [9,10] {materials::MATERIALS.get(t.word(i)? as usize).context("unknown LavaBall material")?;}
         for i in [15,18,26] {ensure!(t.float(i)?>0.0,"nonpositive LavaBall lifetime field {i}");}
@@ -30,16 +30,16 @@ impl LavaBallEffect {
     pub(super) fn update_source(&mut self,source:Mat4) {self.source=source;}
     pub(super) fn terminate_gracefully(&mut self) {self.stopping=true;}
     pub(super) fn source_lost(&mut self) {self.stopping=true;}
-    pub(super) fn priority(&self)->i32 {if self.template.words[11]!=0 {1}else{6}}
+    pub(super) fn priority(&self)->i32 {if self.template.word(11).unwrap_or(0)!=0 {1}else{6}}
     // DS100078c8 uses +1a0 as the render-list bucket for non-world coordinates.
-    pub(super) fn render_bucket(&self)->Option<i32> {if self.template.words[11]!=0 {Some(100)}else{None}}
+    pub(super) fn render_bucket(&self)->Option<i32> {if self.template.word(11).unwrap_or(0)!=0 {Some(100)}else{None}}
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
-        [9,10].map(|i|(Some(self.template.words[i] as usize),(0..CAPACITY as u32).flat_map(|i|[4*i,4*i+1,4*i+2,4*i+1,4*i+2,4*i+3]).collect(),CAPACITY*4)).into()
+        [9,10].map(|i|(Some(self.template.word(i).unwrap_or(0) as usize),(0..CAPACITY as u32).flat_map(|i|[4*i,4*i+1,4*i+2,4*i+1,4*i+2,4*i+3]).collect(),CAPACITY*4)).into()
     }
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words[13]==1 {Blend::AlphaBlend}else{Blend::Additive},Blend::Additive]}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.word(13).unwrap_or(0)==1 {Blend::AlphaBlend}else{Blend::Additive},Blend::Additive]}
     pub(super) fn take_sounds(&mut self)->Vec<AuxSound> {std::mem::take(&mut self.sounds)}
     fn sound(&mut self,name:&str,p:Vec3) {self.sounds.push(AuxSound {id:ao_audio::sbf::sound_id(name),pos:p.to_array(),velocity:[0.0;3],parameters:[1.0,0.0,0.0,0.0],probability:100});}
-    fn f(&self,i:usize)->f32 {f32::from_bits(self.template.words[i])}
+    fn f(&self,i:usize)->f32 {f32::from_bits(self.template.word(i).unwrap_or(0))}
     fn rate_count(&self)->i32 {(self.f(16) as f64*self.time as f64) as i32}
     fn age_smoke(&mut self)->(Option<usize>,usize) {
         let life=self.f(18);let mut free=None;let mut alive=0;
@@ -52,7 +52,7 @@ impl LavaBallEffect {
         if self.done {return Ok(None);}
         let dt=(time-self.previous).max(0.0);self.previous=time;self.time=time;
         if self.duration>=0.0 && time>self.duration {self.done=true;return Ok(None);}
-        let mode=self.template.words[11];let origin=self.source.w_axis.truncate();
+        let mode=self.template.word(11).unwrap_or(0);let origin=self.source.w_axis.truncate();
         match self.state {
             4=>{for p in self.smoke.iter_mut().chain(self.fire.iter_mut()) {p.active=false;}self.done=self.stopping;self.state=0;},
             0=>{self.wait_until=time+(crt.rand() as f64*self.f(27) as f64/16384.0) as f32;self.state=if mode==0 {1}else{5};},
@@ -111,9 +111,9 @@ impl LavaBallEffect {
         Ok(Some(self.draw(camera,right,up)))
     }
     fn draw(&self,camera:Vec3,right:Vec3,up:Vec3)->Vec<Vec<Vertex>> {
-        let origin=if self.template.words[11]==0 {self.source.w_axis.truncate()}else{camera};
+        let origin=if self.template.word(11).unwrap_or(0)==0 {self.source.w_axis.truncate()}else{camera};
         [(9,&self.smoke,self.f(19),[0.0,0.0,0.0,1.0]),(10,&self.fire,self.f(17),[1.0;4])].map(|(material,particles,size,color)|{
-            let m=materials::MATERIALS[self.template.words[material] as usize];let mut vertices=Vec::with_capacity(CAPACITY*4);
+            let m=materials::MATERIALS[self.template.word(material).unwrap_or(0) as usize];let mut vertices=Vec::with_capacity(CAPACITY*4);
             for p in particles {let pos=origin+p.position*REFLECT;let x=right*(size*0.5);let y=up*(size*0.5);let u=(p.frame%m.1 as i32) as f32/m.1 as f32;let v=(p.frame/m.1 as i32) as f32/m.2 as f32;
                 quad(&mut vertices,[pos-x-y,pos+x-y,pos-x+y,pos+x+y],[[u,v+1.0/m.2 as f32],[u+1.0/m.1 as f32,v+1.0/m.2 as f32],[u,v],[u+1.0/m.1 as f32,v]],if p.active {color}else{[0.0;4]});
             }vertices
@@ -124,6 +124,15 @@ impl LavaBallEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn absent_lavaball_wait_field_is_zero_in_frame() {
+        let mut t=authored(0);t.words.truncate(27);
+        let mut e=LavaBallEffect::new(&t,Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default()).unwrap();
+        assert_eq!(e.f(27),0.0);e.models();e.blends();assert_eq!(e.priority(),6);assert_eq!(e.render_bucket(),None);
+        e.state=0;
+        e.vertices(0.1,Vec3::ZERO,Vec3::X,Vec3::Y,&mut CrtRand::new(1),None,None).unwrap();
+        assert_eq!(e.wait_until,0.1);assert_eq!(e.state,1);
+    }
     fn authored(mode:u32)->Template {
         let words=match mode {
             0=>vec![5,0,0,0,0,0,0,2001,3212836864,49,9,0,4278190080,1,1047233823,1063675494,1103626240,1074161254,1066192077,1067030938,0,0,0,0,0,0,1085276160,1065353216],

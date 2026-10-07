@@ -102,7 +102,7 @@ impl Controller {
 
     pub(super) fn models(&self) -> Vec<(Option<usize>,Vec<u32>,usize)> {
         if self.spell.is_none() {return Vec::new();}
-        vec![(Some(self.template.words[9] as usize),(0..100u32).flat_map(|i|[i*4,i*4+2,i*4+1,i*4+1,i*4+2,i*4+3]).collect(),400)]
+        vec![(Some(self.template.words.get(9).copied().unwrap_or(0) as usize),(0..100u32).flat_map(|i|[i*4,i*4+2,i*4+1,i*4+1,i*4+2,i*4+3]).collect(),400)]
     }
     pub(super) fn blends(&self) -> Vec<Blend> { if self.spell.is_some() {vec![Blend::Additive]} else {Vec::new()} }
     pub(super) fn vertices(&mut self, _time:f32, _camera:Vec3, right:Vec3, up:Vec3) -> Result<Option<Vec<Vec<Vertex>>>> {

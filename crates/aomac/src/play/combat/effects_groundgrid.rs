@@ -5,7 +5,7 @@ use anyhow::{ensure, Context, Result};
 use ao_formats::weather::R250;
 use ao_scene::{Blend, Vertex};
 use glam::{Mat4, Vec3};
-fn f(t:&Template,i:usize)->f32 {f32::from_bits(t.words[i])}
+fn f(t:&Template,i:usize)->f32 {f32::from_bits(t.words.get(i).copied().unwrap_or(0))}
 pub(super) struct GroundGrid {
     template:Template, source:Mat4, origin:Vec3, rotation:Mat4, duration:f32,
     fade_start:f32, previous:f32, phase:f32, uv:[f32;4], points:Vec<Vec3>,
@@ -13,26 +13,26 @@ pub(super) struct GroundGrid {
 }
 impl GroundGrid {
     pub(super) fn new(t:&Template,source:Mat4,c:EffectConfig,r:&mut R250)->Result<Self> {
-        ensure!(t.kind==3030,"not GroundGrid");t.word(26)?;
+        ensure!(t.kind==3030,"not GroundGrid");
         for i in [1,2,3,4,5,6,8,12,13,14,15,18,19,20,21,22,23,24,25,26] {ensure!(f(t,i).is_finite(),"nonfinite GroundGrid parameter {i}");}
-        ensure!(t.words[10]>=2 && t.words[10]<=1024,"invalid GroundGrid resolution");
-        ensure!(t.words[11]<=2,"invalid GroundGrid attenuation mode");
-        materials::MATERIALS.get(t.words[9] as usize).context("unknown GroundGrid material")?;
+        ensure!((2..=1024).contains(&t.word(10)?),"invalid GroundGrid resolution");
+        ensure!(t.word(11)?<=2,"invalid GroundGrid attenuation mode");
+        materials::MATERIALS.get(t.words.get(9).copied().unwrap_or(0) as usize).context("unknown GroundGrid material")?;
         let source=sprites::connector(t,source)?;
-        let rotation=if t.words[0]&0x20000!=0 {Mat4::from_rotation_y(-(super::random_fraction(r) as f64*f64::from_bits(0x401921fb60000000)) as f32)}else{Mat4::IDENTITY};
-        let n=t.words[10] as usize;
+        let rotation=if t.words.get(0).copied().unwrap_or(0) & 0x20000!=0 {Mat4::from_rotation_y(-(super::random_fraction(r) as f64*f64::from_bits(0x401921fb60000000)) as f32)}else{Mat4::IDENTITY};
+        let n=t.words.get(10).copied().unwrap_or(0) as usize;
         Ok(Self {template:t.clone(),source,origin:source.w_axis.truncate(),rotation,duration:c.duration.unwrap_or(f(t,8)),fade_start:f(t,8)-f(t,15),previous:0.0,phase:0.0,uv:[f(t,12),f(t,13),f(t,23),f(t,24)],points:vec![Vec3::ZERO;n*n],cached:Vec::new(),cached_origin:source.w_axis.truncate(),initialized:false,deleted:false})
     }
     pub(super) fn update_source(&mut self,m:Mat4)->Result<()> {self.source=sprites::connector(&self.template,m)?;Ok(())}
     pub(super) fn graceful(&mut self) {self.deleted=true;}
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
-        let n=self.template.words[10] as usize;let mut indices=Vec::with_capacity((n-1)*(n-1)*6);
+        let n=self.template.words.get(10).copied().unwrap_or(0) as usize;let mut indices=Vec::with_capacity((n-1)*(n-1)*6);
         for row in 0..n-1 {let start=row*n*2;for i in 0..n*2-2 {let a=(start+i) as u32;indices.extend(if i&1==0 {[a,a+1,a+2]}else{[a+1,a,a+2]});}}
-        vec![(Some(self.template.words[9] as usize),indices,(n-1)*n*2)]
+        vec![(Some(self.template.words.get(9).copied().unwrap_or(0) as usize),indices,(n-1)*n*2)]
     }
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words[0]&0x200!=0 && self.template.words[0]&0x400==0 {Blend::Additive}else{Blend::AlphaBlend}]}
+    pub(super) fn blends(&self)->Vec<Blend> {let flags=self.template.words.first().copied().unwrap_or(0);vec![if flags&0x200!=0 && flags&0x400==0 {Blend::Additive}else{Blend::AlphaBlend}]}
     fn locate(&mut self,terrain:&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>,initial:bool)->Result<()> {
-        let t=&self.template;let n=t.words[10] as usize;let half=(n-1) as f32*f(t,18)*0.5;
+        let t=&self.template;let n=t.words.get(10).copied().unwrap_or(0) as usize;let half=(n-1) as f32*f(t,18)*0.5;
         if !initial {self.origin=self.source.w_axis.truncate();}
         for row in 0..n {for col in 0..n {
             let mut p=Vec3::new(col as f32*f(t,18)-half,0.0,-(row as f32*f(t,18)-half));
@@ -42,25 +42,25 @@ impl GroundGrid {
         }}Ok(())
     }
     fn rebuild(&mut self) {
-        let t=&self.template;let n=t.words[10] as usize;let center=(n-1) as f32*0.5;
-        let uv_center=if t.words[0]&0x8000!=0 {-center}else{0.0};
-        let [a,r,g,b]=t.words[16].to_be_bytes();let rgb=[r,g,b].map(|x|(x as f32/255.0).powf(2.2));
+        let t=&self.template;let n=t.words.get(10).copied().unwrap_or(0) as usize;let center=(n-1) as f32*0.5;
+        let uv_center=if t.words.get(0).copied().unwrap_or(0) & 0x8000!=0 {-center}else{0.0};
+        let [a,r,g,b]=t.words.get(16).copied().unwrap_or(0).to_be_bytes();let rgb=[r,g,b].map(|x|(x as f32/255.0).powf(2.2));
         self.cached.clear();
         self.cached_origin=self.origin;
         for row in 0..n-1 {for col in 0..n {for y in [row,row+1] {
-            let attenuation=match t.words[11] {1=>((col as f32-n as f32*0.5).abs()+(y as f32-n as f32*0.5).abs())/(n as f32*0.5),2=>Vec3::new(col as f32-center,y as f32-center,0.0).length()/center,_=>0.0};
+            let attenuation=match t.words.get(11).copied().unwrap_or(0) { 1=>((col as f32-n as f32*0.5).abs()+(y as f32-n as f32*0.5).abs())/(n as f32*0.5),2=>Vec3::new(col as f32-center,y as f32-center,0.0).length()/center,_=>0.0 };
             let wave=(((attenuation as f64*32.0+self.phase as f64)*0.5).sin() as f32+1.0)*0.5;
-            let alpha=(1.0-attenuation).max(0.0)*a as f32/255.0*if t.words[0]&0x4000!=0 {wave}else{1.0};
+            let alpha=(1.0-attenuation).max(0.0)*a as f32/255.0*if t.words.get(0).copied().unwrap_or(0) & 0x4000!=0 {wave}else{1.0};
             let byte=(alpha*255.0) as i32 as u8;
-            let mut p=self.points[y*n+col];if t.words[0]&0x2000!=0 {p.y+=wave*0.5;}
+            let mut p=self.points[y*n+col];if t.words.get(0).copied().unwrap_or(0) & 0x2000!=0 {p.y+=wave*0.5;}
             self.cached.push(Vertex {pos:(self.origin+p).to_array(),normal:[0.0,1.0,0.0],uv:[(col as f32+uv_center)/(n-1) as f32*self.uv[0]+self.uv[2],(y as f32+uv_center)/(n-1) as f32*self.uv[1]+self.uv[3]],color:[rgb[0],rgb[1],rgb[2],byte as f32/255.0]});
         }}} 
     }
     pub(super) fn vertices(&mut self,time:f32,terrain:&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.deleted || (self.duration>=0.0 && time>self.duration) {return Ok(None);}
         let dt=(time-self.previous).max(0.0);self.previous=time;
-        if !self.initialized {self.locate(terrain,self.template.words[0]&0x800!=0)?;self.rebuild();self.initialized=true;}
-        if self.template.words[0]&0x800==0 {self.locate(terrain,false)?;}
+        if !self.initialized {self.locate(terrain,self.template.words.get(0).copied().unwrap_or(0) & 0x800!=0)?;self.rebuild();self.initialized=true;}
+        if self.template.words.get(0).copied().unwrap_or(0) & 0x800==0 {self.locate(terrain,false)?;}
         for (i,word) in [21,22,25,26].into_iter().enumerate() {self.uv[i]+=f(&self.template,word)*dt;}
         if [21,22,25,26].iter().any(|&i|f(&self.template,i)!=0.0) {self.rebuild();self.phase+=f(&self.template,20)*dt;}
         let alpha=if time<f(&self.template,14) {time/f(&self.template,14)}else if time>=self.fade_start {1.0-(time-self.fade_start)/f(&self.template,15)}else{1.0};

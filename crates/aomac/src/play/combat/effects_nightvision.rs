@@ -15,7 +15,7 @@ pub(super) struct NightVision {
 }
 impl NightVision {
     pub(super) fn new(template:&Template)->Result<Self> {
-        ensure!(template.kind==1020 && template.words.len()>=26,"short NightVision template");
+        ensure!(template.kind==1020,"not NightVision template");
         // The loader reads all fields, including unused third-layer/distortion fields.
         for i in [1,2,3,4,8,9,10,11,15,16,17,18,24,25] {template.float(i)?;}
         let mut layers=Vec::with_capacity(3);
@@ -24,7 +24,7 @@ impl NightVision {
             let start=1+group*7;
             let color=std::array::from_fn(|i| {
                 // Native float*255 conversion and packed RGBA truncate to bytes.
-                ((f32::from_bits(template.words[start+i])*255.0) as i32 as u8) as f32/255.0
+                ((f32::from_bits(template.word(start+i).unwrap_or(0))*255.0) as i32 as u8) as f32/255.0
             });
             let source_blend=template.word(start+5)?;
             let destination_blend=template.word(start+6)?;

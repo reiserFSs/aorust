@@ -536,12 +536,13 @@ invalid lengths. A text search of `docs/captures/*.rec` found no CF34 or
 ApplySpells type-key occurrence; this fixture is an installed record, **not**
 a captured server message. No tests/builds/checks were run by this worker.
 
-### CF41 format-index correction
+### Omitted string-overload arguments (CF41 and census repair)
 
 GD `SpellFormats_c` constructor `0x1000fb0a` adds `(ComplexType 1, stat 0)`
 then `(0, stat 0x27)` before registering CF41 (artifact22543, lines
-1535–1576). This is shared format 45, not integer-only format 46.
-The wrong ID mapping consumed the string length as stat39 and left the
+1535–1576). Native format46 must include that string; the mechanical
+extraction had omitted string-overload `Add` calls. Consuming only the
+integer misread the string length as stat39 and left the
 authored string and integer unread. Installed `1000020:29740` offset 419
 contains `CF41,0,4,0,1,0,2,9,6,"Gulp!\0",2`; the boundary regression
 retains its zero-remaining assertion and now checks exact BE encoder bytes.
@@ -551,6 +552,33 @@ reader (`0x1001474b`) and short/extended truncation checks, with added BE
 encoder roundtrips. No item-element rejection was relaxed: `1000020:25885`
 still rejects type23/sub37, absent from GC `0x1002b297`.
 These regressions were added but not executed by this worker.
+
+The same extraction error affected CF38/CF3E (format44, string stat0),
+CF8C/CF8E (45, string stats0/1 then int39), CF7B (47, string0 then
+ints39/117), CF70 (63, string0 then int39), CFD0 (89, string0),
+CFC4 (96, string0), CFDA/CFDB (103, string0 then int39), CFFC (119,
+string0 then ints72/62/95/73), CFFF (120, string0 then int11), and
+D004 (127, string stats0/1/2 then ints77/84/161/66). All omitted
+arguments are restored, not skipped. Evidence: artifact22543
+1470–1612, 2008–2047, 2595–2625, 2785–2815, 2920–2950,
+3450–3515 and 3628–3709. Constructor `Add` registrations also supply
+the previously omitted D004/D005/D006 IDs, formats127/128/129.
+
+Installed evidence: `1000020:21797` CF3E at1099, `:40082` at1739,
+and `:231353` at1471 contain string length5 and `robe\0`.
+In `:40082`, CF35 starts at1780; it must not start inside the text.
+`:120802` CF8C at354 contains `John\0`, `Doe\0`, int3;
+`:257579` CF7B at168 contains `Please enter your nickname:;/name\0`,
+ints0/1; `:284161` CF70 at195 contains criteria `[62,10,0]`,
+`{stock_pet_attack_accept}\0`, int1. Regressions
+`installed_cf38_cf3e_string_boundaries` and
+`native_string_overload_arguments_are_not_omitted` check LE/BE
+consumption, text, exact encoder bytes and every truncated prefix.
+These parser bugs explain text-as-spell/element signatures in census23700;
+they are not native rejection. Native kind<10000 rejection remains:
+`:213967`/`:213968` literally author kind0 (GC `1002b297`,
+artifact22540). Invalid CF0A rejection remains GD `1000ccf6`/
+`1000d686` (native extraction in `history://FxClasses.Parser`), including `1040005:26349` at283.
 
 ## UNRESOLVED / guesses
 

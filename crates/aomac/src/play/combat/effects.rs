@@ -446,7 +446,7 @@ impl Renderer {
         for tower in self.active.iter_mut().filter(|a|a.config.source_identity==Some(identity)).filter_map(|a|a.tower.as_mut()) {tower.source_removed();}
         while let Some(handle)=self.active.iter().find(|a| {
             a.config.source_identity==Some(identity)
-                && (matches!(self.templates.by_id[&a.effect].kind,3001|3034|3039) || (self.templates.by_id[&a.effect].kind==1029 && self.templates.by_id[&a.effect].words[0]&0x400==0))
+                && (matches!(self.templates.by_id[&a.effect].kind,3001|3034|3039) || (self.templates.by_id[&a.effect].kind==1029 && self.templates.by_id[&a.effect].word(0).unwrap_or(0)&0x400==0))
         }).map(|a|a.actor) {self.delete(handle);}
     }
     pub fn update_source(&mut self, handle: u32, source: Mat4) {
@@ -520,7 +520,7 @@ impl Renderer {
         }
         for a in &mut self.active {
             if let (Some(native),Some(identity)) = (&mut a.native_replicated,a.config.target_identity) {
-                if self.templates.by_id[&a.effect].words[0]&1 !=0 {
+                if self.templates.by_id[&a.effect].word(0).unwrap_or(0)&1 !=0 {
                     if let Some(target)=resolve(identity,native.target_attractor()) {
                         a.target=target.w_axis.truncate();
                         native.update_target(target);
@@ -529,7 +529,7 @@ impl Renderer {
             }
             let Some(identity) = a.config.source_identity else { continue };
             let template=&self.templates.by_id[&a.effect];
-            if a.config.track_source && uses_common_source_header(template.kind) && template.words[0]&1 !=0 && a.beam.is_none() && (a.mesh.is_none() || template.kind==1029) {
+            if a.config.track_source && uses_common_source_header(template.kind) && template.word(0).unwrap_or(0)&1 !=0 && a.beam.is_none() && (a.mesh.is_none() || template.kind==1029) {
                 if let Some(source) = self.anchors.get(&(identity,a.attractor)).copied().flatten().or_else(||self.anchors.get(&(identity,0)).copied().flatten()) {
                     a.raw_source=source;
                     let source=if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|1018|1023|3020) {
@@ -604,11 +604,11 @@ impl Renderer {
         if let Some(projectile)=&mut a.projectile {projectile.terminate_gracefully();return;}
         if let Some(ground)=&mut a.ground_impact {ground.terminate_gracefully();return;}
         if matches!(kind,1005|1006) {
-            let life = if kind == 1006 { a.config.duration.map(|d| d*0.8).unwrap_or(f32::from_bits(t.words[34])) } else { f32::from_bits(t.words[35]) };
+            let life = if kind == 1006 { a.config.duration.map(|d| d*0.8).unwrap_or(f32::from_bits(t.word(34).unwrap_or(0))) } else { f32::from_bits(t.word(35).unwrap_or(0)) };
             a.stop_at = Some(a.elapsed+life);
         } else if matches!(kind,1009|1018) {
             // GC100f0352 / 100f0f33: stop emission, retain the native lifetime tail.
-            let life=f32::from_bits(t.words[if kind==1018 {35}else{26}]);
+            let life=f32::from_bits(t.word(if kind==1018 {35}else{26}).unwrap_or(0));
             if let Some(sprite) = &mut a.sprite { sprite.configure(EffectConfig {duration:Some(a.elapsed+life),..a.config}); }
             a.stop_at = Some(a.elapsed+life);
         } else if kind == 3028 {
@@ -851,7 +851,7 @@ impl Renderer {
                 }
             }
         }
-        if let Some(mesh)=&tracer_mesh {self.prepare_mesh_children(actor,actor,mesh.record_id())?;}
+        if let Some(record)=tracer_mesh.as_ref().and_then(|mesh|mesh.record_id()) {self.prepare_mesh_children(actor,actor,record)?;}
         if let Some(mesh)=&mparticle {for (index,(resource,_,_)) in mesh.instances().enumerate() {self.prepare_mesh_children(actor,actor+index as u32,mesh.resources()[resource].0)?;}}
         self.active.push(Active { actor,enabled:true,native_terminated,effect: binding.effect, source, raw_source,target, elapsed: 0.0, color: binding.color, particles, emitted, next_burst: -1.0, repetitions, config, beam, stop_at: None, ticks:0,sprite,control:controller,attractor,composition,mesh,tracer_mesh,aux:auxiliary,particle,particle2,native_replicated,buff,global,nightvision,bparticle,nano2,mesh_test,mparticle,buffer,projectile,ground_impact,tower });
         Ok(actor)
@@ -878,13 +878,16 @@ impl Renderer {
         let mut vertices=Vec::new();
         let mut submeshes=Vec::new();
         for ((material,indices,count),blend) in buff.models().into_iter().zip(buff.blends()) {
-            let key=if let Some(key)=buff.source_texture() {Some(key)} else if let Some(material)=material {
+            let mut key=if let Some(key)=buff.source_texture() {Some(key)} else if let Some(material)=material {
                 let &(name,_,_,_,_)=materials::MATERIALS.get(material).context("unknown buff material")?;
-                Some(TextureKey {rdb_type:1010004,id:names.id(1010004,name).with_context(||format!("missing buff texture {name}"))?})
+                names.id(1010004,name).map(|id|TextureKey {rdb_type:1010004,id})
             } else {None};
-            if let Some(key)=key.filter(|key|!cached.is_some_and(|scene|scene.textures.contains_key(key))) {
-                if let std::collections::hash_map::Entry::Vacant(entry)=scene.textures.entry(key) {
-                    entry.insert(ao_formats::texture::load_texture(store,key)?.with_context(||format!("missing buff texture {}",key.id))?);
+            if let Some(texture_key)=key.filter(|key|!cached.is_some_and(|scene|scene.textures.contains_key(key))&&!scene.textures.contains_key(key)) {
+                // GC10106e2e creates the material even when GetSync returns null:
+                // retain its geometry with no texture, never invent replacement art.
+                match ao_formats::texture::load_texture(store,texture_key)? {
+                    Some(texture)=>{scene.textures.insert(texture_key,texture);}
+                    None=>key=None,
                 }
             }
             let offset=vertices.len() as u32;
@@ -1186,7 +1189,7 @@ impl Renderer {
                     Err(error)=>{eprintln!("buff vertices: {error:#}");return false;},
                 }
             }
-            let duration = effect.stop_at.unwrap_or_else(|| if template.kind == 1006 { f32::from_bits(template.words[8]) } else { effect.config.duration.unwrap_or(f32::from_bits(template.words[8])) });
+            let duration = effect.stop_at.unwrap_or_else(|| if template.kind == 1006 { f32::from_bits(template.word(8).unwrap_or(0)) } else { effect.config.duration.unwrap_or(f32::from_bits(template.word(8).unwrap_or(0))) });
             if effect.control.is_none() && effect.composition.is_none() && effect.native_replicated.is_none() && effect.particle.is_none() && effect.particle2.is_none() && duration > 0.0 && effect.elapsed > duration { return false; }
             let mut skin = Vec::with_capacity(self.models[&effect.effect].scene.meshes[0].vertices.len());
             if let Some(n)=&mut effect.nano2 {
@@ -1236,7 +1239,7 @@ impl Renderer {
                 let capacity = self.models[&effect.effect].scene.meshes[0].vertices.len()/4;
                 effect.particles.retain(|p| effect.elapsed-p.born <= p.life);
                 emit_sprites(template, effect, &mut self.rng, &mut self.random, capacity, step);
-                let material = template.words[9] as usize;
+                let material = template.word(9).unwrap_or(0) as usize;
                 let (_, columns, rows, first, last) = materials::MATERIALS[material];
                 let mut alive = false;
                 for p in &effect.particles {
@@ -1245,7 +1248,7 @@ impl Renderer {
                     let live = age <= p.life;
                     alive |= live;
                     let radius = lerp(template, 12, 13, t)*p.radius_scale;
-                    let transform = if template.words[0]&2 != 0 { effect.source } else { Mat4::IDENTITY };
+                    let transform = if template.word(0).unwrap_or(0)&2 != 0 { effect.source } else { Mat4::IDENTITY };
                     let p_world = transform.transform_point3(p.position+p.velocity_p*age);
                     let q_world = transform.transform_point3(p.position+p.velocity_q*age);
                     let view = |p: Vec3| { let d=p-camera; glam::Vec2::new(d.dot(right),d.dot(up))/d.dot(forward) };
@@ -1257,7 +1260,7 @@ impl Renderer {
                     let uv = [[x as f32/columns as f32,(y+1) as f32/rows as f32], [x as f32/columns as f32,y as f32/rows as f32], [(x+1) as f32/columns as f32,(y+1) as f32/rows as f32], [(x+1) as f32/columns as f32,y as f32/rows as f32]];
                     let mut color = tint(template, effect.color, t, 16);
                     if effect.config.start_color.is_some() || effect.config.stop_color.is_some() {
-                        let native = |offset| [f32::from_bits(template.words[offset+1]),f32::from_bits(template.words[offset+2]),f32::from_bits(template.words[offset+3]),f32::from_bits(template.words[offset])];
+                        let native = |offset| [f32::from_bits(template.word(offset+1).unwrap_or(0)),f32::from_bits(template.word(offset+2).unwrap_or(0)),f32::from_bits(template.word(offset+3).unwrap_or(0)),f32::from_bits(template.word(offset).unwrap_or(0))];
                         let start = effect.config.start_color.unwrap_or_else(|| native(16));
                         let stop = effect.config.stop_color.unwrap_or_else(|| native(20));
                         color = std::array::from_fn(|i| start[i]+(stop[i]-start[i])*t);
@@ -1267,7 +1270,7 @@ impl Renderer {
                     quad(&mut skin, [p_world-a-b, p_world-a+b, q_world+a-b, q_world+a+b], uv, color);
                 }
                 while skin.len() < capacity*4 { skin.push(Vertex { color:[0.0;4],..Vertex::default() }); }
-                if !alive && template.kind == 1005 && template.words[0]&0x200 != 0 { return false; }
+                if !alive && template.kind == 1005 && template.word(0).unwrap_or(0)&0x200 != 0 { return false; }
             }
             // Dynamic world-space skin has no useful bind-pose sphere (actors.rs:191).
             host.actors.push(ActorFrame { id: effect.actor, model: MODEL_BASE | effect.effect as u32 as u64, transform: IDENTITY, parts: vec![], skin: Some(skin), always: true, alpha: 1.0, priority:native_priority(template.kind), ..Default::default() });
@@ -1318,7 +1321,6 @@ fn native_priority(kind:i32)->Option<i32> {match kind {1017|2015|3024|3030=>Some
 // GC100dcc70: capacity=max(initial count,trunc(rate*1.5*maximum life)).
 fn sprite_capacity(template: &Template) -> Result<usize> {
     let end = if template.kind == 1006 { 38 } else { 36 };
-    ensure!(template.words.len() >= end, "short sprite template");
     for i in 1..end {
         if !matches!(i, 7 | 9 | 24 | 31 | 37) { template.float(i)?; }
     }
@@ -1337,7 +1339,7 @@ pub(super) fn random_fraction(random:&mut R250)->f32 {
 }
 
 fn sprite(template: &Template, rng: &mut R250, born: f32, dt: f32, star: Option<(f32, f32, f32)>) -> Particle {
-    let f = |i| f32::from_bits(template.words[i]);
+    let f = |i| f32::from_bits(template.word(i).unwrap_or(0));
     let mut random = || random_fraction(rng);
     let (az, el, speed, life, radius_scale) = if let Some((az,el,speed)) = star {
         (az,el,speed,f(34),f(35))
@@ -1347,7 +1349,7 @@ fn sprite(template: &Template, rng: &mut R250, born: f32, dt: f32, star: Option<
     // GC100dcd93 native Z=-sin(el); effect_matrix conjugates the scene Z mirror,
     // so feed mirrored local Z into the already mirrored connector.
     let velocity = Vec3::new(az.cos()*el.cos(), az.sin()*el.cos(), el.sin())*speed;
-    let (p,q) = if template.words[0]&0x100 == 0 { (f(32),f(33)) } else { (f(33),f(32)) };
+    let (p,q) = if template.word(0).unwrap_or(0)&0x100 == 0 { (f(32),f(33)) } else { (f(33),f(32)) };
     let instant = life < dt*2.0;
     Particle { position: if instant { velocity } else { Vec3::ZERO }, velocity_p: if instant { Vec3::ZERO } else { velocity*(p/life) }, velocity_q: if instant { Vec3::ZERO } else { velocity*(q/life) }, life, born, radius_scale }
 }
@@ -1355,10 +1357,10 @@ fn sprite(template: &Template, rng: &mut R250, born: f32, dt: f32, star: Option<
 // GC 100dd715: cumulative trunc(rate * elapsed), random bit mask w24,
 // and emission stops one maximum lifetime before the control's duration.
 fn emit_sprites(template: &Template, effect: &mut Active, rng: &mut CrtRand, random:&mut R250, capacity: usize, dt: f32) {
-    let f = |i| f32::from_bits(template.words[i]);
+    let f = |i| f32::from_bits(template.word(i).unwrap_or(0));
     if template.kind == 1005 {
         let duration = effect.stop_at.or(effect.config.duration).unwrap_or(f(8));
-        if rng.rand() & template.words[24] != 0 || (duration >= 0.0 && effect.elapsed >= duration-f(35)) { return; }
+        if rng.rand() & template.word(24).unwrap_or(0) != 0 || (duration >= 0.0 && effect.elapsed >= duration-f(35)) { return; }
         let desired = (f(10)*effect.elapsed).trunc() as i64;
         let count = (desired-effect.emitted).max(0) as usize;
         effect.emitted = desired;
@@ -1378,9 +1380,9 @@ fn emit_sprites(template: &Template, effect: &mut Active, rng: &mut CrtRand, ran
             effect.repetitions -= 1;
             for quadrant in 0..4 {
                 let az = quadrant as f32*std::f32::consts::FRAC_PI_2;
-                let rings = if template.words[0]&0x1000 == 0 { [(0.5,0.62831855),(0.75,0.9424779),(1.0,1.2566371)] } else { [(0.75,0.0),(0.7,0.31415927),(1.0,1.335177)] };
+                let rings = if template.word(0).unwrap_or(0)&0x1000 == 0 { [(0.5,0.62831855),(0.75,0.9424779),(1.0,1.2566371)] } else { [(0.75,0.0),(0.7,0.31415927),(1.0,1.335177)] };
                 for (speed, elevation) in rings {
-                    let (az,el) = if template.words[0]&0x800 != 0 {
+                    let (az,el) = if template.word(0).unwrap_or(0)&0x800 != 0 {
                         let el = elevation+random_fraction(random)*0.4-0.2;
                         (az+random_fraction(random)*0.4-0.2,el)
                     } else { (az,elevation) };
@@ -1403,7 +1405,7 @@ fn emit_sprites(template: &Template, effect: &mut Active, rng: &mut CrtRand, ran
 // GC10105eb4/10105e83: bit2 chooses local particles under the live visual transform;
 // without it, birth position and velocity are world-space and never follow later motion.
 fn locate_particle(mut p:Particle,template:&Template,source:Mat4)->Particle {
-    if template.words[0]&2 == 0 {
+    if template.word(0).unwrap_or(0)&2 == 0 {
         p.position=source.transform_point3(p.position);
         p.velocity_p=source.transform_vector3(p.velocity_p);
         p.velocity_q=source.transform_vector3(p.velocity_q);
@@ -1421,14 +1423,14 @@ fn configure_star_life(p: &mut Particle, duration: Option<f32>) {
 }
 
 fn lerp(template: &Template, a: usize, b: usize, t: f32) -> f32 {
-    let a = f32::from_bits(template.words[a]);
-    a+(f32::from_bits(template.words[b])-a)*t
+    let a = f32::from_bits(template.word(a).unwrap_or(0));
+    a+(f32::from_bits(template.word(b).unwrap_or(0))-a)*t
 }
 
 fn tint(template: &Template, override_color: u32, t: f32, first: usize) -> [f32; 4] {
     let rgba = if override_color == 0 {
         if first == 16 { [lerp(template,17,21,t),lerp(template,18,22,t),lerp(template,19,23,t),lerp(template,16,20,t)] }
-        else { [f32::from_bits(template.words[first+1]),f32::from_bits(template.words[first+2]),f32::from_bits(template.words[first+3]),f32::from_bits(template.words[first])] }
+        else { [f32::from_bits(template.word(first+1).unwrap_or(0)),f32::from_bits(template.word(first+2).unwrap_or(0)),f32::from_bits(template.word(first+3).unwrap_or(0)),f32::from_bits(template.word(first).unwrap_or(0))] }
     } else {
         let [a,r,g,b] = override_color.to_be_bytes().map(|v| v as f32/255.0);
         [r,g,b,a*(1.0-t)]
@@ -1713,7 +1715,7 @@ mod tests {
         host.camera = ao_render::Camera::look_at(eye,origin);
         for id in [2000,2601,continuous,2750] {
             renderer.clear();
-            renderer.spawn_configured(Binding { group:0,attractor:0,effect:id,note:0,color:0 },Mat4::from_translation(origin),origin+Vec3::X*4.0,EffectConfig {creation:if id==2750 {Creation::HitLocation}else{Creation::Vector},hit_location:Some((origin,origin+Vec3::X*4.0)),..Default::default()}).unwrap();
+            renderer.spawn_configured(Binding { group:0,attractor:0,effect:id,note:0,color:0 },Mat4::from_translation(origin),origin+Vec3::X*4.0,EffectConfig {creation:if matches!(id,2601|2750) {Creation::HitLocation}else{Creation::Vector},hit_location:Some((origin,origin+Vec3::X*4.0)),..Default::default()}).unwrap();
             let mut previous = 0.0;
             for time in [0.01,0.04,0.08,0.15,0.4] {
                 host.actors.clear();

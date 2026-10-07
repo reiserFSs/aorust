@@ -62,7 +62,7 @@ impl NativeEffect {
         let connector=sprites::connector(&self.template,source)?;
         self.source=connector;Ok(())
     }
-    pub(super) fn needs_source_root(&self)->bool {self.template.kind==3017 && self.template.words[0]&2==0 && self.track_root}
+    pub(super) fn needs_source_root(&self)->bool {self.template.kind==3017 && self.template.word(0).unwrap_or(0)&2==0 && self.track_root}
     pub(super) fn set_source_root(&mut self,source:Mat4) {self.root=Some(source.w_axis.truncate());}
     pub(super) fn set_environment_position(&mut self,position:Vec3) {self.environment=Some(position);}
     pub(super) fn set_source_visible(&mut self,visible:bool) {self.source_visible=visible;}
@@ -86,13 +86,13 @@ impl NativeEffect {
     }
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
         let n=self.facets;
-        let mut models=vec![(Some(self.template.words[9] as usize),indices(n),n as usize*4)];
-        if self.template.kind==3022 && self.template.words[39] as i32>=0 {models.push((Some(self.template.words[39] as usize),indices(1),4));}
+        let mut models=vec![(Some(self.template.word(9).unwrap_or(0) as usize),indices(n),n as usize*4)];
+        if self.template.kind==3022 && self.template.word(39).unwrap_or(0) as i32>=0 {models.push((Some(self.template.word(39).unwrap_or(0) as usize),indices(1),4));}
         models
     }
     pub(super) fn blends(&self)->Vec<Blend> {
-        let additive=if self.template.kind==3017 {self.template.words[10]!=5}else{self.template.words[0]&0x200!=0};
-        let count=1+usize::from(self.template.kind==3022 && self.template.words[39] as i32>=0);
+        let additive=if self.template.kind==3017 {self.template.word(10).unwrap_or(0)!=5}else{self.template.word(0).unwrap_or(0)&0x200!=0};
+        let count=1+usize::from(self.template.kind==3022 && self.template.word(39).unwrap_or(0) as i32>=0);
         vec![if additive {Blend::Additive}else{Blend::AlphaBlend};count]
     }
     #[allow(clippy::too_many_arguments)]

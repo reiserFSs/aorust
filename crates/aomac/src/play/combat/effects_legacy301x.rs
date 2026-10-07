@@ -26,25 +26,25 @@ impl GroundRing {
         for i in [8,11,12,13,14,15,16,19] {t.float(i)?;}
         ensure!((1..=32766).contains(&t.word(10)?),"invalid GroundRing segments");
         let source=super::sprites::connector(t,source)?;
-        Ok(Self {t:t.clone(),source,center:source.w_axis.truncate(),positions:Vec::with_capacity((t.words[10] as usize+1)*2),elapsed:0.0,started:0,stopped:false,duration:t.float(8)?})
+        Ok(Self {t:t.clone(),source,center:source.w_axis.truncate(),positions:Vec::with_capacity((t.word(10).unwrap_or(0) as usize+1)*2),elapsed:0.0,started:0,stopped:false,duration:t.float(8)?})
     }
     // Native explicit position/matrix setters reject updates; dynel locator refresh is separate.
     pub(super) fn update_source(&mut self,m:Mat4)->Result<()> {self.source=super::sprites::connector(&self.t,m)?;Ok(())}
-    pub(super) fn invalidate_source(&mut self) {if self.t.words[0]&0x1000==0 {self.stopped=true;}}
+    pub(super) fn invalidate_source(&mut self) {if self.t.word(0).unwrap_or(0)&0x1000==0 {self.stopped=true;}}
     pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {self.duration=d;}}
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {step(&mut self.started,&mut self.elapsed,dt)?;Ok(!self.stopped && (self.duration<=0.0 || self.elapsed<=self.duration))}
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
         // GC10106f39 returns null for material IDs >127, including authored100000.
-        vec![((self.t.words[9]<=127).then_some(self.t.words[9] as usize),strip(self.t.words[10]),(self.t.words[10] as usize+1)*2)]
+        vec![((self.t.word(9).unwrap_or(0)<=127).then_some(self.t.word(9).unwrap_or(0) as usize),strip(self.t.word(10).unwrap_or(0)),(self.t.word(10).unwrap_or(0) as usize+1)*2)]
     }
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.t.words[0]&0x400!=0 {Blend::AlphaBlend}else{Blend::Additive}]}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.t.word(0).unwrap_or(0)&0x400!=0 {Blend::AlphaBlend}else{Blend::Additive}]}
     pub(super) fn vertices(&mut self,ground:&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.stopped {return Ok(None)}
         let t=&self.t;
-        if self.positions.is_empty() || t.words[0]&0x800==0 {
-            if t.words[0]&0x800==0 {self.center=self.source.w_axis.truncate();}self.positions.clear();
-            for i in 0..=t.words[10] {let a=std::f32::consts::TAU*i as f32/t.words[10] as f32;
+        if self.positions.is_empty() || t.word(0).unwrap_or(0)&0x800==0 {
+            if t.word(0).unwrap_or(0)&0x800==0 {self.center=self.source.w_axis.truncate();}self.positions.clear();
+            for i in 0..=t.word(10).unwrap_or(0) {let a=std::f32::consts::TAU*i as f32/t.word(10).unwrap_or(0) as f32;
                 for end in 0..2 {let mut p=self.center+Vec3::new(a.cos()*t.float(13+end)?,0.0,-a.sin()*t.float(13+end)?);
                     p.y=ground(p).map_or(0.0,|(p,_)|p.y)+t.float(19)?;self.positions.push(p);}
             }
@@ -52,9 +52,9 @@ impl GroundRing {
         let fade=if self.elapsed<t.float(15)? {self.elapsed/t.float(15)?}else if self.elapsed< t.float(8)?-t.float(16)? {1.0}else{1.0-(self.elapsed-(t.float(8)?-t.float(16)?))/t.float(16)?};
         let mut v=Vec::with_capacity(self.positions.len());
         for (i,&p) in self.positions.iter().enumerate() {
-            let end=i&1;let mut c=super::buff300x::packed_color(t.words[17+end]);
-            c[3]=((t.words[17+end]>>24) as f32*fade) as u8 as f32/255.0;
-            let uv=if t.words[0]&0x100!=0 {[(i/2) as f32/t.words[10] as f32*t.float(11)?,end as f32*t.float(12)?]}else{[p.x*t.float(11)?,-p.z*t.float(12)?]};
+            let end=i&1;let mut c=super::buff300x::packed_color(t.word(17+end).unwrap_or(0));
+            c[3]=((t.word(17+end).unwrap_or(0)>>24) as f32*fade) as u8 as f32/255.0;
+            let uv=if t.word(0).unwrap_or(0)&0x100!=0 {[(i/2) as f32/t.word(10).unwrap_or(0) as f32*t.float(11)?,end as f32*t.float(12)?]}else{[p.x*t.float(11)?,-p.z*t.float(12)?]};
             v.push(Vertex {pos:p.to_array(),normal:[0.0,1.0,0.0],uv,color:c});
         }
         Ok(Some(vec![v]))
@@ -74,7 +74,7 @@ impl Bubble {
     pub(super) fn invalidate_source(&mut self) {self.stopped=true;}
     pub(super) fn configure(&mut self,c:EffectConfig) {
         if let Some(d)=c.duration {self.duration=d;}
-        for (at,color) in [(13,c.start_color),(17,c.stop_color)] {if let Some([r,g,b,a])=color {for (i,v) in [a,r,g,b].into_iter().enumerate() {self.t.words[at+i]=v.to_bits();}}}
+        for (at,color) in [(13,c.start_color),(17,c.stop_color)] {if let Some([r,g,b,a])=color {for (i,v) in [a,r,g,b].into_iter().enumerate() {{ self.t.words.resize(self.t.words.len().max((at+i) + 1), 0); *self.t.words.get_mut(at+i).unwrap() = v.to_bits(); };}}}
         // Native setters change the range only; existing sprites keep their creation colour.
     }
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
@@ -85,7 +85,7 @@ impl Bubble {
         let mode=self.t.words.get(25).copied().unwrap_or(0);
         let mut count=u32::from(self.last_emit+self.t.float(22)?<self.elapsed);
         if self.burst>0 {count+=3;self.burst-=3;}
-        if self.last_burst+(if mode==1 {2.0}else{5.0})*self.t.float(22)?<self.elapsed {self.last_burst=self.elapsed;self.burst=self.t.words[24] as i32;}
+        if self.last_burst+(if mode==1 {2.0}else{5.0})*self.t.float(22)?<self.elapsed {self.last_burst=self.elapsed;self.burst=self.t.word(24).unwrap_or(0) as i32;}
         if self.stopped {count=0;}
         for p in &mut self.particles {
             if !p.active {if count>0 {p.position=Vec3::ZERO;p.velocity=Vec3::Y;p.born=self.elapsed;p.size=crt.rand() as f32*self.t.float(12)?/32768.0;p.frame=5;p.active=true;count-=1;self.last_emit=self.elapsed;}}
@@ -97,10 +97,10 @@ impl Bubble {
         }
         Ok(true)
     }
-    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.t.words[9] as usize),(0..25).flat_map(|i|[i*4,i*4+1,i*4+2,i*4+1,i*4+2,i*4+3]).collect(),100)]}
+    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.t.word(9).unwrap_or(0) as usize),(0..25).flat_map(|i|[i*4,i*4+1,i*4+2,i*4+1,i*4+2,i*4+3]).collect(),100)]}
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::AlphaBlend]}
     pub(super) fn vertices(&self,right:Vec3,up:Vec3)->Result<Option<Vec<Vec<Vertex>>>> {
-        let &(..,columns,rows,_,_)=super::materials::MATERIALS.get(self.t.words[9] as usize).ok_or_else(||anyhow::anyhow!("unknown Bubble material"))?;
+        let &(..,columns,rows,_,_)=super::materials::MATERIALS.get(self.t.word(9).unwrap_or(0) as usize).ok_or_else(||anyhow::anyhow!("unknown Bubble material"))?;
         let mut out=Vec::with_capacity(100);let mode=self.t.words.get(25).copied().unwrap_or(0);
         for p in &self.particles {
             if !p.active {continue;}
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     #[ignore="installed authored3012/3013/3016 assets and offscreen GPU"]
     fn retail_legacy301x_authored_frames()->Result<()> {
-        use super::super::MODEL_BASE;
+        use super::super::{MODEL_BASE,MESH_MODEL_BASE};
         use anyhow::Context;
         let out=std::path::PathBuf::from(std::env::var_os("AOMAC_EFFECT_FRAMES").context("AOMAC_EFFECT_FRAMES required")?);
         std::fs::create_dir_all(&out)?;
@@ -239,11 +239,24 @@ mod tests {
                 let mut ground=|p:Vec3|Some((Vec3::new(p.x,10.0,p.z),Vec3::Y));
                 r.frame(1.0/60.0,&mut host,Some(&mut ground));
                 if [1,15,30,60,120,240,600,660].contains(&frame) {
-                    let models:Vec<_>=r.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                    let mut models:Vec<_>=r.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
+                    models.extend(r.buff_models.iter().map(|(&id,m)|(0xfac2_0000_0000_0000|u64::from(id),m.scene.clone())));
+                    models.extend(r.mesh_resources.iter().map(|(&id,m)|(MESH_MODEL_BASE|u64::from(id),(**m).clone())));
                     ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy301x_{id}_{frame}.png")),frame as f32/60.0)?;
                 }
             }
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn short_ring_defaults_missing_colors_to_zero() {
+    let mut words=vec![0;11];words[10]=3;
+    let mut effect=GroundRing::new(&Template {kind:3012,words},Mat4::IDENTITY).unwrap();
+    let vertices=effect.vertices(&mut |p|Some((p,Vec3::Y))).unwrap().unwrap();
+    assert!(vertices[0].iter().all(|v|v.color==[0.0;4]));
+    assert_eq!(effect.t.float(19).unwrap(),0.0);
+    assert_eq!(effect.models()[0].0,Some(0));
 }

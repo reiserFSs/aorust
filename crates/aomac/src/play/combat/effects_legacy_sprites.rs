@@ -17,7 +17,7 @@ pub(super) struct Drips {
 }
 impl Drips {
     pub fn new(template: &Template, source: Mat4) -> Result<Self> {
-        ensure!(template.kind == 2009 && template.words.len() >= 25, "invalid Drips template");
+        ensure!(template.kind == 2009, "invalid Drips template");
         for i in 11..25 { template.float(i)?; }
         ensure!(template.float(23)? > 0.0 && template.float(24)? > 0.0, "invalid Drips animation period");
         ensure!((template.word(9)? as usize) < materials::MATERIALS.len(), "unknown Drips material");
@@ -27,9 +27,9 @@ impl Drips {
             last_spawn: 0.0, stop: (duration >= 0.0).then_some(duration), _terminating: false })
     }
     pub fn configure(&mut self, config: EffectConfig) { if let Some(d) = config.duration { self.stop = (d >= 0.0).then_some(d); } }
-    pub fn update_source(&mut self, source: Mat4) -> Result<()> { if self.template.words[0] & 1 != 0 { self.source = super::sprites::connector(&self.template,source)?; } Ok(()) }
+    pub fn update_source(&mut self, source: Mat4) -> Result<()> { if self.template.word(0).unwrap_or(0) & 1 != 0 { self.source = super::sprites::connector(&self.template,source)?; } Ok(()) }
     pub fn terminate_gracefully(&mut self) { self._terminating = true; }
-    pub fn material(&self) -> usize { self.template.words[9] as usize }
+    pub fn material(&self) -> usize { self.template.word(9).unwrap_or(0) as usize }
     pub fn blend(&self) -> Blend { Blend::AlphaBlend }
     /// Native acceleration is per Process, not dt-scaled (100d884a).
     pub fn advance(&mut self, dt: f32, valid: bool, mut ground: impl FnMut(Vec3)->f32) -> Result<bool> {
@@ -88,12 +88,12 @@ impl Drips {
 pub(super) struct Hexagram { template: Template, source: Mat4, anchor: Vec3, elapsed: f32, _duration: f32, terminated: bool }
 impl Hexagram {
     pub fn new(t: &Template, source: Mat4, mut ground: impl FnMut(Vec3)->f32) -> Result<Self> {
-        ensure!(t.kind == 2008 && t.words.len() >= 32, "invalid Hexagram template");
+        ensure!(t.kind == 2008, "invalid Hexagram template");
         for i in [8,11,12,15,16,17,18,19,20,21,22,23,30,31] { t.float(i)?; }
         ensure!(t.word(10)? > 0 && t.word(10)? <= 1024 && t.word(13)? <= 1024 && t.word(14)? >= 1, "invalid Hexagram geometry");
         let source = super::sprites::connector(t,source)?;
         let mut anchor = source.w_axis.truncate();
-        if t.words[0]&0x4000 != 0 { anchor.y = ground(anchor); }
+        if t.word(0).unwrap_or(0)&0x4000 != 0 { anchor.y = ground(anchor); }
         Ok(Self {template:t.clone(),source,anchor,elapsed:0.0,_duration:t.float(8)?,terminated:false})
     }
     pub fn configure(&mut self, c: EffectConfig) { if let Some(d) = c.duration { self._duration = d; } }
@@ -102,14 +102,14 @@ impl Hexagram {
     pub fn frame(&mut self, dt: f32) -> bool {
         self.elapsed += dt;
         // Process100e2069 overrides the base duration-end byte while a ring remains.
-        !self.terminated && self.elapsed < f32::from_bits(self.template.words[11])+f32::from_bits(self.template.words[12])+self.template.words[10] as f32*f32::from_bits(self.template.words[31])
+        !self.terminated && self.elapsed < f32::from_bits(self.template.word(11).unwrap_or(0))+f32::from_bits(self.template.word(12).unwrap_or(0))+self.template.word(10).unwrap_or(0) as f32*f32::from_bits(self.template.word(31).unwrap_or(0))
     }
     pub fn models(&self) -> Vec<(Option<usize>,Vec<u32>,usize)> {
-        let n = self.template.words[14];
+        let n = self.template.word(14).unwrap_or(0);
         let indices = (0..n*2).flat_map(|i|if i&1 == 0 {[i,i+1,i+2]}else{[i+1,i,i+2]}).collect::<Vec<_>>();
-        (0..self.template.words[10]*self.template.words[13]).map(|_|(Some(self.template.words[9] as usize),indices.clone(),(n as usize+1)*2)).collect()
+        (0..self.template.word(10).unwrap_or(0)*self.template.word(13).unwrap_or(0)).map(|_|(Some(self.template.word(9).unwrap_or(0) as usize),indices.clone(),(n as usize+1)*2)).collect()
     }
-    pub fn blends(&self) -> Vec<Blend> { vec![if self.template.words[0]&0x200 != 0 {Blend::Additive}else{Blend::AlphaBlend}; (self.template.words[10]*self.template.words[13]) as usize] }
+    pub fn blends(&self) -> Vec<Blend> { vec![if self.template.word(0).unwrap_or(0)&0x200 != 0 {Blend::Additive}else{Blend::AlphaBlend}; (self.template.word(10).unwrap_or(0)*self.template.word(13).unwrap_or(0)) as usize] }
     pub fn vertices(&mut self, valid: bool, mut ground: impl FnMut(Vec3)->f32) -> Result<Option<Vec<Vec<Vertex>>>> {
         let t = &self.template; let flags = t.word(0)?;
         let rise = t.float(11)?; let fall = t.float(12)?;
@@ -168,7 +168,7 @@ pub(super) struct MeshTest {
 }
 impl MeshTest {
     pub fn new(t:&Template,source:Mat4,store:&ao_rdb::RecordStore,names:&ao_formats::character::NameTable,random:&mut ao_formats::weather::R250,crt:&mut ao_formats::character::CrtRand,cache:&mut std::collections::HashMap<u32,std::sync::Arc<ao_scene::Scene>>)->Result<Self> {
-        ensure!(t.kind==1028 && t.words.len()>=10,"invalid MeshTest template");
+        ensure!(t.kind==1028,"invalid MeshTest template");
         let source=super::sprites::connector(t,source)?;
         let mut resources=Vec::with_capacity(8);
         for selector in 11..=18 {
@@ -272,7 +272,7 @@ mod tests {
         rocks.terminate_gracefully();assert!(!rocks.frame(0.0,&mut random,|_|0.0));
         let sprite_template=table.by_id.values().find(|t|t.kind==1012).unwrap();
         for selector in [1,2] {
-            let mut t=sprite_template.clone();t.words[10]=(t.words[10]&!3)|selector;
+            let mut t=sprite_template.clone();{ t.words.resize(t.words.len().max((10) + 1), 0); *t.words.get_mut(10).unwrap() = (t.word(10).unwrap_or(0)&!3)|selector; };
             let mut sprite=super::super::sprites::SpriteEffect::new_with_id(0,&t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut random)?;
             assert!(sprite.vertices(0.0,Vec3::Z,Vec3::X,Vec3::Y,&mut random,&mut ao_formats::weather::R250::new(8),&mut crt)?.is_none());
         }
@@ -302,4 +302,15 @@ mod tests {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn short_hexagram_defaults_missing_fields_to_zero() {
+    let mut words=vec![0;15];words[10]=1;words[13]=1;words[14]=3;
+    let mut effect=Hexagram::new(&Template {kind:2008,words},Mat4::IDENTITY,|_|0.0).unwrap();
+    assert_eq!(effect.template.float(31).unwrap(),0.0);
+    assert!(!effect.frame(0.0));
+    assert_eq!(effect.models().len(),1);
+    assert_eq!(effect.blends(),vec![Blend::AlphaBlend]);
 }

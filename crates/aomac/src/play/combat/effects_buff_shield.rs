@@ -13,7 +13,7 @@ pub(super) struct Shield {
 }
 impl Shield {
     pub(super) fn new(t:&Template,source:Mat4,c:EffectConfig)->Result<Self> {
-        ensure!(t.kind==3003,"not a shield template");t.word(31)?;
+        ensure!(t.kind==3003,"not a shield template");
         for i in [8,11,12,13,14,15,16,17,19,20,21,22,23,24,25,27,28,30,31] {t.float(i)?;}
         ensure!(t.word(18)?<=2,"invalid native shield UV mode");
         ensure!(t.word(26)?<=2 && t.word(29)?<=3,"invalid native shield time mode");
@@ -21,7 +21,7 @@ impl Shield {
         Ok(Self {template:t.clone(),source,identity,vertices:Vec::new(),indices:Vec::new(),source_material:None,elapsed:0.0,duration:c.duration.unwrap_or(t.float(8)?),started:false,terminating:None,terminated:false})
     }
     pub(super) fn identity(&self)->(u32,u32) {self.identity}
-    pub(super) fn uses_source_material(&self)->bool {self.template.words[0]&0x10000!=0}
+    pub(super) fn uses_source_material(&self)->bool {self.template.words.get(0).copied().unwrap_or(0)&0x10000!=0}
     pub(super) fn update_source(&mut self,source:Mat4) {self.source=source;}
     pub(super) fn update_mesh(&mut self,vertices:&[Vertex],indices:&[u32],material:Option<usize>)->Result<()> {
         ensure!(indices.iter().all(|&i|(i as usize)<vertices.len()),"invalid Shield source indices");
@@ -36,7 +36,7 @@ impl Shield {
     }
     pub(super) fn terminate_gracefully(&mut self) {
         if self.terminating.is_none() {
-            let low=f32::from_bits(self.template.words[27]);let high=f32::from_bits(self.template.words[28]);
+            let low=f32::from_bits(self.template.words.get(27).copied().unwrap_or(0));let high=f32::from_bits(self.template.words.get(28).copied().unwrap_or(0));
             let phase=if low<high {self.elapsed%(high-low)+low}else{self.elapsed};
             self.terminating=Some((self.elapsed,phase));
         }
@@ -44,17 +44,17 @@ impl Shield {
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {
         ensure!(dt.is_finite() && dt>=0.0,"invalid Shield timestep");
         if self.started {self.elapsed+=dt;} else {self.started=true;}
-        let fade=f32::from_bits(self.template.words[30]);
+        let fade=self.template.float(30)?;
         if let Some((start,_))=self.terminating {if self.elapsed-start>=fade {self.terminated=true;}}
         if self.duration>0.0 && self.elapsed>self.duration-fade {self.terminate_gracefully();}
         Ok(!self.terminated)
     }
     pub(super) fn alive(&self)->bool {!self.terminated}
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
-        let material=if self.template.words[0]&0x10000!=0 {self.source_material}else{Some(self.template.words[9] as usize)};
+        let material=if self.uses_source_material() {self.source_material}else{Some(self.template.words.get(9).copied().unwrap_or(0) as usize)};
         vec![(material,self.indices.clone(),self.vertices.len())]
     }
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words[0]&0x400!=0 {Blend::Additive}else{Blend::AlphaBlend}]}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words.get(0).copied().unwrap_or(0)&0x400!=0 {Blend::Additive}else{Blend::AlphaBlend}]}
     pub(super) fn vertices(&mut self)->Result<Option<Vec<Vec<Vertex>>>> {
         if !self.alive() {return Ok(None);}
         let t=&self.template;let flags=t.word(0)?;
@@ -97,6 +97,13 @@ impl Shield {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn short_shield_zero_defaults_cover_frame_and_graceful_stop() -> Result<()> {
+        let mut s=Shield::new(&Template {kind:3003,words:vec![]},Mat4::IDENTITY,EffectConfig {source_identity:Some((50000,1)),..Default::default()})?;
+        assert!(!s.uses_source_material());assert_eq!(s.models()[0].0,Some(0));assert_eq!(s.blends(),vec![Blend::AlphaBlend]);
+        assert!(s.frame(0.0)?);assert!(s.vertices()?.unwrap()[0].is_empty());
+        s.terminate_gracefully();assert_eq!(s.terminating,Some((0.0,0.0)));assert!(!s.frame(0.0)?);Ok(())
+    }
     #[test]
     fn shield_uses_posed_normals_and_native_fade() {
         let mut words=vec![0;32];words[0]=0x400;words[8]=(-1.0f32).to_bits();words[9]=13;words[10]=u32::MAX;

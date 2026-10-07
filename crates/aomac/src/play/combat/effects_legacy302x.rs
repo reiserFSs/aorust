@@ -32,7 +32,9 @@ impl MParticle {
         let count=t.word(11)? as usize;ensure!(count<=65535,"invalid MParticle capacity");
         let mut resources=Vec::with_capacity(n);
         for name in resource_names {
-            let id=names.id(MESH_TYPE,name).with_context(||format!("missing MParticle mesh {name}"))?;
+            // GC1010ef6f returns zero on absent name;1010fcd8 still allocates
+            // and passes Identity{1010001,0} to SetMesh (unlike3025).
+            let id=names.id(MESH_TYPE,name).unwrap_or(0);
             // GC1010fcd8 allocates every VisualMesh before asynchronous SetMesh.
             let mut scene=Scene::default();
             if let Some(mesh)=decode_mesh_into(store,id,&mut scene)? {
@@ -42,11 +44,11 @@ impl MParticle {
         }
         let mut t=t.clone();
         // GC1010f09d chooses the zero-axis replacement at construction.
-        if t.float(23)?==0.0&&t.float(24)?==0.0&&t.float(25)?==0.0 {for i in 23..=25 {t.words[i]=(fraction(r)*2.0-1.0).to_bits();}}
+        if t.float(23)?==0.0&&t.float(24)?==0.0&&t.float(25)?==0.0 {for i in 23..=25 {{ t.words.resize(t.words.len().max((i) + 1), 0); *t.words.get_mut(i).unwrap() = (fraction(r)*2.0-1.0).to_bits(); };}}
         let particles=(0..count).map(|_|MeshParticle {resource:crt.rand() as usize%n,position:Vec3::ZERO,velocity:Vec3::ZERO,axis:Vec3::Y,angle:0.0,spin:0.0,scale:0.0,remaining:0.0,life:0.0,alpha:0.0}).collect();
         Ok(Self {t,source,elapsed:0.0,emission:0.0,started:false,particles,resources})
     }
-    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {self.t.words[8]=d.to_bits();}}
+    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {{ self.t.words.resize(self.t.words.len().max((8) + 1), 0); *self.t.words.get_mut(8).unwrap() = d.to_bits(); };}}
     pub(super) fn update_source(&mut self,m:Mat4) {self.source=m;}
     pub(super) fn resources(&self)->&[(u32,Arc<Scene>)] {&self.resources}
     pub(super) fn actor_count(&self)->usize {self.particles.len()}
@@ -71,10 +73,10 @@ impl MParticle {
     pub(super) fn frame(&mut self,dt:f32,r:&mut R250,ground:&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>)->Result<bool> {
         ensure!(dt.is_finite()&&dt>=0.0,"invalid MParticle timestep");self.elapsed+=dt;self.emission+=dt;
         let mut source=self.source;
-        if self.t.words[0]&0x100!=0 {source.w_axis.y=ground(source.w_axis.truncate()).map_or(0.0,|(p,_)|p.y);}
+        if self.t.word(0).unwrap_or(0)&0x100!=0 {source.w_axis.y=ground(source.w_axis.truncate()).map_or(0.0,|(p,_)|p.y);}
         if !self.started {
             for p in &mut self.particles {Self::reset(&self.t,p,source,r,false)?;}
-            if self.t.words[9]==1 {for (i,p) in self.particles.iter_mut().enumerate(){p.remaining=if i==0 {self.t.float(29)?}else{0.0};}}
+            if self.t.word(9).unwrap_or(0)==1 {for (i,p) in self.particles.iter_mut().enumerate(){p.remaining=if i==0 {self.t.float(29)?}else{0.0};}}
             self.started=true;
         }
         let mut alive=false;
@@ -82,7 +84,7 @@ impl MParticle {
             p.remaining-=dt;
             if p.remaining<=0.0 {p.remaining=0.0;p.alpha=0.0;continue;}
             alive=true;
-            if self.t.words[0]&0x800!=0 && p.position.y<=ground(p.position).map_or(0.0,|(p,_)|p.y) {
+            if self.t.word(0).unwrap_or(0)&0x800!=0 && p.position.y<=ground(p.position).map_or(0.0,|(p,_)|p.y) {
                 let friction=self.t.float(32)?;p.velocity.x-=friction*p.velocity.x*dt*100.0;p.velocity.y*=friction*dt*-100.0;p.velocity.z-=friction*p.velocity.z*dt*100.0;
                 p.spin=range(r,self.t.float(26)?.to_radians(),self.t.float(27)?.to_radians())*(p.velocity.y*0.1).abs()*friction;
             }
@@ -90,7 +92,7 @@ impl MParticle {
             let phase=1.0-p.remaining/p.life;
             p.alpha=if phase<self.t.float(14)? {phase/self.t.float(14)?}else if phase>1.0-self.t.float(15)? {1.0-(phase-(1.0-self.t.float(15)?))/self.t.float(15)?}else{1.0};
         }
-        if self.t.words[9]==0 {return Ok(alive);}
+        if self.t.word(9).unwrap_or(0)==0 {return Ok(alive);}
         let duration=self.t.float(8)?;
         if duration>0.0&&self.elapsed>=duration {return Ok(false);}
         if self.elapsed<duration-self.t.float(29)? && self.t.float(12)?>0.0 && self.emission>self.t.float(12)? {
@@ -116,19 +118,19 @@ impl EnergyBall {
         ensure!((1..=1024).contains(&t.word(12)?)&&t.word(22)?<=2,"invalid EnergyBall mode/count");
         let mut position=source.w_axis.truncate();
         if t.float(26)?>0.0 {position+=Vec3::new(fraction(r)*2.0-1.0,fraction(r)*2.0-1.0,-(fraction(r)*2.0-1.0))*t.float(26)?;}
-        if t.words[0]&0x2000!=0 {position.y=ground(position).map_or(0.0,|(p,_)|p.y);}
+        if t.word(0).unwrap_or(0)&0x2000!=0 {position.y=ground(position).map_or(0.0,|(p,_)|p.y);}
         Ok(Self {t:t.clone(),source,position,elapsed:0.0,started:false})
     }
     pub(super) fn update_source(&mut self,m:Mat4) {self.source=m;}
-    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {self.t.words[8]=d.to_bits();}}
-    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.t.words[9] as usize),(0..self.t.words[12]*3).flat_map(|i|[i*4,i*4+1,i*4+2,i*4+2,i*4+1,i*4+3]).collect(),self.t.words[12] as usize*12)]}
+    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {{ self.t.words.resize(self.t.words.len().max((8) + 1), 0); *self.t.words.get_mut(8).unwrap() = d.to_bits(); };}}
+    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.t.word(9).unwrap_or(0) as usize),(0..self.t.word(12).unwrap_or(0)*3).flat_map(|i|[i*4,i*4+1,i*4+2,i*4+2,i*4+1,i*4+3]).collect(),self.t.word(12).unwrap_or(0) as usize*12)]}
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::Additive]}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {ensure!(dt.is_finite()&&dt>=0.0,"invalid EnergyBall timestep");if self.started {self.elapsed+=dt;}else{self.started=true;}Ok(self.elapsed<self.t.float(10)?+self.t.float(11)? && (self.t.float(8)?<=0.0||self.elapsed<self.t.float(8)?))}
     pub(super) fn vertices(&self)->Result<Vec<Vec<Vertex>>> {
         let t=&self.t;let grow=t.float(10)?;let shrink=t.float(11)?;let phase=self.elapsed/(grow+shrink);
         let rising=self.elapsed<grow;
         let raw=if rising {self.elapsed/grow}else{1.0-(self.elapsed-grow)/shrink};
-        let u=match t.words[22] {0=>1.0-(1.0-raw).powi(6),1=>raw.powi(6),_=>raw};
+        let u=match t.word(22).unwrap_or(0) {0=>1.0-(1.0-raw).powi(6),1=>raw.powi(6),_=>raw};
         let mut radius=if rising {t.float(15)?*(1.0-u)+t.float(16)?*u}else{t.float(17)?*(1.0-u)+t.float(16)?*u};
         radius+=(phase*std::f32::consts::TAU).cos()*t.float(24)?;
         let h=t.float(25)?;
@@ -138,14 +140,14 @@ impl EnergyBall {
         let axis=Vec3::new(-(phase*std::f32::consts::FRAC_PI_2).cos(),-(phase*1.5*std::f32::consts::PI).cos(),(phase*3.0*std::f32::consts::PI).sin()).normalize_or_zero();
         let q=Quat::from_axis_angle(axis,phase*std::f32::consts::FRAC_PI_2);
         let rotation=Mat4::from_quat(q)*Mat4::from_cols(self.source.x_axis,self.source.y_axis,self.source.z_axis,glam::Vec4::W);
-        let c0=color(t.words[18],t.words[20],u);let c1=color(t.words[19],t.words[21],u);
-        let mut out=Vec::with_capacity(t.words[12] as usize*12);
+        let c0=color(t.word(18).unwrap_or(0),t.word(20).unwrap_or(0),u);let c1=color(t.word(19).unwrap_or(0),t.word(21).unwrap_or(0),u);
+        let mut out=Vec::with_capacity(t.word(12).unwrap_or(0) as usize*12);
         // DS10012264: three independently rotated planes per angular step.
-        for i in 0..t.words[12] {let a=std::f32::consts::PI*i as f32/t.words[12] as f32;
+        for i in 0..t.word(12).unwrap_or(0) {let a=std::f32::consts::PI*i as f32/t.word(12).unwrap_or(0) as f32;
             for plane in 0..3 {let rq=match plane {0=>Quat::from_rotation_x(a),1=>Quat::from_rotation_y(a),_=>Quat::from_rotation_z(a)};
                 let right=rq*if plane==2 {Vec3::Z}else{Vec3::X};let up=rq*Vec3::Y;
                 for (j,(x,y)) in [(1.0,1.0),(-1.0,1.0),(1.0,-1.0),(-1.0,-1.0)].into_iter().enumerate() {
-                    let uv=if t.words[0]&0x100!=0 {[j as f32%2.0,if j<2 {1.0}else{0.0}]}else{[j as f32%2.0,if j<2 {0.0}else{1.0}]};
+                    let uv=if t.word(0).unwrap_or(0)&0x100!=0 {[j as f32%2.0,if j<2 {1.0}else{0.0}]}else{[j as f32%2.0,if j<2 {0.0}else{1.0}]};
                     out.push(vertex(p+rotation.transform_vector3((right*x+up*y)*radius),uv,if j<2 {c0}else{c1}));
                 }
             }
@@ -160,16 +162,16 @@ impl SkyRise {
         ensure!(t.kind==3018,"not SkyRise");t.word(25)?;
         for i in [8,11,12,15,17,18,19] {t.float(i)?;}
         ensure!((6..=512).contains(&t.word(14)?)&&t.word(24)?<=1,"invalid SkyRise geometry");
-        let mut position=source.w_axis.truncate();if t.words[0]&0x4000!=0 {position.y=ground(position).map_or(0.0,|(p,_)|p.y);}
+        let mut position=source.w_axis.truncate();if t.word(0).unwrap_or(0)&0x4000!=0 {position.y=ground(position).map_or(0.0,|(p,_)|p.y);}
         Ok(Self {t:t.clone(),position,elapsed:0.0,started:false})
     }
-    pub(super) fn update_source(&mut self,m:Mat4) {if self.t.words[0]&0x1000!=0 {self.position=m.w_axis.truncate();}}
-    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {self.t.words[8]=d.to_bits();}}
-    fn count(&self)->u32 {if self.t.words[24]==1 {self.t.words[14]*2}else{14}}
-    fn bands(&self)->u32 {if self.t.words[24]==1 {self.t.words[14]/2}else{2}}
+    pub(super) fn update_source(&mut self,m:Mat4) {if self.t.word(0).unwrap_or(0)&0x1000!=0 {self.position=m.w_axis.truncate();}}
+    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {{ self.t.words.resize(self.t.words.len().max((8) + 1), 0); *self.t.words.get_mut(8).unwrap() = d.to_bits(); };}}
+    fn count(&self)->u32 {if self.t.word(24).unwrap_or(0)==1 {self.t.word(14).unwrap_or(0)*2}else{14}}
+    fn bands(&self)->u32 {if self.t.word(24).unwrap_or(0)==1 {self.t.word(14).unwrap_or(0)/2}else{2}}
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
         let n=self.count();let bands=self.bands();
-        (0..2).map(|_|(Some(self.t.words[9] as usize),(0..bands).flat_map(|b|strip(n).into_iter().map(move|i|i+b*n)).collect(),(n*bands) as usize)).collect()
+        (0..2).map(|_|(Some(self.t.word(9).unwrap_or(0) as usize),(0..bands).flat_map(|b|strip(n).into_iter().map(move|i|i+b*n)).collect(),(n*bands) as usize)).collect()
     }
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::Additive;2]}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {ensure!(dt.is_finite()&&dt>=0.0,"invalid SkyRise timestep");if self.started {self.elapsed+=dt;}else{self.started=true;}Ok(self.elapsed<self.t.float(8)?)}
@@ -177,20 +179,20 @@ impl SkyRise {
         let t=&self.t;let phase=self.elapsed/t.float(8)?;
         let opacity=if self.elapsed<t.float(11)? {(1.0-self.elapsed/t.float(11)?)*0.25+0.75}else{(1.0-(self.elapsed-t.float(11)?)/(t.float(8)?-t.float(11)?))*0.75};
         let alpha=[(1.0-(1.0-opacity)*4.0).max(0.0),(opacity*1.33).min(1.0),(1.0-(1.0-opacity)*4.0).max(0.0)];
-        let radius=if t.words[25]&1!=0 {t.float(18)?*(1.0-phase)+t.float(19)?*phase}else{t.float(18)?};
-        let mut c=[rgba(t.words[20]),rgba(t.words[21])];
-        if t.words[24]==1&&t.words[25]&2!=0 {c=[color(t.words[20],t.words[21],phase),color(t.words[22],t.words[23],phase)];}
-        if t.words[24]==1&&t.words[25]&4!=0 {
+        let radius=if t.word(25).unwrap_or(0)&1!=0 {t.float(18)?*(1.0-phase)+t.float(19)?*phase}else{t.float(18)?};
+        let mut c=[rgba(t.word(20).unwrap_or(0)),rgba(t.word(21).unwrap_or(0))];
+        if t.word(24).unwrap_or(0)==1&&t.word(25).unwrap_or(0)&2!=0 {c=[color(t.word(20).unwrap_or(0),t.word(21).unwrap_or(0),phase),color(t.word(22).unwrap_or(0),t.word(23).unwrap_or(0),phase)];}
+        if t.word(24).unwrap_or(0)==1&&t.word(25).unwrap_or(0)&4!=0 {
             let cycles=(t.float(8)?/t.float(12)?).floor();let triangle=|u:f32|{let x=u.fract()*2.0;if x>1.0 {2.0-x}else{x}};
-            c=[color(t.words[20],t.words[21],triangle(cycles*phase)),color(t.words[22],t.words[23],triangle((cycles+1.0)*phase))];
+            c=[color(t.word(20).unwrap_or(0),t.word(21).unwrap_or(0),triangle(cycles*phase)),color(t.word(22).unwrap_or(0),t.word(23).unwrap_or(0),triangle((cycles+1.0)*phase))];
         }
         let mut out=Vec::with_capacity(2);
         let u=0.2*self.elapsed+0.2*self.elapsed.sin();let v=0.6*self.elapsed;
         for (pass,pass_color) in c.into_iter().enumerate() {
             let mut vertices=Vec::with_capacity((self.count()*self.bands()) as usize);
-            let (scroll_u,scroll_v,vertical,texture_scale)=if pass==0 {(u,v,t.words[0]&0x100!=0,4.0)}else{(v*-0.9,u*-1.3,t.words[0]&0x100==0,5.0)};
-            if t.words[24]==1 {
-                let n=t.words[14];let bands=n/2;
+            let (scroll_u,scroll_v,vertical,texture_scale)=if pass==0 {(u,v,t.word(0).unwrap_or(0)&0x100!=0,4.0)}else{(v*-0.9,u*-1.3,t.word(0).unwrap_or(0)&0x100==0,5.0)};
+            if t.word(24).unwrap_or(0)==1 {
+                let n=t.word(14).unwrap_or(0);let bands=n/2;
                 for band in 0..bands {for i in 0..n {let azimuth=i as f32*std::f32::consts::TAU/(n-1) as f32;
                     for end in 0..2 {let elevation=(band+end) as f32*f32::from_bits(0x3fc90cb3)/bands as f32;let p=self.position+Vec3::new(azimuth.sin()*elevation.cos(),elevation.sin(),-azimuth.cos()*elevation.cos())*radius;
                         let x=i as f32*(radius*f32::from_bits(0x40c8f5c3)/t.float(15)?).floor()/n as f32;
@@ -202,7 +204,7 @@ impl SkyRise {
             } else {
                 let xs:[f32;6]=[5.0,5.0,-5.0,-5.0,0.0,0.0];let zs=[5.0,-5.0,-5.0,0.0,0.0,5.0];let height=t.float(17)?;let levels=[0.0,(height*0.5).min(1.0),height];
                 for band in 0..2 {let mut distance=0.0;for i in 0..=6 {let j=(i+5)%6;if i>0 {let prev=(j+5)%6;distance+=(xs[j]-xs[prev]).hypot(zs[j]-zs[prev]);}
-                    for end in 0..2 {let y=levels[band+end];let mut color=color(t.words[21],t.words[20],(band+end) as f32*0.5);color[3]=alpha[band+end];
+                    for end in 0..2 {let y=levels[band+end];let mut color=color(t.word(21).unwrap_or(0),t.word(20).unwrap_or(0),(band+end) as f32*0.5);color[3]=alpha[band+end];
                         let uv=if vertical {[y/texture_scale+scroll_u,distance/texture_scale+scroll_v]}else{[distance/texture_scale+scroll_u,y/texture_scale+scroll_v]};
                         vertices.push(vertex(self.position+Vec3::new(xs[j],y,-zs[j]),uv,color));
                     }
@@ -223,9 +225,9 @@ impl Trail {
         Ok(Self {t:t.clone(),source,elapsed:0.0,last_sample:0.0,samples:std::collections::VecDeque::with_capacity(1000),distance:0.0,stop:false})
     }
     pub(super) fn update_source(&mut self,m:Mat4) {self.source=m;}
-    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some([r,g,b,a])=c.start_color {self.t.words[13]=u32::from_be_bytes([ (a.clamp(0.0,1.0)*255.0) as u8,(r.clamp(0.0,1.0)*255.0) as u8,(g.clamp(0.0,1.0)*255.0) as u8,(b.clamp(0.0,1.0)*255.0) as u8]);}}
+    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some([r,g,b,a])=c.start_color {{ self.t.words.resize(self.t.words.len().max((13) + 1), 0); *self.t.words.get_mut(13).unwrap() = u32::from_be_bytes([ (a.clamp(0.0,1.0)*255.0) as u8,(r.clamp(0.0,1.0)*255.0) as u8,(g.clamp(0.0,1.0)*255.0) as u8,(b.clamp(0.0,1.0)*255.0) as u8]); };}}
     pub(super) fn terminate_gracefully(&mut self) {self.stop=true;}
-    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {(0..if self.t.words.get(14).copied().unwrap_or(0)==1 {4}else{1}).map(|_|(Some(self.t.words[9] as usize),strip(104),104)).collect()}
+    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {(0..if self.t.words.get(14).copied().unwrap_or(0)==1 {4}else{1}).map(|_|(Some(self.t.word(9).unwrap_or(0) as usize),strip(104),104)).collect()}
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::Additive;self.models().len()]}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {
         ensure!(dt.is_finite()&&dt>=0.0,"invalid Trail timestep");self.elapsed+=dt;
@@ -236,7 +238,7 @@ impl Trail {
     }
     pub(super) fn vertices(&self,camera:Vec3)->Result<Vec<Vec<Vertex>>> {
         let count=if self.t.words.get(14).copied().unwrap_or(0)==1 {4}else{1};let mut out=Vec::with_capacity(count);let width=self.t.float(10)?;let newest=self.samples.back();
-        for plane in 0..count {let mut v=Vec::with_capacity(104);let Some(newest)=newest else{out.push(v);continue;};let p=newest.source.w_axis.truncate();
+        for plane in 0..count {let mut v=Vec::with_capacity(104);let Some(newest)=newest else{out.push(vec![Vertex::default();104]);continue;};let p=newest.source.w_axis.truncate();
             let mut travel=0.0;let mut index=self.samples.len()-1;let mut previous=p;
             for point in 0..=50 {let distance=newest.distance-point as f32*2.5;
                 while index>0&&self.samples[index-1].distance>distance {index-=1;}
@@ -245,10 +247,13 @@ impl Trail {
                 let alpha=(1.0-(self.elapsed-time)/self.t.float(12)?).max(0.0);
                 let x=older.source.x_axis.truncate().lerp(current.source.x_axis.truncate(),u);let z=older.source.z_axis.truncate().lerp(current.source.z_axis.truncate(),u);
                 let offset=if count==1 {(previous-position).cross(camera-position).try_normalize().unwrap_or(Vec3::X)*width*0.5*0.97f32.powi(point)}else{match plane {0=>z*width*0.5,1=>x*width*0.5,2=>(x+z).normalize_or_zero()*width*0.35,_=>(x-z).normalize_or_zero()*width*0.35}};
-                travel+=previous.distance(position);let mut c=rgba(self.t.words[13]);c[3]*=alpha;
+                travel+=previous.distance(position);let mut c=rgba(self.t.word(13).unwrap_or(0));c[3]*=alpha;
                 for side in 0..2 {v.push(vertex(position+offset*if side==0 {1.0}else{-1.0},[(newest.distance-travel)/self.t.float(11)?,side as f32],c));}
                 previous=position;if alpha==0.0||index<2 {break;}
             }
+            // Actor skins must match the fixed strip model; unused pairs are degenerate.
+            let mut end=v.last().copied().unwrap_or_default();end.color=[0.0;4];
+            v.resize(104,end);
             out.push(v);
         }
         Ok(out)
@@ -279,8 +284,9 @@ mod tests {
     fn authored_12570_trail_missing_mode_defaults_to_zero() {
         let t=Template {kind:3019,words:vec![7,0,0,0,0,0,0,2001,0xbf800000,54,0x40000000,0x40600000,0x40400000,u32::MAX]};
         let mut trail=Trail::new(&t,Mat4::IDENTITY).unwrap();assert_eq!(trail.models().len(),1);
+        assert_eq!(trail.vertices(Vec3::Z*10.0).unwrap()[0].len(),trail.models()[0].2);
         for i in 0..20 {trail.update_source(Mat4::from_translation(Vec3::X*i as f32));assert!(trail.frame(0.06).unwrap());}
-        assert!(!trail.vertices(Vec3::Z*10.0).unwrap()[0].is_empty());trail.terminate_gracefully();assert!(trail.frame(30.0).unwrap());
+        let groups=trail.vertices(Vec3::Z*10.0).unwrap();assert_eq!(groups[0].len(),trail.models()[0].2);assert!(groups[0].iter().any(|v|v.color[3]>0.0));trail.terminate_gracefully();assert!(trail.frame(30.0).unwrap());
     }
     #[test]
     fn authored_71250_mesh_particle_reset_preserves_random_order() {
@@ -295,7 +301,7 @@ mod tests {
         let dir=ao_gui::client_dir();let store=RecordStore::open(&dir)?;
         let names=NameTable::load(&store)?;let templates=super::super::Templates::open(&dir)?;
         // Exercise native selector1 on actual71250 against71123's real asset hole.
-        let mut t=templates.by_id[&71250].clone();t.words[34]=1;
+        let mut t=templates.by_id[&71250].clone();{ t.words.resize(t.words.len().max((34) + 1), 0); *t.words.get_mut(34).unwrap() = 1; };
         let mut crt=CrtRand::new(1);let mut rng=R250::new(0xe6f1);
         let mut effect=MParticle::new(&t,Mat4::IDENTITY,&store,&names,&mut crt,&mut rng)?;
         assert_eq!(effect.resources.len(),1);assert!(effect.resources[0].1.meshes.is_empty());
@@ -304,7 +310,7 @@ mod tests {
         assert!(effect.frame(1.0/60.0,&mut rng,&mut ground)?);
         assert!(effect.particles[0].remaining>0.0);
         assert!(effect.actors(1,0).is_empty(),"retained slots have no drawable payload");
-        t.words[28]=f32::NAN.to_bits();
+        { t.words.resize(t.words.len().max((28) + 1), 0); *t.words.get_mut(28).unwrap() = f32::NAN.to_bits(); };
         assert!(MParticle::new(&t,Mat4::IDENTITY,&store,&names,&mut crt,&mut rng).is_err());
         Ok(())
     }
@@ -340,4 +346,16 @@ mod tests {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn short_energy_ball_defaults_missing_fields_to_zero() {
+    let mut words=vec![0;13];words[12]=1;
+    let mut rng=R250::new(1);
+    let mut effect=EnergyBall::new(&Template {kind:3023,words},Mat4::IDENTITY,&mut rng,&mut |_|None).unwrap();
+    effect.configure(EffectConfig {duration:Some(2.0),..Default::default()});
+    assert_eq!(effect.t.float(8).unwrap(),2.0);
+    assert_eq!(effect.t.word(22).unwrap(),0);
+    assert_eq!(effect.vertices().unwrap()[0].len(),12);
 }

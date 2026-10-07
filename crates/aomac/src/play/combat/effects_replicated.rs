@@ -24,14 +24,13 @@ impl ReplicatedEffect {
     pub(super) fn supports(kind:i32)->bool {matches!(kind,1011|3007)}
     pub(super) fn new(t:&Template,source:Mat4,target:Vec3,config:EffectConfig)->Result<Self> {
         ensure!(Self::supports(t.kind),"unsupported replicated class {}",t.kind);
-        t.word(if t.kind==1011 {25}else{17})?;
         for i in 1..=6 {t.float(i)?;}
         t.float(8)?;
         if t.kind==1011 {for i in 12..=25 {t.float(i)?;}}
         let center=source.w_axis.truncate();
         Ok(Self {template:t.clone(),config,target:Mat4::from_translation(target),center,point:center,children:[0;2],elapsed:0.0,ticks:0,target_valid:true,steam:if t.kind==3007 {Some(fall_steam::FallSteam::new(t,center,target)?)}else{None}})
     }
-    pub(super) fn target_attractor(&self)->i32 {self.template.words[7] as i32}
+    pub(super) fn target_attractor(&self)->i32 {self.template.words.get(7).copied().unwrap_or(0) as i32}
     // GC100f3aee/100f3afa forward position/matrix setters to the target connector.
     // FallSteam's corresponding native slots are no-ops.
     pub(super) fn update_source(&mut self,source:Mat4) {if self.template.kind==1011 {self.target=source;}}
@@ -40,7 +39,7 @@ impl ReplicatedEffect {
     pub(super) fn invalidate_target(&mut self) {self.target_valid=false;}
     fn destination(&self)->Result<Vec3> {
         // Connector bit2 returns zero position (GC10105eb4), not its authored target.
-        if self.template.words[0]&2!=0 {return Ok(Vec3::ZERO);}
+        if self.template.word(0)?&2!=0 {return Ok(Vec3::ZERO);}
         Ok(sprites::connector(&self.template,self.target)?.w_axis.truncate())
     }
     fn initial_point(&self)->Result<Vec3> {
@@ -106,6 +105,12 @@ impl ReplicatedEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn short_spinning_shot_defaults_to_zero() -> Result<()> {
+        let mut e=ReplicatedEffect::new(&Template {kind:1011,words:vec![]},Mat4::IDENTITY,Vec3::Z,EffectConfig::default())?;
+        assert_eq!(e.target_attractor(),0);assert_eq!(e.initial_point()?,Vec3::ZERO);
+        e.advance_shot(0.1)?;assert_eq!(e.center,Vec3::ZERO);assert_eq!(e.point,Vec3::ZERO);Ok(())
+    }
     #[test]
     fn authored_9010_spinning_shot_uses_frame_angle_and_live_vector_target()->Result<()> {
         let t=Template {kind:1011,words:vec![5,0,0,0,0,0,0,0,1090519040,u32::MAX,6203,8003,1065353216,1048576000,1056964608,1065185444,0,1048576000,1056964608,1065185444,1092616192,1065353216,1070141403,1086918619,1065353216,1065353216]};

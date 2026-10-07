@@ -74,7 +74,7 @@ pub(super) struct TracerMesh {
     track_source: bool,
     rig: Option<ao_formats::mesh::NodeRig>,
     visible: bool,
-    record_id: u32,
+    record_id: Option<u32>,
 }
 
 impl TracerMesh {
@@ -92,17 +92,17 @@ impl TracerMesh {
                 _ => RESOURCES.get(selector as usize).context("invalid effect-mesh selector")?,
             }
         } else { RESOURCES.get(selector as usize).context("invalid effect-mesh selector")? };
-        let id = names.id(MESH_TYPE, name).with_context(|| format!("missing native effect mesh {name}"))?;
+        let id = names.id(MESH_TYPE, name);
         // Separate the effect-mesh selector namespace from the rock-list selectors.
         let animated = template.word(0)? & 0x1000 != 0;
         let key = 0x3025_0000 | selector | (u32::from(atrox) << 5) | (u32::from(animated) << 6) | (rendering_effect << 8);
-        let (mut animated_scene, rig) = if animated {
+        let (mut animated_scene, rig) = if let Some(id)=id.filter(|_|animated) {
             match ao_formats::mesh::load_animated_mesh(store, id)? {
                 Some((scene, rig)) => (Some(scene), Some(rig)),
                 None => (None, None),
             }
         } else { (None, None) };
-        let scene = match resources.entry(key) {
+        let scenes = if let Some(id)=id {let scene = match resources.entry(key) {
             std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let mut scene = match animated_scene.take() {
@@ -125,7 +125,7 @@ impl TracerMesh {
                 }
                 Arc::clone(entry.insert(Arc::new(scene)))
             }
-        };
+        };vec![(key,scene)]} else {Vec::new()};
         let count = template.word(32)? as usize;
         ensure!(count <= template.words.len().saturating_sub(33)/2, "short effect-mesh opacity envelope");
         let points = (0..count).map(|i| Ok((template.float(33+i*2)?, template.float(34+i*2)?))).collect::<Result<Vec<_>>>()?;
@@ -133,7 +133,7 @@ impl TracerMesh {
         let axis = vector(22)? * Vec3::new(-1.0,-1.0,-1.0);
         let source = super::sprites::connector(template, source)?;
         Ok(Self {
-            template: template.clone(), scenes: vec![(key, scene)], source,
+            template: template.clone(), scenes, source,
             offset: vector(13)?, velocity: source.transform_vector3(vector(16)?), acceleration: source.transform_vector3(vector(19)?), axis,
             angle: template.float(25)?, angular_velocity: template.float(26)?, angular_acceleration: template.float(27)?,
             scale: template.float(28)?, scale_velocity: template.float(29)?, scale_acceleration: template.float(30)?,
@@ -149,13 +149,13 @@ impl TracerMesh {
         })
     }
     pub(super) fn scenes(&self) -> &[(u32, Arc<Scene>)] { &self.scenes }
-    pub(super) fn record_id(&self) -> u32 { self.record_id }
+    pub(super) fn record_id(&self) -> Option<u32> { self.record_id }
     pub(super) fn is_animated(&self) -> bool { self.rig.is_some() }
     pub(super) fn connector_transform(&self, frame: usize) -> Option<Mat4> {
         self.rig.as_ref()?.frame_transform(frame).map(|m| Mat4::from_cols_array_2d(&m))
     }
     pub(super) fn set_context(&mut self, context: MeshContext) { self.context = Some(context); }
-    pub(super) fn actor_count(&self) -> usize { 1 }
+    pub(super) fn actor_count(&self) -> usize { self.scenes.len() }
     pub(super) fn set_anchors(&mut self, source: Mat4, _target: Vec3) -> Result<()> {
         ensure!(source.is_finite(), "invalid effect-mesh source transform");
         self.source = super::sprites::connector(&self.template, source)?;
@@ -163,6 +163,8 @@ impl TracerMesh {
     }
     pub(super) fn frame(&mut self, dt: f32) -> Result<bool> {
         ensure!(dt.is_finite() && dt >= 0.0, "invalid effect-mesh timestep");
+        // GC1010cf05: failed GetTypeInstance marks done+0x14 without allocating VisualMesh.
+        if self.record_id.is_none() {return Ok(false);}
         self.age += dt;
         if self.duration > 0.0 && self.age > self.duration { return Ok(false); }
         let flags = self.template.word(0)?;
@@ -200,6 +202,7 @@ impl TracerMesh {
         Ok(true)
     }
     pub(super) fn actors(&mut self, actor_base: u32, model_base: u64) -> Vec<ActorFrame> {
+        if self.record_id.is_none() {return Vec::new();}
         let (_, source_rotation, position) = self.source.to_scale_rotation_translation();
         let (sine, cosine) = (self.angle*0.5).sin_cos();
         let mut rotation = source_rotation * Quat::from_xyzw(self.axis.x*sine, self.axis.y*sine, self.axis.z*sine, cosine);
@@ -271,7 +274,7 @@ mod tests {
             config_scale: 1.0, context: None, vehicle_alpha: 1.0, track_source: false,
             rig: None,
             visible: true,
-            record_id: 0,
+            record_id: Some(0),
         };
         assert!(effect.frame(2.0).unwrap());
         assert_eq!(effect.offset, Vec3::Y * 3.0);
@@ -287,17 +290,27 @@ mod tests {
         assert!(effect.frame(0.5).unwrap());
         assert_eq!(effect.vehicle_alpha, 0.25);
         assert!((effect.actors(1, 0)[0].alpha - 0.0625).abs() < 1e-6);
+        // A resolved identity with pending payload keeps its allocated control.
+        assert!(effect.scenes()[0].1.meshes.is_empty());
+        assert!(effect.frame(0.0).unwrap());
+        effect.record_id=None;
+        effect.scenes.clear();
+        assert!(!effect.frame(0.0).unwrap());
+        assert!(effect.actors(1,0).is_empty());
     }
     #[test]
     #[ignore = "requires installed retail assets"]
-    fn installed_71123_missing_heal_retains_visual_control() -> Result<()> {
+    fn installed_71123_missing_heal_terminates_control() -> Result<()> {
         let dir=ao_gui::client_dir();let store=RecordStore::open(&dir)?;
         let names=NameTable::load(&store)?;let templates=super::super::Templates::open(&dir)?;
         let t=&templates.by_id[&71123];assert_eq!(t.kind,3025);assert_eq!(t.word(10)?,1);
+        assert!(names.id(MESH_TYPE,RESOURCES[1]).is_none(),"regression requires the proven installed name hole");
         let mut resources=HashMap::new();
         let mut effect=TracerMesh::new(t,&store,&names,Mat4::IDENTITY,&mut resources,EffectConfig::default())?;
-        assert_eq!(effect.scenes().len(),1);assert!(effect.scenes()[0].1.meshes.is_empty());
-        assert!(effect.frame(1.0/60.0)?);
+        assert!(effect.record_id().is_none());assert!(effect.scenes().is_empty());
+        assert!(!effect.frame(1.0/60.0)?,"failed native identity lookup terminates control");
+        assert!(effect.actors(1,0).is_empty());
+        assert!(resources.is_empty(),"failed lookup allocates no visual resource");
         let mut malformed=t.clone();malformed.words[28]=f32::NAN.to_bits();
         assert!(TracerMesh::new(&malformed,&store,&names,Mat4::IDENTITY,&mut resources,EffectConfig::default()).is_err());
         Ok(())
@@ -347,14 +360,16 @@ mod tests {
             effect.set_context(MeshContext { camera: Vec3::new(6.0,5.0,9.0), first_person: false,
                 body_scale: 1.0, breed: 4, vehicle_speed: Some(1.0), vehicle_direction: 1,
                 visible: true, source_alive: true, ground_height: Some(0.0) });
-            let models: Vec<_> = if id==71123 {Vec::new()} else {effect.scenes().iter().map(|(key, scene)| (u64::from(*key), scene.as_ref().clone())).collect()};
-            assert_eq!(effect.scenes()[0].1.meshes.is_empty(),id==71123,"exact installed3025 missing resource");
+            let missing_name=effect.record_id().is_none();
+            assert_eq!(missing_name,id==71123,"exact installed3025 missing name");
+            assert_eq!(effect.scenes().is_empty(),missing_name);
+            let models: Vec<_> = effect.scenes().iter().filter(|(_,scene)|!scene.meshes.is_empty()).map(|(key, scene)| (u64::from(*key), scene.as_ref().clone())).collect();
             for frame in 1..=30 {
                 let alive=effect.frame(1.0/60.0).unwrap();
-                if id==71123 {assert!(alive,"allocated missing visual retains its authored control");}
+                if missing_name {assert!(!alive,"failed native lookup terminates control");}
                 if !alive {break;}
                 if [1,15,30].contains(&frame) {
-                    let actors=if id==71123 {Vec::new()} else {effect.actors(1000,0)};
+                    let actors=effect.actors(1000,0).into_iter().filter(|actor|models.iter().any(|(model,_)|*model==actor.model)).collect();
                     ao_render::render_to_png_actors(&Scene::default(), &models, actors,
                         [6.0,5.0,9.0], [0.0,0.0,0.0], 640,480,
                         &out.join(format!("mesh3025_{id}_{frame}.png")), frame as f32/60.0).unwrap();

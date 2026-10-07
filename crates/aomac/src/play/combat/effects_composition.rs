@@ -79,8 +79,6 @@ impl Composition {
             return Ok(Self {template:t.clone(),source,target,config,children:[0;10],elapsed:0.0,ticks:0,duration,
                 angle:0.0,sampled_angle:0.0,stopped:false,links:VecDeque::new(),origin,head:origin,tracer_speed:0.0,finished:false});
         }
-        let end = match t.kind { 1002 => 26, 1003 => 36, 3026=>14, _ => 15 };
-        t.word(end)?;
         for i in 1..=6 { t.float(i)?; }
         if t.kind == 1002 {
             for i in 12..=25 { t.float(i)?; }

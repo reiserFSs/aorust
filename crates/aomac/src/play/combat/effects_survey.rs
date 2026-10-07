@@ -48,9 +48,13 @@ impl Census {
 }
 
 fn native_rejected(error: &str) -> bool {
-    // GC1002b297 has no type23 dispatch branch; this exact authored element is
-    // rejected by retail too. Do not generalize to other parser failures.
-    error == "unsupported item element (0x17, 0x25)"
+    // Exact retail rejections only: GC1002b297 rejects kind0 and has no type23
+    // or type0 branch; GD1000ccf6 rejects CF0A with both required stats zero.
+    matches!(error, "unsupported item element (0x17, 0x25)"
+        | "invalid item kind 0"
+        | "invalid spell 0xcf0a: stats 2 and 0x25 are both 0"
+        | "unsupported item element (0x0, 0x0)"
+        | "unsupported item element (0x0, 0x2)")
 }
 
 fn retail() -> Result<(RecordStore, Templates)> {
@@ -302,7 +306,14 @@ fn retail_authored_effect_census() -> Result<()> {
                     let mesh = super::tracer_meshes::TracerMesh::new(template, &renderer.store,
                         &renderer.names, glam::Mat4::IDENTITY, &mut renderer.mesh_resources,
                         super::EffectConfig::default())?;
-                    Ok(vec![mesh.record_id()])
+                    if let Some(mesh) = mesh.record_id() {
+                        Ok(vec![mesh])
+                    } else {
+                        let reason = format!("missing native effect mesh name for selector {}", template.word(10)?);
+                        eprintln!("mesh_dependency_unavailable: parent={id} class={} reason={reason}", template.kind);
+                        unavailable_mesh_metadata.insert(id, reason);
+                        Ok(Vec::new())
+                    }
                 } else {
                     let mut meshes = Vec::new();
                     for name in super::legacy302x::MParticle::resource_names(template)? {
@@ -431,6 +442,12 @@ fn retail_authored_effect_census() -> Result<()> {
 #[test]
 fn census_native_rejection_is_exact() {
     assert!(native_rejected("unsupported item element (0x17, 0x25)"));
+    assert!(native_rejected("invalid item kind 0"));
+    assert!(native_rejected("invalid spell 0xcf0a: stats 2 and 0x25 are both 0"));
+    assert!(!native_rejected("invalid item kind 9999"));
+    assert!(!native_rejected("invalid spell 0xcf0b: stats 2 and 0x25 are both 0"));
+    assert!(native_rejected("unsupported item element (0x0, 0x0)"));
+    assert!(native_rejected("unsupported item element (0x0, 0x2)"));
     assert!(!native_rejected("unsupported item element (0x0, 0x16)"));
     assert!(!native_rejected("spell 0x0: version 0 (format 4)"));
 }

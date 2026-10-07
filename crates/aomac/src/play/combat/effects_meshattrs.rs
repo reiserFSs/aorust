@@ -66,8 +66,14 @@ mod tests {
         let mut ids=Vec::new();
         for (id,t) in templates {
             if t.kind==3025 {
-                let mesh=super::super::tracer_meshes::TracerMesh::new(&t,&renderer.store,&renderer.names,Mat4::IDENTITY,&mut renderer.mesh_resources,EffectConfig::default())?;
-                ids.push((id,mesh.record_id()));
+                let mut mesh=super::super::tracer_meshes::TracerMesh::new(&t,&renderer.store,&renderer.names,Mat4::IDENTITY,&mut renderer.mesh_resources,EffectConfig::default())?;
+                if let Some(record)=mesh.record_id() {
+                    ids.push((id,record));
+                } else {
+                    assert_eq!(id,71123,"unexpected installed mesh name hole");
+                    assert!(mesh.scenes().is_empty());
+                    assert!(!mesh.frame(1.0/60.0)?,"failed native name lookup terminates control");
+                }
             } else {
                 let mesh=super::super::legacy302x::MParticle::new(&t,Mat4::IDENTITY,&renderer.store,&renderer.names,&mut renderer.rng,&mut renderer.random)?;
                 ids.extend(mesh.resources().iter().map(|(mesh,_)|(id,*mesh)));
@@ -75,7 +81,7 @@ mod tests {
         }
         let mut exercised=[false;2];
         for (id,mesh) in ids {
-            let Some(bytes)=renderer.store.get(MESH_TYPE,mesh)? else {continue};
+            let bytes=renderer.store.get(MESH_TYPE,mesh)?.context("missing authored child-bearing mesh payload")?;
             let attrs=mesh_effect_attrs(&bytes)?;if attrs.is_empty(){continue}
             let (scene,mut rig)=match load_animated_mesh(&renderer.store,mesh)? {
                 Some((scene,rig))=>(scene,Some(rig)),

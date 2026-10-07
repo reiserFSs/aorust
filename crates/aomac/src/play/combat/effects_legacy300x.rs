@@ -29,14 +29,14 @@ impl TowerMesh {
         let source=super::sprites::connector(t,source)?;
         Ok(Self {t:t.clone(),source,elapsed:0.0,started:false,stopped:resource==0,scene,resource})
     }
-    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {self.t.words[8]=d.to_bits();}}
+    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {{ self.t.words.resize(self.t.words.len().max((8) + 1), 0); *self.t.words.get_mut(8).unwrap() = d.to_bits(); };}}
     pub(super) fn update_source(&mut self,m:Mat4)->Result<()> {self.source=super::sprites::connector(&self.t,m)?;Ok(())}
-    pub(super) fn source_removed(&mut self) {if self.t.words[0]&0x200==0 {self.stopped=true;}}
-    pub(super) fn needs_ground(&self)->bool {self.t.words[0]&0x100!=0}
+    pub(super) fn source_removed(&mut self) {if self.t.word(0).unwrap_or(0)&0x200==0 {self.stopped=true;}}
+    pub(super) fn needs_ground(&self)->bool {self.t.word(0).unwrap_or(0)&0x100!=0}
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {ensure!(dt.is_finite()&&dt>=0.0,"invalid Mesh timestep");if self.started {self.elapsed+=dt;}else{self.started=true;}Ok(!self.stopped&&self.elapsed<=self.t.float(8)?)}
     pub(super) fn scene(&self)->Option<(u32,Arc<Scene>)> {self.scene.as_ref().map(|scene|(self.resource,Arc::clone(scene)))}
-    pub(super) fn alpha(&self)->f32 {let rise=f32::from_bits(self.t.words[10]);let fall=f32::from_bits(self.t.words[11]);let end=f32::from_bits(self.t.words[8])-fall;if self.elapsed<rise {self.elapsed/rise}else if self.elapsed>=end {1.0-(self.elapsed-end)/fall}else{1.0}}
+    pub(super) fn alpha(&self)->f32 {let rise=f32::from_bits(self.t.word(10).unwrap_or(0));let fall=f32::from_bits(self.t.word(11).unwrap_or(0));let end=f32::from_bits(self.t.word(8).unwrap_or(0))-fall;if self.elapsed<rise {self.elapsed/rise}else if self.elapsed>=end {1.0-(self.elapsed-end)/fall}else{1.0}}
     pub(super) fn actor(&self,id:u32,model:u64,ground:&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>)->Result<Option<ActorFrame>> {
         if self.scene.is_none() {return Ok(None);}
         let mut p=self.source.w_axis.truncate();if self.needs_ground() {let Some((g,_))=ground(p) else{return Ok(None)};p.y=g.y;}
@@ -58,12 +58,12 @@ fn cone_models(material:u32,count:u32,segments:u32)->Vec<(Option<usize>,Vec<u32>
 pub(super) struct Splash {t:Template,position:Vec3,elapsed:f32,started:bool,stopped:bool,liquid:Option<bool>}
 impl Splash {
     pub(super) fn new(t:&Template,source:Mat4)->Result<Self> {ensure!(t.kind==3002,"not Splash");for i in [1,2,3,11,12,14,15,16,17,18,19,20,21,24,27,28,29,30,31] {t.float(i)?;}ensure!((1..=4096).contains(&t.word(13)?),"invalid Splash segments");t.word(32)?;let position=source.w_axis.truncate()+Vec3::new(t.float(1)?,t.float(2)?,-t.float(3)?);Ok(Self{t:t.clone(),position,elapsed:0.0,started:false,stopped:false,liquid:None})}
-    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {self.t.words[8]=d.to_bits();}}
+    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {{ self.t.words.resize(self.t.words.len().max((8) + 1), 0); *self.t.words.get_mut(8).unwrap() = d.to_bits(); };}}
     pub(super) fn update_source(&mut self,_:Mat4)->Result<()> {Ok(())}
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {ensure!(dt.is_finite()&&dt>=0.0,"invalid Splash timestep");if self.started {self.elapsed+=dt;}else{self.started=true;}let t=&self.t;let end=(t.word(10)?.saturating_sub(1)) as f32*t.float(12)?+t.float(11)?*t.float(30)?;Ok(!self.stopped&&self.liquid!=Some(false)&&self.elapsed<end)}
-    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {cone_models(self.t.words[9],self.t.words[10],self.t.words[13])}
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.t.words[0]&0x100!=0 {Blend::Additive}else{Blend::AlphaBlend};self.t.words[10] as usize]}
+    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {cone_models(self.t.word(9).unwrap_or(0),self.t.word(10).unwrap_or(0),self.t.word(13).unwrap_or(0))}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.t.word(0).unwrap_or(0)&0x100!=0 {Blend::Additive}else{Blend::AlphaBlend};self.t.word(10).unwrap_or(0) as usize]}
     pub(super) fn vertices(&mut self,liquid:&mut dyn FnMut(Vec3)->Option<(f32,i32)>)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.liquid.is_none() {let Some((height,kind))=liquid(self.position) else{return Ok(None)};self.liquid=Some(kind!=2&&self.position.y<=height);if self.liquid==Some(true) {self.position.y=height;}}
         if self.liquid!=Some(true)||self.stopped {return Ok(None)}
@@ -72,7 +72,7 @@ impl Splash {
             let amplitude=scale*(t.float(16)?*(1.0-f/(count-1) as f32)+t.float(17)?*f/(count-1) as f32);
             let parabola=2.0*age-1.0+f*t.float(28)?;let shifted=parabola-t.float(29)?;let bottom_height=if shifted>=-1.0 {(1.0-shifted*shifted)*amplitude}else{0.0};let height=(1.0-parabola*parabola)*amplitude-bottom_height;
             let position=self.position+Vec3::Y*(f*t.float(27)?*scale+bottom_height);
-            out.push(cone(t.word(13)?,position,f*t.float(24)?,[height,scale*(t.float(18)?+f*t.float(20)?),scale*(t.float(19)?+f*t.float(21)?)*age],[lerp_color(t.word(22)?,t.word(25)?,age/t.float(30)?),lerp_color(t.word(23)?,t.word(26)?,age/t.float(30)?)],[t.float(14)?,t.float(15)?,0.0,0.0],t.words[0]&0x200!=0));
+            out.push(cone(t.word(13)?,position,f*t.float(24)?,[height,scale*(t.float(18)?+f*t.float(20)?),scale*(t.float(19)?+f*t.float(21)?)*age],[lerp_color(t.word(22)?,t.word(25)?,age/t.float(30)?),lerp_color(t.word(23)?,t.word(26)?,age/t.float(30)?)],[t.float(14)?,t.float(15)?,0.0,0.0],t.word(0).unwrap_or(0)&0x200!=0));
         }Ok(Some(out))
     }
 }
@@ -82,7 +82,7 @@ pub(super) struct CrazyCone {t:Template,source:Mat4,elapsed:f32,started:bool,sto
 impl CrazyCone {
     pub(super) fn new(t:&Template,source:Mat4)->Result<Self> {
         ensure!(t.kind==3009,"not CrazyCone");ensure!((1..=4096).contains(&t.word(11)?),"invalid CrazyCone segments");
-        let states=t.word(20)? as usize;ensure!(states>0&&states<=4096,"invalid CrazyCone states");ensure!(t.words.len()>=21+states*29,"short CrazyCone state table");
+        let states=t.word(20)? as usize;ensure!(states>0&&states<=4096,"invalid CrazyCone states");
         for i in 12..=19 {t.float(i)?;}for s in 0..states {for i in 0..17 {t.float(21+s*29+i)?;}for i in 22..27 {t.float(21+s*29+i)?;}ensure!(t.float(21+s*29)?>0.0,"nonpositive CrazyCone state duration");}
         let source=super::sprites::connector(t,source)?;let values=[t.float(14)?,t.float(15)?,t.float(16)?,t.float(17)?,t.float(18)?,t.float(19)?,0.0,0.0];
         Ok(Self{t:t.clone(),source,elapsed:0.0,started:false,stopped:false,state:0,state_time:0.0,pulse:-1,pulse_time:0.0,values,colors:[0;2]})
@@ -92,28 +92,28 @@ impl CrazyCone {
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {
         ensure!(dt.is_finite()&&dt>=0.0,"invalid CrazyCone timestep");let mut left=if self.started {dt}else{self.started=true;0.0};self.elapsed+=left;
-        if self.stopped||self.state>=self.t.words[20] as usize {return Ok(false)}
+        if self.stopped||self.state>=self.t.word(20).unwrap_or(0) as usize {return Ok(false)}
         loop {let base=21+self.state*29;let duration=self.t.float(base)?;let step=left.min(duration-self.state_time);self.state_time+=step;let fraction=self.state_time/duration;
-            for (v,a) in [(7,12),(8,13),(5,10),(6,11),(3,14),(4,15),(9,16)] {let value=self.t.float(base+v)?+step*self.t.float(base+a)?;self.t.words[base+v]=value.to_bits();}
+            for (v,a) in [(7,12),(8,13),(5,10),(6,11),(3,14),(4,15),(9,16)] {let value=self.t.float(base+v)?+step*self.t.float(base+a)?;{ self.t.words.resize(self.t.words.len().max((base+v) + 1), 0); *self.t.words.get_mut(base+v).unwrap() = value.to_bits(); };}
             for (value,velocity) in [(0,1),(1,2),(2,7),(3,8),(4,5),(5,6),(6,3),(7,4)] {self.values[value]+=step*self.t.float(base+velocity)?;}
-            self.colors=[lerp_argb(self.t.words[base+18],self.t.words[base+20],fraction),lerp_argb(self.t.words[base+17],self.t.words[base+19],fraction)];
-            let pulses=self.t.words[base+21] as i32;
+            self.colors=[lerp_argb(self.t.word(base+18).unwrap_or(0),self.t.word(base+20).unwrap_or(0),fraction),lerp_argb(self.t.word(base+17).unwrap_or(0),self.t.word(base+19).unwrap_or(0),fraction)];
+            let pulses=self.t.word(base+21).unwrap_or(0) as i32;
             if pulses!=0 && (self.pulse>=0||self.state_time>self.t.float(base+22)?) {
                 if self.pulse<0 {self.pulse=0;self.pulse_time=0.0;}self.pulse_time+=step;
                 let attack=self.t.float(base+25)?;let release=self.t.float(base+24)?;
                 let factor=if self.pulse_time<attack {self.pulse_time/attack}else if self.pulse_time<release {1.0-(self.pulse_time-attack)/(release-attack)}else{0.0};
-                for (end,word) in [(0,28),(1,27)] {self.colors[end]=lerp_argb(self.colors[end],self.t.words[base+word],factor);}
-                if self.pulse_time>release+self.t.float(base+23)? {self.pulse+=1;self.pulse_time=0.0;if self.pulse==pulses-1 {self.t.words[base+24]=(release+self.t.float(base+26)?).to_bits();}else if self.pulse==pulses {self.t.words[base+21]=0;}}
+                for (end,word) in [(0,28),(1,27)] {self.colors[end]=lerp_argb(self.colors[end],self.t.word(base+word).unwrap_or(0),factor);}
+                if self.pulse_time>release+self.t.float(base+23)? {self.pulse+=1;self.pulse_time=0.0;if self.pulse==pulses-1 {{ self.t.words.resize(self.t.words.len().max((base+24) + 1), 0); *self.t.words.get_mut(base+24).unwrap() = (release+self.t.float(base+26)?).to_bits(); };}else if self.pulse==pulses {{ self.t.words.resize(self.t.words.len().max((base+21) + 1), 0); *self.t.words.get_mut(base+21).unwrap() = 0; };}}
             }
-            left-=step;if self.state_time<duration||left<=0.0 {break}self.state+=1;self.state_time=0.0;self.pulse= -1;if self.state>=self.t.words[20] as usize {break}
+            left-=step;if self.state_time<duration||left<=0.0 {break}self.state+=1;self.state_time=0.0;self.pulse= -1;if self.state>=self.t.word(20).unwrap_or(0) as usize {break}
         }Ok(true)
     }
-    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {cone_models(self.t.words[9],self.t.words[10],self.t.words[11])}
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.t.words[0]&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend};self.t.words[10] as usize]}
+    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {cone_models(self.t.word(9).unwrap_or(0),self.t.word(10).unwrap_or(0),self.t.word(11).unwrap_or(0))}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.t.word(0).unwrap_or(0)&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend};self.t.word(10).unwrap_or(0) as usize]}
     pub(super) fn vertices(&self,ground:&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>)->Result<Option<Vec<Vec<Vertex>>>> {
-        let mut position=self.source.w_axis.truncate();if self.t.words[0]&0x800!=0 {let Some((g,_))=ground(position) else{return Ok(None)};position.y=g.y;}position.y+=self.values[5];
-        let base=21+self.state.min(self.t.words[20] as usize-1)*29;let count=self.t.words[10];
-        Ok(Some((0..count).map(|i|cone(self.t.words[11],position,self.state_time*f32::from_bits(self.t.words[base+9])+std::f32::consts::TAU*i as f32/count as f32,[self.values[4]-self.values[5],self.values[3]+i as f32*f32::from_bits(self.t.words[13]),self.values[2]+i as f32*f32::from_bits(self.t.words[12])],self.colors.map(super::buff300x::packed_color),[self.values[0],self.values[1],self.values[6],self.values[7]],self.t.words[0]&0x100!=0)).collect()))
+        let mut position=self.source.w_axis.truncate();if self.t.word(0).unwrap_or(0)&0x800!=0 {let Some((g,_))=ground(position) else{return Ok(None)};position.y=g.y;}position.y+=self.values[5];
+        let base=21+self.state.min(self.t.word(20).unwrap_or(0) as usize-1)*29;let count=self.t.word(10).unwrap_or(0);
+        Ok(Some((0..count).map(|i|cone(self.t.word(11).unwrap_or(0),position,self.state_time*f32::from_bits(self.t.word(base+9).unwrap_or(0))+std::f32::consts::TAU*i as f32/count as f32,[self.values[4]-self.values[5],self.values[3]+i as f32*f32::from_bits(self.t.word(13).unwrap_or(0)),self.values[2]+i as f32*f32::from_bits(self.t.word(12).unwrap_or(0))],self.colors.map(super::buff300x::packed_color),[self.values[0],self.values[1],self.values[6],self.values[7]],self.t.word(0).unwrap_or(0)&0x100!=0)).collect()))
     }
 }
 
@@ -123,7 +123,7 @@ struct Ring {position:Vec3,rotation:Quat,born:f32}
 pub(super) struct WaterRipples {t:Template,source:Mat4,previous:Vec3,elapsed:f32,last:f32,started:bool,stopped:bool,rings:Vec<Ring>,depth:f32,liquid_flags:u32,direction:Vec3}
 impl WaterRipples {
     pub(super) fn new(t:&Template,source:Mat4)->Result<Self> {ensure!(t.kind==3005,"not WaterRipples");t.word(24)?;ensure!((1..=4096).contains(&t.word(5)?),"invalid WaterRipples segments");for i in [2,3,4,8,10,11,15,16,20,21,22,23,24] {t.float(i)?;}ensure!(t.float(2)?>0.0,"invalid WaterRipples lifetime");Ok(Self{t:t.clone(),source,previous:source.w_axis.truncate(),elapsed:0.0,last:-1.0e30,started:false,stopped:false,rings:Vec::new(),depth:0.0,liquid_flags:0,direction:Vec3::Y})}
-    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {self.t.words[8]=d.to_bits();}}
+    pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {{ self.t.words.resize(self.t.words.len().max((8) + 1), 0); *self.t.words.get_mut(8).unwrap() = d.to_bits(); };}}
     pub(super) fn update_source(&mut self,m:Mat4)->Result<()> {self.source=m;Ok(())}
     pub(super) fn update_liquid(&mut self,depth:f32,flags:u32,direction:Vec3) {self.depth=depth;self.liquid_flags=flags;self.direction=direction;}
     pub(super) fn clear_liquid(&mut self) {self.depth= -9999.0;}
@@ -143,7 +143,7 @@ impl WaterRipples {
         }
         let lifetime=self.t.float(2)?;self.rings.retain(|r|self.elapsed-r.born<=lifetime);Ok(!self.stopped||!self.rings.is_empty())
     }
-    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {cone_models(self.t.words[9],self.rings.len() as u32,self.t.words[5])}
+    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {cone_models(self.t.word(9).unwrap_or(0),self.rings.len() as u32,self.t.word(5).unwrap_or(0))}
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::AlphaBlend;self.rings.len()]}
     pub(super) fn vertices(&self)->Result<Vec<Vec<Vertex>>> {
         let t=&self.t;let n=t.word(5)?;let lifetime=t.float(2)?;let mut out=Vec::with_capacity(self.rings.len());
@@ -218,8 +218,8 @@ mod tests {
         assert!(mesh.needs_ground());assert!(mesh.actor(1,9,&mut |_|None).unwrap().is_none());
         let actor=mesh.actor(1,9,&mut |p|Some((Vec3::new(p.x,11.0,p.z),Vec3::Y))).unwrap().unwrap();
         let transform=Mat4::from_cols_array_2d(&actor.transform);assert_eq!(transform.w_axis.truncate(),Vec3::new(3.0,13.0,5.0));assert_eq!(actor.alpha,1.0);
-        mesh.t.words[0]|=0x200;mesh.source_removed();assert!(mesh.frame(0.0).unwrap());
-        mesh.t.words[0]&=!0x200;mesh.source_removed();assert!(!mesh.frame(0.0).unwrap());
+        *mesh.t.words.get_mut(0).unwrap() |= 0x200;mesh.source_removed();assert!(mesh.frame(0.0).unwrap());
+        *mesh.t.words.get_mut(0).unwrap() &= !0x200;mesh.source_removed();assert!(!mesh.frame(0.0).unwrap());
         mesh.stopped=false;mesh.terminate_gracefully();assert!(!mesh.frame(0.0).unwrap());
     }
     #[test]
@@ -299,4 +299,28 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn short_splash_defaults_missing_fields_to_zero() {
+    let mut words=vec![0;14];words[13]=3;
+    let mut effect=Splash::new(&Template {kind:3002,words},Mat4::IDENTITY).unwrap();
+    assert_eq!(effect.t.float(31).unwrap(),0.0);
+    assert_eq!(effect.models().len(),0);
+    assert!(effect.blends().is_empty());
+    assert!(!effect.frame(0.0).unwrap());
+}
+
+#[cfg(test)]
+#[test]
+fn short_mesh_configuration_materializes_only_zero_defaults() {
+    let mut mesh=TowerMesh {t:Template {kind:3010,words:Vec::new()},source:Mat4::IDENTITY,elapsed:0.0,started:false,stopped:false,scene:None,resource:0};
+    mesh.configure(EffectConfig {duration:Some(2.0),..Default::default()});
+    assert_eq!(mesh.t.float(8).unwrap(),2.0);
+    assert_eq!(mesh.t.word(0).unwrap(),0);
+    assert!(!mesh.needs_ground());
+    assert_eq!(mesh.alpha(),1.0);
+    mesh.source_removed();
+    assert!(!mesh.frame(0.0).unwrap());
 }

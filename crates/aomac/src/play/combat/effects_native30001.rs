@@ -24,33 +24,33 @@ impl ShockWave {
         Ok(Self {t:t.clone(),position:source.w_axis.truncate(),centers:vec![None;t.word(11)? as usize],cones:source.w_axis.truncate(),elapsed:0.0,started:false,stopped:false,track:false})
     }
     // Native matrix/position setters reject updates. Dynel tracking uses flag1.
-    pub(super) fn update_source(&mut self,m:Mat4) {if self.track && self.t.words[0]&1!=0 {self.position=m.w_axis.truncate();}}
-    pub(super) fn configure(&mut self,c:EffectConfig) {self.track=c.track_source&&c.source_identity.is_some();if let Some(d)=c.duration {self.t.words[8]=d.to_bits();}}
+    pub(super) fn update_source(&mut self,m:Mat4) {if self.track && self.t.word(0).unwrap_or(0)&1!=0 {self.position=m.w_axis.truncate();}}
+    pub(super) fn configure(&mut self,c:EffectConfig) {self.track=c.track_source&&c.source_identity.is_some();if let Some(d)=c.duration {self.t.words.resize(self.t.words.len().max(9),0);self.t.words[8]=d.to_bits();}}
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
-    pub(super) fn frame(&mut self,dt:f32)->Result<bool> {ensure!(dt.is_finite()&&dt>=0.0,"invalid ShockWave timestep");if self.started {self.elapsed+=dt;}else{self.started=true;}Ok(!self.stopped && self.elapsed<=self.t.float(8)?+self.t.float(23)?*(self.t.words[11].saturating_sub(1)) as f32)}
+    pub(super) fn frame(&mut self,dt:f32)->Result<bool> {ensure!(dt.is_finite()&&dt>=0.0,"invalid ShockWave timestep");if self.started {self.elapsed+=dt;}else{self.started=true;}Ok(!self.stopped && self.elapsed<=self.t.float(8)?+self.t.float(23)?*(self.t.word(11).unwrap_or(0).saturating_sub(1)) as f32)}
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
-        (0..self.t.words[11]).map(|_|(Some(self.t.words[9] as usize),strip(self.t.words[10]),(self.t.words[10] as usize+1)*2))
-        .chain((0..self.t.words[24]).map(|_|(Some(self.t.words[25] as usize),strip(self.t.words[26]),(self.t.words[26] as usize+1)*2))).collect()
+        (0..self.t.word(11).unwrap_or(0)).map(|_|(Some(self.t.word(9).unwrap_or(0) as usize),strip(self.t.word(10).unwrap_or(0)),(self.t.word(10).unwrap_or(0) as usize+1)*2))
+        .chain((0..self.t.word(24).unwrap_or(0)).map(|_|(Some(self.t.word(25).unwrap_or(0) as usize),strip(self.t.word(26).unwrap_or(0)),(self.t.word(26).unwrap_or(0) as usize+1)*2))).collect()
     }
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.t.words[0]&0x800!=0 {Blend::Additive}else{Blend::AlphaBlend};(self.t.words[11]+self.t.words[24]) as usize]}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.t.word(0).unwrap_or(0)&0x800!=0 {Blend::Additive}else{Blend::AlphaBlend};(self.t.word(11).unwrap_or(0)+self.t.word(24).unwrap_or(0)) as usize]}
     pub(super) fn vertices(&mut self,ground:&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.stopped {return Ok(None)}
-        let t=&self.t;let flags=t.words[0];let spacing=t.float(23)?;
-        let mut out=Vec::with_capacity((t.words[11]+t.words[24]) as usize);
-        for ring in 0..t.words[11] as usize {
+        let t=&self.t;let flags=t.word(0).unwrap_or(0);let spacing=t.float(23)?;
+        let mut out=Vec::with_capacity((t.word(11).unwrap_or(0)+t.word(24).unwrap_or(0)) as usize);
+        for ring in 0..t.word(11).unwrap_or(0) as usize {
             let phase=(self.elapsed-spacing*ring as f32)/t.float(8)?;
-            let mut v=Vec::with_capacity((t.words[10] as usize+1)*2);
+            let mut v=Vec::with_capacity((t.word(10).unwrap_or(0) as usize+1)*2);
             if phase>0.0 && phase<=1.0 {
                 let center=*self.centers[ring].get_or_insert(self.position);
-                for i in 0..=t.words[10] {
-                    let angle=std::f32::consts::TAU*i as f32/t.words[10] as f32;
+                for i in 0..=t.word(10).unwrap_or(0) {
+                    let angle=std::f32::consts::TAU*i as f32/t.word(10).unwrap_or(0) as f32;
                     for end in 0..2 {
                         let mut radius=t.float(12+end)?*(1.0-phase)+t.float(16+end)?*phase;
                         if flags&0x2000!=0 {radius=radius.max(0.0);}
                         let mut p=center+Vec3::new(angle.cos()*radius,0.0,angle.sin()*radius);
                         p.y=ground(p).map_or(0.0,|(p,_)|p.y)+t.float(22)?;
-                        let uv=if flags&0x1000!=0 {[i as f32*t.float(20)?/t.words[10] as f32,end as f32*t.float(21)?]}else{[p.x*t.float(20)?,p.z*t.float(21)?]};
-                        v.push(Vertex {pos:p.to_array(),normal:[0.0,1.0,0.0],uv,color:color(t.words[14+end],t.words[18+end],phase)});
+                        let uv=if flags&0x1000!=0 {[i as f32*t.float(20)?/t.word(10).unwrap_or(0) as f32,end as f32*t.float(21)?]}else{[p.x*t.float(20)?,p.z*t.float(21)?]};
+                        v.push(Vertex {pos:p.to_array(),normal:[0.0,1.0,0.0],uv,color:color(t.word(14+end).unwrap_or(0),t.word(18+end).unwrap_or(0),phase)});
                     }
                 }
             }
@@ -59,16 +59,16 @@ impl ShockWave {
         let cycle=self.elapsed/spacing;let phase=cycle.fract();
         if phase<0.1 {self.cones=self.position;}
         let (bottom_alpha,top_alpha)=if phase<0.1 {(phase*10.0,phase*10.0)}else if phase<0.2 {(1.0,2.0-phase*10.0)}else {((1.0-(phase-0.2)/0.8).max(0.0),0.0)};
-        for cone in 0..t.words[24] {
-            let mut v=Vec::with_capacity((t.words[26] as usize+1)*2);
-            if (cycle as u32)<t.words[11] {
-                for i in 0..=t.words[26] {
-                    let a=std::f32::consts::TAU*i as f32/t.words[26] as f32;
+        for cone in 0..t.word(24).unwrap_or(0) {
+            let mut v=Vec::with_capacity((t.word(26).unwrap_or(0) as usize+1)*2);
+            if (cycle as u32)<t.word(11).unwrap_or(0) {
+                for i in 0..=t.word(26).unwrap_or(0) {
+                    let a=std::f32::consts::TAU*i as f32/t.word(26).unwrap_or(0) as f32;
                     for end in 0..2 {
                         let radius=if end==0 {t.float(30)?+cone as f32*t.float(32)?}else{t.float(31)?*t.float(33)?.powi(cone as i32)+cone as f32*t.float(32)?};
                         let p=self.cones+Vec3::new(a.cos()*radius,end as f32*t.float(29)?,a.sin()*radius);
-                        let uv=if flags&0x4000!=0 {[end as f32*t.float(27)?,i as f32*t.float(28)?/t.words[26] as f32]}else{[i as f32*t.float(27)?/t.words[26] as f32,end as f32*t.float(28)?]};
-                        let mut c=super::buff300x::packed_color(t.words[34+end]);c[3]*=if end==0 {bottom_alpha}else{top_alpha};
+                        let uv=if flags&0x4000!=0 {[end as f32*t.float(27)?,i as f32*t.float(28)?/t.word(26).unwrap_or(0) as f32]}else{[i as f32*t.float(27)?/t.word(26).unwrap_or(0) as f32,end as f32*t.float(28)?]};
+                        let mut c=super::buff300x::packed_color(t.word(34+end).unwrap_or(0));c[3]*=if end==0 {bottom_alpha}else{top_alpha};
                         v.push(Vertex {pos:p.to_array(),normal:[0.0,1.0,0.0],uv,color:c});
                     }
                 }
@@ -85,13 +85,13 @@ impl Deformer {
     pub(super) fn new(t:&Template,c:EffectConfig)->Result<Self> {
         ensure!(t.kind==3001,"not Deformer");for i in [8,11,12,13] {t.float(i)?;}
         ensure!(matches!(t.word(10)?,0|1|4),"un-authored Deformer mode");
-        let mut t=t.clone();if let Some(d)=c.duration {t.words[8]=d.to_bits();}
-        let mut locals=Vec::new();if t.words[10]==0 {let n=t.word(14)?;ensure!(n<=4096,"Deformer attractor count");for i in 0..n as usize {let j=15+i*6;let radius=t.float(j+4)?;ensure!(radius>0.0,"Deformer radius");locals.push(Local {a:t.word(j)? as i32,b:t.word(j+1)? as i32,frequency:t.float(j+2)?,phase:t.float(j+3)?,radius,strength:t.float(j+5)?,center:Vec3::ZERO});}}
-        if t.words[10]==1 {t.float(14)?;t.float(15)?;}
-        if t.words[10]==4 {ensure!(t.float(12)?>0.0,"Deformer morph transition");}
+        let mut t=t.clone();if let Some(d)=c.duration {t.words.resize(t.words.len().max(9),0);t.words[8]=d.to_bits();}
+        let mut locals=Vec::new();if t.word(10)?==0 {let n=t.word(14)?;ensure!(n<=4096,"Deformer attractor count");for i in 0..n as usize {let j=15+i*6;let radius=t.float(j+4)?;ensure!(radius>0.0,"Deformer radius");locals.push(Local {a:t.word(j)? as i32,b:t.word(j+1)? as i32,frequency:t.float(j+2)?,phase:t.float(j+3)?,radius,strength:t.float(j+5)?,center:Vec3::ZERO});}}
+        if t.word(10)?==1 {t.float(14)?;t.float(15)?;}
+        if t.word(10)?==4 {ensure!(t.float(12)?>0.0,"Deformer morph transition");}
         Ok(Self {t,elapsed:0.0,started:false,stop:None,intensity:0.0,actor:None,locals})
     }
-    pub(super) fn mode(&self)->u32 {self.t.words[10]}
+    pub(super) fn mode(&self)->u32 {self.t.word(10).unwrap_or(0)}
     pub(super) fn prepare_source(&mut self,_scene:&Scene,actor:&ActorFrame)->Result<bool> {self.actor=Some(actor.id);Ok(false)}
     pub(super) fn terminate_gracefully(&mut self) {if self.stop.is_none() {self.stop=Some((self.elapsed,self.intensity));}}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {
@@ -108,16 +108,16 @@ impl Deformer {
         for (v,rest) in vertices.iter_mut().zip(original) {
             let mut p=Vec3::from_array(v.pos);let n=Vec3::from_array(v.normal);
             if self.mode()==0 {for l in &self.locals {let distance=p.distance(l.center);let weight=(1.0-distance/l.radius).clamp(0.0,1.0);p+=n*(l.strength*weight*self.intensity);}}
-            else if self.mode()==1 {let q=Vec3::from_array(rest.pos);let time=f32::from_bits(self.t.words[14])*self.elapsed;let phase=((q.x+time*13.0)*13.0+(q.y-time*11.0)*17.0+q.z*time*19.0)*11.0+time;p+=n*(phase.sin().powi(2)*f32::from_bits(self.t.words[15])*self.intensity);}
+            else if self.mode()==1 {let q=Vec3::from_array(rest.pos);let time=f32::from_bits(self.t.word(14).unwrap_or(0))*self.elapsed;let phase=((q.x+time*13.0)*13.0+(q.y-time*11.0)*17.0+q.z*time*19.0)*11.0+time;p+=n*(phase.sin().powi(2)*f32::from_bits(self.t.word(15).unwrap_or(0))*self.intensity);}
             else {let f=self.morph_fraction();let mut q=p;if q.y>1.5 {q.y-=1.5;q=q.normalize_or_zero()*0.2;q.y+=1.5;}else {let y=q.y;q.y=0.0;q=q.normalize_or_zero()*0.2;q.y=y;}p=p*(1.0-f)+q*f;}
             v.pos=p.to_array();
         }
     }
     pub(super) fn apply_actor(&self,actors:&mut[ActorFrame],original:&[Vertex]) {if self.mode()!=4 {if let Some(actor)=actors.iter_mut().find(|a|Some(a.id)==self.actor) {if let Some(v)=actor.skin.as_mut() {self.deform(v,original);}}}}
-    pub(super) fn morph_fraction(&self)->f32 {let rise=f32::from_bits(self.t.words[12]);let hold=f32::from_bits(self.t.words[13]);if self.elapsed<rise {self.elapsed/rise}else if self.elapsed<=rise+hold {1.0}else{1.0-(self.elapsed-rise-hold)/rise}}
+    pub(super) fn morph_fraction(&self)->f32 {let rise=f32::from_bits(self.t.word(12).unwrap_or(0));let hold=f32::from_bits(self.t.word(13).unwrap_or(0));if self.elapsed<rise {self.elapsed/rise}else if self.elapsed<=rise+hold {1.0}else{1.0-(self.elapsed-rise-hold)/rise}}
     pub(super) fn morph_alpha(&self)->f32 {self.morph_fraction()*0.7+0.15}
-    pub(super) fn morph_child_should_stop(&self)->bool {self.elapsed>f32::from_bits(self.t.words[12])+f32::from_bits(self.t.words[13])}
-    pub(super) fn transition_time(&self)->f32 {f32::from_bits(self.t.words[12])}
+    pub(super) fn morph_child_should_stop(&self)->bool {self.elapsed>f32::from_bits(self.t.word(12).unwrap_or(0))+f32::from_bits(self.t.word(13).unwrap_or(0))}
+    pub(super) fn transition_time(&self)->f32 {f32::from_bits(self.t.word(12).unwrap_or(0))}
 }
 
 pub(super) struct MorphVisual {
@@ -147,6 +147,19 @@ impl MorphVisual {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn short_native_records_zero_default_fields()->Result<()> {
+        let mut d=Deformer::new(&Template {kind:3001,words:vec![]},EffectConfig {duration:Some(2.0),..Default::default()})?;
+        assert_eq!(d.mode(),0);assert_eq!(d.t.float(8)?,2.0);assert_eq!(d.t.word(14)?,0);
+        assert!(d.frame(0.0)?);
+        let mut words=vec![0;24];words[8]=1.0f32.to_bits();words[10]=3;words[11]=1;words[23]=1.0f32.to_bits();
+        let mut s=ShockWave::new(&Template {kind:3000,words},Mat4::IDENTITY)?;
+        assert_eq!(s.models().len(),1);assert_eq!(s.t.word(24)?,0);
+        s.frame(0.0)?;s.frame(0.5)?;
+        let vertices=s.vertices(&mut |_|None)?.unwrap();
+        assert_eq!(vertices.len(),1);assert_eq!(vertices[0][0].color,[0.0;4]);
+        Ok(())
+    }
     #[test]
     fn authored_30101_terrain_rings_and_cones() {
         let t=Template {kind:3000,words:vec![14337,0,0,0,0,0,0,0,1080033280,34,40,6,3221225472,0,4294938656,4294938656,1092616192,1094713344,16711935,16711935,1092616192,3212836864,1045891645,1053609165,5,13,10,1065353216,1065353216,1101004800,1050253722,1050253722,3175926989,1061158912,2164232192,16711935]};
@@ -206,6 +219,11 @@ mod tests {
         ensure!(ids.len()==16,"authored native3000/3001 census changed");
         for id in ids {
             r.clear();
+            // Tracked native constructors resolve the source before the first frame.
+            let (skin,parts)=visual.rig.pose(Some((&visual.clip,0.0)));
+            let actor=ActorFrame {id:1,model:1,transform:source.to_cols_array_2d(),skin:Some(skin),parts,..Default::default()};
+            r.prepare_source_mesh((50000,1),visual.model(),&actor);
+            r.prepare_anchors((50000,1),|_,anchor|visual.rig.effect_anchor_composed(anchor,std::iter::empty()).map(|m|source*Mat4::from_cols_array_2d(&m)));
             let handle=r.spawn_configured(Binding {group:0,attractor:0,effect:id,note:0,color:0},source,origin,EffectConfig {source_identity:Some((50000,1)),track_source:true,..Default::default()})?;
             ensure!(handle!=0,"authored native class did not spawn: {id}");
             for frame in 1..=240 {

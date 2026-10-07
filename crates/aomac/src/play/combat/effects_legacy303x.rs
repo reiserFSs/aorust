@@ -33,26 +33,26 @@ impl Spiral2 {
         if self.elapsed<self.duration-1.0 {self.duration=self.elapsed+1.0;self.finish=Some((self.elapsed/self.duration,self.curves[1].scalar(0.0),self.curves[0].color(0.0)));}
     }
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
-        let n=self.template.words[11]*2;
+        let n=self.template.word(11).unwrap_or(0)*2;
         let indices=(0..n-2).flat_map(|i|if i&1==0 {[i,i+2,i+1]}else{[i,i+1,i+2]}).collect::<Vec<_>>();
-        (0..self.template.words[10]).map(|_|(Some(self.template.words[9] as usize),indices.clone(),n as usize)).collect()
+        (0..self.template.word(10).unwrap_or(0)).map(|_|(Some(self.template.word(9).unwrap_or(0) as usize),indices.clone(),n as usize)).collect()
     }
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words[0]&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend};self.template.words[10] as usize]}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.word(0).unwrap_or(0)&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend};self.template.word(10).unwrap_or(0) as usize]}
     pub(super) fn vertices(&mut self,time:f32,_camera:Vec3,_right:Vec3,_up:Vec3,_gc:&mut R250)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.removed || (self.duration>=0.0 && time>self.duration) {return Ok(None);}
         if !self.scale_ready {return Ok(Some(Vec::new()));}
         let dt=(time-self.elapsed).max(0.0);self.elapsed=time;self.angle+=self.speed*dt;self.speed+=self.template.float(19)?*dt;
         let phase=time/self.duration;let (radius,c)=if let Some((start,r,c))=self.finish {let u=((phase-start)/(1.0-start)).clamp(0.0,1.0);let mut c=c;for v in &mut c {*v*=1.0-u;}(r+u,c)}else{(self.curves[1].scalar(phase),self.curves[0].color(phase))};
-        let radius=radius*self.scale;let t=&self.template;let count=t.words[11];
-        let rotation=Mat4::from_rotation_y(-self.angle);let mut out=Vec::with_capacity(t.words[10] as usize);
-        for layer in 0..t.words[10] {
+        let radius=radius*self.scale;let t=&self.template;let count=t.word(11).unwrap_or(0);
+        let rotation=Mat4::from_rotation_y(-self.angle);let mut out=Vec::with_capacity(t.word(10).unwrap_or(0) as usize);
+        for layer in 0..t.word(10).unwrap_or(0) {
             let mut vertices=Vec::with_capacity(count as usize*2);
             for i in 0..count {
-                let u=i as f32/count as f32;let theta=self.initial+layer as f32*SPIRAL_TAU/t.words[10] as f32+i as f32*t.float(16)?*self.scale/count as f32;
+                let u=i as f32/count as f32;let theta=self.initial+layer as f32*SPIRAL_TAU/t.word(10).unwrap_or(0) as f32+i as f32*t.float(16)?*self.scale/count as f32;
                 let mut fade=1.0;
                 if t.float(21)?>0.0 && u<t.float(21)? {fade=u/t.float(21)?;}
                 if t.float(20)?>0.0 && u>1.0-t.float(20)? {fade=(1.0-u)/t.float(20)?;}
-                if t.words[0]&0x400!=0 {fade*=(1.0+(theta*4.0+phase*t.float(12)?).sin())*0.5;}
+                if t.word(0).unwrap_or(0)&0x400!=0 {fade*=(1.0+(theta*4.0+phase*t.float(12)?).sin())*0.5;}
                 let mut c=c;c[3]=(c[3]*fade*255.0) as u8 as f32/255.0;
                 for (sign,v) in [(1.0,0.0),(-1.0,1.0)] {
                     let p=Vec3::new(theta.sin()*radius,u*t.float(14)?*self.scale+sign*t.float(13)?, -theta.cos()*radius);
@@ -70,11 +70,11 @@ impl AParticle {
         ensure!(t.kind==3035,"not AParticle");t.word(25)?;for i in (1..=6).chain([8]).chain(12..=23).chain([25]) {t.float(i)?;}
         ensure!(t.word(9)?<=2 && t.word(24)?<=3 && t.word(11)?<=u16::MAX as u32/4 && t.float(25)?>0.0,"invalid AParticle parameters");
         let material=materials::MATERIALS.get(t.word(10)? as usize).context("unknown AParticle material")?;
-        let mut at=26;let curve=Curve::parse(t,&mut at,true)?;let mut particles=Vec::with_capacity(t.words[11] as usize);
-        for _ in 0..t.words[11] {
-            let size=sample(t,17,18,gc)?;let frame=if t.words[0]&0x20000!=0 {material.3 as f32+(material.4-material.3) as f32*super::random_fraction(gc)}else{0.0};
+        let mut at=26;let curve=Curve::parse(t,&mut at,true)?;let mut particles=Vec::with_capacity(t.word(11).unwrap_or(0) as usize);
+        for _ in 0..t.word(11).unwrap_or(0) {
+            let size=sample(t,17,18,gc)?;let frame=if t.word(0).unwrap_or(0)&0x20000!=0 {material.3 as f32+(material.4-material.3) as f32*super::random_fraction(gc)}else{0.0};
             let phase=super::random_fraction(gc)*std::f32::consts::TAU;let frequency=sample(t,19,20,gc)?;let amplitude=sample(t,21,22,gc)?;
-            let position=cube(t.float(14)?,gc);let angle=if t.words[0]&0x4000!=0 {0.0}else{super::random_fraction(gc)*std::f32::consts::TAU};let spin=sample(t,15,16,gc)?.to_radians();
+            let position=cube(t.float(14)?,gc);let angle=if t.word(0).unwrap_or(0)&0x4000!=0 {0.0}else{super::random_fraction(gc)*std::f32::consts::TAU};let spin=sample(t,15,16,gc)?.to_radians();
             particles.push(AmbientParticle {position,angle,spin,size,frame,phase,frequency,amplitude});
         }
         Ok(Self {template:t.clone(),source:sprites::connector(t,source)?,duration:c.duration.unwrap_or(t.float(8)?),elapsed:0.0,particles,curve,center:None,wind:None,frame_rate:t.float(23)?,removed:false})
@@ -83,12 +83,12 @@ impl AParticle {
     pub(super) fn source_removed(&mut self) {self.removed=true;}
     pub(super) fn update_source(&mut self,source:Mat4)->Result<()> {self.source=sprites::connector(&self.template,source)?;Ok(())}
     pub(super) fn graceful(&mut self) {} // base 100a719a is a no-op.
-    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.words[10] as usize),(0..self.particles.len() as u32).flat_map(|i|{let b=i*4;[b,b+1,b+2,b+2,b+1,b+3]}).collect(),self.particles.len()*4)]}
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words[0]&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend}]}
+    pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.word(10).unwrap_or(0) as usize),(0..self.particles.len() as u32).flat_map(|i|{let b=i*4;[b,b+1,b+2,b+2,b+1,b+3]}).collect(),self.particles.len()*4)]}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.word(0).unwrap_or(0)&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend}]}
     pub(super) fn vertices(&mut self,time:f32,_camera:Vec3,right:Vec3,up:Vec3,gc:&mut R250)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.removed || (self.duration>=0.0 && time>self.duration) {return Ok(None);}
         let center=self.center.context("AParticle needs actual native camera position")?;let wind=self.wind.context("AParticle needs actual environment oscillator channels")?;
-        let dt=(time-self.elapsed).max(0.0);self.elapsed=time;let t=&self.template;let m=&materials::MATERIALS[t.words[10] as usize];let mut vertices=Vec::with_capacity(self.particles.len()*4);
+        let dt=(time-self.elapsed).max(0.0);self.elapsed=time;let t=&self.template;let m=&materials::MATERIALS[t.word(10).unwrap_or(0) as usize];let mut vertices=Vec::with_capacity(self.particles.len()*4);
         for p in &mut self.particles {
             let bound=p.amplitude+t.float(14)?+5.0;let delta=p.position-center;
             if delta.abs().max_element()>bound+10.0 {p.position=center+cube(t.float(14)?,gc);}else{for axis in 0..3 {
@@ -96,16 +96,16 @@ impl AParticle {
                 if delta[axis]>bound {p.position[axis]=center[axis]-bound;}
             }}
             let mut pos=p.position;
-            if (1..=2).contains(&t.words[9]) {pos+=Vec3::new(p.phase.sin()+1.2*wind.x,p.phase.sin()*0.4,-(p.phase.cos()*0.7+2.0*wind.z*wind.x))*p.amplitude;if t.words[9]==2 {super::random_fraction(gc);}}
+            if (1..=2).contains(&t.word(9).unwrap_or(0)) {pos+=Vec3::new(p.phase.sin()+1.2*wind.x,p.phase.sin()*0.4,-(p.phase.cos()*0.7+2.0*wind.z*wind.x))*p.amplitude;if t.word(9).unwrap_or(0)==2 {super::random_fraction(gc);}}
             p.phase=(p.phase+p.frequency*dt)%std::f32::consts::TAU;
             let near=t.float(12)?.powi(2);let far=t.float(14)?.powi(2);let phase=((pos-center).length_squared()-near)/(far-near);let c=self.curve.color(phase.clamp(0.0,1.0));
             p.angle+=p.spin*dt;let x=(right*(-p.angle).cos()+up*(-p.angle).sin())*p.size;let y=(-right*(-p.angle).sin()+up*(-p.angle).cos())*(p.size/t.float(25)?);
-            if t.words[24]!=0 {p.frame+=dt*self.frame_rate;
-                if p.frame>m.4 as f32 {match t.words[24] {1=>p.frame=m.3 as f32,2=>p.frame=m.4 as f32,3=>{self.frame_rate= -self.frame_rate;p.frame+=dt*self.frame_rate;},_=>{}}}
-                if p.frame<m.3 as f32 && t.words[24]==3 {self.frame_rate= -self.frame_rate;p.frame+=dt*self.frame_rate;}
+            if t.word(24).unwrap_or(0)!=0 {p.frame+=dt*self.frame_rate;
+                if p.frame>m.4 as f32 {match t.word(24).unwrap_or(0) {1=>p.frame=m.3 as f32,2=>p.frame=m.4 as f32,3=>{self.frame_rate= -self.frame_rate;p.frame+=dt*self.frame_rate;},_=>{}}}
+                if p.frame<m.3 as f32 && t.word(24).unwrap_or(0)==3 {self.frame_rate= -self.frame_rate;p.frame+=dt*self.frame_rate;}
             }
             let frame=p.frame as i32;let u=frame.rem_euclid(m.1 as i32) as f32/m.1 as f32;let v=(frame/m.1 as i32) as f32/m.2 as f32;let du=1.0/m.1 as f32;let dv=1.0/m.2 as f32;
-            let uv=if t.words[0]&0x100!=0 {[[u,v],[u,v+dv],[u+du,v],[u+du,v+dv]]}else{[[u,v],[u+du,v],[u,v+dv],[u+du,v+dv]]};
+            let uv=if t.word(0).unwrap_or(0)&0x100!=0 {[[u,v],[u,v+dv],[u+du,v],[u+du,v+dv]]}else{[[u,v],[u+du,v],[u,v+dv],[u+du,v+dv]]};
             quad(&mut vertices,[pos+x+y,pos+y-x,pos+x-y,pos-x-y],uv,color(c));
         }Ok(Some(vec![vertices]))
     }
@@ -113,27 +113,27 @@ impl AParticle {
 
 pub(super) struct Toggle {template:Template,source:Mat4,target:Vec3,config:EffectConfig,elapsed:f32,child:u32,terminating:bool,moving:bool,motion:Option<(f32,i32)>,playfield:Option<(u32,u32)>,removed:bool}
 impl Toggle {
-    pub(super) fn new(t:&Template,source:Mat4,target:Vec3,c:EffectConfig)->Result<Self> {ensure!(t.kind==3036,"not Toggle");t.float(1)?;let count=t.word(4)? as usize;ensure!(count<=t.words.len().saturating_sub(5),"truncated Toggle playfield list");Ok(Self {template:t.clone(),source,target,config:c,elapsed:0.0,child:0,terminating:false,moving:false,motion:None,playfield:None,removed:false})}
+    pub(super) fn new(t:&Template,source:Mat4,target:Vec3,c:EffectConfig)->Result<Self> {ensure!(t.kind==3036,"not Toggle");t.float(1)?;Ok(Self {template:t.clone(),source,target,config:c,elapsed:0.0,child:0,terminating:false,moving:false,motion:None,playfield:None,removed:false})}
     pub(super) fn update_source(&mut self,source:Mat4) {self.source=source;}
     pub(super) fn set_playfield(&mut self,id:u32,flags:u32) {self.playfield=Some((id,flags));}
     pub(super) fn set_motion(&mut self,speed:f32,direction:i32) {self.motion=Some((speed,direction));}
     pub(super) fn source_removed(&mut self) {self.removed=true;}
-    fn permitted(&self)->Result<bool> {let (id,flags)=self.playfield.context("Toggle needs actual playfield resource")?;let t=&self.template;if t.words[3]!=0 && flags&t.words[3]==0 {return Ok(false);}let listed=t.words[5..5+t.words[4] as usize].contains(&id);Ok(if t.words[0]&0x800!=0 {!listed}else{listed})}
-    fn update_motion(&mut self)->Result<bool> {let old=self.moving;if self.template.words[0]&0x6000!=0 {let (speed,direction)=self.motion.context("Toggle needs actual vehicle motion")?;if self.template.words[0]&0x2000!=0 && direction>0 {self.moving=speed>0.0;}}Ok(old)}
-    pub(super) fn graceful(&mut self,renderer:&mut Renderer)->Result<()> {self.template.words[0]&=!0x400;if self.child!=0 {renderer.terminate_gracefully(self.child);}self.terminating=true;Ok(())}
+    fn permitted(&self)->Result<bool> {let (id,flags)=self.playfield.context("Toggle needs actual playfield resource")?;let t=&self.template;if t.word(3)?!=0 && flags&t.word(3)?==0 {return Ok(false);}let count=t.word(4)? as usize;let list=t.words.get(5..).unwrap_or(&[]);let listed=list.iter().take(count).any(|&word|word==id)||(id==0&&count>list.len());Ok(if t.word(0)?&0x800!=0 {!listed}else{listed})}
+    fn update_motion(&mut self)->Result<bool> {let old=self.moving;if self.template.word(0).unwrap_or(0)&0x6000!=0 {let (speed,direction)=self.motion.context("Toggle needs actual vehicle motion")?;if self.template.word(0).unwrap_or(0)&0x2000!=0 && direction>0 {self.moving=speed>0.0;}}Ok(old)}
+    pub(super) fn graceful(&mut self,renderer:&mut Renderer)->Result<()> {self.template.words.resize(self.template.words.len().max(1),0);*self.template.words.get_mut(0).unwrap() &= !0x400;if self.child!=0 {renderer.terminate_gracefully(self.child);}self.terminating=true;Ok(())}
     pub(super) fn cancel(&mut self,renderer:&mut Renderer) {if self.child!=0 {renderer.delete(self.child);self.child=0;}}
     pub(super) fn frame(&mut self,dt:f32,renderer:&mut Renderer)->Result<bool> {
         self.elapsed+=dt;if self.removed || (self.template.float(1)?>=0.0 && self.elapsed>self.template.float(1)?) {self.cancel(renderer);return Ok(false);}
-        if self.child!=0 && !renderer.is_active(self.child) {self.child=0;if self.template.words[0]&0x400==0 || self.terminating {return Ok(false);}}
+        if self.child!=0 && !renderer.is_active(self.child) {self.child=0;if self.template.word(0).unwrap_or(0)&0x400==0 || self.terminating {return Ok(false);}}
         if self.child==0 && !self.terminating {
             if !self.permitted()? {return Ok(true);}
-            if self.config.creation==Creation::Dynel {let old=self.update_motion()?;if self.template.words[0]&0x2000!=0 && (!self.moving || old) {return Ok(true);}}
+            if self.config.creation==Creation::Dynel {let old=self.update_motion()?;if self.template.word(0).unwrap_or(0)&0x2000!=0 && (!self.moving || old) {return Ok(true);}}
             let mut c=self.config;c.duration=None;c.start_color=None;c.stop_color=None;c.repetitions=None;
-            if self.template.words[0]&0x1000!=0 {c.creation=Creation::Unlocated;c.source_identity=None;c.track_source=false;}
-            self.child=renderer.spawn_configured(Binding {group:0,attractor:0,effect:self.template.words[2] as i32,note:0,color:0},self.source,self.target,c)?;
+            if self.template.word(0).unwrap_or(0)&0x1000!=0 {c.creation=Creation::Unlocated;c.source_identity=None;c.track_source=false;}
+            self.child=renderer.spawn_configured(Binding {group:0,attractor:0,effect:self.template.word(2).unwrap_or(0) as i32,note:0,color:0},self.source,self.target,c)?;
             return Ok(true);
         }
-        if self.child!=0 && self.template.words[0]&0x8000!=0 {let old=self.update_motion()?;if !self.moving && old {renderer.terminate_gracefully(self.child);}}
+        if self.child!=0 && self.template.word(0).unwrap_or(0)&0x8000!=0 {let old=self.update_motion()?;if !self.moving && old {renderer.terminate_gracefully(self.child);}}
         Ok(self.child!=0)
     }
 }
@@ -204,8 +204,20 @@ mod tests {
                     let mut sub=Submesh::new(models[i].1.clone(),Some(key));sub.blend=blends[i];sub.two_sided=true;sub.emissive=[1.0;3];
                     scene.meshes.push(Mesh {vertices,submeshes:vec![sub]});
                 }
+                scene.instances.extend((0..scene.meshes.len()).map(|mesh|ao_scene::Instance {mesh,transform:Mat4::IDENTITY.to_cols_array_2d()}));
+                assert_eq!(scene.instances.len(),scene.meshes.len(),"every legacy303x fixture mesh must be drawable");
                 ao_render::render_to_png_actors(&scene,&[],Vec::<ActorFrame>::new(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy303x_{id}_{frame}.png")),time)?;
             }
         }Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn short_toggle_defaults_missing_fields_to_zero() {
+    let mut effect=Toggle::new(&Template {kind:3036,words:Vec::new()},Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default()).unwrap();
+    effect.set_playfield(1,0);
+    assert!(!effect.permitted().unwrap());
+    assert!(!effect.update_motion().unwrap());
+    assert_eq!(effect.template.word(2).unwrap(),0);
 }

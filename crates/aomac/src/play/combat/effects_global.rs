@@ -31,7 +31,7 @@ impl GlobalEffect {
     pub(super) fn new(t:&Template)->Result<Self> {
         ensure!(matches!(t.kind,1000|1014|1015|3037),"not a global control");
         // CMSBlock float getter10106893 returns zero for absent parameters.
-        let get=|i|if i<t.words.len(){t.float(i)}else{Ok(0.0)};
+        let get=|i|t.float(i);
         let mut layers=Vec::new();
         if t.kind==3037 {
             let count=t.word(0)? as usize;

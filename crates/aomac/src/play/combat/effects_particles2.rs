@@ -30,7 +30,6 @@ impl ParticleEffect {
     pub(super) fn supports(kind:i32)->bool {kind==3028}
     pub(super) fn new(t:&Template,source:Mat4,_target:Mat4,_color:u32,gc:&mut R250,_ds:&mut R250,_crt:&mut CrtRand)->Result<Self> {
         ensure!(Self::supports(t.kind),"unsupported BParticle class {}",t.kind);
-        t.word(34)?;
         let integers=[0,7,9,10,11,15,32,34,35];
         let end=35;
         for i in 0..end {if !integers.contains(&i) {ensure!(float(t,i).is_finite(),"nonfinite BParticle parameter {i}");}}
@@ -120,7 +119,8 @@ impl ParticleEffect {
             quad(&mut vertices,positions,uv,render(color));
         }
             if (word(t,9)==0 || self.terminated) && alive==0 {return Ok(None);}
-            if !self.terminated && word(t,9)==1 && (self.duration<0.0 || time<self.duration-float(t,26)) && float(t,12)>0.0 && self.emission>float(t,12) {
+            // GC1010af47 accepts zero intervals too: emit once per positive-dt process.
+            if !self.terminated && word(t,9)==1 && (self.duration<0.0 || time<self.duration-float(t,26)) && float(t,12)>=0.0 && self.emission>float(t,12) {
                 let mut emitted=0;for i in 0..self.particles.len() {if self.particles[i].remaining<=0.0 {
                     self.emission=0.0;let mut p=self.emit(gc);
                     if word(&self.template,0)&0x10000!=0 {let query=terrain.as_mut().context("BParticle2 ground emission requires terrain")?;p.position.y=query(p.position).context("missing BParticle2 emission ground")?.0.y+float(&self.template,2);}
@@ -171,6 +171,21 @@ mod tests {
         effect.set_visible(true,10.01);
         assert_eq!(effect.previous,10.0);assert_eq!(effect.emission,0.25);assert_eq!(effect.particles[0].remaining,2.0);
     }
+    #[test]
+    fn authored_zero_interval_recycles_once_per_process()->Result<()> {
+        let templates=super::super::Templates::open(&ao_gui::client_dir())?;
+        let t=&templates.by_id[&72219];
+        assert_eq!(word(t,9),1);assert_eq!(float(t,12),0.0);
+        let mut gc=R250::new(0xe6f1);let mut ds=R250::new(0xe6f1);let mut crt=CrtRand::new(1);
+        let mut effect=ParticleEffect::new(t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt)?;
+        assert!(effect.particles.iter().all(|p|p.remaining==0.0));
+        effect.vertices(0.01,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt,None)?;
+        assert_eq!(effect.particles.iter().filter(|p|p.remaining>0.0).count(),word(t,15) as usize);
+        effect.vertices(0.02,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt,None)?;
+        assert_eq!(effect.particles.iter().filter(|p|p.remaining>0.0).count(),2*word(t,15) as usize);
+        Ok(())
+    }
+
 
     #[test]
     #[ignore = "requires installed retail gfxtweak and offscreen GPU rendering"]

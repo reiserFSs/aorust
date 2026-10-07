@@ -52,18 +52,18 @@ impl Vein {
             let phase=ring as f32/(layers+1) as f32;
             let byte=|a:u32,b:u32,shift:u32| -> f32 {((phase*((a>>shift)&255) as f32+(1.0-phase)*((b>>shift)&255) as f32) as u32&255) as f32/255.0};
             let rgba=|a:u32,b:u32|[byte(a,b,16).powf(2.2),byte(a,b,8).powf(2.2),byte(a,b,0).powf(2.2),phase*(a>>24) as f32+(1.0-phase)*(b>>24) as f32];
-            colors.push([rgba(t.words[24],t.words[25]),rgba(t.words[26],t.words[27])]);
+            colors.push([rgba(t.word(24).unwrap_or(0),t.word(25).unwrap_or(0)),rgba(t.word(26).unwrap_or(0),t.word(27).unwrap_or(0))]);
         }
         Ok(Self {template:t.clone(),position:sprites::connector(t,source)?.w_axis.truncate(),config:c,elapsed:0.0,started:false,advanced:false,dead:false,children:[0;2],weights,rings:vec![Vec3::ZERO;count],facing:vec![0.0;count],heights,colors,sides,layers})
     }
     // Native public UpdatePosition/UpdateMatrix slots reject the request.
     pub(super) fn refresh_source(&mut self,source:Option<Mat4>)->Result<()> {
-        if self.template.words[0]&0x1000!=0 {
+        if self.template.word(0).unwrap_or(0)&0x1000!=0 {
             if let Some(source)=source {self.position=sprites::connector(&self.template,source)?.w_axis.truncate();}else{self.dead=true;}
         }
         Ok(())
     }
-    pub(super) fn requires_terrain(&self)->bool {self.template.words[0]&0x4000!=0}
+    pub(super) fn requires_terrain(&self)->bool {self.template.word(0).unwrap_or(0)&0x4000!=0}
     pub(super) fn set_ground_height(&mut self,height:f32) {self.position.y=height;}
     pub(super) fn graceful(&mut self) {self.dead=true;}
     pub(super) fn cancel(&mut self,renderer:&mut Renderer) {for child in &mut self.children {if *child!=0 {renderer.delete(*child);*child=0;}}}
@@ -75,19 +75,19 @@ impl Vein {
             self.advanced=true;
         } else {
             self.started=true;
-            for i in 0..2 {let id=self.template.words[28+i] as i32;if id!=0 {
+            for i in 0..2 {let id=self.template.word(28+i).unwrap_or(0) as i32;if id!=0 {
                 let mut p=self.position;if i==1 {p.x*=0.5;p.z*=0.5;}
                 self.children[i]=renderer.spawn_configured(Binding {group:0,attractor:0,effect:id,note:0,color:0},Mat4::from_translation(p),p,EffectConfig {creation:Creation::Vector,..EffectConfig::default()})?;
             }}
         }
-        let lifetime=self.config.duration.unwrap_or(f32::from_bits(self.template.words[8]));
+        let lifetime=self.config.duration.unwrap_or(f32::from_bits(self.template.word(8).unwrap_or(0)));
         if self.dead || (lifetime>=0.0&&self.elapsed>lifetime) || self.elapsed>=self.template.float(11)?+self.template.float(12)? {self.cancel(renderer);return Ok(false);}
         Ok(true)
     }
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {
         let per=(self.sides+1)*2;let count=per*self.layers;
         let indices:Vec<_>=(0..self.layers).flat_map(|layer|(0..self.sides).flat_map(move|i|{let a=(layer*per+i*2) as u32;[a,a+1,a+2,a+2,a+1,a+3]})).collect();
-        vec![(Some(self.template.words[9] as usize),indices.clone(),count),(Some(self.template.words[9] as usize),indices,count)]
+        vec![(Some(self.template.word(9).unwrap_or(0) as usize),indices.clone(),count),(Some(self.template.word(9).unwrap_or(0) as usize),indices,count)]
     }
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::Additive;2]}
     pub(super) fn vertices(&mut self,time:f32,camera:Vec3,right:Vec3,up:Vec3)->Result<Option<Vec<Vec<Vertex>>>> {
@@ -103,7 +103,7 @@ impl Vein {
             let controls=controls(timer);
             let radius=bottom*(1.0-layer as f32/self.layers as f32)+top*(layer as f32/self.layers as f32);
             let mut offset=Vec3::ZERO;
-            if self.template.words[0]&0x10000!=0 {
+            if self.template.word(0).unwrap_or(0)&0x10000!=0 {
                 let h=self.heights[layer];let scale=(self.template.float(20)? as f64*f64::from_bits(0x3f9eb851e0000000)*(1.0-layer as f64/self.layers as f64)) as f32;
                 let a=(time as f64*f64::from_bits(0x4008ccccc0000000)+h as f64*f64::from_bits(0x3fb1eb8520000000)) as f32;
                 let b=(time as f64*f64::from_bits(0x40059999a0000000)+h as f64*f64::from_bits(0x3fc0a3d700000000)) as f32;
@@ -121,7 +121,7 @@ impl Vein {
         let (sin,cos)=time.sin_cos();let second_scale=f64::from_bits(0x3fe6666660000000) as f32;
         let vscroll=(time as f64*V_SCROLL) as f32;
         let uscale=self.template.float(15)?;let vscale=self.template.float(16)?;
-        let swapped=self.template.words[0]&0x100!=0;
+        let swapped=self.template.word(0).unwrap_or(0)&0x100!=0;
         let uvstep=if swapped {vscale}else{uscale}/self.sides as f32;
         for layer in 0..self.layers {
             let mut uvphase=0.0;
@@ -169,6 +169,34 @@ fn controls(time:f32)->[[f64;2];9] {
 mod tests {
     use super::*;
     fn authored()->Template {Template {kind:3014,words:vec![0x203,0,0,0,0,0,0,0,0xbf800000,48,6,0x3f99999a,0x48afc800,1,30,0x40800000,0x3e4ccccd,0x40800000,0x40400000,0x3dcccccd,0x3f800000,0x3ca3d70a,0x3dcccccd,0,0x7ed6,0xff007ed6,0x7ed6,0xff00c27e,0,0]}}
+    fn fixture_view(n:&Vein)->(Vec3,Vec3) {
+        let height=n.heights.iter().copied().map(f32::abs).fold(0.0,f32::max);
+        let bottom=n.template.float(18).unwrap().abs();
+        let radial=bottom.max(n.template.float(19).unwrap().abs())*1.4*2.0f32.sqrt();
+        let sway=if n.template.word(0).unwrap()&0x10000!=0 {
+            bottom*n.template.float(20).unwrap().abs()*0.03*height*2.0*2.0f32.sqrt()
+        } else {0.0};
+        // Cubic points stay in their control hull; include both rotated passes.
+        let radius=Vec3::new(radial+sway,height,radial+sway).length().max(1.0);
+        let mut distance=radius*2.4;
+        // DS grows distant geometry logarithmically; frame that native growth too.
+        for _ in 0..16 {
+            let scale=if distance>100.0 {(distance/f64::from_bits(0x404264db5a52cb99) as f32).ln().max(1.0)}else{1.0};
+            distance=distance.max(radius*scale*2.4);
+        }
+        (n.position+Vec3::new(2.0,2.0,5.0).normalize()*distance,n.position)
+    }
+    #[test]
+    fn vein_fixture_camera_contains_authored_geometry()->Result<()> {
+        let mut n=Vein::new(&authored(),Mat4::IDENTITY,EffectConfig::default())?;
+        let (eye,target)=fixture_view(&n);
+        for time in [0.0,0.25,0.5,1.0,2.0] {
+            for v in n.vertices(time,eye,Vec3::X,Vec3::Y)?.unwrap().iter().flatten() {
+                assert!(Vec3::from_array(v.pos).distance(target)<eye.distance(target)/2.4+0.001);
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn authored_12201_vein_cubic_periodicity_and_two_passes()->Result<()> {
         let mut n=Vein::new(&authored(),Mat4::IDENTITY,EffectConfig::default())?;
@@ -190,15 +218,19 @@ mod tests {
         use super::super::MODEL_BASE;
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").map(std::path::PathBuf::from).unwrap_or_else(||"/tmp/FxClasses/frames".into());std::fs::create_dir_all(&out)?;
         let mut renderer=Renderer::open(&ao_gui::client_dir())?;
-        let origin=Vec3::new(5000.0,10.0,5000.0);let eye=origin+Vec3::new(2.0,2.0,5.0);
-        let mut host=ao_render::Host::headless();host.camera=ao_render::Camera::look_at(eye,origin);
+        let origin=Vec3::new(5000.0,10.0,5000.0);
+        let mut host=ao_render::Host::headless();
         for id in [12200,12201,12202,12203,12206,96002,96003,96004,96005] {
+            let fixture=Vein::new(&renderer.templates.by_id[&id],Mat4::from_translation(origin),EffectConfig::default())?;
+            let (eye,target)=fixture_view(&fixture);
+            host.camera=ao_render::Camera::look_at(eye,target);
             renderer.clear();renderer.spawn(Binding {group:0,attractor:0,effect:id,note:0,color:0},Creation::Vector,Mat4::from_translation(origin),origin)?;
             for frame in 1..=120 {
-                host.actors.clear();renderer.frame(1.0/60.0,&mut host,None);
+                host.actors.clear();let mut terrain=|p:Vec3|Some((Vec3::new(p.x,origin.y,p.z),Vec3::Y));
+                renderer.frame(1.0/60.0,&mut host,Some(&mut terrain));
                 if [1,15,30,60,120].contains(&frame) {
                     let models:Vec<_>=renderer.models.iter().map(|(&id,m)|(MODEL_BASE|id as u32 as u64,m.scene.clone())).collect();
-                    ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("vein3014_{id}_{frame}.png")),frame as f32/60.0)?;
+                    ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),target.to_array(),640,480,&out.join(format!("vein3014_{id}_{frame}.png")),frame as f32/60.0)?;
                 }
             }
         }

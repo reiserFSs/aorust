@@ -109,6 +109,34 @@ mod tests {
         assert_eq!(actor.priority,None);assert_eq!(actor.part_priorities,[Some(-1)]);
     }
     #[test]
+    fn authored_meta_25002_forwards_source_and_changes_root_material()->Result<()> {
+        let dir=ao_gui::client_dir();
+        if !dir.join("Setupf/gfxtweak.bin").exists() || !dir.join("cd_image/rdb.db").exists() {return Ok(());}
+        let mut renderer=super::super::Renderer::open(&dir)?;
+        let identity=(50000,1);
+        let child=&renderer.templates.by_id[&11502];
+        assert_eq!((child.kind,child.word(1)?),(2011,1));
+        assert_eq!(renderer.templates.by_id[&25002].word(0)?,11502);
+        let handle=renderer.spawn_configured(super::super::Binding {group:0,attractor:0,effect:25002,note:0,color:0},glam::Mat4::IDENTITY,glam::Vec3::ZERO,EffectConfig {source_identity:Some(identity),creation:super::super::Creation::Dynel,..Default::default()})?;
+        renderer.prepare_anchors(identity,|_,_|Some(glam::Mat4::IDENTITY));
+        renderer.set_source_runtime(identity,1.0,1,None,0,true);
+        let mut host=ao_render::Host::headless();
+        // Meta initialization emits actual children; source preparation must
+        // reach its Highlight rather than only the composition parent.
+        let actor=ao_scene::ActorFrame {id:1,..Default::default()};
+        assert!(renderer.needs_source_mesh(identity));
+        renderer.prepare_source_mesh(identity,&ao_scene::Scene::default(),&actor);
+        host.actors.clear();host.actors.push(actor);
+        renderer.frame(0.5,&mut host,None);
+        let actor=host.actors.iter().find(|actor|actor.id==1).context("missing source actor")?;
+        assert_eq!(actor.alpha,1.0);
+        let expected=[0.3f32,0.3,0.6].map(|c|c.powf(2.2));
+        let actual=actor.emissive.context("Meta child did not apply root emissive")?;
+        for (a,e) in actual.into_iter().zip(expected) {assert!((a-e).abs()<1e-6);}
+        renderer.delete(handle);
+        Ok(())
+    }
+    #[test]
     #[ignore="installed authored assets and offscreen GPU regression"]
     fn retail_highlight_held_authored_frames()->Result<()> {
         use ao_formats::character::{actor::{ActorAssets,ActorRig,PlayerLook},Breed,Gender,Skin,Equipment};
@@ -118,6 +146,10 @@ mod tests {
         let assets=ActorAssets::new(&store)?;
         let look=PlayerLook {breed:Breed::Solitus,gender:Gender::Male,skin:Skin::Caucasian,build:1,head:None,equipment:Equipment::default()};
         let rig=ActorRig::player(&store,&assets,&look,&[(1,15839)])?;
+        let held=rig.part_attractors().iter().position(|place|place.is_some_and(|place|place!=0)).context("held Highlight fixture requires an actual non-head mounted mesh")?;
+        // Isolate the authored material envelope, not a retail lighting reference:
+        // the generic viewer's ambient + sun can saturate emissive to white.
+        let world=ao_scene::Scene {environment:Some(ao_scene::Environment {sky_color:[0.0;3],fog_color:[0.0;3],fog_start:100.0,fog_end:200.0,ambient:[0.0;3],sun_color:[0.0;3],sun_dir:[0.0,1.0,0.0],sun_specular:0.0}),..Default::default()};
         let templates=super::super::Templates::open(&ao_gui::client_dir())?;
         for id in [11507,11508] {
             let t=templates.by_id.get(&id).context("missing authored held highlight")?;
@@ -129,8 +161,11 @@ mod tests {
                 let mut actor=ao_scene::ActorFrame {id:1,model:1,skin:Some(skin),parts,part_attractors:rig.part_attractors(),..Default::default()};
                 h.apply(std::slice::from_mut(&mut actor));
                 assert!(actor.emissive.is_none());assert_eq!(actor.alpha,1.0);
+                assert_eq!(actor.part_materials[held].emissive,Some(std::array::from_fn(|i|h.color()[i+1].powf(2.2))));
+                assert_eq!(actor.part_materials[held].alpha,Some(h.color()[0]));
+                assert_eq!(actor.part_materials[held].specular,actor.part_materials[held].emissive);
                 if [0,15,30,45,60].contains(&frame) {
-                    ao_render::render_to_png_actors(&ao_scene::Scene::default(),&[(1,rig.model().clone())],vec![actor],[2.0,2.0,5.0],[0.0,1.0,0.0],640,480,&out.join(format!("highlight2011_{id}_{frame}.png")),frame as f32/60.0)?;
+                    ao_render::render_to_png_actors(&world,&[(1,rig.model().clone())],vec![actor],[2.0,2.0,5.0],[0.0,1.0,0.0],640,480,&out.join(format!("highlight2011_{id}_{frame}.png")),frame as f32/60.0)?;
                 }
             }
         }

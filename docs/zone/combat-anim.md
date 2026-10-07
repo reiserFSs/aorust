@@ -1134,6 +1134,41 @@ its harness supplies an authored-list-compatible playfield/mask context and
 a moving-to-stopped source transition, without rewriting templates or children.
 These additions have not been run or visually inspected.
 
+Contact inspection of snapshot7816a52 found blank Cylinder2601 captures:
+`retail_effect_frames` requested Vector although class1013 admits only
+hit-location/tracer creation. The fixture now supplies its existing hit endpoints
+through HitLocation. The legacy301x capture fixture now includes private buff
+and mesh resources, matching the legacy302x resource list.
+Trail12570/71000/71003 were blank despite moving sources: `Trail::vertices`
+returned variable-length strips (at most102 vertices) against104-vertex models,
+so `ao-render/src/actors.rs`'s exact skin-length gate discarded their skins.
+Each strip now retains104 vertices with transparent degenerate tail padding;
+the existing12570 regression asserts model/skin length before and after motion.
+These corrections have not been built, tested or recaptured here.
+
+The same fixed-camera limitation affected class3020/3024 inspection.
+Installed3020 records71033–71038 use mode1 endpoints in a ±130-unit cube;
+97100/97105 use ±5 endpoints and widths1.5→3→5 (their ±50 velocity words
+are inert in mode1). Record71104 mode2 occupies native Y0–600, whereas
+71105 mode3 is intentionally nonvisual. The3020 fixture now frames authored
+endpoint/emission, movement, trail and width bounds; mode2 also retains a
+close-up framed from the first actual particle's vertices.
+Installed3024 pulse71352 has half-width/height175;71115 has150 and
+71225/71228 have40, all additive and viewed previously from distance√33.
+The3024 fixture now frames authored width/height, geometry and motion bounds,
+but preserves any valid authored distance-visibility interval instead of
+moving beyond it. No native size/colour/geometry was changed; new captures
+remain unrun/uninspected by this worker.
+
+Crystal frame inspection of `crystal3031_0.png` exposed a harness camera
+inside the authored geometry: records71558/72365 have width words27/28=4/8,
+aspect33=0.5 (tail half-width8–16), growth30≈1.01 per process, versus the
+old camera distance√33≈5.74. Their flags0x203 select additive blending;
+overlapping near-camera strips saturated the sampled view. The harness now
+frames conservative authored emission/velocity/acceleration/trail/width bounds
+using `ao_render::default_view`'s sphere-framing factor2.4, without changing
+particle size, colour or native update logic. Updated frames are not yet inspected.
+
 #### Legacy geometry, mesh and audio variants
 
 | Class/family | Native implementation evidence |
@@ -1373,6 +1408,27 @@ An installed class marked `supported=true` in the census means renderer
 dispatch exists. `constructed` means its synthetic constructor succeeded;
 neither flag certifies runtime animation, GPU output or live combat.
 
+Short-template handling follows native CMS access semantics: absent scalar
+words/floats are zero, consistently in constructor, frame and configuration
+paths rather than guarded reads followed by unchecked indexing. This includes
+TParticle/sprite model, flags and colour inputs and LavaBall's wait value.
+Explicit packed-array bounds and nonfinite-value rejection remain errors.
+The new short-record regressions await the parent's integrated gate; this
+source correction is not yet a reported verification result.
+
+Further native frame corrections distinguish absent textures from absent
+geometry: GC `10106e2e` creates a material even when `the_wave.png` is
+unavailable, retaining geometry with a null texture. BParticle3024
+effect72219's zero interval is legal: GC `1010af47` tests `>=0` and emits
+its quota once per process call. The source/anchor harness now supplies
+real birth-pose mesh inputs before native3000/3001 creation, including
+71226's missing-root fixture. Their regressions await the parent's gate.
+The Vein3014 fixture likewise now provides required terrain for12203/12206
+flag0x4000 and fits the camera to the authored cubic-control hull and native
+logarithmic-distance growth. This repairs cropped/saturated test captures,
+not the native geometry or alpha; `vein_fixture_camera_contains_authored_geometry`
+and `retail_vein3014_frames` await the central gate.
+
 Concrete installed-art gap (not an unsupported class): TowerMesh3010
 effect61042 selects nameID201713, `tower_destroyed_buff&debuff_LL.abiff`,
 whose installed payload is absent; sibling selector IDs201710/201714/
@@ -1386,18 +1442,21 @@ but its native path is synchronous: GC `100ec363` asks ResourceManager
 GetSync; a null result leaves clone+0x48=0. Process `100ec273` advances
 base state but performs movement/distance expiry only with that clone,
 so the missing arrow retains a stationary nondrawing base control.
-TracerMesh3025 effect71123's absent `EP03_mech_heal_effect.abiff` instead
-uses GC `1010cf05`'s allocated VisualMesh/void SetMesh, pending callback
-`1010c526`, native controls and visibility. MParticle `1010fcd8` allocates
-every VisualMesh0xc0 before SetMesh/disable; missing payload registers
-`1010eeef` callback rather than deleting slots, and `1010f3da` processes
-the visual pointer. Its missing-heal regression changes actual71250's
-selector to the real absent resource; that is not an authored3027 census
-gap. Malformed present resources still propagate errors. GroundImpact
+TracerMesh3025 effect71123's `EP03_mech_heal_effect.abiff` is missing
+from the name directory, not merely missing a named record's payload.
+GC `1010cf05` sets done byte+0x14 and allocates no VisualMesh for an
+unresolved name. A resolved name with absent payload instead retains the
+allocated VisualMesh/void SetMesh, pending `1010c526` callback and timer.
+These are distinct native lifecycles, not interchangeable asset fallbacks.
+MParticle `1010fcd8` allocates every VisualMesh0xc0 before SetMesh/disable;
+a resolved name with absent payload registers `1010eeef` callback rather
+than deleting slots, and `1010f3da` processes the visual pointer.
+Its missing-resource regression is not an authored3027 census gap.
+Malformed present resources still propagate errors. GroundImpact
 `100e11e0` builds ForceSword geometry, not an absent mesh fallback.
 Added, not run by implementation workers:
 `installed_2693_missing_arrow_retains_stationary_control`,
-`installed_71123_missing_heal_retains_visual_control`,
+`installed_71123_missing_heal_terminates_control`,
 `installed_mparticle_missing_heal_keeps_slots_and_lifetime`.
 
 Executable provenance matters: the available
@@ -1425,6 +1484,16 @@ not a final all-class gate or retail/live equivalence claim. Live effect45083
 was **not verified**: the window closed without login. §7.8's native addresses
 and record values remain unchanged.
 
+The parent's later live observation used one muted `Aomacfixr` session
+under the live lock on clean snapshot `7816a52`: ICC4582,
+position930.01/24.21/759.67, a thirty-second wait and120 fixed frames.
+`/camp` returned to login with session=false and exit0. Effect45083 and
+a new combat effect were **not observed**. This was offscreen live evidence,
+not a retail comparison or real-window PASS. Partial rock occlusion and
+alternating foreground at static-camera frames50/102 were assigned to
+the separate CameraFlicker investigation; they are not effect-coverage
+successes and no second authentication was attempted.
+
 * The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
 * Native nulls and implementation gaps are separate (§7.9): class0 body
   profiles and class2003 cannot be constructed by any factory; missing
@@ -1432,10 +1501,21 @@ and record values remain unchanged.
   Actual native-constructible failures retain their ID/class/configuration
   error rather than substituting another visual.
 * Source-record rejection is also distinct from malformed parsing:
-  GC spell-element dispatcher `1002b297` has no type0x17 or0x25 branch.
-  The census retains those native-rejected records separately from unresolved
-  malformed records, rather than skipping their bytes as supported effects.
-  Parser boundary corrections use GD `1000fb0a` CF41 stat0/int39, native mapping45 (not46), and
+  GC spell-element dispatcher `1002b297` has no type0x17 branch and rejects
+  item kinds below10000; installed records213967/213968 begin with kind0.
+  GD `IsValid` `1000ccf6` rejects CF0A when stats2 and0x25 are both0;
+  reader `1000d686` throws DataStreamException. Twenty-one installed nano
+  records exhibit that exact rejection (including26349, CF0A offset283).
+  GC `1002b297`'s type0 falls through `LAB_1002b337` and returns0 without
+  consuming payload. Installed285827/286243 have declared type0/sub0 at412;
+  284388 has type0/sub2 at371, after the complete CF8E payload at367–371.
+  These are real rejected element headers, not text misalignment.
+  The census preserves only these exact native rejection signatures separately
+  from unresolved malformed records. Source: `FxClasses.Parser` native export.
+  Parser boundary corrections restore GD `1000fb0a` CF41 string stat0/int39
+  in native format46; the former format45 assignment omitted other string
+  overloads and is superseded. The complete constructor evidence is22543.
+  Additional evidence:
   TextureSpellFormat CF2F ctor/read/write/default
   `10014440`/`1001474b`/`1001455d`/`100144f1`, vtable `10020c90`.
   Sources: artifact22543 and the parser worker's native dispatcher export.
