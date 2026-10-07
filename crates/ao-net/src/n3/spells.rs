@@ -110,6 +110,20 @@ pub fn format_of(function: u32) -> &'static [Arg] {
     }
 }
 
+// TextureSpellFormat_c (GD 10014440 / ReadBinary 1001474b) owns a
+// conditional payload, not the ordinary argument list used by CF2B/2D/2E.
+fn read_texture(r: &mut Reader, s: &mut Spell) -> Result<()> {
+    s.stats.insert(0x27, 0); // TextureSpellFormat_c::SetDefaultValues 100144f1.
+    s.stats.insert(0x39, r.i32()?);
+    let marker = r.i32()?;
+    let value = if marker < 100 { marker } else { r.i32()? };
+    s.stats.insert(0x38, value);
+    s.stats.insert(0x3a, r.i32()?);
+    s.stats.insert(0x42, if marker < 100 { 0 } else { r.i32()? });
+    s.stats.insert(0x43, if marker < 100 { 0 } else { r.i32()? });
+    Ok(())
+}
+
 fn read_criteria(r: &mut Reader) -> Result<Vec<[i32; 3]>> {
     let n = r.i32()?;
     ensure!((0..=1000).contains(&n), "spell criteria count {n}");
@@ -146,6 +160,9 @@ pub fn read_spell(r: &mut Reader) -> Result<Spell> {
         } else {
             s.stats.insert(stat, r.i32()?);
         }
+    }
+    if s.function == 0xCF2F {
+        read_texture(r, &mut s)?;
     }
     match s.function {
         0xCF17 => s.criteria.extend(read_sized_criteria(r)?),
@@ -192,6 +209,17 @@ fn write_spell(w: &mut Writer, s: &Spell) -> Result<()> {
             }
         } else {
             w.i32(s.stat(stat));
+        }
+    }
+    if s.function == 0xCF2F {
+        w.i32(s.stat(0x39));
+        if s.stat(0x42) == 0 && s.stat(0x43) == 0 {
+            ensure!(s.stat(0x38) < 100, "texture short-form value must be below 100");
+            w.i32(s.stat(0x38));
+            w.i32(s.stat(0x3a));
+        } else {
+            w.i32(100);
+            for stat in [0x38, 0x3a, 0x42, 0x43] { w.i32(s.stat(stat)); }
         }
     }
     ensure!(!matches!(s.function, 0xCF17 | 0xCF20), "spell {:#x} has a second stream part", s.function);
@@ -264,7 +292,7 @@ static FORMATS: [&[Arg]; 130] = [
     &[(0, 56), (8, 8)],
     &[(0, 56), (1, 0)],
     &[],
-    &[(1, 1), (0, 39)],
+    &[(1, 0), (0, 39)],
     &[(0, 39)],
     &[(0, 39), (0, 117)],
     &[(1, 0), (0, 66), (0, 67), (0, 68), (0, 69), (0, 78)],
@@ -355,8 +383,8 @@ static IDS: [(u32, u8); 231] = [
     (0xcf0a, 2), (0xcf0b, 10), (0xcf0c, 22), (0xcf0d, 26), (0xcf0e, 27), (0xcf10, 28), (0xcf11, 30), (0xcf13, 31), (0xcf14, 9), (0xcf15, 29),
     (0xcf16, 32), (0xcf17, 33), (0xcf18, 36), (0xcf19, 37), (0xcf1a, 37), (0xcf1b, 38), (0xcf1f, 23), (0xcf20, 40), (0xcf21, 39), (0xcf22, 6),
     (0xcf23, 6), (0xcf24, 6), (0xcf25, 7), (0xcf26, 49), (0xcf27, 11), (0xcf28, 36), (0xcf29, 6), (0xcf2a, 10), (0xcf2b, 22), (0xcf2d, 22),
-    (0xcf2e, 22), (0xcf2f, 22), (0xcf30, 8), (0xcf31, 8), (0xcf32, 51), (0xcf33, 24), (0xcf34, 48), (0xcf35, 4), (0xcf37, 3), (0xcf38, 44),
-    (0xcf3a, 107), (0xcf3b, 1), (0xcf3c, 41), (0xcf3d, 43), (0xcf3e, 44), (0xcf3f, 42), (0xcf40, 12), (0xcf41, 46), (0xcf43, 34), (0xcf44, 35),
+    (0xcf2e, 22), (0xcf2f, 0), (0xcf30, 8), (0xcf31, 8), (0xcf32, 51), (0xcf33, 24), (0xcf34, 48), (0xcf35, 4), (0xcf37, 3), (0xcf38, 44),
+    (0xcf3a, 107), (0xcf3b, 1), (0xcf3c, 41), (0xcf3d, 43), (0xcf3e, 44), (0xcf3f, 42), (0xcf40, 12), (0xcf41, 45), (0xcf43, 34), (0xcf44, 35),
     (0xcf45, 25), (0xcf46, 52), (0xcf47, 14), (0xcf48, 19), (0xcf49, 54), (0xcf4a, 55), (0xcf4b, 57), (0xcf4c, 57), (0xcf4d, 107), (0xcf4e, 107),
     (0xcf50, 58), (0xcf51, 59), (0xcf53, 54), (0xcf54, 54), (0xcf55, 60), (0xcf56, 64), (0xcf57, 65), (0xcf58, 66), (0xcf59, 66), (0xcf5a, 67),
     (0xcf5b, 68), (0xcf5c, 36), (0xcf5d, 1), (0xcf5e, 107), (0xcf5f, 71), (0xcf60, 69), (0xcf61, 56), (0xcf62, 61), (0xcf63, 72), (0xcf64, 107),
@@ -412,10 +440,10 @@ mod tests {
         assert_eq!(m.spells, vec![fear, features]);
         assert_eq!((m.target, m.apply), (me(), true));
         assert!(!parse(&encode(me(), &[], false).unwrap()).unwrap().apply);
-        // a string argument: a format with `(ComplexType 1, stat 1), (0, 0x27)`
-        let id = IDS.iter().find(|e| FORMATS[e.1 as usize] == [(1, 1), (0, 39)]).unwrap().0;
-        let mut s = spell(id, &[(39, 5)]);
-        s.strings.insert(1, "hello".into());
+        // GD 1000fb0a: CF41 adds string stat0, then integer stat0x27.
+        assert_eq!(format_of(0xCF41), &[(1, 0), (0, 39)]);
+        let mut s = spell(0xCF41, &[(39, 5)]);
+        s.strings.insert(0, "hello".into());
         assert_eq!(parse(&encode(me(), &[s.clone()], true).unwrap()).unwrap().spells, vec![s]);
     }
 
@@ -431,6 +459,52 @@ mod tests {
             assert_eq!(s.function, 0xCF35);
             assert_eq!((s.stat(stat::STAT), s.stat(stat::VALUE), s.stat(stat::TARGET)), (108, amount, 2));
             assert_eq!((s.stat(3), s.stat(4), s.stat(0x23)), (1, 0, 9));
+        }
+    }
+
+    #[test]
+    fn texture_and_chat_payload_boundaries() {
+        // Installed 1000020:29426 at 232: CF2F's short payload is 14038,1,0.
+        // The following element begins at 276, not inside that final zero.
+        for tail in [vec![14038, 1, 0], vec![14038, 100, 7, 8, 9, 10]] {
+            let mut words = vec![0xcf2f_i32, 0, 4, 0, 1, 0, 2, 9];
+            words.extend(tail);
+            let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut r = Reader::little_endian(&bytes);
+            let s = read_spell(&mut r).unwrap();
+            assert_eq!(r.remaining(), 0);
+            assert_eq!(s.stat(0x39), 14038);
+            let mut wire = Writer::default();
+            write_spell(&mut wire, &s).unwrap();
+            let mut wire_reader = Reader::new(&wire.0);
+            assert_eq!(read_spell(&mut wire_reader).unwrap(), s);
+            assert_eq!(wire_reader.remaining(), 0);
+            for end in 0..bytes.len() {
+                assert!(read_spell(&mut Reader::little_endian(&bytes[..end])).is_err());
+            }
+        }
+        // Installed 1000020:29740 at 419: CF41 string "Gulp!" then stat39=2.
+        let mut bytes: Vec<_> = [0xcf41_i32, 0, 4, 0, 1, 0, 2, 9, 6]
+            .into_iter().flat_map(i32::to_le_bytes).collect();
+        bytes.extend(b"Gulp!\0");
+        bytes.extend(2i32.to_le_bytes());
+        let mut r = Reader::little_endian(&bytes);
+        let s = read_spell(&mut r).unwrap();
+        assert_eq!(r.remaining(), 0);
+        assert_eq!(s.strings.get(&0).unwrap(), "Gulp!");
+        assert_eq!(s.stat(39), 2);
+        let mut wire = Writer::default();
+        write_spell(&mut wire, &s).unwrap();
+        let mut expected: Vec<_> = [0xcf41_i32, 0, 4, 0, 1, 0, 2, 9, 6]
+            .into_iter().flat_map(i32::to_be_bytes).collect();
+        expected.extend(b"Gulp!\0");
+        expected.extend(2i32.to_be_bytes());
+        assert_eq!(wire.0, expected);
+        let mut wire_reader = Reader::new(&wire.0);
+        assert_eq!(read_spell(&mut wire_reader).unwrap(), s);
+        assert_eq!(wire_reader.remaining(), 0);
+        for end in 0..bytes.len() {
+            assert!(read_spell(&mut Reader::little_endian(&bytes[..end])).is_err());
         }
     }
 

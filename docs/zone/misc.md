@@ -536,6 +536,22 @@ invalid lengths. A text search of `docs/captures/*.rec` found no CF34 or
 ApplySpells type-key occurrence; this fixture is an installed record, **not**
 a captured server message. No tests/builds/checks were run by this worker.
 
+### CF41 format-index correction
+
+GD `SpellFormats_c` constructor `0x1000fb0a` adds `(ComplexType 1, stat 0)`
+then `(0, stat 0x27)` before registering CF41 (artifact22543, lines
+1535–1576). This is shared format 45, not integer-only format 46.
+The wrong ID mapping consumed the string length as stat39 and left the
+authored string and integer unread. Installed `1000020:29740` offset 419
+contains `CF41,0,4,0,1,0,2,9,6,"Gulp!\0",2`; the boundary regression
+retains its zero-remaining assertion and now checks exact BE encoder bytes.
+The generic roundtrip explicitly uses CF41/string stat0 rather than searching
+for the nonexistent string-stat1 format. CF2F retains its native conditional
+reader (`0x1001474b`) and short/extended truncation checks, with added BE
+encoder roundtrips. No item-element rejection was relaxed: `1000020:25885`
+still rejects type23/sub37, absent from GC `0x1002b297`.
+These regressions were added but not executed by this worker.
+
 ## UNRESOLVED / guesses
 
 * FollowTarget: meaning of `mode` 21/24/25 (they go to the vehicle controller at `Vehicle+0x178`, vtbl +0x18; class not identified); unused `speed`.

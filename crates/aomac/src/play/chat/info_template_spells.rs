@@ -169,6 +169,31 @@ mod tests {
     }
 
     #[test]
+    fn native_unsupported_element_is_not_skipped() {
+        let bytes: Vec<_> = [51035_u32, 2, 15, 23, 1009, 23, 37, 1009]
+            .into_iter().flat_map(u32::to_le_bytes).collect();
+        assert!(data(&bytes, 10).err().unwrap().to_string()
+            .contains("unsupported item element (0x17, 0x25)"));
+    }
+
+    #[test]
+    fn installed_texture_and_chat_elements() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let store = ao_rdb::RecordStore::open(&dir).unwrap();
+        for id in [21793, 29426, 29740, 40821] {
+            let record = store.get(1000020, id).unwrap().unwrap();
+            data(&record, u32::MAX).unwrap_or_else(|e| panic!("item {id}: {e}"));
+        }
+        // Native FUN_1002b297 has no type23 branch: this old ammunition
+        // record is genuinely rejected, unlike the misaligned spell failures.
+        let record = store.get(1000020, 25885).unwrap().unwrap();
+        assert!(data(&record, u32::MAX).err().unwrap().to_string()
+            .contains("unsupported item element (0x17, 0x25)"));
+    }
+
+    #[test]
     fn original_tower_item_record() {
         let Some(home) = std::env::var_os("HOME") else { return };
         let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
