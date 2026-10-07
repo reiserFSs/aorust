@@ -509,6 +509,8 @@ pub struct Mover {
     status: Status,
     /// Current ground speed (signed along the facing: negative when reversing).
     speed: f32,
+    /// Retained `Vehicle_t::GetDir` sign, independent of the current speed.
+    direction: i32,
     /// Drawn position lags the simulated one by the reconcile offset (`n3VisualDynel_t+0xa0`).
     recon: Option<[f32; 3]>,
     path: Vec<[f32; 3]>,
@@ -534,6 +536,7 @@ impl Mover {
             yaw,
             status: Status::default(),
             speed: 0.0,
+            direction: 1,
             recon: None,
             path: vec![],
             wanted_yaw: None,
@@ -553,6 +556,11 @@ impl Mover {
         let mut m = Mover::new(pos, yaw);
         if let Some(s) = Status::from_blob(blob) {
             m.status = s;
+            m.direction = if s.forward < 0 { -1 } else { 1 };
+            let velocity = [0, 4, 8].map(|offset| f32::from_be_bytes(blob[offset..offset + 4].try_into().unwrap()));
+            if velocity.iter().all(|v| v.is_finite()) {
+                m.speed = velocity[0].hypot(velocity[2]) * m.direction as f32;
+            }
         }
         m
     }
@@ -619,6 +627,11 @@ impl Mover {
             _ => rs,
         }
     }
+    /// Native horizontal speed (`Vehicle +0xcc`), excluding jump/fall velocity.
+    pub fn vehicle_speed(&self) -> f32 { self.speed.abs() }
+    /// Native retained forward/reverse direction (`Vehicle +0x90`).
+    pub fn vehicle_direction(&self) -> i32 { self.direction }
+
 
     fn place(&mut self, pos: [f32; 3]) {
         // UpdateReconcilePos stores the simulated position *before* the teleport (N3 0x19414).
@@ -633,7 +646,15 @@ impl Mover {
     fn apply(&mut self, t: MoveType) -> bool {
         // Leave* guards test Features bit 4, which the DC gate already requires for these types; SitGround: `set_sit_allowed`
         let ok = if t == MoveType::SwitchToSitGroundMode { self.sit_ok } else { true };
-        self.status.transition(t, ok)
+        let applied = self.status.transition(t, ok);
+        if applied {
+            match t {
+                MoveType::ReverseStart => self.direction = -1,
+                MoveType::ForwardStart | MoveType::ReverseStop | MoveType::FullStop => self.direction = 1,
+                _ => {}
+            }
+        }
+        applied
     }
 
     /// `CharDCMoveIIR_t` (`FUN_1006bcc6` + `FUN_1006b84b` [GC]): reconcile, teleport to `pos`/`rot`, then — if Features bit 4,
@@ -988,6 +1009,23 @@ mod tests {
         }
         assert_eq!(n, 81);
     }
+    #[test]
+    fn effect_inputs_retain_native_vehicle_direction_and_speed() {
+        let mut blob = [0u8; 28];
+        blob[0..4].copy_from_slice(&3.0f32.to_be_bytes());
+        blob[4..8].copy_from_slice(&100.0f32.to_be_bytes());
+        blob[8..12].copy_from_slice(&4.0f32.to_be_bytes());
+        blob[12..22].copy_from_slice(&[3, 2, 2, 1, 0, 1, 0, 1, 0, 1]);
+        blob[25] = 3;
+        let mut mover = Mover::with_blob([0.0; 3], 0.0, &blob);
+        assert_eq!((mover.vehicle_speed(), mover.vehicle_direction()), (5.0, -1), "vertical velocity is not Vehicle+cc");
+        assert!(mover.apply(MoveType::ReverseStop));
+        assert_eq!(mover.vehicle_direction(), 1);
+        assert!(mover.apply(MoveType::ForwardStart));
+        assert!(mover.apply(MoveType::ForwardStop));
+        assert_eq!(mover.vehicle_direction(), 1);
+    }
+
 
     #[test]
     fn fsm_guards() {
