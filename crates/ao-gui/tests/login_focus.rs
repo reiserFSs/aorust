@@ -17,6 +17,7 @@ fn click_and_tab_move_focus() {
     };
     let (ux, uy) = c(&g, "username");
     click(&mut g, ux, uy);
+    assert_eq!(g.focused_view().as_deref(), Some("username"));
     g.input(InputEvent::Text("abc".into()));
     let (px, py) = c(&g, "password");
     click(&mut g, px, py);
@@ -26,6 +27,12 @@ fn click_and_tab_move_focus() {
     click(&mut g, ux, uy);
     g.input(InputEvent::Key { key: Key::Tab, pressed: true, mods: Modifiers::default() });
     g.input(InputEvent::Text("y".into()));
+    assert_eq!(g.focused_view().as_deref(), Some("password"));
     assert_eq!(g.text(w, "password"), "y");
     assert_eq!(g.text(w, "username"), "abc");
+    g.input(InputEvent::Key { key: Key::Tab, pressed: true, mods: Modifiers::default() });
+    assert_eq!(g.focused_view().as_deref(), Some("username"));
+    g.input(InputEvent::Text("tab-user".into()));
+    assert_eq!(g.text(w, "username"), "tab-user");
+    assert_eq!(g.text(w, "password"), "y");
 }
