@@ -55,8 +55,9 @@ impl Highlight {
         if self.mode!=3 {actor.alpha=c[0];actor.emissive=Some(rgb);}
         actor.part_materials.resize_with(actor.part_attractors.len(),Default::default);
         for (place,material) in actor.part_attractors.iter().zip(&mut actor.part_materials) {
-            // GC100e29a7 excludes place0 (the head) only in mode3.
-            if place.is_some_and(|place|self.mode!=3 || place!=0) {
+            // GC100e29a7 selects place0 only in mode3. DS1007347e identifies
+            // VisualAttractorMesh+4 as place; DS10071ca2 maps zero to the head.
+            if place.is_some_and(|place|self.mode!=3 || place==0) {
                 material.alpha=Some(c[0]);material.emissive=Some(rgb);
                 if self.mode==3 {material.specular=Some(rgb);}
             }
@@ -78,7 +79,7 @@ mod tests {
         h.advance(1.0);assert_eq!(h.color(),[1.0,0.0,0.0,0.0]);assert!(!h.advance(0.01));
     }
     #[test]
-    fn held_highlight_changes_weapon_material_not_body_or_head() {
+    fn mode3_highlight_changes_head_material_not_body_or_weapon() {
         let mut words=vec![0;12];words[1]=3;words[2]=2.0f32.to_bits();
         words[3]=1.0f32.to_bits();words[7]=0.5f32.to_bits();
         for word in &mut words[8..11] {*word=0.5f32.to_bits();}
@@ -87,12 +88,12 @@ mod tests {
         let mut actor=ao_scene::ActorFrame {id:1,part_attractors:vec![None,Some(0),Some(1)],..Default::default()};
         h.apply(std::slice::from_mut(&mut actor));
         assert_eq!(actor.alpha,1.0);assert!(actor.emissive.is_none());
-        assert!(actor.part_materials[0].alpha.is_none());assert!(actor.part_materials[1].specular.is_none());
-        assert_eq!(actor.part_materials[2].alpha,Some(0.5));
-        assert_eq!(actor.part_materials[2].specular,Some([0.5f32.powf(2.2);3]));
+        assert!(actor.part_materials[0].alpha.is_none());assert!(actor.part_materials[2].specular.is_none());
+        assert_eq!(actor.part_materials[1].alpha,Some(0.5));
+        assert_eq!(actor.part_materials[1].specular,Some([0.5f32.powf(2.2);3]));
     }
     #[test]
-    fn authored_11507_held_specular_has_parabolic_envelope() {
+    fn authored_11507_head_specular_has_parabolic_envelope() {
         let t=Template {kind:2011,words:vec![3,3,1065353216,1065353216,0,0,0,1065353216,1065353216,1065353216,1065353216,0]};
         let mut h=Highlight::new(&t,EffectConfig {source_identity:Some((50000,1)),..Default::default()}).unwrap();
         assert_eq!(h.color(),[1.0,0.0,0.0,0.0]);h.advance(0.5);
@@ -138,21 +139,21 @@ mod tests {
     }
     #[test]
     #[ignore="installed authored assets and offscreen GPU regression"]
-    fn retail_highlight_held_authored_frames()->Result<()> {
+    fn retail_highlight_head_authored_frames()->Result<()> {
         use ao_formats::character::{actor::{ActorAssets,ActorRig,PlayerLook},Breed,Gender,Skin,Equipment};
         let out=std::env::var_os("AOMAC_EFFECT_FRAMES").context("AOMAC_EFFECT_FRAMES required")?;
         let out=std::path::PathBuf::from(out);std::fs::create_dir_all(&out)?;
         let store=ao_rdb::RecordStore::open(&ao_gui::client_dir())?;
         let assets=ActorAssets::new(&store)?;
-        let look=PlayerLook {breed:Breed::Solitus,gender:Gender::Male,skin:Skin::Caucasian,build:1,head:None,equipment:Equipment::default()};
-        let rig=ActorRig::player(&store,&assets,&look,&[(1,15839)])?;
-        let held=rig.part_attractors().iter().position(|place|place.is_some_and(|place|place!=0)).context("held Highlight fixture requires an actual non-head mounted mesh")?;
+        let look=PlayerLook {breed:Breed::Solitus,gender:Gender::Female,skin:Skin::Caucasian,build:1,head:Some(40629),equipment:Equipment::default()};
+        let rig=ActorRig::player(&store,&assets,&look,&[(1,7796)])?;
+        let head=rig.part_attractors().iter().position(|place|*place==Some(0)).context("mode3 Highlight fixture requires an actual mounted head mesh")?;
         // Isolate the authored material envelope, not a retail lighting reference:
         // the generic viewer's ambient + sun can saturate emissive to white.
         let world=ao_scene::Scene {environment:Some(ao_scene::Environment {sky_color:[0.0;3],fog_color:[0.0;3],fog_start:100.0,fog_end:200.0,ambient:[0.0;3],sun_color:[0.0;3],sun_dir:[0.0,1.0,0.0],sun_specular:0.0}),..Default::default()};
         let templates=super::super::Templates::open(&ao_gui::client_dir())?;
         for id in [11507,11508] {
-            let t=templates.by_id.get(&id).context("missing authored held highlight")?;
+            let t=templates.by_id.get(&id).context("missing authored head highlight")?;
             let mut h=Highlight::new(t,EffectConfig {source_identity:Some((50000,1)),..Default::default()})?;
             h.prepare_actor(1);
             for frame in 0..=60 {
@@ -161,9 +162,12 @@ mod tests {
                 let mut actor=ao_scene::ActorFrame {id:1,model:1,skin:Some(skin),parts,part_attractors:rig.part_attractors(),..Default::default()};
                 h.apply(std::slice::from_mut(&mut actor));
                 assert!(actor.emissive.is_none());assert_eq!(actor.alpha,1.0);
-                assert_eq!(actor.part_materials[held].emissive,Some(std::array::from_fn(|i|h.color()[i+1].powf(2.2))));
-                assert_eq!(actor.part_materials[held].alpha,Some(h.color()[0]));
-                assert_eq!(actor.part_materials[held].specular,actor.part_materials[held].emissive);
+                assert_eq!(actor.part_materials[head].emissive,Some(std::array::from_fn(|i|h.color()[i+1].powf(2.2))));
+                assert_eq!(actor.part_materials[head].alpha,Some(h.color()[0]));
+                assert_eq!(actor.part_materials[head].specular,actor.part_materials[head].emissive);
+                for (place,material) in actor.part_attractors.iter().zip(&actor.part_materials) {
+                    if *place!=Some(0) {assert!(material.alpha.is_none());assert!(material.emissive.is_none());assert!(material.specular.is_none());}
+                }
                 if [0,15,30,45,60].contains(&frame) {
                     ao_render::render_to_png_actors(&world,&[(1,rig.model().clone())],vec![actor],[2.0,2.0,5.0],[0.0,1.0,0.0],640,480,&out.join(format!("highlight2011_{id}_{frame}.png")),frame as f32/60.0)?;
                 }

@@ -514,7 +514,8 @@ mod tests {
         // 120802:354 authors CF8C "John\0","Doe\0",3.
         // 257579:168 authors CF7B "Please enter your nickname:;/name\0",0,1.
         // 284161:195 authors CF70 "{stock_pet_attack_accept}\0",1.
-        let cases: &[(u32, &[&str], &[(u8, u16)], &[i32])] = &[
+        type StringFormatCase<'a> = (u32, &'a [&'a str], &'a [Arg], &'a [i32]);
+        let cases: &[StringFormatCase<'_>] = &[
             (0xCF8C, &["John", "Doe"], &[(0, 39)], &[3]),
             (0xCF8E, &["John", "Doe"], &[(0, 39)], &[3]),
             (0xCF7B, &["Please enter your nickname:;/name"], &[(0, 39), (0, 117)], &[0, 1]),

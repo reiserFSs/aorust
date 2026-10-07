@@ -31,7 +31,7 @@ impl SkyFlash {
         Ok(Self {template:t.clone(),anchor,current_source:anchor,elapsed:0.0,duration:t.float(8)?,started:false,terminated:false})
     }
     pub(super) fn configure(&mut self,c:EffectConfig) {if let Some(d)=c.duration {self.duration=d;}}
-    pub(super) fn requires_terrain(&self)->bool {self.template.words.get(0).copied().unwrap_or(0)&0x4000!=0}
+    pub(super) fn requires_terrain(&self)->bool {self.template.words.first().copied().unwrap_or(0)&0x4000!=0}
     pub(super) fn update_source(&mut self,source:Mat4)->Result<()> {self.current_source=super::sprites::connector(&self.template,source)?;Ok(())}
     pub(super) fn terminate_gracefully(&mut self) {self.terminated=true;}
     pub(super) fn frame(&mut self,dt:f32)->Result<bool> {
@@ -48,7 +48,7 @@ impl SkyFlash {
         let indices=(0..n*2).flat_map(|i|if i&1==0 {[i,i+1,i+2]}else{[i+1,i,i+2]}).collect::<Vec<_>>();
         (0..self.template.words.get(13).copied().unwrap_or(0)).map(|_|(Some(self.template.words.get(9).copied().unwrap_or(0) as usize),indices.clone(),(n as usize+1)*2)).collect()
     }
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words.get(0).copied().unwrap_or(0)&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend};self.template.words.get(13).copied().unwrap_or(0) as usize]}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words.first().copied().unwrap_or(0)&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend};self.template.words.get(13).copied().unwrap_or(0) as usize]}
     pub(super) fn vertices(&mut self,terrain:&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>)->Result<Option<Vec<Vec<Vertex>>>> {
         if !self.alive() {return Ok(None);}
         let t=&self.template;

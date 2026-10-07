@@ -794,7 +794,7 @@ Exact class/selector inventory (the runnable census also prints source nano IDs)
   The process writes live root/held transparency and emissive, not
   replacement geometry. Native RGB is gamma-space; the scene's material
   override stores its linear equivalent. It never changes shininess.
-  Mode3 is a separate held-attractor-only specular path, not the mode2
+  Mode3 is a separate head-attractor-only specular path, not the mode2
   root effect. Cleanup `100e2bde` refreshes alpha and clears emissive
   and specular on the applicable native visual frames.
 * Shield2/3034 `10110b31` and Trail2/3039 `10114b20` immediately end
@@ -1094,7 +1094,7 @@ Ignored installed-asset frame checks require `AOMAC_EFFECT_FRAMES`:
 | 1020 NightVision1 | GC ctor `100eaddd`, loader `100ea6a1`, init `100ea813`, process `100ea652`, duration `100ea694`, graceful `100a719a`, destructor/fog restore `100ea5c5`, scalar delete `100eae3b`. Up to three viewport layers with independent blend/repeat; DS priority7 `10023885`, fullscreen strip `10023929`. Optional distortion DS `10011597`/`1001165a` calls empty `10007a2f`: native no draw, not missing geometry. Nine records3400/3401/3410/3411/3422/3423/3430/43652/43733. |
 | 2001 Spiral | GC vector/dynel ctors `100f4ab6`/`100f4e53`, loader/init/process `100f499c`/`100f49f0`/`100f4760`, graceful/delete `100f488e`/`100f4f87`; DS `10021eb4`/`10021924`: two twelve-segment strips, native sweep/radius/pitch/UV, independent Y rotation, endpoint clipping. Records11200/43010/43011. |
 | 2002 Plasma | Hit-location-only ctor `100ec059` via `100d145c`, loader `100ebf73` (duration18 overrides8), init/process `100ebfcd`/`100ebd91`, hit endpoints `10104fa8`/`10104fde`, graceful/delete `100ebe66`/`100ec194`; DS `1001b8f7`/`1001bbf2`:75 segments, four sine-cubed waves and CRT phase perturbation, two-sided camera ribbon. Records11201/17500/17600/17912–17914; located creation of17600 is native null. Sources22557/22571/22592/22660/22744/22757. |
-| 2011 Highlight extensions | GC ctor/load/process/delete `100e2e10`/`100e286a`/`100e29a7`/`100e2bde`: modes1/3 use1−(2t/duration−1)²; mode3 updates only held VisualAttractorMesh place≠0, including specular, not CAT root. Records11507/11508; flag0x400 in61110/61112 sets root priority−1 (`100e292b`) and restores on deletion. Word11 suppresses restoration, but all installed records have0. |
+| 2011 Highlight extensions | GC ctor/load/process/delete `100e2e10`/`100e286a`/`100e29a7`/`100e2bde`: modes1/3 use1−(2t/duration−1)²; mode3 excludes the CAT root and selects only VisualAttractorMesh place0 (head), including alpha/emissive/specular. GC `100e29a7` tests `VisualAttractorMesh+4 == 0`; DS `1007347e` (`GetAttractorMesh`) compares that field to `AttractorPlace_e`, `10071cce` (`AddAttractorMesh`) sorts by it, and `10071ca2` (`GetName`) maps zero to `Attractor01_head`. The previous place≠0 weapon predicate was reversed and is corrected. Records11507/11508 now use an actual mounted head40629 fixture (Solitus female, weapon7796 unchanged); zero ambient/sun isolates its material envelope, not retail lighting equivalence. Flag0x400 in61110/61112 sets root priority−1 (`100e292b`) and restores on deletion. Word11 suppresses restoration, but all installed records have0. |
 | 3015 LavaBall | GC ctor/load/init/process/graceful/delete `100e435c`/`100e4031`/`100e413e`/`100e3005`/`100e3f04`/`100e4cd9`; DS `10010d70`/`1001105e` and render bucket100 `100078c8` (not near clipping). Mode0 ballistic terrain/collision/audio, mode1 camera arc, other modes fixed camera hemisphere; two128-slot DiaBill pools, CRT wait/azimuth,64-frame atlas, per-frame fire velocity×0.8 and30-impact cap. Records12300/12301/12560/12580; artifacts22826/22935. |
 | 3018 SkyRise | GC vector/dynel ctors `100efd12`/`100efe2c`, loader/init/process `100efb10`/`100ef7a5`/`100ef462`; DS ctor/hemisphere/two-pass strips/flat height-colour/endpoints `100203c9`/`1001ff05`/`1002016d`/`1001f39d`/`1001fb2b`. Record12520 mode0;12521 mode1 flags5 radius+pulse;12522 mode1 flags3 radius+colour. |
 | 3019 Trail | GC ctors `101020db`/`101021ad`/`10102301`/`10102455`/`1010252d`, loader/init/process `10101f88`/`10102010`/`10101ddb`; graceful `10101e67` only writes field0x40. DS `1002b486`:50ms sampling,1000-slot ring,50 points, spatial2.5;12570 absent mode defaults0,71000/71003 mode1 four oriented strips. |
@@ -1114,7 +1114,7 @@ the CRT srand42/time calls are separate side effects, not geometry seeds.
 Additional runnable checks, not run here:
 `authored_nightvision_layers_and_native_lifetime`,
 `authored_43010_43011_spiral_lifecycle`, `authored_17500_plasma_hit_lifetime_and_rng`,
-`authored_11507_held_specular_has_parabolic_envelope`,
+`authored_11507_head_specular_has_parabolic_envelope`,
 `authored_71320_mech_cylindrical_uv_and_71319_stop_child`,
 `authored_modes_preserve_native_rng_and_motion`, `ground_flag_snaps_only_initial_position`,
 `all_authored_class3020_records`, `authored_lavaball_lifecycle_and_atlas`,
@@ -1123,7 +1123,7 @@ Additional runnable checks, not run here:
 `authored_12570_trail_missing_mode_defaults_to_zero`,
 `authored_71250_mesh_particle_reset_preserves_random_order`.
 Installed frame checks: `retail_nightvision_frames`, `retail_native2001_frames`,
-`retail_native2002_hit_frames`, `retail_highlight_held_authored_frames`,
+`retail_native2002_hit_frames`, `retail_highlight_head_authored_frames`,
 `retail_surface_authored_modes_frames`, `retail_class3020_frames`,
 `all_authored_lavaball_frames`; no frame outcome is inferred from these names.
 

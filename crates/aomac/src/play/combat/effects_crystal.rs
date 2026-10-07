@@ -32,11 +32,11 @@ impl Crystal {
     fn emit(&self,r:&mut R250)->Particle {
         let t=&self.template;let size=sample(t,27,28,r);let life=sample(t,25,26,r);
         let material=materials::MATERIALS[t.words.get(10).copied().unwrap_or(0) as usize];
-        let frame=if t.words.get(0).copied().unwrap_or(0) & 0x20000!=0 {material.3 as f32+(material.4-material.3) as f32*super::random_fraction(r)}else{0.0};
+        let frame=if t.words.first().copied().unwrap_or(0) & 0x20000!=0 {material.3 as f32+(material.4-material.3) as f32*super::random_fraction(r)}else{0.0};
         let position=self.source.w_axis.truncate()+Vec3::new(super::random_fraction(r)*2.0-1.0,super::random_fraction(r)*2.0-1.0,-(super::random_fraction(r)*2.0-1.0))*f(t,13);
         let velocity=Vec3::new(sample(t,17,18,r),sample(t,19,20,r),-sample(t,21,22,r));
         // Native consumes angle and spin samples even though this visual uses velocity axes.
-        if t.words.get(0).copied().unwrap_or(0) & 0x4000==0 {super::random_fraction(r);}sample(t,23,24,r);
+        if t.words.first().copied().unwrap_or(0) & 0x4000==0 {super::random_fraction(r);}sample(t,23,24,r);
         let rotation=Mat4::from_cols(self.source.x_axis.truncate().normalize_or_zero().extend(0.0),self.source.y_axis.truncate().normalize_or_zero().extend(0.0),self.source.z_axis.truncate().normalize_or_zero().extend(0.0),Vec3::ZERO.extend(1.0));
         Particle {position,velocity:rotation.transform_vector3(velocity),acceleration:rotation.transform_vector3(Vec3::Y*f(t,16)),life,remaining:life,size,frame}
     }
@@ -47,7 +47,7 @@ impl Crystal {
     pub(super) fn vertices(&mut self,time:f32,camera:Vec3,r:&mut R250,mut terrain:Option<&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>>)->Result<Option<Vec<Vec<Vertex>>>> {
         let initial=self.previous==0.0;let dt=(time-self.previous).max(0.0);self.previous=time;self.emission+=dt;
         if self.duration>=0.0 && time>self.duration {return Ok(None);}
-        if self.template.words.get(0).copied().unwrap_or(0) & 0x400!=0 {
+        if self.template.words.first().copied().unwrap_or(0) & 0x400!=0 {
             let query=terrain.as_mut().context("TParticle2 ground snapping requires terrain")?;
             let old_y=self.source.w_axis.y;
             self.source.w_axis.y=query(self.source.w_axis.truncate()).context("missing TParticle2 source ground")?.0.y;
@@ -58,7 +58,7 @@ impl Crystal {
             p.remaining-=dt;
             if p.remaining>0.0 {
                 alive+=1;
-                if t.words.get(0).copied().unwrap_or(0) & 0x8000!=0 {
+                if t.words.first().copied().unwrap_or(0) & 0x8000!=0 {
                     let query=terrain.as_mut().context("TParticle2 bounce requires terrain")?;
                     if p.position.y<=query(p.position).context("missing TParticle2 particle ground")?.0.y {
                         p.velocity*=f(t,29);p.velocity.y= -p.velocity.y;
@@ -81,12 +81,12 @@ impl Crystal {
                 let material=materials::MATERIALS[t.words.get(10).copied().unwrap_or(0) as usize];
                 let frame=p.frame as i32;let u=frame.rem_euclid(material.1 as i32) as f32/material.1 as f32;let v=(frame/material.1 as i32) as f32/material.2 as f32;
                 let du=1.0/material.1 as f32;let dv=1.0/material.2 as f32;
-                let uv=if t.words.get(0).copied().unwrap_or(0) & 0x100!=0 {[[u,v],[u,v+dv],[u+du,v],[u+du,v+dv]]}else{[[u,v+dv],[u+du,v+dv],[u,v],[u+du,v]]};
-                let uv=if t.words.get(0).copied().unwrap_or(0) & 0x80000!=0 {[uv[2],uv[3],uv[0],uv[1]]}else{uv};
+                let uv=if t.words.first().copied().unwrap_or(0) & 0x100!=0 {[[u,v],[u,v+dv],[u+du,v],[u+du,v+dv]]}else{[[u,v+dv],[u+du,v+dv],[u,v],[u+du,v]]};
+                let uv=if t.words.first().copied().unwrap_or(0) & 0x80000!=0 {[uv[2],uv[3],uv[0],uv[1]]}else{uv};
                 quad(&mut out,positions,uv,[0.0;4]);
                 let base=out.len()-4;if p.remaining>0.0 {for (j,mut c) in [head,head,tail,tail].into_iter().enumerate() {
                     // DS1002aaa3 attenuates each strip by its facing to the camera.
-                    if t.words.get(0).copied().unwrap_or(0) & 0x40000!=0 {c[3]*=axis.cross(direction).normalize_or_zero().dot((camera-p.position).normalize_or_zero()).abs();}
+                    if t.words.first().copied().unwrap_or(0) & 0x40000!=0 {c[3]*=axis.cross(direction).normalize_or_zero().dot((camera-p.position).normalize_or_zero()).abs();}
                     out[base+j].color=c;
                 }}
             }
@@ -97,7 +97,7 @@ impl Crystal {
             let mut emitted=0;
             for i in 0..self.particles.len() {if self.particles[i].remaining<=0.0 {
                 let mut p=self.emit(r);
-                if self.template.words.get(0).copied().unwrap_or(0) & 0x10000!=0 {let query=terrain.as_mut().context("TParticle2 ground emission requires terrain")?;p.position.y=query(p.position).context("missing TParticle2 emission ground")?.0.y;}
+                if self.template.words.first().copied().unwrap_or(0) & 0x10000!=0 {let query=terrain.as_mut().context("TParticle2 ground emission requires terrain")?;p.position.y=query(p.position).context("missing TParticle2 emission ground")?.0.y;}
                 self.particles[i]=p;self.emission=0.0;emitted+=1;if emitted>=count {break;}
             }}
         }

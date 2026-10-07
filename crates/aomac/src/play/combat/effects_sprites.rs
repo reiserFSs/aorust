@@ -397,6 +397,10 @@ mod tests {
             assert_eq!(e.models()[0].0,Some(0));e.blends();
             assert_eq!(e.emission_position(),Vec3::ZERO);
             assert_eq!(e.emission_matrix().unwrap(),Mat4::IDENTITY);
+            if kind==1008 {
+                let anchors=std::array::from_fn::<_,14,_>(|i|Mat4::from_translation(Vec3::X*(i+1) as f32));
+                e.update_anchors(&anchors).unwrap();
+            }
             e.initialize_native(&mut gc,&mut crt).unwrap();
             let groups=e.vertices(0.0,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt).unwrap();
             if kind==1012 {

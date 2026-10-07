@@ -21,7 +21,7 @@ impl Shield {
         Ok(Self {template:t.clone(),source,identity,vertices:Vec::new(),indices:Vec::new(),source_material:None,elapsed:0.0,duration:c.duration.unwrap_or(t.float(8)?),started:false,terminating:None,terminated:false})
     }
     pub(super) fn identity(&self)->(u32,u32) {self.identity}
-    pub(super) fn uses_source_material(&self)->bool {self.template.words.get(0).copied().unwrap_or(0)&0x10000!=0}
+    pub(super) fn uses_source_material(&self)->bool {self.template.words.first().copied().unwrap_or(0)&0x10000!=0}
     pub(super) fn update_source(&mut self,source:Mat4) {self.source=source;}
     pub(super) fn update_mesh(&mut self,vertices:&[Vertex],indices:&[u32],material:Option<usize>)->Result<()> {
         ensure!(indices.iter().all(|&i|(i as usize)<vertices.len()),"invalid Shield source indices");
@@ -54,7 +54,7 @@ impl Shield {
         let material=if self.uses_source_material() {self.source_material}else{Some(self.template.words.get(9).copied().unwrap_or(0) as usize)};
         vec![(material,self.indices.clone(),self.vertices.len())]
     }
-    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words.get(0).copied().unwrap_or(0)&0x400!=0 {Blend::Additive}else{Blend::AlphaBlend}]}
+    pub(super) fn blends(&self)->Vec<Blend> {vec![if self.template.words.first().copied().unwrap_or(0)&0x400!=0 {Blend::Additive}else{Blend::AlphaBlend}]}
     pub(super) fn vertices(&mut self)->Result<Option<Vec<Vec<Vertex>>>> {
         if !self.alive() {return Ok(None);}
         let t=&self.template;let flags=t.word(0)?;

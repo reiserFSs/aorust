@@ -94,7 +94,7 @@ impl ScatterEffect {
     pub(super) fn frame(&mut self,dt:f32,renderer:&mut Renderer,mut terrain:Option<&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>>)->Result<bool> {
         self.elapsed+=dt;
         let t=&self.template;
-        if self.terminating && t.words.get(0).copied().unwrap_or(0) & 0x4000!=0 {return Ok(false);}
+        if self.terminating && t.words.first().copied().unwrap_or(0) & 0x4000!=0 {return Ok(false);}
         let mut alive=false;
         for slot in &mut self.slots {
             if slot.child!=0 && !renderer.is_active(slot.child) {slot.child=0;}
@@ -112,9 +112,9 @@ impl ScatterEffect {
                 let mut source=self.source;
                 let mut config=self.config;
                 config.duration=None;
-                if t.words.get(0).copied().unwrap_or(0) & 0x2000==0 {
+                if t.words.first().copied().unwrap_or(0) & 0x2000==0 {
                     let mut position=self.source.w_axis.truncate()+offset;
-                    if t.words.get(0).copied().unwrap_or(0) & 0x1000!=0 {
+                    if t.words.first().copied().unwrap_or(0) & 0x1000!=0 {
                         let locator=terrain.as_deref_mut().ok_or_else(||anyhow::anyhow!("Scatter requires terrain locator"))?;
                         let (ground,_)=locator(position).ok_or_else(||anyhow::anyhow!("Scatter terrain position is unavailable"))?;
                         position.y=ground.y;
@@ -130,7 +130,7 @@ impl ScatterEffect {
             }
             alive|=slot.child!=0;
         }
-        if !alive && t.words.get(0).copied().unwrap_or(0) & 0x400!=0 {
+        if !alive && t.words.first().copied().unwrap_or(0) & 0x400!=0 {
             for slot in &mut self.slots {slot.fired=false;}
             self.cycle_start=self.elapsed;
             alive=true;
@@ -310,7 +310,7 @@ mod tests {
                 // Exercise the authored include/exclude and mask gates without
                 // changing the installed Toggle or its child template.
                 let listed=&t.words[5..5+t.word(4)? as usize];
-                let playfield=if t.words.get(0).copied().unwrap_or(0) & 0x800!=0 {
+                let playfield=if t.words.first().copied().unwrap_or(0) & 0x800!=0 {
                     (0..=listed.len() as u32).find(|id|!listed.contains(id)).context("Toggle excludes every playfield")?
                 } else {
                     *listed.first().context("Toggle has no permitted playfield")?
@@ -363,7 +363,7 @@ impl GridEffect {
         let mut at=17;
         let curves=[Curve::parse(t,&mut at,false)?,Curve::parse(t,&mut at,false)?,Curve::parse(t,&mut at,false)?,Curve::parse(t,&mut at,true)?,Curve::parse(t,&mut at,true)?];
         let source=super::sprites::connector(t,source)?;
-        let angle=if t.words.get(0).copied().unwrap_or(0) & 0x1000!=0 {super::random_fraction(gc)*std::f32::consts::TAU-std::f32::consts::PI}else{0.0};
+        let angle=if t.words.first().copied().unwrap_or(0) & 0x1000!=0 {super::random_fraction(gc)*std::f32::consts::TAU-std::f32::consts::PI}else{0.0};
         Ok(Self {template:t.clone(),source,position:source.w_axis.truncate(),curves,duration:t.float(8)?,previous:0.0,angle})
     }
     // Native SetDuration and TerminateGracefully are no-ops (100793e8/10115963).
@@ -379,7 +379,7 @@ impl GridEffect {
         if time>=self.duration {return Ok(None);}
         let dt=(time-self.previous).max(0.0);self.previous=time;
         let t=&self.template;
-        if t.words.get(0).copied().unwrap_or(0) & 0x800!=0 {self.position=self.source.w_axis.truncate();}
+        if t.words.first().copied().unwrap_or(0) & 0x800!=0 {self.position=self.source.w_axis.truncate();}
         self.angle+=t.float(13)?*dt;
         let phase=(time%self.duration)/self.duration;
         let h=self.curves[0].scalar(phase);let w=self.curves[1].scalar(phase);let d=self.curves[2].scalar(phase);
@@ -398,12 +398,12 @@ impl GridEffect {
                     _=>{let y=h*u;[Vec3::new(0.0,y,0.0),Vec3::new(-w*0.5,y,-w*0.5),Vec3::new(-w*0.5,y,w*0.5),Vec3::new(w*0.5,y,w*0.5),Vec3::new(w*0.5,y,-w*0.5)]}
                 };
                 let colors=match axis {0=>[mix(bottom,top,0.5),bottom,bottom,top,top],2=>[mix(bottom,top,0.5),bottom,top,top,bottom],_=>[mix(bottom,top,u);5]};
-                let uv=if axis==1 || t.words.get(0).copied().unwrap_or(0) & 0x400!=0 {
+                let uv=if axis==1 || t.words.first().copied().unwrap_or(0) & 0x400!=0 {
                     if axis==0 {[[0.5,0.5],[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0]]}
                     else {[[0.5,0.5],[0.0,0.0],[0.0,1.0],[1.0,1.0],[1.0,0.0]]}
                 }else if axis==0 {[[0.5,u],[0.0,u],[1.0,u],[1.0,u],[0.0,u]]}else{[[0.5,u],[0.0,u],[0.0,u],[1.0,u],[1.0,u]]};
                 let normal=(points[1]-points[0]).normalize_or_zero().cross((points[2]-points[0]).normalize_or_zero());
-                let fade=if t.words.get(0).copied().unwrap_or(0) & 0x4000!=0 && view!=Vec3::ZERO && normal!=Vec3::ZERO {normal.dot(view).abs()}else{1.0};
+                let fade=if t.words.first().copied().unwrap_or(0) & 0x4000!=0 && view!=Vec3::ZERO && normal!=Vec3::ZERO {normal.dot(view).abs()}else{1.0};
                 for j in 0..5 {let mut color=colors[j];color[3]=(color[3]*255.0*fade).trunc()/255.0;vertices.push(Vertex {pos:rotation.transform_point3(points[j]).to_array(),color:render(color),uv:uv[j],..Default::default()});}
             }
         }
@@ -433,9 +433,9 @@ impl ShieldEffect {
         true
     }
     pub(super) fn material(&self)->usize {self.template.words.get(12).copied().unwrap_or(0) as usize}
-    pub(super) fn uses_source_material(&self)->bool {self.template.words.get(0).copied().unwrap_or(0) & 0x10000!=0 && self.mech_resource().is_none()}
-    pub(super) fn priority(&self)->Option<i32> {if self.template.words.get(0).copied().unwrap_or(0) & 0x8000!=0 {Some(3)}else{None}}
-    pub(super) fn blend(&self)->Blend {if self.template.words.get(0).copied().unwrap_or(0) & 0x400!=0 {Blend::Additive}else{Blend::AlphaBlend}}
+    pub(super) fn uses_source_material(&self)->bool {self.template.words.first().copied().unwrap_or(0) & 0x10000!=0 && self.mech_resource().is_none()}
+    pub(super) fn priority(&self)->Option<i32> {if self.template.words.first().copied().unwrap_or(0) & 0x8000!=0 {Some(3)}else{None}}
+    pub(super) fn blend(&self)->Blend {if self.template.words.first().copied().unwrap_or(0) & 0x400!=0 {Blend::Additive}else{Blend::AlphaBlend}}
     pub(super) fn layer_count(&self)->usize {self.template.words.get(19).copied().unwrap_or(0) as usize}
     pub(super) fn mech_resource(&self)->Option<&'static str> {
         const RESOURCES:[&str;10]=["EP03_preorder_mech_simple.abiff","EP03_scout_mech_simple.abiff","EP03_heavy_mech_simple.abiff","EP03_anti_personnel_gun_simple.abiff","EP03_anti_vehicle_gun_simple.abiff","EP03_preorder_mech_upgraded_simple.abiff","EP03_scout_mech_upgraded_simple.abiff","EP03_heavy_mech_upgraded_simple.abiff","EP03_anti_personnel_gun_upgraded_simple.abiff","EP03_anti_vehicle_gun_upgraded_simple.abiff"];
@@ -449,8 +449,8 @@ impl ShieldEffect {
     }
     pub(super) fn vertices(&self,source:&[Vertex],body_scale:f32)->Vec<Vertex> {
         let t=&self.template;let phase=self.elapsed/self.duration;
-        if self.surface_stopped && t.words.get(0).copied().unwrap_or(0) & 0x20000!=0 {return Vec::new();}
-        if t.words.get(0).copied().unwrap_or(0) & 0x40000!=0 && source.len()>1000 {return Vec::new();}
+        if self.surface_stopped && t.words.first().copied().unwrap_or(0) & 0x20000!=0 {return Vec::new();}
+        if t.words.first().copied().unwrap_or(0) & 0x40000!=0 && source.len()>1000 {return Vec::new();}
         let offset=self.offset.scalar(phase);let color=self.color.color(phase);
         let frequency=f32::from_bits(t.words.get(18).copied().unwrap_or(0));
         let u=f32::from_bits(t.words.get(13).copied().unwrap_or(0));let vv=f32::from_bits(t.words.get(14).copied().unwrap_or(0));
@@ -479,7 +479,7 @@ impl ShieldEffect {
             for vertex in &surface {
                 let mut v=*vertex;
                 let mut p=Vec3::from_array(v.pos)*(1.0+expand);
-                if t.words.get(0).copied().unwrap_or(0) & 0x1000!=0 {p.y-=expand;}
+                if t.words.first().copied().unwrap_or(0) & 0x1000!=0 {p.y-=expand;}
                 v.pos=p.to_array();out.push(v);
             }
         }
@@ -529,7 +529,7 @@ impl TrailEffect {
         let movement=matrix.w_axis.truncate()-self.origin.matrix.w_axis.truncate();
         let mut color=self.curves[0].color(phase);
         let mut emit=true;
-        if self.template.words.get(0).copied().unwrap_or(0) & 0x800!=0 {
+        if self.template.words.first().copied().unwrap_or(0) & 0x800!=0 {
             if movement==Vec3::ZERO {emit=false;}
             else {
                 let direction=self.vehicle_direction.ok_or_else(||anyhow::anyhow!("Trail2 requires source vehicle direction"))?;
@@ -544,7 +544,7 @@ impl TrailEffect {
                 while self.emission>=period {self.sample(self.origin);self.emission-=period;}
             }
         }
-        if self.template.words.get(0).copied().unwrap_or(0) & 0x1000!=0 && dt!=0.0 {
+        if self.template.words.first().copied().unwrap_or(0) & 0x1000!=0 && dt!=0.0 {
             let thrust=(super::random_fraction(ds)*f32::from_bits(self.template.words.get(15).copied().unwrap_or(0))+f32::from_bits(self.template.words.get(14).copied().unwrap_or(0)))*dt;
             let displacement=-self.origin.matrix.z_axis.truncate()*thrust;
             for sample in &mut self.samples[..self.count] {sample.matrix.w_axis+=displacement.extend(0.0);}
@@ -562,7 +562,7 @@ impl TrailEffect {
                 let color=render(if strip==0 {sample.color}else{last_color});
                 for side in 0..2 {
                     let u=if self.count==0 {0.0}else{i as f32/self.count as f32};
-                    let uv=if self.template.words.get(0).copied().unwrap_or(0) & 0x400==0 {[u,side as f32]}else{[side as f32,u]};
+                    let uv=if self.template.words.first().copied().unwrap_or(0) & 0x400==0 {[u,side as f32]}else{[side as f32,u]};
                     vertices[strip*n*2+i*2+side]=Vertex {pos:(p+offsets[side]).to_array(),uv,color,..Default::default()};
                 }
             }

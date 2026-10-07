@@ -86,7 +86,12 @@ mod tests {
             assert!(effect.frame(1.0,&mut host));assert!(!effect.frame(0.008,&mut host));
             let mut effect=NightVision::new(&authored(id)).unwrap();effect.terminate();assert!(!effect.frame(0.0,&mut host));
         }
-        let mut bad=authored(3400);bad.words.truncate(25);assert!(NightVision::new(&bad).is_err());
+        let mut short=authored(3400);short.words.truncate(15);
+        let effect=NightVision::new(&short).unwrap();
+        assert_eq!(effect.layers.len(),2);assert_eq!(short.float(25).unwrap(),0.0);
+        assert_eq!(effect.layers[1].color,[1.0,0.0,1.0,0.0]);
+        short.words[1]=f32::NAN.to_bits();assert!(NightVision::new(&short).is_err());
+        let mut bad=authored(3400);bad.words[6]=0;assert!(NightVision::new(&bad).is_err());
     }
     #[test]
     #[ignore="installed retail configurations and offscreen Metal rendering"]
