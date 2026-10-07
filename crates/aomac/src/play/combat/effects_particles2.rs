@@ -235,8 +235,8 @@ mod tests {
         for &id in &ids {
             renderer.clear();
             host.camera = ao_render::Camera::look_at(Vec3::new(2.0,2.0,5.0), Vec3::ZERO);
-            let handle=renderer.spawn(Binding { group:0, attractor:0, effect:id, note:0, color:0 },
-                super::super::Creation::Vector,Mat4::IDENTITY, Vec3::X)?;
+            let handle=renderer.spawn_configured(Binding { group:0, attractor:0, effect:id, note:0, color:0 },
+                Mat4::IDENTITY, Vec3::X, super::super::EffectConfig {creation:super::super::Creation::Vector,..Default::default()})?;
             let mut rendered = false;
             let t=&templates.by_id[&id];
             let steps=((float(t,25).max(float(t,26))+float(t,12).max(0.0)+0.02)*100.0).ceil() as usize;
