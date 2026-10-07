@@ -29,6 +29,84 @@ fn shot(p: &mut Play, o: &mut Offscreen, dir: &Path, name: &str) {
     eprintln!("wrote {name}.png");
 }
 
+/// Actual login assets, including a world sky answer arriving after the backdrop replacement.
+#[test]
+fn backdrop_after_live_sky_matches_fresh_pixels() {
+    let Some(out) = std::env::var_os("AOMAC_SHOT_DIR").map(PathBuf::from) else { return };
+    let client = ao_gui::client_dir();
+    if !client.join("cd_image/gui").exists() {
+        return eprintln!("skipping: no client");
+    }
+    std::fs::create_dir_all(&out).unwrap();
+    let store = RecordStore::open(&client).unwrap();
+    for stage in 0..=1 {
+        let mut p = Play::new(client.clone(), None, None, None).unwrap();
+        if stage == 1 {
+            p.screen = Screen::CharSelect;
+        }
+        let mut o = Offscreen::new(&p, SIZE).unwrap();
+        backdrop(&p);
+        steps(&mut p, &mut o, 3, 0.0);
+        let blank = ao_gui::DrawList::default();
+        let fresh = out.join(format!("backdrop-{stage}-fresh.png"));
+        o.png(&p, &blank, &fresh).unwrap();
+        let expected = image::open(&fresh).unwrap().to_rgba8();
+
+        let mut world = screens::login_world_scene(&store, stage).unwrap();
+        let env = world.environment.as_mut().expect("login environment");
+        env.sky_color = [1.0, 0.0, 1.0];
+        env.fog_color = [1.0, 0.0, 1.0];
+        env.fog_start = 0.0;
+        env.fog_end = 1.0;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        o.host.live_sky = Some(Some(ao_render::LiveSky {
+            start: 100.0,
+            scale: 10.0,
+            source: Box::new(move |time| {
+                started_tx.send(time).unwrap();
+                release_rx.recv().unwrap();
+                world.clone()
+            }),
+        }));
+        o.frame(&mut p, 0.0); // install the world worker
+        o.host.sky_clock = Some(200.0);
+        o.frame(&mut p, 0.0); // request at the old clock, then apply resync
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 100.0);
+        release_tx.send(()).unwrap();
+        // Drain the first answer and ask for another; the second stays blocked across reset.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            o.frame(&mut p, 0.5);
+            if let Ok(time) = started_rx.try_recv() {
+                assert!(time >= 205.0, "offscreen must apply the host sky clock");
+                break;
+            }
+            assert!(Instant::now() < deadline, "live sky worker did not advance");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let world_path = out.join(format!("backdrop-{stage}-world.png"));
+        o.png(&p, &blank, &world_path).unwrap();
+        let world_pixels = image::open(&world_path).unwrap().to_rgba8();
+        assert!(expected.pixels().zip(world_pixels.pixels()).any(|(a, b)| a.0.iter().zip(b.0).any(|(a, b)| a.abs_diff(b) > 2)),
+            "live sky must visibly change the real backdrop before reset");
+
+        backdrop(&p); // same delivery path as fresh login/character selection
+        o.frame(&mut p, 0.0);
+        release_tx.send(()).unwrap(); // obsolete in-flight worker result
+        for tick in 0..8 {
+            std::thread::sleep(Duration::from_millis(10));
+            o.frame(&mut p, 0.5);
+            let restored = out.join(format!("backdrop-{stage}-restored-{tick}.png"));
+            o.png(&p, &blank, &restored).unwrap();
+            let actual = image::open(&restored).unwrap().to_rgba8();
+            assert_eq!(expected.dimensions(), actual.dimensions());
+            assert!(expected.pixels().zip(actual.pixels()).all(|(a, b)| a.0.iter().zip(b.0).all(|(a, b)| a.abs_diff(b) <= 2)),
+                "stage {stage}, delayed tick {tick}: backdrop differs from fresh login by more than 2/255 per channel");
+        }
+    }
+}
+
 #[test]
 fn shots() {
     let Some(out) = std::env::var_os("AOMAC_SHOT_DIR").map(PathBuf::from) else { return };

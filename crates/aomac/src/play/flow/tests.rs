@@ -538,7 +538,9 @@ fn leaving_the_world_closes_chat_and_interact() {
         r.p.frame(0.016, (1280, 800), &mut r.host);
     }
     assert!(r.p.chat.is_some() && r.p.interact.is_some() && r.p.gui.window_ids().len() > 3);
+    r.host.live_sky = None; // The viewer drains the world's live-sky request.
     r.p.show_login(&mut r.host);
+    assert!(matches!(r.host.live_sky, Some(None)), "returning to login stops the world's live sky");
     assert!(r.p.chat.is_none() && r.p.interact.is_none() && r.p.hud.is_none());
     let left: Vec<_> = r.p.gui.window_ids().into_iter().map(|w| (w, r.p.gui.view_names(w))).collect();
     assert_eq!(r.p.gui.window_ids(), vec![r.p.login_w.unwrap()], "only the login window is left: {left:?}");

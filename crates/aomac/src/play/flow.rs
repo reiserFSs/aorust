@@ -57,6 +57,7 @@ impl Play {
 
     /// `LoginWorld_c::SetStage`: stage 0 for login/progress, 1 for character selection; camera fixed (docs/screens.md §2).
     fn show_backdrop(&mut self, stage: u32, host: &mut Host) {
+        host.live_sky = Some(None);
         let Some(b) = &self.backdrop else { return };
         let mut s = (**b).clone();
         set_login_stage(&mut s, stage);

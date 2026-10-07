@@ -150,6 +150,24 @@ impl LiveRun {
         }
         got
     }
+
+    fn apply_host(live: &mut Option<Self>, host: &mut Host) {
+        if let Some(next) = host.live_sky.take() {
+            *live = next.map(Self::new);
+        }
+        if let (Some(time), Some(run)) = (host.sky_clock.take(), live.as_mut()) {
+            run.day_time = time;
+        }
+    }
+
+    fn advance(live: &mut Option<Self>, renderer: &mut Renderer, dt: f32) {
+        if let Some(run) = live {
+            renderer.day_time_rate = run.scale;
+            if let Some(sky) = run.tick(dt) {
+                renderer.set_sky(&sky);
+            }
+        }
+    }
 }
 
 struct Gui {
@@ -379,12 +397,7 @@ impl State {
         if let Some(scene) = g.host.repose.take() {
             self.renderer.repose(&scene);
         }
-        if let Some(l) = g.host.live_sky.take() {
-            self.live = l.map(LiveRun::new);
-        }
-        if let (Some(t), Some(l)) = (g.host.sky_clock.take(), self.live.as_mut()) {
-            l.day_time = t;
-        }
+        LiveRun::apply_host(&mut self.live, &mut g.host);
         if let Some(lens) = g.host.lens.take() {
             self.renderer.set_lens(lens);
         }
@@ -408,12 +421,7 @@ impl State {
         self.last = now;
         self.clock += dt;
         self.renderer.time = self.clock;
-        if let Some(l) = &self.live {
-            self.renderer.day_time_rate = l.scale;
-        }
-        if let Some(sky) = self.live.as_mut().and_then(|l| l.tick(dt)) {
-            self.renderer.set_sky(&sky);
-        }
+        LiveRun::advance(&mut self.live, &mut self.renderer, dt);
 
         // HiDPI/resize: follow the physical size every frame.
         let PhysicalSize { width, height } = self.window.inner_size();
@@ -610,6 +618,7 @@ pub struct Offscreen {
     gr: crate::GuiRenderer,
     pub host: Host,
     size: (u32, u32),
+    live: Option<LiveRun>,
 }
 
 impl Offscreen {
@@ -617,7 +626,7 @@ impl Offscreen {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = Renderer::new(&instance, None)?;
         let (targets, gr) = (Targets::new(&r, size.0, size.1), crate::GuiRenderer::new(&r, fe.gui()));
-        Ok(Self { r, targets, gr, host: Host::headless(), size })
+        Ok(Self { r, targets, gr, host: Host::headless(), size, live: None })
     }
 
     /// Changes the render surface size without replacing the live frontend or its GUI state.
@@ -629,6 +638,7 @@ impl Offscreen {
     /// One `Frontend::frame`, applying what it asked of the host.
     pub fn frame(&mut self, fe: &mut dyn Frontend, dt: f32) -> ao_gui::DrawList {
         self.r.time += dt;
+        LiveRun::advance(&mut self.live, &mut self.r, dt);
         let list = fe.frame(dt, self.size, &mut self.host);
         if let Some(scene) = self.host.scene.take() {
             self.r.upload(&scene);
@@ -636,6 +646,7 @@ impl Offscreen {
         if let Some(scene) = self.host.repose.take() {
             self.r.repose(&scene);
         }
+        LiveRun::apply_host(&mut self.live, &mut self.host);
         if let Some(lens) = self.host.lens.take() {
             self.r.set_lens(lens);
         }

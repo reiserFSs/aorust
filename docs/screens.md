@@ -143,6 +143,18 @@ lit by (a) the device state that `Randy_t`'s reset leaves and (b) the lights sto
   environment (ambient 0.35/0.38/0.45, a warm sun, vertical 60°): the hall looked evenly white-grey. With the engine's values only the two coloured point lights
   shine (mint, warm white): walls are tinted by the light they face, surfaces turned away from both lights are black (no ambient), the view is narrower vertically
   (horizontal 60°). Checked with `login_shot` renders of both versions (`/tmp` PNGs, not committed) and the `aomac play --fake-charlist` window.
+  Returning from the world also resets the sky driver: `play::flow::show_backdrop` queues `Host::live_sky = Some(None)` before uploading the static backdrop.
+  The native root cause was a retained world `LiveRun`, not incorrect login lighting: `ao-render/src/viewer.rs::run_gui` uploads the backdrop but only replaces
+  its live driver when a `Host::live_sky` request is present; subsequent `LiveRun::tick` results otherwise overwrite the login environment.
+  `play::flow::tests::leaving_the_world_closes_chat_and_interact` asserts the explicit stop request after returning to login.
+  The renderer upload already replaces environment, fog model, lens, scene lights and sky geometry; no gamma/exposure override exists on this path.
+  Fog-density scale is inert with the backdrop's disabled fog, and world statel/view-distance state belongs to the discarded world scene.
+  `create::shots::backdrop_after_live_sky_matches_fresh_pixels` passed with actual login assets at both stages: a visibly changed simulated world sky,
+  an obsolete in-flight sky result released after reset, then eight delayed frames matching fresh backdrop pixels within 2/255 per channel.
+  Offscreen now advances and stops the same `LiveRun` as the window; previously it ignored live-sky requests and could not reproduce this leak.
+  Real-window verification (2026-10-07, clean origin/main plus reset): fresh login → live test character → physical `/camp` → login → character selection.
+  Both returned backdrops retained the fresh stars/planet and dim floor. A static floor crop (x=180..499, y=600..789 in the 1392×940 window capture)
+  matched exactly for login and character selection (maximum channel difference 0); animated preview characters were excluded from this crop.
 * **Specular (implemented)**: 9 of main's materials set `SPECULARENABLE` = 1 (`hull default`, `tech plated`, `grey-shit` = the floor, …), `spec` 0.9, `shin` 10–25; `ao-render` adds `Cs · Ls · (N·H)^power · atten` per vertex after the texture stage (`LOCALVIEWER` = 1, light specular = diffuse colour; see `docs/formats.md` *Vertex lighting*). With the two distant lights the highlights are weak: the `login_shot` render differs from the per-pixel one mostly by Gouraud shading on the pedestals.
 * **`CCCharacter_t::ShowSelectionGlow(bool)`** [GUI 0x1011a9ae] (the "selection glow") is a `GfxVisualShield` over the character's `RCATMesh_t`; it is switched on/off only by
   `BreedScene_t::SlotBreedButton` [0x1011385b] — the character *creation* breed hover — and **never visibly renders**; the full decode is in §12 *Breed hover glow*.
