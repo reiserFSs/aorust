@@ -676,6 +676,20 @@ source `(930.0051,9.733654,-759.66864)`, listener
 `(932.2918,27.584023,-755.5124)`, distance18.469948m versus authored15m.
 Both269 and272 explicitly reported `reason=distance`; definitions and
 sample paths resolved. The own server/avatar height was24.21m.
+The fixed offscreen muted replay logged107 own requests at avatar origin
+`(930.0051,24.21451,-759.66864)`:269 sustained voice5 and272 allocated
+voice7. During casting the mixer had4 voices and RMS0.1902 (output gain0);
+the request volume0.6→1 and repeated269 calls reused voice5. Body Boost
+has no271, so no invented release/loop sound is expected.
+
+The same replay exercised116628 at inventory slot0x42 while seated:
+60 captured60Hz use frames showed the authored13600 bright pink-white
+Stars expanding around the actor, then fading. Nano rose20/36→36/36.
+Its template has no animation/sound map (see `interact.md`); the seated
+pose plus authored visual callback, not an invented sound, is the contract.
+Body Boost cast frames showed red hand effects. After waiting10s beyond
+the one-second cast capture, NCU was1/8; removal's120 captured frames
+and a further2s wait left NCU0/8 and no cast/torso particles.
 
 
 ### 7.5 Persistent buff selector census
