@@ -159,6 +159,12 @@ impl Module {
         self.combat.is_fighting(id)
     }
 
+    /// `FUN_100688f9`: resolve the fight target when the animation note fires.
+    pub fn note_target(&self, id: i32) -> Option<i32> {
+        let fight = self.combat.fight(id)?;
+        fight.target.or(fight.last_target).map(|target| target.instance)
+    }
+
     /// Frames to send to the zone server.
     pub fn take_outbox(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.outbox)

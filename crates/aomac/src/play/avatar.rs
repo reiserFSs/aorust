@@ -174,7 +174,7 @@ fn fallback(r: &Role) -> Option<Role> {
 
 /// The `[loopstart, loopend]` span of a clip (event markers of the CAT clip, e.g. walk 733..1733 ms of 2433): the clip is
 /// `intro, loop, outro`; while the role holds, playback wraps from `loopend` back to `loopstart`.
-fn loop_span(a: &CatAnim) -> Option<(f32, f32)> {
+pub(super) fn loop_span(a: &CatAnim) -> Option<(f32, f32)> {
     let at = |n: &str| a.events.iter().find(|e| e.1 == n).map(|e| e.0 as f32);
     let (s, e) = (at("loopstart")?, at("loopend").unwrap_or(a.duration));
     (s < e && e <= a.duration).then_some((s, e))
@@ -393,6 +393,9 @@ impl Avatar {
         // `FUN_1006a239`: a weapon swing is sped up so its first note lands within the weapon's ItemDelay
         if let (Some(d), Some(a)) = (self.swing_delay, &self.clip) {
             self.rate *= super::combat::anim::swing_speed_scale(a.events.first().map_or(0.0, |e| e.0 as f32), d);
+            if self.ms == 0.0 && std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
+                eprintln!("combat: swing clip role={:?} abstract_id={} source_id={} duration_ms={} rate={} events={:?}", pose.role, self.calibration_id, a.source_id, a.duration, self.rate, a.events);
+            }
         }
         if let Some(k) = self.clip_scale {
             self.rate *= k;

@@ -72,6 +72,24 @@ Every `Hit` / `Miss` / `SpecialAttack` event of any character (a miss runs `FUN_
    `0x00f000`, effect `0x2f5a` path, `combat-log.md` section 6) with the text without its trailing newline. The sound of Brawl / Dimach is in section 6.
 * `CharSecSpecAttack` queues only when empty; `SpecialAttackInfo` starts the front's swing before feedback and clears the deque afterward (`FUN_1006a9c5`, `FUN_1005548b`). Active list keys are suppressed (`FUN_1003bfd2`, its list node `+0xc` comparison), not clip names:
   distinct special keys resolving to the same clip restart the own avatar clock/notes and replace a busy dynel swing. Social and reaction `play_once` calls retain their busy gate.
+* Same-frame event order is preserved by `combat_animations`: `CharFight_t` constructor
+  (`1007b816`, §4) draw precedes the later `SpecialAttackInfo` swing (`1006a9c5`).
+  The former split loops played all swings first and then all stance transitions,
+  replacing a start+special rifle clip with `rifle-start`. Regression
+  `fight_start_does_not_replace_same_frame_rifle_special` checks the actual own
+  `Player` transient remains Burst 1024 / Fling 1023. Added, not run here.
+  `AOMAC_COMBAT_LOG` records selected list/abstract id/name and the sampled own
+  clip's source id, duration, rate and authored events.
+* Pre-fix capture `artifact://21482` received own33512 normal slot6 hit (damage3,
+  flags3) and note0xb, Burst148 slot6 damage29, Fling150 slot6 damage6.
+  No pre-spawn effect diagnostic appeared. Root found in glue: these four flags
+  belong to `IndependentPrefs` (`dvalue/indep.rs`, login defaults all 1), not
+  DValue nodes. `DValues::flag` only reads nodes, so HUD-backed category masks
+  were always zero. Glue now reads `prefs.get_int(..., Kind::Login)` (DS
+  `1005fd60`; GC `100ce1fa` packs nano bits4/32); default weapon/nano masks
+  are10/36. Regression `effect_categories_read_independent_login_preferences`
+  checks defaults and each individual preference off. Temporary early-return
+  instrumentation removed; authored spawn diagnostics remain. Added, not run here.
 * A 0/1/2 "height" variant (`param_3` of `FUN_1003c8b7`) is computed for `AnimSet == 0` weapons from the muzzle attractor
   (`AttractorMesh::GetName(0)`) vs the target's height and distance < 6 m (`_DAT_1015d0a0`; < 3 m `_DAT_1015d69c`); what it selects inside
   `FUN_1003c802` is **[UNRESOLVED]** (not modelled).
@@ -251,15 +269,12 @@ notes `aimedshot/burst/fullauto/flingshot/sneakattack`, which `FUN_10045069` ign
 to those offsets are `SimpleChar` fields): dead data of an earlier design, which is why most names are not in the .sbf.
 
 **Wired** (`combat/notes.rs`, `Dynels::{note_sounds, weapon_hit, swish, record_note}`): the avatar (own, `Avatar::take_notes` while `Player::swing` marks the clip as a swing, bare hands included) and the dynels
-(`Dynels::swing_mark` + the clip time in `update_with_collision`) fire notes once per play; `glue.rs` hands them to `note_sounds` with the attacker's last `AttackInfo` / `MissedAttackInfo` (`hit_of`, `Dynels::hit_seen`: victim,
-slot, damage, hit kind) and the item behind that slot (`Armory::slot_item`: record sounds, `AmmoType`, wielded); sounds go through the `GameSound` queue (`material`, `size`, delayed ones through `Dynels::update_with_collision`) to
-`Audio::play_game_sound_with` (flow.rs logs `game sound <id> at <pos>: N voice(s) (material m, size s)` with `AOMAC_AUDIO_LOG=1`). Positions: the character; the own character at the camera.
+(`Dynels::swing_mark` + the clip time in `update_with_collision`) fire notes once per play; `glue.rs` hands them to `note_sounds`, `note_reaction` and `note_effects`. `Dynels::hit_seen` retains damage/hit kind per (attacker, slot); `special_hit_seen` changes only the active swing target/slot. The note resolves the current fight target (or the controller's retained last target), then reads that slot's values (`FUN_100688f9` → `FUN_1009b84b` → `FUN_1009b7e8` → `FUN_1009b4ac`). Reactions now start at qualifying attack notes, never at `Hit` message arrival. Specials after a hit retain reaction rate, impact effects and old-damage sound size; after a miss or on constructor-zero slots there is no impact. Wielded weapon swing sounds remain ungated. Own-item special animation selection remains separate from slot-item note sounds/effects (resolved contradiction: combat-log.md §2.2).
+Sounds go through the `GameSound` queue (`material`, `size`, delayed ones through `Dynels::update_with_collision`) to `Audio::play_game_sound_with` (flow.rs logs `game sound <id> at <pos>: N voice(s) (material m, size s)` with `AOMAC_AUDIO_LOG=1`). Positions: the character; the own character at the camera.
 Tests: `notes::tests::*` (note ids, once-per-play firing, size / ammo / player-impact rules, real swing clips), `dynels::variant_tests::{a_bare_handed_hit_plays_the_weapon_swing_and_the_material_impact,
-swish_and_attack_start_notes, a_marked_swing_clip_reports_its_notes, creature_records_carry_a_fabric_type, a_struck_creature_plays_an_impact_clip}`, `arms::tests::real_records`, ao-formats
+swish_and_attack_start_notes, a_marked_swing_clip_reports_its_notes, creature_records_carry_a_fabric_type, a_struck_creature_plays_an_impact_clip, special_notes_retain_only_their_attacker_and_slot_flags, special_sound_impact_uses_retained_damage_not_the_result}`, `arms::tests::real_records`, ao-formats
 `a_weapon_record_finds_its_sound_multimap_behind_the_unwalked_elements`, ao-audio `game_material_maps_to_a_variant_slot` and `weapon_sounds_resolve` (all 31 843 ids but 75 are in the sbf; the flesh variant plays).
-Deviations: the notes fire from the clip time of the swing, which restarts like the original's (not at the `AttackInfo`); the impact uses the attacker's target at the `AttackInfo` (the original reads the fight target at note
-time); unknown victims / items (no slot object, `FUN_10068072` null) are silent as in the original; creature impacts need the NPC model to be built.
-The `EffectType` 413 / `ImpactEffectType` 414 effect scripts (`FUN_1009ad7d`) are visual only and stay unresolved.
+Notes fire from the swing clip clock, not at `AttackInfo` arrival; impact sounds/effects and reactions resolve the active fight target at note time. Unknown victims/items (no slot object, `FUN_10068072` null) are silent as in the original; creature impacts need the NPC model to be built. The visual `EffectType` 413 / `ImpactEffectType` 414 scripts (`FUN_1009ad7d`) use the same retained slot hit-kind gate, independently of special-result damage.
 **Correction to docs/formats.md ("168 `sfx/player/*.txt` unused")**: the files (`<breed>_<sex>_<cool|distunguished|military|simple>_<heal|help|inc|no|run|yes>_NN.wav` + subtitle `.txt`) are the
 **chat voice commands** (GUI.dll strings `sound/sfx/player/`, `VoiceSndFxType`, `VoiceSndFxHear{Team,Guild,Vicinity}On`, `Voicecommands.html`), not per-animation FX; no combat code uses them.
 
@@ -430,6 +445,31 @@ The corpse holds the resulting death pose, rather than bind pose; corrected fiel
   normal one-shot path. The death replay fixture awaits `Model::Ready` with a
   bounded deadline before advancing its unchanged thirty-second simulation;
   all death selector, phase and sound assertions remain intact.
+
+#### Fixed-step live frame capture (2026-10-07)
+
+The retained offscreen harness runs the same `Play` and renderer as the window.
+`arm=shot:1:note,Q=0.1,capturewait=30` saves the actual own-note processing frame
+as `shot-0000.png`, then every fixed-1/60-second frame (60 PNGs).
+`arm=burst:1:special,M=0.1,capturewait=30` and the equivalent `L`/Fling recipe
+start at SpecialAttack processing. Use `AOMAC_LIVE_SHOTS=/tmp/<owner>/` and
+the live lock; keep the same-target fight active between specials.
+`frames=prefix:2` saves 120 frames; NPC phase/clock recipes are in `npc.md`.
+GPU readback can take longer than simulation time. This is offscreen evidence,
+not a real-window or retail-footage claim.
+
+Observed Aomacvolk rifle frames: artifact21482 had no visuals before the preference
+fix; artifact21528 `diag-normal-0000..0059` showed muzzle2005 at authored3000,
+the cord2750 traveling toward the target, and successful-hit impact62002 in
+`diag-burst-0094..` at target1007. Muzzle emission ended after its authored0.1s.
+Artifact21582 `final-burst-0000..0059` retained rifle-burst1024/source14770
+(1000ms, rate1): attack notes at133/233/333/433ms appeared at frames8/14/20/26.
+Fling resolves rifle-shot1023/source14773 (866ms, rate1, attack200ms), as observed
+in artifact21528. Artifact21651 additionally confirmed Special150/list0x1c;
+the target's subsequent normal-hit death at frame8 interrupted that later clip
+before its attack note, rather than indicating a missing authored effect.
+The owned patch passed clean-origin/main workspace tests (1300 passed,
+13 ignored), release build and strict workspace/all-target clippy.
 
 ### 7.3 Nano visual controls
 

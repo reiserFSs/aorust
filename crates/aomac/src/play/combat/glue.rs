@@ -17,6 +17,59 @@ use ao_gui::{DrawList, FontId};
 use ao_net::n3::action;
 use ao_render::Host;
 
+
+fn effect_categories(values: &crate::play::dvalue::DValues) -> (u32, u32) {
+    use crate::play::dvalue::Kind;
+    let enabled = |name| u32::from(values.prefs.get_int(name, Kind::Login).is_some_and(|value| value != 0));
+    ((enabled("MuzzleFlashFX") * 8) | (enabled("TracersFX") * 2),
+     (enabled("NanoEffectFX") * 4) | (enabled("OthersFX") * 32))
+}
+
+#[test]
+fn effect_categories_read_independent_login_preferences() {
+    use crate::play::dvalue::{DValues, Kind};
+    let mut values = DValues::new(std::path::Path::new(""));
+    assert_eq!(effect_categories(&values), (10, 36));
+    for (name, expected) in [
+        ("MuzzleFlashFX", (2, 36)), ("TracersFX", (8, 36)),
+        ("NanoEffectFX", (10, 32)), ("OthersFX", (10, 4)),
+    ] {
+        assert!(!values.flag(name), "IndependentPrefs are not DValue nodes");
+        values.prefs.set_int(name, 0, Kind::Login);
+        assert_eq!(effect_categories(&values), expected);
+        values.prefs.set_int(name, 1, Kind::Login);
+    }
+}
+#[cfg(test)]
+fn live_attack_events(own: i32, notes: &[(i32, u32)], events: &[CombatEvent]) -> [u64; 2] {
+    use super::notes::id;
+    let mut counts = [0; 2];
+    for &(who, note) in notes {
+        if who == own && matches!(note, id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) {
+            counts[0] += 1;
+            eprintln!("live attack note {note:#x} own={own}");
+        }
+    }
+    for event in events {
+        if matches!(event, CombatEvent::SpecialAttack { who, .. } if *who == own) {
+            counts[1] += 1;
+            eprintln!("live attack special {event:?}");
+        }
+    }
+    counts
+}
+
+#[test]
+fn live_attack_events_accounting() {
+    use super::notes::id;
+    let notes = [(7, id::ATTACK), (7, id::ATTACK_EFFECT_4), (7, 0), (9, id::ATTACK)];
+    let special = |who| CombatEvent::SpecialAttack {
+        who, target: ao_net::msg::Identity { kind: 50000, instance: 9 }, special: 148, slot: 1, damage: 5,
+    };
+    assert_eq!(live_attack_events(7, &notes, &[special(7), special(9)]), [2, 1]);
+    assert_eq!(live_attack_events(7, &[], &[]), [0, 0]);
+}
+
 impl Play {
     /// (Re)creates the combat layer for the current zone connection.
     pub(in crate::play) fn fight_reset(&mut self) {
@@ -121,55 +174,32 @@ impl Play {
         }
         // what the attack notes of a swing read from the attacker's slot object (`FUN_1006a8f3`); a miss runs the same routine with damage 0 and
         // hit kind 1 (`FUN_1006ae50`: `FUN_1006a8f3(slot, 0, value_1c, 0, 1, 0)`)
-        for (attacker, ctx) in events.iter().filter_map(hit_of) {
-            self.zone.world.hit_seen(attacker, ctx);
-        }
         for e in &events {
-            if let CombatEvent::SpecialAttack { who, target, special, slot, damage } = e {
-                self.zone.world.special_hit_seen(*who, target.instance, *slot, *damage, *special);
+            if let Some((attacker, ctx)) = hit_of(e) {
+                self.zone.world.hit_seen(attacker, ctx);
+            }
+            if let CombatEvent::SpecialAttack { who, target, slot, .. } = e {
+                self.zone.world.special_hit_seen(*who, target.instance, *slot);
             }
             if let CombatEvent::Died { dynel, .. } = e {
                 self.zone.world.cancel_nano_visuals(*dynel);
             }
         }
-        // swings (`FUN_1006a239` [GC 0x1006a239], docs/zone/combat-anim.md §3): every hit, miss and special attack of every character
-        for e in &events {
-            match e {
-                CombatEvent::Hit { attacker, .. } | CombatEvent::Miss { attacker, .. } => swing(&mut self.zone.world, self.player.as_mut(), *attacker, list::ATTACK, 0, own),
-                CombatEvent::SpecialAttack { who, special, .. } => {
-                    let s = special_swing(*special);
-                    swing(&mut self.zone.world, self.player.as_mut(), *who, s.map_or(list::ATTACK, |s| s.list), if s.is_some_and(|s| s.own_item) { *special } else { 0 }, own)
-                }
-                _ => {}
-            }
-        }
-        // the struck character's reaction clip (`FUN_1009b4ac`, docs/zone/combat-anim.md §4): hit kind > 1, not while swimming (mode 4 / 8)
-        for e in &events {
-            let CombatEvent::Hit { victim, flags, .. } = e else { continue };
-            if *flags <= 1 {
-                continue;
-            }
-            if *victim != own {
-                self.zone.world.react_to_hit(*victim, *flags);
-            } else if let Some(p) = self.player.as_mut().filter(|p| !matches!(p.mode(), 4 | 8)) {
-                let anim = self.zone.world.impact_anim();
-                self.zone.world.set_impact_location(*victim, anim);
-                if let Some((name, _)) = anim_name(anim) {
-                    p.react(Role::Clip(name.into()), if *flags == 4 { 1.0 } else { 0.5 });
-                }
-            }
-        }
+        // Constructor draw/holster and attack playback follow server event order.
+        combat_animations(&mut self.zone.world, self.player.as_mut(), own, &events, |id| m.is_fighting(id));
         // fight sounds (docs/zone/combat-anim.md §6): played by the app next to the door sounds (`Dynels::take_sounds`, listener = camera).
         // The weapon / swish / impact sounds belong to the animation notes of the swing clips (`FUN_1003c036` -> `FUN_10045069`, `notes`)
         let own_notes = self.player.as_mut().map(|p| p.take_notes()).unwrap_or_default();
         let notes: Vec<(i32, u32)> = own_notes.into_iter().map(|n| (own, n)).chain(self.zone.world.take_notes()).collect();
-        self.zone.world.weapon_effect_categories = self.hud.as_ref().map_or(10, |h| {
-            (u32::from(h.dvalues.flag("MuzzleFlashFX")) * 8) | (u32::from(h.dvalues.flag("TracersFX")) * 2)
-        });
-        // DS 1005fd60 prefs offsets 10/13; GC 100ce1fa packs them as 4/32.
-        self.zone.world.nano_effect_categories = self.hud.as_ref().map_or(36, |h| {
-            (u32::from(h.dvalues.flag("NanoEffectFX")) * 4) | (u32::from(h.dvalues.flag("OthersFX")) * 32)
-        });
+        #[cfg(test)]
+        {
+            let counts = live_attack_events(own, &notes, &events);
+            self.live_attack_events[0] += counts[0];
+            self.live_attack_events[1] += counts[1];
+        }
+        // DS 1005fd60 reads IndependentPrefs, not DistributedValue nodes.
+        (self.zone.world.weapon_effect_categories, self.zone.world.nano_effect_categories) =
+            self.hud.as_ref().map_or((10, 36), |h| effect_categories(&h.dvalues));
         let player = self.player.as_ref();
         let stats = &self.zone.stats;
         let character_stats = &self.zone.character_stats;
@@ -186,7 +216,11 @@ impl Play {
             if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
                 eprintln!("combat: note {n:#x} of {who}");
             }
+            if let Some(target) = m.note_target(who) {
+                self.zone.world.note_target(who, target);
+            }
             self.zone.world.note_sounds(who, n);
+            note_reaction(&mut self.zone.world, self.player.as_mut(), own, who, n);
             let player = self.player.as_ref();
             self.zone.world.note_effects(who, n, |anchor, slot| {
                 let p = player?;
@@ -208,8 +242,6 @@ impl Play {
                 _ => {}
             }
         }
-        // AnimHolder stance clips (docs/zone/combat-anim.md §4): the fight idle, the draw and the holster follow the fight controller of every character
-        stance(&mut self.zone.world, self.player.as_mut(), own, &events, |id| m.is_fighting(id));
         if let Some(p) = self.player.as_mut() {
             for e in events {
                 match e {
@@ -346,6 +378,9 @@ fn swing(world: &mut Dynels, player: Option<&mut Player>, who: i32, key: u16, sp
     } else {
         world.pick_swing(who, key).or_else(|| world.pick_item_swing(who, 0, key))
     };
+    if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
+        eprintln!("combat: swing who={who} list={key:#x} special_item={special_item} picked={picked:?} name={:?}", picked.and_then(|(anim, _)| anim_name(anim).map(|(name, _)| name)));
+    }
     // the clip's notes (`attack`, `swish_*`) start the sounds: the own avatar and the dynels watch them while the clip plays
     if who != own {
         world.swing_mark(who);
@@ -363,6 +398,27 @@ fn swing(world: &mut Dynels, player: Option<&mut Player>, who: i32, key: u16, sp
         }
         (false, Some((anim, _))) => world.play_swing(who, Some(anim as u32), key),
         (false, None) => world.play_swing(who, None, key),
+    }
+}
+
+/// `FUN_1009b4ac` reads retained slot flags at the attack note, never at message arrival.
+pub(in crate::play) fn note_reaction(world: &mut Dynels, player: Option<&mut Player>, own: i32, who: i32, note: u32) {
+    use super::notes::id;
+    if !matches!(note, id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) { return; }
+    let Some(h) = world.note_ctx(who) else { return };
+    if h.flags <= 1 {
+        let anim = world.impact_anim();
+        world.set_impact_location(h.victim, anim);
+        return;
+    }
+    if h.victim != own {
+        world.react_to_hit(h.victim, h.flags);
+    } else if let Some(p) = player.filter(|p| !matches!(p.mode(), 4 | 8)) {
+        let anim = world.impact_anim();
+        world.set_impact_location(h.victim, anim);
+        if let Some((name, _)) = anim_name(anim) {
+            p.react(Role::Clip(name.into()), if h.flags == 4 { 1.0 } else { 0.5 });
+        }
     }
 }
 
@@ -395,12 +451,17 @@ fn fight_idle(world: &mut Dynels, player: &mut Option<&mut Player>, own: i32, wh
 /// character starts fighting (not when it only switches target: `FUN_10069c68` stops the old fight first, `FUN_10068b7f` -> `FUN_1003cc15` plays the
 /// holster, and the fight state stays 2 without a new draw), `FUN_10068b7f` the holster when a fight stops, `FUN_1006a700` the idle update when a weapon
 /// is wielded while the holder fights (`fighting`).
-fn stance(world: &mut Dynels, mut player: Option<&mut Player>, own: i32, events: &[CombatEvent], fighting: impl Fn(i32) -> bool) {
+pub(in crate::play) fn combat_animations(world: &mut Dynels, mut player: Option<&mut Player>, own: i32, events: &[CombatEvent], fighting: impl Fn(i32) -> bool) {
     let died = |who: i32| events.iter().any(|e| matches!(e, CombatEvent::Died { dynel, .. } if *dynel == who));
     for e in events {
         match e {
             CombatEvent::FightStarted { who, switched: false, .. } => fight_idle(world, &mut player, own, *who, true, true),
             CombatEvent::FightStopped { who } => fight_idle(world, &mut player, own, *who, false, !died(*who)),
+            CombatEvent::Hit { attacker, .. } | CombatEvent::Miss { attacker, .. } => swing(world, player.as_deref_mut(), *attacker, list::ATTACK, 0, own),
+            CombatEvent::SpecialAttack { who, special, .. } => {
+                let s = special_swing(*special);
+                swing(world, player.as_deref_mut(), *who, s.map_or(list::ATTACK, |s| s.list), if s.is_some_and(|s| s.own_item) { *special } else { 0 }, own);
+            }
             _ => {}
         }
     }

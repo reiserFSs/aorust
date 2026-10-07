@@ -122,11 +122,27 @@ an **infinite loop**, so an idle never re-rolls at the loop end and there is no 
 After movement-state Play, `FUN_1006be27` calls `FUN_1006fb56` even for idle: speed zero means vehicle maximum velocity (`Vehicle_t+0x3c`), not stationary playback. Calibration × inverse MonsterScale × maximum/reference velocity is set once on the new handle; ordinary idle is not unconditionally rate 1.0. Direct stance idle Play (`FUN_1003cc15`/`FUN_1003cad0`) remains authored-rate playback; see the clock distinction in `avatar.md`.
 
 The test-only live harness can inspect the sampled NPC clock without forcing movement:
-`selname=<NPC>,npcprobe=target,frames=npc-cycle:2` captures 120 fixed-60Hz frames and logs
+`selname=<NPC>,npcprobe=target,npcwait=walk:30,frames=npc-cycle:2` captures 120 fixed-60Hz frames and logs
 the selected abstract clip key, RDB source id, CAT root name, duration/loop markers,
 absolute clock, sampled pose time, rate, model, body scale and movement status per frame.
 Use a naturally walking NPC; holding the own avatar's W key does not drive that NPC.
 The CAT root name is skeleton metadata, not an asset filename.
+`npcwait=idle[:timeout]` gates an idle capture instead; neither wait guarantees the NPC will
+remain in that state for the entire capture.
+
+Live offscreen evidence (Ithaca PF 800, captured log `artifact://21582`, lines 25–506):
+Viviparous Lizard 1019367, model 22773, scale 0.900 stayed Walk throughout
+`final-npc-walk-0000..0119`: abstract key 0x64, CAT source 22783/root `Bone01`,
+duration 4000 ms, loop 1333..2666 ms, rate 1.111111. The absolute clock advanced
+37.037 → 2240.742 ms: 2203.705 ms across 119/60 simulation seconds, matching
+`119/60 × 1000 × 1.111111 = 2203.704` ms (rounded). The authored repeated span
+therefore has a 1.1997 s wall/simulation cycle at this rate; total clip duration is
+not the repeated-cycle length. The capture agent inspected all 120 frames in four
+cropped chunks and reported visible leg/tail walking (body still visible at the upper
+edge in the last chunk); this is offscreen evidence, not a real-window or retail comparison.
+The subsequent `final-npc-idle` sequence began Idle (0x78/source 22777,
+3333 ms, no loop markers, same rate), but ended Walk: it does **not** establish
+two seconds of uninterrupted idle.
 
 | key → parent | |
 |---|---|

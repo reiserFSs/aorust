@@ -24,6 +24,8 @@ pub const DEFAULT_DAMAGE_TYPE: i32 = 0x5b;
 const BARE_HANDS_KEY: i32 = 100;
 /// `CharacterActionIIR_t` id that empties a body slot (`identity_b.instance`).
 pub const ACTION_UNWIELD: i32 = 0x61;
+/// Explicit wield notification (`FUN_1006ad94`), distinct from initial weapon replication.
+pub const ACTION_WIELD: i32 = 0x83;
 /// The `CharacterActionIIR_t` 0x61 of the rifle's unwear (header = the own character 0x82e8, `identity_b = {0, 6}`), as received live.
 #[cfg(test)]
 pub const UNWIELD_SLOT_6: &str = "011d000a0001003700000001000082e85e4777700000c350000082e8000000006100000000000000000000000000000000000000060000";
@@ -207,9 +209,12 @@ impl Armory {
         self.by.get(&holder)?.slots.get(&slot)
     }
 
-    pub fn special_item(&self, holder: i32, special: i32) -> Option<&Item> {
-        self.by.get(&holder)?.specials.get(&special)
+    /// Resolve an explicit wield notification against the replicated weapon dynel, not an outgoing inventory request.
+    pub fn worn_item(&self, item: i32) -> Option<(i32, i32, &Item)> {
+        let &(holder, slot) = self.worn.get(&item)?;
+        Some((holder, slot, self.slot_item(holder, slot)?))
     }
+
 
     /// Lists of the special's own item, or the bare-hands item for an ordinary unarmed attack.
     pub fn item_animation(&self, holder: i32, special: i32, key: u16, pick: u32) -> Option<u16> {

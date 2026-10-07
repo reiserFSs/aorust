@@ -281,6 +281,11 @@ impl Player {
         self.avatar.restart_clip();
     }
 
+    #[cfg(test)]
+    pub(super) fn transient_role(&self) -> Option<&Role> {
+        self.transient.as_ref().map(|(role, _)| role)
+    }
+
     /// The notes the own swing clip reached since the last call (`combat::notes` ids).
     pub fn take_notes(&mut self) -> Vec<u32> {
         self.avatar.take_notes()

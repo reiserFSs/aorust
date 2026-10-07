@@ -668,8 +668,8 @@ pub struct Dynels {
     later: Vec<(f32, GameSound)>,
     /// Animation notes fired by the swing clips of the other characters since the last [`Dynels::take_notes`]: (character, note id).
     notes: Vec<(i32, u32)>,
-    /// The last `AttackInfo` of every attacker (what the attack notes read from the slot object, `FUN_1006a8f3`).
-    last_hit: HashMap<i32, super::combat::notes::HitCtx>,
+    /// Persistent slot +0x30 damage / +0x2c hit kind (`FUN_1006a8f3`); specials never write these.
+    slot_hits: HashMap<(i32, i32), (i32, i32)>,
     effects: Option<super::combat::effects::Renderer>,
     /// Visual spell applications wait until the own animated connectors are available.
     nano_visuals: Vec<ao_net::n3::spells::ApplySpells>,
@@ -682,7 +682,8 @@ pub struct Dynels {
     pub nano_effect_categories: u32,
     /// Retail effect category bits: muzzle=8, tracers/hits=2.
     pub weapon_effect_categories: u32,
-    special_hit: HashMap<i32, (i32, i32, i32, i32)>,
+    /// Active swing target and clip slot, independent of the retained slot flags.
+    swings: HashMap<i32, (i32, i32)>,
     impact_locations: HashMap<i32, i32>,
     /// Camera position of the last [`Dynels::update_with_collision`] (scene space).
     cam: [f32; 3],
@@ -765,7 +766,7 @@ impl Default for Dynels {
             sounds: vec![],
             later: vec![],
             notes: vec![],
-            last_hit: HashMap::new(),
+            slot_hits: HashMap::new(),
             effects: None,
             nano_visuals: vec![],
             nano_handles: vec![],
@@ -776,7 +777,7 @@ impl Default for Dynels {
             nano_templates: HashMap::new(),
             nano_effect_categories: 36,
             weapon_effect_categories: 10,
-            special_hit: HashMap::new(),
+            swings: HashMap::new(),
             impact_locations: HashMap::new(),
             cam: [0.0; 3],
         }
@@ -822,6 +823,27 @@ fn quat_yaw(q: &[f32; 4]) -> f32 {
 }
 
 impl Dynels {
+    #[cfg(test)]
+    pub fn npc_movement_probe(&self, id: i32) -> Option<AnimState> {
+        self.chars.get(&id).filter(|c| c.npc).map(|c| c.pose.anim)
+    }
+
+    /// The selected variant and clock actually sampled by the last NPC frame.
+    #[cfg(test)]
+    pub fn npc_animation_probe(&self, id: i32) -> Option<String> {
+        let c = self.chars.get(&id).filter(|c| c.npc)?;
+        let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
+        let rig = built.rig.as_ref()?;
+        let a = built.clips.get(&c.anim)?.get(c.roll.variant)?;
+        let once = !matches!(c.special, Special::None | Special::Cast(_));
+        Some(format!(
+            "npc={id} name={:?} clip={:#x} source_id={} clip_root={:?} duration_ms={:.3} loopspan_ms={:?} clip_ms={:.3} pose_ms={:.3} rate={:.6} model={} scale={:.3} movement={:?} status={:?}",
+            c.name, c.anim, a.source_id, a.root, a.duration, super::avatar::loop_span(a),
+            c.clip_ms, super::avatar::clip_time(a, c.clip_ms, once), c.clip_rate,
+            rig.model_id, c.scale, c.pose.anim, c.mover.status(),
+        ))
+    }
+
     /// Starts the model builder for the client at `dir`; `own` = the player's own instance id (drawn by the avatar code).
     pub fn start(&mut self, dir: PathBuf, own: i32) {
         self.own = own;
@@ -843,10 +865,10 @@ impl Dynels {
     /// Forgets every dynel (a playfield change, `Zone::reset_world`).
     pub fn clear(&mut self) {
         self.chars.clear();
-        self.last_hit.clear();
+        self.slot_hits.clear();
         self.later.clear();
         self.arms.clear();
-        self.special_hit.clear();
+        self.swings.clear();
         self.impact_locations.clear();
         self.nano_visuals.clear();
         self.nano_handles.clear();
@@ -1090,14 +1112,25 @@ impl Dynels {
 
     /// `FUN_1006a8f3` [GC 0x1006a8f3] stores the damage and the hit kind of an `AttackInfo` in the attacker's slot object (and the victim is its target).
     pub fn hit_seen(&mut self, attacker: i32, ctx: super::combat::notes::HitCtx) {
-        self.last_hit.insert(attacker, ctx);
-        self.special_hit.remove(&attacker);
+        self.slot_hits.insert((attacker, ctx.slot), (ctx.damage, ctx.flags));
+        self.swings.insert(attacker, (ctx.victim, ctx.slot));
     }
 
-    /// Special result has a real slot/damage but no wire hit-kind/crit flag.
-    pub fn special_hit_seen(&mut self, who: i32, victim: i32, slot: i32, damage: i32, special: i32) {
-        self.last_hit.remove(&who);
-        self.special_hit.insert(who, (victim, slot, damage, special));
+    /// `FUN_1006a9c5` selects a special clip but retains the slot's previous flags and damage.
+    pub fn special_hit_seen(&mut self, who: i32, victim: i32, slot: i32) {
+        self.swings.insert(who, (victim, slot));
+    }
+
+    pub fn note_ctx(&self, who: i32) -> Option<super::combat::notes::HitCtx> {
+        let &(victim, slot) = self.swings.get(&who)?;
+        let (damage, flags) = self.slot_hits.get(&(who, slot)).copied().unwrap_or((0, 0));
+        Some(super::combat::notes::HitCtx { victim, slot, damage, flags })
+    }
+
+    pub fn note_target(&mut self, who: i32, victim: i32) {
+        if let Some(swing) = self.swings.get_mut(&who) {
+            swing.0 = victim;
+        }
     }
 
     pub fn set_impact_location(&mut self, victim: i32, anim: u16) {
@@ -1305,15 +1338,9 @@ impl Dynels {
     pub fn note_effects(&mut self, who: i32, note: u32, mut own_anchor: impl FnMut(i32, i32) -> Option<[[f32; 4]; 4]>) {
         use super::combat::{effects::Binding, notes::id};
         if !matches!(note, id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) { return; }
-        let (victim, slot, special, hit) = if let Some(h) = self.last_hit.get(&who) {
-            (h.victim, h.slot, 0, h.flags > 1)
-        } else if let Some(&(victim, slot, damage, special)) = self.special_hit.get(&who) {
-            (victim, slot, special, damage > 0)
-        } else { return };
-        let item = if special != 0 && canim::special_swing(special).is_some_and(|s| s.own_item) {
-            self.arms.special_item(who, special)
-        } else { self.arms.slot_item(who, slot) };
-        let Some(item) = item else { return };
+        let Some(h) = self.note_ctx(who) else { return };
+        let (victim, slot, hit) = (h.victim, h.slot, h.flags > 1);
+        let Some(item) = self.arms.slot_item(who, slot) else { return };
         let mut bindings = item.effects.clone();
         if hit && !bindings.iter().any(|b| b.group == 2) {
             bindings.push(Binding { group: 2, attractor: 0, effect: 62002, note: 0, color: 0 });
@@ -1337,7 +1364,7 @@ impl Dynels {
             let origin = if binding.group == 2 { target.unwrap_or(source) } else { source };
             #[cfg(test)]
             if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
-                eprintln!("live weapon effect note={note:#x} who={who} victim={victim} slot={slot} special={special} effect={} group={} source_anchor={source_anchor} target_anchor={target_anchor} source={:?} origin={:?} target={position:?}", binding.effect, binding.group, source.w_axis.truncate(), origin.w_axis.truncate());
+                eprintln!("live weapon effect note={note:#x} who={who} victim={victim} slot={slot} effect={} group={} source_anchor={source_anchor} target_anchor={target_anchor} source={:?} origin={:?} target={position:?}", binding.effect, binding.group, source.w_axis.truncate(), origin.w_axis.truncate());
             }
             if let Err(error) = renderer.spawn(binding, origin, position) { eprintln!("weapon effects: {error:#}"); }
         }
@@ -1351,7 +1378,7 @@ impl Dynels {
             id::SWISH_PUNCH..=id::SWISH_HUGE => self.swish(who, note),
             id::ATTACK_START_1..=id::ATTACK_START_9 => self.record_note(who, note),
             id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4 => {
-                if let Some(h) = self.last_hit.get(&who).copied() {
+                if let Some(h) = self.note_ctx(who) {
                     self.weapon_hit(who, note, h);
                 }
             }
@@ -1779,6 +1806,8 @@ impl Dynels {
                 self.chars.remove(&who.instance);
                 self.swing_delay.remove(&who.instance);
                 self.once_rate.remove(&who.instance);
+                self.swings.remove(&who.instance);
+                self.slot_hits.retain(|&(attacker, _), _| attacker != who.instance);
             }
             _ => {}
         }
@@ -2754,6 +2783,30 @@ mod variant_tests {
         assert_eq!(d.pick_swing(8, canim::list::ATTACK), None);
     }
 
+    #[test]
+    fn fight_start_does_not_replace_same_frame_rifle_special() {
+        use super::super::{combat::state::CombatEvent, player::Player};
+        use ao_formats::character::Role;
+        let Some(dir) = client() else { return };
+        let own = 25988;
+        let mut zone = Zone::new(own as u32);
+        zone.world.start(dir.clone(), own);
+        for frame in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            zone.on_frame(&frame);
+        }
+        zone.world.wield.entry(own).or_default()[0] = Some(Wield { set: 3, delay: 200 });
+        let mut player = Player::new(&dir, &zone, zone.playfield.unwrap_or(800)).expect("capture has own character");
+        for (special, expected) in [(148, 1024), (150, 1023)] {
+            let target = ao_net::msg::Identity { kind: CHAR_KIND, instance: 7 };
+            let events = [
+                CombatEvent::FightStarted { who: own, target, switched: false },
+                CombatEvent::SpecialAttack { who: own, target, special, slot: 6, damage: 3 },
+            ];
+            super::super::combat::glue::combat_animations(&mut zone.world, Some(&mut player), own, &events, |_| true);
+            assert_eq!(player.transient_role(), Some(&Role::Clip(canim::anim_name(expected).unwrap().0.into())));
+        }
+    }
+
     /// A rifle wielder out of a fight stands in `idle-2h`, in a fight in `idle-rifle`, and walks / runs with 0x421 / 0x422; a blade keeps the plain idle
     /// out of a fight and has the blade idle in one (`FUN_1009c858`, `FUN_1003cad0`).
     #[test]
@@ -3207,6 +3260,70 @@ mod variant_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         Some((z, player, leet))
+    }
+
+    #[test]
+    fn special_notes_retain_only_their_attacker_and_slot_flags() {
+        use crate::play::combat::{glue::note_reaction, notes::{HitCtx, id}};
+        let mut world = Dynels::default();
+        world.hit_seen(1, HitCtx { victim: 2, slot: 6, damage: 20, flags: 4 });
+        assert!(world.once_rate.is_empty(), "message arrival must not react");
+        note_reaction(&mut world, None, 99, 1, id::SWISH_PUNCH);
+        assert!(world.once_rate.is_empty(), "only an attack note reacts");
+        note_reaction(&mut world, None, 99, 1, id::ATTACK);
+        assert_eq!(world.once_rate[&2].1, 1.0);
+        world.once_rate.clear();
+        world.special_hit_seen(1, 3, 6);
+        assert_eq!(world.note_ctx(1).map(|h| (h.victim, h.damage, h.flags)), Some((3, 20, 4)));
+        world.note_target(1, 4);
+        note_reaction(&mut world, None, 99, 1, id::ATTACK_EFFECT_1);
+        assert_eq!(world.once_rate[&4].1, 1.0, "special reacts on its actual target");
+        world.once_rate.clear();
+        world.hit_seen(1, HitCtx { victim: 2, slot: 8, damage: 0, flags: 1 });
+        world.special_hit_seen(1, 3, 8);
+        note_reaction(&mut world, None, 99, 1, id::ATTACK);
+        assert!(world.once_rate.is_empty(), "special after miss has no impact");
+        world.special_hit_seen(1, 3, 6);
+        assert_eq!(world.note_ctx(1).map(|h| (h.damage, h.flags)), Some((20, 4)), "other slot's miss is isolated");
+        for (who, slot) in [(1, 7), (5, 6)] {
+            world.special_hit_seen(who, 3, slot);
+            assert_eq!(world.note_ctx(who).map(|h| (h.damage, h.flags)), Some((0, 0)));
+            note_reaction(&mut world, None, 99, who, id::ATTACK);
+            assert!(world.once_rate.is_empty(), "constructors initialize both fields to zero");
+        }
+    }
+
+    #[test]
+    fn special_sound_impact_uses_retained_damage_not_the_result() {
+        use crate::play::combat::notes::HitCtx;
+        let Some((mut z, att, _)) = fight_zone() else { return };
+        z.world.arms.clear();
+        z.world.arms.list(att, false, &[(43712, 100), (43713, 142)]);
+        z.world.hit_seen(att, HitCtx { victim: att, slot: 0, damage: 20, flags: 4 });
+        z.world.special_hit_seen(att, att, 0);
+        z.world.note_sounds(att, 0xb);
+        assert!(!z.world.take_sounds().is_empty(), "special retains slot swing sound");
+        assert!(!z.world.later.is_empty(), "special after hit retains delayed impact");
+        assert!(z.world.later.iter().all(|(_, s)| s.size == crate::play::combat::notes::impact_size(20)));
+        z.world.later.clear();
+        z.world.hit_seen(att, HitCtx { victim: att, slot: 0, damage: 0, flags: 1 });
+        z.world.special_hit_seen(att, att, 0);
+        z.world.note_sounds(att, 0xb);
+        assert!(z.world.take_sounds().is_empty(), "dummy slot after miss has no gated sound");
+        assert!(z.world.later.is_empty());
+        z.world.special_hit_seen(att, att, 8);
+        z.world.note_sounds(att, 0xb);
+        assert!(z.world.later.is_empty(), "untouched slot has no impact");
+        z.world.arms.wield(att, 900, 6, Some(121567), &[]);
+        z.world.special_hit_seen(att, att, 6);
+        z.world.note_sounds(att, 0xb);
+        assert!(!z.world.take_sounds().is_empty(), "constructor-zero wielded slot still plays its ungated weapon sound");
+        assert!(z.world.later.is_empty());
+        z.world.hit_seen(att, HitCtx { victim: att, slot: 6, damage: 0, flags: 1 });
+        z.world.special_hit_seen(att, att, 6);
+        z.world.note_sounds(att, 0xb);
+        assert!(!z.world.take_sounds().is_empty(), "special after miss still plays wielded swing sound");
+        assert!(z.world.later.is_empty());
     }
 
     /// `FUN_10045069` + `FUN_1009b4ac` with real data (docs/zone/combat-anim.md section 6): a bare-handed player (martial-arts item 43712: swing `0xb` ->

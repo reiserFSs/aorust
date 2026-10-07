@@ -6,6 +6,16 @@
 //! `drag=right:dx:dy` / `drag=left:dx:dy` mouse-look with raw counts, `cam` prints the camera and lens. HUD steps: `ui=u|ctrl+1` window hotkey,
 //! `move=x:y` hover, `click=x:y`, `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
+//! Frame captures require `AOMAC_LIVE_SHOTS`: `arm=attack:1:note,down=Q,capturewait=30,up=Q` records the frame
+//! processing the next own attack note. `arm=burst:1:special,M=0.1,capturewait=30` selects SpecialAttack instead.
+//! (60 PNGs for one second, `attack-0000.png` onward). No event queue polling; the processing hook counts events.
+//! `npcprobe=target` (or an instance id) logs the NPC's sampled animation clock on each captured frame.
+//! Select/frame a naturally walking NPC first with `selname`, camera and movement steps, then use
+//! `npcprobe=target,npcwait=walk:30,frames=npc-walk:2` (120 fixed-60Hz frames); repeat with idle.
+//! `npcwait=walk|idle[:timeout]` polls the selected NPC at fixed 60Hz before capture. W drives only the own avatar.
+//! PNG readback may run slower than real time; simulation dt stays 1/60 s. Use unique prefixes.
+//! `arm=prefix:seconds[:note|special|either]` defaults to either. Exact processed notes/specials are logged;
+//! special stat 148 identifies Burst, 150 Fling Shot. Arm before sending the attack input.
 use super::*;
 use ao_render::{GameInput, KeyCode, Offscreen};
 use std::io::BufRead;
@@ -20,6 +30,69 @@ fn approach_state(zone: &super::super::zone::Zone, fixed: Option<(f32, f32)>, id
     Some((own, goal))
 }
 
+const CAPTURE_DT: f32 = 1.0 / 60.0;
+
+struct FrameCapture {
+    name: String,
+    frames: usize,
+    next: usize,
+    event: Option<[u64; 2]>,
+    kind: &'static str,
+}
+
+impl FrameCapture {
+    fn new(spec: &str, event: Option<[u64; 2]>) -> Self {
+        let mut parts = spec.split(':');
+        let name = parts.next().unwrap();
+        let secs: f64 = parts.next().expect("capture=prefix:seconds[:note|special|either]").parse().expect("capture seconds");
+        let kind = match parts.next().unwrap_or("either") {
+            "note" => "note",
+            "special" => "special",
+            "either" => "either",
+            _ => panic!("capture trigger must be note, special or either"),
+        };
+        assert!(parts.next().is_none(), "extra capture arguments");
+        assert!(!name.is_empty() && !name.contains(['/', '\\']), "capture prefix must be a filename");
+        assert!(secs.is_finite() && secs > 0.0 && secs <= 60.0, "capture duration must be in (0, 60]");
+        Self { name: name.into(), frames: (secs * 60.0).ceil() as usize, next: 0, event, kind }
+    }
+
+    fn frame(&mut self, event: [u64; 2]) -> Option<usize> {
+        let unchanged = self.event.is_some_and(|before| match self.kind {
+            "note" => event[0] == before[0],
+            "special" => event[1] == before[1],
+            _ => event == before,
+        });
+        if unchanged || self.next == self.frames {
+            return None;
+        }
+        self.event = None;
+        let index = self.next;
+        self.next += 1;
+        Some(index)
+    }
+}
+
+#[test]
+fn live_capture_frame_accounting() {
+    let mut capture = FrameCapture::new("attack:1:note", Some([4, 2]));
+    assert_eq!(capture.frame([4, 3]), None); // an unrelated special cannot consume a note capture
+    assert_eq!(capture.frame([5, 3]), Some(0)); // triggering frame, not the following frame
+    for index in 1..60 {
+        assert_eq!(capture.frame([5, 3]), Some(index));
+    }
+    assert_eq!(capture.frame([6, 4]), None); // additional events never restart the sequence
+    let mut special = FrameCapture::new("burst:1:special", Some([4, 2]));
+    assert_eq!(special.frame([5, 2]), None);
+    assert_eq!(special.frame([5, 3]), Some(0));
+    let mut direct = FrameCapture::new("npc:2", None);
+    for index in 0..120 {
+        assert_eq!(direct.frame([0, 0]), Some(index));
+    }
+    assert_eq!(direct.frame([0, 0]), None);
+    assert_eq!(120.0 * CAPTURE_DT, 2.0);
+}
+
 struct Live {
     p: Play,
     o: Offscreen,
@@ -27,14 +100,37 @@ struct Live {
     shots: Option<std::path::PathBuf>,
     /// Longest frame time handed to the game (the autopilot sets it: a slow offscreen frame must not skip over a ramp edge).
     dt_cap: f32,
+    capture: Option<FrameCapture>,
+    npc_probe: Option<i32>,
 }
 
 impl Live {
     fn tick(&mut self) -> ao_gui::DrawList {
+        self.tick_dt(None)
+    }
+    fn tick_dt(&mut self, fixed_dt: Option<f32>) -> ao_gui::DrawList {
         std::thread::sleep(Duration::from_millis(16));
-        let dt = self.last.elapsed().as_secs_f32().min(self.dt_cap);
+        let dt = fixed_dt.unwrap_or_else(|| if self.capture.is_some() { CAPTURE_DT } else { self.last.elapsed().as_secs_f32().min(self.dt_cap) });
         self.last = Instant::now();
-        self.o.frame(&mut self.p, dt)
+        let list = self.o.frame(&mut self.p, dt);
+        if let Some(capture) = &mut self.capture {
+            if let Some(index) = capture.frame(self.p.live_attack_events) {
+                let path = self.shots.as_ref().expect("capture requires AOMAC_LIVE_SHOTS").join(format!("{}-{index:04}.png", capture.name));
+                self.o.png(&self.p, &list, &path).unwrap();
+                eprintln!("frame shot {} sim_offset={:.6}s events={:?}", path.display(), index as f32 * CAPTURE_DT, self.p.live_attack_events);
+                if let Some(id) = self.npc_probe {
+                    match self.p.zone.world.npc_animation_probe(id) {
+                        Some(probe) => eprintln!("npc frame={index:04} {probe}"),
+                        None => eprintln!("npc frame={index:04} id={id} animation unavailable"),
+                    }
+                }
+                self.last = Instant::now(); // readback must not inflate the next ordinary simulation step
+            }
+            if capture.next == capture.frames {
+                self.capture = None;
+            }
+        }
+        list
     }
     fn until(&mut self, what: &str, secs: u64, f: impl Fn(&Play) -> bool) {
         let t = Instant::now();
@@ -55,6 +151,20 @@ impl Live {
             let path = dir.join(format!("{name}.png"));
             self.o.png(&self.p, &list, &path).unwrap();
             eprintln!("shot {}", path.display());
+        }
+    }
+    fn capture(&mut self, spec: &str, triggered: bool) {
+        assert!(self.shots.is_some(), "capture requires AOMAC_LIVE_SHOTS");
+        assert!(self.capture.is_none(), "previous capture still armed or running");
+        self.capture = Some(FrameCapture::new(spec, triggered.then_some(self.p.live_attack_events)));
+    }
+
+    fn capture_wait(&mut self, secs: f32) {
+        assert!(secs.is_finite() && secs > 0.0, "capturewait requires positive finite seconds");
+        let start = Instant::now();
+        while self.capture.is_some() {
+            assert!(start.elapsed().as_secs_f32() < secs, "capture timeout: own attack event missing or PNG sequence incomplete");
+            self.tick();
         }
     }
     fn pos(&self) -> String {
@@ -343,7 +453,7 @@ fn live_walk() {
     if let Some(d) = &shots {
         std::fs::create_dir_all(d).unwrap();
     }
-    let mut l = Live { p, o, last: Instant::now(), shots, dt_cap: f32::INFINITY };
+    let mut l = Live { p, o, last: Instant::now(), shots, dt_cap: f32::INFINITY, capture: None, npc_probe: None };
     l.tick();
     let w = l.p.login_w.unwrap();
     l.p.gui.set_text(w, "username", &user);
@@ -411,6 +521,41 @@ fn live_walk() {
         let (k, v) = step.split_once('=').unwrap_or((step, ""));
         match k {
             "wait" => l.wait(v.parse().unwrap()),
+            "arm" => l.capture(v, true),
+            "capturewait" => l.capture_wait(v.parse().unwrap()),
+            "npcprobe" => {
+                let id = if v == "target" { l.p.zone.target.expect("npcprobe requires a selected NPC") } else { v.parse().expect("npcprobe requires target or instance id") };
+                assert!(l.p.zone.world.chars.get(&id).is_some_and(|c| c.npc), "npcprobe requires an NPC");
+                l.npc_probe = Some(id);
+            }
+            "npcwait" => {
+                let (state, timeout) = v.split_once(':').unwrap_or((v, "30"));
+                let state = match state {
+                    "walk" => ao_net::n3::motion::AnimState::Walk,
+                    "idle" => ao_net::n3::motion::AnimState::Idle,
+                    _ => panic!("npcwait requires walk or idle"),
+                };
+                let timeout: f32 = timeout.parse().expect("npcwait timeout must be seconds");
+                assert!(timeout.is_finite() && timeout > 0.0, "npcwait timeout must be positive");
+                let id = l.npc_probe.expect("npcwait requires npcprobe");
+                assert!(l.capture.is_none(), "npcwait cannot consume an armed capture");
+                let start = Instant::now();
+                loop {
+                    l.tick_dt(Some(CAPTURE_DT));
+                    if l.p.zone.world.npc_movement_probe(id) == Some(state) {
+                        break;
+                    }
+                    assert!(start.elapsed().as_secs_f32() < timeout, "timeout waiting for NPC {id} {state:?}");
+                }
+                eprintln!("npcwait id={id} movement={state:?}");
+            }
+            "frames" => {
+                l.capture(v, false);
+                // PNG readback is wall-clock work, not simulation time.
+                while l.capture.is_some() {
+                    l.tick();
+                }
+            }
             // Keep movement held across screenshots for gait/ground-speed comparisons.
             "down" | "up" => l.key(code(v), k == "down"),
             "resize" => {
@@ -1059,7 +1204,7 @@ fn cached_select_shot(client: std::path::PathBuf, entry: CharacterEntry, shots: 
     let p = Play::new(client, None, None, None).unwrap();
     p.start_backdrop();
     let o = Offscreen::new(&p, (1280, 800)).unwrap();
-    let mut select = Live { p, o, last: Instant::now(), shots, dt_cap: f32::INFINITY };
+    let mut select = Live { p, o, last: Instant::now(), shots, dt_cap: f32::INFINITY, capture: None, npc_probe: None };
     select.tick();
     select.p.show_characters(CharacterList { characters: vec![entry], allowed_characters: 1, ..Default::default() }, &mut select.o.host);
     select.p.select_row(0, &mut select.o.host);

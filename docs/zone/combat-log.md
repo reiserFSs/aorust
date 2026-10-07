@@ -97,6 +97,9 @@ Target must resolve; then `FUN_1006a239(slot,1)` starts the special swing **befo
 else `0x31` (`0x33` for flagged PvP). `FUN_10012bd5(type, target, damage, attacker, name, 0, 0, 0)`; `Health(target) -= damage`; `unk_30 != 0` → `FUN_1005ae91(unk_30)` on the target (immediately);
 `FUN_10068320(slot,value_28)` (weapon slot stat 0x1a); `FUN_1005548b` at GC 0x1006abed clears the complete pending deque. `FUN_1006855a` reads the deque's front via `FUN_100553f8` (begin) and `FUN_1006af02` (dereference), not the result message's special stat.
 
+**Resolved slot-flag contradiction [CODE]:** `FUN_1006a239(slot,1)`'s `1` selects the queued special clip through `FUN_10069acb` / `FUN_1003c594`; it does **not** set hit kind 1. `FUN_1006a9c5` never writes slot `+0x2c` (hit kind) or `+0x30` (damage): only `FUN_1006a8f3` writes result values, and slot constructors `FUN_1009b37e` / `FUN_1009b415` initialize both to zero. Special notes retain the previous hit/miss on the **same attacker and slot**. The special's own damage changes health/logging only. Brawl/Dimach still select their queued own item's animation list, but notes resolve the message's slot item through `FUN_10068072`, not the special item.
+
+
 ### 2.3 `MissedAttackInfoIIR_t` → `FUN_1006ae50(slot, value_1c, &source, &target, stat)` [GC 0x1006ae50]
 `source` (`+0x20`) = **B**, the one that missed; `target` (`+0x28`) = **A**, the one missed (apply [GC 0x100a0b20] passes `&+0x20, &+0x28` in this order; the formatter's own rules agree: B client → "You tried to hit A, but missed!").
 Both must be `SimpleChar_t`. `stat != 0` → `fStatToString(stat)` (English enum name, `Missing stat: N` if absent; table in `stat_names.rs`) as `extra`. `FUN_10012bd5(0x3b, A, 1, B, extra, 0, 0, 0)`; `FUN_10068320`; then `FUN_1006a8f3(slot, 0, value_1c, 0, 1, 0)` which is a no-op for the text (damage 0: the formatter returns at once).
