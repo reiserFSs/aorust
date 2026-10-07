@@ -544,6 +544,22 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
   Dynel routes; flare/vector placement and authored sizes remain unchanged.
   Actual1070 profiles are20093/20098 (payloads `0xae1c`/`0xb04c`), with
   breed1/male/shape1 radius0.20; flare6203 radius remains0.01–0.02.
+  A subsequent native capture of20 frames10–18seconds after recasting still
+  showed no visible cord outside the fully visible avatar; a4× shoulder crop
+  resolved an isolated white flare, not armor highlighting. Logged own1070
+  pulses at5.933/11.367/16.521seconds established that
+  the controller was running. The remaining renderer mismatch was Cord4 UV:
+  every vertex sampled V=1, the black edge of material8 `light_halo2.png`
+  (RDB1010004/47483,32×32; both edge rows have zero RGB).
+  GC `100d5d22` constructs Cord4 with fourth bool=false, stored by DS
+  `1000ea4f` at+0x2e4. Consequently DS `1000e3e8` and `1000e7d0` use fixed
+  V=`10089f00`=0.25 (`3e800000`), not their optional age-dependent branch.
+  Class1003 now uses this native fixed V; no sizes or alpha were increased.
+  `body_boost_cord_uv_samples_authored_halo_interior` checks both real cord
+  templates' geometry UVs against luminous interior texels of the actual
+  texture, and establishes that the former edge texels have zero RGB.
+  This is CPU geometry/texture evidence; post-fix GPU/live visibility remains
+  to be verified.
 * Class1002's orbiting children (`100d4f72`/`100d52dc`/`100d53e3`/
   `100d57bb`/`100d4d6b`) use their actual class0 body-profile records
   (20013/20018,42words), selected by Breed/Sex/BodyShape/MonsterScale,

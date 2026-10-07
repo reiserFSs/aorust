@@ -304,8 +304,10 @@ impl Composition {
             let offset=if i==0 {side*width} else if i+1==self.links.len() {previous*width} else {(previous+side)*0.5*width};
             previous=side;
             let mut color=link.color;color[3]*=(link.remaining/life).clamp(0.0,1.0);
+            // GC100d5d22 selects Cord4's fixed-UV constructor (fourth bool false).
+            // DS1000e3e8/1000e7d0 use float10089f00=0.25, not the black V=1 edge.
             for (j,sign) in [-1.0,1.0].into_iter().enumerate() {
-                vertices[i*2+j]=Vertex {pos:(point+offset*sign).to_array(),normal:[0.0,1.0,0.0],uv:[j as f32,1.0],color};
+                vertices[i*2+j]=Vertex {pos:(point+offset*sign).to_array(),normal:[0.0,1.0,0.0],uv:[j as f32,0.25],color};
             }
         }
         if let Some(last)=self.links.front() {
@@ -355,6 +357,36 @@ mod tests {
         for i in 0..300 {c.update_position(Vec3::X*i as f32);}
         assert_eq!(c.links.len(),256);assert_eq!(c.links[0].point.x,44.0);
         c.next_state();c.update_position(Vec3::ZERO);assert_eq!(c.links.len(),256);assert_eq!(c.duration,0.5);
+    }
+    #[test]
+    fn body_boost_cord_uv_samples_authored_halo_interior() -> Result<()> {
+        let dir=ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("Setupf/gfxtweak.bin").exists() {return Ok(());}
+        let renderer=Renderer::open(&dir)?;
+        let texture_id=renderer.names.id(1010004,"light_halo2.png").unwrap();
+        assert_eq!(texture_id,47483);
+        let texture=ao_formats::texture::load_texture(&renderer.store,ao_scene::TextureKey {rdb_type:1010004,id:texture_id})?.unwrap();
+        assert_eq!((texture.width,texture.height),(32,32));
+        for id in [20092,20097] {
+            let t=&renderer.templates.by_id[&id];
+            assert_eq!(t.word(9)?,8);
+            let mut cord=Composition::new(t,Mat4::IDENTITY,Vec3::ZERO,EffectConfig::default())?;
+            cord.update_position(Vec3::ZERO);
+            cord.update_position(Vec3::X*0.1);
+            cord.update_position(Vec3::X*0.2);
+            let groups=cord.vertices(0.0,Vec3::Z,Vec3::X,Vec3::Y)?.unwrap();
+            let vertices=&groups[0][..6];
+            assert!(vertices.iter().all(|v|v.uv[1]==0.25 && v.color[3]>0.0));
+            // Raster interpolation crosses U=0.5 between the two ribbon sides.
+            let u=(vertices[0].uv[0]+vertices[1].uv[0])*0.5;
+            let x=(u*texture.width as f32) as usize;
+            let y=(vertices[0].uv[1]*texture.height as f32) as usize;
+            let pixel=&texture.rgba[(y*texture.width as usize+x)*4..][..4];
+            assert!(pixel[..3].iter().any(|&c|c>0) && pixel[3]>0,"the cord must sample actual luminous texels");
+            let edge=&texture.rgba[((texture.height-1) as usize*texture.width as usize+x)*4..][..4];
+            assert_eq!(&edge[..3],&[0,0,0],"old V=1 sampled the black texture edge");
+        }
+        Ok(())
     }
     #[test]
     fn body_profiles_select_authored_breed_sex_and_shape() {
