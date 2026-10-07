@@ -651,6 +651,28 @@ casts at23825/29898/74495ms are NPCShadowTouch163449, an instant nano
 with no269–272: its template-sound path is silent, not a Body Boost
 stand-in. Its authored effect2710 may independently emit effect audio.
 
+**Own-character audio position correction (2026-10-07).** The own avatar
+is simulated by `Player`, while `Dynels::chars[own].pose` belongs to the
+remote-character mover. Nano269/271 and self-target272 now use the own
+avatar's world-space origin (`Player::effect_anchor(0)`; CAT anchor0 is
+identity before the avatar transform), passed through the existing
+`nano_visual_frame` anchor callback. Foreign sources retain their mover
+position. Scene conversion changes only Z (`zone::scene_pos`); a height
+difference is not an axis swap. The existing stage regression deliberately
+separates the live avatar from the remote pose and checks all three selectors.
+
+**[DATA]** Installed `SM_Sandy_Game_Dummy.sbf` records at offsets
+`0x18a6ae` (269/`35a9ce7d`) and `0x18c01d` (272/`80d5111a`) both
+have min/max distance0/15m, volume bytes127/127 and probability100.
+Both decoded files exist;272 uses
+`sfx/spells/cast_base_pos_target_med.wav` and has one child.
+`AOMAC_AUDIO_LOG` now records the runtime definition, resolved sample,
+source/listener scene positions, distance, FX gain and caller parameters;
+rejections distinguish missing runtime/definition, distance, decoding,
+empty sample, keepalive sample and mixer pool. Muting still acts only
+after mixer statistics. These are offline data/code findings, not a
+live voices/RMS verification.
+
 
 ### 7.5 Persistent buff selector census
 

@@ -1367,10 +1367,13 @@ impl Dynels {
         std::mem::take(&mut self.nano_sounds)
     }
 
-    fn nano_sound(&mut self, spell: i32, selector: u32, who: i32, duration: f32, volume: f32) {
+    fn nano_sound(&mut self, spell: i32, selector: u32, source: (i32, Option<[f32; 3]>), duration: f32, volume: f32) {
+        let (who, own_pos) = source;
         let Some(sound) = self.nano_templates.get(&spell).and_then(|t| t.stat(selector)).filter(|&id| id != 0) else { return };
         let Some(character) = self.chars.get(&who) else { return };
-        self.nano_sounds.push((sound as u32, scene_pos(character.pose.pos), duration, volume, selector, who));
+        // The own character is simulated by Player, not the remote-character mover.
+        let pos = if who == self.own { own_pos.unwrap_or_else(|| scene_pos(character.pose.pos)) } else { scene_pos(character.pose.pos) };
+        self.nano_sounds.push((sound as u32, pos, duration, volume, selector, who));
     }
 
     /// Nano states use the single body clip, not the combat holder's positive-count history.
@@ -1405,6 +1408,7 @@ impl Dynels {
 
     pub fn nano_visual_frame(&mut self, dt: f32, own_finished: bool, mut own_anchor: impl FnMut(i32) -> Option<[[f32; 4]; 4]>, mut stat: impl FnMut(i32, u32) -> Option<i32>) {
         use super::combat::effects::{Binding, EffectConfig};
+        let own_pos = own_anchor(0).map(|m| glam::Mat4::from_cols_array_2d(&m).w_axis.truncate().to_array());
         let mut renderer = self.effects.take();
         let anchor = |world: &Self, who, id, own_anchor: &mut dyn FnMut(i32) -> Option<[[f32; 4]; 4]>| {
             if who == world.own { own_anchor(id).map(|m| glam::Mat4::from_cols_array_2d(&m)) }
@@ -1434,7 +1438,7 @@ impl Dynels {
             let release_anim = template.stat(if target == who { 0x17a } else { 0x179 }).unwrap_or(if target == who { 202 } else { 201 }) as u32;
             self.casting.push(NanoCast { who, spell: cast.spell, target, handle: 0, remaining, release_anim, released: instant, release_seen: false, done: false, instant, finish_enabled: !instant || cast.flag, start_effect: if instant || self.nano_effect_categories & 4 == 0 { 49999 } else { template.stat(0x1ac).unwrap_or(49999) }, finish: if !instant || cast.flag { [template.stat(0x19e).unwrap_or(49999), template.stat(0x169).unwrap_or(49999)] } else { [49999; 2] } });
             if !instant {
-                self.nano_sound(cast.spell, 0x10d, who, 0.2, 0.6);
+                self.nano_sound(cast.spell, 0x10d, (who, own_pos), 0.2, 0.6);
                 let animation = template.stat(0x178).unwrap_or(203) as u32;
                 if who == self.own { self.nano_animations.push(Some((animation, true))); }
                 else { self.nano_clip(who, animation, true); }
@@ -1461,7 +1465,7 @@ impl Dynels {
             if !cast.released && !cast.instant {
                 cast.remaining -= dt;
                 if cast.remaining > 0.0 {
-                    self.nano_sound(cast.spell, 0x10d, cast.who, 0.2, 1.0);
+                    self.nano_sound(cast.spell, 0x10d, (cast.who, own_pos), 0.2, 1.0);
                     continue;
                 }
                 if let Some(r) = &mut renderer { r.next_state(cast.handle); }
@@ -1482,12 +1486,12 @@ impl Dynels {
                 })
             };
             if !finished && !cast.done {
-                self.nano_sound(cast.spell, 0x10f, cast.who, 0.2, 1.0);
+                self.nano_sound(cast.spell, 0x10f, (cast.who, own_pos), 0.2, 1.0);
             }
             if finished && !cast.done {
                 cast.done = true;
                 if cast.finish_enabled {
-                    self.nano_sound(cast.spell, 0x110, cast.target, 0.0, 1.0);
+                    self.nano_sound(cast.spell, 0x110, (cast.target, own_pos), 0.0, 1.0);
                 }
             }
             if cast.done {
@@ -3670,10 +3674,13 @@ mod variant_tests {
             let target = ao_net::msg::Identity { kind: CHAR_KIND, instance: leet };
             let cast = ao_net::n3::dynel::CastNanoSpell { spell: -1, target, source, flag: true, rest: vec![] };
             world.nano_casts.push((player, cast.clone()));
-            let matrix = glam::Mat4::from_translation(glam::Vec3::from(scene_pos(world.chars[&player].pose.pos))).to_cols_array_2d();
+            let live_pos = glam::Vec3::from(scene_pos(world.chars[&player].pose.pos)) + glam::Vec3::new(31.0, 24.21 - 9.733, -17.0);
+            let matrix = glam::Mat4::from_translation(live_pos).to_cols_array_2d();
             world.nano_visual_frame(0.0, false, |_| Some(matrix), |_, _| None);
             let start = world.take_nano_sounds();
             assert_eq!(start.iter().map(|s| (s.0, s.2, s.3, s.4)).collect::<Vec<_>>(), [(11, 0.2, 0.6, 269), (11, 0.2, 1.0, 269)]);
+            let expected_pos = if own == player { live_pos.to_array() } else { scene_pos(world.chars[&player].pose.pos) };
+            assert!(start.iter().all(|sound| sound.1 == expected_pos), "own audio follows the rendered Player, foreign audio follows its mover");
             if own != player {
                 assert_eq!(world.chars[&player].special, Special::Cast(203));
                 assert!(world.chars[&player].actions.iter().all(|node| node.key.is_none()), "nano charge is not a combat list-history node");
@@ -3682,7 +3689,9 @@ mod variant_tests {
             world.nano_visual_frame(1.1, false, |_| Some(matrix), |_, _| None);
             world.take_nano_animations();
             world.nano_visual_frame(0.0, false, |_| Some(matrix), |_, _| None);
-            assert_eq!(world.take_nano_sounds().iter().map(|s| (s.0, s.2, s.4)).collect::<Vec<_>>(), [(12, 0.2, 271)]);
+            let release = world.take_nano_sounds();
+            assert_eq!(release.iter().map(|s| (s.0, s.2, s.4)).collect::<Vec<_>>(), [(12, 0.2, 271)]);
+            assert_eq!(release[0].1, expected_pos);
             world.casting[0].release_seen = true;
             world.chars.get_mut(&player).unwrap().special = Special::None;
             world.nano_visual_frame(0.0, true, |_| Some(matrix), |_, _| None);
@@ -3690,6 +3699,8 @@ mod variant_tests {
             assert_eq!(finish.len(), 1);
             assert_eq!((finish[0].0, finish[0].2, finish[0].4, finish[0].5), (13, 0.0, 272, leet));
             assert_eq!(finish[0].1, scene_pos(world.chars[&leet].pose.pos));
+            world.nano_sound(-1, 272, (player, Some(live_pos.to_array())), 0.0, 1.0);
+            assert_eq!(world.take_nano_sounds()[0].1, expected_pos, "self-target finish uses the same live source");
             world.nano_casts.push((player, cast));
             world.nano_visual_frame(0.0, false, |_| Some(matrix), |_, _| None);
             world.on_message(&Message {

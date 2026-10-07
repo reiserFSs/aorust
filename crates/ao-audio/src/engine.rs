@@ -98,7 +98,9 @@ impl Shared {
             if audio_log() { eprintln!("audio rejection reason=empty-sample sample={}", path.display()); }
             return 0;
         }
-        self.mixer().play(VoiceDesc { gain, looping, priority: Some(priority), ..VoiceDesc::new(Source::Sample(pcm)) })
+        let voice = self.mixer().play(VoiceDesc { gain, looping, priority: Some(priority), ..VoiceDesc::new(Source::Sample(pcm)) });
+        if voice == 0 && audio_log() { eprintln!("audio rejection reason=voice-pool sample={} gain={gain} priority={priority}", path.display()); }
+        voice
     }
 }
 
@@ -408,7 +410,10 @@ impl Audio {
         }
         let level = crate::game::attenuation(d, def.min_dist, def.max_dist, None) * volume;
         let voice = rt.keepalive_duration(&self.sh, def, level, duration);
-        if voice == 0 { Vec::new() } else { vec![voice] }
+        if voice == 0 {
+            if audio_log() { eprintln!("audio rejection id={id:#x} reason=keepalive-sample sample={:?} resolved={:?}", def.file, def.file.as_deref().and_then(|f| self.sh.resolve(f))); }
+            Vec::new()
+        } else { vec![voice] }
     }
 
     /// GC4000 / SI100071ed command, including native delay and duration overrides.
