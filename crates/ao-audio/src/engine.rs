@@ -90,12 +90,21 @@ impl Shared {
     }
 
     pub fn play_sample(&self, path: &Path, gain: f32, looping: bool, priority: u8) -> u64 {
-        let Some(pcm) = self.load(path) else { return 0 };
+        let Some(pcm) = self.load(path) else {
+            if audio_log() { eprintln!("audio rejection reason=decode sample={}", path.display()); }
+            return 0;
+        };
         if pcm.frames() == 0 {
+            if audio_log() { eprintln!("audio rejection reason=empty-sample sample={}", path.display()); }
             return 0;
         }
         self.mixer().play(VoiceDesc { gain, looping, priority: Some(priority), ..VoiceDesc::new(Source::Sample(pcm)) })
     }
+}
+
+fn audio_log() -> bool {
+    static LOG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("AOMAC_AUDIO_LOG").is_some());
+    *LOG
 }
 
 fn seed() -> u64 {
@@ -377,11 +386,23 @@ impl Audio {
     /// Positive durations re-arm the definition's looping voice; zero remains a one-shot.
     pub fn play_game_sound_duration(&self, id: u32, pos: [f32; 3], listener: [f32; 3], duration: f32, volume: f32) -> Vec<u64> {
         let mut g = self.rt();
-        let Some(rt) = g.as_mut() else { return Vec::new() };
+        let Some(rt) = g.as_mut() else {
+            if audio_log() { eprintln!("audio rejection id={id:#x} reason=no-runtime source={pos:?} listener={listener:?}"); }
+            return Vec::new();
+        };
         let db = rt.lib.sounds.clone();
-        let Some(def) = db.get(id) else { return Vec::new() };
+        let Some(def) = db.get(id) else {
+            if audio_log() { eprintln!("audio rejection id={id:#x} reason=no-definition source={pos:?} listener={listener:?}"); }
+            return Vec::new();
+        };
         let d = if pos == [0.0; 3] { 0.0 } else { (0..3).map(|i| (pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt() };
-        if d > def.max_dist { return Vec::new(); } // SI10002d98 returns before re-arming an out-of-range source.
+        if audio_log() {
+            eprintln!("audio duration id={id:#x} source={pos:?} listener={listener:?} distance={d} min={} max={} sample={:?} resolved={:?} fx={} volume={volume} duration={duration} probability={} children={:?}", def.min_dist, def.max_dist, def.file, def.file.as_deref().and_then(|f| self.sh.resolve(f)), rt.fx, def.prob, def.children);
+        }
+        if d > def.max_dist {
+            if audio_log() { eprintln!("audio rejection id={id:#x} reason=distance distance={d} max={}", def.max_dist); }
+            return Vec::new();
+        } // SI10002d98 returns before re-arming an out-of-range source.
         if duration <= 0.0 {
             return rt.play_effect_at(&self.sh, def, d, volume, 0.0, 100);
         }
