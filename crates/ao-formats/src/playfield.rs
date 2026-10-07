@@ -26,7 +26,7 @@ mod zone;
 pub use camera::{camera_views, CameraViews};
 pub use record::CameraAttractor;
 pub use ao_scene::FogVolume;
-pub use sky::{open_weather, SkyClock, DEFAULT_DAY_TIME};
+pub use sky::{open_weather, sun_dir, SkyClock, DEFAULT_DAY_TIME};
 pub use spawn::{floor_below, scene_bounds, support_below};
 pub use zone::{zone_locator, ZoneLocator};
 

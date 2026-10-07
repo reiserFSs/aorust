@@ -12,9 +12,9 @@
 //!   record ambient (`VisualAmbientLight_t::AddAmbientLight` keeps the maximum, DisplaySystem @0x10059d2c).
 //! * `Sun1`: additive `newsun_frame01.png` rays, colour (255,155,55), rotated by `GAME.Sun1Rotation`.
 //!
-//! The game writes `GameDayTime` and the sun rotations from the server clock (not available offline); we evaluate at the
-//! values of `Tweak_GAME_FrozenTime.txt` (`CurrentDayTime 2648.69`, `Sun1Rotation q(0.900351, -0.0951056, 0.344078, 0.248863)`, components x y z w),
-//! the client's own fixed-time debug setting.
+//! The server clock drives the native binary-sun orbit (Gamecode 0x100b879b/0x100b9044).
+//! Offline scenes use `Tweak_GAME_FrozenTime.txt`'s `CurrentDayTime 2648.69`; its authored
+//! Sun1/Sun2 quaternions are independent regression fixtures, never ephemeris calibration inputs.
 
 mod aurora;
 mod layers;
@@ -31,11 +31,11 @@ pub const DEFAULT_DAY_TIME: f32 = 2648.69;
 /// `GAME.CurrentDayTime / 6480` (27 * 60 * 4) is the factor that indexes every colour track.
 pub(super) const DAY_LENGTH: f32 = 6480.0;
 /// `Sun1Rotation` of `Tweak_GAME_FrozenTime.txt` as written, (x, y, z, w) (see [`rot`]), valid at [`DEFAULT_DAY_TIME`].
+#[cfg(test)]
 const SUN1_ROT: [f32; 4] = [0.900351, -0.0951056, 0.344078, 0.248863];
 /// `Sun2Rotation` of the same file.
+#[cfg(test)]
 const SUN2_ROT: [f32; 4] = [0.836913, -0.16263, 0.384351, 0.354122];
-/// Day time factor of solar noon [FIT]: midway between the sunrise and sunset edges of the `GroundLight` tracks.
-const NOON: f32 = 0.525;
 /// Seconds of 60 Hz wind history simulated before the weather of a static scene is read [GUESS]: the wind is a random walk
 /// started when the client enters the playfield (`weather` module docs), so there is no single faithful value.
 pub const WIND_WARMUP: f32 = 30.0;
@@ -221,48 +221,57 @@ pub fn day_factor(day_time: f32) -> f32 {
 
 /// `q(a, b, c, d)` of the scripts: FXS stores the four values as they are written, i.e. (x, y, z, w)
 /// (`FXS.dll` `FUN_10009c3b` copies the expressions in order; `RRefFrame::SetRotation` stores x, y, z, w).
+#[cfg(test)]
 fn rot(q: [f32; 4]) -> script::Quat {
     script::Quat { x: q[0], y: q[1], z: q[2], w: q[3] }
 }
 
 /// Where a `GAME.SunNRotation` points the sun: the `SunRays` fan sits at local z = -100 (`FUN_1005a7f6` DisplaySystem).
+#[cfg(test)]
 const SUN_LOCAL: [f32; 3] = [0.0, 0.0, -1.0];
 
-/// Unit vector towards sun 1 in AO space at `day_time`. The server clock and the game's sun ephemeris are not available
-/// offline [FIT]: the sun runs on a great circle at one turn per day whose horizon crossings are at `NOON ± 0.25` (the
-/// `GroundLight` tracks switch on at factor ~0.27 and off at ~0.79) and that passes through the direction of the frozen
-/// `Sun1Rotation` at the frozen time, which fixes the noon elevation and azimuth.
-fn sun_ao(day_time: f32) -> [f32; 3] {
-    let d0 = rot(SUN1_ROT).rotate(SUN_LOCAL);
-    let w0 = std::f32::consts::TAU * (day_factor(DEFAULT_DAY_TIME) - NOON);
-    let noon_elevation = (d0[1] / w0.cos()).clamp(-1.0, 1.0).asin();
-    let (sin_e, cos_e) = noon_elevation.sin_cos();
-    // azimuth of the noon sun: that of the frozen sun minus the azimuth swept since noon
-    let a = d0[0].atan2(d0[2]) - w0.sin().atan2(w0.cos() * cos_e);
-    let w = std::f32::consts::TAU * (day_factor(day_time) - NOON);
-    let (sin_w, cos_w) = w.sin_cos();
-    [cos_w * cos_e * a.sin() + sin_w * a.cos(), sin_e * cos_w, cos_w * cos_e * a.cos() - sin_w * a.sin()]
+/// Native binary-sun positions (Gamecode 0x100b86ca/0x100b8ea6/0x100b9044).
+/// `GameTime_t::GetCurrentRealTime` is game seconds within the 97200-second day;
+/// DisplaySystem's `GameDayTime` is that value divided by the default time speed 15.
+/// The secondary orbit makes six complete revolutions per day, so no game-day index is needed.
+fn sun_positions(day_time: f32) -> [[f32; 3]; 2] {
+    use script::Quat;
+    let game_seconds = day_time.rem_euclid(DAY_LENGTH) * 15.0;
+    // GC 0x1016749c = 0x3b72b9d6; 0x10158ba0 is the double multiplier 6.
+    let speed = f32::from_bits(0x3b72b9d6);
+    let primary_angle = 176.0 + speed * game_seconds;
+    let secondary_angle = speed * 6.0 * game_seconds;
+    // Native row-vector matrices: Ry(phase) * Rx(tilt) * Ry(azimuth).
+    // Quat uses column vectors, hence the negative angles and reverse composition.
+    let primary = Quat::axis_angle([0.0, 1.0, 0.0], -primary_angle)
+        .then(Quat::axis_angle([1.0, 0.0, 0.0], -45.0))
+        .then(Quat::axis_angle([0.0, 1.0, 0.0], -90.0))
+        .rotate([0.0, 0.0, 70.0]);
+    let secondary = Quat::axis_angle([0.0, 1.0, 0.0], -secondary_angle)
+        .then(Quat::axis_angle([1.0, 0.0, 0.0], -145.0))
+        .rotate([0.0, 0.0, 1.0]);
+    [5.0, -15.0].map(|radius| {
+        let p = std::array::from_fn::<_, 3, _>(|k| primary[k] + secondary[k] * radius);
+        let length = p.iter().map(|v| v * v).sum::<f32>().sqrt();
+        p.map(|v| v / length)
+    })
 }
 
-/// Sun 2 keeps its frozen offset from sun 1 in sun 1's own (azimuth, elevation) frame [INFERENCE: its ephemeris is not
-/// stored, the two frozen rotations are 13 degrees apart].
-fn sun2_ao(day_time: f32) -> [f32; 3] {
-    // basis (to the side, up along the sky) around a sun direction
-    let basis = |d: [f32; 3]| {
-        let side = [d[2], 0.0, -d[0]];
-        let l = (side[0] * side[0] + side[2] * side[2]).sqrt().max(1e-6);
-        let side = side.map(|c| c / l);
-        let up = [d[1] * side[2] - d[2] * side[1], d[2] * side[0] - d[0] * side[2], d[0] * side[1] - d[1] * side[0]];
-        (side, up)
-    };
-    let dot = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| a[k] * b[k]).sum::<f32>();
-    let (d1, d2) = (rot(SUN1_ROT).rotate(SUN_LOCAL), rot(SUN2_ROT).rotate(SUN_LOCAL));
-    let (side, up) = basis(d1);
-    let (c, a, b) = (dot(d2, d1), dot(d2, side), dot(d2, up));
-    let d = sun_ao(day_time);
-    let (side, up) = basis(d);
-    std::array::from_fn(|k| c * d[k] + a * side[k] + b * up[k])
+/// Native SunNRotation look frame: forward = −sun, right = forward × world-up,
+/// up = forward × right (GC 0x100b879b → 0x1013c1f7 → 0x1013c2eb).
+/// Unlike a shortest-arc rotation, this retains the authored sun fan's roll.
+fn sun_rotation(direction: [f32; 3]) -> script::Quat {
+    use script::Quat;
+    let forward = direction.map(|v| -v);
+    Quat::axis_angle([0.0, 0.0, 1.0], 180.0)
+        .then(Quat::axis_angle([1.0, 0.0, 0.0], -forward[1].asin().to_degrees()))
+        .then(Quat::axis_angle([0.0, 1.0, 0.0], forward[0].atan2(forward[2]).to_degrees()))
 }
+
+fn sun_ao(day_time: f32) -> [f32; 3] {
+    sun_positions(day_time)[0]
+}
+
 
 /// Unit vector towards sun 1 in scene space (`z` mirrored) at `day_time`.
 pub fn sun_dir(day_time: f32) -> [f32; 3] {
@@ -286,7 +295,8 @@ impl Sky {
         let sun = t.rgb(["GroundLightR", "GroundLightG", "GroundLightB"], f).map(|c| c.map(|v| (v * 2.0).min(1.0)));
         let ambient = t.at("AmbientLight", f).map(|a| [a; 3]).or_else(|| t.rgb(["AmbientLightR", "AmbientLightG", "AmbientLightB"], f));
         let cloud_light = t.rgb(["CloudLightR", "CloudLightG", "CloudLightB"], f).unwrap_or([1.0; 3]);
-        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, sun_specular: t.scalar("SpecularLightIntensity").unwrap_or(1.0), cloud_light, sun_dir: sun_dir(day_time), sun_ao: sun_ao(day_time), sun2_ao: sun2_ao(day_time), day_time, night: t.at("NightIntensity", f).unwrap_or(1.0), weather: crate::weather::State::clear() })
+        let [sun_ao, sun2_ao] = sun_positions(day_time);
+        Some(Sky { top, bottom, top_i, bottom_i, fog, sun, ambient, sun_specular: t.scalar("SpecularLightIntensity").unwrap_or(1.0), cloud_light, sun_dir: [sun_ao[0], sun_ao[1], -sun_ao[2]], sun_ao, sun2_ao, day_time, night: t.at("NightIntensity", f).unwrap_or(1.0), weather: crate::weather::State::clear() })
     }
 
     /// The weather of the playfield at this moment (`ThickCloudsIntensity`, `HighAltitudeWind`).
@@ -461,22 +471,61 @@ mod tests {
     }
 
     #[test]
-    fn sun_orbit_hits_the_frozen_sample_and_sets_at_night() {
-        // the frozen Sun1Rotation direction is reproduced exactly at the frozen time
-        let frozen = rot(SUN1_ROT).rotate(SUN_LOCAL);
-        let d = sun_ao(DEFAULT_DAY_TIME);
-        assert!((0..3).all(|k| (d[k] - frozen[k]).abs() < 1e-4), "{d:?} {frozen:?}");
-        // above the horizon between the track's sunrise and sunset, below it at midnight, always a unit vector
-        let height = |f: f32| sun_ao(f * DAY_LENGTH)[1];
-        assert!(height(NOON) > 0.3 && height(0.0) < -0.3 && height(0.97) < 0.0);
-        assert!(height(0.28) > 0.0 && height(0.76) > 0.0 && height(0.22) < 0.0 && height(0.82) < 0.0);
-        let u = sun_ao(1234.0);
-        assert!((u.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-4);
-        // sun 2 keeps its frozen separation from sun 1
-        let sep = |a: [f32; 3], b: [f32; 3]| (0..3).map(|k| a[k] * b[k]).sum::<f32>().acos().to_degrees();
-        let frozen2 = rot(SUN2_ROT).rotate(SUN_LOCAL);
-        let (want, got) = (sep(frozen, frozen2), sep(sun_ao(5000.0), sun2_ao(5000.0)));
-        assert!(want > 5.0 && (want - got).abs() < 0.05, "{want} {got}");
+    fn native_binary_sun_matches_authored_quaternions_and_clock_edges() {
+        // Independent client-authored fixture, not a calibration input.
+        for (direction, authored) in sun_positions(DEFAULT_DAY_TIME).into_iter().zip([SUN1_ROT, SUN2_ROT]) {
+            let frozen = rot(authored).rotate(SUN_LOCAL);
+            assert!((0..3).all(|k| (direction[k] - frozen[k]).abs() < 1e-5));
+            let q = sun_rotation(direction);
+            let dot = q.x * authored[0] + q.y * authored[1] + q.z * authored[2] + q.w * authored[3];
+            assert!((dot.abs() - 1.0).abs() < 1e-5, "{q:?}");
+            let ray = q.rotate([0.0, 0.0, 1.0]);
+            assert!((0..3).all(|k| (ray[k] + direction[k]).abs() < 1e-5), "native 3008 ray is +Z, not the sun fan's -Z");
+        }
+        // GC matrix evaluations: primary radius70 plus secondary radius5 / -15.
+        for (time, expected) in [
+            (0.0, [[0.7216359, -0.6797222, -0.1312225], [0.6453176, -0.7577605, 0.0967688]]),
+            (3240.0, [[-0.6868368, 0.7267292, 0.0109499], [-0.7447781, 0.6150048, 0.2589878]]),
+            (4860.0, [[-0.0524522, 0.0088852, -0.9985839], [-0.0415651, 0.1451375, -0.988_538]]),
+        ] {
+            for (actual, expected) in sun_positions(time).into_iter().zip(expected) {
+                assert!((0..3).all(|k| (actual[k] - expected[k]).abs() < 1e-5), "{time}: {actual:?}");
+            }
+        }
+        for time in [-1.0, 0.0, 6480.0, 6481.0] {
+            let actual = sun_positions(time);
+            let wrapped = sun_positions(time.rem_euclid(DAY_LENGTH));
+            assert_eq!(actual, wrapped);
+            for direction in actual {
+                assert!((direction.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-5);
+            }
+        }
+        assert!(sun_positions(0.0)[0][1] < 0.0 && sun_positions(3240.0)[0][1] > 0.0);
+    }
+
+    #[test]
+    fn native_sun_look_frame_preserves_roll_through_the_day() {
+        // GC1013c1f7 builds right=forward×worldUp, up=forward×right.
+        // Check the complete frame independently of the quaternion construction.
+        for minute in 0..=108 {
+            for direction in sun_positions(minute as f32 * 60.0) {
+                let forward = direction.map(|v| -v);
+                let length = (forward[0] * forward[0] + forward[2] * forward[2]).sqrt();
+                let right = [-forward[2] / length, 0.0, forward[0] / length];
+                let up = [
+                    forward[1] * right[2],
+                    forward[2] * right[0] - forward[0] * right[2],
+                    -forward[1] * right[0],
+                ];
+                let rotation = sun_rotation(direction);
+                for (axis, expected) in [([1.0, 0.0, 0.0], right), ([0.0, 1.0, 0.0], up), ([0.0, 0.0, 1.0], forward)] {
+                    let actual = rotation.rotate(axis);
+                    assert!((0..3).all(|k| (actual[k] - expected[k]).abs() < 1e-5));
+                }
+            }
+        }
+        let ao = sun_positions(DEFAULT_DAY_TIME)[0];
+        assert_eq!(sun_dir(DEFAULT_DAY_TIME), [ao[0], ao[1], -ao[2]]);
     }
 
     #[test]

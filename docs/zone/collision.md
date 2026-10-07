@@ -4,6 +4,59 @@ Port of the data and queries behind `ao_formats::playfield::collision` (`crates/
 `collision/kd.rs`). Everything below was read from the client DLLs (Ghidra, N3.dll image base `0x10000000`) and checked
 against the shipped data. Labels: **[CODE]** read in the decompile, **[DATA]** verified on the files, **[GUESS]** not resolved.
 
+## Native Shadow3008 / WaterRipples3005 context
+
+**[CODE]** `Vehicle_t::EnsureSurfaceAlignment` @Vehicle `0x1000d1aa` passes `vehicle+0x10c` as
+`LiquidMediumData_t*` to `Surface_i::CalculateClosestPoint`; the retained
+submersion is overwritten after the liquid-medium state machine when the final feet position
+is below the liquid.
+N3 outdoor `0x10018f0c` and room `0x10013ee6` write liquid flags at struct `+4` (Vehicle `+0x110`)
+and the collision-plane direction at struct `+8/+0xc/+0x10` (Vehicle `+0x114/+0x118/+0x11c`).
+The port retains these authored polygon flags/normals in `Closest::liquid_info` and
+`SurfaceState::liquid_info`; `Movement::effect_liquid` passes them with the existing native
+submersion, not a fresh render-time depth estimate. No liquid is represented by `None`.
+**[CODE]** The outdoor query now uses native authored order, not highest-surface selection.
+GC `0x100b7f61` calls `VisualWater_t::Create` for the authored triangles in order, decodes
+depth as `(kind >> 5)/10` (zero means 100000 m), and registers each collision info in every
+zone intersecting its expanded bounding rectangle via N3 `SetWater` `0x1001abf2`.
+DS `0x1003a3b4` recursively splits cross-product magnitude above 10000 into midpoint
+corner A/B/C/centre children; `0x1003a0d6` emits collision infos only for even liquid
+types and appends them using `0x10071fc4` (sentinel tail insertion). The collision plane
+normal is flipped upwards by `0x10039f14`; flags contain only `kind & 0x1f`.
+Its centroid bucket test uses `trunc(x/100)-60*trunc(z/-100)` in `[0,3600)`, with
+double constants at `0x10089e48` (+100), `0x1008c030` (-100), and `0x1008a690` (3).
+N3 `GetLiquidSurfaceHeight` `0x1000cb1e` → zone `0x1001ab68` walks this appended
+list, returns the first positive collision satisfying authored depth, and stops on the first
+positive collision that fails depth. DS `PerformCollisionTest` `0x10039d3c` rejects
+triangle edges, points at/above the triangle top, and nonpositive plane heights.
+The port builds the same collision-only subdivision/order and uses these strict/depth tests.
+Testing triangle membership against this ordered list is equivalent to restricting it to
+the registered zone list: every containing collision triangle was registered into the
+point's zone by the bounding-rectangle registration.
+
+`outdoor_liquids_use_authored_order_depth_and_strict_edges` covers first-not-highest
+selection, depth-failure short circuit, low-five-bit flags, excluded edges, four-child
+subdivision and upwards normal. It was added but not run by the implementation worker.
+
+**[CODE/DATA]** Shadow `GC 0x100ecee4` reads VisualEnvFX sun Light `+0x104`.
+DisplaySystem's GAME tweak update `FUN_1005cdcf` (the `TweakedSunDirection` variable copy to Light
+`+0x104/+0x108/+0x10c`) writes `Tweak_GAME.txt` line 71:
+`Unit1ZDirection [ROT] Sun1Rotation`, where `Unit1ZDirection` is **+Z**.
+The existing scene sky uses **−Z** for its vector towards the sun, so the Host passes
+the negated loaded environment direction and updates it with each received live sky.
+It does not substitute the renderer's generic default environment when no scene environment exists.
+The scene sun direction now uses the native binary-sun ephemeris (GC `0x100b879b` /
+`0x100b9044`, constructor parameters `0x100b86ca` / `0x100b8ea6`; see the sky documentation).
+Dungeon state comes from the loaded
+`ZoneLocator::is_dungeon`; head height comes from the current avatar rig's root/head
+attractor via `Avatar::head_height`, not a camera-pivot constant.
+
+Regression coverage: `native_shadow_sun_uses_the_loaded_environment_ray_direction` checks
+the environment sign and scene-replacement reset; `collision_room_liquids_are_found_in_dungeons`
+checks real playfield 120's retained liquid flags/direction against its collision query.
+These checks were added but not run by the implementation worker.
+
+
 ## 1. What the client collides with
 
 The playfield owns one `Surface_i` (`n3Playfield_t::InitializeSurface` N3 @0x1000c64b, stored at `playfield+0x60`):

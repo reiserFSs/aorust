@@ -50,8 +50,8 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
     });
     let ctx = Ctx {
         day_time: sky.day_time,
-        sun1: Quat::between([0.0, 0.0, -1.0], sky.sun_ao),
-        sun2: Quat::between([0.0, 0.0, -1.0], sky.sun2_ao),
+        sun1: super::sun_rotation(sky.sun_ao),
+        sun2: super::sun_rotation(sky.sun2_ao),
         cloud_intensity: sky.weather.thick_clouds_intensity(),
         hq_offset: hq_offset(objs),
         delta_time: 0.0,
