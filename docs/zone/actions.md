@@ -481,3 +481,24 @@ For example, `arm=equip:2:equipment,dclick=40,capturewait=30` or
 For level-up, arm `arm=level-up:2:level` before the action earning the level, then `capturewait=30`.
 `frames=<prefix>:<seconds>` still records immediately without an event trigger.
 
+2026-10-07 muted offscreen equipment replay: Aomacvolk33512 in Borealis800
+unwore Solar-Powered Assault Rifle121569 from slot6 to bag0x41, then
+`dclick=item:121569` returned it to slot6. Each transition captured90
+frames at60Hz. Holster raised the empty hands before settling; draw
+raised the arms and restored the held rifle. Own visibility notes0x3c
+(hide) and0x3f (show) fired, and the worn UI slot/inventory changed with
+the model. There was no equipment sound request: the installed705-byte
+`1000020:121569` record's sound multimap at0x285/sub5 contains only
+11=`ba94da9b`,22=`808e0f71`,28=`ba94da9b`, not keys8/9 read by
+GC1009e301/1009ce50. Silent equip/unequip for this rifle is authored,
+not a muted/rejected voice; the0x3c/0x3f notes are visibility callbacks.
+
+The same round's level-up feasibility check logged Aomacrceg33550 at
+ICC4582 `(940,47.02,874.78)`, level2, XP1523, absolute next threshold
+5500 (stat53):3977 XP remain. Level-start1450 (stat57) plus per-level
+span4050 (stat350) equals5500;350 is not an absolute threshold.
+Aomacfixr33588 was also measured at level2, XP2115/5500:3385 remain.
+No living hostile level≤2 existed within rceg's60m `goto=hunt` filter;
+that helper rejected the attempt before attack. No kill, per-kill XP,
+level sound/animation or `got_ip` live PASS is claimed.
+

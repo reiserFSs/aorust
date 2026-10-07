@@ -508,9 +508,19 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
   word8=−1, words10/11=20091/20096, word20=4, word21=−1. Both children
   are class1002 with word8=1.5 seconds (payload offsets `0xad04`/`0xaf34`);
   that finite visual tail is retail behavior, not a stuck buff controller.
-  Regression `body_boost_cancel_preserves_emitted_children` checks these
-  authored records and that cancellation releases the throttle without
-  deleting either emitted child.
+  Class1002's deleting destructor `100d59e3`→`100d5133` deletes both
+  owned descendants (`+0x7c/+0x80`): flare6203 and cord20092/20097.
+  The flare's authored20s lifetime cannot extend its owning1.5s pulse.
+  Regression `body_boost_cancel_preserves_emitted_children` checks the
+  authored records, throttle release and immediate child retention, then
+  actual renderer expiry: descendants and Host submissions disappear
+  within120 frames at60Hz and no pulse resumes over another360 frames.
+  Red cast particles are separate:29091 starts46129 (class1010, mode1,
+  source phases0/6/8s) and finishes43421 (class2004,3s plus350ms particles).
+  Successful cast completion `1007ac9a` emits finish effects and returns
+  idle without DeleteEffect; destructor `1007b290`→`1007b27f` also does
+  not delete that handle. Removing the buff soon after casting therefore
+  cannot establish a1070 leak from red particles alone.
 * Class1002's orbiting children (`100d4f72`/`100d52dc`/`100d53e3`/
   `100d57bb`/`100d4d6b`) use their actual class0 body-profile records
   (20013/20018,42words), selected by Breed/Sex/BodyShape/MonsterScale,
