@@ -809,11 +809,66 @@ located overload. Vtable `1016e9f4` graceful slot6 is base `100a719a`,
 not a particle-drain override; process slot1 is `10113604`.
 
 
+### 7.8 VulcanRocks (class1029), including effect45083
+
+GC dynel dispatch `100d0102` allocates0x98 and calls `101034c2`;
+the vector dispatch `100ce4f7` calls `10103147`. Both install
+`_GfxControlVulcanRocks_t` vtable `1016d234`, load parameters at
+`10102ef2`, initialize at `1010303f`, and process at `1010366b`.
+The unlocated overload `100ce3be` does not accept this class.
+The loader reads flags0, connector1–7, duration8, speed10,
+elevation endpoints11/12, colour13–16, capacity20, rate21,
+selector count22 and selectors23 onward; the next word is the
+delete-rocks flag (`10106872` returns zero if absent; trailing unused authored words are retained).
+Process uses cumulative ceil emission, uniform azimuth, authored elevation,
+connector basis/position, gravity9.8, terrain/closest-surface reflection
+with0.75 damping and at most four bounce retumbles. Controls older than
+the newest50 Vulcan creations terminate. Slot5 (`10102ee1`) updates the
+connector matrix; slot6 (`10102eed`) terminates immediately. Deleting
+destructor `10103b8f` calls `101035f7`, releasing locator, visual list and
+selector array; the authored delete flag selects `DeleteRocks`.
+
+DS `GfxVisualRockList` ctor `1001c5d0`/capacity setup `1001c4a6`
+caps capacity at128; the global rock handler `1001c0ea` has512 slots.
+`GetNew` (`1001c4f9`) obtains the authored
+VisualEnvFX resource through `1001c199`; `ProcessRocks` (`1001c435`)
+updates actual mesh translation and axis-angle quaternion, not billboards.
+VisualEnvFX loader `100616e4` resolves selector39 to
+`gib05_slime.abiff` (1010001); selectors5–10 and42 are material-only entries,
+43–45 have no resource, so the native mesh getter `100612c3` cannot create rocks from them.
+List destruction `1001c68f`/`1001c602` releases objects to the global
+handler; handler `1001c130` removes released zero-lifetime meshes,
+while explicit `DeleteRocks` (`1001c659`/`1001c097`) deletes immediately.
+
+Installed effect45083 has flags1, attractor3000, connector X rotation
+0.125663713 and Z rotation4.83805275, duration−1, speed6.4,
+elevation1.25663710–1.57079637, capacity1, rate256, selector count1,
+selector39 and delete flag5. These authored fields select the actual
+slime-gib mesh and its original material/textures. The mesh renderer is
+shared with class1027, but emission direction is the native Vulcan cone,
+not1027's target ballistic path. All eleven installed1029 records are
+covered by the existing ignored mesh-frame regression.
+
+Isolated origin/main gate checks: the first `cargo test --release --workspace`
+exposed the source-deletion omission (the other765 aomac tests passed,
+13 ignored); the shared source-deletion predicate now includes attached1029
+unless flag0x400 is set. Both authored45083 tests passed after that fix,
+then the final `cargo test --release --workspace` passed1381 tests
+(37 suites,15 ignored).
+`cargo clippy --release --workspace --all-targets -- -D warnings` passed.
+`AOMAC_EFFECT_FRAMES=/tmp/FxClasses/frames1029 cargo test --release -p aomac authored_native_rock_frames -- --ignored --nocapture`
+passed. All44 frames for the eleven1029 records were inspected at frames
+15/30/60/120: textured rock cones and actual gib/casing geometry, with no
+substitute sprites. Effect45083 had3658/3072/3522/2977 visible resource
+pixels respectively, showing the authored textured slime-gib tumbling.
+This is offscreen evidence with the harness floor, not a retail-reference
+comparison or a real-window/live-server pass.
+
 ## 8. Not found / open
 * The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
 * Unsupported authored classes still report their actual ID/class, never
   fabricated artwork. A read-only installed-data census finds additional
-  weapon/nano roots in classes1018/1020/1029,2001/2002/2004/2005/2006/2011/
+  weapon/nano roots in classes1018/1020,2001/2002/2004/2005/2006/2011/
   2013,3000/3001/3003/3004/3006/3017/3022/3029/3038/5000.
   This inventory is incomplete: the existing spell parser rejects9320 item
   records and237 nano records, which are counted rather than silently treated

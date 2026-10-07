@@ -235,6 +235,7 @@ pub struct Renderer {
     buff_models: HashMap<u32,EffectModel>,
     retired_buff_models: Vec<u64>,
     aux_sounds: Vec<aux::AuxSound>,
+    vulcan_sequence:u64,
 }
 
 impl Renderer {
@@ -245,7 +246,7 @@ impl Renderer {
         let mut anchor_ids: Vec<_> = templates.by_id.values().filter_map(|t| t.words.get(7).map(|v| *v as i32)).chain(1000..=1018).chain(2000..=2023).chain([3000,3001]).collect();
         anchor_ids.sort_unstable();
         anchor_ids.dedup();
-        Ok(Self { templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::new(1), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![] })
+        Ok(Self { templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::new(1), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![],vulcan_sequence:0 })
     }
 
     pub fn clear(&mut self) {
@@ -264,7 +265,7 @@ impl Renderer {
         self.aux_sounds.clear();
     }
 
-    pub fn supports(kind: i32) -> bool { matches!(kind,1001|1005|1006|1010|1025|1027|3025) || beams::Beam::supports(kind) || sprites::SpriteEffect::supports(kind) || composition::Composition::supports(kind) || aux::AuxEffect::supports(kind) || particles::ParticleEffect::supports(kind) || particles2::ParticleEffect::supports(kind) || replicated::ReplicatedEffect::supports(kind) || buffs::Buff::supports(kind) }
+    pub fn supports(kind: i32) -> bool { matches!(kind,1001|1005|1006|1010|1025|1027|1029|3025) || beams::Beam::supports(kind) || sprites::SpriteEffect::supports(kind) || composition::Composition::supports(kind) || aux::AuxEffect::supports(kind) || particles::ParticleEffect::supports(kind) || particles2::ParticleEffect::supports(kind) || replicated::ReplicatedEffect::supports(kind) || buffs::Buff::supports(kind) }
     pub fn delete(&mut self, handle: u32) {
         if let Some(index) = self.active.iter().position(|a| a.actor == handle) {
             let mut a = self.active.swap_remove(index);
@@ -281,12 +282,13 @@ impl Renderer {
         }
     }
     pub fn is_active(&self, handle: u32) -> bool { self.active.iter().any(|a| a.actor == handle) }
-    /// Native GC10110b31/10114b20: destroyed source dynels delete Shield2/Trail2.
+    /// Destroyed source dynels delete Shield2/Trail2 and attached VulcanRocks.
     /// Lack of a visible actor or a fresh CPU pose is not dynel destruction.
     pub fn source_deleted(&mut self,identity:(u32,u32)) {
         while let Some(handle)=self.active.iter().find(|a| {
             a.config.source_identity==Some(identity)
-                && matches!(self.templates.by_id[&a.effect].kind,3034|3039)
+                && (matches!(self.templates.by_id[&a.effect].kind,3034|3039)
+                    || (self.templates.by_id[&a.effect].kind==1029 && self.templates.by_id[&a.effect].words[0]&0x400==0))
         }).map(|a|a.actor) {self.delete(handle);}
     }
     pub fn update_source(&mut self, handle: u32, source: Mat4) {
@@ -302,6 +304,7 @@ impl Renderer {
             if let Some(c) = &mut a.control { c.update_source(a.source); }
             if let Some(p)=&mut a.particle {p.update_source(a.source);}
             if let Some(p)=&mut a.particle2 {if let Err(error)=p.update_source(source) {eprintln!("effect particle connector: {error:#}");}}
+            if let Some(mesh)=&mut a.mesh {if let Err(error)=mesh.update_source(source) {eprintln!("rock connector: {error:#}");}}
             if let Some(t)=&mut a.tracer_mesh { if let Err(error)=t.set_anchors(source,a.target) {eprintln!("effect mesh connector: {error:#}");} }
             if let Some(aux)=&mut a.aux { aux.update_source(source); }
             if let Some(native)=&mut a.native_replicated { native.update_source(source); }
@@ -355,7 +358,7 @@ impl Renderer {
             }
             let Some(identity) = a.config.source_identity else { continue };
             let template=&self.templates.by_id[&a.effect];
-            if a.config.track_source && !matches!(template.kind,2007|2011|3004|3029|4000) && template.words[0]&1 !=0 && a.beam.is_none() && a.mesh.is_none() {
+            if a.config.track_source && !matches!(template.kind,2007|2011|3004|3029|4000) && template.words[0]&1 !=0 && a.beam.is_none() && (a.mesh.is_none() || template.kind==1029) {
                 if let Some(source) = self.anchors.get(&(identity,a.attractor)).copied().flatten() {
                     a.raw_source=source;
                     let source=if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|1018|3020) {
@@ -367,6 +370,7 @@ impl Renderer {
                     if let Some(c) = &mut a.composition { c.update_source(source); }
                     if let Some(p)=&mut a.particle {p.update_source(source);}
                     if let Some(p)=&mut a.particle2 {if let Err(error)=p.update_source(a.raw_source) {eprintln!("effect particle connector: {error:#}");}}
+                    if let Some(mesh)=&mut a.mesh {if let Err(error)=mesh.update_source(source) {eprintln!("rock connector: {error:#}");}}
                     if let Some(t)=&mut a.tracer_mesh { if let Err(error)=t.set_anchors(source,a.target) {eprintln!("effect mesh connector: {error:#}");} }
                     if let Some(aux)=&mut a.aux {aux.update_source(source);}
                     if let Some(buff)=&mut a.buff {if let Err(error)=buff.update_source(source) {eprintln!("buff source: {error:#}");}}
@@ -404,7 +408,7 @@ impl Renderer {
         let kind = self.templates.by_id[&self.active[index].effect].kind;
         // Native slot 6 sets the control's terminating byte for these classes:
         // 100d385e / 100f20bd / 100f5a3c / base 100a719a.
-        if matches!(kind,1001|1010|1011|1012|3007|3020|3031|3032) {
+        if matches!(kind,1001|1010|1011|1012|1029|3007|3020|3031|3032) {
             self.delete(handle);
             return;
         }
@@ -493,8 +497,12 @@ impl Renderer {
         let mut composition = if composition::Composition::supports(template.kind) { Some(composition::Composition::new(template,source,target,config)?) } else { None };
         let mut beam = if beams::Beam::supports(template.kind) { Some(beams::Beam::new(template,source,Mat4::from_translation(target),binding.color)?) } else { None };
         if let (Some(beam),Some(duration)) = (&mut beam,config.duration) { beam.set_duration(duration); }
-        let mut mesh = if template.kind==1027 { Some(meshes::MeshEffect::new(template,&self.store,&self.names,source,target,&mut self.mesh_resources)?) } else { None };
+        let mut mesh = if matches!(template.kind,1027|1029) { Some(meshes::MeshEffect::new(template,&self.store,&self.names,source,target,&mut self.mesh_resources)?) } else { None };
         if let (Some(mesh),Some(duration)) = (&mut mesh,config.duration) { mesh.set_duration(duration); }
+        if template.kind==1029 {
+            if let Some(mesh)=&mut mesh {mesh.sequence=self.vulcan_sequence;}
+            self.vulcan_sequence+=1;
+        }
         if let Some(mesh) = &mesh { for (selector,_) in mesh.scenes() { self.mesh_uploaded.entry(*selector).or_insert(false); } }
         let tracer_mesh=if template.kind==3025 {Some(tracer_meshes::TracerMesh::new(template,&self.store,&self.names,source,&mut self.mesh_resources,config)?)} else {None};
         if let Some(mesh)=&tracer_mesh {for (selector,_) in mesh.scenes() {self.mesh_uploaded.entry(*selector).or_insert(false);}}
@@ -727,6 +735,7 @@ impl Renderer {
         let up = host.camera.up();
         let camera = host.camera.pos;
         let forward = host.camera.forward();
+        let mut live_rocks=self.active.iter().filter_map(|a|a.mesh.as_ref()).map(meshes::MeshEffect::rock_count).sum::<usize>();
         self.active.retain_mut(|effect| {
             let template = &self.templates.by_id[&effect.effect];
             if !dt.is_finite() { return true; }
@@ -735,8 +744,9 @@ impl Renderer {
             effect.ticks = effect.ticks.saturating_add(1);
             effect.elapsed += step;
             if let Some(mesh)=&mut effect.mesh {
+                if template.kind==1029 && mesh.sequence+50<self.vulcan_sequence {return false;}
                 let Some(terrain)=collision.as_deref_mut() else { eprintln!("effect {} needs native terrain collision",effect.effect);return false; };
-                match mesh.frame(step,&mut self.random,terrain) {
+                match mesh.frame_with_pool(step,&mut self.random,terrain,&mut live_rocks) {
                     Ok(true)=>host.actors.extend(mesh.actors(effect.actor,MESH_MODEL_BASE)),
                     Ok(false)=>return false,
                     Err(error)=>{ eprintln!("effect mesh: {error:#}");return false; }
