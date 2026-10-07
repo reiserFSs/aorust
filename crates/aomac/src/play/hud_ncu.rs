@@ -9,8 +9,8 @@
 //!
 //! Interactions: double click = `N3Msg_RemoveBuff` (`FUN_10044c31`): a friendly effect (`Flags & 0xc100 == 0`) is cancelled and "Deactivating friendly timed nanoprogram."
 //! goes to the System window, otherwise "Can't remove hostile timed nanoprogram."; the tooltip (`FUN_1004518b`) is the name, "NCU usage: %d", "Remaining: hh:mm:ss" and the
-//! modifier list. UNRESOLVED / not ported: the "Modifies:" text (`N3Msg_GetModifierString`), the right-click menu (only "LookAtNano" -> InfoView), the Type column (8) text and
-//! how the original learns that an effect ended (the server's action 0x1b / 0x66 paths, `FUN_1004f504`): an effect ends here when its `TimeExist` has run out.
+//! modifier list. UNRESOLVED / not ported: the "Modifies:" text (`N3Msg_GetModifierString`), the right-click menu (only "LookAtNano" -> InfoView), and the Type column (8) text.
+//! Effect timing and removal belong to `OwnNanos`; opening this window never expires or removes effects.
 
 use super::hud::WindowKind;
 use super::hud_listview::{self as lv, Column, Hit, ListView, ListWindow, MenuTexts, Mode, Row, Spec};
@@ -145,12 +145,7 @@ impl HudNcu {
         fmt.replacen("%u", &used.to_string(), 1).replacen("%u", &max.to_string(), 1)
     }
 
-    /// Remaining time of an effect in 1/100 s (`FUN_1004eb5a`: start + total - now).
-    fn remaining(total_cs: i32, started: f32, now: f32) -> i32 {
-        total_cs - ((now - started) * 100.0) as i32
-    }
-
-    pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, dt: f32) {
+    pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone, dt: f32) {
         self.clock += dt;
         let Some(win) = self.win.as_ref() else { return };
         let w = win.win;
@@ -159,16 +154,7 @@ impl HudNcu {
             win.set_title(gui, &title);
             self.title = title;
         }
-        // effects whose time ran out end (UNRESOLVED how the original learns it, see the module doc)
         let now = zone.nanos.time;
-        let expired: Vec<i32> = zone
-            .nanos
-            .buffs
-            .iter()
-            .filter(|b| self.db.info(gui, b.nano).is_none_or(|i| i.total_time() > 0 && Self::remaining(i.total_time(), b.started, now) <= 0))
-            .map(|b| b.nano)
-            .collect();
-        zone.nanos.remove_buffs(&expired);
         let second = now as i64;
         let win = self.win.as_ref().expect("open");
         let sig = (zone.nanos.serial, second, win.view.mode, win.view.columns.len() * 31 + win.view.sort.0 as usize + usize::from(win.view.sort.1));
@@ -179,12 +165,13 @@ impl HudNcu {
         let mut rows = vec![];
         for b in &zone.nanos.buffs {
             let Some(info) = self.db.info(gui, b.nano).cloned() else { continue };
-            let total = info.total_time();
-            let rem = Self::remaining(total, b.started, now);
+            let rem = b.remaining_cs(now);
             let mut cells = HudNano::cells(&info, &columns);
             for (c, cell) in columns.iter().zip(cells.iter_mut()) {
-                if c.id == 12 {
-                    *cell = lv::hms(rem);
+                match c.id {
+                    12 => *cell = lv::hms(rem),
+                    13 => *cell = lv::hms(b.total_cs),
+                    _ => {}
                 }
             }
             // `FUN_1004518b`
@@ -264,11 +251,35 @@ impl HudNcu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::own_nanos::Buff;
 
     #[test]
-    fn remaining_counts_down_from_the_start() {
-        assert_eq!(HudNcu::remaining(45000, 3.0, 3.0), 45000);
-        assert_eq!(HudNcu::remaining(45000, 3.0, 13.5), 43950);
-        assert!(HudNcu::remaining(100, 0.0, 1.0) <= 0);
+    fn window_reads_runtime_duration_without_owning_expiry() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("cd_image/gui").exists() {
+            return;
+        }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut ncu = HudNcu::new(&dir, (1100, 760)).unwrap();
+        let mut zone = Zone::new(7);
+        zone.nanos.buffs = vec![
+            Buff { nano: 25982, total_cs: 90000, ..Default::default() },
+            Buff { nano: -1, total_cs: 100, ..Default::default() },
+        ];
+        zone.nanos.time = 500.0;
+        ncu.open(&mut gui);
+        ncu.update(&mut gui, &zone, 0.0);
+        assert_eq!(zone.nanos.buffs.len(), 2, "missing records and elapsed template durations cannot remove lifecycle entries");
+        assert_eq!(ncu.shown(), [25982]);
+        let view = &ncu.win.as_ref().unwrap().view;
+        let row = &view.rows()[0];
+        assert!(row.tip_body.ends_with(&lv::hms(40000)));
+        for (column, cell) in view.columns.iter().zip(&row.cells) {
+            match column.id {
+                12 => assert_eq!(cell, &lv::hms(40000)),
+                13 => assert_eq!(cell, &lv::hms(90000)),
+                _ => {}
+            }
+        }
     }
 }

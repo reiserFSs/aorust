@@ -1540,6 +1540,10 @@ mod tests {
         assert_eq!(zone.stat(sid::NCU_MAX), Some(8), "stored stat remains raw");
         assert_eq!(gui.text(hud.cc, "ncu"), "3/20");
         assert_eq!(hud.ncu.title(), HudNcu::title_for(&TextDb::load(&dir).unwrap(), 3, 20));
+        zone.apply_effects(&[ao_net::n3::spells::spell(0xcf35, &[(0, sid::NCU_USED as i32), (0x27, 4)])], true);
+        hud.update(&mut gui, &mut zone, 0.0);
+        assert_eq!(gui.text(hud.cc, "ncu"), "7/20");
+        assert_eq!(hud.ncu.title(), HudNcu::title_for(&TextDb::load(&dir).unwrap(), 7, 20));
     }
 
     #[test]
@@ -2141,6 +2145,7 @@ mod tests {
         assert_eq!(s.hud.shortcuts[0].slot_names()[4], "Shadow Touch");
         s.hud.shortcuts[0].use_slot(4, &s.hud.actions.list);
         assert_eq!(s.hud.shortcuts[0].take_uses(), [SlotUse::Nano(163449)]);
+        assert!(s.zone.nanos.buffs.is_empty(), "learning a program is not activating an NCU effect");
         s.hud.close_kind(&mut s.gui, WindowKind::Nano);
         s.hud.dvalues.set_i64("OpenNanoWindow", 0);
         s.zone.on_frame(&frame);

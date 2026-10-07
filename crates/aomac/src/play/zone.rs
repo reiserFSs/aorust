@@ -244,7 +244,16 @@ impl Zone {
 
     /// `FullCharacter` Activate [GC 0x10073a2f]: each group is applied in order, skipping the `0x499602D2` marker.
     fn apply_stats(&mut self, pairs: impl IntoIterator<Item = (u32, i32)>) {
-        self.stats.extend(pairs.into_iter().filter(|p| p.1 != ao_formats::stats::INVALID));
+        for (id, value) in pairs.into_iter().filter(|p| p.1 != ao_formats::stats::INVALID) {
+            self.stats.insert(id, value);
+            if id == 180 { self.skill_values.insert(id, value); }
+        }
+    }
+
+    fn adjust_ncu(&mut self, delta: i32) {
+        if delta == 0 { return; }
+        *self.stats.entry(180).or_default() += delta;
+        if let Some(value) = self.skill_values.get_mut(&180) { *value += delta; }
     }
 
     /// The sky clock (`GameDayTime`, 0..6480 s) now: the server's `GameTimeIIR_t` advanced by the frames since, or the
@@ -256,7 +265,8 @@ impl Zone {
     /// `GameTime_t::RunFunction` [GC 0x1000b214]: the clock runs `TimeSpeed` (15) game seconds per real second, i.e. one
     /// `GameDayTime` second per real second.
     pub fn tick(&mut self, dt: f32) {
-        self.nanos.tick(dt);
+        let delta = self.nanos.tick(dt);
+        self.adjust_ncu(delta);
         if let Some(t) = &mut self.server_unix {
             *t += f64::from(dt);
         }
@@ -369,7 +379,9 @@ impl Zone {
                 _ => {}
             }
         }
-        self.nanos.on_message(who, Identity { kind: CHAR_KIND, instance: self.char_id as i32 }, &m.body);
+        let duration_percent = self.skill_value(464).unwrap_or(100);
+        let delta = self.nanos.on_message(who, Identity { kind: CHAR_KIND, instance: self.char_id as i32 }, &m.body, duration_percent);
+        self.adjust_ncu(delta);
         if who == (Identity { kind: CHAR_KIND, instance: self.char_id as i32 }) {
             if let N3::World(World::CharacterAction(a)) = &m.body {
                 if a.action == ao_net::n3::inventory::ACTION_DELETE_ITEM {
@@ -547,7 +559,7 @@ impl Zone {
                 }
                 // `FUN_1005d0d8` case 0x5a (action 0xd0, 0x1005e8b5): `SetStat(identity_b.kind, identity_b.instance)` on the drained character (Health / Nano)
                 if a.action == 0xd0 && a.identity_b.kind > 0 {
-                    self.stats.insert(a.identity_b.kind as u32, a.identity_b.instance);
+                    self.apply_stats([(a.identity_b.kind as u32, a.identity_b.instance)]);
                 }
                 self.own_events.push(OwnEvent::Action(a.action));
             }
@@ -742,6 +754,80 @@ mod tests {
                 (dir == "<").then(|| Frame::decode_with(&b, false).ok().flatten().map(|(f, _)| f)).flatten()
             })
             .collect()
+    }
+
+    /// Actual capture: three nano-add/removal pairs on Bergdoktor, not the capturing player.
+    #[test]
+    fn captured_nano_add_and_buff_removal() {
+        let mut z = Zone::new(0x827a);
+        let mut adds = 0;
+        let mut removes = 0;
+        for frame in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            let Ok(message) = n3::decode(&frame) else { continue };
+            if message.header.target != (Identity { kind: CHAR_KIND, instance: 0x827a }) { continue; }
+            match &message.body {
+                N3::World(World::CharacterAction(a)) if a.action == 0x62 => {
+                    z.on_frame(&frame);
+                    let buff = z.nanos.buffs.iter().find(|b| b.nano == 163449).unwrap();
+                    assert_eq!(buff.source, a.identity_b.kind);
+                    assert_eq!(buff.total_cs, 0);
+                    adds += 1;
+                }
+                N3::Misc(Misc::Buff(b)) if b.kind == 0 => {
+                    z.on_frame(&frame);
+                    assert!(!z.nanos.buffs.iter().any(|b| b.nano == 163449));
+                    removes += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((adds, removes), (3, 3));
+    }
+
+    /// Synthetic supplementary login effects on a real decoded full-update envelope.
+    #[test]
+    fn synthetic_login_restores_effect_timing_and_absolute_ncu() {
+        let mut update = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter()
+            .find_map(|f| match n3::decode(f).ok()?.body {
+                N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => Some(u),
+                _ => None,
+            }).unwrap();
+        update.effects = vec![ao_net::n3::dynel::EffectEntry { source: Identity { kind: 0xcf1b, instance: 163449 }, a: 999, b: 1000, c: 400 }];
+        let mut z = Zone::new(7);
+        z.nanos.tick(20.0);
+        let own = Identity { kind: CHAR_KIND, instance: 7 };
+        let delta = z.nanos.on_message(own, own, &N3::Dynel(Dynel::SimpleCharFullUpdate(update)), 100);
+        z.adjust_ncu(delta);
+        assert_eq!(z.nanos.buffs[0].started, 14.0);
+        assert_eq!(z.nanos.buffs[0].remaining_cs(20.0), 400);
+        z.apply_stats([(180, 8)]);
+        assert_eq!(z.stat(180), Some(8));
+        assert_eq!(z.skill_value(180), Some(8));
+        z.tick(10.0);
+        assert_eq!(z.nanos.buffs[0].remaining_cs(z.nanos.time), 0);
+        assert_eq!(z.stat(180), Some(8), "timer zero is not a fabricated removal");
+    }
+
+    /// Synthetic supplementary accounting: server absolute values are not summed with active costs.
+    #[test]
+    fn synthetic_ncu_absolute_then_server_expiry() {
+        let mut z = Zone::new(7);
+        z.apply_stats([(180, 2)]);
+        z.nanos.buffs.push(super::super::own_nanos::Buff { nano: 1, total_cs: 100, ncu_cost: 3, ..Default::default() });
+        z.adjust_ncu(3);
+        assert_eq!(z.skill_value(180), Some(5));
+        z.apply_stats([(180, 5)]);
+        assert_eq!(z.skill_value(180), Some(5));
+        z.tick(2.0);
+        assert_eq!(z.skill_value(180), Some(5));
+        let own = Identity { kind: CHAR_KIND, instance: 7 };
+        let removal = N3::Misc(Misc::Buff(ao_net::n3::misc::Buff {
+            kind: 0, nano: Some(Identity { kind: 0xcf1b, instance: 1 }), rest: vec![],
+        }));
+        let delta = z.nanos.on_message(own, own, &removal, 100);
+        z.adjust_ncu(delta);
+        assert_eq!(z.stat(180), Some(2));
+        assert_eq!(z.skill_value(180), Some(2));
     }
 
     #[test]

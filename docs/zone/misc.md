@@ -224,9 +224,18 @@ Read [GC 0x1007213b], write [GC 0x1007216f], apply [GC 0x1007219c].
 
 Apply: when the header dynel resolves (`FUN_10058e36`, kind 50000) and `kind == 0` → `FUN_10050afd(&identity, 0, 1, 0, 0)`:
 looks up (and caches) the nano program object for the identity — `FUN_100a45ba` creates `FUN_100861a4(0xCF1B, instance)` and
-loads RDB record type **0xFDE85** with the same instance — so identity kind **0xCF1B = nano program**. It then (conditions on the local char / nano state not decoded) formats a chat line, clears bit `1 << nanoSlot` of stat 0x212, adjusts stat 0xB4
-("CurrentNCU" in the stat table; exact arithmetic not decoded) and spawns the nano's effect (`FUN_1005064c`, `_EffectHandler_t`). Non-zero `kind`: the apply
-code does nothing; semantics unresolved (decoder keeps the remaining bytes in `rest`).
+loads RDB record type **0xFDE85** with the same instance — so identity kind **0xCF1B = nano program**.
+This is **removal**, not addition. `1004ee0b` checks that the entry exists before accounting; `10050e83` calls
+`1005064c`, whose boolean argument at +0xc enables list erase (`1005069e..100506a6`, `1002df93`).
+For an installed entry, CurrentNCU (stat180) loses stat54 only if nano Flags contain `0x10000` and none of
+`0x4000|0x8000|0x100` (`10050afd`, matching add `100512af`). An absolute server stat180 replaces the value,
+not a base to which the active effects are summed again. Nonzero kind does nothing.
+Expiry is server-authoritative: remaining-time getter `1004eb5a` clamps at zero, with sole observed caller
+export `10017880`; it does not erase. The observed `10050afd` callers are replacement `1005134a`, bulk clear
+`1005169a`, and BuffIIR `100721c3`. A zero timer must not manufacture a local removal.
+Implementation: missing/unreadable nano metadata is reported with its record/load error, kept distinct from
+real zero-valued families, and never used to infer cross-nano conflicts or an estimated NCU cost.
+Same-id refresh remains possible. Pet rows use the same runtime total/remaining timing and await server removal.
 
 ```
 39343c68 0000c350 0000827a 00 | 0000 | 0000cf1b 00027e79      nano id 163449 (0x27E79) on character 33402; seen at 23920, 29898, 74495 ms

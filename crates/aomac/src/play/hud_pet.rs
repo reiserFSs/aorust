@@ -42,8 +42,13 @@ impl HudPet {
     pub(super) fn take_closed(&mut self) -> bool { std::mem::take(&mut self.closed) }
     pub(super) fn on_frame(&mut self, frame: &Frame) {
         let Ok(m) = ao_net::n3::decode(frame) else { return; };
-        if matches!(&m.body, ao_net::n3::N3::Misc(ao_net::n3::misc::Misc::Buff(_))) {
-            self.nanos.entry(m.header.target.instance).or_default().on_message(m.header.target, m.header.target, &m.body);
+        if matches!(&m.body,
+            ao_net::n3::N3::Misc(ao_net::n3::misc::Misc::Buff(_))
+            | ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(_))
+            | ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(_)))
+        {
+            self.nanos.entry(m.header.target.instance).or_default()
+                .on_message(m.header.target, m.header.target, &m.body, 100);
         }
     }
     fn text(&self, key: &str) -> String {
@@ -105,11 +110,9 @@ impl HudPet {
             gui.remove_children(w, &format!("buffs{i}"));
             gui.set_visible(w, &format!("buffs{i}"), false);
             if let Some(nanos) = self.nanos.get_mut(&pet.instance) {
-                let mut expired = vec![];
                 for buff in &nanos.buffs {
                     let Some(info) = self.db.info(gui, buff.nano) else { continue; };
-                    let remaining = info.total_time() as f32 / 100.0 - (nanos.time - buff.started);
-                    if info.total_time() > 0 && remaining <= 0.0 { expired.push(buff.nano); continue; }
+                    let remaining = buff.remaining_cs(nanos.time);
                     let Some((icon, width, height)) = info.icon else { continue; };
                     let name = format!("buff{i}_{}", buff.nano);
                     // PetView's NanoTemplateInfoListView: icon size 3 (16px), 1..100 cells.
@@ -117,10 +120,9 @@ impl HudPet {
                     if gui.add_view_xml(w, &format!("buffs{i}"), "PetBuff", &xml).is_ok() {
                         gui.set_visible(w, &format!("buffs{i}"), true);
                         gui.set_canvas(w, &name, vec![CanvasItem::Image { id: icon, src: [0.0, 0.0, width as f32, height as f32], dst: [0.0, 0.0, 16.0, 16.0], alpha: 1.0 }]);
-                        gui.set_tooltip(w, &name, &info.name, &super::hud_listview::hms((remaining * 100.0) as i32));
+                        gui.set_tooltip(w, &name, &info.name, &super::hud_listview::hms(remaining));
                     }
                 }
-                nanos.remove_buffs(&expired);
             }
         }
     }

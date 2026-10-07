@@ -375,7 +375,7 @@ mod tests {
         }
         fn frame(&mut self, dt: f32, _size: (u32, u32), _host: &mut Host) -> DrawList {
             self.nano.update(&mut self.gui, &self.zone, dt);
-            self.ncu.update(&mut self.gui, &mut self.zone, dt);
+            self.ncu.update(&mut self.gui, &self.zone, dt);
             self.gui.frame(dt)
         }
     }
@@ -441,7 +441,7 @@ mod tests {
         let mut zone = Zone::new(7);
         // 163449 Shadow Touch (school 5 = Space), 25982 (timed 45000 = 7:30)
         zone.nanos.programs = vec![163449, 25982];
-        zone.nanos.buffs = vec![super::super::own_nanos::Buff { nano: 25982, started: 0.0 }];
+        zone.nanos.buffs = vec![super::super::own_nanos::Buff { nano: 25982, started: 0.0, total_cs: 45000, ncu_cost: 14, ..Default::default() }];
         zone.nanos.serial += 1;
         zone.stats.insert(0xb4, 14);
         zone.stats.insert(0xb5, 40);

@@ -77,7 +77,7 @@ Rows with an empty "client applies" column are ids the client only *sends* (the 
 | `0x57` | StandUp | 0x16 @ 0x1005d72f | **stand up**: FSM `vtable[6](0x29 / 0x2a / 0x25)` for WaitState `0xf` / `0x10` / else |
 | `0x5c` | text cmd (?) | default (ignored) |  |
 | `0x61` |  | 0x17 @ 0x1005d790 |  |
-| `0x62` |  | 0x18 @ 0x1005d7de | live x3: `identity_a` {0xCF1B,0x27E79}, `identity_b.kind` = NPC dynel id; adds an entry in the object at `char+0x1c0` (`FUN_100512af`) [meaning unresolved] |
+| `0x62` | add nano effect | 0x18 @ 0x1005d7de | live x3: `identity_a` = nano {0xCF1B,0x27E79}; `identity_b.kind` = caster instance, `.instance` = duration centiseconds; `FUN_100512af` replaces conflicts then adds |
 | `0x63` |  | 0x19 @ 0x1005d827 | live x15 (NPCs at spawn, `identity_b = {0,503}`): sets flag 0x10 on the stat holder, **stat 0x183 := identity_b.instance**, `FUN_10059ae5(1)` |
 | `0x64` |  | 0x1a @ 0x1005d873 | stores `identity_b.instance` in the object at `char+0x1dc` (`FUN_1003c47c`, the same setter the emote path uses) |
 | `0x66` |  | 0x1b @ 0x1005d258 | recv text `Feedback_TargetIsOutsideRange` |
@@ -135,7 +135,7 @@ Rows with an empty "client applies" column are ids the client only *sends* (the 
 | `0xae` | text cmd clearunique | default (ignored) |  |
 | `0xaf` | RequestChecklist | default (ignored) |  |
 | `0xb0` |  | 0x40 @ 0x1005d213 |  |
-| `0xb1` |  | 0x41 @ 0x1005d7f5 |  |
+| `0xb1` | refresh nano effect | 0x41 @ 0x1005d7f5 | same operands/add routine as 0x62, fourth argument 1 instead of 0; replacement and accounting are identical |
 | `0xb2` |  | 0x42 @ 0x1005e2b4 |  |
 | `0xb3` | FUN_1004256c | default (ignored) |  |
 | `0xb4` |  | 0x43 @ 0x1005e49b |  |
@@ -457,3 +457,12 @@ Rows without a note are UI / GlobalSignals plumbing of another feature (team, co
 | `0xfc` | 0x1005e7b3 | UI / GlobalSignals plumbing | not driven, not fight state |
 | `0x105` | 0x1005ed1a | Inspect rejected text | chat (Inspect) |
 | `0x106` | 0x1005ed04 | duel | **wired** duel.rs |
+
+Nano lifecycle detail (`100512af`, `1004fc8d`, `1004e488`, `1005195a`): runtime start is integer GameTime seconds ×100;
+duration is scaled by own stat464 percent. Conflict comparison first rejects an existing stat551 greater than incoming551.
+Families are stats75,546..550: when both sums of546..550 are zero, compare75 (including zero); otherwise any nonzero
+incoming family matching any existing family conflicts. Login `SimpleCharFullUpdate.effects` (`10051b40`,
+`10051741`) uses `source` as nano identity, ignores `a`, restores totalcs=`b`, remainingcs=`c`,
+startcs=`nowcs-b+c`, and disables replacement. Actual `zone_ithaca.rec` evidence has three action62/BuffIIR removal
+pairs at 23825/23920, 29898,74495 ms; no captured b1 or nonempty login list, so those regressions are synthetic.
+

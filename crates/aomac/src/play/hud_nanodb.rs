@@ -54,7 +54,7 @@ impl NanoInfo {
         self.stat(stat::SCHOOL).filter(|s| (1..=5).contains(s)).map(|s| (s - 1) as usize)
     }
 
-    /// `FUN_10085fd4`: the effect's total time in 1/100 s (the float at `+0xb0` of the dynel is a runtime value of a casting nano; a program in the list has none).
+    /// Template `TimeExist`, used by Programs; active effects use the lifecycle's server-provided runtime duration.
     pub fn total_time(&self) -> i32 {
         self.stat(stat::TIME_EXIST).unwrap_or(0).max(0)
     }
