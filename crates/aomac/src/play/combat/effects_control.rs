@@ -275,9 +275,11 @@ mod tests {
             assert_eq!(renderer.templates.by_id[&id].float(8).unwrap(),1.5);
         }
         let identity=(50000,1);
-        let handle=renderer.spawn_configured(Binding {group:0,attractor:0,effect:1070,note:0,color:0},Mat4::IDENTITY,Vec3::ZERO,EffectConfig {source_identity:Some(identity),source_appearance:Some([1,1,0,100]),..EffectConfig::default()}).unwrap();
+        let origin=Vec3::new(930.0051,24.21451,-759.66864);
+        let handle=renderer.spawn_configured(Binding {group:0,attractor:0,effect:1070,note:0,color:0},Mat4::from_translation(origin),origin,EffectConfig {source_identity:Some(identity),source_appearance:Some([1,2,1,100]),..EffectConfig::default()}).unwrap();
         renderer.elapsed=6.0;
         let mut host=ao_render::Host::headless();
+        host.camera=ao_render::Camera::look_at(origin+Vec3::new(2.0,3.0,4.0),origin+Vec3::Y);
         renderer.frame(0.0,&mut host,None);
         let children:Vec<_>=renderer.active.iter().filter(|a|matches!(a.effect,20091|20096)).map(|a|a.actor).collect();
         assert_eq!(children.len(),2);
@@ -287,10 +289,13 @@ mod tests {
         assert!(children.iter().all(|handle|renderer.active.iter().any(|a|a.actor==*handle)));
         renderer.terminate_gracefully(handle);
         assert!(children.iter().all(|handle|renderer.active.iter().any(|a|a.actor==*handle)));
+        let mut visible=false;
         for _ in 0..120 {
             host.actors.clear();
             renderer.frame(1.0/60.0,&mut host,None);
+            visible|=host.actors.iter().any(|a|a.skin.as_ref().is_some_and(|vertices|vertices.iter().any(|v|v.color[3]>0.0)));
         }
+        assert!(visible,"an emitted Body Boost pulse must submit nontransparent geometry before orbit expiry");
         assert!(renderer.active.is_empty(),"orbit expiry must delete the owned flare and cord, not leave a twenty-second flare");
         assert!(host.actors.is_empty(),"expired pulse must no longer submit visual actors");
         for _ in 0..360 {
