@@ -359,6 +359,24 @@ impl Runtime {
         self.eval = 1.0; // evaluate immediately
     }
 
+    /// Leave the game sound lifecycle without changing the user's volume or combat preferences.
+    pub fn reset(&mut self, sh: &Shared) {
+        self.music.reset();
+        self.combat.reset();
+        self.pf = None;
+        self.eval = 1.0;
+        self.ambient.clear();
+        self.emitters.clear();
+        self.want = None;
+        self.dying.clear();
+        self.keepalive.clear();
+        self.effect_delays.clear();
+        self.effect_children.clear();
+        self.weather = [0.0; 7];
+        self.land_control = false;
+        sh.mixer().stop_all();
+    }
+
     fn stop_ambience(&mut self, sh: &Shared, fade: f32) {
         let mut m = sh.mixer();
         for (_, a) in self.ambient.drain() {
@@ -742,6 +760,33 @@ mod tests {
         let lib = Library::load(&sh.root).unwrap();
         let rt = Runtime::new(&sh, lib, 1);
         (sh, rt)
+    }
+
+    #[test]
+    fn reset_clears_world_commands_but_keeps_sound_preferences() {
+        let Some(dir) = client() else { return };
+        let (sh, mut rt) = runtime(&dir);
+        rt.combat.set_pref(2);
+        rt.combat.set_override(Some("EP_01\\Battle_new"));
+        rt.combat.combat_update(&crate::combat::CombatSample { is_self: true, health_pct: 0, ..Default::default() });
+        rt.combat.update(0.1);
+        assert_ne!(rt.combat.state(), 0);
+        rt.weather = [1.0; 7];
+        rt.land_control = true;
+        rt.want = Some(37);
+        rt.dying.push((10.0, 1, 4.0));
+        rt.keepalive.insert(1, (1, 10.0, 1.0, 4.0));
+        rt.effect_children.insert(1, (3, true));
+        rt.effect_delays.push_back((10.0, EffectSound { id: 1, pos: [0.0; 3], velocity: [0.0; 3], parameters: [1.0, 0.0, 0.0, 0.0], probability: 100 }));
+        rt.reset(&sh);
+        assert_eq!(rt.combat.state(), 0);
+        assert_eq!(rt.combat.pref(), 2);
+        assert_eq!(rt.combat.override_name(), Some("EP_01\\Battle_new"));
+        assert_eq!(rt.weather, [0.0; 7]);
+        assert!(!rt.land_control && rt.want.is_none() && rt.pf.is_none());
+        assert!(rt.dying.is_empty() && rt.keepalive.is_empty() && rt.effect_delays.is_empty() && rt.effect_children.is_empty());
+        rt.update(&sh, 30.0, [0.0; 3], 3240.0);
+        assert!(rt.music.layer().is_none());
     }
 
     /// `AllocateChannel` with every handle busy and nothing stealable returns NULL; the emitter's next frame asks again

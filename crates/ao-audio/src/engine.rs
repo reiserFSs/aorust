@@ -272,6 +272,16 @@ impl Audio {
         }
     }
 
+    /// `StopAllSounds` (SI 0x10007446) + `StopMusic` (0x1000221e): hard lifecycle stop, not a layer fade.
+    /// Login itself does not request a music layer; the device and user preferences remain available.
+    pub fn reset(&self) {
+        if let Some(rt) = self.rt().as_mut() {
+            rt.reset(&self.sh);
+        } else {
+            self.sh.mixer().stop_all();
+        }
+    }
+
     /// Per frame: `cam` = camera = listener position (scene space), `day_time` = the viewer clock (0..6480 s).
     pub fn update(&self, dt: f32, cam: [f32; 3], day_time: f32) {
         if let Some(rt) = self.rt().as_mut() {
@@ -329,7 +339,7 @@ impl Audio {
         true
     }
 
-    /// Login/startup music (`SandyInterface_t::PlayStartupMusic` = layer `mountain\night`).
+    /// Character-login startup music (`SandyInterface_t::PlayStartupMusic` = layer `mountain\night`).
     pub fn play_startup_music(&self) {
         self.set_music_layer(Some("mountain\\night"));
     }
@@ -475,5 +485,27 @@ mod tests {
         assert!(audio.play_game_sound_with(0x94bb7805, [1.0, 0.0, 0.0], listener, 0, 1).is_empty());
         assert!(audio.play_game_sound_duration(0x35a9ce7d, [1.0, 0.0, 0.0], listener, 0.2, 1.0).is_empty());
         assert!(!audio.play_game_sound_duration(0x35a9ce7d, [0.0; 3], listener, 0.2, 1.0).is_empty());
+    }
+
+    #[test]
+    fn mission_completion_sounds_reach_the_mixer_for_a_world_listener() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/sound/SourceFiles/SM_Sandy_Game_Dummy.sbf").exists() { return; }
+        let audio = Audio::offline(&dir, 44100);
+        for (name, id) in [
+            ("SM_Sandy_Gui_Mission_Complete", 0x76a54fdc),
+            ("SM_Sandy_Gui_Mission_Complete_Clan", 0x3714f9bd),
+            ("SM_Sandy_Gui_Mission_Complete_Omni", 0x3012f932),
+            ("SM_Sandy_Gui_Mission_Complete_Neutral", 0x2d601cf1),
+        ] {
+            assert_eq!(crate::sbf::sound_id(name), id);
+            audio.reset();
+            assert!(!audio.play_game_sound_with(id, [0.0; 3], [1234.0, 56.0, -789.0], 0, 1).is_empty(), "{name}");
+            let mut samples = vec![0.0; 44100 * 2];
+            audio.render(&mut samples);
+            let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+            assert!(rms > 0.0, "{name}: no audible mixer output");
+        }
     }
 }

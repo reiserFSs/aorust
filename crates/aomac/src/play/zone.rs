@@ -593,6 +593,20 @@ impl Zone {
                 self.own_events.push(OwnEvent::Appearance(a));
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                // GC 1005efdf[action - 1]: 0x3b -> case 0xf, 0x3c -> case 0x10.
+                // Both remove identity_b; only completion plays the own character's side sound.
+                if matches!(a.action, 0x3b | 0x3c) {
+                    self.quests.remove(&a.identity_b);
+                    if a.action == 0x3b {
+                        let sound = match self.stats.get(&ao_formats::stats::SIDE).copied().unwrap_or(0) {
+                            0 => 0x2d601cf1, // SM_Sandy_Gui_Mission_Complete_Neutral
+                            1 => 0x3714f9bd, // SM_Sandy_Gui_Mission_Complete_Clan
+                            2 => 0x3012f932, // SM_Sandy_Gui_Mission_Complete_Omni
+                            _ => 0x76a54fdc, // SM_Sandy_Gui_Mission_Complete
+                        };
+                        self.world.sound_id_at_position(sound, [0.0; 3]);
+                    }
+                }
                 if a.action == 0x14 {
                     self.recharge_feed.push((a.identity_b.kind, a.identity_b.instance));
                 }
@@ -786,6 +800,41 @@ pub fn scene_yaw(server_yaw: f32) -> f32 {
 mod tests {
     use super::*;
     use ao_net::frame::Frame;
+    #[test]
+    fn mission_completion_queues_side_sound_only_for_own_character() {
+        use ao_net::n3::{action, outgoing::n3_frame, quest::Quest};
+        let quest = Identity { kind: 0xdac3, instance: 123 };
+        for (name, id) in [
+            ("SM_Sandy_Gui_Mission_Complete", 0x76a54fdc),
+            ("SM_Sandy_Gui_Mission_Complete_Clan", 0x3714f9bd),
+            ("SM_Sandy_Gui_Mission_Complete_Omni", 0x3012f932),
+            ("SM_Sandy_Gui_Mission_Complete_Neutral", 0x2d601cf1),
+        ] {
+            assert_eq!(ao_audio::sbf::sound_id(name), id);
+        }
+        for (side, expected) in [(0, 0x2d601cf1), (1, 0x3714f9bd), (2, 0x3012f932), (3, 0x76a54fdc), (-1, 0x76a54fdc)] {
+            let mut zone = Zone::new(7);
+            zone.stats.insert(ao_formats::stats::SIDE, side);
+            zone.quests.insert(quest, Quest { id: quest, ..Default::default() });
+            let completion = action::simple(0x3b, Identity::default(), quest);
+            zone.on_frame(&n3_frame(1, 0, action::character_action(8, &completion)));
+            assert!(zone.quests.contains_key(&quest));
+            assert!(zone.world.take_sounds().is_empty());
+            zone.on_frame(&n3_frame(2, 0, action::character_action(7, &completion)));
+            assert!(!zone.quests.contains_key(&quest));
+            let sounds = zone.world.take_sounds();
+            assert_eq!(sounds, [super::super::dynels_doors::GameSound::at(expected, [0.0; 3])]);
+            assert!(zone.world.take_sounds().is_empty());
+            // Retail plays even if the quest was absent from the local list.
+            zone.on_frame(&n3_frame(3, 0, action::character_action(7, &completion)));
+            assert_eq!(zone.world.take_sounds(), sounds);
+            zone.quests.insert(quest, Quest { id: quest, ..Default::default() });
+            zone.on_frame(&n3_frame(4, 0, action::character_action(7, &action::simple(0x3c, Identity::default(), quest))));
+            assert!(!zone.quests.contains_key(&quest));
+            assert!(zone.world.take_sounds().is_empty());
+        }
+    }
+
 
     fn frames(rec: &str) -> Vec<Frame> {
         rec.lines()

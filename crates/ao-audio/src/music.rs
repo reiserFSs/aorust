@@ -120,6 +120,19 @@ impl MusicPlayer {
         }
     }
 
+    /// Immediately closes all streams and forgets pending transitions and pause-track resumes.
+    pub(crate) fn reset(&mut self) {
+        self.stop_streams();
+        self.layer = None;
+        self.state = State::Idle;
+        self.played = 0.0;
+        self.node = 0;
+        self.pause_layer = None;
+        self.resume = None;
+        self.weights.clear();
+        self.now_playing = None;
+    }
+
     /// Opens a stream voice and remembers it (id 0 when all three Miles stream handles are in use, `AIL_open_stream` = 0).
     fn open_stream(&mut self, path: &Path, gain: f32, fade_in: f32) -> u64 {
         let id = self.sh.play_stream(path, gain, fade_in);
@@ -463,6 +476,25 @@ mod tests {
             mp.tick(0.01);
             sh.mixer().render(&mut buf);
         }
+    }
+
+    #[test]
+    fn reset_closes_streams_and_cancels_pause_resume() {
+        let (mut mp, sh) = player("logout");
+        mp.signal(Some(0));
+        let voices = mp.streams.clone();
+        assert!(!voices.is_empty());
+        mp.resume = Some(1);
+        mp.state = State::Paused { left: 0.1 };
+        mp.reset();
+        assert!(voices.iter().all(|&id| !sh.mixer().is_playing(id)));
+        assert!(mp.streams.is_empty() && mp.resume.is_none() && mp.pause_layer.is_none());
+        run(&mut mp, &sh, 40.0);
+        assert!(mp.layer().is_none() && mp.now_playing.is_none());
+        mp.signal(Some(0));
+        assert!(mp.now_playing.is_some(), "the same layer can start in the next session");
+        mp.reset();
+        let _ = std::fs::remove_dir_all(&sh.root);
     }
 
     /// `FUN_10008d2e` is cached per sample/request: a pending request is not searched again every frame (which bumped the

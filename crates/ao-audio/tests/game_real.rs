@@ -41,6 +41,30 @@ fn newland_city_music_and_ambience() {
 }
 
 #[test]
+fn world_audio_reset_stays_silent_until_character_login() {
+    let Some(dir) = client() else { return };
+    let store = RecordStore::open(&dir).unwrap();
+    let (scene, report) = load_playfield_report(&store, &dir, 566).unwrap();
+    let a = Audio::offline(&dir, 44100);
+    a.set_playfield(Some(PlayfieldAudio::load(&store, 566, &report.sounds).unwrap()));
+    let cam = scene.spawn.unwrap();
+    run(&a, 2.0, cam, 3240.0);
+    assert!(a.now_playing().is_some());
+    assert!(!a.play_ui("SM_Sandy_CC_GUI_Select").is_empty());
+    a.play_ui_keepalive("SM_Sandy_CC_Ambience");
+    a.play_effect_sound(0x35a9ce7d, [0.0; 3], [0.0; 3], cam, [1.0, 0.0, 0.2, 1.0], 100).unwrap();
+    a.reset();
+    assert!(a.music_layer().is_none() && a.now_playing().is_none());
+    assert_eq!(a.active_emitters(), 0);
+    let (rms, playing) = run(&a, 30.0, cam, 3240.0);
+    assert_eq!(rms, 0.0, "login frames cannot revive world audio or delayed effects");
+    assert!(playing.is_none());
+    a.play_startup_music();
+    assert_eq!(a.music_layer().as_deref(), Some("mountain\\night"));
+    assert!(a.now_playing().is_some());
+}
+
+#[test]
 fn ui_sounds_play() {
     let Some(dir) = client() else { return };
     let a = Audio::offline(&dir, 44100);

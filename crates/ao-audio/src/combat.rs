@@ -152,6 +152,13 @@ impl CombatMusic {
         }
     }
 
+    /// A new session keeps the user's configuration, not the old character's combat snapshot.
+    pub(crate) fn reset(&mut self) {
+        let override_name = self.override_name.take();
+        *self = Self::new(self.pref);
+        self.override_name = override_name;
+    }
+
     /// `SetStaticBattleMusicMode(int)` @0x100019fc (GUI `SlotPrefBattlemusicModeChanged`).
     pub fn set_pref(&mut self, pref: i32) {
         self.pref = pref;

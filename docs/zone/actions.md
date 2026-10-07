@@ -37,6 +37,17 @@ Class `SocialActionCmd_t` (vftable GC 0x10155f0c, registered by `FUN_1000e5f2`, 
 `if (action - 1 > 0x105) default; case = byte[0x1005efdf + action - 1]` (**106 ids** have a case, everything else -> case 0x66 = ignored); jump table at [GC 0x1005ee43]. Both tables are in
 `action::RECEIVED` `(id, case, handler address)`. The senders are `action::SENT`. The enum has no symbols; names below are the sender function names, or the feedback key a handler prints.
 Rows with an empty "client applies" column are ids the client only *sends* (the server consumes them).
+Mission sound evidence: table bytes **`1005f019 = 0f`, `1005f01a = 10`** (the table indexes `action - 1`, not the decompiler's case number). At `1005d522` the completion branch pushes reason **2** and `identity_b` (`[EBP+0x14]`) into `FUN_1005668b` via quest manager `FUN_10058778`; the adjacent `1005d65c` branch pushes reason **1** and has no audio call. Completion then checks character byte `+0x140` (own character), reads stat **33 / Side** through stat vtable `+0x3c` (`1005d548..1005d552`), and calls `FUN_1001117d` (`1005d650`) with zero position and velocity. This sound is independent of whether the quest was present locally. `FUN_100571ab` initializes `DAT_102e30c0/c4/c8/cc` from Sandy names:
+
+| Side | Name | Sandy/SBF ID |
+|---|---|---|
+| other | `SM_Sandy_Gui_Mission_Complete` | `0x76a54fdc` |
+| 1 | `SM_Sandy_Gui_Mission_Complete_Clan` | `0x3714f9bd` |
+| 2 | `SM_Sandy_Gui_Mission_Complete_Omni` | `0x3012f932` |
+| 0 | `SM_Sandy_Gui_Mission_Complete_Neutral` | `0x2d601cf1` |
+
+IDs use the existing `ao_audio::sbf::sound_id` (`CreateSoundID`, SandyInterface `10005ad2` → `10008213`). `Zone::on_frame` handles the decoded own-character action directly and queues through `Dynels::sound_id_at_position`; the existing `take_sounds` → `flow.rs` → `play_game_sound_with` consumer plays it, with no chat-text matching. Regression `mission_completion_queues_side_sound_only_for_own_character` covers own/other targets, all side IDs including unknown sides, absent local quest, one-shot queue drain, and silent `0x3c` removal. No mission capture was used for this synthetic wire regression.
+
 
 | id | client sends (sender) | client applies (case @ handler) | notes |
 |---|---|---|---|
@@ -62,8 +73,8 @@ Rows with an empty "client applies" column are ids the client only *sends* (the 
 | `0x35` | JoinItems | 0xe @ 0x1005d50e |  |
 | `0x36` | HideAgainstOpponent | default (ignored) |  |
 | `0x39` | UseItem | default (ignored) |  |
-| `0x3b` |  | 0xf @ 0x1005d522 |  |
-| `0x3c` |  | 0x10 @ 0x1005d65c |  |
+| `0x3b` |  | 0xf @ 0x1005d522 | mission completion: remove `identity_b`, own-character side-specific Sandy sound (below) |
+| `0x3c` |  | 0x10 @ 0x1005d65c | mission expiry/removal: `identity_b`, no completion sound |
 | `0x41` | RemoveBuff | default (ignored) |  |
 | `0x42` | FUN_1003fa2c | default (ignored) |  |
 | `0x46` | UseSkill | default (ignored) |  |

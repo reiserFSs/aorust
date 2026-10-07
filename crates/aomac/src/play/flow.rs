@@ -132,6 +132,16 @@ impl Play {
         self.close_all();
         self.conn_gen += 1; // a connect still in flight is stale now (Bg::Connected is dropped)
         self.session = None; // dropping the session closes the connection (ResetConnectionAndConfig)
+        self.world_audio = None;
+        if let Some(audio) = &self.audio {
+            if std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
+                let before = audio.music_layer();
+                audio.reset();
+                eprintln!("audio login reset layer={before:?}->{:?} {}", audio.music_layer(), audio.status());
+            } else {
+                audio.reset();
+            }
+        }
         self.hud_pending.clear();
         if let Some(h) = self.hud.take() {
             h.close(&mut self.gui); // leaving the world
@@ -1196,6 +1206,10 @@ impl Frontend for Play {
             }
         }
         if self.screen == Screen::InWorld {
+            // Complete camp before world updates can emit more sounds into the login lifecycle.
+            self.camp_frame(dt, host);
+        }
+        if self.screen == Screen::InWorld {
             if self.player.as_ref().is_some_and(|p| p.serial() != self.zone.own_serial) {
                 // the server placed the own character again (teleport within the playfield)
                 self.player = player::Player::new(&self.dir, &self.zone, self.zone.playfield.unwrap_or(0));
@@ -1272,7 +1286,6 @@ impl Frontend for Play {
                     },
                 ));
             }
-            self.camp_frame(dt, host);
             let mut collision = self.player.as_ref().and_then(|p| p.effect_surface())
                 .map(|surface| move |p| super::player::effect_collision(&surface.borrow(), p));
             let query = collision.as_mut().map(|query| query as &mut dyn FnMut(ao_render::Vec3) -> Option<(ao_render::Vec3, ao_render::Vec3)>);

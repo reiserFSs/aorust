@@ -629,10 +629,22 @@ fn leaving_the_world_closes_chat_and_interact() {
         r.p.frame(0.016, (1280, 800), &mut r.host);
     }
     assert!(r.p.chat.is_some() && r.p.interact.is_some() && r.p.gui.window_ids().len() > 3);
+    r.p.audio = Some(ao_audio::Audio::offline(&r.p.dir, 44100));
+    let audio = r.p.audio.as_ref().unwrap();
+    audio.play_startup_music();
+    assert!(audio.now_playing().is_some());
     r.host.live_sky = None; // The viewer drains the world's live-sky request.
-    r.p.show_login(&mut r.host);
+    r.p.camp = Some(30.0); // CAMP_SECONDS, the retail countdown
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert!(r.p.screen == Screen::Login);
     assert!(matches!(r.host.live_sky, Some(None)), "returning to login stops the world's live sky");
     assert!(r.p.chat.is_none() && r.p.interact.is_none() && r.p.hud.is_none());
+    let audio = r.p.audio.as_ref().unwrap();
+    assert!(audio.music_layer().is_none() && audio.now_playing().is_none());
+    audio.update(30.0, [0.0; 3], 3240.0);
+    let mut samples = vec![0.0; 4410 * 2];
+    audio.render(&mut samples);
+    assert!(samples.iter().all(|&sample| sample == 0.0), "login has no surviving world audio");
     let left: Vec<_> = r.p.gui.window_ids().into_iter().map(|w| (w, r.p.gui.view_names(w))).collect();
     assert_eq!(r.p.gui.window_ids(), vec![r.p.login_w.unwrap()], "only the login window is left: {left:?}");
 }
