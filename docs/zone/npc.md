@@ -55,6 +55,13 @@ The reported **288560** is absent from installed `rdb_1040023`; an all-56-table 
 not a usable visual fallback. None of the retained captures includes MonsterData 288560, so its live breed/head/texture
 fields must be captured before claiming which humanoid model, or unchanged non-humanoid visual, retail selects.
 
+A subsequent FxFrames Borealis NPC probe (`AOMAC_NET_TRACE`, 2026-10-07) captured **302** frames, **255** incoming,
+including **30** SimpleCharFullUpdate messages. No packet contained MonsterData/instance/raw big-endian value 288560.
+MonsterData counts were `0:1, 17655:5, 17687:4, 17708:1, 22794:6, 30365:2, 154136:11` [DATA].
+Therefore the real reported entity's branch and rendering remain **unverified**, not a live PASS. The runnable
+`missing_monster_data_builds_humanoid_with_named_clips` regression uses real absent id 288560 with an explicit humanoid
+look; it verifies model/clip resolution and missing corpse-animation handling, not the absent live creature's appearance.
+
 
 ## 2. Record layout (`FUN_1004d919`, all little-endian `i32`; verified by 1360/1360 real records)
 
