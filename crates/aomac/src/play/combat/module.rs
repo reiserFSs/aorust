@@ -6,7 +6,7 @@
 
 use super::actions::{Actions, Event as ActionEvent};
 use super::anim::{plays_hit_sound, special_swing, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM, WIELD_GESTURE};
-use super::arms::ACTION_UNWIELD;
+use super::arms::{ACTION_UNWIELD, ACTION_WIELD};
 use super::log::{floating_number, FloatingNumber, Space, HUD_X, HUD_X_JITTER};
 use super::state::{Combat, CombatEvent, ACTION_PLAY_ANIM, FIGHT_IDLE};
 use crate::play::zone::{DynelState, Zone};
@@ -77,6 +77,8 @@ pub struct Module {
     pose_events: Vec<ActionEvent>,
     /// Duel / pet-duel reactions of the last received frames ([`Module::take_duel`]).
     duel: Vec<super::duel::Event>,
+    equipment_sounds: Vec<(i32, Vec<u32>)>,
+    equipment_actions: Vec<i32>,
 }
 
 /// `Feedback_*` texts of the server's attack refusal (`CharacterAction` 0x76, `FUN_1005d0d8` case 0x23 @ 0x1005d92b): the jump table at
@@ -141,6 +143,8 @@ impl Module {
             events: Vec::new(),
             pose_events: Vec::new(),
             duel: Vec::new(),
+            equipment_sounds: Vec::new(),
+            equipment_actions: Vec::new(),
         }
     }
 
@@ -194,6 +198,29 @@ impl Module {
         std::mem::take(&mut self.anims)
     }
 
+    /// Equipment sound candidates at the wielder; the consumer selects with the shared retail CRT random stream.
+    pub fn take_equipment_sounds(&mut self) -> Vec<(i32, Vec<u32>)> {
+        std::mem::take(&mut self.equipment_sounds)
+    }
+
+    /// Resolved explicit equipment broadcasts, independent of whether their record has a sound.
+    pub fn take_equipment_actions(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.equipment_actions)
+    }
+
+    fn equipment_sound(&mut self, who: i32, item: i32, slot: Option<i32>, key: u32) {
+        let item = if let Some(slot) = slot {
+            self.combat.arms.slot_item(who, slot)
+        } else {
+            self.combat.arms.weapon_item(item)
+        };
+        let values = item.and_then(|item| item.sounds.iter().find(|entry| entry.0 == key)).map(|entry| entry.1.as_slice()).unwrap_or_default();
+        if values.is_empty() {
+            return;
+        }
+        self.equipment_sounds.push((who, values.to_vec()));
+    }
+
     /// The own character is dead (`CharacterAction` 99 seen, not resurrected yet): the live harness ends a `goto` with it.
     #[cfg(test)]
     pub fn is_dying(&self) -> bool {
@@ -219,7 +246,17 @@ impl Module {
 
     /// One received frame (call before `Zone::on_frame` so the zone's stats are still the old ones, like the chat log).
     pub fn on_frame(&mut self, f: &Frame) {
-        if let Ok(m) = ao_net::n3::decode(f) {
+        let message = ao_net::n3::decode(f).ok();
+        if let Some(m) = &message {
+            if let ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::WeaponItemFullUpdate(w)) = &m.body {
+                if w.parent.kind == DYNEL_CHAR && matches!(w.byte_71, 6 | 8 | 0x3d | 0x3f) {
+                    if let Some((holder, slot, item)) = self.combat.arms.worn_item(m.header.target.instance) {
+                        if matches!(item.item_class, 1 | 14) {
+                            self.equipment_sound(holder, 0, Some(slot), 9);
+                        }
+                    }
+                }
+            }
             if let ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(a)) = &m.body {
                 if m.header.target.instance == self.own {
                     match a.action {
@@ -249,12 +286,32 @@ impl Module {
                 if a.action == ACTION_PLAY_ANIM && m.header.target.kind == DYNEL_CHAR && a.identity_b.instance > 0 {
                     self.anims.push((m.header.target.instance, a.identity_b.instance as u16));
                 }
-                // `FUN_1006a857` (action 0x61): after the unwield `FUN_10081e74(char, 3)` plays the wield gesture 0x6d once; a fight (`+0x44` != 1) then runs
-                // the idle update `FUN_1006a772` -> `FUN_1003cad0`, which starts the idle clip over it in the same frame (docs/zone/combat-anim.md §4)
-                if a.action == ACTION_UNWIELD && m.header.target.kind == DYNEL_CHAR {
+                if m.header.target.kind == DYNEL_CHAR {
                     let who = m.header.target.instance;
-                    if self.combat.arms.slot_item(who, a.identity_b.instance).is_some() && !self.combat.is_fighting(who) {
-                        self.anims.push((who, WIELD_GESTURE));
+                    if a.action == ACTION_UNWIELD && a.identity_b.instance != 0
+                        && self.combat.arms.slot_item(who, a.identity_b.instance).is_some_and(|item| item.wielded)
+                    {
+                        // Resolve before Combat/Armory empties the slot.
+                        self.equipment_sound(who, 0, Some(a.identity_b.instance), 9);
+                        self.equipment_actions.push(who);
+                        if !self.combat.is_fighting(who) {
+                            self.anims.push((who, WIELD_GESTURE));
+                        }
+                    } else if a.action == ACTION_WIELD && a.identity_a.kind == 0xc74a
+                        && self.combat.arms.weapon_item(a.identity_a.instance).is_some()
+                    {
+                        // +a4 unwields an already attached weapon first, then plays key 8.
+                        if let Some((holder, slot, _)) = self.combat.arms.worn_item(a.identity_a.instance) {
+                            self.equipment_sound(holder, 0, Some(slot), 9);
+                        }
+                        self.equipment_sound(who, a.identity_a.instance, None, 8);
+                        self.equipment_actions.push(who);
+                        // A bag-slot attach returns before replacing this gesture with a stance.
+                        if a.identity_b.instance >= 0x30 && !self.combat.is_fighting(who)
+                            && self.anims.last() != Some(&(who, WIELD_GESTURE))
+                        {
+                            self.anims.push((who, WIELD_GESTURE));
+                        }
                     }
                 }
             }
@@ -285,6 +342,16 @@ impl Module {
                 _ => {}
             }
             self.events.push(e);
+        }
+        if let Some(m) = &message {
+            if let ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::WeaponItemFullUpdate(w)) = &m.body {
+                let slot = i32::from(w.byte_71);
+                if w.parent.kind == DYNEL_CHAR && matches!(slot, 6 | 8 | 0x3d | 0x3f)
+                    && self.combat.arms.weapon_item(m.header.target.instance).is_some_and(|item| matches!(item.item_class, 1 | 14))
+                {
+                    self.equipment_sound(w.parent.instance, m.header.target.instance, None, 8);
+                }
+            }
         }
         self.pose_events.extend(self.actions.on_frame(f));
     }
@@ -683,6 +750,70 @@ mod tests {
         assert!(m.is_fighting(own));
         unwield(&mut m);
         assert!(m.take_anims().is_empty(), "in a fight the idle update replaces the gesture");
+    }
+
+    #[test]
+    fn rifle_capture_replication_and_confirmed_equipment_are_distinct() {
+        let own = 0x82e8;
+        let dir = std::env::var_os("HOME").map(std::path::PathBuf::from).map(|h| h.join("Games/ProjectRubiKa/client"));
+        for actor in [own, 0x12345] {
+            let mut module = Module::with_texts(Box::new(Fixed::new()), own);
+            module.combat.arms = dir.as_deref().filter(|d| d.join("cd_image/rdb.db").exists()).map_or_else(super::super::arms::Armory::default, super::super::arms::Armory::open);
+            let mut updates = 0;
+            for line in include_str!("../../../../../docs/captures/zone_wear_rifle_borealis.rec").lines() {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields[1] != "<" { continue; }
+                let hex = fields[2];
+                let bytes: Vec<_> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+                let (mut frame, _) = Frame::decode_with(&bytes, false).unwrap().unwrap();
+                if matches!(n3::decode(&frame).unwrap().body, N3::Dynel(ao_net::n3::dynel::Dynel::WeaponItemFullUpdate(_))) {
+                    // WeaponFullUpdate body: version at 13, parent kind at 17, parent instance at 21.
+                    frame.payload[21..25].copy_from_slice(&(actor as i32).to_be_bytes());
+                    updates += 1;
+                }
+                let message = n3::decode(&frame).unwrap();
+                let mut expected_sounds = Vec::new();
+                if let N3::Dynel(ao_net::n3::dynel::Dynel::WeaponItemFullUpdate(w)) = &message.body {
+                    if w.byte_71 == 6 {
+                        if let Some((holder, _, item)) = module.combat.arms.worn_item(message.header.target.instance) {
+                            if let Some((_, values)) = item.sounds.iter().find(|entry| entry.0 == 9 && !entry.1.is_empty()) {
+                                expected_sounds.push((holder, values.clone()));
+                            }
+                        }
+                    }
+                }
+                module.on_frame(&frame);
+                assert!(module.take_anims().is_empty(), "replication/appearance is not a wield gesture");
+                assert!(module.take_equipment_actions().is_empty(), "the saved capture has no 0x61/0x83 broadcasts");
+                let sounds = module.take_equipment_sounds();
+                if let N3::Dynel(ao_net::n3::dynel::Dynel::WeaponItemFullUpdate(w)) = message.body {
+                    let expected = module.combat.arms.weapon_item(message.header.target.instance).unwrap().sounds.iter().find(|entry| entry.0 == 8).filter(|entry| !entry.1.is_empty()).map(|entry| entry.1.clone());
+                    if w.byte_71 == 6 {
+                        if let Some(sound) = expected { expected_sounds.push((actor as i32, sound)); }
+                        assert_eq!(sounds, expected_sounds);
+                    } else {
+                        assert!(sounds.is_empty(), "bag replication does not attach");
+                    }
+                } else {
+                    assert!(sounds.is_empty(), "appearance must not replay equipment sound");
+                }
+            }
+            assert_eq!(updates, 3);
+            let wield = n3_frame(0, actor, action::character_action(actor as i32, &simple(ACTION_WIELD, Identity { kind: 0xc74a, instance: 0xd4d810 }, Identity { kind: 0, instance: 6 })));
+            module.on_frame(&wield);
+            assert_eq!(module.take_equipment_actions(), [actor as i32]);
+            assert!(module.take_anims().is_empty(), "hand attach replaces the gesture with stance");
+            module.take_equipment_sounds();
+            let unwield = n3_frame(0, actor, action::character_action(actor as i32, &simple(ACTION_UNWIELD, Identity::default(), Identity { kind: 0, instance: 6 })));
+            module.on_frame(&unwield);
+            assert_eq!(module.take_equipment_actions(), [actor as i32]);
+            assert_eq!(module.take_anims(), [(actor as i32, WIELD_GESTURE)]);
+            module.take_equipment_sounds();
+            module.on_frame(&unwield);
+            assert!(module.take_equipment_actions().is_empty());
+            assert!(module.take_anims().is_empty());
+            assert!(module.take_equipment_sounds().is_empty(), "an empty slot cannot unwear twice");
+        }
     }
 
     #[test]

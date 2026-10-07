@@ -230,9 +230,9 @@ struct Play {
     player: Option<player::Player>,
     /// Combat / action layer of the zone connection (`combat/module.rs`).
     fight: Option<combat::module::Module>,
-    /// Own attack notes and SpecialAttack results actually processed (live harness only).
+    /// Processed own events: attack note, SpecialAttack, equipment, item use, level (live harness only).
     #[cfg(test)]
-    live_attack_events: [u64; 2],
+    live_attack_events: [u64; 5],
     /// Seconds since a successful `N3Msg_StartCamping` (the logout countdown, `hud_use.rs`).
     camp: Option<f32>,
     /// The "Logout" timer bar of the camp countdown (`FlowControlModule_t::m_pcCampTimer`, `hud_use.rs`).
@@ -331,7 +331,7 @@ impl Play {
             player: None,
             fight: None,
             #[cfg(test)]
-            live_attack_events: [0; 2],
+            live_attack_events: [0; 5],
             camp: None,
             camp_bar: None,
             logout: Default::default(),

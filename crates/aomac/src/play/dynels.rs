@@ -1065,6 +1065,23 @@ impl Dynels {
         self.sounds.push(GameSound::at(ao_audio::sbf::sound_id(name), pos));
     }
 
+    /// An authored Sandy sound ID at the character, shared by confirmed item actions.
+    pub fn sound_id_at(&mut self, id: i32, sound: u32) {
+        if let Some(pos) = self.char_pos(id) {
+            self.sounds.push(GameSound::at(sound, pos));
+        }
+    }
+
+    /// Select an authored sound variant with the same CRT stream as other character sounds.
+    pub fn sound_variants_at(&mut self, id: i32, sounds: &[u32]) {
+        let sound = match sounds.len() {
+            0 => return,
+            1 => sounds[0],
+            n => sounds[self.rng.rand() as usize % n],
+        };
+        self.sound_id_at(id, sound);
+    }
+
     /// Where a character's sounds play: the camera for the own character (the avatar is not a dynel model here), else its position.
     fn char_pos(&self, id: i32) -> Option<[f32; 3]> {
         let c = self.chars.get(&id)?;

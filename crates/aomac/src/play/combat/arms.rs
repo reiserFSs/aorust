@@ -41,6 +41,7 @@ pub fn valid_slot(s: i32) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
     pub dtype: i32,
+    pub item_class: i32,
     pub sounds: Vec<(u32, Vec<u32>)>,
     pub animations: Vec<(u32, Vec<u32>)>,
     /// Authored muzzle, hit/tracer and successful-hit impact bindings (item event 10).
@@ -109,6 +110,8 @@ pub struct Armory {
     by: HashMap<i32, Arms>,
     /// Weapon dynel instance -> (holder, body slot).
     worn: HashMap<i32, (i32, i32)>,
+    /// Replicated bag weapons remain resolvable for the subsequent action 0x83.
+    bag: HashMap<i32, Item>,
 }
 
 impl Armory {
@@ -121,6 +124,7 @@ impl Armory {
     pub fn clear(&mut self) {
         self.by.clear();
         self.worn.clear();
+        self.bag.clear();
     }
 
     /// The item of the rdb 1000020 record `template` under the message stats: stat `0x1b4` else [`DEFAULT_DAMAGE_TYPE`], stat 420 else the
@@ -131,15 +135,17 @@ impl Armory {
         let record = template.zip(self.store.as_ref()).and_then(|(t, s)| s.get(ao_formats::dynel_visual::ITEM_TEMPLATE_TYPE, t).ok().flatten());
         let animations = record.as_ref().map(|r| ao_formats::dynel_visual::animation_map(r)).unwrap_or_default();
         let effects = record.as_ref().and_then(|r| super::super::chat::item_template_spells(r, 10).ok()).map(|s| super::effects::bindings(&s)).unwrap_or_default();
-        Item { dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), delay: get(&stats, 0x126).unwrap_or(200), effect_type: get(&stats, 413).unwrap_or(0), impact_effect_type: get(&stats, 414).unwrap_or(49999), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), animations, effects, wielded }
+        Item { item_class: get(&stats, 0x37).unwrap_or(0), dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), delay: get(&stats, 0x126).unwrap_or(200), effect_type: get(&stats, 413).unwrap_or(0), impact_effect_type: get(&stats, 414).unwrap_or(49999), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), animations, effects, wielded }
     }
 
     /// `holder` wields weapon dynel `item` in body `slot` (`WeaponItemFullUpdateIIR_t`).
     pub fn wield(&mut self, holder: i32, item: i32, slot: i32, template: Option<u32>, msg: &[(u32, i32)]) {
+        let t = self.item(template, msg, true);
         if !valid_slot(slot) {
+            self.bag.insert(item, t);
             return;
         }
-        let t = self.item(template, msg, true);
+        self.bag.remove(&item);
         self.by.entry(holder).or_default().wield(slot, t);
         self.worn.insert(item, (holder, slot));
     }
@@ -159,6 +165,7 @@ impl Armory {
 
     /// Weapon dynel `item` is gone (`n3ToClientQuit`): its slot is emptied (`FUN_1006a857`).
     pub fn unwield(&mut self, item: i32) {
+        self.bag.remove(&item);
         if let Some((holder, slot)) = self.worn.remove(&item) {
             if let Some(a) = self.by.get_mut(&holder) {
                 a.unwield(slot);
@@ -213,6 +220,10 @@ impl Armory {
     pub fn worn_item(&self, item: i32) -> Option<(i32, i32, &Item)> {
         let &(holder, slot) = self.worn.get(&item)?;
         Some((holder, slot, self.slot_item(holder, slot)?))
+    }
+
+    pub fn weapon_item(&self, item: i32) -> Option<&Item> {
+        self.bag.get(&item).or_else(|| self.worn_item(item).map(|(_, _, item)| item))
     }
 
 

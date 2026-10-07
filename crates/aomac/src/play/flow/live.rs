@@ -14,8 +14,8 @@
 //! `npcprobe=target,npcwait=walk:30,frames=npc-walk:2` (120 fixed-60Hz frames); repeat with idle.
 //! `npcwait=walk|idle[:timeout]` polls the selected NPC at fixed 60Hz before capture. W drives only the own avatar.
 //! PNG readback may run slower than real time; simulation dt stays 1/60 s. Use unique prefixes.
-//! `arm=prefix:seconds[:note|special|either]` defaults to either. Exact processed notes/specials are logged;
-//! special stat 148 identifies Burst, 150 Fling Shot. Arm before sending the attack input.
+//! `arm=prefix:seconds[:note|special|either|equipment|use|level]` defaults to either (note/special).
+//! Special stat 148 identifies Burst, 150 Fling Shot. Arm before input, including internally waiting `dclick`/`invuse`.
 use super::*;
 use ao_render::{GameInput, KeyCode, Offscreen};
 use std::io::BufRead;
@@ -36,20 +36,23 @@ struct FrameCapture {
     name: String,
     frames: usize,
     next: usize,
-    event: Option<[u64; 2]>,
+    event: Option<[u64; 5]>,
     kind: &'static str,
 }
 
 impl FrameCapture {
-    fn new(spec: &str, event: Option<[u64; 2]>) -> Self {
+    fn new(spec: &str, event: Option<[u64; 5]>) -> Self {
         let mut parts = spec.split(':');
         let name = parts.next().unwrap();
-        let secs: f64 = parts.next().expect("capture=prefix:seconds[:note|special|either]").parse().expect("capture seconds");
+        let secs: f64 = parts.next().expect("capture=prefix:seconds[:note|special|either|equipment|use|level]").parse().expect("capture seconds");
         let kind = match parts.next().unwrap_or("either") {
             "note" => "note",
             "special" => "special",
             "either" => "either",
-            _ => panic!("capture trigger must be note, special or either"),
+            "equipment" => "equipment",
+            "use" => "use",
+            "level" => "level",
+            _ => panic!("capture trigger must be note, special, either, equipment, use or level"),
         };
         assert!(parts.next().is_none(), "extra capture arguments");
         assert!(!name.is_empty() && !name.contains(['/', '\\']), "capture prefix must be a filename");
@@ -57,11 +60,14 @@ impl FrameCapture {
         Self { name: name.into(), frames: (secs * 60.0).ceil() as usize, next: 0, event, kind }
     }
 
-    fn frame(&mut self, event: [u64; 2]) -> Option<usize> {
+    fn frame(&mut self, event: [u64; 5]) -> Option<usize> {
         let unchanged = self.event.is_some_and(|before| match self.kind {
             "note" => event[0] == before[0],
             "special" => event[1] == before[1],
-            _ => event == before,
+            "equipment" => event[2] == before[2],
+            "use" => event[3] == before[3],
+            "level" => event[4] == before[4],
+            _ => event[..2] == before[..2],
         });
         if unchanged || self.next == self.frames {
             return None;
@@ -75,22 +81,50 @@ impl FrameCapture {
 
 #[test]
 fn live_capture_frame_accounting() {
-    let mut capture = FrameCapture::new("attack:1:note", Some([4, 2]));
-    assert_eq!(capture.frame([4, 3]), None); // an unrelated special cannot consume a note capture
-    assert_eq!(capture.frame([5, 3]), Some(0)); // triggering frame, not the following frame
+    let mut capture = FrameCapture::new("attack:1:note", Some([4, 2, 0, 0, 0]));
+    assert_eq!(capture.frame([4, 3, 0, 0, 0]), None); // an unrelated special cannot consume a note capture
+    assert_eq!(capture.frame([5, 3, 0, 0, 0]), Some(0)); // triggering frame, not the following frame
     for index in 1..60 {
-        assert_eq!(capture.frame([5, 3]), Some(index));
+        assert_eq!(capture.frame([5, 3, 0, 0, 0]), Some(index));
     }
-    assert_eq!(capture.frame([6, 4]), None); // additional events never restart the sequence
-    let mut special = FrameCapture::new("burst:1:special", Some([4, 2]));
-    assert_eq!(special.frame([5, 2]), None);
-    assert_eq!(special.frame([5, 3]), Some(0));
+    assert_eq!(capture.frame([6, 4, 0, 0, 0]), None); // additional events never restart the sequence
+    let mut special = FrameCapture::new("burst:1:special", Some([4, 2, 0, 0, 0]));
+    assert_eq!(special.frame([5, 2, 0, 0, 0]), None);
+    assert_eq!(special.frame([5, 3, 0, 0, 0]), Some(0));
     let mut direct = FrameCapture::new("npc:2", None);
     for index in 0..120 {
-        assert_eq!(direct.frame([0, 0]), Some(index));
+        assert_eq!(direct.frame([0; 5]), Some(index));
     }
-    assert_eq!(direct.frame([0, 0]), None);
+    assert_eq!(direct.frame([0; 5]), None);
     assert_eq!(120.0 * CAPTURE_DT, 2.0);
+}
+
+#[test]
+fn live_capture_action_selectors() {
+    let before = [4, 2, 7, 8, 9];
+    for (kind, selected) in [("equipment", 2), ("use", 3), ("level", 4)] {
+        let mut capture = FrameCapture::new(&format!("action:1:{kind}"), Some(before));
+        assert_eq!(capture.frame(before), None);
+        for other in 0..5 {
+            if other != selected {
+                let mut event = before;
+                event[other] += 1;
+                assert_eq!(capture.frame(event), None);
+            }
+        }
+        let mut event = before;
+        event[selected] += 1;
+        assert_eq!(capture.frame(event), Some(0));
+        for index in 1..60 {
+            assert_eq!(capture.frame(before), Some(index));
+        }
+        assert_eq!(capture.frame([99; 5]), None);
+    }
+    for spec in ["attack:1", "attack:1:either"] {
+        let mut capture = FrameCapture::new(spec, Some(before));
+        assert_eq!(capture.frame([4, 2, 8, 9, 10]), None);
+        assert_eq!(capture.frame([4, 3, 8, 9, 10]), Some(0));
+    }
 }
 
 struct Live {
@@ -163,7 +197,7 @@ impl Live {
         assert!(secs.is_finite() && secs > 0.0, "capturewait requires positive finite seconds");
         let start = Instant::now();
         while self.capture.is_some() {
-            assert!(start.elapsed().as_secs_f32() < secs, "capture timeout: own attack event missing or PNG sequence incomplete");
+            assert!(start.elapsed().as_secs_f32() < secs, "capture timeout: selected own event missing or PNG sequence incomplete");
             self.tick();
         }
     }

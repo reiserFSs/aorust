@@ -230,6 +230,17 @@ impl Play {
         for id in m.take_struck() {
             self.zone.world.char_sound(id, npc_sound::HIT);
         }
+        for (who, sounds) in m.take_equipment_sounds() {
+            self.zone.world.sound_variants_at(who, &sounds);
+        }
+        for who in m.take_equipment_actions() {
+            #[cfg(test)]
+            if who == own {
+                self.live_attack_events[2] += 1;
+            }
+            #[cfg(not(test))]
+            let _ = who;
+        }
         for e in &events {
             match e {
                 // `CharDie_t` is the state of the server's action 99 (cause 0); a death the client computed itself does not start it

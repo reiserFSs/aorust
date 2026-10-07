@@ -466,3 +466,16 @@ incoming family matching any existing family conflicts. Login `SimpleCharFullUpd
 startcs=`nowcs-b+c`, and disables replacement. Actual `zone_ithaca.rec` evidence has three action62/BuffIIR removal
 pairs at 23825/23920, 29898,74495 ms; no captured b1 or nonempty login list, so those regressions are synthetic.
 
+## Live action frame sequences
+
+The existing `live_walk` harness accepts `AOMAC_LIVE_SHOTS=<directory>` and
+`arm=<prefix>:<seconds>[:note|special|either|equipment|use|level]`.
+`either` remains the default and selects only own attack notes or SpecialAttack results.
+The other selectors wait for their confirmed own event to be processed, not an outgoing request.
+The processing frame is `<prefix>-0000.png`; recording continues at fixed 60 Hz for the requested duration.
+Arm **before** the action: `dclick` and `invuse` already tick while waiting internally.
+For example, `arm=equip:2:equipment,dclick=40,capturewait=30` or
+`arm=item-use:2:use,invuse=0x40,capturewait=30`; use a suitable item/slot for the selected action.
+For level-up, arm `arm=level-up:2:level` before the action earning the level, then `capturewait=30`.
+`frames=<prefix>:<seconds>` still records immediately without an event trigger.
+
