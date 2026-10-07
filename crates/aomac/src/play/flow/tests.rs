@@ -4,6 +4,14 @@ use super::*;
 use std::net::{Ipv4Addr, TcpListener};
 use std::time::{Duration, Instant};
 
+#[test]
+fn nano_audio_logs_oneshots_and_refusals_not_successful_rearms() {
+    assert!(log_nano_sound(0.0, &[11]));
+    assert!(log_nano_sound(-1.0, &[11]));
+    assert!(log_nano_sound(0.2, &[]));
+    assert!(!log_nano_sound(0.2, &[11]));
+}
+
 struct Rig {
     p: Play,
     host: Host,

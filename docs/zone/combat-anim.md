@@ -673,7 +673,8 @@ fades during its final authored fade-out and stops at zero. The native
 key is the sound definition, not a new voice each frame. The port uses
 the existing looping mixer/keepalive mechanism, including positional
 attenuation; `AOMAC_AUDIO_LOG` records emitter, selector, ID, duration,
-volume and actual voice IDs even with muted output.
+volume and actual voice IDs for one-shots and refusals, even with muted
+output. Successful positive-duration re-arms are silent.
 
 Body Boost29091 has269=`35a9ce7d`
 (`sfx/spells/chant_base_pos_lo_loop.wav`, authored fade-out1s),
@@ -699,9 +700,10 @@ separates the live avatar from the remote pose and checks all three selectors.
 have min/max distance0/15m, volume bytes127/127 and probability100.
 Both decoded files exist;272 uses
 `sfx/spells/cast_base_pos_target_med.wav` and has one child.
-`AOMAC_AUDIO_LOG` now records the runtime definition, resolved sample,
-source/listener scene positions, distance, FX gain and caller parameters;
-rejections distinguish missing runtime/definition, distance, decoding,
+The diagnostic capture below recorded the runtime definition, resolved
+sample, source/listener scene positions, distance, FX gain and caller
+parameters. The redundant per-frame `audio duration` trace is now removed;
+current rejections still distinguish missing runtime/definition, distance, decoding,
 empty sample, keepalive sample and mixer pool. Muting still acts only
 after mixer statistics. An instrumentation-only offscreen live capture on
 2026-10-07 logged120 own-character requests (33588), all refused:

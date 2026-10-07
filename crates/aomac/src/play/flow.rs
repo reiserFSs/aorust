@@ -1299,7 +1299,7 @@ impl Frontend for Play {
             for (id, pos, duration, volume, selector, who) in self.zone.world.take_nano_sounds() {
                 if let Some(audio) = &self.audio {
                     let voices = audio.play_game_sound_duration(id, pos, host.camera.pos.to_array(), duration, volume);
-                    if std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
+                    if log_nano_sound(duration, &voices) && std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
                         eprintln!("nano sound who={who} stage={selector:#x} id={id:#x} at {pos:?} duration={duration} volume={volume} voices={voices:?}");
                     }
                 }
@@ -1478,6 +1478,10 @@ fn errorurl(dir: &std::path::Path) -> Option<String> {
         .filter_map(|l| l.split_once('='))
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("errorurl"))
         .map(|(_, v)| v.trim().to_string())
+}
+
+fn log_nano_sound(duration: f32, voices: &[u64]) -> bool {
+    duration <= 0.0 || voices.is_empty()
 }
 
 #[cfg(test)]

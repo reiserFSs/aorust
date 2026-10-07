@@ -398,9 +398,6 @@ impl Audio {
             return Vec::new();
         };
         let d = if pos == [0.0; 3] { 0.0 } else { (0..3).map(|i| (pos[i] - listener[i]).powi(2)).sum::<f32>().sqrt() };
-        if audio_log() {
-            eprintln!("audio duration id={id:#x} source={pos:?} listener={listener:?} distance={d} min={} max={} sample={:?} resolved={:?} fx={} volume={volume} duration={duration} probability={} children={:?}", def.min_dist, def.max_dist, def.file, def.file.as_deref().and_then(|f| self.sh.resolve(f)), rt.fx, def.prob, def.children);
-        }
         if d > def.max_dist {
             if audio_log() { eprintln!("audio rejection id={id:#x} reason=distance distance={d} max={}", def.max_dist); }
             return Vec::new();
