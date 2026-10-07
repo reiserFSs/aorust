@@ -16,6 +16,7 @@ mod dynels_doors;
 mod fightmode;
 mod flow;
 mod hud;
+mod level_notice;
 mod hud_aggdef;
 mod hud_actions;
 mod hud_actionwin;

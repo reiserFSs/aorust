@@ -24,11 +24,11 @@ pub(super) fn connector(template:&Template, source:Mat4)->Result<Mat4> {
 }
 
 /// GC 100d2ab0: one shared 2048-entry sphere table and the retail index walk.
-fn sphere_point(rng:&mut CrtRand) -> Vec3 {
+pub(super) fn sphere_point(rng:&mut CrtRand) -> Vec3 {
     // Initialization consumes the live CRT stream, so LazyLock cannot supply it.
     static TABLE:OnceLock<[Vec3;2048]>=OnceLock::new();
     let table=TABLE.get_or_init(||std::array::from_fn(|_|loop {
-        let v=Vec3::new(rng.rand() as f32*2.0/32767.0-1.0,rng.rand() as f32*2.0/32767.0-1.0,rng.rand() as f32*2.0/32767.0-1.0);
+        let v=Vec3::new(rng.rand() as f32*2.0/32768.0-1.0,rng.rand() as f32*2.0/32768.0-1.0,rng.rand() as f32*2.0/32768.0-1.0);
         if v.length_squared()>0.0 && v.length_squared()<1.0 {break v.normalize();}
     }));
     static WALK:Mutex<(u32,u32)>=Mutex::new((0,11));
@@ -87,33 +87,34 @@ pub(super) struct SpriteEffect {
 }
 
 impl SpriteEffect {
-    pub(super) fn supports(kind: i32) -> bool { matches!(kind,1004|1007|1008|1009|1012) }
+    pub(super) fn supports(kind: i32) -> bool { matches!(kind,1004|1007|1008|1009|1012|1018) }
 
     pub(super) fn new_with_id(effect: i32, template: &Template, source: Mat4, _target: Mat4, color: u32, display_random:&mut R250) -> Result<Self> {
         ensure!(Self::supports(template.kind), "unsupported sprite class {}", template.kind);
-        let last = match template.kind { 1004=>31,1007|1008=>38,1009=>32,_=>26 };
+        let last = match template.kind { 1004=>31,1007|1008=>38,1009=>32,1018=>40,_=>26 };
         template.word(last)?;
         for i in 8..=last {
             let integer=i==9 || (template.kind==1012 && matches!(i,10|24))
                 || (template.kind==1004 && matches!(i,29|31))
                 || (template.kind==1009 && i==29)
-                || (matches!(template.kind,1007|1008) && matches!(i,24|31|37));
+                || (matches!(template.kind,1007|1008) && matches!(i,24|31|37))
+                || (template.kind==1018 && matches!(i,24|31|38|40));
             if !integer {template.float(i)?;}
         }
         if template.kind!=1012 {ensure!(template.float(10)? >= 0.0,"invalid sprite emission rate");}
         materials::MATERIALS.get(template.word(9)? as usize).context("unknown sprite material")?;
-        let life = template.float(if template.kind == 1012 { 23 } else if matches!(template.kind,1007|1008) {35} else {26})?;
+        let life = template.float(if template.kind == 1012 { 23 } else if matches!(template.kind,1007|1008|1018) {35} else {26})?;
         ensure!(life >= 0.0, "invalid sprite lifetime");
         let capacity = if template.kind == 1012 {
             ensure!(matches!(template.word(10)? & 3,0|3), "unsupported sprite plane");
             1
         } else {
-            let initial = if matches!(template.kind,1007|1008) { template.word(31)? as usize } else {0};
+            let initial = if matches!(template.kind,1007|1008|1018) { template.word(31)? as usize } else {0};
             ((template.float(10)?*life*1.5) as usize).max(initial)
         };
         ensure!(capacity <= u16::MAX as usize/4, "sprite capacity exceeds native indices");
         let out = Self { template:template.clone(),source,color,effect,particles:Vec::with_capacity(capacity),capacity,
-            default_direction:if template.kind==1012 {Vec3::ZERO}else{Vec3::new(display_uniform(display_random)*2.0-1.0,display_uniform(display_random)*0.89+0.1,-(display_uniform(display_random)*2.0-1.0))},previous_time:0.0,previous_source:source.w_axis.truncate(),emitted:0,
+            default_direction:if matches!(template.kind,1012|1018) {Vec3::ZERO}else{Vec3::new(display_uniform(display_random)*2.0-1.0,display_uniform(display_random)*0.89+0.1,-(display_uniform(display_random)*2.0-1.0))},previous_time:0.0,previous_source:source.w_axis.truncate(),emitted:0,
             wind:Vec3::ZERO,smoke_wind:Vec3::ZERO,anchors:vec![],stage:0,next_stage:0.0,config:EffectConfig::default() };
         // Nano0's initial burst waits for Process, after CreateEffect2 setters.
         Ok(out)
@@ -146,7 +147,7 @@ impl SpriteEffect {
     /// GC 100db97d,100e6475/100e674f,100eff68 create different native particles.
     fn emit(&mut self, at:Vec3,random:&mut R250,crt:&mut CrtRand) -> Result<()> {
         if self.particles.len()>=self.capacity { return Ok(()); }
-        let nano=matches!(self.template.kind,1007|1008);
+        let nano=matches!(self.template.kind,1007|1008|1018);
         let smoke=self.template.kind==1009;
         let mut life=if nano {self.template.float(34)?}else{self.template.float(26)?};
         if smoke { life*=1.0+(super::random_fraction(random))*0.29999995; }
@@ -165,9 +166,10 @@ impl SpriteEffect {
             let az=self.template.float(25)?+(self.template.float(26)?-self.template.float(25)?)*(super::random_fraction(random));
             let el=self.template.float(27)?+(self.template.float(28)?-self.template.float(27)?)*(super::random_fraction(random));
             let speed=self.template.float(29)?+(self.template.float(30)?-self.template.float(29)?)*(super::random_fraction(random));
-            velocity=matrix.transform_vector3(Vec3::new(az.cos()*el.cos(),el.sin(),-az.sin()*el.cos())*speed)*self.template.float(32)?;
+            velocity=matrix.transform_vector3(Vec3::new(az.cos()*el.cos(),el.sin(),-az.sin()*el.cos())*speed)*if self.template.kind==1018 {1.0}else{self.template.float(32)?};
             life=self.template.float(34)?+(self.template.float(35)?-self.template.float(34)?)*(super::random_fraction(random));
             ensure!(life>0.0,"invalid Nano particle lifetime");
+            if self.template.kind==1018 {position=matrix.transform_point3(Vec3::ZERO);}
         } else if smoke {
             let az=(super::random_fraction(random))*std::f32::consts::TAU;
             let el=(super::random_fraction(random))*std::f32::consts::FRAC_PI_2;
@@ -200,12 +202,12 @@ impl SpriteEffect {
         let scale=self.config.scale.unwrap_or(1.0);
         width*=scale; height*=scale; width_end*=scale; height_end*=scale;
         let &(_,_,_,first,last)=&materials::MATERIALS[self.template.words[9] as usize];
-        let mode=self.template.word(if nano{37}else{29})? as i32;
+        let mode=self.template.word(if self.template.kind==1018 {38}else if nano{37}else{29})? as i32;
         ensure!((0..=7).contains(&mode),"unknown native sprite wind mode {mode}");
-        let low=height_base.unwrap_or(position.y)+self.template.float(if nano{35}else{27})?;
-        let high=height_base.unwrap_or(position.y)+self.template.float(if nano{36}else{28})?;
+        let low=height_base.unwrap_or(position.y)+self.template.float(if self.template.kind==1018 {36}else if nano{35}else{27})?;
+        let high=height_base.unwrap_or(position.y)+self.template.float(if self.template.kind==1018 {37}else if nano{36}else{28})?;
         let factor=if nano||smoke {super::random_fraction(random)*0.9+0.1}else{1.0};
-        let wind_scale=factor*self.template.float(if nano{38}else{30})?;
+        let wind_scale=factor*self.template.float(if self.template.kind==1018 {39}else if nano{38}else{30})?;
         let previous_velocity=self.default_direction;
         self.particles.push(SpriteParticle {position,velocity,previous_velocity,remaining:life,width,height,
             width_rate:(width_end-width)/life,height_rate:(height_end-height)/life,
@@ -216,11 +218,11 @@ impl SpriteEffect {
 
     fn particle_vertices(&mut self,time:f32,right:Vec3,up:Vec3,random:&mut R250,display_random:&mut R250,crt:&mut CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
         let dt=(time-self.previous_time).max(0.0);
-        let nano=matches!(self.template.kind,1007|1008);
+        let nano=matches!(self.template.kind,1007|1008|1018);
         let life=self.template.float(if nano{35}else{26})?;
         let duration=self.config.duration.unwrap_or(self.template.float(8)?);
         let emitting=duration<0.0 || time<duration-life;
-        if self.template.kind==1007 && self.previous_time==0.0 && self.particles.is_empty() && self.emitted==0 {
+        if matches!(self.template.kind,1007|1018) && self.previous_time==0.0 && self.particles.is_empty() && self.emitted==0 {
             for _ in 0..self.template.word(31)? {self.emit(self.emission_position(),random,crt)?;}
         }
         if self.template.kind==1008 {
@@ -290,7 +292,7 @@ impl SpriteEffect {
     pub(super) fn blends(&self) -> Vec<Blend> {
         let flags = self.template.words[10];
         vec![if self.template.kind==1009 { if self.effect==80005 {Blend::Additive} else {Blend::AlphaBlend} }
-            else if self.template.kind==1007 && self.template.words[0]&0x800!=0 {Blend::AlphaBlend}
+            else if matches!(self.template.kind,1007|1018) && self.template.words[0]&0x800!=0 {Blend::AlphaBlend}
             else if self.template.kind!=1012 {Blend::Additive}
             else if flags&3==0 {
                 if flags&0x1000!=0 {Blend::Opaque}else if flags&4==0 {Blend::Additive}else{Blend::AlphaBlend}
@@ -403,6 +405,20 @@ mod tests {
         assert_eq!(s.blends(),[Blend::AlphaBlend]);
         assert!(!SpriteEffect::supports(1010));
         for _ in 0..32 {assert!((sphere_point(&mut CrtRand::new(1)).length()-1.0).abs()<1e-5);}
+    }
+
+    #[test]
+    fn sparks_uses_native_unscaled_velocity_and_wind_word38() {
+        let mut words=vec![0;41];
+        for (i,f) in [(8,-1.0f32),(12,1.0),(13,1.0),(14,1.0),(15,1.0),(16,1.0),(17,1.0),(29,2.0),(30,2.0),(32,99.0),(34,1.0),(35,1.0)] {words[i]=f.to_bits();}
+        words[31]=1;words[38]=0;words[37]=2.0f32.to_bits();
+        let t=Template {kind:1018,words};
+        let mut effect=SpriteEffect::new_with_id(2710,&t,Mat4::IDENTITY,Mat4::IDENTITY,0,&mut R250::new(1)).unwrap();
+        effect.vertices(0.0,Vec3::Z,Vec3::X,Vec3::Y,&mut R250::new(1),&mut R250::new(1),&mut CrtRand::new(1)).unwrap();
+        assert_eq!(effect.particles.len(),1);
+        assert_eq!(effect.particles[0].velocity,Vec3::X*2.0);
+        assert_eq!(effect.particles[0].mode,0);
+        assert_eq!(effect.particles[0].high,2.0);
     }
 
     #[test]

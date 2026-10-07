@@ -10,7 +10,7 @@ use std::io::Read;
 #[derive(Clone, Debug)]
 pub struct Track {
     pub bone: u32,
-    /// `CATKeyframeAnimData_t+0x40[bone]`: 2 in nearly all records, meaning not decoded.
+    /// Authored layer bitmask (`CATKeyframeAnimData_t+0x40`); enabled when ANDed with playback layers.
     pub mode: u32,
     /// (time in ms, quaternion x y z w), strictly increasing times.
     pub rot: Vec<(f32, [f32; 4])>,
@@ -35,6 +35,78 @@ pub struct CatAnim {
     /// (DisplaySystem 0x10072fde uses only seconds * 1000 * the animation's speed scale).
     pub param: f32,
     pub tracks: Vec<Track>,
+}
+
+/// One node of the retail animation blend chain, in composition order (previous chain first).
+/// `layers` is the effective `CATKeyframeAnim_t::SetLayers` mask, not an abstract animation id.
+#[derive(Clone, Copy, Debug)]
+pub struct AnimLayer<'a> {
+    pub clip: &'a CatAnim,
+    pub ms: f32,
+    pub layers: u32,
+    /// Weight of this clip when both this clip and the preceding chain enable the bone.
+    pub blend: f32,
+}
+
+/// DS 0x10073f23: remaining time of the preceding same-priority animation, clamped by
+/// 0x100af8a0 (0x43480000 = 200 ms) and 0x100af89c (0x43960000 = 300 ms).
+pub fn animation_fade_ms(previous_duration: f32, previous_ms: f32) -> f32 {
+    let remaining = if previous_duration > 0.0 {
+        previous_duration - previous_ms.rem_euclid(previous_duration)
+    } else { 0.0 };
+    remaining.clamp(200.0, 300.0)
+}
+
+/// Positive-count DS 0x10072562 blend. Short clips finish before the fade-out switch.
+pub fn animation_blend(ms: f32, duration: f32, fade_ms: f32) -> f32 {
+    (if ms <= fade_ms { ms / fade_ms } else { (duration - ms) / fade_ms }).clamp(0.0, 1.0)
+}
+
+/// Apply DS 0x10074180/0x100729f9 exclusion masks to a priority-descending chain.
+/// Each tuple carries priority, original Layer_e, and its time/weight sample.
+pub fn animation_layers<'a>(nodes: impl Clone + Iterator<Item = (i32, u32, AnimLayer<'a>)>) -> impl Clone + Iterator<Item = AnimLayer<'a>> {
+    nodes.scan((i32::MAX, 0u32, 0u32), |state, (priority, exclusion, mut layer)| {
+        layer.layers = animation_layer_mask(state, priority, exclusion, layer.layers);
+        Some(layer)
+    })
+}
+
+/// One step of DS's resource-completion mask refresh. Initialize `state` to `(i32::MAX, 0, 0)`.
+/// A zero exclusion leaves the stored mask unchanged; expiration does not restore it.
+pub fn animation_layer_mask(state: &mut (i32, u32, u32), priority: i32, exclusion: u32, current_mask: u32) -> u32 {
+    if state.0 != priority {
+        state.2 = state.1;
+        state.0 = priority;
+    }
+    state.1 |= exclusion;
+    if state.2 & 3 == 0 { current_mask } else { !(state.2 & 3) & 3 }
+}
+
+/// Retail per-bone composition: authored masks, sparse-track passthrough, slerp + linear translation.
+/// No bone-name mask and no allocation. DS 0x10074228; randy 0x10050742/0x10050586/0x1005063c.
+pub(crate) fn sample_layers<'a>(layers: impl IntoIterator<Item = AnimLayer<'a>>, signature: u32, bone: usize) -> Option<([f32; 4], [f32; 3])> {
+    let mut pose: Option<([f32; 4], [f32; 3])> = None;
+    let mut enabled = false;
+    for layer in layers.into_iter().filter(|l| l.clip.signature == signature) {
+        // A fully blended whole-body node discards the preceding chain (DS 0x10074228).
+        if layer.blend >= 1.0 && layer.layers > 2 {
+            pose = None;
+            enabled = false;
+        }
+        let track = layer.clip.tracks.iter().find(|t| t.bone as usize == bone);
+        let active = track.is_some_and(|t| t.mode & layer.layers != 0);
+        let next = track.map(|track| sample_track(track, layer.ms));
+        pose = match (pose, next) {
+            (Some((q, t)), Some((nq, nt))) if enabled && active => Some((
+                slerp(q, nq, layer.blend),
+                std::array::from_fn(|i| t[i] * (1.0 - layer.blend) + nt[i] * layer.blend),
+            )),
+            (_, Some(next)) if active || pose.is_none() => Some(next),
+            (previous, _) => previous,
+        };
+        enabled |= active;
+    }
+    pose
 }
 
 /// `FUN_1005bb82`: `ncols` interleaved columns, each a zlib blob of big-endian `ceil(bits/8)`-byte
@@ -167,6 +239,11 @@ impl CatAnim {
     /// Local (rotation quaternion xyzw, translation) of `bone` at `t_ms`, `None` if the clip has no track for it.
     pub fn sample(&self, bone: usize, t_ms: f32) -> Option<([f32; 4], [f32; 3])> {
         let tr = self.tracks.iter().find(|t| t.bone as usize == bone)?;
+        Some(sample_track(tr, t_ms))
+    }
+}
+
+fn sample_track(tr: &Track, t_ms: f32) -> ([f32; 4], [f32; 3]) {
         let q = match key_span(&tr.rot, t_ms, |k| k.0) {
             None => [0.0, 0.0, 0.0, 1.0],
             Some((a, b, f)) => slerp(tr.rot[a].1, tr.rot[b].1, f),
@@ -175,8 +252,7 @@ impl CatAnim {
             None => [0.0; 3],
             Some((a, b, f)) => std::array::from_fn(|i| tr.trans[a].1[i] * (1.0 - f) + tr.trans[b].1[i] * f),
         };
-        Some((q, p))
-    }
+    (q, p)
 }
 
 /// Surrounding keys and blend factor for `t`, clamped to the first/last key (`FUN_10051d2a` / `FUN_10051df4`).
@@ -227,5 +303,46 @@ mod tests {
         assert_eq!(f(400.0), Some((2, 2, 0.0)));
         assert_eq!(f(200.0), Some((1, 2, 0.5)));
         assert_eq!(key_span::<f32>(&[], 0.0, |k| *k), None);
+    }
+
+    #[test]
+    fn authored_layers_blend_and_pass_through_sparse_tracks() {
+        let clip = |tracks| CatAnim { source_id: 0, root: String::new(), events: vec![], version: 0x106, duration: 100.0, signature: 7, param: 0.0, tracks };
+        let track = |bone, mode, x| Track { bone, mode, rot: vec![(0.0, [0.0, 0.0, 0.0, 1.0])], trans: vec![(0.0, [x, 0.0, 0.0])] };
+        let base = clip(vec![track(0, 1, 2.0), track(1, 2, 4.0), track(2, 2, 6.0)]);
+        let upper = clip(vec![track(0, 1, 10.0), track(1, 2, 12.0)]);
+        let layers = [
+            AnimLayer { clip: &base, ms: 0.0, layers: 3, blend: 1.0 },
+            AnimLayer { clip: &upper, ms: 0.0, layers: 2, blend: 0.5 },
+        ];
+        assert_eq!(sample_layers(layers, 7, 0).unwrap().1[0], 2.0);
+        assert_eq!(sample_layers(layers, 7, 1).unwrap().1[0], 8.0);
+        assert_eq!(sample_layers(layers, 7, 2).unwrap().1[0], 6.0);
+        assert_eq!(sample_layers(layers, 8, 1), None);
+        let only = [AnimLayer { clip: &upper, ms: 0.0, layers: 2, blend: 0.0 }];
+        // A track enabled only by anim2 passes through even with blend zero.
+        assert_eq!(sample_layers(only, 7, 1).unwrap().1[0], 12.0);
+        let overlay = [
+            AnimLayer { clip: &upper, ms: 0.0, layers: 3, blend: 1.0 },
+            AnimLayer { clip: &base, ms: 0.0, layers: 2, blend: 1.0 },
+        ];
+        assert_eq!(sample_layers(overlay, 7, 0).unwrap().1[0], 10.0);
+        assert_eq!(sample_layers(overlay, 7, 1).unwrap().1[0], 4.0);
+        assert_eq!(sample_layers(overlay, 7, 2).unwrap().1[0], 6.0);
+    }
+
+    #[test]
+    fn retail_priority_masks_and_positive_count_fades() {
+        assert_eq!(animation_fade_ms(0.0, 0.0), 200.0);
+        assert_eq!(animation_fade_ms(1000.0, 750.0), 250.0);
+        assert_eq!(animation_fade_ms(1000.0, 500.0), 300.0);
+        assert_eq!(animation_blend(100.0, 1000.0, 200.0), 0.5);
+        assert_eq!(animation_blend(800.0, 1000.0, 200.0), 1.0);
+        assert_eq!(animation_blend(900.0, 1000.0, 200.0), 0.5);
+        assert_eq!(animation_blend(100.0, 100.0, 200.0), 0.5, "short clips never switch to fade-out");
+        let clip = CatAnim { source_id: 0, root: String::new(), events: vec![], version: 0x106, duration: 1000.0, signature: 7, param: 0.0, tracks: vec![] };
+        let layer = AnimLayer { clip: &clip, ms: 0.0, layers: 3, blend: 0.5 };
+        let masks: Vec<_> = animation_layers([(0, 0, layer), (-1, 1, layer), (-1, 0, layer), (-2, 0, layer)].into_iter()).map(|l| l.layers).collect();
+        assert_eq!(masks, [3, 3, 3, 2], "only lower-priority groups inherit exclusion bits");
     }
 }

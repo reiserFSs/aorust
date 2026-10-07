@@ -28,7 +28,7 @@ fn curve(t:&Template,phase:f32)->[f32;4] {
     out
 }
 struct Particle { position:Vec3, velocity:Vec3, remaining:f32, life:f32, size:f32, angle:f32, spin:f32, frame:f32, phase:f32, delay:f32 }
-pub(super) struct ParticleEffect { template:Template, source:Mat4, particles:Vec<Particle>, previous:f32, emission:f32, frame_rate:f32, duration:f32 }
+pub(super) struct ParticleEffect { template:Template, source:Mat4, particles:Vec<Particle>, previous:f32, emission:f32, frame_rate:f32, duration:f32, terminated:bool }
 impl ParticleEffect {
     pub(super) fn supports(kind:i32)->bool {matches!(kind,3024|3028)}
     pub(super) fn new(t:&Template,source:Mat4,_target:Mat4,_color:u32,gc:&mut R250,ds:&mut R250,_crt:&mut CrtRand)->Result<Self> {
@@ -43,7 +43,7 @@ impl ParticleEffect {
         let material=word(t,if t.kind==3028 {10}else{9}) as usize;
         materials::MATERIALS.get(material).context("unknown BParticle material")?;
         let count=word(t,11) as usize;ensure!(count<=u16::MAX as usize/4,"BParticle capacity exceeds native indices");
-        let mut out=Self {template:t.clone(),source:sprites::connector(t,source)?,particles:Vec::with_capacity(count),previous:0.0,emission:0.0,frame_rate:float(t,31),duration:float(t,8)};
+        let mut out=Self {template:t.clone(),source:sprites::connector(t,source)?,particles:Vec::with_capacity(count),previous:0.0,emission:0.0,frame_rate:float(t,31),duration:float(t,8),terminated:false};
         for i in 0..count {
             let p=if t.kind==3028 {out.emit(gc)}else{
                 // DS mode 8 consumes only its shared DisplaySystem R250 stream.
@@ -65,6 +65,9 @@ impl ParticleEffect {
         Particle {position,velocity,remaining:life,life,size,angle,spin,frame,phase:0.0,delay:0.0}
     }
     pub(super) fn configure(&mut self,c:EffectConfig)->Result<()> {if let Some(d)=c.duration {self.duration=d;}Ok(())}
+    // GC1010aa16 sets +28. GC1010af47 immediately ends ordinary particles;
+    // the 0x200000 held-life branch instead releases their remaining lifetimes.
+    pub(super) fn terminate_gracefully(&mut self) {self.terminated=true;}
     pub(super) fn update_source(&mut self,source:Mat4)->Result<()> {self.source=sprites::connector(&self.template,source)?;Ok(())}
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {let n=self.particles.len();vec![(Some(word(&self.template,if self.template.kind==3028 {10}else{9}) as usize),(0..n as u32).flat_map(|i|[i*4,i*4+2,i*4+3,i*4,i*4+3,i*4+1]).collect(),n*4)]}
     pub(super) fn blends(&self)->Vec<Blend> {vec![if word(&self.template,0)&0x200!=0 {Blend::Additive}else{Blend::AlphaBlend}]}
@@ -73,12 +76,13 @@ impl ParticleEffect {
     pub(super) fn vertices(&mut self,time:f32,_camera:Vec3,right:Vec3,up:Vec3,gc:&mut R250,ds:&mut R250,_crt:&mut CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
         let dt=(time-self.previous).max(0.0);self.previous=time;self.emission+=dt;
         let t=&self.template;let modern=t.kind==3028;
+        if modern && self.terminated && word(t,0)&0x200000==0 {return Ok(None);}
         if !modern && self.duration>=0.0 && time>self.duration {return Ok(None);}
         let material=materials::MATERIALS[word(t,if modern {10}else{9}) as usize];
         let mut alive=0;let mut vertices=Vec::with_capacity(self.particles.len()*4);
         for p in &mut self.particles {
             if modern {
-                if word(t,0)&0x200000==0 {p.remaining-=dt;}
+                if word(t,0)&0x200000==0 || self.terminated {p.remaining-=dt;}
                 if p.remaining>0.0 {
                     alive+=1;
                     if word(t,0)&0x100000==0 {p.position+=p.velocity*dt;p.velocity+=self.source.transform_vector3(Vec3::Y*float(t,16))*dt;}else{p.position=self.source.w_axis.truncate();}
@@ -106,8 +110,8 @@ impl ParticleEffect {
             quad(&mut vertices,[pos-x-y,pos+x-y,pos-x+y,pos+x+y],[[u,v+dv],[u+du,v+dv],[u,v],[u+du,v]],render(color));
         }
         if modern {
-            if word(t,9)==0 && alive==0 {return Ok(None);}
-            if word(t,9)==1 && (self.duration<0.0 || time<self.duration-float(t,26)) && float(t,12)>0.0 && self.emission>float(t,12) {
+            if (word(t,9)==0 || self.terminated) && alive==0 {return Ok(None);}
+            if !self.terminated && word(t,9)==1 && (self.duration<0.0 || time<self.duration-float(t,26)) && float(t,12)>0.0 && self.emission>float(t,12) {
                 let mut emitted=0;for i in 0..self.particles.len() {if self.particles[i].remaining<=0.0 {self.emission=0.0;self.particles[i]=self.emit(gc);emitted+=1;if emitted>=word(t,15) {break;}}}
             }
             if self.duration>=0.0 && time>self.duration {return Ok(None);}
@@ -124,6 +128,14 @@ mod tests {
         assert_eq!(curve(&t,0.5)[3],0.0);assert!((curve(&t,0.25)[3]-0.5).abs()<1e-6);
         t.words.resize(44,0);t.words[35]=4;t.words[42]=1.5f32.to_bits();assert_eq!(curve(&t,1.5),rgba(0));
     }
+    #[test]
+    fn ordinary_bparticle2_graceful_termination_ends_rendering() {
+        let mut effect = ParticleEffect {template:Template {kind:3028,words:vec![0;36]},source:Mat4::IDENTITY,particles:vec![],previous:0.0,emission:0.0,frame_rate:0.0,duration:-1.0,terminated:false};
+        effect.terminate_gracefully();
+        let mut gc=R250::new(1);let mut ds=R250::new(1);let mut crt=CrtRand::new(1);
+        assert!(effect.vertices(0.0,Vec3::Z,Vec3::X,Vec3::Y,&mut gc,&mut ds,&mut crt).unwrap().is_none());
+    }
+
     #[test]
     #[ignore = "requires installed retail gfxtweak and offscreen GPU rendering"]
     fn retail_particle_dependency_frames()->Result<()> {

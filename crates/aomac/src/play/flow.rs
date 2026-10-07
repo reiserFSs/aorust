@@ -1203,12 +1203,29 @@ impl Frontend for Play {
                 weather.update(self.zone.game_day as u32, self.zone.day_time() as f64, dt);
                 host.effect_wind = weather.state().wind;
             }
+            self.use_action_frame(dt);
             self.fight_frame(dt);
+            {
+                let own=self.zone.char_id as i32;
+                let player=self.player.as_ref();
+                let stats=&self.zone.stats;
+                let character_stats=&self.zone.character_stats;
+                // GC1003a04f emits filename+Identity on GlobalSignals+190. No retail
+                // subscriber was found; do not invent UI/file/numeric sound playback.
+                drop(self.zone.world.server_effect_frame(
+                    |anchor| player?.effect_anchor(anchor).map(|matrix| glam::Mat4::from_cols_array_2d(&matrix)),
+                    |who,stat| {
+                        if who==own {stats.get(&stat).copied()} else {None}
+                            .or_else(|| character_stats.get(&who)?.get(&stat).copied())
+                    },
+                ));
+            }
             self.camp_frame(dt, host);
             let mut collision = self.player.as_ref().and_then(|p| p.effect_surface())
                 .map(|surface| move |p| super::player::effect_collision(surface, p));
             let query = collision.as_mut().map(|query| query as &mut dyn FnMut(ao_render::Vec3) -> Option<(ao_render::Vec3, ao_render::Vec3)>);
             let player = self.player.as_ref();
+            if let Some(player) = player { player.prepare_effect_source(&mut self.zone.world, host); }
             self.zone.world.update_with_collision(dt, host.camera.pos.to_array(), host.camera.forward().to_array(), host, query, |id| {
                 player?.effect_anchor(id).map(|matrix| glam::Mat4::from_cols_array_2d(&matrix))
             });
@@ -1238,6 +1255,14 @@ impl Frontend for Play {
                     let voices = a.play_game_sound_with(s.id, s.pos, host.camera.pos.to_array(), s.material, s.size);
                     if std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
                         eprintln!("game sound {} at {:?}: {} voice(s) (material {}, size {})", s.id, s.pos, voices.len(), s.material, s.size);
+                    }
+                }
+            }
+            for (id, pos, duration, volume, selector, who) in self.zone.world.take_nano_sounds() {
+                if let Some(audio) = &self.audio {
+                    let voices = audio.play_game_sound_duration(id, pos, host.camera.pos.to_array(), duration, volume);
+                    if std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
+                        eprintln!("nano sound who={who} stage={selector:#x} id={id:#x} at {pos:?} duration={duration} volume={volume} voices={voices:?}");
                     }
                 }
             }
@@ -1348,6 +1373,9 @@ impl Frontend for Play {
             h.update(&mut self.gui, &mut self.zone, dt);
             if let Some(s) = &self.session {
                 for f in h.take_outbox() {
+                    if let Some(interact) = self.interact.as_mut() {
+                        interact.observe_use_request(&f, &self.zone);
+                    }
                     s.send_zone(f);
                 }
             }

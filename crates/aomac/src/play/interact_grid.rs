@@ -330,10 +330,10 @@ mod tests {
         use super::super::interact::Interact;
         use ao_net::n3::{self, N3};
         let Some(mut gui) = rig() else { return };
-        let z = zone(0x800);
+        let mut z = zone(0x800);
         let mut it = Interact::new(OWN, (1280, 800));
         let list = Grid::DestinationSelect { destinations: vec![dest(9991, "Alpha"), dest(9990, "Mid")], token: vec![1, 2] };
-        it.on_frame(&mut gui, &ao_net::n3::outgoing::n3_frame(0, 1, list.encode(ME)), &z);
+        it.on_frame(&mut gui, &ao_net::n3::outgoing::n3_frame(0, 1, list.encode(ME)), &mut z);
         assert!(it.grid_dump(&gui).contains("Mid | unknown pf"), "{}", it.grid_dump(&gui));
         assert!(!it.grid_select(&mut gui, 5));
         assert!(it.grid_select(&mut gui, 0));

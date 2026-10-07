@@ -28,7 +28,7 @@ impl Play {
             if let Some(hud) = self.hud.as_ref() {
                 i.mission.load_config(&hud.dvalues);
             }
-            i.on_frame(&mut self.gui, f, &self.zone);
+            i.on_frame(&mut self.gui, f, &mut self.zone);
         }
     }
 

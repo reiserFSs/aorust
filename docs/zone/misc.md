@@ -245,6 +245,10 @@ CAT-bound native effects receive the actual source model topology plus the same 
 for that character, before effect rendering; first-person hiding does not remove the own CAT geometry source.
 The feed is gated by native consumers, borrows existing model/pose data, and requests a fresh terminal pose only
 when a newly attached consumer needs it. No bind-pose substitution or fabricated body points are introduced.
+Own appearance rebuilds explicitly invalidate native source geometry even though the avatar's renderer model key
+is stable; unchanged appearance messages do not invalidate it. Foreign model-key changes use the existing key check.
+Actual `ToClientQuit` and corpse-replacement deletion notify the renderer of the missing identity before
+nano cancellation; death alone keeps the character identity and follows native graceful termination instead.
 
 Retail add `100512af` sets effect-handler category **4** (`NanoEffectFX`, `10051544`) and calls the single-dynel
 `CreateEffect2@100d1b1c` with template **stat413**, affected dynel, and zero extra argument. Category suppression exempts
@@ -504,6 +508,33 @@ verification is claimed.
 `retail_layouts_and_every_truncated_prefix` covers all six Gfx layouts, every
 truncated prefix, the NUL-bearing sound writer form and invalid sound lengths;
 no tests/builds/checks were run during this change.
+
+## 17. Shared authored-spell string framing (CF34)
+
+`spells::read_spell` is shared by N3 ApplySpells/full-update and installed item
+event readers. Fresh read-only GameData.dll decompilation confirms that
+`SpellArgument_c::GetBaseType` [GD 0x1000eac0] treats **only ComplexType 1**
+as a string; ComplexType 10 remains integer-valued.
+
+`SpellFormats_c` constructor [GD 0x1000fb0a] constructs CF34 (format 48) with
+`Add(1, 0, std::string)` **before** integer arguments with stats
+66, 67, 68, 69 and 78. The previous descriptor omitted that first argument;
+the fix inserts `(1, 0)`, not a string replacement for stat 66.
+`ValueFromBinary` [GD 0x1000f01d] reads the length and bytes, appends NUL and
+assigns a C string. The shared decoder consumes every framed byte but retains
+only the prefix before the first NUL. `ValueToBinary` [GD 0x1000ec37] writes
+zero for an empty string, otherwise length **including** NUL and the string
+with its terminating NUL; the encoder now follows that framing.
+
+Installed RDB item `1000020:43551`, event 0, has the CF34 spell at offsets
+598..692: header/standard words `53044,0,4,0,1,0,3,9`, length 38,
+`You have 30 seconds to swap implants.\0`, then five zero i32 arguments.
+The next CF41 starts at 692. `installed_cf34_string_precedes_integer_arguments`
+uses those exact authored words in record and wire endian, checks consumption,
+semantic text, integer arguments, encoder bytes, every truncated prefix and
+invalid lengths. A text search of `docs/captures/*.rec` found no CF34 or
+ApplySpells type-key occurrence; this fixture is an installed record, **not**
+a captured server message. No tests/builds/checks were run by this worker.
 
 ## UNRESOLVED / guesses
 

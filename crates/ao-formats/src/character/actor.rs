@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::character::player::part_textures;
+use super::anim::{AnimLayer, sample_layers};
 use ao_scene::Vertex;
 use std::sync::Arc;
 use std::cell::RefCell;
@@ -273,11 +274,21 @@ impl ActorRig {
     /// without one): the world matrix translation `VisualCATMesh_t::GetAttractorMatrix` hands to the camera look target
     /// (`FUN_10020af1` @N3 0x10020af1, docs/zone/camera.md §3). `None` for models without a head attractor.
     pub fn head_attractor(&self, clip: Option<(&CatAnim, f32)>) -> Option<[f32; 3]> {
+        let layer = clip.map(single_layer);
+        self.head_attractor_layered(layer.as_slice())
+    }
+
+    pub fn head_attractor_layered(&self, layers: &[AnimLayer<'_>]) -> Option<[f32; 3]> {
+        self.head_attractor_composed(layers.iter().copied())
+    }
+
+    pub fn head_attractor_composed<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> Option<[f32; 3]> {
         let att = self.cat.attractors.iter().find(|a| a.name.ends_with("_head"))?;
         let b = att.bone as usize;
-        let bone = match clip.filter(|(a, _)| a.signature == self.cat.signature) {
-            Some((a, ms)) => self.world(Some((a, ms)))[b],
-            None => self.bind[b].or_else(|| self.nearest_frame(&self.bind, b))?,
+        let bone = if layers.clone().any(|l| l.clip.signature == self.cat.signature) {
+            self.effect_bone(b, layers)?
+        } else {
+            self.bind[b].or_else(|| self.nearest_frame(&self.bind, b))?
         };
         Some(bone.mul(&Xf::from_qt(att.rot, att.pos)).t)
     }
@@ -285,40 +296,58 @@ impl ActorRig {
     /// Retail effect binding (GC 0x10105917), column-major model scene matrix.
     /// Missing authored geometry is not replaced with an invented offset.
     pub fn effect_anchor(&self, id: i32, clip: Option<(&CatAnim, f32)>) -> Option<[[f32; 4]; 4]> {
+        let layer = clip.map(single_layer);
+        self.effect_anchor_layered(id, layer.as_slice())
+    }
+
+    pub fn effect_anchor_layered(&self, id: i32, layers: &[AnimLayer<'_>]) -> Option<[[f32; 4]; 4]> {
+        self.effect_anchor_composed(id, layers.iter().copied())
+    }
+
+    pub fn effect_anchor_composed<'a>(&self, id: i32, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> Option<[[f32; 4]; 4]> {
         const BONES: [&str; 19] = ["Bip01 Pelvis_ac", "Bip01 Spine_ac", "Bip01 Spine1_ac", "Bip01 Spine2_ac", "Bip01 Spine3_ac", "Bip01 Neck_ac", "Bip01 Head_ac", "Bip01 L UpperArm_ac", "Bip01 R UpperArm_ac", "Bip01 L Forearm_ac", "Bip01 R Forearm_ac", "Bip01 L Thigh_ac", "Bip01 R Thigh_ac", "Bip01 L Calf_ac", "Bip01 R Calf_ac", "Bip01 L Foot_ac", "Bip01 R Foot_ac", "Bip01 L Hand_ac", "Bip01 R Hand_ac"];
         const ATTRACTORS: [&str; 24] = ["Attractor02_righthand", "Attractor03_lefthand", "Attractor01_head", "Attractor06_back", "Attractor05_leftshoulder", "Attractor04_rightshoulder", "Attractor07_special", "Attractor08_special", "Attractor09_special", "Attractor10_special", "Attractor11_special", "Attractor12_attack1", "Attractor13_attack2", "Attractor14_destroyed", "Attractor15_flare1_flash", "Attractor16_flare2_flash", "Attractor17_smoke75", "Attractor18_smoke50", "Attractor19_smoke25", "Attractor20_sparks50", "Attractor21_flames15", "Attractor22_flare1", "Attractor23_flare2", "Attractor30_beam"];
         if id == 0 { return Some(IDENTITY) }
-        if id == 3000 { return self.weapon_effect_anchor(1, clip) }
+        if id == 3000 { return self.weapon_effect_anchor_composed(1, layers) }
         let w = if let Some(name) = id.checked_sub(1000).and_then(|n| usize::try_from(n).ok()).and_then(|n| BONES.get(n)) {
-            self.cat.bones.iter().position(|b| b.name == *name).and_then(|bone| self.effect_bone(bone, clip))
-                .or_else(|| self.effect_attractor("Attractor01_head", clip))?
+            self.cat.bones.iter().position(|b| b.name == *name).and_then(|bone| self.effect_bone(bone, layers.clone()))
+                .or_else(|| self.effect_attractor("Attractor01_head", layers.clone()))?
         } else {
             let name = id.checked_sub(2000).and_then(|n| usize::try_from(n).ok()).and_then(|n| ATTRACTORS.get(n))?;
-            self.effect_attractor(name, clip).or_else(|| self.effect_attractor("Attractor01_head", clip))?
+            self.effect_attractor(name, layers.clone()).or_else(|| self.effect_attractor("Attractor01_head", layers.clone()))?
         };
         Some(effect_matrix(w))
     }
 
-    fn effect_attractor(&self, name: &str, clip: Option<(&CatAnim, f32)>) -> Option<Xf> {
+    fn effect_attractor<'a>(&self, name: &str, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> Option<Xf> {
         let att = self.cat.attractors.iter().find(|a| a.name == name)?;
-        Some(self.effect_bone(att.bone as usize, clip)?.mul(&Xf::from_qt(att.rot, att.pos)))
+        Some(self.effect_bone(att.bone as usize, layers)?.mul(&Xf::from_qt(att.rot, att.pos)))
     }
 
     /// Weapon connector composed through its animated hand attachment (GC 0x1009bded).
     /// `place` is the wire attachment place: 1 right hand, 2 left hand.
     pub fn weapon_effect_anchor(&self, place: u8, clip: Option<(&CatAnim, f32)>) -> Option<[[f32; 4]; 4]> {
+        let layer = clip.map(single_layer);
+        self.weapon_effect_anchor_layered(place, layer.as_slice())
+    }
+
+    pub fn weapon_effect_anchor_layered(&self, place: u8, layers: &[AnimLayer<'_>]) -> Option<[[f32; 4]; 4]> {
+        self.weapon_effect_anchor_composed(place, layers.iter().copied())
+    }
+
+    pub fn weapon_effect_anchor_composed<'a>(&self, place: u8, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> Option<[[f32; 4]; 4]> {
         let name = match place { 1 => "Attractor02_righthand", 2 => "Attractor03_lefthand", _ => return None };
         let mount = self.mounts.iter().find(|m| self.cat.attractors[m.attractor].name == name && m.muzzle.is_some())?;
         let att = &self.cat.attractors[mount.attractor];
-        let w = self.effect_bone(att.bone as usize, clip)?.mul(&Xf::from_qt(att.rot, att.pos)).mul(&mount.muzzle?);
+        let w = self.effect_bone(att.bone as usize, layers)?.mul(&Xf::from_qt(att.rot, att.pos)).mul(&mount.muzzle?);
         Some(effect_matrix(w))
     }
 
-    fn effect_bone(&self, bone: usize, clip: Option<(&CatAnim, f32)>) -> Option<Xf> {
-        let Some((a, ms)) = clip.filter(|(a, _)| a.signature == self.cat.signature) else { return self.bind[bone] };
-        let (q, t) = a.sample(bone, ms).unwrap_or(([0.0, 0.0, 0.0, 1.0], [0.0; 3]));
+    fn effect_bone<'a>(&self, bone: usize, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> Option<Xf> {
+        if !layers.clone().any(|l| l.clip.signature == self.cat.signature) { return self.bind[bone] }
+        let (q, t) = sample_layers(layers.clone(), self.cat.signature, bone).unwrap_or(([0.0, 0.0, 0.0, 1.0], [0.0; 3]));
         let local = Xf::from_qt(q, t.map(|c| c * self.scale[bone]));
-        Some(match self.parents[bone] { Some(parent) => self.effect_bone(parent, clip)?.mul(&local), None => local })
+        Some(match self.parents[bone] { Some(parent) => self.effect_bone(parent, layers)?.mul(&local), None => local })
     }
 
     /// Height (metres above the feet, bind pose, unscaled) of the name tag / indicator anchor: `Attractor01_head` + 0.5 m
@@ -328,12 +357,12 @@ impl ActorRig {
     }
 
     /// World frame of every bone in the pose (`FUN_100540a5`).
-    fn world(&self, pose: Option<(&CatAnim, f32)>) -> Vec<Xf> {
-        let mut world = vec![Xf::ID; self.cat.bones.len()];
+    fn world<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> Vec<Option<Xf>> {
+        let mut world = vec![Some(Xf::ID); self.cat.bones.len()];
         for &b in &self.order {
-            let (q, t) = pose.and_then(|(a, ms)| a.sample(b, ms)).unwrap_or(([0.0, 0.0, 0.0, 1.0], [0.0; 3]));
+            let (q, t) = sample_layers(layers.clone(), self.cat.signature, b).unwrap_or(([0.0, 0.0, 0.0, 1.0], [0.0; 3]));
             let local = Xf::from_qt(q, t.map(|c| c * self.scale[b]));
-            world[b] = self.parents[b].map_or(local, |p| world[p].mul(&local));
+            world[b] = Some(self.parents[b].map_or(local, |p| world[p].unwrap().mul(&local)));
         }
         world
     }
@@ -341,23 +370,33 @@ impl ActorRig {
     /// Body vertices (same layout as `model().meshes[0]`) and the per-mesh mount transforms (column-major, relative to the actor)
     /// for `clip` at `ms` milliseconds (caller controls looping); `None` = bind pose. `parts[0]` is identity.
     pub fn pose(&self, clip: Option<(&CatAnim, f32)>) -> (Vec<Vertex>, Vec<[[f32; 4]; 4]>) {
-        let clip = clip.filter(|(a, _)| a.signature == self.cat.signature);
+        let layer = clip.map(single_layer);
+        self.pose_layered(layer.as_slice())
+    }
+
+    /// Sample the authored-mask blend chain for skin, mounts and effect anchors.
+    pub fn pose_layered(&self, layers: &[AnimLayer<'_>]) -> (Vec<Vertex>, Vec<[[f32; 4]; 4]>) {
+        self.pose_composed(layers.iter().copied())
+    }
+
+    pub fn pose_composed<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> (Vec<Vertex>, Vec<[[f32; 4]; 4]>) {
+        let animated = layers.clone().any(|l| l.clip.signature == self.cat.signature);
         let mut verts = self.model.meshes[0].vertices.clone();
-        let frames: Vec<Option<Xf>> = match clip {
-            Some(_) => self.world(clip).into_iter().map(Some).collect(),
-            None => self.bind.clone(),
+        let frames: Vec<Option<Xf>> = if animated {
+            self.world(layers)
+        } else {
+            self.bind.clone()
         };
-        if clip.is_some() {
-            let world: Vec<Xf> = frames.iter().map(|f| f.unwrap()).collect();
+        if animated {
             let mut out = verts.iter_mut();
             for &si in &self.used {
                 for v in &self.cat.submeshes[si].vertices {
-                    let m0 = &world[v.bones[0] as usize];
+                    let m0 = &frames[v.bones[0] as usize].unwrap();
                     let p0 = m0.apply(v.local[0]);
                     let p = if v.weight >= SINGLE_BONE_WEIGHT {
                         p0
                     } else {
-                        let p1 = world[v.bones[1] as usize].apply(v.local[1]);
+                        let p1 = frames[v.bones[1] as usize].unwrap().apply(v.local[1]);
                         std::array::from_fn(|i| v.weight * p0[i] + (1.0 - v.weight) * p1[i])
                     };
                     let n = unit(m0.rot(v.normal));
@@ -396,6 +435,10 @@ impl ActorRig {
             }
         }
     }
+}
+
+fn single_layer((clip, ms): (&CatAnim, f32)) -> AnimLayer<'_> {
+    AnimLayer { clip, ms, layers: 3, blend: 1.0 }
 }
 
 /// Conjugate an AO frame by the scene Z mirror, as for rendered attachment parts.
@@ -443,6 +486,13 @@ mod tests {
                 }
                 assert_ne!(actual[3], hand[3], "muzzle must not be the hand or camera");
                 for id in 1000..=1007 { assert!(rig.effect_anchor(id, pose).is_some(), "bone anchor {id}"); }
+                let layers = [
+                    AnimLayer { clip: &clip, ms, layers: 3, blend: 1.0 },
+                    AnimLayer { clip: &clip, ms, layers: 2, blend: 1.0 },
+                ];
+                assert_eq!(rig.effect_anchor_layered(3000, &layers), Some(actual));
+                assert_eq!(rig.head_attractor_layered(&layers), rig.head_attractor(pose));
+                assert_eq!(rig.pose_layered(&layers).1, rig.pose(pose).1);
             }
             assert!(rig.effect_anchor(2001, None).is_some());
             assert!(rig.weapon_effect_anchor(2, None).is_none());

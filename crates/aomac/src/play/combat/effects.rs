@@ -99,6 +99,26 @@ pub use aux::AuxSound;
 mod particles;
 #[path = "effects_particles2.rs"]
 mod particles2;
+#[path = "effects_replicated.rs"]
+mod replicated;
+#[path = "effects_crystal.rs"]
+mod crystal;
+#[path = "effects_buffs.rs"]
+mod buffs;
+#[path = "effects_buff200x.rs"]
+mod buff200x;
+#[path = "effects_buffelectra.rs"]
+mod buffelectra;
+#[path = "effects_buffstars.rs"]
+mod buffstars;
+#[path = "effects_buff300x.rs"]
+mod buff300x;
+#[path = "effects_buff_shield.rs"]
+mod buff_shield;
+#[path = "effects_buff303x.rs"]
+mod buff303x;
+#[path = "effects_highlight.rs"]
+mod highlight;
 #[cfg(test)]
 #[path = "effects_survey.rs"]
 mod survey;
@@ -159,6 +179,8 @@ struct Active {
     aux: Option<aux::AuxEffect>,
     particle: Option<particles::ParticleEffect>,
     particle2: Option<particles2::ParticleEffect>,
+    native_replicated: Option<replicated::ReplicatedEffect>,
+    buff: Option<Box<buffs::Buff>>,
 }
 
 struct EffectModel {
@@ -176,6 +198,8 @@ pub struct EffectConfig {
     pub scale: Option<f32>,
     pub source_identity: Option<(u32,u32)>,
     pub target_identity: Option<(u32,u32)>,
+    /// Nonzero CreateEffect2 dynel argument overrides the native connector attractor.
+    pub source_attractor: Option<i32>,
     pub source_appearance: Option<[i32;4]>,
     pub target_appearance: Option<[i32;4]>,
     /// Native dynel locator overload; matrix-created children leave this false.
@@ -206,6 +230,10 @@ pub struct Renderer {
     anchor_ids: Vec<i32>,
     control_work: Vec<(u32,control::Controller)>,
     composition_work: Vec<(u32,composition::Composition)>,
+    native_work: Vec<(u32,replicated::ReplicatedEffect)>,
+    buff_work: Vec<(u32,Box<buffs::Buff>)>,
+    buff_models: HashMap<u32,EffectModel>,
+    retired_buff_models: Vec<u64>,
     aux_sounds: Vec<aux::AuxSound>,
 }
 
@@ -217,7 +245,7 @@ impl Renderer {
         let mut anchor_ids: Vec<_> = templates.by_id.values().filter_map(|t| t.words.get(7).map(|v| *v as i32)).chain(1000..=1018).chain(2000..=2023).chain([3000,3001]).collect();
         anchor_ids.sort_unstable();
         anchor_ids.dedup();
-        Ok(Self { templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::new(1), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),anchor_ids,control_work:vec![],composition_work:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![] })
+        Ok(Self { templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::new(1), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![] })
     }
 
     pub fn clear(&mut self) {
@@ -225,28 +253,48 @@ impl Renderer {
         for mut a in active {
             if let Some(c) = &mut a.control { c.cancel(self); }
             if let Some(c) = &mut a.composition { if let Err(error)=c.cancel(self) { eprintln!("effect cancellation: {error:#}"); } }
+            if let Some(native)=&mut a.native_replicated { native.cancel(self); }
+            if let Some(buff)=&mut a.buff { if let Err(error)=buff.cancel(self) {eprintln!("buff cancellation: {error:#}");} }
         }
         self.active.clear();
+        self.retired_buff_models.extend(self.buff_models.iter().filter(|(_,model)|model.uploaded).map(|(&handle,_)|0xfac2_0000_0000_0000|u64::from(handle)));
+        self.buff_models.clear();
         self.bph_last.clear();
         self.anchors.clear();
         self.aux_sounds.clear();
     }
 
-    pub fn supports(kind: i32) -> bool { matches!(kind,1001|1005|1006|1010|1025|1027|3025) || beams::Beam::supports(kind) || sprites::SpriteEffect::supports(kind) || composition::Composition::supports(kind) || aux::AuxEffect::supports(kind) || particles::ParticleEffect::supports(kind) || particles2::ParticleEffect::supports(kind) }
+    pub fn supports(kind: i32) -> bool { matches!(kind,1001|1005|1006|1010|1025|1027|3025) || beams::Beam::supports(kind) || sprites::SpriteEffect::supports(kind) || composition::Composition::supports(kind) || aux::AuxEffect::supports(kind) || particles::ParticleEffect::supports(kind) || particles2::ParticleEffect::supports(kind) || replicated::ReplicatedEffect::supports(kind) || buffs::Buff::supports(kind) }
     pub fn delete(&mut self, handle: u32) {
         if let Some(index) = self.active.iter().position(|a| a.actor == handle) {
             let mut a = self.active.swap_remove(index);
             if let Some(c) = &mut a.control { c.cancel(self); }
             if let Some(c) = &mut a.composition { if let Err(error)=c.cancel(self) { eprintln!("effect cancellation: {error:#}"); } }
+            if let Some(native)=&mut a.native_replicated { native.cancel(self); }
+            if let Some(buff)=&mut a.buff { if let Err(error)=buff.cancel(self) {eprintln!("buff cancellation: {error:#}");} }
+            if self.buff_models.remove(&handle).is_some_and(|model|model.uploaded) {self.retired_buff_models.push(0xfac2_0000_0000_0000|u64::from(handle));}
+        }
+    }
+    pub fn source_model_changed(&mut self,identity:(u32,u32)) {
+        for buff in self.active.iter_mut().filter_map(|a|a.buff.as_mut()) {
+            if buff.identity()==Some(identity) {buff.source_model_changed();}
         }
     }
     pub fn is_active(&self, handle: u32) -> bool { self.active.iter().any(|a| a.actor == handle) }
+    /// Native GC10110b31/10114b20: destroyed source dynels delete Shield2/Trail2.
+    /// Lack of a visible actor or a fresh CPU pose is not dynel destruction.
+    pub fn source_deleted(&mut self,identity:(u32,u32)) {
+        while let Some(handle)=self.active.iter().find(|a| {
+            a.config.source_identity==Some(identity)
+                && matches!(self.templates.by_id[&a.effect].kind,3034|3039)
+        }).map(|a|a.actor) {self.delete(handle);}
+    }
     pub fn update_source(&mut self, handle: u32, source: Mat4) {
         let mut forwarded=None;
         if let Some(a) = self.active.iter_mut().find(|a| a.actor == handle) {
             let template=&self.templates.by_id[&a.effect];
             a.raw_source=source;
-            a.source=if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|3020) {
+            a.source=if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|1018|3020) {
                 match sprites::connector(template,source) { Ok(m)=>m,Err(error)=>{eprintln!("effect connector: {error:#}");return;} }
             } else {source};
             if let Some(s) = &mut a.sprite { s.update_source(a.source); }
@@ -256,6 +304,8 @@ impl Renderer {
             if let Some(p)=&mut a.particle2 {if let Err(error)=p.update_source(source) {eprintln!("effect particle connector: {error:#}");}}
             if let Some(t)=&mut a.tracer_mesh { if let Err(error)=t.set_anchors(source,a.target) {eprintln!("effect mesh connector: {error:#}");} }
             if let Some(aux)=&mut a.aux { aux.update_source(source); }
+            if let Some(native)=&mut a.native_replicated { native.update_source(source); }
+            if let Some(buff)=&mut a.buff {if let Err(error)=buff.update_source(source) {eprintln!("buff source: {error:#}");}}
             if template.kind==1019 {
                 if let Some(b)=&mut a.beam { if let Err(error)=b.update_source(source) {eprintln!("effect connector: {error:#}");} }
             }
@@ -268,6 +318,7 @@ impl Renderer {
         let mut source=None;
         if let Some(a) = self.active.iter_mut().find(|a| a.actor==handle) {
             if let Some(c) = &mut a.composition { c.update_position(position);forwarded=c.forwarded_children(); }
+            else if let Some(native)=&mut a.native_replicated {native.update_position(position);}
             else {let mut m=a.raw_source;m.w_axis=position.extend(1.0);source=Some(m);}
         }
         if let Some(source)=source {self.update_source(handle,source);}
@@ -277,10 +328,16 @@ impl Renderer {
     pub fn prepare_anchors(&mut self,identity:(u32,u32),mut resolve:impl FnMut((u32,u32),i32)->Option<Mat4>) {
         for &id in &self.anchor_ids { self.anchors.insert((identity,id),resolve(identity,id)); }
     }
+    pub fn prepare_anchor(&mut self, identity: (u32,u32), id: i32, matrix: Option<Mat4>) {
+        self.anchors.insert((identity,id),matrix);
+    }
 
     pub fn refresh_anchors(&mut self, mut resolve: impl FnMut((u32,u32),i32)->Option<Mat4>) {
         self.anchors.clear();
         for a in &self.active {
+            if let (Some(identity),Some(id)) = (a.config.source_identity,a.config.source_attractor) {
+                self.anchors.entry((identity,id)).or_insert_with(|| resolve(identity,id));
+            }
             for identity in [a.config.source_identity,a.config.target_identity].into_iter().flatten() {
                 for &id in &self.anchor_ids {
                     self.anchors.entry((identity,id)).or_insert_with(|| resolve(identity,id));
@@ -288,12 +345,20 @@ impl Renderer {
             }
         }
         for a in &mut self.active {
+            if let (Some(native),Some(identity)) = (&mut a.native_replicated,a.config.target_identity) {
+                if self.templates.by_id[&a.effect].words[0]&1 !=0 {
+                    if let Some(target)=resolve(identity,native.target_attractor()) {
+                        a.target=target.w_axis.truncate();
+                        native.update_target(target);
+                    } else {native.invalidate_target();}
+                }
+            }
             let Some(identity) = a.config.source_identity else { continue };
             let template=&self.templates.by_id[&a.effect];
-            if a.config.track_source && !matches!(template.kind,2007|4000) && template.words[0]&1 !=0 && a.beam.is_none() && a.mesh.is_none() {
+            if a.config.track_source && !matches!(template.kind,2007|2011|3004|3029|4000) && template.words[0]&1 !=0 && a.beam.is_none() && a.mesh.is_none() {
                 if let Some(source) = self.anchors.get(&(identity,a.attractor)).copied().flatten() {
                     a.raw_source=source;
-                    let source=if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|3020) {
+                    let source=if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|1018|3020) {
                         match sprites::connector(template,source) {Ok(m)=>m,Err(error)=>{eprintln!("effect connector: {error:#}");continue;}}
                     } else {source};
                     a.source = source;
@@ -304,6 +369,7 @@ impl Renderer {
                     if let Some(p)=&mut a.particle2 {if let Err(error)=p.update_source(a.raw_source) {eprintln!("effect particle connector: {error:#}");}}
                     if let Some(t)=&mut a.tracer_mesh { if let Err(error)=t.set_anchors(source,a.target) {eprintln!("effect mesh connector: {error:#}");} }
                     if let Some(aux)=&mut a.aux {aux.update_source(source);}
+                    if let Some(buff)=&mut a.buff {if let Err(error)=buff.update_source(source) {eprintln!("buff source: {error:#}");}}
                 }
             }
             if let Some(c) = &mut a.control {
@@ -321,6 +387,9 @@ impl Renderer {
                     }
                 }
             }
+            if let Some(buff)=&mut a.buff {
+                if let Err(error)=buff.refresh_anchors(|id|self.anchors.get(&(identity,id)).copied().flatten()) {eprintln!("buff anchors: {error:#}");}
+            }
             if let Some(s) = &mut a.sprite {
                 let mut matrices = [Mat4::IDENTITY;14];
                 let ids = s.anchor_ids();
@@ -331,12 +400,38 @@ impl Renderer {
         }
     }
     pub fn terminate_gracefully(&mut self, handle: u32) {
-        if let Some(a) = self.active.iter_mut().find(|a| a.actor == handle) {
-            let t = &self.templates.by_id[&a.effect];
-            if matches!(t.kind,1005|1006) {
-                let life = if t.kind == 1006 { a.config.duration.map(|d| d*0.8).unwrap_or(f32::from_bits(t.words[34])) } else { f32::from_bits(t.words[35]) };
-                a.stop_at = Some(a.elapsed+life);
-            }
+        let Some(index) = self.active.iter().position(|a| a.actor == handle) else { return };
+        let kind = self.templates.by_id[&self.active[index].effect].kind;
+        // Native slot 6 sets the control's terminating byte for these classes:
+        // 100d385e / 100f20bd / 100f5a3c / base 100a719a.
+        if matches!(kind,1001|1010|1011|1012|3007|3020|3031|3032) {
+            self.delete(handle);
+            return;
+        }
+        if let Some(mut buff)=self.active[index].buff.take() {
+            if let Err(error)=buff.graceful(self) {eprintln!("buff termination: {error:#}");}
+            if let Some(a)=self.active.iter_mut().find(|a|a.actor==handle) {a.buff=Some(buff);}
+            return;
+        }
+        let mut children = None;
+        let a = &mut self.active[index];
+        let t = &self.templates.by_id[&a.effect];
+        if matches!(kind,1005|1006) {
+            let life = if kind == 1006 { a.config.duration.map(|d| d*0.8).unwrap_or(f32::from_bits(t.words[34])) } else { f32::from_bits(t.words[35]) };
+            a.stop_at = Some(a.elapsed+life);
+        } else if matches!(kind,1009|1018) {
+            // GC100f0352 / 100f0f33: stop emission, retain the native lifetime tail.
+            let life=f32::from_bits(t.words[if kind==1018 {35}else{26}]);
+            if let Some(sprite) = &mut a.sprite { sprite.configure(EffectConfig {duration:Some(a.elapsed+life),..a.config}); }
+            a.stop_at = Some(a.elapsed+life);
+        } else if kind == 3028 {
+            if let Some(particle) = &mut a.particle2 { particle.terminate_gracefully(); }
+        } else if kind == 2007 {
+            // GC100e5888 forwards the call without deleting the child handles.
+            children = a.composition.as_ref().and_then(|c| c.forwarded_children());
+        }
+        if let Some(children) = children {
+            for child in children { if child != 0 { self.terminate_gracefully(child); } }
         }
     }
     pub fn next_state(&mut self, handle: u32) {
@@ -347,11 +442,16 @@ impl Renderer {
         }
     }
 
+    pub fn effect_kind(&self, effect: i32) -> Option<i32> {
+        self.templates.by_id.get(&effect).map(|template| template.kind)
+    }
+
+
     /// Default connector attractor (parameter 7), overridden by a nonzero item tuple.
     pub fn attractor(&self, effect: i32, explicit: i32) -> Option<i32> {
         if explicit != 0 { return Some(explicit); }
         let template=self.templates.by_id.get(&effect)?;
-        if matches!(template.kind,2007|4000) {Some(0)} else {template.words.get(7).map(|&v|v as i32)}
+        if matches!(template.kind,2007|2011|3004|3029|4000) {Some(0)} else {template.words.get(7).map(|&v|v as i32)}
     }
 
     pub fn spawn(&mut self, binding: Binding, source: Mat4, target: Vec3) -> Result<()> {
@@ -380,13 +480,13 @@ impl Renderer {
         if template.kind == 1006 {
             ensure!(config.duration.is_none_or(|d| d > 0.0), "invalid starburst duration");
         }
-        let attractor = if binding.attractor != 0 { binding.attractor } else if matches!(template.kind,2007|4000) {0} else {template.word(7)? as i32};
-        let source = if config.track_source && !matches!(template.kind,2007|4000) {
+        let attractor = if let Some(explicit) = config.source_attractor.filter(|&id| id != 0) { explicit } else if binding.attractor != 0 { binding.attractor } else if matches!(template.kind,2007|2011|3004|3029|4000) {0} else {template.word(7)? as i32};
+        let source = if config.track_source && !matches!(template.kind,2007|2011|3004|3029|4000) {
             let who=config.source_identity.context("dynel effect requires source identity")?;
             self.anchors.get(&(who,attractor)).copied().flatten().with_context(|| format!("missing effect {} source anchor {attractor}",binding.effect))?
         } else {source};
         let raw_source=source;
-        let source = if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|3020) { sprites::connector(template,source)? } else { source };
+        let source = if matches!(template.kind,1001|1004|1005|1006|1007|1008|1009|1012|1018|3020) { sprites::connector(template,source)? } else { source };
         let controller = if matches!(template.kind,1001|1010) { Some(control::Controller::new(template,source,target,config)?) } else { None };
         let mut sprite = if sprites::SpriteEffect::supports(template.kind) { Some(sprites::SpriteEffect::new_with_id(binding.effect,template,source,Mat4::from_translation(target),binding.color,&mut self.display_random)?) } else { None };
         if let Some(s) = &mut sprite { s.configure(config); }
@@ -403,12 +503,31 @@ impl Renderer {
         if let Some(p)=&mut particle {p.configure(config)?;}
         let mut particle2=if particles2::ParticleEffect::supports(template.kind) {Some(particles2::ParticleEffect::new(template,raw_source,Mat4::from_translation(target),binding.color,&mut self.random,&mut self.display_random,&mut self.rng)?)} else {None};
         if let Some(p)=&mut particle2 {p.configure(config)?;}
-        let count = if template.kind == 1025 || beam.is_some() || sprite.is_some() || controller.is_some() || composition.is_some() || mesh.is_some() || tracer_mesh.is_some() || auxiliary.is_some() || particle.is_some() || particle2.is_some() { 1 } else { sprite_capacity(template)? };
-        if mesh.is_none() && tracer_mesh.is_none() && auxiliary.is_none() && !self.models.contains_key(&binding.effect) {
-            let groups = if let Some(beam) = &beam { beam.models() } else if let Some(s) = &sprite { s.models() } else if let Some(c) = &controller { c.models() } else if let Some(c) = &composition { c.models() } else if let Some(p)=&particle {p.models()} else if let Some(p)=&particle2 {p.models()} else {
+        let mut native_replicated=if replicated::ReplicatedEffect::supports(template.kind) {
+            let mut native_config=config;
+            if binding.color!=0 {
+                let [a,r,g,b]=binding.color.to_be_bytes().map(|v| v as f32/255.0);
+                native_config.start_color=Some([r,g,b,a]);
+                native_config.stop_color=Some([r,g,b,0.0]);
+            }
+            let mut native=replicated::ReplicatedEffect::new(template,raw_source,target,native_config)?;
+            if let Some(identity)=config.target_identity {
+                let matrix=self.anchors.get(&(identity,native.target_attractor())).copied().flatten()
+                    .context("missing replicated effect target connector")?;
+                native.update_target(matrix);
+            }
+            Some(native)
+        } else {None};
+        let mut buff=if buffs::Buff::supports(template.kind) {Some(Box::new(buffs::Buff::new(template,raw_source,target,binding.color,config,&mut self.random,&mut self.display_random,&mut self.rng)?))} else {None};
+        if let (Some(buff),Some(identity))=(&mut buff,config.source_identity) {
+            buff.refresh_anchors(|id|self.anchors.get(&(identity,id)).copied().flatten())?;
+        }
+        let count = if template.kind == 1025 || beam.is_some() || sprite.is_some() || controller.is_some() || composition.is_some() || mesh.is_some() || tracer_mesh.is_some() || auxiliary.is_some() || particle.is_some() || particle2.is_some() || native_replicated.is_some() || buff.is_some() { 1 } else { sprite_capacity(template)? };
+        if buff.is_none() && mesh.is_none() && tracer_mesh.is_none() && auxiliary.is_none() && !self.models.contains_key(&binding.effect) {
+            let groups = if let Some(beam) = &beam { beam.models() } else if let Some(s) = &sprite { s.models() } else if let Some(c) = &controller { c.models() } else if let Some(c) = &composition { c.models() } else if let Some(p)=&particle {p.models()} else if let Some(p)=&particle2 {p.models()} else if let Some(native)=&native_replicated {native.models()} else {
                 vec![(Some(template.word(9)? as usize), (0..count as u32).flat_map(|i| [i*4,i*4+2,i*4+3,i*4,i*4+3,i*4+1]).collect(), count*4)]
             };
-            let blends = if let Some(beam) = &beam { beam.blends() } else if let Some(s) = &sprite { s.blends() } else if let Some(c) = &controller { c.blends() } else if let Some(c) = &composition { c.blends() } else if let Some(p)=&particle {p.blends()} else if let Some(p)=&particle2 {p.blends()} else { vec![Blend::Additive] };
+            let blends = if let Some(beam) = &beam { beam.blends() } else if let Some(s) = &sprite { s.blends() } else if let Some(c) = &controller { c.blends() } else if let Some(c) = &composition { c.blends() } else if let Some(p)=&particle {p.blends()} else if let Some(p)=&particle2 {p.blends()} else if let Some(native)=&native_replicated {native.blends()} else { vec![Blend::Additive] };
             let mut scene = Scene::default();
             let mut vertices = Vec::new();
             let mut submeshes = Vec::new();
@@ -441,8 +560,57 @@ impl Renderer {
         let actor = self.next_actor;
         self.next_actor = self.next_actor.wrapping_add(mesh.as_ref().map(|m| m.actor_count()).or_else(|| tracer_mesh.as_ref().map(|m|m.actor_count())).unwrap_or(1).max(1) as u32).max(ACTOR_BASE);
         if let Some(c) = &mut composition { c.initialize(self)?; }
-        self.active.push(Active { actor, effect: binding.effect, source, raw_source,target, elapsed: 0.0, color: binding.color, particles, emitted, next_burst: -1.0, repetitions, config, beam, stop_at: None, ticks:0,sprite,control:controller,attractor,composition,mesh,tracer_mesh,aux:auxiliary,particle,particle2 });
+        if let Some(native)=&mut native_replicated { native.initialize(self)?; }
+        if let Some(buff)=&buff {
+            if buff.needs_private_model() {let model=self.buff_model(buff)?;self.buff_models.insert(actor,model);}
+            else if !self.models.contains_key(&binding.effect) {let model=self.buff_model(buff)?;self.models.insert(binding.effect,model);}
+        }
+        self.active.push(Active { actor, effect: binding.effect, source, raw_source,target, elapsed: 0.0, color: binding.color, particles, emitted, next_burst: -1.0, repetitions, config, beam, stop_at: None, ticks:0,sprite,control:controller,attractor,composition,mesh,tracer_mesh,aux:auxiliary,particle,particle2,native_replicated,buff });
         Ok(actor)
+    }
+    fn buff_model(&self,buff:&buffs::Buff)->Result<EffectModel> {
+        let mut scene=Scene::default();
+        let mut vertices=Vec::new();
+        let mut submeshes=Vec::new();
+        for ((material,indices,count),blend) in buff.models().into_iter().zip(buff.blends()) {
+            let key=if let Some(key)=buff.source_texture() {Some(key)} else if let Some(material)=material {
+                let &(name,_,_,_,_)=materials::MATERIALS.get(material).context("unknown buff material")?;
+                Some(TextureKey {rdb_type:1010004,id:self.names.id(1010004,name).with_context(||format!("missing buff texture {name}"))?})
+            } else {None};
+            if let Some(key)=key {
+                if let std::collections::hash_map::Entry::Vacant(entry)=scene.textures.entry(key) {
+                    entry.insert(ao_formats::texture::load_texture(&self.store,key)?.with_context(||format!("missing buff texture {}",key.id))?);
+                }
+            }
+            let offset=vertices.len() as u32;
+            let mut sub=Submesh::new(indices.into_iter().map(|i|i+offset).collect(),key);
+            sub.blend=blend;sub.two_sided=true;sub.emissive=[1.0;3];
+            submeshes.push(sub);vertices.resize(vertices.len()+count,Vertex::default());
+        }
+        scene.meshes.push(Mesh {vertices,submeshes});
+        Ok(EffectModel {scene,uploaded:false})
+    }
+    pub fn needs_source_mesh(&self,identity:(u32,u32))->bool {
+        self.active.iter().filter_map(|a|a.buff.as_ref()).any(|b|b.identity()==Some(identity)&&b.needs_source_mesh())
+    }
+    pub fn needs_source_pose(&self,identity:(u32,u32))->bool {
+        self.active.iter().filter_map(|a|a.buff.as_ref()).any(|b|b.identity()==Some(identity)&&b.needs_source_pose())
+    }
+    pub fn prepare_source_mesh(&mut self,identity:(u32,u32),scene:&Scene,actor:&ActorFrame) {
+        for index in 0..self.active.len() {
+            let Some(mut buff)=self.active[index].buff.take() else {continue};
+            if buff.identity()==Some(identity)&&buff.needs_source_mesh() {
+                match buff.prepare_source(scene,actor,&mut self.rng) {
+                    Ok(true) if buff.needs_private_model()=>match self.buff_model(&buff) {
+                        Ok(model)=>{self.buff_models.insert(self.active[index].actor,model);}
+                        Err(error)=>eprintln!("buff model: {error:#}"),
+                    },
+                    Ok(_)=>{},
+                    Err(error)=>eprintln!("buff source geometry: {error:#}"),
+                }
+            }
+            self.active[index].buff=Some(buff);
+        }
     }
 
     pub fn take_aux_sounds(&mut self)->impl Iterator<Item=AuxSound>+'_ {self.aux_sounds.drain(..)}
@@ -501,10 +669,47 @@ impl Renderer {
             } else { self.delete(handle); }
         }
         self.composition_work = work;
+        let mut work=std::mem::take(&mut self.native_work);
+        for a in &mut self.active {
+            if let Some(native)=a.native_replicated.take() { work.push((a.actor,native)); }
+        }
+        for (handle,mut native) in work.drain(..) {
+            if !self.is_active(handle) { native.cancel(self); continue; }
+            let alive=match native.frame(dt.abs(),self) {
+                Ok(alive)=>alive,
+                Err(error)=>{eprintln!("replicated effect: {error:#}");false}
+            };
+            if alive {
+                if let Some(a)=self.active.iter_mut().find(|a| a.actor==handle) {a.native_replicated=Some(native);}
+                else {native.cancel(self);}
+            } else {native.cancel(self);self.delete(handle);}
+        }
+        self.native_work=work;
+        let mut work=std::mem::take(&mut self.buff_work);
+        for a in &mut self.active {if let Some(buff)=a.buff.take() {work.push((a.actor,buff));}}
+        for (handle,mut buff) in work.drain(..) {
+            if !self.is_active(handle) {let _=buff.cancel(self);continue;}
+            let alive=match buff.frame(dt.abs(),self) {
+                Ok(alive)=>alive,
+                Err(error)=>{eprintln!("buff control: {error:#}");false},
+            };
+            if alive {
+                if let Some(a)=self.active.iter_mut().find(|a|a.actor==handle) {a.buff=Some(buff);}
+                else {let _=buff.cancel(self);}
+            } else {let _=buff.cancel(self);self.delete(handle);}
+        }
+        self.buff_work=work;
         if self.generation != host.scene_generation() {
             self.generation = host.scene_generation();
             for model in self.models.values_mut() { model.uploaded = false; }
+            for model in self.buff_models.values_mut() {model.uploaded=false;}
             for uploaded in self.mesh_uploaded.values_mut() { *uploaded=false; }
+        }
+        for (handle,model) in &mut self.buff_models {
+            if !model.uploaded {
+                host.actor_models.push((0xfac2_0000_0000_0000|u64::from(*handle),model.scene.clone()));
+                model.uploaded=true;
+            }
         }
         for (id, model) in &mut self.models {
             if !model.uploaded {
@@ -551,8 +756,24 @@ impl Renderer {
                 if let Some(sound)=aux.take_sound() {self.aux_sounds.push(sound);}
                 return alive;
             }
+            if let Some(buff)=&mut effect.buff {
+                buff.apply_material(&mut host.actors);
+                let terrain:Option<&mut dyn FnMut(Vec3)->Option<(Vec3,Vec3)>>=match &mut collision {Some(f)=>Some(&mut **f),None=>None};
+                match buff.vertices(effect.elapsed,camera,right,up,&mut self.random,&mut self.display_random,&mut self.rng,terrain) {
+                    Ok(Some(groups))=>{
+                        let skin:Vec<_>=groups.into_iter().flatten().collect();
+                        if !skin.is_empty() {
+                            let model=if buff.needs_private_model() {0xfac2_0000_0000_0000|u64::from(effect.actor)}else{MODEL_BASE|effect.effect as u32 as u64};
+                            host.actors.push(ActorFrame {id:effect.actor,model,transform:IDENTITY,skin:Some(skin),always:true,alpha:1.0,..Default::default()});
+                        }
+                        return true;
+                    },
+                    Ok(None)=>return false,
+                    Err(error)=>{eprintln!("buff vertices: {error:#}");return false;},
+                }
+            }
             let duration = effect.stop_at.unwrap_or_else(|| if template.kind == 1006 { f32::from_bits(template.words[8]) } else { effect.config.duration.unwrap_or(f32::from_bits(template.words[8])) });
-            if effect.control.is_none() && effect.composition.is_none() && effect.particle.is_none() && effect.particle2.is_none() && duration > 0.0 && effect.elapsed > duration { return false; }
+            if effect.control.is_none() && effect.composition.is_none() && effect.native_replicated.is_none() && effect.particle.is_none() && effect.particle2.is_none() && duration > 0.0 && effect.elapsed > duration { return false; }
             let mut skin = Vec::with_capacity(self.models[&effect.effect].scene.meshes[0].vertices.len());
             if let Some(beam) = &mut effect.beam {
                 let Ok(Some(groups)) = beam.vertices(effect.elapsed,camera,right,up,&mut self.beam_state) else { return false };
@@ -575,6 +796,9 @@ impl Renderer {
                 let Ok(Some(groups)) = c.vertices(effect.elapsed,camera,right,up) else { return false };
                 for group in groups { skin.extend(group); }
                 if skin.is_empty() { return true; }
+            } else if let Some(native)=&mut effect.native_replicated {
+                if native.write_vertices(effect.elapsed,right,up,&mut self.display_random,&mut skin).is_err() {return false;}
+                if skin.is_empty() {return true;}
             } else if template.kind == 1025 {
                 let Ok(Some((tail, head, width))) = Self::projectile(template, effect.source.w_axis.truncate(), effect.target, effect.elapsed) else { return false };
                 let side = (head-tail).cross(camera-(head+tail)*0.5).normalize_or_zero()*width;
@@ -621,6 +845,13 @@ impl Renderer {
             host.actors.push(ActorFrame { id: effect.actor, model: MODEL_BASE | effect.effect as u32 as u64, transform: IDENTITY, parts: vec![], skin: Some(skin), always: true, alpha: 1.0, ..Default::default() });
             true
         });
+        self.buff_models.retain(|handle,model| {
+            let alive=self.active.iter().any(|a|a.actor==*handle);
+            if !alive && model.uploaded {self.retired_buff_models.push(0xfac2_0000_0000_0000|u64::from(*handle));}
+            alive
+        });
+        host.actor_models.retain(|(key,_)|!self.retired_buff_models.contains(key));
+        host.actor_model_removals.append(&mut self.retired_buff_models);
     }
 }
 
@@ -763,7 +994,7 @@ mod tests {
     }
 
     fn active_sprite(template: &Template) -> Active {
-        Active { actor:ACTOR_BASE,effect:1,source:Mat4::IDENTITY,raw_source:Mat4::IDENTITY,target:Vec3::X,elapsed:0.0,color:0,particles:vec![],emitted:-(template.words[31] as i64),next_burst:-1.0,repetitions:1,config:EffectConfig::default(),beam:None,stop_at:None,ticks:0,sprite:None,control:None,attractor:0,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None }
+        Active { actor:ACTOR_BASE,effect:1,source:Mat4::IDENTITY,raw_source:Mat4::IDENTITY,target:Vec3::X,elapsed:0.0,color:0,particles:vec![],emitted:-(template.words[31] as i64),next_burst:-1.0,repetitions:1,config:EffectConfig::default(),beam:None,stop_at:None,ticks:0,sprite:None,control:None,attractor:0,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None,native_replicated:None,buff:None }
     }
 
     #[test]
@@ -827,6 +1058,97 @@ mod tests {
         a.elapsed = 1.01;
         emit_sprites(&t,&mut a,&mut rng,&mut random,16,0.01);
         assert!(a.particles.is_empty());
+    }
+
+    #[test]
+    fn persistent_buff_renderer_remove_refresh_and_death() {
+        let dir=ao_gui::client_dir();
+        if !dir.join("Setupf/gfxtweak.bin").exists() || !dir.join("cd_image/rdb.db").exists() {return;}
+        let mut renderer=Renderer::open(&dir).unwrap();
+        let identity=(50000,1234);
+        let binding=Binding {group:0,attractor:0,effect:11506,note:0,color:0};
+        let config=EffectConfig {source_identity:Some(identity),..Default::default()};
+        let first=renderer.spawn_configured(binding,Mat4::IDENTITY,Vec3::ZERO,config).unwrap();
+        assert!(renderer.is_active(first));
+        assert!(renderer.needs_source_mesh(identity));
+        renderer.prepare_source_mesh(identity,&Scene::default(),&ActorFrame {id:1234,..Default::default()});
+        assert!(!renderer.needs_source_pose(identity));
+        renderer.terminate_gracefully(first);
+        assert!(renderer.is_active(first),"native mode2 keeps its ramp-down tail");
+        renderer.delete(first);
+        assert!(!renderer.is_active(first));
+        let refreshed=renderer.spawn_configured(binding,Mat4::IDENTITY,Vec3::ZERO,config).unwrap();
+        assert_ne!(refreshed,first);
+        assert!(renderer.is_active(refreshed));
+        renderer.clear();
+        assert!(!renderer.is_active(refreshed));
+        assert!(!renderer.needs_source_mesh(identity));
+        assert!(renderer.buff_models.is_empty());
+    }
+
+    #[test]
+    fn deleted_source_kills_shield_but_missing_pose_preserves_it() {
+        let dir=ao_gui::client_dir();
+        if !dir.join("Setupf/gfxtweak.bin").exists() || !dir.join("cd_image/rdb.db").exists() {return;}
+        let mut renderer=Renderer::open(&dir).unwrap();
+        let identity=(50000,1234);
+        let binding=Binding {group:0,attractor:0,effect:72260,note:0,color:0};
+        let handle=renderer.spawn_configured(binding,Mat4::IDENTITY,Vec3::ZERO,EffectConfig {source_identity:Some(identity),..Default::default()}).unwrap();
+        assert!(renderer.needs_source_pose(identity));
+        renderer.prepare_source_mesh(identity,&Scene::default(),&ActorFrame {id:1234,..Default::default()});
+        assert!(renderer.is_active(handle),"missing fresh posed geometry is not deletion");
+        renderer.terminate_gracefully(handle);
+        assert!(renderer.is_active(handle),"native Shield2 retains its two-second drain");
+        renderer.source_deleted(identity);
+        assert!(!renderer.is_active(handle),"actual source destruction bypasses the drain");
+        assert!(!renderer.buff_models.contains_key(&handle));
+        let trail=renderer.spawn_configured(Binding {effect:72422,..binding},Mat4::IDENTITY,Vec3::ZERO,EffectConfig {source_identity:Some(identity),..Default::default()}).unwrap();
+        renderer.source_deleted(identity);
+        assert!(!renderer.is_active(trail),"native Trail2 deletes with its source dynel");
+    }
+
+    #[test]
+    fn buff_refresh_retires_gpu_models_and_same_key_appearance_stops_surface() {
+        let dir=ao_gui::client_dir();
+        if !dir.join("Setupf/gfxtweak.bin").exists() || !dir.join("cd_image/rdb.db").exists() {return;}
+        let mut renderer=Renderer::open(&dir).unwrap();
+        // Finite authored duration exercises expiry as well as explicit delete/clear.
+        renderer.templates.by_id.get_mut(&72260).unwrap().words[8]=4.0f32.to_bits();
+        let identity=(50000,1234);
+        let config=EffectConfig {source_identity:Some(identity),..Default::default()};
+        let binding=Binding {group:0,attractor:0,effect:72260,note:0,color:0};
+        let vertices=vec![Vertex {pos:[0.0,0.0,0.0],..Default::default()};3];
+        let scene=Scene {meshes:vec![Mesh {vertices:vertices.clone(),submeshes:vec![Submesh::new(vec![0,1,2],None)]}],..Default::default()};
+        let actor=ActorFrame {id:1234,model:super::super::super::avatar::MODEL_KEY,transform:IDENTITY,skin:Some(vertices),alpha:1.0,..Default::default()};
+        let mut host=ao_render::Host::headless();
+        let mut uploaded=std::collections::HashSet::new();
+        for cycle in 0..32 {
+            let handle=renderer.spawn_configured(binding,Mat4::IDENTITY,Vec3::ZERO,config).unwrap();
+            renderer.prepare_source_mesh(identity,&scene,&actor);
+            renderer.frame(0.01,&mut host,None);
+            for key in host.actor_model_removals.drain(..) {uploaded.remove(&key);}
+            for (key,_) in host.actor_models.drain(..) {uploaded.insert(key);}
+            assert_eq!(uploaded.len(),1,"refresh must not retain previous per-handle GPU models");
+            assert!(host.actors.iter().any(|a|a.id==handle));
+            host.actors.clear();
+            renderer.source_model_changed(identity);
+            assert!(renderer.needs_source_pose(identity));
+            let mut replacement=scene.clone();
+            replacement.meshes[0].submeshes[0].indices=vec![2,1,0];
+            renderer.prepare_source_mesh(identity,&replacement,&actor);
+            renderer.frame(0.01,&mut host,None);
+            assert!(host.actors.is_empty(),"native CAT replacement Stop applies even with unchanged model key and vertex count");
+            match cycle%3 {
+                0=>renderer.delete(handle),
+                1=>renderer.clear(),
+                _=>{renderer.frame(1000.0,&mut host,None);renderer.frame(3.0,&mut host,None);},
+            }
+            renderer.frame(0.01,&mut host,None);
+            for key in host.actor_model_removals.drain(..) {uploaded.remove(&key);}
+            for (key,_) in host.actor_models.drain(..) {uploaded.insert(key);}
+            assert!(uploaded.is_empty(),"deleted effect GPU model must be retired");
+            host.actors.clear();
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! combat-log.md, combat-anim.md, actions.md.
 
 use super::actions::{Actions, Event as ActionEvent};
-use super::anim::{plays_hit_sound, special_swing, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM, WIELD_GESTURE};
+use super::anim::{plays_hit_sound, special_swing, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM};
 use super::arms::{ACTION_UNWIELD, ACTION_WIELD};
 use super::log::{floating_number, FloatingNumber, Space, HUD_X, HUD_X_JITTER};
 use super::state::{Combat, CombatEvent, ACTION_PLAY_ANIM, FIGHT_IDLE};
@@ -70,8 +70,8 @@ pub struct Module {
     announced: Option<Identity>,
     /// Characters hit by an `0xd1` `CharacterAction` (sound cue, [`Module::take_struck`]).
     struck: Vec<i32>,
-    /// `CharacterAction` 0x64: `(dynel, AbstractAnimID)` the server asks to play ([`Module::take_anims`]).
-    anims: Vec<(i32, u16)>,
+    /// `(dynel, AbstractAnimID, layer override)`; `None` uses the social table layer.
+    anims: Vec<(i32, u16, Option<u8>)>,
     /// Events of the last received frames for the HUD / sounds (taken by [`Module::take_events`]).
     events: Vec<CombatEvent>,
     pose_events: Vec<ActionEvent>,
@@ -79,6 +79,7 @@ pub struct Module {
     duel: Vec<super::duel::Event>,
     equipment_sounds: Vec<(i32, Vec<u32>)>,
     equipment_actions: Vec<i32>,
+    equipment_gestures: Vec<(i32, Vec<u32>, bool)>,
 }
 
 /// `Feedback_*` texts of the server's attack refusal (`CharacterAction` 0x76, `FUN_1005d0d8` case 0x23 @ 0x1005d92b): the jump table at
@@ -145,6 +146,7 @@ impl Module {
             duel: Vec::new(),
             equipment_sounds: Vec::new(),
             equipment_actions: Vec::new(),
+            equipment_gestures: Vec::new(),
         }
     }
 
@@ -194,7 +196,7 @@ impl Module {
 
     /// `FUN_1005d0d8` case 0x1a (action 0x64, handler 0x1005d873): `FUN_1003c47c(identity_b.instance)` = the animation holder (`char+0x1dc`) gets a new
     /// animation id, which its idle update plays (the same setter as the emote path). 0 = nothing to play.
-    pub fn take_anims(&mut self) -> Vec<(i32, u16)> {
+    pub fn take_anims(&mut self) -> Vec<(i32, u16, Option<u8>)> {
         std::mem::take(&mut self.anims)
     }
 
@@ -206,6 +208,22 @@ impl Module {
     /// Resolved explicit equipment broadcasts, independent of whether their record has a sound.
     pub fn take_equipment_actions(&mut self) -> Vec<i32> {
         std::mem::take(&mut self.equipment_actions)
+    }
+
+    /// Item key-3 variants retained before the weapon slot is emptied; select using the shared CRT stream.
+    pub fn take_equipment_gestures(&mut self) -> Vec<(i32, Vec<u32>, bool)> {
+        std::mem::take(&mut self.equipment_gestures)
+    }
+
+    fn equipment_gesture(&mut self, who: i32, item: i32, slot: Option<i32>) {
+        let item = if let Some(slot) = slot {
+            self.combat.arms.slot_item(who, slot)
+        } else {
+            self.combat.arms.weapon_item(item)
+        };
+        let variants = item.and_then(|item| item.animations.iter().find(|entry| entry.0 == 3)).map(|entry| entry.1.clone()).unwrap_or_default();
+        let crawling = self.combat.char(who).is_some_and(|actor| actor.stat(0x1ae) == 0xe);
+        self.equipment_gestures.push((who, variants, crawling));
     }
 
     fn equipment_sound(&mut self, who: i32, item: i32, slot: Option<i32>, key: u32) {
@@ -284,7 +302,7 @@ impl Module {
                     self.struck.push(m.header.target.instance);
                 }
                 if a.action == ACTION_PLAY_ANIM && m.header.target.kind == DYNEL_CHAR && a.identity_b.instance > 0 {
-                    self.anims.push((m.header.target.instance, a.identity_b.instance as u16));
+                    self.anims.push((m.header.target.instance, a.identity_b.instance as u16, None));
                 }
                 if m.header.target.kind == DYNEL_CHAR {
                     let who = m.header.target.instance;
@@ -295,7 +313,7 @@ impl Module {
                         self.equipment_sound(who, 0, Some(a.identity_b.instance), 9);
                         self.equipment_actions.push(who);
                         if !self.combat.is_fighting(who) {
-                            self.anims.push((who, WIELD_GESTURE));
+                            self.equipment_gesture(who, 0, Some(a.identity_b.instance));
                         }
                     } else if a.action == ACTION_WIELD && a.identity_a.kind == 0xc74a
                         && self.combat.arms.weapon_item(a.identity_a.instance).is_some()
@@ -307,10 +325,8 @@ impl Module {
                         self.equipment_sound(who, a.identity_a.instance, None, 8);
                         self.equipment_actions.push(who);
                         // A bag-slot attach returns before replacing this gesture with a stance.
-                        if a.identity_b.instance >= 0x30 && !self.combat.is_fighting(who)
-                            && self.anims.last() != Some(&(who, WIELD_GESTURE))
-                        {
-                            self.anims.push((who, WIELD_GESTURE));
+                        if a.identity_b.instance >= 0x30 && !self.combat.is_fighting(who) {
+                            self.equipment_gesture(who, a.identity_a.instance, None);
                         }
                     }
                 }
@@ -732,24 +748,29 @@ mod tests {
         assert!(!m.attacking());
     }
 
-    /// The unwield action (0x61, `FUN_1006a857`) of an occupied hand slot plays the wield gesture 0x6d (`FUN_10081e74(char, 3)`) unless the holder fights
-    /// (the idle update of `FUN_1006a772` then starts the idle clip over it); an empty slot does nothing.
+    /// Unwear retains item key 3 before slot removal; combat idle replaces its gesture during a fight.
     #[test]
     fn unwield_queues_the_wield_gesture_out_of_a_fight() {
         let (mut m, _z, t) = primed();
         let own = OWN as i32;
+        m.on_frame(&n3_frame(0, OWN, action::character_action(own, &simple(ACTION_PLAY_ANIM, Identity::default(), Identity { kind: 0, instance: 6 }))));
+        assert_eq!(m.take_anims(), [(own, 6, None)], "generic action retains its table layer");
         let unwield = |m: &mut Module| m.on_frame(&n3_frame(0, OWN, action::character_action(own, &simple(ACTION_UNWIELD, Identity::default(), Identity { kind: 0, instance: 6 }))));
         assert!(!m.attacking());
         unwield(&mut m);
-        assert!(m.take_anims().is_empty(), "nothing in the hand");
+        assert!(m.take_equipment_gestures().is_empty(), "nothing in the hand");
         m.combat.arms.wield(own, 901, 6, None, &[(0x1b4, 0x5a)]);
         unwield(&mut m);
-        assert_eq!(m.take_anims(), vec![(own, WIELD_GESTURE)]);
+        assert_eq!(m.take_equipment_gestures(), [(own, Vec::new(), false)]);
+        m.combat.stats(own, &[(0x1ae, 0xe)], &mut Vec::new());
+        m.combat.arms.wield(own, 901, 6, None, &[(0x1b4, 0x5a)]);
+        unwield(&mut m);
+        assert_eq!(m.take_equipment_gestures(), [(own, Vec::new(), true)], "crawl overrides the selected item gesture");
         m.combat.arms.wield(own, 901, 6, None, &[(0x1b4, 0x5a)]);
         m.on_frame(&n3_frame(0, OWN, net::attack(own, Identity { kind: DYNEL_CHAR, instance: t }, 0)));
         assert!(m.is_fighting(own));
         unwield(&mut m);
-        assert!(m.take_anims().is_empty(), "in a fight the idle update replaces the gesture");
+        assert!(m.take_equipment_gestures().is_empty(), "in a fight the idle update replaces the gesture");
     }
 
     #[test]
@@ -784,6 +805,7 @@ mod tests {
                 }
                 module.on_frame(&frame);
                 assert!(module.take_anims().is_empty(), "replication/appearance is not a wield gesture");
+                assert!(module.take_equipment_gestures().is_empty());
                 assert!(module.take_equipment_actions().is_empty(), "the saved capture has no 0x61/0x83 broadcasts");
                 let sounds = module.take_equipment_sounds();
                 if let N3::Dynel(ao_net::n3::dynel::Dynel::WeaponItemFullUpdate(w)) = message.body {
@@ -803,16 +825,36 @@ mod tests {
             module.on_frame(&wield);
             assert_eq!(module.take_equipment_actions(), [actor as i32]);
             assert!(module.take_anims().is_empty(), "hand attach replaces the gesture with stance");
+            assert!(module.take_equipment_gestures().is_empty());
             module.take_equipment_sounds();
             let unwield = n3_frame(0, actor, action::character_action(actor as i32, &simple(ACTION_UNWIELD, Identity::default(), Identity { kind: 0, instance: 6 })));
+            let variants = module.combat.arms.slot_item(actor as i32, 6).unwrap().animations.iter().find(|entry| entry.0 == 3).map(|entry| entry.1.clone()).unwrap_or_default();
             module.on_frame(&unwield);
             assert_eq!(module.take_equipment_actions(), [actor as i32]);
-            assert_eq!(module.take_anims(), [(actor as i32, WIELD_GESTURE)]);
+            assert_eq!(module.take_equipment_gestures(), [(actor as i32, variants.clone(), false)]);
             module.take_equipment_sounds();
             module.on_frame(&unwield);
             assert!(module.take_equipment_actions().is_empty());
             assert!(module.take_anims().is_empty());
+            assert!(module.take_equipment_gestures().is_empty());
             assert!(module.take_equipment_sounds().is_empty(), "an empty slot cannot unwear twice");
+            let bag_attach = n3_frame(0, actor, action::character_action(actor as i32, &simple(ACTION_WIELD, Identity { kind: 0xc74a, instance: 0xd4d810 }, Identity { kind: 0, instance: 0x41 })));
+            module.on_frame(&bag_attach);
+            module.on_frame(&bag_attach);
+            assert_eq!(module.take_equipment_gestures(), [(actor as i32, variants.clone(), false), (actor as i32, variants, false)], "each retail bag attach retains its gesture call");
+        }
+    }
+
+    #[test]
+    fn clothing_identity_is_not_a_weapon_wield_broadcast() {
+        let (mut module, _, _) = primed();
+        for actor in [OWN, 0x12345] {
+            let frame = n3_frame(0, actor, action::character_action(actor as i32, &simple(ACTION_WIELD, Identity { kind: 0x66, instance: 0x10 }, Identity { kind: 0, instance: 0x10 })));
+            module.on_frame(&frame);
+            assert!(module.take_equipment_actions().is_empty());
+            assert!(module.take_equipment_gestures().is_empty());
+            assert!(module.take_equipment_sounds().is_empty());
+            assert!(module.take_anims().is_empty());
         }
     }
 

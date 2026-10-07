@@ -281,7 +281,7 @@ mod tests {
         recv(&mut m, 4, act(0x64, 0, 0, 0, 510));
         recv(&mut m, OWN, act(0x64, 0, 0, 0, 0));
         recv(&mut m, OWN, act(0x64, 0, 0, 0, 503));
-        assert_eq!(m.take_anims(), [(4, 510), (OWN as i32, 503)]);
+        assert_eq!(m.take_anims(), [(4, 510, None), (OWN as i32, 503, None)]);
         assert!(m.take_anims().is_empty());
     }
 

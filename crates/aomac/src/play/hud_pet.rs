@@ -47,8 +47,10 @@ impl HudPet {
             | ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(_))
             | ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(_)))
         {
-            self.nanos.entry(m.header.target.instance).or_default()
-                .on_message(m.header.target, m.header.target, &m.body, 100);
+            let nanos = self.nanos.entry(m.header.target.instance).or_default();
+            nanos.on_message(m.header.target, m.header.target, &m.body, 100);
+            // Dynels consumes the same pet lifecycle for target-attached visuals.
+            nanos.take_visuals();
         }
     }
     fn text(&self, key: &str) -> String {

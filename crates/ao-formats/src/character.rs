@@ -19,7 +19,7 @@ pub use names::NameTable;
 pub use npc::*;
 pub use player::*;
 pub use viewer_cache::{CachedCharacter, ClothEntry, MeshEntry, ViewerCache};
-pub use anim::{CatAnim, Track};
+pub use anim::{animation_blend, animation_fade_ms, animation_layer_mask, animation_layers, AnimLayer, CatAnim, Track};
 pub use cat::{Attractor, Bone, CatMesh, ColSphere, Material, Part, SkinVertex, SubMesh};
 
 use crate::texture::load_texture;

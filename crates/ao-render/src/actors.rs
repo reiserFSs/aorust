@@ -61,6 +61,16 @@ pub(crate) struct ActorLayer {
     items: Vec<Item>,
 }
 
+impl ActorLayer {
+    fn remove_model(&mut self, key: u64) {
+        self.models.remove(&key);
+        self.actors.retain(|_, actor| actor.model != key);
+        self.frames.retain(|frame| frame.model != key);
+        self.items.retain(|item| item.model != key);
+        // Instance buffers are shared scratch space, rebuilt from frames before each draw.
+    }
+}
+
 impl Renderer {
     /// Uploads a model for [`ActorFrame::model`] `key`: `scene.meshes[0]` is the (skinned) body, the others are rigid parts.
     /// Replaces a model of the same key.
@@ -143,6 +153,12 @@ impl Renderer {
         for a in self.act.actors.values_mut().filter(|a| a.model == key) {
             a.vb = None;
         }
+    }
+
+    /// Retires one model and its actors' skin buffers, submitted frames and draw items.
+    /// Other models and actors remain available; missing keys are harmless.
+    pub fn remove_actor_model(&mut self, key: u64) {
+        self.act.remove_model(key);
     }
 
     /// Forgets every model and actor (a new zone).
@@ -291,6 +307,29 @@ fn blended_pipe(pipe: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_removal_keeps_unrelated_actors_and_is_idempotent() {
+        let mut layer = ActorLayer::default();
+        for (id, model) in [(1, 7), (2, 8), (3, 7)] {
+            layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![] });
+            layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model });
+            layer.frames.push(ActorFrame { id, model, skin: Some(vec![ao_scene::Vertex::default()]), ..Default::default() });
+            layer.items.push(Item { actor: id, model, mesh: 0, dist: 0.0, faded: false });
+        }
+        for key in [7, 7, 99] {
+            layer.remove_model(key);
+            assert_eq!(layer.models.len(), 1);
+            assert!(layer.models.contains_key(&8));
+            assert_eq!(layer.actors.len(), 1);
+            assert_eq!(layer.actors[&2].model, 8);
+            assert_eq!(layer.frames.len(), 1);
+            assert_eq!(layer.frames[0].id, 2);
+            assert!(layer.frames[0].skin.is_some());
+            assert_eq!(layer.items.len(), 1);
+            assert_eq!(layer.items[0].actor, 2);
+        }
+    }
 
     #[test]
     fn env_layer_follows_the_phase_of_its_submesh() {

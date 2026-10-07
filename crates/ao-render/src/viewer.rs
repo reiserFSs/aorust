@@ -30,6 +30,8 @@ pub struct Host {
     pub look: bool,
     /// Actor models to upload before the next frame (`key`, model scene), see [`Renderer::add_actor_model`]; drained by the viewer.
     pub actor_models: Vec<(u64, Scene)>,
+    /// Model keys to retire before uploads and actor frames; drained by the viewer. See [`Renderer::remove_actor_model`].
+    pub actor_model_removals: Vec<u64>,
     /// The actors to draw this frame ([`ao_scene::ActorFrame`]); push every frame, the viewer drains it. Actors that are not pushed are forgotten.
     pub actors: Vec<ao_scene::ActorFrame>,
     /// Forget all actor models and actors before applying `actor_models` (a new zone).
@@ -52,6 +54,9 @@ impl Host {
         if std::mem::take(&mut self.clear_actors) {
             r.clear_actors();
         }
+        for key in self.actor_model_removals.drain(..) {
+            r.remove_actor_model(key);
+        }
         for (key, scene) in self.actor_models.drain(..) {
             r.add_actor_model(key, &scene);
         }
@@ -60,7 +65,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3] }
+        Host { camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, look: false, actor_models: vec![], actor_model_removals: vec![], actors: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3] }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -79,6 +84,7 @@ impl Host {
         // Queued poses/models belong to the replaced topology, not the newly uploaded scene.
         self.repose = None;
         self.actor_models.clear();
+        self.actor_model_removals.clear();
         self.actors.clear();
         self.clear_actors = true;
         self.scene = Some(scene);
@@ -683,12 +689,15 @@ mod tests {
     #[test]
     fn replacing_scene_discards_pending_old_topology_updates() {
         let mut host = Host::headless();
+        assert!(host.actor_model_removals.is_empty());
         host.repose(Scene::default());
         host.actor_models.push((1, Scene::default()));
+        host.actor_model_removals.push(1);
         host.set_scene(Scene::default());
         assert!(host.scene.is_some());
         assert!(host.repose.is_none());
         assert!(host.actor_models.is_empty() && host.actors.is_empty());
+        assert!(host.actor_model_removals.is_empty());
         assert!(host.clear_actors);
         assert_eq!(host.scene_generation(), 1);
         host.set_scene(Scene::default());

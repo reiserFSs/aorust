@@ -808,7 +808,7 @@ mod tests {
     }
 
     /// The machine's stock and the trade start as the live server sent them, then the window.
-    fn open(gui: &mut Gui, z: &Zone) -> Interact {
+    fn open(gui: &mut Gui, z: &mut Zone) -> Interact {
         let mut i = Interact::new(OWN, (1280, 800));
         i.shop.pricing.insert((MACHINE.kind, MACHINE.instance), (0x3c, 100));
         i.on_frame(gui, &server(ShopUpdate { items: items() }.encode(MACHINE)), z);
@@ -821,8 +821,8 @@ mod tests {
     #[test]
     fn shop_resolves_both_endpoints_at_actual_quality() {
         let Some(mut gui) = rig() else { return };
-        let z = Zone::new(OWN);
-        let mut i = open(&mut gui, &z);
+        let mut z = Zone::new(OWN);
+        let mut i = open(&mut gui, &mut z);
         let item = AcgItem { low_id: 111, high_id: 222, level: 73 };
         let s = i.shop.shop.as_mut().unwrap();
         s.stock = vec![item];
@@ -841,8 +841,8 @@ mod tests {
     #[test]
     fn shop_info_requires_active_known_stock_and_computed_price() {
         let Some(mut gui) = rig() else { return };
-        let z = Zone::new(OWN);
-        let mut i = open(&mut gui, &z);
+        let mut z = Zone::new(OWN);
+        let mut i = open(&mut gui, &mut z);
         let id = Identity { kind: SHOP_ITEM, instance: 1 };
         assert_eq!(i.shop_info(id, MACHINE), Some((items()[1], 2220)));
         assert_eq!(i.shop_info(id, SESSION), None);
@@ -896,8 +896,8 @@ mod tests {
     #[test]
     fn the_trade_start_opens_the_buy_window_with_the_stock() {
         let Some(mut gui) = rig() else { return };
-        let z = Zone::new(OWN);
-        let i = open(&mut gui, &z);
+        let mut z = Zone::new(OWN);
+        let i = open(&mut gui, &mut z);
         let s = i.shop.shop.as_ref().expect("window");
         assert_eq!(gui.window_size(s.win), CLIENT);
         for v in ["ShopInventoryDock", "PartnerInventoryDock", "PartnerCashView", "AcceptButton", "DeclineButton", "shop_items", "bought_items"] {
@@ -915,21 +915,21 @@ mod tests {
     #[test]
     fn start_without_a_machine_or_while_in_a_trade_opens_nothing() {
         let Some(mut gui) = rig() else { return };
-        let z = Zone::new(OWN);
+        let mut z = Zone::new(OWN);
         let mut i = Interact::new(OWN, (1280, 800));
         // a player trade start (b == 0), a character partner, and the machine's own copy never open the shop window
         let bob = Identity { kind: 50000, instance: 5 };
-        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: bob, b: SESSION }.encode(ME)), &z);
-        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: ME, b: SESSION }.encode(MACHINE)), &z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: bob, b: SESSION }.encode(ME)), &mut z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: ME, b: SESSION }.encode(MACHINE)), &mut z);
         assert!(i.shop.shop.is_none());
         // an open player trade refuses (`Feedback_YouAreAlreadyInATrade`)
-        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: bob, b: ZERO }.encode(ME)), &z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: bob, b: ZERO }.encode(ME)), &mut z);
         i.ptrade_start(&mut gui, &z, |_| false);
-        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: MACHINE, b: SESSION }.encode(ME)), &z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::START, a: MACHINE, b: SESSION }.encode(ME)), &mut z);
         assert!(i.shop.shop.is_none());
         assert_eq!(std::mem::take(&mut i.shop.feedback), ["Feedback_YouAreAlreadyInATrade"]);
         // an empty stock says so
-        i.on_frame(&mut gui, &server(ShopUpdate { items: vec![] }.encode(MACHINE)), &z);
+        i.on_frame(&mut gui, &server(ShopUpdate { items: vec![] }.encode(MACHINE)), &mut z);
         assert_eq!(std::mem::take(&mut i.shop.feedback), ["Feedback_ShopContainsNoEntries"]);
     }
 
@@ -938,7 +938,7 @@ mod tests {
         let Some(mut gui) = rig() else { return };
         let mut z = Zone::new(OWN);
         z.character_stats.entry(OWN as i32).or_default().insert(0x3c, 100_000);
-        let mut i = open(&mut gui, &z);
+        let mut i = open(&mut gui, &mut z);
         // plain double click = MoveItemToInventory({0x6f, 1}, any bag), Shift = TradeAddItem(own, {0x6f, 1})
         assert!(i.shop_buy(&mut gui, 1));
         assert_eq!(sent(&mut i), [inventory::move_item_to_inventory(ME.instance, Identity { kind: SHOP_ITEM, instance: 1 }, ANY_BAG_SLOT)]);
@@ -947,19 +947,19 @@ mod tests {
         assert_eq!(sent(&mut i), [trade::add_item(ME, item)]);
         assert!(!i.shop_buy(&mut gui, 3), "no such stock item");
         // the server's echo fills the bought list and the credits
-        i.on_frame(&mut gui, &server(Trade { op: trade::ADD_ITEM, a: ME, b: item }.encode(ME)), &z);
-        i.on_frame(&mut gui, &server(Trade { op: trade::VENDING_ADD, a: ME, b: Identity { kind: SHOP_ITEM, instance: 2 } }.encode(ME)), &z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::ADD_ITEM, a: ME, b: item }.encode(ME)), &mut z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::VENDING_ADD, a: ME, b: Identity { kind: SHOP_ITEM, instance: 2 } }.encode(ME)), &mut z);
         i.shop_render(&mut gui, &mut info);
         let d = i.shop_dump(&gui);
         assert!(d.contains("bought (2)") && d.contains("credits: \"5,550\""), "{d}");
         // the amount the machine sends wins until the list changes
-        i.on_frame(&mut gui, &server(Trade { op: trade::SET_CASH, a: Identity { kind: 0, instance: 99 }, b: ZERO }.encode(MACHINE)), &z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::SET_CASH, a: Identity { kind: 0, instance: 99 }, b: ZERO }.encode(MACHINE)), &mut z);
         i.shop_render(&mut gui, &mut info);
         assert!(i.shop_dump(&gui).contains("credits: \"99\""));
         // removing a bought item
         assert!(i.shop_remove(&mut gui, 0));
         assert_eq!(sent(&mut i), [trade::remove_item(ME, ME, item)]);
-        i.on_frame(&mut gui, &server(Trade { op: trade::REMOVE_ITEM, a: ME, b: item }.encode(ME)), &z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::REMOVE_ITEM, a: ME, b: item }.encode(ME)), &mut z);
         i.shop_render(&mut gui, &mut info);
         assert!(i.shop_dump(&gui).contains("bought (1)"));
         // Accept = TradeAccept (and the button is disabled), Decline / Esc / close = TradeAbort(true)
@@ -977,25 +977,25 @@ mod tests {
     #[test]
     fn window_ends_with_the_servers_abort_or_complete() {
         let Some(mut gui) = rig() else { return };
-        let z = Zone::new(OWN);
+        let mut z = Zone::new(OWN);
         for (op, who, a, feedback) in [
             (trade::COMPLETE, ME, ZERO, vec![]),
             (trade::ABORT, ME, Identity { kind: 0, instance: 1 }, vec!["Feedback_TradeCancelled"]),
             (trade::ABORT, ME, ZERO, vec![]),
             (trade::ABORT, MACHINE, ME, vec!["Feedback_TradeCancelled"]),
         ] {
-            let mut i = open(&mut gui, &z);
-            i.on_frame(&mut gui, &server(Trade { op, a, b: ZERO }.encode(who)), &z);
+            let mut i = open(&mut gui, &mut z);
+            i.on_frame(&mut gui, &server(Trade { op, a, b: ZERO }.encode(who)), &mut z);
             assert!(i.shop.shop.is_none(), "op {op}");
             assert_eq!(std::mem::take(&mut i.shop.feedback), feedback, "op {op}");
         }
         // the zone change closes it without a word
-        let mut i = open(&mut gui, &z);
+        let mut i = open(&mut gui, &mut z);
         i.close_all(&mut gui);
         assert!(i.shop.shop.is_none() && i.take_outbox().is_empty());
         // a new stock refreshes an open window
-        let mut i = open(&mut gui, &z);
-        i.on_frame(&mut gui, &server(ShopUpdate { items: items()[..1].to_vec() }.encode(MACHINE)), &z);
+        let mut i = open(&mut gui, &mut z);
+        i.on_frame(&mut gui, &server(ShopUpdate { items: items()[..1].to_vec() }.encode(MACHINE)), &mut z);
         i.shop_render(&mut gui, &mut info);
         assert!(i.shop_dump(&gui).contains("stock (1)"));
     }
@@ -1005,7 +1005,7 @@ mod tests {
         let Some(mut gui) = rig() else { return };
         let mut z = Zone::new(OWN);
         z.character_stats.entry(OWN as i32).or_default().insert(0x3d, 100_000);
-        let mut i = open(&mut gui, &z);
+        let mut i = open(&mut gui, &mut z);
         let win = i.shop.shop.as_ref().unwrap().win;
         assert!(i.shop_add(&mut gui, 1, &z));
         assert!(sent(&mut i).is_empty(), "Cash does not fund a different ShopType");
@@ -1031,7 +1031,7 @@ mod tests {
     #[test]
     fn live_capture_opens_the_window() {
         let Some(mut gui) = rig() else { return };
-        let z = Zone::new(OWN);
+        let mut z = Zone::new(OWN);
         let mut i = Interact::new(OWN, (1280, 800));
         // The sparse use capture has no FullUpdate; these are the ICC retail template factors.
         i.shop.pricing.insert((MACHINE.kind, MACHINE.instance), (0x3d, 105));
@@ -1041,7 +1041,7 @@ mod tests {
             let (idx, dir, hex) = (p.next().unwrap().parse::<u32>().unwrap(), p.next().unwrap(), p.next().unwrap());
             if dir != "<" || !(100825..=100830).contains(&idx) { continue; }
             let b: Vec<u8> = (0..hex.len() / 2).map(|k| u8::from_str_radix(&hex[2 * k..2 * k + 2], 16).unwrap()).collect();
-            i.on_frame(&mut gui, &Frame::decode_with(&b, false).unwrap().unwrap().0, &z);
+            i.on_frame(&mut gui, &Frame::decode_with(&b, false).unwrap().unwrap().0, &mut z);
         }
         let s = i.shop.shop.as_ref().expect("window");
         assert_eq!((s.machine, s.stock.len()), (MACHINE, 36));
@@ -1110,7 +1110,7 @@ mod tests {
                 assert_eq!(v.base.parent, Identity { kind: 50000, instance: 0xf42fc });
             }
             z.on_frame(&frame);
-            i.on_frame(&mut gui, &frame, &z);
+            i.on_frame(&mut gui, &frame, &mut z);
         }
         assert!(i.shop.shop.is_none());
         z.world.start(ao_gui::client_dir(), own as i32);
@@ -1150,10 +1150,10 @@ mod tests {
         let dir = ao_gui::client_dir();
         let (Ok(labels), true) = (ao_formats::screens::TextDb::load(&dir), std::env::var_os("AOMAC_SHOT_DIR").is_some()) else { return };
         let mut gui = Gui::new(&dir, Some(Box::new(move |s: &str| Some(labels.label(s)).filter(|r| r != s)))).unwrap();
-        let z = Zone::new(OWN);
-        let mut i = open(&mut gui, &z);
+        let mut z = Zone::new(OWN);
+        let mut i = open(&mut gui, &mut z);
         let item = Identity { kind: SHOP_ITEM, instance: 1 };
-        i.on_frame(&mut gui, &server(Trade { op: trade::ADD_ITEM, a: ME, b: item }.encode(ME)), &z);
+        i.on_frame(&mut gui, &server(Trade { op: trade::ADD_ITEM, a: ME, b: item }.encode(ME)), &mut z);
         i.shop_render(&mut gui, &mut info);
         let mut s = Shot(gui);
         let mut o = Offscreen::new(&s, (1280, 560)).unwrap();

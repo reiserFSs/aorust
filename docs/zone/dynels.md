@@ -19,6 +19,10 @@ N3 frame ──Zone::on_frame──▶ Dynels::on_message ──▶ Char (Mover)
   is rewritten when a new pose is supplied; head and attached weapons are rigid meshes that only get a transform. Actors are
   frustum-culled per mesh (bounding sphere + 1 m pose margin on the body). Actors that are not pushed in a frame are forgotten
   (`Renderer::set_actors`).
+  `Host::actor_model_removals` queues individual model retirement through `Renderer::remove_actor_model`, releasing that key's
+  model resources, actor skin buffers, frames and draw items without forgetting unrelated actors. The viewer drains removals
+  after a full actor clear and before model uploads, so a same-frame upload may reuse a retired key; shared instance buffers
+  are rebuilt from the remaining frames before rendering.
 * **Draw order** (RE: `DisplaySystem_t::Render` @0x100793b8 = `RViewPort_t::Render(list a, list b, type, first bucket, last bucket)` @0x1004bfff
   calls; a visual is queued by `RVisual_t::AddToRenderList` @0x1004c9c2 into `list × 0x708 distance buckets`): sky/ground lists 0–2, then **lists 3 + 4** (3 = opaque
   meshes and the CAT visual `FUN_10056ed6` without transparency (`SetRenderPriority(3)`); **4 = `VisualLiquid_t`** = the water ctor @0x10067385 `SetRenderPriority(4)`), then the blended

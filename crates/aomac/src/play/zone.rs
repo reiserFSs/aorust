@@ -382,6 +382,7 @@ impl Zone {
         let duration_percent = self.skill_value(464).unwrap_or(100);
         let delta = self.nanos.on_message(who, Identity { kind: CHAR_KIND, instance: self.char_id as i32 }, &m.body, duration_percent);
         self.adjust_ncu(delta);
+        self.world.apply_buff_visuals(self.char_id as i32, self.nanos.take_visuals());
         if who == (Identity { kind: CHAR_KIND, instance: self.char_id as i32 }) {
             if let N3::World(World::CharacterAction(a)) = &m.body {
                 if a.action == ao_net::n3::inventory::ACTION_DELETE_ITEM {

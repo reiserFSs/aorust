@@ -46,7 +46,8 @@ The app has no per-character state objects, so the state ids (`CharState`), the 
 * **Creature** (mesh without weapon attractors, `VisualCATMesh_t::HasWeaponAttractors` false, `FUN_100679a0`): `AbstractAnimID 0x40a`
   = `unarmed-rswing` (1034), resolved through the NPC record's anim table.
 * **Wielded weapon** (`FUN_10068072(slot)` entry, `+0x14` = the item): `FUN_10069acb` returns `FUN_1004570c(0xb)` = a random value
-  of the **weapon's list 0xb**. For a queued special attack it first calls `FUN_1003c594` (section 3.2).
+  of the **weapon's list 0xb**. For a queued special attack it first calls `FUN_1003c594` (section 3.2). If that list is absent,
+  `FUN_10069acb` writes `0xb` back through its list-key output; `FUN_1006a239` passes this resolved key to both `FUN_1003bfd2` and `Play`.
 * The id then goes through the holder (section 1). Holder `Play(clip, 1.0f, -1, 0, listKey, 1, 0, 0, slot)`; list keys already
   playing (`FUN_1003bfd2`) are not restarted. If no clip is found and `char+0x21c == 0`: `FUN_10010d83(char, 0x3e, 1)` (the social
   `wave`!) [CODE, taken literally].
@@ -61,9 +62,10 @@ Every `Hit` / `Miss` / `SpecialAttack` event of any character (a miss runs `FUN_
 1. **Weapon swing**: the holder's wielded weapon (`Dynels::wield`, the `WeaponItemFullUpdate` children in body slot 6 = right hand, 8 = left;
    `AnimSet` 0x161 and `ItemDelay` 0x126 from the item template under the message stats) -> `weapon_list(AnimSet, left, crawl = false, key)`
    (`key` = `0xb`, or the special's list key, else `0xb` when the weapon has no such key) -> random value (the CRT-rand stream of `Dynels`)
-   -> AbstractAnimID -> the own avatar plays `Role::Clip(anim_name(id))` (`Player::swing`, rate x `swing_speed_scale(first event time, ItemDelay)`,
-   `Avatar::set_swing_delay`), every other character `Dynels::play_swing(id,anim,key)` (NPC record table or the set's file name through
-   `resolve_clip`, same speed scale in `Dynels::update_with_collision`). [DATA] all weapon attack ids exist as clips for male / female / athrox (test `fight_clips_exist_in_the_data`).
+   -> `(AbstractAnimID, ItemDelay, resolved list key)` -> the own avatar plays `Role::Clip(anim_name(id))` (`Player::swing_list`,
+   rate x `swing_speed_scale(first event time, ItemDelay)`), every other character `Dynels::play_swing(id,anim,resolved_key)` (NPC record table
+   or the set's file name through `resolve_clip`). Both holder gates use the resolved key, including `0xb` after a missing special list;
+   remote `ActionAnim::advance` applies the same first-event speed scale. [DATA] all weapon attack ids exist as clips for male / female / athrox (test `fight_clips_exist_in_the_data`).
 2. **Item lists**: Brawl, Dimach and bow special resolve the list on the special item's record (`FUN_100686d0(stat)+0xe4`).
    Bare hands resolve the martial-arts item delivered under key 100. `dynel_visual::animation_map` decodes element `{0xe,0x13}` using the same validated multimap size words as the sound parser.
    The martial-arts fixture (rdb 1000020:43712) asserts list `0xb = [1034,1035,1037,1033]`; Dimach 42033 has `0xb=[163]`, Brawl 70292 has `0xb=[1036]` (element offsets 203 and 184). Special keys missing on their own item fall back to its `0xb` (`FUN_1003c594`). Missing lists retain the creature-path `0x40a` fallback;
@@ -410,6 +412,10 @@ The corpse holds the resulting death pose, rather than bind pose; corrected fiel
   Environment=16, Others=32. Gamecode `100ce1fa` packs preference offsets
   8–13; DisplaySystem `1005fd60` installs their callbacks. Cast visuals use
   category4, while visual ApplySpells handlers use category32.
+  Categories belong to the spawning handler, not CMSBlock word 1: native
+  Sequencer parameters GC `100ec81f` use word 1 as entry count
+  (`effects_buff300x.rs`, decoder), and Highlight uses it as mode. The unused
+  generic word-1 category accessor was removed; the explicit caller gates remain.
 * Bounded-parser, tuple replacement/miss-hit gating, real rifle-art,
   projectile-parameter and real item-binding regressions are covered by the
   release workspace checks: build, **1292 passing tests**, and
@@ -432,10 +438,13 @@ The corpse holds the resulting death pose, rather than bind pose; corrected fiel
   birth frames and cover the later atlas/alpha rise. No live session was used.
 
 * Fallback swings use the preloaded `ATTACK_KEY` NPC record variants
-  (`dynels::build_char`, `anim_key_variants`) through `Special::Attack`;
-  `play_swing` retains same-list suppression and replaces pending distinct-list
-  clips. The regression `distinct_swing_lists_replace_a_busy_identical_clip`
-  checks this path as well. `arms::real_records` uses a separate creature holder
+  (`dynels::build_char`, `anim_key_variants`) as independent positive-count holder nodes.
+  `play_swing` suppresses an already active list key but preserves distinct-list
+  nodes, their authored lifetimes and retained attack slots. The regression
+  `distinct_swing_lists_preserve_parallel_holder_nodes` checks Burst followed by a normal swing
+  at 50 ms, an actual group-0 rifle holster inserted after Fling at 133 ms, dynamic target/retained flags,
+  and missing weapon-special list fallback to `0xb` suppressing a later normal swing.
+  `arms::real_records` uses a separate creature holder
   for innate attacks: reusing the rifle holder already fills one slot, so
   `FUN_1006ac03` / `FUN_10067fbe` allocate its innate entries at 1 and 2,
   not 0 and 1. Melee/projectile assertions remain unchanged. These repairs have
@@ -466,8 +475,12 @@ Artifact21582 `final-burst-0000..0059` retained rifle-burst1024/source14770
 (1000ms, rate1): attack notes at133/233/333/433ms appeared at frames8/14/20/26.
 Fling resolves rifle-shot1023/source14773 (866ms, rate1, attack200ms), as observed
 in artifact21528. Artifact21651 additionally confirmed Special150/list0x1c;
-the target's subsequent normal-hit death at frame8 interrupted that later clip
-before its attack note, rather than indicating a missing authored effect.
+the target's subsequent normal-hit death at frame8 incorrectly discarded that
+clip's pending attack note. Retail holder nodes survive holster/idle and later
+swings: GC `1003c216` inserts independent nodes, `1003bfd2` suppresses an active
+list key, and `1003c036` flushes remaining attack notes when a CAT handle ends.
+DS `10074228` cannot remove group-1 swings with group0 holster/idle. The missing
+Fling effect is a holder-lifetime mismatch, not a faithful interruption.
 The owned patch passed clean-origin/main workspace tests (1300 passed,
 13 ignored), release build and strict workspace/all-target clippy.
 
@@ -548,12 +561,260 @@ The owned patch passed clean-origin/main workspace tests (1300 passed,
   Nonzero timing/velocity variants remain explicit errors, not discarded
   arguments. The implemented one-shot uses the real positional sound runtime.
 
+### 7.4 Template cast sounds
+
+`CharCastNano_t` ctor GC `1007b084` plays stat269 (`0x10d`) at the
+caster's global position, duration override0.2s and volume0.6. Update
+`1007ac9a` refreshes269 during casting (assembly `1007af13`), then271
+(`0x10f`, assembly `1007aeac`) while the release clip is unfinished,
+both duration0.2s/volume1. The constants are `1015e41c=0.2` and
+`10161740=0.6`. After successful release (`state+0x28==1`), stat272
+(`0x110`) plays once at the target, duration0/volume1. Cancellation,
+death and disappearance stop refreshes and do not synthesize a finish.
+
+Incoming `CastNanoSpell` GC `10072306` forwards its flag to
+`10051754`→`10050ed9`, stored as queue byte+0x2c. Queue result+0x20
+is independently initialized to1 (`10050f17`); `1004ee7e` returns it
+to `CharCastNano+0x28`. Thus timed received casts start successful;
+the instant `100500ca` path additionally gates its finish visuals on
+byte+0x2c. The port stores explicit `finish_enabled`, not a visual-ID
+heuristic. Cast/audio stages run without the FX renderer or posed
+connectors; visual starts wait for connectors while casting, and finish
+visuals wait for target connectors without repeating the finish sound.
+Foreign nano charge/release use the existing single-clip `play_once`
+loader: charge becomes `Special::Cast`, release remains `Special::Once`.
+They do not create the combat holder's independent positive-count list
+histories. Transition resets discard stale pending single clips; cancel
+also discards outstanding charge/release loads so a late worker reply
+cannot resume a canceled nano.
+
+Wire cancellation is distinct from removing buffs: the compact action
+map at `1005efdf` maps action0x66 to case0x1b, which calls
+`1004f504(0,0)` at `1005d260` (first pending cast), and action0x6c
+to case0x1e, calling the same function at `1005d8e7` with
+`identity_b.instance` as result and `identity_b.kind` as spell.
+Action0x75/case0x22 calls `1004fdad` at `1005d921`; after resolving
+the interrupting character and nano it calls `1004f504(4, spell)`
+at `1004fe5c`, using `identity_b.instance` as spell. `1004f504`
+removes the selected pending spell and sets holder+0x10 if it was
+first (`1004f575`), causing `CharCastNano`'s cancellation branch.
+These routes remove pending sounds/animations/effects but leave
+already applied buffs alone. Regression coverage exercises all three
+actions, own/foreign selectors, missing271, actual Shadow Touch bytes,
+and a real looping PCM surviving its sample end then expiring after
+the duration override plus authored fade-out.
+
+Action0x89/case0x2b instead calls queue-clear `1004f274` at
+`1005d24e`, without setting holder+0x10. Stage0's next update finds no
+pending cast (`1004ed14`) and enters release rather than cancellation;
+there is no successful result to copy. An already released controller
+retains its cached result. This distinction is covered separately:
+queue clear can play271 while releasing but does not invent272 for
+an uncompleted cast. The other native callers of `1004f504` are
+`10050622` (queue failure processing) and `1005942e` (actor transition
+`100593d3`, conditional on its cancellation argument). The other
+`1004f274` call is the death ctor at `1007b514`. Death/disappearance
+already route through the shared cast termination path.
+
+Zero XYZ is SI `10002d98`'s non-positional sentinel, not a world-space
+source at the origin. The shared `play_game_sound_with` path, nano
+duration path and authored-effect path all preserve that convention;
+an offline actual-bank regression uses a distant listener to distinguish it.
+
+SI `PlaySample` `10002d98` re-arms the sound-definition handle to
+`fade_out + duration`; `FrameProcessSound` `10003b70` counts it down,
+fades during its final authored fade-out and stops at zero. The native
+key is the sound definition, not a new voice each frame. The port uses
+the existing looping mixer/keepalive mechanism, including positional
+attenuation; `AOMAC_AUDIO_LOG` records emitter, selector, ID, duration,
+volume and actual voice IDs even with muted output.
+
+Body Boost29091 has269=`35a9ce7d`
+(`sfx/spells/chant_base_pos_lo_loop.wav`, authored fade-out1s),
+270=`94bb7805`,272=`80d5111a`, but no271. This controller does **not**
+read270 or substitute it for missing271. The absent stat accessor's
+unset ID `499602d2` has no sound definition. Actual `zone_ithaca.rec`
+casts at23825/29898/74495ms are NPCShadowTouch163449, an instant nano
+with no269–272: its template-sound path is silent, not a Body Boost
+stand-in. Its authored effect2710 may independently emit effect audio.
+
+
+### 7.5 Persistent buff selector census
+
+The ignored `retail_persistent_buff_census` parses stat413 from every installed
+type1040005 nano record (not a raw byte-pattern scan). The 2026-10-07 census
+observed11,160 records, no malformed records, and6,366 positive bindings:
+154 distinct installed selectors in21 classes, including the no-effect sentinel
+49999. The existing authored visual inventory is therefore153 IDs, not the
+earlier rough160-ID estimate. Three additional selectors have no installed
+gfxtweak template:16451(one binding),39606(seven),39745(sixteen). The census
+asserts this exact known missing set and fails on any changed gap; no other
+artwork is substituted.
+
+Exact class/selector inventory (the runnable census also prints source nano IDs):
+
+| Class | Authored selectors |
+| --- | --- |
+| 1001 | 1000/1001,1010/1011,1020/1021,1030/1031,1040/1041,1050/1051,1060/1061,1070/1071,1080/1081,1090/1091,1100/1101,1110/1111,1120/1121,1130/1131,1140/1141,1150/1151,1160/1161,1170/1171 |
+| 1005 | 43233,43243 |
+| 1009 | 43657,80000,80001,80002 |
+| 1010 | 46262 |
+| 1012 | 43607,61085,61086,61087,80006,80007,80008,80009 |
+| 1018 | 2710 |
+| 2004 | 43024,43044,43046,43072,43121,43123,43141,43299,43653,43713,45004,45008,45025 |
+| 2005 | 14400,43068,43307,43768 |
+| 2006 | 43452,43455,43457,43458,43462 |
+| 2007 | 18200,43681,43682,43683,43684,43685,43686,43687,47382,47396,47398,49999,71002,72303,72304,72305,72306,72307,72308,72309,72310,72626,80004 |
+| 2011 | 11506 |
+| 3003 | 12350,12351,43054,43062,43151,43152,43473,43474,43608,43609,43610,43611,43711,43722 |
+| 3004 | 43613,43614,43615,43616,43617,43618,43619,43620,43621,43622,43629,43630,43646,43647,43648,43649,43650,43651,43666,43712,43725,45079,45081,47500,47501,47502,61090,71015,72381,73007 |
+| 3006 | 43108 |
+| 3020 | 71512 |
+| 3028 | 72027 |
+| 3029 | 73006 |
+| 3032 | 72380 |
+| 3034 | 72260 |
+| 3038 | 72233,72360,72361,72362,72363 |
+| 3039 | 72422 |
+
+#### Native persistent-control evidence
+
+* Stars2004 uses loader `100f6d54` (duration word26 overrides word8),
+  constructor/init `100f7a63`, all29 process modes `100f7f3c`, and graceful
+  termination `100f6c27`, which stops emission through control+1648.
+  Its visual is DiaBill DS `1001105e`, not `GfxVisualStar`.
+  Integer helpers `1013ecf0`/`1013ed26` truncate; they are not RNG calls.
+  Mode13 uses reversed-Hamilton multiplication `1007c09c`; mode26 uses
+  locator cubic helpers `101051e7`/`101050d0`; modes21/22 use the actual
+  twelve-entry bone connector chain at `102c4fe8`; mode15 samples the
+  live CAT surface in callback `100f6eb6`; mode25 consumes actual ground
+  height. Missing terrain, body geometry or named attachments are not
+  replaced with a synthetic plane, character radius or source point.
+* Graceful virtual slot6 is distinct from `NextState`: BPHFSM1001
+  `100d385e`, Spell1/1010 `100f20bd`, Sprite1012 `100f5a3c`, and base
+  `100a719a` for3020/3032 mark the control terminated. Smoke1009
+  `100f0352` and Sparks1018 `100f0f33` instead set duration to elapsed
+  plus their authored maximum particle lifetime (word26/word35).
+  Meta2007 `100e5888` forwards graceful termination to all ten real
+  child handles. BParticle2/3028 `1010aa16` sets its stop byte; process
+  `1010af47` immediately terminates ordinary particles, while held-life
+  flag0x200000 releases their remaining lifetimes.
+* Highlight2011's installed persistent selector11506 uses mode2:
+  loader `100e286a`, process `100e29a7`, envelope
+  `10108089`/`101081a5`, and graceful transition `100e283c`.
+  Its two-second authored ramp is separate from the duration; mode2's
+  native default infinite duration is −1 at `10155dd0`.
+  Graceful termination sets duration to elapsed plus that ramp.
+  The process writes live root/held transparency and emissive, not
+  replacement geometry. Native RGB is gamma-space; the scene's material
+  override stores its linear equivalent. It never changes shininess.
+  Mode3 is a separate held-attractor-only specular path, not the mode2
+  root effect. Cleanup `100e2bde` refreshes alpha and clears emissive
+  and specular on the applicable native visual frames.
+* Shield2/3034 `10110b31` and Trail2/3039 `10114b20` immediately end
+  when their source dynel is actually deleted. This is not equivalent to
+  BuffIIR removal or death: those preserve their native graceful path.
+  An omitted fresh CPU pose retains the last actual posed surface rather
+  than being treated as a deleted dynel or replaced with the bind pose.
+  Source CAT model replacement invokes Shield2's native Stop path
+  (`10111147`/DS `1001dffe`).
+  Ordinary installed-data renderer regressions cover lifecycle teardown
+  and deleted-source versus unchanged-pose behavior; these newly added
+  checks were not run during implementation.
+* Static buff geometry shares GPU models by authored effect selector.
+  CAT surface controls3003/3034 instead own private GPU models because
+  their topology comes from the affected actor. Delete, expiry and clear
+  retire those models through `Host::actor_model_removals`.
+  Actual own-avatar appearance replacement forces fresh pose, topology
+  and source-material input even when `MODEL_KEY` is unchanged, and
+  invokes3034's native Stop path. A vertex-count comparison is not an
+  appearance-change detector.
+  The regression
+  `buff_refresh_retires_gpu_models_and_same_key_appearance_stops_surface`
+  was added but not run during implementation.
+* The ordinary `own_nanos::tests::synthetic_lifecycle` regression also
+  asserts raw visual duration (not stat464-scaled NCU time), remove-before-add
+  ordering on refresh, no visual removal at timer zero, and a single removal
+  event for repeated authoritative BuffIIR removal. It requires no retail
+  assets or GPU. The three installed-data lifecycle tests above and
+  `authored_9010_parent_delete_and_target_loss_delete_actual_children`
+  also run ordinarily when RDB and gfxtweak are present, following the
+  existing asset-presence early-return convention; they do not require GPU.
+  Census and offscreen frame capture tests retain their explicit ignored gates.
+
+
+### 7.6 Vector-created replicated classes
+
+Fresh read-only Gamecode constructor evidence corrects the legacy “Spell2”
+label: class1011 installs `_GfxControlSpinningShot_t::vftable` at `1016cc04`.
+The vector/vector gate `100d0eba` permits1011 and3007; vector/dynel gate
+`100d1018` permits only1011. Installed templates are9010 (1011,26words)
+and36000 (3007,18words), not generic replacement effects.
+
+* SpinningShot constructors `100f41c5`/`100f45e2`, loader `100f3b0b`,
+  initialization `100f4053`, process `100f3d16`, delete `100f4741`→
+  `100f3cab`: words10/11 own two real child controls; words12–19 supply
+  start/stop ARGB components,20 is center speed,21 orbit radius,22 initial
+  angle and23 frame angular speed. Assembly `100f3e6c..100f3e72` multiplies
+  angular speed by this frame's delta, not total age. The children are moved
+  together; destruction deletes both immediately, without a fade substitute.
+  The target connector uses authored1–7 and flags0, through `10106259`
+  (vector) or `1010668c` (dynel). Flag bit0 enables target tracking; missing
+  tracked targets terminate through `1010603b`. Flag bit1 returns zero
+  connector position (`10105eb4`). Source-vector effects do not require a
+  source dynel identity.
+* FallSteam vector constructor `100da927`, loader `100da828`,
+  visual setup `100da71f`, process `100da6da`, delete `100dab12`→
+  `100da691`: material9, direction bias4–6, position offset1–3 and particle
+  parameters11/16/17/14/13/15 feed the actual DisplaySystem visual.
+  DS constructor `100394d1`, particle parameters `10038ef9`, activation
+  `10039792`, simulation `1003983e` and draw `10038f5d` establish its bounded
+  particle pool, native DisplaySystem RNG, atlas and alpha-blended billboards.
+  The native pool factor is double `1008af80` =
+  `1.2000000476837158`; capacity is trunc(length×rate×life×factor).
+  Frame milliseconds truncate independently before accumulated emission;
+  DS assembly `1003986c` is `DC C9` (multiply ST1 by ST0), establishing the
+  delta×1000 conversion, not truncation of seconds. Nine DisplaySystem R250
+  samples initialize each emitted particle; native atlas draw `10038f5d`
+  preserves its alpha envelope and billboard sizes. Deletion destroys the
+  visual directly; no independent invented fade lifecycle is added.
+* Base `100d2531` uses seconds from engine+0x68: first process has delta0,
+  the first advancing step is capped at0.033, then normal frame deltas apply.
+
+### 7.7 Corrupted Crystal TParticle2
+
+Effect73001 is class3031, flags515 (`0x203`), attr0, material74,
+80-particle continuous pool; words12/15 emit at most three expired slots after
+0.001 seconds. GC located dispatcher `100d0102` selects constructor
+`101143bb` (allocation0xd8), not class3020 or3038. Parameter loader
+`101131ec`, initialization `10113dbf`, process `10113604` and velocity
+rotation `1010a9a0` establish randomized lifetimes0.15–0.4, widths4–8,
+velocity axes−5–5, per-process width multiplier1.01 and trail length1.
+The two independent colour curves begin at word34 and47; `1011623a`
+uses strict interval bounds and the last colour at exact knots.
+DisplaySystem `GfxVisualTParticle2` constructor `1002a9e7`, draw `1002ac11`
+forms two crossed velocity-aligned strips with tail width divided by
+word33 (0.5), never camera-facing sprites. Native dispatch now reaches this
+separate implementation through the shared buff renderer and
+`Renderer::spawn_configured`; duration and identity/attractor remain caller inputs.
+Other environment flags and animated-atlas modes fail explicitly rather than
+silently reusing this authored crystal mode.
+Inventory SimpleItem has no visual dynel: GC `1010668c` requires its
+`n3VisualDynel` cast before locator setup. Constructor `101143bb` marks failed
+initialization terminated but still returns the allocated control, so CF26
+does not take an actor-origin fallback merely because the visual is absent.
+Built props with an actual visual/attr0 can reach the renderer normally.
+Unlocated gate `100ce3be` excludes3031; the actual supported path is the
+located overload. Vtable `1016e9f4` graceful slot6 is base `100a719a`,
+not a particle-drain override; process slot1 is `10113604`.
+
+
 ## 8. Not found / open
 * The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
 * Unsupported authored classes still report their actual ID/class, never
   fabricated artwork. A read-only installed-data census finds additional
   weapon/nano roots in classes1018/1020/1029,2001/2002/2004/2005/2006/2011/
-  2013,3000/3001/3003/3004/3006/3017/3022/3029/3031/3038/5000.
+  2013,3000/3001/3003/3004/3006/3017/3022/3029/3038/5000.
   This inventory is incomplete: the existing spell parser rejects9320 item
   records and237 nano records, which are counted rather than silently treated
   as supported. References to effect IDs71900/91000/91006/42161 have no

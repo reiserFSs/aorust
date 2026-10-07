@@ -809,15 +809,15 @@ mod tests {
     #[test]
     fn server_frames_reach_the_window() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
+        let mut z = zone();
         let mut i = Interact::new(OWN as u32, (1280, 800));
         let frame = |t: Trade, who: Identity| ao_net::n3::outgoing::n3_frame(1, OWN as u32, t.encode(who));
-        i.on_frame(&mut gui, &frame(msg(trade::START, BOB, ZERO), ME), &z);
+        i.on_frame(&mut gui, &frame(msg(trade::START, BOB, ZERO), ME), &mut z);
         i.ptrade_start(&mut gui, &z, |_| false);
-        i.on_frame(&mut gui, &frame(msg(trade::SET_CASH, Identity { kind: 0, instance: 900 }, ZERO), BOB), &z);
+        i.on_frame(&mut gui, &frame(msg(trade::SET_CASH, Identity { kind: 0, instance: 900 }, ZERO), BOB), &mut z);
         let p = i.ptrade.trade.as_ref().unwrap();
         assert_eq!(gui.text(p.win, "PartnerCashView"), "900");
-        i.on_frame(&mut gui, &frame(msg(trade::ABORT, ZERO, ZERO), BOB), &z);
+        i.on_frame(&mut gui, &frame(msg(trade::ABORT, ZERO, ZERO), BOB), &mut z);
         assert!(i.ptrade.trade.is_none());
         assert_eq!(i.ptrade.take_feedback(), ["Feedback_TradeCancelled"]);
     }

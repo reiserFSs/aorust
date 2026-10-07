@@ -183,6 +183,10 @@ impl DValues {
         for n in ["AutoTargetMOB", "AutoTargetPvP", "DisableXPGain"] {
             s.add(n, Variant::Bool(false), false, CAT_VARIABLES, None, None, false);
         }
+        // Gamecode NewLevel (0x10075a0c) creates these session-only GUI notification values.
+        for n in ["got_ip", "got_perk", "got_tech"] {
+            s.add(n, Variant::Bool(false), false, CAT_VARIABLES, None, None, false);
+        }
         s
     }
 

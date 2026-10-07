@@ -124,6 +124,8 @@ pub enum CombatEvent {
     Health { dynel: i32, health: i32, max_health: i32, delta: i32 },
     /// Absolute stat applied by NewLevelIIR (GC 0x10075a0c), without StatIIR delta feedback.
     StatChanged { dynel: i32, stat: u32, value: i32 },
+    /// Retail own-character NewLevel gate: social 6, level-complete sound, and GUI DValues.
+    OwnNewLevel { dynel: i32, level: i32, animation: u16, sound: &'static str, got_ip: bool, got_perk: bool, got_tech: bool },
     /// `dynel` died: `cause` = `FUN_1005ae91` mode (1 terminate, 2 reflect, 3 shield, 4 weapon, 5 spell, 6 fall, 7 liquid) or
     /// 0 for the server's `CharacterAction` 99.
     Died { dynel: i32, cause: u32 },
@@ -212,6 +214,15 @@ impl Combat {
                         if who.instance == self.own && f[5] > 0 {
                             c.stats.insert(0x25, f[5]);
                             ev.push(CombatEvent::StatChanged { dynel: who.instance, stat: 0x25, value: f[5] });
+                        }
+                        if who.instance == self.own {
+                            let expansion = c.stat(0x185);
+                            ev.push(CombatEvent::OwnNewLevel {
+                                dynel: who.instance, level: f[0], animation: 6,
+                                sound: "SM_Sandy_Game_Level_Complete", got_ip: true,
+                                got_perk: f[0] % 10 == 0 && expansion & 2 != 0,
+                                got_tech: f[0] == 5 && expansion & 0x20 != 0,
+                            });
                         }
                     }
                 }
@@ -603,6 +614,48 @@ mod tests {
     use super::*;
     use ao_net::msg::Identity;
     use ao_net::n3::misc::{Attack, AttackInfo, MissedAttackInfo, SpecialAttackInfo};
+
+    /// Codec-layout fixtures, not a live level-up capture.
+    #[test]
+    fn authoritative_level_wire_preserves_retail_own_gate() {
+        let packet = |kind: u32, id: i32, words: &[i32]| {
+            let mut payload = kind.to_be_bytes().to_vec();
+            payload.extend_from_slice(&CHAR_KIND.to_be_bytes());
+            payload.extend_from_slice(&id.to_be_bytes());
+            payload.push(0);
+            for word in words { payload.extend_from_slice(&word.to_be_bytes()); }
+            Frame { seq: 1, ptype: ao_net::frame::PT_N3, sender: 1, receiver: 1, payload }
+        };
+        let mut c = setup();
+        let notices = |events: &[CombatEvent]| events.iter().filter(|event| matches!(event, CombatEvent::OwnNewLevel { .. })).count();
+        for id in [1, 3] {
+            let new_level = packet(0x7f40_5a16, id, &[2, 100, 200, 150, 300, 2, 8, 50]);
+            let events = c.on_frame(&new_level, 1);
+            assert_eq!(notices(&events), usize::from(id == 1));
+            assert_eq!(c.char(id).unwrap().stat(STAT_LEVEL), 2);
+            // Retail NewLevel's own gate is unconditional; repeated packets repeat its notice.
+            assert_eq!(notices(&c.on_frame(&new_level, 1)), usize::from(id == 1));
+            let stat = packet(ao_net::n3::dynel::STAT, id, &[1, STAT_LEVEL, 2]);
+            assert_eq!(notices(&c.on_frame(&stat, 1)), 0);
+            let stat = packet(ao_net::n3::dynel::STAT, id, &[1, STAT_LEVEL, 3]);
+            assert_eq!(notices(&c.on_frame(&stat, 1)), 0);
+            let new_level = packet(0x7f40_5a16, id, &[3, 100, 200, 150, 300, 0, 8, 50]);
+            assert_eq!(notices(&c.on_frame(&new_level, 1)), usize::from(id == 1));
+            let lower = packet(ao_net::n3::dynel::STAT, id, &[1, STAT_LEVEL, 2]);
+            assert_eq!(notices(&c.on_frame(&lower, 1)), 0);
+        }
+        c.chars.get_mut(&3).unwrap().stats.remove(&STAT_LEVEL);
+        assert_eq!(notices(&c.on_frame(&packet(ao_net::n3::dynel::STAT, 3, &[1, STAT_LEVEL, 10]), 1)), 0);
+        c.chars.get_mut(&1).unwrap().stats.remove(&STAT_LEVEL);
+        c.chars.get_mut(&1).unwrap().stats.insert(0x185, 0x22);
+        let events = c.on_frame(&packet(0x7f40_5a16, 1, &[10, 0, 0, 0, 0, 0, 0, 0]), 1);
+        assert!(events.iter().any(|event| matches!(event, CombatEvent::OwnNewLevel {
+            animation: 6, sound: "SM_Sandy_Game_Level_Complete", got_ip: true, got_perk: true, got_tech: false, ..
+        })));
+        let events = c.on_frame(&packet(0x7f40_5a16, 1, &[5, 0, 0, 0, 0, 0, 0, 0]), 1);
+        assert!(events.iter().any(|event| matches!(event, CombatEvent::OwnNewLevel { got_perk: false, got_tech: true, .. })));
+        assert_eq!(notices(&c.on_frame(&packet(0x7f40_5a16, 99, &[10, 0, 0, 0, 0, 0, 0, 0]), 1)), 0);
+    }
 
     fn ch(i: i32) -> Identity {
         Identity { kind: CHAR_KIND, instance: i }

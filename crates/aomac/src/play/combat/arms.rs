@@ -176,7 +176,17 @@ impl Armory {
     /// `CharacterActionIIR_t` 0x61 (`FUN_1006a857` -> `FUN_1006a772`, docs/zone/actions.md): `holder`'s body `slot` is emptied. The weapon dynel stays
     /// alive (it goes back to the bag: its `WeaponItemFullUpdate` then names the bag slot), so no `n3ToClientQuit` follows.
     pub fn unwield_slot(&mut self, holder: i32, slot: i32) {
-        self.worn.retain(|_, w| *w != (holder, slot));
+        let bag = &mut self.bag;
+        let mut arms = self.by.get_mut(&holder);
+        self.worn.retain(|item, worn| {
+            if *worn != (holder, slot) {
+                return true;
+            }
+            if let Some(record) = arms.as_mut().and_then(|a| a.slots.remove(&slot)) {
+                bag.insert(*item, record);
+            }
+            false
+        });
         if let Some(a) = self.by.get_mut(&holder) {
             a.unwield(slot);
         }
@@ -228,11 +238,11 @@ impl Armory {
 
 
     /// Lists of the special's own item, or the bare-hands item for an ordinary unarmed attack.
-    pub fn item_animation(&self, holder: i32, special: i32, key: u16, pick: u32) -> Option<u16> {
+    pub fn item_animation(&self, holder: i32, special: i32, key: u16, pick: u32) -> Option<(u16, u16)> {
         let a = self.by.get(&holder)?;
         let item = if special == 0 { a.slots.get(&0)? } else { a.specials.get(&special)? };
-        let values = &item.animations.iter().find(|e| e.0 == u32::from(key)).or_else(|| item.animations.iter().find(|e| e.0 == 0xb))?.1;
-        u16::try_from(*values.get(pick as usize % values.len().max(1))?).ok()
+        let (resolved_key, values) = item.animations.iter().find(|e| e.0 == u32::from(key)).or_else(|| item.animations.iter().find(|e| e.0 == 0xb))?;
+        Some((u16::try_from(*values.get(pick as usize % values.len().max(1))?).ok()?, u16::try_from(*resolved_key).ok()?))
     }
 
     pub fn swing_delay(&self, holder: i32) -> Option<i32> {
@@ -280,6 +290,21 @@ mod tests {
     }
 
     #[test]
+    fn slot_unwear_retains_the_weapon_dynel_until_quit() {
+        let mut a = player();
+        a.wield(1, 500, 6, None, &[(STAT_DAMAGE_TYPE, PROJECTILE)]);
+        a.unwield_slot(1, 6);
+        assert!(a.worn_item(500).is_none());
+        assert!(a.slot_item(1, 6).is_none());
+        assert_eq!(a.weapon_item(500).unwrap().dtype, PROJECTILE);
+        assert_eq!(a.damage_type(1, 0, 0), Some(MELEE));
+        a.unwield_slot(1, 6);
+        assert_eq!(a.weapon_item(500).unwrap().dtype, PROJECTILE);
+        a.unwield(500);
+        assert!(a.weapon_item(500).is_none());
+    }
+
+    #[test]
     fn a_weapon_record_without_the_stat_keeps_the_item_default() {
         let mut a = Armory::default();
         a.wield(1, 500, 6, None, &[]);
@@ -318,9 +343,9 @@ mod tests {
         // unarmed: the martial-arts item (record 43712 has no stat 436: the item default); its special-attack siblings alike
         a.list(1, false, &[(43712, 100), (42033, 144), (70292, 142)]);
         assert_eq!((a.damage_type(1, 0, 0), a.damage_type(1, 0, 144)), (Some(MELEE), Some(MELEE)));
-        assert_eq!(a.item_animation(1, 144, 0x24, 0), Some(163));
-        assert_eq!(a.item_animation(1, 142, 0x23, 0), Some(1036));
-        assert_eq!((0..4).map(|n| a.item_animation(1, 0, 0xb, n).unwrap()).collect::<Vec<_>>(), [1034, 1035, 1037, 1033]);
+        assert_eq!(a.item_animation(1, 144, 0x24, 0), Some((163, 0xb)));
+        assert_eq!(a.item_animation(1, 142, 0x23, 0), Some((1036, 0xb)));
+        assert_eq!((0..4).map(|n| a.item_animation(1, 0, 0xb, n).unwrap()).collect::<Vec<_>>(), [(1034, 0xb), (1035, 0xb), (1037, 0xb), (1033, 0xb)]);
         // right hand: Solar-Powered Pistol (projectile); left hand: Dull E-Blade (a 2H blade that deals energy damage)
         a.wield(1, 500, 6, Some(121567), &[]);
         a.wield(1, 501, 8, Some(122159), &[]);

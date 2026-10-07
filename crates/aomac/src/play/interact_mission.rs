@@ -307,15 +307,15 @@ mod tests {
         let booth = Identity { kind: 0xc748, instance: 2 };
         let confirmed = Misc::GenericCmd(GenericCmd { state: 1, seq: 1, cmd: 3, args: GenericArgs::Item { flag: 0, actor: own, item: booth } }).encode(own, 0);
         zone.world.test_prop(booth, vec![]);
-        interact.on_frame(&mut gui, &n3_frame(0, 1, confirmed), &zone);
+        interact.on_frame(&mut gui, &n3_frame(0, 1, confirmed), &mut zone);
         assert!(interact.mission.window().is_none(), "unbuilt props cannot invoke a runtime use callback");
         let store = RecordStore::open(&dir).unwrap();
-        zone.world.test_template_prop(booth, 41568, &store).unwrap();
+        zone.world.test_template_prop(booth, 41568, &store, vec![]).unwrap();
         assert_eq!(zone.world.item_class_of(booth.kind, booth.instance), Some(0xdac1));
         assert_eq!(zone.world.item_class_of(0xdac1, booth.instance), None, "template class must not remap the wire identity");
         for (state, actor) in [(0, own), (1, Identity { instance: 3, ..own }), (1, own)] {
             let payload = Misc::GenericCmd(GenericCmd { state, seq: 1, cmd: 3, args: GenericArgs::Item { flag: 0, actor, item: booth } }).encode(own, 0);
-            interact.on_frame(&mut gui, &n3_frame(0, 1, payload), &zone);
+            interact.on_frame(&mut gui, &n3_frame(0, 1, payload), &mut zone);
             assert_eq!(interact.mission.window().is_some(), state == 1 && actor == own);
         }
         interact.close_all(&mut gui);

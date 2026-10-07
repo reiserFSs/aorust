@@ -375,7 +375,7 @@ Rows without a note are UI / GlobalSignals plumbing of another feature (team, co
 | `0x56` | 0x1005d723 | sit relay | combat/actions.rs + player.rs |
 | `0x57` | 0x1005d72f | stand up | combat/actions.rs + player.rs |
 | `0x61` | 0x1005d790 | unwield of body slot `identity_b.instance` of the header char (`FUN_1006a857` -> `FUN_1006a772`, stats 0x112/0x2b2), then `FUN_10081e74(char, 3)` = the wield gesture 0x6d; live: the rifle's unwear, `identity_b = {0, 6}`, 1 ms before the weapon's `WeaponItemFullUpdate` names the bag slot 0x41 | **wired**: `Armory::unwield_slot`, `Dynels::unwield_slot` (docs/zone/avatar.md §6); the gesture: `Module::on_frame` -> `take_anims` (docs/zone/combat-anim.md §4) |
-| `0x62` | 0x1005d7de | buff/effect entry add (`FUN_100512af`) | not fight state; not driven |
+| `0x62` | 0x1005d7de | buff/effect entry add (`FUN_100512af`) | **wired**: shared `OwnNanos` lifecycle + `Dynels` stat413 target-attached persistent visuals for own/foreign characters (docs/zone/misc.md §9) |
 | `0x63` | 0x1005d827 | death: flag 0x10, stat 0x183 | combat/state.rs + player.rs; sound CwSound |
 | `0x64` | 0x1005d873 | anim holder id := `identity_b.instance` | **wired**: `Module::take_anims` -> glue |
 | `0x66` | 0x1005d258 | nano cast out of range (effect entry + own text) | not driven (nano casting) |
@@ -471,11 +471,13 @@ pairs at 23825/23920, 29898,74495 ms; no captured b1 or nonempty login list, so 
 The existing `live_walk` harness accepts `AOMAC_LIVE_SHOTS=<directory>` and
 `arm=<prefix>:<seconds>[:note|special|either|equipment|use|level]`.
 `either` remains the default and selects only own attack notes or SpecialAttack results.
-The other selectors wait for their confirmed own event to be processed, not an outgoing request.
+The other selectors wait for the own equipment event, item-use playback, or NewLevel action to be processed.
 The processing frame is `<prefix>-0000.png`; recording continues at fixed 60 Hz for the requested duration.
 Arm **before** the action: `dclick` and `invuse` already tick while waiting internally.
 For example, `arm=equip:2:equipment,dclick=40,capturewait=30` or
 `arm=item-use:2:use,invuse=0x40,capturewait=30`; use a suitable item/slot for the selected action.
+`dclick=item:<template id>` selects that actual inventory item at its current slot (for example,
+`dclick=item:121569` for the captured rifle), avoiding guesses about the free bag slot after unwearing.
 For level-up, arm `arm=level-up:2:level` before the action earning the level, then `capturewait=30`.
 `frames=<prefix>:<seconds>` still records immediately without an event trigger.
 

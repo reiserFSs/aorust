@@ -51,6 +51,7 @@ pub struct Interact {
     notices: Vec<String>,
     /// `n3Command_t` sequence numbers of the commands we sent.
     seq: i32,
+    use_actions: super::combat::use_actions::Uses,
     /// Screen size for centring the window.
     pub(super) screen: (u32, u32),
     /// Every NPC dialogue line seen, in order, for the live harness (`HTML` as shown).
@@ -84,6 +85,7 @@ impl Interact {
 
     /// The zone changes or the connection ends: the dialogue window goes away without a word to the server.
     pub fn close_all(&mut self, gui: &mut Gui) {
+        self.use_actions.clear();
         self.use_ui.close_all(gui);
         self.ptrade.close_all(gui);
         self.shop_close_all(gui);
@@ -99,7 +101,23 @@ impl Interact {
     }
 
     pub fn take_outbox(&mut self) -> Vec<Frame> {
+        for frame in &self.outbox {
+            if let Ok(message) = n3::decode(frame) { self.use_actions.request(&message); }
+        }
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Actual outgoing use requests, after their inventory/world gates succeeded.
+    pub fn observe_use_request(&mut self, frame: &Frame, _zone: &Zone) {
+        if let Ok(message) = n3::decode(frame) { self.use_actions.request(&message); }
+    }
+
+    pub fn advance_use_actions(&mut self, dt: f32, zone: &mut Zone) {
+        self.use_actions.update(zone, dt);
+    }
+
+    pub fn take_use_actions(&mut self) -> Vec<super::combat::use_actions::Playback> {
+        self.use_actions.take()
     }
 
     pub(super) fn send(&mut self, payload: Vec<u8>) {
@@ -107,12 +125,13 @@ impl Interact {
     }
 
     /// Every received zone frame: Knubot, trade, inventory and grid messages.
-    pub fn on_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &Zone) {
+    pub fn on_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &mut Zone) {
         let Ok(m) = n3::decode(f) else { return };
         let who = m.header.target;
         self.shop.literacy = zone.skill_value(0xa1).unwrap_or(0).min(3000);
         self.watch_objects(gui, &m);
         self.shop_watch(&m);
+        self.use_actions.on_message(&m, zone);
         match m.body {
             N3::Knubot(k) => self.on_knubot(gui, k, zone),
             N3::Trade(t) => self.on_trade(gui, t, who, zone),

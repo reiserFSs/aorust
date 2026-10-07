@@ -1112,9 +1112,16 @@ fn live_walk() {
                 l.wait(5.0);
             }
             // `useon=<slot>:<kind>:<instance>`: the bag item in `slot` released over the world object (`N3Msg_UseItemOnItem` / `UseItemOnCharacter`)
-            // `dclick=<slot hex>`: the double click on the item of an inventory slot (bag item: wear / use, worn item: back to the bag)
+            // `dclick=<slot hex>` or `dclick=item:<template id>` uses the actual inventory UI path.
+            // Template selection is useful when unwearing moves an item to the next free bag slot.
             "dclick" => {
-                let slot = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+                let slot = if let Some(template) = v.strip_prefix("item:") {
+                    let template: i32 = template.parse().expect("dclick item template id");
+                    l.p.zone.inventory.iter().filter(|(_, item)| item.item.low_id == template)
+                        .map(|(slot, _)| *slot).min().expect("dclick item not in inventory")
+                } else {
+                    u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap()
+                };
                 let p = &mut l.p;
                 p.hud.as_mut().unwrap().live_double_click(&p.zone, slot);
                 l.wait(3.0);

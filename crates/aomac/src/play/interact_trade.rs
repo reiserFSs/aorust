@@ -470,7 +470,7 @@ mod tests {
         z
     }
 
-    fn feed(i: &mut Interact, gui: &mut Gui, z: &Zone, k: Knubot) {
+    fn feed(i: &mut Interact, gui: &mut Gui, z: &mut Zone, k: Knubot) {
         i.on_frame(gui, &n3_frame(0, OWN, k.encode(ME)), z);
     }
 
@@ -485,7 +485,7 @@ mod tests {
             .collect()
     }
 
-    fn open(gui: &mut Gui, z: &Zone, b20: bool, b21: bool) -> Interact {
+    fn open(gui: &mut Gui, z: &mut Zone, b20: bool, b21: bool) -> Interact {
         let mut i = Interact::new(OWN, (1280, 800));
         feed(&mut i, gui, z, Knubot::Open { npc: NPC, b20, b21 });
         i
@@ -506,7 +506,7 @@ mod tests {
         let mut i = Interact::new(OWN, (1280, 800));
         // stat 0 bit 21 of the NPC enables the fourth button (read when the window is built)
         z.character_stats.entry(4711).or_default().insert(0, STAT0_USE_BIT);
-        feed(&mut i, &mut gui, &z, Knubot::Open { npc: NPC, b20: true, b21: false });
+        feed(&mut i, &mut gui, &mut z, Knubot::Open { npc: NPC, b20: true, b21: false });
         assert!(i.press_button(&mut gui, 0));
         assert!(!i.press_button(&mut gui, 2), "trade needs b21");
         assert!(i.press_button(&mut gui, 1));
@@ -522,8 +522,8 @@ mod tests {
     #[test]
     fn transcript_links_use_the_existing_info_queue_without_sending_an_answer() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
-        let mut i = open(&mut gui, &z, true, false);
+        let mut z = zone();
+        let mut i = open(&mut gui, &mut z, true, false);
         i.take_outbox();
         i.chat_out(&mut gui, ChatOut::Link("itemref://53019/53020/1".into()));
         assert_eq!(i.take_info_urls(), ["itemref://53019/53020/1"]);
@@ -536,7 +536,7 @@ mod tests {
         let mut z = zone();
         let mut i = Interact::new(OWN, (1280, 800));
         z.character_stats.entry(4711).or_default().insert(0, STAT0_USE_BIT);
-        feed(&mut i, &mut gui, &z, Knubot::Open { npc: NPC, b20: false, b21: false });
+        feed(&mut i, &mut gui, &mut z, Knubot::Open { npc: NPC, b20: false, b21: false });
         assert!(i.press_button(&mut gui, 3));
         let f = i.take_outbox();
         assert_eq!(f.len(), 1);
@@ -547,14 +547,14 @@ mod tests {
     #[test]
     fn trade_round_trip_accept() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
-        let mut i = open(&mut gui, &z, true, true);
+        let mut z = zone();
+        let mut i = open(&mut gui, &mut z, true, true);
         // the trade button asks the server; the server's StartTrade builds the window
         assert!(i.press_button(&mut gui, 2));
         // (the empty string is what the client writes; the read side of the class rejects it, so compare the frame)
         assert_eq!(i.take_outbox(), vec![n3_frame(0, OWN, knubot::start_trade(ME, NPC))]);
         assert!(i.trade.win.is_none());
-        feed(&mut i, &mut gui, &z, Knubot::StartTrade { npc: NPC, value: 3, text: "Sell me <b>stuff</b>".into() });
+        feed(&mut i, &mut gui, &mut z, Knubot::StartTrade { npc: NPC, value: 3, text: "Sell me <b>stuff</b>".into() });
         let t = i.trade.win.as_ref().expect("trade window");
         assert_eq!(gui.text(t.win, "give_items"), "GIVE ITEMS");
         assert_eq!(gui.text(i.chat.as_ref().unwrap().win, "npc_answers"), "<font color=CCNPCChatTrade>Sell me <b>stuff</b></font>");
@@ -566,7 +566,7 @@ mod tests {
         assert_eq!((tw.0, tw.1), dock_right(chat));
         assert_eq!(gui.window_outer_frame(i.chat.as_ref().unwrap().bar).map(|b| (b.0, b.1)), Some(dock_below(chat)));
         // a second StartTrade while a bar exists changes nothing (`FUN_10058a4c` tests `this+0x140`)
-        feed(&mut i, &mut gui, &z, Knubot::StartTrade { npc: NPC, value: 9, text: "again".into() });
+        feed(&mut i, &mut gui, &mut z, Knubot::StartTrade { npc: NPC, value: 9, text: "again".into() });
         assert_eq!(i.trade.win.as_ref().unwrap().max, 3);
         // items: three fit, the fourth is refused
         let item = |n| Identity { kind: 0x68, instance: 0x40 + n };
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(gui.text(i.trade.win.as_ref().unwrap().win, "credits"), "500");
         assert_eq!(i.take_cash_delta(), -500);
         // the server ends the trade: credits back, window gone, last text type 3
-        feed(&mut i, &mut gui, &z, Knubot::RejectedItems { npc: NPC, items: vec![(item(0), 1, 2)], value: 120 });
+        feed(&mut i, &mut gui, &mut z, Knubot::RejectedItems { npc: NPC, items: vec![(item(0), 1, 2)], value: 120 });
         assert!(i.trade.win.is_none());
         assert_eq!(i.take_cash_delta(), 120);
         assert_eq!(i.trade.rejected.len(), 1);
@@ -593,16 +593,16 @@ mod tests {
     #[test]
     fn decline_and_the_trade_button_cancel() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
-        let mut i = open(&mut gui, &z, true, true);
-        feed(&mut i, &mut gui, &z, Knubot::StartTrade { npc: NPC, value: 1, text: "x".into() });
+        let mut z = zone();
+        let mut i = open(&mut gui, &mut z, true, true);
+        feed(&mut i, &mut gui, &mut z, Knubot::StartTrade { npc: NPC, value: 1, text: "x".into() });
         assert_eq!(gui.text(i.trade.win.as_ref().unwrap().win, "give_items"), "GIVE ITEM");
         assert!(i.trade_decline(&mut gui, &z));
         assert_eq!(sent(&mut i), vec![Knubot::FinishTrade { npc: NPC, flag: true, value: 0 }]);
         assert!(i.trade.win.is_none());
         assert_eq!(i.take_cash_delta(), 0);
         // the same through the bar's trade button while the trade runs
-        feed(&mut i, &mut gui, &z, Knubot::StartTrade { npc: NPC, value: 1, text: "x".into() });
+        feed(&mut i, &mut gui, &mut z, Knubot::StartTrade { npc: NPC, value: 1, text: "x".into() });
         assert!(i.press_button(&mut gui, 2));
         assert_eq!(sent(&mut i), vec![Knubot::FinishTrade { npc: NPC, flag: true, value: 0 }]);
         assert!(i.trade.win.is_none());
@@ -611,9 +611,9 @@ mod tests {
     #[test]
     fn drops_on_the_container_add_and_remove_items() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
-        let mut i = open(&mut gui, &z, true, true);
-        feed(&mut i, &mut gui, &z, Knubot::StartTrade { npc: NPC, value: 2, text: "x".into() });
+        let mut z = zone();
+        let mut i = open(&mut gui, &mut z, true, true);
+        feed(&mut i, &mut gui, &mut z, Knubot::StartTrade { npc: NPC, value: 2, text: "x".into() });
         gui.frame(0.0);
         let r = gui.view_rect(i.trade.win.as_ref().unwrap().win, "items").unwrap();
         let (x, y) = (r.l + 10.0, r.t + 10.0);
@@ -650,12 +650,12 @@ mod tests {
     #[test]
     fn closing_the_dialogue_closes_the_trade_window() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
-        let mut i = open(&mut gui, &z, true, true);
-        feed(&mut i, &mut gui, &z, Knubot::StartTrade { npc: NPC, value: 1, text: "x".into() });
+        let mut z = zone();
+        let mut i = open(&mut gui, &mut z, true, true);
+        feed(&mut i, &mut gui, &mut z, Knubot::StartTrade { npc: NPC, value: 1, text: "x".into() });
         let (bar, tw) = (i.chat.as_ref().unwrap().bar, i.trade.win.as_ref().unwrap().win);
         assert!(gui.window_visible(bar) && gui.window_visible(tw));
-        feed(&mut i, &mut gui, &z, Knubot::Close { npc: NPC, value: 0, text: String::new() });
+        feed(&mut i, &mut gui, &mut z, Knubot::Close { npc: NPC, value: 0, text: String::new() });
         assert!(i.chat.is_none() && i.trade.win.is_none());
         assert!(!gui.window_visible(bar) && !gui.window_visible(tw), "both windows are closed");
     }
@@ -663,9 +663,9 @@ mod tests {
     #[test]
     fn window_close_button_sends_close_and_removes_the_trade_window() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
-        let mut i = open(&mut gui, &z, true, true);
-        feed(&mut i, &mut gui, &z, Knubot::StartTrade { npc: NPC, value: 1, text: "x".into() });
+        let mut z = zone();
+        let mut i = open(&mut gui, &mut z, true, true);
+        feed(&mut i, &mut gui, &mut z, Knubot::StartTrade { npc: NPC, value: 1, text: "x".into() });
         let win = i.chat.as_ref().unwrap().win;
         assert!(i.event(&mut gui, &Event::CloseRequested { window: win }, &z));
         assert_eq!(sent(&mut i), vec![Knubot::Close { npc: NPC, value: 0, text: String::new() }]);
@@ -677,14 +677,14 @@ mod tests {
     fn npc_dialogue_render() {
         let Some(dir) = std::env::var_os("AOMAC_SHOT_DIR") else { return };
         let Some(mut gui) = rig() else { return };
-        let z = zone();
+        let mut z = zone();
         gui.set_screen_size(1000, 760);
         let texts = ChatTexts { tips: ["Request description".into(), "Request info".into(), "Give items".into(), "Shop".into()] };
         let mut i = Interact::new(OWN, (1000, 760));
         i.trade.texts = texts;
-        feed(&mut i, &mut gui, &z, Knubot::Open { npc: NPC, b20: true, b21: true });
-        feed(&mut i, &mut gui, &z, Knubot::AppendText { npc: NPC, kind: 0, text: "Welcome, stranger. What can I do for you today?".into() });
-        feed(&mut i, &mut gui, &z, Knubot::AnswerList { npc: NPC, answers: vec!["Where am I?".into(), "I would like to trade a very long answer that has to wrap over several lines of the answer list.".into(), "Goodbye".into()] });
+        feed(&mut i, &mut gui, &mut z, Knubot::Open { npc: NPC, b20: true, b21: true });
+        feed(&mut i, &mut gui, &mut z, Knubot::AppendText { npc: NPC, kind: 0, text: "Welcome, stranger. What can I do for you today?".into() });
+        feed(&mut i, &mut gui, &mut z, Knubot::AnswerList { npc: NPC, answers: vec!["Where am I?".into(), "I would like to trade a very long answer that has to wrap over several lines of the answer list.".into(), "Goodbye".into()] });
         i.chat.as_mut().unwrap().sync_docks(&mut gui, None);
         struct Fe(Gui);
         impl ao_render::Frontend for Fe {
@@ -704,7 +704,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         o.png(&fe, &list, &std::path::Path::new(&dir).join("npc_answers.png")).unwrap();
         // the trade: the text replaces the answers, the trade window docks to the right
-        feed(&mut i, &mut fe.0, &z, Knubot::StartTrade { npc: NPC, value: 3, text: "Give me 3 items and some credits".into() });
+        feed(&mut i, &mut fe.0, &mut z, Knubot::StartTrade { npc: NPC, value: 3, text: "Give me 3 items and some credits".into() });
         let mut items = super::super::hud_stats::items::Items::new(&ao_gui::client_dir());
         let info = items.info(&mut fe.0, 248323).map(|i| (i.name.clone(), i.icon)).unwrap();
         assert_eq!(info.0, "Spinal Section");

@@ -443,6 +443,7 @@ Live verification (Fix8World, clean `origin/main` plus world patch): muted offsc
 passed in 31.28 s. The server supplied stat 64 = 40099; after dropping `Play`, the persisted cache had `HeadID=40099`.
 The inspected `select-after.png` showed swept/full dark hair rather than the default mohawk. This proves the offscreen
 frontend/cache path, not a real-window visual check: the workstation session was locked.
+
 Real-window verification (CharSelect, 2026-10-07; muted, live lock, PID-owned window): inspected Testy
 (Female Solitus), Aomacvolk (Male Solitus with rifle), Aomacfixr (Male Solitus), and Aomacvktq (Uni Atrox).
 Heads and resolved bodies matched; the selected row showed complete level/gender/breed/profession/location values

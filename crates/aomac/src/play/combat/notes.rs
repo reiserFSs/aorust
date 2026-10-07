@@ -5,6 +5,13 @@
 //! calls `FUN_1003bccb` -> `FUN_10045069` [GC 0x10045069] for each note (the clip's named events, `CatAnim::events`) whose time has been reached.
 //! The note id comes from the event *name* ([`note_id`], DisplaySystem `FUN_10075c84` [DS 0x10075c84], `strncmp` prefixes).
 
+
+/// A holder marker carries its own playback slot; combat state is read when it is dispatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FiredNote {
+    pub id: u32,
+    pub slot: i32,
+}
 /// Note ids the fight code reacts to (`FUN_10045069`).
 pub mod id {
     /// `attack` (also `attack\r\n`): the moment of the blow / shot of a swing clip.
@@ -95,19 +102,25 @@ pub fn note_id(name: &str) -> u32 {
 
 /// The notes of a playing clip whose event time (`CatAnim::events`, ms) has been reached at `clip_ms`; every event fires once per play (`fired` is the
 /// per-clip bit mask, `piVar7[0xd]`, cleared when the clip starts). Events without a note id are marked but not returned.
-pub fn fire(events: &[(u32, String)], clip_ms: f32, fired: &mut u32) -> Vec<u32> {
-    let mut out = Vec::new();
-    for (i, (t, name)) in events.iter().enumerate() {
+pub fn fire<'a>(events: &'a [(u32, String)], clip_ms: f32, fired: &'a mut u32) -> impl Iterator<Item = u32> + 'a {
+    events.iter().enumerate().filter_map(move |(i, (t, name))| {
         let bit = 1u32 << (i & 31);
-        if *fired & bit == 0 && *t as f32 <= clip_ms {
-            *fired |= bit;
-            let n = note_id(name);
-            if n != 0 {
-                out.push(n);
-            }
-        }
-    }
-    out
+        if *fired & bit != 0 || *t as f32 > clip_ms { return None }
+        *fired |= bit;
+        let note = note_id(name);
+        (note != 0).then_some(note)
+    })
+}
+
+/// GC 0x1003c036 flushes unfired attack-related markers when the CAT handle disappears.
+pub fn finish<'a>(events: &'a [(u32, String)], fired: &'a mut u32) -> impl Iterator<Item = u32> + 'a {
+    events.iter().enumerate().filter_map(move |(i, (_, name))| {
+        let bit = 1u32 << (i & 31);
+        let note = note_id(name);
+        if *fired & bit != 0 || !matches!(note, id::ATTACK | 0x3c..=0x41 | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) { return None }
+        *fired |= bit;
+        Some(note)
+    })
 }
 
 /// `SM_Sandy_Swish_*` of a player (`AnimHolder_t` ctor `FUN_10044702` members `+0x10..+0x1c`, played by notes 0x73..0x76 when the character has no NPC record).
@@ -234,11 +247,20 @@ mod tests {
     fn a_note_fires_once_when_its_time_is_reached() {
         let ev = vec![(100, "attack_start_1".to_string()), (400, "attack".to_string()), (400, "swish_punch".to_string()), (900, "loopend".to_string())];
         let mut fired = 0;
-        assert_eq!(fire(&ev, 50.0, &mut fired), Vec::<u32>::new());
-        assert_eq!(fire(&ev, 100.0, &mut fired), [0x77]);
-        assert_eq!(fire(&ev, 399.0, &mut fired), Vec::<u32>::new());
-        assert_eq!(fire(&ev, 420.0, &mut fired), [0xb, 0x73]);
-        assert_eq!(fire(&ev, 2000.0, &mut fired), Vec::<u32>::new(), "loopend has no note and nothing fires twice");
+        assert_eq!(fire(&ev, 50.0, &mut fired).collect::<Vec<_>>(), Vec::<u32>::new());
+        assert_eq!(fire(&ev, 100.0, &mut fired).collect::<Vec<_>>(), [0x77]);
+        assert_eq!(fire(&ev, 399.0, &mut fired).collect::<Vec<_>>(), Vec::<u32>::new());
+        assert_eq!(fire(&ev, 420.0, &mut fired).collect::<Vec<_>>(), [0xb, 0x73]);
+        assert_eq!(fire(&ev, 2000.0, &mut fired).collect::<Vec<_>>(), Vec::<u32>::new(), "loopend has no note and nothing fires twice");
+    }
+
+    #[test]
+    fn interrupted_holder_flushes_only_pending_attack_markers() {
+        let events = vec![(133, "attack_effect_1".into()), (233, "attack_effect_2".into()), (333, "attack_effect_3".into()), (433, "attack_effect_4".into()), (500, "swish_punch".into())];
+        let mut fired = 0;
+        assert_eq!(fire(&events, 150.0, &mut fired).collect::<Vec<_>>(), [id::ATTACK_EFFECT_1]);
+        assert_eq!(finish(&events, &mut fired).collect::<Vec<_>>(), [id::ATTACK_EFFECT_1 + 1, id::ATTACK_EFFECT_1 + 2, id::ATTACK_EFFECT_4]);
+        assert_eq!(finish(&events, &mut fired).count(), 0);
     }
 
     #[test]

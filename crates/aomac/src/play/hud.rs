@@ -325,6 +325,7 @@ pub(super) struct Hud {
     size: (u32, u32),
     /// The distributed-value store (`play/dvalue.rs`): window flags, prefs, `/option` `/dvalue` (docs/chat/dvalue.md).
     pub(super) dvalues: DValues,
+    level_notice: super::level_notice::LevelNotice,
     /// Tooltip titles of the health / nano / XP / alien XP bars (text.mdb category 0x2710).
     bar_titles: [String; 4],
     bars: Vec<Bar>,
@@ -397,7 +398,7 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), bars: vec![], bar_titles, menu_roots, popup: None, menu_scripts: vec![], menu_camera: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, options: HudOptions::new(dir, size)?, help_urls: vec![], mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), bindings: Bindings::default(), fixed: FixedKeys::default(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None, wincfg: super::hud_wincfg::WinCfgs::new(dir) };
+        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), level_notice: Default::default(), bars: vec![], bar_titles, menu_roots, popup: None, menu_scripts: vec![], menu_camera: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, options: HudOptions::new(dir, size)?, help_urls: vec![], mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), bindings: Bindings::default(), fixed: FixedKeys::default(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None, wincfg: super::hud_wincfg::WinCfgs::new(dir) };
         hud.target.targets_target = hud.dvalues.flag("Targetstarget");
         hud.rollup.restore_docks(gui, &hud.wincfg.load_docks(&hud.dvalues));
         hud.fill_docks(gui);
@@ -643,6 +644,7 @@ impl Hud {
 
     pub(super) fn activate_item(&mut self, zone: &Zone, slot: u32) {
         self.stats.activate_item(zone, slot);
+        self.outbox.extend(self.stats.take_outbox());
     }
 
     pub(super) fn activate_nano(&mut self, gui: &mut Gui, zone: &Zone, id: i32) {
@@ -729,6 +731,7 @@ impl Hud {
 
     /// Re-evaluates criteria and refreshes every value-driven widget.
     fn refresh(&mut self, gui: &mut Gui, zone: &Zone) {
+        self.level_notice.update(gui, &mut self.dvalues, self.size);
         let res = self.res(zone);
         gui.apply_criteria(self.cc, &res);
         for b in &self.bars {
@@ -1010,6 +1013,11 @@ impl Hud {
 
     /// `true` when the event was consumed by the HUD.
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
+        if let Some(target) = self.level_notice.event(ev) {
+            self.dvalues.set_i64(target, 1);
+            if let Some(kind) = WindowKind::from_dvalue(target) { self.open(gui, kind); }
+            return true;
+        }
         if self.wincfg.hud_frame_event(gui, ev, self.size) {
             return true;
         }
@@ -1258,6 +1266,7 @@ impl Hud {
     pub(super) fn open(&mut self, gui: &mut Gui, kind: WindowKind) {
         let before = gui.window_ids();
         self.dvalues.set_i64(kind.dvalue(), 1);
+        super::level_notice::LevelNotice::opened(&mut self.dvalues, kind.dvalue());
         gui.set_cc_active(self.cc, kind.dvalue(), true);
         self.stats.open(gui, &mut self.rollup, kind);
         if HudNano::handles(kind) {
@@ -1466,6 +1475,27 @@ mod tests {
         assert_eq!(group(0), "0");
         assert_eq!(group(1234567), "1,234,567");
         assert_eq!(group(-1000), "-1,000");
+    }
+
+    #[test]
+    fn hotbar_item_activation_flushes_without_a_mouse_event() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = Hud::new(&mut gui, &dir, (1280, 800)).unwrap();
+        let mut zone = Zone::new(123);
+        let slot = 0x40;
+        zone.inventory.insert(slot, ao_net::n3::world::InventoryEntry {
+            slot, a: 0, b: 1, id: ao_net::n3::inventory::item_identity(slot),
+            item: ao_net::n3::world::AcgItem { low_id: 23314, high_id: 23314, level: 1 },
+        });
+        hud.activate_item(&zone, slot);
+        let frames = hud.take_outbox();
+        assert_eq!(frames.len(), 1);
+        assert!(super::super::combat::use_actions::requested(&ao_net::n3::decode(&frames[0]).unwrap()).is_some());
+        assert!(hud.take_outbox().is_empty());
+        hud.activate_item(&zone, slot + 1);
+        assert!(hud.take_outbox().is_empty());
     }
 
     #[test]

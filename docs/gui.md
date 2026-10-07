@@ -44,6 +44,16 @@ indices remain unchanged. Regressions: `view::lifetime_tests` (asset-independent
 (installed assets; Programs-style row replacement, chat close/reopen, options
 dropdown/list widgets, wrapper errors and stale interaction state).
 
+Shared application `hud_listview::ListView` content refreshes (NCU, Programs,
+actions and missions) retain canvas/row controls when ordered item keys and
+layout are unchanged. Text, icons, selection colors and tooltips update in
+place; changed keys/layout use normal subtree reclamation. Chat does not use
+this application list helper. The shared GUI `SetToolTip` rule refreshes changed
+tooltip texts and shown metrics without discarding hover identity.
+Regression: `hud_listview::tests::timer_updates_preserve_hover_and_press_identity`
+(installed assets; one-second refresh, subsequent mouse move, press/release
+across refresh, list double click and removal).
+
 ## 1. Skin archive (`gfx.rs`)
 
 * `cd_image/gui/Default/Graphics.uvgi`: text; line 1 = entry count, then `name offset length`. `Graphics.uvga` = concatenated PNGs
@@ -353,6 +363,30 @@ Evidence (GUI.dll, project copy of `/tmp/aomac-ghidra/dsky/gui`):
 * **Mini toolbar above Wear (bug 11):** retail `pasted-image-cf5fb9f9b633eadc.png` shows this icon strip, distinct from the Wear header in `pasted-image-ba7bc439cfc00e5e.png`. `Views/ControlCenter.xml:19` registers `CCMiniToolbar` with `cc_mini_toolbar && cc_rollup_panel && cc_section1`; `CharPrefs.xml:67` defaults the setting to false, so the capture is a nondefault setting. The unsupported XML element was an empty view in the port. It now keeps the native criteria and receives the native buttons.
   GUI.dll `MiniToolbar_c` ctor `0x100726b3` defines, in order, Wear (`wear_window`, SB_WEAR), Controls (`specialaction_window`, SB_ACTION), Knowledge (`knowledge_window`, SB_REF), Mission (`mission_window`, SB_MISSION), Team (`team_view`, SB_TEAM), Map (`map_window`, SB_MAP), Friends (`friends_window`, SB_FRIENDS), Programs (`nano_window`, SB_NANO), Stats (`stat_window`, SB_STAT), NCU (`ncu_window`, SB_NCU). Names in parentheses are exact DValues, and the displayed names are the constructor's tooltip strings (empty tooltip body). `ToolbarButton_c` `0x10072b33` binds the DValue, toggle value and tooltip; assembly `0x1007272b..0x10072743` passes raised `0x173` = SB_WEAR_OFF and pressed/hover `0x172` = SB_WEAR. Each entry uses its corresponding ON/OFF pair. Click callback `0x10072429` writes the bool DValue; `0x10072475` applies DValue changes back to the button. Layout `0x100724e8` places the first at (0,0), advances by inclusive Width+1, and reports summed width/max height; no invented spacing or icons.
   Existing `Hud::toggle_dvalue` opens/closes implemented windows; Friends remains chat-owned. Knowledge's exact DValue is toggled and reflected in the icon, but its window consumer is not implemented (existing feature gap, not a fabricated substitute). Regression `hud::tests::native_mini_toolbar_setting_order_and_window_toggles` covers disabled default, enabled strip, native icon widths/contiguous order, all ten DValue actions, implemented-window membership and rollup criteria. No builds/tests/live checks were run by this worker.
+* **NewLevel notices** (`play/level_notice.rs`): fresh GUI.dll string xrefs resolve
+  `got_ip` at `0x101aec6c`, `got_perk` at `0x101aec98`, and `got_tech` at
+  `0x101aeca8` to `0x1002de8e`, `0x1002dfe7`, and `0x1002e140`.
+  These create `NotifyButton` (`0x10052fa0`), a style-3 borderless window
+  (flags `0xd3c`) with a native icon button, **not a chat toast or golden CC entry**.
+  Raised/pressed/hover all use `GFX_GUI_NEW_IP` (`0xaf`), `NEW_PERK` (`0xb0`),
+  or `NEW_TECH` (`0xb1`). Origin is `(screenW-60, screenH-273/333/393)`;
+  exact f32 constants are `0x101aec64=60`, `0x101aec68=273`,
+  `0x101aec88=333`, `0x101aeca4=393`. No flash timer is created.
+  Click handler `0x10052f39` sets `skill_window`, `perk_window`, or
+  `research_window` true. Login pref `ShowIPPerkbutton` (default 1) gates
+  the notices; disabled callbacks clear `got_*`. Opening Skills/Perks/Research
+  clears their flag (GUI `0x100fe956`, `0x100611dc`, `0x100f6bf4`);
+  the Research callback additionally suppresses a notice while Research is open.
+  `DValues::new` registers these nonpersistent booleans; HUD refresh and
+  click handling use the original assets/positions and existing window consumers.
+  **Existing gap:** the Research window itself has no native port consumer:
+  clicking its notice sets the correct `research_window` DValue without
+  creating a fabricated replacement. No new level text is generated.
+  Regressions `level_notice::tests::opening_notice_target_clears_only_its_flag`
+  and `native_notice_assets_geometry_click_and_preference` cover independent
+  dismissal, actual asset IDs/natural dimensions, borderless window sizing,
+  native origins, click targets, and the disabled preference.
+  No tests, builds, or live checks were run by this worker.
 * `prefs/NewChar/*` is the install's new-character template; **no DLL contains the string `NewChar`** (searched all DLL/EXE, ASCII and UTF-16), so its consumer is UNRESOLVED. Its arbitrary bar/hotbar frames demonstrate saved custom positions, not a screen-independent first-login layout. Pool bars use the constructor positions from `SlotPlayerCharacterAlive` 0x1006afed, the compass uses 0x1006d433, and the hotbar starts at `(20,20)` from 0x100d94e9; character-owned `WindowFrame`s override those origins and are clamped by `MoveInsideScreen`.
 * **Item inspection (bug 7):** `hud_stats/item_ui.rs` routes Shift/Ctrl-left-click and right-click on filled wear/grid cells, and inventory list rows, through `Hud::take_info_urls` to the existing chat InfoView (`Views/InfoView.xml`, `BrowserView`, Back/Forward; docs/chat/dialogs.md §1). URLs carry the runtime inventory identity from GC `FUN_10046d8e(slot)`, not a template ID or the entry's unresolved `id` words. The qualified click never arms drag or enters double-click use; missing slots produce no URL. Shift/Ctrl info signals are evidenced by `MultiListView_c` handler `FUN_10040a17` (§10.5); direct right-click inspection is the requested interaction, while the complete retail item popup remains unresolved. The inventory tab's **“i”** is the window-icon menu (`WndBorder::SlotIconButton` 0x1015a74e; `Event::FrameIcon`), not an item-information button; it is intentionally not rebound to inspect an arbitrary item. Regression `item_inspection_does_not_use_or_drag_inventory_and_wear` covers filled wear/grid/list routes and absence of outbound use/move messages; not run during this edit.
 

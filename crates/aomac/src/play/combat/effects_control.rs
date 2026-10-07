@@ -26,10 +26,12 @@ impl Controller {
         ensure!(template.words.len() >= if template.kind==1001 {22} else {33}, "short controller template");
         ensure!(config.source_identity.is_some(), "controller requires a source dynel identity");
         for i in (1..=6).chain([8]).chain(if template.kind==1001 {12..=20} else {10..=26}) { template.float(i)?; }
-        if template.kind==1010 { ensure!(config.target_identity.is_some(), "Spell1 requires a target dynel identity"); }
         let remaining = config.repetitions.map(|n| n as i32).unwrap_or(if template.kind==1001 {template.word(21)? as i32} else {-1});
         let spell=if template.kind==1010 {Some(Spell::new(template)?)} else {None};
-        let anchor_ids=if template.kind==1010 {[2001,2000,1003]} else {[template.word(7)? as i32,0,0]};
+        let anchor_ids=if template.kind==1010 {
+            let explicit=config.source_attractor.filter(|id| *id != 0);
+            [explicit.unwrap_or(2001),explicit.unwrap_or(2000),1003]
+        } else {[config.source_attractor.filter(|id| *id != 0).unwrap_or(template.word(7)? as i32),0,0]};
         Ok(Self { template: template.clone(), config, anchors: [source,source,Mat4::from_translation(target)], elapsed:0.0, delay:0.0, remaining, registered:false,spell,started:false,anchor_ids })
     }
 
@@ -267,6 +269,10 @@ mod tests {
         assert_eq!(controller.anchors[2].w_axis.truncate(),Vec3::Z);
         controller.update_target(Vec3::Z*2.0);
         assert_eq!(controller.anchors.map(|m|m.w_axis.truncate()),[Vec3::X,Vec3::Y,Vec3::Z*2.0]);
+        let config=EffectConfig {source_identity:Some((50000,1)),source_attractor:Some(1007),..EffectConfig::default()};
+        let controller=Controller::new(&Template {kind:1010,words:vec![0;34]},Mat4::IDENTITY,Vec3::Z,config).unwrap();
+        assert_eq!(controller.anchor_ids(),&[1007,1007,1003]);
+        assert_eq!(controller.anchors[2].w_axis.truncate(),Vec3::Z);
     }
     #[test]
     fn release_retimes_only_retail_cast_mode() {

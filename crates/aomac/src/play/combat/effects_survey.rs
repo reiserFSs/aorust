@@ -1,4 +1,4 @@
-//! Explicit retail-data census; missing client data is an error, never a skipped pass.
+//! Explicit retail-data census; unexpected missing client data is an error.
 use super::{bindings, Renderer, Templates};
 use anyhow::{ensure, Context, Result};
 use ao_rdb::RecordStore;
@@ -95,6 +95,39 @@ fn nanos(store: &RecordStore, templates: &Templates) -> Result<Census> {
         }
     }
     Ok(out)
+}
+
+fn persistent_buffs(store: &RecordStore, templates: &Templates) -> Result<Census> {
+    let mut out = Census::default();
+    for id in store.ids(crate::play::hud_nanodb::NANO_RDB_TYPE)? {
+        out.records += 1;
+        let record = store.get(crate::play::hud_nanodb::NANO_RDB_TYPE, id)?.with_context(|| format!("enumerated nano {id} disappeared"))?;
+        match ao_formats::dynel_visual::parse_item_template(&record) {
+            Ok(template) => {
+                if let Some(effect) = template.stat(413).filter(|&effect| effect > 0) {
+                    out.add(templates, id, 413, 0, effect);
+                }
+            }
+            Err(error) => { out.malformed.insert(id, format!("{error:#}")); }
+        }
+    }
+    Ok(out)
+}
+
+#[test]
+#[ignore = "requires installed retail client; census of persistent stat413 buff effects"]
+fn retail_persistent_buff_census() -> Result<()> {
+    let (store, templates) = retail()?;
+    let census = persistent_buffs(&store, &templates)?;
+    census.report("persistent buff stat413");
+    ensure!(census.records > 0 && census.total > 0, "empty persistent buff stat413 census");
+    ensure!(census.malformed.is_empty(), "persistent buff stat413: malformed records {:?}", census.malformed);
+    // Installed gfxtweak gaps documented in docs/zone/combat-anim.md §7.5; never substitute artwork.
+    ensure!(census.missing.keys().copied().collect::<BTreeSet<_>>() == BTreeSet::from([16451, 39606, 39745]),
+        "persistent buff stat413: changed missing effect IDs {:?}", census.missing);
+    let unsupported: BTreeMap<_, _> = census.classes.iter().filter(|(kind, _)| !Renderer::supports(**kind)).collect();
+    ensure!(unsupported.is_empty(), "unsupported persistent buff classes and IDs: {unsupported:?}");
+    Ok(())
 }
 
 #[test]

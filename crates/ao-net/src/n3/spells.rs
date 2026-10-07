@@ -141,7 +141,8 @@ pub fn read_spell(r: &mut Reader) -> Result<Spell> {
             let n = r.i32()?;
             ensure!(n >= 0 && n as usize <= r.remaining(), "spell string length {n}");
             let b = r.bytes(n as usize)?;
-            s.strings.insert(stat, String::from_utf8_lossy(b).into_owned());
+            let end = b.iter().position(|&byte| byte == 0).unwrap_or(b.len());
+            s.strings.insert(stat, String::from_utf8_lossy(&b[..end]).into_owned());
         } else {
             s.stats.insert(stat, r.i32()?);
         }
@@ -182,8 +183,13 @@ fn write_spell(w: &mut Writer, s: &Spell) -> Result<()> {
     for &(ct, stat) in STD.iter().chain(format_of(s.function)) {
         if ct == STRING_TYPE {
             let t = s.strings.get(&stat).map_or("", |t| t.as_str());
-            w.i32(t.len() as i32);
-            w.bytes(t.as_bytes());
+            if t.is_empty() {
+                w.i32(0);
+            } else {
+                w.i32(t.len() as i32 + 1);
+                w.bytes(t.as_bytes());
+                w.u8(0);
+            }
         } else {
             w.i32(s.stat(stat));
         }
@@ -261,7 +267,7 @@ static FORMATS: [&[Arg]; 130] = [
     &[(1, 1), (0, 39)],
     &[(0, 39)],
     &[(0, 39), (0, 117)],
-    &[(0, 66), (0, 67), (0, 68), (0, 69), (0, 78)],
+    &[(1, 0), (0, 66), (0, 67), (0, 68), (0, 69), (0, 78)],
     &[(0, 39), (0, 49), (0, 50), (0, 51), (0, 52), (0, 53), (0, 54)],
     &[(0, 39), (0, 49), (0, 50), (0, 153), (0, 154), (0, 155), (0, 156), (0, 157), (0, 158), (0, 159), (0, 160), (0, 161), (0, 86)],
     &[(0, 51), (0, 52), (0, 53)],
@@ -425,6 +431,46 @@ mod tests {
             assert_eq!(s.function, 0xCF35);
             assert_eq!((s.stat(stat::STAT), s.stat(stat::VALUE), s.stat(stat::TARGET)), (108, amount, 2));
             assert_eq!((s.stat(3), s.stat(4), s.stat(0x23)), (1, 0, 9));
+        }
+    }
+
+    #[test]
+    fn installed_cf34_string_precedes_integer_arguments() {
+        // RDB 1000020:43551, event 0, record offsets 598..692. The 38-byte
+        // string at 634 includes NUL; the next CF41 spell starts at 692.
+        // GD 1000fb0a adds (1,0) before integer stats 66/67/68/69/78.
+        assert_eq!(format_of(0xCF34), &[(1, 0), (0, 66), (0, 67), (0, 68), (0, 69), (0, 78)]);
+        let prefix: [i32; 9] = [53044, 0, 4, 0, 1, 0, 3, 9, 38];
+        let text = b"You have 30 seconds to swap implants.\0";
+        let mut record: Vec<u8> = prefix.iter().flat_map(|word| word.to_le_bytes()).collect();
+        record.extend_from_slice(text);
+        record.extend_from_slice(&[0; 20]);
+        assert_eq!(record.len(), 94);
+        let mut r = Reader::little_endian(&record);
+        let s = read_spell(&mut r).unwrap();
+        assert_eq!(r.remaining(), 0);
+        assert_eq!(s.strings.get(&0).unwrap(), "You have 30 seconds to swap implants.");
+        assert_eq!((s.stat(3), s.stat(4), s.stat(0x20), s.stat(0x23)), (1, 0, 3, 9));
+        for stat in [66, 67, 68, 69, 78] {
+            assert_eq!(s.stats.get(&stat), Some(&0));
+        }
+        let mut wire: Vec<u8> = prefix.iter().flat_map(|word| word.to_be_bytes()).collect();
+        wire.extend_from_slice(text);
+        wire.extend_from_slice(&[0; 20]);
+        let mut r = Reader::new(&wire);
+        assert_eq!(read_spell(&mut r).unwrap(), s);
+        assert_eq!(r.remaining(), 0);
+        let mut encoded = Writer::default();
+        write_spell(&mut encoded, &s).unwrap();
+        assert_eq!(encoded.0, wire);
+        for cut in 0..record.len() {
+            assert!(read_spell(&mut Reader::little_endian(&record[..cut])).is_err(), "record cut {cut}");
+            assert!(read_spell(&mut Reader::new(&wire[..cut])).is_err(), "wire cut {cut}");
+        }
+        for length in [-1i32, i32::MAX] {
+            let mut bad = wire.clone();
+            bad[32..36].copy_from_slice(&length.to_be_bytes());
+            assert!(read_spell(&mut Reader::new(&bad)).is_err());
         }
     }
 

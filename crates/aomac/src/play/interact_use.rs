@@ -464,13 +464,13 @@ mod tests {
         }
         let mut gui = Gui::new(&client, None).unwrap();
         gui.set_screen_size(1280, 800);
-        let zone = Zone::new(0x6584);
+        let mut zone = Zone::new(0x6584);
         let mut i = Interact::new(0x6584, (1280, 800));
         i.set_client_dir(client);
         let corpse = Identity { kind: 0xC76A, instance: 5 };
-        i.on_frame(&mut gui, &loot_frame(0x6584, &[(0, 21_797), (4, 21_797)], false), &zone);
+        i.on_frame(&mut gui, &loot_frame(0x6584, &[(0, 21_797), (4, 21_797)], false), &mut zone);
         assert!(i.loot_dump(&mut gui).is_empty(), "no window without the open flag");
-        i.on_frame(&mut gui, &loot_frame(0x6584, &[(0, 21_797), (4, 21_797)], true), &zone);
+        i.on_frame(&mut gui, &loot_frame(0x6584, &[(0, 21_797), (4, 21_797)], true), &mut zone);
         let dump = i.loot_dump(&mut gui);
         assert_eq!(dump.len(), 1);
         assert_eq!((dump[0].0, dump[0].1.len()), (corpse, 2));
@@ -497,7 +497,7 @@ mod tests {
         }
         let mut gui = Gui::new(&client, None).unwrap();
         gui.set_screen_size(1280, 800);
-        let zone = Zone::new(0x830e);
+        let mut zone = Zone::new(0x830e);
         let mut i = Interact::new(0x830e, (1280, 800));
         i.set_client_dir(client);
         let mut rows = vec![];
@@ -506,7 +506,7 @@ mod tests {
             let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
             if dir == "<" {
                 let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
-                i.on_frame(&mut gui, &ao_net::frame::Frame::decode_with(&b, false).unwrap().unwrap().0, &zone);
+                i.on_frame(&mut gui, &ao_net::frame::Frame::decode_with(&b, false).unwrap().unwrap().0, &mut zone);
                 rows.push(i.loot_dump(&mut gui).iter().map(|(_, r)| r.len()).sum::<usize>());
             }
         }

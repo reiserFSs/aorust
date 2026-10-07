@@ -181,6 +181,44 @@ values without synthesizing StatIIR XP feedback; chat retains its existing
 NewLevel formatting. The same compact-packet regression covers both own and
 NPC level/range updates and HealthDamage-before-death ordering.
 
+`OwnNewLevel` describes the **own-character-only** retail actions, not a
+synthetic animation on every Level stat change. Fresh Gamecode decompilation
+of `0x10075a0c` and assembly `0x10075eac..0x10075efd` show social animation
+**6**, priority **1**, via `FUN_10010d83`, followed by level-complete sound.
+The receive constructor `0x10075884` resolves
+`SM_Sandy_Game_Level_Complete` into object member `+0x38`; this is **not a
+ninth wire word**. Reader `0x100758c8` and writer `0x10075928` have exactly
+eight i32 fields (`+0x18..+0x34`). `FUN_1001117d` calls
+`SandyInterfaceModule_t::PlayGameSound`; the NewLevel call uses zero position,
+volume 1, and priority 100. No direct effect-resource call occurs in this handler.
+
+The same own gate sets DValue `got_ip=true`, `got_perk=true` when level is
+divisible by ten and `Expansion` stat **0x185** has bit 2, and `got_tech=true`
+at level five when that stat has bit 0x20. The stat id is explicit at
+`0x10075bc6`; these booleans are carried in `OwnNewLevel`. Existing
+`Feedback_NewLevel` chat remains unchanged, with no second generated text notice.
+
+The stat setter `FUN_10059e6a` calls `FUN_100112e5` only when old != new;
+its Level branches recalculate `0x10052cfd` / `0x10052db2`, not celebration
+animation/effect/sound. `FUN_100112e5 -> 0x10004bf5 -> 0x10004660` forwards
+own stat signals (`GlobalSignals+0x28`, `SendStatSignal`); remote handling in
+`0x10004bf5` only emits pet stat notification. Neither `FUN_10010d83` nor
+the resource resolver `0x10010c57` sends an outgoing social message:
+`param3=1` is passed to CAT `SetAnimation` as priority. Therefore no remote
+level celebration is invented from a bare Level stat; nearby authored
+SocialAction / CharacterAction animation packets retain their existing path.
+
+`authoritative_level_wire_preserves_retail_own_gate` uses **codec-layout
+fixtures, not a live level-up capture**, covering own/nearby NewLevel stat
+updates, Stat-before-NewLevel, repeated Stat, unknown actors, missing own
+baseline, the resolved descriptors and Expansion gates. Repeated NewLevel
+retains retail's unconditional own gate: suppressing it based on current
+Level would incorrectly drop NewLevel after StatIIR already applied that
+level. StatIIR does not synthesize a second celebration. The compact N3
+header and eight NewLevel words come from `chat::log::from_n3`; StatIIR uses
+`StatUpdate::read`'s count and `(stat,value)` pairs. No `.rec` capture
+contains NewLevel (`7f405a16`) or ShadowLevel (`3c1e2803`), per capture search.
+
 ## 6. Floating numbers
 Created by the formatter tail for every message with a non-zero value; the number is `sprintf("%d", value)` (signed, no sign character added, e.g. XP loss `-5`), the colour is the line's category.
 

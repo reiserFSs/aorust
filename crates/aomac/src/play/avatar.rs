@@ -276,9 +276,50 @@ impl Fader {
     }
 }
 
+struct ActionClip {
+    clip: Arc<CatAnim>,
+    ms: f32,
+    layer: u8,
+    priority: i32,
+    fade_ms: f32,
+    layers: u32,
+    note_fired: u32,
+    rate: f32,
+    key: Option<u16>,
+    slot: i32,
+    #[cfg(test)]
+    role: Option<Role>,
+}
+
+impl ActionClip {
+    fn take_notes(&mut self) -> impl Iterator<Item = super::combat::notes::FiredNote> + '_ {
+        let slot = self.slot;
+        super::combat::notes::fire(&self.clip.events, self.ms.min(self.clip.duration), &mut self.note_fired)
+            .filter_map(move |id| attributed_note(id, slot))
+    }
+    fn finish_notes(&mut self) -> impl Iterator<Item = super::combat::notes::FiredNote> + '_ {
+        let slot = self.slot;
+        super::combat::notes::finish(&self.clip.events, &mut self.note_fired)
+            .filter_map(move |id| attributed_note(id, slot))
+    }
+    fn sample(&self) -> ao_formats::character::AnimLayer<'_> {
+        ao_formats::character::AnimLayer {
+            clip: &self.clip, ms: self.ms.min(self.clip.duration), layers: self.layers,
+            blend: ao_formats::character::animation_blend(self.ms, self.clip.duration, self.fade_ms),
+        }
+    }
+}
+
+fn attributed_note(note: u32, slot: i32) -> Option<super::combat::notes::FiredNote> {
+    use super::combat::notes::{id, FiredNote};
+    (slot >= 0 || (note != id::ATTACK && !(id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4).contains(&note)))
+        .then_some(FiredNote { id: note, slot })
+}
+
 pub struct Avatar {
     id: u32,
     rig: ActorRig,
+    anim_set: &'static str,
     /// What `rig` was built from (full update plus [`Avatar::set_appearance`] deltas).
     look: PlayerLook,
     attachments: Vec<(u8, u32)>,
@@ -287,22 +328,21 @@ pub struct Avatar {
     calibration: Calibration,
     pose: AvatarPose,
     clip: Option<Arc<CatAnim>>,
+    actions: Vec<ActionClip>,
+    body_priority: i32,
+    body_layers: u32,
     /// rdb 1010003 id of `clip`.
     clip_id: u32,
     /// AbstractAnimID passed to calibration (GC 0x1006fb56), not the RDB clip id.
     calibration_id: u32,
     /// Playback rate of the current clip ([`anim_rate`]).
     rate: f32,
-    /// `ItemDelay` of the weapon of the swing clip that plays ([`Avatar::set_swing_delay`]).
-    swing_delay: Option<i32>,
-    /// The clip that plays is a weapon swing: its animation notes fire ([`Avatar::take_notes`]).
-    swinging: bool,
     /// Playback rate factor of a hit-reaction clip ([`Avatar::set_clip_scale`]).
     clip_scale: Option<f32>,
     cast_loop: bool,
     /// Bit `i` = event `i` of the clip has fired its note (cleared when a clip starts).
     note_fired: u32,
-    notes: Vec<u32>,
+    notes: Vec<super::combat::notes::FiredNote>,
     /// `AnimSet` of the wielded weapon ([`Avatar::set_stance`]).
     stance: Option<i32>,
     /// Milliseconds into the current clip.
@@ -318,7 +358,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, look: l.look, attachments: l.attachments, assets, scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, clip_id: 0, calibration_id: 0, rate: 1.0, swing_delay: None, swinging: false, clip_scale: None, cast_loop: false, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, look: l.look, attachments: l.attachments, assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, note_fired: 0, notes: Vec::new(), stance: None, ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -353,11 +393,63 @@ impl Avatar {
         Ok(true)
     }
 
-    /// A different one-shot list can resolve to the same role; restart its clock and notes explicitly.
-    pub fn restart_clip(&mut self) {
-        self.ms = 0.0;
-        self.note_fired = 0;
+    /// Abstract-id action playback; explicit `Layer_e` overrides the table's layer.
+    pub fn play_action(&mut self, store: &RecordStore, id: u16, layer: Option<u8>, priority: i32) -> Result<bool> {
+        use super::combat::anim::{resolve_clip, Layer};
+        let Some((clip_id, _, default_layer)) = resolve_clip(&self.assets.names, self.anim_set, id, false) else { return Ok(false) };
+        let clip = self.assets.anim(store, clip_id)?;
+        let layer = layer.unwrap_or(match default_layer { Layer::Body => 0, Layer::Upper => 1 });
+        self.start_action(clip, layer, priority, 1.0, (None, -1, None));
+        Ok(true)
     }
+
+    pub fn play_swing(&mut self, store: &RecordStore, role: Role, delay: Option<i32>, key: u16, slot: i32) -> Result<()> {
+        if self.actions.iter().any(|a| a.key == Some(key)) {
+            return Ok(());
+        }
+        let name = role.clip_name();
+        let Some((id, _, _)) = super::combat::anim::ANIMS.iter().find(|(_, clip_name, _)| *clip_name == name) else { return Ok(()) };
+        let Some((clip_id, _, _)) = super::combat::anim::resolve_clip(&self.assets.names, self.anim_set, *id, false) else { return Ok(()) };
+        let clip = self.assets.anim(store, clip_id)?;
+        let rate = delay.map_or(1.0, |delay| super::combat::anim::swing_speed_scale(clip.events.first().map_or(0.0, |e| e.0 as f32), delay));
+        self.start_action(clip, 0, -1, rate, (Some(key), slot, Some(role)));
+        Ok(())
+    }
+
+    fn start_action(&mut self, clip: Arc<CatAnim>, layer: u8, priority: i32, rate: f32, playback: (Option<u16>, i32, Option<Role>)) {
+        let (key, slot, role) = playback;
+        #[cfg(not(test))]
+        let _ = role;
+        let previous = self.actions.iter().rev().find(|a| a.priority == priority);
+        let fade_ms = previous.map_or(200.0, |a| ao_formats::character::animation_fade_ms(a.clip.duration, a.ms));
+        let at = self.actions.partition_point(|a| a.priority >= priority);
+        self.actions.insert(at, ActionClip { clip, ms: 0.0, layer, priority, fade_ms, layers: 3, note_fired: 0, rate, key, slot, #[cfg(test)] role });
+        // DS 100702d4 refreshes masks on clip load, not on node expiration.
+        self.refresh_masks();
+    }
+    pub fn set_body_priority(&mut self, priority: i32) {
+        if priority != self.body_priority {
+            self.body_priority = priority;
+            self.body_layers = 3;
+            self.refresh_masks();
+        }
+    }
+
+    fn refresh_masks(&mut self) {
+        use ao_formats::character::animation_layer_mask;
+        let mut state = (i32::MAX, 0, 0);
+        let at = self.actions.partition_point(|a| a.priority >= self.body_priority);
+        let (before, after) = self.actions.split_at_mut(at);
+        for action in before {
+            action.layers = animation_layer_mask(&mut state, action.priority, u32::from(action.layer), action.layers);
+        }
+        self.body_layers = animation_layer_mask(&mut state, self.body_priority, 0, self.body_layers);
+        for action in after {
+            action.layers = animation_layer_mask(&mut state, action.priority, u32::from(action.layer), action.layers);
+        }
+    }
+
+
 
     /// Switches the clip when the role changes; a change between locomotion clips keeps the gait phase, any other restarts.
     pub fn set_pose(&mut self, store: &RecordStore, pose: AvatarPose) -> Result<()> {
@@ -388,15 +480,10 @@ impl Avatar {
             self.clip_id = id;
             self.calibration_id = calibration_id;
             self.note_fired = 0;
+            self.body_layers = 3;
+            self.refresh_masks();
         }
         self.rate = anim_rate(self.calibration.get(self.rig.model_id, self.calibration_id), self.scale * 100.0, pose.speed, pose.ref_speed, false);
-        // `FUN_1006a239`: a weapon swing is sped up so its first note lands within the weapon's ItemDelay
-        if let (Some(d), Some(a)) = (self.swing_delay, &self.clip) {
-            self.rate *= super::combat::anim::swing_speed_scale(a.events.first().map_or(0.0, |e| e.0 as f32), d);
-            if self.ms == 0.0 && std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
-                eprintln!("combat: swing clip role={:?} abstract_id={} source_id={} duration_ms={} rate={} events={:?}", pose.role, self.calibration_id, a.source_id, a.duration, self.rate, a.events);
-            }
-        }
         if let Some(k) = self.clip_scale {
             self.rate *= k;
         }
@@ -423,19 +510,15 @@ impl Avatar {
         self.clip_scale = scale;
     }
 
-    /// `ItemDelay` (centiseconds) of the weapon whose swing clip is playing (`None`: no swing speed scale); set before [`Avatar::set_pose`].
-    pub fn set_swing_delay(&mut self, delay: Option<i32>) {
-        self.swing_delay = delay;
-    }
-
-    /// Whether the one-shot clip that plays is a weapon swing (set every frame before [`Avatar::set_pose`]).
-    pub fn set_swinging(&mut self, swinging: bool) {
-        self.swinging = swinging;
-    }
 
     /// The notes (`combat::notes`) the swing clip reached since the last call.
-    pub fn take_notes(&mut self) -> Vec<u32> {
+    pub fn take_notes(&mut self) -> Vec<super::combat::notes::FiredNote> {
         std::mem::take(&mut self.notes)
+    }
+
+    #[cfg(test)]
+    pub fn swing_role(&self) -> Option<&Role> {
+        self.actions.iter().rev().find_map(|a| a.role.as_ref())
     }
 
     /// The weapon stance (`AnimSet` of the weapon in the first hand slot, `None` = nothing wielded): idle / walk / run play the weapon's lists
@@ -460,9 +543,14 @@ impl Avatar {
     /// Advances the clip by `dt` seconds at the pose's speed.
     pub fn update(&mut self, dt: f32) {
         self.ms += dt * 1000.0 * self.rate;
-        if let (true, Some(a), Role::Clip(_)) = (self.swinging, &self.clip, &self.pose.role) {
-            self.notes.extend(super::combat::notes::fire(&a.events, self.ms.min(a.duration), &mut self.note_fired));
+        for action in &mut self.actions {
+            action.ms += dt * 1000.0 * action.rate;
+            self.notes.extend(action.take_notes());
+            if action.ms > action.clip.duration {
+                self.notes.extend(action.finish_notes());
+            }
         }
+        self.actions.retain(|a| a.ms <= a.clip.duration);
         // keep the counter bounded; looping clips wrap by themselves, one-shots stop at the end
         if let Some(a) = &self.clip {
             if !self.one_shot() && a.duration > 0.0 && self.ms > 4.0 * a.duration {
@@ -471,22 +559,27 @@ impl Avatar {
         }
     }
 
+    fn layers(&self) -> impl Clone + Iterator<Item = ao_formats::character::AnimLayer<'_>> {
+        use ao_formats::character::AnimLayer;
+        let body = self.clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.ms, self.one_shot()), layers: self.body_layers, blend: 1.0 });
+        let at = self.actions.partition_point(|a| a.priority >= self.body_priority);
+        let (before, after) = self.actions.split_at(at);
+        before.iter().map(ActionClip::sample).chain(body).chain(after.iter().map(ActionClip::sample))
+    }
+
     /// The actor to draw this frame (CPU-skinned pose, never frustum culled).
     pub fn frame(&self) -> ActorFrame {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
-        let (skin, parts) = self.rig.pose(clip);
+        let (skin, parts) = self.rig.pose_composed(self.layers());
         ActorFrame { id: self.id, model: MODEL_KEY, transform: self.transform.to_cols_array_2d(), parts, skin: Some(skin), always: true, alpha: 1.0, ..Default::default() }
     }
 
     /// Current effect anchor in world scene space, including heading and body scale.
     pub fn effect_anchor(&self, id: i32) -> Option<[[f32; 4]; 4]> {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
-        self.rig.effect_anchor(id, clip).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
+        self.rig.effect_anchor_composed(id, self.layers()).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
     }
 
     pub fn weapon_effect_anchor(&self, place: u8) -> Option<[[f32; 4]; 4]> {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
-        self.rig.weapon_effect_anchor(place, clip).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
+        self.rig.weapon_effect_anchor_composed(place, self.layers()).map(|m| (self.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d())
     }
 
     /// `n3Dynel_t::GetBodyCollSphereRadi` (N3 0x10004dd3): the model's torso sphere radius (`VisualCATMesh_t::GetTorsoSphereRadi`), 0.5 when
@@ -505,16 +598,14 @@ impl Avatar {
     /// Height of the head attractor over the feet in the current pose, times the body scale: the camera look target
     /// (`FUN_10020af1` N3, docs/zone/camera.md §3). `None` for models without a head attractor.
     pub fn head_height(&self) -> Option<f32> {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
-        self.rig.head_attractor(clip).map(|p| p[1] * self.scale)
+        self.rig.head_attractor_composed(self.layers()).map(|p| p[1] * self.scale)
     }
 
     /// Scene position of the head attractor (`Attractor01_head`) in the current pose, the point `RefreshAlpha` measures the camera distance
     /// from (attractor translation x body scale, through the CAT frame's world matrix); the feet for a model without one (the identity
     /// attractor matrix `RefreshAlpha` starts from).
     pub fn head_position(&self) -> Vec3 {
-        let clip = self.clip.as_ref().map(|a| (&**a, clip_time(a, self.ms, self.one_shot())));
-        self.transform.transform_point3(self.rig.head_attractor(clip).map_or(Vec3::ZERO, Vec3::from))
+        self.transform.transform_point3(self.rig.head_attractor_composed(self.layers()).map_or(Vec3::ZERO, Vec3::from))
     }
 }
 
@@ -525,6 +616,100 @@ mod tests {
         frame::Frame,
         n3::{self, dynel::Dynel, N3},
     };
+
+    #[test]
+    fn own_action_notes_do_not_replay_retained_weapon_effects() {
+        use super::super::combat::notes::id;
+        let clip = CatAnim { source_id: 0, root: String::new(), events: vec![
+            (0, "attack".into()), (0, "attack_effect_1".into()),
+            (0, "attack_effect_4".into()), (0, "swish_punch".into()),
+        ], version: 0, duration: 1000.0, signature: 0, param: 0.0, tracks: vec![] };
+        let mut action = ActionClip { clip: Arc::new(clip), ms: 100.0, layer: 1, priority: -1, fade_ms: 200.0, layers: 3, note_fired: 0, rate: 1.0, key: None, slot: -1, role: None };
+        assert_eq!(action.take_notes().map(|note| note.id).collect::<Vec<_>>(), vec![id::SWISH_PUNCH]);
+        assert_eq!(action.take_notes().count(), 0, "authored notes still fire only once");
+    }
+
+    #[test]
+    fn own_swing_history_preserves_slots_through_replacement_and_death() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let clip = |time| Arc::new(CatAnim { source_id: 0, root: String::new(),
+            events: vec![(time, "attack".into())], version: 0, duration: 1000.0,
+            signature: 0, param: 0.0, tracks: vec![] });
+        avatar.start_action(clip(300), 0, -1, 1.0, (Some(0x1a), 7, None));
+        avatar.update(0.05);
+        avatar.start_action(clip(100), 0, -1, 1.0, (Some(0xb), 0, None));
+        avatar.play_swing(&store, Role::Clip("unarmed-rswing".into()), None, 0x1a, 7).unwrap();
+        assert_eq!(avatar.actions.len(), 2, "any active node suppresses its list key");
+        avatar.update(0.1);
+        assert_eq!(avatar.take_notes(), vec![super::super::combat::notes::FiredNote { id: 0xb, slot: 0 }]);
+        avatar.set_body_priority(-3);
+        avatar.set_pose(&store, AvatarPose::still(Role::Clip("die-knees".into()))).unwrap();
+        avatar.update(0.15);
+        assert_eq!(avatar.take_notes(), vec![super::super::combat::notes::FiredNote { id: 0xb, slot: 7 }], "older special survives replacement and death");
+        assert_eq!(avatar.actions.len(), 2);
+        avatar.start_action(clip(2000), 0, -1, 1.0, (Some(0x19), 8, None));
+        avatar.update(1.1);
+        assert_eq!(avatar.take_notes(), vec![super::super::combat::notes::FiredNote { id: 0xb, slot: 8 }], "removal flushes pending attack markers");
+        assert!(avatar.actions.is_empty());
+    }
+
+    #[test]
+    fn own_social_actions_use_retail_clip_candidates() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        for (id, name) in [(6, "backflip"), (0x12, "eat"), (0x29, "puke")] {
+            let expected = super::super::combat::anim::resolve_clip(&avatar.assets.names, avatar.anim_set, id, false).expect("retail social clip");
+            assert_eq!(expected.1, id, "{name} should not need a fallback");
+            assert!(avatar.play_action(&store, id, Some(0), -2).unwrap(), "{name}");
+            assert_eq!(avatar.actions.last().unwrap().clip.source_id, expected.0);
+        }
+    }
+
+    #[test]
+    fn own_upper_action_preserves_locomotion_and_composes_effect_anchors() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update()).unwrap();
+        let walk = AvatarPose { role: Role::Walk, speed: 1.5, ref_speed: 1.5 };
+        avatar.set_pose(&store, walk.clone()).unwrap();
+        avatar.update(0.2);
+        let body_id = avatar.clip_id;
+        let body_ms = avatar.ms;
+        assert!(avatar.play_action(&store, 107, None, -2).unwrap());
+        assert_eq!((avatar.clip_id, avatar.ms), (body_id, body_ms));
+        avatar.set_pose(&store, walk).unwrap();
+        avatar.update(0.1);
+        assert!(avatar.ms > body_ms, "locomotion clock continues under the action");
+        let layers: Vec<_> = avatar.layers().collect();
+        assert_eq!(layers.len(), 2);
+        assert_eq!((layers[0].layers, layers[1].layers), (3, 3));
+        assert_eq!(layers[0].clip.source_id, avatar.clip.as_ref().unwrap().source_id);
+        assert_eq!(layers[1].blend, 0.5, "retail first action fades in over 200 ms");
+        let local = avatar.rig.effect_anchor_composed(2000, avatar.layers()).expect("retail hand attractor");
+        let expected = (avatar.transform * Mat4::from_cols_array_2d(&local)).to_cols_array_2d();
+        assert_eq!(avatar.effect_anchor(2000), Some(expected), "effect samples the rendered composition");
+        assert!(avatar.play_action(&store, 107, Some(0), -1).unwrap());
+        assert_eq!(avatar.actions[0].layer, 0, "explicit override beats table upper layer");
+        assert_eq!(avatar.actions[0].priority, -1);
+        assert_eq!(avatar.actions[1].priority, -2);
+        assert_eq!(avatar.actions.len(), 2, "positive-count history survives for fade-out");
+        let expected_fade = ao_formats::character::animation_fade_ms(avatar.actions[0].clip.duration, avatar.actions[0].ms);
+        assert!(avatar.play_action(&store, 107, Some(0), -1).unwrap());
+        assert_eq!(avatar.actions.len(), 3, "same-priority positive-count predecessor remains");
+        assert_eq!(avatar.actions[1].fade_ms, expected_fade);
+        avatar.update(30.0);
+        assert!(avatar.actions.is_empty(), "actions expire at their authored durations");
+        assert!(avatar.play_action(&store, 107, None, -1).unwrap());
+        assert!(avatar.play_action(&store, 107, Some(0), -2).unwrap());
+        assert_eq!(avatar.actions[1].layers, 2, "higher upper node excludes the lower node");
+        avatar.actions[0].ms = avatar.actions[0].clip.duration + 1.0;
+        avatar.update(0.0);
+        assert_eq!(avatar.actions.len(), 1);
+        assert_eq!(avatar.actions[0].layers, 2, "expiry does not reset the stored exclusion mask");
+    }
 
     fn own_update() -> SimpleCharFullUpdate {
         let rec = include_str!("../../../../docs/captures/zone_newchar_ithaca.rec");

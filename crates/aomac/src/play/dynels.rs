@@ -9,7 +9,7 @@
 use anyhow::Context;
 use ao_formats::character::actor::{attractor_list, npc_part_layers, npc_part_textures, ActorAssets, ActorRig, PlayerLook};
 use ao_formats::dynel_visual::{blob_stats, corpse_visual, default_mesh, effective_stats, item_template, placed_dynels, static_instance, visual, PlacedDynel};
-use ao_formats::character::{load_cat_mesh, CatAnim, ClothPart, CrtRand, Equipment, NpcRecord, TextureOverride, CHAR_MESH_TYPE};
+use ao_formats::character::{load_cat_mesh, AnimLayer, CatAnim, ClothPart, CrtRand, Equipment, NpcRecord, TextureOverride, CHAR_MESH_TYPE};
 use ao_gui::Gui;
 use ao_net::n3::dynel::{Dynel, SimpleCharFullUpdate};
 use ao_net::n3::misc::Misc;
@@ -31,8 +31,13 @@ use super::dynels_doors::{Cmd, GameSound, ItemRig, PropAnim};
 use super::tags::{Indicator, Listing, Tag, TagLayer};
 use super::zone::{scene_pos, scene_yaw};
 
+#[path = "dynels_actions.rs"]
+mod actions;
+#[path = "dynels_buffs.rs"]
+mod buffs;
+
 /// Identity kind of character / NPC dynels (`SimpleChar_t`).
-const CHAR_KIND: i32 = 0xC350;
+pub(super) const CHAR_KIND: i32 = 0xC350;
 /// Props (non-character dynels) farther than this (metres) are not drawn (about the fog distance of the outdoor playfields; a guess:
 /// the client draws them up to the far plane). Characters use `Dynels::char_view_distance`.
 pub const DRAW_DISTANCE: f32 = 250.0;
@@ -502,9 +507,7 @@ fn npc_rig(store: &RecordStore, assets: &ActorAssets, look: &CharLook, rec: &Npc
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Special {
     None,
-    /// The attack clip plays once.
-    Attack,
-    /// Clip `AbstractAnimID` plays once (emotes, swings).
+    /// Clip `AbstractAnimID` plays once (emotes and nano-release state).
     Once(u32),
     /// CharCastNano's stat 0x178 clip loops until release.
     Cast(u32),
@@ -553,6 +556,8 @@ pub struct Char {
     pose: ao_net::n3::motion::Pose,
     anim: u32,
     special: Special,
+    actions: Vec<ActionAnim>,
+    base_layers: u32,
     clip_ms: f32,
     clip_rate: f32,
     terminal_pose: bool,
@@ -563,10 +568,83 @@ pub struct Char {
     /// Model-space box of the last pose's skinned body vertices (`RCATMesh_t+0x1fc/+0x208`, hud_pick.rs); `None` until posed.
     bounds: Option<([f32; 3], [f32; 3])>,
     roll: Roll,
-    /// Seconds left of a swing mark ([`Dynels::swing_mark`]): while the character's one-shot clip is a weapon swing its animation notes fire.
-    swing_ttl: f32,
     /// Bit `i` = event `i` of the playing clip has fired its note (`piVar7[0xd]` of the holder's clip entry, `FUN_1003c036`).
     note_fired: u32,
+}
+
+/// Authored action playback is independent of locomotion and its markers.
+struct ActionAnim {
+    id: u32,
+    layer: canim::Layer,
+    priority: i32,
+    layers: u32,
+    fade_ms: f32,
+    ms: f32,
+    variant: Option<usize>,
+    note_fired: u32,
+    rate: f32,
+    key: Option<u16>,
+    slot: i32,
+    delay: Option<i32>,
+}
+
+impl ActionAnim {
+    fn advance(&mut self, clip: &CatAnim, dt: f32, mut emit: impl FnMut(super::combat::notes::FiredNote)) -> bool {
+        use super::combat::notes::{fire, finish, id, FiredNote};
+        let slot = self.slot;
+        let mut emit_note = |note| {
+            if slot >= 0 || !matches!(note, id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) {
+                emit(FiredNote { id: note, slot });
+            }
+        };
+        if self.ms >= clip.duration {
+            for id in finish(&clip.events, &mut self.note_fired) { emit_note(id); }
+            return false;
+        }
+        if self.ms == 0.0 {
+            if let Some(delay) = self.delay {
+                self.rate = canim::swing_speed_scale(clip.events.first().map_or(0.0, |e| e.0 as f32), delay);
+            }
+        }
+        self.ms += (dt * 1000.0 * self.rate).abs();
+        for id in fire(&clip.events, self.ms.min(clip.duration), &mut self.note_fired) { emit_note(id); }
+        true
+    }
+}
+
+impl Char {
+    fn base_priority(&self) -> i32 {
+        if matches!(self.special, Special::Die(_)) { -3 } else { 0 }
+    }
+
+    fn layers<'a>(&'a self, built: &'a Built) -> impl Clone + Iterator<Item = AnimLayer<'a>> {
+        let priority = self.base_priority();
+        let base = built.clips.get(&self.anim)
+            .and_then(|clips| clips.get(self.roll.variant % clips.len().max(1)))
+            .map(|clip| AnimLayer { clip, ms: super::avatar::clip_time(clip, self.clip_ms, !matches!(self.special, Special::None | Special::Cast(_))), layers: self.base_layers, blend: 1.0 });
+        let action_layer = |action: &'a ActionAnim| {
+            let clips = built.clips.get(&action.id)?;
+            let clip = clips.get(action.variant? % clips.len().max(1))?;
+            Some(AnimLayer { clip, ms: action.ms.min(clip.duration), layers: action.layers, blend: ao_formats::character::animation_blend(action.ms, clip.duration, action.fade_ms) })
+        };
+        let before = self.actions.iter().filter(move |action| action.priority > priority).filter_map(action_layer);
+        let after = self.actions.iter().filter(move |action| action.priority <= priority).filter_map(action_layer);
+        before.chain(base).chain(after)
+    }
+
+    fn refresh_layers(&mut self) {
+        let priority = self.base_priority();
+        let mut state = (i32::MAX, 0, 0);
+        let split = self.actions.partition_point(|action| action.priority > priority);
+        let (before, after) = self.actions.split_at_mut(split);
+        for action in before {
+            action.layers = ao_formats::character::animation_layer_mask(&mut state, action.priority, u32::from(action.layer == canim::Layer::Upper), action.layers);
+        }
+        self.base_layers = ao_formats::character::animation_layer_mask(&mut state, priority, 0, self.base_layers);
+        for action in after {
+            action.layers = ao_formats::character::animation_layer_mask(&mut state, action.priority, u32::from(action.layer == canim::Layer::Upper), action.layers);
+        }
+    }
 }
 
 /// GC 0x1006fb56 sets speed at Play; DS 0x10072fde advances absolute milliseconds.
@@ -607,8 +685,6 @@ const CORPSE_CAN: i32 = 8;
 /// A sound multimap: key -> Sandy sound ids.
 type SoundTable = Vec<(u32, Vec<u32>)>;
 
-/// Seconds a [`Dynels::swing_mark`] lasts.
-const SWING_MARK_S: f32 = 3.0;
 
 /// First `ActorFrame::id` of props (character instances stay far below).
 const PROP_ID_BASE: u32 = 0x4000_0000;
@@ -634,7 +710,6 @@ pub struct Dynels {
     pub arms: super::combat::arms::Armory,
     /// (swing clip, `ItemDelay`) of the last [`Dynels::pick_swing`] of a character: the clip plays sped up by [`canim::swing_speed_scale`].
     swing_delay: HashMap<i32, (u32, i32)>,
-    swing_keys: HashMap<i32, u16>,
     /// (clip, playback rate) of the last [`Dynels::react_to_hit`] of a character.
     once_rate: HashMap<i32, (u32, f32)>,
     /// Weapon dynel instance -> (holder, hand index).
@@ -666,17 +741,21 @@ pub struct Dynels {
     sounds: Vec<GameSound>,
     /// Sounds that wait for their delay (`PlayGameSound`'s delay argument, the material impact sounds): (seconds left, sound).
     later: Vec<(f32, GameSound)>,
-    /// Animation notes fired by the swing clips of the other characters since the last [`Dynels::take_notes`]: (character, note id).
-    notes: Vec<(i32, u32)>,
+    /// Authored holder notes retain the playback node's slot, not the most recent swing's slot.
+    notes: Vec<(i32, super::combat::notes::FiredNote)>,
     /// Persistent slot +0x30 damage / +0x2c hit kind (`FUN_1006a8f3`); specials never write these.
     slot_hits: HashMap<(i32, i32), (i32, i32)>,
     effects: Option<super::combat::effects::Renderer>,
+    pending_effects: Vec<ao_net::n3::effects::Effects>,
     /// Visual spell applications wait until the own animated connectors are available.
     nano_visuals: Vec<ao_net::n3::spells::ApplySpells>,
-    nano_handles: Vec<(i32, ao_net::n3::spells::Spell, u32)>,
+    nano_handles: Vec<(ao_net::msg::Identity, ao_net::n3::spells::Spell, u32)>,
+    buff_nanos: HashMap<i32, super::own_nanos::OwnNanos>,
+    buff_visuals: HashMap<(i32, i32), buffs::BuffVisual>,
     nano_casts: Vec<(i32, ao_net::n3::dynel::CastNanoSpell)>,
     casting: Vec<NanoCast>,
     nano_animations: Vec<Option<(u32, bool)>>,
+    nano_sounds: Vec<(u32, [f32; 3], f32, f32, u32, i32)>,
     nano_store: Option<RecordStore>,
     nano_templates: HashMap<i32, Arc<ao_formats::dynel_visual::ItemTemplate>>,
     pub nano_effect_categories: u32,
@@ -701,6 +780,8 @@ struct NanoCast {
     release_seen: bool,
     done: bool,
     instant: bool,
+    finish_enabled: bool,
+    start_effect: i32,
 }
 
 /// GC 10050ed9 (asm 10050f85–10051064), in seconds.
@@ -745,7 +826,6 @@ impl Default for Dynels {
             wielded: vec![],
             arms: Default::default(),
             swing_delay: HashMap::new(),
-            swing_keys: HashMap::new(),
             once_rate: HashMap::new(),
             weapons: HashMap::new(),
             pending_weapons: vec![],
@@ -768,11 +848,15 @@ impl Default for Dynels {
             notes: vec![],
             slot_hits: HashMap::new(),
             effects: None,
+            pending_effects: vec![],
             nano_visuals: vec![],
             nano_handles: vec![],
+            buff_nanos: HashMap::new(),
+            buff_visuals: HashMap::new(),
             nano_casts: vec![],
             casting: vec![],
             nano_animations: vec![],
+            nano_sounds: vec![],
             nano_store: None,
             nano_templates: HashMap::new(),
             nano_effect_categories: 36,
@@ -871,12 +955,15 @@ impl Dynels {
         self.swings.clear();
         self.impact_locations.clear();
         self.nano_visuals.clear();
+        self.pending_effects.clear();
         self.nano_handles.clear();
+        self.buff_nanos.clear();
+        self.buff_visuals.clear();
         self.nano_casts.clear();
         self.casting.clear();
         self.nano_animations.clear();
+        self.nano_sounds.clear();
         if let Some(effects) = &mut self.effects { effects.clear(); }
-        self.swing_keys.clear();
         self.props.clear();
         self.weapons.clear();
         self.wield.clear();
@@ -932,19 +1019,11 @@ impl Dynels {
         self.want_placed = Some(id);
     }
 
-    /// The attack clip of `id` plays once (combat messages).
-    pub fn attack(&mut self, id: i32) {
-        if let Some(c) = self.chars.get_mut(&id).filter(|c| c.special == Special::None) {
-            c.special = Special::Attack;
-            c.clip_ms = 0.0;
-        }
-    }
 
     /// Plays clip `anim_id` (client AbstractAnimID, social ids 1..=0x46 are emotes) once on `id` if it is not busy. The clip is resolved
     /// on the worker the first time (NPC record table, or the player set's file name via `combat::anim::resolve_clip`).
     pub fn play_once(&mut self, id: i32, anim_id: u32) {
         let Some(c) = self.chars.get_mut(&id).filter(|c| c.special == Special::None) else { return };
-        self.swing_keys.remove(&id);
         let Look::Char(look) = &c.look else { return };
         if let Some(Model::Ready { built, .. }) = self.models.get(&c.key) {
             if built.clips.contains_key(&anim_id) {
@@ -956,48 +1035,80 @@ impl Dynels {
         self.pending_clips.push((c.key, look.clone(), anim_id, id));
     }
 
-    /// A playing list key is suppressed; a different special list replaces the swing even if its clip is identical.
-    /// `None` selects the preloaded fallback attack; an explicit clip (even ATTACK_KEY) keeps its authored one-shot path.
-    pub fn play_swing(&mut self, id: i32, anim: Option<u32>, key: u16) {
-        let Some(c) = self.chars.get_mut(&id) else { return };
-        if matches!(c.special, Special::Die(_)) || (c.special != Special::None && self.swing_keys.get(&id) == Some(&key)) {
-            return;
-        }
-        c.special = Special::None;
-        c.note_fired = 0;
-        self.pending_clips.retain(|p| p.3 != id);
-        self.replay.retain(|p| p.0 != id);
-        if let Some(anim) = anim {
-            self.play_once(id, anim);
-        } else {
-            self.attack(id);
-        }
-        self.swing_keys.insert(id, key);
+    /// Original producer's layer wins over the generic name-table mapping.
+    pub fn play_action(&mut self, id: i32, anim_id: u32, layer: canim::Layer, priority: i32) {
+        self.start_node(id, ActionAnim { id: anim_id, layer, priority, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None });
     }
 
-    pub fn pick_item_swing(&mut self, id: i32, special: i32, key: u16) -> Option<(u16, i32)> {
-        let anim = self.arms.item_animation(id, special, key, self.rng.rand())?;
+    fn start_node(&mut self, id: i32, mut node: ActionAnim) {
+        let Some(c) = self.chars.get_mut(&id).filter(|c| !matches!(c.special, Special::Die(_))) else { return };
+        let Look::Char(look) = &c.look else { return };
+        if node.layer == canim::Layer::Body && matches!(c.special, Special::Once(_)) {
+            let outgoing = ActionAnim {
+                id: c.anim, layer: canim::Layer::Body, priority: -1, layers: c.base_layers, fade_ms: 200.0,
+                ms: c.clip_ms, variant: Some(c.roll.variant), note_fired: c.note_fired,
+                rate: c.clip_rate, key: None, slot: -1, delay: None,
+            };
+            let at = c.actions.partition_point(|action| action.priority >= -1);
+            c.actions.insert(at, outgoing);
+        }
+        let previous = c.actions.iter().rev().find(|action| action.priority == node.priority).and_then(|action| {
+            let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
+            let clips = built.clips.get(&action.id)?;
+            let clip = clips.get(action.variant? % clips.len().max(1))?;
+            Some((clip.duration, action.ms))
+        }).unwrap_or((0.0, 0.0));
+        node.fade_ms = ao_formats::character::animation_fade_ms(previous.0, previous.1);
+        let anim_id = node.id;
+        let at = c.actions.partition_point(|action| action.priority >= node.priority);
+        if node.layer == canim::Layer::Body && c.special != Special::None {
+            c.special = Special::None;
+            c.note_fired = 0;
+        }
+        c.actions.insert(at, node);
+        if anim_id != ATTACK_KEY && !matches!(self.models.get(&c.key), Some(Model::Ready { built, .. }) if built.clips.contains_key(&anim_id))
+            && !self.pending_clips.iter().any(|pending| pending.0 == c.key && pending.2 == anim_id && pending.3 == id)
+            && !self.replay.contains(&(id, anim_id)) {
+            self.pending_clips.push((c.key, look.clone(), anim_id, id));
+        }
+        c.refresh_layers();
+    }
+
+    /// Holder list keys remain busy while any matching positive-count node is alive.
+    /// `None` uses the preloaded NPC fallback attack without requesting an abstract id for its cache key.
+    pub fn play_swing(&mut self, id: i32, anim: Option<u32>, key: u16) {
+        let Some(c) = self.chars.get(&id) else { return };
+        if matches!(c.special, Special::Die(_)) || c.actions.iter().any(|action| action.key == Some(key)) { return }
+        let anim = anim.unwrap_or(ATTACK_KEY);
+        let slot = self.note_slot(id).unwrap_or(-1);
+        let delay = self.swing_delay.get(&id).filter(|entry| entry.0 == anim).map(|entry| entry.1);
+        self.start_node(id, ActionAnim { id: anim, layer: canim::Layer::Body, priority: -1, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: Some(key), slot, delay });
+    }
+
+    pub fn pick_item_swing(&mut self, id: i32, special: i32, key: u16) -> Option<(u16, i32, u16)> {
+        let (anim, resolved_key) = self.arms.item_animation(id, special, key, self.rng.rand())?;
         let delay = self.arms.swing_delay(id).unwrap_or(0);
         self.swing_delay.insert(id, (u32::from(anim), delay));
-        Some((anim, delay))
+        Some((anim, delay, resolved_key))
     }
 
     /// The weapon swing of `id` (`FUN_10069acb` [GC 0x10069acb] + `FUN_1003c594`): a random value of list `key` of the `AnimSet` lists of the
-    /// weapon in its right hand (else left) - list 0xb when the weapon has no such key - and the weapon's `ItemDelay` (centiseconds), which
-    /// a following [`Dynels::play_once`] of that clip uses for the swing speed scale. `None`: nothing wielded, or an `AnimSet` whose lists live
-    /// in the item record (4, 5, martial arts; record layout not decoded, docs/zone/combat-anim.md §3.1): the caller plays the unarmed swing.
+    /// weapon in its right hand (else left) - list 0xb when the weapon has no such key. Returns (clip, ItemDelay in centiseconds, resolved list key);
+    /// [`Dynels::play_swing`] uses the delay for speed scaling and the resolved key for duplicate suppression.
+    /// `None`: nothing wielded, or an `AnimSet` whose lists live in the item record; the caller tries [`Dynels::pick_item_swing`].
     /// [GUESS] the wielder is never crawling (stat 0x1ae == 0xe is not tracked), so the crawl lists are not used.
-    pub fn pick_swing(&mut self, id: i32, key: u16) -> Option<(u16, i32)> {
+    pub fn pick_swing(&mut self, id: i32, mut key: u16) -> Option<(u16, i32, u16)> {
         let hands = self.wield.get(&id)?;
         let hand = hands.iter().position(Option::is_some)?;
         let w = hands[hand]?;
         let mut list = canim::weapon_list(w.set, hand == 1, false, key);
         if list.is_empty() {
+            key = canim::list::ATTACK;
             list = canim::weapon_list(w.set, hand == 1, false, canim::list::ATTACK);
         }
         let anim = *list.get(self.rng.rand() as usize % list.len().max(1))?;
         self.swing_delay.insert(id, (anim as u32, w.delay));
-        Some((anim, w.delay))
+        Some((anim, w.delay, key))
     }
 
     /// `SimpleChar::GetImpactAnim` (vtable `+0x90` = `FUN_10058cfa` [GC 0x10058cfa]): a crawling character (stat 0x1ae == 0xe, not tracked here) plays
@@ -1072,14 +1183,32 @@ impl Dynels {
         }
     }
 
+    /// An item callback can explicitly use the world origin (depleted-item key 0x32).
+    pub fn sound_id_at_position(&mut self, sound: u32, pos: [f32; 3]) {
+        self.sounds.push(GameSound::at(sound, pos));
+    }
+
     /// Select an authored sound variant with the same CRT stream as other character sounds.
     pub fn sound_variants_at(&mut self, id: i32, sounds: &[u32]) {
-        let sound = match sounds.len() {
-            0 => return,
-            1 => sounds[0],
-            n => sounds[self.rng.rand() as usize % n],
-        };
-        self.sound_id_at(id, sound);
+        if let Some(pos) = self.char_pos(id) {
+            self.sound_variants_at_position(sounds, pos);
+        }
+    }
+
+    /// Item actions use the actor's explicit scene position, including the own actor without a dynel model.
+    pub fn sound_variants_at_position(&mut self, sounds: &[u32], pos: [f32; 3]) {
+        if let Some(sound) = self.pick_variant(sounds) {
+            self.sound_id_at_position(sound, pos);
+        }
+    }
+
+    /// Authored item animation and sound lists share the character CRT stream.
+    pub fn pick_variant(&mut self, values: &[u32]) -> Option<u32> {
+        match values.len() {
+            0 => None,
+            1 => Some(values[0]),
+            n => Some(values[self.rng.rand() as usize % n]),
+        }
     }
 
     /// Where a character's sounds play: the camera for the own character (the avatar is not a dynel model here), else its position.
@@ -1116,16 +1245,6 @@ impl Dynels {
         self.sounds.extend(due);
     }
 
-    /// Marks the next one-shot clip of `id` as a weapon swing: its animation notes (`attack`, `swish_*`, ...) start the attack sounds
-    /// ([`Dynels::take_notes`], `combat::notes`). The mark lasts [`SWING_MARK_S`] (the clip may still have to load).
-    pub fn swing_mark(&mut self, id: i32) {
-        if let Some(c) = self.chars.get_mut(&id) {
-            c.swing_ttl = SWING_MARK_S;
-            if c.special == Special::None {
-                c.note_fired = 0;
-            }
-        }
-    }
 
     /// `FUN_1006a8f3` [GC 0x1006a8f3] stores the damage and the hit kind of an `AttackInfo` in the attacker's slot object (and the victim is its target).
     pub fn hit_seen(&mut self, attacker: i32, ctx: super::combat::notes::HitCtx) {
@@ -1138,8 +1257,13 @@ impl Dynels {
         self.swings.insert(who, (victim, slot));
     }
 
-    pub fn note_ctx(&self, who: i32) -> Option<super::combat::notes::HitCtx> {
-        let &(victim, slot) = self.swings.get(&who)?;
+    pub fn note_slot(&self, who: i32) -> Option<i32> {
+        self.swings.get(&who).map(|swing| swing.1)
+    }
+
+    pub fn note_ctx(&self, who: i32, slot: i32) -> Option<super::combat::notes::HitCtx> {
+        if slot < 0 { return None }
+        let &(victim, _) = self.swings.get(&who)?;
         let (damage, flags) = self.slot_hits.get(&(who, slot)).copied().unwrap_or((0, 0));
         Some(super::combat::notes::HitCtx { victim, slot, damage, flags })
     }
@@ -1159,16 +1283,27 @@ impl Dynels {
         let c = self.chars.get(&who)?;
         let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
         let rig = built.rig.as_ref()?;
-        let clip = built.clips.get(&c.anim).and_then(|clips| clips.get(c.roll.variant % clips.len().max(1))).map(|a| (&**a, super::avatar::clip_time(a, c.clip_ms, !matches!(c.special, Special::None | Special::Cast(_)))));
-        let matrix = if anchor == 3000 { rig.weapon_effect_anchor(if slot == 8 { 2 } else { 1 }, clip) } else { rig.effect_anchor(anchor, clip) }?;
+        let layers = c.layers(built);
+        let matrix = if anchor == 3000 { rig.weapon_effect_anchor_composed(if slot == 8 { 2 } else { 1 }, layers) } else { rig.effect_anchor_composed(anchor, layers) }?;
         let local = glam::Mat4::from_cols_array_2d(&matrix);
         let world = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(c.scale), glam::Quat::from_rotation_y(scene_yaw(c.pose.yaw)), glam::Vec3::from(scene_pos(c.pose.pos)));
         Some(world * local)
     }
 
+    /// GC 10105917: attractor zero is the dynel frame; character-only bones
+    /// and static-mesh connector 3001 are not interchangeable with it.
+    fn item_effect_anchor(&self, identity: ao_net::msg::Identity, attractor: i32) -> Option<glam::Mat4> {
+        if attractor != 0 { return None; }
+        let prop = self.props.get(&(identity.kind, identity.instance))?;
+        let Model::Ready { .. } = self.models.get(&prop.key)? else { return None };
+        Some(glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(prop.scale), glam::Quat::from_rotation_y(scene_yaw(prop.yaw)), glam::Vec3::from(scene_pos(prop.pos))))
+    }
+
     pub(in crate::play) fn cancel_nano_visuals(&mut self, who: i32) {
-        self.nano_casts.retain(|(caster, _)| *caster != who);
-        self.nano_visuals.retain(|application| application.target.instance != who);
+        self.cancel_buff_visuals(who);
+        self.nano_sounds.retain(|sound| sound.5 != who);
+        self.nano_casts.retain(|(caster, cast)| *caster != who && !(cast.target.kind == CHAR_KIND && cast.target.instance == who));
+        self.nano_visuals.retain(|application| application.target.kind != CHAR_KIND || application.target.instance != who);
         if who == self.own { self.nano_animations.push(None); }
         if let Some(c) = self.chars.get_mut(&who).filter(|c| matches!(c.special, Special::Cast(_))) {
             c.special = Special::None;
@@ -1177,6 +1312,10 @@ impl Dynels {
         let mut renderer = self.effects.take();
         self.casting.retain(|cast| {
             if cast.who != who && cast.target != who { return true; }
+            self.nano_sounds.retain(|sound| sound.5 != cast.who);
+            let charge = self.nano_templates.get(&cast.spell).and_then(|template| template.stat(0x178)).unwrap_or(203) as u32;
+            self.pending_clips.retain(|clip| clip.3 != cast.who || (clip.2 != charge && clip.2 != cast.release_anim));
+            self.replay.retain(|clip| clip.0 != cast.who || (clip.1 != charge && clip.1 != cast.release_anim));
             if cast.who == self.own { self.nano_animations.push(None); }
             else if let Some(c) = self.chars.get_mut(&cast.who).filter(|c| matches!(c.special, Special::Cast(_)) || c.special == Special::Once(cast.release_anim)) {
                 c.special = Special::None;
@@ -1186,18 +1325,67 @@ impl Dynels {
             false
         });
         self.nano_handles.retain(|(target, _, handle)| {
-            if *target != who { return true; }
+            if target.kind != CHAR_KIND || target.instance != who { return true; }
             if let Some(renderer) = &mut renderer { renderer.delete(*handle); }
             false
         });
         self.effects = renderer;
     }
 
+    /// GC 1004f504: spell0 selects the first pending cast; this never removes applied buffs.
+    fn cancel_nano_cast(&mut self, who: i32, spell: i32) {
+        let spell = if spell != 0 { Some(spell) } else {
+            self.casting.iter().find(|cast| cast.who == who && !cast.done).map(|cast| cast.spell)
+                .or_else(|| self.nano_casts.iter().find(|(caster, _)| *caster == who).map(|(_, cast)| cast.spell))
+        };
+        let Some(spell) = spell else { return };
+        self.nano_casts.retain(|(caster, cast)| *caster != who || cast.spell != spell);
+        self.casting.retain(|cast| {
+            if cast.who != who || cast.spell != spell || cast.done { return true; }
+            self.nano_sounds.retain(|sound| sound.5 != who);
+            let charge = self.nano_templates.get(&cast.spell).and_then(|template| template.stat(0x178)).unwrap_or(203) as u32;
+            self.pending_clips.retain(|clip| clip.3 != who || (clip.2 != charge && clip.2 != cast.release_anim));
+            self.replay.retain(|clip| clip.0 != who || (clip.1 != charge && clip.1 != cast.release_anim));
+            if who == self.own { self.nano_animations.push(None); }
+            else if let Some(c) = self.chars.get_mut(&who).filter(|c| matches!(c.special, Special::Cast(_)) || c.special == Special::Once(cast.release_anim)) {
+                c.special = Special::None;
+                c.clip_ms = 0.0;
+            }
+            if let Some(renderer) = &mut self.effects { renderer.delete(cast.handle); }
+            false
+        });
+    }
+
 
     /// GC 100a5083 / 100a78c6 / 100a8c03: spell visual handlers use category 0x20.
     pub fn apply_nano_visuals(&mut self, application: ao_net::n3::spells::ApplySpells) {
-        if application.target.kind == CHAR_KIND {
-            self.nano_visuals.push(application);
+        self.nano_visuals.push(application);
+    }
+
+    /// Native CharCastNano calls: id, scene position, duration override, volume, selector, emitter.
+    pub fn take_nano_sounds(&mut self) -> Vec<(u32, [f32; 3], f32, f32, u32, i32)> {
+        std::mem::take(&mut self.nano_sounds)
+    }
+
+    fn nano_sound(&mut self, spell: i32, selector: u32, who: i32, duration: f32, volume: f32) {
+        let Some(sound) = self.nano_templates.get(&spell).and_then(|t| t.stat(selector)).filter(|&id| id != 0) else { return };
+        let Some(character) = self.chars.get(&who) else { return };
+        self.nano_sounds.push((sound as u32, scene_pos(character.pose.pos), duration, volume, selector, who));
+    }
+
+    /// Nano states use the single body clip, not the combat holder's positive-count history.
+    fn nano_clip(&mut self, who: i32, animation: u32, looping: bool) {
+        let Some(character) = self.chars.get_mut(&who).filter(|c| !matches!(c.special, Special::Die(_))) else { return };
+        character.special = Special::None;
+        character.clip_ms = 0.0;
+        character.note_fired = 0;
+        character.roll.key = None;
+        self.pending_clips.retain(|clip| clip.3 != who);
+        self.replay.retain(|clip| clip.0 != who);
+        self.once_rate.remove(&who);
+        self.play_once(who, animation);
+        if looping {
+            if let Some(character) = self.chars.get_mut(&who) { character.special = Special::Cast(animation); }
         }
     }
 
@@ -1207,7 +1395,7 @@ impl Dynels {
     pub fn refresh_effect_anchors(&mut self, mut own_anchor: impl FnMut(i32) -> Option<glam::Mat4>) {
         let Some(mut renderer) = self.effects.take() else { return };
         renderer.refresh_anchors(|identity, id| {
-            if identity.0 != CHAR_KIND as u32 { return None; }
+            if identity.0 != CHAR_KIND as u32 { return self.item_effect_anchor(ao_net::msg::Identity { kind: identity.0 as i32, instance: identity.1 as i32 }, id); }
             if identity.1 as i32 == self.own { own_anchor(id) }
             else { self.effect_anchor(identity.1 as i32, id, 0) }
         });
@@ -1217,7 +1405,7 @@ impl Dynels {
 
     pub fn nano_visual_frame(&mut self, dt: f32, own_finished: bool, mut own_anchor: impl FnMut(i32) -> Option<[[f32; 4]; 4]>, mut stat: impl FnMut(i32, u32) -> Option<i32>) {
         use super::combat::effects::{Binding, EffectConfig};
-        let Some(mut renderer) = self.effects.take() else { return };
+        let mut renderer = self.effects.take();
         let anchor = |world: &Self, who, id, own_anchor: &mut dyn FnMut(i32) -> Option<[[f32; 4]; 4]>| {
             if who == world.own { own_anchor(id).map(|m| glam::Mat4::from_cols_array_2d(&m)) }
             else { world.effect_anchor(who, id, 0) }
@@ -1225,7 +1413,7 @@ impl Dynels {
         let appearance = |who, stat: &mut dyn FnMut(i32, u32) -> Option<i32>| -> Option<[i32; 4]> {
             Some([stat(who, 4)?, stat(who, 59)?, stat(who, 47)?, stat(who, 360)?])
         };
-        self.nano_handles.retain(|(_, _, handle)| renderer.is_active(*handle));
+        self.nano_handles.retain(|(_, _, handle)| renderer.as_ref().is_some_and(|r| r.is_active(*handle)));
         for (who, cast) in std::mem::take(&mut self.nano_casts) {
             if !self.nano_templates.contains_key(&cast.spell) {
                 let Some(store) = &self.nano_store else { continue };
@@ -1240,51 +1428,47 @@ impl Dynels {
             }
             let template = Arc::clone(&self.nano_templates[&cast.spell]);
             let target = if cast.target.kind == 0 && cast.target.instance == 0 && template.stat(0).unwrap_or(0) & 0x8000 == 0 { who } else { cast.target.instance };
-            self.casting.retain(|old| { if old.who == who && old.spell == cast.spell { renderer.delete(old.handle); false } else { true } });
+            self.casting.retain(|old| { if old.who == who && old.spell == cast.spell { if let Some(r) = &mut renderer { r.delete(old.handle); } false } else { true } });
             let remaining = nano_cast_delay(template.stat(0x126).unwrap_or(200), template.stat(0x20b).unwrap_or(1_234_567_890), stat(who, 0x95).unwrap_or(0), stat(who, 0x33).unwrap_or(0), template.stat(0).unwrap_or(1));
             let instant = template.stat(0).unwrap_or(1) & 0x80000 != 0;
-            let effect = template.stat(0x1ac).unwrap_or(49999);
-            let attractor = renderer.attractor(effect, 0).unwrap_or(0);
-            let Some(source) = anchor(self, who, attractor, &mut own_anchor) else { continue };
-            let Some(destination) = anchor(self, target, 0, &mut own_anchor) else { continue };
-            let binding = Binding { group: 0, attractor, effect, note: 0, color: 0 };
-            let handle = if instant || self.nano_effect_categories & 4 == 0 || effect == 49999 { 0 } else {
-                renderer.prepare_anchors((CHAR_KIND as u32, who as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
-                if target != who {
-                    renderer.prepare_anchors((CHAR_KIND as u32, target as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
-                }
-                match renderer.spawn_configured(binding, source, destination.w_axis.truncate(), EffectConfig { duration: Some(6000.0), track_source: true, source_identity: Some((CHAR_KIND as u32, who as u32)), target_identity: Some((CHAR_KIND as u32, target as u32)), source_appearance: appearance(who, &mut stat), target_appearance: appearance(target, &mut stat), ..Default::default() }) {
-                    Ok(handle) => handle,
-                    Err(error) => { eprintln!("nano cast: {error:#}"); continue; }
-                }
-            };
             let release_anim = template.stat(if target == who { 0x17a } else { 0x179 }).unwrap_or(if target == who { 202 } else { 201 }) as u32;
-            self.casting.push(NanoCast { who, spell: cast.spell, target, handle, remaining, release_anim, released: instant, release_seen: false, done: false, instant, finish: if !instant || cast.flag { [template.stat(0x19e).unwrap_or(49999), template.stat(0x169).unwrap_or(49999)] } else { [49999; 2] } });
+            self.casting.push(NanoCast { who, spell: cast.spell, target, handle: 0, remaining, release_anim, released: instant, release_seen: false, done: false, instant, finish_enabled: !instant || cast.flag, start_effect: if instant || self.nano_effect_categories & 4 == 0 { 49999 } else { template.stat(0x1ac).unwrap_or(49999) }, finish: if !instant || cast.flag { [template.stat(0x19e).unwrap_or(49999), template.stat(0x169).unwrap_or(49999)] } else { [49999; 2] } });
             if !instant {
+                self.nano_sound(cast.spell, 0x10d, who, 0.2, 0.6);
                 let animation = template.stat(0x178).unwrap_or(203) as u32;
                 if who == self.own { self.nano_animations.push(Some((animation, true))); }
-                else {
-                    self.play_swing(who, Some(animation), animation as u16);
-                    if let Some(c) = self.chars.get_mut(&who).filter(|c| !matches!(c.special, Special::Die(_))) {
-                        c.special = Special::Cast(animation);
-                        c.clip_ms = 0.0;
-                        c.roll.key = None;
-                    }
-                }
+                else { self.nano_clip(who, animation, true); }
             }
             else if who == self.own { self.nano_animations.push(Some((release_anim, false))); }
-            else { self.play_swing(who, Some(release_anim), release_anim as u16); }
+            else { self.nano_clip(who, release_anim, false); }
         }
         let mut casting = std::mem::take(&mut self.casting);
         for cast in &mut casting {
+            if !cast.released && cast.start_effect != 49999 && cast.start_effect != 0 {
+                if let Some(r) = &mut renderer {
+                    let effect = cast.start_effect;
+                    let attractor = r.attractor(effect, 0).unwrap_or(0);
+                    if let (Some(source), Some(destination)) = (anchor(self, cast.who, attractor, &mut own_anchor), anchor(self, cast.target, 0, &mut own_anchor)) {
+                        r.prepare_anchors((CHAR_KIND as u32, cast.who as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
+                        r.prepare_anchors((CHAR_KIND as u32, cast.target as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
+                        match r.spawn_configured(Binding { group: 0, attractor, effect, note: 0, color: 0 }, source, destination.w_axis.truncate(), EffectConfig { duration: Some(6000.0), track_source: true, source_identity: Some((CHAR_KIND as u32, cast.who as u32)), target_identity: Some((CHAR_KIND as u32, cast.target as u32)), source_appearance: appearance(cast.who, &mut stat), target_appearance: appearance(cast.target, &mut stat), ..Default::default() }) {
+                            Ok(handle) => { cast.handle = handle; cast.start_effect = 49999; }
+                            Err(error) => { eprintln!("nano cast: {error:#}"); cast.start_effect = 49999; }
+                        }
+                    }
+                }
+            }
             if !cast.released && !cast.instant {
                 cast.remaining -= dt;
-                if cast.remaining > 0.0 { continue; }
-                renderer.next_state(cast.handle);
+                if cast.remaining > 0.0 {
+                    self.nano_sound(cast.spell, 0x10d, cast.who, 0.2, 1.0);
+                    continue;
+                }
+                if let Some(r) = &mut renderer { r.next_state(cast.handle); }
                 cast.released = true;
                 if cast.who == self.own { self.nano_animations.push(Some((cast.release_anim, false))); }
                 else {
-                    self.play_swing(cast.who, Some(cast.release_anim), cast.release_anim as u16);
+                    self.nano_clip(cast.who, cast.release_anim, false);
                     cast.release_seen = self.chars.get(&cast.who).is_some_and(|c| c.special == Special::Once(cast.release_anim));
                 }
                 continue;
@@ -1297,51 +1481,63 @@ impl Dynels {
                     cast.release_seen && c.special == Special::None
                 })
             };
+            if !finished && !cast.done {
+                self.nano_sound(cast.spell, 0x10f, cast.who, 0.2, 1.0);
+            }
             if finished && !cast.done {
                 cast.done = true;
-                if self.nano_effect_categories & 4 != 0 {
-                    for effect in cast.finish.into_iter().filter(|&effect| effect != 0 && effect != 49999) {
-                        if let Some(attractor) = renderer.attractor(effect, 0) {
+                if cast.finish_enabled {
+                    self.nano_sound(cast.spell, 0x110, cast.target, 0.0, 1.0);
+                }
+            }
+            if cast.done {
+                if self.nano_effect_categories & 4 == 0 { cast.finish = [49999; 2]; }
+                if let Some(r) = &mut renderer {
+                    for effect in &mut cast.finish {
+                        if *effect == 0 || *effect == 49999 { continue; }
+                        if let Some(attractor) = r.attractor(*effect, 0) {
                             if let Some(source) = anchor(self, cast.target, attractor, &mut own_anchor) {
-                                let binding = Binding { group: 0, attractor, effect, note: 0, color: 0 };
+                                let binding = Binding { group: 0, attractor, effect: *effect, note: 0, color: 0 };
                                 let identity = Some((CHAR_KIND as u32, cast.target as u32));
                                 let profile = appearance(cast.target, &mut stat);
                                 let config = EffectConfig { track_source: true, source_identity: identity, target_identity: identity, source_appearance: profile, target_appearance: profile, ..Default::default() };
-                                renderer.prepare_anchors((CHAR_KIND as u32, cast.target as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
-                                if let Err(error) = renderer.spawn_configured(binding, source, source.w_axis.truncate(), config) { eprintln!("nano release: {error:#}"); }
+                                r.prepare_anchors((CHAR_KIND as u32, cast.target as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
+                                if let Err(error) = r.spawn_configured(binding, source, source.w_axis.truncate(), config) { eprintln!("nano release: {error:#}"); }
+                                *effect = 49999;
                             }
                         }
                     }
                 }
             }
         }
-        casting.retain(|cast| !cast.done || renderer.is_active(cast.handle));
+        casting.retain(|cast| !cast.done || cast.finish.iter().any(|&effect| effect != 0 && effect != 49999) || renderer.as_ref().is_some_and(|r| r.is_active(cast.handle)));
         self.casting = casting;
+        let Some(mut renderer) = renderer else { return };
         for application in std::mem::take(&mut self.nano_visuals) {
             let who = application.target.instance;
             for spell in application.spells {
                 let Some((effect, explicit, mut config)) = nano_visual(&spell) else { continue };
                 // GC 100a78c6 rejects non-control characters (+0x140 == 0).
-                if spell.function == 0xcf57 && who != self.own { continue; }
+                if spell.function == 0xcf57 && (application.target.kind != CHAR_KIND || who != self.own) { continue; }
                 if !application.apply {
                     self.nano_handles.retain(|(target, original, handle)| {
-                        if *target == who && *original == spell { renderer.delete(*handle); false } else { true }
+                        if *target == application.target && *original == spell { renderer.delete(*handle); false } else { true }
                     });
                     continue;
                 }
                 if self.nano_effect_categories & 32 == 0 { continue; }
                 let Some(attractor) = renderer.attractor(effect, explicit) else { continue };
-                let Some(source) = anchor(self, who, attractor, &mut own_anchor) else { continue };
+                let Some(source) = (if application.target.kind == CHAR_KIND { anchor(self, who, attractor, &mut own_anchor) } else { self.item_effect_anchor(application.target, attractor) }) else { continue };
                 let binding = Binding { group: 0, attractor, effect, note: 0, color: 0 };
-                config.source_identity = Some((CHAR_KIND as u32, who as u32));
+                config.source_identity = Some((application.target.kind as u32, who as u32));
                 config.track_source = true;
                 config.target_identity = config.source_identity;
-                config.source_appearance = appearance(who, &mut stat);
+                config.source_appearance = (application.target.kind == CHAR_KIND).then(|| appearance(who, &mut stat)).flatten();
                 config.target_appearance = config.source_appearance;
-                renderer.prepare_anchors((CHAR_KIND as u32, who as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
+                renderer.prepare_anchors((application.target.kind as u32, who as u32), |identity, id| if identity.0 == CHAR_KIND as u32 { anchor(self, identity.1 as i32, id, &mut own_anchor) } else { self.item_effect_anchor(application.target, id) });
                 match renderer.spawn_configured(binding, source, source.w_axis.truncate(), config) {
                     Ok(handle) => {
-                        self.nano_handles.push((who, spell, handle));
+                        self.nano_handles.push((application.target, spell, handle));
                     }
                     Err(error) => eprintln!("nano effects: {error:#}"),
                 }
@@ -1352,10 +1548,10 @@ impl Dynels {
 
     /// Visual effects use the actor's actual animated connector, never `char_pos`'s
     /// own-character sound/camera shortcut.
-    pub fn note_effects(&mut self, who: i32, note: u32, mut own_anchor: impl FnMut(i32, i32) -> Option<[[f32; 4]; 4]>) {
+    pub fn note_effects(&mut self, who: i32, note: u32, slot: i32, mut own_anchor: impl FnMut(i32, i32) -> Option<[[f32; 4]; 4]>) {
         use super::combat::{effects::Binding, notes::id};
         if !matches!(note, id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) { return; }
-        let Some(h) = self.note_ctx(who) else { return };
+        let Some(h) = self.note_ctx(who, slot) else { return };
         let (victim, slot, hit) = (h.victim, h.slot, h.flags > 1);
         let Some(item) = self.arms.slot_item(who, slot) else { return };
         let mut bindings = item.effects.clone();
@@ -1389,13 +1585,13 @@ impl Dynels {
     }
 
     /// One animation note of `who`'s swing clip (`FUN_10045069` [GC 0x10045069], `combat::notes`).
-    pub fn note_sounds(&mut self, who: i32, note: u32) {
+    pub fn note_sounds(&mut self, who: i32, note: u32, slot: i32) {
         use super::combat::notes::id;
         match note {
             id::SWISH_PUNCH..=id::SWISH_HUGE => self.swish(who, note),
             id::ATTACK_START_1..=id::ATTACK_START_9 => self.record_note(who, note),
             id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4 => {
-                if let Some(h) = self.note_ctx(who) {
+                if let Some(h) = self.note_ctx(who, slot) {
                     self.weapon_hit(who, note, h);
                 }
             }
@@ -1404,7 +1600,7 @@ impl Dynels {
     }
 
     /// The notes the swing clips of the other characters fired since the last call: (character, note id).
-    pub fn take_notes(&mut self) -> Vec<(i32, u32)> {
+    pub fn take_notes(&mut self) -> Vec<(i32, super::combat::notes::FiredNote)> {
         std::mem::take(&mut self.notes)
     }
 
@@ -1516,8 +1712,9 @@ impl Dynels {
 
     /// Real-template fixture through the production build path, without renderer upload.
     #[cfg(test)]
-    pub(super) fn test_template_prop(&mut self, who: ao_net::msg::Identity, template: u32, store: &RecordStore) -> anyhow::Result<()> {
-        let look = Look::Item { template: Some(template), stats: vec![] };
+    pub(super) fn test_template_prop(&mut self, who: ao_net::msg::Identity, template: u32, store: &RecordStore, mut stats: Vec<(u32, i32)>) -> anyhow::Result<()> {
+        stats.push((23, template as i32));
+        let look = Look::Item { template: Some(template), stats };
         let built = build(store, &mut ActorAssets::new(store)?, &look)?;
         self.add_prop(who.kind, who.instance, look, [0.0; 3], None, 1.0);
         let key = self.props[&(who.kind, who.instance)].key;
@@ -1624,8 +1821,19 @@ impl Dynels {
 
     pub fn on_message(&mut self, m: &Message) {
         let who = m.header.target;
+        if matches!(&m.body, N3::Misc(Misc::ToClientQuit)) {
+            if let Some(effects) = &mut self.effects { effects.source_deleted((who.kind as u32, who.instance as u32)); }
+            self.nano_visuals.retain(|application| application.target != who);
+            self.nano_handles.retain(|(target, _, handle)| {
+                if *target != who { return true; }
+                if let Some(effects) = &mut self.effects { effects.delete(*handle); }
+                false
+            });
+        }
+        self.buff_message(m);
         self.arms.on_message(m, self.chars.get(&who.instance).is_some_and(|c| c.npc));
         match &m.body {
+            N3::Effects(effect) => self.pending_effects.push(effect.clone()),
             N3::World(World::VendingMachine(v)) => {
                 let stats = v.base.stats.iter().map(|&(i, x)| (i, x)).collect::<Vec<_>>();
                 let template = static_instance(&stats);
@@ -1670,6 +1878,7 @@ impl Dynels {
                             let name = c.base.name();
                             self.props.get_mut(&(who.kind, who.instance)).unwrap().name = (!name.is_empty()).then_some(name);
                             // A corpse replaces its character even when the full update beats the quit.
+                            if let Some(effects) = &mut self.effects { effects.source_deleted((c.owner.kind as u32, c.owner.instance as u32)); }
                             self.cancel_nano_visuals(c.owner.instance);
                             self.chars.remove(&c.owner.instance);
                         }
@@ -1681,6 +1890,22 @@ impl Dynels {
                 self.die(who.instance, a.identity_b.instance as u32)
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == ACTION_UNWIELD => self.unwield_slot(who.instance, a.identity_b.instance),
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && matches!(a.action, 0x66 | 0x6c) => {
+                self.cancel_nano_cast(who.instance, if a.action == 0x66 { 0 } else { a.identity_b.kind });
+            }
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == 0x75 && a.identity_a.kind == CHAR_KIND && self.chars.contains_key(&a.identity_a.instance) => {
+                self.cancel_nano_cast(who.instance, a.identity_b.instance);
+            }
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == 0x89 => {
+                // GC1004f274 clears the queue without holder+0x10: stage0 releases,
+                // with no result to copy; an already released controller keeps its cached result.
+                self.nano_casts.retain(|(caster, _)| *caster != who.instance);
+                for cast in self.casting.iter_mut().filter(|cast| cast.who == who.instance && !cast.released) {
+                    cast.remaining = 0.0;
+                    cast.finish_enabled = false;
+                    cast.finish = [49999; 2];
+                }
+            }
             N3::Dynel(Dynel::CastNanoSpell(cast)) if who.kind == CHAR_KIND => self.nano_casts.push((who.instance, cast.clone())),
             N3::Dynel(Dynel::WeaponItemFullUpdate(w)) if w.parent.kind == CHAR_KIND => {
                 // body location 6 = right hand, 8 = left hand (docs/zone/static.md §4)
@@ -1765,6 +1990,8 @@ impl Dynels {
                         pose,
                         anim: 0x78,
                         special: if u.max_health > 0 && u.health <= 0 { Special::Die(DIE_KEY) } else { Special::None },
+                        actions: vec![],
+                        base_layers: 3,
                         clip_ms: 0.0,
                         clip_rate: 1.0,
                         terminal_pose: false,
@@ -1773,7 +2000,6 @@ impl Dynels {
                         features_set: !u.is_npc(),
                         bounds: None,
                         roll: Roll::default(),
-                        swing_ttl: 0.0,
                         next: None,
                         note_fired: 0,
                     },
@@ -1889,8 +2115,14 @@ impl Dynels {
                         built.clips.insert(id, anims);
                     }
                     for (who, _) in self.replay.iter().filter(|r| r.1 == id) {
-                        if let Some(c) = self.chars.get_mut(who).filter(|c| c.key == key && c.special == Special::None) {
-                            if matches!(self.models.get(&key), Some(Model::Ready { built, .. }) if built.clips.contains_key(&id)) {
+                        if let Some(c) = self.chars.get_mut(who).filter(|c| c.key == key) {
+                            let available = matches!(self.models.get(&key), Some(Model::Ready { built, .. }) if built.clips.contains_key(&id));
+                            if c.actions.iter().any(|action| action.id == id) {
+                                if !available { c.actions.retain(|action| action.id != id); }
+                                if available { c.refresh_layers(); }
+                                continue;
+                            }
+                            if available && c.special == Special::None {
                                 c.special = Special::Once(id);
                                 c.clip_ms = 0.0;
                             }
@@ -1942,7 +2174,7 @@ impl Dynels {
                 let _ = worker.tx.send(Req::Model { key, look });
             }
         }
-        for p in self.props.values_mut() {
+        for (&(kind, instance), p) in &mut self.props {
             let Some(Model::Ready { built, uploaded }) = self.models.get_mut(&p.key) else { continue };
             if !built.visible {
                 continue;
@@ -1969,7 +2201,12 @@ impl Dynels {
             let skin = built.held.as_ref().filter(|_| !p.submitted).map(|h| h.0.clone()).or(moved);
             p.submitted = true;
             let parts = built.held.as_ref().map_or(vec![], |h| h.1.clone());
-            host.actors.push(ActorFrame { id: p.id, model: p.key, transform, parts, skin, always: false, alpha: 1.0, ..Default::default() });
+            let actor = ActorFrame { id: p.id, model: p.key, transform, parts, skin, always: false, alpha: 1.0, ..Default::default() };
+            if let Some(effects) = &mut self.effects {
+                let identity = (kind as u32, instance as u32);
+                if effects.needs_source_mesh(identity) { effects.prepare_source_mesh(identity, &built.model, &actor); }
+            }
+            host.actors.push(actor);
         }
         self.advance(dt);
         for (id, c) in &mut self.chars {
@@ -2020,10 +2257,6 @@ impl Dynels {
                     ),
                     None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
                 },
-                Special::Attack => match built.clips.get(&ATTACK_KEY) {
-                    Some(a) => (ATTACK_KEY, Some(a), 1.0),
-                    None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
-                },
                 Special::None => {
                     let (id, a) = clip_of(built, state).map_or((0x78, None), |(i, a)| (i, Some(a)));
                     // a wielder: the idle of the equip routine (rifle / bazooka list 0x29) out of a fight, the weapon idle (list 0x10) in a fight, the
@@ -2045,6 +2278,8 @@ impl Dynels {
             let clip = list.filter(|l| !l.is_empty()).map(|l| &l[c.roll.pick(roll_key, l.len(), &mut self.rng)]);
             if key != c.anim || started {
                 c.anim = key;
+                c.base_layers = 3;
+                c.refresh_layers();
                 c.clip_ms = 0.0;
                 c.note_fired = 0;
                 c.terminal_pose = false;
@@ -2069,16 +2304,17 @@ impl Dynels {
                     )
                 } else { rate }
             });
-            // the notes of a swing clip (`FUN_1003c036`): the weapon / swish sounds start when the clip reaches them
-            c.swing_ttl = (c.swing_ttl - dt).max(0.0);
-            if let (Some(a), true) = (clip, c.swing_ttl > 0.0 && matches!(c.special, Special::Once(_) | Special::Attack)) {
-                self.notes.extend(super::combat::notes::fire(&a.events, c.clip_ms, &mut c.note_fired).into_iter().map(|n| (*id, n)));
-            }
+            c.actions.retain_mut(|action| {
+                let Some(clips) = built.clips.get(&action.id).filter(|clips| !clips.is_empty()) else { return true };
+                let variant = *action.variant.get_or_insert_with(|| if clips.len() > 1 { self.rng.rand() as usize % clips.len() } else { 0 });
+                let clip = &clips[variant % clips.len()];
+                action.advance(clip, dt, |note| self.notes.push((*id, note)))
+            });
             let dead = matches!(c.special, Special::Die(_));
             if let Some(a) = clip.filter(|_| !matches!(c.special, Special::None | Special::Cast(_))) {
-                // one-shot clips: Attack returns to the movement state at the end, Die holds the last frame
+                // Legacy emote/nano-release returns to movement; death holds its last frame.
                 if c.clip_ms >= a.duration {
-                    if matches!(c.special, Special::Attack | Special::Once(_)) {
+                    if matches!(c.special, Special::Once(_)) {
                         c.special = Special::None;
                         c.clip_ms = 0.0;
                     } else {
@@ -2095,9 +2331,10 @@ impl Dynels {
                 continue;
             }
             let terminal = dead && clip.is_some_and(|a| c.clip_ms >= a.duration);
-            let skin = if !terminal || !c.terminal_pose || !c.submitted {
+            let needs_effect_pose = self.effects.as_ref().is_some_and(|effects| effects.needs_source_pose((CHAR_KIND as u32, *id as u32)));
+            let skin = if !terminal || !c.terminal_pose || !c.submitted || needs_effect_pose {
                 c.terminal_pose = terminal;
-                Some(rig.pose(clip.map(|a| (&**a, super::avatar::clip_time(a, c.clip_ms, !matches!(c.special, Special::None | Special::Cast(_)))))))
+                Some(rig.pose_composed(c.layers(built)))
             } else {
                 None
             };
@@ -2110,7 +2347,12 @@ impl Dynels {
             let (s, cs) = scene_yaw(c.pose.yaw).sin_cos();
             let k = c.scale;
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [p[0], p[1], p[2], 1.0]];
-            host.actors.push(ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), skin, always: false, alpha: 1.0, ..Default::default() });
+            let actor = ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), skin, always: false, alpha: 1.0, ..Default::default() };
+            if let Some(effects) = &mut self.effects {
+                let identity = (CHAR_KIND as u32, *id as u32);
+                if effects.needs_source_mesh(identity) { effects.prepare_source_mesh(identity, &built.model, &actor); }
+            }
+            host.actors.push(actor);
         }
         self.refresh_effect_anchors(own_anchor);
         if let Some(effects) = &mut self.effects { effects.frame(dt, host, collision); }
@@ -2251,7 +2493,7 @@ mod tests {
         assert_eq!(world.nano_visuals.len(), 2);
         assert_eq!(world.nano_casts.len(), 2);
         world.own = 42;
-        world.casting.push(NanoCast { who: 42, spell: 163449, target: 43, handle: 0, remaining: 2.0, finish: [49999; 2], release_anim: 201, released: false, release_seen: false, done: false, instant: false });
+        world.casting.push(NanoCast { who: 42, spell: 163449, target: 43, handle: 0, remaining: 2.0, finish: [49999; 2], release_anim: 201, released: false, release_seen: false, done: false, instant: false, finish_enabled: true, start_effect: 49999 });
         world.cancel_nano_visuals(43);
         assert!(world.casting.is_empty(), "target disappearance ends the caster's loop even without an effect renderer");
         assert_eq!(world.take_nano_animations(), [None]);
@@ -2340,6 +2582,47 @@ mod tests {
         assert!(world.on_ground(id));
         world.props.get_mut(&(id.kind, id.instance)).unwrap().parent = Some(ao_net::msg::Identity { kind: CHAR_KIND, instance: 1 });
         assert!(!world.on_ground(id));
+    }
+
+    #[test]
+    fn item_visual_queue_preserves_kind_and_rejects_character_anchor_substitution() {
+        let mut world = Zone::new(1).world;
+        let item = ao_net::msg::Identity { kind: 0xc73d, instance: 1 };
+        world.test_prop(item, vec![]);
+        let key = world.props[&(item.kind, item.instance)].key;
+        world.models.insert(key, Model::Ready { built: Box::new(plain(Default::default(), true)), uploaded: false });
+        let spell = ao_net::n3::spells::spell(0xcf26, &[(0x27, 71214)]);
+        world.apply_nano_visuals(ao_net::n3::spells::ApplySpells { target: item, spells: vec![spell], apply: true });
+        world.cancel_nano_visuals(1);
+        assert_eq!(world.nano_visuals.len(), 1, "same-instance character teardown must not remove an item application");
+        assert!(world.item_effect_anchor(item, 0).is_some());
+        assert!(world.item_effect_anchor(item, 1000).is_none());
+        assert!(world.item_effect_anchor(item, 3001).is_none(), "mesh connector cannot be replaced by the item origin");
+        world.clear();
+        assert!(world.nano_visuals.is_empty());
+    }
+
+    #[test]
+    fn authored_beacon_and_laboratory_spawn_on_their_real_receivers() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut world = Zone::new(1).world;
+        world.own = 1;
+        world.effects = Some(crate::play::combat::effects::Renderer::open(&dir).unwrap());
+        let item = ao_net::msg::Identity { kind: 0xc73d, instance: 2 };
+        world.test_prop(item, vec![(23, 288073)]);
+        let key = world.props[&(item.kind, item.instance)].key;
+        world.models.insert(key, Model::Ready { built: Box::new(plain(Default::default(), true)), uploaded: false });
+        for (receiver, effect) in [(item, 71214), (ao_net::msg::Identity { kind: CHAR_KIND, instance: 1 }, 13600)] {
+            let spell = ao_net::n3::spells::spell(0xcf26, &[(0x27, effect), (0x31, 100)]);
+            world.apply_nano_visuals(ao_net::n3::spells::ApplySpells { target: receiver, spells: vec![spell.clone()], apply: true });
+            world.nano_visual_frame(0.0, false, |_| Some(glam::Mat4::IDENTITY.to_cols_array_2d()), |_, _| None);
+            let (_, _, handle) = world.nano_handles.iter().find(|(who, original, _)| *who == receiver && *original == spell).unwrap();
+            assert!(world.effects.as_ref().unwrap().is_active(*handle));
+            world.apply_nano_visuals(ao_net::n3::spells::ApplySpells { target: receiver, spells: vec![spell], apply: false });
+            world.nano_visual_frame(0.0, false, |_| Some(glam::Mat4::IDENTITY.to_cols_array_2d()), |_, _| None);
+            assert!(!world.nano_handles.iter().any(|(who, _, _)| *who == receiver));
+        }
     }
     use crate::play::zone::{scene_forward, Zone};
     use ao_net::frame::Frame;
@@ -2727,7 +3010,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_swing_lists_replace_a_busy_identical_clip() {
+    fn distinct_swing_lists_preserve_parallel_holder_nodes() {
         let mut z = Zone::new(25988);
         for l in include_str!("../../../../docs/captures/zone_ithaca.rec").lines() {
             let mut p = l.split(' ');
@@ -2739,20 +3022,91 @@ mod tests {
         }
         let who = *z.world.chars.keys().next().unwrap();
         let c = z.world.chars.get_mut(&who).unwrap();
-        c.special = Special::Once(1034);
+        c.special = Special::None;
         c.clip_ms = 100.0;
-        z.world.swing_keys.insert(who, canim::list::ATTACK);
+        z.world.play_swing(who, Some(0x3ff), canim::list::ATTACK);
+        z.world.play_swing(who, Some(0x3ff), canim::list::ATTACK);
+        assert_eq!(z.world.chars[&who].actions.len(), 1, "same live list must not restart");
+        z.world.play_swing(who, Some(0x3ff), canim::list::FLING_SHOT);
+        assert_eq!(z.world.chars[&who].actions.len(), 2, "different list adds a holder node even for the same clip");
+        assert_eq!(z.world.pending_clips.iter().filter(|p| p.2 == 0x3ff && p.3 == who).count(), 1, "distinct list nodes share one native rifle-shot clip request while busy");
+        z.world.play_swing(who, None, canim::list::ATTACK);
+        assert_eq!(z.world.chars[&who].actions.len(), 2, "fallback cannot bypass an active key");
+        z.world.play_swing(who, None, canim::list::BURST);
+        assert_eq!(z.world.chars[&who].actions.last().unwrap().id, ATTACK_KEY, "fallback uses the preloaded record attack");
+        assert_eq!(z.world.chars[&who].clip_ms, 100.0, "swings do not restart locomotion");
+        z.world.play_action(who, 0x6d, canim::Layer::Upper, -2);
+        let c = &z.world.chars[&who];
+        assert_eq!(c.clip_ms, 100.0, "authored action must not restart the base clock");
+        assert_eq!(c.special, Special::None, "action owns a separate playback slot");
+        assert_eq!(c.actions.last().unwrap().layer, canim::Layer::Upper);
+        z.world.play_action(who, 0x6d, canim::Layer::Body, -1);
+        let c = &z.world.chars[&who];
+        assert_eq!(c.actions.iter().find(|action| action.id == 0x6d && action.priority == -1).unwrap().layer, canim::Layer::Body, "explicit producer layer wins over the wield table");
+        assert_eq!(c.special, Special::None, "replaced combat transient must not resume after the action");
+        assert_eq!(z.world.pending_clips.iter().filter(|pending| pending.3 == who).count(), 2, "parallel nodes share clip requests without canceling another clip");
+        let mut built = plain(Default::default(), true);
+        let clip = Arc::new(CatAnim { source_id: 0, root: String::new(), events: vec![], version: 0x106, duration: 1000.0, signature: 7, param: 0.0, tracks: vec![] });
+        built.clips.insert(0x6d, vec![clip.clone()]);
+        let c = z.world.chars.get_mut(&who).unwrap();
+        built.clips.insert(c.anim, vec![clip]);
+        for action in &mut c.actions { action.variant = Some(0); action.ms = 100.0; }
+        let samples: Vec<_> = c.layers(&built).map(|layer| (layer.layers, layer.blend)).collect();
+        assert_eq!(samples[0], (3, 1.0), "base priority 0 must compose before negative action priorities");
+        assert!(samples[1..].iter().all(|sample| sample.1 == 0.5), "action nodes must retain their authored fade weights");
+        c.actions.insert(0, ActionAnim { id: 0x6d, layer: canim::Layer::Upper, priority: 1, layers: 3, fade_ms: 200.0, ms: 100.0, variant: Some(0), note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None });
+        c.refresh_layers();
+        assert_eq!(c.base_layers, 2);
+        c.actions.remove(0);
+        c.refresh_layers();
+        assert_eq!(c.base_layers, 2, "expiration/zero exclusion must not reset stored playback masks");
+
+        c.actions.clear();
+        let burst = CatAnim { events: vec![(200, "attack_effect_1".into()), (400, "attack_effect_2".into()), (600, "attack_effect_3".into()), (800, "attack_effect_4".into())], ..built.clips[&0x6d][0].as_ref().clone() };
+        let tick = |world: &mut Dynels, clip: &CatAnim, dt| {
+            world.chars.get_mut(&who).unwrap().actions.retain_mut(|node| node.advance(clip, dt, |note| world.notes.push((who, note))));
+        };
+        z.world.hit_seen(who, crate::play::combat::notes::HitCtx { victim: 77, slot: 6, damage: 20, flags: 4 });
+        z.world.play_swing(who, Some(1034), canim::list::BURST);
+        tick(&mut z.world, &burst, 0.05);
+        z.world.hit_seen(who, crate::play::combat::notes::HitCtx { victim: 77, slot: 0, damage: 0, flags: 1 });
         z.world.play_swing(who, Some(1034), canim::list::ATTACK);
-        assert_eq!(z.world.chars[&who].clip_ms, 100.0, "same active list must not restart");
+        z.world.play_swing(who, Some(1034), canim::list::BURST);
+        assert_eq!(z.world.chars[&who].actions.len(), 2, "the older Burst key stays suppressed while its holder node lives");
+        for _ in 0..5 { tick(&mut z.world, &burst, 0.2); }
+        let notes = z.world.take_notes();
+        assert_eq!(notes.iter().filter(|(_, note)| note.slot == 6).count(), 4, "a normal swing at 50 ms must not lose Burst's later notes");
+        assert_eq!(z.world.note_ctx(who, 6).unwrap().flags, 4, "older nodes use their original slot's retained flags");
+
+        z.world.chars.get_mut(&who).unwrap().actions.clear();
+        z.world.special_hit_seen(who, 77, 6);
         z.world.play_swing(who, Some(1034), canim::list::FLING_SHOT);
-        assert_eq!(z.world.swing_keys[&who], canim::list::FLING_SHOT);
-        assert!(z.world.pending_clips.iter().any(|p| p.2 == 1034 && p.3 == who), "distinct key is not dropped while busy");
-        z.world.play_swing(who, None, canim::list::ATTACK);
-        assert_eq!(z.world.chars[&who].special, Special::Attack, "fallback uses the preloaded record attack");
-        assert!(z.world.pending_clips.iter().all(|p| p.3 != who), "fallback replaces pending special clips");
-        z.world.chars.get_mut(&who).unwrap().clip_ms = 100.0;
-        z.world.play_swing(who, None, canim::list::ATTACK);
-        assert_eq!(z.world.chars[&who].clip_ms, 100.0, "same fallback list must not restart");
+        let fling = CatAnim { events: vec![(200, "attack".into())], ..burst.clone() };
+        tick(&mut z.world, &fling, 0.133);
+        assert!(z.world.take_notes().is_empty());
+        z.world.play_action(who, 0x3fe, canim::Layer::Body, 0);
+        assert!(z.world.chars[&who].actions.iter().any(|node| node.id == 0x3fe && node.priority == 0 && node.key.is_none()), "FightStop inserts its group-0 holster node");
+        assert!(z.world.chars[&who].actions.iter().any(|node| node.key == Some(canim::list::FLING_SHOT) && (node.ms - 133.0).abs() < 0.001), "holster preserves the advancing Fling node");
+        z.world.note_target(who, 88);
+        z.world.chars.get_mut(&who).unwrap().refresh_layers();
+        tick(&mut z.world, &fling, 0.068);
+        let notes = z.world.take_notes();
+        assert_eq!(notes, [(who, crate::play::combat::notes::FiredNote { id: crate::play::combat::notes::id::ATTACK, slot: 6 })], "FightStop at 133 ms must preserve Fling's 200 ms attack note");
+        let ctx = z.world.note_ctx(who, notes[0].1.slot).unwrap();
+        assert_eq!((ctx.victim, ctx.flags), (88, 4), "target is dynamic, slot flags are retained");
+        assert!(z.world.note_ctx(who, -1).is_none(), "non-swing action notes cannot reuse combat context");
+
+        z.world.chars.get_mut(&who).unwrap().actions.clear();
+        z.world.wield.entry(who).or_default()[0] = Some(Wield { set: 1, delay: 120 });
+        let special = crate::play::combat::state::CombatEvent::SpecialAttack {
+            who, target: ao_net::msg::Identity { kind: 50000, instance: 77 }, special: 148, slot: 6, damage: 20,
+        };
+        crate::play::combat::glue::combat_animations(&mut z.world, None, -1, &[special], |_| false);
+        assert_eq!(z.world.chars[&who].actions.len(), 1);
+        assert_eq!(z.world.chars[&who].actions[0].key, Some(canim::list::ATTACK), "missing Burst list resolves to retail 0xb");
+        let normal = crate::play::combat::state::CombatEvent::Hit { attacker: who, victim: 77, damage: 10, slot: 6, flags: 4 };
+        crate::play::combat::glue::combat_animations(&mut z.world, None, -1, &[normal], |_| false);
+        assert_eq!(z.world.chars[&who].actions.len(), 1, "normal attack is suppressed by the fallback special's resolved key");
     }
 }
 
@@ -2778,6 +3132,24 @@ mod variant_tests {
         d.join("cd_image/rdb.db").exists().then_some(d)
     }
 
+    #[test]
+    fn explicit_actor_sound_position_uses_the_shared_variant_stream_without_a_model() {
+        let mut dynels = Dynels::default();
+        let mut expected_rng = CrtRand::new(1);
+        let pos = [12.0, 4.0, -7.0];
+        let variants = [11, 22, 33];
+        assert!(dynels.chars.is_empty());
+        dynels.sound_variants_at_position(&[], pos);
+        dynels.sound_variants_at_position(&[99], pos);
+        dynels.sound_variants_at_position(&variants, pos);
+        assert_eq!(dynels.take_sounds(), [
+            GameSound::at(99, pos),
+            GameSound::at(variants[expected_rng.rand() as usize % variants.len()], pos),
+        ]);
+        let list = [(8, variants.to_vec())];
+        assert_eq!(dynels.pick_of(&list, 8), Some(variants[expected_rng.rand() as usize % variants.len()]));
+    }
+
     /// `FUN_10069acb`: the swing is a value of the wielded weapon's list (its `AnimSet`, the hand), a special key the weapon lacks falls back
     /// to list 0xb; nothing wielded = no weapon swing.
     #[test]
@@ -2786,7 +3158,8 @@ mod variant_tests {
         assert_eq!(d.pick_swing(7, canim::list::ATTACK), None);
         d.wield.entry(7).or_default()[0] = Some(Wield { set: 1, delay: 120 });
         for _ in 0..20 {
-            let (a, delay) = d.pick_swing(7, canim::list::ATTACK).unwrap();
+            let (a, delay, key) = d.pick_swing(7, canim::list::ATTACK).unwrap();
+            assert_eq!(key, canim::list::ATTACK);
             assert!([0x3eb, 0x3ec].contains(&a) && delay == 120, "{a:#x}");
             assert!([0x3eb, 0x3ec].contains(&d.pick_swing(7, canim::list::BURST).unwrap().0), "a 1H blade has no burst: list 0xb");
         }
@@ -2820,7 +3193,7 @@ mod variant_tests {
                 CombatEvent::SpecialAttack { who: own, target, special, slot: 6, damage: 3 },
             ];
             super::super::combat::glue::combat_animations(&mut zone.world, Some(&mut player), own, &events, |_| true);
-            assert_eq!(player.transient_role(), Some(&Role::Clip(canim::anim_name(expected).unwrap().0.into())));
+            assert_eq!(player.swing_role(), Some(&Role::Clip(canim::anim_name(expected).unwrap().0.into())));
         }
     }
 
@@ -2878,8 +3251,8 @@ mod variant_tests {
         assert!(pump(&mut z, 500, &|w| w.wielded_set(own) == Some(3)), "the rifle never resolved");
         assert_eq!(attractors(&mut z), [vec![(1, 0x3ddf), (0, 0x9ee9)]], "the rifle mesh in the right hand attractor, next to the head");
         assert_eq!(z.world.arms.damage_type(own, 6, 0), Some(0x5a));
-        let (anim, delay) = z.world.pick_swing(own, canim::list::ATTACK).unwrap();
-        assert_eq!((anim, delay), (0x3ff, 100), "rifle shot");
+        let (anim, delay, key) = z.world.pick_swing(own, canim::list::ATTACK).unwrap();
+        assert_eq!((anim, delay, key), (0x3ff, 100, canim::list::ATTACK), "rifle shot");
         // the resolved weapon is announced once (a weapon wielded during a fight runs the AnimHolder idle update, `combat/glue.rs::stance`)
         assert_eq!((z.world.take_wielded(), z.world.take_wielded()), (vec![own], vec![]));
         unwield.iter().for_each(|f| {
@@ -3280,32 +3653,219 @@ mod variant_tests {
     }
 
     #[test]
+    fn nano_sound_stages_own_foreign_and_cancel() {
+        let Some((mut zone, player, leet)) = fight_zone() else { return };
+        let world = &mut zone.world;
+        world.nano_casts.clear();
+        world.casting.clear();
+        world.nano_effect_categories = 0;
+        world.effects = None; // Audio must not depend on FX renderer or connector availability.
+        world.nano_templates.insert(-1, Arc::new(ao_formats::dynel_visual::ItemTemplate {
+            kind: 0, name: None, sounds: vec![],
+            stats: vec![(0, 0), (0x126, 100), (269, 11), (270, 99), (271, 12), (272, 13)],
+        }));
+        for (own, cancellation) in [(player, 0x66), (25988, 0x6c), (player, 0x75), (25988, 0x89)] {
+            world.own = own;
+            let source = ao_net::msg::Identity { kind: CHAR_KIND, instance: player };
+            let target = ao_net::msg::Identity { kind: CHAR_KIND, instance: leet };
+            let cast = ao_net::n3::dynel::CastNanoSpell { spell: -1, target, source, flag: true, rest: vec![] };
+            world.nano_casts.push((player, cast.clone()));
+            let matrix = glam::Mat4::from_translation(glam::Vec3::from(scene_pos(world.chars[&player].pose.pos))).to_cols_array_2d();
+            world.nano_visual_frame(0.0, false, |_| Some(matrix), |_, _| None);
+            let start = world.take_nano_sounds();
+            assert_eq!(start.iter().map(|s| (s.0, s.2, s.3, s.4)).collect::<Vec<_>>(), [(11, 0.2, 0.6, 269), (11, 0.2, 1.0, 269)]);
+            if own != player {
+                assert_eq!(world.chars[&player].special, Special::Cast(203));
+                assert!(world.chars[&player].actions.iter().all(|node| node.key.is_none()), "nano charge is not a combat list-history node");
+            }
+            world.take_nano_animations();
+            world.nano_visual_frame(1.1, false, |_| Some(matrix), |_, _| None);
+            world.take_nano_animations();
+            world.nano_visual_frame(0.0, false, |_| Some(matrix), |_, _| None);
+            assert_eq!(world.take_nano_sounds().iter().map(|s| (s.0, s.2, s.4)).collect::<Vec<_>>(), [(12, 0.2, 271)]);
+            world.casting[0].release_seen = true;
+            world.chars.get_mut(&player).unwrap().special = Special::None;
+            world.nano_visual_frame(0.0, true, |_| Some(matrix), |_, _| None);
+            let finish = world.take_nano_sounds();
+            assert_eq!(finish.len(), 1);
+            assert_eq!((finish[0].0, finish[0].2, finish[0].4, finish[0].5), (13, 0.0, 272, leet));
+            assert_eq!(finish[0].1, scene_pos(world.chars[&leet].pose.pos));
+            world.nano_casts.push((player, cast));
+            world.nano_visual_frame(0.0, false, |_| Some(matrix), |_, _| None);
+            world.on_message(&Message {
+                header: ao_net::n3::N3Header { msg_type: ao_net::n3::world::CHARACTER_ACTION, target: source, flag: 0 },
+                sender: player as u32,
+                body: N3::World(World::CharacterAction(ao_net::n3::world::CharacterAction {
+                    action: cancellation, param: 0,
+                    identity_a: source, identity_b: if cancellation == 0x75 { ao_net::msg::Identity { kind: 0, instance: -1 } } else { ao_net::msg::Identity { kind: -1, instance: 7 } }, text: String::new(),
+                })),
+            });
+            if cancellation == 0x89 {
+                assert!(world.take_nano_sounds().iter().all(|sound| sound.4 == 269));
+                assert!(!world.casting.is_empty(), "queue clear does not cancel the playing controller");
+                world.nano_visual_frame(0.0, false, |_| Some(matrix), |_, _| None);
+                world.take_nano_animations();
+                world.nano_visual_frame(0.0, false, |_| Some(matrix), |_, _| None);
+                assert_eq!(world.take_nano_sounds().iter().map(|sound| sound.4).collect::<Vec<_>>(), [271]);
+                world.casting[0].release_seen = true;
+                world.chars.get_mut(&player).unwrap().special = Special::None;
+                world.nano_visual_frame(0.0, true, |_| Some(matrix), |_, _| None);
+                assert!(world.take_nano_sounds().is_empty(), "queue clear has no successful finish");
+            } else {
+                assert!(world.take_nano_sounds().is_empty(), "cancel removes undelivered refreshes");
+                assert!(world.pending_clips.iter().all(|clip| clip.3 != player || !matches!(clip.2, 201 | 203)), "cancel removes pending nano clip loads");
+                assert!(world.replay.iter().all(|clip| clip.0 != player || !matches!(clip.1, 201 | 203)), "cancel cannot replay a late nano clip");
+                world.nano_visual_frame(2.0, true, |_| Some(matrix), |_, _| None);
+                assert!(world.take_nano_sounds().is_empty(), "cancel never emits finish or release");
+            }
+            assert!(world.casting.is_empty());
+        }
+    }
+
+    #[test]
+    fn body_boost_uses_authored_sound_ids_without_270_substitution() {
+        let Some((mut zone, player, leet)) = fight_zone() else { return };
+        let world = &mut zone.world;
+        world.nano_casts.clear();
+        world.casting.clear();
+        world.effects = None;
+        world.nano_effect_categories = 0;
+        world.own = player;
+        let source = ao_net::msg::Identity { kind: CHAR_KIND, instance: player };
+        let target = ao_net::msg::Identity { kind: CHAR_KIND, instance: leet };
+        world.nano_casts.push((player, ao_net::n3::dynel::CastNanoSpell { spell: 29091, target, source, flag: true, rest: vec![] }));
+        world.nano_visual_frame(0.0, false, |_| None, |_, _| None);
+        let template = &world.nano_templates[&29091];
+        assert_eq!(template.stat(269).map(|v| v as u32), Some(0x35a9ce7d));
+        assert_eq!(template.stat(270).map(|v| v as u32), Some(0x94bb7805));
+        assert_eq!(template.stat(271), None);
+        assert_eq!(template.stat(272).map(|v| v as u32), Some(0x80d5111a));
+        assert!(world.take_nano_sounds().iter().all(|sound| sound.0 == 0x35a9ce7d && sound.4 == 269));
+        world.take_nano_animations();
+        world.nano_visual_frame(100.0, false, |_| None, |_, _| None);
+        world.take_nano_animations();
+        world.nano_visual_frame(0.0, false, |_| None, |_, _| None);
+        assert!(world.take_nano_sounds().is_empty(), "missing271 is silent, not stat270");
+        world.nano_visual_frame(0.0, true, |_| None, |_, _| None);
+        let sounds = world.take_nano_sounds();
+        assert_eq!(sounds.len(), 1);
+        assert_eq!((sounds[0].0, sounds[0].2, sounds[0].4, sounds[0].5), (0x80d5111a, 0.0, 272, leet));
+    }
+
+    #[test]
+    fn captured_npc_shadow_touch_traverses_silent_template_sound_path() {
+        let Some((mut zone, _, _)) = fight_zone() else { return };
+        let casts: Vec<_> = frames(include_str!("../../../../docs/captures/zone_ithaca.rec"))
+            .iter().filter_map(|frame| ao_net::n3::decode(frame).ok())
+            .filter(|message| matches!(&message.body, N3::Dynel(Dynel::CastNanoSpell(cast)) if cast.spell == 163449)).collect();
+        assert_eq!(casts.len(), 3);
+        zone.world.nano_casts.clear();
+        zone.world.casting.clear();
+        zone.world.nano_effect_categories = 0;
+        zone.world.effects = None;
+        for message in casts {
+            let who = message.header.target.instance;
+            zone.world.own = who;
+            zone.world.on_message(&message);
+            zone.world.nano_visual_frame(0.0, false, |_| None, |_, _| None);
+            assert_eq!(zone.world.casting.len(), 1, "actual received cast enters stage path");
+            assert!(zone.world.casting[0].instant);
+            let template = &zone.world.nano_templates[&163449];
+            assert!((269..=272).all(|stat| template.stat(stat).is_none()));
+            zone.world.take_nano_animations();
+            zone.world.nano_visual_frame(0.0, false, |_| None, |_, _| None);
+            zone.world.nano_visual_frame(0.0, true, |_| None, |_, _| None);
+            assert!(zone.world.casting.is_empty(), "actual release completion ends the cast");
+            assert!(zone.world.take_nano_sounds().is_empty(), "no fabricated sound for absent stats");
+        }
+    }
+
+    /// Actual received casts, with an explicit simulated release completion; never real-window evidence.
+    #[test]
+    #[ignore = "installed retail assets and offscreen Metal capture replay"]
+    fn captured_shadow_touch_offscreen_effect_frames() {
+        let (mut zone, _, _) = fight_zone().expect("installed capture fixture");
+        let out = std::path::PathBuf::from(std::env::var_os("AOMAC_EFFECT_FRAMES").expect("AOMAC_EFFECT_FRAMES output directory"));
+        std::fs::create_dir_all(&out).unwrap();
+        let casts: Vec<_> = frames(include_str!("../../../../docs/captures/zone_ithaca.rec"))
+            .iter().filter_map(|frame| ao_net::n3::decode(frame).ok())
+            .filter(|message| matches!(&message.body, N3::Dynel(Dynel::CastNanoSpell(cast)) if cast.spell == 163449)).collect();
+        assert_eq!(casts.len(), 3);
+        zone.world.nano_casts.clear();
+        zone.world.casting.clear();
+        zone.world.nano_effect_categories = 4;
+        for (index, message) in casts.into_iter().enumerate() {
+            let N3::Dynel(Dynel::CastNanoSpell(cast)) = &message.body else { unreachable!() };
+            let target = cast.target.instance;
+            let mut host = Host::headless();
+            let point = glam::Vec3::from_array(scene_pos(zone.world.chars[&target].pose.pos));
+            let eye = point + glam::Vec3::new(0.0, 1.0, 4.0);
+            let look = point + glam::Vec3::Y;
+            host.camera = ao_render::Camera::look_at(ao_render::Vec3::from_array(eye.to_array()), ao_render::Vec3::from_array(look.to_array()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while zone.world.effect_anchor(target, 0, 0).is_none() {
+                zone.world.update_with_collision(0.0, eye.to_array(), [0.0, 0.0, -1.0], &mut host, None, |_| None);
+                assert!(std::time::Instant::now() < deadline, "captured target connector unavailable");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            zone.world.effects = Some(crate::play::combat::effects::Renderer::open(&ao_gui::client_dir()).unwrap());
+            zone.world.own = message.header.target.instance;
+            zone.world.on_message(&message);
+            zone.world.nano_visual_frame(0.0, false, |_| None, |_, _| None);
+            let template = &zone.world.nano_templates[&163449];
+            assert!((269..=272).all(|stat| template.stat(stat).is_none()));
+            assert!(template.stat(413).is_none());
+            assert!(zone.world.casting[0].finish.contains(&2710));
+            zone.world.take_nano_animations();
+            zone.world.nano_visual_frame(0.0, true, |_| None, |_, _| None);
+            assert!(zone.world.take_nano_sounds().is_empty());
+            assert!(zone.world.casting.is_empty(), "captured finish connector must spawn without a pending cast");
+            host.actors.clear();
+            host.actor_models.clear();
+            let mut models = Vec::new();
+            let mut visible = false;
+            for frame in 0..30 {
+                host.actors.clear();
+                zone.world.effects.as_mut().unwrap().frame(1.0 / 60.0, &mut host, None);
+                models.append(&mut host.actor_models);
+                visible |= !host.actors.is_empty();
+                if [0, 2, 5, 11, 23, 29].contains(&frame) {
+                    let path = out.join(format!("shadow-touch-{index}-{frame:04}.png"));
+                    ao_render::render_to_png_actors(&ao_scene::Scene::default(), &models, host.actors.clone(), eye.to_array(), look.to_array(), 640, 480, &path, (frame + 1) as f32 / 60.0).unwrap();
+                    eprintln!("captured ShadowTouch caster={} target={target} effect=2710 frame={frame} dt=1/60 actors={} template_sounds=0 persistent_stat413=absent path={}", message.header.target.instance, host.actors.len(), path.display());
+                }
+            }
+            assert!(visible, "actual captured finish effect must produce renderer actors");
+        }
+    }
+
+    #[test]
     fn special_notes_retain_only_their_attacker_and_slot_flags() {
         use crate::play::combat::{glue::note_reaction, notes::{HitCtx, id}};
         let mut world = Dynels::default();
         world.hit_seen(1, HitCtx { victim: 2, slot: 6, damage: 20, flags: 4 });
         assert!(world.once_rate.is_empty(), "message arrival must not react");
-        note_reaction(&mut world, None, 99, 1, id::SWISH_PUNCH);
+        note_reaction(&mut world, None, 99, 1, id::SWISH_PUNCH, 6);
         assert!(world.once_rate.is_empty(), "only an attack note reacts");
-        note_reaction(&mut world, None, 99, 1, id::ATTACK);
+        note_reaction(&mut world, None, 99, 1, id::ATTACK, 6);
         assert_eq!(world.once_rate[&2].1, 1.0);
         world.once_rate.clear();
         world.special_hit_seen(1, 3, 6);
-        assert_eq!(world.note_ctx(1).map(|h| (h.victim, h.damage, h.flags)), Some((3, 20, 4)));
+        assert_eq!(world.note_ctx(1, 6).map(|h| (h.victim, h.damage, h.flags)), Some((3, 20, 4)));
         world.note_target(1, 4);
-        note_reaction(&mut world, None, 99, 1, id::ATTACK_EFFECT_1);
+        note_reaction(&mut world, None, 99, 1, id::ATTACK_EFFECT_1, 6);
         assert_eq!(world.once_rate[&4].1, 1.0, "special reacts on its actual target");
         world.once_rate.clear();
         world.hit_seen(1, HitCtx { victim: 2, slot: 8, damage: 0, flags: 1 });
         world.special_hit_seen(1, 3, 8);
-        note_reaction(&mut world, None, 99, 1, id::ATTACK);
+        note_reaction(&mut world, None, 99, 1, id::ATTACK, 8);
         assert!(world.once_rate.is_empty(), "special after miss has no impact");
         world.special_hit_seen(1, 3, 6);
-        assert_eq!(world.note_ctx(1).map(|h| (h.damage, h.flags)), Some((20, 4)), "other slot's miss is isolated");
+        assert_eq!(world.note_ctx(1, 6).map(|h| (h.damage, h.flags)), Some((20, 4)), "other slot's miss is isolated");
         for (who, slot) in [(1, 7), (5, 6)] {
             world.special_hit_seen(who, 3, slot);
-            assert_eq!(world.note_ctx(who).map(|h| (h.damage, h.flags)), Some((0, 0)));
-            note_reaction(&mut world, None, 99, who, id::ATTACK);
+            assert_eq!(world.note_ctx(who, slot).map(|h| (h.damage, h.flags)), Some((0, 0)));
+            note_reaction(&mut world, None, 99, who, id::ATTACK, slot);
             assert!(world.once_rate.is_empty(), "constructors initialize both fields to zero");
         }
     }
@@ -3318,27 +3878,27 @@ mod variant_tests {
         z.world.arms.list(att, false, &[(43712, 100), (43713, 142)]);
         z.world.hit_seen(att, HitCtx { victim: att, slot: 0, damage: 20, flags: 4 });
         z.world.special_hit_seen(att, att, 0);
-        z.world.note_sounds(att, 0xb);
+        z.world.note_sounds(att, 0xb, 0);
         assert!(!z.world.take_sounds().is_empty(), "special retains slot swing sound");
         assert!(!z.world.later.is_empty(), "special after hit retains delayed impact");
         assert!(z.world.later.iter().all(|(_, s)| s.size == crate::play::combat::notes::impact_size(20)));
         z.world.later.clear();
         z.world.hit_seen(att, HitCtx { victim: att, slot: 0, damage: 0, flags: 1 });
         z.world.special_hit_seen(att, att, 0);
-        z.world.note_sounds(att, 0xb);
+        z.world.note_sounds(att, 0xb, 0);
         assert!(z.world.take_sounds().is_empty(), "dummy slot after miss has no gated sound");
         assert!(z.world.later.is_empty());
         z.world.special_hit_seen(att, att, 8);
-        z.world.note_sounds(att, 0xb);
+        z.world.note_sounds(att, 0xb, 8);
         assert!(z.world.later.is_empty(), "untouched slot has no impact");
         z.world.arms.wield(att, 900, 6, Some(121567), &[]);
         z.world.special_hit_seen(att, att, 6);
-        z.world.note_sounds(att, 0xb);
+        z.world.note_sounds(att, 0xb, 6);
         assert!(!z.world.take_sounds().is_empty(), "constructor-zero wielded slot still plays its ungated weapon sound");
         assert!(z.world.later.is_empty());
         z.world.hit_seen(att, HitCtx { victim: att, slot: 6, damage: 0, flags: 1 });
         z.world.special_hit_seen(att, att, 6);
-        z.world.note_sounds(att, 0xb);
+        z.world.note_sounds(att, 0xb, 6);
         assert!(!z.world.take_sounds().is_empty(), "special after miss still plays wielded swing sound");
         assert!(z.world.later.is_empty());
     }
@@ -3364,7 +3924,7 @@ mod variant_tests {
         eprintln!("Beach Leet FabricType {fabric}");
         // a hit on the leet: the swing sound now, the impact later
         z.world.hit_seen(att, HitCtx { victim: leet, slot: 0, damage: 20, flags: 3 });
-        z.world.note_sounds(att, 0xb);
+        z.world.note_sounds(att, 0xb, 0);
         let now = z.world.take_sounds();
         assert_eq!(now, [GameSound::at(0xc1080179, apos)], "the weapon's list 0xb at the attacker");
         assert!(z.world.take_sounds().is_empty());
@@ -3384,7 +3944,7 @@ mod variant_tests {
         }
         // a hit that does no damage / a hit kind <= 1 plays the swing only (`FUN_1009b4ac` returns before the impact)
         z.world.hit_seen(att, HitCtx { victim: leet, slot: 0, damage: 20, flags: 1 });
-        z.world.note_sounds(att, 0xb);
+        z.world.note_sounds(att, 0xb, 0);
         assert!(z.world.take_sounds().is_empty() || z.world.take_sounds().is_empty(), "hit kind 1: the dummy weapon's b4ac part is skipped");
         z.world.update_with_collision(1.0, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
         assert!(z.world.take_sounds().is_empty());
@@ -3393,7 +3953,7 @@ mod variant_tests {
             let Look::Char(l) = &z.world.chars[&victim].look else { unreachable!() };
             let (breed, sex) = (l.breed, l.sex);
             z.world.hit_seen(att, HitCtx { victim, slot: 0, damage: 4, flags: 4 });
-            z.world.note_sounds(att, 0xb);
+            z.world.note_sounds(att, 0xb, 0);
             z.world.take_sounds();
             let vpos = scene_pos(z.world.chars[&victim].pose.pos);
             z.world.update_with_collision(0.5, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
@@ -3411,9 +3971,9 @@ mod variant_tests {
     fn swish_and_attack_start_notes() {
         let Some((mut z, player, leet)) = fight_zone() else { return };
         let (pp, lp) = (scene_pos(z.world.chars[&player].pose.pos), scene_pos(z.world.chars[&leet].pose.pos));
-        z.world.note_sounds(player, 0x73);
-        z.world.note_sounds(player, 0x75);
-        z.world.note_sounds(player, 0x77);
+        z.world.note_sounds(player, 0x73, -1);
+        z.world.note_sounds(player, 0x75, -1);
+        z.world.note_sounds(player, 0x77, -1);
         let sid = ao_audio::sbf::sound_id;
         assert_eq!(z.world.take_sounds(), [GameSound::at(sid("SM_Sandy_Swish_punch"), pp), GameSound::at(sid("SM_Sandy_Swish_tail"), pp)]);
         let rec = {
@@ -3422,7 +3982,7 @@ mod variant_tests {
             built.sounds.clone()
         };
         for note in [0x73u32, 0x77, 0x78] {
-            z.world.note_sounds(leet, note);
+            z.world.note_sounds(leet, note, -1);
             let got = z.world.take_sounds();
             let want = rec.iter().find(|s| s.0 == note).map_or(&[][..], |s| &s.1[..]);
             assert_eq!(got.len(), usize::from(!want.is_empty()), "note {note:#x}: {want:?}");
@@ -3430,22 +3990,14 @@ mod variant_tests {
         }
     }
 
-    /// The swing clip of a creature fires its notes while it plays (`FUN_1003c036`): marked, the Beach Leet's attack clip reports its `attack` /
-    /// `attack_start` / `swish` notes once each; an unmarked clip (an emote) reports none.
+    /// The Beach Leet's authored attack notes fire once per independent holder node.
     #[test]
-    fn a_marked_swing_clip_reports_its_notes() {
+    fn a_holder_swing_clip_reports_its_notes() {
         let Some((mut z, _, leet)) = fight_zone() else { return };
         let mut host = Host::headless();
         let (eye, fwd) = (scene_pos(z.own().unwrap().pos), [0.0, 0.0, -1.0]);
         z.world.take_notes();
-        z.world.attack(leet);
-        for _ in 0..60 {
-            z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);
-            host.actors.clear();
-        }
-        assert!(z.world.take_notes().is_empty(), "unmarked clip");
-        z.world.swing_mark(leet);
-        z.world.attack(leet);
+        z.world.play_swing(leet, None, canim::list::ATTACK);
         let mut notes = vec![];
         for _ in 0..80 {
             z.world.update_with_collision(0.05, eye, fwd, &mut host, None, |_| None);

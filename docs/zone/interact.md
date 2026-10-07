@@ -301,6 +301,154 @@ whose merged pick list starts with that identity, then sends the ordinary mouse 
 Object under the pointer when a carried bag item is released (`InputConfig_t+0xb0`): ground (`0x9c47`) -> `N3Msg_DropItem`; a character (50000) -> `GenericCmd_t` cmd 0x20; any other object -> cmd 5, both with
 `UseItemOnItemActionData_t{flag 0, actor = own, item, target}`. Ours: `Play::interact_mouse` stores the pick, `hud_stats/item_ui.rs` `Action::UseOn`. [LIVE] works (§12.1).
 
+### 8.8 Authored item-use gestures and sounds
+
+`combat/use_actions.rs` exposes `confirmed(Message)`, `requested(Message)` (only after the real local use gates),
+`gesture` and `sound_key`, plus `Uses` for the runtime queue. There is no category/name heuristic:
+the existing RDB helpers decode the authored maps and the existing CRT `pick_variant` selects variants.
+`Interact::observe_use_request` receives actual outgoing frames after the existing use gates,
+`advance_use_actions(dt, zone)` advances timers, and `take_use_actions()` returns actor/animation/sound
+descriptors for the shared own/remote playback path. `Interact::on_frame` observes confirmations and aborts;
+closing the zone clears all pending requests, sounds and timers.
+The hotbar item route flushes `HudStats`'s outbox immediately in `Hud::activate_item`, matching the
+mouse/event routes; it no longer waits for an unrelated inventory mouse event to send the use.
+`hotbar_item_activation_flushes_without_a_mouse_event` covers the carried slot, one-shot drain and empty-slot gate.
+Variant picking uses `Dynels::pick_variant` and the existing shared character CRT stream, also used by
+equipment and character notes; `Uses` owns no separate seed or picker. Gamecode `1011bb4a` seeds from
+time on playfield load; DisplaySystem effects can reseed the CRT, so exact effect-driven retail reseeding
+remains outside this item's selection implementation.
+
+
+**Fresh Gamecode trace (2026-10-07):** `1007c8b7` validates the own state-0 request with `1007c7fd == 2`,
+then calls `1003b066`. `1007c76a` state 1 calls the same gesture routine only when `1007c749(actor)` says
+the actor is foreign; the own acknowledgement must not replay its request gesture. State 2 calls
+`1003b21d`, which emits own UI refresh signals, not another gesture. No sequence-deduplication branch was
+found in these handlers; the helper does not invent one. The decoded action-data actor is retained for
+remote replay; an inventory identity belongs to that actor, never implicitly to our bag.
+
+**Important correction to the earlier decompile interpretation:** `10081e74` is a method on the **item**,
+with `(actor, command)` as stack arguments. ASM `1003b0b2 MOV ECX,EAX` passes the resolved SimpleItem;
+`10081e7f LEA ESI,[ECX+0x78]` selects its authored animation map, then `10081e85` reads the command key.
+Missing/zero values and values above 2000 fall back to `0x6d` (wield); the actor's stat `0x1ae == 0xe`
+overrides it with `0x9b` (wield-crawl). This is **not** a character action-key fallback. The selected
+AbstractAnimID subsequently resolves through the character/NPC clip map or the ordinary player-set name rule.
+`1003b066` resolves the used identity to a SimpleItem before starting a gesture; an unresolved identity must
+not produce a fallback. `100267e0` (UseItemOnItem) also starts item key 5 after `1004a70d` succeeds.
+`100268af` (UseItemOnCharacter) has no explicit sender-side gesture call.
+
+Authored RDB 1000020 evidence from the installed client:
+
+| Category | Actual template/map evidence | Gesture selection |
+|---|---|---|
+| kit | First-Aid Kit 23314 has no `{0xe,0x13}`; Startup Coil of Health 215423 has key 3 `0x97`; Weak Coil 218351 has `0x96` | item map, else retail `0x6d` |
+| lab | Treatment Laboratory 25812 has no map; Standard Emergency Treatment Laboratory 154327 has key 3 `0x29` | absent-map fallback or authored social-puke |
+| eat | Hacked Pill 88395, Blister Pack 93708: key 3 `0x12` | authored social-eat |
+| upload | Nano Crystal 26522/27280 and Shadow Crystal 220409 have no map | absent-map fallback; upload success remains server-driven |
+| terminal | terminal templates have no use animation map | resolved runtime item gets retail fallback; do not guess a keypad clip |
+| loot | corpse has no template use map; chests 23163 have sound key 3 | resolved corpse item gets retail fallback; taking inventory entries adds no gesture |
+
+The installed-data regression asserts authored eat/coil/emergency-lab ids and absent kit/lab/crystal maps.
+The capture regression replays `zone_use_object_ithaca.rec`, then replays its confirmations with a different
+action-data actor while retaining the original frame target. That replay is synthetic remote coverage,
+**not** evidence that Ithaca relayed a foreign actor in this capture.
+
+Sounds are runtime callback-specific, not simply animation-command aliases. `10080f1c` plays SimpleItem
+key 3 **only for the own actor**; stat `0x1a` zero (but not -1) selects key `0x32` instead.
+`1008983a` plays use-on-item key 5 at the actor for both own and foreign actors, except when source equals
+target. `1008035a` use-on-character has no sound-map call. Missing lists mean silence. The positional
+sound request uses the existing `GameSound`/audio path.
+The depleted key `0x32` branch passes zero XYZ to PlayGameSound; its playback descriptor sets
+`sound_at_origin` instead of substituting the actor's position.
+
+Authored visual callbacks use the same confirmed lifetime, not an outgoing cosmetic trigger.
+`10002175(event)` is a non-null/nonempty event-list check; `100020fd(event)` returns that list.
+`10080f1c` takes event 0 after the depleted-charge branch (zero charges returns before it).
+`Uses` reads that authored list with the existing item-template spell parser and queues its `0xcf26`
+visual spells in `Playback.visuals`, even when no sound map exists. The descriptor contains an owned
+`ApplySpells` application for `Dynels::apply_nano_visuals`, which takes it by value.
+Template 116628, **Startup Treatment Laboratory**, has no animation/sound map but event 0 contains
+`0xcf26`, effect 13600, duration stat `0x31 = 100` and RGBA 255. Its other event-0 functions
+(`0xcf0a` health/nano modifiers and `0xcf29` modifier) are not duplicated as local gameplay changes.
+`starter_laboratory_confirmed_callback_queues_authored_stars_for_own_actor` uses the installed authored
+record to cover confirmed own-actor playback, absent mapped sound and effect selection.
+
+The cmd-3 foreign-actor branch at `10080fbd -> 10081021` skips only the own sound:
+event 0's nonempty check (`10081047..10081051`) and callback (`100810a5`) remain outside it.
+The remote laboratory regression resolves a world item's real template and retains the action-data
+actor despite a frame addressed to the own character. Zero charges returns before that callback.
+
+For cmd 5 (`1008983a`, source != target) and cmd `0x20` (`1008035a`), the authored callback is event 4.
+The callback's `Beholder` is the source item, but this does **not** make every spell item-targeted:
+SimpleItem's primary table `10163b4c` has `+0x20 = 10003d7b` (sets context identity at `+0x3c/+0x40`)
+and `+0x30 = 100026d0`. The callbacks set that context to the actor before applying the list.
+`Target=2` uses `10001ec4` to resolve that context and therefore acts on the actor; `Target=3` uses the
+supplied Beholder directly (the actor for cmd 3, the source item for cmd 5/`0x20`). The ordinary
+self/default branch uses the source item. `Uses` preserves those distinct receivers in separate
+applications; it does not reinterpret an inventory slot as a visible actor. Owner/fighting/pet
+selectors `0xe`/`0x17` require runtime relations not exposed by this module and are not guessed.
+
+Read-only authored evidence after the CF34 format correction: Corrupted Crystal variants
+275468–275471 have event-4 `0xcf26`, `Target=3`, effect 73001, duration 100; Empty Power Core Slot
+287981 has event-4 `Target=1`, effect 72336; Alien Distress Beacon 288073 has event-4 `Target=1`,
+effect 71214. `crystal_use_on_item_keeps_authored_source_item_receiver` covers an actual authored
+crystal callback and source-equals-target rejection. Event 5 is not substituted for event 4.
+The candidate census fully walked 585 CF26-bearing records; 87 further records had unsupported
+spell framing and 61 had unsupported item elements, so this is not a claim of a full-RDB census.
+
+`Dynels` preserves the complete receiver identity through the visual queue, handle ownership,
+undo, connector refresh and dynel deletion. The old character-only queue guard discarded
+source-item applications before rendering. Located item effects now use the built prop's
+world frame for attractor 0: GC `10105917` returns success without a connector lookup for
+that attractor. It does not substitute the actor, a character bone, or the item origin for
+static-mesh connector 3001. Installed tweak evidence is effect 71214 class 3020, flags 515,
+attractor 0; Stars 13600 is class 2004, flags 5, attractor 1000. Both use their existing real
+renderer classes; `authored_beacon_and_laboratory_spawn_on_their_real_receivers` exercises
+spawn and undo for these receivers. The separate queue regression guards kind collisions.
+GC `100a5083` tries unlocated creation, then located creation on the receiver, then a
+hit-location overload only when the returned handle is zero. Beacon's located constructor
+`10112f9c` marks an unsuccessful `InitDynelTemplate` as terminating (`this+0x14 = 1`)
+but returns the allocated control, so `100d1b1c` still obtains a nonzero handle:
+an inventory SimpleItem without an `n3VisualDynel` does not fall back to the actor.
+The no-anchor path intentionally emits no visible effect instead of inventing that fallback.
+The located chain is `100d1b1c → 100d0102 → 10112f9c → 100d2a03 → 1010668c`:
+the last function re-resolves the receiver identity and requires an `n3VisualDynel`
+before locating even attractor 0. Crystal effect 73001's distinct class 3031 constructor
+`101143bb` likewise returns the allocated control after failed initialization, so its
+missing inventory visual does not reach an owner fallback either.
+General 3001 mesh-connector/hit-location allocation is outside this located-class dispatch;
+no guessed connector origin is introduced.
+
+Animation and sound maps are decoded independently from the raw record using the existing multimap
+helpers. An unrelated event parse failure cannot replace a sound map with invented silence.
+If neither a valid template's constructor defaults nor explicit runtime stats establish attack/
+recharge timing, no callback is queued with a fabricated zero delay; the authored gesture remains
+independent of that unavailable timing.
+`parse_item_template` is already a strict leading-stat reader, not a full event parser: it stops at
+the first non-name element after the stat prefix. Therefore unsupported later event/skill elements
+do not discard known delay/charge stats. Its sound vector comes from the raw multimap helper;
+`Uses` moves that vector when the prefix is valid and reads the raw map independently otherwise.
+
+**Timing:** `1003b947` executes cmd 3 immediately when item stats `0xd2 + 0x126 < 31`
+or the identity kind is `0xc749`; otherwise it registers the item action timer (`1003d7ce`, `1003d6b1`).
+`1003d305` subtracts `dt * _DAT10158670`, whose double words are `00000000 40590000` = 100.0;
+the attack stage starts at stat `0x126` and recharge is stat `0xd2`. `Uses` delays mapped callback sounds
+by that attack stage, using the same immediate-use exception, and cancels pending sounds on state 2.
+`100877a6` invokes the runtime callback only after slot `+0x98` returns 2; it also remembers the item identity
+at actor controller `+0x190/+0x194`. Fresh `1003b3a2` trace rejects a dead actor, stat `0x296 != 0`
+(vehicle), current controller state 5 (program activation), missing source/target runtime dynels and an
+unparented cmd-3 object that fails `10059ca0`'s range gate; inventory kinds 101..249 delegate to `10049850`.
+The runtime queue rechecks known source availability, death and vehicle state at callback completion.
+**[UNRESOLVED]** actor controller state 5, the exact `10059ca0` parent/range rule and runtime item slot `+0x98`
+skill criteria are not exposed by the existing item/zone helpers; server confirmation is required but does not
+replace those local post-timer gates. A local item change can still change retail's callback decision.
+Remote inventory items require the server-provided actor-relative item/template; absent data must not borrow
+our similarly numbered inventory slot. No foreign inventory template is present in the object-use capture.
+`10049850` excludes bank/corpse inventories and requires a real carried item; cmd 3 invokes that item's
+virtual `+0x50`, cmd 5 invokes `+0x54` (with a weapon-target special case), and cmd `0x20` resolves the
+character target then calls `1008177c`. Existing item-requirement helpers format criteria but do not expose
+these runtime skill checks as a boolean evaluator.
+
+
 ## 9. The container (loot) window of corpses
 Code: `interact_loot.rs`, `interact_use.rs::{watch_objects, use_out}`. Test: `interact_use::tests::corpse_loot_window_opens_with_the_flag_and_a_double_click_takes_an_item`, `interact_loot::tests`.
 

@@ -78,15 +78,10 @@ pub(super) struct Player {
     game: Vec<Cmd>,
     /// World clicks `Controls` accepted (movement <= 0.02), for the interaction layer (`interact_play.rs`).
     clicks: Vec<ao_gui::MouseButton>,
-    /// A one-shot clip over the movement pose (emote, attack swing, death): the role and whether it holds its last frame.
+    /// A one-shot body pose (emote, cast, death): the role and whether it holds its last frame.
     transient: Option<(Role, bool)>,
     cast_loop: Option<bool>,
     cast_restart: bool,
-    /// `ItemDelay` of the weapon of the swing in `transient`.
-    swing_delay: Option<i32>,
-    /// `transient` is a weapon swing (its notes start the attack sounds, `combat::notes`).
-    swinging: bool,
-    swing_key: Option<u16>,
     /// Playback rate factor of the hit reaction in `transient`.
     clip_scale: Option<f32>,
     /// The pose the movement role showed last frame (`None` before the first update).
@@ -161,9 +156,6 @@ impl Player {
                 transient: None,
                 cast_loop: None,
                 cast_restart: false,
-                swing_delay: None,
-                swinging: false,
-                swing_key: None,
                 clip_scale: None,
                 pose: None,
                 fighting: false,
@@ -230,13 +222,33 @@ impl Player {
 
     /// Plays `role` once over the movement pose (`hold`: keep the last frame, for the death clip).
     pub fn play(&mut self, role: Role, hold: bool) {
+        self.avatar.set_body_priority(if hold { -3 } else { 0 });
         self.transient = Some((role, hold));
         self.cast_loop = None;
         self.cast_restart = false;
-        self.swing_delay = None;
-        self.swinging = false;
-        self.swing_key = None;
         self.clip_scale = None;
+    }
+    /// Plays an own use/equipment abstract id without replacing the movement pose.
+    pub fn play_action(&mut self, id: u16, layer: Option<u8>, priority: i32) -> bool {
+        match self.avatar.play_action(&self.store, id, layer, priority) {
+            Ok(started) => {
+                let body = layer.map_or_else(
+                    || anim_name(id).is_some_and(|(_, layer)| layer == super::combat::anim::Layer::Body),
+                    |layer| layer == 0,
+                );
+                if started && body {
+                    self.stand();
+                    self.clip_scale = None;
+                    self.avatar.set_clip_scale(None);
+                    self.avatar.set_cast_loop(false);
+                }
+                started
+            }
+            Err(e) => {
+                eprintln!("avatar action {id}: {e:#}");
+                false
+            }
+        }
     }
     pub fn cast_animation(&mut self, animation: Option<(Role, bool)>) {
         match animation {
@@ -263,31 +275,21 @@ impl Player {
         }
     }
 
-    /// Plays the swing `role` once (`FUN_1006a239`), sped up for the weapon's `ItemDelay` (centiseconds) when there is a weapon; its animation notes
-    /// start the attack sounds ([`Player::take_notes`]).
-    pub fn swing(&mut self, role: Role, item_delay: Option<i32>) {
-        self.play(role, false);
-        self.swing_delay = item_delay;
-        self.swinging = true;
-    }
 
     /// Retail suppresses a list key already playing, not a different key resolving to the same clip.
-    pub fn swing_list(&mut self, role: Role, item_delay: Option<i32>, key: u16) {
-        if self.transient.is_some() && !self.avatar.finished() && self.swing_key == Some(key) {
-            return;
+    pub fn swing_list(&mut self, role: Role, item_delay: Option<i32>, key: u16, slot: i32) {
+        if let Err(e) = self.avatar.play_swing(&self.store, role, item_delay, key, slot) {
+            eprintln!("avatar swing: {e:#}");
         }
-        self.swing(role, item_delay);
-        self.swing_key = Some(key);
-        self.avatar.restart_clip();
     }
 
     #[cfg(test)]
-    pub(super) fn transient_role(&self) -> Option<&Role> {
-        self.transient.as_ref().map(|(role, _)| role)
+    pub(super) fn swing_role(&self) -> Option<&Role> {
+        self.avatar.swing_role()
     }
 
     /// The notes the own swing clip reached since the last call (`combat::notes` ids).
-    pub fn take_notes(&mut self) -> Vec<u32> {
+    pub fn take_notes(&mut self) -> Vec<super::combat::notes::FiredNote> {
         self.avatar.take_notes()
     }
 
@@ -338,6 +340,7 @@ impl Player {
 
     /// Ends a held clip (resurrection).
     pub fn stand(&mut self) {
+        self.avatar.set_body_priority(0);
         self.transient = None;
         self.cast_loop = None;
         self.cast_restart = false;
@@ -502,8 +505,6 @@ impl Player {
             None => AvatarPose::still(role),
         };
         self.avatar.set_stance(zone.world.wielded_set(self.char_id as i32));
-        self.avatar.set_swing_delay(self.transient.as_ref().and(self.swing_delay));
-        self.avatar.set_swinging(self.transient.is_some() && self.swinging);
         self.avatar.set_clip_scale(self.transient.as_ref().and(self.clip_scale));
         self.avatar.set_cast_loop(self.cast_loop == Some(true));
         if std::mem::take(&mut self.cast_restart) { self.avatar.restart_cast_clip(); }
@@ -541,6 +542,18 @@ impl Player {
             host.actors.push(frame);
         }
         out
+    }
+
+    /// Native CAT-bound effects use the same posed geometry as the actual avatar submission.
+    pub fn prepare_effect_source(&self, world: &mut super::dynels::Dynels, host: &Host) {
+        let identity = (super::dynels::CHAR_KIND as u32, self.char_id);
+        if !world.needs_effect_source_mesh(identity) { return; }
+        if let Some(actor) = host.actors.iter().find(|actor| actor.id == self.char_id && actor.model == avatar::MODEL_KEY) {
+            world.prepare_effect_source_mesh(identity, self.avatar.model(), actor);
+        } else {
+            // First-person hides the actor, not the CAT pose needed by its native effects.
+            world.prepare_effect_source_mesh(identity, self.avatar.model(), &self.avatar.frame());
+        }
     }
 
     /// `N3Msg_SitToggle` [GC 0x10028e0a] without the attack stop (the combat layer's): the frames the original sends. A `Move(0x1e)` is applied
@@ -618,7 +631,12 @@ impl Player {
                     }
                 }
                 OwnEvent::Appearance(appearance) => match self.avatar.set_appearance(&self.store, &appearance) {
-                    Ok(changed) => self.model_sent &= !changed, // the next frame uploads the rebuilt model again
+                    Ok(changed) => {
+                        self.model_sent &= !changed;
+                        if changed {
+                            zone.world.effect_source_model_changed((super::dynels::CHAR_KIND as u32, self.char_id));
+                        }
+                    }
                     Err(e) => eprintln!("avatar appearance: {e:#}"),
                 },
             }
