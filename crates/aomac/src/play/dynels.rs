@@ -33,6 +33,24 @@ use super::dynels_doors::{Cmd, GameSound, ItemRig, PropAnim};
 use super::tags::{Indicator, Listing, Tag, TagLayer};
 use super::zone::{scene_pos, scene_yaw};
 
+
+fn remote_pose(
+    mover: &mut Mover,
+    collision: Option<&std::rc::Rc<std::cell::RefCell<ao_formats::playfield::collision::Collision>>>,
+    dt: f32,
+) -> ao_net::n3::motion::Pose {
+    let Some(collision) = collision else { return mover.advance(dt); };
+    let collision = collision.borrow();
+    mover.advance_with_surface(dt, |old, new, body, state| {
+        let mut aligned = collision.align(scene_pos(old), scene_pos(new), body, state);
+        aligned.pos = scene_pos(aligned.pos);
+        aligned.normal = scene_pos(aligned.normal);
+        aligned
+    }, |pos| {
+        let start = scene_pos(pos);
+        collision.line(start, [start[0], start[1] + 100.0, start[2]]).map(|hit| hit.p[1])
+    })
+}
 #[path = "dynels_actions.rs"]
 mod actions;
 #[path = "dynels_buffs.rs"]
@@ -768,6 +786,7 @@ pub struct Dynels {
     impact_locations: HashMap<i32, i32>,
     /// Camera position of the last [`Dynels::update_with_collision`] (scene space).
     cam: [f32; 3],
+    collision: Option<std::rc::Rc<std::cell::RefCell<ao_formats::playfield::collision::Collision>>>,
 }
 
 struct NanoCast {
@@ -876,6 +895,7 @@ impl Default for Dynels {
             swings: HashMap::new(),
             impact_locations: HashMap::new(),
             cam: [0.0; 3],
+            collision: None,
         }
     }
 }
@@ -961,6 +981,7 @@ impl Dynels {
     /// Forgets every dynel (a playfield change, `Zone::reset_world`).
     pub fn clear(&mut self) {
         self.chars.clear();
+        self.collision = None;
         self.slot_hits.clear();
         self.later.clear();
         self.arms.clear();
@@ -2065,16 +2086,23 @@ impl Dynels {
                 let look = Look::Char(look);
                 let key = look.key();
                 let yaw = u.yaw().unwrap_or(0.0);
-                let mut mover = Mover::with_blob(u.pos, yaw, &u.blob);
+                let mut mover = Mover::new(u.pos, yaw);
+                mover.set_body_scale(if u.monster_scale == 0 { 1.0 } else { u.monster_scale as f32 / 100.0 });
+                mover.on_stat(0, u.flags2 as i32);
+                if let ao_net::n3::dynel::CharClass::Pc(pc) = &u.class {
+                    mover.on_stat(16, pc.stats[1] as i32);
+                    mover.on_stat(17, pc.stats[2] as i32);
+                }
                 // players: [INFERENCE] bit 4 (their moves are applied live); NPCs get their record's `Features` when the model is built
                 mover.set_features(if u.is_npc() { 2 } else { 4 });
                 mover.on_stat(ao_net::n3::motion::STAT_RUN_SPEED, u.run_speed as i32);
                 mover.on_stat(ao_net::n3::motion::STAT_MAX_HEALTH, u.max_health);
                 mover.on_stat(STAT_HEALTH, u.health);
+                mover.restore_blob(&u.blob);
                 if let Some(p) = &u.path {
                     mover.on_path(p.id.kind != 0 || p.id.instance != 0, &p.waypoints);
                 }
-                let pose = mover.pose();
+                let pose = remote_pose(&mut mover, self.collision.as_ref(), 0.0);
                 self.chars.insert(
                     who.instance,
                     Char {
@@ -2156,13 +2184,24 @@ impl Dynels {
             }
             _ => {}
         }
+        if let Some(c) = self.chars.get_mut(&who.instance) {
+            c.pose = remote_pose(&mut c.mover, self.collision.as_ref(), 0.0);
+        }
     }
 
     /// Integrates the movement of every character by `dt` seconds (the drawn pose and animation state).
     pub fn advance(&mut self, dt: f32) {
         for c in self.chars.values_mut() {
             if !matches!(c.special, Special::Die(_)) {
-                c.pose = c.mover.advance(dt);
+                if let Some(Model::Ready { built, .. }) = self.models.get(&c.key) {
+                    if let Some(rig) = &built.rig {
+                        let radius = rig.cat().torso_sphere.radius;
+                        c.mover.set_body_radius((if radius < 0.0 {
+                            ao_formats::playfield::collision::DEFAULT_BODY_RADIUS
+                        } else { radius }) * c.scale);
+                    }
+                }
+                c.pose = remote_pose(&mut c.mover, self.collision.as_ref(), dt);
             }
         }
     }
@@ -2202,8 +2241,10 @@ impl Dynels {
         if let Some(renderer) = &mut self.effects { renderer.set_source_torso_factor(identity, factor); }
     }
 
-    pub fn set_effect_collision(&mut self, collision: Option<std::rc::Rc<std::cell::RefCell<ao_formats::playfield::collision::Collision>>>) {
+    pub fn set_collision(&mut self, collision: Option<std::rc::Rc<std::cell::RefCell<ao_formats::playfield::collision::Collision>>>) {
+        self.collision = collision.clone();
         if let Some(renderer) = &mut self.effects { renderer.set_collision(collision); }
+        self.advance(0.0);
     }
 
 
@@ -3117,6 +3158,39 @@ mod tests {
             }
             ao_render::render_to_png_actors(&scene, &models, actors, cam, at, 1200, 700, std::path::Path::new(&out), 0.0).unwrap();
         }
+    }
+
+    #[test]
+    fn captured_remote_dynels_align_with_loaded_playfield() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(
+            ao_formats::playfield::collision::Collision::load(&store, 4582).unwrap(),
+        ));
+        let mut world = Dynels::default();
+        world.set_collision(Some(collision.clone()));
+        let mut placements = 0;
+        for frame in frames(include_str!("../../../../docs/captures/zone_ithaca.rec")) {
+            let Ok(message) = ao_net::n3::decode(&frame) else { continue };
+            world.on_message(&message);
+            if matches!(message.body, N3::Dynel(Dynel::CharDCMove(_) | Dynel::SimpleCharFullUpdate(_))) {
+                placements += 1;
+            }
+            world.advance(1.0 / 60.0);
+            for character in world.chars.values() {
+                let simulated = character.mover.sim_pos();
+                assert!(simulated.iter().all(|v| v.is_finite()));
+                assert_eq!(character.pose.pos[1], simulated[1], "draw reconcile must retain aligned Y");
+            }
+        }
+        assert!(placements > 10);
+        let character = world.chars.values_mut().find(|c| !matches!(c.special, Special::Die(_))).unwrap();
+        let mut position = character.mover.sim_pos();
+        let ground = collision.borrow().ground(scene_pos(position)).expect("captured actor has terrain");
+        position[1] = ground - 0.2;
+        character.mover.on_teleport(position, &[0.0, 0.0, 0.0, 1.0]);
+        character.pose = remote_pose(&mut character.mover, Some(&collision), 0.0);
+        assert!(character.mover.sim_pos()[1] >= ground, "placement uses the loaded floor immediately");
     }
 
     /// The capture replayed with its timestamps: moving NPCs walk (their animation state follows the movement FSM) and their drawn

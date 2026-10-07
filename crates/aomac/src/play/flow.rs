@@ -1251,7 +1251,7 @@ impl Frontend for Play {
             host.effect_environment_wind = Some(environment_channels(&mut self.effect_environment_phase, dt));
             host.effect_environment_center = self.player.as_ref().map(|_| host.camera.pos.to_array());
             host.effect_playfield = self.player.as_ref().and_then(|player| player.effect_surface()).and_then(|surface| surface.borrow().effect_resource());
-            self.zone.world.set_effect_collision(self.player.as_ref().and_then(|player| player.effect_surface()));
+            self.zone.world.set_collision(self.player.as_ref().and_then(|player| player.effect_surface()));
             self.zone.world.refresh_effect_source_runtime();
             let breed = self.zone.stat(4);
             if let Some(player) = self.player.as_ref() { player.prepare_effect_source(&mut self.zone.world, host, breed); }

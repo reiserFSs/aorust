@@ -64,8 +64,10 @@ N3 frame ──Zone::on_frame──▶ Dynels::on_message ──▶ Char (Mover)
 Missing MonsterData is not a missing model error: Gamecode's null-record path uses the normal humanoid resolver for breed 1..4; breed > 4 leaves the previous visual unchanged. The NPC wire bit alone does not select a morphed rig. No other-record/direct-mesh/default-creature fallback exists (npc.md §1).
 
 Coordinates: scene = `(x, y, -z)` of the server position; a model faces -Z at rest, so the actor rotation is `scene_yaw(server_yaw)`
-(`play/zone.rs`, verified against NPC travel directions). Server `y` is trusted (the client never lets a dynel sink below terrain but does not
-snap it up either, docs/zone/motion.md §4d).
+(play/zone.rs, verified against NPC travel directions). Remote placements and every vehicle substep run
+`Vehicle_t::EnsureSurfaceAlignment` (Vehicle.dll @0x1000d1aa) through the loaded playfield collision;
+unsupported walking bodies fall with retail gravity, while flying/no-fall modes retain their vertical rules
+(docs/zone/motion.md §4d). Server `y` is a placement input, not a permanently trusted render height.
 
 ## 3. Movement and animation
 

@@ -8,6 +8,7 @@
 
 use super::dynel::{yaw as quat_yaw, CharDCMove};
 use super::misc::FollowTarget;
+use ao_formats::playfield::collision::{Aligned, Body, SurfaceState};
 
 /// Stat ids (decimal ids of the client's `fStatToString` table).
 pub const STAT_MAX_HEALTH: i32 = 1;
@@ -525,6 +526,19 @@ pub struct Mover {
     reported_mode: Option<i32>,
     /// Turn started by a mouse-turn type (10/13): the vehicle's turn rate is 0, the heading comes with the messages.
     mouse_turn: bool,
+    surface: SurfaceState,
+    vy: f32,
+    airborne: bool,
+    placement_pending: bool,
+    placement_from: [f32; 3],
+    jump_pending: bool,
+    strength: i32,
+    agility: i32,
+    gm_level: i32,
+    flags: u32,
+    falling: bool,
+    body_scale: f32,
+    elevate_speed: f32,
 }
 
 impl Mover {
@@ -548,21 +562,54 @@ impl Mover {
             sit_ok: false,
             reported_mode: None,
             mouse_turn: false,
+            surface: SurfaceState::default(),
+            vy: 0.0,
+            airborne: false,
+            placement_pending: true,
+            placement_from: pos,
+            jump_pending: false,
+            strength: super::world::STAT_UNSET,
+            agility: super::world::STAT_UNSET,
+            gm_level: super::world::STAT_UNSET,
+            flags: 0,
+            falling: true,
+            body_scale: 1.0,
+            elevate_speed: 0.0,
         }
+    }
+
+    /// Dynel body scale used by the native jump ceiling clearance.
+    pub fn set_body_scale(&mut self, scale: f32) {
+        self.body_scale = scale;
+    }
+
+    pub fn set_body_radius(&mut self, radius: f32) {
+        self.surface.radius = radius;
     }
 
     /// As [`Mover::new`] with the FSM state read from the `SimpleCharFullUpdate` blob (see [`Status::from_blob`]).
     pub fn with_blob(pos: [f32; 3], yaw: f32, blob: &[u8]) -> Mover {
         let mut m = Mover::new(pos, yaw);
+        m.restore_blob(blob);
+        m
+    }
+
+    /// Restore after full-update stat hooks; GC 0x10077af2 sets Flags before +0xac.
+    pub fn restore_blob(&mut self, blob: &[u8]) {
         if let Some(s) = Status::from_blob(blob) {
-            m.status = s;
-            m.direction = if s.forward < 0 { -1 } else { 1 };
+            self.status = s;
+            self.direction = if s.forward < 0 { -1 } else { 1 };
             let velocity = [0, 4, 8].map(|offset| f32::from_be_bytes(blob[offset..offset + 4].try_into().unwrap()));
             if velocity.iter().all(|v| v.is_finite()) {
-                m.speed = velocity[0].hypot(velocity[2]) * m.direction as f32;
+                self.speed = velocity[0].hypot(velocity[2]) * self.direction as f32;
+                self.vy = velocity[1];
+                self.airborne = velocity[1] != 0.0 || s.jumping;
+            }
+            if blob.len() >= 42 {
+                let elevate = f32::from_be_bytes(blob[38..42].try_into().unwrap());
+                if elevate.is_finite() { self.elevate_speed = elevate; }
             }
         }
-        m
     }
 
     /// Stat `Features` (0xE0, decimal 224): bit 4 lets every move type drive the FSM, bit 2 only the turn types 9..=14
@@ -570,6 +617,10 @@ impl Mover {
     /// players are **[INFERENCE]** bit 4 (their DC moves are applied live). Same as `on_stat(STAT_FEATURES, v)`.
     pub fn set_features(&mut self, features: i32) {
         self.features = features;
+        if features & 8 != 0 {
+            self.vy = 0.0;
+            self.airborne = false;
+        }
     }
 
     /// Allow a *DC move* type 30 to sit the dynel down. The client's guard is `Features & 4` of the dynel itself
@@ -585,7 +636,7 @@ impl Mover {
     /// guards' Features bit-4 test taken from the dynel's own Features stat (= `Features & 4`, the helper at `dynel+0x1ec`
     /// holds the dynel itself). Returns whether the transition was valid. No placement, no follow cancel.
     pub fn on_move_type(&mut self, id: u8) -> bool {
-        MoveType::from_id(id).is_some_and(|t| self.status.transition(t, self.features & 4 != 0))
+        MoveType::from_id(id).is_some_and(|t| self.apply_guarded(t, self.features & 4 != 0))
     }
 
     /// `StatIIR_t` pair. RunSpeed (156) is the speed skill, Health/MaxHealth (27/1) scale it below 15 % health,
@@ -597,8 +648,20 @@ impl Mover {
             STAT_HEALTH => self.health = Some(value),
             STAT_MAX_HEALTH => self.max_health = value,
             STAT_TURN_SPEED => self.turn_speed = value,
-            STAT_FEATURES => self.features = value,
+            STAT_FEATURES => self.set_features(value),
             STAT_CURRENT_MOVEMENT_MODE => self.reported_mode = Some(value),
+            0 => {
+                self.flags = value as u32;
+                self.falling = self.flags & 0x20000000 == 0;
+                if !self.falling_enabled() || self.flags & 0x80000000 != 0 {
+                    self.vy = 0.0;
+                    self.airborne = false;
+                }
+            }
+            16 => self.strength = value,
+            17 => self.agility = value,
+            215 => self.gm_level = value,
+            360 => self.body_scale = if value == 0 { 1.0 } else { value as f32 / 100.0 },
             _ => {}
         }
     }
@@ -636,7 +699,9 @@ impl Mover {
     fn place(&mut self, pos: [f32; 3]) {
         // UpdateReconcilePos stores the simulated position *before* the teleport (N3 0x19414).
         self.recon = Some(self.pos);
+        self.placement_from = self.pos;
         self.pos = pos;
+        self.placement_pending = true;
     }
 
     fn stop_follow(&mut self) {
@@ -646,8 +711,36 @@ impl Mover {
     fn apply(&mut self, t: MoveType) -> bool {
         // Leave* guards test Features bit 4, which the DC gate already requires for these types; SitGround: `set_sit_allowed`
         let ok = if t == MoveType::SwitchToSitGroundMode { self.sit_ok } else { true };
+        self.apply_guarded(t, ok)
+    }
+
+    fn apply_guarded(&mut self, t: MoveType, ok: bool) -> bool {
+        let previous_mode = self.status.mode;
         let applied = self.status.transition(t, ok);
         if applied {
+            if t == MoveType::JumpStart {
+                self.jump_pending = true;
+            }
+            if self.status.mode == Mode::Fly {
+                self.vy = 0.0;
+                self.airborne = false;
+            }
+            match t {
+                MoveType::SwitchToFlyMode => {
+                    self.falling = false;
+                    self.pos[1] += 0.5;
+                }
+                MoveType::SwitchToRunMode | MoveType::SwitchToWalkMode | MoveType::LeaveFlyMode
+                    | MoveType::SwitchToSwimMode | MoveType::SwitchToFrozenMode
+                    if previous_mode == Mode::Fly => {
+                        self.falling = true;
+                        self.pos[1] += 0.1;
+                        self.elevate_speed = 0.0;
+                    }
+                MoveType::ElevateUpStart => self.elevate_speed = 3.0,
+                MoveType::ElevateUpStop => self.elevate_speed = -0.8,
+                _ => {}
+            }
             match t {
                 MoveType::ReverseStart => self.direction = -1,
                 MoveType::ForwardStart | MoveType::ReverseStop | MoveType::FullStop => self.direction = 1,
@@ -692,9 +785,11 @@ impl Mover {
     /// `n3TeleportIIR_t::Activate` [N3 0x10029f87], in-playfield branch: `SetRelPosRot(pos, rot)` (docs/zone/world.md §10.2). Unlike
     /// `CharDCMove` nothing reconciles, so the drawn position snaps; that call does not touch a running path / follow.
     pub fn on_teleport(&mut self, pos: [f32; 3], rot: &[f32; 4]) {
+        self.placement_from = self.pos;
         self.pos = pos;
         self.recon = None;
         self.yaw = quat_yaw(rot);
+        self.placement_pending = true;
     }
 
     /// `SetWantedDirectionIIR_t`: heading the dynel turns to (live: the direction of the travel that the next
@@ -773,6 +868,91 @@ impl Mover {
             left -= h;
         }
         self.pose()
+    }
+
+    /// Run the same remote vehicle against the loaded playfield, in wire coordinates.
+    pub fn advance_with_surface(
+        &mut self,
+        dt: f32,
+        mut align: impl FnMut([f32; 3], [f32; 3], &Body, &mut SurfaceState) -> Aligned,
+        mut ceiling: impl FnMut([f32; 3]) -> Option<f32>,
+    ) -> Pose {
+        if dt > 4.0 { return self.pose(); }
+        if self.placement_pending {
+            self.align_surface(self.placement_from, true, &mut align);
+            self.placement_pending = false;
+        }
+        if self.jump_pending {
+            self.jump_pending = false;
+            if !self.airborne {
+                let sum = self.strength as f32 + self.agility as f32;
+                let sum = if self.gm_level == 0 { sum.min(800.0) } else { sum };
+                let mut height = (sum / 200.0 + 1.0).max(0.5);
+                if let Some(y) = ceiling(self.pos) {
+                    height = height.min((y - self.pos[1] - 2.0 * self.body_scale).max(0.1));
+                }
+                self.status.jumping = true;
+                self.vy = (40.0 * height).sqrt();
+                self.falling = true;
+                self.airborne = true;
+            }
+        }
+        let mut left = dt.max(0.0);
+        while left > 0.0 {
+            let h = left.min(1.0 / 60.0);
+            let old = self.pos;
+            if self.airborne && self.falling_enabled() {
+                self.vy = (self.vy - 20.0 * h).clamp(-50.0, 50.0);
+            }
+            self.step(h);
+            self.pos[1] += self.vy * h;
+            if self.status.mode == Mode::Fly {
+                self.pos[1] += self.elevate_speed * h;
+            }
+            self.align_surface(old, false, &mut align);
+            left -= h;
+        }
+        self.pose()
+    }
+
+    fn falling_enabled(&self) -> bool {
+        self.falling && self.features & 8 == 0
+    }
+
+    fn align_surface(
+        &mut self, old: [f32; 3], teleport: bool,
+        align: &mut impl FnMut([f32; 3], [f32; 3], &Body, &mut SurfaceState) -> Aligned,
+    ) {
+        if self.flags & 0x80000000 != 0 {
+            self.vy = 0.0;
+            self.airborne = false;
+            return;
+        }
+        let falling_enabled = self.falling_enabled();
+        let body = Body { falling_enabled, airborne: self.airborne, vy: self.vy, teleport };
+        self.surface.heading = self.yaw;
+        let r = align(old, self.pos, &body, &mut self.surface);
+        self.pos = r.pos;
+        match self.surface.event.take() {
+            Some(ao_formats::playfield::collision::LiquidEvent::Enter) => {
+                self.status.transition(MoveType::SwitchToSwimMode, true);
+            }
+            Some(ao_formats::playfield::collision::LiquidEvent::Leave) => {
+                self.status.transition(MoveType::LeaveSwimMode, true);
+            }
+            None => {}
+        }
+        if let Some(r) = &mut self.recon { r[1] = self.pos[1]; }
+        if falling_enabled {
+            if r.airborne && !self.airborne {
+                self.airborne = true;
+                self.vy = 0.0;
+            } else if !r.airborne {
+                self.airborne = false;
+                self.vy = 0.0;
+                self.status.transition(MoveType::JumpStop, true);
+            }
+        }
     }
 
     fn turn_rate(&self, dir: i8, moving: bool) -> f32 {
@@ -871,7 +1051,9 @@ impl Mover {
             let adv = (self.speed * dt).min(seg);
             if seg > 1e-6 {
                 let k = adv / seg;
-                self.pos[1] += (w[1] - self.pos[1]) * k;
+                if mode == Mode::Fly {
+                    self.pos[1] += (w[1] - self.pos[1]) * k;
+                }
                 self.pos[0] = ox + (w[0] - ox) * k;
                 self.pos[2] = oz + (w[2] - oz) * k;
             }
@@ -904,6 +1086,172 @@ mod tests {
     use crate::n3::{capture, decode, dynel::Dynel, misc::Misc, Message, N3};
     use std::collections::HashMap;
 
+    fn surface_step(m: &mut Mover, dt: f32, floor: impl Fn([f32; 3]) -> f32) -> Pose {
+        surface_step_ceiling(m, dt, floor, |_| None)
+    }
+
+    #[test]
+    fn remote_jump_uses_native_unset_stats_and_ceiling_height() {
+        let mut mover = Mover::new([0.0; 3], 0.0);
+        mover.on_move_type(MoveType::JumpStart as u8);
+        surface_step(&mut mover, 0.0, |_| 0.0);
+        let height = (2.0 * super::super::world::STAT_UNSET as f32) / 200.0 + 1.0;
+        assert_eq!(mover.vy, (40.0 * height).sqrt(), "missing GM is nonzero, so no 800 cap");
+        let mut mover = Mover::new([0.0; 3], 0.0);
+        mover.on_stat(16, 0);
+        mover.on_stat(17, 0);
+        mover.on_stat(215, 0);
+        mover.on_stat(0, 0x20000000);
+        mover.on_move_type(MoveType::JumpStart as u8);
+        surface_step_ceiling(&mut mover, 0.0, |_| 0.0, |_| Some(2.1));
+        assert!((mover.vy - 2.0).abs() < 1e-5, "stored NPC minimum does not raise launch impulse");
+        assert!(mover.falling_enabled(), "Jump enables falling even after no-fall Flags");
+    }
+
+    #[test]
+    fn remote_fly_blob_restore_does_not_execute_mode_actions() {
+        let mut blob = [0u8; 42];
+        blob[12] = Mode::Fly as u8;
+        blob[22..26].copy_from_slice(&(Mode::Run as i32).to_be_bytes());
+        blob[38..42].copy_from_slice(&(-0.8f32).to_be_bytes());
+        let mut mover = Mover::new([0.0, 8.0, 0.0], 0.0);
+        mover.on_stat(0, 0x20000000);
+        mover.restore_blob(&blob);
+        assert_eq!(surface_step(&mut mover, 0.0, |_| 0.0).pos[1], 8.0);
+        surface_step(&mut mover, 1.0, |_| 0.0);
+        assert!((mover.pos[1] - 7.2).abs() < 1e-4, "restored elevate input, no synthesized lift");
+        blob[4..8].copy_from_slice(&(2.0f32).to_be_bytes());
+        mover.restore_blob(&blob);
+        assert_eq!(mover.vy, 2.0, "Flags hook runs before serialized velocity restore");
+        assert!(!mover.falling_enabled());
+        let falling = Mover::with_blob([0.0, 8.0, 0.0], 0.0, &blob);
+        assert!(falling.falling_enabled(), "restoring Fly does not execute DisableFalling");
+    }
+
+    #[test]
+    fn remote_fly_exit_applies_swim_and_frozen_lifts() {
+        for action in [MoveType::SwitchToSwimMode, MoveType::SwitchToFrozenMode] {
+            let mut mover = Mover::new([0.0, 8.0, 0.0], 0.0);
+            mover.on_move_type(MoveType::SwitchToFlyMode as u8);
+            mover.on_move_type(MoveType::ElevateUpStart as u8);
+            mover.on_move_type(action as u8);
+            assert!((mover.pos[1] - 8.6).abs() < 1e-5);
+            assert_eq!(mover.elevate_speed, 0.0);
+            assert!(mover.falling_enabled());
+        }
+    }
+
+    fn surface_step_ceiling(
+        m: &mut Mover, dt: f32, floor: impl Fn([f32; 3]) -> f32,
+        ceiling: impl FnMut([f32; 3]) -> Option<f32>,
+    ) -> Pose {
+        m.advance_with_surface(dt, |_, mut pos, body, _| {
+            let ground = floor(pos);
+            let supported = pos[1] - 0.48 <= ground && body.vy <= 0.1;
+            pos[1] = if body.falling_enabled && supported { ground } else { pos[1].max(ground) };
+            Aligned { pos, airborne: !supported, normal: [0.0, 1.0, 0.0], liquid: -9999.0 }
+        }, ceiling)
+    }
+
+    #[test]
+    fn remote_ground_downhill_fall_jump_and_fly() {
+        let mut m = Mover::new([0.0, 0.2, 0.0], 0.0);
+        m.set_features(4);
+        m.on_stat(16, 0);
+        m.on_stat(17, 0);
+        m.on_stat(215, 0);
+        assert_eq!(surface_step(&mut m, 0.0, |_| 0.0).pos[1], 0.0);
+        m.on_move_type(1);
+        surface_step(&mut m, 1.0, |p| -0.1 * p[2]);
+        assert!((m.pos[1] + 0.1 * m.pos[2]).abs() < 1e-5, "downhill follows support");
+        assert!(!m.airborne);
+        m.on_teleport([0.0, 5.0, 0.0], &[0.0, 0.0, 0.0, 1.0]);
+        m.on_move_type(21);
+        surface_step(&mut m, 0.25, |_| 0.0);
+        assert!(m.pos[1] < 5.0 && m.pos[1] > 0.0 && m.airborne);
+        surface_step(&mut m, 1.0, |_| 0.0);
+        assert_eq!(m.pos[1], 0.0);
+        m.on_move_type(15);
+        surface_step(&mut m, 0.2, |_| 0.0);
+        assert!(m.pos[1] > 0.5 && m.airborne && m.status.jumping);
+        surface_step(&mut m, 1.0, |_| 0.0);
+        assert!(!m.airborne && !m.status.jumping);
+        m.on_move_type(29);
+        assert_eq!(m.pos[1], 0.5, "Fly Apply lifts the body");
+        m.on_teleport([0.0, 8.0, 0.0], &[0.0, 0.0, 0.0, 1.0]);
+        surface_step(&mut m, 1.0, |_| 0.0);
+        assert_eq!(m.pos[1], 8.0, "flight is not ground-clamped");
+        m.on_move_type(17);
+        surface_step(&mut m, 0.25, |_| 0.0);
+        assert!((m.pos[1] - 8.75).abs() < 1e-5, "elevate speed is 3 m/s");
+        m.on_move_type(18);
+        surface_step(&mut m, 0.25, |_| 0.0);
+        assert!((m.pos[1] - 8.55).abs() < 1e-4, "stop-elevate sinks at 0.8 m/s");
+        m.on_move_type(39);
+        assert!((m.pos[1] - 8.65).abs() < 1e-4, "leaving flight lifts by 0.1 m before falling");
+        surface_step(&mut m, 2.0, |_| 0.0);
+        assert_eq!(m.pos[1], 0.0);
+        m.on_stat(0, 0x20000000);
+        m.on_teleport([0.0, 5.0, 0.0], &[0.0, 0.0, 0.0, 1.0]);
+        surface_step(&mut m, 1.0, |_| 0.0);
+        assert_eq!(m.pos[1], 5.0, "Flags DisableFalling preserves height");
+        m.on_stat(0, 0);
+        m.set_features(4 | 8);
+        surface_step(&mut m, 1.0, |_| 0.0);
+        assert_eq!(m.pos[1], 5.0, "Features bit 8 disables falling");
+        m.set_features(4);
+        m.on_stat(0, i32::MIN);
+        m.on_teleport([0.0, -1.0, 0.0], &[0.0, 0.0, 0.0, 1.0]);
+        surface_step(&mut m, 1.0, |_| 0.0);
+        assert_eq!(m.pos[1], -1.0, "Flags DisableSurfaceCollision bypasses alignment");
+        m.on_stat(0, 0);
+        surface_step(&mut m, 0.1, |_| 0.0);
+        assert_eq!(m.pos[1], 0.0);
+        m.on_move_type(15);
+        surface_step_ceiling(&mut m, 0.0, |_| 0.0, |_| Some(2.2));
+        assert!((m.vy - 8.0f32.sqrt()).abs() < 1e-4, "ceiling shortens the launch height");
+    }
+
+    #[test]
+    fn captured_remote_movement_runs_surface_on_placements_and_substeps() {
+        let mut movers = HashMap::new();
+        let mut previous = 0;
+        let mut placements = 0;
+        let mut steps = 0;
+        for (ms, message) in events() {
+            for mover in movers.values_mut() {
+                surface_step(mover, (ms - previous) as f32 / 1000.0, |_| 0.0);
+                steps += 1;
+                assert!(mover.pos[1] >= 0.0);
+                assert_eq!(mover.pose().pos[1], mover.pos[1], "reconcile must not restore stale Y");
+            }
+            previous = ms;
+            let id = message.header.target.instance;
+            match message.body {
+                N3::Dynel(Dynel::SimpleCharFullUpdate(update)) => {
+                    let mut mover = Mover::with_blob(update.pos, update.yaw().unwrap_or(0.0), &update.blob);
+                    mover.set_features(if update.is_npc() { 2 } else { 4 });
+                    movers.insert(id, mover);
+                }
+                N3::Dynel(Dynel::CharDCMove(mv)) => {
+                    if let Some(mover) = movers.get_mut(&id) {
+                        mover.on_char_dc_move(&mv);
+                        surface_step(mover, 0.0, |_| 0.0);
+                        assert!(!mover.placement_pending);
+                        placements += 1;
+                    }
+                }
+                N3::Misc(Misc::FollowTarget(follow)) => {
+                    if let Some(mover) = movers.get_mut(&id) {
+                        mover.on_follow_target(&follow);
+                        surface_step(mover, 0.0, |_| 0.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(placements > 10 && steps > 10);
+    }
     /// The captured zone session as `(ms, decoded message)`.
     fn events() -> Vec<(u32, Message)> {
         capture()

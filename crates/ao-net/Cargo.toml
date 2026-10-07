@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ao-formats.workspace = true
 flate2 = "1"
 getrandom = { version = "0.2", features = ["std"] }
 num-bigint = "0.4"
