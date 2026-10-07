@@ -144,6 +144,19 @@ The subsequent `final-npc-idle` sequence began Idle (0x78/source 22777,
 3333 ms, no loop markers, same rate), but ended Walk: it does **not** establish
 two seconds of uninterrupted idle.
 
+Uninterrupted idle was subsequently captured on clean origin/main `839c057`
+(Ithaca PF 800, `artifact://22268`): `selname=Aleksei Innokenti,approach=target,
+npcprobe=target,npcwait=idle:30,frames=town-idle:2`. Aleksei 1000216 stayed Idle
+in every `town-idle-0000..0119` frame: key 0x78, source 10173/root `Bip01_ac`,
+model 5907, scale 1.180, duration 3799 ms, no loop markers, rate 1.178429.
+Absolute clock 9228.418 → 11565.652 ms advanced 2337.234 ms across 119/60 s,
+versus 2337.218 ms from the logged rate (0.016 ms accumulated float difference).
+The full-duration repeat is therefore 3.223784 s; sampled pose wrapped from
+3790.887 ms at frame110 to 11.527 ms at frame111 without changing clip or state.
+All 120 frames were inspected in six 20-frame crops: head/torso remained visible
+with subtle idle sway and no walking; the own avatar partially occluded the legs.
+This is muted, locked, offscreen live evidence, not a retail/window comparison.
+
 | key → parent | |
 |---|---|
 | 0x3fc→0x3f2, 0x3fd→0x3f3, 0x3fe→0x3f4, 0x3ff→0x3f5 | rifle start/idle/stop/shot → smallarms |
