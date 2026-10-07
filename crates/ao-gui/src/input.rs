@@ -47,8 +47,12 @@ pub enum InputEvent {
 }
 
 pub type WindowId = usize;
-/// Handle of a view subtree created with `Gui::add_view` (e.g. one `CharacterSelectionItem`).
-pub type ViewHandle = usize;
+/// Generation-checked handle of a subtree created with `Gui::add_view`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ViewHandle {
+    pub(crate) id: usize,
+    pub(crate) generation: u64,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {

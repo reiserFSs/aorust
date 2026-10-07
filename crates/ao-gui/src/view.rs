@@ -348,12 +348,43 @@ pub const VF_COLLAPSE_WHEN_HIDDEN: u32 = 0x100;
 #[derive(Default)]
 pub struct Tree {
     pub views: Vec<View>,
+    free: Vec<ViewId>,
+    generations: Vec<u64>,
 }
 
 impl Tree {
     pub fn add(&mut self, v: View) -> ViewId {
+        if let Some(id) = self.free.pop() {
+            self.views[id] = v;
+            return id;
+        }
         self.views.push(v);
+        self.generations.push(0);
         self.views.len() - 1
+    }
+    pub fn handle(&self, id: ViewId) -> crate::input::ViewHandle {
+        crate::input::ViewHandle { id, generation: self.generations[id] }
+    }
+    pub fn resolve(&self, h: crate::input::ViewHandle) -> Option<ViewId> {
+        (self.generations.get(h.id) == Some(&h.generation)).then_some(h.id)
+    }
+    /// Detaches and empties a subtree, retaining live indices and recycling its slots.
+    pub fn free_subtrees(&mut self, mut dead: Vec<ViewId>) -> Vec<ViewId> {
+        for &root in &dead {
+            if let Some(p) = self.views[root].parent {
+                self.views[p].children.retain(|c| *c != root);
+            }
+        }
+        let mut i = 0;
+        while i < dead.len() {
+            let id = dead[i];
+            let old = std::mem::replace(&mut self.views[id], View::new(Kind::View));
+            dead.extend(old.children);
+            self.generations[id] = self.generations[id].checked_add(1).expect("view generation exhausted");
+            self.free.push(id);
+            i += 1;
+        }
+        dead
     }
     pub fn append_child(&mut self, parent: ViewId, child: ViewId) {
         self.views[child].parent = Some(parent);
@@ -929,3 +960,34 @@ fn build_multi(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> ViewId {
 
 /// `ColumnHeaderButton_c` preferred height (0x10139b82): the label's preferred extent (font height 13 - 1 = 12) plus the 3 px label insets on both sides.
 pub const MULTI_HEADER_H: f32 = 12.0 + 3.0 + 3.0;
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn subtree_slots_recycle_without_moving_live_nodes_or_reviving_handles() {
+        let mut tree = Tree::default();
+        let live = tree.add(View::new(Kind::View));
+        let live_handle = tree.handle(live);
+        for _ in 0..500 {
+            let root = tree.add(View::new(Kind::View));
+            let old = tree.handle(root);
+            tree.append_child(live, root);
+            for _ in 0..50 {
+                let child = tree.add(View::new(Kind::View));
+                tree.append_child(root, child);
+            }
+            assert_eq!(tree.views.len(), 52);
+            let dead = tree.free_subtrees(vec![root]);
+            assert_eq!(dead.len(), 51);
+            assert!(tree.views[live].children.is_empty());
+            assert_eq!(tree.resolve(live_handle), Some(live));
+            assert_eq!(tree.resolve(old), None);
+            let replacement = tree.add(View::new(Kind::View));
+            assert!(dead.contains(&replacement));
+            assert_eq!(tree.resolve(old), None);
+            tree.free_subtrees(vec![replacement]);
+        }
+    }
+}

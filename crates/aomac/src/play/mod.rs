@@ -136,7 +136,7 @@ enum Fade {
 }
 
 struct Row {
-    handle: usize,
+    handle: ao_gui::ViewHandle,
     activated: bool,
 }
 

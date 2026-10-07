@@ -25,6 +25,25 @@ still lay out the client. Repeated unchanged text/visibility updates likewise
 leave child geometry intact. Regression:
 `gui::clip_tests::unchanged_updates_and_moves_preserve_child_layout`.
 
+### GUI view lifetime
+
+Native ownership rule (not a retail layout/behaviour claim): `Tree` retains stable
+indices for live nodes and recycles emptied subtree slots. `remove_children`,
+`remove_view_in`, window close and failed wrapper construction reclaim all
+descendants. Cleanup removes only reclaimed IDs from hover/press/focus,
+selection, tooltips (including pending timers), canvas double-click tracking,
+scroll/list/header/dropdown interactions, default buttons, item roots, tab
+state, deferred list measurements and chat text fades. Other live windows retain
+their interaction state. Window IDs remain monotonic and are not reused.
+
+Public `ViewHandle`s carry a slot generation: a delayed click event or retained
+row handle cannot mutate a new subtree occupying an old slot. Internal `ViewId`
+indices remain unchanged. Regressions: `view::lifetime_tests` (asset-independent),
+`gui::clip_tests::rebuilt_subtrees_and_closed_windows_reuse_bounded_slots` and
+`gui::clip_tests::recycled_views_do_not_inherit_pointer_focus_fades_or_public_handles`
+(installed assets; Programs-style row replacement, chat close/reopen, options
+dropdown/list widgets, wrapper errors and stale interaction state).
+
 ## 1. Skin archive (`gfx.rs`)
 
 * `cd_image/gui/Default/Graphics.uvgi`: text; line 1 = entry count, then `name offset length`. `Graphics.uvga` = concatenated PNGs

@@ -357,11 +357,49 @@ impl Gui {
     }
 
     pub fn close_window(&mut self, w: WindowId) {
-        if let Some(slot) = self.windows.get_mut(w) {
-            *slot = None;
+        if let Some(win) = self.windows.get_mut(w).and_then(Option::take) {
+            self.free_views(win.root);
         }
-        if self.focus.is_some_and(|f| self.window_of(f).is_none()) {
-            self.focus = None;
+        if self.frame_press.is_some_and(|(id, _)| id == w) { self.frame_press = None; }
+        if self.border_hover == Some(w) { self.border_hover = None; }
+        if self.ix.frame_drag.as_ref().is_some_and(|d| d.window == w) { self.ix.frame_drag = None; }
+        if self.ix.tab_drag.as_ref().is_some_and(|d| d.window == w) { self.ix.tab_drag = None; }
+        self.dirty_windows.retain(|id| *id != w);
+    }
+
+    fn free_views(&mut self, root: ViewId) {
+        self.free_subtrees(vec![root]);
+    }
+
+    fn free_subtrees(&mut self, roots: Vec<ViewId>) {
+        if roots.is_empty() { return; }
+        let mut dead = self.tree.free_subtrees(roots);
+        dead.sort_unstable();
+        let gone = |v| dead.binary_search(&v).is_ok();
+        if self.hover.is_some_and(gone) { self.hover = None; }
+        if self.pressed.is_some_and(gone) { self.pressed = None; }
+        if self.focus.is_some_and(gone) { self.focus = None; }
+        if self.popup.as_ref().is_some_and(|p| gone(p.combo)) { self.popup = None; }
+        if self.scroll_drag.is_some_and(|(v, _)| gone(v)) { self.scroll_drag = None; }
+        if self.canvas_press.is_some_and(|(v, ..)| gone(v)) { self.canvas_press = None; }
+        if self.ix.sel.as_ref().is_some_and(|s| gone(s.view)) {
+            self.ix.sel = None;
+            self.ix.sel_timer = 0.0;
+        }
+        if self.wx.forget_views(&dead) { self.ix.menu = None; }
+        self.tip_forget_views(&dead);
+        self.items.retain(|v| !gone(*v));
+        self.view_tabs.retain(|v, _| !gone(*v));
+        self.text_fades.retain(|v, _| !gone(*v));
+        self.dirty_lists.retain(|v| !gone(*v));
+        for w in self.windows.iter_mut().flatten() {
+            if w.default_button.is_some_and(gone) { w.default_button = None; }
+        }
+        for v in &mut self.tree.views {
+            if v.selector_pref_child.is_some_and(gone) { v.selector_pref_child = None; }
+            if let Kind::MultiHeader { rows } = &mut v.kind {
+                if gone(*rows) { v.kind = Kind::View; }
+            }
         }
     }
 
@@ -469,7 +507,7 @@ impl Gui {
         self.tree.append_child(p, id);
         self.items.insert(id);
         self.relayout_window(w);
-        Ok(id)
+        Ok(self.tree.handle(id))
     }
 
     /// Like [`Gui::add_view`] for view XML text built by the application (rows the original creates in code, e.g. `StatRow`).
@@ -483,7 +521,7 @@ impl Gui {
         self.tree.append_child(p, id);
         self.items.insert(id);
         self.relayout_window(w);
-        Ok(id)
+        Ok(self.tree.handle(id))
     }
 
     /// Wraps an existing window root in view XML, retaining every old view
@@ -494,7 +532,10 @@ impl Gui {
         let e = e.children.first().ok_or_else(|| anyhow!("empty wrapper"))?;
         let mut ctx = BuildCtx { gfx: &self.gfx, localize: &*self.localize, warnings: Vec::new() };
         let root = build(&mut self.tree, &mut ctx, e).ok_or_else(|| anyhow!("cannot build wrapper"))?;
-        let p = self.tree.find(root, parent).ok_or_else(|| anyhow!("no wrapper parent {parent}"))?;
+        let Some(p) = self.tree.find(root, parent) else {
+            self.free_views(root);
+            return Err(anyhow!("no wrapper parent {parent}"));
+        };
         self.warnings.extend(ctx.warnings);
         self.tree.append_child(p, old);
         self.windows[w].as_mut().unwrap().root = root;
@@ -538,12 +579,7 @@ impl Gui {
     pub fn remove_children(&mut self, w: WindowId, parent: &str) {
         if let Some(p) = self.find(w, parent) {
             let kids = std::mem::take(&mut self.tree.views[p].children);
-            for k in kids {
-                self.tree.views[k].parent = None;
-                self.items.remove(&k);
-            }
-            self.hover = None;
-            self.pressed = None;
+            self.free_subtrees(kids);
             self.relayout_window(w);
         }
     }
@@ -557,17 +593,17 @@ impl Gui {
     }
 
     fn find_in(&self, h: ViewHandle, name: &str) -> Option<ViewId> {
-        self.tree.find(h, name)
+        self.tree.find(self.tree.resolve(h)?, name)
     }
     fn find_all_in(&self, h: ViewHandle, name: &str) -> Vec<ViewId> {
-        self.tree.find_all(h, name)
+        self.tree.resolve(h).map_or_else(Vec::new, |id| self.tree.find_all(id, name))
     }
     /// All `*_in` setters apply to every view of that name in the instance.
     pub fn set_text_in(&mut self, h: ViewHandle, name: &str, text: &str) {
         for v in self.find_all_in(h, name) {
             self.set_text_view(v, text);
         }
-        if let Some(w) = self.window_of(h) {
+        if let Some(w) = self.tree.resolve(h).and_then(|id| self.window_of(id)) {
             self.relayout_window(w);
         }
     }
@@ -581,20 +617,25 @@ impl Gui {
         for v in self.find_all_in(h, name) {
             self.tree.views[v].visible = visible;
         }
-        if let Some(w) = self.window_of(h) {
+        if let Some(w) = self.tree.resolve(h).and_then(|id| self.window_of(id)) {
             self.relayout_window(w);
         }
     }
     /// Removes a named view from its parent (`View::RemoveChild`).
     pub fn remove_view_in(&mut self, h: ViewHandle, name: &str) {
-        for v in self.find_all_in(h, name) {
-            if let Some(p) = self.tree.views[v].parent.take() {
-                self.tree.views[p].children.retain(|c| *c != v);
+        let w = self.tree.resolve(h).and_then(|id| self.window_of(id));
+        let targets = self.find_all_in(h, name);
+        for v in targets {
+            // A same-named ancestor may already have reclaimed this descendant.
+            if self.window_of(v).is_some() {
+                if self.windows.iter().flatten().any(|w| w.root == v) {
+                    if let Some(w) = self.window_of(v) { self.close_window(w); }
+                } else {
+                    self.free_views(v);
+                }
             }
         }
-        if let Some(w) = self.window_of(h) {
-            self.relayout_window(w);
-        }
+        if let Some(w) = w { self.relayout_window(w); }
     }
     /// Sets the colour (0xRRGGBB) of a `TextView` (`View::SetColor`).
     pub fn set_color_in(&mut self, h: ViewHandle, name: &str, color: u32) {
@@ -622,7 +663,7 @@ impl Gui {
             }
         }
         self.set_toggle_in(h, "name_btn", true, selected);
-        if let Some(w) = self.window_of(h) {
+        if let Some(w) = self.tree.resolve(h).and_then(|id| self.window_of(id)) {
             self.relayout_window(w);
         }
     }
@@ -936,7 +977,7 @@ impl Gui {
     fn item_of(&self, mut v: ViewId) -> Option<ViewHandle> {
         loop {
             if self.items.contains(&v) {
-                return Some(v);
+                return Some(self.tree.handle(v));
             }
             v = self.tree.views[v].parent?;
         }
@@ -2320,6 +2361,7 @@ mod clip_tests {
             }
             for pair in rows.windows(2) {
                 let row_bounds = |h| {
+                    let h = gui.tree.resolve(h).unwrap();
                     let o = gui.origin(h);
                     let f = gui.tree.views[h].frame;
                     Rect::new(o.0, o.1, o.0 + f.width(), o.1 + f.height())
@@ -2329,7 +2371,7 @@ mod clip_tests {
                 assert!(a.b < b.t, "rows overlap: {a:?}, {b:?}");
             }
             let h = rows[selected];
-            let detail = gui.find_in(h, "detailed_view").unwrap();
+            let detail = gui.tree.handle(gui.find_in(h, "detailed_view").unwrap());
             let bounds = gui.frame_in(h, "detailed_view").unwrap();
             let mut previous_bottom = bounds.t - 1.0;
             for (field, value) in [("level", "220"), ("gender", "Female"), ("breed", "Nanomage"), ("profession", "Meta-Physicist"), ("location", "Newland City (566)"), ("status", "Inactive")] {
@@ -2401,5 +2443,100 @@ mod clip_tests {
         gui.set_window_clip(top, Some(clip));
         assert_eq!(gui.hit(10.0, 30.0).map(|h| h.0), Some(top));
         assert_eq!(gui.hit(10.0, 60.0).map(|h| h.0), Some(w));
+    }
+
+    #[test]
+    fn rebuilt_subtrees_and_closed_windows_reuse_bounded_slots() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut g = Gui::new(&dir, None).unwrap();
+        let xml = r#"<root><View name="root"><View name="lv_content"/></View></root>"#;
+        let row = r#"<root><View name="row"><TextView name="label" value="live"/></View></root>"#;
+        let w = g.open_window_xml("Programs", xml, (0, 0), WindowSize::Fixed(200, 100)).unwrap();
+        let live_root = g.windows[w].as_ref().unwrap().root;
+        for _ in 0..300 {
+            for _ in 0..30 { g.add_view_xml(w, "lv_content", "row", row).unwrap(); }
+            assert_eq!(g.tree.views.len(), 62);
+            g.hover = Some(live_root);
+            g.pressed = Some(live_root);
+            g.focus = Some(live_root);
+            g.remove_children(w, "lv_content");
+            assert_eq!(g.windows[w].as_ref().unwrap().root, live_root);
+            assert!(g.tree.views[live_root].parent.is_none());
+            assert_eq!((g.hover, g.pressed, g.focus), (Some(live_root), Some(live_root), Some(live_root)));
+        }
+        let before = g.tree.views.len();
+        for _ in 0..100 {
+            assert!(g.wrap_window_xml(w, xml, "missing").is_err());
+            assert_eq!(g.tree.views.len(), before);
+        }
+        for name in ["Chat", "Programs"] {
+            for _ in 0..100 {
+                let transient = g.open_window_xml(name, xml, (0, 0), WindowSize::Fixed(200, 100)).unwrap();
+                g.close_window(transient);
+                g.close_window(transient);
+                assert_eq!(g.tree.views.len(), before);
+            }
+        }
+        // Same dropdown/list XML widgets as tests/listview.rs, used by options.
+        let options_xml = r#"<root><View view_layout="vertical"><DropdownMenu name="dd"/><StringListView name="fl" min_size="Point(120,100)"/><MultiListView name="ml" min_size="Point(150,100)"/></View></root>"#;
+        let options = g.open_window_xml("Options", options_xml, (0, 0), WindowSize::Fixed(600, 400)).unwrap();
+        let ceiling = g.tree.views.len();
+        g.close_window(options);
+        for _ in 0..100 {
+            let options = g.open_window_xml("Options", options_xml, (0, 0), WindowSize::Fixed(600, 400)).unwrap();
+            assert_eq!(g.tree.views.len(), ceiling);
+            g.close_window(options);
+        }
+        g.close_window(w);
+        assert!(g.tree.views.iter().all(|v| v.children.is_empty() && v.name.is_empty()));
+    }
+
+    #[test]
+    fn recycled_views_do_not_inherit_pointer_focus_fades_or_public_handles() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut g = Gui::new(&dir, None).unwrap();
+        let w = g.open_window_xml("lifetime", r#"<root><View name="root"/></root>"#, (0, 0), WindowSize::Fixed(200, 100)).unwrap();
+        let xml = r#"<root><View name="row"><CanvasView name="canvas" min_size="Point(100,40)" tooltip="old"/><ScrollView name="scroll"><ScrollViewChild><TextView name="text" value="old"/></ScrollViewChild></ScrollView></View></root>"#;
+        let old = g.add_view_xml(w, "root", "row", xml).unwrap();
+        let canvas = g.find_in(old, "canvas").unwrap();
+        let scroll = g.find_in(old, "scroll").unwrap();
+        g.set_text_fade(w, "scroll", Some((8.0, 0.3)), "old");
+        let r = g.view_rect(w, "canvas").unwrap();
+        g.input(InputEvent::MouseMove { x: r.l + 1.0, y: r.t + 1.0 });
+        g.frame(0.6);
+        assert_eq!(g.tooltip_shown().map(|t| t.0), Some("old"));
+        g.hover = Some(canvas);
+        g.pressed = Some(canvas);
+        g.focus = Some(canvas);
+        g.scroll_drag = Some((scroll, 1.0));
+        g.canvas_press = Some((canvas, MouseButton::Left, 0.0, Point::default()));
+        g.ix.sel = Some(select::Sel { view: canvas, anchor: 0, caret: 0, dragging: true });
+        g.dirty_lists.push(canvas);
+        g.windows[w].as_mut().unwrap().default_button = Some(canvas);
+        g.remove_view_in(old, "row");
+        assert!(g.hover.is_none() && g.pressed.is_none() && g.focus.is_none());
+        assert!(g.canvas_press.is_none() && g.scroll_drag.is_none() && g.ix.sel.is_none());
+        assert!(g.text_fades.is_empty() && g.dirty_lists.is_empty() && g.items.is_empty());
+        assert!(g.windows[w].as_ref().unwrap().default_button.is_none());
+        assert!(g.tooltip_shown().is_none());
+        let new = g.add_view_xml(w, "root", "row", xml).unwrap();
+        assert_eq!(g.tree.views.len(), 6, "replacement occupies the reclaimed slots");
+        assert_ne!(old, new);
+        assert!(g.tree.resolve(old).is_none());
+        g.set_text_in(old, "text", "stale");
+        g.remove_view_in(old, "row");
+        assert_eq!(g.text_in(new, "text"), "old");
+        assert_eq!(g.fade_line_count(w, "scroll"), 0);
+        g.frame(1.0);
+        assert!(g.tooltip_shown().is_none());
+        // A pending tooltip must not fire after close, either.
+        let r = g.view_rect(w, "canvas").unwrap();
+        g.input(InputEvent::MouseMove { x: r.l + 1.0, y: r.t + 1.0 });
+        g.close_window(w);
+        assert!(g.tree.resolve(new).is_none());
+        g.frame(1.0);
+        assert!(g.tooltip_shown().is_none());
     }
 }

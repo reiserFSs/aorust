@@ -44,6 +44,20 @@ pub(super) struct Wx {
     last: Option<(ViewId, String, u8, f32)>,
 }
 
+impl Wx {
+    pub(super) fn forget_views(&mut self, dead: &[ViewId]) -> bool {
+        let gone = |v| dead.binary_search(&v).is_ok();
+        let menu = self.dd_open.is_some_and(gone) || self.col_menu.is_some_and(gone);
+        if self.hdrag.is_some_and(|(v, _)| gone(v)) { self.hdrag = None; }
+        if self.dd_open.is_some_and(gone) { self.dd_open = None; }
+        if self.dd_arrow.is_some_and(gone) { self.dd_arrow = None; }
+        if self.head.is_some_and(|(v, ..)| gone(v)) { self.head = None; }
+        if self.col_menu.is_some_and(gone) { self.col_menu = None; }
+        if self.last.as_ref().is_some_and(|(v, ..)| gone(*v)) { self.last = None; }
+        menu
+    }
+}
+
 fn rgb_(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
@@ -1142,5 +1156,24 @@ impl Gui {
             _ => return false,
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn removed_widget_ids_clear_drag_menu_and_click_state_only_for_dead_views() {
+        let mut wx = Wx {
+            hdrag: Some((3, 1.0)), dd_open: Some(3), dd_arrow: Some(3),
+            head: Some((3, 1, 0, 0.0, 10.0)), col_menu: Some(3),
+            last: Some((3, "row".into(), 1, 0.0)),
+        };
+        assert!(!wx.forget_views(&[2]));
+        assert!(wx.hdrag.is_some() && wx.dd_open.is_some() && wx.head.is_some() && wx.last.is_some());
+        assert!(wx.forget_views(&[3]));
+        assert!(wx.hdrag.is_none() && wx.dd_open.is_none() && wx.dd_arrow.is_none());
+        assert!(wx.head.is_none() && wx.col_menu.is_none() && wx.last.is_none());
     }
 }

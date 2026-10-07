@@ -167,6 +167,12 @@ impl Gui {
         }
     }
 
+    pub(super) fn tip_forget_views(&mut self, dead: &[ViewId]) {
+        if self.tip.view.is_some_and(|(v, _)| dead.binary_search(&v).is_ok()) {
+            self.tip_hide();
+        }
+    }
+
     fn tip_hide(&mut self) {
         self.tip.view = None;
         self.tip.title.clear();
