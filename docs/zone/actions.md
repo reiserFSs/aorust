@@ -464,7 +464,16 @@ Families are stats75,546..550: when both sums of546..550 are zero, compare75 (in
 incoming family matching any existing family conflicts. Login `SimpleCharFullUpdate.effects` (`10051b40`,
 `10051741`) uses `source` as nano identity, ignores `a`, restores totalcs=`b`, remainingcs=`c`,
 startcs=`nowcs-b+c`, and disables replacement. Actual `zone_ithaca.rec` evidence has three action62/BuffIIR removal
-pairs at 23825/23920, 29898,74495 ms; no captured b1 or nonempty login list, so those regressions are synthetic.
+pairs at 23825/23920, 29898,74495 ms; b1 coverage remains synthetic. The sanitized server-only
+`docs/captures/body_boost_login.rec` retains `kills4.rec` lines 10,229,231,235 in original order:
+own33588 playfield at 5112 ms, action62 nano29091 (Body Boost) duration175186cs at 5169 ms,
+own `SimpleCharFullUpdate.effects` nano29091 with total/remaining175180cs, then `FullCharacter`
+with an empty spells list. This is observed nonempty login-list evidence, not a templated cast.
+`captured_body_boost_login_retains_timed_nano_and_pending_visual` replays that zone route:
+the timed nano (NCU cost1) survives the later empty spells list; its stat413 effect1070 remains
+pending without own anchors, then acquires a nonzero active renderer handle when anchors arrive.
+The visual receives retail integer-second duration1751s; the timed nano retains175180cs.
+The fixture contains only these four incoming N3 frames, no authentication frames, credentials or cookies.
 
 ## Live action frame sequences
 
@@ -507,4 +516,59 @@ Aomacfixr33588 was also measured at level2, XP2115. Corrected gaps are
 No living hostile level≤2 existed within rceg's60m `goto=hunt` filter;
 that helper rejected the attempt before attack. No kill, per-kill XP,
 level sound/animation or `got_ip` live PASS is claimed.
+
+2026-10-07 subsequent muted offscreen checks used Aomacfixr33588 at
+ICC4582 `(930.88,24.22,754.30)` with Solar-Powered Assault Rifle121569
+equipped in slot6. Grounded Beach Leets at `(930.89,24.31,754.69)`
+had level1/12HP. Seven kills changed absolute XP2115→3935, each +260;
+NextXP remained4050, leaving115 for the threshold kill. The earlier
+145XP observation was for a level1 character, not this measured level2 run.
+
+Body Boost **offscreen PASS**: self selected, Medical program icon
+double-clicked with the existing fast click steps, then `wait=10,frames=neck:8`
+recorded480 frames. The own29091 buff refreshed to180000cs/NCU1;
+effect1070 registered and pulsed with children20091/20096. In `neck-0240`
+(4s into that capture), magnified neck/shoulder pixels showed two bright
+authored flares and a thin white-gray segment from the left flare toward
+the neck. This establishes a visible cord segment, not an unobstructed
+full-width cord through the occluding body. Independent inspection agreed.
+The pulse was born at frame205 (controller clock23.21267). Sparse earlier
+still captures showed no effect but did not sample a known pulse clock;
+they were insufficient to establish a visibility failure.
+Captures were inspected window-independently and are scratch, not bundled
+game data or a retail screenshot comparison.
+
+The threshold kill was armed with `arm=level:3:level` before attack.
+It changed XP3935→4195, level2→3, IP5500→9500 and LastXP1450→4050.
+The processing frame `level-0000` logged event counter4=1;
+180 frames covered3s. `level-0030` showed both arms raised above the
+head (the own social6 level animation), and `level-0060` lowered them.
+`AOMAC_AUDIO_LOG` reported sound4096852927 (`0xf43103bf`,
+`SM_Sandy_Game_Level_Complete`) at origin with **1 voice** while muted.
+`notice.png` showed “New Level: 3!” (`Feedback_NewLevel`) and the
+authored improvement-points notice at `(1280-60,800-273)`.
+Click `(1232,539)` opened Skills with9500 available IP and removed the
+notice (`skills.png`). **Level-up offscreen PASS**. The screen had become
+locked before this final run, so this is not a real-window PASS.
+
+A subsequent ordinary kill verified the XP-chat fix through the Combat
+tab: “You received 303 xp.” matched stat52 `4195→4498`.
+The timed modifier lifecycle was also exercised through real HUD inputs:
+Body Boost removal from NCU changed effective health maximum66→46 and
+NCU1→0; a fast Programs double-click restored maximum66 and NCU1.
+The raw Life remained46. These checks complement the native event4/0
+modifier regressions and dispatch-order XP regression; they are not
+claims of audible speaker output. Every successful session used `/camp`
+and reached login with `session=false`; one106 login rejection was
+followed by a released lock and a240s cooldown before the next attempt.
+
+The final66s offscreen session verified native Life undo without false
+damage feedback: same-nano refresh changed Health52→46 with Combat
+delta0; Startup Treatment Laboratory116628 filled Health66/66; NCU
+removal then changed Health66→46 with Combat delta0 and NCU0/8.
+The Combat frame contained no nanobot-damage line from either clamp.
+Recasting restored the timed entry (180000cs, NCU1/8).
+Captured removal, same-nano refresh, and SCFU-only authoritative-header
+restoration have separate regressions; the last keeps Health52 despite
+raw Life46, without relying on a following FullCharacter packet.
 

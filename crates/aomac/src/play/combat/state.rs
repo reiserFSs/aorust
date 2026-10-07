@@ -172,6 +172,13 @@ impl Combat {
         self.chars.get(&instance)
     }
 
+    /// Local stat-holder SetStat, not StatIIR feedback (`1006469b` Life undo).
+    pub(super) fn set_health_local(&mut self, id: i32, health: i32) {
+        if let Some(character) = self.chars.get_mut(&id) {
+            character.stats.insert(STAT_HEALTH, health);
+        }
+    }
+
     pub fn fight(&self, instance: i32) -> Option<&Fight> {
         self.chars.get(&instance).map(|c| &c.fight)
     }

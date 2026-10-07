@@ -632,6 +632,10 @@ impl Hud {
         self.stats.set_world_under(id);
     }
 
+    pub(super) fn nano_stats_changed(&mut self, zone: &mut Zone) -> Option<i32> {
+        self.stats.nano_stats_changed(zone)
+    }
+
     /// Inventory items released over a foreign window since the last call (`HudStats::take_drops`).
     pub(super) fn take_item_drops(&mut self) -> Vec<(u32, f32, f32)> {
         self.stats.take_drops()

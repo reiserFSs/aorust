@@ -127,6 +127,7 @@ pub(super) struct HudStats {
     model: Model,
     items: Items,
     equipment: equipment::Equipment,
+    timed_effects: buffs::TimedEffects,
     pools: super::hud_pools::Pools,
     skills: Option<Skills>,
     wear: Option<Tabbed>,
@@ -183,6 +184,7 @@ impl HudStats {
             model,
             items: Items::new(dir),
             equipment: equipment::Equipment::new(dir),
+            timed_effects: buffs::TimedEffects::new(dir),
             pools: super::hud_pools::Pools::new(dir),
             skills: None,
             wear: None,
@@ -874,12 +876,42 @@ impl HudStats {
     pub(super) fn stat_event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone, d: &mut super::dvalue::DValues) -> bool {
         self.stat.as_mut().is_some_and(|s| s.event(gui, ev, zone, d, self.screen))
     }
-    pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
-        self.dnd.clock += _dt;
+    /// Complete each native undo phase before projecting the replacement's final state.
+    /// Called between received messages, not at the end of their render-frame batch.
+    pub(super) fn nano_stats_changed(&mut self, zone: &mut Zone) -> Option<i32> {
+        let mut removed = std::mem::take(&mut zone.nano_stat_removals);
+        let mut corrected = None;
+        for &nano in &removed {
+            if !self.timed_effects.remove(nano) { continue; }
+            self.model.refresh_buffs(&|id| zone.stat(id), self.timed_effects.effects(), self.equipment.effects(), self.equipment.attack_weights());
+            if let (Some(limit), Some(health)) = (self.model.life_limit(&|id| zone.stat(id)), zone.stat(27)) {
+                if health > limit {
+                    let health = limit.max(0); // Native SetStat(Health) floors negative values to zero.
+                    zone.stats.insert(27, health);
+                    zone.skill_values.insert(27, health);
+                    zone.character_stats.entry(zone.char_id as i32).or_default().insert(27, health);
+                    if let Some(own) = zone.dynels.get_mut(&(zone.char_id as i32)) { own.health = health; }
+                    corrected = Some(health);
+                }
+            }
+        }
+        removed.clear();
+        zone.nano_stat_removals = removed;
+        self.refresh_stats(zone);
+        corrected
+    }
+
+    fn refresh_stats(&mut self, zone: &mut Zone) {
         self.equipment.refresh(zone);
-        self.model.refresh_buffs(&|id| zone.stat(id), &zone.active_spells, self.equipment.effects(), self.equipment.attack_weights());
+        self.timed_effects.refresh(zone);
+        self.model.refresh_buffs(&|id| zone.stat(id), self.timed_effects.effects(), self.equipment.effects(), self.equipment.attack_weights());
         self.pools.apply(zone, &|z, id| self.model.value(&|s| z.stat(s), id));
         self.model.publish(zone);
+    }
+
+    pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
+        self.dnd.clock += _dt;
+        self.refresh_stats(zone);
         self.update_skills(gui, zone);
         self.update_wear(gui, zone);
         self.update_inventory(gui, zone);

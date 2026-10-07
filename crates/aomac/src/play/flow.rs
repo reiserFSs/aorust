@@ -790,10 +790,24 @@ impl Play {
                             None => self.hud_pending.push(f.clone()),
                         }
                     }
-                    // InfoPacket Apply (GC 0x10045fba) updates skills before its info signal builds the page.
-                    let zone_event = self.zone.on_frame(&f);
+                    // Stat feedback needs the old values; InfoPacket pages need the applied values.
                     if let Some(c) = self.chat.as_mut() {
                         c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text);
+                    }
+                    let nano_serial = self.zone.nanos.serial;
+                    let zone_event = self.zone.on_frame(&f);
+                    if self.zone.nanos.serial != nano_serial {
+                        if let Some(hud) = self.hud.as_mut() {
+                            if let Some(health) = hud.nano_stats_changed(&mut self.zone) {
+                                if let Some(combat) = self.fight.as_mut() { combat.set_health_local(health); }
+                            }
+                        } else {
+                            // Login headers initialize health before the in-world projection exists.
+                            self.zone.nano_stat_removals.clear();
+                        }
+                    }
+                    if let Some(c) = self.chat.as_mut() {
+                        c.on_zone_applied(&mut self.gui, &f, &self.zone, &self.text);
                     }
                     match zone_event {
                         zone::ZoneEvent::Playfield(id) => {

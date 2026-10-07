@@ -1,6 +1,6 @@
 //! GUI 1003343f: skill name, optional next-point IP cost, base/buffed points, description.
 use ao_formats::{screens::TextDb, stats::{self, buffs, skills::{Character, SkillTables}}};
-use crate::play::{hud_stats::{buffs::modifiers_with_equipment, equipment::Equipment}, zone::Zone};
+use crate::play::{hud_stats::{buffs::{modifiers_with_equipment, TimedEffects}, equipment::Equipment}, zone::Zone};
 
 pub(super) fn html(zone: &Zone, stat: u32, texts: &TextDb) -> anyhow::Result<String> {
     let dir = ao_gui::client_dir();
@@ -11,8 +11,10 @@ pub(super) fn html(zone: &Zone, stat: u32, texts: &TextDb) -> anyhow::Result<Str
     let lock = zone.stat(buffs::LOCK_STAT).unwrap_or(0);
     let mut equipment = Equipment::new(&dir);
     equipment.refresh(zone);
+    let mut effects = TimedEffects::new(&dir);
+    effects.refresh(zone);
     let current = |id, modifiers: &buffs::Modifiers| buffs::skill_value(&tables, id, zone.stat(id).unwrap_or(0), &character, modifiers, lock);
-    let modifiers = modifiers_with_equipment(&zone.active_spells, equipment.effects(), zone.stat(stats::LEVEL).unwrap_or(0), &current);
+    let modifiers = modifiers_with_equipment(effects.effects(), equipment.effects(), zone.stat(stats::LEVEL).unwrap_or(0), &current);
     let base = buffs::skill_base(&tables, stat, zone.stat(stat).unwrap_or(0), &character, &modifiers, lock);
     let value = zone.skill_value(stat).unwrap_or(0);
     let cost = tables.cost(stat, base, &character);

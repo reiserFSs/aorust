@@ -260,6 +260,11 @@ impl Module {
         (self.rng >> 8) as f32 / (1u32 << 24) as f32
     }
 
+    /// Keep StatIIR's baseline in sync with native local Life-undo health writes.
+    pub(in crate::play) fn set_health_local(&mut self, health: i32) {
+        self.combat.set_health_local(self.own, health);
+    }
+
     /// One received frame (call before `Zone::on_frame` so the zone's stats are still the old ones, like the chat log).
     pub fn on_frame(&mut self, f: &Frame) {
         let message = ao_net::n3::decode(f).ok();

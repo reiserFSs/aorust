@@ -190,6 +190,15 @@ It is also run on the chat-server vicinity text by `HandleVicinityMessage` [GUI 
 used for the old value of `Stat` and the nano damage-type override 0x153 `DamageOverrideType` of the attacker, valid values 90..97 and 168 via
 `FUN_1009a709`), `weapon(attacker, slot, special)` (stat 0x1b4 `DamageType` of the item behind the `AttackInfo` weapon slot, `combat::arms::Armory`; `FUN_1009afde`), and the `ChatFilter`. The hub applies the stat changes itself (Health `-= damage`, `FUN_10062349`).
 
+Live dispatch in `play/flow.rs::pump` sends game-event feedback through `Chat::on_zone_frame` before
+`Zone::on_frame` applies the packet, so `StatIIR_t` 0x34 (decimal 52, XP) compares the new total against
+the old total rather than itself (§3, GC 0x100a1aaf). `Chat::on_zone_applied` separately builds InfoPacket
+pages after zone application (GC 0x10045fba), retaining current packet skills on the first response and refresh.
+The headless dispatch regression `stat_xp_feedback_uses_old_value_before_dispatch_applies_update` delivers
+totals 100 then 137 through `LoginEvent::ZoneFrame`/`pump` and expects one 37-XP line plus stored total 137;
+`character_info_first_response_and_refresh_use_current_packet_stats` covers the post-apply page ordering.
+
+
 ## 7. Filters
 
 * Class subscription: which window shows a class is the window's group list (win owner).

@@ -98,6 +98,36 @@ fn character_info_first_response_and_refresh_use_current_packet_stats() {
 }
 
 #[test]
+fn stat_xp_feedback_uses_old_value_before_dispatch_applies_update() {
+    let Some(mut r) = rig() else { return };
+    r.p.zone = zone::Zone::new(42);
+    // Stat feedback is emitted only for announced dynels (`LogCtx::known`).
+    r.p.zone.dynels.insert(42, zone::DynelState {
+        name: "XP dispatch fixture".into(), pos: [0.0; 3], yaw: None,
+        npc: false, side: 0, level: 1, health: 100, max_health: 100,
+    });
+    let stat_frame = |xp| {
+        let mut w = ao_net::Writer::default();
+        w.u32(ao_net::n3::dynel::STAT);
+        ao_net::msg::Identity { kind: 50000, instance: 42 }.write(&mut w);
+        w.u8(0);
+        w.i32(1);
+        w.i32(52);
+        w.i32(xp);
+        ao_net::n3::outgoing::n3_frame(0, 42, w.0)
+    };
+    r.event(LoginEvent::ZoneFrame(stat_frame(100)));
+    r.p.chat = Some(super::super::chat::Chat::new());
+    r.event(LoginEvent::ZoneFrame(stat_frame(137)));
+    assert_eq!(r.p.zone.stat(52), Some(137));
+    let lines = r.p.chat.as_ref().unwrap().pending_log_lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1);
+    let template = r.p.text.by_key(110, "Feedback_ReceivedXP").unwrap();
+    let expected = super::super::chat::log::ldb_format(&template, &[super::super::chat::log::Arg::N(37)]);
+    assert!(lines[0].text.contains(&expected), "{}", lines[0].text);
+}
+
+#[test]
 fn preview_first_waits_for_backdrop_instead_of_losing_upload() {
     let Some(mut r) = rig() else { return };
     r.p.backdrop = None;

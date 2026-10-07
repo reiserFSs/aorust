@@ -589,6 +589,123 @@ mod health_tests {
     use crate::play::combat::state::{Combat, CHAR_KIND};
     use crate::play::combat::log::fake::Fixed;
 
+    fn recorded_frames(record: &str) -> Vec<ao_net::frame::Frame> {
+        record.lines().map(|line| {
+            let hex = line.split_whitespace().nth(2).unwrap();
+            let bytes: Vec<_> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+            ao_net::frame::Frame::decode_with(&bytes, false).unwrap().unwrap().0
+        }).collect()
+    }
+
+    /// Real wire bytes; no GUI/render tick between undo, recast and Health StatIIR.
+    #[test]
+    fn captured_life_undo_clamps_zone_and_combat_before_same_batch_stat_feedback() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let captures = [
+            (include_str!("../../../../../docs/captures/body_boost_remove.rec"), 46, 55, false),
+            (include_str!("../../../../../docs/captures/body_boost_refresh.rec"), 40, 52, true),
+        ];
+        for (record, base_life, before_health, recast) in captures {
+            let frames = recorded_frames(record);
+            let own = 33588;
+            let mut combat = Combat::new(Box::new(Fixed::new()));
+            let mut zone = crate::play::zone::Zone::new(own);
+            let mut stats = crate::play::hud_stats::HudStats::new(&dir, (960, 628)).unwrap();
+            for frame in &frames[..4] {
+                combat.on_frame(frame, own);
+                let serial = zone.nanos.serial;
+                zone.on_frame(frame);
+                if zone.nanos.serial != serial {
+                    if let Some(health) = stats.nano_stats_changed(&mut zone) {
+                        combat.set_health_local(own as i32, health);
+                    }
+                }
+            }
+            // The first in-world HUD refresh computes PRK's raw Life=1 from the native tables.
+            stats.nano_stats_changed(&mut zone);
+            assert_eq!((zone.stat(1), zone.stat(27)), (Some(base_life), Some(before_health)));
+            assert_eq!(zone.skill_value(1), Some(base_life + 20));
+            assert_eq!(combat.char(own as i32).unwrap().health(), before_health);
+            // Without undo, the exact captured lower Health packet still produces genuine delta feedback.
+            let feedback_frame = frames.last().unwrap();
+            let normal = combat.on_frame(feedback_frame, own);
+            assert!(normal.iter().any(|e| matches!(e, CombatEvent::Log(_))));
+            assert!(normal.iter().any(|e| matches!(e, CombatEvent::Health { delta, .. } if *delta == base_life - before_health)));
+            combat.set_health_local(own as i32, before_health);
+            for frame in &frames[4..frames.len() - 1] {
+                let events = combat.on_frame(frame, own);
+                assert!(!events.iter().any(|e| matches!(e, CombatEvent::Log(_))));
+                let serial = zone.nanos.serial;
+                zone.on_frame(frame);
+                if zone.nanos.serial != serial {
+                    if let Some(health) = stats.nano_stats_changed(&mut zone) {
+                        combat.set_health_local(own as i32, health);
+                    }
+                }
+                assert_eq!(zone.stat(27), Some(base_life));
+                assert_eq!(zone.stat_of(own as i32, 27), Some(base_life));
+                assert_eq!(zone.own().unwrap().health, base_life);
+                assert_eq!(combat.char(own as i32).unwrap().health(), base_life);
+            }
+            if recast { assert_eq!(zone.skill_value(1), Some(base_life + 20)); }
+            let events = combat.on_frame(feedback_frame, own);
+            assert!(!events.iter().any(|e| matches!(e, CombatEvent::Log(_) | CombatEvent::Floating { .. })));
+            assert!(events.iter().any(|e| matches!(e, CombatEvent::Health { delta: 0, .. })));
+            zone.on_frame(feedback_frame);
+            assert_eq!(zone.stat(27), Some(base_life));
+        }
+    }
+
+    #[test]
+    fn captured_same_nano_refresh_clamps_before_readding_unchanged_maximum() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let frames = recorded_frames(include_str!("../../../../../docs/captures/body_boost_refresh.rec"));
+        let mut zone = crate::play::zone::Zone::new(33588);
+        let mut stats = crate::play::hud_stats::HudStats::new(&dir, (960, 628)).unwrap();
+        for frame in &frames[..4] {
+            zone.on_frame(frame);
+            stats.nano_stats_changed(&mut zone);
+        }
+        assert_eq!((zone.stat(27), zone.skill_value(1)), (Some(52), Some(60)));
+        // Replay the actual recast notification against the still-active old entry.
+        zone.on_frame(&frames[5]);
+        assert_eq!(stats.nano_stats_changed(&mut zone), Some(40));
+        assert_eq!((zone.stat(27), zone.skill_value(1)), (Some(40), Some(60)));
+        assert_eq!(zone.nanos.buffs.len(), 1);
+    }
+
+    #[test]
+    fn captured_scfu_replacement_preserves_authoritative_health_with_hud_present() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let frames = recorded_frames(include_str!("../../../../../docs/captures/body_boost_remove.rec"));
+        let own = 33588;
+        let mut combat = Combat::new(Box::new(Fixed::new()));
+        let mut zone = crate::play::zone::Zone::new(own);
+        let mut stats = crate::play::hud_stats::HudStats::new(&dir, (960, 628)).unwrap();
+        for frame in &frames[..4] {
+            combat.on_frame(frame, own);
+            zone.on_frame(frame);
+            stats.nano_stats_changed(&mut zone);
+        }
+        assert_eq!((zone.stat(1), zone.stat(27)), (Some(46), Some(55)));
+        // Re-place using the real SCFU alone: max66 - encoded delta14 = Health52.
+        // No following FullCharacter/StatIIR is allowed to mask an erroneous clamp.
+        let scfu = &frames[1];
+        combat.on_frame(scfu, own);
+        zone.on_frame(scfu);
+        assert!(zone.nano_stat_removals.is_empty(), "restoration visual teardown is not a post-header undo");
+        assert_eq!(stats.nano_stats_changed(&mut zone), None);
+        assert_eq!((zone.stat(27), zone.skill_value(27)), (Some(52), Some(52)));
+        assert_eq!(zone.character_stats[&(own as i32)][&27], 52);
+        assert_eq!(zone.own().unwrap().health, 52);
+        assert_eq!(combat.char(own as i32).unwrap().health(), 52);
+        assert_eq!(zone.skill_value(1), Some(66));
+        assert_eq!(zone.nanos.buffs.len(), 1);
+    }
+
     #[test]
     fn npc_hit_and_authoritative_health_reach_all_zone_views() {
         let mut combat = Combat::new(Box::new(Fixed::new()));

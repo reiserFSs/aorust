@@ -158,6 +158,9 @@ pub struct Zone {
     child_rel: HashMap<i32, ([f32; 3], f32)>,
     /// The own nano programs and timed nano effects (`own_nanos.rs`, the Programs / NCU windows).
     pub nanos: super::own_nanos::OwnNanos,
+    /// Ordered modifier undo phases awaiting the in-world stat projection.
+    /// Separate from final active entries so same-nano refresh still clamps health.
+    pub(super) nano_stat_removals: Vec<i32>,
     /// The `TeleportTrier_t` [GC 0x10037d05] of a client-initiated teleport try (a child of the playfield, so it survives the own dynel being
     /// placed again and dies with the playfield): seconds elapsed since `StartTryingTeleport`. `None`: no try is running.
     pub trier: Option<f32>,
@@ -387,7 +390,16 @@ impl Zone {
         let duration_percent = self.skill_value(464).unwrap_or(100);
         let delta = self.nanos.on_message(who, Identity { kind: CHAR_KIND, instance: self.char_id as i32 }, &m.body, duration_percent);
         self.adjust_ncu(delta);
-        self.world.apply_buff_visuals(self.char_id as i32, self.nanos.take_visuals());
+        let visuals = self.nanos.take_visuals();
+        // SCFU replaces authoritative Health later in this message. Its visual
+        // teardown is restoration bookkeeping, not a Life undo after that header.
+        if !matches!(&m.body, N3::Dynel(Dynel::SimpleCharFullUpdate(_))) {
+            self.nano_stat_removals.extend(visuals.iter().filter_map(|event| match event {
+                super::own_nanos::VisualEvent::Remove { nano } => Some(*nano),
+                _ => None,
+            }));
+        }
+        self.world.apply_buff_visuals(self.char_id as i32, visuals);
         if who == (Identity { kind: CHAR_KIND, instance: self.char_id as i32 }) {
             if let N3::World(World::CharacterAction(a)) = &m.body {
                 if a.action == ao_net::n3::inventory::ACTION_DELETE_ITEM {
@@ -500,6 +512,7 @@ impl Zone {
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if who.kind == CHAR_KIND => {
                 if who.instance == self.char_id as i32 {
                     self.own_update = Some(u.clone());
+                    self.stats.insert(ao_formats::stats::HEALTH, u.health);
                     // `FUN_10077af2` [GC]: stat `InPlay` (0xC2) = `VisualFlags >> 1 & 1`
                     self.stats.insert(IN_PLAY_STAT, i32::from(u.visual_flags >> 1 & 1));
                     self.own_serial += 1;

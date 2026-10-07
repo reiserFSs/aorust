@@ -732,6 +732,7 @@ fn live_walk() {
                 v.sort();
                 eprintln!("stats {}", v.iter().map(|(k, x)| format!("{k}={x}")).collect::<Vec<_>>().join(" "));
             }
+            "buffs" => eprintln!("buffs time={} ncu={} entries={:?}", l.p.zone.nanos.time, l.p.zone.nanos.buffs.iter().map(|b| b.ncu_cost).sum::<i32>(), l.p.zone.nanos.buffs),
             // the spells running on the own character (docs/gui.md §11.14) and the maps they fill
             "spells" => {
                 eprintln!("spells {}", l.p.zone.active_spells.iter().map(|s| format!("{:#x}(stat {} amount {} target {})", s.function, s.stat(0), s.stat(0x27), s.stat(0x20))).collect::<Vec<_>>().join(" "));

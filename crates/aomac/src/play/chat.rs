@@ -325,6 +325,14 @@ impl Chat {
         self.net.drop_connection();
     }
 
+    #[cfg(test)]
+    pub fn pending_log_lines(&self) -> impl Iterator<Item = &ChatLine> {
+        self.backlog.iter().filter_map(|entry| match entry {
+            Back::Line(line, _) => Some(line),
+            _ => None,
+        })
+    }
+
     /// `/waypoint`, heard voices, `/macro` results for the flow.
     pub fn take_requests(&mut self) -> Requests {
         std::mem::take(&mut self.requests)
@@ -407,16 +415,13 @@ impl Chat {
     pub fn on_zone_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &Zone, texts: &TextDb) {
         self.own_id = zone.char_id;
         self.expansion = zone.stat(0x185).unwrap_or(0);
+        if f.ptype == PT_N3 && f.payload.get(..4) == Some(ao_net::n3::info::INFO_PACKET.to_be_bytes().as_slice()) {
+            return; // InfoPacket pages require the applied zone, not the old stats.
+        }
         match f.ptype {
             PT_SYSTEM => self.net.on_system_frame(f, zone.char_id),
             PT_N3 => {
                 let Ok(m) = n3::decode(f) else { return };
-                if let N3::World(ao_net::n3::world::World::Info(packet)) = &m.body {
-                    match info::character_html(zone, m.header.target, packet, texts) {
-                        Ok(html) => self.info.character_page(gui, m.header.target, html),
-                        Err(error) => self.system_line(gui, &format!("Character info failed: {error:#}"), 12),
-                    }
-                }
                 if let N3::Chat(c) = &m.body {
                     let ctx = zone::ZoneChatCtx {
                         texts,
@@ -436,6 +441,20 @@ impl Chat {
                 self.log_events(gui, &log::events(&m), zone, texts);
             }
             _ => {}
+        }
+    }
+
+    /// InfoPacket Apply (GC 0x10045fba) updates skills before its info signal builds the page.
+    pub fn on_zone_applied(&mut self, gui: &mut Gui, f: &Frame, zone: &Zone, texts: &TextDb) {
+        if f.ptype != PT_N3 || f.payload.get(..4) != Some(ao_net::n3::info::INFO_PACKET.to_be_bytes().as_slice()) {
+            return;
+        }
+        let Ok(m) = n3::decode(f) else { return };
+        if let N3::World(ao_net::n3::world::World::Info(packet)) = &m.body {
+            match info::character_html(zone, m.header.target, packet, texts) {
+                Ok(html) => self.info.character_page(gui, m.header.target, html),
+                Err(error) => self.system_line(gui, &format!("Character info failed: {error:#}"), 12),
+            }
         }
     }
 

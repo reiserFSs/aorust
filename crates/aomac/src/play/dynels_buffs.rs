@@ -183,6 +183,51 @@ mod tests {
         assert!(!host.actors.iter().any(|a|matches!(a.model as u32,6203|20092|20097)));
     }
 
+    /// Captured login order: action62, nonempty own effects, then empty FullCharacter spells.
+    #[test]
+    fn captured_body_boost_login_retains_timed_nano_and_pending_visual() {
+        let Some(dir) = installed() else { return };
+        let mut zone = crate::play::zone::Zone::new(33588);
+        zone.world.start(dir, 33588);
+        let frames: Vec<_> = include_str!("../../../../docs/captures/body_boost_login.rec").lines().map(|line| {
+            let hex = line.split_whitespace().nth(2).unwrap();
+            let bytes: Vec<_> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+            Frame::decode_with(&bytes, false).unwrap().unwrap().0
+        }).collect();
+        assert_eq!(frames.len(), 4);
+        for (index, frame) in frames.iter().enumerate() {
+            let message = ao_net::n3::decode(frame).unwrap();
+            match (index, &message.body) {
+                (0, N3::World(World::Playfield(_))) => {}
+                (1, N3::World(World::CharacterAction(a))) => {
+                    assert_eq!(a.action, 0x62);
+                    assert_eq!(a.identity_b.instance, 175186);
+                }
+                (2, N3::Dynel(Dynel::SimpleCharFullUpdate(update))) => {
+                    assert_eq!(update.effects.len(), 1);
+                    assert_eq!(update.effects[0].source, nano::nano(29091));
+                    assert_eq!((update.effects[0].b, update.effects[0].c), (175180, 175180));
+                }
+                (3, N3::World(World::FullCharacter(character))) => assert!(character.spells.is_empty()),
+                _ => panic!("unexpected captured login order"),
+            }
+            zone.on_frame(frame);
+            if index == 0 { continue; }
+            let buff = zone.nanos.buffs.iter().find(|buff| buff.nano == 29091).expect("login retains timed Body Boost");
+            assert_eq!(buff.total_cs, if index == 1 { 175186 } else { 175180 });
+            assert_eq!(buff.ncu_cost, 1);
+            zone.world.buff_visual_frame(0.0, |_| None, |_, _| None);
+            let visual = &zone.world.buff_visuals[&(33588, 29091)];
+            assert_eq!(visual.duration, 1751.0);
+            assert_eq!(visual.handle, None, "login visual waits for own avatar anchors");
+        }
+        zone.world.buff_visual_frame(0.0, |_| Some(glam::Mat4::IDENTITY.to_cols_array_2d()), |_, _| None);
+        let handle = zone.world.buff_visuals[&(33588, 29091)].handle.expect("own anchor starts restored Body Boost");
+        assert_ne!(handle, 0);
+        assert!(zone.world.effects.as_ref().unwrap().is_active(handle));
+        assert_eq!(zone.nanos.buffs[0].remaining_cs(zone.nanos.time), 175180);
+    }
+
     fn installed() -> Option<std::path::PathBuf> {
         let dir = ao_gui::client_dir();
         dir.join("cd_image/rdb.db").exists().then_some(dir)

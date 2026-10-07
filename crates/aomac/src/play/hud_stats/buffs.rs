@@ -15,16 +15,79 @@
 //! argument 0x20) is 0xe or 0x17 run on the owner / pet relation of the character, not on it (`FUN_100026d0`), so they are not kept.
 //!
 //! Item Wear effects are supplied by `equipment.rs`: `FUN_100cba71` merges the low/high templates by QL; modifier functions interpolate argument 39 only.
+//! Timed nano template events 4/0 are supplied by `TimedEffects` from the zone's authoritative active entries; removal drops their contribution.
+//! Timed Life-bonus undo clamps stored Health between received messages (`HudStats::nano_stats_changed`, native `1006469b`), including refresh's intermediate undo.
 //! **UNRESOLVED / not modelled**:
 //! * Timed effects: `FUN_100a59f5` ends spells with a duration (`GetStat(0x19)`, function `0xcf16`) by itself; the server's undo `ApplySpellsIIR_t` is what removes
 //!   a spell here.
 //! * The delta of `0xcfb7` / `0xcff5` is fixed at apply time in the client (stored in the spell object for the undo); it is recomputed from the current
 //!   level / value on every refresh here.
-//! * `FUN_100644c8`'s side effects (a `Life` clamp for stat 1, `FUN_1006253c` stat-change events for ability changes) are not ported: they do not change the maps' values.
+//! * `FUN_100644c8`'s minimum-Life bonus adjustment and `FUN_1006253c` ability stat-change signals are not ported. Health clamping on timed Life undo is implemented.
 
 use super::super::zone::Zone;
 use ao_formats::stats::buffs::Modifiers;
 use ao_net::n3::spells::{stat, Spell};
+
+/// Timed nano entries execute template events 4 and 0 (`GC 100512af`,
+/// 10051487..100514ff); 1005064c undoes both on removal. These are independent
+/// of FullCharacter/ApplySpells spell lists, just as in the native executor.
+pub(in crate::play) struct TimedEffects {
+    store: Option<ao_rdb::RecordStore>,
+    templates: std::collections::HashMap<i32, Vec<Spell>>,
+    signature: Vec<i32>,
+    active: Vec<Spell>,
+    effects: Vec<Spell>,
+}
+
+impl TimedEffects {
+    pub(in crate::play) fn new(dir: &std::path::Path) -> Self {
+        Self { store: ao_rdb::RecordStore::open(dir).ok(), templates: Default::default(),
+            signature: Vec::new(), active: Vec::new(), effects: Vec::new() }
+    }
+
+    pub(in crate::play) fn refresh(&mut self, zone: &Zone) {
+        if self.signature.iter().copied().eq(zone.nanos.buffs.iter().map(|b| b.nano))
+            && self.active == zone.active_spells { return; }
+        self.signature.clear();
+        self.signature.extend(zone.nanos.buffs.iter().map(|b| b.nano));
+        self.active.clone_from(&zone.active_spells);
+        self.effects.clone_from(&self.active);
+        for &nano in &self.signature {
+            let spells = self.templates.entry(nano).or_insert_with(|| {
+                let load = || -> anyhow::Result<Vec<Spell>> {
+                    let store = self.store.as_ref().ok_or_else(|| anyhow::anyhow!("nano record store unavailable"))?;
+                    let record = store.get(super::super::hud_nanodb::NANO_RDB_TYPE, u32::try_from(nano)?)?
+                        .ok_or_else(|| anyhow::anyhow!("nano template {nano} missing"))?;
+                    let mut spells = super::super::chat::item_template_spells(&record, 4)?;
+                    spells.extend(super::super::chat::item_template_spells(&record, 0)?);
+                    spells.retain(|s| runs_on_character(s) && matches!(s.function, 0xcf14 | 0xcf35 | 0xcfb7 | 0xcff5 | 0xcfc0));
+                    Ok(spells)
+                };
+                load().unwrap_or_else(|error| {
+                    eprintln!("nano {nano}: timed modifiers unavailable: {error:#}");
+                    Vec::new()
+                })
+            });
+            self.effects.extend_from_slice(spells);
+        }
+    }
+
+    /// Undo the old entry before a refresh/conflicting replacement adds its new one.
+    /// Returns whether an undone bonus-map spell targeted Life (`1006469b`).
+    pub(super) fn remove(&mut self, nano: i32) -> bool {
+        let Some(index) = self.signature.iter().position(|&id| id == nano) else { return false };
+        self.signature.remove(index);
+        let life = self.templates.get(&nano).is_some_and(|spells| spells.iter().any(|s|
+            s.stat(stat::STAT) == 1 && matches!(s.function, 0xcf14 | 0xcf35 | 0xcfb7 | 0xcff5)));
+        self.effects.clone_from(&self.active);
+        for id in &self.signature {
+            if let Some(spells) = self.templates.get(id) { self.effects.extend_from_slice(spells); }
+        }
+        life
+    }
+
+    pub(in crate::play) fn effects(&self) -> &[Spell] { &self.effects }
+}
 
 /// Function ids of the spells that write the maps (see the module table).
 const MODIFY_STAT: [u32; 2] = [0xCF14, 0xCF35];
@@ -85,6 +148,81 @@ mod tests {
 
     fn modify(function: u32, stat_id: i32, amount: i32) -> Spell {
         spell(function, &[(stat::STAT, stat_id), (stat::VALUE, amount), (stat::TARGET, 2)])
+    }
+
+    #[test]
+    fn timed_ability_and_percent_modifiers_keep_info_base_cost_and_total_consistent() {
+        use ao_formats::stats::{buffs, skills::{Character, SkillTables}};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let store = ao_rdb::RecordStore::open(&dir).unwrap();
+        let tables = SkillTables::load(&store).unwrap();
+        let mut zone = Zone::new(7);
+        zone.stats.extend([(4, 1), (54, 10), (60, 1), (37, 1), (152, 20)]);
+        zone.stats.extend((16..=21).map(|id| (id, 20)));
+        zone.nanos.buffs.push(super::super::super::own_nanos::Buff { nano: 1, ..Default::default() });
+        let mut effects = TimedEffects::new(&dir);
+        effects.templates.insert(1, vec![modify(0xcf35, 18, 12), modify(0xcfc0, 152, 50)]);
+        effects.refresh(&zone);
+        let character = Character::from_stats(|id| zone.stat(id));
+        let current = |id, modifiers: &Modifiers| buffs::skill_value(&tables, id, zone.stat(id).unwrap_or(0), &character, modifiers, 0);
+        let modifiers = modifiers_with_equipment(effects.effects(), &[], 10, &current);
+        let info_base = buffs::skill_base(&tables, 152, 20, &character, &modifiers, 0);
+        let unbuffed_base = buffs::skill_base(&tables, 152, 20, &character, &Modifiers::default(), 0);
+        assert!(info_base > unbuffed_base, "timed stamina and percent buffs affect Base, not just Total");
+        assert_ne!(tables.cost(152, info_base, &character), tables.cost(152, unbuffed_base, &character));
+        let mut model = super::super::skill_model::Model::new(tables, Vec::new());
+        model.refresh_buffs(&|id| zone.stat(id), effects.effects(), &[], None);
+        let row = model.row(&|id| zone.stat(id), 152);
+        model.publish(&mut zone);
+        assert_eq!(info_base, row.base);
+        assert_eq!(zone.skill_value(152), Some(row.value));
+    }
+
+    #[test]
+    fn body_boost_timed_template_health_lifecycle() {
+        use ao_net::{msg::Identity, n3::{action::simple, nano, world::World, N3}};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let own = Identity { kind: 0xc350, instance: 7 };
+        let mut zone = Zone::new(7);
+        zone.stats.extend([(1, 40), (27, 60)]);
+        let mut timed = TimedEffects::new(&dir);
+        let mut model = super::super::skill_model::Model::new(Default::default(), Vec::new());
+        let add = N3::World(World::CharacterAction(simple(0x62, nano::nano(29091), Identity { kind: 7, instance: 180000 })));
+        let publish = |timed: &mut TimedEffects, model: &mut super::super::skill_model::Model, zone: &mut Zone| {
+            timed.refresh(zone);
+            model.refresh_buffs(&|id| zone.stat(id), timed.effects(), &[], None);
+            model.publish(zone);
+        };
+        zone.nanos.on_message(Identity { instance: 8, ..own }, own, &add, 100);
+        publish(&mut timed, &mut model, &mut zone);
+        assert_eq!(zone.skill_value(1), Some(40));
+        for _ in 0..2 {
+            zone.nanos.on_message(own, own, &add, 100);
+            publish(&mut timed, &mut model, &mut zone);
+            assert_eq!((zone.stat(1), zone.skill_value(1), zone.skill_value(27)), (Some(40), Some(60), Some(60)));
+        }
+        zone.nanos.tick(1801.0);
+        publish(&mut timed, &mut model, &mut zone);
+        assert_eq!(zone.skill_value(1), Some(60), "timer zero does not invent server removal");
+        // The projection also consumes entries restored at login, without an immediate spell list.
+        let mut restored = Zone::new(7);
+        restored.stats.extend([(1, 40), (27, 60)]);
+        restored.nanos.buffs.clone_from(&zone.nanos.buffs);
+        publish(&mut timed, &mut model, &mut restored);
+        assert_eq!(restored.skill_value(1), Some(60));
+        // Native immediate and timed sources are independent, not value-deduplicated.
+        restored.active_spells.push(modify(0xcf35, 1, 20));
+        publish(&mut timed, &mut model, &mut restored);
+        assert_eq!(restored.skill_value(1), Some(80));
+        restored.active_spells.clear();
+        let remove = N3::Misc(ao_net::n3::misc::Misc::Buff(ao_net::n3::misc::Buff {
+            kind: 0, nano: Some(nano::nano(29091)), rest: Vec::new(),
+        }));
+        restored.nanos.on_message(own, own, &remove, 100);
+        publish(&mut timed, &mut model, &mut restored);
+        assert_eq!((restored.stat(1), restored.skill_value(1)), (Some(40), Some(40)));
     }
 
     #[test]

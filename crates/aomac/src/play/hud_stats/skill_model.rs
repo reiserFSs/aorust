@@ -115,6 +115,13 @@ impl Model {
         buffs::skill_value(&self.tables, stat, raw, &Character::from_stats(get), &self.mods, get(buffs::LOCK_STAT).unwrap_or(0))
     }
 
+    /// Direct stat-holder mode 3 (`10064800`): stored value plus bonus,
+    /// without percent/trickle. Life undo uses this limit (`1006469b`).
+    pub(super) fn life_limit(&self, get: Get) -> Option<i32> {
+        let raw = get(stats::LIFE)?;
+        Some(raw + self.mods.bonus_of(stats::LIFE, raw, get(buffs::LOCK_STAT).unwrap_or(0)))
+    }
+
     /// Reuses the map allocation; raw values remain untouched so trickle-down is never added twice.
     pub fn publish(&self, zone: &mut super::super::zone::Zone) {
         let mut values = std::mem::take(&mut zone.skill_values);
