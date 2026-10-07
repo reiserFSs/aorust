@@ -283,7 +283,9 @@ mod tests {
         // Synthetic connector for this ownership-only regression; the captured
         // Zone regression resolves the actual avatar's authored Spine3 matrix.
         renderer.prepare_anchor(identity,1004,Some(Mat4::from_translation(origin)));
-        let handle=renderer.spawn_configured(Binding {group:0,attractor:0,effect:1070,note:0,color:0},Mat4::from_translation(origin),origin,EffectConfig {source_identity:Some(identity),source_appearance:Some([1,2,1,100]),..EffectConfig::default()}).unwrap();
+        // BPHFSM is Dynel-only in the native factory; Matrix creation returns null.
+        let handle=renderer.spawn_configured(Binding {group:0,attractor:0,effect:1070,note:0,color:0},Mat4::from_translation(origin),origin,EffectConfig {creation:super::super::Creation::Dynel,source_identity:Some(identity),source_appearance:Some([1,2,1,100]),..EffectConfig::default()}).unwrap();
+        assert_ne!(handle,0,"the authored Dynel overload must create the Body Boost controller");
         renderer.elapsed=6.0;
         let mut host=ao_render::Host::headless();
         host.camera=ao_render::Camera::look_at(origin+Vec3::new(2.0,3.0,4.0),origin+Vec3::Y);
