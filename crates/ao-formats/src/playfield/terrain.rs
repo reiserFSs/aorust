@@ -1,15 +1,8 @@
-//! Outdoor terrain mesh: per-patch meshes with smooth tile transitions and baked ground shadows.
+//! Outdoor terrain mesh: authored tile orientations and baked ground shadows.
 //!
-//! * One [`Mesh`] + [`Instance`] per `PATCH` x `PATCH` cells (frustum culling granularity). The patch's
-//!   `(PATCH+1)^2` vertices are shared by all base submeshes (uv = lattice coordinates, tile textures repeat).
-//! * Base: every cell is drawn opaque with its own tile texture (grouped per texture), as the client does
-//!   (`FUN_10037957`, DisplaySystem @0x10037957, samples the same tile textures per cell).
-//! * Transitions: the client has no blend masks (1010021/1010022 are only the 128/64 pixel mip sets of 1010006);
-//!   edges are authored in the tile art. To hide the 4 m grid steps we additionally draw, over every cell, its
-//!   neighbours' textures as alpha-blended overlays. Vertex weight `w_M(v)` = fraction of the up to four cells around
-//!   vertex `v` that use texture `M`; a cell with base texture `T` overlays each other texture `M` (ascending texture id)
-//!   with alpha `w_M / (w_T + sum of w_M' of the overlays up to M)`. Over the opaque base this reproduces
-//!   `sum_M w_M(v) * tex_M` exactly at every vertex (continuous across cell and patch borders).
+//! * One [`Mesh`] + [`Instance`] per `PATCH` x `PATCH` cells (frustum culling granularity).
+//! * Four vertices per cell carry normalized, oriented UVs; opaque submeshes batch by texture.
+//!   DisplaySystem `FUN_100374c5` rotates the authored tile art, without neighbour blending.
 //! * Shadows: rdb 1000007, the client's day-time blend of two layers (`shadow::at_time`), multiplies the vertex colour (see `shadow`). The map already contains
 //!   hill shading; the geometric normals are kept anyway (the renderer flips normals that face away from the eye, so
 //!   flat "up" normals turn hills above the camera dark).
@@ -18,7 +11,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use ao_rdb::RecordStore;
-use ao_scene::{Blend, Environment, Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
+use ao_scene::{Environment, Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
 
 use super::ground::Tilemap;
 use super::shadow;
@@ -28,8 +21,6 @@ const TILE_TEXTURES: u32 = 1_010_021;
 const SHADOWS: u32 = 1_000_007;
 /// Cells per patch edge.
 const PATCH: usize = 64;
-/// Overlays are lifted by this much to stay above the coplanar base (the renderer also biases blended depth).
-const LIFT: f32 = 0.01;
 const NONE: u16 = u16::MAX;
 
 fn texture_key(store: &RecordStore, scene: &mut Scene, id: u16) -> Option<TextureKey> {
@@ -42,31 +33,14 @@ fn texture_key(store: &RecordStore, scene: &mut Scene, id: u16) -> Option<Textur
     Some(key)
 }
 
-/// Texture weights at a lattice vertex: the cells around it, `(texture, count)`.
-fn weights(tex: &[u16], cx: usize, cz: usize, vx: usize, vz: usize) -> ([(u16, u8); 4], usize, f32) {
-    let mut w = [(NONE, 0u8); 4];
-    let mut n = 0;
-    let mut total = 0.0;
-    for (dx, dz) in [(1, 1), (0, 1), (1, 0), (0, 0)] {
-        let (Some(x), Some(z)) = ((vx + dx).checked_sub(1), (vz + dz).checked_sub(1)) else { continue };
-        if x >= cx || z >= cz {
-            continue;
-        }
-        let t = tex[z * cx + x];
-        total += 1.0;
-        match w[..n].iter_mut().find(|e| e.0 == t) {
-            Some(e) => e.1 += 1,
-            None => {
-                w[n] = (t, 1);
-                n += 1;
-            }
-        }
+/// Source coordinates for a destination cell coordinate (DisplaySystem `FUN_100374c5`).
+fn tile_uv(raw: u16, [u, v]: [f32; 2]) -> [f32; 2] {
+    match raw >> 14 {
+        0 => [u, 1.0 - v],
+        1 => [1.0 - v, 1.0 - u],
+        2 => [1.0 - u, v],
+        _ => [v, u],
     }
-    (w, n, total)
-}
-
-fn weight_of(w: &[(u16, u8); 4], n: usize, total: f32, t: u16) -> f32 {
-    w[..n].iter().find(|e| e.0 == t).map_or(0.0, |e| e.1 as f32 / total)
 }
 
 pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_time: f32) -> Result<()> {
@@ -83,7 +57,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_
             }
         }
     }
-    // cells whose tile texture does not exist stay untextured and are never blended
+    // Cells whose tile texture does not exist stay untextured.
     tex.iter_mut().filter(|t| missing.contains(t)).for_each(|t| *t = NONE);
     let shade = store.get(SHADOWS, id).ok().flatten().and_then(|d| shadow::parse(&d).ok()).map(|l| shadow::at_time(&l, super::sky::ground_shadow_time(day_time)));
     let normal = |x: usize, z: usize| -> [f32; 3] {
@@ -102,22 +76,23 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_
     let env = scene.environment.unwrap_or(Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 0.0, fog_end: 1.0, ambient: [1.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 1.0 });
     let (sun, ambient) = (env.sun_color.map(super::environment::linear_to_srgb), env.ambient.map(super::environment::linear_to_srgb));
     let prelit = shade.is_some();
-    let vertex = |x: usize, z: usize, a: f32, lift: f32| {
+    let vertex = |x: usize, z: usize, uv: [f32; 2]| {
         let n = normal(x, z);
         let color = match &shade {
             Some(s) => {
                 let ndl = (n[0] * env.sun_dir[0] + n[1] * env.sun_dir[1] + n[2] * env.sun_dir[2]).max(0.0);
                 let p = shadow::palette(s.sample(x as f32 * 0.5, z as f32));
                 let c = [0, 1, 2].map(|c| p + sun[c] * ndl - 0.8 * ambient[c]);
-                [c[0], c[1], c[2], a]
+                [c[0], c[1], c[2], 1.0]
             }
-            None => [1.0, 1.0, 1.0, a],
+            None => [1.0, 1.0, 1.0, 1.0],
         };
-        Vertex { pos: [x as f32 * cs, tm.height(x, z) + lift, -(z as f32 * cs)], normal: n, uv: [x as f32, z as f32], color }
+        Vertex { pos: [x as f32 * cs, tm.height(x, z), -(z as f32 * cs)], normal: n, uv, color }
     };
-    // CCW seen from +Y in scene space (z negated); bit 14 of the tile value picks the diagonal.
+    // Outdoor checkerboard diagonal (N3 FUN_10017800), independent of texture orientation.
+    // CCW seen from +Y in scene space (z negated).
     let quad = |x: usize, z: usize, b: u32| {
-        if tm.diagonal_p10_p01(x, z) {
+        if (!z ^ x) & 1 == 0 {
             [b, b + 1, b + 2, b + 1, b + 3, b + 2]
         } else {
             [b, b + 1, b + 3, b, b + 3, b + 2]
@@ -126,61 +101,25 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, day_
     for pz in (0..cz).step_by(PATCH) {
         for px in (0..cx).step_by(PATCH) {
             let (ex, ez) = ((px + PATCH).min(cx), (pz + PATCH).min(cz));
-            let (nx, nz) = (ex - px + 1, ez - pz + 1);
-            let mut mesh = Mesh { vertices: (0..nz).flat_map(|j| (0..nx).map(move |i| (i, j))).map(|(i, j)| vertex(px + i, pz + j, 1.0, 0.0)).collect(), ..Default::default() };
+            let mut mesh = Mesh { vertices: Vec::with_capacity((ex - px) * (ez - pz) * 4), ..Default::default() };
             let mut base: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
-            let mut over: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
             for z in pz..ez {
                 for x in px..ex {
                     let t = tex[z * cx + x];
-                    let b = ((z - pz) * nx + (x - px)) as u32;
-                    // lattice corners (b, b+1, b+nx, b+nx+1) -> the quad helper expects 4 consecutive vertices
-                    let q = quad(x, z, 0).map(|i| match i {
-                        0 => b,
-                        1 => b + 1,
-                        2 => b + nx as u32,
-                        _ => b + nx as u32 + 1,
-                    });
-                    base.entry(t).or_default().extend(q);
-                    if t == NONE {
-                        continue;
+                    let b = mesh.vertices.len() as u32;
+                    let raw = tm.tiles[z * (tm.verts_x - 1) + x];
+                    for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        mesh.vertices.push(vertex(x + dx, z + dz, tile_uv(raw, [dx as f32, dz as f32])));
                     }
-                    let corners = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dz)| weights(&tex, cx, cz, x + dx, z + dz));
-                    let mut mats: Vec<u16> = corners.iter().flat_map(|c| c.0[..c.1].iter().map(|e| e.0)).filter(|&m| m != t && m != NONE).collect();
-                    mats.sort_unstable();
-                    mats.dedup();
-                    let mut acc = [0.0f32; 4];
-                    for (k, c) in corners.iter().enumerate() {
-                        acc[k] = weight_of(&c.0, c.1, c.2, t);
-                    }
-                    for m in mats {
-                        let mut alpha = [0.0f32; 4];
-                        for (k, c) in corners.iter().enumerate() {
-                            let w = weight_of(&c.0, c.1, c.2, m);
-                            acc[k] += w;
-                            alpha[k] = w / acc[k];
-                        }
-                        if alpha.iter().all(|&a| a < 0.01) {
-                            continue;
-                        }
-                        let first = mesh.vertices.len() as u32;
-                        for (k, (dx, dz)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
-                            mesh.vertices.push(vertex(x + dx, z + dz, alpha[k], LIFT));
-                        }
-                        over.entry(m).or_default().extend(quad(x, z, first));
-                    }
+                    base.entry(t).or_default().extend(quad(x, z, b));
                 }
             }
             for (t, indices) in base {
                 let texture = keys.get(&t).copied();
                 let mut s = Submesh::new(indices, texture);
                 s.prelit = prelit;
-                mesh.submeshes.push(s);
-            }
-            for (t, indices) in over {
-                let mut s = Submesh::new(indices, keys.get(&t).copied());
-                s.blend = Blend::AlphaBlend;
-                s.prelit = prelit;
+                // AnarchyGround constructor FUN_10033b97: texture state 12 = 3 (CLAMP).
+                s.texture_clamp = true;
                 mesh.submeshes.push(s);
             }
             scene.meshes.push(mesh);
@@ -195,39 +134,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vertex_weights_count_cells_around_the_vertex() {
-        // 2x2 map: textures [1 2 / 1 2]
-        let tex = [1, 2, 1, 2];
-        let (w, n, total) = weights(&tex, 2, 2, 1, 1); // centre vertex touches all four cells
-        assert_eq!(total, 4.0);
-        assert_eq!(n, 2);
-        assert_eq!((weight_of(&w, n, total, 1), weight_of(&w, n, total, 2)), (0.5, 0.5));
-        let (w, n, total) = weights(&tex, 2, 2, 0, 0); // corner: only cell (0,0)
-        assert_eq!((total, weight_of(&w, n, total, 1)), (1.0, 1.0));
-        let (w, n, total) = weights(&tex, 2, 2, 2, 1); // right border: cells (1,0),(1,1)
-        assert_eq!((total, weight_of(&w, n, total, 2)), (2.0, 1.0));
-    }
-
-    /// Alphas of the sequential overlays reproduce `sum w_M tex_M` regardless of which cell's base is `T`.
-    #[test]
-    fn sequential_alpha_is_a_partition_of_unity() {
-        let w = [(1u16, 0.25f32), (2, 0.5), (3, 0.25)]; // weights at a vertex
-        let colour = |m: u16| m as f32 * 10.0;
-        let expect: f32 = w.iter().map(|&(m, wm)| wm * colour(m)).sum();
-        for base in [1u16, 2, 3] {
-            let mut acc = w.iter().find(|e| e.0 == base).unwrap().1;
-            let mut c = colour(base);
-            for &(m, wm) in w.iter().filter(|e| e.0 != base) {
-                acc += wm;
-                let a = wm / acc;
-                c = c * (1.0 - a) + colour(m) * a;
-            }
-            assert!((c - expect).abs() < 1e-4, "base {base}: {c} vs {expect}");
+    fn native_tile_uv_orientations() {
+        let corners = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let expected = [
+            [[0.0, 1.0], [1.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+            [[1.0, 1.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+            [[1.0, 0.0], [0.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]],
+        ];
+        for (orientation, expected) in expected.iter().enumerate() {
+            assert_eq!(corners.map(|uv| tile_uv((orientation as u16) << 14 | 37, uv)), *expected);
         }
+        assert_eq!(tile_uv(0x4000, [0.25, 0.75]), [0.25, 0.75]);
     }
 
     /// Real data (skipped without the client): every playfield record's tail parses completely, the shadow map
-    /// size follows the vertex grid (`(verts_x-1)/2` x `verts_z-1`, padded) and the terrain builds with overlays.
+    /// size follows the vertex grid (`(verts_x-1)/2` x `verts_z-1`, padded).
     #[test]
     fn real_tails_shadows_and_terrain() {
         use crate::playfield::{environment, record, water};
@@ -249,6 +171,50 @@ mod tests {
         let mut scene = Scene::default();
         build(&store, 566, &tm, &mut scene, crate::playfield::DEFAULT_DAY_TIME).unwrap();
         assert!(scene.instances.len() >= 9); // 150 x 150 cells = 3 x 3 patches
-        assert!(scene.meshes.iter().flat_map(|m| &m.submeshes).any(|s| s.blend == Blend::AlphaBlend));
+        assert!(scene.meshes.iter().flat_map(|m| &m.submeshes).all(|s| s.blend != ao_scene::Blend::AlphaBlend && s.texture_clamp));
+    }
+
+    #[test]
+    fn installed_pf4582_authored_terrain() {
+        use crate::playfield::record;
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let Ok(store) = RecordStore::open(&std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client")) else { return };
+        let raw = store.get(super::super::RECORD, 4582).unwrap().unwrap();
+        let rec = record::parse(&raw).unwrap();
+        let tm = super::super::ground::parse(&store.get(super::super::TILEMAP, rec.tilemap).unwrap().unwrap()).unwrap();
+        let mut scene = Scene::default();
+        build(&store, 4582, &tm, &mut scene, crate::playfield::DEFAULT_DAY_TIME).unwrap();
+        assert!(!scene.meshes.is_empty());
+        let mut patches = scene.meshes.iter();
+        for pz in (0..tm.cells_z).step_by(PATCH) {
+            for px in (0..tm.cells_x).step_by(PATCH) {
+                let mesh = patches.next().unwrap();
+                let (ex, ez) = ((px + PATCH).min(tm.cells_x), (pz + PATCH).min(tm.cells_z));
+                assert_eq!(mesh.vertices.len(), (ex - px) * (ez - pz) * 4);
+                assert!(mesh.submeshes.iter().all(|s| s.blend != ao_scene::Blend::AlphaBlend && s.texture_clamp));
+                let quads: BTreeMap<_, _> = mesh.submeshes.iter().flat_map(|s| s.indices.as_chunks::<6>().0.iter().map(move |q| (q[0], (s.texture, q)))).collect();
+                assert_eq!(quads.len(), (ex - px) * (ez - pz));
+                for z in pz..ez {
+                    for x in px..ex {
+                        let b = ((z - pz) * (ex - px) + x - px) * 4;
+                        let raw = tm.tiles[z * (tm.verts_x - 1) + x];
+                        for (k, (dx, dz)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
+                            let v = &mesh.vertices[b + k];
+                            assert_eq!(v.uv, tile_uv(raw, [dx as f32, dz as f32]));
+                            assert_eq!(v.pos, [(x + dx) as f32 * tm.cell_size, tm.height(x + dx, z + dz), -((z + dz) as f32 * tm.cell_size)]);
+                            assert_eq!(v.color[3], 1.0);
+                        }
+                        let b = b as u32;
+                        // Native P0-P2 on even checkerboard cells, P1-P3 on odd cells.
+                        let expected = if (x + z).is_multiple_of(2) { [b, b + 1, b + 3, b, b + 3, b + 2] } else { [b, b + 1, b + 2, b + 1, b + 3, b + 2] };
+                        let t = tm.tile_texture[tm.tile(x, z) as usize] as u32;
+                        let (texture, indices) = quads.get(&b).unwrap();
+                        assert_eq!(*texture, Some(TextureKey { rdb_type: TILE_TEXTURES, id: t }));
+                        assert_eq!(**indices, expected);
+                    }
+                }
+            }
+        }
+        assert!(patches.next().is_none());
     }
 }

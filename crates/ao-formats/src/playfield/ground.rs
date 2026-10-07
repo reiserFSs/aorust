@@ -49,10 +49,6 @@ impl Tilemap {
     pub fn tile(&self, x: usize, z: usize) -> u16 {
         self.tiles[z * (self.verts_x - 1) + x] & self.tile_mask
     }
-    /// Bit 14 of the raw tile value: split the cell along (x+1,z)-(x,z+1) instead of (x,z)-(x+1,z+1).
-    pub fn diagonal_p10_p01(&self, x: usize, z: usize) -> bool {
-        self.tiles[z * (self.verts_x - 1) + x] >> 14 & 1 != 0
-    }
 }
 
 /// Minimal object-archive walker: name table + objects, returns the members of object 1.

@@ -162,9 +162,9 @@ desynchronise (cells wider than ~460 m overflow).
 `P1 (x+1,z)`, `P2 (x+1,z+1)`, `P3 (x,z+1)` at the heights of `FUN_10017c3e` (`u16 * scale`, indices clamped to the map);
 the cell is split by the parity `(~z ^ x) & 1`: **1** → diagonal `P0-P2`: `dx <= dz` → `(P0,P2,P3)` else `(P0,P1,P2)`;
 **0** → diagonal `P1-P3`: `dx + dz > cell` → `(P1,P2,P3)` else `(P0,P1,P3)`. The height is the plane of that triangle
-(normal = cross product, flipped up). Note: this differs from the **render mesh**, which uses bit 14 of the tile word
-(`diagonal_p10_p01`); the collision uses the parity, so on steep cells the two surfaces differ by up to a diagonal's error
-(in 4582 the difference is 0 on flat ground and up to ~2.3 m next to cliffs). `Terrain::at` in `collision.rs`.
+(normal = cross product, flipped up). The outdoor render mesh uses the same parity triangulation; raw tile bits 14–15
+instead orient the authored texture (DisplaySystem `FUN_100374c5`). `Terrain::at` in `collision.rs` retains this native
+collision calculation independently of texture orientation.
 
 ### 3.2 Dungeon, `n3RoomSurface_t::CalculateClosestPoint` @0x10013ee6
 `PosToRoom` (@0x1000c8aa, first room for which `n3Room_t::IsPosInside` @0x10011664 holds; ported in `zone.rs::room_contains`).
