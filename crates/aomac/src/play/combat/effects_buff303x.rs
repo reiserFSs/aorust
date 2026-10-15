@@ -597,7 +597,7 @@ impl TrailEffect {
         if remaining!=0 {for old in &mut self.samples[..remaining] {*old=sample;}}
     }
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn vertices(&mut self,time:f32,_camera:Vec3,right:Vec3,up:Vec3,_gc:&mut R250,ds:&mut R250,_crt:&mut ao_scene::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
+    pub(super) fn vertices(&mut self,time:f32,_camera:Vec3,_right:Vec3,_up:Vec3,_gc:&mut R250,ds:&mut R250,_crt:&mut ao_scene::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.done {return Ok(None);}
         let dt=(time-self.previous).max(0.0);self.previous=time;
         let phase=(time*f32::from_bits(self.template.words.get(13).copied().unwrap_or(0)))%1.0;
