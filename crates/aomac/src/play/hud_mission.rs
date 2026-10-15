@@ -210,7 +210,7 @@ impl HudMission {
             return;
         }
         let all = self.columns();
-        let view = ListView::new(Mode::List, all.clone(), 1, 0, (COL_REMAINING, false));
+        let view = ListView::new(Mode::List, all.clone(), 1, 0, (0, false));
         let texts = MenuTexts { list_mode: self.text("ListMode"), auto_arrange: self.text("AutoArrange") };
         let spec = Spec { name: "MissionView", title: "Missions", pos: (0, 0), client: CLIENT, top_xml: "", top_h: 0.0, texts, menu_base: MENU_BASE, screen: self.screen };
         match ListWindow::open(gui, spec, view, all, None) {
@@ -265,11 +265,18 @@ impl HudMission {
             let left = now.and_then(|n| q.remaining_secs(n)).unwrap_or(0);
             let cells = columns.iter().map(|c| if c.id == COL_REMAINING { remaining(left) } else { q.name.clone() }).collect();
             let icon = self.icon(gui, q.icon);
-            rows.push(Row { key: q.id.instance, icon, cells, tip_title: q.name.clone(), tip_body: String::new() });
+            rows.push((left, Row { key: q.id.instance, icon, cells, tip_title: q.name.clone(), tip_body: String::new() }));
         }
         self.quests = quests;
         let win = self.win.as_mut().expect("open");
-        win.view.set_rows(rows);
+        let (column, descending) = win.view.sort;
+        if win.view.mode == Mode::List && column != 0 {
+            rows.sort_by(|(left, a), (right, b)| {
+                let order = if column == COL_REMAINING { left.cmp(right) } else { a.tip_title.to_lowercase().cmp(&b.tip_title.to_lowercase()) };
+                if descending { order.reverse() } else { order }
+            });
+        }
+        win.view.set_rows_presorted(rows.into_iter().map(|(_, row)| row).collect());
         win.view.paint(gui, w, lv::ICON_32);
         self.built = Some(sig);
     }
@@ -485,7 +492,10 @@ mod tests {
         m.sync = Some((10_000, 0.0));
         m.serial += 1;
         m.update(&mut gui, 0.0);
-        assert_eq!(m.shown(), vec![(2, vec!["Team Job".into(), "00:00".into()]), (1, vec!["Rat Hunt".into(), "00:01".into()])]);
+        assert_eq!(m.shown(), vec![(1, vec!["Rat Hunt".into(), "00:01".into()]), (2, vec!["Team Job".into(), "00:00".into()])]);
+        m.win.as_mut().unwrap().view.sort = (COL_REMAINING, false);
+        m.update(&mut gui, 0.0);
+        assert_eq!(m.shown()[0].0, 2, "explicit Remaining sort, not the initial grid-position order");
         let win = m.win.as_ref().unwrap().win;
         for (width, height) in [CLIENT, (640, 400), (900, 600)] {
             gui.resize_window(win, ao_gui::WindowSize::Fixed(width, height));
@@ -532,6 +542,12 @@ mod tests {
         m.sync_removed(&zone);
         m.update(&mut gui, 0.0);
         assert_eq!(m.shown(), vec![(2, vec!["Team Job".into(), "00:00".into()])]);
+        m.set_quests(&[quest(4, "Later", 0, 10_120), quest(5, "Earlier", 0, 10_119)]);
+        m.update(&mut gui, 0.0);
+        assert_eq!(m.shown().iter().map(|r| r.0).collect::<Vec<_>>(), [5, 4], "raw seconds sort even when both cells display00:01");
+        m.win.as_mut().unwrap().view.sort.1 = true;
+        m.update(&mut gui, 0.0);
+        assert_eq!(m.shown().iter().map(|r| r.0).collect::<Vec<_>>(), [4, 5]);
     }
 
     /// `MP_Quest_Icon`: `icon_at` finds a quest row and misses empty space (regression for the shift-to-inspect cursor).

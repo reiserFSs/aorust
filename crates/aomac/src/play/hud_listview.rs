@@ -146,8 +146,7 @@ impl ListView {
 
     /// Replaces the items. Grid: server order (`GetFirstFreePos` per arrival); list: sorted by [`ListView::sort`].
     pub fn set_rows(&mut self, rows: Vec<Row>) {
-        self.rows = rows;
-        self.dirty = true;
+        self.set_rows_presorted(rows);
         if self.mode == Mode::List {
             let Some(ci) = self.columns.iter().position(|c| c.id == self.sort.0) else { return };
             let desc = self.sort.1;
@@ -164,6 +163,12 @@ impl ListView {
                 }
             });
         }
+    }
+
+    /// Domain-owned sorting, when the displayed cells discard part of the numeric key.
+    pub fn set_rows_presorted(&mut self, rows: Vec<Row>) {
+        self.rows = rows;
+        self.dirty = true;
     }
 
     /// The disabled overlay of icons whose action recharges (`FUN_10040001`: `GFX_GUI_ICONFADER32` tinted 0, source and destination shrunk from both
