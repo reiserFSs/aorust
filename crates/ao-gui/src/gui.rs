@@ -1664,7 +1664,7 @@ impl Gui {
     /// outer rect minus the `WndBorder` border (3, 7, 3, 3); its tab-strip box (`GFX_GUI_TAB_BORDER_*` + `TAB_BACKGROUND`, layer-2 alpha) starts 2 px above the end of
     /// the 18 px strip; the selected tab (`GFX_GUI_TAB_ACTIVE_LEFT/MIDDLE/RIGHT`, 17 rows, layer-2 alpha, `Tab::SetSelected` 0x10146110 text colour 0xffffff,
     /// font NORMAL) sits 20 px from the left edge with the title 5 px inside; its width is the title width + 1 + 5 + 16 (`FUN_101461dc`).
-    /// UNRESOLVED: the title's vertical offset inside the tab (drawn at the tab top like any `TextView`) and +-1 px of the strip height.
+    /// Title layout is `Tab::Layout` 0x10145444: left inset 5, right reserve 16, vertically centred preferred text extent.
     fn draw_tab_strip(&mut self, box_gfx: &[Option<GfxId>; 9], outer: Rect, root: ViewId, col: [u8; 3], out: &mut Vec<DrawCmd>) {
         let tv = outer.resize(3.0, 7.0, -3.0, -3.0);
         let top = Rect::new(tv.l, tv.t + TAB_BOX_TOP, tv.r, tv.b);

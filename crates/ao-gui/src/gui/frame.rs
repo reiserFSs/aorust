@@ -523,11 +523,13 @@ impl Gui {
         let text = if selected { [255; 3] } else { [0; 3] };
         // The title is a `TextView` (HTML subset): a `<font color=..>` run keeps its own colour, the rest uses the tab's text colour.
         let runs = self.tab_runs(title);
+        // Tab::Layout (GUI 10145444) centres the preferred text extent vertically.
+        let y = tab.t + ((TAB_H - self.fonts.font(FontId::Normal).height as f32) * 0.5).floor();
         let mut pen = (tab.l + TAB_PAD_L) as i32;
         let outer = push_clip(out, [(tab.l + TAB_PAD_L) as i32, tab.t as i32, (tab.r + 1.0 - TAB_PAD_R) as i32, tab.b as i32 + 1]);
         for run in runs {
             let c = run.color.map_or(text, rgb);
-            pen += self.draw_string(out, FontId::Normal, &run.text, pen, tab.t as i32, c, alpha, false);
+            pen += self.draw_string(out, FontId::Normal, &run.text, pen, y as i32, c, alpha, false);
         }
         out.push(DrawCmd::Clip(outer));
         out.push(DrawCmd::Clip(tab_clip));
@@ -693,6 +695,17 @@ mod tests {
         eprintln!("window drag MouseMove: {:.1} us/event ({} events)", per_event.as_secs_f64() * 1e6, n);
         gui.input(crate::InputEvent::MouseUp { x: 150.0, y: 107.0, button: crate::MouseButton::Left });
         assert!(per_event.as_micros() < 500, "drag MouseMove got {per_event:?}/event, expected sub-millisecond (no relayout on a pure move)");
+    }
+
+    #[test]
+    fn tab_titles_use_native_vertical_centre_and_left_inset() {
+        let Ok(mut gui) = Gui::new(&crate::client_dir(), None) else { return };
+        let tab = Rect::new(10.0, 20.0, 109.0, 36.0);
+        let mut cmds = Vec::new();
+        gui.draw_tab(&mut cmds, tab, "Title", true, [255; 3], 1.0);
+        let y = 20 + ((TAB_H - gui.fonts.font(FontId::Normal).height as f32) * 0.5).floor() as i32;
+        assert!(cmds.iter().any(|cmd| matches!(cmd, DrawCmd::Glyph { dst, .. } if dst[0] == 15 && dst[1] == y)));
+        assert!(y > 20);
     }
 
     #[test]
