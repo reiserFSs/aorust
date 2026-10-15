@@ -5,6 +5,11 @@ use ao_net::msg::Identity;
 use ao_net::n3::inventory::{self as inv, InventoryMsg};
 
 impl Zone {
+    /// `N3Msg_ToggleReclaim` queries registered container kind DEAE (GC 0x1003f03e).
+    pub(in crate::play) fn reclaim_registered(&self) -> bool {
+        self.containers.keys().any(|&(kind, _)| kind == 0xdeae)
+    }
+
     /// The own character's identity (`{0xC350, char_id}`).
     fn own_identity(&self) -> Identity {
         Identity { kind: 0xC350, instance: self.char_id as i32 }

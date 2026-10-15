@@ -678,6 +678,11 @@ impl Zone {
                 self.own_events.push(OwnEvent::Appearance(a));
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+                // Reclaim-off acknowledgment: GC 1005d8ad -> 10046c13 -> 1003f3b2
+                // unregisters the reclaim container. Sending the request alone does not.
+                if a.action == 0x6e {
+                    self.containers.retain(|&(kind, _), _| kind != 0xdeae);
+                }
                 // GC 1005efdf[action - 1]: 0x3b -> case 0xf, 0x3c -> case 0x10.
                 // Both remove identity_b; only completion plays the own character's side sound.
                 if matches!(a.action, 0x3b | 0x3c) {

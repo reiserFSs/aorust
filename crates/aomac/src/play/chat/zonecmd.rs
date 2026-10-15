@@ -56,7 +56,7 @@ pub struct ZoneCmdCtx<'a> {
     /// Own stat `VisualFlags` (0x2a1), `/rp` toggles bit 9 of it.
     pub visual_flags: i32,
     /// The reclaim container (`Identity{0xDEAE, ..}` of `BankCorpseIIR_t`) is registered with the client (`FUN_1003f03e`).
-    /// [UNRESOLVED] the port does not track that container yet; the hub passes false, i.e. `/reclaim` always switches reclaim on.
+    /// Read from `Zone::containers`; the server's reclaim-off action or a world reset unregisters it.
     pub reclaim_open: bool,
 }
 

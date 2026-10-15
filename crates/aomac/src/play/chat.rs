@@ -1057,7 +1057,7 @@ impl Chat {
                 move_mode: 0,
             },
             visual_flags: zone.skill_value(0x2a1).unwrap_or(0),
-            reclaim_open: false,
+            reclaim_open: zone.reclaim_registered(),
         };
         let out = zonecmd::perform(a, &ctx);
         if let (Some(on), ChatAction::Lft { text, .. }) = (out.lft, a) {
@@ -1319,6 +1319,45 @@ mod tests {
         assert_eq!(c.last_tell_from.as_deref(), Some("Bob"));
         c.remember_reply_sender("Alice");
         assert_eq!(c.last_tell_from.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn reclaim_command_follows_incoming_registration_removal_and_world_reset() {
+        use ao_net::n3::{action, misc::Misc, outgoing::n3_frame};
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        let texts = TextDb::load(&client).unwrap();
+        let mut chat = Chat::new(false);
+        let mut zone = Zone::new(7);
+        // BankCorpseIIR_t: own header, empty inventory vector, reclaim instance 9.
+        let registration = n3_frame(0, 0, vec![
+            0x52, 0x21, 0x34, 0x20, 0, 0, 0xc3, 0x50, 0, 0, 0, 7, 1,
+            0, 0, 3, 0xf1, 0, 0, 0, 9,
+        ]);
+        let send = |chat: &mut Chat, gui: &mut Gui, zone: &Zone, expected| {
+            chat.submit(gui, "/reclaim", None, zone, &texts);
+            let frames = std::mem::take(&mut chat.outbox);
+            assert_eq!(frames.len(), 1);
+            let (header, command) = action::parse_character_action(&frames[0].payload).unwrap();
+            assert_eq!(header.target, Identity { kind: 0xc350, instance: 7 });
+            assert_eq!(command.action, expected);
+        };
+        send(&mut chat, &mut gui, &zone, 0x6d);
+        zone.on_frame(&registration);
+        send(&mut chat, &mut gui, &zone, 0x6e);
+        send(&mut chat, &mut gui, &zone, 0x6e); // outbound requests do not unregister.
+        let off = action::simple(0x6e, Identity::default(), Identity::default());
+        zone.on_frame(&n3_frame(0, 0, action::character_action(8, &off)));
+        send(&mut chat, &mut gui, &zone, 0x6e); // another character cannot close ours.
+        zone.on_frame(&n3_frame(0, 0, Misc::ToClientQuit.encode(Identity { kind: 0xc350, instance: 8 }, 0)));
+        send(&mut chat, &mut gui, &zone, 0x6e); // a dynel quit is not a container close.
+        zone.on_frame(&n3_frame(0, 0, action::character_action(7, &off)));
+        send(&mut chat, &mut gui, &zone, 0x6d);
+        zone.on_frame(&registration);
+        send(&mut chat, &mut gui, &zone, 0x6e);
+        zone.reset_world();
+        send(&mut chat, &mut gui, &zone, 0x6d);
     }
 
     #[test]
