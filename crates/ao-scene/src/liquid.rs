@@ -78,6 +78,22 @@ impl Surface {
     /// DS1003f50f..1003f533: _ftol(z/-100), _ftol(x/100), 60 cells/row.
     pub fn cell(camera: [f32;3]) -> [i32;2] {[(f64::from(camera[0])/100.0).trunc() as i32,(-f64::from(camera[2])/100.0).trunc() as i32]}
 
+    /// DS1003f4ee: recognition-ID FX41 spheres are replaced on cell rebuild,
+    /// one per original lava triangle in the near flat-index 3x3 neighbourhood.
+    pub fn heat_spheres(&self, camera: [f32; 3], realistic: bool, out: &mut Vec<[f32; 4]>) {
+        out.clear();
+        if self.style != 1 || !realistic { return; }
+        let cell = Self::cell(camera);
+        let id = i64::from(cell[0]) + i64::from(cell[1]) * 60;
+        for triangle in self.triangles.iter().filter(|triangle| [-61, -60, -59, -1, 0, 1, 59, 60, 61].contains(&(i64::from(triangle.cell) - id))) {
+            let points = triangle.indices.map(|index| self.vertices[index as usize].vertex.pos);
+            let mut center = std::array::from_fn(|axis| (points[0][axis] + points[1][axis] + points[2][axis]) / 3.0);
+            let radius = points.iter().map(|point| length(sub(*point, center))).fold(0.0f32, f32::max);
+            center[1] -= radius * 0.25;
+            out.push([center[0], center[1], center[2], radius]);
+        }
+    }
+
     /// Rebuild only when camera cell or RealisticWater changes. Scratch capacities are retained.
     pub fn geometry(&self,camera:[f32;3],realistic:bool,vertices:&mut Vec<Vertex>,indices:&mut Vec<u32>,colors:&mut Vec<u32>) {
         vertices.clear();indices.clear();colors.clear();
@@ -197,6 +213,19 @@ mod tests {
     use super::*;
     fn triangle(size:f32)->SourceTriangle {
         SourceTriangle {kind:0,vertices:[[0.0,0.0,0.0],[size,0.0,0.0],[0.0,0.0,-size]].map(|pos|Vertex {pos,..Default::default()})}
+    }
+    #[test]
+    fn lava_fx41_sources_follow_native_near_cell_lifecycle() {
+        let surface = Surface::new(0, 1, vec![SourceTriangle { kind: 2, ..triangle(30.0) }]).unwrap();
+        let mut spheres = vec![];
+        surface.heat_spheres([0.0; 3], true, &mut spheres);
+        assert_eq!(spheres.len(), 1);
+        let radius = (20.0f32 * 20.0 + 10.0 * 10.0).sqrt();
+        assert_eq!(spheres[0], [10.0, -radius * 0.25, -10.0, radius]);
+        surface.heat_spheres([500.0, 0.0, -500.0], true, &mut spheres);
+        assert!(spheres.is_empty(), "recognition-ID rebuild removes old emitters outside the near neighbourhood");
+        surface.heat_spheres([0.0; 3], false, &mut spheres);
+        assert!(spheres.is_empty(), "disabled RealisticWater takes the native coarse branch without FX41 creation");
     }
     #[test]
     fn native_default_kinds_refine_as_water() {

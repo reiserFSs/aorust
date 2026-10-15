@@ -21,6 +21,7 @@ fn lava_color(vertex: &Vertex, wave: &[f32; 16]) -> [f32; 4] {
 
 pub(super) struct LiquidRun {
     pub source: Surface,
+    pub(super) heat_spheres: Vec<[f32; 4]>,
     cell: Option<([i32; 2], bool)>,
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
@@ -32,7 +33,7 @@ pub(super) struct LiquidRun {
 }
 impl LiquidRun {
     pub fn new(source: Surface) -> Self {
-        Self { source, cell: None, vertices: vec![], indices: vec![], colors: vec![], bytes: vec![], gpu_indices: vec![], vertex_capacity: 0, index_capacity: 0 }
+        Self { source, heat_spheres: vec![], cell: None, vertices: vec![], indices: vec![], colors: vec![], bytes: vec![], gpu_indices: vec![], vertex_capacity: 0, index_capacity: 0 }
     }
 }
 
@@ -100,6 +101,7 @@ impl Renderer {
             let cell = (Surface::cell(camera.to_array()), self.realistic_water);
             let changed = run.cell.is_none_or(|previous| previous.1 != cell.1 || (self.realistic_water && previous.0 != cell.0));
             if changed {
+                run.source.heat_spheres(camera.to_array(), self.realistic_water, &mut run.heat_spheres);
                 run.source.geometry(camera.to_array(), self.realistic_water, &mut run.vertices, &mut run.indices, &mut run.colors);
                 if !run.vertices.is_empty() {
                     let (low, high) = run.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(low, high), vertex| {

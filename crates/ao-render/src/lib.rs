@@ -12,6 +12,7 @@ pub use native_fog::{NativeFog,SharedNativeFog,NativeFogControl};
 mod native_ground;
 mod native_texture;
 mod native_liquid;
+mod heat_haze;
 mod gpu_stats;
 mod sky_probe;
 use gpu_stats::{GpuStatsExt, TextureViewStatsExt};
@@ -557,6 +558,7 @@ pub struct Renderer {
     depth_clear_pipe: wgpu::RenderPipeline,
     gpu: Gpu,
     liquids: Vec<native_liquid::LiquidRun>,
+    heat_haze: heat_haze::HeatHaze,
     realistic_water: bool,
     liquid_edge: [f32; 3],
     water_light: Option<([f32; 3], [f32; 3])>,
@@ -948,6 +950,7 @@ impl Renderer {
             spaceship_slots: vec![],
             spaceships_shown: true,
             liquids: vec![],
+            heat_haze: Default::default(),
             realistic_water: true,
             liquid_edge: [0.0; 3],
             water_light: None,
@@ -1315,6 +1318,7 @@ impl Renderer {
         // Keep VisualWater's style order (water, acid, lava, star, shallow), including both coplanar passes.
         self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, liquid, insts, mesh_range, radius, grid };
         self.liquids = scene.liquids.iter().cloned().map(native_liquid::LiquidRun::new).collect();
+        self.heat_haze.reset();
         self.ground = (!scene.ground_detail.is_empty()).then(|| {
             let indices = scene.ground_detail.iter().map(|p| scene.meshes[p.mesh].submeshes.iter().map(|s| Vec::with_capacity(s.indices.len())).collect()).collect();
             let draws = scene.ground_detail.iter().map(|p| ground_materials[p.mesh].iter().map(|&mat| self.gpu.opaque.iter().position(|d| d.mesh == p.mesh && d.mat == mat).unwrap_or(usize::MAX)).collect()).collect();
@@ -1905,13 +1909,16 @@ impl Renderer {
 
         let calls = std::cell::Cell::new(0usize);
         self.screen.prepare(&self.device,&self.queue,self.format,t.size);
+        self.heat_haze.update(t.size, vp, cam.pos, cam.forward(), self.liquids.iter().flat_map(|run| run.heat_spheres.iter()));
+        self.heat_haze.prepare(&self.device, &self.queue, self.format, t.size);
+        let world_resolve = self.heat_haze.source().unwrap_or(resolve);
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: t.msaa.as_ref().unwrap_or(resolve),
+                    view: t.msaa.as_ref().unwrap_or(world_resolve),
                     // Resolve only after the complete ordered world list has drawn.
-                    resolve_target: t.msaa.as_ref().map(|_| resolve),
+                    resolve_target: t.msaa.as_ref().map(|_| world_resolve),
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)),
@@ -2021,6 +2028,7 @@ impl Renderer {
             }
             for priority in [5,6,10,7] {calls.set(calls.get()+self.draw_actors(&mut pass,priority));}
         }
+        self.heat_haze.draw(&mut enc, resolve);
         self.screen.draw(&mut enc,resolve);
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };
         self.queue.submit([enc.finish()])
