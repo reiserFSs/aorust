@@ -186,3 +186,44 @@ Reports include requested and adapter-clamped actual sample counts; only compare
 actual counts. Without this override preferences remain authoritative; without
 `AOMAC_PERF`, `AOMAC_PERF_MSAA` has no effect. The equivalent live preference step is
 `option=AomacEdgeSmoothing:0` for 1x or `option=AomacEdgeSmoothing:2` for 4x.
+
+### Recorded single-pass comparison (2026-10-15)
+
+Baseline: `e6c45f9` plus the measurement harness above. Each cell is the median of
+three independent 600-frame ICC capture replays after 120 warmup frames, 1280×800,
+fixed camera `(927.02765, 28.060379, -730.7181)`, yaw `0`, pitch `-0.24497865`.
+The Mac was shared with other work; timings are observations, not isolated causal
+estimates. Calling-thread CPU excludes driver/asset worker threads. Zone loading
+used the warm OS file cache. Metal allocation is unified-memory device allocation,
+not dedicated VRAM or a claim about physical residency.
+
+| Configuration | Frame p50 / p95 (ms) | Thread CPU mean (ms) | Metal allocated (MiB) | RSS at report (MiB) | Zone ready (s) |
+|---|---:|---:|---:|---:|---:|
+| Baseline, 1× | 6.0229 / 8.2919 | 3.3707 | 456.17 | 725.36 | 6.359 |
+| Single pass, 1× | 3.8047 / 5.1687 | 2.2276 | 452.05 | 690.89 | 6.373 |
+| Baseline, 4× | 5.6834 / 6.7328 | 2.7963 | 484.34 | 712.67 | 6.427 |
+| Single pass, 4× | 3.8837 / 5.2535 | 2.3178 | 452.63 | 697.22 | 6.392 |
+
+Calling-thread CPU means in milliseconds, same three-run median:
+
+| Stage | Baseline 1× | Single pass 1× | Baseline 4× | Single pass 4× |
+|---|---:|---:|---:|---:|
+| Update | 0.0676 | 0.0430 | 0.0549 | 0.0462 |
+| Frontend | 1.6694 | 1.1743 | 1.3799 | 1.1865 |
+| Upload | 0.2597 | 0.1683 | 0.2160 | 0.1785 |
+| Render encoding/submission | 1.0167 | 0.6336 | 0.8827 | 0.6903 |
+| GUI encoding/submission | 0.1277 | 0.0872 | 0.1089 | 0.0889 |
+| Completion wait CPU | 0.2296 | 0.1235 | 0.1824 | 0.1319 |
+
+All replays reported 347 world instances and 675 object draw calls. The new ordered
+clear regression compares exact RGBA against the former split-pass attachment
+clear at every supported MSAA count. Full renderer tests passed: 88 tests, 6 ignored.
+Separate 640×400 frozen-time CLI captures before/after had zero differing RGBA bytes:
+ICC4582 SHA256 `184894e60b2da3a82c4f645f8781556ee6195ba32206c1f51d35726c7bc7bf5b`;
+Borealis800 SHA256 `91aa2aeeedb62988e4c65f691b67246ed31327c21cc8b15dbbbdacd688bbbeb0`.
+These cover world/sky/liquid composition, not a claim that every sky/weather
+combination was exhaustively sampled. A separate `sample` profile was taken after
+the replay camera-ready marker, outside the runs used for these numbers.
+
+Live measurements are deferred: PRK maintenance, with login explicitly prohibited
+until Main announces recovery. No window, desktop input or desktop capture was used.

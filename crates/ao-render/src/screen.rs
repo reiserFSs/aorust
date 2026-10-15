@@ -102,12 +102,25 @@ fn upload(device:&wgpu::Device,queue:&wgpu::Queue,image:&ao_scene::Texture,polic
     texture.create_view_tracked(&Default::default())
 }
 
-/// Draws into `t.msaa` (or `resolve` directly when MSAA is off) with the colour buffer preserved from the previous pass
-/// (`LoadOp::Load`). Never resolves: `Renderer::render` resolves once, in a single trailing pass after every draw
-/// completes, instead of on every intermediate pass boundary (audit item 1, S-effort stopgap).
-pub(super) fn world_pass<'a>(enc:&'a mut wgpu::CommandEncoder,t:&'a Targets,resolve:&'a wgpu::TextureView,clear_depth:bool)->wgpu::RenderPass<'a> {
-    let view=t.msaa.as_ref().unwrap_or(resolve);
-    enc.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("ordered native viewport"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view,resolve_target:None,depth_slice:None,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&t.depth,depth_ops:Some(wgpu::Operations {load:if clear_depth {wgpu::LoadOp::Clear(1.0)}else {wgpu::LoadOp::Load},store:wgpu::StoreOp::Store}),stencil_ops:None}),timestamp_writes:None,occlusion_query_set:None,multiview_mask:None})
+/// DS1000bc0b/Randy1004b75a clears depth at an ordered render-list position.
+/// Writing every sample at depth 1 with Always preserves that operation inside one world pass.
+pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureFormat,samples:u32)->wgpu::RenderPipeline {
+    let shader=device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label:Some("native viewport depth clear"),
+        source:wgpu::ShaderSource::Wgsl(include_str!("depth_clear.wgsl").into()),
+    });
+    let layout=device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label:Some("native viewport depth clear"),bind_group_layouts:&[],immediate_size:0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label:Some("native viewport depth clear"),layout:Some(&layout),
+        vertex:wgpu::VertexState {module:&shader,entry_point:Some("vs"),compilation_options:Default::default(),buffers:&[]},
+        fragment:Some(wgpu::FragmentState {module:&shader,entry_point:Some("fs"),compilation_options:Default::default(),
+            targets:&[Some(wgpu::ColorTargetState {format,blend:None,write_mask:wgpu::ColorWrites::empty()})]}),
+        primitive:Default::default(),
+        depth_stencil:Some(wgpu::DepthStencilState {format:DEPTH,depth_write_enabled:Some(true),depth_compare:Some(wgpu::CompareFunction::Always),stencil:Default::default(),bias:Default::default()}),
+        multisample:wgpu::MultisampleState {count:samples,..Default::default()},multiview_mask:None,cache:None,
+    })
 }
 
 #[cfg(test)]

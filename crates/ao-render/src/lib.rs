@@ -4,6 +4,8 @@ mod actors;
 mod gui;
 mod viewer;
 mod screen;
+#[cfg(test)]
+mod depth_clear_tests;
 pub use screen::{ScreenLayer,ViewportDepthClear};
 mod native_fog;
 pub use native_fog::{NativeFog,SharedNativeFog,NativeFogControl};
@@ -510,7 +512,7 @@ impl Targets {
                 sample_count: samples,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT,
                 view_formats: &[],
             }).create_view_tracked(&Default::default())
         };
@@ -545,6 +547,7 @@ pub struct Renderer {
     texture_policy: native_texture::Policy,
     pipes: Vec<wgpu::RenderPipeline>, // indexed by Draw::pipe
     actor_pipes: Vec<wgpu::RenderPipeline>, // same indices, actor-only instance layout
+    depth_clear_pipe: wgpu::RenderPipeline,
     gpu: Gpu,
     liquids: Vec<native_liquid::LiquidRun>,
     realistic_water: bool,
@@ -820,7 +823,7 @@ impl Renderer {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                required_features: adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC,
+                required_features: adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES),
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
@@ -918,6 +921,7 @@ impl Renderer {
             immediate_size: 0,
         });
         let (pipes, actor_pipes, ground_pipes) = build_pipelines(&device, &shader, format, &layout, &holo_pipeline_layout, 1);
+        let depth_clear_pipe = screen::depth_clear_pipeline(&device, format, 1);
         let mut r = Self {
             device,
             queue,
@@ -950,6 +954,7 @@ impl Renderer {
             texture_policy: Default::default(),
             pipes,
             actor_pipes,
+            depth_clear_pipe,
             sky: SkyGpu::default(),
             cloud_preferences: (true, true, false),
             sky_views: HashMap::new(),
@@ -1041,8 +1046,7 @@ impl Renderer {
     /// downward-clamped to a level the adapter's colour+depth format features actually support ([`clamp_msaa_samples`]); every
     /// pipeline is then rebuilt at the new [`wgpu::MultisampleState`] (wgpu bakes the sample count into the pipeline, there is no
     /// live toggle). Callers that keep a [`Targets`] across frames must rebuild it when [`Renderer::msaa_samples`] changes
-    /// (`Targets::sample_count`). Audit item 1 (single pass, memoryless targets) is a separate follow-up: this only makes the
-    /// existing multi-pass path support sample counts other than the former hardcoded 4, including disabling MSAA.
+    /// (`Targets::sample_count`). The single world pass resolves once and discards its transient MSAA/depth attachments.
     pub fn set_msaa_samples(&mut self, requested: u32) {
         let level = clamp_msaa_samples(requested.max(1), &self.msaa_supported);
         if level == self.msaa_samples { return; }
@@ -1051,6 +1055,7 @@ impl Renderer {
         self.pipes = pipes;
         self.actor_pipes = actor_pipes;
         self.ground_pipes = ground_pipes;
+        self.depth_clear_pipe = screen::depth_clear_pipeline(&self.device, self.format, level);
     }
 
     pub fn msaa_samples(&self) -> u32 {
@@ -1844,19 +1849,17 @@ impl Renderer {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: t.msaa.as_ref().unwrap_or(resolve),
-                    // Resolved once, in a single trailing pass after every draw this frame (below): mid-frame resolves
-                    // are pure wasted bandwidth, since nothing reads `resolve` before `self.screen.draw` at the very
-                    // end (audit item 1, S-effort stopgap: skip empty passes, resolve only in the last pass).
-                    resolve_target: None,
+                    // Resolve only after the complete ordered world list has drawn.
+                    resolve_target: t.msaa.as_ref().map(|_| resolve),
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)),
-                        store: wgpu::StoreOp::Store,
+                        store: if t.msaa.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
@@ -1890,14 +1893,12 @@ impl Renderer {
                     draw(&mut pass, d, *k..*k + 1, true);
                 }
             }
-            drop(pass);
-            calls.set(calls.get()+self.draw_actors(&mut enc,t,resolve,0));
+            calls.set(calls.get()+self.draw_actors(&mut pass,0));
             // AnarchyGround_t ctor 10033b97 sets priority 1. Complete the
             // native base stage for all terrain before the shadow stage.
             if let (Some(ground), Some(inst)) = (&self.ground, inst_buf) {
                 for stage in 0..=1 {
                     if stage == 1 && self.ground_state.path() != GroundPath::ShadowsTwoPass { break; }
-                    let mut pass = screen::world_pass(&mut enc,t,resolve,false);
                     pass.set_bind_group(0,&self.globals_bg,&[]);
                     pass.set_vertex_buffer(1,inst.slice(..));
                     pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
@@ -1914,8 +1915,7 @@ impl Renderer {
                     }
                 }
             }
-            for priority in 1..=2 {calls.set(calls.get()+self.draw_actors(&mut enc,t,resolve,priority));}
-            let mut pass=screen::world_pass(&mut enc,t,resolve,false);
+            for priority in 1..=2 {calls.set(calls.get()+self.draw_actors(&mut pass,priority));}
             pass.set_bind_group(0,&self.globals_bg,&[]);
             pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
             // Order of `DisplaySystem_t::Render` @0x100793b8: sky, the opaque lists 3 + 4 (list 3 = world meshes and the actors'
@@ -1930,12 +1930,8 @@ impl Renderer {
                     }
                 }
             }
-            drop(pass);
-            calls.set(calls.get() + self.draw_actors(&mut enc,t,resolve,3));
-            // The liquid and blended passes previously opened even with nothing to draw: skip them entirely then
-            // (audit item 1, S-effort stopgap).
+            calls.set(calls.get() + self.draw_actors(&mut pass,3));
             if !self.gpu.liquid.is_empty() {
-                let mut pass=screen::world_pass(&mut enc,t,resolve,false);
                 pass.set_bind_group(0,&self.globals_bg,&[]);
                 // the actor pass rebinds pipeline, buffers and material: forget the cached state
                 pipe.set(usize::MAX);
@@ -1950,11 +1946,9 @@ impl Renderer {
                         }
                     }
                 }
-                drop(pass);
             }
-            calls.set(calls.get()+self.draw_actors(&mut enc,t,resolve,4));
+            calls.set(calls.get()+self.draw_actors(&mut pass,4));
             if !self.sorted.is_empty() {
-                let mut pass=screen::world_pass(&mut enc,t,resolve,false);
                 pass.set_bind_group(0,&self.globals_bg,&[]);
                 pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
                 if let Some(inst)=inst_buf {
@@ -1963,28 +1957,8 @@ impl Renderer {
                         draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1, false);
                     }
                 }
-                drop(pass);
             }
-            for priority in [5,6,10,7] {calls.set(calls.get()+self.draw_actors(&mut enc,t,resolve,priority));}
-            if let Some(msaa) = &t.msaa {
-                // The one real resolve of the frame (audit item 1, S-effort stopgap): every earlier pass above wrote
-                // `resolve_target: None`, so this zero-draw pass is the only point this frame's draws are resolved
-                // into `resolve`, right before `self.screen.draw` reads it. `StoreOp::Discard`: nothing reads `msaa`
-                // again before the next frame clears it.
-                enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("msaa resolve"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: msaa,
-                        resolve_target: Some(resolve),
-                        depth_slice: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-            }
+            for priority in [5,6,10,7] {calls.set(calls.get()+self.draw_actors(&mut pass,priority));}
         }
         self.screen.draw(&mut enc,resolve);
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };

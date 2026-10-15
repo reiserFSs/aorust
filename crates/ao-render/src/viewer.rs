@@ -1246,10 +1246,9 @@ impl Offscreen {
         if let Some(textures) = self.host.ground_textures.take() { self.r.refresh_ground_textures(&textures); }
         self.host.apply_actors(&mut self.r);
         if let Some(camera) = self.fixed_camera { self.host.camera = camera; }
-        if self.perf.is_some() {
+        if let Some(perf) = self.perf.as_mut() {
             let upload_end = Instant::now();
             let cpu_upload = perf_thread_cpu();
-            let perf = self.perf.as_mut().unwrap();
             self.r.render(&perf.view, &self.targets, &self.host.camera);
             let render_end = Instant::now();
             let cpu_render = perf_thread_cpu();
