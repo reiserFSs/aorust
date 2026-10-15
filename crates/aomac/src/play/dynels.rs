@@ -1526,31 +1526,32 @@ impl Dynels {
     /// weapon in its right hand (else left) - list 0xb when the weapon has no such key. Returns (clip, ItemDelay in centiseconds, resolved list key);
     /// [`Dynels::play_swing`] uses the delay for speed scaling and the resolved key for duplicate suppression.
     /// `None`: nothing wielded, or an `AnimSet` whose lists live in the item record; the caller tries [`Dynels::pick_item_swing`].
-    /// [GUESS] the wielder is never crawling (stat 0x1ae == 0xe is not tracked), so the crawl lists are not used.
     pub fn pick_swing(&mut self, id: i32, mut key: u16) -> Option<(u16, i32, u16)> {
         let hands = self.wield.get(&id)?;
         let hand = hands.iter().position(Option::is_some)?;
         let w = hands[hand]?;
-        let mut list = canim::weapon_list(w.set, hand == 1, false, key);
+        let crawl = self.chars.get(&id).is_some_and(|c| c.mover.wait_state() == 0xe);
+        let mut list = canim::weapon_list(w.set, hand == 1, crawl, key);
         if list.is_empty() {
             key = canim::list::ATTACK;
-            list = canim::weapon_list(w.set, hand == 1, false, canim::list::ATTACK);
+            list = canim::weapon_list(w.set, hand == 1, crawl, canim::list::ATTACK);
         }
         let anim = *list.get(self.rng.rand() as usize % list.len().max(1))?;
         self.swing_delay.insert(id, (anim as u32, w.delay));
         Some((anim, w.delay, key))
     }
 
-    /// `SimpleChar::GetImpactAnim` (vtable `+0x90` = `FUN_10058cfa` [GC 0x10058cfa]): a crawling character (stat 0x1ae == 0xe, not tracked here) plays
-    /// 0xd0, everyone else a random one of `0x81, 0x82, 0x80, 0x84, 0x7f` (`rand() % 5`, the `imp-*` clips).
-    pub fn impact_anim(&mut self) -> u16 {
+    /// GC 0x10058cfa: WaitState 0xe selects the crawl impact.
+    /// The mover tracks stat 0x1ae and writes it on movement FSM transitions.
+    pub fn impact_anim(&mut self, id: i32) -> u16 {
+        if self.chars.get(&id).is_some_and(|c| c.mover.wait_state() == 0xe) { return 0xd0; }
         [0x81, 0x82, 0x80, 0x84, 0x7f][self.rng.rand() as usize % 5]
     }
 
     /// The struck character's reaction (`FUN_1009b4ac` [GC 0x1009b4ac] before its sounds): `Play(GetImpactAnim(), rate)` on `id` when its own `imp` clip
     /// is not already playing, at rate 1 for hit kind 4 (a crit), else `_DAT_1015d0a4` = 0.5. Returns the clip id and the rate.
     pub fn react_to_hit(&mut self, id: i32, flags: i32) -> (u16, f32) {
-        let anim = self.impact_anim();
+        let anim = self.impact_anim(id);
         self.set_impact_location(id, anim);
         let rate = if flags == 4 { 1.0 } else { 0.5 };
         self.once_rate.insert(id, (u32::from(anim), rate));
@@ -6315,13 +6316,31 @@ mod variant_tests {
     /// `FUN_10058cfa` (the `GetImpactAnim` override of `SimpleChar`): one of `0x81 0x82 0x80 0x84 0x7f`; the struck leet plays the `imp-*` clip once,
     /// at half speed unless the hit kind is 4.
     #[test]
+    fn crawl_wait_state_selects_weapon_and_impact_lists() {
+        use ao_net::n3::dynel::StatUpdate;
+        let mut spawn = captured_posture_player();
+        let who = spawn.header.target.instance;
+        let mut world = Dynels::default();
+        world.on_message(&spawn);
+        world.wield.entry(who).or_default()[0] = Some(Wield { set: 3, delay: 100 });
+        spawn.body = N3::Dynel(Dynel::Stat(StatUpdate { stats: vec![(0x1ae, 0xe)], rest: vec![] }));
+        world.on_message(&spawn);
+        assert_eq!(world.pick_swing(who, canim::list::ATTACK).unwrap().0, 0xd1);
+        assert_eq!(world.impact_anim(who), 0xd0);
+        spawn.body = N3::Dynel(Dynel::Stat(StatUpdate { stats: vec![(0x1ae, 0)], rest: vec![] }));
+        world.on_message(&spawn);
+        assert_eq!(world.pick_swing(who, canim::list::ATTACK).unwrap().0, 0x3ff);
+        assert_ne!(world.impact_anim(who), 0xd0);
+    }
+
+    #[test]
     fn a_struck_creature_plays_an_impact_clip() {
         let Some((mut z, _, leet)) = fight_zone() else { return };
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..40 {
-            seen.insert(z.world.impact_anim());
+            seen.insert(z.world.impact_anim(leet));
         }
-        assert_eq!(seen.into_iter().collect::<Vec<_>>(), [0x7f, 0x80, 0x81, 0x82, 0x84], "crawling (0xd0) is not tracked");
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), [0x7f, 0x80, 0x81, 0x82, 0x84]);
         let (anim, rate) = z.world.react_to_hit(leet, 3);
         assert_eq!(rate, 0.5);
         let mut host = Host::headless();

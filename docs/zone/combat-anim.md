@@ -69,7 +69,7 @@ Every `Hit` / `Miss` / `SpecialAttack` event of any character (a miss runs `FUN_
 2. **Item lists**: Brawl, Dimach and bow special resolve the list on the special item's record (`FUN_100686d0(stat)+0xe4`).
    Bare hands resolve the martial-arts item delivered under key 100. `dynel_visual::animation_map` decodes element `{0xe,0x13}` using the same validated multimap size words as the sound parser.
    The martial-arts fixture (rdb 1000020:43712) asserts list `0xb = [1034,1035,1037,1033]`; Dimach 42033 has `0xb=[163]`, Brawl 70292 has `0xb=[1036]` (element offsets 203 and 184). Special keys missing on their own item fall back to its `0xb` (`FUN_1003c594`). Missing lists retain the creature-path `0x40a` fallback;
-   this missing-player-list fallback remains **[UNRESOLVED]**, not a fabricated special clip. The crawl lists (`crawl = true`) are not used: stat 0x1ae is not tracked per dynel.
+   this missing-player-list fallback remains **[UNRESOLVED]**, not a fabricated special clip. Crawl lists now read the holder's existing `Mover::wait_state()` (stat 0x1ae): value 0xe selects crawl weapon attacks; that stat was already tracked by the movement FSM, contrary to the earlier gap note.
 3. **Text above the character** for special attacks (`FUN_10011108(char, "Burst!\n", 0xd)`): `Module::on_frame` pushes a world-space `Number` (category 0xd = colour
    `0x00f000`, effect `0x2f5a` path, `combat-log.md` section 6) with the text without its trailing newline. The sound of Brawl / Dimach is in section 6.
 * `CharSecSpecAttack` queues only when empty; `SpecialAttackInfo` starts the front's swing before feedback and clears the deque afterward (`FUN_1006a9c5`, `FUN_1005548b`). Active list keys are suppressed (`FUN_1003bfd2`, its list node `+0xc` comparison), not clip names:
@@ -92,9 +92,7 @@ Every `Hit` / `Miss` / `SpecialAttack` event of any character (a miss runs `FUN_
   are10/36. Regression `effect_categories_read_independent_login_preferences`
   checks defaults and each individual preference off. Temporary early-return
   instrumentation removed; authored spawn diagnostics remain. Added, not run here.
-* A 0/1/2 "height" variant (`param_3` of `FUN_1003c8b7`) is computed for `AnimSet == 0` weapons from the muzzle attractor
-  (`AttractorMesh::GetName(0)`) vs the target's height and distance < 6 m (`_DAT_1015d0a0`; < 3 m `_DAT_1015d69c`); what it selects inside
-  `FUN_1003c802` is **[UNRESOLVED]** (not modelled).
+* A 0/1/2 height variant is computed for `AnimSet == 0` weapons from muzzle vs target height and distance < 6 m / < 3 m (`FUN_1006a239`). **[CODE, re-read 2026-10-15]** `FUN_1003c8b7` accepts the third argument but never reads it or forwards it: `FUN_1003c802` receives only abstract id, layer output, breed and sex. It does not select an `imp-*` clip or a height-specific animation. No variant selection should be fabricated.
 
 ### 3.1 Weapon action lists (`weapon_anims`, `FUN_1009d41a` [GC 0x1009d41a])
 Built when a weapon is wielded: `(list key -> AbstractAnimID)` multimap, selected by the item's stat **`AnimSet` (0x161 = 353)**;
@@ -179,8 +177,7 @@ The char's `UnarmedTemplateInstance` (stat 418) is 0 for the own char in the cap
   the victim's movement mode is not 4 / 8: `Play(GetImpactAnim(victim), rate)`. `GetImpactAnim` is the `SimpleChar` vtable slot `+0x90` = `FUN_10058cfa` [GC 0x10058cfa] (vtable 0x1015fa94, the ctor
   `FUN_1005cb6a` stores it): stat `0x1ae == 0xe` (crawling) -> `0xd0`, else `rand() % 5` of `{0x81, 0x82, 0x80, 0x84, 0x7f}` (the `imp-*` clips; creatures resolve them through their record's
   parent chain `0x80..0x84 -> 0x7f`, npc.md section 3). Rate `1.0` when the hit kind is 4 (crit), else `_DAT_1015d0a4` = 0.5. The same `GetImpactAnim` id also picks the impact effect location (`0x3e9 / 0x3ef /
-  0x3f0 / 1000 / 0x3ee`, `FUN_1009ad7d`). **Wired**: `Dynels::impact_anim`, `Dynels::react_to_hit` (others), `Player::react` (own avatar, `Avatar::set_clip_scale`), from `combat/glue.rs`. The crawl case is not
-  tracked (stat 0x1ae); "already playing" is "the character is busy with another one-shot clip" (`play_once` / `Player::react` ignore the call); the movement mode 4 / 8 test is only done for the own character.
+  0x3f0 / 1000 / 0x3ee`, `FUN_1009ad7d`). **Wired**: `Dynels::impact_anim(id)` reads existing `Mover::wait_state()` (stat 0x1ae; 0xe -> 0xd0); `Dynels::react_to_hit` (others), `Player::react` (own avatar, `Avatar::set_clip_scale`), from `combat/glue.rs`. Regression `crawl_wait_state_selects_weapon_and_impact_lists` applies actual Stat updates and checks rifle attack / impact selection in both postures. "Already playing" is still "busy with another one-shot clip"; the movement mode 4 / 8 test is only done for the own character.
 * **Miss** (`MissedAttackInfoIIR_t`, apply `FUN_1006ae50`): the combat-log text **and the same swing as a hit**: `FUN_1006ae50` ends with `FUN_1006a8f3(slot, 0, value_1c, 0, 1, 0)` (damage 0, hit kind 1; a
   zero amount prints no log line, `FUN_10012bd5` returns on it), i.e. `FUN_1006a239` starts the swing clip and its notes fire; with hit kind 1 `FUN_1009b4ac` stops before the reaction and the impact
   sound, so a miss only plays the swing sounds of section 6.1 (**fixed**: the old note here said "no animation or sound"; `combat/notes.rs::hit_of`, `glue.rs` swings on `CombatEvent::Miss` too).
@@ -1796,7 +1793,7 @@ alternating foreground at static-camera frames50/102 were assigned to
 the separate CameraFlicker investigation; they are not effect-coverage
 successes and no second authentication was attempted.
 
-* The `imp-*` hit-reaction selector (section 4); the bare-hand attack list (3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
+* The `imp-*` selector is resolved (`FUN_10058cfa`, §4), including crawl; the height argument is unused (`FUN_1003c8b7`, §3.0), not an unresolved selector in `FUN_1003c802`. Still open: missing player-item attack lists (§3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
 * Native nulls and implementation gaps are separate (§7.9): class0 body
   profiles and class2003 cannot be constructed by any factory; missing
   class/form cases are likewise native null, not missing port artwork.
@@ -1829,4 +1826,4 @@ successes and no second authentication was attempted.
   Weapon firing/impact sounds are resolved in §6.1.
 * Sound-map keys 0x15 0x16 0x17 0x1c 0x1d 0x50 0x87 of the weapon records (no consumer found), wield / unwield / grenade sounds (keys 8 / 9 / 0x31, found, not wired), the `0x2c` empty-weapon click.
 * `FUN_1005d0d8` case 0x5b also calls `vtable+0x40` of the stat system and, for a non-control char, `FUN_100523c3` (purpose not read); `FUN_10012a1e(..)` before every `PlayGameSound` is only the lazy creation of the `SandyInterfaceModule` singleton (`DAT_102e063c`), not a sound step.
-* The own character's `Dying` default animation when no action 99 arrived (death computed by `FUN_1005ae91`): 503 is a **guess** (`DEFAULT_DEATH_ANIM`).
+* **[UNRESOLVED GUESS]** Own `Dying` without action 99 still uses 503 (`DEFAULT_DEATH_ANIM`). Re-searched GC `FUN_1005ae91` (including disassembly `0x1005af00..0x1005af48`): it writes Health 0 (`push 0; push 0x1b; call stat-vtable+0x40`), not stat 0x183 or a death-animation default. `FUN_1007b2ba` reads stat 0x183; action 99 sets it. This proves the old attribution of 503 to `1005ae91` was wrong, but does not determine the stat system's initial value or another writer for the no-action path. Capture only demonstrates 503 on server action 99 (§5.1), not a faithful fallback.

@@ -510,14 +510,14 @@ pub(in crate::play) fn note_reaction(world: &mut Dynels, player: Option<&mut Pla
     if !matches!(note, id::ATTACK | id::ATTACK_EFFECT_1..=id::ATTACK_EFFECT_4) { return; }
     let Some(h) = world.note_ctx(who, slot) else { return };
     if h.flags <= 1 {
-        let anim = world.impact_anim();
+        let anim = world.impact_anim(h.victim);
         world.set_impact_location(h.victim, anim);
         return;
     }
     if h.victim != own {
         world.react_to_hit(h.victim, h.flags);
     } else if let Some(p) = player.filter(|p| !matches!(p.mode(), 4 | 8)) {
-        let anim = world.impact_anim();
+        let anim = world.impact_anim(h.victim);
         world.set_impact_location(h.victim, anim);
         if let Some((name, _)) = anim_name(anim) {
             p.react(Role::Clip(name.into()), if h.flags == 4 { 1.0 } else { 0.5 });
