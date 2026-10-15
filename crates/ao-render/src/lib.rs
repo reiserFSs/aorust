@@ -166,6 +166,8 @@ struct Globals {
     dyn_info: [i32; 4],
     /// x = DotStars per-FXS-frame Counter (not elapsed seconds).
     sky_counter: [f32; 4],
+    /// Pairs of toward-light direction / gamma diffuse+specular colour.
+    directional: [[f32; 4]; 16],
 }
 
 /// One submesh draw. Scene pipes use `material_pipe`; sky draws use `sky_material_pipe`.
@@ -442,6 +444,7 @@ struct SkyGpu {
     bufs: Vec<wgpu::Buffer>, // ring of per-frame instance transforms (translation = camera)
     colors: Vec<ColorAnim>,
     clouds: Vec<CloudAnim>,
+    directional_epoch: f32,
     /// Pose-only resource snapshot: no textures or world geometry; sun fans retain their tiny alpha buffers.
     pose: Scene,
     fan_alpha: Vec<(usize, f32)>,
@@ -1083,6 +1086,7 @@ impl Renderer {
     /// Replaces the GPU-side scene.
     pub fn upload(&mut self, scene: &Scene) {
         self.sky_dot_counter = 0.0;
+        self.sky.directional_epoch = self.time;
         self.water_light = scene.water_light;
         self.sky.clouds.clear();
         self.ground_state.recreate();
@@ -1440,6 +1444,7 @@ impl Renderer {
             sky_yaw: scene.sky_yaw.clone(),
             sky_wave_spin: scene.sky_wave_spin.clone(),
             environment: scene.environment,
+            directional_lights: scene.directional_lights.clone(),
             meshes: scene.meshes.iter().map(|mesh| ao_scene::Mesh {
                 vertices: if mesh.submeshes.iter().any(|sub| sub.sun_flicker) { mesh.vertices.clone() } else { vec![] },
                 ..Default::default()
@@ -1749,8 +1754,17 @@ impl Renderer {
             view: Mat4::look_to_rh(cam.pos, cam.forward(), cam.up()).to_cols_array_2d(),
             water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), 0.0),
             water_g: g4(water_color, env.sun_specular),
-            dyn_info: [self.dyn_light_count, 0, 0, 0],
+            dyn_info: [self.dyn_light_count, self.sky.pose.directional_lights.len().min(8) as i32, 0, 0],
             sky_counter: [self.sky_dot_counter, 0.0, 0.0, 0.0],
+            directional: std::array::from_fn(|lane| {
+                self.sky.pose.directional_lights.get(lane / 2).map_or([0.0; 4], |light| {
+                    if lane % 2 == 0 {
+                        v4(Vec3::from_array(light.direction).normalize_or_zero().to_array(), 0.0)
+                    } else {
+                        g4(light.color_at(self.time - self.sky.directional_epoch), 0.0)
+                    }
+                })
+            }),
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 

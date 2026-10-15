@@ -17,6 +17,7 @@ struct G {
     water_g: vec4<f32>,    // authored WaterLightCurrent, not doubled GroundLightCurrent
     dyn_info: vec4<i32>,   // x = active dynamic (per-frame moving) light count in `dyn_lights`, yzw unused
     sky_counter: vec4<f32>, // x = DotStars Counter += .01 per FXS frame, independent of time/dt
+    directional: array<vec4<f32>, 16>, // toward-light direction / gamma colour pairs
 }
 struct Mat {
     color: vec4<f32>,
@@ -206,7 +207,19 @@ fn vertex_lights(p: vec3<f32>, n: vec3<f32>, power: f32) -> array<vec3<f32>, 2> 
     let c = vec3<i32>(floor((p - g.grid.xyz) / g.grid.w));
     // D3D7 fixed function: at most 8 active lights; the cell list is sorted strongest first.
     // Lights switched off by the statel distance LOD (range 0) do not count against the 8.
-    var used = 0u;
+    let directional_count = u32(g.dyn_info.y);
+    var used = directional_count;
+    for (var k = 0u; k < directional_count; k = k + 1u) {
+        let l = g.directional[k * 2u].xyz;
+        let col = g.directional[k * 2u + 1u].rgb;
+        let nl = dot(n, l);
+        if nl > 0.0 {
+            diff += col * nl;
+            if power > 0.0 {
+                spec += col * pow(max(dot(n, normalize(l + v)), 0.0), power);
+            }
+        }
+    }
     if !(any(c < vec3<i32>(0)) || any(c >= g.dims.xyz)) {
         let e = cells[u32((c.z * g.dims.y + c.y) * g.dims.x + c.x)];
         for (var k = 0u; k < e.y && used < 8u; k = k + 1u) {

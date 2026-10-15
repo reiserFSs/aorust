@@ -51,6 +51,7 @@ pub fn emit(sky: &super::Sky, objs: &[Obj], store: &RecordStore, scene: &mut Sce
         ..super::game_context(objs, sky.day_time)
     };
     scene.water_light=water_light(objs,&ctx);
+    scene.directional_lights = horizon_lights(objs, &ctx);
     let mut b = Builder { store, names, ctx, objs, sky, scene, sorts };
     // (sort, mesh, constant spin, aurora simulation, wave driven turns)
     type Layer = (u32, Mesh, Option<SkySpin>, Option<(ao_scene::aurora::GloomySky, f32)>, Vec<SkyWaveSpin>, Option<f32>, Option<usize>);
@@ -167,6 +168,35 @@ fn water_light(objs:&[Obj],ctx:&Ctx)->Option<([f32;3],[f32;3])> {
     let color=script::vector(light,ctx,light.field("WaterLightCurrent")?,0)?;
     let rotation=script::rotation(light,ctx,light.field("WaterLightDirection")?,0)?;
     Some((color.map(srgb_to_linear),scene(rotation.rotate([0.0,0.0,-1.0]))))
+}
+
+/// Inferno's four HorizonLight objects are lights, not renderable horizon geometry.
+/// DS1005bdad binds Use/Direction/Color and creates a root RLight of type1.
+fn horizon_lights(objs: &[Obj], ctx: &Ctx) -> Vec<ao_scene::DirectionalLight> {
+    objs.iter().filter(|o| o.fxid() == "DirectionalLight" && o.name.starts_with("HorizonLight_"))
+        .filter_map(|o| {
+            if o.field("Use")?.trim() == "e_No" { return None; }
+            let direction = scene(script::vector(o, ctx, o.field("Direction")?, 0)?).map(|v| -v);
+            let expression = o.field("Color")?;
+            let (track, rest) = expression.split_once('[')?;
+            let (index, factor) = rest.split_once(']')?;
+            let (owner, field) = track.trim().split_once('.')?;
+            let owner = objs.iter().find(|o| o.name == owner)?;
+            let factor = script::eval_field_in(objs, o, ctx, factor.trim().strip_prefix('*')?.trim(), 0)?;
+            let palette: Option<Vec<_>> = owner.field(field)?.split("v(").skip(1)
+                .map(|entry| script::vector(owner, ctx, &format!("v({entry}"), 0).map(|v| v.map(|c| c * factor)))
+                .collect();
+            let palette = palette.filter(|p| !p.is_empty())?;
+            let phase = script::eval_field_in(objs, o, ctx, index, 0)?;
+            let stepped = Ctx { delta_time: 0.01, ..ctx.clone() };
+            let rate = (script::eval_field_in(objs, o, &stepped, index, 0)? - phase) / 0.01;
+            let mut light = ao_scene::DirectionalLight {
+                direction, color: [0.0; 3],
+                cycle: Some(ao_scene::LightCycle { palette, phase, rate }),
+            };
+            light.color = light.color_at(0.0);
+            Some(light)
+        }).collect()
 }
 
 /// Position expressions of the scenery objects: `RKPP.<place> - PlayfieldData.UniversePosition + This.UniversePosition + v(..)`

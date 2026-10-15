@@ -188,6 +188,36 @@ pub struct Light {
     pub zone: Option<u32>,
 }
 
+/// Root directional FXS light (DisplaySystem1005bdad); direction points toward the light.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DirectionalLight {
+    pub direction: [f32; 3],
+    /// Linear RGB, used when there is no animated palette.
+    pub color: [f32; 3],
+    pub cycle: Option<LightCycle>,
+}
+
+/// Native cyclic vector array: interpolate in D3D gamma space, including last-to-first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LightCycle {
+    pub palette: Vec<[f32; 3]>,
+    pub phase: f32,
+    pub rate: f32,
+}
+
+impl DirectionalLight {
+    pub fn color_at(&self, seconds: f32) -> [f32; 3] {
+        let Some(cycle) = self.cycle.as_ref().filter(|cycle| !cycle.palette.is_empty()) else { return self.color };
+        let position = (cycle.phase + seconds * cycle.rate).rem_euclid(1.0) * cycle.palette.len() as f32;
+        let index = position.floor() as usize % cycle.palette.len();
+        let next = (index + 1) % cycle.palette.len();
+        std::array::from_fn(|k| {
+            let a = cycle.palette[index][k];
+            (a + (cycle.palette[next][k] - a) * position.fract()).max(0.0).powf(2.2)
+        })
+    }
+}
+
 /// `D3DLIGHT_SPOT` cone: full inner angle `theta` and outer angle `phi` (radians, `dvTheta` / `dvPhi`), falloff 1:
 /// factor 1 inside `theta`, 0 outside `phi`, linear in `cos(angle / 2)` between.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -370,6 +400,8 @@ pub struct Scene {
     /// `None` = [`Lens::default`].
     pub lens: Option<Lens>,
     pub lights: Vec<Light>,
+    /// Additional root directional lights; the native sun remains in `environment`.
+    pub directional_lights: Vec<DirectionalLight>,
     /// Sky domes/backdrops: instances of `meshes` drawn first, depth-write off, unfogged,
     /// with the transform's translation replaced by the camera position. Not in `instances`.
     pub sky: Vec<Instance>,
