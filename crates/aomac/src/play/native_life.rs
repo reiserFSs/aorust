@@ -1,5 +1,6 @@
 //! Gamecode Species_c 1011d716/1011d88f and Vehicle.dll 1000e3d3.
 use ao_formats::wildlife::LifeKind;
+use ao_formats::playfield::collision::{Aligned, Body, SurfaceState};
 use glam::{Quat, Vec3};
 use std::sync::Arc;
 #[path="native_life_air.rs"] mod air;
@@ -7,6 +8,7 @@ use std::sync::Arc;
 
 pub struct CharacterSensor { pub pos: Vec3, pub radius: f32 }
 pub trait Environment {
+    fn align(&self, old: Vec3, new: Vec3, body: &Body, state: &mut SurfaceState) -> Aligned;
     fn ground(&self, pos: Vec3) -> Option<(Vec3, Vec3)>;
     fn ground_ray(&self, origin: Vec3) -> Option<(Vec3, Vec3)>;
     fn alignment(&self, pos: Vec3) -> Vec3;
@@ -33,11 +35,11 @@ pub struct Species {
     pub pending_animation: Option<usize>, pub animation_time: f32, pub animation_serial: u64,
     pub liquid_escape: bool, pub surface_hug: bool, pub falling: bool,
     pub descending_animation: bool, pub lifespan: f32, pub elapsed: f32, pub alive: bool, pub visible: bool,
-    gravity_velocity: f32, surface_up: Vec3, seed: u32,
+    gravity_velocity: f32, airborne: bool, surface: SurfaceState, surface_up: Vec3, seed: u32,
 }
 impl Species {
     pub fn new(kind: LifeKind, catalog_index: usize, pos: Vec3, district: usize, seed: u32) -> Self {
-        let mut s=Self {id:0,kind,catalog_index,district,pos,vel:Vec3::ZERO,rotation:Quat::IDENTITY,wander:Vec3::ZERO,last_in_district:Vec3::ZERO,target:Vec3::ZERO,state:0,timer:0.,counter:0,max_speed:0.,max_force:0.,mass:1.,brake_distance:1.,body_radius:0.,group:None,animation:0,pending_animation:None,animation_time:0.,animation_serial:0,liquid_escape:false,surface_hug:false,falling:false,descending_animation:false,lifespan:-1.,elapsed:0.,alive:true,visible:false,gravity_velocity:0.,surface_up:Vec3::Y,seed};
+        let mut s=Self {id:0,kind,catalog_index,district,pos,vel:Vec3::ZERO,rotation:Quat::IDENTITY,wander:Vec3::ZERO,last_in_district:Vec3::ZERO,target:Vec3::ZERO,state:0,timer:0.,counter:0,max_speed:0.,max_force:0.,mass:1.,brake_distance:1.,body_radius:0.,group:None,animation:0,pending_animation:None,animation_time:0.,animation_serial:0,liquid_escape:false,surface_hug:false,falling:false,descending_animation:false,lifespan:-1.,elapsed:0.,alive:true,visible:false,gravity_velocity:0.,airborne:false,surface:SurfaceState::default(),surface_up:Vec3::Y,seed};
         match kind {
             LifeKind::Bird|LifeKind::Rabbit|LifeKind::Fish=>animals::configure(&mut s),
             LifeKind::Butterfly|LifeKind::Fly|LifeKind::Hoverbot|LifeKind::Pollen=>air::configure(&mut s),
@@ -47,6 +49,20 @@ impl Species {
             LifeKind::TumbleWeed=>{s.max_speed=5.;s.max_force=1.;s.mass=0.5;s.brake_distance=0.1;s.falling=true;},
         }
         s
+    }
+    /// SetRelPos placement resolves support before the first Vehicle substep.
+    pub fn place(&mut self, environment: &dyn Environment) { self.resolve(self.pos, self.pos, true, environment); }
+    fn resolve(&mut self, old: Vec3, next: Vec3, teleport: bool, environment: &dyn Environment) {
+        self.surface.radius = self.body_radius;
+        let forward = self.rotation * Vec3::Z;
+        self.surface.heading = forward.x.atan2(forward.z);
+        let body = Body { falling_enabled: self.falling, airborne: self.airborne, vy: self.gravity_velocity, teleport };
+        let aligned = environment.align(old, next, &body, &mut self.surface);
+        self.pos = Vec3::from_array(aligned.pos);
+        if self.falling {
+            self.airborne = aligned.airborne;
+            if !self.airborne { self.gravity_velocity = 0.; }
+        }
     }
     pub fn random(&mut self)->f32 { self.seed=self.seed.wrapping_mul(214013).wrapping_add(2531011); ((self.seed>>16)&32767) as f32/32767. }
     pub fn animate(&mut self,index:usize,queued:bool) { if queued {self.pending_animation=Some(index)} else {self.animation=index;self.pending_animation=None;self.animation_time=0.;self.animation_serial=self.animation_serial.wrapping_add(1);} }
@@ -94,11 +110,13 @@ impl Species {
         while left>0. {let h=left.min(0.4);let c=Context {dt:h,environment,neighbors};
             let steering=match self.kind {LifeKind::Bird|LifeKind::Rabbit|LifeKind::Fish=>animals::steer(self,&c),LifeKind::Butterfly|LifeKind::Fly|LifeKind::Hoverbot|LifeKind::Pollen=>air::steer(self,&c),_=>self.steer_other(&c)};
             let force=match steering {Steering::Force(v)=>v,Steering::Halt=>{self.halt();Vec3::ZERO},Steering::None=>Vec3::ZERO};
-            if self.falling {self.gravity_velocity=(self.gravity_velocity-20.*h).clamp(-50.,50.);} else if self.surface_hug {self.gravity_velocity=0.;self.vel.y=0.;}
+            // Vehicle+0x52 is airborne, independently of EnableFalling (+0x50).
+            if self.airborne {self.gravity_velocity=(self.gravity_velocity-20.*h).clamp(-50.,50.);} else if self.surface_hug {self.gravity_velocity=0.;self.vel.y=0.;}
             self.vel+=(force.clamp_length_max(self.max_force)/self.mass)*h;
             self.vel=self.vel.clamp_length_max(self.max_speed);
-            self.pos+=(self.vel+Vec3::Y*self.gravity_velocity)*h;
-            if let Some((ground,_))=environment.ground(self.pos) {if self.pos.y<ground.y+0.01 {self.pos.y=ground.y+0.01;self.gravity_velocity=0.;}else if self.surface_hug&&self.gravity_velocity==0. {self.pos.y=ground.y+0.01;}}
+            let old = self.pos;
+            let next = old + (self.vel + Vec3::Y * self.gravity_velocity) * h;
+            self.resolve(old, next, false, environment);
             self.orient(environment);
             left-=h;
         }
@@ -164,8 +182,11 @@ impl Animation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Flat;
+    pub(super) struct Flat;
     impl Environment for Flat {
+        fn align(&self, old: Vec3, new: Vec3, body: &Body, state: &mut SurfaceState) -> Aligned {
+            ao_formats::playfield::collision::Collision::from_scene(&ao_scene::Scene::default()).align(old.to_array(), new.to_array(), body, state)
+        }
         fn ground(&self,p:Vec3)->Option<(Vec3,Vec3)> {Some((Vec3::new(p.x,0.,p.z),Vec3::Y))}
         fn ground_ray(&self,p:Vec3)->Option<(Vec3,Vec3)> {self.ground(p)}
         fn alignment(&self,_:Vec3)->Vec3 {Vec3::Y}
@@ -179,6 +200,28 @@ mod tests {
         fn landing(&self,_:Vec3,_:f32)->Option<Vec3> {None}
     }
     #[test]
+    fn native_support_state_controls_gravity_and_survives_substeps() {
+        let mut rabbit = Species::new(LifeKind::Rabbit, 0, Vec3::Y * 0.01, 0, 1);
+        rabbit.place(&Flat);
+        assert!(!rabbit.airborne);
+        rabbit.tick(0.1, &Flat, &[], true, true);
+        assert_eq!(rabbit.gravity_velocity, 0.);
+        assert!((rabbit.pos.y - 0.01).abs() < 0.00001);
+        rabbit.pos.y = 10.;
+        rabbit.place(&Flat);
+        assert!(rabbit.airborne);
+        rabbit.tick(0.4, &Flat, &[], true, true);
+        assert!((rabbit.pos.y - 6.8).abs() < 0.00001);
+        assert_eq!(rabbit.gravity_velocity, -8.);
+        rabbit.tick(0.4, &Flat, &[], true, true);
+        rabbit.tick(0.4, &Flat, &[], true, true);
+        assert!(!rabbit.airborne);
+        assert_eq!(rabbit.gravity_velocity, 0.);
+        let mut fish = Species::new(LifeKind::Fish, 0, Vec3::Y * 10., 0, 1);
+        fish.place(&Flat);
+        assert!(!fish.airborne, "DisableFalling never starts the gravity branch");
+    }
+    #[test]
     fn native_lifetime_visibility_and_authored_animation_segments() {
         let mut s=Species::new(LifeKind::Beetle,0,Vec3::ZERO,0,1);
         assert_eq!((s.state,s.animation,s.max_speed,s.mass),(1,1,0.8,0.1));
@@ -189,6 +232,7 @@ mod tests {
         s.tick(0.01,&Flat,&[],true,false);
         assert!(!s.alive);
         let mut s=Species::new(LifeKind::TumbleWeed,0,Vec3::Y*100.,0,1);
+        s.place(&Flat);
         s.tick(0.4,&Flat,&[],true,true);
         assert!((s.pos.y-96.8).abs()<0.0001);
         s.tick(0.1,&Flat,&[],false,true);

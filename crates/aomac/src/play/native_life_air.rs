@@ -214,6 +214,9 @@ mod tests {
     }
     struct Sensors { ground: f32, water: Option<f32>, corpses: Vec<Vec3> }
     impl super::super::Environment for Sensors {
+        fn align(&self, old: Vec3, new: Vec3, body: &super::super::Body, state: &mut super::super::SurfaceState) -> super::super::Aligned {
+            super::super::Environment::align(&super::super::tests::Flat, old, new, body, state)
+        }
         fn ground(&self, p: Vec3) -> Option<(Vec3, Vec3)> { Some((Vec3::new(p.x, self.ground, p.z), Vec3::Y)) }
         fn ground_ray(&self, p: Vec3) -> Option<(Vec3, Vec3)> { self.ground(p) }
         fn alignment(&self, _: Vec3) -> Vec3 { Vec3::Y }

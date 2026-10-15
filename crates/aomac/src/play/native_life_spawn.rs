@@ -83,6 +83,7 @@ impl LifeWorld {
             self.prepare(surface);
             self.prepared = true;
         }
+        let env = WorldEnvironment { surface, zones: &self.zones, districts: self.districts.as_ref(), characters, dangers, corpses, wind };
         let centre = self.zones.zone_at(mirror(control).to_array()).unwrap_or(0) as u32;
         let current = vicinity(centre, self.geometry.zones_x as u32);
         let update_zone = centre != self.previous[4];
@@ -100,6 +101,7 @@ impl LifeWorld {
                                 let mut s = Species::new(kind, request.catalog, request.pos, request.district, self.rng.value());
                                 s.group = group; s.body_radius = self.heights[request.catalog] * 0.5;
                                 s.pos.y += s.body_radius;
+                                s.place(&env);
                                 s.id = self.next_id;
                                 let animation = self.clips[request.catalog].as_ref().map(|(boundaries,total)| {
                                     let mut animation = Animation::new(Arc::clone(boundaries), *total);
@@ -117,7 +119,6 @@ impl LifeWorld {
         self.distance_timer += dt;
         let update_distance = self.distance_timer > 5.0; // DAT102c5b40
         if update_distance { self.distance_timer = 0.0; }
-        let env = WorldEnvironment { surface, zones: &self.zones, districts: self.districts.as_ref(), characters, dangers, corpses, wind };
         self.neighbors.clear();
         self.neighbors.extend(self.species.iter().map(|s| Neighbor { id: s.id, pos: s.pos, vel: s.vel, state: s.state, group: s.group }));
         for (index, (s, state)) in self.species.iter_mut().zip(&mut self.states).enumerate() {
@@ -243,6 +244,13 @@ struct WorldEnvironment<'a> {
     characters: &'a [CharacterSensor], dangers: &'a [CharacterSensor], corpses: &'a [Vec3], wind: Vec3,
 }
 impl Environment for WorldEnvironment<'_> {
+    fn align(&self, old: Vec3, new: Vec3, body: &ao_formats::playfield::collision::Body, state: &mut ao_formats::playfield::collision::SurfaceState) -> ao_formats::playfield::collision::Aligned {
+        // SurfaceState.last remains in collision coordinates across steps.
+        let mut aligned = self.surface.align(mirror(old).to_array(), mirror(new).to_array(), body, state);
+        aligned.pos = mirror(Vec3::from_array(aligned.pos)).to_array();
+        aligned.normal = mirror(Vec3::from_array(aligned.normal)).to_array();
+        aligned
+    }
     fn ground(&self, pos: Vec3) -> Option<(Vec3,Vec3)> { self.surface.closest(mirror(pos).to_array(), -1).map(|p| (mirror(Vec3::from_array(p.pos)), mirror(Vec3::from_array(p.normal)))) }
     fn ground_ray(&self, origin: Vec3) -> Option<(Vec3,Vec3)> { self.surface.line(mirror(origin).to_array(), [origin.x,-0.1,-origin.z]).map(|p| (mirror(Vec3::from_array(p.p)),mirror(Vec3::from_array(p.n)))) }
     fn liquid(&self, pos: Vec3) -> Option<f32> { self.surface.liquid_surface_at(mirror(pos).to_array()).map(|l| l.level) }

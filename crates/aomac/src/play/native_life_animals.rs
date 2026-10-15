@@ -279,6 +279,9 @@ mod tests {
 
     struct Water;
     impl Environment for Water {
+        fn align(&self, old: Vec3, new: Vec3, body: &super::super::Body, state: &mut super::super::SurfaceState) -> super::super::Aligned {
+            super::super::Environment::align(&super::super::tests::Flat, old, new, body, state)
+        }
         fn ground(&self, p: Vec3) -> Option<(Vec3, Vec3)> { Some((Vec3::new(p.x, 0.0, p.z), Vec3::Y)) }
         fn ground_ray(&self, p: Vec3) -> Option<(Vec3, Vec3)> { self.ground(p) }
         fn liquid(&self, _: Vec3) -> Option<f32> { Some(3.0) }
