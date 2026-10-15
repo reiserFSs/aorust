@@ -207,6 +207,8 @@ pub struct Zone {
     /// GC 0x101295f3 own-position district has nonzero LC minimum and maximum.
     /// `None` means the authored district/zone query is unavailable, not refusal.
     pub own_lca: Option<bool>,
+    /// GC1001cf60, shared authored district metadata; refreshed only on district changes.
+    pub lc_district: Option<(String, (u16, u16))>,
     /// `RelocateDynelsIIR_t`: `(child, parent)` links (`n3Dynel_t::RelocateDynel`), cleared with the playfield.
     pub parents: Vec<(Identity, Identity)>,
     /// Position and heading of each parented character relative to its parent (the vehicle's `+0x58` / `+0x80`).

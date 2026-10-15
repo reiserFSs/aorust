@@ -612,7 +612,11 @@ impl Player {
             let pos = if id == self.char_id as i32 { self.movement.pos() } else { zone.world.character_position(id).unwrap_or(d.pos) };
             zone.character_fight_levels.insert(id, self.fight_level(pos));
         }
-        zone.own_lca = self.fight.as_ref().and_then(|f| f.own_lca(self.movement.pos()));
+        let district = self.fight.as_ref().and_then(|f| f.lc_district(self.movement.pos()));
+        zone.own_lca = district.map(|(_, (min, max))| min != 0 && max != 0);
+        if zone.lc_district.as_ref().map(|(name, range)| (name.as_str(), *range)) != district {
+            zone.lc_district = district.map(|(name, range)| (name.to_owned(), range));
+        }
 
         let role = self.movement.role();
         let moving = self.movement.speed() > 0.01 && self.movement.grounded();
