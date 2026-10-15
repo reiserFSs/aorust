@@ -767,7 +767,14 @@ impl Player {
                     }
                     _ => {}
                 },
-                OwnEvent::Resurrected => {}
+                OwnEvent::Resurrected => {
+                    // GC 0x1003ea0d clears held CAT animation, then refreshes the current vehicle mode.
+                    self.stand();
+                    self.movement.resurrect();
+                    if zone.stat(0x36).is_some_and(|level| level >= 15) {
+                        zone.stats.insert(0xf7, 5000);
+                    }
+                }
                 OwnEvent::Spells { spells, apply } => {
                     for sp in &spells {
                         self.movement.apply_spell(sp, apply);
@@ -876,6 +883,49 @@ mod tests {
 
     /// Offline, real-CAT Player::frame regression, including the movement FSM and transient dispatch.
     /// AOMAC_POSTURE_TRACE writes both CSVs; AOMAC_POSTURE_PNG also renders every sampled frame.
+    #[test]
+    fn own_server_moves_queued_resurrection_refreshes_without_stopping() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::{outgoing::n3_frame, server_move as sm};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut zone = Zone::new(7);
+        zone.own_update = Some(Box::new(avatar::tests::own_update()));
+        let mut player = Player::new(&dir, &mut zone, 0).expect("captured own avatar");
+        zone.stats.insert(0x36, 15);
+        let frame = n3_frame(1, 0, sm::resurrect(Identity { kind: 0xC350, instance: 7 }, &sm::Resurrect { health: 77, nano: 33 }));
+        let mut combat = super::super::combat::state::Combat::new(Box::new(super::super::combat::log::fake::Fixed::new()));
+        combat.add_test_char(7, "Own", false, 100);
+        let death = n3_frame(1, 0, ao_net::n3::action::character_action(7, &ao_net::n3::action::simple(99, Identity::default(), Identity::default())));
+        combat.on_frame(&death, 7);
+        assert!(combat.char(7).unwrap().dead);
+        combat.on_frame(&frame, 7);
+        let restored = combat.char(7).unwrap();
+        assert!(!restored.dead);
+        assert_eq!((restored.health(), restored.stat(0xd6), restored.stat(0xf7)), (77, 33, 0), "below level 15 there is no shock");
+        for mode in [mode::RUN, mode::SIT_GROUND, mode::FLY] {
+            player.movement = Movement::new([0.0; 3], 0.0, 0);
+            let action = match mode {
+                mode::RUN => mv::SWITCH_RUN,
+                mode::SIT_GROUND => mv::SWITCH_SIT_GROUND,
+                _ => mv::SWITCH_FLY,
+            };
+            player.movement.transition(action);
+            if mode == mode::RUN { player.movement.action(mv::FORWARD_START, 0.0); }
+            player.movement.take_outgoing();
+            player.movement.take_stat_writes();
+            let before = *player.movement.fsm();
+            zone.on_frame(&frame);
+            player.apply_own_events(&mut zone);
+            assert_eq!(*player.movement.fsm(), before, "resurrection retains the movement FSM");
+            assert_eq!((zone.stat(0x1b), zone.stat(0xd6), zone.stat(0xf7)), (Some(77), Some(33), Some(5000)));
+            assert!(player.movement.take_outgoing().is_empty(), "no movement message or FullStop");
+            let writes = player.movement.take_stat_writes();
+            if mode == mode::SIT_GROUND { assert!(writes.contains(&(0x1a9, 25)) && writes.contains(&(0x1ae, 2))); }
+            if mode == mode::FLY { assert!(!player.movement.falling_enabled()); }
+        }
+    }
+
     #[test]
     fn own_sit_stand_player_frame_pose_continuity() {
         use std::fmt::Write as _;

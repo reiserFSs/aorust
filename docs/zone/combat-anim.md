@@ -217,7 +217,7 @@ No separate "you died" message was seen in the capture (the own char did not die
   emits `GlobalSignals+0x24`, sets `InputConfig_t::m_isAlive = false` and clears static input mode 8 (movement/input lock). Who calls `ToClientDynelDead` (N3 side,
   vtable ref 0x1004e484) was not traced.
 * `ResurrectIIR_t` (0x445F2A0B, vtable 0x10161290, apply `FUN_100769bd`): body `i32 health, i32 nano` -> `SetStat(Health 0x1b, health)`, `SetStat(CurrentNano 0xd6, nano)`,
-  then `FUN_10058816` / `FUN_1003ea0d` (purpose **[UNRESOLVED]**). `FlowControlModule_t::OnCharResurrectedMessage` [GUI 0x10027d47] raises the tip event `OnResurrect`; the death raises `OnDeath`
+  then `FUN_10058816` (lazy controller getter) / `FUN_1003ea0d`: clears controller `+0x38`, resolves the current animation (`1003c8b7`), clears CAT animations (`1003bff3`), reapplies the resolved animation (`1003c4e1`), refreshes vehicle mode/speed (`1006f963(0)`), and enables visibility. The own-player event releases its held animation and refreshes movement without FullStop. Own Level >=15 writes ResurrectionShock `0xf7 = 5000` (`10063bd9` -> `10063ac7`) and prints shock feedback. `Combat::on_frame` restores health/nano and clears its dead flag. `FlowControlModule_t::OnCharResurrectedMessage` [GUI 0x10027d47] raises the tip event `OnResurrect`; the death raises `OnDeath`
   (`FUN_100331d3`, TipSystem). Feedback strings: `Feedback_DeathByWeaponDamage/SpellDamage/FallDamage/LiquidDamage/ReflectDamage/ShieldDamage/Terminate`,
   `Feedback_NotWhileInResurrectionShock`, `Feedback_ResurrectionShockFillsYourBody`. The music hook is `SandyInterfaceModule_t::SetDeathMusicMode` (SI export 0x15a).
 

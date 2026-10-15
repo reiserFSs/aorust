@@ -150,6 +150,8 @@ snprintf's the token with the value (a `%s` fed a number prints `int_value<N>` /
 Client char and cause 1..7 → `FUN_10058b00(key, 0)` [GC 0x10058b00] (style 0, category 0) with `DeathByTerminate / ReflectDamage / ShieldDamage / WeaponDamage / SpellDamage / FallDamage / LiquidDamage`
 (`death_key`); `Health := 0`; non-NPC client char with stat `0x36 ≥ 1000` → `Feedback_ItemsWillBeReclaimed` fed with stat `0x22` (≤ 0 → 75). Causes live: 4 (weapon). The server's own death signal is
 `CharacterAction` 99 (`Died{cause: 0}` event; stops the fight like `CharDie_t`).
+The surprising threshold is confirmed by raw instructions, not a decompiler guess: `1005af30 PUSH 2; 1005af32 PUSH 0x36; 1005af3a CALL [EAX+0x3c]; 1005af3d CMP EAX,0x3e8; 1005af42 JL` skips reclaim. Stat `0x36` is Level. `1005af50 PUSH 0x22` obtains the reclaim delay; `1005af61 PUSH 0x4b` supplies its fallback. The Level >=1000 condition is intentionally unchanged. Resurrection's own-inventory branch independently uses the same Level >=1000 gate (`1003ea37..1003ea43`).
+
 
 ## 5. `StatIIR_t` apply [GC 0x100a1aaf] (`Combat::stats`)
 Pairs are applied ascending by stat id (std::map, duplicates overwritten). For each: `delta = new − current`, then

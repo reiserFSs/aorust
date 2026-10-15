@@ -332,6 +332,23 @@ impl Combat {
             N3::Misc(Misc::ToClientQuit) if h.kind == CHAR_KIND => {
                 self.chars.remove(&h.instance);
             }
+            N3::Unknown(body) if h.kind == CHAR_KIND && m.header.msg_type == ao_net::n3::server_move::RESURRECT => {
+                if let Ok(r) = ao_net::n3::server_move::parse_resurrect(&body) {
+                    if let Some(c) = self.chars.get_mut(&h.instance) {
+                        c.dead = false;
+                        c.stats.insert(0xd6, r.nano);
+                        let shock = h.instance == self.own && c.stat(STAT_LEVEL) >= 15;
+                        if shock {
+                            // GC 1003ea78 -> 10063bd9 -> 10063ac7: SetStat(ResurrectionShock, 5000).
+                            c.stats.insert(0xf7, 5000);
+                        }
+                        self.set_health(h.instance, r.health, &mut ev);
+                        if shock {
+                            self.plain(&mut ev, "Feedback_ResurrectionShockFillsYourBody");
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         ev
@@ -453,6 +470,7 @@ impl Combat {
         self.set_health(id, 0, ev);
         ev.push(CombatEvent::Died { dynel: id, cause: cause as u32 });
         let Some(c) = self.chars.get(&id) else { return };
+        // GC 1005af30..1005af42: GetStat(0x36, 2), CMP 0x3e8; this really is Level >= 1000.
         if !c.npc && client && c.stat(STAT_LEVEL) >= 1000 {
             let n = match c.stat(0x22) {
                 n if n > 0 => n,

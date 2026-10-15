@@ -990,9 +990,23 @@ impl Movement {
     }
 
     /// `FUN_10059ae5(1)`: while the vehicle `IsMoving` (vtable `+0x9c`) its vtable `+0x98` (`FUN_1006f008`) runs FSM `Transition(0x15)` FullStop.
-    /// Used by SetPos (flag), the death action `0x63`, `FUN_10044a07` (Features bit 4 cleared) and Resurrect.
+    /// Used by SetPos (flag), the death action `0x63` and `FUN_10044a07` (Features bit 4 cleared), not resurrection.
     pub fn stop_if_moving(&mut self) -> bool {
         self.fsm.is_moving() && self.transition(id::FULL_STOP)
+    }
+
+    /// `ResurrectIIR_t` -> `FUN_1003ea0d` -> `FUN_1006f963(0)`: retune the existing mode, without FullStop.
+    pub fn resurrect(&mut self) {
+        self.recalc();
+        if self.fsm.mode == mode::FLY {
+            self.disable_falling();
+            // `FUN_1006d196`, mode 7: SetFlag(0x20000000).
+            self.stats.flags |= FLAG_NO_FALL;
+            self.write_stat(0, self.stats.flags);
+        } else if self.fsm.mode == mode::SIT_GROUND {
+            // `FUN_1006d196`, mode 8.
+            self.write_rest(Some(25), 2);
+        }
     }
 
     /// `FollowTargetIIR_c` apply [GC 0x100732e3] part 1: `pos` (non-zero) is set with the current rotation (`SetRelPosRot`, then again by
