@@ -96,7 +96,7 @@ mod tests {
                 host.actors.clear();host.actors.push(ao_scene::ActorFrame {id:1,model:1,transform:world.to_cols_array_2d(),parts:parts.clone(),..Default::default()});
                 renderer.frame(1.0/60.0,&mut host,None);
                 if [1,15,30].contains(&frame) {
-                    let mut models=vec![(1,scene.clone())];models.extend(renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())));
+                    let mut models=vec![(1,std::sync::Arc::new(scene.clone()))];models.extend(renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())));
                     ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("meshchildren_{kind}_{id}_{frame}.png")),frame as f32/60.0)?;
                 }
             }

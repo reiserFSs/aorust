@@ -131,7 +131,7 @@ mod tests {
             let mut terrain=|p:Vec3|Some((Vec3::new(p.x,p.x*0.01,p.z),Vec3::Y));
             let models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
             let mut wrapped=models.clone();
-            for (_,model) in &mut wrapped {for mesh in &mut model.meshes {for sub in &mut mesh.submeshes {sub.texture_clamp=false;}}}
+            for (_,model) in &mut wrapped {for mesh in &mut std::sync::Arc::make_mut(model).meshes {for sub in &mut mesh.submeshes {sub.texture_clamp=false;}}}
             for time in [0.25,1.0,2.0] {
                 let skin=grid.vertices(time,&mut terrain).unwrap().unwrap().remove(0);
                 let actor=ao_scene::ActorFrame { id:1,model:super::super::texture_model_key(id,renderer.store.other_texture_quality()), skin: Some(std::sync::Arc::new(skin)), always:true,..Default::default() };

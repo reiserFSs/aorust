@@ -113,15 +113,15 @@ impl LightningFx {
 
     /// This frame's actor model uploads, once per [`LightningFx`] instance (reset on zone load, matching
     /// `combat::effects`' own "upload once" `host.actor_models` precedent).
-    pub fn take_model_upload(&mut self) -> Vec<(u64, Scene)> {
+    pub fn take_model_upload(&mut self) -> Vec<(u64, std::sync::Arc<Scene>)> {
         let mut uploads = Vec::new();
         if !self.model_uploaded {
             self.model_uploaded = true;
-            uploads.push((FAN_MODEL, fan_model()));
+            uploads.push((FAN_MODEL, std::sync::Arc::new(fan_model())));
         }
         if !self.bolt_model_uploaded {
             self.bolt_model_uploaded = true;
-            uploads.push((BOLT_MODEL, bolt_model()));
+            uploads.push((BOLT_MODEL, std::sync::Arc::new(bolt_model())));
         }
         uploads
     }

@@ -137,7 +137,9 @@ impl MorphVisual {
         let clip=assets.anim(store,42892)?;
         Ok(Self {rig,clip})
     }
+    #[cfg(test)]
     pub(super) fn model(&self)->&Scene {self.rig.model()}
+    pub(super) fn model_arc(&self)->std::sync::Arc<Scene> {self.rig.model_arc()}
     pub(super) fn pose(&self,deformer:&Deformer)->(Vec<Vertex>,Vec<[[f32;4];4]>) {
         let (mut vertices,parts)=self.rig.pose(Some((&self.clip,deformer.elapsed*1000.0)));
         for v in &mut vertices {
@@ -265,7 +267,7 @@ mod tests {
                 if [1,6,15,30,60,120,210,240].contains(&frame) {
                     let mut models:Vec<_>=r.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                     models.extend(r.buff_models.iter().map(|(&id,m)|(0xfac2_0000_0000_0000|u64::from(id),m.scene.clone())));
-                    models.push((1,visual.model().clone()));
+                    models.push((1,visual.model_arc()));
                     ao_render::render_to_png_actors(&Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("native30001_{id}_{frame}.png")),frame as f32/60.0)?;
                 }
             }

@@ -241,7 +241,7 @@ mod tests {
                 if [1,15,30,60,120,240,600,660].contains(&frame) {
                     let mut models:Vec<_>=r.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
                     models.extend(r.buff_models.iter().map(|(&id,m)|(0xfac2_0000_0000_0000|u64::from(id),m.scene.clone())));
-                    models.extend(r.mesh_resources.iter().map(|(&id,m)|(MESH_MODEL_BASE|u64::from(id),(**m).clone())));
+                    models.extend(r.mesh_resources.iter().map(|(&id,m)|(MESH_MODEL_BASE|u64::from(id),m.clone())));
                     ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy301x_{id}_{frame}.png")),frame as f32/60.0)?;
                 }
             }

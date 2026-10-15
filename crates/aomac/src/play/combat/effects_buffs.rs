@@ -179,7 +179,7 @@ impl Buff {
         }
         Ok(())
     }
-    pub(super) fn morph_scene(&self)->Option<&Scene> {match &self.native {Native::Deformer {visual:Some(v),..}=>Some(v.model()),_=>None}}
+    pub(super) fn morph_scene(&self)->Option<std::sync::Arc<Scene>> {match &self.native {Native::Deformer {visual:Some(v),..}=>Some(v.model_arc()),_=>None}}
     pub(super) fn morph_actor(&self,id:u32,model:u64)->Option<ActorFrame> {
         let Native::Deformer {effect,visual:Some(visual),..}=&self.native else {return None};
         let (vertices,parts)=visual.pose(effect);

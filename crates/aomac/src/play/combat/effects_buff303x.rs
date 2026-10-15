@@ -409,7 +409,7 @@ mod tests {
                 // Include the second tick: authored 20ms Burst children can be
                 // invisible at tick1 and already expired by the old tick15 sample.
                 if [1,2,15,30,45,60].contains(&frame) {
-                    let mut models=vec![(1,rig.model().clone())];
+                    let mut models=vec![(1,rig.model_arc())];
                     models.extend(r.models.iter().map(|(&id,m)| (id,m.scene.clone())));
                     models.extend(r.buff_models.iter().map(|(&id,m)|(0xfac2_0000_0000_0000|u64::from(id),m.scene.clone())));
                     let world=if id==25002 {&highlight_world}else{&ao_scene::Scene::default()};

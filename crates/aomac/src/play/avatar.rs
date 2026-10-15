@@ -499,6 +499,7 @@ impl Avatar {
         }
         self.scale = scale;
     }
+    pub fn model_arc(&self) -> Arc<Scene> { self.rig.model_arc() }
 
     /// Apply cloth deltas and replace attractors (`AppearanceUpdateIIR_c::Activate`, GC 0x10071679).
     /// Returns whether the caller must upload the rebuilt model; keeps the current animation.

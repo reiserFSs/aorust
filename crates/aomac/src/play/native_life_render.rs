@@ -9,7 +9,7 @@ const MODEL_BASE: u64 = 0x4c49_4645_0000_0000;
 const ACTOR_BASE: u32 = 0x7000_0000;
 
 struct Model {
-    scene: Scene,
+    scene: std::sync::Arc<Scene>,
     rig: Option<NodeRig>,
     uploaded: bool,
     boundaries: std::sync::Arc<[f32]>,
@@ -43,7 +43,7 @@ impl LifeModels {
             Some((scene, rig)) => (scene, Some(rig)),
             None => (mesh::load_mesh(store, mesh)?, None),
         };
-        self.models.insert(mesh, Model { scene, rig, uploaded: false, boundaries, height });
+        self.models.insert(mesh, Model { scene: std::sync::Arc::new(scene), rig, uploaded: false, boundaries, height });
         Ok(())
     }
     pub fn upload(&mut self, host: &mut ao_render::Host) {

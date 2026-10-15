@@ -295,7 +295,7 @@ mod tests {
                 renderer.frame(1.0/60.0,&mut host,Some(&mut terrain));
                 if [1,6,30,60,120].contains(&frame) {
                     let mut models:Vec<_>=renderer.models.iter().map(|(&id,m)| (id,m.scene.clone())).collect();
-                    models.extend(renderer.mesh_resources.iter().map(|(&id,m)|(MESH_MODEL_BASE|id as u64,m.as_ref().clone())));
+                    models.extend(renderer.mesh_resources.iter().map(|(&id,m)|(MESH_MODEL_BASE|id as u64,m.clone())));
                     ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy_{id}_{frame}.png")),frame as f32/60.0)?;
                 }
             }

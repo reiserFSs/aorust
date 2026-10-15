@@ -221,7 +221,7 @@ fn future_texture_family_changes_model_identity_without_mutating_existing_looks(
 /// A built model: the scene to upload, the rig (pose source) of CAT models, the clips of its set by client animation id
 /// (`AnimState::anim_id`, plus [`DIE_KEY`] / [`ATTACK_KEY`] / the death keys), the NPC record's `Features` stat.
 pub struct Built {
-    pub model: ao_scene::Scene,
+    pub model: Arc<ao_scene::Scene>,
     pub rig: Option<Arc<ActorRig>>,
     pub clips: HashMap<u32, Vec<Arc<CatAnim>>>,
     pub features: Option<i32>,
@@ -402,7 +402,7 @@ fn static_model(store: &RecordStore, mesh: u32, override_texture: Option<u32>) -
 }
 
 fn plain(model: ao_scene::Scene, visible: bool) -> Built {
-    Built { model, rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None, item_kind: None, name: None, stats: Vec::new(), sounds: Vec::new(), fabric: 0 }
+    Built { model: Arc::new(model), rig: None, clips: HashMap::new(), features: None, tag_height: 1.0, held: None, visible, item: None, item_kind: None, name: None, stats: Vec::new(), sounds: Vec::new(), fabric: 0 }
 }
 
 fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::Result<Built> {
@@ -419,7 +419,7 @@ fn build(store: &RecordStore, assets: &mut ActorAssets, look: &Look) -> anyhow::
                 (Some(cat), _) => {
                     let rig = ActorRig::new(store, assets, cat, None, &Default::default(), &Default::default(), &[])?;
                     let held = rig.pose(None);
-                    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), item_kind, name, stats: eff, ..plain(Default::default(), v.visible) })
+                    Ok(Built { model: rig.model_arc(), rig: Some(Arc::new(rig)), held: Some(held), item_kind, name, stats: eff, ..plain(Default::default(), v.visible) })
                 }
                 (None, Some(mesh)) => {
                     let model = static_model(store, mesh, v.override_texture)?;
@@ -472,7 +472,7 @@ fn build_corpse(store: &RecordStore, assets: &mut ActorAssets, c: &CorpseLook) -
         None => None,
     };
     let held = rig.pose(animation.as_ref().map(|a| (&**a, a.duration)));
-    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), held: Some(held), ..plain(Default::default(), true) })
+    Ok(Built { model: rig.model_arc(), rig: Some(Arc::new(rig)), held: Some(held), ..plain(Default::default(), true) })
 }
 
 fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) -> anyhow::Result<Built> {
@@ -553,7 +553,7 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
     let fabric = rec.as_ref().and_then(|r| r.stat(super::combat::notes::STAT_FABRIC_TYPE)).unwrap_or(0);
     let stats = rec.as_ref().map(|r| r.stats.clone()).unwrap_or_default();
     let sounds = rec.map(|r| r.sounds).unwrap_or_default();
-    Ok(Built { model: rig.model().clone(), rig: Some(Arc::new(rig)), clips, features, tag_height, sounds, fabric, stats, ..plain(Default::default(), true) })
+    Ok(Built { model: rig.model_arc(), rig: Some(Arc::new(rig)), clips, features, tag_height, sounds, fabric, stats, ..plain(Default::default(), true) })
 }
 
 fn monster_record(store: &RecordStore, look: &CharLook) -> anyhow::Result<Option<NpcRecord>> {
@@ -5213,7 +5213,7 @@ mod variant_tests {
             let built = build_char(&store, &mut assets, &CharLook::from_update(&u)).unwrap();
             let rig = built.rig.unwrap();
             let (vertices, transforms) = rig.pose(None);
-            let mut scene = built.model;
+            let mut scene = (*built.model).clone();
             scene.meshes[0].vertices = vertices;
             scene.instances = transforms.into_iter().enumerate().map(|(mesh, transform)| ao_scene::Instance { mesh, transform }).collect();
             let mut shot = Shot { gui: Gui::new(&dir, None).unwrap(), scene: Some(scene), eye_z: 3.5 };
@@ -5256,7 +5256,7 @@ mod variant_tests {
         let (vertices, transforms) = rig.pose(None);
         let lights = rig.mount_lights(&transforms); // actor-relative = world, the actor sits at the scene origin here
         assert!(!lights.is_empty(), "Bergdoktor's summon_light must decode");
-        let mut scene = built.model;
+        let mut scene = (*built.model).clone();
         scene.meshes[0].vertices = vertices;
         scene.instances = transforms.into_iter().enumerate().map(|(mesh, transform)| ao_scene::Instance { mesh, transform }).collect();
         scene.environment = Some(ao_scene::Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 400.0, fog_end: 800.0, ambient: [0.01; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0 });

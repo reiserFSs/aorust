@@ -206,7 +206,7 @@ mod tests {
                 }
                 scene.instances.extend((0..scene.meshes.len()).map(|mesh|ao_scene::Instance {mesh,transform:Mat4::IDENTITY.to_cols_array_2d()}));
                 assert_eq!(scene.instances.len(),scene.meshes.len(),"every legacy303x fixture mesh must be drawable");
-                ao_render::render_to_png_actors(&scene,&[],Vec::<ActorFrame>::new(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy303x_{id}_{frame}.png")),time)?;
+                ao_render::render_to_png_actors(&scene,&[] as &[(u64,ao_scene::Scene)],Vec::<ActorFrame>::new(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy303x_{id}_{frame}.png")),time)?;
             }
         }Ok(())
     }

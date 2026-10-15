@@ -140,7 +140,7 @@ mod tests {
             host.actors.clear();host.actors.push(actor);
             r.frame(1.0/60.0,&mut host,None);
             if [1,6,12,30,60].contains(&frame) {
-                let mut models=vec![(1,rig.model().clone())];
+                let mut models=vec![(1,rig.model_arc())];
                 models.extend(r.models.iter().map(|(&id,m)| (id,m.scene.clone())));
                 ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),(origin+Vec3::Y).to_array(),640,480,&out.join(format!("nano2_8012_{frame}.png")),frame as f32/60.0)?;
             }

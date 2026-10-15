@@ -2021,12 +2021,12 @@ pub fn render_to_png(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32
 
 /// [`render_to_png`] with the scrolling textures (`Submesh::uv_scroll`) at `time` seconds.
 pub fn render_to_png_at(scene: &Scene, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32) -> Result<()> {
-    render_to_png_actors(scene, &[], vec![], eye, look_at, width, height, path, time)
+    render_to_png_actors(scene, &[] as &[(u64, Scene)], vec![], eye, look_at, width, height, path, time)
 }
 
 /// [`render_to_png_at`] with dynamic actors on top of the scene (`models` for [`Renderer::add_actor_model`], `actors` for [`Renderer::set_actors`]).
 #[allow(clippy::too_many_arguments)]
-pub fn render_to_png_actors(scene: &Scene, models: &[(u64, Scene)], actors: Vec<ao_scene::ActorFrame>, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32) -> Result<()> {
+pub fn render_to_png_actors(scene: &Scene, models: &[(u64, impl std::borrow::Borrow<Scene>)], actors: Vec<ao_scene::ActorFrame>, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32) -> Result<()> {
     render_to_png_effects(scene,models,actors,eye,look_at,width,height,path,time,vec![],NativeFog::default())
 }
 
@@ -2035,16 +2035,16 @@ pub fn render_to_png_screen(scene:&Scene,layers:Vec<ScreenLayer>,fog_disabled:bo
     render_to_png_screen_fog(scene,layers,NativeFog{enabled:!fog_disabled,..Default::default()},width,height,path)
 }
 pub fn render_to_png_screen_fog(scene:&Scene,layers:Vec<ScreenLayer>,fog:NativeFog,width:u32,height:u32,path:&Path)->Result<()> {
-    render_to_png_effects(scene,&[],vec![],[0.0,0.0,5.0],[0.0;3],width,height,path,0.0,layers,fog)
+    render_to_png_effects(scene,&[] as &[(u64, Scene)],vec![],[0.0,0.0,5.0],[0.0;3],width,height,path,0.0,layers,fog)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_to_png_effects(scene: &Scene, models: &[(u64, Scene)], actors: Vec<ao_scene::ActorFrame>, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32,layers:Vec<ScreenLayer>,fog:NativeFog) -> Result<()> {
+fn render_to_png_effects(scene: &Scene, models: &[(u64, impl std::borrow::Borrow<Scene>)], actors: Vec<ao_scene::ActorFrame>, eye: [f32; 3], look_at: [f32; 3], width: u32, height: u32, path: &Path, time: f32,layers:Vec<ScreenLayer>,fog:NativeFog) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let mut r = Renderer::new(&instance, None)?;
     r.upload(scene);
     for (k, m) in models {
-        r.add_actor_model(*k, m);
+        r.add_actor_model(*k, m.borrow());
     }
     r.set_actors(actors);
     r.seek(time);

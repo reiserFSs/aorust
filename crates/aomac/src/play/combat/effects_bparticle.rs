@@ -212,7 +212,7 @@ mod tests {
                 let blank=out.join(format!("bparticle3024_blank_{id}_{step}.png"));
                 let time=step as f32*0.01;
                 ao_render::render_to_png_actors(&ao_scene::Scene::default(),&models,host.actors.clone(),eye.to_array(),[0.0;3],640,480,&path,time)?;
-                ao_render::render_to_png_actors(&ao_scene::Scene::default(),&[],Vec::new(),eye.to_array(),[0.0;3],640,480,&blank,time)?;
+                ao_render::render_to_png_actors(&ao_scene::Scene::default(),&[] as &[(u64, ao_scene::Scene)],Vec::new(),eye.to_array(),[0.0;3],640,480,&blank,time)?;
                 let image=image::open(&path)?.to_rgba8();let background=image::open(&blank)?.to_rgba8();
                 let pixels=image.pixels().zip(background.pixels()).filter(|(a,b)|a!=b).count();
                 visible_pixels+=pixels;

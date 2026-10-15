@@ -689,7 +689,7 @@ impl Player {
             self.lens_set = true;
         }
         if !self.model_sent {
-            host.actor_models.push((avatar::MODEL_KEY, self.avatar.model().clone()));
+            host.actor_models.push((avatar::MODEL_KEY, self.avatar.model_arc()));
             self.model_sent = true;
         }
         // `VisualCATMesh_t::RunFunction` -> `RefreshAlpha`: opacity from the camera <-> head attractor distance (own character only)

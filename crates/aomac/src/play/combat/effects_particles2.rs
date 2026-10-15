@@ -344,7 +344,7 @@ mod tests {
                 let scene=particle_inspection_scene(eye,min,max);
                 ao_render::render_to_png_actors(&scene, &models,
                     host.actors.clone(), eye.to_array(), center.to_array(), 640,480, &path,time)?;
-                ao_render::render_to_png_actors(&scene, &[], Vec::new(),
+                ao_render::render_to_png_actors(&scene, &[] as &[(u64,ao_scene::Scene)], Vec::new(),
                     eye.to_array(), center.to_array(), 640,480, &background,time)?;
                 let frame = image::open(&path)?.to_rgba8();
                 let blank = image::open(&background)?.to_rgba8();

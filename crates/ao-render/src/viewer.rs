@@ -71,9 +71,10 @@ pub struct Host {
     /// Frontend request: capture the cursor and deliver [`GameInput::MouseMotion`] (mouse-look); applied after each frame/input.
     pub look: bool,
     /// Actor models to upload before the next frame (`key`, model scene), see [`Renderer::add_actor_model`]; drained by the viewer.
-    pub actor_models: Vec<(u64, Scene)>,
+    /// Shared ownership keeps decoded mesh/texture arrays in place until the upload is drained.
+    pub actor_models: Vec<(u64, std::sync::Arc<Scene>)>,
     /// Dynamic geometry replacements retaining previously uploaded textures; drained after model uploads.
-    pub actor_model_updates: Vec<(u64, Scene)>,
+    pub actor_model_updates: Vec<(u64, std::sync::Arc<Scene>)>,
     /// Model keys to retire before uploads and actor frames; drained by the viewer. See [`Renderer::remove_actor_model`].
     pub actor_model_removals: Vec<u64>,
     /// The actors to draw this frame ([`ao_scene::ActorFrame`]); push every frame, the viewer drains it. Actors that are not pushed are forgotten.
@@ -1553,11 +1554,24 @@ mod tests {
 
 
     #[test]
+    fn actor_model_handoff_keeps_the_original_scene_allocation() {
+        let scene = std::sync::Arc::new(Scene::default());
+        let mut host = Host::headless();
+        host.actor_models.push((1, scene.clone()));
+        host.actor_model_updates.push((1, scene.clone()));
+        assert!(std::sync::Arc::ptr_eq(&scene, &host.actor_models[0].1));
+        assert!(std::sync::Arc::ptr_eq(&scene, &host.actor_model_updates[0].1));
+        assert_eq!(std::sync::Arc::strong_count(&scene), 3);
+        host.set_scene(Scene::default());
+        assert_eq!(std::sync::Arc::strong_count(&scene), 1);
+    }
+
+    #[test]
     fn replacing_scene_discards_pending_old_topology_updates() {
         let mut host = Host::headless();
         assert!(host.actor_model_removals.is_empty());
         host.repose(Scene::default());
-        host.actor_models.push((1, Scene::default()));
+        host.actor_models.push((1, std::sync::Arc::new(Scene::default())));
         host.actor_model_removals.push(1);
         host.set_scene(Scene::default());
         assert!(host.scene.is_some());

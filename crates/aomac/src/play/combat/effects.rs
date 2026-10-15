@@ -253,8 +253,14 @@ struct Active {
 }
 
 struct EffectModel {
-    scene: Scene,
+    scene: Arc<Scene>,
     uploaded: bool,
+}
+
+impl EffectModel {
+    fn new(scene: Arc<Scene>) -> Self {
+        Self { scene, uploaded: false }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -871,7 +877,7 @@ impl Renderer {
                 vertices.resize(vertices.len()+n,Vertex::default());
             }
             scene.meshes.push(Mesh { vertices, submeshes });
-            self.models.insert(model_key,EffectModel { scene,uploaded:false });
+            self.models.insert(model_key,EffectModel::new(Arc::new(scene)));
         }
         let particles = Vec::with_capacity(count);
         let repetitions = config.repetitions.unwrap_or(if template.kind == 1006 { template.word(37)?.max(1) } else { 0 });
@@ -881,10 +887,10 @@ impl Renderer {
         self.next_actor = self.next_actor.wrapping_add(mesh_test.as_ref().map(|_|32).or_else(||mparticle.as_ref().map(|m|m.actor_count())).or_else(||mesh.as_ref().map(|m| m.actor_count())).or_else(|| tracer_mesh.as_ref().map(|m|m.actor_count())).unwrap_or(1).max(1) as u32).max(ACTOR_BASE);
         if let Some(c) = &mut composition { c.initialize(self)?; }
         if let Some(native)=&mut native_replicated { native.initialize(self)?; }
-        if let Some(g)=&ground_impact {self.buff_models.insert(actor,EffectModel {scene:g.scene(&self.store,&self.names)?,uploaded:false});}
+        if let Some(g)=&ground_impact {self.buff_models.insert(actor,EffectModel::new(Arc::new(g.scene(&self.store,&self.names)?)));}
         if let Some(buff)=&mut buff {
             buff.initialize(self)?;
-            if let Some(scene)=buff.morph_scene() {self.buff_models.insert(actor,EffectModel {scene:scene.clone(),uploaded:false});}
+            if let Some(scene)=buff.morph_scene() {self.buff_models.insert(actor,EffectModel::new(scene));}
             else if !buff.models().is_empty() {
                 if buff.needs_private_model() {let model=self.buff_model(buff)?;self.buff_models.insert(actor,model);}
                 else if !self.models.contains_key(&model_key) {let model=self.buff_model(buff)?;self.models.insert(model_key,model);}
@@ -944,7 +950,7 @@ impl Renderer {
             submeshes.push(sub);vertices.resize(vertices.len()+count,Vertex::default());
         }
         scene.meshes.push(Mesh {vertices,submeshes});
-        Ok(EffectModel {scene,uploaded:false})
+        Ok(EffectModel::new(Arc::new(scene)))
     }
     pub fn needs_source_mesh(&self,identity:(u32,u32))->bool {
         self.active.iter().filter_map(|a|a.buff.as_ref()).any(|b|b.identity()==Some(identity)&&b.needs_source_mesh())
@@ -1095,7 +1101,7 @@ impl Renderer {
         }
         for (selector,uploaded) in &mut self.mesh_uploaded {
             if !*uploaded {
-                host.actor_models.push((MESH_MODEL_BASE|u64::from(*selector),self.mesh_resources[selector].as_ref().clone()));
+                host.actor_models.push((MESH_MODEL_BASE|u64::from(*selector),self.mesh_resources[selector].clone()));
                 *uploaded=true;
             }
         }
@@ -1216,10 +1222,13 @@ impl Renderer {
                     Ok(Some(groups))=>{
                         self.aux_sounds.extend(buff.take_sounds());
                         if buff.dynamic_models() {
-                            match Self::build_buff_geometry(&self.store,&self.names,buff,self.buff_models.get(&effect.actor).map(|model|&model.scene)) {
+                            match Self::build_buff_geometry(&self.store,&self.names,buff,self.buff_models.get(&effect.actor).map(|model|model.scene.as_ref())) {
                                 Ok(model)=>{
-                                    let cached=self.buff_models.entry(effect.actor).or_insert_with(||EffectModel {scene:Scene::default(),uploaded:true});
-                                    for (&key,texture) in &model.scene.textures {cached.scene.textures.insert(key,texture.clone());}
+                                    let cached=self.buff_models.entry(effect.actor).or_insert_with(||EffectModel::new(Arc::new(Scene::default())));
+                                    if !model.scene.textures.is_empty() {
+                                        let cached_scene=Arc::make_mut(&mut cached.scene);
+                                        for (&key,texture) in &model.scene.textures {cached_scene.textures.insert(key,texture.clone());}
+                                    }
                                     cached.uploaded=true;
                                     host.actor_model_updates.push((0xfac2_0000_0000_0000|u64::from(effect.actor),model.scene));
                                 }

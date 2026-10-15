@@ -192,7 +192,7 @@ pub struct ActorRig {
     bind: Vec<Option<Xf>>,
     /// `cat.submeshes` indices in the order their vertices appear in `model.meshes[0]`.
     used: Vec<usize>,
-    model: Scene,
+    model: Arc<Scene>,
     mounts: Vec<Mount>,
     /// The attractor of the head mesh.
     head: Option<usize>,
@@ -264,7 +264,7 @@ impl ActorRig {
         let scale = translation_scales(&cat);
         let order = cat.bone_order();
         let bounding_radius = cat.bounding_radius();
-        Ok(Self { cat, parents, scale, order, bind, used, model, mounts, head: head_att, model_id, bounding_radius })
+        Ok(Self { cat, parents, scale, order, bind, used, model: Arc::new(model), mounts, head: head_att, model_id, bounding_radius })
     }
 
     /// Native CAT triangle order, indexing the composed body vertices (scene Z mirror).
@@ -304,6 +304,9 @@ impl ActorRig {
     pub fn model(&self) -> &Scene {
         &self.model
     }
+
+    /// Shared immutable model for renderer handoff without copying mesh or texture data.
+    pub fn model_arc(&self) -> Arc<Scene> { self.model.clone() }
 
     /// Native attractor place of each rigid mounted mesh (body is unmounted).
     pub fn part_attractors(&self) -> Vec<Option<u8>> {

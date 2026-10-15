@@ -198,7 +198,7 @@ impl TagLayer {
             if self.shown.get(&slot) != Some(&h) {
                 self.shown.insert(slot, h);
                 let (layout, rgba) = render(gui, t);
-                host.actor_models.push((key, quad_model(layout.width, rgba)));
+                host.actor_models.push((key, std::sync::Arc::new(quad_model(layout.width, rgba))));
             }
             let c = |v: ao_render::Vec3| [v.x, v.y, v.z, 0.0];
             host.actors.push(ActorFrame {
@@ -378,7 +378,7 @@ mod tests {
         let widths: Vec<u32> = host.actor_models.iter().map(|m| m.1.textures.values().next().unwrap().width).collect();
         assert_eq!(widths, vec![128, 256, 128]);
         // the nametag has no plate or bar: only text pixels; the indicator has the plate corners
-        let opaque = |m: &(u64, Scene)| m.1.textures.values().next().unwrap().rgba.chunks(4).filter(|p| p[3] == 255).count();
+        let opaque = |m: &(u64, std::sync::Arc<Scene>)| m.1.textures.values().next().unwrap().rgba.chunks(4).filter(|p| p[3] == 255).count();
         assert!(opaque(&host.actor_models[0]) > opaque(&host.actor_models[2]) && opaque(&host.actor_models[2]) > 20);
         let models = host.actor_models.clone();
         let actors = host.actors.clone();

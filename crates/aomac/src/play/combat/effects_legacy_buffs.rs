@@ -224,7 +224,7 @@ mod tests {
                 let mut scene=Scene::default();scene.textures.insert(key,texture);scene.meshes.push(Mesh {vertices:vertices.remove(0),submeshes:vec![sub]});
                 scene.instances.extend((0..scene.meshes.len()).map(|mesh|ao_scene::Instance {mesh,transform:Mat4::IDENTITY.to_cols_array_2d()}));
                 assert_eq!(scene.instances.len(),scene.meshes.len(),"every legacy buff fixture mesh must be drawable");
-                ao_render::render_to_png_actors(&scene,&[],Vec::<ActorFrame>::new(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy_{}_{id}_{frame}.png",t.kind)),frame as f32/60.0)?;
+                ao_render::render_to_png_actors(&scene,&[] as &[(u64,ao_scene::Scene)],Vec::<ActorFrame>::new(),eye.to_array(),origin.to_array(),640,480,&out.join(format!("legacy_{}_{id}_{frame}.png",t.kind)),frame as f32/60.0)?;
             }
         }Ok(())
     }

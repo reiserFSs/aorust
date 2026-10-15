@@ -38,7 +38,7 @@ Ported from the decompiled PRK launcher (`MainWindow.DownloadLatestVersion`, `Ht
 
 ### Shared actor resources
 
-Performance audit item 11: `ao-render/src/actors.rs` interns immutable archive texture uploads across actor
+Performance audit items 11–12: `ao-render/src/actors.rs` interns immutable archive texture uploads across actor
 model keys. Identity includes the native `TextureKey`, decoded source format, dimensions, texture quality,
 compression, better-mip policy and a stdlib content fingerprint of the decoded bytes. `RecordStore` remaps
 canonical type 1010004 to quality families 1010016/1010017 independently of the upload policy; the fingerprint
@@ -54,11 +54,19 @@ or source change selects a different upload, including when supplied through `up
 data is copied into a permanent GPU cache. `actor_texture_resources()` reports unique model-retained textures
 and estimated encoded mip bytes, not total Metal VRAM; `actor_texture_uploads()` counts actual actor uploads.
 
+`Host::actor_models` and `actor_model_updates` carry `Arc<Scene>` so uploading an existing model does not
+deep-copy its decoded textures or mesh arrays. Actors using the same model key already share its material,
+index and rigid-vertex buffers. Different model keys keep separate mutable geometry buffers because
+`update_actor_model` rewrites them in place; texture sharing must not alias these writes.
+
 Regression coverage: `immutable_actor_textures_share_uploads_pixels_and_reclaim` compares offscreen pixels
 for two models, counts one shared texture upload (white placeholders remain model-local), proves generated
 textures stay independent, checks policy/source variants, and verifies last-owner reclamation and independent
 geometry writes. `actor_texture_identity_excludes_generated_namespaces_and_tracks_upload_policy` covers
 synthetic namespaces and every policy field. These are runnable checks, not benchmark results.
+`actor_model_handoff_keeps_the_original_scene_allocation` proves both Host queues retain the original allocation
+and release their references on scene replacement. Offscreen actor image helpers borrow either owned or shared
+scenes, so capture/test callers can consume the same handoff without cloning scene contents.
 
 ### Native window move profiling (2026-10-07)
 
