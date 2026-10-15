@@ -541,11 +541,10 @@ Evidence (decompiled GUI.dll, all addresses `0x1xxxxxxx`):
   (`ViewSurface_c(Rect, flags)`, flags = anchoring: bit0 left, bit1 right, bit2 top, bit3 bottom, `_LayoutSelf` 0x101509e1): four edge lines of thickness `p` (flags 0xd left, 7 top,
   0xe right, 0xb bottom) in the **HOVER** colour, plus – with a body – a separator line `p` thick under the title (flags 7, HOVER), without a body a solid black fill (flags 0xf).
   Title frame `(2p, 2p, R−2p, titleH+2p−1)`, body frame `(2p, titleH+5p, R−2p, B−2p)`. Without a body the title is drawn in the DEFAULT colour
-  (`TextRenderer_c::SetDefaultColor`), with a body both texts use the default text colour (UNRESOLVED GUESS: TEXT).
+  (`TextRenderer_c::SetDefaultColor`); with a body both texts retain **white** (`TextRenderer_c` constructor **0x10163412**, `+0x1bc = 0xffffffff`; `TextView::Initialize` **0x10164b88** never overrides it).
 * **Placement** `Window::MoveToMouse(false)` 0x10154e16: `x = mouse.x + 16`, or `mouse.x − (width+1)` if `mouse.x ≥ screenW/2`; `y = mouse.y + 32`, or `mouse.y − (height+1)` if
   `mouse.y ≥ screenH/2`; then `MoveInsideScreen`.
-* Not decided from the binary (UNRESOLVED): the window size beyond the view (`pref + (2,2)` hits the argument list of `Window::ResizeTo` only through a mangled decompile; we use
-  `pref` + 2 only with a body, since the view is inset by 1), the title colour with a body, the sqrt operand of the aspect rule (we use unwrapped width × line height).
+* **Window extent and wrap area resolved:** assembly **0x10149b42–10149b74** adds `Point(2,2)` to the view preferred size unconditionally, including title-only tooltips; the body-only inset remains separate. `HTMLParser_c::_UpdateWordSizes` **0x1015d779** stores the sum of all glyph/image advances × **13** at parser `+0x44` (renderer `+0x18c`), not maximum unwrapped line width × current font height. `CalculatePreferredSize` assembly **0x10162475–10162486** takes its square root, multiplies aspect2 and truncates. Regression `native_tooltip_window_padding_and_body_default_colour` checks both body states and emitted glyph colours.
 
 Engine API (`ao_gui::Gui`): `tooltip=`/`tooltip_body=` on any XML element → `View::tip`; `set_tooltip(window, view, title, body)` / `set_tooltip_in(handle, …)` for dynamic
 texts; `set_screen_size` (default: largest visible window); `show_tooltip(title, body)` shows a `ToolTip_c` at the pointer immediately (`tooltip_shown`, `tooltip_rect` for

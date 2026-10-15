@@ -220,10 +220,10 @@ impl Gui {
         let mut body_lay = None;
         let mut bh = 0.0;
         if has_body {
-            // `TextRenderer_c::CalculatePreferredSize` 0x101623ea with an unset width: wrap width = ftol(sqrt(area) * aspect)
-            // ([INFERENCE] the area `+0x18c` is the unwrapped text width × line height).
+            // HTMLParser::_UpdateWordSizes (1015d779, final store at +44) sums all
+            // glyph/image advances, including every hard line, then multiplies by 13.
             let flat = text::layout_text(&mut self.fonts, &self.colors, FONT, body, tvf::MULTILINE | tvf::WORD_WRAP, None);
-            let area = (flat.max_width * self.fonts.font(FONT).height) as f32;
+            let area = (flat.lines.iter().flat_map(|line| &line.runs).map(|run| run.advance(self.fonts.font(FONT))).sum::<i32>() * 13) as f32;
             let w0 = (area.sqrt() * ASPECT) as i32;
             let lay = text::layout_text(&mut self.fonts, &self.colors, FONT, body, tvf::MULTILINE | tvf::WORD_WRAP, Some(w0));
             // the body is at least as wide as the title (`if (bodyW < titleW) bodyW = titleW`), then re-measured
@@ -235,8 +235,8 @@ impl Gui {
         }
         let pref = Point::new(pref_x + 4.0 * p, if has_body { th + bh + 1.0 + 7.0 * p } else { th + 4.0 * p });
         let inset = if has_body { 1.0 } else { 0.0 };
-        // window extents = pref (+2 when the view is inset by 1 on each side); the view fills the window minus the inset
-        let win = Point::new(pref.x + 2.0 * inset, pref.y + 2.0 * inset);
+        // ToolTip ctor 10149b42..10149b74 unconditionally adds Point(2,2).
+        let win = Point::new(pref.x + 2.0, pref.y + 2.0);
         let view = Rect::new(0.0, 0.0, pref.x, pref.y);
         let edges = [
             Rect::new(0.0, 0.0, p - 1.0, view.b),
@@ -298,12 +298,11 @@ impl Gui {
         for e in &m.edges {
             solid(out, *e, hover);
         }
-        // title colour: DEFAULT only when there is no body (`TextRenderer_c::SetDefaultColor`, `FUN_101492c6`); with a body the
-        // default text colour is used (UNRESOLVED GUESS: TEXT).
-        let title_col = if m.black { self.map_color(0x1000000) } else { self.map_color(0x4000000) };
+        // Renderer ctor 10163412 defaults to white; only title-only tips override it.
+        let title_col = if m.black { self.map_color(0x1000000) } else { [255; 3] };
         self.draw_string(out, FONT, &m.title, (vx + m.title_rect.l) as i32, (vy + m.title_rect.t) as i32, title_col, 1.0, false);
         if let Some((lay, r)) = &m.body {
-            let text_col = self.map_color(0x4000000);
+            let text_col = [255; 3];
             for line in &lay.lines {
                 let mut pen = (vx + r.l) as i32;
                 if let crate::view::Align::Center = line.align {
@@ -314,6 +313,26 @@ impl Gui {
                     pen += self.draw_string(out, FONT, &run.text, pen, (vy + r.t) as i32 + line.y, c, 1.0, false);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_tooltip_window_padding_and_body_default_colour() {
+        let Ok(mut gui) = Gui::new(&crate::client_dir(), None) else { return };
+        for body in ["", "Body"] {
+            let m = gui.tip_metrics("Title", body);
+            assert_eq!(m.size, (m.view.width() as i32 + 3, m.view.height() as i32 + 3));
+            assert_eq!(m.inset, if body.is_empty() { 0.0 } else { 1.0 });
+            let mut cmds = Vec::new();
+            gui.draw_tip(&Shown { pos: (0, 0), m }, &mut cmds);
+            let expected = if body.is_empty() { gui.map_color(0x1000000) } else { [255; 3] };
+            assert!(cmds.iter().any(|cmd| matches!(cmd, DrawCmd::Glyph { tint, .. } if *tint == expected)));
+            assert!(!cmds.iter().any(|cmd| matches!(cmd, DrawCmd::Glyph { tint, .. } if !body.is_empty() && *tint != [255; 3])));
         }
     }
 }
