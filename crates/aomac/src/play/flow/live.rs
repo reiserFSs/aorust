@@ -14,7 +14,9 @@
 //! Programs window's first row onto a shortcut bar slot (bug 18); `nanopage=<index>` selects its school tab first. `barnames` prints bar 0's slot names, `clickslot=<bar>:<slot>` real-clicks one.
 //! `missioninfo=<mission name>` opens Missions and Shift+LMBs its real row, checks the existing InfoView against Zone quest data;
 //! logs only redacted quest metadata. Follow with `shot=name` for a frame of the resulting page.
-//! `nanos` prints learned program IDs; `buffs` prints running buffs and NCU usage.
+//! `nanos` prints learned IDs, authored names, schools, costs; `buffs` prints running buffs and NCU usage; `skills` prints projected values.
+//! `pets` prints the own pet list and dynel state; `nanoclick` double-clicks the current school's first program.
+//! `viewclick=<view name>` resolves a unique named control and clicks it through GUI mouse dispatch.
 //! `down=KEY` / `up=KEY` hold across steps; `clickcorpse` / `rightcorpse` click a visible, GUI-unobscured corpse pick point.
 //! `focuslost` cancels held game input as the host's window-focus-loss event does.
 //! Named GUI keys are delivered before physical game keys, as in the viewer; letters stay physical (no invented layout/IME text).
@@ -1023,7 +1025,26 @@ fn live_walk() {
                 eprintln!("abilityraise {stat}: before={before:?} after_server_confirmed={after:?}");
             }
             "buffs" => eprintln!("buffs time={} ncu={} entries={:?}", l.p.zone.nanos.time, l.p.zone.nanos.buffs.iter().map(|b| b.ncu_cost).sum::<i32>(), l.p.zone.nanos.buffs),
-            "nanos" => eprintln!("nanos {:?}", l.p.zone.nanos.programs),
+            "nanos" => {
+                eprintln!("nanos {:?}", l.p.zone.nanos.programs);
+                let mut db = super::super::hud_nanodb::NanoDb::new(&l.p.dir);
+                for &id in &l.p.zone.nanos.programs {
+                    if let Some(info) = db.info(&mut l.p.gui, id) {
+                        eprintln!("nano {id}: {:?} school={:?} cost={:?} ncu={:?}", info.name, info.school(), info.stat(super::super::hud_nanodb::stat::NANO_POINTS), info.stat(super::super::hud_nanodb::stat::NCU));
+                    }
+                }
+            }
+            "pets" => {
+                for pet in &l.p.zone.pets {
+                    eprintln!("pet {pet:?} state={:?}", l.p.zone.dynels.get(&pet.instance));
+                }
+                eprintln!("pets count={}", l.p.zone.pets.len());
+            }
+            "skills" => {
+                let mut values: Vec<_> = l.p.zone.skill_values.iter().collect();
+                values.sort();
+                eprintln!("skills {}", values.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
+            }
             // the spells running on the own character (docs/gui.md §11.14) and the maps they fill
             "spells" => {
                 eprintln!("spells {}", l.p.zone.active_spells.iter().map(|s| format!("{:#x}(stat {} amount {} target {})", s.function, s.stat(0), s.stat(0x27), s.stat(0x20))).collect::<Vec<_>>().join(" "));
@@ -1202,6 +1223,28 @@ fn live_walk() {
                 }
                 l.tick();
                 l.o.host.mods = mods;
+            }
+            // `viewclick=<view name>` uses the real GUI mouse dispatch after resolving a unique named control.
+            "viewclick" => {
+                let windows: Vec<_> = l.p.gui.window_ids().into_iter().filter(|&w| l.p.gui.window_visible(w) && l.p.gui.has_view(w, v) && l.p.gui.view_rect(w, v).is_some()).collect();
+                assert_eq!(windows.len(), 1, "viewclick requires one visible control named {v}");
+                let r = l.p.gui.view_rect(windows[0], v).unwrap();
+                let (x, y) = (r.l + r.width() / 2.0, r.t + r.height() / 2.0);
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                l.p.input(ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                l.tick();
+                l.p.input(ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                l.tick();
+            }
+            // `nanoclick` double-clicks the currently selected school's first program through mouse input.
+            "nanoclick" => {
+                let (x, y) = l.p.hud.as_ref().unwrap().nano_first_point(&l.p.gui);
+                l.p.input(ao_gui::InputEvent::MouseMove { x, y }, &mut l.o.host);
+                for _ in 0..2 {
+                    l.p.input(ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                    l.p.input(ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, &mut l.o.host);
+                    l.tick();
+                }
             }
             // `rightclickitem=<slot hex>` or `rightclickitem=item:<template id>`: real right-click (GUI mouse dispatch,
             // not a direct command) at the screen cell currently showing the bag/wear item (bug 10 right-click
@@ -1640,10 +1683,17 @@ fn live_walk() {
                 eprintln!("feedback {:?}\nloot: {:?}", i.take_feedback(), i.loot_dump(&mut p.gui));
             }
             // `windump`: all open window ids, outer position/size and named views, for locating tab/click targets.
+            // `windump=text` also prints nonempty named text controls and their current rectangles.
             "windump" => {
                 let p = &l.p;
                 for w in p.gui.window_ids() {
                     eprintln!("window {w:?} pos={:?} size={:?} views={:?}", p.gui.window_pos(w), p.gui.outer_size(w), p.gui.view_names(w));
+                    if v == "text" {
+                        for name in p.gui.view_names(w) {
+                            let text = p.gui.text(w, &name);
+                            if !text.is_empty() { eprintln!("view {name:?} rect={:?} text={text:?}", p.gui.view_rect(w, &name)); }
+                        }
+                    }
                 }
             }
             "grid" => {
