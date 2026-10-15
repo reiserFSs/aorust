@@ -813,6 +813,8 @@ impl Hud {
         v.extend(self.target_ncu.take_urls());
         v.extend(self.nano.take_urls());
         v.append(&mut self.winb.team.info_urls);
+        v.extend(self.actwin.take_info_urls());
+        for bar in &mut self.shortcuts { v.extend(bar.take_info_urls()); }
         v
     }
     /// Native TipSystem event producer; parameters come from each retail callback.

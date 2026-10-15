@@ -112,6 +112,7 @@ pub(super) struct ShortcutBar {
     pub(super) new_mouse: bool,
     tooltip_key: Option<(usize, u32, u32, bool)>,
     tooltip_body: String,
+    info_urls: Vec<String>,
     released: Option<(Slot, f32, f32)>,
     item_templates: HashMap<u32, (i32, super::hud_stats::ItemInfo)>,
 }
@@ -203,7 +204,7 @@ impl ShortcutBar {
         let (x, y) = (20, 20);
         let store = ao_rdb::RecordStore::open(dir).ok();
         let slots = if n == 0 { first_login(gui, store.as_ref()) } else { Default::default() };
-        let mut bar = ShortcutBar { window, primary: n == 0, slots, rows: vec![Default::default(); ROWS], row: 0, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true, hold_delay: HOLD_DELAY, new_mouse: true, tooltip_key: None, tooltip_body: String::new(), released: None, item_templates: HashMap::new() };
+        let mut bar = ShortcutBar { window, primary: n == 0, slots, rows: vec![Default::default(); ROWS], row: 0, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true, hold_delay: HOLD_DELAY, new_mouse: true, tooltip_key: None, tooltip_body: String::new(), info_urls: vec![], released: None, item_templates: HashMap::new() };
         bar.place(gui, (x, y), screen);
         bar.paint(gui);
         Ok(bar)
@@ -382,6 +383,10 @@ impl ShortcutBar {
         }
     }
 
+    pub(super) fn take_info_urls(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.info_urls)
+    }
+
     /// Slot under a screen position.
     pub(super) fn slot_at(&self, gui: &Gui, x: f32, y: f32) -> Option<usize> {
         if !gui.window_visible(self.window) { return None; }
@@ -486,7 +491,7 @@ impl ShortcutBar {
     /// `FUN_100d8c12` 0x100d8eb8). `MultiListView_c::MouseDown` 0x10133b63 captures the mouse and records the cell, `FUN_100410a0` (the down
     /// handler) arms the hold timer for a left press on an item; `MouseUp` 0x10133c28 emits the click only when the release is in the same cell
     /// (and the capture was still held, i.e. the timer had not fired), `FUN_10040a17`: `GetQualifiers() & 3` (Shift only, not Ctrl;
-    /// masks in `FUN_100bc5cf`) -> the info signal (`FUN_100d765d`, no info view here: nothing happens), else the **use** signal.
+    /// masks in `FUN_100bc5cf`) -> the info signal (`FUN_100d765d`, itemid:// inspection except macros), else the **use** signal.
     /// Use therefore fires on the release, never on the press; a slot held for
     /// `MouseButtonHoldDelay` starts its drag without moving (see [`Self::update`]); the legacy mode instead arms the timer on a right press.
     /// In new mode the right-click signal is not connected by `ShortcutBarView_c`. The drag follows `FUN_100d7ec1` (begin: not when locked), `FUN_100d8047`
@@ -518,8 +523,14 @@ impl ShortcutBar {
                     gui.close_window(d.ghost);
                     self.drop(gui, d, x, y);
                 } else if let Some(p) = self.press.take() {
-                    if button == MouseButton::Left && self.slot_at(gui, x, y) == Some(p.slot) && !mods.shift {
-                        self.activate(p.slot, list);
+                    if button == MouseButton::Left && self.slot_at(gui, x, y) == Some(p.slot) {
+                        if mods.shift {
+                            if let Some(slot) = self.slots[p.slot].as_ref().filter(|s| s.kind != KIND_MACRO) {
+                                self.info_urls.push(format!("itemid://{}/{}", slot.kind, slot.instance));
+                            }
+                        } else {
+                            self.activate(p.slot, list);
+                        }
                     }
                 }
             }
@@ -797,7 +808,8 @@ mod tests {
                 assert!(bar.press.is_some());
                 assert!(bar.take_uses().is_empty(), "use waits for release");
                 bar.input(&mut gui, &InputEvent::MouseUp { x, y, button: MouseButton::Left }, &list, mods);
-                assert_eq!(bar.take_uses(), if shift { vec![] } else { vec![SlotUse::Nano(163449)] }, "Shift alone selects the unconnected info signal");
+                assert_eq!(bar.take_uses(), if shift { vec![] } else { vec![SlotUse::Nano(163449)] });
+                assert_eq!(bar.take_info_urls(), if shift { vec![format!("itemid://{}/163449", ao_net::n3::nano::NANO_KIND)] } else { vec![] });
                 assert!(bar.press.is_none());
             }
         }

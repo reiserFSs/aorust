@@ -7,10 +7,8 @@
 //! (default 0.3 s, left button in new mouse mode / right in legacy mode) drags the action (`FUN_100410a0` / `FUN_1004173a`); dropping on a hotbar slot puts it there (`FUN_100d8047`).
 //! Hosted by [`ListWindow`] / [`Rollup::open_page`](super::hud_rollup::Rollup::open_page).
 //!
-//! UNRESOLVED / not ported: the saved `item_position_map` (free rearranging by drag inside the window; the icons stay in list order), the info
-//! signal (`itemid://k/i`, Shift click: no InfoView here, the click does nothing; `FUN_10040a17` tests `GetQualifiers() & 3`,
-//! Shift only per `FUN_100bc5cf`; Ctrl still activates), the recharge seconds text over an icon (the grid canvas
-//! has no text item; the overlay shrinks like the hotbar's), the right-click popup.
+//! UNRESOLVED / not ported: the saved `item_position_map` (free rearranging by drag inside the window; the icons stay in list order).
+//! Shift-click opens the identity's InfoView. Native right-click emits the unconnected +0x2e8 signal: there is no Actions item popup.
 
 use super::hud::WindowKind;
 use super::hud_bar::{self, ShortcutBar, SlotUse};
@@ -59,11 +57,12 @@ pub(super) struct HudActionWin {
     uses: Vec<SlotUse>,
     pub(super) hold_delay: f32,
     pub(super) new_mouse: bool,
+    info_urls: Vec<String>,
 }
 
 impl HudActionWin {
     pub(super) fn new(dir: &Path, screen: (u32, u32)) -> Self {
-        Self { store: ao_rdb::RecordStore::open(dir).ok(), screen, win: None, cache: HashMap::new(), built: None, press: None, drag: None, mouse: (0.0, 0.0), uses: vec![], hold_delay: HOLD_DELAY, new_mouse: true }
+        Self { store: ao_rdb::RecordStore::open(dir).ok(), screen, win: None, cache: HashMap::new(), built: None, press: None, drag: None, mouse: (0.0, 0.0), uses: vec![], hold_delay: HOLD_DELAY, new_mouse: true, info_urls: vec![] }
     }
 
     pub(super) fn handles(kind: WindowKind) -> bool {
@@ -76,6 +75,10 @@ impl HudActionWin {
 
     pub(super) fn take_uses(&mut self) -> Vec<SlotUse> {
         std::mem::take(&mut self.uses)
+    }
+
+    pub(super) fn take_info_urls(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.info_urls)
     }
 
     pub(super) fn open(&mut self, gui: &mut Gui, rollup: &mut Rollup) {
@@ -214,9 +217,12 @@ impl HudActionWin {
                         }
                     }
                 } else if let Some(p) = self.press.take() {
-                    if button == MouseButton::Left && self.row_at(gui, x, y) == Some(p.key) && !mods.shift {
-                        // `N3Msg_PerformSpecialAction(identity)`: not listed = `Feedback_ActionIsNotAvailable`, else the action the entry shows
-                        self.uses.push(list.find(p.key as u32).map_or(SlotUse::Unavailable, |e| SlotUse::SpecialAction(e.shown)));
+                    if button == MouseButton::Left && self.row_at(gui, x, y) == Some(p.key) {
+                        if mods.shift {
+                            self.info_urls.push(format!("itemid://{}/{}", 0xdeb0, p.key));
+                        } else {
+                            self.uses.push(list.find(p.key as u32).map_or(SlotUse::Unavailable, |e| SlotUse::SpecialAction(e.shown)));
+                        }
                     }
                 }
             }
@@ -266,7 +272,8 @@ mod tests {
                 assert!(actions.press.is_some());
                 assert!(actions.take_uses().is_empty(), "use waits for release");
                 actions.input(&mut gui, &InputEvent::MouseUp { x, y, button: MouseButton::Left }, &list, mods, &mut []);
-                assert_eq!(actions.take_uses(), if shift { vec![] } else { vec![SlotUse::SpecialAction(entry.shown)] }, "Shift alone selects the unconnected info signal");
+                assert_eq!(actions.take_uses(), if shift { vec![] } else { vec![SlotUse::SpecialAction(entry.shown)] });
+                assert_eq!(actions.take_info_urls(), if shift { vec![format!("itemid://{}/{}", 0xdeb0, entry.template().unwrap())] } else { vec![] });
                 assert!(actions.press.is_none());
             }
         }
