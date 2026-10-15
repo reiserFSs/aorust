@@ -83,6 +83,7 @@ impl Interact {
         self.use_ui.configure_escape(values);
         self.ptrade.configure_escape(values);
         self.tower.configure_escape(values);
+        self.grid.configure(values);
     }
 
     pub(super) fn own_id(&self) -> Identity {

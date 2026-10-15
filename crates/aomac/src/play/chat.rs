@@ -13,7 +13,7 @@ pub(super) mod log;
 mod net;
 mod social;
 mod social_hub;
-mod social_win;
+pub(super) mod social_win;
 pub(super) mod win;
 mod voice;
 mod zone;

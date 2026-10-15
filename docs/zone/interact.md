@@ -205,24 +205,24 @@ object, built in `FUN_1002e537`); its show slot **`FUN_1002e313` [GUI]**:
 
 ### 7.3 The window (`TeleportTarget_c`, `FUN_100ffa7c` [GUI])
 * `Window(Rect(200, 180, 700, 600), "", "Vehicle", 0, 0x1000)` (`_DAT_101a959c/95a0/95a8`, `_DAT_101b3db8`; the name is a copy-paste leftover) -> client 501 x 421, one tab titled
-  **"Target List"** (`AppendTab`), `MoveToCenter` (ported: centred), `LoadWndConfig(DValue TeleportTargetConfig)` (empty on a fresh install; **not persisted** here), `Show(true)`.
+  **"Target List"** (`AppendTab`), `MoveToCenter`, then `LoadWndConfig(DValue TeleportTargetConfig)` (empty on a fresh install), `Show(true)`. The port uses the existing character-local `read_cfg`/`write_cfg` social-window archive pattern (`TeleportTargetConfig.xml`), bound from `DValues::char_dir` before dispatch.
   Help file "The teleport target window.html".
 * View from `Views/TeleportTarget.xml`: vertical `View` of `TargetView` (min 1x1, max 10000) and a row with `Go` ("Go!") left, spacer, `Quit` ("#Close") right, borders 5.
 * A `MultiListView_c(Rect(), 0x40 = row selection, 0, 0)` in list layout (`SetLayoutMode(1)`), scrollbars `ScrollView_c` modes 2/2 (auto), placed in `TargetView`. Columns
   `AddColumn(0, "Location", w, 0xe)` and `(1, "Playfield", w, 0xe)` (flags: resizable | label | sortable), `w` = `FindFloat("LocationColWidth" / "PlayfieldColWidth", 200.0)`.
-  The destructor `FUN_100ff82c` saves both widths + the frame into the DValue `TeleportTargetConfig` (not ported).
+  The destructor `FUN_100ff82c` saves exactly `LocationColWidth`, `PlayfieldColWidth` and `Window::SaveWndConfig` frame/pin fields into `TeleportTargetConfig`; no sort column/order is saved. Every port destruction path, including existing zone/disconnect teardown, writes these fields before releasing the GUI window. Regression `teleport_config_restores_native_columns_and_frame_per_character` binds the real character preference directory, checks both column widths, frame/pin, destructor persistence and character isolation.
 * Rows (loop of `FUN_100ffa7c`, one `TeleportTargetItem_c` per entry, `FUN_10100123`, `AddItem(IPoint(0, i), item, sorted = true)`): item key `Variant(i)` (list position),
   `+0x88` = entry playfield, `+0x80/84` = entry identity, `+0x48` = entry name, `+0x64` = `N3Msg_GetPFName(playfield)` or **"unknown pf"**. Cell 0 shows `+0x48` (the name), cell 1 `+0x64`
   (item view `FUN_10100203`, cell width `FUN_1010030b`). **Compare** (`FUN_10100340`, virtual +4): column 0 compares `+0x64`, column 1 `+0x48` (the opposite of what is shown, [INFERENCE]
   an original quirk), so the list starts sorted by playfield name (stable on ties, list order); ported with rank keys. Names: `pfnrmap.dat` (as `LFT`).
   Rows are not enabled/disabled, there are no cost / level columns and no double-click action.
 * Slots: the list's mouse signal (`+0x134`, `FUN_100ff922`) selects the row under the pointer (`MultiListViewItem_c::Select(true, true)`); `Go` (button signal `+0x148`) -> `FUN_100ffa12`;
-  `Quit` -> a `Window` method thunk [GUI 0x1012a778] (the close path, [INFERENCE]).
+  `Quit` -> `Window::Close` GUI `1012a778` -> virtual +0x20; TeleportTarget's table `101c20ac+0x20=101c20cc` points to `100ff91d`, which forwards to virtual +0x1c (`100ff939`). It is not a generic destructor-only dismissal.
 * `Go` (`FUN_100ffa12`): no selection = nothing. Else `N3Msg_GridDestinationSelected(row, playfield, identity)`, then the **close virtual** (vtable slot 7 = `FUN_100ff939`).
 * Close virtual (`FUN_100ff939`): if the DValue `teleport_target_window` is still true: `N3Msg_GridDestinationSelected(-1, 0, Identity(0, 0))` (cancel) and the DValue := false (the module then
-  deletes the window). So **`Go` sends the selection and then a cancel** (nothing in `FUN_100ffa12` clears the DValue first); `Quit` and the frame's close button [INFERENCE] send only the cancel.
+  deletes the window). So **`Go` sends the selection and then a cancel** (nothing in `FUN_100ffa12` clears the DValue first); `Quit` and the frame's close button send only the cancel through that same native thunk.
   Ported exactly (test `window_lists_the_destinations_and_go_sends_the_selected_one`: two frames).
-* Zone change / disconnect: `Interact::close_all` removes the window without a message [INFERENCE: the original's behaviour was not found].
+* Zone/disconnect: existing `Interact::close_all` destruction now saves the config without adding a synthetic user-cancel message. **Native zone observer remains unproven**, not a claimed faithful cancellation policy: fresh dumps of TeleportTarget ctor `100ffa7c`, base Window ctor `101563ff`, activator ctor `1002e537` and all activator instructions `1002c000..1002f1e2` show the Teleport weak window at activator+`0xf90` read only by destructor `1002c9e6` and DValue show/hide `1002e313`. The base constructor's listeners are window layout/tab signals, not a proven zone listener. `CancelDialog` consumer `1002d043` **must not be aliased to teleport close**: type0 deletes activator+`0xfc0` (the mode2 Browser made by `1002d7b8`), while types3/4/5/7 target their separate signup/laser/airstrike/mech windows and reset those DValues. None targets teleport+`0xf90`; in particular it does not prove a cancel packet on zoning.
 * `FUN_10031462` [GUI] (not ported): builds a string from a *per-dynel* `N3Msg_GetGridDestinationList(Identity)` (names joined by `DAT_101af164`, wrapped in the text LDB 0x1fa "MastersOf");
   [UNRESOLVED] where it is shown.
 

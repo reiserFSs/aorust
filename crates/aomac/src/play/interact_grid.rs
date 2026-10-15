@@ -7,12 +7,14 @@
 //! is already open (the list shown stays the old one, the engine's token is the new one).
 
 use super::zone::Zone;
+use super::chat::social_win::{read_cfg, restore_frame, write_cfg};
 use ao_gui::widgets::{MultiCell, MultiKey};
 use ao_gui::{Event, Gui, WindowId, WindowSize};
 use ao_net::msg::Identity;
 use ao_net::n3::grid::{self, Destination};
 use ao_net::n3::outgoing::DYNEL_CHAR;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// `Window(Rect(200, 180, 700, 600), "", "Vehicle", 0, 0x1000)` [GUI 0x100ffa7c] (`_DAT_101a959c/95a0/95a8`, `_DAT_101b3db8`): a 501 x 421 client (inclusive
 /// corners, like the NPC chat window's `Rect(0, 0, 399, 299)`); the window is centred afterwards (`Window::MoveToCenter`).
@@ -41,6 +43,7 @@ pub struct GridUi {
     /// DValue `teleport_target_window`.
     flag: bool,
     pf_names: Option<HashMap<u32, String>>,
+    prefs: Option<PathBuf>,
 }
 
 /// Rank of every distinct string in byte order (`std::string::compare`), so the rows compare like the item's virtual `+4` does.
@@ -52,6 +55,10 @@ fn ranks<'a>(it: impl Iterator<Item = &'a str>) -> HashMap<&'a str, i64> {
 }
 
 impl GridUi {
+    pub(super) fn configure(&mut self, values: &super::dvalue::DValues) {
+        self.prefs = values.char_dir().map(std::path::Path::to_path_buf);
+    }
+
     /// `GridDestinationSelectIIR_t::Activate` (`FUN_10128fd9`) followed by the module's show slot (`FUN_1002e313`). `target` = the header's dynel,
     /// which must be a known character (`GetDynel` + `RTDynamicCast<SimpleChar_t>`).
     pub fn activate(&mut self, gui: &mut Gui, screen: (u32, u32), zone: &Zone, target: Identity, destinations: Vec<Destination>, token: Vec<u8>) {
@@ -86,8 +93,11 @@ impl GridUi {
         let pos = ((screen.0 as i32 - w as i32) / 2, (screen.1 as i32 - h as i32) / 2);
         let win = gui.open_tabbed_window("TeleportTarget", TAB_TITLE, pos, WindowSize::Fixed(w, h))?;
         gui.add_view_xml(win, "TargetView", "targets", &format!("<root><MultiListView name=\"targets\" feature_flags=\"{LIST_FLAGS}\" max_size=\"Point(16000,16000)\"/></root>"))?;
-        gui.multi_add_column(win, "targets", 0, "Location", COL_WIDTH, COL_FLAGS);
-        gui.multi_add_column(win, "targets", 1, "Playfield", COL_WIDTH, COL_FLAGS);
+        let cfg = read_cfg(self.prefs.as_deref(), "TeleportTargetConfig.xml");
+        for (id, label, key) in [(0, "Location", "LocationColWidth"), (1, "Playfield", "PlayfieldColWidth")] {
+            let width = cfg.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.parse().ok()).unwrap_or(COL_WIDTH);
+            gui.multi_add_column(win, "targets", id, label, width, COL_FLAGS);
+        }
         self.entries = list;
         let names = self.pf_names.get_or_insert_with(|| ao_formats::screens::pfnr_names(&ao_gui::client_dir()).unwrap_or_default());
         let pf: Vec<String> = self.entries.iter().map(|d| names.get(&(d.playfield as u32)).cloned().unwrap_or_else(|| UNKNOWN_PF.into())).collect();
@@ -101,6 +111,7 @@ impl GridUi {
             ];
             gui.multi_add_row(win, "targets", i as i64, cells, true);
         }
+        restore_frame(gui, win, &cfg, screen);
         Ok(win)
     }
 
@@ -115,11 +126,11 @@ impl GridUi {
             }
             Event::Clicked { window, view, .. } if *window == win => match view.as_str() {
                 "Go" => Some(self.go(gui, own)),
-                // `Quit` is wired to a `Window` method [GUI 0x1012a778] = the close path; [INFERENCE]: it reaches the virtual `FUN_100ff939` like `Go` does.
+                // Window::Close1012a778 -> vtable+0x20 (100ff91d) -> +0x1c (100ff939).
                 "Quit" => Some(self.close(gui, own)),
                 _ => Some(vec![]),
             },
-            // the frame's close button [INFERENCE: same virtual]
+            // The frame close uses the same Window::Close thunk.
             Event::CloseRequested { window } if *window == win => Some(self.close(gui, own)),
             _ => None,
         }
@@ -149,11 +160,17 @@ impl GridUi {
 
     fn destroy(&mut self, gui: &mut Gui) {
         if let Some(win) = self.win.take() {
+            let columns = gui.multi_columns(win, "targets");
+            let items: Vec<_> = [(0, "LocationColWidth"), (1, "PlayfieldColWidth")].into_iter()
+                .map(|(id, key)| ("Float", key, columns.iter().find(|c| c.0 == id).map_or(COL_WIDTH, |c| c.1).to_string())).collect();
+            write_cfg(gui, win, self.prefs.as_deref(), "TeleportTargetConfig.xml", &items);
             gui.close_window(win);
         }
     }
 
-    /// The zone changes or the connection ends: the window goes away without a word to the server ([INFERENCE]: the original's behaviour on a zone change was not found).
+    /// Existing zone/disconnect teardown runs the native destructor save, without synthesizing user-close cancellation.
+    /// Native zone notification policy remains unproven: TeleportTarget ctor100ffa7c/base101563ff register no zone observer;
+    /// activator+f90 is used only by show/hide1002e313 and destructor1002c9e6. CancelDialog1002d043 targets other windows.
     pub fn close_all(&mut self, gui: &mut Gui) {
         self.destroy(gui);
         self.flag = false;
@@ -361,6 +378,44 @@ mod tests {
         // a click on the "Playfield" header sorts by the other column's compare (the location)
         assert!(gui.multi_sort(win, "targets", 1, false));
         assert_eq!(gui.multi_row_ids(win, "targets"), [0, 1, 2, 3, 4]);
+        assert!(gui.multi_sort(win, "targets", 1, true));
+        assert_eq!(gui.multi_row_ids(win, "targets"), [4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn teleport_config_restores_native_columns_and_frame_per_character() {
+        let Some(mut gui) = rig() else { return };
+        let root = super::super::prefs::test_dir();
+        let character = root.join("Account/Char1");
+        let mut values = super::super::dvalue::DValues::new(&ao_gui::client_dir());
+        values.open_user(&root, "Account", 1);
+        let mut g = GridUi::default();
+        g.configure(&values);
+        open(&mut gui, &mut g, &zone(0x800));
+        let win = g.win.unwrap();
+        gui.multi_set_column_width(win, "targets", 0, 245.0);
+        gui.multi_set_column_width(win, "targets", 1, 175.0);
+        gui.set_window_outer_frame(win, (80, 90, 600, 450));
+        gui.set_window_pinned(win, true);
+        assert_eq!(g.close(&mut gui, ME), [grid::cancel(ME, &[5, 6, 7])]);
+        let cfg = read_cfg(Some(&character), "TeleportTargetConfig.xml");
+        assert!(cfg.contains(&("LocationColWidth".into(), "245".into())));
+        assert!(cfg.contains(&("PlayfieldColWidth".into(), "175".into())));
+        open(&mut gui, &mut g, &zone(0x800));
+        let win = g.win.unwrap();
+        assert_eq!(gui.multi_columns(win, "targets").iter().map(|c| c.1).collect::<Vec<_>>(), [245.0, 175.0]);
+        assert_eq!(gui.window_outer_frame(win), Some((80, 90, 600, 450)));
+        assert!(gui.window_pinned(win));
+        gui.multi_set_column_width(win, "targets", 0, 260.0);
+        g.close_all(&mut gui);
+        assert!(read_cfg(Some(&character), "TeleportTargetConfig.xml").contains(&("LocationColWidth".into(), "260".into())), "zone teardown runs destructor persistence too");
+        assert!(!g.flag && g.win.is_none());
+        values.open_user(&root, "Account", 2);
+        g.configure(&values);
+        open(&mut gui, &mut g, &zone(0x800));
+        assert_eq!(gui.multi_columns(g.win.unwrap(), "targets").iter().map(|c| c.1).collect::<Vec<_>>(), [200.0, 200.0]);
+        g.close_all(&mut gui);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// What the capture says about the module's gate: the own character's `Features` in the new-character capture.

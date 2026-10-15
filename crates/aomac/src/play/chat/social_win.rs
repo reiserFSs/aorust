@@ -40,7 +40,7 @@ fn cfg_path(prefs: Option<&Path>, file: &str) -> Option<PathBuf> {
     prefs.map(|d| d.join(file))
 }
 
-fn read_cfg(prefs: Option<&Path>, file: &str) -> Vec<(String, String)> {
+pub(in crate::play) fn read_cfg(prefs: Option<&Path>, file: &str) -> Vec<(String, String)> {
     let Some(src) = cfg_path(prefs, file).and_then(|p| std::fs::read_to_string(p).ok()) else { return vec![] };
     let Ok(root) = ao_gui::xml::parse(&src) else { return vec![] };
     root.children.iter().filter_map(|c| Some((c.attr("name")?.to_owned(), c.attr("value")?.trim_matches('\'').trim_matches('"').to_owned()))).collect()
@@ -59,7 +59,7 @@ fn cfg_xml(items: &[(&str, &str, String)]) -> String {
     o + "</Archive>\n"
 }
 
-fn write_cfg(gui: &Gui, win: WindowId, prefs: Option<&Path>, file: &str, items: &[(&str, &str, String)]) {
+pub(in crate::play) fn write_cfg(gui: &Gui, win: WindowId, prefs: Option<&Path>, file: &str, items: &[(&str, &str, String)]) {
     if let Some(p) = cfg_path(prefs, file) {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -76,7 +76,7 @@ fn write_cfg(gui: &Gui, win: WindowId, prefs: Option<&Path>, file: &str, items: 
 }
 
 /// Window::LoadWndConfig (0x10154d6e), followed by MoveInsideScreen(false,true,true).
-fn restore_frame(gui: &mut Gui, win: WindowId, cfg: &[(String, String)], screen: (u32, u32)) {
+pub(in crate::play) fn restore_frame(gui: &mut Gui, win: WindowId, cfg: &[(String, String)], screen: (u32, u32)) {
     gui.set_window_frame(win, true, true);
     let items: Vec<_> = cfg.iter().filter_map(|(key, value)| {
         let kind = match key.as_str() {
