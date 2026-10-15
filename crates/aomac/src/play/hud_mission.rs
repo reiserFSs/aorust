@@ -11,8 +11,8 @@
 //!
 //! Initial size: `FUN_100d2c7e` calls `FUN_100cf72a`, returning `(167,112)`; the unsaved dock uses its normal centred placement.
 //! Remaining uses hours:minutes (`FUN_1003cdf6`, case 0xf), from integer seconds, not NCU centiseconds.
-//! UNRESOLVED: exact row tie order; kept-quest feedback is `GetText(0x66, "Quest_CannotDelete")`;
-//! single-quest removal is synchronized from Zone.
+//! Default list order is the retained grid position (`FUN_1003cc19`, column0).
+//! Kept-quest feedback uses `GetText(0x66, "Quest_CannotDelete")`; single removals synchronize from Zone.
 
 use super::hud::WindowKind;
 use super::hud_bar::icon_image;
@@ -67,6 +67,21 @@ pub(super) struct HudMission {
     /// The quest the open popup belongs to.
     popup: Option<i32>,
     built: Option<(u32, i64, Mode, usize)>,
+    grid_slots: Vec<Option<i32>>,
+}
+
+/// GUI100d2ab7 adds missing quests (100d2275/GetFirstFreePos), then deletes stale rows.
+fn refresh_grid_slots(slots: &mut Vec<Option<i32>>, quests: &[Quest]) {
+    for quest in quests {
+        let key = Some(quest.id.instance);
+        if !slots.contains(&key) {
+            if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) { *slot = key; }
+            else { slots.push(key); }
+        }
+    }
+    for slot in slots {
+        if slot.is_some_and(|key| !quests.iter().any(|quest| quest.id.instance == key)) { *slot = None; }
+    }
 }
 
 /// The frames [`HudMission::on_frame`] reads: `QuestFullUpdateIIR_t` and `GameTimeIIR_t`, by message key.
@@ -102,6 +117,7 @@ impl HudMission {
             waypoint_lines: vec![],
             popup: None,
             built: None,
+            grid_slots: vec![],
         })
     }
 
@@ -239,6 +255,7 @@ impl HudMission {
         if self.win.is_some() {
             return;
         }
+        self.grid_slots.clear();
         let all = self.columns();
         let view = ListView::new(Mode::List, all.clone(), 1, 0, (0, false));
         let texts = MenuTexts { list_mode: self.text("ListMode"), auto_arrange: self.text("AutoArrange") };
@@ -291,6 +308,7 @@ impl HudMission {
             return;
         }
         let columns = win.view.columns.clone();
+        refresh_grid_slots(&mut self.grid_slots, &self.quests);
         let quests = std::mem::take(&mut self.quests);
         let mut rows = vec![];
         for q in &quests {
@@ -303,6 +321,8 @@ impl HudMission {
         self.quests = quests;
         let win = self.win.as_mut().expect("open");
         let (column, descending) = win.view.sort;
+        rows.sort_by_key(|(_, row)| self.grid_slots.iter().position(|slot| *slot == Some(row.key)));
+        if win.view.mode == Mode::List && column == 0 && descending { rows.reverse(); }
         if win.view.mode == Mode::List && column != 0 {
             rows.sort_by(|(left, a), (right, b)| {
                 let order = if column == COL_REMAINING { left.cmp(right) } else { a.tip_title.to_lowercase().cmp(&b.tip_title.to_lowercase()) };
@@ -478,6 +498,17 @@ mod tests {
     fn quest(instance: i32, name: &str, flags: i32, deadline: i32) -> Quest {
         let action = quest::QuestAction { id: 1, identities: [Identity::default(); 8], floats: [0.0; 8], ints: [deadline, 0], pos: quest::WorldPos { playfield: Identity { kind: 0xC79C, instance: 4605 }, x: 1500, z: 2500, local: [123.5, 45.0, 678.25] } };
         Quest { id: Identity { kind: quest::QUEST_KIND, instance }, name: name.into(), value_a4: flags, actions: vec![action], ..Default::default() }
+    }
+
+    #[test]
+    fn mission_refresh_retains_grid_slots_before_deleting_stale_rows() {
+        let mut slots = vec![];
+        refresh_grid_slots(&mut slots, &[quest(1, "First", 0, 0), quest(2, "Second", 0, 0)]);
+        assert_eq!(slots, [Some(1), Some(2)]);
+        refresh_grid_slots(&mut slots, &[quest(2, "Second updated", 0, 0), quest(3, "Third", 0, 0)]);
+        assert_eq!(slots, [None, Some(2), Some(3)], "new items precede stale-item deletion");
+        refresh_grid_slots(&mut slots, &[quest(3, "Third", 0, 0), quest(4, "Fourth", 0, 0), quest(2, "Second", 0, 0)]);
+        assert_eq!(slots, [Some(4), Some(2), Some(3)], "existing positions survive server order changes; new items reuse prior holes");
     }
 
     #[test]
