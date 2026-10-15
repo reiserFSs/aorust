@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 ao-rdb.workspace = true
 ao-formats.workspace = true
+ao-scene.workspace = true
 ao-net.workspace = true
 cpal = "0.15"
 symphonia = { version = "0.5", default-features = false, features = ["wav", "ogg", "vorbis", "mp3", "pcm", "adpcm"] }

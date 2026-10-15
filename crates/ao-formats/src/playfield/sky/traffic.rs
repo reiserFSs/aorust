@@ -56,6 +56,52 @@ pub fn counter_of(objs: &[Obj], o: &Obj, depth: u32) -> Option<Counter> {
     Some(c)
 }
 
+fn sound_profile(o: &Obj, prefix: &str) -> Option<ao_scene::mover::SoundProfile> {
+    let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let sound = compact(o.field("EngineSound")?);
+    let engine = [
+        "SM_Sandy_ShipEngine_Freighter", "SM_Sandy_ShipEngine_Mothership",
+        "SM_Sandy_ShipEngine_Cruiser", "SM_Sandy_ShipEngine_SmallTransporter",
+        "SM_Sandy_Env_SandWind",
+    ].into_iter().find(|name| sound.starts_with(&format!("s({name},")))?;
+    let vip = engine == "SM_Sandy_Env_SandWind";
+    let pitch = if vip { 200.0 } else { 100.0 };
+    let volume = if vip { "0.15f" } else { "This.EngineSpeed" };
+    let radius = if vip { 120.0 } else { 0.0 };
+    let velocity_suffix = if vip { "*0.1f" } else { "" };
+    let expected = format!("s({engine},This.Position,1.0f,{volume}*This.Visibility,e_SoundMaterialDefault,0.0f,{pitch:.1}f,1.0f,{radius:.1}f,This.{prefix}PreviousPos-This.Position/GAME.GameDeltaTime{velocity_suffix})");
+    if sound != expected { return None; }
+    let mut divide_delta = false;
+    let mut speed_scale = 1.0;
+    if !vip {
+        let speed = compact(o.field("EngineSpeed")?);
+        let rest = speed.strip_prefix("This.Position-This.PrevActualPos[LENGTH]1.0f")?.strip_suffix("<|1.0f")?;
+        match rest {
+            "" => {}
+            "/GAME.GameDeltaTime" => { divide_delta = true; }
+            "/GAME.GameDeltaTime*0.00000001f" => { divide_delta = true; speed_scale = 0.00000001; }
+            "/GAME.GameDeltaTime*0.00000001f*0.01f" => { divide_delta = true; speed_scale = 0.00000001 * 0.01; }
+            _ => return None,
+        }
+    }
+    let transport_triggers = o.field("Rotation")?.split("<|").map(str::trim).collect::<Vec<_>>().ends_with(&["This.EngineSound", "This.ThrustSound", "This.LandingSound"]);
+    if transport_triggers {
+        for (field, expected) in [
+            ("Trigger1", "This.EngineSpeed-0.5f|>0.0f*1000.0f<|1.0f+This.Trigger2-This.Trigger2"),
+            ("Trigger2", "This.Trigger1"),
+            ("StartTrigger", "This.Trigger1*0.0f+1.0f-This.Trigger2*This.Trigger1"),
+            ("StopTrigger", "1.0f-This.Trigger1*This.Trigger2"),
+            ("ThrustSound", "s(SM_Sandy_ShipTakeoff_Small,This.Position,0.0f,This.StartTrigger*This.Visibility,e_SoundMaterialDefault,0.0f,100.0f,1.0f,0.0f,v(0,0,0))"),
+            ("LandingSound", "s(SM_Sandy_ShipLand_Clank,This.Position,0.0f,This.StopTrigger*This.Visibility,e_SoundMaterialDefault,0.0f,100.0f,1.0f,0.0f,v(0,0,0))"),
+        ] {
+            if compact(o.field(field)?) != expected { return None; }
+        }
+    } else if !o.field("Rotation")?.trim().ends_with("<| This.EngineSound") {
+        return None;
+    }
+    Some(ao_scene::mover::SoundProfile { engine, speed_scale, divide_delta, constant_volume: vip.then_some(0.15), pitch, radius, velocity_scale: if vip { 0.1 } else { 1.0 }, transport_triggers })
+}
+
 /// The mover of scenery object `o`, `None` unless it is a template traffic ship (instance index left 0).
 pub fn mover_of(objs: &[Obj], o: &Obj) -> Option<Mover> {
     let ahead = o.fields.iter().find(|(_, e)| e.contains("This.UniversePosition[This.Counter]"))?.0;
@@ -111,6 +157,7 @@ pub fn mover_of(objs: &[Obj], o: &Obj) -> Option<Mover> {
         cut_y,
         rotation,
         scale: object_scale(o, &ctx),
+        sound: sound_profile(o, p),
     })
 }
 
@@ -217,6 +264,25 @@ Object Integrator
     }
 
     #[test]
+    fn installed_traffic_templates_retain_authored_sound_profiles() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client/cd_image/twk");
+        if !dir.is_dir() { return; }
+        for template in ["Freighter", "ICC_Shuttle", "ICC_Tanker", "OmniCruiser", "OmniMothership", "Transporter", "VIP"] {
+            let text = std::fs::read_to_string(dir.join(format!("Template_Spaceship_{template}.txt"))).unwrap();
+            let text = text.lines().map(|line| line.split('#').next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+            let objects = script::parse_objects(&text);
+            let object = objects.iter().find(|object| object.field("EngineSound").is_some()).unwrap();
+            let prefix = if matches!(template, "Transporter" | "VIP") { "GS_" } else { "HS_" };
+            let profile = sound_profile(object, prefix).unwrap_or_else(|| panic!("missing authored sound for {template}"));
+            assert_eq!(profile.transport_triggers, template == "Transporter");
+            if template == "VIP" {
+                assert_eq!((profile.radius, profile.pitch, profile.constant_volume), (120.0, 200.0, Some(0.15)));
+            }
+        }
+    }
+
+    #[test]
     fn real_newland_has_a_transporter_loop_in_view_of_the_city() {
         let Some(dir) = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/ProjectRubiKa/client")) else { return };
         let (Some(t), Ok(store)) = (super::super::Tweaks::load(&dir, 566, true), RecordStore::open(&dir)) else { return };
@@ -227,6 +293,7 @@ Object Integrator
         assert!(scene.instances[m.instance].mesh < scene.meshes.len());
         assert!(scene.spaceships.contains(&m.instance), "native GameShowSpaceship gates authored traffic");
         assert_eq!(scene.spaceships, (0..scene.instances.len()).collect::<Vec<_>>(), "all authored distant scenery shares the native visibility gate");
+        assert!(m.sound.is_some(), "the live mover retains its authored audio profile");
         let s = MoverState::settled(m, 2648.69, 1.0);
         assert!((0..3).all(|k| (s.pos[k] - m.target(2648.69)[k]).abs() < 50.0), "{:?} {:?}", s.pos, m.target(2648.69));
     }

@@ -77,6 +77,8 @@ pub struct SoundDef {
     pub priority: u8,
     /// Byte6 bit7: pass the caller's duration to child definitions (SI10003520).
     pub inherit_duration: bool,
+    /// Byte7 bit5: speed-driven ShipEngine pitch (SI100025fc).
+    pub doppler: bool,
     /// 46 material variant ids (0 = none).
     pub variants: Vec<u32>,
 }
@@ -133,6 +135,7 @@ impl SoundDb {
                     random_child: flags & 0x40 != 0,
                     priority: (r[6] >> 5) & 3,
                     inherit_duration: r[6] & 0x80 != 0,
+                    doppler: r[7] & 0x20 != 0,
                     variants: (0..46).map(|i| u(0x14 + 4 * i)).collect(),
                 };
                 // The client updates an existing object in place when an id repeats (later wins).

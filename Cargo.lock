@@ -172,6 +172,7 @@ dependencies = [
  "ao-formats",
  "ao-net",
  "ao-rdb",
+ "ao-scene",
  "cpal",
  "symphonia",
 ]

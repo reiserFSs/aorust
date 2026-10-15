@@ -155,12 +155,17 @@ fn playfield_audio(dir: &std::path::Path, pf: ao_audio::PlayfieldAudio, mut weat
     audio.set_playfield(Some(pf));
     let (mut day, mut since_log) = (start, 0.0f32);
     let log = std::env::var_os("AOMAC_AUDIO_LOG").is_some();
-    Some(Box::new(move |cam, dt| {
+    Some(Box::new(move |cam, dt, renderer| {
         day += dt * scale;
         // FUN_100be767 / FUN_100b6d67: the weather runs per frame, its music slot state and the sky manager's sound levels
         // (FUN_100bfa11, FUN_100be767) go to the mixer
         weather.update(ao_formats::weather::OFFLINE_DAY + (day / 6480.0).floor() as u32, day.rem_euclid(6480.0) as f64, dt);
-        audio.update_weather(weather.state());
+        audio.update_weather(&weather.state());
+        for event in renderer.take_mover_sounds() {
+            if let Err(error) = audio.play_mover_sound(event, cam.to_array()) {
+                eprintln!("traffic sound: {error:#}");
+            }
+        }
         audio.update(dt, cam.into(), day);
         since_log += dt;
         if log && since_log >= 2.0 {

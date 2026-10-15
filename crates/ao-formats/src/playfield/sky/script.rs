@@ -54,7 +54,7 @@ enum Block {
     StateBlob,
 }
 
-const TYPES: [&str; 8] = ["Unsigned", "Float", "Vector", "Quaternion", "String", "Matrix", "Object", "Color"];
+const TYPES: [&str; 9] = ["Unsigned", "Float", "Vector", "Quaternion", "String", "Matrix", "Object", "Color", "Sound"];
 
 /// Named objects of the flattened script; a later definition replaces the whole object (FXS1000132f).
 pub fn parse_objects(text: &str) -> Vec<Obj> {

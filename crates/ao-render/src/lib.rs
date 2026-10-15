@@ -361,6 +361,9 @@ struct Inst {
 struct MoverRun {
     mover: ao_scene::Mover,
     state: ao_scene::MoverState,
+    sound_time: f32,
+    sound_trigger: f32,
+    sounds: [Option<ao_scene::mover::SoundEvent>; 3],
     slot: usize,
     /// Centre of the mesh's bounding sphere in object space.
     local_center: Vec3,
@@ -1261,7 +1264,7 @@ impl Renderer {
             .filter_map(|m| {
                 let slot = *slots.get(m.instance).filter(|&&s| s != usize::MAX)?;
                 let local_center = sphere[scene.instances[m.instance].mesh].0;
-                Some(MoverRun { mover: m.clone(), state: ao_scene::MoverState::settled(m, scene.day_time, rate), slot, local_center })
+                Some(MoverRun { mover: m.clone(), state: ao_scene::MoverState::settled(m, scene.day_time, rate), sound_time: self.time, sound_trigger: 0.0, sounds: [None; 3], slot, local_center })
             })
             .collect();
         self.far_away = scene
@@ -1627,12 +1630,21 @@ impl Renderer {
     fn step_movers(&mut self) {
         let day = self.day_time + self.time * self.day_time_rate;
         for r in &mut self.movers {
+            let previous = r.state;
             r.state.step(&r.mover, r.mover.target(day));
+            let dt = self.time - r.sound_time;
+            r.sound_time = self.time;
+            r.sounds = r.mover.sound.map(|sound| sound.frame(&previous, &r.state, dt, self.spaceships_shown, &mut r.sound_trigger)).unwrap_or([None; 3]);
             if let Some(g) = self.gpu.insts.get_mut(r.slot) {
                 g.m = r.mover.transform(&r.state);
                 g.center = Mat4::from_cols_array_2d(&g.m).transform_point3(r.local_center);
             }
         }
+    }
+
+    /// Drains the actual FXS-frame ship sound requests, before far-away visual placement.
+    pub fn take_mover_sounds(&mut self) -> impl Iterator<Item = ao_scene::mover::SoundEvent> + '_ {
+        self.movers.iter_mut().flat_map(|mover| mover.sounds.iter_mut().filter_map(Option::take))
     }
 
     /// `e_ScaleVisibleFarAway` objects: pulled in towards the camera like the client's `GenericMeshObject::Process`.
@@ -1656,6 +1668,9 @@ impl Renderer {
         let day = self.day_time + time * self.day_time_rate;
         for r in &mut self.movers {
             r.state = ao_scene::MoverState::settled(&r.mover, day, self.day_time_rate);
+            r.sound_time = time;
+            r.sound_trigger = 0.0;
+            r.sounds = [None; 3];
         }
         for a in &mut self.sky.colors {
             a.sim = ao_scene::aurora::GloomySky::new(a.sim.params.clone());

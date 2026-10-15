@@ -188,6 +188,7 @@ pub(crate) struct Runtime {
     keepalive: HashMap<u32, (u64, f32, f32, f32)>,
     effect_delays: VecDeque<(f32, EffectSound)>,
     effect_children: HashMap<u32, (usize, bool)>,
+    pub(crate) ship_doppler: HashMap<u64, crate::mixer::Doppler>,
     pub(crate) life_dangers: Vec<([f32; 3], f32)>,
 }
 
@@ -204,7 +205,7 @@ pub(crate) struct EffectSound {
 impl Runtime {
     pub fn new(sh: &Arc<Shared>, lib: Library, seed: u64) -> Runtime {
         let music = MusicPlayer::new(sh.clone(), lib.project.clone(), seed);
-        Runtime { lib, music, combat: CombatMusic::new(3), pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), weather: [0.0; 7], land_control: false, keepalive: HashMap::new(), effect_delays: VecDeque::new(), effect_children: HashMap::new(), life_dangers: Vec::new() }
+        Runtime { lib, music, combat: CombatMusic::new(3), pf: None, eval: 1.0, ambient: HashMap::new(), emitters: Vec::new(), want: None, dying: Vec::new(), rng: Rng(seed.rotate_left(17) | 1), weather: [0.0; 7], land_control: false, keepalive: HashMap::new(), effect_delays: VecDeque::new(), effect_children: HashMap::new(), ship_doppler: HashMap::new(), life_dangers: Vec::new() }
     }
 
     /// Emitters currently inside the camera's radius (or in their 2 s hold).
@@ -371,6 +372,7 @@ impl Runtime {
         self.keepalive.clear();
         self.effect_delays.clear();
         self.effect_children.clear();
+        self.ship_doppler.clear();
         self.emitters = self.pf.as_ref().map(|p| p.emitters.iter().map(|_| EmitterState::default()).collect()).unwrap_or_default();
         self.eval = 1.0;
     }
@@ -388,6 +390,7 @@ impl Runtime {
         self.keepalive.clear();
         self.effect_delays.clear();
         self.effect_children.clear();
+        self.ship_doppler.clear();
         self.weather = [0.0; 7];
         self.land_control = false;
         sh.mixer().stop_all();
@@ -756,7 +759,7 @@ mod tests {
         for &(i, id) in v {
             variants[i] = id;
         }
-        SoundDef { id: 1, flags: 1, file: None, vol_min: 0.5, vol_max: 0.5, min_dist: 0.0, max_dist: 15.0, scare_radius: 0.0, fade_in: 0.0, fade_out: 0.0, duration_min: 0.0, duration_max: 0.0, prob: 100, children: vec![], interval_min: 0.0, interval_max: 0.0, play_all: false, sequential: false, random_child: false, priority: 1, inherit_duration: false, variants }
+        SoundDef { id: 1, flags: 1, file: None, vol_min: 0.5, vol_max: 0.5, min_dist: 0.0, max_dist: 15.0, scare_radius: 0.0, fade_in: 0.0, fade_out: 0.0, duration_min: 0.0, duration_max: 0.0, prob: 100, children: vec![], interval_min: 0.0, interval_max: 0.0, play_all: false, sequential: false, random_child: false, priority: 1, inherit_duration: false, doppler: false, variants }
     }
 
     /// `MapGameMaterialToSoundMaterial` [SI 0x10007490] (jump table @0x100074e3) and the variant choice of `PlaySample` [SI 0x10002d98].

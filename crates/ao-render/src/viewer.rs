@@ -227,6 +227,8 @@ pub trait Frontend {
     fn input(&mut self, ev: ao_gui::InputEvent, host: &mut Host);
     /// Raw key/mouse-look input while `host.fly` is off (default: ignored).
     fn game_input(&mut self, _ev: GameInput, _host: &mut Host) {}
+    /// Authored traffic-ship sound side effect of the last rendered FXS frame.
+    fn mover_sound(&mut self, _event: ao_scene::mover::SoundEvent, _host: &Host) {}
     /// Window-level scale known before any frame runs (aomac Enhanced option, audit item 2: Interface Scale); read
     /// once by [`State::new`] so the very first window/frame (the login screen) already honours it. `0` = Auto.
     fn interface_scale(&self) -> u8 { 0 }
@@ -455,8 +457,8 @@ struct State {
     pending_screenshot: Option<std::path::PathBuf>,
 }
 
-/// Called once per frame with the camera position and the frame time (audio listener).
-pub type FrameHook = Box<dyn FnMut(Vec3, f32)>;
+/// Called once per frame with listener position, delta, and renderer (including drainable ship sounds).
+pub type FrameHook = Box<dyn FnMut(Vec3, f32, &mut Renderer)>;
 
 struct App {
     scene: Scene,
@@ -477,7 +479,7 @@ pub fn run_viewer_live(scene: Scene, live: LiveSky) -> Result<()> {
     run(scene, None, Some(live), None)
 }
 
-/// [`run_viewer`]/[`run_viewer_live`] calling `hook(camera position, dt)` every frame.
+/// [`run_viewer`]/[`run_viewer_live`] calling `hook(camera position, dt, renderer)` every frame.
 pub fn run_viewer_hooked(scene: Scene, live: Option<LiveSky>, hook: FrameHook) -> Result<()> {
     run(scene, None, live, Some(hook))
 }
@@ -676,6 +678,7 @@ impl State {
         let size = (self.config.width / g.scale, self.config.height / g.scale);
         self.renderer.visible_actor_ids(&mut g.host.previous_visible_actors);
         g.host.window_scale = g.scale;
+        for event in self.renderer.take_mover_sounds() { g.frontend.mover_sound(event, &g.host); }
         let list = g.frontend.frame(dt, size, &mut g.host);
         if let Some(wait) = g.host.wait_for_vert_sync.take() {
             let mode = present_mode(wait && std::env::var_os("AOMAC_NOVSYNC").is_none());
@@ -813,7 +816,7 @@ impl State {
         }
         self.sync_cursor();
         if let Some(h) = self.hook.as_mut() {
-            h(self.cam.pos, dt);
+            h(self.cam.pos, dt, &mut self.renderer);
         }
 
         if let Some(t) = work_start { self.perf_times[2] += t.elapsed().as_secs_f64(); }
@@ -1216,6 +1219,7 @@ impl Offscreen {
         self.r.visible_actor_ids(&mut self.host.previous_visible_actors);
         let update_end = start.map(|_| Instant::now());
         let cpu_update = start.map(|_| perf_thread_cpu());
+        for event in self.r.take_mover_sounds() { fe.mover_sound(event, &self.host); }
         let list = fe.frame(dt, self.size, &mut self.host);
         let frontend_end = start.map(|_| Instant::now());
         let cpu_frontend = start.map(|_| perf_thread_cpu());

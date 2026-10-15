@@ -479,6 +479,26 @@ impl Audio {
         } else { vec![voice] }
     }
 
+    /// FXS10005560's authored traffic sound command, including the ShipEngine Doppler flag.
+    pub fn play_mover_sound(&self, event: ao_scene::mover::SoundEvent, listener: [f32; 3]) -> Result<Vec<u64>> {
+        let mut g = self.rt();
+        let rt = g.as_mut().context("traffic audio runtime unavailable")?;
+        let db = rt.lib.sounds.clone();
+        let def = db.by_name(event.name).with_context(|| format!("missing traffic sound {}", event.name))?;
+        let voices = rt.effect_sound(&self.sh, crate::game::EffectSound {
+            id: def.id, pos: event.position, velocity: event.velocity,
+            parameters: [event.volume, event.radius, event.duration, 0.0], probability: 100,
+        }, listener)?;
+        for &voice in &voices {
+            let pitch = if def.doppler {
+                rt.ship_doppler.entry(voice).or_default().update(event.velocity, event.position, listener).map(|pitch| pitch as f32)
+            } else { Some(event.pitch) };
+            if let Some(pitch) = pitch { self.sh.mixer().set_pitch(voice, pitch); }
+        }
+        rt.ship_doppler.retain(|voice, _| self.sh.mixer().is_playing(*voice));
+        Ok(voices)
+    }
+
     /// Drains the positional sound-danger spheres recorded since the last call (GC100b85a3 reads these once per
     /// `Life::Run` pass). Positions are in the same scene-space coordinates passed to `play_game_sound*`.
     pub fn take_life_dangers(&self) -> Vec<([f32; 3], f32)> {
@@ -594,6 +614,28 @@ mod tests {
         p.sound_on = true;
         audio.set_prefs(&p);
         assert_ne!(audio.sh.mixer().play(VoiceDesc::new(Source::Sample(pcm))), 0);
+    }
+
+    #[test]
+    fn traffic_engine_rearms_and_retains_native_doppler_state() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/sound/SourceFiles/SM_Sandy_Game_Dummy.sbf").exists() { return; }
+        let audio = Audio::offline(&dir, 44100);
+        let event = ao_scene::mover::SoundEvent {
+            name: "SM_Sandy_ShipEngine_SmallTransporter", position: [1.0, 0.0, 1.0],
+            velocity: [10.0, 0.0, 0.0], duration: 1.0, volume: 0.8, pitch: 100.0, radius: 0.0,
+        };
+        let first = audio.play_mover_sound(event, [0.0; 3]).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(audio.rt().as_ref().unwrap().ship_doppler.len(), 1);
+        let second = audio.play_mover_sound(event, [0.0; 3]).unwrap();
+        assert_eq!(second, first, "FXS duration rearms the same looping voice");
+        let mut samples = vec![0.0; 44100 * 2];
+        audio.render(&mut samples);
+        assert!(samples.iter().any(|&sample| sample != 0.0));
+        audio.reset();
+        assert!(audio.rt().as_ref().unwrap().ship_doppler.is_empty());
     }
 
     #[test]

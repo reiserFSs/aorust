@@ -1101,6 +1101,14 @@ impl Play {
 }
 
 impl Frontend for Play {
+    fn mover_sound(&mut self, event: ao_scene::mover::SoundEvent, host: &Host) {
+        if let Some(audio) = &self.audio {
+            if let Err(error) = audio.play_mover_sound(event, host.camera.pos.to_array()) {
+                eprintln!("traffic sound: {error:#}");
+            }
+        }
+    }
+
     fn gui(&self) -> &Gui {
         &self.gui
     }
@@ -1530,7 +1538,7 @@ impl Frontend for Play {
             if let Some(weather) = &mut self.world_weather {
                 weather.update(self.zone.game_day as u32, self.zone.day_time() as f64, dt);
                 if let Some(audio) = &self.audio {
-                    audio.update_weather(weather.state());
+                    audio.update_weather(&weather.state());
                 }
                 host.effect_wind = weather.state().wind;
                 let enabled = weather.state().lightning_enabled();

@@ -147,6 +147,8 @@ pub struct Mover {
     pub rotation: Vec<RotTerm>,
     /// `Scale` (`e_ScaleVisibleFarAway` factor as decided by the emitter).
     pub scale: f32,
+    /// Authored FXS `Rotation <| EngineSound` side effects.
+    pub sound: Option<SoundProfile>,
 }
 
 impl Default for Mover {
@@ -161,6 +163,7 @@ impl Default for Mover {
             cut_y: [1.0, 0.0, 1.0],
             rotation: vec![],
             scale: 1.0,
+            sound: None,
         }
     }
 }
@@ -218,6 +221,55 @@ impl Mover {
     }
 }
 
+/// Exact sound formulas accepted from the retail traffic templates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoundProfile {
+    pub engine: &'static str,
+    pub speed_scale: f32,
+    pub divide_delta: bool,
+    pub constant_volume: Option<f32>,
+    pub pitch: f32,
+    pub radius: f32,
+    pub velocity_scale: f32,
+    pub transport_triggers: bool,
+}
+
+/// One FXS PlayGameSound request; coordinates are renderer space, before far-away posing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoundEvent {
+    pub name: &'static str,
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    pub duration: f32,
+    pub volume: f32,
+    pub pitch: f32,
+    pub radius: f32,
+}
+
+impl SoundProfile {
+    /// Script evaluation is left-to-right, including the start/stop trigger products.
+    pub fn frame(&self, previous: &MoverState, current: &MoverState, dt: f32, shown: bool, trigger: &mut f32) -> [Option<SoundEvent>; 3] {
+        let displacement = sub(current.pos, previous.pos);
+        let mut speed = dot(displacement, displacement).sqrt();
+        if self.divide_delta { speed = if dt == 0.0 { 0.0 } else { speed / dt }; }
+        speed = (speed * self.speed_scale).min(1.0);
+        let visibility = if shown { 1.0 } else { 0.0 };
+        let event = |name, duration, volume, velocity, pitch| SoundEvent {
+            name, duration, volume: volume * visibility, velocity, radius: self.radius,
+            position: [current.pos[0], current.pos[1], -current.pos[2]], pitch,
+        };
+        let velocity = if dt == 0.0 { [0.0; 3] } else { scale(sub(previous.ahead, current.pos), self.velocity_scale / dt) };
+        let mut events = [Some(event(self.engine, 1.0, self.constant_volume.unwrap_or(speed), [velocity[0], velocity[1], -velocity[2]], self.pitch)), None, None];
+        if self.transport_triggers {
+            let next = ((speed - 0.5).max(0.0) * 1000.0).min(1.0);
+            events[1] = Some(event("SM_Sandy_ShipTakeoff_Small", 0.0, (1.0 - *trigger) * next, [0.0; 3], 100.0));
+            events[2] = Some(event("SM_Sandy_ShipLand_Clank", 0.0, (1.0 - next) * *trigger, [0.0; 3], 100.0));
+            *trigger = next;
+        }
+        events.map(|event| event.filter(|event| event.volume > 0.0))
+    }
+}
+
 impl MoverState {
     /// One FXS frame towards `target` (`UniversePosition[Counter]` of this frame).
     pub fn step(&mut self, m: &Mover, target: [f32; 3]) {
@@ -246,6 +298,25 @@ impl MoverState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn traffic_audio_uses_real_frame_motion_and_transport_edges() {
+        let profile = SoundProfile { engine: "SM_Sandy_ShipEngine_SmallTransporter", speed_scale: 1.0, divide_delta: true, constant_volume: None, pitch: 100.0, radius: 0.0, velocity_scale: 1.0, transport_triggers: true };
+        let previous = MoverState::default();
+        let moving = MoverState { pos: [1.0, 0.0, 2.0], ..previous };
+        let mut trigger = 0.0;
+        let events = profile.frame(&previous, &moving, 0.1, true, &mut trigger);
+        assert_eq!(events[0].unwrap().position, [1.0, 0.0, -2.0]);
+        assert_eq!(events[0].unwrap().velocity, [-10.0, 0.0, 20.0]);
+        assert_eq!(events[1].unwrap().name, "SM_Sandy_ShipTakeoff_Small");
+        assert!(events[2].is_none());
+        let steady = profile.frame(&previous, &moving, 0.1, true, &mut trigger);
+        assert!(steady[1].is_none() && steady[2].is_none());
+        let stopped = profile.frame(&moving, &moving, 0.1, true, &mut trigger);
+        assert!(stopped[0].is_none() && stopped[1].is_none());
+        assert_eq!(stopped[2].unwrap().name, "SM_Sandy_ShipLand_Clank");
+        assert!(profile.frame(&previous, &moving, 0.1, false, &mut trigger).iter().all(Option::is_none));
+    }
+
 
     const SQUARE: [[f32; 3]; 4] = [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [100.0, 0.0, 100.0], [0.0, 0.0, 100.0]];
 
