@@ -36,6 +36,7 @@ const WINDOW_PROVIDERS: &[(&str, WindowKind)] = &[
     ("WINDOW_MISSION", WindowKind::Mission),
     ("WINDOW_TEAM", WindowKind::Team),
     ("WINDOW_RAID", WindowKind::Raid),
+    ("WINDOW_RESEARCH", WindowKind::Research),
     ("WINDOW_MAP", WindowKind::Map),
     ("WINDOW_FRIENDS", WindowKind::Friends),
     ("WINDOW_NANO", WindowKind::Nano),
@@ -108,6 +109,7 @@ mod tests {
         assert_eq!(m.lookup(k('u', 0)), [HudKey::Window(WindowKind::Skills)]);
         assert_eq!(m.lookup(k('p', 0)), [HudKey::Window(WindowKind::PlanetMap)]);
         assert_eq!(m.lookup(k('p', id::SHIFT)), [HudKey::Window(WindowKind::Perks)]);
+        assert_eq!(m.lookup(k('o', id::SHIFT)), [HudKey::Window(WindowKind::Research)]);
         assert_eq!(m.lookup(k('1', id::CTRL)), [HudKey::Window(WindowKind::Character)]);
         assert_eq!(m.lookup(k('2', id::CTRL)), [HudKey::Window(WindowKind::Actions)]);
         assert_eq!(m.lookup(k('6', id::CTRL)), [HudKey::Window(WindowKind::Map)]);
