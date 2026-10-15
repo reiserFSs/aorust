@@ -395,6 +395,11 @@ impl Player {
         self.transient.as_ref().is_some_and(|t| t.1)
     }
 
+    /// Death may be queued while the previous clip is already finished.
+    pub fn death_animation_finished(&self) -> bool {
+        self.transient.as_ref().is_some_and(|(role, hold)| *hold && self.avatar.finished_role(role))
+    }
+
     /// `Door_t` open / close and lock changes of the zone's doors into the collision world: the door's room link
     /// (`n3Room_t::GetDoorLinkFromPos` through `Door_t::LinkDoorToRooms`) gets the open flag (`n3RoomMonitor_t::DoorOpened/Closed`, read by the
     /// camera's attractor test) and the pass flag (`Door_t::CanPass`, read by `VetoRoomTransition`).
@@ -1065,6 +1070,29 @@ mod tests {
         assert!(!skin.is_empty());
         assert!(skin.iter().zip(original.iter()).any(|(a, b)| a.pos != b.pos), "Deformer must edit the submitted own body");
         assert!(player.avatar.frame().skin.is_none(), "ordinary frames stay palette-only even after source geometry is cached");
+    }
+
+    #[test]
+    fn own_death_completion_reads_the_actual_held_clip() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut zone = Zone::new(7);
+        zone.own_update = Some(Box::new(avatar::tests::own_update()));
+        let mut player = Player::new(&dir, &mut zone, 0).expect("captured own avatar");
+        player.collision = None;
+        player.zones = None;
+        player.avatar.set_pose(&player.store, AvatarPose::still(Role::Clip("ground-stop".into()))).unwrap();
+        player.avatar.update(100.0);
+        assert!(player.avatar.finished(), "the preceding clip is already complete");
+        player.play(Role::Clip("die-shot".into()), true);
+        assert!(!player.death_animation_finished(), "queued death must not inherit previous clip completion");
+        let mut host = Host::headless();
+        player.frame(0.0, &mut host, &mut zone, false);
+        assert!(!player.death_animation_finished());
+        player.frame(100.0, &mut host, &mut zone, false);
+        assert!(player.holding() && player.death_animation_finished());
+        player.stand();
+        assert!(!player.death_animation_finished(), "resurrection ends the held death");
     }
 
     /// Offline, real-CAT Player::frame regression, including the movement FSM and transient dispatch.

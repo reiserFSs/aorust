@@ -587,23 +587,32 @@ pub struct Dying {
     pub elapsed: f32,
     /// The control (own) character: sends [`ACTION_DEATH_DONE`] when the wait is over.
     pub own: bool,
+    fading: bool,
     done_sent: bool,
 }
 
 /// What a [`Dying`] tick asks the app to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DieEvent {
+    /// Own death animation completed: create WhiteOut record 3000 and SetStat(Health, 1).
+    StartWhiteOut,
     /// Own character, wait over: send `CharacterActionIIR_t(action 0x98, no identities, "")` (`FUN_1007b58c`).
     SendDeathDone,
 }
 
 impl Dying {
     pub fn new(anim: u16, own: bool) -> Dying {
-        Dying { anim, elapsed: 0.0, own, done_sent: false }
+        Dying { anim, elapsed: 0.0, own, fading: false, done_sent: false }
     }
 
-    /// `FUN_1007b58c`: advance the timer; at [`DIE_WAIT_S`] the own character emits [`DieEvent::SendDeathDone`] once.
-    pub fn tick(&mut self, dt: f32) -> Option<DieEvent> {
+    /// GC1007b58c starts its three-second clock only after the held animation completes.
+    pub fn tick(&mut self, dt: f32, animation_finished: bool) -> Option<DieEvent> {
+        if !self.own { return None; }
+        if !self.fading {
+            if !animation_finished { return None; }
+            self.fading = true;
+            return Some(DieEvent::StartWhiteOut);
+        }
         self.elapsed += dt;
         if self.own && !self.done_sent && self.elapsed > DIE_WAIT_S {
             self.done_sent = true;
@@ -735,10 +744,13 @@ mod tests {
         assert_eq!(death_anim_from_action(99, 503), Some(503));
         assert_eq!(death_anim_from_action(98, 503), None);
         let mut d = Dying::new(503, true);
-        assert_eq!(d.tick(2.9), None);
-        assert_eq!(d.tick(0.2), Some(DieEvent::SendDeathDone));
-        assert_eq!(d.tick(1.0), None);
-        assert_eq!(Dying::new(503, false).tick(10.0), None);
+        assert_eq!(d.tick(10.0, false), None, "animation time is not death-wait time");
+        assert_eq!(d.elapsed, 0.0);
+        assert_eq!(d.tick(10.0, true), Some(DieEvent::StartWhiteOut));
+        assert_eq!(d.tick(2.9, true), None);
+        assert_eq!(d.tick(0.2, true), Some(DieEvent::SendDeathDone));
+        assert_eq!(d.tick(1.0, true), None);
+        assert_eq!(Dying::new(503, false).tick(10.0, true), None);
         assert_eq!(die_sound(3), sound::FEMALE_DIES);
         assert_eq!(hit_sound(2), sound::MALE_GETS_HIT);
         assert!(plays_hit_sound(5, 1) && !plays_hit_sound(5, 0));

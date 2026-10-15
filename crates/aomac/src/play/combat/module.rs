@@ -421,29 +421,37 @@ impl Module {
         self.pose_events.extend(self.actions.on_frame(f));
     }
 
-    /// Per frame: ages the numbers, feeds the combat music (`FUN_10059736` for every character), runs the own death timer.
+    /// Per frame: ages the numbers and feeds combat music (`FUN_10059736`).
     pub fn update(&mut self, dt: f32, zone: &Zone, audio: Option<&Audio>) {
         self.announce(zone);
         for n in &mut self.numbers {
             n.age += dt;
         }
         self.numbers.retain(|n| n.age < n.spec.life);
-        if let Some(d) = self.dying.as_mut() {
-            if d.tick(dt) == Some(DieEvent::SendDeathDone) {
-                let none = Identity::default();
-                let a = simple(ACTION_DEATH_DONE, none, none);
-                if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
-                    eprintln!("combat: CharDie_t wait over, sending CharacterAction {ACTION_DEATH_DONE:#x}");
-                }
-                self.outbox.push(n3_frame(0, self.own as u32, action::character_action(self.own, &a)));
-            }
-        }
         if self.dying.is_some() && self.combat.char(self.own).is_some_and(|c| !c.dead && c.health() > 0) {
             self.dying = None; // resurrected (ResurrectIIR sets Health)
         }
         let Some(a) = audio else { return };
         for (&id, d) in &zone.dynels {
             a.set_combat_char(&self.music_char(id, d));
+        }
+    }
+
+    /// The visual holder supplies actual completion, not an estimated clip duration.
+    /// Returns true once when GC1007b58c creates WhiteOut and restores local Health to 1.
+    pub fn update_death(&mut self, dt: f32, animation_finished: bool) -> bool {
+        match self.dying.as_mut().and_then(|dying| dying.tick(dt, animation_finished)) {
+            Some(DieEvent::StartWhiteOut) => {
+                self.combat.set_health_local(self.own, 1);
+                true
+            }
+            Some(DieEvent::SendDeathDone) => {
+                let none = Identity::default();
+                let action = simple(ACTION_DEATH_DONE, none, none);
+                self.outbox.push(n3_frame(0, self.own as u32, action::character_action(self.own, &action)));
+                false
+            }
+            None => false,
         }
     }
 
@@ -1107,11 +1115,14 @@ mod death_tests {
         m.on_frame(&action(own as i32, 0, a_id(500), 99));
         assert_eq!(m.death_anim(), 500);
         assert!(m.take_events().iter().any(|e| matches!(e, CombatEvent::Died { dynel, cause: 0 } if *dynel == own as i32)));
-        let z = Zone::new(own);
-        m.update(2.9, &z, None);
-        assert!(m.take_outbox().is_empty(), "the wait is 3 s");
-        m.update(0.2, &z, None);
-        m.update(1.0, &z, None);
+        assert!(!m.update_death(10.0, false));
+        assert!(m.take_outbox().is_empty(), "no timer until the actual holder completes");
+        assert!(m.update_death(10.0, true));
+        assert_eq!(m.combat.char(own as i32).unwrap().health(), 1);
+        assert!(!m.update_death(2.9, true));
+        assert!(m.take_outbox().is_empty(), "the post-animation wait is 3 s");
+        assert!(!m.update_death(0.2, true));
+        assert!(!m.update_death(1.0, true));
         let out = m.take_outbox();
         let done: Vec<i32> = out.iter().filter_map(|f| match n3::decode(f).ok()?.body {
             N3::World(ao_net::n3::world::World::CharacterAction(a)) => Some(a.action),

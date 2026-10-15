@@ -919,6 +919,8 @@ pub struct Dynels {
     /// Persistent slot +0x30 damage / +0x2c hit kind (`FUN_1006a8f3`); specials never write these.
     slot_hits: HashMap<(i32, i32), (i32, i32)>,
     effects: Option<super::combat::effects::Renderer>,
+    /// GC1007b58c stores own WhiteOut at the character effect controller +0x9c.
+    death_whiteout: Option<u32>,
     pending_effects: Vec<ao_net::n3::effects::Effects>,
     /// Visual spell applications wait until the own animated connectors are available.
     nano_visuals: Vec<ao_net::n3::spells::ApplySpells>,
@@ -1082,6 +1084,7 @@ impl Default for Dynels {
             notes: vec![],
             slot_hits: HashMap::new(),
             effects: None,
+            death_whiteout: None,
             pending_effects: vec![],
             nano_visuals: vec![],
             nano_handles: vec![],
@@ -1313,6 +1316,7 @@ impl Dynels {
             Some(names) => super::combat::effects::Renderer::open_with_names(&dir, names.clone()),
             None => super::combat::effects::Renderer::open(&dir),
         }.map_err(|error| eprintln!("weapon effects: {error:#}")).ok();
+        self.death_whiteout = None;
         self.dir = Some(dir);
     }
 
@@ -1340,7 +1344,7 @@ impl Dynels {
         self.nano_lock_second = 0.0;
         self.nano_animations.clear();
         self.nano_sounds.clear();
-        if let Some(effects) = &mut self.effects { effects.clear(); }
+        if let Some(effects) = &mut self.effects { effects.clear_preserving(self.death_whiteout); }
         self.props.clear();
         self.weapons.clear();
         self.wield.clear();
@@ -2602,6 +2606,17 @@ impl Dynels {
     pub fn effect_camera_offset(&mut self, eye: glam::Vec3) -> anyhow::Result<glam::Vec3> {
         self.effects.as_mut().map_or(Ok(glam::Vec3::ZERO), |effects| effects.camera_offset(eye))
     }
+    /// Own CharDie post-animation phase: unlocated record3000 (class1015 WhiteOut).
+    pub fn start_death_whiteout(&mut self) -> anyhow::Result<()> {
+        use super::combat::effects::{Binding, Creation, EffectConfig};
+        if self.death_whiteout.is_some() { return Ok(()); }
+        let Some(renderer) = &mut self.effects else { return Ok(()); };
+        let handle = renderer.spawn_configured(Binding { group: 0, attractor: 0, effect: 3000, note: 0, color: 0 },
+            glam::Mat4::IDENTITY, glam::Vec3::ZERO, EffectConfig { creation: Creation::Unlocated, ..Default::default() })?;
+        self.death_whiteout = (handle != 0).then_some(handle);
+        Ok(())
+    }
+
     /// GC1001698d: an existing dynel gets authored Highlight11507, no replacement art.
     pub fn flash_head(&mut self, who: u32) -> anyhow::Result<()> {
         use super::combat::effects::{Binding, Creation, EffectConfig};
@@ -2656,6 +2671,13 @@ impl Dynels {
 
     pub fn on_message(&mut self, m: &Message) {
         let who = m.header.target;
+        if m.header.msg_type == ao_net::n3::server_move::RESURRECT && who.kind == CHAR_KIND && who.instance == self.own {
+            if let N3::Unknown(body) = &m.body {
+                if ao_net::n3::server_move::parse_resurrect(body).is_ok() {
+                    if let (Some(renderer), Some(handle)) = (&mut self.effects, self.death_whiteout.take()) { renderer.delete(handle); }
+                }
+            }
+        }
         if matches!(&m.body, N3::Misc(Misc::ToClientQuit)) {
             if let Some(effects) = &mut self.effects { effects.source_deleted((who.kind as u32, who.instance as u32)); }
             self.nano_visuals.retain(|application| application.target != who);
@@ -3699,6 +3721,35 @@ mod tests {
         values.prefs.set_int("IsOrgNameShownOverHead", 1, Kind::Char);
         world.set_name_prefs(&values);
         assert!(world.show_all_names && world.show_org_names);
+    }
+
+    #[test]
+    fn own_death_whiteout_survives_zone_clear_until_valid_own_resurrection() {
+        let Some(dir) = client() else { return };
+        let mut world = Dynels { own: 7, effects: Some(super::super::combat::effects::Renderer::open(&dir).unwrap()), ..Default::default() };
+        world.start_death_whiteout().unwrap();
+        let handle = world.death_whiteout.expect("authored WhiteOut3000");
+        world.start_death_whiteout().unwrap();
+        assert_eq!(world.death_whiteout, Some(handle), "one WhiteOut per own death");
+        let mut host = Host::headless();
+        world.effects.as_mut().unwrap().frame(1.0, &mut host, None);
+        assert!(!host.screen_layers.is_empty(), "record3000 produces the native fullscreen control");
+        world.clear();
+        assert!(world.effects.as_ref().unwrap().is_active(handle), "changing playfields must not cancel the character's WhiteOut");
+        let mut message = Message {
+            header: ao_net::n3::N3Header { msg_type: ao_net::n3::server_move::RESURRECT, target: ao_net::msg::Identity { kind: CHAR_KIND, instance: 7 }, flag: 0 },
+            sender: 0, body: N3::Unknown(vec![]),
+        };
+        world.on_message(&message);
+        assert_eq!(world.death_whiteout, Some(handle), "malformed resurrection cannot remove the fade");
+        message.body = N3::Unknown([10i32.to_be_bytes(), 10i32.to_be_bytes()].concat());
+        message.header.target.instance = 8;
+        world.on_message(&message);
+        assert_eq!(world.death_whiteout, Some(handle), "another character's resurrection is unrelated");
+        message.header.target.instance = 7;
+        world.on_message(&message);
+        assert!(world.death_whiteout.is_none());
+        assert!(!world.effects.as_ref().unwrap().is_active(handle), "GC1003e40a deletes the saved handle");
     }
 
     #[test]

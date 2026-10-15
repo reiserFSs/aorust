@@ -392,6 +392,14 @@ impl Renderer {
         Ok(())
     }
 
+    /// Unlocated own-death WhiteOut belongs to the character lifecycle, not the playfield.
+    pub fn clear_preserving(&mut self, handle: Option<u32>) {
+        let retained = handle.and_then(|handle| self.active.iter().position(|effect| effect.actor == handle))
+            .map(|index| self.active.swap_remove(index));
+        self.clear();
+        if let Some(effect) = retained { self.active.push(effect); }
+    }
+
     pub fn clear(&mut self) {
         self.mesh_children.clear();
         self.retired_screens.clear();

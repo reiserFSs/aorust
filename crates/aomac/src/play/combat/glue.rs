@@ -169,6 +169,15 @@ impl Play {
         let Some(m) = self.fight.as_mut() else { return };
         m.update(dt, &self.zone, self.audio.as_ref());
         let own = self.zone.char_id as i32;
+        if m.update_death(dt, self.player.as_ref().is_some_and(Player::death_animation_finished)) {
+            // SetStat(Health,1) is local state, not incoming damage/healing feedback.
+            self.zone.stats.insert(ao_formats::stats::HEALTH, 1);
+            self.zone.character_stats.entry(own).or_default().insert(ao_formats::stats::HEALTH, 1);
+            if let Some(character) = self.zone.dynels.get_mut(&own) { character.health = 1; }
+            if let Err(error) = self.zone.world.start_death_whiteout() {
+                self.zone.world.report_effect_failure(format_args!("own death WhiteOut3000: {error:#}"));
+            }
+        }
         if self.zone.world.update_attack_bars(own, m.attacking(), dt) {
             if let Some(c) = self.chat.as_mut() { c.feedback(&mut self.gui, "Feedback_ReloadingCompleted", &self.text); }
         }

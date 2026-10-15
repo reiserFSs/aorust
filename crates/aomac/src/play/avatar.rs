@@ -756,6 +756,10 @@ impl Avatar {
         self.one_shot() && self.clip.as_ref().is_none_or(|a| self.ms >= a.duration)
     }
 
+    pub fn finished_role(&self, role: &Role) -> bool {
+        &self.pose.role == role && self.finished()
+    }
+
     /// Scene position (feet) and rotation about +Y ([`super::zone::scene_yaw`] of the server heading).
     pub fn set_transform(&mut self, scene_pos: [f32; 3], scene_yaw: f32) {
         self.transform = Mat4::from_translation(Vec3::from(scene_pos)) * Mat4::from_rotation_y(scene_yaw) * Mat4::from_scale(Vec3::splat(self.scale));
