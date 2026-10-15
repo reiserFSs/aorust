@@ -88,7 +88,7 @@ NUMERIC 0x2000, ALT_ENTER_MODE 0x4000.
 **Password mask**: `TextRenderer_c::_RenderString` 0x1015ffdd: `if (flags & 0x100 != 0 …) { if (flags & 0x10) ch = 0x2a; }` → every glyph of the
 field is drawn as **`*`** (ASCII 0x2a) in the field font, advance of `*`. Copy/Cut are disabled for password fields.
 `TextView_c::SlotTabPressed` 0x10002a83: a text field that gains focus by Tab selects all of its text.
-**UNRESOLVED**: line pitch of `_AddLineDesc` (we use the font height).
+`_AddLineDesc` **0x10161b44** advances line y by the recorded maximum run height, substituting renderer default font height (`+0x1c4`) only when that height is0. The port now preserves short image-only lines rather than imposing a font-height floor; mixed text/image lines retain the taller run. Regression `line_pitch_uses_run_height_and_empty_line_font_fallback` covers shorter/taller images and empty lines.
 
 ## 4. View XML (`view.rs`, `xml.rs`)
 

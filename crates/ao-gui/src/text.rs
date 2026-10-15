@@ -6,8 +6,8 @@
 //!   (`_RenderString` 0x1015ffdd).  `TVF_PASSWORD` (0x10) replaces every glyph with `*` (0x2a).
 //! * Line alignment 1 = right, 4 = centre (`_RenderLine`).
 //! * `\n` is a space when `TVF_IGNORE_NEWLINES` is set, a line break when `TVF_MULTILINE` is set.
-//! * UNRESOLVED: the exact line pitch of `_AddLineDesc` (we use the font height) and the HTML tags
-//!   other than `br`, `center`, `font color`, `a`, `p`, `div`, `b`, `i`, `u`, `img` (ignored).
+//! * `_AddLineDesc` 10161b44 advances by the maximum run height; only empty lines use
+//!   the renderer's font height. HTML tags beyond the supported subset remain unresolved.
 
 use crate::font::{FontId, FontSystem};
 use crate::geom::Point;
@@ -267,10 +267,10 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                 for part in t.split('\n') {
                     if !first {
                         if flags & tvf::MULTILINE != 0 && flags & tvf::IGNORE_NEWLINES == 0 {
-                            if let Some(w) = words.last_mut() {
-                                w.hard_break_after = true;
-                            } else {
+                            if words.last().is_none_or(|word| word.hard_break_after) {
                                 words.push(Word { hard_break_after: true, ..new_word(String::new(), None, &no_link, 0, align, wrapped) });
+                            } else if let Some(word) = words.last_mut() {
+                                word.hard_break_after = true;
                             }
                         } else {
                             push_text(&mut words, fonts.font(font), " ", color, link, align, wrapped);
@@ -285,10 +285,10 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
                 if std::mem::take(&mut block_closed) {
                     continue;
                 }
-                if let Some(w) = words.last_mut() {
-                    w.hard_break_after = true;
-                } else {
+                if words.last().is_none_or(|word| word.hard_break_after) {
                     words.push(Word { hard_break_after: true, ..new_word(String::new(), None, &no_link, 0, align, wrapped) });
+                } else if let Some(word) = words.last_mut() {
+                    word.hard_break_after = true;
                 }
             }
             Tok::Open(name, attrs) => {
@@ -386,7 +386,7 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
     let mut layout = TextLayout::default();
     let mut cur_runs: Vec<TextRun> = Vec::new();
     let mut cur_w = 0;
-    let mut cur_h = line_h;
+    let mut cur_h = 0;
     let mut cur_align = Align::Left;
     let mut y = 0;
     // `_ReWrap`'s wrapped-line counter: -1 outside a `<div indent=wrapped>`, 0 at its first line, +1 per line added
@@ -395,9 +395,9 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
     let flush = |layout: &mut TextLayout, runs: &mut Vec<TextRun>, w: &mut i32, h: &mut i32, y: &mut i32, align: Align, indent: i32, hard: bool| {
         layout.max_width = layout.max_width.max(*w);
         layout.lines.push(TextLine { y: *y, width: *w, align, runs: std::mem::take(runs), hard_break: hard, indent });
-        *y += *h;
+        *y += if *h == 0 { line_h } else { *h };
         *w = 0;
-        *h = line_h;
+        *h = 0;
     };
     let nwords = words.len();
     for (n, wd) in words.into_iter().enumerate() {
@@ -430,6 +430,7 @@ pub fn layout_text(fonts: &mut FontSystem, colors: &Colors, font: FontId, text: 
         if wd.img.is_some() {
             cur_runs.push(TextRun { text: String::new(), color: wd.color, link: wd.link, href: wd.href, img: wd.img });
         } else if !wd.text.is_empty() {
+            cur_h = cur_h.max(line_h);
             match cur_runs.last_mut() {
                 Some(r) if r.img.is_none() && r.color == wd.color && r.link == wd.link && r.href == wd.href => r.text.push_str(&wd.text),
                 _ => cur_runs.push(TextRun { text: wd.text, color: wd.color, link: wd.link, href: wd.href, img: None }),

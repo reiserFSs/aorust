@@ -76,3 +76,17 @@ fn text_view_draws_the_bullet_next_to_the_answer() {
     let hit = list.cmds.iter().filter(|c| matches!(c, DrawCmd::Gfx { id, .. } if *id == bullet)).count();
     assert_eq!(hit, 1, "one bullet drawn");
 }
+
+#[test]
+fn line_pitch_uses_run_height_and_empty_line_font_fallback() {
+    let Some(mut g) = rig() else { return };
+    let fh = g.font_height(FontId::Normal);
+    for h in [3, fh + 7] {
+        let (fonts, colors) = g.text_parts();
+        let mut colors = colors.clone();
+        colors.images.insert("pitch".into(), (5, h));
+        let l = layout_text(fonts, &colors, FontId::Normal, "<img src=tdb://id:pitch><br><br>text", FLAGS, None);
+        assert_eq!(l.lines.iter().map(|line| line.y).collect::<Vec<_>>(), [0, h, h + fh]);
+        assert_eq!(l.height, h + 2 * fh);
+    }
+}
