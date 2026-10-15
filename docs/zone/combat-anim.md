@@ -60,16 +60,16 @@ The app has no per-character state objects, so the state ids (`CharState`), the 
 ### 3.0 What the client runs (`combat/glue.rs::swing`, `Dynels::pick_swing`)
 Every `Hit` / `Miss` / `SpecialAttack` event of any character (a miss runs `FUN_1006a8f3` with damage 0, section 4):
 1. **Weapon swing**: the holder's wielded weapon (`Dynels::wield`, the `WeaponItemFullUpdate` children in body slot 6 = right hand, 8 = left;
-   `AnimSet` 0x161 and `ItemDelay` 0x126 from the item template under the message stats) -> `weapon_list(AnimSet, left, crawl = false, key)`
-   (`key` = `0xb`, or the special's list key, else `0xb` when the weapon has no such key) -> random value (the CRT-rand stream of `Dynels`)
+   `AnimSet` 0x161 and `ItemDelay` 0x126 from the item template under the message stats) -> `weapon_list(AnimSet, left, crawl, key)`
+   (`key` = `0xb`, or the special's list key, else `0xb` when the weapon has no such key; crawl from stat 0x1ae) -> random value (the CRT-rand stream of `Dynels`)
    -> `(AbstractAnimID, ItemDelay, resolved list key)` -> the own avatar plays `Role::Clip(anim_name(id))` (`Player::swing_list`,
    rate x `swing_speed_scale(first event time, ItemDelay)`), every other character `Dynels::play_swing(id,anim,resolved_key)` (NPC record table
    or the set's file name through `resolve_clip`). Both holder gates use the resolved key, including `0xb` after a missing special list;
    remote `ActionAnim::advance` applies the same first-event speed scale. [DATA] all weapon attack ids exist as clips for male / female / athrox (test `fight_clips_exist_in_the_data`).
 2. **Item lists**: Brawl, Dimach and bow special resolve the list on the special item's record (`FUN_100686d0(stat)+0xe4`).
    Bare hands resolve the martial-arts item delivered under key 100. `dynel_visual::animation_map` decodes element `{0xe,0x13}` using the same validated multimap size words as the sound parser.
-   The martial-arts fixture (rdb 1000020:43712) asserts list `0xb = [1034,1035,1037,1033]`; Dimach 42033 has `0xb=[163]`, Brawl 70292 has `0xb=[1036]` (element offsets 203 and 184). Special keys missing on their own item fall back to its `0xb` (`FUN_1003c594`). Missing lists retain the creature-path `0x40a` fallback;
-   this missing-player-list fallback remains **[UNRESOLVED]**, not a fabricated special clip. Crawl lists now read the holder's existing `Mover::wait_state()` (stat 0x1ae): value 0xe selects crawl weapon attacks; that stat was already tracked by the movement FSM, contrary to the earlier gap note.
+   The martial-arts fixture (rdb 1000020:43712) asserts list `0xb = [1034,1035,1037,1033]`; Dimach 42033 has `0xb=[163]`, Brawl 70292 has `0xb=[1036]` (element offsets 203 and 184). Special keys missing on their own item fall back to its `0xb` (`FUN_1003c594`). Missing lists on a mesh with weapon attractors now take the native **social wave 0x3e** fallback, not a fabricated unarmed attack. GC `1006a239 → 10010d83` plays wave at priority −2, count 1; DS `HasWeaponAttractors` `10073199` tests `GetAttractorMatrix(GetName(2))` (`Attractor03_lefthand`). Creatures without that attractor retain 0x40a. Regression `missing_humanoid_attack_list_plays_native_wave_not_creature_swing` exercises the actual combat event dispatch with captured humanoid / Leet models.
+   Crawl lists read the holder's existing `Mover::wait_state()` (stat 0x1ae): value 0xe selects crawl weapon attacks; that stat was already tracked by the movement FSM, contrary to the earlier gap note.
 3. **Text above the character** for special attacks (`FUN_10011108(char, "Burst!\n", 0xd)`): `Module::on_frame` pushes a world-space `Number` (category 0xd = colour
    `0x00f000`, effect `0x2f5a` path, `combat-log.md` section 6) with the text without its trailing newline. The sound of Brawl / Dimach is in section 6.
 * `CharSecSpecAttack` queues only when empty; `SpecialAttackInfo` starts the front's swing before feedback and clears the deque afterward (`FUN_1006a9c5`, `FUN_1005548b`). Active list keys are suppressed (`FUN_1003bfd2`, its list node `+0xc` comparison), not clip names:
@@ -1793,7 +1793,7 @@ alternating foreground at static-camera frames50/102 were assigned to
 the separate CameraFlicker investigation; they are not effect-coverage
 successes and no second authentication was attempted.
 
-* The `imp-*` selector is resolved (`FUN_10058cfa`, §4), including crawl; the height argument is unused (`FUN_1003c8b7`, §3.0), not an unresolved selector in `FUN_1003c802`. Still open: missing player-item attack lists (§3.1); `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
+* The `imp-*` selector is resolved (`FUN_10058cfa`, §4), including crawl; the height argument is unused (`FUN_1003c8b7`, §3.0), not an unresolved selector in `FUN_1003c802`. Missing humanoid-item attack lists now use the native wave fallback (§3.0). Still open: `ToClientDynelDead` caller; action 0x98 server-side meaning; stat 0x183 name.
 * Native nulls and implementation gaps are separate (§7.9): class0 body
   profiles and class2003 cannot be constructed by any factory; missing
   class/form cases are likewise native null, not missing port artwork.

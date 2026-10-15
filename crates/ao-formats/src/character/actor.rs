@@ -311,6 +311,10 @@ impl ActorRig {
 
     /// Shared immutable model for renderer handoff without copying mesh or texture data.
     pub fn model_arc(&self) -> Arc<Scene> { self.model.clone() }
+    /// DS 0x10073199 checks GetAttractorMatrix(GetName(2)), the left-hand attractor.
+    pub fn has_weapon_attractors(&self) -> bool {
+        self.cat.attractors.iter().any(|a| a.name == "Attractor03_lefthand" && self.bind.get(a.bone as usize).is_some_and(Option::is_some))
+    }
 
     /// Native attractor place of each rigid mounted mesh (body is unmounted).
     pub fn part_attractors(&self) -> Vec<Option<u8>> {

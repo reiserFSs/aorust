@@ -580,6 +580,7 @@ impl Player {
         self.movement.set_face_target(fight_target_position(zone, self.char_id as i32, self.movement.pos()));
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
+            if id == 0x1ae { zone.world.set_wait_state(self.char_id as i32, v); }
         }
         self.sync_travel_appearance(zone);
         if let Some(z) = self.zones.as_ref().and_then(|l| l.zone_at(flip(self.movement.pos()))) {
@@ -594,6 +595,7 @@ impl Player {
         };
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
+            if id == 0x1ae { zone.world.set_wait_state(self.char_id as i32, v); }
         }
         let (pos, yaw) = (self.movement.pos(), self.movement.yaw());
         zone.nano_motion = Some(super::hud_nano::NanoMotion {
@@ -625,15 +627,15 @@ impl Player {
         let now = Pose::from_role(&role);
         if let Some(from) = self.pose.replace(now).filter(|&b| b != now && self.cast_loop.is_none()) {
             if let Some(id) = Pose::transition_anim(from, now) {
-                    self.transient = None;
-                    self.cast_loop = None;
-                    self.avatar.set_body_priority(0);
-                    self.avatar.set_clip_scale(None);
-                    self.avatar.set_cast_loop(false);
-                    let idle = if self.fighting && role == Role::Idle { Role::IdleCombat } else { role.clone() };
-                    if let Err(e) = self.avatar.play_posture(&self.store, id, AvatarPose::still(idle)) {
-                        eprintln!("avatar posture: {e:#}");
-                    }
+                self.transient = None;
+                self.cast_loop = None;
+                self.avatar.set_body_priority(0);
+                self.avatar.set_clip_scale(None);
+                self.avatar.set_cast_loop(false);
+                let idle = if self.fighting && role == Role::Idle { Role::IdleCombat } else { role.clone() };
+                if let Err(e) = self.avatar.play_posture(&self.store, id, AvatarPose::still(idle)) {
+                    eprintln!("avatar posture: {e:#}");
+                }
             }
         }
         // the airborne->grounded edge plays the jump-landing clip once over the resuming movement pose (`jump-land-*`);

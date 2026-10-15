@@ -495,11 +495,16 @@ fn swing(world: &mut Dynels, player: Option<&mut Player>, who: i32, key: u16, sp
             }
         }
         (true, None) => {
-            if let (Some(p), Some((name, _))) = (player, anim_name(UNARMED_RSWING)) {
-                p.swing_list(Role::Clip(name.into()), None, key, world.note_slot(who).unwrap_or(-1));
+            if let Some(p) = player {
+                if world.has_weapon_attractors(who) {
+                    p.play_action(0x3e, Some(0), -2);
+                } else if let Some((name, _)) = anim_name(UNARMED_RSWING) {
+                    p.swing_list(Role::Clip(name.into()), None, key, world.note_slot(who).unwrap_or(-1));
+                }
             }
         }
         (false, Some((anim, _, key))) => world.play_swing(who, Some(anim as u32), key),
+        (false, None) if world.has_weapon_attractors(who) => world.play_action(who, 0x3e, super::anim::Layer::Body, -2),
         (false, None) => world.play_swing(who, None, key),
     }
 }

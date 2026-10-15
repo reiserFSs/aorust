@@ -1522,6 +1522,17 @@ impl Dynels {
         Some((anim, delay, resolved_key))
     }
 
+    /// Mirror the own movement Apply writes into the holder used by combat.
+    pub fn set_wait_state(&mut self, id: i32, value: i32) {
+        if let Some(c) = self.chars.get_mut(&id) { c.mover.on_stat(0x1ae, value); }
+    }
+
+    /// Native creature-vs-item swing branch (GC 0x100679a0, DS 0x10073199).
+    pub fn has_weapon_attractors(&self, id: i32) -> bool {
+        let Some(c) = self.chars.get(&id) else { return false };
+        matches!(self.models.get(&c.key), Some(Model::Ready { built, .. }) if built.rig.as_ref().is_some_and(|rig| rig.has_weapon_attractors()))
+    }
+
     /// The weapon swing of `id` (`FUN_10069acb` [GC 0x10069acb] + `FUN_1003c594`): a random value of list `key` of the `AnimSet` lists of the
     /// weapon in its right hand (else left) - list 0xb when the weapon has no such key. Returns (clip, ItemDelay in centiseconds, resolved list key);
     /// [`Dynels::play_swing`] uses the delay for speed scaling and the resolved key for duplicate suppression.
@@ -6331,6 +6342,19 @@ mod variant_tests {
         world.on_message(&spawn);
         assert_eq!(world.pick_swing(who, canim::list::ATTACK).unwrap().0, 0x3ff);
         assert_ne!(world.impact_anim(who), 0xd0);
+    }
+
+    #[test]
+    fn missing_humanoid_attack_list_plays_native_wave_not_creature_swing() {
+        let Some((mut zone, player, leet)) = fight_zone() else { return };
+        assert!(zone.world.has_weapon_attractors(player));
+        assert!(!zone.world.has_weapon_attractors(leet));
+        zone.world.wield.remove(&player);
+        zone.world.arms = Default::default();
+        let events = [super::super::combat::state::CombatEvent::Miss { attacker: player, target: leet, slot: 6 }];
+        super::super::combat::glue::combat_animations(&mut zone.world, None, -1, &events, |_| false);
+        let node = zone.world.chars[&player].actions.last().unwrap();
+        assert_eq!((node.id, node.priority, node.key), (0x3e, -2, None));
     }
 
     #[test]
