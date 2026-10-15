@@ -105,7 +105,7 @@ pub struct OwnState {
 /// Dimach 0x90, Sneak Attack 0x92, Fast Attack 0x93, Burst 0x94, Fling Shot 0x96, Aimed Shot 0x97, Full Auto 0xa7, 0x243, 0x2a1) where `pct = 0`.
 pub fn recharge_time(action: u32, duration: i32, pct: i32) -> i32 {
     let pct = if matches!(action, 0x8e | 0x90 | 0x92..=0x94 | 0x96 | 0x97 | 0xa7 | 0x243 | 0x2a1) { 0 } else { pct.max(-0x32) };
-    (f64::from(duration * pct) / 100.0 + f64::from(duration) + 0.5) as i32
+    (f64::from(duration.wrapping_mul(pct)) / 100.0 + f64::from(duration) + 0.5) as i32
 }
 
 /// One record of the recharge list (`FUN_10063c50`: `{+4 action, +8 total, +0xc remaining}` in seconds, `FUN_10064301` prints h:m:s).
@@ -349,6 +349,7 @@ mod tests {
         assert_eq!(recharge_time(0x11, 20, 50), 30);
         assert_eq!(recharge_time(0x11, 20, -90), 10, "floored at -50 %");
         assert_eq!(recharge_time(0x11, 7, -10), 6, "7 - 0.7 + 0.5 = 6.8, truncated");
+        assert_eq!(recharge_time(0x11, 100_000_000, 50), 107_050_327, "native IMUL wraps before conversion to double");
         let mut l = SpecialList::new();
         l.feed_recharge(0x88, 30, 0);
         l.tick(10.0);
