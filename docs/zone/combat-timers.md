@@ -139,6 +139,8 @@ Runtime behavior is intentionally unchanged for this report.
   bytes through `Zone::on_frame`, covering dual-wield exact selection, source replacement/removal,
   signed container registration, count bounds and negative-Ammo rejection. These are native-derived
   synthetic checks, **not** a finite-magazine live capture; that independent server acceptance remains unverified.
+  `manual_reload_waits_for_server_acknowledgement` also exercises real special-action dispatch:
+  exactly one action-0xd2 request is queued and no reload bar appears before a server message.
 * **Offscreen live evidence (2026-10-15):** Aomacfixr 33588 wielded template **121569**, weapon
   **24763172**. Both received weapon updates at **5291 ms** carried current ammo26 **0**.
   The two normal own hits at **19203 / 21389 ms** dealt **11 / 2** damage in slot6 and each supplied

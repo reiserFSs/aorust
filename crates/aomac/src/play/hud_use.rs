@@ -287,6 +287,22 @@ impl Play {
 mod tests {
     use super::hud_timerbar;
 
+    #[test]
+    fn manual_reload_waits_for_server_acknowledgement() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut play = super::Play::new(dir.clone(), None, None, None).unwrap();
+        let own = play.zone.char_id as i32;
+        play.zone.world.arms.wield(own, 900, 6, None, &[(26, 0), (420, 2), (210, 250)]);
+        play.fight = Some(crate::play::combat::module::Module::new(&dir, own as u32));
+        play.special_action(0x6e);
+        assert!(play.zone.world.reload_bar_progress().is_none());
+        let frames = play.fight.as_mut().unwrap().take_outbox();
+        assert_eq!(frames.len(), 1);
+        let ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(a)) = ao_net::n3::decode(&frames[0]).unwrap().body else { panic!("expected reload request") };
+        assert_eq!(a.action, ao_net::n3::action::id::RELOAD);
+    }
+
     /// The Logout bar's "Logout" label: `TOOLTIP` font, horizontally centred across the whole bar (`TextOutput_t::Alignment`
     /// 0x100231d8, flags bit `0x800`), 1 px down from the top (`AdjustHotspot` 0x10023247 is a no-op for that flag, so the
     /// local y the ctor passes, 1, is never touched), drawn solid black (`TextLine_t::SetDefaultColor(this, 0)` 0x100223ef --
