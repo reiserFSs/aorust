@@ -214,7 +214,10 @@ impl Play {
             }
         }
         // Constructor draw/holster and attack playback follow server event order.
-        combat_animations(&mut self.zone.world, self.player.as_mut(), own, &events, |id| m.is_fighting(id));
+        let stats = &self.zone.stats;
+        let character_stats = &self.zone.character_stats;
+        combat_animations(&mut self.zone.world, self.player.as_mut(), own, &events, |id| m.is_fighting(id),
+            |id| if id == own { stats.get(&0x296) } else { character_stats.get(&id).and_then(|stats| stats.get(&0x296)) }.is_some_and(|value| *value != 0));
         // fight sounds (docs/zone/combat-anim.md §6): played by the app next to the door sounds (`Dynels::take_sounds`, listener = camera).
         // The weapon / swish / impact sounds belong to the animation notes of the swing clips (`FUN_1003c036` -> `FUN_10045069`, `notes`)
         let own_notes = self.player.as_mut().map(|p| p.take_notes()).unwrap_or_default();
@@ -478,12 +481,14 @@ impl Play {
 
 /// One swing of `who` (`FUN_1006a239`): own-item specials resolve their `{0xe,0x13}` list through `FUN_100686d0(stat)`,
 /// other specials use the wielded weapon's list; bare hands use the martial-arts item delivered under key 100.
-fn swing(world: &mut Dynels, player: Option<&mut Player>, who: i32, key: u16, special_item: i32, own: i32) {
+fn swing(world: &mut Dynels, player: Option<&mut Player>, who: i32, key: u16, special_item: i32, own: i32, in_vehicle: bool) {
     let picked = if special_item != 0 {
         world.pick_item_swing(who, special_item, key)
     } else {
         world.pick_swing(who, key).or_else(|| world.pick_item_swing(who, 0, key))
     };
+    // GC10010d83 refuses the social fallback while stat0x296 is nonzero (10057b1c).
+    if picked.is_none() && in_vehicle && world.has_weapon_attractors(who) { return; }
     if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
         eprintln!("combat: swing who={who} list={key:#x} special_item={special_item} picked={picked:?} name={:?}", picked.and_then(|(anim, _, _)| anim_name(anim).map(|(name, _)| name)));
     }
@@ -559,16 +564,16 @@ fn fight_idle(world: &mut Dynels, player: &mut Option<&mut Player>, own: i32, wh
 /// character starts fighting (not when it only switches target: `FUN_10069c68` stops the old fight first, `FUN_10068b7f` -> `FUN_1003cc15` plays the
 /// holster, and the fight state stays 2 without a new draw), `FUN_10068b7f` the holster when a fight stops, `FUN_1006a700` the idle update when a weapon
 /// is wielded while the holder fights (`fighting`).
-pub(in crate::play) fn combat_animations(world: &mut Dynels, mut player: Option<&mut Player>, own: i32, events: &[CombatEvent], fighting: impl Fn(i32) -> bool) {
+pub(in crate::play) fn combat_animations(world: &mut Dynels, mut player: Option<&mut Player>, own: i32, events: &[CombatEvent], fighting: impl Fn(i32) -> bool, in_vehicle: impl Fn(i32) -> bool) {
     let died = |who: i32| events.iter().any(|e| matches!(e, CombatEvent::Died { dynel, .. } if *dynel == who));
     for e in events {
         match e {
             CombatEvent::FightStarted { who, switched: false, .. } => fight_idle(world, &mut player, own, *who, true, true),
             CombatEvent::FightStopped { who } => fight_idle(world, &mut player, own, *who, false, !died(*who)),
-            CombatEvent::Hit { attacker, .. } | CombatEvent::Miss { attacker, .. } => swing(world, player.as_deref_mut(), *attacker, list::ATTACK, 0, own),
+            CombatEvent::Hit { attacker, .. } | CombatEvent::Miss { attacker, .. } => swing(world, player.as_deref_mut(), *attacker, list::ATTACK, 0, own, in_vehicle(*attacker)),
             CombatEvent::SpecialAttack { who, special, .. } => {
                 let s = special_swing(*special);
-                swing(world, player.as_deref_mut(), *who, s.map_or(list::ATTACK, |s| s.list), if s.is_some_and(|s| s.own_item) { *special } else { 0 }, own);
+                swing(world, player.as_deref_mut(), *who, s.map_or(list::ATTACK, |s| s.list), if s.is_some_and(|s| s.own_item) { *special } else { 0 }, own, in_vehicle(*who));
             }
             _ => {}
         }

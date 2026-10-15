@@ -4990,11 +4990,11 @@ mod tests {
         let special = crate::play::combat::state::CombatEvent::SpecialAttack {
             who, target: ao_net::msg::Identity { kind: 50000, instance: 77 }, special: 148, slot: 6, damage: 20,
         };
-        crate::play::combat::glue::combat_animations(&mut z.world, None, -1, &[special], |_| false);
+        crate::play::combat::glue::combat_animations(&mut z.world, None, -1, &[special], |_| false, |_| false);
         assert_eq!(z.world.chars[&who].actions.len(), 1);
         assert_eq!(z.world.chars[&who].actions[0].key, Some(canim::list::ATTACK), "missing Burst list resolves to retail 0xb");
         let normal = crate::play::combat::state::CombatEvent::Hit { attacker: who, victim: 77, damage: 10, slot: 6, flags: 4 };
-        crate::play::combat::glue::combat_animations(&mut z.world, None, -1, &[normal], |_| false);
+        crate::play::combat::glue::combat_animations(&mut z.world, None, -1, &[normal], |_| false, |_| false);
         assert_eq!(z.world.chars[&who].actions.len(), 1, "normal attack is suppressed by the fallback special's resolved key");
     }
 
@@ -5129,7 +5129,7 @@ mod variant_tests {
                 CombatEvent::FightStarted { who: own, target, switched: false },
                 CombatEvent::SpecialAttack { who: own, target, special, slot: 6, damage: 3 },
             ];
-            super::super::combat::glue::combat_animations(&mut zone.world, Some(&mut player), own, &events, |_| true);
+            super::super::combat::glue::combat_animations(&mut zone.world, Some(&mut player), own, &events, |_| true, |_| false);
             assert_eq!(player.swing_role(), Some(&Role::Clip(canim::anim_name(expected).unwrap().0.into())));
         }
     }
@@ -6355,9 +6355,12 @@ mod variant_tests {
         zone.world.wield.remove(&player);
         zone.world.arms = Default::default();
         let events = [super::super::combat::state::CombatEvent::Miss { attacker: player, target: leet, slot: 6 }];
-        super::super::combat::glue::combat_animations(&mut zone.world, None, -1, &events, |_| false);
+        super::super::combat::glue::combat_animations(&mut zone.world, None, -1, &events, |_| false, |_| false);
         let node = zone.world.chars[&player].actions.last().unwrap();
         assert_eq!((node.id, node.priority, node.key), (0x3e, -2, None));
+        zone.world.chars.get_mut(&player).unwrap().actions.clear();
+        super::super::combat::glue::combat_animations(&mut zone.world, None, -1, &events, |_| false, |_| true);
+        assert!(zone.world.chars[&player].actions.is_empty(), "10010d83 blocks the social fallback in a vehicle");
     }
 
     #[test]
