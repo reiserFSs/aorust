@@ -13,6 +13,8 @@ use std::path::Path;
 /// `SetMaxItemCount(0x15)` of a container view (docs/gui.md §11.5) and the `item_position_map` loop of `FUN_100cc2ca` (`n % 3`, `n / 3`, `n < 0x15`).
 const SLOTS: usize = 0x15;
 const COLUMNS: usize = 3;
+/// InventoryView vtable 101bd854 +0x80 -> 100c9ada: Point(167,167), inclusive extent.
+const BANK_CLIENT: (u32, u32) = (168, 168);
 const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
 
 struct Loot {
@@ -27,6 +29,7 @@ struct Loot {
     entries: Vec<InventoryEntry>,
     /// GUI 0x100cdb3a: bank 0x66; ordinary chest 0x15.
     slots: usize,
+    layout: (usize, f32),
     /// The cell of the last short click and when (`Interact::now`), for the double click.
     clicked: Option<(usize, f32)>,
     tip: Option<(usize, bool, String)>,
@@ -82,22 +85,22 @@ fn canvas_size_for(slots: usize) -> (u32, u32) {
 fn canvas_size() -> (u32, u32) { canvas_size_for(SLOTS) }
 
 /// Top-left corner of the 54 px slot art of cell `n` (the art is centred on the 48 px cell, as in the inventory window).
-fn slot_origin(n: usize) -> (f32, f32) {
-    let (x, y) = cell_origin(n % COLUMNS, n / COLUMNS, gap());
+fn slot_origin(n: usize, (cols, horizontal_gap): (usize, f32)) -> (f32, f32) {
+    let (x, y) = cell_origin(n % cols, n / cols, (horizontal_gap, SPACING));
     let o = (SLOT - CELL - 1.0) / 2.0;
     (x - o, y - o)
 }
 
 /// The cell under the canvas position.
-fn cell_at_for(x: f32, y: f32, slots: usize) -> Option<usize> {
+fn cell_at_for(x: f32, y: f32, slots: usize, (cols, horizontal_gap): (usize, f32)) -> Option<usize> {
     (0..slots).find(|&n| {
-        let (ox, oy) = cell_origin(n % COLUMNS, n / COLUMNS, gap());
+        let (ox, oy) = cell_origin(n % cols, n / cols, (horizontal_gap, SPACING));
         x >= ox && x < ox + CELL + 1.0 && y >= oy && y < oy + CELL + 1.0
     })
 }
 
 #[cfg(test)]
-fn cell_at(x: f32, y: f32) -> Option<usize> { cell_at_for(x, y, SLOTS) }
+fn cell_at(x: f32, y: f32) -> Option<usize> { cell_at_for(x, y, SLOTS, (COLUMNS, SPACING)) }
 
 impl LootUi {
     pub(super) fn configure_escape(&mut self, values: &super::dvalue::DValues) {
@@ -195,15 +198,19 @@ impl LootUi {
                 let xml = if container.kind == 0xdeaa {
                     // GUI100cdb3a: contracts force name-sorted list mode, max100.
                     format!("<root><MultiListView name=\"contracts\" feature_flags=\"64\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point({w},{})\" max_size=\"Point(16000,16000)\"/></root>", canvas_size_for(SLOTS).1)
-                } else if matches!(container.kind, 0xdead | 0xdeae) {
+                } else if container.kind == 0xdead {
+                    format!("<root><ScrollView name=\"scrollview\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point(60,60)\" max_size=\"Point(2902,2902)\"><ScrollViewChild name=\"bank_client\" view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></ScrollViewChild></ScrollView></root>")
+                } else if container.kind == 0xdeae {
                     format!("<root><ScrollView name=\"scrollview\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point({w},1)\" max_size=\"Point(16000,16000)\"><ScrollViewChild view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></ScrollViewChild></ScrollView></root>")
                 } else {
                     format!("<root><View view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></View></root>")
                 };
-                // [UNRESOLVED guess] bank's saved InventoryView frame is not loaded here:
-                // reuse the existing three-column viewport until bank config persistence is ported.
-                // Searched GUI 0x100cc2ca/0x100cdb3a and shipped CharPrefs.xml; capacity, not initial viewport, is fixed by code.
-                let size = if matches!(container.kind, 0xdead | 0xdeae) { WindowSize::Fixed(w, canvas_size_for(SLOTS).1) } else { WindowSize::Preferred };
+                // GetDefaultSize100c9ada is independent of ItemContainerView's 102-cell capacity.
+                let size = if container.kind == 0xdead {
+                    WindowSize::Fixed(BANK_CLIENT.0, BANK_CLIENT.1)
+                } else if container.kind == 0xdeae {
+                    WindowSize::Fixed(w, canvas_size_for(SLOTS).1)
+                } else { WindowSize::Preferred };
                 let Ok(window) = gui.open_tabbed_window_xml("LootView", title, &xml, (0, 0), size) else { return };
                 let (ow, oh) = gui.outer_size(window);
                 // `Window::MoveToCenter` is the default of a window without a saved frame (`container_position` is not stored)
@@ -217,7 +224,7 @@ impl LootUi {
                 // GUI 100cc2ca: owned Chest_t uses esc_backpacks, world Chest_t esc_chests, Corpse_t esc_corpses.
                 let policy = self.escape_options.unwrap_or([true; 3]);
                 let escape = match container.kind { 0xc749 => policy[usize::from(!owned)], 0xc76a => policy[2], _ => false };
-                self.open.push(Loot { window, escape, owned, container, word: u.word, slots, entries: vec![], clicked: None, tip: None });
+                self.open.push(Loot { window, escape, owned, container, word: u.word, slots, layout: (COLUMNS, SPACING), entries: vec![], clicked: None, tip: None });
                 self.open.len() - 1
             }
             None => return,
@@ -240,10 +247,21 @@ impl LootUi {
             }
             return;
         }
+        if self.open[at].container.kind == 0xdead {
+            let window = self.open[at].window;
+            if let Some(viewport) = gui.view_rect(window, "bank_client") {
+                let (cols, horizontal_gap) = super::hud_stats::inv_grid::columns(viewport.width());
+                self.open[at].layout = (cols, horizontal_gap);
+                let rows = self.open[at].slots.div_ceil(cols);
+                let height = 2.0 * BORDER + rows as f32 * (CELL + 1.0) + (rows - 1) as f32 * SPACING;
+                let width = viewport.width() + 1.0;
+                gui.set_view_pref_size(window, "grid", (width, height), (width, height));
+            }
+        }
         let slot_gfx = gui.gfx_id(SLOT_GFX).map(ao_gui::GfxId);
         let (mut cmds, mut tips) = (vec![], vec![]);
         for n in 0..self.open[at].slots {
-            let (x, y) = slot_origin(n);
+            let (x, y) = slot_origin(n, self.open[at].layout);
             if let Some(g) = slot_gfx {
                 cmds.push(CanvasItem::Image { id: g, src: [0.0, 0.0, SLOT, SLOT], dst: [x, y, x + SLOT, y + SLOT], alpha: 1.0 });
             }
@@ -270,7 +288,7 @@ impl LootUi {
                 continue;
             }
             let cell = gui.view_rect(loot.window, "grid").filter(|r| gui.window_visible(loot.window) && x >= r.l && x < r.r && y >= r.t && y < r.b)
-                .and_then(|r| cell_at_for(x - r.l, y - r.t, loot.slots));
+                .and_then(|r| cell_at_for(x - r.l, y - r.t, loot.slots, loot.layout));
             let Some((cell, entry)) = cell.and_then(|cell| loot.entries.get(cell).copied().map(|e| (cell, e))) else {
                 self.open[at].tip = None;
                 continue;
@@ -283,7 +301,7 @@ impl LootUi {
                     Err(error) => { eprintln!("container tooltip: {error:#}"); String::new() }
                 }
             } else { String::new() };
-            let origin = slot_origin(cell);
+            let origin = slot_origin(cell, loot.layout);
             let tip = gui.canvas_tips(loot.window, "grid").iter().position(|t| t.rect[0] == origin.0 && t.rect[1] == origin.1);
             gui.set_canvas_tip_body(loot.window, "grid", tip, &body);
             self.open[at].tip = Some((cell, descriptions, body));
@@ -310,7 +328,8 @@ impl LootUi {
     #[cfg(test)]
     pub fn take(&mut self, gui: &mut Gui, n: usize, now: f32) -> Option<Identity> {
         let window = self.open.first()?.window;
-        let (x, y) = cell_origin(n % 3, n / 3, gap());
+        let l = self.open.first()?;
+        let (x, y) = cell_origin(n % l.layout.0, n / l.layout.0, (l.layout.1, SPACING));
         let click = Event::CanvasClick { window, view: "grid".into(), x: x + 2.0, y: y + 2.0 };
         self.event(gui, &click, now);
         self.event(gui, &click, now + 0.1).flatten()
@@ -320,6 +339,12 @@ impl LootUi {
     /// time (`FUN_100ca1e7` -> `MoveItemToInventory(item)`): the item to take.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, now: f32) -> Option<Option<Identity>> {
         match ev {
+            Event::WindowFrame { window } => {
+                let at = self.open.iter().position(|l| l.window == *window && l.container.kind == 0xdead)?;
+                self.open[at].tip = None;
+                self.draw(gui, at);
+                Some(None)
+            }
             Event::MultiMouse { window, view, id, button, clicks, .. } if view == "contracts" => {
                 let Some(id) = *id else { return Some(None) };
                 let loot = self.open.iter().find(|l| l.window == *window)?;
@@ -335,7 +360,7 @@ impl LootUi {
             Event::Escape { window } if self.open.iter().any(|l| l.window == *window && !l.escape) => Some(None),
             Event::CanvasPress { window, view, x, y, button, .. } if view == "grid" => {
                 let l = self.open.iter_mut().find(|l| l.window == *window)?;
-                let Some(n) = cell_at_for(*x, *y, l.slots).filter(|&n| n < l.entries.len()) else { return Some(None) };
+                let Some(n) = cell_at_for(*x, *y, l.slots, l.layout).filter(|&n| n < l.entries.len()) else { return Some(None) };
                 let item = l.item_identity(&l.entries[n]);
                 if *button == ao_gui::MouseButton::Left && self.info_click {
                     l.clicked = None;
@@ -388,7 +413,7 @@ impl LootUi {
             Event::CanvasClick { window, view, x, y } if view == "grid" => {
                 let l = self.open.iter_mut().find(|l| l.window == *window)?;
                 if self.info_click { return Some(None); }
-                let Some(n) = cell_at_for(*x, *y, l.slots).filter(|&n| n < l.entries.len()) else { return Some(None) };
+                let Some(n) = cell_at_for(*x, *y, l.slots, l.layout).filter(|&n| n < l.entries.len()) else { return Some(None) };
                 let double = l.clicked.is_some_and(|(c, t)| c == n && now - t <= ao_gui::DOUBLE_CLICK_TIME);
                 l.clicked = if double { None } else { Some((n, now)) };
                 Some(double.then(|| l.item_identity(&l.entries[n])))
@@ -555,6 +580,18 @@ mod tests {
         assert_eq!(ui.open[0].slots, 102);
         assert_eq!(ui.take(&mut gui, 0, 1.0), Some(Identity { kind: 0x69, instance: 101 }));
         let w = ui.open[0].window;
+        assert_eq!(gui.window_size(w), BANK_CLIENT, "GetDefaultSize, not a guessed 3×7 viewport");
+        let viewport = gui.view_rect(w, "bank_client").unwrap();
+        assert_eq!(ui.open[0].layout, super::super::hud_stats::inv_grid::columns(viewport.width()));
+        assert_eq!(ui.open[0].layout.0, 2);
+        assert_eq!(gui.gfx().size(gui.gfx().id(SLOT_GFX).unwrap()), (54, 54));
+        let old_layout = ui.open[0].layout;
+        gui.set_window_outer_frame(w, (20, 20, 350, 300));
+        ui.event(&mut gui, &Event::WindowFrame { window: w }, 1.5);
+        assert!(ui.open[0].layout.0 > old_layout.0);
+        let layout = ui.open[0].layout;
+        let (x, y) = cell_origin(101 % layout.0, 101 / layout.0, (layout.1, SPACING));
+        assert_eq!(cell_at_for(x + 1.0, y + 1.0, 102, layout), Some(101));
         ui.event(&mut gui, &Event::Escape { window: w }, 2.0);
         assert!(ui.is_open(c), "bank is not registered with the Esc handler");
         ui.close_bank(&mut gui);
