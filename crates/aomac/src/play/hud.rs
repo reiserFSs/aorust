@@ -1073,7 +1073,7 @@ impl Hud {
             s.update(gui, _dt, &self.actions.list, &changes, locked, timers);
             s.update_tooltip(gui, zone, &self.stats, long_tips);
         }
-        self.actwin.update(gui, &self.actions.list, _dt, timers.0);
+        self.actwin.update(gui, &self.actions.list, _dt, timers);
         let descriptions = self.dvalues.flag("ItemDescriptionTooltips");
         self.nano.update_item_tooltip(gui, zone, &self.stats, descriptions);
         self.actwin.update_item_tooltip(gui, zone, &self.stats, descriptions);

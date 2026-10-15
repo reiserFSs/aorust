@@ -49,8 +49,8 @@ pub(super) struct HudActionWin {
     win: Option<ListWindow>,
     /// `(name, icon)` of the action templates shown so far (the textures are made once).
     cache: HashMap<u32, hud_bar::Slot>,
-    /// What the grid was built from: per cell `(template, fade bits)`.
-    built: Option<Vec<(u32, u32)>>,
+    /// What the grid was built from: per cell `(template, fade bits, timer seconds)`.
+    built: Option<Vec<(u32, u32, i32)>>,
     press: Option<Press>,
     drag: Option<Drag>,
     mouse: (f32, f32),
@@ -121,8 +121,8 @@ impl HudActionWin {
         self.cache.get(&instance)
     }
 
-    /// Per frame: the hold timer and the grid (entries in list order, the recharge overlay of each). `timers` = `IconTimers`.
-    pub(super) fn update(&mut self, gui: &mut Gui, list: &SpecialList, dt: f32, timers: bool) {
+    /// Per frame: the hold timer and grid; `timers` = (`IconTimers`, `IconTimerText`).
+    pub(super) fn update(&mut self, gui: &mut Gui, list: &SpecialList, dt: f32, timers: (bool, bool)) {
         let mouse = self.mouse;
         if let Some(p) = &mut self.press {
             p.held += dt;
@@ -135,31 +135,36 @@ impl HudActionWin {
         if self.win.is_none() {
             return;
         }
-        let shown: Vec<(u32, u32, f32)> = list
+        let shown: Vec<(u32, f32, i32)> = list
             .entries()
             .iter()
             .filter_map(|e| e.template().map(|t| (t, e.shown)))
             .take(CELLS)
             .map(|(t, a)| {
-                let p = list.progress(a).map_or(-1.0, |(p, _)| if timers { p } else { 1.0 });
-                (t, a, p)
+                let progress = list.progress(a);
+                let p = progress.filter(|_| timers.0).map_or(-1.0, |(p, _)| p);
+                let seconds = progress.filter(|_| timers.1).map_or(-1, |(_, seconds)| seconds);
+                (t, p, seconds)
             })
             .collect();
-        let sig: Vec<(u32, u32)> = shown.iter().map(|&(t, _, p)| (t, p.to_bits())).collect();
+        let sig: Vec<(u32, u32, i32)> = shown.iter().map(|&(t, p, seconds)| (t, p.to_bits(), seconds)).collect();
         if self.built.as_ref() == Some(&sig) {
             return;
         }
         let mut rows = vec![];
         let mut fades = vec![];
-        for &(t, _, p) in &shown {
+        let mut labels = vec![];
+        for &(t, p, seconds) in &shown {
             let Some(s) = self.slot(gui, t) else { continue };
             rows.push(Row { key: t as i32, icon: s.icon, cells: vec![], tip_title: s.name.clone(), tip_body: String::new() });
+            if seconds >= 0 { labels.push((t as i32, super::hud_special::timer_text(seconds))); }
             if p >= 0.0 {
                 fades.push((t as i32, p));
             }
         }
         let win = self.win.as_mut().expect("open");
         win.view.set_fades(fades);
+        win.view.set_icon_labels(labels);
         win.view.set_rows(rows);
         win.view.paint(gui, win.win, lv::ICON_32);
         self.built = Some(sig);
@@ -277,5 +282,30 @@ mod tests {
                 assert!(actions.press.is_none());
             }
         }
+    }
+
+    #[test]
+    fn action_recharge_labels_follow_text_setting_independently_of_fader() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut rollup = Rollup::new(&dir, (1280, 800));
+        let mut actions = HudActionWin::new(&dir, (1280, 800));
+        actions.open(&mut gui, &mut rollup);
+        let mut list = SpecialList::new();
+        list.sync_equipment(&[(0x800, -1)], 0);
+        list.feed_recharge(0x94, 30, 0);
+        actions.update(&mut gui, &list, 0.0, (false, true));
+        let window = actions.win.as_ref().unwrap().win;
+        let cell = actions.shown().iter().position(|id| *id == 0x14123).unwrap();
+        let label = format!("lv_icon_label{cell}");
+        assert_eq!(gui.text(window, &label), super::super::hud_special::timer_text(30));
+        let (x, y) = actions.cell_centre(&gui, cell).unwrap();
+        let frame = gui.view_rect(window, &label).unwrap();
+        assert!((frame.l + frame.r - 2.0 * x + 1.0).abs() <= 1.0);
+        assert!((frame.t + frame.b - 2.0 * y + 1.0).abs() <= 1.0);
+        actions.update(&mut gui, &list, 0.0, (true, false));
+        assert!(gui.text(window, &label).is_empty());
+        actions.close(&mut gui, &mut rollup);
     }
 }

@@ -89,6 +89,7 @@ pub(super) struct ListView {
     dirty: bool,
     painted_selection: Option<i32>,
     item_tip: Option<(i32, bool, String)>,
+    icon_labels: Option<Vec<(i32, String)>>,
 }
 
 /// Columns of a grid that fits `client_w` px: `n` icons and `n - 1` spacings between the borders (`RecalcCellCount`
@@ -129,7 +130,7 @@ pub(super) fn scroll_xml(min_h: f32, w: f32) -> String {
 
 impl ListView {
     pub fn new(mode: Mode, columns: Vec<Column>, cols: usize, min_rows: usize, sort: (u32, bool)) -> Self {
-        Self { mode, columns, cols, min_rows, spacing: SPACING, icon_height: None, selected: None, sort, rows: vec![], order: vec![], last_click: None, fades: vec![], painted: None, dirty: true, painted_selection: None, item_tip: None }
+        Self { mode, columns, cols, min_rows, spacing: SPACING, icon_height: None, selected: None, sort, rows: vec![], order: vec![], last_click: None, fades: vec![], painted: None, dirty: true, painted_selection: None, item_tip: None, icon_labels: None }
     }
 
     #[cfg(test)]
@@ -171,6 +172,15 @@ impl ListView {
         if self.fades != fades {
             self.dirty = true;
             self.fades = fades;
+        }
+    }
+
+    /// Optional native ItemIconView timer text, above the icon fader (GUI 1003f2ea).
+    pub fn set_icon_labels(&mut self, labels: Vec<(i32, String)>) {
+        if self.icon_labels.as_ref() != Some(&labels) {
+            if self.icon_labels.is_none() { self.painted = None; }
+            self.icon_labels = Some(labels);
+            self.dirty = true;
         }
     }
 
@@ -241,7 +251,29 @@ impl ListView {
         let ih = self.icon_height.unwrap_or(icon);
         let (cw, ch) = (2.0 * BORDER + self.cols as f32 * icon + (self.cols as f32 - 1.0) * self.spacing, 2.0 * BORDER + rows as f32 * ih + (rows as f32 - 1.0) * self.spacing);
         if rebuild {
-            let xml = format!("<root><CanvasView name=\"grid\" min_size=\"Point({cw},{ch})\" max_size=\"Point({cw},{ch})\"/></root>");
+            let mut xml = if self.icon_labels.is_some() {
+                format!("<root><View view_layout=\"stacked\" min_size=\"Point({cw},{ch})\" max_size=\"Point({cw},{ch})\"><CanvasView name=\"grid\" min_size=\"Point({cw},{ch})\" max_size=\"Point({cw},{ch})\"/>")
+            } else {
+                format!("<root><CanvasView name=\"grid\" min_size=\"Point({cw},{ch})\" max_size=\"Point({cw},{ch})\"/></root>")
+            };
+            if self.icon_labels.is_some() {
+                let th = gui.font_height(ao_gui::FontId::Bold) as f32 - 1.0;
+                xml += &format!("<View view_layout=\"vertical\" h_alignment=\"left\" v_alignment=\"top\"><View min_size=\"Point(0,{})\" max_size=\"Point(0,{})\"/>", BORDER - 1.0, BORDER - 1.0);
+                for row in 0..rows {
+                    if row != 0 {
+                        xml += &format!("<View min_size=\"Point(0,{gap})\" max_size=\"Point(0,{gap})\"/>", gap = self.spacing - 1.0);
+                    }
+                    xml += &format!("<View view_layout=\"horizontal\" h_alignment=\"left\" min_size=\"Point(0,{h})\" max_size=\"Point({cw},{h})\"><View min_size=\"Point({border},0)\" max_size=\"Point({border},0)\"/>", h = ih - 1.0, border = BORDER - 1.0);
+                    for col in 0..self.cols {
+                        if col != 0 {
+                            xml += &format!("<View min_size=\"Point({gap},0)\" max_size=\"Point({gap},0)\"/>", gap = self.spacing - 1.0);
+                        }
+                        xml += &format!("<View view_layout=\"vertical\" v_alignment=\"center\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"><TextView name=\"lv_icon_label{i}\" value=\"\" font=\"BOLD\" color=\"0xffff00\" h_alignment=\"center\" min_size=\"Point(0,{th})\" max_size=\"Point({w},{th})\"/></View>", w = icon - 1.0, h = ih - 1.0, i = row * self.cols + col);
+                    }
+                    xml += "</View>";
+                }
+                xml += "</View></View></root>";
+            }
             if let Err(e) = gui.add_view_xml(w, "lv_content", "Grid", &xml) {
                 eprintln!("hud: list grid: {e:#}");
                 return;
@@ -277,6 +309,12 @@ impl ListView {
         }
         gui.set_canvas(w, "grid", items);
         gui.set_canvas_tips(w, "grid", tips);
+        if let Some(labels) = &self.icon_labels {
+            for i in 0..cells {
+                let text = self.order.get(i).and_then(|key| labels.iter().find(|(k, _)| k == key)).map_or("", |(_, text)| text.as_str());
+                gui.set_text(w, &format!("lv_icon_label{i}"), text);
+            }
+        }
     }
 
     fn paint_list(&self, gui: &mut Gui, w: WindowId, rebuild: bool) {
