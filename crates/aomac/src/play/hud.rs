@@ -1306,7 +1306,7 @@ impl Hud {
             self.help_urls.push(url.clone());
             return true;
         }
-        if self.map.event(gui, ev, zone) {
+        if self.map.event(gui, ev, zone, self.size) {
             for k in self.map.take_closed() {
                 self.close_kind(gui, k);
             }

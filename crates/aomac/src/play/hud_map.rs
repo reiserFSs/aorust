@@ -28,8 +28,9 @@ const PLANET_POS: (i32, i32) = (100, 100);
 const PF_SIZE: (u32, u32) = (179, 199);
 // First-time placement: `DockableView_c::LoadConfig` (`FUN_10038c98`, GUI 0x10038c98, called by the ctor with `"RollupArea"`) docks the view into the named dock via
 // `FUN_1003a26f` (dock lookup by name) when it exists; the centred screen rect it computes is only the fallback of a newly created dock. So the map is a rollup page.
-/// Height of the button row (the 27 px `GFX_GUI_PLANETMAP_*` buttons).
-const BUTTONS_H: u32 = 27;
+/// Two native HLayout rows of 27px buttons (`PlanetMapView_c`0x1004d26a).
+const BUTTONS_H: u32 = 54;
+const MENU_PLANET_BUTTONS: u32 = 0x7700;
 /// Longest side of the playfield map image.
 const PF_MAX_PX: u32 = 2048;
 /// Screen pixels per terrain cell: `MapData_c::FUN_10042996` sets the content rect to `cells * pt - 1` (`pt` = 4 `_DAT_101b0840` when its first argument, `+8`, is set, else
@@ -111,6 +112,7 @@ pub(super) struct HudMap {
     texts: Option<TextDb>,
     planet: Option<Planet>,
     pf: Option<Pf>,
+    planet_buttons: bool,
     closed: Vec<WindowKind>,
     /// The ground image of the loaded playfield, built by the world loader from the scene it just decoded (`Report::ground`, [`ground_map`]); the
     /// `Option` is the terrain cell size in metres (`None`: a dungeon, rooms lit by exploration).
@@ -132,7 +134,7 @@ fn canvas_xml(name: &str, size: (u32, u32)) -> String {
 
 impl HudMap {
     pub(super) fn new(client: &std::path::Path) -> Self {
-        HudMap { client: client.to_path_buf(), texts: TextDb::load(client).ok(), planet: None, pf: None, closed: vec![], ground_in: None, mission: None }
+        HudMap { client: client.to_path_buf(), texts: TextDb::load(client).ok(), planet: None, pf: None, planet_buttons: false, closed: vec![], ground_in: None, mission: None }
     }
 
     /// The loader's ground image of playfield `pf` (replaces the one of an earlier playfield).
@@ -174,6 +176,8 @@ impl HudMap {
                 );
                 match gui.open_tabbed_window_xml("PlanetMapView", PLANET_TITLE, &xml, PLANET_POS, WindowSize::Fixed(PLANET_SIZE.0, PLANET_SIZE.1)) {
                     Ok(window) => {
+                        gui.set_window_context(window, true);
+                        gui.set_visible(window, "buttons", self.planet_buttons);
                         set_button_tips(gui, window, self.texts.as_ref());
                         let (w, h) = gui.canvas_size(window, "map");
                         self.planet = Some(Planet { window, map: None, tried: None, level: 0, center: [w as f32 / 2.0, h as f32 / 2.0], followed: None, tiles: HashMap::new(), pressed: None, hold: false })
@@ -218,9 +222,25 @@ impl HudMap {
         self.close(gui, rollup, WindowKind::Map);
     }
 
-    pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, _zone: &Zone) -> bool {
+    fn toggle_planet_buttons(&mut self, gui: &mut Gui) {
+        self.planet_buttons = !self.planet_buttons;
+        if let Some(p) = &self.planet {
+            gui.set_visible(p.window, "buttons", self.planet_buttons);
+            set_button_tips(gui, p.window, self.texts.as_ref());
+        }
+    }
+
+    pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, _zone: &Zone, screen: (u32, u32)) -> bool {
+        if matches!(ev, Event::MenuPicked { id: MENU_PLANET_BUTTONS }) {
+            self.toggle_planet_buttons(gui);
+            return true;
+        }
         if let Some(p) = self.planet.as_mut() {
             match ev {
+                Event::FrameIcon { window, x, y } if *window == p.window => {
+                    gui.open_menu((*x, *y), (screen.0 as i32, screen.1 as i32), vec![ao_gui::MenuItem::check(MENU_PLANET_BUTTONS, "Show buttons", self.planet_buttons)]);
+                    return true;
+                }
                 Event::WindowFrame { window } if *window == p.window => {
                     set_button_tips(gui, p.window, self.texts.as_ref());
                 }
@@ -367,7 +387,7 @@ impl HudMap {
             items.push(CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [x.floor(), y.floor(), x.floor() + w as f32, y.floor() + h as f32], alpha: 1.0 });
         }
         gui.set_canvas(p.window, "map", items);
-        // button row: ZoomIn/ZoomOut left, Character/Quest right; the unusable ones are not drawn enabled
+        // Each pair sits between equal flexible spacers in its own HLayout row.
         let levels = map.index.levels.len();
         let mut row = Vec::new();
         for (i, (name, gfx, gfx_pressed, _)) in BUTTONS.iter().enumerate() {
@@ -381,7 +401,8 @@ impl HudMap {
             let Some(g) = gui.gfx().id(if down { gfx_pressed } else { gfx }) else { continue };
             let (w, h) = gui.gfx().size(g);
             let (x, _) = button_rect(i, gui.canvas_size(p.window, "buttons").0 as f32);
-            row.push(CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [x, 0.0, x + w as f32, h as f32], alpha: if enabled { 1.0 } else { 0.4 } });
+            let y = (i / 2) as f32 * 27.0;
+            row.push(CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [x, y, x + w as f32, y + h as f32], alpha: if enabled { 1.0 } else { 0.4 } });
         }
         gui.set_canvas(p.window, "buttons", row);
     }
@@ -485,20 +506,15 @@ impl HudMap {
 }
 
 fn button_rect(i: usize, width: f32) -> (f32, f32) {
-    // zoom buttons on the left, the two centre buttons on the right edge (the original's two HLayout rows)
-    let (w, gap) = (27.0, 2.0);
-    if i < 2 {
-        (gap + i as f32 * (w + gap), w)
-    } else {
-        (width - (4 - i) as f32 * (w + gap), w)
-    }
+    (width / 2.0 - 27.0 + (i % 2) as f32 * 27.0, 27.0)
 }
 fn set_button_tips(gui: &mut Gui, window: WindowId, texts: Option<&TextDb>) {
     let width = gui.canvas_size(window, "buttons").0 as f32;
     let tips = BUTTONS.iter().enumerate().filter_map(|(i, b)| {
         let title = texts?.by_key(ao_formats::screens::CAT_GUI, b.3)?;
         let (left, width) = button_rect(i, width);
-        Some(CanvasTip { rect: [left, 0.0, left + width, BUTTONS_H as f32], title, body: String::new() })
+        let top = (i / 2) as f32 * 27.0;
+        Some(CanvasTip { rect: [left, top, left + width, top + 27.0], title, body: String::new() })
     }).collect();
     gui.set_canvas_tips(window, "buttons", tips);
 }
@@ -507,7 +523,8 @@ fn set_button_tips(gui: &mut Gui, window: WindowId, texts: Option<&TextDb>) {
 fn button_index_at(x: f32, y: f32, width: f32) -> Option<usize> {
     (0..BUTTONS.len()).find(|&i| {
         let (l, w) = button_rect(i, width);
-        x >= l && x < l + w && y >= 0.0 && y < BUTTONS_H as f32
+        let top = (i / 2) as f32 * 27.0;
+        x >= l && x < l + w && y >= top && y < top + 27.0
     })
 }
 
@@ -627,6 +644,8 @@ mod tests {
         let mut rollup = Rollup::new(&dir, (1280, 800));
         let mut maps = HudMap::new(&dir);
         maps.open(&mut gui, &mut rollup, WindowKind::PlanetMap);
+        assert!(!maps.planet_buttons, "native ShowButtons defaults false");
+        maps.toggle_planet_buttons(&mut gui);
         let window = maps.planet.as_ref().unwrap().window;
         gui.set_window_preferred_size_limits(window, true);
         let before = gui.canvas_size(window, "map");
@@ -637,7 +656,7 @@ mod tests {
         for width in [300.0, 500.0] {
             for i in 0..4 {
                 let (left, size) = button_rect(i, width);
-                assert_eq!(button_index_at(left + size / 2.0, 13.0, width), Some(i));
+                assert_eq!(button_index_at(left + size / 2.0, (i / 2) as f32 * 27.0 + 13.0, width), Some(i));
             }
         }
         gui.resize_window(window, WindowSize::Fixed(100, 100));
@@ -663,7 +682,7 @@ mod tests {
         }
         fn input(&mut self, ev: InputEvent, _host: &mut Host) {
             for e in self.gui.input(ev) {
-                self.map.event(&mut self.gui, &e, &self.zone);
+                self.map.event(&mut self.gui, &e, &self.zone, (640, 600));
             }
         }
         fn frame(&mut self, dt: f32, _size: (u32, u32), _host: &mut Host) -> DrawList {
@@ -799,6 +818,7 @@ mod tests {
     fn planet_map_follows_the_character_and_zooms() {
         let Some((mut s, mut o)) = shot() else { return };
         s.map.open(&mut s.gui, &mut s.rollup, WindowKind::PlanetMap);
+        s.map.toggle_planet_buttons(&mut s.gui);
         // Newland City, 100 m east of its origin
         own_at(&mut s, 566, [100.0, 0.0, 200.0], 0.0);
         png(&mut s, &mut o, "planet-566-level0");
@@ -809,7 +829,7 @@ mod tests {
         // the zoom-in button (first of the row), then drag the map: the view moves, the follow state is kept until the character moves
         let w = s.map.planet.as_ref().unwrap().window;
         let r = s.gui.view_rect(w, "buttons").unwrap();
-        let (x, y) = (r.l + 2.0 + 13.0, r.t + 13.0);
+        let (x, y) = (r.l + button_rect(0, r.width() + 1.0).0 + 13.0, r.t + 13.0);
         s.input(InputEvent::MouseMove { x, y }, &mut o.host);
         s.input(InputEvent::MouseDown { x, y, button: MouseButton::Left }, &mut o.host);
         s.input(InputEvent::MouseUp { x, y, button: MouseButton::Left }, &mut o.host);
@@ -850,6 +870,7 @@ mod tests {
     fn planet_map_buttons_tooltips_pressed_art_double_click_and_mission() {
         let Some((mut s, mut o)) = shot() else { return };
         s.map.open(&mut s.gui, &mut s.rollup, WindowKind::PlanetMap);
+        s.map.toggle_planet_buttons(&mut s.gui);
         s.gui.set_screen_size(640, 600);
         own_at(&mut s, 566, [100.0, 0.0, 200.0], 0.0);
         png(&mut s, &mut o, "planet-window-title");
@@ -857,7 +878,7 @@ mod tests {
         let br = s.gui.view_rect(w, "buttons").unwrap();
         let on_button = |i: usize| {
             let (l, bw) = button_rect(i, br.width() + 1.0);
-            (br.l + l + bw / 2.0, br.t + 13.0)
+            (br.l + l + bw / 2.0, br.t + (i / 2) as f32 * 27.0 + 13.0)
         };
         // tooltips: texts.mdb 10000 `Click2ZoomEtc` .. `CenterOnMission`, shown after the pointer rests 500 ms
         for (i, text) in [(0, "Click to zoom in or double click left button directly on map."), (1, "Click to zoom out or double click right button directly on map."), (2, "Center view on your character."), (3, "Center view on mission marker.")] {
