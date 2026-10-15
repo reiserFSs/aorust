@@ -47,7 +47,7 @@ impl Species {
             LifeKind::Bird|LifeKind::Rabbit|LifeKind::Fish=>animals::configure(&mut s),
             LifeKind::Butterfly|LifeKind::Fly|LifeKind::Hoverbot|LifeKind::Pollen=>air::configure(&mut s),
             LifeKind::Beetle=>{s.max_speed=0.8;s.max_force=10.;s.mass=0.1;s.brake_distance=0.1;s.falling=true;s.surface_hug=true;s.state=1;s.animation=1;},
-            LifeKind::Cleanerbot=>{s.max_speed=0.6;s.max_force=8.;s.mass=3.;s.brake_distance=0.1;s.falling=true;s.surface_hug=true;s.counter=(s.random()*32767.) as u32%5;s.animation=1;},
+            LifeKind::Cleanerbot=>{s.max_speed=0.6;s.max_force=8.;s.mass=3.;s.brake_distance=0.1;s.falling=true;s.surface_hug=true;s.counter=s.rng.rand()%5;s.animation=1;},
             LifeKind::Trash=>{s.max_speed=3.;s.max_force=14.;s.mass=0.2;s.brake_distance=0.1;},
             LifeKind::TumbleWeed=>{s.max_speed=5.;s.max_force=1.;s.mass=0.5;s.brake_distance=0.1;s.falling=true;},
         }
@@ -214,6 +214,18 @@ mod tests {
         assert_eq!(b.random(), expected.rand() as f32 / 32767.);
         a.rng.reseed(42); // DS1001975e reseeds the same stream through another handle.
         assert_eq!(b.random(), CrtRand::new(42).rand() as f32 / 32767.);
+    }
+    #[test]
+    fn native_constructor_counters_use_integer_crt_draws() {
+        for seed in 0..1024 {
+            for kind in [LifeKind::Bird, LifeKind::Rabbit, LifeKind::Hoverbot, LifeKind::Cleanerbot] {
+                let mut expected = CrtRand::new(seed);
+                let counter = expected.rand() % 5;
+                let mut species = Species::new(kind, 0, Vec3::ZERO, 0, CrtRand::new(seed));
+                assert_eq!(species.counter, counter, "{kind:?}, seed {seed}");
+                assert_eq!(species.rng.rand(), expected.rand(), "one constructor draw");
+            }
+        }
     }
     #[test]
     fn native_support_state_controls_gravity_and_survives_substeps() {

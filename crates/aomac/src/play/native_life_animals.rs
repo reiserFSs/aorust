@@ -19,7 +19,7 @@ pub(super) fn configure(s: &mut Species) {
     s.state = if ground { 2 } else { 0 };
     // Mesh attachment slots40: Bird101174ee, Rabbit1011cea4, Fish10118dcf.
     s.animation = if ground { 0 } else { 1 };
-    s.counter = if s.kind == LifeKind::Fish { 0 } else { (s.random() * 32767.0) as u32 % 5 };
+    s.counter = if s.kind == LifeKind::Fish { 0 } else { s.rng.rand() % 5 };
 }
 
 pub(super) fn steer(s: &mut Species, c: &Context<'_>) -> Steering {

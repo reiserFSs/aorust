@@ -19,7 +19,7 @@ pub(super) fn configure(s: &mut Species) {
         }
         LifeKind::Hoverbot => {
             s.max_speed = 1.6; s.max_force = 10.0; s.mass = 2.0; s.brake_distance = 1.0;
-            s.counter = ((s.random() * 32767.0) as u32) % 5;
+            s.counter = s.rng.rand() % 5;
         }
         _ => unreachable!(),
     }
