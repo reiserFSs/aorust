@@ -26,11 +26,11 @@ use ao_net::n3::knubot::{self, Knubot};
 
 /// Cash (`0x3d`, `N3Msg_GetSkill(0x3d, 2)` in `FUN_100574dc`).
 pub const STAT_CASH: u32 = 0x3d;
-/// ItemContainerView 100cdb3a retains the MultiListView 10136423 default: 32px icons,
-/// ten-pixel gaps and six-pixel borders (CellCountToPreferredSize 101331dc).
-const CELL: f32 = 38.0;
-const ICON: f32 = 32.0;
-const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_32_CLOSED";
+/// ItemContainerView 100cdb3a retains the MultiListView 10136423 default: 48px icons
+/// (+180 = 101b0288 = extent47), ten-pixel gaps and six-pixel borders (101331dc).
+const CELL: f32 = 54.0;
+const ICON: f32 = 48.0;
+const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
 
 /// Columns and rows of the item container (`FUN_100575a1`: `SetViewCellCounts(IPoint((max != 1) + 1, (max + 1) / 2))`).
 pub fn grid(max: i32) -> (u32, u32) {
@@ -117,7 +117,7 @@ impl TradeWin {
         let slot = gui.gfx().id(SLOT_GFX);
         let mut v = vec![];
         for i in 0..(cols * rows) as usize {
-            let (ix, iy) = super::interact_ptrade::grid_icon_origin(i, cols as usize, 10.0);
+            let (ix, iy) = super::hud_stats::inv_grid::cell_origin(i % cols as usize, i / cols as usize, (10.0, 10.0));
             let (x, y) = (ix - 3.0, iy - 3.0);
             if let Some(id) = slot {
                 let (w, h) = gui.gfx().size(id);
@@ -542,15 +542,15 @@ mod tests {
         assert_eq!(grid(2), (2, 1));
         assert_eq!(grid(5), (2, 3));
         assert_eq!(grid(0), (2, 1));
-        assert_eq!(super::super::hud_listview::grid_width(1, ICON), 44.0);
-        assert_eq!(super::super::hud_listview::grid_width(2, ICON), 86.0);
-        assert_eq!(super::super::hud_listview::grid_width(3, ICON), 128.0);
+        assert_eq!(super::super::hud_listview::grid_width(1, ICON), 60.0);
+        assert_eq!(super::super::hud_listview::grid_width(2, ICON), 118.0);
+        assert_eq!(super::super::hud_listview::grid_width(3, ICON), 176.0);
         let window = TradeWin { win: 0, max: 5, items: vec![TradeItem { id: ME, name: String::new(), icon: None }; 5] };
         assert_eq!(window.item_at(6.0, 6.0), Some(0));
-        assert_eq!(window.item_at(48.0, 6.0), Some(1));
-        assert_eq!(window.item_at(6.0, 48.0), Some(2));
-        assert_eq!(window.item_at(42.0, 6.0), None, "slot gap is not an item");
-        assert_eq!(window.item_at(86.0, 6.0), None, "past the fixed two-column grid");
+        assert_eq!(window.item_at(64.0, 6.0), Some(1));
+        assert_eq!(window.item_at(6.0, 64.0), Some(2));
+        assert_eq!(window.item_at(58.0, 6.0), None, "slot gap is not an item");
+        assert_eq!(window.item_at(118.0, 6.0), None, "past the fixed two-column grid");
     }
 
     #[test]

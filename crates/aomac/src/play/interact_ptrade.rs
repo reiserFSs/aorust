@@ -32,10 +32,10 @@ pub const CLIENT: (u32, u32) = (super::hud_rollup::AREA_W, 453);
 pub const RANGE: f32 = 5.0;
 /// The own cash field is sent this long after the last edit: `EventTimer_c::Start(0xf4240, 0, 1)` [GUI 0x100df82d] ([INFERENCE]: microseconds).
 pub const CASH_DELAY: f32 = 1.0;
-/// ItemContainerView 100cdb3a retains MultiListView 10136423's default 32px icons.
-const SLOT: f32 = 38.0;
-pub(super) const ICON: f32 = 32.0;
-const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_32_CLOSED";
+/// ItemContainerView 100cdb3a retains MultiListView 10136423's default 48px icons (+180 = 101b0288 = extent47).
+const SLOT: f32 = 54.0;
+pub(super) const ICON: f32 = 48.0;
+const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
 /// `BitmapView_c::AddBitmap(0x15b)`, `AddBitmap(0xd9)` of `PartnerStatusDock` [GUI 0x100e039a]: index 0 / 1 = not accepted / accepted.
 const STATUS_GFX: [u32; 2] = [0x15b, 0xd9];
 const SCROLLS: [&str; 2] = ["our_items_scroll", "partner_items_scroll"];
@@ -208,21 +208,11 @@ pub struct PTradeUi {
     pub log: Vec<String>,
 }
 
-/// RecalcCellCount 101349f6, using the inherited icon extent rather than inventory's 48px override.
-pub(super) fn grid_columns(width: f32) -> (usize, f32) {
-    let cols = (((width - 1.0).trunc() / (ICON + inv_grid::SPACING)) as usize).max(1);
-    let gap = if cols > 1 { ((width - 2.0 * inv_grid::BORDER - cols as f32 * ICON) / (cols - 1) as f32).floor().max(0.0) } else { inv_grid::SPACING };
-    (cols, gap)
-}
 
-pub(super) fn grid_icon_origin(n: usize, cols: usize, gap: f32) -> (f32, f32) {
-    (inv_grid::BORDER + (n % cols) as f32 * (ICON + gap), inv_grid::BORDER + (n / cols) as f32 * (ICON + inv_grid::SPACING))
-}
-
-/// Native grid slot-art origin (three pixels outside the 32px icon).
+/// Native grid slot-art origin (three pixels outside the 48px icon).
 fn cell(n: usize, width: f32) -> (f32, f32) {
-    let (cols, gap) = grid_columns(width);
-    let (x, y) = grid_icon_origin(n, cols, gap);
+    let (cols, gap) = inv_grid::columns(width - 1.0);
+    let (x, y) = inv_grid::cell_origin(n % cols, n / cols, (gap, inv_grid::SPACING));
     (x - 3.0, y - 3.0)
 }
 
@@ -277,7 +267,7 @@ impl PTrade {
         for (i, (view, list)) in [("our_items", &self.ours), ("partner_items", &self.theirs)].into_iter().enumerate() {
             let (mut cmds, mut tips) = (vec![], vec![]);
             let width = self.dock[i].0 as f32;
-            let (cols, _) = grid_columns(width);
+            let (cols, _) = inv_grid::columns(width - 1.0);
             let visible_rows = ((self.dock[i].1 as f32 - 2.0 * inv_grid::BORDER + inv_grid::SPACING) / (ICON + inv_grid::SPACING)).floor().max(1.0) as usize;
             let rows = list.len().max(1).div_ceil(cols).max(visible_rows);
             let height = super::hud_listview::grid_width(rows, ICON) - 1.0;
@@ -360,7 +350,7 @@ impl PTrade {
             return None;
         }
         let width = self.dock[list].0 as f32;
-        let (cols, gap) = grid_columns(width);
+        let (cols, gap) = inv_grid::columns(width - 1.0);
         let (c, r) = (((x - 3.0).max(0.0) / (ICON + gap)) as usize, ((y - 3.0).max(0.0) / (ICON + inv_grid::SPACING)) as usize);
         let i = r * cols + c;
         let (left, top) = cell(i, width);
@@ -1041,13 +1031,13 @@ pub(super) mod tests {
         p.render(&mut gui, &mut |_, _| None);
         let before = p.dock[0].0;
         let partner_height = p.dock[1].1;
-        assert_eq!(gui.view_rect(p.win, SCROLLS[0]).unwrap().height() + 1.0, 44.0);
+        assert_eq!(gui.view_rect(p.win, SCROLLS[0]).unwrap().height() + 1.0, 60.0);
         let size = gui.window_size(p.win);
         gui.resize_window(p.win, WindowSize::Fixed(size.0 + 200, size.1 + 100));
         p.render(&mut gui, &mut |_, _| None);
         assert!(p.dock[0].0 > before);
         assert!(p.dock[1].1 > partner_height, "partner tray retains the 50-row preferred ceiling");
-        assert_eq!(gui.view_rect(p.win, SCROLLS[0]).unwrap().height() + 1.0, 44.0);
+        assert_eq!(gui.view_rect(p.win, SCROLLS[0]).unwrap().height() + 1.0, 60.0);
         let (x, y) = cell(1, p.dock[0].0 as f32);
         assert_eq!(p.entry_at(0, x + 4.0, y + 4.0), Some(1));
         let r = gui.view_rect(p.win, SCROLLS[0]).unwrap();

@@ -14,7 +14,8 @@ use super::hud::group;
 use super::interact::Interact;
 use super::dvalue::{DValues, Variant, element_xml};
 use super::hud_wincfg::ListCfg;
-use super::interact_ptrade::{grid_columns, grid_icon_origin, ICON};
+use super::hud_stats::inv_grid;
+use super::interact_ptrade::ICON;
 use ao_gui::{CanvasItem, CanvasTip, GfxId, MenuItem};
 use ao_gui::xml::{self, Element};
 use ao_gui::widgets::MultiCell;
@@ -213,10 +214,10 @@ impl Shop {
         self.apply_modes(gui);
     }
 
-    /// Original auto-arranged 32-pixel default grid; tray one-row counts cap preferred height, not wrapping.
+    /// Original auto-arranged 48-pixel default grid; tray one-row counts cap preferred height, not wrapping.
     fn paint_grid(&mut self, gui: &mut Gui, view: &str, rows: &[(i64, Option<GfxId>, String)]) {
         let Some(i) = LISTS.iter().position(|v| *v == view) else { return };
-        let (cols, gap) = grid_columns(self.grid_width);
+        let (cols, gap) = inv_grid::columns(self.grid_width - 1.0);
         let nrows = rows.len().max(1).div_ceil(cols);
         let height = super::hud_listview::grid_width(nrows, ICON) - 1.0;
         let canvas = format!("{view}_grid");
@@ -226,8 +227,8 @@ impl Shop {
         let mut pictures = vec![];
         let mut tips = vec![];
         for (n, (key, icon, title)) in rows.iter().enumerate() {
-            let (x, y) = grid_icon_origin(n, cols, gap);
-            if let Some(id) = gui.gfx_id("GFX_GUI_MULTILISTVIEW_SLOT_32_CLOSED").map(GfxId) {
+            let (x, y) = inv_grid::cell_origin(n % cols, n / cols, (gap, inv_grid::SPACING));
+            if let Some(id) = gui.gfx_id("GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED").map(GfxId) {
                 let (w, h) = gui.gfx().size(id);
                 pictures.push(CanvasItem::Image { id, src: [0.0, 0.0, w as f32, h as f32], dst: [x - 3.0, y - 3.0, x + ICON + 3.0, y + ICON + 3.0], alpha: 1.0 });
             }
@@ -248,9 +249,9 @@ impl Shop {
 
     fn grid_hit(&self, view: &str, x: f32, y: f32) -> Option<(&'static str, i64)> {
         let i = LISTS.iter().position(|v| view == format!("{v}_grid"))?;
-        let (cols, gap) = grid_columns(self.grid_width);
+        let (cols, gap) = inv_grid::columns(self.grid_width - 1.0);
         self.grid_keys[i].iter().enumerate().find_map(|(n, key)| {
-            let (cx, cy) = grid_icon_origin(n, cols, gap);
+            let (cx, cy) = inv_grid::cell_origin(n % cols, n / cols, (gap, inv_grid::SPACING));
             (x >= cx && x < cx + ICON && y >= cy && y < cy + ICON).then_some((LISTS[i], *key))
         })
     }
@@ -823,14 +824,14 @@ mod tests {
         let Some(mut gui) = rig() else { return };
         let mut shop = Shop::open(&mut gui, (1280, 800), MACHINE, "Shop", vec![], true).unwrap();
         let offer = gui.view_rect(shop.win, GRID_SCROLLS[1]).unwrap();
-        assert_eq!(offer.height() + 1.0, 44.0);
+        assert_eq!(offer.height() + 1.0, 60.0);
         let (min, max) = gui.window_preferred_size_limits(shop.win).unwrap();
         assert!(max.0 > CLIENT.0 && max.1 > CLIENT.1);
         let size = gui.window_size(shop.win);
         gui.resize_window(shop.win, WindowSize::Fixed(size.0 + 200, size.1 + 100));
         let wider = gui.view_rect(shop.win, GRID_SCROLLS[1]).unwrap();
         assert!(wider.width() > offer.width());
-        assert_eq!(wider.height() + 1.0, 44.0);
+        assert_eq!(wider.height() + 1.0, 60.0);
         for cfg in &mut shop.configs { cfg.list = Some(true); }
         shop.apply_modes(&mut gui);
         let list_min = gui.window_preferred_size_limits(shop.win).unwrap().0;
