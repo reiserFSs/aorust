@@ -36,6 +36,30 @@ Ported from the decompiled PRK launcher (`MainWindow.DownloadLatestVersion`, `Ht
   - on any view: `--screenshot out.png [--eye x,y,z] [--at x,y,z] [--size WxH]` renders offscreen and exits (defaults: `ao_render::default_view`, 1280x800).
 - Perf (M4 Pro, release, 1280x800 logical = 2560x1600 px window, 4x MSAA, `AOMAC_NOVSYNC=1`, ms/frame; before = old renderer that drew every instance, no culling, treated all non-opaque blends as cutouts): pf 505 spawn view 2.95 -> 2.1-2.5; pf 566 spawn view 1.8 -> 0.85 (wgpu 29) ; pf 505 from 2.5 km up with ~26.6k statels visible 2.3 -> 5.3 (6689 draws; 5.7k of them are per-instance sorted AlphaBlend submeshes, CPU 2.7 ms; with those batched as opaque it is 4.2, so true sorted blending costs ~1 ms per 5.7k instances: producers should prefer AlphaTest for foliage cutouts); pf 566 from 500 m up 1.7 -> 1.9. Spawn-view numbers include scene changes by other slices between measurements. Demo `--count 10000`: 1.5-2.2 ms.
 
+### Shared actor resources
+
+Performance audit item 11: `ao-render/src/actors.rs` interns immutable archive texture uploads across actor
+model keys. Identity includes the native `TextureKey`, decoded source format, dimensions, texture quality,
+compression, better-mip policy and a stdlib content fingerprint of the decoded bytes. `RecordStore` remaps
+canonical type 1010004 to quality families 1010016/1010017 independently of the upload policy; the fingerprint
+prevents those decoded variants aliasing even at equal dimensions. It is a non-cryptographic fingerprint for
+trusted immutable RDB assets, not a collision-proof content-addressed store. Only native bitmap families 1010004/1010006/1010009/1010011/1010021/1010022
+qualify; generated-source textures, type-0 keys and synthetic composite namespaces never share. In particular,
+CAT skin composites use `0x40000000 | id` (`ao-formats/src/character/actor.rs` and `player.rs`) and must remain
+model-local even when their keys collide.
+
+Models own reference-counted texture resources and clone wgpu views into their material bindings. The lookup
+holds weak references only; replacement/removal prunes dead entries, and clearing a zone empties it. A policy
+or source change selects a different upload, including when supplied through `update_actor_model`. No pixel
+data is copied into a permanent GPU cache. `actor_texture_resources()` reports unique model-retained textures
+and estimated encoded mip bytes, not total Metal VRAM; `actor_texture_uploads()` counts actual actor uploads.
+
+Regression coverage: `immutable_actor_textures_share_uploads_pixels_and_reclaim` compares offscreen pixels
+for two models, counts one shared texture upload (white placeholders remain model-local), proves generated
+textures stay independent, checks policy/source variants, and verifies last-owner reclamation and independent
+geometry writes. `actor_texture_identity_excludes_generated_namespaces_and_tracks_upload_policy` covers
+synthetic namespaces and every policy field. These are runnable checks, not benchmark results.
+
 ### Native window move profiling (2026-10-07)
 
 - Before pacing, a real muted `aomac play` login window (PID-owned, exclusive live lock, unlocked screen) was moved by focused HID mouse events over 120×60 logical points and live-resized by 120×80. No account login was needed. Normal login rendering was approximately 4.2–4.7 ms/frame, with 3.5–4.0 ms/frame spent acquiring the surface drawable. One instrumented move-start aggregate reached 8.54 ms/frame, acquisition 7.79 ms, and worst frame-entry gap 169.34 ms; a separate baseline reached 21.56 ms/frame. These are half-second aggregates, not per-frame percentiles.

@@ -1204,6 +1204,8 @@ impl Offscreen {
         let rss = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output();
         let rss_kib = rss.ok().filter(|out| out.status.success()).and_then(|out| String::from_utf8(out.stdout).ok()).and_then(|s| s.trim().parse::<u64>().ok());
         eprintln!("AOMAC_PERF {label} rss_kib={rss_kib:?} instances={} draws={} native_gpu_allocated_bytes={:?} (Metal device allocation, unified memory; not dedicated VRAM)", self.r.stats.instances, self.r.stats.draw_calls, native_gpu_allocated_bytes(&self.r));
+        let (actor_textures, actor_texture_bytes) = self.r.actor_texture_resources();
+        eprintln!("AOMAC_PERF {label} retained_actor_textures={actor_textures} retained_actor_texture_bytes_estimate={actor_texture_bytes} actor_texture_uploads_total={}", self.r.actor_texture_uploads());
         let (creates, bytes) = crate::gpu_stats::perf_snapshot();
         eprintln!("AOMAC_PERF {label} tracked_creates_total={creates} tracked_created_bytes_estimate_total={bytes} (cumulative, not live VRAM)");
         perf.count = 0;

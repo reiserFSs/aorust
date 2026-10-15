@@ -4,6 +4,45 @@
 
 use super::*;
 use ao_scene::ActorFrame;
+use std::sync::{Arc, Weak};
+
+/// Native archive identity plus every input that changes the uploaded bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TextureIdentity {
+    key: TextureKey,
+    source: u8,
+    width: u32,
+    height: u32,
+    quality: i32,
+    compressed: bool,
+    better: bool,
+    content: u64,
+}
+
+impl TextureIdentity {
+    fn new(key: TextureKey, texture: &ao_scene::Texture, policy: native_texture::Policy) -> Self {
+        let mut identity = Self { key, source: texture.source as u8, width: texture.width, height: texture.height,
+            quality: policy.quality, compressed: policy.compressed, better: policy.better, content: 0 };
+        if identity.immutable() {
+            // RecordStore may load 1010016/17 under a canonical 1010004 key.
+            // DisplayOtherTextureQuality is independent of the GPU upload policy.
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::hash::DefaultHasher::new();
+            texture.rgba.hash(&mut hash);
+            identity.content = hash.finish();
+        }
+        identity
+    }
+    fn immutable(self) -> bool {
+        matches!(self.key.rdb_type, 1_010_004 | 1_010_006 | 1_010_009 | 1_010_011 | 1_010_021 | 1_010_022)
+            && self.source != ao_scene::TextureSource::Generated as u8
+    }
+}
+
+struct ActorTexture {
+    view: wgpu::TextureView,
+    bytes: u64,
+}
 
 /// `(mat, pipe, env (mat, pipe))`: see `ModelMesh::submesh_mats`.
 type SubmeshMat = (usize, usize, Option<(usize, usize)>);
@@ -54,6 +93,8 @@ struct Model {
     holo: Option<wgpu::BindGroup>,
     views: Vec<wgpu::TextureView>,
     view_of: HashMap<TextureKey, usize>,
+    textures: Vec<Arc<ActorTexture>>,
+    identities: HashMap<TextureKey, TextureIdentity>,
     topology: Vec<(usize, Vec<ao_scene::Submesh>)>,
 }
 
@@ -81,6 +122,9 @@ struct Item {
 #[derive(Default)]
 pub(crate) struct ActorLayer {
     models: HashMap<u64, Model>,
+    /// Weak lookup only: the last owning model reclaims the GPU allocation.
+    textures: HashMap<TextureIdentity, Weak<ActorTexture>>,
+    texture_uploads: u64,
     actors: HashMap<u32, ActorGpu>,
     frames: Vec<ActorFrame>,
     tick: u64,
@@ -113,6 +157,7 @@ pub(crate) struct ActorLayer {
 impl ActorLayer {
     fn remove_model(&mut self, key: u64) {
         self.models.remove(&key);
+        self.textures.retain(|_, texture| texture.strong_count() != 0);
         self.actors.retain(|_, actor| actor.model != key);
         self.frames.retain(|frame| frame.model != key);
         self.items.retain(|item| item.model != key);
@@ -122,6 +167,35 @@ impl ActorLayer {
 }
 
 impl Renderer {
+    /// Unique retained actor texture allocations and estimated mip bytes (not total device VRAM).
+    pub fn actor_texture_resources(&self) -> (usize, u64) {
+        let mut seen = std::collections::HashSet::new();
+        let mut bytes = 0;
+        for texture in self.act.models.values().flat_map(|model| &model.textures) {
+            if seen.insert(Arc::as_ptr(texture)) { bytes += texture.bytes; }
+        }
+        (seen.len(), bytes)
+    }
+
+    /// Actual actor texture uploads, including generated textures and model placeholders.
+    pub fn actor_texture_uploads(&self) -> u64 { self.act.texture_uploads }
+
+    fn actor_texture(&mut self, identity: TextureIdentity, texture: &ao_scene::Texture) -> Arc<ActorTexture> {
+        if identity.immutable() {
+            if let Some(shared) = self.act.textures.get(&identity).and_then(Weak::upgrade) { return shared; }
+        }
+        let bc = self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        let built = native_texture::build_texture_mips(self.texture_policy, texture.source, bc,
+            &texture.rgba, texture.width, texture.height, false);
+        let shared = Arc::new(ActorTexture {
+            view: self.upload_built_texture(&built),
+            bytes: built.levels.iter().map(|level| level.bytes.len() as u64).sum(),
+        });
+        self.act.texture_uploads += 1;
+        if identity.immutable() { self.act.textures.insert(identity, Arc::downgrade(&shared)); }
+        shared
+    }
+
     /// Uploads a model for [`ActorFrame::model`] `key`: `scene.meshes[0]` is the (skinned) body, the others are rigid parts.
     /// Replaces a model of the same key.
     pub fn add_actor_model(&mut self, key: u64, scene: &Scene) {
@@ -140,7 +214,7 @@ impl Renderer {
     /// the only place bind groups are created.
     pub fn update_actor_model(&mut self, key: u64, scene: &Scene) {
         let eligible = self.act.models.get(&key).is_some_and(|model| {
-            scene.textures.keys().all(|k| model.view_of.contains_key(k))
+            scene.textures.iter().all(|(k, texture)| model.identities.get(k) == Some(&TextureIdentity::new(*k, texture, self.texture_policy)))
                 && model.topology.len() == scene.meshes.len()
                 && model.meshes.len() == scene.meshes.len()
                 && model.topology.iter().zip(&scene.meshes).zip(&model.meshes).all(|(((_, subs), mesh), gpu)| {
@@ -209,15 +283,29 @@ impl Renderer {
 
     fn upload_actor_model(&mut self, key: u64, scene: &Scene, retain_textures: bool) {
         let old = if retain_textures { self.act.models.remove(&key) } else { None };
-        let (mut views, mut view_of) = old.map_or_else(
-            || (vec![self.texture_view(&[255; 4], 1, 1, ao_scene::TextureSource::Generated)], HashMap::new()),
-            |model| (model.views, model.view_of),
-        );
+        let (mut views, mut view_of, mut textures, mut identities) = match old {
+            Some(model) => (model.views, model.view_of, model.textures, model.identities),
+            None => {
+                let white = ao_scene::Texture { source: ao_scene::TextureSource::Generated, width: 1, height: 1, rgba: vec![255; 4] };
+                let identity = TextureIdentity::new(TextureKey { rdb_type: 0, id: 0 }, &white, self.texture_policy);
+                let texture = self.actor_texture(identity, &white);
+                (vec![texture.view.clone()], HashMap::new(), vec![texture], HashMap::new())
+            }
+        };
         for (k, t) in &scene.textures {
-            if view_of.contains_key(k) { continue; }
+            let identity = TextureIdentity::new(*k, t, self.texture_policy);
+            if identities.get(k) == Some(&identity) { continue; }
             if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize {
-                view_of.insert(*k, views.len());
-                views.push(self.texture_view(&t.rgba, t.width, t.height, t.source));
+                let texture = self.actor_texture(identity, t);
+                if let Some(&index) = view_of.get(k) {
+                    views[index] = texture.view.clone();
+                    textures[index] = texture;
+                } else {
+                    view_of.insert(*k, views.len());
+                    views.push(texture.view.clone());
+                    textures.push(texture);
+                }
+                identities.insert(*k, identity);
             }
         }
         let holo = [0x28022, 0x28023].map(|id| view_of.iter().find(|(key, _)| key.id == id).map(|(_, &view)| view));
@@ -301,7 +389,8 @@ impl Renderer {
             meshes.push(Some(ModelMesh { vb, ib, vertex_capacity, index_capacity, nverts: mesh.vertices.len(), draws, submesh_mats, sphere: (c, r) }));
         }
         let topology = scene.meshes.iter().map(|mesh| (mesh.vertices.len(), submesh_shape(&mesh.submeshes))).collect();
-        self.act.models.insert(key, Model { meshes, mats, holo, views, view_of, topology });
+        self.act.models.insert(key, Model { meshes, mats, holo, views, view_of, textures, identities, topology });
+        self.act.textures.retain(|_, texture| texture.strong_count() != 0);
         // actors of a replaced model rebuild their body buffer at the next pose
         for a in self.act.actors.values_mut().filter(|a| a.model == key) {
             a.vb = None;
@@ -318,6 +407,7 @@ impl Renderer {
     /// Forgets every model and actor (a new zone).
     pub fn clear_actors(&mut self) {
         self.act.models.clear();
+        self.act.textures.clear();
         self.act.actors.clear();
         self.act.frames.clear();
     }
@@ -672,6 +762,111 @@ mod tests {
     }
     use super::*;
     #[test]
+    fn immutable_actor_textures_share_uploads_pixels_and_reclaim() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("resource regression requires GPU");
+        let key = TextureKey { rdb_type: 1010004, id: 481 };
+        let mut scene = Scene::default();
+        scene.textures.insert(key, ao_scene::Texture { source: ao_scene::TextureSource::Rgba,
+            width: 2, height: 2, rgba: [213, 77, 31, 255].repeat(4) });
+        scene.meshes.push(ao_scene::Mesh {
+            vertices: [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)].into_iter()
+                .map(|(x, y)| ao_scene::Vertex { pos: [x, y, 0.0], normal: [0.0, 0.0, 1.0], ..Default::default() }).collect(),
+            submeshes: vec![ao_scene::Submesh { two_sided: true, emissive: [1.0; 3],
+                ..ao_scene::Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key)) }],
+        });
+        let capture = |renderer: &mut Renderer, model| {
+            let mut frame = ActorFrame { id: 1, model, ..Default::default() };
+            frame.transform[3][2] = -3.0;
+            renderer.set_actors(vec![frame]);
+            let targets = Targets::new(renderer, 32, 32);
+            let output = renderer.device.create_texture_tracked(&wgpu::TextureDescriptor {
+                label: None, size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                format: renderer.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            renderer.render(&output.create_view_tracked(&Default::default()), &targets,
+                &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+            super::texture_to_rgba(renderer, &output, 32, 32).unwrap()
+        };
+        renderer.add_actor_model(1, &scene);
+        let before = capture(&mut renderer, 1);
+        assert!(before.chunks_exact(4).any(|p| p[0] > 180 && p[1] < 100), "textured quad must actually render");
+        let uploads = renderer.actor_texture_uploads();
+        renderer.add_actor_model(2, &scene);
+        assert_eq!(renderer.actor_texture_uploads(), uploads + 1, "only model-local white placeholder uploads");
+        assert_eq!(renderer.act.models[&1].views[1], renderer.act.models[&2].views[1]);
+        assert_eq!(renderer.actor_texture_resources(), (3, 28), "two white texels plus one shared 2x2 mip chain");
+        assert_eq!(before, capture(&mut renderer, 2), "interning preserves every pixel");
+        assert_ne!(renderer.act.models[&1].meshes[0].as_ref().unwrap().vb, renderer.act.models[&2].meshes[0].as_ref().unwrap().vb);
+        assert_ne!(renderer.act.models[&1].meshes[0].as_ref().unwrap().ib, renderer.act.models[&2].meshes[0].as_ref().unwrap().ib);
+        let mut moved = scene.clone();
+        for vertex in &mut moved.meshes[0].vertices { vertex.pos[0] += 100.0; }
+        renderer.update_actor_model(1, &moved);
+        assert_eq!(before, capture(&mut renderer, 2), "mutable geometry updates must not affect the other model");
+        assert_eq!(renderer.actor_texture_uploads(), uploads + 1, "geometry updates never reupload an identical texture");
+        let shared = Arc::downgrade(&renderer.act.models[&1].textures[1]);
+        renderer.remove_actor_model(1);
+        assert!(shared.upgrade().is_some());
+        renderer.remove_actor_model(2);
+        assert!(shared.upgrade().is_none(), "no strong reference in the lookup cache");
+        assert_eq!(renderer.actor_texture_resources(), (0, 0));
+        assert!(renderer.act.textures.is_empty());
+
+        // Generated bitmaps may reuse archive-looking keys (composited CAT skins).
+        scene.textures.get_mut(&key).unwrap().source = ao_scene::TextureSource::Generated;
+        renderer.add_actor_model(1, &scene);
+        scene.textures.get_mut(&key).unwrap().rgba = [31, 213, 77, 255].repeat(4);
+        renderer.add_actor_model(2, &scene);
+        assert_ne!(renderer.act.models[&1].views[1], renderer.act.models[&2].views[1]);
+        assert_ne!(capture(&mut renderer, 1), capture(&mut renderer, 2));
+
+        scene.textures.get_mut(&key).unwrap().source = ao_scene::TextureSource::Rgba;
+        renderer.add_actor_model(3, &scene);
+        let original = renderer.act.models[&3].views[1].clone();
+        scene.textures.get_mut(&key).unwrap().rgba = [77, 31, 213, 255].repeat(4);
+        renderer.add_actor_model(6, &scene);
+        assert_ne!(original, renderer.act.models[&6].views[1], "same canonical key and dimensions can load different asset families");
+        assert_ne!(capture(&mut renderer, 3), capture(&mut renderer, 6), "different decoded native contents retain their pixels");
+        scene.textures.get_mut(&key).unwrap().rgba = [31, 213, 77, 255].repeat(4);
+        renderer.set_texture_policy(0, false, false);
+        renderer.add_actor_model(4, &scene);
+        assert_ne!(original, renderer.act.models[&4].views[1], "policy variants cannot alias");
+        renderer.update_actor_model(3, &scene);
+        assert_eq!(renderer.act.models[&3].views[1], renderer.act.models[&4].views[1], "updates migrate to the new policy variant");
+        scene.textures.get_mut(&key).unwrap().source = ao_scene::TextureSource::PngRgba;
+        renderer.add_actor_model(5, &scene);
+        assert_ne!(renderer.act.models[&4].views[1], renderer.act.models[&5].views[1], "source format participates in identity");
+        renderer.clear_actors();
+        assert_eq!(renderer.actor_texture_resources(), (0, 0));
+        assert!(renderer.act.textures.is_empty());
+    }
+
+    #[test]
+    fn actor_texture_identity_excludes_generated_namespaces_and_tracks_upload_policy() {
+        let key = TextureKey { rdb_type: 1_010_004, id: 7 };
+        let texture = ao_scene::Texture { width: 4, height: 4, rgba: vec![255; 64], source: ao_scene::TextureSource::Rgba };
+        let policy = native_texture::Policy::default();
+        let identity = TextureIdentity::new(key, &texture, policy);
+        assert!(identity.immutable());
+        for rdb_type in [0, 1, 0x4000_0007] {
+            assert!(!TextureIdentity::new(TextureKey { rdb_type, id: 7 }, &texture, policy).immutable());
+        }
+        for changed in [
+            native_texture::Policy { quality: 0, ..policy },
+            native_texture::Policy { compressed: true, ..policy },
+            native_texture::Policy { better: true, ..policy },
+        ] {
+            assert!(identity != TextureIdentity::new(key, &texture, changed));
+        }
+        let changed = ao_scene::Texture { width: 2, ..texture.clone() };
+        assert!(identity != TextureIdentity::new(key, &changed, policy));
+        let changed = ao_scene::Texture { rgba: vec![127; 64], ..texture.clone() };
+        assert!(identity != TextureIdentity::new(key, &changed, policy), "canonical keys may load different native quality families");
+    }
+
+    #[test]
     fn dynamic_geometry_update_retains_uploaded_texture_views() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut renderer = Renderer::new(&instance, None).expect("resource regression requires GPU");
@@ -940,7 +1135,7 @@ mod tests {
     fn model_removal_keeps_unrelated_actors_and_is_idempotent() {
         let mut layer = ActorLayer::default();
         for (id, model) in [(1, 7), (2, 8), (3, 7)] {
-            layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), topology: vec![] });
+            layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), textures: vec![], identities: HashMap::new(), topology: vec![] });
             layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None });
             layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
             layer.items.push(Item { actor: id, model, mesh: 0, bucket: 0, faded: false, rendering_effect: 0, priority: None });
