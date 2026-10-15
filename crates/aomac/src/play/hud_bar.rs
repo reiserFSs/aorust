@@ -218,20 +218,31 @@ impl ShortcutBar {
                 std::fs::read_to_string(character.join("Containers/ShortcutBar.xml"))
             } else { Err(err) }
         });
-        let Ok(src) = src else { return };
         let result = (|| -> anyhow::Result<()> {
-            let root = ao_gui::xml::parse(&src)?;
-            let map = root.children.iter().find(|e| e.attr("name") == Some("position_map")).ok_or_else(|| anyhow::anyhow!("missing position_map"))?;
-            let ids: Vec<_> = map.children.iter().filter(|e| e.attr("name") == Some("item_id")).collect();
-            let positions: Vec<_> = map.children.iter().filter(|e| e.attr("name") == Some("item_pos")).collect();
-            anyhow::ensure!(ids.len() == positions.len(), "unpaired shortcut positions");
-            let mut entries = Vec::with_capacity(ids.len());
-            for (id, pos) in ids.into_iter().zip(positions) {
-                let [kind, instance] = archive_pair(id.attr("value"), "Identity(")?;
-                let [x, y] = archive_pair(pos.attr("value"), "IPoint(")?;
-                anyhow::ensure!(x < SLOTS as u32 && y < ROWS as u32, "shortcut position outside bar");
-                entries.push((kind, instance, x as usize, y as usize));
-            }
+            let root = match src {
+                Ok(src) => Some(ao_gui::xml::parse(&src)?),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err.into()),
+            };
+            let entries = if let Some(map) = root.as_ref().and_then(|root| root.children.iter().find(|e| e.attr("name") == Some("position_map"))) {
+                let ids: Vec<_> = map.children.iter().filter(|e| e.attr("name") == Some("item_id")).collect();
+                let positions: Vec<_> = map.children.iter().filter(|e| e.attr("name") == Some("item_pos")).collect();
+                anyhow::ensure!(ids.len() == positions.len(), "unpaired shortcut positions");
+                let mut entries = Vec::with_capacity(ids.len());
+                for (id, pos) in ids.into_iter().zip(positions) {
+                    let [kind, instance] = archive_pair(id.attr("value"), "Identity(")?;
+                    let [x, y] = archive_pair(pos.attr("value"), "IPoint(")?;
+                    anyhow::ensure!(x < SLOTS as u32 && y < ROWS as u32, "shortcut position outside bar");
+                    entries.push((kind, instance, x as usize, y as usize));
+                }
+                entries
+            } else {
+                match std::fs::read(character.join("IconPositions.bin")) {
+                    Ok(bytes) => legacy_positions(&bytes)?,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(err) => return Err(err.into()),
+                }
+            };
             let mut nanos = super::hud_nanodb::NanoDb::new(client);
             let macros = super::chat::macros::TextMacros::open();
             self.slots = Default::default();
@@ -247,10 +258,10 @@ impl ShortcutBar {
                 let slot = slot.unwrap_or(Slot { kind, instance, name: String::new(), icon: None, text: String::new() });
                 if y == self.row { self.slots[x] = Some(slot); } else { self.rows[y][x] = Some(slot); }
             }
-            if let Some(primary) = root.children.iter().find(|e| e.attr("name") == Some("IsPrimary")).and_then(|e| e.attr("value")) {
+            if let Some(primary) = root.as_ref().and_then(|root| root.children.iter().find(|e| e.attr("name") == Some("IsPrimary"))).and_then(|e| e.attr("value")) {
                 self.primary = primary == "true";
             }
-            if let Some(row) = root.children.iter().find(|e| e.attr("name") == Some("selected_bar")).and_then(|e| e.attr("value")).and_then(|s| s.parse::<usize>().ok()).filter(|&r| r < ROWS) {
+            if let Some(row) = root.as_ref().and_then(|root| root.children.iter().find(|e| e.attr("name") == Some("selected_bar"))).and_then(|e| e.attr("value")).and_then(|s| s.parse::<usize>().ok()).filter(|&r| r < ROWS) {
                 self.set_row(gui, row);
             }
             self.paint(gui);
@@ -701,6 +712,32 @@ impl ShortcutBar {
     }
 }
 
+/// Native IconPositionSystem_t archive, GUI 1001e53a / 1001e148.
+fn legacy_positions(bytes: &[u8]) -> anyhow::Result<Vec<(u32, u32, usize, usize)>> {
+    let mut words = bytes.chunks_exact(4);
+    anyhow::ensure!(words.remainder().is_empty(), "unaligned IconPositions.bin");
+    let mut next = || -> anyhow::Result<u32> {
+        Ok(u32::from_be_bytes(words.next().ok_or_else(|| anyhow::anyhow!("truncated IconPositions.bin"))?.try_into()?))
+    };
+    anyhow::ensure!(next()? as usize == bytes.len(), "IconPositions.bin size mismatch");
+    let maps = next()? as usize;
+    anyhow::ensure!(maps <= bytes.len().saturating_sub(8) / 16, "invalid icon map count");
+    let mut entries = Vec::new();
+    for _ in 0..maps {
+        let (owner_kind, owner_id, map_type, count) = (next()?, next()?, next()?, next()? as usize);
+        anyhow::ensure!(count <= bytes.len() / 12, "invalid icon position count");
+        for _ in 0..count {
+            let (pos, kind, instance) = (next()?, next()?, next()?);
+            if (owner_kind, owner_id, map_type) == (0, 0, 6) {
+                anyhow::ensure!((pos as usize) < SLOTS * ROWS, "shortcut position outside bar");
+                entries.push((kind, instance, pos as usize % SLOTS, pos as usize / SLOTS));
+            }
+        }
+    }
+    anyhow::ensure!(words.next().is_none(), "trailing IconPositions.bin data");
+    Ok(entries)
+}
+
 fn archive_pair(value: Option<&str>, prefix: &str) -> anyhow::Result<[u32; 2]> {
     let body = value.and_then(|v| v.strip_prefix(prefix)).and_then(|v| v.strip_suffix(')')).ok_or_else(|| anyhow::anyhow!("invalid shortcut value"))?;
     let (a, b) = body.split_once(',').ok_or_else(|| anyhow::anyhow!("invalid shortcut pair"))?;
@@ -715,6 +752,40 @@ pub(super) fn default_count(dvalues: &super::dvalue::DValues) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_shortcut_fallback_defers_to_xml_position_map() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let character = std::env::temp_dir().join(format!("aomac-shortcut-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(character.join("Containers")).unwrap();
+        let words: [u32; 9] = [36, 1, 0, 0, 6, 1, 14, KIND_SPECIAL_ACTION, 0xc1a2];
+        let bytes: Vec<_> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+        std::fs::write(character.join("IconPositions.bin"), bytes).unwrap();
+        let mut gui = Gui::new(&client, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &client, 1, (1280, 800)).unwrap();
+        bar.load_contents(&mut gui, &client, &character, 1);
+        assert_eq!(bar.rows[1][4].as_ref().unwrap().instance, 0xc1a2);
+        std::fs::write(character.join("Containers/ShortcutBar_1.xml"), "<Archive><Archive name=\"position_map\"/></Archive>").unwrap();
+        bar.load_contents(&mut gui, &client, &character, 1);
+        assert!(bar.rows.iter().flatten().all(Option::is_none), "an empty XML map overrides legacy contents");
+        bar.close(&mut gui);
+        std::fs::remove_dir_all(character).unwrap();
+    }
+
+    #[test]
+    fn legacy_positions_validate_and_select_native_shortcut_map() {
+        let words: [u32; 19] = [76, 2, 0, 5, 5, 1, 0, KIND_SPECIAL_ACTION, 0xc1a5, 0, 0, 6, 2, 14, KIND_SPECIAL_ACTION, 0xc1a2, 99, KIND_SPECIAL_ACTION, 0xc1a8];
+        let bytes: Vec<_> = words.into_iter().flat_map(u32::to_be_bytes).collect();
+        assert_eq!(legacy_positions(&bytes).unwrap(), [(KIND_SPECIAL_ACTION, 0xc1a2, 4, 1), (KIND_SPECIAL_ACTION, 0xc1a8, 9, 9)]);
+        for n in 0..bytes.len() { assert!(legacy_positions(&bytes[..n]).is_err()); }
+        let mut malformed = bytes.clone();
+        malformed[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(legacy_positions(&malformed).is_err());
+        malformed = bytes.clone();
+        malformed[52..56].copy_from_slice(&100u32.to_be_bytes());
+        assert!(legacy_positions(&malformed).is_err());
+    }
 
     #[test]
     fn persisted_inventory_shortcuts_refresh_every_row_after_template_replacement() {
