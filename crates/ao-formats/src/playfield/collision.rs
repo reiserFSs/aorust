@@ -518,20 +518,12 @@ impl Collision {
         self.liquid_probe(p, p[1], self.rooms.as_ref().and_then(|_| self.room_at(p, -1)))
     }
 
-    /// Wildlife's `GetLiquidSurfaceHeight(..., -1, -1)` tests authored XZ polygons
-    /// without requiring the requesting flying body's Y to lie beneath their surface.
-    pub fn liquid_surface_at(&self, p: [f32; 3]) -> Option<Liquid> {
-        let room = self.rooms.as_ref().and_then(|_| self.room_at(p, -1));
-        for (triangle, kind) in &self.liquids {
-            if triangle.n[1].abs() <= 1e-6 || !triangle.liquid_contains_xz(p[0], p[2]) { continue; }
-            let level = triangle.y_at(p[0], p[2]);
-            if let Some(rooms) = &self.rooms {
-                let index = room?;
-                if triangle.floor != index as u16 + 1 || level <= rooms.rooms[index].0.pos[1] { continue; }
-            } else if level <= 0.0 { continue; }
-            return Some(Liquid { level, kind: *kind & 0x1f, normal: triangle.n });
-        }
-        None
+    /// Wildlife's `GetLiquidSurfaceHeight(..., -1, -1)` (N3 1000cb1e):
+    /// veto the query position, then replace the -1 height sentinel with its Y.
+    /// The ordinary liquid probe supplies native height/depth and first-candidate rules.
+    pub fn liquid_surface_at(&self, mut p: [f32; 3]) -> Option<Liquid> {
+        self.veto(&mut p, &mut SurfaceState::default());
+        self.liquid_at(p)
     }
 
     /// Liquid test of a closest-point query: `ground` is the closest point found, `y` the queried height, `room` the dungeon room.
@@ -962,6 +954,17 @@ mod tests {
         let acid: Vec<(Tri, u32)> = quad(1.0, -10.0, 10.0, -10.0, 10.0).into_iter().map(|t| (t, 6)).collect();
         assert_eq!(Collision::build(Vec::new(), None, None, acid).ground_material([5.0, 0.5, -8.0]), 11, "calm acid");
     }
+    #[test]
+    fn wildlife_liquid_height_sentinel_uses_query_y_and_authored_depth() {
+        let mut water: Vec<(Tri, u32)> = quad(1.0, -10.0, 10.0, -10.0, 10.0).into_iter().map(|t| (t, 5 << 5)).collect();
+        water.extend(quad(0.9, -10.0, 10.0, -10.0, 10.0).into_iter().map(|t| (t, 0)));
+        let c = Collision::build(Vec::new(), None, None, water);
+        assert_eq!(c.liquid_surface_at([5.0, 0.75, -8.0]).unwrap().level, 1.0);
+        assert!(c.liquid_surface_at([5.0, 2.0, -8.0]).is_none(), "above the liquid bounds");
+        assert!(c.liquid_surface_at([5.0, 0.5, -8.0]).is_none(), "strict authored lower depth bound; do not try the later deep candidate");
+        assert!(c.liquid_surface_at([5.0, 0.25, -8.0]).is_none(), "below the authored liquid volume");
+    }
+
 
     #[test]
     fn terrain_parity_split() {
