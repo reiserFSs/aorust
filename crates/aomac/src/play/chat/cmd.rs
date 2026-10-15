@@ -645,7 +645,7 @@ pub(super) fn atoi(s: &str) -> i32 {
 }
 
 /// C `atof`: the longest prefix of the blank-stripped text that is a decimal number (no `inf` / `nan`), 0 when none.
-pub(super) fn atof(s: &str) -> f64 {
+pub(in crate::play) fn atof(s: &str) -> f64 {
     let s = s.trim_start();
     (0..=s.len())
         .rev()

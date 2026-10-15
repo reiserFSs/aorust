@@ -604,7 +604,9 @@ impl Hud {
     }
 
     pub(super) fn take_waypoint_lines(&mut self) -> Vec<(String, u32)> {
-        self.mission.take_waypoint_lines()
+        let mut lines = self.mission.take_waypoint_lines();
+        lines.extend(self.map.take_lines());
+        lines
     }
 
     pub(super) fn take_equipment_feedback(&mut self) -> Option<&'static str> {
@@ -1038,7 +1040,12 @@ impl Hud {
         if let Some((quest, marker)) = self.mission.take_marker() {
             self.set_mission(marker, Some(quest), zone.playfield);
         }
+        self.map.sync_config(gui, &mut self.dvalues);
         self.map.update(gui, zone, _dt);
+        if let Some(marker) = self.map.take_waypoint() {
+            let source = marker.is_none().then_some(ao_net::msg::Identity::default());
+            self.set_mission(marker, source, zone.playfield);
+        }
         self.winb.update(gui, zone, _dt);
         self.research_vehicle.update(gui, zone, &mut self.winb.perks);
         self.outbox.append(&mut self.research_vehicle.outbox);

@@ -11,10 +11,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ao_formats::map_areas;
+use ao_formats::landcontrol::{self, LandControlMap};
 use ao_formats::planetmap::PlanetMap;
 use ao_formats::screens::TextDb;
 use ao_formats::topdown::{self, GroundMap, NO_OWNER};
 use ao_gui::{CanvasItem, CanvasTip, Event, GfxId, Gui, MouseButton, WindowId, WindowSize};
+use ao_rdb::RecordStore;
 
 use super::hud::WindowKind;
 use super::hud_rollup::Rollup;
@@ -31,8 +33,20 @@ const PF_SIZE: (u32, u32) = (179, 199);
 /// Two native HLayout rows of 27px buttons (`PlanetMapView_c`0x1004d26a).
 const BUTTONS_H: u32 = 54;
 const MENU_PLANET_BUTTONS: u32 = 0x7700;
+const MENU_PF_BUTTONS: u32 = 0x7701;
 /// Longest side of the playfield map image.
 const PF_MAX_PX: u32 = 2048;
+/// MapControlView_c100ec4e0: ordinary controls, not invented overlay coordinates.
+const PF_XML: &str = r#"<root><View view_layout="vertical">
+<ViewSelector name="sel"><CanvasView name="map" view_layout="stacked" max_size="Point(16000,16000)">
+<TextView name="lc_info" view_flags="0x100" feature_flags="TVF_MULTILINE" h_alignment="left" v_alignment="top" layout_borders="Rect(5,5,0,0)"/>
+</CanvasView><TextView name="na" value="&lt;center&gt;Map&amp;nbsp;Not&lt;br&gt;Available&lt;/center&gt;" feature_flags="TVF_MULTILINE" h_alignment="center" v_alignment="center"/></ViewSelector>
+<View name="pf_controls" view_flags="0x100" view_layout="vertical" weight="0" layout_borders="Rect(3,3,3,3)">
+<View view_layout="horizontal"><Button name="lc_toggle"/><HLayoutSpacer min_size="5" max_size="16000" weight="1"/>
+<Button name="lc_build"/><HLayoutSpacer min_size="5" max_size="16000" weight="1"/><Button name="lc_war"/></View>
+<View view_layout="horizontal"><TextInputView name="pf_x" layout_borders="Rect(3,3,3,0)"/><TextInputView name="pf_z" layout_borders="Rect(3,3,3,0)"/>
+<Button name="pf_add_waypoint" text="Add Waypoint" layout_borders="Rect(3,3,3,0)"/><Button name="pf_remove_waypoint" text="Remove Waypoint" layout_borders="Rect(3,3,3,0)"/>
+<VLayoutSpacer min_size="0" max_size="16000" weight="1"/></View></View></View></root>"#;
 /// Screen pixels per terrain cell: `MapData_c::FUN_10042996` sets the content rect to `cells * pt - 1` (`pt` = 4 `_DAT_101b0840` when its first argument, `+8`, is set, else
 /// 2 `_DAT_101ae17c`) and `PFMapRenderer_c`'s ctor / `FUN_100e9729` scales the view by `_DAT_101b36b0 / pt` = 4 / pt, so one terrain cell is 4 px either way
 /// (cell size in metres: `AnarchyGround_t +0x8264`, [`ao_formats::playfield::Report::cell_size`]).
@@ -90,9 +104,12 @@ struct Pf {
     arrows: HashMap<u8, GfxId>,
     /// The own character owns the map of the playfield ([`map_areas::owns_map`]): `MapData_c +0x80` = `N3Msg_GetMapCharacters` succeeded.
     owns: bool,
-    /// The map is shown; otherwise the "Map Not Available" text (`FUN_100eacda`: `!owns && !(land-control view on && land-control bitmap)`; the land-control
-    /// toggle (`RenderLandControlData` button of `MapControlView_c`, hidden by default) is not implemented, so it is `owns`).
+    /// GUI100eacda: ownership or enabled land-control bitmap.
     available: bool,
+    land: Option<LandControlMap>,
+    land_image: Option<(bool, GfxId)>,
+    district: Option<(String, (u16, u16))>,
+    lc_poll: f32,
 }
 
 struct Ground {
@@ -110,15 +127,21 @@ struct Ground {
 pub(super) struct HudMap {
     client: PathBuf,
     texts: Option<TextDb>,
+    store: Option<RecordStore>,
     planet: Option<Planet>,
     pf: Option<Pf>,
     planet_buttons: bool,
+    pf_buttons: bool,
+    land_control: bool,
+    config_loaded: bool,
+    config_dirty: bool,
+    waypoint: Option<Option<(u32, [f32; 2])>>,
+    lines: Vec<(String, u32)>,
     closed: Vec<WindowKind>,
     /// The ground image of the loaded playfield, built by the world loader from the scene it just decoded (`Report::ground`, [`ground_map`]); the
     /// `Option` is the terrain cell size in metres (`None`: a dungeon, rooms lit by exploration).
     ground_in: Option<(u32, GroundMap, Option<f32>)>,
-    /// The active mission's marker (playfield, world X/Z): `GlobalSignals+0x158` of `InventoryGUIModule_c::SlotGotNewMission` 0x100c69e2
-    /// (`N3Msg_GetQuestWorldPos`), handler `FUN_1004b9c9`. UNRESOLVED: nothing feeds it yet (`QuestFullUpdateIIR_t` is not decoded).
+    /// Native mission and manual waypoint producers share this planet-map consumer.
     mission: Option<(u32, [f32; 2])>,
 }
 
@@ -129,12 +152,52 @@ pub(in crate::play) fn ground_map(scene: &ao_scene::Scene, report: &ao_formats::
 
 fn canvas_xml(name: &str, size: (u32, u32)) -> String {
     let min = if name == "buttons" { (size.0.min(54).saturating_sub(1) as i32, size.1.saturating_sub(1) as i32) } else { (-1, -1) };
-    format!("<CanvasView name=\"{name}\" min_size=\"Point({},{})\" max_size=\"Point(16000,{})\"/>", min.0, min.1, if name == "buttons" { BUTTONS_H - 1 } else { 16000 })
+    let flags = if name == "buttons" { " view_flags=\"0x100\"" } else { "" };
+    format!("<CanvasView name=\"{name}\"{flags} min_size=\"Point({},{})\" max_size=\"Point(16000,{})\"/>", min.0, min.1, if name == "buttons" { BUTTONS_H - 1 } else { 16000 })
 }
 
 impl HudMap {
     pub(super) fn new(client: &std::path::Path) -> Self {
-        HudMap { client: client.to_path_buf(), texts: TextDb::load(client).ok(), planet: None, pf: None, planet_buttons: false, closed: vec![], ground_in: None, mission: None }
+        HudMap { client: client.to_path_buf(), texts: TextDb::load(client).ok(), store: RecordStore::open(client).ok(), planet: None, pf: None, planet_buttons: false, pf_buttons: false, land_control: false, config_loaded: false, config_dirty: false, waypoint: None, lines: vec![], closed: vec![], ground_in: None, mission: None }
+    }
+
+    pub(super) fn take_waypoint(&mut self) -> Option<Option<(u32, [f32; 2])>> {
+        self.waypoint.take()
+    }
+
+    pub(super) fn take_lines(&mut self) -> Vec<(String, u32)> {
+        std::mem::take(&mut self.lines)
+    }
+
+    /// Native map configs retain window geometry and unrelated message fields.
+    pub(super) fn sync_config(&mut self, gui: &mut Gui, d: &mut super::dvalue::DValues) {
+        use super::dvalue::{element_xml, Variant, CAT_CHAR};
+        use ao_gui::xml::{self, Element};
+        if self.config_loaded && !self.config_dirty { return; }
+        for (name, planet) in [("PlanetMapViewConfig", true), ("PFMapWindowConfig", false)] {
+            let mut root = match d.get(name) {
+                Some(Variant::Archive(source)) => xml::parse(source).ok(),
+                _ => None,
+            }.unwrap_or_else(|| Element { name: "Archive".into(), attrs: vec![("name".into(), name.into()), ("code".into(), "0".into())], children: vec![] });
+            let flag = |key: &str| root.children.iter().find(|e| e.attr("name") == Some(key)).and_then(|e| e.attr("value")).is_some_and(|v| v == "true" || v == "1");
+            if !self.config_loaded && !self.config_dirty {
+                if planet { self.planet_buttons = flag("ShowButtons"); }
+                else { self.pf_buttons = flag("ShowButtons"); self.land_control = flag("RenderLandControlData"); }
+            }
+            if self.config_dirty {
+                let fields = [("ShowButtons", if planet { self.planet_buttons } else { self.pf_buttons }), ("RenderLandControlData", self.land_control)];
+                for (key, value) in fields.into_iter().take(if planet { 1 } else { 2 }) {
+                    root.children.retain(|e| e.attr("name") != Some(key));
+                    root.children.push(Element { name: "Bool".into(), attrs: vec![("name".into(), key.into()), ("value".into(), value.to_string())], children: vec![] });
+                }
+                let value = Variant::Archive(element_xml(&root));
+                if d.exists(name) { d.set(name, value); } else { d.add(name, value, true, CAT_CHAR, None, None, false); }
+            }
+        }
+        self.config_loaded = true;
+        self.config_dirty = false;
+        if let Some(p) = &self.planet { gui.set_visible(p.window, "buttons", self.planet_buttons); }
+        if let Some(p) = &self.pf { gui.set_visible(p.window, "pf_controls", self.pf_buttons); }
     }
 
     /// The loader's ground image of playfield `pf` (replaces the one of an earlier playfield).
@@ -186,15 +249,22 @@ impl HudMap {
                 }
             }
             WindowKind::Map => {
-                let xml = format!(
-                    "<root><ViewSelector name=\"sel\">{}<TextView name=\"na\" value=\"&lt;center&gt;Map&amp;nbsp;Not&lt;br&gt;Available&lt;/center&gt;\" feature_flags=\"TVF_MULTILINE\" h_alignment=\"center\" v_alignment=\"center\"/></ViewSelector></root>",
-                    canvas_xml("map", PF_SIZE)
-                );
+                let xml = PF_XML;
                 // `FUN_10038c98` (`DockableViewDockName` default "RollupArea"): a page of the rollup dock, not a free window
-                match rollup.open_page(gui, kind.dvalue(), PF_TITLE, &xml, PF_SIZE.1 as f32) {
+                match rollup.open_page(gui, kind.dvalue(), PF_TITLE, xml, PF_SIZE.1 as f32) {
                     Ok(window) => {
                         gui.select_child(window, "sel", Some(0));
-                        self.pf = Some(Pf { window, playfield: 0, ground: None, center: [0.0; 2], followed: None, arrows: HashMap::new(), owns: true, available: true })
+                        gui.set_window_context(window, true);
+                        gui.set_visible(window, "pf_controls", self.pf_buttons);
+                        gui.set_visible(window, "lc_info", false);
+                        gui.set_text_pref_size(window, "lc_info", (0.0, 0.0), (16000.0, 16000.0));
+                        for (name, key) in [("lc_toggle", "Info"), ("lc_build", "Build"), ("lc_war", "Plafieldmap_War")] {
+                            if let Some(text) = self.texts.as_ref().and_then(|t| t.by_key(10000, key)) { gui.set_text(window, name, &super::hud_listview::esc(&text)); }
+                        }
+                        for (name, key) in [("lc_toggle", "ShowLConMap"), ("lc_build", "OpenLCbuild"), ("lc_war", "OpenLCwar")] {
+                            if let Some(text) = self.texts.as_ref().and_then(|t| t.by_key(10000, key)) { gui.set_tooltip(window, name, &text, ""); }
+                        }
+                        self.pf = Some(Pf { window, playfield: 0, ground: None, center: [0.0; 2], followed: None, arrows: HashMap::new(), owns: true, available: true, land: None, land_image: None, district: None, lc_poll: 0.0 })
                     }
                     Err(e) => eprintln!("playfield map: {e:#}"),
                 }
@@ -224,15 +294,22 @@ impl HudMap {
 
     fn toggle_planet_buttons(&mut self, gui: &mut Gui) {
         self.planet_buttons = !self.planet_buttons;
+        self.config_dirty = true;
         if let Some(p) = &self.planet {
             gui.set_visible(p.window, "buttons", self.planet_buttons);
             set_button_tips(gui, p.window, self.texts.as_ref());
         }
     }
 
-    pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, _zone: &Zone, screen: (u32, u32)) -> bool {
+    pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone, screen: (u32, u32)) -> bool {
         if matches!(ev, Event::MenuPicked { id: MENU_PLANET_BUTTONS }) {
             self.toggle_planet_buttons(gui);
+            return true;
+        }
+        if matches!(ev, Event::MenuPicked { id: MENU_PF_BUTTONS }) {
+            self.pf_buttons = !self.pf_buttons;
+            self.config_dirty = true;
+            if let Some(p) = &self.pf { gui.set_visible(p.window, "pf_controls", self.pf_buttons); }
             return true;
         }
         if let Some(p) = self.planet.as_mut() {
@@ -303,6 +380,39 @@ impl HudMap {
             }
         }
         if let Some(p) = self.pf.as_mut() {
+            match ev {
+                Event::FrameIcon { window, x, y } if *window == p.window => {
+                    gui.open_menu((*x, *y), (screen.0 as i32, screen.1 as i32), vec![ao_gui::MenuItem::check(MENU_PF_BUTTONS, "Show buttons", self.pf_buttons)]);
+                    return true;
+                }
+                Event::Clicked { window, name } if *window == p.window => match name.as_str() {
+                    "lc_toggle" if zone.skill_value(389).unwrap_or(0) & 1 != 0 => {
+                        self.land_control = !self.land_control;
+                        self.config_dirty = true;
+                        p.lc_poll = 0.0;
+                        return true;
+                    }
+                    // Installed native Build/War emit GlobalSignals+170(bool), with no
+                    // subscribers in the shipped modules. Do not invent a generic opener.
+                    "lc_build" | "lc_war" if zone.skill_value(389).unwrap_or(0) & 1 != 0 => return true,
+                    "pf_add_waypoint" => {
+                        let x = super::chat::atof(&gui.text(p.window, "pf_x")) as f32;
+                        let z = super::chat::atof(&gui.text(p.window, "pf_z")) as f32;
+                        if x > 0.0 && z > 0.0 {
+                            self.waypoint = Some(Some((zone.playfield.unwrap_or(0), [x, z])));
+                        } else {
+                            self.lines.push(("Coordinates not in range.".into(), 0x52));
+                        }
+                        return true;
+                    }
+                    "pf_remove_waypoint" => {
+                        self.waypoint = Some(None);
+                        return true;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
             if let Event::CanvasDrag { window, view, dx, dy, .. } = ev {
                 if *window == p.window && view == "map" {
                     let scale = p.ground.as_ref().map_or(PF_SCALE_ROOMS, |g| g.scale);
@@ -316,7 +426,7 @@ impl HudMap {
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone, _dt: f32) {
         self.update_planet(gui, zone);
-        self.update_pf(gui, zone);
+        self.update_pf(gui, zone, _dt);
     }
 
     // ------------------------------------------------------------------ planet map
@@ -409,7 +519,7 @@ impl HudMap {
 
     // ------------------------------------------------------------------ playfield map
 
-    fn update_pf(&mut self, gui: &mut Gui, zone: &Zone) {
+    fn update_pf(&mut self, gui: &mut Gui, zone: &Zone, dt: f32) {
         let Some(p) = self.pf.as_mut() else { return };
         if let Some(pf) = zone.playfield.filter(|&pf| pf != p.playfield) {
             // a new playfield: the map is rebuilt (exploration starts again, "since you last entered"); the image is the one the world loader
@@ -417,6 +527,11 @@ impl HudMap {
             p.playfield = pf;
             p.ground = None;
             p.followed = None;
+            p.land = self.store.as_ref().and_then(|s| s.get(landcontrol::RDB_TYPE, pf).ok().flatten()).and_then(|bytes| landcontrol::parse(&bytes).ok());
+            p.land_image = None;
+            p.district = None;
+            p.lc_poll = 0.0;
+            gui.set_text(p.window, "lc_info", "");
         }
         if p.ground.is_none() && self.ground_in.as_ref().is_some_and(|g| Some(g.0) == zone.playfield) {
             if let Some((_, map, cell)) = self.ground_in.take() {
@@ -426,9 +541,24 @@ impl HudMap {
         }
         // `MapData_c::FUN_100425eb`: `owns` = `N3Msg_GetMapCharacters` result (= `FUN_10057ca5`); `FUN_100eacda` swaps the map for the "Map Not Available" text
         p.owns = map_areas::owns_map(zone.playfield, |s| zone.stat(s).unwrap_or(0));
-        if p.owns != p.available {
-            p.available = p.owns;
+        let available = p.owns || (self.land_control && p.land.is_some());
+        if available != p.available {
+            p.available = available;
             gui.select_child(p.window, "sel", Some(if p.available { 0 } else { 1 }));
+        }
+        let expansion = zone.skill_value(389).unwrap_or(0) & 1 != 0;
+        for name in ["lc_toggle", "lc_build", "lc_war"] { gui.set_enabled(p.window, name, expansion); }
+        gui.set_button_pressed(p.window, "lc_toggle", self.land_control);
+        gui.set_visible(p.window, "lc_info", self.land_control && p.ground.as_ref().is_some_and(|g| !g.rooms));
+        p.lc_poll -= dt;
+        if self.land_control && p.lc_poll <= 0.0 {
+            p.lc_poll = 0.5;
+            if p.district != zone.lc_district {
+                p.district.clone_from(&zone.lc_district);
+                let text = p.district.as_ref().filter(|(_, (min, max))| *min > 0 && *max > 0)
+                    .map_or_else(String::new, |(name, (min, max))| format!("{}<br>Lvl Rng: {min} - {max}", super::hud_listview::esc(name)));
+                gui.set_text(p.window, "lc_info", &text);
+            }
         }
         if !p.available {
             return;
@@ -446,7 +576,7 @@ impl HudMap {
         let center = p.center;
         let scale = p.ground.as_ref().map_or(PF_SCALE_ROOMS, |g| g.scale);
         let to_screen = |x: f32, z: f32| [cw / 2.0 + (x - center[0]) * scale, ch / 2.0 - (z - center[1]) * scale];
-        let mut items = Vec::new();
+        let mut items = vec![CanvasItem::Solid { dst: [0.0, 0.0, cw, ch], color: 0, alpha: 1.0 }];
         if let Some(g) = p.ground.as_mut() {
             if let Some(h) = here {
                 let px = g.map.to_px(h[0], h[1]);
@@ -472,10 +602,33 @@ impl HudMap {
             let (w, h) = (g.map.width as f32 * g.map.mpp * scale, g.map.height as f32 * g.map.mpp * scale);
             items.push(CanvasItem::Image { id, src: [0.0, 0.0, g.map.width as f32, g.map.height as f32], dst: [a[0], a[1], a[0] + w, a[1] + h], alpha: 1.0 });
         }
+        if self.land_control && p.ground.as_ref().is_some_and(|g| !g.rooms) {
+            if let Some(land) = &p.land {
+                let image = match p.land_image {
+                    Some((owns, image)) if owns == p.owns => image,
+                    _ => {
+                        let image = gui.add_image("land-control map", land_rgba(land, p.owns), land.width, land.height, false);
+                        p.land_image = Some((p.owns, image));
+                        image
+                    }
+                };
+                let cell = PF_PX_PER_CELL / scale;
+                let top_left = to_screen(0.0, land.height as f32 * cell);
+                items.push(CanvasItem::Image { id: image, src: [0.0, 0.0, land.width as f32, land.height as f32], dst: [top_left[0], top_left[1], top_left[0] + land.width as f32 * PF_PX_PER_CELL, top_left[1] + land.height as f32 * PF_PX_PER_CELL], alpha: 1.0 });
+                if !p.owns {
+                    //100e9ebb's64x64 mask: one opaque green row/column, map-locked.
+                    let origin = to_screen(0.0, 0.0);
+                    let mut x = origin[0].rem_euclid(64.0);
+                    while x < cw { items.push(CanvasItem::Solid { dst: [x, 0.0, x + 1.0, ch], color: 0x00ff00, alpha: 1.0 }); x += 64.0; }
+                    let mut y = origin[1].rem_euclid(64.0);
+                    while y < ch { items.push(CanvasItem::Solid { dst: [0.0, y, cw, y + 1.0], color: 0x00ff00, alpha: 1.0 }); y += 64.0; }
+                }
+            }
+        }
         if let Some((pos, yaw)) = own {
             // other characters (`FUN_100425eb` list, drawn by `FUN_100ea626` only when `GetMapCharacters` succeeded = `owns`, true here): 4x4 squares (`MapSquare` art), range 500
             for (id, d) in &zone.dynels {
-                if *id == zone.char_id as i32 {
+                if !p.owns || *id == zone.char_id as i32 {
                     continue;
                 }
                 let (dx, dz) = (d.pos[0] - pos[0], d.pos[2] - pos[2]);
@@ -503,6 +656,18 @@ impl HudMap {
         }
         gui.set_canvas(p.window, "map", items);
     }
+}
+
+/// GUI100eb328, TextureFormat10=A4R4G4B4 (Randy100262dc), flipped bitmap rows.
+fn land_rgba(map: &LandControlMap, owns: bool) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(map.width as usize * map.height as usize * 4);
+    for y in (0..map.height).rev() {
+        for x in 0..map.width {
+            let pixel = if map.get(x, y) { [0x33, 0x99, 0x22, 0xff] } else if owns { [0, 0, 0, 0x44] } else { [0x55, 0x55, 0x55, 0xff] };
+            rgba.extend_from_slice(&pixel);
+        }
+    }
+    rgba
 }
 
 fn button_rect(i: usize, width: f32) -> (f32, f32) {
@@ -637,6 +802,96 @@ fn pick_planet_map(client: &std::path::Path, pf: Option<u32>) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn land_fixture() -> LandControlMap {
+        let mut bytes = vec![1, 0, 0, 0, 2, 0, 2, 0];
+        bytes.resize(20, 0);
+        bytes.extend([0b01, 0b10]);
+        landcontrol::parse(&bytes).unwrap()
+    }
+
+    #[test]
+    fn native_land_control_texels_and_flipped_rows() {
+        let map = land_fixture();
+        let green = [0x33, 0x99, 0x22, 0xff];
+        let dim = [0, 0, 0, 0x44];
+        let grey = [0x55, 0x55, 0x55, 0xff];
+        assert_eq!(land_rgba(&map, true), [dim, green, green, dim].concat());
+        assert_eq!(land_rgba(&map, false), [grey, green, green, grey].concat());
+    }
+
+    #[test]
+    fn land_control_controls_availability_district_poll_and_waypoint_signals() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut rollup = Rollup::new(&dir, (1024, 768));
+        let mut maps = HudMap::new(&dir);
+        let mut zone = Zone::new(7);
+        zone.playfield = Some(4001); // native map ownership requires area bit79
+        zone.lc_district = Some(("Authored Field".into(), (10, 20)));
+        maps.open(&mut gui, &mut rollup, WindowKind::Map);
+        maps.provide_ground(4001, GroundMap { width: 2, height: 2, rgba: vec![255; 16], origin: [0.0, 2.0], mpp: 1.0, owner: vec![0; 4] }, Some(1.0));
+        maps.update(&mut gui, &zone, 0.0);
+        let window = maps.pf.as_ref().unwrap().window;
+        assert!(!maps.pf_buttons && !maps.land_control);
+        assert!(!maps.pf.as_ref().unwrap().available);
+        maps.pf.as_mut().unwrap().land = Some(land_fixture());
+        let click = |name: &str| Event::Clicked { window, name: name.into() };
+        assert!(!maps.event(&mut gui, &click("lc_toggle"), &zone, (1024, 768)));
+        assert!(!maps.land_control, "NotumWars bit gates nativeInfo/Build/War controls");
+        zone.stats.insert(389, 1);
+        assert!(maps.event(&mut gui, &Event::MenuPicked { id: MENU_PF_BUTTONS }, &zone, (1024, 768)));
+        assert!(maps.event(&mut gui, &click("lc_toggle"), &zone, (1024, 768)));
+        maps.update(&mut gui, &zone, 0.0);
+        let p = maps.pf.as_ref().unwrap();
+        assert!(p.available && !p.owns, "LC bitmap makes an unowned map available");
+        let image = p.land_image.unwrap().1;
+        assert!(gui.canvas_items(window, "map").iter().any(|item| matches!(item, CanvasItem::Image { id, .. } if *id == image)));
+        assert_eq!(gui.text(window, "lc_info"), "Authored Field<br>Lvl Rng: 10 - 20");
+        zone.lc_district = Some(("Next Field".into(), (20, 30)));
+        maps.update(&mut gui, &zone, 0.1);
+        assert!(gui.text(window, "lc_info").starts_with("Authored Field"));
+        maps.update(&mut gui, &zone, 0.5);
+        assert!(gui.text(window, "lc_info").starts_with("Next Field"));
+        assert_eq!(maps.pf.as_ref().unwrap().land_image.unwrap().1, image, "static bitmap upload is cached");
+        for name in ["lc_build", "lc_war"] {
+            assert!(maps.event(&mut gui, &click(name), &zone, (1024, 768)));
+            assert!(maps.land_control, "native unobserved170 signal does not toggleInfo");
+        }
+        gui.set_text(window, "pf_x", " 5.5suffix");
+        gui.set_text(window, "pf_z", "7.25");
+        assert!(maps.event(&mut gui, &click("pf_add_waypoint"), &zone, (1024, 768)));
+        assert_eq!(maps.take_waypoint(), Some(Some((4001, [5.5, 7.25]))));
+        gui.set_text(window, "pf_x", "0");
+        maps.event(&mut gui, &click("pf_add_waypoint"), &zone, (1024, 768));
+        assert_eq!(maps.take_lines(), [("Coordinates not in range.".into(), 0x52)]);
+        maps.event(&mut gui, &click("pf_remove_waypoint"), &zone, (1024, 768));
+        assert_eq!(maps.take_waypoint(), Some(None));
+        maps.event(&mut gui, &click("lc_toggle"), &zone, (1024, 768));
+        maps.update(&mut gui, &zone, 0.0);
+        assert!(!maps.pf.as_ref().unwrap().available);
+    }
+
+    #[test]
+    fn native_map_flags_roundtrip_without_losing_window_fields() {
+        use super::super::dvalue::{DValues, Variant, CAT_CHAR};
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut d = DValues::default();
+        d.add("PlanetMapViewConfig", Variant::Archive("<Archive name=\"PlanetMapViewConfig\"><Bool name=\"ShowButtons\" value=\"true\"/><Int32 name=\"ZoomLev\" value=\"2\"/></Archive>".into()), true, CAT_CHAR, None, None, false);
+        d.add("PFMapWindowConfig", Variant::Archive("<Archive name=\"PFMapWindowConfig\"><Bool name=\"ShowButtons\" value=\"true\"/><Bool name=\"RenderLandControlData\" value=\"true\"/><Rect name=\"WindowFrame\" value=\"Rect(1,2,300,400)\"/></Archive>".into()), true, CAT_CHAR, None, None, false);
+        let mut maps = HudMap::new(&dir);
+        maps.sync_config(&mut gui, &mut d);
+        assert!(maps.planet_buttons && maps.pf_buttons && maps.land_control);
+        maps.toggle_planet_buttons(&mut gui);
+        maps.sync_config(&mut gui, &mut d);
+        let mut restored = HudMap::new(&dir);
+        restored.sync_config(&mut gui, &mut d);
+        assert!(!restored.planet_buttons && restored.pf_buttons && restored.land_control);
+        assert!(matches!(d.get("PFMapWindowConfig"), Some(Variant::Archive(xml)) if xml.contains("WindowFrame")));
+        assert!(matches!(d.get("PlanetMapViewConfig"), Some(Variant::Archive(xml)) if xml.contains("ZoomLev")));
+    }
+
     #[test]
     fn map_viewports_grow_in_both_axes_and_buttons_follow_width() {
         let dir = ao_gui::client_dir();

@@ -3,6 +3,7 @@
 //! performs what an input line asks for.
 
 mod cmd;
+pub(super) use cmd::atof;
 pub(super) mod dialog;
 mod filter;
 pub(super) mod info;
