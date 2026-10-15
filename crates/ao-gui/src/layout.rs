@@ -542,7 +542,7 @@ pub fn layout(env: &mut Env, tree: &mut Tree, id: ViewId) {
         Node::Base | Node::Selector => {
             let kids: Vec<ViewId> = tree.views[id].children.iter().copied().filter(|c| included(tree, *c)).collect();
             for c in kids {
-                let r = b.shrink(&tree.views[c].borders);
+                let r = if tree.views[id].node == Node::Selector { b } else { b.shrink(&tree.views[c].borders) };
                 set_frame(env, tree, c, r);
             }
         }

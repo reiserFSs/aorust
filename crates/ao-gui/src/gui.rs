@@ -2950,4 +2950,16 @@ mod clip_tests {
         }
         assert!(visible > 0 && visible < lines, "the test must scroll some lines off-screen while keeping others visible");
     }
+    #[test]
+    fn selector_limits_include_hidden_pages_and_take_largest_min_and_max() {
+        let Ok(mut gui) = Gui::new(&crate::client_dir(), None) else { return };
+        let xml = "<root><ViewSelector name=\"pages\"><CanvasView min_size=\"Point(40,20)\" max_size=\"Point(80,50)\"/><CanvasView min_size=\"Point(70,30)\" max_size=\"Point(120,40)\"/></ViewSelector></root>";
+        let window = gui.open_window_xml("selector", xml, (0, 0), WindowSize::Fixed(200, 100)).unwrap();
+        for selection in [0, 1, 0] {
+            gui.select_child(window, "pages", Some(selection));
+            assert_eq!(gui.window_preferred_size_limits(window), Some(((71, 31), (121, 51))));
+            gui.relayout_window(window);
+            assert_eq!(gui.window_preferred_size_limits(window), Some(((71, 31), (121, 51))));
+        }
+    }
 }
