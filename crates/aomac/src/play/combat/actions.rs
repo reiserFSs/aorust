@@ -52,9 +52,8 @@ impl Pose {
     /// is nearly over): SwitchToSitGround `FUN_1006e2be` (0xd7, 0xd5 `ground-start`), LeaveSit `FUN_1006e372` (0xd6 `ground-stop`), sleep
     /// `FUN_1006e6ff` (0xee, 0xed `sleep-ground`), lounge `FUN_1006e8a9` (0xf0, 0xef `lounging`), crawl enter `FUN_1006e646` (0x9a, 0x68
     /// `crawl_start`), crawl leave `FUN_1006e3ff` (0x69 `crawl_stop`). Sitting on an item runs the same mode 8 handler: there is no chair clip
-    /// (`chair-start`/`idle-chair` are in the id table but no handler pushes 0xd8..0xda). **[UNRESOLVED]** leaving sleep / lounge to sitting
-    /// (`FUN_1006e79f` / `FUN_1006e949`) plays 0xed / 0xef with `Play` flag `param_5 = 1` (taken as backwards playback): not reproduced, the
-    /// avatar goes straight to `idle-ground`.
+    /// (`chair-start`/`idle-chair` are in the id table but no handler pushes 0xd8..0xda). Leaving sleep / lounge to sitting
+    /// (`FUN_1006e79f` / `FUN_1006e949`) plays the same enter clip with `Direction_e = 1`, backwards over its intro interval.
     pub fn transition_anim(from: Pose, to: Pose) -> Option<u16> {
         use Pose::*;
         match (from, to) {
@@ -62,6 +61,8 @@ impl Pose {
             (SitGround | SitItem, Standing) => Some(0xd6),
             (SitGround | SitItem, Sleeping) => Some(0xed),
             (SitGround | SitItem, Lounging) => Some(0xef),
+            (Sleeping, SitGround | SitItem) => Some(0xed),
+            (Lounging, SitGround | SitItem) => Some(0xef),
             (Standing, Crawling) => Some(0x68),
             (Crawling, Standing) => Some(0x69),
             _ => None,
@@ -355,8 +356,8 @@ mod tests {
         assert_eq!(name(Pose::SitGround, Pose::Lounging), Some("lounging"));
         assert_eq!(name(Pose::Standing, Pose::Crawling), Some("crawl_start"));
         assert_eq!(name(Pose::Crawling, Pose::Standing), Some("crawl_stop"));
-        // the way out of sleep / lounge plays the enter clip backwards: not reproduced
-        assert_eq!(name(Pose::Sleeping, Pose::SitGround), None);
+        assert_eq!(name(Pose::Sleeping, Pose::SitGround), Some("sleep-ground"));
+        assert_eq!(name(Pose::Lounging, Pose::SitGround), Some("lounging"));
         assert_eq!(Pose::from_role(&Role::SleepGround), Pose::Sleeping);
         assert_eq!(Pose::from_role(&Role::Run), Pose::Standing);
     }

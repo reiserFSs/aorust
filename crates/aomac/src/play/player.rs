@@ -625,7 +625,6 @@ impl Player {
         let now = Pose::from_role(&role);
         if let Some(from) = self.pose.replace(now).filter(|&b| b != now && self.cast_loop.is_none()) {
             if let Some(id) = Pose::transition_anim(from, now) {
-                if matches!(id, 0xd5 | 0xd6) {
                     self.transient = None;
                     self.cast_loop = None;
                     self.avatar.set_body_priority(0);
@@ -635,9 +634,6 @@ impl Player {
                     if let Err(e) = self.avatar.play_posture(&self.store, id, AvatarPose::still(idle)) {
                         eprintln!("avatar posture: {e:#}");
                     }
-                } else if let Some((name, _)) = anim_name(id) {
-                    self.play(Role::Clip(name.into()), false);
-                }
             }
         }
         // the airborne->grounded edge plays the jump-landing clip once over the resuming movement pose (`jump-land-*`);

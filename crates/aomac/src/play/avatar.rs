@@ -346,7 +346,7 @@ impl ActionClip {
     }
     fn sample(&self) -> ao_formats::character::AnimLayer<'_> {
         ao_formats::character::AnimLayer {
-            clip: &self.clip, ms: self.ms.min(self.duration), layers: self.layers,
+            clip: &self.clip, ms: if self.rate < 0.0 { (self.duration - self.ms).max(0.0) } else { self.ms.min(self.duration) }, layers: self.layers,
             blend: ao_formats::character::animation_blend(self.ms, self.duration, self.fade_ms),
         }
     }
@@ -590,6 +590,7 @@ impl Avatar {
         let Some((clip_id, _)) = self.action_clip(id) else { return Ok(()) };
         let clip = self.assets.anim(store, clip_id)?;
         let duration = posture_interval_end(&clip);
+        let reverse = matches!(id, 0xed | 0xef) && matches!(idle.role, Role::SitGround | Role::SitChair);
         let idle_fade = self.actions.iter().rev().find(|action| action.priority == self.body_priority && !action.before_body)
             .map(|action| animation_fade_ms(action.duration, action.ms));
         self.set_pose(store, idle)?;
@@ -597,7 +598,7 @@ impl Avatar {
         self.body_delay_ms = (duration - POSTURE_IDLE_LEAD_MS).max(0.0);
         let idle_duration = self.clip.as_ref().map_or(0.0, |idle| loop_span(idle).map_or(idle.duration, |(start, end)| end - start));
         let fade_ms = animation_fade_ms(idle_duration, 0.0);
-        self.start_action(clip, 0, 0, 1.0, (None, -1, None));
+        self.start_action(clip, 0, 0, if reverse { -1.0 } else { 1.0 }, (None, -1, None));
         let action = self.actions.iter_mut().rev().find(|action| action.priority == 0).unwrap();
         action.duration = duration;
         action.fade_ms = fade_ms;
@@ -776,7 +777,7 @@ impl Avatar {
             }
         }
         for action in &mut self.actions {
-            action.ms += dt * 1000.0 * action.rate;
+            action.ms += (dt * 1000.0 * action.rate).abs();
             self.notes.extend(action.take_notes());
             if action.ms > action.duration && !action.posture {
                 self.notes.extend(action.finish_notes());
@@ -1240,6 +1241,19 @@ pub(super) mod tests {
         let mut action = ActionClip { clip: Arc::new(clip), ms: 100.0, duration: 1000.0, posture: false, before_body: false, layer: 1, priority: -1, fade_ms: 200.0, layers: 3, note_fired: 0, rate: 1.0, key: None, slot: -1, role: None };
         assert_eq!(action.take_notes().map(|note| note.id).collect::<Vec<_>>(), vec![id::SWISH_PUNCH]);
         assert_eq!(action.take_notes().count(), 0, "authored notes still fire only once");
+    }
+
+    #[test]
+    fn reverse_posture_samples_intro_end_toward_zero() {
+        let clip = CatAnim { source_id: 0, root: String::new(), events: vec![], version: 0, duration: 2000.0, signature: 0, param: 0.0, tracks: vec![] };
+        let mut action = ActionClip { clip: Arc::new(clip), ms: 0.0, duration: 1000.0, posture: true, before_body: false, layer: 0, priority: 0, fade_ms: 200.0, layers: 3, note_fired: 0, rate: -1.0, key: None, slot: -1, role: None };
+        assert_eq!(action.sample().ms, 1000.0);
+        action.ms = 250.0;
+        assert_eq!(action.sample().ms, 750.0);
+        assert_eq!(action.sample().blend, 1.0);
+        action.ms = 1000.0;
+        assert_eq!(action.sample().ms, 0.0);
+        assert_eq!(action.sample().blend, 0.0);
     }
 
     #[test]

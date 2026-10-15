@@ -753,7 +753,8 @@ impl Char {
         let action_layer = |action: &'a ActionAnim| {
             let clips = built.clips.get(&action.id)?;
             let clip = clips.get(action.variant? % clips.len().max(1))?;
-            Some(AnimLayer { clip, ms: action.ms.min(action.duration(clip)), layers: action.layers, blend: ao_formats::character::animation_blend(action.ms, action.duration(clip), action.fade_ms) })
+            let ms = if action.rate < 0.0 { (action.duration(clip) - action.ms).max(0.0) } else { action.ms.min(action.duration(clip)) };
+            Some(AnimLayer { clip, ms, layers: action.layers, blend: ao_formats::character::animation_blend(action.ms, action.duration(clip), action.fade_ms) })
         };
         let before = self.actions.iter().filter(move |action| action.priority > priority).filter_map(action_layer);
         let older = self.actions.iter().filter(move |action| action.priority == priority && action.before_body).filter_map(action_layer);
@@ -1459,7 +1460,8 @@ impl Dynels {
         c.posture_idle = Some(anim_id);
         c.special = Special::None;
         for action in &mut c.actions { if action.priority == 0 { action.before_body = true; } }
-        self.start_node(id, ActionAnim { id: anim_id, layer: canim::Layer::Body, priority: 0, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None, posture: true, before_body: false });
+        let reverse = matches!(anim_id, 0xed | 0xef) && c.mover.status().mode == Mode::SitGround;
+        self.start_node(id, ActionAnim { id: anim_id, layer: canim::Layer::Body, priority: 0, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: if reverse { -1.0 } else { 1.0 }, key: None, slot: -1, delay: None, posture: true, before_body: false });
     }
 
     /// Original producer's layer wins over the generic name-table mapping.
