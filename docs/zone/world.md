@@ -400,8 +400,7 @@ the corpse to the dead character's relative position when closer than a threshol
     destination bits for the try: the server decides the target. Survey (`cargo run --release -p ao-formats --example portal_survey`): 8948
     of 234349 surface records carry a polygon (4 to 6 corners; the same polygon is stored in every zone it overlaps), in playfields
     505..800 (49 of them), 4001/4005/4006, 4310-4312/4320/4321, 4504/4505/4540-4544, 4605, 4872/4873, 6101/6102 and 6550/6551.
-    **None in Newland City 4582 / 4604**: the Newland whompahs (and the grid) are click-used dynels, not teleportals, so they are not part of
-    this path (a click-use goes through the dynel use interaction, not through the movement stream).
+    **None in ICC Shuttleport 4582 / Arrival Hall 4604** (`pfnrmap.dat`; Newland City is 566, the earlier label was wrong). These polygons are distinct from placed travel objects: Borealis's template-96272 Whom-Pahs were exercised by walking through them (movement.md §4.2), whereas its template-95350 Grid terminal is used as an object. A missing polygon does not prove that a playfield has no travel objects or server-controlled boundary transitions.
     `Collision::in_teleportal(scene_pos)` picks the zone (`n3Dynel_t::GetZone`: zone grid outdoors via `zone::grid_zone`, `PosToRoom` or 0 in
     a dungeon) and runs the same parity test. Tests: `collision::portal::tests`, `tests/collision_real.rs::collision_teleportal_of_real_polygons`.
   * **Per frame** (`FUN_1005b016` [GC], the own dynel's `Run`, calls `FUN_100585ee` [GC 0x100585ee]): `IsPosInTeleportal(vehicle global pos)`

@@ -566,6 +566,7 @@ fn live_walk() {
     }
     let mut l = Live { p, o, last: Instant::now(), shots, dt_cap: f32::INFINITY, capture: None, npc_probe: None };
     l.tick();
+    l.until("server discovery", 15, |p| !p.servers_fetching);
     let w = l.p.login_w.unwrap();
     l.p.gui.set_text(w, "username", &user);
     l.p.gui.set_text(w, "password", &pass);
@@ -1443,6 +1444,9 @@ fn live_walk() {
                 v.sort_by_key(|q| (q.id.kind, q.id.instance));
                 for q in v {
                     eprintln!("quest {:?} {:?}: {:?}", q.id, q.name, q.description);
+                    for action in &q.actions {
+                        eprintln!("quest destination {:?}", action.pos);
+                    }
                 }
             }
             // `weardrag=<bag_col>:<bag_row>:<tab>:<wear_id>`: drags a bag cell onto a Character-window wear slot, like a real GUI drag

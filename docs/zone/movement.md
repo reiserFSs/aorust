@@ -182,10 +182,12 @@ Our `CharDCMove` stream (736 frames over the session) is within the client's rul
 The speed/teleport/terrain-height checks are therefore not the cause; the walk simply has to avoid hostiles (`AOMAC_LIVE_AVOID=1` makes `goto` route around living
 side-3 NPCs by the given metres) and the harness now ends a `goto` when the own character dies (`Module::is_dying`).
 
-### 4.2 [LIVE] Zone line, swimming (Aomacvolk, Borealis pf 800, 2026-10-06)
-* **Borealis exit** (no whompah / Grid terminal in pf 800, as in 4582 / 4833): walking into the door prop 0xC748 at (684, 74, 534) (placed doors carry no destination: the zone
-  lines are the server's) gave "Locating next playfield server." + `n3TeleportIIR_t` + `ZoneRedirection` to **pf 790 "Stret West Bank"** at (1277.05, 0.12, 2891.71) (`NEW LOC` line). Walking
-  back into the "BOREALIS" gate door at (1273, 1, 2887) returned to pf 800 at (681.5, 72.8, 530.7). Both redirections kept the zone server (199.241.136.157:8502).
+### 4.2 [LIVE] Whom-Pah transfer, swimming (Aomacvolk, Borealis pf 800, 2026-10-06)
+* **Borealis Whom-Pah** (rdb 1000026 pf 800 placement, name from rdb 1000020: template 96272 "Whom-Pah", kind 0xC748, instance -1071774944 at (684, 74.6, 534.8); earlier
+  text called it a zone-line door): walking into it gave "Locating next playfield server." + `n3TeleportIIR_t` + `ZoneRedirection` to **pf 790 "Stret West Bank"** at (1277.05, 0.12, 2891.71) (`NEW LOC` line); the server chose the destination. Walking
+  back into the pf 790 Whom-Pah (template 96272, instance -1073544426 at (1273.2, 1.8, 2887.5); the session's "BOREALIS" gate) returned to pf 800 at (681.5, 72.8, 530.7). Both redirections kept the zone server (199.241.136.157:8502).
+  pf 800 also places two more Whom-Pahs (template 96272: -1072430304 at (679.7, 74.6, 543.9), -1072037088 at (738.2, 61.8, 692)) and the Grid terminal (template 95350 "Enter The Grid",
+  kind 0xC73D, -1073478880 at (636.4, 66.8, 728.8)); the earlier "no whompah / Grid terminal in pf 800" was wrong. None of them, and no Whom-Pah / Grid destination list, was exercised (interact.md §12.1).
 * **Swimming**: the nearest deep water by a walkable route is the lake at (773, 8.8, 589) (the plateau's south-east foot; the nearer pools at (592, 89, 521) / (592, 59, 565) are not
   reachable by the collision route). A 576-cell `goto` (`AOMAC_LIVE_AVOID=8`, around the Pumpkin-Head line) ended with the FSM in **mode 4 (Swim)** at y 9.99 (surface 10.0): the avatar holds the IdleSwim clip (0xc3, arms out, shot inspected; night 20:49 RKT, so the shot is dark).
   The earlier harness `water` scan mixed the server and the collision z axis (`player::to_col` negates z) and pointed `goto=400:-147` at the wrong place; fixed with a test.

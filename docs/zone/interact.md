@@ -694,12 +694,17 @@ Captures (login traffic excluded): `docs/captures/zone_npc_dialogue_ithaca.rec`,
 Movement harness `approach` now ends and releases its held key on the same death/playfield-change conditions as `goto`, or when the own dynel/destination is removed after a frame. The ICC detour from `(802.37,20.29,720.64)` toward `(800,800)` exposed the former unconditional own-dynel unwrap; the available run log did not identify whether removal was death or transition. The offline regression covers own/destination removal without inventing a replacement position or destination.
 
 ### 12.1 Off the ICC beach (pf 4582 -> 4833 -> pf 800 Borealis)
-1. Plateau door (`Door_t` 0xC748, Can 1032, (936.1, 47.6, 888.4)): right click = `UseItem` (echo), walking through it enters **pf 4833 "ICC Shuttleport"** (its door at (185, 6.1, 144) leads back).
+1. Plateau door (`Door_t` 0xC748, Can 1032, (936.1, 47.6, 888.4)): right click = `UseItem` (echo), walking through it enters **pf 4833 "Teleport Tower"** (`pfnrmap.dat`; "ICC Shuttleport" is pf 4582, the earlier label was wrong; its door at (185, 6.1, 144) leads back).
 2. Dialogues: Teleporter Technician (4833, instance 1001786) "use it on the portal to Borealis"; Travis Molen -> recruiters / Neutral Observer; Neutral Observer "use this access card to activate the teleporter".
 3. The card is the starting-bag **key item 249721** (slot 0x44). Released over a teleporter prop (0xC73D, pf 4833) it is `UseItemOnItem` (GenericCmd cmd 5, §8.7). Wrong teleporter: `FormatFeedback`
-   "This is not the correct key"; wrong item: "You can not use this item on the teleporter"; the right one (instance -1073474847, (189.5, 6.3, 190.6)) redirects to **pf 800 (Borealis)** at (679.6, 72.8, 476.7). ICC cannot be re-entered.
+   "This is not the correct key"; wrong item: "You can not use this item on the teleporter"; the right one (rdb 1000026/1000020: template 95351 "Exit the Grid", instance -1073474847, (189.5, 6.3, 190.6)) redirects to **pf 800 (Borealis)** at (679.6, 72.8, 476.7):
+   an observed key-use transfer to 800, not evidence of The Grid (pf 152). ICC cannot be re-entered.
    Newland is not offered to a level-1 character; Borealis is (three faction recruiters).
 4. Other 0xC73D objects are billboards (echo only); 0xC773 is a mail terminal (chat line "Unknown entity used: MailTerminal").
+5. **Travel coverage.** Exercised in earlier offscreen live sessions: Arrival Hall 4604 → ICC Shuttleport 4582 (Aomacfixr `goto=193:157`, dynels.md), ICC 4582 → Teleport Tower 4833 → Borealis 800 (above),
+   Borealis 800 ↔ Stret West Bank 790 through their Whom-Pahs (movement.md §4.2), swimming and the death respawn (movement.md §4.1-4.2). Not live-exercised: Newland City 566, Omni-1, the other pf 800 Whom-Pahs,
+   the Grid terminal / Whom-Pah destination list (`GridDestinationSelect`, §7) and The Grid 152 (no proven Grid route into Arrival Hall either), mission instance entry / exit (the Borealis mission terminal accepted
+   a quest, §14.3, but no instance was entered), Yalmaha, fall damage. The 2026-10-15 travel sweep never reached a world: the status API timed out, the client showed `errors/1.html`, and the offscreen harness timed out awaiting the character list (80.68 s; peak RSS 125472 KiB). The user subsequently confirmed PRK maintenance; all further logins are suspended until Main confirms availability. This adds no live PASS.
 
 ### 12.2 NPC dialogue and trade
 * Server Knubot frames carry header flag byte 1, the client's own 0 (`encode` writes 0; the replay tests patch the byte).
@@ -712,8 +717,10 @@ Movement harness `approach` now ends and releases its held key on the same death
 * Vending machine (0xC75B): echo, then `ShopUpdateIIR_t` (key 58362220, 36 items) and a `TradeIIR_t` **op 0** (START, not op 2: version word `00000002`, op byte `00`) pair: header = own, `a` = the machine, `b` = `{0xC767, 0x116f7753}` (a session identity); then header = the machine, `a` = own, the same `b` (buy UI: section 13).
 * Corpse (0xC76A, "Remains of Uncle Pumpkin-Head"): echo + `InventoryUpdateIIR_t` (flag set) -> loot window (screenshot checked). The first double click sent `MoveItemToInventory({0x6a, cell}, any)`; the server ignored it, as it
   did `{0x6a,1}`, `{0xC76A,0}` and the entry id, also on our own kill (`zone_loot_own_kill_ithaca.rec`). The identity the original client builds is `{0x6b, update word << 16 | slot}` (section 9, step 4) [UNRESOLVED-live until re-run].
-* Borealis exit (movement.md §4.2): the door prop 0xC748 at (684, 74, 534) is a zone line to pf 790 "Stret West Bank" (walking into it), its gate door at (1273, 1, 2887) leads back; no Grid window opened.
-* Grid terminal / whompah: none in pf 4582/4833/800, `GridDestinationSelect` never received [UNRESOLVED-live]. Player trade needs a second player [UNRESOLVED-live].
+* Borealis Whom-Pah (movement.md §4.2): the pf 800 Whom-Pah (template 96272, kind 0xC748, instance -1071774944, (684, 74.6, 534.8)) took the character walking into it to pf 790 "Stret West Bank"; the pf 790 Whom-Pah
+  (template 96272, instance -1073544426, (1273.2, 1.8, 2887.5)) leads back; no Grid window opened.
+* Grid terminal / Whom-Pah: none in pf 4582/4833; pf 800 places the Grid terminal (template 95350 "Enter The Grid", kind 0xC73D, -1073478880, (636.4, 66.8, 728.8)) and two more Whom-Pahs, none used, and no
+  destination list opened: `GridDestinationSelect` never received [UNRESOLVED-live]. Player trade needs a second player [UNRESOLVED-live].
 
 ## 13. Vending machines / shops
 
