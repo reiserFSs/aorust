@@ -63,6 +63,10 @@ impl Play {
                 }
                 return;
             }
+            if let Some(outgoing) = entry.registered_action(self.zone.char_id as i32) {
+                self.send_outgoing(vec![outgoing]);
+                return;
+            }
         }
         if self.fight_special(a) {
             return;
@@ -324,6 +328,36 @@ impl Play {
 #[cfg(test)]
 mod tests {
     use super::hud_timerbar;
+
+    #[test]
+    fn registered_owner_activation_and_flag_refusal_reach_actual_play_dispatch() {
+        use ao_net::{msg::Identity, n3::{action, outgoing::n3_frame}};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut play = super::Play::new(dir.clone(), None, None, None).unwrap();
+        play.zone.char_id = 42;
+        play.fight = Some(crate::play::combat::module::Module::new(&dir, 42));
+        play.hud = Some(crate::play::hud::Hud::new(&mut play.gui, &dir, play.size).unwrap());
+        let registration = action::simple(0xb4, Identity { kind: 0, instance: 213010 }, Identity { kind: 10111, instance: -7 });
+        play.zone.on_frame(&n3_frame(1, 0, action::character_action(42, &registration)));
+        play.hud.as_mut().unwrap().update(&mut play.gui, &mut play.zone, 0.0);
+        play.special_action(10111);
+        let frames = play.fight.as_mut().unwrap().take_outbox();
+        assert_eq!(frames.len(), 1);
+        let (_, request) = action::parse_character_action(&frames[0].payload).unwrap();
+        assert_eq!((request.action, request.identity_a, request.identity_b),
+            (0xb3, Identity { kind: 0xc350, instance: 42 }, Identity { kind: 10111, instance: -7 }));
+        play.zone.feed_perk_lock(111, 30); // Native catalogue111 grants Action_e10111, not template213010.
+        play.hud.as_mut().unwrap().update(&mut play.gui, &mut play.zone, 0.0);
+        assert!(play.hud.as_ref().unwrap().actions.list.disabled(10111));
+        play.special_action(10111);
+        assert!(play.fight.as_mut().unwrap().take_outbox().is_empty(), "locked flag stops activation before packet dispatch");
+        let clear = action::simple(0xb2, Identity::default(), Identity { kind: 0, instance: 10111 });
+        play.zone.on_frame(&n3_frame(2, 0, action::character_action(42, &clear)));
+        play.hud.as_mut().unwrap().update(&mut play.gui, &mut play.zone, 0.0);
+        play.special_action(10111);
+        assert_eq!(play.fight.as_mut().unwrap().take_outbox().len(), 1, "native flag clear releases dispatch independently of the icon lock");
+    }
 
     #[test]
     fn manual_reload_waits_for_server_acknowledgement() {

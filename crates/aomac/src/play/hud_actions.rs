@@ -47,7 +47,7 @@ impl HudActions {
     pub(super) fn update(&mut self, zone: &mut Zone, perks: &super::hud_perks::PerkDb) {
         for event in std::mem::take(&mut zone.special_action_feed) {
             match event {
-                super::zone::SpecialActionEvent::Register(action, template) => self.list.register(action, template),
+                super::zone::SpecialActionEvent::Register(action, owner, template) => self.list.register(action, owner, template),
                 super::zone::SpecialActionEvent::Action(action, disabled) => self.list.set_disabled(action, disabled),
                 super::zone::SpecialActionEvent::Perk(id, disabled) => {
                     if let Some(perk) = perks.get(id) { self.list.set_disabled(perk.action, disabled); }
@@ -93,7 +93,16 @@ mod tests {
         assert_eq!(actions.list.find(213010).unwrap().shown, 10111);
         assert!(actions.menu_items().contains(&(213010, 1, "Registered perk".into(), 10111)));
         assert!(zone.special_action_feed.is_empty());
-
+        let ao_net::n3::action::Outgoing::Action(request) = actions.list.find(213010).unwrap().registered_action(42).unwrap() else { panic!("registered action request") };
+        let bytes = ao_net::n3::action::character_action(42, &request);
+        let (header, decoded) = ao_net::n3::action::parse_character_action(&bytes).unwrap();
+        assert_eq!(header.target, ao_net::msg::Identity { kind: 0xc350, instance: 42 });
+        assert_eq!((decoded.action, decoded.param, decoded.identity_a, decoded.identity_b, decoded.text.as_str()),
+            (0xb3, 0, header.target, ao_net::msg::Identity { kind: 10111, instance: 111 }, ""));
+        actions.list.set_disabled(10111, true);
+        assert!(actions.list.find(213010).unwrap().registered_action(42).is_none(), "entry flag blocks dynamic packet dispatch");
+        actions.list.set_disabled(10111, false);
+        assert!(actions.list.find(213010).unwrap().registered_action(42).is_some());
     }
 
     #[test]
@@ -102,10 +111,11 @@ mod tests {
         let mut actions = HudActions::new(std::path::Path::new("/nonexistent-aomac-client"));
         let mut zone = Zone::default();
         let perks = super::super::hud_perks::PerkDb::default();
-        zone.special_action_feed.extend([SpecialActionEvent::Action(10111, true), SpecialActionEvent::Register(10111, 213010)]);
+        zone.special_action_feed.extend([SpecialActionEvent::Action(10111, true), SpecialActionEvent::Register(10111, -7, 213010)]);
         actions.update(&mut zone, &perks);
         let entry = actions.list.find(213010).unwrap();
         assert_eq!(entry.flags, 0, "a flag event for an absent entry is not replayed after registration");
+        assert_eq!(entry.registered_owner, Some(-7), "owner instances retain the raw wire bits");
         zone.special_action_feed.push(SpecialActionEvent::Action(10111, true));
         actions.update(&mut zone, &perks);
         assert!(actions.list.disabled(10111));

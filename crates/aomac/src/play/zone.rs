@@ -93,7 +93,7 @@ pub const TELEPORT_TIMEOUT: f32 = 30.0;
 
 /// Ordered native special-action registrations and entry-flag changes.
 pub enum SpecialActionEvent {
-    Register(u32, u32),
+    Register(u32, i32, u32),
     Action(u32, bool),
     Perk(u32, bool),
 }
@@ -808,7 +808,7 @@ impl Zone {
                     self.apply_stats([(0x241, 0)]);
                 }
                 if a.action == 0xb4 && a.identity_b.kind > 0 && a.identity_a.instance > 0 {
-                    self.special_action_feed.push(SpecialActionEvent::Register(a.identity_b.kind as u32, a.identity_a.instance as u32));
+                    self.special_action_feed.push(SpecialActionEvent::Register(a.identity_b.kind as u32, a.identity_b.instance, a.identity_a.instance as u32));
                 }
                 // `FUN_1005d0d8` case 0x5a (action 0xd0, 0x1005e8b5): `SetStat(identity_b.kind, identity_b.instance)` on the drained character (Health / Nano)
                 if a.action == 0xd0 && a.identity_b.kind > 0 {

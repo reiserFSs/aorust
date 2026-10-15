@@ -80,6 +80,8 @@ pub struct Entry {
     pub shown: u32,
     /// Template supplied by `GC 10042e16` for dynamically registered actions.
     pub registered_template: Option<u32>,
+    /// Dynamic owner identity instance, supplied independently of action/template by CharacterAction 0xb4.
+    pub registered_owner: Option<i32>,
     /// Native +0x1c; bit 0 marks an action disabled independently of its progress timer.
     pub flags: u32,
 }
@@ -89,6 +91,14 @@ impl Entry {
         self.registered_template.or_else(|| template_of(self.shown))
     }
 
+    /// GC1004256c: dynamic owner kind0xc78e sends action0xb3, with the own character as identity_a.
+    pub fn registered_action(&self, own: i32) -> Option<ao_net::n3::action::Outgoing> {
+        if self.flags & 1 != 0 { return None; }
+        self.registered_owner.map(|owner| ao_net::n3::action::Outgoing::Action(ao_net::n3::action::simple(
+            0xb3, ao_net::msg::Identity { kind: 0xc350, instance: own },
+            ao_net::msg::Identity { kind: self.shown as i32, instance: owner },
+        )))
+    }
 }
 
 /// What the own character is doing: the inputs of the toggles (`FUN_1006d196` movement-mode switch, `FUN_10068b7f` / `FUN_100593d3` fight
@@ -148,18 +158,19 @@ impl SpecialList {
     fn add(&mut self, action: u32, alt: u32) {
         if template_of(action).is_some() && !self.entries.iter().any(|e| e.key == action) {
             let flags = u32::from(action > 0x8d && self.recharge.iter().any(|lock| lock.action == action));
-            self.entries.push(Entry { key: action, alt, shown: action, registered_template: None, flags });
+            self.entries.push(Entry { key: action, alt, shown: action, registered_template: None, registered_owner: None, flags });
         }
     }
 
     /// `GC 10042e16`: the server supplies the template; catalogue perk items are not action templates.
-    pub fn register(&mut self, action: u32, template: u32) {
+    pub fn register(&mut self, action: u32, owner: i32, template: u32) {
         if template == 0 { return; }
         if let Some(entry) = self.entries.iter_mut().find(|e| e.key == action) {
             entry.registered_template = Some(template);
+            entry.registered_owner = Some(owner);
         } else {
             let flags = u32::from(action > 0x8d && self.recharge.iter().any(|lock| lock.action == action));
-            self.entries.push(Entry { key: action, alt: 0, shown: action, registered_template: Some(template), flags });
+            self.entries.push(Entry { key: action, alt: 0, shown: action, registered_template: Some(template), registered_owner: Some(owner), flags });
         }
     }
 
@@ -287,8 +298,8 @@ mod tests {
     #[test]
     fn registered_perk_template_is_authoritative() {
         let mut l = SpecialList::new();
-        l.register(10111, 213010);
-        l.register(10111, 213010);
+        l.register(10111, 111, 213010);
+        l.register(10111, 111, 213010);
         let e = l.find(213010).unwrap();
         assert_eq!((e.shown, e.template()), (10111, Some(213010)));
         assert_eq!(l.entries().iter().filter(|e| e.key == 10111).count(), 1);
@@ -306,7 +317,7 @@ mod tests {
     fn initial_list_shows_the_first_action_of_each_toggle() {
         let l = SpecialList::new();
         assert_eq!(shown(&l), [3, 1, 0xb, 0x4c, 0x11, 0x13, 0x51, 0x14, 0x86]);
-        assert_eq!(l.entries[2], Entry { key: 0xb, alt: 0x4e, shown: 0xb, registered_template: None, flags: 0 });
+        assert_eq!(l.entries[2], Entry { key: 0xb, alt: 0x4e, shown: 0xb, registered_template: None, registered_owner: None, flags: 0 });
     }
 
     /// Sit shows Stand, release shows Sit; a hotbar slot holding Sit follows the queued change and the change is queued once.
@@ -385,7 +396,7 @@ mod tests {
     #[test]
     fn native_lock_ranges_and_entry_flags_are_independent_of_timer_text() {
         let mut list = SpecialList::new();
-        list.register(10111, 213010);
+        list.register(10111, 111, 213010);
         list.sync_recharge(
             [Recharge { action: 141, total: 10, remaining: 5 }, Recharge { action: 142, total: 10, remaining: 5 },
                 Recharge { action: 999, total: 10, remaining: 5 }, Recharge { action: 10111, total: 99, remaining: 98 }].into_iter(),
