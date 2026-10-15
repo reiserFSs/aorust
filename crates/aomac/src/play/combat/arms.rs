@@ -236,6 +236,11 @@ impl Armory {
     pub fn on_message(&mut self, m: &Message, npc: bool) {
         let who = m.header.target;
         match &m.body {
+            N3::Dynel(Dynel::Stat(s)) if who.kind == ao_net::n3::dynel::KIND_WEAPON_ITEM => {
+                if let Some(item) = self.weapon_item_mut(who.instance) {
+                    for &(stat, value) in &s.stats { if stat == 26 { item.clip = value; } }
+                }
+            }
             N3::Dynel(Dynel::WeaponItemFullUpdate(w)) if w.parent.kind == CHAR_KIND => {
                 let stats: Vec<(u32, i32)> = w.stats.iter().map(|&(i, v)| (i as u32, v)).collect();
                 self.wield(w.parent.instance, who.instance, i32::from(w.byte_71), static_instance(&stats), &stats);
@@ -301,14 +306,18 @@ impl Armory {
         self.bag.get(&item).or_else(|| self.worn_item(item).map(|(_, _, item)| item))
     }
 
+    fn weapon_item_mut(&mut self, instance: i32) -> Option<&mut Item> {
+        if let Some(&(holder, slot)) = self.worn.get(&instance) {
+            self.by.get_mut(&holder)?.slots.get_mut(&slot)
+        } else {
+            self.bag.get_mut(&instance)
+        }
+    }
+
     /// GC10069274: set the named weapon's nonnegative Ammo; return raw RechargeDelay.
     pub fn reload(&mut self, weapon: ao_net::msg::Identity, clip: i32) -> Option<i32> {
         if weapon.kind != ao_net::n3::dynel::KIND_WEAPON_ITEM { return None; }
-        let item = if let Some(&(holder, slot)) = self.worn.get(&weapon.instance) {
-            self.by.get_mut(&holder)?.slots.get_mut(&slot)?
-        } else {
-            self.bag.get_mut(&weapon.instance)?
-        };
+        let item = self.weapon_item_mut(weapon.instance)?;
         if item.clip < 0 { return None; }
         item.clip = clip;
         Some(item.recharge)

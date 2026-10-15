@@ -133,6 +133,8 @@ Runtime behavior is intentionally unchanged for this report.
   weapon identity (including bag weapons), updates nonnegative Ammo26, starts its raw RechargeDelay timer,
   and emits `Feedback_Reloading`. No template/item exceptions and no fabricated automatic reload.
   The shared `Dynels::stat_of` accessor exposes the retained weapon Ammo26 to item-info consumers.
+  Generic weapon `StatIIR_t` deltas also update that same retained Ammo field unconditionally
+  (the normal stat message setter path); only reload acknowledgements use the prior-nonnegative guard.
   The send gate is also resolved: `100694aa` passes `WeaponHolder_t+0x84` (the reload timer weak pointer)
   to `10029e66`, which tests the live reference count at control-block+4 for zero. `10068a89`
   installs that same timer; its completion slot `10068301` calls `1006b228` to clear the weak pointer

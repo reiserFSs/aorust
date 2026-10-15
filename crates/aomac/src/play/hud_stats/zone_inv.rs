@@ -271,6 +271,18 @@ mod tests {
         assert_eq!(z.inventory[&0x40].b, 123);
         assert_eq!(z.world.arms.weapon_item(900).unwrap().clip, 25);
         assert_eq!(z.world.stat_of(KIND_WEAPON_ITEM, 900, 26), Some(25));
+        // A generic authoritative stat delta must update that same retained Ammo state,
+        // including crossing from negative to nonnegative (unlike the reload guard).
+        {
+            use ao_net::n3::{Message, N3, N3Header, dynel::{Dynel, StatUpdate}};
+            for value in [-1, 25] {
+                z.world.on_message(&Message {
+                    header: N3Header { msg_type: ao_net::n3::dynel::STAT, target: weapon, flag: 0 }, sender: 1,
+                    body: N3::Dynel(Dynel::Stat(StatUpdate { stats: vec![(26, value)], rest: vec![] })),
+                });
+                assert_eq!(z.world.stat_of(KIND_WEAPON_ITEM, 900, 26), Some(value));
+            }
+        }
         assert_eq!(z.world.arms.weapon_item(899).unwrap().clip, 0);
         assert_eq!(z.world.reload_bar_progress(), Some((0.0, 2.5)));
         z.on_frame(&ack(inv::item_identity(0x40), 0, 30, 2));
