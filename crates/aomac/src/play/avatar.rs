@@ -742,9 +742,9 @@ impl Avatar {
         }
     }
 
-    /// Embedded worn lights remain active even when the camera hides or fades the own body.
-    /// Unresolved retail guess: Randy 0x1003ff72/0x1004ce96 show no own-character distinction,
-    /// but whether ShowMyCharacter hiding skips light Process upstream is not yet traced.
+    /// Embedded worn lights use the posed avatar transform, independently of body alpha.
+    /// The caller applies CAT visibility: DisplaySystem 0x10073693 detaches hidden frames
+    /// before Randy 0x1005798b -> 0x100577d3 can process their mounted lights.
     pub fn lights(&self) -> impl Iterator<Item = ao_scene::Light> + '_ {
         if self.rig.has_mount_lights() {
             self.refresh_pose();

@@ -676,9 +676,11 @@ impl Player {
         let head_to_camera = head_position - host.camera.pos;
         let alpha = self.fader.step(&self.fade, head_to_camera.length_squared());
         self.avatar.set_animation_refresh(host.smooth_animations, host.camera.pos, host.previous_visible_actors.contains(&self.char_id));
-        host.dynamic_lights.extend(self.avatar.lights());
         zone.world.set_own_pick(None);
         if self.camera.show_avatar() {
+            // N3 Run 0x100196bd -> DisableVisibility 0x10073693 detaches the CAT frame,
+            // so its mounted lights no longer reach Randy ProcessAttractorChilds 0x100577d3.
+            host.dynamic_lights.extend(self.avatar.lights());
             let mut frame = self.avatar.frame();
             frame.alpha = alpha;
             zone.world.set_own_pick(frame.skin.as_ref().and_then(|vertices| super::hud_pick::bounds_of(vertices.iter().map(|v| &v.pos)))
@@ -1079,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn own_light_bar_tracks_player_frame_even_when_body_hidden_and_unequips() {
+    fn own_light_bar_tracks_visible_player_frame_and_unequips() {
         let dir = ao_gui::client_dir();
         if !dir.join("cd_image/rdb.db").exists() { return; }
         let (mut player, mut zone) = light_bar_player(&dir, 175);
@@ -1108,11 +1110,17 @@ mod tests {
             host.dynamic_lights.clear();
             player.frame(0.0, &mut host, &mut zone, false);
             assert!(host.actors.is_empty(), "first-person must really hide the body");
-            assert_eq!(host.dynamic_lights.len(), 1, "hidden own body still illuminates the world");
+            assert!(host.dynamic_lights.is_empty(), "disabled CAT visibility must also stop mounted light processing");
+            player.camera.set_prefs(&ControlPrefs { show_my_character: true, ..Default::default() });
+            player.frame(0.0, &mut host, &mut zone, false);
+            assert_eq!(host.actors.len(), 1, "ShowMyCharacter must restore the first-person body");
+            assert_eq!(host.dynamic_lights.len(), 1, "ShowMyCharacter must restore its mounted light");
             let world = glam::Mat4::from_translation(glam::Vec3::from(scene_pos(pos)))
                 * glam::Mat4::from_rotation_y(scene_yaw(yaw)) * glam::Mat4::from_scale(glam::Vec3::splat(1.75));
             assert!((glam::Vec3::from(host.dynamic_lights[0].pos) - world.transform_point3(local)).length() < 1e-4);
+            player.camera.set_prefs(&ControlPrefs { show_my_character: false, ..Default::default() });
         }
+        player.camera.select_mode(3);
         zone.own_events.push(OwnEvent::Appearance(light_bar_appearance(false)));
         host.dynamic_lights.clear();
         player.frame(0.0, &mut host, &mut zone, false);
