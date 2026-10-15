@@ -562,8 +562,10 @@ pub fn swing_speed_scale(note_time_ms: f32, item_delay_cs: i32) -> f32 {
 pub const ACTION_DIE: i32 = 0x63;
 /// Stat the dying character's animation id is stored in (`CharDie_t` ctor reads `GetSkill(0x183)`).
 pub const STAT_DEATH_ANIM: u32 = 0x183;
-/// Death animation of the own character when its stat 0x183 is 0 (a death the client computed itself, `FUN_1005ae91`, no server action 99):
-/// **[UNRESOLVED GUESS]** 503 (`die-shot`), the only value seen in the capture.
+/// Death animation of the own character when stat 0x183 is absent (no server action 99).
+/// **[UNRESOLVED GUESS]** 503 (`die-shot`) is only observed on server actions.
+/// Searched GC 0x1005ae91 / asm 0x1005af00: writes Health 0, not a default for
+/// 0x183; GC 0x1007b2ba reads that stat. Its initial value remains unproven.
 pub const DEFAULT_DEATH_ANIM: u16 = 503;
 /// `CharacterActionIIR_t` action of a character being struck (`FUN_1005d0d8` case 0x5b).
 pub const ACTION_HIT: i32 = 0xd1;
