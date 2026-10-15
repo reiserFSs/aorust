@@ -7,6 +7,18 @@ use crate::gpu_stats::GpuStatsExt;
 // The two native passes follow the final ordinary/sky pipeline, not the native blend block.
 pub(super) const PIPE: usize = super::SKY_LAST_PIPE + 1;
 
+fn passes(style: u32) -> usize { if style == 1 { 3 } else if style == 4 { 1 } else { 2 } }
+fn pass_pipe(style: u32, pass: usize) -> usize {
+    PIPE + match style { 1 => 2 + pass, 3 => 5 + pass, _ => pass }
+}
+
+// DS1003c509 writes byte26 (red), not byte27 (alpha), of FVF0x152.
+fn lava_color(vertex: &Vertex, wave: &[f32; 16]) -> [f32; 4] {
+    let selector = (f64::from(vertex.pos[0] - vertex.pos[2]) - 0.49999).round_ties_even() as i64 as usize & 7;
+    let red = 255 - ((wave[selector] * 255.0) as u32 >> 2);
+    [(red as f32 / 255.0).powf(2.2), vertex.color[1], vertex.color[2], vertex.color[3]]
+}
+
 pub(super) struct LiquidRun {
     pub source: Surface,
     cell: Option<([i32; 2], bool)>,
@@ -27,14 +39,27 @@ impl LiquidRun {
 // The two native accumulators are draw-count based (not dt based). Keep them
 // independent of texture-scroll time, including when screenshots seek the clock.
 fn next_edge_phase(phase: &mut f32, style: u32) {
-    *phase += if style == 2 { 0.03 } else { 0.003 };
+    *phase += if matches!(style, 1 | 2) { 0.03 } else { 0.003 };
     if *phase > 1000.0 { *phase = 0.0; }
 }
 
 fn layer_uv(v: &Vertex, index: usize, style: u32, pass: usize, time: f32, edge: f32, wave: &[f32; 16]) -> [f32; 2] {
     let [x, _, z] = v.pos;
     let [nx, ny, nz] = v.normal;
-    let base = [x / if style == 2 { 12.0 } else if style == 4 { 160.0 } else { 40.0 }, -z / if style == 2 { 12.0 } else if style == 4 { 160.0 } else { 40.0 }];
+    let scale = if style == 1 { 8.0 } else if style == 2 { 12.0 } else if style == 4 { 160.0 } else { 40.0 };
+    let base = [x / scale, -z / scale];
+    if style == 1 {
+        if pass == 0 {
+            return [base[0] + 0.36 * (wave[index & 7] + wave[0]), base[1] + 0.36 * (wave[(index + 1) & 7] + wave[1])];
+        }
+        if pass == 2 { return base; } // crust uses camera-position texgen in the shader
+        if ny < 0.9999 {
+            let n = Vec3::new(nx * 1000.0, ny, -nz * 1000.0).normalize();
+            return [base[0] - edge * n.x + 0.36 * wave[0], base[1] - edge * n.z + 0.36 * wave[1]];
+        }
+        return [base[0] + 0.36 * wave[0], base[1] + 0.36 * wave[1]];
+    }
+    if style == 3 { return base; }
     if style == 2 {
         // Native integer oscillator table +0x50, divided by4096; identity
         // matrix diagonal100aec48/4c, off-diagonals1015017c/80 start0.
@@ -91,20 +116,19 @@ impl Renderer {
                 }
                 run.cell = Some(cell);
                 run.gpu_indices.clear();
-                run.gpu_indices.extend_from_slice(&run.indices);
-                if run.source.style != 4 {
-                    let base = run.vertices.len() as u32;
-                    run.gpu_indices.extend(run.indices.iter().map(|i| i + base));
+                let base = run.vertices.len() as u32;
+                for pass in 0..passes(run.source.style) {
+                    run.gpu_indices.extend(run.indices.iter().map(|i| i + base * pass as u32));
                 }
                 for (pass, draw) in self.gpu.liquid.iter_mut().filter(|draw| draw.mesh == run.source.mesh).enumerate() {
                     draw.first_index = (pass * run.indices.len()) as u32;
                     draw.count = run.indices.len() as u32;
-                    draw.pipe = PIPE + pass;
+                    draw.pipe = pass_pipe(run.source.style, pass);
                 }
             }
             if run.indices.is_empty() { continue; }
-            let edge = &mut self.liquid_edge[usize::from(run.source.style == 2)];
-            if run.source.style != 4 { next_edge_phase(edge, run.source.style); }
+            let edge = &mut self.liquid_edge[match run.source.style { 1 => 2, 2 => 1, _ => 0 }];
+            if !matches!(run.source.style, 3 | 4) { next_edge_phase(edge, run.source.style); }
             // Visibility is from the *previous* frame's frustum cull (this frame's isn't computed yet when
             // `update_liquids` runs, before `render`'s cull pass): close enough to skip the per-vertex UV pass
             // (the actual per-frame cost here, `layer_uv`'s wave/trig math times every vertex times up to 2
@@ -113,14 +137,14 @@ impl Renderer {
             let visible = self.vis_range.get(run.source.mesh).is_none_or(|r| !r.is_empty());
             if !changed && !visible { continue; }
             run.bytes.clear();
-            let passes = if run.source.style == 4 { 1 } else { 2 };
-            for pass in 0..passes {
+            for pass in 0..passes(run.source.style) {
                 for (i, vertex) in run.vertices.iter().enumerate() {
                     let uv = layer_uv(vertex, i, run.source.style, pass, self.time, *edge, &wave);
                     run.bytes.extend_from_slice(&vertex.pos);
                     run.bytes.extend_from_slice(&vertex.normal);
                     run.bytes.extend_from_slice(&uv);
-                    run.bytes.extend_from_slice(&vertex.color);
+                    let color = if run.source.style == 1 { lava_color(vertex, &wave) } else { vertex.color };
+                    run.bytes.extend_from_slice(&color);
                 }
             }
             let vertex_size = (run.bytes.len() * 4) as u64;
@@ -145,6 +169,58 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lava_three_passes_preserve_native_color_channel_and_uvs() {
+        let v = Vertex { pos: [8.0, 0.0, -16.0], color: [1.0, 0.0, 0.0, 0.25], ..Default::default() };
+        let wave = [1.0; 16];
+        assert_eq!(passes(1), 3);
+        assert_eq!((0..3).map(|p| pass_pipe(1, p)).collect::<Vec<_>>(), vec![PIPE + 2, PIPE + 3, PIPE + 4]);
+        let color = lava_color(&v, &wave);
+        assert!((color[0] - (192.0f32 / 255.0).powf(2.2)).abs() < 1e-6);
+        assert_eq!(color[3], 0.25, "draw animation changes red, never geometry alpha");
+        let close = |a: [f32; 2], b: [f32; 2]| assert!(a.into_iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-6));
+        close(layer_uv(&v, 0, 1, 0, 0.0, 0.03, &wave), [1.72, 2.72]);
+        close(layer_uv(&v, 0, 1, 1, 0.0, 0.03, &wave), [1.36, 2.36]);
+        let mut phase = 0.0;
+        next_edge_phase(&mut phase, 1);
+        assert_eq!(phase, 0.03);
+    }
+
+    #[test]
+    fn native_lava_crust_multiplies_both_texture_alphas_offscreen() {
+        use ao_scene::{liquid::SourceTriangle, Blend, Instance, Mesh, Scene, Submesh, Texture, TextureKey, TextureSource, IDENTITY};
+        let positions = [[100.0, 0.0, -100.0], [140.0, 0.0, -100.0], [140.0, 0.0, -140.0], [100.0, 0.0, -140.0]];
+        let source = Surface::new(0, 1, [[0, 1, 2], [0, 2, 3]].map(|triangle| SourceTriangle {
+            kind: 2, vertices: triangle.map(|index| Vertex { pos: positions[index], ..Default::default() }),
+        }).into()).unwrap();
+        let (mut vertices, mut indices, mut colors) = (vec![], vec![], vec![]);
+        source.geometry([120.0, 10.0, -120.0], false, &mut vertices, &mut indices, &mut colors);
+        let count = vertices.len() as u32;
+        let water = TextureKey { rdb_type: 0, id: 1 };
+        let crust = TextureKey { rdb_type: 0, id: 2 };
+        let mut mesh = Mesh { vertices, submeshes: vec![] };
+        for (pass, texture) in [water, water, crust].into_iter().enumerate() {
+            if pass != 0 { mesh.vertices.extend_from_within(..count as usize); }
+            let mut sub = Submesh::new(indices.iter().map(|index| index + count * pass as u32).collect(), Some(texture));
+            sub.liquid = true;
+            sub.two_sided = true;
+            sub.blend = Blend::AlphaBlend;
+            mesh.submeshes.push(sub);
+        }
+        let mut scene = Scene { meshes: vec![mesh], instances: vec![Instance { mesh: 0, transform: IDENTITY }], liquids: vec![source], ..Default::default() };
+        for (key, rgba) in [(water, vec![255, 255, 255, 255]), (crust, vec![0, 255, 0, 128])] {
+            scene.textures.insert(key, Texture { width: 1, height: 1, rgba, source: TextureSource::PngRgba });
+        }
+        let path = std::env::temp_dir().join(format!("aomac-native-lava-{}.png", std::process::id()));
+        super::super::render_to_png(&scene, [120.0, 10.0, -120.0], [120.0, 0.0, -120.1], 64, 64, &path).unwrap();
+        let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap())).read_info().unwrap();
+        let mut pixels = vec![0; decoder.output_buffer_size()];
+        decoder.next_frame(&mut pixels).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let pixel = &pixels[(32 * 64 + 32) * 4..][..3];
+        assert!((55..75).contains(&pixel[1]) && pixel[0] > 100 && pixel[2] < 5, "{pixel:?}: crust alpha must be (128/255)^2, not a mean .84");
+    }
+
     #[test]
     fn native_authored_water_layers_and_draw_clock() {
         let close = |actual: [f32; 2], expected: [f32; 2]| assert!(actual.into_iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-6), "{actual:?} != {expected:?}");

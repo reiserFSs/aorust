@@ -558,7 +558,7 @@ pub struct Renderer {
     gpu: Gpu,
     liquids: Vec<native_liquid::LiquidRun>,
     realistic_water: bool,
-    liquid_edge: [f32; 2],
+    liquid_edge: [f32; 3],
     water_light: Option<([f32; 3], [f32; 3])>,
     sky: SkyGpu,
     cloud_preferences: (bool, bool, bool),
@@ -732,6 +732,14 @@ fn build_pipelines(
                 ("fs_blend", Some(wgpu::BlendState { color: component, alpha: component }), true)
             },
             14 => ("fs_sky_add", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
+            15..=17 => {
+                let component = wgpu::BlendComponent {
+                    src_factor: if effect == 16 { wgpu::BlendFactor::OneMinusSrcAlpha } else { wgpu::BlendFactor::SrcAlpha },
+                    dst_factor: if effect == 16 { wgpu::BlendFactor::SrcAlpha } else { wgpu::BlendFactor::OneMinusSrcAlpha },
+                    operation: wgpu::BlendOperation::Add,
+                };
+                (if effect == 17 { "fs_lava_crust" } else { "fs_lava" }, Some(wgpu::BlendState { color: component, alpha: component }), true)
+            },
             _ => (fs, state, depth_write),
         };
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -742,7 +750,7 @@ fn build_pipelines(
             layout: Some(if effect == 1 || (8..=11).contains(&effect) { holo_pipeline_layout } else { layout }),
             vertex: wgpu::VertexState {
                 module: shader,
-                entry_point: Some(if effect == 14 { "vs_sky_points" } else if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 2 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
+                entry_point: Some(if effect == 14 { "vs_sky_points" } else if (15..=17).contains(&effect) { "vs_lava" } else if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 2 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
                 compilation_options: Default::default(),
                 buffers: &[
                     wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
@@ -769,7 +777,7 @@ fn build_pipelines(
                 format: DEPTH,
                 depth_write_enabled: Some(depth_write),
                 // the env pass redraws the very triangles of the base pass: D3D's default ZFUNC LESSEQUAL
-                depth_compare: Some(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 10 | 12 | 13) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }),
+                depth_compare: Some(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 10 | 12 | 13 | 15..=17) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }),
                 stencil: Default::default(),
                 // Blended overlays are often coplanar with the opaque surface below them.
                 bias: if effect == 7 { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else if effect != 0 || depth_write || env { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
@@ -801,8 +809,8 @@ fn build_pipelines(
     assert_eq!(pipe_specs.clone().count(), SKY_POINT_PIPE, "point list follows triangle sky pipelines");
     let pipes: Vec<_> = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0))
         .chain(std::iter::once(mk(Blend::Additive, true, true, false, false, false, false, 14)))
-        .chain((12..=13).map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, effect))).collect();
-    assert_eq!(pipes.len(), native_liquid::PIPE + 2);
+        .chain([12, 13, 15, 16, 17].into_iter().map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, effect))).collect();
+    assert_eq!(pipes.len(), native_liquid::PIPE + 5);
     let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().take(MESH_EFFECT_STRIDE).map(move |spec| (effect, spec)))
         .map(|(effect, (b, two, sky, env, fade, sprite))| mk(b, two, sky, env, fade, sprite, true, effect)).collect();
     let ground_pipes = (8..=11).map(|effect| mk(Blend::Opaque, false, false, false, false, false, false, effect)).collect();
@@ -941,7 +949,7 @@ impl Renderer {
             spaceships_shown: true,
             liquids: vec![],
             realistic_water: true,
-            liquid_edge: [0.0; 2],
+            liquid_edge: [0.0; 3],
             water_light: None,
             far_away: vec![],
             day_time: 0.0,

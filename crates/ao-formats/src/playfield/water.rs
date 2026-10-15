@@ -53,32 +53,18 @@ pub fn parse(r: &mut Rd) -> Result<Vec<Water>> {
     Ok(out)
 }
 
-/// Retained independent lava/star stages.
-/// Water/slime/mud/acid/shallow and native default-kind materials use `native_mesh`.
+/// Retained star-water stage; lava uses the native three-pass path.
 struct Liquid {
-    /// Vertex colour ARGB bytes (sRGB-ish, as D3D: the alpha is the vertex alpha, the water textures are JPEG).
     argb: u32,
     texture: &'static str,
-    /// Metres per texture repeat (40 star, 8 lava).
     scale: f32,
 }
 
 const WATER_TEX: &str = "water5.png";
 
 fn legacy_liquid(kind: u32) -> Option<Liquid> {
-    let (argb, texture, scale) = match kind >> 1 {
-        1 => (0xffff_0000, WATER_TEX, 8.0),
-        7 => (0xffff_ffff, "stars01.png", 40.0),
-        _ => return None,
-    };
-    Some(Liquid { argb, texture, scale })
+    (kind >> 1 == 7).then_some(Liquid { argb: 0xffff_ffff, texture: "stars01.png", scale: 40.0 })
 }
-
-/// Crust of the lava: `env_lava2.png` (RGBA, alpha 60..255) blended over the lava with its own alpha; the client multiplies the
-/// alphas of two copies at 75 m and 250 m (`FUN_1003c356`, blob 0x7e8), we draw one at 75 m with the mean of the product.
-const CRUST_TEX: &str = "env_lava2.png";
-const CRUST_SCALE: f32 = 75.0;
-const CRUST_ALPHA: f32 = 0.84;
 
 fn argb_to_linear(argb: u32) -> [f32; 4] {
     let b = |s: u32| (argb >> s & 0xff) as f32 / 255.0;
@@ -102,8 +88,8 @@ pub fn emit(store: &RecordStore, waters: &[Water], scene: &mut Scene) -> Result<
         let source: Vec<_> = waters.iter().filter(|w| native_style(w.kind) == Some(style) && !w.tris.is_empty()).collect();
         if source.is_empty() { continue; }
         let mesh_index = scene.meshes.len();
-        let mesh = if matches!(style, 0 | 2 | 4) {
-            let scale = if style == 2 { 12.0 } else if style == 4 { 160.0 } else { 40.0 };
+        let mesh = if matches!(style, 0 | 1 | 2 | 4) {
+            let scale = if style == 1 { 8.0 } else if style == 2 { 12.0 } else if style == 4 { 160.0 } else { 40.0 };
             let triangles = source.iter().flat_map(|w| w.tris.iter().map(|t| ao_scene::liquid::SourceTriangle {
                 kind: w.kind,
                 vertices: t.map(|i| { let p = w.verts[i as usize]; Vertex { pos: [p[0], p[1], -p[2]], uv: [p[0] / scale, p[2] / scale], ..Default::default() } }),
@@ -131,6 +117,23 @@ fn native_mesh(surface: &ao_scene::liquid::Surface, camera: [f32; 3], tex: &mut 
     let mut mesh = Mesh::default();
     let (mut indices, mut colors) = (Vec::new(), Vec::new());
     surface.geometry(camera, false, &mut mesh.vertices, &mut indices, &mut colors);
+    if surface.style == 1 {
+        // DS1003c356/1003db41: two unlit water5 passes, then the
+        // camera-generated env_lava2 RGB / two-texture alpha-product crust.
+        let water = tex(WATER_TEX).ok_or_else(|| anyhow::anyhow!("missing native lava texture {WATER_TEX}"))?;
+        let crust = tex("env_lava2.png").ok_or_else(|| anyhow::anyhow!("missing native lava texture env_lava2.png"))?;
+        let count = mesh.vertices.len() as u32;
+        for (pass, texture) in [water, water, crust].into_iter().enumerate() {
+            if pass != 0 { mesh.vertices.extend_from_within(..count as usize); }
+            let mut sub = Submesh::new(indices.iter().map(|index| index + pass as u32 * count).collect(), Some(texture));
+            sub.liquid = true;
+            sub.two_sided = true;
+            sub.blend = Blend::AlphaBlend;
+            sub.emissive = [1.0; 3];
+            mesh.submeshes.push(sub);
+        }
+        return Ok(mesh);
+    }
     let name = if surface.style == 2 { "toxicwater.png" } else { WATER_TEX };
     let key = tex(name).ok_or_else(|| anyhow::anyhow!("missing native liquid texture {name}"))?;
     let mut sub = Submesh::new(indices, Some(key));
@@ -158,7 +161,6 @@ fn native_mesh(surface: &ao_scene::liquid::Surface, camera: [f32; 3], tex: &mut 
 /// `tex` resolves a texture name to a scene texture.
 fn legacy_mesh<'a>(waters: impl IntoIterator<Item = &'a Water>, tex: &mut dyn FnMut(&str) -> Option<TextureKey>) -> Option<Mesh> {
     let mut mesh = Mesh::default();
-    let mut crust: Vec<u32> = Vec::new();
     let mut by_kind: Vec<(u32, Vec<u32>)> = Vec::new();
     for w in waters.into_iter().filter(|w| !w.tris.is_empty()) {
         let key = (w.kind >> 1).min(10);
@@ -170,12 +172,6 @@ fn legacy_mesh<'a>(waters: impl IntoIterator<Item = &'a Water>, tex: &mut dyn Fn
             by_kind.len() - 1
         });
         by_kind[idx].1.extend(w.tris.iter().flatten().map(|&i| base + i as u32));
-        if key == 1 {
-            // the crust layer has its own uv scale: a second copy of the vertices
-            let cbase = mesh.vertices.len() as u32;
-            mesh.vertices.extend(w.verts.iter().map(|v| Vertex { pos: [v[0], v[1], -v[2]], uv: [v[0] / CRUST_SCALE, v[2] / CRUST_SCALE], ..Default::default() }));
-            crust.extend(w.tris.iter().flatten().map(|&i| cbase + i as u32));
-        }
     }
     if mesh.vertices.is_empty() {
         return None;
@@ -185,26 +181,8 @@ fn legacy_mesh<'a>(waters: impl IntoIterator<Item = &'a Water>, tex: &mut dyn Fn
         let mut s = Submesh::new(indices, tex(l.texture));
         s.two_sided = true;
         s.liquid = true; // `VisualLiquid_t` render list 4
-        let c = argb_to_linear(l.argb);
-        match key {
-            // lava: opaque, unlit red water5 + the crust; `prelit` = unlit in the renderer (vertex colour is white)
-            1 => {
-                s.prelit = true;
-                s.base_color = [c[0], c[1], c[2], 1.0];
-                mesh.submeshes.push(s);
-                let mut crust = Submesh::new(std::mem::take(&mut crust), tex(CRUST_TEX));
-                crust.blend = Blend::AlphaBlend;
-                crust.two_sided = true;
-                crust.liquid = true;
-                crust.prelit = true;
-                crust.base_color = [1.0, 1.0, 1.0, CRUST_ALPHA];
-                mesh.submeshes.push(crust);
-                continue;
-            }
-            // star water: the client projects a star field and mist layers with `ONE, INVSRCCOLOR` [not decoded in detail]
-            7 => s.blend = Blend::Additive,
-            _ => unreachable!("legacy_liquid only emits lava or star water"),
-        }
+        s.base_color = argb_to_linear(l.argb);
+        s.blend = Blend::Additive;
         mesh.submeshes.push(s);
     }
     Some(mesh)
@@ -238,15 +216,18 @@ mod tests {
         let w = parse(&mut r).unwrap();
         assert_eq!(r.o, d.len());
         assert_eq!(w, vec![Water { kind: 2, verts: vec![[0.0, 5.0, 0.0], [10.0, 5.0, 0.0], [0.0, 5.0, 10.0]], tris: vec![[0, 1, 2]] }]);
-        let m = legacy_mesh(w.iter(), &mut |n| Some(TextureKey { rdb_type: TEXTURES, id: n.len() as u32 })).unwrap();
-        assert_eq!(m.vertices.len(), 6); // 3 lava vertices + 3 crust copies
-        assert_eq!(m.vertices[2].pos, [0.0, 5.0, -10.0]); // z negated
-        assert_eq!(m.vertices[2].uv, [0.0, 10.0 / 8.0]); // z metres / lava scale
-        assert_eq!(m.vertices[5].uv, [0.0, 10.0 / 75.0]); // crust scale
-        assert_eq!(m.submeshes.len(), 2);
-        assert_eq!(m.submeshes[0].blend, Blend::Opaque);
-        assert_eq!(m.submeshes[0].base_color, [1.0, 0.0, 0.0, 1.0]); // lava = red
-        assert_eq!(m.submeshes[1].blend, Blend::AlphaBlend);
+        let surface = ao_scene::liquid::Surface::new(0, 1, w.iter().flat_map(|water| water.tris.iter().map(|triangle| ao_scene::liquid::SourceTriangle {
+            kind: water.kind,
+            vertices: triangle.map(|index| { let p = water.verts[index as usize]; Vertex { pos: [p[0], p[1], -p[2]], uv: [p[0] / 8.0, p[2] / 8.0], ..Default::default() } }),
+        })).collect()).unwrap();
+        let m = native_mesh(&surface, surface.initial_camera().unwrap(), &mut |n| Some(TextureKey { rdb_type: TEXTURES, id: n.len() as u32 })).unwrap();
+        assert_eq!(m.vertices.len(), 9);
+        assert_eq!(m.vertices[2].pos, [0.0, 5.0, -10.0]);
+        assert_eq!(m.vertices[2].uv, [0.0, 10.0 / 8.0]);
+        assert_eq!(m.submeshes.len(), 3);
+        assert!(m.submeshes.iter().all(|sub| sub.blend == Blend::AlphaBlend && sub.base_color == [1.0; 4] && sub.emissive == [1.0; 3]));
+        assert_eq!(m.submeshes[2].indices, vec![6, 7, 8]);
+        assert_eq!(m.submeshes[2].texture.unwrap().id, "env_lava2.png".len() as u32);
         assert!(m.submeshes.iter().all(|s| s.liquid), "every liquid submesh is in render list 4");
         assert_eq!(m.submeshes[1].indices, vec![3, 4, 5]);
     }
@@ -275,7 +256,7 @@ mod tests {
         }
         assert!(mesh.vertices[..count].iter().all(|v| v.normal[1] >= 0.0));
         assert!(mesh.vertices[..count].iter().any(|v| v.color[3] > 0.0 && v.color[3] < 1.0));
-        assert!(scene.liquids.iter().all(|surface| matches!(surface.style, 0 | 2 | 4)), "RealisticWater never owns lava/star geometry");
+        assert!(scene.liquids.iter().all(|surface| matches!(surface.style, 0 | 1 | 2 | 4)), "star remains independent until its own cutover");
     }
 
     #[test]
