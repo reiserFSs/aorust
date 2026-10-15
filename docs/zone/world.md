@@ -440,8 +440,10 @@ the corpse to the dead character's relative position when closer than a threshol
 * **Zone-change audio**: `PlayfieldInit` [GC 0x10016e2c] -> `SandyInterfaceModule_t::ActivateGameZone`: when the new world appears the loader
   thread's `ao_audio::PlayfieldAudio::load(store, id, Report::sounds)` is handed to `Audio::set_playfield` (`Bg::Info`, `Play::frame`'s
   world-ready block; `None` leaves the playfield), which stops the old ambience and follows the new districts / emitters through the existing
-  `Audio::update(dt, camera, zone clock)`. Not wired in-world: the weather driver of the offline viewer (`audio.set_weather` / rain, wind
-  levels), see docs/formats.md §audio.
+  `Audio::update(dt, camera, zone clock)`. Live `Play::frame` now feeds `Audio::update_weather` after the server-day weather update,
+  sharing the offline viewer's music inputs and six rain/wind/sand/fallout/quake keepalives. Native GC `100be767` submits rain and quake
+  levels each frame, `100bfa11` submits the four wind levels, and `100b6d67` consumes weather music inputs on the existing 1 Hz district pass.
+  Regression: `weather_frame_routes_music_and_each_keepalive` (installed retail sound bank, headless).
 * **`EnteringNewArea`**: `Report::dungeon` (`Layout::Dungeon`: the playfield record's tilemap id differs from its own id) travels through `Bg::Info`
   to `Play::dungeon`; a dungeon always says `EnteringNewArea` like `N3Msg_IsDungeon`, also when `pfnrmap.dat` names it.
 * **Not implemented**: `SaveAllPrefs` and the two `ParseList`/present passes of `TeleportStartedMessage` (no effect on state/visuals we draw).

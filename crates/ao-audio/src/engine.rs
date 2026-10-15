@@ -256,6 +256,21 @@ impl Audio {
         }
     }
 
+    /// GC100be767/100bfa11 per-frame weather keepalives and GC100b6d67 music inputs.
+    pub fn update_weather(&self, state: &ao_formats::weather::State) {
+        self.set_weather(state.music_state());
+        for (name, level) in [
+            ("SM_Sandy_Env_Rain", state.levels.rain),
+            ("SM_Sandy_Env_Wind", state.levels.wind),
+            ("SM_Sandy_Env_SandWind", state.levels.sand_wind),
+            ("SM_Sandy_Env_FalloutRWind", state.levels.fallout_red_wind),
+            ("SM_Sandy_Env_FalloutGWind", state.levels.fallout_green_wind),
+            ("SM_Sandy_Env_Quake", state.levels.quake),
+        ] {
+            self.play_keepalive_level(name, level);
+        }
+    }
+
     /// Module flag +0xbc (server driven): land-control districts play `Landcontrol_neutral`.
     pub fn set_land_control(&self, on: bool) {
         if let Some(rt) = self.rt().as_mut() {
@@ -579,6 +594,27 @@ mod tests {
         p.sound_on = true;
         audio.set_prefs(&p);
         assert_ne!(audio.sh.mixer().play(VoiceDesc::new(Source::Sample(pcm))), 0);
+    }
+
+    #[test]
+    fn weather_frame_routes_music_and_each_keepalive() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/sound/SourceFiles/SM_Sandy_Game_Dummy.sbf").exists() { return; }
+        let audio = Audio::offline(&dir, 44100);
+        for channel in 0..6 {
+            audio.reset();
+            let mut state = ao_formats::weather::State::clear();
+            state.fields[0] = 0.8;
+            let levels = &mut state.levels;
+            *[&mut levels.rain, &mut levels.wind, &mut levels.sand_wind,
+                &mut levels.fallout_red_wind, &mut levels.fallout_green_wind, &mut levels.quake][channel] = 0.5;
+            audio.update_weather(&state);
+            assert_eq!(audio.rt().as_ref().unwrap().weather, state.music_state());
+            let mut samples = vec![0.0; 44100 * 2];
+            audio.render(&mut samples);
+            assert!(samples.iter().any(|&sample| sample != 0.0), "weather channel {channel}");
+        }
     }
 
     #[test]

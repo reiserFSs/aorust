@@ -1529,6 +1529,9 @@ impl Frontend for Play {
             }
             if let Some(weather) = &mut self.world_weather {
                 weather.update(self.zone.game_day as u32, self.zone.day_time() as f64, dt);
+                if let Some(audio) = &self.audio {
+                    audio.update_weather(weather.state());
+                }
                 host.effect_wind = weather.state().wind;
                 let enabled = weather.state().lightning_enabled();
                 let extent = self.player.as_ref().and_then(|p| p.effect_surface()).and_then(|c| c.borrow().tile_size()).map(ao_formats::lightning::extent).unwrap_or(0.0);

@@ -160,18 +160,7 @@ fn playfield_audio(dir: &std::path::Path, pf: ao_audio::PlayfieldAudio, mut weat
         // FUN_100be767 / FUN_100b6d67: the weather runs per frame, its music slot state and the sky manager's sound levels
         // (FUN_100bfa11, FUN_100be767) go to the mixer
         weather.update(ao_formats::weather::OFFLINE_DAY + (day / 6480.0).floor() as u32, day.rem_euclid(6480.0) as f64, dt);
-        let w = weather.state();
-        audio.set_weather(w.music_state());
-        for (name, level) in [
-            ("SM_Sandy_Env_Rain", w.levels.rain),
-            ("SM_Sandy_Env_Wind", w.levels.wind),
-            ("SM_Sandy_Env_SandWind", w.levels.sand_wind),
-            ("SM_Sandy_Env_FalloutRWind", w.levels.fallout_red_wind),
-            ("SM_Sandy_Env_FalloutGWind", w.levels.fallout_green_wind),
-            ("SM_Sandy_Env_Quake", w.levels.quake),
-        ] {
-            audio.play_keepalive_level(name, level);
-        }
+        audio.update_weather(weather.state());
         audio.update(dt, cam.into(), day);
         since_log += dt;
         if log && since_log >= 2.0 {
