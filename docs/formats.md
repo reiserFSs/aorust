@@ -1,4 +1,40 @@
 
+## Knowledge references (`References.bin`)
+
+`aomac::play::references` follows installed `references.dll` (MD5
+`4ae74e444c445fbc9a63745a85e40bd0`), `RefMan_t::Save` **0x10001784** and
+`Load` **0x10001d50**. All scalar words are **big endian**: BinaryIO.dll
+`File_t::WriteU32` **0x10003741** and `ReadU32` **0x10003267**, byte-order
+argument zero, explicitly write/read most significant byte first.
+
+Header: `u32 version=1003`, `u32 record_count`. Each record starts with a
+`u32 type`: **1** is `u32 low_template, high_template, QL`; **0** is
+`u32 original_identity_type, original_identity_id, payload_byte_length`,
+followed by exactly that many raw bytes, with no terminating NUL. Character
+payload is captured information HTML, not a plain character name. Native
+load rejects lengths above **0x7c00**, truncates the resulting string at its
+first embedded NUL, and reads at most the configured maximum record count.
+The parser reports malformed/truncated input instead of publishing a partial
+store; unknown tags are rejected. Neither runtime dummy-item identities,
+map keys, nor grid positions are stored here. Keys regenerate from one in
+load order; item triples deduplicate and character identities deduplicate
+while updating the captured payload (`AddItemRef` **0x10001a87**,
+`AddCharRef` **0x10001bf3**). Zero item fields and all-zero character
+identities do not create records.
+
+`Initialise` **0x100020c3**/constructor **0x10001f7d** establish the directory,
+maximum load count and empty map; loading is explicit. New additions save
+when the caller requests it, deletion (**0x100019be**, **0x100018bb**) saves
+before its notification, and shutdown **0x100020a1** invokes destructor
+**0x1000200b**, which saves before clearing. Reinitialization also destroys
+and saves the prior singleton. The Rust caller owns this lifecycle and
+character directory; `save` uses the native **0600** file permissions.
+`GetCharName` **0x100013b3** extracts the HTML payload before the first LF,
+then applies Utils `StripHTML` and `ConvertCharRefs`; `IsCharacter`
+**0x1000104b** tests the original identity's type field for nonzero.
+Regression `native_bytes_keys_dedup_and_malformed` covers exact bytes,
+rekeying, deduplication, limits, truncation, storage and permissions.
+
 ## installer
 
 Ported from the decompiled PRK launcher (`MainWindow.DownloadLatestVersion`, `HttpPatchServerService`, `VersionMap`, `VersionIdentifier`, `DeletionHandler`, `RDBController.ApplyRDBPatch`). Implementation: `crates/ao-install`.
