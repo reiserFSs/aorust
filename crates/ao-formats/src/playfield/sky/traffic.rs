@@ -271,7 +271,7 @@ Object Integrator
         for template in ["Freighter", "ICC_Shuttle", "ICC_Tanker", "OmniCruiser", "OmniMothership", "Transporter", "VIP"] {
             let text = std::fs::read_to_string(dir.join(format!("Template_Spaceship_{template}.txt"))).unwrap();
             let text = text.lines().map(|line| line.split('#').next().unwrap_or("")).collect::<Vec<_>>().join("\n");
-            let objects = script::parse_objects(&text);
+            let objects = script::parse_objects(&format!("Object Test\n{{\n{text}\n}}\n"));
             let object = objects.iter().find(|object| object.field("EngineSound").is_some()).unwrap();
             let prefix = if matches!(template, "Transporter" | "VIP") { "GS_" } else { "HS_" };
             let profile = sound_profile(object, prefix).unwrap_or_else(|| panic!("missing authored sound for {template}"));

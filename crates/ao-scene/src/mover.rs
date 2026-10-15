@@ -266,7 +266,8 @@ impl SoundProfile {
             events[2] = Some(event("SM_Sandy_ShipLand_Clank", 0.0, (1.0 - next) * *trigger, [0.0; 3], 100.0));
             *trigger = next;
         }
-        events.map(|event| event.filter(|event| event.volume > 0.0))
+        // FXS10005560 submits only above float100126f8 = 0.01.
+        events.map(|event| event.filter(|event| event.volume > 0.01))
     }
 }
 
