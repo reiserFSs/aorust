@@ -59,18 +59,16 @@ impl HudKnowledge {
     }
 
     fn sync_identities(&mut self) {
-        self.identities.retain(|k,_| self.store.entries().any(|(key,_)| key == *k));
+        self.identities.retain(|k,_| self.store.get(*k).is_some());
         for (key,r) in self.store.entries() {
-            if self.identities.contains_key(&key) { continue; }
-            let id = match r {
+            self.identities.entry(key).or_insert_with(|| match r {
                 Reference::Item {..} => {
                     let id=(0xc788,self.next_dummy);
                     self.next_dummy=self.next_dummy.wrapping_add(1);
                     id
                 }
                 Reference::Character {identity_type,identity_id,..} => (*identity_type,*identity_id),
-            };
-            self.identities.insert(key,id);
+            });
         }
     }
 
@@ -183,7 +181,7 @@ impl HudKnowledge {
     }
 
     fn inspect(&mut self, key: u32) {
-        if let Some((_,r)) = self.store.entries().find(|(k,_)| *k == key) {
+        if let Some(r) = self.store.get(key) {
             self.urls.push(match r {
                 Reference::Item { low,high,ql } => format!("itemref://{low}/{high}/{ql}"),
                 Reference::Character { identity_type,identity_id,name } => format!("charref://{identity_type}/{identity_id}/{}",String::from_utf8_lossy(name)),
@@ -406,8 +404,12 @@ mod tests {
         restored.update(&mut gui,&mut stats);
         assert_eq!(restored.positions.get(1),Some((0,1)));
         assert_eq!(restored.store.entries().count(),2);
-        restored.context=Some(1);
+        let rr=gui.view_rect(restored.win.unwrap(),"knowledge_grid").unwrap();
+        input(&mut restored,&mut gui,&mut d,InputEvent::MouseDown {x:rr.l+grid::BORDER+12.0,y:rr.t+grid::BORDER+ICON+grid::SPACING+12.0,button:MouseButton::Right},Default::default());
+        assert!(gui.menu_open());
+        assert_eq!(restored.context,Some(1));
         assert!(restored.event(&mut gui,&Event::MenuPicked {id:DELETE},(1280,800),&mut d));
+        gui.close_menu();
         assert_eq!(restored.store.entries().count(),1);
         assert_eq!(restored.identity(2),Some((0xc788,1)),"deletion never renumbers live dummy identities");
         let path=d.char_dir().unwrap().join("References.bin");

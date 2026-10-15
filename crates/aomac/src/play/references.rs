@@ -33,6 +33,10 @@ impl ReferenceStore {
         self.entries.iter().map(|(&key, value)| (key, value))
     }
 
+    pub fn get(&self, key: u32) -> Option<&Reference> {
+        self.entries.get(&key)
+    }
+
     pub fn add_item(&mut self, low: u32, high: u32, ql: u32) -> io::Result<u32> {
         // RefMan_t::AddItemRef 0x10001a87 rejects zero, deduplicates the triple.
         if low == 0 || high == 0 || ql == 0 {
