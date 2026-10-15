@@ -526,6 +526,97 @@ fn character_info_first_response_and_refresh_use_current_packet_stats() {
 }
 
 #[test]
+fn create_reference_physical_binding_fires_on_release_only() {
+    let Some(mut r) = rig() else { return };
+    r.p.screen = Screen::InWorld;
+    r.p.awaiting_alive = false;
+    let mut hud = super::super::hud::Hud::new(&mut r.p.gui, &r.p.dir, (1280, 800)).unwrap();
+    let provider = super::super::controls::provider_hash("ACTION_CREATEREF");
+    hud.dvalues.set("KeyBindings", super::super::dvalue::Variant::Archive(format!("<Archive name=\"KeyBindings\" code=\"0\"><Int32 name=\"Version\" value=\"7\"/><Array name=\"Bind\"><Archive code=\"0\"><Int32 name=\"Input\" value=\"43\"/><Int64 name=\"Provider\" value=\"{provider}\"/></Archive></Array></Archive>")));
+    r.p.hud = Some(hud);
+    let key = |r: &mut Rig, pressed| r.p.game_input(ao_render::GameInput::Key { code: ao_render::KeyCode::F5, pressed, repeat: false }, &mut r.host);
+    key(&mut r, true);
+    assert!(!r.p.hud.as_mut().unwrap().take_create_reference());
+    key(&mut r, false);
+    assert!(r.p.hud.as_mut().unwrap().take_create_reference());
+    assert!(!r.p.hud.as_mut().unwrap().take_create_reference());
+    key(&mut r, false);
+    assert!(!r.p.hud.as_mut().unwrap().take_create_reference(), "a binding capture's unarmed release must not act");
+    key(&mut r, true);
+    r.p.game_input(ao_render::GameInput::FocusLost, &mut r.host);
+    key(&mut r, false);
+    assert!(!r.p.hud.as_mut().unwrap().take_create_reference(), "focus loss cancels the held provider");
+}
+
+#[test]
+fn create_reference_waits_for_matching_player_info_and_uses_response_stats() {
+    use ao_net::msg::Identity;
+    let Some(mut r) = rig() else { return };
+    r.p.zone = zone::Zone::new(42);
+    r.p.chat = Some(super::super::chat::Chat::new(false));
+    let player = Identity { kind: 50000, instance: 77 };
+    let other = Identity { kind: 50000, instance: 78 };
+    for id in [77, 78] {
+        r.p.zone.dynels.insert(id, zone::DynelState { name: format!("Reference{id}"), pos: [0.0; 3], yaw: None, npc: false, side: 0, level: 1, health: 100, max_health: 100 });
+    }
+    let response = |id: Identity, title: u8| {
+        let mut w = ao_net::Writer::default();
+        w.u32(ao_net::n3::info::INFO_PACKET);
+        id.write(&mut w);
+        w.u8(0);
+        for byte in [0, 1, 1, title, 0, 1] { w.u8(byte); }
+        w.i16(0);
+        for value in [100, 100, 0, 0] { w.i32(value); }
+        for value in ["First", "Last", "", ""] { w.str_i16(value); }
+        for value in [731, 29, 0] { w.i32(value); }
+        for _ in 0..8 { w.i32(0); }
+        ao_net::n3::outgoing::n3_frame(0, 42, w.0)
+    };
+    r.p.zone.set_target(Some(player));
+    let chat = r.p.chat.as_mut().unwrap();
+    chat.create_character_reference(&r.p.zone);
+    assert_eq!(chat.take_outbox(), [ao_net::n3::outgoing::n3_frame(0, 42, ao_net::n3::info::request(42, player))]);
+    assert!(chat.take_character_references().is_empty(), "no local snapshot");
+    r.event(LoginEvent::ZoneFrame(response(other, 2)));
+    assert!(r.p.chat.as_mut().unwrap().take_character_references().is_empty(), "unrelated response must not consume pending query");
+    r.event(LoginEvent::ZoneFrame(response(player, 5)));
+    let saved = r.p.chat.as_mut().unwrap().take_character_references();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].0, player);
+    let html = std::str::from_utf8(&saved[0].1).unwrap();
+    assert!(html.contains("TitleLevel 5"), "{html}");
+    assert!(html.contains("Reference77"), "{html}");
+    let dated = html.find("<div indent=wrapped><font color=CCInfoHeader>Dated: </font>").unwrap();
+    assert!(html[..dated].ends_with("</font>\n"));
+    assert!(html[dated..].contains(":02</font></div>"));
+    r.event(LoginEvent::ZoneFrame(response(player, 6)));
+    assert!(r.p.chat.as_mut().unwrap().take_character_references().is_empty(), "completion is one-shot");
+    r.p.chat.as_mut().unwrap().create_character_reference(&r.p.zone);
+    r.p.zone.set_target(Some(other));
+    r.p.chat.as_mut().unwrap().create_character_reference(&r.p.zone);
+    r.p.chat.as_mut().unwrap().take_outbox();
+    r.event(LoginEvent::ZoneFrame(response(player, 3)));
+    assert!(r.p.chat.as_mut().unwrap().take_character_references().is_empty(), "latest CreateRef query supersedes the old target");
+    r.event(LoginEvent::ZoneFrame(response(other, 4)));
+    let saved = r.p.chat.as_mut().unwrap().take_character_references();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].0, other);
+    r.p.zone.set_target(Some(player));
+    r.p.zone.dynels.get_mut(&77).unwrap().npc = true;
+    r.p.chat.as_mut().unwrap().create_character_reference(&r.p.zone);
+    assert!(r.p.chat.as_mut().unwrap().take_outbox().is_empty(), "NPC must not request a reference");
+    r.p.zone.dynels.get_mut(&77).unwrap().npc = false;
+    r.p.chat.as_mut().unwrap().create_character_reference(&r.p.zone);
+    r.p.chat.as_mut().unwrap().take_outbox();
+    r.p.zone.dynels.get_mut(&77).unwrap().npc = true;
+    r.event(LoginEvent::ZoneFrame(response(player, 6)));
+    assert!(r.p.chat.as_mut().unwrap().take_character_references().is_empty(), "NPC status must be checked again on completion");
+    r.p.zone.dynels.get_mut(&77).unwrap().npc = false;
+    r.event(LoginEvent::ZoneFrame(response(player, 6)));
+    assert!(r.p.chat.as_mut().unwrap().take_character_references().is_empty(), "rejected completion still clears its query");
+}
+
+#[test]
 fn stat_xp_feedback_uses_old_value_before_dispatch_applies_update() {
     let Some(mut r) = rig() else { return };
     r.p.zone = zone::Zone::new(42);

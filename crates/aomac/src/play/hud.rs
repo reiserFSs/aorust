@@ -804,6 +804,10 @@ impl Hud {
         self.target.info.take()
     }
 
+    pub(super) fn take_create_reference(&mut self) -> bool {
+        std::mem::take(&mut self.create_reference)
+    }
+
     #[cfg(test)]
     pub(super) fn live_option_inputs(&mut self, gui: &mut Gui, name: &str, value: f64) -> Vec<InputEvent> {
         self.options.probe_inputs(gui, &mut self.dvalues, name, value)
@@ -1239,6 +1243,20 @@ impl Hud {
         false
     }
 
+    /// SlotCreateReference ignores the provider's pressed=true signal.
+    pub(super) fn key_release(&mut self, gui: &Gui, key: u32, mods: ao_gui::Modifiers) {
+        let armed = self.create_reference_key == Some(super::options::keys::key_input(key, mods));
+        self.create_reference_key = None;
+        if armed && !gui.text_focused() && !self.options.capturing()
+        {
+            self.create_reference = true;
+        }
+    }
+
+    pub(super) fn cancel_key_input(&mut self) {
+        self.create_reference_key = None;
+    }
+
     /// The tables every key consumer reads (`options/keys.rs`).
     pub(super) fn key_tables(&self) -> (&Bindings, &FixedKeys) {
         (&self.bindings, &self.fixed)
@@ -1261,6 +1279,7 @@ impl Hud {
             match k {
                 HudKey::Window(kind) => self.toggle(gui, kind),
                 HudKey::SocialWindow(name) => self.toggle_dvalue(gui, name),
+                HudKey::CreateReference => self.create_reference_key = Some(input),
                 HudKey::BarActive(n) => {
                     if let Some(s) = self.shortcuts.iter_mut().find(|s| s.is_active()) {
                         s.use_slot(n, &self.actions.list);

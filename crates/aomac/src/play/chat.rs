@@ -123,6 +123,11 @@ pub(super) struct Chat {
     own_id: u32,
     /// `InfoView_c` (`/help`, `/showfile`, `/tipoftheday`, `text://` links).
     info: info::InfoView,
+    /// InfoTextCreator query IDs are client-local; InfoPacket carries only the identity.
+    character_queries: Vec<(Identity, u32)>,
+    next_character_query: u32,
+    reference_query: Option<u32>,
+    character_references: Vec<(Identity, Vec<u8>)>,
     /// `DialogBox_c` boxes and the `/afk` message dialog.
     dialogs: dialog::Dialogs,
     /// DValue `CurrentTipOfTheDay` (CharPrefs.xml default -1).
@@ -175,7 +180,7 @@ impl Chat {
         net.set_trace(std::env::var_os("AOMAC_CHAT_TRACE").map(Into::into));
         let warn_unsub = true;
         let invite_action = social::InviteAction::Dialog;
-        Self { win: None, backlog: vec![], net, afk: None, auto_afk: true, idle_seconds: 0.0, afk_started: std::time::SystemTime::now(), chat_indicator: true, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], shop_info_urls: vec![], tip_events: vec![], pet_scripts: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], dvalue_cmds: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default(), filter: filter::FilterState::load(), macros: macros::TextMacros::open(), voice_prefs: VoicePrefs::default(), warn_unsub, invite_action, voice_throttle: voice::Throttle::default(), expansion: 0, last_out_group: None, bug: None, requests: Requests::default() }
+        Self { win: None, backlog: vec![], net, afk: None, auto_afk: true, idle_seconds: 0.0, afk_started: std::time::SystemTime::now(), chat_indicator: true, last_tell_from: None, ignored: HashSet::new(), outbox: vec![], shop_info_urls: vec![], tip_events: vec![], pet_scripts: vec![], game: vec![], swallow: None, social_counter: 0, own_id: 0, info: info::InfoView::new(&ao_gui::client_dir()), character_queries: vec![], next_character_query: 0, reference_query: None, character_references: vec![], dialogs: dialog::Dialogs::default(), tip: -1, windows: vec![], dvalue_cmds: vec![], quit: false, screen: (0, 0), social: social::Social::default(), swin: social_win::SocialWin::new((0, 0)), tell_log: Default::default(), pg_windows: Default::default(), filter: filter::FilterState::load(), macros: macros::TextMacros::open(), voice_prefs: VoicePrefs::default(), warn_unsub, invite_action, voice_throttle: voice::Throttle::default(), expansion: 0, last_out_group: None, bug: None, requests: Requests::default() }
     }
 
     /// The chat windows (`ChatGUIModule_c::Initialize`), once the world is shown.
@@ -551,7 +556,21 @@ impl Chat {
         let Ok(m) = n3::decode(f) else { return };
         if let N3::World(ao_net::n3::world::World::Info(packet)) = &m.body {
             match info::character_html(zone, m.header.target, packet, texts) {
-                Ok(html) => self.info.character_page(gui, m.header.target, html),
+                Ok(html) => {
+                    let id = m.header.target;
+                    let creating = self.reference_query.is_some_and(|query| self.character_queries.contains(&(id, query)));
+                    self.character_queries.retain(|(target, _)| *target != id);
+                    if creating {
+                        self.reference_query = None;
+                        if id.kind == CHAR_KIND && zone.dynels.get(&id.instance).is_some_and(|d| !d.npc) {
+                            match info::dated_character_html(&html) {
+                                Ok(saved) => self.character_references.push((id, saved.into_bytes())),
+                                Err(error) => self.system_line(gui, &format!("Character reference failed: {error:#}"), 12),
+                            }
+                        }
+                    }
+                    self.info.character_page(gui, id, html);
+                },
                 Err(error) => self.system_line(gui, &format!("Character info failed: {error:#}"), 12),
             }
         }
@@ -774,7 +793,7 @@ impl Chat {
             match o {
                 info::InfoOut::Command(c) => self.run_line(gui, &c, zone, texts),
                 info::InfoOut::ExternalUrl(url) => self.open_url(&url),
-                info::InfoOut::Character(target) => self.outbox.push(ao_net::n3::outgoing::n3_frame(0, zone.char_id, ao_net::n3::info::request(zone.char_id as i32, target))),
+                info::InfoOut::Character(target) => { self.request_character_info(zone, target); },
                 info::InfoOut::Quest(target) => {
                     match info::quest_html(zone, target, texts) {
                         Ok(Some(html)) => self.info.quest_page(gui, target, html),
@@ -803,6 +822,25 @@ impl Chat {
                 info::InfoOut::Error(t) => self.system_line(gui, &t, 12),
             }
         }
+    }
+
+    /// GUI 10031011: send the existing InfoPacket request, then register its local query ID.
+    fn request_character_info(&mut self, zone: &Zone, target: Identity) -> u32 {
+        let query = self.next_character_query;
+        self.next_character_query = query.wrapping_add(1);
+        self.outbox.push(ao_net::n3::outgoing::n3_frame(0, zone.char_id, ao_net::n3::info::request(zone.char_id as i32, target)));
+        self.character_queries.push((target, query));
+        query
+    }
+
+    /// GUI 10068119: only a non-NPC current reference, never cached character HTML.
+    pub(super) fn create_character_reference(&mut self, zone: &Zone) {
+        let Some(target) = zone.selected_target().filter(|id| id.kind == CHAR_KIND && zone.dynels.get(&id.instance).is_some_and(|d| !d.npc)) else { return };
+        self.reference_query = Some(self.request_character_info(zone, target));
+    }
+
+    pub(super) fn take_character_references(&mut self) -> Vec<(Identity, Vec<u8>)> {
+        std::mem::take(&mut self.character_references)
     }
 
     /// `DialogBox_c` + `Go` + `MoveToCenter`.

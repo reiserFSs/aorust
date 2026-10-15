@@ -188,42 +188,51 @@ pub fn played_line(now_unix: i64, tz_offset_min: i32, game: (u32, u32)) -> Strin
     )
 }
 
-/// Local wall clock `(hour, minute, UTC offset in minutes)` of a unix time (`_localtime64` / `strftime` of the original); `None` where unavailable.
+#[cfg(unix)]
+#[repr(C)]
+struct Tm {
+    sec: i32,
+    min: i32,
+    hour: i32,
+    mday: i32,
+    mon: i32,
+    year: i32,
+    wday: i32,
+    yday: i32,
+    isdst: i32,
+    gmtoff: std::ffi::c_long,
+    zone: *const std::ffi::c_char,
+}
+
+#[cfg(unix)]
+fn local_clock(now_unix: i64) -> Option<Tm> {
+    extern "C" {
+        fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+    }
+    let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+    // SAFETY: `localtime_r` fills the caller-provided BSD/glibc struct and returns null on failure.
+    unsafe {
+        if localtime_r(&now_unix, tm.as_mut_ptr()).is_null() {
+            return None;
+        }
+        Some(tm.assume_init())
+    }
+}
+
+/// Local wall clock `(hour, minute, UTC offset in minutes)` of a unix time.
 pub fn local_time(now_unix: i64) -> Option<(u32, u32, i32)> {
     #[cfg(unix)]
-    {
-        #[repr(C)]
-        struct Tm {
-            sec: i32,
-            min: i32,
-            hour: i32,
-            mday: i32,
-            mon: i32,
-            year: i32,
-            wday: i32,
-            yday: i32,
-            isdst: i32,
-            gmtoff: std::ffi::c_long,
-            zone: *const std::ffi::c_char,
-        }
-        extern "C" {
-            fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
-        }
-        let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
-        // SAFETY: `localtime_r` fills the caller-provided struct (BSD/glibc layout with `tm_gmtoff`) and returns null on failure.
-        unsafe {
-            if localtime_r(&now_unix, tm.as_mut_ptr()).is_null() {
-                return None;
-            }
-            let tm = tm.assume_init();
-            Some((tm.hour as u32, tm.min as u32, (tm.gmtoff / 60) as i32))
-        }
-    }
+    { local_clock(now_unix).map(|tm| (tm.hour as u32, tm.min as u32, (tm.gmtoff / 60) as i32)) }
     #[cfg(not(unix))]
-    {
-        let _ = now_unix;
-        None
-    }
+    { let _ = now_unix; None }
+}
+
+/// Utils 10001399, flags zero: local `%Y-%m-%d %H:%M:%S`.
+pub(super) fn local_date_time(now_unix: i64) -> Option<String> {
+    #[cfg(unix)]
+    { local_clock(now_unix).map(|tm| format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", tm.year + 1900, tm.mon + 1, tm.mday, tm.hour, tm.min, tm.sec)) }
+    #[cfg(not(unix))]
+    { let _ = now_unix; None }
 }
 
 /// UTC offset of the local time zone in minutes, 0 where unavailable.

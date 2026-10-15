@@ -74,6 +74,14 @@ pub fn character_html(zone: &crate::play::zone::Zone, id: ao_net::msg::Identity,
     character::html(zone, id, packet, texts)
 }
 
+/// GUI 1006a882 inserts Dated between the player headline and the response body.
+pub(super) fn dated_character_html(html: &str) -> anyhow::Result<String> {
+    // GUI 1006a8eb passes timestamp 2, flags 0 (not the current clock).
+    let date = super::zonecmd::local_date_time(2).ok_or_else(|| anyhow::anyhow!("local date unavailable"))?;
+    let end = html.find("</font>\n").ok_or_else(|| anyhow::anyhow!("missing character headline"))? + 8;
+    Ok(format!("{}<div indent=wrapped><font color=CCInfoHeader>Dated: </font><font color=CCInfoText>{date}</font></div>{}", &html[..end], &html[end..]))
+}
+
 pub fn quest_html(zone: &crate::play::zone::Zone, id: ao_net::msg::Identity, texts: &ao_formats::screens::TextDb) -> anyhow::Result<Option<String>> {
     let store = ao_rdb::RecordStore::open(&ao_gui::client_dir())?;
     quest::html(zone,id,texts,Some(&store))

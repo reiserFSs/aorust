@@ -15,6 +15,8 @@ pub(super) enum HudKey {
     Window(WindowKind),
     /// A window owned by the social module rather than Hud.
     SocialWindow(&'static str),
+    /// GUI 10068119: request a saved character reference.
+    CreateReference,
     /// `SHORTUCT_BAR_ACTIVE_n` (default: the digit keys): use slot `n` of the active bar (`FUN_100d7cef`).
     BarActive(usize),
     /// `SHORTUCT_BAR_ROW_n` (default Shift + digit): show row `n` of the active bar (`FUN_100d85fb`).
@@ -33,6 +35,7 @@ const WINDOW_PROVIDERS: &[(&str, WindowKind)] = &[
     ("WINDOW_PLANETMAP", WindowKind::PlanetMap),
     ("WINDOW_WEAR", WindowKind::Character),
     ("WINDOW_SPECIALACTION", WindowKind::Actions),
+    ("WINDOW_KNOWLEDGE", WindowKind::Knowledge),
     ("WINDOW_MISSION", WindowKind::Mission),
     ("WINDOW_TEAM", WindowKind::Team),
     ("WINDOW_RAID", WindowKind::Raid),
@@ -51,6 +54,7 @@ const SLOTS: usize = 10;
 fn providers() -> Vec<(u32, HudKey)> {
     let mut v: Vec<(u32, HudKey)> = WINDOW_PROVIDERS.iter().map(|(n, k)| (provider_hash(n), HudKey::Window(*k))).collect();
     v.push((provider_hash("WINDOW_LFT"), HudKey::SocialWindow("lft_window")));
+    v.push((provider_hash("ACTION_CREATEREF"), HudKey::CreateReference));
     for b in 0..BARS {
         v.push((provider_hash(&format!("SHORTUCT_BAR_ACTIVE_{b}")), HudKey::BarActive(b)));
         v.push((provider_hash(&format!("SHORTUCT_BAR_ROW_{b}")), HudKey::BarRow(b)));
@@ -114,7 +118,7 @@ mod tests {
         assert_eq!(m.lookup(k('2', id::CTRL)), [HudKey::Window(WindowKind::Actions)]);
         assert_eq!(m.lookup(k('6', id::CTRL)), [HudKey::Window(WindowKind::Map)]);
         assert_eq!(m.lookup(k('0', id::CTRL)), [HudKey::Window(WindowKind::Ncu)]);
-        assert_eq!(m.lookup(k('3', id::CTRL)), [], "Knowledge has no window");
+        assert_eq!(m.lookup(k('3', id::CTRL)), [HudKey::Window(WindowKind::Knowledge)]);
         assert_eq!(m.lookup(48), [HudKey::Window(WindowKind::Options)], "F10");
         assert_eq!(m.lookup(k('1', 0)), [HudKey::BarActive(0)]);
         assert_eq!(m.lookup(k('0', 0)), [HudKey::BarActive(9)]);
@@ -126,6 +130,13 @@ mod tests {
     #[test]
     fn raid_provider_resolves_to_native_window() {
         assert_eq!(providers().into_iter().find(|(p, _)| *p == provider_hash("WINDOW_RAID")).map(|(_, key)| key), Some(HudKey::Window(WindowKind::Raid)));
+    }
+
+    #[test]
+    fn knowledge_and_create_reference_providers_resolve() {
+        let table = providers();
+        assert_eq!(table.iter().find(|(p, _)| *p == provider_hash("WINDOW_KNOWLEDGE")).map(|(_, key)| *key), Some(HudKey::Window(WindowKind::Knowledge)));
+        assert_eq!(table.iter().find(|(p, _)| *p == provider_hash("ACTION_CREATEREF")).map(|(_, key)| *key), Some(HudKey::CreateReference));
     }
 
     #[test]

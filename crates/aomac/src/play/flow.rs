@@ -1266,6 +1266,16 @@ impl Frontend for Play {
                 chat.afk_activity(&mut self.gui, &self.zone, &self.text, self.player.as_ref().is_some_and(|p| p.mode() == 6));
             }
         }
+        if matches!(ev, ao_render::GameInput::FocusLost) {
+            if let Some(hud) = self.hud.as_mut() { hud.cancel_key_input(); }
+        }
+        if let (Screen::InWorld, ao_render::GameInput::Key { code, pressed: false, .. }, Some(h)) = (self.screen, ev, self.hud.as_mut()) {
+            if open {
+                if let Some(key) = super::controls::key_id(code) {
+                    h.key_release(&self.gui, key, host.mods);
+                }
+            }
+        }
         // the window / hotbar hot keys and the options window's key capture read the physical key (any key can be bound, `options/keys.rs`)
         if let (Screen::InWorld, ao_render::GameInput::Key { code, pressed: true, repeat }, Some(h)) = (self.screen, ev, self.hud.as_mut()) {
             if let Some(key) = super::controls::key_id(code) {
@@ -1824,6 +1834,12 @@ impl Frontend for Play {
         }
         // the NCU / team windows' System-window lines, and the Shift + click character info page (`ShowURL("charid://50000/<id>")`)
         if let (Some(h), Some(c)) = (self.hud.as_mut(), self.chat.as_mut()) {
+            if h.take_create_reference() {
+                c.create_character_reference(&self.zone);
+            }
+            for (identity, html) in c.take_character_references() {
+                h.add_character_reference(identity.kind as u32, identity.instance as u32, html);
+            }
             if let Some(key) = h.take_equipment_feedback() {
                 c.feedback(&mut self.gui, key, &self.text);
             }
