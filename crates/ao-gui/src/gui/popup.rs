@@ -1,8 +1,7 @@
 //! `PopupMenu_c`: the context / icon menus of the chat windows (docs/chat/gui.md §11).
 //!
-//! RE: entries `PopupMenu_c::AppendMenuEntry(Variant, text, -1, submenu)`, `AppendSeparatorEntry`, `PopupMenuItem_c::MakeBoolean` + `Check` (a check mark),
-//! `View::Enable(item, false)` (greyed). **UNRESOLVED**: the menu skin (the combo-box popup's raised border art is reused), the check mark art
-//! (a 5 px square is drawn) and the sub-menu arrow glyph.
+//! `PopupMenu_c::Go` 1013bf93 uses WINDOW border art over WINDOW_BACKGROUND, white tint,
+//! alpha 1; item highlight 1013dbc0 is solid 2020c0. Boolean/submenu tails use 117/118.
 
 use super::*;
 
@@ -64,6 +63,9 @@ fn menu_item_mut(m: &mut Menu, lv: usize, i: usize) -> Option<&mut MenuItem> {
     }
     items.get_mut(i)
 }
+
+/// BorderView::SetGfx in PopupMenu_c::Go (GUI 1013bf93).
+pub(super) const BORDER: [u32; 9] = [0xf9, 0xfb, 0xf4, 0xf6, 0xf7, 0xfa, 0xf8, 0xf5, 0x1bf];
 
 const PAD: f32 = 6.0;
 /// Left column of check marks / right column of sub-menu arrows.
@@ -243,11 +245,9 @@ impl Gui {
         let Some(m) = &self.ix.menu else { return };
         let levels: Vec<Vec<MenuItem>> = Self::menu_levels(m).into_iter().map(|l| l.to_vec()).collect();
         let hover = m.hover;
-        let col = self.map_color(0x1000000);
-        // UNRESOLVED: PopupMenu_c skin; the raised button border set, like the combo popup
-        let raised: [Option<GfxId>; 9] = [0x24, 0x26, 0x1f, 0x21, 0x22, 0x25, 0x23, 0x20, 0x1e].map(|i| Some(GfxId(i)));
+        let skin = BORDER.map(|id| Some(GfxId(id)));
         for (lv, pn) in panels.iter().enumerate() {
-            self.draw_border(out, &raised, pn.rect, col, 0.95);
+            self.draw_border(out, &skin, pn.rect, [255; 3], 1.0);
             for (r, i) in &pn.items {
                 let it = &levels[lv][*i];
                 if it.sep {
@@ -263,15 +263,16 @@ impl Gui {
                     continue;
                 }
                 if it.enabled && hover == Some((lv, *i)) || (it.enabled && !it.sub.is_empty() && m_path_has(&self.ix.menu, lv, *i)) {
-                    out.push(DrawCmd::Solid { dst: [r.l, r.t, r.r + 1.0, r.b + 1.0], color: rgb(self.palette[2]), alpha: 0.5 });
+                    out.push(DrawCmd::Solid { dst: [r.l, r.t, r.r + 1.0, r.b + 1.0], color: [0x20, 0x20, 0xc0], alpha: 1.0 });
                 }
-                let tint = if it.enabled { [255; 3] } else { [0x90; 3] };
-                if it.checked == Some(true) {
-                    out.push(DrawCmd::Solid { dst: [r.l + 4.0, r.t + 4.0, r.l + 9.0, r.t + 9.0], color: tint, alpha: 1.0 });
-                }
+                let tint = if it.enabled { [255; 3] } else { [0xa0; 3] };
                 self.draw_string(out, FontId::Normal, &it.text, (r.l + COL + PAD - 2.0) as i32, r.t as i32 + 1, tint, 1.0, false);
-                if !it.sub.is_empty() {
-                    self.draw_string(out, FontId::Normal, ">", (r.r - COL + 4.0) as i32, r.t as i32 + 1, tint, 1.0, false);
+                let tail = if it.checked == Some(true) { Some(GfxId(0x117)) } else if !it.sub.is_empty() { Some(GfxId(0x118)) } else { None };
+                if let Some(id) = tail {
+                    let (w, h) = self.gfx.size(id);
+                    let x = r.r - w as f32 + 1.0;
+                    let y = r.t + ((r.height() + 1.0 - h as f32) * 0.5).floor();
+                    self.push_gfx(out, id, Rect::new(x, y, r.r, y + h as f32 - 1.0), if it.enabled { [255; 3] } else { [0x90; 3] }, 1.0);
                 }
             }
         }
@@ -280,4 +281,24 @@ impl Gui {
 
 fn m_path_has(m: &Option<Menu>, lv: usize, i: usize) -> bool {
     m.as_ref().is_some_and(|m| m.path.get(lv) == Some(&i))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_uses_native_border_and_opaque_blue_highlight() {
+        let Ok(mut gui) = Gui::new(&crate::client_dir(), None) else { return };
+        gui.open_menu((10, 10), (800, 600), vec![MenuItem::entry(1, "Entry")]);
+        gui.ix.menu.as_mut().unwrap().hover = Some((0, 0));
+        let mut cmds = Vec::new();
+        gui.draw_menu(&mut cmds);
+        let rect = gui.menu_panels()[0].rect;
+        let mut expected = Vec::new();
+        gui.draw_border(&mut expected, &BORDER.map(|id| Some(GfxId(id))), rect, [255; 3], 1.0);
+        assert!(!expected.is_empty());
+        assert_eq!(format!("{:?}", &cmds[..expected.len()]), format!("{expected:?}"));
+        assert!(cmds.iter().any(|cmd| matches!(cmd, DrawCmd::Solid { color: [0x20, 0x20, 0xc0], alpha: 1.0, .. })));
+    }
 }

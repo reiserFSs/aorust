@@ -1692,14 +1692,12 @@ impl Gui {
         let (l, t) = (o.0 + win.pos.0 as f32, o.1 + win.pos.1 as f32 + f.height() + 1.0);
         let ih = self.fonts.font(FontId::Normal).height as f32 + 2.0;
         let rect = Rect::new(l, t, l + f.width(), t + ih * c.items.len() as f32 + 1.0);
-        // UNRESOLVED: PopupMenu_c skin; drawn with the button raised border set.
-        let raised: [Option<GfxId>; 9] = [0x24, 0x26, 0x1f, 0x21, 0x22, 0x25, 0x23, 0x20, 0x1e].map(|i| Some(GfxId(i)));
-        let col = self.map_color(0x1000000);
-        self.draw_border(out, &raised, rect, col, 0.95);
+        let skin = popup::BORDER.map(|id| Some(GfxId(id)));
+        self.draw_border(out, &skin, rect, [255; 3], 1.0);
         for (i, s) in c.items.iter().enumerate() {
             let y = t + 2.0 + ih * i as f32;
             if hover == Some(i) {
-                out.push(DrawCmd::Solid { dst: [l + 2.0, y, rect.r - 1.0, y + ih], color: rgb(self.palette[2]), alpha: 0.5 });
+                out.push(DrawCmd::Solid { dst: [l + 2.0, y, rect.r - 1.0, y + ih], color: [0x20, 0x20, 0xc0], alpha: 1.0 });
             }
             self.draw_string(out, FontId::Normal, s, l as i32 + 6, y as i32 + 1, [255; 3], 1.0, false);
         }
