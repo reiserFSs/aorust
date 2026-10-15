@@ -545,6 +545,12 @@ mod tests {
         assert_eq!(super::super::hud_listview::grid_width(1, ICON), 44.0);
         assert_eq!(super::super::hud_listview::grid_width(2, ICON), 86.0);
         assert_eq!(super::super::hud_listview::grid_width(3, ICON), 128.0);
+        let window = TradeWin { win: 0, max: 5, items: vec![TradeItem { id: ME, name: String::new(), icon: None }; 5] };
+        assert_eq!(window.item_at(6.0, 6.0), Some(0));
+        assert_eq!(window.item_at(48.0, 6.0), Some(1));
+        assert_eq!(window.item_at(6.0, 48.0), Some(2));
+        assert_eq!(window.item_at(42.0, 6.0), None, "slot gap is not an item");
+        assert_eq!(window.item_at(86.0, 6.0), None, "past the fixed two-column grid");
     }
 
     #[test]

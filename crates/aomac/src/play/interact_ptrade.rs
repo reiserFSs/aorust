@@ -243,7 +243,7 @@ impl PTrade {
         for (dock, view, max_h) in [("PartnerInventoryDock", "partner_items", max), ("OurInventoryDock", "our_items", min)] {
             let min_w = min + 11.0;
             let max_w = max + 11.0;
-            let xml = format!("<root><View view_layout=\"stacked\" min_size=\"Point({min_w},{min})\" max_size=\"Point({max_w},{max_h})\" max_size_limit=\"Point({max_w},{max_h})\"><ScrollView name=\"{view}_scroll\" h_scrollbar_mode=\"none\" v_scrollbar_mode=\"always\"><ScrollViewChild view_layout=\"vertical\"><CanvasView name=\"{view}\" min_size=\"Point({min},{min})\" max_size=\"Point({max},{min})\"/></ScrollViewChild></ScrollView></View></root>");
+            let xml = format!("<root><View view_layout=\"stacked\" min_size=\"Point({min_w},{min})\" max_size=\"Point({max_w},{max_h})\" max_size_limit=\"Point({max_w},{max_h})\"><ScrollView name=\"{view}_scroll\" h_scrollbar_mode=\"none\" v_scrollbar_mode=\"always\"><ScrollViewChild view_layout=\"vertical\"><CanvasView name=\"{view}\" min_size=\"Point({min},{min})\" max_size=\"Point({max},{max_h})\"/></ScrollViewChild></ScrollView></View></root>");
             gui.add_view_xml(win, dock, view, &xml)?;
         }
         let (sw, sh) = STATUS_GFX.iter().map(|&g| gui.gfx().size(GfxId(g))).fold((0, 0), |a, s| (a.0.max(s.0), a.1.max(s.1)));
@@ -283,7 +283,7 @@ impl PTrade {
             let height = super::hud_listview::grid_width(rows, ICON) - 1.0;
             let min = super::hud_listview::grid_width(1, ICON) - 1.0;
             let max = super::hud_listview::grid_width(50, ICON) - 1.0;
-            gui.set_view_pref_size(self.win, view, (min, height), (max, height));
+            gui.set_view_pref_size(self.win, view, (min, height), (max, height.max(max)));
             for n in 0..rows * cols {
                 let (x, y) = cell(n, width);
                 if let Some(g) = slot {
@@ -1040,11 +1040,13 @@ pub(super) mod tests {
         p.ours = (0..20).map(|n| Entry { item: Identity { kind: 0x68, instance: n }, acg: None }).collect();
         p.render(&mut gui, &mut |_, _| None);
         let before = p.dock[0].0;
+        let partner_height = p.dock[1].1;
         assert_eq!(gui.view_rect(p.win, SCROLLS[0]).unwrap().height() + 1.0, 44.0);
         let size = gui.window_size(p.win);
         gui.resize_window(p.win, WindowSize::Fixed(size.0 + 200, size.1 + 100));
         p.render(&mut gui, &mut |_, _| None);
         assert!(p.dock[0].0 > before);
+        assert!(p.dock[1].1 > partner_height, "partner tray retains the 50-row preferred ceiling");
         assert_eq!(gui.view_rect(p.win, SCROLLS[0]).unwrap().height() + 1.0, 44.0);
         let (x, y) = cell(1, p.dock[0].0 as f32);
         assert_eq!(p.entry_at(0, x + 4.0, y + 4.0), Some(1));
