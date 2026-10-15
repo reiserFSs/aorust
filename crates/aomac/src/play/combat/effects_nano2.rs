@@ -2,7 +2,7 @@
 //! DS ctor 10018c08/process 1001975e/render 10018de7. No sprite replacement.
 use super::Template;
 use anyhow::{ensure, Result};
-use ao_formats::character::CrtRand;
+use ao_scene::CrtRand;
 use ao_formats::weather::R250;
 use ao_scene::{Blend, Vertex};
 use glam::{Mat4, Vec3};
@@ -42,7 +42,7 @@ impl Nano2 {
         if self.duration>=0.0 && time>=self.duration { return Ok(None); }
         let dt=time-self.previous; self.previous=time;
         // These globals advance once per ProcessStuff call, not once per frame.
-        *crt=CrtRand::new(42);
+        crt.reseed(42);
         state.phase+=dt*5.0;
         if state.phase>1.0 { state.phase=0.0; state.cycle=(state.cycle+1)%5; }
         // DS time() reseeds all eighteen blocks identically in wall-clock seconds.
@@ -50,7 +50,7 @@ impl Nano2 {
         let (_,columns,rows,_,_)=super::materials::MATERIALS[self.material];
         let mut vertices=Vec::with_capacity(360);
         for (trail,anchor) in ORDER.into_iter().enumerate() {
-            *crt=CrtRand::new(seed);
+            crt.reseed(seed);
             let start=self.anchors[anchor];
             let direction=(start-self.anchors[11]).normalize_or_zero()*2.0;
             // Preserve DS's 200-byte block aliasing: the eleventh position overlaps

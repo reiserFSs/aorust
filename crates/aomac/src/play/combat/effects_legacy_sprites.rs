@@ -167,7 +167,7 @@ pub(super) struct MeshTest {
     terminated: bool,
 }
 impl MeshTest {
-    pub fn new(t:&Template,source:Mat4,store:&ao_rdb::RecordStore,names:&ao_formats::character::NameTable,random:&mut ao_formats::weather::R250,crt:&mut ao_formats::character::CrtRand,cache:&mut std::collections::HashMap<u32,std::sync::Arc<ao_scene::Scene>>)->Result<Self> {
+    pub fn new(t:&Template,source:Mat4,store:&ao_rdb::RecordStore,names:&ao_formats::character::NameTable,random:&mut ao_formats::weather::R250,crt:&mut ao_scene::CrtRand,cache:&mut std::collections::HashMap<u32,std::sync::Arc<ao_scene::Scene>>)->Result<Self> {
         ensure!(t.kind==1028,"invalid MeshTest template");
         let source=super::sprites::connector(t,source)?;
         let mut resources=Vec::with_capacity(8);
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(h.models().len(),24);assert_eq!(h.models()[0].2,22);
         h.frame(0.5);assert_eq!(h.vertices(true,|_|0.0)?.unwrap().len(),24);
         assert!(!h.frame(10.0));
-        let mut random=ao_formats::weather::R250::new(7);let mut crt=ao_formats::character::CrtRand::new(7);
+        let mut random=ao_formats::weather::R250::new(7);let mut crt=ao_scene::CrtRand::new(7);
         let mut s=super::super::sprites::SpriteEffect::new_with_id(8020,&table.by_id[&8020],Mat4::IDENTITY,Mat4::IDENTITY,0,&mut random)?;
         s.initialize_native(&mut random,&mut crt)?;
         assert_eq!(s.models()[0].2,400);

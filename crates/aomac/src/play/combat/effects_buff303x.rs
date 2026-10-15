@@ -143,7 +143,7 @@ mod tests {
     use super::*;
     #[test]
     fn truncated_native_surface_templates_keep_zero_field_defaults() {
-        let mut gc=R250::new(1);let mut ds=R250::new(1);let mut crt=ao_formats::character::CrtRand::new(1);
+        let mut gc=R250::new(1);let mut ds=R250::new(1);let mut crt=ao_scene::CrtRand::new(1);
         for (kind,len) in [(3031,34),(3030,11),(3038,9),(3034,0),(3039,12)] {
             let mut words=vec![0;len];
             match kind {
@@ -195,7 +195,7 @@ mod tests {
     #[test] fn native_curve_knots_fan_lifetime_and_trail_termination() {
         let curve=Curve {knots:vec![(0.0,0.0f32.to_bits()),(0.5,2.0f32.to_bits()),(1.0,4.0f32.to_bits())]};
         assert_eq!(curve.scalar(0.0),0.0);assert_eq!(curve.scalar(0.5),2.0);assert_eq!(curve.scalar(-1.0),4.0);
-        let mut gc=R250::new(0xe6f1);let mut ds=R250::new(0xe6f1);let mut crt=ao_formats::character::CrtRand::new(1);
+        let mut gc=R250::new(0xe6f1);let mut ds=R250::new(0xe6f1);let mut crt=ao_scene::CrtRand::new(1);
         let mut words=vec![0;22];words[8]=3.0f32.to_bits();words[9]=100;words[14]=1;words[15]=1;words[16]=1;
         let mut grid=GridEffect::new(&Template {kind:3038,words},Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt).unwrap();
         grid.configure(EffectConfig {duration:Some(100.0),..Default::default()}).unwrap();
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn authored_72420_trail_uses_vehicle_direction_not_connector_axis() {
         let words=vec![7171,0,0,0,0,0,0,2006,3212836864,0,46,8,0,1056964608,1090519040,1077936128,4,0,4287692688,1055286886,4291624908,1057803469,4291624908,1065353216,4287692688,3,0,1034147594,1056964608,1039516303,1065353216,1034147594,3,0,1045220557,1056964608,1048576000,1065353216,1045220557];
-        let mut gc=R250::new(7);let mut ds=R250::new(7);let mut crt=ao_formats::character::CrtRand::new(1);
+        let mut gc=R250::new(7);let mut ds=R250::new(7);let mut crt=ao_scene::CrtRand::new(1);
         let mut trail=TrailEffect::new(&Template {kind:3039,words},Mat4::IDENTITY,Mat4::IDENTITY,0,&mut gc,&mut ds,&mut crt).unwrap();
         trail.set_vehicle_direction(Vec3::X);
         trail.update_source(Mat4::from_translation(Vec3::X)).unwrap();
@@ -258,7 +258,7 @@ mod tests {
         let missing_payload=super::super::materials::MATERIALS.iter().position(|m|r.names.id(1010004,m.0)==Some(8714)).expect("installed material referencing texture8714");
         for material in [98,missing_payload] {
             let mut words=vec![0;22];words[8]=3.0f32.to_bits();words[9]=material as u32;words[14]=1;words[15]=1;words[16]=1;
-            let mut gc=R250::new(7);let mut ds=R250::new(7);let mut crt=ao_formats::character::CrtRand::new(1);
+            let mut gc=R250::new(7);let mut ds=R250::new(7);let mut crt=ao_scene::CrtRand::new(1);
             let buff=super::super::buffs::Buff::new(&Template {kind:3038,words},Mat4::IDENTITY,Vec3::ZERO,0,EffectConfig::default(),&mut gc,&mut ds,&mut crt,None,None)?;
             let model=Renderer::build_buff_model(&r.store,&r.names,&buff)?;
             assert!(model.scene.textures.is_empty());
@@ -431,7 +431,7 @@ pub(super) struct GridEffect {template:Template,source:Mat4,position:Vec3,curves
 impl GridEffect {
     // GC10115a3b loads words10/11/12, but GC10115964 and10115d41 never
     // forward or read them: installed mode11=4/scale12=1 are inert natively.
-    pub(super) fn new(t:&Template,source:Mat4,_target:Mat4,_color:u32,gc:&mut R250,_ds:&mut R250,_crt:&mut ao_formats::character::CrtRand)->Result<Self> {
+    pub(super) fn new(t:&Template,source:Mat4,_target:Mat4,_color:u32,gc:&mut R250,_ds:&mut R250,_crt:&mut ao_scene::CrtRand)->Result<Self> {
         ensure!(t.kind==3038,"not native VolGrid");
         for i in [1,2,3,4,5,6,8,12,13] {t.float(i)?;}
         ensure!(t.float(8)?>0.0,"invalid VolGrid duration");
@@ -452,7 +452,7 @@ impl GridEffect {
     }
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::Additive]}
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn vertices(&mut self,time:f32,camera:Vec3,_right:Vec3,_up:Vec3,_gc:&mut R250,_ds:&mut R250,_crt:&mut ao_formats::character::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
+    pub(super) fn vertices(&mut self,time:f32,camera:Vec3,_right:Vec3,_up:Vec3,_gc:&mut R250,_ds:&mut R250,_crt:&mut ao_scene::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
         if time>=self.duration {return Ok(None);}
         let dt=(time-self.previous).max(0.0);self.previous=time;
         let t=&self.template;
@@ -569,7 +569,7 @@ struct TrailSample {matrix:Mat4,color:[f32;4]}
 /// GC10114c39/101150b4/10114bae; DS1002c7bd/1002c918/1002d169.
 pub(super) struct TrailEffect {template:Template,source:Mat4,origin:TrailSample,samples:Vec<TrailSample>,head:usize,count:usize,curves:[Curve;3],previous:f32,emission:f32,done:bool,vehicle_direction:Option<Vec3>}
 impl TrailEffect {
-    pub(super) fn new(t:&Template,source:Mat4,_target:Mat4,_color:u32,_gc:&mut R250,_ds:&mut R250,_crt:&mut ao_formats::character::CrtRand)->Result<Self> {
+    pub(super) fn new(t:&Template,source:Mat4,_target:Mat4,_color:u32,_gc:&mut R250,_ds:&mut R250,_crt:&mut ao_scene::CrtRand)->Result<Self> {
         ensure!(t.kind==3039,"not native Trail2");
         ensure!((1..=4096).contains(&t.word(11)?),"invalid Trail2 sample capacity");
         for i in [1,2,3,4,5,6,8,12,13,14,15] {t.float(i)?;}
@@ -597,7 +597,7 @@ impl TrailEffect {
         if remaining!=0 {for old in &mut self.samples[..remaining] {*old=sample;}}
     }
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn vertices(&mut self,time:f32,_camera:Vec3,_right:Vec3,_up:Vec3,_gc:&mut R250,ds:&mut R250,_crt:&mut ao_formats::character::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
+    pub(super) fn vertices(&mut self,time:f32,_camera:Vec3,right:Vec3,up:Vec3,_gc:&mut R250,ds:&mut R250,_crt:&mut ao_scene::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.done {return Ok(None);}
         let dt=(time-self.previous).max(0.0);self.previous=time;
         let phase=(time*f32::from_bits(self.template.words.get(13).copied().unwrap_or(0)))%1.0;

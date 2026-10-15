@@ -4,7 +4,7 @@ use super::{materials, quad, EffectConfig, Template};
 use anyhow::{ensure, Context, Result};
 use ao_scene::{Blend, Vertex};
 use glam::{Mat4, Vec3};
-use ao_formats::character::CrtRand;
+use ao_scene::CrtRand;
 use ao_formats::weather::R250;
 use std::sync::{Mutex, OnceLock};
 

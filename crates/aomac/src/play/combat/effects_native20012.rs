@@ -125,7 +125,7 @@ impl Plasma {
         vec![(Some(self.template.word(9).unwrap_or(0) as usize),(0..75u32).flat_map(|i| {let a=i*2;[a,a+1,a+2,a+2,a+1,a+3]}).collect(),152)]
     }
     pub(super) fn blends(&self) -> Vec<Blend> { vec![Blend::Additive] }
-    pub(super) fn vertices(&mut self,time:f32,forward:Vec3,crt:&mut ao_formats::character::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
+    pub(super) fn vertices(&mut self,time:f32,forward:Vec3,crt:&mut ao_scene::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
         ensure!(time.is_finite() && time>=0.0,"invalid Plasma time");
         if self.duration>=0.0 && time>self.duration {return Ok(None);}
         let Some((start,end))=self.hit else {return Ok(None)};
@@ -185,8 +185,8 @@ mod tests {
         let t=Template {kind:2002,words:vec![5,0,0x3e800000,0,0,0,0,0,0xbf800000,8,0x3f800000,0x3e99999a,0x3f800000,0x3e99999a,0x3f800000,0x3e99999a,0x3f800000,0x3e99999a,0x3f800000]};
         let mut n=Plasma::new(&t,Some((Vec3::ZERO,Vec3::X)),EffectConfig::default())?;
         assert_eq!(n.duration,1.0); assert_eq!(n.models()[0].2,152);
-        let mut crt=ao_formats::character::CrtRand::new(7);
-        let mut expected=ao_formats::character::CrtRand::new(7);expected.rand();
+        let mut crt=ao_scene::CrtRand::new(7);
+        let mut expected=ao_scene::CrtRand::new(7);expected.rand();
         let v=n.vertices(0.5,Vec3::Z,&mut crt)?.unwrap();
         assert_eq!(v[0].len(),152);assert_eq!(crt.rand(),expected.rand());
         assert!(v[0].iter().all(|v|v.pos.iter().all(|x|x.is_finite())));
@@ -209,7 +209,7 @@ mod tests {
         let origin=Vec3::new(5000.0,10.0,5000.0);let eye=origin+Vec3::new(2.0,2.0,5.0);
         for id in [11201,17500,17600,17912,17913,17914] {
             let t=&templates.by_id[&id];let mut n=Plasma::new(t,Some((origin,origin+Vec3::Y*2.0)),EffectConfig::default())?;
-            let mut crt=ao_formats::character::CrtRand::new(1);
+            let mut crt=ao_scene::CrtRand::new(1);
             let name=materials::MATERIALS[t.words[9] as usize].0;
             let key=TextureKey {rdb_type:1010004,id:renderer.names.id(1010004,name).context("missing Plasma texture name")?};
             let texture=ao_formats::texture::load_texture(&renderer.store,key)?.context("missing Plasma texture")?;

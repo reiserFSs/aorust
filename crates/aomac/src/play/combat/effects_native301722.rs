@@ -4,7 +4,8 @@
 //! Process101096b7, graceful1010916d, delete1010953f; DS10008056/100087c1.
 use super::{materials, quad, sprites, EffectConfig, Template};
 use anyhow::{ensure, Context, Result};
-use ao_formats::{character::CrtRand, weather::R250};
+use ao_formats::weather::R250;
+use ao_scene::CrtRand;
 use ao_scene::{Blend, Vertex};
 use glam::{Mat4, Vec3};
 

@@ -4,17 +4,13 @@ use ao_audio::district::Districts;
 use ao_formats::{playfield::{self, collision::Collision, WildlifeGeometry, ZoneLocator}, wildlife::{self, LifeAsset, LifeKind}};
 use ao_rdb::RecordStore;
 use glam::Vec3;
+use ao_scene::CrtRand;
 use std::sync::Arc;
 use super::native_life::{Animation, CharacterSensor, Environment, Neighbor, Species};
 
 #[derive(Clone, Copy)]
 struct Request { catalog: usize, district: usize, pos: Vec3, count: u32, grouped: bool }
 struct InstanceState { animation: Option<Animation>, serial: u64, zone_visible: bool, distance_visible: bool }
-struct Rng(u32);
-impl Rng {
-    fn value(&mut self) -> u32 { self.0 = self.0.wrapping_mul(214013).wrapping_add(2531011); (self.0 >> 16) & 32767 }
-    fn unit(&mut self) -> f64 { f64::from(self.value()) / 32767.0 }
-}
 fn mirror(p: Vec3) -> Vec3 { Vec3::new(p.x, p.y, -p.z) }
 
 pub struct LifeWorld {
@@ -34,7 +30,7 @@ pub struct LifeWorld {
     distance_timer: f32,
     next_id: u32,
     next_group: u32,
-    rng: Rng,
+    rng: CrtRand,
     neighbors: Vec<Neighbor>,
 }
 impl LifeWorld {
@@ -51,7 +47,7 @@ impl LifeWorld {
             }
         }
         let requests = (0..geometry.zones_x * geometry.zones_z).map(|_| Vec::new()).collect();
-        Ok(Self { catalog, species: Vec::new(), ids: Vec::new(), geometry, zones, districts, requests, heights, clips, states: Vec::new(), enabled: false, prepared: false, previous: [0; 25], distance_timer: 0.0, next_id: 1, next_group: 1, rng: Rng(1), neighbors: Vec::new() })
+        Ok(Self { catalog, species: Vec::new(), ids: Vec::new(), geometry, zones, districts, requests, heights, clips, states: Vec::new(), enabled: false, prepared: false, previous: [0; 25], distance_timer: 0.0, next_id: 1, next_group: 1, rng: CrtRand::thread(), neighbors: Vec::new() })
     }
     pub fn catalog_used(&self, index: usize) -> bool {
         self.districts.as_ref().is_some_and(|districts| districts.districts.iter().any(|district| district.wildlife.iter().any(|&(asset,count)| asset as usize == index && count > 0)))
@@ -79,8 +75,8 @@ impl LifeWorld {
     pub fn tick(&mut self, dt: f32, control: Vec3, surface: &Collision, characters: &[CharacterSensor], dangers: &[CharacterSensor], corpses: &[Vec3], wind: Vec3) {
         if !self.enabled { return; }
         if !self.prepared {
-            self.rng = Rng(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
-            self.prepare(surface);
+            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32);
+            self.prepare(surface, seed);
             self.prepared = true;
         }
         let env = WorldEnvironment { surface, zones: &self.zones, districts: self.districts.as_ref(), characters, dangers, corpses, wind };
@@ -98,7 +94,7 @@ impl LifeWorld {
                             let group = request.grouped.then(|| { let id = self.next_group; self.next_group += 1; id });
                             for _ in 0..request.count {
                                 let kind = LifeKind::from_native(self.catalog[request.catalog].kind).expect("validated native life kind");
-                                let mut s = Species::new(kind, request.catalog, request.pos, request.district, self.rng.value());
+                                let mut s = Species::new(kind, request.catalog, request.pos, request.district, self.rng.clone());
                                 s.group = group; s.body_radius = self.heights[request.catalog] * 0.5;
                                 s.pos.y += s.body_radius;
                                 s.place(&env);
@@ -161,8 +157,12 @@ impl LifeWorld {
         self.states.truncate(kept);
         self.previous = current;
     }
-    fn prepare(&mut self, surface: &Collision) {
+    fn prepare(&mut self, surface: &Collision, seed: u32) {
+        for requests in &mut self.requests { requests.clear(); }
         let Some(districts) = &self.districts else { return };
+        // GC1011bce4 -> 1011bb4a: one srand(time) immediately before regenerating
+        // requests after disabled -> enabled, only when district data exists.
+        self.rng.reseed(seed);
         for (district, data) in districts.districts.iter().enumerate() {
             let zones: Vec<usize> = districts.zone_to_district.iter().enumerate().filter_map(|(z,&d)| (d as usize == district && z < self.requests.len()).then_some(z)).collect();
             if zones.is_empty() { continue; }
@@ -196,7 +196,7 @@ fn vicinity(zone: u32, width: u32) -> [u32; 25] {
     for z in -2i32..=2 { for x in -2i32..=2 { if x.abs() == 2 || z.abs() == 2 { out[p] = zone.wrapping_add_signed(z.wrapping_mul(width as i32).wrapping_add(x)); p += 1; } } }
     out
 }
-fn positions(kind: LifeKind, count: usize, zones: &[usize], geometry: &WildlifeGeometry, surface: &Collision, rng: &mut Rng) -> Vec<(usize, Vec3)> {
+fn positions(kind: LifeKind, count: usize, zones: &[usize], geometry: &WildlifeGeometry, surface: &Collision, rng: &mut CrtRand) -> Vec<(usize, Vec3)> {
     let mut out = Vec::with_capacity(count);
     let edge = geometry.zone_edge;
     let mut bounds = Vec::new();
@@ -296,7 +296,12 @@ mod tests {
             }
         }
         world.set_enabled(true);
-        world.prepare(&collision);
+        world.rng = CrtRand::new(1);
+        world.set_enabled(true);
+        assert_eq!(world.rng.rand(), 41, "repeated EnableLife does not reseed the CRT");
+        world.rng.reseed(1);
+        world.prepare(&collision, 1);
+        let request_count: usize = world.requests.iter().map(Vec::len).sum();
         world.prepared = true;
         let control = world.requests.iter().skip(2).find_map(|requests| requests.first().map(|r| r.pos)).expect("retail district contains authored wildlife requests");
         world.tick(0.001, control, &collision, &[], &[], &[], Vec3::ZERO);
@@ -311,8 +316,9 @@ mod tests {
         world.tick(0.001, control, &collision, &[], &[], &[], Vec3::ZERO);
         assert!(world.species.is_empty());
         world.set_enabled(true);
-        world.rng = Rng(1);
-        world.prepare(&collision);
+        world.rng.reseed(1);
+        world.prepare(&collision, 1);
+        assert_eq!(world.requests.iter().map(Vec::len).sum::<usize>(), request_count, "regeneration replaces requests instead of appending them");
         world.prepared = true;
         world.tick(0.001, control, &collision, &[], &[], &[], Vec3::ZERO);
         assert!(!world.species.is_empty());

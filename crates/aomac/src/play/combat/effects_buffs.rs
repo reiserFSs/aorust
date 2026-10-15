@@ -2,7 +2,8 @@
 //! controls receive the live posed CAT surface, never replacement geometry.
 use super::{buff200x, buff300x, buff303x, buff_shield, buffelectra, buffstars, crystal, groundgrid, highlight, lavaball, legacy_buffs, legacy_sprites, legacy300x, legacy301x, legacy302x, legacy303x, native20012, native30001, native301722, vein, EffectConfig, Renderer, Template};
 use anyhow::{ensure, Result};
-use ao_formats::{character::CrtRand, weather::R250};
+use ao_formats::weather::R250;
+use ao_scene::CrtRand;
 use ao_scene::{ActorFrame, Blend, Scene, TextureKey, Vertex};
 use glam::{Mat4, Vec3};
 

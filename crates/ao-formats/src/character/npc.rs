@@ -215,7 +215,7 @@ pub fn holder_variants(rec: &NpcRecord, key: u32) -> &[u32] {
 }
 
 /// `FUN_1004570c`: one value of a multimap key. A single value is returned without touching the RNG; several are
-/// `values[rand() % count]` (`rand` = the CRT's, [`CrtRand::rand`]).
+/// `values[rand() % count]` (`rand` = the CRT's, [`ao_scene::CrtRand::rand`]).
 pub fn pick_variant(values: &[u32], rand: &mut impl FnMut() -> u32) -> Option<u32> {
     match values {
         [] => None,
@@ -224,25 +224,6 @@ pub fn pick_variant(values: &[u32], rand: &mut impl FnMut() -> u32) -> Option<u3
     }
 }
 
-/// The Visual C++ 2010 CRT `rand()` (`MSVCR100.dll`, which every client DLL imports - `FUN_1004570c` calls it): per-thread
-/// `holdrand = holdrand * 214013 + 2531011; (holdrand >> 16) & 0x7fff`. A thread that never called `srand` starts at 1.
-/// `srand` callers found: `FUN_1011bb4a` [GC] = `srand(_time64())` (an ID-range remapper that runs on a playfield load) and
-/// `GfxVisualNano2::ProcessStuff` [DS 0x1001975e] = `srand(0x2a)` / `srand(effect seed)` while a particle effect is generated
-/// (not modelled: it makes the real sequence depend on the visible effects).
-#[derive(Clone, Debug)]
-pub struct CrtRand(u32);
-
-impl CrtRand {
-    /// `srand(seed)`.
-    pub const fn new(seed: u32) -> Self {
-        Self(seed)
-    }
-
-    pub fn rand(&mut self) -> u32 {
-        self.0 = self.0.wrapping_mul(214013).wrapping_add(2531011);
-        (self.0 >> 16) & 0x7fff
-    }
-}
 
 /// `FUN_10010ad1`: the parent of an animation key (0 = none).
 pub fn fallback_key(key: u32) -> u32 {
@@ -393,7 +374,7 @@ mod variant_tests {
     /// The classic MSVC CRT sequence after `srand(1)` (also the state of a thread that never seeded).
     #[test]
     fn crt_rand_sequence() {
-        let mut r = CrtRand::new(1);
+        let mut r = ao_scene::CrtRand::new(1);
         assert_eq!([r.rand(), r.rand(), r.rand(), r.rand()], [41, 18467, 6334, 26500]);
     }
 

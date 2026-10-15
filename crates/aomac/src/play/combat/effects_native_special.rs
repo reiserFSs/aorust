@@ -6,7 +6,8 @@
 //! Its visual is ForceSword, DS init10015730/process100156e9/render10015f21.
 use super::Template;
 use anyhow::{ensure, Context, Result};
-use ao_formats::{character::{CrtRand, NameTable}, mesh::{decode_mesh_into, MESH_TYPE}};
+use ao_formats::{character::NameTable, mesh::{decode_mesh_into, MESH_TYPE}};
+use ao_scene::CrtRand;
 use ao_rdb::RecordStore;
 use ao_scene::{ActorFrame, Scene, Vertex};
 use glam::{Mat4, Quat, Vec3};

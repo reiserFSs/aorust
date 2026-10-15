@@ -112,9 +112,9 @@ entries). `NpcAnim` exposes the useful subset.
 with `FUN_1004570c` per key but **without** the first-entry last resort (`holder_variants`).
 
 **Variant pick** (`FUN_1004570c(key)` [GC 0x1004570c], `pick_variant`): `n = count(key)` (`FUN_100456ac`); `n == 0` -> 0; `n == 1` -> that value **without calling `rand`**; `n > 1` ->
-value `rand() % n` of the multimap's equal range (insertion = file order). `rand` = the MSVCR100 CRT's (`CrtRand`: `holdrand * 214013 + 2531011 >> 16 & 0x7fff`, a thread starts at 1);
-`srand` callers: `FUN_1011bb4a` [GC] `srand(_time64())` (reads the playfield; a playfield-load remapper) and `GfxVisualNano2::ProcessStuff` [DS 0x1001975e] `srand(0x2a)` / `srand(effect seed)`
-per particle effect (not modelled). **When it is rolled**: on every lookup, i.e. every clip *start*: the movement-state handler `FUN_1006c065` -> `FUN_1006be27` (callers: the state
+value `rand() % n` of the multimap's equal range (insertion = file order). `rand` = the MSVCR100 CRT's (`ao_scene::CrtRand`: `holdrand * 214013 + 2531011 >> 16 & 0x7fff`, a thread starts at 1).
+`FUN_1011bb4a` [GC] is wildlife request regeneration, not an ID-range remapper: its caller `FUN_1011bce4` seeds `srand(_time64())` only on the disabled→enabled transition. `GfxVisualNano2::ProcessStuff` [DS `1001975e`] reseeds 42 at entry and wall-clock seconds before each of its eighteen blocks; geometry draws use DS R250, but the CRT reseeds affect later NPC variants and wildlife steering on the same native thread.
+Production dynels, effect rendering and wildlife share the allocation-free thread stream; creating a handle does not seed it, and explicit `CrtRand::new(seed)` remains isolated for fixtures. **When it is rolled**: on every lookup, i.e. every clip *start*: the movement-state handler `FUN_1006c065` -> `FUN_1006be27` (callers: the state
 transitions `FUN_1006d196 d5d0 d69c d821 d9e8 dd0c de93 df81 eb63 ecf0`) starts the idle (key from `holder+0x10`, default 0x78) / walk / run clip with `AnimHolder::Play(clip, 1.0, loop -1 (0xffffffff), layer 2)`:
 an **infinite loop**, so an idle never re-rolls at the loop end and there is no chance rule or blend between idle variants; the next roll happens at the next state change (also `FUN_1003ea0d` revive,
 `FUN_1006fcfa` end of a waypoint path, `FUN_1003cc15`/`FUN_1003cad0` stance idle, `FUN_1006a239` attack, `FUN_100a4dcc` emote). Implemented per character in `dynels::Roll` (rolled when the clip key or movement state changes), all variants are loaded into `Built::clips`.
@@ -322,4 +322,4 @@ No colour substitution or invented pink fallback is warranted; the uncaptured fo
 * Marker pairs (`0x0f,0x17` …), the 13 trailing bytes, the fourth list: Gamecode `FUN_1004d919` ignores them; no other reader exists (`0xfde97` occurs only in `FUN_1004dc30`, searched all DLLs for the 4-byte constant and the decimal 1040023: only Gamecode 0x1004dc4c).
 * Consumer of the record's other stats (Flags 0x4000, VolumeMass, Features, 0xc5, 0x165, CharRadius): the only direct readers found are `FUN_1004d8e6(stat)` callers `FUN_10058078`, `FUN_1006fb56`, `FUN_1009b4ac`; likely folded into the dynel's stat object (vtable `+0x3c` GetStat) [GUESS].
 * Cloth table → textures for morphed chars; the global compared in `FUN_10070247`; sound key names; the meaning of `Part::alpha_aux` (see AlphaMode).
-* `AbstractAnimID_e` enumerator names (no symbols; derived from clip names above); the effect-driven `srand` calls (`ProcessStuff`) that reseed the real `rand()` stream; the exact call moment of `FUN_1011bb4a`'s `srand(time)` ([GUESS]: zone start).
+* `AbstractAnimID_e` enumerator names (no symbols; derived from clip names above).

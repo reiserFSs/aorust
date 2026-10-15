@@ -88,7 +88,7 @@ impl Fence {
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.word(9).unwrap_or(0) as usize),(0..64).flat_map(|i|[i*4,i*4+1,i*4+2,i*4+1,i*4+2,i*4+3]).collect(),256)]}
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::Additive]}
-    pub(super) fn vertices(&mut self,time:f32,crt:&mut ao_formats::character::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
+    pub(super) fn vertices(&mut self,time:f32,crt:&mut ao_scene::CrtRand)->Result<Option<Vec<Vec<Vertex>>>> {
         let life=self.template.float(18)?;let width=self.template.float(20)?;let centre=self.source.w_axis.truncate();
         let closest=|edge:Edge| {let p=glam::Vec2::new(centre.x,centre.z);let d=edge.b-edge.a;let u=if d.length_squared()==0.0 {0.0}else{((p-edge.a).dot(d)/d.length_squared()).clamp(0.0,1.0)};let q=edge.a+d*u;((q-p).length_squared(),q)};
         if self.edges.is_empty() {self.stopped=true;}
@@ -192,7 +192,7 @@ mod tests {
         let t=Template {kind:2012,words:vec![1,0,0,0,0,0,0,1000,3212836864,2,1065353216,1065353216,1056964608,1056964608,1065353216,1056964608,1056964608,1065353216,1061997773,1117782016,1061997773]};
         let edge=Edge {a:glam::Vec2::new(-10.0,1.0),b:glam::Vec2::new(10.0,1.0),tangent:Vec3::X,solid:true};
         let mut f=Fence {template:t,source:Mat4::IDENTITY,edges:vec![edge],sparks:[Spark::default();64],nearest:0,candidate:0,emission:0.0,stopped:false};
-        let mut crt=ao_formats::character::CrtRand::new(7);
+        let mut crt=ao_scene::CrtRand::new(7);
         f.vertices(0.0,&mut crt)?;assert_eq!(f.sparks.iter().filter(|s|s.end>0.0).count(),3);
         assert!(f.vertices(0.1,&mut crt)?.unwrap()[0].iter().any(|v|v.color[3]>0.0));
         f.terminate_gracefully();assert!(f.vertices(1.0,&mut crt)?.is_none());Ok(())
@@ -205,7 +205,7 @@ mod tests {
         use anyhow::Context;
         let dir=ao_gui::client_dir();let templates=Templates::open(&dir)?;let renderer=Renderer::open(&dir)?;
         let out=std::path::PathBuf::from(std::env::var_os("AOMAC_EFFECT_FRAMES").context("AOMAC_EFFECT_FRAMES required")?);std::fs::create_dir_all(&out)?;
-        let mut crt=ao_formats::character::CrtRand::new(1);
+        let mut crt=ao_scene::CrtRand::new(1);
         for (&id,t) in templates.by_id.iter().filter(|(_,t)|matches!(t.kind,2012|2014|2015)) {
             let mut font=if t.kind==2014 {let mut f=Font::new(t,Mat4::IDENTITY,EffectConfig::default())?;f.set_text(b"123 Critical!")?;Some(f)}else{None};
             let mut fence=if t.kind==2012 {Some(Fence::new(t,Mat4::IDENTITY,&renderer.store,566)?)}else{None};

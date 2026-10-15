@@ -2,7 +2,8 @@
 //! DS100118d3. All simulation below uses native coordinates, reflected at draw.
 use super::{buff200x::{authored_color, circle, render_color}, materials, sprites, EffectConfig, Template};
 use anyhow::{ensure, Context, Result};
-use ao_formats::{character::CrtRand, weather::R250};
+use ao_formats::weather::R250;
+use ao_scene::CrtRand;
 use ao_scene::{Blend, Vertex};
 use glam::{Mat3, Mat4, Quat, Vec3};
 const ANCHORS:[i32;10]=[1011,1013,1012,1014,1007,1009,1008,1010,1000,1004];

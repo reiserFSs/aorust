@@ -8,6 +8,8 @@ pub mod cloud;
 pub mod ground_detail;
 pub mod liquid;
 pub mod mover;
+mod native_rand;
+pub use native_rand::{crt_rand, crt_srand, CrtRand};
 pub mod wave;
 pub use wave::{sun_flicker_table, wave_curves, SkyWaveSpin};
 pub use mover::{Counter, Mover, MoverState, RotTerm};

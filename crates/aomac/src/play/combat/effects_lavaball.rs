@@ -2,7 +2,7 @@
 //! Two 128-entry DiaBill arrays; DS10010d70/1001105e owns atlas geometry.
 use super::{materials,quad,sprites,AuxSound,EffectConfig,Template};
 use anyhow::{ensure,Context,Result};
-use ao_formats::character::CrtRand;
+use ao_scene::CrtRand;
 use ao_scene::{Blend,Vertex};
 use glam::{Mat4,Vec3};
 const CAPACITY:usize=128;

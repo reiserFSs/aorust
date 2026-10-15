@@ -9,7 +9,8 @@
 use anyhow::Context;
 use ao_formats::character::actor::{attractor_list, npc_part_layers, npc_part_textures, ActorAssets, ActorRig, PlayerLook};
 use ao_formats::dynel_visual::{blob_stats, corpse_visual, default_mesh, effective_stats, item_template, placed_dynels, static_instance, visual, PlacedDynel};
-use ao_formats::character::{load_cat_mesh, AnimLayer, CatAnim, ClothPart, CrtRand, Equipment, NameTable, NpcRecord, TextureOverride, CHAR_MESH_TYPE};
+use ao_formats::character::{load_cat_mesh, AnimLayer, CatAnim, ClothPart, Equipment, NameTable, NpcRecord, TextureOverride, CHAR_MESH_TYPE};
+use ao_scene::CrtRand;
 use ao_gui::Gui;
 use ao_net::n3::dynel::{Dynel, SimpleCharFullUpdate};
 use ao_net::n3::misc::Misc;
@@ -904,7 +905,7 @@ pub struct Dynels {
     /// The tag sprites held by the renderer and the 2 s nametag listing (`play/tags.rs`).
     tags: TagLayer,
     listing: Listing,
-    /// The CRT's `rand()` the variant picks consume (`srand(time)` when the zone starts, [GUESS] for the exact call site).
+    /// Native thread CRT shared with wildlife and effect generation; fixtures retain an isolated seed.
     rng: CrtRand,
     calibration: super::avatar::Calibration,
     /// `PlayGameSound` calls of doors and characters (fight sounds) since the last [`Dynels::take_sounds`].
@@ -1292,7 +1293,7 @@ impl Dynels {
     /// Starts the model builder for the client at `dir`; `own` = the player's own instance id (drawn by the avatar code).
     pub fn start(&mut self, dir: PathBuf, own: i32) {
         self.own = own;
-        self.rng = CrtRand::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
+        self.rng = CrtRand::thread();
         self.arms = super::combat::arms::Armory::open(&dir);
         self.calibration = super::avatar::Calibration::load(&dir);
         self.nano_store = match RecordStore::open(&dir) {

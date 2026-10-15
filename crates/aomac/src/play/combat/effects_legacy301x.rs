@@ -4,7 +4,7 @@
 //! 49fd/4bab, load100d46a0/init100d476c/process100d41f9/delete100d4cd7.
 use super::{Binding, Creation, EffectConfig, Renderer, Template};
 use anyhow::{ensure, Result};
-use ao_formats::character::CrtRand;
+use ao_scene::CrtRand;
 use ao_scene::{Blend, Vertex};
 use glam::{Mat4, Vec3};
 

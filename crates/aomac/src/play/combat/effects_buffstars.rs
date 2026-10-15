@@ -2,7 +2,8 @@
 //! 100f7a63 and Process 100f7f3c; DS GfxVisualDiaBill 1001105e.
 use super::{buff200x::{authored_color, circle}, materials, quad, sprites, EffectConfig, Template};
 use anyhow::{ensure, Result};
-use ao_formats::{character::CrtRand, weather::R250};
+use ao_formats::weather::R250;
+use ao_scene::CrtRand;
 use ao_scene::{Blend, Vertex};
 use glam::{Mat4, Vec3};
 

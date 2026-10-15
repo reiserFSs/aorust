@@ -166,7 +166,8 @@ mod meshattrs;
 #[path = "effects_survey.rs"]
 mod survey;
 
-use ao_formats::character::{CrtRand, NameTable};
+use ao_formats::character::NameTable;
+use ao_scene::CrtRand;
 use ao_formats::weather::R250;
 use ao_rdb::RecordStore;
 use ao_scene::{ActorFrame, Blend, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
@@ -368,7 +369,7 @@ impl Renderer {
         let mut anchor_ids: Vec<_> = templates.by_id.values().filter_map(|t| t.words.get(7).map(|v| *v as i32)).chain(1000..=1018).chain(2000..=2023).chain([0,3000,3001]).collect();
         anchor_ids.sort_unstable();
         anchor_ids.dedup();
-        Ok(Self { diagnostics:HashSet::new(),templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::new(1), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),source_runtime:HashMap::new(),collision:None,anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![],vulcan_sequence:0,screen_resources:HashMap::new(),screen_uploaded:false,nano2_state:nano2::Nano2State::default(),hit_locations:hitlocation::HitLocations::default(),source_torso_factor:HashMap::new(),hit_clock_ms:0,native_fog:std::rc::Rc::new(std::cell::Cell::new(ao_render::NativeFog::default())),mesh_attr_cache:HashMap::new(),mesh_children:HashMap::new(),retired_screens:Vec::new(),shadows:true })
+        Ok(Self { diagnostics:HashSet::new(),templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::thread(), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),source_runtime:HashMap::new(),collision:None,anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![],vulcan_sequence:0,screen_resources:HashMap::new(),screen_uploaded:false,nano2_state:nano2::Nano2State::default(),hit_locations:hitlocation::HitLocations::default(),source_torso_factor:HashMap::new(),hit_clock_ms:0,native_fog:std::rc::Rc::new(std::cell::Cell::new(ao_render::NativeFog::default())),mesh_attr_cache:HashMap::new(),mesh_children:HashMap::new(),retired_screens:Vec::new(),shadows:true })
     }
     pub fn shared_native_fog(&self)->ao_render::SharedNativeFog {self.native_fog.clone()}
     /// GC100ece3a/100ecb5a/100ecee4: Shadows controls the CAT shadow visual,

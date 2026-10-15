@@ -3,7 +3,8 @@
 //! MParticle3027:1010fea9..10110119. Parameters are installed gfxtweak words.
 use super::{EffectConfig, Template};
 use anyhow::{ensure, Context, Result};
-use ao_formats::{character::{CrtRand, NameTable}, mesh::{decode_mesh_into, MESH_TYPE}, weather::R250};
+use ao_formats::{character::NameTable, mesh::{decode_mesh_into, MESH_TYPE}, weather::R250};
+use ao_scene::CrtRand;
 use ao_rdb::RecordStore;
 use ao_scene::{Blend, Scene, Vertex};
 use glam::{Mat4, Quat, Vec3};

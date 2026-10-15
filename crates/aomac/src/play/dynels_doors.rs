@@ -7,7 +7,7 @@
 //!   unlock). Each returns the [`Effect`]s the original performs besides the animation: sounds and the room monitor calls.
 //! * [`PropAnim`] is the glue `dynels.rs` uses: it owns the state of one prop and the pose the renderer holds.
 
-use ao_formats::character::CrtRand;
+use ao_scene::CrtRand;
 use ao_formats::dynel_visual::get;
 use ao_formats::mesh::NodeRig;
 use ao_rdb::RecordStore;

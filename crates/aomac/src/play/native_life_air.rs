@@ -233,7 +233,7 @@ mod tests {
     fn native_air_states_and_sensors() {
         let env = Sensors { ground: 0.0, water: None, corpses: vec![Vec3::new(1.0, 0.0, 0.0)] };
         let c = Context { dt: 0.51, environment: &env, neighbors: &[] };
-        let mut butterfly = Species::new(LifeKind::Butterfly, 0, Vec3::Y * 0.2, 0, 1);
+        let mut butterfly = Species::new(LifeKind::Butterfly, 0, Vec3::Y * 0.2, 0, ao_scene::CrtRand::new(1));
         steer(&mut butterfly, &c);
         assert_eq!(butterfly.state, 1);
         butterfly.pos = butterfly.target;
@@ -242,17 +242,17 @@ mod tests {
         butterfly.state = 3; butterfly.pos.y = 0.4;
         steer(&mut butterfly, &c);
         assert_eq!(butterfly.state, 0);
-        let mut hover = Species::new(LifeKind::Hoverbot, 0, Vec3::Y * 4.5, 0, 1);
+        let mut hover = Species::new(LifeKind::Hoverbot, 0, Vec3::Y * 4.5, 0, ao_scene::CrtRand::new(1));
         hover.state = 2; hover.target = hover.pos;
         assert!(matches!(steer(&mut hover, &c), Steering::Halt));
         assert_eq!((hover.state, hover.pending_animation), (1, Some(0)));
-        let mut fly = Species::new(LifeKind::Fly, 0, Vec3::Y, 0, 1);
+        let mut fly = Species::new(LifeKind::Fly, 0, Vec3::Y, 0, ao_scene::CrtRand::new(1));
         let fly_context = Context { dt: 1.01, ..c };
         steer(&mut fly, &fly_context);
         assert!(fly.liquid_escape);
         assert_eq!(fly.target, Vec3::new(1.0, 0.3, 0.0));
         for kind in [LifeKind::Butterfly, LifeKind::Fly, LifeKind::Hoverbot, LifeKind::Pollen] {
-            let s = Species::new(kind, 0, Vec3::ZERO, 0, 1);
+            let s = Species::new(kind, 0, Vec3::ZERO, 0, ao_scene::CrtRand::new(1));
             assert!(!s.surface_hug && !s.falling);
             assert_eq!(s.animation, 1);
         }

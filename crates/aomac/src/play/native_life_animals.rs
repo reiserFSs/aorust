@@ -298,21 +298,21 @@ mod tests {
     #[test]
     fn native_species_state_and_water_math() {
         let c = Context { dt: 0.25, environment: &Water, neighbors: &[] };
-        let mut fish = Species::new(LifeKind::Fish, 0, Vec3::new(0.0, 2.9, 0.0), 0, 1);
+        let mut fish = Species::new(LifeKind::Fish, 0, Vec3::new(0.0, 2.9, 0.0), 0, ao_scene::CrtRand::new(1));
         assert!(matches!(steer(&mut fish, &c), Steering::None));
         assert!(!fish.liquid_escape);
         let Steering::Force(force) = steer(&mut fish, &c) else { panic!("surface avoidance must steer") };
         assert!(fish.liquid_escape);
         assert_eq!(fish.wander.y, -7.0);
         assert_eq!(force, Vec3::new(0.0, -14.0, 0.0));
-        let mut rabbit = Species::new(LifeKind::Rabbit, 0, Vec3::ZERO, 0, 1);
+        let mut rabbit = Species::new(LifeKind::Rabbit, 0, Vec3::ZERO, 0, ao_scene::CrtRand::new(1));
         rabbit.state = 1;
         rabbit.animation = 0;
         rabbit.vel = Vec3::X;
         assert!(matches!(steer(&mut rabbit, &c), Steering::None));
         assert_eq!(rabbit.state, 2);
         assert_eq!(rabbit.vel, Vec3::ZERO);
-        let mut bird = Species::new(LifeKind::Bird, 0, Vec3::new(0.0, 2.0, 0.0), 0, 1);
+        let mut bird = Species::new(LifeKind::Bird, 0, Vec3::new(0.0, 2.0, 0.0), 0, ao_scene::CrtRand::new(1));
         bird.state = 3;
         bird.timer = 0.5;
         steer(&mut bird, &c);

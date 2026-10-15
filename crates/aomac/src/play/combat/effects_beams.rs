@@ -4,7 +4,7 @@ use super::{Template, tint, quad};
 use anyhow::{ensure, Result};
 use ao_scene::{Blend, Vertex, TextureKey};
 use glam::{Mat4, Vec3};
-use ao_formats::character::CrtRand;
+use ao_scene::CrtRand;
 
 pub(super) struct BeamState {
     rng: CrtRand,
@@ -12,7 +12,7 @@ pub(super) struct BeamState {
     phase_step: f32,
 }
 impl Default for BeamState {
-    fn default()->Self { Self { rng:CrtRand::new(1),phase:[0.0,2.0734513,4.1469026],phase_step:0.314 } }
+    fn default()->Self { Self { rng:CrtRand::thread(),phase:[0.0,2.0734513,4.1469026],phase_step:0.314 } }
 }
 
 pub(super) struct Beam {

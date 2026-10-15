@@ -2,7 +2,8 @@
 //! DS Sol 10020836: rotated camera quads, radius offset, SRCALPHA/ONE.
 use super::{materials, quad, sprites, EffectConfig, Template};
 use anyhow::{ensure, Context, Result};
-use ao_formats::{character::CrtRand, weather::R250};
+use ao_formats::weather::R250;
+use ao_scene::CrtRand;
 use ao_scene::{Blend, Vertex};
 use glam::{Mat4, Vec3};
 
