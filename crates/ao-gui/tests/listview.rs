@@ -259,3 +259,20 @@ fn rig_is_real() {
         assert!(rig().is_some());
     }
 }
+
+#[test]
+fn double_click_column_edge_fits_row_extents_not_header_or_icon_text() {
+    for image in [false, true] {
+        let Some((mut g, w)) = rig() else { return };
+        g.multi_add_column(w, "ml", 0, "A deliberately much wider header", 60.0, 2);
+        let icon = g.add_image("fit-icon", vec![255; 48 * 48 * 4], 48, 48, true);
+        let cell = if image { MultiCell::image(icon) } else { MultiCell::text("Row") };
+        g.multi_add_row(w, "ml", 1, vec![cell], false);
+        let r = g.view_rect(w, "ml").unwrap();
+        click(&mut g, r.l + 60.0, r.t + 5.0);
+        let events = click(&mut g, r.l + 60.0, r.t + 5.0);
+        let expected = if image { 15.0 } else { (g.text_width(ao_gui::font::FontId::Normal, "Row") - 1) as f32 };
+        assert_eq!(g.multi_columns(w, "ml")[0].1, expected);
+        assert!(events.iter().any(|event| matches!(event, Event::MultiColumnResized { col: 0, width, .. } if *width == expected)));
+    }
+}

@@ -990,12 +990,14 @@ impl Gui {
         let clicks = self.row_clicks(hv, key, 1);
         let w0 = self.multi_data(rows).and_then(|m| m.cols.iter().find(|c| c.id == col)).map_or(0.0, |c| c.width);
         if clicks == 2 {
-            // `ResizeColumnToFit`: the widest cell of the column (GUESS: 0x10135a0b not read; the label is not counted)
-            let texts: Vec<String> = self.multi_data(rows).map_or(vec![], |m| {
-                let ci = m.cols.iter().position(|c| c.id == col).unwrap_or(0);
-                m.rows.iter().filter_map(|r| r.cells.get(ci)).map(|c| c.text.clone()).collect()
-            });
-            let fit = texts.iter().map(|t| self.fonts.font(FontId::Normal).text_width(t)).max().unwrap_or(0) as f32;
+            // ResizeColumnToFit 10135a0b takes row preferred extents, never the header.
+            // InventoryListViewItem 1003d2bf: image extent 15; GetStringSize width-1.
+            let Kind::Multi(m) = &self.tree.views[rows].kind else { return };
+            let Some(ci) = m.cols.iter().position(|c| c.id == col) else { return };
+            let font = self.fonts.font(FontId::Normal);
+            let fit = m.rows.iter().filter_map(|row| row.cells.get(ci))
+                .map(|cell| if cell.image.is_some() { 15 } else { font.text_width(&cell.text) - 1 })
+                .max().unwrap_or(0).max(0) as f32;
             self.multi_resize(rows, col, fit);
             self.header_event_resized(rows, col);
             return;
