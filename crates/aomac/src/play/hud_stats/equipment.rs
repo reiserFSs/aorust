@@ -152,7 +152,7 @@ impl Equipment {
             else { added.push(s.clone()); }
         }
         let removed = previous;
-        let target = ao_net::msg::Identity { kind: super::super::dynels::CHAR_KIND as i32, instance: zone.char_id as i32 };
+        let target = ao_net::msg::Identity { kind: super::super::dynels::CHAR_KIND, instance: zone.char_id as i32 };
         for (spells, apply) in [(removed, false), (added, true)] {
             if spells.is_empty() { continue; }
             zone.apply_travel_spell_stats(target, &spells, apply);

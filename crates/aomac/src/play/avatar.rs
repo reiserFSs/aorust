@@ -1043,7 +1043,7 @@ pub(super) mod tests {
         assert!(!avatar.model().meshes.is_empty());
         assert!(frame.parts.iter().flatten().flatten().all(|v| v.is_finite()));
         let has_head = avatar.look.head.is_some() && avatar.rig.cat().attractors.iter().any(|a| a.name.ends_with("_head"));
-        assert_eq!(frame.part_attractors.iter().any(|a| *a == Some(0)), has_head);
+        assert_eq!(frame.part_attractors.contains(&Some(0)), has_head);
         assert!(!avatar.set_monster_data(&store, 99470).unwrap());
         avatar.set_pose(&store, AvatarPose { role: Role::Run, speed: 7.0, ref_speed: 7.0 }).unwrap();
         assert_eq!(avatar.clip_id, 99435);

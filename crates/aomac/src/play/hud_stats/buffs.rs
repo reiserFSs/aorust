@@ -120,7 +120,7 @@ impl Zone {
     /// Raw-stat spell handlers shared by own and remote characters (GC 100a754c / 100a9071).
     pub(in crate::play) fn apply_travel_spell_stats(&mut self, target: ao_net::msg::Identity, spells: &[Spell], apply: bool) {
         use ao_net::n3::spells::function;
-        if target.kind != super::super::dynels::CHAR_KIND as i32 { return; }
+        if target.kind != super::super::dynels::CHAR_KIND { return; }
         let own = target.instance == self.char_id as i32;
         if !own && !self.dynels.contains_key(&target.instance) { return; }
         let npc = self.dynels.get(&target.instance).is_some_and(|d| d.npc)
