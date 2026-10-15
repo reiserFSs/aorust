@@ -150,6 +150,10 @@ Runtime behavior is intentionally unchanged for this report.
   synthetic checks, **not** a finite-magazine live capture; that independent server acceptance remains unverified.
   `manual_reload_waits_for_server_acknowledgement` also exercises real special-action dispatch:
   exactly one action-0xd2 request is queued and no reload bar appears before a server message.
+  Headless verification (2026-10-16): `cargo test --release --workspace -j 2` passed
+  1,944 tests across 40 suites (62 ignored); `cargo clippy --release --workspace --all-targets -j 2 -- -D warnings`
+  passed. All three reload-specific regressions above and the existing attack/reload timer regression passed.
+  No windows, desktop input, screenshots or login attempts were used.
 * **Offscreen live evidence (2026-10-15):** Aomacfixr 33588 wielded template **121569**, weapon
   **24763172**. Both received weapon updates at **5291 ms** carried current ammo26 **0**.
   The two normal own hits at **19203 / 21389 ms** dealt **11 / 2** damage in slot6 and each supplied
