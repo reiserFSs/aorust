@@ -49,8 +49,8 @@ pub(super) struct HudActionWin {
     win: Option<ListWindow>,
     /// `(name, icon)` of the action templates shown so far (the textures are made once).
     cache: HashMap<u32, hud_bar::Slot>,
-    /// What the grid was built from: per cell `(template, fade bits, timer seconds)`.
-    built: Option<Vec<(u32, u32, i32)>>,
+    /// What the grid was built from: per cell `(template, fade bits, optional signed timer seconds)`.
+    built: Option<Vec<(u32, u32, Option<i32>)>>,
     press: Option<Press>,
     drag: Option<Drag>,
     mouse: (f32, f32),
@@ -135,19 +135,19 @@ impl HudActionWin {
         if self.win.is_none() {
             return;
         }
-        let shown: Vec<(u32, f32, i32)> = list
+        let shown: Vec<(u32, f32, Option<i32>)> = list
             .entries()
             .iter()
             .filter_map(|e| e.template().map(|t| (t, e.shown)))
             .take(CELLS)
             .map(|(t, a)| {
                 let progress = list.progress(a);
-                let p = progress.filter(|_| timers.0).map_or(-1.0, |(p, _)| p);
-                let seconds = progress.filter(|_| timers.1).map_or(-1, |(_, seconds)| seconds);
+                let p = if list.disabled(a) { progress.filter(|_| timers.0).map_or(1.0, |(p, _)| p) } else { -1.0 };
+                let seconds = progress.filter(|(p, _)| timers.1 && *p != 1.0).map(|(_, seconds)| seconds);
                 (t, p, seconds)
             })
             .collect();
-        let sig: Vec<(u32, u32, i32)> = shown.iter().map(|&(t, p, seconds)| (t, p.to_bits(), seconds)).collect();
+        let sig: Vec<(u32, u32, Option<i32>)> = shown.iter().map(|&(t, p, seconds)| (t, p.to_bits(), seconds)).collect();
         if self.built.as_ref() == Some(&sig) {
             return;
         }
@@ -157,7 +157,7 @@ impl HudActionWin {
         for &(t, p, seconds) in &shown {
             let Some(s) = self.slot(gui, t) else { continue };
             rows.push(Row { key: t as i32, icon: s.icon, cells: vec![], tip_title: s.name.clone(), tip_body: String::new() });
-            if seconds >= 0 { labels.push((t as i32, super::hud_special::timer_text(seconds))); }
+            if let Some(seconds) = seconds { labels.push((t as i32, super::hud_special::timer_text(seconds))); }
             if p >= 0.0 {
                 fades.push((t as i32, p));
             }
@@ -300,12 +300,26 @@ mod tests {
         let cell = actions.shown().iter().position(|id| *id == 0x14123).unwrap();
         let label = format!("lv_icon_label{cell}");
         assert_eq!(gui.text(window, &label), super::super::hud_special::timer_text(29));
-        let (x, y) = actions.cell_centre(&gui, cell).unwrap();
-        let frame = gui.view_rect(window, &label).unwrap();
-        assert!((frame.l + frame.r - 2.0 * x + 1.0).abs() <= 1.0);
-        assert!((frame.t + frame.b - 2.0 * y + 1.0).abs() <= 1.0);
+        for cell in 0..actions.shown().len() {
+            let (x, y) = actions.cell_centre(&gui, cell).unwrap();
+            let frame = gui.view_rect(window, &format!("lv_icon_label{cell}")).unwrap();
+            assert!((frame.l + frame.r - 2.0 * x + 1.0).abs() <= 1.0, "cell{cell}: label{frame:?}, icon centre({x},{y})");
+            assert!((frame.t + frame.b - 2.0 * y + 1.0).abs() <= 1.0, "cell{cell}: label{frame:?}, icon centre({x},{y})");
+        }
         actions.update(&mut gui, &list, 0.0, (true, false));
         assert!(gui.text(window, &label).is_empty());
+        list.sync_recharge([super::super::hud_special::Recharge { action: 0x94, total: 30, remaining: 30 }].into_iter(), std::iter::empty());
+        actions.update(&mut gui, &list, 0.0, (true, true));
+        assert!(gui.text(window, &label).is_empty(), "native progress 1.0 has no timer text, even while locked");
+        list.set_disabled(3, true);
+        actions.update(&mut gui, &list, 0.0, (false, true));
+        assert_eq!(actions.built.as_ref().unwrap()[0], (0xc1a3, 1.0f32.to_bits(), None), "flag-only action has a full fader without timer text");
+        list.set_disabled(3, false);
+        actions.update(&mut gui, &list, 0.0, (true, true));
+        assert_eq!(actions.built.as_ref().unwrap()[0], (0xc1a3, (-1.0f32).to_bits(), None));
+        list.sync_recharge([super::super::hud_special::Recharge { action: 0x94, total: 30, remaining: -1 }].into_iter(), std::iter::empty());
+        actions.update(&mut gui, &list, 0.0, (true, true));
+        assert_eq!(gui.text(window, &label), super::super::hud_special::timer_text(-1), "signed seconds never serve as a hidden-label sentinel");
         actions.close(&mut gui, &mut rollup);
     }
 }

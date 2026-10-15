@@ -258,21 +258,15 @@ impl ListView {
             };
             if self.icon_labels.is_some() {
                 let th = gui.font_height(ao_gui::FontId::Bold) as f32 - 1.0;
-                xml += &format!("<View view_layout=\"vertical\" h_alignment=\"left\" v_alignment=\"top\"><View min_size=\"Point(0,{})\" max_size=\"Point(0,{})\"/>", BORDER - 1.0, BORDER - 1.0);
-                for row in 0..rows {
-                    if row != 0 {
-                        xml += &format!("<View min_size=\"Point(0,{gap})\" max_size=\"Point(0,{gap})\"/>", gap = self.spacing - 1.0);
-                    }
-                    xml += &format!("<View view_layout=\"horizontal\" h_alignment=\"left\" min_size=\"Point(0,{h})\" max_size=\"Point({cw},{h})\"><View min_size=\"Point({border},0)\" max_size=\"Point({border},0)\"/>", h = ih - 1.0, border = BORDER - 1.0);
-                    for col in 0..self.cols {
-                        if col != 0 {
-                            xml += &format!("<View min_size=\"Point({gap},0)\" max_size=\"Point({gap},0)\"/>", gap = self.spacing - 1.0);
-                        }
-                        xml += &format!("<View view_layout=\"vertical\" v_alignment=\"center\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"><TextView name=\"lv_icon_label{i}\" value=\"\" font=\"BOLD\" color=\"0xffff00\" h_alignment=\"center\" min_size=\"Point(0,{th})\" max_size=\"Point({w},{th})\"/></View>", w = icon - 1.0, h = ih - 1.0, i = row * self.cols + col);
-                    }
-                    xml += "</View>";
+                for i in 0..cells {
+                    let (x, cy) = self.cell_pos(i, icon);
+                    let y = cy + (ih - th - 1.0) * 0.5;
+                    let (right, bottom) = (cw - x - icon + 1.0, ch - y - th);
+                    // A non-stacked wrapper applies borders in the same grid coordinates as the Canvas icon.
+                    // Nested row/spacer layouts floor fractional spacing repeatedly and drift from cell_pos.
+                    xml += &format!("<View><TextView name=\"lv_icon_label{i}\" value=\"\" font=\"BOLD\" color=\"0xffff00\" h_alignment=\"center\" layout_borders=\"Rect({x},{y},{right},{bottom})\" min_size=\"Point(0,{th})\" max_size=\"Point({width},{th})\"/></View>", width = icon - 1.0);
                 }
-                xml += "</View></View></root>";
+                xml += "</View></root>";
             }
             if let Err(e) = gui.add_view_xml(w, "lv_content", "Grid", &xml) {
                 eprintln!("hud: list grid: {e:#}");

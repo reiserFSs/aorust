@@ -101,8 +101,8 @@ pub(super) struct ShortcutBar {
     drag: Option<Drag>,
     uses: Vec<SlotUse>,
     store: Option<ao_rdb::RecordStore>,
-    /// Per slot: the recharge of the action it shows `(remaining / total, seconds)` (`FUN_1003d3ff`), painted by [`Self::paint`].
-    timers: [Option<(f32, i32)>; SLOTS],
+    /// Per slot: fader fraction and optional signed timer seconds (`FUN_1003d3ff` / `1003eebe`).
+    timers: [Option<(f32, Option<i32>)>; SLOTS],
     mouse: (f32, f32),
     /// Slot data of the special-action templates shown so far (the icon textures are made once).
     icons: HashMap<u32, Slot>,
@@ -350,7 +350,7 @@ impl ShortcutBar {
             // `FUN_1003f8e4`: macros show `<font color=yellow>name</font>` (font 7 = SMALL) centred over the macro icon
             gui.set_text(self.window, &format!("label{i}"), s.as_ref().filter(|s| s.kind == KIND_MACRO).map_or("", |s| s.name.as_str()));
             // `FUN_1003eebe`: the remaining seconds (`IconTimerText`) in yellow bold, centred over the icon
-            gui.set_text(self.window, &format!("timer{i}"), &self.timers[i].filter(|_| self.timer_text).map_or(String::new(), |(_, secs)| super::hud_special::timer_text(secs)));
+            gui.set_text(self.window, &format!("timer{i}"), &self.timers[i].filter(|_| self.timer_text).and_then(|(_, seconds)| seconds).map_or(String::new(), super::hud_special::timer_text));
         }
     }
 
@@ -477,7 +477,12 @@ impl ShortcutBar {
         for (i, s) in self.slots.iter().enumerate() {
             let Some(e) = s.as_ref().filter(|s| s.kind == KIND_SPECIAL_ACTION).and_then(|s| list.find(s.instance)) else { continue };
             // `IconTimers` off: the progress is a constant 1.0 (`FUN_1003ea09`), the stipple stays full
-            t[i] = list.progress(e.shown).map(|(p, secs)| (if timers.0 { p } else { 1.0 }, secs));
+            t[i] = list.disabled(e.shown).then(|| {
+                let progress = list.progress(e.shown);
+                let p = progress.filter(|_| timers.0).map_or(1.0, |(p, _)| p);
+                let seconds = progress.filter(|(p, _)| *p != 1.0).map(|(_, seconds)| seconds);
+                (p, seconds)
+            });
         }
         if t != self.timers {
             self.timers = t;
@@ -886,6 +891,39 @@ mod tests {
                 assert!(bar.press.is_none());
             }
         }
+    }
+
+    #[test]
+    fn shortcut_disabled_fader_and_timer_text_use_distinct_native_state() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &dir, 0, (1280, 800)).unwrap();
+        let mut list = SpecialList::new();
+        bar.slots[0] = bar.icon_slot(&mut gui, 0xc1a3);
+        list.set_disabled(3, true);
+        bar.update(&mut gui, 0.0, &list, &[], false, (false, true));
+        assert_eq!(bar.timers[0], Some((1.0, None)));
+        assert!(gui.text(bar.window, "timer0").is_empty());
+        list.set_disabled(3, false);
+        bar.update(&mut gui, 0.0, &list, &[], false, (true, true));
+        assert_eq!(bar.timers[0], None);
+        list.sync_equipment(&[(0x800, -1)], 0);
+        bar.slots[0] = bar.icon_slot(&mut gui, 0x14123);
+        list.sync_recharge([super::super::hud_special::Recharge { action: 0x94, total: 30, remaining: 30 }].into_iter(), std::iter::empty());
+        bar.update(&mut gui, 0.0, &list, &[], false, (true, true));
+        assert_eq!(bar.timers[0], Some((1.0, None)));
+        assert!(gui.text(bar.window, "timer0").is_empty());
+        list.sync_recharge([super::super::hud_special::Recharge { action: 0x94, total: 30, remaining: 29 }].into_iter(), std::iter::empty());
+        bar.update(&mut gui, 0.0, &list, &[], false, (false, true));
+        assert_eq!(bar.timers[0], Some((1.0, Some(29))));
+        assert_eq!(gui.text(bar.window, "timer0"), super::super::hud_special::timer_text(29));
+        bar.update(&mut gui, 0.0, &list, &[], false, (true, false));
+        assert_eq!(bar.timers[0], Some((29.0 / 30.0, Some(29))));
+        assert!(gui.text(bar.window, "timer0").is_empty());
+        list.sync_recharge([super::super::hud_special::Recharge { action: 0x94, total: 30, remaining: -1 }].into_iter(), std::iter::empty());
+        bar.update(&mut gui, 0.0, &list, &[], false, (true, true));
+        assert_eq!(gui.text(bar.window, "timer0"), super::super::hud_special::timer_text(-1), "signed native seconds are not a no-label sentinel");
     }
 
     #[test]
