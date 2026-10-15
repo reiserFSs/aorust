@@ -227,3 +227,22 @@ the replay camera-ready marker, outside the runs used for these numbers.
 
 Live measurements are deferred: PRK maintenance, with login explicitly prohibited
 until Main announces recovery. No window, desktop input or desktop capture was used.
+## Social/economy coverage inventory (2026-10-15)
+
+This sweep is headless only: no application windows, desktop input or screenshots. Live verification is blocked by the user's confirmed PRK maintenance; no login attempts are permitted until explicitly resumed. Existing captures remain evidence only for the particular exchanges they contain, not for new live acceptance.
+
+| Flow | Initial inventory / evidence | Verification boundary |
+|---|---|---|
+| Player trade | Native `Trade_c` GC `100674ab`, GUI `100e092f`; offer/remove/abort/complete originally left bag/cash state incomplete | RE-derived synthetic two-character messages; PRK partner-template delivery remains unobserved |
+| Shop selling | Existing cash-shop sold tray and captured purchases; sale inventory lifecycle needed the same trade-state correction | Synthetic sale/remove/abort/complete, not a new live sale |
+| Bank/backpacks | Bank/reclaim codecs and owned-backpack archive regression existed; deposits, container transfers and frame-order routing needed coverage | Synthetic bank/backpack windows and server confirmations; no captured live bank/backpack session |
+| Tradeskills | Original `TradeskillPanel.xml`, analyzer request/reply codecs existed; native sizing and container-source drops needed coverage | Synthetic analyzer/result/UI checks; compatible live ingredients and server Build confirmation not observed |
+| Teams | Member/invite/leader codecs existed; `/team` membership flags were hardcoded false and first-member leadership fabricated | Replicated membership/leader and UI-action regressions; controlled second-character acceptance unavailable |
+| Organisation | Outgoing `/org`, leave/disband dialogs and org-chat selection existed; incoming org server information/confirmation handling needed coverage | Native signal/packet-derived fixtures; no org membership or live org channel exchange |
+| Duel/reply | Existing duel validation/wire matched native; unresolved tell names could erase the reply target | Native command/wire and synthetic reply-state regression, not a live duel |
+| Friends/LFT | Existing `chat_social_ithaca.rec` covers buddy add/remove and empty search; LFT Invite, ignore refresh and Team Info actions lacked consumers | Existing capture replay plus synthetic action/UI regressions; nonempty live LFT and second-character invitations unobserved |
+| Split/stack/loot rights | Split/join codecs existed without complete UI/application; own-kill loot captures do not establish unauthorised/NoDrop/team outcomes | Native qualifier/count selection and action fixtures; rights evidence is documented separately in `docs/zone/interact.md` |
+
+Same-account concurrent-character support was checked against the public PRK issue tracker, but not established: [issue 1848](https://git.project-rk.com/prk/issues/issues/1848) concerns a stale chat connection after a disconnected game session, not two concurrent characters. The documented LoginError mapping in `docs/protocol.md` is client/CellAO evidence, not proof of PRK policy. No second live process was started to infer a policy result; player trade uses the requested native-RE/synthetic fallback.
+
+Executed headless regression evidence: `RUST_TEST_THREADS=2 cargo test --release -p aomac -j 2` passed **1176**, with **52 ignored**. This includes the social/economy synthetic and recorded-capture regressions; it is not new PRK acceptance or a retail-window visual comparison.

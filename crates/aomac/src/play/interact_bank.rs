@@ -13,23 +13,37 @@ impl Interact {
 }
 
 impl Play {
-    pub(super) fn interact_bank_frame(&mut self) {
-        let Some(i) = self.interact.as_mut() else { return };
-        if let Some((_, entries)) = self.zone.containers.get(&(0xdead, self.zone.char_id as i32)) {
-            i.use_ui.loot.refresh_bank(&mut self.gui, entries);
-        }
-        let Some(h) = self.hud.as_mut() else { return };
+    pub(super) fn interact_bank_frame(&mut self) -> Vec<ao_net::frame::Frame> {
+        let Some(i) = self.interact.as_mut() else { return vec![] };
+        i.use_ui.loot.refresh_containers(&mut self.gui, &self.zone);
+        let Some(h) = self.hud.as_mut() else { return vec![] };
         let mut rest = vec![];
         for (slot, x, y) in h.take_item_drops() {
-            if let Some(bank) = i.use_ui.loot.bank_drop(&self.gui, x, y) {
+            if let Some(bank) = i.use_ui.loot.container_drop(&self.gui, x, y) {
+                if let Some(error) = self.zone.container_move_error(inventory::item_identity(slot), bank) {
+                    i.use_ui.container_feedback.push(error);
+                    continue;
+                }
                 i.send(inventory::container_add_item(self.zone.char_id as i32, bank, inventory::item_identity(slot)));
             } else {
                 rest.push((slot, x, y));
             }
         }
-        for f in i.take_outbox() {
-            if let Some(s) = &self.session { s.send_zone(f); }
+        for (item, x, y) in i.use_ui.loot.take_drops() {
+            if i.tradeskill.drop_identity(&self.gui, &self.zone, item, x, y) { continue; }
+            if h.container_bag_drop(&self.gui, x, y) {
+                i.move_to_bag(&mut self.zone, item);
+            } else if item.kind != inventory::KIND_BANK {
+                if let Some(container) = i.use_ui.loot.container_drop(&self.gui, x, y) {
+                    if let Some(error) = self.zone.container_move_error(item, container) {
+                        i.use_ui.container_feedback.push(error);
+                        continue;
+                    }
+                    i.send(inventory::container_add_item(self.zone.char_id as i32, container, item));
+                }
+            }
         }
         h.requeue_item_drops(rest);
+        i.take_outbox()
     }
 }

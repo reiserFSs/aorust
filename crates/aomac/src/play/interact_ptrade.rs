@@ -29,8 +29,6 @@ use ao_net::n3::world::AcgItem;
 pub const CLIENT: (u32, u32) = (super::hud_rollup::AREA_W, 453);
 /// `FUN_10059ca0` [GC]: the surface distance between both characters must be `<= _DAT_101574fc` = 5.0 m.
 pub const RANGE: f32 = 5.0;
-/// The bounding sphere radius of a character (`n3VisualDynel_t::GetBoundingSphereRadius`) is not known per model: [GUESS] the body collision default 0.5 m for both.
-const RADIUS: f32 = 0.5;
 /// The own cash field is sent this long after the last edit: `EventTimer_c::Start(0xf4240, 0, 1)` [GUI 0x100df82d] ([INFERENCE]: microseconds).
 pub const CASH_DELAY: f32 = 1.0;
 /// Cell art of the item lists (`MultiListView_c` 48 px icons in 54 px slots, hud_stats/items.rs).
@@ -47,6 +45,126 @@ const CONFIRM_TEXT: &str = "Are you sure you want to complete this trade?";
 
 const ZERO: Identity = Identity { kind: 0, instance: 0 };
 
+/// GC100193be..10019422: this is Flags0x4000000, not the generic
+/// move guard's Flags0x40 (operation0x70 explicitly bypasses that guard).
+fn trade_item_error(flags: i32, duration: i32, shop: bool, npc: bool) -> Option<&'static str> {
+    if flags & 0x4000000 != 0 && !npc {
+        Some("Feedback_NoDropItemCantBeTraded")
+    } else if shop && duration != -1 {
+        Some("Feedback_ItemsWithLimitedTimespan")
+    } else {
+        None
+    }
+}
+
+/// Inventory-side state survives the trade window closing on the first completion.
+#[derive(Default)]
+pub(super) struct TradeState {
+    pub(super) partner: Identity,
+    ours: Vec<(Identity, ao_net::n3::world::InventoryEntry)>,
+    cash: [i32; 2],
+    completed: [bool; 2],
+}
+
+impl Zone {
+    /// Retail moves offers out of the bag on acknowledgement (1004aab1),
+    /// returns them on remove/abort (10046f81/100666a3), and transfers on
+    /// completion (100668d1). Shop completion consumes the sold cells (10099f15).
+    pub(super) fn apply_trade(&mut self, t: &Trade, who: Identity) {
+        let me = Identity { kind: DYNEL_CHAR, instance: self.char_id as i32 };
+        if t.op == trade::START && who == me && self.trade_state.is_none() {
+            self.trade_state = Some(TradeState { partner: t.a, ..Default::default() });
+            return;
+        }
+        let Some(mut state) = self.trade_state.take() else { return };
+        let mine = who == me;
+        let partner = who == state.partner;
+        if !mine && !partner {
+            self.trade_state = Some(state);
+            return;
+        }
+        match t.op {
+            trade::ADD_ITEM | trade::VENDING_ADD if mine && t.a == me && t.b.kind == ao_net::n3::inventory::KIND_BAG => {
+                if let Some(mut entry) = self.inventory.remove(&(t.b.instance as u32)) {
+                    entry.slot = (0..=state.ours.len() as u32).find(|slot| !state.ours.iter().any(|(_, e)| e.slot == *slot)).unwrap();
+                    entry.id = Identity { kind: ao_net::n3::inventory::KIND_TRADE, instance: entry.slot as i32 };
+                    state.ours.push((t.b, entry));
+                }
+            }
+            trade::REMOVE_ITEM | trade::VENDING_REMOVE if mine && t.a == me => {
+                if let Some(slot) = self.free_bag_slot() {
+                    if let Some(at) = state.ours.iter().position(|(id, e)| *id == t.b || e.id == t.b) {
+                        let (_, mut entry) = state.ours.remove(at);
+                        entry.slot = slot;
+                        entry.id = ao_net::n3::inventory::item_identity(slot);
+                        self.inventory.insert(slot, entry);
+                    }
+                }
+            }
+            trade::SET_CASH if t.a.instance >= 0 => state.cash[usize::from(!mine)] = t.a.instance,
+            trade::ABORT => {
+                while !state.ours.is_empty() {
+                    let Some(slot) = self.free_bag_slot() else { break };
+                    let (_, mut entry) = state.ours.remove(0);
+                    entry.slot = slot;
+                    entry.id = ao_net::n3::inventory::item_identity(slot);
+                    self.inventory.insert(slot, entry);
+                }
+                // GC100666a3 unconditionally calls1002a97c afterwards: remaining
+                // client placeholders are deleted, not moved into overflow.
+                return;
+            }
+            trade::COMPLETE if !state.completed[usize::from(!mine)] => {
+                state.completed[usize::from(!mine)] = true;
+                if state.partner.kind != DYNEL_CHAR {
+                    // Shop credits and purchased templates arrive authoritatively
+                    // in stat/TemplateAction/ContainerAdd messages, not this op.
+                    return;
+                }
+                if mine {
+                    state.ours.clear();
+                } else if let Some((word, mut entries)) = self.containers.remove(&(state.partner.kind, state.partner.instance)) {
+                    while !entries.is_empty() {
+                        let Some(slot) = self.free_bag_slot() else { break };
+                        let mut entry = entries.remove(0);
+                        entry.slot = slot;
+                        entry.id = ao_net::n3::inventory::item_identity(slot);
+                        self.inventory.insert(slot, entry);
+                    }
+                    if !entries.is_empty() {
+                        self.containers.insert((state.partner.kind, state.partner.instance), (word, entries));
+                    }
+                }
+                // Each header transfers that character's cash once (100668d1).
+                let cash = self.stat_of(me.instance, 0x3d).unwrap_or(0);
+                let delta = if mine { -state.cash[0] } else { state.cash[1] };
+                let cash = cash.saturating_add(delta).max(0);
+                self.stats.insert(0x3d, cash);
+                self.character_stats.entry(me.instance).or_default().insert(0x3d, cash);
+                if state.completed == [true, true] { return; }
+            }
+            _ => {}
+        }
+        self.trade_state = Some(state);
+    }
+
+    pub(super) fn trade_offer_error(&mut self, slot: u32, partner: Identity) -> Option<&'static str> {
+        let entry = *self.inventory.get(&slot)?;
+        // GC10019348 checks the carried chest contents before the item's flags.
+        if self.containers.get(&(entry.id.kind, entry.id.instance)).is_some_and(|(_, entries)| entries.iter().any(|e| self.world.item_template_stat(e.item, 0).unwrap_or(0) & 0x4000000 != 0)) {
+            return Some("Feedback_ChestContainsNoDrop");
+        }
+        let flags = self.world.item_template_stat(entry.item, 0).unwrap_or(0);
+        let duration = self.world.item_template_stat(entry.item, 8).unwrap_or(-1);
+        let npc = partner.kind == DYNEL_CHAR && self.dynels.get(&partner.instance).is_some_and(|d| d.npc);
+        trade_item_error(flags, duration, partner.kind == super::interact_shop::VENDING_MACHINE, npc)
+    }
+
+    pub(super) fn offered_item(&self, item: Identity) -> Option<&ao_net::n3::world::InventoryEntry> {
+        self.trade_state.as_ref()?.ours.iter().rev().find(|(id, e)| *id == item || e.id == item).map(|(_, e)| e)
+    }
+}
+
 /// One item of a trade list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
@@ -59,6 +177,7 @@ pub struct Entry {
 /// The open window and its model (`TradeView_c`: `+0x1c8` partner, `+0x1d0` own).
 pub struct PTrade {
     pub win: WindowId,
+    dock_registered: bool,
     escape: bool,
     pub own: Identity,
     pub partner: Identity,
@@ -110,7 +229,7 @@ fn dock_height(gui: &mut Gui) -> anyhow::Result<u32> {
 
 impl PTrade {
     /// `InventoryGUIModule_c::SlotStartTrade` -> `TradeView_c` ctor [GUI 0x100e092f] for mode 0 (`PlayerTrade`). The view is a `DockableView_c` titled "Trade"
-    /// that docks into `RollupArea`; [UNRESOLVED] it is shown here as a free window left of the rollup column.
+    /// that the frame hook registers as a transient page in `RollupArea`.
     pub fn open(gui: &mut Gui, screen: (u32, u32), own: Identity, partner: Identity, name: &str) -> anyhow::Result<PTrade> {
         let dh = dock_height(gui)?;
         let dw = (COLS as f32 * SLOT) as u32;
@@ -125,8 +244,9 @@ impl PTrade {
         // `FUN_100e039a`: the partner's cash starts as "0" (read-only, green 0x44dd44), the own field as the empty text of the XML
         gui.set_text(win, "PartnerName", name);
         gui.set_text(win, "PartnerCashView", "0");
+        gui.set_feature_flags(win, "OurCashView", ao_gui::view::tvf::NUMERIC);
         gui.relayout_window(win);
-        Ok(PTrade { win, escape: true, own, partner, ours: vec![], theirs: vec![], accepted: false, partner_cash: 0, cash: 0, scroll: [0; 2], dock: (dw, dh), cash_due: None, dirty: true, tip: None })
+        Ok(PTrade { win, dock_registered: false, escape: true, own, partner, ours: vec![], theirs: vec![], accepted: false, partner_cash: 0, cash: 0, scroll: [0; 2], dock: (dw, dh), cash_due: None, dirty: true, tip: None })
     }
 
     /// Paints both lists and the status bitmap when something changed. `info(gui, low_id)` = name and icon of a template.
@@ -217,14 +337,9 @@ impl PTrade {
         (c < COLS && i < self.entries(list).len()).then_some(i)
     }
 
-    /// `GetStat` of the bag items the own list shows: the inventory slot of an own entry.
-    fn slot_of(e: &Entry) -> u32 {
-        e.item.instance as u32
-    }
-
-    /// The own bag has a free slot once the own trade items are counted as gone (`FUN_1002a1b0(0x40)`: the original moves a traded item out of the bag).
+    /// Offers have already left the bag; only an actually empty cell counts.
     fn bag_has_room(&self, zone: &Zone) -> bool {
-        (BAG_FIRST..BAG_FIRST + ao_net::n3::inventory::BAG_SLOTS).any(|s| !zone.inventory.contains_key(&s) || self.ours.iter().any(|e| Self::slot_of(e) == s))
+        zone.free_bag_slot().is_some()
     }
 }
 
@@ -278,8 +393,21 @@ impl Interact {
             return Action::None;
         }
         let (Some(me), Some(them)) = (zone.dynels.get(&own), zone.dynels.get(&id)) else { return Action::None };
-        let d = me.pos.iter().zip(them.pos.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
-        if d - 2.0 * RADIUS > RANGE {
+        let bounds = (zone.world.character_trade_bounds(own), zone.world.character_trade_bounds(id));
+        let (own_y, own_radius, target_y, target_radius) = match bounds {
+            (Ok(Some(a)), Ok(Some(b))) => (a.0, a.1, b.0, b.1),
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("trade bounds: {error:#}");
+                return Action::None;
+            }
+            _ => return Action::None,
+        };
+        let mut a = me.pos;
+        let mut b = zone.world.character_position(id).unwrap_or(them.pos);
+        a[1] += own_y;
+        b[1] += target_y;
+        let d = a.iter().zip(b.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+        if (d - own_radius) - target_radius > RANGE {
             self.ptrade.feedback.push("Feedback_TargetOutsideRangeForTrade");
             return Action::Refused("Feedback_TargetOutsideRangeForTrade");
         }
@@ -350,8 +478,9 @@ impl Interact {
                 }
                 let list = if mine { &mut p.ours } else { &mut p.theirs };
                 if t.op == trade::ADD_ITEM {
-                    let acg = mine.then(|| zone.inventory.get(&(t.b.instance as u32)).map(|e| e.item)).flatten();
-                    list.push(Entry { item: t.b, acg });
+                    let acg = mine.then(|| zone.offered_item(t.b).or_else(|| zone.inventory.get(&(t.b.instance as u32))).map(|e| e.item)).flatten();
+                    let item = if mine { zone.offered_item(t.b).map_or(t.b, |e| e.id) } else { t.b };
+                    list.push(Entry { item, acg });
                 } else if let Some(i) = list.iter().position(|e| e.item == t.b) {
                     list.remove(i);
                 }
@@ -424,18 +553,18 @@ impl Interact {
                 p.cash_due = None;
                 out.push(trade::abort(me, true));
             }
+            Event::CanvasClick { window, view, .. } if *window == p.win && view == "close" => {
+                p.cash_due = None;
+                out.push(trade::abort(me, true));
+            }
             Event::Escape { window } | Event::CloseRequested { window } if *window == p.win => {
                 if matches!(ev, Event::CloseRequested { .. }) || p.escape {
                     p.cash_due = None;
                     out.push(trade::abort(me, true));
                 }
             }
-            // the own cash field: digits only ([GUESS] for the feature flag 0x2000 of `FUN_100e039a`), sent after `CASH_DELAY`
-            Event::TextChanged { window, view, text } if *window == p.win && view == "OurCashView" => {
-                let digits: String = text.chars().filter(char::is_ascii_digit).collect();
-                if digits != *text {
-                    gui.set_text(p.win, "OurCashView", &digits);
-                }
+            // `FUN_100df82d`: NUMERIC is enforced by the editor; edits restart the cash timer.
+            Event::TextChanged { window, view, .. } if *window == p.win && view == "OurCashView" => {
                 p.cash_due = Some(now + CASH_DELAY);
             }
             Event::TextChanged { window, .. } if *window == p.win => {}
@@ -467,8 +596,8 @@ impl Interact {
     }
 
     /// An inventory item released at `(x, y)`: when it is over the own item list `FUN_100df870` accepts the drag object (`inventory/item`, no `split_count`)
-    /// and sends `N3Msg_TradeAddItem(own, item)` [GC 0x100191f6]. The engine's refusals that need item flags (`Feedback_*` of the `vtable+0x14` test) are UNRESOLVED.
-    fn ptrade_drop(&mut self, gui: &Gui, zone: &Zone, slot: u32, x: f32, y: f32) {
+    /// and sends `N3Msg_TradeAddItem(own, item)` [GC 0x100191f6], after the native item/source preflight.
+    fn ptrade_drop(&mut self, gui: &Gui, zone: &mut Zone, slot: u32, x: f32, y: f32) {
         let me = self.own_id();
         let Some(p) = self.ptrade.trade.as_ref() else { return };
         let Some(r) = gui.view_rect(p.win, "our_items") else { return };
@@ -477,6 +606,10 @@ impl Interact {
         }
         let item = ao_net::n3::inventory::item_identity(slot);
         if slot < BAG_FIRST || !zone.inventory.contains_key(&slot) || p.ours.iter().any(|e| e.item == item) {
+            return;
+        }
+        if let Some(error) = zone.trade_offer_error(slot, p.partner) {
+            self.ptrade.feedback.push(error);
             return;
         }
         self.send(trade::add_item(me, item));
@@ -512,7 +645,7 @@ impl Interact {
     }
 
     /// The inventory items released over a window: those over the own item list are added (see [`Interact::ptrade_drop`]).
-    pub(super) fn ptrade_drops(&mut self, gui: &Gui, zone: &Zone, drops: Vec<(u32, f32, f32)>) {
+    pub(super) fn ptrade_drops(&mut self, gui: &Gui, zone: &mut Zone, drops: Vec<(u32, f32, f32)>) {
         for (slot, x, y) in drops {
             self.shop_drop(gui, zone, slot, x, y);
             self.ptrade_drop(gui, zone, slot, x, y);
@@ -529,13 +662,17 @@ impl Play {
         i.ptrade_start(&mut self.gui, &self.zone, |id| chat.is_some_and(|c| c.is_ignored(id)));
         i.ptrade_tick(&self.gui, self.time);
         if let Some(h) = self.hud.as_mut() {
+            if let Some(p) = i.ptrade.trade.as_mut().filter(|p| !p.dock_registered) {
+                if let Err(e) = h.register_transient_dock(&mut self.gui, p.win) { eprintln!("player trade docking: {e:#}"); }
+                p.dock_registered = true;
+            }
             let tradeskill_on = h.dvalue("tradeskill_window");
             i.tradeskill.sync(&mut self.gui, &mut h.dvalues, i.screen);
             if tradeskill_on && !h.dvalue("tradeskill_window") { h.set_dvalue(&mut self.gui, "tradeskill_window", false); }
             if let Some(w) = i.tradeskill.window() {
                 if let Err(e) = h.register_dock(&mut self.gui, "tradeskill_window", w) { eprintln!("dock tradeskill_window: {e:#}"); }
             }
-            i.ptrade_drops(&self.gui, &self.zone, h.take_item_drops());
+            i.ptrade_drops(&self.gui, &mut self.zone, h.take_item_drops());
             if let Some(p) = i.ptrade.trade.as_mut() {
                 p.render(&mut self.gui, &mut |g, low| h.item_info(g, low));
                 p.update_tooltip(&mut self.gui, &self.zone, &self.text, h.dvalues.flag("ItemDescriptionTooltips"));
@@ -581,7 +718,7 @@ impl Interact {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::play::zone::DynelState;
     use ao_net::frame::Frame;
@@ -590,6 +727,135 @@ mod tests {
     const OWN: i32 = 0x6584;
     const ME: Identity = Identity { kind: DYNEL_CHAR, instance: OWN };
     const BOB: Identity = Identity { kind: DYNEL_CHAR, instance: 77 };
+
+    /// Reuse a real PC's model selection, replacing only identities and placement.
+    pub(in crate::play) fn prepare_geometry(zone: &mut Zone) -> bool {
+        let dir = ao_gui::client_dir();
+        if ao_rdb::RecordStore::open(&dir).is_err() { return false; }
+        zone.world.start(dir, zone.char_id as i32);
+        let mut spawn = include_str!("../../../../docs/captures/zone_enter_ithaca.rec").lines().find_map(|line| {
+            let mut parts = line.split(' ');
+            let (_, direction, hex) = (parts.next()?, parts.next()?, parts.next()?);
+            if direction != "<" { return None; }
+            let bytes: Vec<_> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2*i..2*i+2], 16).unwrap()).collect();
+            let (frame, _) = Frame::decode_with(&bytes, false).ok()??;
+            let message = n3::decode(&frame).ok()?;
+            matches!(&message.body, N3::Dynel(n3::dynel::Dynel::SimpleCharFullUpdate(update)) if !update.is_npc()).then_some(message)
+        }).unwrap();
+        for (&id, state) in &zone.dynels {
+            spawn.header.target = Identity { kind: DYNEL_CHAR, instance: id };
+            let N3::Dynel(n3::dynel::Dynel::SimpleCharFullUpdate(update)) = &mut spawn.body else { unreachable!() };
+            update.pos = state.pos;
+            update.path = None;
+            update.monster_scale = 100;
+            zone.world.on_message(&spawn);
+        }
+        true
+    }
+
+    #[test]
+    fn native_trade_flags_distinguish_nodrop_temporary_and_npc_exemptions() {
+        assert_eq!(trade_item_error(0x40, -1, false, false), None, "operation0x70 bypasses generic NoDrop bit");
+        assert_eq!(trade_item_error(0x4000000, -1, false, false), Some("Feedback_NoDropItemCantBeTraded"));
+        assert_eq!(trade_item_error(0x4000000, -1, false, true), None);
+        assert_eq!(trade_item_error(0, 60, true, false), Some("Feedback_ItemsWithLimitedTimespan"));
+        assert_eq!(trade_item_error(0, 60, false, false), None);
+    }
+
+    #[test]
+    fn synthetic_trade_completion_transfers_items_and_cash_once_without_a_second_account() {
+        use ao_net::n3::inventory::{InventoryMsg, InventoryUpdate};
+        let mut z = zone();
+        z.stats.insert(0x3d, 1000);
+        let frame = |t: Trade, who: Identity| ao_net::n3::outgoing::n3_frame(1, OWN as u32, t.encode(who));
+        z.on_frame(&frame(msg(trade::START, BOB, ZERO), ME));
+        let offered = ao_net::n3::inventory::item_identity(0x40);
+        z.on_frame(&frame(msg(trade::ADD_ITEM, ME, offered), ME));
+        assert!(!z.inventory.contains_key(&0x40));
+        assert_eq!(z.offered_item(offered).unwrap().item.low_id, 111);
+        let mut incoming = z.inventory[&0x41];
+        incoming.slot = 0;
+        incoming.item.low_id = 333;
+        incoming.b = 7;
+        z.apply_inventory(&InventoryMsg::Update(InventoryUpdate {
+            capacity: 30, access: 2, entries: vec![incoming], container: BOB, word: 0, flag: true,
+        }));
+        z.on_frame(&frame(msg(trade::SET_CASH, flag(100), ZERO), ME));
+        z.on_frame(&frame(msg(trade::SET_CASH, flag(250), ZERO), BOB));
+        z.on_frame(&frame(msg(trade::COMPLETE, ZERO, ZERO), ME));
+        assert_eq!(z.stat_of(OWN, 0x3d), Some(900));
+        z.on_frame(&frame(msg(trade::COMPLETE, ZERO, ZERO), ME));
+        assert_eq!(z.stat_of(OWN, 0x3d), Some(900), "duplicate completion cannot debit twice");
+        z.on_frame(&frame(msg(trade::COMPLETE, ZERO, ZERO), BOB));
+        assert_eq!(z.stat_of(OWN, 0x3d), Some(1150));
+        assert_eq!((z.inventory[&0x40].item.low_id, z.inventory[&0x40].b), (333, 7));
+        assert!(z.trade_state.is_none());
+    }
+
+    #[test]
+    fn synthetic_shop_sale_remove_abort_and_complete_keep_real_inventory() {
+        let mut z = zone();
+        let machine = Identity { kind: super::super::interact_shop::VENDING_MACHINE, instance: 1 };
+        let item = ao_net::n3::inventory::item_identity(0x40);
+        let start = msg(trade::START, machine, flag(1));
+        z.apply_trade(&start, ME);
+        z.apply_trade(&msg(trade::ADD_ITEM, ME, item), ME);
+        assert!(!z.inventory.contains_key(&0x40));
+        let temporary = z.offered_item(item).unwrap().id;
+        assert_eq!(temporary, Identity { kind: ao_net::n3::inventory::KIND_TRADE, instance: 0 });
+        z.apply_trade(&msg(trade::REMOVE_ITEM, ME, temporary), ME);
+        assert_eq!(z.inventory[&0x40].item.low_id, 111);
+        z.apply_trade(&msg(trade::ADD_ITEM, ME, item), ME);
+        z.apply_trade(&msg(trade::ABORT, flag(1), ZERO), ME);
+        assert_eq!(z.inventory[&0x40].item.low_id, 111);
+        z.apply_trade(&start, ME);
+        z.apply_trade(&msg(trade::ADD_ITEM, ME, item), ME);
+        z.apply_trade(&msg(trade::COMPLETE, ZERO, ZERO), ME);
+        assert!(!z.inventory.contains_key(&0x40), "accepted sale consumes only the offered item");
+        assert_eq!(z.inventory[&0x41].item.low_id, 222);
+        assert!(z.trade_state.is_none());
+    }
+
+    #[test]
+    fn reused_bag_slot_gets_a_distinct_trade_cell() {
+        let mut z = zone();
+        z.apply_trade(&msg(trade::START, BOB, ZERO), ME);
+        let item = ao_net::n3::inventory::item_identity(0x40);
+        z.apply_trade(&msg(trade::ADD_ITEM, ME, item), ME);
+        let first = z.offered_item(item).unwrap().id;
+        let mut next = z.inventory[&0x41];
+        next.slot = 0x40;
+        next.id = item;
+        z.inventory.insert(0x40, next);
+        z.apply_trade(&msg(trade::ADD_ITEM, ME, item), ME);
+        let second = z.offered_item(item).unwrap().id;
+        assert_ne!(first, second);
+        assert_eq!(z.offered_item(first).unwrap().item.low_id, 111);
+        assert_eq!(z.offered_item(second).unwrap().item.low_id, 222);
+        z.apply_trade(&msg(trade::REMOVE_ITEM, ME, first), ME);
+        assert_eq!(z.inventory[&0x40].item.low_id, 111);
+        assert!(z.offered_item(second).is_some());
+    }
+
+    #[test]
+    fn full_bag_abort_clears_native_placeholders_and_completion_preserves_source() {
+        let mut z = zone();
+        z.apply_trade(&msg(trade::START, BOB, ZERO), ME);
+        z.apply_trade(&msg(trade::ADD_ITEM, ME, ao_net::n3::inventory::item_identity(0x40)), ME);
+        let filler = z.inventory[&0x41];
+        for slot in BAG_FIRST..BAG_FIRST + ao_net::n3::inventory::BAG_SLOTS {
+            z.inventory.insert(slot, InventoryEntry { slot, ..filler });
+        }
+        z.apply_trade(&msg(trade::ABORT, ZERO, ZERO), ME);
+        assert!(z.trade_state.is_none(), "abort cannot lock out later START");
+        assert!(!z.containers.contains_key(&(ao_net::n3::inventory::KIND_OVERFLOW, OWN)), "native does not fabricate overflow recovery");
+        z.apply_trade(&msg(trade::START, BOB, ZERO), ME);
+        assert!(z.trade_state.is_some(), "a new trade can start after full-bag abort");
+        z.containers.insert((BOB.kind, BOB.instance), (7, vec![filler]));
+        z.apply_trade(&msg(trade::COMPLETE, ZERO, ZERO), BOB);
+        assert_eq!(z.containers[&(BOB.kind, BOB.instance)].1, [filler]);
+        assert_eq!(z.inventory.len(), ao_net::n3::inventory::BAG_SLOTS as usize);
+    }
 
     fn rig() -> Option<Gui> {
         let client = ao_gui::client_dir();
@@ -672,13 +938,13 @@ mod tests {
     #[test]
     fn trade_escape_policy_is_captured_at_open() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
+        let mut z = zone();
         let mut i = open(&mut gui, &z);
         let mut d = super::super::dvalue::DValues::new(&ao_gui::client_dir());
         d.set_i64("esc_trades", 0);
         i.configure_escape(&d);
         let win = i.ptrade.trade.as_ref().unwrap().win;
-        i.event(&mut gui, &Event::Escape { window: win }, &z);
+        i.event(&mut gui, &Event::Escape { window: win }, &mut z);
         assert_eq!(sent(&mut i), [msg(trade::ABORT, flag(1), ZERO)]);
         i.close_all(&mut gui);
         i.on_trade(&mut gui, msg(trade::START, BOB, ZERO), ME, &z);
@@ -686,13 +952,13 @@ mod tests {
         let win = i.ptrade.trade.as_ref().unwrap().win;
         d.set_i64("esc_trades", 1);
         i.configure_escape(&d);
-        i.event(&mut gui, &Event::Escape { window: win }, &z);
+        i.event(&mut gui, &Event::Escape { window: win }, &mut z);
         assert!(sent(&mut i).is_empty());
-        i.event(&mut gui, &Event::CloseRequested { window: win }, &z);
+        i.event(&mut gui, &Event::CloseRequested { window: win }, &mut z);
         assert_eq!(sent(&mut i), [msg(trade::ABORT, flag(1), ZERO)]);
     }
 
-    fn click(i: &mut Interact, gui: &mut Gui, z: &Zone, view: &str) {
+    fn click(i: &mut Interact, gui: &mut Gui, z: &mut Zone, view: &str) {
         let window = i.ptrade.trade.as_ref().unwrap().win;
         assert!(i.event(gui, &Event::Clicked { window, view: view.into(), item: None }, z), "{view}");
     }
@@ -700,8 +966,10 @@ mod tests {
     #[test]
     fn default_action_starts_a_trade_only_within_range_and_target_outside_fights() {
         let mut z = zone();
+        z.dynels.get_mut(&78).unwrap().pos[0] = 100.0;
+        if !prepare_geometry(&mut z) { return; }
         let mut i = Interact::new(OWN as u32, (1280, 800));
-        // 5.5 m between the centres = 4.5 m between the assumed 0.5 m spheres
+        // Both spheres come from the captured PC's native MeshMeta, not collision constants.
         assert_eq!(i.trade_action(&z, 77), Action::Trade);
         assert_eq!(sent(&mut i), [msg(trade::START, BOB, ZERO)]);
         assert_eq!(i.trade_action(&z, 78), Action::Refused("Feedback_TargetOutsideRangeForTrade"));
@@ -722,6 +990,21 @@ mod tests {
         z.character_stats.entry(77).or_default().insert(0x184, 0);
         assert_eq!(i.default_action_on(&z, BOB), Action::Trade);
         assert_eq!(sent(&mut i).len(), 1);
+    }
+
+    #[test]
+    fn player_trade_docks_transiently_and_header_close_declines() {
+        let Some(mut gui) = rig() else { return };
+        let mut hud = super::super::hud::Hud::new(&mut gui, &ao_gui::client_dir(), (1280, 800)).unwrap();
+        let mut z = zone();
+        let mut i = open(&mut gui, &z);
+        let win = i.ptrade.trade.as_ref().unwrap().win;
+        hud.register_transient_dock(&mut gui, win).unwrap();
+        assert_eq!(gui.window_pos(win).0, 1280 - (super::super::hud_rollup::AREA_W as i32 - 1));
+        let close = Event::CanvasClick { window: win, view: "close".into(), x: 1.0, y: 1.0 };
+        assert!(!hud.event(&mut gui, &close, &z), "transient header close belongs to the trade owner");
+        assert!(i.event(&mut gui, &close, &mut z));
+        assert_eq!(sent(&mut i), [msg(trade::ABORT, flag(1), ZERO)]);
     }
 
     #[test]
@@ -813,13 +1096,14 @@ mod tests {
     #[test]
     fn cash_edits_are_sent_once_after_the_delay() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
+        let mut z = zone();
         let mut i = open(&mut gui, &z);
         let win = i.ptrade.trade.as_ref().unwrap().win;
         i.ptrade_tick(&gui, 10.0);
-        gui.set_text(win, "OurCashView", "12x3");
-        assert!(i.event(&mut gui, &Event::TextChanged { window: win, view: "OurCashView".into(), text: "12x3".into() }, &z));
-        assert_eq!(gui.text(win, "OurCashView"), "123", "digits only");
+        gui.focus(win, "OurCashView");
+        let events = gui.input(ao_gui::InputEvent::Text("12x3".into()));
+        assert_eq!(gui.text(win, "OurCashView"), "123", "the native NUMERIC editor rejects non-digits");
+        for event in events { i.event(&mut gui, &event, &mut z); }
         i.ptrade_tick(&gui, 10.5);
         assert!(i.take_outbox().is_empty());
         i.ptrade_tick(&gui, 11.1);
@@ -831,15 +1115,15 @@ mod tests {
     #[test]
     fn accept_confirm_and_the_box() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
+        let mut z = zone();
         let mut i = open(&mut gui, &z);
         let win = i.ptrade.trade.as_ref().unwrap().win;
         i.ptrade.set_texts("Yes".into(), "No".into());
         i.ptrade_tick(&gui, 1.0);
         gui.set_text(win, "OurCashView", "2500");
-        i.event(&mut gui, &Event::TextChanged { window: win, view: "OurCashView".into(), text: "2500".into() }, &z);
+        i.event(&mut gui, &Event::TextChanged { window: win, view: "OurCashView".into(), text: "2500".into() }, &mut z);
         // Accept: the pending cash first, the field formatted, the button disabled, the light green, then `TradeConfirm`
-        click(&mut i, &mut gui, &z, "AcceptButton");
+        click(&mut i, &mut gui, &mut z, "AcceptButton");
         assert_eq!(sent(&mut i), [msg(trade::SET_CASH, Identity { kind: 0, instance: 2500 }, ZERO), msg(trade::CONFIRM, ZERO, ZERO)]);
         assert_eq!(gui.text(win, "OurCashView"), "2,500");
         assert!(!gui.is_enabled(win, "AcceptButton"));
@@ -848,12 +1132,12 @@ mod tests {
         i.on_trade(&mut gui, msg(trade::CONFIRM, ZERO, ZERO), ME, &z);
         let dlg = i.ptrade.confirm.windows();
         assert_eq!(dlg.len(), 1);
-        assert!(i.event(&mut gui, &Event::Clicked { window: dlg[0], view: "btn0".into(), item: None }, &z));
+        assert!(i.event(&mut gui, &Event::Clicked { window: dlg[0], view: "btn0".into(), item: None }, &mut z));
         assert_eq!(sent(&mut i), [msg(trade::ACCEPT, ZERO, ZERO)]);
         // No -> TradeAbort(true)
         i.on_trade(&mut gui, msg(trade::CONFIRM, ZERO, ZERO), ME, &z);
         let dlg = i.ptrade.confirm.windows();
-        i.event(&mut gui, &Event::Clicked { window: dlg[0], view: "btn1".into(), item: None }, &z);
+        i.event(&mut gui, &Event::Clicked { window: dlg[0], view: "btn1".into(), item: None }, &mut z);
         assert_eq!(sent(&mut i), [msg(trade::ABORT, Identity { kind: 0, instance: 1 }, ZERO)]);
         // op 10 resets the accepted state, enables Accept and closes the box
         i.on_trade(&mut gui, msg(trade::CONFIRM, ZERO, ZERO), ME, &z);
@@ -863,7 +1147,7 @@ mod tests {
         // a confirm about the partner's state asks nothing
         i.on_trade(&mut gui, msg(trade::CONFIRM, ZERO, ZERO), BOB, &z);
         assert!(i.ptrade.confirm.windows().is_empty());
-        click(&mut i, &mut gui, &z, "DeclineButton");
+        click(&mut i, &mut gui, &mut z, "DeclineButton");
         assert_eq!(sent(&mut i), [msg(trade::ABORT, Identity { kind: 0, instance: 1 }, ZERO)]);
         assert!(i.ptrade.trade.is_some(), "the window waits for the server's answer");
     }
@@ -871,7 +1155,7 @@ mod tests {
     #[test]
     fn abort_and_completion_close_the_window() {
         let Some(mut gui) = rig() else { return };
-        let z = zone();
+        let mut z = zone();
         let flag = |v| Identity { kind: 0, instance: v };
         for (who, a, op, notice) in [
             (ME, flag(1), trade::ABORT, true),
@@ -892,8 +1176,8 @@ mod tests {
         assert!(i.ptrade.trade.is_some());
         // Esc declines (`esc_trades`), as does the window's close button
         let win = i.ptrade.trade.as_ref().unwrap().win;
-        assert!(i.event(&mut gui, &Event::Escape { window: win }, &z));
-        assert!(i.event(&mut gui, &Event::CloseRequested { window: win }, &z));
+        assert!(i.event(&mut gui, &Event::Escape { window: win }, &mut z));
+        assert!(i.event(&mut gui, &Event::CloseRequested { window: win }, &mut z));
         assert_eq!(sent(&mut i), [msg(trade::ABORT, flag(1), ZERO), msg(trade::ABORT, flag(1), ZERO)]);
         // leaving the zone closes without a word
         i.close_all(&mut gui);
@@ -911,30 +1195,29 @@ mod tests {
         let bag = |s: i32| Identity { kind: 0x68, instance: s };
         // over the partner's list, over nothing, an empty slot, a worn slot: nothing
         let p = gui.view_rect(win, "partner_items").unwrap();
-        i.ptrade_drops(&gui, &z, vec![(0x40, p.l + 5.0, p.t + 5.0), (0x40, 5.0, 5.0), (0x55, x, y), (0x10, x, y)]);
+        i.ptrade_drops(&gui, &mut z, vec![(0x40, p.l + 5.0, p.t + 5.0), (0x40, 5.0, 5.0), (0x55, x, y), (0x10, x, y)]);
         assert!(i.take_outbox().is_empty());
-        i.ptrade_drops(&gui, &z, vec![(0x40, x, y)]);
+        i.ptrade_drops(&gui, &mut z, vec![(0x40, x, y)]);
         assert_eq!(sent(&mut i), [msg(trade::ADD_ITEM, ME, bag(0x40))]);
         i.on_trade(&mut gui, msg(trade::ADD_ITEM, ME, bag(0x40)), ME, &z);
-        i.ptrade_drops(&gui, &z, vec![(0x40, x, y)]);
+        i.ptrade_drops(&gui, &mut z, vec![(0x40, x, y)]);
         assert!(i.take_outbox().is_empty(), "already in the trade");
         // the item is drawn in the first cell (the template is unknown without rdb, the slot art is there)
         i.ptrade.trade.as_mut().unwrap().render(&mut gui, &mut |_, _| Some(("Thing".into(), None)));
         assert!(!gui.canvas_items(win, "our_items").is_empty());
         let press = |x: f32, y: f32| Event::CanvasPress { window: win, view: "our_items".into(), x, y, button: MouseButton::Left, clicks: 2 };
-        assert!(i.event(&mut gui, &press(SLOT * 2.5, 3.0), &z), "empty cell");
+        assert!(i.event(&mut gui, &press(SLOT * 2.5, 3.0), &mut z), "empty cell");
         assert!(i.take_outbox().is_empty());
-        i.event(&mut gui, &press(3.0, 3.0), &z);
+        i.event(&mut gui, &press(3.0, 3.0), &mut z);
         assert_eq!(sent(&mut i), [msg(trade::REMOVE_ITEM, ME, bag(0x40))]);
-        // the traded item's own slot counts as free: with a full bag the removal is still sent; with nothing traded it is refused
+        // A filled bag refuses removal even when an original offered slot was reused.
         for sl in 0x40..0x40 + 30 {
             z.inventory.insert(sl, z.inventory[&0x41]);
         }
-        assert!(i.ptrade.trade.as_ref().unwrap().bag_has_room(&z));
-        i.event(&mut gui, &press(3.0, 3.0), &z);
-        assert_eq!(sent(&mut i), [msg(trade::REMOVE_ITEM, ME, bag(0x40))]);
-        i.on_trade(&mut gui, msg(trade::REMOVE_ITEM, ME, bag(0x40)), ME, &z);
         assert!(!i.ptrade.trade.as_ref().unwrap().bag_has_room(&z));
+        i.event(&mut gui, &press(3.0, 3.0), &mut z);
+        assert!(sent(&mut i).is_empty());
+        assert_eq!(i.ptrade.take_feedback(), ["Feedback_NoRoomInInventory"]);
     }
 
     /// Frame of the trade window through the zone-frame hook: the bytes the server sends decode into the N3 enum and drive the window.

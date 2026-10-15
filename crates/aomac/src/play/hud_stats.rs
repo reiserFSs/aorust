@@ -407,6 +407,7 @@ impl HudStats {
 
     pub(super) fn close_all(&mut self, gui: &mut Gui, rollup: &mut Rollup) {
         self.drop_dialogs.close_all(gui);
+        self.cancel_item_drag(gui);
         for k in [WindowKind::Skills, WindowKind::Inventory, WindowKind::Character, WindowKind::Stat] {
             self.close(gui, rollup, k);
         }
@@ -866,7 +867,7 @@ impl HudStats {
                     "<View name=\"item{}\" view_layout=\"horizontal\"><CanvasView name=\"icon{n}\" min_size=\"Point(16,16)\" max_size=\"Point(16,16)\"/>{}<TextView name=\"count{}\" value=\"{}\" min_size=\"Point(30,-1)\" max_size=\"Point(30,-1)\"/>{}</View>",
                     e.slot,
                     col(&esc(&i.name), 200),
-                    e.slot, e.b,
+                    e.slot, e.b as u16,
                     col(&e.item.level.to_string(), 100)
                 );
                 icons.push((n, i.icon));
@@ -1523,6 +1524,12 @@ mod tests {
         zone.on_frame(&consumed);
         hud.update_inventory(&mut gui, &zone);
         assert_eq!(gui.text(window, "count64"), "2", "count-only server change rebuilds the visible row");
+        zone.inventory.get_mut(&0x40).unwrap().b = 50_000u16 as i16;
+        hud.update_inventory(&mut gui, &zone);
+        assert_eq!(gui.text(window, "count64"), "50000", "runtime count is an unsigned word");
+        zone.on_frame(&consumed);
+        hud.update_inventory(&mut gui, &zone);
+        assert_eq!(gui.text(window, "count64"), "49999", "consumption must not delete stacks above i16::MAX");
     }
 
     #[test]

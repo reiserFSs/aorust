@@ -135,9 +135,13 @@ pub struct Zone {
     pub server_unix: Option<f64>,
     /// The own inventory by slot (`FullCharacterIIR_t` inventory; slots 0..0x3f equipment pages, 0x40.. bag; docs/gui.md §11.5).
     pub inventory: HashMap<u32, ao_net::n3::world::InventoryEntry>,
+    /// Temporary trade inventory, populated by confirmed TradeIIR operations.
+    pub(super) trade_state: Option<super::interact_ptrade::TradeState>,
     /// The contents of the chests / corpses the server sent (`InventoryUpdateIIR_t`, `FUN_100a040e`): container identity -> (`word`, entries by slot).
     /// `{0x6b, word << 16 | slot}` item identities resolve against it (`FUN_10048644`; `play/hud_stats/zone_inv.rs`).
     pub containers: HashMap<(i32, i32), (i32, Vec<ao_net::n3::world::InventoryEntry>)>,
+    /// Native inventory access mask (`Inventory_t + 0x24`), supplied by inventory updates.
+    pub(super) container_access: HashMap<(i32, i32), i32>,
     /// Other players / NPCs as renderer actors (`play/dynels.rs`).
     pub world: super::dynels::Dynels,
     /// Character projection of `InputConfig_t+0xc0`; character-only combat/skill consumers use this.
@@ -349,6 +353,8 @@ impl Zone {
         self.world.clear();
         self.set_target(None);
         self.containers.clear();
+        self.container_access.clear();
+        self.trade_state = None;
         self.dynels.clear();
         self.character_stats.clear();
         self.info_packets.clear();
@@ -479,13 +485,18 @@ impl Zone {
         self.world.apply_buff_visuals(self.char_id as i32, visuals);
         if who == (Identity { kind: CHAR_KIND, instance: self.char_id as i32 }) {
             if let N3::World(World::CharacterAction(a)) = &m.body {
-                if a.action == ao_net::n3::inventory::ACTION_DELETE_ITEM {
-                    self.delete_inventory_item(a.identity_a, a.identity_b.kind > 0);
+                match a.action {
+                    ao_net::n3::inventory::ACTION_DELETE_ITEM => self.delete_inventory_item(a.identity_a, a.identity_b.kind > 0),
+                    0x34 => self.split_inventory_item(a.identity_a, a.identity_b.instance),
+                    0x35 => self.join_inventory_items(a.identity_a, a.identity_b),
+                    _ => {}
                 }
             }
         }
         match m.body {
-            N3::Trade(t) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => {
+            N3::Trade(t) if who.kind == CHAR_KIND => {
+                self.apply_trade(&t, who);
+                if who.instance != self.char_id as i32 { return ZoneEvent::None; }
                 // Trade start sets Flags bit 8; abort/complete clear it (`FUN_100661bf`, `FUN_100666a3`, `FUN_100668d1`).
                 let flags = self.stat_of(who.instance, 0).unwrap_or(0);
                 let flags = match t.op {

@@ -128,9 +128,9 @@ impl TradeskillUi {
                 slot_canvases(&mut root);
                 Ok(element_xml(&root))
             };
-            // GUI 0x100de9b8 (TradeSkillView_c ctor): the base `View_c` `Window(Rect())` constructor runs with an empty rect, not an
-            // authored frame; the panel is sized from its own preferred content, like the other unframed-constructor windows in this port.
-            match open().and_then(|s| gui.open_tabbed_window_xml("TradeskillPanel", "Tradeskill Kit", &s, (0, 0), WindowSize::Preferred)) {
+            // GUI 100de9b8 calls ResizeTo(FUN_100ddb44()) after attaching the XML:
+            // native default client size is 300x400, before TradeSkillViewConfig restoration.
+            match open().and_then(|s| gui.open_tabbed_window_xml("TradeskillPanel", "Tradeskill Kit", &s, (0, 0), WindowSize::Fixed(300, 400))) {
                 Ok(w) => {
                     self.win = Some(w);
                     self.escape = d.flag("esc_tradeskill");
@@ -160,15 +160,26 @@ impl TradeskillUi {
         if self.win.is_some() && self.state.reply(a) { self.dirty = true; }
     }
     pub fn drop_item(&mut self, gui: &Gui, zone: &Zone, slot: u32, x: f32, y: f32) {
-        let Some(w) = self.win else { return };
-        let Some(entry) = zone.inventory.get(&slot) else { return };
+        self.drop_identity(gui, zone, ao_net::n3::inventory::item_identity(slot), x, y);
+    }
+    pub fn drop_identity(&mut self, gui: &Gui, zone: &Zone, item: Identity, x: f32, y: f32) -> bool {
+        let Some(w) = self.win else { return false };
+        if gui.pointer_owner(x, y) != Some(w) { return false; }
+        let entry = if item.kind == ao_net::n3::inventory::KIND_IN_CONTAINER {
+            zone.containers.values().find(|(word, _)| i32::from(*word as i16) == item.instance >> 16)
+                .and_then(|(_, entries)| entries.iter().find(|e| e.slot == (item.instance & 0xffff) as u32))
+        } else {
+            zone.inventory.get(&(item.instance as u32)).filter(|e| ao_net::n3::inventory::item_identity(e.slot) == item)
+        };
+        let Some(entry) = entry else { return false };
         for (index, name) in SLOTS[..2].iter().enumerate() {
             if gui.view_rect(w, name).is_some_and(|r| x >= r.l && x <= r.r && y >= r.t && y <= r.b) {
-                self.requests.push(self.state.insert(index, Some((ao_net::n3::inventory::item_identity(slot), entry.item))));
+                self.requests.push(self.state.insert(index, Some((item, entry.item))));
                 self.dirty = true;
-                break;
+                return true;
             }
         }
+        false
     }
     pub fn event(&mut self, ev: &Event) -> bool {
         let Some(w) = self.win else { return false };
@@ -283,6 +294,7 @@ mod tests {
         d.set_i64("esc_tradeskill", 0);
         ui.sync(&mut gui, &mut d, (1280, 800));
         let w = ui.win.unwrap();
+        assert_eq!(gui.window_size(w), (300, 400), "native constructor explicitly sizes the XML panel");
         for view in SLOTS.into_iter().chain(["ClearButton", "BuildButton", "TradeskillSlider", "BuildFeedback"]) {
             assert!(gui.has_view(w, view), "{view}");
         }
@@ -290,9 +302,20 @@ mod tests {
         let item = AcgItem { low_id: 1, high_id: 2, level: 50 };
         zone.inventory.insert(0x40, ao_net::n3::world::InventoryEntry { slot: 0x40, a: 0, b: 0, id: Identity::default(), item });
         let rect = gui.view_rect(w, SLOTS[0]).unwrap();
-        assert_eq!((rect.r - rect.l, rect.b - rect.t), (54.0, 54.0));
+        // The XML's bordered columns, operators and buttons share a 300-wide row.
+        // 54x54 is the slot art/preferred size, not a fixed layout allocation:
+        // native View::SpaceOut (1014a238) also distributes a space deficit.
+        // view_rect reports the allocated inclusive extents, not the icon size.
+        assert_eq!((rect.r - rect.l, rect.b - rect.t), (51.0, 54.0));
         ui.drop_item(&gui, &zone, 0x40, rect.l + 4.0, rect.t + 4.0);
         assert_eq!(ui.take_requests(), [action::simple(0xdc, Identity::default(), ao_net::n3::inventory::item_identity(0x40))]);
+        let id = ao_net::n3::inventory::container_item_identity(0x70, 3);
+        zone.containers.insert((0xc749, 7), (0x70, vec![ao_net::n3::world::InventoryEntry { slot: 3, a: 0, b: 0, id, item }]));
+        assert!(ui.drop_identity(&gui, &zone, id, rect.l + 4.0, rect.t + 4.0));
+        assert_eq!(ui.take_requests(), [action::simple(0xdc, Identity::default(), id)]);
+        ui.reply(&action::simple(0xe4, Identity { kind: 10, instance: 11 }, Identity { kind: 100, instance: 200 }));
+        ui.event(&Event::CanvasPress { window: w, view: SLOTS[2].into(), x: 4.0, y: 4.0, button: ao_gui::MouseButton::Left, clicks: 1 });
+        assert_eq!(ui.take_urls(), ["itemref://10/11/200"]);
         d.set_i64("esc_tradeskill", 1);
         ui.event(&Event::Escape { window: w });
         ui.sync(&mut gui, &mut d, (1280, 800));

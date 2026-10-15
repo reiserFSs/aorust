@@ -120,7 +120,7 @@ IDs use the existing `ao_audio::sbf::sound_id` (`CreateSoundID`, SandyInterface 
 | `0x8b` |  | 0x2d @ 0x1005dc50 |  |
 | `0x8c` |  | 0x2e @ 0x1005dc96 | recv text `Feedback_IncreasedNanoPool` |
 | `0x8e` | FUN_1003f692 | default (ignored) |  |
-| `0x91` | text cmd (team loot) | 0x2f @ 0x1005ddda |  |
+| `0x91` | text cmd (team loot) | 0x2f @ 0x1005ddda | `10065a9c`: `Feedback_CurrentTeamLootOrder` with reverse-teamcmd name of `identity_b.instance`, group/color 0 |
 | `0x92` |  | 0x30 @ 0x1005ddf3 |  |
 | `0x93` |  | 0x31 @ 0x1005de04 |  |
 | `0x96` | text cmd clone | default (ignored) |  |
@@ -208,8 +208,7 @@ IDs use the existing `ao_audio::sbf::sound_id` (`CreateSoundID`, SandyInterface 
 | `0x107` | RequestClaims | default (ignored) |  |
 
 Text commands (`N3Msg_TextCommand` [GC 0x176db] -> `FUN_1003fba6`, debug/GM commands, not needed for play): `/version` 0x9d, `/resetskill` 0x9a, `/clone` 0x96, `/played` 0x85, `/damagemult` 0x67,
-`/clearunique` 0xae (command = the nearest literal before the call site, **[INFERENCE]** except 0x9d/0x9a which match `N3Msg_ResetSkill` and the reply handler); 0x5c, 0x24, 0x7f, 0x86, 0x91 are text-command
-carriers whose command name was not pinned down.
+`/clearunique` 0xae (command = the nearest literal before the call site, **[INFERENCE]** except 0x9d/0x9a which match `N3Msg_ResetSkill` and the reply handler); 0x5c, 0x24, 0x86 are text-command carriers whose command name was not pinned down in this section. Team commands are pinned down: `/team loot` 0x91, `/team loot <mode>` 0x7f (GC `100406df..100408d9`, docs/chat/cmd.md).
 
 ## 3. Sit / stand / camping (client side)
 
@@ -354,7 +353,7 @@ Clip: `social-<name>` in the character clip set (`%s_%s_01_01.ani`, docs/formats
 
 * Server-side behaviour for sit-on-item (`0x55`): what the server relays back (`0x56` + `WaitState = 1`?) is not captured.
 * The `Vehicle_t` virtual `+0x9c` blocker in SitToggle; the exact object behind `FUN_10058816()+0x5c`; `Can` bit 2 = "sit" is inferred from use.
-* Meaning of live actions `0x62` (list at `char+0x1c0`), `0x63` (stat 0x183 = 503), the third emote field, the numbering of mode 9, and the command names of text commands 0x5c/0x24/0x7f/0x86/0x91.
+* Meaning of live actions `0x62` (list at `char+0x1c0`), `0x63` (stat 0x183 = 503), the third emote field, the numbering of mode 9, and the command names of text commands 0x5c/0x24/0x86 in this section.
 * A real `SocialActionCmd_t` capture (counter start value, server's relayed `state`).
 
 ## 6. Duel / PetDuel (CwDuel; full evidence: docs/zone/combat-duel.md)
@@ -416,7 +415,7 @@ Rows without a note are UI / GlobalSignals plumbing of another feature (team, co
 | `0x8a` | 0x1005dc77 | combat-log line | chat/log.rs |
 | `0x8b` | 0x1005dc50 | combat-log line | chat/log.rs |
 | `0x8c` | 0x1005dc96 | text IncreasedNanoPool | chat/log.rs |
-| `0x91` | 0x1005ddda | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0x91` | 0x1005ddda → 0x10065a9c | localized CurrentTeamLootOrder with native mode name; group/color 0 | **wired**: chat/log.rs; regression `team_loot_response_uses_native_mode_and_default_routing` |
 | `0x92` | 0x1005ddf3 | UI / GlobalSignals plumbing | not driven, not fight state |
 | `0x93` | 0x1005de04 | attack failed, clears +0x79 | combat/module.rs |
 | `0x99` | 0x1005d861 | death cause `FUN_1005ae91` | **wired**: state.rs `ACTION_DEATH_CAUSE` |

@@ -1611,7 +1611,7 @@ fn live_walk() {
             // `loottake=<cell>`: the double click on a cell of the open loot window (`FUN_100ca1e7` -> `MoveItemToInventory`)
             "loottake" => {
                 let p = &mut l.p;
-                eprintln!("loottake {v}: {}", p.interact.as_mut().unwrap().loot_take(&mut p.gui, &p.zone, v.parse().unwrap()));
+                eprintln!("loottake {v}: {}", p.interact.as_mut().unwrap().loot_take(&mut p.gui, &mut p.zone, v.parse().unwrap()));
                 l.wait(4.0);
                 let p = &mut l.p;
                 let i = p.interact.as_mut().unwrap();
@@ -1628,7 +1628,7 @@ fn live_walk() {
                     _ => i.loot_entry_id(n).expect("no such cell"),
                 };
                 eprintln!("lootid {item:?}");
-                i.move_to_bag(item);
+                i.move_to_bag(&mut p.zone, item);
                 l.wait(4.0);
                 let p = &mut l.p;
                 let i = p.interact.as_mut().unwrap();

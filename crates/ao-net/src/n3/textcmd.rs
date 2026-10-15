@@ -98,6 +98,85 @@ pub fn org_client(char_id: i32, window: i32, code: u8, id: Identity, text: &str)
     w.0
 }
 
+/// Incoming organisation confirmations (`OrgServerIIR_c`, GC read 0x10126842 / apply 0x10126a07).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrgDialog {
+    Invitation { identity: Identity, name: String, tax: u32 },
+    LeavePayTax { identity: Identity, tax: u32 },
+    TaxChangeLeave { tax: u32 },
+    Promotion { identity: Identity },
+}
+
+/// Decode only the native dialog requests; other organisation replies retain their existing dispatch.
+pub fn org_dialog(payload: &[u8]) -> anyhow::Result<Option<OrgDialog>> {
+    let (header, mut r) = super::N3Header::parse(payload)?;
+    if header.msg_type != 0x6458_2a07 {
+        return Ok(None);
+    }
+    let code = r.u8()?;
+    if !matches!(code, 5 | 7 | 8 | 9) {
+        return Ok(None);
+    }
+    let target = Identity::read(&mut r)?;
+    let identity = Identity::read(&mut r)?;
+    Ok(Some(match code {
+        5 => OrgDialog::Invitation { identity, name: r.str_i16()?, tax: r.u32()? },
+        7 => OrgDialog::LeavePayTax { identity, tax: r.u32()? },
+        8 => OrgDialog::TaxChangeLeave { tax: r.u32()? },
+        _ => OrgDialog::Promotion { identity: target },
+    }))
+}
+
+/// Native dialog answers: invitation 0x0f, promotion 0x0a + flag 1, leave/pay tax 0x1d/0x1e.
+pub fn org_dialog_answer(char_id: i32, code: u8, identity: Identity) -> Vec<u8> {
+    let mut payload = org_client(char_id, 0, code, identity, "");
+    if code == org::PROMOTE {
+        *payload.last_mut().expect("promotion flag") = 1;
+    }
+    payload
+}
+
+/// `OrgServerIIR_c` code 2: native InfoView text data (GC 0x10126842 / 0x10126c64).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgInfo {
+    /// Wire order; `OrgInfo` formatter feeds 0, 5, 4, 1, 2, 3.
+    pub fields: [String; 7],
+    pub areas: Vec<OrgArea>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgArea {
+    pub playfield: i32,
+    pub identity: Identity,
+    pub name: String,
+    pub level: i32,
+    pub site: i32,
+}
+
+pub fn org_info(payload: &[u8]) -> anyhow::Result<Option<OrgInfo>> {
+    let (header, mut r) = super::N3Header::parse(payload)?;
+    if header.msg_type != 0x6458_2a07 || r.u8()? != 2 {
+        return Ok(None);
+    }
+    let _target = Identity::read(&mut r)?;
+    let _organisation = Identity::read(&mut r)?;
+    let mut fields = std::array::from_fn(|_| String::new());
+    for field in &mut fields {
+        *field = r.str_i16()?;
+    }
+    // GridDestinationList_t, GC 0x10128f1e: encoded size is (count + 1) * 1009.
+    let encoded = r.u32()?;
+    let count = encoded / 1009;
+    anyhow::ensure!(encoded.is_multiple_of(1009) && (1..=30001).contains(&count), "invalid organisation area count");
+    let count = (count - 1) as usize;
+    anyhow::ensure!(count <= r.remaining() / 22, "truncated organisation areas");
+    let mut areas = Vec::with_capacity(count);
+    for _ in 0..count {
+        areas.push(OrgArea { playfield: r.i32()?, identity: Identity::read(&mut r)?, name: r.str_i16()?, level: r.i32()?, site: r.i32()? });
+    }
+    Ok(Some(OrgInfo { fields, areas }))
+}
+
 /// `RaidCmdIIR_c` (ctor 0x100a3531, write 0x100a34ea): `i32 cmd, Identity a`, and for cmd 5 also `Identity b, Identity c`.
 pub fn raid_cmd(char_id: i32, cmd: i32, a: Identity, b: Identity, c: Identity) -> Vec<u8> {
     let mut w = Writer::default();
@@ -735,6 +814,60 @@ fn follow(st: &TextState) -> TextResult {
 mod tests {
     use super::*;
     use crate::n3::action::parse_character_action;
+
+    #[test]
+    fn organisation_server_dialogs_and_info_follow_native_layout() {
+        let target = Identity { kind: 50000, instance: 41 };
+        let organisation = Identity { kind: 1, instance: 99 };
+        let packet = |code| {
+            let mut w = Writer::default();
+            header(&mut w, "OrgServerIIR_c", 42);
+            w.u8(code);
+            target.write(&mut w);
+            organisation.write(&mut w);
+            w
+        };
+        let mut w = packet(5);
+        w.str_i16("Test Org");
+        w.u32(123);
+        assert_eq!(org_dialog(&w.0).unwrap(), Some(OrgDialog::Invitation { identity: organisation, name: "Test Org".into(), tax: 123 }));
+        for n in 13..w.0.len() {
+            assert!(org_dialog(&w.0[..n]).is_err(), "truncated invitation at {n}");
+        }
+        for (code, want) in [
+            (7, OrgDialog::LeavePayTax { identity: organisation, tax: 123 }),
+            (8, OrgDialog::TaxChangeLeave { tax: 123 }),
+        ] {
+            let mut w = packet(code);
+            w.u32(123);
+            assert_eq!(org_dialog(&w.0).unwrap(), Some(want));
+        }
+        assert_eq!(org_dialog(&packet(9).0).unwrap(), Some(OrgDialog::Promotion { identity: target }));
+        let promotion = org_dialog_answer(42, org::PROMOTE, target);
+        assert_eq!(promotion.last(), Some(&1));
+        assert_eq!(org_client(42, 0, org::PROMOTE, target, "").last(), Some(&0));
+        for code in [0x0f, 0x1d, 0x1e, org::LEAVE_CONFIRMED] {
+            assert_eq!(org_dialog_answer(42, code, target), org_client(42, 0, code, target, ""));
+        }
+        let mut w = packet(2);
+        for s in ["name", "history", "objective", "description", "form", "leader", "rank"] {
+            w.str_i16(s);
+        }
+        w.u32(2018); // (one area + 1) * 1009
+        w.i32(540);
+        organisation.write(&mut w);
+        w.str_i16("Area");
+        w.i32(200);
+        w.i32(4);
+        let info = org_info(&w.0).unwrap().unwrap();
+        assert_eq!(info.fields[5], "leader");
+        assert_eq!(info.areas, [OrgArea { playfield: 540, identity: organisation, name: "Area".into(), level: 200, site: 4 }]);
+        assert!(org_info(&w.0[..w.0.len() - 1]).is_err());
+        let mut bad = packet(2);
+        for _ in 0..7 { bad.str_i16(""); }
+        bad.u32(u32::MAX);
+        assert!(org_info(&bad.0).is_err());
+    }
 
     fn state<'a>(stat: &'a dyn Fn(&str) -> Option<i32>) -> TextState<'a> {
         TextState { char_id: 0x1234, window: 7, target: id(DYNEL_CHAR, 99), gm: false, in_team: true, team_leader: true, stat_id: stat, pet: PetState::default() }

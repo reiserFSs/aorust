@@ -66,6 +66,7 @@ pub struct UseUi {
     /// Objects whose confirmation dialog is to be opened (needs the text database, see [`Interact::show_confirms`]).
     pending: Vec<Identity>,
     feedback: Vec<&'static str>,
+    pub(super) container_feedback: Vec<(u32, &'static str)>,
 }
 
 impl UseUi {
@@ -222,7 +223,7 @@ impl Interact {
 
     /// What a GUI event of the use layer asked for ([`UseOut`]): the confirmed use, or taking an item out of a loot window (`FUN_100ca1e7`: a double click
     /// calls `MoveItemToInventory(item)` = `N3Msg_MoveItemToInventory(item, bag, any slot)`; `Feedback_InventoryFull` when no bag slot is free).
-    pub(super) fn use_out(&mut self, zone: &Zone, out: UseOut) {
+    pub(super) fn use_out(&mut self, zone: &mut Zone, out: UseOut) {
         match out {
             UseOut::Handled => {}
             UseOut::Use(id) => self.use_object(id),
@@ -233,13 +234,19 @@ impl Interact {
                     self.use_object(item);
                     return;
                 }
-                if Self::bag_full(zone) {
-                    self.use_ui.feedback.push("Feedback_InventoryFull");
-                } else {
-                    let p = inventory::move_item_to_inventory(self.own as i32, item, ANY_BAG_SLOT);
-                    self.send(p);
-                }
+                self.move_to_bag(zone, item);
             }
+        }
+    }
+
+    /// Shared container withdrawal: native access refusals precede capacity/stack checks.
+    pub(super) fn move_to_bag(&mut self, zone: &mut Zone, item: Identity) {
+        if let Some(error) = zone.container_move_error(item, self.own_id()) {
+            self.use_ui.container_feedback.push(error);
+        } else if !zone.can_take_from_container(item) {
+            self.use_ui.feedback.push("Feedback_InventoryFull");
+        } else {
+            self.send(inventory::move_item_to_inventory(self.own as i32, item, ANY_BAG_SLOT));
         }
     }
 
@@ -253,7 +260,7 @@ impl Interact {
         match &m.body {
             N3::Inventory(InventoryMsg::Bank(entries)) if m.header.target == self.own_id() => {
                 let container = Identity { kind: 0xdead, instance: self.own as i32 };
-                let u = inventory::InventoryUpdate { capacity: 0x66, kind: 3, entries: entries.clone(), container, word: 0, flag: true };
+                let u = inventory::InventoryUpdate { capacity: 0x66, access: 3, entries: entries.clone(), container, word: 0, flag: true };
                 let ui = &mut self.use_ui;
                 ui.loot.update(gui, ui.dir.as_deref(), self.screen, container, "Bank", &u, false);
             }
@@ -305,19 +312,13 @@ impl Interact {
 /// Live-harness helpers (`flow/live.rs`).
 #[cfg(test)]
 impl Interact {
-    /// `MoveItemToInventory(item)` to any bag slot with an arbitrary item identity (live probing of what the server accepts for a corpse item).
-    pub fn move_to_bag(&mut self, item: Identity) {
-        let p = inventory::move_item_to_inventory(self.own as i32, item, ANY_BAG_SLOT);
-        self.send(p);
-    }
-
     /// The `id` of entry `n` of the first loot window.
     pub fn loot_entry_id(&self, n: usize) -> Option<Identity> {
         self.use_ui.loot.entry_id(n)
     }
 
     /// Double click on cell `n` of the open loot window: the item goes to the bag ([`Interact::use_out`]).
-    pub fn loot_take(&mut self, gui: &mut Gui, zone: &Zone, n: usize) -> bool {
+    pub fn loot_take(&mut self, gui: &mut Gui, zone: &mut Zone, n: usize) -> bool {
         let Some(item) = self.use_ui.loot.take(gui, n, self.use_ui.now) else { return false };
         self.use_out(zone, UseOut::Take(item));
         true
@@ -371,6 +372,7 @@ mod tests {
         assert_eq!(i.default_action_on(&zone, npc), Action::Abort);
         assert_eq!(i.take_outbox()[0].payload, ao_net::n3::trade::abort(i.own_id(), true));
         zone.character_stats.entry(2).or_default().insert(0, 0);
+        if !super::super::interact_ptrade::tests::prepare_geometry(&mut zone) { return; }
         assert_eq!(i.default_action_on(&zone, npc), Action::Trade, "NPCs without the use flag take the trade branch");
         assert_eq!(i.take_outbox()[0].payload, ao_net::n3::trade::start(i.own_id(), npc));
         assert_eq!(i.default_action_on(&zone, i.own_id()), Action::None);
@@ -485,6 +487,40 @@ mod tests {
     }
 
     #[test]
+    fn full_bag_loot_gui_requests_native_eligible_stack_merge_only() {
+        use ao_net::n3::world::{AcgItem, InventoryEntry};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut zone = Zone::new(7);
+        let mut i = Interact::new(7, (1280, 800));
+        let template = AcgItem { low_id: 10, high_id: 10, level: 20 };
+        for slot in BAG_FIRST..BAG_FIRST + BAG_SLOTS {
+            zone.inventory.insert(slot, InventoryEntry { slot, a: 1, b: 10, id: inventory::item_identity(slot), item: template });
+        }
+        zone.world.test_inventory_can(10, 0x200);
+        let container = Identity { kind: 0xc76a, instance: 5 };
+        let item = inventory::container_item_identity(0x70, 3);
+        let update = inventory::InventoryUpdate {
+            capacity: 21, access: 3, word: 0x70, container, flag: true,
+            entries: vec![InventoryEntry { slot: 3, a: 1, b: 2, id: item, item: template }],
+        };
+        zone.apply_inventory(&InventoryMsg::Update(update.clone()));
+        i.use_ui.loot.update(&mut gui, None, (1280, 800), container, "Loot", &update, false);
+        let window = i.use_ui.loot.window_of(container).unwrap();
+        let gap = super::super::hud_stats::inv_grid::SPACING;
+        let (x, y) = super::super::hud_stats::inv_grid::cell_origin(0, 0, (gap, gap));
+        let press = Event::CanvasPress { window, view: "grid".into(), x: x + 2.0, y: y + 2.0, button: ao_gui::MouseButton::Right, clicks: 1 };
+        assert!(i.event(&mut gui, &press, &mut zone));
+        assert_eq!(payloads(&mut i), [inventory::move_item_to_inventory(7, item, ANY_BAG_SLOT)]);
+        assert!(i.use_ui.feedback.is_empty());
+        zone.world.test_inventory_can(10, 0x1000200);
+        assert!(i.event(&mut gui, &press, &mut zone));
+        assert!(payloads(&mut i).is_empty(), "cannot-split items must still refuse a full bag");
+        assert_eq!(i.use_ui.feedback, ["Feedback_InventoryFull"]);
+    }
+
+    #[test]
     fn corpse_loot_window_opens_with_the_flag_and_a_double_click_takes_an_item() {
         let client = ao_gui::client_dir();
         if !client.join("cd_image/gui").exists() {
@@ -508,10 +544,10 @@ mod tests {
         let (ox, oy) = super::super::hud_stats::inv_grid::cell_origin(1, 0, (10.0, 10.0));
         let click = Event::CanvasClick { window: w, view: "grid".into(), x: ox + 2.0, y: oy + 2.0 };
         i.tick(1.0);
-        assert!(i.event(&mut gui, &click, &zone));
+        assert!(i.event(&mut gui, &click, &mut zone));
         assert!(payloads(&mut i).is_empty());
         i.tick(1.2);
-        assert!(i.event(&mut gui, &click, &zone));
+        assert!(i.event(&mut gui, &click, &mut zone));
         let p = payloads(&mut i);
         assert_eq!(p, [inventory::move_item_to_inventory(0x6584, Identity { kind: 0x6b, instance: 0x0070_0004 }, ANY_BAG_SLOT)]);
     }
@@ -585,17 +621,17 @@ mod tests {
         assert!(!i.loot_dump(&mut gui)[0].1[0].2.is_empty());
         values.set_i64("esc_backpacks", 1);
         i.use_ui.configure_escape(&values);
-        assert!(i.event(&mut gui, &Event::Escape { window }, &zone));
+        assert!(i.event(&mut gui, &Event::Escape { window }, &mut zone));
         assert!(i.use_ui.loot.is_open(container));
-        assert!(i.loot_take(&mut gui, &zone, 0));
+        assert!(i.loot_take(&mut gui, &mut zone, 0));
         let frames = i.take_outbox();
         assert_eq!(frames.len(), 1);
         assert!(matches!(ao_net::n3::decode(&frames[0]).unwrap().body,
             N3::Misc(Misc::GenericCmd(cmd)) if cmd.cmd == 3));
-        assert!(i.event(&mut gui, &Event::CloseRequested { window }, &zone));
+        assert!(i.event(&mut gui, &Event::CloseRequested { window }, &mut zone));
         i.watch_objects(&mut gui, &message, &zone);
         let window = i.use_ui.loot.window_of(container).unwrap();
-        assert!(i.event(&mut gui, &Event::Escape { window }, &zone));
+        assert!(i.event(&mut gui, &Event::Escape { window }, &mut zone));
         assert!(!i.use_ui.loot.is_open(container));
         zone.inventory.clear();
         assert!(!zone.is_item_mine(container), "cached contents are not ownership");

@@ -4,6 +4,7 @@
 use super::hud_stats::inv_grid::{cell_origin, BORDER, ICON as CELL, SPACING};
 use super::hud_stats::items::{Items, SLOT};
 use ao_gui::{CanvasItem, CanvasTip, Event, Gui, WindowId, WindowSize};
+use ao_gui::widgets::MultiCell;
 use ao_net::msg::Identity;
 use ao_net::n3::inventory::{container_item_identity, InventoryUpdate};
 use ao_net::n3::world::InventoryEntry;
@@ -35,6 +36,15 @@ struct Loot {
 #[cfg(test)]
 pub type LootRows = Vec<(Identity, Vec<(u32, i32, String)>)>;
 
+#[derive(Clone, Copy)]
+struct ContainerDrag {
+    source: WindowId,
+    item: Identity,
+    px: f32,
+    py: f32,
+    ghost: Option<WindowId>,
+}
+
 /// The open container windows (one per container).
 #[derive(Default)]
 pub struct LootUi {
@@ -43,6 +53,8 @@ pub struct LootUi {
     escape_options: Option<[bool; 3]>,
     pub(super) info_click: bool,
     pub(super) info_urls: Vec<String>,
+    drag: Option<ContainerDrag>,
+    drops: Vec<(Identity, f32, f32)>,
 }
 
 fn gap() -> (f32, f32) {
@@ -90,22 +102,33 @@ impl LootUi {
         if self.items.is_none() { self.items = dir.map(Items::new); }
         self.items.as_mut()?.info(gui, low_id).map(|info| info.name.clone())
     }
-    pub fn bank_drop(&self, gui: &Gui, x: f32, y: f32) -> Option<Identity> {
-        self.open.iter().find(|l| l.container.kind == 0xdead && gui.view_rect(l.window, "scrollview").is_some_and(|r| x >= r.l && x < r.r && y >= r.t && y < r.b)).map(|l| l.container)
+    pub fn container_drop(&self, gui: &Gui, x: f32, y: f32) -> Option<Identity> {
+        self.open.iter().find(|l| (l.container.kind == 0xdead || l.owned)
+            && gui.pointer_owner(x, y) == Some(l.window)
+            && gui.view_rect(l.window, if l.container.kind == 0xdead { "scrollview" } else { "grid" })
+                .is_some_and(|r| x >= r.l && x < r.r && y >= r.t && y < r.b)).map(|l| l.container)
     }
 
-    pub fn refresh_bank(&mut self, gui: &mut Gui, entries: &[InventoryEntry]) {
-        let Some(at) = self.open.iter().position(|l| l.container.kind == 0xdead) else { return };
-        if self.open[at].entries != entries {
-            self.open[at].entries = entries.to_vec();
-            self.open[at].entries.sort_by_key(|e| e.slot);
-            self.open[at].tip = None;
-            self.draw(gui, at);
+    pub fn take_drops(&mut self) -> Vec<(Identity, f32, f32)> { std::mem::take(&mut self.drops) }
+
+    pub fn refresh_containers(&mut self, gui: &mut Gui, zone: &super::zone::Zone) {
+        for at in 0..self.open.len() {
+            let c = self.open[at].container;
+            let Some((_, entries)) = zone.containers.get(&(c.kind, c.instance)) else { continue };
+            if self.open[at].entries != *entries {
+                self.open[at].entries = entries.clone();
+                self.open[at].entries.sort_by_key(|e| e.slot);
+                self.open[at].tip = None;
+                self.draw(gui, at);
+            }
         }
     }
 
     pub fn close_bank(&mut self, gui: &mut Gui) {
         if let Some(at) = self.open.iter().position(|l| l.container.kind == 0xdead) {
+            if self.drag.is_some_and(|d| d.source == self.open[at].window) {
+                if let Some(ghost) = self.drag.take().and_then(|d| d.ghost) { gui.close_window(ghost); }
+            }
             gui.close_window(self.open.remove(at).window);
         }
     }
@@ -120,6 +143,8 @@ impl LootUi {
     }
 
     pub fn close_all(&mut self, gui: &mut Gui) {
+        if let Some(ghost) = self.drag.take().and_then(|d| d.ghost) { gui.close_window(ghost); }
+        self.drops.clear();
         for l in self.open.drain(..) {
             gui.close_window(l.window);
         }
@@ -129,7 +154,7 @@ impl LootUi {
     /// unless one is open already, `SlotContainerOpened`), without it only an open window is refreshed (`+0x8c`, container changed).
     #[allow(clippy::too_many_arguments)]
     pub fn update(&mut self, gui: &mut Gui, dir: Option<&Path>, screen: (u32, u32), container: Identity, title: &str, u: &InventoryUpdate, owned: bool) {
-        let slots = if container.kind == 0xdead { 0x66 } else { SLOTS };
+        let slots = match container.kind { 0xdead => 0x66, 0xdeaa => 100, _ => SLOTS };
         if self.items.is_none() {
             self.items = dir.map(Items::new);
         }
@@ -140,7 +165,10 @@ impl LootUi {
             Some(i) => i,
             None if u.flag => {
                 let (w, h) = canvas_size_for(slots);
-                let xml = if container.kind == 0xdead {
+                let xml = if container.kind == 0xdeaa {
+                    // GUI100cdb3a: contracts force name-sorted list mode, max100.
+                    format!("<root><MultiListView name=\"contracts\" feature_flags=\"64\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point({w},{})\" max_size=\"Point(16000,16000)\"/></root>", canvas_size_for(SLOTS).1)
+                } else if container.kind == 0xdead {
                     format!("<root><ScrollView name=\"scrollview\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point({w},1)\" max_size=\"Point(16000,16000)\"><ScrollViewChild view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></ScrollViewChild></ScrollView></root>")
                 } else {
                     format!("<root><View view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></View></root>")
@@ -153,6 +181,12 @@ impl LootUi {
                 let (ow, oh) = gui.outer_size(window);
                 // `Window::MoveToCenter` is the default of a window without a saved frame (`container_position` is not stored)
                 gui.set_window_pos(window, ((screen.0 as i32 - ow as i32) / 2, (screen.1 as i32 - oh as i32) / 2));
+                if container.kind == 0xdeaa {
+                    for (id, name, width, flags) in [(0, "Icon", 16.0, 8), (1, "Name", 200.0, 0xe), (2, "Count", 30.0, 0xe), (3, "Price", 100.0, 0xe), (4, "Quality", 100.0, 0xe)] {
+                        gui.multi_add_column(window, "contracts", id, name, width, flags);
+                    }
+                    gui.multi_sort(window, "contracts", 1, false);
+                }
                 // GUI 100cc2ca: owned Chest_t uses esc_backpacks, world Chest_t esc_chests, Corpse_t esc_corpses.
                 let policy = self.escape_options.unwrap_or([true; 3]);
                 let escape = match container.kind { 0xc749 => policy[usize::from(!owned)], 0xc76a => policy[2], _ => false };
@@ -168,6 +202,17 @@ impl LootUi {
     }
 
     fn draw(&mut self, gui: &mut Gui, at: usize) {
+        if self.open[at].container.kind == 0xdeaa {
+            let window = self.open[at].window;
+            gui.multi_clear(window, "contracts");
+            for entry in &self.open[at].entries {
+                let info = self.items.as_mut().and_then(|items| items.info(gui, entry.item.low_id));
+                let name = info.as_ref().map(|i| i.name.as_str()).unwrap_or("");
+                let icon = info.as_ref().and_then(|i| i.icon).map(|(id, _, _)| MultiCell::image(id)).unwrap_or_else(|| MultiCell::unsorted(""));
+                gui.multi_add_row(window, "contracts", entry.slot as i64, vec![icon, MultiCell::text(name), MultiCell::num(i32::from(entry.b as u16).max(1) as i64), MultiCell::unsorted(""), MultiCell::num(entry.item.level as i64)], true);
+            }
+            return;
+        }
         let slot_gfx = gui.gfx_id(SLOT_GFX).map(ao_gui::GfxId);
         let (mut cmds, mut tips) = (vec![], vec![]);
         for n in 0..self.open[at].slots {
@@ -248,6 +293,18 @@ impl LootUi {
     /// time (`FUN_100ca1e7` -> `MoveItemToInventory(item)`): the item to take.
     pub fn event(&mut self, gui: &mut Gui, ev: &Event, now: f32) -> Option<Option<Identity>> {
         match ev {
+            Event::MultiMouse { window, view, id, button, clicks, .. } if view == "contracts" => {
+                let Some(id) = *id else { return Some(None) };
+                let loot = self.open.iter().find(|l| l.window == *window)?;
+                let entry = loot.entries.iter().find(|e| e.slot as i64 == id)?;
+                let item = Identity { kind: ao_net::n3::inventory::KIND_CONTRACT, instance: entry.slot as i32 };
+                if self.info_click && *button == 1 {
+                    self.info_urls.push(format!("itemid://{}/{}", item.kind, item.instance));
+                    Some(None)
+                } else {
+                    Some(((*button == 1 && *clicks >= 2) || *button == 2).then_some(item))
+                }
+            }
             Event::Escape { window } if self.open.iter().any(|l| l.window == *window && !l.escape) => Some(None),
             Event::CanvasPress { window, view, x, y, button, .. } if view == "grid" => {
                 let l = self.open.iter_mut().find(|l| l.window == *window)?;
@@ -261,8 +318,45 @@ impl LootUi {
                     l.clicked = None;
                     Some(Some(item))
                 } else {
+                    if *button == ao_gui::MouseButton::Left {
+                        if let Some(r) = gui.view_rect(l.window, "grid") {
+                            self.drag = Some(ContainerDrag { source: *window, item, px: r.l + *x, py: r.t + *y, ghost: None });
+                        }
+                    }
                     Some(None)
                 }
+            }
+            Event::CanvasDrag { window, view, x, y, .. } if view == "grid" => {
+                let ContainerDrag { source, item, px, py, ghost } = self.drag?;
+                if source != *window { return None; }
+                let r = gui.view_rect(source, "grid")?;
+                let (sx, sy) = (r.l + *x, r.t + *y);
+                let ghost = if let Some(ghost) = ghost {
+                    gui.set_window_pos(ghost, (sx as i32 - 16, sy as i32 - 16));
+                    Some(ghost)
+                } else if (sx - px).hypot(sy - py) > 3.0 {
+                    // Match the carried inventory icon: native drag hotspot (16,16),
+                    // with the existing inventory's unresolved 32px ghost-size convention.
+                    let l = self.open.iter_mut().find(|l| l.window == source)?;
+                    let entry = l.entries.iter().find(|e| e.slot == (item.instance & 0xffff) as u32)?;
+                    l.clicked = None;
+                    let xml = "<root><CanvasView name=\"icon\" min_size=\"Point(32,32)\" max_size=\"Point(32,32)\"/></root>";
+                    let ghost = gui.open_window_xml("ItemDrag", xml, (sx as i32 - 16, sy as i32 - 16), WindowSize::Preferred).ok()?;
+                    if let Some((g, w, h)) = self.items.as_mut().and_then(|items| items.info(gui, entry.item.low_id)).and_then(|info| info.icon) {
+                        gui.set_canvas(ghost, "icon", vec![CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, 32.0, 32.0], alpha: 1.0 }]);
+                    }
+                    Some(ghost)
+                } else { None };
+                self.drag = Some(ContainerDrag { source, item, px, py, ghost });
+                Some(None)
+            }
+            Event::CanvasRelease { window, view } if view == "grid" && self.drag.is_some_and(|d| d.source == *window) => {
+                if let Some(ContainerDrag { item, ghost: Some(ghost), .. }) = self.drag.take() {
+                    gui.close_window(ghost);
+                    let (x, y) = gui.mouse_position();
+                    self.drops.push((item, x, y));
+                }
+                Some(None)
             }
             Event::CanvasClick { window, view, x, y } if view == "grid" => {
                 let l = self.open.iter_mut().find(|l| l.window == *window)?;
@@ -274,6 +368,9 @@ impl LootUi {
             }
             Event::CloseRequested { window } | Event::Escape { window } if self.open.iter().any(|l| l.window == *window) => {
                 let i = self.open.iter().position(|l| l.window == *window)?;
+                if self.drag.is_some_and(|d| d.source == *window) {
+                    if let Some(ghost) = self.drag.take().and_then(|d| d.ghost) { gui.close_window(ghost); }
+                }
                 gui.close_window(self.open.remove(i).window);
                 Some(None)
             }
@@ -306,7 +403,7 @@ mod escape_tests {
         for (kind, owned, key) in [(0xc749, true, "esc_backpacks"), (0xc749, false, "esc_chests"), (0xc76a, false, "esc_corpses")] {
             let mut ui = LootUi::default();
             let container = Identity { kind, instance: 7 };
-            let update = InventoryUpdate { capacity: 21, kind: 2, entries: vec![], container, word: 0, flag: true };
+            let update = InventoryUpdate { capacity: 21, access: 2, entries: vec![], container, word: 0, flag: true };
             values.set_i64(key, 0);
             ui.configure_escape(&values);
             ui.update(&mut gui, None, (800, 600), container, "Container", &update, owned);
@@ -330,6 +427,52 @@ mod escape_tests {
 mod tests {
     use super::*;
     use ao_net::n3::world::AcgItem;
+
+    #[test]
+    fn organisation_contracts_use_sorted_list_and_native_slot_identities() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut ui = LootUi::default();
+        let container = Identity { kind: 0xdeaa, instance: 9 };
+        let mut update = update(true, &[29]);
+        update.container = container;
+        update.access = 3;
+        ui.update(&mut gui, None, (1280, 800), container, "", &update, false);
+        let window = ui.window_of(container).unwrap();
+        assert_eq!(ui.open[0].slots, 100);
+        assert_eq!(gui.multi_sort_state(window, "contracts"), Some((1, false)));
+        assert!(gui.has_view(window, "contracts") && !gui.has_view(window, "grid"));
+        assert_eq!(ui.event(&mut gui, &Event::MultiMouse { window, view: "contracts".into(), id: Some(29), button: 1, clicks: 2, x: 0, y: 0 }, 0.0), Some(Some(Identity { kind: ao_net::n3::inventory::KIND_CONTRACT, instance: 29 })));
+        assert_eq!(ui.container_drop(&gui, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn backpack_deposit_targets_owned_view_and_drag_keeps_identity() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        gui.set_screen_size(1280, 800);
+        let mut ui = LootUi::default();
+        let c = Identity { kind: 0xc749, instance: 7 };
+        let mut u = update(true, &[3]);
+        u.container = c;
+        ui.update(&mut gui, None, (1280, 800), c, "Backpack", &u, true);
+        let w = ui.window_of(c).unwrap();
+        let r = gui.view_rect(w, "grid").unwrap();
+        let (ox, oy) = cell_origin(0, 0, gap());
+        let (x, y) = (r.l + ox + 2.0, r.t + oy + 2.0);
+        assert_eq!(ui.container_drop(&gui, x, y), Some(c));
+        let press = Event::CanvasPress { window: w, view: "grid".into(), x: ox + 2.0, y: oy + 2.0, button: ao_gui::MouseButton::Left, clicks: 1 };
+        ui.event(&mut gui, &press, 1.0);
+        ui.event(&mut gui, &Event::CanvasDrag { window: w, view: "grid".into(), x: ox + 20.0, y: oy + 2.0, dx: 18.0, dy: 0.0 }, 1.1);
+        gui.input(ao_gui::InputEvent::MouseMove { x: 10.0, y: 20.0 });
+        ui.event(&mut gui, &Event::CanvasRelease { window: w, view: "grid".into() }, 1.2);
+        assert_eq!(ui.take_drops(), [(container_item_identity(u.word, 3), 10.0, 20.0)]);
+        ui.open[0].owned = false;
+        assert_eq!(ui.container_drop(&gui, x, y), None, "world chest cache grants no deposit ownership");
+        ui.close_all(&mut gui);
+    }
 
     #[test]
     fn right_click_takes_and_shift_left_only_inspects_bank_and_loot() {
@@ -393,7 +536,7 @@ mod tests {
 
     fn update(flag: bool, slots: &[u32]) -> InventoryUpdate {
         let entries = slots.iter().map(|&s| InventoryEntry { slot: s, a: 0, b: 0, id: Identity::default(), item: AcgItem { low_id: 1, high_id: 1, level: 1 } }).collect();
-        InventoryUpdate { capacity: 21, kind: 0, entries, container: Identity { kind: 0xC76A, instance: 5 }, word: 0x70, flag }
+        InventoryUpdate { capacity: 21, access: 0, entries, container: Identity { kind: 0xC76A, instance: 5 }, word: 0x70, flag }
     }
 
     #[test]

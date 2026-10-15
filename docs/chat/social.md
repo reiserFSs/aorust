@@ -111,8 +111,8 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
   signal with id 0 and empty fields; other statuses ignored. The slot `FUN_100efe4b` clears busy (`+0x7c`) when **id == 0** and adds a row otherwise (so status 0 / id 0 ends the search too;
   live, section 9: an empty search is answered by exactly one status-0 packet, every field zero; fixed in `Lft::on_reply`, before the fix the port showed an empty row and stayed busy). Handler `FUN_100efe4b` builds `LFTCandidateItem_c` (`FUN_100f1456`): name, level, `GetText(2005, side)`, `GetText(2004, profession)`,
   `N3Msg_GetPFName(playfield)` ("Not found"), description.
-* **Invite** (`FUN_100eff95`): `N3Msg_TeamJoinRequest(Identity(50000, id), false)` then the line `JoinTeamRequestSentTo` + name (category 100) as System text; the button is disabled
-  when in a team and not its leader (`FUN_100efb0a`). **Tell** (`FUN_100efa55`): `OpenTellWindow(name, id)`.
+* **Invite** (`FUN_100eff95`): rechecks that the own character is not a nonleader team member, then `N3Msg_TeamJoinRequest(Identity(50000, id), false)` and, only on success, the line `JoinTeamRequestSentTo` + name (category 100) as System text. Gamecode `N3Msg_TeamJoinRequest` 0x1001b929 refuses a known NPC (`SimpleChar+0x21c`); missing remote dynels are allowed. The hub now sends `team_join_request` directly (action `0x1a`, idA candidate, idB zero), not the unrelated `/team` text parser. Regression: `lft_invite_sends_join_request_and_requires_team_leader`.
+  The button is disabled when in a team and not its leader (`FUN_100efb0a`). **Tell** (`FUN_100efa55`): `OpenTellWindow(name, id)`.
 * **LFT checkbox / team description** (`FUN_100f0313` -> `FUN_100f01a3(on, desc)`): off = request kind 0xb (`0x5dd`), on = kind 10 (`0x5dc S`) and `LFTWindowConfig.TeamDesc` updated; `DAT_10276620` = own flag
   (`/lft` toggles the same flag, docs/chat/cmd.md). `FUN_1007850a` (a Gamecode state reset) also calls `FUN_100f01a3(0, "")`: when exactly is unresolved, not ported.
 * Ported: the window from the client's own `LFTView.xml` (labels, layout, buttons, check box, input) with the **real widgets** (docs/gui.md §14): the three `DropdownMenu` (items
@@ -124,6 +124,8 @@ C2S: `0x28 I D` (D = 1 menu "Befriend", 0 temporary entry created when a tell wi
 
 
 ## 7. Not faithful / unresolved (each labelled in code)
+
+The action-routing fixes are separate from the remaining window/persistence gaps below: `/ignore` target/id and resolved-name paths now refresh Friends and emit native feedback (GUI `0x100ba9fc`, regression `ignore_target_and_name_paths_refresh_friends_and_feedback`); LFT Invite emits the direct team request (§6); Team menu Info reaches the shared InfoView queue (GUI `0x10079a2a`, regression `team_info_urls_reach_shared_info_view_queue`). These fixes do not establish parity for unrelated folder contents, assignment check boxes, Mail or tell routing. No new live verification was performed.
 
 * The list widgets are real now (docs/gui.md §14): the label colours (selected / not selectable `0xffffff`, selectable `0xc0c0c0`, red `0xff6666` / `0xc04c4c`), the folder icons
   (`0xd5` open, `0xd4` closed), the 15 px indent and the 0.5 s icon blink come from `StringListViewItem_c` / `ListViewBaseItem_c`. A click on a friend toggles its tell window
@@ -168,3 +170,62 @@ online character; the server sent none for an offline target, and inviting a str
 (`FUN_1016d6dc`) with the unit tests of `ao_net::chat`. A non-empty LFT result row (levels / playfield / side / profession bytes) was likewise not seen because no other character had LFT on; the
 `BISIIBBS` row decoding stays covered by the client's format string and the `ao_net` byte test. The data block of a permanent buddy is empty on the server's side, so `Buddy_t.data == {0}` as the
 temporary marker is only ever produced by the server for the temporary add we send (which it did not answer at all).
+
+## 10. Organisation windows and confirmation routing
+
+There is no independent organisation roster window in `OrganizationGUIModule_c`. Its constructor (GUI `0x10052c4d`) derives from
+`SignalTarget_c`, registers AFCM module `0x15` messages `0xf8..0xfb`, and subscribes to the leave (`GlobalSignals+0x1f4`) and promotion
+(`+0x24c`) signals. Its visible UI consists of ordinary `DialogBox_c` instances; no organisation-specific XML layout is loaded.
+The actual organisation information page uses the existing InfoView: GC `0x10126f41` emits `GlobalSignals+0x18c` through
+`0x1001266c`; GUI InfoView module constructor `0x100ef374` connects that signal to `ShowText` (`0x100ef22a`), which opens a `text://`
+page. `/org info` remains a server request, not an invented local roster.
+
+`OrgServerIIR_c` (`0x64582a07`) read `0x10126842` has a byte operation followed by **two identities** (`+0x1c`, `+0x24`).
+`textcmd::org_info` and `org_dialog` now decode the reachable information/confirmation replies:
+
+| operation | body after identities | native UI / response |
+|---|---|---|
+| 2 | seven `str_i16`, encoded land-area list | GC `0x10126c64..0x10126f50`: InfoView HTML, category 508 `OrgInfo` fed string indices **0,5,4,1,2,3**; optional index 6 `OrgInfoRank`; `OrgInfoLC(count,5)` and `LC_AreaInfo` rows |
+| 5 | `str_i16` name, `u32` tax | GUI `0x10052978`, category 501 `Org_Invite(name)`, Yes/No; Yes (`0x1005204d`) sends client operation **15**, second identity |
+| 7 | `u32` tax | GUI `0x1005221d`, `Org_LeaveAskPayTax(tax)`; Yes sends **29**, No/Escape sends **30**, second identity (`0x10052076`, GC `0x1001a6a0`) |
+| 8 | `u32` tax | GUI `0x100523d1`, `Org_TaxChangedAskLeave(tax)`; only Yes sends **16** with the current engine target (`0x10052017`, GC `0x1001a732`) |
+| 9 | no additional body | GUI `0x100526e6`, `ConfirmPromotion(target name)`; target is the **first identity**, must resolve to a dynel; only Yes sends **10** with its flag byte **1** (GC `0x1001dbc1`), not the ordinary `/org promote` flag 0 |
+
+Operations 7/8 show a dialog only for tax `1..999999999` (GC `0x10126b3a..0x10126bbd`); invitation/payment require a nonzero
+second identity. GUI `0x10052a29..0x10052ad2` builds an invitation tax suffix but `0x10052b59` passes the **original** `Org_Invite`
+formatter to `DialogBox_c`; the port preserves that native behavior instead of adding unused text.
+The seven information strings are followed by `GridDestinationList_t` (`0x10128f1e`): `(count+1)*1009`, at most 30000 rows.
+Each row (`0x10128b07`) is `i32 playfield, Identity, str_i16 name, i32 level, i32 site`; HTML uses playfield name, area name,
+Roman site label (`0x1012667a`, decimal at >=4000), level. Invalid/truncated counts return an error before allocation.
+
+Existing `/org leave` and `/org disband` dialogs remain unchanged. All new confirmations reuse their existing dialog view/layout,
+button localization and captured `esc_dialogs` setting; information reuses InfoView history and frame behavior. The contract inventory
+(server operation 1) belongs to the standard inventory window path (`GlobalSignals+0x84`, GC `0x10011754`), not this dialog module.
+
+Code 1 is decoded by `inventory::decode`, not the dialog parser: GC `10126842` reads operation byte, actor identity, **container identity**, `NewInventory_t` cells (`1002a41a`, size word `(n+1)*0x3f1`), then one boolean byte (`1009fbee`). Its factory `1002ae7b` receives capacity 30/access 3; activation `10126a07` registers the inventory (`100474cb`) and emits `ContainerOpened`. GUI `100c71a3` uses the existing `InventoryView` path. The DEAA branch in `100cdb3a` sets maximum 100, owned=false and forced name-sorted **list mode**, not the ordinary 21-cell chest grid. `LootUi` reuses the existing container owner with those contract-specific list settings; no contract-specific title was found in `100cc2ca` (constructor title is empty), so none is invented.
+
+GC `1001753e` dispatches DEAA to `10047cb6`, which generates **`KIND_CONTRACT=0x6d`, instance=slot**. Double click uses normal `ClientMoveItemToInventoryIIR_t` (`100ca1e7`→`10027a30`), not an Org request. Server confirmation `1004ad44`→`100472d7` copies the descriptor (count 1) into the first free bag cell and clears the source; full bags leave the source untouched. Depositing to DEAA uses `10048c32`: remove the source inventory item and await the next server contract snapshot rather than invent a contract descriptor. Contract descriptions resolve the same native slot identity. Regressions: `org_contract_inventory_has_two_identities_and_a_byte_flag`, `organisation_contracts_use_sorted_list_and_native_slot_identities`, `contract_withdrawal_retains_full_bag_source_and_deposit_waits_for_snapshot`, `organisation_contract_info_resolves_native_slot_identity` (added, not run).
+
+
+### Regression inventory and live prerequisites
+
+Added (not executed in this assignment): `organisation_server_dialogs_and_info_follow_native_layout` (two distinct identities,
+truncation, operation payloads, promotion flag, information fields/area limits), `organisation_answers_preserve_identity_and_payment_decline`,
+`organisation_requests_use_native_text_and_existing_dialog_view`, `organisation_info_uses_native_html_and_infoview_history`, and
+`organisation_server_frames_open_windows_and_route_answers` (incoming frame → existing dialog/InfoView → outgoing answer).
+
+Audited existing Friends/LFT cases: `friends_window_lists_folders_and_acts` covers folder ordering/collapse, tell toggling, context
+menu delete confirmation, Befriend and frame close; `lft_window_searches_and_lists` covers native XML controls, dropdown selection,
+search request, candidate rows/selection, Tell/Invite, checkbox and description persistence; `lft_escape_preference_is_captured_on_creation`
+and `social_frames_and_pin_persist_per_character` cover Escape/prefs/geometry. These GUI cases require the retail client data
+(`cd_image/gui`, `text.mdb`) and otherwise skip. They are fixture coverage, not new live proof.
+Sizing evidence distinguishes Friends' **view** rectangle (DockableView base `0x10038b47` calls `View::View`) from LFT's **outer**
+rectangle (`0x100f03fb` calls `Window::Window`, `0x101563ff` passes the rectangle to `WndBorder`); no new dimensions were invented.
+
+Live prerequisites: server maintenance must end and Main must explicitly authorize login; the session must hold the existing live lock
+and use an approved test character. Friends online/offline and nonempty LFT require a second controlled character with the desired presence/
+LFT flag. Team invitation enable/disable needs unteamed, team leader and nonleader states. Organisation info requires membership or an
+inspectable organisation target; invitation/promotion need a second controlled character plus an officer with the necessary rank;
+payment/tax-change dialogs require a server-emitted nonzero tax change/debt. Leave/disband and tax answers alter membership/funds:
+use only a disposable test organisation with explicit authorization, never the user's organisation. No builds, tests, logins, windows,
+screenshots or desktop input were performed for this update.

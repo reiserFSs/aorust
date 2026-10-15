@@ -725,6 +725,15 @@ impl Hud {
         self.stats.take_drops()
     }
 
+    /// Native count selection returns the pointer to its press origin after each displacement.
+    pub(super) fn take_pointer_warp(&mut self) -> Option<(f32, f32)> {
+        self.stats.take_pointer_warp()
+    }
+
+    pub(super) fn container_bag_drop(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        self.stats.container_bag_drop(gui, x, y)
+    }
+
     /// Puts back the drops no window claimed.
     pub(super) fn requeue_item_drops(&mut self, drops: Vec<(u32, f32, f32)>) {
         self.stats.requeue_drops(drops);
@@ -793,6 +802,7 @@ impl Hud {
         v.extend(self.notifications.take_urls());
         v.extend(self.target_ncu.take_urls());
         v.extend(self.nano.take_urls());
+        v.append(&mut self.winb.team.info_urls);
         v
     }
     /// Native TipSystem event producer; parameters come from each retail callback.
@@ -2239,6 +2249,15 @@ mod tests {
         assert_eq!(s.hud.winb.team.invite_dialog(&mut s.gui), None);
         let reply = s.hud.take_outbox();
         assert!(reply.iter().any(|f| f.payload == ao_net::n3::team::request_reply(own, from, false)));
+    }
+
+    #[test]
+    fn team_info_urls_reach_shared_info_view_queue() {
+        let Some((mut s, _)) = shot((1280, 800)) else { return };
+        s.hud.take_info_urls();
+        s.hud.winb.team.info_urls.push("charid://50000/9".into());
+        assert_eq!(s.hud.take_info_urls(), ["charid://50000/9"]);
+        assert!(s.hud.take_info_urls().is_empty());
     }
 
     #[test]

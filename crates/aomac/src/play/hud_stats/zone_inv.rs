@@ -15,6 +15,72 @@ impl Zone {
         (inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS).find(|s| !self.inventory.contains_key(s))
     }
 
+    /// GC1004b80a checks source access first, then destination access.
+    /// GC100a0310/1002ae7b/100a040e preserve these server-supplied masks.
+    pub(in crate::play) fn container_move_error(&self, item: Identity, destination: Identity) -> Option<(u32, &'static str)> {
+        let source = if item.kind == inv::KIND_IN_CONTAINER {
+            self.containers.iter().find(|(_, (word, _))| i32::from(*word as i16) == item.instance >> 16).map(|(key, _)| *key)
+        } else if item.kind == inv::KIND_BANK {
+            Some((0xdead, self.char_id as i32))
+        } else { None };
+        if source.and_then(|key| self.container_access.get(&key)).is_some_and(|access| access & 2 == 0) {
+            return Some((10003, "Inv_SrcCantRemove"));
+        }
+        if self.container_access.get(&(destination.kind, destination.instance)).is_some_and(|access| access & 1 == 0) {
+            return Some((10003, "Inv_DstCantAdd"));
+        }
+        None
+    }
+
+    /// GC 1005d4f6 -> 10049e8f: confirmed split creates a copy in the first free slot.
+    pub(in crate::play) fn split_inventory_item(&mut self, item: Identity, count: i32) {
+        if count <= 0 { return; }
+        if item.kind == inv::KIND_BAG {
+            let Some(to) = self.free_bag_slot() else { return };
+            let Some(source) = self.inventory.get_mut(&(item.instance as u32)) else { return };
+            let total = i32::from(source.b as u16);
+            if count >= total { return; }
+            source.b = (total - count) as i16;
+            let mut entry = *source;
+            entry.slot = to;
+            entry.id = inv::item_identity(to);
+            entry.b = count as i16;
+            self.inventory.insert(to, entry);
+        } else if item.kind == inv::KIND_IN_CONTAINER {
+            let Some((word, entries)) = self.containers.values_mut().find(|(word, _)| i32::from(*word as i16) == item.instance >> 16) else { return };
+            let Some(to) = (0..21).find(|s| !entries.iter().any(|e| e.slot == *s)) else { return };
+            let Some(source) = entries.iter_mut().find(|e| e.slot == (item.instance & 0xffff) as u32) else { return };
+            let total = i32::from(source.b as u16);
+            if count >= total { return; }
+            source.b = (total - count) as i16;
+            let mut entry = *source;
+            entry.slot = to;
+            entry.id = inv::container_item_identity(*word, to);
+            entry.b = count as i16;
+            entries.push(entry);
+            entries.sort_by_key(|e| e.slot);
+        }
+    }
+
+    /// GC 1005d50e -> 10049cfe: first identity stays, second disappears.
+    pub(in crate::play) fn join_inventory_items(&mut self, onto: Identity, from: Identity) {
+        if onto == from || onto.kind != from.kind { return; }
+        if onto.kind == inv::KIND_BAG {
+            let (Some(a), Some(b)) = (self.inventory.get(&(onto.instance as u32)), self.inventory.get(&(from.instance as u32))) else { return };
+            let total = u32::from(a.b as u16) + u32::from(b.b as u16);
+            if a.item != b.item || total > 50_000 { return; }
+            self.inventory.remove(&(from.instance as u32));
+            self.inventory.get_mut(&(onto.instance as u32)).expect("found above").b = total as i16;
+        } else if onto.kind == inv::KIND_IN_CONTAINER && onto.instance >> 16 == from.instance >> 16 {
+            let Some((_, entries)) = self.containers.values_mut().find(|(word, _)| i32::from(*word as i16) == onto.instance >> 16) else { return };
+            let (Some(a), Some(b)) = (entries.iter().position(|e| e.slot == (onto.instance & 0xffff) as u32), entries.iter().position(|e| e.slot == (from.instance & 0xffff) as u32)) else { return };
+            let total = u32::from(entries[a].b as u16) + u32::from(entries[b].b as u16);
+            if entries[a].item != entries[b].item || total > 50_000 { return; }
+            entries[a].b = total as i16;
+            entries.remove(b);
+        }
+    }
+
     /// GC 10017707 -> 100489be/10087e68: inventory membership, including one
     /// container parent. A world chest/corpse being cached does not imply ownership.
     pub(in crate::play) fn is_item_mine(&self, item: Identity) -> bool {
@@ -33,8 +99,8 @@ impl Zone {
         if item.kind == inv::KIND_BAG && item.instance >= inv::BAG_FIRST as i32 {
             let slot = item.instance as u32;
             if let Some(entry) = self.inventory.get_mut(&slot) {
-                if one && entry.b > 1 {
-                    entry.b -= 1;
+                if one && entry.b as u16 > 1 {
+                    entry.b = ((entry.b as u16) - 1) as i16;
                 } else {
                     self.inventory.remove(&slot);
                 }
@@ -45,13 +111,13 @@ impl Zone {
         let list = match item.kind {
             inv::KIND_IN_CONTAINER => self.containers.values_mut().find(|(word, _)| i32::from(*word as i16) == item.instance >> 16),
             inv::KIND_BANK => self.containers.get_mut(&(0xdead, self.char_id as i32)),
-            inv::KIND_TRADE => self.containers.get_mut(&(inv::KIND_TRADE, self.char_id as i32)),
+            inv::KIND_OVERFLOW => self.containers.get_mut(&(inv::KIND_OVERFLOW, self.char_id as i32)),
             _ => None, // worn pages (65/66/67/73) are refused by FUN_10047242
         };
         if let Some((_, entries)) = list {
             if let Some(at) = entries.iter().position(|e| e.slot == slot) {
-                if one && entries[at].b > 1 {
-                    entries[at].b -= 1;
+                if one && entries[at].b as u16 > 1 {
+                    entries[at].b = ((entries[at].b as u16) - 1) as i16;
                 } else {
                     entries.remove(at);
                 }
@@ -98,7 +164,7 @@ impl Zone {
     ///   to = slot)`): the item at `from` and the cell `to` swap places (`FUN_1002a200` swaps two vector cells), `to == 0x6f` means the first
     ///   free bag slot (`FUN_1002a1b0(0x40)`, nothing happens when the bag is full). The "has item" check `FUN_1002a82b(from)` makes a move of
     ///   an empty cell a no-op. An item `{0x6b, word << 16 | slot}` of a corpse / chest list moves into the bag (`take_from_container`).
-    ///   A temporary trade/overflow item (`0x6e`, created by `TemplateActionIIR_t` action 0x57) transfers into the first free bag slot (`FUN_100475ae`).
+    ///   A temporary overflow item (`0x6e`, created by `TemplateActionIIR_t` action 0x57) transfers into the first free bag slot (`FUN_100475ae`).
     ///   Picking up a ground item (container `{0, 0}`, `FUN_10047eb2`) still requires the item dynel's stats and is not decoded here.
     /// * `ItemReplacedIIR_c`: a worn slot (`< 0x40`) gets the new item when it differs from the current one (`FUN_1004cf08`).
     /// * `InventoryUpdateIIR_t` of a chest / corpse stores its list in [`Zone::containers`] (`FUN_100a040e`); `InventoryUpdatedIIR_t` is the signal only (`FUN_10074e49`).
@@ -109,27 +175,46 @@ impl Zone {
             }
             // GC 1004d148 action 0x57: create an actual server-described item in the temporary inventory.
             InventoryMsg::TemplateAction { item, count, action: 0x57, .. } => {
-                let (_, entries) = self.containers.entry((inv::KIND_TRADE, self.char_id as i32)).or_default();
+                let (_, entries) = self.containers.entry((inv::KIND_OVERFLOW, self.char_id as i32)).or_default();
                 let slot = (0..=entries.len() as u32).find(|slot| !entries.iter().any(|e| e.slot == *slot)).unwrap();
                 entries.push(ao_net::n3::world::InventoryEntry {
                     slot,
                     a: 0x21,
                     b: *count as i16,
-                    id: Identity { kind: inv::KIND_TRADE, instance: slot as i32 },
+                    id: Identity { kind: inv::KIND_OVERFLOW, instance: slot as i32 },
                     item: *item,
                 });
             }
             InventoryMsg::ContainerAdd { item, container, .. }
-                if item.kind == inv::KIND_TRADE && container.kind == inv::KIND_TRADE && container.instance == self.char_id as i32 =>
+                if item.kind == inv::KIND_OVERFLOW && container.kind == inv::KIND_OVERFLOW && container.instance == self.char_id as i32 =>
             {
                 // GC 100475ae: the wire destination is ignored; transfer the temporary item into the first free bag cell.
                 let Some(slot) = self.free_bag_slot() else { return };
-                let Some((_, entries)) = self.containers.get_mut(&(inv::KIND_TRADE, self.char_id as i32)) else { return };
+                let Some((_, entries)) = self.containers.get_mut(&(inv::KIND_OVERFLOW, self.char_id as i32)) else { return };
                 let Some(at) = entries.iter().position(|e| e.slot as i32 == item.instance) else { return };
                 let mut entry = entries.remove(at);
                 entry.slot = slot;
                 entry.id = inv::item_identity(slot);
                 self.inventory.insert(slot, entry);
+            }
+            // GC1004ad44 ->100472d7: contract item0x6d is copied to
+            // the first free bag cell and removed from the contract inventory.
+            InventoryMsg::ContainerAdd { item, container, .. }
+                if item.kind == ao_net::n3::inventory::KIND_CONTRACT && (*container == self.own_identity() || *container == Identity::default()) =>
+            {
+                let Some(slot) = self.free_bag_slot() else { return };
+                let Some((_, (_, entries))) = self.containers.iter_mut().find(|((kind, _), _)| *kind == 0xdeaa) else { return };
+                let Some(at) = entries.iter().position(|e| e.slot as i32 == item.instance) else { return };
+                let mut entry = entries.remove(at);
+                entry.slot = slot;
+                entry.id = inv::item_identity(slot);
+                entry.b = 1;
+                self.inventory.insert(slot, entry);
+            }
+            // GC10048c32 removes the deposited inventory item; a subsequent
+            // OrgServer snapshot supplies the contract inventory descriptor.
+            InventoryMsg::ContainerAdd { item, container, .. } if container.kind == 0xdeaa => {
+                self.delete_inventory_item(*item, false);
             }
             InventoryMsg::Bank(entries) => {
                 self.containers.insert((0xdead, self.char_id as i32), (0, entries.clone()));
@@ -137,15 +222,10 @@ impl Zone {
             InventoryMsg::Reclaim { entries, instance } => {
                 self.containers.insert((0xdeae, *instance), (0, entries.clone()));
             }
-            InventoryMsg::ContainerAdd { item, container, .. } if container.kind == 0xdead && container.instance == self.char_id as i32 => {
-                let Some((_, entries)) = self.containers.get_mut(&(0xdead, self.char_id as i32)) else { return };
-                let Some(slot) = (0..0x66).find(|s| !entries.iter().any(|e| e.slot == *s)) else { return };
-                if item.instance < 0 || inv::slot_kind(item.instance as u32) != item.kind { return; }
-                if let Some(mut e) = self.inventory.remove(&(item.instance as u32)) {
-                    e.slot = slot;
-                    entries.push(e);
-                    entries.sort_by_key(|e| e.slot);
-                }
+            InventoryMsg::ContainerAdd { item, container, .. }
+                if container.kind == 0xc749 || (container.kind == 0xdead && container.instance == self.char_id as i32) =>
+            {
+                self.put_into_container(*item, *container);
             }
             InventoryMsg::ContainerAdd { item, container, .. } if item.kind == inv::KIND_BANK && *container == self.own_identity() => {
                 let Some(slot) = self.free_bag_slot() else { return };
@@ -203,10 +283,11 @@ impl Zone {
                 }
             }
             // `FUN_100a040e`: the contents of a chest / corpse replace the stored list (the own character's pages are `FullCharacterIIR_t`'s)
-            InventoryMsg::Update(u) if u.container.kind != 0xC350 => {
+            InventoryMsg::Update(u) if u.container.kind != 0xC350 || self.trade_state.as_ref().is_some_and(|s| s.partner == u.container) => {
                 let mut entries = u.entries.clone();
                 entries.sort_by_key(|e| e.slot);
                 self.containers.insert((u.container.kind, u.container.instance), (u.word, entries));
+                self.container_access.insert((u.container.kind, u.container.instance), u.access);
             }
             InventoryMsg::Updated(_) | InventoryMsg::Update(_) | InventoryMsg::TemplateAction { .. } => {}
         }
@@ -214,30 +295,86 @@ impl Zone {
 }
 
 impl Zone {
+    /// GC 1004abe5/10048678/100492fa: chest and bank deposits use the first free
+    /// destination cell. A full or unknown destination never consumes the source.
+    fn put_into_container(&mut self, item: Identity, container: Identity) {
+        let target = (container.kind, container.instance);
+        let Some((word, entries)) = self.containers.get(&target) else { return };
+        let word = *word;
+        let capacity = if container.kind == 0xdead { 102 } else { 21 };
+        let Some(slot) = (0..capacity).find(|s| !entries.iter().any(|e| e.slot == *s)) else { return };
+        let source = if item.kind == inv::KIND_IN_CONTAINER {
+            self.containers.iter().find(|(_, (word, entries))|
+                i32::from(*word as i16) == item.instance >> 16 && entries.iter().any(|e| e.slot == (item.instance & 0xffff) as u32)).map(|(key, _)| *key)
+        } else { None };
+        let entry = if let Some(source) = source {
+            if source == target { return; }
+            let entries = &mut self.containers.get_mut(&source).expect("source found above").1;
+            entries.iter().position(|e| e.slot == (item.instance & 0xffff) as u32).map(|at| entries.remove(at))
+        } else if item.instance >= 0 && inv::slot_kind(item.instance as u32) == item.kind {
+            self.inventory.remove(&(item.instance as u32))
+        } else { None };
+        if let Some(mut entry) = entry {
+            entry.slot = slot;
+            entry.id = if container.kind == 0xdead { Identity { kind: inv::KIND_BANK, instance: slot as i32 } } else { inv::container_item_identity(word, slot) };
+            let entries = &mut self.containers.get_mut(&target).expect("destination found above").1;
+            entries.push(entry);
+            entries.sort_by_key(|e| e.slot);
+        }
+    }
+
+    fn container_stack_slot(&mut self, item: Identity) -> Option<u32> {
+        if item.kind != inv::KIND_IN_CONTAINER { return None; }
+        let source = self.containers.values().find(|(word, _)| i32::from(*word as i16) == item.instance >> 16)?
+            .1.iter().find(|e| e.slot == (item.instance & 0xffff) as u32).copied()?;
+        if source.a & 1 == 0 { return None; }
+        let can = self.world.item_template_stat(source.item, 30)?;
+        if can & 0x200 == 0 || can & 0x1000000 != 0 { return None; }
+        (inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS).find(|s| self.inventory.get(s).is_some_and(|e| e.a & 1 != 0 && e.item == source.item))
+    }
+
+    pub(in crate::play) fn can_take_from_container(&mut self, item: Identity) -> bool {
+        self.free_bag_slot().is_some() || self.container_stack_slot(item).is_some()
+    }
+
     /// `ContainerAddItemIIR_t` for an item `{0x6b, word << 16 | slot}` into the own character (`FUN_1004ad44` -> `FUN_1004a7b3(item, slot)` [GC]): the item
     /// is looked up in the container registered under `word` (`FUN_10048644`, the list of its last `InventoryUpdateIIR_t`), the cell `slot` of that
     /// list is emptied (`FUN_1002a64f(slot, 0)`) and the item goes to the bag slot `slot_to` (`0x6f` / `-1` = the first free bag slot
-    /// `FUN_1002a1b0(0x40)`, nothing happens when the bag is full). [UNRESOLVED]: the stack merge `FUN_1002a2bc(0x16, ...)` the original tries for a
-    /// stackable item first (`FUN_1002a5ff`) is not applied.
+    /// `FUN_1002a1b0(0x40)`, nothing happens when the bag is full). `FUN_1002a5ff` first finds an identical
+    /// stack for automatic destinations; `FUN_1002a2bc` merges up to 50000, otherwise the native move swaps the cells.
     fn take_from_container(&mut self, item: Identity, container: Identity, slot_to: i32) {
         if container != self.own_identity() {
             return;
         }
         let (key, from) = (item.instance >> 16, (item.instance & 0xffff) as u32);
         let Some(&at) = self.containers.iter().find(|(_, (word, l))| i32::from(*word as i16) == key && l.iter().any(|e| e.slot == from)).map(|(k, _)| k) else { return };
+        let stack = if matches!(slot_to, inv::ANY_BAG_SLOT | -1) { self.container_stack_slot(item) } else { None };
         let to = match slot_to {
-            inv::ANY_BAG_SLOT | -1 => match self.free_bag_slot() {
+            inv::ANY_BAG_SLOT | -1 => match stack.or_else(|| self.free_bag_slot()) {
                 Some(s) => s,
                 None => return,
             },
-            s if s >= inv::BAG_FIRST as i32 && !self.inventory.contains_key(&(s as u32)) => s as u32,
+            s if (inv::BAG_FIRST as i32..(inv::BAG_FIRST + inv::BAG_SLOTS) as i32).contains(&s) => s as u32,
             _ => return,
         };
         let list = &mut self.containers.get_mut(&at).expect("found above").1;
         let mut e = list.remove(list.iter().position(|e| e.slot == from).expect("found above"));
+        if let Some(target) = self.inventory.get_mut(&to) {
+            let total = u32::from(target.b as u16) + u32::from(e.b as u16);
+            if stack.is_some() && total <= 50_000 {
+                target.b = total as i16;
+                return;
+            }
+        }
         e.slot = to;
         e.a &= !0x40;
-        self.inventory.insert(to, e);
+        e.id = inv::item_identity(to);
+        if let Some(mut displaced) = self.inventory.insert(to, e) {
+            displaced.slot = from;
+            displaced.id = item;
+            list.push(displaced);
+            list.sort_by_key(|e| e.slot);
+        }
     }
 }
 
@@ -245,6 +382,127 @@ impl Zone {
 mod tests {
     use super::*;
     use ao_net::n3::world::{AcgItem, InventoryEntry};
+
+    #[test]
+    fn acg_endpoint_can_and_flags_follow_quality_and_tie_high_for_stack_eligibility() {
+        let mut z = Zone::new(7);
+        z.world.test_inventory_endpoint(10, 1, 0x200, 0);
+        z.world.test_inventory_endpoint(20, 9, 0x1000200, 0x4000000);
+        for slot in inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS { put(&mut z, slot, 99); }
+        let container = (0xc76a, 22);
+        let id = inv::container_item_identity(0x77, 0);
+        for (ql, eligible, flags) in [(4, true, 0), (5, false, 0x4000000), (8, false, 0x4000000)] {
+            let item = AcgItem { low_id: 10, high_id: 20, level: ql };
+            z.inventory.insert(0x40, InventoryEntry { slot: 0x40, a: 1, b: 10, id: inv::item_identity(0x40), item });
+            z.containers.insert(container, (0x77, vec![InventoryEntry { slot: 0, a: 1, b: 2, id, item }]));
+            assert_eq!(z.world.item_template_stat(item, 0), Some(flags));
+            assert_eq!(z.can_take_from_container(id), eligible, "QL {ql}: Can must not always come from low endpoint");
+        }
+        let missing = AcgItem { low_id: 10, high_id: 999, level: 1 };
+        assert_eq!(z.world.item_template_stat(missing, 30), None, "missing high endpoint must not become a low fallback");
+    }
+
+    #[test]
+    fn contract_withdrawal_retains_full_bag_source_and_deposit_waits_for_snapshot() {
+        let mut z = Zone::new(7);
+        let container = Identity { kind: 0xdeaa, instance: 9 };
+        let entry = InventoryEntry { slot: 29, a: 1, b: 1, id: Identity::default(), item: AcgItem { low_id: 5, high_id: 5, level: 1 } };
+        z.apply_inventory(&InventoryMsg::Update(inv::InventoryUpdate { capacity: 30, access: 3, entries: vec![entry], container, word: 0, flag: true }));
+        for slot in inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS { put(&mut z, slot, 100); }
+        let take = InventoryMsg::ContainerAdd { item: Identity { kind: inv::KIND_CONTRACT, instance: 29 }, container: z.own_identity(), slot: inv::ANY_BAG_SLOT };
+        z.apply_inventory(&take);
+        assert_eq!(z.containers[&(container.kind, container.instance)].1.len(), 1);
+        z.inventory.remove(&0x45);
+        z.apply_inventory(&take);
+        assert_eq!(z.inventory[&0x45].item, entry.item);
+        assert!(z.containers[&(container.kind, container.instance)].1.is_empty());
+        z.apply_inventory(&InventoryMsg::ContainerAdd { item: inv::item_identity(0x45), container, slot: 0 });
+        assert!(!z.inventory.contains_key(&0x45));
+        assert!(z.containers[&(container.kind, container.instance)].1.is_empty());
+    }
+
+    #[test]
+    fn synthetic_loot_access_update_preserves_native_source_then_destination_refusals() {
+        use ao_net::n3::{self, outgoing};
+        use ao_net::wire::Writer;
+        let mut z = Zone::new(7);
+        let source = Identity { kind: 0xc76a, instance: 8 };
+        let target = Identity { kind: 0xc749, instance: 9 };
+        let item = inv::container_item_identity(0x8001, 3);
+        let update = |container: Identity, access, word| {
+            let mut w = Writer::default();
+            w.u32(inv::INVENTORY_UPDATE);
+            Identity { kind: 0xc350, instance: 7 }.write(&mut w);
+            w.u8(0);
+            w.i32(21);
+            w.i32(access);
+            w.i32(0x3f1); // empty inventory, native count encoding
+            container.write(&mut w);
+            w.i32(word);
+            w.i32(0); // refresh rights without reopening the view
+            outgoing::n3_frame(1, 7, w.0)
+        };
+        for (container, access, word) in [(source, 0, 0x8001), (target, 0, 0x71)] {
+            let frame = update(container, access, word);
+            assert!(matches!(n3::decode(&frame).unwrap().body, n3::N3::Inventory(_)));
+            z.on_frame(&frame);
+        }
+        assert_eq!(z.container_move_error(item, target), Some((10003, "Inv_SrcCantRemove")));
+        z.on_frame(&update(source, 2, 0x8001));
+        assert_eq!(z.container_move_error(item, target), Some((10003, "Inv_DstCantAdd")));
+        z.on_frame(&update(target, 1, 0x71));
+        assert_eq!(z.container_move_error(item, target), None);
+        assert_eq!(z.container_move_error(item, z.own_identity()), None);
+        z.on_frame(&update(source, 1, 0x8001));
+        assert_eq!(z.container_move_error(item, z.own_identity()), Some((10003, "Inv_SrcCantRemove")));
+    }
+
+    #[test]
+    fn confirmed_loot_joins_full_bag_only_with_native_can_and_matching_acg() {
+        let mut z = Zone::new(7);
+        for slot in inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS { put(&mut z, slot, 10); }
+        z.world.test_inventory_can(10, 0x200);
+        let bag = z.inventory.get_mut(&0x40).unwrap();
+        bag.a = 1;
+        bag.b = 49_998u16 as i16;
+        let mut loot = *bag;
+        loot.slot = 0;
+        loot.b = 2;
+        let source = Identity { kind: 0xc76a, instance: 22 };
+        let item = inv::container_item_identity(0x77, 0);
+        z.containers.insert((source.kind, source.instance), (0x77, vec![loot]));
+        let reply = InventoryMsg::ContainerAdd { item, container: z.own_identity(), slot: inv::ANY_BAG_SLOT };
+        assert!(z.can_take_from_container(item), "the production request guard must admit full-bag merging");
+        z.apply_inventory(&reply);
+        assert_eq!(z.inventory[&0x40].b as u16, 50_000);
+        assert!(z.containers[&(source.kind, source.instance)].1.is_empty());
+        z.world.test_inventory_can(10, 0x1000200);
+        z.containers.get_mut(&(source.kind, source.instance)).unwrap().1.push(loot);
+        assert!(!z.can_take_from_container(item));
+        z.apply_inventory(&reply);
+        assert_eq!(z.containers[&(source.kind, source.instance)].1.len(), 1, "cannot-split forbids automatic merging and the bag is full");
+        assert_eq!(z.inventory[&0x40].b as u16, 50_000);
+    }
+
+    #[test]
+    fn split_join_confirmations_preserve_counts_and_reject_invalid_or_full_moves() {
+        let mut z = Zone::new(7);
+        put(&mut z, 0x40, 10);
+        z.inventory.get_mut(&0x40).unwrap().b = 10;
+        for count in [-1, 0, 10, 11] { z.split_inventory_item(inv::item_identity(0x40), count); }
+        assert_eq!(z.inventory.len(), 1);
+        z.split_inventory_item(inv::item_identity(0x40), 4);
+        assert_eq!((z.inventory[&0x40].b, z.inventory[&0x41].b), (6, 4));
+        z.join_inventory_items(inv::item_identity(0x40), inv::item_identity(0x41));
+        assert_eq!(z.inventory[&0x40].b, 10);
+        assert_eq!(z.inventory.len(), 1);
+        for slot in inv::BAG_FIRST + 1..inv::BAG_FIRST + inv::BAG_SLOTS { put(&mut z, slot, 10); }
+        z.split_inventory_item(inv::item_identity(0x40), 4);
+        assert_eq!(z.inventory[&0x40].b, 10);
+        z.inventory.get_mut(&0x40).unwrap().b = 50_000u16 as i16;
+        z.join_inventory_items(inv::item_identity(0x40), inv::item_identity(0x41));
+        assert!(z.inventory.contains_key(&0x41), "50001 must not overflow a stack");
+    }
 
     fn put(z: &mut Zone, slot: u32, low: i32) {
         let id = inv::item_identity(slot);
@@ -314,6 +572,32 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_backpack_moves_use_first_free_slot_and_preserve_full_sources() {
+        let mut z = Zone::new(7);
+        let a = Identity { kind: 0xc749, instance: 101 };
+        let b = Identity { kind: 0xc749, instance: 102 };
+        z.containers.insert((a.kind, a.instance), (0x70, vec![]));
+        z.containers.insert((b.kind, b.instance), (0x71, vec![]));
+        z.containers.insert((0xdead, 7), (0, vec![]));
+        put(&mut z, 0x40, 10);
+        z.apply_inventory(&InventoryMsg::ContainerAdd { item: inv::item_identity(0x40), container: a, slot: 19 });
+        assert!(!z.inventory.contains_key(&0x40));
+        assert_eq!(z.containers[&(a.kind, a.instance)].1[0].slot, 0);
+        z.apply_inventory(&InventoryMsg::ContainerAdd { item: inv::container_item_identity(0x70, 0), container: b, slot: 19 });
+        assert!(z.containers[&(a.kind, a.instance)].1.is_empty());
+        assert_eq!(z.containers[&(b.kind, b.instance)].1[0].id, inv::container_item_identity(0x71, 0));
+        z.apply_inventory(&InventoryMsg::ContainerAdd { item: inv::container_item_identity(0x71, 0), container: Identity { kind: 0xdead, instance: 7 }, slot: 99 });
+        assert!(z.containers[&(b.kind, b.instance)].1.is_empty());
+        assert_eq!(z.containers[&(0xdead, 7)].1[0].slot, 0);
+        z.apply_inventory(&InventoryMsg::ContainerAdd { item: Identity { kind: inv::KIND_BANK, instance: 0 }, container: z.own_identity(), slot: 19 });
+        assert_eq!(z.inventory[&0x40].item.low_id, 10);
+        let entry = z.inventory[&0x40];
+        z.containers.get_mut(&(a.kind, a.instance)).unwrap().1 = (0..21).map(|slot| InventoryEntry { slot, ..entry }).collect();
+        z.apply_inventory(&InventoryMsg::ContainerAdd { item: inv::item_identity(0x40), container: a, slot: 0 });
+        assert!(z.inventory.contains_key(&0x40), "full destination cannot discard the source");
+    }
+
+    #[test]
     fn server_delete_consumes_stack_or_removes_item_without_learning_a_nano() {
         let mut z = Zone::new(7);
         put(&mut z, 0x40, 100);
@@ -340,13 +624,13 @@ mod tests {
     fn temporary_server_items_preserve_count_and_wait_for_bag_space() {
         let mut z = Zone::new(7);
         let item = AcgItem { low_id: 218395, high_id: 218395, level: 1 };
-        let create = InventoryMsg::TemplateAction { item, count: 3, action: 0x57, identity_a: Identity { kind: inv::KIND_TRADE, instance: 0 }, identity_b: Identity::default() };
+        let create = InventoryMsg::TemplateAction { item, count: 3, action: 0x57, identity_a: Identity { kind: inv::KIND_OVERFLOW, instance: 0 }, identity_b: Identity::default() };
         z.apply_inventory(&create);
         z.apply_inventory(&create);
-        let key = (inv::KIND_TRADE, 7);
+        let key = (inv::KIND_OVERFLOW, 7);
         assert_eq!(z.containers[&key].1.iter().map(|e| (e.slot, e.b)).collect::<Vec<_>>(), [(0, 3), (1, 3)]);
         for slot in inv::BAG_FIRST..inv::BAG_FIRST + inv::BAG_SLOTS { put(&mut z, slot, 100); }
-        let transfer = InventoryMsg::ContainerAdd { item: Identity { kind: inv::KIND_TRADE, instance: 0 }, container: Identity { kind: inv::KIND_TRADE, instance: 7 }, slot: inv::ANY_BAG_SLOT };
+        let transfer = InventoryMsg::ContainerAdd { item: Identity { kind: inv::KIND_OVERFLOW, instance: 0 }, container: Identity { kind: inv::KIND_OVERFLOW, instance: 7 }, slot: inv::ANY_BAG_SLOT };
         z.apply_inventory(&transfer);
         assert_eq!(z.containers[&key].1.len(), 2, "full bag must retain the server item");
         z.inventory.remove(&0x45);
@@ -375,12 +659,12 @@ mod tests {
             match message.body {
                 N3::Inventory(InventoryMsg::TemplateAction { action: 0x57, .. }) => {
                     assert_eq!(z.inventory.len(), 5, "template creation alone does not place a bag item");
-                    assert_eq!(z.containers[&(inv::KIND_TRADE, 0x830e)].1.len(), 1);
+                    assert_eq!(z.containers[&(inv::KIND_OVERFLOW, 0x830e)].1.len(), 1);
                 }
-                N3::Inventory(InventoryMsg::ContainerAdd { item, .. }) if item.kind == inv::KIND_TRADE => {
+                N3::Inventory(InventoryMsg::ContainerAdd { item, .. }) if item.kind == inv::KIND_OVERFLOW => {
                     assert_eq!(z.inventory[&0x45].item, AcgItem { low_id: 218395, high_id: 218395, level: 1 });
                     assert_eq!(z.inventory[&0x45].b, 1);
-                    assert!(z.containers[&(inv::KIND_TRADE, 0x830e)].1.is_empty());
+                    assert!(z.containers[&(inv::KIND_OVERFLOW, 0x830e)].1.is_empty());
                     transferred = true;
                 }
                 N3::Trade(t) if t.op == n3::trade::COMPLETE => {
@@ -491,7 +775,7 @@ mod tests {
         let mut z = Zone::new(7);
         let corpse = Identity { kind: 0xc76a, instance: 1 };
         let entry = InventoryEntry { slot: 3, a: 0, b: 0, id: Identity::default(), item: AcgItem { low_id: 5, high_id: 5, level: 1 } };
-        z.apply_inventory(&InventoryMsg::Update(inv::InventoryUpdate { capacity: 21, kind: 2, entries: vec![entry], container: corpse, word: 0x70, flag: true }));
+        z.apply_inventory(&InventoryMsg::Update(inv::InventoryUpdate { capacity: 21, access: 2, entries: vec![entry], container: corpse, word: 0x70, flag: true }));
         let own = Identity { kind: 0xC350, instance: 7 };
         let take = |slot: u32, key: i32| InventoryMsg::ContainerAdd { item: inv::container_item_identity(key, slot), container: own, slot: inv::ANY_BAG_SLOT };
         z.apply_inventory(&take(4, 0x70));

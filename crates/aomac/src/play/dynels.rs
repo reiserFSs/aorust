@@ -922,6 +922,9 @@ pub struct Dynels {
     nano_sounds: Vec<(u32, [f32; 3], f32, f32, u32, i32)>,
     nano_store: Option<RecordStore>,
     nano_templates: HashMap<i32, Arc<ao_formats::dynel_visual::ItemTemplate>>,
+    /// Inventory templates are record type 1000020, not the nano cache's 1040005.
+    inventory_templates: HashMap<i32, Option<ao_formats::dynel_visual::ItemTemplate>>,
+    inventory_acg_templates: HashMap<(i32, i32, i32), Option<ao_formats::dynel_visual::ItemTemplate>>,
     pub nano_effect_categories: u32,
     /// Retail effect category bits: muzzle=8, tracers/hits=2.
     pub weapon_effect_categories: u32,
@@ -1047,6 +1050,8 @@ impl Default for Dynels {
             nano_sounds: vec![],
             nano_store: None,
             nano_templates: HashMap::new(),
+            inventory_templates: HashMap::new(),
+            inventory_acg_templates: HashMap::new(),
             nano_effect_categories: 36,
             weapon_effect_categories: 10,
             swings: HashMap::new(),
@@ -1119,6 +1124,46 @@ impl Dynels {
         ao_formats::dynel_visual::get(&built.stats, stat)
     }
 
+    fn cache_inventory_template(&mut self, low: i32) -> Option<()> {
+        if !self.inventory_templates.contains_key(&low) {
+            let store = self.nano_store.as_ref()?;
+            let template = match u32::try_from(low).ok().map(|id| ao_formats::dynel_visual::item_template(store, id)).transpose() {
+                Ok(template) => template.flatten(),
+                Err(error) => { eprintln!("inventory template {low}: {error:#}"); None }
+            };
+            self.inventory_templates.insert(low, template);
+        }
+        self.inventory_templates.get(&low)?.as_ref().map(|_| ())
+    }
+
+    /// GC 10082a3d/100cc270: Can and Flags come from the nearest ACG endpoint, tie high.
+    pub(super) fn item_template_stat(&mut self, item: ao_net::n3::world::AcgItem, stat: u32) -> Option<i32> {
+        let key = (item.low_id, item.high_id, item.level);
+        if !self.inventory_acg_templates.contains_key(&key) {
+            self.cache_inventory_template(item.low_id)?;
+            self.cache_inventory_template(item.high_id)?;
+            let low = self.inventory_templates.get(&item.low_id)?.as_ref()?;
+            let high = self.inventory_templates.get(&item.high_id)?.as_ref()?;
+            let template = match ao_formats::dynel_visual::interpolate_item_templates(low, high, item.level) {
+                Ok(template) => Some(template),
+                Err(error) => { eprintln!("inventory ACG {item:?}: {error:#}"); None }
+            };
+            self.inventory_acg_templates.insert(key, template);
+        }
+        self.inventory_acg_templates.get(&key)?.as_ref()?.stat(stat)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_inventory_can(&mut self, low: i32, can: i32) {
+        self.test_inventory_endpoint(low, 1, can, 0);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_inventory_endpoint(&mut self, id: i32, ql: i32, can: i32, flags: i32) {
+        self.inventory_acg_templates.clear();
+        self.inventory_templates.insert(id, Some(ao_formats::dynel_visual::ItemTemplate { kind: 0, name: None, sounds: vec![], stats: vec![(54, ql), (30, can), (0, flags)] }));
+    }
+
     pub fn object_position(&self, id: ao_net::msg::Identity) -> Option<[f32; 3]> {
         self.props.get(&(id.kind, id.instance)).map(|p| p.pos)
     }
@@ -1126,6 +1171,27 @@ impl Dynels {
     /// Current remote vehicle pose in server coordinates, before the render-space Z flip.
     pub fn character_position(&self, id: i32) -> Option<[f32; 3]> {
         self.chars.get(&id).map(|c| c.pose.pos)
+    }
+
+    /// N3 `10019629` caches MeshMeta, not the posed CAT bounds; `10019b51/10019b69`
+    /// scale its radius and vertical centre. Missing resource rows have native zero bounds.
+    pub(super) fn character_trade_bounds(&self, id: i32) -> anyhow::Result<Option<(f32, f32)>> {
+        let Some(c) = self.chars.get(&id) else { return Ok(None) };
+        let Some(store) = self.nano_store.as_ref() else { return Ok(None) };
+        let Look::Char(look) = &c.look else { return Ok(None) };
+        let model = match monster_record(store, look)? {
+            Some(record) => record.mesh().context("NPC record has no mesh")?,
+            None => {
+                let Some(names) = self.names.as_ref() else { return Ok(None) };
+                let (breed, gender) = ao_formats::screens::wire_breed_sex(look.breed as i32, look.sex as i32)?;
+                ao_formats::character::player_model_build_with_names(names, breed, gender, look.fatness.min(2))?
+            }
+        };
+        let Some(data) = store.get(1_000_047, model)? else { return Ok(Some((0.0, 0.0))) };
+        anyhow::ensure!(data.len() == 28, "MeshMeta {model}: expected 28 bytes, got {}", data.len());
+        let centre_y = f32::from_le_bytes(data[4..8].try_into().unwrap());
+        let radius = f32::from_le_bytes(data[12..16].try_into().unwrap());
+        Ok(Some((centre_y * c.scale, radius * c.scale)))
     }
 
     pub fn texture_quality(&self) -> i32 { self.texture_quality }
@@ -3648,6 +3714,29 @@ mod tests {
                 (dir == "<").then(|| Frame::decode_with(&b, false).ok().flatten().map(|(f, _)| f)).flatten()
             })
             .collect()
+    }
+
+    #[test]
+    fn trade_sphere_uses_meshmeta_and_body_scale_not_pose_bounds() {
+        let Ok(store) = RecordStore::open(&ao_gui::client_dir()) else { return };
+        let names = Arc::new(NameTable::load(&store).unwrap());
+        let mut spawn = captured_posture_player();
+        let who = spawn.header.target.instance;
+        let N3::Dynel(Dynel::SimpleCharFullUpdate(update)) = &mut spawn.body else { unreachable!() };
+        update.monster_scale = 100;
+        let (breed, gender) = ao_formats::screens::wire_breed_sex(update.breed as i32, update.sex as i32).unwrap();
+        let model = ao_formats::character::player_model_build_with_names(&names, breed, gender, update.fatness.min(2)).unwrap();
+        let data = store.get(1_000_047, model).unwrap().unwrap();
+        let expected = (f32::from_le_bytes(data[4..8].try_into().unwrap()), f32::from_le_bytes(data[12..16].try_into().unwrap()));
+        let mut world = Dynels { nano_store: Some(store), names: Some(names), ..Default::default() };
+        world.on_message(&spawn);
+        assert_eq!(world.character_trade_bounds(who).unwrap(), Some(expected));
+        assert_ne!(expected.1, 0.5, "the fixture distinguishes visual metadata from the old collision guess");
+        let character = world.chars.get_mut(&who).unwrap();
+        character.scale = 2.0;
+        character.bounds = Some(([-100.0; 3], [100.0; 3]));
+        assert_eq!(world.character_trade_bounds(who).unwrap(), Some((expected.0 * 2.0, expected.1 * 2.0)));
+        assert_eq!(world.character_trade_bounds(-1).unwrap(), None);
     }
 
     #[test]

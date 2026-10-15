@@ -48,6 +48,8 @@ pub(super) struct TeamState {
     pub own_sub_team: i32,
     pub members: Vec<Member>,
     pub leader: Option<Identity>,
+    /// Event `0x10` carries the server's team level, not a character level.
+    team_level: Option<i32>,
     /// A pending `TeamInviteIIR_t` (`flag == 0`): who asked and under which name.
     pub invite: Option<(Identity, String)>,
     /// System lines the window module would print (category 0x2710 texts): `(key, argument)`.
@@ -82,10 +84,9 @@ impl TeamState {
             })
     }
 
-    /// `TeamViewModule_c::GetTeamLevel`: UNRESOLVED GUESS, the highest member level. The module stores the value of its team event `0x10` (`identity.instance`,
-    /// `FUN_1007a5f2`), whose emitter in Gamecode was not found; no capture has a team.
+    /// GUI `10079fae` / `1007a5f2`: event value, initially 1 (`1007b9be`).
     pub(super) fn level(&self) -> i32 {
-        self.members.iter().map(|m| i32::from(m.level)).max().unwrap_or(0)
+        self.team_level.unwrap_or(1)
     }
 
     fn clear(&mut self) {
@@ -93,6 +94,7 @@ impl TeamState {
         self.own_sub_team = -1;
         self.members.clear();
         self.leader = None;
+        self.team_level = None;
     }
 
     /// One zone N3 message (`FUN_1007a033` / `FUN_1007a294` / `FUN_1005d0d8` cases 4, 8, 9 / `FUN_100a3f26`).
@@ -129,8 +131,8 @@ impl TeamState {
     }
 
     /// `FUN_1007a033`: a member record. `team.instance == 0` clears that dynel's team (`FUN_10065745`); otherwise the entry is created / replaced
-    /// (`FUN_10065d09`). The own record carries the own team; the leader defaults to the first member of a new team (**UNRESOLVED GUESS**: the
-    /// leader comes with action `0x23`, see [`TeamState::on_action`]).
+    /// (`FUN_10065d09`). The own record carries the own team. Leader starts unset (`FUN_100658b9`) and is set only by action `0x23`
+    /// (`FUN_10065718`, see [`TeamState::on_action`]).
     fn on_member(&mut self, t: &team::TeamMember) {
         if t.team.instance == 0 {
             self.remove(t.member);
@@ -149,12 +151,7 @@ impl TeamState {
                 let keep = self.members[i].clone();
                 self.members[i] = Member { health: keep.health, nano: keep.nano, ..m };
             }
-            None => {
-                if self.leader.is_none() {
-                    self.leader = Some(t.member);
-                }
-                self.members.push(m);
-            }
+            None => self.members.push(m),
         }
     }
 
@@ -176,6 +173,8 @@ impl TeamState {
     /// `identity_a` as the leader.
     fn on_action(&mut self, target: Identity, a: &n3::world::CharacterAction) {
         match a.action {
+            // GC `1005d2b5`: action 0x1b -> event 0x10(identity_a), own controlled dynel only.
+            0x1b if target == self.own => self.team_level = Some(a.identity_a.instance),
             team::action::MEMBER_LEFT => self.remove(a.identity_a),
             team::action::LEAVE => self.remove(target),
             team::action::LEADER if self.in_team() => self.leader = Some(a.identity_a),
@@ -392,7 +391,8 @@ impl HudTeam {
         self.build_buttons(gui, &mut w, false);
         let st = &self.state;
         let header = if st.in_team() {
-            let side = self.texts.as_ref().and_then(|t| t.by_id(2005, zone.stat(ao_formats::stats::SIDE).unwrap_or(0).max(0) as u32)).unwrap_or_default();
+            // GC `10004bf5`: own TeamSide stat (213) -> event 0x36; GUI default is 0.
+            let side = self.texts.as_ref().and_then(|t| t.by_id(2005, zone.stat(213).unwrap_or(0) as u32)).unwrap_or_default();
             fmt(&self.text("TeamLvlTeamSide"), &[&st.level().to_string(), &side])
         } else {
             self.text("NoTeam")
@@ -561,6 +561,38 @@ mod tests {
     }
 
     #[test]
+    fn team_level_uses_own_action_value_and_resets_on_leave() {
+        let mut h = HudTeam::new(&ao_gui::client_dir(), (1024, 768));
+        assert_eq!(h.state.level(), 1);
+        feed(&mut h, member(ME, "Me"));
+        assert_eq!(h.state.level(), 1, "member level 30 is not the team level");
+        let action = ao_net::n3::action::simple(0x1b, Identity { kind: 0, instance: 4 }, Identity::default());
+        feed(&mut h, ao_net::n3::action::character_action(7, &action));
+        assert_eq!(h.state.level(), 4);
+        let other = ao_net::n3::decode(&n3_frame(0, 7, ao_net::n3::action::character_action(9, &ao_net::n3::action::simple(0x1b, Identity { kind: 0, instance: 6 }, Identity::default())))).unwrap();
+        h.state.on_message(&other);
+        assert_eq!(h.state.level(), 4, "another character's action is not relayed to the Team module");
+        feed(&mut h, ao_net::n3::action::character_action(7, &ao_net::n3::action::simple(action::LEAVE, ME, Identity::default())));
+        assert_eq!(h.state.level(), 1);
+    }
+
+    #[test]
+    fn team_header_uses_team_side_instead_of_character_side() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut h = HudTeam::new(&dir, (1280, 800));
+        let Some(texts) = h.texts.as_ref() else { return };
+        let expected = fmt(&h.text("TeamLvlTeamSide"), &["1", &texts.by_id(2005, 2).unwrap()]);
+        let mut zone = Zone { char_id: 7, ..Zone::default() };
+        zone.stats.insert(ao_formats::stats::SIDE, 1);
+        zone.stats.insert(213, 2);
+        feed(&mut h, member(ME, "Me"));
+        h.open(&mut gui);
+        h.update(&mut gui, &mut zone, 0.0);
+        assert_eq!(gui.text(h.win.as_ref().unwrap().window, "header"), expected);
+    }
+
+    #[test]
     fn team_native_background_and_rows_stay_inside_client() {
         let dir = ao_gui::client_dir();
         let Ok(mut gui) = Gui::new(&dir, None) else { return };
@@ -624,7 +656,11 @@ mod tests {
         let mut h = HudTeam::new(&ao_gui::client_dir(), (1024, 768));
         feed(&mut h, member(ME, "Me"));
         feed(&mut h, member(OTHER, "Other"));
-        assert!(h.state.in_team() && h.state.is_leader() && h.state.members.len() == 2);
+        assert!(h.state.in_team() && !h.state.is_leader() && h.state.members.len() == 2);
+        assert_eq!(h.state.leader, None, "member order does not grant leadership");
+        let a = ao_net::n3::action::character_action(7, &ao_net::n3::action::simple(action::LEADER, ME, Identity::default()));
+        feed(&mut h, a);
+        assert!(h.state.is_leader());
         feed(&mut h, team_member_info(ME, &TeamMemberInfo { member: OTHER, nano: 1, max_nano: 2, max_health: 10, health: 5 }));
         assert_eq!(h.state.members[1].health, (5, 10));
         // leader action 0x23 hands the leadership over

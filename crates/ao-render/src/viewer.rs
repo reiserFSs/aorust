@@ -93,6 +93,8 @@ pub struct Host {
     pub mods: ao_gui::Modifiers,
     /// Frontend request: hide the OS cursor because the frontend draws the game's own pointer in its draw list; applied after each frame/input.
     pub hide_cursor: bool,
+    /// One-shot cursor position in GUI pixels (native split-count selection); applied only to the focused, uncaptured owned window.
+    pub pointer_warp: Option<(f32, f32)>,
     /// Current weather wind in AO world coordinates (`GCComputeWind`, Gamecode 0x100cd993).
     pub effect_wind: [f32; 3],
     /// Current server-synchronized GameDayTime (0..6480 seconds); absent outside a game zone.
@@ -171,7 +173,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
+        Host { pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -632,6 +634,15 @@ impl State {
         if hide != self.cursor_hidden {
             self.cursor_hidden = hide;
             self.window.set_cursor_visible(!hide);
+        }
+        if let Some(g) = &mut self.gui {
+            if let Some((x, y)) = g.host.pointer_warp.take().filter(|_| self.focused && self.window.has_focus() && !self.looking) {
+                let pos = winit::dpi::PhysicalPosition::new(x as f64 * g.scale as f64, y as f64 * g.scale as f64);
+                match self.window.set_cursor_position(pos) {
+                    Ok(()) => g.cursor = (x, y),
+                    Err(e) => eprintln!("cursor position: {e}"),
+                }
+            }
         }
     }
 

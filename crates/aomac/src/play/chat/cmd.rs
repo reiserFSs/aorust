@@ -106,7 +106,7 @@ pub enum ChatAction {
     IgnoreList,
     /// `/ignore <nick>` (queued action type 9; the hub resolves the name then toggles).
     IgnoreByName(String),
-    /// `/ignore [id]`: toggle `IgnoreSystem_t` for a character id; the feedback is `ignore_feedback`.
+    /// `/ignore [id]`: toggle `IgnoreSystem_t` for a character id; the hub updates Friends and prints feedback.
     IgnoreToggle { id: u32, name: Option<String> },
     /// `/cc <args...>` for the chat server (`addbuddy`, `rembuddy`, ...).
     Cc(Vec<String>),

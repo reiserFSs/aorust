@@ -80,7 +80,7 @@ Global map (`FUN_100badf1` 0x100badf1..0x100bbc30; handler address in the 2nd co
 | word(s) | argc | handler | what it becomes |
 |---|---|---|---|
 | `/tell` | 3 | 0x100ba2e6 | queued action 2: target `Expand(tok1)`, text `Expand(tok2)` or empty; `< 2` tokens: silently nothing. Empty text opens the tell window (0x1008947b: `OpenTellWindow`) |
-| `/reply` `/r` | 2 | 0x100ba42f | target = head of reply list (+0x288); empty list: info "You have not received any tell messages yet." (hardcoded, 0x52) |
+| `/reply` `/r` | 2 | 0x100ba42f | queued tell action 2: target = newest reply-list entry (`+0x288` sentinel's previous node), text `Expand(tok1)` or empty (opens tell window); empty list: info "You have not received any tell messages yet." (hardcoded, 0x52). `HandlePrivateMessage` 0x1008792e updates history only for normal, non-self, non-ignored (unless flag 1) tells with a nonempty sender name (`+0x1c`, gate near 0x10087c10); `FUN_10089089` appends newest. `Chat::remember_reply_sender` preserves the previous target when name lookup is unresolved; synthetic regression `unresolved_tell_sender_preserves_reply_target` |
 | `/afk` | 2 | 0x100b7cb8 | see below |
 | `/invite` `/kick` `/leave` | 2 | 0x100ba6db / 0x100ba7e6 / 0x100ba8f1 | queued actions 3 / 4 / 5 with `Expand(tok1)`; usage `Usage: /invite &lt;nick&gt;` |
 | `/ignore` | 2 | 0x100ba9fc | see below |
@@ -88,7 +88,8 @@ Global map (`FUN_100badf1` 0x100badf1..0x100bbc30; handler address in the 2nd co
 | `/cc` | -1 | 0x100ba105 | `info <name>` (exactly 3 tokens) -> action; `< 2` tokens "Invalid syntax"; chat server down "Error: Not connected to chat-server."; else all tokens expanded and handed to `Client_c` (0x1016cadf) |
 | `/lft` | 2 | 0x100b69b0 | `FUN_100f01a3(on, text)`: with text on, bare toggles |
 | `/help` | 2 | 0x100b6d56 | topic map lookup -> `file://<file>` in the InfoView (docs/chat/dialogs.md §1); none: "Error: no help topic named 'X'."; no argument: `helpcommands.html` |
-| `/petition /fxscript /selectself /funcom /bug /showfile /tipoftheday /open /toggle /close /messagebox /assist /text /start /camp /quit /voice /macro /petduel /duel /filter /waypoint /rp /reclaim` | see `GLOBAL_CMDS` | GUI-local | `ChatAction::ClientCommand(line)` (not chat) |
+| `/petition /fxscript /selectself /funcom /bug /showfile /tipoftheday /open /toggle /close /messagebox /assist /text /start /camp /quit /voice /macro /filter /waypoint /rp /reclaim` | see `GLOBAL_CMDS` | GUI-local | client-side command actions (not chat); details in docs/chat/dialogs.md |
+| `/duel /petduel` | 2 | 0x100b8a10 / 0x100b8789 | `ChatAction::Duel` → combat target validation → `ao_net::n3::action::duel` wire; docs/chat/dialogs.md, docs/zone/combat-duel.md |
 | `/option /setoption /dvalue /chardist /viewdist /char&viewdist` | 3 / 3 / 3 / 2 / 2 / 3 | 0x100b5adc / 0x100b7127 / 0x100b62ed / 0x100b63b8 / 0x100b6465 | `ChatAction::DValue(tokens)` → flow → `DValues::command` (docs/chat/dvalue.md) |
 | `/played` | 1 | 0x100b2321 | prints "Time: %02d:%02d local (%02d:%02d GMT), %02d:%02d game<br>" + "Date: ..." then `N3Msg_TextCommand("played")` |
 | `/version /bank /team /org /born /pet /follow /items /raid` | -1 | 0x100b2278 | `N3Msg_TextCommand(window, Expand(line[1..]), target)` (Interfaces 0x10008a72 -> Gamecode 0x176db -> FUN_1003fba6) |
@@ -138,6 +139,7 @@ character that is a digit means a character id (`Identity{50000, strtoul}`); ano
 bare `/ignore` uses the current target. Then: nothing -> `Ignore_NoTargetOrNick`; type != 50000 ->
 `Ignore_CanOnlyIgnoreCharacters`; own id (`InputConfig_t+0xd4`) -> `Ignore_CantIgnoreYourself`; else toggle with
 `Ignore_IgnoringCharacter` / `Ignore_UnignoringCharacter` (name via `N3Msg_GetName`). `Ignore_ToManyArguments` is unreachable with argc 2.
+Both immediate target/id and resolved-name paths use `Chat::toggle_ignored`: update the local ignore set, Friends node state and visible list, then emit the category-10001 feedback. Regression `ignore_target_and_name_paths_refresh_friends_and_feedback` covers ignoring by id and unignoring through the resolved-name path.
 
 ### Usage lines
 
@@ -193,6 +195,9 @@ stored at `+0x20/+0x1c/+0x18/+0x28/+0x30`). **`param` = the window id** for text
 `ao_net::n3::textcmd::text_command(line, &TextState) -> TextResult` implements the table (byte-layout tests in the module); feedback keys are text.mdb
 **category 110** (`LDBface::GetTextPtr(0x6e, key)`; e.g. `Feedback_YouAreNotMemberOfTeam` = "You are not a member of a team!"), emitted through
 GlobalSignals+0x17c with colour code 0 (the window default; our `ChatKind::System` is a guess).
+
+`Chat::zone_action` reads actual replicated team membership and authoritative action `0x23` leadership from `Zone::target_team`; it must not hardcode either false or infer leadership from member order. Native `/team` gates are GC `100406df..100408d4`, TeamManager initialization/setter `100658b9` / `10065718`. Regression `team_loot_command_uses_replicated_membership_and_leadership` feeds membership and leadership packets through Zone before executing the real chat command path, checking that only a confirmed leader sends loot-order action `0x7f`.
+The `/team loot` response is action `0x91`: GC `1005ddda` passes `identity_b.instance` to `10065a9c`, which formats category-110 `Feedback_CurrentTeamLootOrder` and emits group 0 / color 0 (not the request's window parameter). Mode names are the native reverse `teamcmd` table (`10036a7d`, initialized by `100324d2`): 1 `team`, 2 `loot`, 3 `all`, 4 `leader`, 5 `alpha`; an unknown value prints `Missing teamcmd: %d`. These names are literal client strings, while the feedback template is localized. `chat/log.rs::action_lines` handles the response; synthetic regression `team_loot_response_uses_native_mode_and_default_routing` covers all modes, unknown values and routing.
 
 ### `/pet`, `/tower` — `PetCommandIIR_c` (key 6B333303)
 

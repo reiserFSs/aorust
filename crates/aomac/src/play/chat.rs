@@ -3,7 +3,7 @@
 //! performs what an input line asks for.
 
 mod cmd;
-mod dialog;
+pub(super) mod dialog;
 mod filter;
 pub(super) mod info;
 mod line;
@@ -497,6 +497,28 @@ impl Chat {
         match f.ptype {
             PT_SYSTEM => self.net.on_system_frame(f, zone.char_id),
             PT_N3 => {
+                if f.payload.get(..4) == Some(0x6458_2a07u32.to_be_bytes().as_slice()) {
+                    if let Ok(Some(packet)) = ao_net::n3::textcmd::org_info(&f.payload) {
+                        let playfields = if packet.areas.is_empty() { Default::default() } else {
+                            ao_formats::screens::pfnr_names(&ao_gui::client_dir()).unwrap_or_default()
+                        };
+                        let html = info::org_html(&packet, texts, &playfields);
+                        let out = self.info.show_url(gui, self.screen, &format!("text://{html}"), false);
+                        self.info_out(gui, out, zone, texts);
+                        return;
+                    }
+                    if let Ok(Some(request)) = ao_net::n3::textcmd::org_dialog(&f.payload) {
+                        let name = match &request {
+                            ao_net::n3::textcmd::OrgDialog::Promotion { identity } =>
+                                zone.dynels.get(&identity.instance).map(|d| d.name.as_str()),
+                            _ => None,
+                        };
+                        if let Some(spec) = dialog::org_spec(&request, name, texts) {
+                            self.dialogs.go(gui, self.screen, &spec);
+                        }
+                        return;
+                    }
+                }
                 let Ok(m) = n3::decode(f) else { return };
                 if let N3::Chat(c) = &m.body {
                     let ctx = zone::ZoneChatCtx {
@@ -562,6 +584,13 @@ impl Chat {
         self.log_events(gui, &[log::LogEvent::CastNano { who, nano_name }], zone, texts);
     }
 
+    /// GUI `HandlePrivateMessage` 0x10087c10: an unresolved (empty) sender name does not enter the reply history.
+    fn remember_reply_sender(&mut self, name: &str) {
+        if !name.is_empty() {
+            self.last_tell_from = Some(name.to_owned());
+        }
+    }
+
     /// Per frame: chat-server events into the windows, window fades.
     pub fn update(&mut self, gui: &mut Gui, dt: f32, texts: &TextDb) {
         self.pet_scripts.retain_mut(|s| match s.step(dt, self.own_id as i32) {
@@ -575,7 +604,7 @@ impl Chat {
             match o {
                 Out::Msg(m) => {
                     if m.tell && m.kind == 0 && m.from_id != self.own_id && (m.flags & 1 != 0 || !self.ignored.contains(&m.from_id)) {
-                        self.last_tell_from = Some(m.from_name.clone());
+                        self.remember_reply_sender(&m.from_name);
                         self.social_tell_in(gui, m.from_id, &m.from_name, &m.text, m.flags & 1 != 0, texts);
                         if let Some(message) = &self.afk {
                             let template = texts.by_key(10001, "ChatCmdFeedback_AFKReplyText").unwrap_or_default();
@@ -776,12 +805,19 @@ impl Chat {
     }
 
     /// `DialogBox_c` + `Go` + `MoveToCenter`.
-    fn dialog(&mut self, gui: &mut Gui, kind: dialog::Kind, body: String, buttons: Vec<String>, input: Option<String>) {
+    pub(super) fn dialog(&mut self, gui: &mut Gui, kind: dialog::Kind, body: String, buttons: Vec<String>, input: Option<String>) {
         self.dialogs.go(gui, self.screen, &dialog::Spec { kind, body, buttons, input });
     }
 
     /// What a decided dialog does: org leave / disband send `N3Msg_Org*Confirmed` on Yes (button 0); the AFK dialog is `FUN_100b6576`.
     fn answer(&mut self, gui: &mut Gui, a: dialog::Answer, zone: Option<&Zone>, texts: &TextDb) {
+        if let Some(z) = zone {
+            if let Some((code, identity)) = a.kind.org_answer(a.button, Self::target_identity(z)) {
+                let payload = ao_net::n3::textcmd::org_dialog_answer(z.char_id as i32, code, identity);
+                self.outbox.push(ao_net::n3::outgoing::n3_frame(0, z.char_id, payload));
+                return;
+            }
+        }
         match (a.kind, a.button) {
             (dialog::Kind::OrgLeave, 0) => self.outbox.extend(zone.map(|z| zonecmd::org_confirmed(z.char_id, true, Self::target_identity(z)))),
             (dialog::Kind::OrgDisband, 0) => self.outbox.extend(zone.map(|z| zonecmd::org_confirmed(z.char_id, false, Self::target_identity(z)))),
@@ -988,8 +1024,8 @@ impl Chat {
             target: Self::target_identity(zone),
             target_is_tower: false,
             gm: false,
-            in_team: false,
-            team_leader: false,
+            in_team: zone.target_team.in_team(),
+            team_leader: zone.target_team.is_leader(),
             stat_id: &|n| ao_formats::stats::id_of(n).map(|i| i as i32),
             anim_by_name: &|_| None,
             move_mode: 0,
@@ -1072,11 +1108,7 @@ impl Chat {
             match r {
                 zonecmd::Resolved::Chat(c) => self.net.send(c),
                 zonecmd::Resolved::Line(l) => self.line(gui, l),
-                zonecmd::Resolved::IgnoreToggle(i) => {
-                    if !self.ignored.remove(&i) {
-                        self.ignored.insert(i);
-                    }
-                }
+                zonecmd::Resolved::IgnoreToggle(i) => self.toggle_ignored(gui, i, name, texts),
             }
         }
     }
@@ -1142,8 +1174,9 @@ impl Chat {
                 self.afk = m;
             }
             ChatAction::IgnoreToggle { id, name } => {
-                let now = self.ignored.insert(id) || !self.ignored.remove(&id);
-                let _ = (now, name); // feedback text needs the TextDb: see IgnoreList; persistence is not ported
+                let name = name.or_else(|| zone.dynels.get(&(id as i32)).map(|d| d.name.clone()))
+                    .or_else(|| self.net.name_of(id).map(str::to_owned)).unwrap_or_default();
+                self.toggle_ignored(gui, id, &name, texts);
             }
             ChatAction::Social(id) => self.game.push(GameAction::Social(id)),
             ChatAction::DValue(t) => self.dvalue_cmds.push(t),
@@ -1204,6 +1237,79 @@ impl Chat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn organisation_server_frames_open_windows_and_route_answers() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        let texts = TextDb::load(&client).unwrap();
+        let mut chat = Chat::new(false);
+        let zone = Zone::new(42);
+        let actor = Identity { kind: 50000, instance: 41 };
+        let organisation = Identity { kind: 1, instance: 99 };
+        let packet = |code| {
+            let mut w = ao_net::Writer::default();
+            w.u32(0x6458_2a07);
+            Identity { kind: 50000, instance: 42 }.write(&mut w);
+            w.u8(0);
+            w.u8(code);
+            actor.write(&mut w);
+            organisation.write(&mut w);
+            w
+        };
+        for (code, button, expected) in [(5, 0, 15), (7, 1, 30)] {
+            let mut w = packet(code);
+            if code == 5 { w.str_i16("ExampleOrg"); }
+            w.u32(100);
+            chat.on_zone_frame(&mut gui, &ao_net::n3::outgoing::n3_frame(0, 42, w.0), &zone, &texts);
+            let window = chat.dialogs.windows().next().unwrap();
+            let (_, answer) = chat.dialogs.event(&mut gui, &Event::Clicked { window, view: format!("btn{button}"), item: None });
+            chat.answer(&mut gui, answer.unwrap(), Some(&zone), &texts);
+            assert_eq!(chat.take_outbox()[0].payload, ao_net::n3::textcmd::org_dialog_answer(42, expected, organisation));
+        }
+        let mut w = packet(2);
+        for field in ["Org", "History", "Objective", "Description", "Form", "Leader", "Rank"] { w.str_i16(field); }
+        w.u32(1009);
+        chat.on_zone_frame(&mut gui, &ao_net::n3::outgoing::n3_frame(0, 42, w.0), &zone, &texts);
+        assert!(chat.info.window().is_some());
+        assert!(chat.take_outbox().is_empty());
+    }
+
+    #[test]
+    fn team_loot_command_uses_replicated_membership_and_leadership() {
+        use ao_net::n3::{action, outgoing, team};
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        let texts = TextDb::load(&client).unwrap();
+        let mut chat = Chat::new(false);
+        let mut zone = Zone::new(42);
+        let own = Identity { kind: 50000, instance: 42 };
+        chat.zone_action(&mut gui, &ChatAction::ZoneCommand("team loot all".into()), &zone, &texts);
+        assert!(chat.outbox.is_empty());
+        let member = team::TeamMember { member: own, team: Identity { kind: team::TEAM_KIND, instance: 7 }, sub_team: 0, profession: 1, level: 3, name: "Aomacfixr".into() };
+        zone.on_frame(&outgoing::n3_frame(0, 42, team::team_member(own, &member)));
+        chat.zone_action(&mut gui, &ChatAction::ZoneCommand("team loot all".into()), &zone, &texts);
+        assert!(chat.outbox.is_empty(), "membership does not grant leader privileges");
+        zone.on_frame(&outgoing::n3_frame(0, 42, action::character_action(42, &action::simple(team::action::LEADER, own, Identity::default()))));
+        chat.zone_action(&mut gui, &ChatAction::ZoneCommand("team loot all".into()), &zone, &texts);
+        assert_eq!(chat.outbox.len(), 1, "authoritative leader can set loot order");
+        let (_, request) = action::parse_character_action(&chat.outbox[0].payload).unwrap();
+        assert_eq!(request.action, ao_net::n3::textcmd::action::TEAM_LOOT_SET);
+    }
+
+    #[test]
+    fn unresolved_tell_sender_preserves_reply_target() {
+        let mut c = Chat::new(false);
+        c.remember_reply_sender("");
+        assert!(c.last_tell_from.is_none());
+        c.remember_reply_sender("Bob");
+        c.remember_reply_sender("");
+        assert_eq!(c.last_tell_from.as_deref(), Some("Bob"));
+        c.remember_reply_sender("Alice");
+        assert_eq!(c.last_tell_from.as_deref(), Some("Alice"));
+    }
+
     #[test]
     fn auto_afk_three_minute_timer_and_indicator_pref_are_live() {
         let client = ao_gui::client_dir();

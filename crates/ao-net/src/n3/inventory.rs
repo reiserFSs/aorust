@@ -61,8 +61,12 @@ pub const KIND_BANK: i32 = 0x69;
 /// container's inventory. Built by `FUN_1007de99` [GC] (the list `N3Msg_GetContainerInventoryList` returns for a chest) and read back by `FUN_1004b80a`,
 /// `FUN_1004a7b3`, `FUN_10048829` (`instance >> 16` as signed short, `& 0xffff`).
 pub const KIND_IN_CONTAINER: i32 = 0x6b;
-/// An item in the character's trade / overflow inventory.
-pub const KIND_TRADE: i32 = 0x6e;
+/// An item offered in the character's player/shop trade inventory (GC 1004ad44).
+pub const KIND_TRADE: i32 = 0x6c;
+/// An organization contract inventory cell (GC10047cb6 builds {0x6d,index}).
+pub const KIND_CONTRACT: i32 = 0x6d;
+/// An item in the temporary overflow inventory (TemplateAction action 0x57).
+pub const KIND_OVERFLOW: i32 = 0x6e;
 
 /// The identity of the item in `slot` of the container whose last `InventoryUpdateIIR_t` carried `word` (`FUN_1007de99`).
 pub fn container_item_identity(word: i32, slot: u32) -> Identity {
@@ -184,11 +188,12 @@ pub fn split_item(char_id: i32, item: Identity, count: i32) -> Vec<u8> {
 }
 
 /// Body of `InventoryUpdateIIR_t` (`FUN_100a0310`): the contents of a container the server (re)sends. `capacity` (`+0x14` of the
-/// `NewInventory_t` made by `FUN_1002ae7b`) and `kind` (`+0x24`) are the first two words; the element list is the one of `FullCharacterIIR_t`.
+/// `NewInventory_t` made by `FUN_1002ae7b`) and `access` (`+0x24`) are the first two words; the element list is the one of `FullCharacterIIR_t`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryUpdate {
     pub capacity: i32,
-    pub kind: i32,
+    /// GC1004b80a: bit 1 permits withdrawal, bit 0 permits deposit.
+    pub access: i32,
     pub entries: Vec<InventoryEntry>,
     /// The container the list belongs to (`+0x1c`; a `Chest_t` or `SimpleChar_t` dynel).
     pub container: Identity,
@@ -239,6 +244,17 @@ pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<InventoryMsg>> {
             ensure!(r.remaining() == 0, "ReloadIIR_t: {} trailing bytes", r.remaining());
             Some(InventoryMsg::Reload { source, weapon, remaining, clip, remove_source })
         }
+        // OrgServerIIR_c code 1: GC 10126842 constructs NewInventory(30,
+        // second identity, type 3), reads its cells, then a one-byte bool.
+        0x6458_2a07 => {
+            if r.u8()? != 1 { return Ok(None); }
+            let _actor = Identity::read(r)?;
+            let container = Identity::read(r)?;
+            let entries = super::world::read_inventory(r)?;
+            let _flag = r.u8()? == 1;
+            ensure!(r.remaining() == 0, "Org contract inventory: {} trailing bytes", r.remaining());
+            Some(InventoryMsg::Update(InventoryUpdate { capacity: 30, access: 3, entries, container, word: 0, flag: true }))
+        }
         TEMPLATE_ACTION => {
             let (item, count) = read_acg_count(r)?;
             let (action, identity_a, identity_b) = (r.i32()?, Identity::read(r)?, Identity::read(r)?);
@@ -268,11 +284,11 @@ pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<InventoryMsg>> {
             Some(InventoryMsg::Updated(v))
         }
         INVENTORY_UPDATE => {
-            let (capacity, kind) = (r.i32()?, r.i32()?);
+            let (capacity, access) = (r.i32()?, r.i32()?);
             let entries = super::world::read_inventory(r)?;
             let (container, word, flag) = (Identity::read(r)?, r.i32()?, r.i32()? != 0);
             ensure!(r.remaining() == 0, "InventoryUpdateIIR_t: {} trailing bytes", r.remaining());
-            Some(InventoryMsg::Update(InventoryUpdate { capacity, kind, entries, container, word, flag }))
+            Some(InventoryMsg::Update(InventoryUpdate { capacity, access, entries, container, word, flag }))
         }
         _ => None,
     })
@@ -282,6 +298,15 @@ pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<InventoryMsg>> {
 mod tests {
     use super::*;
     use crate::n3::outgoing::message_key;
+
+    #[test]
+    fn org_contract_inventory_has_two_identities_and_a_byte_flag() {
+        let bytes = hex("64582a07 0000c350 00000007 01 01 0000c350 00000007 0000deaa 00000009 000003f1 01");
+        let Some(InventoryMsg::Update(update)) = parse(&bytes).unwrap() else { panic!() };
+        assert_eq!((update.container, update.capacity, update.access), (Identity { kind: 0xdeaa, instance: 9 }, 30, 3));
+        assert!(update.entries.is_empty() && update.flag);
+        for n in 14..bytes.len() { assert!(parse(&bytes[..n]).is_err()); }
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.split_whitespace().collect();
@@ -364,7 +389,7 @@ mod tests {
             item: AcgItem { low_id: 218395, high_id: 218395, level: 1 },
             count: 1,
             action: 0x57,
-            identity_a: Identity { kind: KIND_TRADE, instance: 0 },
+            identity_a: Identity { kind: KIND_OVERFLOW, instance: 0 },
             identity_b: Identity::default(),
         }));
         for n in 13..b.len() { assert!(parse(&b[..n]).is_err()); }
@@ -400,12 +425,12 @@ mod tests {
         );
         assert_eq!(parse(&hex("485e7202 0000c350 00006584 00 00000005")).unwrap(), Some(InventoryMsg::Updated(5)));
         assert!(parse(&hex("485e7202 0000c350 00006584 00 00000005")[..16]).is_err());
-        // InventoryUpdateIIR_t: capacity, kind, list (size word (n+1)*0x3f1: one element), container, word, flag
+        // InventoryUpdateIIR_t: capacity, access, list (size word (n+1)*0x3f1: one element), container, word, flag
         let b = hex(
             "4e536976 0000c750 00000001 00  00000015 00000002  000007e2  00000041 0001 0003 00000068 00000041  00000010 00000011 00000019 00000000  0000c750 00000001 00000007 00000001",
         );
         let Some(InventoryMsg::Update(u)) = parse(&b).unwrap() else { panic!() };
-        assert_eq!((u.capacity, u.kind, u.word, u.flag), (0x15, 2, 7, true));
+        assert_eq!((u.capacity, u.access, u.word, u.flag), (0x15, 2, 7, true));
         assert_eq!(u.container, Identity { kind: 0xc750, instance: 1 });
         assert_eq!(u.entries.len(), 1);
         assert_eq!((u.entries[0].slot, u.entries[0].item.low_id, u.entries[0].item.high_id), (0x41, 0x10, 0x11));

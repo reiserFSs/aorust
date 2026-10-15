@@ -36,7 +36,7 @@ impl Play {
 
     pub(super) fn interact_event(&mut self, e: &Event) -> bool {
         if let (Some(i), Some(hud)) = (self.interact.as_mut(), self.hud.as_ref()) { i.configure_escape(&hud.dvalues); }
-        self.interact.as_mut().is_some_and(|i| i.event(&mut self.gui, e, &self.zone))
+        self.interact.as_mut().is_some_and(|i| i.event(&mut self.gui, e, &mut self.zone))
     }
 
     /// Per frame: the frames the player's actions produced go to the zone server.
@@ -102,9 +102,20 @@ impl Play {
             }
         }
         self.interact_trade_frame();
+        // Containers claim their destinations before player trade drains the remaining foreign drops.
+        for frame in self.interact_bank_frame() {
+            if let Some(session) = &self.session { session.send_zone(frame); }
+        }
         self.interact_ptrade_frame();
         self.interact_shop_frame();
-        self.interact_bank_frame();
+        let notices = self.interact.as_mut().map(|i| std::mem::take(&mut i.use_ui.container_feedback)).unwrap_or_default();
+        for (category, key) in notices {
+            if let (Some(chat), Some(text)) = (self.chat.as_mut(), self.text.by_key(category, key)) {
+                // GUI100304df ->10030636 connects GlobalSignals+184 to1002f852.
+                let ok = self.text.by_key(10000, "MsgBox_OK").unwrap_or_default();
+                chat.dialog(&mut self.gui, super::chat::dialog::Kind::Information, text, vec![ok], None);
+            }
+        }
     }
 
     /// A plain left click that selected character `id`: the second one on the same dynel within [`ao_gui::DOUBLE_CLICK_TIME`] is a double click,
@@ -185,6 +196,35 @@ mod tests {
     use super::*;
     use ao_net::n3::inventory::{container_item_identity, InventoryUpdate};
     use ao_net::n3::world::{AcgItem, InventoryEntry};
+
+    #[test]
+    fn play_loot_access_refusal_opens_information_dialog_and_ok_sends_nothing() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut play = Play::new(dir, None, None, None).unwrap();
+        play.size = (1280, 800);
+        play.gui.set_screen_size(1280, 800);
+        let mut chat = super::super::chat::Chat::new(false);
+        chat.open(&mut play.gui, play.size, None).unwrap();
+        play.chat = Some(chat);
+        play.interact = Some(Interact::new(7, play.size));
+        let source = Identity { kind: 0xc76a, instance: 8 };
+        play.zone.apply_inventory(&ao_net::n3::inventory::InventoryMsg::Update(InventoryUpdate {
+            capacity: 21, access: 1, entries: vec![], container: source, word: 0x70, flag: false,
+        }));
+        let before = play.gui.window_ids();
+        play.interact.as_mut().unwrap().move_to_bag(&mut play.zone, container_item_identity(0x70, 0));
+        assert!(play.interact.as_mut().unwrap().take_outbox().is_empty());
+        play.interact_frame();
+        let window = play.gui.window_ids().into_iter().find(|w| !before.contains(w)).expect("native Information dialog");
+        assert_eq!(play.gui.text(window, "text"), "It is not possible to remove items from this inventory.");
+        assert_eq!(play.gui.button_label(window, "btn0"), Some(play.text.by_key(10000, "MsgBox_OK").unwrap().as_str()));
+        assert!(!play.gui.has_view(window, "progress_bar"), "not the login ProgressDialog");
+        assert!(play.chat.as_mut().unwrap().event(&mut play.gui,
+            &Event::Clicked { window, view: "btn0".into(), item: None }, &play.zone, &play.text));
+        assert!(!play.gui.window_ids().contains(&window));
+        assert!(play.interact.as_mut().unwrap().take_outbox().is_empty());
+    }
     #[test]
     fn mission_alternative_raw_shift_click_inspects_once_and_preserves_plain_double() {
         use ao_net::n3::{mission_selection::{Alternative, Alternatives}, quest::Quest};
@@ -218,7 +258,7 @@ mod tests {
                 ] {
                     play.interact_mouse(&ev, &host);
                     for event in play.gui.input(ev) {
-                        play.interact.as_mut().unwrap().event(&mut play.gui, &event, &play.zone);
+                        play.interact.as_mut().unwrap().event(&mut play.gui, &event, &mut play.zone);
                     }
                 }
                 let i = play.interact.as_mut().unwrap();
@@ -232,6 +272,33 @@ mod tests {
 
 
     #[test]
+    fn play_container_frame_claims_deposits_and_preserves_other_window_drops() {
+        use ao_net::n3::inventory;
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut play = Play::new(dir.clone(), None, None, None).unwrap();
+        play.size = (1280, 800);
+        play.gui.set_screen_size(1280, 800);
+        play.hud = Some(super::super::hud::Hud::new(&mut play.gui, &dir, play.size).unwrap());
+        play.interact = Some(Interact::new(play.zone.char_id, play.size));
+        for kind in [0xdead, 0xc749] {
+            let container = Identity { kind, instance: play.zone.char_id as i32 };
+            let update = InventoryUpdate { capacity: 21, access: 0, container, word: 0x70, flag: true, entries: vec![] };
+            let loot = &mut play.interact.as_mut().unwrap().use_ui.loot;
+            loot.update(&mut play.gui, None, play.size, container, "Container", &update, kind == 0xc749);
+            let window = loot.window_of(container).unwrap();
+            let rect = play.gui.view_rect(window, if kind == 0xdead { "scrollview" } else { "grid" }).unwrap();
+            let foreign = (0x41, -100.0, -100.0);
+            play.hud.as_mut().unwrap().requeue_item_drops(vec![(0x40, rect.l + 10.0, rect.t + 10.0), foreign]);
+            let requests = play.interact_bank_frame();
+            assert_eq!(requests.len(), 1, "production Play frame must claim bank/backpack drops before player trade drains them");
+            assert_eq!(requests[0].payload, inventory::container_add_item(play.zone.char_id as i32, container, inventory::item_identity(0x40)));
+            assert_eq!(play.hud.as_mut().unwrap().take_item_drops(), [foreign]);
+            play.interact.as_mut().unwrap().use_ui.loot.close_all(&mut play.gui);
+        }
+    }
+
+    #[test]
     fn shift_inspects_ctrl_keeps_container_activation_and_shop_quick() {
         let dir = ao_gui::client_dir();
         if !dir.join("cd_image/gui").exists() { return; }
@@ -241,7 +308,7 @@ mod tests {
         for kind in [0xdead, 0xc76a] {
             let container = Identity { kind, instance: 7 };
             let update = InventoryUpdate {
-                capacity: 21, kind: 0, container, word: 0x70, flag: true,
+                capacity: 21, access: 0, container, word: 0x70, flag: true,
                 entries: vec![InventoryEntry {
                     slot: 3, a: 0, b: 0, id: Identity::default(),
                     item: AcgItem { low_id: 1, high_id: 1, level: 1 },

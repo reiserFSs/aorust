@@ -446,7 +446,8 @@ impl Interact {
             trade::COMPLETE if who == me => self.shop_close(gui),
             // the server confirms an add / remove (`FUN_10066cf7` / `FUN_10066faf`, vending `FUN_10067109` / `FUN_100671e8`); `b` = the item
             trade::ADD_ITEM | trade::VENDING_ADD if who == me && t.b.kind != SHOP_ITEM && s.cash_shop => {
-                s.sold.push(super::interact_ptrade::Entry { item: t.b, acg: zone.inventory.get(&(t.b.instance as u32)).map(|e| e.item) });
+                let offered = zone.offered_item(t.b);
+                s.sold.push(super::interact_ptrade::Entry { item: offered.map_or(t.b, |e| e.id), acg: offered.or_else(|| zone.inventory.get(&(t.b.instance as u32))).map(|e| e.item) });
                 s.dirty = true;
             }
             trade::REMOVE_ITEM | trade::VENDING_REMOVE if who == me && t.b.kind != SHOP_ITEM && s.cash_shop => {
@@ -567,7 +568,7 @@ impl Interact {
                         }
                         "sold_items" if s.cash_shop => {
                             if let Some(e) = s.sold.get(id as usize) {
-                                if (inventory::BAG_FIRST..inventory::BAG_FIRST + inventory::BAG_SLOTS).any(|slot| !zone.inventory.contains_key(&slot) || s.sold.iter().any(|e| e.item.instance as u32 == slot)) {
+                                if zone.free_bag_slot().is_some() {
                                     out.push(trade::remove_item(me, me, e.item));
                                 } else {
                                     self.shop.feedback.push("Feedback_NoRoomInInventory");
@@ -588,7 +589,7 @@ impl Interact {
     }
 
 
-    pub(super) fn shop_drop(&mut self, gui: &Gui, zone: &super::zone::Zone, slot: u32, x: f32, y: f32) {
+    pub(super) fn shop_drop(&mut self, gui: &Gui, zone: &mut super::zone::Zone, slot: u32, x: f32, y: f32) {
         let Some(s) = self.shop.shop.as_ref().filter(|s| s.cash_shop) else { return };
         if !LISTS.iter().enumerate().any(|(n, view)| {
             let view = if s.configs[n].list.unwrap_or(false) { (*view).to_owned() } else { format!("{view}_grid_scroll") };
@@ -596,6 +597,10 @@ impl Interact {
         }) { return; }
         let item = inventory::item_identity(slot);
         if slot < inventory::BAG_FIRST || !zone.inventory.contains_key(&slot) || s.sold.iter().any(|e| e.item == item) { return; }
+        if let Some(error) = zone.trade_offer_error(slot, s.machine) {
+            self.shop.feedback.push(error);
+            return;
+        }
         self.send(trade::add_item(self.own_id(), item));
     }
 
@@ -767,7 +772,7 @@ impl Interact {
         self.shop.shop.as_ref().is_some_and(|s| index < s.stock.len()) && self.shop_double_click(gui, "shop_items", index, false)
     }
 
-    /// Shift + double click on stock item `index` (`TradeAddItem(own, {0x6f, index})`, the server then confirms it into the bought list).
+    /// Ctrl + double click on stock item `index` (`TradeAddItem(own, {0x6f, index})`, the server then confirms it into the bought list).
     pub fn shop_add(&mut self, gui: &mut Gui, index: usize, zone: &super::zone::Zone) -> bool {
         let Some(win) = self.shop.shop.as_ref().filter(|s| index < s.stock.len()).map(|s| s.win) else { return false };
         self.shop.quick = true;
@@ -933,7 +938,7 @@ mod tests {
         d.set_i64("esc_shops", 0);
         i.configure_escape(&d);
         let win = i.shop.shop.as_ref().unwrap().win;
-        i.event(&mut gui, &Event::Escape { window: win }, &z);
+        i.event(&mut gui, &Event::Escape { window: win }, &mut z);
         assert_eq!(sent(&mut i), [trade::abort(ME, true)]);
         i.close_all(&mut gui);
         i.on_frame(&mut gui, &server(ShopUpdate { items: items() }.encode(MACHINE)), &mut z);
@@ -942,9 +947,9 @@ mod tests {
         let win = i.shop.shop.as_ref().unwrap().win;
         d.set_i64("esc_shops", 1);
         i.configure_escape(&d);
-        i.event(&mut gui, &Event::Escape { window: win }, &z);
+        i.event(&mut gui, &Event::Escape { window: win }, &mut z);
         assert!(sent(&mut i).is_empty());
-        i.event(&mut gui, &Event::CloseRequested { window: win }, &z);
+        i.event(&mut gui, &Event::CloseRequested { window: win }, &mut z);
         assert_eq!(sent(&mut i), [trade::abort(ME, true)]);
     }
 
@@ -1007,7 +1012,7 @@ mod tests {
         // Original default is grid mode: the hidden native list has no live drop geometry.
         let r = gui.view_rect(win, "sold_items_grid_scroll").unwrap();
         assert!(r.r > r.l && r.b > r.t, "the active shop tray must retain its dock area: {r:?}");
-        i.ptrade_drops(&gui, &z, vec![(slot, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0)]);
+        i.ptrade_drops(&gui, &mut z, vec![(slot, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0)]);
         assert_eq!(sent(&mut i), [trade::add_item(ME, item)]);
         i.on_trade(&mut gui, Trade { op: trade::ADD_ITEM, a: ME, b: item }, ME, &z);
         assert_eq!(i.shop.shop.as_ref().unwrap().sold[0].acg, Some(items()[0]));
@@ -1098,8 +1103,8 @@ mod tests {
         assert!(i.shop_dump(&gui).contains("accept enabled: false"));
         assert!(i.shop_press(&mut gui, false));
         let win = i.shop.shop.as_ref().unwrap().win;
-        assert!(i.event(&mut gui, &Event::Escape { window: win }, &z));
-        assert!(i.event(&mut gui, &Event::CloseRequested { window: win }, &z));
+        assert!(i.event(&mut gui, &Event::Escape { window: win }, &mut z));
+        assert!(i.event(&mut gui, &Event::CloseRequested { window: win }, &mut z));
         assert_eq!(sent(&mut i), vec![trade::abort(ME, true); 3]);
         assert!(i.shop.shop.is_some(), "the window waits for the server's abort");
     }

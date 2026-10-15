@@ -78,6 +78,39 @@ pub fn quest_html(zone: &crate::play::zone::Zone, id: ao_net::msg::Identity, tex
     quest::html(zone,id,texts,Some(&store))
 }
 
+/// GC 0x10126c64..0x10126f50: organisation info is category-508 HTML sent to the existing InfoView.
+pub fn org_html(packet: &ao_net::n3::textcmd::OrgInfo, texts: &ao_formats::screens::TextDb, playfields: &std::collections::HashMap<u32, String>) -> String {
+    use super::log::{ldb_format, Arg};
+    let text = |key: &str, args: &[Arg]| ldb_format(&texts.by_key(508, key).unwrap_or_default(), args);
+    let mut html = text("OrgInfo", &[0, 5, 4, 1, 2, 3].map(|i| Arg::S(packet.fields[i].clone())));
+    if !packet.fields[6].is_empty() {
+        html += &text("OrgInfoRank", &[Arg::S(packet.fields[6].clone())]);
+    }
+    if !packet.areas.is_empty() {
+        html += &text("OrgInfoLC", &[Arg::N(packet.areas.len() as i32), Arg::N(5)]);
+        for area in &packet.areas {
+            let name = playfields.get(&(area.playfield as u32)).map(String::as_str).unwrap_or("ERROR: Unnamed playfield");
+            html += &text("LC_AreaInfo", &[Arg::S(name.to_owned()), Arg::S(area.name.clone()), Arg::S(org_site_label(area.site)), Arg::N(area.level)]);
+        }
+    }
+    html
+}
+
+/// Native Roman numeral helper GC 0x1012667a (values >=4000 use decimal).
+fn org_site_label(mut site: i32) -> String {
+    if !(0..4000).contains(&site) {
+        return site.to_string();
+    }
+    let mut label = String::new();
+    for (value, roman) in [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")] {
+        while site >= value {
+            label.push_str(roman);
+            site -= value;
+        }
+    }
+    label
+}
+
 /// `FUN_100eeedb`: `Point(_DAT_101b1840 = 400, _DAT_101b172c = 500)`, used as the client size (**GUESS**: the decompile only shows the
 /// constants returned; the window's creation rectangle is `Rect()` and the config archive `InfoViewConfig` is empty on a fresh install).
 const CLIENT: (u32, u32) = (400, 500);
@@ -447,6 +480,26 @@ impl InfoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn organisation_info_uses_native_html_and_infoview_history() {
+        use ao_net::n3::textcmd::{OrgArea, OrgInfo};
+        let Some((mut gui, mut info)) = rig() else { return };
+        let texts = ao_formats::screens::TextDb::load(&ao_gui::client_dir()).unwrap();
+        let packet = OrgInfo {
+            fields: ["ExampleOrg", "ExampleHistory", "ExampleObjective", "ExampleDescription", "ExampleForm", "ExampleLeader", "ExampleRank"].map(str::to_owned),
+            areas: vec![OrgArea { playfield: 540, identity: Default::default(), name: "ExampleArea".into(), level: 200, site: 4 }],
+        };
+        let html = org_html(&packet, &texts, &std::collections::HashMap::from([(540, "ExamplePF".into())]));
+        for text in ["ExampleOrg", "ExampleHistory", "ExampleObjective", "ExampleDescription", "ExampleForm", "ExampleLeader", "ExampleRank", "ExampleArea", "ExamplePF", "IV", "200"] {
+            assert!(html.contains(text), "{text} missing from {html}");
+        }
+        assert!(info.show_url(&mut gui, (1280, 800), &format!("text://{html}"), false).is_empty());
+        assert!(info.window().is_some());
+        assert_eq!(info.hist.e.last().unwrap().text, html);
+        for (site, label) in [(0, ""), (4, "IV"), (49, "XLIX"), (3999, "MMMCMXCIX"), (4000, "4000")] {
+            assert_eq!(org_site_label(site), label);
+        }
+    }
     #[test]
     fn info_escape_policy_is_captured_at_open() {
         let Some((mut gui, mut iv)) = rig() else { return };

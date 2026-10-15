@@ -497,14 +497,18 @@ pub fn load_player(store: &RecordStore, p: &Player, pose: Option<(Role, f32)>) -
 /// Body model id of a player type with `build` 0 / 1 / 2 = `_thin` / normal / `_fat` (`CCCharacter_t::ChangeMesh`,
 /// GUI 0x1011ab53: `<race>_<sex><suffix>.cir`).
 pub fn player_model_build(store: &RecordStore, breed: Breed, gender: Gender, build: u8) -> Result<u32> {
+    player_model_build_with_names(&NameTable::load(store)?, breed, gender, build)
+}
+
+/// Resolves the same body model against an already-loaded client name table.
+pub fn player_model_build_with_names(names: &NameTable, breed: Breed, gender: Gender, build: u8) -> Result<u32> {
     let suffix = match build {
         0 => "_thin",
         2 => "_fat",
         _ => "",
     };
     let name = format!("{}_{}{suffix}.cir", breed.model_race(), gender.name());
-    NameTable::load(store)?
-        .id(CHAR_MESH_TYPE, &name)
+    names.id(CHAR_MESH_TYPE, &name)
         .with_context(|| format!("no player model {name}: the client has no {breed:?} {gender:?}"))
 }
 

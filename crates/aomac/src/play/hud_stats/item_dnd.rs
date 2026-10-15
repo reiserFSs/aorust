@@ -79,8 +79,13 @@ pub fn default_wear(info: &Info) -> Option<(usize, u32)> {
 }
 
 /// `N3Msg_JoinItems` preconditions we can check: same template, both stackable (`Can & 0x200`) and the same quality level.
-pub fn can_join(a: &Info, b: &Info, same_template: bool, level_a: i32, level_b: i32) -> bool {
-    same_template && a.stat(STAT_CAN).unwrap_or(0) & 0x200 != 0 && b.stat(STAT_CAN).unwrap_or(0) & 0x200 != 0 && level_a == level_b
+pub fn can_join(can_a: i32, can_b: i32, same_template: bool, level_a: i32, level_b: i32) -> bool {
+    same_template && can_a & 0x200 != 0 && can_b & 0x200 != 0 && level_a == level_b
+}
+
+/// GC 1001bc8a: the count must leave at least one item, and Can bit 0x1000000 forbids splitting.
+pub fn can_split(can: i32, total: i32, count: i32) -> bool {
+    can & 0x1000000 == 0 && count > 0 && count < total
 }
 
 /// What a finished drag asks for.
@@ -90,6 +95,8 @@ pub enum Action {
     Move { item: Identity, slot: i32 },
     /// `CharacterActionIIR_t` `0x35`: stack `from` onto `onto`.
     Join { from: Identity, onto: Identity },
+    /// `CharacterActionIIR_t` `0x34`: split off `count` units.
+    Split { item: Identity, count: i32 },
     /// Only the client side grid changes.
     MoveCell { from: (usize, usize), to: (usize, usize) },
     /// `DropTemplateIIR_t` at the player's position.
@@ -166,11 +173,22 @@ pub struct Dnd {
     pub dropped: Vec<(u32, f32, f32)>,
     /// The world object under the pointer when the button went up (`InputConfig_t+0xb0`, set by `Play::interact_mouse`); `None` = the ground.
     pub world_under: Option<Identity>,
+    /// GUI 10040f22/100412a0: Ctrl-left horizontal count selection before starting a split drag.
+    pub split: Option<Split>,
+    pub pointer_warp: Option<(f32, f32)>,
 }
 
 pub struct Drag {
     pub slot: u32,
     pub ghost: WindowId,
+    pub count: i32,
+}
+
+pub struct Split {
+    pub place: Place,
+    pub anchor: (f32, f32),
+    pub count: i32,
+    pub popup: Option<WindowId>,
 }
 
 /// Double click time (`GUIColors`/input config value not located: UNRESOLVED, the usual 0.4 s).
@@ -211,11 +229,17 @@ mod tests {
 
     #[test]
     fn join_needs_stackable_same_level() {
-        let s = info(&[(STAT_CAN, 0x200)]);
-        assert!(can_join(&s, &s, true, 5, 5));
-        assert!(!can_join(&s, &s, true, 5, 6));
-        assert!(!can_join(&s, &s, false, 5, 5));
-        assert!(!can_join(&s, &info(&[]), true, 5, 5));
+        assert!(can_join(0x200, 0x200, true, 5, 5));
+        assert!(!can_join(0x200, 0x200, true, 5, 6));
+        assert!(!can_join(0x200, 0x200, false, 5, 5));
+        assert!(!can_join(0x200, 0, true, 5, 5));
+    }
+
+    #[test]
+    fn split_count_must_leave_one_and_respect_cannot_split() {
+        assert!(can_split(0x200, 10, 4));
+        for count in [-1, 0, 10, 11] { assert!(!can_split(0x200, 10, count)); }
+        assert!(!can_split(0x1000200, 10, 4));
     }
 
     /// `N3Msg_MoveItemToInventory`'s `FUN_100474a9`/`FUN_1004aed0`: weapon/armor/implant wear sums the moved item's `EquipDelay` with the

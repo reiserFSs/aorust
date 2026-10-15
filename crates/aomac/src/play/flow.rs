@@ -1182,6 +1182,7 @@ impl Frontend for Play {
         tests::InputTiming::mark(&mut input_timing, 4);
         if let Some(h) = self.hud.as_mut() {
             h.input(&mut self.gui, &mut self.zone, self.player.as_ref(), &ev, host.mods);
+            host.pointer_warp = h.take_pointer_warp();
             // CTRL / ALT + left click on a character: select (done) and `N3Msg_SwitchTarget` (`FUN_1002c469`)
             let clicked = h.take_click();
             if let (Some(id), Some(p)) = (clicked, self.player.as_ref()) {

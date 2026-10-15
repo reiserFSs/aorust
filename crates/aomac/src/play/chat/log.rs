@@ -1173,6 +1173,19 @@ fn action_lines(ctx: &LogCtx, who: Identity, action: i32, param: i32, a: Identit
                 tail = Some(ldb_format(&ctx.fb("Feedback_IncreasedNanoPool"), &[n(b.instance)]));
             }
         }
+        // GC 1005ddda -> 10065a9c: reply to `/team loot`; the reverse teamcmd table (10036a7d) supplies literal mode names,
+        // while Feedback_CurrentTeamLootOrder is localized. The reply always uses group/color 0, not the request's param.
+        0x91 => {
+            let mode = match b.instance {
+                1 => "team".into(),
+                2 => "loot".into(),
+                3 => "all".into(),
+                4 => "leader".into(),
+                5 => "alpha".into(),
+                mode => format!("Missing teamcmd: {mode}"),
+            };
+            direct(0, 0, ldb_format(&ctx.fb("Feedback_CurrentTeamLootOrder"), &[s(mode)]), out);
+        }
         0x9b => {
             if let Some(d) = a_dyn {
                 direct(param, 12, ldb_format(&ctx.fb("Feedback_YouHaveBeenDetected"), &[s(ctx.nm(d))]), out);
@@ -1299,6 +1312,35 @@ mod tests {
         assert_eq!(ldb_format("100%% %02d|%-3d|", &[n(7), n(5)]), "100% 07|5 |");
         assert_eq!(ldb_format("%u", &[n(-1)]), "4294967295");
         assert_eq!(ldb_format("%s", &[n(3)]), "int_value<3>");
+    }
+
+    #[test]
+    fn team_loot_response_uses_native_mode_and_default_routing() {
+        let filter = ChatFilter::default();
+        let ctx = LogCtx {
+            own: id(1),
+            name: &|who| (who.kind == 50000).then(|| "Member".into()),
+            text: &|cat, key| (cat == 110 && key == elf_hash("Feedback_CurrentTeamLootOrder")).then(|| "Loot order: %s".into()),
+            is_npc: &|_| false,
+            is_own_pet: &|_| false,
+            nano_name: &|_| None,
+            stat: &|_, _| None,
+            weapon: &|_, _, _| None,
+            filter: &filter,
+        };
+        for (mode, name) in [(1, "team"), (2, "loot"), (3, "all"), (4, "leader"), (5, "alpha"), (0, "Missing teamcmd: 0"), (-1, "Missing teamcmd: -1")] {
+            let m = Message {
+                header: ao_net::n3::N3Header { msg_type: ao_net::n3::world::CHARACTER_ACTION, target: id(2), flag: 0 },
+                sender: 1,
+                body: N3::World(World::CharacterAction(ao_net::n3::world::CharacterAction {
+                    action: 0x91, param: 123, identity_a: id(99), identity_b: Identity { kind: 777, instance: mode }, text: String::new(),
+                })),
+            };
+            let lines = classify(&from_n3(&m).unwrap(), &ctx);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].class, 0);
+            assert_eq!(lines[0].line.text, format!("Loot order: {name}"));
+        }
     }
 
     #[test]

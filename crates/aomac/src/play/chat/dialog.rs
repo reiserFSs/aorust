@@ -8,10 +8,20 @@ use ao_gui::{Event, Gui, WindowId, WindowSize};
 pub enum Kind {
     /// `/messagebox` (`FUN_100b7a6f`): one OK button, nothing happens afterwards.
     MessageBox,
+    /// GlobalSignals+0x184 -> GuiSystem_c::ShowMessageBox (GUI100304df/1002f852).
+    Information,
     /// `/org leave` (`OrganizationGUIModule_c::LeaveOrg` 0x10052568): Yes (0) -> `LeaveOrgConfirmed` 0x10052032.
     OrgLeave,
     /// `/org disband` (`OpenDisbandDialog` 0x100520dd): Yes (0) -> `DisbandDialogClosed` 0x10051ffc.
     OrgDisband,
+    /// GUI 0x10052978 / 0x1005204d: only Yes accepts the server's organisation invitation.
+    OrgInvitation(ao_net::msg::Identity),
+    /// GUI 0x100526e6 / 0x100520a4: promotion confirmation keeps the dialog's identity.
+    OrgPromotion(ao_net::msg::Identity),
+    /// GUI 0x1005221d / 0x10052076: both Yes and No/Escape send a tax answer.
+    OrgLeavePayTax(ao_net::msg::Identity),
+    /// GUI 0x100523d1 / 0x10052017: only Yes leaves following a tax change.
+    OrgTaxChangeLeave,
     /// Bare `/afk` (`FUN_10082a6f`): OK / Enter / the 30 s timeout (0) with the typed text, Esc (-1).
     Afk,
     /// `/bug` (`FlowControlModule_t::SetBugReportStringMessage` 0x1002aa28, dialog "BugReport"): OK (0) sends the report.
@@ -22,6 +32,20 @@ pub enum Kind {
     DuelSent,
     /// "StartPvP" dialog of `GuiSystem_c::StartPvPFightDialogue` (GUI 0x1002fa8e, action 0x7b): Yes (0) -> `N3Msg_StartPvP(target)` (the dialog's identity).
     StartPvp(ao_net::msg::Identity),
+}
+
+impl Kind {
+    /// GUI org callbacks 0x10052017..0x100520a4; No/Escape is a negative payment answer, not silence.
+    pub fn org_answer(self, button: i32, target: ao_net::msg::Identity) -> Option<(u8, ao_net::msg::Identity)> {
+        use ao_net::n3::textcmd::org;
+        match self {
+            Self::OrgInvitation(identity) if button == 0 => Some((0x0f, identity)),
+            Self::OrgPromotion(identity) if button == 0 => Some((org::PROMOTE, identity)),
+            Self::OrgLeavePayTax(identity) => Some((if button == 0 { 0x1d } else { 0x1e }, identity)),
+            Self::OrgTaxChangeLeave if button == 0 => Some((org::LEAVE_CONFIRMED, target)),
+            _ => None,
+        }
+    }
 }
 
 /// A decided dialog.
@@ -41,6 +65,32 @@ pub struct Spec {
     pub buttons: Vec<String>,
     /// AFK dialog: the prefilled input text.
     pub input: Option<String>,
+}
+
+/// The original organisation module uses ordinary `DialogBox_c` views, not an organisation roster.
+pub fn org_spec(request: &ao_net::n3::textcmd::OrgDialog, name: Option<&str>, texts: &ao_formats::screens::TextDb) -> Option<Spec> {
+    use ao_net::n3::textcmd::OrgDialog;
+    use super::log::{ldb_format, Arg};
+    let nonzero = |id: &ao_net::msg::Identity| id.kind != 0 || id.instance != 0;
+    let (kind, category, key, args) = match request {
+        // 0x10052b59 passes the original Org_Invite formatter to DialogBox_c; the tax suffix built at
+        // 0x10052a29..0x10052ad2 is not passed to the dialog in this client.
+        OrgDialog::Invitation { identity, name, .. } if nonzero(identity) =>
+            (Kind::OrgInvitation(*identity), 501, "Org_Invite", vec![Arg::S(name.clone())]),
+        OrgDialog::LeavePayTax { identity, tax } if nonzero(identity) && (1..1_000_000_000).contains(tax) =>
+            (Kind::OrgLeavePayTax(*identity), 501, "Org_LeaveAskPayTax", vec![Arg::N(*tax as i32)]),
+        OrgDialog::TaxChangeLeave { tax } if (1..1_000_000_000).contains(tax) =>
+            (Kind::OrgTaxChangeLeave, 501, "Org_TaxChangedAskLeave", vec![Arg::N(*tax as i32)]),
+        OrgDialog::Promotion { identity } =>
+            (Kind::OrgPromotion(*identity), 501, "ConfirmPromotion", vec![Arg::S(name?.to_owned())]),
+        _ => return None,
+    };
+    Some(Spec {
+        kind,
+        body: ldb_format(&texts.by_key(category, key).unwrap_or_default(), &args),
+        buttons: ["MsgBox_Yes", "MsgBox_No"].iter().map(|key| texts.by_key(10000, key).unwrap_or_default()).collect(),
+        input: None,
+    })
 }
 
 struct Open {
@@ -96,7 +146,7 @@ fn xml(spec: &Spec) -> String {
     match spec.kind {
         // (the bug report is a `DialogBox_c` with the text and two buttons, 0x1002aa28)
         // `DialogBoxView_c` 0x1012aa23: text borders (15, 5, 15, 20) = `_DAT_101b00e0 / _DAT_101a8b98 / _DAT_101b00e0 / _DAT_101b4e08`
-        Kind::MessageBox | Kind::OrgLeave | Kind::OrgDisband | Kind::BugReport | Kind::DuelReceived | Kind::DuelSent | Kind::StartPvp(_) => {
+        Kind::Information | Kind::MessageBox | Kind::OrgLeave | Kind::OrgDisband | Kind::OrgInvitation(_) | Kind::OrgPromotion(_) | Kind::OrgLeavePayTax(_) | Kind::OrgTaxChangeLeave | Kind::BugReport | Kind::DuelReceived | Kind::DuelSent | Kind::StartPvp(_) => {
             format!("<root><View view_layout=\"vertical\">{}{}</View></root>", text("text", "Rect(15,5,15,20)"), button_row(&spec.buttons))
         }
         // `FUN_10082a6f`: form borders (15, 10, 15, 15) (`_DAT_101b00e0 / _DAT_101a98e4`), body bottom border 10, countdown, input
@@ -143,7 +193,8 @@ impl Dialogs {
 
     /// `DialogBox_c::Go` + `Window::MoveToCenter`.
     pub fn go(&mut self, gui: &mut Gui, screen: (u32, u32), spec: &Spec) {
-        let Ok(win) = gui.open_framed_window_xml("DialogBox", &xml(spec), (0, 0), WindowSize::Preferred) else { return };
+        let name = if spec.kind == Kind::Information { "Information" } else { "DialogBox" };
+        let Ok(win) = gui.open_framed_window_xml(name, &xml(spec), (0, 0), WindowSize::Preferred) else { return };
         gui.set_text(win, "text", &spec.body);
         if let Some(i) = &spec.input {
             gui.set_text(win, "input", i);
@@ -205,6 +256,51 @@ impl Dialogs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn organisation_answers_preserve_identity_and_payment_decline() {
+        let id = ao_net::msg::Identity { kind: 50000, instance: 41 };
+        let target = ao_net::msg::Identity { kind: 50000, instance: 77 };
+        for (kind, code) in [(Kind::OrgInvitation(id), 15), (Kind::OrgPromotion(id), 10)] {
+            assert_eq!(kind.org_answer(0, target), Some((code, id)));
+            assert_eq!(kind.org_answer(1, target), None);
+            assert_eq!(kind.org_answer(-1, target), None);
+        }
+        assert_eq!(Kind::OrgTaxChangeLeave.org_answer(0, target), Some((16, target)));
+        assert_eq!(Kind::OrgTaxChangeLeave.org_answer(-1, target), None);
+        for button in [0, 1, -1] {
+            assert_eq!(Kind::OrgLeavePayTax(id).org_answer(button, target), Some((if button == 0 { 29 } else { 30 }, id)));
+        }
+    }
+
+    #[test]
+    fn organisation_requests_use_native_text_and_existing_dialog_view() {
+        use ao_net::n3::textcmd::OrgDialog;
+        let Some(mut gui) = rig() else { return };
+        let texts = ao_formats::screens::TextDb::load(&ao_gui::client_dir()).unwrap();
+        let id = ao_net::msg::Identity { kind: 50000, instance: 41 };
+        let mut dialogs = Dialogs::default();
+        for (request, key, name) in [
+            (OrgDialog::Invitation { identity: id, name: "Test Org".into(), tax: 100 }, "Org_Invite", None),
+            (OrgDialog::LeavePayTax { identity: id, tax: 100 }, "Org_LeaveAskPayTax", None),
+            (OrgDialog::TaxChangeLeave { tax: 100 }, "Org_TaxChangedAskLeave", None),
+            (OrgDialog::Promotion { identity: id }, "ConfirmPromotion", Some("Testy")),
+        ] {
+            let spec = org_spec(&request, name, &texts).unwrap();
+            assert!(!spec.body.is_empty(), "{key}");
+            assert_eq!(spec.buttons, ["MsgBox_Yes", "MsgBox_No"].map(|key| texts.by_key(10000, key).unwrap()));
+            dialogs.go(&mut gui, (1280, 800), &spec);
+            let win = dialogs.open.last().unwrap().win;
+            assert_eq!(gui.text(win, "text"), spec.body);
+            let (_, answer) = dialogs.event(&mut gui, &Event::Clicked { window: win, view: "btn0".into(), item: None });
+            assert_eq!(answer.unwrap().kind, spec.kind);
+        }
+        assert!(org_spec(&OrgDialog::Promotion { identity: id }, None, &texts).is_none());
+        for tax in [0, 1_000_000_000, u32::MAX] {
+            assert!(org_spec(&OrgDialog::TaxChangeLeave { tax }, None, &texts).is_none());
+        }
+        assert!(org_spec(&OrgDialog::Invitation { identity: Default::default(), name: "Invalid".into(), tax: 0 }, None, &texts).is_none());
+    }
 
     fn rig() -> Option<Gui> {
         let client = ao_gui::client_dir();

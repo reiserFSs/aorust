@@ -752,7 +752,7 @@ impl Play {
         self.cc_update_finish(c);
     }
 
-    /// `NameScene_t::Message(text)`: the text goes to global signal 0x184 (receiver UNRESOLVED), here a notice box; the
+    /// `NameScene_t::Message(text)`: global signal 0x184 -> GuiSystem_c::ShowMessageBox (GUI100304df/10030636/1002f852), here a notice box; the
     /// name scene falls back to state 0 and the error sound plays. The original also asks for `SM_Sandy_CC_Name` /
     /// `SM_Sandy_CC_Nick`, but no sound bank defines them (`GetSoundPointer` → 0, `PlaySample(0)` returns; docs/screens.md
     /// §12), so those callers pass `None` — silence is the faithful result.

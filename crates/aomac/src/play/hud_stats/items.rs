@@ -36,10 +36,15 @@ impl Info {
 /// A shop item's name, count, Value and icon.
 pub type ShopInfo = (String, i32, i32, Option<GfxId>);
 
+struct ShopItem {
+    template: ao_formats::dynel_visual::ItemTemplate,
+    icon: Option<Option<GfxId>>,
+}
+
 pub struct Items {
     store: Option<RecordStore>,
     cache: HashMap<i32, Option<Info>>,
-    shop_cache: HashMap<(i32, i32, i32), Option<ShopInfo>>,
+    shop_cache: HashMap<(i32, i32, i32), Option<ShopItem>>,
 }
 
 impl Items {
@@ -69,33 +74,58 @@ impl Items {
         self.cache[&low_id].as_ref()
     }
 
-    /// ACG-resolved shop name/count/Value; malformed endpoint templates never fall back to low QL.
+    fn cache_acg(&mut self, item: ao_net::n3::world::AcgItem) -> anyhow::Result<()> {
+        let key = (item.low_id, item.high_id, item.level);
+        if self.shop_cache.contains_key(&key) { return Ok(()); }
+        let template = (|| -> anyhow::Result<_> {
+            let Some(store) = self.store.as_ref() else { return Ok(None) };
+            let Some(low) = item_template(store, u32::try_from(item.low_id)?)? else { return Ok(None) };
+            let high = if item.high_id == item.low_id { None } else { item_template(store, u32::try_from(item.high_id)?)? };
+            if item.high_id != item.low_id && high.is_none() { return Ok(None); }
+            let template = ao_formats::dynel_visual::interpolate_item_templates(&low, high.as_ref().unwrap_or(&low), item.level)?;
+            Ok(Some(ShopItem { template, icon: None }))
+        })()?;
+        self.shop_cache.insert(key, template);
+        Ok(())
+    }
+
+    pub(super) fn acg_stat(&mut self, item: ao_net::n3::world::AcgItem, stat: u32) -> anyhow::Result<Option<i32>> {
+        self.cache_acg(item)?;
+        Ok(self.shop_cache.get(&(item.low_id, item.high_id, item.level)).and_then(|v| v.as_ref()).and_then(|v| v.template.stat(stat)))
+    }
+
+    /// ACG-resolved shop name/count/Value, sharing the owned-item stat cache.
     pub fn shop_info(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> Option<ShopInfo> {
         let key = (item.low_id, item.high_id, item.level);
-        if !self.shop_cache.contains_key(&key) {
-            let result = (|| -> anyhow::Result<Option<ShopInfo>> {
-                let Some(store) = self.store.as_ref() else { return Ok(None) };
-                let Some(low) = item_template(store, u32::try_from(item.low_id)?)? else { return Ok(None) };
-                let high = if item.high_id == item.low_id { None } else {
-                    let Some(high) = item_template(store, u32::try_from(item.high_id)?)? else { return Ok(None) };
-                    Some(high)
-                };
-                let t = ao_formats::dynel_visual::interpolate_item_templates(&low, high.as_ref().unwrap_or(&low), item.level)?;
-                let icon = t.stat(STAT_ICON).filter(|&id| id > 0).and_then(|id| icon_image(gui, store, id as u32)).map(|(id, _, _)| id);
-                Ok(Some((t.name.clone().unwrap_or_default(), t.stat(STAT_COUNT).filter(|&c| c > 0).unwrap_or(1), t.stat(0x4a).unwrap_or(0), icon)))
-            })();
-            let info = match result {
-                Ok(info) => info,
-                Err(e) => { eprintln!("shop: invalid ACG {item:?}: {e:#}"); None }
-            };
-            self.shop_cache.insert(key, info);
+        if let Err(error) = self.cache_acg(item) {
+            eprintln!("shop: invalid ACG {item:?}: {error:#}");
+            self.shop_cache.insert(key, None);
+            return None;
         }
-        self.shop_cache[&key].clone()
+        let cached = self.shop_cache.get_mut(&key)?.as_mut()?;
+        let t = &cached.template;
+        let icon = *cached.icon.get_or_insert_with(|| {
+            t.stat(STAT_ICON).filter(|&id| id > 0).and_then(|id| icon_image(gui, self.store.as_ref()?, id as u32)).map(|(id, _, _)| id)
+        });
+        Some((t.name.clone().unwrap_or_default(), t.stat(STAT_COUNT).filter(|&c| c > 0).unwrap_or(1), t.stat(0x4a).unwrap_or(0), icon))
     }
 
     /// The record of an item that [`Items::info`] already loaded.
     pub fn cached(&self, low_id: i32) -> Option<&Info> {
         self.cache.get(&low_id)?.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_test_info(&mut self, id: i32, info: Info) {
+        self.cache.insert(id, Some(info));
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_test_acg(&mut self, item: ao_net::n3::world::AcgItem, stats: &[(u32, i32)]) {
+        self.shop_cache.insert((item.low_id, item.high_id, item.level), Some(ShopItem {
+            template: ao_formats::dynel_visual::ItemTemplate { kind: 0, name: None, sounds: vec![], stats: stats.to_vec() },
+            icon: Some(None),
+        }));
     }
 
     /// Canvas items of one item picture whose slot cell has its top-left corner at `(x, y)` (the 48 px picture sits 3 px inside the 54 px slot).
@@ -141,6 +171,20 @@ pub const BAG_SLOTS: u32 = 30;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acg_stat_cache_keeps_quality_and_high_endpoint_separate() {
+        let mut items = Items { store: None, cache: HashMap::new(), shop_cache: HashMap::new() };
+        let low = ao_net::n3::world::AcgItem { low_id: 1, high_id: 2, level: 4 };
+        let high = ao_net::n3::world::AcgItem { level: 5, ..low };
+        items.insert_test_info(1, Info { name: String::new(), icon: None, stats: vec![(30, 0)] });
+        items.insert_test_acg(low, &[(30, 0x200), (0, 0)]);
+        items.insert_test_acg(high, &[(30, 0x1000200), (0, 0x4000000)]);
+        assert_eq!(items.acg_stat(low, 30).unwrap(), Some(0x200));
+        assert_eq!(items.acg_stat(high, 30).unwrap(), Some(0x1000200));
+        assert_eq!(items.acg_stat(high, 0).unwrap(), Some(0x4000000));
+        assert_eq!(items.acg_stat(ao_net::n3::world::AcgItem { high_id: 3, ..high }, 30).unwrap(), None);
+    }
 
     #[test]
     fn wear_slots_follow_the_cell_tables() {

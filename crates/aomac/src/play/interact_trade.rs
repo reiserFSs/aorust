@@ -681,7 +681,7 @@ mod tests {
             let mut evs = gui.input(InputEvent::MouseDown { x: r.l + 5.0, y: r.t + 5.0, button });
             evs.extend(gui.input(InputEvent::MouseUp { x: r.l + 5.0, y: r.t + 5.0, button }));
             for e in evs {
-                i.event(&mut gui, &e, &z);
+                i.event(&mut gui, &e, &mut z);
             }
             let _ = win;
         }
@@ -723,7 +723,7 @@ mod tests {
         let mut i = open(&mut gui, &mut z, true, true);
         feed(&mut i, &mut gui, &mut z, Knubot::StartTrade { npc: NPC, value: 1, text: "x".into() });
         let win = i.chat.as_ref().unwrap().win;
-        assert!(i.event(&mut gui, &Event::CloseRequested { window: win }, &z));
+        assert!(i.event(&mut gui, &Event::CloseRequested { window: win }, &mut z));
         assert_eq!(sent(&mut i), vec![Knubot::Close { npc: NPC, value: 0, text: String::new() }]);
         assert!(i.chat.is_none() && i.trade.win.is_none());
     }

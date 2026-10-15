@@ -19,8 +19,13 @@ fn fixture(t:&ItemTemplate)->bool {t.stat(30).is_some_and(|v|v!=MISSING&&v&1!=0)
 fn runtime_quality(zone:&Zone,id:Identity,item:AcgItem,inventory:bool)->Option<i32> {zone.world.stat_of(id.kind,id.instance,701).or_else(||(id.kind==0xc788 || inventory).then_some(item.level))}
 
 fn inventory_item(zone:&Zone,id:Identity,container:Identity)->Option<(AcgItem,i32)> {
-    if let Some(e)=zone.inventory.get(&(id.instance as u32)).filter(|e|inv::item_identity(e.slot)==id || e.id==id && id!=Identity::default()) { return Some((e.item,i32::from(e.b))); }
-    zone.containers.iter().filter(|((kind,instance),_)|container==Identity::default() || container==Identity{kind:*kind,instance:*instance}).find_map(|(_, (word,entries))|entries.iter().find(|e|inv::container_item_identity(*word,e.slot)==id || e.id==id && id!=Identity::default()).map(|e|(e.item,i32::from(e.b))))
+    if let Some(e)=zone.inventory.get(&(id.instance as u32)).filter(|e|inv::item_identity(e.slot)==id || e.id==id && id!=Identity::default()) { return Some((e.item,i32::from(e.b as u16))); }
+    if let Some(e)=zone.offered_item(id) { return Some((e.item,i32::from(e.b as u16))); }
+    if id.kind==inv::KIND_CONTRACT {
+        return zone.containers.iter().filter(|((kind,instance),_)|*kind==0xdeaa && (container==Identity::default() || container==Identity{kind:*kind,instance:*instance}))
+            .find_map(|(_,(_,entries))|entries.iter().find(|e|e.slot as i32==id.instance).map(|e|(e.item,i32::from(e.b as u16))));
+    }
+    zone.containers.iter().filter(|((kind,instance),_)|container==Identity::default() || container==Identity{kind:*kind,instance:*instance}).find_map(|(_, (word,entries))|entries.iter().find(|e|inv::container_item_identity(*word,e.slot)==id || e.id==id && id!=Identity::default()).map(|e|(e.item,i32::from(e.b as u16))))
 }
 
 pub(super) fn html(zone:&Zone,request:&ItemRequest,texts:&TextDb)->Result<Option<String>> {
@@ -267,6 +272,16 @@ fn modifiers(out:&mut String,low:&[u8],high:&[u8],ql:i32,nano:bool,zone:&Zone,st
 mod tests {
     use super::*;
     #[test]
+    fn organisation_contract_info_resolves_native_slot_identity() {
+        let mut zone=Zone::new(7);
+        let container=Identity{kind:0xdeaa,instance:7};
+        let item=AcgItem{low_id:1,high_id:2,level:3};
+        zone.containers.insert((container.kind,container.instance),(0,vec![ao_net::n3::world::InventoryEntry{slot:4,a:0,b:1,id:Identity::default(),item}]));
+        assert_eq!(inventory_item(&zone,Identity{kind:inv::KIND_CONTRACT,instance:4},container),Some((item,1)));
+        assert!(inventory_item(&zone,Identity{kind:inv::KIND_CONTRACT,instance:4},Identity{kind:0xdeaa,instance:8}).is_none());
+    }
+
+    #[test]
     fn title_and_description_keep_retail_html_and_literal_line_breaks() {
         let texts=TextDb::parse(b"MMDB\0\0\0\0".to_vec()).unwrap();
         let mut template=ItemTemplate{kind:0xc73d,stats:vec![(688,2)],name:None,sounds:vec![]};
@@ -293,5 +308,25 @@ mod tests {
             assert_eq!(runtime_quality(&zone,Identity{kind:0xc788,instance:0},item,false),Some(level));
             assert_eq!(runtime_quality(&zone,inv::item_identity(0x16),item,true),Some(level));
         }
+    }
+    #[test]
+    fn offered_item_info_survives_inventory_removal() {
+        use ao_net::n3::trade::{self, Trade};
+        let mut zone=Zone::new(7);
+        let own=Identity{kind:0xc350,instance:7};
+        let partner=Identity{kind:0xc350,instance:8};
+        let id=inv::item_identity(0x40);
+        let offered=Identity{kind:inv::KIND_TRADE,instance:0};
+        let item=AcgItem{low_id:1,high_id:2,level:3};
+        zone.inventory.insert(0x40,ao_net::n3::world::InventoryEntry{slot:0x40,a:0,b:50_000u16 as i16,id:Identity::default(),item});
+        zone.apply_trade(&Trade{op:trade::START,a:partner,b:Identity::default()},own);
+        zone.apply_trade(&Trade{op:trade::ADD_ITEM,a:own,b:id},own);
+        assert!(!zone.inventory.contains_key(&0x40));
+        assert_eq!(inventory_item(&zone,id,Identity::default()),Some((item,50_000)));
+        assert_eq!(inventory_item(&zone,offered,Identity::default()),Some((item,50_000)));
+        zone.apply_trade(&Trade{op:trade::ABORT,a:Identity::default(),b:Identity::default()},own);
+        assert!(zone.offered_item(id).is_none());
+        assert!(inventory_item(&zone,offered,Identity::default()).is_none());
+        assert_eq!(inventory_item(&zone,id,Identity::default()),Some((item,50_000)));
     }
 }

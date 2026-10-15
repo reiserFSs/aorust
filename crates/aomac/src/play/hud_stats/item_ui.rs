@@ -23,6 +23,10 @@ const CMD_USE_ITEM_ON_CHARACTER: i32 = 0x20;
 const STAT_DECK: u32 = 0x2d;
 
 impl HudStats {
+    /// Native count selector `100412a0`: logical window coordinates, same units as MouseMove.
+    pub(in crate::play) fn take_pointer_warp(&mut self) -> Option<(f32, f32)> {
+        self.dnd.pointer_warp.take()
+    }
     pub(in crate::play) fn take_info_urls(&mut self) -> Vec<String> {
         std::mem::take(&mut self.info_urls)
     }
@@ -111,13 +115,43 @@ impl HudStats {
         })
     }
 
+    /// Container withdrawals use the inventory view, never an obscured window or wear page.
+    pub(in crate::play) fn container_bag_drop(&self, gui: &Gui, x: f32, y: f32) -> bool {
+        matches!(self.place_at_window(gui, x, y, gui.pointer_owner(x, y)), Some(Place::Bag { .. }))
+            && self.inventory.as_ref().is_some_and(|i| gui.pointer_owner(x, y) == Some(i.window))
+    }
+
     /// Raw pointer events (`Hud::input`): press on an item, drag, drop.
+    pub(super) fn cancel_item_drag(&mut self, gui: &mut Gui) {
+        if let Some(split) = self.dnd.split.take() {
+            if let Some(w) = split.popup { gui.close_window(w); }
+        }
+        if let Some(drag) = self.dnd.drag.take() { gui.close_window(drag.ghost); }
+        self.dnd.press = None;
+        self.dnd.hover = None;
+        self.item_hold = None;
+        self.dnd.pointer_warp = None;
+    }
+
     pub(in crate::play) fn input(&mut self, gui: &mut Gui, zone: &Zone, ev: &InputEvent, mods: ao_gui::Modifiers) {
         match *ev {
+            InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, .. } => self.cancel_item_drag(gui),
             InputEvent::MouseDown { x, y, .. } if !gui.pointer_owner(x, y).is_some_and(|owner|
                 self.wear.as_ref().is_some_and(|w| w.window == owner)
                     || self.inventory.as_ref().is_some_and(|i| i.window == owner)) => {}
             InputEvent::MouseDown { x, y, button: MouseButton::Left } => {
+                if mods.ctrl && self.dnd.drag.is_none() {
+                    if let Some(place) = self.place_at_window(gui, x, y, gui.pointer_owner(x, y)) {
+                        if self.slot_of(place).and_then(|s| zone.inventory.get(&s)).is_some_and(|e| (e.b as u16) > 1) {
+                            self.dnd.press = None;
+                            self.item_hold = None;
+                            self.dnd.last_click = None;
+                            self.info_click = true;
+                            self.dnd.split = Some(dnd::Split { place, anchor: (x, y), count: 1, popup: None });
+                            return;
+                        }
+                    }
+                }
                 // GUI 10040a17: information uses qualifier mask 3 (Shift), not Ctrl.
                 self.info_click = mods.shift;
                 if self.info_click {
@@ -148,6 +182,22 @@ impl HudStats {
             }
             InputEvent::MouseMove { x, y } => {
                 self.item_mouse = (x, y);
+                if let Some(split) = &mut self.dnd.split {
+                    let total = match split.place {
+                        Place::Bag { cell } => self.inventory.as_ref().and_then(|i| i.positions.at(cell)),
+                        Place::Wear { slot, .. } => Some(slot),
+                    }.and_then(|s| zone.inventory.get(&s)).map_or(1, |e| i32::from(e.b as u16));
+                    split.count = (split.count + (x - split.anchor.0).trunc() as i32).clamp(1, (total - 1).max(1));
+                    if (x, y) != split.anchor { self.dnd.pointer_warp = Some(split.anchor); }
+                    if split.popup.is_none() {
+                        split.popup = gui.open_window_xml("ItemSplitCount", "<root><TextView name=\"count\"/></root>", (split.anchor.0 as i32, split.anchor.1 as i32), WindowSize::Preferred).ok();
+                    }
+                    if let Some(w) = split.popup {
+                        gui.set_text(w, "count", &format!("<font color=yellow>{}</font>", split.count));
+                        gui.relayout_window(w);
+                    }
+                    return;
+                }
                 if let Some((ghost, slot)) = self.dnd.drag.as_ref().map(|d| (d.ghost, d.slot)) {
                     gui.set_window_pos(ghost, (x as i32 - GHOST as i32 / 2, y as i32 - GHOST as i32 / 2));
                     self.dnd.hover = self.place_at(gui, x, y).map(|p| (p, self.drop_action(zone, slot, p).is_some()));
@@ -156,6 +206,14 @@ impl HudStats {
                         self.begin_drag(gui, zone, p, x, y);
                     }
                 }
+            }
+            InputEvent::MouseUp { x, y, button: MouseButton::Left } if self.dnd.split.is_some() => {
+                let split = self.dnd.split.take().expect("matched above");
+                self.dnd.pointer_warp = None;
+                if let Some(w) = split.popup { gui.close_window(w); }
+                self.begin_drag(gui, zone, split.place, x, y);
+                if let Some(drag) = &mut self.dnd.drag { drag.count = split.count; }
+                self.item_button = MouseButton::Left;
             }
             InputEvent::MouseUp { x, y, button } if button == self.item_button => {
                 let pressed = self.dnd.press.take();
@@ -169,6 +227,26 @@ impl HudStats {
                     gui.close_window(d.ghost);
                     self.dnd.hover = None;
                     let dest = self.place_at(gui, x, y);
+                    if d.count > 0 {
+                        if let Some(Place::Bag { cell }) = dest {
+                            let Some(inventory) = self.inventory.as_ref() else { return };
+                            let empty = inventory.list || inventory.positions.at(cell).is_none();
+                            let dest = (!inventory.list).then_some(Place::Bag { cell });
+                            if empty && zone.free_bag_slot().is_some() {
+                                if let Some(e) = zone.inventory.get(&d.slot) {
+                                    let can = match self.items.acg_stat(e.item, dnd::STAT_CAN) {
+                                        Ok(Some(can)) => can,
+                                        Ok(None) => return,
+                                        Err(error) => { eprintln!("split item: {error:#}"); return; }
+                                    };
+                                    if dnd::can_split(can, i32::from(e.b as u16), d.count) {
+                                        self.run(zone, Action::Split { item: inv::item_identity(d.slot), count: d.count }, dest);
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
                     if self.equipment_locked && (d.slot < inv::BAG_FIRST || matches!(dest, Some(Place::Wear { .. }))) {
                         self.equipment_feedback = true;
                         return;
@@ -229,11 +307,11 @@ impl HudStats {
         }
         self.dnd.press = None;
         self.item_hold = None;
-        self.dnd.drag = Some(Drag { slot, ghost });
+        self.dnd.drag = Some(Drag { slot, ghost, count: 0 });
     }
 
     /// What dropping the item of inventory slot `slot` on `dest` asks for; `None` = refused (the drop is cancelled).
-    pub(super) fn drop_action(&self, zone: &Zone, slot: u32, dest: Place) -> Option<Action> {
+    pub(super) fn drop_action(&mut self, zone: &Zone, slot: u32, dest: Place) -> Option<Action> {
         if self.equipment_locked && (slot < inv::BAG_FIRST || matches!(dest, Place::Wear { .. })) {
             return None;
         }
@@ -261,9 +339,10 @@ impl HudStats {
                 match inventory.positions.at(cell) {
                     Some(t) => {
                         let te = zone.inventory.get(&t)?;
-                        let (a, b) = (self.items.cached(te.item.low_id)?, self.items.cached(e.item.low_id)?);
+                        let a = self.items.acg_stat(te.item, dnd::STAT_CAN).map_err(|error| eprintln!("join item: {error:#}")).ok().flatten()?;
+                        let b = self.items.acg_stat(e.item, dnd::STAT_CAN).map_err(|error| eprintln!("join item: {error:#}")).ok().flatten()?;
                         let same = te.item.low_id == e.item.low_id && te.item.high_id == e.item.high_id;
-                        if dnd::can_join(a, b, same, te.item.level, e.item.level) {
+                        if dnd::can_join(a, b, same, te.item.level, e.item.level) && u32::from(te.b as u16) + u32::from(e.b as u16) <= 50_000 {
                             Some(Action::Join { from: item, onto: inv::item_identity(t) })
                         } else {
                             Some(Action::MoveCell { from, to: cell })
@@ -309,6 +388,12 @@ impl HudStats {
                 inv::move_item_to_inventory(char_id, item, slot)
             }
             Action::Join { from, onto } => inv::join_items(char_id, onto, from),
+            Action::Split { item, count } => {
+                if let (Some(Place::Bag { cell }), Some(i)) = (dest, self.inventory.as_mut()) {
+                    i.pending_drop = Some(cell);
+                }
+                inv::split_item(char_id, item, count)
+            }
             Action::MoveCell { from, to } => {
                 if let Some(i) = self.inventory.as_mut() {
                     i.positions.move_cell(from, to);
@@ -499,5 +584,61 @@ mod upload_tests {
         assert!(zone.nanos.programs.is_empty(), "sending use must not fake a successful upload");
         stats.activate_item(&zone, 0x41);
         assert!(stats.take_outbox().is_empty(), "missing item cannot be activated");
+    }
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+    use ao_net::n3::world::{AcgItem, InventoryEntry};
+
+    #[test]
+    fn ctrl_horizontal_selection_splits_then_drag_rejoins_on_server_reply() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = HudStats::new(&dir, (800, 600)).unwrap();
+        let mut zone = Zone::new(7);
+        hud.items.insert_test_info(1, items::Info { name: "Stack".into(), icon: None, stats: vec![(dnd::STAT_CAN, 0x200)] });
+        zone.inventory.insert(0x40, InventoryEntry { slot: 0x40, a: 1, b: 10, id: inv::item_identity(0x40), item: AcgItem { low_id: 1, high_id: 1, level: 5 } });
+        hud.items.insert_test_acg(zone.inventory[&0x40].item, &[(dnd::STAT_CAN, 0x200)]);
+        hud.open_inventory(&mut gui).unwrap();
+        hud.update_inventory(&mut gui, &zone);
+        let (x, y) = hud.item_screen_pos(&gui, 0x40).unwrap();
+        let ctrl = ao_gui::Modifiers { ctrl: true, ..Default::default() };
+        hud.input(&mut gui, &zone, &InputEvent::MouseDown { x, y, button: MouseButton::Left }, ctrl);
+        hud.input(&mut gui, &zone, &InputEvent::MouseMove { x: x + 3.0, y }, ctrl);
+        let selection = hud.dnd.split.as_ref().unwrap();
+        assert_eq!(selection.count, 4);
+        assert!(gui.text(selection.popup.unwrap(), "count").contains('4'));
+        let mut host = ao_render::Host::headless();
+        host.pointer_warp = hud.take_pointer_warp();
+        assert_eq!(host.pointer_warp.take(), Some((x, y)));
+        assert_eq!(host.pointer_warp.take(), None, "Host consumes the warp exactly once");
+        hud.input(&mut gui, &zone, &InputEvent::MouseMove { x, y }, ctrl);
+        assert_eq!(hud.dnd.split.as_ref().unwrap().count, 4, "the native warp event contributes no count");
+        assert_eq!(hud.take_pointer_warp(), None, "a synthesized warp must not queue another warp");
+        hud.input(&mut gui, &zone, &InputEvent::MouseUp { x: x + 3.0, y, button: MouseButton::Left }, ctrl);
+        assert_eq!(hud.dnd.drag.as_ref().unwrap().count, 4);
+        assert!(hud.take_outbox().is_empty(), "selecting a count only starts the carried drag");
+        let inventory = hud.inventory.as_ref().unwrap();
+        let grid = gui.view_rect(inventory.window, "grid").unwrap();
+        let (dx, dy) = inv_grid::cell_origin(1, 0, inventory.gap);
+        let (tx, ty) = (grid.l + dx + 10.0, grid.t + dy + 10.0);
+        hud.input(&mut gui, &zone, &InputEvent::MouseUp { x: tx, y: ty, button: MouseButton::Left }, Default::default());
+        assert_eq!(hud.take_outbox(), vec![n3_frame(0, 7, inv::split_item(7, inv::item_identity(0x40), 4))]);
+        assert_eq!(zone.inventory[&0x40].b, 10, "UI never fabricates the reply");
+        zone.on_frame(&n3_frame(0, 7, inv::split_item(7, inv::item_identity(0x40), 4)));
+        assert_eq!((zone.inventory[&0x40].b, zone.inventory[&0x41].b), (6, 4));
+        hud.update_inventory(&mut gui, &zone);
+        let cell = hud.inventory.as_ref().unwrap().positions.get(0x40).unwrap();
+        let action = hud.drop_action(&zone, 0x41, Place::Bag { cell }).unwrap();
+        assert_eq!(action, Action::Join { from: inv::item_identity(0x41), onto: inv::item_identity(0x40) });
+        hud.run(&zone, action, Some(Place::Bag { cell }));
+        assert_eq!(hud.take_outbox(), vec![n3_frame(0, 7, inv::join_items(7, inv::item_identity(0x40), inv::item_identity(0x41)))]);
+        assert_eq!(zone.inventory.len(), 2);
+        zone.on_frame(&n3_frame(0, 7, inv::join_items(7, inv::item_identity(0x40), inv::item_identity(0x41))));
+        assert_eq!(zone.inventory[&0x40].b, 10);
+        assert!(!zone.inventory.contains_key(&0x41));
     }
 }

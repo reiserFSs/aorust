@@ -210,6 +210,17 @@ impl Chat {
         hit
     }
 
+    /// `/ignore` target/id and resolved-name paths share the native toggle, feedback and Friends refresh (GUI 100ba9fc).
+    pub(super) fn toggle_ignored(&mut self, gui: &mut Gui, id: u32, name: &str, texts: &TextDb) {
+        let on = !self.ignored.remove(&id);
+        if on { self.ignored.insert(id); }
+        self.social.set_ignored(id, on, name);
+        self.refresh_friends(gui, texts);
+        let key = if on { "ChatCmdFeedback_Ignore_IgnoringCharacter" } else { "ChatCmdFeedback_Ignore_UnignoringCharacter" };
+        let text = texts.by_key(10001, key).unwrap_or_default().replacen("%s", name, 1);
+        self.line(gui, super::zonecmd::info_line(&text));
+    }
+
     fn social_req(&mut self, gui: &mut Gui, r: Req, zone: &Zone, texts: &TextDb) {
         match r {
             Req::OpenTell { id: 0, name } => self.open_tell_named(gui, &name, texts),
@@ -258,9 +269,12 @@ impl Chat {
                 let c = self.social.lft.set(on, &description);
                 self.net.send(c);
             }
-            Req::LftInvite { name, .. } => {
-                // `N3Msg_TeamJoinRequest(id, false)` then "JoinTeamRequestSentTo" + name (GUESS: sent through the `/team invite` text command)
-                self.run_line(gui, &format!("/team invite {name}"), zone, texts);
+            Req::LftInvite { id, name } => {
+                if zone.target_team.in_team() && !zone.target_team.is_leader() { return; }
+                if zone.dynels.get(&(id as i32)).is_some_and(|d| d.npc) { return; }
+                // GUI 100eff95 sends TeamJoinRequest directly, never the unrelated `/team loot` text parser.
+                let payload = ao_net::n3::team::team_join_request(zone.char_id as i32, ao_net::msg::Identity { kind: 50000, instance: id as i32 }, false);
+                self.outbox.push(ao_net::n3::outgoing::n3_frame(0, zone.char_id, payload));
                 let head = texts.by_key(100, "JoinTeamRequestSentTo").unwrap_or_default();
                 self.line(gui, ChatLine::new(ChatKind::System, format!("{head}{name}")));
             }
@@ -273,6 +287,41 @@ mod tests {
     use super::*;
     use crate::play::chat::net::Out;
     use ao_gui::{InputEvent, MouseButton};
+
+    #[test]
+    fn ignore_target_and_name_paths_refresh_friends_and_feedback() {
+        let Some((mut gui, db, mut c)) = rig() else { return };
+        c.win = None;
+        let zone = Zone::new(1);
+        c.perform(&mut gui, super::super::cmd::ChatAction::IgnoreToggle { id: 5, name: Some("Bob".into()) }, &zone, &db);
+        assert!(c.ignored.contains(&5));
+        assert_eq!(c.social.nodes[&5].state, 3);
+        let expected = db.by_key(10001, "ChatCmdFeedback_Ignore_IgnoringCharacter").unwrap().replacen("%s", "Bob", 1);
+        assert!(c.pending_log_lines().any(|l| l.text.contains(&expected)));
+        c.name_op(&mut gui, super::super::zonecmd::NameOp::Ignore, 5, "Bob", &db);
+        assert!(!c.ignored.contains(&5));
+        assert_ne!(c.social.nodes[&5].state, 3);
+        let expected = db.by_key(10001, "ChatCmdFeedback_Ignore_UnignoringCharacter").unwrap().replacen("%s", "Bob", 1);
+        assert!(c.pending_log_lines().any(|l| l.text.contains(&expected)));
+    }
+
+    #[test]
+    fn lft_invite_sends_join_request_and_requires_team_leader() {
+        let Some((mut gui, db, mut c)) = rig() else { return };
+        let mut zone = Zone::new(1);
+        let invite = || Req::LftInvite { id: 5, name: "Bob".into() };
+        c.social_req(&mut gui, invite(), &zone, &db);
+        let frames = c.take_outbox();
+        assert_eq!(frames.len(), 1);
+        let who = ao_net::msg::Identity { kind: 50000, instance: 5 };
+        assert_eq!(frames[0].payload, ao_net::n3::team::team_join_request(1, who, false));
+        zone.target_team.team = Some(ao_net::msg::Identity { kind: 0xdea9, instance: 9 });
+        c.social_req(&mut gui, invite(), &zone, &db);
+        assert!(c.take_outbox().is_empty());
+        zone.target_team.leader = Some(zone.target_team.own);
+        c.social_req(&mut gui, invite(), &zone, &db);
+        assert_eq!(c.take_outbox().len(), 1);
+    }
 
     fn rig() -> Option<(Gui, TextDb, Chat)> {
         let client = ao_gui::client_dir();

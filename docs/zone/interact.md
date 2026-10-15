@@ -495,6 +495,78 @@ The preference and ownership are stored when opening; later updates do not re-ar
 Backpack titles resolve the actual carried item's archive name. Regression `real_backpack_archive_opens_owned_view_and_snapshots_escape` decodes installed `1000020:99228` (Small Backpack) and real captured loot contents,
 then checks use-in-place, close/reopen, Esc snapshot and loss of ownership after removal. It is an archive/protocol regression, not a captured live backpack session.
 
+**Container move sweep (2026-10-15, headless RE only):** `interact_bank_frame`
+now dispatches carried-item drops into owned backpack views as well as banks.
+Container canvases retain the full `{0x6b, signed word << 16 | slot}` (or bank
+`{0x69, slot}`) through a dragged icon and release; withdrawals target the own
+inventory, backpack-to-backpack and backpack-to-bank drops use
+`ClientContainerAddItemIIR_t`. Bank-to-backpack is refused by GUI `100cbc21`'s
+foreign-bank-container check. Only the topmost visible destination receives a drop.
+Confirmed deposits follow GC `1004ad44`: chest targets `1004abe5`, chest-to-chest
+`10048678`, bank targets `100492fa`; each chooses the first free destination slot
+(21 chest / 102 bank) rather than the requested wire slot. A full or unknown
+destination leaves the source untouched. Open views refresh from authoritative
+container lists after confirmations, not optimistic removal.
+New regressions `backpack_deposit_targets_owned_view_and_drag_keeps_identity`
+and `confirmed_backpack_moves_use_first_free_slot_and_preserve_full_sources`
+cover identity retention, owned destination gating, cross-container/bank moves
+and full-destination retention. Added, **not run** by this worker.
+The production frame dispatches containers before player trade, whose terminal
+foreign-drop drain otherwise discarded all bank/backpack deposits. Regression
+`play_container_frame_claims_deposits_and_preserves_other_window_drops` exercises
+the Play frame path, compares the outgoing deposit payload, and checks that
+unclaimed drops remain queued for subsequent windows; it was added, not run.
+
+**Loot-rights metadata and feedback (2026-10-15, offline native trace):**
+`InventoryUpdateIIR_t`'s second i32 is **access**, not an inventory type.
+GC `100a0310` passes it as constructor `1002ae7b`'s fourth argument, stored
+at `NewInventory_t+0x24`; activation `100a040e` copies that mask into the
+existing chest inventory, including refreshes with open flag zero.
+`Zone::container_access` retains it. `container_move_error` follows
+`1004ba86` (source `&2`) before `1004bb9e` (destination `&1`).
+Denied requests never reach the socket: both loot activation and all bank/
+backpack drag paths share the preflight. Exact category **10003** keys:
+`Inv_SrcCantRemove` (`1015e348`) = “It is not possible to remove items from this inventory.”
+and `Inv_DstCantAdd` (`1015e338`) = “It is not possible to add items to this inventory.”
+Installed `text.mdb` ELF hashes/string offsets are respectively
+`035e0ad5/42de2` and `0cc63824/43144`. Native emits `GlobalSignals+0x184`;
+GUI `GuiSystem_c` constructor `100304d1` gets GlobalSignals, then `100304d9`
+pushes `ShowMessageBox` (`1002f852`), and `100304df` passes `instance+0x184`
+to `10030636`. That helper creates the one-string `SlotObjconst1` and calls
+`SignalBase::_Connect`. `ShowMessageBox` constructs the centered **Information**
+`DialogBox_c` with category10000 `MsgBox_OK`. The port reuses the existing
+chat/dialog subsystem's `Information` kind, not chat output or `ProgressDialog`.
+`play_loot_access_refusal_opens_information_dialog_and_ok_sends_nothing`
+covers the actual Play refusal drain, exact localized body/button, normal
+dialog OK closure and absent outgoing move. Added, not run.
+
+Do **not** confuse these with category110 `Feedback_NotAllowedToLoot`
+(`1004bc6a`, “You're not allowed to loot these remains!”) or
+`Feedback_YouCantLootNoDropItems` (`1004bd6d`, “You can't loot NoDrop items!”).
+The first checks entry allocation `1002a596`: blocked byte `+0x24`, then
+owner identity `+0x1c/+0x20`. Constructor `10029fec` initializes all three
+to zero; **every** incoming inventory transfer `1002aeca` calls `1002a0c6`,
+which resets those fields to zero/false. Allocation setter `1002a551`
+has no references in the analyzed Gamecode image. Thus an ordinary decoded
+inventory update has native unrestricted per-entry allocation, not invented
+team ownership. The second feedback is **reclaim kind0x6a only**
+(`1004bd32`), with foreign reclaim owner and item flag `0x4000000`,
+unless effective Flags `0x40` is set. It is not a corpse-kind0x6b denial.
+The separate Flags0x40 movement refusal (`1004bd23`) is
+`Feedback_ItemCanOnlyResideInYourMainInventory`, exempting operation0x70
+and requiring the source-owner state for chest-kind0x6b.
+
+Synthetic regression
+`synthetic_loot_access_update_preserves_native_source_then_destination_refusals`
+feeds real encoded/decoded updates, signed-word container resolution,
+zero-open-flag rights changes, and both ordered refusal keys. GUI regression
+`full_bag_loot_gui_requests_native_eligible_stack_merge_only` covers the shared
+withdrawal path's native eligible-stack/full-bag decision. Added, **not run**.
+No live session, build/test execution, or retail screenshot comparison was
+performed; PRK maintenance prohibits login attempts. Team allocation and
+foreign reclaim NoDrop live acceptance still require corresponding server data.
+
+
 **[UNRESOLVED]:** (a) the order / flag of the live server's answer is now captured (one `InventoryUpdateIIR_t`, flag 1, word 0x70); (b) the window title
 (`String::Format` of `FUN_100cc2ca` was not read; the saved window position `container_position` / `container_id` and `TempContainer_%u.xml` are not stored); (c) the original's
 list / grid mode switch (`InventoryViewMode`) and the scrollbar of the container view; (d) chest (0xC749) items use the same `Chest_t` path (`FUN_1007de99`, kind 0x6b) but were never captured; (e) team loot (`Feedback_TeamLoot*`, "Random Looter" / "Looter" columns of
@@ -535,7 +607,7 @@ decompile hides): **not ported** [UNRESOLVED].
 ### 10.2 Default action
 
 `N3Msg_DefaultActionOnDynel` [GC 0x100291da] dispatches to player trade for a living non-dialogue character without the NPC use flag, subject to the **target's** idle fight controller (§3). The fight state is `Zone::fight_target` (relayed `AttackIIR_t` / `StopFightIIR_t`).
-`N3Msg_TradeStart` also checks TowerType and range (§10.1). Per-character skills are retained by `Zone::character_stats` / `stat_of` from `SimpleCharFullUpdateIIR_t` and `StatIIR_t`; full updates supply NPC `TowerType`. The bounding sphere radius of characters is still unresolved: the existing range check uses [GUESS] 0.5 m each, permitting centres 6.0 m apart. `Feedback_TargetOutsideRangeForTrade` goes to the chat.
+`N3Msg_TradeStart` also checks TowerType and range (§10.1). Per-character skills are retained by `Zone::character_stats` / `stat_of` from `SimpleCharFullUpdateIIR_t` and `StatIIR_t`; full updates supply NPC `TowerType`. Character range now uses **MeshMeta** rather than the old guessed 0.5 m collision spheres: N3 `SetCatMesh` **10019fb2** selects resource type **1000047** (static `SetMesh` **10019e8f** selects 1000046); `UpdateMeshMeta` **10019629** caches its centre/radius, clearing both to zero if the record is absent. The 28-byte resource's first 16 bytes are little-endian `f32 centre xyz, radius` (docs/formats.md). N3 **10019b51** returns cached radius × body scale, and **10019b69** uses `(worldX, worldY + centreY × scale, worldZ)` (X/Z offset constant **1003cb08** = 0). The port queries the character's selected body model metadata through the existing Dynels store/name table even before its render model is ready, uses live remote position, and compares `(centre_distance - own_radius) - target_radius <= 5`. Absent character/resource-store prerequisites do not invent replacement geometry; malformed metadata reports an error and sends no trade. `Feedback_TargetOutsideRangeForTrade` goes to the chat. Regressions `trade_sphere_uses_meshmeta_and_body_scale_not_pose_bounds` and `default_action_starts_a_trade_only_within_range_and_target_outside_fights` cover metadata/scale and the request gate; neither was run in this headless sweep. Native parent-dynel substitution and the dungeon door test remain unported.
 
 ### 10.3 The window (`TradeView_c`, GUI.dll 0x100e092f; `PlayerTrade` of `Views/TradeGUI.xml`)
 
@@ -544,6 +616,9 @@ decompile hides): **not ported** [UNRESOLVED].
 (`_DAT_101bfa98/9c`), docked into `RollupArea` (`FUN_10038c98`). Built from the XML: `PartnerName` (`ScrollingTextView`, text = the partner's name), "Bought Items" (the partner's items), `PartnerInventoryDock`,
 "Credits" + `PartnerCashView` (read-only, "0", green `0x44dd44`), "Sold Items", `OurInventoryDock`, "Credits" + `OurCashView` (editable, green), `AcceptButton`, `DeclineButton`, `PartnerStatusDock`
 (a `BitmapView_c` with gfx `0x15b` `GFX_GUI_RED_LIGHT` and `0xd9` `GFX_GUI_GREEN_LIGHT`: index 0 / 1). The docks hold `MultiListView_c`s (`FUN_100cdb3a`), view cell counts `(1, 1)..(1000, ..)`, vertical scrollbar.
+
+The frame hook registers player trade through the same `Hud::register_transient_dock` path as Shop: empty view identity, initial RollupArea placement, no persisted trade page, and header close forwarded to the trade owner's abort handler. `player_trade_docks_transiently_and_header_close_declines` covers the real PlayerTrade window.
+`FUN_100e039a` sets the own editor's feature flag `0x2000` (`tvf::NUMERIC`); PTrade now sets that flag rather than filtering TextChanged payloads. `cash_edits_are_sent_once_after_the_delay` feeds editor input containing a non-digit and retains the delayed wire assertion.
 
 | signal | slot | effect |
 |---|---|---|
@@ -568,10 +643,10 @@ template read from the inventory when the server adds them; the status light; fo
   `a` = the partner; the partner's cash with the partner as header. Not seen live yet (no second account); if the server uses other headers, only `Interact::on_trade` changes.
 * [UNRESOLVED] How the partner's item templates reach the client: op 5 carries only an item identity of the *partner's* bag. We show the template when an `InventoryUpdateIIR_t` with the partner's identity
   arrives ([INFERENCE], `Interact::ptrade_inventory`), else an empty slot.
-* [UNRESOLVED] Op 4 (complete): the original moves the traded items between the inventories itself; we leave `Zone::inventory` to the server's own inventory messages.
-* [UNRESOLVED] Docking: the window is free (left of the rollup column, 192 px wide = the dock's width) instead of a `RollupArea` page; its close button declines. List geometry (3 columns of 54 px slots, `(1,1)..(1000,..)` cell counts
-  not mapped), the "Credits" label colour (the engine's `TextView` default), the 1 s timer unit (µs [INFERENCE]), digits-only cash field (feature flag `0x2000` of `FUN_100e039a` not decoded), `Feedback_*`
-  refusals of `N3Msg_TradeAddItem`, item info page, `TowerType` of the target and the characters' sphere radii.
+* **Inventory completion is ported**, not delegated to later server bag updates. Rechecked GC `1004aab1` (ACK moves the offered bag cell into the trade container), `10046f81` (remove returns it to `1002a1b0(0x40)`, first free bag cell), `100666a3` (abort restores offers), and `100668d1` (each character header transfers that character's offers and cash; cash clamps at zero). `Zone::apply_trade` retains inventory-side state after the first op 4 closes the GUI, handles both character headers, and ignores duplicate completion for a side. Own ACK templates remain available to the UI after removal from the bag. Partner transfers use the cached partner trade snapshot; its actual PRK delivery remains unresolved above. `synthetic_trade_completion_transfers_items_and_cash_once_without_a_second_account` exercises encoded START/add/cash/COMPLETE frames plus the inferred partner snapshot without requiring a second account.
+  Exact identity distinction from GC `1004ad44`: offered trade cells are `KIND_TRADE=0x6c`; `KIND_OVERFLOW=0x6e` is the separate action-0x57 delivery inventory. GC `100666a3` attempts abort returns, then **unconditionally deletes remaining client placeholders** via `1002a97c` (each remaining entry is deleted/cleared). The port mirrors this even for a filled bag and clears trade state so later START is not blocked; it does not invent overflow recovery. Any subsequent server inventory resynchronization is [INFERENCE], not a demonstrated ownership guarantee. Completion instead stops at a full destination and retains untransferred source entries (`100668d1`). `full_bag_abort_clears_native_placeholders_and_completion_preserves_source` covers both distinctions.
+  Trade-add preflight (`100191f6`, instructions `10019348..10019422`) tests **Flags 0x4000000** for nested chest contents and the item, allows the item flag for NPC character partners, and refuses shop items with stat 8 other than -1. Feedback keys are `Feedback_ChestContainsNoDrop`, `Feedback_NoDropItemCantBeTraded`, `Feedback_ItemsWithLimitedTimespan`. Generic move Flags0x40 must not substitute for this test: operation0x70 bypasses that earlier guard. Both own player offers and shop-selling drops share this check; `native_trade_flags_distinguish_nodrop_temporary_and_npc_exemptions` covers the flag distinction.
+* [UNRESOLVED] List geometry (3 columns of 54 px slots, `(1,1)..(1000,..)` cell counts not mapped), the "Credits" label colour (the engine's `TextView` default), the 1 s timer unit (µs [INFERENCE]), item info page and the characters' sphere radii. Trade-add flag and temporary-item refusals are ported above; other common move guards remain separately documented.
 
 ## 11. NPC trade (`NPCChatTradeBar_c`, `KnubotStartTrade` / `KnubotTrade` / `KnubotFinishTrade` / `KnubotRejectedItems`)
 
@@ -673,6 +748,9 @@ Shop inputs use the original text-editor flags rather than disabling the control
 The shop list/grid wrapper carries the same explicit min/max dock size as its children: stacked views have no layout node and `View::CalculatePreferredSize` returns (-1,-1) (`ao-gui/layout.rs::node_calc`; the same wrapper constraint is documented in gui.md §6.5). Child sizes alone do not reserve its area. A collapsed wrapper gives its active grid an inverted/empty drop rectangle; the cash-shop regression requires positive tray geometry before checking the unchanged `TradeAddItem` bytes.
 `Interact::shop.quick` = Ctrl held (`host.mods`, set per input event). Harness (`cfg(test)`): `shop_dump(&gui)` (name, stock rows `[i] Name | Count | Price | Quality`, bought rows, credits, the Accept state, the trade log), `shop_buy(&mut gui, index) -> bool` (plain double click on stock item `index`: `MoveItemToInventory({0x6f, index})`), `shop_add(&mut gui, index, &zone)` (Ctrl double click: original affordability-checked `TradeAddItem`), `shop_remove(&mut gui, bought_index)`, `shop_press(&mut gui, accept)`; live steps `shop`, `shopbuy=<i>`, `shopadd=<i>`, `shoprm=<i>`, `shopaccept`, `shopdecline`.
 
+Inventory-side selling follows GC `1004aab1` / `10046f81` / `100666a3` / `10099f15`: server add ACK removes the offered bag cell, remove ACK and abort return it to the first free bag cell, and completion consumes only the offered cells. The sold tray retains its ACG after the bag move. A reused original bag slot is not treated as free when removing an offer. `synthetic_shop_sale_remove_abort_and_complete_keep_real_inventory` covers these inventory transitions; it does not simulate server credit updates or invent purchased templates. No live sale or two-account trade was exercised in this sweep.
+
+
 ### 13.5 Not ported / unresolved
 * Original affordability is enforced **before adding a stock item**, not by disabling Accept. GC `100662b7` computes the machine's net session cost (`10099d56`, bought price × count minus sale proceeds), adds the proposed item's price (machine virtual `+0x108`), then subtracts the own stat selected by the machine's ShopType. `N3Msg_TradeAddItem` `100191f6` refuses positive shortages with LDB category `0x6e`, key `CannotAffordThisItem` (string `10157530`, pushed at `100194ca`), feeding shortage then the currency's `fStatToString` name (`100194e4..100194f9`); receive handler `10066cf7` also rejects the local addition when shortage is positive. The port uses the existing ACG item-info cache and effective currency stat for this guard, retaining CL captured at trade start.
 * Buy pricing (`GC 10099954`, x87 instructions): truncate Value × BuyPrice(0x1ab)/100, then Cash discount `min(truncate(min(CL,3000)/10×.25),90)` and add truncate(discount×base/-100). Sell proceeds (`GC 10099d56`, assembly 10099dc0–10099e42): truncate Value × SellPrice(0x1aa)/100, sentinel Value 0x499602d2 → zero, then add truncate(truncate(CL/10×.25)×base/100). CL is snapshotted at trade start (`1009a23c`). GUI `100dfbf3` displays sold proceeds minus bought cost in own cash and does not change Accept's enabled state. GUI `100dfd33` disables Accept and sends direct op 1 with zero identities (`GC 10015bfd`); shop acceptance does not send calculated `TradeSetCash`. `10066598` clears internal accepted byte `+0x18` but emits own GlobalSignals `+0xe0(1)`; this is distinct from RESET op 10's false-state signal, which GUI `100df971` uses to re-enable Accept.
@@ -738,8 +816,15 @@ The three native `ItemSlotView` elements become application-painted canvases, re
 their XML names and layout. `ItemSlotView_c` XML factory `100309ec` calls `1004235f`;
 initialization `100420f5` loads graphic `0x11d` (`GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED`).
 The installed Graphics.uvgi record is offset **976601**, length **3954**; its PNG IHDR
-is **54x54**, framing a centred 48x48 inventory icon. Inventory names/icons and
-the result template reuse the existing HUD item-information loader.
+is **54x54**, framing a centred 48x48 inventory icon. This is the art/preferred
+size, not a guaranteed layout allocation. `TradeskillPanel.xml` lines 3–42 place
+the three bordered slot columns (`Rect(3,8,0,3)`), operators and Clear/Build
+buttons in one horizontal row. Native `View::SpaceOut` `1014a238` distributes
+`available - sum_min` even when negative; the 300-wide default therefore permits
+the slots to shrink. The source canvas's allocated inclusive frame extents are
+**51×54** in the headless regression, not the art's 54×54. `Gui::view_rect` reports
+those frame extents; its contract is not an icon-size query. Inventory names/icons
+and the result template reuse the existing HUD item-information loader.
 
 ### 15.1 Authoritative analyzer requests and replies
 
@@ -771,6 +856,18 @@ before clearing the view, avoiding extra empty-input requests. Clear/destruction
 (`100ddd4a`) sends a zero analyzer identity only for each populated input.
 MouseDown `100de34a` (TradeSkillView vtable `101bf504+0x3c`) clears a clicked input;
 clicking the result opens `itemref://low/high/QL` through the existing InfoView.
+
+The constructor was re-read in full during the economy sweep: after attaching
+`TradeskillPanel.xml`, GUI `100de9b8` calls `ResizeTo(100ddb44())`, explicitly
+300×400, before configuration restoration. The previous preferred-XML-size
+substitute is removed. `100de34a` accepts inventory drag identities without
+rewriting them to bag slots; backpack canvas drops can now populate either
+analyzer input with their original `0x6b` identity. The native-panel regression
+also covers this source identity, explicit default dimensions and result InfoView URL.
+Live recipe acceptance still requires an actual compatible source/target pair,
+the relevant tradeskill value, server analyzer replies `0xdf..0xe4`, and a Build
+confirmation changing inventory; synthetic replies do not establish that result.
+
 
 Regression tests: `analyzer_requests_replies_and_inclusive_quality`,
 `native_panel_escape_capture_and_inventory_drop`. These have been added, not run

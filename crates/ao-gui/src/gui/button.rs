@@ -4,6 +4,14 @@
 use super::*;
 
 impl Gui {
+    /// Label drawn by the named `Button` (not editable text returned by [`Gui::text`]).
+    pub fn button_label(&self, w: WindowId, name: &str) -> Option<&str> {
+        match &self.tree.views[self.find(w, name)?].kind {
+            Kind::Button(b) => Some(&b.label),
+            _ => None,
+        }
+    }
+
     /// `Button_c::SetBackgroundIcon` 0x10127d08. The caller loads either skin art or an RDB bitmap.
     pub fn set_button_background_icon(&mut self, w: WindowId, name: &str, icon: Option<GfxId>) {
         let Some(v) = self.find(w, name) else { return };

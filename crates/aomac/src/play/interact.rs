@@ -227,7 +227,7 @@ impl Interact {
     }
 
     /// GUI events of the NPC chat window; `true` when consumed.
-    pub fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
+    pub fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &mut Zone) -> bool {
         let me = self.own_id();
         if let Some(out) = self.tower.event(gui, ev, me) {
             match out {

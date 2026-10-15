@@ -88,7 +88,7 @@ pub enum ChatReq {
 pub enum Resolved {
     Chat(ChatCmd),
     Line(ChatLine),
-    /// `IgnoreSystem_t` toggle for this character id (feedback: [`super::cmd::ignore_feedback`]).
+    /// `IgnoreSystem_t` toggle for this character id; the hub updates Friends and prints feedback.
     IgnoreToggle(u32),
 }
 
