@@ -134,6 +134,7 @@ Runtime behavior is intentionally unchanged for this report.
   and emits `Feedback_Reloading`. No template/item exceptions and no fabricated automatic reload.
   Fresh `FUN_10048829` resolves own pages, registered container high words, bank and temporary trade inventory;
   `FUN_1002ad45` stores an unsigned 16-bit count and converts values outside 0..65535 to zero.
+  `FUN_1002aa2d` additionally removes the first own-inventory entry matching a non-page source dynel identity.
   Regression `reload_wire_counts_and_i32_flag` covers the 28-byte body, noncanonical true, truncation and
   trailing bytes; `reload_ack_updates_source_and_exact_weapon_before_feedback` feeds actual framed synthetic
   bytes through `Zone::on_frame`, covering dual-wield exact selection, source replacement/removal,

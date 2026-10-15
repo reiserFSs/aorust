@@ -65,6 +65,12 @@ impl Zone {
         let slot = if source.kind == inv::KIND_IN_CONTAINER { (source.instance & 0xffff) as u32 } else { source.instance as u32 };
         // GC1002ad45 stores a u16; out-of-range counts become zero, not saturation.
         let remaining = if (0..=0xffff).contains(&remaining) { remaining as i16 } else { 0 };
+        if !(0x65..0xfa).contains(&source.kind) && remove_source {
+            // GC1002aa2d: non-page identities remove the first matching inventory dynel.
+            if let Some(slot) = self.inventory.iter().filter(|(_, e)| e.id == source).map(|(&slot, _)| slot).min() {
+                self.inventory.remove(&slot);
+            }
+        }
         if matches!(source.kind, 0x65..=0x68 | 0x73) && source.instance >= 0 {
             if remove_source { self.inventory.remove(&slot); }
             else if let Some(e) = self.inventory.get_mut(&slot) { e.b = remaining; }
@@ -283,6 +289,11 @@ mod tests {
         assert!(z.containers[&(0xc750, 55)].1.is_empty());
         assert_eq!(z.world.arms.weapon_item(900).unwrap().clip, -1);
         assert_eq!(z.world.reload_bar_progress(), Some((0.0, 2.5)));
+        put(&mut z, 0x42, 102);
+        let dynel_source = Identity { kind: KIND_WEAPON_ITEM, instance: 12345 };
+        z.inventory.get_mut(&0x42).unwrap().id = dynel_source;
+        z.on_frame(&ack(dynel_source, 0, 9, 1));
+        assert!(!z.inventory.contains_key(&0x42));
     }
 
     fn add(from: u32, to: i32) -> InventoryMsg {
