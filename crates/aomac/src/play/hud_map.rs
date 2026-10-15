@@ -174,7 +174,8 @@ impl HudMap {
                 match gui.open_tabbed_window_xml("PlanetMapView", PLANET_TITLE, &xml, PLANET_POS, WindowSize::Fixed(PLANET_SIZE.0, PLANET_SIZE.1)) {
                     Ok(window) => {
                         set_button_tips(gui, window, self.texts.as_ref());
-                        self.planet = Some(Planet { window, map: None, tried: None, level: 0, center: [0.0; 2], followed: None, tiles: HashMap::new(), pressed: None, hold: false })
+                        let (w, h) = gui.canvas_size(window, "map");
+                        self.planet = Some(Planet { window, map: None, tried: None, level: 0, center: [w as f32 / 2.0, h as f32 / 2.0], followed: None, tiles: HashMap::new(), pressed: None, hold: false })
                     }
                     Err(e) => eprintln!("planet map: {e:#}"),
                 }
@@ -326,11 +327,6 @@ impl HudMap {
                 p.center = m;
             }
             p.followed = marker;
-        }
-        // no marker and the view never placed (an unmapped playfield on first open): the middle of the level's map
-        // [UNRESOLVED GUESS: the original's `BitmapTileView_c` may start at scroll 0]
-        if marker.is_none() && p.center == [0.0; 2] {
-            p.center = [(lv.rect[0] + lv.rect[2]) as f32 / 2.0, (lv.rect[1] + lv.rect[3]) as f32 / 2.0];
         }
         let (cw, ch) = gui.canvas_size(p.window, "map");
         let (cw, ch) = (cw as f32, ch as f32);
@@ -783,16 +779,16 @@ mod tests {
         }
     }
 
-    /// First open on an unmapped playfield (ICC beach 4582): the view starts in the middle of the map, not at its north-west corner.
+    /// An unmapped playfield leaves the freshly constructed BitmapTileView at scroll zero.
     #[test]
-    fn planet_map_unmapped_playfield_is_centred() {
+    fn planet_map_unmapped_playfield_starts_at_zero_scroll() {
         let Some((mut s, mut o)) = shot() else { return };
         s.map.open(&mut s.gui, &mut s.rollup, WindowKind::PlanetMap);
         own_at(&mut s, 4582, [10.0, 0.0, 10.0], 0.0);
-        png(&mut s, &mut o, "planet-4582-centred");
+        png(&mut s, &mut o, "planet-4582-zero-scroll");
         let p = s.map.planet.as_ref().unwrap();
-        let lv = &p.map.as_ref().unwrap().index.levels[p.level];
-        assert_eq!(p.center, [(lv.rect[0] + lv.rect[2]) as f32 / 2.0, (lv.rect[1] + lv.rect[3]) as f32 / 2.0]);
+        let (w, h) = s.gui.canvas_size(p.window, "map");
+        assert_eq!(p.center, [w as f32 / 2.0, h as f32 / 2.0]);
     }
 
     #[test]
