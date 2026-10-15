@@ -231,7 +231,7 @@ impl Rollup {
         let art = if page.expanded { COLLAPSE } else { EXPAND };
         let items = gui.gfx_id(art).map(GfxId).map(|g| {
             let (w, h) = gui.gfx().size(g);
-            // a toggle button: the pressed view (SELECTED) while expanded, DEFAULT when collapsed (**GUESS** for the value; the retail shot shows the expanded pages' button cream)
+            // RollupPage 10049389 initializes SetValue(Variant(expanded)); 1004903b repeats it on expansion changes.
             CanvasItem::ImageTint { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, size.0 as f32, size.1 as f32], color: if page.expanded { 0x2000000 } else { 0x1000000 }, alpha: 0.85 }
         });
         gui.set_canvas(page.window, "arrow", items.into_iter().collect());

@@ -145,7 +145,7 @@ The in-world windows are `DockWindow_c` (`FUN_1003bdd4`: `Window(Rect(), "", "",
 title, view)` with `title` = the `DockableView_c` constructor argument (`FUN_100389bd`). `Window::SetTitle` (0x1015427b) only stores a string, nothing draws it. The title texts are therefore
 the constructor literals: `"Planet Map"` (`PlanetMapView_c` 0x1004d26a), `"PF Map"` (`PlayfieldMapView_c` 0x100eb905), `"Skills"` (`SkillWindow` Window ctor), `"Stats"`, `"Friends"`, `"Knowledge"`, `"Missions"`, `"NCU"`,
 `"Actions"`, `"Faction"`, `"Trade"`, `"Tradeskill Kit"`, `"Info"`, `"Tips"`; `GetText(10000, "Wear")` (`WearView_c` 0x100e1bc9, string at 0x101b59ac), `"Inspect"` for the inspect variant; the inventory
-passes `""` (its tab title is set later, UNRESOLVED). **`#WindowMap` / `#WindowPlanetMap` of `ControlCenterModule_c::SetupProviders` 0x10068c38 are not titles**: the four strings of each provider
+passes `""` initially, then sets the localized `GetText(10000,"Inventory")` title (**0x100c9fb7**, implemented in `hud_stats.rs`). **`#WindowMap` / `#WindowPlanetMap` of `ControlCenterModule_c::SetupProviders` 0x10068c38 are not titles**: the four strings of each provider
 (`FUN_10018788`) are dvalue name, key-binding option label (`#WindowPlanetMap`), group (`#Window`) and the provider key (`WINDOW_PLANETMAP`, §12.1).
 * Style 0 (`WndBorder::SetBorderGfx` 0x1015a82d): the same outer `GFX_GUI_WINDOW3_BORDER_*` art as style 1 (alpha 0.33) but `TabView::SetRenderFlags(7)` and no inner `top_level_border`. Outer border
   `Rect(3, _DAT_101b6e54 = 7, 3, 3)` (`UpdateBorderSizes` 0x10159f98) + `TabView` borders `(2, strip + 1, 2, 2)` (`LayoutBorders` 0x10145be5: `+= _DAT_101a8b90 = 2.0` on all four, then the top is `+0x158` =
@@ -208,7 +208,7 @@ The capture is an **older retail build** than the installed 0.7.2 data (the skil
 | Item | Retail | Ours | Verdict |
 |---|---|---|---|
 | Skills title strip icons | `i` left; `?`, pin, X right (pin cream = pressed) | only `i` and X | **fixed** (§6.2): `?` after `SetHelpFile`, pin unless flag 0x800, tint per state |
-| Rollup pages (Wear, NCU, Programs) | `i`, title, rollup button (cream), X | art untinted | **fixed**: tinted DEFAULT / SELECTED at 0.85 (`hud_rollup.rs`); the toggle value mapping is a GUESS |
+| Rollup pages (Wear, NCU, Programs) | `i`, title, rollup button (cream), X | art untinted | **fixed**: tinted DEFAULT / SELECTED at 0.85 (`hud_rollup.rs`); **0x10049389** initializes `SetValue(Variant(expanded))`, **0x1004903b** repeats it on expansion changes, confirming expanded=true |
 | Inventory / chat frames | `i` left, pin + X right | `i` + X | **fixed** (pin shown for every tabbed window; chat keeps its own fade) |
 | Border button inset | 8 px from the outer edge (scaled, older build) | 5 px (`Layout` 0x1015a1d9, §6.2) | **code-derived, confirmed** by the capture once the sprite's 4 transparent columns are discounted (§6.2) |
 | Button hover/pressed art | n/a in capture | hover/pressed state ids reversed, alpha 1.0 | **fixed** (§6.2) |
@@ -309,7 +309,7 @@ Regression additions: `hud_wincfg::tests::plain_window_resize_restores_size_and_
   `ButtonBase_c::SetToggleButton` → click switches it on. `Gui::set_item_selected(h, bool)` mirrors `CharSelectItem_c::SetSelected` 0x1000cb1a
   (toggle + `detailed_view` instead of `summary_view`; the client swaps them in the row container, we collapse the hidden one).
   `set_toggle_in`, `set_color_in` (status colour 0xEE4444).
-* **TextInputView / ComboBox editor**: caret (blink), selection (shift+arrows, mouse drag, double click not implemented), Home/End, Delete/Backspace,
+* **TextInputView / ComboBox editor**: caret (blink), selection (shift+arrows, mouse drag), Home/End, Delete/Backspace. Native `TextRenderer_c::MouseDown` **0x101637ef** always places the caret/begins selection on left-down; it has no double-click word-selection branch, so none is added;
   Ctrl+A/C/X/V (events `Copy(text)` / `PasteRequested` → `InputEvent::Paste`), password mask `*`, horizontal scrolling to keep the caret visible,
   click-to-focus + caret placement, `TextChanged`, `EnterPressed`. **Tab / Shift-Tab** cycles the enabled, visible text-input fields of the top
   windows in tree order (original `TextView_c::SlotTabPressed`; buttons are not tab stops – **[INFERENCE]**, no focus ring exists in the art);
@@ -336,10 +336,10 @@ Raw inventory/wear, Programs, Actions and shortcut-bar press initiation uses `Gu
 
 ## 9. UNRESOLVED (summary)
 
-Several tabs / tab vertical text offset (§6.1); window drag/resize hit-testing; `PopupMenu_c` skin; `_AddLineDesc` line pitch;
-GDI dropout rules; layer-alpha values from `GUIColors.xml`/prefs (defaults used); tooltips (`View::SetToolTip` texts exist, not shown);
-double-click word selection; IME; border-button row origin (3 px inset is a retail-screenshot GUESS, §6.2); pin persistence (`SaveWndConfig`) and the rollup button's toggle value (§6.4);
-palette / skin of the older retail build (§6.4).
+GDI rasterizer/dropout byte parity (§2), IME, border-button row origin (3px screenshot inference, §6.2), and palette/skin of the older retail build (§6.4) remain unresolved.
+NewChar template bootstrap has no established native consumer (§6.4); see the searched preferences routines and missing first-launch provenance there.
+Tabs, tab title centering (§6.1), window drag/resize and pin archives (§6.5), PopupMenu art (§7), tooltips (§10), `_AddLineDesc` pitch (§3), and rollup expanded/toggle mapping (§6.4) are implemented; the old summary predated these paths.
+Double-click word selection is absent in the native text input handler, not an unimplemented retail feature.
 
 ## 11. Stat tables and the skills / inventory / wear windows (`ao_formats::stats`, `play/hud_stats.rs`)
 
@@ -482,7 +482,7 @@ No enclosing Actions backdrop is therefore added.
 `settings_nested_popup_and_pet_actions` asserts the borderless dimensions and
 absence of an enclosing solid backdrop.
   No tests, builds, or live checks were run by this worker.
-* `prefs/NewChar/*` is the install's new-character template; **no DLL contains the string `NewChar`** (searched all DLL/EXE, ASCII and UTF-16), so its consumer is UNRESOLVED. Its arbitrary bar/hotbar frames demonstrate saved custom positions, not a screen-independent first-login layout. Pool bars use the constructor positions from `SlotPlayerCharacterAlive` 0x1006afed, the compass uses 0x1006d433, and the hotbar starts at `(20,20)` from 0x100d94e9; character-owned `WindowFrame`s override those origins and are clamped by `MoveInsideScreen`.
+* `prefs/NewChar/*` is the install's new-character template, but its retail bootstrap consumer remains unestablished. DLL/EXE ASCII and UTF-16 searches found no `NewChar` string; traced `GetCharPrefsPath` **0x1006bacd**, `GetCharacterPath` **0x101245f9**, `Preferences::LoadCharPrefs` **0x101246af**, and `SetDefaultCharPrefs` **0x1012447a**. They establish the character-ID archive path, archive loading and registered defaults, not a NewChar-directory copy. Missing prerequisite: provenance of first-character preference creation (original launcher/installer bootstrap implementation or a pristine first-launch filesystem trace); this is not an undecoded preferences loader. The port's explicit template adoption is an intentional behavior, not proven retail parity. Arbitrary NewChar bar/hotbar frames are saved custom positions, not a screen-independent first-login layout. Pool bars use `SlotPlayerCharacterAlive` **0x1006afed**, compass **0x1006d433**, hotbar `(20,20)` **0x100d94e9**; character-owned frames override those origins and are clamped by `MoveInsideScreen`.
 * **Item inspection (bug 7):** `hud_stats/item_ui.rs` routes Shift-left-click and right-click on filled wear/grid cells, and inventory list rows, through `Hud::take_info_urls` to the existing chat InfoView (`Views/InfoView.xml`, `BrowserView`, Back/Forward; docs/chat/dialogs.md §1). URLs carry the runtime inventory identity from GC `FUN_10046d8e(slot)`, not a template ID or the entry's unresolved `id` words. The qualified click never arms drag or enters double-click use; missing slots produce no URL. Shift info signals are evidenced by `MultiListView_c` handler `FUN_10040a17` (§10.5); direct right-click inspection is the requested interaction, while the complete retail item popup remains unresolved. The inventory tab's **“i”** is the window-icon menu (`WndBorder::SlotIconButton` 0x1015a74e; `Event::FrameIcon`), not an item-information button; it is intentionally not rebound to inspect an arbitrary item. Regression `item_inspection_does_not_use_or_drag_inventory_and_wear` covers filled wear/grid/list routes and absence of outbound use/move messages; not run during this edit.
 
 Not done / UNRESOLVED: Knowledge window consumer of the mini toolbar; fade timer period (50 Hz assumed); label-only entry width; RollupArea page parenting / clip-flag setup (area containment is [INFERENCE], shared View clipping is traced, §10.8); alien bar default position; the compass / slider / hotbar gaps are listed in 10.1 – 10.3. Shots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac hud::tests` writes `hud-1280.png`, `hud-1920.png`, `compass-*.png`, `hud-aggdef-*.png`, `hud-hotbar*.png`.
@@ -832,7 +832,7 @@ Native evidence: `View` XML constructor 0x1014e21c creates the down signal at +0
 * API: `Gui::multi_{set_flags, add_column, clear, add_row, sort, row_ids, selected, sort_state, columns, select, set_column_width}(window, name, ..)`, row cells `view::MultiCell::{text, num, unsorted, image}`; events `MultiSelected`, `MultiMouse { id, button, clicks, x, y }`, `MultiColumnResized { col, width }` (the LFT window persists the widths in `LFTWindowConfig`). XML: `<MultiListView name=.. feature_flags=..>` is engine-only (the original builds it in code).
 
 ### 14.4 Horizontal scroll bar (`gui/hscroll.rs`)
-`ScrollView` now honours `h_scrollbar_mode` (auto shows the bar when the content is wider than the viewport; the bars shrink each other's viewport): offset `x`, arrows ±13 px, track pages, thumb drag. UNRESOLVED: GUI.dll has only the vertical `GFX_GUI_SCROLLBAR_GRAY_*` sprites, so the horizontal bar reuses them unrotated (arrow sprites as is, track / thumb stretched).
+`ScrollView` honours `h_scrollbar_mode` (auto shows the bar when content is wider than the viewport; the bars shrink each other's viewport): offset `x`, arrows ±13px, track pages, thumb drag. The unrotated `GFX_GUI_SCROLLBAR_GRAY_*` art is intentional native behavior: `ScrollBar_c` **0x10141d6a** selects the same default sprite IDs for either orientation and changes destination geometry/anchoring, not image rotation. Existing horizontal scrolling/multilist regressions exercise the reachable implementation; no replacement horizontal artwork is invented.
 
 ### 14.5 Tests / screenshots
 `cargo test --release -p ao-gui --test listview` (real mouse events on the three widgets); `cargo test --release -p aomac social_win` (Friends window, LFT window); `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac social_win_shot` → `social.png`.
