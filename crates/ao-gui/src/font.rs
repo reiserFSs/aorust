@@ -8,7 +8,7 @@
 //! | 1 | TOOLTIP  | bitmap font `textures/fonts/FontTooltip9.fnt` + skin image `GFX_FONT_TOOLTIP9` |
 //! | 2 | SHELL    | bitmap `FontGameShell12.fnt` + `GFX_FONT_GAMESHELL12` |
 //! | 3 | CLOCK    | same table row as SHELL |
-//! | 4 | CC17     | Verdana bold, size = `ftol(DisplayHeight/768)` (UNRESOLVED: GDI is asked for height 1; not used by the login screens) |
+//! | 4 | CC17     | Verdana bold, `lfHeight = trunc(20 * f32(DisplayHeight/768))` (1012efab..1012efdb) |
 //! | 5 | NORMAL   | GDI Verdana, `lfHeight` 13, regular |
 //! | 6 | BOLD     | Verdana 13 bold |
 //! | 7 | SMALL    | Verdana 12 |
@@ -27,8 +27,8 @@
 //!   drawn with `TextOutW` into a **1-bpp** bitmap (`FontInfo_t::GetGlyph` 0x1012e73c), i.e. aliased,
 //!   hinted glyphs.  The advance is `GetTextExtentPoint32W().cx`, the line height `tmHeight`
 //!   (`FontInfo+0xff0`).  `lfHeight > 0` selects the em size whose cell height (tmAscent+tmDescent) equals it.
-//!   The Windows rasteriser is reproduced with the TrueType interpreter of `skrifa` in mono-hinting mode
-//!   plus a centre-sampling scan converter with dropout control (UNRESOLVED: exact GDI dropout rules).
+//!   The port uses `skrifa` mono hinting plus a centre-sampling scan converter with dropout control;
+//!   exact Windows GDI dropout behaviour remains unresolved, not byte-equivalent rendering.
 //!   Verdana is taken from the host (`/System/Library/Fonts/Supplemental/Verdana*.ttf`), because the
 //!   client resolves the face by name through GDI and does not ship the file.
 
@@ -148,6 +148,7 @@ impl Font {
 pub struct FontSystem {
     fonts: HashMap<FontId, Font>,
     dir: PathBuf,
+    cc17_height: i32,
 }
 
 impl FontSystem {
@@ -185,10 +186,24 @@ impl FontSystem {
         ] {
             fonts.insert(id, tt("Verdana", h, b, i)?);
         }
-        Ok(Self { fonts, dir })
+        Ok(Self { fonts, dir, cc17_height: 20 })
     }
     pub fn font(&mut self, id: FontId) -> &mut Font {
         self.fonts.get_mut(&id).expect("all FontIds are loaded")
+    }
+
+    /// FontSystem ctor 1012efab..1012efdb: scale the table's 20px cell by display height.
+    pub fn set_display_height(&mut self, height: u32) -> Result<bool> {
+        let lf = (20.0 * (height as f32 / 768.0)) as i32;
+        if lf == self.cc17_height {
+            return Ok(false);
+        }
+        let f = TtFont::new(&self.dir, "Verdana", lf, true, false)?;
+        let mut font = Font { height: f.cell_height, space: 0, kind: Kind::Tt(f), cache: HashMap::new(), aa_cache: HashMap::new() };
+        font.space = font.advance(' ');
+        self.fonts.insert(FontId::Cc17, font);
+        self.cc17_height = lf;
+        Ok(true)
     }
 
     /// Re-creates the CHAT font from the `ChatFontName` / `ChatFontStyle` / `ChatFontSize` prefs (`size` in tenths of a point = `lfHeight * 10`, so
@@ -316,8 +331,8 @@ impl TtFont {
         Ok(Self { data, ppem: ppem as f32, hint, ascent, descent, cell_height: ascent + descent, hdmx })
     }
 
-    /// Without `smooth`, reproduces the retail 1-bit hinted bitmap exactly. The opt-in Enhanced AA path
-    /// uses real coverage even at scale 1, while retaining retail logical advances and cell dimensions.
+    /// Retail-style 1-bit hinted bitmap; exact Windows GDI dropout equivalence is unresolved.
+    /// Enhanced AA uses real coverage while retaining the port's logical advances and cell dimensions.
     /// Callers divide the physical bitmap dimensions by `scale`, so layout is unaffected.
     fn glyph(&self, ch: char, scale: u8, smooth: bool) -> Glyph {
         let font = FontRef::new(&self.data).expect("validated in new");

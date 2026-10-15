@@ -72,7 +72,8 @@ across refresh, list double click and removal).
 `FontSystem_t` table 0x10272df0: TOOLTIP/SHELL/CLOCK bitmap `.fnt` fonts (256×256 skin image, 255 glyph rects + widths, advance = `x1−x0+1`);
 NORMAL (Verdana 13), BOLD (13 bold), SMALL (12), LARGE (16), HUGE (24 bold), TT_MIN12 (14), ITALIC (16 italic), CHAT (prefs) are GDI
 TrueType, aliased 1-bpp glyphs (`CreateFontA`, `TextOutW`). We rasterise with skrifa mono hinting from the host Verdana
-(client does not ship it). **UNRESOLVED**: exact GDI dropout rules; CC17 height.
+(client does not ship it). **UNRESOLVED platform equivalence:** native **0x1012ec5c** calls Windows `CreateFontA` / `GetTextMetricsA`; **0x1012e73c** delegates glyph rasterization to `TextOutW` in a 1-bit bitmap. The host Verdana/skrifa scan converter is an approximation; exact Windows font revision and GDI-produced glyph masks/dropout reference fixtures are unavailable in this headless macOS environment. No exact-font claim is made. **CC17 height is resolved:** assembly **0x1012efab–1012efdb** multiplies integer20 (`0x10272e4c = 0x14`) by `f32(displayHeight/768)`, then truncates; decompilation hid that multiply. `Gui::set_screen_size` updates that font and invalidates glyph/layout caches only when its integer height changes, and the production frontend now supplies screen size each frame. Normal font sizes remain fixed.
+Regression `display_height_rescales_only_cc17_and_invalidates_atlas_on_change` covers768→800 (same truncated height, no atlas churn),1536 (40px), fixed NORMAL metrics and glyph invalidation. Font rasterizer byte parity is deliberately not asserted.
 
 ## 3. Colours and text (`text.rs`)
 

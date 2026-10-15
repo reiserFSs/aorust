@@ -71,8 +71,22 @@ impl Gui {
         }
     }
 
-    /// Screen size used by `Window::MoveToMouse` (default: the largest visible window).
+    /// Screen size for tooltip placement and the native resolution-dependent CC17 font.
     pub fn set_screen_size(&mut self, w: u32, h: u32) {
+        if self.tip.screen.1 != h as f32 {
+            match self.fonts.set_display_height(h) {
+                Ok(true) => {
+                    self.glyph_map.clear();
+                    self.glyphs.clear();
+                    let windows: Vec<_> = self.windows.iter().enumerate().filter_map(|(id, w)| w.as_ref().map(|_| id)).collect();
+                    for window in windows {
+                        self.relayout_window(window);
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("CC17 display-height font update failed: {error:#}"),
+            }
+        }
         self.tip.screen = (w as f32, h as f32);
     }
 
@@ -320,6 +334,23 @@ impl Gui {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_height_rescales_only_cc17_and_invalidates_atlas_on_change() {
+        let Ok(mut gui) = Gui::new(&crate::client_dir(), None) else { return };
+        let normal = gui.fonts.font(FontId::Normal).height;
+        gui.set_screen_size(1024, 768);
+        assert_eq!(gui.fonts.font(FontId::Cc17).height, 20);
+        gui.glyph_src(FontId::Cc17, 'A').unwrap();
+        let version = gui.glyphs.version;
+        gui.set_screen_size(1280, 800); // trunc(20*800/768) remains 20
+        assert_eq!(gui.glyphs.version, version);
+        gui.set_screen_size(2048, 1536);
+        assert_eq!(gui.fonts.font(FontId::Cc17).height, 40);
+        assert_eq!(gui.fonts.font(FontId::Normal).height, normal);
+        assert!(gui.glyph_map.is_empty());
+        assert!(gui.glyphs.version > version);
+    }
 
     #[test]
     fn native_tooltip_window_padding_and_body_default_colour() {

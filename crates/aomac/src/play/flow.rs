@@ -1319,6 +1319,7 @@ impl Frontend for Play {
         host.interface_scale = Some(self.interface_scale);
         // Apply saved text preferences to login/character screens too; AA is independent of GUI scale.
         self.gui.set_text_scale(host.window_scale.clamp(1, 8) as u8, self.smooth_text);
+        self.gui.set_screen_size(size.0, size.1);
         if let Some((life, models)) = &mut self.world_life {
             life.set_enabled(self.wildlife_enabled);
             if !self.wildlife_enabled { models.clear(); }
