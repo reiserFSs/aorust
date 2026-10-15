@@ -438,7 +438,6 @@ impl Gui {
             if w.default_button.is_some_and(gone) { w.default_button = None; }
         }
         for v in &mut self.tree.views {
-            if v.selector_pref_child.is_some_and(gone) { v.selector_pref_child = None; }
             if let Kind::MultiHeader { rows } = &mut v.kind {
                 if gone(*rows) { v.kind = Kind::View; }
             }
@@ -621,9 +620,6 @@ impl Gui {
     /// `ViewSelector_c::SetValue(index)`: shows child `index` of the named view and hides (and collapses) the others.
     pub fn select_child(&mut self, w: WindowId, name: &str, index: Option<usize>) {
         if let Some(p) = self.find(w, name) {
-            if self.tree.views[p].node == Node::Selector && self.tree.views[p].selector_pref_child.is_none() {
-                self.tree.views[p].selector_pref_child = index.and_then(|i| self.tree.views[p].children.get(i).copied());
-            }
             for i in 0..self.tree.views[p].children.len() {
                 let c = self.tree.views[p].children[i];
                 self.tree.views[c].visible = Some(i) == index;
@@ -730,6 +726,8 @@ impl Gui {
             if let Kind::TextButton(b) = &mut self.tree.views[v].kind {
                 b.toggle = toggle;
                 b.toggled = on;
+            } else if let Kind::Button(b) = &mut self.tree.views[v].kind {
+                b.toggled = toggle && on;
             }
         }
     }
@@ -946,6 +944,14 @@ impl Gui {
             }
         }
         self.relayout_window(w);
+    }
+    /// Bitmap subset of `Button_c::SetIconView`, independent of the label/border tint.
+    pub fn set_button_icon_view(&mut self, w: WindowId, name: &str, image: GfxId, color: u32) {
+        if let Some(v) = self.find(w, name) {
+            if let Kind::Button(b) = &mut self.tree.views[v].kind {
+                b.icon_view = Some((image, color));
+            }
+        }
     }
     pub fn focus(&mut self, w: WindowId, name: &str) {
         if let Some(e) = self.find(w, name).and_then(|v| self.editor_of(v)) {
@@ -1369,7 +1375,7 @@ impl Gui {
         let tint = mul(tint, disabled);
         if let Some([raised, down, hover]) = b.gfx_override {
             // SetGfx/GetBorderView (0x10128270/0x10128111) keeps the same palette/layer-2 alpha as bordered buttons.
-            let (id, col) = if b.pressed { (down, 0x2000000) } else { (raised, 0x1000000) };
+            let (id, col) = if b.pressed || b.toggled { (down, 0x2000000) } else { (raised, 0x1000000) };
             self.push_gfx(out, id, r, mul(tint, self.map_color(col)), alpha * BUTTON_ALPHA);
             if b.hover && v.enabled {
                 self.push_gfx(out, hover, r, mul(tint, self.map_color(0x3000000)), alpha * BUTTON_ALPHA);
@@ -1388,7 +1394,7 @@ impl Gui {
         let raised = g([0x24, 0x26, 0x1f, 0x21, 0x22, 0x25, 0x23, 0x20, 0x1e]);
         let pressed = g([0x35, 0x37, 0x30, 0x32, 0x33, 0x36, 0x34, 0x31, 0x2f]);
         let hover = g([0x2c, 0x2e, 0x27, 0x29, 0x2a, 0x2d, 0x2b, 0x28, 0]);
-        let (set, col) = if b.pressed { (pressed, 0x2000000) } else { (raised, 0x1000000) };
+        let (set, col) = if b.pressed || b.toggled { (pressed, 0x2000000) } else { (raised, 0x1000000) };
         let t = mul(tint, self.map_color(col));
         self.draw_border(out, &set, r, t, alpha * BUTTON_ALPHA);
         if b.hover && v.enabled {
@@ -1396,13 +1402,21 @@ impl Gui {
             self.draw_border(out, &hover, r, t, alpha * BUTTON_ALPHA);
         }
         self.draw_button_background_icon(out, b.background_icon, b.background_icon_fade, r, tint, alpha);
+        // `LayoutLabel` 101278d6: icon at left border + 2, then a 2px label gap.
+        let label_left = b.icon_view.map(|(image, color)| {
+            let (w, h) = self.gfx.size(image);
+            let left = r.l + self.gfx.size(GfxId(0x22)).0 as f32 + 2.0;
+            let top = r.t + ((r.height() + 1.0 - h as f32) * 0.5).floor();
+            self.push_gfx(out, image, Rect::new(left, top, left + w as f32 - 1.0, top + h as f32 - 1.0), mul(tint, self.map_color(color)), alpha);
+            left + w as f32 + 2.0
+        });
         if !b.label.is_empty() && (b.background_icon.is_none() || b.background_icon_fade > 0.8) {
             // label: TextView (font NORMAL) centred in the bounds (Rect::TranslateCenter 0x1000aae4)
             let s = text::string_size(&mut self.fonts, &self.colors, FontId::Normal, &b.label);
             let (lw, lh) = (s.x + 1.0, s.y + 1.0);
-            let lx = r.l + ((r.width() + 1.0 - lw) * 0.5).floor();
+            let lx = label_left.unwrap_or_else(|| r.l + ((r.width() + 1.0 - lw) * 0.5).floor());
             let ly = r.t + ((r.height() + 1.0 - lh) * 0.5).floor();
-            let lt = mul(tint, self.map_color(col));
+            let lt = mul(tint, self.map_color(b.label_color.unwrap_or(col)));
             self.draw_string(out, FontId::Normal, &b.label, lx as i32, ly as i32, lt, alpha, false);
         }
     }
@@ -2885,6 +2899,20 @@ mod clip_tests {
         assert_eq!(g.layout_computed, before + 2, "the new key hits the cache on the next call");
         g.layout_text_cached(id, FontId::Normal, "different text", 0, Some(40));
         assert_eq!(g.layout_computed, before + 3, "a wrap-width change must invalidate the cache");
+    }
+
+    #[test]
+    fn selector_limits_include_every_page_componentwise_even_when_hidden() {
+        let dir = crate::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut g = Gui::new(&dir, None).unwrap();
+        // max_size is a preferred-size floor, not a ceiling. Empty vertical
+        // clients otherwise keep their native unlimited (16000) horizontal maximum.
+        let w = g.open_window_xml("selector", r#"<root><ViewSelector name="pages"><View min_size="Point(99,49)" max_size="Point(199,149)" max_size_limit="Point(199,149)"/><View min_size="Point(299,29)" max_size="Point(399,99)" max_size_limit="Point(399,99)"/><View min_size="Point(49,249)" max_size="Point(149,349)" max_size_limit="Point(149,349)"/></ViewSelector></root>"#, (0, 0), WindowSize::Fixed(350, 300)).unwrap();
+        for page in 0..3 {
+            g.select_child(w, "pages", Some(page));
+            assert_eq!(g.window_preferred_size_limits(w), Some(((300, 250), (400, 350))));
+        }
     }
 
     /// `draw_text_view` used to emit glyph quads for every line of a `TextView`, even lines scrolled above or below

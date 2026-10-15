@@ -484,8 +484,7 @@ impl HudOptions {
         if let Some(leaf) = self.win.as_ref().and_then(|w| w.leaves.get(w.selected).cloned()) {
             gui.list_select(id, TREE, &leaf, true, false);
         }
-        // Establish the initial page's sizing before restoring visibility (native AppendView selects page 0).
-        gui.select_child(id, PAGES, Some(0));
+        // ViewSelector measures every page; restore only the selected page's visibility.
         gui.select_child(id, PAGES, Some(selected));
         // `AppendTab("Preferences")`, `AppendTab("Fixed keys")` (only when HotKeys.xml loaded), `AppendTab("Key bindings")`
         let mut tabs = vec!["Preferences".to_string()];

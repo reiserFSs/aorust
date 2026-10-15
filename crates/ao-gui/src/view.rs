@@ -125,12 +125,18 @@ pub struct BorderData {
 #[derive(Clone, Debug)]
 pub struct ButtonData {
     pub label: String,
+    /// Explicit native label colour, without tinting the border or icon view.
+    pub label_color: Option<u32>,
     /// Icon art instead of the 9-slice border: raised, pressed, hover (XML `gfxid_raised/pressed/hover`; `Button_c::SetGfx`). The button is the icon's size.
     pub gfx_override: Option<[GfxId; 3]>,
+    /// `Button_c::SetIconView` (1012779d), bitmap subset: independent local tint.
+    pub icon_view: Option<(GfxId, u32)>,
     /// `Button_c::SetBackgroundIcon` 0x10127d08; independent of border state art.
     pub background_icon: Option<GfxId>,
     pub background_icon_fade: f32,
     pub background_icon_timer: f32,
+    /// Server/owner-set toggle state, independent of a transient mouse press.
+    pub toggled: bool,
     pub pressed: bool,
     pub hover: bool,
 }
@@ -307,8 +313,6 @@ pub struct View {
     pub h_align: Align,
     pub v_align: Align,
     pub node: Node,
-    /// Unresolved initial sizing convention: anchor preferences to the initial page, not visibility (docs/gui.md).
-    pub selector_pref_child: Option<ViewId>,
     pub stacked: bool,
     pub flags: u32,
     /// `View::_ParentSized` 0x1014ad6c edge-follow mask.
@@ -354,7 +358,6 @@ impl View {
             h_align: Align::Center,
             v_align: Align::Center,
             node: Node::None,
-            selector_pref_child: None,
             stacked: false,
             flags: 0,
             resize_mask: 0,
@@ -676,14 +679,17 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
         "Button" => {
             let mut v = View::new(Kind::Button(ButtonData {
                 label: ctx.string(e, "label"),
+                label_color: e.attr("label_color").map(|_| color_attr(e, "label_color", 0xffffff)),
                 // `Button_c::SetGfx(state, id)` of an icon button (NPC chat button bar `FUN_10059704`): raised / pressed / hover art by gfx name
                 gfx_override: {
                     let g = |k: &str| e.attr(k).and_then(|n| ctx.gfx.id(n));
                     g("gfxid_raised").map(|r| [r, g("gfxid_pressed").unwrap_or(r), g("gfxid_hover").unwrap_or(r)])
                 },
+                icon_view: None,
                 background_icon: None, // Native Button XML constructor does not read bgicon (0x10128c73).
                 background_icon_fade: 0.0,
                 background_icon_timer: 0.0,
+                toggled: false,
                 pressed: false,
                 hover: false,
             }));
@@ -808,7 +814,7 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             apply_view_attrs(&mut v, e, 0);
             let id = tree.add(v);
             load_children(tree, ctx, id, e);
-            // Initial preferred sizing retains the existing selected-page convention; docs/gui.md.
+            // ViewSelector_c::Initialize 0x1014fd77 defaults use_max_size=true: all pages size the selector.
             tree.views[id].node = Node::Selector;
             id
         }

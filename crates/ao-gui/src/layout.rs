@@ -100,9 +100,8 @@ pub fn pref(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
 
 fn node_calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
     let v = &tree.views[id];
-    let sizing_child = v.selector_pref_child.filter(|child| v.children.contains(child));
     let kids: Vec<ViewId> = v.children.iter().copied().filter(|c| {
-        if v.node == Node::Selector && sizing_child.is_some() { Some(*c) == sizing_child } else { included(tree, *c) }
+        v.node == Node::Selector || included(tree, *c)
     }).collect();
     // (cmin, cmax, borders) per included child
     let info: Vec<(Point, Point, Rect)> = kids.iter().map(|c| {
@@ -147,7 +146,13 @@ fn node_calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
                 min
             }
         }
-        Node::Base | Node::Selector => {
+        // ViewSelector_c::CalculatePreferredSize 0x1014fe68 takes the componentwise
+        // largest preferred size across every page, including hidden pages.
+        Node::Selector => info.iter().fold(Point::new(-1.0, -1.0), |p, (min, mx, _)| {
+            let c = if max { mx } else { min };
+            Point::new(p.x.max(c.x), p.y.max(c.y))
+        }),
+        Node::Base => {
             let (mut min, mut mx) = (Point::new(-1.0, -1.0), Point::new(BIG, BIG));
             for (cmin, cmax, b) in &info {
                 min.x = min.x.max(cmin.x + b.l + b.r);
@@ -199,6 +204,12 @@ fn calc(env: &mut Env, tree: &Tree, id: ViewId, max: bool) -> Point {
                     let (w, h) = env.gfx.size(icon);
                     // 0x10127ee4: max(label, bitmap preferred size + 1), then mode-0 border/padding.
                     p.x = p.x.max(w as f32 + 25.0);
+                    p.y = p.y.max(h as f32 - 1.0 + 9.0);
+                }
+                if let Some((icon, _)) = b.icon_view {
+                    let (w, h) = env.gfx.size(icon);
+                    // CalculatePreferredSize 10127ee4: icon extent + 2px gap.
+                    p.x += w as f32 + 2.0;
                     p.y = p.y.max(h as f32 - 1.0 + 9.0);
                 }
                 p
