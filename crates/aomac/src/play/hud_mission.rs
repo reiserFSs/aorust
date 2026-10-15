@@ -307,7 +307,7 @@ impl HudMission {
             POPUP_MAP => {
                 // `FUN_100d2409`: the marker of the quest's first action position
                 if let Some(p) = self.quest(key).and_then(Quest::world_pos) {
-                    self.marker = Some((p.playfield.instance as u32, [p.x as f32, p.z as f32]));
+                    self.marker = Some((p.playfield.instance as u32, [p.local[0], p.local[2]]));
                 }
             }
             POPUP_TEAM => {
@@ -424,7 +424,7 @@ mod tests {
     use ao_net::msg::Identity;
 
     fn quest(instance: i32, name: &str, flags: i32, deadline: i32) -> Quest {
-        let action = quest::QuestAction { id: 1, identities: [Identity::default(); 8], floats: [0.0; 8], ints: [deadline, 0], pos: quest::WorldPos { playfield: Identity { kind: 0xC79C, instance: 4605 }, x: 1500, z: 2500, local: [0.0; 3] } };
+        let action = quest::QuestAction { id: 1, identities: [Identity::default(); 8], floats: [0.0; 8], ints: [deadline, 0], pos: quest::WorldPos { playfield: Identity { kind: 0xC79C, instance: 4605 }, x: 1500, z: 2500, local: [123.5, 45.0, 678.25] } };
         Quest { id: Identity { kind: quest::QUEST_KIND, instance }, name: name.into(), value_a4: flags, actions: vec![action], ..Default::default() }
     }
 
@@ -496,7 +496,7 @@ mod tests {
         // Upload2Map: the first action's playfield and position
         m.popup = Some(1);
         m.picked(&mut gui, &zone, POPUP_MAP);
-        assert_eq!(m.take_marker(), Some((4605, [1500.0, 2500.0])));
+        assert_eq!(m.take_marker(), Some((4605, [123.5, 678.25])));
         // UpdateTeamMembers: sent for the quest
         m.popup = Some(2);
         m.picked(&mut gui, &zone, POPUP_TEAM);
