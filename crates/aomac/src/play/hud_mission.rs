@@ -10,9 +10,9 @@
 //! `N3Msg_UpdateNearbyTeamMembers`) and `DeleteMission` (`FUN_100d2517`: the `ReallyWant2DeleteMission` box `Warning`, Yes / No; Yes = `N3Msg_RemoveQuest`).
 //!
 //! UNRESOLVED / GUESS: the window's size and place (`MissionViewConfig` holds nothing, the ctor's size `FUN_100cf72a` is not decoded: 300 x 180 at the screen centre), the
-//! format of the Remaining cell (the item stores an integer; `h:m:s` like the NCU window's cell), the order of the rows (sort column 0xf, ascending), the text the original
-//! emits when a kept quest (`Quest_t+0xa4` bit 10) is removed (`GetText(0x66)`), which of the action position fields is the marker position (we take the integer `x`, `z`
-//! of `WorldPos_c`), the server messages that add / remove single quests (only `QuestFullUpdateIIR_t` replaces the list).
+//! Remaining uses hours:minutes (`FUN_1003cdf6`, case 0xf), from integer seconds, not NCU centiseconds.
+//! UNRESOLVED: exact row tie order; kept-quest feedback is `GetText(0x66, "Quest_CannotDelete")`;
+//! single-quest removal is synchronized from Zone.
 
 use super::hud::WindowKind;
 use super::hud_bar::icon_image;
@@ -257,7 +257,7 @@ impl HudMission {
         for q in &quests {
             // `N3Msg_QuestRemainingTime`: -1 (no deadline / past) shows as 0
             let left = now.and_then(|n| q.remaining_secs(n)).unwrap_or(0);
-            let cells = columns.iter().map(|c| if c.id == COL_REMAINING { lv::hms(left as i32 * 100) } else { q.name.clone() }).collect();
+            let cells = columns.iter().map(|c| if c.id == COL_REMAINING { remaining(left) } else { q.name.clone() }).collect();
             let icon = self.icon(gui, q.icon);
             rows.push(Row { key: q.id.instance, icon, cells, tip_title: q.name.clone(), tip_body: String::new() });
         }
@@ -377,6 +377,11 @@ impl HudMission {
     }
 }
 
+/// GUI 0x1003cf68: seconds / 3600 and (seconds / 60) % 60, `%02d:%02d`.
+fn remaining(seconds: u32) -> String {
+    format!("{:02}:{:02}", seconds / 3600, seconds / 60 % 60)
+}
+
 #[cfg(test)]
 impl HudMission {
     pub(super) fn set_quests(&mut self, quests: &[Quest]) {
@@ -424,6 +429,13 @@ mod tests {
     }
 
     #[test]
+    fn remaining_cell_uses_native_hours_and_minutes_without_centisecond_overflow() {
+        for (seconds, text) in [(0, "00:00"), (59, "00:00"), (60, "00:01"), (3599, "00:59"), (3600, "01:00"), (360_061, "100:01"), (u32::MAX, "1193046:28")] {
+            assert_eq!(remaining(seconds), text);
+        }
+    }
+
+    #[test]
     fn received_mission_native_flag_emits_one_empty_event_per_quest() {
         let dir = ao_gui::client_dir();
         if !dir.join("cd_image/text").exists() { return; }
@@ -461,7 +473,7 @@ mod tests {
         m.sync = Some((10_000, 0.0));
         m.serial += 1;
         m.update(&mut gui, 0.0);
-        assert_eq!(m.shown(), vec![(2, vec!["Team Job".into(), "00:00:00".into()]), (1, vec!["Rat Hunt".into(), "00:01:30".into()])]);
+        assert_eq!(m.shown(), vec![(2, vec!["Team Job".into(), "00:00".into()]), (1, vec!["Rat Hunt".into(), "00:01".into()])]);
         let win = m.win.as_ref().unwrap().win;
         for (width, height) in [CLIENT, (640, 400), (900, 600)] {
             gui.resize_window(win, ao_gui::WindowSize::Fixed(width, height));
@@ -480,7 +492,7 @@ mod tests {
         }
         // the remaining time counts down with the server clock
         m.update(&mut gui, 30.0);
-        assert_eq!(m.shown()[1].1[1], "00:01:00");
+        assert_eq!(m.shown()[1].1[1], "00:01");
         // Upload2Map: the first action's playfield and position
         m.popup = Some(1);
         m.picked(&mut gui, &zone, POPUP_MAP);
@@ -505,7 +517,7 @@ mod tests {
         zone.quests.insert(m.quests[1].id, m.quests[1].clone());
         m.sync_removed(&zone);
         m.update(&mut gui, 0.0);
-        assert_eq!(m.shown(), vec![(2, vec!["Team Job".into(), "00:00:00".into()])]);
+        assert_eq!(m.shown(), vec![(2, vec!["Team Job".into(), "00:00".into()])]);
     }
 
     /// `MP_Quest_Icon`: `icon_at` finds a quest row and misses empty space (regression for the shift-to-inspect cursor).
