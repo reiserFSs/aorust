@@ -126,7 +126,8 @@ pub(in crate::play) fn ground_map(scene: &ao_scene::Scene, report: &ao_formats::
 }
 
 fn canvas_xml(name: &str, size: (u32, u32)) -> String {
-    format!("<CanvasView name=\"{name}\" min_size=\"Point({},{})\" max_size=\"Point(16000,{})\"/>", size.0.saturating_sub(1), size.1.saturating_sub(1), if name == "buttons" { BUTTONS_H - 1 } else { 16000 })
+    let min = if name == "buttons" { (size.0.min(54).saturating_sub(1) as i32, size.1.saturating_sub(1) as i32) } else { (-1, -1) };
+    format!("<CanvasView name=\"{name}\" min_size=\"Point({},{})\" max_size=\"Point(16000,{})\"/>", min.0, min.1, if name == "buttons" { BUTTONS_H - 1 } else { 16000 })
 }
 
 impl HudMap {
@@ -639,6 +640,9 @@ mod tests {
                 assert_eq!(button_index_at(left + size / 2.0, 13.0, width), Some(i));
             }
         }
+        gui.resize_window(window, WindowSize::Fixed(100, 100));
+        let small = gui.canvas_size(window, "map");
+        assert!(small.0 <= 100 && small.1 <= 100, "constructor dimensions are not native viewport minima: {small:?}");
     }
 
     use crate::play::zone::DynelState;
