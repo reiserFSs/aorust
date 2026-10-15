@@ -609,6 +609,21 @@ mod tests {
             assert!(hp.t > header.b && nano.t > hp.b);
             assert!(nano.b <= background.b);
         }
+        // GUI 100791f7 gives the bar pair and both text children two-pixel
+        // top/bottom borders; the horizontal row takes their maximum.
+        let hp_height = gui.gfx().size(ao_gui::GfxId(0x1b)).1 as f32;
+        let nano_height = gui.gfx().size(ao_gui::GfxId(0x1d)).1 as f32;
+        let text_height = gui.fonts().font(ao_gui::FontId::Normal).height as f32;
+        let row_height = text_height.max(hp_height + nano_height) + 4.0;
+        for i in 0..ROWS {
+            let row = gui.view_rect(w, &format!("hl{i}")).unwrap();
+            let hp = gui.view_rect(w, &format!("hp{i}")).unwrap();
+            let nano = gui.view_rect(w, &format!("nano{i}")).unwrap();
+            assert_eq!(row.height() + 1.0, row_height);
+            assert_eq!(hp.height() + 1.0, hp_height);
+            assert_eq!(nano.height() + 1.0, nano_height);
+            assert_eq!(nano.t, hp.b + 1.0);
+        }
         assert!(gui.frame(0.0).cmds.iter().any(|cmd| matches!(cmd,
             ao_gui::DrawCmd::Gfx { id: ao_gui::GfxId(0x198), dst, .. }
             if dst[0] == background.l && dst[1] == background.t
