@@ -283,13 +283,13 @@ impl NpcChat {
         gui.view_rect(self.win, "npcchat").map_or(CLIENT.1, |r| (r.height() + 1.0) as u32)
     }
 
-    /// The splitter bitmap: `GFX_GUI_NPCCHAT_SEPERATOR` over the view's width ([INFERENCE]: `BitmapView_c` drawing was not read, the 16000 px max width suggests it
-    /// is stretched).
+    /// BitmapView::AddBitmap (GUI 10125720/10125693) loads a white surface with flags 0xf and assigns the view bounds.
+    /// ViewSurface::_LayoutSelf (101509e1) stretches both axes without tiling (bits 0x10/0x20 are clear).
     fn paint_splitter(&self, gui: &mut Gui) {
-        let (w, _) = gui.canvas_size(self.win, "npc_split");
+        let (w, h) = gui.canvas_size(self.win, "npc_split");
         if let Some(id) = gui.gfx().id(SPLITTER_GFX) {
             let (iw, ih) = gui.gfx().size(id);
-            gui.set_canvas(self.win, "npc_split", vec![CanvasItem::Image { id, src: [0.0, 0.0, iw as f32, ih as f32], dst: [0.0, 0.0, w as f32, ih as f32], alpha: 1.0 }]);
+            gui.set_canvas(self.win, "npc_split", vec![CanvasItem::ImageTint { id, src: [0.0, 0.0, iw as f32, ih as f32], dst: [0.0, 0.0, w as f32, h as f32], color: 0xffffff, alpha: 1.0 }]);
         }
     }
 
@@ -588,6 +588,22 @@ mod tests {
         gui.input(InputEvent::MouseDown { x, y, button: MouseButton::Left });
         let evs = gui.input(InputEvent::MouseUp { x, y, button: MouseButton::Left });
         assert!(evs.iter().all(|e| !matches!(e, Event::Clicked { .. })), "{evs:?}");
+    }
+
+    #[test]
+    fn splitter_stretches_the_original_bitmap_without_tint_or_tiling() {
+        let Some(mut gui) = rig() else { return };
+        let mut w = open_chat(&mut gui, BarFlags::default());
+        gui.set_window_outer_frame(w.win, (20, 20, 560, 410));
+        w.apply_split(&mut gui);
+        let (width, height) = gui.canvas_size(w.win, "npc_split");
+        assert!(width > 32);
+        assert_eq!(height, 3);
+        assert_eq!(gui.canvas_items(w.win, "npc_split"), &[CanvasItem::ImageTint {
+            id: gui.gfx().id(SPLITTER_GFX).unwrap(), src: [0.0, 0.0, 32.0, 3.0],
+            dst: [0.0, 0.0, width as f32, height as f32], color: 0xffffff, alpha: 1.0,
+        }]);
+        w.close(&mut gui);
     }
 
     #[test]

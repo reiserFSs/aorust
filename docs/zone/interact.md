@@ -53,7 +53,7 @@ item), `N3Msg_NPCChatEndTrade` 0x10017fb1 (flag = `!param_4`), `N3Msg_SendNPCCha
   `FUN_10058371(y = offset.y + point.y)`: `split = y / (Height + 1.0)`; `split < 0.1` (`_DAT_101b2058` = the double 0x3fb99999a0000000 = 0.1f) -> `split = 0.1f` (`_DAT_101b2054`);
   else `split > 0.9` (`_DAT_101af630`, double 0.9f) -> `0.9f` (`_DAT_101b2050`); then `FUN_1005824d` re-lays the view out; slot 16 `FUN_10058230` (mouse up) ends the drag. Port:
   `interact_chat::NpcChat::{drag_start, drag_by, drag_end, pointer_over}` + `split_from`, the splitter being a `CanvasView` (`CanvasPress/Drag/Release`) painted with the separator art
-  ([INFERENCE]: stretched over the width; `BitmapView_c` drawing not read); `Play::interact_pointer` draws the pointer sprite over the splitter and hides the OS pointer.
+  stretched across the view bounds: `BitmapView::AddBitmap` GUI `10125720` loads `ViewSurface::Load(id,0xf)`, `10125693` assigns `View::GetBounds`; `ViewSurface::_LayoutSelf` `101509e1` anchors all four edges and leaves the source unchanged (no tile bits 0x10/0x20). Surface initialization `10151e5c` sets white `0xffffff`; the NPC splitter does not override it. `Play::interact_pointer` draws the pointer sprite over the splitter and hides the OS pointer. Regression `splitter_stretches_the_original_bitmap_without_tint_or_tiling` checks the installed 32×3 source, resized destination and white modulation (headless; not a retail render comparison).
   Note the `- 1` of `FUN_10058100`: the dragged text height is `floor(y - 1)` (a press without movement keeps 209, the first pixel of movement lowers it by 1 more).
 * Text composition (`FUN_100586fd`, the `AddText` slot; ported as `interact_chat::Composer`, tests in that file). `type` = `NPCChatTextType_e`:
 
