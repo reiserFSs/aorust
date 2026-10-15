@@ -613,14 +613,19 @@ impl Hud {
         self.nano.take_casts()
     }
 
+    pub(super) fn take_nano_feedback(&mut self) -> Vec<&'static str> {
+        self.nano.take_feedback()
+    }
+
     /// The zone frames [`Hud::on_zone_frame`] reads (the flow keeps them until the HUD exists).
     pub(super) fn wants_zone_frame(f: &Frame) -> bool {
         super::hud_winb::wants(f) || super::hud_mission::wants(f)
     }
 
     /// Every zone frame: team members / invitations, the own perk map and perk updates (`hud_winb.rs`).
-    pub(super) fn on_zone_frame(&mut self, gui: &mut Gui, f: &Frame, own: i32, ignored: impl Fn(u32) -> bool) {
-        self.winb.on_zone_frame(f, own);
+    pub(super) fn on_zone_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &mut Zone, ignored: impl Fn(u32) -> bool) {
+        let own = zone.char_id as i32;
+        self.winb.on_zone_frame(f, zone);
         for (event, data) in self.mission.on_frame(f, own) {
             self.trigger_tip(gui, event, data);
         }
@@ -720,6 +725,10 @@ impl Hud {
         self.stats.nano_stats_changed(zone)
     }
 
+    pub(super) fn tick_stat_effects(&mut self, zone: &mut Zone, dt: f64) -> Option<i32> {
+        self.stats.tick_stat_effects(zone, dt)
+    }
+
     /// Inventory items released over a foreign window since the last call (`HudStats::take_drops`).
     pub(super) fn take_item_drops(&mut self) -> Vec<(u32, f32, f32)> {
         self.stats.take_drops()
@@ -740,6 +749,7 @@ impl Hud {
     }
 
     pub(super) fn activate_item(&mut self, zone: &Zone, slot: u32) {
+        self.stats.set_nano_cast_busy(zone.world.nano_busy(zone.char_id as i32));
         self.stats.activate_item(zone, slot);
         self.outbox.extend(self.stats.take_outbox());
     }
@@ -934,6 +944,7 @@ impl Hud {
     }
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, _dt: f32) {
+        self.stats.set_nano_cast_busy(zone.world.nano_busy(zone.char_id as i32));
         self.refresh(gui, zone);
         if let Some(line) = self.options.apply(&mut self.dvalues, zone, &mut self.outbox) {
             self.system_lines.push(line);
@@ -1001,6 +1012,9 @@ impl Hud {
             }
         }
         self.nano.update(gui, zone, _dt);
+        for (spell, effect) in self.nano.take_initiations() {
+            zone.world.start_local_nano(spell, effect);
+        }
         self.start_nano_drag(gui);
         self.ncu.update(gui, zone, _dt);
         self.target_ncu.update(gui, &mut self.dvalues, &mut self.wincfg, zone, self.size, _dt);
@@ -1083,6 +1097,7 @@ impl Hud {
 
     /// Mouse-down outside an open sub menu closes it (the original's popup menus lose focus).
     pub(super) fn input(&mut self, gui: &mut Gui, zone: &mut Zone, player: Option<&super::player::Player>, ev: &InputEvent, mods: ao_gui::Modifiers) {
+        self.stats.set_nano_cast_busy(zone.world.nano_busy(zone.char_id as i32));
         self.target_ncu.input(gui, ev, mods);
         self.winb.raid_bar_input(gui, ev, &self.dvalues);
         for s in &mut self.shortcuts {
@@ -1237,6 +1252,7 @@ impl Hud {
 
     /// `true` when the event was consumed by the HUD.
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
+        self.stats.set_nano_cast_busy(zone.world.nano_busy(zone.char_id as i32));
         if self.research_vehicle.event(gui, ev, zone, &mut self.winb.perks, &mut self.dvalues) {
             self.outbox.append(&mut self.research_vehicle.outbox);
             self.system_lines.append(&mut self.research_vehicle.lines);
@@ -2120,6 +2136,80 @@ mod tests {
             o.png(s, &list, &std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
         }
     }
+    /// Offline presentation fixture only: synthetic perk inputs, real installed catalogue/art.
+    #[test]
+    fn progression_offline_window_shots() {
+        if std::env::var_os("AOMAC_SHOT_DIR").is_none() { return; }
+        let Some((mut s, mut o)) = shot((1280, 800)) else { return };
+        for kind in WindowKind::ALL { s.hud.close_kind(&mut s.gui, kind); }
+        s.zone.stats.extend([(4, 1), (54, 10), (60, 7), (389, 0xff)]);
+        s.hud.winb.perks.known.0.insert(100, 0);
+        s.zone.completed_perks = Some(vec![100]);
+        s.hud.open(&mut s.gui, WindowKind::Perks);
+        o.frame(&mut s, 0.016);
+        let w = s.gui.window_ids().into_iter().find(|&w| s.gui.view_rect(w, "line0").is_some()).unwrap();
+        s.hud.event(&mut s.gui, &Event::Clicked { window: w, view: "line0".into(), item: None }, &s.zone);
+        png(&mut s, &mut o, "offline-perks-native-state");
+        s.hud.close_kind(&mut s.gui, WindowKind::Perks);
+
+        // No completed/active research is invented: these pages show the empty server snapshot.
+        s.hud.open(&mut s.gui, WindowKind::Research);
+        o.frame(&mut s, 0.016);
+        let w = s.gui.window_ids().into_iter().find(|&w| s.gui.view_rect(w, "research_pages").is_some()).unwrap();
+        for (index, name) in ["allocate", "available", "finished"].into_iter().enumerate() {
+            s.hud.event(&mut s.gui, &Event::TabSelected { window: w, index }, &s.zone);
+            png(&mut s, &mut o, &format!("offline-research-{name}"));
+            let root = s.gui.view_rect(w, "research_pages").unwrap();
+            let headings: &[&str] = if index == 0 {
+                &["personal_heading", "global_heading", "personal_started_heading", "global_started_heading"]
+            } else { &["personal_heading", "global_heading", "selected_heading"] };
+            for heading in headings {
+                let heading = format!("page{index}_{heading}");
+                let rect = s.gui.view_rect(w, &heading).unwrap();
+                let text = s.gui.text(w, &heading);
+                let width = s.gui.text_width(ao_gui::FontId::Normal, &text) as f32;
+                assert!(rect.l >= root.l && rect.t >= root.t && rect.l + width <= root.r + 1.0 && rect.b <= root.b,
+                    "{name}: {text:?} paints outside {root:?}: rect={rect:?}, text_width={width}");
+                assert!(width <= rect.width() + 1.0, "{name}: {text:?} escapes its allocated heading: {rect:?}");
+            }
+            if index != 0 {
+                let left = s.gui.view_rect(w, &format!("page{index}_personal_heading")).unwrap();
+                let right = s.gui.view_rect(w, &format!("page{index}_selected_heading")).unwrap();
+                assert!(left.r < right.l, "{name}: project and selected-line headings overlap");
+            }
+            if index == 1 {
+                let bars: Vec<_> = s.gui.view_names(w).into_iter().filter(|n| n.starts_with("hover_") && n.ends_with("_bar")).collect();
+                assert_eq!(bars.len(), 7, "fresh profession-7 snapshot has seven first personal projects");
+                let draw = s.gui.frame(0.0);
+                let fills: Vec<_> = draw.cmds.iter().filter_map(|cmd| match cmd {
+                    ao_gui::DrawCmd::Gfx { id: ao_gui::GfxId(0xe1), src, dst, .. } => Some((src, dst)),
+                    _ => None,
+                }).collect();
+                assert_eq!(fills.len(), bars.len());
+                for (src, dst) in fills {
+                    // Native inclusive Powerbar extent at fraction zero is one pixel, not a full 80px image.
+                    assert_eq!(src[2], 1.0);
+                    assert_eq!(dst[2] - dst[0], 1.0);
+                }
+            }
+        }
+        s.hud.close_kind(&mut s.gui, WindowKind::Research);
+
+        s.hud.open(&mut s.gui, WindowKind::Skills);
+        o.frame(&mut s, 0.016);
+        let w = s.hud.stats_window(WindowKind::Skills).unwrap();
+        s.hud.event(&mut s.gui, &Event::Clicked { window: w, view: "abilities".into(), item: None }, &s.zone);
+        png(&mut s, &mut o, "offline-skills-full");
+        s.hud.event(&mut s.gui, &Event::FrameIcon { window: w, x: 300, y: 100 }, &s.zone);
+        let row_height = s.gui.fonts().font(ao_gui::FontId::Normal).height as f32 + 2.0;
+        let (x, y) = (320.0, 102.0 + row_height / 2.0);
+        send(&mut s, InputEvent::MouseMove { x, y });
+        send(&mut s, InputEvent::MouseDown { x, y, button: MouseButton::Left });
+        send(&mut s, InputEvent::MouseUp { x, y, button: MouseButton::Left });
+        s.hud.event(&mut s.gui, &Event::Clicked { window: w, view: "abilities".into(), item: None }, &s.zone);
+        png(&mut s, &mut o, "offline-skills-compact");
+    }
+
 
     /// Real GUI mouse events through Hud::input/event, including its outbox and window dvalue.
     #[test]
@@ -2146,7 +2236,8 @@ mod tests {
             o.frame(s, 0.016);
             let w = s.hud.stats_window(WindowKind::Skills).unwrap();
             click_view(s, o, w, "abilities");
-            click_view(s, o, w, "name");
+            let r = s.hud.stats.skill_name_rect(&s.gui, 16);
+            click_at(s, o, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
             assert_eq!(s.gui.text(w, "pointdelta"), "<div align=\"right\">0</div>");
             let r = s.gui.view_rect(w, "btn16").unwrap();
             click_at(s, o, r.l + (r.r - r.l) * 0.75, (r.t + r.b) / 2.0);
@@ -2244,7 +2335,7 @@ mod tests {
         let from = ao_net::msg::Identity { kind: 50000, instance: 9 };
         let invitation = ao_net::n3::team::TeamInvite { from, flag: 0, name: "Inviter".into(), refusal: None };
         let frame = ao_net::n3::outgoing::n3_frame(0, own as u32, ao_net::n3::team::team_invite(ao_net::msg::Identity { kind: 50000, instance: own }, &invitation));
-        s.hud.on_zone_frame(&mut s.gui, &frame, own, |id| id == 9);
+        s.hud.on_zone_frame(&mut s.gui, &frame, &mut s.zone, |id| id == 9);
         assert!(s.hud.winb.team.state.invite.is_none());
         assert_eq!(s.hud.winb.team.invite_dialog(&mut s.gui), None);
         let reply = s.hud.take_outbox();
@@ -2748,9 +2839,16 @@ mod tests {
         assert_eq!(s.hud.shortcuts[0].slot_names()[5], "Shadow Touch");
         s.hud.shortcuts[0].use_slot(5, &s.hud.actions.list);
         assert_eq!(s.hud.shortcuts[0].take_uses(), [SlotUse::Nano(163449)]);
-        s.zone.set_target(Some(ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: s.zone.char_id as i32 }));
+        s.zone.stats.extend([(224, 2), (662, 0), (318, 100), (381, 0), (214, 10000)]);
+        s.zone.nano_motion = Some(super::super::hud_nano::NanoMotion {
+            pos: [0.0; 3], radius: 0.5, mode: 3, moving: false, falling: false, input_locked: false,
+        });
+        // Real Shadow Touch Flags0x8c000 require an explicit character target.
+        let own = ao_net::msg::Identity { kind: ao_net::n3::outgoing::DYNEL_CHAR, instance: s.zone.char_id as i32 };
+        s.zone.set_target(Some(own));
         s.hud.nano.cast(&mut s.gui, &s.zone, 163449);
         assert_eq!(s.hud.nano.take_outbox().len(), 1);
+        assert!(s.hud.take_nano_feedback().is_empty());
     }
 
     /// The first-login hotbar: Start Combat / Walk / Sit / Suspended Animation icons from rdb 1010008, the Follow macro, use,

@@ -45,27 +45,54 @@ Feedback texts are printed with `FUN_10058b00(key)` only when `char+0x140` (is c
 Order (all [RE], `combat::can_attack`):
 
 1. If `controller+0x38 == 0` and the controller map `+0x1c` holds key `0x3d` or `0x3f` with non-zero value, and `VisualFlags` (673) `& 0x20` → `false`, silent.
-   (What the map/`+0x38` are is unresolved; field `Attacker::status_blocked`.)
+   (`FUN_10068072` resolves real weapon objects, not condition ids; `Armory::slot_item` supplies the map entries. The mounted `+0x38` override remains unrepresented.)
 2. `GetDynel(target)`; dynamic casts to `SimpleChar_t` and `SimpleItem_t`.
    * `SimpleItem`: if `vtable+0x14(0x10000000)` → `FUN_100811ac(0xb, …) != 0`; else `Feedback_YouCantAttackThisItem`.
    * not a `SimpleChar`, or not `IsInTree` → `false`, silent.
 3. target == self → `Feedback_YouCantAttackYourself`.
-4. `Features`(224)`& 0x20000000` of the **target's** area object (`FUN_10044b6e(this = target+0x1ec, mask)` reads stat `0xe0` of the dynel at `obj+0x40`):
+4. **Target character** `Features`(224)`& 0x20000000`: `FUN_10044b6e(this = target+0x1ec, mask)` follows helper `+0x40` to the owning character and calls the direct stat-holder `GetStat(0xe0,2)`, not exported `N3Msg_GetSkill(...,2)` or a separate area's stats. `10058e52` uses raw Features and replaces bit `0x800` with native `IsGrid`.
    `false`; `Feedback_CantbeAttacked` printed unconditionally unless `char+0x21c`.
-5. GM override: (attacker area `Features & 0x80000000` and attacker `GmLevel`(215) ≠ 0) or the same for the target → `true`.
+5. GM override: (attacker character `Features & 0x80000000` and attacker `GmLevel`(215) ≠ 0) or the same for the target → `true`.
 6. If `!char+0x21c` and movement mode == 4 (`FUN_100574e2`=`char+0x50` vehicle → `FUN_1006ed98`=`+0x178` controller → `FUN_100704e6`=`+4` mode) → `Feedback_YouCantAttackWhileSwimming`.
-7. Attacker area `Features & 0x400` or mode == 7 ([INFERENCE] falling: `FUN_1006dd0c` calls `Vehicle_t::EnableFalling` for mode 7) → `Feedback_YoureUnableToAttack`.
+7. Attacker character `Features & 0x400` or mode == 7 ([INFERENCE] falling: `FUN_1006dd0c` calls `Vehicle_t::EnableFalling` for mode 7) → `Feedback_YoureUnableToAttack`.
 8. Target `dynel+0x138` bit 4 (dead): `Health`(27) ≠ 0 → `false` silent, else `Feedback_TargetIsAlreadyDead`.
 9. Target `char+0x21c` and `NPCIsSurrendering`(449) ∈ {1,2}; `NPCSurrenderInstance`(451) names the surrender partner:
    partner == self and state 2 → `Feedback_YouAcceptedSurrender`; partner ≠ self: state 1 → `Feedback_TargetIsSurrendering`, state 2 → `Feedback_TargetHasSurrendered`; otherwise fall through.
 10. Tail (0x1006991e): the target's own fight target is the attacker → `true`. Else both district fight-mode levels (`FUN_1003e1d0` [GC], default 2, from the playfield's `FightModeHandler`/`PlayfieldDistrictInfo`; override `char+0xf4` of the state object when `char+0x13a & 1`);
     target level < attacker level prints `Feedback_TargetIsInADistrictWithHigherSuppression` **but does not deny**. If `char+0x21c` and `Side`(33)==3 (neutral): allowed iff both levels ≠ 0. Else if the attacker has a team record (`char+0x1e0`) and the target is a member of the active team or of any of the 6 sub-teams
-    (`FUN_1006581f`/`FUN_10065865`, team identity kind `0xDEA9`) → `false` (+ `FUN_10068d6b(5)`, a CharacterAction id `0x76` request, when `report`; not modelled); otherwise `true`.
+    (`FUN_1006581f`/`FUN_10065865`, team identity kind `0xDEA9`) → `false` unless `FUN_10058868()->state == 5` (+ `FUN_10068d6b(5)`, a CharacterAction id `0x76` request, when `report`; that request is not modelled); otherwise `true`.
 
 `FormatFeedbackIIR` category `0x23` (sub-codes 1…14) prints the server-side refusal texts, in the order the strings are pushed in `FUN_1005d0d8` [GC]
 (`CombatIsNotPossibleInThisDistrict`, `AttackNotAllowedSinceYouAreOnSameSide`, `YouCannotAttackThisPlayerTooFarAwayInLevel`, `…ThisTowerTooFarAwayInLevel`, `YouCannotAttackYourPet`,
 `NotAllowedToAttackTeamMembers`, `PvpNotAllowedInThisDistrict`, `PvpNotAllowedSinceYouAreNeutral`, `PvpNotAllowedSinceYourTeamIsNeutral`, `CantAttackTargetIsInPvpGrace`, `DefenseShieldEnabled`,
 `CantAttackTargetYouAreInMixedTeam`, `TowersCanOnlyBeAttackedWhenGaslevelBelow75`, `CantAttackTargetYouAreInMixedTeamBattlestation`). [INFERENCE for the sub-code → text pairing: the switch table was not walked; only the string order is known.]
+
+### Shared live admission projection
+
+`play/combat/module.rs::can_attack` is the single source/target builder for
+normal attacks, secondary specials, and the hostile-nano final guard
+(`GC 1004e7eb` calls `10069556`, except self-target). It uses applied
+`Zone` character skills and raw Features with the native Grid overlay, surrender stats 449/451, replicated death,
+fight-target retaliation, and the existing `Zone.target_team` TeamManager
+projection (ordinary group or all six raid groups), rather than zeroed
+`CharTarget` defaults.
+
+`Player::frame` publishes `character_fight_levels` after movement integration:
+the own movement position and each other actor's runtime position (received
+position if no actor exists) are queried through the existing `FightLevels`.
+Only `FUN_1003e1d0`'s real missing-playfield/district/handler result is 2;
+an absent published query is not converted to 2 and admission is withheld.
+The existing movement spell executor also publishes `crowd_state`: CFF0
+dispatches `100a81eb` -> `1004593b` (state 5), removal -> `10045821`;
+`100458fa` lets a lower-numbered state preempt a higher one. No active-spell
+presence heuristic or duplicate status machine is used.
+
+The `char+0x13a & 1` cached `CharState+0xf4` suppression override remains
+unrepresented: `1003f239` caches the previous district level, not the new
+one (`1003f348`; `10124b70` resets it via old=-1). Current-position district
+queries are authoritative for the available uncached path, not a claim that
+this cache branch is implemented.
+
 
 ### 2.1 `N3Msg_DefaultAttack(target, switch)` (`combat::default_attack`)
 
@@ -154,9 +181,9 @@ Release handler `FUN_1002c469` (event 1 = left, 2 = right) [RE]:
 
 * Receiver of `PACKET_TYPE_DEFAULT_ATTACK` and the default key list (`Setupf/hotkeys.txt`, missing from this install; the Q key rests on the in-client help text).
 * Which of the two `& 0xc` qualifier bits is CTRL and which ALT.
-* Meaning of `controller+0x38` / the condition map keys `0x3d`/`0x3f` in the opening gate of `can_attack`.
-* Target-control hostility is a separate native predicate, not a caller of `GetCloseTarget` classification: GUI `0x100744ae` uses ordinary Side for `N3Msg_IsNpc` targets, but calls `N3Msg_CanAttack` for players. **Unresolved player-hostility gap:** `hud_target::info` still leaves ordinary players non-hostile; substituting team/BattleStation tab classes would be incorrect. Fresh tracing GC `0x10069556`, `0x10058816`, `0x10058868`, `0x10044b6e`, `0x1003e1d0`, `0x1003e228`, `0x1003f239` identifies missing faithful guard inputs: fight controller `+0x38` and condition-map keys `0x3d/0x3f`; the owning dynel's Features stat224 through helper owner `+0x40`; per-character district/cached fight level (controller `+0xf4`, character state flags `+0x13a` bit0 for CanAttack); and the first word of the lazily allocated own `char+0x1f0` object, compared with 5 before excluding team/raid members. Existing `combat::module` builders substitute zero features/status, level2 and no team; reusing them as faithful HUD PvP classification would conceal this missing state. Team/raid membership itself is now available from `Zone::target_team`; authored district levels are available from `FightLevels`, but the override/controller fields are not retained. No guessed PvP classification is added.
-  This is **queued port-state plumbing, not indeterminate native behavior**: `char+0x1f0` resolves through `0x10058868` to an 8-byte control-status object (`0x1004580e`: initial state0, owning-character pointer). State5 is set by `0x1004593b` from spell handler `0x100a81eb` and cleared by `0x10045821`; the other recovered setters are fear state1 `0x10045971`, NPC pacify state2 `0x100459ca`, mindcontrol state3 `0x10045a4d`, and daze state4 `0x10045a71` (clear `0x100458ce`). These setters/removers and the guard predicates are recovered; retaining them and the cached controller state must precede a faithful player CanAttack/HUD cutover.
+* Mounted `controller+0x38` weapon override in the opening gate; ordinary `0x3d`/`0x3f` map entries are resolved by `Armory` (`10068072`).
+* Target-control hostility is a separate native predicate, not a caller of `GetCloseTarget` classification: GUI `0x100744ae` uses ordinary Side for `N3Msg_IsNpc` targets, but calls `N3Msg_CanAttack` for players. **Unresolved player-hostility gap:** `hud_target::info` still leaves ordinary players non-hostile; substituting team/BattleStation tab classes would be incorrect. The shared combat guard now projects character Features stat224 through helper owner `+0x40` (`0x10044b6e`), actual-position district queries (`0x1003e1d0`), team/raid membership from `Zone::target_team`, and the existing movement executor's crowd state. Mounted controller `+0x38` and cached fight-level controller `+0xf4` / character state flags `+0x13a` bit0 remain unrepresented; no guessed HUD PvP classification is added.
+  Native status provenance is recovered, not indeterminate behavior: `char+0x1f0` resolves through `0x10058868` to an 8-byte object (`0x1004580e`: initial state0, owning-character pointer). State5 is set by `0x1004593b` from spell handler `0x100a81eb` and cleared by `0x10045821`; other setters are fear1 `0x10045971`, NPC pacify2 `0x100459ca`, mindcontrol3 `0x10045a4d`, and daze4 `0x10045a71` (clear `0x100458ce`). The own movement executor retains the relevant PC state and publishes it for the shared guard; cached district/controller state still needs retention before a faithful HUD player-hostility cutover.
 * Sub-code → text pairing of `FormatFeedback` category `0x23`; whether categories `0x26` / `0x31` have fixed texts beyond `Feedback_StartingAttackFailed`.
 * Movement mode 7 meaning (falling is inferred).
 

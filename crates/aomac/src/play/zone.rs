@@ -95,6 +95,10 @@ pub const TELEPORT_TIMEOUT: f32 = 30.0;
 pub struct Zone {
     pub char_id: u32,
     pub playfield: Option<u32>,
+    /// Native AreaInfo resource identity: proxy.playfield.instance, not geometry exit-door id.
+    pub area_playfield: Option<u32>,
+    /// GC 10121d84: resolved zone-zero area name is exactly `Grid`; absent metadata is false.
+    pub is_grid: bool,
     /// Headless/gameplay projection of the same server-driven TeamManager as the Team window.
     pub(super) target_team: super::hud_team::TeamState,
     /// Global research side timers, merged by id as in GC 1002bea2.
@@ -118,14 +122,28 @@ pub struct Zone {
     /// The own character's raw stats: `FullCharacterIIR_t` (stats_a, stats_b, u8, i16) then every own `StatIIR_t`.
     /// (docs/zone/world.md §2; the interface reads them like `N3Msg_GetSkill`). [`ao_formats::stats`] names the ids.
     pub stats: HashMap<u32, i32>,
+    /// GC100051d8: completed own perks plus global goals completed for the current side; None before authoritative state.
+    pub completed_perks: Option<Vec<u32>>,
+    pub(super) personal_completed_perks: Option<Vec<u32>>,
+    /// Catalogue IDs with flag0x80; initialized once by the existing perk catalogue owner.
+    pub(super) global_perk_ids: Option<std::collections::HashSet<u32>>,
     /// FullCharacter +0x44 replaces modifier object +8 (`FUN_10073a2f` / `FUN_1006416c`), not the raw stat array.
     pub stat_adjustments: HashMap<u32, i32>,
     /// Own `GetSkill(stat, 2)` projection, refreshed from raw stats and modifier maps before HUD consumers.
     pub skill_values: HashMap<u32, i32>,
     /// Stat360 additive bonus only: body scale uses holder kind3, not kind2 percent/trickle.
     pub monster_scale_bonus: i32,
+    /// Published modifier maps for information pages; only the HUD executor applies spells.
+    pub skill_modifiers: ao_formats::stats::buffs::Modifiers,
+    /// FullCharacter replaces spell instances even when the new records compare equal.
+    pub reset_stat_effects: bool,
+    /// ApplySpells undo indices, in message order (before the corresponding vector removal).
+    pub stat_effect_undos: Vec<usize>,
+    pub stat_effect_adds: Vec<usize>,
     /// Per-character skills received from full dynel updates, `StatIIR_t` and `SkillIIR_t` (GC `N3Msg_GetSkill`).
     pub character_stats: HashMap<i32, HashMap<u32, i32>>,
+    /// Native dynel+0x60 identity, distinct from geometry/area resource keys.
+    pub character_playfields: HashMap<i32, u32>,
     /// Latest InfoPacket per character (`GC 0x1003e694` replaces the cached packet).
     pub info_packets: HashMap<Identity, ao_net::n3::info::InfoPacket>,
     /// Organization-name registry populated by `OrgInfoPacketIIR_t` (`FUN_1003f4fb`).
@@ -153,6 +171,8 @@ pub struct Zone {
     /// The own dynel's last `SimpleCharFullUpdateIIR_t` (the avatar's appearance) and how many arrived (a new one = placed again).
     pub own_update: Option<Box<ao_net::n3::dynel::SimpleCharFullUpdate>>,
     pub own_serial: u32,
+    /// Own vehicle admission state, published by Player after native movement integration.
+    pub nano_motion: Option<super::hud_nano::NanoMotion>,
     /// The fight controller target of every dynel (`SimpleChar+0x1d4`, `+0x4c/+0x50`, set by the relayed `AttackIIR_t`, cleared by
     /// `StopFightIIR_t`; `N3Msg_GetTargetTarget` GC 0x1001641d reads it): fighter → its target instance id.
     pub fight_target: HashMap<i32, i32>,
@@ -173,6 +193,11 @@ pub struct Zone {
     /// District fight-mode level of the own character (`FUN_1003e1d0`, `fightmode.rs`), written by the player each frame; `None` until then
     /// (the original's no-data default is [`super::fightmode::DEFAULT_LEVEL`]). `/follow` reads it.
     pub fight_level: Option<i32>,
+    /// `FUN_1003e1d0` at each announced character's actual position, published by Player.
+    /// An absent entry means no query has run, not the native no-district result 2.
+    pub character_fight_levels: HashMap<i32, i32>,
+    /// Native `char+0x1f0` state from the movement spell executor, not inferred from active nanos.
+    pub crowd_state: Option<u8>,
     /// GC 0x101295f3 own-position district has nonzero LC minimum and maximum.
     /// `None` means the authored district/zone query is unavailable, not refusal.
     pub own_lca: Option<bool>,
@@ -271,10 +296,27 @@ impl Zone {
 
     /// `FullCharacter` Activate [GC 0x10073a2f]: each group is applied in order, skipping the `0x499602D2` marker.
     fn apply_stats(&mut self, pairs: impl IntoIterator<Item = (u32, i32)>) {
+        let mut side_changed = false;
         for (id, value) in pairs.into_iter().filter(|p| p.1 != ao_formats::stats::INVALID) {
             self.stats.insert(id, value);
+            if id == 33 { side_changed = true; }
             if id == 180 { self.skill_values.insert(id, value); }
         }
+        if side_changed { self.refresh_completed_perks(); }
+    }
+
+    /// Rebuild only after a relevant authoritative personal/research/side mutation.
+    pub(super) fn refresh_completed_perks(&mut self) {
+        if self.personal_completed_perks.is_none() && self.global_perk_ids.is_none() { return; }
+        let side = self.stats.get(&33).copied().unwrap_or(0) as usize;
+        let completed = self.completed_perks.get_or_insert_with(Vec::new);
+        completed.clear();
+        if let Some(personal) = &self.personal_completed_perks { completed.extend_from_slice(personal); }
+        completed.extend(self.research.iter().filter(|(id, timers)|
+            self.global_perk_ids.as_ref().is_some_and(|ids| ids.contains(&(**id as u32))) && timers.get(side) == Some(&0))
+            .map(|(&id, _)| id as u32));
+        completed.sort_unstable();
+        completed.dedup();
     }
 
     fn adjust_ncu(&mut self, delta: i32) {
@@ -354,7 +396,9 @@ impl Zone {
     /// A playfield change (`PlayfieldAnarchyFIIR_t` or a zone redirection): everything of the old playfield is gone, the new
     /// burst re-announces the dynels, and `CharInPlay` is owed again after the new world appears (docs/zone/outgoing.md §3).
     pub fn reset_world(&mut self) {
+        self.is_grid = false;
         self.world.clear();
+        self.nano_motion = None;
         self.set_target(None);
         self.containers.clear();
         self.container_access.clear();
@@ -362,9 +406,13 @@ impl Zone {
         self.dynels.clear();
         self.character_stats.clear();
         self.temporary_stats.clear();
+        self.character_playfields.clear();
         self.info_packets.clear();
         self.mission_alternatives.clear();
         self.fight_target.clear();
+        self.character_fight_levels.clear();
+        self.fight_level = None;
+        self.crowd_state = None;
         self.own_events.clear();
         self.parents.clear();
         self.child_rel.clear();
@@ -425,6 +473,7 @@ impl Zone {
                 self.dynels.remove(&c.owner.instance);
                 self.tip_npc_state.remove(&c.owner.instance);
                 self.character_stats.remove(&c.owner.instance);
+                self.character_playfields.remove(&c.owner.instance);
                 self.fight_target.remove(&c.owner.instance);
             }
         }
@@ -444,6 +493,7 @@ impl Zone {
                     self.character_stats.entry(who.instance).or_default().insert(IN_PLAY_STAT, 1);
                 }
                 N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
+                    if let Some(playfield) = u.playfield { self.character_playfields.insert(who.instance, playfield as u32); }
                     // Full-update target restores the same fight controller as AttackIIR_t.
                     if let Some(target) = u.target.filter(|t| t.kind == CHAR_KIND) {
                         self.fight_target.insert(who.instance, target.instance);
@@ -563,6 +613,7 @@ impl Zone {
             }
             N3::World(World::Playfield(p)) => {
                 let id = p.rdb_playfield().map_or(p.playfield_id, |i| i.instance) as u32;
+                self.area_playfield = p.proxy.map(|proxy| proxy.playfield.instance as u32);
                 self.playfield = Some(id);
                 self.reset_world();
                 self.world.on_playfield(id);
@@ -599,6 +650,7 @@ impl Zone {
                 for (id, value) in u.stats {
                     self.stats.insert(id as u32, value);
                     if id == 180 { self.skill_values.insert(id as u32, value); }
+                    if id == 33 { self.refresh_completed_perks(); }
                 }
             }
             // other characters: the stats the target window reads (`N3Msg_GetSkill` of the target; docs/zone/dynel.md §3)
@@ -616,7 +668,7 @@ impl Zone {
                 }
             }
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if who.kind == CHAR_KIND => {
-                self.tip_npc_state.insert(who.instance, u.flags & (1 << 18) != 0);
+                if u.flags & (1 << 18) != 0 { self.tip_npc_state.insert(who.instance, true); }
                 if who.instance == self.char_id as i32 {
                     self.own_update = Some(u.clone());
                     self.stats.insert(ao_formats::stats::HEALTH, u.health);
@@ -740,6 +792,7 @@ impl Zone {
                         for goal in update.goals {
                             self.research.insert(goal.id, goal.remaining);
                         }
+                        self.refresh_completed_perks();
                     }
                     Err(e) => eprintln!("zone: ResearchUpdate: {e:#}"),
                 }
@@ -772,6 +825,7 @@ impl Zone {
                 self.tip_npc_state.remove(&who.instance);
                 self.character_stats.remove(&who.instance);
                 self.temporary_stats.retain(|&(instance, _), _| instance != who.instance);
+                self.character_playfields.remove(&who.instance);
                 self.fight_target.remove(&who.instance);
             }
             N3::Misc(Misc::Attack(a)) if who.kind == CHAR_KIND && a.target.kind == CHAR_KIND => {
@@ -1020,13 +1074,16 @@ mod tests {
         let id = message.header.target.instance;
         let mut zone = Zone::new(0);
         zone.on_frame(&frame);
-        assert_eq!(zone.tip_npc_state.get(&id),Some(&false));
+        assert!(!zone.tip_npc_state.get(&id).copied().unwrap_or(false));
         // N3 header13, version1, flags4: bit18 has no optional payload.
         let flags = u32::from_be_bytes(frame.payload[14..18].try_into().unwrap()) | (1 << 18);
         frame.payload[14..18].copy_from_slice(&flags.to_be_bytes());
         zone.on_frame(&frame);
         assert_eq!(zone.tip_npc_state.get(&id),Some(&true));
         assert!(!zone.dynels[&id].npc,"native character class is unchanged");
+        frame.payload[14..18].copy_from_slice(&(flags & !(1 << 18)).to_be_bytes());
+        zone.on_frame(&frame);
+        assert_eq!(zone.tip_npc_state.get(&id), Some(&true), "an absent wire bit does not clear native state");
     }
 
     #[test]
@@ -1235,6 +1292,30 @@ mod tests {
             }
         }
         assert!(full > 1 && relay > 0);
+    }
+
+    #[test]
+    fn area_identity_survives_geometry_exit_door_remap_and_clears_grid() {
+        use ao_net::{n3::outgoing::n3_frame, wire::Writer};
+        let mut w = Writer(Vec::new());
+        w.u32(ao_net::n3::world::PLAYFIELD_ANARCHY_F);
+        Identity { kind: 0x9c50, instance: 9000 }.write(&mut w);
+        w.u8(0);
+        w.i32(2);
+        for _ in 0..3 { w.f32(0.0); }
+        w.u8(b'a');
+        Identity { kind: 0x9c50, instance: 152 }.write(&mut w);
+        w.i32(0);
+        w.i32(0);
+        Identity { kind: 0x9c50, instance: 4107 }.write(&mut w);
+        w.i32(0);
+        w.i32(0);
+        let mut zone = Zone::new(1);
+        zone.is_grid = true;
+        assert_eq!(zone.on_frame(&n3_frame(0, 1, w.0)), ZoneEvent::Playfield(4107));
+        assert_eq!(zone.playfield, Some(4107));
+        assert_eq!(zone.area_playfield, Some(152));
+        assert!(!zone.is_grid, "no stale Grid flag before destination metadata loads");
     }
 
     #[test]

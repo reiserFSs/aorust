@@ -93,13 +93,13 @@ pub const MODE_SWIMMING: u32 = 4;
 /// Mode 7: `FUN_1006dd0c` [GC] calls `Vehicle_t::EnableFalling` for it ([INFERENCE]: falling).
 pub const MODE_FALLING: u32 = 7;
 
-/// `Features` stat 224 (`0xe0`) bits tested by `FUN_10044b6e` [GC] on the dynel behind `char+0x1ec`.
+/// Character `Features` stat 224 (`0xe0`), read by `FUN_10044b6e` through helper+0x40 (the owning character).
 pub mod features {
     /// Target cannot be attacked here -> `Feedback_CantbeAttacked`.
     pub const CANT_BE_ATTACKED: u32 = 0x2000_0000;
     /// With `GmLevel` (215) != 0: attacking always allowed.
     pub const GM_OVERRIDE: u32 = 0x8000_0000;
-    /// Attacker's area forbids attacking -> `Feedback_YoureUnableToAttack`.
+    /// Attacker's Features forbid attacking -> `Feedback_YoureUnableToAttack`.
     pub const NO_ATTACK: u32 = 0x400;
     /// Read (result unused) by the PvP tail of `FUN_10069556`.
     pub const UNUSED_PVP: u32 = 0x400_0000;
@@ -121,17 +121,17 @@ pub struct Attacker {
     pub mode: u32,
     /// `GmLevel` stat 215.
     pub gm_level: i32,
-    /// `Features` (224) of the area object at `char+0x1ec`.
+    /// Character `Features` (224); historical field name, not a separate area dynel's stats.
     pub area_features: u32,
     /// `Side` stat 33 (3 = neutral).
     pub side: i32,
-    /// Opening gate of `FUN_10069556`: controller `+0x38 == 0` and its condition map holds key 0x3d or 0x3f
-    /// ([INFERENCE] stun/root style conditions) *and* `VisualFlags` (673) bit 5 is set -> no attack, silently.
+    /// Opening gate: controller `+0x38 == 0`, weapon-slot map contains object 0x3d or 0x3f,
+    /// and `VisualFlags` (673) bit 5 is set. These are not crowd-control condition ids.
     pub status_blocked: bool,
     /// District fight-mode level (`FUN_1003e1d0` [GC], default 2; overridden by `char+0xf4` of the state object when
     /// `char+0x13a & 1`).
     pub fight_level: i32,
-    /// `char+0x1e0 != 0`: the character has a team record.
+    /// Effective team gate: `char+0x1e0 != 0`, active team, and native crowd state != 5.
     pub in_team: bool,
 }
 

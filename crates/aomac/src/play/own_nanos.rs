@@ -21,15 +21,21 @@ struct Metadata {
     effect: i32,
 }
 
+/// Family overlap shared by active snapshots and pending self-cast admission
+/// (GC1004e488 / 1004e1ca / 1005195a).
+pub(super) fn same_family(existing: [i32; 6], incoming: [i32; 6]) -> bool {
+    if existing[1..].iter().copied().fold(0, i32::wrapping_add) == 0 && incoming[1..].iter().copied().fold(0, i32::wrapping_add) == 0 {
+        existing[0] == incoming[0]
+    } else {
+        incoming.iter().any(|f| *f != 0 && existing.contains(f))
+    }
+}
+
 impl Metadata {
-    /// GC 1004e488 / 1005195a.
+
     fn conflicts(self, incoming: Self) -> bool {
         if self.rank > incoming.rank { return false; }
-        if self.families[1..].iter().sum::<i32>() == 0 && incoming.families[1..].iter().sum::<i32>() == 0 {
-            self.families[0] == incoming.families[0]
-        } else {
-            incoming.families.iter().any(|f| *f != 0 && self.families.contains(f))
-        }
+        same_family(self.families, incoming.families)
     }
 }
 
@@ -78,6 +84,22 @@ impl OwnNanos {
         0
     }
 
+    /// GC1004f626 / 1004f649 -> 1004f368 -> 1004e1ca. Admission reads
+    /// authoritative entries, including zero-time entries awaiting BuffIIR removal.
+    pub fn permits_cast(&self, incoming: &super::hud_nanodb::NanoInfo, no_replace: bool) -> anyhow::Result<bool> {
+        let incoming = Metadata {
+            rank: incoming.stat(551).unwrap_or(0),
+            families: [75, 546, 547, 548, 549, 550].map(|s| incoming.stat(s).unwrap_or(0)),
+            ..Default::default()
+        };
+        for buff in &self.buffs {
+            let existing = self.metadata.get(&buff.nano).copied().flatten()
+                .ok_or_else(|| anyhow::anyhow!("active nano {} lacks native family/rank metadata", buff.nano))?;
+            if same_family(existing.families, incoming.families) && (existing.rank > incoming.rank || no_replace) { return Ok(false); }
+        }
+        Ok(true)
+    }
+
     fn cost(&self) -> i32 {
         self.buffs.iter().map(|b| b.ncu_cost).sum()
     }
@@ -94,7 +116,7 @@ impl OwnNanos {
                 Ok(Metadata {
                     cost: if flags & 0x10000 != 0 && flags & (0x4000 | 0x8000 | 0x100) == 0 { t.stat(54).unwrap_or(0) } else { 0 },
                     rank: t.stat(551).unwrap_or(0),
-                    families: [75, 546, 547, 548, 549, 550].map(|s| t.stat(s).unwrap_or(0)),
+                    families: [75, 546, 547, 548, 549, 550].map(|s| t.stat(s).unwrap_or(if s == 75 { id } else { 0 })),
                     effect: t.stat(413).unwrap_or(1_234_567_890),
                 })
             };
@@ -277,6 +299,26 @@ mod tests {
         n.add(Buff { nano: 1, total_cs: 200, ..Default::default() }, true);
         assert_eq!(n.buffs.len(), 2);
         assert_eq!(n.buffs.iter().find(|b| b.nano == 1).unwrap().total_cs, 200);
+    }
+
+    #[test]
+    fn native_cast_conflicts_cancel_recast_and_no_replace() {
+        let mut nanos = OwnNanos::default();
+        nanos.metadata.insert(1, Some(Metadata { rank: 4, families: [7, 0, 0, 0, 0, 0], ..Default::default() }));
+        nanos.buffs.push(Buff { nano: 1, total_cs: 0, ..Default::default() });
+        let mut incoming = super::super::hud_nanodb::NanoInfo {
+            id: 2, name: String::new(), stats: vec![(75, 7), (551, 3)], criteria: vec![], spells: vec![], icon: None,
+        };
+        assert!(!nanos.permits_cast(&incoming, false).unwrap(), "stronger active program still exists at timer zero");
+        incoming.stats[1].1 = 4;
+        assert!(nanos.permits_cast(&incoming, false).unwrap(), "equal rank can refresh");
+        assert!(!nanos.permits_cast(&incoming, true).unwrap(), "no-replace forbids equal rank too");
+        incoming.stats[1].1 = 5;
+        assert!(nanos.permits_cast(&incoming, false).unwrap(), "higher rank can replace");
+        assert!(!nanos.permits_cast(&incoming, true).unwrap());
+        let remove = N3::Misc(Misc::Buff(ao_net::n3::misc::Buff { kind: 0, nano: Some(nano::nano(1)), rest: vec![] }));
+        nanos.on_message(me(), me(), &remove, 100);
+        assert!(nanos.permits_cast(&incoming, true).unwrap(), "server cancellation permits recast without a stale conflict");
     }
 
     /// Synthetic supplementary conflict families/priority from GC 1004e488.

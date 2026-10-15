@@ -115,7 +115,7 @@ enum Bg {
     Servers(Result<Vec<ServerEntry>, String>),
     Connected(u32, Result<LoginSession, String>),
     Backdrop(Result<Box<Scene>, String>),
-    World(u32, i32, Result<Box<Scene>, String>),
+    World(u32, Option<u32>, i32, Result<(Box<Scene>, bool), String>),
     GroundTextures(u64, Result<HashMap<ao_scene::TextureKey, ao_scene::Texture>, String>),
     /// The live sky source of playfield `id` (`None`: indoor / no tweak script), sent just before its [`Bg::World`].
     Sky(u32, Box<Option<ao_formats::playfield::SkyClock>>),

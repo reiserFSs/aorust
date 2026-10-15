@@ -74,6 +74,7 @@ fn cost_color(level: i32) -> u32 {
 struct SkillRow {
     stat: u32,
     h: ViewHandle,
+    compact_h: ViewHandle,
     shown: i32,
     /// Colour last given to the value text (`FUN_100fde49`: white / green / red, [`skill_model::Row::color`]).
     color: u32,
@@ -98,6 +99,12 @@ struct Skills {
     /// The "Reset" confirmation (`SkillResetAll` dialog): window and the stat to reset (0 = all).
     confirm: Option<(WindowId, u32)>,
     status_shown: String,
+    qualifiers: ao_gui::Modifiers,
+    /// Captured arrow and seconds until the next native 500/50 ms timer.
+    hold: Option<(u32, bool, f32)>,
+    minimized: bool,
+    inline_group: Option<usize>,
+    menu: bool,
 }
 
 struct Tabbed {
@@ -146,6 +153,8 @@ pub(super) struct HudStats {
     inventory_frame: (i32, i32, u32, u32),
     /// Feedback line of the skill window (`status` view): `Skill_LackIP`.
     status: String,
+    skill_minimized: bool,
+    skill_config_source: Option<String>,
     /// Pointer state of the item drag and drop, and the sequence number of our `GenericCmd_t`s (docs/gui.md §11.12).
     dnd: item_dnd::Dnd,
     use_seq: i32,
@@ -163,7 +172,7 @@ pub(super) struct HudStats {
     item_hold_delay: f32,
     item_hold: Option<(f32, f32)>,
     item_button: ao_gui::MouseButton,
-    /// `FUN_10047fde`/`FUN_1003d7ce` [GC]: the client-local wear/unwear busy timer ([`item_dnd::wear_delay`]).
+    /// `FUN_10047fde`/`FUN_1003d7ce` [GC]: the client-local wear/unwear busy timer ([`item_dnd::wear_delay_values`]).
     wear_timers: item_dnd::WearTimers,
     /// `TimerSystemModule_t::CreateTimer` item-action bar (`hud_timerbar.rs`) while [`Self::wear_timers`] counts down a long enough delay.
     item_timer: Option<(WindowId, i32)>,
@@ -222,6 +231,8 @@ impl HudStats {
             inventory_list,
             inventory_frame,
             status: String::new(),
+            skill_minimized: false,
+            skill_config_source: None,
             dnd: Default::default(),
             use_seq: 0,
             info_urls: vec![],
@@ -451,6 +462,11 @@ impl HudStats {
             details: String::new(),
             confirm: None,
             status_shown: String::new(),
+            qualifiers: Default::default(),
+            hold: None,
+            minimized: false,
+            inline_group: None,
+            menu: false,
         });
         Ok(())
     }
@@ -465,21 +481,28 @@ impl HudStats {
         let w = s.window;
         for g in &stats::SKILL_GROUPS {
             let mut r = vec![];
+            // Native BorderView owns a client with the shipped vertical layout. These
+            // empty XML borders otherwise retain the GUI engine's fill-all base node.
+            let compact_parent = format!("{}_rows", g.prefix);
+            gui.add_view_xml(w, &format!("{}_view", g.prefix), "SkillRows", &format!("<root><View name=\"{compact_parent}\" view_layout=\"vertical\"/></root>"))?;
             for &st in g.stats {
                 let st = st as u32;
                 let color = cost_color(self.model.tables.cost_level(st, &ch));
-                let xml = format!(
+                let row_xml = |compact: bool| format!(
                     "<root><View view_layout=\"horizontal\">\
                      <TextButton name=\"name\" text=\"{}\" color=\"0x{color:06X}\" hover_color=\"TEXT_HOVER\" pressed_color=\"TEXT_SELECTED\" layout_borders=\"Rect(3,0,0,0)\"/>\
                      <HLayoutSpacer/><TextView name=\"value\" value=\"0\" min_size=\"Point(40,-1)\" max_size=\"Point(40,-1)\" layout_borders=\"Rect(0,0,3,0)\"/>\
-                     <CanvasView name=\"btn{st}\" min_size=\"Point({bw},{dh})\" max_size=\"Point({bw},{dh})\" layout_borders=\"Rect(3,3,3,3)\"/>\
-                     <PowerBar name=\"bar{st}\" bg_gfx=\"GFX_GUI_HOR_BAR_SMALL_EMPTY\" full_gfx=\"GFX_GUI_HOR_BAR_SMALL_BLUE\" direction=\"right\" layout_borders=\"Rect(0,0,5,0)\"/>\
+                     <CanvasView name=\"{}btn{st}\" min_size=\"Point({bw},{dh})\" max_size=\"Point({bw},{dh})\" layout_borders=\"Rect(3,3,3,3)\"/>\
+                     {}\
                      </View></root>",
                     esc(&stats::short_name(&self.db, st)),
+                    if compact { "c" } else { "" },
+                    if compact { String::new() } else { format!("<PowerBar name=\"bar{st}\" bg_gfx=\"GFX_GUI_HOR_BAR_SMALL_EMPTY\" full_gfx=\"GFX_GUI_HOR_BAR_SMALL_BLUE\" direction=\"right\" layout_borders=\"Rect(0,0,5,0)\"/>") },
                     bw = dw + s.arrows[2].1,
                 );
-                let h = gui.add_view_xml(w, &format!("{}_group", g.prefix), "StatRow", &xml)?;
-                r.push(SkillRow { stat: st, h, shown: i32::MIN, color: u32::MAX, pending: i32::MIN, frac: -1.0 });
+                let h = gui.add_view_xml(w, &format!("{}_group", g.prefix), "StatRow", &row_xml(false))?;
+                let compact_h = gui.add_view_xml(w, &compact_parent, "StatRow", &row_xml(true))?;
+                r.push(SkillRow { stat: st, h, compact_h, shown: i32::MIN, color: u32::MAX, pending: i32::MIN, frac: -1.0 });
             }
             s.rows.push(r);
         }
@@ -518,6 +541,76 @@ impl HudStats {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn skill_name_rect(&self, gui: &Gui, stat: u32) -> ao_gui::Rect {
+        let s = self.skills.as_ref().unwrap();
+        let row = s.rows.iter().flatten().find(|r| r.stat == stat).unwrap();
+        let h = if s.minimized { row.compact_h } else { row.h };
+        let local = gui.frame_in(h, "name").unwrap();
+        let root = gui.view_rect(s.window, "parent").unwrap();
+        local.translate(root.l, root.t)
+    }
+
+    /// `100fa1ab`: switch the shipped Skills.xml panes, preserving the shared pending model.
+    fn set_skill_minimized(&mut self, gui: &mut Gui, minimized: bool) {
+        let Some(s) = self.skills.as_mut() else { return };
+        if s.minimized == minimized { return; }
+        s.minimized = minimized;
+        s.hold = None;
+        if let Some(g) = s.inline_group.take() {
+            gui.show_collapsing(s.window, &format!("{}_view", stats::SKILL_GROUPS[g].prefix), false);
+        }
+        for name in ["info_area", "top_line", "remaining_ip_lbl"] {
+            gui.show_collapsing(s.window, name, !minimized);
+        }
+    }
+
+    fn skills_input(&mut self, _ev: &ao_gui::InputEvent, mods: ao_gui::Modifiers) {
+        if let Some(s) = self.skills.as_mut() {
+            s.qualifiers = mods;
+        }
+    }
+
+    /// All arrow presses and timer ticks use the same row arithmetic.
+    fn skill_step(&mut self, zone: &Zone, stat: u32, increase: bool) {
+        let get = |id| zone.stat(id);
+        if is_disabled(stat) {
+            self.status = format!("This skill has been disabled and can not be {}.", if increase { "increased" } else { "decreased" });
+        } else if increase {
+            if self.model.at_max(&get, stat) {
+                if let Some((key, arg)) = self.model.max_feedback(&get, stat) {
+                    let text = self.db.by_key(110, key).unwrap_or_default();
+                    self.status = match arg {
+                        Some(n) => super::chat::log::ldb_format(&text, &[super::chat::log::Arg::N(n)]),
+                        None => text,
+                    };
+                } else {
+                    self.status.clear();
+                }
+            } else {
+                let r = self.model.adjust(&get, stat, 1);
+                self.status = if r.lack_ip { self.db.by_id(502, 126196928).unwrap_or_default() } else { String::new() };
+            }
+        } else if self.model.pending(stat) > 0 {
+            self.model.adjust(&get, stat, -1);
+        }
+        if let Some(s) = self.skills.as_mut() {
+            if s.selected == Some(stat) { s.details.clear(); }
+        }
+    }
+
+    fn advance_skill_hold(&mut self, zone: &Zone, dt: f32) {
+        let Some((stat, increase, mut remaining)) = self.skills.as_mut().and_then(|s| s.hold.take()) else { return };
+        remaining -= dt;
+        while remaining <= 0.0 {
+            self.skill_step(zone, stat, increase);
+            remaining += 0.05;
+        }
+        if let Some(s) = self.skills.as_mut() {
+            s.hold = Some((stat, increase, remaining));
+        }
+    }
+
     fn skills_event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
         let Some(s) = self.skills.as_mut() else { return false };
         let get = |id: u32| zone.stat(id);
@@ -547,35 +640,46 @@ impl HudStats {
                 self.closed.push(WindowKind::Skills);
                 true
             }
-            // the arrow buttons (`FUN_100fe0ca` / `FUN_100fe261`): the left half of the canvas decreases, the right half increases
-            Event::CanvasClick { window, view, x, .. } if *window == s.window && view.starts_with("btn") => {
-                let Some(stat) = view[3..].parse::<u32>().ok() else { return false };
-                if is_disabled(stat) {
-                    // "This skill has been disabled and can not be increased / decreased." (literal in `FUN_100fe261` / `FUN_100fe0ca`)
-                    self.status = format!("This skill has been disabled and can not be {}.", if *x < s.arrows[0].1 as f32 { "decreased" } else { "increased" });
-                } else if *x < s.arrows[0].1 as f32 {
-                    if self.model.pending(stat) > 0 {
-                        self.model.adjust(&get, stat, -1);
+            // Native arrow actions happen on press; release stops the timer and applies qualifier bulk changes.
+            Event::CanvasPress { window, view, x, button: ao_gui::MouseButton::Left, .. } if *window == s.window && view.trim_start_matches('c').starts_with("btn") => {
+                let Some(stat) = view.trim_start_matches('c')[3..].parse::<u32>().ok() else { return false };
+                let increase = *x >= s.arrows[0].1 as f32;
+                s.hold = (!is_disabled(stat)).then_some((stat, increase, 0.5));
+                self.skill_step(zone, stat, increase);
+                true
+            }
+            Event::CanvasRelease { window, view } if *window == s.window && view.trim_start_matches('c').starts_with("btn") => {
+                if let Some((stat, increase, _)) = s.hold.take() {
+                    if s.qualifiers.shift || s.qualifiers.ctrl || s.qualifiers.alt {
+                        let row = self.model.row(&get, stat);
+                        self.model.adjust(&get, stat, if increase { row.max - row.pending - row.raw } else { -row.pending });
+                        if s.selected == Some(stat) { s.details.clear(); }
                     }
-                } else if self.model.at_max(&get, stat) {
-                    // `FUN_100fd5b9` -> `N3Msg_SkillMaxFeedback`: the feedback texts (`Feedback_MaximumIncreaseInAbility` ...) are UNRESOLVED, nothing is said
-                } else {
-                    let r = self.model.adjust(&get, stat, 1);
-                    self.status = if r.lack_ip { self.db.by_id(502, 126196928).unwrap_or_default() } else { String::new() };
                 }
-                if s.selected == Some(stat) {
-                    s.details.clear();
-                }
+                true
+            }
+            Event::CanvasClick { window, view, .. } if *window == s.window && view.trim_start_matches('c').starts_with("btn") => {
+                // CanvasClick follows CanvasRelease: the press already applied the single point.
                 true
             }
             Event::Clicked { window, view, item } if *window == s.window => {
                 if let Some(g) = stats::SKILL_GROUPS.iter().position(|g| g.prefix == view) {
-                    // `FUN_100f9552` (not minimised): the info panel shows this group's rows.
-                    s.group = Some(g);
-                    gui.select_child(s.window, "infoselect", Some(1));
-                    gui.select_child(s.window, "groupselect", Some(g));
+                    if s.minimized {
+                        let previous = s.inline_group.take();
+                        if let Some(old) = previous {
+                            gui.show_collapsing(s.window, &format!("{}_view", stats::SKILL_GROUPS[old].prefix), false);
+                        }
+                        if previous != Some(g) {
+                            gui.show_collapsing(s.window, &format!("{}_view", stats::SKILL_GROUPS[g].prefix), true);
+                            s.inline_group = Some(g);
+                        }
+                    } else {
+                        s.group = Some(g);
+                        gui.select_child(s.window, "infoselect", Some(1));
+                        gui.select_child(s.window, "groupselect", Some(g));
+                    }
                 } else if view == "name" {
-                    let stat = item.and_then(|h| s.rows.iter().flatten().find(|r| r.h == h)).map(|r| r.stat);
+                    let stat = item.and_then(|h| s.rows.iter().flatten().find(|r| r.h == h || r.compact_h == h)).map(|r| r.stat);
                     if let Some(stat) = stat {
                         s.selected = Some(stat);
                         s.details.clear();
@@ -635,6 +739,7 @@ impl HudStats {
                 eprintln!("hud: skill rows: {e:#}");
             }
         }
+        self.set_skill_minimized(gui, self.skill_minimized);
         let Some(s) = self.skills.as_mut() else { return };
         let get = |id: u32| zone.stat(id);
         // "Suggested IP distribution" is available until level 20 (inittext).
@@ -663,10 +768,12 @@ impl HudStats {
             if row.shown() != r.shown {
                 r.shown = row.shown();
                 gui.set_text_in(r.h, "value", &r.shown.to_string());
+                gui.set_text_in(r.compact_h, "value", &r.shown.to_string());
             }
             if row.color() != r.color {
                 r.color = row.color();
                 gui.set_color_in(r.h, "value", r.color);
+                gui.set_color_in(r.compact_h, "value", r.color);
             }
             let (frac, changed) = (row.fraction(), row.pending != 0);
             if frac != r.frac {
@@ -679,6 +786,7 @@ impl HudStats {
                 let (dec, inc) = (s.arrows[usize::from(changed)], s.arrows[2 + usize::from(changed)]);
                 let at = |g: (ao_gui::GfxId, u32, u32), x: f32| CanvasItem::Image { id: g.0, src: [0.0, 0.0, g.1 as f32, g.2 as f32], dst: [x, 0.0, x + g.1 as f32, g.2 as f32], alpha: 1.0 };
                 gui.set_canvas(s.window, &format!("btn{}", r.stat), vec![at(dec, 0.0), at(inc, dec.1 as f32)]);
+                gui.set_canvas(s.window, &format!("cbtn{}", r.stat), vec![at(dec, 0.0), at(inc, dec.1 as f32)]);
             }
         }
         if let Some(stat) = s.selected {
@@ -930,6 +1038,14 @@ impl HudStats {
     // ------------------------------------------------------------------------------------------------------------ dispatch
 
     pub(super) fn configure_stat(&mut self, d: &super::dvalue::DValues) {
+        let source = match d.get("SkillConfig") {
+            Some(super::dvalue::Variant::Archive(src)) => Some(src.as_str()),
+            _ => None,
+        };
+        if self.skill_config_source.as_deref() != source {
+            self.skill_minimized = source.and_then(|src| ao_gui::xml::parse(src).ok()).and_then(|e| find_bool(&e, "Minimized")).unwrap_or(false);
+            self.skill_config_source = source.map(str::to_owned);
+        }
         self.equipment_locked = d.flag("LockEquipment");
         self.confirm_drop = d.prefs.get_int("ShowDropItemDialog", super::dvalue::Kind::Char) != Some(0);
         self.drop_dialogs.configure_escape(d);
@@ -940,23 +1056,52 @@ impl HudStats {
     }
 
     pub(super) fn stat_event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone, d: &mut super::dvalue::DValues) -> bool {
+        const SKILL_MENU: u32 = 0x534b_0000;
+        if let Some(s) = self.skills.as_mut() {
+            match ev {
+                Event::FrameIcon { window, x, y } if *window == s.window => {
+                    gui.open_menu((*x, *y), (self.screen.0 as i32, self.screen.1 as i32), vec![ao_gui::MenuItem::check(SKILL_MENU, "Minimized view", s.minimized)]);
+                    s.menu = true;
+                    return true;
+                }
+                Event::MenuPicked { id } if s.menu && *id == SKILL_MENU => {
+                    s.menu = false;
+                    self.skill_minimized = !s.minimized;
+                    use super::dvalue::{element_xml, Variant};
+                    let mut e = match d.get("SkillConfig") {
+                        Some(Variant::Archive(src)) => ao_gui::xml::parse(src).ok(),
+                        _ => None,
+                    }.unwrap_or_else(|| ao_gui::xml::Element { name: "Archive".into(), attrs: vec![("name".into(), "SkillConfig".into()), ("code".into(), "0".into())], children: vec![] });
+                    let child = ao_gui::xml::Element { name: "Bool".into(), attrs: vec![("name".into(), "Minimized".into()), ("value".into(), self.skill_minimized.to_string())], children: vec![] };
+                    if let Some(old) = e.children.iter_mut().find(|c| c.attr("name") == Some("Minimized")) { *old = child; }
+                    else { e.children.push(child); }
+                    d.set("SkillConfig", Variant::Archive(element_xml(&e)));
+                    self.set_skill_minimized(gui, self.skill_minimized);
+                    return true;
+                }
+                Event::MenuClosed { .. } => s.menu = false,
+                _ => {}
+            }
+        }
         self.stat.as_mut().is_some_and(|s| s.event(gui, ev, zone, d, self.screen))
     }
     /// Complete each native undo phase before projecting the replacement's final state.
     /// Called between received messages, not at the end of their render-frame batch.
     pub(super) fn nano_stats_changed(&mut self, zone: &mut Zone) -> Option<i32> {
+        self.sync_effect_undos(zone);
         let mut removed = std::mem::take(&mut zone.nano_stat_removals);
         let mut corrected = None;
         for &nano in &removed {
-            if !self.timed_effects.remove(nano) { continue; }
+            if let Some(range) = self.timed_effects.effect_range(nano) {
+                for index in range.rev() { self.model.remove_active_effect(index); }
+            }
+            let life = self.timed_effects.remove(nano);
             self.model.refresh_buffs(&|id| zone.stat(id), self.timed_effects.effects(), self.equipment.effects(), self.equipment.attack_weights());
+            if !life { continue; }
             if let (Some(limit), Some(health)) = (self.model.life_limit(&|id| zone.stat(id)), zone.stat(27)) {
                 if health > limit {
                     let health = limit.max(0); // Native SetStat(Health) floors negative values to zero.
-                    zone.stats.insert(27, health);
-                    zone.skill_values.insert(27, health);
-                    zone.character_stats.entry(zone.char_id as i32).or_default().insert(27, health);
-                    if let Some(own) = zone.dynels.get_mut(&(zone.char_id as i32)) { own.health = health; }
+                    Self::store_health(zone, health);
                     corrected = Some(health);
                 }
             }
@@ -967,9 +1112,34 @@ impl HudStats {
         corrected
     }
 
+    fn store_health(zone: &mut Zone, health: i32) {
+        zone.stats.insert(27, health);
+        zone.skill_values.insert(27, health);
+        zone.character_stats.entry(zone.char_id as i32).or_default().insert(27, health);
+        if let Some(own) = zone.dynels.get_mut(&(zone.char_id as i32)) { own.health = health; }
+    }
+
+    pub(super) fn tick_stat_effects(&mut self, zone: &mut Zone, dt: f64) -> Option<i32> {
+        let (changed, corrected) = self.model.tick_effects(&|id| zone.stat(id), dt);
+        if let Some(health) = corrected { Self::store_health(zone, health); }
+        if changed { self.refresh_stats(zone); }
+        corrected
+    }
+
+    fn sync_effect_undos(&mut self, zone: &mut Zone) {
+        if std::mem::take(&mut zone.reset_stat_effects) { self.model.reset_effects(); }
+        for index in zone.stat_effect_undos.drain(..) { self.model.remove_active_effect(index); }
+        self.model.add_active_effects(&zone.stat_effect_adds);
+        zone.stat_effect_adds.clear();
+    }
+
     fn refresh_stats(&mut self, zone: &mut Zone) {
+        self.sync_effect_undos(zone);
         self.equipment.refresh_travel(zone);
+        self.model.remove_wear_effects(self.equipment.removed_effects());
+        self.model.add_wear_effects(self.equipment.added_effects());
         self.timed_effects.refresh(zone);
+        self.model.add_active_effects(self.timed_effects.added_effects());
         self.model.refresh_buffs(&|id| zone.stat(id), self.timed_effects.effects(), self.equipment.effects(), self.equipment.attack_weights());
         self.pools.apply(zone, &|z, id| self.model.value(&|s| z.stat(s), id));
         self.model.publish(zone);
@@ -984,6 +1154,7 @@ impl HudStats {
         self.update_reload_timer(gui, zone);
         self.update_nano_timer(gui, zone);
         self.refresh_stats(zone);
+        self.advance_skill_hold(zone, _dt);
         self.update_skills(gui, zone);
         self.update_wear(gui, zone);
         self.update_inventory(gui, zone);
@@ -1005,7 +1176,7 @@ impl HudStats {
 
     /// `TimerSystemModule_t::StartTimerBar` type 4 ("Item", tint `hud_timerbar::COLOR_ITEM`): shown while [`item_dnd::WearTimers`]
     /// counts down a wear/unwear delay of at least [`hud_timerbar::MIN_SECONDS`]; closes itself once the delay clears (the real
-    /// equip/unequip itself only ever happens on the server's own `ContainerAddItemIIR_t`, never gated by this cosmetic bar).
+    /// equip/unequip itself only ever happens on the server's own `ContainerAddItemIIR_t`; kind6 gates new requests, not server confirmations).
     fn update_item_timer(&mut self, gui: &mut Gui) {
         match self.wear_timers.active() {
             Some((progress, total)) if total >= hud_timerbar::MIN_SECONDS => {
@@ -1304,6 +1475,154 @@ mod tests {
     }
 
     #[test]
+    fn compact_skills_toggle_inline_rows_preserve_pending_and_save_config() {
+        let Some((mut s, mut o)) = shot() else { return };
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Skills);
+        let w = s.hud.skills.as_ref().unwrap().window;
+        o.frame(&mut s, 0.016);
+        click(&mut s, &mut o, w, "abilities");
+        arrow(&mut s, &mut o, 16, true);
+        // Native icon-menu entry; choose it through the real GUI pointer path.
+        assert!(s.hud.stat_event(&mut s.gui, &Event::FrameIcon { window: w, x: 300, y: 100 }, &s.zone, &mut s.dvalues));
+        let row_height = s.gui.fonts().font(ao_gui::FontId::Normal).height as f32 + 2.0;
+        click_at(&mut s, &mut o, 320.0, 102.0 + row_height / 2.0);
+        assert!(s.hud.skills.as_ref().unwrap().minimized);
+        for name in ["info_area", "top_line", "remaining_ip_lbl", "abilities_view"] {
+            assert!(!s.gui.is_visible(w, name), "{name}");
+        }
+        click(&mut s, &mut o, w, "abilities");
+        assert!(s.gui.is_visible(w, "abilities_view"));
+        let rows = &s.hud.skills.as_ref().unwrap().rows[0];
+        assert_eq!(rows.len(), 6);
+        let mut previous_bottom = None;
+        let mut handles = std::collections::HashSet::new();
+        for row in rows {
+            assert_ne!(row.h, row.compact_h);
+            assert!(handles.insert(row.compact_h), "compact rows need distinct subtrees");
+            let rect = s.gui.view_rect(w, &format!("cbtn{}", row.stat)).unwrap();
+            assert!(rect.b > rect.t && rect.r > rect.l, "compact row {} collapsed: {rect:?}", row.stat);
+            if let Some(bottom) = previous_bottom {
+                assert!(rect.t > bottom, "compact row {} overlaps the preceding row: {rect:?}, previous bottom {bottom}", row.stat);
+            }
+            previous_bottom = Some(rect.b);
+        }
+        let row = s.hud.skills.as_ref().unwrap().rows[0].iter().find(|r| r.stat == 16).unwrap();
+        assert_eq!(s.gui.text_in(row.compact_h, "value"), "7");
+        let rect = s.gui.view_rect(w, "cbtn16").unwrap();
+        let arrows = s.hud.skills.as_ref().unwrap().arrows;
+        click_at(&mut s, &mut o, rect.l + arrows[0].1 as f32 + arrows[2].1 as f32 / 2.0, (rect.t + rect.b) / 2.0);
+        assert_eq!(s.hud.model.pending(16), 2);
+        let r = s.hud.skill_name_rect(&s.gui, 17);
+        click_at(&mut s, &mut o, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
+        assert_eq!(s.hud.skills.as_ref().unwrap().selected, Some(17));
+        assert_eq!(s.gui.text(w, "pointdelta"), "<div align=\"right\">0</div>");
+        let r = s.hud.skill_name_rect(&s.gui, 16);
+        click_at(&mut s, &mut o, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
+        assert_eq!(s.hud.skills.as_ref().unwrap().selected, Some(16));
+        assert_eq!(s.gui.text(w, "pointdelta"), "<div align=\"right\">2</div>");
+        click(&mut s, &mut o, w, "body");
+        assert!(!s.gui.is_visible(w, "abilities_view"));
+        assert!(s.gui.is_visible(w, "body_view"));
+        click(&mut s, &mut o, w, "body");
+        assert!(!s.gui.is_visible(w, "body_view"));
+        assert!(s.hud.stat_event(&mut s.gui, &Event::FrameIcon { window: w, x: 300, y: 100 }, &s.zone, &mut s.dvalues));
+        click_at(&mut s, &mut o, 320.0, 102.0 + row_height / 2.0);
+        assert!(!s.hud.skills.as_ref().unwrap().minimized);
+        assert!(s.gui.is_visible(w, "info_area"));
+        assert_eq!(row_value(&s, 16), "8");
+        let r = s.hud.skill_name_rect(&s.gui, 17);
+        click_at(&mut s, &mut o, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
+        assert_eq!(s.hud.skills.as_ref().unwrap().selected, Some(17));
+        assert_eq!(s.gui.text(w, "pointdelta"), "<div align=\"right\">0</div>");
+        let r = s.hud.skill_name_rect(&s.gui, 16);
+        click_at(&mut s, &mut o, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
+        assert_eq!(s.hud.skills.as_ref().unwrap().selected, Some(16));
+        assert_eq!(s.gui.text(w, "pointdelta"), "<div align=\"right\">2</div>");
+        let super::super::dvalue::Variant::Archive(config) = s.dvalues.get("SkillConfig").unwrap() else { panic!("SkillConfig archive") };
+        assert_eq!(find_bool(&ao_gui::xml::parse(config).unwrap(), "Minimized"), Some(false));
+        assert!(s.hud.take_outbox().is_empty());
+    }
+
+    #[test]
+    fn skill_arrows_press_repeat_release_and_qualifier_bulk() {
+        let Some((mut s, mut o)) = shot() else { return };
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Skills);
+        let w = s.hud.skills.as_ref().unwrap().window;
+        o.frame(&mut s, 0.016);
+        click(&mut s, &mut o, w, "abilities");
+        let rect = s.gui.view_rect(w, "btn16").unwrap();
+        let dec = s.hud.skills.as_ref().unwrap().arrows[0].1 as f32;
+        let inc = s.hud.skills.as_ref().unwrap().arrows[2].1 as f32;
+        let (x, y) = (rect.l + dec + inc / 2.0, (rect.t + rect.b) / 2.0);
+        let mut host = Host::headless();
+        s.input(InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+        assert_eq!(s.hud.model.pending(16), 1, "native arrows act on press");
+        o.frame(&mut s, 0.49);
+        assert_eq!(s.hud.model.pending(16), 1);
+        o.frame(&mut s, 0.011);
+        assert_eq!(s.hud.model.pending(16), 2);
+        o.frame(&mut s, 0.05);
+        assert_eq!(s.hud.model.pending(16), 3);
+        // Release outside still stops the captured timer, without a CanvasClick.
+        s.input(InputEvent::MouseUp { x: 0.0, y: 0.0, button: ao_gui::MouseButton::Left }, &mut host);
+        assert!(s.hud.skills.as_ref().unwrap().hold.is_none());
+        o.frame(&mut s, 1.0);
+        assert_eq!(s.hud.model.pending(16), 3);
+        for mods in [
+            ao_gui::Modifiers { shift: true, ..Default::default() },
+            ao_gui::Modifiers { ctrl: true, ..Default::default() },
+            ao_gui::Modifiers { alt: true, ..Default::default() },
+        ] {
+            // Qualifiers are read on release, even if pressed after mouse-down.
+            s.hud.model.clear();
+            host.mods = Default::default();
+            s.input(InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+            host.mods = mods;
+            s.input(InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+            let row = s.hud.model.row(&|id| s.zone.stat(id), 16);
+            assert_eq!(row.raw + row.pending, row.max);
+            assert!(s.hud.model.remaining(&|id| s.zone.stat(id)) > 0);
+            host.mods = Default::default();
+            s.input(InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+            s.input(InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+            let text = s.hud.db.by_key(110, "Feedback_MaximumIncreaseInAbility").unwrap();
+            assert!(!text.is_empty());
+            assert_eq!(s.hud.status, super::super::chat::log::ldb_format(&text, &[super::super::chat::log::Arg::N(3)]));
+            o.frame(&mut s, 0.016);
+            assert_eq!(s.gui.text(w, "status"), s.hud.status);
+            host.mods = mods;
+            let x = rect.l + dec / 2.0;
+            s.input(InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+            s.input(InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+            assert_eq!(s.hud.model.pending(16), 0);
+            assert_eq!(s.hud.model.remaining(&|id| s.zone.stat(id)), 1500);
+        }
+        // The same captured decrease timer cannot undo authoritative points.
+        host.mods = Default::default();
+        let left_x = rect.l + dec / 2.0;
+        s.input(InputEvent::MouseDown { x: left_x, y, button: ao_gui::MouseButton::Left }, &mut host);
+        o.frame(&mut s, 0.56);
+        s.input(InputEvent::MouseUp { x: left_x, y, button: ao_gui::MouseButton::Left }, &mut host);
+        assert_eq!(s.hud.model.pending(16), 0);
+        assert_eq!(s.zone.stat(16), Some(6));
+        // A qualified bulk request is still limited by the strict remaining-IP slot.
+        s.zone.on_frame(&stat_frame(s.zone.char_id, &[(53, 13)]));
+        o.frame(&mut s, 0.016);
+        host.mods.ctrl = true;
+        s.input(InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+        s.input(InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+        assert_eq!(s.hud.model.pending(16), 1);
+        assert_eq!(s.hud.model.remaining(&|id| s.zone.stat(id)), 1);
+        host.mods = Default::default();
+        s.input(InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+        s.input(InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }, &mut host);
+        o.frame(&mut s, 0.016);
+        assert_eq!(s.gui.text(w, "status"), s.hud.db.by_id(502, 126196928).unwrap());
+        assert_eq!(s.hud.model.pending(16), 1);
+        assert!(s.hud.take_outbox().is_empty(), "pending edits do not save automatically");
+    }
+
+    #[test]
     fn skills_window_shows_stats_and_follows_stat_deltas() {
         let Some((mut s, mut o)) = shot() else { return };
         s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Skills);
@@ -1363,7 +1682,8 @@ mod tests {
         }
         assert_eq!(row_value(&s, 16), "9");
         // select the row: the details panel (base / maximum / delta / unit cost / total cost)
-        click(&mut s, &mut o, w, "name");
+        let r = s.hud.skill_name_rect(&s.gui, 16);
+        click_at(&mut s, &mut o, (r.l + r.r) / 2.0, (r.t + r.b) / 2.0);
         o.frame(&mut s, 0.016);
         assert_eq!(s.gui.text(w, "pointdelta"), "<div align=\"right\">3</div>");
         png(&mut s, &mut o, "skills-5-details");
@@ -1540,14 +1860,18 @@ mod tests {
         let mut hud = HudStats::new(&dir, SIZE).unwrap();
         let mut rollup = Rollup::new(&dir, SIZE);
         let mut zone = Zone::new(33512);
-        zone.inventory.insert(6, item(6, 0xc1a5, 1));
-        zone.inventory.insert(0x40, item(0x40, 0xc1a2, 3));
+        // RDB31837 is a real class1 wearable (Floating Torch), fitting
+        // Utils slots3/4/5 with DefaultPos3 and no EquipDelay. Wield8 is
+        // stat126>35; action templates49570/49573 cannot wear.
+        zone.stats.insert(126, 36);
+        zone.inventory.insert(3, item(3, 31837, 1));
+        zone.inventory.insert(0x40, item(0x40, 31837, 1));
         hud.open(&mut gui, &mut rollup, WindowKind::Character);
         hud.open(&mut gui, &mut rollup, WindowKind::Inventory);
         hud.update(&mut gui, &mut zone, 0.016);
         for (kind, view, slot, local) in [
             (WindowKind::Inventory, "grid", 0x40, inv_grid::cell_origin(0, 0, hud.inventory.as_ref().unwrap().gap)),
-            (WindowKind::Character, "items", 6, items::wear_origin(0, 2)),
+            (WindowKind::Character, "items", 3, items::wear_origin(0, 1)),
         ] {
             let w = hud.window(kind).unwrap();
             let r = gui.view_rect(w, view).unwrap();
@@ -1622,26 +1946,28 @@ mod tests {
     #[test]
     fn equipment_lock_blocks_drag_and_double_click() {
         let Some((mut s, _)) = shot() else { return };
-        s.zone.inventory.insert(6, item(6, 0xc1a5, 1));
-        s.zone.inventory.insert(0x40, item(0x40, 0xc1a2, 1));
+        // Use real wearable templates, not Walk/StartCombat action records.
+        s.zone.stats.insert(126, 36); // RDB31837 Wield8: stat126>35.
+        s.zone.inventory.insert(3, item(3, 31837, 1));
+        s.zone.inventory.insert(0x40, item(0x40, 31837, 1));
         let mut d = super::super::dvalue::DValues::new(&ao_gui::client_dir());
         d.set_i64("LockEquipment", 1);
         s.hud.configure_stat(&d);
-        assert!(s.hud.drop_action(&s.zone, 6, item_dnd::Place::Bag { cell: (0, 0) }).is_none());
-        assert!(s.hud.drop_action(&s.zone, 0x40, item_dnd::Place::Wear { tab: 0, id: 6, slot: 6 }).is_none());
-        s.hud.item_click(&s.zone, item_dnd::Place::Wear { tab: 0, id: 6, slot: 6 });
-        s.hud.item_click(&s.zone, item_dnd::Place::Wear { tab: 0, id: 6, slot: 6 });
+        assert!(s.hud.drop_action(&s.zone, 3, item_dnd::Place::Bag { cell: (0, 0) }).is_none());
+        assert!(s.hud.drop_action(&s.zone, 0x40, item_dnd::Place::Wear { tab: 0, id: 3, slot: 3 }).is_none());
+        s.hud.item_click(&s.zone, item_dnd::Place::Wear { tab: 0, id: 3, slot: 3 });
+        s.hud.item_click(&s.zone, item_dnd::Place::Wear { tab: 0, id: 3, slot: 3 });
         assert!(s.hud.take_outbox().is_empty(), "double click shares the lock gate");
         assert_eq!(s.hud.take_equipment_feedback(), Some("Feedback_EquipmentLocked"));
         assert_eq!(s.hud.take_equipment_feedback(), None);
-        s.hud.dnd.press = Some((item_dnd::Place::Wear { tab: 0, id: 6, slot: 6 }, 0.0, 0.0));
+        s.hud.dnd.press = Some((item_dnd::Place::Wear { tab: 0, id: 3, slot: 3 }, 0.0, 0.0));
         s.hud.item_hold = Some((0.0, 0.3));
         s.hud.advance_item_hold(&mut s.gui, &s.zone, 0.3);
         assert!(s.hud.dnd.drag.is_none() && s.hud.dnd.press.is_none(), "locked equipment cannot begin a world-drop drag");
         assert_eq!(s.hud.take_equipment_feedback(), Some("Feedback_EquipmentLocked"));
         d.set_i64("LockEquipment", 0);
         s.hud.configure_stat(&d);
-        assert!(s.hud.drop_action(&s.zone, 6, item_dnd::Place::Bag { cell: (0, 0) }).is_some(), "unlock applies without reopening");
+        assert!(s.hud.drop_action(&s.zone, 3, item_dnd::Place::Bag { cell: (0, 0) }).is_some(), "unlock applies without reopening");
     }
 
     #[test]
@@ -1778,6 +2104,14 @@ mod tests {
         click(&mut s, &mut o, w, "tab_clothes");
         o.frame(&mut s, 0.016);
         let payload = |s: &mut Shot| s.hud.take_outbox().into_iter().map(|f| f.payload).collect::<Vec<_>>();
+        // RDB21797 type22/sub36 Wear6: Intelligence19>550,
+        // Psychic21>500, Profession60!=15. Equality must refuse the equip.
+        s.zone.stats.extend([(19, 550), (21, 500), (60, 1)]);
+        o.frame(&mut s, 0.016);
+        dnd!(s, o, bag_xy(&s, (0, 0)), wear_xy(&s, 1, 3));
+        assert!(payload(&mut s).is_empty(), "authored wearer requirements gate the real drag path");
+        s.zone.stats.extend([(19, 551), (21, 501)]);
+        o.frame(&mut s, 0.016);
 
         // the cloak onto the Back slot of the clothes tab: a `ClientMoveItemToInventoryIIR_t` to slot 0x10 + 3, nothing changes locally
         dnd!(s, o, bag_xy(&s, (0, 0)), wear_xy(&s, 1, 3));
@@ -1847,6 +2181,8 @@ mod tests {
         let me = s.zone.char_id as i32;
         let mine = Identity { kind: 0xC350, instance: me };
         s.zone.inventory.insert(0x40, item(0x40, 36777, 1));
+        // RDB36777 Wield8 is the strict ComputerLiteracy161>120.
+        s.zone.stats.insert(161, 121);
         s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Character);
         s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Inventory);
         o.frame(&mut s, 0.016);
@@ -1865,7 +2201,7 @@ mod tests {
         let (half, _) = s.hud.wear_timers.active().expect("still counting down halfway through");
         assert!((half - 0.5).abs() < 0.01, "{half}");
         assert_eq!(s.hud.item_timer.map(|(w, _)| w), Some(bar), "the same bar keeps counting down");
-        // the server's own answer moves the item regardless of the local cosmetic timer
+        // The server's own answer moves the item regardless of the local busy timer.
         s.zone.apply_inventory(&inv::InventoryMsg::ContainerAdd { item: belt, container: mine, slot: 7 });
         o.frame(&mut s, 0.016);
         assert!(s.zone.inventory.contains_key(&7) && !s.zone.inventory.contains_key(&0x40));

@@ -28,7 +28,6 @@ pub(super) struct HudResearchVehicle {
     global: BTreeMap<i32, [i32; 3]>,
     stats: HashMap<u32, i32>,
     equipment: info::PerkEquipment,
-    completed: Vec<u32>,
     dirty: bool,
     request: bool,
     selected_vehicle: Option<u32>,
@@ -52,6 +51,19 @@ impl HudResearchVehicle {
             page.attrs.push(("name".into(), format!("research_page{index}")));
             // Native pages have separate info/finished-list instances. Keep their names unambiguous in the shared tree.
             fn rename(e: &mut xml::Element, index: usize) {
+                if e.name == "TextView" {
+                    let heading = match e.attr("value") {
+                        Some("Personal Research") => Some("personal_heading"),
+                        Some("Global Research") => Some("global_heading"),
+                        Some("Started Personal Research") => Some("personal_started_heading"),
+                        Some("Current Global Research Goal") => Some("global_started_heading"),
+                        Some("Personal Research Progress" | "Completed Personal Research Projects") => Some("personal_heading"),
+                        Some("Global Research Progress" | "Completed Global Research Projects") => Some("global_heading"),
+                        Some("Selected Research Line") => Some("selected_heading"),
+                        _ => None,
+                    };
+                    if let Some(heading) = heading { e.attrs.push(("name".into(), format!("page{index}_{heading}"))); }
+                }
                 for (key, value) in &mut e.attrs {
                     if key == "name" && matches!(value.as_str(), "info" | "PerkLine" | "finishedPersonal" | "finishedGlobal") {
                         *value = format!("page{index}_{value}");
@@ -84,6 +96,8 @@ impl HudResearchVehicle {
                     gui.set_window_tabs(w, &TITLES.map(str::to_owned), 0);
                     gui.select_child(w, PAGES, Some(0));
                     gui.set_window_help(w, Some("The Research window.html"));
+                    // GUI 100f6bf4 overrides the finished info renderer's authored 80px minimum.
+                    gui.set_text_pref_size(w, "page2_info", (0.0, 20.0), (16000.0, 16000.0));
                 } else {
                     gui.set_window_help(w, Some("The Mech Select window.html"));
                     // The XML's HelloKittyMech is a designer sample. Retail deletes it before enumerating completed global goals.
@@ -122,7 +136,7 @@ impl HudResearchVehicle {
 
 
     fn eligible(&self, item: &Item, zone: &Zone) -> anyhow::Result<bool> {
-        item.criteria.eligible(zone, self.equipment.armor(), &self.completed)
+        item.criteria.eligible(zone, self.equipment.armor(), zone.completed_perks.as_deref().unwrap_or_default())
     }
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &Zone, perks: &mut HudPerks) {
@@ -147,10 +161,6 @@ impl HudResearchVehicle {
         self.known.clone_from(&perks.known.0);
         self.global.clone_from(&zone.research);
         self.stats.clone_from(&zone.stats);
-        self.completed.clear();
-        self.completed.extend(self.known.iter().filter(|(_, remaining)| **remaining == 0).map(|(&id, _)| id as u32));
-        let side = zone.skill_value(33).unwrap_or(0) as usize;
-        self.completed.extend(self.global.iter().filter(|(_, remaining)| remaining.get(side) == Some(&0)).map(|(&id, _)| id as u32));
         self.stats.extend(zone.skill_values.iter().map(|(&k, &v)| (k, v)));
         self.dirty = false;
         if let Some(w) = self.research {
@@ -192,13 +202,14 @@ impl HudResearchVehicle {
     }
 
     /// GUI 100f4d9c: PowerbarView_c(0xe0,0xe1), then label and HLayoutSpacer, row borders(8,2,0,2).
-    fn row_xml(&self, def: &PerkDef, side: usize, name: &str, label: &str) -> String {
-        format!("<View name=\"{name}\" view_layout=\"horizontal\" layout_borders=\"Rect(8,2,0,2)\"><PowerBar name=\"{name}_bar\" bg_gfx=\"GFX_GUI_HOR_BAR_SMALL_EMPTY\" full_gfx=\"GFX_GUI_HOR_BAR_SMALL_BLUE\" value=\"{}\" layout_borders=\"Rect(5,0,0,0)\"/><TextView name=\"{name}_label\" value=\"{}\" layout_borders=\"Rect(5,1,1,1)\"/><HLayoutSpacer max_size=\"Point(16000,-1)\"/></View>", self.progress(def, side), quote(label))
+    fn row_xml(name: &str, label: &str) -> String {
+        format!("<View name=\"{name}\" view_layout=\"horizontal\" layout_borders=\"Rect(8,2,0,2)\"><PowerBar name=\"{name}_bar\" bg_gfx=\"GFX_GUI_HOR_BAR_SMALL_EMPTY\" full_gfx=\"GFX_GUI_HOR_BAR_SMALL_BLUE\" layout_borders=\"Rect(5,0,0,0)\"/><TextView name=\"{name}_label\" value=\"{}\" layout_borders=\"Rect(5,1,1,1)\"/><HLayoutSpacer max_size=\"Point(16000,-1)\"/></View>", quote(label))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn add_row(&self, gui: &mut Gui, w: WindowId, parent: &str, def: &PerkDef, side: usize, name: &str, label: &str) -> anyhow::Result<()> {
-        gui.add_view_xml(w, parent, name, &format!("<root>{}</root>", self.row_xml(def, side, name, label)))?;
+        gui.add_view_xml(w, parent, name, &format!("<root>{}</root>", Self::row_xml(name, label)))?;
+        gui.set_progress(w, &format!("{name}_bar"), self.progress(def, side));
         gui.set_view_mouse(w, name, true);
         Ok(())
     }
@@ -217,8 +228,10 @@ impl HudResearchVehicle {
             if self.available(&def, side) {
                 let group = if personal { "personalRadio" } else { "globalRadio" };
                 let name = format!("goal_{}_{}", if personal { "personal" } else { "global" }, def.id);
-                let row = self.row_xml(&def, side, &format!("hover_{}", def.id), &label);
+                let row_name = format!("hover_{}", def.id);
+                let row = Self::row_xml(&row_name, &label);
                 gui.add_view_xml(w, group, &name, &format!("<root><RadioButton name=\"{name}\" value=\"{}\">{row}</RadioButton></root>", def.id))?;
+                gui.set_progress(w, &format!("{row_name}_bar"), self.progress(&def, side));
                 let enabled = if personal { self.eligible(item, zone)? } else { true };
                 gui.set_enabled(w, &name, enabled);
                 gui.set_view_mouse(w, &format!("hover_{}", def.id), true);

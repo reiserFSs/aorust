@@ -26,15 +26,22 @@ service towers are included, and clicking a health bar targets its pet.
 grid. The row has 4-pixel spacers, health background `0xdb`, fill `0xdd`, name label,
 then primary, Follow and Wait buttons. `0x1007ccb3` chooses Heal for MonsterData
 (`455`) `96`, Attack otherwise; keys are `ButtonPetHeal`, `ButtonPetAttack`,
-`ButtonPetFollow`, `ButtonPetWait`. Handlers `0x1007c919`, `0x1007c936`,
-`0x1007c953`, `0x1007c970` send codes `7`, `12`, `1`, `4` respectively, addressing
-exactly one identity with window/arg/tower zero. Health refresh `0x1007c9ac` divides
-Health (`27`) by Life (`1`), with zero for an unknown pet or zero Life.
+`ButtonPetFollow`, `ButtonPetWait`. Attack (`0x1007c919`) sends code `7`;
+Heal (`0x1007c936`) sends `12`; Follow (`0x1007c953`) sends `1`; Wait
+(`0x1007c970`) sends `4`. Each addresses exactly one identity with
+window/arg/tower zero. Health refresh `0x1007c9ac` divides Health (`27`) by
+Life (`1`), with zero for an unknown pet or zero Life.
 `0x1007cf9a` strips name control characters; `0x1007d093` uses `#808080` out of tree
 and `#bbbbbb` in tree before a command-status signal. The native refresh timer is
 500000 microseconds. Effect-grid size index 3 is 16 pixels; spacing is 7 and
-borders 6 (`101b6e54`, `101b5234`). Effect data uses the existing `BuffIIR_c` decoder
-and nano database, with expired entries removed using the nano's `TimeExist`.
+borders 6 (`101b6e54`, `101b5234`). Effect data uses the authoritative
+`Zone.world.target_nanos(pet.instance)` tracker and nano database, not a separate
+pet-window message cache or clock. CharacterAction `0x62` / `0xb1` adds or
+refreshes effects (`GC 0x100512af`); SimpleCharFullUpdate restores their timing
+(`GC 0x10051b40`, `0x10051741`). Remaining duration clamps to zero; entries remain
+until server `BuffIIR_c` removal (`GC 0x10050afd`) or dynel teardown, rather than
+being removed locally from the nano's `TimeExist`. The shared tracker applies
+the same 100% duration semantics used for other non-own characters.
 
 `play/hud_pet.rs` implements the pet-list window, targeting, type-dependent
 commands, health/name updates and timed effect icons. `WindowKind::Pet` routes the

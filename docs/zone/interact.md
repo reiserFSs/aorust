@@ -323,6 +323,58 @@ equipment and character notes; `Uses` owns no separate seed or picker. Gamecode 
 time on playfield load; DisplaySystem effects can reseed the CRT, so exact effect-driven retail reseeding
 remains outside this item's selection implementation.
 
+**Move/equip busy lifetime (native timer kinds, not bar colours):** GC `1004b9c9`
+calls TimerSystem `1005863c` / `HasType` `1003ce37` with **6**, then **3**;
+either refuses packet-backed inventory moves with the previous-action feedback.
+Item-use callbacks `1003b947` → `1003d7ce` create internal **kind 4**, not 3,
+so neither an outgoing item use nor its sound/visual callback blocks these moves.
+The real kind-3 producer is nano execution `10050ed9`: ASM `10051098 PUSH 3`
+precedes the attack/recharge timer construction at `100510bd`. This internal
+`TimerEntry+0x14` kind is separate from the HUD's nano-bar type/colour enumeration.
+`Dynels::nano_busy` and `nano_school_busy` reuse the accepted nano relay and
+`NanoCast.execution`, not the animation's `released`/`done` flags. Attack duration
+uses the existing `nano_cast_delay`; `100500ca` starts recharge from the current
+game time using stat 210 / 100, and `10050570` / `1004e133` expire it strictly
+past the recharge deadline. `1004e68c` removes its timer through `1003d168`.
+`1004f504` selects a named spell only during attack, while an unnamed cancellation
+selects the first entry even in recharge; `1004f274` (action `0x89`) removes every
+queued timer independently of retained visual controllers. Zone clear/disappearance
+uses the existing nano cancellation paths. Instant nanos (`flags & 0x80000`) create
+no kind-3 timer. HUD update, input, GUI event and hotbar item activation refresh the
+shared move guard directly from this runtime, avoiding a stale render-frame snapshot.
+Regression `native_nano_timer_blocks_through_recharge_not_visual_finish` covers
+relay admission, actor isolation, visual completion, recharge deadline and cancellation.
+Only an empty native execution queue allocates the kind-3 TimerEntry (`10051078`);
+later concurrent entries still participate in school admission without inventing
+another timer. `nano_family_locked(own, [families; 6])` also exposes the controller's
+separate kind-1 family-lock vector (`1004ebb5`), not buff or skill-lock snapshots.
+Execution success `100500ca` appends family stat 75 with duration 643 and families
+546–550 with durations 644–648 via `10051aba`; durations are integer-divided by 100.
+The primary pair permits family 0; extra pairs require a nonzero family.
+Before those family entries, ASM `10050232`–`1005027f` reads stat **254**,
+integer-divides by 100, and appends the exact `{0xcf1b, program id}` lock when
+nonzero. `nano_program_locked(own, spell)` compares that native identity in the
+same lock vector and second-pulse lifetime; a family number is never used as a
+program id. The whole-second TTL regression also covers this direct-program branch.
+`1005122c` decrements each whole-second counter once on GameTime's second pulse,
+after execution, removing entries below 1. Instant execution produces these family
+locks without producing a kind-3 timer. Regression
+`native_nano_family_lock_uses_authored_whole_second_ttl` covers authored truncation,
+all-family matching, actor isolation, second-pulse expiry and zone cleanup.
+Attack expiry alone does not invent a successful result: `10050ed9` initializes
+queue byte `+0x1c` (awaiting) and result `+0x20 = 1`; `100500ca` waits until that
+byte is cleared, except for instant execution. The authoritative writer is
+`1004effe`, dispatched by action **0x6b** (`1005d8bd` / call `1005d8cd`):
+`identity_b.kind` is the result, `identity_b.instance` the spell. It clears awaiting;
+result 0 preserves default success 1. Results arriving before the frame drain are
+retained with their already-accepted relay, never synthesized from elapsed time.
+Release callbacks and local initiation cleanup share this gate; only success 1
+produces the family locks. `nano_pending_self` exposes cached templates without
+allocation for `1004f368`'s resolved stage-2, self-target, flags-0x10000 candidates.
+`native_nano_result_releases_wait_and_exposes_pending_self_program` exercises the
+wire result, wait, callback gate and pending replacement lifetime.
+
+
 
 **Fresh Gamecode trace (2026-10-07):** `1007c8b7` validates the own state-0 request with `1007c7fd == 2`,
 then calls `1003b066`. `1007c76a` state 1 calls the same gesture routine only when `1007c749(actor)` says

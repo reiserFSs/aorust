@@ -155,8 +155,8 @@ IDs use the existing `ao_audio::sbf::sound_id` (`CreateSoundID`, SandyInterface 
 | `0xb8` | SetPlayerOption | default (ignored) |  |
 | `0xb9` |  | 0x46 @ 0x1005e69c |  |
 | `0xba` |  | 0x47 @ 0x1005e6b9 |  |
-| `0xbb` | FUN_10052ede | 0x48 @ 0x1005e4f9 |  |
-| `0xbc` | FUN_10052f8e | 0x49 @ 0x1005e512 |  |
+| `0xbb` | FUN_10052ede | 0x48 @ 0x1005e4f9 | `b.instance` -> own perk holder `10058ab1` -> train `100533b3`; catalogue/eligibility/points, zero-timer wear event14 |
+| `0xbc` | FUN_10052f8e | 0x49 @ 0x1005e512 | `b.instance` -> own perk holder -> untrain `1005303e`; stat577 from GameTime+b4 if known, zero-timer undo event14, erase |
 | `0xbd` |  | 0x4a @ 0x1005e6cb |  |
 | `0xbe` |  | 0x4b @ 0x1005e6e5 | recv text `Feedback_TrapDetected` + effect 0x2cf3 |
 | `0xc0` |  | 0x4c @ 0x1005e738 |  |
@@ -440,8 +440,8 @@ Rows without a note are UI / GlobalSignals plumbing of another feature (team, co
 | `0xb6` | 0x1005e4bc | UI / GlobalSignals plumbing | not driven, not fight state |
 | `0xb9` | 0x1005e69c | UI / GlobalSignals plumbing | not driven, not fight state |
 | `0xba` | 0x1005e6b9 | UI / GlobalSignals plumbing | not driven, not fight state |
-| `0xbb` | 0x1005e4f9 | UI / GlobalSignals plumbing | not driven, not fight state |
-| `0xbc` | 0x1005e512 | UI / GlobalSignals plumbing | not driven, not fight state |
+| `0xbb` | 0x1005e4f9 | authoritative learned-perk train, not UI-only | own catalogue/eligibility/point checks; known/completed maps and wear spell consumers; docs/gui.md §11.13 records remaining native executor prerequisites |
+| `0xbc` | 0x1005e512 | authoritative learned-perk untrain, not UI-only | own known entry removal, server reset timestamp, undo spells and point counts; duplicate/foreign relays do not mutate |
 | `0xbd` | 0x1005e6cb | shadow knowledge dialog | not fight; not driven |
 | `0xbe` | 0x1005e6e5 | UI / GlobalSignals plumbing | not driven, not fight state |
 | `0xc0` | 0x1005e738 | faction text (cat 101 id 9) | not fight; not printed |

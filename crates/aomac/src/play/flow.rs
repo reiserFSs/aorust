@@ -739,12 +739,15 @@ impl Play {
         let (texture_quality, ground_texture_quality) = (self.texture_quality, self.ground_texture_quality);
         // the zone clock and game day (`GameTimeIIR_t`) when the burst reached the playfield message; later `GameTime`s resync the live sky
         let (day_time, day) = (self.zone.day_time(), self.zone.game_day as u32);
+        let area_playfield = self.zone.area_playfield;
         let (zt_on, zt0) = (self.zone_timing, self.zone_timer);
         let zt = move |label: &str| if let (true, Some(t0)) = (zt_on, zt0) { eprintln!("zone_timing {label} t={}ms", t0.elapsed().as_millis()); };
         std::thread::spawn(move || {
             let mut r = RecordStore::open(&dir).and_then(|store| {
                 store.set_other_texture_quality(texture_quality);
                 store.set_ground_texture_quality(ground_texture_quality);
+                let is_grid = area_playfield.map(|id| ao_formats::playfield::area::load(&store, id))
+                    .transpose()?.flatten().is_some_and(|areas| areas.is_grid());
                 let (scene, report) = ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day)?;
                 zt("pf_terrain_statics_loaded");
                 let weather = ao_formats::playfield::open_weather(&store, id)?;
@@ -765,15 +768,15 @@ impl Play {
                 let _ = tx.send(Bg::Life(id, life));
                 // `PlayfieldInit` [GC 0x10016e2c] -> `SandyInterfaceModule_t::ActivateGameZone`: district music, ambience and statel emitters
                 let audio = want_audio.then(|| ao_audio::PlayfieldAudio::load(&store, id, &report.sounds).map_err(|e| eprintln!("playfield audio {id}: {e:#}")).ok()).flatten();
-                Ok((scene, report, audio))
+                Ok((scene, report, audio, is_grid))
             });
             // the Map window's ground image comes from the scene just built (`Report::ground`), not from a second load (docs/gui.md 12)
-            let ground = r.as_ref().ok().and_then(|(scene, report, _)| hud::ground_map(scene, report));
+            let ground = r.as_ref().ok().and_then(|(scene, report, ..)| hud::ground_map(scene, report));
             let _ = tx.send(Bg::Ground(id, ground.map(Box::new)));
-            if let Ok((_, report, audio)) = &mut r {
+            if let Ok((_, report, audio, _)) = &mut r {
                 let _ = tx.send(Bg::Info(id, report.dungeon, audio.take().map(Box::new)));
             }
-            let r = r.map(|(scene, ..)| Box::new(scene)).map_err(|e| format!("{e:#}"));
+            let r = r.map(|(scene, _, _, is_grid)| (Box::new(scene), is_grid)).map_err(|e| format!("{e:#}"));
             match ao_formats::playfield::SkyClock::open(&dir, id) {
                 Ok(mut clock) => {
                     if let Some(clock) = &mut clock { clock.set_texture_quality(texture_quality); }
@@ -782,7 +785,7 @@ impl Play {
                 Err(e) => eprintln!("live sky of playfield {id}: {e:#}"),
             }
             zt("pf_thread_done");
-            let _ = tx.send(Bg::World(id, ground_texture_quality, r));
+            let _ = tx.send(Bg::World(id, area_playfield, ground_texture_quality, r));
         });
     }
 
@@ -854,15 +857,16 @@ impl Play {
                 }
                 Bg::Info(..) => {}
                 // a load that the server has since replaced by another playfield is dropped
-                Bg::World(id, _, _) if Some(id) != self.zone.playfield => {}
-                Bg::World(id, quality, Ok(scene)) => {
+                Bg::World(id, area, _, _) if Some(id) != self.zone.playfield || area != self.zone.area_playfield => {}
+                Bg::World(id, _, quality, Ok((scene, is_grid))) => {
                     eprintln!("playfield {id} loaded");
                     self.zt("world_data_ready");
                     self.ground_texture_installed_quality = quality;
+                    self.zone.is_grid = is_grid;
                     self.world_scene = Some(scene);
                     self.world_ready = true;
                 }
-                Bg::World(id, _, Err(e)) => {
+                Bg::World(id, _, _, Err(e)) => {
                     self.show_login(host);
                     self.message_box(&format!("Zone connected, but playfield {id} failed to load: {e}"));
                 }
@@ -938,7 +942,7 @@ impl Play {
                     self.interact_zone_frame(&f);
                     if hud::Hud::wants_zone_frame(&f) {
                         match self.hud.as_mut() {
-                            Some(h) => h.on_zone_frame(&mut self.gui, &f, self.zone.char_id as i32, |id| self.chat.as_ref().is_some_and(|chat| chat.is_ignored(id))),
+                            Some(h) => h.on_zone_frame(&mut self.gui, &f, &mut self.zone, |id| self.chat.as_ref().is_some_and(|chat| chat.is_ignored(id))),
                             None => self.hud_pending.push(f.clone()),
                         }
                     }
@@ -947,7 +951,6 @@ impl Play {
                         if let Some(hud) = self.hud.as_ref() { c.configure_escape(&hud.dvalues); }
                         c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text);
                     }
-                    let nano_serial = self.zone.nanos.serial;
                     let own_events_before = self.zone.own_events.len();
                     let zone_event = self.zone.on_frame(&f);
                     // GUI 0x10027d47: only the own, successfully decoded resurrection message.
@@ -956,15 +959,15 @@ impl Play {
                             hud.trigger_tip(&mut self.gui, "OnResurrect", "");
                         }
                     }
-                    if self.zone.nanos.serial != nano_serial {
-                        if let Some(hud) = self.hud.as_mut() {
-                            if let Some(health) = hud.nano_stats_changed(&mut self.zone) {
-                                if let Some(combat) = self.fight.as_mut() { combat.set_health_local(health); }
-                            }
-                        } else {
-                            // Login headers initialize health before the in-world projection exists.
-                            self.zone.nano_stat_removals.clear();
+                    // Spell instances apply against this message's stats, before any
+                    // later packet changes their level/source skill in the same batch.
+                    if let Some(hud) = self.hud.as_mut() {
+                        if let Some(health) = hud.nano_stats_changed(&mut self.zone) {
+                            if let Some(combat) = self.fight.as_mut() { combat.set_health_local(health); }
                         }
+                    } else {
+                        // Login headers initialize health before the in-world projection exists.
+                        self.zone.nano_stat_removals.clear();
                     }
                     if let Some(c) = self.chat.as_mut() {
                         c.on_zone_applied(&mut self.gui, &f, &self.zone, &self.text);
@@ -1374,6 +1377,11 @@ impl Frontend for Play {
             self.tick_preview(dt, host);
         }
         self.zone.tick(dt);
+        if let Some(hud) = self.hud.as_mut() {
+            if let Some(health) = hud.tick_stat_effects(&mut self.zone, f64::from(dt)) {
+                if let Some(combat) = self.fight.as_mut() { combat.set_health_local(health); }
+            }
+        }
         match self.fade {
             Fade::In(t) if self.screen == Screen::Loading => {
                 let t = t + dt;
@@ -1428,7 +1436,7 @@ impl Frontend for Play {
                         }
                         if let Some(h) = self.hud.as_mut() {
                             for f in std::mem::take(&mut self.hud_pending) {
-                                h.on_zone_frame(&mut self.gui, &f, self.zone.char_id as i32, |id| self.chat.as_ref().is_some_and(|chat| chat.is_ignored(id)));
+                                h.on_zone_frame(&mut self.gui, &f, &mut self.zone, |id| self.chat.as_ref().is_some_and(|chat| chat.is_ignored(id)));
                             }
                         }
                     }
@@ -1820,6 +1828,9 @@ impl Frontend for Play {
             }
             for l in h.take_system_lines() {
                 c.system_line(&mut self.gui, &l, 12);
+            }
+            for key in h.take_nano_feedback() {
+                c.feedback(&mut self.gui, key, &self.text);
             }
             for n in h.take_casts() {
                 c.cast_nano(&mut self.gui, &self.zone, &self.text, n);

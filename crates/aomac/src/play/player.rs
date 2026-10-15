@@ -143,6 +143,7 @@ impl Player {
             let avatar = Avatar::new(&store, dir, zone.char_id, u, assets)?;
             let collision = Collision::load(&store, playfield).map_err(|e| eprintln!("collision {playfield}: {e:#}")).ok();
             let mut movement = Movement::new(u.pos, u.yaw().unwrap_or(0.0), u.run_speed);
+            movement.set_input_lock(u.flag_32f); // GC10077e13 copies the full-update byte to +21d.
             movement.set_body_radius(avatar.body_radius());
             if let Some(c) = &collision {
                 if let Some(g) = c.ground(flip(u.pos)) {
@@ -565,8 +566,6 @@ impl Player {
             if let Some(scale) = s(0x168) { st.monster_scale = scale + zone.monster_scale_bonus; }
         });
         self.apply_own_events(zone);
-        zone.fight_level = Some(self.fight_level(self.movement.pos()));
-        zone.own_lca = self.fight.as_ref().and_then(|f| f.own_lca(self.movement.pos()));
         // `FUN_10070fee`: the target branch re-runs the Features / district gate every frame and reads the target's `GetRelPos`
         if let Some(t) = self.movement.chase_target() {
             if self.follow_gated() {
@@ -597,10 +596,23 @@ impl Player {
             zone.stats.insert(id, v);
         }
         let (pos, yaw) = (self.movement.pos(), self.movement.yaw());
+        zone.nano_motion = Some(super::hud_nano::NanoMotion {
+            pos, radius: self.avatar.body_radius(), mode: self.mode(),
+            moving: self.movement.fsm().is_moving(), falling: !self.movement.grounded(),
+            input_locked: self.movement.input_locked(),
+        });
         if let Some(d) = zone.dynels.get_mut(&(self.char_id as i32)) {
             d.pos = pos;
             d.yaw = Some(yaw);
         }
+        zone.fight_level = Some(self.fight_level(self.movement.pos()));
+        zone.crowd_state = Some(self.movement.crowd_state());
+        zone.character_fight_levels.clear();
+        for (&id, d) in &zone.dynels {
+            let pos = if id == self.char_id as i32 { self.movement.pos() } else { zone.world.character_position(id).unwrap_or(d.pos) };
+            zone.character_fight_levels.insert(id, self.fight_level(pos));
+        }
+        zone.own_lca = self.fight.as_ref().and_then(|f| f.own_lca(self.movement.pos()));
 
         let role = self.movement.role();
         let moving = self.movement.speed() > 0.01 && self.movement.grounded();

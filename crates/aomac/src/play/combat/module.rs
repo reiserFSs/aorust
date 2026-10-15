@@ -20,6 +20,54 @@ use ao_net::n3::outgoing::{n3_frame, DYNEL_CHAR};
 use ao_net::msg::Identity;
 use std::path::Path;
 
+/// Shared live projection for normal/special attacks and the hostile-nano final
+/// guard (GC 10069556 / 1004e7eb). Missing position queries are not district 2.
+pub(in crate::play) fn can_attack(zone: &Zone, target: Identity, mode: u32, report: bool) -> net::Verdict {
+    let own = zone.char_id as i32;
+    let Some(source) = zone.dynels.get(&own) else { return net::Verdict::default() };
+    if target.kind != DYNEL_CHAR { return net::Verdict::default(); }
+    let Some(d) = zone.dynels.get(&target.instance) else { return net::Verdict::default() };
+    let Some(&source_level) = zone.character_fight_levels.get(&own) else { return net::Verdict::default() };
+    let Some(&target_level) = zone.character_fight_levels.get(&target.instance) else { return net::Verdict::default() };
+    let s = |id| zone.skill_value_of(own, id).unwrap_or(0);
+    let t = |id| zone.skill_value_of(target.instance, id).unwrap_or(0);
+    // FUN_10044b6e calls direct GetStat(224,2): raw Features, not buffed GetSkill.
+    let features = |id| (zone.stat_of(id, 224).unwrap_or(ao_formats::stats::INVALID) as u32 & !0x800)
+        | if zone.is_grid { 0x800 } else { 0 };
+    // These are NOT playfield/area flags. Slots 0x3d/0x3f are real weapon objects,
+    // not guessed stun/root conditions (FUN_10068072).
+    // [UNRESOLVED] Mounted controller+0x38 override and CharState+0xf4 cached
+    // district override (10069556 / 1003f239) have no retained runtime owner yet.
+    let me = Attacker {
+        id: own,
+        is_client: true,
+        flag_21c: source.npc,
+        mode,
+        gm_level: s(215),
+        area_features: features(own),
+        side: zone.skill_value_of(own, 33).unwrap_or(i32::from(source.side)),
+        status_blocked: s(673) & 0x20 != 0
+            && [0x3d, 0x3f].iter().any(|&slot| zone.world.arms.slot_item(own, slot).is_some()),
+        fight_level: source_level,
+        in_team: zone.target_team.in_team() && zone.crowd_state != Some(5),
+    };
+    let tgt = Target::Char(CharTarget {
+        id: target.instance,
+        in_tree: true,
+        flag_21c: d.npc,
+        dead_flag: zone.world.is_dead(target.instance),
+        health: zone.skill_value_of(target.instance, 27).unwrap_or(d.health),
+        gm_level: t(215),
+        area_features: features(target.instance),
+        surrendering: t(449),
+        surrender_instance: t(451),
+        fighting_attacker: zone.fight_target.get(&target.instance) == Some(&own),
+        fight_level: target_level,
+        teammate: zone.target_team.target_member(target),
+    });
+    net::can_attack(&me, &tgt, report)
+}
+
 /// What the player asked for (key bindings `ACTION_*`, hotbar special actions, mouse).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -432,36 +480,6 @@ impl Module {
         zone.dynels.contains_key(&self.own)
     }
 
-    fn attacker(&self, zone: &Zone, mode: u32) -> Attacker {
-        let s = |id| zone.skill_value(id).unwrap_or(0);
-        Attacker {
-            id: self.own,
-            is_client: true,
-            flag_21c: false,
-            mode,
-            gm_level: s(0xd7),
-            area_features: 0,
-            side: s(0x21),
-            status_blocked: false,
-            fight_level: 2,
-            in_team: false,
-        }
-    }
-
-    fn target(&self, zone: &Zone, id: i32) -> Target {
-        let Some(d) = zone.dynels.get(&id) else { return Target::Unattackable };
-        let c = self.combat.char(id);
-        Target::Char(CharTarget {
-            id,
-            in_tree: true,
-            flag_21c: d.npc,
-            dead_flag: c.is_some_and(|c| c.dead),
-            health: c.map_or(d.health, |c| c.health()),
-            fighting_attacker: self.combat.fight(id).and_then(|f| f.target).is_some_and(|t| t.instance == self.own),
-            fight_level: 2,
-            ..CharTarget::default()
-        })
-    }
 
     fn send(&mut self, payload: Vec<u8>) {
         self.outbox.push(n3_frame(0, self.own as u32, payload));
@@ -479,9 +497,7 @@ impl Module {
         let tid = target.map_or(Identity::default(), |t| Identity { kind: DYNEL_CHAR, instance: t });
         let f = self.combat.fight(self.own);
         let fight = Fight { fighting: self.attacking(), target: f.and_then(|f| f.target).unwrap_or_default() };
-        let me = self.attacker(zone, mode);
-        let tgt = target.map_or(Target::Unattackable, |t| self.target(zone, t));
-        let r = net::default_attack(fight, tid, switch, mode, || net::can_attack(&me, &tgt, true));
+        let r = net::default_attack(fight, tid, switch, mode, || can_attack(zone, tid, mode, true));
         if r.stop_first {
             self.stop_attack();
         }
@@ -503,9 +519,7 @@ impl Module {
             Some(t) => t,
             None => zone.target.map_or(Identity::default(), |t| Identity { kind: DYNEL_CHAR, instance: t }),
         };
-        let me = self.attacker(zone, mode);
-        let tgt = if tid.kind == DYNEL_CHAR { self.target(zone, tid.instance) } else { Target::Unattackable };
-        let v = net::can_attack(&me, &tgt, true);
+        let v = can_attack(zone, tid, mode, true);
         self.feedback.extend(v.feedback);
         if v.allowed {
             self.send(net::sec_spec_attack(self.own, tid, stat));
@@ -665,9 +679,66 @@ mod tests {
         let mut z = Zone::new(OWN);
         for id in [OWN as i32, t] {
             z.dynels.insert(id, DynelState { name: format!("c{id}"), pos: [0.0; 3], yaw: None, npc: id != OWN as i32, side: 0, level: 1, health: 50, max_health: 50 });
+            z.character_fight_levels.insert(id, crate::play::fightmode::DEFAULT_LEVEL);
         }
         z.target = Some(t);
         (m, z, t)
+    }
+
+    #[test]
+    fn shared_attack_projection_uses_received_districts_teams_features_and_status() {
+        let mut zone = Zone::new(7);
+        let target = Identity { kind: DYNEL_CHAR, instance: 8 };
+        for id in [7, 8] {
+            zone.dynels.insert(id, DynelState { name: String::new(), pos: [id as f32, 0.0, 0.0],
+                yaw: None, npc: false, side: 1, level: 1, health: 10, max_health: 10 });
+        }
+        assert!(!can_attack(&zone, target, 2, true).allowed, "unqueried positions are not district 2");
+        zone.character_fight_levels.extend([(7, 3), (8, 1)]);
+        let verdict = can_attack(&zone, target, 2, true);
+        assert!(verdict.allowed);
+        assert_eq!(verdict.feedback, ["Feedback_TargetIsInADistrictWithHigherSuppression"]);
+        zone.skill_values.insert(224, net::features::NO_ATTACK as i32);
+        assert!(can_attack(&zone, target, 2, true).allowed, "native Features bypass the buff projection");
+        zone.skill_values.remove(&224);
+        zone.character_stats.entry(8).or_default().insert(224, net::features::CANT_BE_ATTACKED as i32);
+        assert_eq!(can_attack(&zone, target, 2, true).feedback, ["Feedback_CantbeAttacked"]);
+        zone.character_stats.get_mut(&8).unwrap().insert(224, 0);
+        zone.stats.insert(224, net::features::NO_ATTACK as i32);
+        assert_eq!(can_attack(&zone, target, 2, true).feedback, ["Feedback_YoureUnableToAttack"]);
+        zone.stats.insert(224, 0);
+        zone.dynels.get_mut(&7).unwrap().npc = true;
+        zone.stats.insert(33, 3);
+        zone.character_fight_levels.insert(8, 0);
+        assert!(!can_attack(&zone, target, 2, false).allowed, "neutral NPC tests both districts");
+        zone.character_fight_levels.insert(8, 2);
+        assert!(can_attack(&zone, target, 2, false).allowed);
+        zone.dynels.get_mut(&7).unwrap().npc = false;
+        for member in [7, 8] {
+            let record = ao_net::n3::team::TeamMember {
+                member: Identity { kind: DYNEL_CHAR, instance: member },
+                team: Identity { kind: ao_net::n3::team::TEAM_KIND, instance: 9 },
+                sub_team: -1, profession: 1, level: 1, name: String::new(),
+            };
+            zone.on_frame(&n3_frame(0, 7, ao_net::n3::team::team_member(
+                Identity { kind: DYNEL_CHAR, instance: 7 }, &record)));
+        }
+        assert!(!can_attack(&zone, target, 2, true).allowed, "received teammate");
+        zone.crowd_state = Some(5);
+        assert!(can_attack(&zone, target, 2, true).allowed, "native control state bypasses team gate");
+        zone.crowd_state = Some(1);
+        assert!(!can_attack(&zone, target, 2, true).allowed, "fear is not control state 5");
+        zone.fight_target.insert(8, 7);
+        assert!(can_attack(&zone, target, 2, true).allowed, "retaliation precedes team gate");
+        zone.stats.insert(673, 0x20);
+        assert!(can_attack(&zone, target, 2, true).allowed, "VisualFlags alone is not a status block");
+        zone.world.arms.wield(7, 100, 0x3d, None, &[]);
+        let blocked = can_attack(&zone, target, 2, true);
+        assert!(!blocked.allowed && blocked.feedback.is_empty());
+        zone.world.arms.unwield_slot(7, 0x3d);
+        assert!(can_attack(&zone, target, 2, true).allowed);
+        zone.character_fight_levels.remove(&8);
+        assert!(!can_attack(&zone, target, 2, false).allowed, "missing target query never becomes 2");
     }
 
     #[test]
@@ -977,6 +1048,7 @@ mod tests {
         let (mut m, mut z, t) = primed();
         let other = t + 1000;
         z.dynels.insert(other, DynelState { name: "b".into(), pos: [0.0; 3], yaw: None, npc: true, side: 0, level: 1, health: 5, max_health: 5 });
+        z.character_fight_levels.insert(other, crate::play::fightmode::DEFAULT_LEVEL);
         m.on_frame(&n3_frame(0, OWN, net::attack(OWN as i32, Identity { kind: DYNEL_CHAR, instance: t }, 0)));
         m.command(Command::SwitchTarget(other), &z, 2);
         let out = sent(&mut m);

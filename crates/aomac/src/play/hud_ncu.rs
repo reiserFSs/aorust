@@ -9,7 +9,7 @@
 //!
 //! Interactions: right click or double click = `N3Msg_RemoveBuff` (`FUN_10044c31`): a friendly effect (`Flags & 0xc100 == 0`) requests cancellation and
 //! "Deactivating friendly timed nanoprogram." goes to the System window, otherwise "Can't remove hostile timed nanoprogram."; the tooltip (`FUN_1004518b`) is
-//! the name, "NCU usage: %d", "Remaining: hh:mm:ss" and the modifier list. UNRESOLVED / not ported: "Modifies:" (`N3Msg_GetModifierString`) and Type column (8).
+//! the type, "NCU usage: %d", "Remaining: hh:mm:ss" and the event-0 modifier list (`N3Msg_GetModifierString`).
 //! Effect timing and removal belong to `OwnNanos`; opening this window never expires or removes effects.
 
 use super::hud::WindowKind;
@@ -181,7 +181,15 @@ impl HudNcu {
                 }
             }
             // `FUN_1004518b`
-            let body = format!("<br>NCU usage:&nbsp;{}<br>Remaining:&nbsp;{}", info.stat(stat::NCU).unwrap_or(0), lv::hms(rem));
+            let mut body = format!("{}<br>NCU usage:&nbsp;{}<br>Remaining:&nbsp;{}", info.type_text(), info.stat(stat::NCU).unwrap_or(0), lv::hms(rem));
+            match self.db.modifiers(&info, zone, &self.texts) {
+                Ok(modifiers) if !modifiers.is_empty() => {
+                    body.push_str("<br>Modifies:<br>");
+                    body.push_str(&modifiers.replace('\n', "<br>"));
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("hud: ncu modifiers {}: {e:#}", b.nano),
+            }
             rows.push(Row { key: b.nano, icon: info.icon, cells, tip_title: info.name.clone(), tip_body: body });
         }
         let win = self.win.as_mut().expect("open");
@@ -269,6 +277,54 @@ impl HudNcu {
 mod tests {
     use super::*;
     use super::super::own_nanos::Buff;
+
+    #[test]
+    fn real_friendly_and_hostile_rows_share_type_radius_and_modifiers() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut ncu = HudNcu::new(&dir, (1100, 760)).unwrap();
+        let store = ao_rdb::RecordStore::open(&dir).unwrap();
+        let friendly = store.ids(super::super::hud_nanodb::NANO_RDB_TYPE).unwrap().into_iter().find_map(|id| {
+            let id = i32::try_from(id).ok()?;
+            let info = ncu.db.info(&mut gui, id)?;
+            (info.stat(stat::FLAGS).unwrap_or(1) & 0x8000 == 0
+                && info.spells.iter().any(|s| s.function == 0xcf14 && s.stat(39) != 0)).then_some(id)
+        }).expect("installed friendly modifier nano");
+        // GUI1003eacb tests only Flags&0x8000 for Type. The cancellation
+        // mask0xc100 is different: timed25982 is not removable but is Friendly.
+        let timed = ncu.db.info(&mut gui, 25982).unwrap();
+        assert_eq!(timed.stat(stat::FLAGS).unwrap_or(1) & 0x8000, 0);
+        assert!(!nano::can_remove_buff(timed.stat(stat::FLAGS).unwrap_or(0)));
+        assert_eq!(timed.type_text(), "<font color=\"white\">Friendly</font>");
+        let hostile = 28612; // Ice Flechette, an actual Flags&0x8000 nano.
+        let mut zone = Zone::new(7);
+        zone.nanos.buffs = [friendly, hostile].into_iter().map(|nano| Buff { nano, total_cs: 90000, ..Default::default() }).collect();
+        ncu.open(&mut gui);
+        ncu.update(&mut gui, &zone, 0.0);
+        for id in [friendly, hostile] {
+            let info = ncu.db.info(&mut gui, id).unwrap().clone();
+            let columns = ncu.columns();
+            let cells = HudNano::cells(&info, &columns);
+            let row = ncu.win.as_ref().unwrap().view.rows().iter().find(|r| r.key == id).unwrap();
+            for (column, cell) in columns.iter().zip(&cells) {
+                if column.id == 8 { assert_eq!(cell, info.type_text()); }
+                if column.id == 11 { assert_eq!(cell, "0", "static NanoItem+b8"); }
+            }
+            assert_eq!(row.cells, cells.iter().enumerate().map(|(i, cell)| match columns[i].id {
+                12 | 13 => lv::hms(90000), _ => cell.clone(),
+            }).collect::<Vec<_>>());
+            assert!(row.tip_body.starts_with(info.type_text()));
+            let modifiers = ncu.db.modifiers(&info, &zone, &ncu.texts).unwrap();
+            if id == friendly { assert!(!modifiers.is_empty()); }
+            assert_eq!(row.tip_body.contains("<br>Modifies:<br>"), !modifiers.is_empty());
+            if !modifiers.is_empty() { assert!(row.tip_body.ends_with(&modifiers.replace('\n', "<br>"))); }
+            if id == hostile {
+                assert_ne!(info.stat(stat::FLAGS).unwrap_or(0) & 0x8000, 0, "GUI1003eacb hostile Type predicate");
+                assert_eq!(info.type_text(), "<font color=\"red\">Hostile</font>");
+            }
+        }
+    }
 
     #[test]
     fn right_click_requests_cancellation_and_waits_for_server_removal() {
@@ -359,7 +415,7 @@ mod tests {
         assert_eq!(ncu.shown(), [25982]);
         let view = &ncu.win.as_ref().unwrap().view;
         let row = &view.rows()[0];
-        assert!(row.tip_body.ends_with(&lv::hms(40000)));
+        assert!(row.tip_body.contains(&format!("Remaining:&nbsp;{}", lv::hms(40000))));
         for (column, cell) in view.columns.iter().zip(&row.cells) {
             match column.id {
                 12 => assert_eq!(cell, &lv::hms(40000)),

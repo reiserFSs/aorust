@@ -60,6 +60,7 @@ pub struct Model {
     cost: HashMap<u32, i32>,
     /// The bonus / percent maps of the active spells (`SimpleChar+0x1bc`), see [`Model::refresh_buffs`].
     mods: Modifiers,
+    effects: super::buffs::AppliedEffects,
     /// AMS raw value rebuilt from the equipped weapon's attack list (`FUN_10068359`).
     ams: i32,
 }
@@ -93,12 +94,12 @@ impl Model {
         get(stats::IP).unwrap_or(0) - self.cost.values().sum::<i32>()
     }
 
-    /// Rebuilds the modifier maps from the spells running on the own character (`hud_stats/buffs.rs`); the window calls it every update.
+    /// Reconciles spell lifecycles; unchanged instances keep their apply-time delta.
     pub fn refresh_buffs(&mut self, get: Get, active: &[ao_net::n3::spells::Spell], wear: &[ao_net::n3::spells::Spell], attack: Option<&[(u32, i32)]>) {
         let (ch, lock) = (Character::from_stats(get), get(buffs::LOCK_STAT).unwrap_or(0));
         let tables = &self.tables;
         let current = |stat: u32, m: &Modifiers| buffs::skill_value(tables, stat, get(stat).unwrap_or(0), &ch, m, lock);
-        self.mods = super::buffs::modifiers_with_equipment(active, wear, get(stats::LEVEL).unwrap_or(0), &current);
+        self.effects.refresh(&mut self.mods, active, wear, get(stats::LEVEL).unwrap_or(0), &current);
         // `FUN_10081c67` truncates each weighted term, then adds AMSModifier only for a positive armed total.
         self.ams = match attack {
             None => self.value(get, 100) + self.value(get, 276),
@@ -107,6 +108,40 @@ impl Model {
                 if sum > 0 { sum + self.value(get, 276) } else { sum }
             }
         };
+    }
+
+    pub(super) fn reset_effects(&mut self) {
+        self.effects.reset_sources(&mut self.mods);
+    }
+
+    pub(super) fn tick_effects(&mut self, get: Get, dt: f64) -> (bool, Option<i32>) {
+        let mut health = get(27);
+        let original = health;
+        let life = get(stats::LIFE);
+        let lock = get(buffs::LOCK_STAT).unwrap_or(0);
+        let changed = self.effects.tick(dt, &mut self.mods, &mut |maps| {
+            if let (Some(raw), Some(stored)) = (life, health) {
+                let limit = (raw + maps.bonus_of(stats::LIFE, raw, lock)).max(0);
+                if stored > limit { health = Some(limit); }
+            }
+        });
+        (changed, if health == original { None } else { health })
+    }
+
+    pub(super) fn remove_wear_effects(&mut self, indices: &[usize]) {
+        self.effects.remove_wear(&mut self.mods, indices);
+    }
+
+    pub(super) fn remove_active_effect(&mut self, index: usize) {
+        self.effects.remove_active(&mut self.mods, index);
+    }
+
+    pub(super) fn add_wear_effects(&mut self, indices: &[usize]) {
+        self.effects.added_wear.extend_from_slice(indices);
+    }
+
+    pub(super) fn add_active_effects(&mut self, indices: &[usize]) {
+        self.effects.added_active.extend_from_slice(indices);
     }
 
     /// `GetSkill(stat, 2)`, without the Skills window's pending ability points (which belong to mode 4).
@@ -137,6 +172,7 @@ impl Model {
         let scale = get(360).unwrap_or(100);
         zone.monster_scale_bonus = self.mods.bonus_of(360, scale, lock);
         zone.skill_values = values;
+        if zone.skill_modifiers != self.mods { zone.skill_modifiers.clone_from(&self.mods); }
     }
 
     pub fn row(&self, get: Get, stat: u32) -> Row {
@@ -157,10 +193,15 @@ impl Model {
         !is_disabled(stat) && r.pending + 1 + r.raw <= r.max
     }
 
-    /// `FUN_100fd5b9` is the refusal at the maximum (feedback text UNRESOLVED, docs §11.10); `true` when [`Model::adjust`] would be called.
+    /// `FUN_100fd5b9`: the next attempted point exceeds the row maximum.
     pub fn at_max(&self, get: Get, stat: u32) -> bool {
         let r = self.row(get, stat);
         r.max < r.pending + 1 + r.raw
+    }
+
+    pub fn max_feedback(&self, get: Get, stat: u32) -> Option<(&'static str, Option<i32>)> {
+        let row = self.row(get, stat);
+        self.tables.max_feedback(stat, &self.character(get), row.value, row.raw + row.pending + 1)
     }
 
     /// The IP slot `FUN_100fa185`: `remaining - price` must stay above zero (`0 < remaining`), otherwise nothing changes.

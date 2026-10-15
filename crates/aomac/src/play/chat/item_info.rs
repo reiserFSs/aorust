@@ -83,7 +83,7 @@ fn html_request(zone:&Zone,request:&ItemRequest,texts:&TextDb,price:Option<i32>)
     Ok(Some((out,template.name.unwrap_or_default())))
 }
 
-fn interpolated_data(low:&[u8],high:&[u8],ql:i32,aq:i32,bq:i32)->Result<Data> {
+pub(crate) fn interpolated_data(low:&[u8],high:&[u8],ql:i32,aq:i32,bq:i32)->Result<Data> {
     let a=template_spells::data(low,u32::MAX)?;
     if std::ptr::eq(low,high) {return Ok(a)}
     let b=template_spells::data(high,u32::MAX)?;

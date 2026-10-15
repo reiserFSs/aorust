@@ -255,6 +255,51 @@ impl SkillTables {
         ftol(max)
     }
 
+    /// `Gamecode::N3Msg_SkillMaxFeedback` `10064cde`: localization key and optional LDB integer argument.
+    /// `value` is GetSkill(stat, 2), `attempt` is the row's raw + pending + 1.
+    pub fn max_feedback(&self, stat: u32, ch: &Character, value: i32, attempt: i32) -> Option<(&'static str, Option<i32>)> {
+        if (100..=168).contains(&stat) && ch.profession != -1 {
+            let class = ftol(self.cost_factor(ch.profession, stat) as f32 / 10.0 + 0.5);
+            let tl = ch.title_level;
+            if value >= self.class_t(class, tl) {
+                return Some(("Feedback_ReachedYourTitleMax", None));
+            }
+            let mut b = self.class_b(class);
+            let mut limit = ch.level * b + 5;
+            let title_limited = if tl > 1 {
+                self.title_start(ch.profession, tl).is_some_and(|start| {
+                    let prev = self.class_t(class, tl - 1);
+                    let v = if tl == 7 { prev } else { (ch.level.min(204) - start + 1) * b + prev };
+                    v < limit
+                })
+            } else {
+                false
+            };
+            if ch.level > 200 {
+                limit += (ch.level - 200) * (6 - class) * 5;
+                b = 5;
+            }
+            if attempt >= limit || title_limited {
+                return Some(("Feedback_MaximumIncreaseInSkill", Some(b)));
+            }
+        }
+        if (16..=21).contains(&stat) {
+            let i = (stat - 16) as usize;
+            let class = *self.ability_class.get(&ch.breed)?.get(i)?;
+            let mut absolute = self.breed_cap.get(&ch.breed)?[i];
+            let per_level = if ch.level > 200 {
+                absolute += match class { 1 => 400, 2 => 300, 3 => 200, _ => 0 };
+                match class { 1 => 20, 2 => 15, 3 => 10, _ => 0 }
+            } else { 3 };
+            if attempt >= absolute {
+                return Some(("Feedback_AbsoluteAbilityMax", None));
+            }
+            return (attempt >= self.ability_max(stat, ch)).then_some(("Feedback_MaximumIncreaseInAbility", Some(per_level)));
+        }
+        let limit = ftol(self.trickle(stat, ch.abilities) * 8.0);
+        (limit > 0 && attempt >= limit).then_some(("Feedback_BaseAbilitiesTooLow", None))
+    }
+
     /// `N3Msg_GetSkillCostLevel` = `FUN_10062398`: the cost factor (skills), ten times the ability cost class, 1 without profession.
     pub fn cost_level(&self, stat: u32, ch: &Character) -> i32 {
         if ch.profession == -1 {
@@ -339,6 +384,14 @@ mod tests {
         let ch = Character { breed: 1, profession: 1, level: 1, title_level: 1, abilities: [6; 6] };
         // base 6 + 3 * level 1
         assert_eq!(t.ability_max(16, &ch), 9);
+        assert_eq!(t.max_feedback(16, &ch, 6, 10), Some(("Feedback_MaximumIncreaseInAbility", Some(3))));
+        assert_eq!(t.max_feedback(16, &ch, 472, 473), Some(("Feedback_AbsoluteAbilityMax", None)));
+        assert_eq!(t.max_feedback(16, &Character { level: 205, ..ch }, 547, 548), Some(("Feedback_MaximumIncreaseInAbility", Some(15))));
+        t.cost.insert(1, HashMap::from([(152, 10)]));
+        t.class.insert(1, ([100; 7], 6));
+        assert_eq!(t.max_feedback(152, &ch, 100, 101), Some(("Feedback_ReachedYourTitleMax", None)));
+        assert_eq!(t.max_feedback(152, &ch, 5, 12), Some(("Feedback_MaximumIncreaseInSkill", Some(6))));
+        assert_eq!(t.max_feedback(152, &Character { level: 10, ..ch }, 5, 13), Some(("Feedback_BaseAbilitiesTooLow", None)));
         // level 205: (205 - 200) * 15 + cap 472 (class 2), below the raised cap 472 + 300
         assert_eq!(t.ability_max(16, &Character { level: 205, ..ch }), 5 * 15 + 472);
         // trickle: 0.25 * (50*6/100 + 50*6/100) = 1.5 -> truncated 1

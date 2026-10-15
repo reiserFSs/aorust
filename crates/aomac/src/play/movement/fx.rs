@@ -102,12 +102,11 @@ impl Movement {
 
     /// `dynel+0x21d` (`FUN_10058d6c` sets it, `FUN_10058d7d` clears it; only for a player): while set `PlayerVehicle` vtable `[0x24]`
     /// (`FUN_10070fd0`) is false and every movement action is refused.
-    fn set_input_lock(&mut self, locked: bool) {
+    pub(in crate::play) fn set_input_lock(&mut self, locked: bool) {
         self.controllable = !locked;
     }
 
     /// The own character's input is locked (fear, control).
-    #[cfg(test)]
     pub fn input_locked(&self) -> bool {
         !self.controllable
     }
@@ -143,7 +142,6 @@ impl Movement {
     }
 
     /// The crowd-control state (`char+0x1f0`).
-    #[cfg(test)]
     pub fn crowd_state(&self) -> u8 {
         self.fx.crowd
     }

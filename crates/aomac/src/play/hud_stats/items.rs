@@ -10,6 +10,8 @@ use ao_net::n3::world::InventoryEntry;
 use ao_rdb::RecordStore;
 use std::collections::HashMap;
 use std::path::Path;
+use crate::play::{chat::info::{item_eligibility::EquipCriteria, PerkEquipment}, zone::Zone};
+use ao_net::n3::world::AcgItem;
 
 /// Stat `Icon`.
 const STAT_ICON: u32 = 0x4f;
@@ -35,21 +37,125 @@ impl Info {
 
 /// A shop item's name, count, Value and icon.
 pub type ShopInfo = (String, i32, i32, Option<GfxId>);
+type WearDestination = Option<(usize, u32)>;
 
-struct ShopItem {
-    template: ao_formats::dynel_visual::ItemTemplate,
-    icon: Option<Option<GfxId>>,
-}
 
 pub struct Items {
     store: Option<RecordStore>,
     cache: HashMap<i32, Option<Info>>,
-    shop_cache: HashMap<(i32, i32, i32), Option<ShopItem>>,
+    shop_cache: HashMap<(i32, i32, i32), Option<ShopInfo>>,
+    equip: HashMap<(i32, i32, i32), Result<EquipCriteria, String>>,
+    destinations: HashMap<(i32, i32, i32), Result<WearDestination, String>>,
+    equipment: PerkEquipment,
+    pub(super) nano_cast_busy: bool,
 }
 
 impl Items {
     pub fn new(dir: &Path) -> Self {
-        Self { store: RecordStore::open(dir).ok(), cache: HashMap::new(), shop_cache: HashMap::new() }
+        Self { store: RecordStore::open(dir).ok(), cache: HashMap::new(), shop_cache: HashMap::new(), equip: HashMap::new(), destinations: HashMap::new(), equipment: PerkEquipment::default(), nano_cast_busy: false }
+    }
+
+    fn equip_criteria(&mut self, item: AcgItem) -> anyhow::Result<&EquipCriteria> {
+        let key = (item.low_id, item.high_id, item.level);
+        if !self.equip.contains_key(&key) {
+            let result = self.store.as_ref().ok_or_else(|| anyhow::anyhow!("item database unavailable"))
+                .and_then(|store| EquipCriteria::load(store, item)).map_err(|e| format!("{e:#}"));
+            self.equip.insert(key, result);
+        }
+        self.equip[&key].as_ref().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    pub(super) fn acg_stat(&mut self, item: AcgItem, stat: u32) -> anyhow::Result<Option<i32>> {
+        Ok(self.equip_criteria(item)?.stat(stat))
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_test_acg(&mut self, item: AcgItem, stats: &[(u32, i32)]) {
+        self.equip.insert((item.low_id, item.high_id, item.level), Ok(EquipCriteria::test_stats(stats)));
+    }
+
+    pub(super) fn wear_destination(&mut self, item: AcgItem) -> anyhow::Result<Option<(usize, u32)>> {
+        let key = (item.low_id, item.high_id, item.level);
+        if !self.destinations.contains_key(&key) {
+            let result = (|| -> anyhow::Result<_> {
+                let store = self.store.as_ref().ok_or_else(|| anyhow::anyhow!("item database unavailable"))?;
+                let low = item_template(store, u32::try_from(item.low_id)?)?.ok_or_else(|| anyhow::anyhow!("missing item {}", item.low_id))?;
+                let high_id = if item.high_id == 0 { item.low_id } else { item.high_id };
+                let high = if high_id == item.low_id { None } else { Some(item_template(store, u32::try_from(high_id)?)?.ok_or_else(|| anyhow::anyhow!("missing item {high_id}"))?) };
+                let template = ao_formats::dynel_visual::interpolate_item_templates(&low, high.as_ref().unwrap_or(&low), item.level)?;
+                Ok(super::item_dnd::default_wear_stats(&template.stats))
+            })().map_err(|e| format!("{e:#}"));
+            self.destinations.insert(key, result);
+        }
+        self.destinations[&key].as_ref().copied().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    pub(super) fn can_unwear(&mut self, zone: &Zone, slot: u32) -> anyhow::Result<bool> {
+        let item = zone.inventory.get(&slot).ok_or_else(|| anyhow::anyhow!("missing worn slot {slot}"))?.item;
+        if slot == 7 && (9..=14).any(|s| zone.inventory.contains_key(&s)) { return Ok(false); }
+        self.equip_criteria(item)?;
+        let check = self.equip[&(item.low_id, item.high_id, item.level)].as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+        check.removable(zone, (0x30..0x40).contains(&slot), check.completion_state(zone, true)?)
+    }
+
+    pub(super) fn wear_delay(&mut self, zone: &Zone, source: u32, destination: i32) -> anyhow::Result<Option<f32>> {
+        if source >= 0x30 && !(0..0x30).contains(&destination) { return Ok(None); }
+        let moved = zone.inventory.get(&source).ok_or_else(|| anyhow::anyhow!("missing source slot {source}"))?.item;
+        let delay = self.acg_stat(moved, super::item_dnd::STAT_EQUIP_DELAY)?.unwrap_or(0);
+        let occupant = if (0..0x30).contains(&destination) {
+            if let Some(entry) = zone.inventory.get(&(destination as u32)) {
+                self.acg_stat(entry.item, super::item_dnd::STAT_EQUIP_DELAY)?.unwrap_or(0)
+            } else { 0 }
+        } else { 0 };
+        Ok(super::item_dnd::wear_delay_values(delay, source as i32, destination, occupant))
+    }
+
+    pub(super) fn can_equip(&mut self, zone: &Zone, source: u32, tab: usize, id: u32) -> anyhow::Result<bool> {
+        let entry = zone.inventory.get(&source).ok_or_else(|| anyhow::anyhow!("missing source slot {source}"))?;
+        if entry.b > 1 { return Ok(false); }
+        // 1004c570: the temporary/overflow inventory (10048829 kind0x6e)
+        // must have its first cell free before an equip.
+        if zone.containers.get(&(ao_net::n3::inventory::KIND_TRADE, zone.char_id as i32)).is_some_and(|(_, entries)| entries.iter().any(|e| e.slot == 0)) { return Ok(false); }
+        let item = entry.item;
+        let destination = tab as u32 * 16 + id;
+        // 1004c534: already worn items cannot move into/out of Social.
+        if source < 0x40 && (tab == 3 || source >= 0x30) { return Ok(false); }
+        self.equip_criteria(item)?;
+        let key = (item.low_id, item.high_id, item.level);
+        let class = self.equip[&key].as_ref().map_err(|e| anyhow::anyhow!("{e}"))?.stat(76);
+        if matches!(class, Some(3 | 5)) {
+            if zone.inventory.contains_key(&destination) { return Ok(false); }
+            if (class == Some(5)) != (zone.skill_value(60) == Some(15)) { return Ok(false); }
+        }
+        if class != Some(1) && zone.stat(224).unwrap_or(0) & 0x800 != 0 { return Ok(false); }
+        if class == Some(1) && destination == 7 && (9..=14).any(|s| zone.inventory.contains_key(&s)) { return Ok(false); }
+        // Replacement checks the displaced item's own Unwear/Unwield stream.
+        if destination != source {
+            if let Some(occupant) = zone.inventory.get(&destination) {
+                if !self.can_unwear(zone, destination)? { return Ok(false); }
+                if source < 0x40 {
+                    let check = self.equip_criteria(occupant.item)?;
+                    if check.stat(76) == Some(1) && !super::item_dnd::can_wear_stats(check.stats(), (source / 16) as usize, source % 16, zone.stat(0x2d).unwrap_or(0)) { return Ok(false); }
+                }
+            }
+        }
+        // 1004c6e1 passes the opposite *occupied* slot to 10068e28.
+        if class == Some(1) {
+            let opposite = match destination { 6 => Some(8), 8 => Some(6), 13 => Some(15), 15 => Some(13), _ => None };
+            if let Some(opposite) = opposite.filter(|&slot| slot != source).and_then(|slot| zone.inventory.get(&slot)) {
+                self.equip_criteria(opposite.item)?;
+                let check = self.equip[&key].as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let other = self.equip[&(opposite.item.low_id, opposite.item.high_id, opposite.item.level)].as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+                if !check.dual_wield(other, zone)? { return Ok(false); }
+            }
+        }
+        if !matches!(tab, 0 | 3) {
+            let store = self.store.as_ref().ok_or_else(|| anyhow::anyhow!("item database unavailable"))?;
+            self.equipment.refresh(store, zone)?;
+        }
+        let check = self.equip[&key].as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !super::item_dnd::can_wear_stats(check.stats(), tab, id, zone.stat(0x2d).unwrap_or(0)) { return Ok(false); }
+        check.eligible(zone, self.equipment.armor(), tab == 3, check.completion_state(zone, false)?)
     }
 
     /// Interfaces 1000a707: tower type or use-event criterion action 0x53.
@@ -74,40 +180,29 @@ impl Items {
         self.cache[&low_id].as_ref()
     }
 
-    fn cache_acg(&mut self, item: ao_net::n3::world::AcgItem) -> anyhow::Result<()> {
-        let key = (item.low_id, item.high_id, item.level);
-        if self.shop_cache.contains_key(&key) { return Ok(()); }
-        let template = (|| -> anyhow::Result<_> {
-            let Some(store) = self.store.as_ref() else { return Ok(None) };
-            let Some(low) = item_template(store, u32::try_from(item.low_id)?)? else { return Ok(None) };
-            let high = if item.high_id == item.low_id { None } else { item_template(store, u32::try_from(item.high_id)?)? };
-            if item.high_id != item.low_id && high.is_none() { return Ok(None); }
-            let template = ao_formats::dynel_visual::interpolate_item_templates(&low, high.as_ref().unwrap_or(&low), item.level)?;
-            Ok(Some(ShopItem { template, icon: None }))
-        })()?;
-        self.shop_cache.insert(key, template);
-        Ok(())
-    }
-
-    pub(super) fn acg_stat(&mut self, item: ao_net::n3::world::AcgItem, stat: u32) -> anyhow::Result<Option<i32>> {
-        self.cache_acg(item)?;
-        Ok(self.shop_cache.get(&(item.low_id, item.high_id, item.level)).and_then(|v| v.as_ref()).and_then(|v| v.template.stat(stat)))
-    }
-
-    /// ACG-resolved shop name/count/Value, sharing the owned-item stat cache.
+    /// ACG-resolved shop name/count/Value and icon. Owned item predicates use
+    /// `acg_stat`'s canonical EquipCriteria cache, not a second shop template.
     pub fn shop_info(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> Option<ShopInfo> {
         let key = (item.low_id, item.high_id, item.level);
-        if let Err(error) = self.cache_acg(item) {
-            eprintln!("shop: invalid ACG {item:?}: {error:#}");
-            self.shop_cache.insert(key, None);
-            return None;
+        if !self.shop_cache.contains_key(&key) {
+            let result = (|| -> anyhow::Result<Option<ShopInfo>> {
+                let Some(store) = self.store.as_ref() else { return Ok(None) };
+                let Some(low) = item_template(store, u32::try_from(item.low_id)?)? else { return Ok(None) };
+                let high = if item.high_id == item.low_id { None } else {
+                    let Some(high) = item_template(store, u32::try_from(item.high_id)?)? else { return Ok(None) };
+                    Some(high)
+                };
+                let t = ao_formats::dynel_visual::interpolate_item_templates(&low, high.as_ref().unwrap_or(&low), item.level)?;
+                let icon = t.stat(STAT_ICON).filter(|&id| id > 0).and_then(|id| icon_image(gui, store, id as u32)).map(|(id, _, _)| id);
+                Ok(Some((t.name.clone().unwrap_or_default(), t.stat(STAT_COUNT).filter(|&c| c > 0).unwrap_or(1), t.stat(0x4a).unwrap_or(0), icon)))
+            })();
+            let info = match result {
+                Ok(info) => info,
+                Err(e) => { eprintln!("shop: invalid ACG {item:?}: {e:#}"); None }
+            };
+            self.shop_cache.insert(key, info);
         }
-        let cached = self.shop_cache.get_mut(&key)?.as_mut()?;
-        let t = &cached.template;
-        let icon = *cached.icon.get_or_insert_with(|| {
-            t.stat(STAT_ICON).filter(|&id| id > 0).and_then(|id| icon_image(gui, self.store.as_ref()?, id as u32)).map(|(id, _, _)| id)
-        });
-        Some((t.name.clone().unwrap_or_default(), t.stat(STAT_COUNT).filter(|&c| c > 0).unwrap_or(1), t.stat(0x4a).unwrap_or(0), icon))
+        self.shop_cache[&key].clone()
     }
 
     /// The record of an item that [`Items::info`] already loaded.
@@ -120,13 +215,6 @@ impl Items {
         self.cache.insert(id, Some(info));
     }
 
-    #[cfg(test)]
-    pub(super) fn insert_test_acg(&mut self, item: ao_net::n3::world::AcgItem, stats: &[(u32, i32)]) {
-        self.shop_cache.insert((item.low_id, item.high_id, item.level), Some(ShopItem {
-            template: ao_formats::dynel_visual::ItemTemplate { kind: 0, name: None, sounds: vec![], stats: stats.to_vec() },
-            icon: Some(None),
-        }));
-    }
 
     /// Canvas items of one item picture whose slot cell has its top-left corner at `(x, y)` (the 48 px picture sits 3 px inside the 54 px slot).
     pub fn picture(&mut self, gui: &mut Gui, e: &InventoryEntry, x: f32, y: f32) -> Option<CanvasItem> {
@@ -173,17 +261,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn acg_stat_cache_keeps_quality_and_high_endpoint_separate() {
-        let mut items = Items { store: None, cache: HashMap::new(), shop_cache: HashMap::new() };
-        let low = ao_net::n3::world::AcgItem { low_id: 1, high_id: 2, level: 4 };
-        let high = ao_net::n3::world::AcgItem { level: 5, ..low };
+    fn resolved_item_stats_are_cached_by_both_endpoints_and_quality() {
+        let mut items = Items::new(Path::new("/no-item-database"));
+        let low = AcgItem { low_id: 1, high_id: 2, level: 1 };
+        let quality = AcgItem { level: 2, ..low };
+        let endpoint = AcgItem { high_id: 3, ..low };
         items.insert_test_info(1, Info { name: String::new(), icon: None, stats: vec![(30, 0)] });
         items.insert_test_acg(low, &[(30, 0x200), (0, 0)]);
-        items.insert_test_acg(high, &[(30, 0x1000200), (0, 0x4000000)]);
+        items.insert_test_acg(quality, &[(30, 0x1000200), (0, 0x4000000)]);
+        items.insert_test_acg(endpoint, &[(30, 8)]);
         assert_eq!(items.acg_stat(low, 30).unwrap(), Some(0x200));
-        assert_eq!(items.acg_stat(high, 30).unwrap(), Some(0x1000200));
-        assert_eq!(items.acg_stat(high, 0).unwrap(), Some(0x4000000));
-        assert_eq!(items.acg_stat(ao_net::n3::world::AcgItem { high_id: 3, ..high }, 30).unwrap(), None);
+        assert_eq!(items.acg_stat(quality, 30).unwrap(), Some(0x1000200));
+        assert_eq!(items.acg_stat(quality, 0).unwrap(), Some(0x4000000));
+        assert_eq!(items.acg_stat(endpoint, 30).unwrap(), Some(8));
+        assert!(items.acg_stat(AcgItem { high_id: 4, ..low }, 30).is_err(), "missing ACG never falls back to the low-info cache");
     }
 
     #[test]

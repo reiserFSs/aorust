@@ -19,14 +19,17 @@ const CMD_USE_ITEM: i32 = 3;
 const CMD_USE_ITEM_ON_ITEM: i32 = 5;
 /// `GenericCmd_t` command of `N3Msg_UseItemOnCharacter` [GC 0x100268af].
 const CMD_USE_ITEM_ON_CHARACTER: i32 = 0x20;
-/// `ComputerLiteracy` (stat 0x2d): the deck weapons need it (`FUN_10046cbf`).
-const STAT_DECK: u32 = 0x2d;
 
 impl HudStats {
     /// Native count selector `100412a0`: logical window coordinates, same units as MouseMove.
     pub(in crate::play) fn take_pointer_warp(&mut self) -> Option<(f32, f32)> {
         self.dnd.pointer_warp.take()
     }
+
+    pub(in crate::play) fn set_nano_cast_busy(&mut self, busy: bool) {
+        self.items.nano_cast_busy = busy;
+    }
+
     pub(in crate::play) fn take_info_urls(&mut self) -> Vec<String> {
         std::mem::take(&mut self.info_urls)
     }
@@ -134,6 +137,7 @@ impl HudStats {
     }
 
     pub(in crate::play) fn input(&mut self, gui: &mut Gui, zone: &Zone, ev: &InputEvent, mods: ao_gui::Modifiers) {
+        self.skills_input(ev, mods);
         match *ev {
             InputEvent::Key { key: ao_gui::Key::Escape, pressed: true, .. } => self.cancel_item_drag(gui),
             InputEvent::MouseDown { x, y, .. } if !gui.pointer_owner(x, y).is_some_and(|owner|
@@ -315,6 +319,10 @@ impl HudStats {
         if self.equipment_locked && (slot < inv::BAG_FIRST || matches!(dest, Place::Wear { .. })) {
             return None;
         }
+        if (slot < inv::BAG_FIRST || matches!(dest, Place::Wear { .. }))
+            && (self.items.nano_cast_busy || self.wear_timers.active().is_some() || (slot < inv::BAG_FIRST && !self.can_unwear(zone, slot))) {
+            return None;
+        }
         let item = inv::item_identity(slot);
         let e = zone.inventory.get(&slot)?;
         match dest {
@@ -322,9 +330,8 @@ impl HudStats {
                 if dslot == slot {
                     return None;
                 }
-                let info = self.items.cached(e.item.low_id)?;
                 let (page, _) = dnd::tab_page(tab)?;
-                dnd::can_wear(info, tab, id, zone.stat(STAT_DECK).unwrap_or(0)).then(|| Action::Move { item, slot: (page.base() + id) as i32 })
+                self.can_equip(zone, slot, tab, id).then(|| Action::Move { item, slot: (page.base() + id) as i32 })
             }
             Place::Bag { cell } => {
                 if slot < inv::BAG_FIRST {
@@ -370,20 +377,22 @@ impl HudStats {
                     self.equipment_feedback = true;
                     return;
                 }
+                if self.items.nano_cast_busy || self.wear_timers.active().is_some() { return; }
+                if (0..inv::BAG_FIRST as i32).contains(&item.instance) && !self.can_unwear(zone, item.instance as u32) { return; }
+                if (1..0x40).contains(&slot) {
+                    let tab = (slot / 0x10) as usize;
+                    if !self.can_equip(zone, item.instance as u32, tab, slot as u32 % 0x10) { return; }
+                }
                 // `FUN_100cbc21`: the cell the item was dropped on is where it appears once the server has moved it into the bag
                 if let (Some(Place::Bag { cell }), Some(i)) = (dest, self.inventory.as_mut()) {
                     i.pending_drop = Some(cell);
                 }
-                // `FUN_1004aed0`/`FUN_10047fde` [GC]: the client-local wear-delay timer (`EquipDelay` of the moved item plus, when
-                // wearing into an occupied weapon/armor/implant slot, the occupant's), purely cosmetic -- the item itself only
-                // moves once the server answers.
-                if let Some(src) = zone.inventory.get(&(item.instance as u32)) {
-                    if let Some(moved) = self.items.cached(src.item.low_id) {
-                        let occupant = zone.inventory.get(&(slot as u32)).and_then(|e| self.items.cached(e.item.low_id));
-                        if let Some(seconds) = dnd::wear_delay(moved, item.instance, slot, occupant) {
-                            self.wear_timers.start(item, seconds);
-                        }
-                    }
+                // GC1004aed0 sums ACG-resolved moved/displaced EquipDelay.
+                // Kind6 gates later requests, but never fabricates the server move.
+                match self.items.wear_delay(zone, item.instance as u32, slot) {
+                    Ok(Some(seconds)) => self.wear_timers.start(seconds),
+                    Ok(None) => {}
+                    Err(error) => { eprintln!("item wear delay: {error:#}"); return; }
                 }
                 inv::move_item_to_inventory(char_id, item, slot)
             }
@@ -500,11 +509,9 @@ impl HudStats {
         self.use_slot(zone, slot);
     }
 
-    /// Activates a carried inventory item without interpreting a shortcut as an equip request.
+    /// Shortcuts use the same native UseItem wear/default-position dispatch as clicks.
     pub(in crate::play) fn activate_item(&mut self, zone: &Zone, slot: u32) {
-        if zone.inventory.contains_key(&slot) {
-            self.run(zone, Action::Use { item: inv::item_identity(slot) }, None);
-        }
+        self.use_slot(zone, slot);
     }
 
     /// The double click on the item in inventory slot `slot` (worn: to the bag; bag: worn at its `DefaultPos` or used).
@@ -514,17 +521,34 @@ impl HudStats {
         let action = if slot < inv::BAG_FIRST {
             zone.free_bag_slot().map(|_| Action::Move { item, slot: inv::ANY_BAG_SLOT })
         } else {
-            let Some(info) = self.items.cached(e.item.low_id) else { return };
-            match dnd::default_wear(info) {
+            let destination = match self.items.wear_destination(e.item) {
+                Ok(destination) => destination,
+                Err(error) => { eprintln!("item wear: {error:#}"); return; }
+            };
+            match destination {
                 Some((tab, id)) => {
                     let Some((page, _)) = dnd::tab_page(tab) else { return };
-                    dnd::can_wear(info, tab, id, zone.stat(STAT_DECK).unwrap_or(0)).then(|| Action::Move { item, slot: (page.base() + id) as i32 })
+                    Some(Action::Move { item, slot: (page.base() + id) as i32 })
                 }
                 None => Some(Action::Use { item }),
             }
         };
         if let Some(a) = action {
             self.run(zone, a, None);
+        }
+    }
+
+    fn can_equip(&mut self, zone: &Zone, source: u32, tab: usize, id: u32) -> bool {
+        match self.items.can_equip(zone, source, tab, id) {
+            Ok(allowed) => allowed,
+            Err(error) => { eprintln!("item wear: {error:#}"); false }
+        }
+    }
+
+    fn can_unwear(&mut self, zone: &Zone, slot: u32) -> bool {
+        match self.items.can_unwear(zone, slot) {
+            Ok(allowed) => allowed,
+            Err(error) => { eprintln!("item unwear: {error:#}"); false }
         }
     }
 }
@@ -560,6 +584,39 @@ mod upload_tests {
     use super::*;
 
     #[test]
+    fn native_implant_activation_and_removal_require_clinic_without_replacement() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut stats = HudStats::new(&dir, (800, 600)).unwrap();
+        let mut zone = Zone::new(7);
+        zone.stats.extend([(60, 1), (224, 0)]);
+        // Native RDB25806: class3, DefaultPos13, Placement0x2000,
+        // EquipDelay50cs. Its criteria key is Use3, not Wear6.
+        let item = ao_net::n3::world::AcgItem { low_id: 25806, high_id: 25806, level: 1 };
+        zone.inventory.insert(0x40, ao_net::n3::world::InventoryEntry { slot: 0x40, a: 0, b: 1, id: inv::item_identity(0x40), item });
+        let destination = Place::Wear { tab: 2, id: 13, slot: 0x2d };
+        assert!(stats.drop_action(&zone, 0x40, destination).is_none());
+        stats.activate_item(&zone, 0x40);
+        assert!(stats.take_outbox().is_empty());
+        zone.stats.insert(224, 0x10);
+        assert!(stats.drop_action(&zone, 0x40, destination).is_some());
+        stats.activate_item(&zone, 0x40);
+        assert_eq!(stats.take_outbox().into_iter().map(|f| f.payload).collect::<Vec<_>>(), [inv::move_item_to_inventory(7, inv::item_identity(0x40), 0x2d)]);
+        assert!(zone.inventory.contains_key(&0x40), "request never fabricates the server move");
+        zone.apply_inventory(&inv::InventoryMsg::ContainerAdd { item: inv::item_identity(0x40), container: Identity { kind: DYNEL_CHAR, instance: 7 }, slot: 0x2d });
+        stats.wear_timers.tick(0.5);
+        zone.inventory.insert(0x41, ao_net::n3::world::InventoryEntry { slot: 0x41, a: 0, b: 1, id: inv::item_identity(0x41), item });
+        stats.activate_item(&zone, 0x41);
+        assert!(stats.take_outbox().is_empty(), "native implants cannot replace an occupied slot");
+        zone.stats.insert(224, 0);
+        stats.activate_item(&zone, 0x2d);
+        assert!(stats.take_outbox().is_empty(), "removal requires the clinic too");
+        zone.stats.insert(224, 0x10);
+        stats.activate_item(&zone, 0x2d);
+        assert_eq!(stats.take_outbox().into_iter().map(|f| f.payload).collect::<Vec<_>>(), [inv::move_item_to_inventory(7, inv::item_identity(0x2d), inv::ANY_BAG_SLOT)]);
+    }
+
+    #[test]
     fn activation_sends_use_and_waits_for_server_upload() {
         let dir = ao_gui::client_dir();
         if !dir.join("cd_image/text").exists() {
@@ -570,7 +627,7 @@ mod upload_tests {
         let mut zone = Zone::new(7);
         zone.inventory.insert(0x40, ao_net::n3::world::InventoryEntry {
             slot: 0x40, a: 0, b: 0, id: Identity::default(),
-            item: ao_net::n3::world::AcgItem { low_id: 0, high_id: 0, level: 1 },
+            item: ao_net::n3::world::AcgItem { low_id: 23314, high_id: 23314, level: 1 },
         });
         stats.activate_item(&zone, 0x40);
         let out = stats.take_outbox();
@@ -584,6 +641,20 @@ mod upload_tests {
         assert!(zone.nanos.programs.is_empty(), "sending use must not fake a successful upload");
         stats.activate_item(&zone, 0x41);
         assert!(stats.take_outbox().is_empty(), "missing item cannot be activated");
+        let movement = Action::Move { item: inv::item_identity(0x40), slot: inv::ANY_BAG_SLOT };
+        stats.set_nano_cast_busy(true);
+        stats.run(&zone, Action::Move { item: inv::item_identity(0x40), slot: 6 }, None);
+        assert!(stats.take_outbox().is_empty(), "native kind3 also blocks equip dispatch");
+        assert!(stats.drop_action(&zone, 0x40, Place::Wear { tab: 0, id: 6, slot: 6 }).is_none(), "busy preview refuses equip");
+        stats.run(&zone, movement.clone(), None);
+        assert!(stats.take_outbox().is_empty(), "native kind3 blocks packet-backed moves");
+        stats.set_nano_cast_busy(false);
+        stats.wear_timers.start(2.0);
+        stats.run(&zone, movement.clone(), None);
+        assert!(stats.take_outbox().is_empty(), "native kind6 blocks packet-backed moves");
+        stats.wear_timers.tick(2.0);
+        stats.run(&zone, movement, None);
+        assert_eq!(stats.take_outbox().len(), 1, "move resumes only after timer expires");
     }
 }
 

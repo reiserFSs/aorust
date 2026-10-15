@@ -17,8 +17,9 @@ mod tower_interpolation;
 mod quest;
 #[path = "item_info.rs"]
 mod item;
+pub(crate) use item::interpolated_data;
 #[path = "item_effects.rs"]
-mod item_effects;
+pub(crate) mod item_effects;
 #[path = "item_info_combat.rs"]
 mod item_info_combat;
 #[path = "item_requirements.rs"]

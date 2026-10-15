@@ -46,6 +46,105 @@ const BUTTON_PAD: f32 = 24.0;
 const BUTTON_GAP: f32 = 2.0;
 const BUTTON_H: f32 = 22.0;
 
+/// Native vehicle state used by GC1004f720..1004f7ce; published by Player,
+/// not reconstructed from keyboard input or animation.
+#[derive(Clone, Copy, Debug)]
+pub struct NanoMotion {
+    pub pos: [f32; 3],
+    pub radius: f32,
+    pub mode: u32,
+    pub moving: bool,
+    pub falling: bool,
+    pub input_locked: bool,
+}
+
+fn runtime_admission(info: &NanoInfo, zone: &Zone, target: Identity) -> anyhow::Result<bool> {
+    if zone.nano_motion.map_or_else(|| zone.own_update.as_ref().is_some_and(|u| u.flag_32f), |m| m.input_locked) { return Ok(false); }
+    if zone.nano_motion.is_some_and(|m| m.moving || m.falling || matches!(m.mode, 4 | 5 | 8 | 9 | 11 | 12)) { return Ok(false); }
+    let own = zone.char_id as i32;
+    if zone.own_update.is_some() {
+        anyhow::ensure!(zone.nano_motion.is_some(), "nano admission needs the initialized own vehicle");
+        if !zone.dynels.contains_key(&own) { return Ok(false); } // Removed control dynel is no longer cast-capable.
+    }
+    let target = info.cast_target(zone.char_id, target);
+    if zone.stat_of(target.instance, 662).is_some_and(|v| v != 0) { return Ok(false); }
+    let hostile = info.stat(stat::FLAGS).unwrap_or(1) & 0x8000 != 0;
+    let pet = zone.pets.contains(&target);
+    // +21c is the native NPC discriminator; 100523c3 checks the pet list.
+    if !hostile && target.instance != own && zone.dynels.get(&target.instance).is_some_and(|d| d.npc) && !pet {
+        return Ok(false);
+    }
+    if zone.world.nano_school_busy(own, info.stat(stat::SCHOOL).unwrap_or(1)) { return Ok(false); }
+    if zone.world.nano_program_locked(own, info.id) { return Ok(false); }
+    let families = [75, 546, 547, 548, 549, 550].map(|s| info.stat(s).unwrap_or(0));
+    if zone.world.nano_family_locked(own, families) { return Ok(false); }
+    let pending_conflict = |who, no_replace| zone.world.nano_pending_self(who).any(|(id, existing)| {
+        let existing_families = [75, 546, 547, 548, 549, 550].map(|s| existing.stat(s).unwrap_or(if s == 75 { id } else { 0 }));
+        super::own_nanos::same_family(existing_families, families)
+            && (no_replace || existing.stat(551).unwrap_or(0) > info.stat(551).unwrap_or(0))
+    });
+    if pending_conflict(target.instance, false) { return Ok(false); }
+    let effects = if target.instance == own { Some(&zone.nanos) } else { zone.world.target_nanos(target.instance) };
+    if let Some(effects) = effects {
+        if !effects.permits_cast(info, false)? { return Ok(false); }
+    }
+    // The no-replace check deliberately uses SOURCE effects (1004fab1), not
+    // the target list used by the stronger-program check (1004fa91).
+    if info.stat(stat::FLAGS).unwrap_or(1) & 0x800000 != 0
+        && (!zone.nanos.permits_cast(info, true)? || pending_conflict(own, true)) { return Ok(false); }
+    if let Some(motion) = zone.nano_motion {
+        let (pos, radius) = if target.instance == own { (motion.pos, motion.radius) } else {
+            let source_pf = zone.character_playfields.get(&own)
+                .ok_or_else(|| anyhow::anyhow!("nano source playfield identity is unavailable"))?;
+            let target_pf = zone.character_playfields.get(&target.instance)
+                .ok_or_else(|| anyhow::anyhow!("nano target playfield identity is unavailable"))?;
+            if source_pf != target_pf { return Ok(false); }
+            zone.world.nano_target_geometry(target.instance)
+                .ok_or_else(|| anyhow::anyhow!("nano target {} has no native collision sphere yet", target.instance))?
+        };
+        let range_bonus = super::hud_nanodb::effective_nano_stat(zone, 381);
+        let range = nano_range(info.stat(stat::ATTACK_RANGE).unwrap_or(20), range_bonus);
+        if !nano_in_range(motion.pos, motion.radius, pos, radius, range) { return Ok(false); }
+        if target.instance != own {
+            let visible = zone.world.nano_line_of_sight(motion.pos, pos)
+                .ok_or_else(|| anyhow::anyhow!("nano visibility needs loaded playfield collision"))?;
+            if !visible { return Ok(false); }
+        }
+    }
+    if target.instance == own { return Ok(true); }
+    if hostile {
+        return Ok(super::combat::module::can_attack(zone, target, zone.nano_motion.map_or(3, |m| m.mode), false).allowed);
+    }
+    let target_side = zone.stat_of(target.instance, 33).unwrap_or(ao_formats::stats::INVALID);
+    let side = zone.stat(33).unwrap_or(ao_formats::stats::INVALID);
+    if !pet && target_side == 3 && side != 3 { return Ok(false); }
+    if pet { return Ok(true); }
+    let source_level = zone.character_fight_levels.get(&own)
+        .ok_or_else(|| anyhow::anyhow!("friendly nano needs the source district query"))?;
+    let target_level = zone.character_fight_levels.get(&target.instance)
+        .ok_or_else(|| anyhow::anyhow!("friendly nano needs the target district query"))?;
+    if *source_level != 2 && *target_level != 2 { return Ok(true); }
+    if zone.target_team.target_member(target) { return Ok(true); }
+    let playfield = zone.playfield.ok_or_else(|| anyhow::anyhow!("friendly nano needs the source playfield"))?;
+    if (0x111c..0x1125).contains(&playfield) {
+        // Both character constructors seed BattlestationSide668 to zero.
+        return Ok(zone.stat(668).unwrap_or(0) == zone.stat_of(target.instance, 668).unwrap_or(0));
+    }
+    if zone.target_team.in_team() && zone.stat(213).unwrap_or(ao_formats::stats::INVALID) != target_side { return Ok(false); }
+    Ok(side == target_side)
+}
+
+/// GC10086044: additive effective NanoRange381 percentage, truncate, cap at40m.
+fn nano_range(base: i32, bonus: i32) -> i32 {
+    ((f64::from(base.wrapping_mul(bonus)) / 100.0 + f64::from(base)) as i64 as i32).min(40)
+}
+
+/// Final GC1004e7eb uses the unrounded surface-to-surface distance.
+fn nano_in_range(from: [f32; 3], source_radius: f32, to: [f32; 3], target_radius: f32, range: i32) -> bool {
+    let distance = (0..3).map(|i| (from[i] - to[i]).powi(2)).sum::<f32>().sqrt() - target_radius - source_radius;
+    distance <= range as f32
+}
+
 pub(super) struct HudNano {
     db: NanoDb,
     texts: TextDb,
@@ -58,6 +157,8 @@ pub(super) struct HudNano {
     outbox: Vec<Frame>,
     /// Names of the programs cast since the last call (`N3Msg_CastNanoSpell`'s chat line, [`super::chat::Chat::cast_nano`]).
     casts: Vec<String>,
+    initiations: Vec<(i32, i32)>,
+    feedback: Vec<&'static str>,
     clock: f32,
     /// What the rows were built from: (own list serial, page, moved count, mode).
     built: Option<(u32, usize, usize, Mode, usize)>,
@@ -89,6 +190,8 @@ impl HudNano {
             closed: vec![],
             outbox: vec![],
             casts: vec![],
+            initiations: vec![],
+            feedback: vec![],
             clock: 0.0,
             built: None,
             ctx: None,
@@ -125,6 +228,14 @@ impl HudNano {
 
     pub(super) fn take_casts(&mut self) -> Vec<String> {
         std::mem::take(&mut self.casts)
+    }
+
+    pub(super) fn take_initiations(&mut self) -> impl Iterator<Item = (i32, i32)> + '_ {
+        self.initiations.drain(..)
+    }
+
+    pub(super) fn take_feedback(&mut self) -> Vec<&'static str> {
+        std::mem::take(&mut self.feedback)
     }
 
     pub(super) fn take_urls(&mut self) -> Vec<String> {
@@ -255,8 +366,8 @@ impl HudNano {
         self.qualified_click = false;
     }
 
-    /// Row cells of a program (`FUN_1003d50c`: columns are `N3Msg_GetSkill(nano, stat, 2)`; UNRESOLVED: column 11 "Radius" is `N3Msg_GetFormularRadius`, a
-    /// parse of the nano's formula, shown as 0).
+    /// GUI1003d50c. Radius is NanoItem+b8 (GC100164f2), initialized to zero
+    /// by GC10085bf8 and unchanged by static template loading GC1008622a.
     pub(super) fn cells(info: &NanoInfo, columns: &[Column]) -> Vec<String> {
         columns
             .iter()
@@ -265,6 +376,7 @@ impl HudNano {
                 5 => num(info.stat(stat::ATTACK_RANGE)),
                 6 => num(info.stat(stat::ATTACK_DELAY)),
                 7 => num(info.stat(stat::RECHARGE_DELAY)),
+                8 => info.type_text().into(),
                 9 => num(info.stat(stat::NANO_POINTS)),
                 10 => num(info.stat(stat::NCU)),
                 11 => "0".into(),
@@ -328,22 +440,30 @@ impl HudNano {
         self.built = Some(sig);
     }
 
-    /// `FUN_100d3b11`: cast the program on the selected target (self when there is none and the program needs no target: `FUN_1004f6a0`'s
-    /// `target == {0,0} && flags & 0x8000 == 0` rewrite).
+    /// GC1001b54b validates through1004f6a0 but sends the ORIGINAL target.
+    /// The fallback to own identity belongs only to local validation.
     pub(super) fn cast(&mut self, gui: &mut Gui, zone: &Zone, id: i32) {
-        let own = Identity { kind: outgoing::DYNEL_CHAR, instance: zone.char_id as i32 };
-        let info = self.db.info(gui, id);
-        let needs_target = info.is_some_and(|i| i.stat(stat::FLAGS).unwrap_or(0) & 0x8000 != 0);
-        let name = info.map(|i| i.name.clone());
-        let target = match zone.selected_target() {
-            Some(t) => t,
-            None if !needs_target => own,
-            // `FUN_1004f6a0` then refuses ("Feedback_UnableToExecuteOnThisTarget"): nothing is sent
-            None => return,
-        };
+        let target = zone.selected_target().unwrap_or_default();
+        let accepted = zone.nanos.programs.contains(&id) && self.db.info(gui, id).is_some_and(|info| {
+            match info.can_cast(zone, target).and_then(|accepted| if accepted { runtime_admission(info, zone, target) } else { Ok(false) }) {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    eprintln!("nano {id}: {error:#}");
+                    false
+                }
+            }
+        });
+        if !accepted {
+            self.feedback.push("Feedback_UnableToExecuteOnThisTarget");
+            return;
+        }
+        let info = self.db.info(gui, id).expect("admitted known nano");
+        let name = info.name.clone();
+        let effect = info.stat(366).unwrap_or(49999);
+        if effect != 0 { self.initiations.push((id, effect)); }
         let payload = nano::cast_nano(zone.char_id as i32, id, target);
         self.outbox.push(outgoing::n3_frame(0, zone.char_id, payload));
-        self.casts.extend(name);
+        self.casts.push(name);
     }
 
     /// `true` when the event belonged to this window.
@@ -451,6 +571,61 @@ mod tests {
     use ao_gui::{DrawList, InputEvent};
     use ao_render::{Frontend, Host, Offscreen};
 
+    #[test]
+    fn native_runtime_motion_target_and_exact_range_guards() {
+        let mut zone = Zone::new(7);
+        let mut info = NanoInfo { id: 1, name: String::new(), stats: vec![(stat::FLAGS, 0)], criteria: vec![], spells: vec![], icon: None };
+        assert!(runtime_admission(&info, &zone, Identity::default()).unwrap());
+        let idle = NanoMotion { pos: [0.0; 3], radius: 0.5, mode: 3, moving: false, falling: false, input_locked: false };
+        for mode in [4, 5, 8, 9, 11, 12] {
+            zone.nano_motion = Some(NanoMotion { mode, ..idle });
+            assert!(!runtime_admission(&info, &zone, Identity::default()).unwrap());
+        }
+        for motion in [NanoMotion { moving: true, ..idle }, NanoMotion { falling: true, ..idle }, NanoMotion { input_locked: true, ..idle }] {
+            zone.nano_motion = Some(motion);
+            assert!(!runtime_admission(&info, &zone, Identity::default()).unwrap());
+        }
+        zone.nano_motion = None;
+        let target = Identity { kind: outgoing::DYNEL_CHAR, instance: 8 };
+        zone.character_stats.entry(8).or_default().insert(662, 1);
+        assert!(!runtime_admission(&info, &zone, target).unwrap());
+        zone.character_stats.get_mut(&8).unwrap().insert(662, 0);
+        zone.dynels.insert(8, super::super::zone::DynelState { name: String::new(), pos: [0.0; 3], yaw: None, npc: true, side: 0, level: 1, health: 10, max_health: 10 });
+        zone.dynels.insert(7, super::super::zone::DynelState { npc: false, ..zone.dynels[&8].clone() });
+        zone.character_fight_levels.extend([(7, 2), (8, 2)]);
+        zone.playfield = Some(4582);
+        assert!(!runtime_admission(&info, &zone, target).unwrap(), "friendly player nano cannot assist an unrelated NPC");
+        zone.pets.push(target);
+        assert!(runtime_admission(&info, &zone, target).unwrap());
+        zone.pets.clear();
+        info.stats[0].1 = 0x8000;
+        assert!(runtime_admission(&info, &zone, target).unwrap(), "hostile damage/debuff may target an NPC");
+        info.stats[0].1 = 0;
+        zone.dynels.get_mut(&8).unwrap().npc = false;
+        zone.stats.insert(33, 1);
+        zone.character_stats.get_mut(&8).unwrap().insert(33, 2);
+        assert!(!runtime_admission(&info, &zone, target).unwrap(), "friendly opposite-side assistance in level2 requires team authorization");
+        zone.target_team.team = Some(Identity { kind: ao_net::n3::team::TEAM_KIND, instance: 9 });
+        zone.target_team.members.push(super::super::hud_team::Member {
+            id: target, name: String::new(), level: 1, sub_team: 0, health: (1, 1), nano: (1, 1),
+        });
+        assert!(runtime_admission(&info, &zone, target).unwrap(), "native ordinary-team member bypass precedes side comparison");
+        zone.target_team.team = None;
+        zone.playfield = Some(0x111c);
+        zone.stats.insert(668, 7);
+        zone.character_stats.get_mut(&8).unwrap().insert(668, 7);
+        assert!(runtime_admission(&info, &zone, target).unwrap(), "battlestation admission compares BattlestationSide668");
+        zone.character_stats.get_mut(&8).unwrap().insert(668, 8);
+        assert!(!runtime_admission(&info, &zone, target).unwrap());
+        assert_eq!(nano_range(20, 25), 25);
+        assert_eq!(nano_range(25, 3), 25);
+        assert_eq!(nano_range(30, 100), 40);
+        assert_eq!(nano_range(20, ao_formats::stats::INVALID), -10_784_439, "native IMUL wraps before floating conversion");
+        assert!(nano_in_range([0.0; 3], 0.5, [21.25, 0.0, 0.0], 0.75, 20));
+        assert!(!nano_in_range([0.0; 3], 0.5, [21.26, 0.0, 0.0], 0.75, 20), "the final native check is not integer-truncated distance");
+        assert!(!nano_in_range([0.0; 3], 0.5, [0.0, 22.0, 0.0], 0.75, 20), "range is three dimensional");
+    }
+
     struct Shot {
         gui: Gui,
         nano: HudNano,
@@ -486,6 +661,106 @@ mod tests {
         }
     }
 
+    /// Explicit synthetic standing caster snapshot for UI tests. The selected
+    /// own identity is required by real Shadow Touch Flags0x8c000.
+    fn standing_self_caster() -> Zone {
+        let mut zone = Zone::new(7);
+        zone.stats.extend([(224, 2), (662, 0), (318, 100), (381, 0), (214, 10000)]);
+        zone.nano_motion = Some(NanoMotion {
+            pos: [0.0; 3], radius: 0.5, mode: 3, moving: false, falling: false, input_locked: false,
+        });
+        zone.set_target(Some(Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
+        zone
+    }
+
+    #[test]
+    fn native_cast_guards_real_templates_and_original_wire_target() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() || !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut programs = HudNano::new(&dir, (1100, 760)).unwrap();
+        let mut zone = Zone::new(7);
+        let own = Identity { kind: outgoing::DYNEL_CHAR, instance: 7 };
+        zone.stats.extend([(60, 5), (129, 662), (128, 223), (127, 199), (130, 169), (131, 74), (122, 35), (251, 0), (359, 0), (214, 10000), (318, 100)]);
+        let other = Identity { kind: outgoing::DYNEL_CHAR, instance: 8 };
+        zone.dynels.insert(8, super::super::zone::DynelState { name: "Target".into(), pos: [0.0; 3], yaw: None, npc: false, side: 0, level: 1, health: 10, max_health: 10 });
+        zone.dynels.insert(7, zone.dynels[&8].clone());
+        zone.character_fight_levels.extend([(7, 2), (8, 2)]);
+        zone.playfield = Some(4582);
+        for (id, requires_target, requirement, threshold) in [
+            (163449, true, None, 0), (25980, true, Some(129), 661), (25982, false, Some(128), 222),
+            (26465, false, Some(127), 18), (28612, true, Some(130), 4),
+            (43324, false, Some(131), 3), (56027, true, Some(131), 73), (26707, true, Some(122), 34),
+        ] {
+            zone.stats.insert(368, if id == 43324 { 12 } else { 11 });
+            // Each row begins with sufficient skills; strict threshold tests below
+            // must not leak reduced values into the next real program.
+            zone.stats.extend([(129, 662), (128, 223), (127, 199), (130, 169), (131, 74), (122, 35)]);
+            programs.cast(&mut gui, &zone, id);
+            assert!(programs.take_outbox().is_empty(), "unlearned real program {id}");
+            assert!(programs.take_casts().is_empty());
+            assert_eq!(programs.take_feedback(), ["Feedback_UnableToExecuteOnThisTarget"]);
+            zone.nanos.programs.push(id);
+            for target in [None, Some(own), Some(other)] {
+                zone.set_target(target);
+                programs.cast(&mut gui, &zone, id);
+                let frames = programs.take_outbox();
+                if requires_target && target.is_none() {
+                    assert!(frames.is_empty());
+                    assert!(programs.take_casts().is_empty());
+                    assert_eq!(programs.take_feedback(), ["Feedback_UnableToExecuteOnThisTarget"]);
+                    assert_eq!(programs.take_initiations().count(), 0);
+                } else {
+                    assert_eq!(frames.len(), 1, "real template {id}");
+                    assert_eq!(frames[0].payload, nano::cast_nano(7, id, target.unwrap_or_default()));
+                    assert_eq!(programs.take_casts().len(), 1);
+                    assert!(programs.take_feedback().is_empty());
+                    let effect = programs.db.info(&mut gui, id).unwrap().stat(366).unwrap_or(49999);
+                    let expected = if effect != 0 { vec![(id, effect)] } else { vec![] };
+                    assert_eq!(programs.take_initiations().collect::<Vec<_>>(), expected, "real native initiation selector, independent of relay effect428");
+                }
+            }
+            if let Some(stat) = requirement {
+                zone.stats.insert(stat, threshold);
+                programs.cast(&mut gui, &zone, id);
+                assert!(programs.take_outbox().is_empty(), "strict real Use3 requirement");
+                assert!(programs.take_casts().is_empty());
+                assert_eq!(programs.take_feedback(), ["Feedback_UnableToExecuteOnThisTarget"]);
+                zone.stats.insert(stat, threshold + 1);
+            }
+            if id != 163449 {
+                zone.stats.insert(214, 0);
+                programs.cast(&mut gui, &zone, id);
+                assert!(programs.take_outbox().is_empty(), "real template nano-point cost");
+                assert!(programs.take_casts().is_empty());
+                assert_eq!(programs.take_feedback(), ["Feedback_UnableToExecuteOnThisTarget"]);
+                zone.stats.insert(214, 10000);
+            }
+            if id == 43324 {
+                zone.stats.insert(251, 1);
+                programs.cast(&mut gui, &zone, id);
+                assert!(programs.take_outbox().is_empty(), "real pet-count requirement forbids a second attack pet");
+                assert!(programs.take_casts().is_empty());
+                assert_eq!(programs.take_feedback(), ["Feedback_UnableToExecuteOnThisTarget"]);
+                zone.stats.insert(251, 0);
+            }
+            if matches!(id, 28612 | 43324 | 56027) {
+                zone.stats.insert(368, 0);
+                programs.cast(&mut gui, &zone, id);
+                assert!(programs.take_outbox().is_empty(), "real VisualProfession requirement");
+                assert!(programs.take_casts().is_empty());
+                assert_eq!(programs.take_feedback(), ["Feedback_UnableToExecuteOnThisTarget"]);
+                zone.stats.insert(368, if id == 43324 { 12 } else { 11 });
+            }
+            zone.set_target(Some(Identity { kind: 51035, instance: 42 }));
+            programs.cast(&mut gui, &zone, id);
+            assert!(programs.take_outbox().is_empty(), "selected objects are not character targets");
+            assert!(programs.take_casts().is_empty());
+            assert_eq!(programs.take_feedback(), ["Feedback_UnableToExecuteOnThisTarget"]);
+            zone.set_target(None);
+        }
+    }
+
     #[test]
     fn server_upload_refreshes_open_programs_and_casts() {
         let dir = ao_gui::client_dir();
@@ -496,7 +771,7 @@ mod tests {
         let mut gui = Gui::new(&dir, None).unwrap();
         let mut rollup = Rollup::new(&dir, (1100, 760));
         let mut programs = HudNano::new(&dir, (1100, 760)).unwrap();
-        let mut zone = Zone::new(7);
+        let mut zone = standing_self_caster();
         programs.open(&mut gui, &mut rollup);
         assert_eq!(programs.page, FAVORITES);
         programs.update(&mut gui, &zone, 0.0);
@@ -514,7 +789,6 @@ mod tests {
         zone.on_frame(&frame);
         assert_eq!(zone.nanos.programs, [163449], "duplicate server upload is idempotent");
         assert!(zone.nanos.take_learned().is_empty());
-        zone.set_target(Some(Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
         programs.cast(&mut gui, &zone, 163449);
         assert_eq!(programs.take_outbox()[0].payload, nano::cast_nano(7, 163449, Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
     }
@@ -531,10 +805,8 @@ mod tests {
             let mut gui = Gui::new(&dir, None).unwrap();
             let mut rollup = Rollup::new(&dir, size);
             let mut programs = HudNano::new(&dir, size).unwrap();
-            let mut zone = Zone::new(7);
+            let mut zone = standing_self_caster();
             zone.nanos.programs = vec![163449];
-            // Give casting a valid target; this regression covers qualifiers, not target-required nano rejection.
-            zone.set_target(Some(Identity { kind: outgoing::DYNEL_CHAR, instance: 7 }));
             programs.open(&mut gui, &mut rollup);
             programs.set_page(4);
             programs.update(&mut gui, &zone, 0.0);
@@ -597,7 +869,7 @@ mod tests {
         png(&mut s, &mut o, "ncu");
         assert_eq!(s.ncu.shown(), vec![25982]);
         assert_eq!(s.ncu.title(), "NCU (14/40)");
-        // double click on the nano casts it on self (Shadow Touch needs no target)
+        // Merely displaying a program does not cast it.
         let frames = s.nano.take_outbox();
         assert!(frames.is_empty());
     }

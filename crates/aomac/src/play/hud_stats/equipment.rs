@@ -91,12 +91,14 @@ pub struct Equipment {
     worn: Vec<(u32, AcgItem)>,
     effects: Vec<Spell>,
     travel_effects: Vec<Spell>,
+    removed_effects: Vec<usize>,
+    added_effects: Vec<usize>,
     attack: Option<Vec<(u32, i32)>>,
 }
 
 impl Equipment {
     pub fn new(dir: &Path) -> Self {
-        Self { store: RecordStore::open(dir).ok(), templates: HashMap::new(), items: HashMap::new(), worn: Vec::new(), effects: Vec::new(), travel_effects: Vec::new(), attack: None }
+        Self { store: RecordStore::open(dir).ok(), templates: HashMap::new(), items: HashMap::new(), worn: Vec::new(), effects: Vec::new(), travel_effects: Vec::new(), removed_effects: Vec::new(), added_effects: Vec::new(), attack: None }
     }
 
     fn load(&mut self, item: AcgItem) {
@@ -120,9 +122,24 @@ impl Equipment {
     }
 
     pub fn refresh(&mut self, zone: &Zone) {
+        self.removed_effects.clear();
+        self.added_effects.clear();
         let changed = self.worn.len() != zone.inventory.keys().filter(|&&s| s < 0x30).count()
             || self.worn.iter().any(|(slot, item)| zone.inventory.get(slot).map(|e| e.item) != Some(*item));
         if !changed { return; }
+        let added_slots: Vec<u32> = zone.inventory.iter().filter(|(slot, entry)|
+            **slot < 0x30 && !self.worn.iter().any(|(s, item)| s == *slot && *item == entry.item))
+            .map(|(&slot, _)| slot).collect();
+        let mut offset = 0;
+        for &(slot, item) in &self.worn {
+            let high = if item.high_id == 0 { item.low_id } else { item.high_id };
+            if let Some(t) = self.items[&(item.low_id, high, item.level)].as_ref() {
+                if zone.inventory.get(&slot).map(|e| e.item) != Some(item) {
+                    self.removed_effects.extend(offset..offset + t.wear.len());
+                }
+                offset += t.wear.len();
+            }
+        }
         self.worn.clear();
         self.worn.extend(zone.inventory.iter().filter(|(s, _)| **s < 0x30).map(|(&s, e)| (s, e.item)));
         self.worn.sort_unstable_by_key(|e| e.0);
@@ -132,6 +149,9 @@ impl Equipment {
         for &(slot, item) in &self.worn {
             let high = if item.high_id == 0 { item.low_id } else { item.high_id };
             if let Some(t) = self.items[&(item.low_id, high, item.level)].as_ref() {
+                if added_slots.contains(&slot) {
+                    self.added_effects.extend(self.effects.len()..self.effects.len() + t.wear.len());
+                }
                 self.effects.extend(t.wear.iter().cloned());
                 if matches!(slot, 6 | 8) && self.attack.is_none() && t.weapon { self.attack = Some(t.attack.clone()); }
             }
@@ -161,6 +181,8 @@ impl Equipment {
     }
 
     pub fn effects(&self) -> &[Spell] { &self.effects }
+    pub fn removed_effects(&self) -> &[usize] { &self.removed_effects }
+    pub fn added_effects(&self) -> &[usize] { &self.added_effects }
     pub fn attack_weights(&self) -> Option<&[(u32, i32)]> { self.attack.as_deref() }
 }
 

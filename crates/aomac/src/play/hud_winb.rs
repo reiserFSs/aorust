@@ -261,10 +261,10 @@ impl HudWinB {
     }
 
     /// Every zone frame (team members, invitations, the own perk map, perk updates).
-    pub(super) fn on_zone_frame(&mut self, f: &Frame, own: i32) {
+    pub(super) fn on_zone_frame(&mut self, f: &Frame, zone: &mut Zone) {
+        let own = zone.char_id as i32;
         self.team.on_frame(f, own);
-        self.perks.on_frame(f, own);
-        self.pet.on_frame(f);
+        self.perks.on_frame(f, zone);
         if let Ok(message) = ao_net::n3::decode(f) {
             if message.header.target.instance == own {
                 if let ao_net::n3::N3::Unknown(body) = message.body {
@@ -387,7 +387,7 @@ mod raid_tests {
         wire.u16(0);
         let frame = ao_net::n3::outgoing::n3_frame(0, 7, wire.0);
         assert!(wants(&frame));
-        windows.on_zone_frame(&frame, 7);
+        windows.on_zone_frame(&frame, &mut Zone::new(7));
         assert!(windows.in_raid);
         if dir.join("cd_image/gui/Default/Views/RaidBar.xml").exists() {
             let mut gui = Gui::new(&dir, None).unwrap();
@@ -397,7 +397,7 @@ mod raid_tests {
             assert!(windows.raid_bars.is_empty(), "no invented roster");
             let own = ao_net::msg::Identity { kind: 50000, instance: 7 };
             let member = ao_net::n3::team::TeamMember { member: own, team: ao_net::msg::Identity { kind: ao_net::n3::team::TEAM_KIND, instance: 1 }, sub_team: 0, profession: 1, level: 1, name: "Native fixture".into() };
-            windows.on_zone_frame(&ao_net::n3::outgoing::n3_frame(0, 7, ao_net::n3::team::team_member(own, &member)), 7);
+            windows.on_zone_frame(&ao_net::n3::outgoing::n3_frame(0, 7, ao_net::n3::team::team_member(own, &member)), &mut Zone::new(7));
             windows.update_raid(&mut gui, &Zone::default(), &mut prefs);
             assert_eq!(windows.raid_bars.len(), 1);
             assert_eq!(windows.raid_bars[0].member, own);

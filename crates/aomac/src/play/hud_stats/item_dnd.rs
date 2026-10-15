@@ -1,4 +1,4 @@
-//! Drag and drop of items between the wear window and the inventory (docs/gui.md §11.12). The rules are the client's:
+//! Drag and drop of items between the wear window and the inventory (docs/gui.md §11.11). The rules are the client's:
 //! `InventoryView_c` slots `FUN_100cbab4` (drag begin), `FUN_100cbc21` (drop on the bag), `FUN_100ca1e7` (double click), `WearView_c`
 //! drop `FUN_100e1920`, and the checks of `N3Msg_IsItemPossibleToWear` [GC 0x10026adb], `N3Msg_IsItemPossibleToUnWear` [GC 0x10026763],
 //! `N3Msg_MoveItemToInventory` [GC 0x10027a30], `N3Msg_UseItem` [GC 0x100286f8]. Nothing changes locally: the server answers a move with a
@@ -39,13 +39,17 @@ pub fn tab_page(tab: usize) -> Option<(Page, i32)> {
     }
 }
 
-/// `N3Msg_IsItemPossibleToWear` without the checks that need state we do not have (the wearer's skill requirements
-/// `vtable+0x5c`, implant access `FUN_10044b6e(0x10)`; the server decides those): `ItemClass` in {1, 2, 3, 5}, the `Placement` bit of the slot id, and the
-/// deck slot rule of `FUN_10047be5` for weapons.
-/// UNRESOLVED: the decompilation drops the `class` argument (`param_3`) the callers pass, so whether the original also compares it to the item's class is
-/// unknown; we do (weapon tab: class 1, armor: 2, implants: 3 or 5, social: any wearable class), the server validates anyway.
+/// Structural portion of `N3Msg_IsItemPossibleToWear`; `Items::can_equip`
+/// additionally checks ACG-resolved wearer requirements and implant access.
+/// Owned-item class matching is explicit in GC `1004959a`.
+#[cfg(test)]
 pub fn can_wear(info: &Info, tab: usize, id: u32, deck: i32) -> bool {
-    let Some(class) = info.stat(STAT_ITEM_CLASS) else { return false };
+    can_wear_stats(&info.stats, tab, id, deck)
+}
+
+pub(super) fn can_wear_stats(stats: &[(u32, i32)], tab: usize, id: u32, deck: i32) -> bool {
+    let stat = |id| stats.iter().find(|s| s.0 == id).map(|s| s.1);
+    let Some(class) = stat(STAT_ITEM_CLASS) else { return false };
     if !matches!(class, 1 | 2 | 3 | 5) || !(1..=16).contains(&id) {
         return false;
     }
@@ -53,10 +57,15 @@ pub fn can_wear(info: &Info, tab: usize, id: u32, deck: i32) -> bool {
         0 => class == 1,
         1 => class == 2,
         2 => matches!(class, 3 | 5),
-        3 => true,
+        3 => matches!(class, 1 | 2),
         _ => false,
     };
-    let fits = info.stat(STAT_PLACEMENT).is_some_and(|p| p & (1 << id) != 0);
+    let placement = stat(STAT_PLACEMENT).unwrap_or(0);
+    // Social armor loses hand bits; weapons map left/right hand to fingers.
+    let placement = if tab != 3 { placement } else if class == 1 {
+        (if placement & 0x100 != 0 { 0x8000 } else { 0 }) | (if placement & 0x40 != 0 { 0x2000 } else { 0 })
+    } else { placement & 0xffff5fff_u32 as i32 };
+    let fits = placement & (1 << id) != 0;
     // `FUN_10047be5(class 1, slot, ..)`: the deck slots 9..14 need `ComputerLiteracy`/deck (`GetSkill(0x2d) > slot - 9`)
     let deck_ok = !(tab == 0 && class == 1 && (9..15).contains(&id)) || deck > id as i32 - 9;
     on_tab && fits && deck_ok
@@ -64,12 +73,18 @@ pub fn can_wear(info: &Info, tab: usize, id: u32, deck: i32) -> bool {
 
 /// Where a double click wears a bag item (`N3Msg_UseItem`): `Can & 8 == 0`, class 1 -> weapon page, 2 -> armor page (`+0x10`), 3 / 5 -> implants
 /// (`+0x20`), slot id = `DefaultPos`; returns (tab, slot id).
+#[cfg(test)]
 pub fn default_wear(info: &Info) -> Option<(usize, u32)> {
-    if info.stat(STAT_CAN).unwrap_or(0) & 8 != 0 {
+    default_wear_stats(&info.stats)
+}
+
+pub(super) fn default_wear_stats(stats: &[(u32, i32)]) -> Option<(usize, u32)> {
+    let stat = |id| stats.iter().find(|s| s.0 == id).map(|s| s.1);
+    if stat(STAT_CAN).unwrap_or(0) & 8 != 0 {
         return None;
     }
-    let id = info.stat(STAT_DEFAULT_POS)?;
-    let tab = match info.stat(STAT_ITEM_CLASS)? {
+    let id = stat(STAT_DEFAULT_POS)?;
+    let tab = match stat(STAT_ITEM_CLASS)? {
         1 => 0,
         2 => 1,
         3 | 5 => 2,
@@ -118,44 +133,47 @@ pub const STAT_EQUIP_DELAY: u32 = 211;
 /// all (weapon/armor/implant page, `0..0x30`, either as the destination (wearing) or the item's own current slot (unwearing); the social
 /// page and bag-to-bag moves are never timed), and if so `FUN_1004aed0`'s summed duration in seconds (the moved item's own `EquipDelay`,
 /// plus the occupant's when wearing over one).
+#[cfg(test)]
 pub fn wear_delay(moved: &Info, item_slot: i32, slot: i32, occupant: Option<&Info>) -> Option<f32> {
+    wear_delay_values(moved.stat(STAT_EQUIP_DELAY).unwrap_or(0), item_slot, slot, occupant.and_then(|o| o.stat(STAT_EQUIP_DELAY)).unwrap_or(0))
+}
+
+pub(super) fn wear_delay_values(moved: i32, item_slot: i32, slot: i32, occupant: i32) -> Option<f32> {
     let worn_page = |s: i32| (0..0x30).contains(&s);
     if !worn_page(slot) && !worn_page(item_slot) {
         return None;
     }
-    let mut cs = moved.stat(STAT_EQUIP_DELAY).unwrap_or(0).max(0);
+    let mut cs = i64::from(moved.max(0));
     if worn_page(slot) {
-        cs += occupant.and_then(|o| o.stat(STAT_EQUIP_DELAY)).unwrap_or(0).max(0);
+        cs += i64::from(occupant.max(0));
     }
-    (cs > 0).then(|| cs as f32 / 100.0)
+    (cs > 0 && cs != 1_234_567_890).then(|| cs as f32 / 100.0)
 }
 
-/// Client-local countdown of [`wear_delay`], keyed by the moved item's identity: purely cosmetic (paints the same
-/// `GFX_GUI_ICONFADER32` wipe the hotbar recharge uses, `hud_bar.rs`/`hud_listview.rs`). The server's own `ContainerAddItemIIR_t` moves
-/// the item when it actually answers; this never gates or fabricates that move.
+/// Native kind6 countdown, gating later moves while active (GC1004b9c9).
+/// The server's `ContainerAddItemIIR_t` still owns actual inventory changes.
 #[derive(Default)]
 pub struct WearTimers {
-    pending: Vec<(Identity, f32, f32)>,
+    pending: Option<(f32, f32)>,
 }
 
 impl WearTimers {
-    pub fn start(&mut self, item: Identity, seconds: f32) {
-        self.pending.retain(|(i, ..)| *i != item);
-        self.pending.push((item, seconds, seconds));
+    pub fn start(&mut self, seconds: f32) {
+        // 10047fde refuses a second kind6 entry until the first is removed.
+        self.pending.get_or_insert((seconds, seconds));
     }
 
     pub fn tick(&mut self, dt: f32) {
-        for e in &mut self.pending {
-            e.1 -= dt;
+        if let Some((remaining, _)) = self.pending.as_mut() {
+            *remaining -= dt;
+            if *remaining <= 0.0 { self.pending = None; }
         }
-        self.pending.retain(|(_, remaining, _)| *remaining > 0.0);
     }
 
-    /// The timer bar to show (the first still-pending entry; this port never has more than one wear/unwear in flight at once --
-    /// ponytail: a real concurrent stack would need `TimerSystemModule_t`'s free-slot list, `hud_timerbar.rs`). `(remaining / total,
-    /// total)` so the caller can gate the bar on [`super::super::hud_timerbar::MIN_SECONDS`].
+    /// Native kind6 is a singleton. `(remaining / total, total)` also feeds
+    /// the optional timer bar (minimum visible duration is a GUI policy).
     pub fn active(&self) -> Option<(f32, f32)> {
-        self.pending.first().map(|(_, remaining, total)| ((remaining / total).clamp(0.0, 1.0), *total))
+        self.pending.map(|(remaining, total)| ((remaining / total).clamp(0.0, 1.0), total))
     }
 }
 
@@ -209,6 +227,12 @@ mod tests {
         assert!(!can_wear(&helmet, 1, 3, 0), "wrong slot");
         assert!(!can_wear(&helmet, 0, 2, 0), "armor on the weapon tab");
         assert!(can_wear(&helmet, 3, 2, 0), "social mirrors the clothes slots");
+        let social_weapon = info(&[(STAT_ITEM_CLASS, 1), (STAT_PLACEMENT, 0x140)]);
+        assert!(can_wear(&social_weapon, 3, 13, 0));
+        assert!(can_wear(&social_weapon, 3, 15, 0));
+        assert!(!can_wear(&social_weapon, 3, 6, 0), "social weapon maps hands to fingers");
+        let implant = info(&[(STAT_ITEM_CLASS, 3), (STAT_PLACEMENT, 1 << 2)]);
+        assert!(!can_wear(&implant, 3, 2, 0), "social accepts only weapons and clothing");
         assert_eq!(default_wear(&helmet), Some((1, 2)));
         let deck_weapon = info(&[(STAT_ITEM_CLASS, 1), (STAT_PLACEMENT, 1 << 10)]);
         assert!(!can_wear(&deck_weapon, 0, 10, 0));
@@ -265,16 +289,15 @@ mod tests {
     #[test]
     fn wear_timers_count_down_and_clear() {
         let mut t = WearTimers::default();
-        let item = Identity { kind: 0x66, instance: 0x12 };
         assert_eq!(t.active(), None);
-        t.start(item, 2.0);
+        t.start(2.0);
         assert_eq!(t.active(), Some((1.0, 2.0)));
         t.tick(1.5);
         assert_eq!(t.active(), Some((0.25, 2.0)));
-        // restarting (a weapon swapped back in) resets to full
-        t.start(item, 2.0);
-        assert_eq!(t.active(), Some((1.0, 2.0)));
-        t.tick(2.0);
+        // A second registration cannot reset an already-active kind6 timer.
+        t.start(2.0);
+        assert_eq!(t.active(), Some((0.25, 2.0)));
+        t.tick(0.5);
         assert_eq!(t.active(), None, "elapsed timers clear themselves");
     }
 }

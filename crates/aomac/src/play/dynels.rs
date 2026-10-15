@@ -924,6 +924,13 @@ pub struct Dynels {
     buff_visuals: HashMap<(i32, i32), buffs::BuffVisual>,
     nano_casts: Vec<(i32, ao_net::n3::dynel::CastNanoSpell)>,
     casting: Vec<NanoCast>,
+    /// Result action0x6b arriving before the accepted relay's frame drain.
+    nano_cast_results: HashMap<(i32, i32), i32>,
+    /// Own controller+8/+c: local admission effect, distinct from relay stat428.
+    local_nano_initiation: Option<(i32, i32, u32)>,
+    /// Controller+0x40 entries: caster, native lock identity, whole seconds remaining.
+    nano_locks: Vec<(i32, ao_net::msg::Identity, i32)>,
+    nano_lock_second: f32,
     nano_animations: Vec<Option<(u32, bool)>>,
     nano_sounds: Vec<(u32, [f32; 3], f32, f32, u32, i32)>,
     nano_store: Option<RecordStore>,
@@ -957,8 +964,35 @@ struct NanoCast {
     release_seen: bool,
     done: bool,
     instant: bool,
+    execution: Option<NanoExecution>,
     finish_enabled: bool,
     start_effect: i32,
+}
+
+/// GC10050ed9/100500ca/1004e68c: internal kind3 survives attack and recharge.
+/// Visual release/finish callbacks do not remove it.
+struct NanoExecution {
+    left: f32,
+    recharge: Option<f32>,
+    /// GC10051078: only an empty execution queue allocates a TimerEntry.
+    timer: bool,
+    /// Native +0x1c awaits a result; +0x20 defaults to success 1.
+    result: Option<i32>,
+}
+
+impl NanoExecution {
+    fn advance(&mut self, dt: f32) -> bool {
+        self.left -= dt;
+        if self.left > 0.0 || (self.left == 0.0 && self.recharge.is_none()) { return true; }
+        if self.recharge.is_some() && self.result.is_none() { return true; }
+        if let Some(recharge) = self.recharge.take() {
+            // Native starts recharge at this frame's time, not the old attack deadline.
+            self.left = recharge;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// GC 10050ed9 (asm 10050f85–10051064), in seconds.
@@ -1052,6 +1086,10 @@ impl Default for Dynels {
             buff_visuals: HashMap::new(),
             nano_casts: vec![],
             casting: vec![],
+            nano_cast_results: HashMap::new(),
+            local_nano_initiation: None,
+            nano_locks: vec![],
+            nano_lock_second: 0.0,
             nano_animations: vec![],
             nano_sounds: vec![],
             nano_store: None,
@@ -1200,6 +1238,27 @@ impl Dynels {
         Ok(Some((centre_y * c.scale, radius * c.scale)))
     }
 
+    /// GC1004faec reads the scaled native torso collision sphere, not a
+    /// targeting box or an estimated humanoid radius.
+    pub fn nano_target_geometry(&self, id: i32) -> Option<([f32; 3], f32)> {
+        let c = self.chars.get(&id)?;
+        let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
+        let radius = built.rig.as_ref()?.cat().torso_sphere.radius;
+        let radius = if radius < 0.0 { ao_formats::playfield::collision::DEFAULT_BODY_RADIUS } else { radius };
+        Some((c.pose.pos, radius * c.scale))
+    }
+
+    /// GC10058908: ordinary player casts use the playfield LOS query at
+    /// feet + 1.6m. An unavailable surface is not an unobstructed ray.
+    pub fn nano_line_of_sight(&self, from: [f32; 3], to: [f32; 3]) -> Option<bool> {
+        let collision = self.collision.as_ref()?.borrow();
+        let mut from = scene_pos(from);
+        let mut to = scene_pos(to);
+        from[1] += 1.6;
+        to[1] += 1.6;
+        Some(collision.line(from, to).is_none())
+    }
+
     pub fn texture_quality(&self) -> i32 { self.texture_quality }
 
     /// Native CAT observer changes the resource family for future loads, not cached models.
@@ -1272,6 +1331,10 @@ impl Dynels {
         self.buff_visuals.clear();
         self.nano_casts.clear();
         self.casting.clear();
+        self.nano_cast_results.clear();
+        self.local_nano_initiation = None;
+        self.nano_locks.clear();
+        self.nano_lock_second = 0.0;
         self.nano_animations.clear();
         self.nano_sounds.clear();
         if let Some(effects) = &mut self.effects { effects.clear(); }
@@ -1702,6 +1765,86 @@ impl Dynels {
             .map(|c| ((1.0 - c.remaining / c.total).clamp(0.0, 1.0), c.total))
     }
 
+    /// Internal TimerEntry kind3, distinct from the GUI timer bar's type enum.
+    pub fn nano_busy(&self, own: i32) -> bool {
+        let executing = self.casting.iter().any(|cast| cast.who == own && cast.execution.is_some());
+        self.casting.iter().any(|cast| cast.who == own && cast.execution.as_ref().is_some_and(|execution| execution.timer))
+            || (!executing && self.nano_casts.iter().any(|(who, cast)| *who == own && self.nano_templates.get(&cast.spell).is_some_and(|template| template.stat(0).unwrap_or(0) & 0x80000 == 0)))
+    }
+
+    /// GC1004ee95 scans executing entries (including recharge) by school.
+    pub fn nano_school_busy(&self, own: i32, school: i32) -> bool {
+        let same_school = |spell| self.nano_templates.get(&spell).is_some_and(|template| template.stat(0).unwrap_or(0) & 0x80000 == 0 && template.stat(0x195).unwrap_or(0) == school);
+        self.casting.iter().any(|cast| cast.who == own && cast.execution.is_some() && same_school(cast.spell))
+            || self.nano_casts.iter().any(|(who, cast)| *who == own && same_school(cast.spell))
+    }
+
+    /// GC1004f368: resolved, recharge-stage self programs are replacement candidates.
+    pub fn nano_pending_self(&self, own: i32) -> impl Iterator<Item = (i32, &ao_formats::dynel_visual::ItemTemplate)> {
+        self.casting.iter().filter(move |cast| cast.who == own && cast.target == own
+            && cast.execution.as_ref().is_some_and(|execution| execution.recharge.is_none() && execution.result.is_some()))
+            .filter_map(|cast| self.nano_templates.get(&cast.spell).filter(|template| template.stat(0).unwrap_or(0) & 0x10000 != 0).map(|template| (cast.spell, template.as_ref())))
+    }
+
+    /// GC1004effe: result zero preserves the queue entry's default success code 1.
+    fn nano_result(&mut self, who: i32, spell: i32, result: i32) {
+        let result = if result == 0 { 1 } else { result };
+        for cast in self.casting.iter_mut().filter(|cast| cast.who == who && cast.spell == spell) {
+            if let Some(execution) = cast.execution.as_mut().filter(|execution| execution.result.is_none()) {
+                execution.result = Some(result);
+            }
+        }
+        if self.nano_casts.iter().any(|(caster, cast)| *caster == who && cast.spell == spell) {
+            self.nano_cast_results.entry((who, spell)).or_insert(result);
+        }
+    }
+
+    /// GC1004ebb5: compare controller kind1 locks to all six incoming families.
+    pub fn nano_family_locked(&self, own: i32, families: [i32; 6]) -> bool {
+        self.nano_locks.iter().any(|&(who, lock, _)| who == own && lock.kind == 1 && families.contains(&lock.instance))
+    }
+
+    /// GC1004ebb5 also compares exact nano identities, not just family locks.
+    pub fn nano_program_locked(&self, own: i32, spell: i32) -> bool {
+        self.nano_locks.iter().any(|&(who, lock, _)| who == own && lock.kind == 0xcf1b && lock.instance == spell)
+    }
+
+    fn start_nano_locks(&mut self, who: i32, spell: i32) {
+        let Some(template) = self.nano_templates.get(&spell) else { return };
+        let seconds = template.stat(254).unwrap_or(0) / 100;
+        if seconds != 0 {
+            self.nano_locks.push((who, ao_net::msg::Identity { kind: 0xcf1b, instance: spell }, seconds));
+        }
+        for (index, family_stat) in [75, 546, 547, 548, 549, 550].into_iter().enumerate() {
+            let family = template.stat(family_stat).unwrap_or(0);
+            let seconds = template.stat(643 + index as u32).unwrap_or(0) / 100;
+            if seconds != 0 && (index == 0 || family != 0) {
+                self.nano_locks.push((who, ao_net::msg::Identity { kind: 1, instance: family }, seconds));
+            }
+        }
+    }
+
+    fn advance_nano_locks(&mut self, dt: f32) {
+        self.nano_lock_second += dt;
+        if self.nano_lock_second < 1.0 { return; }
+        // GC1005122c decrements once on GameTime's second pulse, after execution.
+        self.nano_lock_second %= 1.0;
+        self.nano_locks.retain_mut(|(_, _, seconds)| { *seconds -= 1; *seconds > 0 });
+    }
+
+    fn load_nano_template(&mut self, spell: i32) -> bool {
+        if self.nano_templates.contains_key(&spell) { return true; }
+        let Some(store) = &self.nano_store else { return false };
+        let result = (|| -> anyhow::Result<_> {
+            let record = store.get(super::hud_nanodb::NANO_RDB_TYPE, u32::try_from(spell)?)?.context("missing nano template")?;
+            ao_formats::dynel_visual::parse_item_template(&record)
+        })();
+        match result {
+            Ok(template) => { self.nano_templates.insert(spell, Arc::new(template)); true }
+            Err(error) => { eprintln!("nano cast: {error:#}"); false }
+        }
+    }
+
     /// `FUN_1006a9c5` selects a special clip but retains the slot's previous flags and damage.
     pub fn special_hit_seen(&mut self, who: i32, victim: i32, slot: i32) {
         self.swings.insert(who, (victim, slot));
@@ -1757,9 +1900,11 @@ impl Dynels {
     }
 
     pub(in crate::play) fn cancel_nano_visuals(&mut self, who: i32) {
+        if who == self.own { self.clear_local_nano_initiation(); }
         self.cancel_buff_visuals(who);
         self.nano_sounds.retain(|sound| sound.5 != who);
         self.nano_casts.retain(|(caster, cast)| *caster != who && !(cast.target.kind == CHAR_KIND && cast.target.instance == who));
+        self.nano_cast_results.retain(|&(caster, spell), _| self.nano_casts.iter().any(|(who, cast)| *who == caster && cast.spell == spell));
         self.nano_visuals.retain(|application| application.target.kind != CHAR_KIND || application.target.instance != who);
         if who == self.own { self.nano_animations.push(None); }
         if let Some(c) = self.chars.get_mut(&who).filter(|c| matches!(c.special, Special::Cast(_))) {
@@ -1789,14 +1934,19 @@ impl Dynels {
 
     /// GC 1004f504: spell0 selects the first pending cast; this never removes applied buffs.
     fn cancel_nano_cast(&mut self, who: i32, spell: i32) {
+        let named = spell != 0;
         let spell = if spell != 0 { Some(spell) } else {
-            self.casting.iter().find(|cast| cast.who == who && !cast.done).map(|cast| cast.spell)
+            self.casting.iter().find(|cast| cast.who == who && cast.execution.is_some()).map(|cast| cast.spell)
                 .or_else(|| self.nano_casts.iter().find(|(caster, _)| *caster == who).map(|(_, cast)| cast.spell))
         };
         let Some(spell) = spell else { return };
+        if who == self.own && self.local_nano_initiation.is_some_and(|local| local.0 == spell) {
+            self.clear_local_nano_initiation();
+        }
         self.nano_casts.retain(|(caster, cast)| *caster != who || cast.spell != spell);
+        self.nano_cast_results.remove(&(who, spell));
         self.casting.retain(|cast| {
-            if cast.who != who || cast.spell != spell || cast.done { return true; }
+            if cast.who != who || cast.spell != spell || (named && cast.execution.as_ref().is_some_and(|execution| execution.recharge.is_none())) { return true; }
             self.nano_sounds.retain(|sound| sound.5 != who);
             let charge = self.nano_templates.get(&cast.spell).and_then(|template| template.stat(0x178)).unwrap_or(203) as u32;
             self.pending_clips.retain(|clip| clip.3 != who || (clip.2 != charge && clip.2 != cast.release_anim));
@@ -1849,6 +1999,20 @@ impl Dynels {
             }
         }
         c.pose = remote_pose(&mut c.mover, self.collision.as_ref(), 0.0);
+    }
+
+    /// GC1004e177: request the template's initiation visual on the source.
+    pub fn start_local_nano(&mut self, spell: i32, effect: i32) {
+        if effect == 0 { return; }
+        self.clear_local_nano_initiation();
+        self.local_nano_initiation = Some((spell, if effect == 49999 { 0 } else { effect }, 0));
+    }
+
+    /// GC1004eef0, also called by CharCastNano when attack leaves stage1.
+    fn clear_local_nano_initiation(&mut self) {
+        if let Some((_, _, handle)) = self.local_nano_initiation.take() {
+            if let Some(renderer) = &mut self.effects { renderer.delete(handle); }
+        }
     }
 
 
@@ -1910,26 +2074,46 @@ impl Dynels {
         let appearance = |who, stat: &mut dyn FnMut(i32, u32) -> Option<i32>| -> Option<[i32; 4]> {
             Some([stat(who, 4)?, stat(who, 59)?, stat(who, 47)?, stat(who, 360)?])
         };
-        self.nano_handles.retain(|(_, _, handle)| renderer.as_ref().is_some_and(|r| r.is_active(*handle)));
-        for (who, cast) in std::mem::take(&mut self.nano_casts) {
-            if !self.nano_templates.contains_key(&cast.spell) {
-                let Some(store) = &self.nano_store else { continue };
-                let result = (|| -> anyhow::Result<_> {
-                    let record = store.get(super::hud_nanodb::NANO_RDB_TYPE, u32::try_from(cast.spell)?)?.context("missing nano template")?;
-                    ao_formats::dynel_visual::parse_item_template(&record)
-                })();
-                match result {
-                    Ok(template) => { self.nano_templates.insert(cast.spell, Arc::new(template)); }
-                    Err(error) => { eprintln!("nano cast: {error:#}"); continue; }
+        if let Some((spell, mut effect, mut handle)) = self.local_nano_initiation.take() {
+            if handle == 0 && effect != 0 && self.nano_effect_categories & 4 != 0 {
+                if let Some(r) = &mut renderer {
+                    let attractor = r.attractor(effect, 0).unwrap_or(0);
+                    if let (Some(source), Some(target)) = (anchor(self, self.own, attractor, &mut own_anchor).or_else(|| anchor(self, self.own, 0, &mut own_anchor)), anchor(self, self.own, 0, &mut own_anchor)) {
+                        r.prepare_anchors((CHAR_KIND as u32, self.own as u32), |identity, id| anchor(self, identity.1 as i32, id, &mut own_anchor));
+                        let look = appearance(self.own, &mut stat);
+                        let config = EffectConfig { creation: Creation::Dynel, track_source: true,
+                            source_identity: Some((CHAR_KIND as u32, self.own as u32)),
+                            target_identity: Some((CHAR_KIND as u32, self.own as u32)),
+                            source_appearance: look, target_appearance: look, ..Default::default() };
+                        match r.spawn_configured(Binding { group: 0, attractor, effect, note: 0, color: 0 }, source, target.w_axis.truncate(), config) {
+                            Ok(created) => handle = created,
+                            Err(error) => eprintln!("nano initiation {spell}: {error:#}"),
+                        }
+                        effect = 0; // Native factory is attempted once, including null/error.
+                    }
                 }
             }
+            if self.nano_effect_categories & 4 == 0 { effect = 0; }
+            self.local_nano_initiation = Some((spell, effect, handle));
+        }
+        self.nano_handles.retain(|(_, _, handle)| renderer.as_ref().is_some_and(|r| r.is_active(*handle)));
+        for (who, cast) in std::mem::take(&mut self.nano_casts) {
+            let result = self.nano_cast_results.remove(&(who, cast.spell));
+            if !self.load_nano_template(cast.spell) { continue; }
             let template = Arc::clone(&self.nano_templates[&cast.spell]);
             let target = if cast.target.kind == 0 && cast.target.instance == 0 && template.stat(0).unwrap_or(0) & 0x8000 == 0 { who } else { cast.target.instance };
             self.casting.retain(|old| { if old.who == who && old.spell == cast.spell { if let Some(r) = &mut renderer { r.delete(old.handle); } false } else { true } });
             let remaining = nano_cast_delay(template.stat(0x126).unwrap_or(200), template.stat(0x20b).unwrap_or(1_234_567_890), stat(who, 0x95).unwrap_or(0), stat(who, 0x33).unwrap_or(0), template.stat(0).unwrap_or(1));
             let instant = template.stat(0).unwrap_or(1) & 0x80000 != 0;
+            if instant { self.start_nano_locks(who, cast.spell); }
+            if instant && who == self.own {
+                if let Some((_, _, handle)) = self.local_nano_initiation.take() {
+                    if let Some(r) = &mut renderer { r.delete(handle); }
+                }
+            }
             let release_anim = template.stat(if target == who { 0x17a } else { 0x179 }).unwrap_or(if target == who { 202 } else { 201 }) as u32;
-            self.casting.push(NanoCast { who, spell: cast.spell, target, handle: 0, remaining, total: remaining, release_anim, released: instant, release_seen: false, done: false, instant, finish_enabled: !instant || cast.flag, start_effect: if instant || self.nano_effect_categories & 4 == 0 { 49999 } else { template.stat(0x1ac).unwrap_or(49999) }, finish: if !instant || cast.flag { [template.stat(0x19e).unwrap_or(49999), template.stat(0x169).unwrap_or(49999)] } else { [49999; 2] } });
+            let timer = !self.casting.iter().any(|cast| cast.who == who && cast.execution.is_some());
+            self.casting.push(NanoCast { who, spell: cast.spell, target, handle: 0, remaining, total: remaining, release_anim, released: instant, release_seen: false, done: false, instant, execution: (!instant).then_some(NanoExecution { left: remaining, recharge: Some(template.stat(0xd2).unwrap_or(0).max(0) as f32 / 100.0), timer, result }), finish_enabled: !instant || cast.flag, start_effect: if instant || self.nano_effect_categories & 4 == 0 { 49999 } else { template.stat(0x1ac).unwrap_or(49999) }, finish: if !instant || cast.flag { [template.stat(0x19e).unwrap_or(49999), template.stat(0x169).unwrap_or(49999)] } else { [49999; 2] } });
             if !instant {
                 self.nano_sound(cast.spell, 0x10d, (who, own_pos), 0.2, 0.6);
                 let animation = template.stat(0x178).unwrap_or(203) as u32;
@@ -1941,6 +2125,11 @@ impl Dynels {
         }
         let mut casting = std::mem::take(&mut self.casting);
         for cast in &mut casting {
+            let attacking = cast.execution.as_ref().is_some_and(|execution| execution.recharge.is_some());
+            if cast.execution.as_mut().is_some_and(|execution| !execution.advance(dt)) { cast.execution = None; }
+            if attacking && cast.execution.as_ref().is_some_and(|execution| execution.recharge.is_none() && execution.result == Some(1)) {
+                self.start_nano_locks(cast.who, cast.spell);
+            }
             if !cast.released && cast.start_effect != 49999 && cast.start_effect != 0 {
                 if let Some(r) = &mut renderer {
                     let effect = cast.start_effect;
@@ -1957,12 +2146,17 @@ impl Dynels {
             }
             if !cast.released && !cast.instant {
                 cast.remaining -= dt;
-                if cast.remaining > 0.0 {
+                if cast.remaining > 0.0 || cast.execution.as_ref().is_some_and(|execution| execution.result.is_none()) {
                     self.nano_sound(cast.spell, 0x10d, (cast.who, own_pos), 0.2, 1.0);
                     continue;
                 }
                 if let Some(r) = &mut renderer { r.next_state(cast.handle); }
                 cast.released = true;
+                if cast.who == self.own {
+                    if let Some((_, _, handle)) = self.local_nano_initiation.take() {
+                        if let Some(r) = &mut renderer { r.delete(handle); }
+                    }
+                }
                 if cast.who == self.own { self.nano_animations.push(Some((cast.release_anim, false))); }
                 else {
                     self.nano_clip(cast.who, cast.release_anim, false);
@@ -2007,8 +2201,9 @@ impl Dynels {
                 }
             }
         }
-        casting.retain(|cast| !cast.done || cast.finish.iter().any(|&effect| effect != 0 && effect != 49999) || renderer.as_ref().is_some_and(|r| r.is_active(cast.handle)));
+        casting.retain(|cast| cast.execution.is_some() || !cast.done || cast.finish.iter().any(|&effect| effect != 0 && effect != 49999) || renderer.as_ref().is_some_and(|r| r.is_active(cast.handle)));
         self.casting = casting;
+        self.advance_nano_locks(dt);
         let Some(mut renderer) = renderer else { return };
         for application in std::mem::take(&mut self.nano_visuals) {
             let who = application.target.instance;
@@ -2544,6 +2739,9 @@ impl Dynels {
                 }
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == ACTION_UNWIELD => self.unwield_slot(who.instance, a.identity_b.instance),
+            N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == 0x6b => {
+                self.nano_result(who.instance, a.identity_b.instance, a.identity_b.kind);
+            }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && matches!(a.action, 0x66 | 0x6c) => {
                 self.cancel_nano_cast(who.instance, if a.action == 0x66 { 0 } else { a.identity_b.kind });
             }
@@ -2551,16 +2749,24 @@ impl Dynels {
                 self.cancel_nano_cast(who.instance, a.identity_b.instance);
             }
             N3::World(World::CharacterAction(a)) if who.kind == CHAR_KIND && a.action == 0x89 => {
+                if who.instance == self.own { self.clear_local_nano_initiation(); }
                 // GC1004f274 clears the queue without holder+0x10: stage0 releases,
                 // with no result to copy; an already released controller keeps its cached result.
                 self.nano_casts.retain(|(caster, _)| *caster != who.instance);
+                self.nano_cast_results.retain(|&(caster, _), _| caster != who.instance);
+                // GC1004f274 -> 1004e68c removes every internal kind3 timer,
+                // independently of the retained visual controller.
+                for cast in self.casting.iter_mut().filter(|cast| cast.who == who.instance) { cast.execution = None; }
                 for cast in self.casting.iter_mut().filter(|cast| cast.who == who.instance && !cast.released) {
                     cast.remaining = 0.0;
                     cast.finish_enabled = false;
                     cast.finish = [49999; 2];
                 }
             }
-            N3::Dynel(Dynel::CastNanoSpell(cast)) if who.kind == CHAR_KIND => self.nano_casts.push((who.instance, cast.clone())),
+            N3::Dynel(Dynel::CastNanoSpell(cast)) if who.kind == CHAR_KIND => {
+                self.load_nano_template(cast.spell);
+                self.nano_casts.push((who.instance, cast.clone()));
+            }
             N3::Dynel(Dynel::WeaponItemFullUpdate(w)) if w.parent.kind == CHAR_KIND => {
                 // body location 6 = right hand, 8 = left hand (docs/zone/static.md §4)
                 if let Some(hand) = match w.byte_71 {
@@ -3471,7 +3677,7 @@ mod tests {
         assert_eq!(world.nano_visuals.len(), 2);
         assert_eq!(world.nano_casts.len(), 2);
         world.own = 42;
-        world.casting.push(NanoCast { who: 42, spell: 163449, target: 43, handle: 0, remaining: 2.0, total: 2.0, finish: [49999; 2], release_anim: 201, released: false, release_seen: false, done: false, instant: false, finish_enabled: true, start_effect: 49999 });
+        world.casting.push(NanoCast { who: 42, spell: 163449, target: 43, handle: 0, remaining: 2.0, total: 2.0, finish: [49999; 2], release_anim: 201, released: false, release_seen: false, done: false, instant: false, execution: Some(NanoExecution { left: 2.0, recharge: Some(1.0), timer: true, result: None }), finish_enabled: true, start_effect: 49999 });
         world.cancel_nano_visuals(43);
         assert!(world.casting.is_empty(), "target disappearance ends the caster's loop even without an effect renderer");
         assert_eq!(world.take_nano_animations(), [None]);
@@ -5442,6 +5648,158 @@ mod variant_tests {
     }
 
     #[test]
+    fn native_nano_timer_blocks_through_recharge_not_visual_finish() {
+        let mut world = Dynels { own: 42, nano_effect_categories: 0, ..Default::default() };
+        world.nano_templates.insert(-1, Arc::new(ao_formats::dynel_visual::ItemTemplate {
+            kind: 0, name: None, sounds: vec![],
+            stats: vec![(0, 0), (0x126, 100), (0xd2, 200), (0x195, 7)],
+        }));
+        let source = ao_net::msg::Identity { kind: CHAR_KIND, instance: 42 };
+        let message = Message {
+            header: ao_net::n3::N3Header { msg_type: ao_net::n3::dynel::CAST_NANO_SPELL, target: source, flag: 0 },
+            sender: 42,
+            body: N3::Dynel(Dynel::CastNanoSpell(ao_net::n3::dynel::CastNanoSpell {
+                spell: -1, target: source, source, flag: true, rest: vec![],
+            })),
+        };
+        let tick = |world: &mut Dynels, dt| world.nano_visual_frame(dt, true, |_| None, |_, _| None);
+        world.start_local_nano(-1, 49999);
+        assert_eq!(world.local_nano_initiation, Some((-1, 0, 0)), "native no-effect selector retains the program id but creates no handle");
+        // Supplementary synthetic selector: tests ownership without claiming a rendered resource.
+        world.start_local_nano(-1, 123);
+        world.on_message(&message);
+        world.nano_result(42, -1, 0);
+        assert!(world.nano_busy(42), "accepted relay blocks before the frame drain");
+        assert!(world.nano_school_busy(42, 7));
+        assert!(!world.nano_busy(43));
+        tick(&mut world, 0.5);
+        assert!(world.nano_busy(42));
+        assert!(world.local_nano_initiation.is_some(), "local initiation survives the attack phase");
+        tick(&mut world, 0.5);
+        assert!(world.local_nano_initiation.is_none(), "CharCastNano clears controller+8 when attack releases");
+        world.take_nano_animations();
+        tick(&mut world, 0.0);
+        assert!(world.casting[0].done, "visual callback may finish before recharge");
+        assert!(world.nano_busy(42));
+        tick(&mut world, 2.0);
+        assert!(world.nano_busy(42), "native recharge expiry is strictly past deadline");
+        tick(&mut world, 0.01);
+        assert!(!world.nano_busy(42));
+        assert!(!world.nano_school_busy(42, 7));
+
+        world.on_message(&message);
+        world.start_local_nano(-1, 123);
+        tick(&mut world, 0.0);
+        world.cancel_nano_cast(42, -1);
+        assert!(!world.nano_busy(42), "named attack cancel removes its timer");
+        assert!(world.local_nano_initiation.is_none(), "named attack cancellation deletes the local initiation");
+        world.on_message(&message);
+        world.nano_result(42, -1, 1);
+        tick(&mut world, 1.0);
+        world.cancel_nano_cast(42, -1);
+        assert!(world.nano_busy(42), "named cancel does not select recharge-stage entries");
+        world.cancel_nano_cast(42, 0);
+        assert!(!world.nano_busy(42), "unnamed cancel removes the first entry during recharge");
+
+        world.on_message(&message);
+        tick(&mut world, 0.0);
+        world.on_message(&Message {
+            header: ao_net::n3::N3Header { msg_type: ao_net::n3::world::CHARACTER_ACTION, target: source, flag: 0 },
+            sender: 42,
+            body: N3::World(World::CharacterAction(ao_net::n3::world::CharacterAction {
+                action: 0x89, param: 0, identity_a: source, identity_b: source, text: String::new(),
+            })),
+        });
+        assert!(!world.nano_busy(42), "queue clear releases kind3 even while visuals finish");
+
+        world.nano_templates.insert(-2, Arc::new(ao_formats::dynel_visual::ItemTemplate {
+            kind: 0, name: None, sounds: vec![],
+            stats: vec![(0, 0x80000), (0x126, 100), (0xd2, 200), (0x195, 7)],
+        }));
+        world.nano_casts.push((42, ao_net::n3::dynel::CastNanoSpell {
+            spell: -2, target: source, source, flag: true, rest: vec![],
+        }));
+        assert!(!world.nano_busy(42), "instant relays never allocate an internal timer");
+        assert!(!world.nano_school_busy(42, 7));
+        tick(&mut world, 0.0);
+        assert!(!world.nano_busy(42));
+        world.start_local_nano(-1, 123);
+        world.cancel_nano_visuals(42);
+        assert!(world.local_nano_initiation.is_none(), "source death/disappearance clears the initiation even before a relay");
+        world.start_local_nano(-1, 123);
+        world.clear();
+        assert!(world.local_nano_initiation.is_none());
+    }
+
+    #[test]
+    fn native_nano_result_releases_wait_and_exposes_pending_self_program() {
+        let mut world = Dynels { own: 42, nano_effect_categories: 0, ..Default::default() };
+        world.nano_templates.insert(-1, Arc::new(ao_formats::dynel_visual::ItemTemplate {
+            kind: 0, name: None, sounds: vec![],
+            stats: vec![(0, 0x10000), (75, 9), (643, 1000)],
+        }));
+        world.casting.push(NanoCast {
+            who: 42, spell: -1, target: 42, handle: 0, remaining: 0.0, total: 1.0,
+            finish: [49999; 2], release_anim: 201, released: false, release_seen: false,
+            done: false, instant: false, execution: Some(NanoExecution {
+                left: 0.0, recharge: Some(2.0), timer: true, result: None,
+            }), finish_enabled: true, start_effect: 49999,
+        });
+        let tick = |world: &mut Dynels, dt| world.nano_visual_frame(dt, true, |_| None, |_, _| None);
+        tick(&mut world, 5.0);
+        assert!(world.nano_busy(42), "elapsed attack cannot invent an authoritative result");
+        assert!(!world.casting[0].released, "release callbacks also await the authoritative result");
+        assert_eq!(world.nano_pending_self(42).count(), 0);
+        assert!(!world.nano_family_locked(42, [9; 6]));
+        let source = ao_net::msg::Identity { kind: CHAR_KIND, instance: 42 };
+        world.on_message(&Message {
+            header: ao_net::n3::N3Header { msg_type: ao_net::n3::world::CHARACTER_ACTION, target: source, flag: 0 },
+            sender: 42,
+            body: N3::World(World::CharacterAction(ao_net::n3::world::CharacterAction {
+                action: 0x6b, param: 0, identity_a: source,
+                identity_b: ao_net::msg::Identity { kind: 0, instance: -1 }, text: String::new(),
+            })),
+        });
+        tick(&mut world, 0.0);
+        assert_eq!(world.nano_pending_self(42).map(|(spell, _)| spell).collect::<Vec<_>>(), [-1]);
+        assert_eq!(world.nano_pending_self(43).count(), 0);
+        assert!(world.nano_family_locked(42, [9; 6]), "result0 preserves success1");
+        tick(&mut world, 2.1);
+        assert!(!world.nano_busy(42));
+        assert_eq!(world.nano_pending_self(42).count(), 0);
+    }
+
+    #[test]
+    fn native_nano_family_lock_uses_authored_whole_second_ttl() {
+        let mut world = Dynels::default();
+        world.nano_templates.insert(-1, Arc::new(ao_formats::dynel_visual::ItemTemplate {
+            kind: 0, name: None, sounds: vec![],
+            stats: vec![(75, 9), (546, 10), (254, 199), (643, 299), (644, 100), (645, 99)],
+        }));
+        world.start_nano_locks(42, -1);
+        assert!(world.nano_family_locked(42, [9, 0, 0, 0, 0, 0]));
+        assert!(world.nano_family_locked(42, [0, 0, 10, 0, 0, 0]));
+        assert!(!world.nano_family_locked(43, [9; 6]));
+        assert!(!world.nano_family_locked(42, [0; 6]), "absent extra families create no lock");
+        assert!(world.nano_program_locked(42, -1));
+        assert!(!world.nano_program_locked(43, -1));
+        assert!(!world.nano_program_locked(42, 9), "a family number is not a program identity");
+        world.advance_nano_locks(0.5);
+        assert!(world.nano_family_locked(42, [10; 6]));
+        assert!(world.nano_program_locked(42, -1));
+        world.advance_nano_locks(0.5);
+        assert!(!world.nano_family_locked(42, [10; 6]));
+        assert!(!world.nano_program_locked(42, -1), "stat254 truncates to whole seconds on the shared pulse");
+        assert!(world.nano_family_locked(42, [9; 6]));
+        world.advance_nano_locks(1.0);
+        assert!(!world.nano_family_locked(42, [9; 6]));
+        world.start_nano_locks(42, -1);
+        world.clear();
+        assert!(!world.nano_family_locked(42, [9; 6]));
+        assert!(!world.nano_program_locked(42, -1));
+    }
+
+    #[test]
     fn nano_sound_stages_own_foreign_and_cancel() {
         let Some((mut zone, player, leet)) = fight_zone() else { return };
         let world = &mut zone.world;
@@ -5459,6 +5817,7 @@ mod variant_tests {
             let target = ao_net::msg::Identity { kind: CHAR_KIND, instance: leet };
             let cast = ao_net::n3::dynel::CastNanoSpell { spell: -1, target, source, flag: true, rest: vec![] };
             world.nano_casts.push((player, cast.clone()));
+            world.nano_result(player, -1, 1); // Explicit successful result for this synthetic stage replay.
             let live_pos = glam::Vec3::from(scene_pos(world.chars[&player].pose.pos)) + glam::Vec3::new(31.0, 24.21 - 9.733, -17.0);
             let matrix = glam::Mat4::from_translation(live_pos).to_cols_array_2d();
             world.nano_visual_frame(0.0, false, |_| Some(matrix), |_, _| None);
@@ -5530,6 +5889,7 @@ mod variant_tests {
         let source = ao_net::msg::Identity { kind: CHAR_KIND, instance: player };
         let target = ao_net::msg::Identity { kind: CHAR_KIND, instance: leet };
         world.nano_casts.push((player, ao_net::n3::dynel::CastNanoSpell { spell: 29091, target, source, flag: true, rest: vec![] }));
+        world.nano_result(player, 29091, 1); // Explicit result; the template alone cannot confirm execution.
         world.nano_visual_frame(0.0, false, |_| None, |_, _| None);
         let template = &world.nano_templates[&29091];
         assert_eq!(template.stat(269).map(|v| v as u32), Some(0x35a9ce7d));

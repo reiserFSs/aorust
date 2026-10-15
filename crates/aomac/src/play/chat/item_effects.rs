@@ -135,7 +135,7 @@ pub(super) fn interpolated_spells(low: &[u8], high: &[u8], ql: i32, event: u32) 
 
 // NanoItem::ReadBinary 1008622a sets Spell_c+0x24 bit 8 on every event.
 // DummyItemBase::ReadBinary 1008070e leaves that constructor flag clear.
-pub(super) fn event_text(spells: &[Spell], nano: bool, zone: &Zone, store: &RecordStore, texts: &TextDb) -> Result<String> {
+pub(crate) fn event_text(spells: &[Spell], nano: bool, zone: &Zone, store: &RecordStore, texts: &TextDb) -> Result<String> {
     let mut out = String::new();
     let mut previous_target = -1;
     let mut previous_visible = true;

@@ -6,6 +6,7 @@
 //! | function | handler | effect on the maps (stat = `GetStat(0)`, amount = `GetStat(0x27)`) |
 //! |---|---|---|
 //! | `0xcf14`, `0xcf35` | `FUN_100a4c24` | bonus `+= amount` (`FUN_100644c8`; undo `FUN_1006469b` `-= amount`) |
+//! | `0xcf16` | `FUN_100a59f5` / `FUN_100a4c24` | queue9: delayed bonus once, local undo at delay + duration (centiseconds) |
 //! | `0xcfb7` | `FUN_100a87b5` | bonus `+= trunc(level * amount / 200.0)`, level = `GetStat(0x36, 2)` |
 //! | `0xcff5` | `FUN_100a88ee` | bonus `+= trunc(f32(amount / 100.0) * GetStat(stat, 0))` (percent of the current buffed value) |
 //! | `0xcfc0` | `FUN_100a8a96` | percent `+= amount` (`FUN_1006497b`; undo `FUN_10064999`) |
@@ -15,13 +16,10 @@
 //! argument 0x20) is 0xe or 0x17 run on the owner / pet relation of the character, not on it (`FUN_100026d0`), so they are not kept.
 //!
 //! Item Wear effects are supplied by `equipment.rs`: `FUN_100cba71` merges the low/high templates by QL; modifier functions interpolate argument 39 only.
-//! Timed nano template events 4/0 are supplied by `TimedEffects` from the zone's authoritative active entries; removal drops their contribution.
+//! Timed nano template events 4/0 are supplied by `TimedEffects` from the zone's authoritative active entries; removal drops ordinary modifiers.
 //! Timed Life-bonus undo clamps stored Health between received messages (`HudStats::nano_stats_changed`, native `1006469b`), including refresh's intermediate undo.
+//! CF16 runs in the same executor's native queue9, independently of source-list removal; its local undo does not remove an NCU entry.
 //! **UNRESOLVED / not modelled**:
-//! * Timed effects: `FUN_100a59f5` ends spells with a duration (`GetStat(0x19)`, function `0xcf16`) by itself; the server's undo `ApplySpellsIIR_t` is what removes
-//!   a spell here.
-//! * The delta of `0xcfb7` / `0xcff5` is fixed at apply time in the client (stored in the spell object for the undo); it is recomputed from the current
-//!   level / value on every refresh here.
 //! * `FUN_100644c8`'s minimum-Life bonus adjustment and `FUN_1006253c` ability stat-change signals are not ported. Health clamping on timed Life undo is implemented.
 
 use super::super::zone::Zone;
@@ -37,17 +35,21 @@ pub(in crate::play) struct TimedEffects {
     signature: Vec<i32>,
     active: Vec<Spell>,
     effects: Vec<Spell>,
+    added: Vec<usize>,
 }
 
 impl TimedEffects {
     pub(in crate::play) fn new(dir: &std::path::Path) -> Self {
         Self { store: ao_rdb::RecordStore::open(dir).ok(), templates: Default::default(),
-            signature: Vec::new(), active: Vec::new(), effects: Vec::new() }
+            signature: Vec::new(), active: Vec::new(), effects: Vec::new(), added: Vec::new() }
     }
 
     pub(in crate::play) fn refresh(&mut self, zone: &Zone) {
+        self.added.clear();
         if self.signature.iter().copied().eq(zone.nanos.buffs.iter().map(|b| b.nano))
             && self.active == zone.active_spells { return; }
+        let added_nanos: Vec<i32> = zone.nanos.buffs.iter().map(|b| b.nano)
+            .filter(|id| !self.signature.contains(id)).collect();
         self.signature.clear();
         self.signature.extend(zone.nanos.buffs.iter().map(|b| b.nano));
         self.active.clone_from(&zone.active_spells);
@@ -60,7 +62,7 @@ impl TimedEffects {
                         .ok_or_else(|| anyhow::anyhow!("nano template {nano} missing"))?;
                     let mut spells = super::super::chat::item_template_spells(&record, 4)?;
                     spells.extend(super::super::chat::item_template_spells(&record, 0)?);
-                    spells.retain(|s| runs_on_character(s) && matches!(s.function, 0xcf14 | 0xcf35 | 0xcfb7 | 0xcff5 | 0xcfc0));
+                    spells.retain(|s| runs_on_character(s) && matches!(s.function, 0xcf14 | 0xcf16 | 0xcf35 | 0xcfb7 | 0xcff5 | 0xcfc0));
                     Ok(spells)
                 };
                 load().unwrap_or_else(|error| {
@@ -68,8 +70,23 @@ impl TimedEffects {
                     Vec::new()
                 })
             });
+            if added_nanos.contains(&nano) {
+                self.added.extend(self.effects.len()..self.effects.len() + spells.len());
+            }
             self.effects.extend_from_slice(spells);
         }
+    }
+
+    pub(super) fn added_effects(&self) -> &[usize] { &self.added }
+
+    pub(super) fn effect_range(&self, nano: i32) -> Option<std::ops::Range<usize>> {
+        let mut start = self.active.len();
+        for id in &self.signature {
+            let len = self.templates.get(id).map_or(0, Vec::len);
+            if *id == nano { return Some(start..start + len); }
+            start += len;
+        }
+        None
     }
 
     /// Undo the old entry before a refresh/conflicting replacement adds its new one.
@@ -103,6 +120,9 @@ fn runs_on_character(s: &Spell) -> bool {
 impl Zone {
     /// `FullCharacterIIR_t`: the spell list of the message replaces what ran before.
     pub fn set_effects(&mut self, spells: &[Spell]) {
+        self.reset_stat_effects = true;
+        self.stat_effect_adds.clear();
+        self.stat_effect_undos.clear();
         self.active_spells = spells.iter().filter(|s| runs_on_character(s)).cloned().collect();
     }
 
@@ -110,8 +130,10 @@ impl Zone {
     pub fn apply_effects(&mut self, spells: &[Spell], apply: bool) {
         for s in spells.iter().filter(|s| runs_on_character(s)) {
             if apply {
+                self.stat_effect_adds.push(self.active_spells.len());
                 self.active_spells.push(s.clone());
             } else if let Some(i) = self.active_spells.iter().position(|a| a == s) {
+                self.stat_effect_undos.push(i);
                 self.active_spells.remove(i);
             }
         }
@@ -157,25 +179,155 @@ impl Zone {
     }
 }
 
+/// Applied spell instances retain the delta returned by `100a87b5` / `100a88ee`.
+/// Native undo reads spell-object +0x18 when +0x1c says a delta was recorded.
+/// Keep the existing wear/active lifecycles separate, including equal occurrences.
+#[derive(Default)]
+pub struct AppliedEffects {
+    wear: Vec<(Spell, i32)>,
+    active: Vec<(Spell, i32)>,
+    pub(super) added_wear: Vec<usize>,
+    pub(super) added_active: Vec<usize>,
+    clock: f64,
+    queued: Vec<TimedStat>,
+}
+
+/// Native queue9 execution, independent of the source list after enqueue.
+struct TimedStat {
+    spell: Spell,
+    start: f64,
+    applied: bool,
+}
+
+impl AppliedEffects {
+    pub(super) fn reset_sources(&mut self, maps: &mut Modifiers) {
+        self.wear.clear();
+        self.active.clear();
+        self.added_wear.clear();
+        self.added_active.clear();
+        maps.bonus.clear();
+        maps.percent.clear();
+        for timed in &self.queued {
+            if timed.applied {
+                if let Ok(target) = u32::try_from(timed.spell.stat(stat::STAT)) {
+                    *maps.bonus.entry(target).or_default() += timed.spell.stat(stat::VALUE);
+                }
+            }
+        }
+    }
+
+    /// GC10002fc7 runs queue9 each character frame; 100a59f5 uses centiseconds.
+    pub(super) fn tick(&mut self, dt: f64, maps: &mut Modifiers, life_undo: &mut dyn FnMut(&Modifiers)) -> bool {
+        self.clock += dt;
+        let mut changed = false;
+        self.queued.retain_mut(|timed| {
+            if self.clock == timed.start && timed.spell.stat(4) > 0 && timed.spell.stat(3) > 1 {
+                timed.start -= f64::from(timed.spell.stat(4) / 100);
+            }
+            let elapsed = ((self.clock - timed.start) * 100.0) as i64;
+            let interval = i64::from(timed.spell.stat(4)).abs();
+            if elapsed < interval { return true; }
+            let Ok(target) = u32::try_from(timed.spell.stat(stat::STAT)) else { return false };
+            let amount = timed.spell.stat(stat::VALUE);
+            if !timed.applied {
+                changed = true;
+                *maps.bonus.entry(target).or_default() += amount;
+                timed.applied = true;
+            }
+            if elapsed < interval + i64::from(timed.spell.stat(stat::DURATION)) { return true; }
+            changed = true;
+            *maps.bonus.entry(target).or_default() -= amount;
+            if target == 1 { life_undo(maps); }
+            false
+        });
+        changed
+    }
+
+    pub fn remove_active(&mut self, maps: &mut Modifiers, index: usize) {
+        if index < self.active.len() {
+            let (spell, delta) = self.active.remove(index);
+            add_delta(maps, &spell, -delta);
+        }
+    }
+    pub fn remove_wear(&mut self, maps: &mut Modifiers, indices: &[usize]) {
+        for &i in indices.iter().rev() {
+            if i < self.wear.len() {
+                let (spell, delta) = self.wear.remove(i);
+                add_delta(maps, &spell, -delta);
+            }
+        }
+    }
+
+    pub fn refresh(&mut self, maps: &mut Modifiers, active: &[Spell], wear: &[Spell], level: i32, current: &dyn Fn(u32, &Modifiers) -> i32) {
+        if self.wear.iter().map(|(s, _)| s).eq(wear)
+            && self.active.iter().map(|(s, _)| s).eq(active)
+            && self.added_wear.is_empty() && self.added_active.is_empty() { return; }
+        // First undo disappearing instances, so new CFF5 effects observe the
+        // surviving maps, not a replay against today's level/raw skills.
+        fn reconcile(old: &mut Vec<(Spell, i32)>, spells: &[Spell], added: &[usize], maps: &mut Modifiers) -> Vec<(Spell, Option<i32>)> {
+            let mut next = Vec::with_capacity(spells.len());
+            for (index, spell) in spells.iter().enumerate() {
+                let delta = if added.contains(&index) { None } else {
+                    old.iter().position(|(s, _)| s == spell).map(|i| old.remove(i).1)
+                };
+                next.push((spell.clone(), delta));
+            }
+            for (spell, delta) in old.drain(..) { add_delta(maps, &spell, -delta); }
+            next
+        }
+        let wear = reconcile(&mut self.wear, wear, &self.added_wear, maps);
+        let active = reconcile(&mut self.active, active, &self.added_active, maps);
+        self.added_wear.clear();
+        self.added_active.clear();
+        for (out, spells) in [(&mut self.wear, wear), (&mut self.active, active)] {
+            for (spell, saved) in spells {
+                let delta = saved.unwrap_or_else(|| {
+                    if spell.function == 0xcf16 && spell.stat(3) != 0 {
+                        self.queued.push(TimedStat { spell: spell.clone(), start: self.clock, applied: false });
+                    }
+                    let delta = spell_delta(&spell, level, maps, current);
+                    add_delta(maps, &spell, delta);
+                    delta
+                });
+                out.push((spell, delta));
+            }
+        }
+    }
+}
+
+fn spell_delta(s: &Spell, level: i32, maps: &Modifiers, current: &dyn Fn(u32, &Modifiers) -> i32) -> i32 {
+    let Ok(target) = u32::try_from(s.stat(stat::STAT)) else { return 0 };
+    let amount = s.stat(stat::VALUE);
+    match s.function {
+        f if MODIFY_STAT.contains(&f) || f == MODIFY_PERCENT_MAP => amount,
+        MODIFY_PER_LEVEL => (f64::from(amount) * f64::from(level) / 200.0) as i32,
+        MODIFY_PERCENT_OF_VALUE => {
+            let pct = (f64::from(amount) / 100.0) as f32;
+            (f64::from(pct) * f64::from(current(target, maps))) as i32
+        }
+        _ => 0,
+    }
+}
+
+fn add_delta(m: &mut Modifiers, s: &Spell, delta: i32) {
+    let Ok(target) = u32::try_from(s.stat(stat::STAT)) else { return };
+    match s.function {
+        f if MODIFY_STAT.contains(&f) || matches!(f, MODIFY_PER_LEVEL | MODIFY_PERCENT_OF_VALUE) =>
+            *m.bonus.entry(target).or_default() += delta,
+        MODIFY_PERCENT_MAP => *m.percent.entry(target).or_default() += delta,
+        _ => {}
+    }
+}
+
 /// The two maps after the spells ran in order. `level` is `GetStat(0x36, 2)`; `current(stat, maps)` is `GetStat(stat, 0)` (the buffed value) under the maps
 /// built so far (`0xcff5` takes a percentage of it).
 /// Wear and running spells share the same maps, so percent-of-current effects see preceding equipment bonuses.
+#[cfg(test)]
 pub fn modifiers_with_equipment(active: &[Spell], wear: &[Spell], level: i32, current: &dyn Fn(u32, &Modifiers) -> i32) -> Modifiers {
     let mut m = Modifiers::default();
     for s in wear.iter().chain(active) {
-        let Ok(target) = u32::try_from(s.stat(stat::STAT)) else { continue };
-        let amount = s.stat(stat::VALUE);
-        match s.function {
-            f if MODIFY_STAT.contains(&f) => *m.bonus.entry(target).or_default() += amount,
-            MODIFY_PER_LEVEL => *m.bonus.entry(target).or_default() += (f64::from(amount) * f64::from(level) / 200.0) as i32,
-            MODIFY_PERCENT_OF_VALUE => {
-                let pct = (f64::from(amount) / 100.0) as f32;
-                let delta = (f64::from(pct) * f64::from(current(target, &m))) as i32;
-                *m.bonus.entry(target).or_default() += delta;
-            }
-            MODIFY_PERCENT_MAP => *m.percent.entry(target).or_default() += amount,
-            _ => {}
-        }
+        let delta = spell_delta(s, level, &m, current);
+        add_delta(&mut m, s, delta);
     }
     m
 }
@@ -187,6 +339,90 @@ mod tests {
 
     fn modify(function: u32, stat_id: i32, amount: i32) -> Spell {
         spell(function, &[(stat::STAT, stat_id), (stat::VALUE, amount), (stat::TARGET, 2)])
+    }
+
+    #[test]
+    fn cf16_queue_delays_undoes_locally_and_survives_source_undo_and_replacement() {
+        let timed = spell(0xcf16, &[(3, 1), (4, 100), (stat::DURATION, 200),
+            (stat::STAT, 1), (stat::VALUE, 20), (stat::TARGET, 2)]);
+        let mut effects = AppliedEffects::default();
+        let mut maps = Modifiers::default();
+        effects.refresh(&mut maps, std::slice::from_ref(&timed), &[], 1, &|_, _| 40);
+        effects.tick(0.5, &mut maps, &mut |_| panic!("not expired"));
+        assert_eq!(maps.bonus.get(&1).copied().unwrap_or(0), 0);
+        effects.tick(0.5, &mut maps, &mut |_| panic!("not expired"));
+        assert_eq!(maps.bonus[&1], 20);
+        effects.remove_active(&mut maps, 0);
+        effects.refresh(&mut maps, &[], &[], 1, &|_, _| 40);
+        assert_eq!(maps.bonus[&1], 20, "explicit CF16 undo does not cancel queue9");
+        // FullCharacter restores SpellData with a new start time, not elapsed
+        // NCU time; an existing queue entry belongs to the stat holder.
+        effects.reset_sources(&mut maps);
+        effects.refresh(&mut maps, std::slice::from_ref(&timed), &[], 1, &|_, _| 40);
+        effects.tick(1.0, &mut maps, &mut |_| panic!("not expired"));
+        assert_eq!(maps.bonus[&1], 40, "restored execution starts its own delay");
+        let mut limits = Vec::new();
+        effects.tick(1.0, &mut maps, &mut |m| limits.push(40 + m.bonus[&1]));
+        assert_eq!((maps.bonus[&1], limits.as_slice()), (20, &[60][..]));
+        effects.remove_active(&mut maps, 0);
+        effects.added_active.push(0);
+        effects.refresh(&mut maps, std::slice::from_ref(&timed), &[], 1, &|_, _| 40);
+        effects.tick(1.0, &mut maps, &mut |m| limits.push(40 + m.bonus[&1]));
+        assert_eq!(limits, [60, 40], "native clamps during undo before an equal new execution adds");
+        assert_eq!(maps.bonus[&1], 20);
+        effects.tick(2.0, &mut maps, &mut |m| limits.push(40 + m.bonus[&1]));
+        assert_eq!(maps.bonus[&1], 0);
+        assert_eq!(effects.queued.len(), 0);
+        effects.refresh(&mut maps, std::slice::from_ref(&timed), &[], 1, &|_, _| 40);
+        assert!(effects.queued.is_empty(), "expired source records are not reapplied every refresh");
+        let mut model = super::super::skill_model::Model::default();
+        let get = |id| match id { 1 => Some(40), 27 => Some(60), _ => None };
+        model.refresh_buffs(&get, std::slice::from_ref(&timed), &[], None);
+        assert_eq!(model.tick_effects(&get, 1.0), (true, None));
+        assert_eq!(model.tick_effects(&get, 2.0), (true, Some(40)),
+            "local Life expiry corrects stored Health, not merely the displayed maximum");
+    }
+
+    #[test]
+    fn applied_deltas_survive_level_and_source_changes_and_undo_before_refresh() {
+        let wear = [modify(0xcfb7, 108, 100)];
+        let active = [modify(0xcff5, 108, 10)];
+        let mut effects = AppliedEffects::default();
+        let mut maps = Modifiers::default();
+        let current = |raw| move |id, m: &Modifiers| raw + m.bonus.get(&id).copied().unwrap_or(0);
+        effects.refresh(&mut maps, &active, &wear, 50, &current(100));
+        assert_eq!(maps.bonus[&108], 37, "wear +25, then 10% of 125 = +12");
+        effects.refresh(&mut maps, &active, &wear, 100, &current(200));
+        assert_eq!(maps.bonus[&108], 37, "neither running instance is re-evaluated");
+        effects.refresh(&mut maps, &[], &wear, 100, &current(200));
+        assert_eq!(maps.bonus[&108], 25, "undo removes the original +12, not today's +22");
+        effects.refresh(&mut maps, &active, &wear, 100, &current(200));
+        assert_eq!(maps.bonus[&108], 47, "refresh snapshots the replacement's +22");
+        effects.refresh(&mut maps, &active, &[], 100, &current(200));
+        assert_eq!(maps.bonus[&108], 22, "wear undo removes its original +25");
+        effects.refresh(&mut maps, &[], &[], 100, &current(200));
+        assert_eq!(maps.bonus[&108], 0);
+    }
+
+    #[test]
+    fn equal_instances_undo_the_selected_original_delta() {
+        let spell = modify(0xcfb7, 108, 100);
+        let mut effects = AppliedEffects::default();
+        let mut maps = Modifiers::default();
+        effects.refresh(&mut maps, std::slice::from_ref(&spell), &[], 50, &|_, _| 0);
+        effects.added_active.push(1);
+        effects.refresh(&mut maps, &[spell.clone(), spell.clone()], &[], 100, &|_, _| 0);
+        assert_eq!(maps.bonus[&108], 75);
+        effects.remove_active(&mut maps, 0);
+        effects.refresh(&mut maps, std::slice::from_ref(&spell), &[], 200, &|_, _| 0);
+        assert_eq!(maps.bonus[&108], 50, "undo first equal record keeps the second instance's delta");
+        effects.refresh(&mut maps, &[], &[spell.clone(), spell.clone()], 50, &|_, _| 0);
+        effects.remove_wear(&mut maps, &[1]);
+        effects.added_wear.push(0);
+        effects.refresh(&mut maps, &[], &[spell.clone(), spell], 100, &|_, _| 0);
+        assert_eq!(maps.bonus[&108], 75, "only the replaced equipment instance reapplies");
+        effects.remove_wear(&mut maps, &[0]);
+        assert_eq!(maps.bonus[&108], 25, "insertion before an equal survivor does not steal its snapshot");
     }
 
     #[test]

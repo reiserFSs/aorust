@@ -6,7 +6,6 @@ use ao_formats::screens::TextDb;
 use ao_gui::{CanvasItem, Event, GfxId, Gui, MouseButton, WindowId, WindowSize};
 use ao_net::{frame::Frame, msg::Identity, n3::textcmd};
 use std::path::Path;
-use std::collections::HashMap;
 
 pub(super) struct HudPet {
     window: Option<WindowId>,
@@ -15,7 +14,6 @@ pub(super) struct HudPet {
     screen: (u32, u32),
     closed: bool,
     select: Option<i32>,
-    nanos: HashMap<i32, super::own_nanos::OwnNanos>,
     db: super::hud_nanodb::NanoDb,
     elapsed: f32,
     pub(super) outbox: Vec<Frame>,
@@ -35,24 +33,11 @@ fn health(zone: &Zone, pet: Identity) -> f32 {
 
 impl HudPet {
     pub(super) fn new(dir: &Path, screen: (u32, u32)) -> Self {
-        Self { window: None, pets: vec![], texts: TextDb::load(dir).ok(), screen, closed: false, select: None, outbox: vec![], nanos: HashMap::new(), db: super::hud_nanodb::NanoDb::new(dir), elapsed: 0.5 }
+        Self { window: None, pets: vec![], texts: TextDb::load(dir).ok(), screen, closed: false, select: None, outbox: vec![], db: super::hud_nanodb::NanoDb::new(dir), elapsed: 0.5 }
     }
 
     pub(super) fn set_screen(&mut self, screen: (u32, u32)) { self.screen = screen; }
     pub(super) fn take_closed(&mut self) -> bool { std::mem::take(&mut self.closed) }
-    pub(super) fn on_frame(&mut self, frame: &Frame) {
-        let Ok(m) = ao_net::n3::decode(frame) else { return; };
-        if matches!(&m.body,
-            ao_net::n3::N3::Misc(ao_net::n3::misc::Misc::Buff(_))
-            | ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(_))
-            | ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(_)))
-        {
-            let nanos = self.nanos.entry(m.header.target.instance).or_default();
-            nanos.on_message(m.header.target, m.header.target, &m.body, 100);
-            // Dynels consumes the same pet lifecycle for target-attached visuals.
-            nanos.take_visuals();
-        }
-    }
     fn text(&self, key: &str) -> String {
         self.texts.as_ref().and_then(|t| t.by_key(10000, key)).unwrap_or_else(|| key.to_string())
     }
@@ -80,7 +65,6 @@ impl HudPet {
     }
 
     pub(super) fn update(&mut self, gui: &mut Gui, zone: &mut Zone, dt: f32) {
-        for nanos in self.nanos.values_mut() { nanos.tick(dt); }
         if let Some(id) = self.select.take() { zone.set_target(Some(ao_net::msg::Identity { kind: 50000, instance: id })); }
         let Some(w) = self.window else { return; };
         self.elapsed += dt;
@@ -111,7 +95,7 @@ impl HudPet {
             for action in ["primary", "follow", "wait"] { gui.set_enabled(w, &format!("{action}{i}"), known.is_some()); }
             gui.remove_children(w, &format!("buffs{i}"));
             gui.set_visible(w, &format!("buffs{i}"), false);
-            if let Some(nanos) = self.nanos.get_mut(&pet.instance) {
+            if let Some(nanos) = zone.world.target_nanos(pet.instance) {
                 for buff in &nanos.buffs {
                     let Some(info) = self.db.info(gui, buff.nano) else { continue; };
                     let remaining = buff.remaining_cs(nanos.time);
@@ -157,6 +141,52 @@ impl HudPet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pet_buffs_follow_shared_updates_clock_and_removal_not_other_characters() {
+        use ao_net::n3::{self, action, misc, nano, outgoing};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut hud = HudPet::new(&dir, (1024, 768));
+        let mut zone = Zone::new(7);
+        let pet = Identity { kind: 50000, instance: 8 };
+        zone.pets.push(pet);
+        let add = |who, op, duration| outgoing::n3_frame(0, 7, action::character_action(who, &action::simple(
+            op, nano::nano(29091), Identity { kind: 7, instance: duration },
+        )));
+        // Ordinary characters are tracked by the world, never copied into pet-owned state.
+        zone.on_frame(&add(9, 0x62, 1000));
+        hud.open(&mut gui);
+        hud.update(&mut gui, &mut zone, 0.0);
+        let window = hud.window.unwrap();
+        assert_eq!(hud.pets, [pet]);
+        assert!(!gui.is_visible(window, "buffs0"));
+        zone.on_frame(&add(8, 0x62, 1000));
+        hud.update(&mut gui, &mut zone, 0.5);
+        assert!(gui.is_visible(window, "buff0_29091"));
+        zone.on_frame(&add(8, 0xb1, 250));
+        let nanos = zone.world.target_nanos(8).unwrap();
+        assert_eq!(nanos.buffs.len(), 1);
+        assert_eq!(nanos.buffs[0].total_cs, 250);
+        let time = nanos.time;
+        hud.update(&mut gui, &mut zone, 0.5);
+        assert_eq!(zone.world.target_nanos(8).unwrap().time, time, "HUD must not advance the shared clock");
+        zone.world.buff_visual_frame(3.0, |_| None, |_, _| None);
+        hud.update(&mut gui, &mut zone, 0.5);
+        let nanos = zone.world.target_nanos(8).unwrap();
+        assert_eq!(nanos.buffs[0].remaining_cs(nanos.time), 0);
+        assert!(gui.is_visible(window, "buff0_29091"), "zero duration does not replace server removal");
+        zone.world.on_message(&n3::Message {
+            header: n3::N3Header { msg_type: outgoing::message_key("BuffIIR_c"), target: pet, flag: 0 },
+            sender: 1,
+            body: n3::N3::Misc(misc::Misc::Buff(misc::Buff { kind: 0, nano: Some(nano::nano(29091)), rest: vec![] })),
+        });
+        hud.update(&mut gui, &mut zone, 0.5);
+        assert!(!gui.is_visible(window, "buffs0"));
+        assert!(!gui.is_visible(window, "buff0_29091"));
+        assert!(zone.world.target_nanos(8).unwrap().buffs.is_empty());
+        assert_eq!(zone.world.target_nanos(9).unwrap().buffs.len(), 1);
+    }
     #[test]
     fn pet_list_count_and_type_commands_use_real_zone_state() {
         let mut zone = Zone::new(7);
