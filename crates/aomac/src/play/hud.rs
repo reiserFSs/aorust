@@ -1104,6 +1104,15 @@ impl Hud {
             s.input(gui, ev, &self.actions.list, mods);
             self.uses.extend(s.take_uses());
         }
+        // Resolve another shortcut window only after every bar consumed this release, so a newly
+        // displaced drag cannot consume the same MouseUp that created it.
+        for source in 0..self.shortcuts.len() {
+            if let Some((slot, x, y)) = self.shortcuts[source].take_drop() {
+                if let Some((target, to)) = self.shortcuts.iter().enumerate().find_map(|(i, bar)| bar.slot_at(gui, x, y).map(|to| (i, to))) {
+                    self.shortcuts[target].accept_drop(gui, to, slot, x, y);
+                }
+            }
+        }
         self.actwin.input(gui, ev, &self.actions.list, mods, &mut self.shortcuts);
         self.uses.extend(self.actwin.take_uses());
         self.nano.input(gui, ev, mods);

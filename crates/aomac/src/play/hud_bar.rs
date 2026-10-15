@@ -112,6 +112,7 @@ pub(super) struct ShortcutBar {
     pub(super) new_mouse: bool,
     tooltip_key: Option<(usize, u32, u32, bool)>,
     tooltip_body: String,
+    released: Option<(Slot, f32, f32)>,
 }
 
 struct Press {
@@ -201,7 +202,7 @@ impl ShortcutBar {
         let (x, y) = (20, 20);
         let store = ao_rdb::RecordStore::open(dir).ok();
         let slots = if n == 0 { first_login(gui, store.as_ref()) } else { Default::default() };
-        let mut bar = ShortcutBar { window, primary: n == 0, slots, rows: vec![Default::default(); ROWS], row: 0, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true, hold_delay: HOLD_DELAY, new_mouse: true, tooltip_key: None, tooltip_body: String::new() };
+        let mut bar = ShortcutBar { window, primary: n == 0, slots, rows: vec![Default::default(); ROWS], row: 0, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true, hold_delay: HOLD_DELAY, new_mouse: true, tooltip_key: None, tooltip_body: String::new(), released: None };
         bar.place(gui, (x, y), screen);
         bar.paint(gui);
         Ok(bar)
@@ -544,7 +545,8 @@ impl ShortcutBar {
     /// `true` when the drop landed on this bar.
     pub(super) fn drop_special(&mut self, gui: &mut Gui, instance: u32, x: f32, y: f32) -> bool {
         let Some(to) = self.slot_at(gui, x, y) else { return false };
-        self.slots[to] = self.icon_slot(gui, instance);
+        let Some(slot) = self.icon_slot(gui, instance) else { return false };
+        self.replace_shortcut(gui, to, slot, x, y);
         self.paint(gui);
         true
     }
@@ -553,7 +555,7 @@ impl ShortcutBar {
     pub(super) fn drop_item(&mut self, gui: &mut Gui, slot: u32, name: &str, icon: Option<(GfxId, u32, u32)>, x: f32, y: f32) -> bool {
         let Some(to) = self.slot_at(gui, x, y) else { return false };
         let id = ao_net::n3::inventory::item_identity(slot);
-        self.slots[to] = Some(Slot { kind: id.kind as u32, instance: slot, name: name.to_owned(), icon, text: String::new() });
+        self.replace_shortcut(gui, to, Slot { kind: id.kind as u32, instance: slot, name: name.to_owned(), icon, text: String::new() }, x, y);
         self.paint(gui);
         true
     }
@@ -603,18 +605,32 @@ impl ShortcutBar {
         self.drag = Some(Drag { from, slot, ghost, button: MouseButton::Left });
     }
 
-    /// `FUN_100d8047` / `FUN_100d76cf`. UNRESOLVED: dropping on an occupied slot, the original moves the item and starts a new drag
-    /// with the displaced one; here the two swap places (a new macro replaces the occupant).
+    fn replace_shortcut(&mut self, gui: &mut Gui, to: usize, slot: Slot, x: f32, y: f32) {
+        let macro_drop = slot.kind == KIND_MACRO;
+        let displaced = self.slots[to].replace(slot);
+        if let Some(slot) = displaced.filter(|_| !macro_drop) {
+            self.start_drag(gui, None, slot, x, y);
+        }
+    }
+
+    pub(super) fn take_drop(&mut self) -> Option<(Slot, f32, f32)> {
+        self.released.take()
+    }
+
+    pub(super) fn accept_drop(&mut self, gui: &mut Gui, to: usize, slot: Slot, x: f32, y: f32) {
+        self.replace_shortcut(gui, to, slot, x, y);
+        self.paint(gui);
+    }
+
+    /// Native `100d8047`: re-drag displaced shortcuts; macro drops delete their occupant.
     fn drop(&mut self, gui: &mut Gui, d: Drag, x: f32, y: f32) {
-        match (self.slot_at(gui, x, y), d.from) {
-            (Some(to), Some(from)) if to == from => {}
-            (Some(to), Some(from)) => {
-                self.slots[from] = self.slots[to].take();
-                self.slots[to] = Some(d.slot);
-            }
-            (Some(to), None) => self.slots[to] = Some(d.slot),
-            (None, Some(from)) => self.slots[from] = None,
-            (None, None) => {}
+        let to = self.slot_at(gui, x, y);
+        if to == d.from && to.is_some() { return; }
+        if let Some(from) = d.from { self.slots[from] = None; }
+        if let Some(to) = to {
+            self.replace_shortcut(gui, to, d.slot, x, y);
+        } else {
+            self.released = Some((d.slot, x, y));
         }
         self.paint(gui);
     }
@@ -664,6 +680,53 @@ pub(super) fn default_count(dvalues: &super::dvalue::DValues) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn occupied_shortcut_redrags_displaced_item_except_macros() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &dir, 0, (1280, 800)).unwrap();
+        let slot = |id: u32| Slot { kind: ao_net::n3::nano::NANO_KIND as u32, instance: id, name: id.to_string(), icon: None, text: String::new() };
+        bar.slots[0] = Some(slot(1));
+        bar.slots[1] = Some(slot(2));
+        let (x, y) = bar.slot_screen_pos(&gui, 1);
+        bar.begin_drag(&mut gui, 0, x, y, MouseButton::Left);
+        let drag = bar.drag.take().unwrap();
+        gui.close_window(drag.ghost);
+        bar.drop(&mut gui, drag, x, y);
+        assert!(bar.slots[0].is_none());
+        assert_eq!(bar.slots[1].as_ref().unwrap().instance, 1);
+        assert_eq!(bar.drag.as_ref().unwrap().slot.instance, 2);
+        let (x, y) = bar.slot_screen_pos(&gui, 2);
+        let drag = bar.drag.take().unwrap();
+        gui.close_window(drag.ghost);
+        bar.drop(&mut gui, drag, x, y);
+        assert_eq!(bar.slots[2].as_ref().unwrap().instance, 2);
+        assert!(bar.drag.is_none());
+        bar.begin_macro_drag(&mut gui, 1, "Macro", "/sit");
+        let drag = bar.drag.take().unwrap();
+        gui.close_window(drag.ghost);
+        let (x, y) = bar.slot_screen_pos(&gui, 1);
+        bar.drop(&mut gui, drag, x, y);
+        assert_eq!(bar.slots[1].as_ref().unwrap().kind, KIND_MACRO);
+        assert!(bar.drag.is_none(), "native inventory/textmacro branch deletes the occupant");
+        let mut other = ShortcutBar::new(&mut gui, &dir, 1, (1280, 800)).unwrap();
+        gui.set_window_pos(other.window, (20, 100));
+        other.slots[0] = Some(slot(3));
+        let (x, y) = other.slot_screen_pos(&gui, 0);
+        bar.begin_drag(&mut gui, 2, x, y, MouseButton::Left);
+        let drag = bar.drag.take().unwrap();
+        gui.close_window(drag.ghost);
+        bar.drop(&mut gui, drag, x, y);
+        let (slot, x, y) = bar.take_drop().unwrap();
+        other.accept_drop(&mut gui, 0, slot, x, y);
+        assert!(bar.slots[2].is_none());
+        assert_eq!(other.slots[0].as_ref().unwrap().instance, 2);
+        assert_eq!(other.drag.as_ref().unwrap().slot.instance, 3);
+        other.close(&mut gui);
+        bar.close(&mut gui);
+    }
 
     #[test]
     fn ctrl_click_uses_hotbar_slot_while_shift_click_does_not() {
