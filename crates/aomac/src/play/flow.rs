@@ -953,7 +953,7 @@ impl Play {
                     // Stat feedback needs the old values; InfoPacket pages need the applied values.
                     if let Some(c) = self.chat.as_mut() {
                         if let Some(hud) = self.hud.as_ref() { c.configure_escape(&hud.dvalues); }
-                        c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text);
+                        c.on_zone_frame(&mut self.gui, &f, &self.zone, &self.text, self.hud.as_mut().map(|hud| &mut hud.winb.perks));
                     }
                     let own_events_before = self.zone.own_events.len();
                     let zone_event = self.zone.on_frame(&f);

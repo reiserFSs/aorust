@@ -410,7 +410,7 @@ Rows without a note are UI / GlobalSignals plumbing of another feature (team, co
 | `0x81` | 0x1005dc31 | combat-log line | chat/log.rs |
 | `0x82` | 0x1005dc12 | combat-log line | chat/log.rs |
 | `0x83` | 0x1005d7b7 | weapon slot map (`FUN_1006ad94`: `FUN_10081e74(char, 3)` gesture 0x6d, then `WeaponItem_t` vtable `+0xa4` = `FUN_1009e301` wield); live: right after every wear / unwear, `identity_a` = the weapon item `{0xC74A, id}`, `identity_b = {0, slot}` (6 on the wear, the bag slot 0x41 on the unwear) | **not implemented**: the `WeaponItemFullUpdate` of the same moment already carries what the slot tables need (a bag slot is no valid weapon slot); its repeat of the wield / gesture is invisible ([INFERENCE], combat-anim.md §4) |
-| `0x84` | 0x1005ddbc | special action locked "Unable to perform action, able in hh:mm:ss" | **wired** chat/log.rs (perk branch: perk name unresolved, not printed) |
+| `0x84` | 0x1005ddbc → 0x10064301 | special action locked feedback; skill first, else perk name, else generic, with hh:mm:ss | **wired** chat/log.rs through existing `HudPerks::name` (GC `1005366e`); own character only, class0/colour0, no duplicate progression runtime. Archive-backed name/wire/routing regression in chat/log.rs. |
 | `0x89` | 0x1005d248 | UI / GlobalSignals plumbing | not driven, not fight state |
 | `0x8a` | 0x1005dc77 | combat-log line | chat/log.rs |
 | `0x8b` | 0x1005dc50 | combat-log line | chat/log.rs |

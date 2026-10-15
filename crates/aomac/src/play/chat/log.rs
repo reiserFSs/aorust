@@ -518,6 +518,8 @@ pub struct LogCtx<'a> {
     pub in_pet_list: &'a dyn Fn(Identity) -> bool,
     /// Nano record name by nano instance id (`FUN_10082998` object, vtable +0x34).
     pub nano_name: &'a dyn Fn(i32) -> Option<String>,
+    /// Existing perk runtime's `N3Msg_GetPerkName(id, true)` (GC 1005366e), including the line rank.
+    pub perk_name: &'a dyn Fn(u32) -> Option<String>,
     /// Current stat of a dynel (`GetStat(stat, ..)`), used for old values and the nano damage-type override 0x153.
     pub stat: &'a dyn Fn(Identity, i32) -> Option<i32>,
     /// Player Features bit 0x800000 (GC10058a05), also set by full-update bit18.
@@ -1217,14 +1219,17 @@ fn action_lines(ctx: &LogCtx, who: Identity, action: i32, param: i32, a: Identit
         // `FUN_10064301` [GC 0x10064301] (case 0x2a, handler 0x1005ddbc): a special action / skill cannot be used for `identity_b.instance` more seconds; own
         // character only. Template (LDB 1000) `UnableToPerformActionSkill` (skill `identity_b.kind` named by `GetText(2003, kind)`), `...Perk` (perk
         // `identity_a.instance`) or `UnableToPerformAction`; fed (name,) hours, minutes, seconds.
-        // [UNRESOLVED port] the perk branch needs the perk name (`FUN_1005366e`, the perk records of the RDB): that line is not printed.
-        0x84 if own && !(b.kind == 0 && a.instance != 0) => {
+        0x84 if own => {
             let (h, secs) = (b.instance / 3600, b.instance);
             let m = secs / 60 - h * 60;
             let mut args = vec![];
             let key = if b.kind != 0 {
                 args.push(s((ctx.text)(2003, b.kind as u32).unwrap_or_default()));
                 "UnableToPerformActionSkill"
+            } else if a.instance != 0 {
+                let Some(name) = (ctx.perk_name)(a.instance as u32) else { return };
+                args.push(s(name));
+                "UnableToPerformActionPerk"
             } else {
                 "UnableToPerformAction"
             };
@@ -1293,6 +1298,7 @@ mod tests {
             in_pet_list: &|i| i.instance == 5,
             npc_state: &|_| false,
             nano_name: &|i| Some(format!("Nano#{i}")),
+            perk_name: &|id| Some(format!("Perk#{id}")),
             stat: &|i, st| (i.instance == 5 && st == 0).then_some(0x0800_0000),
             // Bob (3) carries a pistol in slot 6, Testy (1) too; everyone else fights bare-handed (the martial-arts / creature items: melee)
             weapon: &|a, slot, _| match (a.instance, slot) {
@@ -1364,6 +1370,7 @@ mod tests {
             in_pet_list: &|_| false,
             npc_state: &|_| false,
             nano_name: &|_| None,
+            perk_name: &|id| Some(format!("Perk#{id}")),
             stat: &|_, _| None,
             weapon: &|_, _, _| None,
             filter: &filter,
@@ -1381,6 +1388,38 @@ mod tests {
             assert_eq!(lines[0].class, 0);
             assert_eq!(lines[0].line.text, format!("Loot order: {name}"));
         }
+    }
+
+    #[test]
+    fn action84_resolves_real_perk_name_and_routes_only_own_feedback() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let perks = std::cell::RefCell::new(crate::play::hud_perks::HudPerks::new(&dir, (1280, 800)));
+        let perk = perks.borrow().db.defs.first().expect("installed perk catalogue").id;
+        let name = perks.borrow_mut().name(perk);
+        assert!(!name.is_empty() && !name.starts_with("Missing perk:"));
+        with_ctx(1, &[], |base| {
+            let resolve = |id| Some(perks.borrow_mut().name(id));
+            let ctx = LogCtx { perk_name: &resolve, ..*base };
+            let action = ao_net::n3::action::simple(0x84, Identity { kind: 0, instance: perk as i32 }, Identity { kind: 0, instance: 3725 });
+            let frame = ao_net::n3::outgoing::n3_frame(0, 1, ao_net::n3::action::character_action(1, &action));
+            let message = ao_net::n3::decode(&frame).unwrap();
+            let event = from_n3(&message).unwrap();
+            let lines = classify(&event, &ctx);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].class, 0);
+            let expected = ldb_format(&ctx.key(1000, "UnableToPerformActionPerk"), &[s(name.clone()), n(1), n(2), n(5)]);
+            assert_eq!(lines[0].line.text, expected);
+            assert!(lines[0].line.text.contains(&name));
+            let mut remote = message;
+            remote.header.target = id(2);
+            assert!(classify(&from_n3(&remote).unwrap(), &ctx).is_empty());
+            let skill = LogEvent::Action { who: id(1), action: 0x84, param: 99, a: action.identity_a, b: Identity { kind: 142, instance: 3725 } };
+            let ctx = LogCtx { perk_name: &|_| panic!("skill name takes precedence over perk"), ..ctx };
+            let lines = classify(&skill, &ctx);
+            assert_eq!(lines[0].class, 0, "native feedback ignores param");
+            assert_eq!(lines[0].line.text, ldb_format(&ctx.key(1000, "UnableToPerformActionSkill"), &[s((ctx.text)(2003, 142).unwrap()), n(1), n(2), n(5)]));
+        }).expect("installed text database");
     }
 
     #[test]
@@ -1467,10 +1506,12 @@ mod tests {
             assert_eq!((l[0].1, l[0].2.as_str()), ("CCRed", "You have been detected by Snake!"));
             let l = texts(classify(&act(0x01, 0x4000_0001, Identity::default(), Identity::default()), ctx));
             assert_eq!(l[0].2, "You killed the mission target!..");
-            // special action recharge refusal (action 0x84): 3725 s = 1:02:05; perk branch (`identity_a.instance != 0`, no skill) prints nothing
+            // special action recharge refusal (action 0x84): 3725 s = 1:02:05.
             let l = texts(classify(&act(0x84, 0, Identity::default(), Identity { kind: 0, instance: 3725 }), ctx));
             assert_eq!(l[0].2, "Unable to perform action, able in 01:02:05");
-            assert!(classify(&act(0x84, 0, id(9), Identity { kind: 0, instance: 5 }), ctx).is_empty());
+            let l = texts(classify(&act(0x84, 0, id(9), Identity { kind: 0, instance: 5 }), ctx));
+            assert_eq!(l[0].2, ldb_format(&ctx.key(1000, "UnableToPerformActionPerk"), &[s("Perk#9".into()), n(0), n(0), n(5)]));
+            assert!(l[0].2.contains("Perk#9"));
             // level up
             let nl = LogEvent::NewLevel { who: id(1), f: [12, 0, 0, 0, 0, 0, 0, 0] };
             assert_eq!(texts(classify(&nl, ctx))[0].2, "New Level: 12!");
@@ -1582,6 +1623,7 @@ mod tests {
             in_pet_list: &|_| false,
             npc_state: &|_| false,
             nano_name: &|_| None,
+            perk_name: &|id| Some(format!("Perk#{id}")),
             stat: &|_, _| None,
             weapon: &|a, slot, sp| arms.damage_type(a.instance, slot, sp),
             filter: &filter,

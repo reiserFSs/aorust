@@ -161,6 +161,7 @@ cases; most cases are non-text game actions (UI, anims, ...). Text cases impleme
 | 0x4f | 0x12 | tail: category 1000 `YouAreInsured` |
 | 0x77 | 0x24 | direct (class `param`, colour 0): `TeamMemberLinkdead`(name a) |
 | 0x81 / 0x82 | 0x27 / 0x28 | cat 0x42 / 0x41 with dynel = a, amount `b.instance`, other = header |
+| 0x84 | 0x2a, `1005ddbc` → `10064301` | own only; direct class0/colour0, `UnableToPerformActionSkill` (text2003 `b.kind`) takes precedence, else `UnableToPerformActionPerk` (`a.instance`, existing `HudPerks::name` = GC `1005366e`), else `UnableToPerformAction`; `b.instance` seconds split into hours/minutes/seconds |
 | 0x8a / 0x8b | 0x2c / 0x2d | cat 0x44 / 0x43 (0x8b only when `b.instance > 0`) |
 | 0x8c | 0x2e | tail: `IncreasedNanoPool`(b.instance) when a is a dynel and `b.instance > 0` |
 | 0x9b | 0x33 | direct, colour 12 (CCRed): `YouHaveBeenDetected`(name a) |
@@ -169,6 +170,9 @@ cases; most cases are non-text game actions (UI, anims, ...). Text cases impleme
 | 0xa4 | 0x38 | direct, colour 30: `SkillAvailable`(text category 2002) |
 | 0xc4 / 0xc5 | 0x50 / 0x51 | direct: `StuckResolved` / `StuckAvailable`(b.instance) |
 | 0xd1 | 0x5b | toxic damage when `a.instance > 0 && b.instance > 0`: client cat 0x2c, client's pet cat 0x3f (amount `b.instance`) |
+
+Action84 now resolves the perk through the same live `HudWinB.perks` runtime used by the Perks window; it does not create a second perk catalogue, progression map or completed-perk cache. `flow` supplies the runtime to `Chat::on_zone_frame`, and `LogCtx::perk_name` feeds the resolved name into the existing classifier. Before the HUD exists no perk resource resolver is available; ordinary/skill feedback is independent. Native `10064301` checks the client-character byte before emitting `FUN_10012b05`, ignoring the action's `param` for routing. Regression `action84_resolves_real_perk_name_and_routes_only_own_feedback` decodes the CharacterAction wire shape, uses the installed perk catalogue/name and text template, checks class0, remote suppression and skill-name precedence. No live session was used.
+
 
 Not ported (no chat line or not decoded): 0xce `PerkAvailable` (name via `FUN_1005366e`), 0xd0 `DrainedHealth/Nano`, 0x105 `InspectRejected` (popup),
 the `PvPTargetLvl` signal (0x54), every other case. Live captures only contain actions 0xA7, 0x63, 0x62, 0xAD, which print nothing.

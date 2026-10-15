@@ -370,7 +370,7 @@ pub(super) struct Hud {
     /// Playfield map and planet map windows (`hud_map.rs`).
     map: HudMap,
     /// Team, Perks and Faction windows (`hud_winb.rs`).
-    winb: HudWinB,
+    pub(super) winb: HudWinB,
     research_vehicle: super::hud_research_vehicle::HudResearchVehicle,
     /// Target docks, health-bar windows and click-to-select (`hud_target.rs`).
     target: HudTarget,

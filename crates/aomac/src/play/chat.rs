@@ -496,7 +496,7 @@ impl Chat {
     }
 
     /// One zone frame: 0x43 (chat server list) connects; N3 chat messages become lines.
-    pub fn on_zone_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &Zone, texts: &TextDb) {
+    pub(super) fn on_zone_frame(&mut self, gui: &mut Gui, f: &Frame, zone: &Zone, texts: &TextDb, perks: Option<&mut super::hud_perks::HudPerks>) {
         self.own_id = zone.char_id;
         self.expansion = zone.stat(0x185).unwrap_or(0);
         if f.ptype == PT_N3 && f.payload.get(..4) == Some(ao_net::n3::info::INFO_PACKET.to_be_bytes().as_slice()) {
@@ -544,7 +544,7 @@ impl Chat {
                     return;
                 }
                 // combat / stat / level feedback lines (docs/chat/log.md); evaluated before `zone.on_frame` applies the stat change
-                self.log_events(gui, &log::events(&m), zone, texts);
+                self.log_events(gui, &log::events(&m), zone, texts, perks);
             }
             _ => {}
         }
@@ -579,10 +579,11 @@ impl Chat {
     }
 
     /// The chat lines of game events (docs/chat/log.md).
-    fn log_events(&mut self, gui: &mut Gui, events: &[log::LogEvent], zone: &Zone, texts: &TextDb) {
+    fn log_events(&mut self, gui: &mut Gui, events: &[log::LogEvent], zone: &Zone, texts: &TextDb, perks: Option<&mut super::hud_perks::HudPerks>) {
         let own = Identity { kind: CHAR_KIND, instance: zone.char_id as i32 };
         let dyn_of = |id: Identity| (id.kind == CHAR_KIND).then(|| zone.dynels.get(&id.instance)).flatten();
         let filter = log::ChatFilter::default();
+        let perks = std::cell::RefCell::new(perks);
         let ctx = log::LogCtx {
             own,
             name: &|id| dyn_of(id).map(|d| d.name.clone()),
@@ -592,6 +593,7 @@ impl Chat {
             npc_state: &|id| zone.stat_of(id.instance, 224).unwrap_or(0) & 0x80_0000 != 0
                 || zone.tip_npc_state.get(&id.instance) == Some(&true),
             nano_name: &|_| None,
+            perk_name: &|id| perks.borrow_mut().as_deref_mut().map(|perks| perks.name(id)),
             stat: &|id, st| (id.kind == CHAR_KIND).then(|| zone.stat_of(id.instance, st as u32)).flatten(),
             weapon: &|id, slot, special| (id.kind == CHAR_KIND).then(|| zone.world.arms.damage_type(id.instance, slot, special)).flatten(),
             filter: &filter,
@@ -605,7 +607,7 @@ impl Chat {
     /// `N3Msg_CastNanoSpell` of the own character: the "Executing Nano Program" line.
     pub fn cast_nano(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb, nano_name: String) {
         let who = Identity { kind: CHAR_KIND, instance: zone.char_id as i32 };
-        self.log_events(gui, &[log::LogEvent::CastNano { who, nano_name }], zone, texts);
+        self.log_events(gui, &[log::LogEvent::CastNano { who, nano_name }], zone, texts, None);
     }
 
     /// GUI `HandlePrivateMessage` 0x10087c10: an unresolved (empty) sender name does not enter the reply history.
@@ -1324,7 +1326,7 @@ mod tests {
             let mut w = packet(code);
             if code == 5 { w.str_i16("ExampleOrg"); }
             w.u32(100);
-            chat.on_zone_frame(&mut gui, &ao_net::n3::outgoing::n3_frame(0, 42, w.0), &zone, &texts);
+            chat.on_zone_frame(&mut gui, &ao_net::n3::outgoing::n3_frame(0, 42, w.0), &zone, &texts, None);
             let window = chat.dialogs.windows().next().unwrap();
             let (_, answer) = chat.dialogs.event(&mut gui, &Event::Clicked { window, view: format!("btn{button}"), item: None });
             chat.answer(&mut gui, answer.unwrap(), Some(&zone), &texts);
@@ -1333,7 +1335,7 @@ mod tests {
         let mut w = packet(2);
         for field in ["Org", "History", "Objective", "Description", "Form", "Leader", "Rank"] { w.str_i16(field); }
         w.u32(1009);
-        chat.on_zone_frame(&mut gui, &ao_net::n3::outgoing::n3_frame(0, 42, w.0), &zone, &texts);
+        chat.on_zone_frame(&mut gui, &ao_net::n3::outgoing::n3_frame(0, 42, w.0), &zone, &texts, None);
         assert!(chat.info.window().is_some());
         assert!(chat.take_outbox().is_empty());
     }
