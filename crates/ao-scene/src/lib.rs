@@ -203,18 +203,22 @@ pub struct LightCycle {
     pub palette: Vec<[f32; 3]>,
     pub phase: f32,
     pub rate: f32,
+    pub intensity: f32,
 }
 
 impl DirectionalLight {
     pub fn color_at(&self, seconds: f32) -> [f32; 3] {
-        let Some(cycle) = self.cycle.as_ref().filter(|cycle| !cycle.palette.is_empty()) else { return self.color };
-        let position = (cycle.phase + seconds * cycle.rate).rem_euclid(1.0) * cycle.palette.len() as f32;
-        let index = position.floor() as usize % cycle.palette.len();
-        let next = (index + 1) % cycle.palette.len();
-        std::array::from_fn(|k| {
-            let a = cycle.palette[index][k];
-            (a + (cycle.palette[next][k] - a) * position.fract()).max(0.0).powf(2.2)
-        })
+        if self.cycle.is_none() { return self.color; }
+        self.gamma_at(seconds).map(|c| c.max(0.0).powf(2.2))
+    }
+
+    /// FXS evaluates colours in D3D gamma space; renderer upload avoids a decode/re-encode pair.
+    pub fn gamma_at(&self, seconds: f32) -> [f32; 3] {
+        let Some(cycle) = self.cycle.as_ref().filter(|cycle| !cycle.palette.is_empty()) else {
+            return self.color.map(|c| c.max(0.0).powf(1.0 / 2.2));
+        };
+        let phase = (seconds * cycle.rate + cycle.phase) % 1.0;
+        mover::waypoint_at(&cycle.palette, phase).map(|c| c * cycle.intensity)
     }
 }
 

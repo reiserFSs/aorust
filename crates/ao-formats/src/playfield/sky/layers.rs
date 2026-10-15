@@ -183,16 +183,17 @@ fn horizon_lights(objs: &[Obj], ctx: &Ctx) -> Vec<ao_scene::DirectionalLight> {
             let (owner, field) = track.trim().split_once('.')?;
             let owner = objs.iter().find(|o| o.name == owner)?;
             let factor = script::eval_field_in(objs, o, ctx, factor.trim().strip_prefix('*')?.trim(), 0)?;
-            let palette: Option<Vec<_>> = owner.field(field)?.split("v(").skip(1)
-                .map(|entry| script::vector(owner, ctx, &format!("v({entry}"), 0).map(|v| v.map(|c| c * factor)))
-                .collect();
+            let entries = owner.field(field)?;
+            let palette: Option<Vec<_>> = entries.match_indices("v(")
+                .map(|(start, _)| script::vector(owner, ctx, &entries[start..], 0)).collect();
             let palette = palette.filter(|p| !p.is_empty())?;
             let phase = script::eval_field_in(objs, o, ctx, index, 0)?;
-            let stepped = Ctx { delta_time: 0.01, ..ctx.clone() };
-            let rate = (script::eval_field_in(objs, o, &stepped, index, 0)? - phase) / 0.01;
+            let rate = ctx.counters.iter().find_map(|(key, rate)| {
+                (key.strip_prefix(&owner.name)? == ".Counter").then_some(*rate)
+            })?;
             let mut light = ao_scene::DirectionalLight {
                 direction, color: [0.0; 3],
-                cycle: Some(ao_scene::LightCycle { palette, phase, rate }),
+                cycle: Some(ao_scene::LightCycle { palette, phase, rate, intensity: factor }),
             };
             light.color = light.color_at(0.0);
             Some(light)
@@ -730,6 +731,33 @@ fn wave_curves_read(o: &Obj, expr: &str, depth: u32) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inferno_horizon_lights_use_authored_cardinal_directions_and_palette_clock() {
+        let Some(tweaks) = real_tweaks(4605) else { return };
+        let objects = tweaks.objects();
+        let ctx = Ctx { counters: counters(&objects), ..Ctx::at(0.0) };
+        let lights = horizon_lights(&objects, &ctx);
+        assert_eq!(lights.len(), 4, "HorizonLight_Base is a formula owner, not a fifth light");
+        let directions = [[0.0, 0.3, 1.0], [0.0, 0.3, -1.0], [1.0, 0.3, 0.0], [-1.0, 0.3, 0.0]];
+        for ((light, direction), phase) in lights.iter().zip(directions).zip([0.1, 0.3, 0.9, 0.7]) {
+            assert_eq!(light.direction, direction, "D3D incident direction must be negated after AO Z mirroring");
+            let cycle = light.cycle.as_ref().unwrap();
+            assert_eq!((cycle.phase, cycle.rate, cycle.intensity), (phase, 0.4, 0.45));
+            assert_eq!(cycle.palette.len(), 10);
+            for (time, intensity) in [(0.0, 0.8), (0.125, 0.9), (0.25, 1.0), (2.5, 0.8)] {
+                let expected = [1.0, 0.5, 0.04].map(|v| v * intensity * 0.45);
+                let actual = light.gamma_at(time);
+                assert!((0..3).all(|k| (actual[k] - expected[k]).abs() < 1e-6), "{time}: {actual:?} != {expected:?}");
+            }
+        }
+        let mut disabled = objects.clone();
+        for object in &mut disabled {
+            if object.fxid() == "DirectionalLight" { object.fields.insert("Use".into(), "e_No".into()); }
+        }
+        assert!(horizon_lights(&disabled, &ctx).is_empty());
+        assert!(horizon_lights(&[], &ctx).is_empty(), "no invented horizon replacement");
+    }
+
     use super::*;
 
     #[test]

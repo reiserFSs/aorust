@@ -162,7 +162,7 @@ struct Globals {
     view: [[f32; 4]; 4],
     water_dir: [f32; 4],
     water_g: [f32; 4],
-    /// x = active dynamic light count (`Renderer::set_dynamic_lights`), yzw unused.
+    /// x = moving light count, y = extra directional count (sun uses its existing lanes).
     dyn_info: [i32; 4],
     /// x = DotStars per-FXS-frame Counter (not elapsed seconds).
     sky_counter: [f32; 4],
@@ -1754,14 +1754,14 @@ impl Renderer {
             view: Mat4::look_to_rh(cam.pos, cam.forward(), cam.up()).to_cols_array_2d(),
             water_dir: v4(Vec3::from_array(water_dir).normalize_or_zero().to_array(), 0.0),
             water_g: g4(water_color, env.sun_specular),
-            dyn_info: [self.dyn_light_count, self.sky.pose.directional_lights.len().min(8) as i32, 0, 0],
+            dyn_info: [self.dyn_light_count, self.sky.pose.directional_lights.len().min(7) as i32, 0, 0],
             sky_counter: [self.sky_dot_counter, 0.0, 0.0, 0.0],
             directional: std::array::from_fn(|lane| {
                 self.sky.pose.directional_lights.get(lane / 2).map_or([0.0; 4], |light| {
                     if lane % 2 == 0 {
                         v4(Vec3::from_array(light.direction).normalize_or_zero().to_array(), 0.0)
                     } else {
-                        g4(light.color_at(self.time - self.sky.directional_epoch), 0.0)
+                        v4(light.gamma_at(self.time - self.sky.directional_epoch), 0.0)
                     }
                 })
             }),
@@ -3070,6 +3070,32 @@ mod sky_tests {
         // light at the eye: H = L, N.H = N.L = 10 / sqrt(108) = 0.962 at the corners -> 0.962^10 = 0.68
         assert_eq!(centre(&off), 0);
         assert!(centre(&on) > 150, "specular {}", centre(&on));
+    }
+
+    #[test]
+    fn horizon_directionals_light_world_diffuse_and_specular_with_a_live_palette() {
+        let mut scene = lit_quad(2.0, [0.0; 3], 1.0, 0.0);
+        scene.lights.clear();
+        let light = ao_scene::DirectionalLight {
+            direction: [0.0, 0.3, 1.0],
+            cycle: Some(ao_scene::LightCycle {
+                palette: (0..10).map(|i| [1.0, 0.5, 0.04].map(|c| c * if i % 2 == 0 { 1.0 } else { 0.8 })).collect(),
+                phase: 0.1, rate: 0.4, intensity: 0.45,
+            }),
+            ..Default::default()
+        };
+        scene.directional_lights.push(light);
+        let (Some(low), Some(high)) = (pixels(&scene, 0.0, "horizon_low"), pixels(&scene, 0.25, "horizon_high")) else { return };
+        // +Z-facing normal: N.L=1/sqrt(1+.3²); native palette red .36 -> .45.
+        assert!((86..=90).contains(&centre(&low)), "gamma diffuse {}", centre(&low));
+        assert!((108..=112).contains(&centre(&high)), "animated gamma diffuse {}", centre(&high));
+        scene.meshes[0].submeshes[0].base_color = [0.0, 0.0, 0.0, 1.0];
+        scene.meshes[0].submeshes[0].specular = [1.0; 3];
+        let specular = pixels(&scene, 0.25, "horizon_specular").unwrap();
+        assert!(centre(&specular) > 45, "directional specular must survive a black diffuse material");
+        scene.directional_lights.clear();
+        let off = pixels(&scene, 0.25, "horizon_removed").unwrap();
+        assert_eq!(centre(&off), 0, "no stale directional light after scene replacement");
     }
 
     /// D3D sums ambient + sun in framebuffer (gamma) space and saturates there: 0.5 + 0.5 = 1.0 (255), where a linear-space sum of

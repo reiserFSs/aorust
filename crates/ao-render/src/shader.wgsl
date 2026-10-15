@@ -15,7 +15,7 @@ struct G {
     view: mat4x4<f32>,     // world -> camera space (env map texgen)
     water_dir: vec4<f32>,
     water_g: vec4<f32>,    // authored WaterLightCurrent, not doubled GroundLightCurrent
-    dyn_info: vec4<i32>,   // x = active dynamic (per-frame moving) light count in `dyn_lights`, yzw unused
+    dyn_info: vec4<i32>,   // x = moving light count, y = extra directional count
     sky_counter: vec4<f32>, // x = DotStars Counter += .01 per FXS frame, independent of time/dt
     directional: array<vec4<f32>, 16>, // toward-light direction / gamma colour pairs
 }
@@ -208,7 +208,9 @@ fn vertex_lights(p: vec3<f32>, n: vec3<f32>, power: f32) -> array<vec3<f32>, 2> 
     // D3D7 fixed function: at most 8 active lights; the cell list is sorted strongest first.
     // Lights switched off by the statel distance LOD (range 0) do not count against the 8.
     let directional_count = u32(g.dyn_info.y);
-    var used = directional_count;
+    // The pre-existing sun path does not reserve a slot without FXS lights.
+    // With root FXS directionals, keep sun + extra + point/spot within D3D's eight.
+    var used = directional_count + select(0u, 1u, directional_count > 0u);
     for (var k = 0u; k < directional_count; k = k + 1u) {
         let l = g.directional[k * 2u].xyz;
         let col = g.directional[k * 2u + 1u].rgb;
