@@ -197,6 +197,10 @@ nothing calls it yet). The camera's attractor test reads a **different** flag, t
 Port: `collision/vehicle.rs` (`Collision::align`, `sweep`, `line`, `closest`, `veto`). Vehicle.dll was imported into a private Ghidra project;
 `this+0x50` is *falling enabled*, `+0x52` airborne, `+0x54` vertical speed, `+0x13c` steep slopes allowed (0 for characters), `+0xb0` orientation mode (0).
 
+**Mech ordering.** `N3Msg_ActivateMech` (Gamecode `0x10079707`) refuses with `Feedback_YouCantDoThisWhileFalling` when Vehicle_t `+0x50` is zero,
+not when `+0x52` is airborne. `Movement::falling_enabled` → `Player::falling_enabled` → HUD mech context preserves that distinction:
+an airborne jump still has falling enabled and passes this check; `DisableFalling` or fly mode clears falling enabled and is refused even with airborne clear.
+
 **Body sphere.** One sphere for every vehicle, radius **0.4** (f32 @0x100127a0, the `param_2` of the sweep), centre 0.4 above the feet (f64 @0x100127f8). There is no
 head sphere or capsule height, and no scaling by monster scale. `n3Dynel_t::GetBodyCollSphereRadi` (@0x10004dd3, `CollPrim_t` radius at dynel+0x5c+0x18)
 and `GetBodyCollSphereDisplacement` only feed the dynel against dynel test `CheckBodyCollision` (@0x1000483b).

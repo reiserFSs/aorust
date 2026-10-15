@@ -300,8 +300,8 @@ impl Player {
         self.serial
     }
 
-    /// Own Vehicle_t ground contact, read by N3Msg_ActivateMech (GC 10079707).
-    pub fn grounded(&self) -> bool { self.movement.grounded() }
+    /// Own Vehicle_t +0x50, read by N3Msg_ActivateMech (GC 0x10079707).
+    pub fn falling_enabled(&self) -> bool { self.movement.falling_enabled() }
 
     /// Movement FSM mode (`FUN_100704e6`; 4 = swimming).
     pub fn mode(&self) -> u32 {

@@ -1772,7 +1772,7 @@ impl Frontend for Play {
         if let Some(h) = self.hud.as_mut() {
             h.resize(&mut self.gui, size);
             h.set_attack_range(super::hud_target::in_attack_range(&self.zone));
-            h.set_vehicle_motion_context(self.dungeon, self.player.as_ref().map(super::player::Player::grounded));
+            h.set_vehicle_motion_context(self.dungeon, self.player.as_ref().map(super::player::Player::falling_enabled));
             h.update(&mut self.gui, &mut self.zone, dt);
             if let Some(s) = &self.session {
                 for f in h.take_outbox() {

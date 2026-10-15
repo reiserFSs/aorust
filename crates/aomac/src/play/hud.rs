@@ -1732,9 +1732,9 @@ pub(super) fn group(n: i32) -> String {
     out
 }
 impl Hud {
-    pub(super) fn set_vehicle_motion_context(&mut self, dungeon: bool, grounded: Option<bool>) {
+    pub(super) fn set_vehicle_motion_context(&mut self, dungeon: bool, falling_enabled: Option<bool>) {
         self.research_vehicle.guard.dungeon = Some(dungeon);
-        self.research_vehicle.guard.grounded = grounded;
+        self.research_vehicle.guard.falling_enabled = falling_enabled;
     }
 }
 

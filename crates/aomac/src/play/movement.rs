@@ -732,6 +732,10 @@ impl Movement {
     pub fn grounded(&self) -> bool {
         !self.airborne
     }
+    /// Vehicle_t +0x50, independent of airborne (+0x52).
+    pub fn falling_enabled(&self) -> bool {
+        self.falling_enabled
+    }
     pub fn fsm(&self) -> &Fsm {
         &self.fsm
     }
@@ -1946,6 +1950,32 @@ mod tests {
         run(&mut m, &w, 1.0);
         assert!((m.yaw() + 1.5).abs() < 0.05, "{}", m.yaw());
         assert!((m.speed() - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn mech_guard_uses_falling_enabled_not_airborne() {
+        use super::super::vehicle_guard::{check, Context, Verdict};
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        let verdict = |m: &Movement| check(1, 0, &Context {
+            skill_locked: Some(false), dungeon: Some(false), falling_enabled: Some(m.falling_enabled()),
+            vehicles_allowed: Some(true), resurrection_shock: Some(0), ..Context::default()
+        }).unwrap();
+        m.action(id::JUMP_START, 0.0);
+        m.update(0.0, &Flat(0.0));
+        assert!(!m.grounded());
+        assert!(m.falling_enabled());
+        assert_eq!(verdict(&m), Verdict::Allowed);
+        m.disable_falling();
+        assert!(m.grounded());
+        assert!(!m.falling_enabled());
+        assert_eq!(verdict(&m), Verdict::Feedback("Feedback_YouCantDoThisWhileFalling"));
+        m.enable_falling();
+        m.set_stats(|s| s.gm_level = 1);
+        m.action(id::SWITCH_FLY, 0.0);
+        assert_eq!(m.fsm().mode, mode::FLY);
+        assert!(m.grounded());
+        assert!(!m.falling_enabled());
+        assert_eq!(verdict(&m), Verdict::Feedback("Feedback_YouCantDoThisWhileFalling"));
     }
 
     #[test]

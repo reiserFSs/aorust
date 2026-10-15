@@ -8,7 +8,7 @@ pub struct Context {
     pub skill_locked: Option<bool>,
     pub dungeon: Option<bool>,
     /// Vehicle_t +0x50: zero is the native falling refusal.
-    pub grounded: Option<bool>,
+    pub falling_enabled: Option<bool>,
     /// Playfield resource +0x5b bit 0 clear AND !IsShadowlandPF.
     pub vehicles_allowed: Option<bool>,
     /// Own GetStat(247, 2), GC 0x10062526.
@@ -35,7 +35,7 @@ pub fn check(vehicle: i32, perk_flags: u32, state: &Context) -> Result<Verdict> 
     if state.dungeon.context("vehicle activation requires the loaded native playfield dungeon state")? {
         return Ok(Verdict::Feedback("Feedback_MustBeOutside"));
     }
-    if !state.grounded.context("vehicle activation requires the own native movement ground-contact state")? {
+    if !state.falling_enabled.context("vehicle activation requires the own native movement falling-enabled state")? {
         return Ok(Verdict::Feedback("Feedback_YouCantDoThisWhileFalling"));
     }
     if !state.vehicles_allowed.context("vehicle activation requires playfield resource +0x5b and native shadowland classification")? {
@@ -57,7 +57,7 @@ pub fn check(vehicle: i32, perk_flags: u32, state: &Context) -> Result<Verdict> 
 mod tests {
     use super::*;
     fn ready() -> Context {
-        Context { skill_locked: Some(false), dungeon: Some(false), grounded: Some(true), vehicles_allowed: Some(true), resurrection_shock: Some(0), battlestation: Some(false), own_lca: Some(true) }
+        Context { skill_locked: Some(false), dungeon: Some(false), falling_enabled: Some(true), vehicles_allowed: Some(true), resurrection_shock: Some(0), battlestation: Some(false), own_lca: Some(true) }
     }
     #[test]
     fn native_refusal_order_and_missing_prerequisites() {
@@ -68,7 +68,7 @@ mod tests {
         assert!(check(1, 0, &s).is_err());
         s.dungeon = Some(true);
         assert_eq!(check(1, 0, &s).unwrap(), Verdict::Feedback("Feedback_MustBeOutside"));
-        s = ready(); s.grounded = Some(false);
+        s = ready(); s.falling_enabled = Some(false);
         assert_eq!(check(1, 0, &s).unwrap(), Verdict::Feedback("Feedback_YouCantDoThisWhileFalling"));
         s = ready(); s.vehicles_allowed = Some(false);
         assert_eq!(check(1, 0, &s).unwrap(), Verdict::Feedback("Feedback_MechCantBeOrdered"));
