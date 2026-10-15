@@ -22,7 +22,7 @@ enum Cmd {
     Play {
         #[arg(long)]
         client: Option<PathBuf>,
-        /// Server name (case-insensitive) from the status API; default: the last used, else the first.
+        /// Server name (case-insensitive) or explicit IPv4:port; default: last selected, else first listed.
         #[arg(long)]
         server: Option<String>,
         /// Debug: skip login and show a built-in character list (offline 3D preview).

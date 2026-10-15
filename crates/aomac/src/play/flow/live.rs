@@ -555,9 +555,10 @@ fn live_walk() {
             a.set_output_gain(0.0);
         }
     });
-    let mut p = Play::new(dir.clone(), None, Some("Ithaca".into()), audio).unwrap();
+    let server = std::env::var("AOMAC_LIVE_SERVER").ok();
+    let mut p = Play::new(dir.clone(), None, server, audio).unwrap();
     p.start_backdrop();
-    p.servers = Some(ao_net::client::fetch_servers().map_err(|e| e.to_string()));
+    p.request_servers();
     let o = Offscreen::new(&p, (1280, 800)).unwrap();
     let shots = std::env::var_os("AOMAC_LIVE_SHOTS").map(std::path::PathBuf::from);
     if let Some(d) = &shots {

@@ -85,7 +85,7 @@ use ao_audio::Audio;
 use ao_formats::screens::{self, TextDb};
 use ao_formats::create::CcWorld;
 use ao_gui::{DrawCmd, DrawList, Event, FontId, Gui, GfxId, InputEvent, Key, MouseButton, WindowId, WindowSize};
-use ao_net::client::{fetch_servers, LoginEvent, LoginSession, ServerEntry};
+use ao_net::client::{LoginEvent, LoginSession, ServerEntry};
 use ao_net::msg::{CharacterEntry, CharacterList};
 use ao_rdb::RecordStore;
 use ao_render::{Camera, Frontend, Host, Vec3};
@@ -185,6 +185,7 @@ struct Play {
     screen: Screen,
     // servers
     servers: Option<Result<Vec<ServerEntry>, String>>,
+    servers_fetching: bool,
     server_arg: Option<String>,
     // windows
     login_w: Option<WindowId>,
@@ -341,6 +342,7 @@ impl Play {
             size: (0, 0),
             screen: Screen::Login,
             servers: None,
+            servers_fetching: false,
             server_arg,
             login_w: None,
             progress_w: None,
@@ -443,13 +445,10 @@ pub fn run(dir: PathBuf, fake_charlist: Option<usize>, server_arg: Option<String
             a.set_output_gain(0.0);
         }
     });
-    let p = Play::new(dir.clone(), fake_charlist, server_arg, audio)?;
+    let mut p = Play::new(dir.clone(), fake_charlist, server_arg, audio)?;
     p.start_backdrop();
     if fake_charlist.is_none() {
-        let tx = p.tx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(Bg::Servers(fetch_servers().map_err(|e| format!("{e:#}"))));
-        });
+        p.request_servers();
     }
     ao_render::run_frontend(Scene::default(), p)
 }

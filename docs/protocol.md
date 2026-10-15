@@ -42,6 +42,53 @@ Ghidra projects: `/tmp/aomac-ghidra/proto/` (not in repo).
 * Username/password are *not* on the command line; they come from the in-client login UI
   (`Client_t::s_cPlayerName` / `s_cPlayerPasswd`, used in `MakeChallengeResponse` `[IF 0x10002054]`).
 
+### Launcher discovery and explicit hosts
+
+`ServerStatusService.GetServerStatuses` in the decompiled PRK launcher reads
+`servers.json` from its working directory as a raw `ServerStatus[]`, adds those entries
+first, then appends the status API's `data` array. `apiServer.txt` optionally replaces
+the default API base `https://site.project-rk.com`; the service appends `/api/status`.
+File/API exceptions are swallowed by that launcher method. These are launcher inputs,
+not an endpoint cache or a requirement of the native login protocol above.
+Evidence: Main-supplied RE of `PRK.Launcher.Lib`'s
+`ServerStatusService.GetServerStatuses`, launcher version **0.5.11**
+(`~/Downloads/win/PRK.Launcher.exe`, adjacent `launcher.version`). The historical
+`/tmp/prk/src` decompile is no longer present; no source-line or IL-offset citation
+for this method was recoverable in this headless investigation. Whitespace and
+trailing-slash normalization of `apiServer.txt` are aomac adaptations, not confirmed
+launcher behavior.
+
+aomac uses its **preferences directory** (`AOMAC_PREFS_DIR`, or
+`~/Library/Application Support/aomac`) for those two files, never the client install
+directory. `servers.json` has exactly this array shape:
+
+```json
+[{"loginIp":"127.0.0.1","loginPort":7000,"serverName":"Local","count":0}]
+```
+
+The example is a loopback configuration, not a shipped/default endpoint. Valid local
+entries remain usable when the API fails; remote entries append without replacing
+local ordering. With neither a usable local list nor API response, login retains the
+existing error-1 page. A new login request can initiate one fresh discovery fetch;
+frames do not retry, and concurrent requests share the in-flight fetch. A named
+selection is matched case-insensitively and never silently replaced with an unrelated
+server. Only an empty selection chooses the first listed entry.
+
+`aomac play --server IPv4:port` directly supplies the login host, bypassing discovery
+(the Rust CLI spelling of native `IA`/`IP`, `[AO 0x405f33]`, and the PRK launcher
+arguments `[PRK GameClientService.cs:211-219]`). The offscreen harness uses the same
+selection/fetch/login path; `AOMAC_LIVE_SERVER` supplies the same name or endpoint.
+The selected server remains the existing `server=` preference; no inferred or
+last-successful-address fallback is persisted.
+
+Offline regressions: `launcher_server_files_precede_api_and_survive_api_failure`
+checks local-file/API merging and API-base selection with an injected failing
+transport. `explicit_login_host_and_local_list_do_not_require_api_or_cached_endpoint`
+checks loopback session creation and mismatched selection rejection;
+`failed_discovery_retries_only_on_new_login_requests` uses a loopback HTTP 503 fixture
+to check one refetch per explicit request and none per frame.
+
+
 ## 2. Transport framing
 
 All integers **big-endian** on the wire. `BinaryStream` defaults to big-endian stream / little-endian machine, so
@@ -456,4 +503,4 @@ Raw records (redacted; `<ms> <'>' sent | '<' received> <hex of one decoded frame
 * This repo's analysis of the binaries above (Ghidra 12.1.4, headless; scripts in `/tmp/aomac-ghidra/proto/scripts`).
 * CellAO (BSD-3-Clause) — message layouts and server-side decrypt; no code copied.
 * Budabot/AOChat `generate_login_key` (GPLv2) — algorithm cross-check only (`$dhN`, `aochat_crypt`/`aocrypt_permute`); no code copied.
-* Decompiled PRK launcher (`/tmp/prk/src`) — argument format.
+* PRK launcher `~/Downloads/win/PRK.Launcher.exe`, version 0.5.11 — launcher discovery contract supplied by Main's RE; historical `/tmp/prk/src` decompile supplied the argument-format citation and is no longer present.

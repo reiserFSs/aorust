@@ -198,14 +198,39 @@ impl Play {
         }
     }
 
+    pub(super) fn request_servers(&mut self) {
+        // Explicit retail-style login hosts do not depend on launcher discovery.
+        let wanted = self.server_arg.as_deref().unwrap_or(&self.prefs.server);
+        if self.servers_fetching || wanted.contains(':') {
+            return;
+        }
+        self.servers_fetching = true;
+        let (tx, dir) = (self.tx.clone(), prefs::dir());
+        std::thread::spawn(move || {
+            let result = ao_net::client::fetch_servers_with_config(dir.as_deref()).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Bg::Servers(result));
+        });
+    }
+
     fn server(&mut self) -> Result<ServerEntry, String> {
+        let wanted = self.server_arg.as_deref().unwrap_or(&self.prefs.server);
+        if wanted.contains(':') {
+            let endpoint = wanted.parse::<std::net::SocketAddrV4>()
+                .map_err(|_| format!("Invalid login endpoint {wanted:?}; expected IPv4:port."))?;
+            if endpoint.port() == 0 || endpoint.ip().is_unspecified() || endpoint.ip().is_multicast() || endpoint.ip().is_broadcast() {
+                return Err(format!("Invalid login endpoint {wanted:?}."));
+            }
+            let server = ServerEntry { name: wanted.into(), ip: *endpoint.ip(), port: endpoint.port(), players: 0 };
+            self.prefs.server = server.name.clone();
+            return Ok(server);
+        }
         let list = match self.servers.as_ref() {
             None => return Err("The server list has not arrived yet.".into()),
             Some(Err(e)) => return Err(format!("Server list unavailable: {e}")),
             Some(Ok(l)) => l,
         };
-        let wanted = self.server_arg.clone().unwrap_or_else(|| self.prefs.server.clone());
-        let s = list.iter().find(|s| s.name.eq_ignore_ascii_case(&wanted)).or(list.first()).cloned().ok_or("No servers online.")?;
+        let s = if wanted.is_empty() { list.first() } else { list.iter().find(|s| s.name.eq_ignore_ascii_case(wanted)) }
+            .cloned().ok_or_else(|| if wanted.is_empty() { "No servers online.".into() } else { format!("Selected server {wanted:?} is not available.") })?;
         self.prefs.server = s.name.clone();
         Ok(s)
     }
@@ -217,6 +242,10 @@ impl Play {
         let pass: String = self.gui.text(w, "password").chars().take(67).collect();
         if user.is_empty() || pass.is_empty() {
             return;
+        }
+        // One retry per new login request, never from the per-frame pump.
+        if matches!(self.servers, Some(Err(_))) {
+            self.request_servers();
         }
         let server = match self.server() {
             Ok(s) => s,
@@ -779,6 +808,7 @@ impl Play {
         while let Ok(bg) = self.rx.try_recv() {
             match bg {
                 Bg::Servers(r) => {
+                    self.servers_fetching = false;
                     match &r {
                         Ok(l) => eprintln!("servers: {}", l.iter().map(|s| format!("{} ({} online)", s.name, s.players)).collect::<Vec<_>>().join(", ")),
                         Err(e) => eprintln!("server list: {e}"),

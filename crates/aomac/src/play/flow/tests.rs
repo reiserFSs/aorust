@@ -746,6 +746,79 @@ fn login_flow_headless() {
     assert!(r.p.screen == Screen::Login && r.p.cc.is_none() && r.login_visible());
 }
 
+#[test]
+fn explicit_login_host_and_local_list_do_not_require_api_or_cached_endpoint() {
+    let Some(mut r) = rig() else { return };
+    r.p.server_arg = Some(format!("127.0.0.1:{}", r.port));
+    r.p.servers = Some(Err("API unreachable".into()));
+    r.p.request_servers();
+    assert!(!r.p.servers_fetching, "explicit endpoint must bypass discovery");
+    r.login();
+    r.pump_until("explicit endpoint session", |p| p.session.is_some());
+    r.cancel();
+    // This is the merged local-file result when the remote API is unavailable.
+    r.p.server_arg = Some("local".into());
+    r.p.servers = Some(Ok(vec![ServerEntry { name: "Local".into(), ip: Ipv4Addr::LOCALHOST, port: r.port, players: 0 }]));
+    r.login();
+    r.pump_until("local entry session", |p| p.session.is_some());
+    r.cancel();
+    r.p.server_arg = Some("unrelated".into());
+    assert!(r.p.server().unwrap_err().contains("unrelated"));
+    r.p.server_arg = Some("127.0.0.1:0".into());
+    assert!(r.p.server().unwrap_err().contains("Invalid login endpoint"));
+    r.p.server_arg = None;
+    r.p.prefs.server = "Local".into();
+    r.p.servers = Some(Err("API unreachable".into()));
+    assert!(r.p.server().unwrap_err().contains("Server list unavailable"));
+    assert_eq!(r.p.prefs.server, "Local", "failed lookup preserves the selection");
+}
+
+#[test]
+fn failed_discovery_retries_only_on_new_login_requests() {
+    use std::io::Write;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    let Some(mut r) = rig() else { return };
+    let api = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    api.set_nonblocking(true).unwrap();
+    let root = super::super::prefs::dir().unwrap();
+    std::fs::write(root.join("apiServer.txt"), format!("http://{}", api.local_addr().unwrap())).unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let worker = std::thread::spawn(move || {
+        let start = Instant::now();
+        while seen.load(Ordering::SeqCst) < 2 {
+            assert!(start.elapsed() < Duration::from_secs(10), "missing explicit discovery retry");
+            match api.accept() {
+                Ok((mut stream, _)) => {
+                    stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => panic!("fixture API: {e}"),
+            }
+        }
+    });
+    r.p.server_arg = Some("Local".into());
+    r.p.servers = Some(Err("API unreachable".into()));
+    let w = r.p.login_w.unwrap();
+    r.p.gui.set_text(w, "username", "aomac-verify");
+    r.p.gui.set_text(w, "password", "not-a-password");
+    r.click(w, "login_btn");
+    assert!(r.p.servers_fetching && r.p.screen == Screen::Login);
+    r.pump_until("first failed API retry", |p| !p.servers_fetching);
+    assert!(r.p.opened_urls.last().unwrap().ends_with("/1.html"));
+    for _ in 0..10 {
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "frames must not refetch");
+    r.click(w, "login_btn");
+    assert!(r.p.servers_fetching);
+    r.pump_until("second failed API retry", |p| !p.servers_fetching);
+    worker.join().unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    std::fs::remove_file(root.join("apiServer.txt")).unwrap();
+}
+
 /// Frames the server sent (`<`) in a capture of `docs/captures`.
 fn captured(rec: &str) -> Vec<ao_net::frame::Frame> {
     rec.lines()

@@ -289,4 +289,38 @@ fn status_api_json() {
         vec![ServerEntry { name: "Ithaca".into(), ip: Ipv4Addr::new(199, 241, 136, 157), port: 7000, players: 199 }]
     );
     assert!(parse_servers(&serde_json::json!({})).is_err());
+    for entry in [
+        serde_json::json!({"loginIp":"127.0.0.1","loginPort":0,"serverName":"Local"}),
+        serde_json::json!({"loginIp":"not-an-ip","loginPort":7000,"serverName":"Local"}),
+        serde_json::json!({"loginIp":"127.0.0.1","loginPort":7000,"serverName":""}),
+    ] {
+        assert!(parse_server_entries(&serde_json::json!([entry])).is_err());
+    }
+}
+
+#[test]
+fn launcher_server_files_precede_api_and_survive_api_failure() {
+    let dir = std::env::temp_dir().join(format!("aomac-server-config-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir(&dir).unwrap();
+    let local = r#"[{"loginIp":"127.0.0.1","loginPort":7000,"serverName":"Local","count":3}]"#;
+    std::fs::write(dir.join("servers.json"), local).unwrap();
+    std::fs::write(dir.join("apiServer.txt"), "https://example.invalid/\n").unwrap();
+    let expected = ServerEntry { name: "Local".into(), ip: Ipv4Addr::LOCALHOST, port: 7000, players: 3 };
+    let offline = configured_servers(Some(&dir), |url| {
+        assert_eq!(url, "https://example.invalid/api/status");
+        Err(anyhow!("API unreachable"))
+    }).unwrap();
+    assert_eq!(offline, vec![expected.clone()]);
+    let remote = ServerEntry { name: "Local".into(), port: 7001, ..expected.clone() };
+    let combined = configured_servers(Some(&dir), |_| Ok(vec![remote.clone()])).unwrap();
+    assert_eq!(combined, vec![expected, remote]);
+    std::fs::write(dir.join("servers.json"), r#"{"data":[]}"#).unwrap();
+    assert!(configured_servers(Some(&dir), |_| Err(anyhow!("API unreachable"))).is_err());
+    std::fs::remove_file(dir.join("servers.json")).unwrap();
+    std::fs::remove_file(dir.join("apiServer.txt")).unwrap();
+    assert!(configured_servers(Some(&dir), |url| {
+        assert_eq!(url, STATUS_URL);
+        Err(anyhow!("API unreachable"))
+    }).is_err());
+    std::fs::remove_dir(dir).unwrap();
 }

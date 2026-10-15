@@ -37,26 +37,60 @@ pub struct ServerEntry {
 
 /// `GET` [`STATUS_URL`]: `{"data":[{"loginIp","loginPort","serverName","count"}]}`.
 pub fn fetch_servers() -> Result<Vec<ServerEntry>> {
-    let v: serde_json::Value = ureq::get(STATUS_URL)
+    fetch_servers_at(STATUS_URL)
+}
+
+/// Fetch using the PRK launcher's optional `servers.json` and `apiServer.txt`.
+/// aomac supplies its preferences directory rather than the launcher's working directory.
+pub fn fetch_servers_with_config(dir: Option<&std::path::Path>) -> Result<Vec<ServerEntry>> {
+    configured_servers(dir, fetch_servers_at)
+}
+
+fn configured_servers(dir: Option<&std::path::Path>, fetch: impl FnOnce(&str) -> Result<Vec<ServerEntry>>) -> Result<Vec<ServerEntry>> {
+    let mut local = dir.and_then(|d| std::fs::read_to_string(d.join("servers.json")).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| parse_server_entries(&v).ok()).unwrap_or_default();
+    let url = dir.and_then(|d| std::fs::read_to_string(d.join("apiServer.txt")).ok())
+        .map(|base| format!("{}/api/status", base.trim().trim_end_matches('/')))
+        .unwrap_or_else(|| STATUS_URL.into());
+    match fetch(&url) {
+        Ok(remote) => local.extend(remote),
+        Err(e) if local.is_empty() => return Err(e),
+        Err(_) => {}
+    }
+    Ok(local)
+}
+
+fn fetch_servers_at(url: &str) -> Result<Vec<ServerEntry>> {
+    let v: serde_json::Value = ureq::get(url)
         .timeout(Duration::from_secs(10))
         .call()
-        .map_err(|e| anyhow!("{STATUS_URL}: {e}"))?
+        .map_err(|e| anyhow!("{url}: {e}"))?
         .into_json()?;
     parse_servers(&v)
 }
 
 fn parse_servers(v: &serde_json::Value) -> Result<Vec<ServerEntry>> {
-    v["data"]
+    parse_server_entries(&v["data"])
+}
+
+/// Shared `ServerStatus[]` shape used by the launcher file and the API's `data`.
+fn parse_server_entries(v: &serde_json::Value) -> Result<Vec<ServerEntry>> {
+    v
         .as_array()
-        .ok_or_else(|| anyhow!("status response has no `data` array"))?
+        .ok_or_else(|| anyhow!("server statuses must be an array"))?
         .iter()
         .map(|e| {
-            Ok(ServerEntry {
+            let server = ServerEntry {
                 name: e["serverName"].as_str().ok_or_else(|| anyhow!("serverName"))?.to_owned(),
                 ip: e["loginIp"].as_str().ok_or_else(|| anyhow!("loginIp"))?.parse()?,
                 port: u16::try_from(e["loginPort"].as_u64().ok_or_else(|| anyhow!("loginPort"))?)?,
                 players: e["count"].as_u64().unwrap_or(0) as u32,
-            })
+            };
+            if server.name.is_empty() || server.port == 0 || server.ip.is_unspecified() || server.ip.is_multicast() || server.ip.is_broadcast() {
+                bail!("invalid server name or login endpoint");
+            }
+            Ok(server)
         })
         .collect()
 }
