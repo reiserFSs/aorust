@@ -45,6 +45,8 @@ mod lightning;
 mod hud_keys;
 mod hud_nanodb;
 mod hud_ncu;
+mod hud_knowledge;
+mod references;
 mod hud_target_ncu;
 mod hud_notification;
 mod hud_pools;

@@ -259,7 +259,7 @@ Initial placement uses final preferred-clamped dimensions before `MoveInsideScre
 
 The free dock wrapper measures its preserved owner content through a layout-bearing elastic body instead of freezing the current client height as a minimum. The removed floor also mixed pixel count (`window_size`) with inclusive extent (`min_size`), adding one pixel on every restored registration. Saved frames remain independent of content limits; the existing full HUD resize/restore regression checks exact dimensions across a fresh login.
 
-Inventory below covers all 20 current `WindowKind::ALL` entries plus separately owned HUD surfaces. “Content-derived” specifies the established retail rule, not a claim that every reconstructed view's pixel metrics are already exact.
+Inventory below covers all 21 current `WindowKind::ALL` entries plus separately owned HUD surfaces. “Content-derived” specifies the established retail rule, not a claim that every reconstructed view's pixel metrics are already exact.
 
 | Window / surface | Constructor or sizing evidence | Content sizing / resize | Persistence |
 |---|---|---|---|
@@ -269,6 +269,7 @@ Inventory below covers all 20 current `WindowKind::ALL` entries plus separately 
 | Inventory | `InventoryView` **0x100c9fb7**, `DockWindow` **0x1003bdd4** | Dock flags 0x1000; scroll/grid content, `MultiListView::SetFrame` recalc reflected by inventory frame-event reflow | `DockAreas`, ordered identities/frame/tab/pin |
 | Team | `TeamBar` **0x100791f7**, `DockArea1.xml` outer Rect(1836,893,2030,1050) | Dock preferred min/max, not template dimensions; six vertical rows, each horizontal text/spacers plus vertical bars. Row height derives from text/art preferred sizes with native2px borders, not the removed16px guess | `DockAreas`, `TeamViewConfig` owner |
 | NCU | `DockWindow` **0x1003bdd4**, list owner `hud_listview.rs` | Dock preferred range; scroll/list contents relayout | `DockAreas` |
+| Knowledge | `KnowledgeView_c` **0x100cefe4**, initial extent167×167 **0x100d694e** | Native48px icon grid,6px borders,10px default spacing; scrolls and follows Rollup/DockAreas layout | `KnowledgeViewConfig`, character-owned `References.bin` |
 | Missions | Same dock constructor; owner `hud_mission.rs` | Dock preferred range; initial `ResizeTo(167,112)` (`100d2c7e→100cf72a`, floats `101bd710`, `101bdfa4`), not the reconstructed300×180 | `DockAreas` |
 | Playfield map | `PlayfieldMapView` **0x100eb905**,179×199 initial size | Constructor dimensions are not minima. Renderer preferred-size override`0x100e95b1` delegates to`0x10045d65`, whose minimum isPoint(-1,-1); unavailable state uses its text's preferred size. Rollup constrains docked placement | `DockAreas` |
 | Planet map | `PlanetMapView` **0x1004d26a**,300×400 at(100,100) | Bitmap preferred min delegates to View and max16000 (`0x10050010`); two-row buttons impose their art extent only when shown. Canvas no longer imposes constructor-sized minima; regression shrinks to100×100 | `DockAreas` |
@@ -425,7 +426,7 @@ Evidence (GUI.dll, project copy of `/tmp/aomac-ghidra/dsky/gui`):
 * Shortcut bar: `ShortcutBarWindow_c` 0x100d94e9 / `ShortcutBarView_c` 0x100d8c12: radio (0x159/0x15a) + `TOOLBAR_CONTROL_H` 32×38 with up/down buttons + 10×1 `MultiListView` of `SLOT_32_CLOSED` (38×38, pitch 36) = 403×38. Config path `…/Containers/ShortcutBar_<n>.xml`.
 * **Mini toolbar above Wear (bug 11):** retail `pasted-image-cf5fb9f9b633eadc.png` shows this icon strip, distinct from the Wear header in `pasted-image-ba7bc439cfc00e5e.png`. `Views/ControlCenter.xml:19` registers `CCMiniToolbar` with `cc_mini_toolbar && cc_rollup_panel && cc_section1`; `CharPrefs.xml:67` defaults the setting to false, so the capture is a nondefault setting. The unsupported XML element was an empty view in the port. It now keeps the native criteria and receives the native buttons.
   GUI.dll `MiniToolbar_c` ctor `0x100726b3` defines, in order, Wear (`wear_window`, SB_WEAR), Controls (`specialaction_window`, SB_ACTION), Knowledge (`knowledge_window`, SB_REF), Mission (`mission_window`, SB_MISSION), Team (`team_view`, SB_TEAM), Map (`map_window`, SB_MAP), Friends (`friends_window`, SB_FRIENDS), Programs (`nano_window`, SB_NANO), Stats (`stat_window`, SB_STAT), NCU (`ncu_window`, SB_NCU). Names in parentheses are exact DValues, and the displayed names are the constructor's tooltip strings (empty tooltip body). `ToolbarButton_c` `0x10072b33` binds the DValue, toggle value and tooltip; assembly `0x1007272b..0x10072743` passes raised `0x173` = SB_WEAR_OFF and pressed/hover `0x172` = SB_WEAR. Each entry uses its corresponding ON/OFF pair. Click callback `0x10072429` writes the bool DValue; `0x10072475` applies DValue changes back to the button. Layout `0x100724e8` places the first at (0,0), advances by inclusive Width+1, and reports summed width/max height; no invented spacing or icons.
-  Existing `Hud::toggle_dvalue` opens/closes implemented windows; Friends remains chat-owned. Knowledge's exact DValue is toggled and reflected in the icon, but its window consumer is not implemented (existing feature gap, not a fabricated substitute). Regression `hud::tests::native_mini_toolbar_setting_order_and_window_toggles` covers disabled default, enabled strip, native icon widths/contiguous order, all ten DValue actions, implemented-window membership and rollup criteria. No builds/tests/live checks were run by this worker.
+  Existing `Hud::toggle_dvalue` opens/closes implemented windows, including the Knowledge reference grid; Friends remains chat-owned. Regression `hud::tests::native_mini_toolbar_setting_order_and_window_toggles` covers disabled default, enabled strip, native icon widths/contiguous order, all ten DValue actions, implemented-window membership and rollup criteria.
 * **Mini-toolbar/Wear gap (bug23):** `ControlCenter.xml:15–23` places
   `CCMiniToolbar` immediately before `RollupControllerDock`, without a spacer
   or intervening top borders. Fresh GUI.dll layout `0x100724e8` caches the
@@ -490,7 +491,7 @@ absence of an enclosing solid backdrop.
 * `prefs/NewChar/*` is the install's new-character template, but its retail bootstrap consumer remains unestablished. DLL/EXE ASCII and UTF-16 searches found no `NewChar` string; traced `GetCharPrefsPath` **0x1006bacd**, `GetCharacterPath` **0x101245f9**, `Preferences::LoadCharPrefs` **0x101246af**, and `SetDefaultCharPrefs` **0x1012447a**. They establish the character-ID archive path, archive loading and registered defaults, not a NewChar-directory copy. Missing prerequisite: provenance of first-character preference creation (original launcher/installer bootstrap implementation or a pristine first-launch filesystem trace); this is not an undecoded preferences loader. The port's explicit template adoption is an intentional behavior, not proven retail parity. Arbitrary NewChar bar/hotbar frames are saved custom positions, not a screen-independent first-login layout. Pool bars use `SlotPlayerCharacterAlive` **0x1006afed**, compass **0x1006d433**, hotbar `(20,20)` **0x100d94e9**; character-owned frames override those origins and are clamped by `MoveInsideScreen`.
 * **Item inspection (bug 7):** `hud_stats/item_ui.rs` routes Shift-left-click and right-click on filled wear/grid cells, and inventory list rows, through `Hud::take_info_urls` to the existing chat InfoView (`Views/InfoView.xml`, `BrowserView`, Back/Forward; docs/chat/dialogs.md §1). URLs carry the runtime inventory identity from GC `FUN_10046d8e(slot)`, not a template ID or the entry's unresolved `id` words. The qualified click never arms drag or enters double-click use; missing slots produce no URL. Shift info signals are evidenced by `MultiListView_c` handler `FUN_10040a17` (§10.5); direct right-click inspection is the requested interaction, while the complete retail item popup remains unresolved. The inventory tab's **“i”** is the window-icon menu (`WndBorder::SlotIconButton` 0x1015a74e; `Event::FrameIcon`), not an item-information button; it is intentionally not rebound to inspect an arbitrary item. Regression `item_inspection_does_not_use_or_drag_inventory_and_wear` covers filled wear/grid/list routes and absence of outbound use/move messages; not run during this edit.
 
-Not done / UNRESOLVED: Knowledge window consumer of the mini toolbar; fade timer period (50 Hz assumed); label-only entry width; RollupArea page parenting / clip-flag setup (area containment is [INFERENCE], shared View clipping is traced, §10.8); alien bar default position; the compass / slider / hotbar gaps are listed in 10.1 – 10.3. Shots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac hud::tests` writes `hud-1280.png`, `hud-1920.png`, `compass-*.png`, `hud-aggdef-*.png`, `hud-hotbar*.png`.
+Not done / UNRESOLVED: fade timer period (50 Hz assumed); label-only entry width; RollupArea page parenting / clip-flag setup (area containment is [INFERENCE], shared View clipping is traced, §10.8); alien bar default position; the compass / slider / hotbar gaps are listed in 10.1 – 10.3. Shots: `AOMAC_SHOT_DIR=/tmp/x cargo test --release -p aomac hud::tests` writes `hud-1280.png`, `hud-1920.png`, `compass-*.png`, `hud-aggdef-*.png`, `hud-hotbar*.png`.
 
 ### 10.1 Compass (`play/hud_compass.rs`)
 * `CompassWindow_c` factory `FUN_1006d433` (GUI 0x1006d433; the dtor `FUN_1006d697` saves the window into the DValue `CompassWindowConfig`): `Window(Rect(0,0,0,0), "compass_window", style 3, flags 0xd3c)`, criteria `dvalue:cc_section1 && dvalue:cc_compass` (`CriteriaMonitor_c`, both true in `CharPrefs.xml`; `FUN_10067c45` shows / hides the window when the criteria flip), child `CompassView_c` (`FUN_100677b3`, 0x160 bytes). Position: `MoveTo(floor(screenW · (double)0.73f − Width(frame)/2), 5)` (`_PTR_101b45b0` = 0x3fe75c29_00000000, `_DAT_101a8b98` = 5.0; `Width` = inclusive extent 136), then `LoadWndConfig` (nothing saved on a first login) and `MoveInsideScreen`. Check: the install's template `prefs/NewChar/Prefs.xml` `CompassWindowConfig` `Rect(1800,5,1936,26)` is exactly this formula for a 2560 px screen (`floor(2560·0.73 − 68) = 1800`), so the template is *not* an extra input; per resolution: 1280 → x 866, 1920 → x 1333 (test `origin_follows_the_screen_width`).
@@ -1645,3 +1646,61 @@ Live acceptance is blocked by the user's PRK maintenance instruction.
 No login, leveling, character creation, perk train/reset, implant clinic
 session, combat nano cast or owned-pet command session was attempted in this
 sweep. Those server interactions must not be inferred from fixture results.
+
+### Knowledge references (`play/hud_knowledge.rs`)
+
+GUI `KnowledgeView_c` **0x100cefe4** constructs `knowledge_window`, title
+`Knowledge`, initially in `RollupArea`, and a plain `ItemListViewBase` with no
+added columns. `0x100d694e` / float **0x101bd710=167** supplies its initial
+inclusive extent. `MultiListView_c` **0x10136423** supplies icon extent47
+(48 pixels), borders6 (**0x101b5234**), spacing10 (**0x101a98e4**); the
+existing inventory grid arithmetic is reused. Unbounded48px grid background
+selection is **0x10134023**, art **0x11d**.
+
+Reference add/remove callbacks are **0x100ce591/0x100ce6f7**. Item references
+retain low/high/QL and inspect via the existing `itemref://` InfoView path;
+character references retain the complete dated HTML snapshot and use
+`charref://kind/id/html` (**0x100cea17**, also context callback **0x100ceafb**).
+The native item dummy allocator **GC0x10082a3d** uses identity kind **0xc788**,
+monotonic instances and deduplicated low/high/QL triples. Character icon
+selection is **GUI0x1003eb30**, art **0xb8**; missing item icons use native
+**0xb9**. Reference type3 adds badge **0x15c** (**0x1003f859**), placed bottom-left
+and scaled against48 pixels (**0x1003f2ea**, double **0x101b03f8=48**).
+
+Item drops copy reference data without moving inventory
+(**0x100ce811**); own-reference drags move only into empty cells, do not swap,
+and are rejected by shortcut bars (**0x100d8047**). Native drag cursor offset
+is16 (**0x100ce74e**, float **0x101b55e4**). The context menu
+**0x100cee16** reads `Look@Item` (**0x101bdf94**) and `DeleteReference`
+(**0x101bdf84**); delete calls **0x100ce9dc**. Qualified clicks inspect on
+release through the existing item-list info signal; double-click also inspects.
+
+`KnowledgeViewConfig` contains ordered `item_id` / `item_pos` pairs
+(save **0x100cebe2**, restore **0x100cecf1**); restore stops using saved
+positions after the first identity mismatch. The view participates in the
+shared Rollup/DockAreas persistence. `Preferences_t::OpenGamePrefs`
+**0x101248ff/0x10124971** initializes References with the character directory
+and load limit **20**; `InventoryGUIModule::SlotInitialize` **0x100c722f**
+loads it. Binary storage evidence and malformed-input checks are in
+`docs/formats.md`. Failed loads cannot overwrite an existing reference file.
+
+Regression `native_reference_grid_inspects_moves_deletes_and_restores` uses
+only in-memory GUI input and private preference files: native icon/badge art,
+release inspection, item-copy insertion, reference movement, immutable live
+dummy identities after deletion, snapshot/config reload, and preservation
+of a malformed file.
+
+**UNRESOLVED, not claimed fixed: MP_Ref_Icon/eighth inspect-cursor mode.**
+`InputConfig::FrameProcess` **0x1001ae14** checks modes **0x25..0x2c** and adds
+LOOKAT while Shift is held outside HelpMode; this includes reference mode
+**0x26**, but does not prove that Knowledge activates it. Fresh caller traces
+of `SetNonStaticInputMode` **0x10019b2e** find `NewGuiSpot::CheckHotSpot`
+**0x1001d7f7** (mode0x3f) and `MouseDetectorButton::CheckHotSpot`
+**0x1001f915** (variable mode). The latter's only constructor caller is legacy
+`ActionView_t` **0x100247cf** (mode2). `SetStaticInputMode`
+**0x10019b10** callers and scalar searches for **0x26** and direct flag
+offset **0x4a** reveal no Knowledge producer. The previous comment that
+Inventory implemented `MP_Ref_Icon` was false and is removed; no guessed
+Knowledge cursor activation is installed. Grid column-change reflow retains
+the existing inventory PositionMap rule, whose exact native ordering is
+still unresolved (`inv_grid.rs`, GUI `RecalcCellCount` **0x101349f6**).

@@ -82,6 +82,7 @@ impl ReferenceStore {
         }
     }
 
+    #[cfg(test)]
     pub fn parse(mut bytes: &[u8], max: usize) -> io::Result<Self> {
         Self::read(&mut bytes, max)
     }

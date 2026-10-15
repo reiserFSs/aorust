@@ -64,7 +64,7 @@ pub(super) fn store_of(kind: WindowKind) -> Option<Store> {
         WindowKind::Vehicle => Store::Value("MechSelectConfig"),
         WindowKind::Pet => Store::Value("PetWindowConfig"),
         WindowKind::Raid => Store::Value("RaidConfig"),
-        WindowKind::Inventory | WindowKind::Team | WindowKind::Ncu | WindowKind::Mission | WindowKind::Map | WindowKind::PlanetMap | WindowKind::Faction | WindowKind::Actions => {
+        WindowKind::Inventory | WindowKind::Team | WindowKind::Ncu | WindowKind::Knowledge | WindowKind::Mission | WindowKind::Map | WindowKind::PlanetMap | WindowKind::Faction | WindowKind::Actions => {
             Store::Dock(kind.dvalue())
         }
         _ => return None,
@@ -208,6 +208,7 @@ fn view_archive(identity: &str) -> Option<&'static str> {
         "stat_window" => "StatViewConfig",
         "team_view" => "TeamViewConfig",
         "ncu_window" => "NCUWindowConfig",
+        "knowledge_window" => "KnowledgeViewConfig",
         "mission_window" => "MissionViewConfig",
         "map_window" => "PFMapWindowConfig",
         "planetmap_window" => "PlanetMapViewConfig",

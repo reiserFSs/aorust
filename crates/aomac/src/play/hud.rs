@@ -42,6 +42,7 @@ pub enum WindowKind {
     PlanetMap,
     Nano,
     Ncu,
+    Knowledge,
     Mission,
     Friends,
     Team,
@@ -60,7 +61,7 @@ pub enum WindowKind {
 }
 
 impl WindowKind {
-    pub const ALL: [WindowKind; 20] = [
+    pub const ALL: [WindowKind; 21] = [
         WindowKind::Skills,
         WindowKind::Inventory,
         WindowKind::Character,
@@ -69,6 +70,7 @@ impl WindowKind {
         WindowKind::PlanetMap,
         WindowKind::Nano,
         WindowKind::Ncu,
+        WindowKind::Knowledge,
         WindowKind::Mission,
         WindowKind::Friends,
         WindowKind::Team,
@@ -94,6 +96,7 @@ impl WindowKind {
             WindowKind::PlanetMap => "planetmap_window",
             WindowKind::Nano => "nano_window",
             WindowKind::Ncu => "ncu_window",
+            WindowKind::Knowledge => "knowledge_window",
             WindowKind::Mission => "mission_window",
             WindowKind::Friends => "friends_window",
             WindowKind::Team => "team_view",
@@ -351,6 +354,9 @@ pub(super) struct Hud {
     /// Programs and NCU windows (`hud_nano.rs`, `hud_ncu.rs`).
     nano: HudNano,
     ncu: HudNcu,
+    knowledge: super::hud_knowledge::HudKnowledge,
+    pub(super) create_reference: bool,
+    create_reference_key: Option<u32>,
     target_ncu: super::hud_target_ncu::TargetNcu,
     notifications: super::hud_notification::Notifications,
     /// The options window (`options.rs`).
@@ -417,7 +423,7 @@ impl Hud {
         let texts = ao_formats::screens::TextDb::load(dir)?;
         let bar_titles = ["Health", "Nano", "Experience", "AlienExperience"].map(|k| texts.by_key(ao_formats::screens::CAT_GUI, k).unwrap_or_else(|| k.to_string()));
         let compass = Compass::new(gui, size).map_err(|e| eprintln!("hud: compass: {e:#}")).ok();
-        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), level_notice: Default::default(), help_button: Default::default(), tips: super::hud_tips::Tips::new(dir)?, bars: vec![], bar_titles, menu_roots, popup: None, menu_scripts: vec![], menu_camera: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, target_ncu: super::hud_target_ncu::TargetNcu::new(dir)?, notifications: super::hud_notification::Notifications::new(dir)?, options: HudOptions::new(dir, size)?, help_urls: vec![], mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), research_vehicle: super::hud_research_vehicle::HudResearchVehicle::new(dir)?, target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), bindings: Bindings::default(), fixed: FixedKeys::default(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None, wincfg: super::hud_wincfg::WinCfgs::new(dir) };
+        let mut hud = Hud { cc, size, dvalues: DValues::new(dir), level_notice: Default::default(), help_button: Default::default(), tips: super::hud_tips::Tips::new(dir)?, bars: vec![], bar_titles, menu_roots, popup: None, menu_scripts: vec![], menu_camera: None, open: vec![], stats: HudStats::new(dir, size)?, rollup: Rollup::new(dir, size), nano: HudNano::new(dir, size)?, ncu: HudNcu::new(dir, size)?, knowledge: super::hud_knowledge::HudKnowledge::new(dir)?, create_reference: false, create_reference_key: None, target_ncu: super::hud_target_ncu::TargetNcu::new(dir)?, notifications: super::hud_notification::Notifications::new(dir)?, options: HudOptions::new(dir, size)?, help_urls: vec![], mission: HudMission::new(dir, size)?, system_lines: vec![], map: HudMap::new(dir), winb: HudWinB::new(dir, size), research_vehicle: super::hud_research_vehicle::HudResearchVehicle::new(dir)?, target, shortcuts: vec![], actions: HudActions::new(dir), actwin: HudActionWin::new(dir, size), keys: KeyMap::default(), keys_src: String::new(), bindings: Bindings::default(), fixed: FixedKeys::default(), compass, aggdef: AggDef::default(), outbox: vec![], uses: vec![], click: None, wincfg: super::hud_wincfg::WinCfgs::new(dir) };
         hud.target.targets_target = hud.dvalues.flag("Targetstarget");
         hud.rollup.restore_docks(gui, &hud.wincfg.load_docks(&hud.dvalues));
         hud.fill_docks(gui);
@@ -824,6 +830,7 @@ impl Hud {
         v.append(&mut self.winb.team.info_urls);
         v.extend(self.actwin.take_info_urls());
         for bar in &mut self.shortcuts { v.extend(bar.take_info_urls()); }
+        v.extend(self.knowledge.take_urls());
         v
     }
     /// Native TipSystem event producer; parameters come from each retail callback.
@@ -850,16 +857,20 @@ impl Hud {
         self.target.draw_cursor(gui, zone, player, host, list, self.size, mode, dblclick, self.help_button.help_mode(), gui_item_hover);
     }
 
-    /// Whether the mouse sits over any of the GUI's 8 shift-to-inspect icon categories: `MP_Item_Icon` / `MP_Ref_Icon`
-    /// (Wear/Inventory, `HudStats::info_slot_at`), `MP_Spell_Icon` (Nano/Programs, NCU), `MP_Quest_Icon` (Mission),
-    /// `MP_Action_Icon` / `MP_Macro_Icon` (shortcut bar; this port has no separate macro-bar concept, dragged macros
-    /// render in the same shortcut slots). `MP_TradeItem_Icon` / `MP_ShopItem_Icon` are covered by `Interact::icon_hover_at`.
+    /// GUI icon categories currently represented by the HUD. `MP_Ref_Icon`
+    /// (mode 0x26) is not an alias of Inventory: Knowledge owns reference icons.
+    /// Its native mode producer remains unresolved (searched GUI 1001ae14,
+    /// 10019b2e/10019b10 callers and direct 0x4a writes), so do not guess one.
     pub(super) fn icon_hover_at(&self, gui: &Gui, zone: &Zone, x: f32, y: f32) -> bool {
         self.stats.info_slot_at(gui, zone, x, y).is_some()
             || self.nano.icon_at(gui, x, y)
             || self.ncu.icon_at(gui, x, y)
             || self.mission.icon_at(gui, x, y)
             || self.shortcuts.iter().any(|b| b.slot_at(gui, x, y).is_some())
+    }
+
+    pub(super) fn add_character_reference(&mut self, kind: u32, id: u32, html: Vec<u8>) {
+        self.knowledge.add_character(kind, id, html, &mut self.dvalues);
     }
 
     pub(super) fn take_uses(&mut self) -> Vec<SlotUse> {
@@ -1028,6 +1039,7 @@ impl Hud {
         }
         self.start_nano_drag(gui);
         self.ncu.update(gui, zone, _dt);
+        self.knowledge.update(gui, &mut self.stats);
         self.target_ncu.update(gui, &mut self.dvalues, &mut self.wincfg, zone, self.size, _dt);
         self.notifications.update(gui, &mut self.dvalues, &mut self.wincfg, self.size, _dt);
         self.outbox.extend(self.nano.take_outbox());
@@ -1138,12 +1150,16 @@ impl Hud {
         self.actwin.input(gui, ev, &self.actions.list, mods, &mut self.shortcuts);
         self.uses.extend(self.actwin.take_uses());
         self.nano.input(gui, ev, mods);
+        self.knowledge.input(gui, ev, mods, &mut self.dvalues);
         self.mission.input(gui, ev, mods);
         self.start_nano_drag(gui);
         // item drag and drop between the wear window and the inventory (hud_stats/item_ui.rs)
         self.stats.input(gui, zone, ev, mods);
         let mut unclaimed = Vec::new();
         for (slot, x, y) in self.stats.take_drops() {
+            if let Some(entry) = zone.inventory.get(&slot)
+                && self.knowledge.drop_item(gui, entry.item, x, y, &mut self.dvalues)
+            { continue; }
             let info = zone.inventory.get(&slot).and_then(|e| self.stats.item_info(gui, e.item.low_id));
             let claimed = info.is_some_and(|(name, icon)| self.shortcuts.iter_mut().any(|bar| bar.drop_item(gui, slot, &name, icon, x, y)));
             if !claimed {
@@ -1359,6 +1375,10 @@ impl Hud {
             }
             return true;
         }
+        if self.knowledge.event(gui, ev, self.size, &mut self.dvalues) {
+            if self.knowledge.take_closed() { self.close_kind(gui, WindowKind::Knowledge); }
+            return true;
+        }
         if self.options.event(gui, ev, &mut self.dvalues) {
             if self.options.take_closed() {
                 self.close_kind(gui, WindowKind::Options);
@@ -1567,6 +1587,7 @@ impl Hud {
         if HudNcu::handles(kind) {
             self.ncu.open(gui);
         }
+        if kind == WindowKind::Knowledge { self.knowledge.open(gui, &mut self.rollup); }
         if HudOptions::handles(kind) {
             self.options.open(gui, &self.dvalues);
         }
@@ -1609,6 +1630,10 @@ impl Hud {
         }
         if HudNcu::handles(kind) {
             self.ncu.close(gui);
+        }
+        if kind == WindowKind::Knowledge {
+            self.knowledge.close(gui, &mut self.dvalues);
+            self.rollup.close_page(gui, kind.dvalue());
         }
         if HudOptions::handles(kind) {
             self.options.close(gui, &mut self.dvalues);
@@ -1691,6 +1716,7 @@ impl Hud {
     /// (`wear_window` ... = 1) opened and the others closed; a first login keeps the NewChar template's set.
     pub(super) fn prefs_loaded(&mut self, gui: &mut Gui) {
         let Some(chr) = self.dvalues.char_dir().map(Path::to_path_buf) else { return };
+        self.knowledge.load(&self.dvalues);
         for (n, bar) in self.shortcuts.iter_mut().enumerate() {
             bar.load_contents(gui, &ao_gui::client_dir(), &chr, n);
         }
@@ -1716,6 +1742,7 @@ impl Hud {
         self.wincfg.detach_all(gui, &mut self.dvalues);
         self.wincfg.save_docks(&mut self.dvalues, &self.rollup.dock_states(gui));
         self.target_ncu.close(gui);
+        self.knowledge.close(gui, &mut self.dvalues);
         self.notifications.close(gui);
         if let Some(chr) = self.dvalues.char_dir() {
             for (n, bar) in self.shortcuts.iter().enumerate() {
