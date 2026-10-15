@@ -404,7 +404,18 @@ mod tests {
             }
             assert_eq!(net.attempts, u32::from(enabled));
             assert_eq!(net.session.is_some(), enabled);
-            match listener.accept() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let accepted = loop {
+                match listener.accept() {
+                    Err(error) if enabled && error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    result => break result,
+                }
+            };
+            match accepted {
                 Ok(_) => assert!(enabled, "replay created an outbound socket"),
                 Err(error) => {
                     assert!(!enabled);
