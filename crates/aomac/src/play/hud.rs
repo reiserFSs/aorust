@@ -1278,7 +1278,7 @@ impl Hud {
         for k in self.keys.lookup(input) {
             match k {
                 HudKey::Window(kind) => self.toggle(gui, kind),
-                HudKey::SocialWindow(name) => self.toggle_dvalue(gui, name),
+                HudKey::ModuleWindow(name) => self.toggle_dvalue(gui, name),
                 HudKey::CreateReference => self.create_reference_key = Some(input),
                 HudKey::BarActive(n) => {
                     if let Some(s) = self.shortcuts.iter_mut().find(|s| s.is_active()) {
@@ -2441,6 +2441,36 @@ mod tests {
         s.hud.sync_options(&mut s.gui);
         assert_eq!(s.hud.shortcuts.iter().map(|b| b.window).collect::<Vec<_>>(), windows);
         assert!(windows.iter().all(|&w| s.gui.window_visible(w)));
+    }
+
+    #[test]
+    fn module_hotkeys_reach_real_shortcut_and_tradeskill_consumers() {
+        let Some((mut s, _)) = shot((1280, 800)) else { return };
+        let shortcut = super::super::controls::provider_hash("WINDOW_SHORTCUTBAR");
+        let tradeskill = super::super::controls::provider_hash("WINDOW_TS");
+        s.hud.dvalues.set("KeyBindings", super::super::dvalue::Variant::Archive(format!("<Archive name=\"KeyBindings\" code=\"0\"><Int32 name=\"Version\" value=\"7\"/><Array name=\"Bind\"><Archive code=\"0\"><Int32 name=\"Input\" value=\"43\"/><Int64 name=\"Provider\" value=\"{shortcut}\"/></Archive><Archive code=\"0\"><Int32 name=\"Input\" value=\"44\"/><Int64 name=\"Provider\" value=\"{tradeskill}\"/></Archive></Array></Archive>")));
+        s.hud.dvalues.set_i64("shortcutbar_window", 1);
+        s.hud.dvalues.set_i64("tradeskill_window", 0);
+        s.hud.sync_options(&mut s.gui);
+        let windows: Vec<_> = s.hud.shortcuts.iter().map(|b| b.window).collect();
+        let contents = s.hud.bar_slot_names(0);
+        s.hud.hot_input(&mut s.gui, 43);
+        s.hud.sync_options(&mut s.gui);
+        assert!(!s.hud.dvalue("shortcutbar_window"));
+        assert!(windows.iter().all(|&w| !s.gui.window_visible(w)));
+        s.hud.hot_input(&mut s.gui, 43);
+        s.hud.sync_options(&mut s.gui);
+        assert!(windows.iter().all(|&w| s.gui.window_visible(w)));
+        assert_eq!(s.hud.bar_slot_names(0), contents);
+        let mut ui = super::super::interact_tradeskill::TradeskillUi::default();
+        s.hud.hot_input(&mut s.gui, 44);
+        ui.sync(&mut s.gui, &mut s.hud.dvalues, (1280, 800));
+        let window = ui.window().expect("native TradeskillPanel consumer");
+        assert!(s.gui.has_view(window, "BuildButton"));
+        assert!(s.gui.has_view(window, "TradeskillSlider"));
+        s.hud.hot_input(&mut s.gui, 44);
+        ui.sync(&mut s.gui, &mut s.hud.dvalues, (1280, 800));
+        assert!(ui.window().is_none());
     }
 
     /// The bar tooltip titles are `LDBface::GetText(0x2710, key)` of the keys in `FUN_100666b6`…`FUN_100669f7`, `Targetstarget` is read from `LoginPrefs.xml`.

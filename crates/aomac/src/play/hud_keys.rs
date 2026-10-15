@@ -13,8 +13,8 @@ use super::options::keys::{Bindings, FixedKeys};
 pub(super) enum HudKey {
     /// `WINDOW_*`: toggles the window.
     Window(WindowKind),
-    /// A window owned by the social module rather than Hud.
-    SocialWindow(&'static str),
+    /// A module window driven by its DValue rather than a Hud-owned WindowKind.
+    ModuleWindow(&'static str),
     /// GUI 10068119: request a saved character reference.
     CreateReference,
     /// `SHORTUCT_BAR_ACTIVE_n` (default: the digit keys): use slot `n` of the active bar (`FUN_100d7cef`).
@@ -53,7 +53,9 @@ const SLOTS: usize = 10;
 /// Provider hash -> what the HUD does.
 fn providers() -> Vec<(u32, HudKey)> {
     let mut v: Vec<(u32, HudKey)> = WINDOW_PROVIDERS.iter().map(|(n, k)| (provider_hash(n), HudKey::Window(*k))).collect();
-    v.push((provider_hash("WINDOW_LFT"), HudKey::SocialWindow("lft_window")));
+    v.push((provider_hash("WINDOW_LFT"), HudKey::ModuleWindow("lft_window")));
+    v.push((provider_hash("WINDOW_SHORTCUTBAR"), HudKey::ModuleWindow("shortcutbar_window")));
+    v.push((provider_hash("WINDOW_TS"), HudKey::ModuleWindow("tradeskill_window")));
     v.push((provider_hash("ACTION_CREATEREF"), HudKey::CreateReference));
     for b in 0..BARS {
         v.push((provider_hash(&format!("SHORTUCT_BAR_ACTIVE_{b}")), HudKey::BarActive(b)));
@@ -140,8 +142,19 @@ mod tests {
     }
 
     #[test]
+    fn module_window_and_function_key_row_bindings_resolve() {
+        let table = providers();
+        for (provider, name) in [("WINDOW_SHORTCUTBAR", "shortcutbar_window"), ("WINDOW_TS", "tradeskill_window")] {
+            assert_eq!(table.iter().find(|(p, _)| *p == provider_hash(provider)).map(|(_, key)| *key), Some(HudKey::ModuleWindow(name)));
+        }
+        let row = provider_hash("SHORTUCT_BAR_ROW_7");
+        let archive = format!("<Archive name=\"KeyBindings\" code=\"0\"><Int32 name=\"Version\" value=\"7\"/><Array name=\"Bind\"><Archive code=\"0\"><Int32 name=\"Input\" value=\"43\"/><Int64 name=\"Provider\" value=\"{row}\"/></Archive></Array></Archive>");
+        assert_eq!(map(&archive).lookup(43), [HudKey::BarRow(7)], "F5 physical key routes to the saved row provider");
+    }
+
+    #[test]
     fn lft_provider_resolves_to_existing_social_window() {
-        assert_eq!(providers().into_iter().find(|(p, _)| *p == provider_hash("WINDOW_LFT")).map(|(_, key)| key), Some(HudKey::SocialWindow("lft_window")));
+        assert_eq!(providers().into_iter().find(|(p, _)| *p == provider_hash("WINDOW_LFT")).map(|(_, key)| key), Some(HudKey::ModuleWindow("lft_window")));
     }
 
     /// A saved archive rebinding the Inventory window to J and a hotbar slot to F5 replaces the defaults it names (any key, not only letters); unknown providers are ignored.
