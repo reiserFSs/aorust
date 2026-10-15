@@ -792,7 +792,7 @@ mod tests {
         };
         renderer.add_actor_model(1, &scene);
         let before = capture(&mut renderer, 1);
-        assert!(before.chunks_exact(4).any(|p| p[0] > 180 && p[1] < 100), "textured quad must actually render");
+        assert!(before.as_chunks::<4>().0.iter().any(|p| p[0] > 180 && p[1] < 100), "textured quad must actually render");
         let uploads = renderer.actor_texture_uploads();
         renderer.add_actor_model(2, &scene);
         assert_eq!(renderer.actor_texture_uploads(), uploads + 1, "only model-local white placeholder uploads");

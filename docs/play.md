@@ -187,7 +187,7 @@ actual counts. Without this override preferences remain authoritative; without
 `AOMAC_PERF`, `AOMAC_PERF_MSAA` has no effect. The equivalent live preference step is
 `option=AomacEdgeSmoothing:0` for 1x or `option=AomacEdgeSmoothing:2` for 4x.
 
-### Recorded single-pass comparison (2026-10-15)
+### Recorded single-pass comparison (2026-10-16)
 
 Baseline: `e6c45f9` plus the measurement harness above. Each cell is the median of
 three independent 600-frame ICC capture replays after 120 warmup frames, 1280×800,
@@ -227,6 +227,40 @@ the replay camera-ready marker, outside the runs used for these numbers.
 
 Live measurements are deferred: PRK maintenance, with login explicitly prohibited
 until Main announces recovery. No window, desktop input or desktop capture was used.
+
+### Recorded shared-resource comparison (2026-10-16)
+
+Items 11/12 were measured together, but are independent commits: native texture
+sharing and `Arc<Scene>` handoff. The exact baseline is `6e8269c`; both sides were
+built in the same worktree/target directory. Same camera, warmup, dimensions and
+three-run medians as above. This shared-Mac observation demonstrates a small device
+allocation reduction, **not a measured frame-time or zone-load speedup**:
+
+| Configuration | Frame p50 / p95 (ms) | Thread CPU mean (ms) | Metal allocated (MiB) | RSS at report (MiB) | Zone ready (s) |
+|---|---:|---:|---:|---:|---:|
+| Before resources, 1× | 4.7399 / 5.3364 | 2.3079 | 452.05 | 713.12 | 5.587 |
+| Shared resources, 1× | 5.4520 / 6.8850 | 2.6470 | 451.22 | 694.28 | 6.406 |
+| Before resources, 4× | 4.8552 / 6.3800 | 2.3711 | 452.59 | 707.06 | 5.712 |
+| Shared resources, 4× | 5.5302 / 7.8823 | 2.8283 | 451.73 | 697.47 | 6.512 |
+
+| Calling-thread CPU stage mean (ms) | Before 1× | After 1× | Before 4× | After 4× |
+|---|---:|---:|---:|---:|
+| Update | 0.0431 | 0.0497 | 0.0453 | 0.0542 |
+| Frontend | 1.2061 | 1.3256 | 1.2170 | 1.4030 |
+| Upload | 0.1758 | 0.2063 | 0.1846 | 0.2234 |
+| Render encoding/submission | 0.6568 | 0.7864 | 0.6930 | 0.8484 |
+| GUI encoding/submission | 0.0889 | 0.1122 | 0.0954 | 0.1235 |
+| Completion wait CPU | 0.1357 | 0.1605 | 0.1435 | 0.1759 |
+
+After replay: 139 unique retained actor textures, 15,887,292 encoded mip bytes,
+180 cumulative actor texture uploads (includes generated images and placeholders).
+The deterministic two-model regression proves one native texture upload is shared,
+exact rendered RGBA is unchanged, generated images never alias, differing decoded
+texture families/policies do not alias, mutable mesh updates remain isolated, and
+the last model releases the allocation. The Arc regression proves the upload queue
+retains the original scene allocation rather than copying decoded geometry/RGBA.
+These structural results are independent of noisy end-to-end timings.
+
 ## Social/economy coverage inventory (2026-10-15)
 
 This sweep is headless only: no application windows, desktop input or screenshots. Live verification is blocked by the user's confirmed PRK maintenance; no login attempts are permitted until explicitly resumed. Existing captures remain evidence only for the particular exchanges they contain, not for new live acceptance.
