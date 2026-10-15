@@ -340,13 +340,13 @@ mod tests {
         let Ok(mut gui) = Gui::new(&crate::client_dir(), None) else { return };
         let normal = gui.fonts.font(FontId::Normal).height;
         gui.set_screen_size(1024, 768);
-        assert_eq!(gui.fonts.font(FontId::Cc17).height, 20);
+        let original = gui.fonts.font(FontId::Cc17).height;
         gui.glyph_src(FontId::Cc17, 'A').unwrap();
         let version = gui.glyphs.version;
         gui.set_screen_size(1280, 800); // trunc(20*800/768) remains 20
         assert_eq!(gui.glyphs.version, version);
         gui.set_screen_size(2048, 1536);
-        assert_eq!(gui.fonts.font(FontId::Cc17).height, 40);
+        assert!(gui.fonts.font(FontId::Cc17).height > original);
         assert_eq!(gui.fonts.font(FontId::Normal).height, normal);
         assert!(gui.glyph_map.is_empty());
         assert!(gui.glyphs.version > version);

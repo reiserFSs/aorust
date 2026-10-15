@@ -151,6 +151,10 @@ pub struct FontSystem {
     cc17_height: i32,
 }
 
+fn cc17_lf_height(display_height: u32) -> i32 {
+    (20.0 * (display_height as f32 / 768.0)) as i32
+}
+
 impl FontSystem {
     /// `verdana_dir` holds `Verdana.ttf`, `Verdana Bold.ttf`, `Verdana Italic.ttf`.
     pub fn new(client_cd: &Path, gfx: &GfxSet, verdana_dir: Option<&Path>) -> Result<Self> {
@@ -194,7 +198,7 @@ impl FontSystem {
 
     /// FontSystem ctor 1012efab..1012efdb: scale the table's 20px cell by display height.
     pub fn set_display_height(&mut self, height: u32) -> Result<bool> {
-        let lf = (20.0 * (height as f32 / 768.0)) as i32;
+        let lf = cc17_lf_height(height);
         if lf == self.cc17_height {
             return Ok(false);
         }
@@ -518,6 +522,13 @@ impl OutlinePen for Flatten {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cc17_requested_height_uses_native_display_ratio_and_truncation() {
+        assert_eq!(cc17_lf_height(768), 20);
+        assert_eq!(cc17_lf_height(800), 20);
+        assert_eq!(cc17_lf_height(1536), 40);
+    }
 
     fn dump(g: &Glyph) -> String {
         let mut s = String::new();
