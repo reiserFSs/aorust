@@ -819,6 +819,13 @@ impl Chat {
             }
         }
         match (a.kind, a.button) {
+            // GUI 0x100b33ef: literal "terminate", null target identity (not the selected character).
+            (dialog::Kind::Terminate, 0) => {
+                if let Some(z) = zone {
+                    let payload = n3::textcmd::fanatic(z.char_id as i32, 0, Identity::default(), "terminate");
+                    self.outbox.push(n3::outgoing::n3_frame(0, z.char_id, payload));
+                }
+            }
             (dialog::Kind::OrgLeave, 0) => self.outbox.extend(zone.map(|z| zonecmd::org_confirmed(z.char_id, true, Self::target_identity(z)))),
             (dialog::Kind::OrgDisband, 0) => self.outbox.extend(zone.map(|z| zonecmd::org_confirmed(z.char_id, false, Self::target_identity(z)))),
             (dialog::Kind::Afk, 0) => {
@@ -1195,6 +1202,10 @@ impl Chat {
                 let ok = texts.by_key(10000, "MsgBox_OK").unwrap_or_else(|| "OK".into());
                 self.dialog(gui, dialog::Kind::MessageBox, t, vec![ok], None);
             }
+            ChatAction::Terminate => {
+                let body = texts.by_key(10000, "WarningTerminate").unwrap_or_default();
+                self.dialog(gui, dialog::Kind::Terminate, body, Self::yes_no(texts), None);
+            }
             ChatAction::AfkPrompt { default, body } => self.dialog(gui, dialog::Kind::Afk, body, vec!["Ok".into()], Some(default)),
             ChatAction::Camp => self.game.push(GameAction::Camp),
             ChatAction::SelectSelf => self.game.push(GameAction::SelectSelf),
@@ -1308,6 +1319,40 @@ mod tests {
         assert_eq!(c.last_tell_from.as_deref(), Some("Bob"));
         c.remember_reply_sender("Alice");
         assert_eq!(c.last_tell_from.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn terminate_command_confirms_before_sending_native_fanatic_request() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        let texts = TextDb::load(&client).unwrap();
+        let zone = Zone { char_id: 0x1234, target: Some(77), ..Default::default() };
+        let mut c = Chat::new(false);
+        c.screen = (1280, 800);
+        for button in [Some("btn1"), None, Some("btn0")] {
+            c.run_line(&mut gui, "/terminate", &zone, &texts);
+            assert!(c.outbox.is_empty(), "opening confirmation must not send");
+            let win = c.dialogs.windows().next().expect("terminate confirmation");
+            assert_eq!(gui.text(win, "text"), texts.by_key(10000, "WarningTerminate").unwrap());
+            let event = match button {
+                Some(view) => Event::Clicked { window: win, view: view.into(), item: None },
+                None => Event::Escape { window: win },
+            };
+            assert!(c.event(&mut gui, &event, &zone, &texts));
+            assert!(!c.dialogs.is_open());
+            if button != Some("btn0") {
+                assert!(c.outbox.is_empty(), "No and Escape must not send");
+            }
+        }
+        let frames = c.take_outbox();
+        assert_eq!(frames.len(), 1);
+        let mut payload = n3::outgoing::message_key("FanaticIIR_t").to_be_bytes().to_vec();
+        payload.extend([0, 0, 0xc3, 0x50, 0, 0, 0x12, 0x34, 0]); // own identity, passed-on zero
+        payload.extend([0; 12]); // window zero, null target identity (not selected target 77)
+        payload.extend(9i32.to_be_bytes());
+        payload.extend(b"terminate");
+        assert_eq!(frames[0], n3::outgoing::n3_frame(0, zone.char_id, payload));
     }
 
     #[test]

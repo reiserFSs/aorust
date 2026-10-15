@@ -122,6 +122,8 @@ pub enum ChatAction {
     TipOfTheDay { prev: bool },
     /// `/messagebox <text>` (`FUN_100b7a6f`): a `DialogBox_c` with one OK button; the text is `%`-expanded.
     MessageBox(String),
+    /// `/terminate` (GUI 0x100b345e): confirmation before the Fanatic termination request.
+    Terminate,
     /// `/camp`: AFCM 0x134 = `FlowControlModule_t::StartQuitToLoginMessage` (GUI 0x10027c74).
     Camp,
     /// `/quit`: AFCM 0x133 = `StartQuitToSystemMessage` (GUI 0x10029a0d).
@@ -259,6 +261,7 @@ enum Kind {
     DValue,
     Tip,
     MessageBox,
+    Terminate,
     /// `/text`: local info line.
     Text,
     /// `/funcom`: local info line.
@@ -387,11 +390,11 @@ const GLOBAL_CMDS: &[Cmd] = &[
     c("/anim", 2, Kind::Anim),
     c("/emote", 2, Kind::Emote),
     // FUN_100b39f6: handler GUI 0x100b30cf = Fanatic::ClientInterface_c::Command (`Kind::Fanatic`); /tower 0x100b314f; /command 0x100b379b,
-    // /gfx 0x100b3258, /terminate 0x100b345e, /reloadgfxtweak 0x100b3317, /togglegroundlightingfix 0x100b30ad are GUI-local (not decoded).
+    // /gfx 0x100b3258, /reloadgfxtweak 0x100b3317, /togglegroundlightingfix 0x100b30ad are GUI-local (not decoded).
     c("/command", 4, Kind::Client),
     c("/gfx", 3, Kind::Client),
     c("/tower", 2, Kind::Tower),
-    c("/terminate", 2, Kind::Client),
+    c("/terminate", 2, Kind::Terminate),
     c("/getfull", 2, Kind::Fanatic),
     c("/anon", 2, Kind::Fanatic),
     c("/stuck", 2, Kind::Fanatic),
@@ -775,6 +778,7 @@ fn run(cmd: &Cmd, line: &str, t: &[String], ctx: &CmdCtx) -> Vec<ChatAction> {
     let n = t.len();
     let x = |i: usize| expand(&t[i], ctx);
     match cmd.kind {
+        Kind::Terminate => vec![ChatAction::Terminate],
         Kind::Ch => {
             if n != 2 {
                 return usage(ctx, &t[0], " &lt;group name&gt;");

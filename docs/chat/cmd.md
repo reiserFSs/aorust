@@ -100,7 +100,8 @@ Global map (`FUN_100badf1` 0x100badf1..0x100bbc30; handler address in the 2nd co
 | `/<emote>` (70 names, `EMOTES`) | 1 | 0x100b2aba | same; with argc 1 the token is the whole line so `/wave now` does nothing (faithful quirk) |
 | `/anon /stuck /list /shop /teleport /tp /monster /npc /spawn /reload /weather /perks /perk /gethash /item /dumphash /framerate /lazyreload /spawnacgentrance /spawnquest /syncdisplay /teleportdynel /getfull` | 2 | 0x100b30cf | `Fanatic::ClientInterface_c::Command(window, target, line without slash)` = `FanaticIIR_t` (not `N3Msg_TextCommand`; line NOT expanded) |
 | `/tower` | 2 | 0x100b314f | `create` (and `terminate` on a tower target) -> Fanatic; everything else `N3Msg_TextCommand(line)` (unexpanded) |
-| `/command /gfx /terminate /reloadgfxtweak /togglegroundlightingfix` | | 0x100b379b / 0x100b3258 / 0x100b345e / 0x100b3317 / 0x100b30ad | developer tools (§5 of dialogs.md): not implemented -> `ClientCommand` |
+| `/terminate` | 2 | 0x100b345e | `ChatAction::Terminate`: confirmation `WarningTerminate` / Yes / No; result 0 → callback 0x100b33ef → `FanaticIIR_t(window, {0,0}, "terminate")` (dialogs.md §2.2) |
+| `/command /gfx /reloadgfxtweak /togglegroundlightingfix` | | 0x100b379b / 0x100b3258 / 0x100b3317 / 0x100b30ad | developer tools (§5 of dialogs.md): not implemented -> `ClientCommand` |
 | `/rp` `/reclaim` | | 0x100b21dd / 0x100b21ca | `ChatAction::Rp` / `Reclaim`: `CharacterActionIIR_t` 0xa6 / 0x6d,0x6e (docs/chat/dialogs.md §6) |
 
 ### `/g` `/group` `/ch` group matching (`FUN_10083814`)
@@ -322,7 +323,7 @@ The earlier `ChatCmd::PrivJoin/PrivPart` ids (0x33/0x34) were wrong and are corr
 
 ## Gaps / guesses
 
-* The GM debug commands, `/terminate`, `/command`, `/gfx` are not decoded (see the tables). `/pet`, `/tower`, `/follow` are decoded; open inputs: pet script runner, district fight-mode level, vehicle `vtbl[0x90]`, `rename` default target (see their sections).
+* The GM debug commands `/command`, `/gfx` are not decoded (see the tables). `/terminate` is decoded through its confirmation and Fanatic sender (dialogs.md §2.2). `/pet`, `/tower`, `/follow` are decoded; open inputs: pet script runner, district fight-mode level, vehicle `vtbl[0x90]`, `rename` default target (see their sections).
 * The engine target used by `OrgClientIIR_c` (`+0x5c`) is taken to be the GUI target; the colour of `Feedback_*` lines (code 0 through GlobalSignals+0x17c); case-insensitivity of the
   org/raid sub-word maps; the key/value roles of the `/cc info` forward map.
 * The `/<cmd> help` redirect condition and the keys marked `*` in `HELP_TOPICS` (org, pet, chat, team, misc, list, perk, raid share their string with another literal; inferred from chatcommands.html).

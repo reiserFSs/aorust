@@ -10,6 +10,8 @@ pub enum Kind {
     MessageBox,
     /// GlobalSignals+0x184 -> GuiSystem_c::ShowMessageBox (GUI100304df/1002f852).
     Information,
+    /// `/terminate` (GUI 0x100b345e): Yes (0) -> callback 0x100b33ef.
+    Terminate,
     /// `/org leave` (`OrganizationGUIModule_c::LeaveOrg` 0x10052568): Yes (0) -> `LeaveOrgConfirmed` 0x10052032.
     OrgLeave,
     /// `/org disband` (`OpenDisbandDialog` 0x100520dd): Yes (0) -> `DisbandDialogClosed` 0x10051ffc.
@@ -146,7 +148,7 @@ fn xml(spec: &Spec) -> String {
     match spec.kind {
         // (the bug report is a `DialogBox_c` with the text and two buttons, 0x1002aa28)
         // `DialogBoxView_c` 0x1012aa23: text borders (15, 5, 15, 20) = `_DAT_101b00e0 / _DAT_101a8b98 / _DAT_101b00e0 / _DAT_101b4e08`
-        Kind::Information | Kind::MessageBox | Kind::OrgLeave | Kind::OrgDisband | Kind::OrgInvitation(_) | Kind::OrgPromotion(_) | Kind::OrgLeavePayTax(_) | Kind::OrgTaxChangeLeave | Kind::BugReport | Kind::DuelReceived | Kind::DuelSent | Kind::StartPvp(_) => {
+        Kind::Information | Kind::MessageBox | Kind::Terminate | Kind::OrgLeave | Kind::OrgDisband | Kind::OrgInvitation(_) | Kind::OrgPromotion(_) | Kind::OrgLeavePayTax(_) | Kind::OrgTaxChangeLeave | Kind::BugReport | Kind::DuelReceived | Kind::DuelSent | Kind::StartPvp(_) => {
             format!("<root><View view_layout=\"vertical\">{}{}</View></root>", text("text", "Rect(15,5,15,20)"), button_row(&spec.buttons))
         }
         // `FUN_10082a6f`: form borders (15, 10, 15, 15) (`_DAT_101b00e0 / _DAT_101a98e4`), body bottom border 10, countdown, input
@@ -193,7 +195,7 @@ impl Dialogs {
 
     /// `DialogBox_c::Go` + `Window::MoveToCenter`.
     pub fn go(&mut self, gui: &mut Gui, screen: (u32, u32), spec: &Spec) {
-        let name = if spec.kind == Kind::Information { "Information" } else { "DialogBox" };
+        let name = if spec.kind == Kind::Information { "Information" } else if spec.kind == Kind::Terminate { "Terminate" } else { "DialogBox" };
         let Ok(win) = gui.open_framed_window_xml(name, &xml(spec), (0, 0), WindowSize::Preferred) else { return };
         gui.set_text(win, "text", &spec.body);
         if let Some(i) = &spec.input {

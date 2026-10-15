@@ -140,6 +140,7 @@ Esc / frame close answer -1.
 | `/messagebox <text>` | `FUN_100b7a6f`: no argument → `Usage: /messagebox <message>` (0x51); else `DialogBox_c(0, "", ExpandChatTextArgs(token1), GetText(10000,"MsgBox_OK"))`, `Go`, `MoveToCenter` | body = the expanded text; button `MsgBox_OK` | none |
 | `/org leave` | `OrganizationGUIModule_c::LeaveOrg` 0x10052568 (signal from the `/org` text command, `Local::OrgLeaveDialog`) | cat 10000 `ReallyLeaveOrg` (body), `Warning`, buttons `MsgBox_Yes`, `MsgBox_No` (index 0 = Yes). Which of `ReallyLeaveOrg` / `Warning` is the title and which the body is **not read** (stack order of the by-value argument): body = `ReallyLeaveOrg` | Yes → `LeaveOrgConfirmed` 0x10052032 → `N3Msg_OrgLeaveConfirmed` (Gamecode 0x1001a7c1): `OrgClientIIR_c` code **0x10**, id `{0,0}`, empty text |
 | `/org disband` | `OpenDisbandDialog` 0x100520dd (`Local::OrgDisbandDialog`), window name `OrgDisband` | cat **501** (0x1f5) `Org_ConfirmDisband` (body), `MsgBox_Yes` / `MsgBox_No` | Yes → `DisbandDialogClosed` 0x10051ffc → `N3Msg_OrgDisbandConfirmed` (Gamecode 0x1001a611): `OrgClientIIR_c` code **6**, id = the engine target (`FUN_10058816()+0x5c`, [INFERENCE] = GUI target), empty text, flag 0 |
+| `/terminate` | `FUN_100b345e`, window name `Terminate`, centred | category 10000 `WarningTerminate`; buttons `MsgBox_Yes` (0), `MsgBox_No` (1) | `FUN_100b33ef`: only 0 sends Fanatic command `terminate` with target `{0,0}`; No / Esc / close send nothing (§2.2) |
 
 Other `DialogBox_c` users seen (not chat-command reachable, not ported here): `OpenLeavePayTaxQuery` 0x1005221d, `OpenTaxChangeLeaveQuery` 0x100523d1, `OpenPromotionDialog` 0x100526e6 (`ConfirmPromotion`),
 `OpenInvitationDialog` 0x10052978 (`OrgJoin`), `ConfirmUseItemDialogue` 0x1003012f, `StartPvPFightDialogue` 0x1002fa8e, duel dialogs (`DuelChallengeReceivedResult` 0x1002f802), `GuiSystem_c::ShowMessageBox` 0x1002f852 ("Information").
@@ -156,6 +157,14 @@ Keys inside the input (`FUN_10082f50`, key codes 0x18 / 0xe): 0x18 → answer 0,
 * index ≠ 0 (Esc): `SetAFK("")` and the line `AFK off.` (hard-coded).
 
 Both after `/afk` already switched AFK on with the default message (cmd.md §`/afk`; the `AFK_AFKOn` line and the `/me` announcement are not undone by Esc). Port: `dialog::Kind::Afk`, `Chat::answer`.
+
+## 2.2 `/terminate` death confirmation
+
+GUI `100b345e` creates `DialogBox_c` named `Terminate` (`101bb2c8`). Assembly resolves the three category-10000 lookups: `100b34b4` loads `MsgBox_No` (`101aee54`), `100b34e9` loads `MsgBox_Yes` (`101aee60`), and `100b3512` loads body `WarningTerminate` (`101bb2b4`). The constructor's reverse stack order puts Yes first. At `100b3571` the callback address is **`100b33ef`**, connected by `100b42ec`; `100b3583` centres the window, and `100b358b` passes the originating chat window's `+0x1ec` integer through `Variant` to `Go`.
+
+Callback `100b33ef` accepts only result **0** (`100b33ff` / `100b3402`). It constructs literal lowercase `terminate` (`101bb260`), zeroes **both target identity words** (`100b342e` / `100b3431`), converts the saved window with `Variant::AsInt32` (`100b3434`), and calls **`Fanatic::ClientInterface_c::Command`** (`100b343b`). This is **not a Gamecode `CharacterActionIIR_t` death action** and must not be replaced by an invented one. Fanatic.dll `10001066` gets the control-dynel identity via virtual `+0x1c` and sends `FanaticIIR_t`; constructor `10001187`, writer `10001112`: own-character header, passed-on 0, then `i32 window`, null target identity, `i32 9`, bytes `terminate` (no terminator).
+
+Port: `ChatAction::Terminate` → existing `Dialogs` / `Kind::Terminate` → `Chat::answer`, using `textcmd::fanatic`. The existing single chat-window wire id is 0 (as for other Fanatic commands); the selected target is deliberately ignored. `terminate_command_confirms_before_sending_native_fanatic_request` exercises the real command, No, Escape and Yes through `Chat::event`, checks the localized body and the complete exact frame including own and null target identities. Added but not executed by this worker.
 
 ## 3. `/camp`, `/quit`, `/open` `/close` `/toggle`
 
@@ -191,7 +200,7 @@ Regressions: `trade_escape_policy_is_captured_at_open`, `shop_escape_policy_is_c
 `FUN_100b24e4` third loop (0x100b272c) uses `stat:gmlevel & 0x0001` for `/clone /criterialocal /damagemult /joycamacc /spelllocal /resetskill`. Further GM checks sit inside `FUN_1003fba6` (`N3Msg_GetSkill(0xd7,2)`).
 The Fanatic group (`/anon /stuck /list /shop /teleport /tp /monster /npc /spawn /reload /weather /perks /perk /gethash /item /dumphash /framerate /lazyreload /spawnacgentrance /spawnquest /syncdisplay /teleportdynel /getfull`),
 `/command` (0x100b379b, `Fanatic::ClientInterface_c::Command` with an identity from `t <id> <id2>`; "Error: Invalid ID." / "Error: To few arguments."), `/gfx enable|disable <n>` (0x100b3258 → `N3Msg_EnableGFX`),
-`/fxscript <script> [params] #` (0x100b6acf → `SignalFXSScript`), `/terminate` (0x100b345e, a `"Terminate"` window) are developer tools: no GM string at their registration, but they act on debug/GM-only subsystems; not implemented.
+`/fxscript <script> [params] #` (0x100b6acf → `SignalFXSScript`) remains unimplemented. `/terminate` is the ordinary death-confirmation flow (§2.2), not an unimplemented developer tool.
 
 ## 6. Every GUI-local row of `GLOBAL_CMDS`
 
@@ -221,7 +230,8 @@ The Fanatic group (`/anon /stuck /list /shop /teleport /tp /monster /npc /spawn 
 | `/selectself` | 0x100b593a: `AFCM::Send(0x1e, 0x126, own id)` = `TargetingModule_t::SetTargetMessage` → `SetTarget(own, false)` (client-local, nothing is sent to the server, docs/gui.md §13.2) | **done**: `GameAction::SelectSelf` sets `zone.target` (combat/glue.rs) |
 | `/bug <text>` | 0x100b5a2a: the **whole line** ("/bug " included) must be ≥ 20 bytes, else "Bug description to short. Should be at least 20 characters." (0x51); `AFCM::Send(10, 0x121, ExpandChatTextArgs(line))` → `FlowControlModule_t::SetBugReportStringMessage` 0x1002aa28: `DialogBox_c` "BugReport", body = text.mdb 5000 `BugReport_ReportMsgH` + the text, buttons 10000 `MsgBox_OK` / `MsgBox_Cancel`; callback `SendBugReportResult` 0x1002a028: OK → `BugReport_t::SendUserMadeBugReport` (Interfaces 0x1000f931: **SMTP mail** `Client-<n>` → `ingamebugs@anarchy-online.com` via `bugreport.funcom.com:7501`, "BUG: <first line>" + `GenerateReport` system report) → system line 5000 `BugReport_Sent` / `BugReport_SendFailed`, Cancel → `BugReport_SendCancelled`. (`DebugReportBugMessage` 0x10029f41, AFCM 0x72: "To report a bug use the  /bug <explain the bug>  chat command…") | **done up to the transmission**: dialog + texts + result line are ported; the mail is **deliberately not sent** (Funcom's mail server is not PRK's, the report would leak the player's text and system data to a third party): the result line is `BugReport_SendFailed`, as the original shows when the mail server is unreachable |
 | `/assist` | 0x100b7bc5 | done elsewhere (combat) |
-| `/command` `/gfx` `/terminate` `/fxscript` | see §5 | developer tools, not implemented |
+| `/terminate` | 0x100b345e → callback 0x100b33ef | implemented: localized Yes / No death confirmation; Yes sends `FanaticIIR_t("terminate")` with null target identity (§2.2) |
+| `/command` `/gfx` `/fxscript` | see §5 | developer tools, not implemented |
 
 ## 7. Verification
 
