@@ -39,6 +39,9 @@ const COL_REMAINING: u32 = 0xf;
 /// GUI `FUN_100cf72a`: `_DAT_101bd710=167`, `_DAT_101bdfa4=112`.
 const CLIENT: (u32, u32) = (167, 112);
 
+/// GlobalSignals+158 carries the quest identity as well as position/playfield.
+pub(super) type Marker = (ao_net::msg::Identity, Option<(u32, [f32; 2])>);
+
 pub(super) struct HudMission {
     store: Option<RecordStore>,
     texts: TextDb,
@@ -58,7 +61,9 @@ pub(super) struct HudMission {
     lines: Vec<String>,
     press: Option<i32>,
     last_click: Option<(i32, f32)>,
-    marker: Option<(u32, [f32; 2])>,
+    marker: Option<Marker>,
+    marker_source: Option<ao_net::msg::Identity>,
+    waypoint_lines: Vec<(String, u32)>,
     /// The quest the open popup belongs to.
     popup: Option<i32>,
     built: Option<(u32, i64, Mode, usize)>,
@@ -93,6 +98,8 @@ impl HudMission {
             press: None,
             last_click: None,
             marker: None,
+            marker_source: None,
+            waypoint_lines: vec![],
             popup: None,
             built: None,
         })
@@ -155,9 +162,29 @@ impl HudMission {
         }
     }
 
-    /// The marker `Upload2Map` emitted (`GlobalSignals+0x158`): playfield and world X / Z.
-    pub(super) fn take_marker(&mut self) -> Option<(u32, [f32; 2])> {
+    /// Pending GlobalSignals+158/+15c: quest identity, and a location or removal.
+    pub(super) fn take_marker(&mut self) -> Option<Marker> {
         self.marker.take()
+    }
+
+    pub(super) fn waypoint_changed(&mut self, marker: Option<(u32, [f32; 2])>, source: Option<ao_net::msg::Identity>, current_pf: Option<u32>, announce: bool) {
+        self.marker_source = source;
+        if !announce { return; }
+        let keys: &[&str] = match marker {
+            Some((0, _)) | None => &["NoWptInfo"],
+            Some((pf, _)) if Some(pf) == current_pf => &["MissionWptUploaded", "MissionShownAsDot"],
+            Some(_) => &["MissionWptUploaded", "MissionNotInArea"],
+        };
+        let color = if marker.is_some_and(|m| m.0 != 0) { 16 } else { 12 };
+        for key in keys {
+            if let Some(text) = self.texts.by_key(CAT_GUI, key) {
+                self.waypoint_lines.push((text, color));
+            }
+        }
+    }
+
+    pub(super) fn take_waypoint_lines(&mut self) -> Vec<(String, u32)> {
+        std::mem::take(&mut self.waypoint_lines)
     }
 
     fn text(&self, key: &str) -> String {
@@ -186,6 +213,9 @@ impl HudMission {
     /// (SetMainDynel10019f77). GUI100c69e2 forwards an empty tip payload.
     fn on_quests(&mut self, q: &n3::world::QuestFullUpdate) -> std::iter::RepeatN<(&'static str, &'static str)> {
         let count = if q.quests.len() == q.quest_count {
+            if let Some(source) = self.marker_source.filter(|source| self.quests.iter().any(|old| old.id == *source) && !q.quests.iter().any(|new| new.id == *source)) {
+                self.marker = Some((source, None));
+            }
             self.quests = q.quests.clone();
             self.serial += 1;
             if q.flag != 0 { q.quests.len() } else { 0 }
@@ -237,6 +267,9 @@ impl HudMission {
     /// Quest removal actions update the canonical Zone list without a full-list packet.
     pub(super) fn sync_removed(&mut self, zone: &Zone) {
         let previous = self.quests.len();
+        if let Some(source) = self.marker_source.filter(|source| self.quests.iter().any(|old| old.id == *source) && !zone.quests.contains_key(source)) {
+            self.marker = Some((source, None));
+        }
         self.quests.retain(|q| zone.quests.contains_key(&q.id));
         if self.quests.len() != previous {
             self.serial += 1;
@@ -323,8 +356,10 @@ impl HudMission {
             POPUP_LOOK => self.look(key),
             POPUP_MAP => {
                 // `FUN_100d2409`: the marker of the quest's first action position
-                if let Some(p) = self.quest(key).and_then(Quest::world_pos) {
-                    self.marker = Some((p.playfield.instance as u32, [p.local[0], p.local[2]]));
+                if let Some(q) = self.quest(key) {
+                    if let Some(p) = q.world_pos() {
+                        self.marker = Some((q.id, Some((p.playfield.instance as u32, [p.local[0], p.local[2]]))));
+                    }
                 }
             }
             POPUP_TEAM => {
@@ -446,6 +481,34 @@ mod tests {
     }
 
     #[test]
+    fn waypoint_feedback_and_removal_retain_native_quest_identity() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/text").exists() { return; }
+        let mut m = HudMission::new(&dir, (1024, 768)).unwrap();
+        let q = quest(9, "Marker", 0, 0);
+        let marker = Some((4605, [12.0, 34.0]));
+        m.waypoint_changed(marker, Some(q.id), Some(4605), true);
+        let text = |key| m.texts.by_key(CAT_GUI, key).expect("native waypoint text");
+        let uploaded = text("MissionWptUploaded");
+        let shown = text("MissionShownAsDot");
+        let elsewhere = text("MissionNotInArea");
+        let missing = text("NoWptInfo");
+        assert_eq!(m.take_waypoint_lines(), [(uploaded.clone(), 16), (shown, 16)]);
+        m.waypoint_changed(marker, Some(q.id), Some(1), true);
+        assert_eq!(m.take_waypoint_lines(), [(uploaded, 16), (elsewhere, 16)]);
+        m.quests = vec![q.clone()];
+        m.sync_removed(&Zone::new(7));
+        assert_eq!(m.take_marker(), Some((q.id, None)));
+        m.waypoint_changed(None, Some(q.id), Some(4605), false);
+        assert!(m.take_waypoint_lines().is_empty(), "+15c removal has no +158 feedback");
+        m.waypoint_changed(None, None, Some(4605), true);
+        assert_eq!(m.take_waypoint_lines(), [(missing, 12)]);
+        m.quests = vec![q];
+        m.sync_removed(&Zone::new(7));
+        assert!(m.take_marker().is_none(), "a manual waypoint no longer belongs to the old quest");
+    }
+
+    #[test]
     fn remaining_cell_uses_native_hours_and_minutes_without_centisecond_overflow() {
         for (seconds, text) in [(0, "00:00"), (59, "00:00"), (60, "00:01"), (3599, "00:59"), (3600, "01:00"), (360_061, "100:01"), (u32::MAX, "1193046:28")] {
             assert_eq!(remaining(seconds), text);
@@ -518,7 +581,7 @@ mod tests {
         // Upload2Map: the first action's playfield and position
         m.popup = Some(1);
         m.picked(&mut gui, &zone, POPUP_MAP);
-        assert_eq!(m.take_marker(), Some((4605, [123.5, 678.25])));
+        assert_eq!(m.take_marker(), Some((m.quests[0].id, Some((4605, [123.5, 678.25])))));
         // UpdateTeamMembers: sent for the quest
         m.popup = Some(2);
         m.picked(&mut gui, &zone, POPUP_TEAM);

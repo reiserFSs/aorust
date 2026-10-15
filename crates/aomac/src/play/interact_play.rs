@@ -91,9 +91,9 @@ impl Play {
                 chat.show_url(&mut self.gui, &self.zone, &self.text, &url);
             }
         }
-        if let Some(marker) = i.mission.take_marker() {
+        if let Some((quest, marker)) = i.mission.take_marker() {
             if let Some(hud) = self.hud.as_mut() {
-                hud.set_mission(Some(marker));
+                hud.set_mission(Some(marker), Some(quest), self.zone.playfield);
             }
         }
         for f in i.take_outbox() {

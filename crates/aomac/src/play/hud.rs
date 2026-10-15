@@ -603,6 +603,10 @@ impl Hud {
         std::mem::take(&mut self.system_lines)
     }
 
+    pub(super) fn take_waypoint_lines(&mut self) -> Vec<(String, u32)> {
+        self.mission.take_waypoint_lines()
+    }
+
     pub(super) fn take_equipment_feedback(&mut self) -> Option<&'static str> {
         self.stats.take_equipment_feedback()
     }
@@ -1031,8 +1035,8 @@ impl Hud {
         self.mission.update(gui, _dt);
         self.outbox.extend(self.mission.take_outbox());
         self.system_lines.extend(self.mission.take_lines());
-        if let Some(m) = self.mission.take_marker() {
-            self.set_mission(Some(m));
+        if let Some((quest, marker)) = self.mission.take_marker() {
+            self.set_mission(marker, Some(quest), zone.playfield);
         }
         self.map.update(gui, zone, _dt);
         self.winb.update(gui, zone, _dt);
@@ -1626,7 +1630,9 @@ impl Hud {
 
     /// The `/waypoint` marker (`GlobalSignals+0x158`): the Planet Map's mission button (`hud_map::HudMap::set_mission`) and the compass marker
     /// (`FUN_100670f8`) read the same value.
-    pub(super) fn set_mission(&mut self, marker: Option<(u32, [f32; 2])>) {
+    pub(super) fn set_mission(&mut self, marker: Option<(u32, [f32; 2])>, source: Option<ao_net::msg::Identity>, current_pf: Option<u32>) {
+        self.mission.waypoint_changed(marker, source, current_pf, marker.is_some() || source.is_none());
+        let marker = marker.filter(|m| m.0 != 0);
         self.map.set_mission(marker);
         if let Some(c) = &mut self.compass {
             c.set_waypoint(marker.map(|(playfield, [x, z])| super::hud_compass::Waypoint { playfield, pos: [x, 0.0, z] }));

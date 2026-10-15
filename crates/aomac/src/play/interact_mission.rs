@@ -26,7 +26,7 @@ pub(super) struct MissionUi {
     grab: Option<(usize, f32)>,
     pub(super) info_click: bool,
     urls: Vec<String>,
-    marker: Option<(u32, [f32; 2])>,
+    marker: Option<(Identity, (u32, [f32; 2]))>,
     popup: Option<i32>,
     dialogs: Dialogs<()>,
     screen: (u32, u32),
@@ -159,7 +159,7 @@ impl MissionUi {
             if matches!(*id, LOOK | MAP) {
                 if let Some(q) = self.popup.take().and_then(|k| self.alternatives.as_ref()?.missions.iter().find(|a| a.quest.id.instance == k)).map(|a| &a.quest) {
                     if *id == LOOK { self.urls.push(format!("itemid://{}/{}", q.id.kind, q.id.instance)); }
-                    else if let Some(p) = q.world_pos() { self.marker = Some((p.playfield.instance as u32, [p.x as f32, p.z as f32])); }
+                    else if let Some(p) = q.world_pos() { self.marker = Some((q.id, (p.playfield.instance as u32, [p.local[0], p.local[2]]))); }
                 }
                 return Some(vec![]);
             }
@@ -169,7 +169,7 @@ impl MissionUi {
             gui.set_enabled(win, "accept", true);
             self.list.paint(gui, win, lv::ICON_32);
             if let Some(q) = self.alternatives.as_ref().and_then(|a| a.missions.iter().find(|a| a.quest.id.instance == key)).map(|a| &a.quest) {
-                if let Some(p) = q.world_pos() { self.marker = Some((p.playfield.instance as u32, [p.x as f32, p.z as f32])); }
+                if let Some(p) = q.world_pos() { self.marker = Some((q.id, (p.playfield.instance as u32, [p.local[0], p.local[2]]))); }
                 match hit {
                     // GUI 100d0adf connects list+0x2e4 to 100cf975 (ShowURL).
                     // Shared InventoryList handler 10040a17 emits info for qualifier mask 3 (Shift).
@@ -261,7 +261,7 @@ impl MissionUi {
     pub(super) fn take_urls(&mut self) -> Vec<String> { std::mem::take(&mut self.urls) }
     #[cfg(test)]
     pub(super) fn window(&self) -> Option<WindowId> { self.win }
-    pub(super) fn take_marker(&mut self) -> Option<(u32, [f32; 2])> { self.marker.take() }
+    pub(super) fn take_marker(&mut self) -> Option<(Identity, (u32, [f32; 2]))> { self.marker.take() }
 }
 #[cfg(test)]
 mod tests {

@@ -1782,7 +1782,7 @@ impl Frontend for Play {
         }
         if let Some(rq) = self.chat.as_mut().map(|c| c.take_requests()) {
             if let (Some(w), Some(h)) = (rq.waypoint, self.hud.as_mut()) {
-                h.set_mission(Some(w));
+                h.set_mission(Some(w), None, self.zone.playfield);
             }
             if let (Some(m), Some(h)) = (&rq.macro_drag, self.hud.as_mut()) {
                 h.begin_macro_drag(&mut self.gui, m.id, &m.name, &m.command);
@@ -1831,6 +1831,9 @@ impl Frontend for Play {
             }
             for key in h.take_nano_feedback() {
                 c.feedback(&mut self.gui, key, &self.text);
+            }
+            for (line, color) in h.take_waypoint_lines() {
+                c.system_line(&mut self.gui, &line, color);
             }
             for n in h.take_casts() {
                 c.cast_nano(&mut self.gui, &self.zone, &self.text, n);
