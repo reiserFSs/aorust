@@ -42,8 +42,6 @@ const PF_SCALE_ROOMS: f32 = 1.0;
 const DOT_RANGE: f32 = 500.0;
 /// New planet map tiles decoded per frame.
 const TILES_PER_FRAME: usize = 6;
-/// Stat `MapNavigation` (140): UNRESOLVED guess for what turns the own dot into the heading arrow (the map upgrades of the help text).
-const STAT_MAP_NAVIGATION: u32 = 140;
 
 const RUBIKA_INDEX: &str = "Normal/PlanetMapIndexNormal.txt";
 const SHADOWLANDS_INDEX: &str = "Shadowlands/ShadowlandsMap.txt";
@@ -479,14 +477,10 @@ impl HudMap {
                 }
             }
             let s = to_screen(pos[0], pos[2]);
-            // UNRESOLVED: what turns the own marker from the yellow dot (help text *The Map Window*) into the arrow: the own-marker draw of `PFMapRenderer_c` was not
-            // found (`FUN_100ea626` draws the list entries, type 9 = ?); we keep the guess that map upgrades (stat MapNavigation) do
-            if zone.stat(STAT_MAP_NAVIGATION).is_some_and(|v| v != 0) {
-                if let Some(id) = p.arrow(gui, yaw.unwrap_or(0.0)) {
-                    items.push(CanvasItem::Image { id, src: [0.0, 0.0, 16.0, 16.0], dst: [s[0].floor() - 8.0, s[1].floor() - 8.0, s[0].floor() + 8.0, s[1].floor() + 8.0], alpha: 1.0 });
-                }
-            } else {
-                items.push(CanvasItem::Solid { dst: [s[0].floor() - 2.0, s[1].floor() - 2.0, s[0].floor() + 2.0, s[1].floor() + 2.0], color: 0xffff00, alpha: 1.0 });
+            // GUI100eb216→100e92ef: MapData+81 selects the arrow, set unconditionally
+            // by100425eb after the first map-character poll; MapNavigation is not read.
+            if let Some(id) = p.arrow(gui, yaw.unwrap_or(0.0)) {
+                items.push(CanvasItem::Image { id, src: [0.0, 0.0, 16.0, 16.0], dst: [s[0].floor() - 8.0, s[1].floor() - 8.0, s[0].floor() + 8.0, s[1].floor() + 8.0], alpha: 1.0 });
             }
         }
         gui.set_canvas(p.window, "map", items);
@@ -756,8 +750,8 @@ mod tests {
             let pos = some_floor(&s);
             own_at(&mut s, pf, pos, 0.6);
             png(&mut s, &mut o, &format!("map-{tag}"));
-            // a map upgrade (stat MapNavigation) turns the dot into the heading arrow
-            s.zone.stats.insert(STAT_MAP_NAVIGATION, 1);
+            // Both map-navigation values use the native heading marker after polling.
+            s.zone.stats.insert(140, 1);
             png(&mut s, &mut o, &format!("map-{tag}-upgraded"));
         }
     }
@@ -773,6 +767,20 @@ mod tests {
         s.zone.stats.insert(585, 1 << 15);
         png(&mut s, &mut o, "map-owned-by-area-bit");
         assert!(s.map.pf.as_ref().unwrap().available);
+    }
+
+    #[test]
+    fn own_heading_arrow_does_not_require_map_navigation() {
+        let Some((mut s, _)) = shot() else { return };
+        own_at(&mut s, 4582, [10.0, 0.0, 10.0], 0.0);
+        s.map.open(&mut s.gui, &mut s.rollup, WindowKind::Map);
+        for navigation in [0, 1, 100] {
+            s.zone.stats.insert(140, navigation);
+            s.map.update(&mut s.gui, &s.zone, 0.0);
+            let p = s.map.pf.as_ref().unwrap();
+            assert!(!p.arrows.is_empty(), "MapData+81 is set even at MapNavigation={navigation}");
+            assert!(s.gui.canvas_items(p.window, "map").iter().any(|item| matches!(item, CanvasItem::Image { id, .. } if p.arrows.values().any(|arrow| arrow == id))));
+        }
     }
 
     /// First open on an unmapped playfield (ICC beach 4582): the view starts in the middle of the map, not at its north-west corner.
