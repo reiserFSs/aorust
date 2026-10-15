@@ -821,6 +821,7 @@ mod tests {
         if !dir.join("cd_image/gui").exists() { return; }
         let mut gui = Gui::new(&dir, None).unwrap();
         let mut bar = ShortcutBar::new(&mut gui, &dir, 0, (1280, 800)).unwrap();
+        bar.slots.fill(None); // This fixture's third cell must be empty, unlike the native first-login defaults.
         let slot = |id: u32| Slot { kind: ao_net::n3::nano::NANO_KIND as u32, instance: id, name: id.to_string(), icon: None, text: String::new() };
         bar.slots[0] = Some(slot(1));
         bar.slots[1] = Some(slot(2));
