@@ -294,12 +294,12 @@ mod tests {
         actions.open(&mut gui, &mut rollup);
         let mut list = SpecialList::new();
         list.sync_equipment(&[(0x800, -1)], 0);
-        list.feed_recharge(0x94, 30, 0);
+        list.sync_recharge([super::super::hud_special::Recharge { action: 0x94, total: 30, remaining: 29 }].into_iter(), std::iter::empty());
         actions.update(&mut gui, &list, 0.0, (false, true));
         let window = actions.win.as_ref().unwrap().win;
         let cell = actions.shown().iter().position(|id| *id == 0x14123).unwrap();
         let label = format!("lv_icon_label{cell}");
-        assert_eq!(gui.text(window, &label), super::super::hud_special::timer_text(30));
+        assert_eq!(gui.text(window, &label), super::super::hud_special::timer_text(29));
         let (x, y) = actions.cell_centre(&gui, cell).unwrap();
         let frame = gui.view_rect(window, &label).unwrap();
         assert!((frame.l + frame.r - 2.0 * x + 1.0).abs() <= 1.0);

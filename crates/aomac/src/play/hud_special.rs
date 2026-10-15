@@ -80,12 +80,15 @@ pub struct Entry {
     pub shown: u32,
     /// Template supplied by `GC 10042e16` for dynamically registered actions.
     pub registered_template: Option<u32>,
+    /// Native +0x1c; bit 0 marks an action disabled independently of its progress timer.
+    pub flags: u32,
 }
 
 impl Entry {
     pub fn template(&self) -> Option<u32> {
         self.registered_template.or_else(|| template_of(self.shown))
     }
+
 }
 
 /// What the own character is doing: the inputs of the toggles (`FUN_1006d196` movement-mode switch, `FUN_10068b7f` / `FUN_100593d3` fight
@@ -112,14 +115,15 @@ pub fn recharge_time(action: u32, duration: i32, pct: i32) -> i32 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Recharge {
     pub action: u32,
-    pub total: f32,
-    pub remaining: f32,
+    pub total: i32,
+    pub remaining: i32,
 }
 
 #[derive(Default)]
 pub struct SpecialList {
     entries: Vec<Entry>,
     recharge: Vec<Recharge>,
+    perk_recharge: Vec<Recharge>,
     /// `(old template, new template)` of every identity change (`FUN_10042c40` emits it on GlobalSignals): hotbar slots follow it.
     changes: Vec<(u32, u32)>,
 }
@@ -143,7 +147,8 @@ impl SpecialList {
     /// `FUN_10042c9f`: an entry for `action` (skipped when the map has no template or the action is listed already).
     fn add(&mut self, action: u32, alt: u32) {
         if template_of(action).is_some() && !self.entries.iter().any(|e| e.key == action) {
-            self.entries.push(Entry { key: action, alt, shown: action, registered_template: None });
+            let flags = u32::from(action > 0x8d && self.recharge.iter().any(|lock| lock.action == action));
+            self.entries.push(Entry { key: action, alt, shown: action, registered_template: None, flags });
         }
     }
 
@@ -153,7 +158,8 @@ impl SpecialList {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.key == action) {
             entry.registered_template = Some(template);
         } else {
-            self.entries.push(Entry { key: action, alt: 0, shown: action, registered_template: Some(template) });
+            let flags = u32::from(action > 0x8d && self.recharge.iter().any(|lock| lock.action == action));
+            self.entries.push(Entry { key: action, alt: 0, shown: action, registered_template: Some(template), flags });
         }
     }
 
@@ -172,7 +178,7 @@ impl SpecialList {
 
     /// The toggles for the own state, in the order of the DLL's events: movement mode (`FUN_1006d196`: sneak end `FUN_1003b5f3` -> 0x4f, sneak
     /// start `FUN_1003b59b` -> 0x13, sit 0x4c / stand 0x4d, walk 0x11 / run 0x12 -- while sitting, sneaking or frozen the last speed mode
-    /// decides), fight (0xb start / 0x4e stop), camp (0x51 / 0x52). Crawl (mode 5: 0x14, leaving 0x8d) is an [INFERENCE] from the sneak pair.
+    /// decides), fight (0xb start / 0x4e stop), camp (0x51 / 0x52). Crawl enter / leave are GC1006e646 / 1006e3ff.
     pub fn apply_state(&mut self, s: OwnState) {
         use super::movement::mode;
         let speed = |l: &mut Self| l.show_other(if s.last_speed_walk { 0x11 } else { 0x12 });
@@ -242,34 +248,37 @@ impl SpecialList {
         }
     }
 
-    /// The own stat `0x17e` read by [`recharge_time`] (`FUN_1006389c` [GC]: `GetStat(0x17e, 0)`).
-    pub const STAT_RECHARGE_PCT: u32 = 0x17e;
-
-    /// A relayed `CharacterActionIIR_t` action `0x14` of the own character: `identity_b = {kind: action, instance: duration}` (case 2 of the apply
-    /// switch `FUN_1005d0d8`, handler [GC 0x1005e2cd] -> `FUN_100655d3`). A record of that action is *extended* by the adjusted duration (total and
-    /// remaining), otherwise a new `{action, total, remaining}` is made (`FUN_10064a6e`); the duration is the unit [`SpecialList::progress`] counts
-    /// down in (seconds, as `FUN_10064301` splits it into h:m:s). `pct` = stat `0x17e`.
-    pub fn feed_recharge(&mut self, action: u32, duration: i32, pct: i32) {
-        let t = recharge_time(action, duration, pct) as f32;
-        match self.recharge.iter_mut().find(|r| r.action == action) {
-            Some(r) => {
-                r.total += t;
-                r.remaining += t;
-            }
-            None => self.recharge.push(Recharge { action, total: t, remaining: t }),
-        }
-    }
-
-    pub fn tick(&mut self, dt: f32) {
-        for r in &mut self.recharge {
-            r.remaining -= dt;
-        }
-        self.recharge.retain(|r| r.remaining > 0.0);
+    /// Project the authoritative native lock vectors; the Zone owns their shared second-pulse clock.
+    /// Skill locks are keyed by Stat_e; perk locks have already been resolved through catalogue word 4.
+    pub fn sync_recharge(&mut self, skill: impl Iterator<Item = Recharge>, perks: impl Iterator<Item = Recharge>) {
+        self.recharge.clear();
+        self.recharge.extend(skill);
+        self.perk_recharge.clear();
+        self.perk_recharge.extend(perks);
     }
 
     /// `N3Msg_GetActionProgress` [GC 0x100275f7]: `(remaining / total, remaining seconds)` while recharging.
     pub fn progress(&self, action: u32) -> Option<(f32, i32)> {
-        self.recharge.iter().find(|r| r.action == action).map(|r| (r.remaining / r.total, r.remaining.ceil() as i32))
+        let locks = if action >= 1000 { &self.perk_recharge } else if action >= 0x8e { &self.recharge } else { return None };
+        locks.iter().find(|r| r.action == action).map(|r| (r.remaining as f32 / r.total as f32, r.remaining))
+    }
+
+    /// GC1003f0c3 / 1003f065 update every entry currently showing this action.
+    pub fn set_disabled(&mut self, action: u32, disabled: bool) {
+        for entry in self.entries.iter_mut().filter(|entry| entry.shown == action) {
+            if disabled { entry.flags |= 1; } else { entry.flags &= !1; }
+        }
+    }
+
+    /// GC1003f156: stat-lock membership takes precedence for 142..999; otherwise perk-lock
+    /// membership or the entry's flag word disables the action. Expiry is not tested here.
+    pub fn disabled(&self, action: u32) -> bool {
+        if (0x8e..1000).contains(&action) {
+            self.recharge.iter().any(|lock| lock.action == action)
+        } else {
+            self.perk_recharge.iter().any(|lock| lock.action == action)
+                || self.entries.iter().any(|entry| entry.shown == action && entry.flags != 0)
+        }
     }
 }
 
@@ -297,7 +306,7 @@ mod tests {
     fn initial_list_shows_the_first_action_of_each_toggle() {
         let l = SpecialList::new();
         assert_eq!(shown(&l), [3, 1, 0xb, 0x4c, 0x11, 0x13, 0x51, 0x14, 0x86]);
-        assert_eq!(l.entries[2], Entry { key: 0xb, alt: 0x4e, shown: 0xb, registered_template: None });
+        assert_eq!(l.entries[2], Entry { key: 0xb, alt: 0x4e, shown: 0xb, registered_template: None, flags: 0 });
     }
 
     /// Sit shows Stand, release shows Sit; a hotbar slot holding Sit follows the queued change and the change is queued once.
@@ -351,10 +360,8 @@ mod tests {
         assert_eq!(recharge_time(0x11, 7, -10), 6, "7 - 0.7 + 0.5 = 6.8, truncated");
         assert_eq!(recharge_time(0x11, 100_000_000, 50), 107_050_327, "native IMUL wraps before conversion to double");
         let mut l = SpecialList::new();
-        l.feed_recharge(0x88, 30, 0);
-        l.tick(10.0);
-        l.feed_recharge(0x88, 30, 0);
-        assert_eq!(l.progress(0x88), Some((50.0 / 60.0, 50)));
+        l.sync_recharge([Recharge { action: 0x88, total: 60, remaining: 50 }].into_iter(), std::iter::empty());
+        assert_eq!(l.progress(0x88), None, "Search's stat lock is not an icon action-progress timer");
     }
 
     /// Recharge: unavailable while a record exists, progress is `remaining / total`, the icon timer text is seconds below a minute.
@@ -363,16 +370,38 @@ mod tests {
         let mut l = SpecialList::new();
         l.sync_equipment(&[(0x800, -1)], 0);
         assert_eq!(l.progress(0x94), None);
-        l.feed_recharge(0x94, 20, 0);
-        l.tick(5.0);
+        l.sync_recharge([Recharge { action: 0x94, total: 20, remaining: 15 }].into_iter(), std::iter::empty());
         assert_eq!(l.progress(0x94), Some((0.75, 15)));
-        l.tick(10.0);
+        l.sync_recharge([Recharge { action: 0x94, total: 20, remaining: 5 }].into_iter(), std::iter::empty());
         assert_eq!(l.progress(0x94), Some((0.25, 5)));
-        l.tick(6.0);
+        l.sync_recharge(std::iter::empty(), std::iter::empty());
         assert_eq!(l.progress(0x94), None);
         assert_eq!(timer_text(5), " 5s");
         assert_eq!(timer_text(60), "60s");
         assert_eq!(timer_text(61), " 1m");
         assert_eq!(timer_text(150), " 2m");
+    }
+
+    #[test]
+    fn native_lock_ranges_and_entry_flags_are_independent_of_timer_text() {
+        let mut list = SpecialList::new();
+        list.register(10111, 213010);
+        list.sync_recharge(
+            [Recharge { action: 141, total: 10, remaining: 5 }, Recharge { action: 142, total: 10, remaining: 5 },
+                Recharge { action: 999, total: 10, remaining: 5 }, Recharge { action: 10111, total: 99, remaining: 98 }].into_iter(),
+            [Recharge { action: 999, total: 50, remaining: 40 }, Recharge { action: 10111, total: 30, remaining: 29 }].into_iter(),
+        );
+        assert_eq!(list.progress(141), None);
+        assert_eq!(list.progress(142), Some((0.5, 5)));
+        assert_eq!(list.progress(999), Some((0.5, 5)));
+        assert_eq!(list.progress(10111), Some((29.0 / 30.0, 29)), "perk identity resolves through catalogue action, not the stat-lock vector");
+        list.set_disabled(10111, true);
+        list.set_disabled(142, true);
+        list.sync_recharge(std::iter::empty(), std::iter::empty());
+        assert!(list.disabled(10111), "native perk lock sets the entry flag independently");
+        assert!(!list.disabled(142), "stat-range actions ignore entry flags when their lock expires");
+        assert_eq!(list.progress(10111), None, "flag-only disability never fabricates a zero-second timer");
+        list.set_disabled(10111, false);
+        assert!(!list.disabled(10111));
     }
 }

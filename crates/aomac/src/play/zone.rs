@@ -91,6 +91,13 @@ pub enum TeleportEvent {
 /// at GC 0x10157500 is also the 30 m radius of `N3Msg_GetDynelsInVicinity`).
 pub const TELEPORT_TIMEOUT: f32 = 30.0;
 
+/// Ordered native special-action registrations and entry-flag changes.
+pub enum SpecialActionEvent {
+    Register(u32, u32),
+    Action(u32, bool),
+    Perk(u32, bool),
+}
+
 #[derive(Default)]
 pub struct Zone {
     pub char_id: u32,
@@ -105,6 +112,8 @@ pub struct Zone {
     pub research: std::collections::BTreeMap<i32, [i32; 3]>,
     /// Native Locks_t vector, FullCharacter +0x28; unknown until its server snapshot.
     pub skill_locks: Option<Vec<ao_net::n3::world::GroupEntry>>,
+    /// Perk-manager lock vector, FullCharacter +0x2c; unrelated to learned/research timers.
+    pub perk_locks: Vec<ao_net::n3::world::GroupEntry>,
     pub lock_second: f32,
     /// Inverse Root BoundingBoxTargeting Variant; native default true means triangles default off.
     pub triangle_targeting: bool,
@@ -176,11 +185,8 @@ pub struct Zone {
     /// The fight controller target of every dynel (`SimpleChar+0x1d4`, `+0x4c/+0x50`, set by the relayed `AttackIIR_t`, cleared by
     /// `StopFightIIR_t`; `N3Msg_GetTargetTarget` GC 0x1001641d reads it): fighter → its target instance id.
     pub fight_target: HashMap<i32, i32>,
-    /// `(action, duration)` of the own relayed `CharacterActionIIR_t` actions `0x14` (the recharge feed, `identity_b = {action, duration}`;
-    /// [GC 0x1005e2cd]); `Hud::update` drains it into the special-action list.
-    pub recharge_feed: Vec<(i32, i32)>,
-    /// `GC 1005e49b`: `(Action_e, template)` registered by own CharacterAction 0xb4.
-    pub special_registration_feed: Vec<(u32, u32)>,
+    /// Retain packet order: a flag change before registration must not affect a later entry.
+    pub special_action_feed: Vec<SpecialActionEvent>,
     /// The own pet list (`dynel+0x1d8` -> `+0x1c`, `AddPetIIR_c` / `RemovePetIIR_c`; docs/zone/pets.md): service towers included.
     pub pets: Vec<Identity>,
     /// The spells currently running on the own character (`FullCharacterIIR_t` list, `ApplySpellsIIR_t`): their stat bonuses are the buffs of
@@ -349,6 +355,10 @@ impl Zone {
                     lock.b > 0
                 });
             }
+            self.perk_locks.retain_mut(|lock| {
+                lock.b = lock.b.wrapping_sub(1);
+                lock.b > 0
+            });
         }
         let delta = self.nanos.tick(dt);
         self.adjust_ncu(delta);
@@ -368,6 +378,29 @@ impl Zone {
     /// entries after decrementing +0xc on GameTime_t's second pulse (1005b016).
     pub fn skill_locked(&self, skill: i32) -> Option<bool> {
         self.skill_locks.as_ref().map(|locks| locks.iter().any(|lock| lock.id.instance == skill))
+    }
+
+    /// GC10064a6e adds a missing stat lock; GC100655d3 extends the first existing record.
+    pub fn feed_skill_lock(&mut self, skill: i32, duration: i32, extend: bool) {
+        if !extend && self.skill_locked(skill) == Some(true) { return; }
+        let pct = self.stats.get(&382).copied().unwrap_or(ao_formats::stats::INVALID);
+        let duration = super::hud_special::recharge_time(skill as u32, duration, pct);
+        let locks = self.skill_locks.get_or_insert_with(Vec::new);
+        if let Some(lock) = locks.iter_mut().find(|lock| lock.id.instance == skill) {
+            lock.a = lock.a.wrapping_add(duration);
+            lock.b = lock.b.wrapping_add(duration);
+        } else {
+            locks.push(ao_net::n3::world::GroupEntry { ignored: 0, id: Identity { kind: 0, instance: skill }, a: duration, b: duration });
+            self.special_action_feed.push(SpecialActionEvent::Action(skill as u32, true));
+        }
+    }
+
+    /// GC10053619: locks append, including duplicate perk IDs; the first matching lock drives progress.
+    pub fn feed_perk_lock(&mut self, perk: i32, duration: i32) {
+        self.perk_locks.push(ao_net::n3::world::GroupEntry {
+            ignored: 0, id: Identity { kind: 0xd6f3, instance: perk }, a: duration, b: duration,
+        });
+        self.special_action_feed.push(SpecialActionEvent::Perk(perk as u32, true));
     }
 
     /// `n3EngineClientAnarchy_t::StartTeleportTry` [GC 0x10018f9a] after the movement sync: creates the `TeleportTrier_t` (its constructor gets
@@ -628,6 +661,7 @@ impl Zone {
             N3::World(World::FullCharacter(c)) if who.instance == self.char_id as i32 => {
                 // GC10073a2f appends +0x28 into the skill controller's Locks_t vector.
                 self.skill_locks.get_or_insert_with(Vec::new).extend_from_slice(&c.groups[0].entries);
+                self.perk_locks.extend_from_slice(&c.groups[1].entries);
                 self.apply_stats(c.stats_a.iter().chain(&c.stats_b).copied());
                 self.apply_stats(c.stats_u8.iter().map(|s| (s.0 as u32, s.1 as i32)));
                 self.apply_stats(c.stats_i16.iter().map(|s| (s.0 as u32, s.1 as i32)));
@@ -756,24 +790,25 @@ impl Zone {
                         self.world.sound_id_at_position(sound, [0.0; 3]);
                     }
                 }
-                if a.action == 0xaa && self.skill_locked(a.identity_b.kind) != Some(true) {
-                    let skill = a.identity_b.kind;
-                    let modifier = if matches!(skill, 142 | 144 | 146..=148 | 150 | 151 | 167 | 579 | 673) {
-                        0
-                    } else {
-                        // Native GetSkill(382, 0), not the buff-adjusted mode-2 projection.
-                        self.stats.get(&382).copied().unwrap_or(ao_formats::stats::INVALID).max(-50)
-                    };
-                    let duration = (modifier.wrapping_mul(a.identity_b.instance) as f64 / 100.0 + a.identity_b.instance as f64 + 0.5) as i32;
-                    self.skill_locks.get_or_insert_with(Vec::new).push(ao_net::n3::world::GroupEntry {
-                        ignored: 0, id: Identity { kind: 0, instance: skill }, a: duration, b: duration,
-                    });
+                if matches!(a.action, 0xaa | 0x14) {
+                    self.feed_skill_lock(a.identity_b.kind, a.identity_b.instance, a.action == 0x14);
                 }
-                if a.action == 0x14 {
-                    self.recharge_feed.push((a.identity_b.kind, a.identity_b.instance));
+                // GC1005e297 -> 10053619: perk id, unscaled signed integer seconds.
+                if a.action == 0xcf {
+                    self.feed_perk_lock(a.identity_b.kind, a.identity_b.instance);
+                }
+                if a.action == 0xb2 {
+                    self.special_action_feed.push(SpecialActionEvent::Action(a.identity_b.instance as u32, false));
+                }
+                // GC1005e7b3 -> 100535ae clears flags for all locked perks, then empties the vector.
+                if a.action == 0xfc {
+                    for lock in self.perk_locks.drain(..) {
+                        self.special_action_feed.push(SpecialActionEvent::Perk(lock.id.instance as u32, false));
+                    }
+                    self.apply_stats([(0x241, 0)]);
                 }
                 if a.action == 0xb4 && a.identity_b.kind > 0 && a.identity_a.instance > 0 {
-                    self.special_registration_feed.push((a.identity_b.kind as u32, a.identity_a.instance as u32));
+                    self.special_action_feed.push(SpecialActionEvent::Register(a.identity_b.kind as u32, a.identity_a.instance as u32));
                 }
                 // `FUN_1005d0d8` case 0x5a (action 0xd0, 0x1005e8b5): `SetStat(identity_b.kind, identity_b.instance)` on the drained character (Health / Nano)
                 if a.action == 0xd0 && a.identity_b.kind > 0 {
@@ -1030,6 +1065,59 @@ mod tests {
         assert_eq!(zone.skill_locked(662), Some(true)); // predicate never compares expiry
         zone.tick(1.01);
         assert_eq!(zone.skill_locked(662), Some(false));
+    }
+
+    #[test]
+    fn native_action_locks_restore_relay_extend_and_share_second_pulse() {
+        use ao_net::n3::{action, outgoing::n3_frame};
+        let mut snapshot = frames(include_str!("../../../../docs/captures/zone_enter_ithaca.rec")).into_iter()
+            .find(|frame| matches!(n3::decode(frame).map(|m| m.body), Ok(N3::World(World::FullCharacter(_))))).unwrap();
+        let own = n3::decode(&snapshot).unwrap().header.target.instance;
+        // The captured group0/group1 counts are empty. Insert a native +0x2c record.
+        assert_eq!(&snapshot.payload[33..37], &[0; 4]);
+        assert_eq!(&snapshot.payload[41..45], &[0; 4]);
+        let mut group = 1u32.to_be_bytes().to_vec();
+        for word in [0u32, 0xd6f3, 111, 30, 2] { group.extend(word.to_be_bytes()); }
+        snapshot.payload.splice(41..45, group);
+        let mut zone = Zone::new(own as u32);
+        zone.on_frame(&snapshot);
+        assert_eq!((zone.perk_locks[0].id.instance, zone.perk_locks[0].a, zone.perk_locks[0].b), (111, 30, 2));
+        let relay = |who, action_id, kind, instance| n3_frame(1, 0, action::character_action(who,
+            &action::simple(action_id, Identity::default(), Identity { kind, instance })));
+        zone.on_frame(&relay(own + 1, 0xcf, 112, 7));
+        assert_eq!(zone.perk_locks.len(), 1, "other characters cannot lock the own perk");
+        zone.on_frame(&relay(own, 0xcf, 112, 7));
+        assert_eq!((zone.perk_locks[1].id.instance, zone.perk_locks[1].a, zone.perk_locks[1].b), (112, 7, 7));
+        assert!(matches!(zone.special_action_feed.pop(), Some(SpecialActionEvent::Perk(112, true))));
+        zone.stats.insert(382, 0);
+        zone.on_frame(&relay(own, 0x14, 148, 20));
+        zone.tick(1.0);
+        assert_eq!(zone.skill_locks.as_ref().unwrap()[0].b, 20);
+        assert_eq!(zone.perk_locks[0].b, 2);
+        zone.tick(0.01);
+        assert_eq!(zone.skill_locks.as_ref().unwrap()[0].b, 19);
+        assert_eq!(zone.perk_locks[0].b, 1);
+        zone.on_frame(&relay(own, 0x14, 148, 10));
+        assert_eq!((zone.skill_locks.as_ref().unwrap()[0].a, zone.skill_locks.as_ref().unwrap()[0].b), (30, 29));
+        zone.on_frame(&relay(own, 0xaa, 148, 99));
+        assert_eq!(zone.skill_locks.as_ref().unwrap()[0].a, 30, "0xaa never extends an existing lock");
+        zone.tick(5.0);
+        assert_eq!(zone.skill_locks.as_ref().unwrap()[0].b, 28, "one pulse, not catch-up subtraction");
+        assert_eq!(zone.perk_locks.len(), 1);
+        zone.on_frame(&relay(own, 0xb2, 0, 10111));
+        assert!(matches!(zone.special_action_feed.pop(), Some(SpecialActionEvent::Action(10111, false))));
+        let spell = ao_net::n3::spells::spell(0xcfc3, &[(0, 112), (0x27, 3)]);
+        zone.set_effects(std::slice::from_ref(&spell));
+        assert_eq!(zone.perk_locks.len(), 2, "snapshot spell executes alongside the restored lock vector");
+        zone.apply_effects(std::slice::from_ref(&spell), false);
+        assert_eq!(zone.perk_locks.len(), 2, "undo does not cancel a native perk lock");
+        zone.apply_effects(std::slice::from_ref(&spell), true);
+        assert_eq!(zone.perk_locks.len(), 3, "the native lock vector preserves duplicate IDs");
+        assert_eq!((zone.perk_locks[2].a, zone.perk_locks[2].b), (3, 3), "CFC3 is unscaled seconds");
+        zone.on_frame(&relay(own, 0xfc, 0, 0));
+        assert!(zone.perk_locks.is_empty());
+        assert_eq!(zone.stat(0x241), Some(0));
+        assert!(matches!(zone.special_action_feed.pop(), Some(SpecialActionEvent::Perk(112, false))));
     }
 
     fn frames(rec: &str) -> Vec<Frame> {

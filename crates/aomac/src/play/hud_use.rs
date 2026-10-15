@@ -49,6 +49,21 @@ impl Play {
     /// `FUN_1004256c` for the own character: combat (attack 0xb / 0x4e, specials) and sit (0x4c / 0x4d) belong to the combat layer;
     /// walk / run 0x11 / 0x12 and camping 0x51 / 0x52 are here.
     fn special_action(&mut self, a: u32) {
+        let entry = self.hud.as_ref().and_then(|hud| hud.actions.list.entries().iter().find(|entry| entry.shown == a)).copied();
+        if let Some(entry) = entry {
+            // GC1004256c tests the entry flag before dispatch, independently of the icon's disabled predicate.
+            if entry.flags & 1 != 0 {
+                if let Some(lock) = self.zone.skill_locks.iter().flatten().find(|lock| lock.id.instance == a as i32) {
+                    if lock.b > 0 { self.action_recharge_feedback(lock.b, Some(a), None); }
+                } else if let Some(lock) = self.zone.perk_locks.iter().find(|lock|
+                    self.hud.as_ref().is_some_and(|hud| hud.perks().db.get(lock.id.instance as u32).is_some_and(|perk| perk.action == a))) {
+                    self.action_recharge_feedback(lock.b, None, Some(lock.id.instance as u32));
+                } else {
+                    self.feedback("Feedback_ActionIsNotAvailable");
+                }
+                return;
+            }
+        }
         if self.fight_special(a) {
             return;
         }
@@ -129,15 +144,37 @@ impl Play {
         }
     }
 
-    /// Search `FUN_1003fa2c` [GC]: nothing while the Search recharge (action 0x88) runs (the original prints its remaining time through
-    /// `FUN_10064301`; the text keys are UNRESOLVED), else `Feedback_SearchingForHiddenObjects` and `CharacterActionIIR_t` 0x42 (the effect 0xb01c on
-    /// the own dynel is not created).
+    /// Search GC1003fa2c tests positive remaining stat136 seconds, not icon action-progress membership.
     fn search(&mut self) {
-        if self.hud.as_ref().is_some_and(|h| h.actions.list.progress(0x88).is_some()) {
+        if let Some(remaining) = self.zone.skill_locks.iter().flatten().find(|lock| lock.id.instance == 0x88).map(|lock| lock.b).filter(|&seconds| seconds > 0) {
+            self.action_recharge_feedback(remaining, Some(0x88), None);
             return;
         }
         self.feedback("Feedback_SearchingForHiddenObjects");
         self.send_outgoing(vec![action::plain_action(action::id::SEARCH)]);
+    }
+
+    /// GC10064301: table1000 feedback key and optional table2003 stat / raw perk-item name, followed by h:m:s.
+    fn action_recharge_feedback(&mut self, seconds: i32, skill: Option<u32>, perk: Option<u32>) {
+        use super::chat::log::{ldb_format, Arg};
+        let (key, name) = if let Some(skill) = skill {
+            ("UnableToPerformActionSkill", self.text.by_id(2003, skill).unwrap_or_default())
+        } else if let Some(perk) = perk {
+            let name = self.hud.as_ref().and_then(|hud| {
+                let item = hud.perks().db.get(perk)?.item;
+                ao_formats::dynel_visual::item_template(hud.perks().store.as_ref()?, item).ok()??.name
+            }).unwrap_or_default();
+            ("UnableToPerformActionPerk", name)
+        } else {
+            ("UnableToPerformAction", String::new())
+        };
+        let hours = seconds / 3600;
+        let minutes = seconds / 60 - hours * 60;
+        let remaining = seconds - (hours * 60 + minutes) * 60;
+        let named = !name.is_empty();
+        let args = [Arg::S(name), Arg::N(hours), Arg::N(minutes), Arg::N(remaining)];
+        let message = ldb_format(&self.text.by_key(1000, key).unwrap_or_default(), if named { &args } else { &args[1..] });
+        if let Some(chat) = &mut self.chat { chat.system_line(&mut self.gui, &message, 0); }
     }
 
     /// `/camp` / `StartQuitToLoginMessage` [GUI 0x10027c74]: unless already camping to the login (state 2), `N3Msg_StartCamping` (from state 0;

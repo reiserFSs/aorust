@@ -14,7 +14,6 @@ pub(super) use super::hud_map::ground_map;
 use super::hud_aggdef::{self, AggDef};
 use super::hud_bar::{self, ShortcutBar, SlotUse};
 use super::hud_actions::HudActions;
-use super::hud_special::SpecialList;
 use super::hud_actionwin::HudActionWin;
 use super::hud_keys::{HudKey, KeyMap};
 use super::options::keys::{Bindings, FixedKeys};
@@ -763,6 +762,10 @@ impl Hud {
         self.stats.item_info(gui, low_id)
     }
 
+    pub(super) fn perks(&self) -> &super::hud_perks::HudPerks {
+        &self.winb.perks
+    }
+
     /// Name, count and price of an item template (`HudStats::shop_info`).
     pub(super) fn shop_info(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> Option<(String, i32, i32, Option<ao_gui::GfxId>)> {
         self.stats.shop_info(gui, item)
@@ -1045,18 +1048,22 @@ impl Hud {
             c.update(gui, zone);
         }
         // the special-action list (equipment, recharge) and the hotbar slots following it (`hud_actions.rs`, `hud_bar.rs`)
-        self.actions.update(zone, _dt);
+        // GC100275f7 projects stat locks (142..999) or catalogue-resolved perk locks (>=1000).
+        self.actions.list.sync_recharge(
+            zone.skill_locks.iter().flatten().map(|lock| super::hud_special::Recharge {
+                action: lock.id.instance as u32, total: lock.a, remaining: lock.b,
+            }),
+            zone.perk_locks.iter().filter_map(|lock| self.winb.perks.db.get(lock.id.instance as u32).map(|perk| super::hud_special::Recharge {
+                action: perk.action, total: lock.a, remaining: lock.b,
+            })),
+        );
+        self.actions.update(zone, &self.winb.perks.db);
         if self.popup.as_ref().is_some_and(|p| p.source.is_some() && p.action_snapshot != self.actions.list.entries()) {
             let popup = self.popup.as_ref().unwrap();
             let source = popup.source.as_ref().unwrap().clone();
             let anchor = popup.anchor;
             self.close_popup(gui);
             self.open_popup(gui, &source, anchor, zone);
-        }
-        // the recharge feed: relayed `CharacterActionIIR_t` 0x14 (`hud_special::SpecialList::feed_recharge`)
-        let pct = zone.skill_value(SpecialList::STAT_RECHARGE_PCT).unwrap_or(0);
-        for (action, duration) in std::mem::take(&mut zone.recharge_feed) {
-            self.actions.list.feed_recharge(action as u32, duration, pct);
         }
         let changes = self.actions.list.take_changes();
         let locked = self.dvalues.flag("LockHotbars");
@@ -2663,10 +2670,12 @@ mod tests {
         send(&mut s, InputEvent::MouseUp { x: sx, y: sy, button: MouseButton::Left });
         assert!(s.hud.take_uses().is_empty(), "the release of a drag is no use");
         assert_eq!(s.hud.shortcuts[0].slot_names()[7], "Walk");
-        // the recharge feed of action 0x86 (Search) shows its overlay and counts down
-        s.zone.recharge_feed.push((0x86, 30));
+        // Burst's native stat lock projects into the action overlay on the shared second pulse.
+        s.hud.actions.list.sync_equipment(&[(0x800, -1)], 0);
+        s.zone.feed_skill_lock(0x94, 30, true);
+        s.zone.tick(1.01);
         png(&mut s, &mut o, "hud-actions-recharge");
-        assert!(s.hud.actions.list.progress(0x86).is_some());
+        assert_eq!(s.hud.actions.list.progress(0x94), Some((29.0 / 30.0, 29)));
         // hotbar rows: down shows the empty row 1, up returns; the row key `Shift+2` goes to row 1 again
         let (bx, by) = (wx as f32 + 11.0 + 11.0 + 4.0, wy as f32 + 30.0);
         send(&mut s, InputEvent::MouseDown { x: bx, y: by, button: MouseButton::Left });

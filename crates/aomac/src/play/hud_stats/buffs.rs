@@ -123,7 +123,11 @@ impl Zone {
         self.reset_stat_effects = true;
         self.stat_effect_adds.clear();
         self.stat_effect_undos.clear();
-        self.active_spells = spells.iter().filter(|s| runs_on_character(s)).cloned().collect();
+        self.active_spells.clear();
+        for spell in spells.iter().filter(|spell| runs_on_character(spell)) {
+            if spell.function == 0xcfc3 { self.feed_perk_lock(spell.stat(0), spell.stat(0x27)); }
+            self.active_spells.push(spell.clone());
+        }
     }
 
     /// `ApplySpellsIIR_t` on the own character: apply adds the spells, undo removes the first equal spell of each.
@@ -131,6 +135,8 @@ impl Zone {
         for s in spells.iter().filter(|s| runs_on_character(s)) {
             if apply {
                 self.stat_effect_adds.push(self.active_spells.len());
+                // GC100a8b04 (CFC3) shares the unscaled perk-lock append with CharacterAction 0xcf.
+                if s.function == 0xcfc3 { self.feed_perk_lock(s.stat(0), s.stat(0x27)); }
                 self.active_spells.push(s.clone());
             } else if let Some(i) = self.active_spells.iter().position(|a| a == s) {
                 self.stat_effect_undos.push(i);

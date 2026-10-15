@@ -43,10 +43,16 @@ impl HudActions {
         items
     }
 
-    /// Per frame: the weapon entries follow the equipment (`FUN_1009e301` on every item put into a slot below 0x30), the recharge records count down.
-    pub(super) fn update(&mut self, zone: &mut Zone, dt: f32) {
-        for (action, template) in std::mem::take(&mut zone.special_registration_feed) {
-            self.list.register(action, template);
+    /// Per frame: weapon entries follow the equipment (`FUN_1009e301`).
+    pub(super) fn update(&mut self, zone: &mut Zone, perks: &super::hud_perks::PerkDb) {
+        for event in std::mem::take(&mut zone.special_action_feed) {
+            match event {
+                super::zone::SpecialActionEvent::Register(action, template) => self.list.register(action, template),
+                super::zone::SpecialActionEvent::Action(action, disabled) => self.list.set_disabled(action, disabled),
+                super::zone::SpecialActionEvent::Perk(id, disabled) => {
+                    if let Some(perk) = perks.get(id) { self.list.set_disabled(perk.action, disabled); }
+                }
+            }
         }
         let mut eq: Vec<(u32, i32)> = zone.inventory.values().filter(|e| e.slot < EQUIP_SLOTS).map(|e| (e.slot, e.item.low_id)).collect();
         eq.sort_unstable();
@@ -63,7 +69,6 @@ impl HudActions {
             self.equipped = eq;
             self.char_flags = flags;
         }
-        self.list.tick(dt);
     }
 
     pub(super) fn set_state(&mut self, s: OwnState) {
@@ -80,12 +85,33 @@ mod tests {
         let mut actions = HudActions::new(std::path::Path::new("/nonexistent-aomac-client"));
         // Synthetic registration: the wire supplies this pairing, not the perk catalogue.
         actions.menu_metadata.insert(213010, Some((1, "Registered perk".into())));
-        let mut zone = Zone::default();
-        zone.special_registration_feed.push((10111, 213010));
-        actions.update(&mut zone, 0.0);
+        let mut zone = Zone::new(42);
+        let registration = ao_net::n3::action::simple(0xb4,
+            ao_net::msg::Identity { kind: 0, instance: 213010 }, ao_net::msg::Identity { kind: 10111, instance: 111 });
+        zone.on_frame(&ao_net::n3::outgoing::n3_frame(1, 0, ao_net::n3::action::character_action(42, &registration)));
+        actions.update(&mut zone, &super::super::hud_perks::PerkDb::default());
         assert_eq!(actions.list.find(213010).unwrap().shown, 10111);
         assert!(actions.menu_items().contains(&(213010, 1, "Registered perk".into(), 10111)));
-        assert!(zone.special_registration_feed.is_empty());
+        assert!(zone.special_action_feed.is_empty());
+
+    }
+
+    #[test]
+    fn registration_and_flag_changes_preserve_native_packet_order() {
+        use super::super::zone::SpecialActionEvent;
+        let mut actions = HudActions::new(std::path::Path::new("/nonexistent-aomac-client"));
+        let mut zone = Zone::default();
+        let perks = super::super::hud_perks::PerkDb::default();
+        zone.special_action_feed.extend([SpecialActionEvent::Action(10111, true), SpecialActionEvent::Register(10111, 213010)]);
+        actions.update(&mut zone, &perks);
+        let entry = actions.list.find(213010).unwrap();
+        assert_eq!(entry.flags, 0, "a flag event for an absent entry is not replayed after registration");
+        zone.special_action_feed.push(SpecialActionEvent::Action(10111, true));
+        actions.update(&mut zone, &perks);
+        assert!(actions.list.disabled(10111));
+        zone.special_action_feed.push(SpecialActionEvent::Action(10111, false));
+        actions.update(&mut zone, &perks);
+        assert!(!actions.list.disabled(10111));
     }
 
     #[test]
