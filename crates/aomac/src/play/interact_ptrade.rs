@@ -556,6 +556,13 @@ impl Interact {
         let now = ui.now;
         let mut out: Vec<Vec<u8>> = vec![];
         match ev {
+            // CanvasView emits CanvasWheel instead of Gui's ordinary ScrollView ancestor routing.
+            Event::CanvasWheel { window, view, dy, .. } if *window == p.win => {
+                if let Some(list) = PTrade::list_of(view) {
+                    let offset = gui.scroll_offset(p.win, SCROLLS[list]) - dy * 3.0 * 13.0;
+                    gui.set_scroll_offset(p.win, SCROLLS[list], offset);
+                }
+            }
             // `FUN_100dfd33`: pending cash goes out first, the field is shown formatted, Accept is disabled, the status shows "accepted", `TradeConfirm`
             Event::Clicked { window, view, .. } if *window == p.win && view == "AcceptButton" => {
                 let text = gui.text(p.win, "OurCashView");
@@ -1040,9 +1047,11 @@ pub(super) mod tests {
         assert_eq!(gui.view_rect(p.win, SCROLLS[0]).unwrap().height() + 1.0, 60.0);
         let (x, y) = cell(1, p.dock[0].0 as f32);
         assert_eq!(p.entry_at(0, x + 4.0, y + 4.0), Some(1));
-        let r = gui.view_rect(p.win, SCROLLS[0]).unwrap();
-        gui.input(ao_gui::InputEvent::Wheel { x: r.l + 5.0, y: r.t + 5.0, dy: -1.0 });
-        assert!(gui.scroll_offset(p.win, SCROLLS[0]) > 0.0);
+        let win = p.win;
+        let r = gui.view_rect(win, SCROLLS[0]).unwrap();
+        let events = gui.input(ao_gui::InputEvent::Wheel { x: r.l + 5.0, y: r.t + 5.0, dy: -1.0 });
+        for event in events { ui.ptrade_event(&mut gui, &event, &z); }
+        assert!(gui.scroll_offset(win, SCROLLS[0]) > 0.0);
     }
 
     #[test]

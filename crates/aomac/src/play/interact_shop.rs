@@ -529,6 +529,12 @@ impl Interact {
         let Some(s) = self.shop.shop.as_mut() else { return false };
         let mut out: Vec<Vec<u8>> = vec![];
         match ev {
+            Event::CanvasWheel { window, view, dy, .. } if *window == s.win => {
+                if let Some(list) = GRIDS.iter().position(|name| view.as_str() == *name) {
+                    let offset = gui.scroll_offset(s.win, GRID_SCROLLS[list]) - dy * 3.0 * 13.0;
+                    gui.set_scroll_offset(s.win, GRID_SCROLLS[list], offset);
+                }
+            }
             Event::CanvasClick { window, view, .. } if *window == s.win && view == "close" => out.push(trade::abort(me, true)),
             Event::ContextMenu { window, x, y, .. } | Event::FrameIcon { window, x, y } if *window == s.win => {
                 // GUI 100dfad8: the trade window's ListMode entry controls the shop stock, not the bought/sold trays.
@@ -818,6 +824,21 @@ mod tests {
     use super::*;
     use crate::play::zone::Zone;
     use ao_net::frame::Frame;
+
+    #[test]
+    fn shop_grid_wheel_reaches_its_enclosing_scroll_view() {
+        let Some(mut gui) = rig() else { return };
+        let mut zone = Zone::new(OWN);
+        let mut ui = open(&mut gui, &mut zone);
+        let shop = ui.shop.shop.as_mut().unwrap();
+        let win = shop.win;
+        let rows = (0..20).map(|n| (n, None, String::new())).collect::<Vec<_>>();
+        shop.paint_grid(&mut gui, LISTS[1], &rows);
+        let rect = gui.view_rect(win, GRID_SCROLLS[1]).unwrap();
+        let events = gui.input(ao_gui::InputEvent::Wheel { x: rect.l + 6.0, y: rect.t + 6.0, dy: -1.0 });
+        for event in events { ui.shop_event(&mut gui, &event, &zone); }
+        assert!(gui.scroll_offset(win, GRID_SCROLLS[1]) > 0.0);
+    }
 
     #[test]
     fn shop_native_stock_and_offer_preferred_limits_follow_mode_and_width() {
