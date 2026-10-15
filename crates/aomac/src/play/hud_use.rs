@@ -96,7 +96,6 @@ impl Play {
             0x86 => self.search(),
             // Reload `FUN_1006949a` [GC]: action 0xd2. UNRESOLVED: its gate `FUN_10029e66` (a field of the manager's `+4` object being 0).
             0x6e => {
-                self.zone.world.start_reload_bar(self.zone.char_id as i32);
                 self.send_outgoing(vec![action::plain_action(action::id::RELOAD)]);
             }
             _ => eprintln!("hud: special action {a:#x} has no consumer yet"),

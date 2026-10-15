@@ -59,6 +59,33 @@ impl Zone {
         }
     }
 
+    /// GC10069274 / 10049036 / 10049073: source count replacement/removal
+    /// precedes weapon lookup, including when the weapon is absent or Ammo is negative.
+    pub(in crate::play) fn apply_reload(&mut self, source: Identity, weapon: Identity, remaining: i32, clip: i32, remove_source: bool) -> bool {
+        let slot = if source.kind == inv::KIND_IN_CONTAINER { (source.instance & 0xffff) as u32 } else { source.instance as u32 };
+        // GC1002ad45 stores a u16; out-of-range counts become zero, not saturation.
+        let remaining = if (0..=0xffff).contains(&remaining) { remaining as i16 } else { 0 };
+        if matches!(source.kind, 0x65..=0x68 | 0x73) && source.instance >= 0 {
+            if remove_source { self.inventory.remove(&slot); }
+            else if let Some(e) = self.inventory.get_mut(&slot) { e.b = remaining; }
+        } else {
+            let list = match source.kind {
+                inv::KIND_IN_CONTAINER => self.containers.values_mut().find(|(word, _)| i32::from(*word as i16) == source.instance >> 16),
+                inv::KIND_BANK => self.containers.get_mut(&(0xdead, self.char_id as i32)),
+                inv::KIND_TRADE => self.containers.get_mut(&(inv::KIND_TRADE, self.char_id as i32)),
+                _ => None,
+            };
+            if let Some((_, entries)) = list {
+                if remove_source { entries.retain(|e| e.slot != slot); }
+                else if let Some(e) = entries.iter_mut().find(|e| e.slot == slot) { e.b = remaining; }
+            }
+        }
+        if let Some(recharge) = self.world.arms.reload(weapon, clip) {
+            self.world.start_reload_bar(recharge);
+            true
+        } else { false }
+    }
+
     /// Apply one server inventory message addressed to the own character.
     ///
     /// * `ContainerAddItemIIR_t` with the own character as container and an item identity of the own pages (`FUN_10047d77(kind, from = item.instance,
@@ -71,6 +98,9 @@ impl Zone {
     /// * `InventoryUpdateIIR_t` of a chest / corpse stores its list in [`Zone::containers`] (`FUN_100a040e`); `InventoryUpdatedIIR_t` is the signal only (`FUN_10074e49`).
     pub fn apply_inventory(&mut self, msg: &InventoryMsg) {
         match msg {
+            InventoryMsg::Reload { source, weapon, remaining, clip, remove_source } => {
+                self.apply_reload(*source, *weapon, *remaining, *clip, *remove_source);
+            }
             // GC 1004d148 action 0x57: create an actual server-described item in the temporary inventory.
             InventoryMsg::TemplateAction { item, count, action: 0x57, .. } => {
                 let (_, entries) = self.containers.entry((inv::KIND_TRADE, self.char_id as i32)).or_default();
@@ -213,6 +243,46 @@ mod tests {
     fn put(z: &mut Zone, slot: u32, low: i32) {
         let id = inv::item_identity(slot);
         z.inventory.insert(slot, InventoryEntry { slot, a: 0x40, b: 1, id, item: AcgItem { low_id: low, high_id: low, level: 1 } });
+    }
+
+    #[test]
+    fn reload_ack_updates_source_and_exact_weapon_before_feedback() {
+        use ao_net::{n3::{dynel::KIND_WEAPON_ITEM, outgoing::n3_frame}, wire::Writer};
+        let mut z = Zone::new(7);
+        put(&mut z, 0x40, 100);
+        let weapon = Identity { kind: KIND_WEAPON_ITEM, instance: 900 };
+        z.world.arms.wield(7, 899, 8, None, &[(26, 0), (210, 700)]);
+        z.world.arms.wield(7, 900, 6, None, &[(26, 0), (210, 250)]);
+        let ack = |source: Identity, remaining: i32, clip: i32, remove: i32| {
+            let mut w = Writer::default();
+            w.u32(0x26515e61); Identity { kind: 50000, instance: 7 }.write(&mut w); w.u8(0);
+            source.write(&mut w); weapon.write(&mut w);
+            w.i32(remaining); w.i32(clip); w.i32(remove);
+            n3_frame(1, 1, w.0)
+        };
+        assert!(z.world.reload_bar_progress().is_none());
+        assert_eq!(z.on_frame(&ack(inv::item_identity(0x40), 123, 25, 0)), crate::play::zone::ZoneEvent::Reloading);
+        assert_eq!(z.inventory[&0x40].b, 123);
+        assert_eq!(z.world.arms.weapon_item(900).unwrap().clip, 25);
+        assert_eq!(z.world.arms.weapon_item(899).unwrap().clip, 0);
+        assert_eq!(z.world.reload_bar_progress(), Some((0.0, 2.5)));
+        z.on_frame(&ack(inv::item_identity(0x40), 0, 30, 2));
+        assert!(!z.inventory.contains_key(&0x40));
+        // Container lookup uses signed high-word registration, and count bounds are native u16.
+        put(&mut z, 0x41, 101);
+        let mut entry = z.inventory.remove(&0x41).unwrap(); entry.slot = 3;
+        z.containers.insert((0xc750, 55), (0xfffe, vec![entry]));
+        let source = inv::container_item_identity(-2, 3);
+        z.on_frame(&ack(source, 65535, 5, 0));
+        assert_eq!(z.containers[&(0xc750, 55)].1[0].b as u16, 65535);
+        z.on_frame(&ack(source, 65536, 5, 0));
+        assert_eq!(z.containers[&(0xc750, 55)].1[0].b, 0);
+        // Source removal still happens when the resolved weapon's Ammo rejects the reload.
+        z.world.arms.wield(7, 900, 6, None, &[(26, -1), (210, 900)]);
+        assert_eq!(z.on_frame(&ack(source, 0, 9, 1)), crate::play::zone::ZoneEvent::None);
+        assert!(z.containers[&(0xc750, 55)].1.is_empty());
+        assert_eq!(z.world.arms.weapon_item(900).unwrap().clip, -1);
+        assert_eq!(z.world.reload_bar_progress(), Some((0.0, 2.5)));
     }
 
     fn add(from: u32, to: i32) -> InventoryMsg {

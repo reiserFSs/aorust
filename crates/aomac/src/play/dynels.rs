@@ -851,10 +851,7 @@ pub struct Dynels {
     /// `(slot, elapsed since the last swing or fight start)` of the own character's wielded hands while fighting: backs the
     /// HUD `TimerSystemModule_t::StartTimerBar` kind-1 "Attack" bars (`Dynels::update_attack_bars`, `hud_stats::update_attack_timers`).
     attack_bars: HashMap<i32, f32>,
-    /// `(elapsed, total)` of the predicted Reload bar (kind 5 "Reload"), started by `Dynels::start_reload_bar` when the
-    /// player sends the Reload special action. Duration = the ranged hand's raw `RechargeDelay` stat alone (no
-    /// initiative scaling, no `AttackDelay` sum) -- traced to `ReloadIIR_t` 0x26515E61's apply, not a guess.
-    /// docs/zone/combat-timers.md.
+    /// `(elapsed, total)` of the server-acknowledged Reload bar (kind 5).
     reload_bar: Option<(f32, f32)>,
     /// (swing clip, `ItemDelay`) of the last [`Dynels::pick_swing`] of a character: the clip plays sped up by [`canim::swing_speed_scale`].
     swing_delay: HashMap<i32, (u32, i32)>,
@@ -1610,18 +1607,9 @@ impl Dynels {
         }).collect()
     }
 
-    /// Starts the Reload bar (`hud_use.rs` Reload special action 0x6e): duration = the ranged hand's raw
-    /// `RechargeDelay` stat (0xd2/210), read directly with **no** initiative scaling and **not** summed with
-    /// `AttackDelay` -- the exact value Gamecode passes to `TimerSystemModule_t::StartTimerBar` kind 5. Evidence
-    /// (`~/aomac-ghidra` Gamecode): `ReloadIIR_t` 0x26515E61 apply chain `FUN_10076780` -> `FUN_10069274` (sets
-    /// stat `0x1a`/26 ammo count, prints `Feedback_Reloading`) -> `FUN_10068a89`, whose first instruction literally
-    /// pushes `(0xd2, 2)` into the item's stat getter before constructing the `TimerEntry_t` (`FUN_1003d7ce`,
-    /// confirmed via the `boost::detail::sp_counted_impl_p<TimerEntry_t>` RTTI chain). docs/zone/combat-timers.md §3.
-    /// A no-op without a ranged hand (the action is only offered for one, `hud_special.rs::sync_equipment`).
-    pub fn start_reload_bar(&mut self, own: i32) {
-        if let Some(item) = self.arms.attack_slots(own).iter().filter_map(|&s| self.arms.slot_item(own, s)).find(|i| i.ammo != -1) {
-            self.reload_bar = Some((0.0, item.recharge as f32 / 100.0));
-        }
+    /// GC10069274 -> 10068a89: the acknowledged weapon's raw RechargeDelay / 100.
+    pub fn start_reload_bar(&mut self, recharge: i32) {
+        self.reload_bar = Some((0.0, recharge as f32 / 100.0));
     }
 
     /// `(progress 0..1, total seconds)` of the open Reload bar, if any.
@@ -4536,7 +4524,7 @@ mod tests {
         assert!(d.attack_bar_progress(own, &stats).is_empty());
         // Reload: the ranged hand (AmmoType present) starts a bar and it clears once elapsed reaches its total
         assert!(d.reload_bar_progress().is_none());
-        d.start_reload_bar(own);
+        d.start_reload_bar(500);
         let (p0, reload_total) = d.reload_bar_progress().expect("a ranged hand is wielded");
         assert_eq!(reload_total, 5.0, "raw RechargeDelay (stat 0xd2 = 500) / 100, no initiative scaling, no AttackDelay sum");
         assert_eq!(p0, 0.0);

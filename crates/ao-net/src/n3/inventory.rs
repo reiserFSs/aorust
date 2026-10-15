@@ -201,6 +201,8 @@ pub struct InventoryUpdate {
 /// A decoded server inventory message; the header target is the character the message is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryMsg {
+    /// ReloadIIR_t (GC 100766e1/1007673a): two identities, two counts, i32 boolean.
+    Reload { source: Identity, weapon: Identity, remaining: i32, clip: i32, remove_source: bool },
     /// `ContainerAddItemIIR_t`: wire order `item, container, slot` (`FUN_10038ef6` reads `+0x20`, `+0x18`, `+0x28`; apply `FUN_1004ad44(container, item, slot)`).
     ContainerAdd { item: Identity, container: Identity, slot: i32 },
     /// `ItemReplacedIIR_c`: the item at `slot` (< 0x40) became `new` (`FUN_1004cf08`; `old` is only compared).
@@ -231,6 +233,12 @@ fn read_acg_count(r: &mut Reader) -> Result<(AcgItem, i32)> {
 
 pub fn decode(h: &N3Header, r: &mut Reader) -> Result<Option<InventoryMsg>> {
     Ok(match h.msg_type {
+        0x2651_5e61 => {
+            let (source, weapon) = (Identity::read(r)?, Identity::read(r)?);
+            let (remaining, clip, remove_source) = (r.i32()?, r.i32()?, r.i32()? != 0);
+            ensure!(r.remaining() == 0, "ReloadIIR_t: {} trailing bytes", r.remaining());
+            Some(InventoryMsg::Reload { source, weapon, remaining, clip, remove_source })
+        }
         TEMPLATE_ACTION => {
             let (item, count) = read_acg_count(r)?;
             let (action, identity_a, identity_b) = (r.i32()?, Identity::read(r)?, Identity::read(r)?);
@@ -278,6 +286,20 @@ mod tests {
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.split_whitespace().collect();
         (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn reload_wire_counts_and_i32_flag() {
+        let mut bytes = hex("26515e61 0000c350 00000007 00 00000068 00000040 0000c750 00000123 00000064 00000019 00000000");
+        assert_eq!(parse(&bytes).unwrap(), Some(InventoryMsg::Reload {
+            source: item_identity(0x40), weapon: Identity { kind: 0xc750, instance: 0x123 },
+            remaining: 100, clip: 25, remove_source: false,
+        }));
+        for n in 13..bytes.len() { assert!(parse(&bytes[..n]).is_err()); }
+        *bytes.last_mut().unwrap() = 2;
+        assert!(matches!(parse(&bytes).unwrap(), Some(InventoryMsg::Reload { remove_source: true, .. })));
+        bytes.push(0);
+        assert!(parse(&bytes).is_err());
     }
 
     #[test]

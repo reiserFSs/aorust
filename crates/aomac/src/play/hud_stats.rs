@@ -1885,7 +1885,7 @@ mod tests {
         s.zone.stats.insert(51, 0);
         s.zone.world.update_attack_bars(own, true, 0.0);
         assert_eq!(s.zone.world.attack_bar_progress(own, &s.zone.stats).len(), 2, "both hands open a bar");
-        s.zone.world.start_reload_bar(own);
+        s.zone.world.start_reload_bar(500);
         assert!(s.zone.world.reload_bar_progress().is_some());
         // Body Boost (29091), same real-rdb fixture as `dynels.rs`'s own nano tests.
         let identity = Identity { kind: 50000, instance: own };

@@ -959,6 +959,9 @@ impl Play {
                         zone::ZoneEvent::Alive => { self.zt("server_alive"); self.alive(); }
                         // `GameTime_t::Update`: the clock jumps to the server's; the loading world already used the older one
                         zone::ZoneEvent::Time => host.sky_clock = Some(self.zone.day_time()),
+                        zone::ZoneEvent::Reloading => {
+                            if let Some(c) = self.chat.as_mut() { c.feedback(&mut self.gui, "Feedback_Reloading", &self.text); }
+                        }
                         zone::ZoneEvent::None => {}
                     }
                 }

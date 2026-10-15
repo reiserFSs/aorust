@@ -228,7 +228,7 @@ Note on names: the id of the 4 ids first not matched by an `IIR_t` string scan w
 | `260F3671` | `FollowTargetIIR_c` | both | [GC 0x1000dc0a] | [GC 0x1000b89d] | 173 | `FUN_1003fba6` 0x1003fba6 |
 | `264B514B` | `RelocateDynelsIIR_t` | ? | [GC 0x1000fd04] | [GC 0x1000ca70] |  |  |
 | `264E5F61` | `AbsorbIIR_t` | ? | [GC 0x1000e938] | [GC 0x1000bfd5] |  |  |
-| `26515E61` | `ReloadIIR_t` | ? | [GC 0x1000fca6] | [GC 0x1000ca3e] |  |  |
+| `26515E61` | `ReloadIIR_t` | S→C | [GC 0x1000fca6] | [GC 0x1000ca3e] | 28 | reader 0x100766e1 / writer 0x1007673a; source identity, weapon identity, source count, clip count, i32 remove flag; apply 0x10069274 (combat-timers.md §3) |
 | `270A4C62` | `KnubotCloseChatWindowIIR_c` | C→S | [GC 0x1000de3e] | [GC 0x1000b9cc] |  | `N3Msg_NPCChatCloseWindow` 0x1001ce62 |
 | `271B3A6B` | `SimpleCharFullUpdateIIR_t` | S→C | [GC 0x1001016a] | [GC 0x1000cc96] | 81 |  |
 | `28251F01` | `StartLogoutIIR_t` | ? | [GC 0x1000e6ae] | [GC 0x1000be6a] |  |  |

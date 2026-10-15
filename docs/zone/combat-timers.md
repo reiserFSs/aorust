@@ -106,7 +106,7 @@ Runtime behavior is intentionally unchanged for this report.
 
 ### Native Reload message and timer
 
-* **Message class**: `ReloadIIR_t` **0x26515E61** remains registered but undecoded in the port.
+* **Message class**: `ReloadIIR_t` **0x26515E61** is decoded as `InventoryMsg::Reload`.
   Fresh Gamecode `ReadSubClass` **0x100766e1**, corroborated by writer **0x1007673a**, establishes a
   **28-byte body**: ammo-source `Identity`, weapon `Identity`, remaining-source-count `i32`,
   new-clip-count `i32`, and flag **`i32`** (nonzero becomes true, despite the in-memory one-byte bool).
@@ -128,11 +128,17 @@ Runtime behavior is intentionally unchanged for this report.
   reaches sender **0x1006949a**, which only gates and sends `CharacterActionIIR_t` action **0xd2**.
   It does **not** start the timer on send. Ordinary hit application **0x1006a8f3** assigns the server's
   ammo field to stat 26 for ammo-bearing weapons; it does not locally decrement a clip or send Reload.
-* **Port limitation, outside this Solar-rifle report:** `hud_use.rs` still predicts a Reload bar on a
-  manual send instead of decoding the server message. The former statement that the native trigger
-  timing was unknown is withdrawn: it is the server apply above. End-to-end ordinary finite-ammo
-  reload behavior still needs a finite-magazine capture; do not add a fabricated automatic reload
-  for the self-supplied Solar rifle to compensate for that separate gap.
+* **Port implementation (2026-10-15):** the manual action now only sends action 0xd2; no predicted timer.
+  Server acknowledgement replaces the source stack count or removes the source, then resolves the exact
+  weapon identity (including bag weapons), updates nonnegative Ammo26, starts its raw RechargeDelay timer,
+  and emits `Feedback_Reloading`. No template/item exceptions and no fabricated automatic reload.
+  Fresh `FUN_10048829` resolves own pages, registered container high words, bank and temporary trade inventory;
+  `FUN_1002ad45` stores an unsigned 16-bit count and converts values outside 0..65535 to zero.
+  Regression `reload_wire_counts_and_i32_flag` covers the 28-byte body, noncanonical true, truncation and
+  trailing bytes; `reload_ack_updates_source_and_exact_weapon_before_feedback` feeds actual framed synthetic
+  bytes through `Zone::on_frame`, covering dual-wield exact selection, source replacement/removal,
+  signed container registration, count bounds and negative-Ammo rejection. These are native-derived
+  synthetic checks, **not** a finite-magazine live capture; that independent server acceptance remains unverified.
 * **Offscreen live evidence (2026-10-15):** Aomacfixr 33588 wielded template **121569**, weapon
   **24763172**. Both received weapon updates at **5291 ms** carried current ammo26 **0**.
   The two normal own hits at **19203 / 21389 ms** dealt **11 / 2** damage in slot6 and each supplied

@@ -49,6 +49,8 @@ pub struct Item {
     pub effect_type: i32,
     pub impact_effect_type: i32,
     pub ammo: i32,
+    /// Effective Ammo (26), updated only by server weapon/reload messages.
+    pub clip: i32,
     /// Stat `AttackDelay` (0x126 = 294).
     pub delay: i32,
     /// Stat `RechargeDelay` (0xd2 = 210): the item-info DPS cell's other half of the round time
@@ -173,7 +175,7 @@ impl Armory {
         let animations = record.as_ref().map(|r| ao_formats::dynel_visual::animation_map(r)).unwrap_or_default();
         let effects = record.as_ref().and_then(|r| super::super::chat::item_template_spells(r, 10).ok()).map(|s| super::effects::bindings(&s)).unwrap_or_default();
         let invalid = ao_formats::stats::INVALID;
-        Item { item_class: get(&stats, 0x37).unwrap_or(0), dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), delay: get(&stats, 0x126).unwrap_or(200), recharge: get(&stats, 0xd2).unwrap_or(200), initiative_skill: get(&stats, 440).unwrap_or(invalid), attack_cap: get(&stats, 523).filter(|&v| v != invalid), recharge_cap: get(&stats, 524).filter(|&v| v != invalid), attack_range: get(&stats, 0x11f).unwrap_or(if wielded { 20 } else { 2 }), effect_type: get(&stats, 413).unwrap_or(0), impact_effect_type: get(&stats, 414).unwrap_or(49999), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), animations, effects, wielded }
+        Item { item_class: get(&stats, 0x37).unwrap_or(0), dtype: get(&stats, STAT_DAMAGE_TYPE).unwrap_or(DEFAULT_DAMAGE_TYPE), ammo: get(&stats, STAT_AMMO_TYPE).unwrap_or(-1), clip: get(&stats, 26).unwrap_or(invalid), delay: get(&stats, 0x126).unwrap_or(200), recharge: get(&stats, 0xd2).unwrap_or(200), initiative_skill: get(&stats, 440).unwrap_or(invalid), attack_cap: get(&stats, 523).filter(|&v| v != invalid), recharge_cap: get(&stats, 524).filter(|&v| v != invalid), attack_range: get(&stats, 0x11f).unwrap_or(if wielded { 20 } else { 2 }), effect_type: get(&stats, 413).unwrap_or(0), impact_effect_type: get(&stats, 414).unwrap_or(49999), sounds: tpl.map(|t| t.sounds).unwrap_or_default(), animations, effects, wielded }
     }
 
     /// `holder` wields weapon dynel `item` in body `slot` (`WeaponItemFullUpdateIIR_t`).
@@ -297,6 +299,19 @@ impl Armory {
 
     pub fn weapon_item(&self, item: i32) -> Option<&Item> {
         self.bag.get(&item).or_else(|| self.worn_item(item).map(|(_, _, item)| item))
+    }
+
+    /// GC10069274: set the named weapon's nonnegative Ammo; return raw RechargeDelay.
+    pub fn reload(&mut self, weapon: ao_net::msg::Identity, clip: i32) -> Option<i32> {
+        if weapon.kind != ao_net::n3::dynel::KIND_WEAPON_ITEM { return None; }
+        let item = if let Some(&(holder, slot)) = self.worn.get(&weapon.instance) {
+            self.by.get_mut(&holder)?.slots.get_mut(&slot)?
+        } else {
+            self.bag.get_mut(&weapon.instance)?
+        };
+        if item.clip < 0 { return None; }
+        item.clip = clip;
+        Some(item.recharge)
     }
 
 

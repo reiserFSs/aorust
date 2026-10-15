@@ -45,6 +45,8 @@ pub enum ZoneEvent {
     /// `CharInPlayIIR_t` relayed for the own character (the server's echo of our `CharInPlay`): `Activate` [GC 0x1007264d] sets stat
     /// `InPlay` and posts event `0xa5` = `FlowControlModule_t::AliveMessage` [GUI 0x10028543] (docs/zone/world.md §10.2).
     Alive,
+    /// ReloadIIR_t applied to an ammo-bearing weapon (GC10069274).
+    Reloading,
     None,
 }
 
@@ -566,6 +568,11 @@ impl Zone {
                 // `FUN_1002aeca` replaces the character's inventory vector by the message's elements
                 self.inventory = c.inventory.iter().map(|e| (e.slot, *e)).collect();
                 self.set_effects(&c.spells);
+            }
+            N3::Inventory(ao_net::n3::inventory::InventoryMsg::Reload { source, weapon, remaining, clip, remove_source })
+                if who.kind == CHAR_KIND && (who.instance == self.char_id as i32 || self.dynels.contains_key(&who.instance)) =>
+            {
+                if self.apply_reload(source, weapon, remaining, clip, remove_source) { return ZoneEvent::Reloading; }
             }
             // server item moves of the own inventory (`play/hud_stats/zone_inv.rs`, docs/gui.md §11.12)
             N3::Inventory(m) if who.kind == CHAR_KIND && who.instance == self.char_id as i32 => self.apply_inventory(&m),
