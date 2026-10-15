@@ -714,10 +714,11 @@ impl ShortcutBar {
 
 /// Native IconPositionSystem_t archive, GUI 1001e53a / 1001e148.
 fn legacy_positions(bytes: &[u8]) -> anyhow::Result<Vec<(u32, u32, usize, usize)>> {
-    let mut words = bytes.chunks_exact(4);
-    anyhow::ensure!(words.remainder().is_empty(), "unaligned IconPositions.bin");
+    let (words, remainder) = bytes.as_chunks::<4>();
+    anyhow::ensure!(remainder.is_empty(), "unaligned IconPositions.bin");
+    let mut words = words.iter();
     let mut next = || -> anyhow::Result<u32> {
-        Ok(u32::from_be_bytes(words.next().ok_or_else(|| anyhow::anyhow!("truncated IconPositions.bin"))?.try_into()?))
+        Ok(u32::from_be_bytes(*words.next().ok_or_else(|| anyhow::anyhow!("truncated IconPositions.bin"))?))
     };
     anyhow::ensure!(next()? as usize == bytes.len(), "IconPositions.bin size mismatch");
     let maps = next()? as usize;
