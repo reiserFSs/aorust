@@ -1030,6 +1030,7 @@ impl Hud {
         self.mission.sync_removed(zone);
         self.mission.update(gui, _dt);
         self.outbox.extend(self.mission.take_outbox());
+        self.system_lines.extend(self.mission.take_lines());
         if let Some(m) = self.mission.take_marker() {
             self.set_mission(Some(m));
         }

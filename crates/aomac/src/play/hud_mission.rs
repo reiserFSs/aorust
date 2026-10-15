@@ -55,6 +55,7 @@ pub(super) struct HudMission {
     closed: Vec<WindowKind>,
     outbox: Vec<Frame>,
     urls: Vec<String>,
+    lines: Vec<String>,
     press: Option<i32>,
     last_click: Option<(i32, f32)>,
     marker: Option<(u32, [f32; 2])>,
@@ -88,6 +89,7 @@ impl HudMission {
             closed: vec![],
             outbox: vec![],
             urls: vec![],
+            lines: vec![],
             press: None,
             last_click: None,
             marker: None,
@@ -124,6 +126,10 @@ impl HudMission {
     pub(super) fn take_urls(&mut self) -> Vec<String> {
         std::mem::take(&mut self.urls)
     }
+    pub(super) fn take_lines(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.lines)
+    }
+
 
     /// Native MultiListView release semantics apply to every cell, not just the name text.
     pub(super) fn input(&mut self, gui: &Gui, ev: &ao_gui::InputEvent, mods: ao_gui::Modifiers) {
@@ -293,10 +299,14 @@ impl HudMission {
         }
     }
 
-    /// `N3Msg_RemoveQuest` [GC 0x10019e5a]: a quest with bit 10 set is kept (the original prints a feedback text, UNRESOLVED), otherwise the message goes out.
+    /// GC `0x10019e5a`: kept quests emit category0x66 feedback instead of a request.
     fn remove(&mut self, zone: &Zone, key: i32) {
-        if let Some(q) = self.quest(key).filter(|q| q.removable()) {
-            self.outbox.push(outgoing::n3_frame(0, zone.char_id, quest::remove_quest(zone.char_id as i32, q.id)));
+        if let Some(q) = self.quest(key) {
+            if q.removable() {
+                self.outbox.push(outgoing::n3_frame(0, zone.char_id, quest::remove_quest(zone.char_id as i32, q.id)));
+            } else if let Some(text) = self.texts.by_key(0x66, "Quest_CannotDelete") {
+                self.lines.push(text);
+            }
         }
     }
 
@@ -513,6 +523,8 @@ mod tests {
         m.quests.push(quest(3, "Keep", 1 << 10, 0));
         m.remove(&zone, 3);
         assert!(m.take_outbox().is_empty());
+        assert_eq!(m.take_lines(), vec![m.texts.by_key(0x66, "Quest_CannotDelete").expect("native kept-quest feedback")]);
+        assert!(m.take_lines().is_empty(), "feedback is consumed once");
         // A removal action does not resend QuestFullUpdate: discard the stale row
         // when the canonical Zone list no longer contains that quest.
         let mut zone = Zone::new(7);
