@@ -9,7 +9,7 @@
 //! `Upload2Map` (only with `N3Msg_GetQuestWorldPos`: `FUN_100d2409` emits `GlobalSignals+0x158`, the map / compass marker), `UpdateTeamMembers` (team missions only:
 //! `N3Msg_UpdateNearbyTeamMembers`) and `DeleteMission` (`FUN_100d2517`: the `ReallyWant2DeleteMission` box `Warning`, Yes / No; Yes = `N3Msg_RemoveQuest`).
 //!
-//! UNRESOLVED / GUESS: the window's size and place (`MissionViewConfig` holds nothing, the ctor's size `FUN_100cf72a` is not decoded: 300 x 180 at the screen centre), the
+//! Initial size: `FUN_100d2c7e` calls `FUN_100cf72a`, returning `(167,112)`; the unsaved dock uses its normal centred placement.
 //! Remaining uses hours:minutes (`FUN_1003cdf6`, case 0xf), from integer seconds, not NCU centiseconds.
 //! UNRESOLVED: exact row tie order; kept-quest feedback is `GetText(0x66, "Quest_CannotDelete")`;
 //! single-quest removal is synchronized from Zone.
@@ -36,8 +36,8 @@ const POPUP_TEAM: u32 = POPUP_BASE + 2;
 const POPUP_DELETE: u32 = POPUP_BASE + 3;
 /// The remaining-time column (`AddColumn(0xf, ...)`).
 const COL_REMAINING: u32 = 0xf;
-/// UNRESOLVED GUESS: client size of the window.
-const CLIENT: (u32, u32) = (300, 180);
+/// GUI `FUN_100cf72a`: `_DAT_101bd710=167`, `_DAT_101bdfa4=112`.
+const CLIENT: (u32, u32) = (167, 112);
 
 pub(super) struct HudMission {
     store: Option<RecordStore>,
@@ -469,6 +469,8 @@ mod tests {
         let mut m = HudMission::new(&dir, (1100, 760)).unwrap();
         let zone = Zone::new(7);
         m.open(&mut gui);
+        assert_eq!(CLIENT, (167, 112), "MissionView's native initial ResizeTo");
+        assert!(gui.window_size(m.win.as_ref().unwrap().win).0 < 300, "do not retain the reconstructed 300px viewport");
         m.quests = vec![quest(1, "Rat Hunt", 0, 10_000 + 90), quest(2, "Team Job", 1 << 8, 0)];
         m.sync = Some((10_000, 0.0));
         m.serial += 1;
