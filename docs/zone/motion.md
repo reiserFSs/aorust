@@ -48,7 +48,7 @@ NPC blobs are 28 bytes; player blobs are 42 bytes, with four input floats immedi
 | 26 | SwitchToSwimMode | → mode 4 | – |
 | 27 | SwitchToCrawlMode | only if not jumping and fwd stopped → mode 5 | – |
 | 28 | SwitchToSneakMode | → mode 6 | – |
-| 29 | SwitchToFlyMode | → mode 7 (also skipped for non-PCs whose stat 0xD7 bit 0 is clear, `FUN_1006b84b`) | – |
+| 29 | SwitchToFlyMode | → mode 7; received move requires NPC (`SimpleChar+0x21c != 0`) or GmLevel (215) bit 0, `FUN_1006b84b`; direct CF92 bypasses this gate | – |
 | 30 | SwitchToSitGroundMode | only if not (fwd/strafe moving, jumping, fly) **and `Features & 4`** → mode 8 | 60 (NPC spawn placement) |
 | 31, 32 | *none* | – | – |
 | 33 | SwitchToSleepMode | only if not jumping and fwd stopped → mode 0xb | – |
@@ -120,12 +120,15 @@ The animation of a status is chosen by `FUN_1006be27` (stationary/moving), `FUN_
 | sneak (moving or not) | Sneak 0x66 (`sneakcool`) |
 | swim moving / stopped | Swim 0x85 / IdleSwim 0xc3 (fallback 0x85, then 0x78) |
 | crawl moving / stopped | Crawl 0x67 / IdleCrawl 0x9a |
-| fly moving / stopped | Fly 0xb3 `hover-norm` (**[GUESS]**, `FUN_1006be27` leaves the clip unchanged for mode 7) / Hover 0xb2 `idle-hover` (`AnimHolder+8`) |
+| fly moving / stopped | Retain current clip while moving (`FUN_1006be27` returns for mode 7); Fly Apply `1006dfaf` and idle `1006c065` request `AnimHolder+8` (`1003c441`, key 0xb2). Existing native parent resolution (`1003c802` → `10010ad1`) maps B2→78; no invented B3/B4 movement clip. |
 | jump | JumpStand 0x9c if fwd stopped else JumpForward 0x9d (`FUN_1006d792`); landing clips 0xb9/0xba/0xbb (`jump-land-walk/run/idle`) are one-shots |
 | sit (8) | SitGround 0xd7 `idle-ground` (after `ground-start` 0xd5 / before `ground-stop` 0xd6), fallback 0x78 |
 | sleep (0xb) / lounge (0xc) | 0xed `sleep-ground` → loops 0xee `idle-sleep-ground`; 0xef `lounging` → 0xf0 `idle-lounging` |
 | frozen | Idle |
 | attack / die | set by the application from combat messages (ids 0x3e8.. weapon sets, die 0x1f4..0x1f9, 0x1770 `die-pain`) |
+
+Remote travel spells use `Dynels::apply_travel_spells` for direct CF92 movement (`100a7bb1`): exit Crawl through 40, Sit through 37, Sleep through 41 then 37, Lounge through 42 then 37, then apply 29 / undo 39. Canonical spell stat writes use the same `apply_travel_stats` hook as StatIIR: MonsterData359 rebuilds through the existing look/model worker only when MechData662 is zero; MonsterScale360 clamps to 20 percent (`10059e6a`) and updates rendering and collision body scale. Appearance data survives shape undo. Real Yalmaha shape99470 resolves mesh42370 with authored idle99429/movement99435 and no hover B2/B3/B4. Regression sources: captured remote SCFU (`zone_enter_ithaca.rec`), `captured_remote_yalmaha_stat_morph_restores_original_look`, `remote_flight_spell_bypasses_received_gate_and_exits_postures`.
+
 
 `SetWantedDirection` (§4) turns a standing NPC with the turn clips. Animation speed: `FUN_1006fb56` scales a newly started movement-state clip (idle included) by `anim_calibration · (vehicle maximum speed)/(+0x170 reference speed)` and by stat 0x168 MonsterScale (`100/scale`); `Dynels` implements this clip-start clock through `avatar::anim_rate` and `Calibration` (see `avatar.md`). Direct stance idles retain authored playback.
 
@@ -246,7 +249,7 @@ Typical loaded-world wiring: on `SimpleCharFullUpdate` create `Mover::new(c.pos,
 ## 7. Unresolved / not found
 
 * Whether the retail client really sits `Features&4` NPCs down on the spawn t30 (see §1); `Features` of players (inferred).
-* The FollowTarget gate on the client character's Features (bit 1 / 0x4000000) and the waypoint arrival radius (virtual `+0xb0`); the strafe speed for remote players; the fly-move clip; turn rate of NPCs (the turn-in-place rate 3.5 rad/s is the player's).
+* The FollowTarget gate on the client character's Features (bit 1 / 0x4000000) and the waypoint arrival radius (virtual `+0xb0`); the strafe speed for remote players; turn rate of NPCs (the turn-in-place rate 3.5 rad/s is the player's).
 * `SimpleChar_t+0x1f8` consumer beyond the AI state angle (`FUN_1007c24a` caller chain: state ids 0/4/5/7/10/11 of `FUN_1007be9f`).
 * `FUN_1007022d`'s helper functions' exact semantics, DC `time`/`extra` (always 0, type 22 hook is a no-op for SimpleChar).
 * Frame-rate normalisation of the reconcile factor (client: once per rendered frame).

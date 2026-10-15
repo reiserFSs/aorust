@@ -577,9 +577,13 @@ fn named(store: &RecordStore, assets: &mut ActorAssets, model: u32, name: &str) 
 /// An NPC: the record's model (`MonsterData` -> rdb 1040023 `Mesh`), `textures[]` replacing the part textures (`SetCATTextures`),
 /// worn `cloth[]` composited over the part's texture like the player equipment, `head` (the place-0 attractor) and attachment
 /// meshes. The record's own `HeadMesh` stat only selects the naked skin textures (`FUN_10058078`), it mounts nothing.
-fn npc_rig(store: &RecordStore, assets: &ActorAssets, look: &CharLook, rec: &NpcRecord, head: Option<u32>, attachments: &[(u8, u32)]) -> anyhow::Result<ActorRig> {
+pub(super) fn npc_rig(store: &RecordStore, assets: &ActorAssets, look: &CharLook, rec: &NpcRecord, head: Option<u32>, attachments: &[(u8, u32)]) -> anyhow::Result<ActorRig> {
     let model = rec.mesh().context("NPC record has no mesh")?;
     let cat = load_cat_mesh(store, CHAR_MESH_TYPE, model)?;
+    // DS 10073110 registers mounts; Randy 100577d3 processes a child only
+    // when GetAttractor succeeds. Keep the retained humanoid head for undo,
+    // but do not require its mount point on a different MonsterData skeleton.
+    let head = head.filter(|_| cat.attractors.iter().any(|a| a.name.ends_with("_head")));
     let list: Vec<TextureOverride> = look.textures.iter().map(|(m, t, env, alpha)| TextureOverride { material: m, texture: *t as u32, env_texture: *env as u32, alpha_mode: *alpha as u32 }).collect();
     let cloth: Vec<(ClothPart, u32)> = super::avatar::visible_cloth(&look.cloth).filter_map(|(p, t)| Some((*ClothPart::ALL.get(p as usize)?, t as u32))).collect();
     let skin_head = rec.stat(64).filter(|&h| h > 0).map(|h| h as u32);
@@ -631,6 +635,8 @@ pub struct Char {
     pub mover: Mover,
     /// `MonsterScale / 100`.
     pub scale: f32,
+    /// Raw MechData (662); native MonsterData writes rebuild only outside a mech.
+    mech_data: i32,
     pub side: u8,
     /// Stat `Flags` (0) and `VisualFlags` (0x2A1), name tag inputs.
     flags: i32,
@@ -1804,6 +1810,47 @@ impl Dynels {
         });
     }
 
+    /// Movement part of travel spells; Zone owns canonical stat writes and CF76 snapshots.
+    pub fn apply_travel_spells(&mut self, application: &ao_net::n3::spells::ApplySpells) {
+        if application.target.kind != CHAR_KIND || application.target.instance == self.own { return; }
+        let Some(c) = self.chars.get_mut(&application.target.instance) else { return };
+        for spell in &application.spells {
+            if spell.function == ao_net::n3::spells::function::FLIGHT {
+                c.mover.apply_flight_spell(application.apply);
+                if application.apply {
+                    c.anim = 0xb2;
+                    c.restart_body = true;
+                }
+            }
+        }
+        c.pose = remote_pose(&mut c.mover, self.collision.as_ref(), 0.0);
+    }
+
+    /// StatIIR and spell writes share GC 10059e6a's visual/movement stat hooks.
+    pub fn apply_travel_stats(&mut self, target: ao_net::msg::Identity, stats: &[(i32, i32)]) {
+        if target.kind != CHAR_KIND { return; }
+        let Some(c) = self.chars.get_mut(&target.instance) else { return };
+        for &(stat, value) in stats {
+            let value = if stat == 360 { value.max(20) } else { value };
+            c.mover.on_stat(stat, value);
+            match stat {
+                0 => c.flags = value,
+                359 if c.mech_data == 0 => {
+                    if let Look::Char(look) = &mut c.look {
+                        look.monster_data = value;
+                        c.next = Some(c.look.key(self.texture_quality)).filter(|&key| key != c.key);
+                    }
+                }
+                360 => c.scale = value as f32 / 100.0,
+                662 => c.mech_data = value,
+                ao_net::n3::motion::STAT_FEATURES => c.features_set = true,
+                _ if stat == super::zone::IN_PLAY_STAT as i32 => c.in_play = value != 0,
+                _ => {}
+            }
+        }
+        c.pose = remote_pose(&mut c.mover, self.collision.as_ref(), 0.0);
+    }
+
 
     /// GC 100a5083 / 100a78c6 / 100a8c03: spell visual handlers use category 0x20.
     pub fn apply_nano_visuals(&mut self, application: ao_net::n3::spells::ApplySpells) {
@@ -2582,7 +2629,8 @@ impl Dynels {
                 let key = look.key(self.texture_quality);
                 let yaw = u.yaw().unwrap_or(0.0);
                 let mut mover = Mover::new(u.pos, yaw);
-                mover.set_body_scale(if u.monster_scale == 0 { 1.0 } else { u.monster_scale as f32 / 100.0 });
+                mover.set_npc(u.is_npc());
+                mover.set_body_scale(u.monster_scale.max(20) as f32 / 100.0);
                 mover.on_stat(0, u.flags2 as i32);
                 if let ao_net::n3::dynel::CharClass::Pc(pc) = &u.class {
                     mover.on_stat(16, pc.stats[1] as i32);
@@ -2612,6 +2660,7 @@ impl Dynels {
                         key,
                         mover,
                         scale: u.monster_scale.max(20) as f32 / 100.0,
+                        mech_data: u.pairs.iter().find(|p| p.0 == 662).map_or(0, |p| p.1),
                         side: u.side,
                         flags: u.flags2 as i32,
                         visual_flags: u.visual_flags as i32,
@@ -2663,17 +2712,7 @@ impl Dynels {
                 }
             }
             N3::Dynel(Dynel::Stat(s)) => {
-                if let Some(c) = self.chars.get_mut(&who.instance) {
-                    for &(stat, value) in &s.stats {
-                        c.mover.on_stat(stat, value);
-                        if stat == ao_net::n3::motion::STAT_FEATURES {
-                            c.features_set = true;
-                        }
-                        if stat == super::zone::IN_PLAY_STAT as i32 {
-                            c.in_play = value != 0;
-                        }
-                    }
-                }
+                self.apply_travel_stats(who, &s.stats);
                 if s.stats.iter().any(|&(stat, value)| stat == 0x1b && value <= 0) && self.chars.get(&who.instance).is_some_and(|c| !matches!(c.special, Special::Die(_))) {
                     self.die(who.instance, DIE_KEY);
                 }
@@ -2929,6 +2968,10 @@ impl Dynels {
                         (c.key, c.next) = (k, None);
                         c.current_skin = None;
                         c.cadence = Default::default();
+                        c.pose_cache = Default::default();
+                        c.bounds = None;
+                        c.previous_body = None;
+                        c.parts.clear();
                     }
                     Some(Model::Failed) => c.next = None,
                     _ => {}
@@ -2950,7 +2993,7 @@ impl Dynels {
             let (dx, dz) = (p[0] - cam[0], p[2] - cam[2]);
             let dist = (dx * dx + (p[1] - cam[1]).powi(2) + dz * dz).sqrt();
             // clip: death / attack override the movement state; walking and running scale the clip with the real speed
-            let state = c.pose.anim;
+            let state = if c.mover.status().mode == Mode::Fly && !c.mover.status().jumping { AnimState::Hover } else { c.pose.anim };
             // Finish before selecting the next body, never rewind the outgoing clip before skinning.
             if matches!(c.special, Special::Once(_)) && c.body_once && !c.restart_body
                 && built.clips.get(&c.anim).and_then(|clips| clips.get(c.roll.variant)).is_some_and(|clip| c.clip_ms >= clip.duration)
@@ -2976,6 +3019,15 @@ impl Dynels {
                     ),
                     None => (0x78, clip_of(built, state).map(|x| x.1), 1.0),
                 },
+                // GC 1006be27 leaves moving mode 7 unchanged; 1006c065/1006dfaf
+                // request holder+8 on idle/entry, using the existing native key-parent resolver.
+                Special::None if c.mover.status().mode == Mode::Fly && !c.mover.status().jumping => {
+                    let entering = !matches!(c.roll.key, Some((_, Some(AnimState::Hover))));
+                    let hover = (entering || c.mover.status().forward == 0) && built.clips.contains_key(&0xb2);
+                    let id = if hover { 0xb2 } else { c.anim };
+                    movement_rate = false;
+                    (id, built.clips.get(&id), 1.0)
+                }
                 Special::None => {
                     let (id, a) = clip_of(built, state).map_or((0x78, None), |(i, a)| (i, Some(a)));
                     // a wielder: the idle of the equip routine (rifle / bazooka list 0x29) out of a fight, the weapon idle (list 0x10) in a fight, the
@@ -3956,6 +4008,89 @@ mod tests {
             let m = ao_net::n3::decode(frame).ok()?;
             matches!(&m.body, N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if !u.is_npc()).then_some(m)
         }).unwrap()
+    }
+
+    #[test]
+    fn captured_remote_yalmaha_stat_morph_restores_original_look() {
+        let spawn = captured_posture_player();
+        let who = spawn.header.target;
+        let mut world = Dynels::default();
+        world.on_message(&spawn);
+        let original = world.chars[&who.instance].look.clone();
+        let original_key = world.chars[&who.instance].key;
+        let mut stat = spawn.clone();
+        stat.body = N3::Dynel(Dynel::Stat(ao_net::n3::dynel::StatUpdate { stats: vec![(359, 99470), (360, 10)], rest: vec![] }));
+        world.on_message(&stat);
+        let c = &world.chars[&who.instance];
+        assert!(matches!(&c.look, Look::Char(look) if look.monster_data == 99470));
+        assert!(c.next.is_some());
+        assert_eq!(c.scale, 0.2, "native stat360 minimum is 20 percent");
+        world.apply_travel_stats(who, &[(662, 1), (359, 0)]);
+        assert!(matches!(&world.chars[&who.instance].look, Look::Char(look) if look.monster_data == 99470), "mech gates rebuild, not canonical raw stat");
+        world.apply_travel_stats(who, &[(662, 0), (359, 0), (360, 100)]);
+        let c = &world.chars[&who.instance];
+        assert_eq!(c.look, original);
+        assert_eq!(c.next, None);
+        assert_eq!(c.key, original_key);
+        assert_eq!(c.scale, 1.0);
+
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let record = NpcRecord::lookup(&store, 99470).unwrap().unwrap();
+        assert_eq!(record.mesh(), Some(42370));
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let Look::Char(mut look) = original else { unreachable!() };
+        look.monster_data = 99470;
+        let built = build_char(&store, &mut assets, &look).unwrap();
+        assert!(built.clips.contains_key(&0x78), "authored idle99429");
+        assert!(built.clips.contains_key(&0x65), "authored movement99435");
+        for key in [0xb2, 0xb3, 0xb4] {
+            assert!(record.anim_variants(key).is_empty(), "Yalmaha has no authored hover clip {key:x}");
+        }
+        assert_eq!(ao_formats::character::holder_variants(&record, 0xb2), &[99429], "native hover parent resolves authored idle");
+    }
+
+    #[test]
+    fn rdb_yalmaha_spells_replay_remote_apply_and_undo_through_zone() {
+        use ao_net::{n3::{inventory as inv, outgoing::n3_frame, spells, world::{AcgItem, InventoryEntry}}, Writer};
+        use super::super::hud_stats::equipment::Equipment;
+        let Some(dir) = client() else { return };
+        let frame = frames(include_str!("../../../../docs/captures/zone_enter_ithaca.rec")).into_iter().find(|frame| {
+            matches!(ao_net::n3::decode(frame).map(|m| m.body), Ok(N3::Dynel(Dynel::SimpleCharFullUpdate(u))) if !u.is_npc())
+        }).unwrap();
+        let who = ao_net::n3::decode(&frame).unwrap().header.target;
+        let mut zone = Zone::new((who.instance + 1) as u32);
+        zone.on_frame(&frame);
+        let original = zone.world.chars[&who.instance].look.clone();
+        let original_scale = zone.stat_of(who.instance, 360);
+        assert_eq!(zone.stat_of(who.instance, 359), Some(0));
+        zone.inventory.insert(1, InventoryEntry {
+            slot: 1, a: 0, b: 1, id: inv::item_identity(1),
+            item: AcgItem { low_id: 96088, high_id: 117322, level: 30 },
+        });
+        let mut equipment = Equipment::new(&dir);
+        equipment.refresh(&zone);
+        assert_eq!(equipment.effects().iter().map(|spell| spell.function).collect::<Vec<_>>(),
+            [0xcf35, 0xcf4c, 0xcf76, 0xcf92, 0xcf44]);
+        for apply in [true, false] {
+            let mut writer = Writer::default();
+            writer.u32(spells::APPLY_SPELLS);
+            who.write(&mut writer);
+            writer.u8(0);
+            writer.0.extend(spells::encode(who, equipment.effects(), apply).unwrap());
+            zone.on_frame(&n3_frame(0, 43, writer.0));
+            let remote = &zone.world.chars[&who.instance];
+            if apply {
+                assert_eq!((zone.stat_of(who.instance, 359), zone.stat_of(who.instance, 360)), (Some(99470), Some(20)));
+                assert!(matches!(&remote.look, Look::Char(look) if look.monster_data == 99470));
+                assert_eq!(remote.scale, 0.2);
+                assert_eq!(remote.mover.status().mode, Mode::Fly);
+            } else {
+                assert_eq!((zone.stat_of(who.instance, 359), zone.stat_of(who.instance, 360)), (Some(0), original_scale));
+                assert_eq!(remote.look, original);
+                assert_ne!(remote.mover.status().mode, Mode::Fly);
+            }
+        }
     }
 
     fn posture_action(who: i32, action_id: i32) -> Message {

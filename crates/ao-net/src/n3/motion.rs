@@ -537,6 +537,8 @@ pub struct Mover {
     strength: i32,
     agility: i32,
     gm_level: i32,
+    /// SimpleChar+0x21c: received flight is allowed for NPCs, or GmLevel bit 0.
+    npc: bool,
     flags: u32,
     falling: bool,
     body_scale: f32,
@@ -574,6 +576,7 @@ impl Mover {
             strength: super::world::STAT_UNSET,
             agility: super::world::STAT_UNSET,
             gm_level: super::world::STAT_UNSET,
+            npc: false,
             flags: 0,
             falling: true,
             body_scale: 1.0,
@@ -635,6 +638,29 @@ impl Mover {
         self.sit_ok = ok;
     }
 
+    pub fn set_npc(&mut self, npc: bool) {
+        self.npc = npc;
+    }
+
+    /// CF92 (GC 100a7bb1) invokes the FSM directly, bypassing the received-move GM gate.
+    pub fn apply_flight_spell(&mut self, apply: bool) {
+        use MoveType::*;
+        match self.status.mode {
+            Mode::Crawl => { self.on_move_type(LeaveCrawlMode as u8); }
+            Mode::SitGround => { self.on_move_type(LeaveSitMode as u8); }
+            Mode::Sleep => {
+                self.on_move_type(LeaveSleepMode as u8);
+                self.on_move_type(LeaveSitMode as u8);
+            }
+            Mode::Lounge => {
+                self.on_move_type(LeaveLoungeMode as u8);
+                self.on_move_type(LeaveSitMode as u8);
+            }
+            _ => {}
+        }
+        self.on_move_type(if apply { SwitchToFlyMode } else { LeaveFlyMode } as u8);
+    }
+
     /// Run FSM transition `id` directly (what `CharacterActionIIR_t` actions 0x56/0x57 do through `vtable[6]`), with the
     /// guards' Features bit-4 test taken from the dynel's own Features stat (= `Features & 4`, the helper at `dynel+0x1ec`
     /// holds the dynel itself). Returns whether the transition was valid. No placement, no follow cancel.
@@ -669,7 +695,7 @@ impl Mover {
             16 => self.strength = value,
             17 => self.agility = value,
             215 => self.gm_level = value,
-            360 => self.body_scale = if value == 0 { 1.0 } else { value as f32 / 100.0 },
+            360 => self.body_scale = value.max(20) as f32 / 100.0,
             _ => {}
         }
     }
@@ -784,6 +810,10 @@ impl Mover {
         }
         if m.move_type != 22 && m.move_type != 15 {
             self.stop_follow();
+        }
+        // GC 1006b84b: placement/follow cancellation precede the received-flight gate.
+        if m.move_type == MoveType::SwitchToFlyMode as u8 && !self.npc && self.gm_level & 1 == 0 {
+            return;
         }
         if let Some(t) = MoveType::from_id(m.move_type) {
             if self.apply(t) {
@@ -1104,6 +1134,35 @@ mod tests {
     use super::*;
     use crate::n3::{capture, decode, dynel::Dynel, misc::Misc, Message, N3};
     use std::collections::HashMap;
+
+    #[test]
+    fn remote_flight_spell_bypasses_received_gate_and_exits_postures() {
+        let dc = CharDCMove { move_type: 29, type_bit7: false, rot: [0.0, 0.0, 0.0, 1.0], pos: [0.0, 8.0, 0.0], time: 0, extra: [0.0; 2] };
+        for (npc, gm, allowed) in [(false, 0, false), (false, 2, false), (false, 1, true), (true, 0, true)] {
+            let mut mover = Mover::new(dc.pos, 0.0);
+            mover.set_features(4);
+            mover.set_npc(npc);
+            mover.on_stat(215, gm);
+            mover.on_char_dc_move(&dc);
+            assert_eq!(mover.status.mode == Mode::Fly, allowed);
+        }
+        for mode in [Mode::Crawl, Mode::SitGround, Mode::Sleep, Mode::Lounge, Mode::Run] {
+            let mut mover = Mover::new(dc.pos, 0.0);
+            mover.set_features(4);
+            mover.on_stat(215, 0);
+            mover.status.mode = mode;
+            mover.status.prev_mode = Mode::Run;
+            mover.apply_flight_spell(true);
+            assert_eq!(mover.status.mode, Mode::Fly);
+            mover.on_move_type(MoveType::ForwardStart as u8);
+            mover.on_move_type(MoveType::ElevateUpStart as u8);
+            surface_step(&mut mover, 1.0, |_| 0.0);
+            assert!(mover.pos[1] > 8.5 && mover.pos[2] > 0.0);
+            mover.apply_flight_spell(false);
+            assert_eq!(mover.status.mode, Mode::Run);
+            assert!(mover.falling_enabled());
+        }
+    }
 
     #[test]
     fn leave_apply_writes_wait_state_even_without_mode_change() {

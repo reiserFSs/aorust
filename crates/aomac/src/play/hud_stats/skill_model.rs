@@ -134,6 +134,8 @@ impl Model {
             let raw = if id == 22 { self.ams } else { get(id).unwrap_or(0) };
             values.insert(id, buffs::skill_value(&self.tables, id, raw, &ch, &self.mods, lock));
         }
+        let scale = get(360).unwrap_or(100);
+        zone.monster_scale_bonus = self.mods.bonus_of(360, scale, lock);
         zone.skill_values = values;
     }
 

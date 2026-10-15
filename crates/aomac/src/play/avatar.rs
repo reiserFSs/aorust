@@ -373,6 +373,12 @@ pub struct Avatar {
     look: PlayerLook,
     attachments: Vec<(u8, u32)>,
     cloth_pages: Vec<(i32, i32)>,
+    monster_data: i32,
+    monster: Option<ao_formats::character::NpcRecord>,
+    monster_look: super::dynels::CharLook,
+    // ponytail: own variants use a private CRT stream; share the scene stream if
+    // multi-variant own morph/effect ordering needs exact retail interleaving.
+    monster_rand: ao_formats::character::CrtRand,
     assets: ActorAssets,
     scale: f32,
     calibration: Calibration,
@@ -430,7 +436,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, body_once: false, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, ms: 0.0, body_delay_ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_once: false, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, current_skin: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), monster_data: 0, monster: None, monster_look: super::dynels::CharLook::from_update(u), monster_rand: ao_formats::character::CrtRand::new(1), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, body_once: false, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, ms: 0.0, body_delay_ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_once: false, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -445,6 +451,54 @@ impl Avatar {
     /// The model for `Host::actor_models` (key [`MODEL_KEY`]).
     pub fn model(&self) -> &Scene {
         self.rig.model()
+    }
+
+    fn invalidate_model(&mut self) {
+        *self.current_skin.get_mut() = None;
+        self.current_bounds.set(None);
+        self.current_parts.get_mut().clear();
+        *self.pose_cache.get_mut() = Default::default();
+        self.sample_pose.set(true);
+    }
+
+    /// GC 10059e6a -> 10052147 -> 10051d2d: MonsterData replaces the actor,
+    /// not an attractor. The caller applies the MechData guard before this call.
+    pub fn set_monster_data(&mut self, store: &RecordStore, monster_data: i32) -> Result<bool> {
+        if self.monster_data == monster_data { return Ok(false); }
+        let monster = if monster_data != 0 {
+            ao_formats::character::NpcRecord::lookup(store, monster_data as u32)?
+        } else { None };
+        let rig = if let Some(rec) = &monster {
+            super::dynels::npc_rig(store, &self.assets, &self.monster_look, rec, self.look.head, &self.attachments)?
+        } else {
+            ActorRig::player(store, &self.assets, &self.look, &self.attachments)?
+        };
+        self.rig = rig;
+        self.monster_data = monster_data;
+        self.monster = monster;
+        self.invalidate_model();
+        // Never blend clips belonging to different CAT skeletons.
+        self.clip = None;
+        self.prev_clip = None;
+        self.actions.clear();
+        self.notes.clear();
+        self.set_pose(store, self.pose.clone())?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(in crate::play) fn monster_visual(&self) -> (i32, u32, u32) {
+        (self.monster_data, self.rig.model_id, self.clip_id)
+    }
+
+    /// Effective native MonsterScale(kind 3) / 100, supplied by the stat owner.
+    pub fn set_body_scale(&mut self, scale: f32) {
+        if self.scale == scale { return; }
+        let ratio = scale / self.scale;
+        for axis in [&mut self.transform.x_axis, &mut self.transform.y_axis, &mut self.transform.z_axis] {
+            *axis *= ratio;
+        }
+        self.scale = scale;
     }
 
     /// Apply cloth deltas and replace attractors (`AppearanceUpdateIIR_c::Activate`, GC 0x10071679).
@@ -469,18 +523,34 @@ impl Avatar {
             return Ok(false);
         }
         let look = PlayerLook { head, equipment, ..self.look.clone() };
-        self.rig = ActorRig::player(store, &self.assets, &look, &attachments)?;
-        *self.current_skin.get_mut() = None;
-        self.current_bounds.set(None);
+        self.monster_look.apply_appearance(appearance);
+        self.rig = if let Some(rec) = &self.monster {
+            super::dynels::npc_rig(store, &self.assets, &self.monster_look, rec, head, &attachments)?
+        } else {
+            ActorRig::player(store, &self.assets, &look, &attachments)?
+        };
+        self.invalidate_model();
         self.look = look;
         self.attachments = attachments;
         Ok(true)
     }
 
+    fn action_clip(&mut self, id: u16) -> Option<(u32, super::combat::anim::Layer)> {
+        use super::combat::anim::{resolve_clip, Layer, ANIMS};
+        if let Some(rec) = &self.monster {
+            let variants = ao_formats::character::holder_variants(rec, u32::from(id));
+            let clip = ao_formats::character::pick_variant(variants, &mut || self.monster_rand.rand())?;
+            let layer = ANIMS.iter().find(|a| a.0 == id).map_or(Layer::Body, |a| a.2);
+            Some((clip, layer))
+        } else {
+            resolve_clip(&self.assets.names, self.anim_set, id, false).map(|(clip, _, layer)| (clip, layer))
+        }
+    }
+
     /// Abstract-id action playback; explicit `Layer_e` overrides the table's layer.
     pub fn play_action(&mut self, store: &RecordStore, id: u16, layer: Option<u8>, priority: i32) -> Result<bool> {
-        use super::combat::anim::{resolve_clip, Layer};
-        let Some((clip_id, _, default_layer)) = resolve_clip(&self.assets.names, self.anim_set, id, false) else { return Ok(false) };
+        use super::combat::anim::Layer;
+        let Some((clip_id, default_layer)) = self.action_clip(id) else { return Ok(false) };
         let clip = self.assets.anim(store, clip_id)?;
         let layer = layer.unwrap_or(match default_layer { Layer::Body => 0, Layer::Upper => 1 });
         self.start_action(clip, layer, priority, 1.0, (None, -1, None));
@@ -493,7 +563,7 @@ impl Avatar {
         }
         let name = role.clip_name();
         let Some((id, _, _)) = super::combat::anim::ANIMS.iter().find(|(_, clip_name, _)| *clip_name == name) else { return Ok(()) };
-        let Some((clip_id, _, _)) = super::combat::anim::resolve_clip(&self.assets.names, self.anim_set, *id, false) else { return Ok(()) };
+        let Some((clip_id, _)) = self.action_clip(*id) else { return Ok(()) };
         let clip = self.assets.anim(store, clip_id)?;
         let rate = delay.map_or(1.0, |delay| super::combat::anim::swing_speed_scale(clip.events.first().map_or(0.0, |e| e.0 as f32), delay));
         self.start_action(clip, 0, -1, rate, (Some(key), slot, Some(role)));
@@ -515,7 +585,7 @@ impl Avatar {
     /// GC 1006d330: enqueue the infinite mode-2 idle first, then a priority-0 mode-1 enter.
     /// DS 100737db/10072eeb freezes the idle clock; the finite enter keeps its own fade/lifetime.
     pub fn play_posture(&mut self, store: &RecordStore, id: u16, idle: AvatarPose) -> Result<()> {
-        let Some((clip_id, _, _)) = super::combat::anim::resolve_clip(&self.assets.names, self.anim_set, id, false) else { return Ok(()) };
+        let Some((clip_id, _)) = self.action_clip(id) else { return Ok(()) };
         let clip = self.assets.anim(store, clip_id)?;
         let duration = posture_interval_end(&clip);
         let idle_fade = self.actions.iter().rev().find(|action| action.priority == self.body_priority && !action.before_body)
@@ -563,20 +633,39 @@ impl Avatar {
 
     /// Switches clips at the movement handler's authored loop start (GC 0x1006be27 / 0x100108be).
     pub fn set_pose(&mut self, store: &RecordStore, pose: AvatarPose) -> Result<()> {
+        // Movement retains Hover while flying: GC 1006be27 moving mode 7
+        // leaves the flight-entry clip unchanged, not a B3/B4 fallback.
         if pose.role != self.pose.role || self.clip.is_none() {
-            let mut role = pose.role.clone();
-            let clips = self.assets.clips(store, self.rig.model_id)?;
-            // a wielder: the weapon's stance clip over the movement clip while the model's set has it, else the plain role
-            let mut stance = self.stance.and_then(|set| stance_clip(set, &pose.role)).filter(|n| clips.iter().any(|c| c.0 == *n));
-            let (clip, id, calibration_id) = loop {
-                let name = stance.take().unwrap_or_else(|| role.clip_name());
-                if let Some(&(_, id)) = clips.iter().find(|c| c.0 == name) {
-                    let abstract_id = super::combat::anim::ANIMS.iter().find(|a| a.1 == name).map_or(0, |a| u32::from(a.0));
-                    break (Some(self.assets.anim(store, id)?), id, abstract_id);
+            let (clip, id, calibration_id) = if let Some(rec) = &self.monster {
+                let name = pose.role.clip_name();
+                let Some(key) = super::combat::anim::ANIMS.iter().find(|a| a.1 == name).map(|a| u32::from(a.0)) else {
+                    self.pose = pose;
+                    return Ok(());
+                };
+                let variants = ao_formats::character::holder_variants(rec, key);
+                let id = ao_formats::character::pick_variant(variants, &mut || self.monster_rand.rand());
+                match id {
+                    Some(id) => (Some(self.assets.anim(store, id)?), id, key),
+                    None => {
+                        self.pose = pose;
+                        return Ok(()); // native holder failure leaves the installed clip unchanged
+                    }
                 }
-                match fallback(&role) {
-                    Some(r) => role = r,
-                    None => break (None, 0, 0),
+            } else {
+                let mut role = pose.role.clone();
+                let clips = self.assets.clips(store, self.rig.model_id)?;
+                // A wielder overrides movement only while the model has the stance clip.
+                let mut stance = self.stance.and_then(|set| stance_clip(set, &pose.role)).filter(|n| clips.iter().any(|c| c.0 == *n));
+                loop {
+                    let name = stance.take().unwrap_or_else(|| role.clip_name());
+                    if let Some(&(_, id)) = clips.iter().find(|c| c.0 == name) {
+                        let abstract_id = super::combat::anim::ANIMS.iter().find(|a| a.1 == name).map_or(0, |a| u32::from(a.0));
+                        break (Some(self.assets.anim(store, id)?), id, abstract_id);
+                    }
+                    match fallback(&role) {
+                        Some(r) => role = r,
+                        None => break (None, 0, 0),
+                    }
                 }
             };
             let old_ms = self.ms;
@@ -934,6 +1023,48 @@ pub(super) mod tests {
             avatar.ms = 1000.0 / 60.0;
             avatar.sample_pose.set(true);
         }
+    }
+
+    #[test]
+    fn own_yalmaha_shape_replaces_rig_and_restores_humanoid() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
+        let humanoid = avatar.rig.model_id;
+        let humanoid_signature = avatar.rig.cat().signature;
+        assert!(avatar.set_monster_data(&store, 99470).unwrap());
+        assert_eq!(avatar.rig.model_id, 42370);
+        assert_ne!(avatar.rig.cat().signature, humanoid_signature);
+        assert_eq!(avatar.clip_id, 99429);
+        assert_eq!(avatar.clip.as_ref().unwrap().signature, avatar.rig.cat().signature);
+        assert!(avatar.prev_clip.is_none());
+        let frame = avatar.frame();
+        assert_eq!(frame.model, MODEL_KEY);
+        assert!(!avatar.model().meshes.is_empty());
+        assert!(frame.parts.iter().flatten().flatten().all(|v| v.is_finite()));
+        let has_head = avatar.look.head.is_some() && avatar.rig.cat().attractors.iter().any(|a| a.name.ends_with("_head"));
+        assert_eq!(frame.part_attractors.iter().any(|a| *a == Some(0)), has_head);
+        assert!(!avatar.set_monster_data(&store, 99470).unwrap());
+        avatar.set_pose(&store, AvatarPose { role: Role::Run, speed: 7.0, ref_speed: 7.0 }).unwrap();
+        assert_eq!(avatar.clip_id, 99435);
+        avatar.set_pose(&store, AvatarPose::still(Role::Hover)).unwrap();
+        assert_eq!(avatar.clip_id, 99429, "B2 holder falls back to authored idle; no Yalm hover clip");
+        avatar.update(0.1);
+        let (clip, clock) = (avatar.clip_id, avatar.ms);
+        avatar.set_pose(&store, AvatarPose { role: Role::Hover, speed: 7.0, ref_speed: 7.0 }).unwrap();
+        assert_eq!((avatar.clip_id, avatar.ms), (clip, clock), "moving mode 7 must not start a clip");
+        avatar.set_body_scale(0.2);
+        assert_eq!(avatar.body_scale(), 0.2);
+        assert!((avatar.transform.x_axis.truncate().length() - 0.2).abs() < 1e-5);
+        assert!(avatar.set_monster_data(&store, 0).unwrap());
+        assert_eq!(avatar.rig.model_id, humanoid);
+        assert_eq!(avatar.rig.cat().signature, humanoid_signature);
+        assert!(avatar.prev_clip.is_none(), "different skeletons must never crossfade");
+        assert_eq!(avatar.clip.as_ref().unwrap().signature, humanoid_signature);
+        assert!(!avatar.frame().parts.is_empty(), "humanoid mounts must be restored");
+        assert!(avatar.set_monster_data(&store, 202286).unwrap());
+        assert_eq!(avatar.monster_visual().0, 202286);
+        assert_eq!(avatar.rig.model_id, humanoid, "native null record lookup retains the humanoid resolver");
     }
     use super::*;
     use ao_net::{

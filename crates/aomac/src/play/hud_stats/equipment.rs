@@ -90,12 +90,13 @@ pub struct Equipment {
     items: HashMap<(i32, i32, i32), Option<Template>>,
     worn: Vec<(u32, AcgItem)>,
     effects: Vec<Spell>,
+    travel_effects: Vec<Spell>,
     attack: Option<Vec<(u32, i32)>>,
 }
 
 impl Equipment {
     pub fn new(dir: &Path) -> Self {
-        Self { store: RecordStore::open(dir).ok(), templates: HashMap::new(), items: HashMap::new(), worn: Vec::new(), effects: Vec::new(), attack: None }
+        Self { store: RecordStore::open(dir).ok(), templates: HashMap::new(), items: HashMap::new(), worn: Vec::new(), effects: Vec::new(), travel_effects: Vec::new(), attack: None }
     }
 
     fn load(&mut self, item: AcgItem) {
@@ -134,6 +135,28 @@ impl Equipment {
                 self.effects.extend(t.wear.iter().cloned());
                 if matches!(slot, 6 | 8) && self.attack.is_none() && t.weapon { self.attack = Some(t.attack.clone()); }
             }
+        }
+    }
+
+    pub(in crate::play) fn refresh_travel(&mut self, zone: &mut Zone) {
+        self.refresh(zone);
+        let travel = |s: &&Spell| matches!(s.function, 0xCF44 | 0xCF76 | 0xCF92 | 0xCF4B | 0xCF4C);
+        if self.travel_effects.iter().eq(self.effects.iter().filter(travel)) { return; }
+        let mut previous = std::mem::take(&mut self.travel_effects);
+        self.travel_effects.extend(self.effects.iter().filter(travel).cloned());
+        // GC 1004b6f5 -> 10080a79 runs Wear (event 14); 10080cd0 undoes it.
+        // Modifier spells remain in the existing equipment projection, not active_spells.
+        let mut added = Vec::new();
+        for s in &self.travel_effects {
+            if let Some(i) = previous.iter().position(|old| old == s) { previous.remove(i); }
+            else { added.push(s.clone()); }
+        }
+        let removed = previous;
+        let target = ao_net::msg::Identity { kind: super::super::dynels::CHAR_KIND as i32, instance: zone.char_id as i32 };
+        for (spells, apply) in [(removed, false), (added, true)] {
+            if spells.is_empty() { continue; }
+            zone.apply_travel_spell_stats(target, &spells, apply);
+            zone.own_events.push(super::super::zone::OwnEvent::Spells { spells, apply });
         }
     }
 

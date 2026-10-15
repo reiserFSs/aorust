@@ -122,6 +122,8 @@ pub struct Zone {
     pub stat_adjustments: HashMap<u32, i32>,
     /// Own `GetSkill(stat, 2)` projection, refreshed from raw stats and modifier maps before HUD consumers.
     pub skill_values: HashMap<u32, i32>,
+    /// Stat360 additive bonus only: body scale uses holder kind3, not kind2 percent/trickle.
+    pub monster_scale_bonus: i32,
     /// Per-character skills received from full dynel updates, `StatIIR_t` and `SkillIIR_t` (GC `N3Msg_GetSkill`).
     pub character_stats: HashMap<i32, HashMap<u32, i32>>,
     /// Latest InfoPacket per character (`GC 0x1003e694` replaces the cached packet).
@@ -164,6 +166,8 @@ pub struct Zone {
     /// The spells currently running on the own character (`FullCharacterIIR_t` list, `ApplySpellsIIR_t`): their stat bonuses are the buffs of
     /// `GetSkill(stat, 2)` (`play/hud_stats/buffs.rs`, docs/gui.md §11.10).
     pub active_spells: Vec<ao_net::n3::spells::Spell>,
+    /// GC 10064831 / 10063cc9: the first raw value saved by temporary-stat spells, removed on undo.
+    pub temporary_stats: HashMap<(i32, u32), i32>,
     /// Pending [`OwnEvent`]s (drained by the player each frame).
     pub own_events: Vec<OwnEvent>,
     /// District fight-mode level of the own character (`FUN_1003e1d0`, `fightmode.rs`), written by the player each frame; `None` until then
@@ -357,6 +361,7 @@ impl Zone {
         self.trade_state = None;
         self.dynels.clear();
         self.character_stats.clear();
+        self.temporary_stats.clear();
         self.info_packets.clear();
         self.mission_alternatives.clear();
         self.fight_target.clear();
@@ -446,7 +451,7 @@ impl Zone {
                     let s = self.character_stats.entry(who.instance).or_default();
                     s.extend([(0, u.flags2 as i32), (1, u.max_health), (4, u.breed as i32), (0x1b, u.health), (0x21, u.side as i32), (0x36, u.level as i32), (0x3b, u.sex as i32), (0x185, u.expansion as i32), (0x294, u.account_flags as i32), (0x2a1, u.visual_flags as i32)]);
                     s.insert(IN_PLAY_STAT, i32::from(u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0));
-                    s.extend([(0x2f, i32::from(u.fatness)), (0x168, i32::from(u.monster_scale))]);
+                    s.extend([(0x2f, i32::from(u.fatness)), (0x167, u.monster_data), (0x168, i32::from(u.monster_scale))]);
                     if let ao_net::n3::dynel::CharClass::Npc(n) = &u.class {
                         s.extend([(0x184, n.tower_type as i32), (0x1c7, n.npc_family as i32), (0x200, n.pet_type as i32)]);
                         // NPC-only dialogue flag (`SimpleChar+0x21c`, GC 0x1007850f–0x10078539).
@@ -618,6 +623,8 @@ impl Zone {
                     if let Some(side) = u.battlestation_side {
                         self.stats.insert(0x29c, i32::from(side));
                     }
+                    self.stats.insert(0x167, u.monster_data);
+                    self.stats.insert(0x168, i32::from(u.monster_scale));
                     // GC 0x10077af2 reads the message's main flags bit 1, not VisualFlags.
                     self.stats.insert(IN_PLAY_STAT, i32::from(u.flags & ao_net::n3::dynel::flag::IN_PLAY != 0));
                     self.own_serial += 1;
@@ -764,6 +771,7 @@ impl Zone {
                 self.dynels.remove(&who.instance);
                 self.tip_npc_state.remove(&who.instance);
                 self.character_stats.remove(&who.instance);
+                self.temporary_stats.retain(|&(instance, _), _| instance != who.instance);
                 self.fight_target.remove(&who.instance);
             }
             N3::Misc(Misc::Attack(a)) if who.kind == CHAR_KIND && a.target.kind == CHAR_KIND => {
@@ -793,6 +801,8 @@ impl Zone {
                     if !visuals.is_empty() {
                         self.world.apply_nano_visuals(ao_net::n3::spells::ApplySpells { target: a.target, apply: a.apply, spells: visuals });
                     }
+                    self.apply_travel_spell_stats(a.target, &a.spells, a.apply);
+                    if a.target != own { self.world.apply_travel_spells(&a); }
                     if a.target == own {
                         self.apply_effects(&a.spells, a.apply);
                         self.own_events.push(OwnEvent::Spells { spells: a.spells, apply: a.apply });

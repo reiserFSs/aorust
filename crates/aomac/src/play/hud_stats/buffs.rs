@@ -116,6 +116,45 @@ impl Zone {
             }
         }
     }
+
+    /// Raw-stat spell handlers shared by own and remote characters (GC 100a754c / 100a9071).
+    pub(in crate::play) fn apply_travel_spell_stats(&mut self, target: ao_net::msg::Identity, spells: &[Spell], apply: bool) {
+        use ao_net::n3::spells::function;
+        if target.kind != super::super::dynels::CHAR_KIND as i32 { return; }
+        let own = target.instance == self.char_id as i32;
+        if !own && !self.dynels.contains_key(&target.instance) { return; }
+        let npc = self.dynels.get(&target.instance).is_some_and(|d| d.npc)
+            || self.stat_of(target.instance, 0).unwrap_or(0) & 0x1000_0000 != 0;
+        let mut writes = Vec::new();
+        for s in spells.iter().filter(|s| runs_on_character(s)) {
+            let write = match s.function {
+                function::SHAPE if !npc => {
+                    let current = self.stat_of(target.instance, 359).unwrap_or(0);
+                    let shape = s.stat(stat::VALUE);
+                    if apply && current == 0 { Some((359, shape)) }
+                    else if !apply && current == shape { Some((359, 0)) }
+                    else { None }
+                }
+                function::TEMP_STAT => {
+                    let Ok(id) = u32::try_from(s.stat(stat::STAT)) else { continue };
+                    let key = (target.instance, id);
+                    if apply {
+                        let original = self.stat_of(target.instance, id).unwrap_or(0);
+                        self.temporary_stats.entry(key).or_insert(original);
+                        Some((id, s.stat(stat::VALUE)))
+                    } else { self.temporary_stats.remove(&key).map(|v| (id, v)) }
+                }
+                _ => None,
+            };
+            if let Some((id, value)) = write {
+                let value = if id == 360 { value.max(20) } else { value };
+                if own { self.stats.insert(id, value); }
+                self.character_stats.entry(target.instance).or_default().insert(id, value);
+                if !own { writes.push((id as i32, value)); }
+            }
+        }
+        if !own && !writes.is_empty() { self.world.apply_travel_stats(target, &writes); }
+    }
 }
 
 /// The two maps after the spells ran in order. `level` is `GetStat(0x36, 2)`; `current(stat, maps)` is `GetStat(stat, 0)` (the buffed value) under the maps

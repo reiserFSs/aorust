@@ -252,3 +252,43 @@ Animation requests retain their layer source: `Module::take_anims` returns `(act
 * **Not done / unresolved**: the bare-hand draw / holster (martial-arts item lists, record layout not decoded); selection of cloth pages other than page 0.
 * **[UNRESOLVED, found live 2026-10-12]** A character that logs in with a weapon *already* worn from a previous session never gets `Armory::slots[6/8]` populated: live Aomacfixr (ICC pf 4582, rifle in the right hand per the Wear/Inventory windows) showed `Armory::slot_item(own, 6) == None` and `slot_item(own, 8) == None` after a fresh zone-in, only `slot_item(own, 0)` (the bare-hands fallback, `attack_range: 2`) — `in_attack_range` then always computes bare-hand range regardless of the actual weapon, so the target bar's fight caps never turn red and no damage lands while attacking a level-1 critter 3-7 m away for 4+ s. The `AppearanceUpdateIIR_c` / cloth/mesh path above *does* show the rifle (it is driven by the character's full appearance snapshot, not a live wear action), so the server's zone-in state dump clearly carries the equipped item; `Armory` is fed only by the live `WeaponItemFullUpdateIIR_t`/`CharacterAction 0x83` stream (§6 above), which the existing docs/captures (`zone_wear_rifle_borealis.rec`) only show for an *explicit* wear action, not a zone-in snapshot of already-worn gear. Unknown: whether the server resends `WeaponItemFullUpdateIIR_t` for already-equipped slots on zone-in (and our client drops/misorders it) or never resends it at all (and the real client derives the slot table from the appearance/inventory snapshot instead, a path `Armory` does not have). Needs a packet capture of a *fresh relogin* with a weapon already worn (not a live wear action) before fixing; do not guess.
 * **Other characters** (`Dynels::on_message`, `CharLook::apply_appearance`): `AppearanceUpdateIIR_c::Activate` [GC 0x10071679] is not specific to the own dynel: `FUN_10058e36` only tests the identity kind 50000 (`SimpleChar_t`, players and NPCs alike, no NPC branch), then `FUN_100480fc` (cloth: entry `(page*5 + part)`, `{b = texture, c = page}` of the wire `ClothData`; written only when the texture changed, a texture 0 clears the part, parts not named stay), stat 0x2A1 `VisualFlags`, `FUN_100572b9(extra)`, and `VisualCATMesh_t::ClearAttractors` [DS 0x10073d8a] (walks the same list at `this+4` as `CharacterMesh::ClearAttractors` [DS 0x10071dd0], deletes every node, head included) + `CharacterMesh::AddAttractors(wire list)`. So the mounted set is exactly the update's list, also when the full update carried the `SET_DYNEL_800` skip flag. `Dynels` edits the character's `CharLook` (cloth page 0 by part, sorted; attractors replaced; `visual_flags`) and sends the changed look through the worker's `Req::Model`; the character keeps drawing its old model (`Char::next`) until the new one is ready. Evidence: in `zone_ithaca.rec` the player 33513 arrives with no attractors and receives his head (place 0, mesh 223820) only through this update; the NPC 1026282's full update and its update both have an empty list; the wear capture's lists retargeted to another player (`other_player_wields_and_unwields_live`: rifle `{1, 0x3ddf}` + head, then head only, the player's earlier back item `{5, ..}` is dropped by the wholesale replace) rebuild his model each time.
+
+## 7. MonsterData actor replacement (Yalmaha)
+
+GC `10059e6a` handles stat 359 (`MonsterData`) on players as well as NPCs;
+when `MechData` 662 is zero it calls `10152f70 → 10052147 → 10051d2d`.
+The direct shape spell CF44 (`100a754c`) writes that same stat. The own avatar
+therefore replaces its `ActorRig` through the existing NPC rig builder, retaining
+the source-resolved humanoid look for undo; it does not attach a vehicle mesh to
+the humanoid skeleton. Rebuild invalidates the pose/mount cache and drops clips
+of the previous skeleton, while retaining the existing actor-model key,
+first-person visibility, light, palette/skinning and effect-anchor paths.
+
+Yalmaha templates 96088/117322 select shape record 99470 (RDB 1040023), CAT mesh
+42370; its movement/idle animation lists resolve to 99435/99429. The shape
+does not author B2/B3/B4 hover/fly animations. GC `1006dfaf` (flight entry) and
+`1006c065` (flight idle) play holder `+8` (`1003c441`); the B2 holder lookup's
+native parent chain reaches idle 0x78 for this shape. GC `1006be27` returns
+without playing anything for moving mode 7: movement must retain that installed
+clip, not synthesize a B3/B4 or walk/run fallback. Its stationary mode-7 path
+can read the ordinary idle getter `1003c456` (`+0x10`); that is distinct from
+the flight-entry/idle handler's `+8`.
+
+Body scale is `MonsterScale(360, kind 3) / 100.0` (`1005bea6`, double constant
+`10158670`). Getter `10064800 → 1006460b` adds the raw stat and its additive
+modifier-map value; stat 360 is outside the shock-subtraction ranges.
+Thus authored raw values 20/80 mean factors 0.2/0.8 absent additive modifiers,
+not normalized values 1.0/1.0. The stat owner supplies this effective factor to
+`Avatar::set_body_scale`; the normal stat setter's raw minimum is 20
+(`10059e6a`). Regression `own_yalmaha_shape_replaces_rig_and_restores_humanoid`
+loads the real shape, checks skeleton/mesh/clip and finite mount output, checks
+moving flight retains its clock, and restores the original humanoid on undo.
+
+Morph mounts retain their source bookkeeping, but an unavailable head mount
+does not fail the shape build: DS `10073110` registers children through Randy
+`10057de0` (`AddAttractorChild`); Randy `100577d3` (`ProcessAttractorChilds`)
+processes a named child only when `GetAttractor` succeeds. The shared NPC
+builder therefore omits an unavailable head mount; ordinary attachments
+already follow the same named-attractor filtering in `ActorRig::new`.
+Null MonsterData lookup uses the native humanoid branch (`10058078`), while
+retaining the requested stat value separately from the selected rig.

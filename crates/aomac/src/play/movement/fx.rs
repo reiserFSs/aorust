@@ -209,6 +209,23 @@ impl Movement {
     pub fn apply_spell(&mut self, s: &Spell, apply: bool) -> bool {
         let start = apply && s.stat(stat::EFFECT_OR_END) != 1;
         match s.function {
+            function::FLIGHT => {
+                // GC 100a7bb1: spell transitions bypass the keyboard/received-move GM gate.
+                match self.fsm.mode {
+                    mode::CRAWL => { self.transition(id::LEAVE_CRAWL); }
+                    mode::SIT_GROUND => { self.transition(id::LEAVE_SIT); }
+                    mode::SLEEP => {
+                        self.transition(id::LEAVE_SLEEP);
+                        self.transition(id::LEAVE_SIT);
+                    }
+                    mode::LOUNGE => {
+                        self.transition(id::LEAVE_LOUNGE);
+                        self.transition(id::LEAVE_SIT);
+                    }
+                    _ => {}
+                }
+                self.transition(if apply { id::SWITCH_FLY } else { id::LEAVE_FLY });
+            }
             function::FEAR if start => self.fear_start(),
             function::FEAR => self.fear_end(),
             function::CONTROL if start => self.control_start(),

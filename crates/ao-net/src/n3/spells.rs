@@ -56,6 +56,12 @@ pub mod stat {
 
 /// Function ids (`SpellData_t +0xc`, the `switch` of `FUN_100a59f5` [GC]) the own-character movement reacts to.
 pub mod function {
+    /// `FUN_100a754c`: set MonsterData when empty; undo clears only the matching shape.
+    pub const SHAPE: u32 = 0xCF44;
+    /// `FUN_100a9071`: temporarily replace a raw stat, restoring its first saved value on undo.
+    pub const TEMP_STAT: u32 = 0xCF76;
+    /// `FUN_100a7bb1`: direct movement transition to flight (undo leaves flight).
+    pub const FLIGHT: u32 = 0xCF92;
     /// `FUN_100a767e`: grant the Features bits of stat 0x49 (undo: revoke).
     pub const FEATURES_GRANT: u32 = 0xCF4B;
     /// `FUN_100a7723`: revoke the Features bits of stat 0x49 (undo: grant).

@@ -198,7 +198,10 @@ impl Player {
                 screenshot_requested: false,
             })
         })();
-        built.map_err(|e| eprintln!("player: {e:#}")).ok()
+        built.map(|mut player| {
+            player.sync_travel_appearance(zone);
+            player
+        }).map_err(|e| eprintln!("player: {e:#}")).ok()
     }
 
     /// Reclaims the own avatar's `ActorAssets`, to hand to [`Dynels::stash_avatar_assets`](super::dynels::Dynels::stash_avatar_assets)
@@ -540,9 +543,10 @@ impl Player {
         host.effect_dungeon = self.zones.as_ref().map(|zones| zones.is_dungeon());
         let s = |id| zone.stat(id);
         self.movement.set_stats(|st| {
+            // GC 1006edb3 reads GetStat(RunSpeed, 2), including authored equipment/nano modifiers.
+            if let Some(speed) = zone.skill_value(0x9c) { st.run_speed = speed; }
             // stat ids: RunSpeed 0x9C, Health 0x1B, Life 1, TurnSpeed 0x10B, Strength 0x10, Agility 0x11, Features 0xE0, ...
             for (field, id) in [
-                (&mut st.run_speed, 0x9C),
                 (&mut st.health, 0x1B),
                 (&mut st.max_health, 1),
                 (&mut st.turn_speed, 0x10B),
@@ -551,7 +555,6 @@ impl Player {
                 (&mut st.features, 0xE0),
                 (&mut st.mech_data, 0x296),
                 (&mut st.gm_level, 0xD7),
-                (&mut st.monster_scale, 0x168),
                 (&mut st.wait_state, 0x1AE),
                 (&mut st.flags, 0),
             ] {
@@ -559,6 +562,7 @@ impl Player {
                     *field = v;
                 }
             }
+            if let Some(scale) = s(0x168) { st.monster_scale = scale + zone.monster_scale_bonus; }
         });
         self.apply_own_events(zone);
         zone.fight_level = Some(self.fight_level(self.movement.pos()));
@@ -578,6 +582,7 @@ impl Player {
         for (id, v) in self.movement.take_stat_writes() {
             zone.stats.insert(id, v);
         }
+        self.sync_travel_appearance(zone);
         if let Some(z) = self.zones.as_ref().and_then(|l| l.zone_at(flip(self.movement.pos()))) {
             self.movement.zone_instance(z as u32);
         }
@@ -724,6 +729,24 @@ impl Player {
     pub fn sit_ground(&mut self) -> Vec<ao_net::n3::outgoing::CharMove> {
         self.movement.action(mv::SWITCH_SIT_GROUND, self.clock);
         self.movement.take_outgoing()
+    }
+
+    /// GC 10059e6a MonsterData hook and 1005bea6 body-scale refresh.
+    fn sync_travel_appearance(&mut self, zone: &mut Zone) {
+        if zone.stat(0x296).unwrap_or(0) == 0 {
+            let shape = zone.stat(0x167).or_else(|| zone.own_update.as_ref().map(|u| u.monster_data)).unwrap_or(0);
+            match self.avatar.set_monster_data(&self.store, shape) {
+                Ok(true) => {
+                    self.model_sent = false;
+                    self.movement.set_body_radius(self.avatar.body_radius());
+                    zone.world.effect_source_model_changed((super::dynels::CHAR_KIND as u32, self.char_id));
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("avatar morph {shape}: {e:#}"),
+            }
+        }
+        let scale = zone.stat(0x168).or_else(|| zone.own_update.as_ref().map(|u| i32::from(u.monster_scale))).unwrap_or(100) + zone.monster_scale_bonus;
+        self.avatar.set_body_scale(if scale == 0 { 1.0 } else { scale as f32 / 100.0 });
     }
 
     /// Server messages for the own dynel (docs/zone/movement.md §10), in arrival order.
@@ -881,8 +904,67 @@ fn fight_target_position(zone: &Zone, own: i32, own_pos: [f32; 3]) -> Option<[f3
 mod tests {
     use super::*;
 
-    /// Offline, real-CAT Player::frame regression, including the movement FSM and transient dispatch.
-    /// AOMAC_POSTURE_TRACE writes both CSVs; AOMAC_POSTURE_PNG also renders every sampled frame.
+    /// Authored offline replay: installed RDB Wear spells, acknowledged inventory move, real own CAT rebuild and undo.
+    #[test]
+    fn rdb_yalmaha_equipment_ack_enters_flight_morph_and_undoes() {
+        use ao_net::{msg::Identity, n3::{inventory as inv, spells, world::{AcgItem, InventoryEntry}}, Writer};
+        use super::super::hud_stats::equipment::Equipment;
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut zone = Zone::new(7);
+        zone.own_update = Some(Box::new(avatar::tests::own_update()));
+        zone.stats.extend([(0x167, 0), (0x168, 100), (0x296, 0), (0xd7, 0)]);
+        let mut player = Player::new(&dir, &mut zone, 0).expect("real own character");
+        let original_meshes = player.avatar.model().meshes.len();
+        let store = RecordStore::open(&dir).unwrap();
+        let template = store.get(1000020, 96088).unwrap().unwrap();
+        let level = ao_formats::dynel_visual::parse_item_template(&template).unwrap().stat(54).unwrap();
+        let item = AcgItem { low_id: 96088, high_id: 117322, level };
+        zone.inventory.insert(0x40, InventoryEntry { slot: 0x40, a: 0, b: 1, id: inv::item_identity(0x40), item });
+        let mut equipment = Equipment::new(&dir);
+        equipment.refresh_travel(&mut zone);
+        assert!(zone.own_events.is_empty(), "a bag item does not run Wear");
+        let ack = |source, destination| {
+            let mut w = Writer::default();
+            w.u32(inv::CONTAINER_ADD_ITEM);
+            Identity { kind: 0xc350, instance: 7 }.write(&mut w);
+            w.u8(0);
+            inv::item_identity(source).write(&mut w);
+            Identity { kind: 0xc350, instance: 7 }.write(&mut w);
+            w.i32(destination);
+            n3_frame(1, 0, w.0)
+        };
+        zone.on_frame(&ack(0x40, 1));
+        equipment.refresh_travel(&mut zone);
+        assert_eq!(equipment.effects().iter().map(|s| s.function).collect::<Vec<_>>(),
+            [0xcf35, 0xcf4c, 0xcf76, 0xcf92, 0xcf44], "functions come from both real item templates");
+        let authored = equipment.effects().to_vec();
+        assert_eq!(authored[0].stat(spells::stat::VALUE), 750);
+        assert_eq!((zone.stat(359), zone.stat(360)), (Some(99470), Some(20)));
+        player.apply_own_events(&mut zone);
+        player.sync_travel_appearance(&mut zone);
+        assert_eq!(player.movement.stats().gm_level, 0);
+        assert_eq!(player.movement.fsm().mode, mode::FLY);
+        assert!(!player.movement.falling_enabled());
+        assert_eq!(player.avatar.body_scale(), 0.2);
+        assert_eq!(player.avatar.monster_visual(), (99470, 42370, 99429));
+        assert!(zone.active_spells.is_empty(), "wear modifiers are not duplicated as nano buffs");
+        equipment.refresh_travel(&mut zone);
+        assert!(zone.own_events.is_empty(), "unchanged equipment never reapplies Features counters");
+        zone.on_frame(&ack(1, 0x40));
+        equipment.refresh_travel(&mut zone);
+        player.apply_own_events(&mut zone);
+        player.sync_travel_appearance(&mut zone);
+        assert_ne!(player.movement.fsm().mode, mode::FLY);
+        assert!(player.movement.falling_enabled());
+        assert_eq!((zone.stat(359), zone.stat(360)), (Some(0), Some(100)));
+        assert_eq!(player.avatar.monster_visual().0, 0);
+        assert_eq!(player.avatar.body_scale(), 1.0);
+        assert_eq!(player.avatar.model().meshes.len(), original_meshes);
+        assert!(zone.temporary_stats.is_empty());
+    }
+
+    /// Same hand-built ResurrectIIR as `own_server_moves_are_queued`, through the player consumer.
     #[test]
     fn own_server_moves_queued_resurrection_refreshes_without_stopping() {
         use ao_net::msg::Identity;
@@ -926,6 +1008,8 @@ mod tests {
         }
     }
 
+    /// Offline, real-CAT Player::frame regression, including the movement FSM and transient dispatch.
+    /// AOMAC_POSTURE_TRACE writes both CSVs; AOMAC_POSTURE_PNG also renders every sampled frame.
     #[test]
     fn own_sit_stand_player_frame_pose_continuity() {
         use std::fmt::Write as _;

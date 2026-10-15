@@ -968,7 +968,7 @@ impl HudStats {
     }
 
     fn refresh_stats(&mut self, zone: &mut Zone) {
-        self.equipment.refresh(zone);
+        self.equipment.refresh_travel(zone);
         self.timed_effects.refresh(zone);
         self.model.refresh_buffs(&|id| zone.stat(id), self.timed_effects.effects(), self.equipment.effects(), self.equipment.attack_weights());
         self.pools.apply(zone, &|z, id| self.model.value(&|s| z.stat(s), id));

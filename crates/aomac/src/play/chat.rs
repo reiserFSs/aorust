@@ -1322,6 +1322,40 @@ mod tests {
     }
 
     #[test]
+    fn terminate_command_confirms_before_sending_native_fanatic_request() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&client, None).unwrap();
+        let texts = TextDb::load(&client).unwrap();
+        let zone = Zone { char_id: 0x1234, target: Some(77), ..Default::default() };
+        let mut c = Chat::new(false);
+        c.screen = (1280, 800);
+        for button in [Some("btn1"), None, Some("btn0")] {
+            c.run_line(&mut gui, "/terminate", &zone, &texts);
+            assert!(c.outbox.is_empty(), "opening confirmation must not send");
+            let win = c.dialogs.windows().next().expect("terminate confirmation");
+            assert_eq!(gui.text(win, "text"), texts.by_key(10000, "WarningTerminate").unwrap());
+            let event = match button {
+                Some(view) => Event::Clicked { window: win, view: view.into(), item: None },
+                None => Event::Escape { window: win },
+            };
+            assert!(c.event(&mut gui, &event, &zone, &texts));
+            assert!(!c.dialogs.is_open());
+            if button != Some("btn0") {
+                assert!(c.outbox.is_empty(), "No and Escape must not send");
+            }
+        }
+        let frames = c.take_outbox();
+        assert_eq!(frames.len(), 1);
+        let mut payload = n3::outgoing::message_key("FanaticIIR_t").to_be_bytes().to_vec();
+        payload.extend([0, 0, 0xc3, 0x50, 0, 0, 0x12, 0x34, 0]); // own identity, passed-on zero
+        payload.extend([0; 12]); // window zero, null target identity (not selected target 77)
+        payload.extend(9i32.to_be_bytes());
+        payload.extend(b"terminate");
+        assert_eq!(frames[0], n3::outgoing::n3_frame(0, zone.char_id, payload));
+    }
+
+    #[test]
     fn reclaim_command_follows_incoming_registration_removal_and_world_reset() {
         use ao_net::n3::{action, misc::Misc, outgoing::n3_frame};
         let client = ao_gui::client_dir();
@@ -1358,40 +1392,6 @@ mod tests {
         send(&mut chat, &mut gui, &zone, 0x6e);
         zone.reset_world();
         send(&mut chat, &mut gui, &zone, 0x6d);
-    }
-
-    #[test]
-    fn terminate_command_confirms_before_sending_native_fanatic_request() {
-        let client = ao_gui::client_dir();
-        if !client.join("cd_image/gui").exists() { return; }
-        let mut gui = Gui::new(&client, None).unwrap();
-        let texts = TextDb::load(&client).unwrap();
-        let zone = Zone { char_id: 0x1234, target: Some(77), ..Default::default() };
-        let mut c = Chat::new(false);
-        c.screen = (1280, 800);
-        for button in [Some("btn1"), None, Some("btn0")] {
-            c.run_line(&mut gui, "/terminate", &zone, &texts);
-            assert!(c.outbox.is_empty(), "opening confirmation must not send");
-            let win = c.dialogs.windows().next().expect("terminate confirmation");
-            assert_eq!(gui.text(win, "text"), texts.by_key(10000, "WarningTerminate").unwrap());
-            let event = match button {
-                Some(view) => Event::Clicked { window: win, view: view.into(), item: None },
-                None => Event::Escape { window: win },
-            };
-            assert!(c.event(&mut gui, &event, &zone, &texts));
-            assert!(!c.dialogs.is_open());
-            if button != Some("btn0") {
-                assert!(c.outbox.is_empty(), "No and Escape must not send");
-            }
-        }
-        let frames = c.take_outbox();
-        assert_eq!(frames.len(), 1);
-        let mut payload = n3::outgoing::message_key("FanaticIIR_t").to_be_bytes().to_vec();
-        payload.extend([0, 0, 0xc3, 0x50, 0, 0, 0x12, 0x34, 0]); // own identity, passed-on zero
-        payload.extend([0; 12]); // window zero, null target identity (not selected target 77)
-        payload.extend(9i32.to_be_bytes());
-        payload.extend(b"terminate");
-        assert_eq!(frames[0], n3::outgoing::n3_frame(0, zone.char_id, payload));
     }
 
     #[test]
