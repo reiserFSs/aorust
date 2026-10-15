@@ -112,6 +112,8 @@ pub struct OwnState {
     /// `Fsm::last_speed_mode == WALK` (`+0x30 == 2` in `FUN_1006d196`).
     pub last_speed_walk: bool,
     pub camping: bool,
+    /// Serial and disabled value emitted by the actual Fly Apply handlers, not inferred from the mode.
+    pub control_action_flags: (u32, bool),
 }
 
 /// `FUN_1006389c` [GC 0x1006389c]: `trunc(d * pct / 100.0 + d + 0.5)` with `pct = max(stat 0x17e, -50)`, except for the special attacks (Brawl 0x8e,
@@ -134,6 +136,7 @@ pub struct SpecialList {
     entries: Vec<Entry>,
     recharge: Vec<Recharge>,
     perk_recharge: Vec<Recharge>,
+    control_action_flags_serial: u32,
     /// `(old template, new template)` of every identity change (`FUN_10042c40` emits it on GlobalSignals): hotbar slots follow it.
     changes: Vec<(u32, u32)>,
 }
@@ -192,6 +195,12 @@ impl SpecialList {
     /// decides), fight (0xb start / 0x4e stop), camp (0x51 / 0x52). Crawl enter / leave are GC1006e646 / 1006e3ff.
     pub fn apply_state(&mut self, s: OwnState) {
         use super::movement::mode;
+        if self.control_action_flags_serial != s.control_action_flags.0 {
+            for action in [0x4d, 0x4c, 0x11, 0x12, 0x13, 0x4f, 0x14, 0x8d] {
+                self.set_disabled(action, s.control_action_flags.1);
+            }
+            self.control_action_flags_serial = s.control_action_flags.0;
+        }
         let speed = |l: &mut Self| l.show_other(if s.last_speed_walk { 0x11 } else { 0x12 });
         match s.mode {
             mode::WALK | mode::RUN => {
@@ -414,5 +423,37 @@ mod tests {
         assert_eq!(list.progress(10111), None, "flag-only disability never fabricates a zero-second timer");
         list.set_disabled(10111, false);
         assert!(!list.disabled(10111));
+    }
+
+    #[test]
+    fn flight_action_flags_follow_apply_events_not_mode_inference() {
+        use super::super::movement::{id, Movement};
+        let mut movement = Movement::new([0.0; 3], 0.0, 100);
+        let state = |movement: &Movement| OwnState {
+            mode: movement.fsm().mode, control_action_flags: movement.control_action_flags(), ..OwnState::default()
+        };
+        let mut list = SpecialList::new();
+        assert!(movement.transition(id::SWITCH_FLY));
+        list.apply_state(state(&movement));
+        assert!(list.disabled(0x4c));
+        assert!(list.disabled(0x11));
+        assert!(!list.disabled(0xb));
+        list.set_disabled(0x4c, false);
+        list.apply_state(state(&movement));
+        assert!(!list.disabled(0x4c), "an unchanged Fly mode cannot overwrite a later native flag clear");
+        assert!(movement.transition(id::SWITCH_FLY));
+        list.apply_state(state(&movement));
+        assert!(list.disabled(0x4c), "a repeated Apply event must still write flags");
+        assert!(movement.transition(id::SWITCH_FROZEN));
+        list.apply_state(state(&movement));
+        assert!(list.disabled(0x4c), "Frozen entered from Fly does not call the LeaveFly flag handler");
+        assert!(movement.transition(id::LEAVE_FROZEN));
+        assert!(movement.transition(id::SWITCH_FLY));
+        assert!(movement.transition(id::LEAVE_FLY));
+        list.apply_state(state(&movement));
+        assert!(!list.disabled(0x4c));
+        assert!(!list.disabled(0x11));
+        assert!(!list.disabled(0x13));
+        assert!(!list.disabled(0x14));
     }
 }

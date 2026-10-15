@@ -532,6 +532,8 @@ pub struct Movement {
     dir: i32,
     airborne: bool,
     falling_enabled: bool,
+    /// Generation and disabled bit of the eight control-action flags written by enter/leave Fly Apply handlers.
+    control_action_flags: (u32, bool),
     launch_y: f32,
     /// `PlayerVehicle +0x164 == 0`: a new jump may start.
     jump_ready: bool,
@@ -638,6 +640,7 @@ impl Movement {
             dir: 1,
             airborne: false,
             falling_enabled: true,
+            control_action_flags: (0, false),
             launch_y: pos[1],
             jump_ready: true,
             jump_pending: None,
@@ -738,6 +741,9 @@ impl Movement {
     }
     pub fn fsm(&self) -> &Fsm {
         &self.fsm
+    }
+    pub fn control_action_flags(&self) -> (u32, bool) {
+        self.control_action_flags
     }
     pub fn stats(&self) -> &Stats {
         &self.stats
@@ -1531,11 +1537,13 @@ impl Movement {
             }
             Act::LeaveSneak => self.recalc(),
             Act::ToFly => {
+                self.control_action_flags = (self.control_action_flags.0.wrapping_add(1), true);
                 self.recalc();
                 self.disable_falling();
                 self.pos[1] += 0.5;
             }
             Act::LeaveFly => {
+                self.control_action_flags = (self.control_action_flags.0.wrapping_add(1), false);
                 self.recalc();
                 self.enable_falling();
                 self.pos[1] += 0.1;

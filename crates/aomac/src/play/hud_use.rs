@@ -14,7 +14,7 @@ impl Play {
         // the toggles of the special-action list follow the own state (`FUN_1006d196`, fight start / stop, camping; hud_special.rs)
         if let (Some(h), Some(p)) = (self.hud.as_mut(), self.player.as_ref()) {
             let fighting = self.fight.as_ref().is_some_and(|m| m.attacking());
-            h.actions.set_state(super::hud_special::OwnState { fighting, mode: p.mode() as u8, last_speed_walk: p.last_speed_walk(), camping: self.camp.is_some() });
+            h.actions.set_state(super::hud_special::OwnState { fighting, mode: p.mode() as u8, last_speed_walk: p.last_speed_walk(), camping: self.camp.is_some(), control_action_flags: p.control_action_flags() });
         }
         let uses = self.hud.as_mut().map(|h| h.take_uses()).unwrap_or_default();
         for u in uses {

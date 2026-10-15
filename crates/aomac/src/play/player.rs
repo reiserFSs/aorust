@@ -875,6 +875,10 @@ impl Player {
     pub fn last_speed_walk(&self) -> bool {
         self.movement.fsm().last_speed_mode == mode::WALK
     }
+
+    pub fn control_action_flags(&self) -> (u32, bool) {
+        self.movement.control_action_flags()
+    }
 }
 
 /// `n3Playfield_t::LineOfSight` (N3 0x1000d34c) tests both directions against
