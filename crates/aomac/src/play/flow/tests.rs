@@ -327,6 +327,40 @@ fn rig() -> Option<Rig> {
     Some(Rig { p, host, port, _l: l })
 }
 
+/// Real offscreen replay, not the logic-only Rig or PNG encoder. Run explicitly with AOMAC_PERF=1.
+#[test]
+#[ignore = "client data + GPU; performance replay"]
+fn offscreen_icc_performance_replay() {
+    assert!(std::env::var_os("AOMAC_PERF").is_some(), "requires AOMAC_PERF=1");
+    let mut r = rig().expect("performance replay requires client data");
+    let mut o = ao_render::Offscreen::new(&r.p, (1280, 800)).unwrap();
+    let load = Instant::now();
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 25988 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_ithaca.rec")));
+    o.host = r.host;
+    loop {
+        o.frame(&mut r.p, 1.0 / 60.0);
+        if r.p.screen == Screen::InWorld && r.p.zone.world.cpu_benchmark_scene().0 { break; }
+        assert!(load.elapsed() < Duration::from_secs(300), "ICC world/models did not load");
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    eprintln!("AOMAC_PERF replay zone_load_ms={:.3} (handoff through InWorld and actor readiness)", load.elapsed().as_secs_f64() * 1000.0);
+    // The capture's Testy spawn and this offset define the same ICC view on both revisions.
+    let own = r.p.zone.own().expect("captured Testy");
+    let at = Vec3::new(own.pos[0], own.pos[1] + 1.6, -own.pos[2]);
+    let camera = Camera::look_at(at + Vec3::new(0.0, 3.0, 12.0), at);
+    o.fixed_camera(Some(camera));
+    eprintln!("AOMAC_PERF replay camera={camera:?} dt=0.016666667");
+    for _ in 0..120 { o.frame(&mut r.p, 1.0 / 60.0); }
+    o.perf_reset();
+    let mut list = o.frame(&mut r.p, 1.0 / 60.0);
+    for _ in 1..600 { list = o.frame(&mut r.p, 1.0 / 60.0); }
+    o.perf_report("replay");
+    if let Some(path) = std::env::var_os("AOMAC_PERF_SHOT") {
+        o.png(&r.p, &list, std::path::Path::new(&path)).unwrap();
+    }
+}
+
 #[test]
 fn character_selection_expands_only_the_selected_row() {
     let Some(mut r) = rig() else { return };

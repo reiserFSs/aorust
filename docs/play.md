@@ -118,3 +118,71 @@ The desktop session was locked (`CGSSessionScreenIsLocked`), so no window can re
 **F12 screenshot** (retail `GUI.dll` `FlowControlModule_t::SlotScreenshot`, which makes an unconditional virtual call into `DisplaySystem.dll`'s backbuffer capture routine): PNG, zlib level 9, folder `AnarchyPath_t::GetScreenshotsPath` = `%LOCALAPPDATA%\Funcom\Anarchy Online\Screenshots\` (created if missing), file name `scrn%04d.png` against a process-lifetime counter that keeps counting up past any name already on disk, so it never overwrites. No chat feedback line exists anywhere in retail's GUI/Gamecode/Interfaces/DisplaySystem modules for this command (`DumpRefs` for "Screenshot"/"ScreenShot" across all four only hits the `#CameraScreenshot` command name and the `SlotScreenshot` symbol itself), so aomac stays silent too. aomac's equivalent folder is the prefs app-support dir's `Screenshots` subfolder (`play::prefs::next_screenshot_path`), never the client install dir. The capture itself re-renders the just-drawn frame (world + GUI) into a one-off render-to-texture (not `COPY_SRC` on the swapchain, which macOS `CAMetalLayer` drawables don't reliably support) and PNG-encodes it on a background thread so the slow zlib compression never stalls the render loop (`ao_render::capture_frame_to_png`).
 
 **Wiring** (integration owner): per frame `host.look = controls.mouse_capture()`; keys → `controls.on_key`, mouse → `on_mouse_button/on_mouse_motion/on_wheel`; route `Cmd::Move(a)` → `Movement::action`, `MouseTurn` → `Movement::mouse_turn`, `Camera(c)` → `camera.apply(&c)` (an `EndLook` result is a heading sync for the avatar), then `camera.update_with(avatar_scene_pos, avatar_yaw, dt, &line_of_sight)` → `host.camera` and `lens` from `camera::lens`. Chat input focus: `controls.set_text_input(true)`.
+
+## Headless performance comparison
+
+`AOMAC_PERF=1` makes `Offscreen::frame` render the real 3D scene and GUI every tick to one
+persistent attachment, then wait for that frame's GPU submission. Without it, the harness
+remains logic-only except explicit screenshots. No readback/PNG encoding occurs in timed
+frames. Reports include CPU **wall** durations and calling-thread CPU time from
+`clock_gettime(CLOCK_THREAD_CPUTIME_ID)` (Darwin 16 / Linux 3). Thread CPU excludes
+descheduling, GPU time, and background asset/driver workers; it is not process-wide CPU.
+No GPU timestamp queries are used. Stage boundaries are:
+`update` = renderer sky advance/visibility, `frontend` = `Play::frame` (including simulation,
+asset completion and GUI layout), `upload` = host policies/scene/actor application,
+`render`/`gui` = command preparation and submission, `gpu_wait` = final submit/completion.
+`total` includes all those stages, excludes harness sleeps, reporting, and screenshots.
+Reports give mean and nearest-rank p50/p95, bounded to 600 samples per interval.
+RSS comes from `ps` in KiB at report time. Metal `currentAllocatedSize` is native device
+allocation in unified memory, **not dedicated VRAM**. Tracked creations/estimated created
+bytes are cumulative, not retained allocation; `AOMAC_GPU_STATS=1` optionally adds call-site
+creation logs. Unsupported native allocation/RSS observations are explicitly unavailable.
+
+For baseline, apply **only the instrumentation patch** to `origin/main`; for after, apply
+the optimizations to that same instrumented revision. In each checkout run exactly:
+
+```sh
+AOMAC_PERF=1 AOMAC_AUDIO_MUTE=1 CARGO_TARGET_DIR=/tmp/PerfRound2/wt/target \
+  cargo test --release -j 2 -p aomac offscreen_icc_performance_replay -- --ignored --nocapture --test-threads=1
+```
+
+This existing flow replay route consumes `docs/captures/zone_ithaca.rec` (Testy, id 25988),
+waits for InWorld and actor readiness, reports handoff-to-ready `zone_load_ms`, fixes the
+ICC camera to capture spawn + `(0, 4.6, 12)` looking at spawn + `(0, 1.6, 0)` in renderer
+coordinates (server Z negated), warms 120 frames, then measures 600 frames at fixed 1/60 s.
+Camera coordinates are logged. Actor animation/background sky completion can still vary;
+do not treat this replay as a bitwise deterministic visual fixture. Optional
+`AOMAC_PERF_SHOT=/absolute/path.png` writes just the final frame **after** measurement.
+
+Live comparison uses the same offscreen `live_walk` harness, never a window. Acquire
+`scripts/live-lock.sh acquire PerfRound2` first; release it immediately afterward.
+Use the same approved test character in ICC, position, preferences and explicit renderer
+camera on both revisions. Credentials are two stdin lines only (not files, argv or logs).
+The camera numbers below are illustrative, not an observed ICC location. First log
+`cam` in the baseline session, then reuse those actual coordinates for both revisions:
+
+```sh
+AOMAC_PERF=1 AOMAC_AUDIO_MUTE=1 AOMAC_LIVE_CHAR=Aomacfixr \
+  AOMAC_LIVE_STEPS='wait=5,perfcam=205.2:5.6:-243.8:0:-0.244979,perf=600' \
+  CARGO_TARGET_DIR=/tmp/PerfRound2/wt/target \
+  cargo test --release -j 2 -p aomac live_walk -- --ignored --nocapture --test-threads=1
+```
+
+`perfcam=x:y:z:yaw:pitch` pins only the camera, not the avatar or server state.
+`perf=N` resets samples and measures N fixed-60Hz frames; it excludes tick pacing.
+`perfreset` / `perfreport=label` delimit other intervals. Live `zone_load_ms` spans
+selection/create request through InWorld (includes network/loading fade), unlike the
+replay's actor-ready endpoint; compare like with like, not the two values against each
+other. Keep `AOMAC_LIVE_SHOTS` unset during timing. No live or baseline execution is
+implied by these commands.
+
+Focused CPU-only metrics check:
+`cargo test --release -j 2 -p ao-render offscreen_perf_percentiles_use_nearest_rank`.
+
+Repeat the same baseline/after replay command with `AOMAC_PERF_MSAA=1` (retail default)
+and `AOMAC_PERF_MSAA=4` (enhanced), keeping all other inputs fixed. With `AOMAC_PERF`
+enabled this override wins over loaded preferences in both replay and live harnesses.
+Reports include requested and adapter-clamped actual sample counts; only compare matched
+actual counts. Without this override preferences remain authoritative; without
+`AOMAC_PERF`, `AOMAC_PERF_MSAA` has no effect. The equivalent live preference step is
+`option=AomacEdgeSmoothing:0` for 1x or `option=AomacEdgeSmoothing:2` for 4x.

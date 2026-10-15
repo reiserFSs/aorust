@@ -607,6 +607,7 @@ fn live_walk() {
     }
     // `AOMAC_LIVE_NEW=<name>:<CC breed 1..7>:<CC profession 1..14>`: New Character, the creation module sends its request (no scene clicks),
     // the login server's `CharacterCreated` + `ZoneHandoff` take the app into the world
+    let zone_load = Instant::now();
     if cc_name.is_some() {
         // the creation module's Finish click sent the request: wait for the zone hand-off below
     } else if let Ok(spec) = std::env::var("AOMAC_LIVE_NEW") {
@@ -626,10 +627,32 @@ fn live_walk() {
         l.p.handle(Event::Clicked { window: cw, view: "login_btn".into(), item: None }, &mut l.o.host);
     }
     l.until("world", 120, |p| p.screen == Screen::InWorld && matches!(p.fade, Fade::Hold));
+    if std::env::var_os("AOMAC_PERF").is_some() {
+        eprintln!("AOMAC_PERF live zone_load_ms={:.3} (selection/create request through InWorld)", zone_load.elapsed().as_secs_f64() * 1000.0);
+    }
     eprintln!("in world: {} (player built: {}, focus {:?})", l.pos(), l.p.player.is_some(), l.p.gui.focused_view());
     for step in std::env::var("AOMAC_LIVE_STEPS").unwrap_or_else(|_| "wait=2,shot=enter".into()).split(',') {
         let (k, v) = step.split_once('=').unwrap_or((step, ""));
         match k {
+            "perfcam" => {
+                let c: Vec<f32> = v.split(':').map(|s| s.parse().expect("perfcam=x:y:z:yaw:pitch")).collect();
+                assert!(c.len() == 5 && c.iter().all(|v| v.is_finite()), "perfcam requires five finite values");
+                let mut camera = l.o.host.camera;
+                camera.pos = Vec3::new(c[0], c[1], c[2]);
+                camera.yaw = c[3];
+                camera.pitch = c[4];
+                l.o.fixed_camera(Some(camera));
+            }
+            "perfreset" => l.o.perf_reset(),
+            "perfreport" => l.o.perf_report(v),
+            "perf" => {
+                assert!(std::env::var_os("AOMAC_PERF").is_some(), "perf requires AOMAC_PERF=1");
+                let frames: usize = v.parse().expect("perf=frame_count");
+                assert!(frames > 0, "perf requires frames");
+                l.o.perf_reset();
+                for _ in 0..frames { l.tick_dt(Some(1.0 / 60.0)); }
+                l.o.perf_report("live");
+            }
             "option" | "optioncheck" => {
                 let (name, value) = v.split_once(':').expect("option=NativeVariable:value");
                 let value: f64 = value.parse().expect("native option number");

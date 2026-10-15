@@ -10,6 +10,16 @@ use std::collections::HashMap;
 use std::panic::Location;
 use std::sync::LazyLock;
 use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PERF_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var_os("AOMAC_PERF").is_some());
+static CREATED: AtomicU64 = AtomicU64::new(0);
+static CREATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative tracked creations, not live resources or physical VRAM residency.
+pub(crate) fn perf_snapshot() -> (u64, u64) {
+    (CREATED.load(Ordering::Relaxed), CREATED_BYTES.load(Ordering::Relaxed))
+}
 
 #[derive(Default, Clone, Copy)]
 struct Site {
@@ -52,6 +62,10 @@ fn report_loop() {
 
 #[track_caller]
 fn record(bytes: u64) {
+    if *PERF_ENABLED {
+        CREATED.fetch_add(1, Ordering::Relaxed);
+        CREATED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
     if !enabled() {
         return;
     }

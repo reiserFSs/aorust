@@ -1077,6 +1077,75 @@ pub struct Offscreen {
     pub host: Host,
     size: (u32, u32),
     live: Option<LiveRun>,
+    perf: Option<OffscreenPerf>,
+    fixed_camera: Option<Camera>,
+}
+
+// Bounded samples and a persistent attachment: no screenshot/readback or metrics allocation per frame.
+struct OffscreenPerf {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    gui_view: wgpu::TextureView,
+    samples: [[f64; 7]; 600],
+    cpu_samples: [[f64; 7]; 600],
+    count: usize,
+    msaa: Option<u32>,
+}
+
+impl OffscreenPerf {
+    fn new(r: &Renderer, size: (u32, u32)) -> Self {
+        let msaa = std::env::var("AOMAC_PERF_MSAA").ok().map(|value| {
+            let samples = value.parse::<u32>().expect("AOMAC_PERF_MSAA must be 1, 2, 4, or 8");
+            assert!(matches!(samples, 1 | 2 | 4 | 8), "AOMAC_PERF_MSAA must be 1, 2, 4, or 8");
+            samples
+        });
+        let texture = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: Some("offscreen performance target"),
+            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view_tracked(&Default::default());
+        let gui_view = crate::GuiRenderer::view(&texture);
+        Self { _texture: texture, view, gui_view, samples: [[0.0; 7]; 600], cpu_samples: [[0.0; 7]; 600], count: 0, msaa }
+    }
+}
+
+fn perf_percentiles(samples: &mut [f64]) -> (f64, f64) {
+    samples.sort_unstable_by(f64::total_cmp);
+    let at = |percent: usize| samples[(samples.len() * percent).div_ceil(100).saturating_sub(1)];
+    (at(50), at(95))
+}
+
+/// Calling-thread CPU time: excludes descheduling, GPU time, and background asset/driver threads.
+fn perf_thread_cpu() -> Duration {
+    #[repr(C)]
+    struct Timespec { seconds: std::os::raw::c_long, nanos: std::os::raw::c_long }
+    unsafe extern "C" {
+        fn clock_gettime(clock: std::os::raw::c_int, time: *mut Timespec) -> std::os::raw::c_int;
+    }
+    let mut time = Timespec { seconds: 0, nanos: 0 };
+    let clock = if cfg!(target_os = "macos") { 16 } else { 3 };
+    // SAFETY: valid native timespec storage; Darwin/Linux CLOCK_THREAD_CPUTIME_ID.
+    assert_eq!(unsafe { clock_gettime(clock, &mut time) }, 0);
+    Duration::new(time.seconds as u64, time.nanos as u32)
+}
+
+fn native_gpu_allocated_bytes(r: &Renderer) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the HAL guard keeps the Metal queue alive; its device implements these
+        // read-only MTLDevice selectors. No raw object escapes the guard's lifetime.
+        unsafe {
+            let queue = r.queue.as_hal::<wgpu::hal::api::Metal>()?;
+            let device: *mut objc2::runtime::AnyObject = objc2::msg_send![queue.as_raw(), device];
+            if device.is_null() { return None; }
+            Some(objc2::msg_send![device, currentAllocatedSize])
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = r; None }
 }
 
 impl Offscreen {
@@ -1084,32 +1153,75 @@ impl Offscreen {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = Renderer::new(&instance, None)?;
         let (targets, gr) = (Targets::new(&r, size.0, size.1), crate::GuiRenderer::new(&r, fe.gui()));
-        Ok(Self { r, targets, gr, host: Host::headless(), size, live: None })
+        let perf = std::env::var_os("AOMAC_PERF").map(|_| OffscreenPerf::new(&r, size));
+        Ok(Self { r, targets, gr, host: Host::headless(), size, live: None, perf, fixed_camera: None })
     }
 
     /// Changes the render surface size without replacing the live frontend or its GUI state.
     pub fn resize(&mut self, size: (u32, u32)) {
         self.size = (size.0.max(1), size.1.max(1));
         self.targets = Targets::new(&self.r, self.size.0, self.size.1);
+        if self.perf.is_some() { self.perf = Some(OffscreenPerf::new(&self.r, self.size)); }
+    }
+
+    /// Overrides the rendered/picking camera after frontend updates; `None` restores normal following.
+    pub fn fixed_camera(&mut self, camera: Option<Camera>) { self.fixed_camera = camera; }
+
+    /// Starts a fresh measured interval without rebuilding the renderer or its resources.
+    pub fn perf_reset(&mut self) {
+        if let Some(perf) = &mut self.perf { perf.count = 0; }
+    }
+
+    /// Reports thread CPU stages and completed-frame wall latency, never PNG encoding.
+    pub fn perf_report(&mut self, label: &str) {
+        let Some(perf) = &mut self.perf else { return };
+        if perf.count == 0 { return; }
+        let mut column = [0.0; 600];
+        eprintln!("AOMAC_PERF {label} frames={} size={}x{} msaa_requested={:?} msaa_actual={}", perf.count, self.size.0, self.size.1, perf.msaa, self.r.msaa_samples());
+        for (kind, samples) in [("wall", &perf.samples), ("thread_cpu", &perf.cpu_samples)] {
+            for (stage, name) in ["total", "update", "frontend", "upload", "render", "gui", "gpu_wait"].into_iter().enumerate() {
+                for (out, sample) in column.iter_mut().zip(&samples[..perf.count]) { *out = sample[stage] * 1000.0; }
+                let values = &mut column[..perf.count];
+                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                let (p50, p95) = perf_percentiles(values);
+                eprintln!("AOMAC_PERF {label} {kind}_{name}_ms mean={mean:.4} p50={p50:.4} p95={p95:.4}");
+            }
+        }
+        let rss = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output();
+        let rss_kib = rss.ok().filter(|out| out.status.success()).and_then(|out| String::from_utf8(out.stdout).ok()).and_then(|s| s.trim().parse::<u64>().ok());
+        eprintln!("AOMAC_PERF {label} rss_kib={rss_kib:?} instances={} draws={} native_gpu_allocated_bytes={:?} (Metal device allocation, unified memory; not dedicated VRAM)", self.r.stats.instances, self.r.stats.draw_calls, native_gpu_allocated_bytes(&self.r));
+        let (creates, bytes) = crate::gpu_stats::perf_snapshot();
+        eprintln!("AOMAC_PERF {label} tracked_creates_total={creates} tracked_created_bytes_estimate_total={bytes} (cumulative, not live VRAM)");
+        perf.count = 0;
     }
 
     /// One `Frontend::frame`, applying what it asked of the host.
     pub fn frame(&mut self, fe: &mut dyn Frontend, dt: f32) -> ao_gui::DrawList {
+        if self.perf.as_ref().is_some_and(|p| p.count == p.samples.len()) { self.perf_report("interval"); }
+        let start = self.perf.as_ref().map(|_| Instant::now());
+        let cpu_start = start.map(|_| perf_thread_cpu());
         self.r.time += dt;
         if let Some(sun) = LiveRun::advance(&mut self.live, &mut self.r, dt) { self.host.effect_sun_direction = Some(sun); }
         self.r.visible_actor_ids(&mut self.host.previous_visible_actors);
+        let update_end = start.map(|_| Instant::now());
+        let cpu_update = start.map(|_| perf_thread_cpu());
         let list = fe.frame(dt, self.size, &mut self.host);
-        if self.targets.sample_count != self.r.msaa_samples() {
-            self.targets = Targets::new(&self.r, self.size.0, self.size.1);
-        }
+        let frontend_end = start.map(|_| Instant::now());
+        let cpu_frontend = start.map(|_| perf_thread_cpu());
         if let Some((quality, compressed, better_mips)) = self.host.texture_policy.take() {
             self.r.set_texture_policy(quality, compressed, better_mips);
         }
         if let Some(level) = self.host.anisotropy.take() {
             self.r.set_anisotropy(level);
         }
+        if let Some(samples) = self.perf.as_ref().and_then(|perf| perf.msaa) {
+            self.host.msaa_samples = Some(samples);
+        }
         if let Some(samples) = self.host.msaa_samples.take() {
             self.r.set_msaa_samples(samples);
+        }
+        if self.targets.sample_count != self.r.msaa_samples() {
+            self.targets = Targets::new(&self.r, self.size.0, self.size.1);
         }
         if let Some(scene) = self.host.scene.take() {
             self.r.upload(&scene);
@@ -1133,15 +1245,46 @@ impl Offscreen {
         self.r.set_ground_rendering(self.host.ground_rendering);
         if let Some(textures) = self.host.ground_textures.take() { self.r.refresh_ground_textures(&textures); }
         self.host.apply_actors(&mut self.r);
+        if let Some(camera) = self.fixed_camera { self.host.camera = camera; }
+        if self.perf.is_some() {
+            let upload_end = Instant::now();
+            let cpu_upload = perf_thread_cpu();
+            let perf = self.perf.as_mut().unwrap();
+            self.r.render(&perf.view, &self.targets, &self.host.camera);
+            let render_end = Instant::now();
+            let cpu_render = perf_thread_cpu();
+            self.gr.draw(&self.r, &perf.gui_view, self.size, 1, fe.gui(), &list);
+            let gui_end = Instant::now();
+            let cpu_gui = perf_thread_cpu();
+            // This submission follows both 3D and GUI work. Bound the queue to one frame, like a
+            // swapchain, rather than accumulating GPU work and deferred destruction in a tight loop.
+            let submission = self.r.queue.submit([]);
+            self.r.device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }).expect("offscreen performance GPU wait");
+            let end = Instant::now();
+            let cpu_end = perf_thread_cpu();
+            let (start, update, frontend) = (start.unwrap(), update_end.unwrap(), frontend_end.unwrap());
+            perf.samples[perf.count] = [
+                (end - start).as_secs_f64(), (update - start).as_secs_f64(),
+                (frontend - update).as_secs_f64(), (upload_end - frontend).as_secs_f64(),
+                (render_end - upload_end).as_secs_f64(), (gui_end - render_end).as_secs_f64(),
+                (end - gui_end).as_secs_f64(),
+            ];
+            let (cpu_start, cpu_update, cpu_frontend) = (cpu_start.unwrap(), cpu_update.unwrap(), cpu_frontend.unwrap());
+            perf.cpu_samples[perf.count] = [
+                (cpu_end - cpu_start).as_secs_f64(), (cpu_update - cpu_start).as_secs_f64(),
+                (cpu_frontend - cpu_update).as_secs_f64(), (cpu_upload - cpu_frontend).as_secs_f64(),
+                (cpu_render - cpu_upload).as_secs_f64(), (cpu_gui - cpu_render).as_secs_f64(),
+                (cpu_end - cpu_gui).as_secs_f64(),
+            ];
+            perf.count += 1;
+        } else {
+            // Flush staged writes even when the normal logic-only harness does not render.
+            self.r.queue.submit([]);
+            let _ = self.r.device.poll(wgpu::PollType::Poll);
+        }
         if let Some(path) = self.host.screenshot.take() {
             if let Err(e) = self.png(fe, &list, &path) { eprintln!("screenshot: {}: {e}", path.display()); }
         }
-        // No swapchain/present here to drive wgpu's own resource reclaim; queue.write_buffer/write_texture calls
-        // (sky ticks, actor skin updates, GUI) stage pending writes that wgpu only flushes/frees on the next
-        // queue.submit, so an explicit empty submit every tick (matching the real windowed loop's per-frame
-        // render+submit) is required before poll, not just poll by itself.
-        self.r.queue.submit([]);
-        let _ = self.r.device.poll(wgpu::PollType::Poll);
         list
     }
     /// Reads actual last-render sky fragments without advancing the simulation.
@@ -1173,6 +1316,16 @@ impl Offscreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offscreen_perf_percentiles_use_nearest_rank() {
+        let cpu_start = perf_thread_cpu();
+        for n in 0..10_000 { std::hint::black_box(n); }
+        assert!(perf_thread_cpu() > cpu_start, "calling-thread CPU clock must advance during work");
+        let mut samples = [5.0, 1.0, 4.0, 2.0, 3.0];
+        assert_eq!(perf_percentiles(&mut samples), (3.0, 5.0));
+        assert_eq!(perf_percentiles(&mut [7.0]), (7.0, 7.0));
+    }
 
     #[test]
     fn live_sky_renderer_frame_positions_survive_delayed_worker_responses() {
