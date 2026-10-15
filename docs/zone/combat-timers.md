@@ -132,6 +132,7 @@ Runtime behavior is intentionally unchanged for this report.
   Server acknowledgement replaces the source stack count or removes the source, then resolves the exact
   weapon identity (including bag weapons), updates nonnegative Ammo26, starts its raw RechargeDelay timer,
   and emits `Feedback_Reloading`. No template/item exceptions and no fabricated automatic reload.
+  The shared `Dynels::stat_of` accessor exposes the retained weapon Ammo26 to item-info consumers.
   Fresh `FUN_10048829` resolves own pages, registered container high words, bank and temporary trade inventory;
   `FUN_1002ad45` stores an unsigned 16-bit count and converts values outside 0..65535 to zero.
   `FUN_1002aa2d` additionally removes the first own-inventory entry matching a non-page source dynel identity.

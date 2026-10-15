@@ -2191,6 +2191,9 @@ impl Dynels {
     /// Stat `id` of the non-character dynel `(kind, instance)`: a message's value, else its template's (`None` while the model is not built
     /// yet, the dynel is unknown or has no such stat).
     pub fn stat_of(&self, kind: i32, instance: i32, id: u32) -> Option<i32> {
+        if kind == ao_net::n3::dynel::KIND_WEAPON_ITEM && id == 26 {
+            if let Some(item) = self.arms.weapon_item(instance) { return Some(item.clip); }
+        }
         let p = self.props.get(&(kind, instance))?;
         ao_formats::dynel_visual::get(&p.stats, id).or_else(|| match self.models.get(&p.key) {
             Some(Model::Ready { built, .. }) => ao_formats::dynel_visual::get(&built.stats, id),

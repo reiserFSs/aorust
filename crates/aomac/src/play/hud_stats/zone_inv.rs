@@ -270,6 +270,7 @@ mod tests {
         assert_eq!(z.on_frame(&ack(inv::item_identity(0x40), 123, 25, 0)), crate::play::zone::ZoneEvent::Reloading);
         assert_eq!(z.inventory[&0x40].b, 123);
         assert_eq!(z.world.arms.weapon_item(900).unwrap().clip, 25);
+        assert_eq!(z.world.stat_of(KIND_WEAPON_ITEM, 900, 26), Some(25));
         assert_eq!(z.world.arms.weapon_item(899).unwrap().clip, 0);
         assert_eq!(z.world.reload_bar_progress(), Some((0.0, 2.5)));
         z.on_frame(&ack(inv::item_identity(0x40), 0, 30, 2));
