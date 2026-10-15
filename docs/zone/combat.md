@@ -87,12 +87,12 @@ their native branches are in `1010c94a` and `1010cf05`, not approximated by spri
 * The weapon-specific parts of `N3Msg_SecondarySpecialAttack` (`FUN_10063be4` recharge, `FUN_100686fb` weapon slot availability,
   `FUN_100679c1` range, `FUN_10058908` line of sight): the server refuses such attacks itself; the client text for the refusal arrives as a
   `FormatFeedback`/`CharacterAction` 0x76 and is printed by the chat layer.
-* Own swing animation: the wielded weapon's list (combat-anim.md §3); bare hands, own-item specials and AnimSet 4/5 play `unarmed-rswing` (item record multimap layout not decoded, labelled GUESS).
+* Own swings resolve wielded and special-item animation lists, including the martial-arts item, with native crawl selection; missing humanoid lists use the native wave fallback rather than a guessed unarmed swing (combat-anim.md §3).
 * `/duel`, `/petduel`, the received PvP / duel action ids: [combat-duel.md](combat-duel.md), [actions.md](actions.md) §7.
 * The HUD floating-number reference y (`DAT_102761c0`) and the effect `0x2f5a` bitmap font (material 40): the numbers are drawn with the
   GUI `Shell` font at the lower third of the screen (own) / above the head (others), colours and life/rise speed from the client.
 * Combat music `flag` input (`dynel+0x21c`, writer unknown) is fed as false; stat 421 as 0 (stored, never read by a decision).
-* Hit reaction (`imp-*`) and miss/dodge animations: selector not found (combat-anim.md §8).
+* Hit-reaction selection is resolved (`GC10058cfa`), including stat 0x1ae == 0xe crawl. The height argument is unused by `1003c8b7`, not an unknown selector in `1003c802` (combat-anim.md §3–4). Reaction busy-key and remote movement-mode gates still differ as documented there.
 
 ## Live result (Ithaca, pf 4582 beach; headless `live_walk` sessions, no desktop capture)
 
