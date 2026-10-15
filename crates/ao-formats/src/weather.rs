@@ -634,6 +634,8 @@ pub struct State {
     pub levels: Levels,
     /// Full AO world-space wind (`FUN_100bf699`: wind object `+0xc/+0x10/+0x14`, base + A).
     pub wind: [f32; 3],
+    /// AO camera-eye displacement, GC100be767 writes n3Camera+0x1d4.
+    pub quake_offset: [f32; 3],
     /// `GAME.HighAltitudeWindX/Z` increment of the last frame.
     pub high_altitude_wind: [f32; 2],
     /// The same wind per second (`0.004 · 0.5 · (C + D)`).
@@ -643,7 +645,7 @@ pub struct State {
 impl State {
     /// Clear sky, no wind (before any frame).
     pub const fn clear() -> State {
-        State { fields: [0.0; FIELDS], levels: Levels { rain: 0.0, wind: 0.0, sand_wind: 0.0, fallout_red_wind: 0.0, fallout_green_wind: 0.0, quake: 0.0 }, wind: [0.0; 3], high_altitude_wind: [0.0; 2], high_altitude_wind_rate: [0.0; 2] }
+        State { fields: [0.0; FIELDS], levels: Levels { rain: 0.0, wind: 0.0, sand_wind: 0.0, fallout_red_wind: 0.0, fallout_green_wind: 0.0, quake: 0.0 }, wind: [0.0; 3], quake_offset: [0.0; 3], high_altitude_wind: [0.0; 2], high_altitude_wind_rate: [0.0; 2] }
     }
 
     /// `GAME.ThickCloudsIntensity` (`FUN_100ad5db`).
@@ -748,6 +750,8 @@ impl Wind {
 struct Quake {
     left: f32,
     acc: f32,
+    offset: [f32; 3],
+    pending: f32,
 }
 
 const QUAKE_DURATION: f32 = 2.0;
@@ -767,11 +771,16 @@ impl Quake {
                 }
             }
         }
+        self.left = self.left.max(self.pending * QUAKE_DURATION);
+        self.pending = 0.0;
         if self.left > 0.0 {
             let level = self.left / QUAKE_DURATION;
+            // GC100bef09..100bf035: three CRT draws before decrementing the timer.
+            self.offset = std::array::from_fn(|_| (((rng.rand() % 100 - 50) as f32 * 0.5 / 300.0) * self.left) / QUAKE_DURATION);
             self.left = (self.left - dt).max(0.0);
             level
         } else {
+            self.offset = [0.0; 3];
             0.0
         }
     }
@@ -791,6 +800,14 @@ impl Weather {
     /// `env`: `playfield::environment::Env::raw`.
     pub fn new(env: &[u8; 26], day: u32) -> Weather {
         Weather { area: Area::new(Config::from_env(env), day), wind: Wind::default(), quake: Quake::default(), rng: CrtRand::default(), haw: [0.0; 2], quake_level: 0.0 }
+    }
+
+    /// GC100b9850 -> module9/0xbf ->100b29a0/100bda8c: camera-local quake request.
+    /// The message is consumed by the following sky-manager frame.
+    pub fn lightning_impulse(&mut self, distance: f32) {
+        if (0.0..25.0).contains(&distance) {
+            self.quake.pending = self.quake.pending.max(1.5 - distance / 25.0 * 1.5);
+        }
     }
 
     /// One client frame (`FUN_100be767`): `day` = game day, `day_time` = `GameDayTime` (0..6480 s), `dt` = frame time.
@@ -830,7 +847,7 @@ impl Weather {
             fallout_green_wind: base * f[6],
             quake: self.quake_level,
         };
-        State { fields: f, levels, wind: self.wind.vector(), high_altitude_wind: self.haw, high_altitude_wind_rate: self.wind.rate() }
+        State { fields: f, levels, wind: self.wind.vector(), quake_offset: self.quake.offset, high_altitude_wind: self.haw, high_altitude_wind_rate: self.wind.rate() }
     }
 
 }
@@ -1018,6 +1035,27 @@ mod tests {
         let r = run();
         assert_eq!(r, run());
         assert!(r.iter().all(|v| v.is_finite() && v.abs() < 1.0), "{r:?}");
+    }
+
+    #[test]
+    fn lightning_uses_quake_timer_and_native_camera_draws() {
+        let mut weather = Weather::new(&[0; 26], 0);
+        weather.lightning_impulse(25.0);
+        assert_eq!(weather.quake.pending, 0.0);
+        weather.lightning_impulse(0.0);
+        weather.lightning_impulse(20.0);
+        assert_eq!(weather.quake.pending, 1.5);
+        let mut rng = CrtRand::default();
+        let mut expected_rng = rng.clone();
+        let expected = std::array::from_fn(|_| (((expected_rng.rand() % 100 - 50) as f32 * 0.5 / 300.0) * 3.0) / 2.0);
+        assert_eq!(weather.quake.step(0.0, 0.25, &mut rng), 1.5);
+        assert_eq!(weather.quake.offset, expected);
+        assert_eq!(weather.quake.left, 2.75);
+        assert_eq!(weather.quake.pending, 0.0);
+        assert_eq!(rng.rand(), expected_rng.rand());
+        weather.quake.left = 0.0;
+        assert_eq!(weather.quake.step(0.0, 0.25, &mut rng), 0.0);
+        assert_eq!(weather.quake.offset, [0.0; 3]);
     }
 
     #[test]

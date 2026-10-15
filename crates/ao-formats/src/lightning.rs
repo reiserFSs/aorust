@@ -81,15 +81,13 @@
 //!   instead of reusing the primary FX8 instance (presumably FXS resource-pool occupancy — e.g.
 //!   two strikes firing before the first's fans expire) was not traced; this is the FX9 pool/
 //!   lifetime semantics gap flagged before starting this port.
-//! * The `<25 m` `AFCM::Send(9, 0xbf, …)` camera impulse: the trigger condition and payload
-//!   constants are confirmed (see above), but AFCM.dll dispatches message processors through a
-//!   runtime `RegisterMessageProcessor` table (only the `AFCM::Send` overload *symbols* are
-//!   visible in Gamecode.dll's import names; the module-9/0xbf consumer inside AFCM.dll that
-//!   would turn this payload into an actual camera displacement is not decoded).
-//!   `aomac::play::camera::apply_ground_shake` is an existing offset-the-eye primitive, but it
-//!   backs a different native path (GC effect kind 3032 "GroundShake",
-//!   `aomac::play::combat::effects_aux`); feeding it a guessed direction/magnitude here would not
-//!   be faithful, so [`Strike::audio`] only reports `camera_impulse: bool` and applies nothing.
+//! * Nearby camera impulses are handled by the shared weather quake timer, not bolt geometry:
+//!   GC100b68ad registers module9/0xbf to100b29a0, which receives both vectors and calls100bda8c.
+//!   With the request at the camera, strength is `1.5*(1-distance/25)` and radius is25.
+//!   The next GC100be767 frame merges `strength*2` into the quake timer, draws three CRT offsets
+//!   `(rand()%100-50)*0.5/300 * time_left/2`, then decrements it. N3 callback1001ff2f
+//!   adds camera+0x1d4 to the visual eye only. `Weather::lightning_impulse` and live flow
+//!   now connect this path independently of whether an audio device is available.
 //! * Live wiring (`aomac::play::lightning::LightningFx`): `extent` comes from `Collision::tile_size()` (the same
 //!   `Tilemap` already retained for terrain collision — no second rdb 1000009 load) through [`extent`]. `aomac`'s
 //!   effect renderer (`aomac::play::combat::effects`) is bound 1:1 to RDB-templated, dynel-addressed GC effect

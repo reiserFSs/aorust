@@ -1539,14 +1539,17 @@ impl Frontend for Play {
                 let strikes = self.world_lightning.tick(enabled, dt, controlled, extent, controlled[1]);
                 host.actor_models.extend(self.world_lightning.take_model_upload());
                 host.actors.extend(self.world_lightning.actors());
-                if let Some(audio) = &self.audio {
-                    for strike in &strikes {
-                        let cue = strike.audio(controlled, extent);
+                for strike in &strikes {
+                    let cue = strike.audio(controlled, extent);
+                    weather.lightning_impulse(cue.distance);
+                    if let Some(audio) = &self.audio {
                         if let Err(error) = audio.play_lightning_cue(cue.volume, cue.delay) {
                             eprintln!("lightning cue: {error:#}");
                         }
                     }
                 }
+                let offset = weather.state().quake_offset;
+                super::camera::apply_ground_shake(&mut host.camera, glam::Vec3::new(offset[0], offset[1], -offset[2]));
             }
             host.effect_day_time = Some(self.zone.day_time());
             host.effect_game_seconds = self.zone.game_seconds();
