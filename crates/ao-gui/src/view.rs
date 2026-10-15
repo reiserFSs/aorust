@@ -314,6 +314,8 @@ pub struct View {
     pub v_align: Align,
     pub node: Node,
     pub stacked: bool,
+    /// ScrollingTextView's own preferred-width override (GUI 10008fd2), separate from TextView content width.
+    pub scrolling_text: bool,
     pub flags: u32,
     /// `View::_ParentSized` 0x1014ad6c edge-follow mask.
     pub resize_mask: u32,
@@ -359,6 +361,7 @@ impl View {
             v_align: Align::Center,
             node: Node::None,
             stacked: false,
+            scrolling_text: false,
             flags: 0,
             resize_mask: 0,
             visible: true,
@@ -674,8 +677,13 @@ pub fn build(tree: &mut Tree, ctx: &mut BuildCtx, e: &Element) -> Option<ViewId>
             }
             id
         }
-        // `ScrollingTextView_c` (the partner name of `TradeGUI.xml`): a `TextView_c` that scrolls a too-wide text; the scrolling is not ported
-        "TextView" | "ScrollingTextView" => tree.add(new_text_view(ctx, e)),
+        "TextView" => tree.add(new_text_view(ctx, e)),
+        // Native scrolling-title preferred bounds differ from TextView; timed scrolling remains unported.
+        "ScrollingTextView" => {
+            let mut v = new_text_view(ctx, e);
+            v.scrolling_text = true;
+            tree.add(v)
+        }
         "Button" => {
             let mut v = View::new(Kind::Button(ButtonData {
                 label: ctx.string(e, "label"),

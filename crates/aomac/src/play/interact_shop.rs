@@ -1073,7 +1073,8 @@ mod tests {
         let mut z = Zone::new(OWN);
         let i = open(&mut gui, &mut z);
         let s = i.shop.shop.as_ref().expect("window");
-        assert_eq!(gui.window_size(s.win), CLIENT);
+        let (min, max) = gui.window_preferred_size_limits(s.win).unwrap();
+        assert_eq!(gui.window_size(s.win), (CLIENT.0.clamp(min.0, max.0), CLIENT.1.clamp(min.1, max.1)));
         for v in ["ShopInventoryDock", "PartnerInventoryDock", "PartnerCashView", "AcceptButton", "DeclineButton", "shop_items", "bought_items"] {
             assert!(gui.has_view(s.win, v), "{v}");
         }

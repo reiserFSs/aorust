@@ -309,6 +309,11 @@ pub const SCROLLBAR_W: f32 = 10.0; // GFX_GUI_SCROLLBAR_GRAY_* are 11 px wide â†
 
 /// `TextRenderer_c::CalculatePreferredSize` 0x101623ea.
 fn text_pref(env: &mut Env, tree: &Tree, id: ViewId, t: &TextData, max: bool) -> Point {
+    // ScrollingTextView 10008fd2: width -1/16000, height cached from its empty child TextView
+    // (XML ctor 10008d03 -> 10008aab). Assigned long names do not constrain the owner.
+    if tree.views[id].scrolling_text {
+        return Point::new(if max { BIG } else { -1.0 }, env.fonts.font(t.font).height as f32 - 1.0);
+    }
     let (mn, mx) = (t.min_pref, t.max_pref);
     let pm = if max { mx } else { mn };
     if pm.x > 0.0 && pm.y >= 0.0 {

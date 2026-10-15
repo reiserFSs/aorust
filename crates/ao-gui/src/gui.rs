@@ -2951,6 +2951,17 @@ mod clip_tests {
         assert!(visible > 0 && visible < lines, "the test must scroll some lines off-screen while keeping others visible");
     }
     #[test]
+    fn scrolling_title_preferred_width_is_independent_of_assigned_name() {
+        let Ok(mut gui) = Gui::new(&crate::client_dir(), None) else { return };
+        let window = gui.open_window_xml("title", "<root><ScrollingTextView name=\"name\"/></root>", (0, 0), WindowSize::Fixed(200, 40)).unwrap();
+        gui.set_text(window, "name", "Shop");
+        let bounds = gui.window_preferred_size_limits(window).unwrap();
+        assert_eq!(bounds.1.0, 16001, "native scrolling title maximum is extent16000");
+        gui.set_text(window, "name", &"Long shop name ".repeat(100));
+        assert_eq!(gui.window_preferred_size_limits(window), Some(bounds));
+    }
+
+    #[test]
     fn selector_limits_include_hidden_pages_and_take_largest_min_and_max() {
         let Ok(mut gui) = Gui::new(&crate::client_dir(), None) else { return };
         let xml = "<root><ViewSelector name=\"pages\"><CanvasView min_size=\"Point(40,20)\" max_size=\"Point(80,50)\"/><CanvasView min_size=\"Point(70,30)\" max_size=\"Point(120,40)\"/></ViewSelector></root>";
