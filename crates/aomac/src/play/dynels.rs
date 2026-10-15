@@ -1567,8 +1567,8 @@ impl Dynels {
 
     /// Starts/clears the own Attack bars and advances every open one (once per tick, `combat/glue.rs`). `fighting` =
     /// `combat::module::Module::attacking()`; a slot whose hand is no longer wielded drops its bar, a newly wielded one
-    /// starts fresh at zero.
-    pub fn update_attack_bars(&mut self, own: i32, fighting: bool, dt: f32) {
+    /// starts fresh at zero. Returns true once when the Reload timer completes (GC10068301).
+    pub fn update_attack_bars(&mut self, own: i32, fighting: bool, dt: f32) -> bool {
         if fighting {
             let slots = self.arms.attack_slots(own);
             self.attack_bars.retain(|slot, _| slots.contains(slot));
@@ -1585,8 +1585,10 @@ impl Dynels {
             *elapsed += dt;
             if *elapsed >= *total {
                 self.reload_bar = None;
+                return true;
             }
         }
+        false
     }
 
     /// Restarts the Attack bar of `slot` at a swing of the own character (`CombatEvent::Hit`/`Miss` whose attacker is
@@ -4531,11 +4533,12 @@ mod tests {
         let (p0, reload_total) = d.reload_bar_progress().expect("a ranged hand is wielded");
         assert_eq!(reload_total, 5.0, "raw RechargeDelay (stat 0xd2 = 500) / 100, no initiative scaling, no AttackDelay sum");
         assert_eq!(p0, 0.0);
-        d.update_attack_bars(own, false, reload_total * 0.5);
+        assert!(!d.update_attack_bars(own, false, reload_total * 0.5));
         let (half, _) = d.reload_bar_progress().unwrap();
         assert!((half - 0.5).abs() < 0.01, "{half}");
-        d.update_attack_bars(own, false, reload_total);
+        assert!(d.update_attack_bars(own, false, reload_total));
         assert!(d.reload_bar_progress().is_none(), "the reload bar closes once its duration elapses");
+        assert!(!d.update_attack_bars(own, false, reload_total), "completion fires once");
     }
 }
 

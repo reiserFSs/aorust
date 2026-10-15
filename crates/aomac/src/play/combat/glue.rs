@@ -169,7 +169,9 @@ impl Play {
         let Some(m) = self.fight.as_mut() else { return };
         m.update(dt, &self.zone, self.audio.as_ref());
         let own = self.zone.char_id as i32;
-        self.zone.world.update_attack_bars(own, m.attacking(), dt);
+        if self.zone.world.update_attack_bars(own, m.attacking(), dt) {
+            if let Some(c) = self.chat.as_mut() { c.feedback(&mut self.gui, "Feedback_ReloadingCompleted", &self.text); }
+        }
         // Every health consumer (target, team, nametag and NPC info) reads the zone stores.
         let events = m.take_events();
         for e in &events {

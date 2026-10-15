@@ -94,10 +94,11 @@ impl Play {
             }
             0x89 => self.send_outgoing(vec![action::plain_action(action::id::FORAGE)]),
             0x86 => self.search(),
-            // Reload `FUN_1006949a` [GC]: action 0xd2. UNRESOLVED: its gate `FUN_10029e66` (a field of the manager's `+4` object being 0).
-            0x6e => {
+            // GC100694aa: WeaponHolder+84 weak timer gate (10029e66), cleared by 10068301.
+            0x6e if self.zone.world.reload_bar_progress().is_none() => {
                 self.send_outgoing(vec![action::plain_action(action::id::RELOAD)]);
             }
+            0x6e => {}
             _ => eprintln!("hud: special action {a:#x} has no consumer yet"),
         }
     }
@@ -301,6 +302,12 @@ mod tests {
         assert_eq!(frames.len(), 1);
         let ao_net::n3::N3::World(ao_net::n3::world::World::CharacterAction(a)) = ao_net::n3::decode(&frames[0]).unwrap().body else { panic!("expected reload request") };
         assert_eq!(a.action, ao_net::n3::action::id::RELOAD);
+        play.zone.world.start_reload_bar(250);
+        play.special_action(0x6e);
+        assert!(play.fight.as_mut().unwrap().take_outbox().is_empty(), "active server reload timer gates repeated requests");
+        assert!(play.zone.world.update_attack_bars(own, false, 2.5));
+        play.special_action(0x6e);
+        assert_eq!(play.fight.as_mut().unwrap().take_outbox().len(), 1, "completion releases the reload request gate");
     }
 
     /// The Logout bar's "Logout" label: `TOOLTIP` font, horizontally centred across the whole bar (`TextOutput_t::Alignment`
