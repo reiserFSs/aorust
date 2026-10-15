@@ -283,7 +283,7 @@ impl Runtime {
         if let Some(path) = def.file.as_deref().and_then(|path| sh.resolve(path)) {
             if hold > 0.0 {
                 let already = self.keepalive.contains_key(&def.id);
-                let voice = self.keepalive_duration(sh, def, if def.vol_max == 0.0 { 0.0 } else { gain / def.vol_max }, hold, [0.0; 3]);
+                let voice = self.keepalive_gain(sh, def, level, gain, hold, [0.0; 3]);
                 if voice != 0 {
                     if !already && def.fade_in > 0.0 {
                         sh.mixer().fade_from_zero(voice, def.fade_in);
@@ -335,10 +335,16 @@ impl Runtime {
 
     /// Native PlaySample positive duration override; returns the current looping voice.
     pub fn keepalive_duration(&mut self, sh: &Shared, def: &SoundDef, scale: f32, duration: f32, pos: [f32; 3]) -> u64 {
-        let level = def.vol_max * scale;
-        if level > 0.0 || self.keepalive.get(&def.id).is_some_and(|k| k.2 > 0.0) {
-            record_life_danger(&mut self.life_dangers, def, pos);
+        self.keepalive_gain(sh, def, scale, def.vol_max * scale.clamp(0.0, 1.0), duration, pos)
+    }
+    fn keepalive_gain(&mut self, sh: &Shared, def: &SoundDef, caller: f32, level: f32, duration: f32, pos: [f32; 3]) -> u64 {
+        // SI10002d98 gates caller gain against the retained authored gain BEFORE
+        // multiplying by the authored volume. Silent definitions can still scare life.
+        if caller <= 0.0 && self.keepalive.get(&def.id).is_none_or(|k| k.2 <= 0.0) {
+            if let Some((voice, ..)) = self.keepalive.remove(&def.id) { sh.mixer().stop(voice); }
+            return 0;
         }
+        record_life_danger(&mut self.life_dangers, def, pos);
         let t = def.fade_out + duration;
         if let Some(k) = self.keepalive.get_mut(&def.id) {
             if sh.mixer().is_playing(k.0) {
@@ -941,5 +947,26 @@ mod tests {
         rt.update(&sh, 0.26, [0.0; 3], 0.0);
         assert!(!sh.mixer().is_playing(voice));
         assert!(!rt.keepalive.contains_key(&def.id));
+    }
+    #[test]
+    fn native_keepalive_scare_gate_precedes_authored_volume() {
+        let Some(dir) = client() else { return };
+        let (sh, mut rt) = runtime(&dir);
+        let mut def = def_with_variants(&[]);
+        def.vol_min = 0.;
+        def.vol_max = 0.;
+        def.scare_radius = 12.;
+        let pos = [3., 4., 5.];
+        assert_eq!(rt.keepalive_duration(&sh, &def, 1., 0.2, pos), 0);
+        assert_eq!(rt.life_dangers, [(pos, 12.)], "positive caller gain emits even with no sample and zero authored gain");
+        rt.life_dangers.clear();
+        rt.keepalive_duration(&sh, &def, 0., 0.2, pos);
+        assert!(rt.life_dangers.is_empty());
+        rt.keepalive.insert(def.id, (u64::MAX, 1., 0.5, 0.));
+        rt.keepalive_duration(&sh, &def, 0., 0.2, pos);
+        assert_eq!(rt.life_dangers, [(pos, 12.)], "retained gain keeps the native gate open");
+        rt.life_dangers.clear();
+        rt.keepalive_duration(&sh, &def, 1., 0.2, [0.; 3]);
+        assert!(rt.life_dangers.is_empty(), "non-positional requests never emit danger spheres");
     }
 }
