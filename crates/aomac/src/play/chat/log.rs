@@ -585,7 +585,8 @@ pub enum LogEvent {
     /// `ShieldAttackIIR_t` 25192476.
     DamageShield { who: Identity, amount: i32, attacker: Identity },
     /// `StatIIR_t` 2B333D6E, one pair: new value of `stat` on `who` (old value from [`LogCtx::stat`]).
-    Stat { who: Identity, stat: i32, new: i32 },
+    /// `alien_level` is the last AlienLevel pair from this same message (GC 0x100a1d0b).
+    Stat { who: Identity, stat: i32, new: i32, alien_level: Option<i32> },
     /// `NewLevelIIR_t` 7F405A16 (eight `i32`: level, ip, xp, ..., title level `+0x2c`, ..., xp gain `+0x34`).
     NewLevel { who: Identity, f: [i32; 8] },
     /// `ShadowLevelIIR_t` 3C1E2803 (same eight `i32`, SK gain `+0x30`, title level `+0x34`).
@@ -678,7 +679,8 @@ pub fn events(m: &Message) -> Vec<LogEvent> {
             for &(stat, new) in &s.stats {
                 map.insert(stat, new);
             }
-            map.into_iter().map(|(stat, new)| LogEvent::Stat { who: m.header.target, stat, new }).collect()
+            let alien_level = map.get(&0xa9).copied();
+            map.into_iter().map(|(stat, new)| LogEvent::Stat { who: m.header.target, stat, new, alien_level }).collect()
         }
         _ => from_n3(m).into_iter().collect(),
     }
@@ -1052,7 +1054,7 @@ pub fn classify(ev: &LogEvent, ctx: &LogCtx) -> Vec<LogLine> {
                 combat(&Call { o, ..Call::new(cat, *who, *amount) }, ctx, &mut out);
             }
         }
-        LogEvent::Stat { who, stat, new } => {
+        LogEvent::Stat { who, stat, new, alien_level } => {
             // StatIIR apply [GC 0x100a1aaf]
             if !ctx.known(*who) {
                 return out;
@@ -1075,7 +1077,11 @@ pub fn classify(ev: &LogEvent, ctx: &LogCtx) -> Vec<LogLine> {
                     }
                 }
                 0x34 if own => combat(&Call::new(0x24, *who, diff), ctx, &mut out),
-                0x28 if own => combat(&Call::new(0x45, *who, diff), ctx, &mut out), // [GUESS] the AlienXP branch with stat 0xa9 / 0xb2 adds a second term
+                0x28 if own => {
+                    let rollover = alien_level.is_some_and(|level| level > (ctx.stat)(*who, 0xa9).unwrap_or(0));
+                    let amount = if rollover { diff.wrapping_add((ctx.stat)(*who, 0xb2).unwrap_or(0)) } else { diff };
+                    combat(&Call::new(0x45, *who, amount), ctx, &mut out);
+                }
                 0x23d if own => combat(&Call::new(0x3e, *who, diff), ctx, &mut out),
                 0x2aa..=0x2ac if own => {
                     let t = ldb_format(&ctx.fb("Feedback_GotPVPScore"), &[n(diff), s((ctx.text)(2002, *stat as u32).unwrap_or_default())]);
@@ -1399,10 +1405,10 @@ mod tests {
             let l = texts(classify(&LogEvent::SpecialHit { attacker: id(2), victim: id(1), damage: 5, special: 142 }, ctx));
             assert_eq!(l[0].2, "Snake hit you for 5 points of Brawling damage.");
             // xp / sk / heal
-            let xp = |amount| LogEvent::Stat { who: id(1), stat: 0x34, new: amount };
+            let xp = |amount| LogEvent::Stat { who: id(1), stat: 0x34, new: amount, alien_level: None };
             assert_eq!(texts(classify(&xp(100), ctx)), vec![(class::ME_GOT_XP, "CCMeGotXpColor", "You received 100 xp.".into())]);
             assert_eq!(texts(classify(&xp(-30), ctx))[0].2, "You lost 30 xp.");
-            let l = texts(classify(&LogEvent::Stat { who: id(1), stat: 0x23d, new: 4 }, ctx));
+            let l = texts(classify(&LogEvent::Stat { who: id(1), stat: 0x23d, new: 4, alien_level: None }, ctx));
             assert_eq!(l[0].2, "You gained 4 points of Shadowknowledge.");
             let l = texts(classify(&LogEvent::HealthDamage { who: id(1), health: 100, delta: 12, dtype: 0, death_cause: 0, attacker: Identity::default(), nano: 0 }, ctx));
             assert_eq!(l, vec![(class::ME_GOT_HEALTH, "CCMeHealedColor", "You were healed for 12 points.".into())]);
@@ -1438,6 +1444,45 @@ mod tests {
             eprintln!("skipped: no client text.mdb");
             return;
         };
+    }
+
+    #[test]
+    fn alien_xp_rollover_uses_same_message_level_and_old_threshold() {
+        let filter = ChatFilter::default();
+        let ctx = LogCtx {
+            own: id(1),
+            name: &|_| Some("Testy".into()),
+            text: &|cat, key| (cat == 110 && key == elf_hash("Feedback_GainedAlienXP")).then(|| "You gained %d alien xp.".into()),
+            is_npc: &|_| false,
+            is_own_pet: &|_| false,
+            nano_name: &|_| None,
+            stat: &|_, stat| match stat { 0x28 => Some(90), 0xa9 => Some(2), 0xb2 => Some(100), _ => None },
+            weapon: &|_, _, _| None,
+            filter: &filter,
+        };
+        // Wire-layout fixture: ascending application must use old 0xb2=100, not incoming 200.
+        let decode = |who: i32, pairs: &[(i32, i32)]| {
+            let mut payload = ao_net::n3::dynel::STAT.to_be_bytes().to_vec();
+            payload.extend_from_slice(&50000_i32.to_be_bytes());
+            payload.extend_from_slice(&who.to_be_bytes());
+            payload.push(0);
+            payload.extend_from_slice(&(pairs.len() as i32).to_be_bytes());
+            for (stat, new) in pairs {
+                payload.extend_from_slice(&stat.to_be_bytes());
+                payload.extend_from_slice(&new.to_be_bytes());
+            }
+            let frame = ao_net::frame::Frame { seq: 1, ptype: ao_net::frame::PT_N3, sender: 1, receiver: 1, payload };
+            events(&ao_net::n3::decode(&frame).unwrap())
+        };
+        let lines = |events: Vec<LogEvent>| texts(events.iter().flat_map(|event| classify(event, &ctx)).collect());
+        let expected = vec![(class::ME_GOT_XP, "CCMeGotXpColor", "You gained 15 alien xp.".into())];
+        assert_eq!(lines(decode(1, &[(0xb2, 200), (0xa9, 2), (0x28, 5), (0xa9, 3)])), expected);
+        for level in [1, 2] {
+            assert!(lines(decode(1, &[(0x28, 5), (0xa9, level)])).is_empty());
+        }
+        assert!(lines(decode(1, &[(0x28, 5)])).is_empty());
+        assert!(lines(decode(3, &[(0x28, 5), (0xa9, 3)])).is_empty());
+        assert_eq!(lines(decode(1, &[(0x28, 105)])), expected);
     }
 
     #[test]

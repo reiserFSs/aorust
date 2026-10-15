@@ -118,6 +118,9 @@ Example, template + live capture: `%s hit %s for %u points of %s damage.` with t
 | `FormatFeedbackIIR_t` 206B4B73 | [GC 0x10039341] -> `FUN_1005aaa9` [GC 0x1005aaa9] | mode 1 / 2: floating text (not chat); else direct `(group, RemoteFormat::ParseString(text), colour 16 = CCYellow)` | `FormatFeedback` |
 | `N3Msg_CastNanoSpell` (local) | [GC 0x1001b54b] | client casts: cat 0x47 with the nano name | `CastNano` (hub builds it) |
 
+
+Alien XP rollover is resolved by fresh `FUN_100a1aaf` decompilation: before applying the ascending map, compare its last `0xa9` value with the current AlienLevel; only an increase enables the `0x100a1d0b` branch, adding current `stat(0xb2)` to `new AlienXP − old AlienXP`. Because `0x28` precedes `0xb2`, this is the old threshold even when the packet updates both. `LogEvent::Stat.alien_level` retains the same-message value for chat classification before zone application. Regression `alien_xp_rollover_uses_same_message_level_and_old_threshold` decodes codec-layout fixtures, covers duplicate AlienLevel last-wins, old/new threshold, absent/equal/decreased level, ordinary gain, and foreign-character silence; it is not a live capture.
+
 Resolution of the dynels: `FUN_10058e36` returns a dynel only for identity kind 50000 (0xC350). A missing dynel drops the event (`LogCtx::name`
 returning `None`). **Direction (code wins over the earlier guess in docs/zone/misc.md §4/§7):** in `AttackInfoIIR_t` the header dynel is the
 *attacker* and `other` (+0x24) the *victim* (`FUN_1009ed0d` prints "You were hit" when the header is absent and `other` is the client; Health is
@@ -223,7 +226,6 @@ totals 100 then 137 through `LoginEvent::ZoneFrame`/`pump` and expects one 37-XP
 * Victim/attacker direction of `AttackInfo` (§3): derived from `FUN_1009ed0d` and `FUN_1009b170`; the live capture has no message involving the client.
 * Damage type of a hit: `FUN_1009afde` reads stat 0x1b4 of the item behind the attacker's weapon slot (resolved, docs/zone/combat-log.md §2.1.1); `FUN_10058a05`
   (pvp flag in the 0x1e/0x1d choice) is treated as false.
-* `Stat` 0x28 (AlienXP) has a second branch using stats 0xa9/0xb2 that is not modelled (diff only).
 * CharacterAction 0xa4: the id given to `GetText(2002, ..)` is `b.instance` (register pattern identical to the Stuck cases, not proven).
 * `AttackInfo` damage type default `0x1b`/`unknown` for stat-driven DoT (cat 0x1a / 0x1b with no damage type): text "... points of unknown damage." is what the code produces.
 * Loot lines (class 0x4200001a/1b) come from the chat server's vicinity messages (§5), not from an N3 IIR; no Gamecode code emits those classes.

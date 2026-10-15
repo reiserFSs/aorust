@@ -17,7 +17,7 @@ impl LevelNotice {
     pub(super) fn update(&mut self, gui: &mut Gui, values: &mut DValues, screen: (u32, u32)) {
         let enabled = values.prefs.get_int("ShowIPPerkbutton", Kind::Login).unwrap_or(1) != 0;
         for (i, &(flag, gfx, kind, bottom)) in NOTICES.iter().enumerate() {
-            if values.flag(flag) && (!enabled || values.flag(kind)) {
+            if values.flag(flag) && (!enabled || (kind == "research_window" && values.flag(kind))) {
                 values.set_i64(flag, 0);
             }
             if !values.flag(flag) {
@@ -69,6 +69,17 @@ mod tests {
             assert_eq!(gui.window_pos(window), (1220, 800 - bottom));
             assert_eq!(notices.event(&Event::Clicked { window, view: "notify".into(), item: None }), Some(target));
         }
+        // Only Research suppresses a new notice while its target is already open.
+        for &(flag, _, kind, _) in &NOTICES {
+            LevelNotice::opened(&mut values, kind);
+            values.set_i64(kind, 1);
+            values.set_i64(flag, 1);
+        }
+        notices.update(&mut gui, &mut values, (1280, 800));
+        assert!(values.flag("got_ip") && values.flag("got_perk"));
+        assert!(!values.flag("got_tech"));
+        assert!(notices.windows[0].is_some() && notices.windows[1].is_some());
+        assert!(notices.windows[2].is_none());
         values.prefs.set_int("ShowIPPerkbutton", 0, Kind::Login);
         notices.update(&mut gui, &mut values, (1280, 800));
         assert!(notices.windows.iter().all(Option::is_none));

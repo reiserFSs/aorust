@@ -299,6 +299,11 @@ impl Play {
                         self.zone.world.sound_at(*who, name);
                     }
                 }
+                CombatEvent::OwnAlienLevel => {
+                    if let Some(h) = self.hud.as_mut() {
+                        h.dvalues.set("got_perk", crate::play::dvalue::Variant::Bool(true));
+                    }
+                }
                 CombatEvent::OwnNewLevel { animation, sound, got_ip, got_perk, got_tech, .. } => {
                     self.zone.world.sound_id_at_position(ao_audio::sbf::sound_id(sound), [0.0; 3]);
                     if let Some(p) = self.player.as_mut() {

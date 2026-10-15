@@ -126,6 +126,8 @@ pub enum CombatEvent {
     StatChanged { dynel: i32, stat: u32, value: i32 },
     /// Retail own-character NewLevel gate: social 6, level-complete sound, and GUI DValues.
     OwnNewLevel { dynel: i32, level: i32, animation: u16, sound: &'static str, got_ip: bool, got_perk: bool, got_tech: bool },
+    /// Own AlienLevel pair sets got_perk even when unchanged or decreased (GC 0x100a1aaf).
+    OwnAlienLevel,
     /// `dynel` died: `cause` = `FUN_1005ae91` mode (1 terminate, 2 reflect, 3 shield, 4 weapon, 5 spell, 6 fall, 7 liquid) or
     /// 0 for the server's `CharacterAction` 99.
     Died { dynel: i32, cause: u32 },
@@ -616,6 +618,7 @@ impl Combat {
                 }
                 STAT_XP if client => fb = Some((log::ty::XP, delta)),
                 STAT_ALIEN_XP if client => fb = Some((log::ty::ALIEN_XP, if level_up { alien_base + delta } else { delta })),
+                STAT_ALIEN_LEVEL if client => ev.push(CombatEvent::OwnAlienLevel),
                 STAT_SHADOW_KNOWLEDGE if client => fb = Some((log::ty::SHADOW_KNOWLEDGE, delta)),
                 _ => {}
             }
@@ -680,6 +683,19 @@ mod tests {
         let events = c.on_frame(&packet(0x7f40_5a16, 1, &[5, 0, 0, 0, 0, 0, 0, 0]), 1);
         assert!(events.iter().any(|event| matches!(event, CombatEvent::OwnNewLevel { got_perk: false, got_tech: true, .. })));
         assert_eq!(notices(&c.on_frame(&packet(0x7f40_5a16, 99, &[10, 0, 0, 0, 0, 0, 0, 0]), 1)), 0);
+    }
+
+    #[test]
+    fn own_alien_level_pair_always_raises_perk_notice() {
+        let mut c = setup();
+        for id in [1, 3] {
+            for level in [2, 2, 1] {
+                let mut events = Vec::new();
+                c.stats(id, &[(STAT_ALIEN_LEVEL, level)], &mut events);
+                assert_eq!(events.iter().filter(|event| matches!(event, CombatEvent::OwnAlienLevel)).count(), usize::from(id == 1));
+                assert!(!events.iter().any(|event| matches!(event, CombatEvent::OwnNewLevel { .. })));
+            }
+        }
     }
 
     fn ch(i: i32) -> Identity {

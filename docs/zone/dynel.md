@@ -339,7 +339,7 @@ vftable [GC 0x10166d54]; ReadSubClass [GC 0x100a1a7c] → `FUN_10009dd4`; WriteS
 | 17 | `n × (i32 stat, i32 value)` | stat id (client table in §0) and new value |
 
 The client keeps the pairs in a `std::map<int,int>` (later duplicates overwrite); apply sets each stat on the dynel and shows combat text: stat 0x1b (Health)
-deltas → floating damage/heal numbers, 0x28 (AlienXP), 0xA9 (AlienLevel, sets DValue `got_perk`), 0x34 (XP), 0x23D, 0x2AA..0x2AC (LDB strings). Live (69
+deltas → floating damage/heal numbers, 0x28 (AlienXP), 0xA9 (AlienLevel, every own-character pair sets DValue `got_perk=true`, even unchanged/decreased; fresh GC `0x100a1aaf` decompilation gates only on dynel byte `+0x140`), 0x34 (XP), 0x23D, 0x2AA..0x2AC (LDB strings). Live (69
 messages, one pair each, sender = the dynel): `(0x300 = 768, 0|1)` ×60 (stat 0x300 is not in the client's name table), `(0x40 HeadMesh, 0 | 40629)`, `(0x209 SocialStatus, 0)`,
 `(0xAD CurrentMovementMode, 3)`, `(0xD6 CurrentNano, 162…166)` ×3, `(0x1B Health, 215 | 190)`. Example: `2b333d6e 0000c350 000fa513 00 00000001 00000300 00000000`.
 

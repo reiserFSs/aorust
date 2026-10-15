@@ -156,7 +156,7 @@ The surprising threshold is confirmed by raw instructions, not a decompiler gues
 ## 5. `StatIIR_t` apply [GC 0x100a1aaf] (`Combat::stats`)
 Pairs are applied ascending by stat id (std::map, duplicates overwritten). For each: `delta = new − current`, then
 * `Health` (27): `delta < 0` → type `0x1a` (client char) / `0x1c` (pet of the local player: `FUN_100523c3`, not ported) / `0x1b`, value `|delta|`; `delta ≥ 1` and client → `0x22`;
-* `0x34` XP (client) → `0x24`; `0x28` alien XP (client) → `0x45` (value `stat(0xb2) + delta` when the same message raises stat `0xa9` AlienLevel, else `delta`); `0xa9` sets DValue `got_perk`;
+* `0x34` XP (client) → `0x24`; `0x28` alien XP (client) → `0x45` (value `stat(0xb2) + delta` when the same message raises stat `0xa9` AlienLevel, else `delta`, GC `0x100a1d0b`); every own `0xa9` pair sets DValue `got_perk=true`, including equal/lower values: fresh `0x100a1aaf` decompilation shows only the client-byte `+0x140` gate, no delta/increase test. `OwnAlienLevel` carries this to HUD without NewLevel sound/social effects; regression `own_alien_level_pair_always_raises_perk_notice` covers own/foreign increase/repeat/decrease;
   `0x23d` → `0x3e`; `0x2aa..0x2ac` → `Feedback_GotPVPScore` (not ported); `0x34/0x28/0x23d` texts only for the client char;
 * the value is stored (`FUN_10062349`). A health change that the preceding `AttackInfo` already applied therefore has `delta == 0` and prints nothing.
 Live: 69 StatIIR messages with one pair each, of which only a few are `Health` (`215 | 190`) — see dynel.md §3.
