@@ -26,11 +26,11 @@ use ao_net::n3::knubot::{self, Knubot};
 
 /// Cash (`0x3d`, `N3Msg_GetSkill(0x3d, 2)` in `FUN_100574dc`).
 pub const STAT_CASH: u32 = 0x3d;
-/// The container's cell: the 48 px item picture on the 54 px slot art `GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED` ([INFERENCE]: the `ItemContainerView_c` cell metrics were
-/// not read; it is the same `MultiListView_c` grid as the inventory's).
-const CELL: f32 = 54.0;
-const ICON: f32 = 48.0;
-const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
+/// ItemContainerView 100cdb3a retains the MultiListView 10136423 default: 32px icons,
+/// ten-pixel gaps and six-pixel borders (CellCountToPreferredSize 101331dc).
+const CELL: f32 = 38.0;
+const ICON: f32 = 32.0;
+const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_32_CLOSED";
 
 /// Columns and rows of the item container (`FUN_100575a1`: `SetViewCellCounts(IPoint((max != 1) + 1, (max + 1) / 2))`).
 pub fn grid(max: i32) -> (u32, u32) {
@@ -39,7 +39,7 @@ pub fn grid(max: i32) -> (u32, u32) {
 
 fn trade_xml(max: i32) -> String {
     let (cols, rows) = grid(max);
-    let (w, h) = (cols as f32 * CELL, rows as f32 * CELL);
+    let (w, h) = (super::hud_listview::grid_width(cols as usize, ICON) - 1.0, super::hud_listview::grid_width(rows as usize, ICON) - 1.0);
     let label = |name: &str, text: &str, b: &str| {
         format!("<TextView font=\"NORMAL\" layout_borders=\"Rect({b})\" name=\"{name}\" value=\"{text}\"/>")
     };
@@ -85,6 +85,7 @@ impl TradeWin {
     pub fn open(gui: &mut Gui, max: i32, title_pos: (i32, i32)) -> anyhow::Result<Self> {
         let win = gui.open_window_xml("NPCChatTradeBar", &trade_xml(max), title_pos, WindowSize::Preferred)?;
         gui.set_feature_flags(win, "credits", tvf::NUMERIC);
+        gui.set_window_preferred_size_limits(win, true);
         let t = TradeWin { win, max, items: vec![] };
         t.paint(gui);
         Ok(t)
@@ -103,10 +104,12 @@ impl TradeWin {
     /// The item under a canvas-local point of the `"items"` grid, or `None` out of bounds / past the last filled slot
     /// (the same index math as `event`'s `CanvasPress` arm; the container has no scroll offset to add).
     pub fn item_at(&self, x: f32, y: f32) -> Option<usize> {
-        if x < 0.0 || y < 0.0 { return None; }
-        let (cols, _) = grid(self.max);
-        let idx = (y / CELL) as usize * cols as usize + (x / CELL) as usize;
-        (idx < self.items.len()).then_some(idx)
+        if x < 3.0 || y < 3.0 { return None; }
+        let (cols, rows) = grid(self.max);
+        let (c, r) = (((x - 3.0) / (ICON + 10.0)) as u32, ((y - 3.0) / (ICON + 10.0)) as u32);
+        let idx = (r * cols + c) as usize;
+        let (left, top) = (3.0 + c as f32 * (ICON + 10.0), 3.0 + r as f32 * (ICON + 10.0));
+        (c < cols && r < rows && x < left + CELL && y < top + CELL && idx < self.items.len()).then_some(idx)
     }
 
     fn paint(&self, gui: &mut Gui) {
@@ -114,7 +117,8 @@ impl TradeWin {
         let slot = gui.gfx().id(SLOT_GFX);
         let mut v = vec![];
         for i in 0..(cols * rows) as usize {
-            let (x, y) = ((i as u32 % cols) as f32 * CELL, (i as u32 / cols) as f32 * CELL);
+            let (ix, iy) = super::interact_ptrade::grid_icon_origin(i, cols as usize, 10.0);
+            let (x, y) = (ix - 3.0, iy - 3.0);
             if let Some(id) = slot {
                 let (w, h) = gui.gfx().size(id);
                 v.push(CanvasItem::Image { id, src: [0.0, 0.0, w as f32, h as f32], dst: [x, y, x + CELL, y + CELL], alpha: 1.0 });
@@ -157,8 +161,7 @@ impl TradeWin {
             Event::Clicked { window, view, .. } if *window == self.win && view == "accept" => Some(TradeOut::Accept(self.credits(gui, cash))),
             Event::Clicked { window, view, .. } if *window == self.win && view == "decline" => Some(TradeOut::Decline),
             Event::CanvasPress { window, view, x, y, button, clicks } if *window == self.win && view == "items" => {
-                let (cols, _) = grid(self.max);
-                let idx = (*y / CELL) as usize * cols as usize + (*x / CELL) as usize;
+                let idx = self.item_at(*x, *y)?;
                 let item = self.items.get(idx)?.id;
                 // [UNRESOLVED] which gesture raises which container signal: `+0x2e0` (remove) and `+0x2e4` (info) are plain `MultiListView_c` signals; a left
                 // double click removes, the right button asks for the info
@@ -539,6 +542,9 @@ mod tests {
         assert_eq!(grid(2), (2, 1));
         assert_eq!(grid(5), (2, 3));
         assert_eq!(grid(0), (2, 1));
+        assert_eq!(super::super::hud_listview::grid_width(1, ICON), 44.0);
+        assert_eq!(super::super::hud_listview::grid_width(2, ICON), 86.0);
+        assert_eq!(super::super::hud_listview::grid_width(3, ICON), 128.0);
     }
 
     #[test]

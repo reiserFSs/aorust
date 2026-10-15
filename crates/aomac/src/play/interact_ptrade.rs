@@ -13,6 +13,7 @@
 
 use super::hud_dialog::Dialogs;
 use super::hud_stats::ItemInfo;
+use super::hud_stats::inv_grid;
 use super::hud::group;
 use super::interact::{Action, Interact};
 use super::zone::Zone;
@@ -31,14 +32,13 @@ pub const CLIENT: (u32, u32) = (super::hud_rollup::AREA_W, 453);
 pub const RANGE: f32 = 5.0;
 /// The own cash field is sent this long after the last edit: `EventTimer_c::Start(0xf4240, 0, 1)` [GUI 0x100df82d] ([INFERENCE]: microseconds).
 pub const CASH_DELAY: f32 = 1.0;
-/// Cell art of the item lists (`MultiListView_c` 48 px icons in 54 px slots, hud_stats/items.rs).
-const SLOT: f32 = 54.0;
-const ICON: f32 = 48.0;
-const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
-/// Columns of the item lists: three 54 px slots fit the 192 px page ([INFERENCE]: the list views are `SetViewCellCounts((1, 1), (1000, ..))` grids that fill the dock's width).
-const COLS: usize = 3;
+/// ItemContainerView 100cdb3a retains MultiListView 10136423's default 32px icons.
+const SLOT: f32 = 38.0;
+pub(super) const ICON: f32 = 32.0;
+const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_32_CLOSED";
 /// `BitmapView_c::AddBitmap(0x15b)`, `AddBitmap(0xd9)` of `PartnerStatusDock` [GUI 0x100e039a]: index 0 / 1 = not accepted / accepted.
 const STATUS_GFX: [u32; 2] = [0x15b, 0xd9];
+const SCROLLS: [&str; 2] = ["our_items_scroll", "partner_items_scroll"];
 
 /// `FUN_100e066c` [GUI]: the literal English text of the confirmation box (a `DialogBox_c` with the title "Trade").
 const CONFIRM_TEXT: &str = "Are you sure you want to complete this trade?";
@@ -187,9 +187,8 @@ pub struct PTrade {
     pub accepted: bool,
     pub partner_cash: i32,
     pub cash: i32,
-    /// `[ours, theirs]` first visible row.
-    scroll: [usize; 2],
-    dock: (u32, u32),
+    /// Last painted viewport client sizes, excluding the reserved vertical scrollbar.
+    dock: [(u32, u32); 2],
     /// When the own cash field is sent (the 1 s `EventTimer_c` of `+0x200`).
     cash_due: Option<f32>,
     dirty: bool,
@@ -209,9 +208,22 @@ pub struct PTradeUi {
     pub log: Vec<String>,
 }
 
-/// The one-row-at-a-time geometry of a list: slots `(cell index) -> top-left`.
-fn cell(n: usize) -> (f32, f32) {
-    ((n % COLS) as f32 * SLOT, (n / COLS) as f32 * SLOT)
+/// RecalcCellCount 101349f6, using the inherited icon extent rather than inventory's 48px override.
+pub(super) fn grid_columns(width: f32) -> (usize, f32) {
+    let cols = (((width - 1.0).trunc() / (ICON + inv_grid::SPACING)) as usize).max(1);
+    let gap = if cols > 1 { ((width - 2.0 * inv_grid::BORDER - cols as f32 * ICON) / (cols - 1) as f32).floor().max(0.0) } else { inv_grid::SPACING };
+    (cols, gap)
+}
+
+pub(super) fn grid_icon_origin(n: usize, cols: usize, gap: f32) -> (f32, f32) {
+    (inv_grid::BORDER + (n % cols) as f32 * (ICON + gap), inv_grid::BORDER + (n / cols) as f32 * (ICON + inv_grid::SPACING))
+}
+
+/// Native grid slot-art origin (three pixels outside the 32px icon).
+fn cell(n: usize, width: f32) -> (f32, f32) {
+    let (cols, gap) = grid_columns(width);
+    let (x, y) = grid_icon_origin(n, cols, gap);
+    (x - 3.0, y - 3.0)
 }
 
 fn atol(s: &str) -> i32 {
@@ -219,25 +231,21 @@ fn atol(s: &str) -> i32 {
     d.parse::<i64>().map_or(0, |v| v.min(i32::MAX as i64) as i32)
 }
 
-/// Height of one dock so that the whole view is [`CLIENT`] high: the view's fixed rows are measured with empty docks.
-fn dock_height(gui: &mut Gui) -> anyhow::Result<u32> {
-    let w = gui.open_window("TradeGUI", (0, 0), WindowSize::Preferred)?;
-    let h = gui.window_size(w).1;
-    gui.close_window(w);
-    Ok(CLIENT.1.saturating_sub(h) / 2)
-}
 
 impl PTrade {
     /// `InventoryGUIModule_c::SlotStartTrade` -> `TradeView_c` ctor [GUI 0x100e092f] for mode 0 (`PlayerTrade`). The view is a `DockableView_c` titled "Trade"
     /// that the frame hook registers as a transient page in `RollupArea`.
     pub fn open(gui: &mut Gui, screen: (u32, u32), own: Identity, partner: Identity, name: &str) -> anyhow::Result<PTrade> {
-        let dh = dock_height(gui)?;
-        let dw = (COLS as f32 * SLOT) as u32;
         let pos = ((screen.0 as i32 - super::hud_rollup::AREA_W as i32 - CLIENT.0 as i32 - 20).max(0), 40);
         let win = gui.open_tabbed_window("TradeGUI", "Trade", pos, WindowSize::Fixed(CLIENT.0, CLIENT.1))?;
-        let dock = |c: &str| format!("<root><CanvasView name=\"{c}\" min_size=\"Point({dw},{dh})\" max_size=\"Point({dw},{dh})\"/></root>");
-        gui.add_view_xml(win, "PartnerInventoryDock", "partner_items", &dock("partner_items"))?;
-        gui.add_view_xml(win, "OurInventoryDock", "our_items", &dock("our_items"))?;
+        let min = super::hud_listview::grid_width(1, ICON) - 1.0;
+        let max = super::hud_listview::grid_width(50, ICON) - 1.0;
+        for (dock, view, max_h) in [("PartnerInventoryDock", "partner_items", max), ("OurInventoryDock", "our_items", min)] {
+            let min_w = min + 11.0;
+            let max_w = max + 11.0;
+            let xml = format!("<root><View view_layout=\"stacked\" min_size=\"Point({min_w},{min})\" max_size=\"Point({max_w},{max_h})\" max_size_limit=\"Point({max_w},{max_h})\"><ScrollView name=\"{view}_scroll\" h_scrollbar_mode=\"none\" v_scrollbar_mode=\"always\"><ScrollViewChild view_layout=\"vertical\"><CanvasView name=\"{view}\" min_size=\"Point({min},{min})\" max_size=\"Point({max},{min})\"/></ScrollViewChild></ScrollView></View></root>");
+            gui.add_view_xml(win, dock, view, &xml)?;
+        }
         let (sw, sh) = STATUS_GFX.iter().map(|&g| gui.gfx().size(GfxId(g))).fold((0, 0), |a, s| (a.0.max(s.0), a.1.max(s.1)));
         let status = format!("<root><CanvasView name=\"status\" min_size=\"Point({sw},{sh})\" max_size=\"Point({sw},{sh})\"/></root>");
         gui.add_view_xml(win, "PartnerStatusDock", "status", &status)?;
@@ -246,31 +254,48 @@ impl PTrade {
         gui.set_text(win, "PartnerCashView", "0");
         gui.set_feature_flags(win, "OurCashView", ao_gui::view::tvf::NUMERIC);
         gui.relayout_window(win);
-        Ok(PTrade { win, dock_registered: false, escape: true, own, partner, ours: vec![], theirs: vec![], accepted: false, partner_cash: 0, cash: 0, scroll: [0; 2], dock: (dw, dh), cash_due: None, dirty: true, tip: None })
+        gui.set_window_preferred_size_limits(win, true);
+        Ok(PTrade { win, dock_registered: false, escape: true, own, partner, ours: vec![], theirs: vec![], accepted: false, partner_cash: 0, cash: 0, dock: [(0, 0); 2], cash_due: None, dirty: true, tip: None })
     }
 
     /// Paints both lists and the status bitmap when something changed. `info(gui, low_id)` = name and icon of a template.
     pub fn render(&mut self, gui: &mut Gui, info: &mut dyn FnMut(&mut Gui, i32) -> Option<ItemInfo>) {
+        for (i, scroll) in SCROLLS.iter().enumerate() {
+            if let Some(rect) = gui.view_rect(self.win, scroll) {
+                let size = ((rect.width() + 1.0 - 11.0).max(1.0) as u32, (rect.height() + 1.0).max(1.0) as u32);
+                if self.dock[i] != size {
+                    self.dock[i] = size;
+                    self.dirty = true;
+                    self.tip = None;
+                }
+            }
+        }
         if !std::mem::take(&mut self.dirty) {
             return;
         }
         let slot = gui.gfx_id(SLOT_GFX).map(GfxId);
-        let rows = (self.dock.1 as f32 / SLOT) as usize;
         for (i, (view, list)) in [("our_items", &self.ours), ("partner_items", &self.theirs)].into_iter().enumerate() {
             let (mut cmds, mut tips) = (vec![], vec![]);
-            let first = self.scroll[i] * COLS;
-            for n in 0..rows * COLS {
-                let (x, y) = cell(n);
+            let width = self.dock[i].0 as f32;
+            let (cols, _) = grid_columns(width);
+            let visible_rows = ((self.dock[i].1 as f32 - 2.0 * inv_grid::BORDER + inv_grid::SPACING) / (ICON + inv_grid::SPACING)).floor().max(1.0) as usize;
+            let rows = list.len().max(1).div_ceil(cols).max(visible_rows);
+            let height = super::hud_listview::grid_width(rows, ICON) - 1.0;
+            let min = super::hud_listview::grid_width(1, ICON) - 1.0;
+            let max = super::hud_listview::grid_width(50, ICON) - 1.0;
+            gui.set_view_pref_size(self.win, view, (min, height), (max, height));
+            for n in 0..rows * cols {
+                let (x, y) = cell(n, width);
                 if let Some(g) = slot {
                     cmds.push(CanvasItem::Image { id: g, src: [0.0, 0.0, SLOT, SLOT], dst: [x, y, x + SLOT, y + SLOT], alpha: 1.0 });
                 }
-                let Some(e) = list.get(first + n) else { continue };
+                let Some(e) = list.get(n) else { continue };
                 let Some((name, icon)) = e.acg.and_then(|a| info(gui, a.low_id)) else { continue };
                 if let Some((id, w, h)) = icon {
                     let o = (SLOT - ICON) / 2.0;
                     cmds.push(CanvasItem::Image { id, src: [0.0, 0.0, w as f32, h as f32], dst: [x + o, y + o, x + o + ICON, y + o + ICON], alpha: 1.0 });
                 }
-                let body = self.tip.as_ref().filter(|(list, index, entry, _, _)| *list == i && *index == first + n && entry == e).map_or("", |(_, _, _, _, body)| body.as_str());
+                let body = self.tip.as_ref().filter(|(list, index, entry, _, _)| *list == i && *index == n && entry == e).map_or("", |(_, _, _, _, body)| body.as_str());
                 tips.push(CanvasTip { rect: [x, y, x + SLOT, y + SLOT], title: name, body: body.to_owned() });
             }
             gui.set_canvas(self.win, view, cmds);
@@ -285,6 +310,8 @@ impl PTrade {
         let (x, y) = gui.mouse_position();
         let hovered = ["our_items", "partner_items"].iter().enumerate().find_map(|(list, view)| {
             let r = gui.view_rect(self.win, view)?;
+            let viewport = gui.view_rect(self.win, SCROLLS[list])?;
+            if !viewport.contains(ao_gui::geom::Point::new(x, y)) { return None; }
             if !gui.window_visible(self.win) || x < r.l || x >= r.r || y < r.t || y >= r.b { return None; }
             let index = self.entry_at(list, x - r.l, y - r.t)?;
             Some((list, index, self.entries(list)[index].clone()))
@@ -306,7 +333,7 @@ impl PTrade {
                 Err(error) => { eprintln!("trade tooltip: {error:#}"); String::new() }
             }
         } else { String::new() };
-        let (cx, cy) = cell(index - self.scroll[list] * COLS);
+        let (cx, cy) = cell(index, self.dock[list].0 as f32);
         for (n, view) in ["our_items", "partner_items"].iter().enumerate() {
             let tip_index = (n == list).then(|| gui.canvas_tips(self.win, view).iter().position(|tip| tip.rect[0] == cx && tip.rect[1] == cy)).flatten();
             gui.set_canvas_tip_body(self.win, view, tip_index, &body);
@@ -332,9 +359,12 @@ impl PTrade {
         if x < 0.0 || y < 0.0 {
             return None;
         }
-        let (c, r) = ((x / SLOT) as usize, (y / SLOT) as usize);
-        let i = (self.scroll[list] + r) * COLS + c;
-        (c < COLS && i < self.entries(list).len()).then_some(i)
+        let width = self.dock[list].0 as f32;
+        let (cols, gap) = grid_columns(width);
+        let (c, r) = (((x - 3.0).max(0.0) / (ICON + gap)) as usize, ((y - 3.0).max(0.0) / (ICON + inv_grid::SPACING)) as usize);
+        let i = r * cols + c;
+        let (left, top) = cell(i, width);
+        (c < cols && x >= left && x < left + SLOT && y >= top && y < top + SLOT && i < self.entries(list).len()).then_some(i)
     }
 
     /// Offers have already left the bag; only an actually empty cell counts.
@@ -353,6 +383,7 @@ impl PTradeUi {
     pub(super) fn icon_hover_at(&self, gui: &Gui, x: f32, y: f32) -> bool {
         let Some(t) = self.trade.as_ref() else { return false };
         ["our_items", "partner_items"].iter().enumerate().any(|(list, view)| {
+            if !gui.view_rect(t.win, SCROLLS[list]).is_some_and(|r| r.contains(ao_gui::geom::Point::new(x, y))) { return false; }
             gui.view_rect(t.win, view).is_some_and(|r| x >= r.l && x < r.r && y >= r.t && y < r.b && t.entry_at(list, x - r.l, y - r.t).is_some())
         })
     }
@@ -579,13 +610,6 @@ impl Interact {
                             ui.feedback.push("Feedback_NoRoomInInventory");
                         }
                     }
-                }
-            }
-            Event::CanvasWheel { window, view, dy, .. } if *window == p.win => {
-                if let Some(l) = PTrade::list_of(view) {
-                    let max = p.entries(l).len().div_ceil(COLS).saturating_sub((p.dock.1 as f32 / SLOT) as usize);
-                    p.scroll[l] = (p.scroll[l] as i64 - *dy as i64).clamp(0, max as i64) as usize;
-                    p.dirty = true;
                 }
             }
             Event::CanvasPress { window, .. } | Event::CanvasClick { window, .. } | Event::CanvasRelease { window, .. } | Event::CanvasDrag { window, .. } if *window == p.win => {}
@@ -1008,13 +1032,36 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn trade_native_trays_resize_reflow_and_scroll_without_a_fixed_column_count() {
+        let Some(mut gui) = rig() else { return };
+        let z = zone();
+        let mut ui = open(&mut gui, &z);
+        let p = ui.ptrade.trade.as_mut().unwrap();
+        p.ours = (0..20).map(|n| Entry { item: Identity { kind: 0x68, instance: n }, acg: None }).collect();
+        p.render(&mut gui, &mut |_, _| None);
+        let before = p.dock[0].0;
+        assert_eq!(gui.view_rect(p.win, SCROLLS[0]).unwrap().height() + 1.0, 44.0);
+        let size = gui.window_size(p.win);
+        gui.resize_window(p.win, WindowSize::Fixed(size.0 + 200, size.1 + 100));
+        p.render(&mut gui, &mut |_, _| None);
+        assert!(p.dock[0].0 > before);
+        assert_eq!(gui.view_rect(p.win, SCROLLS[0]).unwrap().height() + 1.0, 44.0);
+        let (x, y) = cell(1, p.dock[0].0 as f32);
+        assert_eq!(p.entry_at(0, x + 4.0, y + 4.0), Some(1));
+        let r = gui.view_rect(p.win, SCROLLS[0]).unwrap();
+        gui.input(ao_gui::InputEvent::Wheel { x: r.l + 5.0, y: r.t + 5.0, dy: -1.0 });
+        assert!(gui.scroll_offset(p.win, SCROLLS[0]) > 0.0);
+    }
+
+    #[test]
     fn window_is_the_player_trade_view() {
         let Some(mut gui) = rig() else { return };
         let z = zone();
         let mut i = open(&mut gui, &z);
         let p = i.ptrade.trade.as_ref().unwrap();
         let win = p.win;
-        assert_eq!(gui.window_size(p.win), CLIENT);
+        let (min, max) = gui.window_preferred_size_limits(p.win).unwrap();
+        assert_eq!(gui.window_size(p.win), (CLIENT.0.clamp(min.0, max.0), CLIENT.1.clamp(min.1, max.1)));
         assert_eq!(gui.text(p.win, "PartnerName"), "Bob");
         assert_eq!(gui.text(p.win, "PartnerCashView"), "0");
         for v in ["PartnerInventoryDock", "OurInventoryDock", "OurCashView", "AcceptButton", "DeclineButton", "PartnerStatusDock", "our_items", "partner_items", "status"] {
@@ -1062,7 +1109,7 @@ pub(super) mod tests {
         i.on_trade(&mut gui, msg(trade::ADD_ITEM, ME, Identity { kind: 0x68, instance: 0x40 }), ME, &z);
         let p = i.ptrade.trade.as_ref().unwrap();
         let r = gui.view_rect(p.win, "our_items").unwrap();
-        let (cx, cy) = cell(0);
+        let (cx, cy) = cell(0, p.dock[0].0 as f32);
         assert!(i.icon_hover_at(&gui, r.l + cx + 2.0, r.t + cy + 2.0));
         assert!(!i.icon_hover_at(&gui, r.l - 50.0, r.t - 50.0));
     }
