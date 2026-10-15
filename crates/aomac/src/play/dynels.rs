@@ -6329,7 +6329,10 @@ mod variant_tests {
     #[test]
     fn crawl_wait_state_selects_weapon_and_impact_lists() {
         use ao_net::n3::dynel::StatUpdate;
-        let mut spawn = captured_posture_player();
+        let mut spawn = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter()
+            .filter_map(|frame| ao_net::n3::decode(frame).ok())
+            .find(|message| matches!(&message.body, N3::Dynel(Dynel::SimpleCharFullUpdate(update)) if !update.is_npc()))
+            .expect("captured player");
         let who = spawn.header.target.instance;
         let mut world = Dynels::default();
         world.on_message(&spawn);
