@@ -1067,6 +1067,7 @@ impl Hud {
         for s in &mut self.shortcuts {
             s.hold_delay = hold_delay;
             s.new_mouse = new_mouse;
+            s.refresh_items(gui, zone, &mut self.stats);
             s.update(gui, _dt, &self.actions.list, &changes, locked, timers);
             s.update_tooltip(gui, zone, &self.stats, long_tips);
         }

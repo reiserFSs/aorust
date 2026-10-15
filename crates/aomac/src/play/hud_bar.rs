@@ -113,6 +113,7 @@ pub(super) struct ShortcutBar {
     tooltip_key: Option<(usize, u32, u32, bool)>,
     tooltip_body: String,
     released: Option<(Slot, f32, f32)>,
+    item_templates: HashMap<u32, (i32, super::hud_stats::ItemInfo)>,
 }
 
 struct Press {
@@ -202,7 +203,7 @@ impl ShortcutBar {
         let (x, y) = (20, 20);
         let store = ao_rdb::RecordStore::open(dir).ok();
         let slots = if n == 0 { first_login(gui, store.as_ref()) } else { Default::default() };
-        let mut bar = ShortcutBar { window, primary: n == 0, slots, rows: vec![Default::default(); ROWS], row: 0, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true, hold_delay: HOLD_DELAY, new_mouse: true, tooltip_key: None, tooltip_body: String::new(), released: None };
+        let mut bar = ShortcutBar { window, primary: n == 0, slots, rows: vec![Default::default(); ROWS], row: 0, press: None, drag: None, uses: vec![], store, timers: [None; SLOTS], mouse: (0.0, 0.0), icons: HashMap::new(), timer_text: true, hold_delay: HOLD_DELAY, new_mouse: true, tooltip_key: None, tooltip_body: String::new(), released: None, item_templates: HashMap::new() };
         bar.place(gui, (x, y), screen);
         bar.paint(gui);
         Ok(bar)
@@ -356,6 +357,29 @@ impl ShortcutBar {
             String::new()
         };
         gui.set_tooltip(self.window, &format!("slot{i}"), &slot.name, &self.tooltip_body);
+    }
+
+    /// Resolve retained inventory identities against the current owned template.
+    pub(super) fn refresh_items(&mut self, gui: &mut Gui, zone: &super::zone::Zone, stats: &mut super::hud_stats::HudStats) {
+        let mut dirty = false;
+        for slot in self.slots.iter_mut().chain(self.rows.iter_mut().flat_map(|row| row.iter_mut())).flatten() {
+            if ao_net::n3::inventory::item_identity(slot.instance).kind as u32 != slot.kind { continue; }
+            let Some(entry) = zone.inventory.get(&slot.instance) else { continue };
+            if self.item_templates.get(&slot.instance).is_none_or(|(low, _)| *low != entry.item.low_id) {
+                let Some(info) = stats.item_info(gui, entry.item.low_id) else { continue };
+                self.item_templates.insert(slot.instance, (entry.item.low_id, info));
+            }
+            let (_, (name, icon)) = &self.item_templates[&slot.instance];
+            if slot.name != *name || slot.icon != *icon {
+                slot.name.clone_from(name);
+                slot.icon = *icon;
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.tooltip_key = None;
+            self.paint(gui);
+        }
     }
 
     /// Slot under a screen position.
@@ -680,6 +704,34 @@ pub(super) fn default_count(dvalues: &super::dvalue::DValues) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_inventory_shortcuts_refresh_every_row_after_template_replacement() {
+        let client = ao_gui::client_dir();
+        if !client.join("cd_image/gui").exists() { return; }
+        let character = std::env::temp_dir().join(format!("aomac-shortcut-items-{}", std::process::id()));
+        std::fs::create_dir_all(character.join("Containers")).unwrap();
+        let slot = ao_net::n3::inventory::BAG_FIRST;
+        let id = ao_net::n3::inventory::item_identity(slot);
+        std::fs::write(character.join("Containers/ShortcutBar_1.xml"), format!("<Archive><Archive name=\"position_map\"><Identity name=\"item_id\" value=\"Identity({},{slot})\"/><IPoint name=\"item_pos\" value=\"IPoint(0,0)\"/><Identity name=\"item_id\" value=\"Identity({},{slot})\"/><IPoint name=\"item_pos\" value=\"IPoint(1,2)\"/></Archive></Archive>", id.kind, id.kind)).unwrap();
+        let mut gui = Gui::new(&client, None).unwrap();
+        let mut bar = ShortcutBar::new(&mut gui, &client, 1, (1280, 800)).unwrap();
+        bar.load_contents(&mut gui, &client, &character, 1);
+        assert!(bar.slots[0].as_ref().unwrap().name.is_empty());
+        let mut stats = super::super::hud_stats::HudStats::new(&client, (1280, 800)).unwrap();
+        let mut zone = super::super::zone::Zone::new(7);
+        for low_id in [0xc1a5, 0xc1a2] {
+            zone.inventory.insert(slot, ao_net::n3::world::InventoryEntry { slot, a: 0, b: 1, id, item: ao_net::n3::world::AcgItem { low_id, high_id: low_id, level: 1 } });
+            let expected = stats.item_info(&mut gui, low_id).unwrap();
+            bar.refresh_items(&mut gui, &zone, &mut stats);
+            for actual in [&bar.slots[0], &bar.rows[2][1]] {
+                let actual = actual.as_ref().unwrap();
+                assert_eq!((&actual.name, actual.icon), (&expected.0, expected.1));
+            }
+        }
+        bar.close(&mut gui);
+        std::fs::remove_dir_all(character).unwrap();
+    }
 
     #[test]
     fn occupied_shortcut_redrags_displaced_item_except_macros() {
