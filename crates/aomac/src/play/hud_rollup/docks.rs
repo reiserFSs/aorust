@@ -350,6 +350,18 @@ impl Rollup {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn actions_free_page_uses_native_one_to_fifty_cell_limits() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut rollup = Rollup::new(&dir, (1280, 800));
+        let mut actions = crate::play::hud_actionwin::HudActionWin::new(&dir, (1280, 800));
+        actions.open(&mut gui, &mut rollup);
+        let window = rollup.pages.iter().find(|page| page.key == "specialaction_window").unwrap().window;
+        rollup.free_page(&mut gui, "specialaction_window", 100, 100);
+        assert_eq!(gui.window_preferred_size_limits(window), Some(((44, 44), (2102, 2102))));
+    }
+
+    #[test]
     fn free_page_releases_column_limits_but_keeps_owner_width_constraints() {
         let dir = ao_gui::client_dir();
         let Ok(mut gui) = Gui::new(&dir, None) else { return };

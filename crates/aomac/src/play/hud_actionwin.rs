@@ -94,6 +94,12 @@ impl HudActionWin {
         let spec = Spec { name: "SpecialActionView", title: "Actions", pos: (0, 0), client: (VIEW, VIEW), top_xml: "", top_h: 0.0, texts: MenuTexts::default(), menu_base: 0x6800, screen: self.screen };
         match ListWindow::open(gui, spec, view, vec![], Some((rollup, KEY))) {
             Ok(w) => {
+                // MultiList ctor defaults: min cells(1,1), max(50,50).
+                // CellCountToPreferredSize 101331dc, 32px icons, 10px gaps, 6px borders.
+                let min = lv::grid_width(1, lv::ICON_32) - 1.0;
+                let max = lv::grid_width(50, lv::ICON_32) - 1.0;
+                gui.set_view_pref_size(w.win, "lv_scroll", (min, min), (max, max));
+                gui.set_view_max_size_limit(w.win, "lv_scroll", (max, max));
                 self.win = Some(w);
                 self.built = None;
             }
