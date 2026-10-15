@@ -60,6 +60,11 @@ pub fn parse(r: &mut Rd) -> Result<Env> {
     let (a, b, size) = (r.u32()?, r.u32()?, r.u32()?);
     ensure!(a == 0 && b == 0, "unexpected non-zero environment header {a} {b}");
     ensure!(size == 30, "unsupported EnvironmentData size {size}");
+    parse_raw(r)
+}
+
+/// AreaInfo embeds the same stream bytes without the playfield environment header.
+pub(super) fn parse_raw(r: &mut Rd) -> Result<Env> {
     let mut raw = [0u8; LEN];
     raw.copy_from_slice(r.take(LEN)?);
     Ok(Env { raw })

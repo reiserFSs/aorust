@@ -88,3 +88,68 @@ fn statel_attributes_fog_and_sound_are_decoded() {
     // inside a volume the fog is denser than the base fog, outside it is the base fog
     assert!(m.at(v.pos).1 < m.at([1e6, 0.0, 0.0]).1);
 }
+
+/// All 600 resources: 594 native-valid records and six native-rejected zero-count blobs.
+#[test]
+fn area_info_survey_preserves_native_acceptance() {
+    use ao_formats::playfield::area::{self, PointData};
+    let Some((store, _)) = setup() else { return };
+    let ids = store.ids(area::RECORD).unwrap();
+    assert_eq!(ids.len(), 600);
+    let (mut count, mut valid, mut rejected, mut point_types) = (0, 0, Vec::new(), [0usize; 9]);
+    for id in ids {
+        let raw = store.get(area::RECORD, id).unwrap().unwrap();
+        let areas = match area::parse(&raw) {
+            Ok(areas) => areas,
+            Err(error) => {
+                assert!([1424, 1673, 2006, 2014, 2024, 4352].contains(&id), "{id}: {error:#}");
+                assert_eq!(raw.len(), 19);
+                assert_eq!(&raw[..7], &[6, 0, 0, 0, 0, 0, 0]);
+                assert!(area::load(&store, id).is_err());
+                rejected.push(id);
+                continue;
+            }
+        };
+        valid += 1;
+        count += areas.areas.len();
+        for zone in 0..areas.zone_to_area.len() {
+            assert!(areas.area_for_zone(zone).is_some(), "{id}: zone {zone}");
+        }
+        for area in &areas.areas {
+            for point in area.points.iter().flatten() {
+                let kind = if point.flags >> 24 == 0 { point.flags & 3 } else { point.flags & 0x00ff_ffff };
+                point_types[kind as usize] += 1;
+                assert!(matches!((&point.data, kind),
+                    (PointData::Base, 0 | 4..=6) | (PointData::Acg { .. }, 1..=3)
+                    | (PointData::Fence { .. }, 7) | (PointData::Placement { .. }, 8)));
+            }
+        }
+    }
+    rejected.sort_unstable();
+    assert_eq!(rejected, [1424, 1673, 2006, 2014, 2024, 4352]);
+    assert_eq!(valid, 594);
+    assert_eq!(count, 1998);
+    assert_eq!(point_types, [4482, 2256, 2255, 2255, 237, 17, 6847, 179, 866]);
+    assert!(area::load(&store, u32::MAX).unwrap().is_none());
+}
+
+#[test]
+fn native_grid_names_and_nonidentity_zone_zero_mapping() {
+    use ao_formats::playfield::area;
+    let Some((store, _)) = setup() else { return };
+    let mut grids = Vec::new();
+    for id in store.ids(area::RECORD).unwrap() {
+        if let Ok(Some(areas)) = area::load(&store, id) {
+            if areas.is_grid() { grids.push(id); }
+        } else {
+            assert!([1424, 1673, 2006, 2014, 2024, 4352].contains(&id));
+        }
+    }
+    grids.sort_unstable();
+    assert_eq!(grids, [152, 4107]);
+    let areas = area::load(&store, 560).unwrap().unwrap();
+    assert_eq!(areas.zone_to_area[0], 3);
+    assert_eq!(areas.areas[0].name, "Mort Crater");
+    assert_eq!(areas.area_for_zone(0).unwrap().name, "Czeffyr Desert");
+    assert!(!areas.is_grid());
+}

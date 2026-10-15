@@ -148,10 +148,47 @@ Code: `crates/ao-formats/src/playfield.rs` + `playfield/{record,ground,statel}.r
 | 1010006 / 1010021 / 1010022 | ground tile textures 256² / 128² / 64² (24 zero bytes, then a JPEG (417) or an RGBA PNG (432)) | `FUN_10036180` returns 0xf6956/0xf6965/0xf6966 by quality (DisplaySystem @0x10036150); all 849 ids exist |
 | 1010001 | static mesh referenced by statels | every statel mesh id of playfields 566/705/120 is in 1010001 (see `## meshes`) |
 | 1000046 / 1000047 | 28 byte records `f32 centre xyz, f32 radius` = bounding sphere per mesh id | inspected (not needed for loading) |
-| 1000014 / 1000029 | district / area name tables (`GameData::PlayfieldDistrictInfo_t/AreaInfo_t::ReadBlob`) | [INFERENCE: type mapping from content, names "District", "zone1", "Area"] |
+| 1000014 | district name table | [INFERENCE: mapping from "District" content] |
+| 1000029 | native `PlayfieldAreaInfo_t`: area names, EnvironmentData, AO centres, point lists and zone-to-area mapping (`ao_formats::playfield::area`) | GameData `ReadBlob` 0x10008ed2, `AreaData` reader 0x100032e4, `GetAreaData(zone)` 0x10008cb8; GC resource factory 0x1011eeb4 uses `proxy.playfield.instance`, not geometry's `exit_door_id.instance` |
 | 1000007 | **baked ground shadow maps** (six 8 bit PNGs per playfield, see *Terrain rendering*) | same layout as `data/Shadows/<id>.sdw`; 323 ids [INFERENCE: the type was labelled "map/minimap PNG" before; the content is the sdw format, the DLL consumer was not found by name] |
 | 1000008 | land-control bitmap per playfield (`ao_formats::landcontrol`): `u32 ver, u16 w, u16 h, 12 B`, then `h` rows of `ceil(w/8)` bytes, LSB = left; 53 ids, all `len == 20+ceil(w/8)*h` | INFERENCE from `MapData_c` → `N3Msg_GetLandControlBitmap`; earlier "PNG sets" label was wrong (no PNG inside) |
 `data/Statels/<id>.pf` are **stale copies** of 1000003 (2003/2004 timestamps): 368 of 473 are byte-identical to the rdb record, 105 differ; the engine reads the rdb record. `data/Shadows/<id>.sdw` (244 files) are older copies of rdb 1000007.
+
+**AreaInfo / Grid identity.** `1000029` has no eight-byte RDB prefix: `u16 version=6,
+u32 zone_count, u8 area_count`, then `area_count` version-4 AreaData records and
+`zone_count` one-byte area indices. AreaData contains four packed NUL strings
+(name, owner, description, knowledge), raw 26-byte EnvironmentData in stream
+order, two control percentages, two level bounds, seven words, an AO-space
+centre, and two counted point lists. The final two words are default/allowed
+building-style masks; the first five meanings remain unresolved. Point factory
+GameData 0x10002abd reads base position/flags (0x10001eca), ACG name/styles
+(types 1–3, 0x10001295), fence rotation (7, 0x100025a9), placement angles
+(8, 0x100028af), then each point's zone. No weather radius is serialized.
+Environment decoding reuses the playfield EnvironmentData reader without its
+12-byte header; weather blending is not implemented by this parser.
+
+`N3Msg_IsGrid` GC **0x10121d84** resolves **zone 0 through the zone-to-area
+mapping**, then compares its name exactly against `"Grid"` (0x1016fd14,
+bytes `47 72 69 64 00`; little-endian word `0x64697247`). It does not inspect
+the first area, a geometry id, or a hand-maintained Grid id table. Native
+SetAreaInfo is GC 0x101215c1. `Zone.area_playfield` preserves the proxy identity
+before the exit-door geometry remap; the world loader publishes `Zone.is_grid`
+from that resource, defaults missing metadata to native false, and propagates
+malformed resources through the normal failed-world-load path.
+
+The installed survey covers **600 records: 594 native-valid / 1998 areas and
+six native-rejected resources**. All valid records have exactly four packed
+strings. All 600 records end with 12 zero bytes after the native-read boundary;
+native does not inspect trailing bytes or require EOF, so neither does the parser.
+The six 19-byte zero-count resources (1424, 1673, 2006, 2014, 2024, 4352) fail
+the native nonzero-count requirement and return parser errors, not fabricated
+empty metadata. Survey Grid names occur only in 152 and 4107; these are regression
+expectations, not runtime permission tables.
+PF560 demonstrates why mapping matters: area 0 is `Mort Crater`, while zone 0
+maps to area 3, `Czeffyr Desert`. `playfield_real` retains the complete survey
+and nine point-type counts; parser unit tests cover zone-zero indirection and
+malformed/truncated data.
+
 
 ### Playfield record (1000001)
 ```
