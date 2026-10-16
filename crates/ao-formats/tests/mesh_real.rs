@@ -31,12 +31,13 @@ fn sampled_static_mesh_records_decode() {
 }
 
 #[test]
-fn building_with_cutout_masts() {
+fn building_keeps_native_blended_masts() {
     let Some(store) = store() else { return };
     let scene = load_mesh(&store, 3722).unwrap();
     assert_eq!(scene.instances.len(), 1);
     let m = &scene.meshes[0];
-    assert!(m.submeshes.iter().any(|s| s.blend == ao_scene::Blend::AlphaTest && s.texture.is_some()));
+    // Binary texture alpha must not turn the archive's native blending into AlphaTest.
+    assert!(m.submeshes.iter().any(|s| s.blend == ao_scene::Blend::AlphaBlend && s.texture.is_some()));
     assert!(m.submeshes.iter().any(|s| s.blend == ao_scene::Blend::Opaque));
     // upright building: taller than wide, standing on y ~ 0 (min y near the ground)
     let (min_y, max_y) = m.vertices.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v.pos[1]), b.max(v.pos[1])));
