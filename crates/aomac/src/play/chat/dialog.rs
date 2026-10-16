@@ -143,7 +143,7 @@ fn xml_escape(s: &str) -> String {
 fn xml(spec: &Spec) -> String {
     let w = wrap_width(&spec.body);
     let text = |name: &str, borders: &str| {
-        format!("<TextView name=\"{name}\" feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP\" min_size=\"Point({w},-1)\" max_size=\"Point({w},16000)\" layout_borders=\"{borders}\"/>")
+        format!("<TextView name=\"{name}\" feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP\" min_size=\"Point({w},-1)\" max_size=\"Point({w},-1)\" layout_borders=\"{borders}\"/>")
     };
     match spec.kind {
         // (the bug report is a `DialogBox_c` with the text and two buttons, 0x1002aa28)
@@ -202,8 +202,7 @@ impl Dialogs {
             gui.set_text(win, "input", i);
             gui.focus(win, "input");
         }
-        gui.set_default_button(win, "btn0");
-        gui.relayout_window(win);
+        gui.resize_window(win, WindowSize::Preferred);
         let (w, h) = gui.outer_size(win);
         gui.set_window_pos(win, ((screen.0 as i32 - w as i32) / 2, (screen.1 as i32 - h as i32) / 2));
         self.open.push(Open { win, kind: spec.kind, age: 0.0, escape: self.escape });

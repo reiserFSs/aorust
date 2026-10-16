@@ -404,9 +404,18 @@ the corpse to the dead character's relative position when closer than a threshol
   `Play::teleporting`, also when the server sends no `n3TeleportIIR_t`): red `ChangingArea` line, target cleared, `Player` dropped (input
   locked), old dynels/actors dropped (`Zone::reset_world`), `CharInPlay` owed again, and a black full-screen quad under the GUI
   (the 3D viewport is off; black is [INFERENCE]). The HUD and chat stay. The new playfield loads in the background (a result for a
-  replaced playfield is dropped); when it is ready the scene/sky/camera are replaced, `Hud::provide_ground` refreshes the map, the player is
-  rebuilt from the new own `SimpleCharFullUpdate`, a red `EnteringPF` / `EnteringNewArea` line is printed, `teleporting` clears and the
-  `CharInPlay` countdown (> 10 frames) starts. The viewport / input stay off until the echo (`AliveMessage`, below).
+  replaced playfield is dropped); when it is ready the scene/sky/camera are replaced, `Hud::provide_ground` refreshes the map,
+  a red `EnteringPF` / `EnteringNewArea` line is printed and `teleporting` clears. Player construction requires the current
+  own dynel, not a retained previous-zone SCFU: if it arrives after installation, `frame` constructs the player then and
+  clears the free-fly fallback on success. Initial, delayed and replacement construction share the same path and the
+  same per-frame collision/effect attachment. The attempted `own_serial` is retained even on asset failure, so construction
+  retries only for a new own SCFU or a newly installed world, not every frame. While `CharInPlay` is owed, the own-dynel
+  construction attempt re-arms its native 10-frame/120-second countdown (`SetMainDynel` [GC 0x10019f77] → event 6 above).
+  Sending additionally requires the own control dynel (`N3Msg_SendInPlayMessage` [GC 0x10018090]); absent control dynels
+  leave the send pending even after countdown expiry and asset drain. The viewport / input stay off until the echo
+  (`AliveMessage`, below). Regression: `flow::tests::own_scfu_after_world_install_builds_player_and_allows_camp`
+  withholds the captured own SCFU until the world is installed, then checks player/collision construction, countdown,
+  free-fly reset, Alive input unlock and camp.
   Tests: `flow::tests::{second_playfield_keeps_the_interface_and_hides_the_world, zone_redirect_starts_the_teleport,
   teleport_iir_starts_the_zone_change_only_with_a_destination}`, `ao_net::n3::teleport::tests`.
 * **Client-initiated path (RE, N3.dll / Gamecode.dll / GUI.dll)** — implemented (`Player::teleport_try`, `Zone::{start_teleport_try, run_trier}`,

@@ -77,6 +77,9 @@ Server-only IIRs are marked by `IsAllowedFromClient() == false` (`n3PlayfieldFul
    exactly zero frames/seconds does not pass. The time alternative does not bypass pending loads. The port gates on
    queued and unanswered asset-worker requests and continues draining them behind the loading overlay.
    If there is no control dynel yet native returns false and retries next frame.
+   The port also requires `Zone::own()` before declaring the send successful: world installation alone is not a
+   control dynel. If the own SCFU arrives after installation, its first construction attempt re-arms the
+   10-frame/120-second counters before `WaitingToStartGame` runs, following `SetMainDynel` → event 6 above.
    On success: `InputConfig_t::ClrStaticInputMode(0x3a)` and the waiting flag clear; this does **not** substitute for
    `AliveMessage` [GUI 0x10028543], which closes active loading module `0x1b` and enables the viewport/user input.
    `AliveMessage` also clears the waiting flag [GUI 0x10028680].

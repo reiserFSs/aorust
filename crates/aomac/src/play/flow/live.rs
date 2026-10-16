@@ -70,6 +70,35 @@ fn live_named_gui_keys_do_not_invent_text() {
     }
 }
 
+fn window_dvalue(hud: &mut super::super::hud::Hud, gui: &mut ao_gui::Gui, name: &str, on: bool) {
+    if let Some(kind) = super::super::hud::WindowKind::from_dvalue(name) {
+        if on { hud.open(gui, kind); } else { hud.close_kind(gui, kind); }
+    } else {
+        hud.set_dvalue(gui, name, on);
+    }
+}
+
+#[test]
+fn live_window_dvalue_constructs_and_closes_windows() {
+    let dir = ao_gui::client_dir();
+    if !dir.join("cd_image/gui/Default/Graphics.uvgi").exists() { return; }
+    let mut gui = ao_gui::Gui::new(&dir, None).unwrap();
+    let mut hud = super::super::hud::Hud::new(&mut gui, &dir, (1280, 800)).unwrap();
+    window_dvalue(&mut hud, &mut gui, "ncu_window", false);
+    let before = gui.window_ids();
+    window_dvalue(&mut hud, &mut gui, "ncu_window", true);
+    assert!(hud.dvalues.flag("ncu_window"));
+    let made: Vec<_> = gui.window_ids().into_iter().filter(|id| !before.contains(id)).collect();
+    assert!(!made.is_empty(), "winopen must construct the window, not just set its DValue");
+    window_dvalue(&mut hud, &mut gui, "ncu_window", false);
+    assert!(!hud.dvalues.flag("ncu_window"));
+    assert!(made.iter().all(|id| !gui.window_ids().contains(id)));
+    for on in [true, false] {
+        window_dvalue(&mut hud, &mut gui, "lft_window", on);
+        assert_eq!(hud.dvalues.flag("lft_window"), on);
+    }
+}
+
 fn approach_state(zone: &super::super::zone::Zone, fixed: Option<(f32, f32)>, id: i32) -> Option<(&super::super::zone::DynelState, (f32, f32))> {
     let own = zone.own()?;
     let goal = match fixed {
@@ -949,7 +978,7 @@ fn live_walk() {
             "winopen" => {
                 let (d, state) = v.split_once(':').unwrap_or((v, "on"));
                 let h = l.p.hud.as_mut().expect("hud");
-                h.set_dvalue(&mut l.p.gui, d, state != "off");
+                window_dvalue(h, &mut l.p.gui, d, state != "off");
                 l.tick();
             }
             "missioninfo" => {
@@ -1297,8 +1326,11 @@ fn live_walk() {
                 eprintln!("dragnano to bar {bar} slot {slot} at ({bx},{by})");
             }
             // `nanopage=<index>`: selects the Programs window's school tab (0 Combat, 1 Medical, 2 Prot, 3 Psi, 4 Space, 5 Favorites)
-            // before `dragnano`/a point step, matching the `SchoolSelector_c` button the user would click.
-            "nanopage" => l.p.hud.as_mut().unwrap().nano_set_page(v.parse().unwrap()),
+            // before `nanoclick`/`dragnano`/a point step, rebuilding rows as the next frame after a school button click does.
+            "nanopage" => {
+                l.p.hud.as_mut().unwrap().nano_set_page(v.parse().unwrap());
+                l.tick();
+            }
             // `barnames`: slot names of shortcut bar 0 (verifies a persisted nano/macro/action survives a relog).
             "barnames" => eprintln!("barnames {:?}", l.p.hud.as_ref().unwrap().bar_slot_names(0)),
             // `clickslot=<bar>:<slot>`: real left click (press/release, GUI mouse dispatch) activating a shortcut bar slot.

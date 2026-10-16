@@ -665,6 +665,7 @@ impl Play {
         if let Some(player) = self.player.take() {
             self.zone.world.stash_avatar_assets(player.into_avatar_assets());
         }
+        self.player_attempt_serial = None;
     }
 
     /// `FlowControlModule_t::TeleportStartedMessage` (GUI event 5), also posted by `TeleportTrier_t::StartTryingTeleport` of the client-initiated
@@ -716,7 +717,7 @@ impl Play {
         }
         self.world_frames = self.world_frames.saturating_sub(1);
         self.world_seconds -= dt;
-        (self.world_frames < 0 || self.world_seconds < 0.0) && !self.zone.world.has_workload()
+        (self.world_frames < 0 || self.world_seconds < 0.0) && !self.zone.world.has_workload() && self.zone.own().is_some()
     }
 
     /// Whether the game keys / mouse reach the [`Player`](player::Player): `InputConfig+0x18` (`isUserInputStopped`, = `awaiting_alive`) is
@@ -1578,8 +1579,6 @@ impl Frontend for Play {
                         self.gui.clear_focus(); // the login window's password field kept the keyboard focus
                     }
                     self.drop_player();
-                    let playfield = self.zone.playfield.unwrap_or(0);
-                    self.player = player::Player::new(&self.dir, &mut self.zone, playfield);
                     host.fly = teleported && self.player.is_none();
                     self.world_frames = IN_PLAY_FRAMES;
                     self.world_seconds = IN_PLAY_SECONDS;
@@ -1596,6 +1595,23 @@ impl Frontend for Play {
                 }
             }
             _ => {}
+        }
+        if self.screen == Screen::InWorld && self.world_ready && self.world_scene.is_none() && self.zone.own().is_some()
+            && self.player.as_ref().map(|p| p.serial()).or(self.player_attempt_serial) != Some(self.zone.own_serial)
+        {
+            // SetMainDynel (GC 0x10019f77): the own SCFU can arrive after world installation.
+            // Remember failed asset builds too, rather than attempting heavy construction every frame.
+            self.drop_player();
+            self.player_attempt_serial = Some(self.zone.own_serial);
+            let playfield = self.zone.playfield.unwrap_or(0);
+            self.player = player::Player::new(&self.dir, &mut self.zone, playfield);
+            if self.player.is_some() {
+                host.fly = false;
+            }
+            if !self.zone.in_play_sent {
+                self.world_frames = IN_PLAY_FRAMES;
+                self.world_seconds = IN_PLAY_SECONDS;
+            }
         }
         if self.in_play_due(dt) {
                 // GUI 0x10027d73: clear static mode 0x3a after sending, but input still waits for Alive.
@@ -1619,12 +1635,6 @@ impl Frontend for Play {
             self.camp_frame(dt, host);
         }
         if self.screen == Screen::InWorld {
-            if self.player.as_ref().is_some_and(|p| p.serial() != self.zone.own_serial) {
-                // the server placed the own character again (teleport within the playfield)
-                self.drop_player();
-                let playfield = self.zone.playfield.unwrap_or(0);
-                self.player = player::Player::new(&self.dir, &mut self.zone, playfield);
-            }
             // `ViewDistance` / `DisplayCharViewDistance` (docs/chat/dvalue.md): far plane + fog + statel LOD, characters' draw distance
             if let Some(h) = self.hud.as_mut() {
                 h.sync_keys();

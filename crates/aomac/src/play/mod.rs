@@ -284,6 +284,8 @@ struct Play {
     chat: Option<chat::Chat>,
     /// The own character in the world (movement, avatar, camera, controls); `None` outside the world.
     player: Option<player::Player>,
+    /// Last construction attempt, including failure; retry only after another own SCFU or world installation.
+    player_attempt_serial: Option<u32>,
     /// Combat / action layer of the zone connection (`combat/module.rs`).
     fight: Option<combat::module::Module>,
     /// Processed own events: attack note, SpecialAttack, equipment, item use, level (live harness only).
@@ -414,6 +416,7 @@ impl Play {
             hud_pending: vec![],
             chat: None,
             player: None,
+            player_attempt_serial: None,
             fight: None,
             #[cfg(test)]
             live_attack_events: [0; 5],

@@ -1022,6 +1022,51 @@ fn loading_waits_for_alive_and_countdown_uses_native_boundaries() {
     assert!(r.p.awaiting_alive && r.p.loading_active && !r.p.world_ready && !r.p.teleporting);
 }
 
+#[test]
+fn own_scfu_after_world_install_builds_player_and_allows_camp() {
+    use ao_net::n3::{dynel::Dynel, outgoing::n3_frame, N3};
+    let Some(mut r) = rig() else { return };
+    let own = 33512;
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: own });
+    let frames = captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec"));
+    let (late, burst): (Vec<_>, Vec<_>) = frames.into_iter().partition(|f| {
+        matches!(ao_net::n3::decode(f), Ok(m) if m.header.target.instance == own as i32
+            && matches!(m.body, N3::Dynel(Dynel::SimpleCharFullUpdate(_))))
+    });
+    assert!(!late.is_empty(), "fixture must contain the own SCFU");
+    r.burst(&burst);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while r.p.screen != Screen::InWorld || r.p.zone.world.has_workload() {
+        assert!(Instant::now() < deadline, "world must install without the own SCFU");
+        r.p.frame(0.5, (1280, 800), &mut r.host);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(r.p.world_ready && r.p.world_scene.is_none() && r.p.player.is_none() && r.p.zone.own().is_none());
+    // Neither native countdown expiry nor idle assets can replace GetClientControlDynel.
+    r.p.frame(IN_PLAY_SECONDS + 1.0, (1280, 800), &mut r.host);
+    assert!(!r.p.zone.in_play_sent && !r.p.game_input_open());
+    r.host.fly = true; // A missing-avatar fallback must not survive successful late construction.
+    r.burst(&late);
+    r.p.frame(0.0, (1280, 800), &mut r.host);
+    let player = r.p.player.as_ref().expect("late own SCFU constructs the installed world's player");
+    assert_eq!(player.serial(), r.p.zone.own_serial);
+    assert!(player.effect_surface().is_some(), "late construction loads the same native collision surface");
+    assert!(!r.host.fly && !r.p.zone.in_play_sent);
+    assert_eq!((r.p.world_frames, r.p.world_seconds), (IN_PLAY_FRAMES - 1, IN_PLAY_SECONDS),
+        "SetMainDynel re-arms the native countdown before its first frame");
+    while !r.p.zone.in_play_sent {
+        assert!(Instant::now() < deadline, "late own dynel must release CharInPlay");
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    r.event(LoginEvent::ZoneFrame(n3_frame(0, own, ao_net::n3::outgoing::char_in_play(own as i32))));
+    assert!(r.p.game_input_open());
+    r.p.frame(FADE_OUT, (1280, 800), &mut r.host);
+    r.p.camp();
+    assert_eq!(r.p.logout.state, super::super::logout::State::Login,
+        "camp must reach the restored player rather than silently returning");
+}
+
 /// A second `PlayfieldAnarchyFIIR_t` while in the world: `TeleportStarted` (no loading screen, interface kept, world hidden), the
 /// dynels dropped, the new playfield loaded, `CharInPlay` owed again after `TeleportEnded`; `GameTimeIIR_t` drives the zone clock
 /// (docs/zone/world.md §10, docs/zone/world.md §10.2).
@@ -1071,7 +1116,7 @@ fn second_playfield_keeps_the_interface_and_hides_the_world() {
     for _ in 0..IN_PLAY_FRAMES + 2 {
         r.p.frame(0.016, (1280, 800), &mut r.host);
     }
-    assert!(r.p.zone.in_play_sent, "CharInPlay is due again in the new world");
+    assert!(!r.p.zone.in_play_sent, "native SendInPlay retries until the own control dynel exists");
     assert!(r.p.zone.own().is_none() && r.p.zone.dynels.len() > 10);
     assert!(matches!(r.host.live_sky, Some(Some(_))), "4582 is outdoors: live sky");
     assert_eq!(r.p.text.by_key(110, "EnteringPF").as_deref(), Some("Entering '%s'"));

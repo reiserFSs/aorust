@@ -1389,6 +1389,24 @@ mod tests {
             assert!(c.outbox.is_empty(), "opening confirmation must not send");
             let win = c.dialogs.windows().next().expect("terminate confirmation");
             assert_eq!(gui.text(win, "text"), texts.by_key(10000, "WarningTerminate").unwrap());
+            let (x, y, w, h) = gui.window_outer_frame(win).unwrap();
+            assert_eq!((x, y), ((1280 - w as i32) / 2, (800 - h as i32) / 2));
+            assert!(y >= 0 && y + h as i32 <= 800, "confirmation must fit on screen");
+            let text = gui.view_rect(win, "text").unwrap();
+            let yes = gui.view_rect(win, "btn0").unwrap();
+            let no = gui.view_rect(win, "btn1").unwrap();
+            for rect in [text, yes, no] {
+                assert!(rect.l >= x as f32 && rect.r < (x + w as i32) as f32);
+                assert!(rect.t >= y as f32 && rect.b < (y + h as i32) as f32);
+            }
+            assert_eq!(yes.t - text.b - 1.0, 20.0);
+            assert_eq!(yes.t, no.t);
+            // Native DialogBox never installs a default button (GUI 10156885 / 1012a2f6).
+            for event in gui.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Enter, pressed: true, mods: Default::default() }) {
+                c.event(&mut gui, &event, &zone, &texts);
+            }
+            assert!(c.dialogs.is_open(), "Enter must not choose Yes");
+            assert!(c.outbox.is_empty(), "Enter must not send terminate");
             let event = match button {
                 Some(view) => Event::Clicked { window: win, view: view.into(), item: None },
                 None => Event::Escape { window: win },
