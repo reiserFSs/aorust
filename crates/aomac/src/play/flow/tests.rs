@@ -1784,3 +1784,40 @@ fn server_eof_completes_camp_or_reports_unexpected_loss() {
         }
     }
 }
+
+#[test]
+fn retained_limbo_saves_user_populates_native_view_and_returns_on_timeout() {
+    let Some(mut r) = rig() else { return };
+    r.p.pending_user = "aomac-limbo-synthetic".into();
+    let info = CharacterInfo {
+        id: 77, name: "Synthetic".into(), level: 33, breed: 1, gender: 2,
+        profession: 6, area: "Synthetic area".into(), ..Default::default()
+    };
+    r.event(LoginEvent::LoginLimbo { timeout: -1, info });
+    assert!(matches!(r.p.screen, Screen::Limbo { timeout: 10.0, character_id: 77 }));
+    assert!(r.p.pending_user.is_empty());
+    assert!(r.p.prefs.accounts.iter().any(|name| name == "aomac-limbo-synthetic"));
+    let w = r.p.progress_w.expect("native LimboWindow XML");
+    assert_eq!(r.p.gui.text(w, "name"), "Synthetic");
+    assert_eq!(r.p.gui.text(w, "level"), "33");
+    assert_eq!(r.p.gui.text(w, "location"), "", "retail XML comments out the optional location view");
+    r.p.frame(11.0, (1280, 800), &mut r.host);
+    assert!(r.p.screen == Screen::Login && r.login_visible());
+    assert!(r.p.progress_w.is_none());
+}
+
+#[test]
+fn protocol_not_ok_closes_login_progress_and_displays_literal_error() {
+    let Some(mut r) = rig() else { return };
+    r.p.show_progress(CONNECT_TIMEOUT, false, &mut r.host);
+    r.event(LoginEvent::ProtocolNotOk);
+    assert!(r.p.screen == Screen::Login && r.login_visible());
+    assert!(r.p.progress_w.is_none() && r.p.session.is_none());
+    assert!(r.p.dialog_w.is_some(), "fatal text must not disappear into a status line");
+    let (w, kind) = r.p.dialog_w.unwrap();
+    assert!(kind == DialogKind::Fatal);
+    assert_eq!(r.p.gui.text(w, "message"), "Connection error:\nProtocol Not OK.");
+    assert!(!r.host.quit);
+    r.click(w, "cancel_btn");
+    assert!(r.host.quit && r.p.dialog_w.is_none());
+}

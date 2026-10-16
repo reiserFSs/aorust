@@ -141,6 +141,8 @@ enum Screen {
     Login,
     /// State 1 / 4: `ProgressWindow_c`.
     Progress { timeout: f32, joining: bool },
+    /// LoginModule state 2 / LimboWindow_c.
+    Limbo { timeout: f32, character_id: u32 },
     /// State 3.
     CharSelect,
     /// `CharCreateModule_t` (docs/screens.md §12).
@@ -303,6 +305,8 @@ struct Play {
 enum DialogKind {
     /// Error text; Cancel button relabelled "OK".
     Message,
+    /// Native TextException fatal notice; dismissing finishes shutdown.
+    Fatal,
     Activate,
     /// `CharCreateModule_t::AskExitMessage` ("ExitCC").
     ExitCc,

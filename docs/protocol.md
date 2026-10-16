@@ -233,8 +233,8 @@ x = `0123456789abcdef0123456789abcdef` -> `dhX = 8cc3b8c6…5a9c45`, `K` starts 
 | 0x55 | RandomNameRequest | C | `i32 breed`, `i32 gender`, `i32 profession` |
 | 0x56 | SuggestName | S | `i16 len` + bytes |
 
-Not implemented in `ao-net` (outside the connect→charselect→create/delete→zone path): 0x43 chat-server list, 0x4E character info
-push, 0x20/0x23/0x30 (see below).
+Retained login replies 0x20/0x23/0x30/0x4E are handled as described below. Chat-server
+list 0x43 uses the existing zone-frame/chat consumer.
 
 ### 5a. Character create / delete / name suggestion (char-select phase) — `ao-net` `Message::{CreateCharacter,RandomNameRequest,SuggestName,DeleteCharacter,CharacterCreated,NameInUse,CharacterDeleted}`
 
@@ -254,8 +254,13 @@ server replies are dispatched by `Client_t::ProcessMessage` `[IF 0x10002a9e]` (h
   `[CellAO Libraries/Source/CellAO.Messages/SystemMessages/CreateCharacterMessage.cs]`; so `param_8` = CellAO `StarterArea`.
   Caller `NameScene_t::SetState(0x1006)` `[GUI 0x1011f75e]`: `ConvertCCBreedToGCBreedAndSex(CCSelectedBreed)` -> breed/gender, `ConvertCCProfToGCProf(CCSelectedProfession)`
   -> profession, `head = CCCharacter_t::GetHeadMeshID(CCSelectedHead)`, `height = 90 (CCSelectedHeight==0) | 100 (==1) | 110 (else)`,
-  `width = CCSelectedSize` (raw pref), `name = CCSelectedName`, `param_8 = *(NameScene_t+0x74)`, which `NameScene_t::NameScene_t` initialises to 0
-  `[GUI 0x1011ff0a]` and no function of the class writes -> always 0 (UNRESOLVED: not searched in all of GUI.dll for external writers).
+  `width = CCSelectedSize` (raw pref), `name = CCSelectedName`, `param_8 = *(NameScene_t+0x74)`.
+  The constructor initializes that word to zero `[GUI 0x1011ff0a; store 0x1011ff7d]`;
+  **`CreatePressed` resets it to zero again** `[GUI 0x1011ff01]` before
+  `FinishCharCreation` `[GUI 0x1011fece]` -> `StartServerCreation` `[GUI 0x1011fcac]` ->
+  `SetState(0x1005)` -> feedback `0x1009` -> `0x1006` reads it `[GUI 0x1011fb4e]`.
+  The native Create-button flow therefore sends zero, not a user-selected starter area.
+  The bounded writer/access census is below; it is not an unperformed whole-GUI search.
 * **0x11 CharacterCreated** `i32 id` -> `s_nCharID = id`, **`LoginCharacter()` at once** (0x16 SelectCharacter, §"0x16"), then signal `Client+0x80`
   (arg 0) and the generic reply signal `Client+0x68(0x11, 0)`. `ao-net` does the same (`LoginEvent::CharacterCreated`, then it sends SelectCharacter itself).
 * **0x10 NameInUse** `i32 code` -> signal `Client+0x80(code)` and `+0x68(0x10, code)`.
@@ -280,8 +285,44 @@ server replies are dispatched by `Client_t::ProcessMessage` `[IF 0x10002a9e]` (h
   (the app maps them to `ShowError(0x0d, code)` / `ShowError(0x21, detail)`). After the character list both are reported but the session stays up (the original keeps the connection; it only ends
   before the list); `ZoneInfo`/`ZoneRedirection` handling is untouched (tests `login_select_zone_handoff_*`).
 
-**UNRESOLVED**: real-server layouts of 0x0F reply codes beyond `NameInUse`'s `i32` (CellAO sends 0x1E; the client only forwards it); whether PRK uses additional reply ids
-for create failures (other ids hit `InvalidResponseHandle` `[IF 0x10001e06]`, not analysed); `starter_area` semantics beyond CellAO's name; width as raw size pref vs. percent.
+**Bounded native create/reply census (no server guesses):**
+
+* `NameScene_t`'s symbol census covers destructor `0x1011b0de`, all named methods
+  `0x1011f390..0x10120492`, and constructor `0x1011ff0a`.
+  A whole-GUI instruction-operand search for scalar/displacement `0x74`
+  (`FindScalar.java 74 10000`, **544 hits**, below its cap) finds the creation-scene
+  word only at the read `0x1011fb4e` and zero writes `0x1011ff01`, `0x1011ff7d`.
+  Nearby `CCCharacter_t` store `0x1011adab` is a different object's float, not this word.
+  The constructor's sole code caller is `CharCreateModule_t::FrameProcess`
+  `[GUI 0x1011c02c; call 0x1011c2d6]`: it allocates `0x78` bytes, stores the scene at
+  module `+0x60`, and externally initializes only inherited scene `+0x44`.
+  The `NameScene_t` RTTI `0x102724fc` has exactly five code references:
+  `LHConnectFeedbackMessage` `0x1011b29e`, `CharacterCreateFeedbackMessage`
+  `0x1011b2dc`, `LHLostMessage` `0x1011b31a`, `LoginOKMessage` `0x1011b346`,
+  `SuggestNameFeedbackMessage` `0x1011b763`. Those casts call `SetState` /
+  `SetSuggestedName`; none writes `+0x74`. The concrete Create click, callback and
+  feedback flow has no alternate nonzero producer. This bounded native-flow result
+  does not claim a general binary alias-analysis proof against arbitrary exported
+  function callers; such hypothetical callers are not a reason to invent a selector.
+* `Client_t::ProcessMessage` `[IF 0x10002a9e]` explicitly handles system ids
+  `0x0D,0x0E,0x10,0x11,0x15,0x17,0x21,0x23,0x24,0x3C,0x43,0x4E,0x56`.
+  Other ids go to `InvalidResponseHandle` at call `0x100034c8`; its caller census
+  finds no other code caller in Interfaces (the other references are export metadata).
+  `InvalidResponseHandle` `[IF 0x10001e06]` has only `0x0D,0x10,0x20,0x21,0x30`
+  special cases: 0x0D/0x10 read one int and send AFCM `(10,0xff,detail)` /
+  `(10,0x27,detail)`; 0x21 sends `(10,0x11f)`; 0x20 is fatal and 0x30 consumes
+  three ints as detailed below. Its **default does not decode a create reply**:
+  it formats `"Protocol error: Got unknown system message %u as reply (size %u bytes)!"`,
+  emits `GlobalSignals+0x17c(0,text)`, then returns its initialized zero.
+  There is no `0x0F` reply decoder and no further native create-failure packet layout
+  hidden in this fallback. Known create failure details are the one-int 0x10 path
+  and generic one-int 0x0D / 0x21 paths, not additional recovered reply ids.
+* **Unavailable server evidence:** whether PRK produces any additional reply ids
+  or assigns server-side semantics to nonzero `starter_area` cannot be derived from
+  this client. No corresponding capture/server implementation is available in this
+  assignment. Native reachable consumers are enumerated above; server-specific
+  reply layouts and starter-area policy remain explicitly unclaimed. The native
+  width argument is the raw `CCSelectedSize` pref, independently of server semantics.
 
 ### 0x22 UserLogin `[IF 0x100025a9 InitAuth]`
 `stream << 2; write(name,0x28); write(version,0x14)`; sent as `SystemMessage_t(0x22, 0, 1, size, buf)`. `name` =
@@ -355,13 +396,59 @@ Next: `RedirectToServer` `[IF 0x1000291d]` connects `ACE_INET_Addr::set(port, ip
 ### 0x3C ZoneRedirection `[IF 0x10002a9e case 0x3C]`
 `i32 ip`, `i16 port` -> `OpenConnection` to it, then `SendClientCookie` (0x1B). CellAO: `IPAddress` + `ushort` `[.../ZoneRedirectionMessage.cs]`.
 
-### Other client-handled system messages (not implemented)
-* 0x20 -> fatal "Connection error: Protocol Not OK."; 0x21 -> `AFCM::Send(10, 0x11f)` (+ signal with an `i32`; implemented as
-  `RequestRejected`, seen live: detail 9); 0x30 ->
-  three ints; 0x23 -> ignored; others -> "Protocol error: Got unknown system message %u as reply" `[IF 0x10001e06]`, `[IF 0x10002a9e]`.
-* 0x43: `i32 n`, `n x { i32 len; u8 str[len]; i32; f32 }` -> signal at `GlobalSignals+0x1c8` `[IF 0x10002a9e case 0x43]`. CellAO's
-  `ChatServerInfoMessage` is the `n=1` case: `i32 1, str host, i32 port, i32 unknown` `[CellAO .../ChatServerInfoMessage.cs]`.
-* 0x4E: `i32` + `CharacterInfo_c` blob -> emitted on the `Client_t+0x6c` / `+0x68` signal lists.
+### Retained login replies: 0x20, 0x23, 0x30, 0x4E
+
+* **0x20**: `InvalidResponseHandle` `[IF 0x10001e06]` reads no body and calls
+  `ErrorHandling_t::Error("Connection error:\nProtocol Not OK.")`.
+  `Error` `[IF 0x10011678]` throws `TextException_t(text, 3)`; this is not a LoginError
+  text id and must not be sent through `ShowError(type, detail)`'s HTML URL convention.
+  `ao-net` emits `ProtocolNotOk` and ends the session quietly (no trailing Disconnected);
+  the app closes the pending progress/session and displays the literal message using its
+  existing message dialog. No retry is started. The outer TextException catch
+  `[AnarchyOnline 0x00401795; RTTI 0x00411820; catch metadata 0x0040d04c..58]`
+  calls `SandyInterfaceModule_t::EmergencyShutdown`, displays code 3's literal text
+  in `MessageBoxA(...,"Anarchy Error Handling",0x40000)`, records the error via
+  `MSJExceptionHandler` and returns continuation `0x0040188f`. The port uses the
+  existing notice dialog adapter and quits on its dismissal (including Escape/close),
+  not a recoverable LoginError/browser URL. No new numeric fatal code is introduced.
+* **0x23**: `ProcessMessage` `[IF 0x10002a9e]` returns through its normal cleanup without
+  reading a body or emitting a signal. The session explicitly ignores it, including an
+  opaque body, rather than creating a status-line reply.
+* **0x30**: `InvalidResponseHandle` `[IF 0x10001e06]` reads exactly three BE `i32`s
+  into locals (first at the reused argument slot, then frame offsets `-0x40`, `-0x3c`),
+  destroys that stream and returns its initialized zero result. **There is no downstream
+  signal, AFCM call, field store, or UI consumer in this native branch.** Consequently
+  `ao-net` strictly decodes twelve bytes and explicitly consumes/discards the resulting
+  triple in the session handler, preserving the phase and emitting no event. Giving the
+  integers invented names or adding a UI transition would not be a faithful implementation.
+  Short/trailing bodies fail the session instead of waiting indefinitely or becoming status text.
+* **0x4E**: `ProcessMessage` `[IF 0x10002a9e]` reads `i32 timeout` followed directly by
+  `CharacterInfo_c::ReadStream` `[MP 0x1000196f]` (not `CharacterData_t`, no row status),
+  emits `Client+0x6c(timeout, info)` then `Client+0x68(0x4e,0)`.
+  `LoginModule_c::SlotLoginLimbo` `[GUI 0x10011a6c]` clamps timeout to at least ten seconds,
+  fills `LimboWindow`, sets its timeout and selects state 2. `SlotLoginReply`
+  `[GUI 0x10011f8f]` then saves the authenticated username by the same path as 0x0E, but
+  does not show CharSelect. The decoder shares the canonical 0x0E CharacterInfo reader
+  and rejects truncation, invalid lengths, and trailing bytes.
+  `LimboWindow_c::SetCharacterInfo` `[GUI 0x10010788]` stores the character id/name and
+  fills name, level, sex, breed, profession and location from that blob. The app uses
+  the original `Views/LimboWindow.xml` `[GUI ctor 0x10010311]`, not a replacement layout.
+  In the installed Default XML, lines 18/27 comment out location label/value; the native
+  setter and port both tolerate that absent optional view rather than adding a new one.
+  `SetTimeout` `[GUI 0x1000ffff]` resets the countdown to one;
+  `SlotFrameProcess` `[GUI 0x1001016a]` reduces it to zero and emits the quit signal at
+  expiry; window close uses that same signal `[GUI 0x1001006c]`. Both return to Login.
+  The Login button emits the stored id/name `[GUI 0x100100d9]`; the existing character
+  select command sends 0x16 and enters joining progress.
+* **0x43**: `i32 n`, `n x { i32 len; u8 str[len]; i32; f32 }` -> signal at
+  `GlobalSignals+0x1c8` `[IF 0x10002a9e]`; the existing chat-server-list consumer is unchanged.
+
+**Evidence boundary:** no retail/PRK capture for 0x20, 0x30, or 0x4E is available here.
+Golden bodies, malformed-body tests, socket state regressions and headless flow regressions
+are synthetic native-layout checks, not live acceptance. The bounded native writer /
+reply-consumer census is in §5a: the Create click resets `NameScene_t+0x74` to zero;
+unknown PRK reply production and server-side starter-area policy remain unavailable,
+not additional native decoders or an unperformed native-method search.
 
 ## 6. Differences from CellAO (do not copy its server blindly)
 1. ZoneInfo: client reads 26 bytes (two extra ints). 2. ZoneLogin: client sends `charId + cookie1 + cookie2`. 3. CharacterList: three trailing

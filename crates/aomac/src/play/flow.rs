@@ -76,6 +76,10 @@ fn fake_list() -> CharacterList {
     }
 }
 
+fn limbo_timeout(timeout: i32) -> f32 {
+    timeout.max(10) as f32
+}
+
 impl Play {
     // ---- backdrop ----------------------------------------------------------------------------------------------
 
@@ -122,6 +126,37 @@ impl Play {
         for w in [self.progress_w.take(), self.char_w.take(), self.dialog_w.take().map(|d| d.0)].into_iter().flatten() {
             self.gui.close_window(w);
         }
+    }
+
+    fn remember_login_user(&mut self) {
+        let user = std::mem::take(&mut self.pending_user);
+        if !user.is_empty() {
+            self.prefs.remember(&user); // SlotLoginReply(0x0e / 0x4e), GUI 0x10011f8f
+        }
+    }
+
+    fn show_limbo(&mut self, timeout: i32, info: CharacterInfo, host: &mut Host) {
+        self.close_all();
+        self.show_backdrop(0, host);
+        self.screen = Screen::Limbo { timeout: limbo_timeout(timeout), character_id: info.id as u32 };
+        self.progress_t = 0.0;
+        let Some(w) = self.open_centered("LimboWindow") else { return };
+        self.progress_w = Some(w);
+        let profession = if info.profession < 1 || info.profession == 0xff {
+            self.text.by_key(506, "NotChosenYet").unwrap_or_default()
+        } else {
+            self.text.by_id(2004, info.profession as u32).unwrap_or_default()
+        };
+        for (view, text) in [
+            ("name", info.name), ("level", info.level.to_string()),
+            ("gender", sex_name(info.gender).into()), ("breed", breed_name(info.breed).into()),
+            ("profession", profession), ("location", info.area),
+        ] {
+            self.gui.set_text(w, view, &text);
+        }
+        self.gui.set_progress(w, "countdown_bar", 1.0);
+        self.gui.relayout_window(w);
+        self.recenter(w);
     }
 
     // ---- state 0: login ----------------------------------------------------------------------------------------
@@ -910,11 +945,21 @@ impl Play {
             match ev {
                 LoginEvent::Status(s) => eprintln!("login: {s}"),
                 LoginEvent::CharacterList(l) => {
-                    let user = std::mem::take(&mut self.pending_user);
-                    if !user.is_empty() {
-                        self.prefs.remember(&user); // only after a successful login (LoginWindow_c::SlotLoginReply 0x0e)
-                    }
+                    self.remember_login_user();
                     self.show_characters(l, host);
+                }
+                LoginEvent::ProtocolNotOk => {
+                    self.show_login(host);
+                    self.message_box("Connection error:\nProtocol Not OK.");
+                    if let Some((_, kind)) = self.dialog_w.as_mut() {
+                        *kind = DialogKind::Fatal;
+                    } else {
+                        host.quit = true;
+                    }
+                }
+                LoginEvent::LoginLimbo { timeout, info } => {
+                    self.show_limbo(timeout, info, host);
+                    self.remember_login_user();
                 }
                 LoginEvent::LoginError { code, message } => {
                     // SlotLoginReply: type 0x0d (LoginError) -> ShowError(type, arg)
@@ -1081,13 +1126,21 @@ impl Play {
                 if Some(window) == self.login_w {
                     host.quit = true; // SlotQuitRequested -> shutdown
                 } else if self.dialog_w.is_some_and(|d| d.0 == window) {
+                    if self.dialog_w.is_some_and(|d| d.1 == DialogKind::Fatal) {
+                        host.quit = true;
+                    }
                     self.close_dialog();
+                } else if Some(window) == self.progress_w && matches!(self.screen, Screen::Limbo { .. }) {
+                    self.show_login(host);
                 } // ProgressWindow swallows its close request
             }
             Event::Escape { window } => {
                 if self.dialog_w.is_some_and(|d| d.0 == window && d.1 == DialogKind::ExitCc) {
                     self.cc_exit_answer(false, host);
                 } else if self.dialog_w.is_some_and(|d| d.0 == window) {
+                    if self.dialog_w.is_some_and(|d| d.1 == DialogKind::Fatal) {
+                        host.quit = true;
+                    }
                     self.close_dialog();
                     self.create_message_closed();
                 } else if Some(window) == self.char_w && self.dialog_w.is_none() {
@@ -1116,6 +1169,14 @@ impl Play {
                         _ => {}
                     }
                 } else if Some(window) == self.progress_w {
+                    if let Screen::Limbo { character_id, .. } = self.screen {
+                        if view == "login_btn" {
+                            if let Some(session) = &self.session {
+                                session.select_character(character_id);
+                            }
+                            self.show_progress(JOIN_TIMEOUT, true, host);
+                        }
+                    }
                     if view == "cancel_btn" {
                         self.show_login(host); // SlotLoginTimeout
                     }
@@ -1129,6 +1190,10 @@ impl Play {
                         ("ok_btn", Some(DialogKind::ExitCc)) => self.cc_exit_answer(true, host),
                         ("cancel_btn", Some(DialogKind::ExitCc)) => self.cc_exit_answer(false, host),
                         ("ok_btn", Some(DialogKind::Delete)) => self.delete_ok(host),
+                        ("cancel_btn", Some(DialogKind::Fatal)) => {
+                            self.close_dialog();
+                            host.quit = true;
+                        }
                         ("cancel_btn", Some(DialogKind::Message)) => {
                             self.close_dialog();
                             self.create_message_closed();
@@ -1415,6 +1480,13 @@ impl Frontend for Play {
             self.gui.set_progress(w, "progress_bar", (self.progress_t / timeout).min(1.0));
             if self.progress_t >= timeout {
                 self.show_login(host); // SlotLoginTimeout / SlotSelectCharacterTimeout
+            }
+        }
+        if let (Screen::Limbo { timeout, .. }, Some(w)) = (self.screen, self.progress_w) {
+            self.progress_t += dt;
+            self.gui.set_progress(w, "countdown_bar", 1.0 - (self.progress_t / timeout).min(1.0));
+            if self.progress_t >= timeout {
+                self.show_login(host); // LimboWindow_c::SlotFrameProcess 0x1001016a
             }
         }
         if self.screen == Screen::CharSelect {

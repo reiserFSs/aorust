@@ -25,6 +25,10 @@ pub const USER_CREDENTIALS: u32 = 0x25;
 pub const ZONE_REDIRECTION: u32 = 0x3C;
 pub const RANDOM_NAME_REQUEST: u32 = 0x55;
 pub const SUGGEST_NAME: u32 = 0x56;
+pub const PROTOCOL_NOT_OK: u32 = 0x20;
+pub const LOGIN_IGNORED: u32 = 0x23;
+pub const LOGIN_PARAMETERS: u32 = 0x30;
+pub const LOGIN_LIMBO: u32 = 0x4e;
 
 /// `LoginError` codes (CellAO `LoginError.cs`; client only forwards the int to its UI).
 pub const ERR_ALREADY_LOGGED_IN: i32 = 0x14;
@@ -81,6 +85,46 @@ pub struct CharacterInfo {
     pub width: i32,
 }
 
+impl CharacterInfo {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let version = r.i32()?;
+        if version < 3 {
+            bail!("unsupported CharacterInfo version {version}");
+        }
+        Ok(Self {
+            id: r.i32()?,
+            org_instance: if version > 4 { r.i32()? } else { 0 },
+            name: r.str_i32(MAX_STR)?,
+            breed: r.i32()?,
+            gender: r.i32()?,
+            profession: r.i32()?,
+            level: r.i32()?,
+            area: r.str_i32(MAX_STR)?,
+            banned: r.i32()?,
+            ban_reason: r.str_i32(usize::MAX >> 1)?,
+            head: if version > 3 { r.i32()? } else { 0 },
+            height: if version > 3 { r.i32()? } else { 0 },
+            width: if version > 3 { r.i32()? } else { 0 },
+        })
+    }
+
+    fn write(&self, w: &mut Writer) {
+        w.i32(CHARACTER_INFO_VERSION);
+        w.i32(self.id);
+        w.i32(self.org_instance);
+        w.str_i32(&self.name);
+        for value in [self.breed, self.gender, self.profession, self.level] {
+            w.i32(value);
+        }
+        w.str_i32(&self.area);
+        w.i32(self.banned);
+        w.str_i32(&self.ban_reason);
+        for value in [self.head, self.height, self.width] {
+            w.i32(value);
+        }
+    }
+}
+
 /// One character-list row: `CharacterData_t` (v4) followed by an `i32` status
 /// (CellAO `CharacterStatus`; stored by the client in a parallel vector).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -109,39 +153,13 @@ impl CharacterEntry {
             exit_door_id: Identity::read(r)?,
         };
         let created = r.i32()? != 0;
-        let iver = r.i32()?;
-        if iver < 3 {
-            bail!("unsupported CharacterInfo version {iver}");
-        }
-        let info_id = r.i32()?;
-        let org_instance = if iver > 4 { r.i32()? } else { 0 };
-        let name = r.str_i32(MAX_STR)?;
-        let (breed, gender, profession, level) = (r.i32()?, r.i32()?, r.i32()?, r.i32()?);
-        let area = r.str_i32(MAX_STR)?;
-        let banned = r.i32()?;
-        let ban_reason = r.str_i32(usize::MAX >> 1)?;
-        let (head, height, width) =
-            if iver > 3 { (r.i32()?, r.i32()?, r.i32()?) } else { (0, 0, 0) };
+        let info = CharacterInfo::read(r)?;
         let status = r.i32()?;
         Ok(Self {
             id, // CharacterData_t::ReadBlobStream overwrites info.id with this (0x100011c5)
             proxy,
             created,
-            info: CharacterInfo {
-                id: info_id,
-                org_instance,
-                name,
-                breed,
-                gender,
-                profession,
-                level,
-                area,
-                banned,
-                ban_reason,
-                head,
-                height,
-                width,
-            },
+            info,
             status,
         })
     }
@@ -155,20 +173,7 @@ impl CharacterEntry {
         w.i32(self.proxy.exit_door);
         self.proxy.exit_door_id.write(w);
         w.i32(self.created as i32);
-        let i = &self.info;
-        w.i32(CHARACTER_INFO_VERSION);
-        w.i32(i.id);
-        w.i32(i.org_instance);
-        w.str_i32(&i.name);
-        for v in [i.breed, i.gender, i.profession, i.level] {
-            w.i32(v);
-        }
-        w.str_i32(&i.area);
-        w.i32(i.banned);
-        w.str_i32(&i.ban_reason);
-        for v in [i.head, i.height, i.width] {
-            w.i32(v);
-        }
+        self.info.write(w);
         w.i32(self.status);
     }
 }
@@ -197,7 +202,8 @@ pub struct CreateCharacterRequest {
     /// `CharacterInfo_c+0x78` (GUI passes the `CCSelectedSize` pref).
     pub width: i32,
     pub name: String,
-    /// Trailing `i32` after the `CharacterData_t` (CellAO `StarterArea`); GUI passes `NameScene_t+0x74` (always 0 there).
+    /// Trailing `i32` after `CharacterData_t` (CellAO `StarterArea`). Native `NameScene_t::CreatePressed`
+    /// (GUI 0x1011ff01) resets scene +0x74 to zero before the create flow reads it (0x1011fb4e).
     pub starter_area: i32,
 }
 
@@ -270,6 +276,14 @@ pub enum Message {
     NameInUse(i32),
     /// 0x21 server->client: live PRK answer to an undecryptable `UserCredentials` (detail 9 observed).
     RequestRejected(i32),
+    /// IF 0x10001e06: fatal, no body is read.
+    ProtocolNotOk,
+    /// IF 0x10002a9e: deliberately ignored, no body is read.
+    LoginIgnored,
+    /// IF 0x10001e06: three integers consumed and discarded, without a signal.
+    LoginParameters([i32; 3]),
+    /// IF 0x10002a9e -> GUI SlotLoginLimbo 0x10011a6c.
+    LoginLimbo { timeout: i32, info: CharacterInfo },
 }
 
 impl Message {
@@ -292,12 +306,24 @@ impl Message {
             Message::CharacterCreated { .. } => CHARACTER_CREATED,
             Message::NameInUse(_) => NAME_IN_USE,
             Message::RequestRejected(_) => REQUEST_REJECTED,
+            Message::ProtocolNotOk => PROTOCOL_NOT_OK,
+            Message::LoginIgnored => LOGIN_IGNORED,
+            Message::LoginParameters(_) => LOGIN_PARAMETERS,
+            Message::LoginLimbo { .. } => LOGIN_LIMBO,
         }
     }
 
     pub fn encode_body(&self) -> Vec<u8> {
         let mut w = Writer::default();
         match self {
+            Message::ProtocolNotOk | Message::LoginIgnored => {}
+            Message::LoginParameters(values) => {
+                for value in values { w.i32(*value); }
+            }
+            Message::LoginLimbo { timeout, info } => {
+                w.i32(*timeout);
+                info.write(&mut w);
+            }
             Message::UserLogin { protocol, name, client_version } => {
                 w.i32(*protocol);
                 w.fixed_str(name, 40);
@@ -361,6 +387,19 @@ impl Message {
     pub fn decode(msg_type: u32, body: &[u8]) -> Result<Message> {
         let mut r = Reader::new(body);
         Ok(match msg_type {
+            PROTOCOL_NOT_OK => Message::ProtocolNotOk,
+            LOGIN_IGNORED => Message::LoginIgnored,
+            LOGIN_PARAMETERS => {
+                let values = [r.i32()?, r.i32()?, r.i32()?];
+                if r.remaining() != 0 { bail!("trailing login parameter bytes"); }
+                Message::LoginParameters(values)
+            }
+            LOGIN_LIMBO => {
+                let timeout = r.i32()?;
+                let info = CharacterInfo::read(&mut r)?;
+                if r.remaining() != 0 { bail!("trailing login limbo bytes"); }
+                Message::LoginLimbo { timeout, info }
+            }
             USER_LOGIN => Message::UserLogin {
                 protocol: r.i32()?,
                 name: r.fixed_str(40)?,
@@ -656,4 +695,36 @@ mod tests {
         rt(Message::SuggestName("Zed".into()));
         rt(Message::SuggestName(String::new()));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn retained_login_native_bodies_are_bounded_and_share_character_info() {
+    let parameters = [0x80000000_u32, 42, 0x7fffffff].into_iter().flat_map(u32::to_be_bytes).collect::<Vec<_>>();
+    assert_eq!(Message::decode(0x30, &parameters).unwrap(), Message::LoginParameters([i32::MIN, 42, i32::MAX]));
+    for n in 0..12 { assert!(Message::decode(0x30, &parameters[..n]).is_err()); }
+    let mut extra = parameters;
+    extra.push(0);
+    assert!(Message::decode(0x30, &extra).is_err());
+    // Native 0x20/0x23 read no body, even if opaque trailing bytes exist.
+    assert_eq!(Message::decode(0x20, &[1, 2]).unwrap(), Message::ProtocolNotOk);
+    assert_eq!(Message::decode(0x23, &[1, 2]).unwrap(), Message::LoginIgnored);
+    let mut w = Writer::default();
+    // timeout, v5, id, org, name length/name, breed/gender/profession/level,
+    // area length, banned, ban reason length, head/height/width.
+    for value in [10, 5, 77, 3, 1] { w.i32(value); }
+    w.bytes(b"X");
+    for value in [1, 2, 6, 33, 0, 0, 0, 4, 100, 90] { w.i32(value); }
+    let info = CharacterInfo { id: 77, org_instance: 3, name: "X".into(), breed: 1, gender: 2, profession: 6, level: 33, head: 4, height: 100, width: 90, ..Default::default() };
+    assert_eq!(Message::decode(0x4e, &w.0).unwrap(), Message::LoginLimbo { timeout: 10, info: info.clone() });
+    for n in 0..w.0.len() { assert!(Message::decode(0x4e, &w.0[..n]).is_err(), "{n}"); }
+    let mut malformed = w.0.clone();
+    malformed[16..20].copy_from_slice(&(-1_i32).to_be_bytes());
+    assert!(Message::decode(0x4e, &malformed).is_err());
+    w.u8(0);
+    assert!(Message::decode(0x4e, &w.0).is_err());
+    let entry = CharacterEntry { id: 77, info: info.clone(), ..Default::default() };
+    let list = Message::CharacterList(CharacterList { characters: vec![entry], ..Default::default() });
+    let Message::CharacterList(decoded) = Message::decode(0x0e, &list.encode_body()).unwrap() else { panic!() };
+    assert_eq!(decoded.characters[0].info, info);
 }

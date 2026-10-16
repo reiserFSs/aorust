@@ -324,3 +324,34 @@ fn launcher_server_files_precede_api_and_survive_api_failure() {
     }).is_err());
     std::fs::remove_dir(dir).unwrap();
 }
+
+#[test]
+fn retained_login_replies_consume_ignore_enter_limbo_and_fail_fatally() {
+    let (l, s) = start(login_server_pub());
+    let mut srv = Fake::accept(&l);
+    srv.send(&Message::LoginParameters([i32::MIN, 42, i32::MAX]));
+    srv.send(&Message::LoginIgnored);
+    let info = entry(77).info;
+    srv.send(&Message::LoginLimbo { timeout: -1, info: info.clone() });
+    assert_eq!(
+        events_until(&s, |e| matches!(e, LoginEvent::LoginLimbo { .. })),
+        [LoginEvent::LoginLimbo { timeout: 10, info }],
+    );
+    s.select_character(77);
+    assert_eq!(srv.recv(), Message::SelectCharacter { char_id: 77 });
+    srv.send(&Message::ProtocolNotOk);
+    let events = events_until(&s, |e| matches!(e, LoginEvent::ProtocolNotOk));
+    assert_eq!(events.last(), Some(&LoginEvent::ProtocolNotOk));
+    assert_eq!(s.events.recv_timeout(Duration::from_secs(2)), Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+}
+
+#[test]
+fn malformed_retained_login_bodies_disconnect_instead_of_hanging() {
+    for id in [0x30, 0x4e] {
+        let (l, s) = start(login_server_pub());
+        let mut srv = Fake::accept(&l);
+        srv.raw(&Frame::system(1, 0, 0, id, &[0; 3]).encode().unwrap());
+        let events = events_until(&s, |e| matches!(e, LoginEvent::Disconnected(_)));
+        assert!(matches!(events.as_slice(), [LoginEvent::Disconnected(_)]));
+    }
+}

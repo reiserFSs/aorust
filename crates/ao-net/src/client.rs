@@ -9,7 +9,7 @@
 use crate::conn::{Conn, Tap};
 use crate::crypto::{login_server_pub, make_challenge_response_with};
 use crate::frame::{Frame, PT_SYSTEM};
-use crate::msg::{CharacterList, CreateCharacterRequest, Message, REQUEST_REJECTED};
+use crate::msg::{CharacterInfo, CharacterList, CreateCharacterRequest, Message, REQUEST_REJECTED};
 use anyhow::{anyhow, bail, Result};
 use num_bigint::BigUint;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -99,6 +99,10 @@ fn parse_server_entries(v: &serde_json::Value) -> Result<Vec<ServerEntry>> {
 pub enum LoginEvent {
     Status(String),
     CharacterList(CharacterList),
+    /// Fatal native ErrorHandling_t path; ends the session without a second disconnect.
+    ProtocolNotOk,
+    /// SlotLoginLimbo: show the supplied character and a timeout of at least ten seconds.
+    LoginLimbo { timeout: i32, info: CharacterInfo },
     /// After this the session thread ends silently (no `Disconnected`).
     LoginError { code: u32, message: String },
     /// Reply 0x21 (`RequestRejected`, client `AFCM::Send(10,0x11f)` + `SlotLoginReply(0x21, detail)`): `code` is the
@@ -279,6 +283,16 @@ fn run(
             continue;
         }
         match Message::from_frame(&f) {
+            Ok(Message::ProtocolNotOk) => {
+                send(LoginEvent::ProtocolNotOk);
+                return Ok(true);
+            }
+            // Native InvalidResponseHandle consumes all three ints but emits no reply.
+            Ok(Message::LoginParameters(_)) | Ok(Message::LoginIgnored) => {}
+            Ok(Message::LoginLimbo { timeout, info }) => {
+                phase = Phase::Listed;
+                send(LoginEvent::LoginLimbo { timeout: timeout.max(10), info });
+            }
             Ok(Message::ServerSalt(salt)) if phase == Phase::SentLogin => {
                 let Some(pw) = password.take() else { bail!("salt without pending login") };
                 let (mut e, mut p) = ([0u8; 16], [0u8; 8]);
@@ -350,6 +364,7 @@ fn run(
                 return zone(z, tap, cmds, ev).map(|()| false);
             }
             Ok(m) => send(LoginEvent::Status(format!("login server: {m:?}"))),
+            Err(e) if f.system_parts().is_ok_and(|(id, _)| matches!(id, 0x30 | 0x4e)) => return Err(e),
             Err(_) => send(LoginEvent::Status(format!(
                 "login server frame ptype={:#x} id={:#x?} ({} bytes) not decoded",
                 f.ptype,
