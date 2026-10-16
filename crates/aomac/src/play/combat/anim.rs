@@ -567,6 +567,12 @@ pub const STAT_DEATH_ANIM: u32 = 0x183;
 /// Searched GC 0x1005ae91 / asm 0x1005af00: writes Health 0, not a default for
 /// 0x183; GC 0x1007b2ba reads that stat. Its initial value remains unproven.
 pub const DEFAULT_DEATH_ANIM: u16 = 503;
+/// JumpStop1006d821 chooses from movement intent, never the weapon's AnimSet.
+pub fn landing_anim(mode: u32, forward: bool, strafe: bool) -> Option<u16> {
+    if !forward { return Some(if strafe { 0xb9 } else { 0xbb }); }
+    match mode { 2 | 6 => Some(0xb9), 3 => Some(0xba), 4 => Some(0x85), _ => None }
+}
+
 /// `CharacterActionIIR_t` action of a character being struck (`FUN_1005d0d8` case 0x5b).
 pub const ACTION_HIT: i32 = 0xd1;
 /// Seconds `CharDie_t` waits (`_DAT_1015d69c` = 3.0f): after that the control character sends `CharacterAction 0x98`

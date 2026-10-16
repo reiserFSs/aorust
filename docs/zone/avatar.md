@@ -118,8 +118,7 @@ appearance/attractors, not fabricated weapon models. Parent Motion7 reports all
 48 PNGs rendered and inspected: ordinary/rifle `before` remained upright through
 400 ms, while `after` showed a running stride at200–400 ms; the0 ms fade did not
 pop. This is port before/after evidence, **not a retail-window capture**.
-Jump/emote one-shot flags outside this movement path remain the previously
-documented unresolved per-clip policy.
+Jump/emote playback policy is producer-defined, not a per-file flag: GC `1006d792` starts jump0x9c/0x9d through `1006d3ad` with direction0, count−1 and interval2 (authored loopstart..loopend). JumpStop `1006d821` selects185/186/187 by actual movement intent, **not** a rifle-specific guess, and plays count1/interval1 (0..loopstart, total when absent), then immediately resumes movement. Own and remote bodies use this policy; landing uses an independent finite intro action over the resumed body. Social `10010d83` explicitly uses count1, priority−2 and full time0..total. Regressions cover authored loop clocks, finite landing intro/land notes and intent selection.
 
 **Playback rate (RE).** `FUN_1006fb56` (Gamecode 0x1006fb56, called with `(abstract clip id, play handle, speed, forced)` by
 `FUN_1006be27` (role -> clip), `FUN_1006d3ad` and `FUN_1006fc8e`) sets the speed scale of a freshly started clip to
@@ -132,7 +131,7 @@ if (rate > 0) SetSpeedScale(handle, rate)   // else the authored rate 1.0
 
 * `mesh` = stat 0xC of the dynel (`FUN_10057c75`), `clip` = the **AbstractAnimID** passed by the Play caller, not the selected CAT/RDB id. Calibration comes from `AnimCalibrationControl_t`
   (GC constructor 0x10020f52 → 0x100019f3 → loader 0x1000182c, from `Setupf/animcalibration.txt`; lookup 0x100017f7 returns 1.0 for a missing pair). Loader 0x1000182c parses both keys with `atoi` and inserts the pair through 0x10001d03; neither loader nor lookup converts CAT ids to AbstractAnimIDs. Thus file entries `5907 10191 0.90` / `5907 10194 1.15` do **not** match the ordinary walk/run caller's 0x64 / 0x65. Both own-avatar and NPC calibration now use abstract keys, removing the previous unsupported `source_id` lookup.
-  Duplicate pairs (the file has some): last wins - **[GUESS]**, insert policy not traced.
+  Duplicate pairs are **last wins [CODE]**: loader `1000182c` calls map operator[] `10001d03` then unconditionally writes the parsed factor. The helper returns an existing node's +0x14 value, inserting only a missing key. Existing `calibration_file_parses` checks the duplicate overwrite.
 * `100 / MonsterScale` is 1.0 when the stat is 0 (`_DAT_10158670` = 100.0 double).
 * `speed` = `Vehicle_t+0x3c` (maximum velocity of the movement mode, m/s; current speed is `+0xcc`, Vehicle `FUN_1000e3d3` / `SetVel` 0x1000a4e1), `ref_speed` = `Vehicle_t+0x170`, set by `FUN_1006f4a2` from the movement mode
   (`FUN_100704e6`) and sub-mode (`FUN_100704ee`): mode 3/sub 2 and mode 4 -> 3.0 (`_DAT_1015d69c`), mode 3 otherwise -> 5.0

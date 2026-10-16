@@ -536,7 +536,7 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
         }
     }
     // Resolve posture transitions with the model, not after the first visible sit/stand.
-    for &id in STANCE_IDS.iter().chain([0xd5, 0xd6, 0xed, 0xef, 0x68, 0x69].iter()) {
+    for &id in STANCE_IDS.iter().chain([0xd5, 0xd6, 0xed, 0xef, 0x68, 0x69, 0xb9, 0xba, 0xbb, 0x85].iter()) {
         let ids: Vec<u32> = match &rec {
             Some(rec) if matches!(id, 0xd5 | 0xd6 | 0xed | 0xef | 0x68 | 0x69) => ao_formats::character::anim_key_variants(rec, id as u32).to_vec(),
             Some(rec) => ao_formats::character::holder_variants(rec, id as u32).to_vec(),
@@ -786,7 +786,7 @@ fn advance_clip_clock(ms: &mut f32, rate: &mut f32, dt: f32, started: bool, star
 }
 
 fn movement_loop(state: AnimState) -> bool {
-    matches!(state, AnimState::Idle | AnimState::Walk | AnimState::WalkBack | AnimState::WalkLeft | AnimState::WalkRight | AnimState::Run | AnimState::RunBack | AnimState::TurnLeft | AnimState::TurnRight | AnimState::Swim | AnimState::IdleSwim | AnimState::SitGround | AnimState::Sleep | AnimState::Lounge | AnimState::IdleCrawl)
+    matches!(state, AnimState::Idle | AnimState::Walk | AnimState::WalkBack | AnimState::WalkLeft | AnimState::WalkRight | AnimState::Run | AnimState::RunBack | AnimState::TurnLeft | AnimState::TurnRight | AnimState::Swim | AnimState::IdleSwim | AnimState::SitGround | AnimState::Sleep | AnimState::Lounge | AnimState::IdleCrawl | AnimState::JumpStand | AnimState::JumpForward)
 }
 
 /// GC 0x1006be27 -> 0x100108be interval mode 2 applies to remote characters too.
@@ -921,6 +921,7 @@ pub struct Dynels {
     effects: Option<super::combat::effects::Renderer>,
     /// GC1007b58c stores own WhiteOut at the character effect controller +0x9c.
     death_whiteout: Option<u32>,
+    pending_landings: Vec<(i32, u16)>,
     pending_effects: Vec<ao_net::n3::effects::Effects>,
     /// Visual spell applications wait until the own animated connectors are available.
     nano_visuals: Vec<ao_net::n3::spells::ApplySpells>,
@@ -1085,6 +1086,7 @@ impl Default for Dynels {
             slot_hits: HashMap::new(),
             effects: None,
             death_whiteout: None,
+            pending_landings: Vec::new(),
             pending_effects: vec![],
             nano_visuals: vec![],
             nano_handles: vec![],
@@ -1333,6 +1335,7 @@ impl Dynels {
         self.impact_locations.clear();
         self.nano_visuals.clear();
         self.pending_effects.clear();
+        self.pending_landings.clear();
         self.nano_handles.clear();
         self.buff_nanos.clear();
         self.buff_visuals.clear();
@@ -1471,6 +1474,15 @@ impl Dynels {
     /// Original producer's layer wins over the generic name-table mapping.
     pub fn play_action(&mut self, id: i32, anim_id: u32, layer: canim::Layer, priority: i32) {
         self.start_node(id, ActionAnim { id: anim_id, layer, priority, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None, posture: false, before_body: false });
+    }
+
+    fn play_landing(&mut self, id: i32, anim: u16) {
+        self.play_action(id, u32::from(anim), canim::Layer::Body, 0);
+        if let Some(character) = self.chars.get_mut(&id) {
+            if let Some(action) = character.actions.iter_mut().rev().find(|action| action.priority == 0 && action.id == u32::from(anim)) {
+                action.posture = true;
+            }
+        }
     }
 
     fn start_node(&mut self, id: i32, mut node: ActionAnim) {
@@ -2671,6 +2683,7 @@ impl Dynels {
 
     pub fn on_message(&mut self, m: &Message) {
         let who = m.header.target;
+        let was_jumping = self.chars.get(&who.instance).is_some_and(|character| character.mover.status().jumping);
         if m.header.msg_type == ao_net::n3::server_move::RESURRECT && who.kind == CHAR_KIND && who.instance == self.own {
             if let N3::Unknown(body) = &m.body {
                 if ao_net::n3::server_move::parse_resurrect(body).is_ok() {
@@ -2985,12 +2998,18 @@ impl Dynels {
         }
         if let Some(c) = self.chars.get_mut(&who.instance) {
             c.pose = remote_pose(&mut c.mover, self.collision.as_ref(), 0.0);
+            let status = c.mover.status();
+            if who.instance != self.own && was_jumping && !status.jumping {
+                if let Some(anim) = canim::landing_anim(status.mode as u32, status.forward != 0, status.strafe != 0) {
+                    self.pending_landings.push((who.instance, anim));
+                }
+            }
         }
     }
 
     /// Integrates the movement of every character by `dt` seconds (the drawn pose and animation state).
     pub fn advance(&mut self, dt: f32) {
-        for c in self.chars.values_mut() {
+        for (&id, c) in &mut self.chars {
             if !matches!(c.special, Special::Die(_)) {
                 if let Some(Model::Ready { built, .. }) = self.models.get(&c.key) {
                     if let Some(rig) = &built.rig {
@@ -3000,9 +3019,17 @@ impl Dynels {
                         } else { radius }) * c.scale);
                     }
                 }
+                let was_jumping = c.mover.status().jumping;
                 c.pose = remote_pose(&mut c.mover, self.collision.as_ref(), dt);
+                let status = c.mover.status();
+                if id != self.own && was_jumping && !status.jumping {
+                    if let Some(anim) = canim::landing_anim(status.mode as u32, status.forward != 0, status.strafe != 0) {
+                        self.pending_landings.push((id, anim));
+                    }
+                }
             }
         }
+        while let Some((id, anim)) = self.pending_landings.pop() { self.play_landing(id, anim); }
     }
 
     /// Scene replacement can arrive after the playfield notification and erase already queued uploads.
@@ -3866,7 +3893,7 @@ mod tests {
             fired = next_cycle;
             assert!(super::super::combat::notes::fire(&clip.events, start, &mut fired).next().is_none(), "wrapping does not replay the intro footstep");
         }
-        assert_eq!(movement_interval(&clip, AnimState::JumpForward), (0.0, 0), "one-shot jump playback is not a movement loop interval");
+        assert_eq!(movement_interval(&clip, AnimState::JumpForward), movement_interval(&clip, AnimState::Run), "JumpStart1006d792 uses the same infinite interval2 policy");
         let unmarked = CatAnim { events: vec![], ..clip };
         assert_eq!(movement_interval(&unmarked, AnimState::Run), (0.0, 0));
     }

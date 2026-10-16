@@ -99,9 +99,6 @@ pub(super) struct Player {
     clip_scale: Option<f32>,
     /// The pose the movement role showed last frame (`None` before the first update).
     pose: Option<Pose>,
-    /// Whether the movement FSM was airborne last frame (`None` before the first update): the edge into grounded plays
-    /// the jump-landing clip once (`jump-land-{walk,run,idle}`, `combat::anim::ANIMS` 185..187; `FUN_10045069`'s `land` note).
-    was_airborne: Option<bool>,
     /// The AnimHolder's fight idle is on (`combat/glue.rs::stance`: set by the draw of a fight start, cleared by the holster of a fight stop); the
     /// character then stands in the weapon's fight idle, bare-handed in the fighting stance.
     pub fighting: bool,
@@ -192,7 +189,6 @@ impl Player {
                 cast_restart: false,
                 clip_scale: None,
                 pose: None,
-                was_airborne: None,
                 fighting: false,
                 fight,
                 zones,
@@ -570,6 +566,7 @@ impl Player {
             }
             if let Some(scale) = s(0x168) { st.monster_scale = scale + zone.monster_scale_bonus; }
         });
+        let was_jumping = self.movement.fsm().jump == 3;
         self.apply_own_events(zone);
         // `FUN_10070fee`: the target branch re-runs the Features / district gate every frame and reads the target's `GetRelPos`
         if let Some(t) = self.movement.chase_target() {
@@ -646,11 +643,12 @@ impl Player {
         // the airborne->grounded edge plays the jump-landing clip once over the resuming movement pose (`jump-land-*`);
         // the clip's own `land` note then plays the ground-material footstep thud (`FUN_10045069`).
         let grounded = self.movement.grounded();
-        if self.was_airborne == Some(true) && grounded && self.cast_loop.is_none() {
-            let two_h = zone.world.wielded_set(self.char_id as i32) == Some(super::combat::anim::anim_set::RIFLE);
-            self.play(Role::Clip(jump_land_clip(&role, two_h).into()), false);
+        if was_jumping && self.movement.fsm().jump != 3 && grounded && self.cast_loop.is_none() {
+            let fsm = self.movement.fsm();
+            if let Some(id) = super::combat::anim::landing_anim(u32::from(fsm.mode), fsm.fwd == 2, fsm.strafe == 2) {
+                if let Err(error) = self.avatar.play_intro_action(&self.store, id) { eprintln!("avatar landing: {error:#}"); }
+            }
         }
-        self.was_airborne = Some(!grounded);
         // emotes and swings end with their clip or when the character moves; a death clip holds until `stand`
         if self.cast_loop != Some(true) && !self.cast_restart && self.transient.as_ref().is_some_and(|(_, hold)| !hold && (self.avatar.finished() || (self.cast_loop.is_none() && moving))) {
             self.transient = None;
@@ -911,16 +909,6 @@ pub(super) fn effect_collision(c: &Collision, p: ao_render::Vec3) -> Option<(ao_
     Some((ao_render::Vec3::from_array(point), ao_render::Vec3::from_array(hit.normal)))
 }
 
-/// Jump-landing clip name for the resuming movement intent (`combat::anim::ANIMS` 185..190, `FUN_10045069`'s `land` note
-/// lives in these, never in the takeoff `jump-stand`/`jump-forward` clips): walk / run / idle, `-2h` while a rifle is
-/// wielded (the only `AnimSet` with its own walk/run locomotion clips, [`super::avatar`]'s `wield_walk_run`).
-fn jump_land_clip(role: &Role, two_h: bool) -> &'static str {
-    match role {
-        Role::Walk | Role::Sneak | Role::WalkBack | Role::WalkLeft | Role::WalkRight => if two_h { "jump-land-walk-2h" } else { "jump-land-walk" },
-        Role::Run => if two_h { "jump-land-run-2h" } else { "jump-land-run" },
-        _ => if two_h { "jump-land-idle-2h" } else { "jump-land-idle" },
-    }
-}
 
 fn fight_target_position(zone: &Zone, own: i32, own_pos: [f32; 3]) -> Option<[f32; 3]> {
     let target = *zone.fight_target.get(&own)?;
@@ -1402,13 +1390,14 @@ mod tests {
     }
 
     #[test]
-    fn jump_land_clip_picks_walk_run_idle_and_the_rifle_2h_variant() {
-        assert_eq!(jump_land_clip(&Role::Walk, false), "jump-land-walk");
-        assert_eq!(jump_land_clip(&Role::Run, false), "jump-land-run");
-        assert_eq!(jump_land_clip(&Role::Idle, false), "jump-land-idle");
-        assert_eq!(jump_land_clip(&Role::Walk, true), "jump-land-walk-2h");
-        assert_eq!(jump_land_clip(&Role::Run, true), "jump-land-run-2h");
-        assert_eq!(jump_land_clip(&Role::Idle, true), "jump-land-idle-2h");
+    fn jump_landing_uses_native_intent_not_weapon_variants() {
+        use super::super::combat::anim::landing_anim;
+        assert_eq!(landing_anim(2, true, false), Some(0xb9));
+        assert_eq!(landing_anim(3, true, false), Some(0xba));
+        assert_eq!(landing_anim(3, false, false), Some(0xbb));
+        assert_eq!(landing_anim(3, false, true), Some(0xb9));
+        assert_eq!(landing_anim(4, true, false), Some(0x85));
+        assert_eq!(landing_anim(5, true, false), None);
     }
 
     /// The own avatar's model/rig does not change on a zone change (`zone-preload-proposal.md` §2.1: resolving the

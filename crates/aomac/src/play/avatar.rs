@@ -89,7 +89,7 @@ impl Calibration {
         std::fs::read_to_string(client_dir.join("Setupf/animcalibration.txt")).map(|t| Self::parse(&t)).unwrap_or_default()
     }
 
-    /// A pair listed twice keeps its last line ([GUESS]: the table's insert policy was not traced).
+    /// GC1000182c writes through map operator[]10001d03 unconditionally: the last duplicate wins.
     pub fn parse(text: &str) -> Self {
         let mut m = HashMap::new();
         for l in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
@@ -156,10 +156,10 @@ impl AvatarLook {
     }
 }
 
-/// Roles that play once and hold their last frame (the jump arcs, emotes, combat swings and death clips); every other clip
-/// loops. [GUESS]: derived from the clip names, the original's per-clip loop flags were not traced (docs/zone/avatar.md §4).
+/// Native producers choose playback count, not clip files: JumpStart1006d792 loops
+/// interval2; social10010d83 plays once; cast-start remains an explicit loop.
 fn one_shot(r: &Role, cast_loop: bool) -> bool {
-    !cast_loop && matches!(r, Role::JumpStand | Role::JumpForward | Role::Emote(_) | Role::Clip(_))
+    !cast_loop && matches!(r, Role::Emote(_) | Role::Clip(_))
 }
 
 /// The clip name of the weapon stance of `AnimSet` `set` for movement role `r`: the idle while not fighting is the equip routine's (`FUN_1009c858`:
@@ -180,7 +180,7 @@ fn stance_clip(set: i32, r: &Role) -> Option<String> {
 /// Movement playback uses interval mode 2 (GC 0x1006be27 -> 0x1003c392 -> 0x100108be):
 /// start at `loopstart`, loop to `loopend`; no separate run-start clip or inherited gait phase.
 fn movement_loop(r: &Role) -> bool {
-    matches!(r, Role::Idle | Role::SitGround | Role::Walk | Role::WalkBack | Role::WalkLeft | Role::WalkRight | Role::Run | Role::RunBack | Role::Swim | Role::IdleSwim)
+    matches!(r, Role::Idle | Role::SitGround | Role::Walk | Role::WalkBack | Role::WalkLeft | Role::WalkRight | Role::Run | Role::RunBack | Role::Swim | Role::IdleSwim | Role::JumpStand | Role::JumpForward)
         || matches!(r, Role::Clip(name) if name == "turn-left" || name == "turn-right")
 }
 
@@ -559,6 +559,17 @@ impl Avatar {
         Ok(true)
     }
 
+    /// GC1006d821: finite interval1 landing over the immediately resumed movement body.
+    pub fn play_intro_action(&mut self, store: &RecordStore, id: u16) -> Result<()> {
+        if self.play_action(store, id, Some(0), 0)? {
+            if let Some(action) = self.actions.iter_mut().rev().find(|action| action.priority == 0) {
+                action.duration = posture_interval_end(&action.clip);
+                action.posture = true;
+            }
+        }
+        Ok(())
+    }
+
     pub fn play_swing(&mut self, store: &RecordStore, role: Role, delay: Option<i32>, key: u16, slot: i32) -> Result<()> {
         if self.actions.iter().any(|a| a.key == Some(key)) {
             return Ok(());
@@ -751,7 +762,7 @@ impl Avatar {
         }
     }
 
-    /// Whether a one-shot clip (jump) has played to its end.
+    /// Whether the current finite body action has played to its end.
     pub fn finished(&self) -> bool {
         self.one_shot() && self.clip.as_ref().is_none_or(|a| self.ms >= a.duration)
     }
@@ -1361,9 +1372,11 @@ pub(super) mod tests {
             steps += avatar.take_notes().iter().filter(|n| n.id == super::super::combat::notes::id::STEP).count();
         }
         assert!(steps >= 2, "a 10 s walk must cross several step markers more than once (got {steps})");
-        avatar.set_pose(&store, AvatarPose::still(Role::Clip("jump-land-idle".into()))).unwrap();
+        avatar.play_intro_action(&store, 0xbb).unwrap();
+        let action = avatar.actions.iter().find(|action| action.priority == 0).unwrap();
+        assert_eq!(action.duration, posture_interval_end(&action.clip), "JumpStop uses finite interval1");
         let mut landed = 0;
-        while !avatar.finished() {
+        while avatar.actions.iter().any(|action| action.priority == 0) {
             avatar.update(0.05);
             landed += avatar.take_notes().iter().filter(|n| n.id == super::super::combat::notes::id::LAND).count();
         }
@@ -1819,11 +1832,12 @@ pub(super) mod tests {
         assert_eq!(i.len(), r.len());
         assert!(i.iter().zip(r.iter()).any(|(x, y)| x.pos != y.pos), "run moved nothing");
         assert!(a.height() > 1.4 && a.height() < 2.2, "{}", a.height());
-        // jump plays once and reports it
+        // JumpStart1006d792 loops interval2 until the movement producer lands.
         a.set_pose(&store, AvatarPose::still(Role::JumpStand)).unwrap();
         assert!(!a.finished());
         a.update(30.0);
-        assert!(a.finished());
+        assert!(!a.finished(), "JumpStart is an infinite producer request, not a clip flag");
+        assert!(movement_loop(&a.pose.role));
 
         if let Some(png) = std::env::var_os("AVATAR_SHOT") {
             let pos = super::super::zone::scene_pos(u.pos);
