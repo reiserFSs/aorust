@@ -344,6 +344,8 @@ impl Pilot {
     }
 
     fn set(&mut self, p: &mut Play, host: &mut Host, want: Vec<&'static str>) {
+        // Play drops presses until Alive; only remember keys that can actually reach the player.
+        let want = if p.game_input_open() { want } else { vec![] };
         for k in self.held.clone() {
             if !want.contains(&k) {
                 p.game_input(GameInput::Key { code: code(k), pressed: false, repeat: false }, host);
@@ -1906,6 +1908,45 @@ mod pilot_tests {
         assert_eq!(straight.idx(), 4);
         let mut endpoint = Pilot::new(vec![(1.0, 2.0)]);
         assert_eq!(endpoint.walking_offset([1.0, 0.0, 2.0], 0.0), None);
+    }
+
+    #[test]
+    fn installed_icc_prior_route_advances_past_the_stalled_lookahead() {
+        let Ok(store) = ao_rdb::RecordStore::open(&ao_gui::client_dir()) else { return };
+        let Ok(col) = ao_formats::playfield::collision::Collision::load(&store, 4582) else { return };
+        // Reconstruct the original goto, not a new route starting at the stalled pose.
+        let path = super::route(&col, [977.61, 23.41, 873.79], (920.0, 743.0), &[], 0.0);
+        eprintln!("prior ICC route: {} cells, goal {:?}", path.len(), path.last());
+        for (i, point) in path.iter().enumerate().skip(453).take(13) {
+            eprintln!("prior ICC path[{i}] = {point:?}");
+        }
+        assert_eq!(path.last(), Some(&(920.0, 743.0)), "must reach the goal without the unordered fallback");
+        // The reached-goal BFS has fixed neighbour order; the live log reported cell456/488.
+        assert_eq!(path.len(), 488, "original logged route length");
+        let yaw: f32 = -2.21;
+        let (s, c) = yaw.sin_cos();
+        // The log rounded the stalled pose to two decimals, so its exact coordinates
+        // are unavailable. Include the printed pose and samples inside its rounding bin.
+        let mut reached_lookaheads = 0;
+        for x_offset in [-0.004, 0.0, 0.004] {
+            for z_offset in [-0.004, 0.0, 0.004] {
+                let pos = [920.28 + x_offset, 23.02, 756.96 + z_offset];
+                let mut pilot = Pilot::new(path.clone());
+                pilot.i = 456;
+                let dist = |c: (f32, f32)| (c.0 - pos[0]).abs() + (c.1 - pos[2]).abs();
+                assert!(dist(pilot.path[457]) > dist(pilot.path[456]), "nearest-waypoint advancement must remain blocked");
+                let (dx, dz) = (pilot.path[459].0 - pos[0], pilot.path[459].1 - pos[2]);
+                let reached = (dx * s + dz * c).abs() <= 0.2 && (-dx * c + dz * s).abs() <= 0.2;
+                let (fwd, left) = pilot.walking_offset(pos, yaw).expect("the route is not finished");
+                eprintln!("prior ICC sampled pos={pos:?} reached={reached}: index={} fwd={fwd} left={left}", pilot.idx());
+                if reached {
+                    reached_lookaheads += 1;
+                    assert!(pilot.idx() >= 459, "must consume the reached lookahead");
+                }
+                assert!(fwd.abs() > 0.2 || left.abs() > 0.2, "must hold a movement key instead of idling");
+            }
+        }
+        assert!(reached_lookaheads > 0, "the logged rounding bin must exercise a reached lookahead");
     }
 
 

@@ -1395,6 +1395,71 @@ fn autopilot_crosses_the_arrival_hall() {
     eprintln!("arrived after {frames} frames at {:?}", r.p.zone.own().unwrap().pos);
 }
 
+/// Exact ICC ramp stalls, through the recorded own character's real movement and pf4582 collision.
+#[test]
+fn autopilot_escapes_the_icc_ramp_stalled_poses() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 25988 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_ithaca.rec")));
+    r.enter();
+    for _ in 0..30 { r.p.frame(0.016, (1280, 800), &mut r.host); }
+    assert_eq!(r.p.zone.playfield, Some(4582));
+    assert!(r.p.game_input_open());
+    let collision = r.p.player.as_ref().unwrap().effect_surface().expect("actual pf4582 collision");
+
+    for (start, yaw, goal) in [
+        ([921.12256, 22.818768, 751.18134], 2.0, (920.28, 756.96)),
+        ([920.28, 23.02, 756.96], -2.21, (920.0, 743.0)),
+    ] {
+        r.p.game_input(ao_render::GameInput::FocusLost, &mut r.host);
+        r.p.zone.own_events.push(zone::OwnEvent::Place { pos: start, yaw, full_reset: true });
+        // Apply the placement through Player into Movement, then publish Movement's pose to Zone.
+        // A zero-time frame preserves the reported height rather than grounding it before Pilot sees it.
+        r.p.player.as_mut().unwrap().frame(0.0, &mut r.host, &mut r.p.zone, false);
+        assert!(r.p.zone.own_events.is_empty());
+        let own = r.p.zone.own().unwrap();
+        assert_eq!(own.pos, start, "Movement must receive the exact reported start");
+        assert!((own.yaw.unwrap() - yaw).abs() < 1e-6, "Movement heading {:?}, expected {yaw}", own.yaw);
+
+        let path = live::route(&collision.borrow(), own.pos, goal, &[], 0.0);
+        let end = ((goal.0 * 2.0).round() / 2.0, (goal.1 * 2.0).round() / 2.0);
+        assert_eq!(path.last(), Some(&end), "route must reach the requested goal, not a nearest reachable fallback");
+        eprintln!("ICC start={start:?} yaw={yaw} goal={goal:?} path={} first={:?}", path.len(), &path[..path.len().min(20)]);
+        let mut pilot = live::Pilot::new(path);
+        // The live goto was dispatched before Alive opened game input. Dropped key presses
+        // must not become Pilot's held state, or reopening the gate never sends them again.
+        r.p.awaiting_alive = true;
+        assert!(!r.p.game_input_open());
+        for _ in 0..3 {
+            assert!(!pilot.step(&mut r.p, &mut r.host));
+            assert!(pilot.held().is_empty(), "closed input recorded dropped presses: {:?}", pilot.held());
+            r.p.frame(0.016, (1280, 800), &mut r.host);
+            let own = r.p.zone.own().unwrap();
+            // Ground alignment may settle Y; the closed gate must not move or turn the player.
+            assert_eq!([own.pos[0], own.pos[2]], [start[0], start[2]]);
+            assert!((own.yaw.unwrap() - yaw).abs() < 1e-6);
+        }
+        r.p.awaiting_alive = false;
+        assert!(r.p.game_input_open());
+        let mut frames = 0;
+        while !pilot.step(&mut r.p, &mut r.host) {
+            r.p.frame(0.016, (1280, 800), &mut r.host);
+            frames += 1;
+            let own = r.p.zone.own().expect("route must not finish by losing the own dynel");
+            if frames % 30 == 0 && frames <= 300 {
+                eprintln!("ICC f{frames} pos={:?} yaw={:?} held={:?} idx={}", own.pos, own.yaw, pilot.held(), pilot.idx());
+            }
+            assert!(frames < 12000, "ICC stuck: start={start:?} yaw={yaw} goal={goal:?} pos={:?} current_yaw={:?} held={:?} idx={}", own.pos, own.yaw, pilot.held(), pilot.idx());
+        }
+        let own = r.p.zone.own().expect("arrival requires the own dynel");
+        assert!((own.pos[0] - end.0).abs() + (own.pos[2] - end.1).abs() < 0.6,
+            "false arrival: pos={:?} goal={goal:?} held={:?} idx={}", own.pos, pilot.held(), pilot.idx());
+        assert!((own.pos[0] - goal.0).abs() + (own.pos[2] - goal.1).abs() < 1.0,
+            "missed requested goal: pos={:?} goal={goal:?}", own.pos);
+        eprintln!("ICC arrived after {frames} frames pos={:?} yaw={:?} held={:?} idx={}", own.pos, own.yaw, pilot.held(), pilot.idx());
+    }
+}
+
 /// The live harness' `press=F8` and `drag=right:dx:dy`, headless: the player lens has the client's near plane, F8 puts the camera at the
 /// head (first person), a right drag turns the character by `counts / 1000 * MouseTurnSensitivity` radians (docs/zone/camera.md §4, §5).
 #[test]
