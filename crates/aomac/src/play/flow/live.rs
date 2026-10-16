@@ -10,6 +10,7 @@
 //! `move=x:y` hover; `click`, `rightclick`, `doubleclick` take `[shift+|ctrl+|alt+]x:y` (prefixes may combine), through GUI mouse input.
 //! `clickdyn=<instance>` world click on a dynel, `mdrag=x1:y1:x2:y2` GUI drag, `watch=secs` own-stat changes.
 //! `rightclickitem=<slot hex>` real right-click on the bag/wear cell currently showing `inv`'s slot (bug 10 equip/unequip/use).
+//! `dragitem=<source slot hex>:<destination slot hex>` resolves both visible item cells and uses the `mdrag` events, preserving held modifiers.
 //! `ncurightclick` real right-click on the NCU window's first row (bug 21 cancel). `dragnano=<bar>:<slot>` drags the
 //! Programs window's first row onto a shortcut bar slot (bug 18); `nanopage=<index>` selects its school tab first. `barnames` prints bar 0's slot names, `clickslot=<bar>:<slot>` real-clicks one.
 //! `missioninfo=<mission name>` opens Missions and Shift+LMBs its real row, checks the existing InfoView against Zone quest data;
@@ -360,6 +361,24 @@ impl Pilot {
         self.set(p, host, vec![]);
     }
 
+    fn walking_offset(&mut self, pos: [f32; 3], yaw: f32) -> Option<(f32, f32)> {
+        let last = self.path.len() - 1;
+        let (s, c) = yaw.sin_cos();
+        loop {
+            let target = (self.i + 3).min(last);
+            let (dx, dz) = (self.path[target].0 - pos[0], self.path[target].1 - pos[2]);
+            if self.i == last && dx.abs() + dz.abs() < 0.6 {
+                return None;
+            }
+            let (fwd, left) = (dx * s + dz * c, -dx * c + dz * s);
+            if target == self.i || fwd.abs() > 0.2 || left.abs() > 0.2 {
+                return Some((fwd, left));
+            }
+            // A hairpin can put the lookahead inside the key deadzone before nearest-waypoint advancement reaches it.
+            self.i = target;
+        }
+    }
+
     /// One frame's decision; true = arrived.
     pub(super) fn step(&mut self, p: &mut Play, host: &mut Host) -> bool {
         // the own dynel is dropped while a zone change (teleport / door) runs: the route is over
@@ -399,11 +418,8 @@ impl Pilot {
             self.set(p, host, want);
             return false;
         }
-        let tgt = self.path[(self.i + 3).min(last)];
-        let (dx, dz) = (tgt.0 - pos[0], tgt.1 - pos[2]);
-        // the heading stays put, so the world offset goes to the keys through it: forward = (sin yaw, cos yaw), left = (-cos yaw, sin yaw)
-        let (s, c) = p.zone.own().unwrap().yaw.unwrap_or(0.0).sin_cos();
-        let (fwd, left) = (dx * s + dz * c, -dx * c + dz * s);
+        // The heading stays put: forward = (sin yaw, cos yaw), left = (-cos yaw, sin yaw).
+        let Some((fwd, left)) = self.walking_offset(pos, p.zone.own().unwrap().yaw.unwrap_or(0.0)) else { return true };
         let want = [(fwd > 0.2, "W"), (fwd < -0.2, "S"), (left > 0.2, "Z"), (left < -0.2, "C")].iter().filter(|w| w.0).map(|w| w.1).collect();
         self.set(p, host, want);
         false
@@ -1414,9 +1430,9 @@ fn live_walk() {
                 }
                 l.o.host.mods = Default::default();
             }
-            // `mdrag=x1:y1:x2:y2` GUI left drag (slider knob, windows) in 10 steps; `watch=secs` prints every own stat that changed meanwhile
-            "mdrag" => {
-                let c: Vec<f32> = v.split(':').map(|n| n.parse().unwrap()).collect();
+            // GUI left drag in 10 steps, either raw coordinates or the current visible item cells.
+            "mdrag" | "dragitem" => {
+                let c = drag_points(&l.p, k, v);
                 l.p.input(ao_gui::InputEvent::MouseMove { x: c[0], y: c[1] }, &mut l.o.host);
                 l.p.input(ao_gui::InputEvent::MouseDown { x: c[0], y: c[1], button: ao_gui::MouseButton::Left }, &mut l.o.host);
                 for i in 1..=10 {
@@ -1842,6 +1858,22 @@ fn cached_created_select_shot() {
         ..Default::default()
     }, shots);
 }
+/// Resolve item slots at dispatch time: persisted inventory layout need not match a previous login's coordinates.
+pub(super) fn drag_points(p: &Play, kind: &str, value: &str) -> [f32; 4] {
+    if kind == "dragitem" {
+        let (source, destination) = value.split_once(':').expect("dragitem source:destination slots");
+        let point = |slot: &str| {
+            let slot = u32::from_str_radix(slot.trim_start_matches("0x"), 16).expect("dragitem slot hex");
+            p.hud.as_ref().unwrap().item_screen_pos(&p.gui, slot).unwrap_or_else(|| panic!("slot {slot:#x} is not on screen"))
+        };
+        let ((x, y), (tx, ty)) = (point(source), point(destination));
+        [x, y, tx, ty]
+    } else {
+        let mut coordinates = value.split(':').map(|n| n.parse().unwrap());
+        std::array::from_fn(|_| coordinates.next().expect("mdrag x1:y1:x2:y2"))
+    }
+}
+
 
 #[cfg(test)]
 mod pilot_tests {
@@ -1853,6 +1885,29 @@ mod pilot_tests {
         assert_eq!(Pilot::new(vec![(1.0, 2.0)]).idx(), 0);
         assert_eq!(Pilot::new(vec![(1.0, 2.0), (2.0, 2.0), (3.0, 2.0)]).idx(), 1);
     }
+    #[test]
+    fn reached_walking_lookahead_advances_without_a_nearest_waypoint_jump() {
+        let path = vec![(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 0.5), (0.5, 0.5), (0.0, 0.5)];
+        for yaw in [0.0, -2.21] {
+            let mut pilot = Pilot::new(path.clone());
+            let pos = [0.5, 0.0, 0.5];
+            let dist = |c: (f32, f32)| (c.0 - pos[0]).abs() + (c.1 - pos[2]).abs();
+            assert!(dist(path[2]) > dist(path[1]), "nearest-waypoint advancement is blocked");
+            let (fwd, left) = pilot.walking_offset(pos, yaw).expect("the final point is still ahead");
+            assert_eq!(pilot.idx(), 4);
+            assert!(fwd.abs() > 0.2 || left.abs() > 0.2, "the next decision must hold a movement key");
+            assert_eq!(pilot.walking_offset([0.0, 0.0, 0.5], yaw), None);
+            assert_eq!(pilot.idx(), 5);
+        }
+        let mut straight = Pilot::new((0..10).map(|x| (x as f32 * 0.5, 0.0)).collect());
+        assert_eq!(straight.walking_offset([0.5, 0.0, 0.0], 0.0), Some((0.0, -1.5)));
+        assert_eq!(straight.idx(), 1, "an unreached lookahead must not advance");
+        assert_eq!(straight.walking_offset([2.0, 0.0, 0.0], 0.0), Some((0.0, -1.5)));
+        assert_eq!(straight.idx(), 4);
+        let mut endpoint = Pilot::new(vec![(1.0, 2.0)]);
+        assert_eq!(endpoint.walking_offset([1.0, 0.0, 2.0], 0.0), None);
+    }
+
 
     #[test]
     fn approach_stops_when_own_or_destination_is_removed() {

@@ -1285,11 +1285,19 @@ fn play_ctrl_split_mutates_locally_without_echo_and_join_waits_for_ack() {
     hud.open(&mut r.p.gui, WindowKind::Inventory);
     r.p.frame(0.016, (1280, 800), &mut r.host);
     r.p.hud.as_mut().unwrap().take_outbox();
-    let (x, y) = r.p.hud.as_ref().unwrap().item_screen_pos(&r.p.gui, 0x40).unwrap();
+    let [x, y, same_x, same_y] = live::drag_points(&r.p, "dragitem", "0x40:40");
+    assert_eq!((x, y), r.p.hud.as_ref().unwrap().item_screen_pos(&r.p.gui, 0x40).unwrap());
+    assert_eq!((same_x, same_y), (x, y), "Ctrl count selection permits a zero-length drag");
+    assert_eq!(live::drag_points(&r.p, "mdrag", "1:2:3:4"), [1.0, 2.0, 3.0, 4.0]);
     // Drop on row 1, not the first free visual cell: pending_drop must still place the new entry here.
     let (tx, ty) = (x, y + inv_grid::ICON + 1.0 + inv_grid::SPACING);
     r.host.mods.ctrl = true;
+    r.p.input(InputEvent::MouseMove { x, y }, &mut r.host);
     r.p.input(InputEvent::MouseDown { x, y, button: Left }, &mut r.host);
+    for _ in 0..10 {
+        r.p.input(InputEvent::MouseMove { x: same_x, y: same_y }, &mut r.host);
+    }
+    assert_eq!(r.host.pointer_warp.take(), None, "zero-length drag needs no pointer reset");
     r.p.input(InputEvent::MouseMove { x: x + 0.5, y }, &mut r.host);
     assert_eq!(r.host.pointer_warp.take(), Some((x, y)));
     r.p.input(InputEvent::MouseUp { x, y, button: Left }, &mut r.host);
@@ -1309,9 +1317,11 @@ fn play_ctrl_split_mutates_locally_without_echo_and_join_waits_for_ack() {
     assert_eq!((r.p.zone.inventory[&0x40].b, r.p.zone.inventory[&0x41].b), (299, 1), "local split applies once");
     assert!(r.p.hud.as_mut().unwrap().take_outbox().is_empty());
 
-    r.p.input(InputEvent::MouseDown { x: tx, y: ty, button: Left }, &mut r.host);
-    r.p.input(InputEvent::MouseMove { x, y }, &mut r.host);
-    r.p.input(InputEvent::MouseUp { x, y, button: Left }, &mut r.host);
+    let [from_x, from_y, onto_x, onto_y] = live::drag_points(&r.p, "dragitem", "41:40");
+    assert_eq!((from_x, from_y, onto_x, onto_y), (tx, ty, x, y), "resolve the split stack's actual visual row");
+    r.p.input(InputEvent::MouseDown { x: from_x, y: from_y, button: Left }, &mut r.host);
+    r.p.input(InputEvent::MouseMove { x: onto_x, y: onto_y }, &mut r.host);
+    r.p.input(InputEvent::MouseUp { x: onto_x, y: onto_y, button: Left }, &mut r.host);
     let join = n3_frame(0, 33512, inv::join_items(33512, inv::item_identity(0x40), inv::item_identity(0x41)));
     assert_eq!(r.p.hud.as_mut().unwrap().take_outbox(), vec![join.clone()]);
     assert_eq!((r.p.zone.inventory[&0x40].b, r.p.zone.inventory[&0x41].b), (299, 1), "GC1001baa1 does not mutate locally");
