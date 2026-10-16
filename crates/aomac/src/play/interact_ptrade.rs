@@ -248,8 +248,8 @@ impl PTrade {
         Ok(PTrade { win, dock_registered: false, escape: true, own, partner, ours: vec![], theirs: vec![], accepted: false, partner_cash: 0, cash: 0, dock: [(0, 0); 2], cash_due: None, dirty: true, tip: None })
     }
 
-    /// Paints both lists and the status bitmap when something changed. `info(gui, low_id)` = name and icon of a template.
-    pub fn render(&mut self, gui: &mut Gui, info: &mut dyn FnMut(&mut Gui, i32) -> Option<ItemInfo>) {
+    /// Paints both lists and the status bitmap when something changed.
+    pub fn render(&mut self, gui: &mut Gui, info: &mut dyn FnMut(&mut Gui, AcgItem) -> Option<ItemInfo>) {
         for (i, scroll) in SCROLLS.iter().enumerate() {
             if let Some(rect) = gui.view_rect(self.win, scroll) {
                 let size = ((rect.width() + 1.0 - 11.0).max(1.0) as u32, (rect.height() + 1.0).max(1.0) as u32);
@@ -280,7 +280,7 @@ impl PTrade {
                     cmds.push(CanvasItem::Image { id: g, src: [0.0, 0.0, SLOT, SLOT], dst: [x, y, x + SLOT, y + SLOT], alpha: 1.0 });
                 }
                 let Some(e) = list.get(n) else { continue };
-                let Some((name, icon)) = e.acg.and_then(|a| info(gui, a.low_id)) else { continue };
+                let Some((name, icon)) = e.acg.and_then(|a| info(gui, a)) else { continue };
                 if let Some((id, w, h)) = icon {
                     let o = (SLOT - ICON) / 2.0;
                     cmds.push(CanvasItem::Image { id, src: [0.0, 0.0, w as f32, h as f32], dst: [x + o, y + o, x + o + ICON, y + o + ICON], alpha: 1.0 });
@@ -695,10 +695,10 @@ impl Play {
             }
             i.ptrade_drops(&self.gui, &mut self.zone, h.take_item_drops());
             if let Some(p) = i.ptrade.trade.as_mut() {
-                p.render(&mut self.gui, &mut |g, low| h.item_info(g, low));
+                p.render(&mut self.gui, &mut |g, item| h.item_info(g, item));
                 p.update_tooltip(&mut self.gui, &self.zone, &self.text, h.dvalues.flag("ItemDescriptionTooltips"));
             }
-            i.tradeskill.render(&mut self.gui, &self.zone, &self.text, |g, low| h.item_info(g, low));
+            i.tradeskill.render(&mut self.gui, &self.zone, &self.text, |g, item| h.item_info(g, item));
         }
         for request in i.tradeskill.take_requests() {
             i.send(ao_net::n3::action::character_action(i.own as i32, &request));

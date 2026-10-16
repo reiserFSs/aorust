@@ -295,9 +295,7 @@ the corpse to the dead character's relative position when closer than a threshol
 
 * `PlayfieldAnarchyF`: DbObject `revision` meaning; `attribute`/`exit_door` semantics;
   non-0xC77D DbObject kinds (decoder keeps them in `rest`, then `world_x/z` stay 0).
-* `FullCharacter`: element layouts of inventory (`ACGItem_t`), equipment/team blocks, spells
-  (`SpellData_t`), perk map and quest bodies; meaning of the three entry groups and of the
-  `stats_a`/`stats_b` split; ~180 stat ids have no name in the table that was recovered.
+* `FullCharacter`: equipment/team blocks and the three entry groups' meanings, plus the `stats_a`/`stats_b` split remain separate research. Inventory is decoded: `u32 slot; u16 flags; u16 count; Identity; ACGItem` (GC `1002a04a`). `InventoryEntry.b` is the unsigned count (`1002a7d2`, `1002ad45`), not an unknown field; its Rust i16 retains the raw wire bits. Flag bit0 selects template entries (`1002aa0f`), bit0x40 is `N3Msg_IsItemDisabled` (`10027489` → `1002a6ac`), and bit0x20 is the explicit alternative to Can30 bit0x40 in `1002ace0`, consumed by reclaim iteration `1012584a`. Do not infer server flag names from that predicate.
 * `Corpse`: the 4 integers after the 7 spell arguments (`CorpseSpell::tail`) and spell types other than 0xCF27 (static.md §5).
 * `GameTime.arg3`, `AppearanceUpdate.extra` and cloth `b..e`, `CharacterAction` action ids,
   `DynelBase.x4ac`, `flags`, `template`.

@@ -7,7 +7,7 @@ use ao_gui::{CanvasItem, CanvasTip, Event, Gui, WindowId, WindowSize};
 use ao_gui::widgets::MultiCell;
 use ao_net::msg::Identity;
 use ao_net::n3::inventory::{container_item_identity, InventoryUpdate};
-use ao_net::n3::world::InventoryEntry;
+use ao_net::n3::world::{AcgItem, InventoryEntry};
 use std::path::Path;
 
 /// `SetMaxItemCount(0x15)` of a container view (docs/gui.md §11.5) and the `item_position_map` loop of `FUN_100cc2ca` (`n % 3`, `n / 3`, `n < 0x15`).
@@ -98,9 +98,9 @@ impl LootUi {
             self.open.iter().any(|l| l.owned && i32::from(l.word as i16) == item.instance >> 16)
     }
 
-    pub(super) fn item_title(&mut self, gui: &mut Gui, dir: Option<&Path>, low_id: i32) -> Option<String> {
+    pub(super) fn item_title(&mut self, gui: &mut Gui, dir: Option<&Path>, item: AcgItem) -> Option<String> {
         if self.items.is_none() { self.items = dir.map(Items::new); }
-        self.items.as_mut()?.info(gui, low_id).map(|info| info.name.clone())
+        self.items.as_mut()?.info(gui, item).map(|info| info.name.clone())
     }
     pub fn container_drop(&self, gui: &Gui, x: f32, y: f32) -> Option<Identity> {
         self.open.iter().find(|l| (l.container.kind == 0xdead || l.owned)
@@ -206,7 +206,7 @@ impl LootUi {
             let window = self.open[at].window;
             gui.multi_clear(window, "contracts");
             for entry in &self.open[at].entries {
-                let info = self.items.as_mut().and_then(|items| items.info(gui, entry.item.low_id));
+                let info = self.items.as_mut().and_then(|items| items.info(gui, entry.item));
                 let name = info.as_ref().map(|i| i.name.as_str()).unwrap_or("");
                 let icon = info.as_ref().and_then(|i| i.icon).map(|(id, _, _)| MultiCell::image(id)).unwrap_or_else(|| MultiCell::unsorted(""));
                 gui.multi_add_row(window, "contracts", entry.slot as i64, vec![icon, MultiCell::text(name), MultiCell::num(i32::from(entry.b as u16).max(1) as i64), MultiCell::unsorted(""), MultiCell::num(entry.item.level as i64)], true);
@@ -223,7 +223,7 @@ impl LootUi {
             let Some(e) = self.open[at].entries.get(n).copied() else { continue };
             let Some(items) = self.items.as_mut() else { continue };
             cmds.extend(items.picture(gui, &e, x, y));
-            if let Some(info) = items.info(gui, e.item.low_id) {
+            if let Some(info) = items.info(gui, e.item) {
                 let body = self.open[at].tip.as_ref().filter(|(cell, _, _)| *cell == n).map_or("", |(_, _, body)| body.as_str());
                 tips.push(CanvasTip { rect: [x, y, x + SLOT, y + SLOT], title: info.name.clone(), body: body.to_owned() });
             }
@@ -342,7 +342,7 @@ impl LootUi {
                     l.clicked = None;
                     let xml = "<root><CanvasView name=\"icon\" min_size=\"Point(32,32)\" max_size=\"Point(32,32)\"/></root>";
                     let ghost = gui.open_window_xml("ItemDrag", xml, (sx as i32 - 16, sy as i32 - 16), WindowSize::Preferred).ok()?;
-                    if let Some((g, w, h)) = self.items.as_mut().and_then(|items| items.info(gui, entry.item.low_id)).and_then(|info| info.icon) {
+                    if let Some((g, w, h)) = self.items.as_mut().and_then(|items| items.info(gui, entry.item)).and_then(|info| info.icon) {
                         gui.set_canvas(ghost, "icon", vec![CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, 32.0, 32.0], alpha: 1.0 }]);
                     }
                     Some(ghost)
@@ -383,7 +383,7 @@ impl LootUi {
     pub fn dump(&mut self, gui: &mut Gui) -> LootRows {
         let mut out = vec![];
         for l in &self.open {
-            let rows = l.entries.iter().map(|e| (e.slot, e.item.low_id, self.items.as_mut().and_then(|i| i.info(gui, e.item.low_id).map(|i| i.name.clone())).unwrap_or_default())).collect();
+            let rows = l.entries.iter().map(|e| (e.slot, e.item.low_id, self.items.as_mut().and_then(|i| i.info(gui, e.item).map(|i| i.name.clone())).unwrap_or_default())).collect();
             out.push((l.container, rows));
         }
         out

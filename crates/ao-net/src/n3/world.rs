@@ -255,8 +255,9 @@ pub struct AcgItem {
 }
 
 /// One inventory element of `FullCharacterIIR_t` (`FUN_1002a41a` [GC]): `u32 slot` (index into the character's inventory vector:
-/// 0..0x3f equipment pages, 0x40.. bag), then `FUN_1002a04a`: `i16; i16; Identity; ACGItem_t` (`a`/`b` are the first two members of
-/// the 0x28-byte slot object, meaning UNRESOLVED).
+/// 0..0x3f equipment pages, 0x40.. bag), then `FUN_1002a04a`: two 16-bit words, Identity and ACGItem.
+/// `a` is the flags word (bit0 template entry; bit0x40 disabled: 10027489/1002a6ac).
+/// `b` is an unsigned 16-bit count (getter 1002a7d2, setter 1002ad45), retained as raw i16 wire bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InventoryEntry {
     pub slot: u32,

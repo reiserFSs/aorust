@@ -276,7 +276,7 @@ impl Interact {
                 if owned {
                     let entry = zone.inventory.values().chain(zone.containers.values().flat_map(|(_, entries)| entries.iter())).find(|e| e.id == u.container);
                     if let Some(entry) = entry {
-                        if let Some(name) = ui.loot.item_title(gui, ui.dir.as_deref(), entry.item.low_id) { title = name; }
+                        if let Some(name) = ui.loot.item_title(gui, ui.dir.as_deref(), entry.item) { title = name; }
                     }
                 }
                 ui.loot.update(gui, ui.dir.as_deref(), self.screen, u.container, &title, u, owned);

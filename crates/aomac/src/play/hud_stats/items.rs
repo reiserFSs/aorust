@@ -1,7 +1,7 @@
 //! Item contents of the wear and inventory windows: names and icons of the own `FullCharacterIIR_t` inventory (docs/gui.md §11.9 / §11.11).
 //!
-//! An item (`ACGItem_t{low_id, high_id, level}`) is the rdb 1000020 record `low_id`; its name is `N3Msg_GetName`, its picture the stat `Icon` (0x4f) →
-//! the PNG of rdb 1010008 (`FUN_1003eb30`, the same path as the hotbar icons, [`super::super::hud_bar::icon_image`]).
+//! GUI 1004178f resolves names through GC 10019b0e → 10049772 → the ACG item.
+//! GC 1007cd23 / 10082a3d load nearest-template metadata (ties high); GUI 1003eb30 reads its Icon (0x4f).
 
 use super::super::hud_bar::icon_image;
 use ao_formats::dynel_visual::item_template;
@@ -15,8 +15,8 @@ use ao_net::n3::world::AcgItem;
 
 /// Stat `Icon`.
 const STAT_ICON: u32 = 0x4f;
-/// Stat `MultipleCount` (212): template count for shop stock; owned inventory count is `InventoryEntry::b` (GC 0x1002a7d2).
-const STAT_COUNT: u32 = 212;
+/// GUI 100404a9: shop MultipleCount, distinct from MaxEnergy (212) and wire `InventoryEntry::b`.
+const STAT_COUNT: u32 = 412;
 
 /// Size of an item picture (`MultiListView_c` grid icon, 48 px) and of its slot art `GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED`.
 pub const ICON: f32 = 48.0;
@@ -35,7 +35,7 @@ type WearDestination = Option<(usize, u32)>;
 
 pub struct Items {
     store: Option<RecordStore>,
-    cache: HashMap<i32, Option<Info>>,
+    cache: HashMap<(i32, i32, i32), Option<Info>>,
     shop_cache: HashMap<(i32, i32, i32), Option<ShopInfo>>,
     equip: HashMap<(i32, i32, i32), Result<EquipCriteria, String>>,
     destinations: HashMap<(i32, i32, i32), Result<WearDestination, String>>,
@@ -160,17 +160,22 @@ impl Items {
         crate::play::chat::item_is_shield_disabler(&record)
     }
 
-    /// The record of an item (`None` without rdb or record). Icon textures are created once per item.
-    pub fn info(&mut self, gui: &mut Gui, low_id: i32) -> Option<&Info> {
-        if !self.cache.contains_key(&low_id) {
-            let info = self.store.as_ref().and_then(|s| {
-                let t = item_template(s, u32::try_from(low_id).ok()?).ok()??;
-                let icon = t.stat(STAT_ICON).filter(|&i| i > 0).and_then(|i| icon_image(gui, s, i as u32));
+    /// Quality-selected native metadata; parsing and icon creation happen once per ACG.
+    pub fn info(&mut self, gui: &mut Gui, item: AcgItem) -> Option<&Info> {
+        let key = (item.low_id, item.high_id, item.level);
+        if !self.cache.contains_key(&key) {
+            let info = self.store.as_ref().and_then(|store| {
+                let low = item_template(store, u32::try_from(item.low_id).ok()?).ok()??;
+                let high = if item.high_id == 0 || item.high_id == item.low_id { None } else {
+                    Some(item_template(store, u32::try_from(item.high_id).ok()?).ok()??)
+                };
+                let t = ao_formats::dynel_visual::interpolate_item_templates(&low, high.as_ref().unwrap_or(&low), item.level).ok()?;
+                let icon = t.stat(STAT_ICON).filter(|&i| i > 0).and_then(|i| icon_image(gui, store, i as u32));
                 Some(Info { name: t.name.unwrap_or_default(), icon })
             });
-            self.cache.insert(low_id, info);
+            self.cache.insert(key, info);
         }
-        self.cache[&low_id].as_ref()
+        self.cache[&key].as_ref()
     }
 
     /// ACG-resolved shop name/count/Value and icon. Owned item predicates use
@@ -187,7 +192,7 @@ impl Items {
                 };
                 let t = ao_formats::dynel_visual::interpolate_item_templates(&low, high.as_ref().unwrap_or(&low), item.level)?;
                 let icon = t.stat(STAT_ICON).filter(|&id| id > 0).and_then(|id| icon_image(gui, store, id as u32)).map(|(id, _, _)| id);
-                Ok(Some((t.name.clone().unwrap_or_default(), t.stat(STAT_COUNT).filter(|&c| c > 0).unwrap_or(1), t.stat(0x4a).unwrap_or(0), icon)))
+                Ok(Some((t.name.clone().unwrap_or_default(), shop_count(t.stat(STAT_COUNT)), t.stat(0x4a).unwrap_or(0), icon)))
             })();
             let info = match result {
                 Ok(info) => info,
@@ -200,17 +205,33 @@ impl Items {
 
 
     #[cfg(test)]
-    pub(super) fn insert_test_info(&mut self, id: i32, info: Info) {
-        self.cache.insert(id, Some(info));
+    pub(super) fn insert_test_info(&mut self, item: AcgItem, info: Info) {
+        self.cache.insert((item.low_id, item.high_id, item.level), Some(info));
     }
 
 
     /// Canvas items of one item picture whose slot cell has its top-left corner at `(x, y)` (the 48 px picture sits 3 px inside the 54 px slot).
-    pub fn picture(&mut self, gui: &mut Gui, e: &InventoryEntry, x: f32, y: f32) -> Option<CanvasItem> {
-        let (id, w, h) = self.info(gui, e.item.low_id)?.icon?;
+    pub fn picture(&mut self, gui: &mut Gui, e: &InventoryEntry, x: f32, y: f32) -> impl Iterator<Item = CanvasItem> {
         let o = (SLOT - ICON) / 2.0;
-        Some(CanvasItem::Image { id, src: [0.0, 0.0, w as f32, h as f32], dst: [x + o, y + o, x + o + ICON, y + o + ICON], alpha: 1.0 })
+        let dst = [x + o, y + o, x + o + ICON, y + o + ICON];
+        let picture = self.info(gui, e.item).and_then(|info| info.icon).map(|(id, w, h)| CanvasItem::Image { id, src: [0.0, 0.0, w as f32, h as f32], dst, alpha: 1.0 });
+        let disabled = disabled_overlay(gui, e.a, dst);
+        [picture, disabled].into_iter().flatten()
     }
+}
+
+/// GUI 100404a9 also treats the native missing-stat sentinel as one.
+fn shop_count(count: Option<i32>) -> i32 {
+    match count { None | Some(0 | 0x499602d2) => 1, Some(count) => count }
+}
+
+/// GC 10027489 / 1002a6ac, GUI 1003ebd0 / 10040001: disabled items
+/// retain their art beneath the native black ICONFADER32 alpha mask.
+pub fn disabled_overlay(gui: &Gui, flags: i16, dst: [f32; 4]) -> Option<CanvasItem> {
+    if flags & 0x40 == 0 { return None; }
+    let id = GfxId(gui.gfx_id("GFX_GUI_ICONFADER32")?);
+    let (w, h) = gui.gfx().size(id);
+    Some(CanvasItem::ImageTint { id, src: [0.0, 0.0, w as f32, h as f32], dst, color: 0, alpha: 1.0 })
 }
 
 /// Order of the weapon grid's cells (docs/gui.md §11.9): row-major `1, 15, 2, 3 .. 14` (Hud 1, Hud 2, Hud 3 = slot 15, Utils 1-3, Right Hand 6, Deck 7,
@@ -230,15 +251,28 @@ pub fn wear_slot(tab: usize, cell: usize) -> Option<u32> {
     }
 }
 
-/// Grid position (column, row) of a cell: 3 columns; the 13th implant ("Feet") stands alone in the middle column of row 4 (art `GFX_GUI_WEARVIEW_IMPLANTS`).
+/// Grid positions from native tables 101a5464/101a5684/101a5860/101a5a80.
 pub fn wear_cell(tab: usize, cell: usize) -> (usize, usize) {
     if tab == 2 && cell == 12 { (1, 4) } else { (cell % 3, cell / 3) }
 }
 
-/// Top-left corner of a cell's 54 px slot in the 192 x 320 wear art: the labelled frames of `GFX_GUI_WEARVIEW_*` measured from the PNG are 52 px wide, 52 px high,
-/// columns at x = 9, 70, 131 (pitch 61), rows at y = 22 + 58 r; the slot art has a 1 px margin around its frame.
+/// Native category-505 labels (100e20b0..100e230c); Social slots 13/15
+/// use weapon labels 306/308, not the clothing finger labels.
+pub fn wear_label(tab: usize, cell: usize) -> u32 {
+    match tab {
+        0 => 300 + cell as u32,
+        1 => 100 + cell as u32,
+        2 => 200 + cell as u32,
+        3 if matches!(cell, 12 | 14) => 300 + cell as u32 - 6,
+        3 => 100 + cell as u32,
+        _ => unreachable!(),
+    }
+}
+
+/// Native 6px borders, 48px cells and (11,9) spacing. The 54px frame
+/// extends 3px beyond the cell; the canvas is below the TabView strip.
 pub fn wear_origin(col: usize, row: usize) -> (f32, f32) {
-    (8.0 + 61.0 * col as f32, 21.0 + 58.0 * row as f32)
+    (3.0 + 59.0 * col as f32, 3.0 + 57.0 * row as f32)
 }
 
 /// Bag slots of the own inventory: `0x40 + i`, `SetMaxItemCount(0x1e)`.
@@ -250,12 +284,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shop_multiple_count_uses_412_and_native_defaults() {
+        assert_eq!(STAT_COUNT, 0x19c);
+        assert_eq!([None, Some(0), Some(1), Some(7), Some(0x499602d2)].map(shop_count), [1, 1, 1, 7, 1]);
+    }
+
+    #[test]
+    fn presentation_cache_and_disabled_mask_follow_full_native_item_state() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut items = Items::new(Path::new("/no-item-database"));
+        let low = AcgItem { low_id: 1, high_id: 2, level: 1 };
+        let high = AcgItem { level: 2, ..low };
+        items.insert_test_info(low, Info { name: "low".into(), icon: None });
+        items.insert_test_info(high, Info { name: "high".into(), icon: None });
+        assert_eq!(items.info(&mut gui, low).unwrap().name, "low");
+        assert_eq!(items.info(&mut gui, high).unwrap().name, "high");
+        assert!(items.info(&mut gui, AcgItem { high_id: 3, ..high }).is_none());
+        let dst = [0.0, 0.0, 48.0, 48.0];
+        assert!(disabled_overlay(&gui, 0x20, dst).is_none(), "0x20 is not disabled");
+        assert!(matches!(disabled_overlay(&gui, 0x40, dst), Some(CanvasItem::ImageTint { id, dst: actual, color: 0, alpha: 1.0, .. }) if id == GfxId(0xe2) && actual == dst));
+    }
+
+    #[test]
     fn resolved_item_stats_are_cached_by_both_endpoints_and_quality() {
         let mut items = Items::new(Path::new("/no-item-database"));
         let low = AcgItem { low_id: 1, high_id: 2, level: 1 };
         let quality = AcgItem { level: 2, ..low };
         let endpoint = AcgItem { high_id: 3, ..low };
-        items.insert_test_info(1, Info { name: String::new(), icon: None });
+        items.insert_test_info(low, Info { name: String::new(), icon: None });
         items.insert_test_acg(low, &[(30, 0x200), (0, 0)]);
         items.insert_test_acg(quality, &[(30, 0x1000200), (0, 0x4000000)]);
         items.insert_test_acg(endpoint, &[(30, 8)]);
@@ -272,6 +330,8 @@ mod tests {
         assert_eq!((0..15).map(|c| wear_slot(0, c).unwrap()).collect::<Vec<_>>(), [1, 15, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
         assert_eq!((wear_slot(1, 0), wear_slot(1, 14), wear_slot(2, 12), wear_slot(2, 13), wear_slot(3, 0), wear_slot(3, 14)), (Some(0x11), Some(0x1f), Some(0x2d), None, Some(0x31), Some(0x3f)));
         assert_eq!((wear_cell(2, 12), wear_cell(2, 11), wear_cell(1, 14)), ((1, 4), (2, 3), (2, 4)));
+        assert_eq!((wear_origin(0, 0), wear_origin(2, 4)), ((3.0, 3.0), (121.0, 231.0)));
+        assert_eq!([wear_label(0, 0), wear_label(1, 14), wear_label(2, 12), wear_label(3, 12), wear_label(3, 14)], [300, 114, 212, 306, 308]);
         // every slot is unique over the four tabs and below the bag
         let mut all: Vec<u32> = (0..4).flat_map(|t| (0..15).filter_map(move |c| wear_slot(t, c))).collect();
         all.sort();

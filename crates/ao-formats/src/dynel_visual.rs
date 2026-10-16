@@ -105,11 +105,13 @@ pub fn interpolate_acg_value(a: i32, b: i32, aq: i32, bq: i32, q: i32) -> i32 {
 /// GC 10082a3d / 100cc270 / 100cb689: nearest-template metadata (tie high),
 /// selective stat interpolation, and the quadratic Value adjustment (100cb611).
 pub fn interpolate_item_templates(low: &ItemTemplate, high: &ItemTemplate, ql: i32) -> Result<ItemTemplate> {
+    // 1007cd23 chooses the metadata before 100cc270 normalizes the stat QL.
+    let metadata_ql = ql as u16 as i32;
     let ql = if (1..=511).contains(&(ql as u16 as i32)) { ql as u16 as i32 } else { 1 };
     let aq = low.stat(54).unwrap_or(0) as u16 as i32;
     let bq = high.stat(54).unwrap_or(0) as u16 as i32;
     ensure!((1..=511).contains(&aq) && (1..=511).contains(&bq), "invalid template QL");
-    let mut out = if (ql - aq).abs() < (ql - bq).abs() { low.clone() } else { high.clone() };
+    let mut out = if (metadata_ql - aq).abs() < (metadata_ql - bq).abs() { low.clone() } else { high.clone() };
     if aq != bq {
         ensure!(low.stats.len() == high.stats.len(), "different template stat counts");
         for (id, value) in &mut out.stats {
@@ -143,6 +145,17 @@ fn acg_interpolation_rounds_from_minimum_and_squares_value() {
     let out = interpolate_item_templates(&template(1, 100, "low"), &template(3, 200, "high"), 2).unwrap();
     assert_eq!(out.name.as_deref(), Some("high"));
     assert_eq!(out.stat(74), Some(125));
+}
+
+#[cfg(test)]
+#[test]
+fn acg_metadata_threshold_and_invalid_quality_follow_native_selection_order() {
+    let template = |ql, name: &str, icon| ItemTemplate { kind: 0xc74a, stats: vec![(54, ql), (79, icon)], name: Some(name.into()), sounds: vec![] };
+    let (low, high) = (template(1, "low", 100), template(3, "high", 200));
+    for (ql, name, icon, stat_ql) in [(0, "low", 100, 1), (1, "low", 100, 1), (2, "high", 200, 2), (3, "high", 200, 3), (512, "high", 200, 1), (-1, "high", 200, 1)] {
+        let item = interpolate_item_templates(&low, &high, ql).unwrap();
+        assert_eq!((item.name.as_deref(), item.stat(79), item.stat(54)), (Some(name), Some(icon), Some(stat_ql)));
+    }
 }
 
 /// Parse the leading stat list (and name, if present) of an rdb 1000020 record.

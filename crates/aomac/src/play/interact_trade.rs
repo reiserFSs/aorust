@@ -376,9 +376,9 @@ impl Play {
             }
             let (mut rest, drops) = (vec![], h.take_item_drops());
             for (slot, x, y) in drops {
-                let low = self.zone.inventory.get(&slot).map(|e| e.item.low_id);
-                let taken = i.trade_wants(&self.gui, x, y) && low.is_some_and(|low| {
-                    let info = h.item_info(&mut self.gui, low).unwrap_or_default();
+                let item = self.zone.inventory.get(&slot).map(|e| e.item);
+                let taken = i.trade_wants(&self.gui, x, y) && item.is_some_and(|item| {
+                    let info = h.item_info(&mut self.gui, item).unwrap_or_default();
                     i.trade_drop(&mut self.gui, slot, x, y, info)
                 });
                 if !taken {
@@ -676,7 +676,7 @@ mod tests {
         let client = ao_gui::client_dir();
         if !client.join("cd_image/rdb.db").exists() { return; }
         let mut items = super::super::hud_stats::items::Items::new(&client);
-        let info = items.info(&mut gui, 248323).map(|i| (i.name.clone(), i.icon)).unwrap();
+        let info = items.info(&mut gui, ao_net::n3::world::AcgItem { low_id: 248323, high_id: 248323, level: 1 }).map(|i| (i.name.clone(), i.icon)).unwrap();
         assert_eq!(info.0, "Spinal Section");
         let icon = info.1.expect("retail Spinal Section icon");
         assert!(i.trade_add(&mut gui, 0x40, info.clone()));
@@ -774,7 +774,7 @@ mod tests {
         // the trade: the text replaces the answers, the trade window docks to the right
         feed(&mut i, &mut fe.0, &mut z, Knubot::StartTrade { npc: NPC, value: 3, text: "Give me 3 items and some credits".into() });
         let mut items = super::super::hud_stats::items::Items::new(&ao_gui::client_dir());
-        let info = items.info(&mut fe.0, 248323).map(|i| (i.name.clone(), i.icon)).unwrap();
+        let info = items.info(&mut fe.0, ao_net::n3::world::AcgItem { low_id: 248323, high_id: 248323, level: 1 }).map(|i| (i.name.clone(), i.icon)).unwrap();
         assert_eq!(info.0, "Spinal Section");
         assert!(info.1.is_some());
         assert!(i.trade_add(&mut fe.0, 0x40, info));

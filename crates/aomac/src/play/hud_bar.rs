@@ -114,7 +114,7 @@ pub(super) struct ShortcutBar {
     tooltip_body: String,
     info_urls: Vec<String>,
     released: Option<(Slot, f32, f32)>,
-    item_templates: HashMap<u32, (i32, super::hud_stats::ItemInfo)>,
+    item_templates: HashMap<u32, (ao_net::n3::world::AcgItem, super::hud_stats::ItemInfo)>,
 }
 
 struct Press {
@@ -377,9 +377,9 @@ impl ShortcutBar {
         for slot in self.slots.iter_mut().chain(self.rows.iter_mut().flat_map(|row| row.iter_mut())).flatten() {
             if ao_net::n3::inventory::item_identity(slot.instance).kind as u32 != slot.kind { continue; }
             let Some(entry) = zone.inventory.get(&slot.instance) else { continue };
-            if self.item_templates.get(&slot.instance).is_none_or(|(low, _)| *low != entry.item.low_id) {
-                let Some(info) = stats.item_info(gui, entry.item.low_id) else { continue };
-                self.item_templates.insert(slot.instance, (entry.item.low_id, info));
+            if self.item_templates.get(&slot.instance).is_none_or(|(item, _)| *item != entry.item) {
+                let Some(info) = stats.item_info(gui, entry.item) else { continue };
+                self.item_templates.insert(slot.instance, (entry.item, info));
             }
             let (_, (name, icon)) = &self.item_templates[&slot.instance];
             if slot.name != *name || slot.icon != *icon {
@@ -810,7 +810,7 @@ mod tests {
         let mut zone = super::super::zone::Zone::new(7);
         for low_id in [0xc1a5, 0xc1a2] {
             zone.inventory.insert(slot, ao_net::n3::world::InventoryEntry { slot, a: 0, b: 1, id, item: ao_net::n3::world::AcgItem { low_id, high_id: low_id, level: 1 } });
-            let expected = stats.item_info(&mut gui, low_id).unwrap();
+            let expected = stats.item_info(&mut gui, zone.inventory[&slot].item).unwrap();
             bar.refresh_items(&mut gui, &zone, &mut stats);
             for actual in [&bar.slots[0], &bar.rows[2][1]] {
                 let actual = actual.as_ref().unwrap();

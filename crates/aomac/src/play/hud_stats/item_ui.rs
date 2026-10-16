@@ -306,7 +306,7 @@ impl HudStats {
         }
         let src = format!("<root><CanvasView name=\"icon\" min_size=\"Point({0},{0})\" max_size=\"Point({0},{0})\"/></root>", GHOST as u32);
         let Ok(ghost) = gui.open_window_xml("ItemDrag", &src, (x as i32 - GHOST as i32 / 2, y as i32 - GHOST as i32 / 2), WindowSize::Preferred) else { return };
-        if let Some((g, w, h)) = self.items.info(gui, e.item.low_id).and_then(|i| i.icon) {
+        if let Some((g, w, h)) = self.items.info(gui, e.item).and_then(|i| i.icon) {
             gui.set_canvas(ghost, "icon", vec![CanvasItem::Image { id: g, src: [0.0, 0.0, w as f32, h as f32], dst: [0.0, 0.0, GHOST, GHOST], alpha: 1.0 }]);
         }
         self.dnd.press = None;
@@ -444,7 +444,7 @@ impl HudStats {
             return;
         }
         let Some(e) = zone.inventory.get(&(item.instance as u32)) else { return };
-        let Some(info) = self.items.info(gui, e.item.low_id) else { return };
+        let Some(info) = self.items.info(gui, e.item) else { return };
         let body = super::super::chat::log::ldb_format(
             &self.db.by_key(10000, "Want2DropItemXonGround").unwrap_or_default(),
             &[super::super::chat::log::Arg::S(info.name.clone())],
@@ -478,7 +478,7 @@ impl HudStats {
         if key == self.item_tip { return; }
         self.item_tip = key;
         let body = if self.item_description_tips { slot.map(|s| self.tooltip_body(zone, inv::item_identity(s))).unwrap_or_default() } else { String::new() };
-        let title = key.and_then(|(_, e, _)| self.items.info(gui, e.item.low_id)).map(|i| i.name.as_str()).unwrap_or("");
+        let title = key.and_then(|(_, e, _)| self.items.info(gui, e.item)).map(|i| i.name.as_str()).unwrap_or("");
         if let Some(w) = self.wear.as_ref() {
             gui.set_tooltip(w.window, "items", if slot.is_some_and(|s| s < inv::BAG_FIRST) { title } else { "" }, if slot.is_some_and(|s| s < inv::BAG_FIRST) { &body } else { "" });
         }
@@ -670,7 +670,7 @@ mod stack_tests {
         let mut gui = Gui::new(&dir, None).unwrap();
         let mut hud = HudStats::new(&dir, (800, 600)).unwrap();
         let mut zone = Zone::new(7);
-        hud.items.insert_test_info(1, items::Info { name: "Stack".into(), icon: None });
+        hud.items.insert_test_info(AcgItem { low_id: 1, high_id: 1, level: 5 }, items::Info { name: "Stack".into(), icon: None });
         zone.inventory.insert(0x40, InventoryEntry { slot: 0x40, a: 1, b: 10, id: inv::item_identity(0x40), item: AcgItem { low_id: 1, high_id: 1, level: 5 } });
         hud.items.insert_test_acg(zone.inventory[&0x40].item, &[(dnd::STAT_CAN, 0x200)]);
         hud.open_inventory(&mut gui).unwrap();

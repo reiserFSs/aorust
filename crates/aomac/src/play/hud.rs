@@ -769,9 +769,9 @@ impl Hud {
         self.nano.cast(gui, zone, id);
     }
 
-    /// Name and icon of an item template (`HudStats::item_info`).
-    pub(super) fn item_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<super::hud_stats::ItemInfo> {
-        self.stats.item_info(gui, low_id)
+    /// Name and icon of the quality-selected item (`HudStats::item_info`).
+    pub(super) fn item_info(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> Option<super::hud_stats::ItemInfo> {
+        self.stats.item_info(gui, item)
     }
 
     pub(super) fn perks(&self) -> &super::hud_perks::HudPerks {
@@ -1164,7 +1164,7 @@ impl Hud {
             if zone.inventory.get(&slot).is_some_and(|entry| self.knowledge.drop_item(gui, entry.item, x, y, &mut self.dvalues)) {
                 continue;
             }
-            let info = zone.inventory.get(&slot).and_then(|e| self.stats.item_info(gui, e.item.low_id));
+            let info = zone.inventory.get(&slot).and_then(|e| self.stats.item_info(gui, e.item));
             let claimed = info.is_some_and(|(name, icon)| self.shortcuts.iter_mut().any(|bar| bar.drop_item(gui, slot, &name, icon, x, y)));
             if !claimed {
                 unclaimed.push((slot, x, y));

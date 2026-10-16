@@ -1588,9 +1588,9 @@ fn live_walk() {
                     ao_net::msg::Identity { kind: kind.parse().unwrap(), instance: inst.parse().unwrap() }
                 };
                 let p = &mut l.p;
-                let slot = p.zone.inventory.iter().find_map(|(&slot, entry)| (ao_net::n3::inventory::item_identity(slot) == item || entry.id == item).then_some((slot, entry.item.low_id)));
-                let added = slot.and_then(|(slot, low)| {
-                    let info = p.hud.as_mut()?.item_info(&mut p.gui, low)?;
+                let slot = p.zone.inventory.iter().find_map(|(&slot, entry)| (ao_net::n3::inventory::item_identity(slot) == item || entry.id == item).then_some((slot, entry.item)));
+                let added = slot.and_then(|(slot, item)| {
+                    let info = p.hud.as_mut()?.item_info(&mut p.gui, item)?;
                     Some(p.interact.as_mut().unwrap().trade_add(&mut p.gui, slot, info))
                 }).unwrap_or(false);
                 eprintln!("tadd {v}: {added}");

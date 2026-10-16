@@ -212,7 +212,7 @@ impl TradeskillUi {
         }
         true
     }
-    pub fn render(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb, mut info: impl FnMut(&mut Gui, i32) -> Option<ItemInfo>) {
+    pub fn render(&mut self, gui: &mut Gui, zone: &Zone, texts: &TextDb, mut info: impl FnMut(&mut Gui, AcgItem) -> Option<ItemInfo>) {
         if !self.dirty { return; }
         let Some(w) = self.win else { return };
         self.dirty = false;
@@ -225,7 +225,7 @@ impl TradeskillUi {
                 let (width, height) = gui.gfx().size(g);
                 pictures.push(CanvasItem::Image { id: g, src: [0.0, 0.0, width as f32, height as f32], dst: [0.0, 0.0, 54.0, 54.0], alpha: 1.0 });
             }
-            if let Some((name, icon)) = item.and_then(|a| info(gui, a.low_id)) {
+            if let Some((name, icon)) = item.and_then(|a| info(gui, a)) {
                 names[index] = name.clone();
                 tips.push(CanvasTip { rect: [0.0, 0.0, 54.0, 54.0], title: name, body: String::new() });
                 if let Some((g, width, height)) = icon {

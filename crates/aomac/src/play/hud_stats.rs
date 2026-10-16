@@ -33,21 +33,17 @@ use std::path::Path;
 /// 0x101a95a8 = 700). `WndBorder` 0x1015b44b passes this to SetClientFrame: 651 x 521 client.
 const SKILLS_POS: (i32, i32) = (200, 180);
 const SKILLS_CLIENT: (u32, u32) = (651, 521);
-/// Equipment body art (the baked three-tab strip is covered by the real four-tab strip).
-const WEAR_ART: (u32, u32) = (192, 320);
+/// Native 178×288 backgrounds plus the 17px TabView strip (GUI 100e1bc9).
+const WEAR_ART: (u32, u32) = (178, 305);
 /// `WearView_c` 0x100e2640/269c/26f2/2748: three localized titles and literal Social.
 const WEAR_TABS: [(&str, &str); 4] = [
-    ("weapons", "GFX_GUI_WEARVIEW_WEAPON"),
-    ("clothes", "GFX_GUI_WEARVIEW_CLOTHING"),
-    ("implants", "GFX_GUI_WEARVIEW_IMPLANTS"),
-    ("social", "GFX_GUI_WEARVIEW_CLOTHING"),
+    ("weapons", "GFX_GUI_WEARVIEW_BG1"),
+    ("clothes", "GFX_GUI_WEARVIEW_BG1"),
+    ("implants", "GFX_GUI_WEARVIEW_BG2"),
+    ("social", "GFX_GUI_WEARVIEW_BG1"),
 ];
 const SLOT_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_CLOSED";
 const SLOT_OPEN_GFX: &str = "GFX_GUI_MULTILISTVIEW_SLOT_48_OPEN";
-/// UNRESOLVED GUESS: the vertical gap of the inventory grid. `RecalcCellCount` spaces the rows by `(height + 1 - borders - rows * 48) / (rows - 1)` of the
-/// scrolled client view, a value that depends on the view's own content height (circular, not derivable); the wear grids use `SetGridIconSpacing(11, 9)`, so 9.
-/// The horizontal count / gap come from [`inv_grid::columns`] (verified).
-const INVENTORY_GAP_Y: f32 = 9.0;
 /// Width of a `ScrollView` scrollbar (`SCROLLBAR_W`) the inventory's grid leaves room for.
 const SCROLLBAR: u32 = 13;
 /// The saved frame of the inventory (`prefs/NewChar/DockAreas/DockArea0.xml`, a `DockTabbedWindow`): 187 x 176 inclusive, used as the outer size.
@@ -110,7 +106,7 @@ struct Skills {
 struct Tabbed {
     window: WindowId,
     tab: usize,
-    /// (slot, low_id) of what the item layer shows.
+    /// Full metadata/runtime signature of what the item layer shows.
     drawn: Vec<(u32, i32)>,
 }
 
@@ -120,7 +116,7 @@ struct Inventory {
     list: bool,
     drawn: Vec<(u32, i32)>,
     cols: usize,
-    /// Grid cell gaps (x from [`inv_grid::columns`], y [`INVENTORY_GAP_Y`]) and the grid view's width in px.
+    /// Grid cell gaps (x from [`inv_grid::columns`], y native [`inv_grid::SPACING`]).
     gap: (f32, f32),
     view_w: f32,
     /// Client side cells of the bag items (`item_position_map`) and the cell the last item dropped from outside was released on.
@@ -155,6 +151,8 @@ pub(super) struct HudStats {
     status: String,
     skill_minimized: bool,
     skill_config_source: Option<String>,
+    wear_labels_on_top: bool,
+    wear_config_source: Option<String>,
     /// Pointer state of the item drag and drop, and the sequence number of our `GenericCmd_t`s (docs/gui.md §11.12).
     dnd: item_dnd::Dnd,
     use_seq: i32,
@@ -233,6 +231,8 @@ impl HudStats {
             status: String::new(),
             skill_minimized: false,
             skill_config_source: None,
+            wear_labels_on_top: true,
+            wear_config_source: None,
             dnd: Default::default(),
             use_seq: 0,
             info_urls: vec![],
@@ -343,16 +343,16 @@ impl HudStats {
         self.dnd.dropped.extend(drops);
     }
 
-    /// Name and icon of the item template `low_id` (`items.rs` cache).
-    pub(in crate::play) fn item_info(&mut self, gui: &mut Gui, low_id: i32) -> Option<ItemInfo> {
-        self.items.info(gui, low_id).map(|i| (i.name.clone(), i.icon))
+    /// Name and icon selected by the complete native ACG key (`items.rs` cache).
+    pub(in crate::play) fn item_info(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> Option<ItemInfo> {
+        self.items.info(gui, item).map(|i| (i.name.clone(), i.icon))
     }
 
     /// Live harness: name and resolved stats that decide wearing / weapons of
     /// the actual inventory ACG (both endpoints and quality level).
     #[cfg(test)]
     pub(in crate::play) fn live_item_line(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> String {
-        let Some(name) = self.items.info(gui, item.low_id).map(|i| i.name.clone()) else {
+        let Some(name) = self.items.info(gui, item).map(|i| i.name.clone()) else {
             return format!("{}: no template", item.low_id);
         };
         let st = [("Can", 30), ("ItemClass", 76), ("DefaultPos", 88), ("Placement", 298), ("AnimSet", 353), ("DamageType", 436), ("Delay", 294)];
@@ -825,29 +825,45 @@ impl HudStats {
 
     fn open_wear(&mut self, gui: &mut Gui, rollup: &mut Rollup) -> anyhow::Result<()> {
         let (aw, ah) = WEAR_ART;
-        let mut xml = String::from("<root><View view_layout=\"vertical\" h_alignment=\"left\">");
-        xml += &format!("<View view_layout=\"stacked\" min_size=\"Point({aw},{ah})\" max_size=\"Point({aw},{ah})\">");
-        for (name, gfx, ..) in WEAR_TABS.iter().take(3) {
+        // XML Point bounds are inclusive extents; native BG1/BG2 are 178×288 pixels.
+        let extent_w = aw - 1;
+        let mut xml = format!("<root><View view_layout=\"vertical\" h_alignment=\"left\"><View view_layout=\"stacked\" min_size=\"Point({extent_w},16)\" max_size=\"Point({extent_w},16)\"><CanvasView name=\"wear_tabs\"/><View name=\"wear_tab_hits\" view_layout=\"horizontal\" h_alignment=\"left\"/></View><View view_layout=\"stacked\" min_size=\"Point({extent_w},287)\" max_size=\"Point({extent_w},287)\">");
+        for (name, gfx) in WEAR_TABS {
             xml += &format!("<BitmapView name=\"{name}\" bitmap_id=\"{gfx}\"/>");
         }
-        // the clothes art of the social tab: a second view of it (the three names above toggle visibility one by one)
-        xml += &format!("<BitmapView name=\"social\" bitmap_id=\"{}\"/>", WEAR_TABS[3].1);
-        xml += &format!("<CanvasView name=\"items\" min_size=\"Point({aw},{ah})\" max_size=\"Point({aw},{ah})\"/>");
-        // The original appends all four tabs to the same TabView; no extra
-        // Social row below the equipment body (`FUN_100e1bc9`).
-        xml += &format!("<View view_layout=\"vertical\" v_alignment=\"top\"><View view_layout=\"stacked\" min_size=\"Point({aw},17)\" max_size=\"Point({aw},17)\"><CanvasView name=\"wear_tabs\"/><View name=\"wear_tab_hits\" view_layout=\"horizontal\" h_alignment=\"left\"/></View><VLayoutSpacer/></View></View></View></root>");
+        for front in [false, true] {
+            if front { xml += &format!("<CanvasView name=\"items\" min_size=\"Point({extent_w},287)\" max_size=\"Point({extent_w},287)\"/>"); }
+            let color = if front { 0xffffff } else { 0xc0c0c0 };
+            for (tab, (name, _)) in WEAR_TABS.iter().enumerate() {
+            xml += &format!("<View name=\"{name}_labels_{front}\" view_layout=\"vertical\" layout_borders=\"Rect(6,6,6,6)\">");
+            for row in 0..5 {
+                if row != 0 { xml += "<View min_size=\"Point(0,8)\" max_size=\"Point(16000,8)\"/>"; }
+                xml += "<View view_layout=\"horizontal\">";
+                for col in 0..3 {
+                    if col != 0 { xml += "<View min_size=\"Point(10,0)\" max_size=\"Point(10,16000)\"/>"; }
+                    let cell = (0..15).find(|&cell| items::wear_slot(tab, cell).is_some() && items::wear_cell(tab, cell) == (col, row));
+                    let label = cell.map(|cell| self.db.by_id(505, items::wear_label(tab, cell)).unwrap_or_default()).unwrap_or_default();
+                    xml += &format!("<View view_layout=\"stacked\" min_size=\"Point(47,47)\" max_size=\"Point(47,47)\"><TextView value=\"{}\" font=\"SMALL\" feature_flags=\"0x1020\" color=\"{color}\" h_alignment=\"center\" v_alignment=\"center\"/></View>", esc(&label));
+                }
+                xml += "</View>";
+            }
+            xml += "</View>";
+        }
+        }
+        xml += "</View></View></root>";
         // `WearView_c` (`FUN_100e1bc9`) is a `DockableView_c` titled `GetText(10000, "Wear")`, docked in the rollup column (`WearViewConfig`: `DockableViewDockName = "RollupArea"`, page 317 px)
         let w = rollup.open_page(gui, WEAR_KEY, &self.db.by_key(10000, "Wear").unwrap_or_default(), &xml, ah as f32)?;
         let titles = ["Weapon", "Tab_Clothing", "Tab_Implants"].map(|k| self.db.by_key(10000,k).unwrap_or_default());
         let titles = [titles[0].clone(), titles[1].clone(), titles[2].clone(), "Social".to_owned()];
         let widths = gui.set_view_tabs(w, "wear_tabs", &titles, 0, aw);
         gui.set_canvas(w,"wear_tabs",vec![CanvasItem::Solid { dst:[0.0,0.0,aw as f32,17.0],color:0x404040,alpha:1.0 }]);
-        let mut hits = String::from("<root><View view_layout=\"horizontal\" h_alignment=\"left\"><View min_size=\"Point(2,17)\" max_size=\"Point(2,17)\"/>");
+        let mut hits = String::from("<root><View view_layout=\"horizontal\" h_alignment=\"left\"><View min_size=\"Point(1,16)\" max_size=\"Point(1,16)\"/>");
         let mut left = 2;
         for (i, ((name, _), width)) in WEAR_TABS.iter().zip(widths).enumerate() {
             let width = (width as i32 - if i + 1 < WEAR_TABS.len() { 6 } else { 0 }).min(aw as i32 - left);
             left += width;
-            hits += &format!("<TextButton name=\"tab_{name}\" text=\"\" min_size=\"Point({width},17)\" max_size=\"Point({width},17)\"/>");
+            let extent = width - 1;
+            hits += &format!("<TextButton name=\"tab_{name}\" text=\"\" min_size=\"Point({extent},16)\" max_size=\"Point({extent},16)\"/>");
         }
         hits += "</View></root>";
         gui.add_view_xml(w, "wear_tab_hits", "WearTabHits", &hits)?;
@@ -863,30 +879,41 @@ impl HudStats {
         gui.select_view_tab(t.window, "wear_tabs", tab);
         for (i, (name, ..)) in WEAR_TABS.iter().enumerate() {
             gui.set_visible(t.window, name, i == tab);
+            gui.set_visible(t.window, &format!("{name}_labels_true"), i == tab && self.wear_labels_on_top);
+            gui.set_visible(t.window, &format!("{name}_labels_false"), i == tab && !self.wear_labels_on_top);
         }
         t.drawn = vec![(u32::MAX, 0)];
     }
 
-    /// The item layer of the wear window: the picture of every worn item in the cell of its slot (the frames and labels are in the art).
+    /// Native layers: authored background, labelled slot frames, item pictures.
     fn update_wear(&mut self, gui: &mut Gui, zone: &Zone) {
         let Some(t) = self.wear.as_mut() else { return };
         let mut sig = signature(zone);
         sig.push((u32::MAX - 2, hover_code(self.dnd.hover)));
+        sig.push((u32::MAX - 3, i32::from(self.wear_labels_on_top)));
 
         if t.drawn == sig {
             return;
         }
+        for (i, (name, _)) in WEAR_TABS.iter().enumerate() {
+            gui.set_visible(t.window, &format!("{name}_labels_true"), i == t.tab && self.wear_labels_on_top);
+            gui.set_visible(t.window, &format!("{name}_labels_false"), i == t.tab && !self.wear_labels_on_top);
+        }
         for e in zone.inventory.values() {
-            self.items.info(gui, e.item.low_id);
+            self.items.info(gui, e.item);
         }
         let (mut cmds, mut tips) = (vec![], vec![]);
+        let frame = gui.gfx_id(SLOT_OPEN_GFX).map(ao_gui::GfxId);
         for cell in 0..15 {
             let Some(slot) = items::wear_slot(t.tab, cell) else { continue };
             let (c, r) = items::wear_cell(t.tab, cell);
             let (x, y) = items::wear_origin(c, r);
+            if let Some(id) = frame {
+                cmds.push(CanvasItem::Image { id, src: [0.0, 0.0, items::SLOT, items::SLOT], dst: [x, y, x + items::SLOT, y + items::SLOT], alpha: 1.0 });
+            }
             if let Some(e) = zone.inventory.get(&slot) {
                 cmds.extend(self.items.picture(gui, e, x, y));
-                if let Some(i) = self.items.info(gui, e.item.low_id) {
+                if let Some(i) = self.items.info(gui, e.item) {
                     tips.push(CanvasTip { rect: [x, y, x + items::SLOT, y + items::SLOT], title: i.name.clone(), body: String::new() });
                 }
             }
@@ -922,7 +949,7 @@ impl HudStats {
             list: self.inventory_list,
             drawn: vec![(u32::MAX, 0)],
             cols,
-            gap: (gap_x, INVENTORY_GAP_Y),
+            gap: (gap_x, inv_grid::SPACING),
             view_w,
             positions: Default::default(),
             pending_drop: None,
@@ -957,7 +984,7 @@ impl HudStats {
             return;
         }
         for e in zone.inventory.values() {
-            self.items.info(gui, e.item.low_id);
+            self.items.info(gui, e.item);
         }
         let slot_gfx = gui.gfx_id(SLOT_GFX).map(ao_gui::GfxId);
         let open_gfx = gui.gfx_id(SLOT_OPEN_GFX).map(ao_gui::GfxId);
@@ -971,7 +998,7 @@ impl HudStats {
             bag.sort_by_key(|e| e.slot);
             let mut icons = vec![];
             for (n, e) in bag.iter().enumerate() {
-                let Some(i) = self.items.info(gui, e.item.low_id) else { continue };
+                let Some(i) = self.items.info(gui, e.item) else { continue };
                 xml += &format!(
                     "<View name=\"item{}\" view_layout=\"horizontal\"><CanvasView name=\"icon{n}\" min_size=\"Point(16,16)\" max_size=\"Point(16,16)\"/>{}<TextView name=\"count{}\" value=\"{}\" min_size=\"Point(30,-1)\" max_size=\"Point(30,-1)\"/>{}</View>",
                     e.slot,
@@ -979,14 +1006,17 @@ impl HudStats {
                     e.slot, e.b as u16,
                     col(&e.item.level.to_string(), 100)
                 );
-                icons.push((n, i.icon));
+                icons.push((n, i.icon, e.a));
             }
             xml += "<VLayoutSpacer/></View></root>";
             match gui.add_view_xml(w, "content", "List", &xml) {
                 Ok(_) => {
-                    for (n, icon) in icons {
+                    for (n, icon, flags) in icons {
                         if let Some((g, gw, gh)) = icon {
-                            gui.set_canvas(w, &format!("icon{n}"), vec![CanvasItem::Image { id: g, src: [0.0, 0.0, gw as f32, gh as f32], dst: [0.0, 0.0, 16.0, 16.0], alpha: 1.0 }]);
+                            let dst = [0.0, 0.0, 16.0, 16.0];
+                            let mut pictures = vec![CanvasItem::Image { id: g, src: [0.0, 0.0, gw as f32, gh as f32], dst, alpha: 1.0 }];
+                            pictures.extend(items::disabled_overlay(gui, flags, dst));
+                            gui.set_canvas(w, &format!("icon{n}"), pictures);
                         }
                     }
                 }
@@ -1015,7 +1045,7 @@ impl HudStats {
                 }
                 if let Some(e) = item {
                     cmds.extend(self.items.picture(gui, e, x, y));
-                    if let Some(info) = self.items.info(gui, e.item.low_id) {
+                    if let Some(info) = self.items.info(gui, e.item) {
                         tips.push(CanvasTip { rect: [x, y, x + items::SLOT, y + items::SLOT], title: info.name.clone(), body: String::new() });
                     }
                 }
@@ -1023,7 +1053,7 @@ impl HudStats {
                     cmds.push(CanvasItem::Solid { dst: [x, y, x + items::SLOT, y + items::SLOT], color: 0xFFFFFF, alpha: 0.3 });
                 }
             }
-            let xml = format!("<root><CanvasView name=\"grid\" min_size=\"Point({0},{1})\" max_size=\"Point({0},{1})\"/></root>", cw as u32, ch as u32);
+            let xml = format!("<root><CanvasView name=\"grid\" min_size=\"Point({0},{1})\" max_size=\"Point({0},{1})\"/></root>", cw as u32 - 1, ch as u32 - 1);
             match gui.add_view_xml(w, "content", "Grid", &xml) {
                 Ok(_) => {
                     gui.set_canvas(w, "grid", cmds);
@@ -1039,6 +1069,14 @@ impl HudStats {
     // ------------------------------------------------------------------------------------------------------------ dispatch
 
     pub(super) fn configure_stat(&mut self, d: &super::dvalue::DValues) {
+        let wear_source = match d.get("WearViewConfig") {
+            Some(super::dvalue::Variant::Archive(src)) => Some(src.as_str()),
+            _ => None,
+        };
+        if self.wear_config_source.as_deref() != wear_source {
+            self.wear_labels_on_top = wear_source.and_then(|src| ao_gui::xml::parse(src).ok()).and_then(|e| find_bool(&e, "labels_on_top")).unwrap_or(true);
+            self.wear_config_source = wear_source.map(str::to_owned);
+        }
         let source = match d.get("SkillConfig") {
             Some(super::dvalue::Variant::Archive(src)) => Some(src.as_str()),
             _ => None,
@@ -1058,6 +1096,26 @@ impl HudStats {
 
     pub(super) fn stat_event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone, d: &mut super::dvalue::DValues) -> bool {
         const SKILL_MENU: u32 = 0x534b_0000;
+        const WEAR_MENU: u32 = 0x5745_0000;
+        match ev {
+            Event::FrameIcon { window, x, y } if self.wear.as_ref().is_some_and(|w| w.window == *window) => {
+                gui.open_menu((*x, *y), (self.screen.0 as i32, self.screen.1 as i32), vec![ao_gui::MenuItem::check(WEAR_MENU, &self.db.by_key(10000, "LabelsOnTop").unwrap_or_default(), self.wear_labels_on_top)]);
+                return true;
+            }
+            Event::MenuPicked { id } if *id == WEAR_MENU && self.wear.is_some() => {
+                self.wear_labels_on_top = !self.wear_labels_on_top;
+                use super::dvalue::{element_xml, Variant};
+                let mut e = match d.get("WearViewConfig") {
+                    Some(Variant::Archive(src)) => ao_gui::xml::parse(src).ok(),
+                    _ => None,
+                }.unwrap_or_else(|| ao_gui::xml::Element { name: "Archive".into(), attrs: vec![("name".into(), "WearViewConfig".into()), ("code".into(), "0".into())], children: vec![] });
+                let child = ao_gui::xml::Element { name: "Bool".into(), attrs: vec![("name".into(), "labels_on_top".into()), ("value".into(), self.wear_labels_on_top.to_string())], children: vec![] };
+                if let Some(old) = e.children.iter_mut().find(|c| c.attr("name") == Some("labels_on_top")) { *old = child; } else { e.children.push(child); }
+                d.set("WearViewConfig", Variant::Archive(element_xml(&e)));
+                return true;
+            }
+            _ => {}
+        }
         if let Some(s) = self.skills.as_mut() {
             match ev {
                 Event::FrameIcon { window, x, y } if *window == s.window => {
@@ -1346,9 +1404,9 @@ fn hover_code(h: Option<(item_dnd::Place, bool)>) -> i32 {
     }
 }
 
-/// (slot, low_id) of every inventory item, ascending: what the item layers depend on.
+/// Full ACG and runtime flags of every entry: metadata/disabled changes repaint too.
 fn signature(zone: &Zone) -> Vec<(u32, i32)> {
-    let mut v: Vec<_> = zone.inventory.values().map(|e| (e.slot, e.item.low_id)).collect();
+    let mut v: Vec<_> = zone.inventory.values().flat_map(|e| [(e.slot, e.item.low_id), (e.slot | 0x1000_0000, e.item.high_id), (e.slot | 0x2000_0000, e.item.level), (e.slot | 0x3000_0000, i32::from(e.a))]).collect();
     v.sort_unstable();
     v
 }
@@ -2015,19 +2073,42 @@ mod tests {
         assert_eq!(social.t,weapons.t, "Social belongs in the four-tab strip");
         assert!(social.b <= body.b && social.r <= body.r, "no tab leaks into the next rollup page");
         // weapons tab: Right Hand = slot 6 is cell 6 (column 0, row 2)
-        assert_eq!(s.gui.canvas_items(w, "items").len(), 1);
+        assert_eq!(s.gui.canvas_items(w, "items").len(), 16);
         png(&mut s, &mut o, "wear-0-weapons-items");
         click(&mut s, &mut o, w, "tab_clothes");
-        assert_eq!(s.gui.canvas_items(w, "items").len(), 1);
+        assert_eq!(s.gui.canvas_items(w, "items").len(), 16);
         png(&mut s, &mut o, "wear-1-clothes-items");
         click(&mut s, &mut o, w, "tab_implants");
-        assert_eq!(s.gui.canvas_items(w, "items").len(), 1);
+        assert_eq!(s.gui.canvas_items(w, "items").len(), 14);
         png(&mut s, &mut o, "wear-2-implants-items");
         click(&mut s, &mut o, w, "tab_social");
-        assert_eq!((s.hud.wear.as_ref().unwrap().tab, s.gui.canvas_items(w, "items").len()), (3, 1));
+        assert_eq!((s.hud.wear.as_ref().unwrap().tab, s.gui.canvas_items(w, "items").len()), (3, 16));
         png(&mut s, &mut o, "wear-3-social-items");
+        assert_eq!(WEAR_TABS.map(|(_, gfx)| gfx), ["GFX_GUI_WEARVIEW_BG1", "GFX_GUI_WEARVIEW_BG1", "GFX_GUI_WEARVIEW_BG2", "GFX_GUI_WEARVIEW_BG1"]);
+        let item_body = s.gui.view_rect(w, "items").unwrap();
+        assert_eq!((item_body.width() + 1.0, item_body.height() + 1.0), (178.0, 288.0));
+        assert!(s.gui.is_visible(w, "social_labels_true"));
+        assert!(s.hud.stat_event(&mut s.gui, &Event::MenuPicked { id: 0x5745_0000 }, &s.zone, &mut s.dvalues));
+        o.frame(&mut s, 0.016);
+        assert!(!s.hud.wear_labels_on_top);
+        for (tab, (name, _)) in WEAR_TABS.iter().enumerate() {
+            s.hud.select_wear_tab(&mut s.gui, tab);
+            assert!(s.gui.is_visible(w, &format!("{name}_labels_false")));
+            assert!(!s.gui.is_visible(w, &format!("{name}_labels_true")));
+        }
+        let super::super::dvalue::Variant::Archive(config) = s.dvalues.get("WearViewConfig").unwrap() else { panic!("wear config is not an archive") };
+        assert_eq!(find_bool(&ao_gui::xml::parse(config).unwrap(), "labels_on_top"), Some(false));
         // inventory grid: 30 slot frames + the 2 pictures
         let iw = s.hud.window(WindowKind::Inventory).unwrap();
+        assert_eq!(s.gui.canvas_items(iw, "grid").len(), 32);
+        assert_eq!(s.hud.inventory.as_ref().unwrap().gap.1, 10.0);
+        assert_eq!(s.gui.view_rect(iw, "grid").unwrap().height() + 1.0, 582.0);
+        s.zone.inventory.get_mut(&0x40).unwrap().a |= 0x40;
+        o.frame(&mut s, 0.016);
+        assert_eq!(s.gui.canvas_items(iw, "grid").len(), 33, "disabled flag alone repaints the native mask");
+        assert!(s.gui.canvas_items(iw, "grid").iter().any(|cmd| matches!(cmd, CanvasItem::ImageTint { id, color: 0, .. } if *id == ao_gui::GfxId(0xe2))));
+        s.zone.inventory.get_mut(&0x40).unwrap().a &= !0x40;
+        o.frame(&mut s, 0.016);
         assert_eq!(s.gui.canvas_items(iw, "grid").len(), 32);
         png(&mut s, &mut o, "inventory-grid");
         s.hud.set_inventory_list(true);
@@ -2124,7 +2205,7 @@ mod tests {
         // the server answers: the cloak is worn
         s.zone.apply_inventory(&inv::InventoryMsg::ContainerAdd { item: inv::item_identity(0x40), container: mine, slot: 0x13 });
         o.frame(&mut s, 0.016);
-        assert_eq!((s.gui.canvas_items(w, "items").len(), s.hud.inventory.as_ref().unwrap().positions.get(0x40)), (1, None));
+        assert_eq!((s.gui.canvas_items(w, "items").len(), s.hud.inventory.as_ref().unwrap().positions.get(0x40)), (16, None));
         png(&mut s, &mut o, "dnd-worn");
         // the worn cloak onto the bag cell (2, 1): unequip to "any free slot", the item appears in the cell it was dropped on
         dnd!(s, o, wear_xy(&s, 1, 3), bag_xy(&s, (2, 1)));
