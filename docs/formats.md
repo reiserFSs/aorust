@@ -395,6 +395,9 @@ The client has **no sky data in the playfield records**: the sky is a set of FXS
   peak/wrap and disabled Use; `horizon_directionals_light_world_diffuse_and_specular_with_a_live_palette`
   checks real headless GPU diffuse animation and specular on black diffuse.
   No retail-binary frame comparison or live login is claimed.
+  Exercised verification: isolated release workspace tests passed2077,
+  ignored63 across40 suites; both named regressions passed. Strict release
+  workspace/all-target Clippy with `-D warnings` passed (`-j2` for both).
 
 
 #### Aurora render cadence correction, 2026-10-15
