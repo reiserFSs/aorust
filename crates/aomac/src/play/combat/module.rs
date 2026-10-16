@@ -1005,6 +1005,7 @@ mod tests {
         // /assist: the selected NPC is not fighting -> refused; once it fights `other`, `other` becomes the selection
         assert_eq!(m.assist(&z), Err("Feedback_TargetIsNotInFight"));
         z.dynels.insert(t + 1, z.dynels[&t].clone());
+        m.combat.add_test_char(t + 1, "AssistTarget", true, 50);
         m.on_frame(&n3_frame(0, 0, net::attack(t, Identity { kind: DYNEL_CHAR, instance: t + 1 }, 0)));
         assert_eq!(m.assist(&z), Ok(t + 1));
         z.character_stats.entry(t).or_default().insert(0xc4, 0);

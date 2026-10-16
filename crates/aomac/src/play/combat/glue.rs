@@ -790,7 +790,10 @@ mod health_tests {
         assert_eq!(combat.char(2).unwrap().health(), 37);
         assert_eq!(zone.dynels[&2].health, 37);
         assert_eq!(zone.stat_of(2, ao_formats::stats::HEALTH), Some(37));
-        assert!(matches!(update.as_slice(), [CombatEvent::Health { health: 37, delta: -3, .. }]));
+        assert!(matches!(update.as_slice(), [
+            CombatEvent::Floating { dynel: 2, amount: 3, category: 0x16, .. },
+            CombatEvent::Health { health: 37, delta: -3, .. },
+        ]));
         // A repeated authoritative value must not subtract its feedback delta a second time.
         apply(&mut combat, &mut zone, packet(0x3710_256C, 2, &[37, -3, 95, 0, CHAR_KIND, 1, 0]));
         assert_eq!(zone.dynels[&2].health, 37);
@@ -808,7 +811,10 @@ mod health_tests {
         assert_eq!(zone.stat_of(1, 0x25), Some(2));
         // HealthDamage sets the absolute value before calling the death routine.
         let death = apply(&mut combat, &mut zone, packet(0x3710_256C, 2, &[5, -32, 95, 4, CHAR_KIND, 1, 0]));
-        assert!(matches!(death.first(), Some(CombatEvent::Health { health: 5, .. })));
+        assert!(matches!(death.as_slice(), [
+            CombatEvent::Floating { dynel: 2, amount: 32, .. },
+            CombatEvent::Health { health: 5, .. }, ..
+        ]));
         assert_eq!(zone.dynels[&2].health, 0);
         assert!(death.iter().any(|e| matches!(e, CombatEvent::Died { dynel: 2, cause: 4 })));
     }

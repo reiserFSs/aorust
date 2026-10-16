@@ -1289,7 +1289,7 @@ mod tests {
             own: id(own),
             name: &|i| (i.kind == 50000).then(|| names.get(&i.instance).map(|s| s.to_string())).flatten(),
             text: &|c, i| db.by_id(c, i),
-            is_npc: &|i| npcs.contains(&i.instance),
+            is_npc: &|i| i.instance == 5 || npcs.contains(&i.instance),
             in_pet_list: &|i| i.instance == 5,
             npc_state: &|_| false,
             nano_name: &|i| Some(format!("Nano#{i}")),
@@ -1335,7 +1335,7 @@ mod tests {
         assert_eq!(classify(&hit, &ctx)[0].class, 0x4200_0007);
         let feature = LogCtx { npc_state: &|_| true, ..ctx };
         assert_eq!(classify(&hit, &feature)[0].class, 0x4200_0006);
-        let health = LogEvent::Stat { who: id(2), stat: 27, new: 20 };
+        let health = LogEvent::Stat { who: id(2), stat: 27, new: 20, alien_level: None };
         let remote = LogCtx { stat: &|_, st| (st == 27).then_some(20), ..ctx };
         assert!(classify(&health, &remote).is_empty(), "already-applied remote hit must not repeat");
     }
@@ -1488,7 +1488,8 @@ mod tests {
             name: &|_| Some("Testy".into()),
             text: &|cat, key| (cat == 110 && key == elf_hash("Feedback_GainedAlienXP")).then(|| "You gained %d alien xp.".into()),
             is_npc: &|_| false,
-            is_own_pet: &|_| false,
+            in_pet_list: &|_| false,
+            npc_state: &|_| false,
             nano_name: &|_| None,
             stat: &|_, stat| match stat { 0x28 => Some(90), 0xa9 => Some(2), 0xb2 => Some(100), _ => None },
             weapon: &|_, _, _| None,
