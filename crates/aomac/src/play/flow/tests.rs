@@ -530,22 +530,32 @@ fn create_reference_physical_binding_fires_on_release_only() {
     let Some(mut r) = rig() else { return };
     r.p.screen = Screen::InWorld;
     r.p.awaiting_alive = false;
+    r.p.gui.set_window_visible(r.p.login_w.unwrap(), false);
+    r.p.gui.clear_focus();
+    r.p.zone = zone::Zone::new(42);
+    r.p.chat = Some(super::super::chat::Chat::new(false));
+    let target = ao_net::msg::Identity { kind: 50000, instance: 77 };
+    r.p.zone.dynels.insert(77, zone::DynelState { name: "Reference77".into(), pos: [0.0; 3], yaw: None, npc: false, side: 0, level: 1, health: 100, max_health: 100 });
+    r.p.zone.set_target(Some(target));
     let mut hud = super::super::hud::Hud::new(&mut r.p.gui, &r.p.dir, (1280, 800)).unwrap();
     let provider = super::super::controls::provider_hash("ACTION_CREATEREF");
     hud.dvalues.set("KeyBindings", super::super::dvalue::Variant::Archive(format!("<Archive name=\"KeyBindings\" code=\"0\"><Int32 name=\"Version\" value=\"7\"/><Array name=\"Bind\"><Archive code=\"0\"><Int32 name=\"Input\" value=\"43\"/><Int64 name=\"Provider\" value=\"{provider}\"/></Archive></Array></Archive>")));
     r.p.hud = Some(hud);
-    let key = |r: &mut Rig, pressed| r.p.game_input(ao_render::GameInput::Key { code: ao_render::KeyCode::F5, pressed, repeat: false }, &mut r.host);
+    let key = |r: &mut Rig, pressed| {
+        r.p.game_input(ao_render::GameInput::Key { code: ao_render::KeyCode::F5, pressed, repeat: false }, &mut r.host);
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+    };
     key(&mut r, true);
-    assert!(!r.p.hud.as_mut().unwrap().take_create_reference());
+    assert!(r.p.chat.as_mut().unwrap().take_outbox().is_empty(), "press must not request a reference");
     key(&mut r, false);
-    assert!(r.p.hud.as_mut().unwrap().take_create_reference());
-    assert!(!r.p.hud.as_mut().unwrap().take_create_reference());
+    assert_eq!(r.p.chat.as_mut().unwrap().take_outbox(), [ao_net::n3::outgoing::n3_frame(0, 42, ao_net::n3::info::request(42, target))]);
+    assert!(!r.p.hud.as_mut().unwrap().take_create_reference(), "Play must consume the HUD action exactly once");
     key(&mut r, false);
-    assert!(!r.p.hud.as_mut().unwrap().take_create_reference(), "a binding capture's unarmed release must not act");
+    assert!(r.p.chat.as_mut().unwrap().take_outbox().is_empty(), "a binding capture's unarmed release must not act");
     key(&mut r, true);
     r.p.game_input(ao_render::GameInput::FocusLost, &mut r.host);
     key(&mut r, false);
-    assert!(!r.p.hud.as_mut().unwrap().take_create_reference(), "focus loss cancels the held provider");
+    assert!(r.p.chat.as_mut().unwrap().take_outbox().is_empty(), "focus loss cancels the held provider");
 }
 
 #[test]

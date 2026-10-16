@@ -87,16 +87,22 @@ impl HudKnowledge {
         self.positions = Default::default();
         let keys: Vec<_> = self.store.entries().map(|(k, _)| k).collect();
         let mut saved = Vec::new();
-        if let Some(Variant::Archive(src)) = d.get(CONFIG)
-            && let Ok(root) = ao_gui::xml::parse(src)
-        {
+        let config = match d.get(CONFIG) {
+            Some(Variant::Archive(src)) => ao_gui::xml::parse(src).ok(),
+            _ => None,
+        };
+        if let Some(root) = config {
             let mut id = None;
             for e in &root.children {
-                if e.attr("name") == Some("item_id") { id = pair(e.attr("value").unwrap_or(""), "Identity"); }
-                if e.attr("name") == Some("item_pos")
-                    && let Some(id) = id.take()
-                    && let Some((x,y)) = pair(e.attr("value").unwrap_or(""), "IPoint")
-                { saved.push((id,(x as usize,y as usize))); }
+                match e.attr("name") {
+                    Some("item_id") => id = pair(e.attr("value").unwrap_or(""), "Identity"),
+                    Some("item_pos") => {
+                        if let (Some(id), Some((x,y))) = (id.take(), pair(e.attr("value").unwrap_or(""), "IPoint")) {
+                            saved.push((id,(x as usize,y as usize)));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         // GUI 100cecf1 restores ordered pairs only until the first mismatch.
@@ -112,9 +118,9 @@ impl HudKnowledge {
 
     pub fn save(&self, d: &mut DValues) {
         if !self.loaded || self.read_error { return; }
-        if let Some(dir) = d.char_dir()
-            && let Err(e) = self.store.save(&dir.join("References.bin"))
-        { eprintln!("prefs: References.bin: {e}"); }
+        if let Err(e) = d.char_dir().map_or(Ok(()), |dir| std::fs::create_dir_all(dir).and_then(|()| self.store.save(&dir.join("References.bin")))) {
+            eprintln!("prefs: References.bin: {e}");
+        }
         let mut root = match d.get(CONFIG) {
             Some(Variant::Archive(src)) => ao_gui::xml::parse(src).ok(),
             _ => None,
@@ -225,11 +231,9 @@ impl HudKnowledge {
                     if !self.dragging && (mods.shift || self.qualified)
                         && to.and_then(|p| self.positions.at(p)) == Some(key)
                     { self.inspect(key); }
-                    else if self.dragging
-                        && let Some(to) = to
-                        && self.positions.at(to).is_none()
-                        && let Some(from) = self.positions.get(key)
-                    { self.positions.move_cell(from,to); self.dirty = true; self.save(d); }
+                    else if let Some((from,to)) = to.filter(|to| self.dragging && self.positions.at(*to).is_none()).and_then(|to| self.positions.get(key).map(|from| (from,to))) {
+                        self.positions.move_cell(from,to); self.dirty = true; self.save(d);
+                    }
                 }
                 self.dragging = false;
             }
@@ -304,7 +308,10 @@ impl HudKnowledge {
             let Some((col,row)) = self.positions.get(key) else { continue; };
             let (x,y) = grid::cell_origin(col,row,(self.gap,grid::SPACING));
             let (title,icon) = match r {
-                Reference::Item {low,..} => stats.item_info(gui,*low as i32).unwrap_or_default(),
+                Reference::Item {low,high,ql} => {
+                    let item=ao_net::n3::world::AcgItem {low_id:*low as i32,high_id:*high as i32,level:*ql as i32};
+                    stats.shop_info(gui,item).map(|(name,_,_,icon)| (name,icon.map(|id| { let (w,h)=gui.gfx().size(id); (id,w,h) }))).unwrap_or_default()
+                }
                 Reference::Character {name,..} => (character_name(name),Some((GfxId(0xb8),gui.gfx().size(GfxId(0xb8)).0,gui.gfx().size(GfxId(0xb8)).1))),
             };
             self.icons.push((key,icon));

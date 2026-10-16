@@ -56,11 +56,13 @@ impl ReferenceStore {
         }
         name.truncate(MAX_NAME);
         for (&key, reference) in &mut self.entries {
-            if let Reference::Character { identity_type: old_type, identity_id: old_id, name: old_name } = reference
-                && *old_type == identity_type && *old_id == identity_id
-            {
-                *old_name = name;
-                return Ok(key);
+            match reference {
+                Reference::Character { identity_type: old_type, identity_id: old_id, name: old_name }
+                    if *old_type == identity_type && *old_id == identity_id => {
+                        *old_name = name;
+                        return Ok(key);
+                    }
+                _ => {}
             }
         }
         self.insert(Reference::Character { identity_type, identity_id, name })

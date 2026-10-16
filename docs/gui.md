@@ -1691,6 +1691,12 @@ shared Rollup/DockAreas persistence. `Preferences_t::OpenGamePrefs`
 and load limit **20**; `InventoryGUIModule::SlotInitialize` **0x100c722f**
 loads it. Binary storage evidence and malformed-input checks are in
 `docs/formats.md`. Failed loads cannot overwrite an existing reference file.
+The native `OpenGamePrefs` creates the character directory before reference
+initialization (`CreateDirectoryA`); the reference save follows the existing
+shortcut preference convention and creates that directory before its first
+write. This matters for a new character whose other preferences have not
+yet been flushed. Item reference labels and icons resolve both ACG template
+endpoints at the saved quality level through the existing metadata cache.
 
 Regression `native_reference_grid_inspects_moves_deletes_and_restores` uses
 only in-memory GUI input and private preference files: native icon/badge art,

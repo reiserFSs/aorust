@@ -1161,9 +1161,9 @@ impl Hud {
         self.stats.input(gui, zone, ev, mods);
         let mut unclaimed = Vec::new();
         for (slot, x, y) in self.stats.take_drops() {
-            if let Some(entry) = zone.inventory.get(&slot)
-                && self.knowledge.drop_item(gui, entry.item, x, y, &mut self.dvalues)
-            { continue; }
+            if zone.inventory.get(&slot).is_some_and(|entry| self.knowledge.drop_item(gui, entry.item, x, y, &mut self.dvalues)) {
+                continue;
+            }
             let info = zone.inventory.get(&slot).and_then(|e| self.stats.item_info(gui, e.item.low_id));
             let claimed = info.is_some_and(|(name, icon)| self.shortcuts.iter_mut().any(|bar| bar.drop_item(gui, slot, &name, icon, x, y)));
             if !claimed {
