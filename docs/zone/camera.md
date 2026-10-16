@@ -49,12 +49,19 @@ The forward/back/strafe slots first call `N3Msg_GetMovementMode()`; mode 8 (sitt
 (`MovementWhileSitting`). Its registered handler [GUI 0x10027d5b, registration 0x1002ada6] only calls `TipSystem_t::Event`;
 it does not stand or toggle sitting. The ordinary movement action still goes through the seated FSM permission table.
 
-**`*_GLOBAL_*` (arrow keys).** `FUN_10027e46` [GUI 0x10027e46]: if the input mode `TextInputMode` (3) is off → active; if on, a
-cursor key moves only when the focused text view is not a single-line `TextRenderer_c` flagged `0x8000` or Ctrl/Alt is held
-(`GetQualifiers & 0x30`); every other key only when Ctrl/Alt is held. Also requires `*param_6 == 1` (initial press, so no key
-repeat). Implemented as: while `set_text_input(true)` only the arrows with Ctrl or Alt act; the others (WASD…) never do.
-[INFERENCE] The global bindings are matched with Ctrl/Alt held (they test the modifiers themselves); other bindings need an exact
-`id | modifiers` match.
+**`*_GLOBAL_*` modifier matching [RE, resolved].** `InputConfig_t::ProcessInput` [GUI 0x1001a31a] first calls the user-binding dispatcher
+`FUN_100180fe`. That dispatcher emits exact `id | modifiers` providers, then independently looks up the bare id and emits providers with `+0x71`
+set (the global movement providers registered by `FlowControlModule_t` 0x1002abd6). This is not a fallback: an exact modified binding does not
+suppress a global provider on the same physical key. Shift, Ctrl and Alt all leave the bare global provider eligible; ordinary providers still
+require the exact input. `Controls::on_key` implements this for every global movement slot, including rebound non-arrow keys.
+
+**Text-input filter [RE, corrected from the old inverted decompile reading].** `FUN_10027e46` [GUI 0x10027e46] returns true outside `TextInputMode` (3).
+Inside it, arrows 32..35 require a focused `TextRenderer_c` with `+0x194 & 0x8000`, and **no Alt**; missing focus, a different view type, a clear
+flag, or Alt returns false. Other global keys require Alt. Raw assembly 0x10027eae tests `[ESI] & 0x30`, jumps directly to the false return when
+nonzero, and otherwise sets `BL = 1` at 0x10027eba; 0x10027eb5 reverses that branch for non-arrows. ESI is the qualifier argument
+(`SlotMovementGlobalForward` 0x100289ae). `FUN_100180fe` maps Shift to 3, **Ctrl to 0xc**, **Alt to 0x30**, so Ctrl is not the Alt gate.
+The slots require repeat mode 1 (`*param_6 == 1`), not autorepeat. The existing `set_text_input` provider represents the focused chat text entry.
+Regressions: `native_100180fe_globals_do_not_lose_to_modified_bindings`, `native_10027e46_text_input_global_filter`.
 
 **Fixed (non-rebindable) camera keys** (the compiled key table inside GUI.dll, text block at [GUI 0x101aab18..0x101adcd8]: lines `COMMAND_X [ & mode ] = KEY`; commands in `Setupf/commands.txt`):
 Numpad 4/6/2/8 = rotate camera left/right/up/down (press and release both bound, `FastRepeatMode`), Numpad +/− = zoom in/out
@@ -565,7 +572,7 @@ ordering; it does not instantiate an OS window or prove native report delivery.
   sensitivity 10 = 1 rad. With the right button and **Ctrl held** the look is mode 1 (camera only); releasing Ctrl returns to mode 2.
 * `N3Msg_MouseMovement`: character turn by `dx` (action 0x2B → sent as a sync `0x16` with a rotation, never as 0x2B); pitch `dy`
   (inverted by `s_nInverted`); the camera pitches by `dy` only if `RMBMouseLook1st/3rd` (`MouseCameraControl(0, dy)`). If the character is
-  turning with the keys when the first movement arrives (movement state 3/4), the turn is stopped (0xE / 0xB) and replaced by a strafe (7 / 5).
+  turning with the keys when the first movement arrives (turn direction 3/4 at FSM +0x24 and vehicle turn input +0x368 nonzero), the turn is stopped (0xE / 0xB) and replaced by a strafe (7 / 5).
 * While a look is running (`DAT_102e2588`, set by both look messages, cleared by `End*MouseLook`) `N3Msg_MovementChanged` [GC 0x10018b5c]
   remaps turn-left 0xC→7, turn-right 9→5 and their stops 0xE→8, 0xB→6 (A/D strafe during a right drag). `Controls` emits the final actions
   and, **deliberately unlike the client**, remembers which action each key started and sends the matching stop (the client would send the strafe
@@ -573,6 +580,11 @@ ordering; it does not instantiate an OS window or prove native report delivery.
 * Release (`FUN_1002c469`, `FUN_1002c14d`/`FUN_1002c0e5`): if no look was active or the accumulated movement is ≤ **0.02** (`_DAT_101aeaf4`) it
   is a click (left: select the object under the cursor — `N3Msg_GetNextTarget`/`SwitchTarget`; right: `N3Msg_DefaultActionOnDynel`; double click
   with `DoubleclickAction`); then the look ends (`N3Msg_EndCameraMouseLook` / `N3Msg_EndMouseLook`).
+  `N3Msg_EndMouseMovement` [GC 0x10019a38] separately clears the look flag, stops the active turn (direction 4 → 0xB, otherwise 0xE), and stops strafing with 8/6.
+  `Controls::end_look` now delivers that right-look release to `Movement::end_mouse_look`; a camera-only release uses `end_camera_look` and does not stop keyboard turning.
+  `N3Msg_MouseMovement` [GC 0x1001964b] tests **movement mode 7 = Fly**, not jumping: it sends zero camera pitch in flight, irrespective of the RMB first/third-person pitch prefs.
+  Outside flight the existing per-camera RMB preference gates remain unchanged. Mode 8 is SitGround and continues through the existing movement permission table.
+
 * Middle button = input 9 = forward while held (binding table).
 * **Both buttons = forward: not in the client [RE, negative].** Every layer maps buttons 1:1: `AnarchyOnline.exe` `FUN_00404a66` (window proc;
   `0x201/0x203/0x202` → 1/3/4, `0x204/0x206/0x205` → 5/7/8, `0x207/0x209/0x208` → 9/11/12, `InputConfig_t::AddUserInput`), `InputConfig_t::
@@ -581,13 +593,37 @@ ordering; it does not instantiate an OS window or prove native report delivery.
   `N3Msg_MouseMovement`/`MovementChanged` [GC] read no button state (`GetAsyncKeyState` is not imported by any game DLL). `Controls` therefore does not
   move on both buttons (test `both_buttons_do_not_move_forward`); holding both starts the two looks as the client does. The wheel/middle button is the mouse forward.
 
-## 6. Not resolved
+## 6. Retained input/zoom exactness (resolved)
 
-* Mode 1/2 wheel / key zoom: the client zooms them through `CameraVehicle_t::Forward` → `ZoomSteer` [N3 0x1001db64] (`SteeringSeek` along the line to the look target, stops at 0.7 m / 25 m)
-  and a `ForcedUpdate` at the end; `Camera3p` stores the resulting chase distance directly [INFERENCE] (`zoom_in_by`). The `+0x1a4` direct control and the `Turn` / `Strafe` / `MoveUp` inputs
-  (`CalcLateralSteering` [0x1001e0ae]) are never set by anything reachable (`+0x1a4` only ever 0; no caller of `Turn`/`Strafe`/`MoveUp` besides the n3Camera's own flags): not ported.
-* The movement-state values 3/4/7/8 used by `N3Msg_MouseMovement` (3 = turning left, 4 = turning right by the keys, 7 = jump, 8 = sitting; from the branch
-  structure), `N3Msg_EndMouseLook`, `FUN_1006ed98`/`FUN_10070506` (movement controller state getters, Gamecode).
+* **Modes 1/2 wheel zoom [RE].** `FUN_100200ef` [N3 0x100200ef] accumulates `ZoomSpeed/10 * notches` in camera `+0x204` and calls vehicle `Forward`
+  [0x1001d73e], which stores it at vehicle `+0x1b8`, **not** chase radius `+0x198`. Every frame, before vehicle integration, `FUN_10022345`
+  [0x10022808..0x1002298d] computes the actual radius, updates pending by `radius - previous_radius` (camera `+0x208`), and stores the new previous radius.
+  A direction crossing or magnitude below 0.3 clears Forward, halts the vehicle, and calls `ForcedUpdate(1)` [0x1001e5ac], storing the exact measured radius.
+  At radius below 0.8 with inward pending, it clears pending and applies the existing `ZoomTo1stPerson` preference.
+* **`ZoomSteer` [N3 0x1001db64].** At each integrator substep, positive Forward seeks only for squared radius above **0.4899999797344208**
+  (`f64` at 0x1003e028); negative Forward seeks only below **625** (`f32` at 0x1003e030). Otherwise it halts.
+  The literal seek target is `look + (look - pos) * (2 * Forward)`; it is not a normalized radial displacement.
+  `Vehicle_t::SteeringSeek` [Vehicle 0x1000a87c] requests top-speed velocity toward that target, multiplies `(desired - velocity)` by max force,
+  then the existing integrator clamps force/speed and integrates. Mode 1's attractor remains higher priority [0x1001e797]; mode 2 uses
+  the same zoom branch before fixed-camera arrival [0x1001f752]. The port now follows this cadence instead of directly decrementing chase distance.
+* **Modes 1/2 key zoom [RE, correction].** Numpad zoom is **not** ZoomSteer: `FUN_1002118c` [N3] directly `SetRelPos`s along the actual offset,
+  `ZoomSpeed * dt` per frame, maximum 25 m. Below 0.8 inward it clears the zoom-in flag and applies `ZoomTo1stPerson`; at rest it updates/stores
+  the actual offset/radius. `StopRotate*`/`StopZoom*` also store the measured radius. The user-approved FOV/defaults are unchanged.
+* **Movement-state stale unknown [PASS, source/RE].** `FUN_1006ed98` [GC] returns `vehicle +0x178`; `FUN_10070506` returns FSM `+0x24`,
+  **turn direction** (3 left, 4 right), not movement mode. `FUN_100704e6` reads mode `+4`: 7 Fly, 8 SitGround
+  (docs/zone/movement.md §1). Existing `Movement::mouse_turn` already consumes the actual turn direction and turn input, including
+  the initial mouse-turn start event that drops its delta and the existing sitting permission gate.
+  Regressions: `native_1001964b_turn_direction_and_release_use_live_fsm`, `native_1001964b_flight_blocks_rmb_camera_pitch_not_orbit`,
+  `native_1001db64_wheel_seeks_before_storing_measured_distance`, `native_1001db64_squared_limits_and_seek_target_are_literal`,
+  `native_1002118c_key_zoom_places_vehicle_directly`.
+  **Headless final gate (2026-10-16):** isolated `origin/main` rebase plus this source, `cargo test --release --workspace -j2`
+  passed (2146 tests, 64 ignored, exit 0); `cargo clippy --release --workspace --all-targets -j2 -- -D warnings` passed (exit 0).
+  Both used the private worktree target; no window, desktop input, screenshots, login, FOV/default retuning, or game-data copies.
+  Publication rebase onto the additive Legacy update: `cargo test --release -p aomac camera -j2` passed (70 passed, 1 ignored),
+  `cargo test --release -p aomac controls -j2` passed (27 passed), `cargo test --release -p aomac native_100 -j2` passed (12 passed),
+  followed by the same strict workspace/all-target Clippy command (exit 0). The full workspace gate was not repeated for that additive rebase.
+* **Intentionally omitted unreachable controls.** `+0x1a4` is only ever 0; no reachable caller sets `Turn`/`Strafe`/`MoveUp`
+  (`CalcLateralSteering` [N3 0x1001e0ae]). No generalized controller, guessed smoothing, or new numeric calibration is introduced.
 
 ## 7. Camera vehicles and scripted views (Ctrl+F8 / Shift+F8)
 

@@ -485,13 +485,15 @@ impl Player {
             match c {
                 Cmd::Move(a) => self.movement.action(a, self.clock),
                 Cmd::MouseTurn { dx, dy } => self.movement.mouse_turn(dx, dy, self.clock),
+                Cmd::EndMouseLook => self.movement.end_mouse_look(self.clock),
+                Cmd::Camera(CamCmd::Pitch { dy }) => self.camera.mouse_pitch(dy, self.movement.fsm().mode),
                 Cmd::ToggleWalk => self.movement.toggle_run(self.clock),
                 Cmd::Camera(cc) => {
                     if let Some(turn) = self.camera.apply(&cc) {
                         self.movement.sync_camera_look(turn, self.clock);
-                        self.movement.end_mouse_look(self.clock);
+                        self.movement.end_camera_look(self.clock);
                     } else if cc == CamCmd::EndLook {
-                        self.movement.end_mouse_look(self.clock);
+                        self.movement.end_camera_look(self.clock);
                     }
                 }
                 // Controls-classified world clicks are consumed by `Play::interact_mouse`; item pick-up has no consumer yet.

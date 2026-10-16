@@ -175,11 +175,13 @@ struct Vehicle {
     blind: bool,
     /// `SteeringCamArrive`'s function-static running average of the substep time (`_DAT_1005c864`, first call: that substep).
     frame_avg: Option<f32>,
+    /// `CameraVehicle_t +0x1b8`, set by `Forward`, distinct from chase distance.
+    zoom: f32,
 }
 
 impl Default for Vehicle {
     fn default() -> Self {
-        Self { pos: Vec3::ZERO, vel: Vec3::ZERO, dist: CHASE_DEFAULT_DISTANCE, sees: false, steer: Vec3::ZERO, blind: false, frame_avg: None }
+        Self { pos: Vec3::ZERO, vel: Vec3::ZERO, dist: CHASE_DEFAULT_DISTANCE, sees: false, steer: Vec3::ZERO, blind: false, frame_avg: None, zoom: 0.0 }
     }
 }
 
@@ -223,6 +225,23 @@ impl Vehicle {
         self.run(dt, |v, h| v.arrive_step(target, radius, h));
     }
 
+    /// N3 0x1001db64 + Vehicle 0x1000a87c: squared-radius gates and a seek
+    /// target `look + (look - pos) * (2 * Forward)`, not a distance decrement.
+    fn zoom_step(&mut self, look: Vec3, h: f32) {
+        let to = look - self.pos;
+        let r2 = to.length_squared();
+        if !((r2 > ZOOM_STEER_MIN * ZOOM_STEER_MIN && self.zoom > 0.0)
+            || (r2 < MAX_DISTANCE * MAX_DISTANCE && self.zoom < 0.0)) {
+            self.vel = Vec3::ZERO;
+            return;
+        }
+        let target = look + to * (2.0 * self.zoom);
+        let desired = (target - self.pos).normalize_or_zero() * VEHICLE_MAX_SPEED;
+        let force = ((desired - self.vel) * VEHICLE_MAX_FORCE).clamp_length_max(VEHICLE_MAX_FORCE);
+        self.vel = (self.vel + force * h / VEHICLE_MASS).clamp_length_max(VEHICLE_MAX_SPEED);
+        self.pos += self.vel * h;
+    }
+
     /// `CameraVehicle_t::SteeringCamArrive(target, force, 0.01)` @N3 0x1001dc46 for one substep: a hitch halts the camera;
     /// a wanted spot farther away than the look target in about the same direction is swapped for a spot beside the look
     /// target, so the camera swings round the character instead of flying through it.
@@ -253,8 +272,8 @@ impl Vehicle {
         self.vel = Vec3::ZERO;
     }
 
-    /// `CameraVehicle_t::CalcSteering` @N3 0x1001e797 without an attractor, zoom or direct control (none of them is reachable
-    /// in mode 1: `+0x1a4` is only ever 0, the zoom is the n3Camera's) and with `+0x1cc` (two-shot) and `+0x1e8` (stay behind)
+    /// `CameraVehicle_t::CalcSteering` @N3 0x1001e797 after attractor/zoom
+    /// priority and with unreachable direct control (`+0x1a4`) and two-shot/stay-behind
     /// off, which `FUN_10022345` forces every frame (@0x100223b2, @0x100223c3): the camera wants to sit `dist` from the look
     /// target along its current line to it; blocked, the sensor's steer direction is added, in the clear it is lifted off the
     /// ground (< 0.4 m); below the look target it is lifted again.
@@ -365,6 +384,8 @@ pub struct Camera3p {
     preferred: (f32, f32, f32),
     /// Wheel zoom still to apply, metres, positive = in (`n3Camera_t +0x204`).
     pending_zoom: f32,
+    /// `n3Camera_t +0x208`: prior frame's measured radius for wheel feedback.
+    zoom_radius: f32,
     keys: [bool; 6],
     /// First person: view offset from the avatar heading and look-down pitch (`CameraVehicleFirstPerson_t::SetRotAngles`).
     fp_yaw: f32,
@@ -411,6 +432,7 @@ impl Camera3p {
             dist: DEFAULT_DISTANCE,
             preferred: (0.0, elev, DEFAULT_DISTANCE),
             pending_zoom: 0.0,
+            zoom_radius: 0.0,
             keys: [false; 6],
             fp_yaw: 0.0,
             fp_pitch: 0.0,
@@ -501,7 +523,12 @@ impl Camera3p {
                 }
             }
             CamCmd::Zoom(notches) => self.wheel(notches),
-            CamCmd::Key { key, down } => self.keys[key as usize] = down,
+            CamCmd::Key { key, down } => {
+                self.keys[key as usize] = down;
+                if !down && self.mode != 3 && self.vehicle_placed {
+                    self.store_vehicle_offset(); // StopRotate*/StopZoom*: ForcedUpdate
+                }
+            }
             CamCmd::Reset => {
                 (self.yaw_off, self.elev, self.dist) = self.preferred;
                 self.pending_zoom = 0.0;
@@ -522,6 +549,12 @@ impl Camera3p {
             }
         }
         None
+    }
+
+    /// Gamecode 0x1001964b: flight (mode 7, not jump) sends zero camera pitch.
+    /// The normal first/third-person RMB preference callbacks remain in `apply`.
+    pub fn mouse_pitch(&mut self, dy: f32, movement_mode: u8) {
+        self.apply(&CamCmd::Pitch { dy: if movement_mode == 7 { 0.0 } else { dy } });
     }
 
     /// Ctrl+F8, `n3Camera_t::GetNextVisibleAttractor` @N3 0x10021987: drops the selected attractor and the wheel zoom still
@@ -597,14 +630,27 @@ impl Camera3p {
             self.pending_zoom = 0.0;
         }
         self.pending_zoom += self.prefs.zoom_speed / 10.0 * notches;
+        if self.mode != 3 {
+            self.vehicle.zoom = self.pending_zoom;
+        }
     }
 
     /// Distance change request (positive = in); switches to first person when it runs into the minimum.
     fn zoom_in_by(&mut self, metres: f32) {
-        if self.mode == 1 {
-            // [INFERENCE] `ZoomSteer` (@0x1001db64: seek along the line to the look target, stop at 0.7 m / 25 m) followed by
-            // `ForcedUpdate` leaves the chase distance changed by the zoom: stored directly.
-            self.vehicle.dist = (self.vehicle.dist - metres).clamp(ZOOM_STEER_MIN, MAX_DISTANCE);
+        if self.mode != 3 {
+            // Key zoom goes through SetRelPos (N3 0x1002118c), even in modes 1/2.
+            let off = self.vehicle.pos - self.pivot;
+            let next = (off.length() - metres).min(MAX_DISTANCE);
+            if next < FIRST_PERSON_BELOW && metres > 0.0 {
+                self.first_person = self.prefs.zoom_to_1st_person;
+                self.keys[CamKey::ZoomIn as usize] = false;
+                return;
+            }
+            self.vehicle.pos = self.pivot + off.normalize_or_zero() * next;
+            if self.vehicle.vel.length() < ORBIT_REST_SPEED {
+                self.store_vehicle_offset();
+            }
+            return;
         }
         self.dist -= metres;
         if self.dist <= FIRST_PERSON_BELOW && metres > 0.0 && self.prefs.zoom_to_1st_person {
@@ -614,6 +660,37 @@ impl Camera3p {
             return;
         }
         self.dist = self.dist.clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+
+    /// Event Update/ForcedUpdate stores the measured radius (and fixed-camera direction).
+    fn store_vehicle_offset(&mut self) {
+        let off = self.vehicle.pos - self.pivot;
+        let radius = off.length();
+        self.vehicle.dist = radius;
+        if self.mode == 2 && radius > 0.0 {
+            self.dist = radius;
+            self.yaw_off = (-off.x).atan2(off.z) - self.avatar_yaw;
+            self.elev = (off.y / radius).asin();
+        }
+    }
+
+    fn step_vehicle_wheel(&mut self) {
+        // N3 0x10022808..1002298d: feedback is sampled before the vehicle runs.
+        let radius = (self.vehicle.pos - self.pivot).length();
+        if radius < FIRST_PERSON_BELOW && self.pending_zoom > 0.0 {
+            self.pending_zoom = 0.0;
+            if self.prefs.zoom_to_1st_person { self.first_person = true; }
+        } else if self.pending_zoom != 0.0 {
+            let previous = self.pending_zoom;
+            self.pending_zoom += radius - self.zoom_radius;
+            if self.pending_zoom.signum() != previous.signum() || self.pending_zoom.abs() < ZOOM_STOP {
+                self.pending_zoom = 0.0;
+                self.vehicle.vel = Vec3::ZERO;
+                self.store_vehicle_offset(); // Halt + ForcedUpdate(1)
+            }
+            self.vehicle.zoom = self.pending_zoom;
+        }
+        self.zoom_radius = radius;
     }
 
     fn step_keys_and_zoom(&mut self, dt: f32) -> bool {
@@ -629,7 +706,7 @@ impl Camera3p {
         if zoom != 0.0 && !self.first_person {
             self.zoom_in_by(zoom);
         }
-        if !self.first_person && self.pending_zoom != 0.0 {
+        if !self.first_person && self.mode == 3 && self.pending_zoom != 0.0 {
             let p = self.pending_zoom;
             let step = if p.abs() >= 1.0 { dt * p * ZOOM_RATE } else { dt * ZOOM_RATE * p.signum() };
             self.pending_zoom = p - step;
@@ -663,6 +740,9 @@ impl Camera3p {
     /// between rooms and the ground under a point (scene frame).
     pub fn update_with(&mut self, avatar_pos: [f32; 3], avatar_yaw: f32, dt: f32, sight: &Sight) -> Camera {
         let clear = sight.clear;
+        if self.mode != 3 && self.vehicle_placed {
+            self.step_vehicle_wheel();
+        }
         let distance_change = self.step_keys_and_zoom(dt);
         self.follow_head();
         let feet = Vec3::from(avatar_pos);
@@ -698,6 +778,7 @@ impl Camera3p {
             // (`SetRelPosIgnoreCollision`, `Update`, `ForcedUpdate(0)`)
             self.vehicle.snap(optimal);
             self.vehicle.dist = (pivot - optimal).length();
+            self.zoom_radius = self.vehicle.dist;
         }
         let eye = match self.mode {
             // `DecideSnap` @N3 0x1001f537: inward immediate, outward 0.9 old + 0.1 candidate radius.
@@ -719,7 +800,10 @@ impl Camera3p {
             }
             // CameraVehicleFixedThird_t(damped): `SteeringCamArrive(optimal, 0.01)`
             2 => {
-                self.vehicle.run(dt, |v, h| v.cam_arrive_step(optimal, pivot, h));
+                self.vehicle.run(dt, |v, h| {
+                    if v.zoom != 0.0 { v.zoom_step(pivot, h); }
+                    else { v.cam_arrive_step(optimal, pivot, h); }
+                });
                 self.vehicle.pos
             }
             // CameraVehicle_t (`CalcSteering` @N3 0x1001e797), with the sensors and the blind-camera cut of `FUN_10022345`
@@ -738,8 +822,12 @@ impl Camera3p {
                 match self.views.as_ref().and_then(Views::selected) {
                     Some(v) => self.vehicle.arrive(v.pos, ATTRACTOR_RADIUS, dt),
                     None => self.vehicle.run(dt, |veh, h| {
-                        let want = veh.calc_steering(pivot, sight);
-                        veh.cam_arrive_step(want, pivot, h);
+                        if veh.zoom != 0.0 {
+                            veh.zoom_step(pivot, h);
+                        } else {
+                            let want = veh.calc_steering(pivot, sight);
+                            veh.cam_arrive_step(want, pivot, h);
+                        }
                     }),
                 }
                 self.vehicle.pos
@@ -780,6 +868,70 @@ mod tests {
 
     fn cam() -> Camera3p {
         Camera3p::new(&ControlPrefs::default(), Some(Vec3::Y * 1.5))
+    }
+
+    #[test]
+    fn native_1001db64_wheel_seeks_before_storing_measured_distance() {
+        for mode in [1, 2] {
+            let mut c = cam();
+            c.select_mode(mode);
+            c.update([0.0; 3], 0.0, 0.0);
+            let radius = (c.vehicle.pos - c.pivot).length();
+            let stored = c.vehicle.dist;
+            c.apply(&CamCmd::Zoom(1.0));
+            c.update([0.0; 3], 0.0, 0.01);
+            assert_eq!(c.pending_zoom, 2.0, "feedback is sampled before Run");
+            assert_eq!(c.vehicle.dist, stored, "Forward must not rewrite +0x198");
+            assert!(((c.vehicle.pos - c.pivot).length() - (radius - VEHICLE_MAX_FORCE / VEHICLE_MASS * 0.01 * 0.01)).abs() < 1e-5);
+            c.vehicle.pos = c.pivot + (c.vehicle.pos - c.pivot).normalize() * (radius - 1.8);
+            c.update([0.0; 3], 0.0, 0.0);
+            assert_eq!(c.pending_zoom, 0.0);
+            assert_eq!(c.vehicle.zoom, 0.0);
+            assert_eq!(c.vehicle.vel, Vec3::ZERO);
+            assert!((c.vehicle.dist - (radius - 1.8)).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn native_1001db64_squared_limits_and_seek_target_are_literal() {
+        for (radius, zoom, moves) in [(0.7, 1.0, false), (0.71, 1.0, true), (25.0, -1.0, false), (24.9, -1.0, true)] {
+            let mut v = Vehicle { pos: Vec3::Z * radius, zoom, ..Default::default() };
+            v.zoom_step(Vec3::ZERO, 0.01);
+            assert_eq!(v.vel != Vec3::ZERO, moves);
+        }
+        // Seek is not simply sign(Forward): the authored target can remain inward.
+        let mut v = Vehicle { pos: Vec3::Z * 5.0, zoom: -0.3, ..Default::default() };
+        v.zoom_step(Vec3::ZERO, 0.01);
+        assert!(v.pos.z < 5.0);
+    }
+
+    #[test]
+    fn native_1002118c_key_zoom_places_vehicle_directly() {
+        for mode in [1, 2] {
+            let mut c = cam();
+            c.select_mode(mode);
+            c.update([0.0; 3], 0.0, 0.0);
+            c.apply(&CamCmd::Key { key: CamKey::ZoomIn, down: true });
+            c.step_keys_and_zoom(0.01);
+            assert!(((c.vehicle.pos - c.pivot).length() - 4.8).abs() < 1e-5);
+            assert!((c.vehicle.dist - 4.8).abs() < 1e-5);
+            assert_eq!(c.vehicle.zoom, 0.0);
+        }
+    }
+
+    #[test]
+    fn native_1001964b_flight_blocks_rmb_camera_pitch_not_orbit() {
+        for third_person in [false, true] {
+            let mut c = Camera3p::new(&ControlPrefs { third_person, ..Default::default() }, None);
+            let before = (c.elev, c.fp_pitch);
+            c.mouse_pitch(0.2, 7);
+            assert_eq!((c.elev, c.fp_pitch), before);
+            c.mouse_pitch(0.2, 8);
+            assert_ne!((c.elev, c.fp_pitch), before, "mode 8 is sitting, not the flight gate");
+            let before = (c.elev, c.fp_pitch);
+            c.apply(&CamCmd::Orbit { dx: 0.0, dy: 0.1 });
+            assert_ne!((c.elev, c.fp_pitch), before);
+        }
     }
 
     #[test]

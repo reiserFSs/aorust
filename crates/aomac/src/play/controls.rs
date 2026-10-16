@@ -104,8 +104,8 @@ pub fn char_key_id(c: char) -> Option<u32> {
     }
 }
 
-/// What a binding triggers. The `*Global*` slots are the arrow keys (`SlotMovementGlobal*`), which keep working while
-/// typing when Ctrl/Alt is held (`FUN_10027e46` @GUI 0x10027e46).
+/// What a binding triggers. `*Global*` slots match the bare physical key even with modifiers;
+/// their text-focus filter is GUI 0x10027e46 (arrows without Alt, other keys with Alt).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Slot {
     Forward,
@@ -395,6 +395,8 @@ pub enum Cmd {
     Move(u8),
     /// `N3Msg_MouseMovement(dx, dy)` (action 0x2B): right-drag, turn the character by `dx` radians and pitch by `dy`.
     MouseTurn { dx: f32, dy: f32 },
+    /// `N3Msg_EndMouseMovement`: stop the mouse-turn axis as well as strafing.
+    EndMouseLook,
     /// `SlotMovementWalkToggle`: `N3Msg_PerformSpecialAction(0x12 - (GetLastSpeedMode() != 2))`.
     ToggleWalk,
     Camera(CamCmd),
@@ -502,7 +504,7 @@ impl Controls {
         self.ctrl || self.alt
     }
 
-    /// A text field has the keyboard (chat input): only the arrow keys with Ctrl/Alt still move.
+    /// The chat text entry has focus (`TextInputMode` + focused flagged TextRenderer).
     pub fn set_text_input(&mut self, on: bool) {
         self.text_input = on;
     }
@@ -536,18 +538,27 @@ impl Controls {
             return vec![];
         }
         let Some(kid) = key_id(code) else { return vec![] };
-        // The arrow slots test Ctrl/Alt themselves (FUN_10027e46), so their bindings must match with those held:
-        // [INFERENCE] the bare key id is the fallback for them.
-        let mut slots = self.lookup(kid | self.mods());
-        if slots.is_empty() {
-            slots = self.lookup(kid).into_iter().filter(|s| s.is_global()).collect();
-        }
-        // a key may drive several providers (the original has no conflict check: `FUN_100180fe` calls every provider of the input)
+        // GUI 0x100180fe dispatches global bare-key providers independently of the
+        // exact modified binding, even when that binding already has a consumer.
+        let qualified = kid | self.mods();
         let mut out = vec![];
-        for slot in slots {
-            let typing_ok = slot.is_fixed_camera() || (slot.is_global() && (self.ctrl || self.alt));
-            if !self.text_input || typing_ok {
-                out.extend(self.press(input, slot));
+        for global_pass in [false, true] {
+            for i in 0..self.bindings.len() {
+                let (bound, slot) = self.bindings[i];
+                if global_pass {
+                    if qualified == kid || bound != kid || !slot.is_global() {
+                        continue;
+                    }
+                } else if bound != qualified {
+                    continue;
+                }
+                // GUI 0x10027e46: arrows require no Alt; other globals require Alt.
+                // Ctrl is qualifier 0xc, not the tested 0x30.
+                let arrow = (id::CURSOR_LEFT..=id::CURSOR_DOWN).contains(&kid);
+                let typing_ok = slot.is_fixed_camera() || (slot.is_global() && (arrow != self.alt));
+                if !self.text_input || typing_ok {
+                    out.extend(self.press(input, slot));
+                }
             }
         }
         out
@@ -755,6 +766,9 @@ impl Controls {
         if self.active == Some(Look::Camera) {
             out.push(Cmd::Camera(CamCmd::EndLook));
         }
+        if self.active == Some(Look::Turn) {
+            out.push(Cmd::EndMouseLook);
+        }
         if self.active.is_some() {
             out.extend(self.stop_remapped());
         }
@@ -867,7 +881,7 @@ mod tests {
         c.on_key(KeyD, true);
         c.on_mouse_button(MouseButton::Right, true);
         c.on_mouse_motion(10.0, 0.0);
-        assert_eq!(c.on_focus_lost(), vec![Cmd::Move(6)]);
+        assert_eq!(c.on_focus_lost(), vec![Cmd::Move(6), Cmd::EndMouseLook]);
         assert_eq!(c.on_key(KeyD, true), vec![Cmd::Move(9)]);
         assert_eq!(c.on_key(KeyD, false), vec![Cmd::Move(0xB)]);
         c.set_text_input(true);
@@ -942,13 +956,34 @@ mod tests {
     }
 
     #[test]
-    fn typing_blocks_all_but_ctrl_arrows() {
+    fn native_10027e46_text_input_global_filter() {
         let mut c = ctl();
         c.set_text_input(true);
         assert_eq!(c.on_key(KeyW, true), vec![]);
-        assert_eq!(c.on_key(ArrowUp, true), vec![]);
+        assert_eq!(c.on_key(ArrowUp, true), vec![Cmd::Move(1)]);
+        c.on_key(ArrowUp, false);
         c.on_key(ControlLeft, true);
         assert_eq!(c.on_key(ArrowLeft, true), vec![Cmd::Move(0xC)]);
+        c.on_key(ArrowLeft, false);
+        c.on_key(AltLeft, true);
+        assert_eq!(c.on_key(ArrowLeft, true), vec![]);
+        c.bindings.push((104, Slot::GlobalForward));
+        assert_eq!(c.on_key(KeyW, true), vec![Cmd::Move(1)]);
+    }
+
+    /// GUI 0x100180fe's second dispatch is independent of the exact binding.
+    #[test]
+    fn native_100180fe_globals_do_not_lose_to_modified_bindings() {
+        let mut c = ctl();
+        c.bindings.push((id::CURSOR_UP | id::CTRL, Slot::Jump));
+        c.on_key(ControlLeft, true);
+        let cmds = c.on_key(ArrowUp, true);
+        assert!(cmds.contains(&Cmd::Move(1)));
+        assert!(cmds.contains(&Cmd::Move(0xF)));
+        c.on_key(ArrowUp, false);
+        c.on_key(ShiftLeft, true);
+        c.on_key(AltLeft, true);
+        assert_eq!(c.on_key(ArrowUp, true), vec![Cmd::Move(1)]);
     }
 
     #[test]
@@ -1024,7 +1059,7 @@ mod tests {
         assert_eq!(c.on_key(KeyA, false), vec![Cmd::Move(8)]);
         c.on_key(KeyD, true);
         c.on_key(KeyD, false);
-        assert_eq!(c.on_mouse_button(MouseButton::Right, false), vec![]);
+        assert_eq!(c.on_mouse_button(MouseButton::Right, false), vec![Cmd::EndMouseLook]);
         // after the drag turning is back to normal
         assert_eq!(c.on_key(KeyD, true), vec![Cmd::Move(9)]);
     }
@@ -1035,7 +1070,7 @@ mod tests {
         c.on_mouse_button(MouseButton::Right, true);
         c.on_mouse_motion(50.0, 0.0);
         assert_eq!(c.on_key(KeyD, true), vec![Cmd::Move(5)]);
-        assert_eq!(c.on_mouse_button(MouseButton::Right, false), vec![Cmd::Move(6)]);
+        assert_eq!(c.on_mouse_button(MouseButton::Right, false), vec![Cmd::EndMouseLook, Cmd::Move(6)]);
 
         c.on_mouse_button(MouseButton::Right, true);
         c.on_key(ControlLeft, true);

@@ -908,6 +908,13 @@ impl Movement {
             let a = if self.fsm.turn_dir == 4 { id::TURN_RIGHT_STOP } else { id::TURN_LEFT_STOP };
             self.movement_changed(a, 0.0, 0.0);
         }
+        self.end_camera_look(now);
+    }
+
+    /// Gamecode 0x10019597: camera-only look release stops strafing, not turning.
+    pub fn end_camera_look(&mut self, now: f32) {
+        self.sync_clock(now);
+        self.mouse_look = false;
         if self.fsm.strafe == 2 {
             self.movement_changed(id::STRAFE_LEFT_STOP, 0.0, 0.0);
             self.movement_changed(id::STRAFE_RIGHT_STOP, 0.0, 0.0);
@@ -2448,6 +2455,31 @@ mod tests {
                 assert_eq!(m.fsm().turn, 1);
             }
         }
+    }
+
+    /// GC 0x10070506 reads turn direction +0x24, not movement mode +4.
+    #[test]
+    fn native_1001964b_turn_direction_and_release_use_live_fsm() {
+        for (start, direction, stop, strafe) in [
+            (id::TURN_LEFT_START, 3, id::TURN_LEFT_STOP, id::STRAFE_LEFT_START),
+            (id::TURN_RIGHT_START, 4, id::TURN_RIGHT_STOP, id::STRAFE_RIGHT_START),
+        ] {
+            let mut m = Movement::new([0.0; 3], 0.0, 0);
+            m.action(start, 0.0);
+            assert_eq!(m.fsm.turn_dir, direction);
+            m.take_outgoing();
+            m.mouse_turn(0.0, 0.0, 0.0);
+            let out = m.take_outgoing();
+            assert_eq!(out[0].action, stop);
+            assert_eq!(out[1].action, strafe);
+            m.end_mouse_look(0.0);
+            assert_eq!(m.fsm.turn_dir, 0);
+            assert_eq!(m.fsm.strafe, 1);
+        }
+        let mut m = Movement::new([0.0; 3], 0.0, 0);
+        m.action(id::TURN_LEFT_START, 0.0);
+        m.end_camera_look(0.0);
+        assert_eq!(m.fsm.turn_dir, 3, "camera-only release leaves the keyboard turn");
     }
 
     #[test]
