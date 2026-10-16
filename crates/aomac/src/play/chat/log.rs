@@ -514,12 +514,14 @@ pub struct LogCtx<'a> {
     pub text: &'a dyn Fn(u32, u32) -> Option<String>,
     /// `SimpleChar_t` byte +0x21c != 0 (a non-player character).
     pub is_npc: &'a dyn Fn(Identity) -> bool,
-    /// `+0x21c != 0 && stat flag 0x8000000 && FUN_100523c3` (a pet owned by the client's character).
-    pub is_own_pet: &'a dyn Fn(Identity) -> bool,
+    /// Own pet-holder membership (GC100523c3); toxic action 0xd1 uses this alone.
+    pub in_pet_list: &'a dyn Fn(Identity) -> bool,
     /// Nano record name by nano instance id (`FUN_10082998` object, vtable +0x34).
     pub nano_name: &'a dyn Fn(i32) -> Option<String>,
     /// Current stat of a dynel (`GetStat(stat, ..)`), used for old values and the nano damage-type override 0x153.
     pub stat: &'a dyn Fn(Identity, i32) -> Option<i32>,
+    /// Player Features bit 0x800000 (GC10058a05), also set by full-update bit18.
+    pub npc_state: &'a dyn Fn(Identity) -> bool,
     /// Stat `0x1b4` of the item behind an `AttackInfo` (attacker, `slot`, special key): [`super::super::combat::arms::Armory::damage_type`].
     pub weapon: &'a dyn Fn(Identity, i32, i32) -> Option<i32>,
     pub filter: &'a ChatFilter,
@@ -931,7 +933,11 @@ fn line(class: u32, color: u32, text: String) -> LogLine {
 }
 
 fn pet_involved(ctx: &LogCtx, a: Identity, b: Identity) -> bool {
-    (ctx.is_own_pet)(a) || (ctx.is_own_pet)(b)
+    own_pet(ctx, a) || own_pet(ctx, b)
+}
+
+fn own_pet(ctx: &LogCtx, id: Identity) -> bool {
+    (ctx.is_npc)(id) && (ctx.stat)(id, 0).unwrap_or(0) & 0x0800_0000 != 0 && (ctx.in_pet_list)(id)
 }
 
 /// `FUN_1009a709` [GC 0x1009a709]: a valid damage-type stat.
@@ -969,8 +975,8 @@ pub fn classify(ev: &LogEvent, ctx: &LogCtx) -> Vec<LogLine> {
             let weapon = (ctx.weapon)(*attacker, *slot, *special).unwrap_or(DEFAULT_DAMAGE_TYPE);
             let dtype = over.unwrap_or_else(|| super::super::combat::log::weapon_damage_type(weapon));
             let cat = if ctx.is_own(*victim) {
-                // `[0x21c] == 0 && FUN_10058a05() == 0`: FUN_10058a05's input is unresolved ([GUESS] false)
-                if !(ctx.is_npc)(*attacker) {
+                // GC10058a05 reads the attacker's Features, not playfield flags.
+                if !(ctx.is_npc)(*attacker) && !(ctx.npc_state)(*attacker) {
                     0x1e
                 } else {
                     0x1d
@@ -1028,7 +1034,7 @@ pub fn classify(ev: &LogEvent, ctx: &LogCtx) -> Vec<LogLine> {
             if *delta < 0 {
                 let cat = if ctx.is_own(*who) {
                     0x1a
-                } else if (ctx.is_own_pet)(*who) {
+                } else if own_pet(ctx, *who) {
                     0x1c
                 } else if att.is_some_and(|a| ctx.is_own(a)) {
                     0x40
@@ -1066,7 +1072,7 @@ pub fn classify(ev: &LogEvent, ctx: &LogCtx) -> Vec<LogLine> {
                     if diff < 0 {
                         let cat = if own {
                             0x1a
-                        } else if (ctx.is_own_pet)(*who) {
+                        } else if own_pet(ctx, *who) {
                             0x1c
                         } else {
                             0x1b
@@ -1239,7 +1245,7 @@ fn action_lines(ctx: &LogCtx, who: Identity, action: i32, param: i32, a: Identit
         0xd1 if b.instance > 0 && a.instance > 0 => {
             if own {
                 combat(&Call::new(0x2c, who, b.instance), ctx, out);
-            } else if (ctx.is_own_pet)(who) {
+            } else if (ctx.in_pet_list)(who) {
                 combat(&Call::new(0x3f, who, b.instance), ctx, out);
             }
         }
@@ -1284,9 +1290,10 @@ mod tests {
             name: &|i| (i.kind == 50000).then(|| names.get(&i.instance).map(|s| s.to_string())).flatten(),
             text: &|c, i| db.by_id(c, i),
             is_npc: &|i| npcs.contains(&i.instance),
-            is_own_pet: &|i| i.instance == 5,
+            in_pet_list: &|i| i.instance == 5,
+            npc_state: &|_| false,
             nano_name: &|i| Some(format!("Nano#{i}")),
-            stat: &|_, _| None,
+            stat: &|i, st| (i.instance == 5 && st == 0).then_some(0x0800_0000),
             // Bob (3) carries a pistol in slot 6, Testy (1) too; everyone else fights bare-handed (the martial-arts / creature items: melee)
             weapon: &|a, slot, _| match (a.instance, slot) {
                 (3 | 1, 6) => Some(0x5a),
@@ -1305,6 +1312,32 @@ mod tests {
                 (l.class, c, l.line.text)
             })
             .collect()
+    }
+
+    #[test]
+    fn native_pet_membership_and_player_feature_feedback() {
+        let filter = ChatFilter::default();
+        let ctx = LogCtx {
+            own: id(1), name: &|i| Some(format!("char{}", i.instance)),
+            text: &|_, _| Some("feedback".into()),
+            is_npc: &|i| i.instance == 2, in_pet_list: &|i| i.instance == 2,
+            npc_state: &|_| false, nano_name: &|_| None,
+            stat: &|_, _| None, weapon: &|_, _, _| Some(91), filter: &filter,
+        };
+        assert!(!own_pet(&ctx, id(2)), "listed but unflagged is not a flagged pet");
+        let flagged = LogCtx { stat: &|_, st| (st == 0).then_some(0x0800_0000), ..ctx };
+        assert!(own_pet(&flagged, id(2)));
+        let not_npc = LogCtx { is_npc: &|_| false, ..flagged };
+        assert!(!own_pet(&not_npc, id(2)), "flag alone is insufficient");
+        let toxic = LogEvent::Action { who: id(2), action: 0xd1, param: 0, a: id(1), b: id(7) };
+        assert_eq!(classify(&toxic, &ctx)[0].class, class::YOUR_PET_HIT_BY_MONSTER);
+        let hit = LogEvent::Hit { attacker: id(3), victim: id(1), damage: 4, mode: 0, slot: 0, special: 0 };
+        assert_eq!(classify(&hit, &ctx)[0].class, 0x4200_0007);
+        let feature = LogCtx { npc_state: &|_| true, ..ctx };
+        assert_eq!(classify(&hit, &feature)[0].class, 0x4200_0006);
+        let health = LogEvent::Stat { who: id(2), stat: 27, new: 20 };
+        let remote = LogCtx { stat: &|_, st| (st == 27).then_some(20), ..ctx };
+        assert!(classify(&health, &remote).is_empty(), "already-applied remote hit must not repeat");
     }
 
     #[test]
@@ -1328,7 +1361,8 @@ mod tests {
             name: &|who| (who.kind == 50000).then(|| "Member".into()),
             text: &|cat, key| (cat == 110 && key == elf_hash("Feedback_CurrentTeamLootOrder")).then(|| "Loot order: %s".into()),
             is_npc: &|_| false,
-            is_own_pet: &|_| false,
+            in_pet_list: &|_| false,
+            npc_state: &|_| false,
             nano_name: &|_| None,
             stat: &|_, _| None,
             weapon: &|_, _, _| None,
@@ -1489,7 +1523,7 @@ mod tests {
     fn chat_filter_drops_matching_lines() {
         let Some(()) = with_ctx(1, &[2], |ctx| {
             let f = ChatFilter { enabled: true, rules: vec!["Snake".into()] };
-            let ctx2 = LogCtx { own: ctx.own, name: ctx.name, text: ctx.text, is_npc: ctx.is_npc, is_own_pet: ctx.is_own_pet, nano_name: ctx.nano_name, stat: ctx.stat, weapon: ctx.weapon, filter: &f };
+            let ctx2 = LogCtx { filter: &f, ..*ctx };
             let ev = LogEvent::Hit { attacker: id(2), victim: id(1), damage: 5, mode: 3, slot: 0, special: 0 };
             assert_eq!(classify(&ev, ctx).len(), 1);
             assert!(classify(&ev, &ctx2).is_empty());
@@ -1544,7 +1578,8 @@ mod tests {
             name: &|i| Some(format!("npc{:x}", i.instance)),
             text: &|c, i| db.by_id(c, i),
             is_npc: &|_| true,
-            is_own_pet: &|_| false,
+            in_pet_list: &|_| false,
+            npc_state: &|_| false,
             nano_name: &|_| None,
             stat: &|_, _| None,
             weapon: &|a, slot, sp| arms.damage_type(a.instance, slot, sp),

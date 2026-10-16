@@ -62,8 +62,8 @@ the object is `FUN_100686d0(unk_34)->+0xe4` instead, §2.1.1); if the object's i
 finally `victim.ctrl+0x7c = unk_2c`.
 
 `FUN_1009b170` [GC 0x1009b170] (`this` = slot object): damage type `FUN_1009afde` [GC 0x1009afde] = stat `0x1b4` (`GetStat(0x1b4, 2)`) of `slotobj+0x14` (the wielded `WeaponItem_t`), else of
-`slotobj+0x10` (the `DummyWeapon_t` of the item list, §2.1.1), if in `0x5a..=0x61` or `0xa8`, else `0x5a` (`log::weapon_damage_type`; a valid stat `0x153` of the *attacker* char overrides); feedback type: victim is the client char → `0x1e` (player attacker: `attacker+0x21c == 0` and `FUN_10058a05` [GC 0x10058a05] = area `Features` bit `0x800000` clear) else `0x1d`;
-attacker is the client char → `0x1f`; otherwise `0x20` (`0x21` when a flagged PvP pair, `FUN_100523c3`, not ported); call `FUN_10012bd5(type, victim, damage, attacker, 0, damageType, unk_30, 0)`
+`slotobj+0x10` (the `DummyWeapon_t` of the item list, §2.1.1), if in `0x5a..=0x61` or `0xa8`, else `0x5a` (`log::weapon_damage_type`; a valid stat `0x153` of the *attacker* char overrides); feedback type: victim is the client char → `0x1e` when the attacker is a player with its own raw Features(224) bit `0x800000` clear (GC10058a05 / GC10044b6e), else `0x1d`;
+attacker is the client char → `0x1f`; otherwise `0x21` if either party is an NPC with Flags(0)&`0x08000000` and own pet-list membership (GC1009b25a–1009b2dc / GC100523c3), else `0x20`; call `FUN_10012bd5(type, victim, damage, attacker, 0, damageType, unk_30, 0)`
 (§3); **victim `Health` (27) := Health − damage** (`FUN_10062349` [GC 0x10062349] = set stat); then if `victim.ctrl+0x7c != 0` → `FUN_1005ae91(+0x7c)`.
 Quirk reproduced by the port: `+0x7c` is read here *before* `FUN_1006a8f3` stores this message's `unk_2c`, so a death cause takes effect with the **next** hit on that victim.
 A `SimpleItem_t` victim (`param_1` not a char): type `0x2f`, `FUN_10014e3d` (not ported).
@@ -94,7 +94,7 @@ The wire has no damage type; the old port fed `0` (→ `0x5a`) for every hit. Th
 
 ### 2.2 `SpecialAttackInfoIIR_t` → `FUN_1006a9c5(slot, damage, value_28, target, special, unk_30)` [GC 0x1006a9c5] (`this` = attacker controller)
 Target must resolve; then `FUN_1006a239(slot,1)` starts the special swing **before** feedback (fresh decompile of GC 0x1006a9c5). Name `%s` = `GetText(0x7d3 = 2003, special)` (localized stat name, 142 → "Brawling"; **not** `fStatToString`). Type: attacker is client char → `0x32`; else target is → `0x30`;
-else `0x31` (`0x33` for flagged PvP). `FUN_10012bd5(type, target, damage, attacker, name, 0, 0, 0)`; `Health(target) -= damage`; `unk_30 != 0` → `FUN_1005ae91(unk_30)` on the target (immediately);
+else `0x33` if either party passes the same flagged-own-pet test (GC1006aaac–1006ab57), otherwise `0x31`. `FUN_10012bd5(type, target, damage, attacker, name, 0, 0, 0)`; `Health(target) -= damage`; `unk_30 != 0` → `FUN_1005ae91(unk_30)` on the target (immediately);
 `FUN_10068320(slot,value_28)` (weapon slot stat 0x1a); `FUN_1005548b` at GC 0x1006abed clears the complete pending deque. `FUN_1006855a` reads the deque's front via `FUN_100553f8` (begin) and `FUN_1006af02` (dereference), not the result message's special stat.
 
 **Resolved slot-flag contradiction [CODE]:** `FUN_1006a239(slot,1)`'s `1` selects the queued special clip through `FUN_10069acb` / `FUN_1003c594`; it does **not** set hit kind 1. `FUN_1006a9c5` never writes slot `+0x2c` (hit kind) or `+0x30` (damage): only `FUN_1006a8f3` writes result values, and slot constructors `FUN_1009b37e` / `FUN_1009b415` initialize both to zero. Special notes retain the previous hit/miss on the **same attacker and slot**. The special's own damage changes health/logging only. Brawl/Dimach still select their queued own item's animation list, but notes resolve the message's slot item through `FUN_10068072`, not the special item.
@@ -155,11 +155,18 @@ The surprising threshold is confirmed by raw instructions, not a decompiler gues
 
 ## 5. `StatIIR_t` apply [GC 0x100a1aaf] (`Combat::stats`)
 Pairs are applied ascending by stat id (std::map, duplicates overwritten). For each: `delta = new − current`, then
-* `Health` (27): `delta < 0` → type `0x1a` (client char) / `0x1c` (pet of the local player: `FUN_100523c3`, not ported) / `0x1b`, value `|delta|`; `delta ≥ 1` and client → `0x22`;
+* `Health` (27): `delta < 0` → type `0x1a` (client char) / `0x1c` (NPC + Flags08000000 + own pet list, GC100a1bbe–100a1c08) / `0x1b`, value `|delta|`; `delta ≥ 1` and client → `0x22`;
 * `0x34` XP (client) → `0x24`; `0x28` alien XP (client) → `0x45` (value `stat(0xb2) + delta` when the same message raises stat `0xa9` AlienLevel, else `delta`, GC `0x100a1d0b`); every own `0xa9` pair sets DValue `got_perk=true`, including equal/lower values: fresh `0x100a1aaf` decompilation shows only the client-byte `+0x140` gate, no delta/increase test. `OwnAlienLevel` carries this to HUD without NewLevel sound/social effects; regression `own_alien_level_pair_always_raises_perk_notice` covers own/foreign increase/repeat/decrease;
   `0x23d` → `0x3e`; `0x2aa..0x2ac` → `Feedback_GotPVPScore` (not ported); `0x34/0x28/0x23d` texts only for the client char;
 * the value is stored (`FUN_10062349`). A health change that the preceding `AttackInfo` already applied therefore has `delta == 0` and prints nothing.
 Live: 69 StatIIR messages with one pair each, of which only a few are `Health` (`215 | 190`) — see dynel.md §3.
+
+HealthDamage GC100a00c8 uses that same pet predicate, then GC10012a1e → GC10012bd5 emits floating damage/healing before setting absolute Health and applying death cause. The port retains pet membership from AddPet/RemovePet, without per-frame list copies. Per-message combat health projection occurs after chat's old-value classification, before the next packet.
+
+Features lifecycle: GC10077be1–10077bf8 calls GC10044cb5(0x800000,1) only when full-update bit18 is set. GC10044cb5 resets the bit counter and GC10044842 sets the feature; an update lacking bit18 does not clear it. Explicit clearing uses GC10044cb5(mask,0) → GC10044a07; the latter decrements per-bit counters and clears at zero.
+
+Assist: GC10027374 rejects absent selection/dynel, self, then idle controller, in that order. A known fight target uses GC10016451's predicate: `p(x)=!npc(x)||HasStat(x,0xc4)`; both plain or selected target TowerType(0x184)!=0 silently refuse. HasStat dispatch GC1015fa34 → GC10003db4 tests membership. Unknown fight targets remain selectable and bypass these guards. GUI100b7bc5 resolves an argument through GC10029a88: current-playfield players only, `_stricmp` name match; failure prints `Can't find target >%s<.` with colour0x51 without changing selection.
+
 
 `combat/glue.rs` forwards every `CombatEvent::Health` into `Zone.dynels` and
 `Zone.character_stats`, not just the own `Zone.stats[27]`. This keeps target,
@@ -262,5 +269,5 @@ Replayed as player33402 ("Bergdoktor"), client paths fire combat music and own f
 
 ## 9. Unresolved
 * The `ctrl+0x38` mounted-weapon override and the dynel flag `0x800` (CharacterAction `0xa7`, not tracked); whether the original really drops hits whose slot object is missing live (the port prints them with the melee default);
-  PvP-flag helper `FUN_100523c3`; `Features` flag `0x800000` source. (The weapon-slot objects and the damage type of a hit are resolved, §2.1.1.)
+  (The weapon-slot objects and the damage type of a hit are resolved, §2.1.1.)
 * Consumer of the `CharSecSpecAttack` queue; `Feedback_GotPVPScore` (stats `0x2aa..0x2ac`), types of the formatter not reachable from these messages.

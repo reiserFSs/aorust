@@ -196,7 +196,7 @@ It is also run on the chat-server vicinity text by `HandleVicinityMessage` [GUI 
 ## 6. What the hub has to supply (`LogCtx`)
 
 `own` (the client's character identity), `name(id)` (dynel name or `None` = not in world), `text(cat, id)` (`TextDb::by_id`), `is_npc(id)` (`+0x21c`),
-`is_own_pet(id)` (`+0x21c && stat flag 0x8000000 && FUN_100523c3`), `nano_name(instance)` (RDB nano record name), `stat(id, stat)` (current stat,
+`in_pet_list(id)` (GC100523c3 own pet-holder membership), `npc_state(id)` (attacker Features224 bit0x800000, GC10058a05), `nano_name(instance)` (RDB nano record name), `stat(id, stat)` (raw current stat for own and remote characters,
 used for the old value of `Stat` and the nano damage-type override 0x153 `DamageOverrideType` of the attacker, valid values 90..97 and 168 via
 `FUN_1009a709`), `weapon(attacker, slot, special)` (stat 0x1b4 `DamageType` of the item behind the `AttackInfo` weapon slot, `combat::arms::Armory`; `FUN_1009afde`), and the `ChatFilter`. The hub applies the stat changes itself (Health `-= damage`, `FUN_10062349`).
 
@@ -224,8 +224,7 @@ totals 100 then 137 through `LoginEvent::ZoneFrame`/`pump` and expects one 37-XP
 * `unk_30` of `AttackInfo` as the mode: 3 normal, 4 critical, 2 glancing is derived from the `mode == 4` / `mode == 2` comparisons in `FUN_10012bd5`;
   live values are only 3 and 4 (4 = critical presumed, never seen with text).
 * Victim/attacker direction of `AttackInfo` (§3): derived from `FUN_1009ed0d` and `FUN_1009b170`; the live capture has no message involving the client.
-* Damage type of a hit: `FUN_1009afde` reads stat 0x1b4 of the item behind the attacker's weapon slot (resolved, docs/zone/combat-log.md §2.1.1); `FUN_10058a05`
-  (pvp flag in the 0x1e/0x1d choice) is treated as false.
+* Damage type of a hit: `FUN_1009afde` reads stat 0x1b4 of the item behind the attacker's weapon slot (resolved, docs/zone/combat-log.md §2.1.1). GC10058a05 reads the attacker's raw Features; NPC + Flags08000000 + pet-list membership selects 0x21/0x33/0x1c. Toxic action0xd1 uses pet-list membership alone (GC1005eb73–1005ebd4).
 * CharacterAction 0xa4: the id given to `GetText(2002, ..)` is `b.instance` (register pattern identical to the Stuck cases, not proven).
 * `AttackInfo` damage type default `0x1b`/`unknown` for stat-driven DoT (cat 0x1a / 0x1b with no damage type): text "... points of unknown damage." is what the code produces.
 * Loot lines (class 0x4200001a/1b) come from the chat server's vicinity messages (§5), not from an N3 IIR; no Gamecode code emits those classes.

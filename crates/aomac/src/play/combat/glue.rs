@@ -141,7 +141,12 @@ impl Play {
                         interact.bank_close(&mut self.gui);
                     }
                 }
-                GameAction::Assist => match self.fight.as_ref().map(|m| m.assist(&self.zone)) {
+                GameAction::Assist | GameAction::AssistNamed(_) => match self.fight.as_ref().map(|m| {
+                    match a {
+                        GameAction::AssistNamed(id) => m.assist_target(&self.zone, Some(id)),
+                        _ => m.assist(&self.zone),
+                    }
+                }) {
                     Some(Ok(t)) => self.zone.set_target(Some(ao_net::msg::Identity { kind: 50000, instance: t })),
                     Some(Err(key)) if !key.is_empty() => {
                         if let Some(c) = self.chat.as_mut() {
@@ -592,7 +597,7 @@ pub(in crate::play) fn combat_animations(world: &mut Dynels, mut player: Option<
     }
 }
 
-fn sync_stats(zone: &mut crate::play::zone::Zone, event: &CombatEvent) {
+pub(in crate::play) fn sync_stats(zone: &mut crate::play::zone::Zone, event: &CombatEvent) {
     if let CombatEvent::StatChanged { dynel, stat, value } = event {
         zone.character_stats.entry(*dynel).or_default().insert(*stat, *value);
         if *dynel == zone.char_id as i32 {

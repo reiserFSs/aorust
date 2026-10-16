@@ -304,7 +304,7 @@ pub mod ty {
     /// Client char hit something.
     pub const YOU_HIT: u32 = 0x1f;
     pub const OTHER_HIT_OTHER: u32 = 0x20;
-    pub const OTHER_HIT_OTHER_PVP: u32 = 0x21;
+    pub const OTHER_HIT_OTHER_PET: u32 = 0x21;
     /// Client char healed (`Health` delta > 0).
     pub const HEALED: u32 = 0x22;
     /// XP gained/lost (stat 0x34 delta).
@@ -314,7 +314,7 @@ pub mod ty {
     pub const SPECIAL_OTHER: u32 = 0x31;
     /// Client char's special attack hit.
     pub const SPECIAL_YOU_HIT: u32 = 0x32;
-    pub const SPECIAL_OTHER_PVP: u32 = 0x33;
+    pub const SPECIAL_OTHER_PET: u32 = 0x33;
     /// An attack missed.
     pub const MISS: u32 = 0x3b;
     /// Shadowknowledge gained/lost (stat 0x23d delta).
@@ -450,10 +450,10 @@ pub fn render(texts: &dyn Texts, f: &Feedback) -> Option<Rendered> {
             category = 0x19;
             text = fmt1(texts, "Feedback_HitWithSpecial", &[s(name_a), Arg::UInt(v), s(&dmg)]);
         }
-        ty::OTHER_HIT_OTHER | ty::OTHER_HIT_OTHER_PVP => {
-            let pvp = f.ty == ty::OTHER_HIT_OTHER_PVP;
-            style = STYLE + 9 + u32::from(!pvp);
-            category = 0x1a + u32::from(pvp);
+        ty::OTHER_HIT_OTHER | ty::OTHER_HIT_OTHER_PET => {
+            let pet = f.ty == ty::OTHER_HIT_OTHER_PET;
+            style = STYLE + 9 + u32::from(!pet);
+            category = 0x1a + u32::from(pet);
             text = match f.b {
                 // third `%s` of "Something hit %s for %u points of %s damage." is never fed: it stays literally
                 None => fmt1(texts, "Feedback_SomethingHitOther", &[s(name_a), Arg::UInt(v)]),
@@ -493,10 +493,10 @@ pub fn render(texts: &dyn Texts, f: &Feedback) -> Option<Rendered> {
                 _ => String::new(),
             };
         }
-        ty::SPECIAL_OTHER | ty::SPECIAL_OTHER_PVP => {
-            let pvp = f.ty == ty::SPECIAL_OTHER_PVP;
-            style = STYLE + 9 + u32::from(!pvp);
-            category = 0x1a + u32::from(pvp);
+        ty::SPECIAL_OTHER | ty::SPECIAL_OTHER_PET => {
+            let pet = f.ty == ty::SPECIAL_OTHER_PET;
+            style = STYLE + 9 + u32::from(!pet);
+            category = 0x1a + u32::from(pet);
             text = match (f.extra, f.b) {
                 (Some(x), None) => fmt1(texts, "Feedback_SomethingHitOther", &[s(name_a), Arg::UInt(v), s(x)]),
                 (Some(x), Some(b)) => fmt1(texts, "Feedback_MonsterHitWithSpecial", &[s(b.name), s(name_a), Arg::UInt(v), s(x)]),

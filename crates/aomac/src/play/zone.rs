@@ -302,6 +302,12 @@ impl Zone {
         }
     }
 
+    /// GC10029a88 NameToID: current-playfield players only, `_stricmp` comparison.
+    pub fn player_by_name(&self, name: &str) -> Option<i32> {
+        self.dynels.get(&(self.char_id as i32))?;
+        self.dynels.iter().find_map(|(&id, d)| (!d.npc && d.name.eq_ignore_ascii_case(name)).then_some(id))
+    }
+
     /// `FullCharacter` Activate [GC 0x10073a2f]: each group is applied in order, skipping the `0x499602D2` marker.
     fn apply_stats(&mut self, pairs: impl IntoIterator<Item = (u32, i32)>) {
         let mut side_changed = false;

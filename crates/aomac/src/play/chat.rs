@@ -51,6 +51,8 @@ pub(super) enum GameAction {
     Social(u32),
     /// `/assist`.
     Assist,
+    /// GUI100b7bc5 / GC10029a88: a locally resolved player name.
+    AssistNamed(i32),
     /// `/camp`: AFCM 0x134 (`StartQuitToLoginMessage`, GUI 0x10027c74): camp, then back to the login screen.
     Camp,
     /// `/selectself`: AFCM 0x1e / 0x126 with the own id (`TargetingModule_t::SetTargetMessage`: `SetTarget(own, false)`).
@@ -586,9 +588,11 @@ impl Chat {
             name: &|id| dyn_of(id).map(|d| d.name.clone()),
             text: &|c, i| texts.by_id(c, i),
             is_npc: &|id| dyn_of(id).is_some_and(|d| d.npc),
-            is_own_pet: &|_| false,
+            in_pet_list: &|id| zone.pets.contains(&id),
+            npc_state: &|id| zone.stat_of(id.instance, 224).unwrap_or(0) & 0x80_0000 != 0
+                || zone.tip_npc_state.get(&id.instance) == Some(&true),
             nano_name: &|_| None,
-            stat: &|id, st| (id == own).then(|| zone.stat(st as u32)).flatten(),
+            stat: &|id, st| (id.kind == CHAR_KIND).then(|| zone.stat_of(id.instance, st as u32)).flatten(),
             weapon: &|id, slot, special| (id.kind == CHAR_KIND).then(|| zone.world.arms.damage_type(id.instance, slot, special)).flatten(),
             filter: &filter,
         };
@@ -1226,7 +1230,16 @@ impl Chat {
             }
             ChatAction::Social(id) => self.game.push(GameAction::Social(id)),
             ChatAction::DValue(t) => self.dvalue_cmds.push(t),
-            ChatAction::ClientCommand(c) if c.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/assist")) => self.game.push(GameAction::Assist),
+            ChatAction::ClientCommand(c) if c.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("/assist")) => {
+                let name = c.split_once(char::is_whitespace).map_or("", |(_, name)| name.trim());
+                if name.is_empty() {
+                    self.game.push(GameAction::Assist);
+                } else if let Some(id) = zone.player_by_name(name) {
+                    self.game.push(GameAction::AssistNamed(id));
+                } else {
+                    self.system_line(gui, &format!("Can't find target &gt;{name}&lt;."), 0x51);
+                }
+            }
             ChatAction::ShowUrl(u) => self.show_url(gui, zone, texts, &u),
             // FUN_100b6f0d: only from level 4 on (stat 0x36 > 3); `prev` steps back, anything else forward, never below 0
             ChatAction::TipOfTheDay { prev } => {

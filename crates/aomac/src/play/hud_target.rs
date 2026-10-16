@@ -74,17 +74,14 @@ pub(super) enum WorldClick {
 const PET_MASTER: u32 = 0xc4;
 const TOWER_TYPE: u32 = 0x184;
 
-/// `N3Msg_CanClickTargetTarget(target, targetsTarget)` (Gamecode 0x10016451): both dynels must exist. A dynel with `char+0x21c` set
-/// (the client character: its record has "fewer stats", docs/zone/dynel.md §2) is *plain* when it has a `PetMaster`, every other one
-/// is plain; the click is refused when both are plain, otherwise allowed unless the target has a non-zero `TowerType`. Only the own
-/// character's stats are known, the others' stats count as absent. [INFERENCE] for what `+0x21c` stands for.
+/// `N3Msg_CanClickTargetTarget` (GC10016451): refuse two players/characters with PetMaster,
+/// or a target with nonzero TowerType. HasStat (GC10003db4) tests presence, not value.
 pub fn can_click_target_target(zone: &Zone, target: i32, targets_target: i32) -> bool {
-    let me = zone.char_id as i32;
+    let plain = |id: i32| !zone.dynels[&id].npc || zone.stat_of(id, PET_MASTER).is_some();
     if !zone.dynels.contains_key(&target) || !zone.dynels.contains_key(&targets_target) {
         return false;
     }
-    let plain = |id: i32| id != me || zone.stat(PET_MASTER).is_some();
-    !(plain(target) && plain(targets_target)) && (target != me || zone.stat(TOWER_TYPE).unwrap_or(0) == 0)
+    !(plain(target) && plain(targets_target)) && zone.stat_of(target, TOWER_TYPE).unwrap_or(0) == 0
 }
 
 /// What the target controls show about the selected dynel (`N3Msg_GetName` / `GetSkill` of the target).
@@ -1212,11 +1209,19 @@ mod tests {
         for (id, name) in [(1, "Me"), (2, "Wolf"), (3, "Boar")] {
             z.dynels.insert(id, dyn_at(name, [0.0; 3], id > 1, 0));
         }
-        assert!(!can_click_target_target(&z, 2, 3), "two plain dynels");
-        assert!(can_click_target_target(&z, 2, 1), "the own character is not plain");
+        assert_eq!(z.player_by_name("mE"), Some(1));
+        assert_eq!(z.player_by_name("wolf"), None, "NameToID excludes NPC names");
+        assert_eq!(z.player_by_name("absent"), None);
+        z.character_stats.entry(2).or_default().insert(PET_MASTER, 0);
+        z.character_stats.entry(3).or_default().insert(PET_MASTER, 0);
+        assert!(!can_click_target_target(&z, 2, 3), "zero PetMaster is still present");
+        z.character_stats.get_mut(&2).unwrap().remove(&PET_MASTER);
+        z.character_stats.get_mut(&3).unwrap().remove(&PET_MASTER);
+        assert!(can_click_target_target(&z, 2, 3), "two NPCs without PetMaster");
+        assert!(can_click_target_target(&z, 2, 1));
         assert!(can_click_target_target(&z, 1, 2));
         z.stats.insert(TOWER_TYPE, 1);
-        assert!(!can_click_target_target(&z, 1, 2), "a TowerType on the own character refuses");
+        assert!(!can_click_target_target(&z, 1, 2), "TowerType on the selected character refuses");
         assert!(can_click_target_target(&z, 2, 1));
         assert!(!can_click_target_target(&z, 2, 9), "unknown dynel");
     }

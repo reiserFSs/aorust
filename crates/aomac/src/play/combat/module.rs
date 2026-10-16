@@ -239,6 +239,10 @@ impl Module {
         std::mem::take(&mut self.events)
     }
 
+    pub fn pending_events(&self) -> &[CombatEvent] {
+        &self.events
+    }
+
     pub fn take_pose_events(&mut self) -> Vec<ActionEvent> {
         std::mem::take(&mut self.pose_events)
     }
@@ -572,14 +576,28 @@ impl Module {
     }
 
     /// `N3Msg_AssistFight` [GC 0x10027374] (`/assist`): selects the fight target of the selected character.
-    /// Returns the new selection or the refusal text. [UNRESOLVED] the PvP/side checks of the original (stat 0xc4 / 0x184 tests).
+    /// Known fight targets use the same PetMaster/TowerType guards as target-of-target; unknown targets remain selectable.
     pub fn assist(&self, zone: &Zone) -> Result<i32, &'static str> {
-        let Some(t) = zone.target else { return Err("Feedback_NoTargetToAssist") };
+        self.assist_target(zone, zone.target)
+    }
+
+    pub fn assist_target(&self, zone: &Zone, target: Option<i32>) -> Result<i32, &'static str> {
+        let Some(t) = target else { return Err("Feedback_NoTargetToAssist") };
+        if !zone.dynels.contains_key(&t) {
+            return Err("Feedback_NoTargetToAssist");
+        }
         if t == self.own {
             return Err("Feedback_CantAssistYourself");
         }
         match self.combat.fight(t) {
-            Some(f) if f.state != FIGHT_IDLE => f.target.filter(|x| x.kind == DYNEL_CHAR && zone.dynels.contains_key(&x.instance)).map(|x| x.instance).ok_or(""),
+            Some(f) if f.state != FIGHT_IDLE => {
+                let ft = f.target.ok_or("")?;
+                if zone.dynels.contains_key(&ft.instance)
+                    && !crate::play::hud_target::can_click_target_target(zone, t, ft.instance) {
+                    return Err("");
+                }
+                Ok(ft.instance)
+            }
             _ => Err("Feedback_TargetIsNotInFight"),
         }
     }
@@ -988,7 +1006,17 @@ mod tests {
         assert_eq!(m.assist(&z), Err("Feedback_TargetIsNotInFight"));
         z.dynels.insert(t + 1, z.dynels[&t].clone());
         m.on_frame(&n3_frame(0, 0, net::attack(t, Identity { kind: DYNEL_CHAR, instance: t + 1 }, 0)));
-        let _ = m.assist(&z);
+        assert_eq!(m.assist(&z), Ok(t + 1));
+        z.character_stats.entry(t).or_default().insert(0xc4, 0);
+        z.character_stats.entry(t + 1).or_default().insert(0xc4, 0);
+        assert_eq!(m.assist(&z), Err(""), "HasStat tests presence even when zero");
+        z.character_stats.get_mut(&t).unwrap().remove(&0xc4);
+        z.character_stats.entry(t).or_default().insert(0x184, 1);
+        assert_eq!(m.assist(&z), Err(""), "nonzero TowerType silently refuses");
+        z.dynels.remove(&(t + 1));
+        assert_eq!(m.assist(&z), Ok(t + 1), "unknown fight target bypasses guards");
+        z.target = Some(999);
+        assert_eq!(m.assist(&z), Err("Feedback_NoTargetToAssist"));
         z.target = None;
         assert_eq!(m.assist(&z), Err("Feedback_NoTargetToAssist"));
         z.target = Some(OWN as i32);

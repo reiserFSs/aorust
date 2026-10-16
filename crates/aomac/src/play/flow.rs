@@ -928,6 +928,7 @@ impl Play {
                     }
                 }
                 LoginEvent::ZoneFrame(f) => {
+                    let combat_event_start = self.fight.as_ref().map_or(0, |m| m.pending_events().len());
                     if let Some(m) = self.fight.as_mut() {
                         if let Some(p) = self.player.as_ref() {
                             m.set_third_person(p.camera_mode() != 0);
@@ -956,6 +957,12 @@ impl Play {
                     }
                     let own_events_before = self.zone.own_events.len();
                     let zone_event = self.zone.on_frame(&f);
+                    // Native attack applies Health immediately; the next packet's chat delta must see it.
+                    if let Some(m) = self.fight.as_ref() {
+                        for event in &m.pending_events()[combat_event_start..] {
+                            combat::glue::sync_stats(&mut self.zone, event);
+                        }
+                    }
                     // GUI 0x10027d47: only the own, successfully decoded resurrection message.
                     if self.zone.own_events.get(own_events_before..).is_some_and(|events| events.iter().any(|event| matches!(event, zone::OwnEvent::Resurrected))) {
                         if let Some(hud) = self.hud.as_mut() {

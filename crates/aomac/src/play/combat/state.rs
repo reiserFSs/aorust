@@ -151,18 +151,17 @@ pub struct Combat {
     texts: Box<dyn Texts>,
     chars: HashMap<i32, Char>,
     own: i32,
-    /// GC 100110ab: DAT102e0640 follows the 3rdPersonCamera preference (default 1).
+    /// GC100110ab: DAT102e0640 follows 3rdPersonCamera (default1).
     third_person: bool,
-    /// Stat `Features` (0xe0) of the playfield area (`FUN_10044b6e` [GC 0x10044b6e]); bit 0x800000 makes the client print the
-    /// attacker's name for player hits (type 0x1d instead of 0x1e). [UNRESOLVED] source, 0 until the playfield layer sets it.
-    pub area_features: i32,
+    /// Retained own pet-holder membership, updated only by AddPet/RemovePet (GC100523c3).
+    own_pets: Vec<Identity>,
     /// The weapon-slot tables (stat `DamageType` of the items), filled from the same messages.
     pub arms: Armory,
 }
 
 impl Combat {
     pub fn new(texts: Box<dyn Texts>) -> Self {
-        Self { texts, chars: HashMap::new(), own: 0, third_person: true, area_features: 0, arms: Armory::default() }
+        Self { texts, chars: HashMap::new(), own: 0, third_person: true, own_pets: Vec::new(), arms: Armory::default() }
     }
 
     pub fn set_third_person(&mut self, on: bool) {
@@ -203,6 +202,27 @@ impl Combat {
         Who { id: instance, name: self.chars.get(&instance).map_or("", |c| c.name.as_str()), is_client: instance == self.own }
     }
 
+    fn own_pet(&self, id: i32) -> bool {
+        self.chars.get(&id).is_some_and(|c| c.npc && c.stat(0) & 0x0800_0000 != 0)
+            && self.own_pets.contains(&Identity { kind: CHAR_KIND, instance: id })
+    }
+
+    fn health_damage(&mut self, event: crate::play::chat::log::LogEvent, ev: &mut Vec<CombatEvent>) {
+        let crate::play::chat::log::LogEvent::HealthDamage { who, delta, health, death_cause, .. } = event else { return };
+        let id = who.instance;
+        if who.kind != CHAR_KIND || !self.chars.contains_key(&id) { return; }
+        // GC100a00c8 -> GC10012bd5: chat formats the line, combat owns the number.
+        // Types 0x1b and 0x40 both use category 0x16.
+        let category = if delta < 0 {
+            Some(if id == self.own { 0x15 } else if self.own_pet(id) { 0x1b } else { 0x16 })
+        } else { (id == self.own).then_some(0x1c) };
+        if let Some(category) = category.filter(|_| delta != 0) {
+            self.floating(ev, id, delta.wrapping_abs(), category);
+        }
+        self.set_health(id, health, ev);
+        if death_cause != 0 { self.die(id, death_cause, ev); }
+    }
+
     /// Apply one received frame. `own_id` = the player's character id (the `IsClientChar` dynel).
     pub fn on_frame(&mut self, f: &Frame, own_id: u32) -> Vec<CombatEvent> {
         let mut ev = Vec::new();
@@ -214,11 +234,8 @@ impl Combat {
         // not another subtraction after AttackInfo has already applied a hit.
         if matches!(m.body, N3::Unknown(_)) {
             match crate::play::chat::log::from_n3(&m) {
-                Some(crate::play::chat::log::LogEvent::HealthDamage { who, health, death_cause, .. }) if who.kind == CHAR_KIND => {
-                    self.set_health(who.instance, health, &mut ev);
-                    if death_cause != 0 && self.chars.contains_key(&who.instance) {
-                        self.die(who.instance, death_cause, &mut ev);
-                    }
+                Some(event @ crate::play::chat::log::LogEvent::HealthDamage { .. }) => {
+                    self.health_damage(event, &mut ev);
                 }
                 Some(crate::play::chat::log::LogEvent::NewLevel { who, f }) if who.kind == CHAR_KIND => {
                     if let Some(c) = self.chars.get_mut(&who.instance) {
@@ -245,10 +262,21 @@ impl Combat {
             }
         }
         match m.body {
+            N3::Pet(p) if h.kind == CHAR_KIND && h.instance == self.own => match p {
+                n3::pet::PetList::Add(id) if !self.own_pets.contains(&id) => self.own_pets.push(id),
+                n3::pet::PetList::Add(_) => {}
+                n3::pet::PetList::Remove(id) => self.own_pets.retain(|p| *p != id),
+            },
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) if h.kind == CHAR_KIND => {
                 let c = self.chars.entry(h.instance).or_default();
                 c.name.clone_from(&u.name);
                 c.npc = u.is_npc();
+                c.stats.insert(0, u.flags2 as i32);
+                // GC10077be1 only sets this feature; a later full update without bit18 does not clear it.
+                if u.flags & (1 << 18) != 0 {
+                    let features = c.stat(224) | 0x80_0000;
+                    c.stats.insert(224, features);
+                }
                 for (s, v) in [
                     (STAT_HEALTH, u.health),
                     (STAT_MAX_HEALTH, u.max_health),
@@ -448,15 +476,16 @@ impl Combat {
         let Some(r) = render(self.texts.as_ref(), f) else { return };
         self.push_log(ev, r.category, r.style, r.text);
         if let Some(n) = r.number {
-            // GC 10014d21..44: only the first-person own character uses DamageTextMessage.
-            let space = if f.a.is_client && !self.third_person { Space::Hud } else { Space::World };
-            ev.push(CombatEvent::Floating {
-                dynel: subject,
-                amount: n,
-                category: r.category,
-                number: log::floating_number(space, r.category),
-            });
+            self.floating(ev, subject, n, r.category);
         }
+    }
+
+    fn floating(&self, ev: &mut Vec<CombatEvent>, subject: i32, amount: i32, category: u32) {
+        // GC100044c2 / GC10011108, shared by ordinary feedback and HealthDamage.
+        let space = if subject == self.own && !self.third_person { Space::Hud } else { Space::World };
+        ev.push(CombatEvent::Floating {
+            dynel: subject, amount, category, number: log::floating_number(space, category),
+        });
     }
 
     fn set_health(&mut self, id: i32, health: i32, ev: &mut Vec<CombatEvent>) {
@@ -506,14 +535,16 @@ impl Combat {
         // type selection of FUN_1009b170
         let attacker_player = !self.chars[&att].npc;
         let ty = if v == self.own {
-            // FUN_10058a05: player attacker && area feature bit 0x800000 -> named hit
-            if attacker_player && self.area_features & 0x80_0000 == 0 {
+            // GC10058a05 reads this attacker's raw Features.
+            if attacker_player && self.chars[&att].stat(224) & 0x80_0000 == 0 {
                 log::ty::PLAYER_HIT_YOU
             } else {
                 log::ty::HIT_YOU
             }
         } else if att == self.own {
             log::ty::YOU_HIT
+        } else if self.own_pet(att) || self.own_pet(v) {
+            log::ty::OTHER_HIT_OTHER_PET
         } else {
             log::ty::OTHER_HIT_OTHER
         };
@@ -567,8 +598,10 @@ impl Combat {
             log::ty::SPECIAL_YOU_HIT
         } else if t == self.own {
             log::ty::SPECIAL_HIT_YOU
+        } else if self.own_pet(att) || self.own_pet(t) {
+            log::ty::SPECIAL_OTHER_PET
         } else {
-            log::ty::SPECIAL_OTHER // the PvP flag variant 0x33 needs `FUN_100523c3`, not ported
+            log::ty::SPECIAL_OTHER
         };
         let mut f = Feedback::new(ty, self.who(t), damage);
         f.b = Some(self.who(att));
@@ -615,8 +648,9 @@ impl Combat {
             match stat {
                 STAT_HEALTH => {
                     if delta < 0 {
-                        // 0x1a client char; 0x1c a pet of the local player (FUN_100523c3, not ported); else 0x1b
-                        let ty = if client { log::ty::SELF_ATTACKED } else { log::ty::OTHER_ATTACKED };
+                        let ty = if client { log::ty::SELF_ATTACKED }
+                            else if self.own_pet(id) { log::ty::PET_ATTACKED }
+                            else { log::ty::OTHER_ATTACKED };
                         fb = Some((ty, delta.abs()));
                     } else if delta >= 1 && client {
                         fb = Some((log::ty::HEALED, delta));
@@ -718,6 +752,48 @@ mod tests {
             );
         }
         c
+    }
+
+    #[test]
+    fn native_relations_and_health_damage_numbers() {
+        let mut c = setup();
+        c.arms.wield(3, 300, 6, None, &[(0x1b4, 91)]);
+        let pet_frame = |p: n3::pet::PetList| Frame {
+            seq: 0, ptype: ao_net::frame::PT_N3, sender: 1, receiver: 1, payload: p.encode(ch(1), 0),
+        };
+        c.on_frame(&pet_frame(n3::pet::PetList::Add(ch(2))), 1);
+        let mut events = Vec::new();
+        let style = |events: &[CombatEvent]| events.iter().find_map(|e| match e {
+            CombatEvent::Log(line) => Some(line.style), _ => None,
+        });
+        c.start_fight(3, ch(1), &mut events);
+        events.clear();
+        c.hit(3, &atk(6, 1, 0, 0), &mut events);
+        assert_eq!(style(&events), Some(0x4200_0007));
+        c.chars.get_mut(&3).unwrap().stats.insert(224, 0x80_0000);
+        events.clear();
+        c.hit(3, &atk(6, 1, 0, 0), &mut events);
+        assert_eq!(style(&events), Some(0x4200_0006));
+        c.start_fight(3, ch(2), &mut events);
+        for flagged in [false, true] {
+            c.chars.get_mut(&2).unwrap().stats.insert(0, if flagged { 0x0800_0000 } else { 0 });
+            events.clear();
+            c.hit(3, &atk(6, 1, 0, 0), &mut events);
+            assert_eq!(style(&events), Some(if flagged { 0x4200_0009 } else { 0x4200_000a }));
+            events.clear();
+            c.special_hit(3, &SpecialAttackInfo { slot: 0, damage: 1, target: ch(2), special: 142, value_28: -1, unk_30: 0 }, &mut events);
+            assert_eq!(style(&events), Some(if flagged { 0x4200_0009 } else { 0x4200_000a }));
+            events.clear();
+            c.stats(2, &[(STAT_HEALTH, c.chars[&2].health() - 1)], &mut events);
+            assert_eq!(style(&events), Some(if flagged { 0x4200_0003 } else { 0x4200_0004 }));
+            events.clear();
+            c.health_damage(crate::play::chat::log::LogEvent::HealthDamage {
+                who: ch(2), health: 20, delta: -7, dtype: 95, death_cause: 0, attacker: ch(3), nano: 0,
+            }, &mut events);
+            assert!(events.iter().any(|e| matches!(e, CombatEvent::Floating { dynel: 2, amount: 7, category, .. } if *category == if flagged { 0x1b } else { 0x16 })));
+        }
+        c.on_frame(&pet_frame(n3::pet::PetList::Remove(ch(2))), 1);
+        assert!(!c.own_pet(2), "RemovePet clears retained membership");
     }
 
     #[test]
