@@ -8,6 +8,8 @@ const INFO: u32 = 0x4b4e0000;
 const DELETE: u32 = INFO + 1;
 const ICON: f32 = 48.0;
 
+type Icon = (GfxId, u32, u32);
+
 pub(super) struct HudKnowledge {
     store: ReferenceStore,
     loaded: bool,
@@ -25,7 +27,7 @@ pub(super) struct HudKnowledge {
     press: Option<(u32, f32, f32)>,
     dragging: bool,
     ghost: Option<WindowId>,
-    icons: Vec<(u32, Option<(GfxId,u32,u32)>)>,
+    icons: Vec<(u32, Option<Icon>)>,
     closed: bool,
     qualified: bool,
     texts: ao_formats::screens::TextDb,
@@ -327,7 +329,7 @@ impl HudKnowledge {
     pub fn take_closed(&mut self) -> bool { std::mem::take(&mut self.closed) }
 }
 
-fn icon_items(gui: &Gui, images: &mut Vec<CanvasItem>, icon: Option<(GfxId,u32,u32)>, x: f32, y: f32) {
+fn icon_items(gui: &Gui, images: &mut Vec<CanvasItem>, icon: Option<Icon>, x: f32, y: f32) {
     let (id,iw,ih) = icon.unwrap_or_else(|| { let id=GfxId(0xb9); let (w,h)=gui.gfx().size(id); (id,w,h) });
     images.push(CanvasItem::Image {id,src:[0.0,0.0,iw as f32,ih as f32],dst:[x,y,x+ICON,y+ICON],alpha:1.0});
     // ItemIconView 1003f859/1003f2ea: reference badge above the icon,

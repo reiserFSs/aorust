@@ -1704,6 +1704,16 @@ release inspection, item-copy insertion, reference movement, immutable live
 dummy identities after deletion, snapshot/config reload, and preservation
 of a malformed file.
 
+Headless acceptance (2026-10-16): `cargo test --release --workspace -j 2`
+passed **2082 tests across 40 suites, 63 ignored**; `cargo clippy --release
+--workspace --all-targets -j 2 -- -D warnings` passed. Both used a private
+release target, two test threads and muted audio. The physical CreateRef
+regression now exercises the actual in-world focus transition and a real
+`Play::frame` consumer after each physical key event, asserting the exact
+one-shot InfoPacket request on release and none on press, duplicate release
+or focus-loss cancellation. No live login, desktop input or real-window
+acceptance was attempted.
+
 **UNRESOLVED, not claimed fixed: MP_Ref_Icon/eighth inspect-cursor mode.**
 `InputConfig::FrameProcess` **0x1001ae14** checks modes **0x25..0x2c** and adds
 LOOKAT while Shift is held outside HelpMode; this includes reference mode
