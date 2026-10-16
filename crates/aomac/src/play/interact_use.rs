@@ -182,7 +182,8 @@ impl Interact {
     /// `N3Msg_UseItem(id, confirmed)` [GC 0x100286f8] for what is not an inventory item: banks / corpse containers refuse with a feedback text, the own
     /// character and other characters pass, a world object with `Can` bit 4 asks the confirmation first (`confirmed` = the dialog's Yes), then
     /// `GenericCmd_t` 3 ([`Interact::use_object`]). Inventory items (kinds below 50000: wearing, unwearing, special actions) are the item windows' (`hud_stats`).
-    /// [UNRESOLVED] `VisualMesh_t::AdvertisingUseAction` (billboards use client side): not ported, the server just ignores the command.
+    /// Installed native ad service is disabled: DS 1006badd returns false for the null subscription (+0x34);
+    /// RegisterMesh 10001a93/94 are RET. GC 10028d8c therefore falls through to this same command (static.md §7).
     pub fn use_item(&mut self, zone: &Zone, id: Identity, confirmed: bool) -> Action {
         // Interfaces 1000a707 opens the build UI before GC validates ordinary use.
         if self.queue_tower_use(zone, id) { return Action::Use; }

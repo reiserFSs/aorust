@@ -214,7 +214,7 @@ Programs") has the same `Mesh 93117` and `AnimPlay 2`. Result: **static mesh rdb
 ```
 u32 n ; n × { u32 size ; DynelData_t } ; 12 zero bytes                 (little endian; GD operator>> 0x10005fbf)
 DynelData_t: i32 kind, instance (0xC0000000 | index<<16 | playfield), ?, +0xc, +8, playfield;
-             f32 x y z;  f32 w qx qy qz;  i32 +0x30, template (+0x34);  i32 blob length; blob bytes
+             f32 x y z;  f32 w qx qy qz;  i32 +0x34, template (+0x38);  i32 blob length (+0x3c); blob bytes (+0x40)
 ```
 
 `blob` is a big-endian `BinaryStream`: 12 prefix bytes (`0x66 0x67 0x3F1`; the loader starts at `blob+0xC`), element count, elements as in §3.
@@ -227,6 +227,48 @@ Playfield 4582 (the capture's zone) places two: `{0xC748 Door, 0xC00011E6}` at (
 41560 (no `Mesh`; the blob supplies **258365**). Kinds seen over all playfields: 0xC748 4886, 0xC73D 2941, 0xDAC6 2259, 0xC75B 900, 0xC418 490,
 0xDAC1 407, 0xC773 383, 0xC790 210, 0xC73C 25 (no ribosome → nothing is created), 0xC770 3 (no ribosome), 0xC758 3, 0xC76D 1, 0xC749 1 (no ribosome);
 34 templates are absent from rdb 1000020 (the client creates nothing for them either: `GetBinaryStream` fails).
+
+### Interactive Billboard: installed advertising-service boundary
+
+**Installed record proof (read-only SQLite, no client/RDB copy):** `cd_image/rdb.db`, table `rdb_1000026`,
+id **4582**, version **1**, has 361 data bytes. Its second entry starts at data offset **0xd4**, length **137**:
+identity `{0xc73d,0xc00011e6}`, position `(943.09998,48.4,875.1)`, template **41560** at entry offset **0x38**,
+blob length **73** at **0x3c**. The big-endian blob starts at **0x40**; its stat pair
+`00 00 00 0c 00 03 f1 3d` supplies Mesh **258365**, and its name is `Interactive Billboard`.
+The referenced `rdb_1000020` id **41560**, version **1000000**, is 116 bytes, kind **0xc73d**, Can **8**.
+The actual `rdb_1010001` id **258365**, version **1000000**, is **57658** bytes, with authored screen/material names
+`screen03` at **0xcb9c**, `massive_screen_effect_lines*` at **0xd659**, `massive_screen_effect*` at **0xdb44**,
+and `massive_dreadloch_ad1*` at **0xe005**. Retain those authored resources; they are not an ad-service URL payload.
+
+**Original symbols, not guessed addresses:** `AoSym.java ... Advertising` resolves
+`VisualMesh_t::AdvertisingUseAction` to DisplaySystem **0x1006badd** and the Gamecode import pointer to **0x10153640**;
+`DumpCallers.java 10153640` identifies the actual call at Gamecode **0x10028d8c**, inside `N3Msg_UseItem` **0x100286f8**.
+After the ordinary confirmation branch, **0x10028d6f** resolves the item, obtains its visual at **0x10028d80**,
+and calls that consumer when non-null. **0x10028d94** exits only if it returns true; otherwise **0x10028d96..0x10028df6**
+constructs and queues the ordinary GenericCmd **3**. Picking/default-action/right-click reach this existing `Interact::use_item`
+path (interact.md §8.2–8.5); no UV, hit material, authored action text, URL or browser argument is passed to the native ad consumer.
+
+**Exact unavailable prerequisite:** DisplaySystem **0x1006badd** tests `VisualMesh+0x34`, returning false when null;
+only a non-null subscription invokes **0x1000119b** and returns true. `VisualMesh_t` constructor **0x1006cfc5**
+zeros that field, `ShallowCopy` **0x1006d164** also zeros it, and cleanup **0x1006b5fd** releases/clears it.
+The billboard classifier **0x1006d0af**, called at **0x1006d8ee** by visual-resource installation **0x1006d7b9**
+(which first clears the old subscription via **0x1006b5fd**), includes mesh **0x3f13d = 258365**,
+calls `AdvertisingServer::RegisterMesh`, sets the *separate* registration marker `+0x30 = 1`, and selects RenderingEffect **7**.
+However both registration exports **0x10001a93/0x10001a94** are literal no-op returns:
+classification/rendering does **not** create the subscription.
+`Start/Stop/Activate/Deactivate/SetMovieEnabled/Process/SetZone/DeregisterMesh` **0x10001a8c..0x10001a95**
+likewise return immediately in the installed DLL. There is no reachable asynchronous ad URL to broker on this path.
+Even the dormant subscription-use helper **0x1000119b** only gates on `+0x1c != 0`, `+0x20 == 0` and its expiry,
+then sets `+0x20 = 1`, byte `+0x60 = 1` and a new deadline; it does not dispatch a browser or network request.
+
+The preferences do not bypass this boundary: Gamecode `AdActivator_c` **0x1000124f** binds `Advertisements` at **+8**
+and `VideoAdds` at **+0x58**. Callback **0x10001174** requires initialization byte **+0xac**, applies entitlement
+bits **+0xa8** (bits 0/2 permit, bit 1 forbids), then calls the above disabled Start/Activate/Deactivate exports;
+movie callback **0x100010ff** applies the same entitlement policy to SetMovieEnabled. The port stores those prefs
+(docs/gui.md options-consumer table), renders the authored mesh/materials, and preserves the native false-result
+fallthrough to GenericCmd 3. **Resolved native-unreachable ad-service branch**, not a generic external-browser feature
+or a missing material-hit handler. This is static code/data evidence only: no login, packets, window or live acceptance.
+
 
 ## 8. API (`ao_formats::dynel_visual`)
 
