@@ -1267,6 +1267,60 @@ fn own_character_walks_from_the_keyboard() {
 }
 
 #[test]
+fn play_ctrl_split_mutates_locally_without_echo_and_join_waits_for_ack() {
+    use ao_gui::MouseButton::Left;
+    use ao_net::n3::{inventory as inv, outgoing::n3_frame, world::{AcgItem, InventoryEntry}};
+    use crate::play::{hud::WindowKind, hud_stats::inv_grid};
+
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    r.enter();
+    r.p.zone.inventory.clear();
+    // The real stack from the split/join live acceptance, including its native Can metadata.
+    let item = AcgItem { low_id: 116629, high_id: 116629, level: 1 };
+    r.p.zone.inventory.insert(0x40, InventoryEntry { slot: 0x40, a: 161, b: 300, id: inv::item_identity(0x40), item });
+    let hud = r.p.hud.as_mut().unwrap();
+    hud.dvalues.set_i64("UseNewMouseFunc", 1);
+    hud.open(&mut r.p.gui, WindowKind::Inventory);
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    r.p.hud.as_mut().unwrap().take_outbox();
+    let (x, y) = r.p.hud.as_ref().unwrap().item_screen_pos(&r.p.gui, 0x40).unwrap();
+    // Drop on row 1, not the first free visual cell: pending_drop must still place the new entry here.
+    let (tx, ty) = (x, y + inv_grid::ICON + 1.0 + inv_grid::SPACING);
+    r.host.mods.ctrl = true;
+    r.p.input(InputEvent::MouseDown { x, y, button: Left }, &mut r.host);
+    r.p.input(InputEvent::MouseMove { x: x + 0.5, y }, &mut r.host);
+    assert_eq!(r.host.pointer_warp.take(), Some((x, y)));
+    r.p.input(InputEvent::MouseUp { x, y, button: Left }, &mut r.host);
+    assert_eq!(r.p.zone.inventory[&0x40].b, 300, "selection only starts the carried drag");
+    assert!(r.p.hud.as_mut().unwrap().take_outbox().is_empty());
+    r.host.mods.ctrl = false;
+    r.p.input(InputEvent::MouseMove { x: tx, y: ty }, &mut r.host);
+    r.p.input(InputEvent::MouseUp { x: tx, y: ty, button: Left }, &mut r.host);
+    // No incoming frame and no intervening frame tick: this is the actual Play -> Hud input boundary.
+    assert_eq!((r.p.zone.inventory[&0x40].b, r.p.zone.inventory[&0x41].b), (299, 1));
+    assert_eq!(r.p.zone.inventory.len(), 2);
+    assert_eq!(r.p.zone.inventory[&0x41].item, item);
+    assert_eq!(r.p.hud.as_mut().unwrap().take_outbox(),
+        vec![n3_frame(0, 33512, inv::split_item(33512, inv::item_identity(0x40), 1))]);
+    r.p.frame(0.016, (1280, 800), &mut r.host);
+    assert_eq!(r.p.hud.as_ref().unwrap().item_screen_pos(&r.p.gui, 0x41), Some((tx, ty)));
+    assert_eq!((r.p.zone.inventory[&0x40].b, r.p.zone.inventory[&0x41].b), (299, 1), "local split applies once");
+    assert!(r.p.hud.as_mut().unwrap().take_outbox().is_empty());
+
+    r.p.input(InputEvent::MouseDown { x: tx, y: ty, button: Left }, &mut r.host);
+    r.p.input(InputEvent::MouseMove { x, y }, &mut r.host);
+    r.p.input(InputEvent::MouseUp { x, y, button: Left }, &mut r.host);
+    let join = n3_frame(0, 33512, inv::join_items(33512, inv::item_identity(0x40), inv::item_identity(0x41)));
+    assert_eq!(r.p.hud.as_mut().unwrap().take_outbox(), vec![join.clone()]);
+    assert_eq!((r.p.zone.inventory[&0x40].b, r.p.zone.inventory[&0x41].b), (299, 1), "GC1001baa1 does not mutate locally");
+    r.event(LoginEvent::ZoneFrame(join));
+    assert_eq!(r.p.zone.inventory[&0x40].b, 300);
+    assert!(!r.p.zone.inventory.contains_key(&0x41));
+}
+
+#[test]
 fn focus_loss_resets_input_even_while_game_input_is_closed() {
     let Some(mut r) = rig() else { return };
     r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });

@@ -398,6 +398,7 @@ impl HudStats {
             }
             Action::Join { from, onto } => inv::join_items(char_id, onto, from),
             Action::Split { item, count } => {
+                self.local_split = Some((item, count));
                 if let (Some(Place::Bag { cell }), Some(i)) = (dest, self.inventory.as_mut()) {
                     i.pending_drop = Some(cell);
                 }
@@ -664,7 +665,7 @@ mod stack_tests {
     use ao_net::n3::world::{AcgItem, InventoryEntry};
 
     #[test]
-    fn ctrl_horizontal_selection_splits_then_drag_rejoins_on_server_reply() {
+    fn ctrl_horizontal_selection_queues_local_split_then_drag_rejoins_on_server_reply() {
         let dir = ao_gui::client_dir();
         if !dir.join("cd_image/gui").exists() { return; }
         let mut gui = Gui::new(&dir, None).unwrap();
@@ -698,8 +699,9 @@ mod stack_tests {
         let (tx, ty) = (grid.l + dx + 10.0, grid.t + dy + 10.0);
         hud.input(&mut gui, &zone, &InputEvent::MouseUp { x: tx, y: ty, button: MouseButton::Left }, Default::default());
         assert_eq!(hud.take_outbox(), vec![n3_frame(0, 7, inv::split_item(7, inv::item_identity(0x40), 4))]);
-        assert_eq!(zone.inventory[&0x40].b, 10, "UI never fabricates the reply");
-        zone.on_frame(&n3_frame(0, 7, inv::split_item(7, inv::item_identity(0x40), 4)));
+        let (item, count) = hud.take_local_split().expect("native pre-send local mutation");
+        assert_eq!(hud.take_local_split(), None, "local mutation is drained once");
+        zone.split_inventory_item(item, count);
         assert_eq!((zone.inventory[&0x40].b, zone.inventory[&0x41].b), (6, 4));
         hud.update_inventory(&mut gui, &zone);
         let cell = hud.inventory.as_ref().unwrap().positions.get(0x40).unwrap();

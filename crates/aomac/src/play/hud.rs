@@ -1161,6 +1161,10 @@ impl Hud {
         self.start_nano_drag(gui);
         // item drag and drop between the wear window and the inventory (hud_stats/item_ui.rs)
         self.stats.input(gui, zone, ev, mods);
+        // N3Msg_SplitItem (GC1001bc8a) mutates locally before SendIIRToObservers.
+        if let Some((item, count)) = self.stats.take_local_split() {
+            zone.split_inventory_item(item, count);
+        }
         let mut unclaimed = Vec::new();
         for (slot, x, y) in self.stats.take_drops() {
             if zone.inventory.get(&slot).is_some_and(|entry| self.knowledge.drop_item(gui, entry.item, x, y, &mut self.dvalues)) {

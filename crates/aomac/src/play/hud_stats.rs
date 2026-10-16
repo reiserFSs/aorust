@@ -143,6 +143,8 @@ pub(super) struct HudStats {
     closed: Vec<WindowKind>,
     /// Zone frames produced by the windows (`SkillIIR_t`, `ResetSkill`); the HUD forwards them.
     outbox: Vec<Frame>,
+    /// GC1001bc8a applies GC10049e8f locally before sending the split request.
+    local_split: Option<(Identity, i32)>,
     tower_uses: Vec<Identity>,
     screen: (u32, u32),
     /// `listview_mode` of `prefs/NewChar/Containers/Inventory.xml` and the saved `WindowFrame` of `DockAreas/DockArea0.xml`.
@@ -225,6 +227,7 @@ impl HudStats {
             stat: None,
             closed: vec![],
             outbox: vec![],
+            local_split: None,
             tower_uses: vec![],
             screen,
             inventory_list,
@@ -315,6 +318,10 @@ impl HudStats {
     /// Zone frames queued by the windows since the last call.
     pub(super) fn take_outbox(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.outbox)
+    }
+
+    pub(super) fn take_local_split(&mut self) -> Option<(Identity, i32)> {
+        self.local_split.take()
     }
 
     pub(in crate::play) fn take_tower_uses(&mut self) -> Vec<Identity> {

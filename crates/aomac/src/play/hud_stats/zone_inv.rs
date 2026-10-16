@@ -1,4 +1,4 @@
-//! The server's inventory messages applied to [`Zone::inventory`] (`FUN_1004ad44` / `FUN_10047d77` / `FUN_1004cf08` [GC]; docs/gui.md §11.12).
+//! Inventory mutations from native local actions and server messages (`FUN_10049e8f` / `FUN_1004ad44` / `FUN_10047d77` / `FUN_1004cf08` [GC]; docs/gui.md §11.12).
 
 use super::super::zone::Zone;
 use ao_net::msg::Identity;
@@ -63,7 +63,7 @@ impl Zone {
         None
     }
 
-    /// GC 1005d4f6 -> 10049e8f: confirmed split creates a copy in the first free slot.
+    /// GC1001bc8a calls 10049e8f before sending; GC1005d4f6 also dispatches it on incoming 0x34.
     pub(in crate::play) fn split_inventory_item(&mut self, item: Identity, count: i32) {
         if count <= 0 { return; }
         if item.kind == inv::KIND_BAG {
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn split_join_confirmations_preserve_counts_and_reject_invalid_or_full_moves() {
+    fn split_local_mutation_and_join_confirmation_reject_invalid_or_full_moves() {
         let mut z = Zone::new(7);
         put(&mut z, 0x40, 10);
         z.inventory.get_mut(&0x40).unwrap().b = 10;
@@ -612,6 +612,7 @@ mod tests {
         for slot in inv::BAG_FIRST + 1..inv::BAG_FIRST + inv::BAG_SLOTS { put(&mut z, slot, 10); }
         z.split_inventory_item(inv::item_identity(0x40), 4);
         assert_eq!(z.inventory[&0x40].b, 10);
+        assert_eq!(z.inventory.len(), inv::BAG_SLOTS as usize, "full bag must not gain a fake item");
         z.inventory.get_mut(&0x40).unwrap().b = 50_000u16 as i16;
         z.join_inventory_items(inv::item_identity(0x40), inv::item_identity(0x41));
         assert!(z.inventory.contains_key(&0x41), "50001 must not overflow a stack");
