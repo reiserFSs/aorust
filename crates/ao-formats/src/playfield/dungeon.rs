@@ -701,11 +701,13 @@ fn weld_block(out: &mut RoomBuf, block: &mut [Vertex]) -> Vec<u32> {
 }
 
 /// `n3Room_t::DepackLightmap` (N3 @0x10010eb7) + `FUN_100082a7` (N3 @0x100082a7): the room record stores
-/// `count` (= vertex count of the room shell) and a zlib stream (`FUN_1002a180`, zlib 1.2.5) that inflates to
-/// `count` little-endian u16 (`count * 6` bytes in room format version < 8 is not present in the data). Every
-/// u16 is the vertex diffuse colour of the shell vertex with the same index: `R = (v & 0x1f) << 3`,
-/// `G = (v >> 5 & 0x3f) << 2`, `B = (v >> 8) & 0xf8`, alpha 255. Returns sRGB bytes; `None` when the stream is
-/// shorter than `count * 2` (the client then paints all vertices white, `FUN_100082a7` first branch).
+/// the declared baked `count` and a zlib stream of that many little-endian u16
+/// (`count * 6` bytes in room format version < 8 is not present in the data).
+/// This declared-count decompression precedes shell construction (`10012a68..6e`).
+/// The separate consumer `100082a7` uses the actual shell count: sufficient bytes
+/// supply a prefix; insufficient bytes make the entire shell white, never a partial prefix.
+/// Returns sRGB bytes: `R = (v & 0x1f) << 3`, `G = (v >> 5 & 0x3f) << 2`,
+/// `B = (v >> 8) & 0xf8`, alpha 255.
 fn depack_lightmap(count: u32, z: &[u8]) -> Option<Vec<[u8; 3]>> {
     use std::io::Read;
     let mut raw = Vec::with_capacity(count as usize * 2);
@@ -727,6 +729,7 @@ fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<Text
         return None;
     }
     let floor_min = floor_min(g, room)?;
+    let lightmap = room.lightmap.as_ref().and_then(|l| depack_lightmap(l.0, &l.1));
     let (ox, oz) = room_origin(g, room);
     let mut b = Builder {
         g,
@@ -762,21 +765,21 @@ fn build_room(g: &Gnda, room: &Room, textures: &mut dyn FnMut(u8) -> Option<Text
     if vertices.is_empty() {
         return None;
     }
-    // baked lighting only when the stream matches the shell vertex for vertex (1991 of 2000 rooms; the rest keep ambient light)
-    let prelit = match room.lightmap.as_ref().and_then(|l| depack_lightmap(l.0, &l.1)).filter(|c| c.len() == vertices.len()) {
-        Some(c) => {
-            for (v, c) in vertices.iter_mut().zip(c) {
-                // D3D diffuse bytes: the additive light is used as is (gamma space, see `Submesh::prelit`)
-                let l = c.map(|b| b as f32 / 255.0);
-                v.color = [l[0], l[1], l[2], 1.0];
-            }
-            true
+    // N3:100082a7 compares available bytes with the actual shell size, not count equality.
+    if let Some(colors) = lightmap.filter(|colors| colors.len() >= vertices.len()) {
+        for (vertex, color) in vertices.iter_mut().zip(colors) {
+            let [r, g, b] = color.map(|byte| byte as f32 / 255.0);
+            vertex.color = [r, g, b, 1.0];
         }
-        None => false,
-    };
+    } else {
+        for vertex in &mut vertices {
+            vertex.color = [1.0; 4];
+        }
+    }
     let mut keys: Vec<_> = by_tex.keys().copied().collect();
     keys.sort_by_key(|k| k.map(|k| (k.rdb_type, k.id)));
-    let submeshes = keys.into_iter().map(|k| Submesh { two_sided: true, prelit, ..Submesh::new(by_tex[&k].clone(), k) }).collect();
+    // DS:1006e133 sets EMISSIVEMATERIALSOURCE=COLOR1, including the short-stream white case.
+    let submeshes = keys.into_iter().map(|k| Submesh { two_sided: true, prelit: true, ..Submesh::new(by_tex[&k].clone(), k) }).collect();
     Some(Mesh { vertices, submeshes })
 }
 
@@ -1021,6 +1024,68 @@ mod tests {
     }
 
     #[test]
+    fn room_lightmap_uses_native_prefix_or_all_white_emissive() {
+        use std::io::Write;
+        let g = parse_gnda(&fixture(&[])).unwrap();
+        let mut room = Room { rot: 0, rect: [1, 1, 4, 4], pos: [0.0; 3], name: None, lightmap: None, door_zones: Vec::new(), door_tiles: Vec::new(), waters: Vec::new() };
+        let floor = Rc::new(floor_piece());
+        let mut piece = |id: u16| (id == 7).then(|| floor.clone());
+        let empty = build_room(&g, &room, &mut |_| None, &mut piece).unwrap();
+        assert!(empty.submeshes.iter().all(|submesh| submesh.prelit));
+        assert!(empty.vertices.iter().all(|vertex| vertex.color == [1.0; 4]));
+        let count = empty.vertices.len() as u32;
+        // The last case has enough physical bytes but a short declared decompression size.
+        for (declared, encoded) in [(count, count), (count + 1, count + 1), (count - 1, count - 1), (count - 1, count + 1)] {
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            for index in 0..encoded {
+                let word = if index & 1 == 0 { 0x001fu16 } else { 0x07e0u16 };
+                encoder.write_all(&word.to_le_bytes()).unwrap();
+            }
+            room.lightmap = Some((declared, encoder.finish().unwrap()));
+            let mesh = build_room(&g, &room, &mut |_| None, &mut piece).unwrap();
+            assert!(mesh.submeshes.iter().all(|submesh| submesh.prelit), "white is COLOR1 emissive, not ambient-only");
+            assert_eq!(mesh.vertices.len(), empty.vertices.len());
+            for (index, (actual, original)) in mesh.vertices.iter().zip(&empty.vertices).enumerate() {
+                assert_eq!((actual.pos, actual.normal, actual.uv), (original.pos, original.normal, original.uv));
+                let expected = if declared < count { [1.0; 4] } else if index & 1 == 0 { [248.0 / 255.0, 0.0, 0.0, 1.0] } else { [0.0, 252.0 / 255.0, 0.0, 1.0] };
+                assert_eq!(actual.color, expected, "declared={declared}, encoded={encoded}, vertex={index}");
+            }
+        }
+    }
+
+    #[test]
+    fn installed_taha_tie_and_zero_cell_rooms_use_native_lightmap_consumer() {
+        use std::io::Read;
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let Ok(store) = RecordStore::open(&std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client")) else { return };
+        for (id, rooms) in [(124, &[6usize][..]), (127, &[42][..]), (321, &[55, 56, 57][..]), (322, &[0][..]), (1183, &[2][..]), (1184, &[1][..]), (1185, &[1][..]), (4604, &[0][..]), (4833, &[0][..]), (4885, &[0, 5][..])] {
+            let record = super::super::record::parse(&store.get(super::super::RECORD, id).unwrap().unwrap()).unwrap();
+            let g = parse_gnda(&store.get(TILEMAP, record.tilemap).unwrap().unwrap()).unwrap();
+            let mut pieces: HashMap<u16, Option<Rc<Piece>>> = HashMap::new();
+            let mut piece = |id: u16| pieces.entry(id).or_insert_with(|| store.get(PIECES, id as u32).unwrap().map(|bytes| Rc::new(parse_piece(&bytes).unwrap()))).clone();
+            for &index in rooms {
+                let room = &record.rooms[index];
+                let (declared, compressed) = room.lightmap.as_ref().unwrap();
+                let mut raw = Vec::new();
+                flate2::read::ZlibDecoder::new(compressed.as_slice()).read_to_end(&mut raw).unwrap();
+                assert_eq!(raw.len(), *declared as usize * 2, "installed baked stream pf{id}:{index}");
+                let mesh = build_room(&g, room, &mut |_| None, &mut piece).unwrap();
+                let enough = raw.len() >= mesh.vertices.len() * 2;
+                if (id, index) == (124, 6) { assert!(enough && mesh.vertices.len() < *declared as usize, "TAHA124:6 must exercise a proper prefix"); }
+                if (id, index) == (127, 42) { assert!(!enough, "TAHA127:42 must exercise the native all-white branch"); }
+                assert!(mesh.submeshes.iter().all(|submesh| submesh.prelit), "pf{id}:{index} must retain COLOR1 emissive");
+                for (vertex_index, vertex) in mesh.vertices.iter().enumerate() {
+                    let expected = if enough {
+                        let word = u16::from_le_bytes(raw[vertex_index * 2..vertex_index * 2 + 2].try_into().unwrap());
+                        [((word & 31) << 3) as f32 / 255.0, ((word >> 5 & 63) << 2) as f32 / 255.0, ((word >> 8) & 248) as f32 / 255.0, 1.0]
+                    } else { [1.0; 4] };
+                    assert_eq!(vertex.color, expected, "native consumer pf{id}:{index} vertex{vertex_index}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn weld_shifts_the_block_uv_and_merges_shared_corners() {
         let v = |x: f32, n: [f32; 3], u: f32| Vertex { pos: [x, 0.0, 0.0], normal: n, uv: [u, 0.5], ..Default::default() };
         let up = [0.0, 1.0, 0.0];
@@ -1067,8 +1132,8 @@ mod tests {
         assert_eq!(g.at(2, -1), 2);
     }
 
-    /// Over every dungeon room of the client data: the shell vertex count must equal the room's baked lightmap
-    /// count (`Room::lightmap.0`, the vertex count `CreateDungeonRoom` produced when the lightmap was baked).
+    /// Historical shell/baked-count diagnostic, not the native lightmap acceptance gate.
+    /// `100082a7` consumes a sufficient prefix or paints the whole shell white when short.
     /// `cargo test --release -p ao-formats dungeon_lightmap_survey -- --ignored --nocapture` prints the tally.
     #[test]
     #[ignore]
