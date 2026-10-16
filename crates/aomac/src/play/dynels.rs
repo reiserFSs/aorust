@@ -2777,7 +2777,7 @@ impl Dynels {
         match &m.body {
             N3::Effects(effect) => self.pending_effects.push(effect.clone()),
             N3::World(World::VendingMachine(v)) => {
-                let stats = v.base.stats.iter().map(|&(i, x)| (i, x)).collect::<Vec<_>>();
+                let stats = v.base.applied_stats();
                 let template = static_instance(&stats);
                 let scale = stat_scale(&stats);
                 let parent = (v.base.parent.kind != 0).then_some(v.base.parent);
@@ -2788,7 +2788,7 @@ impl Dynels {
             N3::World(World::DoorStatus(d)) if DOOR_KINDS.contains(&who.kind) => self.door_command(who, Cmd::Status(d.locked, d.open, d.value_c3, d.flag_1a)),
             N3::World(World::Door(d)) if DOOR_KINDS.contains(&who.kind) && !self.props.contains_key(&(who.kind, who.instance)) => {
                 // `FUN_1009faaf`: nothing happens when the dynel exists; a new one opens at once when `Flags` bit 0x80 is set
-                let stats = d.base.stats.clone();
+                let stats = d.base.applied_stats();
                 if let Some(pos) = d.base.position {
                     let open = ao_formats::dynel_visual::get(&stats, 0).is_some_and(|f| f as u32 & super::dynels_doors::FLAG_OPEN != 0);
                     let (template, scale) = (static_instance(&stats), stat_scale(&stats));
@@ -2799,7 +2799,7 @@ impl Dynels {
                 }
             }
             N3::World(World::Corpse(c)) => {
-                let stats: Vec<(u32, i32)> = c.base.stats.clone();
+                let stats = c.base.applied_stats();
                 let cloth: Vec<(i32, i32, i32)> = c.cloth.iter().map(|w| (w.part(), w.texture, w.extra.map_or(0, |e| e.0))).collect();
                 let textures: Vec<(&str, i32)> = c.textures.iter().map(|t| (t.material.as_str(), t.texture)).collect();
                 match corpse_visual(&stats, &cloth, &textures) {
@@ -2907,6 +2907,8 @@ impl Dynels {
             // (normally fed by a live `WeaponItemFullUpdateIIR_t`, line above) from the `FullCharacterIIR_t` inventory so the
             // own character's attack animation resolves after a fresh login too.
             N3::World(World::FullCharacter(c)) if who.kind == CHAR_KIND => {
+                // GC10073a2f -> 1007434f: append raw nano-controller locks.
+                self.nano_locks.extend(c.groups[2].entries.iter().map(|lock| (who.instance, lock.id, lock.b)));
                 for e in &c.inventory {
                     if let Some(hand) = match e.slot { 6 => Some(0), 8 => Some(1), _ => None } {
                         self.weapons.insert(e.id.instance, (who.instance, hand));
@@ -4255,6 +4257,31 @@ mod tests {
                 (dir == "<").then(|| Frame::decode_with(&b, false).ok().flatten().map(|(f, _)| f)).flatten()
             })
             .collect()
+    }
+
+    #[test]
+    fn dynel_base_bytes_reach_runtime_stat_getters() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::world::{DynelBase, VendingMachine};
+        let who = Identity { kind: 0xc75b, instance: 100 };
+        for explicit in [false, true] {
+            let base = DynelBase {
+                flags: [0x80, 0xff], position: Some([0.0; 3]),
+                stats: if explicit { vec![(55, 7), (220, 111)] } else { vec![] },
+                ..Default::default()
+            };
+            let message = Message {
+                header: ao_net::n3::N3Header {
+                    msg_type: ao_net::n3::world::VENDING_MACHINE_FULL_UPDATE,
+                    target: who, flag: 0,
+                },
+                sender: 1, body: N3::World(World::VendingMachine(VendingMachine { base })),
+            };
+            let mut world = Dynels::default();
+            world.on_message(&message);
+            assert_eq!(world.stat_of(who.kind, who.instance, 55), Some(if explicit { 7 } else { -128 }));
+            assert_eq!(world.stat_of(who.kind, who.instance, 220), Some(if explicit { 111 } else { -1 }));
+        }
     }
 
     #[test]
@@ -6049,6 +6076,36 @@ mod variant_tests {
         tick(&mut world, 2.1);
         assert!(!world.nano_busy(42));
         assert_eq!(world.nano_pending_self(42).count(), 0);
+    }
+
+    #[test]
+    fn full_character_restores_existing_nano_lock_consumers() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::world::{FullCharacter, GroupEntry};
+        let mut world = Dynels::default();
+        let mut c = FullCharacter::default();
+        c.groups[2].entries = vec![
+            GroupEntry { id: Identity { kind: 1, instance: 9 }, a: 10, b: 2, ignored: 1 },
+            GroupEntry { id: Identity { kind: 0xcf1b, instance: -1 }, a: 0, b: 0, ignored: 1 },
+        ];
+        let message = Message {
+            header: ao_net::n3::N3Header {
+                msg_type: ao_net::n3::world::FULL_CHARACTER,
+                target: Identity { kind: CHAR_KIND, instance: 42 }, flag: 0,
+            },
+            sender: 42, body: N3::World(World::FullCharacter(Box::new(c))),
+        };
+        world.on_message(&message);
+        assert!(world.nano_family_locked(42, [9, 0, 0, 0, 0, 0]));
+        assert!(world.nano_program_locked(42, -1), "zero duration is retained until the pulse");
+        assert!(!world.nano_family_locked(43, [9; 6]));
+        world.on_message(&message);
+        assert_eq!(world.nano_locks.len(), 4, "native snapshots append without deduplication");
+        world.advance_nano_locks(1.0);
+        assert!(!world.nano_program_locked(42, -1));
+        assert!(world.nano_family_locked(42, [9; 6]));
+        world.advance_nano_locks(1.0);
+        assert!(!world.nano_family_locked(42, [9; 6]));
     }
 
     #[test]

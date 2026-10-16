@@ -143,21 +143,33 @@ Body (offset from payload start; sizes in the live message):
 | 17 | list | inventory (`this+0x70`) | `FUN_1002a41a`: `u32 W`, per element `u32 slot; i16; i16; Identity; ACGItem_t` (`FUN_1002a04a`, `GameData::operator>>`). **Empty (`3f1`)**. Non-empty => decoder stops, `rest` = bytes from this size word |
 | 21 | list | `list_18` | `FUN_100742d5`: `i32` elements; empty |
 | 25 | list | `triples_24` | `FUN_1002d04e`/`FUN_1002cfe5`: 3 x `u8`; empty |
-| 29 | 3 groups | `groups` (`+0x28/+0x2C/+0x30`) | `FUN_1003bbad`: `u32 header` (1 live), `u32 count` (plain, 0 live), count x { `u32 ignored; Identity; i32; i32` } (`FUN_1003bb2d`); applied through `FUN_1007434f` to dynel members `+0x1BC/+0x1C0`. Meaning [UNRESOLVED] |
+| 29 | 3 groups | `groups` (`+0x28/+0x2C/+0x30`) | `FUN_1003bbad`: `u32 header`, plain `u32 count`, count x { `u32 ignored; Identity; i32 total; i32 remaining` } (`FUN_1003bb2d`); skill, perk-action and nano locks respectively (consumer trace below). |
 | 53 | list | `stats_a` (`+0x34`) | **81** x `{u32 stat, i32 value}` (0x14332 = 82 x 0x3F1). Value `0x499602D2` is skipped by the client |
 | 705 | list | `stats_b` (`+0x38`) | **147** x `{u32 stat, i32 value}` |
 | | list | `stats_u8` (`+0x3C`) | 8 x `{u8 stat, u8 value}` (`FUN_1002eab4`) |
 | | list | `stats_i16` (`+0x40`) | 14 x `{u8 stat, i16 value}` (`FUN_1002e744`; value sign-extended) |
 | | i32 + pairs | `stat_map` (`+0x44`) | plain `i32 n` then `{i32 id, i32 value}` (`FUN_10009dd4`); n = 0 |
-| 1955 | u32 | `equipment_flags` | bit0 => `Identity` (+0x60) and team/equipment blocks (`FUN_10125c59`/`FUN_10125dfc`) follow; bit1 => 6 blocks + `i32` (+0x68) instead of 1. Live 0. Non-zero => decoder stops, `rest` starts with this word |
+| 1955 | u32 | `team_flags` | bit0 => leader `Identity` (+0x60) and one team roster (`10125c59`/`10125dfc`); bit1 => own subgroup i32 (+0x68) and six raid rosters. Decoded before list6c/spells/perks, including non-empty teams. |
 | 1959 | list | `list_6c` | `FUN_1002b8b6`: `Identity` elements; empty |
-| 1963 | list | spells (`+0x78`) | `FUN_100a6c58`: `GameData::SpellData_t` records (type-tagged, `SpellFormats_c::ReadBinary` [GD 0x1000f4a6]); empty. Non-empty => `rest` |
-| 1967 | list | perk map (`+0x90`) | `FUN_100537a5` ("inconsistent PerkMap!"); empty. Non-empty => `rest` |
+| 1963 | list | spells (`+0x78`) | `FUN_100a6c58`: type-tagged `SpellData_t` records; supported spell kinds decode, unsupported kinds retain `rest` and leave perks unavailable. |
+| 1967 | list | perk map (`+0x90`) | `FUN_100537a5` ("inconsistent PerkMap!"); decoded at its actual position into `FullCharacter.perks`, including non-empty maps. |
 
 The 1971 bytes are consumed exactly. Application order in Activate: `stats_a`, `stats_b`, `stats_u8`,
 `stats_i16` are each applied with the dynel's stat object (dynel `+0xE8`, vtable `+0x48` has-stat,
 `+0x44` create, `+0x40` set) unless the value is `0x499602D2`; then inventory, `list_18`, triples,
-the three groups, equipment, spells; effects 0x2cf2/0x2ced/0x2d50 are created on the dynel.
+the three groups, team snapshots, spells; effects 0x2cf2/0x2ced/0x2d50 are created on the dynel.
+
+### Retained metadata consumer closure (native evidence, source-ready)
+
+* `FUN_10073a2f` appends all three lock vectors through `1007434f` without filtering zero/negative durations or deduplicating identities. Group0 targets the skill controller `SimpleChar+0x1bc` (constructor `10064194`), group1 the existing perk manager (`10058ab1`, locks via manager+8), group2 the nano controller `SimpleChar+0x1c0`, vector begin/end `+0x40/+0x44` (constructor `1005002c`, allocated by `1005cb6a`). Group0/1 already feed `Zone.skill_locks/perk_locks`, shared second pulses, action recharge UI and invocation feedback. Group2 feeds the existing `Dynels.nano_locks`: `N3Msg_IsFormulaReady` `100166c0` calls `1004ebb5`, which rejects exact nano identities and kind1 locks matching any of six nano families. `1004f063` reads those same locks for progress; `1005122c` advances their integer second pulses. There is no separate metadata registry.
+* Perk-map reader `100537a5` requires positive size divisible by1009 and count<1000; each record key is followed by `10052859`. That reader supports an untagged ID plus three compatibility integers, or `ffffffVV`, ID, timer, and (only VV=1) those integers (`1002ba8c`). The key must equal the catalogue-resolved record ID. Catalogue lookup `1002bbcb` supplies the first seven runtime words; flags without `0xc0` force the timer to zero. `FullCharacter.perks=None` means an earlier unsupported spell block prevented reaching this field, not a known-empty map. The old heuristic decoding of `rest` as a perk map is removed.
+  Native writer proof: map writer `10052994` emits `(count+1)*1009`, each key, then `10052813`; its complete entry-writer caller census is `100529cc` in `10052994`. `10052813` emits tag `ffffff02`, catalogue ID and timer only. `team::perk_map` now emits this proven current form instead of an assumed server version1; the reader regression retains version1 and untagged compatibility coverage. Map-reader caller census is exactly `100739dd` in `10073881`.
+* Apply `10073a2f` transfers +0x90 through `10058ab1`/`100539fe`, replacing the manager map; `100539fe` invokes `10052e66`, replaying item event14 for timer-zero perks. `HudPerks` reuses its existing RDB1000036 catalogue, known map, wear-effect executor and completed-perk projection; unknown catalogue IDs do not fabricate perks. Ordinary/alien point counts, action availability, item criteria and personal/global research completion retain the same owners. Empty authoritative maps clear personal completion; unrelated unsupported tails leave it unchanged.
+* Focused regressions: `full_character_nonempty_perks_have_a_bounded_stream_position`, `full_character_perks_are_not_guessed_from_an_unsupported_tail`, and existing `completed_projection_tracks_authoritative_timer_frames`, `native_skill_locks_membership_and_second_pulse`, `authoritative_perk_relays_update_points_effects_and_reset_time`.
+* Independent cutover on public `0fb9d4b` includes only the necessary RetainedWire `05b5d36` team-snapshot dependency: `TeamSnapshot`/`TeamEntry` codec, `TeamState` roster/leader/subgroup restoration and SCFU PCfield108 team identity. No CastSource helper, Scene, Movement executor, Arms or Root contract is imported. Team entry validation is GC`10125d93` (nonempty name, character identity, side<=7, level<=999, profession<=15); apply is `10073a2f`→`10065951`, leader `10065718`. Regressions `native_team_snapshot_golden_and_malformed` and `full_character_native_rosters_restore_leader_and_raid_groups` cover these actual codec/runtime paths. The perk frame regression also reaches its typed map after all six raid rosters.
+* Runtime regressions: `full_character_restores_existing_nano_lock_consumers` exercises actual message dispatch, exact/family locking, duplicate append and zero/positive expiry; `dynel_base_bytes_reach_runtime_stat_getters` exercises message dispatch through the real prop stat getter, signed values and explicit overrides.
+* Authorized headless verification on public `0fb9d4b`: all nine named codec/perk/team/nano-lock/signed-seed/Masters regressions and the affected FullCharacter, completed-perk, progression-relay and team filters passed. `cargo test --release --workspace -j 2` exited0: **2159 passed, 64 ignored, 40 suites**. `cargo clippy --release --workspace --all-targets -j 2 -- -D warnings` exited0. Source remained frozen throughout both gates; only this evidence paragraph changed afterward. No login, window, input, screenshot or live session was used. Native CastSource execution and additional SCFU-stat changes are separate work and are not claimed covered by this cutover.
+
 
 Stat names below come from the client's own id -> name table built by `FUN_1002f009` [GC]
 (523 ids recovered, max id 1002). Live values for character "Testy":
@@ -202,17 +214,22 @@ Activate [GC 0x100a2672] `GetDynel == null && kind == 0xc75b` -> `CreateDynel`).
 | 37 | f32 x4 | `rotation` quaternion x,y,z,w | (0, 0.7133, 0, -0.7009) |
 | 53 | i32 | `playfield` (`+0x48`) | 4582 |
 | 57 | Identity | `template` (`+0x4C`) | `{1000015, 0}` (0xF424F) |
-| 65 | u8 u8 | flags (`+0x70/+0x71`) | 0, 0x6F |
+| 65 | u8 u8 | signed stat seeds (`+0x70/+0x71`) | `FUN_100a15f8` sign-extends these bytes into stats55/220 before explicit stats; explicit values override. |
 | 67 | list | `stats` (`FUN_1002e618` -> `+0x5C`) | 9 x `{u32 stat, i32}`: (0, 0x80023203) (23, 248371) (701,0) (702,0) (703,0) (412,1) (501,2) (500,0) (12, 93117) |
 | | i32 + bytes | blob (`+0x6C`) | 0 bytes here (corpses: NUL terminated name) |
 | | u32 | version2 = 2 (`DAT_101c1084`) | |
-| | i32 | `x4ac` | 50; stored at `(*(this+0x60))+0x4AC` [UNRESOLVED meaning] |
+| | i32 | `x4ac` | 50; stored at `(*(this+0x60))+0x4AC`; native-unused storage boundary below. |
 | | list | `list_74` (`FUN_1002b8b6`) | `Identity` elements; empty |
 | | u32 | version3 = 3 (`DAT_101c0f80`) | |
 
 Example: `7f544905 0000c75b 00000064 00 0000000b 00000000 00000000 446b0ea4 423cd70f 445ad5c4
 00000000 3f369794 00000000 bf336ecb 000011e6 000f424f 00000000 00 6f 0000276a ...` (163 bytes).
 Unresolved: meaning of stats 23/701-703/412/500/501 on a vending machine, of `template`.
+
+`DynelBase::applied_stats` projects the two signed stat seeds into every currently decoded public DynelBase producer's existing stat path (vending machines, doors, corpses); it does not invent flags or a second property store. Regressions `dynel_base_signed_byte_stats_precede_explicit_overrides` and `dynel_base_bytes_reach_runtime_stat_getters` cover negative bytes, explicit overrides and actual prop-stat retrieval. Native `100a15f8` subsequently applies the explicit stat list via stat-object virtual+0x40, so neither byte may override a transmitted stat55/220. Material's separate generic-item consumer must keep the same helper call when that independent feature is merged; it is not copied into this series.
+
+**Native-unused boundary, x4ac:** a complete Gamecode instruction-operand scalar search (`FindScalar.java 4ac 10000`) returns exactly one address, `100a0768` in reader `100a0730`, which passes the destination address to BinaryStream. There is no instruction reading that member in this module. The complete caller census of `100a0730` is `1009f34b` in `1009f340`, `1009fa42` in `1009fa37`, and data/vtable reference `10166ba8` (no containing function). Reader `100a110a`, subclass reader `100a0730`, activation `100a2672` and generic stat application `100a15f8` were decompiled; none applies it. Complete scalar70/71 searches returned390/14 hits respectively (cap10000); the actual byte consumers are `100a162c/100a163d`, not any relationship to x4ac. Retain x4ac losslessly as stored-but-unread native state, not as an unimplemented runtime consumer or a guessed level/range/stat.
+
 
 ## 4. `GameTimeIIR_t` 0x5F52412E
 
@@ -295,10 +312,10 @@ the corpse to the dead character's relative position when closer than a threshol
 
 * `PlayfieldAnarchyF`: DbObject `revision` meaning; `attribute`/`exit_door` semantics;
   non-0xC77D DbObject kinds (decoder keeps them in `rest`, then `world_x/z` stay 0).
-* `FullCharacter`: equipment/team blocks and the three entry groups' meanings, plus the `stats_a`/`stats_b` split remain separate research. Inventory is decoded: `u32 slot; u16 flags; u16 count; Identity; ACGItem` (GC `1002a04a`). `InventoryEntry.b` is the unsigned count (`1002a7d2`, `1002ad45`), not an unknown field; its Rust i16 retains the raw wire bits. Flag bit0 selects template entries (`1002aa0f`), bit0x40 is `N3Msg_IsItemDisabled` (`10027489` → `1002a6ac`), and bit0x20 is the explicit alternative to Can30 bit0x40 in `1002ace0`, consumed by reclaim iteration `1012584a`. Do not infer server flag names from that predicate.
+* `FullCharacter`: the `stats_a`/`stats_b` split remains separate research; teams, the three lock groups and perk map have the consumer trace above. Inventory is decoded: `u32 slot; u16 flags; u16 count; Identity; ACGItem` (GC `1002a04a`). `InventoryEntry.b` is the unsigned count (`1002a7d2`, `1002ad45`), not an unknown field; its Rust i16 retains the raw wire bits. Flag bit0 selects template entries (`1002aa0f`), bit0x40 is `N3Msg_IsItemDisabled` (`10027489` → `1002a6ac`), and bit0x20 is the explicit alternative to Can30 bit0x40 in `1002ace0`, consumed by reclaim iteration `1012584a`. Do not infer server flag names from that predicate.
 * `Corpse`: the 4 integers after the 7 spell arguments (`CorpseSpell::tail`) and spell types other than 0xCF27 (static.md §5).
 * `GameTime.arg3`, `AppearanceUpdate.extra` and cloth `b..e`, `CharacterAction` action ids,
-  `DynelBase.x4ac`, `flags`, `template`.
+  `DynelBase.template`. `DynelBase.x4ac` is retained native-unused storage, not an unavailable architecture consumer; byte70/71 are stat55/220 seeds (above).
 
 ## 10. Time of day and playfield changes in the app (`play/zone.rs`, `play/flow.rs`)
 

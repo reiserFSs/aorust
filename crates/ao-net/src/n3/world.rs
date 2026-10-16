@@ -287,12 +287,56 @@ pub(crate) fn read_inventory(r: &mut Reader) -> Result<Vec<InventoryEntry>> {
     (0..n).map(|_| InventoryEntry::read(r)).collect()
 }
 
-/// `FullCharacterIIR_t::ReadSubClass` (GC 0x10073881). Reading stops (and `rest` holds the
-/// unread bytes, starting with the size word/flag that could not be decoded) at the first
-/// non-empty equipment block, perk map or a spell list holding a spell kind that `spells::read_spell` cannot read: those layouts (perk
-/// entries, team blocks) are not decoded yet; every capture has them empty. The inventory
-/// (`InventoryEntry`) is decoded from the client code only: every capture has it empty
-/// (unit test on synthetic bytes).
+/// Native TeamEntry_t (GC10125dfc); final word is Profession_e.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamEntry {
+    pub id: Identity,
+    pub name: String,
+    pub organisation: i32,
+    pub side: u8,
+    pub level: u16,
+    pub profession: u16,
+}
+
+/// GC10073881: leader identity, optional own raid group, then one/six rosters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamSnapshot {
+    pub leader: Identity,
+    pub own_sub_team: i32,
+    pub groups: Vec<Vec<TeamEntry>>,
+}
+
+impl TeamSnapshot {
+    fn read(r: &mut Reader, raid: bool) -> Result<Self> {
+        let leader = Identity::read(r)?;
+        let own_sub_team = if raid { r.i32()? } else { -1 };
+        let group_count = if raid { 6 } else { 1 };
+        let mut groups = Vec::with_capacity(group_count);
+        for _ in 0..group_count {
+            let (_, n) = counted(r)?;
+            fits(n, 19, r)?;
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let entry = TeamEntry {
+                    id: Identity::read(r)?, name: r.str_i16()?, organisation: r.i32()?,
+                    side: r.u8()?, level: r.u16()?, profession: r.u16()?,
+                };
+                // GC10125d93 rejects malformed team entries, including empty names.
+                if entry.name.is_empty() || entry.id.kind != 50000 || entry.id.instance == 0
+                    || entry.side > 7 || entry.level > 999 || entry.profession > 15 {
+                    bail!("invalid native team entry");
+                }
+                entries.push(entry);
+            }
+            groups.push(entries);
+        }
+        Ok(Self { leader, own_sub_team, groups })
+    }
+}
+
+/// FullCharacter reader GC10073881. Team snapshots and perks are decoded;
+/// unsupported spell kinds retain their unread tail.
+/// Perks are decoded at their actual stream position, never guessed from an unsupported tail.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FullCharacter {
     /// 26 (= `DAT_101c01ec`).
@@ -314,14 +358,17 @@ pub struct FullCharacter {
     pub stats_i16: Vec<(u8, i16)>,
     /// `this+0x44`: plain `i32` count then `(i32 id, i32 value)` (empty live).
     pub stat_map: Vec<(i32, i32)>,
-    /// bit0: equipment block follows; bit1: 6 blocks + `i32 +0x68` instead of one.
-    pub equipment_flags: u32,
+    /// bit0: team snapshot follows; bit1: six groups and own subgroup index.
+    pub team_flags: u32,
+    pub team_snapshot: Option<TeamSnapshot>,
     /// `this+0x6C`: identity list (empty live).
     pub list_6c: Vec<Identity>,
     /// `this+0x70`: inventory elements in wire order.
     pub inventory: Vec<InventoryEntry>,
     /// `this+0x78`: the active spells (empty in every capture).
     pub spells: Vec<spells::Spell>,
+    /// `this+0x90`; None only when an earlier unsupported block prevented reaching it.
+    pub perks: Option<Vec<super::team::KnownPerk>>,
     pub rest: Vec<u8>,
 }
 
@@ -383,11 +430,9 @@ impl FullCharacter {
         }
         fits(n as usize, 8, r)?;
         self.stat_map = (0..n).map(|_| Ok((r.i32()?, r.i32()?))).collect::<Result<_>>()?;
-        self.equipment_flags = r.u32()?;
-        if self.equipment_flags & 1 != 0 {
-            // Identity (+0x60), then team-data blocks (FUN_10125c59) with `ACGItem`-like entries.
-            self.rest = rest_after(self.equipment_flags, r)?;
-            return Ok(());
+        self.team_flags = r.u32()?;
+        if self.team_flags & 1 != 0 {
+            self.team_snapshot = Some(TeamSnapshot::read(r, self.team_flags & 2 != 0)?);
         }
         self.list_6c = identities(r)?;
         // this+0x78 spell list (`FUN_100a6c58`: `GameData::SpellData_t` records, decoded by `super::spells::read_spell`). `FUN_10073a2f` runs it on the
@@ -407,11 +452,7 @@ impl FullCharacter {
                 }
             }
         }
-        // this+0x90 perk map
-        let (w, n) = counted(r)?;
-        if n != 0 {
-            self.rest = rest_after(w, r)?;
-        }
+        self.perks = Some(super::team::read_perk_map(r)?);
         Ok(())
     }
 }
@@ -447,6 +488,16 @@ pub struct DynelBase {
 }
 
 impl DynelBase {
+    /// GC100a15f8 initializes signed byte stats, then applies explicit values over them.
+    pub fn applied_stats(&self) -> Vec<(u32, i32)> {
+        let mut stats = Vec::with_capacity(self.stats.len() + 2);
+        for (id, byte) in [(55, self.flags[0]), (220, self.flags[1])] {
+            if !self.stats.iter().any(|s| s.0 == id) { stats.push((id, i32::from(byte as i8))); }
+        }
+        stats.extend_from_slice(&self.stats);
+        stats
+    }
+
     fn read(r: &mut Reader) -> Result<Self> {
         Self::read_with(r, 3)
     }
@@ -803,6 +854,39 @@ mod tests {
     }
 
     #[test]
+    fn native_team_snapshot_golden_and_malformed() {
+        for raid in [false, true] {
+            let mut bytes = Vec::new();
+            bytes.extend(50000i32.to_be_bytes());
+            bytes.extend(42i32.to_be_bytes());
+            if raid { bytes.extend(2i32.to_be_bytes()); }
+            for group in 0..if raid { 6 } else { 1 } {
+                bytes.extend(2018u32.to_be_bytes());
+                bytes.extend(50000i32.to_be_bytes());
+                bytes.extend((42i32 + group).to_be_bytes());
+                bytes.extend([0, 1, b'A']);
+                bytes.extend(123i32.to_be_bytes());
+                bytes.push(2);
+                bytes.extend(220u16.to_be_bytes());
+                bytes.extend(14u16.to_be_bytes());
+            }
+            let got = TeamSnapshot::read(&mut Reader::new(&bytes), raid).unwrap();
+            assert_eq!(got.leader.instance, 42);
+            assert_eq!(got.own_sub_team, if raid { 2 } else { -1 });
+            assert_eq!(got.groups.len(), if raid { 6 } else { 1 });
+            assert_eq!((&*got.groups[0][0].name, got.groups[0][0].profession), ("A", 14));
+            for end in 0..bytes.len() { assert!(TeamSnapshot::read(&mut Reader::new(&bytes[..end]), raid).is_err()); }
+            let count = if raid { 12 } else { 8 };
+            let mut bad = bytes.clone();
+            bad[count..count + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+            assert!(TeamSnapshot::read(&mut Reader::new(&bad), raid).is_err());
+            let end = bytes.len();
+            bytes[end - 2..].copy_from_slice(&16u16.to_be_bytes());
+            assert!(TeamSnapshot::read(&mut Reader::new(&bytes), raid).is_err());
+        }
+    }
+
+    #[test]
     fn ids_are_the_class_name_hash() {
         assert_eq!(key("PlayfieldAnarchyFIIR_t"), PLAYFIELD_ANARCHY_F);
         assert_eq!(key("FullCharacterIIR_t"), FULL_CHARACTER);
@@ -873,6 +957,29 @@ mod tests {
     }
 
     #[test]
+    fn dynel_base_signed_byte_stats_precede_explicit_overrides() {
+        let mut base = DynelBase { flags: [0x80, 0xff], ..Default::default() };
+        assert_eq!(base.applied_stats(), [(55, -128), (220, -1)]);
+        base.stats = vec![(220, 111), (55, 7)];
+        assert_eq!(base.applied_stats(), [(220, 111), (55, 7)]);
+    }
+
+    #[test]
+    fn full_character_nonempty_perks_have_a_bounded_stream_position() {
+        let frame = capture_n3().into_iter().find(|f| N3Header::parse(&f.payload).unwrap().0.msg_type == FULL_CHARACTER).unwrap();
+        let (_, mut r) = N3Header::parse(&frame.payload).unwrap();
+        let mut bytes = take_rest(&mut r).unwrap();
+        bytes.truncate(bytes.len() - 4);
+        let start = bytes.len();
+        let perks = [super::super::team::KnownPerk { perk: 100, timer: 60 }];
+        bytes.extend(super::super::team::perk_map(&perks));
+        let c = FullCharacter::read(&mut Reader::new(&bytes)).unwrap();
+        assert_eq!(c.perks.as_deref(), Some(&perks[..]));
+        assert!(c.rest.is_empty());
+        for end in start..bytes.len() { assert!(FullCharacter::read(&mut Reader::new(&bytes[..end])).is_err()); }
+    }
+
+    #[test]
     fn full_character() {
         let v = all(FULL_CHARACTER);
         assert_eq!(v.len(), 1);
@@ -886,7 +993,7 @@ mod tests {
             assert_eq!((g.header, g.entries.len()), (1, 0));
         }
         assert_eq!((c.stats_a.len(), c.stats_b.len(), c.stats_u8.len(), c.stats_i16.len()), (81, 147, 8, 14));
-        assert_eq!(c.equipment_flags, 0);
+        assert_eq!(c.team_flags, 0);
         // Names from the client's own stat table (Gamecode FUN_1002f009).
         assert_eq!(c.stat(54), Some(1)); // Level
         assert_eq!(c.stat(60), Some(1)); // Profession

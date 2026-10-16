@@ -99,6 +99,28 @@ impl TeamState {
 
     /// One zone N3 message (`FUN_1007a033` / `FUN_1007a294` / `FUN_1005d0d8` cases 4, 8, 9 / `FUN_100a3f26`).
     pub(super) fn on_message(&mut self, m: &n3::Message) {
+        if let N3::Dynel(n3::dynel::Dynel::SimpleCharFullUpdate(update)) = &m.body {
+            if m.header.target == self.own {
+                if let n3::dynel::CharClass::Pc(pc) = &update.class {
+                    if pc.field_108 == 0 { self.clear(); }
+                    else { self.team = Some(Identity { kind: team::TEAM_KIND, instance: pc.field_108 }); }
+                }
+            }
+        }
+        if let N3::World(World::FullCharacter(character)) = &m.body {
+            if m.header.target == self.own {
+                if let Some(snapshot) = &character.team_snapshot {
+                    self.own_sub_team = snapshot.own_sub_team;
+                    self.members = snapshot.groups.iter().enumerate().flat_map(|(group, entries)| {
+                        entries.iter().map(move |entry| Member {
+                            id: entry.id, name: entry.name.clone(), level: entry.level,
+                            sub_team: group as i32, health: (0, 0), nano: (0, 0),
+                        })
+                    }).collect();
+                    self.leader = (snapshot.leader.instance != 0).then_some(snapshot.leader);
+                }
+            }
+        }
         let N3::Unknown(body) = &m.body else {
             if let N3::World(World::CharacterAction(a)) = &m.body {
                 self.on_action(m.header.target, a);
@@ -567,6 +589,35 @@ mod tests {
 
     fn member(id: Identity, name: &str) -> Vec<u8> {
         team_member(ME, &TeamMember { member: id, team: Identity { kind: TEAM_KIND, instance: 1 }, sub_team: 0, profession: 1, level: 30, name: name.into() })
+    }
+
+    #[test]
+    fn full_character_native_rosters_restore_leader_and_raid_groups() {
+        use n3::world::{FullCharacter, TeamEntry, TeamSnapshot};
+        for raid in [false, true] {
+            let mut state = TeamState::new(7);
+            state.team = Some(Identity { kind: TEAM_KIND, instance: 123 });
+            let snapshot = TeamSnapshot {
+                leader: OTHER, own_sub_team: if raid { 2 } else { -1 },
+                groups: (0..if raid { 6 } else { 1 }).map(|group| vec![TeamEntry {
+                    id: Identity { kind: 50000, instance: 7 + group }, name: "A".into(),
+                    organisation: 0, side: 2, level: 30, profession: 1,
+                }]).collect(),
+            };
+            let message = n3::Message {
+                header: n3::N3Header { msg_type: n3::world::FULL_CHARACTER, target: ME, flag: 0 },
+                sender: 7, body: N3::World(World::FullCharacter(Box::new(FullCharacter {
+                    team_snapshot: Some(snapshot), ..Default::default()
+                }))),
+            };
+            state.on_message(&message);
+            assert_eq!(state.team.unwrap().instance, 123, "snapshot leader is not the team identity");
+            assert_eq!(state.leader, Some(OTHER));
+            assert_eq!(state.own_sub_team, if raid { 2 } else { -1 });
+            assert_eq!(state.members.len(), if raid { 6 } else { 1 });
+            assert_eq!(state.members.last().unwrap().sub_team, if raid { 5 } else { 0 });
+            assert_eq!(state.level(), 1, "member levels do not set team level");
+        }
     }
 
     #[test]

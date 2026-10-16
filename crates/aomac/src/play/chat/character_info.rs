@@ -105,6 +105,27 @@ pub(super) fn html(zone: &Zone, id: Identity, packet: &InfoPacket, texts: &TextD
 mod tests {
     use super::*;
     #[test]
+    fn masters_of_is_a_player_info_row_gated_by_clan_title() {
+        let Ok(texts) = TextDb::load(&ao_gui::client_dir()) else { return };
+        let mut body = vec![0; 44];
+        body[0] = 0x10;
+        let mut packet = InfoPacket::read(&mut ao_net::Reader::new(&body)).unwrap();
+        packet.destinations = ["First Site", "Second Site"].map(|name| ao_net::n3::grid::Destination {
+            playfield: 540, target: Identity::default(), name: name.into(), v2c: 0, v28: 0,
+        }).to_vec();
+        let zone = Zone::new(7);
+        let id = Identity { kind: 50000, instance: 7 };
+        assert!(!html(&zone, id, &packet, &texts).unwrap().contains("First Site"));
+        packet.s9c = Some("Member".into());
+        let page = html(&zone, id, &packet, &texts).unwrap();
+        let mut row = String::new();
+        entry(&mut row, &texts, "MastersOf", "First Site<br>Second Site<br>");
+        assert!(page.contains(&row));
+        packet.destinations.clear();
+        assert!(!html(&zone, id, &packet, &texts).unwrap().contains(&label(&texts, "MastersOf")));
+    }
+
+    #[test]
     fn original_rows_and_consider_boundaries() {
         let mut out=String::new();row(&mut out,"Level: ","12",0);
         assert_eq!(out,"<div indent=wrapped><font color=CCInfoHeader>Level: </font><font color=CCInfoText>12</font></div>");

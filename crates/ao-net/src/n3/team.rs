@@ -178,12 +178,15 @@ pub fn parse_perk_update(body: &[u8]) -> Result<PerkUpdate> {
     Ok(m)
 }
 
-/// The perk-map block of `FullCharacterIIR_t` (`FUN_100537a5`): a size word `(n + 1) * 0x3f1`, then `n` entries of `i32 key` and the entry
-/// (`FUN_10052859`: `u32 a`; when `a & 0xffffff00 == 0xffffff00` its low byte is the entry version, followed by `i32 id` and `i32 timer`
-/// (+0x1c), and only version 1 adds three more ints `FUN_1002ba8c`; otherwise `a` is the id and the three ints follow). `rest` starts at that
-/// size word (`FullCharacter::rest` when the spell list before it is empty). Refuses anything that does not fit (spell lists start the same way).
-pub fn parse_perk_map(rest: &[u8]) -> Result<Vec<KnownPerk>> {
-    let mut r = Reader::new(rest);
+/// The perk-map block of FullCharacter (`GC100537a5`, entry reader `GC10052859`).
+pub fn parse_perk_map(bytes: &[u8]) -> Result<Vec<KnownPerk>> {
+    let mut r = Reader::new(bytes);
+    let perks = read_perk_map(&mut r)?;
+    done(&r, "PerkMap")?;
+    Ok(perks)
+}
+
+pub(super) fn read_perk_map(r: &mut Reader) -> Result<Vec<KnownPerk>> {
     let size = r.i32()?;
     if size <= 0 || size % 0x3f1 != 0 {
         bail!("inconsistent PerkMap size word {size:#x}");
@@ -267,16 +270,15 @@ pub fn perk_update(target: Identity, m: &PerkUpdate) -> Vec<u8> {
     w.0
 }
 
-/// The perk-map block bytes for `perks` in the version-1 form (what the server's own encoder is assumed to emit; tests only).
+/// Native version-2 perk entries (`GC10052813`, called by map writer `GC10052994`).
 pub fn perk_map(perks: &[KnownPerk]) -> Vec<u8> {
     let mut w = Writer::default();
     w.i32((perks.len() as i32 + 1) * 0x3f1);
     for p in perks {
         w.i32(p.perk);
-        w.u32(0xffff_ff01);
+        w.u32(0xffff_ff02);
         w.i32(p.perk);
         w.i32(p.timer);
-        w.bytes(&[0; 12]);
     }
     w.0
 }
@@ -389,6 +391,11 @@ mod tests {
         let known = [KnownPerk { perk: 100, timer: 0 }, KnownPerk { perk: 101, timer: 3600 }];
         assert_eq!(parse_perk_map(&perk_map(&known)).unwrap(), known);
         assert_eq!(parse_perk_map(&perk_map(&[])).unwrap(), []);
+        assert_eq!(&perk_map(&known)[8..12], &0xffff_ff02u32.to_be_bytes());
+        let mut version1 = Writer::default();
+        version1.i32(2 * 0x3f1);
+        for value in [7u32, 0xffff_ff01, 7, 60, 1, 2, 3] { version1.u32(value); }
+        assert_eq!(parse_perk_map(&version1.0).unwrap(), [KnownPerk { perk: 7, timer: 60 }]);
         // old entry form: the first word is the id, three ints follow, no timer
         let mut w = Writer::default();
         w.i32(2 * 0x3f1);

@@ -246,15 +246,20 @@ impl HudPerks {
         let Ok(m) = n3::decode(f) else { return };
         let mut changed = false;
         match &m.body {
-            // A fully decoded empty perk map leaves rest empty; earlier unsupported blocks retain their size word.
-            N3::World(World::FullCharacter(c)) if m.header.target.kind == 50000 && m.header.target.instance == own && c.rest.is_empty() => {
-                self.known.0.clear();
-                changed = true;
-            }
-            // `FullCharacter::rest` starts at the first block the decoder could not read: the perk map when the spell list before it is empty
-            N3::World(World::FullCharacter(c)) if m.header.target.kind == 50000 && m.header.target.instance == own && !c.rest.is_empty() => {
-                if let Ok(p) = team::parse_perk_map(&c.rest) {
-                    self.known = Known(p.into_iter().map(|k| (k.perk, k.timer)).collect());
+            N3::World(World::FullCharacter(c)) if m.header.target.kind == 50000 && m.header.target.instance == own => {
+                if let Some(perks) = &c.perks {
+                    self.known = Known(perks.iter().map(|k| {
+                        // GC10052859 clears timers on catalogue entries without flags c0.
+                        let timer = if self.db.get(k.perk as u32).is_some_and(|d| d.flags & 0xc0 != 0) { k.timer } else { 0 };
+                        (k.perk, timer)
+                    }).filter(|(id, _)| self.db.get(*id as u32).is_some()).collect());
+                    self.publish_completed(zone);
+                    // GC100539fe -> 10052e66 replays event14 for every completed entry.
+                    for (&id, &timer) in &self.known.0 {
+                        if timer == 0 {
+                            if let Err(e) = self.wear_effects(id as u32, zone, true) { eprintln!("perks: snapshot {id}: {e:#}"); }
+                        }
+                    }
                     changed = true;
                 }
             }
@@ -868,6 +873,52 @@ mod tests {
         let personal = team::perk_update(Identity { kind: 50000, instance: 7 }, &team::PerkUpdate { perk: 101, stat_109: 0, remaining: 10 });
         h.on_frame(&n3_frame(0, 7, personal), &mut zone);
         assert_eq!(zone.completed_perks.as_deref(), Some(&[200][..]), "personal changes preserve global completion");
+    }
+
+    #[test]
+    fn full_character_perks_are_not_guessed_from_an_unsupported_tail() {
+        use ao_net::{Writer, msg::Identity, n3::outgoing::n3_frame};
+        let mut h = HudPerks::new(&ao_gui::client_dir(), (1024, 768));
+        h.db = PerkDb::from_defs(vec![def(100, 0, 0, 0), def(101, 0, 0x40, 0)]);
+        let mut zone = Zone::new(7);
+        let frame = |equipment, perks: &[team::KnownPerk]| {
+            let mut w = Writer::default();
+            w.u32(ao_net::n3::world::FULL_CHARACTER);
+            Identity { kind: 50000, instance: 7 }.write(&mut w);
+            w.u8(0);
+            w.u32(26);
+            for _ in 0..3 { w.u32(1009); }
+            for _ in 0..3 { w.u32(1); w.u32(0); }
+            for _ in 0..4 { w.u32(1009); }
+            w.i32(0);
+            w.u32(equipment);
+            if equipment == 3 {
+                Identity { kind: 50000, instance: 7 }.write(&mut w);
+                w.i32(0);
+                for _ in 0..6 { w.u32(1009); }
+            }
+            if equipment == 4 {
+                w.u32(1009);
+                w.u32(2018);
+                w.i32(0x7fff_ffff); // unsupported SpellData_t function: retain its whole tail
+            } else if equipment != 1 { w.u32(1009); w.u32(1009); }
+            w.bytes(&team::perk_map(perks));
+            n3_frame(0, 7, w.0)
+        };
+        let perks = [team::KnownPerk { perk: 100, timer: 60 }, team::KnownPerk { perk: 101, timer: 20 }];
+        h.on_frame(&frame(0, &perks), &mut zone);
+        assert_eq!(h.known.0.get(&100), Some(&0), "ordinary perk timers are cleared by catalogue flags");
+        assert_eq!(h.known.0.get(&101), Some(&20));
+        assert_eq!(zone.personal_completed_perks.as_deref(), Some(&[100][..]));
+        h.on_frame(&frame(1, &[]), &mut zone);
+        assert_eq!(h.known.0.len(), 2, "a malformed team tail is not a perk snapshot");
+        h.on_frame(&frame(4, &[]), &mut zone);
+        assert_eq!(h.known.0.len(), 2, "an unsupported spell tail cannot masquerade as a perk map");
+        h.on_frame(&frame(3, &perks), &mut zone);
+        assert_eq!(h.known.0.get(&101), Some(&20), "raid roster decoding reaches the actual perk-map position");
+        h.on_frame(&frame(0, &[]), &mut zone);
+        assert!(h.known.0.is_empty());
+        assert_eq!(zone.personal_completed_perks.as_deref(), Some(&[][..]));
     }
 
     #[test]
