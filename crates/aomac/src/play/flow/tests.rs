@@ -4,6 +4,121 @@ use super::*;
 use std::net::{Ipv4Addr, TcpListener};
 use std::time::{Duration, Instant};
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
+
+#[derive(Default)]
+struct AllocationCounts {
+    outstanding: AtomicI64,
+    bytes: AtomicI64,
+    allocations: AtomicU64,
+    allocated_bytes: AtomicU64,
+    reallocations: AtomicU64,
+    reallocated_bytes: AtomicU64,
+}
+
+impl AllocationCounts {
+    fn allocated(&self, size: usize) {
+        self.outstanding.fetch_add(1, Relaxed);
+        self.bytes.fetch_add(size as i64, Relaxed);
+        self.allocations.fetch_add(1, Relaxed);
+        self.allocated_bytes.fetch_add(size as u64, Relaxed);
+    }
+
+    fn deallocated(&self, size: usize) {
+        self.outstanding.fetch_sub(1, Relaxed);
+        self.bytes.fetch_sub(size as i64, Relaxed);
+    }
+
+    fn reallocated(&self, old: usize, new: usize) {
+        self.bytes.fetch_add(new as i64 - old as i64, Relaxed);
+        self.reallocations.fetch_add(1, Relaxed);
+        self.reallocated_bytes.fetch_add(new as u64, Relaxed);
+    }
+}
+
+struct CountingAllocator;
+
+static ALLOCATION_COUNTING: AtomicBool = AtomicBool::new(false);
+static ALLOCATION_COUNTS: AllocationCounts = AllocationCounts {
+    outstanding: AtomicI64::new(0), bytes: AtomicI64::new(0),
+    allocations: AtomicU64::new(0), allocated_bytes: AtomicU64::new(0),
+    reallocations: AtomicU64::new(0), reallocated_bytes: AtomicU64::new(0),
+};
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+// SAFETY: allocation and ownership remain entirely with System; instrumentation only updates atomics.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() && ALLOCATION_COUNTING.load(Relaxed) {
+            ALLOCATION_COUNTS.allocated(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() && ALLOCATION_COUNTING.load(Relaxed) {
+            ALLOCATION_COUNTS.allocated(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        if ALLOCATION_COUNTING.load(Relaxed) { ALLOCATION_COUNTS.deallocated(layout.size()); }
+        unsafe { System.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        let replacement = unsafe { System.realloc(pointer, layout, size) };
+        if !replacement.is_null() && ALLOCATION_COUNTING.load(Relaxed) {
+            ALLOCATION_COUNTS.reallocated(layout.size(), size);
+        }
+        replacement
+    }
+}
+
+/// Opt in once, without mutating the environment or resetting counters used by background threads.
+pub(super) fn allocation_counting_enable() {
+    if std::env::var_os("AOMAC_ALLOC_COUNT").is_some() && !ALLOCATION_COUNTING.swap(true, Relaxed) {
+        eprintln!("AOMAC_ALLOC enabled: process-wide Rust/System counts relative to enable, not absolute heap size; pre-enable allocations are omitted but their later frees count, so values may be negative. Compare snapshot deltas, which include those frees. Native allocations excluded; concurrent snapshots approximate. alloc_bytes_total excludes reallocs; realloc_bytes_total sums successful requested sizes.");
+    }
+}
+
+pub(super) fn allocation_report(label: &str) {
+    if !ALLOCATION_COUNTING.load(Relaxed) { return; }
+    let c = &ALLOCATION_COUNTS;
+    eprintln!("AOMAC_ALLOC {label} outstanding_allocs_delta={} outstanding_bytes_delta={} allocs_total={} alloc_bytes_total={} reallocs_total={} realloc_bytes_total={}",
+        c.outstanding.load(Relaxed), c.bytes.load(Relaxed), c.allocations.load(Relaxed),
+        c.allocated_bytes.load(Relaxed), c.reallocations.load(Relaxed), c.reallocated_bytes.load(Relaxed));
+}
+
+pub(super) fn counted_perf_report(o: &mut ao_render::Offscreen, p: &Play, label: &str) {
+    allocation_report(label);
+    o.perf_report(label);
+    eprintln!("AOMAC_CACHE {label} {}", p.zone.world.cache_sizes());
+}
+
+#[test]
+fn allocation_counter_arithmetic_handles_pre_enable_frees_and_reallocs() {
+    let counts = AllocationCounts::default();
+    counts.deallocated(32); // allocated before instrumentation: signed relative counts, not underflow
+    assert_eq!((counts.outstanding.load(Relaxed), counts.bytes.load(Relaxed)), (-1, -32));
+    counts.allocated(64);
+    counts.reallocated(64, 128);
+    counts.reallocated(128, 16);
+    assert_eq!((counts.outstanding.load(Relaxed), counts.bytes.load(Relaxed)), (0, -16));
+    counts.deallocated(16);
+    assert_eq!((counts.outstanding.load(Relaxed), counts.bytes.load(Relaxed)), (-1, -32));
+    assert_eq!(counts.allocations.load(Relaxed), 1);
+    assert_eq!(counts.allocated_bytes.load(Relaxed), 64);
+    assert_eq!(counts.reallocations.load(Relaxed), 2);
+    assert_eq!(counts.reallocated_bytes.load(Relaxed), 144);
+}
+
 // POSIX thread CPU time excludes descheduling and the background asset workers.
 // These probes are test-only; production input contains no clocks or recorder.
 fn input_cpu_now() -> Duration {
@@ -331,6 +446,10 @@ fn rig() -> Option<Rig> {
 #[test]
 #[ignore = "client data + GPU; performance replay"]
 fn offscreen_icc_performance_replay() {
+    allocation_counting_enable();
+    let frames = std::env::var("AOMAC_PERF_FRAMES").map(|value| value.parse::<usize>().expect("AOMAC_PERF_FRAMES must be a positive frame count")).unwrap_or(600);
+    assert!(frames > 0, "AOMAC_PERF_FRAMES must be positive");
+    let realtime = std::env::var_os("AOMAC_PERF_REALTIME").is_some();
     assert!(std::env::var_os("AOMAC_PERF").is_some(), "requires AOMAC_PERF=1");
     let mut r = rig().expect("performance replay requires client data");
     let mut o = ao_render::Offscreen::new(&r.p, (1280, 800)).unwrap();
@@ -353,11 +472,23 @@ fn offscreen_icc_performance_replay() {
     eprintln!("AOMAC_PERF replay camera={camera:?} dt=0.016666667");
     for _ in 0..120 { o.frame(&mut r.p, 1.0 / 60.0); }
     o.perf_reset();
-    let mut list = o.frame(&mut r.p, 1.0 / 60.0);
-    for _ in 1..600 { list = o.frame(&mut r.p, 1.0 / 60.0); }
-    o.perf_report("replay");
-    if let Some(path) = std::env::var_os("AOMAC_PERF_SHOT") {
-        o.png(&r.p, &list, std::path::Path::new(&path)).unwrap();
+    let measured = Instant::now();
+    for frame in 1..=frames {
+        let list = o.frame(&mut r.p, 1.0 / 60.0);
+        if realtime {
+            let target = Duration::from_secs_f64(frame as f64 / 60.0);
+            std::thread::sleep(target.saturating_sub(measured.elapsed()));
+        }
+        if frame % 600 == 0 || frame == frames {
+            let label = format!("replay@{frame}");
+            eprintln!("AOMAC_PERF {label} elapsed_s={:.3} realtime={realtime}", measured.elapsed().as_secs_f64());
+            counted_perf_report(&mut o, &r.p, &label);
+        }
+        if frame == frames {
+            if let Some(path) = std::env::var_os("AOMAC_PERF_SHOT") {
+                o.png(&r.p, &list, std::path::Path::new(&path)).unwrap();
+            }
+        }
     }
 }
 

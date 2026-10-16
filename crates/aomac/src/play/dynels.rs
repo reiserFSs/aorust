@@ -1164,6 +1164,12 @@ fn quat_yaw(q: &[f32; 4]) -> f32 {
 }
 
 impl Dynels {
+    #[cfg(test)]
+    pub(super) fn cache_sizes(&self) -> String {
+        format!("models={} model_bytes={} model_order={} asked={} chars={} props={}",
+            self.models.len(), self.model_bytes, self.model_order.len(), self.asked.len(), self.chars.len(), self.props.len())
+    }
+
     /// Model readiness and per-instance triangles of palette-posed remote CAT bodies in the headless input fixture.
     #[cfg(test)]
     pub(super) fn cpu_benchmark_scene(&self) -> (bool, usize) {

@@ -36,6 +36,8 @@
 //! Special stat 148 identifies Burst, 150 Fling Shot. Arm before input, including internally waiting `dclick`/`invuse`.
 //! `option=NativeVariable:value` dispatches Options control input and checks native store/runtime consumers.
 //! `optionpersist=name:name` saves/reopens native user files; `optioncheck=name:value` observes a subsequent login without writing.
+//! `perf=N` renders fixed-60Hz steps; `perfreport=label` snapshots timings, memory and caches even with zero samples.
+//! `AOMAC_ALLOC_COUNT=1` opts into process-wide test allocator counts (relative to test entry, native memory excluded).
 use super::*;
 use ao_render::{GameInput, KeyCode, Offscreen};
 use std::io::BufRead;
@@ -589,6 +591,7 @@ fn code(name: &str) -> KeyCode {
 #[test]
 #[ignore]
 fn live_walk() {
+    super::tests::allocation_counting_enable();
     let dir = ao_gui::client_dir();
     let mut lines = std::io::stdin().lock().lines();
     let (user, pass) = (lines.next().unwrap().unwrap(), lines.next().unwrap().unwrap());
@@ -695,14 +698,20 @@ fn live_walk() {
                 l.o.fixed_camera(Some(camera));
             }
             "perfreset" => l.o.perf_reset(),
-            "perfreport" => l.o.perf_report(v),
+            "perfreport" => super::tests::counted_perf_report(&mut l.o, &l.p, v),
             "perf" => {
                 assert!(std::env::var_os("AOMAC_PERF").is_some(), "perf requires AOMAC_PERF=1");
                 let frames: usize = v.parse().expect("perf=frame_count");
                 assert!(frames > 0, "perf requires frames");
                 l.o.perf_reset();
-                for _ in 0..frames { l.tick_dt(Some(1.0 / 60.0)); }
-                l.o.perf_report("live");
+                for frame in 1..=frames {
+                    l.tick_dt(Some(1.0 / 60.0));
+                    if frame == frames {
+                        super::tests::counted_perf_report(&mut l.o, &l.p, "live");
+                    } else if frame % 600 == 0 {
+                        super::tests::counted_perf_report(&mut l.o, &l.p, &format!("live@{frame}"));
+                    }
+                }
             }
             "option" | "optioncheck" => {
                 let (name, value) = v.split_once(':').expect("option=NativeVariable:value");

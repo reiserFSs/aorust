@@ -184,6 +184,22 @@ implied by these commands.
 Focused CPU-only metrics check:
 `cargo test --release -j 2 -p ao-render offscreen_perf_percentiles_use_nearest_rank`.
 
+For a longer memory investigation, add
+`AOMAC_ALLOC_COUNT=1 AOMAC_PERF_FRAMES=30000 AOMAC_PERF_REALTIME=1` to the replay
+invocation. This runs 500 seconds of fixed-60-Hz simulation paced against a
+monotonic wall clock, with memory snapshots every 600 frames and at the end.
+Without these options the original unpaced 600-frame benchmark is unchanged.
+`AOMAC_ALLOC_COUNT` enables a **test-only** process-wide Rust/System allocator
+counter at test entry; it reports outstanding allocation/count deltas and total
+allocation/reallocation requests. Allocations made before enable are omitted,
+but their later frees count, so signed outstanding values may be negative.
+Compare snapshot deltas, not absolute heap sizes; concurrent snapshots are
+approximate. Native Metal/Objective-C allocations are excluded. Allocation
+counting changes overhead, so use separate uncounted runs for timing comparisons.
+`AOMAC_PERF` memory reports include actor-model, actor, pooled-buffer and visual
+history counts; replay/live explicit reports also include CPU dynel-cache sizes.
+Zero-sample reports still emit memory snapshots, without timing percentiles.
+
 Repeat the same baseline/after replay command with `AOMAC_PERF_MSAA=1` (retail default)
 and `AOMAC_PERF_MSAA=4` (enhanced), keeping all other inputs fixed. With `AOMAC_PERF`
 enabled this override wins over loaded preferences in both replay and live harnesses.

@@ -196,6 +196,12 @@ impl Renderer {
     /// Actual actor texture uploads, including generated textures and model placeholders.
     pub fn actor_texture_uploads(&self) -> u64 { self.act.texture_uploads }
 
+    /// Retained actor models, actors, pooled skin buffers, and remembered native visual priorities.
+    pub fn actor_cache_sizes(&self) -> (usize, usize, usize, usize) {
+        (self.act.models.len(), self.act.actors.len(),
+            self.act.vb_pool.values().map(Vec::len).sum(), self.drawn_visuals.len())
+    }
+
     fn actor_texture(&mut self, identity: TextureIdentity, texture: &ao_scene::Texture) -> Arc<ActorTexture> {
         if identity.immutable() {
             if let Some(shared) = self.act.textures.get(&identity).and_then(Weak::upgrade) { return shared; }

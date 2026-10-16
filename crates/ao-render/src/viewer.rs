@@ -1190,16 +1190,17 @@ impl Offscreen {
     /// Reports thread CPU stages and completed-frame wall latency, never PNG encoding.
     pub fn perf_report(&mut self, label: &str) {
         let Some(perf) = &mut self.perf else { return };
-        if perf.count == 0 { return; }
         let mut column = [0.0; 600];
         eprintln!("AOMAC_PERF {label} frames={} size={}x{} msaa_requested={:?} msaa_actual={}", perf.count, self.size.0, self.size.1, perf.msaa, self.r.msaa_samples());
-        for (kind, samples) in [("wall", &perf.samples), ("thread_cpu", &perf.cpu_samples)] {
-            for (stage, name) in ["total", "update", "frontend", "upload", "render", "gui", "gpu_wait"].into_iter().enumerate() {
-                for (out, sample) in column.iter_mut().zip(&samples[..perf.count]) { *out = sample[stage] * 1000.0; }
-                let values = &mut column[..perf.count];
-                let mean = values.iter().sum::<f64>() / values.len() as f64;
-                let (p50, p95) = perf_percentiles(values);
-                eprintln!("AOMAC_PERF {label} {kind}_{name}_ms mean={mean:.4} p50={p50:.4} p95={p95:.4}");
+        if perf.count > 0 {
+            for (kind, samples) in [("wall", &perf.samples), ("thread_cpu", &perf.cpu_samples)] {
+                for (stage, name) in ["total", "update", "frontend", "upload", "render", "gui", "gpu_wait"].into_iter().enumerate() {
+                    for (out, sample) in column.iter_mut().zip(&samples[..perf.count]) { *out = sample[stage] * 1000.0; }
+                    let values = &mut column[..perf.count];
+                    let mean = values.iter().sum::<f64>() / values.len() as f64;
+                    let (p50, p95) = perf_percentiles(values);
+                    eprintln!("AOMAC_PERF {label} {kind}_{name}_ms mean={mean:.4} p50={p50:.4} p95={p95:.4}");
+                }
             }
         }
         let rss = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output();
@@ -1207,6 +1208,9 @@ impl Offscreen {
         eprintln!("AOMAC_PERF {label} rss_kib={rss_kib:?} instances={} draws={} native_gpu_allocated_bytes={:?} (Metal device allocation, unified memory; not dedicated VRAM)", self.r.stats.instances, self.r.stats.draw_calls, native_gpu_allocated_bytes(&self.r));
         let (actor_textures, actor_texture_bytes) = self.r.actor_texture_resources();
         eprintln!("AOMAC_PERF {label} retained_actor_textures={actor_textures} retained_actor_texture_bytes_estimate={actor_texture_bytes} actor_texture_uploads_total={}", self.r.actor_texture_uploads());
+        let (actor_models, actors, pooled_vbs, drawn_visuals) = self.r.actor_cache_sizes();
+        eprintln!("AOMAC_PERF {label} actor_models={actor_models} actors={actors} pooled_vbs={pooled_vbs} drawn_visuals={drawn_visuals} vb_created={} model_rebuilds={} mesh_buffer_grows={}",
+            self.r.actor_vb_creations(), self.r.actor_model_rebuilds(), self.r.actor_mesh_buffer_grows());
         let (creates, bytes) = crate::gpu_stats::perf_snapshot();
         eprintln!("AOMAC_PERF {label} tracked_creates_total={creates} tracked_created_bytes_estimate_total={bytes} (cumulative, not live VRAM)");
         perf.count = 0;
