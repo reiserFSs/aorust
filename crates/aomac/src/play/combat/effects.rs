@@ -212,6 +212,7 @@ struct Particle {
 
 struct Active {
     actor: u32,
+    actor_count: u32,
     enabled: bool,
     native_terminated: bool,
     effect: i32,
@@ -345,6 +346,7 @@ pub struct Renderer {
     buff_work: Vec<(u32,Box<buffs::Buff>)>,
     buff_models: HashMap<u32,EffectModel>,
     retired_buff_models: Vec<u64>,
+    retired_actor_visuals: Vec<(u32,u32)>,
     aux_sounds: Vec<aux::AuxSound>,
     vulcan_sequence:u64,
     screen_resources: HashMap<TextureKey,ao_scene::Texture>,
@@ -389,7 +391,8 @@ impl Renderer {
         let mut anchor_ids: Vec<_> = templates.by_id.values().filter_map(|t| t.words.get(7).map(|v| *v as i32)).chain(1000..=1018).chain(2000..=2023).chain([0,3000,3001]).collect();
         anchor_ids.sort_unstable();
         anchor_ids.dedup();
-        Ok(Self { diagnostics:HashSet::new(),templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::thread(), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),source_runtime:HashMap::new(),collision:None,anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![],vulcan_sequence:0,screen_resources:HashMap::new(),screen_uploaded:false,nano2_state:nano2::Nano2State::default(),hit_locations:hitlocation::HitLocations::default(),source_torso_factor:HashMap::new(),hit_clock_ms:0,native_fog:std::rc::Rc::new(std::cell::Cell::new(ao_render::NativeFog::default())),mesh_attr_cache:HashMap::new(),mesh_children:HashMap::new(),retired_screens:Vec::new(),shadows:true })
+        let retired_actor_visuals = Vec::new();
+        Ok(Self { retired_actor_visuals, diagnostics:HashSet::new(),templates, store, names, models: HashMap::new(), active: vec![], rng: CrtRand::thread(), next_actor: ACTOR_BASE, generation: u64::MAX, beam_state:beams::BeamState::default(),bph_last:HashMap::new(),elapsed:0.0,smoke_wind:Vec3::ZERO,spawning:vec![],anchors:HashMap::new(),source_runtime:HashMap::new(),collision:None,anchor_ids,control_work:vec![],composition_work:vec![],native_work:vec![],buff_work:vec![],buff_models:HashMap::new(),retired_buff_models:vec![],random:R250::new(0xe6f1),display_random:R250::new(0xe6f1),mesh_resources:HashMap::new(),mesh_uploaded:HashMap::new(),aux_sounds:vec![],vulcan_sequence:0,screen_resources:HashMap::new(),screen_uploaded:false,nano2_state:nano2::Nano2State::default(),hit_locations:hitlocation::HitLocations::default(),source_torso_factor:HashMap::new(),hit_clock_ms:0,native_fog:std::rc::Rc::new(std::cell::Cell::new(ao_render::NativeFog::default())),mesh_attr_cache:HashMap::new(),mesh_children:HashMap::new(),retired_screens:Vec::new(),shadows:true })
     }
     pub fn shared_native_fog(&self)->ao_render::SharedNativeFog {self.native_fog.clone()}
     /// GC100ece3a/100ecb5a/100ecee4: Shadows controls the CAT shadow visual,
@@ -419,11 +422,13 @@ impl Renderer {
         self.retired_screens.clear();
         let active = std::mem::take(&mut self.active);
         for mut a in active {
+            self.retired_actor_visuals.push((a.actor,a.actor_count));
             if let Some(c) = &mut a.control { c.cancel(self); }
             if let Some(c) = &mut a.composition { if let Err(error)=c.cancel(self) { report_effect_failure(&mut self.diagnostics, format_args!("effect cancellation: {error:#}")); } }
             if let Some(native)=&mut a.native_replicated { native.cancel(self); }
             if let Some(buff)=&mut a.buff { if let Err(error)=buff.cancel(self) {report_effect_failure(&mut self.diagnostics, format_args!("buff cancellation: {error:#}"));} }
         }
+        self.retired_actor_visuals.extend(self.active.iter().map(|a|(a.actor,a.actor_count)));
         self.active.clear();
         self.retired_buff_models.extend(self.buff_models.iter().filter(|(_,model)|model.uploaded).map(|(&handle,_)|0xfac2_0000_0000_0000|u64::from(handle)));
         self.buff_models.clear();
@@ -439,6 +444,7 @@ impl Renderer {
     pub fn delete(&mut self, handle: u32) {
         if let Some(index) = self.active.iter().position(|a| a.actor == handle) {
             let mut a = self.active.swap_remove(index);
+            self.retired_actor_visuals.push((a.actor,a.actor_count));
             self.delete_mesh_children(handle);
             if let Some(c) = &mut a.control { c.cancel(self); }
             if let Some(c) = &mut a.composition { if let Err(error)=c.cancel(self) { report_effect_failure(&mut self.diagnostics, format_args!("effect cancellation: {error:#}")); } }
@@ -735,7 +741,7 @@ impl Renderer {
         // InitDynelTemplate fails. A rejected locator still returns its control.
         if config.source_nonvisual && matches!(config.creation,Creation::Dynel) && matches!(template.kind,2004|3001|3005|3009|3010|3012|3014|3018|3022|3023|3024|3025|3027|3028|3030|3031|3033|3035|3038) {
             let actor=self.next_actor;self.next_actor=self.next_actor.wrapping_add(1).max(ACTOR_BASE);
-            self.active.push(Active {actor,model_key,enabled:true,native_terminated:true,effect:binding.effect,raw_source:source,source,target,elapsed:0.0,color:binding.color,particles:Vec::new(),emitted:0,next_burst:0.0,repetitions:0,config,beam:None,stop_at:None,ticks:0,sprite:None,control:None,attractor:binding.attractor,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None,native_replicated:None,buff:None,global:None,nightvision:None,bparticle:None,nano2:None,mesh_test:None,mparticle:None,buffer:None,projectile:None,ground_impact:None,tower:None});
+            self.active.push(Active {actor,actor_count:1,model_key,enabled:true,native_terminated:true,effect:binding.effect,raw_source:source,source,target,elapsed:0.0,color:binding.color,particles:Vec::new(),emitted:0,next_burst:0.0,repetitions:0,config,beam:None,stop_at:None,ticks:0,sprite:None,control:None,attractor:binding.attractor,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None,native_replicated:None,buff:None,global:None,nightvision:None,bparticle:None,nano2:None,mesh_test:None,mparticle:None,buffer:None,projectile:None,ground_impact:None,tower:None});
             return Ok(actor);
         }
         ensure!(source.is_finite() && target.is_finite(), "nonfinite effect anchor");
@@ -911,7 +917,8 @@ impl Renderer {
         let emitted = if template.kind == 1005 { -(template.word(31)? as i64) } else { 0 };
         let native_terminated=config.source_nonvisual && matches!(template.kind,1002|1017|1023|1029|2001|2008|2014|3017|3019);
         let actor = self.next_actor;
-        self.next_actor = self.next_actor.wrapping_add(mesh_test.as_ref().map(|_|32).or_else(||mparticle.as_ref().map(|m|m.actor_count())).or_else(||mesh.as_ref().map(|m| m.actor_count())).or_else(|| tracer_mesh.as_ref().map(|m|m.actor_count())).unwrap_or(1).max(1) as u32).max(ACTOR_BASE);
+        let actor_count = mesh_test.as_ref().map(|_|32).or_else(||mparticle.as_ref().map(|m|m.actor_count())).or_else(||mesh.as_ref().map(|m| m.actor_count())).or_else(|| tracer_mesh.as_ref().map(|m|m.actor_count())).unwrap_or(1).max(1) as u32;
+        self.next_actor = self.next_actor.wrapping_add(actor_count).max(ACTOR_BASE);
         if let Some(c) = &mut composition { c.initialize(self)?; }
         if let Some(native)=&mut native_replicated { native.initialize(self)?; }
         if let Some(g)=&ground_impact {self.buff_models.insert(actor,EffectModel::new(Arc::new(g.scene(&self.store,&self.names)?)));}
@@ -933,7 +940,7 @@ impl Renderer {
         }
         if let Some(record)=tracer_mesh.as_ref().and_then(|mesh|mesh.record_id()) {self.prepare_mesh_children(actor,actor,record)?;}
         if let Some(mesh)=&mparticle {for (index,(resource,_,_)) in mesh.instances().enumerate() {self.prepare_mesh_children(actor,actor+index as u32,mesh.resources()[resource].0)?;}}
-        self.active.push(Active { actor,model_key,enabled:true,native_terminated,effect: binding.effect, source, raw_source,target, elapsed: 0.0, color: binding.color, particles, emitted, next_burst: -1.0, repetitions, config, beam, stop_at: None, ticks:0,sprite,control:controller,attractor,composition,mesh,tracer_mesh,aux:auxiliary,particle,particle2,native_replicated,buff,global,nightvision,bparticle,nano2,mesh_test,mparticle,buffer,projectile,ground_impact,tower });
+        self.active.push(Active { actor,actor_count,model_key,enabled:true,native_terminated,effect: binding.effect, source, raw_source,target, elapsed: 0.0, color: binding.color, particles, emitted, next_burst: -1.0, repetitions, config, beam, stop_at: None, ticks:0,sprite,control:controller,attractor,composition,mesh,tracer_mesh,aux:auxiliary,particle,particle2,native_replicated,buff,global,nightvision,bparticle,nano2,mesh_test,mparticle,buffer,projectile,ground_impact,tower });
         Ok(actor)
     }
     fn prepare_mesh_children(&mut self,owner:u32,actor:u32,record:u32)->Result<()> {
@@ -1139,7 +1146,7 @@ impl Renderer {
         let forward = host.camera.forward();
         let mut live_rocks=self.active.iter().filter_map(|a|a.mesh.as_ref()).map(meshes::MeshEffect::rock_count).sum::<usize>();
         if !self.screen_uploaded {host.screen_textures.extend(self.screen_resources.iter().map(|(&key,texture)|(key,texture.clone())));self.screen_uploaded=true;}
-        self.active.retain_mut(|effect| {
+        let mut retain_effect = |effect: &mut Active| {
             if effect.native_terminated {return false;}
             let template = &self.templates.by_id[&effect.effect];
             if !dt.is_finite() { return true; }
@@ -1361,12 +1368,16 @@ impl Renderer {
             // Dynamic world-space skin has no useful bind-pose sphere (actors.rs:191).
             host.actors.push(ActorFrame { id: effect.actor, model: effect.model_key, transform: IDENTITY, parts: vec![], skin: Some(std::sync::Arc::new(skin)), always: true, alpha: 1.0, priority:native_priority(template.kind), ..Default::default() });
             true
+        };
+        self.active.retain_mut(|effect| {
+            let retained = retain_effect(effect);
+            if !retained { self.retired_actor_visuals.push((effect.actor,effect.actor_count)); }
+            retained
         });
         if self.active.iter().any(|effect|!effect.enabled) {
             host.actors.retain(|actor|!self.active.iter().any(|effect| {
                 if effect.enabled {return false;}
-                let count=effect.mesh_test.as_ref().map(|_|32).or_else(||effect.mparticle.as_ref().map(|m|m.actor_count())).or_else(||effect.mesh.as_ref().map(|m|m.actor_count())).or_else(||effect.tracer_mesh.as_ref().map(|m|m.actor_count())).unwrap_or(1) as u32;
-                actor.id>=effect.actor && actor.id-effect.actor<count
+                actor.id.wrapping_sub(effect.actor)<effect.actor_count
             }));
         }
         self.retired_screens.clear();
@@ -1400,6 +1411,9 @@ impl Renderer {
         host.actor_models.retain(|(key,_)|!self.retired_buff_models.contains(key));
         host.actor_model_updates.retain(|(key,_)|!self.retired_buff_models.contains(key));
         host.actor_model_removals.append(&mut self.retired_buff_models);
+        // Destruction can occur between frames or while processing nested controls.
+        // Never infer it from absent actor frames: culled native visuals can return.
+        host.actor_visual_retirements.append(&mut self.retired_actor_visuals);
     }
 }
 
@@ -1644,7 +1658,37 @@ mod tests {
     }
 
     fn active_sprite(template: &Template) -> Active {
-        Active { actor:ACTOR_BASE,model_key:texture_model_key(1,3),enabled:true,native_terminated:false,effect:1,source:Mat4::IDENTITY,raw_source:Mat4::IDENTITY,target:Vec3::X,elapsed:0.0,color:0,particles:vec![],emitted:-(template.words[31] as i64),next_burst:-1.0,repetitions:1,config:EffectConfig::default(),beam:None,stop_at:None, ticks:0,sprite:None,control:None,attractor:0,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None,native_replicated:None,buff:None,global:None,nightvision:None,bparticle:None,nano2:None,mesh_test:None,mparticle:None,buffer:None,projectile:None,ground_impact:None,tower:None }
+        Active { actor:ACTOR_BASE,actor_count:1,model_key:texture_model_key(1,3),enabled:true,native_terminated:false,effect:1,source:Mat4::IDENTITY,raw_source:Mat4::IDENTITY,target:Vec3::X,elapsed:0.0,color:0,particles:vec![],emitted:-(template.words[31] as i64),next_burst:-1.0,repetitions:1,config:EffectConfig::default(),beam:None,stop_at:None, ticks:0,sprite:None,control:None,attractor:0,composition:None,mesh:None,tracer_mesh:None,aux:None,particle:None,particle2:None,native_replicated:None,buff:None,global:None,nightvision:None,bparticle:None,nano2:None,mesh_test:None,mparticle:None,buffer:None,projectile:None,ground_impact:None,tower:None }
+    }
+
+    #[test]
+    fn visual_retirement_covers_expiry_delete_clear_and_preserved_handles() {
+        let mut renderer=Renderer::open(&ao_gui::client_dir()).expect("effect lifecycle requires retail data");
+        let template=authored_sprite(1005);
+        renderer.templates.by_id.insert(1,template.clone());
+        let mut host=ao_render::Host::headless();
+        for (cycle,count) in [1,32,7,16].into_iter().enumerate() {
+            let mut effect=active_sprite(&template);
+            effect.actor=ACTOR_BASE+cycle as u32*64;
+            effect.actor_count=count;
+            let first=effect.actor;
+            effect.native_terminated=true; // common frame destruction, before any model lookup
+            renderer.active.push(effect);
+            match cycle {
+                0=>renderer.frame(0.01,&mut host,None),
+                1=>{renderer.delete(first);renderer.frame(0.01,&mut host,None);},
+                2=>{renderer.clear();renderer.frame(0.01,&mut host,None);},
+                _=>{
+                    renderer.clear_preserving(Some(first));
+                    assert!(renderer.retired_actor_visuals.is_empty());
+                    assert!(renderer.is_active(first));
+                    renderer.frame(0.01,&mut host,None);
+                },
+            }
+            assert_eq!(host.actor_visual_retirements,[(first,count)]);
+            host.actor_visual_retirements.clear();
+            assert!(renderer.retired_actor_visuals.is_empty());
+        }
     }
 
     #[test]
@@ -1866,6 +1910,8 @@ mod tests {
                 _=>{renderer.frame(1000.0,&mut host,None);renderer.frame(3.0,&mut host,None);},
             }
             renderer.frame(0.01,&mut host,None);
+            assert_eq!(std::mem::take(&mut host.actor_visual_retirements),[(handle,1)],
+                "expiry, cancellation and clear all retire the actual visual");
             for key in host.actor_model_removals.drain(..) {uploaded.remove(&key);}
             for (key,_) in host.actor_models.drain(..) {uploaded.insert(key);}
             assert!(uploaded.is_empty(),"deleted effect GPU model must be retired");

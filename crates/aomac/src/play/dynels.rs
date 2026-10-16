@@ -675,6 +675,8 @@ pub struct Char {
     previous_body: Option<PreviousBody>,
     terminal_pose: bool,
     submitted: bool,
+    /// Has emitted a visual in this scene; unlike `submitted`, survives visibility culls.
+    visual_live: bool,
     /// Mount transforms of the last pose.
     parts: Vec<[[f32; 4]; 4]>,
     features_set: bool,
@@ -831,6 +833,7 @@ struct Prop {
     yaw: f32,
     scale: f32,
     submitted: bool,
+    visual_live: bool,
     /// Door / animated item state and the pose the renderer holds (docs/zone/doors.md).
     anim: PropAnim,
     /// Stats set by messages (full update, `StatIIR_t`); they win over the template's ([`Built::stats`]).
@@ -865,6 +868,9 @@ pub struct Dynels {
     /// Non-character dynels by `(identity kind, instance)`.
     props: HashMap<(i32, i32), Prop>,
     next_prop: u32,
+    /// True destructions since the last update, FIFO actor-ID ranges. Only previously emitted
+    /// visuals enter this queue, so message-only spawn/despawn churn cannot grow it.
+    pending_visual_resets: Vec<(u32, u32)>,
     /// Looks asked for before the worker existed.
     pending: Vec<(u64, Look)>,
     /// `AnimSet` of the weapon in the right (slot 6) / left (slot 8) hand of a holder.
@@ -1069,6 +1075,7 @@ impl Default for Dynels {
             chars: HashMap::new(),
             props: HashMap::new(),
             next_prop: PROP_ID_BASE,
+            pending_visual_resets: vec![],
             pending: vec![],
             wield: HashMap::new(),
             fighting: HashMap::new(),
@@ -1351,6 +1358,9 @@ impl Dynels {
     pub fn clear(&mut self) {
         let keep: HashSet<u64> = self.chars.values().map(|c| c.key).chain(self.props.values().map(|p| p.key)).collect();
         self.chars.clear();
+        self.pending_visual_resets.clear();
+        self.pending_clips.clear();
+        self.replay.clear();
         self.collision = None;
         self.slot_hits.clear();
         self.later.clear();
@@ -2575,8 +2585,33 @@ impl Dynels {
         }
     }
 
+    fn retire_visual(&mut self, id: u32) {
+        if let Some((first, count)) = self.pending_visual_resets.last_mut() {
+            if first.checked_add(*count) == Some(id) && *count < u32::MAX {
+                *count += 1;
+                return;
+            }
+        }
+        self.pending_visual_resets.push((id, 1));
+    }
+
+    fn remove_char(&mut self, id: i32) {
+        if let Some(c) = self.chars.remove(&id) {
+            if c.visual_live { self.retire_visual(id as u32); }
+        }
+        self.pending_clips.retain(|request| request.3 != id);
+        self.replay.retain(|request| request.0 != id);
+    }
+
+    fn remove_prop(&mut self, identity: (i32, i32)) {
+        if let Some(p) = self.props.remove(&identity) {
+            if p.visual_live { self.retire_visual(p.id); }
+        }
+    }
+
     fn add_prop(&mut self, kind: i32, instance: i32, look: Look, pos: [f32; 3], rot: Option<[f32; 4]>, scale: f32) {
         let (id, replace) = self.props.get(&(kind, instance)).map_or((self.next_prop, false), |p| (p.id, true));
+        let visual_live = self.props.get(&(kind, instance)).is_some_and(|p| p.visual_live);
         if !replace {
             self.next_prop += 1;
         }
@@ -2585,7 +2620,7 @@ impl Dynels {
             Look::Corpse(_) => vec![(CAN_STAT, CORPSE_CAN)],
             Look::Char(_) => vec![],
         };
-        self.props.insert((kind, instance), Prop { id, key: look.key(self.texture_quality), parent: None, name: None, pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, anim: PropAnim::default(), stats });
+        self.props.insert((kind, instance), Prop { id, key: look.key(self.texture_quality), parent: None, name: None, pos, yaw: rot.map_or(0.0, |q| quat_yaw(&q)), scale, submitted: false, visual_live, anim: PropAnim::default(), stats });
         self.pending.push((look.key(self.texture_quality), look));
     }
     /// Message stats of the known prop `who` (a corpse's, a `StatIIR_t`'s): they replace earlier values.
@@ -2837,7 +2872,7 @@ impl Dynels {
                             // A corpse replaces its character even when the full update beats the quit.
                             if let Some(effects) = &mut self.effects { effects.source_deleted((c.owner.kind as u32, c.owner.instance as u32)); }
                             self.cancel_nano_visuals(c.owner.instance);
-                            self.chars.remove(&c.owner.instance);
+                            self.remove_char(c.owner.instance);
                             self.fighting.remove(&c.owner.instance);
                         }
                     }
@@ -2962,7 +2997,7 @@ impl Dynels {
                     self.set_stats(who, s.stats.iter().map(|x| (x.0 as u32, x.1)));
                 }
                 if matches!(m.body, N3::Misc(Misc::ToClientQuit)) {
-                    self.props.remove(&(who.kind, who.instance));
+                    self.remove_prop((who.kind, who.instance));
                     if let Some((holder, hand)) = self.weapons.remove(&who.instance) {
                         if let Some(w) = self.wield.get_mut(&holder) {
                             w[hand] = None;
@@ -3007,6 +3042,9 @@ impl Dynels {
                     mover.on_path(p.id.kind != 0 || p.id.instance != 0, &p.waypoints);
                 }
                 let pose = remote_pose(&mut mover, self.collision.as_ref(), 0.0);
+                let visual_live = self.chars.get(&who.instance).is_some_and(|c| c.visual_live);
+                self.pending_clips.retain(|request| request.3 != who.instance);
+                self.replay.retain(|request| request.0 != who.instance);
                 self.chars.insert(
                     who.instance,
                     Char {
@@ -3038,6 +3076,7 @@ impl Dynels {
                         previous_body: None,
                         terminal_pose: false,
                         submitted: false,
+                        visual_live,
                         parts: vec![],
                         features_set: !u.is_npc() || u.pairs.iter().any(|p| p.0 == ao_net::n3::motion::STAT_FEATURES),
                         bounds: None,
@@ -3088,7 +3127,7 @@ impl Dynels {
             }
             N3::Misc(Misc::ToClientQuit) => {
                 self.cancel_nano_visuals(who.instance);
-                self.chars.remove(&who.instance);
+                self.remove_char(who.instance);
                 self.fighting.remove(&who.instance);
                 self.swing_delay.remove(&who.instance);
                 self.once_rate.remove(&who.instance);
@@ -3139,6 +3178,10 @@ impl Dynels {
             return;
         }
         self.scene_generation = host.scene_generation();
+        self.pending_visual_resets.clear();
+        for character in self.chars.values_mut() {
+            character.visual_live = false;
+        }
         for model in self.models.values_mut() {
             if let Model::Ready { uploaded, .. } = model {
                 *uploaded = false;
@@ -3146,6 +3189,7 @@ impl Dynels {
         }
         for prop in self.props.values_mut() {
             prop.submitted = false;
+            prop.visual_live = false;
         }
     }
 
@@ -3212,6 +3256,7 @@ impl Dynels {
         own_anchor: impl FnMut(i32) -> Option<glam::Mat4>,
     ) {
         self.sync_scene(host);
+        host.actor_visual_resets.append(&mut self.pending_visual_resets);
         self.cam = cam;
         self.tick_sounds(dt);
         self.refresh_effect_source_runtime();
@@ -3342,6 +3387,7 @@ impl Dynels {
                 if effects.needs_source_mesh(identity) { effects.prepare_source_mesh(identity, &built.model, &actor); }
             }
             host.actors.push(actor);
+            p.visual_live = true;
         }
         self.advance(dt);
         // Retain offscreen palettes unless native effects require a refreshed skeleton.
@@ -3574,6 +3620,7 @@ impl Dynels {
                 *c.current_skin.get_mut() = None;
             }
             c.submitted = true;
+            c.visual_live = true;
             let (s, cs) = scene_yaw(c.pose.yaw).sin_cos();
             let k = c.scale;
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [p[0], p[1], p[2], 1.0]];
@@ -3751,6 +3798,152 @@ fn model_state(world: &Dynels, key: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prop_destruction_resets_fresh_ids_in_fifo_ranges_without_message_churn_growth() {
+        let mut world = Dynels::default();
+        let who = ao_net::msg::Identity { kind: 0xc76a, instance: 7 };
+        let mut quit = captured_posture_player();
+        quit.header.target = who;
+        quit.body = N3::Misc(Misc::ToClientQuit);
+        let mut host = Host::headless();
+        let mut previous = None;
+        for _ in 0..128 {
+            world.test_prop(who, vec![]);
+            let id = world.props[&(who.kind, who.instance)].id;
+            if let Some(previous) = previous { assert_eq!(id, previous + 1); }
+            previous = Some(id);
+            // This is the renderer ownership bit set by actual submission, not current visibility.
+            world.props.get_mut(&(who.kind, who.instance)).unwrap().visual_live = true;
+            world.test_prop(who, vec![]);
+            assert_eq!(world.props[&(who.kind, who.instance)].id, id, "full update reuses the actor");
+            assert!(world.props[&(who.kind, who.instance)].visual_live);
+            assert!(world.pending_visual_resets.is_empty(), "replacement is not destruction");
+            world.on_message(&quit);
+            world.on_message(&quit);
+            assert_eq!(world.pending_visual_resets, [(id, 1)], "duplicate quit does not reset twice");
+            world.update_with_collision(0.0, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
+            assert_eq!(std::mem::take(&mut host.actor_visual_resets), [(id, 1)]);
+            assert!(world.pending_visual_resets.is_empty());
+        }
+        for instance in 0..3 {
+            world.test_prop(ao_net::msg::Identity { instance, ..who }, vec![]);
+            world.props.get_mut(&(who.kind, instance)).unwrap().visual_live = true;
+        }
+        let first = world.props[&(who.kind, 0)].id;
+        for instance in 0..3 { world.remove_prop((who.kind, instance)); }
+        world.retire_visual(17);
+        assert_eq!(world.pending_visual_resets, [(first, 3), (17, 1)]);
+        world.update_with_collision(0.0, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
+        assert_eq!(std::mem::take(&mut host.actor_visual_resets), [(first, 3), (17, 1)]);
+        for _ in 0..1024 {
+            world.test_prop(who, vec![]);
+            world.on_message(&quit);
+        }
+        assert!(world.pending_visual_resets.is_empty(), "never-emitted actors need no retained-state reset");
+        world.test_prop(who, vec![]);
+        world.props.get_mut(&(who.kind, who.instance)).unwrap().visual_live = true;
+        world.on_message(&quit);
+        world.clear();
+        assert!(world.pending_visual_resets.is_empty(), "scene clear already forgets renderer state");
+    }
+
+    #[test]
+    fn character_destruction_and_corpse_before_quit_reset_only_emitted_visuals() {
+        let spawn = captured_posture_player();
+        let who = spawn.header.target;
+        let mut world = Dynels::default();
+        world.on_message(&spawn);
+        world.chars.get_mut(&who.instance).unwrap().visual_live = true;
+        world.on_message(&spawn);
+        assert!(world.chars[&who.instance].visual_live);
+        assert!(world.pending_visual_resets.is_empty(), "full update is the same actor");
+        let mut corpse = frames(include_str!("../../../../docs/captures/zone_kill_ithaca.rec")).iter().find_map(|f| {
+            let m = ao_net::n3::decode(f).ok()?;
+            matches!(&m.body, N3::World(World::Corpse(_))).then_some(m)
+        }).unwrap();
+        if let N3::World(World::Corpse(c)) = &mut corpse.body { c.owner = who; }
+        world.on_message(&corpse);
+        assert!(!world.chars.contains_key(&who.instance));
+        assert!(world.props.contains_key(&(corpse.header.target.kind, corpse.header.target.instance)));
+        assert_eq!(world.pending_visual_resets, [(who.instance as u32, 1)]);
+        let mut quit = spawn.clone();
+        quit.body = N3::Misc(Misc::ToClientQuit);
+        world.on_message(&quit);
+        assert_eq!(world.pending_visual_resets, [(who.instance as u32, 1)], "late quit is idempotent");
+        world.on_message(&spawn);
+        assert!(!world.chars[&who.instance].visual_live, "same-ID respawn has a new visual lifetime");
+        let mut host = Host::headless();
+        world.update_with_collision(0.0, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
+        assert_eq!(std::mem::take(&mut host.actor_visual_resets), [(who.instance as u32, 1)]);
+        world.chars.get_mut(&who.instance).unwrap().visual_live = true;
+        world.on_message(&quit);
+        assert_eq!(world.pending_visual_resets, [(who.instance as u32, 1)]);
+        world.clear();
+        world.own = who.instance;
+        world.on_message(&spawn);
+        world.on_message(&quit);
+        assert!(world.pending_visual_resets.is_empty(), "own player visual belongs to the player renderer");
+    }
+
+    #[test]
+    fn distance_invisibility_and_frustum_culls_preserve_dynel_visual_lifetime() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let spawn = captured_posture_player();
+        let who = spawn.header.target.instance;
+        let mut world = Dynels { dir: Some(dir), ..Default::default() };
+        world.on_message(&spawn);
+        let key = world.chars[&who].key;
+        let built = build(&store, &mut assets, &world.chars[&who].look).unwrap();
+        world.asked.insert(key);
+        world.models.insert(key, Model::Ready { built: Box::new(built), uploaded: false });
+        let prop = ao_net::msg::Identity { kind: 0xc76a, instance: 7 };
+        world.test_prop(prop, vec![]);
+        let prop_key = world.props[&(prop.kind, prop.instance)].key;
+        world.asked.insert(prop_key);
+        world.models.insert(prop_key, Model::Ready { built: Box::new(plain(ao_scene::Scene::default(), true)), uploaded: false });
+        let pos = scene_pos(world.chars[&who].pose.pos);
+        let eye = [pos[0], pos[1] + 1.5, pos[2] + 4.0];
+        world.props.get_mut(&(prop.kind, prop.instance)).unwrap().pos = world.chars[&who].pose.pos;
+        let mut host = Host::headless();
+        world.update_with_collision(0.0, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
+        assert!(host.actors.iter().any(|a| a.id == who as u32));
+        assert!(world.props[&(prop.kind, prop.instance)].visual_live, "real prop emission owns retained state");
+        for (cam, fwd, visible) in [
+            ([eye[0] + 10000.0, eye[1], eye[2]], [0.0, 0.0, -1.0], true),
+            (eye, [0.0, 0.0, 1.0], true),
+            (eye, [0.0, 0.0, -1.0], false),
+            (eye, [0.0, 0.0, -1.0], true),
+        ] {
+            world.chars.get_mut(&who).unwrap().visible = visible;
+            host.actors.clear();
+            world.update_with_collision(0.016, cam, fwd, &mut host, None, |_| None);
+            assert!(world.chars[&who].visual_live);
+            assert!(world.props[&(prop.kind, prop.instance)].visual_live, "prop distance cull is not destruction");
+            assert!(world.pending_visual_resets.is_empty());
+            assert!(host.actor_visual_resets.is_empty());
+        }
+        assert!(host.actors.iter().any(|a| a.id == who as u32), "returning actor remains renderable");
+        let mut quit = spawn;
+        quit.body = N3::Misc(Misc::ToClientQuit);
+        world.on_message(&quit);
+        world.update_with_collision(0.0, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
+        assert_eq!(host.actor_visual_resets, [(who as u32, 1)]);
+        host.actor_visual_resets.clear();
+        for _ in 0..32 {
+            let old = world.props[&(prop.kind, prop.instance)].id;
+            world.remove_prop((prop.kind, prop.instance));
+            world.test_prop(prop, vec![]);
+            world.props.get_mut(&(prop.kind, prop.instance)).unwrap().pos = world.chars.get(&who).map_or([0.0; 3], |c| c.pose.pos);
+            assert_eq!(world.props[&(prop.kind, prop.instance)].id, old + 1);
+            host.actors.clear();
+            world.update_with_collision(0.0, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
+            assert_eq!(std::mem::take(&mut host.actor_visual_resets), [(old, 1)]);
+            assert!(world.props[&(prop.kind, prop.instance)].visual_live);
+        }
+    }
 
     #[test]
     fn remote_deformer_submits_cpu_skin_only_while_needed() {
@@ -4166,7 +4359,7 @@ mod tests {
         }
         assert!(world.model_bytes > Dynels::MODEL_BYTE_BUDGET, "test setup must start over budget");
         let kept = count;
-        world.props.insert((1, 1), Prop { id: 0x4000_0001, key: kept, parent: None, name: None, pos: [0.0; 3], yaw: 0.0, scale: 1.0, submitted: false, anim: PropAnim::default(), stats: vec![] });
+        world.props.insert((1, 1), Prop { id: 0x4000_0001, key: kept, parent: None, name: None, pos: [0.0; 3], yaw: 0.0, scale: 1.0, submitted: false, visual_live: false, anim: PropAnim::default(), stats: vec![] });
         world.on_playfield(100); // A -> B: clear() runs, which now evicts down to the budget
         assert!(world.model_bytes <= Dynels::MODEL_BYTE_BUDGET, "within budget after one zone change: {} bytes", world.model_bytes);
         assert!(world.models.contains_key(&kept), "the zone's own just-used key survives eviction");

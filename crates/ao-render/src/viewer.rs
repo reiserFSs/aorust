@@ -77,6 +77,10 @@ pub struct Host {
     pub actor_model_updates: Vec<(u64, std::sync::Arc<Scene>)>,
     /// Model keys to retire before uploads and actor frames; drained by the viewer. See [`Renderer::remove_actor_model`].
     pub actor_model_removals: Vec<u64>,
+    /// Destroyed actor ID ranges (`first`, `count`), not visibility culls; retired when the following frame replaces the final submission.
+    pub actor_visual_retirements: Vec<(u32, u32)>,
+    /// Destroyed logical actor ranges (`first`, `count`), reset before fresh frames, including same-ID replacements.
+    pub actor_visual_resets: Vec<(u32, u32)>,
     /// The actors to draw this frame ([`ao_scene::ActorFrame`]); push every frame, the viewer drains it. Actors that are not pushed are forgotten.
     pub actors: Vec<ao_scene::ActorFrame>,
     /// Per-frame moving lights (worn/attached item lights, e.g. a Light Bar's embedded `RLight_t`, tracked to its
@@ -157,6 +161,9 @@ impl Host {
         for key in self.actor_model_removals.drain(..) {
             r.remove_actor_model(key);
         }
+        r.queue_actor_visual_retirements(&mut self.actor_visual_retirements);
+        r.retire_actor_visuals(&self.actor_visual_resets);
+        self.actor_visual_resets.clear();
         for (key, scene) in self.actor_models.drain(..) {
             r.add_actor_model(key, &scene);
         }
@@ -174,7 +181,7 @@ impl Host {
 
     /// A host without a window or renderer (headless tests of [`Frontend`]s); scenes handed to it are kept, never drawn.
     pub fn headless() -> Self {
-        Host { pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
+        Host { actor_visual_resets: vec![], actor_visual_retirements: vec![], pointer_warp: None, smooth_animations: true, previous_visible_actors: HashSet::new(), ground_textures: None, texture_policy: None, anisotropy: None, msaa_samples: None, interface_scale: None, borderless_game: false, pinch_zoom: false, cloud_preferences: None, ground_rendering: 3, camera: Camera::look_at(Vec3::ZERO, -Vec3::Z), fly: false, quit: false, scene: None, repose: None, scene_generation: 0, lens: None, fog_density_scale: None, spaceships_shown: true, realistic_water: true, ground_detail: None, wait_for_vert_sync: None, mouse_lag_fix: false, look: false, actor_models: vec![], actor_model_updates: vec![], actor_model_removals: vec![], actors: vec![], dynamic_lights: vec![], clear_actors: false, live_sky: None, sky_clock: None, mods: Default::default(), hide_cursor: false, effect_wind: [0.0; 3],effect_day_time:None,effect_game_seconds:None,effect_first_person:false,effect_environment_center:None,effect_environment_wind:None,effect_playfield:None,effect_sun_direction:None,effect_dungeon:None,screen_layers:vec![],screen_textures:vec![],viewport_depth_clears:vec![],native_fog:None,native_fog_preference:None,screenshot:None,window_scale:1 }
     }
 
     /// Updates vertex positions/instance transforms of the current scene in place ([`Renderer::repose`]).
@@ -197,6 +204,8 @@ impl Host {
         self.actor_models.clear();
         self.actor_model_updates.clear();
         self.actor_model_removals.clear();
+        self.actor_visual_retirements.clear();
+        self.actor_visual_resets.clear();
         self.actors.clear();
         self.dynamic_lights.clear();
         self.screen_layers.clear();
@@ -1577,15 +1586,112 @@ mod tests {
         host.repose(Scene::default());
         host.actor_models.push((1, std::sync::Arc::new(Scene::default())));
         host.actor_model_removals.push(1);
+        host.actor_visual_retirements.push((0xe000_0000, 32));
+        host.actor_visual_resets.push((0x4000_0000, 1));
         host.set_scene(Scene::default());
         assert!(host.scene.is_some());
         assert!(host.repose.is_none());
         assert!(host.actor_models.is_empty() && host.actors.is_empty());
         assert!(host.actor_model_removals.is_empty());
+        assert!(host.actor_visual_retirements.is_empty());
+        assert!(host.actor_visual_resets.is_empty());
         assert!(host.clear_actors);
         assert_eq!(host.scene_generation(), 1);
         host.set_scene(Scene::default());
         assert_eq!(host.scene_generation(), 2);
+    }
+
+    #[test]
+    fn actor_visual_retirement_handoff_is_bounded_without_rendering() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("retirement handoff requires GPU");
+        let mut host = Host::headless();
+        for cycle in 0..256 {
+            let first = 0xe000_0000 + cycle * 32;
+            let key = super::super::VisualKey::Actor(first + 31, 1, 0, 7);
+            renderer.drawn_visuals.insert(key, 3);
+            renderer.pending_visuals.get_mut().insert(key, 3);
+            host.actor_visual_retirements.push((first, 32));
+            host.apply_actors(&mut renderer);
+            assert!(host.actor_visual_retirements.is_empty());
+            assert_eq!(renderer.actor_visual_retirements.len(), 1);
+            assert_eq!(renderer.drawn_visuals.len(), 1);
+            assert_eq!(renderer.pending_visuals.borrow().len(), 1);
+        }
+        host.apply_actors(&mut renderer);
+        assert!(renderer.actor_visual_retirements.is_empty());
+        assert!(renderer.drawn_visuals.is_empty());
+        assert!(renderer.pending_visuals.borrow().is_empty());
+    }
+
+    #[test]
+    fn same_id_actor_replacement_resets_priority_before_its_first_frame_only() {
+        use ao_scene::{ActorFrame, Mesh, Submesh, Vertex, IDENTITY};
+        use super::super::VisualKey;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("same-ID visual reset requires GPU");
+        let vertices = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)].into_iter()
+            .map(|(x, y)| Vertex { pos: [x, y, 0.0], normal: [0.0, 0.0, 1.0], ..Default::default() }).collect();
+        let red = Scene { meshes: vec![Mesh { vertices, submeshes: vec![Submesh {
+            two_sided: true, emissive: [1.0; 3], base_color: [1.0, 0.0, 0.0, 1.0],
+            lighting_enabled: false, fog_enabled: false, render_priority: Some(6), render_node: Some((7, 7)),
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+        }] }], ..Default::default() };
+        let mut blue = red.clone();
+        let blocker = &mut blue.meshes[0].submeshes[0];
+        blocker.base_color = [0.0, 0.0, 1.0, 1.0];
+        blocker.render_priority = Some(10);
+        blocker.render_node = None;
+        renderer.add_actor_model(1, &red);
+        renderer.add_actor_model(2, &blue);
+        let target = renderer.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: None, size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: renderer.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let targets = Targets::new(&renderer, 32, 32);
+        let view = target.create_view_tracked(&Default::default());
+        let camera = Camera::look_at(Vec3::ZERO, Vec3::NEG_Z);
+        let mut transform = IDENTITY;
+        transform[3][2] = -3.0;
+        let id = 0x4000_0000;
+        let frames = || vec![ActorFrame { id, model: 1, transform, ..Default::default() },
+            ActorFrame { id: 2, model: 2, transform, ..Default::default() }];
+        let key = VisualKey::Actor(id, 1, 0, 7);
+        let center = (16 * 32 + 16) * 4;
+        let mut host = Host::headless();
+        host.actors = frames();
+        host.apply_actors(&mut renderer);
+        renderer.render(&view, &targets, &camera);
+        let authored_reference = super::super::texture_to_rgba(&renderer, &target, 32, 32).unwrap();
+        assert_eq!(&authored_reference[center..center + 4], &[0, 0, 255, 255]);
+        renderer.render(&view, &targets, &camera);
+        let advanced_reference = super::super::texture_to_rgba(&renderer, &target, 32, 32).unwrap();
+        assert_eq!(&advanced_reference[center..center + 4], &[255, 0, 0, 255]);
+        assert_ne!(authored_reference, advanced_reference);
+        // True despawn and same-ID respawn arrive in one application, sharing the model.
+        // Pending history must be cleared too, and never deferred onto the new visual.
+        renderer.pending_visuals.get_mut().insert(key, 7);
+        host.actor_visual_resets.push((id, 1));
+        host.actors = frames();
+        host.apply_actors(&mut renderer);
+        assert!(host.actor_visual_resets.is_empty());
+        assert!(!renderer.drawn_visuals.contains_key(&key));
+        assert!(!renderer.pending_visuals.borrow().contains_key(&key));
+        assert!(renderer.actor_visual_retirements.is_empty());
+        renderer.render(&view, &targets, &camera);
+        assert_eq!(authored_reference, super::super::texture_to_rgba(&renderer, &target, 32, 32).unwrap());
+        assert_eq!(renderer.drawn_visuals.get(&key), Some(&7));
+        for _ in 0..2 {
+            renderer.render(&view, &targets, &camera);
+            assert_eq!(advanced_reference, super::super::texture_to_rgba(&renderer, &target, 32, 32).unwrap());
+        }
+        host.actors = frames();
+        host.apply_actors(&mut renderer);
+        assert_eq!(renderer.drawn_visuals.get(&key), Some(&7), "no delayed reset of the replacement");
+        renderer.render(&view, &targets, &camera);
+        assert_eq!(advanced_reference, super::super::texture_to_rgba(&renderer, &target, 32, 32).unwrap());
     }
 
     #[test]

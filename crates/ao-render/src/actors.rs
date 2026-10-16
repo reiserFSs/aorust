@@ -459,11 +459,34 @@ impl Renderer {
     pub fn remove_actor_model(&mut self, key: u64) {
         self.act.remove_model(key);
         self.drawn_visuals.retain(|visual, _| !matches!(visual, VisualKey::Actor(_, model, _, _) if *model == key));
+        self.pending_visuals.get_mut().retain(|visual, _| !matches!(visual, VisualKey::Actor(_, model, _, _) if *model == key));
+    }
+
+    pub(crate) fn queue_actor_visual_retirements(&mut self, ranges: &mut Vec<(u32, u32)>) {
+        // Final ActorFrames can be rendered again by F12/capture. Keep their native
+        // priority until the next apply replaces them, never just until render ends.
+        // This also bounds logic-only hosts to one frame of deferred retirement.
+        let mut retired = std::mem::take(&mut self.actor_visual_retirements);
+        self.retire_actor_visuals(&retired);
+        retired.clear();
+        retired.append(ranges);
+        self.actor_visual_retirements = retired;
+    }
+
+    /// Native visual destruction, independent of model sharing and temporary non-submission.
+    pub fn retire_actor_visuals(&mut self, ranges: &[(u32, u32)]) {
+        if ranges.is_empty() { return; }
+        let keep = |key: &VisualKey, _: &mut i32| !matches!(key, VisualKey::Actor(id, ..)
+            if ranges.iter().any(|&(first, count)| id.wrapping_sub(first) < count));
+        self.drawn_visuals.retain(keep);
+        self.pending_visuals.get_mut().retain(keep);
     }
 
     /// Forgets every model and actor (a new zone).
     pub fn clear_actors(&mut self) {
         self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::World(..)));
+        self.pending_visuals.get_mut().retain(|key, _| matches!(key, VisualKey::World(..)));
+        self.actor_visual_retirements.clear();
         self.act.models.clear();
         self.act.textures.clear();
         self.act.actors.clear();

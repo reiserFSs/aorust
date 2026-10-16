@@ -621,6 +621,7 @@ pub struct Renderer {
     depth_clear_pipe: wgpu::RenderPipeline,
     drawn_visuals: HashMap<VisualKey, i32>,
     pending_visuals: std::cell::RefCell<HashMap<VisualKey, i32>>,
+    actor_visual_retirements: Vec<(u32, u32)>,
     gpu: Gpu,
     liquids: Vec<native_liquid::LiquidRun>,
     heat_haze: heat_haze::HeatHaze,
@@ -1085,6 +1086,7 @@ impl Renderer {
             liquids: vec![],
             drawn_visuals: HashMap::new(),
             pending_visuals: Default::default(),
+            actor_visual_retirements: Vec::new(),
             heat_haze: Default::default(),
             realistic_water: true,
             liquid_edge: [0.0; 3],
@@ -2532,6 +2534,101 @@ mod sky_tests {
         assert_eq!(renderer.drawn_visuals.get(&key), Some(&3), "pose updates do not recreate a native visual");
         renderer.add_actor_model(1, &model);
         assert!(!renderer.drawn_visuals.contains_key(&key), "replacement starts at authored priority again");
+    }
+
+    #[test]
+    fn destroyed_visual_churn_is_bounded_without_resetting_culled_priorities_or_pixels() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("visual retirement regression requires GPU");
+        let model = actor_quad([0.0, 0.0, 1.0], Submesh {
+            emissive: [1.0; 3], base_color: [1.0, 0.0, 0.0, 1.0],
+            lighting_enabled: false, fog_enabled: false,
+            render_priority: Some(6), render_node: Some((7, 7)),
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+        });
+        renderer.add_actor_model(1, &model);
+        let mut blocker = model.clone();
+        let material = &mut blocker.meshes[0].submeshes[0];
+        material.base_color = [0.0, 0.0, 1.0, 1.0];
+        material.render_priority = Some(10);
+        material.render_node = None;
+        renderer.add_actor_model(2, &blocker);
+        let target = renderer.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: None, size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: renderer.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let targets = Targets::new(&renderer, 32, 32);
+        let camera = Camera::look_at(Vec3::ZERO, Vec3::NEG_Z);
+        let view = target.create_view_tracked(&Default::default());
+        let mut transform = IDENTITY;
+        transform[3][2] = -3.0;
+        let frame = |id| ao_scene::ActorFrame { id, model: 1, transform, ..Default::default() };
+        let blocker_frame = ao_scene::ActorFrame { id: 2, model: 2, transform, ..Default::default() };
+        let survivor = VisualKey::Actor(1, 1, 0, 7);
+        let center = (16 * 32 + 16) * 4;
+        renderer.set_actors(vec![frame(1), blocker_frame.clone()]);
+        renderer.render(&view, &targets, &camera);
+        assert_eq!(renderer.drawn_visuals.get(&survivor), Some(&7));
+        for cycle in 0..64 {
+            let first = 0xe000_0000 + cycle * 32;
+            renderer.set_actors(vec![frame(first), frame(first + 31), blocker_frame.clone()]);
+            renderer.render(&view, &targets, &camera);
+            let authored = texture_to_rgba(&renderer, &target, 32, 32).unwrap();
+            assert_eq!(&authored[center..center + 4], &[0, 0, 255, 255],
+                "native order is 6,10,7: the fixed list-10 blocker covers authored list 6");
+            assert_eq!(renderer.drawn_visuals.len(), 3);
+            assert_eq!(renderer.drawn_visuals.get(&survivor), Some(&7),
+                "non-submission must not reset the native 6 -> 7 transition");
+            renderer.render(&view, &targets, &camera);
+            let unretired_reference = texture_to_rgba(&renderer, &target, 32, 32).unwrap();
+            assert_eq!(&unretired_reference[center..center + 4], &[255, 0, 0, 255],
+                "advanced list 7 must cover the blue blocker; the priority oracle is non-vacuous");
+            assert_ne!(authored, unretired_reference);
+            // Nested destruction can follow emission of the final ActorFrames.
+            // F12/capture can render those frames repeatedly before the next host apply.
+            renderer.queue_actor_visual_retirements(&mut vec![(first, 32)]);
+            for _ in 0..2 {
+                renderer.render(&view, &targets, &camera);
+                assert_eq!(unretired_reference, texture_to_rgba(&renderer, &target, 32, 32).unwrap(),
+                    "final-frame and capture renders must match the equivalent unretired reference");
+                assert_eq!(renderer.drawn_visuals.len(), 3);
+                assert_eq!(renderer.drawn_visuals.get(&VisualKey::Actor(first, 1, 0, 7)), Some(&7));
+                assert_eq!(renderer.actor_visual_retirements.len(), 1);
+            }
+            // The next host apply retires old ranges before replacing their frames.
+            renderer.pending_visuals.get_mut().insert(VisualKey::Actor(first + 17, 2, 4, 8), 9);
+            renderer.pending_visuals.get_mut().insert(VisualKey::World(0, 19), 2);
+            renderer.queue_actor_visual_retirements(&mut vec![]);
+            renderer.set_actors(vec![frame(1), blocker_frame.clone()]);
+            assert_eq!(renderer.drawn_visuals.len(), 1, "no retained-state slope under monotonic IDs");
+            assert_eq!(renderer.pending_visuals.borrow().len(), 1);
+            assert_eq!(renderer.pending_visuals.get_mut().remove(&VisualKey::World(0, 19)), Some(2));
+            renderer.render(&view, &targets, &camera);
+            assert_eq!(unretired_reference, texture_to_rgba(&renderer, &target, 32, 32).unwrap(),
+                "the returning survivor retains advanced priority and identical RGBA");
+            assert_eq!(renderer.drawn_visuals.get(&survivor), Some(&7));
+            assert!(renderer.pending_visuals.borrow().is_empty());
+            assert!(renderer.actor_visual_retirements.is_empty());
+            assert_eq!(renderer.actor_cache_sizes().0, 2, "shared models are not retired");
+        }
+        // Logic-only Offscreen applies frames without render calls.
+        for cycle in 0..256 {
+            let first = 0xe200_0000 + cycle * 32;
+            let mut ranges = vec![(first, 32)];
+            renderer.queue_actor_visual_retirements(&mut ranges);
+            renderer.set_actors(vec![]);
+            assert!(ranges.is_empty());
+            assert_eq!(renderer.actor_visual_retirements.len(), 1);
+            assert_eq!(renderer.drawn_visuals.len(), 1);
+        }
+        renderer.queue_actor_visual_retirements(&mut vec![]);
+        assert!(renderer.actor_visual_retirements.is_empty());
+        renderer.pending_visuals.get_mut().insert(survivor, 7);
+        renderer.clear_actors();
+        assert!(renderer.drawn_visuals.is_empty() && renderer.pending_visuals.borrow().is_empty());
+        assert!(renderer.actor_visual_retirements.is_empty());
     }
 
     #[test]
