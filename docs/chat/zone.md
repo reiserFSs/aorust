@@ -9,7 +9,7 @@ hand-built bytes checked against the read order. `every_captured_message_decodes
 
 ## 1. How text reaches the chat windows
 
-There is one sink: `FUN_10012b05` [GC] (a method of the singleton made by `FUN_10012a1e`, which also hooks the `3rdPersonCamera` pref) emits the
+There is one sink: `FUN_10012b05` [GC] (singleton getter `FUN_10012a1e`, constructor `FUN_1001134a` hooks `3rdPersonCamera` via `FUN_100110ab`) emits the
 `GlobalSignals_c` signal at `+0x17c` with `(uint channel, std::string& text, uint colorCode)`. Its slot in every chat window is `FUN_10083898` [GUI]
 (connected in `FUN_10083e53`, disconnected in `FUN_100846c1`):
 

@@ -929,6 +929,9 @@ impl Play {
                 }
                 LoginEvent::ZoneFrame(f) => {
                     if let Some(m) = self.fight.as_mut() {
+                        if let Some(p) = self.player.as_ref() {
+                            m.set_third_person(p.camera_mode() != 0);
+                        }
                         m.on_frame(&f);
                     }
                     // CharacterAction 0x7a posts CancelCampMessage (GC 0x1005dae8 -> event 0x2a -> AFCM 10:0x20).

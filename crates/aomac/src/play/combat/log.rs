@@ -249,8 +249,8 @@ pub struct FloatingNumber {
     pub space: Space,
 }
 
-/// HUD path (own character): `RenderText_t` [GUI 0x1004ac94] created by `DamageTextMessage` [GUI 0x1004ae2f]. Text `"%d"`,
-/// `FontID_e 2`, centred on `(50 + r, DAT_102761c0 - 20)` with `r = round(rand()/32767*40 - 20)` (the first `rand()` is discarded),
+/// First-person own HUD: `RenderText_t` [GUI 0x1004ac94], `DamageTextMessage` [GUI 0x1004ae2f]. Text `"%d"`,
+/// Shell `FontID_e 2`, centred on `(50 + r, -20)`, `r = trunc(second_rand/32767.0*40.0 - 20.0)` in double precision.
 /// the colour escape is the category's `ColorCode`. Life 2.3 s (`DAT_101b1198`); [`FloatingNumber::rise_speed`] =
 /// `70 px (DAT_101b1190) / 2.3 s`: `y = y0 - 70 * elapsed/life` (`FUN_1004aa4f` [GUI 0x1004aa4f], flag bit 0); alpha
 /// `= 255 * remaining/life` is applied when flag bit 1 is set, but `DamageTextMessage` passes flags = 1, so **no fade**.
@@ -261,15 +261,14 @@ pub const HUD_NUMBER: FloatingNumber = FloatingNumber {
     font: FloatingFont::Gui { font_id: 2 },
     space: Space::Hud,
 };
-/// HUD number start position: x = 50 + [-20, 20] jitter, y = `DAT_102761c0` - 20 ([UNRESOLVED] what `DAT_102761c0` is).
+/// GUI DAT102761c0 is zero-filled with one read and no writer; first-person HUD y remains -20.
 pub const HUD_X: i32 = 50;
 pub const HUD_Y_FROM_REF: i32 = -20;
-pub const HUD_X_JITTER: i32 = 20;
 
-/// World path (everyone else): effect `0x2f5a` (`gfxtweak.bin` record type 0x7de = `_GfxControlFont_t`, ctor `FUN_100df42d`
+/// World path (including own third-person): effect `0x2f5a` (`gfxtweak.bin` record type 0x7de = `_GfxControlFont_t`, ctor `FUN_100df42d`
 /// [GC 0x100df42d], params `FUN_100decc3` [GC 0x100decc3]): life = param 0x1a = 1.3 s, char size (`+0x2c`) = param 0x1c = 0.01,
 /// rise = param 0x1d = 0.4 * elapsed (`FUN_100deb04` [GC 0x100deb04] translates the billboard by `(0, 0.4 * t, 0)`),
-/// material id = param 9 = 40, constant colour (`SetColor` = start = stop colour).
+/// material id = param 9 = 40 (`spritefont.png`), locator 1000 (`Bip01 Pelvis_ac`); constant colour.
 pub const WORLD_NUMBER: FloatingNumber = FloatingNumber {
     color: 0,
     rise_speed: 0.4,
@@ -363,7 +362,7 @@ impl<'a> Feedback<'a> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rendered {
     /// `[ebp+0x10]` after the switch: first argument of the chat signal (`FUN_10012b05(style, text, category)`), values
-    /// `0x42000001..=0x42000018`; [UNRESOLVED] what the chat window does with it (`GlobalSignals+0x17c` receiver in GUI.dll not traced).
+    /// `0x42000001..=0x42000018`: chat message classes (`docs/chat/log.md` §1.1).
     pub style: u32,
     /// `[ebp-0x10]`: chat category = `ColorCode_e` of the line and of the floating number.
     pub category: u32,

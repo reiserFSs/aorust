@@ -7,7 +7,7 @@
 use super::actions::{Actions, Event as ActionEvent};
 use super::anim::{plays_hit_sound, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM};
 use super::arms::{ACTION_UNWIELD, ACTION_WIELD};
-use super::log::{FloatingNumber, Space, HUD_X, HUD_X_JITTER};
+use super::log::{FloatingNumber, Space, HUD_X};
 use super::state::{Combat, CombatEvent, ACTION_PLAY_ANIM, FIGHT_IDLE};
 use crate::play::zone::{DynelState, Zone};
 use ao_audio::combat::CharInfo;
@@ -18,6 +18,7 @@ use ao_net::n3::action::{self, simple};
 use ao_net::n3::combat::{self as net, action as act, Attacker, AttackGate, CharTarget, DefaultOutcome, Fight, Target};
 use ao_net::n3::outgoing::{n3_frame, DYNEL_CHAR};
 use ao_net::msg::Identity;
+use ao_scene::CrtRand;
 use std::path::Path;
 
 /// Shared live projection for normal/special attacks and the hostile-nano final
@@ -85,17 +86,27 @@ pub struct Number {
     pub dynel: i32,
     pub text: String,
     pub spec: FloatingNumber,
-    /// Seconds since creation.
-    pub age: f32,
+    /// Native remaining lifetime, decremented before each frame.
+    pub remaining: f32,
     /// HUD path: horizontal jitter in pixels (`50 + r`, `r` in -20..=20).
-    pub jitter: f32,
+    pub jitter: i32,
 }
 
 impl Number {
-    /// Rise since creation: pixels (HUD) or metres (world).
+    /// GUI 1004aa4f computes elapsed * 70 / life before truncating the final y.
     pub fn rise(&self) -> f32 {
-        self.spec.rise_speed * self.age
+        (self.spec.life - self.remaining) * 70.0 / self.spec.life
     }
+
+    pub fn hud_position(&self, width:i32, height:i32) -> (i32,i32) {
+        (self.jitter-width/2, ((super::log::HUD_Y_FROM_REF-height/2) as f32-self.rise()) as i32)
+    }
+}
+
+/// GUI 1004ae2f: discard the first CRT draw; _ftol2 truncates the double offset.
+fn hud_x(rng: &mut CrtRand) -> i32 {
+    rng.rand();
+    HUD_X + (f64::from(rng.rand()) / 32767.0 * 40.0 - 20.0) as i32
 }
 
 /// Everything of the combat layer that lives as long as the zone connection.
@@ -108,7 +119,6 @@ pub struct Module {
     feedback: Vec<&'static str>,
     numbers: Vec<Number>,
     dying: Option<Dying>,
-    rng: u32,
     /// `s_nCommandRefCntr` [GC]: counter of the `n3Command_t`s the client sent (`SocialActionCmd_t.counter`).
     counter: i32,
     /// The selection last announced to the server with `LookAtIIR_t`.
@@ -181,7 +191,6 @@ impl Module {
             feedback: Vec::new(),
             numbers: Vec::new(),
             dying: None,
-            rng: 0x2545_F491 ^ own,
             counter: 0,
             announced: None,
             struck: Vec::new(),
@@ -305,12 +314,8 @@ impl Module {
         &self.numbers
     }
 
-    fn rand01(&mut self) -> f32 {
-        // xorshift32; the original uses the C `rand()` (`RenderText_t` ctor), the stream is unseeded and shared
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 17;
-        self.rng ^= self.rng << 5;
-        (self.rng >> 8) as f32 / (1u32 << 24) as f32
+    pub fn set_third_person(&mut self, on: bool) {
+        self.combat.set_third_person(on);
     }
 
     /// Keep StatIIR's baseline in sync with native local Life-undo health writes.
@@ -392,8 +397,8 @@ impl Module {
         for e in ev {
             match &e {
                 CombatEvent::Floating { dynel, amount, number, .. } if number.space == Space::Hud => {
-                    let jitter = HUD_X as f32 + (self.rand01() * 2.0 - 1.0) * HUD_X_JITTER as f32;
-                    self.numbers.push(Number { dynel: *dynel, text: amount.to_string(), spec: *number, age: 0.0, jitter });
+                    let jitter = hud_x(&mut CrtRand::thread());
+                    self.numbers.push(Number { dynel: *dynel, text: amount.to_string(), spec: *number, remaining: number.life, jitter });
                 }
                 CombatEvent::FightStarted { who, .. } if *who == self.own => {
                     // FUN_10069c68 cleared the controller's +0x79 guard after CanAttack(report = 0) passed
@@ -425,9 +430,9 @@ impl Module {
     pub fn update(&mut self, dt: f32, zone: &Zone, audio: Option<&Audio>) {
         self.announce(zone);
         for n in &mut self.numbers {
-            n.age += dt;
+            n.remaining -= dt;
         }
-        self.numbers.retain(|n| n.age < n.spec.life);
+        self.numbers.retain(|n| n.remaining >= 0.0);
         if self.dying.is_some() && self.combat.char(self.own).is_some_and(|c| !c.dead && c.health() > 0) {
             self.dying = None; // resurrected (ResurrectIIR sets Health)
         }
@@ -642,6 +647,31 @@ impl Module {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hud_random_consumes_two_crt_draws_and_truncates() {
+        let mut rng = CrtRand::new(1);
+        assert_eq!(hud_x(&mut rng), 52);
+        assert_eq!(rng.rand(), 6334);
+        let mut rng=CrtRand::new(1);
+        assert_eq!([hud_x(&mut rng),hud_x(&mut rng),hud_x(&mut rng)],[52,62,50]);
+        assert_eq!(rng.rand(),11478);
+    }
+
+    #[test]
+    fn hud_zero_anchor_integer_center_motion_and_lifetime() {
+        let mut m=Module::with_texts(Box::new(Fixed::new()),1);
+        m.numbers.push(Number {dynel:1,text:"1".into(),spec:super::super::log::HUD_NUMBER,remaining:2.3,jitter:52});
+        assert_eq!(m.numbers[0].hud_position(5,9),(50,-24));
+        m.numbers[0].remaining=2.3-0.01;
+        assert_eq!(m.numbers[0].hud_position(5,9),(50,-24));
+        m.numbers[0].remaining=0.0;
+        m.update(0.0,&Zone::new(1),None);
+        assert_eq!(m.numbers.len(),1);
+        assert_eq!(m.numbers[0].hud_position(5,9),(50,-94));
+        m.update(0.01,&Zone::new(1),None);
+        assert!(m.numbers.is_empty());
+    }
+
     use super::*;
     use crate::play::combat::log::fake::Fixed;
     use crate::play::zone::DynelState;
@@ -1011,6 +1041,7 @@ mod tests {
     fn live_fight_capture() {
         let own = 0x82e8;
         let mut m = Module::with_texts(Box::new(Fixed::new()), own);
+        m.set_third_person(false);
         // the capture's own `FullCharacter` registers the player; the leet's `SimpleCharFullUpdate` is not in the excerpt
         m.combat.add_test_char(0xfd6a9, "Beach Leet", true, 12);
         let (mut sent, mut hits, mut stopped, mut started) = (vec![], 0, false, false);
@@ -1076,6 +1107,7 @@ mod tests {
     #[test]
     fn numbers_age_out() {
         let mut m = Module::with_texts(Box::new(Fixed::new()), 33402);
+        m.set_third_person(false);
         for f in frames() {
             m.on_frame(&f);
         }
@@ -1139,6 +1171,7 @@ mod death_tests {
         let own = 0x830e;
         let leet = 1015682;
         let mut m = Module::with_texts(Box::new(Fixed::new()), own);
+        m.set_third_person(false);
         let (mut dealt, mut died, mut stopped, mut started) = (0, false, false, false);
         for l in include_str!("../../../../../docs/captures/zone_kill_ithaca.rec").lines() {
             let mut p = l.split(' ');

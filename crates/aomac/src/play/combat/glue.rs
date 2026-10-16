@@ -3,7 +3,7 @@
 use super::actions::Event as ActionEvent;
 use super::actions::Pose;
 use super::anim::{anim_name, list, npc_sound, special_swing, UNARMED_RSWING};
-use super::log::{Space, HUD_Y_FROM_REF};
+use super::log::Space;
 use super::state::CombatEvent;
 use super::module::{Command, Module};
 use super::notes::hit_of;
@@ -471,19 +471,16 @@ impl Play {
         }
     }
 
-    /// Floating damage numbers (`DamageTextMessage` for the own character, the effect `0x2f5a` billboard for everybody else).
+    /// First-person own damage HUD; third-person and other characters use world Font 12122.
     pub(in crate::play) fn fight_draw(&mut self, _host: &Host, list: &mut DrawList) {
         let Some(m) = self.fight.as_ref() else { return };
         for n in m.numbers() {
             let rgb = n.spec.color & 0x00ff_ffff;
-            let (x,y)=match n.spec.space {
-                // DamageTextMessage native HUD positioning is unchanged.
-                Space::Hud=>(n.jitter,HUD_Y_FROM_REF as f32-self.gui.font_height(FontId::Shell) as f32/2.0-n.rise()),
-                Space::World=>continue,
-            };
+            if n.spec.space != Space::Hud {continue;}
             let tw = self.gui.text_width(FontId::Shell, &n.text);
-            // neither path fades: the HUD text has flag 1 (move only), the effect keeps its constant colour (combat-log.md §6)
-            self.gui.text_cmds(FontId::Shell, &n.text, x as i32 - tw / 2, y as i32, rgb, 1.0, list);
+            let (x,y)=n.hud_position(tw,self.gui.font_height(FontId::Shell));
+            // GUI1004ac94 centres integer extents; 1004aa4f truncates motion. No fade.
+            self.gui.text_cmds(FontId::Shell, &n.text, x, y, rgb, 1.0, list);
         }
     }
 }

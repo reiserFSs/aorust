@@ -151,6 +151,8 @@ pub struct Combat {
     texts: Box<dyn Texts>,
     chars: HashMap<i32, Char>,
     own: i32,
+    /// GC 100110ab: DAT102e0640 follows the 3rdPersonCamera preference (default 1).
+    third_person: bool,
     /// Stat `Features` (0xe0) of the playfield area (`FUN_10044b6e` [GC 0x10044b6e]); bit 0x800000 makes the client print the
     /// attacker's name for player hits (type 0x1d instead of 0x1e). [UNRESOLVED] source, 0 until the playfield layer sets it.
     pub area_features: i32,
@@ -160,7 +162,11 @@ pub struct Combat {
 
 impl Combat {
     pub fn new(texts: Box<dyn Texts>) -> Self {
-        Self { texts, chars: HashMap::new(), own: 0, area_features: 0, arms: Armory::default() }
+        Self { texts, chars: HashMap::new(), own: 0, third_person: true, area_features: 0, arms: Armory::default() }
+    }
+
+    pub fn set_third_person(&mut self, on: bool) {
+        self.third_person = on;
     }
 
     /// Registers a character the way its `SimpleCharFullUpdate` would (for replays whose capture lacks that frame).
@@ -442,8 +448,8 @@ impl Combat {
         let Some(r) = render(self.texts.as_ref(), f) else { return };
         self.push_log(ev, r.category, r.style, r.text);
         if let Some(n) = r.number {
-            // `FUN_100044c2` (HUD) for the client char unless `DAT_102e0640`, else `FUN_10011108` (world effect on A)
-            let space = if f.a.is_client { Space::Hud } else { Space::World };
+            // GC 10014d21..44: only the first-person own character uses DamageTextMessage.
+            let space = if f.a.is_client && !self.third_person { Space::Hud } else { Space::World };
             ev.push(CombatEvent::Floating {
                 dynel: subject,
                 amount: n,
@@ -781,8 +787,20 @@ mod tests {
     }
 
     #[test]
+    fn own_numbers_follow_camera_mode() {
+        let mut c=setup();
+        for (third_person,space) in [(None,Space::World),(Some(false),Space::Hud),(Some(true),Space::World)] {
+            if let Some(third_person)=third_person {c.set_third_person(third_person);}
+            let mut ev=Vec::new();
+            c.stats(1,&[(STAT_HEALTH,c.char(1).unwrap().health()-1)],&mut ev);
+            assert!(ev.iter().any(|e|matches!(e,CombatEvent::Floating {dynel:1,number,..} if number.space==space)));
+        }
+    }
+
+    #[test]
     fn npc_attacks_you_text_number_health() {
         let mut c = setup();
+        c.set_third_person(false);
         let mut ev = Vec::new();
         c.start_fight(2, ch(1), &mut ev);
         assert!(matches!(&ev[0], CombatEvent::Log(l) if l.text == "Attacked by Junkbot!" && l.category == 0xc));
@@ -881,6 +899,7 @@ mod tests {
     #[test]
     fn stat_updates() {
         let mut c = setup();
+        c.set_third_person(false);
         let mut ev = Vec::new();
         // own health drops by 10 via StatIIR: "attacked with nanobots" line, HUD number
         c.stats(1, &[(STAT_HEALTH, 90)], &mut ev);
@@ -1025,6 +1044,7 @@ mod tests {
     #[test]
     fn replay_as_the_fighting_player() {
         let mut c = Combat::new(Box::new(Fixed::new()));
+        c.set_third_person(false);
         let ev: Vec<_> = frames().iter().flat_map(|f| c.on_frame(f, 33402)).collect();
         assert!(count(&ev, |e| matches!(e, CombatEvent::CombatMusic(true))) >= 1);
         assert!(count(&ev, |e| matches!(e, CombatEvent::Floating { number, .. } if number.space == Space::Hud)) >= 1);
