@@ -252,34 +252,38 @@ impl Tri {
     }
 }
 
+/// Height and unit normal at AO world `(x, z)`: the cell is split along `(x,z)-(x+1,z+1)` when `(~z ^ x) & 1` is 1,
+/// else along `(x+1,z)-(x,z+1)`; the point lies in one of the two triangles (`FUN_10017800` @0x10017800).
+/// Shared with offline camera placement so its eye cannot start below the rendered triangle.
+pub(super) fn terrain_at(tm: &ground::Tilemap, x: f32, z: f32) -> Option<(f32, [f32; 3])> {
+    if x < 0.0 || z < 0.0 || x >= tm.cells_x as f32 * tm.cell_size || z >= tm.cells_z as f32 * tm.cell_size {
+        return None;
+    }
+    let (fx, fz) = (x / tm.cell_size, z / tm.cell_size);
+    let (ix, iz) = (fx as usize, fz as usize);
+    let c = tm.cell_size;
+    let (x0, z0) = (ix as f32 * c, iz as f32 * c);
+    let h = [tm.height(ix, iz), tm.height(ix + 1, iz), tm.height(ix + 1, iz + 1), tm.height(ix, iz + 1)];
+    let p = [[x0, h[0], z0], [x0 + c, h[1], z0], [x0 + c, h[2], z0 + c], [x0, h[3], z0 + c]];
+    let (dx, dz) = (x - x0, z - z0);
+    let t = if ((!iz) ^ ix) & 1 == 0 {
+        if dx + dz > c { [p[1], p[2], p[3]] } else { [p[0], p[1], p[3]] }
+    } else if dx <= dz {
+        [p[0], p[2], p[3]]
+    } else {
+        [p[0], p[1], p[2]]
+    };
+    let mut n = unit(cross(sub(t[2], t[0]), sub(t[1], t[0])))?;
+    if n[1] < 0.0 {
+        n = [-n[0], -n[1], -n[2]];
+    }
+    let y = t[0][1] - (n[0] * (x - t[0][0]) + n[2] * (z - t[0][2])) / n[1];
+    Some((y, n))
+}
+
 impl Terrain {
-    /// Height and unit normal at AO world `(x, z)`: the cell is split along `(x,z)-(x+1,z+1)` when `(~z ^ x) & 1` is 1,
-    /// else along `(x+1,z)-(x,z+1)`; the point lies in one of the two triangles (`FUN_10017800` @0x10017800).
     fn at(&self, x: f32, z: f32) -> Option<(f32, [f32; 3])> {
-        let tm = &self.tm;
-        if x < 0.0 || z < 0.0 || x >= tm.cells_x as f32 * tm.cell_size || z >= tm.cells_z as f32 * tm.cell_size {
-            return None;
-        }
-        let (fx, fz) = (x / tm.cell_size, z / tm.cell_size);
-        let (ix, iz) = (fx as usize, fz as usize);
-        let c = tm.cell_size;
-        let (x0, z0) = (ix as f32 * c, iz as f32 * c);
-        let h = [tm.height(ix, iz), tm.height(ix + 1, iz), tm.height(ix + 1, iz + 1), tm.height(ix, iz + 1)];
-        let p = [[x0, h[0], z0], [x0 + c, h[1], z0], [x0 + c, h[2], z0 + c], [x0, h[3], z0 + c]];
-        let (dx, dz) = (x - x0, z - z0);
-        let t = if ((!iz) ^ ix) & 1 == 0 {
-            if dx + dz > c { [p[1], p[2], p[3]] } else { [p[0], p[1], p[3]] }
-        } else if dx <= dz {
-            [p[0], p[2], p[3]]
-        } else {
-            [p[0], p[1], p[2]]
-        };
-        let mut n = unit(cross(sub(t[2], t[0]), sub(t[1], t[0])))?;
-        if n[1] < 0.0 {
-            n = [-n[0], -n[1], -n[2]];
-        }
-        let y = t[0][1] - (n[0] * (x - t[0][0]) + n[2] * (z - t[0][2])) / n[1];
-        Some((y, n))
+        terrain_at(&self.tm, x, z)
     }
     /// Ground texture id at AO world `(x, z)` (`ground::Tilemap::ground_texture`, the same cell the height came from).
     fn texture_at(&self, x: f32, z: f32) -> Option<u16> {

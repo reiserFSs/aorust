@@ -284,15 +284,9 @@ pub fn load_playfield_report_on_day(store: &RecordStore, client_dir: &Path, id: 
     Ok((scene, report))
 }
 
-/// Bilinear terrain height at scene `(x, z)`; `None` outside the heightfield.
+/// Native checkerboard triangle height at scene `(x, z)`; `None` outside the heightfield.
 fn terrain_height(tm: &ground::Tilemap, x: f32, z: f32) -> Option<f32> {
-    let (fx, fz) = (x / tm.cell_size, -z / tm.cell_size);
-    if fx < 0.0 || fz < 0.0 || fx >= tm.cells_x as f32 || fz >= tm.cells_z as f32 {
-        return None;
-    }
-    let (ix, iz, ax, az) = (fx as usize, fz as usize, fx.fract(), fz.fract());
-    let (a, b) = (tm.height(ix, iz) * (1.0 - ax) + tm.height(ix + 1, iz) * ax, tm.height(ix, iz + 1) * (1.0 - ax) + tm.height(ix + 1, iz + 1) * ax);
-    Some(a * (1.0 - az) + b * az)
+    collision::terrain_at(tm, x, -z).map(|(height, _)| height)
 }
 
 /// A statel's mesh record type and id plus its texture-override attributes: each distinct triple is one decoded scene mesh.
@@ -433,6 +427,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn offline_spawn_height_follows_steep_native_triangle_not_bilinear_patch() {
+        let tm = ground::Tilemap {
+            cells_x: 1, cells_z: 1, cell_size: 4.0, height_scale: 256.0,
+            tile_texture: Vec::new(), verts_x: 2, verts_z: 2,
+            heights: vec![1, 1, 1, 30], tiles: vec![0], tile_mask: 0xff,
+        };
+        let (x, z) = (2.5787964, -2.877472);
+        let expected = 1.0 + 29.0 * x / 4.0; // native A-C-D plane, x <= AO z
+        let height = terrain_height(&tm, x, z).unwrap();
+        assert!((height - expected).abs() < 1e-5);
+        let bilinear = 1.0 + 29.0 * (x / 4.0) * (-z / 4.0);
+        assert!(bilinear + 4.0 < height, "the former bilinear eye was underground");
+        let boxes = [([x - 0.01, height, z - 0.01], [x + 0.01, height + 0.1, z + 0.01])];
+        let spot = spawn::density_spawn(&boxes, &|x, z| terrain_height(&tm, x, z), 4.0).unwrap();
+        let floor = 1.0 + 29.0 * spot.eye[0] / 4.0;
+        assert!((spot.eye[1] - floor - 4.0).abs() < 1e-5, "generated eye must clear the actual triangle");
+        for (x, z) in [(-0.01, -1.0), (4.0, -1.0), (1.0, 0.01), (1.0, -4.0)] {
+            assert!(terrain_height(&tm, x, z).is_none(), "native terrain bounds remain exclusive");
+        }
+    }
+
+    #[test]
+    fn sector35_offline_spawn_is_above_actual_rendered_terrain() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        let Ok(store) = RecordStore::open(&dir) else { return };
+        let record = record::parse(&store.get(RECORD, 4367).unwrap().unwrap()).unwrap();
+        let tm = ground::parse(&store.get(TILEMAP, record.tilemap).unwrap().unwrap()).unwrap();
+        let old_eye = [486.5788, 18.449501, -350.87747];
+        let native = terrain_height(&tm, old_eye[0], old_eye[2]).unwrap();
+        assert!((native - 19.696274).abs() < 1e-4);
+        assert!(native > old_eye[1], "the captured old eye was below the correctly decoded native plane");
+        let scene = load_playfield(&store, &dir, 4367).unwrap();
+        let eye = scene.spawn.expect("generated offline eye");
+        let floor = floor_below(&scene, eye).expect("actual rendered triangle below generated eye");
+        let native = terrain_height(&tm, eye[0], eye[2]).unwrap();
+        assert!((native - floor).abs() < 1e-3, "offline query and rendered checkerboard must agree");
+        assert!((0.5..=30.0).contains(&(eye[1] - floor)), "spawn {eye:?}, native floor {floor}");
+    }
+
+    #[test]
     fn scene_transform_flips_z() {
         // heading 0, unit scale at AO (1, 2, 3) -> scene (1, 2, -3), identity rotation
         let r = statel::orientation(0x2d00, 90);
@@ -447,8 +482,8 @@ mod tests {
         assert!((v[0] - 1.0).abs() < 1e-5 && v[2].abs() < 1e-5);
     }
 
-    /// Statels sit on the terrain: the median gap between a placed object's origin and the heightfield is small,
-    /// also for the 22 maps with 16 bit height samples (556 Coast of Peace, 656, 4380 ...).
+    /// These eight authored near-ground fixture maps keep a small median origin/terrain gap.
+    /// This is not a universal statel constraint; the separate wide-map regression checks native coordinates.
     #[test]
     fn statels_sit_on_the_terrain() {
         let Some(home) = std::env::var_os("HOME") else { return };
