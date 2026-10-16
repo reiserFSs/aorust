@@ -94,6 +94,7 @@ struct Skills {
     details: String,
     /// The "Reset" confirmation (`SkillResetAll` dialog): window and the stat to reset (0 = all).
     confirm: Option<(WindowId, u32)>,
+    confirm_escape: bool,
     status_shown: String,
     qualifiers: ao_gui::Modifiers,
     /// Captured arrow and seconds until the next native 500/50 ms timer.
@@ -462,6 +463,7 @@ impl HudStats {
             arrows,
             details: String::new(),
             confirm: None,
+            confirm_escape: true,
             status_shown: String::new(),
             qualifiers: Default::default(),
             hold: None,
@@ -513,8 +515,7 @@ impl HudStats {
         Ok(())
     }
 
-    /// Opens the confirmation of "Reset all skills" (`stat` 0) / "Reset this skill": the texts are text.mdb 502 (`SkillResetAll` dialog text of the
-    /// full IP reset, "Do you really want to reset the skill %s?"); the dialog's layout itself is UNRESOLVED (a `DialogBox` built in the DLL).
+    /// Native Yes/No DialogBox (`100f9247` / `100f9392`), not an OK/Cancel form.
     fn ask_reset(&mut self, gui: &mut Gui, stat: u32) {
         let Some(s) = self.skills.as_mut() else { return };
         if s.confirm.is_some() {
@@ -525,20 +526,11 @@ impl HudStats {
         } else {
             self.db.by_id(502, 89070509).unwrap_or_default().replace("%s", &stats::long_name(&self.db, stat))
         };
-        let xml = format!(
-            "<root><View view_layout=\"vertical\" layout_borders=\"Rect(10,10,10,10)\">\
-             <TextView name=\"text\" value=\"{}\" feature_flags=\"TVF_MULTILINE|TVF_WORD_WRAP\" min_size=\"Point(300,-1)\" max_size=\"Point(400,-1)\" layout_borders=\"Rect(5,5,5,0)\"/>\
-             <View view_layout=\"horizontal\" layout_borders=\"Rect(0,10,0,0)\">\
-             <Button label=\"#MsgBox_OK\" name=\"reset_ok\" layout_borders=\"Rect(5,5,5,5)\"/>\
-             <Button label=\"#MsgBox_Cancel\" name=\"reset_cancel\" layout_borders=\"Rect(5,5,5,5)\"/></View></View></root>",
-            esc(&text.replace("\r\n", "\n")),
-        );
-        match gui.open_framed_window_xml("SkillResetDialog", &xml, (self.screen.0 as i32 / 2 - 190, self.screen.1 as i32 / 2 - 80), WindowSize::Preferred) {
-            Ok(w) => {
-                gui.relayout_window(w);
-                s.confirm = Some((w, stat));
-            }
-            Err(e) => eprintln!("hud: reset dialog: {e:#}"),
+        let buttons = ["MsgBox_Yes", "MsgBox_No"].map(|key| self.db.by_key(10000, key).unwrap_or_default());
+        let name = if stat == 0 { "SkillResetAll" } else { "SkillReset" };
+        if let Some(w) = super::hud_dialog::open(gui, self.screen, name, &text, &buttons) {
+            s.confirm = Some((w, stat));
+            s.confirm_escape = self.drop_dialogs.escape_enabled();
         }
     }
 
@@ -619,15 +611,15 @@ impl HudStats {
         // the reset confirmation
         if let Some((cw, stat)) = s.confirm {
             match ev {
-                Event::Clicked { window, view, .. } if *window == cw && (view == "reset_ok" || view == "reset_cancel") => {
-                    if view == "reset_ok" {
+                Event::Clicked { window, view, .. } if *window == cw && (view == "btn0" || view == "btn1") => {
+                    if view == "btn0" {
                         self.outbox.push(ao_net::n3::outgoing::n3_frame(0, char_id, ao_net::n3::action::reset_skill(char_id as i32, stat as i32)));
                     }
                     gui.close_window(cw);
                     s.confirm = None;
                     return true;
                 }
-                Event::CloseRequested { window } if *window == cw => {
+                Event::CloseRequested { window } | Event::Escape { window } if *window == cw && (!matches!(ev, Event::Escape { .. }) || s.confirm_escape) => {
                     gui.close_window(cw);
                     s.confirm = None;
                     return true;
@@ -1761,18 +1753,51 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].payload, ao_net::n3::outgoing::skill_ip_adjust(33512, &std::collections::BTreeMap::from([(16, 9)])));
         assert_eq!(s.hud.model.pending(16), 0);
-        // "Reset all skills (1)" asks for confirmation, cancel sends nothing, OK sends `N3Msg_ResetSkill(0)`
+        // GUI100f9247: No sends nothing; Yes sends N3Msg_ResetSkill(0).
         click(&mut s, &mut o, w, "resetAll");
         let dlg = s.hud.skills.as_ref().unwrap().confirm.unwrap().0;
         png(&mut s, &mut o, "skills-6-reset-dialog");
-        click(&mut s, &mut o, dlg, "reset_cancel");
+        click(&mut s, &mut o, dlg, "btn1");
         assert!(s.hud.take_outbox().is_empty() && s.hud.skills.as_ref().unwrap().confirm.is_none());
         click(&mut s, &mut o, w, "resetAll");
         let dlg = s.hud.skills.as_ref().unwrap().confirm.unwrap().0;
-        click(&mut s, &mut o, dlg, "reset_ok");
+        click(&mut s, &mut o, dlg, "btn0");
         let out = s.hud.take_outbox();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].payload, ao_net::n3::action::reset_skill(33512, 0));
+    }
+
+    #[test]
+    fn native_100f9392_individual_reset_samples_escape_and_waits_for_yes() {
+        let Some((mut s, mut o)) = shot() else { return };
+        s.hud.open(&mut s.gui, &mut s.rollup, WindowKind::Skills);
+        o.frame(&mut s, 0.016);
+        let mut values = super::super::dvalue::DValues::new(&ao_gui::client_dir());
+        values.set_i64("esc_dialogs", 0);
+        s.hud.configure_stat(&values);
+        s.hud.ask_reset(&mut s.gui, 16);
+        let win = s.hud.skills.as_ref().unwrap().confirm.unwrap().0;
+        let expected = s.hud.db.by_id(502, 89070509).unwrap().replace("%s", &stats::long_name(&s.hud.db, 16));
+        assert_eq!(s.gui.text(win, "text"), expected);
+        assert!(s.hud.take_outbox().is_empty());
+        s.hud.skills_event(&mut s.gui, &Event::Escape { window: win }, &s.zone);
+        assert!(s.hud.skills.as_ref().unwrap().confirm.is_some());
+        values.set_i64("esc_dialogs", 1);
+        s.hud.configure_stat(&values);
+        s.hud.skills_event(&mut s.gui, &Event::Escape { window: win }, &s.zone);
+        assert!(s.hud.skills.as_ref().unwrap().confirm.is_some(), "Go captures the old setting");
+        s.hud.skills_event(&mut s.gui, &Event::CloseRequested { window: win }, &s.zone);
+        assert!(s.hud.take_outbox().is_empty());
+        s.hud.ask_reset(&mut s.gui, 16);
+        let win = s.hud.skills.as_ref().unwrap().confirm.unwrap().0;
+        s.hud.skills_event(&mut s.gui, &Event::Escape { window: win }, &s.zone);
+        assert!(s.hud.skills.as_ref().unwrap().confirm.is_none());
+        s.hud.ask_reset(&mut s.gui, 16);
+        let win = s.hud.skills.as_ref().unwrap().confirm.unwrap().0;
+        click(&mut s, &mut o, win, "btn0");
+        let out = s.hud.take_outbox();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload, ao_net::n3::action::reset_skill(33512, 16));
     }
 
     /// "Suggested IP distribution" on the captured level 1 Soldier: the priority-1 skills are raised first, round robin, until the IP are used.

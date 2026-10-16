@@ -894,6 +894,8 @@ impl Hud {
     /// `cc_hostile_health_bar`) and `NumHotbars` (bars are created / closed to match, 1..=10).
     fn sync_options(&mut self, gui: &mut Gui) {
         let d = &self.dvalues;
+        self.winb.team.configure_dialogs(d);
+        self.winb.perks.configure_dialogs(d);
         self.target.targets_target = d.flag("Targetstarget");
         let cc = d.flag("cc_section1");
         self.target.bars_enabled = [cc && d.flag("cc_friendly_health_bar"), cc && d.flag("cc_hostile_health_bar")];

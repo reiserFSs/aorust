@@ -218,6 +218,10 @@ impl HudPerks {
         }
     }
 
+    pub(super) fn configure_dialogs(&mut self, values: &super::dvalue::DValues) {
+        self.dialogs.configure_escape(values);
+    }
+
     pub(super) fn set_screen(&mut self, screen: (u32, u32)) {
         self.screen = screen;
     }
@@ -602,7 +606,8 @@ impl HudPerks {
         }
         let body = self.text("ReallyTrainPerk").replacen("%s", &self.name(id), 1).replacen("%d", &HOURS.to_string(), 1);
         let buttons = [self.text("MsgBox_Yes"), self.text("MsgBox_No")];
-        self.dialogs.go(gui, self.screen, Ask::Train(id), &body, &buttons);
+        // `10060ce4`: localized Info title. Training always confirms; no skip-confirm preference is read.
+        self.dialogs.go_named(gui, self.screen, &self.text("Info"), Ask::Train(id), &body, &buttons);
     }
 
     pub(super) fn event(&mut self, gui: &mut Gui, ev: &Event, zone: &Zone) -> bool {
@@ -720,6 +725,47 @@ mod tests {
         assert!(perks.eligible(100, &zone).unwrap());
         zone.stats.insert(PROFESSION, 1);
         assert!(!perks.eligible(100, &zone).unwrap());
+    }
+
+    #[test]
+    fn native_100607f6_train_confirmation_and_1012a3bf_escape_setting() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut perks = HudPerks::new(&dir, (1280, 800));
+        let mut zone = Zone::new(7);
+        zone.stats.extend([(PROFESSION, 7), (LEVEL, 10), (EXPANSION, 2)]);
+        let mut values = super::super::dvalue::DValues::new(&dir);
+        values.set_i64("esc_dialogs", 0);
+        perks.configure_dialogs(&values);
+        perks.click(&mut gui, 100, &zone);
+        let win = perks.dialogs.windows()[0];
+        assert_eq!(perks.text("Info"), "Info"); // localized title101b3b84, no style1 caption
+        let name = perks.name(100);
+        assert_eq!(gui.text(win, "text"), perks.text("ReallyTrainPerk").replacen("%s", &name, 1).replacen("%d", "2", 1));
+        assert!(perks.outbox.is_empty(), "opening must not predict training");
+        assert!(perks.event(&mut gui, &Event::Escape { window: win }, &zone));
+        assert!(perks.dialogs.is_open());
+        perks.event(&mut gui, &Event::Clicked { window: win, view: "btn1".into(), item: None }, &zone);
+        assert!(perks.outbox.is_empty());
+        values.set_i64("esc_dialogs", 1);
+        perks.configure_dialogs(&values);
+        perks.click(&mut gui, 100, &zone);
+        let win = perks.dialogs.windows()[0];
+        perks.event(&mut gui, &Event::Escape { window: win }, &zone);
+        assert!(!perks.dialogs.is_open() && perks.outbox.is_empty());
+        perks.click(&mut gui, 100, &zone);
+        let win = perks.dialogs.windows()[0];
+        let yes = gui.view_rect(win, "btn0").unwrap();
+        let (x, y) = ((yes.l + yes.r) * 0.5, (yes.t + yes.b) * 0.5);
+        gui.input(ao_gui::InputEvent::MouseMove { x, y });
+        gui.input(ao_gui::InputEvent::MouseDown { x, y, button: ao_gui::MouseButton::Left });
+        for event in gui.input(ao_gui::InputEvent::MouseUp { x, y, button: ao_gui::MouseButton::Left }) {
+            perks.event(&mut gui, &event, &zone);
+        }
+        assert_eq!(perks.outbox.len(), 1);
+        assert_eq!(perks.outbox[0].payload, team::train_perk(7, 100));
+        assert!(!perks.known.0.contains_key(&100), "wait for the existing authoritative relay");
     }
 
     /// The perk lines stack below each other (they were all drawn at the top: a `ScrollViewChild` needs its one layout view inside) and start at the left.

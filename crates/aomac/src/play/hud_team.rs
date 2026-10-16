@@ -313,6 +313,10 @@ impl HudTeam {
         gui.close_menu();
     }
 
+    pub(super) fn configure_dialogs(&mut self, values: &super::dvalue::DValues) {
+        self.dialog.configure_escape(values);
+    }
+
     /// `TeamView_c` ctor `FUN_100785f0`: header `BorderView` (client borders 4, 2, 4, 2), the button row (borders 0, 5, 0, 5), six `TeamBar_c`s.
     fn build(&mut self, gui: &mut Gui) -> anyhow::Result<Win> {
         let xml = "<root><BorderView name=\"team_background\" bg_gfx=\"GFX_GUI_TAB_BACKGROUND\" tl_gfx=\"none\" tr_gfx=\"none\" bl_gfx=\"none\" br_gfx=\"none\" left_gfx=\"none\" top_gfx=\"none\" right_gfx=\"none\" bottom_gfx=\"none\" view_layout=\"vertical\"><View view_layout=\"vertical\" name=\"team_root\">\
@@ -425,9 +429,14 @@ impl HudTeam {
             gui.set_progress(w.window, &format!("nano{i}"), nano);
             // the selected member's highlight (`FUN_10078cad`)
             let selected = m.is_some_and(|m| zone.target == Some(m.id.instance));
-            let (cw, ch) = gui.canvas_size(w.window, &format!("hl{i}"));
+            let (cw, _) = gui.canvas_size(w.window, &format!("hl{i}"));
             let bars = gui.view_frame(w.window, &format!("hp{i}")).map_or(0.0, |r| r.r - r.l);
-            let items = if selected { vec![CanvasItem::Solid { dst: [HIGHLIGHT_LEFT, 0.0, (cw as f32 - bars - 4.0).max(HIGHLIGHT_LEFT), ch as f32], color: HIGHLIGHT, alpha: 1.0 }] } else { vec![] };
+            // `10078cf7` copies name+0x180's parent-local frame onto TeamBar, not the full row.
+            let name = gui.view_frame(w.window, &format!("name{i}")).unwrap();
+            let content = gui.view_frame(w.window, &format!("hl{i}")).unwrap();
+            let row_frame = gui.view_frame(w.window, &format!("row{i}")).unwrap();
+            let top = name.t - content.t - (content.t - row_frame.t);
+            let items = if selected { vec![CanvasItem::Solid { dst: [HIGHLIGHT_LEFT, top, (cw as f32 - bars - 6.0).max(HIGHLIGHT_LEFT), top + name.height() + 1.0], color: HIGHLIGHT, alpha: 1.0 }] } else { vec![] };
             gui.set_canvas(w.window, &format!("hl{i}"), items);
         }
         // `FUN_1007791c`: Recruit is enabled for a selected character that is not the own one, not an NPC and not yet a member
@@ -445,7 +454,7 @@ impl HudTeam {
         let (_, name) = self.state.invite.clone()?;
         let body = fmt(&self.text("Want2JoinXsTeam"), &[&name]);
         let buttons = [self.text("MsgBox_Yes"), self.text("MsgBox_No")];
-        self.dialog.go(gui, self.screen, (), &body, &buttons);
+        self.dialog.go_named(gui, self.screen, &self.text("JoinTeam?"), (), &body, &buttons);
         self.dialog.is_open().then_some(("OnInvitedToTeam", ""))
     }
 
@@ -631,6 +640,34 @@ mod tests {
     }
 
     #[test]
+    fn native_10078cad_highlight_copies_name_bounds_even_above_first_separator() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut h = HudTeam::new(&dir, (1280, 800));
+        feed(&mut h, member(ME, "Me"));
+        feed(&mut h, member(OTHER, "Other"));
+        h.open(&mut gui);
+        let window = h.win.as_ref().unwrap().window;
+        let mut zone = Zone::new(ME.instance as u32);
+        for (index, target) in [(0, ME.instance), (1, OTHER.instance)] {
+            zone.target = Some(target);
+            h.update(&mut gui, &mut zone, 0.0);
+            let name = gui.view_frame(window, &format!("name{index}")).unwrap();
+            let content = gui.view_frame(window, &format!("hl{index}")).unwrap();
+            let row = gui.view_frame(window, &format!("row{index}")).unwrap();
+            let hp = gui.view_frame(window, &format!("hp{index}")).unwrap();
+            let [CanvasItem::Solid { dst, color, alpha }] = gui.canvas_items(window, &format!("hl{index}")) else { panic!("missing selected highlight") };
+            assert_eq!((*color, *alpha), (0x88aadd, 1.0));
+            assert_eq!(dst[0], 20.0); // float101b4e08, overwritten left only
+            assert_eq!(content.t + dst[1], row.t + 2.0);
+            assert_eq!(content.t + dst[3], row.t + 2.0 + name.height() + 1.0);
+            assert_eq!(dst[2], row.width() - hp.width() - 6.0 + 1.0); // double101b36a8
+            assert_eq!(content.t - row.t, if index == 0 { gui.gfx().size(ao_gui::GfxId(0xd6)).1 as f32 } else { 0.0 });
+            assert!(gui.canvas_items(window, &format!("hl{}", 1 - index)).is_empty());
+        }
+    }
+
+    #[test]
     fn long_header_is_single_line_and_clipped_to_actual_client() {
         let dir = ao_gui::client_dir();
         let Ok(mut gui) = Gui::new(&dir, None) else { return };
@@ -774,5 +811,36 @@ mod tests {
         assert!(h.win.is_none(), "the invitation does not require the Team window");
         assert_eq!(h.invite_dialog(&mut gui), Some(("OnInvitedToTeam", "")));
         assert_eq!(h.invite_dialog(&mut gui), None, "an existing dialog does not emit again");
+    }
+
+    #[test]
+    fn native_1007a1f6_invitation_text_title_key_and_answer_events() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let mut h = HudTeam::new(&dir, (1024, 768));
+        let zone = Zone::new(ME.instance as u32);
+        // 1007a4eb passes GetText(10000,"JoinTeam?") as constructor name.
+        // Style1 has no drawn title strip; do not manufacture a caption.
+        assert!(!h.text("JoinTeam?").is_empty());
+        for (button, accepted) in [("btn1", false), ("btn0", true)] {
+            feed(&mut h, team_invite(ME, &TeamInvite { from: OTHER, flag: 0, name: "Inviter".into(), refusal: None }));
+            h.invite_dialog(&mut gui).unwrap();
+            let window = h.dialog.windows()[0];
+            assert_eq!(gui.text(window, "text"), fmt(&h.text("Want2JoinXsTeam"), &["Inviter"]));
+            let yes = gui.view_rect(window, "btn0").unwrap();
+            let no = gui.view_rect(window, "btn1").unwrap();
+            assert_eq!(yes.t, no.t);
+            assert!(yes.r < no.l);
+            let rect = gui.view_rect(window, button).unwrap();
+            let (x, y) = ((rect.l + rect.r) * 0.5, (rect.t + rect.b) * 0.5);
+            gui.input(ao_gui::InputEvent::MouseMove { x, y });
+            gui.input(ao_gui::InputEvent::MouseDown { x, y, button: MouseButton::Left });
+            for event in gui.input(ao_gui::InputEvent::MouseUp { x, y, button: MouseButton::Left }) {
+                h.event(&mut gui, &event, &zone);
+            }
+            assert!(!h.dialog.is_open());
+            assert_eq!(h.outbox.pop().unwrap().payload, request_reply(ME.instance, OTHER, accepted));
+            assert!(h.outbox.is_empty());
+        }
     }
 }

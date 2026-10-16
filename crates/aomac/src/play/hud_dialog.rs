@@ -22,18 +22,23 @@ impl<T> Default for Dialogs<T> {
     }
 }
 
-/// Wrap width of the body: `TextRenderer_c::SetAspectRatio(2.0)` asks for a text block twice as wide as high; the exact algorithm is not decoded
-/// (**GUESS**, same as the chat dialogs): about `sqrt(2 * chars * 7 * 14)` px clamped to 160..=520.
-fn wrap_width(body: &str) -> u32 {
-    ((2.0 * body.chars().count() as f32 * 7.0 * 14.0).sqrt() as u32).clamp(160, 520)
+/// GUI `101623ea`: sqrt(total glyph area) * aspect, then rewrap and use the measured extent.
+fn wrap_width(gui: &mut Gui, body: &str) -> u32 {
+    let (fonts, colors) = gui.text_parts();
+    let flags = ao_gui::view::tvf::MULTILINE | ao_gui::view::tvf::WORD_WRAP;
+    let flat = ao_gui::text::layout_text(fonts, colors, ao_gui::FontId::Normal, body, flags, None);
+    let area = flat.lines.iter().flat_map(|line| &line.runs).map(|run| run.advance(fonts.font(ao_gui::FontId::Normal))).sum::<i32>() * 13;
+    let width = (area as f32).sqrt() * 2.0;
+    let wrapped = ao_gui::text::layout_text(fonts, colors, ao_gui::FontId::Normal, body, flags, Some(width as i32));
+    wrapped.max_width.max(1) as u32 - 1
 }
 
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-fn xml(body: &str, buttons: &[String]) -> String {
-    let w = wrap_width(body);
+fn xml(gui: &mut Gui, body: &str, buttons: &[String]) -> String {
+    let w = wrap_width(gui, body);
     // text borders (15, 5, 15, 20), button row with a leading spacer, 8 px left/right borders and a trailing spacer for a single button
     let mut row = String::from("<View view_layout=\"horizontal\" layout_borders=\"Rect(0,0,0,5)\"><HLayoutSpacer/>");
     for (i, b) in buttons.iter().enumerate() {
@@ -49,9 +54,23 @@ fn xml(body: &str, buttons: &[String]) -> String {
     )
 }
 
+pub(super) fn open(gui: &mut Gui, screen: (u32, u32), name: &str, body: &str, buttons: &[String]) -> Option<WindowId> {
+    let source = xml(gui, body, buttons);
+    let win = gui.open_framed_window_xml(name, &source, (0, 0), WindowSize::Preferred).ok()?;
+    gui.set_text(win, "text", body);
+    gui.relayout_window(win);
+    let (w, h) = gui.outer_size(win);
+    gui.set_window_pos(win, ((screen.0 as i32 - w as i32) / 2, (screen.1 as i32 - h as i32) / 2));
+    Some(win)
+}
+
 impl<T: Copy> Dialogs<T> {
     pub(super) fn configure_escape(&mut self, values: &super::dvalue::DValues) {
         self.escape = values.get_i64("esc_dialogs").unwrap_or(1) != 0;
+    }
+
+    pub(super) fn escape_enabled(&self) -> bool {
+        self.escape
     }
 
     pub(super) fn go(&mut self, gui: &mut Gui, screen: (u32, u32), tag: T, body: &str, buttons: &[String]) {
@@ -59,12 +78,7 @@ impl<T: Copy> Dialogs<T> {
     }
 
     pub(super) fn go_named(&mut self, gui: &mut Gui, screen: (u32, u32), name: &str, tag: T, body: &str, buttons: &[String]) {
-        let Ok(win) = gui.open_framed_window_xml(name, &xml(body, buttons), (0, 0), WindowSize::Preferred) else { return };
-        gui.set_text(win, "text", body);
-        gui.set_default_button(win, "btn0");
-        gui.relayout_window(win);
-        let (w, h) = gui.outer_size(win);
-        gui.set_window_pos(win, ((screen.0 as i32 - w as i32) / 2, (screen.1 as i32 - h as i32) / 2));
+        let Some(win) = open(gui, screen, name, body, buttons) else { return };
         self.open.push(Open { win, tag, escape: self.escape });
     }
 
@@ -140,5 +154,28 @@ mod tests {
         values.set_i64("esc_dialogs", 0);
         dialogs.configure_escape(&values);
         assert_eq!(dialogs.event(&mut gui, &Event::Escape { window: win }), (true, Some(((), -1))));
+    }
+
+    #[test]
+    fn native_1012aa23_dialog_layout_has_no_implicit_default_button() {
+        let dir = ao_gui::client_dir();
+        let Ok(mut gui) = Gui::new(&dir, None) else { return };
+        let body = "Do you really want to reset the skill Strength?";
+        let mut dialogs = Dialogs::default();
+        dialogs.go_named(&mut gui, (800, 600), "SkillReset", (), body, &["Yes".into(), "No".into()]);
+        let win = dialogs.windows()[0];
+        let text = gui.view_rect(win, "text").unwrap();
+        let yes = gui.view_rect(win, "btn0").unwrap();
+        let no = gui.view_rect(win, "btn1").unwrap();
+        assert_eq!(gui.text(win, "text"), body);
+        assert_eq!(yes.t, no.t);
+        assert_eq!(no.l - yes.r - 1.0, 16.0); // two8px button borders, 1012ad5f
+        assert_eq!(yes.t - text.b - 1.0, 20.0); // body bottom border
+        let (x, y, w, h) = gui.window_outer_frame(win).unwrap();
+        assert_eq!((x, y), ((800 - w as i32) / 2, (600 - h as i32) / 2));
+        // 10156885 initializes default=null; 1012a2f6/1012ad5f/1012a3bf never installs one.
+        assert!(gui.input(ao_gui::InputEvent::Key { key: ao_gui::Key::Enter, pressed: true, mods: Default::default() }).iter().all(|event| !matches!(event, Event::Clicked { .. })));
+        assert!(dialogs.is_open());
+        assert_eq!(dialogs.event(&mut gui, &Event::Clicked { window: win, view: "btn1".into(), item: None }), (true, Some(((), 1))));
     }
 }
