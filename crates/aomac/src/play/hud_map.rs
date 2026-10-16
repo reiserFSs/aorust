@@ -385,7 +385,7 @@ impl HudMap {
                     gui.open_menu((*x, *y), (screen.0 as i32, screen.1 as i32), vec![ao_gui::MenuItem::check(MENU_PF_BUTTONS, "Show buttons", self.pf_buttons)]);
                     return true;
                 }
-                Event::Clicked { window, name } if *window == p.window => match name.as_str() {
+                Event::Clicked { window, view, .. } if *window == p.window => match view.as_str() {
                     "lc_toggle" if zone.skill_value(389).unwrap_or(0) & 1 != 0 => {
                         self.land_control = !self.land_control;
                         self.config_dirty = true;
@@ -836,7 +836,7 @@ mod tests {
         assert!(!maps.pf_buttons && !maps.land_control);
         assert!(!maps.pf.as_ref().unwrap().available);
         maps.pf.as_mut().unwrap().land = Some(land_fixture());
-        let click = |name: &str| Event::Clicked { window, name: name.into() };
+        let click = |name: &str| Event::Clicked { window, view: name.into(), item: None };
         assert!(!maps.event(&mut gui, &click("lc_toggle"), &zone, (1024, 768)));
         assert!(!maps.land_control, "NotumWars bit gates nativeInfo/Build/War controls");
         zone.stats.insert(389, 1);

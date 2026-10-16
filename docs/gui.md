@@ -713,6 +713,9 @@ The `WINDOW_*` providers of `ControlCenterModule_c::SetupProviders` 0x10068c38 (
 **Native-dormant Build/War boundary, not a fabricated opener.** `0x100ec048/100ec0dc` emit GlobalSignals+0x170 true/false. Full scalar 0x170 scans found no observer in GUI (119 hits), Interfaces (10), Gamecode (36), AnarchyOnline (0), GameData (0), Utils (0), N3 (4, camera only), SandyInterface (6, audio only). The connection-offset convention was verified at `0x1004e4b1` (+0x158). Existing TowerBuildMenuView `0x1005c35b` subscribes other signals, not +0x170. The buttons retain that shipped dormant behavior; no fake generic TowerUi handler was added.
 
 Regressions: `native_land_control_texels_and_flipped_rows` checks exact owned/unowned texels and orientation; `land_control_controls_availability_district_poll_and_waypoint_signals` exercises expansion gate, bitmap-based availability, cached raster, 500ms district changes, dormant Build/War, positive C-atof coordinates, error color and remove; `native_map_flags_roundtrip_without_losing_window_fields` preserves geometry/ZoomLev and native flags.
+
+Headless final workspace verification (2026-10-16): `cargo test --release --workspace -j2` and `cargo clippy --release --workspace --all-targets -j2 -- -D warnings` both passed with the private target. Map LC/control/config, native viewport, zero-scroll, own-arrow and mission cell/order/feedback/waypoint regressions passed. The final compile repair uses ao-gui's existing `Clicked { window, view, item }` event convention. No login or desktop-window verification was attempted.
+
 **Ctrl+2 Actions window and the special-action consumers: done, see §10.5 / §10.7** (`play/hud_actionwin.rs`).
 
 Old RE notes:
