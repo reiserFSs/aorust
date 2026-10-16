@@ -12,6 +12,8 @@ pub use native_fog::{NativeFog,SharedNativeFog,NativeFogControl};
 mod native_ground;
 mod native_texture;
 mod native_liquid;
+mod pipelines;
+use pipelines::{Pipelines, Slot as PipelineSlot, Spec as PipelineSpec};
 mod heat_haze;
 mod gpu_stats;
 mod sky_probe;
@@ -179,6 +181,20 @@ struct Draw {
     count: u32,
     mat: usize,
     pipe: usize,
+    priority: Option<i32>,
+    node: Option<(u32, i32)>,
+    origin: [f32; 3],
+    projection_pass: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum VisualKey {
+    World(usize, u32),
+    Actor(u32, u64, usize, u32),
+}
+
+fn visual_priority(draw: &Draw, key: Option<VisualKey>, states: &HashMap<VisualKey, i32>) -> Option<i32> {
+    key.and_then(|key| states.get(&key).copied()).or(draw.priority)
 }
 
 /// Pipelines 0..8 are scene (blend x cull); 8..12 are sky (per blend, two-sided, no depth).
@@ -195,16 +211,52 @@ const NATIVE_BLEND_PIPE: usize = 22;
 /// Original two-sided sky `SourceColorOne` slot (`fs_sky_blend`, native `(Src, One)`).
 /// It is separate from the four contiguous base sky blends at `SKY_PIPE`.
 const SKY_GLOW_PIPE: usize = NATIVE_BLEND_PIPE + 8;
-const MESH_EFFECT_PIPE: usize = SKY_GLOW_PIPE + 1;
-const MESH_EFFECT_STRIDE: usize = SKY_GLOW_PIPE + 1;
+const MATERIAL_STATE_PIPE: usize = SKY_GLOW_PIPE + 1;
+const MATERIAL_FADE_PIPE: usize = MATERIAL_STATE_PIPE + 18;
+const MATERIAL_ENV_WRITE_PIPE: usize = MATERIAL_FADE_PIPE + 4;
+const MATERIAL_ONE_PIPE: usize = MATERIAL_ENV_WRITE_PIPE + 4;
+const MATERIAL_COMPARE_PIPE: usize = MATERIAL_ONE_PIPE + 2;
+const MATERIAL_COMPARE_FADE_PIPE: usize = MATERIAL_COMPARE_PIPE + 108;
+const MATERIAL_ENV_COMPARE_PIPE: usize = MATERIAL_COMPARE_FADE_PIPE + 24;
+const MESH_EFFECT_STRIDE: usize = MATERIAL_ENV_COMPARE_PIPE + 16;
+const MESH_EFFECT_PIPE: usize = MESH_EFFECT_STRIDE;
 /// Append sky-only cull variants without moving world/actor pipeline slots.
 const SKY_CULL_PIPE: usize = SKY_GLOW_PIPE + 1;
 const SKY_NATIVE_PIPE: usize = SKY_CULL_PIPE + 8;
 const SKY_POINT_PIPE: usize = SKY_NATIVE_PIPE + 3;
 const SKY_LAST_PIPE: usize = SKY_POINT_PIPE;
+const WORLD_MATERIAL_STATE_PIPE: usize = native_liquid::PIPE + 5;
+const WORLD_COMPARE_PIPE: usize = WORLD_MATERIAL_STATE_PIPE + 18;
+const WORLD_ONE_PIPE: usize = WORLD_COMPARE_PIPE + 108;
+const SKY_STATE_PIPE: usize = WORLD_ONE_PIPE + 2;
+
+fn material_depth_write(s: &ao_scene::Submesh) -> bool {
+    s.depth_write.unwrap_or(matches!(s.blend, Blend::Opaque | Blend::AlphaTest)
+        || (s.blend == Blend::AlphaBlend && s.sprite_alpha_test))
+}
+
+fn comparison_slot(s: &ao_scene::Submesh) -> Option<usize> {
+    let mode = match s.depth_func { Some(2) => 0, Some(4) => 1, Some(8) => 2, _ => return None };
+    Some(mode * 36 + material_depth_write(s) as usize * 18 + s.blend as usize * 2 + s.two_sided as usize)
+}
+
+fn world_material_pipe(s: &ao_scene::Submesh) -> usize {
+    if let Some(slot) = comparison_slot(s) { return WORLD_COMPARE_PIPE + slot; }
+    let pipe = material_pipe(s);
+    if (MATERIAL_STATE_PIPE..MATERIAL_FADE_PIPE).contains(&pipe) {
+        WORLD_MATERIAL_STATE_PIPE + pipe - MATERIAL_STATE_PIPE
+    } else if (MATERIAL_ONE_PIPE..MATERIAL_COMPARE_PIPE).contains(&pipe) {
+        WORLD_ONE_PIPE + pipe - MATERIAL_ONE_PIPE
+    } else { pipe }
+}
 
 fn sky_material_pipe(s: &ao_scene::Submesh) -> usize {
     if s.sky_points { return SKY_POINT_PIPE; }
+    if s.depth_func.is_some() || s.depth_write.is_some() || s.blend == Blend::AdditiveOne {
+        let mode = match s.depth_func.unwrap_or(8) { 2 => 0, 4 => 1, _ => 2 };
+        return SKY_STATE_PIPE + mode * 36 + s.depth_write.unwrap_or(false) as usize * 18
+            + s.blend as usize * 2 + s.two_sided as usize;
+    }
     if !s.two_sided {
         SKY_CULL_PIPE + s.blend as usize
     } else {
@@ -249,6 +301,12 @@ fn blended_material(blend: Blend) -> bool {
 }
 
 fn material_pipe(s: &ao_scene::Submesh) -> usize {
+    if let Some(slot) = comparison_slot(s) { return MATERIAL_COMPARE_PIPE + slot; }
+    let default_write = matches!(s.blend, Blend::Opaque | Blend::AlphaTest);
+    if s.depth_write.is_some_and(|write| write != default_write) {
+        return MATERIAL_STATE_PIPE + s.blend as usize * 2 + s.two_sided as usize;
+    }
+    if s.blend == Blend::AdditiveOne { return MATERIAL_ONE_PIPE + s.two_sided as usize; }
     if s.blend == Blend::AlphaBlend && s.sprite_alpha_test {
         SPRITE_PIPE + s.two_sided as usize
     } else if s.blend as usize >= Blend::ZeroSourceColor as usize {
@@ -395,8 +453,8 @@ struct Gpu {
     meshes: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
     inst_bufs: Vec<wgpu::Buffer>, // ring: a buffer is rewritten only after earlier frames using it were submitted
     mats: Vec<wgpu::BindGroup>, // [0] = untextured white
-    opaque: Vec<Draw>,          // Opaque + AlphaTest, sorted by pipeline/mesh/material
-    blended: Vec<Draw>,         // AlphaBlend + Additive, drawn per visible instance, far to near
+    opaque: Vec<Draw>,          // Opaque/alpha-test storage; submission follows authored native lists.
+    blended: Vec<Draw>,         // Blended storage; actual list and distance bucket are per visual.
     liquid: Vec<Draw>,          // `Submesh::liquid` (render list 4): opaque kinds first, then blended; after the opaque phase + actors
     insts: Vec<Inst>,           // grouped by mesh
     mesh_range: Vec<std::ops::Range<usize>>,
@@ -411,9 +469,11 @@ struct GroundRun {
     scratch: Vec<u32>,
     materials: Vec<Option<wgpu::BindGroup>>,
     has_shadow: Vec<bool>,
-    texture_materials: Vec<(usize, TextureKey, [f32; 28])>,
+    texture_materials: Vec<(usize, TextureKey, [f32; 32])>,
     composites: Vec<native_ground::Composite>,
 }
+
+type SkyMaterialKey = (Option<TextureKey>, Option<TextureKey>, bool, [u32; 32]);
 
 /// Sky backdrop with its own mesh/material tables, so [`Renderer::set_sky`] can swap it while the world stays.
 ///
@@ -437,7 +497,7 @@ struct SkyGpu {
     /// offset, so a given sky submesh's uniform is stable tick to tick) reuses the existing uniform buffer and
     /// bind group instead of creating new ones. Bounded by the sky's own small, fairly static material count
     /// (sun, moon, stars, a handful of cloud/overlay layers); never pruned, same as the rest of this cache.
-    mat_of: HashMap<(Option<TextureKey>, bool, [u32; 28]), usize>,
+    mat_of: HashMap<SkyMaterialKey, usize>,
     mats: Vec<wgpu::BindGroup>,
     draws: Vec<(Draw, u32)>, // (draw, index into `xf`) in scene order
     xf: Vec<Mat4>,
@@ -483,11 +543,14 @@ struct ColorAnim {
 }
 
 /// Material uniform of a submesh (see `shader.wgsl` `Mat`).
-fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 28] {
+fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 32] {
     let [wu, au, wv, av] = s.uv_wave;
     let [fr, fg, fb] = s.sky_fog_color.unwrap_or([0.0; 3]);
     let fog_mode = if !s.sky_fog { 0.0 } else if s.sky_fog_color.is_some() { 2.0 } else { 1.0 };
-    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], fog_mode, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, fr, fg, fb, s.uv_camera[0], s.uv_camera[1], s.uv_camera[2], s.uv_camera[3]]
+    let native_flags = u32::from(s.alpha_test.is_some() || s.sprite_alpha_test)
+        | (u32::from(!s.fog_enabled) << 1) | (u32::from(!s.lighting_enabled) << 2);
+    [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], fog_mode, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, fr, fg, fb, s.uv_camera[0], s.uv_camera[1], s.uv_camera[2], s.uv_camera[3],
+        s.stage1_env_texture.is_some() as u32 as f32, f32::from(s.alpha_test.unwrap_or(30)) / 255.0, native_flags as f32, f32::from(s.alpha_func)]
 }
 
 /// Last-frame counters (after frustum culling).
@@ -553,9 +616,11 @@ pub struct Renderer {
     /// Sample counts the adapter actually supports for both the surface colour format and [`DEPTH`] (always includes 1).
     msaa_supported: Vec<u32>,
     texture_policy: native_texture::Policy,
-    pipes: Vec<wgpu::RenderPipeline>, // indexed by Draw::pipe
-    actor_pipes: Vec<wgpu::RenderPipeline>, // same indices, actor-only instance layout
+    pipes: Pipelines,
+    actor_pipes: Pipelines,
     depth_clear_pipe: wgpu::RenderPipeline,
+    drawn_visuals: HashMap<VisualKey, i32>,
+    pending_visuals: std::cell::RefCell<HashMap<VisualKey, i32>>,
     gpu: Gpu,
     liquids: Vec<native_liquid::LiquidRun>,
     heat_haze: heat_haze::HeatHaze,
@@ -582,7 +647,7 @@ pub struct Renderer {
     ground: Option<GroundRun>,
     ground_quality: (i32, i32),
     ground_state: native_ground::NativeGround,
-    ground_pipes: Vec<wgpu::RenderPipeline>,
+    ground_pipes: Pipelines,
     /// Light storage buffer plus its pristine contents and the statel zone of each light (distance gating). `cells`/`idx`
     /// are the light-grid index buffers; all three are kept so [`Renderer::set_anisotropy`] can rebuild `globals_bg` with
     /// the current lighting data instead of recomputing the light grid just to change a sampler.
@@ -612,7 +677,7 @@ pub struct Renderer {
     vis: Vec<[[f32; 4]; 4]>,
     vis_src: Vec<u32>,
     vis_range: Vec<std::ops::Range<u32>>,
-    sorted: Vec<(f32, u32, u32)>, // (distance, blended draw, visible instance)
+    sorted: Vec<(i32, i32, u8, usize, u32)>, // (native list, distance bucket, source list, draw, visible instance)
     /// Dynamic actors drawn after the world, see `actors.rs`.
     act: actors::ActorLayer,
     screen: screen::ScreenPass,
@@ -653,7 +718,7 @@ fn apply_camera_fog(env: &mut Environment, model: &mut ao_scene::FogModel, lens:
 /// The world/material repeat sampler at a given anisotropic filtering clamp (`Renderer::new` default 1 = retail;
 /// [`Renderer::set_anisotropy`] rebuilds it, along with [`make_clamp_sampler`]'s clamp-address variant).
 fn make_world_sampler(device: &wgpu::Device, anisotropy: u16) -> wgpu::Sampler {
-    device.create_sampler_tracked(&wgpu::SamplerDescriptor {
+    let descriptor = wgpu::SamplerDescriptor {
         address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::Repeat,
         address_mode_w: wgpu::AddressMode::Repeat,
@@ -662,14 +727,15 @@ fn make_world_sampler(device: &wgpu::Device, anisotropy: u16) -> wgpu::Sampler {
         mipmap_filter: wgpu::MipmapFilterMode::Linear,
         anisotropy_clamp: anisotropy,
         ..Default::default()
-    })
+    };
+    device.create_sampler_tracked(&descriptor)
 }
 
 /// Clamp-to-edge counterpart of [`make_world_sampler`], same filtering/anisotropy. Both samplers live in the shared
 /// `globals_bg` bind group (group 0); `shader.wgsl`'s `sample_clamped` picks between them per material, so
 /// [`Renderer::set_anisotropy`] only has to rebuild `globals_bg`, not every material's bind group.
 fn make_clamp_sampler(device: &wgpu::Device, anisotropy: u16) -> wgpu::Sampler {
-    device.create_sampler_tracked(&wgpu::SamplerDescriptor {
+    let descriptor = wgpu::SamplerDescriptor {
         label: Some("native D3D texture clamp"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -679,24 +745,26 @@ fn make_clamp_sampler(device: &wgpu::Device, anisotropy: u16) -> wgpu::Sampler {
         mipmap_filter: wgpu::MipmapFilterMode::Linear,
         anisotropy_clamp: anisotropy,
         ..Default::default()
-    })
+    };
+    device.create_sampler_tracked(&descriptor)
 }
 
-fn build_pipelines(
+fn compile_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     layout: &wgpu::PipelineLayout,
     holo_pipeline_layout: &wgpu::PipelineLayout,
     msaa: u32,
-) -> (Vec<wgpu::RenderPipeline>, Vec<wgpu::RenderPipeline>, Vec<wgpu::RenderPipeline>) {
+    spec: PipelineSpec,
+) -> wgpu::RenderPipeline {
+    let PipelineSpec { blend, two_sided, sky, env, fade, sprite, actor, flip_depth, effect, compare } = spec;
     let f4 = |o| wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: o, shader_location: 4 + (o / 16) as u32 };
     let inst_attrs = [f4(0), f4(16), f4(32), f4(48)];
     let actor_attrs = [f4(0), f4(16), f4(32), f4(48), f4(64), f4(80), f4(96), f4(112)];
     let vert_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
     let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
     let one_one = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
-    let mk = |blend: Blend, two_sided: bool, sky: bool, env: bool, fade: bool, sprite: bool, actor: bool, effect: u32| {
         let (fs, state, depth_write) = match blend {
             _ if env => ("fs_env", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
             _ if sprite => ("fs_sprite", Some(wgpu::BlendState::ALPHA_BLENDING), true),
@@ -707,18 +775,22 @@ fn build_pipelines(
             Blend::AlphaBlend => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
             Blend::Additive => ("fs_add", Some(wgpu::BlendState { color: add, alpha: wgpu::BlendComponent::OVER }), false),
             Blend::ZeroSourceColor | Blend::DestinationColorSourceColor | Blend::PremultipliedAlpha | Blend::SourceColorOne => ("fs_blend", Some(native_blend_state(blend)), false),
+            Blend::AdditiveOne => ("fs_add_one", Some(wgpu::BlendState { color: one_one, alpha: one_one }), false),
         };
         let fs = if sky {
             match blend {
                 Blend::Opaque => "fs_sky_opaque",
                 Blend::AlphaTest => "fs_sky_test",
                 Blend::Additive => "fs_sky_add",
+                Blend::AdditiveOne => "fs_sky_add_one",
                 _ => "fs_sky_blend",
             }
         } else { fs };
-        let depth_write = depth_write && !sky;
+        let depth_write = if sky { flip_depth } else { depth_write ^ flip_depth };
         let (fs, state, depth_write) = match effect {
             1 => ("fs_holo", Some(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::Src, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent::OVER }), false),
+            // DS1006c005 handles RTriMesh mode 2 without SetMaterial. CAT
+            // stays on its ordinary material pipeline (selected by provenance).
             2 => (fs, state, true),
             4..=6 => ("fs_mesh_add", Some(wgpu::BlendState { color: add, alpha: add }), false),
             8 => ("fs_ground_fused", None, true),
@@ -752,7 +824,7 @@ fn build_pipelines(
             layout: Some(if effect == 1 || (8..=11).contains(&effect) { holo_pipeline_layout } else { layout }),
             vertex: wgpu::VertexState {
                 module: shader,
-                entry_point: Some(if effect == 14 { "vs_sky_points" } else if (15..=17).contains(&effect) { "vs_lava" } else if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 2 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
+                entry_point: Some(if effect == 14 { "vs_sky_points" } else if (15..=17).contains(&effect) { "vs_lava" } else if (8..=11).contains(&effect) { "vs_ground" } else if matches!(effect, 12 | 13) { "vs_liquid" } else if actor && matches!(effect, 1 | 4..=6) { "vs_actor" } else if sky { "vs_sky" } else if env { "vs_env" } else if actor { "vs_actor" } else { "vs" }),
                 compilation_options: Default::default(),
                 buffers: &[
                     wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vert_attrs },
@@ -778,11 +850,12 @@ fn build_pipelines(
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH,
                 depth_write_enabled: Some(depth_write),
-                // the env pass redraws the very triangles of the base pass: D3D's default ZFUNC LESSEQUAL
-                depth_compare: Some(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 10 | 12 | 13 | 15..=17) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }),
+                // Randy 10041f98 sets ZFUNC=LESSEQUAL; ordinary/CAT base draws
+                // and DS 1006c61d effects 1..7 do not replace ZFUNC.
+                depth_compare: Some(if effect == 2 { wgpu::CompareFunction::LessEqual } else { compare.unwrap_or(if sky { wgpu::CompareFunction::Always } else if env || matches!(effect, 0..=7 | 10 | 12 | 13 | 15..=17) { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Less }) }),
                 stencil: Default::default(),
-                // Blended overlays are often coplanar with the opaque surface below them.
-                bias: if effect == 7 { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else if effect != 0 || depth_write || env { Default::default() } else { wgpu::DepthBiasState { constant: -2, slope_scale: -2.0, clamp: 0.0 } },
+                // Only the native mesh-effect mode 7 authors a depth bias.
+                bias: if effect == 7 { wgpu::DepthBiasState { constant: -1, slope_scale: 0.0, clamp: 0.0 } } else { Default::default() },
             }),
             // Audit item 4 (aomac Enhanced, opt-in): only the hard-cutout alpha-test shaders (`shade`/`shade_sky`'s
             // `mode == 1u`, no blend state of their own) benefit; blended/additive pipelines already have real alpha
@@ -791,6 +864,11 @@ fn build_pipelines(
             multiview_mask: None,
             cache: None,
         })
+}
+
+fn build_pipelines() -> (Pipelines, Pipelines, Pipelines) {
+    let mk = |blend, two_sided, sky, env, fade, sprite, actor, flip_depth, effect, compare| {
+        PipelineSlot::new(PipelineSpec { blend, two_sided, sky, env, fade, sprite, actor, flip_depth, effect, compare })
     };
     let pipe_specs = [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive]
         .into_iter()
@@ -809,15 +887,65 @@ fn build_pipelines(
         .chain([Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha]
             .map(|b| (b, true, true, false, false, false)));
     assert_eq!(pipe_specs.clone().count(), SKY_POINT_PIPE, "point list follows triangle sky pipelines");
-    let pipes: Vec<_> = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, 0))
-        .chain(std::iter::once(mk(Blend::Additive, true, true, false, false, false, false, 14)))
-        .chain([12, 13, 15, 16, 17].into_iter().map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, effect))).collect();
-    assert_eq!(pipes.len(), native_liquid::PIPE + 5);
-    let actor_pipes = (0..=7).flat_map(|effect| pipe_specs.clone().take(MESH_EFFECT_STRIDE).map(move |spec| (effect, spec)))
-        .map(|(effect, (b, two, sky, env, fade, sprite))| mk(b, two, sky, env, fade, sprite, true, effect)).collect();
-    let ground_pipes = (8..=11).map(|effect| mk(Blend::Opaque, false, false, false, false, false, false, effect)).collect();
-
-    (pipes, actor_pipes, ground_pipes)
+    let blends = [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive,
+        Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha,
+        Blend::SourceColorOne, Blend::AdditiveOne];
+    let depth_specs = blends.into_iter().flat_map(|b| [false, true].map(move |two| (b, two, false, false, false, false)));
+    let comparison_specs = [wgpu::CompareFunction::Less, wgpu::CompareFunction::LessEqual, wgpu::CompareFunction::Always].into_iter()
+        .flat_map(|compare| [false, true].into_iter().flat_map(move |write| blends.into_iter()
+            .flat_map(move |blend| [false, true].map(move |two|
+                ((blend, two, false, false, false, false), write != matches!(blend, Blend::Opaque | Blend::AlphaTest), Some(compare))))));
+    let mut pipes: Vec<_> = pipe_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, false, 0, None))
+        .chain(std::iter::once(mk(Blend::Additive, true, true, false, false, false, false, false, 14, None)))
+        .chain([12, 13, 15, 16, 17].into_iter().map(|effect| mk(Blend::AlphaBlend, true, false, false, false, false, false, false, effect, None)))
+        .chain(depth_specs.clone().map(|(b, two, sky, env, fade, sprite)| mk(b, two, sky, env, fade, sprite, false, true, 0, None)))
+        .collect();
+    assert_eq!(pipes.len(), WORLD_COMPARE_PIPE);
+    for ((b, two, sky, env, fade, sprite), flip, compare) in comparison_specs.clone() {
+        pipes.push(mk(b, two, sky, env, fade, sprite, false, flip, 0, compare));
+    }
+    pipes.extend([false, true].map(|two| mk(Blend::AdditiveOne, two, false, false, false, false, false, false, 0, None)));
+    assert_eq!(pipes.len(), SKY_STATE_PIPE);
+    for compare in [wgpu::CompareFunction::Less, wgpu::CompareFunction::LessEqual, wgpu::CompareFunction::Always] {
+        for write in [false, true] {
+            for b in blends {
+                for two in [false, true] {
+                    pipes.push(mk(b, two, true, false, false, false, false, write, 0, Some(compare)));
+                }
+            }
+        }
+    }
+    let comparison_fade_specs = [wgpu::CompareFunction::Less, wgpu::CompareFunction::LessEqual, wgpu::CompareFunction::Always].into_iter()
+        .flat_map(|compare| [false, true].into_iter().flat_map(move |write| [Blend::Opaque, Blend::AlphaTest].into_iter()
+            .flat_map(move |blend| [false, true].map(move |two|
+                ((blend, two, false, false, true, false), !write, Some(compare))))));
+    let actor_specs = pipe_specs.take(MATERIAL_STATE_PIPE).map(|spec| (spec, false, None))
+        .chain(depth_specs.map(|spec| (spec, true, None)))
+        .chain([Blend::Opaque, Blend::AlphaTest].into_iter().flat_map(|b| [false, true].map(move |two| ((b, two, false, false, true, false), true, None))))
+        .chain([false, true, false, true].map(|two| ((Blend::Opaque, two, false, true, false, false), true, None)))
+        .chain([false, true].map(|two| ((Blend::AdditiveOne, two, false, false, false, false), false, None)))
+        .chain(comparison_specs).chain(comparison_fade_specs)
+        .chain([wgpu::CompareFunction::Less, wgpu::CompareFunction::Always].into_iter()
+            .flat_map(|compare| [false, true].into_iter().flat_map(move |_blended|
+                [false, true].into_iter().flat_map(move |write| [false, true].map(move |two|
+                    ((Blend::Opaque, two, false, true, false, false), write, Some(compare)))))));
+    assert_eq!(actor_specs.clone().count(), MESH_EFFECT_STRIDE);
+    let mut actor_pipes = Vec::with_capacity(8 * MESH_EFFECT_STRIDE);
+    for effect in 0..=7 {
+        for (index, ((b, two, sky, env, fade, sprite), flip, compare)) in actor_specs.clone().enumerate() {
+            let env_alias = if (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&index)
+                || (MATERIAL_ENV_WRITE_PIPE + 2..MATERIAL_ENV_WRITE_PIPE + 4).contains(&index) {
+                Some(index - 2)
+            } else if index >= MATERIAL_ENV_COMPARE_PIPE && (index - MATERIAL_ENV_COMPARE_PIPE) % 8 >= 4 {
+                Some(index - 4)
+            } else { None };
+            actor_pipes.push(if effect == 3 { PipelineSlot::alias(index) }
+                else if let Some(source) = env_alias { PipelineSlot::alias(effect as usize * MESH_EFFECT_STRIDE + source) }
+                else { mk(b, two, sky, env, fade, sprite, true, flip, effect, compare) });
+        }
+    }
+    let ground_pipes: Vec<_> = (8..=11).map(|effect| mk(Blend::Opaque, false, false, false, false, false, false, false, effect, None)).collect();
+    (pipes.into(), actor_pipes.into(), ground_pipes.into())
 }
 
 /// Left/right/bottom/top/near/far planes of `vp` (view-projection), normalized, `>= 0` inside. Public so an app can
@@ -920,6 +1048,11 @@ impl Renderer {
                     count: None,
                 },
                 uniform_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
             ],
         });
         let holo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -938,7 +1071,7 @@ impl Renderer {
             bind_group_layouts: &[Some(&g_layout), Some(&tex_layout)],
             immediate_size: 0,
         });
-        let (pipes, actor_pipes, ground_pipes) = build_pipelines(&device, &shader, format, &layout, &holo_pipeline_layout, 1);
+        let (pipes, actor_pipes, ground_pipes) = build_pipelines();
         let depth_clear_pipe = screen::depth_clear_pipeline(&device, format, 1);
         let mut r = Self {
             device,
@@ -950,6 +1083,8 @@ impl Renderer {
             spaceship_slots: vec![],
             spaceships_shown: true,
             liquids: vec![],
+            drawn_visuals: HashMap::new(),
+            pending_visuals: Default::default(),
             heat_haze: Default::default(),
             realistic_water: true,
             liquid_edge: [0.0; 3],
@@ -1046,7 +1181,8 @@ impl Renderer {
                 wgpu::Extent3d { width: lvl.cw.div_ceil(block) * block, height: lvl.ch.div_ceil(block) * block, depth_or_array_layers: 1 },
             );
         }
-        tex.create_view_tracked(&Default::default())
+        let descriptor = wgpu::TextureViewDescriptor::default();
+        tex.create_view_tracked(&descriptor)
     }
     /// Anisotropic filtering clamp (audit item 2: retail runs max anisotropy 1, randy31 `FUN_10041ede`, `docs/screens.md`
     /// "max anisotropy 1"; `Renderer::new` already defaults to it). The aomac Enhanced options page may raise it up to 16x.
@@ -1071,10 +1207,9 @@ impl Renderer {
         let level = clamp_msaa_samples(requested.max(1), &self.msaa_supported);
         if level == self.msaa_samples { return; }
         self.msaa_samples = level;
-        let (pipes, actor_pipes, ground_pipes) = build_pipelines(&self.device, &self.shader, self.format, &self.pipeline_layout, &self.holo_pipeline_layout, level);
-        self.pipes = pipes;
-        self.actor_pipes = actor_pipes;
-        self.ground_pipes = ground_pipes;
+        self.pipes.invalidate();
+        self.actor_pipes.invalidate();
+        self.ground_pipes.invalidate();
         self.depth_clear_pipe = screen::depth_clear_pipeline(&self.device, self.format, level);
     }
 
@@ -1162,12 +1297,13 @@ impl Renderer {
             views.push(self.texture_view(&texture.rgba, texture.width, texture.height, texture.source));
         }
         // One bind group per distinct (texture, base colour, emissive, glow mask).
-        let mut mat_of: HashMap<(usize, bool, [u32; 28]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, usize, bool, [u32; 32]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut material = |dev: &Renderer, view: usize, s: &ao_scene::Submesh, ground_scale: Option<[f32; 2]>| {
             let mut u = mat_uniform(s);
+            let env_view = s.stage1_env_texture.and_then(|key| view_of.get(&key).copied()).unwrap_or(0);
             if let Some([x, z]) = ground_scale { u[12] = x; u[14] = z; }
-            *mat_of.entry((view, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
+            *mat_of.entry((view, env_view, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
                 let ub = dev.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: bytemuck::bytes_of(&u),
@@ -1179,6 +1315,7 @@ impl Renderer {
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[view]) },
                         wgpu::BindGroupEntry { binding: 1, resource: ub.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[env_view]) },
                     ],
                 }));
                 mats.len() - 1
@@ -1241,7 +1378,8 @@ impl Renderer {
                         uniform[12] = patch.shadow_uv_scale[0]; uniform[14] = patch.shadow_uv_scale[1];
                         ground_texture_materials.insert(mat, (key, uniform));
                     }
-                    let d = Draw { mesh: mi, first_index: first, count, mat, pipe: material_pipe(s) };
+                    let d = Draw { mesh: mi, first_index: first, count, mat, pipe: world_material_pipe(s),
+                        priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass };
                     if s.liquid {
                         liquid.push(d)
                     } else if blended_material(s.blend) {
@@ -1317,6 +1455,7 @@ impl Renderer {
         let grid = ([grid.origin.x, grid.origin.y, grid.origin.z, grid.cell], [grid.dims[0], grid.dims[1], grid.dims[2], 0]);
         // Keep VisualWater's style order (water, acid, lava, star, shallow), including both coplanar passes.
         self.gpu = Gpu { meshes, inst_bufs, mats, opaque, blended, liquid, insts, mesh_range, radius, grid };
+        self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::Actor(..)));
         self.liquids = scene.liquids.iter().cloned().map(native_liquid::LiquidRun::new).collect();
         self.heat_haze.reset();
         self.ground = (!scene.ground_detail.is_empty()).then(|| {
@@ -1397,8 +1536,9 @@ impl Renderer {
                     continue;
                 }
                 let key = s.texture.filter(|k| self.sky_views.contains_key(k));
+                let env_key = s.stage1_env_texture.filter(|k| self.sky_views.contains_key(k));
                 let u = mat_uniform(s);
-                let mat = *self.sky.mat_of.entry((key, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
+                let mat = *self.sky.mat_of.entry((key, env_key, s.texture_clamp, u.map(f32::to_bits))).or_insert_with(|| {
                     let ub = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
                     self.sky.mats.push(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                         label: None,
@@ -1406,12 +1546,14 @@ impl Renderer {
                         entries: &[
                             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(key.map_or(self.sky_white_view.get().unwrap(), |k| &self.sky_views[&k])) },
                             wgpu::BindGroupEntry { binding: 1, resource: ub.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(env_key.map_or(self.sky_white_view.get().unwrap(), |k| &self.sky_views[&k])) },
                         ],
                     }));
                     self.sky.mats.len() - 1
                 });
                 let pipe = sky_material_pipe(s);
-                draws.push(Draw { mesh: mi, first_index: first, count, mat, pipe });
+                draws.push(Draw { mesh: mi, first_index: first, count, mat, pipe,
+                    priority: s.render_priority, node: None, origin: s.render_origin, projection_pass: s.projection_pass });
             }
             let ibytes = (indices.len() * 4) as u64;
             let (ib, created) = ensure_buf(&self.device, old_ib, &mut self.sky.index_capacity[mi], ibytes, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST, "sky indices");
@@ -1604,6 +1746,7 @@ impl Renderer {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
                     wgpu::BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(view) },
                 ],
             });
         }
@@ -1821,6 +1964,26 @@ impl Renderer {
         }
         self.frame = (self.frame + 1) % INST_RING;
         self.prepare_actors(cam.pos, &planes);
+        self.prepare_actor_pipelines();
+        {
+            let compile = |spec| compile_pipeline(&self.device, &self.shader, self.format,
+                &self.pipeline_layout, &self.holo_pipeline_layout, self.msaa_samples, spec);
+            if let Some(ground) = &self.ground {
+                for (mesh, material) in ground.materials.iter().enumerate() {
+                    if material.is_none() || self.vis_range[mesh].is_empty() { continue; }
+                    let path = if ground.has_shadow[mesh] { self.ground_state.path() } else { GroundPath::Simple };
+                    let base = match path { GroundPath::Fused => 0, GroundPath::ShadowsTwoPass => 1, GroundPath::Simple => 3 };
+                    self.ground_pipes.ensure(base, &compile);
+                    if path == GroundPath::ShadowsTwoPass { self.ground_pipes.ensure(2, &compile); }
+                }
+            }
+            for d in self.gpu.opaque.iter().chain(&self.gpu.blended).chain(&self.gpu.liquid)
+                .chain(self.sky.draws.iter().map(|(draw, _)| draw)) {
+                if d.count == 0 { continue; }
+                if d.pipe >= 1000 { self.ground_pipes.ensure(d.pipe - 1000, &compile); }
+                else { self.pipes.ensure(d.pipe, &compile); }
+            }
+        }
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.encode_actor_skins(&mut enc);
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
@@ -1897,15 +2060,23 @@ impl Renderer {
                 .collect();
             self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&xf));
         }
-        // Blended: one draw per (visible instance, submesh), far to near by instance centre.
         self.sorted.clear();
-        for (di, d) in self.gpu.blended.iter().enumerate() {
-            for vi in self.vis_range[d.mesh].clone() {
-                let dist = (self.gpu.insts[self.vis_src[vi as usize] as usize].center - cam.pos).length();
-                self.sorted.push((dist, di as u32, vi));
+        for (list, draws) in [&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid].into_iter().enumerate() {
+            for (di, d) in draws.iter().enumerate() {
+                if d.count == 0 || self.ground.as_ref().is_some_and(|ground| ground.materials[d.mesh].is_some()) { continue; }
+                for vi in self.vis_range[d.mesh].clone() {
+                    let instance = self.vis_src[vi as usize] as usize;
+                    let key = d.node.map(|(node, _)| VisualKey::World(instance, node));
+                    let priority = visual_priority(d, key, &self.drawn_visuals).unwrap_or([3, 5, 4][list]);
+                    if priority < 0 { continue; }
+                    let matrix = Mat4::from_cols_array_2d(&self.gpu.insts[instance].m);
+                    let bucket = actors::render_bucket(matrix.transform_point3(Vec3::from(d.origin)).distance(cam.pos));
+                    self.sorted.push((priority, bucket, list as u8, di, vi));
+                }
             }
         }
-        self.sorted.sort_by(|a, b| b.0.total_cmp(&a.0)); // stable: ties keep submesh order
+        self.sorted.sort_by(|a, b| actors::bucket_order(a.0, a.1, b.0, b.1)
+            .then_with(|| b.4.cmp(&a.4)).then_with(|| a.3.cmp(&b.3)));
 
         let calls = std::cell::Cell::new(0usize);
         self.screen.prepare(&self.device,&self.queue,self.format,t.size);
@@ -1951,8 +2122,29 @@ impl Renderer {
                     pass.set_bind_group(1, &if sky { &self.sky.mats } else { &self.gpu.mats }[d.mat], &[]);
                     mat.set((sky, d.mat));
                 }
-                pass.draw_indexed(d.first_index..d.first_index + d.count, 0, insts);
+                pass.draw_indexed(d.first_index..d.first_index + d.count, 0, insts.clone());
                 calls.set(calls.get() + 1);
+                if !sky && d.count != 0 {
+                    if let Some((node, next)) = d.node {
+                        for vi in insts.clone() {
+                            self.pending_visuals.borrow_mut().insert(VisualKey::World(self.vis_src[vi as usize] as usize, node), next);
+                        }
+                    }
+                }
+            };
+            let world_phase = |pass: &mut wgpu::RenderPass, priority: i32| {
+                pass.set_bind_group(0, &self.globals_bg, &[]);
+                pipe.set(usize::MAX); mesh.set((false, usize::MAX)); mat.set((false, usize::MAX));
+                if let Some(inst) = inst_buf {
+                    pass.set_vertex_buffer(1, inst.slice(..));
+                    let first = self.sorted.partition_point(|command| command.0 < priority);
+                    let last = self.sorted.partition_point(|command| command.0 <= priority);
+                    for &(_, _, list, di, vi) in &self.sorted[first..last] {
+                        let d = &[&self.gpu.opaque, &self.gpu.blended, &self.gpu.liquid][list as usize][di];
+                        draw(pass, d, vi..vi + 1, false);
+                    }
+                }
+                calls.set(calls.get() + self.draw_actors(pass, priority));
             };
             if let Some(sky) = sky_buf {
                 pass.set_vertex_buffer(1, sky.slice(..));
@@ -1961,7 +2153,7 @@ impl Renderer {
                     draw(&mut pass, d, *k..*k + 1, true);
                 }
             }
-            calls.set(calls.get()+self.draw_actors(&mut pass,0));
+            world_phase(&mut pass, 0);
             // AnarchyGround_t ctor 10033b97 sets priority 1. Complete the
             // native base stage for all terrain before the shadow stage.
             if let (Some(ground), Some(inst)) = (&self.ground, inst_buf) {
@@ -1983,53 +2175,14 @@ impl Renderer {
                     }
                 }
             }
-            for priority in 1..=2 {calls.set(calls.get()+self.draw_actors(&mut pass,priority));}
-            pass.set_bind_group(0,&self.globals_bg,&[]);
-            pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
-            // Order of `DisplaySystem_t::Render` @0x100793b8: sky, the opaque lists 3 + 4 (list 3 = world meshes and the actors'
-            // opaque parts; list 4 = liquids, `VisualLiquid_t` ctor @0x10067385 `SetRenderPriority(4)`), then the blended lists
-            // 5 (blended meshes) and 6 (actors' blended parts, effects), each far to near.
-            if let Some(inst) = inst_buf {
-                pass.set_vertex_buffer(1, inst.slice(..));
-                for d in &self.gpu.opaque {
-                    let r = self.vis_range[d.mesh].clone();
-                    if !r.is_empty() && d.count > 0 && !self.ground.as_ref().is_some_and(|g| g.materials[d.mesh].is_some()) {
-                        draw(&mut pass,d,r,false);
-                    }
-                }
+            // Existing native list order; list 4 remains the liquid list.
+            for priority in [1, 2, 3, 4, 5, 6, 10, 7] {
+                world_phase(&mut pass, priority);
             }
-            calls.set(calls.get() + self.draw_actors(&mut pass,3));
-            if !self.gpu.liquid.is_empty() {
-                pass.set_bind_group(0,&self.globals_bg,&[]);
-                // the actor pass rebinds pipeline, buffers and material: forget the cached state
-                pipe.set(usize::MAX);
-                mesh.set((false, usize::MAX));
-                mat.set((false, usize::MAX));
-                if let Some(inst) = inst_buf {
-                    pass.set_vertex_buffer(1, inst.slice(..));
-                    for d in &self.gpu.liquid {
-                        let r = self.vis_range[d.mesh].clone();
-                        if !r.is_empty() {
-                            draw(&mut pass, d, r, false);
-                        }
-                    }
-                }
-            }
-            calls.set(calls.get()+self.draw_actors(&mut pass,4));
-            if !self.sorted.is_empty() {
-                pass.set_bind_group(0,&self.globals_bg,&[]);
-                pipe.set(usize::MAX);mesh.set((false,usize::MAX));mat.set((false,usize::MAX));
-                if let Some(inst)=inst_buf {
-                    pass.set_vertex_buffer(1,inst.slice(..));
-                    for &(_, di, vi) in &self.sorted {
-                        draw(&mut pass, &self.gpu.blended[di as usize], vi..vi + 1, false);
-                    }
-                }
-            }
-            for priority in [5,6,10,7] {calls.set(calls.get()+self.draw_actors(&mut pass,priority));}
         }
         self.heat_haze.draw(&mut enc, resolve);
         self.screen.draw(&mut enc,resolve);
+        self.drawn_visuals.extend(self.pending_visuals.get_mut().drain());
         self.stats = FrameStats { instances: self.vis.len(), draw_calls: calls.get() };
         self.queue.submit([enc.finish()])
     }
@@ -2271,6 +2424,117 @@ mod sky_tests {
     use ao_scene::{Instance, Mesh, SkySpin, Submesh, Texture, TextureKey, Vertex, IDENTITY};
 
     #[test]
+    fn native_material_state_slots_keep_depth_alpha_and_blend_independent() {
+        let _ = build_pipelines(); // Slot-table layout assertions are GPU-free.
+        for blend in [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::AdditiveOne] {
+            for two_sided in [false, true] {
+                for write in [false, true] {
+                    for compare in [2, 4, 8] {
+                        let sub = Submesh { blend, two_sided, depth_write: Some(write), depth_func: Some(compare),
+                            alpha_test: Some(30), alpha_func: 5, ..Submesh::new(vec![], None) };
+                        let mode = match compare { 2 => 0, 4 => 1, _ => 2 };
+                        let slot = mode * 36 + write as usize * 18 + blend as usize * 2 + two_sided as usize;
+                        assert_eq!(material_pipe(&sub), MATERIAL_COMPARE_PIPE + slot);
+                        assert_eq!(world_material_pipe(&sub), WORLD_COMPARE_PIPE + slot);
+                        let uniform = mat_uniform(&sub);
+                        assert_eq!(uniform[29], 30.0 / 255.0);
+                        assert_eq!((uniform[30], uniform[31]), (1.0, 5.0));
+                    }
+                }
+            }
+        }
+        let no_light_or_fog = Submesh { fog_enabled: false, lighting_enabled: false, ..Submesh::new(vec![], None) };
+        assert_eq!(mat_uniform(&no_light_or_fog)[30], 6.0);
+    }
+
+    #[test]
+    fn ordinary_environment_add_precedes_blend_while_cat_env_is_another_one_one_pass() {
+        let world = Scene {
+            environment: Some(Environment { sky_color: [0.0; 3], fog_color: [0.0; 3],
+                fog_start: 100.0, fog_end: 200.0, ambient: [0.0; 3], sun_color: [0.0; 3],
+                sun_dir: [0.0, 0.0, 1.0], sun_specular: 0.0 }),
+            ..Default::default()
+        };
+        let env = TextureKey { rdb_type: 1010004, id: 1 };
+        let model = |cat: bool| {
+            let mut model = actor_quad([0.0, 0.0, 1.0], Submesh {
+                blend: Blend::AlphaBlend, base_color: [1.0, 1.0, 1.0, 0.25],
+                stage1_env_texture: (!cat).then_some(env), env_texture: cat.then_some(env),
+                ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+            });
+            model.textures.insert(env, Texture { source: Default::default(), width: 1, height: 1, rgba: vec![0, 255, 0, 0] });
+            model
+        };
+        let Some(ordinary) = actor_shot(&world, model(false), [0.0, 0.0, -3.0], "ordinary-env-stage") else { return };
+        let Some(cat) = actor_shot(&world, model(true), [0.0, 0.0, -3.0], "cat-env-pass") else { return };
+        assert!((60..=68).contains(&ordinary[1]), "{ordinary:?}: stage1 ADD still uses the base blend alpha");
+        assert!(cat[1] >= 250, "{cat:?}: CAT ONE/ONE env RGB is independent of its alpha");
+    }
+
+    #[test]
+    fn native_material_comparisons_and_unlit_fog_reach_fragments() {
+        let key = TextureKey { rdb_type: 1010004, id: 1 };
+        let world = Scene {
+            environment: Some(Environment { sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 100.0,
+                fog_end: 200.0, ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 0.0, 1.0], sun_specular: 0.0 }),
+            ..Default::default()
+        };
+        for (function, passes) in [(1, false), (2, false), (3, true), (4, true), (5, false), (6, false), (7, true), (8, true)] {
+            let mut model = actor_quad([0.0, 0.0, 1.0], Submesh {
+                blend: Blend::AlphaBlend, emissive: [1.0; 3], alpha_test: Some(128), alpha_func: function,
+                ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key))
+            });
+            model.textures.insert(key, Texture { source: Default::default(), width: 1, height: 1, rgba: vec![255, 0, 0, 128] });
+            let Some(pixel) = actor_shot(&world, model, [0.0, 0.0, -3.0], &format!("native-alpha-cmp-{function}")) else { return };
+            assert_eq!(pixel[0] > 120, passes, "native cmp{function}: {pixel:?}");
+        }
+        for fog_enabled in [false, true] {
+            let mut fog_world = world.clone();
+            let env = fog_world.environment.as_mut().unwrap();
+            env.fog_color = [0.0, 1.0, 0.0];
+            env.fog_start = 0.0;
+            env.fog_end = 1.0;
+            let mut model = actor_quad([0.0, 0.0, 1.0], Submesh {
+                lighting_enabled: false, fog_enabled,
+                ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key))
+            });
+            model.textures.insert(key, Texture { source: Default::default(), width: 1, height: 1, rgba: vec![255, 0, 0, 255] });
+            let Some(pixel) = actor_shot(&fog_world, model, [0.0, 0.0, -3.0], &format!("native-unlit-fog-{fog_enabled}")) else { return };
+            assert!(if fog_enabled { pixel[1] > 250 && pixel[0] < 2 } else { pixel[0] > 250 && pixel[1] < 2 }, "{pixel:?}");
+        }
+    }
+
+    #[test]
+    fn native_node_priority_advances_only_after_a_visible_submission() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(mut renderer) = Renderer::new(&instance, None) else { return };
+        let mut model = actor_quad([0.0, 0.0, 1.0], Submesh {
+            emissive: [1.0; 3], render_priority: Some(6), render_node: Some((7, 3)),
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+        });
+        renderer.add_actor_model(1, &model);
+        let target = renderer.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: None, size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: renderer.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        });
+        let targets = Targets::new(&renderer, 32, 32);
+        let mut transform = IDENTITY;
+        transform[3][2] = -3.0;
+        renderer.set_actors(vec![ao_scene::ActorFrame { id: 1, model: 1, transform, ..Default::default() }]);
+        let key = VisualKey::Actor(1, 1, 0, 7);
+        renderer.render(&target.create_view_tracked(&Default::default()), &targets, &Camera::look_at(Vec3::ZERO, Vec3::Z));
+        assert!(!renderer.drawn_visuals.contains_key(&key), "culled submissions do not mutate native priority");
+        renderer.render(&target.create_view_tracked(&Default::default()), &targets, &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+        assert_eq!(renderer.drawn_visuals.get(&key), Some(&3));
+        model.meshes[0].vertices[0].pos[0] += 0.01;
+        renderer.update_actor_model(1, &model);
+        assert_eq!(renderer.drawn_visuals.get(&key), Some(&3), "pose updates do not recreate a native visual");
+        renderer.add_actor_model(1, &model);
+        assert!(!renderer.drawn_visuals.contains_key(&key), "replacement starts at authored priority again");
+    }
+
+    #[test]
     fn native_fog_start_and_end_follow_camera_planes_after_snapshot_refresh() {
         let original = default_environment(400.0);
         for far in [800.0, 1600.0] {
@@ -2364,7 +2628,7 @@ mod sky_tests {
         for vertex in &mut sky.meshes[0].vertices { vertex.uv = [0.25, 0.25]; vertex.color = [1.0; 4]; }
         let material = &mut sky.meshes[0].submeshes[0];
         material.uv_camera = [1.0 / 51200.0, 0.0, 0.0, -1.0 / 51200.0];
-        assert_eq!(&mat_uniform(material)[24..], &material.uv_camera);
+        assert_eq!(&mat_uniform(material)[24..28], &material.uv_camera);
         for (name, eye, expected) in [
             ("origin", [0.0, 0.0, 0.0], [255, 0, 0]),
             ("east", [25600.0, 0.0, 0.0], [0, 255, 0]),
@@ -2387,7 +2651,7 @@ mod sky_tests {
     #[test]
     fn sky_material_pipes_preserve_existing_slots_and_cover_every_blend() {
         assert_eq!((ENV_PIPE, ENV_BLEND_PIPE, FADE_PIPE, SPRITE_PIPE, NATIVE_BLEND_PIPE), (12, 14, 16, 20, 22));
-        assert_eq!((MESH_EFFECT_PIPE, MESH_EFFECT_STRIDE), (31, 31), "actor effect slots must not move");
+        assert_eq!(MESH_EFFECT_PIPE, MESH_EFFECT_STRIDE, "effect families include the independent material-state slots");
         assert_eq!(native_liquid::PIPE, SKY_LAST_PIPE + 1);
         let mut slots = std::collections::HashSet::new();
         for blend in [Blend::Opaque, Blend::AlphaTest, Blend::AlphaBlend, Blend::Additive, Blend::ZeroSourceColor, Blend::DestinationColorSourceColor, Blend::PremultipliedAlpha, Blend::SourceColorOne] {
@@ -2966,6 +3230,9 @@ mod sky_tests {
     fn native_mesh_zbias_and_clear_draw_over_existing_world_depth() {
         let model = actor_quad([0.0, 0.0, 1.0], Submesh {
             base_color: [0.0, 1.0, 0.0, 1.0], emissive: [1.0; 3],
+            // Exercise ZBIAS against explicit LESS; the native default is
+            // LESSEQUAL and already accepts coplanar geometry without bias.
+            depth_func: Some(2),
             ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
         });
         let mut world = model.clone();
@@ -2977,7 +3244,7 @@ mod sky_tests {
         let shot = |effect, z| actor_shot_frame(&world, model.clone(), [0.0, 0.0, z],
             ao_scene::ActorFrame { rendering_effect: effect, ..Default::default() },
             &format!("native-mesh-depth-{effect}")).expect("mesh depth regression requires an offscreen GPU adapter");
-        assert!(shot(0, -5.0)[0] > 240, "ordinary coplanar actor fails depth test");
+        assert!(shot(0, -5.0)[0] > 240, "authored LESS rejects the ordinary coplanar actor");
         assert!(shot(7, -5.0)[1] > 240, "native ZBIAS1 brings coplanar actor forward");
         assert!(shot(3, -6.0)[1] > 240, "native mode 3 clears the preceding world depth");
     }
@@ -3062,6 +3329,214 @@ mod sky_tests {
             assert!(edge[0] > keyed[0] && edge[0] < solid[0], "filtered alpha must blend, not become opaque: {keyed:?}, {edge:?}, {solid:?}");
             assert_ne!(shot(31).unwrap(), keyed, "coverage above ALPHAREF survives");
         }
+    }
+    #[test]
+    fn native_default_less_equal_preserves_coplanar_world_and_actor_draws() {
+        // Randy 10041f98 sets ZFUNC=LESSEQUAL. Ordinary RTriMesh and CAT
+        // base draws inherit it unless a material explicitly authors ZFUNC.
+        for (depth_func, expected) in [(None, [0, 0, 255]), (Some(2), [255, 0, 0]), (Some(4), [0, 0, 255])] {
+            let mut model = actor_quad([0.0, 0.0, 1.0], Submesh {
+                depth_func, lighting_enabled: false, base_color: [1.0, 0.0, 0.0, 1.0],
+                ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+            });
+            let mut second = model.meshes[0].submeshes[0].clone();
+            second.base_color = [0.0, 0.0, 1.0, 1.0];
+            model.meshes[0].submeshes.push(second);
+            let mut world = model.clone();
+            let mut transform = IDENTITY;
+            transform[3][2] = -3.0;
+            world.instances.push(ao_scene::Instance { mesh: 0, transform });
+            let world_pixel = actor_shot(&world, Scene::default(), [0.0; 3], &format!("native-depth-world-{depth_func:?}"))
+                .expect("native inherited depth regression requires an offscreen GPU adapter");
+            let actor_pixel = actor_shot(&Scene::default(), model, [0.0, 0.0, -3.0], &format!("native-depth-actor-{depth_func:?}"))
+                .expect("native inherited depth regression requires an offscreen GPU adapter");
+            assert_eq!(world_pixel, expected, "ordinary world inherited/authored ZFUNC {depth_func:?}");
+            assert_eq!(actor_pixel, expected, "CAT base inherited/authored ZFUNC {depth_func:?}");
+        }
+    }
+    #[test]
+    fn native_rtti_mode_two_depth_uses_visual_provenance_not_skinning() {
+        let red = |projection_pass| actor_quad([0.0, 0.0, 1.0], Submesh {
+            projection_pass, depth_func: Some(2), depth_write: Some(false),
+            lighting_enabled: false, base_color: [1.0, 0.0, 0.0, 1.0],
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+        });
+        let blue = || actor_quad([0.0, 0.0, 1.0], Submesh {
+            lighting_enabled: false, base_color: [0.0, 0.0, 1.0, 1.0],
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None)
+        });
+        for projection_pass in [false, true] {
+            let mut world = blue();
+            let mut transform = IDENTITY;
+            transform[3][2] = -3.0;
+            world.instances.push(ao_scene::Instance { mesh: 0, transform });
+            let frame = ao_scene::ActorFrame { rendering_effect: 2, ..Default::default() };
+            let pixel = actor_shot_frame(&world, red(projection_pass), [0.0, 0.0, -3.0], frame,
+                &format!("rtti-mode-two-compare-{projection_pass}")).unwrap();
+            assert_eq!(pixel, if projection_pass { [255, 0, 0] } else { [0, 0, 255] },
+                "only RTriMesh mode 2 replaces authored LESS with LESSEQUAL");
+
+            let mut model = red(projection_pass);
+            model.meshes[0].submeshes[0].render_priority = Some(1);
+            let mut behind = blue().meshes.remove(0);
+            for vertex in &mut behind.vertices { vertex.pos[2] -= 0.2; }
+            // Native queues prepend separate visuals within one list: explicit
+            // lists make the farther quad draw after the tested depth writer.
+            behind.submeshes[0].render_priority = Some(2);
+            model.meshes.push(behind);
+            // CPU-skinned and rigid models have no native skin buffer; the
+            // archived visual class still determines the mode-2 branch.
+            assert!(model.native_skin.is_none());
+            let cpu_vertices = std::sync::Arc::new(model.meshes[0].vertices.clone());
+            for skin in [None, Some(cpu_vertices)] {
+                let frame = ao_scene::ActorFrame { rendering_effect: 2, skin, ..Default::default() };
+                let pixel = actor_shot_frame(&Scene::default(), model.clone(), [0.0, 0.0, -3.0], frame,
+                    &format!("rtti-mode-two-write-{projection_pass}")).unwrap();
+                assert_eq!(pixel, if projection_pass { [255, 0, 0] } else { [0, 0, 255] },
+                    "only RTriMesh mode 2 overrides disabled ZWRITE, including CPU fallback");
+            }
+        }
+    }
+
+
+
+    #[test]
+    fn native_environment_redraw_inherits_material_depth() {
+        let base = TextureKey { rdb_type: 0, id: 88 };
+        let env = TextureKey { rdb_type: 0, id: 89 };
+        // ONE/ONE adds to the framebuffer: give the alpha-discard case an
+        // explicit black background rather than adding to the default sky.
+        let world = Scene { environment: Some(Environment { sky_color: [0.0; 3], ..default_environment(1000.0) }), ..Default::default() };
+        let reflective = |depth_func, write, discard| {
+            let mut scene = actor_quad([0.0, 0.0, 1.0], Submesh {
+                depth_func, depth_write: Some(write), lighting_enabled: false,
+                alpha_test: Some(128), env_texture: Some(env),
+                base_color: [0.0, 0.0, 0.0, 1.0],
+                ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(base))
+            });
+            scene.textures.insert(base, Texture { source: Default::default(), width: 1, height: 1, rgba: vec![0, 0, 0, if discard { 0 } else { 255 }] });
+            scene.textures.insert(env, Texture { source: Default::default(), width: 1, height: 1, rgba: vec![64, 0, 0, 255] });
+            scene
+        };
+        let blue_quad = |scene: &mut Scene, z: f32| {
+            let mesh = &mut scene.meshes[0];
+            let first = mesh.vertices.len() as u32;
+            let vertices: Vec<_> = mesh.vertices[..4].iter().map(|vertex| {
+                let mut vertex = *vertex;
+                vertex.pos[2] += z;
+                vertex
+            }).collect();
+            mesh.vertices.extend(vertices);
+            mesh.submeshes.push(Submesh {
+                lighting_enabled: false, base_color: [0.0, 0.0, 1.0, 1.0],
+                ..Submesh::new([0, 1, 2, 0, 2, 3].map(|i| first + i).to_vec(), None)
+            });
+        };
+        for depth_func in [None, Some(2), Some(4), Some(8)] {
+            for write in [false, true] {
+                let name = format!("{depth_func:?}-{write}");
+                for effect in [0, 2] {
+                    let frame = ao_scene::ActorFrame { rendering_effect: effect, ..Default::default() };
+                    let pixel = actor_shot_frame(&world, reflective(depth_func, write, false), [0.0, 0.0, -3.0], frame, &format!("env-coplanar-{name}-{effect}"))
+                        .expect("native env depth regression requires an offscreen GPU adapter");
+                    assert_eq!(pixel, if depth_func == Some(2) && write { [0; 3] } else { [64, 0, 0] }, "coplanar base/env inherit ZFUNC/ZWRITE {name}/effect{effect}");
+                    // Base ALPHATEST discards, while the env texture survives.
+                    // Only the env pass can occlude this later, farther blue quad.
+                    let mut scene = reflective(depth_func, write, true);
+                    blue_quad(&mut scene, -0.2);
+                    let frame = ao_scene::ActorFrame { rendering_effect: effect, ..Default::default() };
+                    let pixel = actor_shot_frame(&world, scene, [0.0, 0.0, -3.0], frame, &format!("env-write-{name}-{effect}")).unwrap();
+                    assert_eq!(pixel, if write { [64, 0, 0] } else { [0, 0, 255] }, "env alone inherits ZWRITE {name}/effect{effect}");
+                }
+                let mut scene = reflective(depth_func, write, true);
+                blue_quad(&mut scene, 0.2);
+                scene.meshes[0].submeshes.swap(0, 1);
+                let pixel = actor_shot(&world, scene, [0.0, 0.0, -3.0], &format!("env-occluded-{name}")).unwrap();
+                assert_eq!(pixel, if depth_func == Some(8) { [64, 0, 255] } else { [0, 0, 255] }, "env retains authored ALWAYS rather than replacing it with LESSEQUAL {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_alpha_edge_keeps_environment_stage_derivatives() {
+        // Fixed-function stages precede ALPHATEST, including samples used only
+        // by a later stage. The pixel oracle also covers divergent derivative quads.
+        let shader = include_str!("shader.wgsl");
+        assert!(shader.find("sample_clamped(env_tex, i.env_uv)").unwrap()
+            < shader.find("if native_alpha_test() && !native_alpha_pass(alpha)").unwrap());
+        let base = TextureKey { rdb_type: 0, id: 80 };
+        let env = TextureKey { rdb_type: 0, id: 81 };
+        let mut model = actor_quad([0.0, 0.0, 1.0], Submesh {
+            texture_clamp: true, lighting_enabled: false,
+            alpha_test: Some(128), stage1_env_texture: Some(env),
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(base))
+        });
+        for vertex in &mut model.meshes[0].vertices {
+            let [x, y, _] = vertex.pos;
+            vertex.uv = [0.53 + (x + y) * 0.4, 0.5];
+            vertex.normal = [x * 2.0, y * 2.0, 0.1];
+        }
+        model.textures.insert(base, Texture { source: Default::default(), width: 2, height: 1,
+            rgba: vec![0, 0, 0, 0, 0, 0, 0, 255] });
+        model.textures.insert(env, Texture { source: Default::default(), width: 64, height: 64,
+            rgba: (0..64).flat_map(|y| (0..64).flat_map(move |x| {
+                let value = if (x + y) % 2 == 0 { 0 } else { 255 };
+                [value, value, value, 255]
+            })).collect() });
+        let shot = |model, name| {
+            let png = actor_frame_png(&Scene::default(), model, [0.0, 0.0, -4.0], Default::default(), name)
+                .expect("native alpha/environment regression requires an offscreen GPU adapter");
+            let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+            let mut rgba = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut rgba).unwrap();
+            rgba.truncate(info.buffer_size());
+            rgba
+        };
+        let mut full = model.clone();
+        full.meshes[0].submeshes[0].alpha_test = None;
+        let full = shot(full, "env-before-alpha-full");
+        let mut mask = model.clone();
+        mask.meshes[0].submeshes[0].stage1_env_texture = None;
+        for pixel in mask.textures.get_mut(&base).unwrap().rgba.as_chunks_mut::<4>().0 { pixel[..3].fill(255); }
+        let mask = shot(mask, "env-before-alpha-mask");
+        let actual = shot(model, "env-before-alpha-edge");
+        let background = &mask[..3];
+        let mut surviving = 0;
+        let mut rejected = 0;
+        for ((actual, full), mask) in actual.as_chunks::<4>().0.iter().zip(full.as_chunks::<4>().0).zip(mask.as_chunks::<4>().0) {
+            if mask[..3] == [255; 3] {
+                surviving += 1;
+                assert_eq!(&actual[..3], &full[..3], "discarded neighbours must not change surviving env samples");
+            } else {
+                rejected += usize::from(&full[..3] != background);
+                assert_eq!(&actual[..3], background, "ALPHATEST must reject the whole material, not only its base stage");
+            }
+        }
+        assert!(surviving > 0 && rejected > 0, "the alpha edge must split visible environment geometry");
+    }
+
+    #[test]
+    fn native_cat_coplanar_environment_pass_keeps_invariant_positions() {
+        assert!(include_str!("shader.wgsl").contains("@builtin(position) @invariant clip"));
+        let base = TextureKey { rdb_type: 0, id: 82 };
+        let env = TextureKey { rdb_type: 0, id: 83 };
+        let mut model = actor_quad([0.2, 0.4, 1.0], Submesh {
+            emissive: [1.0; 3], env_texture: Some(env),
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(base))
+        });
+        for vertex in &mut model.meshes[0].vertices {
+            let [x, y, _] = vertex.pos;
+            vertex.pos = [x * 1.17 + 0.023, y * 0.91 - 0.017, x * 0.31 + y * 0.43];
+        }
+        model.textures.insert(base, Texture { source: Default::default(), width: 1, height: 1, rgba: vec![0, 0, 0, 255] });
+        model.textures.insert(env, Texture { source: Default::default(), width: 1, height: 1, rgba: vec![64, 32, 16, 255] });
+        let mut reference = model.clone();
+        reference.meshes[0].submeshes[0].env_texture = None;
+        reference.textures.get_mut(&base).unwrap().rgba = vec![64, 32, 16, 255];
+        let shot = |model, name| actor_frame_png(&Scene::default(), model, [0.0, 0.0, -4.0], Default::default(), name)
+            .expect("native coplanar environment regression requires an offscreen GPU adapter");
+        assert_eq!(shot(model, "cat-coplanar-env"), shot(reference, "cat-coplanar-reference"),
+            "the LEQUAL environment redraw must cover every base-pass sample, including tilted depth gradients");
     }
 
     /// A 1 m quad at the origin of model space facing +Z (one-sided = false) with per-vertex `normal`.

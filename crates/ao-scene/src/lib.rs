@@ -103,6 +103,8 @@ pub enum Blend {
     /// Self-modulated additive glow: the source colour weights its own contribution, so dark texels fade to nothing instead
     /// of washing the destination at full strength like a `SRCALPHA` [`Additive`] would when the alpha source is just 1.0.
     SourceColorOne,
+    /// ONE / ONE (RMaterial alpha mode 4), independent of source alpha.
+    AdditiveOne,
 }
 
 /// Primitive list sharing the parent mesh's vertex buffer (triangles unless `sky_points`).
@@ -118,6 +120,24 @@ pub struct Submesh {
     /// RSprite: alpha blend with alpha > 30/255 and depth writes (randy31 0x10013575).
     /// Only applies to `Blend::AlphaBlend`; other materials keep their normal states.
     pub sprite_alpha_test: bool,
+    /// Independent native ZWRITEENABLE; `None` retains the caller's blend preset.
+    pub depth_write: Option<bool>,
+    /// Authored native ZFUNC: 2 LESS, 4 LESSEQUAL, 8 ALWAYS; `None` retains the caller's preset.
+    pub depth_func: Option<u8>,
+    /// Independent alpha-test reference (0..255), including blended materials.
+    pub alpha_test: Option<u8>,
+    /// D3DCMPFUNC; CAT/sprites use GREATER (5), archive defaults GREATEREQUAL (7).
+    pub alpha_func: u8,
+    /// Native FOGENABLE.
+    pub fog_enabled: bool,
+    /// Native LIGHTING; false passes vertex diffuse directly rather than adding lights.
+    pub lighting_enabled: bool,
+    /// Authored RVisual render list before the first submitted draw.
+    pub render_priority: Option<i32>,
+    /// Archive visual identity and automatic priority after its first submitted draw.
+    pub render_node: Option<(u32, i32)>,
+    /// Native visual frame origin for render-distance buckets.
+    pub render_origin: [f32; 3],
     /// Linear RGBA tint multiplied with the texture (and the vertex colour). Archive meshes and CAT models always carry white RGB +
     /// `opac`: `RViewPort_t::SetMaterial` (randy31 @0x1004b199) never copies the material's `diff`/`ambi` RGB into the
     /// `_D3DMATERIAL7`, whose diffuse and ambient stay white (`SetDefaultMaterial` @0x1004b61e).
@@ -163,6 +183,12 @@ pub struct Submesh {
     /// `SetCATTexture`). Actors only: after the submesh the renderer draws the same triangles again, additive (`SRC = DEST = ONE`,
     /// stage 0 `SELECTARG1` texture, no lighting) with the uv generated from the camera-space normal ([`env_uv`], `FUN_10056ed6`).
     pub env_texture: Option<TextureKey>,
+    /// Ordinary RVisual environment map: stage 1 adds a camera-normal texture inside the base draw,
+    /// before specular and fog. Unlike CAT `env_texture`, this is not another framebuffer-blended draw.
+    pub stage1_env_texture: Option<TextureKey>,
+    /// Ordinary RTriMesh provenance: its native draw invokes the statel projection pass.
+    /// CAT, terrain and procedural visuals do not.
+    pub projection_pass: bool,
     /// Liquid surface (`VisualLiquid_t`, render list 4): drawn after the opaque phase **including the actors' opaque parts** and
     /// before the blended world (list 5) and the actors' blended parts (list 6), `DisplaySystem_t::Render` @0x100793b8.
     pub liquid: bool,
@@ -176,6 +202,15 @@ impl Submesh {
             texture_clamp: false,
             blend: Blend::Opaque,
             sprite_alpha_test: false,
+            depth_write: None,
+            depth_func: None,
+            alpha_test: None,
+            alpha_func: 5,
+            fog_enabled: true,
+            lighting_enabled: true,
+            render_priority: None,
+            render_node: None,
+            render_origin: [0.0; 3],
             base_color: WHITE,
             two_sided: false,
             emissive: [0.0; 3],
@@ -191,6 +226,8 @@ impl Submesh {
             specular: [0.0; 3],
             shininess: 0.0,
             env_texture: None,
+            stage1_env_texture: None,
+            projection_pass: false,
             liquid: false,
         }
     }

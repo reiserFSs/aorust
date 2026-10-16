@@ -9,7 +9,7 @@ use crate::archive::{Archive, Object};
 use crate::texture::load_texture;
 use anyhow::{bail, ensure, Context, Result};
 use ao_rdb::RecordStore;
-use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, Texture, TextureKey, Vertex, IDENTITY};
+use ao_scene::{Blend, Instance, Mesh, Scene, Submesh, TextureKey, Vertex, IDENTITY};
 use std::collections::HashMap;
 
 mod rig;
@@ -27,6 +27,12 @@ pub const MESH_LOW_TYPE: u32 = 1010026;
 const D3DRS_SRCBLEND: i32 = 19;
 const D3DRS_DESTBLEND: i32 = 20;
 const D3DRS_CULLMODE: i32 = 22;
+const D3DRS_ZWRITEENABLE: i32 = 14;
+const D3DRS_ALPHAREF: i32 = 24;
+const D3DRS_ALPHAFUNC: i32 = 25;
+const D3DRS_ZFUNC: i32 = 23;
+const D3DRS_FOGENABLE: i32 = 28;
+const D3DRS_LIGHTING: i32 = 137;
 const D3DRS_ALPHATESTENABLE: i32 = 15;
 const D3DRS_ALPHABLENDENABLE: i32 = 27;
 const D3DRS_SPECULARENABLE: i32 = 29;
@@ -75,7 +81,7 @@ pub fn load_animated_mesh(store: &RecordStore, id: u32) -> Result<Option<(Scene,
             };
             let state = node.ref1("delta_state").and_then(|i| ar.objects.get(i));
             for mesh in ar.objects[data].refs("mesh") {
-                builder.simple_mesh(state, &ar.objects[mesh], &IDENTITY_MAT)?;
+                builder.simple_mesh(state, &ar.objects[mesh], &IDENTITY_MAT, render_node(ar, index, &ar.objects[data]))?;
             }
             builder.mesh.submeshes.retain(|s| !s.indices.is_empty());
             let index = scene.meshes.len();
@@ -197,7 +203,7 @@ fn generic_mesh_archive(ar: &Archive, default: &Object, index: Option<usize>, ca
         }
         let state = node.ref1("delta_state").and_then(|i| ar.objects.get(i));
         for mesh in data.refs("mesh") {
-            builder.simple_mesh(state, ar.objects.get(mesh).context("dangling mesh ref")?, &matrix)?;
+            builder.simple_mesh(state, ar.objects.get(mesh).context("dangling mesh ref")?, &matrix, (None, None))?;
         }
     }
     builder.mesh.submeshes.retain(|s| !s.indices.is_empty());
@@ -215,12 +221,6 @@ fn decode_record(store: &RecordStore, rdb_type: u32, id: u32, scene: &mut Scene,
         scene.textures.contains_key(&key)
     })
     .with_context(|| format!("decoding mesh {rdb_type}/{id}"))?;
-    let mut mesh = mesh;
-    for sub in &mut mesh.submeshes {
-        if sub.blend == Blend::AlphaBlend && sub.base_color[3] >= 1.0 && sub.texture.and_then(|k| scene.textures.get(&k)).is_some_and(is_cutout) {
-            sub.blend = Blend::AlphaTest;
-        }
-    }
     scene.meshes.push(mesh);
     Ok(Some(scene.meshes.len() - 1))
 }
@@ -239,16 +239,6 @@ pub fn texture_refs(store: &RecordStore, rdb_type: u32, id: u32) -> Result<Optio
     Ok(Some(refs))
 }
 
-/// Fraction of texels with a partial alpha (16..240) below which a blended texture is treated as a
-/// cutout. Guess: the engine blends these (rst 27=1, z-write off, sorted), but a texture whose alpha is
-/// essentially 0/255 looks the same alpha-tested while avoiding per-instance depth sorting.
-const CUTOUT_PARTIAL_MAX: f32 = 0.02;
-
-/// True for a texture whose alpha is (almost) only 0 or 255.
-fn is_cutout(t: &Texture) -> bool {
-    let partial = t.rgba.as_chunks::<4>().0.iter().filter(|p| (16..240).contains(&p[3])).count();
-    (partial as f32) <= CUTOUT_PARTIAL_MAX * (t.rgba.len() / 4) as f32
-}
 
 /// Row-major 4x4 for row vectors (`v' = v * M`), as used by the original engine.
 type Mat = [[f32; 4]; 4];
@@ -306,6 +296,16 @@ fn det3(m: &Mat) -> f32 {
 #[derive(Clone, Copy)]
 struct MatKey {
     texture: Option<TextureKey>,
+    stage1_env_texture: Option<TextureKey>,
+    depth_write: bool,
+    depth_func: Option<i32>,
+    alpha_test: Option<i32>,
+    alpha_func: i32,
+    fog_enabled: bool,
+    lighting_enabled: bool,
+    render_priority: Option<i32>,
+    render_node: Option<(u32, i32)>,
+    render_origin: [f32; 3],
     blend: Blend,
     two_sided: bool,
     color: [f32; 4],
@@ -315,13 +315,31 @@ struct MatKey {
     shininess: f32,
 }
 
-type MatId = (Option<TextureKey>, u8, bool, [u32; 4], [u32; 3], bool, [u32; 3], u32);
+type MatId = (Option<TextureKey>, u8, bool, [u32; 4], [u32; 3], bool, [u32; 3], u32,
+    (Option<TextureKey>, bool, Option<i32>, Option<i32>, i32, bool, bool),
+    (Option<i32>, Option<(u32, i32)>, [u32; 3]));
 
 impl MatKey {
     /// Hashable identity (`Blend` and `f32` are not `Hash`).
     fn id(&self) -> MatId {
-        (self.texture, self.blend as u8, self.two_sided, self.color.map(f32::to_bits), self.emissive.map(f32::to_bits), self.glow_mask, self.specular.map(f32::to_bits), self.shininess.to_bits())
+        (self.texture, self.blend as u8, self.two_sided, self.color.map(f32::to_bits), self.emissive.map(f32::to_bits), self.glow_mask, self.specular.map(f32::to_bits), self.shininess.to_bits(),
+            (self.stage1_env_texture, self.depth_write, self.depth_func, self.alpha_test, self.alpha_func, self.fog_enabled, self.lighting_enabled),
+            (self.render_priority, self.render_node, self.render_origin.map(f32::to_bits)))
     }
+}
+
+/// DisplaySystem's cloned archive visual starts transparent nodes in list 6;
+/// successful RVisual::Render10049761 changes other authored lists to 3.
+fn render_node(ar: &Archive, index: usize, data: &Object) -> (Option<i32>, Option<(u32, i32)>) {
+    let transparent = data.refs("mesh").into_iter().filter_map(|i| ar.objects.get(i))
+        .filter_map(|sm| sm.ref1("material")).filter_map(|i| ar.objects.get(i))
+        .filter_map(|mat| mat.ref1("delta_state")).filter_map(|i| ar.objects.get(i))
+        .any(|ds| ds.all("rst_type").flat_map(|b| b.as_chunks::<4>().0.iter())
+            .zip(ds.all("rst_value").flat_map(|b| b.as_chunks::<4>().0.iter()))
+            .filter(|(t, _)| le(*t) == Some(D3DRS_ALPHABLENDENABLE))
+            .last().is_some_and(|(_, value)| le(value) == Some(1)));
+    (Some(if transparent { 6 } else { ar.objects[index].i32("prio").unwrap_or(3) }),
+        Some((index as u32, if transparent { 6 } else { 3 })))
 }
 
 struct Builder<'a, 'b> {
@@ -385,7 +403,7 @@ impl Builder<'_, '_> {
             let data = ar.objects.get(data).context("dangling data ref")?;
             let node_ds = n.ref1("delta_state").and_then(|d| ar.objects.get(d));
             for m in data.refs("mesh") {
-                self.simple_mesh(node_ds, ar.objects.get(m).context("dangling mesh ref")?, &world)?;
+                self.simple_mesh(node_ds, ar.objects.get(m).context("dangling mesh ref")?, &world, render_node(ar, i, data))?;
             }
         }
         for c in n.refs("chld") {
@@ -431,20 +449,31 @@ impl Builder<'_, '_> {
         // left bound, not blank/white.
         let tex = tex.filter(|&k| (self.have_texture)(k)).or(self.last_tex);
         self.last_tex = tex;
-        // Alpha test wins over blend when both are on (mode 2 of @10040645 sets both; the cutout is
-        // what survives without depth sorting). Blend factors ONE/ONE (or SRCALPHA/ONE) = additive.
-        let blend = if state(D3DRS_ALPHATESTENABLE) == Some(1) {
-            Blend::AlphaTest
-        } else if state(D3DRS_ALPHABLENDENABLE) == Some(1) {
+        // Ordinary RVisual environments are enabled by default (+e1), in stage 1 (Randy1004d18a).
+        let stage1_env_texture = mat.and_then(|m| m.ref1("env_texture")).and_then(|i| objs.get(i))
+            .and_then(|t| t.ref1("creator")).and_then(|i| objs.get(i))
+            .and_then(|c| Some(TextureKey { rdb_type: c.i32("type")? as u32, id: c.i32("inst")? as u32 }))
+            .filter(|&key| (self.have_texture)(key));
+        // Archive deltas retain the device's ALPHAREF0 / GREATEREQUAL7 defaults.
+        let alpha_test = (state(D3DRS_ALPHATESTENABLE) == Some(1)).then(|| state(D3DRS_ALPHAREF).unwrap_or(0));
+        let alpha_func = state(D3DRS_ALPHAFUNC).unwrap_or(7);
+        let depth_write = state(D3DRS_ZWRITEENABLE) != Some(0);
+        let depth_func = state(D3DRS_ZFUNC);
+        let fog_enabled = state(D3DRS_FOGENABLE) != Some(0);
+        let lighting_enabled = state(D3DRS_LIGHTING) != Some(0);
+        let blend = if state(D3DRS_ALPHABLENDENABLE) == Some(1) {
             let src = state(D3DRS_SRCBLEND);
             match (src.unwrap_or(D3DBLEND_SRCALPHA), state(D3DRS_DESTBLEND).unwrap_or(6)) {
                 (3, 2) => Blend::SourceColorOne,
-                (D3DBLEND_ONE | D3DBLEND_SRCALPHA, D3DBLEND_ONE) => Blend::Additive,
+                (D3DBLEND_ONE, D3DBLEND_ONE) => Blend::AdditiveOne,
+                (D3DBLEND_SRCALPHA, D3DBLEND_ONE) => Blend::Additive,
                 (1, 3) => Blend::ZeroSourceColor,
                 (9, 3) => Blend::DestinationColorSourceColor,
                 (D3DBLEND_ONE, 6) => Blend::PremultipliedAlpha,
                 _ => Blend::AlphaBlend,
             }
+        } else if state(D3DRS_ALPHATESTENABLE) == Some(1) {
+            Blend::AlphaTest
         } else {
             Blend::Opaque
         };
@@ -466,10 +495,12 @@ impl Builder<'_, '_> {
         let strength = mat.and_then(|m| m.f32s::<1>("shin_str")).map_or(0.0, |v| v[0]);
         let shininess = mat.and_then(|m| m.f32s::<1>("shin")).map_or(0.0, |v| v[0]);
         let (specular, shininess) = if !generic && state(D3DRS_SPECULARENABLE) == Some(1) { (spec.map(|c| lin(c * strength)), shininess) } else { ([0.0; 3], 0.0) };
-        MatKey { texture: tex, blend, two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [1.0, 1.0, 1.0, a], emissive, glow_mask, specular, shininess }
+        MatKey { texture: tex, stage1_env_texture, blend, depth_write, depth_func, alpha_test, alpha_func, fog_enabled, lighting_enabled,
+            render_priority: None, render_node: None, render_origin: [0.0; 3],
+            two_sided: state(D3DRS_CULLMODE) == Some(D3DCULL_NONE), color: [1.0, 1.0, 1.0, a], emissive, glow_mask, specular, shininess }
     }
 
-    fn simple_mesh(&mut self, node_ds: Option<&Object>, sm: &Object, world: &Mat) -> Result<()> {
+    fn simple_mesh(&mut self, node_ds: Option<&Object>, sm: &Object, world: &Mat, (priority, node): (Option<i32>, Option<(u32, i32)>)) -> Result<()> {
         let desc = sm.get("vb_desc").context("SimpleMesh without vb_desc")?;
         ensure!(desc.len() >= 16, "short vb_desc");
         let fvf = u32::from_le_bytes(desc[8..12].try_into().unwrap());
@@ -500,6 +531,9 @@ impl Builder<'_, '_> {
         // The Z flip mirrors the mesh; a node matrix with negative determinant mirrors it back.
         let reverse = det3(world) >= 0.0;
         let mut key = self.material(node_ds, sm);
+        key.render_priority = priority;
+        key.render_node = node;
+        key.render_origin = [world[3][0], world[3][1], -world[3][2]];
         let slot = self.slot;
         self.slot += 1;
         if let Some(&(_, id)) = self.overrides.iter().find(|o| o.0 as usize == slot) {
@@ -509,10 +543,21 @@ impl Builder<'_, '_> {
                 self.last_tex = key.texture;
             }
         }
-        let sub = *self.groups.entry(key.id()).or_insert_with(|| {
-            self.mesh.submeshes.push(Submesh { blend: key.blend, two_sided: key.two_sided, base_color: key.color, emissive: key.emissive, glow_mask: key.glow_mask, specular: key.specular, shininess: key.shininess, ..Submesh::new(vec![], key.texture) });
-            self.mesh.submeshes.len() - 1
-        });
+        // Only adjacent identical draws batch: SimpleMesh order is observable with blending.
+        let identity = key.id();
+        let sub = if let Some(sub) = self.groups.get(&identity).copied().filter(|&sub| sub + 1 == self.mesh.submeshes.len()) {
+            sub
+        } else {
+            self.mesh.submeshes.push(Submesh { blend: key.blend, depth_write: Some(key.depth_write), depth_func: key.depth_func.map(|v| v as u8),
+                alpha_test: key.alpha_test.map(|v| v as u8), alpha_func: key.alpha_func as u8,
+                fog_enabled: key.fog_enabled, lighting_enabled: key.lighting_enabled,
+                render_priority: key.render_priority, render_node: key.render_node, render_origin: key.render_origin,
+                stage1_env_texture: key.stage1_env_texture, projection_pass: true, two_sided: key.two_sided, base_color: key.color, emissive: key.emissive,
+                glow_mask: key.glow_mask, specular: key.specular, shininess: key.shininess, ..Submesh::new(vec![], key.texture) });
+            let sub = self.mesh.submeshes.len() - 1;
+            self.groups.insert(identity, sub);
+            sub
+        };
         for t in tris.as_chunks::<6>().0 {
             let ix: [u32; 3] = std::array::from_fn(|k| u16::from_le_bytes([t[2 * k], t[2 * k + 1]]) as u32);
             if ix.iter().any(|&i| i as usize >= count) {
@@ -683,6 +728,45 @@ mod tests {
         }
     }
 
+    /// Loading textures must not replace native blending with an alpha test, even for binary alpha.
+    #[test]
+    fn binary_alpha_texture_keeps_archived_blending() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        let Ok(store) = RecordStore::open(&dir) else { return };
+        for id in store.ids(MESH_TYPE).unwrap() {
+            let bytes = store.get(MESH_TYPE, id).unwrap().unwrap();
+            let native = decode_archive(&bytes, false, |_| true).unwrap();
+            let mut scene = Scene::default();
+            let Some(index) = decode_mesh_into(&store, id, &mut scene).unwrap() else { continue };
+            for (native, loaded) in native.submeshes.iter().zip(&scene.meshes[index].submeshes) {
+                if native.blend != Blend::AlphaBlend || native.base_color[3] < 1.0 { continue; }
+                let Some(texture) = loaded.texture.and_then(|key| scene.textures.get(&key)) else { continue };
+                if texture.rgba.as_chunks::<4>().0.iter().all(|pixel| matches!(pixel[3], 0 | 255)) {
+                    assert_eq!(loaded.blend, Blend::AlphaBlend, "binary-alpha mesh {id}");
+                    return;
+                }
+            }
+        }
+        panic!("client has no binary-alpha blended mesh");
+    }
+
+    #[test]
+    fn native_environment_and_node_priority_reach_scene_materials() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        let Ok(store) = RecordStore::open(&dir) else { return };
+        let env = load_mesh(&store, 29086).unwrap();
+        assert!(env.meshes[0].submeshes.iter().any(|s| s.stage1_env_texture.is_some()));
+        assert!(env.meshes[0].submeshes.iter().all(|s| s.env_texture.is_none()), "ordinary env is not the CAT redraw");
+        assert!(env.meshes[0].submeshes.iter().all(|s| s.projection_pass), "archive RTriMesh provenance is independent of render_node/skin buffers");
+        for (id, priority) in [(1414, 3), (1436, 6), (206280, 6)] {
+            let scene = load_mesh(&store, id).unwrap();
+            assert!(scene.meshes[0].submeshes.iter().any(|s| s.render_priority == Some(priority)), "1010001/{id} priority {priority}");
+        }
+    }
+
+
     #[test]
     fn generic_resource_resets_raw_cloud_material_emission_and_specular() {
         let Some(home) = std::env::var_os("HOME") else { return };
@@ -844,6 +928,7 @@ mod tests {
         assert_eq!(m.submeshes.len(), 1);
         assert_eq!(m.submeshes[0].indices, vec![0, 2, 1, 3, 1, 2]);
         assert!(m.submeshes[0].texture.is_none());
+        assert!(m.submeshes[0].projection_pass);
     }
 
     /// Two untextured `SimpleMesh`es (one triangle each) that merge into one submesh; a statel texture override on
@@ -1016,12 +1101,17 @@ mod tests {
         assert_eq!(blend(&[(D3DRS_ALPHABLENDENABLE, 1)]).blend, Blend::AlphaBlend);
         assert_eq!(blend(&[(D3DRS_ALPHABLENDENABLE, 0)]).blend, Blend::Opaque);
         assert_eq!(blend(&[(D3DRS_ALPHATESTENABLE, 1)]).blend, Blend::AlphaTest);
-        // alpha test wins over blend (mode 2 of RMaterial_t's state preset sets both)
-        assert_eq!(blend(&[(D3DRS_ALPHATESTENABLE, 1), (D3DRS_ALPHABLENDENABLE, 1)]).blend, Blend::AlphaTest);
-        // ONE/ONE and SRCALPHA/ONE are additive (RSprite::EnableAdditiveRendering @10013128)
-        assert_eq!(blend(&[(D3DRS_ALPHABLENDENABLE, 1), (D3DRS_SRCBLEND, 2), (D3DRS_DESTBLEND, 2)]).blend, Blend::Additive);
+        let both = blend(&[(D3DRS_ALPHATESTENABLE, 1), (D3DRS_ALPHABLENDENABLE, 1),
+            (D3DRS_ALPHAREF, 30), (D3DRS_ALPHAFUNC, 5), (D3DRS_ZWRITEENABLE, 0)]);
+        assert_eq!((both.blend, both.alpha_test, both.alpha_func, both.depth_write),
+            (Blend::AlphaBlend, Some(30), 5, Some(false)));
+        assert_eq!(blend(&[(D3DRS_ALPHABLENDENABLE, 1), (D3DRS_SRCBLEND, 2), (D3DRS_DESTBLEND, 2)]).blend, Blend::AdditiveOne);
         assert_eq!(blend(&[(D3DRS_ALPHABLENDENABLE, 1), (D3DRS_SRCBLEND, 5), (D3DRS_DESTBLEND, 2)]).blend, Blend::Additive);
         assert!(blend(&[(D3DRS_CULLMODE, D3DCULL_NONE)]).two_sided);
         assert!(!blend(&[(D3DRS_CULLMODE, 3)]).two_sided);
+        let states = blend(&[(D3DRS_ZFUNC, 8), (D3DRS_FOGENABLE, 0), (D3DRS_LIGHTING, 0)]);
+        assert_eq!(states.depth_func, Some(8));
+        assert!(!states.fog_enabled && !states.lighting_enabled);
+        assert_eq!(blend(&[(D3DRS_ALPHATESTENABLE, 1)]).alpha_test, Some(0));
     }
 }

@@ -331,11 +331,10 @@ fn linear(c: f32) -> f32 {
 /// @0x10040bec) does to a material, as scene state `(blend, glow_mask)`. D3D7 ids decoded: 0x1b ALPHABLENDENABLE, 0xf ALPHATESTENABLE,
 /// 0xe ZWRITEENABLE, 0x18/0x19 ALPHAREF/ALPHAFUNC, 0x13/0x14 SRC/DESTBLEND; texture-stage types 1 COLOROP, 2 COLORARG1, 3 COLORARG2.
 /// `has_alpha` = the texture carries an alpha channel (`FUN_1004761a`: texture `+0xb4` bit 0). Modes 0 and 5 do nothing without it.
-/// * 0: alpha blend (`ALPHABLENDENABLE` on, alpha used as transparency). The scene contract cannot blend with depth writes, the
-///   one thing mode 0 does differently from [`Blend::AlphaBlend`]; [`submesh_for`] draws a texture whose alpha is only 0/255 as a cutout.
+/// * 0: alpha blend (`ALPHABLENDENABLE` on, alpha used as transparency), including binary-alpha textures. Native mode 0
+///   additionally retains depth writes; that independent state is represented separately from the blend equation.
 /// * 1: alpha test, `ALPHAFUNC GREATER`, `ALPHAREF` 0x80, no blend.
-/// * 2: alpha blend + alpha test (ref 0x1e), z-write off. [GUESS] drawn as `AlphaTest`: the contract has no blend+test (`mesh.rs`
-///   makes the same choice for archive meshes).
+/// * 2: alpha blend + alpha test (`GREATER` ref 0x1e), z-write off; both states survive independently.
 /// * 3: alpha blend, z-write off.
 /// * 4: additive (`ONE, ONE`), z-write off, fog colour black, stage 0 `SELECTARG1` texture (unlit).
 /// * 5: the texture alpha is a glow mask: stage 0 `COLOROP ADD`, `COLORARG1 TEXTURE|ALPHAREPLICATE`, `COLORARG2 DIFFUSE`, stage 1
@@ -344,9 +343,9 @@ fn linear(c: f32) -> f32 {
 pub fn alpha_mode_blend(mode: u32, has_alpha: bool) -> (Blend, bool) {
     match mode {
         0 if has_alpha => (Blend::AlphaBlend, false),
-        1 | 2 => (Blend::AlphaTest, false),
-        3 => (Blend::AlphaBlend, false),
-        4 => (Blend::Additive, false),
+        1 => (Blend::AlphaTest, false),
+        2 | 3 => (Blend::AlphaBlend, false),
+        4 => (Blend::AdditiveOne, false),
         5 if has_alpha => (Blend::Opaque, true),
         _ => (Blend::Opaque, false),
     }
@@ -384,15 +383,20 @@ fn submesh_for(mat: &Material, tex: Option<(TextureKey, &ao_scene::Texture)>, mo
     }
     let mode = mode.unwrap_or_else(|| default_alpha_mode(mat.flags));
     let (mut blend, mut glow) = alpha_mode_blend(mode, cut || soft);
-    if mode == 0 && blend == Blend::AlphaBlend && !soft {
-        blend = Blend::AlphaTest;
-    }
     if mat.opacity < 1.0 && matches!(blend, Blend::Opaque | Blend::AlphaTest) {
         blend = Blend::AlphaBlend;
     }
     glow &= blend == Blend::Opaque;
     s.blend = blend;
     s.glow_mask = glow;
+    s.depth_write = Some(!matches!(mode, 2..=4));
+    s.alpha_test = match mode { 1 => Some(128), 2 => Some(30), _ => None };
+    if mode == 4 {
+        // This alpha-mode preset, not ONE/ONE universally, authors black fog.
+        s.lighting_enabled = false;
+        s.sky_fog = true;
+        s.sky_fog_color = Some([0.0; 3]);
+    }
     // `RViewPort_t::SetMaterial` (randy31 @0x1004b199) copies only opac, emis, spec * shin_str and shin into the `_D3DMATERIAL7`: its
     // diffuse / ambient RGB stay white (`SetDefaultMaterial` @0x1004b61e), so `diffuse` / `ambient` tint nothing (they only reach D3D
     // through `InitD3DMaterial` @0x100409c6 for per-frame material modifiers); EMISSIVEMATERIALSOURCE is the device default MATERIAL.
@@ -828,7 +832,7 @@ mod tests {
         assert_eq!((blend(&m, &tex(&[0, 255])), sub(&m, &tex(&[0, 255])).glow_mask), (Blend::Opaque, true));
         assert!(!sub(&m, &tex(&[255])).glow_mask, "no alpha channel content: nothing to glow");
         m.flags = 0;
-        assert_eq!(blend(&m, &tex(&[0, 255])), Blend::AlphaTest);
+        assert_eq!(blend(&m, &tex(&[0, 255])), Blend::AlphaBlend);
         assert_eq!(blend(&m, &tex(&[0, 128])), Blend::AlphaBlend);
         assert_eq!(blend(&m, &tex(&[255])), Blend::Opaque);
         m.opacity = 0.5;
@@ -843,9 +847,9 @@ mod tests {
             (0, true, (Blend::AlphaBlend, false)),
             (0, false, (Blend::Opaque, false)), // mode 0 and 5 need the texture's alpha channel
             (1, false, (Blend::AlphaTest, false)),
-            (2, true, (Blend::AlphaTest, false)),
+            (2, true, (Blend::AlphaBlend, false)),
             (3, false, (Blend::AlphaBlend, false)),
-            (4, false, (Blend::Additive, false)),
+            (4, false, (Blend::AdditiveOne, false)),
             (5, true, (Blend::Opaque, true)),
             (5, false, (Blend::Opaque, false)),
             (6, true, (Blend::Opaque, false)), // unknown modes change nothing
@@ -863,8 +867,15 @@ mod tests {
         let t = ao_scene::Texture { source: Default::default(), width: 2, height: 1, rgba: vec![9, 9, 9, 0, 9, 9, 9, 255] };
         let s = |mode| submesh_for(&m, Some((key, &t)), mode);
         assert!(s(None).glow_mask);
-        assert_eq!(s(Some(4)).blend, Blend::Additive);
+        assert!(!s(None).projection_pass, "CAT is not an RTriMesh, including CPU skin fallback");
+        assert_eq!(s(Some(4)).blend, Blend::AdditiveOne);
         assert!(!s(Some(4)).glow_mask);
         assert_eq!(s(Some(1)).blend, Blend::AlphaTest);
+        let both = s(Some(2));
+        assert_eq!((both.blend, both.alpha_test, both.alpha_func, both.depth_write),
+            (Blend::AlphaBlend, Some(30), 5, Some(false)));
+        assert_eq!(s(Some(0)).depth_write, Some(true));
+        assert!(!s(Some(4)).lighting_enabled);
+        assert_eq!(s(Some(4)).sky_fog_color, Some([0.0; 3]));
     }
 }

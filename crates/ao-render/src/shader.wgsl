@@ -27,6 +27,7 @@ struct Mat {
     spec: vec4<f32>,     // rgb = material specular (spec * shin_str, 0 = SPECULARENABLE off), w = power
     flags: vec4<f32>,    // x = texture clamp; yzw = linear explicit sky fog colour
     uv_camera: vec4<f32>, // u/v translation coefficients for AO camera X/Z
+    native: vec4<f32>,    // env ADD, alpha ref, state bits (test/no-fog/unlit), D3DCMPFUNC
 }
 @group(0) @binding(0) var<uniform> g: G;
 @group(0) @binding(1) var<storage, read> lights: array<vec4<f32>>; // pairs: (pos, range), (colour, 0)
@@ -39,6 +40,7 @@ struct Mat {
 @group(0) @binding(6) var samp_clamp: sampler;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var<uniform> mat: Mat;
+@group(1) @binding(2) var env_tex: texture_2d<f32>;
 @group(2) @binding(0) var holo0: texture_2d<f32>;
 @group(2) @binding(1) var holo1: texture_2d<f32>;
 
@@ -62,7 +64,8 @@ struct VIn {
     @location(7) m3: vec4<f32>,
 }
 struct VOut {
-    @builtin(position) clip: vec4<f32>,
+    // Native fixed-function base/env passes transform the same VB identically.
+    @builtin(position) @invariant clip: vec4<f32>,
     @location(0) wpos: vec3<f32>,
     @location(1) n: vec3<f32>,
     @location(2) uv: vec2<f32>,
@@ -75,11 +78,39 @@ struct VOut {
     @location(9) @interpolate(flat) effect: u32,
     @location(10) @interpolate(flat) effect_time: f32,
     @location(11) fog: f32,
+    @location(12) env_uv: vec2<f32>,
 }
 
 // Randy10041876: linear vertex fog, no table/range fog (10042065).
 fn vertex_fog(depth: f32) -> f32 {
     return clamp((depth - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+}
+
+// Native StateBlob bits: alpha-test enable, fog disable, lighting disable.
+fn native_alpha_test() -> bool { return (u32(mat.native.z) & 1u) != 0u; }
+fn native_unlit() -> bool { return (u32(mat.native.z) & 4u) != 0u; }
+fn native_fog(factor: f32) -> f32 {
+    return select(factor, 0.0, (u32(mat.native.z) & 2u) != 0u);
+}
+fn native_alpha_pass(alpha: f32) -> bool {
+    switch u32(mat.native.w) {
+        case 1u: { return false; }
+        case 2u: { return alpha < mat.native.y; }
+        case 3u: { return alpha == mat.native.y; }
+        case 4u: { return alpha <= mat.native.y; }
+        case 5u: { return alpha > mat.native.y; }
+        case 6u: { return alpha != mat.native.y; }
+        case 7u: { return alpha >= mat.native.y; }
+        default: { return true; } // ALWAYS8; archive input validates D3DCMPFUNC.
+    }
+}
+fn unlit_vertex(v: VIn, vertex: VOut) -> VOut {
+    var o = vertex;
+    o.light = to_g(v.color.rgb);
+    o.dlight = vec3<f32>(0.0);
+    o.spec = vec3<f32>(0.0);
+    o.tint = to_g(mat.color.rgb);
+    return o;
 }
 
 fn vtx(v: VIn) -> VOut {
@@ -91,6 +122,9 @@ fn vtx(v: VIn) -> VOut {
     o.wpos = wp.xyz;
     o.fog = vertex_fog(-(g.view * wp).z);
     o.n = (model * vec4<f32>(v.normal, 0.0)).xyz;
+    if mat.native.x > 0.5 {
+        o.env_uv = normalize((g.view * vec4<f32>(o.n, 0.0)).xyz).xy * 0.5 + vec2<f32>(0.5);
+    }
     o.uv = v.uv;
     o.color = v.color;
     o.fade = 1.0 + v.m0.w;
@@ -102,6 +136,7 @@ fn vtx(v: VIn) -> VOut {
 @vertex
 fn vs(v: VIn) -> VOut {
     var o = vtx(v);
+    if native_unlit() { return unlit_vertex(v, o); }
     let prelit = mat.emissive.w > 1.5;
     let l = light_vertex(o.wpos, o.n, mat.emissive.rgb, mat.spec.rgb, mat.spec.w);
     // prelit surfaces: the vertex colour is the baked additive light in D3D space (see `shade`)
@@ -159,6 +194,7 @@ fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec
     o.uv = v.uv * uv.xy + uv.zw;
     o.effect = u32(power.z);
     o.effect_time = power.w;
+    if native_unlit() { return unlit_vertex(v, o); }
     // Actor overrides replace the submesh material's emissive/specular/power per instance (holo, degraded nanobots,
     // CAT effects) before evaluating vertex lighting.
     let eff_emissive = select(mat.emissive.rgb, emissive.rgb, emissive.w > 0.5);
@@ -341,38 +377,52 @@ fn light_vertex_sun(p: vec3<f32>, n_in: vec3<f32>, emissive: vec3<f32>, specular
 // with the material alpha = the frame's transparency, `RVisual_t::RenderWithTransparency`; the opaque texture alpha is not used)
 fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     let sprite = fade_mode == 6u;
-    let faded = fade_mode >= 4u && !sprite;
+    let one_one = fade_mode == 9u;
+    let faded = fade_mode == 4u || fade_mode == 5u;
     let mode = select(select(fade_mode, fade_mode - 4u, faded), 2u, sprite);
     let t = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z);
-    let alpha = t.a * i.color.a * mat.color.a * i.fade;
+    // CAT10056ed6 / RVisual1004d2d8 replace material alpha with frame opacity.
+    // Mode5 disables the alpha texture operation: its texture alpha is light, not coverage.
+    let material_alpha = select(mat.color.a, i.fade, i.fade < 1.0);
+    let texture_alpha = select(t.a, 1.0, mat.emissive.w > 0.5 && mat.emissive.w < 1.5);
+    let alpha = texture_alpha * i.color.a * material_alpha;
     // Audit item 4 (aomac Enhanced, opt-in via MSAA > 1): the pipeline's `alpha_to_coverage_enabled` (`lib.rs::build_pipelines`)
     // turns the real alpha this fragment outputs into per-sample coverage instead of a hard cutoff, softening foliage/fence/hair
     // edges. At MSAA = 1 (the retail-faithful default) `a2c` is always false and behaviour is exactly the former hard cutout.
     let a2c = g.fog.w > 0.5;
-    if sprite && alpha <= 30.0 / 255.0 {
-        discard;
-    }
-    if mode == 1u && !a2c && alpha < 0.5 {
-        discard;
-    }
     var light = i.light;
     var spec = i.spec;
-    if mat.emissive.w > 1.5 && i.effect != 2u && i.effect != 4u && i.effect != 5u && i.effect != 6u {
+    if !native_unlit() && mat.emissive.w > 1.5 && i.effect != 2u && i.effect != 4u && i.effect != 5u && i.effect != 6u {
         // prelit: vertex colour is additive light (engine: tex * saturate(lightmap + 0.8 * ambient + dlight))
         light = clamp(i.light + 0.8 * g.ambient_g.rgb + i.dlight, vec3<f32>(0.0), vec3<f32>(1.0));
         spec = vec3<f32>(0.0);
-    } else if mat.emissive.w > 0.5 && (i.effect == 0u || i.effect == 3u || i.effect == 7u) {
+    } else if mat.emissive.w > 0.5 && mat.emissive.w < 1.5 && (i.effect == 0u || i.effect == 3u || i.effect == 7u) {
         light = min(light + t.a, vec3<f32>(1.0)); // alpha = self-illumination mask (stage 0 ADD: saturate(a + lighting))
     }
     // texture stage MODULATE, then the specular add (both clamped to the framebuffer range), then fog: all in gamma space
-    let lit = min(t.rgb * i.tint * light + spec, vec3<f32>(1.0));
-    let f = select(i.fog, 0.0, i.effect == 2u || (i.effect >= 4u && i.effect <= 6u));
+    var texture_color = min(t.rgb * i.tint * light, vec3<f32>(1.0));
+    if mat.native.x > 0.5 {
+        // RVisual1004d18a: stage1 TEXTURE + CURRENT, before specular and fog.
+        let env = sample_clamped(env_tex, i.env_uv);
+        texture_color = min(texture_color + env.rgb, vec3<f32>(1.0));
+    }
+    let lit = min(texture_color + spec, vec3<f32>(1.0));
+    // D3D fixed function evaluates every texture stage before ALPHATEST. Keep
+    // implicit texture derivatives outside the divergent discard control flow.
+    if native_alpha_test() && !native_alpha_pass(alpha) {
+        discard;
+    }
+    if mode == 1u && !native_alpha_test() && !a2c && alpha < 0.5 {
+        discard;
+    }
+    let f = native_fog(select(i.fog, 0.0, i.effect == 2u || (i.effect >= 4u && i.effect <= 6u)));
     // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
     let add = mode == 3u;
-    let rgb = select(mix(lit, g.fog_g.rgb, f), lit, add);
-    var a = select(select(1.0, alpha, mode == 2u || (mode == 1u && a2c)), alpha * (1.0 - f), add);
+    let authored_fog = select(g.fog_g.rgb, to_g(mat.flags.yzw), mat.scroll.z > 1.5);
+    let rgb = select(mix(lit, authored_fog, f), lit, add);
+    var a = select(select(1.0, alpha, one_one || mode == 2u || (mode == 1u && a2c)), alpha * (1.0 - f), add);
     if faded {
-        a = select(i.fade, alpha, mode == 1u);
+        a = alpha;
     }
     return vec4<f32>(rgb, a);
 }
@@ -419,6 +469,8 @@ fn fs_sprite(i: VOut) -> @location(0) vec4<f32> { return shade(i, 6u); }
 fn fs_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u); }
 @fragment
 fn fs_mesh_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u); }
+@fragment
+fn fs_add_one(i: VOut) -> @location(0) vec4<f32> { return shade(i, 9u); }
 
 // HoloDeltaState, DS1006c005: camera-space position transformed back through the camera's world
 // matrix, with X erased and Y scrolled. COUNT3 is not D3DTTFF_PROJECTED (no divide).
@@ -438,6 +490,8 @@ fn fs_sky_test(i: VOut) -> @location(0) vec4<f32> { return shade_sky(i, 1u); }
 fn fs_sky_blend(i: VOut) -> @location(0) vec4<f32> { return shade_sky(i, 2u); }
 @fragment
 fn fs_sky_add(i: VOut) -> @location(0) vec4<f32> { return shade_sky(i, 3u); }
+@fragment
+fn fs_sky_add_one(i: VOut) -> @location(0) vec4<f32> { return shade_sky(i, 3u); }
 
 // CAT environment-map pass (randy31 `FUN_10056ed6`, mirrors `ao_scene::env_uv`): the uv is generated from the camera-space normal
 // (D3DTSS_TCI_CAMERASPACENORMAL) through scale(0.5, 0.5) + translation (0.5, 0.5).
@@ -454,7 +508,11 @@ fn vs_env(v: VIn) -> VOut {
 @fragment
 fn fs_env(i: VOut) -> @location(0) vec4<f32> {
     let t = sample_clamped(tex, i.uv);
-    let f = i.fog;
+    // The env blob10055a3e changes neither ALPHATEST nor material alpha.
+    // ONE/ONE means RGB itself is deliberately independent of opacity.
+    let alpha = t.a * i.color.a * select(mat.color.a, i.fade, i.fade < 1.0);
+    if native_alpha_test() && !native_alpha_pass(alpha) { discard; }
+    let f = native_fog(i.fog);
     return vec4<f32>(mix(t.rgb, g.fog_g.rgb, f), 1.0);
 }
 

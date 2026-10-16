@@ -129,6 +129,10 @@ struct Item {
     priority: Option<i32>,
 }
 
+fn actor_visual_key(item: &Item, draw: &Draw) -> Option<VisualKey> {
+    draw.node.map(|(node, _)| VisualKey::Actor(item.actor, item.model, item.mesh, node))
+}
+
 #[derive(Default)]
 pub(crate) struct ActorLayer {
     models: HashMap<u64, Model>,
@@ -274,9 +278,11 @@ impl Renderer {
                     if count == 0 {
                         continue;
                     }
-                    draws.push(Draw { mesh: i, first_index: first, count, mat, pipe });
+                    draws.push(Draw { mesh: i, first_index: first, count, mat, pipe,
+                        priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass });
                     if let Some((emat, epipe)) = env {
-                        draws.push(Draw { mesh: i, first_index: first, count, mat: emat, pipe: epipe });
+                        draws.push(Draw { mesh: i, first_index: first, count, mat: emat, pipe: epipe,
+                            priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass });
                     }
                 }
                 let ibytes = (indices.len() * 4) as u64;
@@ -331,8 +337,8 @@ impl Renderer {
                 identities.insert(*k, identity);
             }
         }
-        let holo = [0x28022, 0x28023].map(|id| view_of.iter().find(|(key, _)| key.id == id).map(|(_, &view)| view));
-        let holo = match holo {
+        let holo_views = [0x28022, 0x28023].map(|id| view_of.iter().find(|(key, _)| key.id == id).map(|(_, &view)| view));
+        let holo = match holo_views {
             [Some(a), Some(b)] => Some(self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
                 label: Some("native Holo textures"), layout: &self.holo_layout,
                 entries: &[
@@ -342,7 +348,7 @@ impl Renderer {
             })),
             _ => None,
         };
-        let mut mat_of: HashMap<(usize, bool, [u32; 28]), usize> = HashMap::new();
+        let mut mat_of: HashMap<(usize, usize, bool, [u32; 32]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
         let mut meshes = vec![];
         for mesh in &scene.meshes {
@@ -368,8 +374,9 @@ impl Renderer {
                 }
                 let count = indices.len() as u32 - first;
                 let view = s.texture.and_then(|k| view_of.get(&k).copied()).unwrap_or(0);
-                let mut bind = |view: usize, clamp: bool, u: [f32; 28]| {
-                    *mat_of.entry((view, clamp, u.map(f32::to_bits))).or_insert_with(|| {
+                let env_view = s.stage1_env_texture.and_then(|key| view_of.get(&key).copied()).unwrap_or(0);
+                let mut bind = |view: usize, clamp: bool, u: [f32; 32]| {
+                    *mat_of.entry((view, env_view, clamp, u.map(f32::to_bits))).or_insert_with(|| {
                         let ub = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                             label: None,
                             contents: bytemuck::bytes_of(&u),
@@ -381,6 +388,7 @@ impl Renderer {
                             entries: &[
                                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&views[view]) },
                                 wgpu::BindGroupEntry { binding: 1, resource: ub.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[env_view]) },
                             ],
                         }));
                         mats.len() - 1
@@ -391,14 +399,16 @@ impl Renderer {
                 let mat = bind(view, s.texture_clamp, mat_uniform(s));
                 let pipe = material_pipe(s);
                 // the env layer redraws the same triangles right after them, in the same phase (`FUN_10056ed6`)
-                let env = s.env_texture.and_then(|k| view_of.get(&k).copied()).map(|ev| (bind(ev, false, [0.0; 28]), env_pipe(s.blend, s.two_sided)));
+                let env = s.env_texture.and_then(|k| view_of.get(&k).copied()).map(|ev| (bind(ev, false, mat_uniform(s)), env_pipe(s)));
                 submesh_mats.push((mat, pipe, env));
                 if count == 0 {
                     continue;
                 }
-                draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe });
+                draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat, pipe,
+                    priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass });
                 if let Some((emat, epipe)) = env {
-                    draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat: emat, pipe: epipe });
+                    draws.push(Draw { mesh: meshes.len(), first_index: first, count, mat: emat, pipe: epipe,
+                        priority: s.render_priority, node: s.render_node, origin: s.render_origin, projection_pass: s.projection_pass });
                 }
             }
             let index_capacity = ((indices.len() * 4) as u64).next_power_of_two().max(1);
@@ -425,6 +435,9 @@ impl Renderer {
             }).max().unwrap_or(0),
         ));
         self.act.models.insert(key, Model { meshes, mats, holo, views, view_of, textures, identities, topology, native_skin });
+        if !retain_textures {
+            self.drawn_visuals.retain(|visual, _| !matches!(visual, VisualKey::Actor(_, model, _, _) if *model == key));
+        }
         self.act.vb_pool.remove(&key);
         self.act.textures.retain(|_, texture| texture.strong_count() != 0);
         // actors of a replaced model rebuild their body buffer at the next pose
@@ -439,10 +452,12 @@ impl Renderer {
     /// Other models and actors remain available; missing keys are harmless.
     pub fn remove_actor_model(&mut self, key: u64) {
         self.act.remove_model(key);
+        self.drawn_visuals.retain(|visual, _| !matches!(visual, VisualKey::Actor(_, model, _, _) if *model == key));
     }
 
     /// Forgets every model and actor (a new zone).
     pub fn clear_actors(&mut self) {
+        self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::World(..)));
         self.act.models.clear();
         self.act.textures.clear();
         self.act.actors.clear();
@@ -537,6 +552,19 @@ impl Renderer {
         out.extend(self.act.items.iter().filter(|item| item.mesh == 0).map(|item| item.actor));
     }
 
+    pub(super) fn prepare_actor_pipelines(&mut self) {
+        let compile = |spec| compile_pipeline(&self.device, &self.shader, self.format,
+            &self.pipeline_layout, &self.holo_pipeline_layout, self.msaa_samples, spec);
+        for it in &self.act.items {
+            let model = &self.act.models[&it.model];
+            let Some(mesh) = model.meshes[it.mesh].as_ref() else { continue };
+            for draw in &mesh.draws {
+                let pipe = if it.faded { faded_pipe(draw.pipe) } else { draw.pipe };
+                self.actor_pipes.ensure(mesh_effect_pipe(pipe, it.rendering_effect, draw.projection_pass), &compile);
+            }
+        }
+    }
+
     /// Frustum-culls the submitted actors, fills the instance buffer; called by `render` before the pass.
     pub(crate) fn prepare_actors(&mut self, cam: Vec3, planes: &[Vec4; 6]) {
         let layer = &mut self.act;
@@ -604,7 +632,7 @@ impl Renderer {
             let model=&layer.models[&item.model];
             let Some(mesh)=&model.meshes[item.mesh] else {continue};
             for priority in 0..=10 {
-                if mesh.draws.iter().any(|d|actor_priority(item.priority,item.faded,item.rendering_effect,blended_pipe(d.pipe))==priority) {
+                if mesh.draws.iter().any(|d| actor_priority(item.priority.or(visual_priority(d, actor_visual_key(item, d), &self.drawn_visuals)), item.faded, item.rendering_effect, blended_pipe(d.pipe)) == priority) {
                     layer.commands.push((priority, Some(index), item.bucket, item.rendering_effect == 3, layer.commands.len()));
                 }
             }
@@ -644,7 +672,7 @@ impl Renderer {
                 for d in &mesh.draws {
                     let effect = it.rendering_effect;
                     if effect == 1 && model.holo.is_none() { continue; }
-                    if actor_priority(it.priority, it.faded, effect, blended_pipe(d.pipe)) != priority {
+                    if actor_priority(it.priority.or(visual_priority(d, actor_visual_key(it, d), &self.drawn_visuals)), it.faded, effect, blended_pipe(d.pipe)) != priority {
                         continue;
                     }
                     let vb_ptr = vb as *const wgpu::Buffer as usize;
@@ -653,8 +681,8 @@ impl Renderer {
                         pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
                         vb_c.set(vb_ptr);
                     }
-                    let pipe = if it.faded && d.pipe < SKY_PIPE && d.pipe / 2 < 2 { FADE_PIPE + d.pipe } else { d.pipe };
-                    let pipe = mesh_effect_pipe(pipe, effect);
+                    let pipe = if it.faded { faded_pipe(d.pipe) } else { d.pipe };
+                    let pipe = mesh_effect_pipe(pipe, effect, d.projection_pass);
                     if pipe_c.get() != pipe {
                         pass.set_pipeline(&self.actor_pipes[pipe]);
                         pipe_c.set(pipe);
@@ -667,6 +695,9 @@ impl Renderer {
                         pass.set_bind_group(2, model.holo.as_ref().unwrap(), &[]);
                     }
                     pass.draw_indexed(d.first_index..d.first_index + d.count, 0, i as u32..i as u32 + 1);
+                    if let (Some(key), Some((_, next))) = (actor_visual_key(it, d), d.node) {
+                        self.pending_visuals.borrow_mut().insert(key, next);
+                    }
                     calls.set(calls.get() + 1);
                 }
             };
@@ -679,10 +710,18 @@ impl Renderer {
     }
 }
 
-/// Pipeline of the env layer of a submesh that draws with `blend`: the env pipelines live behind the scene/sky ones and come in
-/// an opaque-phase and a blended-phase set (same pipeline, different phase index).
-fn env_pipe(blend: Blend, two_sided: bool) -> usize {
-    (if blended_material(blend) { ENV_BLEND_PIPE } else { ENV_PIPE }) + two_sided as usize
+/// The CAT env blob changes texture/blend, not the material's ZFUNC/ZWRITE.
+/// Separate phase indices keep its redraw immediately after the base submesh.
+fn env_pipe(s: &ao_scene::Submesh) -> usize {
+    let phase = blended_material(s.blend) as usize;
+    let write = material_depth_write(s) as usize;
+    let two = s.two_sided as usize;
+    match s.depth_func {
+        Some(2) => MATERIAL_ENV_COMPARE_PIPE + phase * 4 + write * 2 + two,
+        Some(8) => MATERIAL_ENV_COMPARE_PIPE + 8 + phase * 4 + write * 2 + two,
+        _ if write != 0 => MATERIAL_ENV_WRITE_PIPE + phase * 2 + two,
+        _ => (if phase != 0 { ENV_BLEND_PIPE } else { ENV_PIPE }) + two,
+    }
 }
 
 /// Grows `buf` to `needed` bytes (next power of two), in place, only when it no longer fits (returns `true`);
@@ -707,6 +746,9 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         texture_clamp,
         blend,
         sprite_alpha_test,
+        depth_write, depth_func, alpha_test, alpha_func, fog_enabled, lighting_enabled,
+        render_priority, render_node, render_origin, stage1_env_texture,
+        projection_pass,
         base_color,
         two_sided,
         emissive,
@@ -728,6 +770,12 @@ pub(crate) fn same_material(a: &ao_scene::Submesh, b: &ao_scene::Submesh) -> boo
         && *texture_clamp == b.texture_clamp
         && *blend == b.blend
         && *sprite_alpha_test == b.sprite_alpha_test
+        && *depth_write == b.depth_write && *depth_func == b.depth_func
+        && *alpha_test == b.alpha_test && *alpha_func == b.alpha_func
+        && *fog_enabled == b.fog_enabled && *lighting_enabled == b.lighting_enabled
+        && *render_priority == b.render_priority && *render_node == b.render_node
+        && *render_origin == b.render_origin && *stage1_env_texture == b.stage1_env_texture
+        && *projection_pass == b.projection_pass
         && *base_color == b.base_color
         && *two_sided == b.two_sided
         && *emissive == b.emissive
@@ -758,6 +806,17 @@ fn submesh_shape(submeshes: &[ao_scene::Submesh]) -> Vec<ao_scene::Submesh> {
             texture_clamp: s.texture_clamp,
             blend: s.blend,
             sprite_alpha_test: s.sprite_alpha_test,
+            depth_write: s.depth_write,
+            depth_func: s.depth_func,
+            alpha_test: s.alpha_test,
+            alpha_func: s.alpha_func,
+            fog_enabled: s.fog_enabled,
+            lighting_enabled: s.lighting_enabled,
+            render_priority: s.render_priority,
+            render_node: s.render_node,
+            render_origin: s.render_origin,
+            stage1_env_texture: s.stage1_env_texture,
+            projection_pass: s.projection_pass,
             base_color: s.base_color,
             two_sided: s.two_sided,
             emissive: s.emissive,
@@ -780,12 +839,35 @@ fn submesh_shape(submeshes: &[ao_scene::Submesh]) -> Vec<ao_scene::Submesh> {
 
 /// Whether a draw belongs to the blended actor phase (client render list 6) rather than the opaque one (list 3).
 fn blended_pipe(pipe: usize) -> bool {
+    if pipe >= MATERIAL_ENV_COMPARE_PIPE {
+        return (pipe - MATERIAL_ENV_COMPARE_PIPE) % 8 / 4 != 0;
+    }
+    if pipe >= MATERIAL_COMPARE_FADE_PIPE { return true; }
+    if pipe >= MATERIAL_COMPARE_PIPE { return (pipe - MATERIAL_COMPARE_PIPE) % 18 / 2 >= Blend::AlphaBlend as usize; }
+    if pipe >= MATERIAL_ONE_PIPE { return true; }
+    if pipe >= MATERIAL_ENV_WRITE_PIPE { return pipe >= MATERIAL_ENV_WRITE_PIPE + 2; }
+    if pipe >= MATERIAL_FADE_PIPE { return false; }
+    if pipe >= MATERIAL_STATE_PIPE { return (pipe - MATERIAL_STATE_PIPE) / 2 >= Blend::AlphaBlend as usize; }
     matches!(pipe / 2, 2 | 3) && pipe < SKY_PIPE || (ENV_BLEND_PIPE..ENV_BLEND_PIPE + 2).contains(&pipe) || (SPRITE_PIPE..NATIVE_BLEND_PIPE + 8).contains(&pipe)
 }
 
+fn faded_pipe(pipe: usize) -> usize {
+    if (MATERIAL_COMPARE_PIPE..MATERIAL_COMPARE_FADE_PIPE).contains(&pipe) {
+        let variant = pipe - MATERIAL_COMPARE_PIPE;
+        if variant % 18 < 4 {
+            return MATERIAL_COMPARE_FADE_PIPE + variant / 36 * 8 + variant % 36 / 18 * 4 + variant % 4;
+        }
+    }
+    if pipe < 4 { FADE_PIPE + pipe }
+    else if (MATERIAL_STATE_PIPE..MATERIAL_STATE_PIPE + 4).contains(&pipe) {
+        MATERIAL_FADE_PIPE + pipe - MATERIAL_STATE_PIPE
+    } else { pipe }
+}
+
 /// Each delta state overrides only the native states it owns; mode 3 clears depth before its draw.
-fn mesh_effect_pipe(pipe: usize, effect: u32) -> usize {
+fn mesh_effect_pipe(pipe: usize, effect: u32, projection_pass: bool) -> usize {
     match effect {
+        2 if !projection_pass => pipe, // Native RTriMesh cast fails for CAT/procedural visuals.
         1 | 2 | 4..=7 => MESH_EFFECT_PIPE + (effect as usize - 1) * MESH_EFFECT_STRIDE + pipe,
         _ => pipe,
     }
@@ -803,13 +885,13 @@ fn actor_priority(priority: Option<i32>, faded: bool, effect: u32, blended: bool
 }
 
 /// RVisual::AddToRenderList 1004ca33..1004ca81; constants are f64, near product stored as f32.
-fn render_bucket(distance: f32) -> i32 {
+pub(super) fn render_bucket(distance: f32) -> i32 {
     let (value, offset) = if distance < 200.0 { ((distance * 5.0) as f64, 0) } else { (distance as f64, 800) };
     ((value - 0.49999).round_ties_even() as i32).saturating_add(offset).clamp(0, 1800)
 }
 
-fn bucket_order(priority_a: i32, bucket_a: i32, priority_b: i32, bucket_b: i32) -> std::cmp::Ordering {
-    priority_a.cmp(&priority_b).then_with(|| if matches!(priority_a, 5 | 6) {
+pub(super) fn bucket_order(priority_a: i32, bucket_a: i32, priority_b: i32, bucket_b: i32) -> std::cmp::Ordering {
+    priority_a.cmp(&priority_b).then_with(|| if matches!(priority_a, 5..=7) {
         bucket_b.cmp(&bucket_a)
     } else {
         bucket_a.cmp(&bucket_b)
@@ -821,10 +903,13 @@ mod tests {
     #[test]
     fn mesh_delta_state_pipeline_modes_preserve_material_states() {
         for pipe in 0..MESH_EFFECT_STRIDE {
-            assert_eq!(mesh_effect_pipe(pipe, 0), pipe);
-            assert_eq!(mesh_effect_pipe(pipe, 3), pipe);
-            for effect in [1, 2, 4, 5, 6, 7] {
-                assert_eq!(mesh_effect_pipe(pipe, effect), effect as usize * MESH_EFFECT_STRIDE + pipe);
+            for projection_pass in [false, true] {
+                assert_eq!(mesh_effect_pipe(pipe, 0, projection_pass), pipe);
+                assert_eq!(mesh_effect_pipe(pipe, 3, projection_pass), pipe);
+                for effect in [1, 2, 4, 5, 6, 7] {
+                    let expected = if effect == 2 && !projection_pass { pipe } else { effect as usize * MESH_EFFECT_STRIDE + pipe };
+                    assert_eq!(mesh_effect_pipe(pipe, effect, projection_pass), expected);
+                }
             }
         }
     }
@@ -1224,15 +1309,32 @@ mod tests {
 
     #[test]
     fn env_layer_follows_the_phase_of_its_submesh() {
+        let (_, actor_pipes, _) = build_pipelines();
         for (blend, blended) in [(Blend::Opaque, false), (Blend::AlphaTest, false), (Blend::AlphaBlend, true), (Blend::Additive, true), (Blend::ZeroSourceColor, true), (Blend::DestinationColorSourceColor, true), (Blend::PremultipliedAlpha, true), (Blend::SourceColorOne, true)] {
             for two in [false, true] {
-                let base = material_pipe(&ao_scene::Submesh { blend, two_sided: two, ..ao_scene::Submesh::new(vec![], None) });
-                assert_eq!(blended_pipe(base), blended);
-                assert_eq!(blended_pipe(env_pipe(blend, two)), blended, "{blend:?}");
-                assert!(env_pipe(blend, two) >= ENV_PIPE && env_pipe(blend, two) < ENV_PIPE + 4);
+                for depth_func in [None, Some(2), Some(4), Some(8)] {
+                    for write in [false, true] {
+                        let sub = ao_scene::Submesh { blend, two_sided: two, depth_func, depth_write: Some(write), ..ao_scene::Submesh::new(vec![], None) };
+                        assert_eq!(blended_pipe(material_pipe(&sub)), blended);
+                        assert_eq!(blended_pipe(env_pipe(&sub)), blended, "{blend:?}/{depth_func:?}/{write}");
+                        assert_eq!(faded_pipe(env_pipe(&sub)), env_pipe(&sub), "fading does not replace the env blob's blend/depth");
+                        for effect in [0, 2] {
+                            let spec = actor_pipes.spec(mesh_effect_pipe(env_pipe(&sub), effect, sub.projection_pass));
+                            assert!(spec.env);
+                            assert_eq!(spec.flip_depth, write, "env ZWRITE must inherit the base material");
+                            let compare = match depth_func { Some(2) => wgpu::CompareFunction::Less, Some(8) => wgpu::CompareFunction::Always, _ => wgpu::CompareFunction::LessEqual };
+                            assert_eq!(spec.compare.unwrap_or(wgpu::CompareFunction::LessEqual), compare);
+                            let base = actor_pipes.spec(mesh_effect_pipe(material_pipe(&sub), effect, sub.projection_pass));
+                            let base_write = matches!(base.blend, Blend::Opaque | Blend::AlphaTest) ^ base.flip_depth;
+                            assert_eq!(base_write, write, "effect {effect} base must retain authored ZWRITE");
+                            assert_eq!(base.compare.unwrap_or(wgpu::CompareFunction::LessEqual), compare);
+                        }
+                    }
+                }
             }
         }
-        assert_eq!(env_pipe(Blend::Opaque, true) - env_pipe(Blend::Opaque, false), 1, "two-sided pipeline follows the one-sided one");
+        let sub = ao_scene::Submesh::new(vec![], None);
+        assert_eq!(env_pipe(&ao_scene::Submesh { two_sided: true, ..sub.clone() }) - env_pipe(&sub), 1, "two-sided pipeline follows the one-sided one");
     }
     #[test]
     fn sprite_pipelines_are_blended_without_changing_existing_indices() {
