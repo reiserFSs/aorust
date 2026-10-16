@@ -1594,8 +1594,12 @@ plus first-page-only ViewSelector sizing. Their native sources and regression
 assertions are recorded in the feature sections above.
 
 Verification used the private release target, `RUST_TEST_THREADS=2`, muted
-audio and an isolated preferences directory. `cargo test --release --workspace
--j 2` passed **1973 tests across 40 suites, with 62 ignored**. Strict
+audio and an isolated preferences directory. After rebasing, `cargo test
+--release --workspace -j 2` passed **2035 tests across 40 suites, with 63
+ignored**. Subsequent mechanical removal of obsolete low-ID item metadata
+and migration of test-only diagnostics to the canonical ACG cache passed all
+**62** affected `play::hud_stats::` tests (`cargo test --release -p aomac
+--bin aomac -j 2 play::hud_stats::`). Strict
 `cargo clippy --release --workspace --all-targets -j 2 -- -D warnings` passed.
 The inspected fixture PNGs were deleted; no desktop capture or real window
 was used.

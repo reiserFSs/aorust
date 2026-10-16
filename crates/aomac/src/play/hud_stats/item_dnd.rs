@@ -4,7 +4,6 @@
 //! `N3Msg_MoveItemToInventory` [GC 0x10027a30], `N3Msg_UseItem` [GC 0x100286f8]. Nothing changes locally: the server answers a move with a
 //! `ContainerAddItemIIR_t` ([`ao_net::n3::inventory`]) that updates `Zone::inventory`.
 
-use super::items::Info;
 use ao_gui::WindowId;
 use ao_net::msg::Identity;
 use ao_net::n3::inventory::Page;
@@ -42,11 +41,6 @@ pub fn tab_page(tab: usize) -> Option<(Page, i32)> {
 /// Structural portion of `N3Msg_IsItemPossibleToWear`; `Items::can_equip`
 /// additionally checks ACG-resolved wearer requirements and implant access.
 /// Owned-item class matching is explicit in GC `1004959a`.
-#[cfg(test)]
-pub fn can_wear(info: &Info, tab: usize, id: u32, deck: i32) -> bool {
-    can_wear_stats(&info.stats, tab, id, deck)
-}
-
 pub(super) fn can_wear_stats(stats: &[(u32, i32)], tab: usize, id: u32, deck: i32) -> bool {
     let stat = |id| stats.iter().find(|s| s.0 == id).map(|s| s.1);
     let Some(class) = stat(STAT_ITEM_CLASS) else { return false };
@@ -73,11 +67,6 @@ pub(super) fn can_wear_stats(stats: &[(u32, i32)], tab: usize, id: u32, deck: i3
 
 /// Where a double click wears a bag item (`N3Msg_UseItem`): `Can & 8 == 0`, class 1 -> weapon page, 2 -> armor page (`+0x10`), 3 / 5 -> implants
 /// (`+0x20`), slot id = `DefaultPos`; returns (tab, slot id).
-#[cfg(test)]
-pub fn default_wear(info: &Info) -> Option<(usize, u32)> {
-    default_wear_stats(&info.stats)
-}
-
 pub(super) fn default_wear_stats(stats: &[(u32, i32)]) -> Option<(usize, u32)> {
     let stat = |id| stats.iter().find(|s| s.0 == id).map(|s| s.1);
     if stat(STAT_CAN).unwrap_or(0) & 8 != 0 {
@@ -133,11 +122,6 @@ pub const STAT_EQUIP_DELAY: u32 = 211;
 /// all (weapon/armor/implant page, `0..0x30`, either as the destination (wearing) or the item's own current slot (unwearing); the social
 /// page and bag-to-bag moves are never timed), and if so `FUN_1004aed0`'s summed duration in seconds (the moved item's own `EquipDelay`,
 /// plus the occupant's when wearing over one).
-#[cfg(test)]
-pub fn wear_delay(moved: &Info, item_slot: i32, slot: i32, occupant: Option<&Info>) -> Option<f32> {
-    wear_delay_values(moved.stat(STAT_EQUIP_DELAY).unwrap_or(0), item_slot, slot, occupant.and_then(|o| o.stat(STAT_EQUIP_DELAY)).unwrap_or(0))
-}
-
 pub(super) fn wear_delay_values(moved: i32, item_slot: i32, slot: i32, occupant: i32) -> Option<f32> {
     let worn_page = |s: i32| (0..0x30).contains(&s);
     if !worn_page(slot) && !worn_page(item_slot) {
@@ -216,32 +200,29 @@ pub const DOUBLE_CLICK: f32 = 0.4;
 mod tests {
     use super::*;
 
-    fn info(stats: &[(u32, i32)]) -> Info {
-        Info { name: String::new(), icon: None, stats: stats.to_vec() }
-    }
 
     #[test]
     fn wearing_follows_class_and_placement() {
-        let helmet = info(&[(STAT_ITEM_CLASS, 2), (STAT_PLACEMENT, 1 << 2), (STAT_DEFAULT_POS, 2)]);
-        assert!(can_wear(&helmet, 1, 2, 0));
-        assert!(!can_wear(&helmet, 1, 3, 0), "wrong slot");
-        assert!(!can_wear(&helmet, 0, 2, 0), "armor on the weapon tab");
-        assert!(can_wear(&helmet, 3, 2, 0), "social mirrors the clothes slots");
-        let social_weapon = info(&[(STAT_ITEM_CLASS, 1), (STAT_PLACEMENT, 0x140)]);
-        assert!(can_wear(&social_weapon, 3, 13, 0));
-        assert!(can_wear(&social_weapon, 3, 15, 0));
-        assert!(!can_wear(&social_weapon, 3, 6, 0), "social weapon maps hands to fingers");
-        let implant = info(&[(STAT_ITEM_CLASS, 3), (STAT_PLACEMENT, 1 << 2)]);
-        assert!(!can_wear(&implant, 3, 2, 0), "social accepts only weapons and clothing");
-        assert_eq!(default_wear(&helmet), Some((1, 2)));
-        let deck_weapon = info(&[(STAT_ITEM_CLASS, 1), (STAT_PLACEMENT, 1 << 10)]);
-        assert!(!can_wear(&deck_weapon, 0, 10, 0));
-        assert!(can_wear(&deck_weapon, 0, 10, 2));
-        assert!(!can_wear(&info(&[(STAT_ITEM_CLASS, 4), (STAT_PLACEMENT, 0xffff)]), 1, 1, 9), "class 4 never wears");
-        assert!(!can_wear(&info(&[]), 1, 1, 9));
+        let helmet = [(STAT_ITEM_CLASS, 2), (STAT_PLACEMENT, 1 << 2), (STAT_DEFAULT_POS, 2)];
+        assert!(can_wear_stats(&helmet, 1, 2, 0));
+        assert!(!can_wear_stats(&helmet, 1, 3, 0), "wrong slot");
+        assert!(!can_wear_stats(&helmet, 0, 2, 0), "armor on the weapon tab");
+        assert!(can_wear_stats(&helmet, 3, 2, 0), "social mirrors the clothes slots");
+        let social_weapon = [(STAT_ITEM_CLASS, 1), (STAT_PLACEMENT, 0x140)];
+        assert!(can_wear_stats(&social_weapon, 3, 13, 0));
+        assert!(can_wear_stats(&social_weapon, 3, 15, 0));
+        assert!(!can_wear_stats(&social_weapon, 3, 6, 0), "social weapon maps hands to fingers");
+        let implant = [(STAT_ITEM_CLASS, 3), (STAT_PLACEMENT, 1 << 2)];
+        assert!(!can_wear_stats(&implant, 3, 2, 0), "social accepts only weapons and clothing");
+        assert_eq!(default_wear_stats(&helmet), Some((1, 2)));
+        let deck_weapon = [(STAT_ITEM_CLASS, 1), (STAT_PLACEMENT, 1 << 10)];
+        assert!(!can_wear_stats(&deck_weapon, 0, 10, 0));
+        assert!(can_wear_stats(&deck_weapon, 0, 10, 2));
+        assert!(!can_wear_stats(&[(STAT_ITEM_CLASS, 4), (STAT_PLACEMENT, 0xffff)], 1, 1, 9), "class 4 never wears");
+        assert!(!can_wear_stats(&[], 1, 1, 9));
         // `Can & 8` items are used, not worn
-        assert_eq!(default_wear(&info(&[(STAT_CAN, 8), (STAT_ITEM_CLASS, 2), (STAT_DEFAULT_POS, 2)])), None);
-        assert_eq!(default_wear(&info(&[(STAT_ITEM_CLASS, 5), (STAT_DEFAULT_POS, 4)])), Some((2, 4)));
+        assert_eq!(default_wear_stats(&[(STAT_CAN, 8), (STAT_ITEM_CLASS, 2), (STAT_DEFAULT_POS, 2)]), None);
+        assert_eq!(default_wear_stats(&[(STAT_ITEM_CLASS, 5), (STAT_DEFAULT_POS, 4)]), Some((2, 4)));
     }
 
     #[test]
@@ -271,19 +252,19 @@ mod tests {
     /// (both ends `>= 0x30`) are never timed.
     #[test]
     fn wear_delay_follows_gamecodes_summed_centiseconds() {
-        let belt = info(&[(STAT_EQUIP_DELAY, 2000)]);
-        let old_weapon = info(&[(STAT_EQUIP_DELAY, 500)]);
-        // wearing into an empty armor slot (implants: 0x20..0x2f, NCU belt page): only the moved item's delay
-        assert_eq!(wear_delay(&belt, 0x40, 0x22, None), Some(20.0));
-        // wearing over an occupied weapon slot (0..0xf): both items' delays sum
-        assert_eq!(wear_delay(&old_weapon, 0x40, 3, Some(&belt)), Some(25.0));
-        // unwearing (source < 0x30, dest the "any free bag slot" >= 0x30): only the unworn item's delay, no occupant lookup
-        assert_eq!(wear_delay(&belt, 0x22, 0x6f, Some(&old_weapon)), Some(20.0));
-        // social page (0x30..0x3f) and plain bag-to-bag moves: never timed
-        assert_eq!(wear_delay(&belt, 0x40, 0x31, None), None);
-        assert_eq!(wear_delay(&belt, 0x40, 0x41, None), None);
-        // no EquipDelay stat at all: no timer
-        assert_eq!(wear_delay(&info(&[]), 0x40, 3, None), None);
+        let belt = 2000;
+        let old_weapon = 500;
+        // Wearing into an empty implant slot times only the moved item.
+        assert_eq!(wear_delay_values(belt, 0x40, 0x22, 0), Some(20.0));
+        // Wearing over an occupied weapon slot sums both items.
+        assert_eq!(wear_delay_values(old_weapon, 0x40, 3, belt), Some(25.0));
+        // Unwearing times only the source, regardless of another item's delay.
+        assert_eq!(wear_delay_values(belt, 0x22, 0x6f, old_weapon), Some(20.0));
+        // Social and bag-to-bag moves are never timed.
+        assert_eq!(wear_delay_values(belt, 0x40, 0x31, 0), None);
+        assert_eq!(wear_delay_values(belt, 0x40, 0x41, 0), None);
+        // Missing EquipDelay resolves to zero and starts no timer.
+        assert_eq!(wear_delay_values(0, 0x40, 3, 0), None);
     }
 
     #[test]

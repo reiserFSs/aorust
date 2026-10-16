@@ -25,15 +25,8 @@ pub const SLOT: f32 = 54.0;
 pub struct Info {
     pub name: String,
     pub icon: Option<(GfxId, u32, u32)>,
-    /// The template's stats (rdb 1000020): `Can` (30), `ItemClass` (76), `DefaultPos` (88), `Placement` (298) decide how an item may be worn.
-    pub stats: Vec<(u32, i32)>,
 }
 
-impl Info {
-    pub fn stat(&self, id: u32) -> Option<i32> {
-        self.stats.iter().find(|s| s.0 == id).map(|s| s.1)
-    }
-}
 
 /// A shop item's name, count, Value and icon.
 pub type ShopInfo = (String, i32, i32, Option<GfxId>);
@@ -173,7 +166,7 @@ impl Items {
             let info = self.store.as_ref().and_then(|s| {
                 let t = item_template(s, u32::try_from(low_id).ok()?).ok()??;
                 let icon = t.stat(STAT_ICON).filter(|&i| i > 0).and_then(|i| icon_image(gui, s, i as u32));
-                Some(Info { name: t.name.clone().unwrap_or_default(), icon, stats: t.stats.clone() })
+                Some(Info { name: t.name.unwrap_or_default(), icon })
             });
             self.cache.insert(low_id, info);
         }
@@ -205,10 +198,6 @@ impl Items {
         self.shop_cache[&key].clone()
     }
 
-    /// The record of an item that [`Items::info`] already loaded.
-    pub fn cached(&self, low_id: i32) -> Option<&Info> {
-        self.cache.get(&low_id)?.as_ref()
-    }
 
     #[cfg(test)]
     pub(super) fn insert_test_info(&mut self, id: i32, info: Info) {
@@ -266,7 +255,7 @@ mod tests {
         let low = AcgItem { low_id: 1, high_id: 2, level: 1 };
         let quality = AcgItem { level: 2, ..low };
         let endpoint = AcgItem { high_id: 3, ..low };
-        items.insert_test_info(1, Info { name: String::new(), icon: None, stats: vec![(30, 0)] });
+        items.insert_test_info(1, Info { name: String::new(), icon: None });
         items.insert_test_acg(low, &[(30, 0x200), (0, 0)]);
         items.insert_test_acg(quality, &[(30, 0x1000200), (0, 0x4000000)]);
         items.insert_test_acg(endpoint, &[(30, 8)]);

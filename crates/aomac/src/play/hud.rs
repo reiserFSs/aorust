@@ -671,8 +671,8 @@ impl Hud {
     }
 
     #[cfg(test)]
-    pub(super) fn live_item_line(&mut self, gui: &mut Gui, low_id: i32) -> String {
-        self.stats.live_item_line(gui, low_id)
+    pub(super) fn live_item_line(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> String {
+        self.stats.live_item_line(gui, item)
     }
 
     #[cfg(test)]

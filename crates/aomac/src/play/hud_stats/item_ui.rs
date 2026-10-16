@@ -670,7 +670,7 @@ mod stack_tests {
         let mut gui = Gui::new(&dir, None).unwrap();
         let mut hud = HudStats::new(&dir, (800, 600)).unwrap();
         let mut zone = Zone::new(7);
-        hud.items.insert_test_info(1, items::Info { name: "Stack".into(), icon: None, stats: vec![(dnd::STAT_CAN, 0x200)] });
+        hud.items.insert_test_info(1, items::Info { name: "Stack".into(), icon: None });
         zone.inventory.insert(0x40, InventoryEntry { slot: 0x40, a: 1, b: 10, id: inv::item_identity(0x40), item: AcgItem { low_id: 1, high_id: 1, level: 5 } });
         hud.items.insert_test_acg(zone.inventory[&0x40].item, &[(dnd::STAT_CAN, 0x200)]);
         hud.open_inventory(&mut gui).unwrap();

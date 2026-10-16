@@ -348,18 +348,19 @@ impl HudStats {
         self.items.info(gui, low_id).map(|i| (i.name.clone(), i.icon))
     }
 
-    /// Live harness: name and the stats that decide wearing / weapons of item template `low_id` (`Can` 30, `ItemClass` 76, `DefaultPos` 88, `Placement` 298,
-    /// `AnimSet` 353, `DamageType` 436, `ItemDelay` 294).
+    /// Live harness: name and resolved stats that decide wearing / weapons of
+    /// the actual inventory ACG (both endpoints and quality level).
     #[cfg(test)]
-    pub(in crate::play) fn live_item_line(&mut self, gui: &mut Gui, low_id: i32) -> String {
-        match self.items.info(gui, low_id) {
-            Some(i) => {
-                let st = [("Can", 30), ("ItemClass", 76), ("DefaultPos", 88), ("Placement", 298), ("AnimSet", 353), ("DamageType", 436), ("Delay", 294)];
-                let v: Vec<String> = st.iter().map(|(n, id)| format!("{n}={:?}", i.stat(*id as u32))).collect();
-                format!("{low_id}: {:?} {}", i.name, v.join(" "))
-            }
-            None => format!("{low_id}: no template"),
-        }
+    pub(in crate::play) fn live_item_line(&mut self, gui: &mut Gui, item: ao_net::n3::world::AcgItem) -> String {
+        let Some(name) = self.items.info(gui, item.low_id).map(|i| i.name.clone()) else {
+            return format!("{}: no template", item.low_id);
+        };
+        let st = [("Can", 30), ("ItemClass", 76), ("DefaultPos", 88), ("Placement", 298), ("AnimSet", 353), ("DamageType", 436), ("Delay", 294)];
+        let v: Vec<String> = st.iter().map(|(n, id)| match self.items.acg_stat(item, *id) {
+            Ok(value) => format!("{n}={value:?}"),
+            Err(error) => format!("{n}=error({error:#})"),
+        }).collect();
+        format!("{}: {:?} {}", item.low_id, name, v.join(" "))
     }
 
     /// Name, count and Value resolved from both ACG endpoints at the actual quality level.
