@@ -28,9 +28,86 @@ impl NativeGround {
         else { GroundPath::Simple }
     }
 }
+/// CPU recipe only; geometry/actor buffers do not change on a ground-family refresh.
+pub(super) struct Composite {
+    pub(super) key: ao_scene::TextureKey,
+    source: ao_scene::TextureSource,
+    cells: usize,
+    tiles: Vec<Option<(ao_scene::TextureKey, u16)>>,
+}
+
+pub(super) fn composites(scene: &ao_scene::Scene) -> Vec<Composite> {
+    use ao_scene::TextureSource;
+    scene.ground_detail.iter().filter_map(|patch| {
+        let mesh = scene.meshes.get(patch.mesh)?;
+        let key = mesh.submeshes.get(patch.coarse_submesh)?.texture?;
+        let source = scene.textures.get(&key)?.source;
+        if !matches!(source, TextureSource::GroundComposite565 | TextureSource::GroundComposite1555) { return None; }
+        let tiles = patch.fine_cells.iter().map(|cell| {
+            let key = mesh.submeshes.get(cell.submesh)?.texture?;
+            let uv = mesh.vertices.get(cell.vertices[0] as usize)?.uv;
+            let orientation = match (uv[0] >= 0.5, uv[1] >= 0.5) {
+                (false, true) => 0, (true, true) => 1, (true, false) => 2, (false, false) => 3,
+            };
+            Some((key, orientation))
+        }).collect();
+        Some(Composite { key, source, cells: patch.cells, tiles })
+    }).collect()
+}
+
+pub(super) fn composite_images(recipes: &[Composite], textures: &std::collections::HashMap<ao_scene::TextureKey, ao_scene::Texture>, mips: &std::collections::HashMap<ao_scene::TextureKey, &[[u8; 4]]>) -> std::collections::HashMap<ao_scene::TextureKey, ao_scene::Texture> {
+    use ao_scene::{ground_texture, Texture};
+    let mut images = std::collections::HashMap::new();
+    for recipe in recipes {
+        let source = textures.get(&recipe.key).map_or(recipe.source, |texture| texture.source);
+        let side = recipe.cells * 8;
+        let mut rgba = vec![255; side * side * 4];
+        for (cell, tile) in recipe.tiles.iter().enumerate() {
+            let Some((key, orientation)) = tile else { continue; };
+            let Some(mip) = mips.get(key).or_else(|| mips.iter().find(|(k, _)| k.id == key.id && matches!(k.rdb_type, 1_010_006 | 1_010_021 | 1_010_022)).map(|(_, mip)| mip)) else { continue; };
+            for y in 0..8 { for x in 0..8 {
+                let dst = (((cell / recipe.cells * 8 + y) * side) + cell % recipe.cells * 8 + x) * 4;
+                rgba[dst..dst + 4].copy_from_slice(&mip[ground_texture::oriented_pixel(*orientation, x, y)]);
+            }}
+        }
+        images.insert(recipe.key, Texture { source, width: side as u32, height: side as u32, rgba });
+    }
+    images
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ground_composites_reuse_policy_mips_across_orientations_and_family_refresh() {
+        use ao_scene::{TextureKey, TextureSource};
+        use crate::native_texture::{Policy, build_texture_mips};
+        let tile = TextureKey { rdb_type: 1_010_006, id: 17 };
+        let refreshed = TextureKey { rdb_type: 1_010_022, ..tile };
+        let key = TextureKey { rdb_type: 0, id: 4 };
+        let recipes = [Composite { key, source: TextureSource::GroundComposite1555, cells: 2,
+            tiles: (0..4).map(|orientation| Some((tile, orientation))).collect() }];
+        let rgba: Vec<u8> = (0..32 * 32).flat_map(|_| [128, 128, 128, 255]).collect();
+        for (quality, expected) in [(0, 140), (2, 123)] {
+            let policy = Policy { quality, compressed: true, better: false };
+            let built = build_texture_mips(policy, TextureSource::GroundRgba, true, &rgba, 32, 32, false);
+            let mips = [(refreshed, built.ground_tile_mip().unwrap())].into_iter().collect();
+            let images = composite_images(&recipes, &Default::default(), &mips);
+            let image = &images[&key];
+            let coarse = build_texture_mips(policy, image.source, true, &image.rgba, image.width, image.height, false);
+            assert_eq!(coarse.mips, 1);
+            assert!(coarse.levels[0].bytes.as_chunks::<4>().0.iter().all(|pixel| *pixel == [expected, expected, expected, 255]));
+        }
+        let pixels: Vec<[u8; 4]> = (0..64).map(|i| [i, i, i, 255]).collect();
+        let mips = [(tile, pixels.as_slice())].into_iter().collect();
+        let image = &composite_images(&recipes, &Default::default(), &mips)[&key];
+        for orientation in 0..4 { for y in 0..8 { for x in 0..8 {
+            let dst = (((orientation / 2 * 8 + y) * 16) + orientation % 2 * 8 + x) * 4;
+            assert_eq!(image.rgba[dst], ao_scene::ground_texture::oriented_pixel(orientation as u16, x, y) as u8);
+        }}}
+        assert_eq!(image.source, TextureSource::GroundComposite1555);
+    }
+
     #[test]
     fn native_mode_histories() {
         for initial in 0..=3 {

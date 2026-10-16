@@ -8,10 +8,10 @@ pub struct Policy {
     pub quality: i32,
     pub compressed: bool,
     /// aomac Enhanced option "Better Mip Filtering" (not retail, default off): gamma-correct downsampling plus
-    /// coverage-preserving alpha scaling for alpha-tested textures ([`build_texture_mips`]). Retail's native mip
-    /// builder (randy31 `FUN_100193e4`) box-filters sRGB-encoded bytes directly, which darkens high-contrast
-    /// edges and thins out alpha-tested foliage at a distance; this is purely a load-time CPU change, the same
-    /// GPU texture format and byte layout either way.
+    /// coverage-preserving alpha scaling for alpha-tested textures ([`build_texture_mips`]).
+    /// Native ground uses bundled D3DX filter2 on encoded bytes; ordinary resources
+    /// retain the earlier box-mip approximation. This option changes load-time filtering,
+    /// not the GPU texture format or byte layout.
     pub better: bool,
 }
 
@@ -24,8 +24,8 @@ pub enum Encoding { Rgba8, Rgb565, Rgba4444, Bc1, Bc2 }
 
 impl Policy {
     pub fn encoding(self, source: TextureSource, bc_supported: bool, width: u32, height: u32) -> Encoding {
-        let alpha = matches!(source, TextureSource::Rgba | TextureSource::PngRgba);
-        if source == TextureSource::Generated { return Encoding::Rgba8; }
+        let alpha = matches!(source, TextureSource::Rgba | TextureSource::PngRgba | TextureSource::GroundRgba);
+        if matches!(source, TextureSource::Generated | TextureSource::GroundComposite565 | TextureSource::GroundComposite1555) { return Encoding::Rgba8; }
         // Native .png temporarily disables compression. DXT allocation requires
         // a full block at the base level; unsupported layouts use native RGB(A).
         if self.compressed && bc_supported && matches!(source, TextureSource::Rgb | TextureSource::Rgba) && width.is_multiple_of(4) && height.is_multiple_of(4) {
@@ -115,6 +115,14 @@ pub struct BuiltTexture<'a> {
     pub levels: Vec<BuiltLevel<'a>>,
 }
 
+impl BuiltTexture<'_> {
+    pub fn ground_tile_mip(&self) -> Option<&[[u8; 4]]> {
+        if self.encoding.block_edge() != 1 { return None; }
+        self.levels.iter().find(|level| level.cw == 8 && level.ch == 8)
+            .map(|level| level.bytes.as_chunks::<4>().0)
+    }
+}
+
 /// Coverage-preserving alpha test threshold: `shade`/`fs_test`/`fs_sky_test` in shader.wgsl discard below `0.5`.
 const ALPHA_TEST_THRESHOLD: u8 = 128;
 
@@ -147,8 +155,32 @@ fn preserve_alpha_coverage(alpha: &mut [u8], target: f32) {
     }
 }
 
-/// CPU-side box-filter mip chain (sRGB-space average; fine for diffuse art) plus BC/packed-format
-/// encoding, factored out of `Renderer::texture_view` as a pure function (no GPU access) so a batch
+/// Ground's bundled D3DX path: packed conversion between recursive filter-2
+/// levels; patch composites instead have a fixed packed format and one level.
+fn build_ground_mips(policy: Policy, source: TextureSource, rgba: &[u8], w: u32, h: u32) -> BuiltTexture<'_> {
+    use ao_scene::ground_texture::{Format, downsample};
+    let composite = matches!(source, TextureSource::GroundComposite565 | TextureSource::GroundComposite1555);
+    let format = match source {
+        TextureSource::GroundComposite565 => Format::Rgb565,
+        TextureSource::GroundComposite1555 => Format::Rgba1555,
+        _ => Format::tile(source, policy.quality),
+    };
+    let mut data: Vec<_> = rgba.as_chunks::<4>().0.iter().flat_map(|&p| format.pixel(p)).collect();
+    let mips = if composite { 1 } else { 32 - w.max(h).leading_zeros() };
+    let mut levels = Vec::with_capacity(mips as usize);
+    let (mut cw, mut ch) = (w, h);
+    for level in 0..mips {
+        let next = (level + 1 < mips).then(|| downsample(&data, cw, ch, format));
+        levels.push(BuiltLevel { cw, ch, bytes: std::borrow::Cow::Owned(data) });
+        let Some(next) = next else { break; };
+        data = next; cw = (cw / 2).max(1); ch = (ch / 2).max(1);
+    }
+    BuiltTexture { w, h, mips, encoding: Encoding::Rgba8, levels }
+}
+
+/// CPU-side mip construction plus BC/packed-format encoding. Ground follows the
+/// recovered native policy; ordinary resources retain the earlier box approximation.
+/// Factored out of `Renderer::texture_view` as a pure function (no GPU access) so a batch
 /// of textures can be built across threads; the caller still issues the actual `queue.write_texture`
 /// calls serially afterward (audit item 10). Base-level bytes are borrowed from `rgba` when the
 /// upload format is raw RGBA8 (no copy); every other buffer is produced once by the box filter or the
@@ -157,8 +189,12 @@ fn preserve_alpha_coverage(alpha: &mut [u8], target: f32) {
 /// `policy.better` (aomac Enhanced option, not retail, default off) downsamples the RGB channels in linear
 /// light instead of averaging sRGB bytes directly, and, when `alpha_test` is set (the texture is used by at
 /// least one `Blend::AlphaTest` submesh), rescales every mip's alpha channel to keep the base level's
-/// alpha-test coverage ([`preserve_alpha_coverage`]). Off: byte-identical to the original box filter.
+/// alpha-test coverage ([`preserve_alpha_coverage`]).
 pub fn build_texture_mips<'a>(policy: Policy, source: TextureSource, bc_supported: bool, rgba: &'a [u8], w: u32, h: u32, alpha_test: bool) -> BuiltTexture<'a> {
+    if matches!(source, TextureSource::GroundComposite565 | TextureSource::GroundComposite1555)
+        || (!policy.better && matches!(source, TextureSource::GroundRgb | TextureSource::GroundRgba)) {
+        return build_ground_mips(policy, source, rgba, w, h);
+    }
     let encoding = policy.encoding(source, bc_supported, w, h);
     let mips = 32 - w.max(h).leading_zeros();
     let (mut cw, mut ch) = (w, h);
@@ -219,6 +255,18 @@ pub fn build_texture_mips<'a>(policy: Policy, source: TextureSource, bc_supporte
 mod tests {
     use super::*;
     #[test]
+    fn native_ground_upload_uses_recursive_packed_mips_and_single_level_composites() {
+        let rgba = vec![255; 32 * 32 * 4];
+        let policy = Policy { quality: 0, compressed: true, better: false };
+        let fine = build_texture_mips(policy, TextureSource::GroundRgba, true, &rgba, 32, 32, false);
+        assert_eq!(fine.ground_tile_mip().unwrap(), &[[255; 4]; 64]);
+        let coarse = build_texture_mips(policy, TextureSource::GroundComposite1555, true, &rgba, 32, 32, false);
+        assert_eq!(coarse.mips, 1);
+        assert_eq!(coarse.levels.len(), 1);
+        assert_eq!(coarse.encoding.format(), wgpu::TextureFormat::Rgba8Unorm);
+    }
+
+    #[test]
     fn native_format_selection_and_upload_bytes() {
         let low = Policy { quality: 0, compressed: true, better: false };
         assert_eq!(low.encoding(TextureSource::Rgb, true, 4, 4), Encoding::Bc1);
@@ -227,6 +275,8 @@ mod tests {
         assert_eq!(low.encoding(TextureSource::PngRgba, true, 4, 4), Encoding::Rgba4444);
         assert_eq!(low.encoding(TextureSource::Generated, true, 4, 4), Encoding::Rgba8);
         assert_eq!(low.encoding(TextureSource::Rgb, false, 4, 4), Encoding::Rgb565);
+        assert_eq!(low.encoding(TextureSource::GroundRgb, true, 4, 4), Encoding::Rgb565, "ground disables BC even for JPEG");
+        assert_eq!(low.encoding(TextureSource::GroundRgba, true, 4, 4), Encoding::Rgba4444);
         let mut encoded = Vec::new();
         Encoding::Rgb565.encode(&[123, 127, 251, 17], 1, 1, &mut encoded);
         assert_eq!(encoded, [123, 125, 255, 255]);

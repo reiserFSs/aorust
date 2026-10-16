@@ -6,6 +6,7 @@
 pub mod aurora;
 pub mod cloud;
 pub mod ground_detail;
+pub mod ground_texture;
 pub mod liquid;
 pub mod mover;
 mod native_rand;
@@ -25,6 +26,12 @@ pub enum TextureSource {
     Rgba,
     PngRgb,
     PngRgba,
+    /// RDBGroundTexture disables compression even for JPEG (DS 1007690b).
+    GroundRgb,
+    GroundRgba,
+    /// Native patch composites are packed and have one level (DS 100374c5).
+    GroundComposite565,
+    GroundComposite1555,
 }
 
 /// Decoded texture, tightly packed RGBA8 (sRGB), row-major, top row first.

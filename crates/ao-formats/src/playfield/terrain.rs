@@ -24,7 +24,12 @@ fn texture_key(store: &RecordStore, scene: &mut Scene, id: u16, texture_type: u3
     if let std::collections::hash_map::Entry::Vacant(e) = scene.textures.entry(key) {
         let b = store.get(texture_type, id as u32).ok()??;
         // 24 zero bytes, then a JPEG (417 tiles) or an RGBA PNG (432 Shadowlands tiles, alpha always 255)
-        e.insert(crate::texture::decode_texture(b.get(24..)?).ok()?);
+        let mut texture = crate::texture::decode_texture(b.get(24..)?).ok()?;
+        texture.source = match texture.source {
+            ao_scene::TextureSource::Rgba | ao_scene::TextureSource::PngRgba => ao_scene::TextureSource::GroundRgba,
+            _ => ao_scene::TextureSource::GroundRgb,
+        };
+        e.insert(texture);
     }
     Some(key)
 }
@@ -44,44 +49,34 @@ fn patch_cells(tm: &Tilemap) -> usize {
     1usize << (tm.verts_x - 1).trailing_zeros().min((tm.verts_z - 1).trailing_zeros()).min(6)
 }
 
-/// Native HiTexture locks the 8×8 tile mip, then copies oriented pixels
-/// (DisplaySystem 1003598a, 10037bd7..10037bf0, 100374c5).
-/// Unresolved guess: gamma-space box reduction matches the mip footprint, but
-/// the native driver's mip-generation rounding has not been recovered at 1003598a.
+/// Native tile mip arithmetic is shared with the renderer's resource policy.
 fn tile_mip(texture: &ao_scene::Texture) -> [[u8; 4]; 64] {
-    std::array::from_fn(|i| {
-        let (x, y) = (i % 8, i / 8);
-        let (x0, x1) = (x * texture.width as usize / 8, ((x + 1) * texture.width as usize / 8).max(x * texture.width as usize / 8 + 1));
-        let (y0, y1) = (y * texture.height as usize / 8, ((y + 1) * texture.height as usize / 8).max(y * texture.height as usize / 8 + 1));
-        let mut sum = [0u32; 4];
-        for sy in y0..y1 { for sx in x0..x1 {
-            let p = (sy.min(texture.height as usize - 1) * texture.width as usize + sx.min(texture.width as usize - 1)) * 4;
-            for (c, s) in sum.iter_mut().enumerate() { *s += texture.rgba[p + c] as u32; }
-        }}
-        sum.map(|v| (v / ((x1 - x0) * (y1 - y0)) as u32) as u8)
-    })
+    ao_scene::ground_texture::tile_mip(texture, 2)
 }
 
 fn composite_tile_pixel(raw: u16, x: usize, y: usize) -> usize {
-    match raw >> 14 {
-        0 => (7 - y) * 8 + x,
-        1 => (7 - x) * 8 + 7 - y,
-        2 => y * 8 + 7 - x,
-        _ => x * 8 + y,
-    }
+    ao_scene::ground_texture::oriented_pixel(raw >> 14, x, y)
 }
 
 
-fn composite_patch(tm: &Tilemap, px: usize, pz: usize, cells: usize, mips: &BTreeMap<u16, [[u8; 4]; 64]>) -> ao_scene::Texture {
+fn composite_source(tm: &Tilemap, scene: &Scene) -> ao_scene::TextureSource {
+    // DS 100374c5 initializes its pixel format by loading tile index zero.
+    let alpha = tm.tile_texture.first().is_some_and(|&id| scene.textures.iter().any(|(key, t)|
+        key.id == id as u32 && matches!(t.source, ao_scene::TextureSource::GroundRgba)));
+    if alpha { ao_scene::TextureSource::GroundComposite1555 } else { ao_scene::TextureSource::GroundComposite565 }
+}
+
+fn composite_patch(tm: &Tilemap, px: usize, pz: usize, cells: usize, mips: &BTreeMap<u16, [[u8; 4]; 64]>, source: ao_scene::TextureSource) -> ao_scene::Texture {
     let side = cells * 8;
-    let mut texture = ao_scene::Texture { source: Default::default(), width: side as u32, height: side as u32, rgba: vec![255; side * side * 4] };
+    let mut texture = ao_scene::Texture { source, width: side as u32, height: side as u32, rgba: vec![255; side * side * 4] };
+    let format = if source == ao_scene::TextureSource::GroundComposite1555 { ao_scene::ground_texture::Format::Rgba1555 } else { ao_scene::ground_texture::Format::Rgb565 };
     for z in pz..pz + cells { for x in px..px + cells {
         let raw = tm.tiles[z * (tm.verts_x - 1) + x];
         let Some(id) = tm.tile_texture.get(tm.tile(x, z) as usize) else { continue };
         let Some(mip) = mips.get(id) else { continue };
         for y in 0..8 { for u in 0..8 {
             let dst = (((z - pz) * 8 + y) * side + (x - px) * 8 + u) * 4;
-            texture.rgba[dst..dst + 4].copy_from_slice(&mip[composite_tile_pixel(raw, u, y)]);
+            texture.rgba[dst..dst + 4].copy_from_slice(&format.pixel(mip[composite_tile_pixel(raw, u, y)]));
         }}
     }}
     texture
@@ -98,8 +93,9 @@ pub fn refresh_textures(store: &RecordStore, tm: &Tilemap, patches: &[(usize, [i
             mips.insert(id, tile_mip(&scene.textures[&key]));
         }
     }
+    let source = composite_source(tm, &scene);
     for &(mesh, [x, z], cells) in patches {
-        scene.textures.insert(TextureKey { rdb_type: 0, id: mesh as u32 }, composite_patch(tm, x as usize, z as usize, cells, &mips));
+        scene.textures.insert(TextureKey { rdb_type: 0, id: mesh as u32 }, composite_patch(tm, x as usize, z as usize, cells, &mips, source));
     }
     scene.textures
 }
@@ -120,7 +116,9 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, shad
     }
     // Cells whose tile texture does not exist stay untextured.
     tex.iter_mut().filter(|t| missing.contains(t)).for_each(|t| *t = NONE);
+    if let Some(&first) = tm.tile_texture.first() { texture_key(store, scene, first, 1_010_006); }
     let mips: BTreeMap<_, _> = keys.iter().map(|(&id, key)| (id, tile_mip(&scene.textures[key]))).collect();
+    let composite_source = composite_source(tm, scene);
     let shade = store.get(SHADOWS, id).ok().flatten().and_then(|d| shadow::parse(&d).ok()).map(|l| shadow::at_time(&l, shadow_time));
     let shadow_uv_scale = shade.as_ref().map_or([0.0; 2], |s| [0.5 / (cs * s.w as f32), 1.0 / (cs * s.h as f32)]);
     let shadow_texture = shade.as_ref().map(|s| {
@@ -161,7 +159,7 @@ pub fn build(store: &RecordStore, id: u32, tm: &Tilemap, scene: &mut Scene, shad
             let mut mesh = Mesh { vertices: Vec::with_capacity(patch * patch * 4 + (patch + 1) * (patch + 1)), ..Default::default() };
             let mut base: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
             let mut fine_cells = Vec::with_capacity(patch * patch);
-            let composite = composite_patch(tm, px, pz, patch, &mips);
+            let composite = composite_patch(tm, px, pz, patch, &mips, composite_source);
             for z in pz..ez {
                 for x in px..ex {
                     let t = tex[z * cx + x];

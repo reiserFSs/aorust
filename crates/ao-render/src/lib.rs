@@ -411,6 +411,7 @@ struct GroundRun {
     materials: Vec<Option<wgpu::BindGroup>>,
     has_shadow: Vec<bool>,
     texture_materials: Vec<(usize, TextureKey, [f32; 28])>,
+    composites: Vec<native_ground::Composite>,
 }
 
 /// Sky backdrop with its own mesh/material tables, so [`Renderer::set_sky`] can swap it while the world stays.
@@ -1092,6 +1093,8 @@ impl Renderer {
         self.ground_state.recreate();
         let bc_supported = self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         let policy = self.texture_policy;
+        let composites = native_ground::composites(scene);
+        let composite_keys: std::collections::HashSet<_> = composites.iter().map(|recipe| recipe.key).collect();
         // aomac Enhanced "Better Mip Filtering" coverage preservation only applies to textures actually used by a
         // `Blend::AlphaTest` submesh (foliage, fences, hair cards); every other texture keeps the plain box filter.
         let alpha_tested: std::collections::HashSet<TextureKey> = scene.meshes.iter()
@@ -1107,6 +1110,7 @@ impl Renderer {
         let mut jobs: Vec<Job> = vec![Job::Mip { rgba: &DEFAULT_WHITE, w: 1, h: 1, source: ao_scene::TextureSource::Generated, alpha_test: false }];
         let mut view_of: HashMap<TextureKey, usize> = HashMap::new();
         for (k, t) in &scene.textures {
+            if composite_keys.contains(k) { continue; }
             if t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize {
                 view_of.insert(*k, jobs.len());
                 jobs.push(if k.rdb_type == 1_000_007 { Job::Ground(t) } else { Job::Mip { rgba: &t.rgba, w: t.width, h: t.height, source: t.source, alpha_test: alpha_tested.contains(k) } });
@@ -1132,10 +1136,18 @@ impl Renderer {
                 });
             }
         });
-        let views: Vec<wgpu::TextureView> = jobs.iter().zip(built.iter()).map(|(job, b)| match job {
+        let mut views: Vec<wgpu::TextureView> = jobs.iter().zip(built.iter()).map(|(job, b)| match job {
             Job::Ground(t) => self.ground_palette_view(t),
             Job::Mip { .. } => self.upload_built_texture(b.as_ref().expect("built in parallel above")),
         }).collect();
+        // Reuse the already-built actual tile mip bytes, including low-quality
+        // packed conversion, instead of reducing the decoded source a second time.
+        let tile_mips: HashMap<_, _> = view_of.iter().filter_map(|(key, &index)|
+            built[index].as_ref()?.ground_tile_mip().map(|mip| (*key, mip))).collect();
+        for (key, texture) in native_ground::composite_images(&composites, &scene.textures, &tile_mips) {
+            view_of.insert(key, views.len());
+            views.push(self.texture_view(&texture.rgba, texture.width, texture.height, texture.source));
+        }
         // One bind group per distinct (texture, base colour, emissive, glow mask).
         let mut mat_of: HashMap<(usize, bool, [u32; 28]), usize> = HashMap::new();
         let mut mats: Vec<wgpu::BindGroup> = vec![];
@@ -1307,7 +1319,7 @@ impl Renderer {
                     entries: &[0, 1].map(|binding| wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) }),
                 }));
             }
-            GroundRun { detail: ao_scene::ground_detail::GroundDetail::new(scene.ground_detail.clone()), indices, draws, scratch: Vec::with_capacity(capacity), materials, has_shadow, texture_materials: ground_texture_materials.into_iter().map(|(mat,(key,u))| (mat,key,u)).collect() }
+            GroundRun { detail: ao_scene::ground_detail::GroundDetail::new(scene.ground_detail.clone()), indices, draws, scratch: Vec::with_capacity(capacity), materials, has_shadow, texture_materials: ground_texture_materials.into_iter().map(|(mat,(key,u))| (mat,key,u)).collect(), composites }
         });
     }
 
@@ -1557,8 +1569,17 @@ impl Renderer {
     pub fn refresh_ground_textures(&mut self, textures: &HashMap<TextureKey, ao_scene::Texture>) {
         let Some(ground) = &self.ground else { return; };
         let same = |a: &TextureKey, b: &TextureKey| a == b || (a.id == b.id && matches!(a.rdb_type, 1_010_006 | 1_010_021 | 1_010_022) && matches!(b.rdb_type, 1_010_006 | 1_010_021 | 1_010_022));
-        let views: HashMap<_, _> = textures.iter().filter(|(key,_)| ground.texture_materials.iter().any(|(_,k,_)| same(k,key)))
-            .map(|(key,t)| (*key,self.texture_view(&t.rgba,t.width,t.height,t.source))).collect();
+        let composite_keys: std::collections::HashSet<_> = ground.composites.iter().map(|recipe| recipe.key).collect();
+        let bc_supported = self.device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        let built: HashMap<_, _> = textures.iter().filter(|(key, t)| !composite_keys.contains(*key)
+            && t.width > 0 && t.height > 0 && t.rgba.len() == (t.width * t.height * 4) as usize)
+            .map(|(key, t)| (*key, native_texture::build_texture_mips(self.texture_policy, t.source, bc_supported, &t.rgba, t.width, t.height, false))).collect();
+        let tile_mips: HashMap<_, _> = built.iter().filter_map(|(key, texture)| texture.ground_tile_mip().map(|mip| (*key, mip))).collect();
+        let mut views: HashMap<_, _> = built.iter().filter(|(key, _)| ground.texture_materials.iter().any(|(_, k, _)| same(k, key)))
+            .map(|(key, texture)| (*key, self.upload_built_texture(texture))).collect();
+        for (key, texture) in native_ground::composite_images(&ground.composites, textures, &tile_mips) {
+            views.insert(key, self.texture_view(&texture.rgba, texture.width, texture.height, texture.source));
+        }
         for (mat,key,u) in &ground.texture_materials {
             let Some(view) = views.get(key).or_else(|| views.iter().find(|(k,_)| same(k,key)).map(|(_,v)| v)) else { continue; };
             let uniform = self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
@@ -2803,6 +2824,23 @@ mod sky_tests {
             .expect("native filtering regression requires an offscreen GPU adapter");
         assert!(pixel.iter().all(|&c| (c as i16 - 128).abs() <= 1),
             "D3D7 interpolates encoded black/white to 128, not linear-light 188: {pixel:?}");
+    }
+
+    #[test]
+    fn native_ground_composite_samples_packed_gamma_bytes() {
+        let key = TextureKey { rdb_type: 0, id: 73 };
+        let mut model = actor_quad([0.0, 0.0, 1.0], Submesh {
+            emissive: [1.0; 3], texture_clamp: true,
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key))
+        });
+        model.textures.insert(key, Texture {
+            source: ao_scene::TextureSource::GroundComposite565, width: 8, height: 8,
+            rgba: (0..64).flat_map(|_| [123, 127, 251, 255]).collect(),
+        });
+        let pixel = actor_shot(&Scene::default(), model, [0.0, 0.0, -5.0], "native-ground-packed")
+            .expect("native ground pixel regression requires an offscreen GPU adapter");
+        assert!(pixel.into_iter().zip([123i16, 125, 255]).all(|(actual, expected)|
+            (actual as i16 - expected).abs() <= 1), "native RGB565 expansion: {pixel:?}");
     }
 
     #[test]
