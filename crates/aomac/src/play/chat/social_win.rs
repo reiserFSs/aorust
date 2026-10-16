@@ -122,8 +122,8 @@ impl Texts<'_> {
 
 // ------------------------------------------------------------------------------------------------ friends
 
-/// `FriendListView_c` default frame `Rect(0, 0, 169, 215)` (`_DAT_101b9e70` / `_DAT_101b9e74`).
-const FRIENDS_SIZE: (u32, u32) = (169, 215);
+/// `100a9c58`: Rect(0,0,169,215), inclusive extents → 170×216 client pixels.
+const FRIENDS_SIZE: (u32, u32) = (170, 216);
 /// Folder order of the list (`FUN_100a9c58`: chat windows first, then online / offline / recent) and their text keys.
 const FOLDERS: [&str; 4] = ["ChatWindows", "OnlineFriends", "OfflineFriends", "RecentMessages"];
 /// `is_chat_window_list_open`, `is_online_list_open`, `is_offline_list_open`, `is_recent_list_open` (all default true).
@@ -259,6 +259,8 @@ impl SocialWin {
                 let open = FOLDER_KEYS.map(|k| cfg.iter().find(|(n, _)| n == k).is_none_or(|(_, v)| v == "true"));
                 let src = "<root><View view_layout=\"vertical\"><StringListView name=\"list\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" max_size=\"Point(16000,16000)\"/></View></root>";
                 let Ok(win) = gui.open_tabbed_window_xml("Friends", "Friends", src, (0, 0), WindowSize::Fixed(FRIENDS_SIZE.0, FRIENDS_SIZE.1)) else { return };
+                // `ListViewBase_c::CalculatePreferredSize` 10131484: min(0,0), max(16000,16000).
+                gui.set_window_preferred_size_limits(win, true);
                 // `Window::MoveToCenter` (no saved frame): GUESS, the position is not in the binary's defaults
                 let (w, h) = gui.outer_size(win);
                 gui.set_window_pos(win, ((self.screen.0 as i32 - w as i32) / 2, (self.screen.1 as i32 - h as i32) / 2));
@@ -530,7 +532,6 @@ impl SocialWin {
         gui.set_window_help(win, Some("The LFT Window.html")); // `FUN_100f03fb` (string 0x101c109c)
         let (ow, oh) = gui.outer_size(win);
         gui.set_window_pos(win, ((self.screen.0 as i32 - ow as i32) / 2 + 5, (self.screen.1 as i32 - oh as i32) / 2 + 26));
-        restore_frame(gui, win, &cfg, self.screen);
         let professions: Vec<u32> = social::lft_professions().chain([0x10]).collect();
         // `DropdownMenu_c::InsertItem(id, ...)`: every item goes in at its id as index; the resulting order is the id order
         for (i, (id, t)) in LFT_SIDES.iter().enumerate() {
@@ -571,6 +572,9 @@ impl SocialWin {
             let width = get(key).and_then(|v| v.parse::<f32>().ok()).unwrap_or(LFT_COLS[i] as f32);
             gui.multi_add_column(win, "candidates", i as i32, label.as_deref().unwrap_or_default(), width, 0xe);
         }
+        // `100f03fb` installs the populated hierarchy before LoadWndConfig; list height adds the 19px header (1013314d).
+        gui.set_window_preferred_size_limits(win, true);
+        restore_frame(gui, win, &cfg, self.screen);
         gui.set_default_button(win, "Search");
         self.pf_names = ao_formats::screens::pfnr_names(&ao_gui::client_dir()).unwrap_or_default();
         self.lft = Some(LftWin { win, selected: None, escape_closes });
@@ -878,6 +882,34 @@ mod tests {
         evs.iter().flat_map(|e| w.event(gui, e, soc, &lft, tx, &[]).1).collect()
     }
 
+
+    #[test]
+    fn native_10131484_and_1013314d_social_preferred_limits() {
+        let Some((mut gui, db)) = rig() else { return };
+        let tx = Texts(&db);
+        let mut windows = SocialWin::new((1280, 800));
+        windows.set_friends(&mut gui, true, &Social::default(), &tx, &[]);
+        let friends = windows.friends.as_ref().unwrap().win;
+        assert_eq!(gui.window_size(friends), (170, 216)); // Rect(0,0,169,215), 100a9c58
+        assert_eq!(gui.window_preferred_size_limits(friends), Some(((1, 1), (16001, 16001))));
+        gui.set_window_outer_frame(friends, (10, 10, 700, 500));
+        assert_eq!(gui.window_outer_frame(friends).unwrap(), (10, 10, 700, 500));
+        windows.open_lft(&mut gui, &Lft::default(), &tx, false, true);
+        let lft = windows.lft.as_ref().unwrap().win;
+        assert_eq!(gui.multi_columns(lft, "candidates").iter().map(|column| column.1).collect::<Vec<_>>(), LFT_COLS.map(|width| width as f32));
+        let limits = gui.window_preferred_size_limits(lft).unwrap();
+        // The XML rows, not the constructor650×521 frame, supply its lower bound.
+        assert!(limits.0.0 > 80 && limits.0.0 < 640);
+        assert!(limits.0.1 > 19 && limits.0.1 < 490);
+        assert!(limits.1.0 >= 16000 && limits.1.1 >= 16000);
+        gui.set_window_outer_frame(lft, (20, 20, 1, 1));
+        assert_eq!(gui.window_size(lft), limits.0);
+        gui.set_window_outer_frame(lft, (20, 20, 900, 700));
+        let candidates = gui.view_rect(lft, "candidates").unwrap();
+        assert!(candidates.height() > 19.0 && candidates.width() > 600.0);
+        let description = gui.view_rect(lft, "Description").unwrap();
+        assert!((81.0..=501.0).contains(&(description.width() + 1.0))); // LFTView.xml:29 inclusive80..500
+    }
     #[test]
     fn friends_window_lists_folders_and_acts() {
         let Some((mut gui, db)) = rig() else { return };
