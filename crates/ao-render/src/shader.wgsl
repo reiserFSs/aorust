@@ -187,6 +187,9 @@ fn to_g(v: vec3<f32>) -> vec3<f32> {
 // once per vertex, the results are interpolated across the triangle and modulated with the texture in the fragment stage.
 // Material: diffuse and ambient white (`RViewPort_t::SetMaterial` leaves them at `SetDefaultMaterial`'s 1.0), emissive and
 // specular from `mat`; device AMBIENT is `g.ambient_g`. Everything below is gamma space.
+// UNRESOLVED INFERENCE: absent FVF0x112 vertex colours use the material despite
+// reset COLOR1/COLOR2 defaults. Searched Randy10041ede/1004ac5f/1004b199/1004d2d8;
+// these expose submitted states, not the missing D3D7 runtime fallback (docs/formats.md).
 struct Lit {
     light: vec3<f32>, // saturate(emissive + ambient + sun diffuse + point/spot diffuse) = the D3D vertex diffuse colour
     dlight: vec3<f32>, // point/spot diffuse alone (prelit surfaces add it to the baked vertex colour)
