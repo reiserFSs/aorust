@@ -308,6 +308,72 @@ mod tests {
         assert_eq!(tm.heights[3] >> 8, 44);
     }
 
+    /// N3 `10017c3e` promotes the sample with `&0xffff` and multiplies the stored
+    /// height scale. Statel `1002435c` passes raw XYZ to SetPosition; only dungeon
+    /// loader `100275f6` applies the room transform (`100271b6`).
+    #[test]
+    fn native_wide_maps_preserve_geometry_and_authored_statel_origins() {
+        use super::super::{list_playfields, load_playfield, record, statel, terrain_height, RECORD, STATELS, TILEMAP};
+        use std::collections::HashSet;
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        let Ok(store) = ao_rdb::RecordStore::open(&dir) else { return };
+        let mut audited = Vec::new();
+        let mut high_bit_samples = 0;
+        for (id, _) in list_playfields(&store).unwrap() {
+            let record = record::parse(&store.get(RECORD, id).unwrap().unwrap()).unwrap();
+            if !record.is_outdoor() { continue; }
+            let raw = store.get(TILEMAP, record.tilemap).unwrap().unwrap();
+            let mut reader = Rd::new(&raw, 24);
+            let textures = reader.u16().unwrap() as usize;
+            reader.skip(textures * 2 + 4).unwrap();
+            let members = archive_members(&mut reader).unwrap();
+            let small = chunks(members.iter().find(|(name, _)| name == "heightmap_small_data").unwrap().1).unwrap();
+            if !small.iter().any(|data| data.len() == 8) { continue; }
+            assert!(small.iter().all(|data| data.len() == 8), "native wide-family flag must cover every patch in {id}");
+            let native_scale = f32::from_le_bytes(raw[20..24].try_into().unwrap());
+            let map = parse(&raw).unwrap();
+            high_bit_samples += map.heights.iter().filter(|&&height| height >= 0x8000).count();
+            for z in 0..=map.cells_z {
+                for x in 0..=map.cells_x {
+                    assert_eq!(map.height(x, z).to_bits(), (map.heights[z * map.verts_x + x] as f32 * native_scale).to_bits(), "native unsigned sample formula pf{id} ({x},{z})");
+                }
+            }
+            // Independent authored corner cache, loaded as four ushort words by DS10036f17.
+            let patch = 1usize << (map.verts_x - 1).trailing_zeros().min((map.verts_z - 1).trailing_zeros()).min(6);
+            let across = (map.verts_x - 1) / patch;
+            for (index, corners) in small.iter().enumerate() {
+                let (x, z) = (index % across * patch, index / across * patch);
+                for (corner, (dx, dz)) in [(0, 0), (patch, 0), (0, patch), (patch, patch)].into_iter().enumerate() {
+                    let expected = u16::from_le_bytes(corners[corner * 2..corner * 2 + 2].try_into().unwrap());
+                    assert_eq!(map.heights[(z + dz) * map.verts_x + x + dx], expected, "native patch corner pf{id} patch{index} corner{corner}");
+                }
+            }
+            let file = statel::parse(&store.get(STATELS, id).unwrap().unwrap(), record.count as usize, statel::Layout::Outdoor).unwrap();
+            assert!(file.outdoor);
+            let native_positions: HashSet<_> = std::iter::once(&file.global).chain(&file.zones).flat_map(|zone| &zone.statels).filter(|statel| statel.mesh != 0)
+                .map(|statel| [statel.pos[0].to_bits(), statel.pos[1].to_bits(), (-statel.pos[2]).to_bits()]).collect();
+            let scene = load_playfield(&store, &dir, id).unwrap();
+            let lod = scene.statel_lod.as_ref().expect("outdoor statel instance ownership");
+            assert!(!lod.items.is_empty(), "wide map{id} must exercise placed geometry");
+            let mut gaps = Vec::new();
+            for item in &lod.items {
+                for instance in std::iter::once(item.full).chain(item.reduced) {
+                    let position = scene.instances[instance].transform[3];
+                    assert!(native_positions.contains(&[position[0].to_bits(), position[1].to_bits(), position[2].to_bits()]), "pf{id}: statel position was snapped, offset or room-transformed: {position:?}");
+                }
+                let p = scene.instances[item.full].transform[3];
+                if let Some(height) = terrain_height(&map, p[0], p[2]) { gaps.push((p[1] - height).abs()); }
+            }
+            gaps.sort_by(f32::total_cmp);
+            eprintln!("native wide pf{id}: coordinate mismatches=0, statels={}, diagnostic median origin/terrain gap={:?}", lod.items.len(), gaps.get(gaps.len() / 2));
+            audited.push(id);
+        }
+        assert!(high_bit_samples > 0, "the unsigned conversion regression must exercise bit15");
+        audited.sort_unstable();
+        assert_eq!(audited, [556, 656, 4364, 4365, 4366, 4367, 4368, 4380, 4381, 4382, 4383, 4384, 4385, 4386, 4387, 4388, 4468, 4894, 6001, 6002, 6012, 6022]);
+    }
+
     #[test]
     fn ground_material_resolves_known_footstep_textures_and_defaults_unknown_ids_to_zero() {
         assert_eq!(ground_material(1), 2, "sand");
