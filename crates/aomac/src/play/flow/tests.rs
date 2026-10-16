@@ -933,7 +933,7 @@ fn captured(rec: &str) -> Vec<ao_net::frame::Frame> {
 }
 
 impl Rig {
-    /// Frames until the loading screen has dissolved into the world (`Screen::InWorld`); the playfield loads in the background.
+    /// Install the captured world, drain its real asset worker, then relay the server's own CharInPlay echo.
     fn enter(&mut self) {
         let t = Instant::now();
         while self.p.screen != Screen::InWorld {
@@ -941,6 +941,14 @@ impl Rig {
             self.p.frame(0.5, (1280, 800), &mut self.host);
             std::thread::sleep(Duration::from_millis(20));
         }
+        while self.p.zone.world.has_workload() {
+            assert!(t.elapsed() < Duration::from_secs(120), "timeout waiting for captured assets");
+            self.p.frame(0.5, (1280, 800), &mut self.host);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let id = self.p.zone.char_id;
+        self.event(LoginEvent::ZoneFrame(ao_net::n3::outgoing::n3_frame(0, id, ao_net::n3::outgoing::char_in_play(id as i32))));
+        self.p.frame(FADE_OUT, (1280, 800), &mut self.host);
     }
     /// A burst of captured server frames, one `pump` per frame.
     fn burst(&mut self, frames: &[ao_net::frame::Frame]) {
@@ -951,12 +959,67 @@ impl Rig {
     /// Frames until the teleport ended (the new world is shown again).
     fn settle(&mut self) {
         let t = Instant::now();
-        while self.p.teleporting {
+        while self.p.teleporting || self.p.zone.world.has_workload() {
             assert!(t.elapsed() < Duration::from_secs(120), "timeout waiting for the new world");
             self.p.frame(0.5, (1280, 800), &mut self.host);
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+#[test]
+fn loading_waits_for_alive_and_countdown_uses_native_boundaries() {
+    let Some(mut r) = rig() else { return };
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    assert!(!r.p.game_input_open());
+    r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while r.p.screen != Screen::InWorld {
+        assert!(Instant::now() < deadline);
+        r.p.frame(0.5, (1280, 800), &mut r.host);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(r.p.loading_active && matches!(r.p.fade, Fade::Hold) && !r.p.game_input_open(),
+        "world installation must not close loading or enable input before the echo");
+    r.p.zone.in_play_sent = false;
+    r.p.world_frames = IN_PLAY_FRAMES;
+    r.p.world_seconds = IN_PLAY_SECONDS;
+    // Use the real queued placed-dynel request, before it is dispatched to the worker.
+    r.p.zone.world.on_playfield(4604);
+    for _ in 0..IN_PLAY_FRAMES + 2 { assert!(!r.p.in_play_due(0.0)); }
+    assert!(r.p.world_frames < 0, "pending assets suppress sending even after countdown expiry");
+    while r.p.zone.world.has_workload() {
+        assert!(Instant::now() < deadline);
+        r.p.frame(0.016, (1280, 800), &mut r.host);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    r.p.zone.in_play_sent = false;
+    assert!(r.p.in_play_due(0.0), "drained assets release the expired countdown");
+    r.p.world_frames = IN_PLAY_FRAMES;
+    r.p.world_seconds = IN_PLAY_SECONDS;
+    for _ in 0..IN_PLAY_FRAMES { assert!(!r.p.in_play_due(0.0)); }
+    assert_eq!(r.p.world_frames, 0);
+    assert!(r.p.in_play_due(0.0), "strictly negative frame count, not zero");
+    r.p.world_frames = IN_PLAY_FRAMES;
+    r.p.world_seconds = IN_PLAY_SECONDS;
+    assert!(!r.p.in_play_due(120.0), "zero seconds is not expired");
+    assert!(r.p.in_play_due(0.25), "time alone releases before frame expiry");
+    let echo = |id| LoginEvent::ZoneFrame(ao_net::n3::outgoing::n3_frame(0, id, ao_net::n3::outgoing::char_in_play(id as i32)));
+    r.event(echo(99));
+    assert!(matches!(r.p.fade, Fade::Hold) && !r.p.game_input_open());
+    r.event(echo(33512));
+    assert!(matches!(r.p.fade, Fade::Out(0.0)) && r.p.game_input_open());
+    r.p.frame(FADE_OUT, (1280, 800), &mut r.host);
+    assert!(!r.p.loading_active);
+    r.p.teleport_started(&mut r.host);
+    r.p.teleport_ended();
+    assert_eq!((r.p.world_frames, r.p.world_seconds), (IN_PLAY_FRAMES, IN_PLAY_SECONDS));
+    assert!(!r.p.game_input_open() && !r.p.zone.in_play_sent);
+    r.event(echo(33512));
+    assert!(r.p.game_input_open() && !r.p.loading_active && matches!(r.p.fade, Fade::Hold));
+    r.p.show_login(&mut r.host);
+    r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
+    assert!(r.p.awaiting_alive && r.p.loading_active && !r.p.world_ready && !r.p.teleporting);
 }
 
 /// A second `PlayfieldAnarchyFIIR_t` while in the world: `TeleportStarted` (no loading screen, interface kept, world hidden), the
@@ -1002,7 +1065,7 @@ fn second_playfield_keeps_the_interface_and_hides_the_world() {
     r.burst(&second[pf + 1..]);
     assert_eq!(r.p.zone.day_time(), 4478.0, "resynced by the new burst's GameTime (67170 s = 18:39:30)");
     assert!(r.host.sky_clock.take().is_some(), "the live sky clock is resynced");
-    assert_eq!(r.p.world_frames, 0, "the countdown starts at TeleportEnded, not while the world loads");
+    assert_eq!(r.p.world_frames, IN_PLAY_FRAMES, "the countdown starts at TeleportEnded, not while the world loads");
     r.settle();
     assert!(r.p.hud.is_some() && matches!(r.p.fade, Fade::Hold), "TeleportEnded: no fade");
     for _ in 0..IN_PLAY_FRAMES + 2 {
@@ -1164,7 +1227,7 @@ fn focus_loss_resets_input_even_while_game_input_is_closed() {
     r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
     r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
     r.enter();
-    let frames = |r: &mut Rig, n: u32| (0..n).for_each(|_| drop(r.p.frame(0.016, (1280, 800), &mut r.host)));
+    let frames = |r: &mut Rig, n: i32| (0..n).for_each(|_| drop(r.p.frame(0.016, (1280, 800), &mut r.host)));
     frames(&mut r, IN_PLAY_FRAMES + 2);
     assert!(r.p.game_input_open());
     let key = |r: &mut Rig, code| r.p.game_input(ao_render::GameInput::Key { code, pressed: true, repeat: false }, &mut r.host);
@@ -1524,7 +1587,7 @@ fn teleport_try_stops_the_input_until_the_char_in_play_echo() {
     r.event(LoginEvent::ZoneHandoff { zone_ip: Ipv4Addr::LOCALHOST, zone_port: 1, character_id: 33512 });
     r.burst(&captured(include_str!("../../../../../docs/captures/zone_newchar_ithaca.rec")));
     r.enter();
-    let frames = |r: &mut Rig, n: u32| (0..n).for_each(|_| drop(r.p.frame(0.016, (1280, 800), &mut r.host)));
+    let frames = |r: &mut Rig, n: i32| (0..n).for_each(|_| drop(r.p.frame(0.016, (1280, 800), &mut r.host)));
     frames(&mut r, IN_PLAY_FRAMES + 2);
     assert!(r.p.zone.in_play_sent && !r.p.awaiting_alive && r.p.player.is_some());
     let key = |r: &mut Rig, pressed| r.p.game_input(ao_render::GameInput::Key { code: ao_render::KeyCode::KeyW, pressed, repeat: false }, &mut r.host);

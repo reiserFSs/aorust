@@ -68,15 +68,18 @@ Server-only IIRs are marked by `IsAllowedFromClient() == false` (`n3PlayfieldFul
    message `0x144`).
 5. AFCM `0x144` = `FlowControlModule_t::TeleportEndedMessage` [GUI 0x100292ce] (registered at [GUI 0x1002ad2c]). At its end
    (asm 0x10029628..0x10029641) it arms the in-play countdown: `DAT_102760cd = 1` (waiting), `DAT_102760d8 = 120.0f`
-   (`[GUI 0x101ae4d8] = 0x42f00000`), `DAT_102760dc = 10` (frames). (`FUN_1000482e` is also reached from `StartTryingTeleport`, `TeleportFailed`, `TradeStart`, ... with other event codes; whether
-   a later zone change re-sends `CharInPlay` through the same path was not traced [INFERENCE: yes, `SetMainDynel` runs again].)
+   (`[GUI 0x101ae4d8] = 0x42f00000`, freshly dumped as f32 120.0), `DAT_102760dc = 10` (frames).
+   The same handler re-arms after a zone change and after `TeleportFailed` (docs/zone/world.md §10.2).
 6. `FlowControlModule_t::FrameProcess` [GUI 0x10028a9e] → `WaitingToStartGame` [GUI 0x10027d73] every frame while waiting:
    `t -= frameTime; frames -= 1; if (frames < 0 || t < 0.0)` **and** `!DatabaseInterfaceModule_t::HasWorkLoad()` (no pending
    rdb loads) → `N3InterfaceModule_t::N3Msg_SendInPlayMessage` [IF 0x10009576] → `n3EngineClientAnarchy_t::N3Msg_SendInPlayMessage`
-   [GC 0x10018090]. So: **≥ 11 rendered frames after our own character appeared and the asset queue is idle** (120 s hard
-   timeout as the alternative gate). If there is no control dynel yet it returns false and is retried next frame.
-   On success: `InputConfig_t::ClrStaticInputMode(0x3a)` (input unlocked) and the waiting flag is cleared. `AliveMessage`
-   [GUI 0x10028543] also clears the flag [GUI 0x10028680].
+   [GC 0x10018090]. So: **11 countdown frames or strictly more than 120 seconds, with the asset queue idle**;
+   exactly zero frames/seconds does not pass. The time alternative does not bypass pending loads. The port gates on
+   queued and unanswered asset-worker requests and continues draining them behind the loading overlay.
+   If there is no control dynel yet native returns false and retries next frame.
+   On success: `InputConfig_t::ClrStaticInputMode(0x3a)` and the waiting flag clear; this does **not** substitute for
+   `AliveMessage` [GUI 0x10028543], which closes active loading module `0x1b` and enables the viewport/user input.
+   `AliveMessage` also clears the waiting flag [GUI 0x10028680].
 7. `N3Msg_SendInPlayMessage`: `GetClientControlDynel()`; if null → returns false, nothing sent. Else builds `CharInPlayIIR_t`
    (`FUN_100726ce` [GC]: `n3ToServerUnBlockIIR_t(dynel.identity, "CharInPlayIIR_t")` then `this[0xc] = 1`) and
    `SendIIRToServer`. **One frame** (13-byte payload, size field 29, 32 bytes on the wire).

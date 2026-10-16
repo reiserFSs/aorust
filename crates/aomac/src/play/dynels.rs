@@ -302,9 +302,15 @@ enum Resp {
 struct Worker {
     tx: Sender<Req>,
     rx: Receiver<Resp>,
+    outstanding: std::cell::Cell<usize>,
 }
 
 impl Worker {
+    fn send(&self, request: Req) {
+        if self.tx.send(request).is_ok() {
+            self.outstanding.set(self.outstanding.get() + 1);
+        }
+    }
     fn start(dir: PathBuf, names: Option<Arc<NameTable>>) -> Worker {
         let (tx, req_rx) = channel::<Req>();
         let (resp_tx, rx) = channel();
@@ -359,7 +365,7 @@ impl Worker {
                 }
             }
         });
-        Worker { tx, rx }
+        Worker { tx, rx, outstanding: std::cell::Cell::new(0) }
     }
 }
 
@@ -3167,6 +3173,13 @@ impl Dynels {
         }
     }
 
+    /// DatabaseInterface::HasWorkLoad equivalent: queued asset requests and unanswered worker jobs.
+    pub(super) fn has_workload(&self) -> bool {
+        !self.pending.is_empty() || !self.pending_clips.is_empty() || !self.pending_weapons.is_empty()
+            || self.want_placed.is_some() || self.worker.as_ref().is_some_and(|w| w.outstanding.get() != 0)
+            || self.chars.iter().any(|(&id, c)| id != self.own && !self.asked.contains(&c.next.unwrap_or(c.key)))
+    }
+
     /// Advances the dynels and hands the visible ones to the renderer. `cam` = camera position in scene space, `fwd` = its view direction.
     /// The loaded playfield surface capability; absent geometry is not a no-hit query.
     pub fn update_with_collision(
@@ -3185,17 +3198,26 @@ impl Dynels {
         };
         let worker = self.worker.take().unwrap_or_else(|| Worker::start(dir, self.names.clone()));
         if let Some(pf) = self.want_placed.take() {
-            let _ = worker.tx.send(Req::Placed(pf));
+            worker.send(Req::Placed(pf));
         }
         for (key, look, id, who) in std::mem::take(&mut self.pending_clips) {
-            let _ = worker.tx.send(Req::Clip { key, look, id });
+            worker.send(Req::Clip { key, look, id });
             self.replay.push((who, id));
         }
         for (holder, slot, template, stats) in std::mem::take(&mut self.pending_weapons) {
-            let _ = worker.tx.send(Req::Weapon { holder, slot, template, stats });
+            worker.send(Req::Weapon { holder, slot, template, stats });
         }
         let mut placed = vec![];
-        while let Ok(r) = worker.rx.try_recv() {
+        loop {
+            let r = match worker.rx.try_recv() {
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    worker.outstanding.set(0);
+                    break;
+                }
+            };
+            worker.outstanding.set(worker.outstanding.get().saturating_sub(1));
             match r {
                 Resp::Clip { key, id, anims } => {
                     if let (false, Some(Model::Ready { built, .. })) = (anims.is_empty(), self.models.get_mut(&key)) {
@@ -3260,7 +3282,7 @@ impl Dynels {
             if self.asked.insert(key) {
                 self.models.insert(key, Model::Loading);
                 self.model_order.push_back(key);
-                let _ = worker.tx.send(Req::Model { key, look, texture_quality: (key & 3) as i32 });
+                worker.send(Req::Model { key, look, texture_quality: (key & 3) as i32 });
             }
         }
         for (&(kind, instance), p) in &mut self.props {

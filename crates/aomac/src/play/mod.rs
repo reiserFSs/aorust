@@ -105,8 +105,9 @@ const JOIN_TIMEOUT: f32 = 30.0;
 /// `ServerLogin3DModule_t` fades (GUI 0x101aa198 / 0x101aa190); the unit (ms) is an assumption (docs/screens.md §7).
 const FADE_IN: f32 = 4.0;
 const FADE_OUT: f32 = 7.0;
-/// Frames after the world appeared before `CharInPlay` is sent (`TeleportEndedMessage` countdown, docs/zone/outgoing.md §3).
-const IN_PLAY_FRAMES: u32 = 10;
+/// `TeleportEndedMessage` [GUI 0x100292ce]: signed frame counter and float seconds (0x101ae4d8).
+const IN_PLAY_FRAMES: i32 = 10;
+const IN_PLAY_SECONDS: f32 = 120.0;
 /// Camera height above the player's feet; [GUESS] same eye height as the playfield spawn heuristic (1.7 m), the client's player camera is not ported yet.
 const EYE_HEIGHT: f32 = 1.7;
 
@@ -217,6 +218,8 @@ struct Play {
     // loading screen / world
     loading_img: Option<(GfxId, u32, u32)>,
     fade: Fade,
+    /// Loading module remains active through world installation until Alive closes it.
+    loading_active: bool,
     world_ready: bool,
     /// `FlowControlModule_t::m_isTeleporting` [GUI 0x102635d8] while in the world: set by `TeleportStarted`, cleared by `TeleportEnded`
     /// (the new world appeared). The HUD and chat stay; the 3D world is hidden (docs/zone/world.md §10.2).
@@ -237,8 +240,9 @@ struct Play {
     world_audio: Option<(u32, Box<ao_audio::PlayfieldAudio>)>,
     /// State of the current zone connection (`ZoneHandoff` .. disconnect).
     zone: zone::Zone,
-    /// Frames drawn since the world appeared; `CharInPlay` is sent after [`flow::IN_PLAY_FRAMES`].
-    world_frames: u32,
+    /// Signed `WaitingToStartGame` counters; either must become strictly negative.
+    world_frames: i32,
+    world_seconds: f32,
     fake: bool,
     /// `--fake-charlist`: the replies an in-process fake login server would send (random name, created, hand-off, …).
     fake_events: std::collections::VecDeque<LoginEvent>,
@@ -369,6 +373,7 @@ impl Play {
             preview_error: None,
             loading_img: None,
             fade: Fade::In(0.0),
+            loading_active: false,
             world_ready: false,
             teleporting: false,
             awaiting_alive: false,
@@ -378,7 +383,8 @@ impl Play {
             zone_timing_dynels_seen: false,
             world_audio: None,
             zone: zone::Zone::default(),
-            world_frames: 0,
+            world_frames: IN_PLAY_FRAMES,
+            world_seconds: IN_PLAY_SECONDS,
             fake: fake_charlist.is_some(),
             fake_events: Default::default(),
             under_dialog: None,

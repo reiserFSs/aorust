@@ -132,6 +132,8 @@ impl Play {
         self.close_all();
         self.conn_gen += 1; // a connect still in flight is stale now (Bg::Connected is dropped)
         self.session = None; // dropping the session closes the connection (ResetConnectionAndConfig)
+        self.loading_active = false;
+        self.awaiting_alive = false;
         self.world_audio = None;
         if let Some(audio) = &self.audio {
             if std::env::var_os("AOMAC_AUDIO_LOG").is_some() {
@@ -585,6 +587,7 @@ impl Play {
     /// The hand-off (`LoginEvent::ZoneHandoff`): loading screen plus `CharacterLoggedInMessage` -> `PlayStartupMusic`.
     pub(super) fn start_loading(&mut self, host: &mut Host) {
         self.show_loading(host);
+        self.loading_active = true;
         self.apply_login_audio_prefs();
         if let Some(a) = &self.audio {
             a.play_startup_music(); // CharacterLoggedInMessage -> PlayStartupMusic (timing here: at the hand-off)
@@ -610,7 +613,8 @@ impl Play {
         self.zone.reset_world();
         self.fight_reset();
         self.interact_reset();
-        self.world_frames = 0;
+        self.world_frames = IN_PLAY_FRAMES;
+        self.world_seconds = IN_PLAY_SECONDS;
         self.world_scene = None;
         self.world_ground = None;
         self.ground_texture_patches.clear();
@@ -650,7 +654,8 @@ impl Play {
             return;
         }
         self.entering_text();
-        self.world_frames = 0;
+        self.world_frames = IN_PLAY_FRAMES;
+        self.world_seconds = IN_PLAY_SECONDS;
         self.zone.in_play_sent = false;
     }
 
@@ -659,8 +664,24 @@ impl Play {
     /// `EnableUserInput`, and the `CharInPlay` countdown flag (`DAT_102760cd`) clears. The original has no timeout: without the echo the
     /// viewport stays off and the input stopped after a teleport.
     fn alive(&mut self) {
+        if !self.world_ready || self.world_scene.is_some() || self.teleporting {
+            return;
+        }
+        // AliveMessage sends AFCM 0x1b:0x135 only while the loading module is active.
+        if self.loading_active {
+            self.fade = Fade::Out(0.0);
+        }
         self.awaiting_alive = false;
         self.zone.in_play_sent = true;
+    }
+
+    fn in_play_due(&mut self, dt: f32) -> bool {
+        if self.screen != Screen::InWorld || !self.world_ready || self.zone.in_play_sent || self.teleporting {
+            return false;
+        }
+        self.world_frames = self.world_frames.saturating_sub(1);
+        self.world_seconds -= dt;
+        (self.world_frames < 0 || self.world_seconds < 0.0) && !self.zone.world.has_workload()
     }
 
     /// Whether the game keys / mouse reach the [`Player`](player::Player): `InputConfig+0x18` (`isUserInputStopped`, = `awaiting_alive`) is
@@ -912,7 +933,8 @@ impl Play {
                     self.zone = zone::Zone::new(character_id);
                     // a fresh session: nothing of an earlier world; the playfield may finish loading while the creation cinematic still runs
                     (self.world_ready, self.world_scene, self.world_ground) = (false, None, None);
-                    self.awaiting_alive = false;
+                    self.awaiting_alive = true;
+                    self.teleporting = false;
                     self.fight_reset();
                     self.interact_reset();
                     let mut chat = chat::Chat::new(!self.fake && !replayed);
@@ -921,7 +943,8 @@ impl Play {
                     }
                     self.chat = Some(chat);
                     self.zone.world.start(self.dir.clone(), character_id as i32);
-                    self.world_frames = 0;
+                    self.world_frames = IN_PLAY_FRAMES;
+                    self.world_seconds = IN_PLAY_SECONDS;
                     // creating a character: the exit cinematic runs first, `exit_done` opens the loading screen (docs/screens.md §12)
                     if self.screen != Screen::Create {
                         self.start_loading(host);
@@ -1409,7 +1432,7 @@ impl Frontend for Play {
                 self.fade = if t >= FADE_IN { Fade::Hold } else { Fade::In(t) };
             }
             Fade::Hold if self.world_ready => {
-                // world ready: StartClosingLoadscreen -> the loading screen dissolves into the world
+                // Install the world behind the loading module; only AliveMessage closes it.
                 if let Some(s) = self.world_scene.take() {
                     // the player's own dynel (SimpleCharFullUpdate, arrives with the zone burst) decides; the scene's
                     // density-based spawn is only the fallback when the server sent none
@@ -1486,13 +1509,15 @@ impl Frontend for Play {
                     let playfield = self.zone.playfield.unwrap_or(0);
                     self.player = player::Player::new(&self.dir, &mut self.zone, playfield);
                     host.fly = teleported && self.player.is_none();
-                    self.fade = if teleported { Fade::Hold } else { Fade::Out(0.0) };
+                    self.world_frames = IN_PLAY_FRAMES;
+                    self.world_seconds = IN_PLAY_SECONDS;
                 }
             }
             Fade::Out(t) => {
                 let t = t + dt;
                 if t >= FADE_OUT {
                     self.fade = Fade::Hold;
+                    self.loading_active = false;
                     host.fly = self.player.is_none(); // free-fly only when the avatar could not be built
                 } else {
                     self.fade = Fade::Out(t);
@@ -1500,10 +1525,8 @@ impl Frontend for Play {
             }
             _ => {}
         }
-        if self.screen == Screen::InWorld && !self.zone.in_play_sent && !self.teleporting {
-            self.world_frames += 1;
-            if self.world_frames > IN_PLAY_FRAMES {
-                // WaitingToStartGame (GUI 0x10027d73): after the TeleportEnded countdown the client sends CharInPlayIIR_t once
+        if self.in_play_due(dt) {
+                // GUI 0x10027d73: clear static mode 0x3a after sending, but input still waits for Alive.
                 self.zone.in_play_sent = true;
                 if let Some(s) = &self.session {
                     let id = self.zone.char_id;
@@ -1511,7 +1534,6 @@ impl Frontend for Play {
                     eprintln!("zone: CharInPlay sent ({} frames, {} dynels known)", self.zone.frames, self.zone.dynels.len());
                     self.zt("char_in_play_sent");
                 }
-            }
         }
         // `screen == InWorld` is already true throughout a mid-game teleport (no loading screen, docs/zone/world.md §10.2); gate on
         // `world_ready` (set once the destination's geometry/`Bg::World` arrived) so this does not fire on the pre-teleport dynel list.
@@ -1910,7 +1932,7 @@ impl Frontend for Play {
             }
         }
         let fading_out = matches!(self.fade, Fade::Out(_)) && self.screen == Screen::InWorld;
-        if self.screen == Screen::Loading || fading_out {
+        if self.screen == Screen::Loading || self.loading_active || fading_out {
             self.loading_overlay(&mut list);
         }
         if self.awaiting_alive {

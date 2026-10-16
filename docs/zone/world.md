@@ -366,10 +366,14 @@ the corpse to the dead character's relative position when closer than a threshol
 * **`TeleportEndedMessage` [GUI 0x100292ce]** (`0x144`): `m_isTeleporting = false`; `N3Msg_GetPosAndPF`, `BugReport_t::SetPFProxyInfo`;
   signal `+0x17c (0, text, 0xc)` with (110, `EnteringPF`) = `Entering '%s'` formatted with `N3Msg_GetPFName` (`FUN_1003676c(pf id)`, else
   the playfield's own name), or (110, `EnteringNewArea`) = `Entering new area.` for `N3Msg_IsDungeon` / no name; then arms the
-  `CharInPlay` countdown (`DAT_102760cd = 1`, `DAT_102760d8 = 120.0`, `DAT_102760dc = 10`; docs/zone/outgoing.md §3). The server echoes our
+  `CharInPlay` countdown (`DAT_102760cd = 1`, `DAT_102760d8 = 120.0`, `DAT_102760dc = 10`; float constant
+  `[GUI 0x101ae4d8]`, freshly dumped; docs/zone/outgoing.md §3). `WaitingToStartGame` [GUI 0x10027d73] subtracts
+  frame time and one frame, requiring `(frames < 0 || seconds < 0)` and no database workload. The port counts actual
+  queued/unanswered dynel asset-worker requests (including placed dynels, models, weapons and clips), not a timer-only guard.
+  Installing the world behind the loading overlay does not begin its close fade or unlock game input. The server echoes our
   `CharInPlayIIR_t` for the own character: its `Activate` [GC 0x1007264d] posts event `0xa5` = `FlowControlModule_t::AliveMessage`
-  [GUI 0x10028543]: closes the loading screen if module `0x1b` is active (it is not after a teleport), `SetStaticInputMode(8)`,
-  `Activate3DViewPort` (the world is drawn again), `EnableUserInput`, clears the countdown flag.
+  [GUI 0x10028543]: sends AFCM `(0x1b, 0x135)` if the loading module is active (retaining its existing 7-second close fade),
+  then `SetStaticInputMode(8)`, `Activate3DViewPort`, `EnableUserInput`, and clears the countdown flag.
 * **Loading screen: none for a teleport.** `ServerLogin3DModule_t` (program 5, module `0x1b`) is added only by
   `CharCreateDoneMessage` [GUI 0x100278f9] (the `AddProgram` scan of GUI.dll finds no other `PUSH 5`) and is closed by message `0x135`
   from `AliveMessage`; `SetLoadingScreen(n)` only picks `welcome_to_rubika.jpg` after character creation (docs/screens.md §7);
@@ -429,11 +433,14 @@ the corpse to the dead character's relative position when closer than a threshol
   `WaitingToStartGame` [GUI 0x10027d73] clears static input mode `0x3a` (set by `CharCreateModule_t::InitialiseMessage` [GUI 0x1011ba81]
   with `EnableUserInput`) after `N3Msg_SendInPlayMessage` succeeded. **No timeout** on the echo exists in the original (the 120 s of
   `WaitingToStartGame` only bound the *send*), so after a zone change the viewport stays off and the input stopped until the echo arrives; the
-  port replicates that. App: `Play::awaiting_alive` (= `+0x18` and the viewport; set by `teleport_started`, cleared by `alive`) and
-  `Play::login_input_mode` (= mode `0x3a`; set at the zone hand-off, cleared when `CharInPlay` is sent); `Play::game_input_open` gates the
-  game keys / mouse of the `Player` (releases always pass: the port's stand-in for `EnableUserInput` resetting the key states); the black
-  quad follows `awaiting_alive`. [UNRESOLVED] what static mode `0x3a` itself changes in `InputConfig_t::CheckMode` consumers (the
-  consumer of the mode bytes was not traced; the port locks the game input like `+0x18`). Test: `zone::tests::own_char_in_play_relay_is_the_alive_event`.
+  port replicates that. App: `Play::awaiting_alive` (= input/viewport gate; set at the hand-off and by `teleport_started`,
+  cleared only by the own character's `alive` after world installation). `Play::loading_active` retains module `0x1b` until
+  the Alive-triggered close fade completes; rezones do not reactivate it. `Play::game_input_open` gates game keys / mouse
+  (releases always pass, replacing native key-state reset). Static mode `0x3a` is not a separate port field:
+  [UNRESOLVED] its `InputConfig_t::CheckMode` consumers have not been traced; clearing that mode after sending is not
+  treated as permission to bypass the Alive input/viewport gate. The black quad follows `awaiting_alive` (colour still [INFERENCE]).
+  Regressions: `loading_waits_for_alive_and_countdown_uses_native_boundaries`,
+  `teleport_try_stops_the_input_until_the_char_in_play_echo`, and `zone::tests::own_char_in_play_relay_is_the_alive_event`.
 * **Zone-change audio**: `PlayfieldInit` [GC 0x10016e2c] -> `SandyInterfaceModule_t::ActivateGameZone`: when the new world appears the loader
   thread's `ao_audio::PlayfieldAudio::load(store, id, Report::sounds)` is handed to `Audio::set_playfield` (`Bg::Info`, `Play::frame`'s
   world-ready block; `None` leaves the playfield), which stops the old ambience and follows the new districts / emitters through the existing
