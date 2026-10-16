@@ -1395,7 +1395,7 @@ fn autopilot_crosses_the_arrival_hall() {
     eprintln!("arrived after {frames} frames at {:?}", r.p.zone.own().unwrap().pos);
 }
 
-/// Exact ICC ramp stalls, through the recorded own character's real movement and pf4582 collision.
+/// Reported ICC ramp stall poses, through the recorded own character's real movement and pf4582 collision.
 #[test]
 fn autopilot_escapes_the_icc_ramp_stalled_poses() {
     let Some(mut r) = rig() else { return };
