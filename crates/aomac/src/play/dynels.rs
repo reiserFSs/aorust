@@ -900,16 +900,17 @@ pub struct Dynels {
     /// The playfield whose placed dynels (rdb 1000026) are still to be requested.
     want_placed: Option<u32>,
     playfield: Option<u32>,
-    /// Content-hash-keyed CPU model cache, intentionally kept across zone changes (the same NPC/item look recurs
-    /// in many playfields); bounded by [`Dynels::MODEL_BYTE_BUDGET`] (tracked in `model_bytes`), evicted in
-    /// [`Dynels::clear`] via `model_order`.
+    /// Content-hash-keyed CPU model cache, shared across zones and budgeted after admissions and reference changes.
     models: HashMap<u64, Model>,
     /// Running sum of [`built_bytes`] over `models`' `Model::Ready` entries; what [`Dynels::evict_models`] compares
     /// against [`Dynels::MODEL_BYTE_BUDGET`].
     model_bytes: usize,
-    /// First-seen insertion order of `models`' keys, for the FIFO eviction in [`Dynels::clear`].
+    /// First-seen insertion order for budget eviction.
     model_order: VecDeque<u64>,
     asked: HashSet<u64>,
+    /// Recheck only when admissions/completions or live references change, never on an unchanged frame.
+    budget_dirty: bool,
+    pending_model_removals: Vec<u64>,
     /// The own avatar's [`ActorAssets`], parked here (`Dynels::stash_avatar_assets`) between zone changes so its
     /// `rest`/`clips`/`anims` caches survive the per-zone `Player` rebuild instead of resolving the model's rest
     /// pose from scratch every time (`player::Player::new`, `zone-preload-proposal.md` §2.1).
@@ -1095,6 +1096,8 @@ impl Default for Dynels {
             model_bytes: 0,
             model_order: VecDeque::new(),
             asked: HashSet::new(),
+            budget_dirty: false,
+            pending_model_removals: vec![],
             avatar_assets: None,
             scene_generation: 0,
             show_all_names: true,
@@ -1356,7 +1359,8 @@ impl Dynels {
     /// Forgets every dynel (a playfield change, `Zone::reset_world`). `models` survives (the GPU-ready builds are
     /// reused across playfields for repeated looks) but is capped: see [`Dynels::evict_models`].
     pub fn clear(&mut self) {
-        let keep: HashSet<u64> = self.chars.values().map(|c| c.key).chain(self.props.values().map(|p| p.key)).collect();
+        let keep = self.model_pins();
+        self.budget_dirty = true;
         self.chars.clear();
         self.pending_visual_resets.clear();
         self.pending_clips.clear();
@@ -1391,31 +1395,52 @@ impl Dynels {
         self.evict_models(&keep);
     }
 
-    /// `models` is a content-hash cache, deliberately kept across zone changes so a repeated look (the same NPC
-    /// or item template seen in another playfield) does not rebuild. Left unbounded it grows for the whole
-    /// session: measured live, ~440-540 MB added by one large outdoor playfield's distinct looks, never freed on
-    /// return to a small zone (`zone-preload-proposal.md` §3). Capped here, at the one point a look stops being
-    /// "the current zone's own" (a zone change): FIFO by first-seen order, skipping `keep` (this zone's own keys,
-    /// just used, most likely to be reused again right away). Byte-based, not count-based: a real capture's
-    /// average built model (mesh + texture `rgba`) measured ~720 KB (`model_cache_cap_stays_under_a_byte_budget`),
-    /// so a flat count cap sized for a quiet zone (hundreds of entries) would blow well past a sane memory budget
-    /// in a zone full of large/varied looks; `model_bytes` tracks the running total exactly for that reason.
-    /// ponytail: first-seen-order eviction, not true LRU (no per-access touch, cheap for the ~hundreds of keys a
-    /// session sees).
+    /// Keep the existing 500 MB cache policy, allowing the live working set to exceed it rather than dropping
+    /// visible models. Loading entries remain until their worker answer arrives. Unreferenced failures have no
+    /// reusable payload and are forgotten even below budget.
+    /// ponytail: FIFO rather than LRU; touch-on-access bookkeeping is unnecessary for reused content hashes.
     const MODEL_BYTE_BUDGET: usize = 500_000_000;
     fn evict_models(&mut self, keep: &HashSet<u64>) {
-        let mut scanned = 0;
-        while self.model_bytes > Self::MODEL_BYTE_BUDGET && scanned < self.model_order.len() {
+        for _ in 0..self.model_order.len() {
             let Some(key) = self.model_order.pop_front() else { break };
-            if keep.contains(&key) {
+            if keep.contains(&key) || matches!(self.models.get(&key), Some(Model::Loading))
+                || (self.model_bytes <= Self::MODEL_BYTE_BUDGET && !matches!(self.models.get(&key), Some(Model::Failed))) {
                 self.model_order.push_back(key);
-                scanned += 1;
                 continue;
             }
             if let Some(Model::Ready { built, .. }) = self.models.remove(&key) {
-                self.model_bytes = self.model_bytes.saturating_sub(built_bytes(&built));
+                self.model_bytes -= built_bytes(&built);
             }
             self.asked.remove(&key);
+            self.pending_model_removals.push(key);
+        }
+    }
+
+    fn model_pins(&self) -> HashSet<u64> {
+        self.chars.values().flat_map(|c| std::iter::once(c.key).chain(c.next))
+            .chain(self.props.values().map(|p| p.key))
+            .chain(self.pending_clips.iter().map(|clip| clip.0)).collect()
+    }
+
+    fn admit_model(&mut self, key: u64, built: Box<Built>) {
+        self.model_bytes += built_bytes(&built);
+        if let Some(Model::Ready { built: old, .. }) = self.models.insert(key, Model::Ready { built, uploaded: false }) {
+            self.model_bytes -= built_bytes(&old);
+        }
+        self.budget_dirty = true;
+    }
+
+    fn enforce_model_budget(&mut self, host: &mut Host) {
+        if std::mem::take(&mut self.budget_dirty) {
+            self.evict_models(&self.model_pins());
+        }
+        if !self.pending_model_removals.is_empty() {
+            // Host removes before uploading. Cancel stale uploads, but preserve a fresh readmission of the same key.
+            host.actor_models.retain(|(key, _)| !self.pending_model_removals.contains(key)
+                || matches!(self.models.get(key), Some(Model::Ready { .. })));
+            host.actor_model_updates.retain(|(key, _)| !self.pending_model_removals.contains(key)
+                || matches!(self.models.get(key), Some(Model::Ready { .. })));
+            host.actor_model_removals.append(&mut self.pending_model_removals);
         }
     }
 
@@ -2038,7 +2063,9 @@ impl Dynels {
             if cast.who != who && cast.target != who { return true; }
             self.nano_sounds.retain(|sound| sound.5 != cast.who);
             let charge = self.nano_templates.get(&cast.spell).and_then(|template| template.stat(0x178)).unwrap_or(203) as u32;
+            let pending = self.pending_clips.len();
             self.pending_clips.retain(|clip| clip.3 != cast.who || (clip.2 != charge && clip.2 != cast.release_anim));
+            self.budget_dirty |= self.pending_clips.len() != pending;
             self.replay.retain(|clip| clip.0 != cast.who || (clip.1 != charge && clip.1 != cast.release_anim));
             if cast.who == self.own { self.nano_animations.push(None); }
             else if let Some(c) = self.chars.get_mut(&cast.who).filter(|c| matches!(c.special, Special::Cast(_)) || c.special == Special::Once(cast.release_anim)) {
@@ -2072,7 +2099,9 @@ impl Dynels {
             if cast.who != who || cast.spell != spell || (named && cast.execution.as_ref().is_some_and(|execution| execution.recharge.is_none())) { return true; }
             self.nano_sounds.retain(|sound| sound.5 != who);
             let charge = self.nano_templates.get(&cast.spell).and_then(|template| template.stat(0x178)).unwrap_or(203) as u32;
+            let pending = self.pending_clips.len();
             self.pending_clips.retain(|clip| clip.3 != who || (clip.2 != charge && clip.2 != cast.release_anim));
+            self.budget_dirty |= self.pending_clips.len() != pending;
             self.replay.retain(|clip| clip.0 != who || (clip.1 != charge && clip.1 != cast.release_anim));
             if who == self.own { self.nano_animations.push(None); }
             else if let Some(c) = self.chars.get_mut(&who).filter(|c| matches!(c.special, Special::Cast(_)) || c.special == Special::Once(cast.release_anim)) {
@@ -2112,12 +2141,14 @@ impl Dynels {
                     if let Look::Char(look) = &mut c.look {
                         look.monster_data = value;
                         c.next = Some(c.look.key(self.texture_quality)).filter(|&key| key != c.key);
+                        self.budget_dirty = true;
                     }
                 }
                 0x2f | 0x378 if value != ao_formats::stats::INVALID => {
                     if let Look::Char(look) = &mut c.look {
                         if stat == 0x2f { look.fatness = value as u8; } else { look.body_resolution = value; }
                         c.next = Some(c.look.key(self.texture_quality)).filter(|&key| key != c.key);
+                        self.budget_dirty = true;
                     }
                 }
                 360 => c.scale = value as f32 / 100.0,
@@ -2169,7 +2200,9 @@ impl Dynels {
         let Some(character) = self.chars.get_mut(&who).filter(|c| !matches!(c.special, Special::Die(_))) else { return };
         character.special = Special::None;
         character.restart_body = true;
+        let pending = self.pending_clips.len();
         self.pending_clips.retain(|clip| clip.3 != who);
+        self.budget_dirty |= self.pending_clips.len() != pending;
         self.replay.retain(|clip| clip.0 != who);
         self.once_rate.remove(&who);
         self.play_once(who, animation);
@@ -2597,6 +2630,7 @@ impl Dynels {
 
     fn remove_char(&mut self, id: i32) {
         if let Some(c) = self.chars.remove(&id) {
+            self.budget_dirty = true;
             if c.visual_live { self.retire_visual(id as u32); }
         }
         self.pending_clips.retain(|request| request.3 != id);
@@ -2605,6 +2639,7 @@ impl Dynels {
 
     fn remove_prop(&mut self, identity: (i32, i32)) {
         if let Some(p) = self.props.remove(&identity) {
+            self.budget_dirty = true;
             if p.visual_live { self.retire_visual(p.id); }
         }
     }
@@ -2612,6 +2647,7 @@ impl Dynels {
     fn add_prop(&mut self, kind: i32, instance: i32, look: Look, pos: [f32; 3], rot: Option<[f32; 4]>, scale: f32) {
         let (id, replace) = self.props.get(&(kind, instance)).map_or((self.next_prop, false), |p| (p.id, true));
         let visual_live = self.props.get(&(kind, instance)).is_some_and(|p| p.visual_live);
+        if replace { self.budget_dirty = true; }
         if !replace {
             self.next_prop += 1;
         }
@@ -2974,6 +3010,7 @@ impl Dynels {
                         l.apply_appearance(a);
                         let key = c.look.key(self.texture_quality);
                         c.next = Some(key).filter(|&k| k != c.key);
+                        self.budget_dirty = true;
                     }
                     c.visual_flags = i32::from(a.visual_flags);
                 }
@@ -3043,6 +3080,7 @@ impl Dynels {
                 }
                 let pose = remote_pose(&mut mover, self.collision.as_ref(), 0.0);
                 let visual_live = self.chars.get(&who.instance).is_some_and(|c| c.visual_live);
+                if self.chars.contains_key(&who.instance) { self.budget_dirty = true; }
                 self.pending_clips.retain(|request| request.3 != who.instance);
                 self.replay.retain(|request| request.0 != who.instance);
                 self.chars.insert(
@@ -3263,6 +3301,7 @@ impl Dynels {
         let Some(dir) = self.dir.clone() else {
             self.refresh_effect_anchors(own_anchor);
             if let Some(effects) = &mut self.effects { effects.frame(dt, host, collision); }
+            self.enforce_model_budget(host);
             return;
         };
         let worker = self.worker.take().unwrap_or_else(|| Worker::start(dir, self.names.clone()));
@@ -3270,6 +3309,7 @@ impl Dynels {
             worker.send(Req::Placed(pf));
         }
         for (key, look, id, who) in std::mem::take(&mut self.pending_clips) {
+            self.budget_dirty = true;
             worker.send(Req::Clip { key, look, id });
             self.replay.push((who, id));
         }
@@ -3289,6 +3329,7 @@ impl Dynels {
             worker.outstanding.set(worker.outstanding.get().saturating_sub(1));
             match r {
                 Resp::Clip { key, id, anims } => {
+                    self.budget_dirty = true;
                     if let (false, Some(Model::Ready { built, .. })) = (anims.is_empty(), self.models.get_mut(&key)) {
                         built.clips.insert(id, anims);
                     }
@@ -3316,15 +3357,11 @@ impl Dynels {
                         self.wield.entry(holder).or_default()[slot] = wield;
                     }
                 }
-                Resp::Model { key, result: Ok(built) } => {
-                    self.model_bytes += built_bytes(&built);
-                    if let Some(Model::Ready { built: old, .. }) = self.models.insert(key, Model::Ready { built, uploaded: false }) {
-                        self.model_bytes = self.model_bytes.saturating_sub(built_bytes(&old));
-                    }
-                }
+                Resp::Model { key, result: Ok(built) } => self.admit_model(key, built),
                 Resp::Model { key, result: Err(e) } => {
                     eprintln!("dynels: model {key:016x}: {e}");
                     self.models.insert(key, Model::Failed);
+                    self.budget_dirty = true;
                 }
                 Resp::Placed(pf, list) => placed.push((pf, list)),
             }
@@ -3407,6 +3444,7 @@ impl Dynels {
                 match self.models.get(&k) {
                     Some(Model::Ready { .. }) => {
                         (c.key, c.next) = (k, None);
+                        self.budget_dirty = true;
                         *c.current_skin.get_mut() = None;
                         c.current_palette = None;
                         c.bounds = None;
@@ -3416,7 +3454,7 @@ impl Dynels {
                         c.previous_body = None;
                         c.parts.clear();
                     }
-                    Some(Model::Failed) => c.next = None,
+                    Some(Model::Failed) => { c.next = None; self.budget_dirty = true; }
                     _ => {}
                 }
             }
@@ -3650,6 +3688,7 @@ impl Dynels {
         self.refresh_effect_anchors(own_anchor);
         if let Some(effects) = &mut self.effects { effects.frame(dt, host, collision); }
         self.worker = Some(worker);
+        self.enforce_model_budget(host);
     }
 
     pub fn set_shadows(&mut self, enabled: bool) {
@@ -4337,6 +4376,103 @@ mod tests {
         let texture = ao_scene::Texture { width: 1, height: 1, rgba: vec![0u8; bytes], source: Default::default() };
         let scene = ao_scene::Scene { textures: [(ao_scene::TextureKey { rdb_type: 0, id: 0 }, texture)].into(), ..Default::default() };
         plain(scene, true)
+    }
+
+    #[test]
+    fn within_zone_model_budget_preserves_pins_and_reclaims_retired_models() {
+        fn load(world: &mut Dynels, key: u64, scene: &Arc<ao_scene::Scene>) {
+            assert!(world.asked.insert(key), "evicted looks can be requested again");
+            world.model_order.push_back(key);
+            let mut built = sized_built(0);
+            built.model = Arc::clone(scene);
+            world.admit_model(key, Box::new(built));
+        }
+        fn accounted(world: &Dynels) {
+            let bytes: usize = world.models.values().filter_map(|model| match model {
+                Model::Ready { built, .. } => Some(built_bytes(built)), _ => None,
+            }).sum();
+            assert_eq!(world.model_bytes, bytes);
+            assert_eq!(world.model_order.len(), world.models.len());
+            assert_eq!(world.asked.len(), world.models.len());
+        }
+        let mut world = Dynels::default();
+        let spawn = captured_posture_player();
+        let who = spawn.header.target.instance;
+        world.on_message(&spawn);
+        let c = world.chars.get_mut(&who).unwrap();
+        c.key = 1;
+        c.next = Some(2);
+        let Look::Char(look) = &c.look else { unreachable!() };
+        world.pending_clips.push((4, look.clone(), 99, who));
+        let prop = ao_net::msg::Identity { kind: 0xc76a, instance: 7 };
+        world.test_prop(prop, vec![]);
+        world.props.get_mut(&(prop.kind, prop.instance)).unwrap().key = 3;
+        // Share the synthetic texture allocation; accounting still counts each cached model's exact bytes.
+        let scene = sized_built(Dynels::MODEL_BYTE_BUDGET / 5).model;
+        for key in [1, 2, 3, 4, 6, 8] { load(&mut world, key, &scene); }
+        world.models.insert(5, Model::Loading);
+        world.model_order.push_back(5);
+        world.asked.insert(5);
+        world.models.insert(7, Model::Failed);
+        world.model_order.push_back(7);
+        world.asked.insert(7);
+        let mut host = Host::headless();
+        host.actor_models.extend([(1, Arc::clone(&scene)), (6, Arc::clone(&scene))]);
+        host.actor_model_updates.extend([(1, Arc::clone(&scene)), (6, Arc::clone(&scene))]);
+        world.enforce_model_budget(&mut host);
+        assert_eq!(host.actor_model_removals, [6, 7]);
+        assert_eq!(host.actor_models.iter().map(|entry| entry.0).collect::<Vec<_>>(), [1]);
+        assert_eq!(host.actor_model_updates.iter().map(|entry| entry.0).collect::<Vec<_>>(), [1]);
+        assert_eq!(world.model_bytes, Dynels::MODEL_BYTE_BUDGET);
+        for key in [1, 2, 3, 4, 5] { assert!(world.models.contains_key(&key), "pin {key} survives"); }
+        assert!(matches!(world.models[&5], Model::Loading));
+        accounted(&world);
+
+        let large = sized_built(2 * Dynels::MODEL_BYTE_BUDGET / 5).model;
+        let extra = ao_net::msg::Identity { kind: prop.kind, instance: 9 };
+        world.test_prop(extra, vec![]);
+        world.props.get_mut(&(extra.kind, extra.instance)).unwrap().key = 9;
+        load(&mut world, 9, &large);
+        world.enforce_model_budget(&mut host);
+        assert_eq!(host.actor_model_removals, [6, 7, 8]);
+        assert!(world.model_bytes > Dynels::MODEL_BYTE_BUDGET, "live models may exceed the cache budget");
+        assert!(!world.budget_dirty, "unchanged frames do not rescan the pinned working set");
+        world.remove_prop((extra.kind, extra.instance));
+        world.update_with_collision(0.0, [0.0; 3], [0.0, 0.0, -1.0], &mut host, None, |_| None);
+        assert_eq!(host.actor_model_removals, [6, 7, 8, 9], "despawn trims without another admission");
+        assert_eq!(world.model_bytes, 4 * Dynels::MODEL_BYTE_BUDGET / 5);
+        accounted(&world);
+
+        // A completed, no-longer-referenced Loading entry can now be evicted; clip release also unpins key 4.
+        world.pending_clips.clear();
+        let mut built = sized_built(0);
+        built.model = Arc::clone(&large);
+        world.admit_model(5, Box::new(built));
+        world.enforce_model_budget(&mut host);
+        assert_eq!(host.actor_model_removals, [6, 7, 8, 9, 4]);
+        assert_eq!(world.model_bytes, Dynels::MODEL_BYTE_BUDGET);
+        world.test_prop(extra, vec![]);
+        world.props.get_mut(&(extra.kind, extra.instance)).unwrap().key = 6;
+        load(&mut world, 6, &scene);
+        world.enforce_model_budget(&mut host);
+        assert_eq!(host.actor_model_removals, [6, 7, 8, 9, 4, 5]);
+        assert!(matches!(world.models[&6], Model::Ready { .. }), "a reappearing evicted look loads again");
+        assert_eq!(world.model_bytes, 4 * Dynels::MODEL_BYTE_BUDGET / 5);
+        accounted(&world);
+
+        world.models.insert(7, Model::Failed);
+        world.model_order.push_back(7);
+        world.asked.insert(7);
+        world.budget_dirty = true;
+        world.enforce_model_budget(&mut host);
+        assert_eq!(host.actor_model_removals, [6, 7, 8, 9, 4, 5, 7], "unreferenced failures are bounded even below budget");
+        accounted(&world);
+
+        // A deferred zone-clear removal must not cancel a fresh same-key model uploaded before Host applies it.
+        world.pending_model_removals.push(6);
+        host.actor_models.push((6, Arc::clone(&scene)));
+        world.enforce_model_budget(&mut host);
+        assert!(host.actor_models.iter().any(|entry| entry.0 == 6));
     }
 
     /// Reproduces the unbounded `models` growth measured live (`zone-preload-proposal.md` §3: RSS never dropped

@@ -143,6 +143,43 @@ allocation in unified memory, **not dedicated VRAM**. Tracked creations/estimate
 bytes are cumulative, not retained allocation; `AOMAC_GPU_STATS=1` optionally adds call-site
 creation logs. Unsupported native allocation/RSS observations are explicitly unavailable.
 
+Remote ground alignment is memoized by exact position/body/surface-state bits and
+the loaded collision world's generation; collision replacement and actual door
+changes invalidate it. Effect connectors share bone matrices for one exact
+ordered animation-layer/model generation. Head-only requests cache the original
+ancestor-chain result without eagerly sampling a culled character's full skeleton.
+Displayed palettes keep their existing distance cadence; translation, heading and
+scale still update the world transform independently.
+Behavior regressions compare exact anchor/motion bits against uncached evaluation;
+`native_anchor_generation_cache_is_pixel_identical_to_recursive_connectors` renders
+installed-asset connector markers and compares exact RGBA.
+
+Effect actor IDs increase from `0xe0000000`; visual-priority history is retained across
+visibility culls, but explicitly retired on effect destruction (expiry, cancellation,
+source deletion, or clear). Retirement covers the original allocation: one ID normally,
+32 for MeshTest, particle count for MParticle, mesh capacity for mesh effects, and scene
+count for tracer meshes. Child controls own separate allocations. The host forwards
+destroyed ranges without removing shared models; the renderer discards both committed
+and pending native visual states at the next actor-frame application. This retains
+native priority through repeated F12/capture renders of the final frame, while
+holding at most one frame of retired visual history.
+Regression checks: `destroyed_visual_churn_is_bounded_without_resetting_culled_priorities_or_pixels`,
+`visual_retirement_covers_expiry_delete_clear_and_preserved_handles`, and
+`buff_refresh_retires_gpu_models_and_same_key_appearance_stops_surface`.
+
+Actual character/prop/corpse destruction uses an immediate reset before fresh actor
+frames are applied; same-ID respawns therefore begin at authored priority without
+resetting that replacement again on the next frame. Distance/visibility culls and
+same-identity updates never erase native visual history. Pending resets record only
+previously emitted visuals, bounding message-only spawn/despawn churn.
+
+The existing 500,000,000-byte CPU model-cache budget is enforced within a zone,
+not just at zone changes. Live character/current-next models, props, loading models
+and pending clips are pinned. Unreferenced evictions also retire GPU models and
+cancel queued uploads/updates so they cannot resurrect; active working sets may
+exceed the budget until references disappear. Maintenance runs on actual cache or
+reference changes, not a per-frame pin-set rebuild.
+
 For baseline, apply **only the instrumentation patch** to `origin/main`; for after, apply
 the optimizations to that same instrumented revision. In each checkout run exactly:
 
@@ -188,7 +225,8 @@ For a longer memory investigation, add
 `AOMAC_ALLOC_COUNT=1 AOMAC_PERF_FRAMES=30000 AOMAC_PERF_REALTIME=1` to the replay
 invocation. This runs 500 seconds of fixed-60-Hz simulation paced against a
 monotonic wall clock, with memory snapshots every 600 frames and at the end.
-Without these options the original unpaced 600-frame benchmark is unchanged.
+Without these options the unpaced 600-frame workload is unchanged; its final
+report label is now `replay@600` (formerly `replay`).
 `AOMAC_ALLOC_COUNT` enables a **test-only** process-wide Rust/System allocator
 counter at test entry; it reports outstanding allocation/count deltas and total
 allocation/reallocation requests. Allocations made before enable are omitted,
@@ -342,6 +380,79 @@ real palette-only Player and an actual triangle hit to test Select, Shift-Info a
 first-person exclusion; bounds without a Player are not exact geometry.
 The subsequent additive Knowledge/Team rebase passed the affected `aomac` tests
 (1254 passed, 53 ignored) and another strict workspace/all-target release clippy.
+
+### Recorded live cache and retention comparison (2026-10-16)
+
+The before executable is `4a98542` plus the counting/performance harness; after is
+`37166dd` plus the ground/anchor caches, destruction retirement and in-zone model
+budget. The upstream delta is the unused `goto` harness correction/documentation.
+All measurements were headless, 1280×800, MSAA 1, `AOMAC_PERF=1`, audio muted,
+with allocation counting **off** for timings. Live used Aomacfixr, 12 s warmup,
+heading `-2.21`, inventory open, and fixed renderer camera
+`(924.12, 26.37, -759.85)`, yaw `-2.21`, pitch `-0.32`; Backspace selected actual
+walk mode 2 before 60 s idle and 60 s holding W+Left. Both sessions camped cleanly.
+The starting avatar positions differed by about 5.6 m and the live population
+could change; these are shared-Mac observations, not an isolated causal estimate.
+They should not be substituted directly for the earlier, differently viewed
+8 ms / 6 ms live profile.
+
+| Workload | Frame p50 before → after (ms) | Thread CPU mean before → after (ms) | Draws at reports before → after |
+|---|---:|---:|---:|
+| Live idle, 60 s | 4.297–5.569 → 4.579–4.819 | 3.171 → 2.280 | 924–955 → 925–943 |
+| Live walking, 60 s | 4.553–5.612 → 4.903–5.051 | 3.477 → 2.575 | 924–930 → 922–938 |
+| ICC replay, three-run median | 5.144 → 3.871 | 2.866 → 2.344 | 2307 → 2307 |
+
+Live percentile cells are the range of the individual 600-frame/tail interval
+percentiles, **not** a merged whole-session percentile. CPU means are frame-weighted
+across all measured intervals (idle 2525/2624 frames; walking 2513/2587).
+Live wall means were 5.092 → 4.523 ms idle and 5.215 → 4.816 ms walking.
+Replay alternated before/after order across three pairs, 120 warmup + 600 measured
+frames per process, with the existing fixed ICC camera. Replay p95 was
+5.838 → 5.310 ms. No duplicate character submission or culled-character draw was
+found: the own character is excluded from the remote loop, duplicate actor IDs
+are rejected, and visible mesh commands are submitted once in their native phase.
+The earlier recorded 675-draw replay figure was not reproduced at this baseline;
+the current before and after replays both report 2307.
+
+Memory was measured separately with allocation counting enabled. The 500 s before
+replay ended only 4 allocations / 505 requested bytes above its first 10 s snapshot,
+despite RSS increasing from 742.5 to 778.0 MiB. The after replay ran 72,000 paced
+frames (1200 s simulation, 1209.9 s wall) with Rust counters every 600 frames and
+native `heap`, `vmmap --summary` and `footprint` snapshots:
+
+| Snapshot (s) | Native malloc blocks | Native allocated heap (MiB) | Physical footprint (MiB) |
+|---:|---:|---:|---:|
+| 60 | 264090 | 233.302 | 897.816 |
+| 600 | 264094 | 233.302 | 898.442 |
+| 1140 | 264186 | 233.574 | 898.707 |
+
+After Rust outstanding requested bytes were 228,209,753 → 228,498,906, with the
+last 110 s constant apart from one transient 48-byte allocation. Temporary decode
+peaks recovered; Metal allocation stayed exactly 428,769,280 bytes. RSS itself
+still warmed from 735.8 to 764.4 MiB (last 60 s: 764.16–765.06 MiB), so it is
+**not** described as perfectly flat. `vmmap` showed the helper zone's allocated
+bytes unchanged at 224.0 MiB while empty/reusable medium-region residency grew;
+private dirty size was 225.1 MiB at both native endpoint snapshots. Together with
+the nearly constant counted heap/footprint, this identifies resident allocator
+high-water warming rather than proportional retained-allocation growth in this
+fixed workload. RSS alone would not establish that distinction.
+
+The fixed replay does not cover indefinite encounters or effect churn. Those
+separate, genuinely unbounded paths were fixed structurally: monotonically
+allocated effect/prop visual histories now retire on destruction, and inactive
+CPU/GPU model copies obey the existing budget within a zone. Churn regressions
+assert retained-state counts, preserve culled/reappearing actors, and compare
+non-vacuous colored RGBA against an equivalent unretired reference. The budget
+regression crosses the limit with pinned active models, checks exact evictions,
+and prevents queued uploads from resurrecting retired GPU models.
+
+Verification: full workspace release tests passed 2210, 66 ignored; after five
+test-only `drain().collect()` assertions were replaced with `mem::take`, 16 affected
+tests and fresh strict workspace/all-target release clippy passed. The installed
+connector pixel oracle was explicitly run and passed. The counting allocator is
+inside a `cfg(test)` module; `nm` found its counter symbols in the test executable
+and none in the normal release application, so the normal app has no counting hook.
+No real window, desktop input or desktop capture was used.
 
 ## Social/economy coverage inventory (2026-10-15)
 
