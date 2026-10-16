@@ -1,7 +1,7 @@
 //! Headless GPU proof: exercise the production compute dispatch, not a second test shader.
 use super::*;
 use ao_scene::{NativeSkinVertex, SkinBone, Vertex};
-use ao_formats::character::{actor::{ActorAssets, ActorRig, PoseCache}, *};
+use ao_formats::character::{actor::{ActorAssets, ActorRig, ComposedPoseCache, PoseCache}, *};
 use std::sync::Arc;
 
 fn renderer() -> Renderer {
@@ -333,6 +333,76 @@ fn native_skin_installed_cat_rigs_and_sixty_actor_crowd_are_pixel_identical_to_c
         previous = Some(expected);
     }
     assert!(byte_differences.is_empty(), "GPU/CPU vertex bytes differ (pixels were checked independently): {byte_differences:#?}");
+}
+
+/// Actual effect-anchor consumers: rasterize geometry at every cached/recursive connector, not just the CAT body.
+#[test]
+#[ignore = "installed CAT assets and headless GPU required; run alone with --ignored --exact"]
+fn native_anchor_generation_cache_is_pixel_identical_to_recursive_connectors() {
+    let dir = ao_gui::client_dir();
+    assert!(dir.join("cd_image/rdb.db").exists(), "anchor pixel fixture requires installed client at {}", dir.display());
+    let store = ao_rdb::RecordStore::open(&dir).unwrap();
+    let mut assets = ActorAssets::new(&store).unwrap();
+    // Untextured, two-sided markers isolate connector placement from the unrelated textured-CAT raster quarantine.
+    let marker = Scene {
+        meshes: vec![ao_scene::Mesh {
+            vertices: [(-0.12, -0.12), (0.12, -0.12), (0.12, 0.12), (-0.12, 0.12)].into_iter().map(|(x, y)| Vertex {
+                pos: [x, y, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0; 2], color: [1.0, 0.5, 0.25, 1.0],
+            }).collect(),
+            submeshes: vec![ao_scene::Submesh { two_sided: true, ..ao_scene::Submesh::new(vec![0, 1, 2, 0, 2, 3], None) }],
+        }],
+        ..Default::default()
+    };
+    let (mut cached, mut reference) = (renderer(), renderer());
+    cached.add_actor_model(1, &marker);
+    reference.add_actor_model(1, &marker);
+    let blank = pixels(&mut reference);
+    let mut memo = ComposedPoseCache::default();
+    let mut previous_pose = None;
+    let mut pose_changes_pixels = false;
+    for (model, head) in [(5900, Some(40098)), (5921, None), (29902, None), (5900, Some(40098))] {
+        let rig = ActorRig::new(&store, &assets, model, head, &PartTextures::new(), &PartLayers::new(), &[(1, 15839), (2, 7796)]).unwrap();
+        let clip_id = assets.clips(&store, model).unwrap().iter().find(|(name, _)| name == "walk").map(|(_, id)| *id)
+            .unwrap_or_else(|| compatible_animations(&store, rig.cat()).unwrap()[0].0);
+        let clip = assets.anim(&store, clip_id).unwrap();
+        for time in [None, Some(0.0), Some(173.0), Some(611.0)] {
+            let layers: Vec<_> = time.map(|ms| (AnimLayer { clip: &clip, ms, layers: 3, blend: 1.0 }, &clip)).into_iter()
+                .chain(time.map(|ms| (AnimLayer { clip: &clip, ms: ms + 91.0, layers: 2, blend: 0.375 }, &clip))).collect();
+            let pose = rig.composed_pose_cached(layers.iter().copied(), &mut memo);
+            for (position, yaw, scale) in [([0.0; 3], 0.0, 1.0), ([0.4, 0.0, -0.25], 0.0, 1.0),
+                ([0.4, 0.0, -0.25], 0.7, 1.0), ([0.4, 0.0, -0.25], 0.7, 0.8)] {
+                let world = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(scale), glam::Quat::from_rotation_y(yaw), position.into());
+                let mut actual = Vec::new();
+                let mut expected = Vec::new();
+                for (index, id) in [0, 3000, 3001].into_iter().chain(1000..=1018).chain(2000..=2023).enumerate() {
+                    let (a, b) = if id == 3000 || id == 3001 {
+                        let place = if id == 3000 { 1 } else { 2 };
+                        (rig.cached_weapon_effect_anchor(place, pose), rig.weapon_effect_anchor_composed(place, layers.iter().map(|(l, _)| *l)))
+                    } else {
+                        (rig.cached_effect_anchor(id, pose), rig.effect_anchor_composed(id, layers.iter().map(|(l, _)| *l)))
+                    };
+                    assert_eq!(a.map(|m| m.map(|c| c.map(f32::to_bits))), b.map(|m| m.map(|c| c.map(f32::to_bits))));
+                    let grid = glam::Mat4::from_translation(glam::Vec3::new((index % 8) as f32 * 1.3 - 4.5, (index / 8) as f32 * 0.65 - 1.0, 0.0));
+                    let frame = |m| ActorFrame { id: index as u32 + 1, model: 1, always: true,
+                        transform: (grid * world * glam::Mat4::from_cols_array_2d(&m)).to_cols_array_2d(), ..Default::default() };
+                    if let Some(m) = a { actual.push(frame(m)); }
+                    if let Some(m) = b { expected.push(frame(m)); }
+                }
+                assert!(!actual.is_empty(), "fixture must contain authored connectors");
+                cached.set_actors(actual);
+                reference.set_actors(expected);
+                let (a, b) = (pixels(&mut cached), pixels(&mut reference));
+                assert_ne!(b, blank, "real model {model} connectors must rasterize visible markers");
+                assert!(difference(&a, &b).is_none(), "model {model}, time {time:?}, yaw {yaw}, scale {scale}: {:?}", difference(&a, &b));
+                assert_eq!(a, pixels(&mut cached), "unchanged anchor scene must repeat identical RGBA");
+                if position == [0.0; 3] {
+                    if let Some(old) = previous_pose.take() { pose_changes_pixels |= b != old; }
+                    previous_pose = Some(b);
+                }
+            }
+        }
+    }
+    assert!(pose_changes_pixels, "real model/pose changes must affect connector pixels");
 }
 
 /// Controlled offline throughput evidence; correctness remains the separate strict byte/pixel tests above.

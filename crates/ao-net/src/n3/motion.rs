@@ -501,6 +501,44 @@ fn wrap(a: f32) -> f32 {
     if r == -std::f32::consts::PI { std::f32::consts::PI } else { r }
 }
 
+/// Exact callback inputs: float equality must distinguish signed zero and NaN payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SurfaceKey {
+    revision: u64,
+    positions: [[u32; 3]; 2],
+    body: [u32; 4],
+    state: [u32; 19],
+}
+
+impl SurfaceKey {
+    fn new(revision: u64, old: [f32; 3], new: [f32; 3], body: &Body, st: &SurfaceState) -> Self {
+        let liquid = st.liquid_info.map(|l| [1, l.level.to_bits(), l.kind,
+            l.normal[0].to_bits(), l.normal[1].to_bits(), l.normal[2].to_bits()]).unwrap_or([0; 6]);
+        Self {
+            revision,
+            positions: [old.map(f32::to_bits), new.map(f32::to_bits)],
+            body: [body.falling_enabled as u32, body.airborne as u32, body.vy.to_bits(), body.teleport as u32],
+            state: [
+                st.stuck, st.room as u32, st.last[0].to_bits(), st.last[1].to_bits(), st.last[2].to_bits(),
+                st.medium, st.wade_depth.to_bits(), st.in_liquid as u32, st.submersion.to_bits(),
+                liquid[0], liquid[1], liquid[2], liquid[3], liquid[4], liquid[5],
+                st.event.map_or(0, |e| match e {
+                    ao_formats::playfield::collision::LiquidEvent::Enter => 1,
+                    ao_formats::playfield::collision::LiquidEvent::Leave => 2,
+                }),
+                st.radius.to_bits(), st.heading.to_bits(), st.parented as u32,
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SurfaceMemo {
+    key: SurfaceKey,
+    state: SurfaceState,
+    aligned: Aligned,
+}
+
 /// Dead-reckoning state of one remote character. Feed it the dynel's messages in arrival order, call
 /// [`Mover::advance`] once per frame.
 #[derive(Clone, Debug)]
@@ -529,6 +567,7 @@ pub struct Mover {
     /// Turn started by a mouse-turn type (10/13): the vehicle's turn rate is 0, the heading comes with the messages.
     mouse_turn: bool,
     surface: SurfaceState,
+    surface_memo: Option<SurfaceMemo>,
     vy: f32,
     airborne: bool,
     placement_pending: bool,
@@ -568,6 +607,7 @@ impl Mover {
             reported_mode: None,
             mouse_turn: false,
             surface: SurfaceState::default(),
+            surface_memo: None,
             vy: 0.0,
             airborne: false,
             placement_pending: true,
@@ -920,15 +960,19 @@ impl Mover {
     }
 
     /// Run the same remote vehicle against the loaded playfield, in wire coordinates.
+    /// `revision` enables exact memoization only for a deterministic alignment callback whose
+    /// world and implementation remain unchanged for that globally unique revision.
+    /// Pass `None` for arbitrary callbacks or worlds without a generation.
     pub fn advance_with_surface(
         &mut self,
         dt: f32,
+        revision: Option<u64>,
         mut align: impl FnMut([f32; 3], [f32; 3], &Body, &mut SurfaceState) -> Aligned,
         mut ceiling: impl FnMut([f32; 3]) -> Option<f32>,
     ) -> Pose {
         if dt > 4.0 { return self.pose(); }
         if self.placement_pending {
-            self.align_surface(self.placement_from, true, &mut align);
+            self.align_surface(self.placement_from, true, revision, &mut align);
             self.placement_pending = false;
         }
         if self.jump_pending {
@@ -958,7 +1002,7 @@ impl Mover {
             if self.status.mode == Mode::Fly {
                 self.pos[1] += self.elevate_speed * h;
             }
-            self.align_surface(old, false, &mut align);
+            self.align_surface(old, false, revision, &mut align);
             left -= h;
         }
         self.pose()
@@ -969,7 +1013,7 @@ impl Mover {
     }
 
     fn align_surface(
-        &mut self, old: [f32; 3], teleport: bool,
+        &mut self, old: [f32; 3], teleport: bool, revision: Option<u64>,
         align: &mut impl FnMut([f32; 3], [f32; 3], &Body, &mut SurfaceState) -> Aligned,
     ) {
         if self.flags & 0x80000000 != 0 {
@@ -980,7 +1024,15 @@ impl Mover {
         let falling_enabled = self.falling_enabled();
         let body = Body { falling_enabled, airborne: self.airborne, vy: self.vy, teleport };
         self.surface.heading = self.yaw;
-        let r = align(old, self.pos, &body, &mut self.surface);
+        let key = revision.map(|revision| SurfaceKey::new(revision, old, self.pos, &body, &self.surface));
+        let r = if let Some(memo) = self.surface_memo.as_ref().filter(|memo| Some(&memo.key) == key.as_ref()) {
+            self.surface = memo.state;
+            memo.aligned
+        } else {
+            let aligned = align(old, self.pos, &body, &mut self.surface);
+            self.surface_memo = key.map(|key| SurfaceMemo { key, state: self.surface, aligned });
+            aligned
+        };
         self.pos = r.pos;
         match self.surface.event.take() {
             Some(ao_formats::playfield::collision::LiquidEvent::Enter) => {
@@ -1136,6 +1188,158 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn surface_memo_matches_uncached_remote_sequences() {
+        use ao_formats::playfield::collision::Collision;
+        let mut world = Collision::from_scene(&Default::default());
+        let mut cached = Mover::new([0.0, 0.2, 0.0], 0.0);
+        cached.set_features(4);
+        cached.on_stat(16, 0);
+        cached.on_stat(17, 0);
+        cached.on_stat(215, 0);
+        let mut uncached = cached.clone();
+        let mut calls = 0;
+        let mut idle_calls = 0;
+        for frame in 0..720 {
+            if frame == 500 { world = Collision::from_scene(&Default::default()); }
+            for m in [&mut cached, &mut uncached] {
+                match frame {
+                    120 => { m.on_move_type(MoveType::ForwardStart as u8); }
+                    160 => { m.on_move_type(MoveType::ForwardStop as u8); }
+                    180 => m.yaw = -0.0,
+                    181 => m.yaw = 0.0,
+                    190 => m.yaw = 0.75,
+                    200 => m.set_body_radius(0.8),
+                    210 => m.surface.parented = true,
+                    220 => m.surface.parented = false,
+                    230 => { m.on_move_type(MoveType::JumpStart as u8); }
+                    300 => { m.on_teleport([0.0, 5.0, 0.0], &[0.0, 0.0, 0.0, 1.0]); }
+                    380 => { m.on_move_type(MoveType::SwitchToSwimMode as u8); }
+                    400 => { m.on_move_type(MoveType::LeaveSwimMode as u8); }
+                    420 => { m.on_move_type(MoveType::SwitchToFlyMode as u8); }
+                    440 => { m.on_move_type(MoveType::ElevateUpStart as u8); }
+                    460 => { m.on_move_type(MoveType::SwitchToRunMode as u8); }
+                    520 => m.surface.medium = 4,
+                    540 => m.surface.medium = 0,
+                    560 => { m.on_stat(0, i32::MIN); }
+                    580 => { m.on_stat(0, 0); }
+                    _ => {}
+                }
+            }
+            let a = cached.advance_with_surface(1.0 / 60.0, Some(world.revision()), |old, new, body, st| {
+                calls += 1;
+                world.align(old, new, body, st)
+            }, |_| Some(10.0));
+            let b = uncached.advance_with_surface(1.0 / 60.0, None,
+                |old, new, body, st| world.align(old, new, body, st), |_| Some(10.0));
+            assert_eq!(a.pos.map(f32::to_bits), b.pos.map(f32::to_bits), "frame {frame}");
+            assert_eq!(a.yaw.to_bits(), b.yaw.to_bits());
+            assert_eq!(a.speed.to_bits(), b.speed.to_bits());
+            let body = |m: &Mover| Body { falling_enabled: m.falling_enabled(), airborne: m.airborne, vy: m.vy, teleport: false };
+            assert_eq!(SurfaceKey::new(0, cached.pos, a.pos, &body(&cached), &cached.surface),
+                SurfaceKey::new(0, uncached.pos, b.pos, &body(&uncached), &uncached.surface), "frame {frame}");
+            // Compare all remaining retained FSM/reconcile/input fields, excluding only the memo.
+            let mut without_memo = cached.clone();
+            without_memo.surface_memo = None;
+            assert_eq!(format!("{without_memo:?}"), format!("{uncached:?}"), "frame {frame}");
+            if frame == 10 { idle_calls = calls; }
+            if frame == 119 { assert_eq!(calls, idle_calls, "settled idle never aligns again"); }
+        }
+    }
+
+    #[test]
+    fn surface_memo_replays_output_and_requires_generation() {
+        use ao_formats::playfield::collision::{Liquid, LiquidEvent};
+        let mut m = Mover::new([0.0; 3], 0.0);
+        let calls = std::cell::Cell::new(0);
+        let mut align = |_, pos, _: &Body, st: &mut SurfaceState| {
+            calls.set(calls.get() + 1);
+            st.stuck = (st.stuck + 1).min(2);
+            st.last = pos;
+            st.liquid_info = Some(Liquid { level: 2.0, kind: 7, normal: [0.0, 1.0, -0.0] });
+            st.event = (!st.in_liquid).then_some(LiquidEvent::Enter);
+            st.in_liquid = true;
+            Aligned { pos, airborne: false, normal: [0.0, 1.0, 0.0], liquid: 2.0 }
+        };
+        let initial = m.clone();
+        m.align_surface(m.pos, false, Some(1), &mut align);
+        let first_output = m.surface;
+        // Identical callback inputs must restore the output state, not just its aligned position.
+        m.surface = initial.surface;
+        m.status = initial.status;
+        m.align_surface(m.pos, false, Some(1), &mut align);
+        assert_eq!(m.surface, first_output);
+        assert_eq!(m.status.mode, Mode::Swim);
+        for _ in 0..20 { m.align_surface(m.pos, false, Some(1), &mut align); }
+        assert_eq!(calls.get(), 3, "one miss per changing input state, then settled hits");
+        let mut align = |_, pos, _: &Body, _: &mut SurfaceState| {
+            calls.set(calls.get() + 1);
+            Aligned { pos, airborne: false, normal: [0.0, 1.0, 0.0], liquid: 2.0 }
+        };
+        m.align_surface(m.pos, false, Some(2), &mut align);
+        for _ in 0..3 { m.align_surface(m.pos, false, None, &mut align); }
+        assert_eq!(calls.get(), 7, "new generation misses and unversioned callbacks always run");
+    }
+
+    #[test]
+    fn surface_key_covers_every_input_bit() {
+        use ao_formats::playfield::collision::{Liquid, LiquidEvent};
+        let st = SurfaceState::default();
+        let key = |st: &SurfaceState| SurfaceKey::new(1, [0.0; 3], [0.0; 3], &Body::WALKING, st);
+        let original = key(&st);
+        macro_rules! changed {
+            ($field:ident, $value:expr) => {{
+                let mut next = st;
+                next.$field = $value;
+                assert_ne!(original, key(&next), stringify!($field));
+            }};
+        }
+        changed!(stuck, 1);
+        changed!(room, 0);
+        changed!(medium, 1);
+        changed!(wade_depth, -0.0);
+        changed!(in_liquid, true);
+        changed!(submersion, -0.0);
+        changed!(event, Some(LiquidEvent::Enter));
+        changed!(event, Some(LiquidEvent::Leave));
+        changed!(radius, -0.0);
+        changed!(heading, -0.0);
+        changed!(parented, true);
+        for i in 0..3 {
+            let mut last = st.last;
+            last[i] = -0.0;
+            changed!(last, last);
+            let mut p = [0.0; 3];
+            p[i] = -0.0;
+            assert_ne!(original, SurfaceKey::new(1, p, [0.0; 3], &Body::WALKING, &st));
+            assert_ne!(original, SurfaceKey::new(1, [0.0; 3], p, &Body::WALKING, &st));
+        }
+        let liquid = Liquid { level: 0.0, kind: 0, normal: [0.0; 3] };
+        let wet = SurfaceState { liquid_info: Some(liquid), ..st };
+        assert_ne!(original, key(&wet));
+        for next in [
+            Liquid { level: -0.0, ..liquid }, Liquid { kind: 1, ..liquid },
+            Liquid { normal: [-0.0, 0.0, 0.0], ..liquid },
+            Liquid { normal: [0.0, -0.0, 0.0], ..liquid },
+            Liquid { normal: [0.0, 0.0, -0.0], ..liquid },
+        ] {
+            assert_ne!(key(&wet), key(&SurfaceState { liquid_info: Some(next), ..st }));
+        }
+        for body in [
+            Body { falling_enabled: false, ..Body::WALKING },
+            Body { airborne: true, ..Body::WALKING },
+            Body { vy: -0.0, ..Body::WALKING },
+            Body { teleport: true, ..Body::WALKING },
+        ] {
+            assert_ne!(original, SurfaceKey::new(1, [0.0; 3], [0.0; 3], &body, &st));
+        }
+        assert_ne!(original, SurfaceKey::new(2, [0.0; 3], [0.0; 3], &Body::WALKING, &st));
+        changed!(heading, f32::from_bits(0x7fc00001));
+        let nan = SurfaceState { heading: f32::from_bits(0x7fc00001), ..st };
+        assert_eq!(key(&nan), key(&nan), "identical NaN payload is an exact input");
+        assert_ne!(key(&nan), key(&SurfaceState { heading: f32::from_bits(0x7fc00002), ..st }));
+    }
+
+    #[test]
     fn remote_flight_spell_bypasses_received_gate_and_exits_postures() {
         let dc = CharDCMove { move_type: 29, type_bit7: false, rot: [0.0, 0.0, 0.0, 1.0], pos: [0.0, 8.0, 0.0], time: 0, extra: [0.0; 2] };
         for (npc, gm, allowed) in [(false, 0, false), (false, 2, false), (false, 1, true), (true, 0, true)] {
@@ -1270,7 +1474,7 @@ mod tests {
         m: &mut Mover, dt: f32, floor: impl Fn([f32; 3]) -> f32,
         ceiling: impl FnMut([f32; 3]) -> Option<f32>,
     ) -> Pose {
-        m.advance_with_surface(dt, |_, mut pos, body, _| {
+        m.advance_with_surface(dt, None, |_, mut pos, body, _| {
             let ground = floor(pos);
             let supported = pos[1] - 0.48 <= ground && body.vy <= 0.1;
             pos[1] = if body.falling_enabled && supported { ground } else { pos[1].max(ground) };

@@ -213,9 +213,10 @@ Mover::new(pos:[f32;3], yaw:f32)   Mover::with_blob(pos, yaw, &blob)         // 
 Mover::set_features(i32)  set_sit_allowed(bool)  set_body_scale(f32)  set_body_radius(f32)  restore_blob(&[u8])  on_stat(stat:i32, value:i32)  // Flags, Strength, Agility, GmLevel, MonsterScale
 Mover::on_char_dc_move(&CharDCMove)  on_wanted_direction([f32;3])  on_follow_target(&FollowTarget)->bool  on_move_type(u8)->bool
 Mover::advance(dt:f32)->Pose{pos,yaw,anim,speed}   pose()   sim_pos()   status()   path()   skill()
-Mover::advance_with_surface(dt, align(old,new,&Body,&mut SurfaceState)->Aligned, ceiling(pos)->Option<f32>)->Pose
+Mover::advance_with_surface(dt, revision:Option<u64>, align(old,new,&Body,&mut SurfaceState)->Aligned, ceiling(pos)->Option<f32>)->Pose
 ```
 Typical loaded-world wiring: on `SimpleCharFullUpdate` create `Mover::new(c.pos, c.yaw().unwrap_or(0.0))`, feed speed/health/Flags and body properties, the record's Features, then `restore_blob(&c.blob)` and the full-update path. Feed every later DC/Teleport/FollowTarget/WantedDirection/Stat to it. Resolve placements with `advance_with_surface(0, ...)` before exposing their pose and advance each frame with the same loaded collision adapter; draw the resolved `Pose.pos`, `Pose.yaw` and `anim.anim_id()` without a second terrain clamp. Geometry-free tools use `advance(dt)` for planar dead reckoning. Remove on `ToClientQuit`.
+The loaded-world adapter passes `Some(collision.revision())`: an allocation-free memo reuses ground alignment only when the terrain generation and every callback-input float bit/state field match, replaying the original output state and alignment. Collision replacement and actual door changes mint a new generation. Arbitrary/stateful callbacks pass `None` to disable memoization.
 
 ## 6. Name tags (`ao_net::n3::nametag`)
 

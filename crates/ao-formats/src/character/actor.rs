@@ -178,10 +178,22 @@ struct Mount {
 }
 
 /// Native RCAT skeleton state retained between distance-decimated skin refreshes.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PoseCache {
-    frames: Vec<Option<Xf>>,
+    frames: Arc<Vec<Option<Xf>>>,
     animated: bool,
+}
+
+/// One current composed generation per actor, separate from its distance-decimated displayed pose.
+/// Retaining the clip/model Arcs makes identity keys safe even after replacement and allocator reuse.
+#[derive(Default)]
+pub struct ComposedPoseCache {
+    model: Option<Arc<Scene>>,
+    layers: Vec<(Arc<CatAnim>, u32, u32, u32)>,
+    pose: Option<PoseCache>,
+    head: Option<Option<[f32; 3]>>,
+    #[cfg(test)]
+    head_samples: usize,
 }
 
 pub struct ActorRig {
@@ -364,6 +376,13 @@ impl ActorRig {
         Some(bone.mul(&Xf::from_qt(att.rot, att.pos)).t)
     }
 
+    pub fn cached_head_attractor(&self, pose: &PoseCache) -> Option<[f32; 3]> {
+        let att = self.cat.attractors.iter().find(|a| a.name.ends_with("_head"))?;
+        let b = att.bone as usize;
+        let bone = pose.frames[b].or_else(|| (!pose.animated).then(|| self.nearest_frame(&pose.frames, b)).flatten())?;
+        Some(bone.mul(&Xf::from_qt(att.rot, att.pos)).t)
+    }
+
     /// Retail effect binding (GC 0x10105917), column-major model scene matrix.
     /// Missing authored geometry is not replaced with an invented offset.
     pub fn effect_anchor(&self, id: i32, clip: Option<(&CatAnim, f32)>) -> Option<[[f32; 4]; 4]> {
@@ -472,13 +491,18 @@ impl ActorRig {
     }
 
     pub fn pose_composed_cached<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>, cache: &mut PoseCache) -> (Vec<Vertex>, Vec<[[f32; 4]; 4]>) {
-        self.sample_cached(layers, cache);
+        *cache = self.sample_composed(layers);
         (self.skin_cached(cache), self.cached_parts(cache))
     }
 
     /// Samples bones and rigid mounts without touching body vertices. Empty palette means authored bind pose.
     pub fn pose_palette_composed_cached<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>, cache: &mut PoseCache) -> (Arc<Vec<ao_scene::SkinBone>>, Vec<[[f32; 4]; 4]>) {
-        self.sample_cached(layers, cache);
+        *cache = self.sample_composed(layers);
+        self.palette_cached(cache)
+    }
+
+    /// Build the renderer palette from an already sampled generation.
+    pub fn palette_cached(&self, cache: &PoseCache) -> (Arc<Vec<ao_scene::SkinBone>>, Vec<[[f32; 4]; 4]>) {
         let palette = Arc::new(if cache.animated {
             cache.frames.iter().map(|frame| {
                 let frame = frame.unwrap_or(Xf::ID);
@@ -488,9 +512,44 @@ impl ActorRig {
         (palette, self.cached_parts(cache))
     }
 
-    fn sample_cached<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>, cache: &mut PoseCache) {
-        cache.animated = layers.clone().any(|l| l.clip.signature == self.cat.signature);
-        cache.frames = if cache.animated { self.world(layers) } else { self.bind.clone() };
+    fn sample_composed<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>) -> PoseCache {
+        let animated = layers.clone().any(|l| l.clip.signature == self.cat.signature);
+        PoseCache { frames: Arc::new(if animated { self.world(layers) } else { self.bind.clone() }), animated }
+    }
+
+    /// Sample every bone once with the same parent/local multiplication order as `effect_bone`.
+    /// Keys are exact ordered layer inputs; translation, heading and scale remain caller-owned.
+    pub fn composed_pose_cached<'a, 'c>(&self, layers: impl Clone + Iterator<Item = (AnimLayer<'a>, &'a Arc<CatAnim>)>, cache: &'c mut ComposedPoseCache) -> &'c PoseCache {
+        self.refresh_composed_generation(layers.clone(), cache);
+        cache.pose.get_or_insert_with(|| self.sample_composed(layers.map(|(layer, _)| layer)))
+    }
+
+    /// Head-only consumers keep the original allocation-free ancestor walk on a generation miss.
+    /// They must not force full skeleton sampling for culled or cadence-skipped actors.
+    pub fn composed_head_cached<'a>(&self, layers: impl Clone + Iterator<Item = (AnimLayer<'a>, &'a Arc<CatAnim>)>, cache: &mut ComposedPoseCache) -> Option<[f32; 3]> {
+        self.refresh_composed_generation(layers.clone(), cache);
+        if let Some(pose) = &cache.pose { return self.cached_head_attractor(pose); }
+        if let Some(head) = cache.head { return head; }
+        #[cfg(test)]
+        { cache.head_samples += 1; }
+        let head = self.head_attractor_composed(layers.map(|(layer, _)| layer));
+        cache.head = Some(head);
+        head
+    }
+
+    fn refresh_composed_generation<'a>(&self, layers: impl Clone + Iterator<Item = (AnimLayer<'a>, &'a Arc<CatAnim>)>, cache: &mut ComposedPoseCache) {
+        let mut previous = cache.layers.iter();
+        let same = cache.model.as_ref().is_some_and(|model| Arc::ptr_eq(model, &self.model))
+            && layers.clone().all(|(layer, clip)| previous.next().is_some_and(|(old, ms, mask, blend)|
+                Arc::ptr_eq(clip, old) && layer.ms.to_bits() == *ms && layer.layers == *mask && layer.blend.to_bits() == *blend))
+            && previous.next().is_none();
+        if !same {
+            cache.pose = None;
+            cache.head = None;
+            cache.layers.clear();
+            cache.layers.extend(layers.map(|(layer, clip)| (Arc::clone(clip), layer.ms.to_bits(), layer.layers, layer.blend.to_bits())));
+            cache.model = Some(Arc::clone(&self.model));
+        }
     }
 
     /// CPU geometry for an actual picking/effect consumer, using exactly the last displayed sample.
@@ -597,6 +656,88 @@ mod tests {
     fn store() -> Option<RecordStore> {
         let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Games/ProjectRubiKa/client");
         RecordStore::open(&dir).ok()
+    }
+
+    #[test]
+    fn head_only_generation_cache_is_lazy_and_invalidates_on_layers_and_model_identity() {
+        let Some(store) = store() else { return };
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let mut cache = ComposedPoseCache::default();
+        let mut shared_clip = None;
+        let bits = |head: Option<[f32; 3]>| head.map(|p| p.map(f32::to_bits));
+        for model in [5900, 5921, 29902, 5900] {
+            let rig = ActorRig::new(&store, &assets, model, None, &PartTextures::new(), &PartLayers::new(), &[]).unwrap();
+            let clip: &Arc<CatAnim> = shared_clip.get_or_insert_with(|| {
+                let id = assets.clips(&store, model).unwrap().first().unwrap().1;
+                assets.anim(&store, id).unwrap()
+            });
+            // The last/first layer keys across distinct rigs are identical: only model identity changes.
+            for (ms, mask, blend) in [(173.0, 3, 1.0), (0.0, 3, 1.0), (-0.0, 3, 1.0), (173.0, 2, 1.0), (173.0, 2, 0.375), (173.0, 3, 1.0)] {
+                let layers = std::iter::once((AnimLayer { clip, ms, layers: mask, blend }, clip));
+                let expected = rig.head_attractor_composed(layers.clone().map(|(layer, _)| layer));
+                let before = cache.head_samples;
+                let head = rig.composed_head_cached(layers.clone(), &mut cache);
+                assert_eq!(bits(head), bits(expected));
+                assert!(cache.pose.is_none(), "head-only requests never materialize full skeleton matrices");
+                assert_eq!(cache.head, Some(head), "missing authored heads are cached too");
+                assert_eq!(cache.head_samples, before + 1, "changed layer/model generation walks the head chain once");
+                assert_eq!(bits(rig.composed_head_cached(layers.clone(), &mut cache)), bits(expected));
+                assert!(cache.pose.is_none());
+                assert_eq!(cache.head_samples, before + 1, "second per-frame head request does not resample recursively");
+                let full_head = rig.cached_head_attractor(rig.composed_pose_cached(layers.clone(), &mut cache));
+                assert_eq!(bits(full_head), bits(expected));
+                assert!(cache.pose.is_some(), "an actual palette/anchor consumer materializes the skeleton");
+                assert_eq!(bits(rig.composed_head_cached(layers, &mut cache)), bits(expected));
+                assert_eq!(cache.head_samples, before + 1, "full-pose head lookup never walks the chain again");
+            }
+        }
+    }
+
+    #[test]
+    fn composed_anchor_generation_cache_matches_recursive_bits_and_reuses_frames() {
+        let Some(store) = store() else { return };
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let mut cache = ComposedPoseCache::default();
+        let bits = |m: Option<[[f32; 4]; 4]>| m.map(|m| m.map(|c| c.map(f32::to_bits)));
+        for model in [5900, 5921, 29902, 5900] {
+            let rig = ActorRig::new(&store, &assets, model, None, &PartTextures::new(), &PartLayers::new(), &[(1, 15839), (2, 7796)]).unwrap();
+            let previous_bind = cache.pose.as_ref().map(|pose| pose.frames.clone());
+            let bind = rig.composed_pose_cached(std::iter::empty(), &mut cache);
+            if let Some(previous) = previous_bind {
+                assert!(!Arc::ptr_eq(&previous, &bind.frames), "distinct rigs with identical empty layer keys must invalidate actual matrices");
+            }
+            let clip_id = assets.clips(&store, model).unwrap().first().unwrap().1;
+            let clip = assets.anim(&store, clip_id).unwrap();
+            let replacement = Arc::new((*clip).clone());
+            for animated in [false, true] {
+                for active in [&clip, &replacement] {
+                    for (ms, mask, blend) in [(0.0, 3, 1.0), (-0.0, 3, 1.0), (173.0, 3, 1.0), (173.0, 2, 1.0), (173.0, 2, 0.375), (611.0, 1, 0.75)] {
+                        let layers: Vec<_> = animated.then_some((AnimLayer { clip: active, ms, layers: 3, blend: 1.0 }, active)).into_iter()
+                            .chain(animated.then_some((AnimLayer { clip: &clip, ms: ms + 71.0, layers: mask, blend }, &clip))).collect();
+                        let before = cache.pose.as_ref().map(|pose| pose.frames.clone());
+                        let pose = rig.composed_pose_cached(layers.iter().copied(), &mut cache).clone();
+                        if animated { assert!(before.as_ref().is_none_or(|before| !Arc::ptr_eq(before, &pose.frames)), "changed generation resamples"); }
+                        let frames = pose.frames.clone();
+                        let same = rig.composed_pose_cached(layers.iter().copied(), &mut cache);
+                        assert!(Arc::ptr_eq(&frames, &same.frames), "all requests in a generation share actual bone matrices");
+                        for id in [0, 999, 3000, 3001, i32::MAX].into_iter().chain(1000..=1018).chain(2000..=2023) {
+                            assert_eq!(bits(rig.cached_effect_anchor(id, same)), bits(rig.effect_anchor_composed(id, layers.iter().map(|(l, _)| *l))), "model {model} anchor {id}");
+                        }
+                        for place in [1, 2, 3] {
+                            assert_eq!(bits(rig.cached_weapon_effect_anchor(place, same)), bits(rig.weapon_effect_anchor_composed(place, layers.iter().map(|(l, _)| *l))));
+                        }
+                        assert_eq!(rig.cached_head_attractor(same).map(|p| p.map(f32::to_bits)),
+                            rig.head_attractor_composed(layers.iter().map(|(l, _)| *l)).map(|p| p.map(f32::to_bits)));
+                        assert_eq!(cache.layers.len(), layers.len(), "only the current generation is retained");
+                    }
+                }
+            }
+            let original = rig.composed_pose_cached(std::iter::once((AnimLayer { clip: &clip, ms: 173.0, layers: 3, blend: 1.0 }, &clip)), &mut cache).frames.clone();
+            let replaced = rig.composed_pose_cached(std::iter::once((AnimLayer { clip: &replacement, ms: 173.0, layers: 3, blend: 1.0 }, &replacement)), &mut cache);
+            assert!(!Arc::ptr_eq(&original, &replaced.frames), "same-source-id replacement clips invalidate by retained identity");
+            // Leave the identical empty layer key for the next distinct rig: only model identity changes.
+            rig.composed_pose_cached(std::iter::empty(), &mut cache);
+        }
     }
 
     #[test]

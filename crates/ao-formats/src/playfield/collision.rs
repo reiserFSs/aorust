@@ -15,6 +15,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use ao_rdb::RecordStore;
 use ao_scene::{Scene, IDENTITY};
 
@@ -45,6 +46,13 @@ pub const GROUND_MATERIAL_TOLERANCE: f32 = 0.1;
 const CELL: f32 = 4.0;
 /// A triangle covering more grid cells than this is kept in the always-tested list.
 const BIG_CELLS: usize = 256;
+
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_REVISION.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .expect("collision revision exhausted")
+}
 
 /// A liquid volume at a point.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,6 +92,7 @@ struct Terrain {
 }
 
 pub struct Collision {
+    revision: u64,
     tris: Vec<Tri>,
     /// CSR grid over xz: `start[cell]..start[cell + 1]` indexes `items`.
     origin: [f32; 2],
@@ -294,6 +303,9 @@ impl Terrain {
 }
 
 impl Collision {
+    /// Globally unique world generation, including collision replacement and actual door changes.
+    pub fn revision(&self) -> u64 { self.revision }
+
     /// Native playfield resource tilemap id (`+0x1c`) and flags (`+0x50`).
     pub fn effect_resource(&self) -> Option<(u32, u32)> { self.resource }
 
@@ -349,7 +361,7 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, origin: lo, dims, cell, start, items, big, terrain, rooms, liquids, portals: portal::Portals::default(), zone_size: 1, kd_zones: HashSet::new(), resource: None }
+        Collision { revision: next_revision(), tris, origin: lo, dims, cell, start, items, big, terrain, rooms, liquids, portals: portal::Portals::default(), zone_size: 1, kd_zones: HashSet::new(), resource: None }
     }
 
     /// Collision of the loaded scene's identity-placed meshes (terrain, room shells): the documented fallback when the
@@ -647,11 +659,8 @@ impl Collision {
     pub fn set_door_passable(&mut self, a: u16, b: u16, passable: bool) {
         if let Some(r) = &mut self.rooms {
             let k = (a.min(b), a.max(b));
-            if passable {
-                r.blocked.remove(&k);
-            } else {
-                r.blocked.insert(k);
-            }
+            let changed = if passable { r.blocked.remove(&k) } else { r.blocked.insert(k) };
+            if changed { self.revision = next_revision(); }
         }
     }
 
@@ -662,11 +671,8 @@ impl Collision {
         if let Some(r) = &mut self.rooms {
             let k = (a.min(b), a.max(b));
             if a != b && a != 0xffff && b != 0xffff && r.links.contains(&k) {
-                if open {
-                    r.open.insert(k);
-                } else {
-                    r.open.remove(&k);
-                }
+                let changed = if open { r.open.insert(k) } else { r.open.remove(&k) };
+                if changed { self.revision = next_revision(); }
             }
         }
     }
@@ -802,6 +808,63 @@ fn room_safe_pos(g: &Gnda, room: &Room, min_floor: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collision_revisions_distinguish_replacements_and_ignore_absent_doors() {
+        let mut a = Collision::from_scene(&Scene::default());
+        let b = Collision::from_scene(&Scene::default());
+        assert_ne!(a.revision(), b.revision());
+        let revision = a.revision();
+        a.set_door_passable(0, 1, false);
+        a.set_door_open(0, 1, true);
+        assert_eq!(a.revision(), revision, "no rooms means no door state changed");
+    }
+
+    #[test]
+    fn installed_door_revisions_change_only_with_actual_state() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let store = RecordStore::open(&dir).unwrap();
+        // The Arrival Hall (4604) has no authored room links. Use the same real linked
+        // door fixture as collision_real::collision_door_open_flag_of_a_real_link.
+        let mut c = Collision::load(&store, 6131).unwrap(); // ICC Holodeck Alien Training
+        let links = c.room_links();
+        assert_eq!(links.len(), 1, "ICC Holodeck must retain its authored door link");
+        let (a, b) = links.first().copied().expect("ICC Holodeck authored door link");
+        assert!(c.room_transition_allowed(a as i32, b as i32));
+        assert!(!c.door_open_between(a as usize, b as usize));
+        let initial = c.revision();
+        c.set_door_passable(a, b, true);
+        c.set_door_open(a, b, false);
+        c.set_door_open(a, a, true);
+        c.set_door_open(a, 0xffff, true);
+        assert_eq!(c.revision(), initial);
+        c.set_door_passable(a, b, false);
+        let blocked = c.revision();
+        assert_ne!(blocked, initial);
+        assert!(!c.room_transition_allowed(a as i32, b as i32));
+        c.set_door_passable(b, a, false);
+        assert_eq!(c.revision(), blocked);
+        c.set_door_open(a, b, true);
+        let open = c.revision();
+        assert_ne!(open, blocked);
+        assert!(c.door_open_between(a as usize, b as usize));
+        c.set_door_open(b, a, true);
+        assert_eq!(c.revision(), open);
+        c.set_door_passable(b, a, true);
+        let passable = c.revision();
+        assert_ne!(passable, open);
+        assert!(c.room_transition_allowed(a as i32, b as i32));
+        c.set_door_passable(a, b, true);
+        assert_eq!(c.revision(), passable);
+        c.set_door_open(b, a, false);
+        let closed = c.revision();
+        assert_ne!(closed, passable);
+        assert!(!c.door_open_between(a as usize, b as usize));
+        c.set_door_open(a, b, false);
+        assert_eq!(c.revision(), closed);
+    }
 
     fn quad(y: f32, x0: f32, x1: f32, z0: f32, z1: f32) -> Vec<Tri> {
         let v = |x, z| [x, y, z];

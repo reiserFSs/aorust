@@ -373,6 +373,7 @@ pub struct Avatar {
     sample_pose: std::cell::Cell<bool>,
     cadence: ao_formats::character::AnimationCadence,
     pose_cache: std::cell::RefCell<ao_formats::character::actor::PoseCache>,
+    composed_pose: std::cell::RefCell<ao_formats::character::actor::ComposedPoseCache>,
     anim_set: &'static str,
     /// What `rig` was built from (full update plus [`Avatar::set_appearance`] deltas).
     look: PlayerLook,
@@ -447,7 +448,7 @@ impl Avatar {
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let resolution = u.pairs.iter().rev().find(|p| p.0 == 0x378).map_or(0, |p| p.1);
         let rig = ActorRig::humanoid_with_textures(store, &assets, &l.look, u.mode, resolution, &l.attachments, &[])?;
-        let mut a = Self { id, rig, current_skin: Default::default(), current_palette: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, body_mode: u.mode, body_resolution: resolution, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), monster_data: 0, monster: None, monster_look: super::dynels::CharLook::from_update(u), monster_rand: ao_scene::CrtRand::thread(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, body_once: false, body_finish: None, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, holder_idle: None, stance_changed: false, ms: 0.0, body_delay_ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_once: false, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, current_skin: Default::default(), current_palette: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), composed_pose: Default::default(), look: l.look, body_mode: u.mode, body_resolution: resolution, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), monster_data: 0, monster: None, monster_look: super::dynels::CharLook::from_update(u), monster_rand: ao_scene::CrtRand::thread(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, body_once: false, body_finish: None, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, holder_idle: None, stance_changed: false, ms: 0.0, body_delay_ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_once: false, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -470,6 +471,7 @@ impl Avatar {
         self.current_bounds.set(None);
         self.current_parts.get_mut().clear();
         *self.pose_cache.get_mut() = Default::default();
+        *self.composed_pose.get_mut() = Default::default();
         self.sample_pose.set(true);
     }
 
@@ -901,18 +903,24 @@ impl Avatar {
         if self.body_finish.is_some_and(|(end, _)| self.ms >= end) { self.clip = None; }
     }
 
+    #[cfg(test)]
     fn layers(&self) -> impl Clone + Iterator<Item = ao_formats::character::AnimLayer<'_>> {
+        self.layer_sources().map(|(layer, _)| layer)
+    }
+
+    fn layer_sources(&self) -> impl Clone + Iterator<Item = (ao_formats::character::AnimLayer<'_>, &Arc<CatAnim>)> {
         use ao_formats::character::AnimLayer;
-        let prev_body = self.prev_clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.prev_ms, self.prev_once), layers: self.body_layers, blend: 1.0 });
+        let prev_body = self.prev_clip.as_ref().map(|a| (AnimLayer { clip: a, ms: clip_time(a, self.prev_ms, self.prev_once), layers: self.body_layers, blend: 1.0 }, a));
         let body_blend = if self.prev_clip.is_some() { (self.prev_fade_elapsed / self.prev_fade_ms).clamp(0.0, 1.0) } else { 1.0 };
         let body_blend = self.body_finish.map_or(body_blend, |(end, _)| body_blend.min(((end - self.ms) / self.prev_fade_ms.max(200.0)).clamp(0.0, 1.0)));
-        let body = self.clip.as_ref().map(|a| AnimLayer { clip: a, ms: clip_time(a, self.ms, self.one_shot()), layers: self.body_layers, blend: body_blend });
+        let body = self.clip.as_ref().map(|a| (AnimLayer { clip: a, ms: clip_time(a, self.ms, self.one_shot()), layers: self.body_layers, blend: body_blend }, a));
         let high = self.actions.partition_point(|a| a.priority > self.body_priority);
         let at = self.actions.partition_point(|a| a.priority > self.body_priority || (a.priority == self.body_priority && a.before_body));
         let (higher, rest) = self.actions.split_at(high);
         let (older, after) = rest.split_at(at - high);
-        higher.iter().map(ActionClip::sample).chain(prev_body).chain(older.iter().map(ActionClip::sample))
-            .chain(body).chain(after.iter().map(ActionClip::sample))
+        fn action(a: &ActionClip) -> (AnimLayer<'_>, &Arc<CatAnim>) { (a.sample(), &a.clip) }
+        higher.iter().map(action).chain(prev_body).chain(older.iter().map(action))
+            .chain(body).chain(after.iter().map(action))
     }
 
     /// Own CAT mesh uses the same native camera-distance refresh policy as remote meshes.
@@ -923,7 +931,9 @@ impl Avatar {
 
     fn refresh_pose(&self) {
         if self.sample_pose.replace(false) || self.current_palette.borrow().is_none() {
-            let (palette, parts) = self.rig.pose_palette_composed_cached(self.layers(), &mut self.pose_cache.borrow_mut());
+            let pose = self.rig.composed_pose_cached(self.layer_sources(), &mut self.composed_pose.borrow_mut()).clone();
+            let (palette, parts) = self.rig.palette_cached(&pose);
+            *self.pose_cache.borrow_mut() = pose;
             if self.current_bounds.get().is_none() {
                 let radius = 2.0 * self.rig.bounding_radius + ao_render::POSE_MARGIN;
                 self.current_bounds.set(super::hud_pick::bounds_of(self.rig.model().meshes[0].vertices.iter().map(|vertex| &vertex.pos))
@@ -1030,7 +1040,8 @@ impl Avatar {
 
     /// Scaled local head attractor (`N3 FUN_10020af1`), before the avatar heading.
     pub fn head_local(&self) -> Option<Vec3> {
-        self.rig.head_attractor_composed(self.layers()).map(|p| Vec3::from(p) * self.scale)
+        let mut cache = self.composed_pose.borrow_mut();
+        self.rig.composed_head_cached(self.layer_sources(), &mut cache).map(|p| Vec3::from(p) * self.scale)
     }
 
     /// Animated head height over the feet.
@@ -1044,7 +1055,9 @@ impl Avatar {
     /// attractor matrix `RefreshAlpha` starts from).
     #[cfg(test)]
     pub fn head_position(&self) -> Vec3 {
-        self.transform.transform_point3(self.rig.head_attractor_composed(self.layers()).map_or(Vec3::ZERO, Vec3::from))
+        let mut cache = self.composed_pose.borrow_mut();
+        let head = self.rig.composed_head_cached(self.layer_sources(), &mut cache);
+        self.transform.transform_point3(head.map_or(Vec3::ZERO, Vec3::from))
     }
 }
 
@@ -1487,6 +1500,43 @@ pub(super) mod tests {
             assert_eq!(expected.1, id, "{name} should not need a fallback");
             assert!(avatar.play_action(&store, id, Some(0), -2).unwrap(), "{name}");
             assert_eq!(avatar.actions.last().unwrap().clip.source_id, expected.0);
+        }
+    }
+
+    #[test]
+    fn own_anchor_cache_matches_recursive_bits_across_action_model_and_world_changes() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
+        let bits = |m: Option<[[f32; 4]; 4]>| m.map(|m| m.map(|c| c.map(f32::to_bits)));
+        for build in [0, 2, 1] {
+            avatar.set_body_stats(&store, avatar.body_mode, build, avatar.body_resolution).unwrap();
+            for role in [Role::Idle, Role::Walk, Role::Clip("turn-left".into())] {
+                avatar.set_pose(&store, AvatarPose { role, speed: 1.5, ref_speed: 1.5 }).unwrap();
+                for action in [false, true] {
+                    if action { assert!(avatar.play_action(&store, 107, None, -2).unwrap()); }
+                    avatar.update(0.1);
+                    for (pos, yaw, scale) in [([0.0; 3], 0.0, 1.0), ([3.0, 2.0, -5.0], 0.0, 1.0), ([3.0, 2.0, -5.0], 1.25, 1.0), ([3.0, 2.0, -5.0], 1.25, 0.75)] {
+                        avatar.set_body_scale(scale);
+                        avatar.set_transform(pos, yaw);
+                        for id in [0, 3000, 3001, -1].into_iter().chain(1000..=1018).chain(2000..=2023) {
+                            let expected = avatar.rig.effect_anchor_composed(id, avatar.layers())
+                                .map(|m| (avatar.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d());
+                            assert_eq!(bits(avatar.effect_anchor(id)), bits(expected), "own anchor {id}, build {build}");
+                        }
+                        for place in [1, 2] {
+                            let expected = avatar.rig.weapon_effect_anchor_composed(place, avatar.layers())
+                                .map(|m| (avatar.transform * Mat4::from_cols_array_2d(&m)).to_cols_array_2d());
+                            assert_eq!(bits(avatar.weapon_effect_anchor(place)), bits(expected));
+                        }
+                        let head = avatar.rig.head_attractor_composed(avatar.layers());
+                        assert_eq!(avatar.head_local().map(|p| p.to_array().map(f32::to_bits)),
+                            head.map(|p| (Vec3::from(p) * avatar.scale).to_array().map(f32::to_bits)));
+                        assert_eq!(avatar.head_position().to_array().map(f32::to_bits),
+                            avatar.transform.transform_point3(head.map_or(Vec3::ZERO, Vec3::from)).to_array().map(f32::to_bits));
+                    }
+                }
+            }
         }
     }
 

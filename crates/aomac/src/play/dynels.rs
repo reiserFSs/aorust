@@ -42,7 +42,7 @@ fn remote_pose(
 ) -> ao_net::n3::motion::Pose {
     let Some(collision) = collision else { return mover.advance(dt); };
     let collision = collision.borrow();
-    mover.advance_with_surface(dt, |old, new, body, state| {
+    mover.advance_with_surface(dt, Some(collision.revision()), |old, new, body, state| {
         let mut aligned = collision.align(scene_pos(old), scene_pos(new), body, state);
         aligned.pos = scene_pos(aligned.pos);
         aligned.normal = scene_pos(aligned.normal);
@@ -684,6 +684,7 @@ pub struct Char {
     current_palette: Option<Arc<Vec<ao_scene::SkinBone>>>,
     cadence: ao_formats::character::AnimationCadence,
     pose_cache: ao_formats::character::actor::PoseCache,
+    composed_pose: std::cell::RefCell<ao_formats::character::actor::ComposedPoseCache>,
     roll: Roll,
     /// Bit `i` = event `i` of the playing clip has fired its note (`piVar7[0xd]` of the holder's clip entry, `FUN_1003c036`).
     note_fired: u32,
@@ -753,21 +754,26 @@ impl Char {
         if matches!(self.special, Special::Die(_)) { -3 } else { 0 }
     }
 
+    #[cfg(test)]
     fn layers<'a>(&'a self, built: &'a Built) -> impl Clone + Iterator<Item = AnimLayer<'a>> {
+        self.layer_sources(built).map(|(layer, _)| layer)
+    }
+
+    fn layer_sources<'a>(&'a self, built: &'a Built) -> impl Clone + Iterator<Item = (AnimLayer<'a>, &'a Arc<CatAnim>)> {
         let priority = self.base_priority();
-        let previous = self.previous_body.as_ref().map(|body| AnimLayer {
+        let previous = self.previous_body.as_ref().map(|body| (AnimLayer {
             clip: &body.clip, ms: super::avatar::clip_time(&body.clip, body.ms, body.once),
             layers: self.base_layers, blend: 1.0,
-        });
+        }, &body.clip));
         let blend = self.previous_body.as_ref().map_or(1.0, |body| (body.elapsed / body.fade_ms).clamp(0.0, 1.0));
         let base = built.clips.get(&self.anim)
             .and_then(|clips| clips.get(self.roll.variant % clips.len().max(1)))
-            .map(|clip| AnimLayer { clip, ms: super::avatar::clip_time(clip, self.clip_ms, self.body_once), layers: self.base_layers, blend });
+            .map(|clip| (AnimLayer { clip, ms: super::avatar::clip_time(clip, self.clip_ms, self.body_once), layers: self.base_layers, blend }, clip));
         let action_layer = |action: &'a ActionAnim| {
             let clips = built.clips.get(&action.id)?;
             let clip = clips.get(action.variant? % clips.len().max(1))?;
             let ms = if action.rate < 0.0 { (action.duration(clip) - action.ms).max(0.0) } else { action.ms.min(action.duration(clip)) };
-            Some(AnimLayer { clip, ms, layers: action.layers, blend: ao_formats::character::animation_blend(action.ms, action.duration(clip), action.fade_ms) })
+            Some((AnimLayer { clip, ms, layers: action.layers, blend: ao_formats::character::animation_blend(action.ms, action.duration(clip), action.fade_ms) }, clip))
         };
         let before = self.actions.iter().filter(move |action| action.priority > priority).filter_map(action_layer);
         let older = self.actions.iter().filter(move |action| action.priority == priority && action.before_body).filter_map(action_layer);
@@ -1987,8 +1993,9 @@ impl Dynels {
         let matrix = if c.current_palette.is_some() {
             if anchor == 3000 { rig.cached_weapon_effect_anchor(if slot == 8 { 2 } else { 1 }, &c.pose_cache) } else { rig.cached_effect_anchor(anchor, &c.pose_cache) }
         } else {
-            let layers = c.layers(built);
-            if anchor == 3000 { rig.weapon_effect_anchor_composed(if slot == 8 { 2 } else { 1 }, layers) } else { rig.effect_anchor_composed(anchor, layers) }
+            let mut cache = c.composed_pose.borrow_mut();
+            let pose = rig.composed_pose_cached(c.layer_sources(built), &mut cache);
+            if anchor == 3000 { rig.cached_weapon_effect_anchor(if slot == 8 { 2 } else { 1 }, pose) } else { rig.cached_effect_anchor(anchor, pose) }
         };
         matrix.map(|matrix| world * glam::Mat4::from_cols_array_2d(&matrix))
     }
@@ -3038,6 +3045,7 @@ impl Dynels {
                         current_palette: None,
                         cadence: Default::default(),
                         pose_cache: Default::default(),
+                        composed_pose: Default::default(),
                         roll: Roll::default(),
                         next: None,
                         note_fired: 0,
@@ -3181,7 +3189,9 @@ impl Dynels {
                 if let Some(rig) = &built.rig {
                     let factor = (rig.cat().torso_sphere.radius as f64 / 0.250_750_005_245_208_74 * c.scale as f64) as f32;
                     renderer.set_source_torso_factor((CHAR_KIND as u32, id as u32), factor);
-                    renderer.set_source_native_head_height((CHAR_KIND as u32, id as u32), rig.head_attractor_composed(c.layers(built)).map(|p| p[1] * c.scale));
+                    let mut cache = c.composed_pose.borrow_mut();
+                    let head = rig.composed_head_cached(c.layer_sources(built), &mut cache);
+                    renderer.set_source_native_head_height((CHAR_KIND as u32, id as u32), head.map(|p| p[1] * c.scale));
                 }
             }
         }
@@ -3355,6 +3365,7 @@ impl Dynels {
                         c.current_palette = None;
                         c.bounds = None;
                         c.pose_cache = Default::default();
+                        *c.composed_pose.get_mut() = Default::default();
                         c.cadence = Default::default();
                         c.previous_body = None;
                         c.parts.clear();
@@ -3549,9 +3560,9 @@ impl Dynels {
             let skip_culled = skip_pose_sample(&skin_planes, p, rig.bounding_radius, c.scale, needs_effect_pose, c.current_palette.is_some());
             if !skip_culled && (c.current_palette.is_none() || (sample_pose && (!terminal || !c.terminal_pose || !c.submitted || needs_effect_pose))) {
                 c.terminal_pose = terminal;
-                let mut cache = std::mem::take(&mut c.pose_cache);
-                let (palette, parts) = rig.pose_palette_composed_cached(c.layers(built), &mut cache);
-                c.pose_cache = cache;
+                let pose = rig.composed_pose_cached(c.layer_sources(built), &mut c.composed_pose.borrow_mut()).clone();
+                let (palette, parts) = rig.palette_cached(&pose);
+                c.pose_cache = pose;
                 c.current_palette = Some(palette);
                 c.parts = parts;
                 if c.bounds.is_none() {
@@ -3813,6 +3824,63 @@ mod tests {
         assert!(world.chars[&who].next.is_some(), "appearance changes queue the body model");
         let expected = ao_formats::character::humanoid_model_with_names(&assets.names, breed, gender, 3, 0, 2).unwrap();
         assert_eq!(build_char(&store, &mut assets, look).unwrap().rig.unwrap().model_id, expected);
+    }
+
+    #[test]
+    fn remote_anchor_cache_preserves_composed_and_retained_world_matrix_bits() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let spawn = captured_posture_player();
+        let who = spawn.header.target.instance;
+        let mut world = Dynels::default();
+        world.on_message(&spawn);
+        let key = world.chars[&who].key;
+        let bits = |m: Option<glam::Mat4>| m.map(|m| m.to_cols_array().map(f32::to_bits));
+        for _ in 0..2 {
+            // Replace the rig without clearing the memo: model identity must invalidate it too.
+            let built = build(&store, &mut assets, &world.chars[&who].look).unwrap();
+            let anim = *built.clips.iter().find(|(_, clips)| !clips.is_empty()).expect("real body clips").0;
+            world.models.insert(key, Model::Ready { built: Box::new(built), uploaded: false });
+            for ms in [0.0, 173.0, 611.0] {
+                {
+                    let c = world.chars.get_mut(&who).unwrap();
+                    c.anim = anim;
+                    c.clip_ms = ms;
+                    c.current_palette = None;
+                }
+                for (pos, yaw, scale) in [([0.0; 3], 0.0, 1.0), ([3.0, -1.0, 8.0], 0.0, 1.0), ([3.0, -1.0, 8.0], 1.25, 1.0), ([3.0, -1.0, 8.0], 1.25, 0.75)] {
+                    let c = world.chars.get_mut(&who).unwrap();
+                    c.pose.pos = pos;
+                    c.pose.yaw = yaw;
+                    c.scale = scale;
+                    let c = &world.chars[&who];
+                    let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+                    let rig = built.rig.as_ref().unwrap();
+                    let world_matrix = glam::Mat4::from_scale_rotation_translation(glam::Vec3::splat(scale), glam::Quat::from_rotation_y(scene_yaw(yaw)), glam::Vec3::from(scene_pos(pos)));
+                    for anchor in [0, 3000, 3001, -1].into_iter().chain(1000..=1018).chain(2000..=2023) {
+                        for slot in [0, 8] {
+                            let local = if anchor == 3000 { rig.weapon_effect_anchor_composed(if slot == 8 { 2 } else { 1 }, c.layers(built)) }
+                                else { rig.effect_anchor_composed(anchor, c.layers(built)) };
+                            // The original root branch returns world directly; multiplying identity changes signed-zero bits.
+                            let expected = if anchor == 0 { Some(world_matrix) }
+                                else { local.map(|m| world_matrix * glam::Mat4::from_cols_array_2d(&m)) };
+                            assert_eq!(bits(world.effect_anchor(who, anchor, slot)), bits(expected), "uncached remote anchor {anchor}, slot {slot}");
+                        }
+                    }
+                }
+                let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
+                let rig = built.rig.as_ref().unwrap();
+                let c = world.chars.get_mut(&who).unwrap();
+                let mut pose = Default::default();
+                let (palette, _) = rig.pose_palette_composed_cached(c.layers(built), &mut pose);
+                c.pose_cache = pose;
+                c.current_palette = Some(palette);
+                let old = world.effect_anchor(who, 2002, 0);
+                world.chars.get_mut(&who).unwrap().clip_ms += 97.0;
+                assert_eq!(bits(world.effect_anchor(who, 2002, 0)), bits(old), "displayed palette remains authoritative between cadence samples");
+            }
+        }
     }
 
     #[test]
