@@ -292,7 +292,13 @@ impl ActorRig {
 
     /// Normal humanoid resolver with the dynel's layer-1 diffuse / layer-3 environment overrides.
     pub fn player_with_textures(store: &RecordStore, assets: &ActorAssets, look: &PlayerLook, attachments: &[(u8, u32)], list: &[TextureOverride]) -> Result<Self> {
-        let model = player_model_build(store, look.breed, look.gender, look.build)?;
+        Self::humanoid_with_textures(store, assets, look, 0, 0, attachments, list)
+    }
+
+    /// Live SimpleChar body selection (`GC 10058078`); MonsterData meshes bypass it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn humanoid_with_textures(store: &RecordStore, assets: &ActorAssets, look: &PlayerLook, mode: u8, resolution: i32, attachments: &[(u8, u32)], list: &[TextureOverride]) -> Result<Self> {
+        let model = humanoid_model_with_names(&assets.names, look.breed, look.gender, look.build, mode, resolution)?;
         let p = Player { breed: look.breed, gender: look.gender, skin: look.skin, head: None, equipment: look.equipment };
         if list.is_empty() {
             let overrides = part_textures(&assets.names, store, model, &p)?;

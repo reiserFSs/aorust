@@ -111,6 +111,9 @@ pub struct CharLook {
     pub sex: u8,
     pub race: u8,
     pub fatness: u8,
+    pub body_mode: u8,
+    /// Optional native body resolution stat 0x378 (888), not decimal 378.
+    pub body_resolution: i32,
     pub head: Option<i32>,
     /// Stat `MonsterData` (0x167): rdb 1040023 NPC record id.
     pub monster_data: i32,
@@ -140,7 +143,9 @@ impl CharLook {
             breed: u.breed,
             sex: u.sex,
             race: u.race,
-            fatness: u.fatness,
+            fatness: u.pairs.iter().rev().find(|p| p.0 == 0x2f).map_or(u.fatness, |p| p.1 as u8),
+            body_mode: u.mode,
+            body_resolution: u.pairs.iter().rev().find(|p| p.0 == 0x378).map_or(0, |p| p.1),
             head: u.head_mesh,
             monster_data: u.monster_data,
             textures: u.textures.iter().map(|t| (t.material.clone(), t.texture, t.field_24, t.flag)).collect(),
@@ -158,6 +163,7 @@ impl CharLook {
     /// `CharacterMesh::AddAttractors(list)`: the mounted set is exactly the wire list (head = its place 0), unconditionally (the `SET_DYNEL_800`
     /// flag only skips the full update's block). `cloth` is kept sorted so equal looks share a model whatever order the updates came in.
     pub fn apply_appearance(&mut self, a: &ao_net::n3::world::AppearanceUpdate) {
+        self.body_mode = a.extra;
         for c in &a.cloth {
             let index = c.c * 5 + c.id;
             self.cloth.retain(|p| p.0 != index);
@@ -486,7 +492,8 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
     let rig = if let Some(rec) = &rec {
         npc_rig(store, assets, look, rec, head, &attachments)?
     } else {
-        let (breed, gender) = ao_formats::screens::wire_breed_sex(look.breed as i32, look.sex as i32)?;
+        anyhow::ensure!(look.breed <= 4, "breed {} bypasses the native humanoid resolver", look.breed);
+        let (breed, gender) = ao_formats::character::humanoid_breed_sex(look.breed, look.sex)?;
         // `BreedRace_e`: 1 caucasian, 2 african, 3 asian (docs/zone/dynel.md §1.3)
         let skin = match look.race {
             2 => ao_formats::character::Skin::African,
@@ -501,8 +508,8 @@ fn build_char(store: &RecordStore, assets: &mut ActorAssets, look: &CharLook) ->
             }
         }
         let textures: Vec<_> = look.textures.iter().map(|(m, t, env, alpha)| TextureOverride { material: m, texture: *t as u32, env_texture: *env as u32, alpha_mode: *alpha as u32 }).collect();
-        let look = PlayerLook { breed, gender, skin, build: look.fatness.min(2), head, equipment };
-        ActorRig::player_with_textures(store, assets, &look, &attachments, &textures)?
+        let player = PlayerLook { breed, gender, skin, build: look.fatness, head, equipment };
+        ActorRig::humanoid_with_textures(store, assets, &player, look.body_mode, look.body_resolution, &attachments, &textures)?
     };
     let sig = rig.cat().signature;
     let mut clips: HashMap<u32, Vec<Arc<CatAnim>>> = HashMap::new();
@@ -1233,8 +1240,9 @@ impl Dynels {
             Some(record) => record.mesh().context("NPC record has no mesh")?,
             None => {
                 let Some(names) = self.names.as_ref() else { return Ok(None) };
-                let (breed, gender) = ao_formats::screens::wire_breed_sex(look.breed as i32, look.sex as i32)?;
-                ao_formats::character::player_model_build_with_names(names, breed, gender, look.fatness.min(2))?
+                anyhow::ensure!(look.breed <= 4, "breed {} bypasses the native humanoid resolver", look.breed);
+                let (breed, gender) = ao_formats::character::humanoid_breed_sex(look.breed, look.sex)?;
+                ao_formats::character::humanoid_model_with_names(names, breed, gender, look.fatness, look.body_mode, look.body_resolution)?
             }
         };
         let Some(data) = store.get(1_000_047, model)? else { return Ok(Some((0.0, 0.0))) };
@@ -2072,6 +2080,12 @@ impl Dynels {
                 359 if c.mech_data == 0 => {
                     if let Look::Char(look) = &mut c.look {
                         look.monster_data = value;
+                        c.next = Some(c.look.key(self.texture_quality)).filter(|&key| key != c.key);
+                    }
+                }
+                0x2f | 0x378 if value != ao_formats::stats::INVALID => {
+                    if let Look::Char(look) = &mut c.look {
+                        if stat == 0x2f { look.fatness = value as u8; } else { look.body_resolution = value; }
                         c.next = Some(c.look.key(self.texture_quality)).filter(|&key| key != c.key);
                     }
                 }
@@ -2934,7 +2948,12 @@ impl Dynels {
                 }
             }
             N3::Dynel(Dynel::SimpleCharFullUpdate(u)) => {
-                let look = CharLook::from_update(u);
+                let mut look = CharLook::from_update(u);
+                if !u.pairs.iter().any(|p| p.0 == 0x378) {
+                    if let Some(Char { look: Look::Char(previous), .. }) = self.chars.get(&who.instance) {
+                        look.body_resolution = previous.body_resolution;
+                    }
+                }
                 let look = Look::Char(look);
                 let key = look.key(self.texture_quality);
                 let yaw = u.yaw().unwrap_or(0.0);
@@ -3728,6 +3747,36 @@ mod tests {
         assert_eq!(skin.len(), original.len());
         assert!(!skin.is_empty());
         assert!(skin.iter().zip(original.iter()).any(|(a, b)| a.pos != b.pos), "Deformer must edit the submitted body, not just a detached source clone");
+    }
+
+    #[test]
+    fn remote_live_body_inputs_rebuild_the_authored_model() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let mut spawn = captured_posture_player();
+        let who = spawn.header.target.instance;
+        let N3::Dynel(Dynel::SimpleCharFullUpdate(u)) = &mut spawn.body else { unreachable!() };
+        u.mode = 1;
+        u.fatness = 3;
+        u.pairs.push((0x378, 2));
+        let mut world = Dynels::default();
+        world.on_message(&spawn);
+        let Look::Char(look) = &world.chars[&who].look else { unreachable!() };
+        assert_eq!((look.body_mode, look.fatness, look.body_resolution), (1, 3, 2));
+        let (breed, gender) = ao_formats::character::humanoid_breed_sex(look.breed, look.sex).unwrap();
+        let expected = ao_formats::character::humanoid_model_with_names(&assets.names, breed, gender, 3, 1, 2).unwrap();
+        assert_eq!(build_char(&store, &mut assets, look).unwrap().rig.unwrap().model_id, expected);
+        let mut delta = spawn.clone();
+        delta.body = N3::World(ao_net::n3::world::World::Appearance(ao_net::n3::world::AppearanceUpdate {
+            cloth: vec![], attractors: vec![], visual_flags: 31, extra: 0,
+        }));
+        world.on_message(&delta);
+        let Look::Char(look) = &world.chars[&who].look else { unreachable!() };
+        assert_eq!((look.body_mode, look.body_resolution), (0, 2));
+        assert!(world.chars[&who].next.is_some(), "appearance changes queue the body model");
+        let expected = ao_formats::character::humanoid_model_with_names(&assets.names, breed, gender, 3, 0, 2).unwrap();
+        assert_eq!(build_char(&store, &mut assets, look).unwrap().rig.unwrap().model_id, expected);
     }
 
     #[test]
@@ -5519,7 +5568,7 @@ mod variant_tests {
     #[test]
     fn appearance_update_edits_the_look() {
         use ao_net::n3::world::{AppearanceUpdate, Attractor, ClothData};
-        let mut l = CharLook { npc: false, breed: 1, sex: 2, race: 1, fatness: 1, head: Some(9), monster_data: 0, textures: vec![], cloth: vec![(4, 50), (1, 100)], attractors: vec![(0, 9)], skip_attractors: true };
+        let mut l = CharLook { npc: false, breed: 1, sex: 2, race: 1, fatness: 1, body_mode: 0, body_resolution: 0, head: Some(9), monster_data: 0, textures: vec![], cloth: vec![(4, 50), (1, 100)], attractors: vec![(0, 9)], skip_attractors: true };
         let cl = |id, b, c| ClothData { id, b, c, ..Default::default() };
         let mut a = AppearanceUpdate { cloth: vec![cl(1, 0, 0), cl(2, 77, 0), cl(3, 9, 1)], attractors: vec![Attractor { a: 1, b: 0x3ddf, c: 0, d: 2 }, Attractor { a: 0, b: 7, c: 0, d: 4 }], visual_flags: 0x1f, extra: 0 };
         l.apply_appearance(&a);
@@ -5636,7 +5685,7 @@ mod variant_tests {
         assert!(NpcRecord::lookup(&store, 288560).unwrap().is_none());
         assert!(NpcRecord::load(&store, 288560).is_err(), "surveys retain strict loading");
         let mut assets = ActorAssets::new(&store).unwrap();
-        let look = CharLook { npc: true, breed: 1, sex: 2, race: 1, fatness: 1, head: None, monster_data: 288560, textures: vec![], cloth: vec![], attractors: vec![], skip_attractors: false };
+        let look = CharLook { npc: true, breed: 1, sex: 2, race: 1, fatness: 1, body_mode: 0, body_resolution: 0, head: None, monster_data: 288560, textures: vec![], cloth: vec![], attractors: vec![], skip_attractors: false };
         let built = build_char(&store, &mut assets, &look).unwrap();
         let rig = built.rig.as_ref().unwrap();
         let (breed, gender) = ao_formats::screens::wire_breed_sex(1, 2).unwrap();

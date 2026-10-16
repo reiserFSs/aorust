@@ -505,14 +505,44 @@ pub fn player_model_build(store: &RecordStore, breed: Breed, gender: Gender, bui
 
 /// Resolves the same body model against an already-loaded client name table.
 pub fn player_model_build_with_names(names: &NameTable, breed: Breed, gender: Gender, build: u8) -> Result<u32> {
-    let suffix = match build {
+    humanoid_model_with_names(names, breed, gender, build, 0, 0)
+}
+
+/// Native filename helper remaps breed 5 to Solitus and unisex (1) to male (2).
+/// The live no-MonsterData caller rejects breed > 4 before reaching this helper.
+pub fn humanoid_breed_sex(breed: u8, sex: u8) -> Result<(Breed, Gender)> {
+    let breed = match breed {
+        1 | 5 => Breed::Solitus,
+        2 => Breed::Opifex,
+        3 => Breed::Nanomage,
+        4 => Breed::Atrox,
+        _ => anyhow::bail!("breed {breed} has no humanoid model"),
+    };
+    let gender = match sex {
+        1 | 2 => Gender::Male,
+        3 => Gender::Female,
+        _ => anyhow::bail!("sex {sex} has no humanoid model"),
+    };
+    Ok((breed, gender))
+}
+
+/// Gamecode `10057eb3/10057ff7`: Fatness suffix, build-byte robe, then stat 888
+/// resolution suffix. Only the resolution suffix has a missing-resource fallback.
+pub fn humanoid_model_with_names(names: &NameTable, breed: Breed, gender: Gender, fatness: u8, mode: u8, resolution: i32) -> Result<u32> {
+    let suffix = match fatness {
         0 => "_thin",
         2 => "_fat",
         _ => "",
     };
-    let name = format!("{}_{}{suffix}.cir", breed.model_race(), gender.name());
-    names.id(CHAR_MESH_TYPE, &name)
-        .with_context(|| format!("no player model {name}: the client has no {breed:?} {gender:?}"))
+    let robe = if mode == 1 { "_robe" } else { "" };
+    let detail = match resolution { 1 => "_hires", 2 => "_lores", _ => "" };
+    let name = format!("{}_{}{suffix}{robe}{detail}.cir", breed.model_race(), gender.name());
+    names.id(CHAR_MESH_TYPE, &name).or_else(|| {
+        (resolution != 0).then(|| {
+            let name = format!("{}_{}{suffix}{robe}.cir", breed.model_race(), gender.name());
+            names.id(CHAR_MESH_TYPE, &name)
+        }).flatten()
+    }).with_context(|| format!("no player model {name}: the client has no {breed:?} {gender:?}"))
 }
 
 /// [`load_player`] with the body of `build` ([`player_model_build`]).
@@ -628,6 +658,37 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn native_live_body_names_preserve_robe_and_only_fallback_resolution() {
+        // GC 100581a9 pushes 0x378 (888 decimal); 10057ef0 tests build == 1.
+        // Raw suffix data 1015f324="thin", 1015f32c="fat", 1015f340=".cir".
+        let Some(dir) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+        let Ok(store) = RecordStore::open(&dir.join("Games/ProjectRubiKa/client")) else { return };
+        let names = NameTable::load(&store).unwrap();
+        let mut robes = 0;
+        for (wire, race) in [(1, "solitus"), (2, "opifex"), (3, "nanomage"), (4, "athrox"), (5, "solitus")] {
+            for (sex, gender) in [(1, "male"), (2, "male"), (3, "female")] {
+                let (breed, sex) = humanoid_breed_sex(wire, sex).unwrap();
+                for (fatness, suffix) in [(0, "_thin"), (1, ""), (2, "_fat"), (3, "")] {
+                    for (mode, robe) in [(0, ""), (1, "_robe"), (2, "")] {
+                        let base = format!("{race}_{gender}{suffix}{robe}.cir");
+                        for (resolution, detail) in [(0, ""), (1, "_hires"), (2, "_lores"), (3, "")] {
+                            let name = format!("{race}_{gender}{suffix}{robe}{detail}.cir");
+                            let expected = names.id(CHAR_MESH_TYPE, &name).or_else(|| (resolution != 0).then(|| names.id(CHAR_MESH_TYPE, &base)).flatten());
+                            let actual = humanoid_model_with_names(&names, breed, sex, fatness, mode, resolution);
+                            assert_eq!(actual.ok(), expected, "{name}");
+                            if let Some(id) = expected {
+                                assert!(store.get(CHAR_MESH_TYPE, id).unwrap().is_some(), "{name}: {id}");
+                                robes += usize::from(mode == 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(robes > 0, "installed body keys must exercise authored robe models");
+    }
 
     #[test]
     fn roles_roundtrip() {

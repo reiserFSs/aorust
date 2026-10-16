@@ -5,7 +5,6 @@ use ao_formats::character::{
     actor::{ActorAssets, ActorRig, PlayerLook},
     animation_fade_ms, head_table, CachedCharacter, CatAnim, ClothEntry, Role, Skin,
 };
-use ao_formats::screens::wire_breed_sex;
 use ao_net::n3::dynel::SimpleCharFullUpdate;
 use ao_rdb::RecordStore;
 use ao_scene::{ActorFrame, Scene};
@@ -132,7 +131,8 @@ pub(super) fn visible_cloth(cloth: &[(i32, i32)]) -> impl Iterator<Item = (i32, 
 impl AvatarLook {
     /// `skin_of_head` gives the skin race of a head mesh (creation head table), as the select-screen preview does.
     pub fn from_update(u: &SimpleCharFullUpdate, skin_of_head: impl FnOnce(u32) -> Skin) -> Result<Self> {
-        let (breed, gender) = wire_breed_sex(u.breed as i32, u.sex as i32)?;
+        anyhow::ensure!(u.breed <= 4, "breed {} bypasses the native humanoid resolver", u.breed);
+        let (breed, gender) = ao_formats::character::humanoid_breed_sex(u.breed, u.sex)?;
         // Fullupdate's base ClearAttractors only clears bookkeeping (DS 0x10071dd0), not the HeadMesh child.
         let skip_attractors = u.flags & ao_net::n3::dynel::flag::SET_DYNEL_800 != 0;
         let head = (!skip_attractors).then(|| u.attractors.iter().find(|a| a.place == 0).map(|a| a.mesh)).flatten().or(u.head_mesh).filter(|&h| h > 0).map(|h| h as u32);
@@ -147,8 +147,8 @@ impl AvatarLook {
                 breed,
                 gender,
                 skin: head.map_or(Skin::Caucasian, skin_of_head),
-                // Fatness 0 thin / 1 normal / 2 fat = `_thin` / `` / `_fat` models (GUI ChangeMesh 0x1011ab53); 3 is [GUESS] normal.
-                build: if u.fatness == 0 { 0 } else if u.fatness == 2 { 2 } else { 1 },
+                // GC 10057e86: only 0 and 2 add a suffix; 3 is the normal body.
+                build: u.pairs.iter().rev().find(|p| p.0 == 0x2f).map_or(u.fatness, |p| p.1 as u8),
                 head,
                 equipment: cloth.equipment(),
             },
@@ -376,6 +376,8 @@ pub struct Avatar {
     anim_set: &'static str,
     /// What `rig` was built from (full update plus [`Avatar::set_appearance`] deltas).
     look: PlayerLook,
+    body_mode: u8,
+    body_resolution: i32,
     attachments: Vec<(u8, u32)>,
     cloth_pages: Vec<(i32, i32)>,
     monster_data: i32,
@@ -438,11 +440,12 @@ impl Avatar {
     /// only needs building once per session, not once per `Player::new` (measured live: resolving the own model's
     /// rest pose dominated the ~120-140 ms per-zone-change stall, `zone-preload-proposal.md` §2.1).
     pub fn new(store: &RecordStore, client_dir: &Path, id: u32, u: &SimpleCharFullUpdate, assets: ActorAssets) -> Result<Self> {
-        let (breed, gender) = wire_breed_sex(u.breed as i32, u.sex as i32)?;
+        let (breed, gender) = ao_formats::character::humanoid_breed_sex(u.breed, u.sex)?;
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
-        let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, current_skin: Default::default(), current_palette: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), monster_data: 0, monster: None, monster_look: super::dynels::CharLook::from_update(u), monster_rand: ao_scene::CrtRand::thread(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, body_once: false, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, holder_idle: None, stance_changed: false, ms: 0.0, body_delay_ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_once: false, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
+        let resolution = u.pairs.iter().rev().find(|p| p.0 == 0x378).map_or(0, |p| p.1);
+        let rig = ActorRig::humanoid_with_textures(store, &assets, &l.look, u.mode, resolution, &l.attachments, &[])?;
+        let mut a = Self { id, rig, current_skin: Default::default(), current_palette: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, body_mode: u.mode, body_resolution: resolution, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), monster_data: 0, monster: None, monster_look: super::dynels::CharLook::from_update(u), monster_rand: ao_scene::CrtRand::thread(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, body_once: false, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, holder_idle: None, stance_changed: false, ms: 0.0, body_delay_ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_once: false, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -478,7 +481,7 @@ impl Avatar {
         let rig = if let Some(rec) = &monster {
             super::dynels::npc_rig(store, &self.assets, &self.monster_look, rec, self.look.head, &self.attachments)?
         } else {
-            ActorRig::player(store, &self.assets, &self.look, &self.attachments)?
+            ActorRig::humanoid_with_textures(store, &self.assets, &self.look, self.body_mode, self.body_resolution, &self.attachments, &[])?
         };
         self.rig = rig;
         self.monster_data = monster_data;
@@ -527,7 +530,7 @@ impl Avatar {
         for (part, texture) in visible_cloth(&self.cloth_pages) {
             equipment.0[part as usize] = Some(texture as u32);
         }
-        if head == self.look.head && attachments == old && equipment.0 == self.look.equipment.0 {
+        if head == self.look.head && attachments == old && equipment.0 == self.look.equipment.0 && appearance.extra == self.body_mode {
             return Ok(false);
         }
         let look = PlayerLook { head, equipment, ..self.look.clone() };
@@ -535,8 +538,9 @@ impl Avatar {
         self.rig = if let Some(rec) = &self.monster {
             super::dynels::npc_rig(store, &self.assets, &self.monster_look, rec, head, &attachments)?
         } else {
-            ActorRig::player(store, &self.assets, &look, &attachments)?
+            ActorRig::humanoid_with_textures(store, &self.assets, &look, appearance.extra, self.body_resolution, &attachments, &[])?
         };
+        self.body_mode = appearance.extra;
         self.invalidate_model();
         self.look = look;
         self.attachments = attachments;
@@ -553,6 +557,23 @@ impl Avatar {
         } else {
             resolve_clip(&self.assets.names, self.anim_set, id, false).map(|(clip, _, layer)| (clip, layer))
         }
+    }
+
+    /// Native body inputs from the retained SCFU/appearance snapshot and current stats.
+    pub fn set_body_stats(&mut self, store: &RecordStore, mode: u8, fatness: u8, resolution: i32) -> Result<bool> {
+        if self.body_mode == mode && self.look.build == fatness && self.body_resolution == resolution { return Ok(false); }
+        let look = PlayerLook { build: fatness, ..self.look.clone() };
+        if self.monster.is_none() {
+            self.rig = ActorRig::humanoid_with_textures(store, &self.assets, &look, mode, resolution, &self.attachments, &[])?;
+            self.invalidate_model();
+        }
+        self.body_mode = mode;
+        self.look = look;
+        self.body_resolution = resolution;
+        self.monster_look.body_mode = mode;
+        self.monster_look.fatness = fatness;
+        self.monster_look.body_resolution = resolution;
+        Ok(self.monster.is_none())
     }
 
     /// Abstract-id action playback; explicit `Layer_e` overrides the table's layer.
@@ -1592,6 +1613,45 @@ pub(super) mod tests {
                 _ => None,
             })
             .expect("own update in the capture")
+    }
+
+    #[test]
+    fn live_body_mode_projects_fullupdate_and_appearance_for_own_and_remote() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let names = ao_formats::character::NameTable::load(&store).unwrap();
+        let mut u = own_update();
+        u.mode = 1;
+        u.fatness = 3;
+        let (breed, gender) = ao_formats::character::humanoid_breed_sex(u.breed, u.sex).unwrap();
+        let expected = ao_formats::character::humanoid_model_with_names(&names, breed, gender, 3, 1, 0).unwrap();
+        let mut avatar = Avatar::new(&store, &dir, 1, &u, ActorAssets::new(&store).unwrap()).unwrap();
+        assert_eq!(avatar.rig.model_id, expected, "SCFU.mode selects the own robe");
+        let mut remote = super::super::dynels::CharLook::from_update(&u);
+        assert_eq!((remote.fatness, remote.body_mode), (3, 1));
+        let mut delta = ao_net::n3::world::AppearanceUpdate {
+            cloth: vec![],
+            attractors: u.attractors.iter().map(|a| ao_net::n3::world::Attractor { a: a.place, b: a.mesh, c: 0, d: 0 }).collect(),
+            visual_flags: u.visual_flags,
+            extra: 0,
+        };
+        assert!(avatar.set_appearance(&store, &delta).unwrap());
+        remote.apply_appearance(&delta);
+        assert_eq!(remote.body_mode, 0);
+        assert_eq!(avatar.rig.model_id, ao_formats::character::humanoid_model_with_names(&names, breed, gender, 3, remote.body_mode, 0).unwrap());
+        delta.extra = 1;
+        assert!(avatar.set_appearance(&store, &delta).unwrap());
+        remote.apply_appearance(&delta);
+        assert_eq!(avatar.rig.model_id, expected, "Appearance.extra restores the same authored robe");
+        assert_eq!(remote.body_mode, 1);
+        assert!(avatar.set_body_stats(&store, 1, 1, 2).unwrap());
+        assert_eq!(avatar.rig.model_id, ao_formats::character::humanoid_model_with_names(&names, breed, gender, 1, 1, 2).unwrap());
+        assert!(avatar.set_monster_data(&store, 99470).unwrap());
+        let morph = avatar.rig.model_id;
+        assert!(!avatar.set_body_stats(&store, 1, 3, 0).unwrap());
+        assert_eq!(avatar.rig.model_id, morph, "body updates must not replace an active MonsterData mesh");
+        assert!(avatar.set_monster_data(&store, 0).unwrap());
+        assert_eq!(avatar.rig.model_id, expected, "morph undo restores the retained robe/fatness");
     }
 
 

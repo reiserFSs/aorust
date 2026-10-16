@@ -741,7 +741,7 @@ pub struct AppearanceUpdate {
     pub attractors: Vec<Attractor>,
     /// Becomes stat 0x2A1 (673 `VisualFlags`) of the dynel.
     pub visual_flags: i16,
-    /// Passed to `FUN_100572b9(u8, 0)`. [UNRESOLVED]
+    /// Body build byte at SimpleChar+0x208 (`FUN_100572b9`); 1 selects `_robe`.
     pub extra: u8,
 }
 

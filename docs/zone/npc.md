@@ -32,7 +32,7 @@ Its imported slot `0x10015c2c` has only that reference. It registers no 1040023 
 `FUN_10058078` first reads the dynel's Mesh (`0xc`) and HeadMesh (`0x40`). With a record, nonzero record overrides replace
 those values. **Without a record**, breed > 4 returns without changing the visual; breed ≤ 4 discards the initial Mesh and
 runs the ordinary humanoid name resolver `FUN_10057eb3` / `FUN_10057ff7` using breed, sex, stat `0x2f`, the build byte
-`dynel+0x208`, and optional stat `0x378`. A failed nonzero-`0x378` variant retries without that suffix. There is no retry of
+`dynel+0x208`, and optional stat `0x378` (**888 decimal**, resolution, not robe). Assembly `10057ee5` passes Fatness to `10057e86` (0 thin, 2 fat, otherwise no suffix); `10057ef0` appends robe iff build is 1; `10057f03` passes stat 888 to `10057e9e` (1 hires, 2 lores). A failed nonzero-resolution variant retries without that suffix. Sex 1 remaps to 2; filename-helper breed 5 maps to Solitus, but the live no-record caller rejects breed > 4 first. There is no retry of
 MonsterData as an item template, direct mesh/CATMesh id, or arbitrary default creature [CODE].
 
 Initial creation supplies no hidden default CAT: Gamecode factory `0x10077a84` → SimpleChar constructor `0x1005cb6a` →

@@ -137,7 +137,8 @@ impl Player {
                 Some(a) => a,
                 None => ActorAssets::new(&store)?,
             };
-            let avatar = Avatar::new(&store, dir, zone.char_id, u, assets)?;
+            let mut avatar = Avatar::new(&store, dir, zone.char_id, u, assets)?;
+            avatar.set_body_stats(&store, u.mode, zone.stat(0x2f).map_or(u.fatness, |v| v as u8), zone.stat(0x378).unwrap_or(0))?;
             let collision = Collision::load(&store, playfield).map_err(|e| eprintln!("collision {playfield}: {e:#}")).ok();
             let mut movement = Movement::new(u.pos, u.yaw().unwrap_or(0.0), u.run_speed);
             movement.set_input_lock(u.flag_32f); // GC10077e13 copies the full-update byte to +21d.
@@ -586,6 +587,15 @@ impl Player {
         });
         let was_jumping = self.movement.fsm().jump == 3;
         self.apply_own_events(zone);
+        if let Some(update) = zone.own_update.as_ref() {
+            match self.avatar.set_body_stats(&self.store, update.mode, zone.stat(0x2f).map_or(update.fatness, |v| v as u8), zone.stat(0x378).unwrap_or(0)) {
+                Ok(changed) => {
+                    self.model_sent &= !changed;
+                    if changed { zone.world.effect_source_model_changed((super::dynels::CHAR_KIND as u32, self.char_id)); }
+                }
+                Err(e) => eprintln!("avatar body: {e:#}"),
+            }
+        }
         // `FUN_10070fee`: the target branch re-runs the Features / district gate every frame and reads the target's `GetRelPos`
         if let Some(t) = self.movement.chase_target() {
             if self.follow_gated() {

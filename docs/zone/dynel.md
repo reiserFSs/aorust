@@ -89,7 +89,7 @@ Conditions use the first flags word `F` (`i32` after the version byte) and the s
 | 15 | `i32` | `monster_data` | stat `MonsterData` (0x167); NPC record id (22794 for the Surf Lizard, 254118 ICC Shuttle Guard); 0 for players. |
 | 16 | `i16` | `monster_scale` | stat `MonsterScale` (0x168), percent (`SetBodyScale(stat / 100.0)`, constant [GC 0x10158670] = 100.0): players 100, NPCs 36-181. |
 | 17 | `i16` | `visual_flags` | stat `VisualFlags` (0x2A1): 31 (127 for one player). |
-| 18 | `u8` | `mode` | `SimpleChar_t+0x208` via `FUN_100572b9`; 0 (79×) / 1 (2×). **Unresolved.** |
+| 18 | `u8` | `mode` | `SimpleChar_t+0x208` via `FUN_100572b9`; 0 (79×) / 1 (2×). Body build: exactly 1 appends `_robe` after the Fatness suffix (`10057ef0`); AppearanceUpdate.extra updates the same value. |
 | 19 | `i32 len` + bytes | `blob` | raw copy (`FUN_1006761c`) handed to the vehicle at `SimpleChar_t+0x50` (`vtable+0xac`). 42 bytes for players, 28 for NPCs: velocity, FSM axes/current mode, remembered walk/run mode; players also carry four movement inputs ([movement.md](movement.md), FullUpdate vehicle initialization). |
 | 20 | `i32` | `head_mesh` | iff `F & 0x80`: stat `HeadMesh` (0x40) = **rdb 1010001 mesh id of the head** (Testy 40629 = `head_solitusfemale00.abiff`). |
 | 21 | `i16` (`F & 0x2000`) / `u8` | `run_speed` | stat `RunSpeed` (0x9C) (`SetStat`, signed). Players 6, 34, 70; NPCs 6-144. |
@@ -291,7 +291,7 @@ with fewer stats written (the `n3Dynel_t+0x21c` flag).
 
 **Live changes** (`AppearanceUpdateIIR_c`, [GC 0x10071679], docs/zone/world.md §7): applied to any `SimpleChar_t` of identity kind 50000, NPCs included (no NPC special case): cloth entries by `(page*5 + part)` (`FUN_100480fc`, only changed textures written, 0 clears), `VisualFlags` stat 0x2A1, and the attractor list replaced wholesale (`ClearAttractors` + `AddAttractors`). `Dynels::on_message` edits the `CharLook` (`CharLook::apply_appearance`) and rebuilds the model through `Req::Model`; details and evidence in docs/zone/avatar.md §5.
 
-**Unresolved:** `field_108`, `mode`, the exact meaning of `AttractorMeshData` byte/int, `target`
+**Unresolved:** `field_108`, the exact meaning of `AttractorMeshData` byte/int, `target`
 (`+0xbc`), `path`, `list_190`, `effects`, bits 2/18/21/22 consumers, the MonsterData → model mapping, the sign of the heading, and the PC `extra`/`name_parts` strings
 (code paths read, never seen on the wire).
 
