@@ -101,7 +101,7 @@ const STAT_ANIM_SET: u32 = 353;
 /// Weapon item stat `ItemDelay` (0x126, centiseconds): the swing is sped up to land within it (`FUN_1006a239`).
 const STAT_ITEM_DELAY: u32 = 294;
 /// Weapon stance clips loaded with every character model: the fight idle (list 0x10) of the anim sets 0/1/3/6/7/8, the rifle's idle-2h (list 0x29) and its walk/run.
-const STANCE_IDS: &[u16] = &[0x3f3, 0x3e9, 0x3fd, 0xb6, 0xcb, 0x424, 0x41e, 0x421, 0x422];
+const STANCE_IDS: &[u16] = &[0x3f3, 0x3e9, 0x3fd, 0xb6, 0xcb, 0x424, 0x41e, 0x421, 0x422, 0x407, 0xce, 0xe9, 0x3f2, 0x3f4, 0x3e8, 0x3ea, 0x3fc, 0x3fe, 0xb5, 0xb8, 0x406, 0x408, 0xcd, 0xcf, 0xe7, 0xe8];
 
 /// Everything of a `SimpleCharFullUpdate` that decides what the model looks like; equal looks share one model.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -650,7 +650,7 @@ pub struct Char {
     pose: ao_net::n3::motion::Pose,
     anim: u32,
     special: Special,
-    posture_idle: Option<u32>,
+    posture_idle: Option<(u32, f32)>,
     restart_body: bool,
     body_delay_ms: f32,
     actions: Vec<ActionAnim>,
@@ -786,7 +786,7 @@ fn advance_clip_clock(ms: &mut f32, rate: &mut f32, dt: f32, started: bool, star
 }
 
 fn movement_loop(state: AnimState) -> bool {
-    matches!(state, AnimState::Idle | AnimState::Walk | AnimState::WalkBack | AnimState::WalkLeft | AnimState::WalkRight | AnimState::Run | AnimState::RunBack | AnimState::TurnLeft | AnimState::TurnRight | AnimState::Swim | AnimState::IdleSwim | AnimState::SitGround | AnimState::Sleep | AnimState::Lounge | AnimState::IdleCrawl | AnimState::JumpStand | AnimState::JumpForward)
+    matches!(state, AnimState::Idle | AnimState::Walk | AnimState::WalkBack | AnimState::WalkLeft | AnimState::WalkRight | AnimState::Run | AnimState::RunBack | AnimState::TurnLeft | AnimState::TurnRight | AnimState::Swim | AnimState::IdleSwim | AnimState::SitGround | AnimState::Sleep | AnimState::Lounge | AnimState::IdleCrawl | AnimState::Crawl | AnimState::JumpStand | AnimState::JumpForward)
 }
 
 /// GC 0x1006be27 -> 0x100108be interval mode 2 applies to remote characters too.
@@ -852,7 +852,7 @@ pub struct Dynels {
     wield: HashMap<i32, [Option<Wield>; 2]>,
     /// Characters whose fight controller is in state 2 (`SimpleChar+0x1d4 +0x44`, fed by [`Dynels::set_fighting`]): they stand in the weapon's
     /// fight idle (list 0x10), everyone else in the idle of the equip routine (`canim::peace_idle`).
-    fighting: HashSet<i32>,
+    fighting: HashMap<i32, u16>,
     /// Holders whose weapon resolved since the last [`Dynels::take_wielded`] (a weapon wielded during a fight runs the fight idle update again).
     wielded: Vec<i32>,
     /// Weapon-slot tables of the characters: stat `DamageType` of the item behind an `AttackInfo` slot (the hit lines of the chat log).
@@ -1052,7 +1052,7 @@ impl Default for Dynels {
             next_prop: PROP_ID_BASE,
             pending: vec![],
             wield: HashMap::new(),
-            fighting: HashSet::new(),
+            fighting: HashMap::new(),
             wielded: vec![],
             arms: Default::default(),
             attack_bars: HashMap::new(),
@@ -1114,11 +1114,9 @@ impl Default for Dynels {
     }
 }
 
-/// The weapon stance clip (AbstractAnimID) of a wielder in `state`: the equip routine's idle out of a fight (`None` = the plain `idle-stand`), the
-/// weapon's list-0x10 idle in a fight, the rifle's constant walk / run (`canim::{peace_idle, fight_idle, wield_walk_run}`).
-fn stance_id(set: Option<i32>, state: AnimState, fighting: bool) -> Option<u16> {
+/// Equip idle and rifle walk/run overrides; fight/posture idles are installed separately.
+fn stance_id(set: Option<i32>, state: AnimState) -> Option<u16> {
     match state {
-        AnimState::Idle if fighting => canim::fight_idle(set),
         AnimState::Idle => Some(canim::peace_idle(set)).filter(|&i| i != canim::IDLE_STAND),
         AnimState::Walk => canim::wield_walk_run(set).map(|w| w.0),
         AnimState::Run => canim::wield_walk_run(set).map(|w| w.1),
@@ -1404,12 +1402,65 @@ impl Dynels {
 
     /// `id`'s fight controller changed state (`FUN_10069c68` start / `FUN_10068b7f` stop, `CombatEvent::FightStarted` / `FightStopped`): a
     /// fighting wielder stands in the weapon's fight idle, a character out of a fight in the equip routine's idle.
-    pub fn set_fighting(&mut self, id: i32, fighting: bool) {
-        if fighting {
-            self.fighting.insert(id);
-        } else {
+    pub fn set_fighting(&mut self, id: i32, fighting: bool, moving: bool) -> Option<u16> {
+        if !fighting {
             self.fighting.remove(&id);
+            return if moving { None } else { self.pick_holder_animation(id, canim::list::STOP) };
         }
+        let crawling = self.chars.get(&id).is_some_and(|character| character.mover.wait_state() == 0xe);
+        let previous = self.fighting.get(&id).copied().unwrap_or_else(|| if crawling { 0x9a } else { canim::peace_idle(self.wielded_set(id)) });
+        let idle = self.pick_holder_animation(id, canim::list::IDLE);
+        let holder_exists = self.wielded_set(id).is_some() || [6, 8, 0].into_iter().any(|slot| self.arms.slot_item(id, slot).is_some());
+        let draw = if !holder_exists || idle == Some(previous) { None } else { Some(self.pick_holder_animation(id, canim::list::START).unwrap_or(canim::IDLE_STAND)) };
+        self.install_fight_idle(id, if moving { previous } else { idle.unwrap_or(canim::IDLE_STAND) });
+        draw
+    }
+
+    fn install_fight_idle(&mut self, id: i32, idle: u16) {
+        self.fighting.insert(id, idle);
+        let Some(character) = self.chars.get(&id) else { return };
+        let Look::Char(look) = &character.look else { return };
+        let idle = u32::from(idle);
+        if !matches!(self.models.get(&character.key), Some(Model::Ready { built, .. }) if built.clips.contains_key(&idle))
+            && !self.pending_clips.iter().any(|entry| entry.0 == character.key && entry.2 == idle && entry.3 == id) {
+            self.pending_clips.push((character.key, look.clone(), idle, id));
+        }
+    }
+
+    /// Crawl Apply rebuilds weapon lists (100684ce), then explicitly installs the
+    /// crawl/standing idle (1006e646/1006e3ff), even during an existing fight.
+    pub fn apply_crawl_idle(&mut self, id: i32, transition: u16) {
+        if !self.fighting.contains_key(&id) { return; }
+        let idle = match transition {
+            0x68 => 0x9a,
+            0x69 => canim::peace_idle(self.wielded_set(id)),
+            _ => return,
+        };
+        self.install_fight_idle(id, idle);
+    }
+
+    pub fn fight_idle_animation(&self, id: i32) -> Option<u16> {
+        self.fighting.get(&id).copied()
+    }
+
+    pub fn movement_active(&self, id: i32) -> bool {
+        self.chars.get(&id).is_some_and(|character| {
+            let status = character.mover.status();
+            status.forward != 0 || status.strafe != 0 || status.jumping || status.mode == Mode::Fly
+        })
+    }
+
+    fn pick_holder_animation(&mut self, id: i32, key: u16) -> Option<u16> {
+        if let Some(hands) = self.wield.get(&id) {
+            if let Some((hand, weapon)) = hands.iter().enumerate().find_map(|(hand, weapon)| weapon.as_ref().map(|weapon| (hand, weapon))) {
+                let crawling = self.chars.get(&id).is_some_and(|character| character.mover.wait_state() == 0xe);
+                let values = canim::weapon_list(weapon.set, hand == 1, crawling, key);
+                if !values.is_empty() { return values.get(self.rng.rand() as usize % values.len()).copied(); }
+            }
+        }
+        let values = self.arms.holder_animations(id, key)?;
+        if values.is_empty() { return None; }
+        values.get(self.rng.rand() as usize % values.len()).map(|value| *value as u16)
     }
 
     /// Holders whose weapon finished resolving since the last call (the worker's `Resp::Weapon`): `FUN_1006a700` runs the AnimHolder idle update
@@ -1459,12 +1510,13 @@ impl Dynels {
     }
 
     /// GC 0x1006d330 queues the delayed infinite idle first, then the finite enter at priority zero.
-    pub fn play_posture(&mut self, id: i32, anim_id: u32) {
+    pub fn play_posture(&mut self, id: i32, anim_id: u32, lead_ms: f32) {
+        self.apply_crawl_idle(id, anim_id as u16);
         let Some(c) = self.chars.get(&id) else { return };
         // Every supported posture was loaded with the model; never replay a stale worker response.
         if !matches!(self.models.get(&c.key), Some(Model::Ready { built, .. }) if built.clips.contains_key(&anim_id)) { return; }
         let Some(c) = self.chars.get_mut(&id).filter(|c| !matches!(c.special, Special::Die(_))) else { return };
-        c.posture_idle = Some(anim_id);
+        c.posture_idle = Some((anim_id, lead_ms));
         c.special = Special::None;
         for action in &mut c.actions { if action.priority == 0 { action.before_body = true; } }
         let reverse = matches!(anim_id, 0xed | 0xef) && c.mover.status().mode == Mode::SitGround;
@@ -1476,7 +1528,7 @@ impl Dynels {
         self.start_node(id, ActionAnim { id: anim_id, layer, priority, layers: 3, fade_ms: 200.0, ms: 0.0, variant: None, note_fired: 0, rate: 1.0, key: None, slot: -1, delay: None, posture: false, before_body: false });
     }
 
-    fn play_landing(&mut self, id: i32, anim: u16) {
+    pub fn play_intro_action(&mut self, id: i32, anim: u16) {
         self.play_action(id, u32::from(anim), canim::Layer::Body, 0);
         if let Some(character) = self.chars.get_mut(&id) {
             if let Some(action) = character.actions.iter_mut().rev().find(|action| action.priority == 0 && action.id == u32::from(anim)) {
@@ -1540,7 +1592,7 @@ impl Dynels {
 
     /// Mirror the own movement Apply writes into the holder used by combat.
     pub fn set_wait_state(&mut self, id: i32, value: i32) {
-        if let Some(c) = self.chars.get_mut(&id) { c.mover.on_stat(0x1ae, value); }
+        if let Some(character) = self.chars.get_mut(&id) { character.mover.on_stat(0x1ae, value); }
     }
 
     /// Native creature-vs-item swing branch (GC 0x100679a0, DS 0x10073199).
@@ -2751,6 +2803,7 @@ impl Dynels {
                             if let Some(effects) = &mut self.effects { effects.source_deleted((c.owner.kind as u32, c.owner.instance as u32)); }
                             self.cancel_nano_visuals(c.owner.instance);
                             self.chars.remove(&c.owner.instance);
+                            self.fighting.remove(&c.owner.instance);
                         }
                     }
                     Err(e) => eprintln!("dynels: corpse {}: {e:#}", who.instance),
@@ -2989,6 +3042,7 @@ impl Dynels {
             N3::Misc(Misc::ToClientQuit) => {
                 self.cancel_nano_visuals(who.instance);
                 self.chars.remove(&who.instance);
+                self.fighting.remove(&who.instance);
                 self.swing_delay.remove(&who.instance);
                 self.once_rate.remove(&who.instance);
                 self.swings.remove(&who.instance);
@@ -3029,7 +3083,7 @@ impl Dynels {
                 }
             }
         }
-        while let Some((id, anim)) = self.pending_landings.pop() { self.play_landing(id, anim); }
+        while let Some((id, anim)) = self.pending_landings.pop() { self.play_intro_action(id, anim); }
     }
 
     /// Scene replacement can arrive after the playfield notification and erase already queued uploads.
@@ -3303,10 +3357,12 @@ impl Dynels {
                 }
                 Special::None => {
                     let (id, a) = clip_of(built, state).map_or((0x78, None), |(i, a)| (i, Some(a)));
-                    // a wielder: the idle of the equip routine (rifle / bazooka list 0x29) out of a fight, the weapon idle (list 0x10) in a fight, the
-                    // rifle's constant walk / run (`canim::{peace_idle, fight_idle, wield_walk_run}`, docs/zone/combat-anim.md §4)
+                    // Fight/posture idle is installed once; equip idle and rifle gait remain independent.
                     let set = self.wield.get(id_ref).and_then(|w| w.iter().flatten().next().map(|w| w.set));
-                    let sid = stance_id(set, state, self.fighting.contains(id_ref));
+                    let sid = match state {
+                        AnimState::Idle | AnimState::IdleCrawl => self.fighting.get(id_ref).copied().or_else(|| stance_id(set, state)),
+                        _ => stance_id(set, state),
+                    };
                     let stance = sid.and_then(|sid| built.clips.get(&(sid as u32)).map(|a| (sid as u32, a)));
                     // Direct stance idle Play retains its authored 1.0 (GC 0x1003cc15 / 0x1003cad0).
                     if stance.is_some() && !c.mover.status().is_moving() {
@@ -3353,10 +3409,10 @@ impl Dynels {
                 c.body_phase = clip_start;
                 c.terminal_pose = false;
             }
-            if let Some(animation) = c.posture_idle.take() {
+            if let Some((animation, lead_ms)) = c.posture_idle.take() {
                 if let (Some(idle), Some(action)) = (clip, c.actions.iter_mut().rev().find(|action| action.posture && action.id == animation)) {
                     if let Some(enter) = built.clips.get(&animation).and_then(|clips| clips.first()) {
-                        c.body_delay_ms = (action.duration(enter) - super::avatar::POSTURE_IDLE_LEAD_MS).max(0.0);
+                        c.body_delay_ms = (action.duration(enter) - lead_ms).max(0.0);
                         let (start, end) = super::avatar::loop_span(idle).unwrap_or((0.0, idle.duration));
                         action.fade_ms = ao_formats::character::animation_fade_ms(end - start, 0.0);
                     }
@@ -4262,7 +4318,7 @@ mod tests {
             if remaining < 200.0 { remaining += (200.0 / span).ceil() * span; }
             let expected_idle_fade = remaining.clamp(200.0, 300.0);
             world.on_message(&posture_action(who, action));
-            world.play_posture(who, animation);
+            world.play_posture(who, animation, super::super::avatar::POSTURE_IDLE_LEAD_MS);
             tick(&mut world, &mut host, 0.0);
             let c = &world.chars[&who];
             assert!(c.previous_body.is_some(), "posture entry preserves the old idle");
@@ -4320,7 +4376,7 @@ mod tests {
         assert!(world.chars[&who].previous_body.as_ref().unwrap().once, "outgoing Once playback must clamp, not wrap");
         tick(&mut world, &mut host, 1.0);
         world.on_message(&posture_action(who, id::SIT_RELAY));
-        world.play_posture(who, 0xd5);
+        world.play_posture(who, 0xd5, super::super::avatar::POSTURE_IDLE_LEAD_MS);
         tick(&mut world, &mut host, 0.0);
         tick(&mut world, &mut host, 0.1);
         let c = &world.chars[&who];
@@ -4347,7 +4403,7 @@ mod tests {
         // At most three linear envelopes can change; 200 ms is retail's minimum fade.
         let next_frame_bound = authored_step + 3.0 * (2.0 * radius) / (200.0 / (1000.0 / 60.0));
         world.on_message(&posture_action(who, id::STAND_UP));
-        world.play_posture(who, 0xd6);
+        world.play_posture(who, 0xd6, super::super::avatar::POSTURE_IDLE_LEAD_MS);
         tick(&mut world, &mut host, 0.0);
         let c = &world.chars[&who];
         let Model::Ready { built, .. } = &world.models[&key] else { unreachable!() };
@@ -5215,17 +5271,16 @@ mod variant_tests {
     /// A rifle wielder out of a fight stands in `idle-2h`, in a fight in `idle-rifle`, and walks / runs with 0x421 / 0x422; a blade keeps the plain idle
     /// out of a fight and has the blade idle in one (`FUN_1009c858`, `FUN_1003cad0`).
     #[test]
-    fn wielder_stance_follows_the_fight_state() {
-        assert_eq!(stance_id(Some(3), AnimState::Idle, false), Some(0x41e));
-        assert_eq!(stance_id(Some(3), AnimState::Idle, true), Some(0x3fd));
-        assert_eq!((stance_id(Some(3), AnimState::Walk, false), stance_id(Some(3), AnimState::Run, true)), (Some(0x421), Some(0x422)));
-        assert_eq!((stance_id(Some(1), AnimState::Idle, false), stance_id(Some(1), AnimState::Idle, true)), (None, Some(0x3e9)));
-        assert_eq!((stance_id(Some(1), AnimState::Walk, false), stance_id(Some(8), AnimState::Run, false)), (None, None));
-        assert_eq!((stance_id(None, AnimState::Idle, true), stance_id(Some(4), AnimState::Idle, false)), (None, None));
+    fn wielder_movement_stance_is_independent_of_fight_idle() {
+        assert_eq!(stance_id(Some(3), AnimState::Idle), Some(0x41e));
+        assert_eq!((stance_id(Some(3), AnimState::Walk), stance_id(Some(3), AnimState::Run)), (Some(0x421), Some(0x422)));
+        assert_eq!(stance_id(Some(1), AnimState::Idle), None);
+        assert_eq!((stance_id(Some(1), AnimState::Walk), stance_id(Some(8), AnimState::Run)), (None, None));
+        assert_eq!((stance_id(None, AnimState::Idle), stance_id(Some(4), AnimState::Idle)), (None, None));
         let mut d = Dynels::default();
-        d.set_fighting(7, true);
-        assert!(d.fighting.contains(&7));
-        d.set_fighting(7, false);
+        let _ = d.set_fighting(7, true, false);
+        assert!(d.fighting.contains_key(&7));
+        let _ = d.set_fighting(7, false, false);
         assert!(d.fighting.is_empty());
     }
 
@@ -6405,6 +6460,52 @@ mod variant_tests {
     /// `FUN_10058cfa` (the `GetImpactAnim` override of `SimpleChar`): one of `0x81 0x82 0x80 0x84 0x7f`; the struck leet plays the `imp-*` clip once,
     /// at half speed unless the hit kind is 4.
     #[test]
+    fn remote_draw_holster_and_crawl_share_native_300ms_idle_lead() {
+        let Some((mut zone, who, _)) = fight_zone() else { return };
+        zone.world.wield.entry(who).or_default()[0] = Some(Wield { set: 3, delay: 100 });
+        let character = zone.world.chars.get_mut(&who).unwrap();
+        character.mover = Mover::new(character.pose.pos, character.pose.yaw);
+        character.mover.set_features(4);
+        character.mover.on_move_type(ao_net::n3::motion::MoveType::SwitchToRunMode as u8);
+        let pos = scene_pos(zone.world.chars[&who].pose.pos);
+        let mut host = Host::headless();
+        for (crawl, on, expected) in [(false, true, 0x3fc), (false, false, 0x3fe), (true, true, 0xcd), (true, false, 0xcf)] {
+            if crawl {
+                zone.world.chars.get_mut(&who).unwrap().mover.on_move_type(ao_net::n3::motion::MoveType::SwitchToCrawlMode as u8);
+                zone.world.set_wait_state(who, 0xe);
+            }
+            let animation = zone.world.set_fighting(who, on, false).unwrap();
+            assert_eq!(animation, expected);
+            let duration = {
+                let character = &zone.world.chars[&who];
+                let Model::Ready { built, .. } = &zone.world.models[&character.key] else { unreachable!() };
+                super::super::avatar::posture_interval_end(&built.clips[&u32::from(animation)][0])
+            };
+            zone.world.play_posture(who, u32::from(animation), super::super::avatar::STANCE_IDLE_LEAD_MS);
+            zone.world.update_with_collision(0.0, pos, [0.0, 0.0, 1.0], &mut host, None, |_| None);
+            if duration == 0.0 {
+                assert_eq!(zone.world.chars[&who].body_delay_ms, 0.0);
+                assert!(!zone.world.chars[&who].actions.iter().any(|node| node.id == u32::from(animation)), "an authored zero-length intro completes immediately");
+                continue;
+            }
+            let character = &zone.world.chars[&who];
+            let Model::Ready { built, .. } = &zone.world.models[&character.key] else { unreachable!() };
+            let node = character.actions.iter().rev().find(|node| node.id == u32::from(animation)).unwrap();
+            let clip = &built.clips[&u32::from(animation)][node.variant.unwrap()];
+            let duration = node.duration(clip);
+            let delay = (duration - 300.0).max(0.0);
+            assert_eq!(character.body_delay_ms, delay);
+            let start = character.clip_ms;
+            zone.world.update_with_collision(delay / 1000.0, pos, [0.0, 0.0, 1.0], &mut host, None, |_| None);
+            assert!((zone.world.chars[&who].clip_ms - start).abs() < 0.001);
+            assert!(zone.world.chars[&who].actions.iter().any(|node| node.id == u32::from(animation)));
+            zone.world.update_with_collision(0.01, pos, [0.0, 0.0, 1.0], &mut host, None, |_| None);
+            assert!(zone.world.chars[&who].clip_ms > start);
+            zone.world.update_with_collision(10.0, pos, [0.0, 0.0, 1.0], &mut host, None, |_| None);
+        }
+    }
+
+    #[test]
     fn crawl_wait_state_selects_weapon_and_impact_lists() {
         use ao_net::n3::dynel::StatUpdate;
         let mut spawn = frames(include_str!("../../../../docs/captures/zone_ithaca.rec")).iter()
@@ -6419,10 +6520,18 @@ mod variant_tests {
         world.on_message(&spawn);
         assert_eq!(world.pick_swing(who, canim::list::ATTACK).unwrap().0, 0xd1);
         assert_eq!(world.impact_anim(who), 0xd0);
+        assert_eq!(world.set_fighting(who, true, false), Some(0xcd));
+        assert_eq!(world.fight_idle_animation(who), Some(0xce));
+        world.apply_crawl_idle(who, 0x68);
+        assert_eq!(world.fight_idle_animation(who), Some(0x9a), "Crawl Apply explicitly installs idle-crawl after rebuilding the weapon lists");
         spawn.body = N3::Dynel(Dynel::Stat(StatUpdate { stats: vec![(0x1ae, 0)], rest: vec![] }));
         world.on_message(&spawn);
         assert_eq!(world.pick_swing(who, canim::list::ATTACK).unwrap().0, 0x3ff);
         assert_ne!(world.impact_anim(who), 0xd0);
+        assert_eq!(world.fight_idle_animation(who), Some(0x9a), "a raw WaitState update alone does not reinstall a holder idle");
+        world.apply_crawl_idle(who, 0x69);
+        assert_eq!(world.fight_idle_animation(who), Some(0x41e));
+        assert_eq!(world.set_fighting(who, false, false), Some(0x3fe));
     }
 
     #[test]

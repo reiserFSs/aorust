@@ -135,6 +135,8 @@ pub enum Role {
     SitChair,
     SitGround,
     Crawl,
+    /// Moving crawl producer (GC1006ea44); `Crawl` is its idle.
+    CrawlMove,
     Swim,
     IdleSwim,
     JumpStand,
@@ -161,6 +163,7 @@ const ROLE_NAMES: &[(Role, &str)] = &[
     (Role::SitChair, "idle-chair"),
     (Role::SitGround, "idle-ground"),
     (Role::Crawl, "idle-crawl"),
+    (Role::CrawlMove, "crawl"),
     (Role::Swim, "swim"),
     (Role::IdleSwim, "idle-swim"),
     (Role::JumpStand, "jump-stand"),

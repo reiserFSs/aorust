@@ -2,7 +2,7 @@
 
 use super::actions::Event as ActionEvent;
 use super::actions::Pose;
-use super::anim::{anim_name, draw_clip, holster_clip, list, npc_sound, special_swing, UNARMED_RSWING};
+use super::anim::{anim_name, list, npc_sound, special_swing, UNARMED_RSWING};
 use super::log::{Space, HUD_Y_FROM_REF};
 use super::state::CombatEvent;
 use super::module::{Command, Module};
@@ -358,7 +358,7 @@ impl Play {
                 // the own avatar's enter / stop clips follow its movement role (`Player::update`); the others' pose changes come from the zone stream
                 ActionEvent::Pose { dynel, from, to } if dynel != own => {
                     if let Some(id) = Pose::transition_anim(from, to) {
-                        self.zone.world.play_posture(dynel, id as u32);
+                        self.zone.world.play_posture(dynel, id as u32, crate::play::avatar::POSTURE_IDLE_LEAD_MS);
                     }
                 }
                 ActionEvent::Pose { .. } => {}
@@ -545,11 +545,12 @@ pub(in crate::play) fn note_reaction(world: &mut Dynels, player: Option<&mut Pla
 }
 
 /// Fight draw/holster use holder group 0 without cancelling group -1 swing nodes.
-fn play_anim(world: &mut Dynels, player: &mut Option<&mut Player>, own: i32, who: i32, id: u16) {
+fn play_anim(world: &mut Dynels, player: &mut Option<&mut Player>, own: i32, who: i32, id: u16, delay_idle: bool) {
     if who != own {
-        world.play_action(who, u32::from(id), super::anim::Layer::Body, 0);
+        if delay_idle { world.play_posture(who, u32::from(id), crate::play::avatar::STANCE_IDLE_LEAD_MS); }
+        else { world.play_intro_action(who, id); }
     } else if let Some(p) = player.as_deref_mut() {
-        p.play_action(id, Some(0), 0);
+        p.play_stance(id, world.fight_idle_animation(who), world.wielded_set(who), delay_idle);
     }
 }
 
@@ -557,15 +558,15 @@ fn play_anim(world: &mut Dynels, player: &mut Option<&mut Player>, own: i32, who
 /// on = idle update `FUN_1003cad0` [GC 0x1003cad0] (the weapon's list 0x1a, then the weapon idle), off = `FUN_1003cc15` (list 0x1b, then the idle of
 /// the equip routine); `play` = false skips the clip (a dying character goes straight to its death clip).
 fn fight_idle(world: &mut Dynels, player: &mut Option<&mut Player>, own: i32, who: i32, on: bool, play: bool) {
-    world.set_fighting(who, on);
+    let moving = if who == own { player.as_ref().is_some_and(|player| player.movement_active()) } else { world.movement_active(who) };
+    let transition = world.set_fighting(who, on, moving);
     if who == own {
         if let Some(p) = player.as_deref_mut() {
             p.fighting = on;
         }
     }
-    let set = world.wielded_set(who);
-    if let Some(id) = if on { draw_clip(set) } else { holster_clip(set) }.filter(|_| play) {
-        play_anim(world, player, own, who, id);
+    if let Some(id) = transition.filter(|_| play) {
+        play_anim(world, player, own, who, id, !moving);
     }
 }
 

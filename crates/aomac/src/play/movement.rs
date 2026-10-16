@@ -796,6 +796,7 @@ impl Movement {
         }
         match f.mode {
             SIT_GROUND => Role::SitGround,
+            CRAWL if moving_h => Role::CrawlMove,
             CRAWL => Role::Crawl,
             SLEEP => Role::SleepGround,
             LOUNGE => Role::Lounge,
@@ -2584,6 +2585,17 @@ mod tests {
         m.jump_impulse(2.0);
         run(&mut m, &Flat(0.0), 0.1);
         assert_eq!(m.fsm().fwd, 1, "a jump from a standstill does not fire the callback");
+    }
+
+    #[test]
+    fn crawl_motion_uses_its_own_loop_role() {
+        let mut movement = Movement::new([0.0; 3], 0.0, 0);
+        movement.crawl_toggle(0.0);
+        assert_eq!(movement.role(), Role::Crawl);
+        movement.action(id::FORWARD_START, 0.1);
+        assert_eq!(movement.role(), Role::CrawlMove);
+        movement.action(id::FORWARD_STOP, 0.2);
+        assert_eq!(movement.role(), Role::Crawl);
     }
 
     #[test]

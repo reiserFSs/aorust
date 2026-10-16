@@ -41,7 +41,7 @@ impl Pose {
             Role::SitGround | Role::SitChair => Pose::SitGround,
             Role::SleepGround => Pose::Sleeping,
             Role::Lounge => Pose::Lounging,
-            Role::Crawl => Pose::Crawling,
+            Role::Crawl | Role::CrawlMove => Pose::Crawling,
             _ => Pose::Standing,
         }
     }

@@ -18,10 +18,12 @@ pub const MODEL_KEY: u64 = 0x4156_0000_0000_0001;
 
 /// GC 1006d330 subtracts the double at 101606a8 from the enter interval duration.
 pub(super) const POSTURE_IDLE_LEAD_MS: f32 = 500.0;
+/// GC1003cbea subtracts double1015d640 from fight draw/holster duration.
+pub(super) const STANCE_IDLE_LEAD_MS: f32 = 300.0;
 
 /// GC 100108be mode 1 plays the intro interval, falling back to the entire clip.
 pub(super) fn posture_interval_end(clip: &CatAnim) -> f32 {
-    clip.events.iter().find(|(ms, name)| name == "loopstart" && *ms > 0 && (*ms as f32) <= clip.duration)
+    clip.events.iter().find(|(ms, name)| name == "loopstart" && (*ms as f32) <= clip.duration)
         .map_or(clip.duration, |(ms, _)| *ms as f32)
 }
 
@@ -180,7 +182,7 @@ fn stance_clip(set: i32, r: &Role) -> Option<String> {
 /// Movement playback uses interval mode 2 (GC 0x1006be27 -> 0x1003c392 -> 0x100108be):
 /// start at `loopstart`, loop to `loopend`; no separate run-start clip or inherited gait phase.
 fn movement_loop(r: &Role) -> bool {
-    matches!(r, Role::Idle | Role::SitGround | Role::Walk | Role::WalkBack | Role::WalkLeft | Role::WalkRight | Role::Run | Role::RunBack | Role::Swim | Role::IdleSwim | Role::JumpStand | Role::JumpForward)
+    matches!(r, Role::Idle | Role::IdleCombat | Role::Crawl | Role::CrawlMove | Role::SitGround | Role::Walk | Role::WalkBack | Role::WalkLeft | Role::WalkRight | Role::Run | Role::RunBack | Role::Swim | Role::IdleSwim | Role::JumpStand | Role::JumpForward)
         || matches!(r, Role::Clip(name) if name == "turn-left" || name == "turn-right")
 }
 
@@ -408,6 +410,8 @@ pub struct Avatar {
     notes: Vec<super::combat::notes::FiredNote>,
     /// `AnimSet` of the wielded weapon ([`Avatar::set_stance`]).
     stance: Option<i32>,
+    holder_idle: Option<u16>,
+    stance_changed: bool,
     /// Milliseconds into the current clip.
     ms: f32,
     /// SetAnimationDelay freezes only the new idle node, not the enter or preceding idle.
@@ -436,7 +440,7 @@ impl Avatar {
         let heads = head_table(store, breed, gender, 2)?;
         let l = AvatarLook::from_update(u, |h| heads.iter().find(|e| e.mesh == h).map_or(Skin::Caucasian, |e| e.skin))?;
         let rig = ActorRig::player(store, &assets, &l.look, &l.attachments)?;
-        let mut a = Self { id, rig, current_skin: Default::default(), current_palette: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), monster_data: 0, monster: None, monster_look: super::dynels::CharLook::from_update(u), monster_rand: ao_scene::CrtRand::thread(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, body_once: false, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, ms: 0.0, body_delay_ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_once: false, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
+        let mut a = Self { id, rig, current_skin: Default::default(), current_palette: Default::default(), current_bounds: Default::default(), current_parts: Default::default(), sample_pose: std::cell::Cell::new(true), cadence: Default::default(), pose_cache: Default::default(), look: l.look, attachments: l.attachments, cloth_pages: u.cloth.iter().map(|c| (c.page * 5 + c.part(), c.texture)).collect(), monster_data: 0, monster: None, monster_look: super::dynels::CharLook::from_update(u), monster_rand: ao_scene::CrtRand::thread(), assets, anim_set: super::combat::anim::clip_set(u.breed, u.sex), scale: l.scale, calibration: Calibration::load(client_dir), pose: AvatarPose::default(), clip: None, actions: Vec::new(), body_priority: 0, body_layers: 3, clip_id: 0, calibration_id: 0, rate: 1.0, clip_scale: None, cast_loop: false, body_once: false, note_fired: 0, body_phase: 0.0, airborne: false, notes: Vec::new(), stance: None, holder_idle: None, stance_changed: false, ms: 0.0, body_delay_ms: 0.0, prev_clip: None, prev_ms: 0.0, prev_rate: 1.0, prev_once: false, prev_fade_elapsed: 0.0, prev_fade_ms: 0.0, transform: Mat4::IDENTITY };
         a.set_pose(store, AvatarPose::default())?;
         a.set_transform([u.pos[0], u.pos[1], -u.pos[2]], u.yaw().map_or(0.0, |y| -y));
         Ok(a)
@@ -597,7 +601,7 @@ impl Avatar {
 
     /// GC 1006d330: enqueue the infinite mode-2 idle first, then a priority-0 mode-1 enter.
     /// DS 100737db/10072eeb freezes the idle clock; the finite enter keeps its own fade/lifetime.
-    pub fn play_posture(&mut self, store: &RecordStore, id: u16, idle: AvatarPose) -> Result<()> {
+    pub fn play_posture(&mut self, store: &RecordStore, id: u16, idle: AvatarPose, lead_ms: f32) -> Result<()> {
         let Some((clip_id, _)) = self.action_clip(id) else { return Ok(()) };
         let clip = self.assets.anim(store, clip_id)?;
         let duration = posture_interval_end(&clip);
@@ -606,7 +610,7 @@ impl Avatar {
             .map(|action| animation_fade_ms(action.duration, action.ms));
         self.set_pose(store, idle)?;
         if let Some(fade) = idle_fade { self.prev_fade_ms = fade; }
-        self.body_delay_ms = (duration - POSTURE_IDLE_LEAD_MS).max(0.0);
+        self.body_delay_ms = (duration - lead_ms).max(0.0);
         let idle_duration = self.clip.as_ref().map_or(0.0, |idle| loop_span(idle).map_or(idle.duration, |(start, end)| end - start));
         let fade_ms = animation_fade_ms(idle_duration, 0.0);
         self.start_action(clip, 0, 0, if reverse { -1.0 } else { 1.0 }, (None, -1, None));
@@ -649,10 +653,12 @@ impl Avatar {
     pub fn set_pose(&mut self, store: &RecordStore, pose: AvatarPose) -> Result<()> {
         // Movement retains Hover while flying: GC 1006be27 moving mode 7
         // leaves the flight-entry clip unchanged, not a B3/B4 fallback.
-        if pose.role != self.pose.role || self.clip.is_none() {
+        let stance_changed = std::mem::take(&mut self.stance_changed);
+        if pose.role != self.pose.role || self.clip.is_none() || stance_changed {
             let (clip, id, calibration_id) = if let Some(rec) = &self.monster {
                 let name = pose.role.clip_name();
-                let Some(key) = super::combat::anim::ANIMS.iter().find(|a| a.1 == name).map(|a| u32::from(a.0)) else {
+                let Some(key) = self.holder_idle.filter(|_| matches!(pose.role, Role::IdleCombat | Role::Crawl)).map(u32::from)
+                    .or_else(|| super::combat::anim::ANIMS.iter().find(|a| a.1 == name).map(|a| u32::from(a.0))) else {
                     self.pose = pose;
                     return Ok(());
                 };
@@ -669,7 +675,9 @@ impl Avatar {
                 let mut role = pose.role.clone();
                 let clips = self.assets.clips(store, self.rig.model_id)?;
                 // A wielder overrides movement only while the model has the stance clip.
-                let mut stance = self.stance.and_then(|set| stance_clip(set, &pose.role)).filter(|n| clips.iter().any(|c| c.0 == *n));
+                let mut stance = self.holder_idle.filter(|_| matches!(pose.role, Role::IdleCombat | Role::Crawl))
+                    .and_then(super::combat::anim::anim_name).map(|animation| animation.0.to_owned())
+                    .or_else(|| self.stance.and_then(|set| stance_clip(set, &pose.role))).filter(|name| clips.iter().any(|clip| clip.0 == *name));
                 loop {
                     let name = stance.take().unwrap_or_else(|| role.clip_name());
                     if let Some(&(_, id)) = clips.iter().find(|c| c.0 == name) {
@@ -753,12 +761,19 @@ impl Avatar {
         self.actions.iter().rev().find_map(|a| a.role.as_ref())
     }
 
-    /// Weapon stance of the first wielded hand: peace idle and rifle-only walk/run overrides
-    /// (`stance_clip`, GC 0x1009c858); fight idle independently uses list 0x10.
+    /// Native holder idle selected once by the fight/wield/posture producer.
+    pub fn set_holder_idle(&mut self, idle: Option<u16>) {
+        if idle != self.holder_idle {
+            self.holder_idle = idle;
+            self.stance_changed = true;
+        }
+    }
+
+    /// Weapon stance (`stance_clip`, GC1009c858); holder idle separately supplies list0x10.
     pub fn set_stance(&mut self, set: Option<i32>) {
         if set != self.stance {
             self.stance = set;
-            self.clip = None; // the next `set_pose` picks the clip again
+            self.stance_changed = true; // retain the outgoing body for the native crossfade
         }
     }
 
@@ -1120,6 +1135,47 @@ pub(super) mod tests {
     };
 
     #[test]
+    fn posture_intro_preserves_authored_zero_boundary() {
+        let mut clip = CatAnim { source_id: 0, root: String::new(), events: vec![(0, "loopstart".into())], version: 0, duration: 1000.0, signature: 0, param: 0.0, tracks: vec![] };
+        assert_eq!(posture_interval_end(&clip), 0.0);
+        clip.events[0].0 = 500;
+        assert_eq!(posture_interval_end(&clip), 500.0);
+        clip.events[0].0 = 2000;
+        assert_eq!(posture_interval_end(&clip), clip.duration);
+        clip.events.clear();
+        assert_eq!(posture_interval_end(&clip), clip.duration);
+    }
+
+    #[test]
+    fn holder_idle_and_native_stance_lead_use_actual_intro_clocks() {
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        for (idle, enter, role) in [(0x407, 0x406, Role::IdleCombat), (0x3fd, 0x3fc, Role::IdleCombat), (0xce, 0xcd, Role::Crawl), (0x9a, 0xcf, Role::Crawl)] {
+            let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
+            let expected = avatar.action_clip(idle).unwrap().0;
+            avatar.set_holder_idle(Some(idle));
+            avatar.play_posture(&store, enter, AvatarPose::still(role), STANCE_IDLE_LEAD_MS).unwrap();
+            assert_eq!(avatar.clip_id, expected);
+            let action = avatar.actions.iter().rev().find(|action| action.priority == 0).unwrap();
+            let duration = posture_interval_end(&action.clip);
+            assert_eq!(action.duration, duration);
+            let delay = (duration - 300.0).max(0.0);
+            assert_eq!(avatar.body_delay_ms, delay);
+            let idle_start = avatar.ms;
+            if delay > 0.0 {
+                avatar.update(delay / 1000.0);
+                assert!((avatar.ms - idle_start).abs() < 0.001, "idle remains frozen until the native lead");
+                assert!(avatar.actions.iter().any(|action| action.priority == 0), "draw survives idle waking");
+            }
+            avatar.update(0.01);
+            assert!(avatar.ms > idle_start, "idle wakes while the finite intro still runs");
+        }
+        assert!(!one_shot(&Role::CrawlMove, false));
+        assert_eq!(Role::CrawlMove.clip_name(), "crawl");
+        assert_eq!(crate::play::combat::actions::Pose::from_role(&Role::CrawlMove), crate::play::combat::actions::Pose::Crawling);
+    }
+
+    #[test]
     fn own_interrupted_loop_keeps_installed_playback_count() {
         let Some(dir) = client() else { return };
         let store = RecordStore::open(&dir).unwrap();
@@ -1142,7 +1198,7 @@ pub(super) mod tests {
         let store = RecordStore::open(&dir).unwrap();
         let mut avatar = Avatar::new(&store, &dir, 7, &own_update(), ActorAssets::new(&store).unwrap()).unwrap();
         avatar.update(1.0);
-        avatar.play_posture(&store, 0xd5, AvatarPose::still(Role::SitGround)).unwrap();
+        avatar.play_posture(&store, 0xd5, AvatarPose::still(Role::SitGround), POSTURE_IDLE_LEAD_MS).unwrap();
         avatar.update(0.1);
         assert!(avatar.body_delay_ms > 0.0 && avatar.prev_fade_elapsed == 0.0);
         let before = avatar.rig.pose_composed(avatar.layers()).0;
@@ -1153,7 +1209,7 @@ pub(super) mod tests {
         let old_ms = old_enter.ms;
         let old_duration = old_enter.duration;
         let old_fade = old_enter.fade_ms;
-        avatar.play_posture(&store, 0xd6, AvatarPose::still(Role::Idle)).unwrap();
+        avatar.play_posture(&store, 0xd6, AvatarPose::still(Role::Idle), POSTURE_IDLE_LEAD_MS).unwrap();
         let switched = avatar.rig.pose_composed(avatar.layers()).0;
         let delta = |a: &[ao_scene::Vertex], b: &[ao_scene::Vertex]| a.iter().zip(b)
             .map(|(a, b)| Vec3::from(a.pos).distance(Vec3::from(b.pos))).fold(0.0_f32, f32::max);

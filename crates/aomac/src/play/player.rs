@@ -308,6 +308,24 @@ impl Player {
         u32::from(self.movement.fsm().mode)
     }
 
+    /// Vehicle vtable+0x9c (`GC1006c469`), including jumping and flight.
+    pub fn movement_active(&self) -> bool {
+        let state = self.movement.fsm();
+        state.fwd == 2 || state.strafe == 2 || state.jump == 3 || state.mode == mode::FLY
+    }
+
+    pub fn play_stance(&mut self, id: u16, idle: Option<u16>, set: Option<i32>, delay_idle: bool) {
+        self.avatar.set_stance(set);
+        let result = if delay_idle {
+            self.avatar.set_holder_idle(idle);
+            let role = if self.movement.fsm().mode == mode::CRAWL { Role::Crawl } else if self.fighting { Role::IdleCombat } else { Role::Idle };
+            self.avatar.play_posture(&self.store, id, AvatarPose::still(role), avatar::STANCE_IDLE_LEAD_MS)
+        } else {
+            self.avatar.play_intro_action(&self.store, id)
+        };
+        if let Err(error) = result { eprintln!("avatar stance: {error:#}"); }
+    }
+
     /// Plays `role` once over the movement pose (`hold`: keep the last frame, for the death clip).
     pub fn play(&mut self, role: Role, hold: bool) {
         self.avatar.set_body_priority(if hold { -3 } else { 0 });
@@ -625,6 +643,9 @@ impl Player {
         let role = self.movement.role();
         let moving = self.movement.speed() > 0.01 && self.movement.grounded();
         self.avatar.set_stance(zone.world.wielded_set(self.char_id as i32));
+        self.avatar.set_holder_idle(if self.fighting && !moving && matches!(role, Role::Idle | Role::Crawl) {
+            zone.world.fight_idle_animation(self.char_id as i32)
+        } else { None });
         // the new pose's enter / stop clip plays once over its idle clip (`Pose::transition_anim`, GC 0x1006d330)
         let now = Pose::from_role(&role);
         if let Some(from) = self.pose.replace(now).filter(|&b| b != now && self.cast_loop.is_none()) {
@@ -635,7 +656,11 @@ impl Player {
                 self.avatar.set_clip_scale(None);
                 self.avatar.set_cast_loop(false);
                 let idle = if self.fighting && role == Role::Idle { Role::IdleCombat } else { role.clone() };
-                if let Err(e) = self.avatar.play_posture(&self.store, id, AvatarPose::still(idle)) {
+                zone.world.apply_crawl_idle(self.char_id as i32, id);
+                if self.fighting && matches!(id, 0x68 | 0x69) {
+                    self.avatar.set_holder_idle(zone.world.fight_idle_animation(self.char_id as i32));
+                }
+                if let Err(e) = self.avatar.play_posture(&self.store, id, AvatarPose::still(idle), avatar::POSTURE_IDLE_LEAD_MS) {
                     eprintln!("avatar posture: {e:#}");
                 }
             }

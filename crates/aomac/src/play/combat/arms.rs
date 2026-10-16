@@ -281,6 +281,12 @@ impl Armory {
         self.by.get(&holder)?.slots.get(&slot)
     }
 
+    /// Holder stance keys never fall back to attack0xb (GC1003cad0/1003cc15).
+    pub fn holder_animations(&self, holder: i32, key: u16) -> Option<&[u32]> {
+        let item = [6, 8, 0].into_iter().find_map(|slot| self.slot_item(holder, slot))?;
+        item.animations.iter().find(|entry| entry.0 == u32::from(key)).map(|entry| entry.1.as_slice())
+    }
+
     /// GC 0x10068969: hands 8/6, or bare hands 0 only when neither is occupied -- every wielded hand, for `in_attack_range`
     /// and the per-hand Attack timer bar (`item_round_seconds`, `hud_stats::update_attack_timers`).
     pub fn attack_slots(&self, holder: i32) -> Vec<i32> {
@@ -351,6 +357,25 @@ mod tests {
         let mut a = Armory::default();
         a.list(1, false, &[(43712, 100), (43713, 144), (43714, 142), (43715, 1)]);
         a
+    }
+
+    #[test]
+    fn holder_stance_keys_are_exact_cached_and_respect_movement() {
+        let mut arms = player();
+        let item = arms.by.get_mut(&1).unwrap().slots.get_mut(&0).unwrap();
+        item.animations = vec![(0xb, vec![1034]), (0x1a, vec![1030]), (0x10, vec![1031]), (0x1b, vec![1032])];
+        assert_eq!(arms.holder_animations(1, 0x10), Some(&[1031][..]));
+        assert_eq!(arms.holder_animations(1, 0x29), None, "stance misses must not select attack0xb");
+        let mut world = crate::play::dynels::Dynels::default();
+        world.arms = arms;
+        assert_eq!(world.set_fighting(1, true, false), Some(1030));
+        for _ in 0..20 { assert_eq!(world.fight_idle_animation(1), Some(1031)); }
+        assert_eq!(world.set_fighting(1, false, false), Some(1032));
+        assert_eq!(world.set_fighting(1, true, true), Some(1030), "draw still plays while moving");
+        assert_eq!(world.fight_idle_animation(1), Some(120), "moving start does not install fight idle");
+        assert_eq!(world.set_fighting(1, false, true), None, "native stop skips holster while moving");
+        world.arms.wield(1, 500, 6, None, &[]);
+        assert_eq!(world.arms.holder_animations(1, 0x10), None, "an occupied hand wins over the dummy item even with no key");
     }
 
     #[test]
