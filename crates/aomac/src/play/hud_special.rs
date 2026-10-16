@@ -9,8 +9,10 @@
 
 /// `FUN_100428ad` [GC 0x100428ad], the map `Action_e` -> `{template instance, true}` filled for the own character: the rdb 1000020 record
 /// `{0xF4254, instance}` (`GetItemByTemplate` maps the Identity kind 0xdeb0 to the item template type, GC 0x17aae) that names and draws
-/// the action. Instance 0 = filled at run time from the profession table `FUN_1003e278` (`DAT_102e2fc8`, all zero in the DLL image, no static
-/// writer found: UNRESOLVED, so the alt-state actions 0x8a / 0x8b never get an entry here).
+/// the action. Instance 0 = unresolved profession alt-state template: GC `1003e278` directly reads two dwords at
+/// `0x102e2fc8 + profession*8` for professions 1–15 (`0x102e2fd0..0x102e3047`), not through a pointer/vector header.
+/// These addresses occupy the PE loader-zero `.data` virtual tail, not stored zero words. No runtime writer/templates
+/// were recovered, so the alt-state actions 0x8a / 0x8b get no invented entries here.
 pub const ACTION_TEMPLATES: [(u32, u32); 28] = [
     (0x01, 0xc1aa), // Pick-Up
     (0x03, 0xc1a3), // Use
