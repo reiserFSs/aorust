@@ -530,7 +530,7 @@ impl Collision {
     ///
     /// * dungeon (`n3Zone_t::PerformLiquidCollisionTest` @0x1001a80c, `FUN_1000b498`; the room's own list only): the **first**
     ///   triangle whose xz projection holds the point, with `ground.y <` the triangle's top and a plane height above the room origin
-    ///   `> 0`, decides; it counts when `level - depth < y` with `depth = (kind >> 5) / 10` m (`kind >> 5 == 0`: 100 000 m, the
+    ///   `> 0`, decides; it counts when `level - depth <= y` with `depth = (kind >> 5) / 10` m (`kind >> 5 == 0`: 100 000 m, the
     ///   `n3WaterData_t` kind keeps the liquid type in bits 0..4, `FUN_1000b0d1`);
     /// * outdoors: collision infos are appended in authored triangle order by DS `0x1003a0d6`;
     ///   GC `0x100b7f61` registers that list in each intersected zone. N3 `0x1001ab68` returns
@@ -547,7 +547,7 @@ impl Collision {
                         continue;
                     }
                     let depth = if kind >> 5 == 0 { 100_000.0 } else { (kind >> 5) as f32 / 10.0 };
-                    return (level - depth < y).then_some(Liquid { level, kind: *kind & 0x1f, normal: t.n });
+                    return (level - depth <= y).then_some(Liquid { level, kind: *kind & 0x1f, normal: t.n });
                 }
             }
             return None;
@@ -558,7 +558,7 @@ impl Collision {
                 let level = t.y_at(ground[0], ground[2]);
                 if level > 0.0 {
                     let depth = if kind >> 5 == 0 { 100_000.0 } else { (kind >> 5) as f32 / 10.0 };
-                    return (level - depth < y).then_some(Liquid { level, kind: *kind & 0x1f, normal: t.n });
+                    return (level - depth <= y).then_some(Liquid { level, kind: *kind & 0x1f, normal: t.n });
                 }
             }
         }
@@ -884,6 +884,7 @@ mod tests {
         add_outdoor_liquid(triangle(4.0), 4, &mut c.liquids).unwrap();
         assert_eq!(c.liquid_at([1.0, 1.5, -1.0]).unwrap().level, 2.0, "first collision, not highest");
         assert_eq!(c.liquid_at([1.0, 1.5, -1.0]).unwrap().kind, 2, "depth bits are not liquid flags");
+        assert_eq!(c.liquid_at([1.0, 1.0, -1.0]).unwrap().level, 2.0, "native authored lower depth boundary is inclusive");
         assert!(c.liquid_at([1.0, 0.5, -1.0]).is_none(), "failed first depth does not select the next liquid");
         assert!(c.liquid_at([0.0, 1.5, -1.0]).is_none(), "native boundary is strict");
         let mut split = Vec::new();
@@ -961,8 +962,8 @@ mod tests {
         let c = Collision::build(Vec::new(), None, None, water);
         assert_eq!(c.liquid_surface_at([5.0, 0.75, -8.0]).unwrap().level, 1.0);
         assert!(c.liquid_surface_at([5.0, 2.0, -8.0]).is_none(), "above the liquid bounds");
-        assert!(c.liquid_surface_at([5.0, 0.5, -8.0]).is_none(), "strict authored lower depth bound; do not try the later deep candidate");
-        assert!(c.liquid_surface_at([5.0, 0.25, -8.0]).is_none(), "below the authored liquid volume");
+        assert_eq!(c.liquid_surface_at([5.0, 0.5, -8.0]).unwrap().level, 1.0, "authored lower depth bound includes equality");
+        assert!(c.liquid_surface_at([5.0, 0.25, -8.0]).is_none(), "below the first authored liquid volume; do not try the later deep candidate");
     }
 
 
