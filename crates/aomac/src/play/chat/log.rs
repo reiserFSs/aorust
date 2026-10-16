@@ -1328,6 +1328,7 @@ mod tests {
             text: &|_, _| Some("feedback".into()),
             is_npc: &|i| i.instance == 2, in_pet_list: &|i| i.instance == 2,
             npc_state: &|_| false, nano_name: &|_| None,
+            perk_name: &|_| None,
             stat: &|_, _| None, weapon: &|_, _, _| Some(91), filter: &filter,
         };
         assert!(!own_pet(&ctx, id(2)), "listed but unflagged is not a flagged pet");
@@ -1510,7 +1511,7 @@ mod tests {
             let l = texts(classify(&act(0x84, 0, Identity::default(), Identity { kind: 0, instance: 3725 }), ctx));
             assert_eq!(l[0].2, "Unable to perform action, able in 01:02:05");
             let l = texts(classify(&act(0x84, 0, id(9), Identity { kind: 0, instance: 5 }), ctx));
-            assert_eq!(l[0].2, ldb_format(&ctx.key(1000, "UnableToPerformActionPerk"), &[s("Perk#9".into()), n(0), n(0), n(5)]));
+            assert_eq!(l[0].2, ldb_format(&ctx.key(1000, "UnableToPerformActionPerk"), &[s("Perk#9"), n(0), n(0), n(5)]));
             assert!(l[0].2.contains("Perk#9"));
             // level up
             let nl = LogEvent::NewLevel { who: id(1), f: [12, 0, 0, 0, 0, 0, 0, 0] };
@@ -1532,6 +1533,7 @@ mod tests {
             in_pet_list: &|_| false,
             npc_state: &|_| false,
             nano_name: &|_| None,
+            perk_name: &|_| None,
             stat: &|_, stat| match stat { 0x28 => Some(90), 0xa9 => Some(2), 0xb2 => Some(100), _ => None },
             weapon: &|_, _, _| None,
             filter: &filter,
