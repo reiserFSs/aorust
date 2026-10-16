@@ -11,11 +11,11 @@ const COUNT: usize = WIDTH * HEIGHT;
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex { position: [f32; 2], uv: [f32; 2] }
 
+#[derive(Default)]
 pub(super) struct HeatHaze {
     uv: Vec<Vec2>,
     velocity: Vec<Vec2>,
     vertices: Vec<Vertex>,
-    random: u32,
     active: bool,
     gpu: Option<Gpu>,
 }
@@ -29,17 +29,8 @@ struct Gpu {
 }
 struct Target { size: (u32, u32), view: wgpu::TextureView, bind: wgpu::BindGroup }
 
-impl Default for HeatHaze {
-    fn default() -> Self {
-        Self { uv: vec![], velocity: vec![], vertices: vec![], random: 1, active: false, gpu: None }
-    }
-}
 fn base(index: usize) -> Vec2 { Vec2::new((index % WIDTH) as f32 / 60.0, (index / WIDTH) as f32 / 30.0) }
-fn random(state: &mut u32) -> f32 {
-    // MSVCRT rand; global native stream also depends on unrelated effects.
-    *state = state.wrapping_mul(214013).wrapping_add(2531011);
-    (((*state >> 16) & 32767) % 1000) as f32 / 1000.0
-}
+fn random() -> f32 { (ao_scene::crt_rand() % 1000) as f32 / 1000.0 }
 fn perturb(velocity: &mut [Vec2], center: Vec2, radius: f32, strength: f32) {
     for (index, velocity) in velocity.iter_mut().enumerate() {
         let delta = base(index) + *velocity - center;
@@ -69,6 +60,11 @@ fn indices() -> Vec<u16> {
 }
 impl HeatHaze {
     pub fn reset(&mut self) {
+        // GC100b1f20 activates offscreen compositor FX3e at environment setup.
+        // ActivateFX10063cc1 invokes its init hook10058baf on each activation:
+        // three CRT draws per grid node, even though first-viewport UVs overwrite
+        // the random startup jitter. Do not defer these draws until lava appears.
+        for _ in 0..COUNT * 3 { ao_scene::crt_rand(); }
         self.uv.iter_mut().enumerate().for_each(|(index, uv)| *uv = base(index));
         self.velocity.fill(Vec2::ZERO);
         self.active = false;
@@ -95,8 +91,8 @@ impl HeatHaze {
             }
             // Native uses the camera-space sphere depth only. The perturbation
             // centre is random in screen UV space, not the projected sphere centre.
-            let center = Vec2::new(random(&mut self.random), random(&mut self.random));
-            let radius = random(&mut self.random) * 1.7;
+            let center = Vec2::new(random(), random());
+            let radius = random() * 1.7;
             perturb(&mut self.velocity, center, radius, 0.005 / depth.max(1.0));
             self.active = true;
         }
@@ -166,6 +162,21 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_activation_consumes_grid_initialization_draws_once() {
+        ao_scene::crt_srand(42);
+        let mut expected = ao_scene::CrtRand::new(42);
+        for _ in 0..5400 { expected.rand(); }
+        let mut heat = HeatHaze::default();
+        heat.reset();
+        assert_eq!(ao_scene::crt_rand(), expected.rand());
+        heat.update((64, 64), Mat4::IDENTITY, Vec3::ZERO, Vec3::NEG_Z, std::iter::empty());
+        assert_eq!(ao_scene::crt_rand(), expected.rand(), "no visible sphere must not repeat environment initialization");
+        heat.reset();
+        for _ in 0..5400 { expected.rand(); }
+        assert_eq!(ao_scene::crt_rand(), expected.rand(), "a new environment activation repeats native init, regardless of lava");
+    }
 
     #[test]
     fn native_grid_perturbation_spring_and_checkerboard_topology() {

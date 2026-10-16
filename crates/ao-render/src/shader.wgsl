@@ -138,7 +138,7 @@ fn vs_lava(v: VIn) -> VOut {
 @fragment
 fn fs_lava(i: VOut) -> @location(0) vec4<f32> {
     let t = sample_clamped(tex, i.uv);
-    return vec4<f32>(mix(srgb_enc(t.rgb) * i.tint, g.fog_g.rgb, i.fog), i.color.a);
+    return vec4<f32>(mix(t.rgb * i.tint, g.fog_g.rgb, i.fog), i.color.a);
 }
 
 // DS1003db41: crust stage0 selects texture RGB/alpha; stage1 keeps
@@ -149,7 +149,7 @@ fn fs_lava_crust(i: VOut) -> @location(0) vec4<f32> {
     let p = vec2<f32>(i.wpos.x, -i.wpos.z);
     let a = sample_clamped(tex, p / 75.0 + vec2<f32>(fract(g.fog.z / 750.0), 0.0));
     let b = sample_clamped(tex, p / 250.0 + vec2<f32>(0.0, fract(g.fog.z / 5000.0)));
-    return vec4<f32>(mix(srgb_enc(a.rgb), g.fog_g.rgb, i.fog), a.a * b.a);
+    return vec4<f32>(mix(a.rgb, g.fog_g.rgb, i.fog), a.a * b.a);
 }
 
 // Actor overrides share the submesh's linear storage domain. Independent enable lanes preserve `None`, including power 0.
