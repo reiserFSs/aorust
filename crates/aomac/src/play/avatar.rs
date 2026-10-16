@@ -307,6 +307,8 @@ impl Default for Fader {
 }
 
 impl Fader {
+    pub fn opacity(&self) -> f32 { self.0 }
+
     /// One `RunFunction`: returns the opacity to draw with.
     pub fn step(&mut self, fade: &Fade, dist_sq: f32) -> f32 {
         let f = fade.factor(dist_sq);

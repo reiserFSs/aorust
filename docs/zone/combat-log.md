@@ -112,12 +112,12 @@ action activation in the GUI). Port: an empty `pending_specials` deque accepts t
 ## 3. `FUN_10012bd5` — the feedback formatter [GC 0x10012bd5] (`log::render`)
 Called as `FUN_10012a1e(type, A, value, B, extra, stat, hit, ident)` (`FUN_10012a1e` is only the singleton getter; the eight stack arguments are consumed by `FUN_10012bd5`, `ret 0x20`).
 Frame offsets: `+8` type, `+0xc` **A** (subject; owner of the number), `+0x10` value, `+0x14` **B** (second char), `+0x18` extra string, `+0x1c` stat (0 → `0x1b`), `+0x20` hit flags, `+0x24` identity (resolved to a dynel,
-name only). `value == 0` → nothing at all. Result: `style` (`+0x10` after the switch, `0x42000001..0x42000018`; passed as the first argument of the chat signal — [UNRESOLVED] meaning), `category` (`[ebp-0x10]`,
+name only). `value == 0` → nothing at all. Result: `style` (`+0x10` after the switch, `0x42000001..0x42000018`, chat message class; docs/chat/log.md §1.1), `category` (`[ebp-0x10]`,
 a `ColorCode_e`, initial value 0), the `LDBformat` text, and the number.
 
 Tail [GC 0x10014bb6..]: `hit == 4` and text non-empty → text += `" "` (`0x10154e50`) + `Feedback_CriticalHit`; `hit == 2` → `Feedback_GlancingHit`. Non-empty text →
 `FUN_10012b05(style, text, category)` [GC 0x10012b05] (signal `GlobalSignals+0x17c`, the chat window). Value ≠ 0 → `sprintf("%d", value)` and the **floating number** (§6): `A+0x140` (client char) → `FUN_100044c2` (HUD) unless
-`DAT_102e0640` (written by `FUN_100110ab` [GC 0x100110ab] = `arg != 0`, called from the singleton ctor `FUN_1001134a`; value not traced, assumed 0), else `FUN_10011108(A, text, category)` (world effect).
+`DAT_102e0640` is true, else `FUN_10011108(A, text, category)` (world effect). GC `1001134a` registers the immediate `3rdPersonCamera` callback `100110ab`, which stores `value != 0`; therefore only first-person own numbers use the HUD. Default third-person own numbers use Font 12122 on the own avatar.
 
 Texts: `FUN_1003807c(key)` [GC 0x1003807c] = `LDBface::GetText(0x6e = 110, key)`; the keys are string-hashed (`LDBface::ElfHash`, `TextDb::by_key`). Feeds (`LDBformat::Feed`; `n` = `Name(x)` = `(*(x+0xe8))->vt+0x34`, `dmg` = `FUN_10036adf(stat)`
 [GC 0x10036adf], §7; `v` = value as `unsigned`). Per type (`log::render`), "style / category" in hex:
@@ -224,18 +224,19 @@ contains NewLevel (`7f405a16`) or ShadowLevel (`3c1e2803`), per capture search.
 ## 6. Floating numbers
 Created by the formatter tail for every message with a non-zero value; the number is `sprintf("%d", value)` (signed, no sign character added, e.g. XP loss `-5`), the colour is the line's category.
 
-**HUD path (client char)** — `FUN_100044c2(value, category)` [GC 0x100044c2] = `AFCM::Send(0x19, 0x3b, value, category)` → `RenderTextModule_t::DamageTextMessage` [GUI 0x1004ae2f] → `RenderText_t` ctor `FUN_1004ac94` [GUI 0x1004ac94]:
-text `"%d"`, **font `FontID_e 2`**, position centred on `(50 + r, DAT_102761c0 − 20)` (`r = round(rand()/32767 · 40 − 20)` from the second of two `rand()` calls; `DAT_102761c0` [UNRESOLVED]), colour = `ATextString_t::InsertColor` escape `0x10 <category>` →
-`FontSystem_t::GetColor(category)` [GUI 0x1012e2d1] (`GUI_COLORS`, built by `SetColorsIntoMap` [GUI 0x1012e316]), **life 2.3 s** (`DAT_101b1198`), flags = 1 (move only). Per frame `FUN_1004aa4f` [GUI 0x1004aa4f]: `remaining −= dt`, `y = y0 − 70 · (life − remaining)/life` (`70.0` = `DAT_101b1190`;
-**30.4 px/s upwards**), removed when `remaining ≤ 0`; the alpha branch (`255 · remaining/life`, bit 1) exists but is not enabled by `DamageTextMessage` → no fade.
+**HUD path (first-person client char)** — `FUN_100044c2(value, category)` [GC 0x100044c2] = `AFCM::Send(0x19, 0x3b, value, category)` → `RenderTextModule_t::DamageTextMessage` [GUI 0x1004ae2f] → `RenderText_t` ctor `FUN_1004ac94` [GUI 0x1004ac94]:
+text `"%d"`, **Shell font `FontID_e 2`**, position centred on `(50 + r, −20)`. Native consumes two shared CRT `rand()` draws and keeps the second: `r = trunc((double)r / 32767.0 * 40.0 − 20.0)` (`_ftol2` GUI `10173ad0`). GUI `DAT102761c0` is zero-filled beyond the raw `.data` bytes with only the read at `1004ae53` and no writer; do not move this first-person number into the viewport.
+The constructor subtracts integer `width/2` and `fontHeight/2` to get top-left. Colour is the category escape → `FontSystem_t::GetColor(category)` [GUI 0x1012e2d1]. **Life 2.3 s** (`101b1198`), flags1 (move only). Each frame `1004aa4f` subtracts dt from remaining, then truncates `top0 − (life − remaining) * 70 / life` (`101b1190`).
+Keep while `remaining ≥ 0`; no fade (the alpha branch requires flag bit1, absent here).
 
-**World path (everything else)** — `FUN_10011108(A, text, category)` [GC 0x10011108]: `_EffectHandler_t::CreateEffect2(0x2f5a, dynel A, 0)`, `SetColor(table[category] | 0xff000000)` (`WORLD_COLORS` = `DAT_10156b08`, entries ≥ 0x1e are 0 =
+**World path (other characters and own third-person)** — `FUN_10011108(A, text, category)` [GC 0x10011108]: `_EffectHandler_t::CreateEffect2(0x2f5a, dynel A, 0)`, `SetColor(table[category] | 0xff000000)` (`WORLD_COLORS` = `DAT_10156b08`, entries ≥ 0x1e are 0 =
 black, category > 0x52 → `0xffff0000`), `SetText(text)`. Effect `0x2f5a` = record in `Setupf/gfxtweak.bin` (`i32 id, i32 type, i32 n, n × i32`; 2687 records; this one: type **0x7de** = `_GfxControlFont_t`,
 ctor `FUN_100df42d` [GC 0x100df42d], params `FUN_100decc3` [GC 0x100decc3], 32 params at file offset 22128): **duration 1.3 s** (param 0x1a), glyph size `0.01` (param 0x1c), **rise `0.4 · elapsed`** (param 0x1d; `FUN_100deb04` [GC 0x100deb04] sets the billboard offset `(0, 0.4 · t, 0)`
-every `Process`), bitmap-font **material 40** (param 9, `_EffectHandler_t::MMGetMaterial`; glyph advances `DAT_102c460a`, 3 bytes per char; `GfxVisualDiaBill`, render priority 7), constant colour (`SetColor` → start = stop colour).
-Anchored with `InitDynelTemplate` on the dynel (locator template params 0..7: `7, 0,0,0,0,0,0, 1000` …); the exact height above the head is **[UNRESOLVED]** (locator offset not decoded).
-The attachment is **the formatter's subject dynel A**, not the attacker,
-selected target, own avatar or a separate text dynel. `10058e36` resolves the
+every `Process`), bitmap-font **material40 = `spritefont.png`** (param9; GC material table `10106f39`; glyph advances `DAT102c460a`, 3 bytes per char; `GfxVisualDiaBill`, render priority7), constant colour.
+Locator param7=1000 attaches to `Bip01 Pelvis_ac` (head fallback). SetText GC `100dee29` puts glyph local y at **1.5** (`1015d76c`); DS `1001105e` +1b0 maps that through inverse(view·world), so it is **camera up**, in addition to world-Y rise.
+Font process GC `100deb04` disables rendering when locator+108=0. Fresh writer trace `10105841` initializes it1; `1010603b` sets SimpleChar InPlay (`0xc2`) and clears it if CAT frame opacity< double`1016c9b8` =0.949999988079071. CAT+90 points to the frame wrapper whose RRefFrame is+3c; Randy `SetTransparency` `100453ed` writes +88, hence wrapper+c4. This gate is independent of camera `show_avatar` and unrelated effects' generic visibility.
+The attachment is **the formatter's subject dynel A**, including the own avatar when A is own; it is not forcibly the attacker,
+selected target or a separate text dynel. `10058e36` resolves the
 character before dispatch; a removed subject produces no world effect.
 `100df42d` creates the Font control and its locator, retaining that same identity.
 The actual **GfxVisualDiaBill is created by SetText `100dee29`**, after replacing
@@ -257,11 +258,9 @@ Observer view (own char 25988 "Testy" does not fight): 134 `AttackInfo` → **12
 because the target dynel had not been announced yet, or no `Attack` was sent; the client behaves the same and prints nothing), 11 misses (no text: bystanders), 3 special hits, 3 `CharSecSpecAttack`,
 127 starts / 118 stops of a fight (some starts are target switches), 15 deaths (`CharacterAction` 99). Lines with the real `text.mdb` strings, e.g. `Scout - Jaax'Sinuh hit ICC Shuttle Guard for 17 points of melee damage.` (this first hit arrives before the guard's `SpecialAttackWeapon` list, so the port prints the item default; the original drops it)
 (type `0x20`: B = the attacker named, style `0x4200000a`, category `0x1a`), two `... Critical hit!` lines (the third `unk_30 == 4` AttackInfo is one of the 12 dropped), three `Bergdoktor hit <NPC> for N points of Brawling damage.`
-Replayed as player 33402 ("Bergdoktor", who attacks in the stream) the client-char paths fire: combat music, `Attacking %s...`, `You hit %s for %u points of <type> damage.` (type from the slot item), HUD numbers.
+Replayed as player33402 ("Bergdoktor"), client paths fire combat music and own feedback; floating numbers are world Font by default, HUD only in first-person fixtures.
 
 ## 9. Unresolved
-* Height / locator of the world number above the head; material 40 texture; what `DAT_102761c0` is (HUD number anchor y) and `DAT_102e0640`.
-* Meaning of the first chat-signal argument `0x42000001..0x18` (`GlobalSignals+0x17c` receiver in GUI.dll not traced).
 * The `ctrl+0x38` mounted-weapon override and the dynel flag `0x800` (CharacterAction `0xa7`, not tracked); whether the original really drops hits whose slot object is missing live (the port prints them with the melee default);
   PvP-flag helper `FUN_100523c3`; `Features` flag `0x800000` source. (The weapon-slot objects and the damage type of a hit are resolved, §2.1.1.)
 * Consumer of the `CharSecSpecAttack` queue; `Feedback_GotPVPScore` (stats `0x2aa..0x2ac`), types of the formatter not reachable from these messages.

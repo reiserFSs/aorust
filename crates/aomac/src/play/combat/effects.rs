@@ -297,8 +297,22 @@ struct SourceRuntime {
     vehicle_speed: Option<f32>,
     vehicle_direction: i32,
     visible: bool,
+    font_locator_rendering: bool,
     head_height: Option<f32>,
     liquid: Option<(f32,u32,Vec3)>,
+}
+
+// GC1010603b: CAT frame+c4 compared against double DAT1016c9b8.
+fn font_locator_rendering(in_play:bool,alpha:f32)->bool {
+    in_play && f64::from(alpha)>=0.949999988079071
+}
+
+#[test]
+fn font_locator_uses_in_play_and_cat_opacity_not_camera_visibility() {
+    assert!(!font_locator_rendering(false,1.0));
+    assert!(!font_locator_rendering(true,0.949));
+    assert!(font_locator_rendering(true,0.95));
+    assert!(font_locator_rendering(true,1.0));
 }
 
 /// CPU effect simulation, using the existing dynamic actor upload/render pass.
@@ -447,7 +461,12 @@ impl Renderer {
         let old=self.source_runtime.get(&identity);
         let head_height=old.and_then(|runtime|runtime.head_height);
         let liquid=old.and_then(|runtime|runtime.liquid);
-        self.source_runtime.insert(identity,SourceRuntime {body_scale,breed,vehicle_speed,vehicle_direction,visible,head_height,liquid});
+        let font_locator_rendering=old.is_none_or(|runtime|runtime.font_locator_rendering);
+        self.source_runtime.insert(identity,SourceRuntime {body_scale,breed,vehicle_speed,vehicle_direction,visible,font_locator_rendering,head_height,liquid});
+    }
+    /// GC1010603b locator+108: InPlay, suppressed below CAT frame opacity .95.
+    pub fn set_source_font_locator(&mut self,identity:(u32,u32),in_play:bool,alpha:f32) {
+        if let Some(runtime)=self.source_runtime.get_mut(&identity) {runtime.font_locator_rendering=font_locator_rendering(in_play,alpha);}
     }
     pub fn set_source_native_head_height(&mut self,identity:(u32,u32),value:Option<f32>) {
         if let Some(runtime)=self.source_runtime.get_mut(&identity) {runtime.head_height=value;}
@@ -1073,6 +1092,7 @@ impl Renderer {
                 if let Some(runtime)=self.source_runtime.get(&identity) {
                     if let Some(root)=self.anchors.get(&(identity,0)).copied().flatten() {buff.set_vehicle_direction(root.transform_vector3(Vec3::NEG_Z).normalize_or_zero());}
                     buff.set_visible(runtime.visible);
+                    buff.set_font_locator_rendering(runtime.font_locator_rendering);
                     if let Some(speed)=runtime.vehicle_speed {buff.set_motion(speed,runtime.vehicle_direction);}
                     if let Some((depth,flags,direction))=runtime.liquid {buff.update_liquid(depth,flags,direction);} else {buff.clear_liquid();}
                 } else {buff.source_removed();}

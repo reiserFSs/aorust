@@ -1620,7 +1620,8 @@ impl Frontend for Play {
             self.zone.world.set_collision(self.player.as_ref().and_then(|player| player.effect_surface()));
             self.zone.world.refresh_effect_source_runtime();
             let breed = self.zone.stat(4);
-            if let Some(player) = self.player.as_ref() { player.prepare_effect_source(&mut self.zone.world, host, breed); }
+            let in_play=self.zone.stat(super::zone::IN_PLAY_STAT).is_some_and(|value|value!=0);
+            if let Some(player) = self.player.as_ref() { player.prepare_effect_source(&mut self.zone.world, host, breed, in_play); }
             self.use_action_frame(dt);
             self.fight_frame(dt);
             {

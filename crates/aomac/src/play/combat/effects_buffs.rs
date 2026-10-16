@@ -187,6 +187,7 @@ impl Buff {
     }
     pub(super) fn set_environment_position(&mut self,position:Vec3) {if let Native::Native301722(n)=&mut self.native {n.set_environment_position(position);}}
     pub(super) fn set_visible(&mut self,visible:bool) {match &mut self.native {Native::Spiral(n)=>n.set_visible(visible),Native::Native301722(n)=>n.set_source_visible(visible),_=>{}}}
+    pub(super) fn set_font_locator_rendering(&mut self,rendering:bool) {if let Native::Font(n)=&mut self.native {n.set_locator_rendering(rendering);}}
     pub(super) fn source_removed(&mut self) {self.source_valid=false;match &mut self.native {Native::Spiral(n)=>n.source_removed(),Native::Spiral2(n)=>n.source_removed(),Native::AParticle(n)=>n.source_removed(),Native::Toggle(n)=>n.source_removed(),Native::GroundRing(n)=>n.invalidate_source(),Native::Bubble(n)=>n.invalidate_source(),Native::LavaBall(n)=>n.source_lost(),_=>{}}}
     pub(super) fn refresh_source(&mut self,source:Option<Mat4>)->Result<()> {self.source_valid=source.is_some();if let Native::Vein(n)=&mut self.native {n.refresh_source(source)?;}Ok(())}
     pub(super) fn set_environment(&mut self,center:Vec3,wind:Vec3) {if let Native::AParticle(n)=&mut self.native {n.set_environment(center,wind);}}

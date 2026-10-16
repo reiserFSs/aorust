@@ -3111,6 +3111,9 @@ impl Dynels {
             renderer.set_source_runtime(identity, body_scale, breed, vehicle_speed, vehicle_direction, visible);
         }
     }
+    pub fn set_effect_source_font_locator(&mut self, identity:(u32,u32), in_play:bool, alpha:f32) {
+        if let Some(renderer)=&mut self.effects {renderer.set_source_font_locator(identity,in_play,alpha);}
+    }
     pub fn set_effect_source_head_height(&mut self, identity: (u32, u32), height: Option<f32>) {
         if let Some(renderer) = &mut self.effects { renderer.set_source_native_head_height(identity, height); }
     }
@@ -3134,6 +3137,7 @@ impl Dynels {
             if id == self.own { continue; }
             let breed = match &c.look { Look::Char(look) => i32::from(look.breed), _ => 0 };
             renderer.set_source_runtime((CHAR_KIND as u32, id as u32), c.scale, breed, Some(c.mover.vehicle_speed()), c.mover.vehicle_direction(), c.in_play);
+            renderer.set_source_font_locator((CHAR_KIND as u32,id as u32),c.in_play,1.0);
             if let Some(Model::Ready { built, .. }) = self.models.get(&c.key) {
                 if let Some(rig) = &built.rig {
                     let factor = (rig.cat().torso_sphere.radius as f64 / 0.250_750_005_245_208_74 * c.scale as f64) as f32;

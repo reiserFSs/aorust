@@ -742,12 +742,13 @@ impl Player {
     }
 
     /// Native CAT-bound effects use the same posed geometry as the actual avatar submission.
-    pub fn prepare_effect_source(&self, world: &mut super::dynels::Dynels, host: &Host, breed: Option<i32>) {
+    pub fn prepare_effect_source(&self, world: &mut super::dynels::Dynels, host: &Host, breed: Option<i32>, in_play:bool) {
         let identity = (super::dynels::CHAR_KIND as u32, self.char_id);
         world.set_effect_source_torso_factor(identity, self.avatar.effect_torso_factor());
         if let Some(breed) = breed {
             world.set_effect_source_runtime(identity, self.avatar.body_scale(), breed, Some(self.movement.speed()), self.movement.vehicle_direction(), self.camera.show_avatar());
         }
+        world.set_effect_source_font_locator(identity,in_play,self.fader.opacity());
         world.set_effect_source_head_height(identity, self.avatar.head_local().map(|head| head.y));
         world.set_effect_source_liquid(identity, self.movement.effect_liquid().map(|(depth, flags, direction)| (depth, flags, direction.into())));
         if !world.needs_effect_source_mesh(identity) { return; }
@@ -1070,7 +1071,7 @@ mod tests {
         for _ in 0..4 {
             host.actors.clear();
             player.frame(0.0, &mut host, &mut zone, false);
-            player.prepare_effect_source(&mut zone.world, &host, None);
+            player.prepare_effect_source(&mut zone.world, &host, None, true);
             let eye = host.camera.pos.to_array();
             zone.world.update_with_collision(0.025, eye, [0.0, 0.0, -1.0], &mut host, None,
                 |id| player.effect_anchor(id).map(|m| glam::Mat4::from_cols_array_2d(&m)));

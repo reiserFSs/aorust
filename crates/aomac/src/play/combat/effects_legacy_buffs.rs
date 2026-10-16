@@ -21,14 +21,16 @@ const GLYPHS: [[u8;3];95] = [
 [100,48,7],[107,48,7],[114,48,7],[121,48,4],[0,0,0],[0,0,0],[0,0,0],
 ];
 fn glyph(byte:u8)->[u8;3] {if (32..127).contains(&byte) {GLYPHS[(byte-32) as usize]}else{[0;3]}}
+// GC100dee29 SetText local y, DAT1015d76c; DS1001105e +1b0 maps to camera up.
+const FONT_CAMERA_UP:f32=1.5;
 struct Letter {x:f32,width:f32,uv:[[f32;2];4]}
-pub(super) struct Font {template:Template,source:Mat4,duration:f32,scale:f32,color:[f32;4],letters:Vec<Letter>,stopped:bool}
+pub(super) struct Font {template:Template,source:Mat4,duration:f32,scale:f32,color:[f32;4],letters:Vec<Letter>,stopped:bool,locator_rendering:bool}
 impl Font {
     pub(super) fn new(t:&Template,source:Mat4,c:EffectConfig)->Result<Self> {
         ensure!(t.kind==2014,"not a native Font template");t.word(31)?;
         for i in (1..=6).chain(11..=29) {t.float(i)?;}
         let source=sprites::connector(t,source)?;
-        let mut effect=Self {template:t.clone(),source,duration:c.duration.unwrap_or(t.float(26)?),scale:c.scale.unwrap_or(t.float(28)?),color:super::buff200x::authored_color(t,0.0),letters:Vec::new(),stopped:false};
+        let mut effect=Self {template:t.clone(),source,duration:c.duration.unwrap_or(t.float(26)?),scale:c.scale.unwrap_or(t.float(28)?),color:super::buff200x::authored_color(t,0.0),letters:Vec::new(),stopped:false,locator_rendering:true};
         if let Some(color)=c.start_color {effect.set_color(color);}
         Ok(effect)
     }
@@ -48,13 +50,14 @@ impl Font {
     }
     pub(super) fn update_source(&mut self,source:Mat4)->Result<()> {self.source=sprites::connector(&self.template,source)?;Ok(())}
     pub(super) fn set_color(&mut self,color:[f32;4]) {self.color=color;}
+    pub(super) fn set_locator_rendering(&mut self,rendering:bool) {self.locator_rendering=rendering;}
     pub(super) fn terminate_gracefully(&mut self) {self.stopped=true;}
     pub(super) fn models(&self)->Vec<(Option<usize>,Vec<u32>,usize)> {vec![(Some(self.template.word(9).unwrap_or(0) as usize),(0..self.letters.len() as u32).flat_map(|i|[i*4,i*4+2,i*4+3,i*4,i*4+3,i*4+1]).collect(),self.letters.len()*4)]}
     pub(super) fn blends(&self)->Vec<Blend> {vec![Blend::AlphaBlend]}
     pub(super) fn vertices(&mut self,time:f32,right:Vec3,up:Vec3)->Result<Option<Vec<Vec<Vertex>>>> {
         if self.stopped || (self.duration>=0.0 && time>self.duration) {return Ok(None);}
-        let centre=self.source.w_axis.truncate()+Vec3::Y*(self.template.float(29)?*time)+up*1.5;
-        let color=super::buff200x::render_color(self.color);let mut vertices=Vec::with_capacity(self.letters.len()*4);
+        let centre=self.source.w_axis.truncate()+Vec3::Y*(self.template.float(29)?*time)+up*FONT_CAMERA_UP;
+        let mut color=super::buff200x::render_color(self.color);if !self.locator_rendering {color[3]=0.0;}let mut vertices=Vec::with_capacity(self.letters.len()*4);
         for letter in &self.letters {let pos=centre+right*letter.x;let x=right*(letter.width*0.5);let y=up*(self.scale*6.0);
             quad(&mut vertices,[pos-x-y,pos+x-y,pos-x+y,pos+x+y],letter.uv,color);}
         Ok(Some(vec![vertices]))
@@ -173,6 +176,13 @@ mod tests {
         assert!(f.letters.is_empty());f.set_text(b"1 2\0ignored")?;assert_eq!(f.letters.len(),2);
         assert_eq!(glyph(b'1'),[88,0,3]);assert_eq!(glyph(b'2'),[91,0,9]);
         assert!((f.letters[1].x-f.letters[0].x-0.12).abs()<1e-6);
+        let vertices=f.vertices(0.0,Vec3::X,Vec3::Z)?.unwrap().remove(0);
+        let centre=vertices[..4].iter().map(|v|Vec3::from(v.pos)).sum::<Vec3>()/4.0;
+        assert!((centre.z-FONT_CAMERA_UP).abs()<1e-6);
+        f.set_locator_rendering(false);
+        assert!(f.vertices(0.0,Vec3::X,Vec3::Z)?.unwrap()[0].iter().all(|v|v.color[3]==0.0));
+        f.set_locator_rendering(true);
+        assert!(f.vertices(0.0,Vec3::X,Vec3::Z)?.unwrap()[0].iter().any(|v|v.color[3]>0.0));
         assert!(f.vertices(1.0,Vec3::X,Vec3::Y)?.is_some());f.terminate_gracefully();assert!(f.vertices(1.0,Vec3::X,Vec3::Y)?.is_none());Ok(())
     }
     #[test] fn authored_notum_empty_payload_and_position_clock()->Result<()> {
