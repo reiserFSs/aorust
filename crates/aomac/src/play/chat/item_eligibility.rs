@@ -312,7 +312,14 @@ mod tests {
         assert!(!moved.dual_wield(&other, &zone).unwrap(), "zero requirement is not a free pass");
         other.check.item.stats[3].1 = 400;
         zone.stats.remove(&134);
-        assert!(moved.dual_wield(&other, &zone).is_err(), "missing raw skill is not an invented pass");
+        assert_eq!(zone.stat(134), Some(5), "SimpleChar constructor supplies raw MultiRanged");
+        assert!(!moved.dual_wield(&other, &zone).unwrap(), "native raw default does not meet a 200 requirement");
+        assert!(weapon(5, 0).dual_wield(&other, &zone).unwrap(), "native raw threshold is inclusive");
+        assert!(!weapon(6, 0).dual_wield(&other, &zone).unwrap());
+        zone.skill_values.insert(134, 400);
+        assert!(!moved.dual_wield(&other, &zone).unwrap(), "modified skill does not replace raw skill");
+        zone.stats.insert(134, 0);
+        assert!(!weapon(5, 0).dual_wield(&other, &zone).unwrap(), "received zero overrides the native preset");
     }
     #[test]
     fn social_armor_still_requires_native_wear_capability() {

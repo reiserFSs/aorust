@@ -58,6 +58,36 @@ two vtables: ribosome `0x10161464`, IIR `0x10161480`.
 | ribosome 3 | [GC 0x10077a84] | `operator new(0x2d4)` + `FUN_1005cb6a` = **`SimpleChar_t` constructor** (`SimpleChar_t::vftable`, derives `n3VisualDynel_t` [N3 0x10019365] → `n3Dynel_t` [N3 0x1000566e]) |
 | ribosome 5 | [GC 0x10077af2] | initial stats/appearance of the new `SimpleChar_t` (see "Fields → stats") |
 
+#### Actual character constructor stat presets
+
+`ao_formats::stats::native_character_initial_stat(stat, kind, instance)` is the single
+canonical final constructor table: **348 literal slots**, plus runtime identity stats
+1001/1002. Unlisted slots, including indices outside the native 1200-slot holder,
+return `INVALID = 1234567890`; this table applies only to actual `SimpleChar_t`,
+not item/chest/vendor proxy holders.
+
+The raw-holder-only conclusion (“an omitted character stat is always INVALID”) is
+retracted: it stops before the actual constructor's preset-copy and overlays.
+GC DLL initializer `10152406 →10009d2f` fills the static 1200 slots with INVALID;
+`OpenClient10015ae0 →100628e6` writes 318 static preset slots at `102e32c4`.
+Actual `SimpleChar1005cb6a` creates modifier holder `10064194`; assembly
+`100642e2` pushes `102e32c4`, actor stat virtual+0x1c `10002208` reaches raw-holder
+copy `1002e358`, which copies non-INVALID entries. `NpcHolder10051c3d` overlays
+341/344/340/287/512/519/533/458=0 and671=-1. `1005cb6a` subsequently sets
+34/191/235/410/274/690/446/251/466/262/889/347=0,333=1300 and runtime1001/1002.
+`1005c0f3 →100676a7` adds418=0; assembly `1005c282..1005c2b3` sets flag bits
+0x80000/0x200 and clears0x20000000, producing raw stat0=0x80201. Remaining
+vehicle overlays are659=0,661=100,662=0,267=0,664..667=0,668=2,670=10.
+Thus omitted214/381/382 are0 and318 is100, not INVALID.
+
+`Zone::stat/stat_of` leave received maps sparse: own raw stats precede the own
+received character map, then constructor defaults; remote defaults require an
+existing actual character dynel. Explicit server writes (including signed
+SkillIIR/SCFU values) remain authoritative. Only an unlisted fallback INVALID
+becomes `None`; a received INVALID is not erased. Effective `skill_value` projects
+the same defaults through modifiers/trickle without seeding received maps.
+
+
 ### 1.1 Wire layout (body after the 13-byte N3 header; offsets are payload offsets in the player's own message, see 1.4)
 
 Conditions use the first flags word `F` (`i32` after the version byte) and the second word `F2`; both are listed in §1.2.

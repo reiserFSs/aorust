@@ -1206,8 +1206,17 @@ mod tests {
         let win = i.shop.shop.as_ref().unwrap().win;
         assert!(i.shop_add(&mut gui, 1, &z));
         assert!(sent(&mut i).is_empty(), "Cash does not fund a different ShopType");
-        assert_eq!(std::mem::take(&mut i.shop.shortages), [(2220, 0x3c)]);
+        assert_eq!(z.stat_of(OWN as i32, 0x3c), Some(-1), "native Profession preset is the selected ShopType balance");
+        assert_eq!(std::mem::take(&mut i.shop.shortages), [(2221, 0x3c)]);
         assert!(gui.is_enabled(win, "AcceptButton"));
+        z.character_stats.entry(OWN as i32).or_default().insert(0x3c, 0);
+        assert!(i.shop_add(&mut gui, 1, &z));
+        assert!(sent(&mut i).is_empty());
+        assert_eq!(std::mem::take(&mut i.shop.shortages), [(2220, 0x3c)], "received zero overrides the native negative preset");
+        z.character_stats.entry(OWN as i32).or_default().insert(0x3c, 2219);
+        assert!(i.shop_add(&mut gui, 1, &z));
+        assert!(sent(&mut i).is_empty());
+        assert_eq!(std::mem::take(&mut i.shop.shortages), [(1, 0x3c)]);
         z.character_stats.entry(OWN as i32).or_default().insert(0x3c, 2220);
         assert!(i.shop_add(&mut gui, 1, &z));
         assert_eq!(sent(&mut i), [trade::add_item(ME, Identity { kind: SHOP_ITEM, instance: 1 })]);

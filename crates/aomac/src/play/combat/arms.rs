@@ -80,14 +80,14 @@ pub fn round_delay(raw: i32, cap: Option<i32>, initiative: i32, agg_def: i32, re
 }
 
 /// Total round time (seconds) of `item`: `round_delay(AttackDelay) + round_delay(RechargeDelay)`, both initiative-scaled
-/// against the own character's current raw stats (`stats`, `Zone::stats`). `recharge_init` follows stat 118 unless
-/// `initiative_skill` already lies in 0..=1200 (`chat::item_info_combat::fields`, `FUN_10067849`).
-pub fn item_round_seconds(item: &Item, stats: &HashMap<u32, i32>) -> f32 {
+/// against the own character's current raw stat getter (including native character presets). `recharge_init` follows
+/// stat 118 unless `initiative_skill` already lies in 0..=1200 (`chat::item_info_combat::fields`, `FUN_10067849`).
+pub fn item_round_seconds(item: &Item, stat: impl Fn(u32) -> Option<i32>) -> f32 {
     use ao_formats::stats::INVALID;
-    let agg_def = stats.get(&51).copied().unwrap_or(INVALID);
+    let agg_def = stat(51).unwrap_or(INVALID);
     let init = item.initiative_skill;
-    let attack_init = stats.get(&(init as u32)).copied().unwrap_or(INVALID);
-    let recharge_init = stats.get(&(if (0..=1200).contains(&init) { init } else { 118 } as u32)).copied().unwrap_or(INVALID);
+    let attack_init = stat(init as u32).unwrap_or(INVALID);
+    let recharge_init = stat(if (0..=1200).contains(&init) { init } else { 118 } as u32).unwrap_or(INVALID);
     (round_delay(item.delay, item.attack_cap, attack_init, agg_def, false)
         + round_delay(item.recharge, item.recharge_cap, recharge_init, agg_def, true)) * 0.01
 }
@@ -751,10 +751,25 @@ mod tests {
         stats.insert(51, 0);
         let item = a.slot_item(1, 6).unwrap();
         assert_eq!(item.initiative_skill, 100);
-        let seconds = item_round_seconds(item, &stats);
+        let seconds = item_round_seconds(item, |id| stats.get(&id).copied());
         // round_delay(500, None, 1200, 0, false) = 575 - 400 = 175 (= (500+75) - 1200*0.5/3*1 - 0); recharge uses
         // the same 1200 stat value (0..=1200) -> round_delay(500, None, 1200, 0, true) = 575 - 800/3 = 308.3333
         let expected = (round_delay(500, None, 1200, 0, false) + round_delay(500, None, 1200, 0, true)) * 0.01;
         assert!((seconds - expected).abs() < 0.0001);
+    }
+
+    #[test]
+    fn omitted_character_presets_scale_the_weapon_round() {
+        let mut a = player();
+        a.wield(1, 500, 6, None, &[(294, 500), (210, 500), (440, 100)]);
+        let mut zone = crate::play::zone::Zone { char_id: 1, ..Default::default() };
+        let item = a.slot_item(1, 6).unwrap();
+        assert!(zone.stats.is_empty());
+        let expected = (round_delay(500, None, 5, 100, false) + round_delay(500, None, 5, 100, true)) * 0.01;
+        assert!((item_round_seconds(item, |id| zone.stat(id)) - expected).abs() < 0.0001);
+        zone.stats.insert(51, 0);
+        zone.stats.insert(100, 1200);
+        let expected = (round_delay(500, None, 1200, 0, false) + round_delay(500, None, 1200, 0, true)) * 0.01;
+        assert!((item_round_seconds(item, |id| zone.stat(id)) - expected).abs() < 0.0001);
     }
 }

@@ -281,13 +281,16 @@ impl Zone {
         }
     }
 
-    /// An own raw stat (FullCharacter/StatIIR skip `INVALID`; SkillIIR applies every signed value).
+    /// Own received raw stat, falling back to actual SimpleChar constructor presets.
+    /// FullCharacter/StatIIR skip `INVALID`; SkillIIR applies every signed value.
     pub fn stat(&self, id: u32) -> Option<i32> {
         // `FUN_10051fa2`: NPCNumPets is the pet list's size, not a stale received stat.
         if id == 0x1ca {
             return Some(self.pets.len() as i32);
         }
         self.stats.get(&id).copied()
+            .or_else(|| self.character_stats.get(&(self.char_id as i32))?.get(&id).copied())
+            .or_else(|| self.character_initial_stat(self.char_id as i32, id))
     }
 
     pub fn skill_value(&self, id: u32) -> Option<i32> {
@@ -301,10 +304,20 @@ impl Zone {
 
     pub fn stat_of(&self, instance: i32, stat: u32) -> Option<i32> {
         if instance == self.char_id as i32 {
-            self.stat(stat).or_else(|| self.character_stats.get(&instance)?.get(&stat).copied())
+            self.stat(stat)
         } else {
-            self.character_stats.get(&instance)?.get(&stat).copied()
+            self.character_stats.get(&instance).and_then(|stats| stats.get(&stat).copied())
+                .or_else(|| self.character_initial_stat(instance, stat))
         }
+    }
+
+    fn character_initial_stat(&self, instance: i32, stat: u32) -> Option<i32> {
+        if !(instance != 0 && instance == self.char_id as i32) && !self.dynels.contains_key(&instance) {
+            return None;
+        }
+        let value = ao_formats::stats::native_character_initial_stat(stat, CHAR_KIND, instance);
+        // Absent slots retain Option semantics; explicit received INVALID is not hidden.
+        (value != ao_formats::stats::INVALID).then_some(value)
     }
 
     /// GC10029a88 NameToID: current-playfield players only, `_stricmp` comparison.
@@ -396,7 +409,7 @@ impl Zone {
     /// GC10064a6e adds a missing stat lock; GC100655d3 extends the first existing record.
     pub fn feed_skill_lock(&mut self, skill: i32, duration: i32, extend: bool) {
         if !extend && self.skill_locked(skill) == Some(true) { return; }
-        let pct = self.stats.get(&382).copied().unwrap_or(ao_formats::stats::INVALID);
+        let pct = self.stat(382).unwrap_or(ao_formats::stats::INVALID);
         let duration = super::hud_special::recharge_time(skill as u32, duration, pct);
         let locks = self.skill_locks.get_or_insert_with(Vec::new);
         if let Some(lock) = locks.iter_mut().find(|lock| lock.id.instance == skill) {
@@ -1034,6 +1047,39 @@ pub fn scene_yaw(server_yaw: f32) -> f32 {
 mod tests {
     use super::*;
     use ao_net::frame::Frame;
+
+    #[test]
+    fn native_presets_do_not_seed_or_override_received_stats() {
+        use ao_formats::stats::INVALID;
+        let mut zone = Zone::new(42);
+        for (id, expected) in [(318, 100), (381, 0), (382, 0), (214, 0), (668, 2), (1001, CHAR_KIND), (1002, 42)] {
+            assert_eq!(zone.stat(id), Some(expected), "omitted own stat {id}");
+            assert_eq!(zone.skill_value(id), Some(expected));
+        }
+        assert!(zone.stats.is_empty());
+        assert!(zone.character_stats.is_empty());
+        assert_eq!(zone.stat(7), None);
+        assert_eq!(zone.stat_of(99, 318), None, "unknown identity is not a SimpleChar");
+        zone.character_stats.entry(42).or_default().insert(318, 90);
+        assert_eq!(zone.stat(318), Some(90));
+        zone.stats.insert(318, 80);
+        zone.skill_values.insert(318, 70);
+        assert_eq!(zone.stat_of(42, 318), Some(80));
+        assert_eq!(zone.skill_value(318), Some(70));
+        zone.character_stats.entry(99).or_default().insert(318, INVALID);
+        assert_eq!(zone.stat_of(99, 318), Some(INVALID), "received sentinel remains authoritative");
+        assert_eq!(zone.stat_of(99, 381), None, "a received map alone does not create a character");
+        zone.dynels.insert(99, DynelState {
+            name: String::new(), pos: [0.0; 3], yaw: None, npc: true, side: 0,
+            level: 1, health: 1000, max_health: 1000,
+        });
+        assert_eq!(zone.stat_of(99, 381), Some(0));
+        assert_eq!(zone.stat_of(99, 318), Some(INVALID));
+        zone.stats.insert(381, INVALID);
+        assert_eq!(zone.stat(381), Some(INVALID));
+        zone.feed_skill_lock(148, 20, false);
+        assert_eq!(zone.skill_locks.as_ref().unwrap()[0].b, 20, "omitted SkillLockModifier is zero");
+    }
     #[test]
     fn mission_completion_queues_side_sound_only_for_own_character() {
         use ao_net::n3::{action, outgoing::n3_frame, quest::Quest};

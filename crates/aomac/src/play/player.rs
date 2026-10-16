@@ -1371,6 +1371,8 @@ mod tests {
         update.monster_scale = scale;
         let mut zone = Zone::new(7);
         zone.own_update = Some(Box::new(update));
+        // Mirror SimpleCharFullUpdate reception: the raw scale drives subsequent player frames.
+        zone.stats.insert(0x168, i32::from(scale));
         let mut player = Player::new(dir, &mut zone, 0).expect("own captured avatar");
         player.collision = None;
         player.zones = None;

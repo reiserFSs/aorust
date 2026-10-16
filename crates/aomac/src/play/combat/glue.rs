@@ -800,7 +800,9 @@ mod health_tests {
         assert_eq!(zone.dynels[&2].level, 12);
         assert_eq!(zone.stat_of(2, 0x113), Some(8));
         assert_eq!(combat.char(2).unwrap().stat(0x113), 8);
-        assert_eq!(zone.stat_of(2, 0x25), None); // TitleLevel is own-char gated.
+        // NewLevel writes TitleLevel only for own-char; the remote constructor value remains.
+        assert_eq!(zone.character_stats[&2].get(&0x25), None);
+        assert_eq!(zone.stat_of(2, 0x25), Some(1));
         apply(&mut combat, &mut zone, packet(0x7F40_5A16, 1, &[13, 101, 201, 151, 301, 2, 9, 51]));
         assert_eq!(zone.stat_of(1, 0x36), Some(13));
         assert_eq!(zone.stat_of(1, 0x113), Some(9));

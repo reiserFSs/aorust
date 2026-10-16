@@ -73,6 +73,15 @@ each own `CombatEvent::Hit`/`Miss`. Retail `FUN_10067de8` separately obtains tho
 are not yet traced into equivalent HUD progress. This investigation establishes the opening trigger, not
 the phase/restart model. The former special-attack corroboration was wrong: `FUN_1003b947` is item use (§5).
 
+Character operands use the canonical `native_character_initial_stat` source, not the received-only stat map alone:
+the final SimpleChar constructor `1005cb6a` creates holder `10064194`, whose `100642e2` copies preset
+`102e32c4` through `1002e358`. Omitted AggDef (51) is **100**, and initiative skills 100..168 are **5**;
+explicit server values (including zero and INVALID) take precedence. `item_round_seconds` takes a raw-stat getter,
+and `attack_bar_progress` resolves the own actual-character identity without inserting presets into the received map.
+`omitted_character_presets_scale_the_weapon_round` covers this omission and subsequent explicit overrides.
+Item-template timing/InitiativeSkill defaults are unchanged; the character table does not apply to weapon templates.
+
+
 ## 3. Reload (kind 5): native trigger and Solar rifle ammunition evidence
 
 ### Solar-Powered Assault Rifle does not have a finite clip

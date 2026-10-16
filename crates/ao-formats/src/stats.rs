@@ -50,6 +50,46 @@ pub const SIDE: u32 = 33;
 /// The server marks "no value" with this (`FullCharacter` stat application skips it).
 pub const INVALID: i32 = 0x499602D2;
 
+/// Final actual `SimpleChar_t` constructor state, before authoritative server writes.
+/// GC1005cb6a → modifier holder10064194 copies static preset102e32c4
+/// (100642e2 →10002208 →1002e358), then NPC/character/vehicle constructors overlay it.
+/// This is not the empty raw holder, nor an item/chest/vendor preset.
+pub fn native_character_initial_stat(stat: u32, kind: i32, instance: i32) -> i32 {
+    match stat {
+        60 | 671 => -1,
+        4..=6 | 9 | 11 | 12 | 14 | 22 | 24 | 26 | 33 | 34 | 45 | 49 | 52 | 57 | 58
+        | 61..=69 | 72 | 75 | 78..=87 | 90..=97 | 180 | 191 | 197 | 198 | 204..=208
+        | 212..=219 | 225..=249 | 251 | 256 | 257 | 262..=267 | 274 | 276..=282 | 287
+        | 303 | 311 | 315..=317 | 334 | 338..=341 | 344 | 345 | 347 | 350 | 353 | 359
+        | 368 | 372 | 379..=383 | 388..=391 | 393 | 397 | 410 | 418 | 423 | 430..=432
+        | 438 | 441..=444 | 446 | 455 | 458 | 466 | 470..=472 | 475..=483 | 488 | 512
+        | 516 | 517 | 519 | 530 | 531 | 533 | 539 | 540 | 543..=545 | 552..=572 | 582
+        | 583 | 585..=587 | 589..=591 | 598 | 617..=619 | 659 | 662 | 664..=667 | 685
+        | 686 | 690..=694 | 889 => 0,
+        2 | 10 | 37 | 47 | 54 | 59 | 89 | 199 | 223 | 324 => 1,
+        275 | 421 | 668 => 2,
+        173 | 174 | 343 | 348 | 364 => 3,
+        3 | 16..=21 | 100..=168 | 349 => 5,
+        224 => 6,
+        181 => 8,
+        221 | 670 => 10,
+        203 | 342 | 363 => 30,
+        673 => 31,
+        201 => 60,
+        200 => 70,
+        202 => 80,
+        51 | 318 | 319 | 360 | 425 | 464 | 535..=537 | 581 | 661 | 689 => 100,
+        527 => 999,
+        1 | 27 => 1000,
+        333 => 1300,
+        53 => 1500,
+        0 => 524801,
+        1001 => kind,
+        1002 => instance,
+        _ => INVALID,
+    }
+}
+
 /// One group of the skill window: view/group/button name prefix (`<prefix>_view`, `<prefix>_group`, button `<prefix>`),
 /// `text.mdb` category 10010 key of its label (`#10010:n` in `Skills.xml`), the stats in the original's order.
 pub struct SkillGroup {
@@ -172,6 +212,23 @@ pub fn load_ipdist(client_dir: &Path) -> Result<Vec<DistProfession>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_character_constructor_presets_and_identity() {
+        let get = |stat| native_character_initial_stat(stat, 50000, 42);
+        assert_eq!((0..1200).filter(|&stat| stat != 1001 && stat != 1002 && get(stat) != INVALID).count(), 348);
+        for (stat, value) in [
+            (0, 0x80201), (1, 1000), (27, 1000), (60, -1), (100, 5), (168, 5),
+            (214, 0), (318, 100), (333, 1300), (381, 0), (382, 0), (418, 0),
+            (659, 0), (661, 100), (668, 2), (670, 10), (671, -1), (889, 0),
+            (1001, 50000), (1002, 42), (7, INVALID), (1199, INVALID),
+            (1200, INVALID), (u32::MAX, INVALID),
+        ] {
+            assert_eq!(get(stat), value, "stat {stat}");
+        }
+        assert_eq!(native_character_initial_stat(1001, 17, -7), 17);
+        assert_eq!(native_character_initial_stat(1002, 17, -7), -7);
+    }
 
     #[test]
     fn table_has_the_names_the_zone_docs_use() {

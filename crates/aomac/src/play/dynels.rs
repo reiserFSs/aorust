@@ -1837,7 +1837,9 @@ impl Dynels {
     pub fn attack_bar_progress(&self, own: i32, stats: &HashMap<u32, i32>) -> Vec<(i32, f32, f32)> {
         self.attack_bars.iter().filter_map(|(&slot, &elapsed)| {
             let item = self.arms.slot_item(own, slot)?;
-            let total = super::combat::arms::item_round_seconds(item, stats);
+            let total = super::combat::arms::item_round_seconds(item, |id| {
+                stats.get(&id).copied().or_else(|| (own != 0).then(|| ao_formats::stats::native_character_initial_stat(id, CHAR_KIND, own)))
+            });
             Some((slot, (elapsed / total).min(1.0), total))
         }).collect()
     }
@@ -2966,6 +2968,10 @@ impl Dynels {
                 let key = look.key(self.texture_quality);
                 let yaw = u.yaw().unwrap_or(0.0);
                 let mut mover = Mover::new(u.pos, yaw);
+                // Actual SimpleChar constructor presets precede all packet writes. Generic movers/proxies stay unset.
+                for stat in [16, 17, 215] {
+                    mover.on_stat(stat, ao_formats::stats::native_character_initial_stat(stat as u32, who.kind, who.instance));
+                }
                 mover.set_npc(u.is_npc());
                 mover.set_body_scale(u.monster_scale.max(20) as f32 / 100.0);
                 mover.on_stat(0, u.flags2 as i32);

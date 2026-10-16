@@ -2952,7 +2952,7 @@ mod tests {
         assert_eq!(s.hud.shortcuts[0].slot_names()[5], "Shadow Touch");
         s.hud.shortcuts[0].use_slot(5, &s.hud.actions.list);
         assert_eq!(s.hud.shortcuts[0].take_uses(), [SlotUse::Nano(163449)]);
-        s.zone.stats.extend([(224, 2), (662, 0), (318, 100), (381, 0), (214, 10000)]);
+        s.zone.stats.insert(214, 10000);
         s.zone.nano_motion = Some(super::super::hud_nano::NanoMotion {
             pos: [0.0; 3], radius: 0.5, mode: 3, moving: false, falling: false, input_locked: false,
         });

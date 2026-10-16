@@ -36,13 +36,23 @@ pub mod stat {
     pub const STACKING_LINE: u32 = 0x227;
 }
 
-/// Effective mode0 for the non-skill nano stats318/381. A missing raw
-/// StatHolder slot is INVALID (1002e46a), not an invented zero or100.
+/// Effective mode0 for non-skill nano stats. Zone supplies the actual
+/// SimpleChar constructor presets; only unlisted slots read INVALID.
 pub(super) fn effective_nano_stat(zone: &super::zone::Zone, id: u32) -> i32 {
-    if zone.stat(id).is_some() { return zone.skill_value(id).expect("received raw stat"); }
+    if zone.stat(id).is_some() { return zone.skill_value(id).expect("character raw stat"); }
     let raw = f64::from(ao_formats::stats::INVALID);
     let base = (raw * f64::from(zone.skill_modifiers.multiplier(id))) as i64 as i32;
     base.wrapping_add(zone.skill_modifiers.bonus_of(id, base, 0))
+}
+
+/// GC10026dd7 -> 1004e3e1, shared by cast admission and InfoView.
+pub(super) fn nano_cost_multiplier(zone: &super::zone::Zone) -> i32 {
+    if zone.char_id == 0 { return 0; }
+    let value = effective_nano_stat(zone, 318);
+    // GC100583eb/10058415 mirror actual Flags bit into actor+21c.
+    if zone.stat(0).is_some_and(|flags| flags & 0x10000000 != 0) { return value; }
+    let minimum = match zone.stat(4) { Some(1 | 2) => 50, Some(3) => 45, Some(4) => 55, _ => 0 };
+    value.max(minimum)
 }
 
 #[derive(Clone, Debug)]
@@ -99,8 +109,7 @@ impl NanoInfo {
         let features = (zone.stat(224).unwrap_or(ao_formats::stats::INVALID) & !0x800) | if zone.is_grid { 0x800 } else { 0 };
         if zone.stat(662).is_some_and(|v| v != 0) || features & 0x800 != 0 || features & 2 == 0 { return Ok(false); }
         // 1004e3e1 returns the cost multiplier, NOT the percentage removed.
-        let minimum = match zone.stat(4) { Some(1 | 2) => 50, Some(3) => 45, Some(4) => 55, _ => 0 };
-        let multiplier = effective_nano_stat(zone, 318).max(minimum);
+        let multiplier = nano_cost_multiplier(zone);
         // FILD/FIMUL/FDIV -> native ftol low32 (1004f827..1004f833).
         let cost = (i64::from(self.stat(stat::NANO_POINTS).unwrap_or(1)) * i64::from(multiplier) / 100) as i32;
         // 1004f846 reads current NanoEnergy214; NanoPoints407 is the template cost.
@@ -195,13 +204,21 @@ mod tests {
             zone.stats.insert(214, cost);
             assert!(info.can_cast(&zone, Default::default()).unwrap());
         }
+        zone.stats.extend([(0, 0x10000000), (214, 10)]);
+        assert_eq!(nano_cost_multiplier(&zone), 10, "actual NPC Flags skip the breed floor");
+        assert!(info.can_cast(&zone, Default::default()).unwrap());
+        zone.stats.remove(&0);
         zone.stats.remove(&318);
-        zone.stats.insert(214, 45);
-        assert_eq!(effective_nano_stat(&zone, 318), ao_formats::stats::INVALID);
-        assert!(!info.can_cast(&zone, Default::default()).unwrap(), "missing multiplier is native INVALID, not100");
-        zone.stats.insert(318, 100);
+        zone.stats.insert(214, 100);
+        assert_eq!(effective_nano_stat(&zone, 318), 100);
+        assert_eq!(effective_nano_stat(&zone, 381), 0);
+        assert_eq!(effective_nano_stat(&zone, 1200), ao_formats::stats::INVALID);
+        assert!(!info.can_cast(&zone, Default::default()).unwrap(), "constructor multiplier100 costs101");
+        zone.stats.insert(214, 101);
+        assert!(info.can_cast(&zone, Default::default()).unwrap());
         zone.stats.remove(&214);
-        assert!(info.can_cast(&zone, Default::default()).unwrap(), "raw missing NanoEnergy reads native INVALID");
+        assert!(!info.can_cast(&zone, Default::default()).unwrap(), "constructor NanoEnergy is zero");
+        zone.stats.insert(214, 101);
         zone.is_grid = true;
         assert!(!info.can_cast(&zone, Default::default()).unwrap(), "Grid classification does not depend on a received Features bit");
         zone.is_grid = false;

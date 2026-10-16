@@ -127,8 +127,8 @@ fn runtime_admission(info: &NanoInfo, zone: &Zone, target: Identity) -> anyhow::
     if zone.target_team.target_member(target) { return Ok(true); }
     let playfield = zone.playfield.ok_or_else(|| anyhow::anyhow!("friendly nano needs the source playfield"))?;
     if (0x111c..0x1125).contains(&playfield) {
-        // Both character constructors seed BattlestationSide668 to zero.
-        return Ok(zone.stat(668).unwrap_or(0) == zone.stat_of(target.instance, 668).unwrap_or(0));
+        // Actual SimpleChar ctor1005cb6a seeds BattlestationSide668=2.
+        return Ok(zone.stat(668).unwrap_or(ao_formats::stats::INVALID) == zone.stat_of(target.instance, 668).unwrap_or(ao_formats::stats::INVALID));
     }
     if zone.target_team.in_team() && zone.stat(213).unwrap_or(ao_formats::stats::INVALID) != target_side { return Ok(false); }
     Ok(side == target_side)
@@ -626,6 +626,36 @@ mod tests {
         assert!(!nano_in_range([0.0; 3], 0.5, [0.0, 22.0, 0.0], 0.75, 20), "range is three dimensional");
     }
 
+    #[test]
+    fn captured_own_body_boost_uses_native_presets_and_actual_motion() {
+        let line = include_str!("../../../../docs/captures/zone_own_full_character_ithaca.rec");
+        let hex = line.split_whitespace().nth(2).unwrap();
+        let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+        let (frame, _) = ao_net::frame::Frame::decode_with(&bytes, false).unwrap().unwrap();
+        let mut zone = Zone::new(33588);
+        zone.on_frame(&frame);
+        assert!(!zone.stats.contains_key(&318));
+        assert!(!zone.stats.contains_key(&381));
+        assert_eq!((zone.stat(318), zone.stat(381), zone.stat(214)), (Some(100), Some(0), Some(40)));
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let store = ao_rdb::RecordStore::open(&dir).unwrap();
+        let record = store.get(super::super::hud_nanodb::NANO_RDB_TYPE, 29091).unwrap().unwrap();
+        let template = ao_formats::dynel_visual::parse_item_template(&record).unwrap();
+        let data = super::super::chat::info::template_spells::data(&record, 0).unwrap();
+        let criteria = data.criteria.into_iter().rfind(|entry| entry.1 == 3).map(|entry| entry.2).unwrap_or_default();
+        let info = NanoInfo { id: 29091, name: template.name.unwrap(), stats: template.stats, criteria, spells: data.spells, icon: None };
+        assert_eq!(info.name, "Body Boost");
+        let multiplier = super::super::hud_nanodb::nano_cost_multiplier(&zone);
+        assert_eq!(info.stat(stat::NANO_POINTS).unwrap() * multiplier / 100, 11);
+        assert_eq!(nano_range(info.stat(stat::ATTACK_RANGE).unwrap(), super::super::hud_nanodb::effective_nano_stat(&zone, 381)), 20);
+        zone.nano_motion = Some(NanoMotion {
+            pos: [0.0; 3], radius: 0.5, mode: 3, moving: false, falling: false, input_locked: false,
+        });
+        assert!(info.can_cast(&zone, Identity::default()).unwrap());
+        assert!(runtime_admission(&info, &zone, Identity::default()).unwrap());
+    }
+
     struct Shot {
         gui: Gui,
         nano: HudNano,
@@ -665,7 +695,7 @@ mod tests {
     /// own identity is required by real Shadow Touch Flags0x8c000.
     fn standing_self_caster() -> Zone {
         let mut zone = Zone::new(7);
-        zone.stats.extend([(224, 2), (662, 0), (318, 100), (381, 0), (214, 10000)]);
+        zone.stats.insert(214, 10000);
         zone.nano_motion = Some(NanoMotion {
             pos: [0.0; 3], radius: 0.5, mode: 3, moving: false, falling: false, input_locked: false,
         });
@@ -681,7 +711,7 @@ mod tests {
         let mut programs = HudNano::new(&dir, (1100, 760)).unwrap();
         let mut zone = Zone::new(7);
         let own = Identity { kind: outgoing::DYNEL_CHAR, instance: 7 };
-        zone.stats.extend([(60, 5), (129, 662), (128, 223), (127, 199), (130, 169), (131, 74), (122, 35), (251, 0), (359, 0), (214, 10000), (318, 100)]);
+        zone.stats.extend([(60, 5), (129, 662), (128, 223), (127, 199), (130, 169), (131, 74), (122, 35), (251, 0), (359, 0), (214, 10000)]);
         let other = Identity { kind: outgoing::DYNEL_CHAR, instance: 8 };
         zone.dynels.insert(8, super::super::zone::DynelState { name: "Target".into(), pos: [0.0; 3], yaw: None, npc: false, side: 0, level: 1, health: 10, max_health: 10 });
         zone.dynels.insert(7, zone.dynels[&8].clone());

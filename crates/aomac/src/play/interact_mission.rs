@@ -283,10 +283,14 @@ mod tests {
         let mut ui = MissionUi::default();
         let own = Identity { kind: 50000, instance: 1 };
         let origin = Identity { kind: 51000, instance: 2 };
-        let zone = Zone::new(1);
+        let mut zone = Zone::new(1);
         ui.open(&mut gui, (1280, 800), 1, origin).unwrap();
         let win = ui.win.unwrap();
         let press = Event::Clicked { window: win, view: "request".into(), item: None };
+        assert_eq!((zone.stat(61), zone.stat(54)), (Some(0), Some(1)));
+        assert!(ui.event(&mut gui, &press, own, &zone).unwrap().is_empty(), "native level-one character cannot request missions without cash");
+        ui.dialogs.close_all(&mut gui);
+        zone.stats.insert(61, 1);
         let request = ui.event(&mut gui, &press, own, &zone).unwrap();
         assert_eq!(request, vec![mission_selection::generate(own, &GenerateInfo { difficulty: 50, dimensions: [0; 6], origin_type: 1, origin }).unwrap()]);
         let quest = ao_net::n3::quest::Quest { id: Identity { kind: 56000, instance: 3 }, name: "mission".into(), ..Default::default() };

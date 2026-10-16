@@ -1192,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_jump_uses_native_unset_stats_and_ceiling_height() {
+    fn generic_mover_retains_unset_stats_and_ceiling_height() {
         let mut mover = Mover::new([0.0; 3], 0.0);
         mover.on_move_type(MoveType::JumpStart as u8);
         surface_step(&mut mover, 0.0, |_| 0.0);
@@ -1207,6 +1207,30 @@ mod tests {
         surface_step_ceiling(&mut mover, 0.0, |_| 0.0, |_| Some(2.1));
         assert!((mover.vy - 2.0).abs() < 1e-5, "stored NPC minimum does not raise launch impulse");
         assert!(mover.falling_enabled(), "Jump enables falling even after no-fall Flags");
+    }
+
+    #[test]
+    fn actual_character_jump_presets_and_explicit_overrides() {
+        let mut mover = Mover::new([0.0; 3], 0.0);
+        for stat in [16, 17, 215] {
+            mover.on_stat(stat, ao_formats::stats::native_character_initial_stat(stat as u32, 50000, 1));
+        }
+        mover.on_move_type(MoveType::JumpStart as u8);
+        surface_step(&mut mover, 0.0, |_| 0.0);
+        assert_eq!(mover.vy, (40.0f32 * 1.05).sqrt(), "unreceived Strength/Agility are 5 each");
+        mover.airborne = false;
+        mover.on_move_type(MoveType::JumpStop as u8);
+        mover.on_stat(16, 1000);
+        mover.on_stat(17, 1000);
+        mover.on_move_type(MoveType::JumpStart as u8);
+        surface_step(&mut mover, 0.0, |_| 0.0);
+        assert_eq!(mover.vy, (40.0f32 * 5.0).sqrt(), "unreceived GmLevel is zero: 800 cap applies");
+        mover.airborne = false;
+        mover.on_move_type(MoveType::JumpStop as u8);
+        mover.on_stat(215, 1);
+        mover.on_move_type(MoveType::JumpStart as u8);
+        surface_step(&mut mover, 0.0, |_| 0.0);
+        assert_eq!(mover.vy, (40.0f32 * 11.0).sqrt(), "explicit GM override removes the cap");
     }
 
     #[test]

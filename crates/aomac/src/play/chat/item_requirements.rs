@@ -59,7 +59,7 @@ fn overequip(data: &Data, id: Identity, zone: &Zone) -> i32 {
     if !matches!(id.kind, 101..=103) || zone.char_id == 0 { return 0; }
     let action = match id.instance { 6 | 8 => 8, 16..=31 => 6, _ => return 0 };
     criteria(data, action).iter().filter(|c| c[2] == 2).map(|c| {
-        let value = zone.stats.get(&(c[0] as u32)).copied().unwrap_or(1_234_567_890);
+        let value = zone.stat(c[0] as u32).unwrap_or(ao_formats::stats::INVALID);
         let ratio = (value as f64 / c[1] as f64) as f32;
         if ratio < 1.0 { ((10.0 - ratio as f64 * 10.0) * 0.5) as i32 } else { 0 }
     }).max().unwrap_or(0).clamp(0, 4)
@@ -96,6 +96,8 @@ fn retail_inner_keys_and_overequip() {
     assert_eq!(skills(&data, 3, false, &texts), "   (-2) ");
     assert_eq!(skills(&data, 12, true, &texts), " 25% ");
     let mut zone = Zone { char_id: 1, ..Default::default() };
+    assert_eq!(overequip(&data, Identity { kind: 101, instance: 6 }, &zone), 4, "omitted character skill starts at native 5, not INVALID");
+    assert!(!zone.stats.contains_key(&100), "preset lookup does not seed received stats");
     zone.stats.insert(100, 75);
     assert_eq!(overequip(&data, Identity { kind: 101, instance: 6 }, &zone), 1);
     assert_eq!(overequip(&data, Identity { kind: 102, instance: 16 }, &zone), 3);

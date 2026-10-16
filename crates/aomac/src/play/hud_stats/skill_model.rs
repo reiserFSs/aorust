@@ -164,7 +164,13 @@ impl Model {
         let get = |id| zone.stat(id);
         let ch = Character::from_stats(get);
         let lock = get(buffs::LOCK_STAT).unwrap_or(0);
-        for id in zone.stats.keys().chain(self.mods.bonus.keys()).chain(self.mods.percent.keys()).copied().chain([22]) {
+        // Constructor-backed skills need trickle/percent projection even when the wire omitted them.
+        // Only the effective map is populated; received raw maps remain sparse.
+        for id in (0..1200).filter(|&id| get(id).is_some())
+            .chain(zone.stats.keys().copied())
+            .chain(zone.character_stats.get(&(zone.char_id as i32)).into_iter().flat_map(|stats| stats.keys().copied()))
+            .chain(self.mods.bonus.keys().copied())
+            .chain(self.mods.percent.keys().copied()).chain([22]) {
             if values.contains_key(&id) { continue; }
             let raw = if id == 22 { self.ams } else { get(id).unwrap_or(0) };
             values.insert(id, buffs::skill_value(&self.tables, id, raw, &ch, &self.mods, lock));
@@ -348,6 +354,22 @@ mod tests {
         m.refresh_buffs(&|id| z.stat(id), &active, &[], None);
         m.publish(&mut z);
         assert_eq!((z.stat(91), z.skill_value(91)), (Some(20), Some(143)));
+    }
+
+    #[test]
+    fn published_constructor_defaults_receive_native_modifiers() {
+        let mut z = super::super::super::zone::Zone::new(42);
+        let active = [ao_net::n3::spells::spell(0xcf35, &[(0, 318), (0x27, -15)])];
+        let mut m = tiny();
+        m.refresh_buffs(&|id| z.stat(id), &active, &[], None);
+        m.publish(&mut z);
+        assert_eq!((z.stat(318), z.skill_value(318)), (Some(100), Some(85)));
+        assert_eq!((z.skill_value(381), z.skill_value(382)), (Some(0), Some(0)));
+        assert!(z.stats.is_empty(), "projection must not seed received stats");
+        z.stats.insert(318, 70);
+        m.refresh_buffs(&|id| z.stat(id), &active, &[], None);
+        m.publish(&mut z);
+        assert_eq!((z.stat(318), z.skill_value(318)), (Some(70), Some(55)));
     }
 
     #[test]

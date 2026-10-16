@@ -240,7 +240,7 @@ struct Bar {
     in_range: bool,
 }
 /// GC 0x10044c46 / 0x10059e6a: combat radius comes from CharRadius, not the CAT torso collision sphere.
-/// The cached radius starts at 1 metre (`FUN_10044702`, +0x30).
+/// The cache starts at 1 metre (`FUN_10044702`, +0x30); refresh reads the actual character's CharRadius preset (2).
 fn range_radius(zone: &Zone, id: i32) -> Option<f32> {
     zone.dynels.get(&id)?;
     let Some(radius) = zone.stat_of(id, 0x1a5).or_else(|| zone.world.character_template_stat(id, 0x1a5)) else { return Some(1.0) };
@@ -866,8 +866,11 @@ mod tests {
         let mut z = Zone::new(1);
         z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
         z.dynels.insert(2, dyn_at("Other", [0.0; 3], false, 1));
+        assert_eq!(range_radius(&z, 1), Some(2.0), "GC10044c46 reads constructor CharRadius421=2 and MonsterScale360=100");
+        z.character_stats.entry(1).or_default().insert(0x168, 150);
+        assert_eq!(range_radius(&z, 1), Some(3.0), "explicit own character stats override constructor presets");
         z.stats.insert(0x168, 200);
-        assert_eq!(range_radius(&z, 1), Some(1.0), "missing CharRadius retains the constructor's cached radius, not a scaled stat default");
+        assert_eq!(range_radius(&z, 1), Some(4.0), "GC10044c46 scales the native CharRadius preset even without a received radius");
         z.stats.insert(0x1a5, 2);
         z.stats.insert(0x168, 125);
         assert_eq!(range_radius(&z, 1), Some(2.5));
@@ -906,10 +909,11 @@ mod tests {
         let mut m = captured_character(true);
         let ao_net::n3::N3::Dynel(ao_net::n3::dynel::Dynel::SimpleCharFullUpdate(u)) = &mut m.body else { unreachable!() };
         u.flags |= ao_net::n3::dynel::flag::IN_PLAY;
-        for &id in z.dynels.keys() {
+        for (&id, d) in &z.dynels {
             m.header.target = Identity { kind: DYNEL_CHAR, instance: id };
             z.world.on_message(&m);
-            z.character_stats.entry(id).or_default().insert(super::super::zone::IN_PLAY_STAT, 1);
+            // Full-update reception publishes both raw stats; presentation side alone does not replace the native preset.
+            z.character_stats.entry(id).or_default().extend([(super::super::zone::IN_PLAY_STAT, 1), (stats::SIDE, i32::from(d.side))]);
         }
     }
 

@@ -17,31 +17,18 @@ pub(super) struct Fields {
 /// GC 1006772b/10067849: hundredths, current raw initiative and AggDef,
 /// the post-1200 initiative slope, individual item caps, then the one-second floor.
 fn delay(template: &ItemTemplate, stat: u32, initiative: i32, agg_def: i32, recharge: bool) -> f32 {
-    let initiative = if initiative <= 1200 { initiative as f32 * 0.5 }
-        else { (initiative - 1200) as f32 / 6.0 + 600.0 };
-    let mut time = (template.stat(stat).unwrap_or(INVALID) as f32 + 75.0)
-        - initiative * if recharge { 2.0 } else { 1.0 } / 3.0 - agg_def as f32;
-    if let Some(cap) = template.stat(if recharge { 524 } else { 523 }).filter(|&v| v != INVALID) {
-        time = time.max(cap as f32);
-    }
-    time.max(100.0)
+    crate::play::combat::arms::round_delay(
+        template.stat(stat).unwrap_or(INVALID),
+        template.stat(if recharge { 524 } else { 523 }).filter(|&v| v != INVALID),
+        initiative, agg_def, recharge,
+    )
 }
 
 pub(super) fn fields(template: &ItemTemplate, spells: &[Spell], zone: &Zone, _texts: &TextDb) -> Result<Fields> {
     let mut out = Fields::default();
-    // GC 10026dd7 N3Msg_GetNanoCostModifier -> 1004e3e1: own player's raw cost multiplier (stat 0x13e,
-    // holder mode 0, GC 10058e52 -> 1006554c/100654e1/1006460b), breed floor. The underlying raw
-    // StatHolder getter (GC 1002e46a) has no small-value fallback for an index past its own vector:
-    // it returns the 0x499602d2 "unset" sentinel, which retail never surfaces because the own
-    // FullCharacter dump always streams stat 0x13e before any InfoView can query it. Our zone may
-    // still be mid-stream, so an absent stat uses 0 (no raw multiplier) rather than leaking the raw
-    // sentinel into the breed-floor max(); the floor then supplies the effective value on its own.
-    let multiplier = if zone.char_id == 0 { 0 } else {
-        let value = zone.stats.get(&318).copied().unwrap_or(0);
-        // GC 100583eb/10058415: Flags bit 0x10000000 sets/clears actor+21c.
-        if zone.stats.get(&0).is_some_and(|v| v & 0x10000000 != 0) { value }
-        else { match zone.stat(4) { Some(1 | 2) => value.max(50), Some(3) => value.max(45), Some(4) => value.max(55), _ => value } }
-    };
+    // GC10026dd7 -> 1004e3e1: same effective multiplier and Flags-aware
+    // breed floor as cast admission, including native character presets.
+    let multiplier = crate::play::hud_nanodb::nano_cost_multiplier(zone);
     // GUI 10035dc5 FILD/FIMUL/FDIV 100.0 -> _ftol (truncate, not ceil).
     out.nano_cost = (template.stat(407).unwrap_or(1) as f64 * multiplier as f64 / 100.0) as i32;
     if template.kind == 0xc76b {
@@ -62,9 +49,9 @@ pub(super) fn fields(template: &ItemTemplate, spells: &[Spell], zone: &Zone, _te
                 let bonus = template.stat(284).unwrap_or(INVALID);
                 out.damage = format!("{min}-{max}({bonus})");
                 let init = template.stat(440).unwrap_or(INVALID);
-                let attack_init = zone.stats.get(&(init as u32)).copied().unwrap_or(INVALID);
-                let recharge_init = zone.stats.get(&(if (0..=1200).contains(&init) { init } else { 118 } as u32)).copied().unwrap_or(INVALID);
-                let agg_def = zone.stats.get(&51).copied().unwrap_or(INVALID);
+                let attack_init = zone.stat(init as u32).unwrap_or(INVALID);
+                let recharge_init = zone.stat(if (0..=1200).contains(&init) { init } else { 118 } as u32).unwrap_or(INVALID);
+                let agg_def = zone.stat(51).unwrap_or(INVALID);
                 let seconds = (delay(template, 294, attack_init, agg_def, false)
                     + delay(template, 210, recharge_init, agg_def, true)) * 0.01;
                 out.dps = format!("{:.1}-{:.1}({:.1})", min as f32 / seconds, max as f32 / seconds, bonus as f32 / seconds);
@@ -109,16 +96,22 @@ fn nano_damage_record_fixture() {
 
 #[cfg(test)]
 #[test]
-fn absent_own_nano_cost_modifier_uses_the_breed_floor_not_the_raw_sentinel() {
-    // Bug 19: Aomacfixr (breed 1 Solitus) InfoView of a nano with raw NanoCost 11 (template 29091
-    // "Body Boost") showed "135802467 (11)" when own stat 0x13e had not streamed yet: the old code
-    // substituted ao_formats::stats::INVALID (0x499602d2 = 1234567890) for the missing raw value and
-    // fed it straight into the multiplier, truncating 11 * 1234567890 / 100 = 135802467.
+fn absent_own_nano_cost_modifier_uses_native_character_preset() {
+    // Body Boost29091 previously exposed INVALID arithmetic135802467.
+    // SimpleChar's copied native preset supplies318=100 before any packet.
     let template = ItemTemplate { kind: 0xc76b, stats: vec![(8, 1800000), (407, 11)], name: None, sounds: vec![] };
     let texts = TextDb::parse(b"MMDB\0\0\0\0".to_vec()).unwrap();
-    let mut zone = Zone { char_id: 1, ..Default::default() };
-    zone.stats.insert(4, 1); // breed 1 Solitus, no entry for stat 318
+    let line = include_str!("../../../../../docs/captures/zone_own_full_character_ithaca.rec");
+    let hex = line.split_whitespace().nth(2).unwrap();
+    let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()).collect();
+    let (frame, _) = ao_net::frame::Frame::decode_with(&bytes, false).unwrap().unwrap();
+    let mut zone = Zone::new(33588);
+    zone.on_frame(&frame);
+    assert!(!zone.stats.contains_key(&318));
+    assert!(!zone.stats.contains_key(&381));
     let out = fields(&template, &[], &zone, &texts).unwrap();
-    assert_eq!(out.nano_cost, 5, "breed-1 floor 50%: truncate(11 * 50 / 100)");
+    assert_eq!(out.nano_cost, 11, "native constructor multiplier100, not the breed floor alone");
     assert_ne!(out.nano_cost, 135802467);
+    zone.skill_values.insert(318, 80);
+    assert_eq!(fields(&template, &[], &zone, &texts).unwrap().nano_cost, 8, "InfoView uses effective mode0, not the received raw map");
 }
