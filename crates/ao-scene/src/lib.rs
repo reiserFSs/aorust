@@ -150,9 +150,9 @@ pub struct Submesh {
     /// Texture alpha is a self-illumination mask (opaque materials only): the texel is
     /// lit by `max(lighting, min(lighting + a, 1))` (engine: `saturate(a + lighting)`).
     pub glow_mask: bool,
-    /// Baked-lighting surface (dungeon room shells, shadow-mapped ground): `Vertex::color.rgb` is an *additive* light in D3D
-    /// (gamma) space, not linear: `lit = tex * tint * saturate(vertex.rgb + 0.8 * ambient + point/spot diffuse)` (all gamma
-    /// space); no sun, no specular. Fog still applies.
+    /// Baked-lighting room shell: `Vertex::color.rgb` is additive light in D3D (gamma) space, not linear.
+    /// DS1006e133: saturate `vertex.rgb + 0.8 * ambient + point/spot diffuse` at each vertex, then Gouraud-interpolate
+    /// and multiply by texture/tint; no sun, no specular. Fog still applies. Ground uses its separate lightmap stage.
     pub prelit: bool,
     /// Texture coordinate drift in uv units per second (added to the vertex uv, wrapped by the sampler): scrolling clouds,
     /// water-like layers. `[0, 0]` = static.

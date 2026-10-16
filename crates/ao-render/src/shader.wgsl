@@ -139,8 +139,8 @@ fn vs(v: VIn) -> VOut {
     if native_unlit() { return unlit_vertex(v, o); }
     let prelit = mat.emissive.w > 1.5;
     let l = light_vertex(o.wpos, o.n, mat.emissive.rgb, mat.spec.rgb, mat.spec.w);
-    // prelit surfaces: the vertex colour is the baked additive light in D3D space (see `shade`)
-    o.light = select(l.light, v.color.rgb, prelit);
+    // DS1006e133: COLOR1 emissive + material ambient 0.8 + lamps, saturated before Gouraud interpolation.
+    o.light = select(l.light, clamp(v.color.rgb + 0.8 * g.ambient_g.rgb + l.dlight, vec3<f32>(0.0), vec3<f32>(1.0)), prelit);
     o.dlight = l.dlight;
     o.spec = l.spec;
     o.tint = to_g(mat.color.rgb * select(v.color.rgb, vec3<f32>(1.0), prelit));
@@ -202,7 +202,7 @@ fn vs_actor(v: VIn, @location(8) emissive: vec4<f32>, @location(9) specular: vec
     let eff_power = select(mat.spec.w, power.x, power.y > 0.5);
     let prelit = mat.emissive.w > 1.5 && (o.effect == 0u || o.effect == 3u || o.effect == 7u);
     let l = light_vertex(o.wpos, o.n, eff_emissive, eff_spec, eff_power);
-    o.light = select(l.light, v.color.rgb, prelit);
+    o.light = select(l.light, clamp(v.color.rgb + 0.8 * g.ambient_g.rgb + l.dlight, vec3<f32>(0.0), vec3<f32>(1.0)), prelit);
     o.dlight = l.dlight;
     o.spec = l.spec;
     o.tint = to_g(mat.color.rgb * select(v.color.rgb, vec3<f32>(1.0), prelit));
@@ -393,8 +393,7 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
     var light = i.light;
     var spec = i.spec;
     if !native_unlit() && mat.emissive.w > 1.5 && i.effect != 2u && i.effect != 4u && i.effect != 5u && i.effect != 6u {
-        // prelit: vertex colour is additive light (engine: tex * saturate(lightmap + 0.8 * ambient + dlight))
-        light = clamp(i.light + 0.8 * g.ambient_g.rgb + i.dlight, vec3<f32>(0.0), vec3<f32>(1.0));
+        // Room diffuse is already saturated per vertex; only interpolate and texture-modulate it here.
         spec = vec3<f32>(0.0);
     } else if mat.emissive.w > 0.5 && mat.emissive.w < 1.5 && (i.effect == 0u || i.effect == 3u || i.effect == 7u) {
         light = min(light + t.a, vec3<f32>(1.0)); // alpha = self-illumination mask (stage 0 ADD: saturate(a + lighting))

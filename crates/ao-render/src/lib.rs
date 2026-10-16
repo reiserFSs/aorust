@@ -3712,6 +3712,40 @@ mod sky_tests {
         // 0.07 * 255 = 18, not the per-pixel 255
         assert!((14..24).contains(&centre(&far)), "centre {}", centre(&far));
     }
+
+    #[test]
+    fn prelit_light_saturates_per_vertex_before_interpolation() {
+        // Pixel (32,32) samples x = 10*tan(30°)/64 on this constant-depth quad.
+        let t = (2.0 + 10.0 * (std::f32::consts::PI / 6.0).tan() / 64.0) / 4.0;
+        for lamps in [false, true] {
+            let mut s = lit_quad(2.0, [0.0; 3], 1.0, 0.0);
+            if lamps {
+                s.lights[0].color = [0.5_f32.powf(2.2); 3];
+            } else {
+                s.lights.clear();
+                s.environment.as_mut().unwrap().ambient = [0.5_f32.powf(2.2); 3];
+            }
+            for v in &mut s.meshes[0].vertices {
+                let c = if v.pos[0] < 0.0 { 1.0 } else { 0.0 };
+                v.color = [c, c, c, 1.0];
+            }
+            for prelit in [false, true] {
+                s.meshes[0].submeshes[0].prelit = prelit;
+                let added = if lamps { 0.5 * 10.0 / 108.0_f32.sqrt() } else if prelit { 0.8 * 0.5 } else { 0.5 };
+                let expected = 255.0 * if prelit { (1.0 - t) + t * added } else { (1.0 - t) * added };
+                let name = format!("prelit-gouraud-{lamps}-{prelit}");
+                let Some(png) = pixels(&s, 0.0, &name) else { return };
+                // Exact pixel-centre barycentrics above; allow two UNORM levels for raster/rounding differences.
+                assert!((f32::from(centre(&png)) - expected).abs() <= 2.0, "{name}: {} expected {expected}", centre(&png));
+                if prelit {
+                    let mut world = s.clone();
+                    world.instances.clear();
+                    let Some(actor) = actor_shot_frame(&world, s.clone(), [0.0; 3], ao_scene::ActorFrame::default(), &name) else { return };
+                    assert!((f32::from(actor[0]) - expected).abs() <= 2.0, "actor {name}: {actor:?} expected {expected}");
+                }
+            }
+        }
+    }
     /// `SPECULARENABLE` materials add `specular * (N.H)^power` after the texture stage, also on a black diffuse material.
     #[test]
     fn specular_term_is_added_after_the_texture_stage() {
