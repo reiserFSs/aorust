@@ -111,9 +111,9 @@ pub fn to_scene(env: &Env, outdoor: bool, sky: Option<&Sky>) -> Environment {
             let amb = s.and_then(|s| s.ambient).map_or(a, |m| [0, 1, 2].map(|k| a[k].max(srgb_to_linear(m[k]))));
             (amb, s.and_then(|s| s.sun).map_or(a.map(|v| 1.0 - v), |c| c.map(srgb_to_linear)))
         }
-        // `Tweak_Rubi-Ka_IndoorLight` AmbientLightCurrent 0.01 competes with the record ambient (`AddAmbientLight` keeps the
-        // per-channel maximum, DisplaySystem @0x10059d2c); no sun indoors; the room lightmaps carry the lighting
-        (false, _) => (a.map(|v| v.max(0.01)), [0.0; 3]),
+        // `AddAmbientLight` (DisplaySystem @0x10059d2c) takes the per-channel max in gamma space:
+        // raw IndoorLight AmbientLightCurrent 0.01 vs record / 255. Convert the floor too; no sun indoors.
+        (false, _) => (a.map(|v| v.max(srgb_to_linear(0.01))), [0.0; 3]),
     };
     // the client never clears the colour buffer per frame; only an `e_ClearScreen` tweak object paints the background (applied by
     // the loader through `sky::clear_color`, docs *Clear colour*). Without one (Rubi-Ka outdoors) the uncovered pixels are
@@ -162,7 +162,17 @@ mod tests {
         let s = to_scene(&e, true, None);
         assert!((s.fog_end - (VIEW_DISTANCE - (VIEW_DISTANCE - NEAR - 5.0) * 0.01)).abs() < 1e-3);
         assert_eq!(s.fog_color, [srgb_to_linear(0.2); 3]);
-        assert!(to_scene(&e, false, None).ambient[0] >= 0.01);
+        assert_eq!(to_scene(&e, false, None).ambient, [srgb_to_linear(30.0 / 255.0); 3]);
+    }
+
+    #[test]
+    fn indoor_ambient_floor_is_converted_from_gamma_space_per_channel() {
+        for (record, gamma) in [([0; 3], [0.01; 3]), ([30; 3], [30.0 / 255.0; 3]), ([0, 1, 30], [0.01, 0.01, 30.0 / 255.0])] {
+            let e = parse(&mut Rd::new(&fixture(record, [0; 3], 50), 0)).unwrap();
+            let s = to_scene(&e, false, None);
+            assert_eq!(s.ambient, gamma.map(srgb_to_linear));
+            assert_eq!(s.sun_color, [0.0; 3]);
+        }
     }
 
     #[test]
