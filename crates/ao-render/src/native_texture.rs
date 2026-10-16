@@ -38,7 +38,7 @@ impl Policy {
 
 impl Encoding {
     pub fn format(self) -> wgpu::TextureFormat {
-        match self { Self::Bc1 => wgpu::TextureFormat::Bc1RgbaUnormSrgb, Self::Bc2 => wgpu::TextureFormat::Bc2RgbaUnormSrgb, _ => wgpu::TextureFormat::Rgba8UnormSrgb }
+        match self { Self::Bc1 => wgpu::TextureFormat::Bc1RgbaUnorm, Self::Bc2 => wgpu::TextureFormat::Bc2RgbaUnorm, _ => wgpu::TextureFormat::Rgba8Unorm }
     }
     pub fn block_bytes(self) -> u32 { match self { Self::Bc1 => 8, Self::Bc2 => 16, _ => 4 } }
     pub fn block_edge(self) -> u32 { match self { Self::Bc1 | Self::Bc2 => 4, _ => 1 } }

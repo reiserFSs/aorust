@@ -2786,6 +2786,26 @@ mod sky_tests {
         Some(bytes)
     }
     #[test]
+    fn native_texture_interpolates_encoded_bytes_before_modulation() {
+        let key = TextureKey { rdb_type: 1, id: 1 };
+        let mut model = actor_quad([0.0, 0.0, 1.0], Submesh {
+            emissive: [1.0; 3], texture_clamp: true,
+            ..Submesh::new(vec![0, 1, 2, 0, 2, 3], Some(key))
+        });
+        model.textures.insert(key, Texture {
+            source: ao_scene::TextureSource::Generated, width: 2, height: 1,
+            rgba: vec![0, 0, 0, 255, 255, 255, 255, 255],
+        });
+        // Constant midpoint UV keeps LOD at zero: this tests GPU interpolation,
+        // not the CPU mip builder. sRGB decode/filter/re-encode gives ~188.
+        for vertex in &mut model.meshes[0].vertices { vertex.uv = [0.5, 0.5]; }
+        let pixel = actor_shot(&Scene::default(), model, [0.0, 0.0, -5.0], "native-gamma-filter")
+            .expect("native filtering regression requires an offscreen GPU adapter");
+        assert!(pixel.iter().all(|&c| (c as i16 - 128).abs() <= 1),
+            "D3D7 interpolates encoded black/white to 128, not linear-light 188: {pixel:?}");
+    }
+
+    #[test]
     fn native_texture_clamp_uses_distinct_cached_sampler_materials() {
         let key=TextureKey {rdb_type:1,id:1};
         // Both coplanar draws must execute: opaque depth writes would hide the second sampler.

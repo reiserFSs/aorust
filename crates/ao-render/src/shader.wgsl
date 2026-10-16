@@ -176,14 +176,11 @@ fn vs_sky_points(v: VIn) -> VOut {
 
 // The client computes in framebuffer (gamma) space: D3D7 fixed function lighting, the texture stage (`tex * vertex colour`), the
 // specular add, fog and the blend all operate on the 8 bit gamma values, textures are not decoded. The scene contract hands over
-// colours as `c^2.2` ("linear"); recover them with `to_g` and re-encode sampled sRGB textures. The UNORM framebuffer stores
-// these gamma values directly, so blending and MSAA resolve operate on the same values as D3D7.
-// Texture filtering remains the existing hardware sRGB-decode/filter/re-encode path (not D3D7 gamma-space filtering).
+// colours as `c^2.2` ("linear"); recover them with `to_g`. Native textures use UNORM views:
+// interpolation operates directly on encoded bytes, before lighting, fog, blending and MSAA resolve,
+// matching the D3D7 fixed-function path (no sRGB texture decode).
 fn to_g(v: vec3<f32>) -> vec3<f32> {
     return pow(max(v, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
-}
-fn srgb_enc(l: vec3<f32>) -> vec3<f32> {
-    return select(1.055 * pow(l, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * l, l <= vec3<f32>(0.0031308));
 }
 
 // D3D7 fixed-function vertex lighting (`IDirect3DDevice7::DrawIndexedPrimitive` with LIGHTING = 1, SHADEMODE = GOURAUD): evaluated
@@ -338,7 +335,7 @@ fn shade(i: VOut, fade_mode: u32) -> vec4<f32> {
         light = min(light + t.a, vec3<f32>(1.0)); // alpha = self-illumination mask (stage 0 ADD: saturate(a + lighting))
     }
     // texture stage MODULATE, then the specular add (both clamped to the framebuffer range), then fog: all in gamma space
-    let lit = min(srgb_enc(t.rgb) * i.tint * light + spec, vec3<f32>(1.0));
+    let lit = min(t.rgb * i.tint * light + spec, vec3<f32>(1.0));
     let f = select(i.fog, 0.0, i.effect == 2u || (i.effect >= 4u && i.effect <= 6u));
     // opaque/test: fog towards fog colour, alpha 1; blend: same with alpha; additive: fade out instead of tinting.
     let add = mode == 3u;
@@ -367,7 +364,7 @@ fn shade_sky(i: VOut, mode: u32) -> vec4<f32> {
         discard;
     }
     // MODULATE2X / stage-1 TFACTOR live in material RGB, after saturated lighting.
-    var rgb = clamp(srgb_enc(t.rgb) * i.light * to_g(mat.color.rgb), vec3<f32>(0.0), vec3<f32>(1.0));
+    var rgb = clamp(t.rgb * i.light * to_g(mat.color.rgb), vec3<f32>(0.0), vec3<f32>(1.0));
     if mat.scroll.z > 0.5 {
         // D3D fog follows the texture stage in gamma space, before blending (as in shade).
         let fog_color = select(g.fog_g.rgb, to_g(mat.flags.yzw), mat.scroll.z > 1.5);
@@ -399,7 +396,7 @@ fn fs_mesh_add(i: VOut) -> @location(0) vec4<f32> { return shade(i, 3u); }
 fn fs_holo(i: VOut) -> @location(0) vec4<f32> {
     let t0 = sample_clamped(holo0, vec2<f32>(0.0, i.wpos.y + fract(0.2 * i.effect_time)));
     let t1 = sample_clamped(holo1, i.uv + vec2<f32>(fract(0.15 * i.effect_time), 0.0));
-    let rgb = min(srgb_enc(t0.rgb) + srgb_enc(t1.rgb), vec3<f32>(1.0));
+    let rgb = min(t0.rgb + t1.rgb, vec3<f32>(1.0));
     let f = i.fog;
     return vec4<f32>(mix(rgb, g.fog_g.rgb, f), t0.a * i.color.a * mat.color.a * i.fade);
 }
@@ -428,7 +425,7 @@ fn vs_env(v: VIn) -> VOut {
 fn fs_env(i: VOut) -> @location(0) vec4<f32> {
     let t = sample_clamped(tex, i.uv);
     let f = i.fog;
-    return vec4<f32>(mix(srgb_enc(t.rgb), g.fog_g.rgb, f), 1.0);
+    return vec4<f32>(mix(t.rgb, g.fog_g.rgb, f), 1.0);
 }
 
 // N3 10033b97: +668 ADD palette/diffuse then MODULATE tile; +6ec
@@ -452,7 +449,7 @@ fn ground_palette(i: VOut) -> vec3<f32> {
 fn ground_tile(i: VOut) -> vec3<f32> {
     let tile = sample_clamped(tex, i.uv);
     if tile.a <= 128.0 / 255.0 { discard; }
-    return srgb_enc(tile.rgb);
+    return tile.rgb;
 }
 @fragment
 fn fs_ground_fused(i: VOut) -> @location(0) vec4<f32> {
