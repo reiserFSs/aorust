@@ -1065,19 +1065,38 @@ mod tests {
 
     #[test]
     fn own_third_person_body_is_selectable_and_inspect_does_not_select() {
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
         let mut z = Zone::new(1);
         z.dynels.insert(1, dyn_at("Me", [0.0; 3], false, 1));
-        z.world.set_own_pick(Some(body(1, -5.0)));
-        let cam = Camera::look_at(Vec3::new(0.0, 1.2, 1.0), Vec3::new(0.0, 1.2, -10.0));
+        let mut update = super::super::avatar::tests::own_update();
+        update.pos = [0.0; 3];
+        z.own_update = Some(Box::new(update));
+        z.triangle_targeting = true;
+        let mut player = super::super::player::Player::new(&dir, &mut z, 0).expect("captured own avatar");
+        player.select_camera_mode(3);
+        let mut host = ao_render::Host::headless();
+        player.frame(0.0, &mut host, &mut z, false);
+        let actor = host.actors.iter().find(|actor| actor.id == 1).unwrap();
+        assert!(actor.skin.is_none() && actor.skin_pose.is_some(), "own rendering must remain palette-only before picking");
+        let cam = Camera::look_at(Vec3::new(0.0, 1.2, 5.0), Vec3::new(0.0, 1.2, 0.0));
         let mut h = HudTargetLite::default();
         let lens = Lens::default();
-        assert_eq!(h.0.world_click(&mut z, None, &cam, &lens, (800, 600), (400.0, 300.0), Default::default()), Some(WorldClick::Select(1)));
+        // Target authored body triangles through the live Player/Avatar path, not the conservative own proxy.
+        let mouse = (20..600).step_by(20).find_map(|y| {
+            (20..800).step_by(20).map(|x| (x as f32, y as f32)).find(|&mouse| {
+                let ray = pick_ray(&cam, &lens, (800.0, 600.0), mouse);
+                super::super::interact_use::pick_objects(&ray, &z, Some(&player)).contains(&Identity { kind: DYNEL_CHAR, instance: 1 })
+            })
+        }).expect("captured own body must expose selectable triangles");
+        assert_eq!(h.0.world_click(&mut z, Some(&player), &cam, &lens, (800, 600), mouse, Default::default()), Some(WorldClick::Select(1)));
         assert_eq!(z.target, Some(1));
         h.0.select(&mut z, None);
-        assert_eq!(h.0.world_click(&mut z, None, &cam, &lens, (800, 600), (400.0, 300.0), Modifiers { shift: true, ..Default::default() }), Some(WorldClick::Info(1)));
+        assert_eq!(h.0.world_click(&mut z, Some(&player), &cam, &lens, (800, 600), mouse, Modifiers { shift: true, ..Default::default() }), Some(WorldClick::Info(1)));
         assert_eq!(z.target, None);
-        z.world.set_own_pick(None);
-        assert_eq!(h.0.world_click(&mut z, None, &cam, &lens, (800, 600), (400.0, 300.0), Default::default()), None, "first person must not pick the hidden own body");
+        player.select_camera_mode(0);
+        player.frame(0.0, &mut host, &mut z, false);
+        assert_eq!(h.0.world_click(&mut z, Some(&player), &cam, &lens, (800, 600), mouse, Default::default()), None, "first person must not pick the hidden own body");
     }
 
     #[test]

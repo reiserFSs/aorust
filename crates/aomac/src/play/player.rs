@@ -702,9 +702,13 @@ impl Player {
             // N3 Run 0x100196bd -> DisableVisibility 0x10073693 detaches the CAT frame,
             // so its mounted lights no longer reach Randy ProcessAttractorChilds 0x100577d3.
             host.dynamic_lights.extend(self.avatar.lights());
-            let mut frame = self.avatar.frame();
+            let mut frame = if zone.world.needs_effect_source_mesh((super::dynels::CHAR_KIND as u32, self.char_id)) {
+                self.avatar.source_frame()
+            } else {
+                self.avatar.frame()
+            };
             frame.alpha = alpha;
-            zone.world.set_own_pick(frame.skin.as_ref().and_then(|vertices| super::hud_pick::bounds_of(vertices.iter().map(|v| &v.pos)))
+            zone.world.set_own_pick(self.avatar.pick_bounds()
                 .map(|bounds| super::hud_pick::PickBody { id: self.char_id as i32, bounds, pos: scene_pos(pos), yaw: scene_yaw(yaw), scale: self.avatar.body_scale() }));
             host.actors.push(frame);
         }
@@ -721,12 +725,12 @@ impl Player {
         world.set_effect_source_head_height(identity, self.avatar.head_local().map(|head| head.y));
         world.set_effect_source_liquid(identity, self.movement.effect_liquid().map(|(depth, flags, direction)| (depth, flags, direction.into())));
         if !world.needs_effect_source_mesh(identity) { return; }
+        // First-person hides the actor, not the CAT pose needed by its native effects.
+        let mut source = self.avatar.source_frame();
         if let Some(actor) = host.actors.iter().find(|actor| actor.id == self.char_id && actor.model == avatar::MODEL_KEY) {
-            world.prepare_effect_source_mesh(identity, self.avatar.model(), actor);
-        } else {
-            // First-person hides the actor, not the CAT pose needed by its native effects.
-            world.prepare_effect_source_mesh(identity, self.avatar.model(), &self.avatar.frame());
+            source.alpha = actor.alpha;
         }
+        world.prepare_effect_source_mesh(identity, self.avatar.model(), &source);
     }
 
     /// `N3Msg_SitToggle` [GC 0x10028e0a] without the attack stop (the combat layer's): the frames the original sends. A `Move(0x1e)` is applied
@@ -1026,6 +1030,43 @@ mod tests {
             if mode == mode::SIT_GROUND { assert!(writes.contains(&(0x1a9, 25)) && writes.contains(&(0x1ae, 2))); }
             if mode == mode::FLY { assert!(!player.movement.falling_enabled()); }
         }
+    }
+
+    #[test]
+    fn own_deformer_submits_cpu_skin_only_while_needed() {
+        use super::super::own_nanos::VisualEvent;
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let mut zone = Zone::new(7);
+        zone.world.start(dir.clone(), 7);
+        zone.own_update = Some(Box::new(avatar::tests::own_update()));
+        let mut player = Player::new(&dir, &mut zone, 0).expect("captured own avatar");
+        player.collision = None;
+        player.zones = None;
+        player.camera.select_mode(3);
+        let mut host = Host::headless();
+        player.frame(0.0, &mut host, &mut zone, false);
+        let actor = host.actors.iter().find(|a| a.id == 7).unwrap();
+        assert!(actor.skin.is_none() && actor.skin_pose.is_some(), "ordinary own submission is palette-only");
+        zone.world.apply_buff_visuals(7, [VisualEvent::Add { nano: 1, effect: 31201, duration_cs: 1000 }]);
+        zone.world.buff_visual_frame(0.0, |id| player.effect_anchor(id), |_, _| None);
+        assert!(zone.world.needs_effect_source_mesh((super::super::dynels::CHAR_KIND as u32, 7)));
+        for _ in 0..4 {
+            host.actors.clear();
+            player.frame(0.0, &mut host, &mut zone, false);
+            player.prepare_effect_source(&mut zone.world, &host, None);
+            let eye = host.camera.pos.to_array();
+            zone.world.update_with_collision(0.025, eye, [0.0, 0.0, -1.0], &mut host, None,
+                |id| player.effect_anchor(id).map(|m| glam::Mat4::from_cols_array_2d(&m)));
+        }
+        let actor = host.actors.iter().find(|a| a.id == 7).unwrap();
+        let skin = actor.skin.as_ref().expect("renderer must receive the CPU body that Deformer edits");
+        assert!(actor.skin_pose.is_some(), "CPU skin overrides the retained render palette");
+        let original = player.avatar.source_frame().skin.unwrap();
+        assert_eq!(skin.len(), original.len());
+        assert!(!skin.is_empty());
+        assert!(skin.iter().zip(original.iter()).any(|(a, b)| a.pos != b.pos), "Deformer must edit the submitted own body");
+        assert!(player.avatar.frame().skin.is_none(), "ordinary frames stay palette-only even after source geometry is cached");
     }
 
     /// Offline, real-CAT Player::frame regression, including the movement FSM and transient dispatch.

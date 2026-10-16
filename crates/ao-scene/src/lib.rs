@@ -55,6 +55,25 @@ pub struct Vertex {
     pub color: [f32; 4],
 }
 
+/// Immutable native CAT attributes, in composed body vertex order (before the scene Z mirror).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct NativeSkinVertex {
+    pub local0: [f32; 3],
+    pub weight: f32,
+    pub local1: [f32; 3],
+    pub bone0: u32,
+    pub normal: [f32; 3],
+    pub bone1: u32,
+}
+
+/// Native affine bone frame: row xyz rotation, row w translation; no scene-space mirror.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SkinBone {
+    pub rows: [[f32; 4]; 3],
+}
+
 pub const WHITE: [f32; 4] = [1.0; 4];
 
 impl Default for Vertex {
@@ -337,6 +356,9 @@ pub struct ActorFrame {
     /// New vertices of model mesh 0 (the skinned body pose); `None` keeps the last ones (the bind-pose vertices of the model
     /// at first sight). Shared ownership retains the exact CPU pose for targeting after GPU upload, without copying vertices.
     pub skin: Option<std::sync::Arc<Vec<Vertex>>>,
+    /// Native bone palette; an empty palette explicitly restores the authored bind vertices.
+    /// `None` retains the previous pose. A valid CPU `skin` overrides this palette (authored deformer/effect geometry).
+    pub skin_pose: Option<std::sync::Arc<Vec<SkinBone>>>,
     /// Skip frustum culling (the own avatar).
     pub always: bool,
     /// Opacity of the whole actor, 1 = normal (`RRefFrame_t::SetTransparency`, randy31 0x100453ed: the value is the diffuse alpha
@@ -374,6 +396,7 @@ impl Default for ActorFrame {
             parts: Vec::new(),
             part_uvs: Vec::new(),
             skin: None,
+            skin_pose: None,
             always: false,
             alpha: 1.0,
             emissive: None,
@@ -394,6 +417,8 @@ impl Default for ActorFrame {
 pub struct Scene {
     pub textures: HashMap<TextureKey, Texture>,
     pub meshes: Vec<Mesh>,
+    /// Immutable CAT body attributes for GPU skinning of mesh zero; rigid/effect scenes leave this absent.
+    pub native_skin: Option<std::sync::Arc<Vec<NativeSkinVertex>>>,
     /// Native camera-cell adaptive liquid surfaces; empty when no liquid is authored.
     pub liquids: Vec<liquid::Surface>,
     /// Native adaptive binary ground patches; empty for indoor/model scenes.

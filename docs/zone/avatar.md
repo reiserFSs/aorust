@@ -7,6 +7,8 @@ Native visual-option authority: `N3Msg_EventFeedback` (Gamecode `0x1001cbb4`, ev
 
 Cloth selection is resolved: Gamecode `0x1004b521` examines pages 2, 1, 0 for each of five parts, taking the first nonzero texture. `0x1004b5ab` uploads that result via `VisualCATMesh_t::SetCATTextures`. Own and remote rigs retain all three pages, so clearing an overlay reveals the lower page rather than losing the underlying outfit.
 
+Render submissions normally retain only the CAT bone palette; CPU skinning stays lazy for exact picks and source-mesh effects. Deformer (`3001`, vertex callback GC `0x100d7217`, process `0x100d7752`; `combat-anim.md` native-class census) edits the submitted body's CPU vertices. While such an effect needs source geometry, both `Player::frame` and remote `Dynels::update_with_collision` therefore submit the CPU source frame itself, not a palette-only sibling. The renderer keeps CPU skin authoritative when both skin and palette are present. Installed-asset headless regressions `own_deformer_submits_cpu_skin_only_while_needed` and `remote_deformer_submits_cpu_skin_only_while_needed` cover that exception without requiring a GPU or live session.
+
 ## 1. Heading handedness (resolved)
 
 **Server/engine space is the client's left-handed D3D space; a model's rest forward axis is +Z; a dynel's rotation is a unit

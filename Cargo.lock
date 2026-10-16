@@ -239,7 +239,9 @@ name = "ao-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ao-formats",
  "ao-gui",
+ "ao-rdb",
  "ao-scene",
  "block2 0.6.2",
  "bytemuck",

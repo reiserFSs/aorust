@@ -86,15 +86,14 @@ fn skin_frustum_planes(cam: [f32; 3], fwd: [f32; 3], fov_horizontal: f32) -> [gl
     [planes[0], planes[1], planes[2], planes[3], planes[4]]
 }
 
-/// Whether an actor's CPU skin ([`ao_formats::character::actor::ActorRig::pose_composed_cached`]) can be skipped this
-/// frame (perf audit item 5): conservatively frustum-culled (see [`skin_frustum_planes`]), nothing forces a fresh
-/// pose (`needs_effect_pose`), and it already has a skin to keep drawing (the first frame always skins).
-fn skip_cpu_skin(skin_planes: &[glam::Vec4; 5], pos: [f32; 3], bounding_radius: f32, scale: f32, needs_effect_pose: bool, has_skin: bool) -> bool {
+/// Whether a retained palette can skip sampling outside the conservative camera cone.
+/// Source-pose effects force sampling; the first frame always establishes bones and mounts.
+fn skip_pose_sample(skin_planes: &[glam::Vec4; 5], pos: [f32; 3], bounding_radius: f32, scale: f32, needs_effect_pose: bool, has_palette: bool) -> bool {
     let center = glam::Vec3::from(pos);
     // ponytail: the real bind sphere is centred inside the body, not at the feet; doubling the radius safely
     // over-covers that offset without plumbing the actual mesh-0 sphere centre through to this pre-GPU stage.
     let radius = (2.0 * bounding_radius + ao_render::POSE_MARGIN) * scale;
-    has_skin && !needs_effect_pose && ao_render::frustum_culls_sphere(skin_planes, center, radius)
+    has_palette && !needs_effect_pose && ao_render::frustum_culls_sphere(skin_planes, center, radius)
 }
 
 /// Weapon item stat `AnimSet` (0x161): selects the stance clips (docs/zone/combat-anim.md §3.1).
@@ -254,7 +253,8 @@ fn built_bytes(built: &Built) -> usize {
         m.vertices.len() * std::mem::size_of::<ao_scene::Vertex>() + m.submeshes.iter().map(|s| s.indices.len() * 4).sum::<usize>()
     }).sum();
     let textures: usize = built.model.textures.values().map(|t| t.rgba.len()).sum();
-    meshes + textures
+    let skin = built.model.native_skin.as_ref().map_or(0, |vertices| vertices.len() * std::mem::size_of::<ao_scene::NativeSkinVertex>());
+    meshes + textures + skin
 }
 
 /// A skinned pose held for good: vertices and mount transforms.
@@ -665,9 +665,10 @@ pub struct Char {
     /// Mount transforms of the last pose.
     parts: Vec<[[f32; 4]; 4]>,
     features_set: bool,
-    /// Model-space box of the last pose's skinned body vertices (`RCATMesh_t+0x1fc/+0x208`, hud_pick.rs); `None` until posed.
+    /// Conservative model-space broadphase box, available from the first palette.
     bounds: Option<([f32; 3], [f32; 3])>,
-    current_skin: Option<Arc<Vec<ao_scene::Vertex>>>,
+    current_skin: std::cell::RefCell<Option<Arc<Vec<ao_scene::Vertex>>>>,
+    current_palette: Option<Arc<Vec<ao_scene::SkinBone>>>,
     cadence: ao_formats::character::AnimationCadence,
     pose_cache: ao_formats::character::actor::PoseCache,
     roll: Roll,
@@ -896,7 +897,7 @@ pub struct Dynels {
     /// viewer are not drawn (`n3VisualDynel_t::Run`, N3 0x100196bd: squared distance to the controlled dynel on ground playfields).
     pub char_view_distance: f32,
     /// Real horizontal field of view the active camera renders this frame ([`super::camera::horizontal_fov`]), set by
-    /// `flow.rs` each frame: widens [`skip_cpu_skin`]'s conservative pre-skin cull cone along with the aomac Enhanced
+    /// `flow.rs` each frame: widens [`skip_pose_sample`]'s conservative pose cull cone along with the aomac Enhanced
     /// "Widescreen FOV" option (audit item 16 prerequisite) so it never culls something the renderer would still draw.
     /// Retail (and the default) is the fixed 90° [`super::camera::FOV_HORIZONTAL`].
     pub fov_horizontal: f32,
@@ -1146,7 +1147,7 @@ fn quat_yaw(q: &[f32; 4]) -> f32 {
 }
 
 impl Dynels {
-    /// Model readiness and per-instance triangles of actually skinned remote CAT bodies in the headless input fixture.
+    /// Model readiness and per-instance triangles of palette-posed remote CAT bodies in the headless input fixture.
     #[cfg(test)]
     pub(super) fn cpu_benchmark_scene(&self) -> (bool, usize) {
         let mut keys = self.chars.iter().filter(|(id, _)| **id != self.own)
@@ -1155,7 +1156,7 @@ impl Dynels {
         let ready = self.want_placed.is_none()
             && keys.all(|key| matches!(self.models.get(&key), Some(Model::Ready { .. })));
         let triangles = self.chars.iter().filter(|(id, _)| **id != self.own).filter_map(|(_, c)| {
-            c.current_skin.as_ref()?;
+            c.current_palette.as_ref()?;
             c.bounds?;
             let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
             Some(built.rig.as_ref()?.body_triangles().count())
@@ -1879,7 +1880,7 @@ impl Dynels {
         if anchor==0 {return Some(world);}
         let Model::Ready { built, .. } = self.models.get(&c.key)? else { return None };
         let rig=built.rig.as_ref()?;
-        let matrix = if c.current_skin.is_some() {
+        let matrix = if c.current_palette.is_some() {
             if anchor == 3000 { rig.cached_weapon_effect_anchor(if slot == 8 { 2 } else { 1 }, &c.pose_cache) } else { rig.cached_effect_anchor(anchor, &c.pose_cache) }
         } else {
             let layers = c.layers(built);
@@ -2892,7 +2893,8 @@ impl Dynels {
                         parts: vec![],
                         features_set: !u.is_npc() || u.pairs.iter().any(|p| p.0 == ao_net::n3::motion::STAT_FEATURES),
                         bounds: None,
-                        current_skin: None,
+                        current_skin: Default::default(),
+                        current_palette: None,
                         cadence: Default::default(),
                         pose_cache: Default::default(),
                         roll: Roll::default(),
@@ -3156,7 +3158,7 @@ impl Dynels {
             host.actors.push(actor);
         }
         self.advance(dt);
-        // Perf audit item 5: avoid CPU-skinning (`pose_composed_cached`) actors the renderer would cull anyway.
+        // Retain offscreen palettes unless native effects require a refreshed skeleton.
         // 5 planes (no far plane: the 80 m `char_view_distance` check below already caps distance), built from a
         // `self.fov_horizontal` cone around `fwd` with aspect 1 — identical to the renderer's own horizontal
         // half-angle at retail's fixed 90° (aspect-independent), or widened along with the aomac Enhanced
@@ -3173,10 +3175,11 @@ impl Dynels {
                 match self.models.get(&k) {
                     Some(Model::Ready { .. }) => {
                         (c.key, c.next) = (k, None);
-                        c.current_skin = None;
-                        c.cadence = Default::default();
-                        c.pose_cache = Default::default();
+                        *c.current_skin.get_mut() = None;
+                        c.current_palette = None;
                         c.bounds = None;
+                        c.pose_cache = Default::default();
+                        c.cadence = Default::default();
                         c.previous_body = None;
                         c.parts.clear();
                     }
@@ -3365,28 +3368,27 @@ impl Dynels {
             }
             let terminal = dead && clip.is_some_and(|a| c.clip_ms >= a.duration);
             let needs_effect_pose = self.effects.as_ref().is_some_and(|effects| effects.needs_source_pose((CHAR_KIND as u32, *id as u32)));
-            let skip_culled = skip_cpu_skin(&skin_planes, p, rig.bounding_radius, c.scale, needs_effect_pose, c.current_skin.is_some());
-            let skin = if !skip_culled && (c.current_skin.is_none() || (sample_pose && (!terminal || !c.terminal_pose || !c.submitted || needs_effect_pose))) {
+            let skip_culled = skip_pose_sample(&skin_planes, p, rig.bounding_radius, c.scale, needs_effect_pose, c.current_palette.is_some());
+            if !skip_culled && (c.current_palette.is_none() || (sample_pose && (!terminal || !c.terminal_pose || !c.submitted || needs_effect_pose))) {
                 c.terminal_pose = terminal;
                 let mut cache = std::mem::take(&mut c.pose_cache);
-                let pose = rig.pose_composed_cached(c.layers(built), &mut cache);
+                let (palette, parts) = rig.pose_palette_composed_cached(c.layers(built), &mut cache);
                 c.pose_cache = cache;
-                Some(pose)
-            } else {
-                None
-            };
-            c.submitted = true;
-            let skin = skin.map(|(v, parts)| {
+                c.current_palette = Some(palette);
                 c.parts = parts;
-                c.bounds = super::hud_pick::bounds_of(v.iter().map(|x| &x.pos));
-                let vertices = Arc::new(v);
-                c.current_skin = Some(Arc::clone(&vertices));
-                vertices
-            });
+                if c.bounds.is_none() {
+                    let radius = 2.0 * rig.bounding_radius + ao_render::POSE_MARGIN;
+                    c.bounds = super::hud_pick::bounds_of(built.model.meshes[0].vertices.iter().map(|vertex| &vertex.pos))
+                        .map(|(lo, hi)| (std::array::from_fn(|i| (lo[i] + hi[i]) * 0.5 - radius),
+                            std::array::from_fn(|i| (lo[i] + hi[i]) * 0.5 + radius)));
+                }
+                *c.current_skin.get_mut() = None;
+            }
+            c.submitted = true;
             let (s, cs) = scene_yaw(c.pose.yaw).sin_cos();
             let k = c.scale;
             let transform = [[cs * k, 0.0, -s * k, 0.0], [0.0, k, 0.0, 0.0], [s * k, 0.0, cs * k, 0.0], [p[0], p[1], p[2], 1.0]];
-            let actor = ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), part_attractors: rig.part_attractors(), skin, always: false, alpha: 1.0, ..Default::default() };
+            let actor = ActorFrame { id: *id as u32, model: c.key, transform, parts: c.parts.clone(), part_attractors: rig.part_attractors(), skin_pose: c.current_palette.as_ref().map(Arc::clone), always: false, alpha: 1.0, ..Default::default() };
             // Worn/attached item lights (the Light Bar's embedded `RLight_t` and similar, `mesh.rs::decode_mesh_lights`):
             // actor-relative from `ActorRig::mount_lights`, placed in the world by this dynel's own transform, the same
             // way `ActorFrame::transform` places its mesh vertices (`vertex_lights` in the shader then lights terrain,
@@ -3398,7 +3400,14 @@ impl Dynels {
             }
             if let Some(effects) = &mut self.effects {
                 let identity = (CHAR_KIND as u32, *id as u32);
-                if effects.needs_source_mesh(identity) { effects.prepare_source_mesh(identity, &built.model, &actor); }
+                if effects.needs_source_mesh(identity) {
+                    let vertices = c.current_skin.get_mut().get_or_insert_with(|| Arc::new(rig.skin_cached(&c.pose_cache)));
+                    let mut source = actor.clone();
+                    source.skin = Some(Arc::clone(vertices));
+                    effects.prepare_source_mesh(identity, &built.model, &source);
+                    host.actors.push(source);
+                    continue;
+                }
             }
             host.actors.push(actor);
         }
@@ -3509,13 +3518,19 @@ impl Dynels {
 
     /// False BoundingBoxTargeting uses the same composed body pose as the actor renderer.
     pub fn pick_character_hit(&self, body: &super::hud_pick::PickBody, ray: &super::hud_target::Ray, bounding_box: bool) -> Option<f32> {
-        let distance = body.hit(ray.origin, ray.dir, ray.len)?;
-        if bounding_box { return Some(distance); }
+        body.hit(ray.origin, ray.dir, ray.len)?;
         let character = self.chars.get(&body.id)?;
         let Some(Model::Ready { built, .. }) = self.models.get(&character.key) else { return None };
         let rig = built.rig.as_ref()?;
-        let vertices = character.current_skin.as_ref()?;
-        body.hit_triangles(ray.origin, ray.dir, ray.len, vertices, rig.body_triangles())
+        character.current_palette.as_ref()?;
+        let mut skin = character.current_skin.borrow_mut();
+        let vertices = skin.get_or_insert_with(|| Arc::new(rig.skin_cached(&character.pose_cache)));
+        let exact = super::hud_pick::PickBody {
+            bounds: super::hud_pick::bounds_of(vertices.iter().map(|vertex| &vertex.pos))?,
+            ..*body
+        };
+        if bounding_box { exact.hit(ray.origin, ray.dir, ray.len) }
+        else { exact.hit_triangles(ray.origin, ray.dir, ray.len, vertices, rig.body_triangles()) }
     }
 
     pub fn set_own_pick(&mut self, body: Option<super::hud_pick::PickBody>) {
@@ -3547,6 +3562,50 @@ fn model_state(world: &Dynels, key: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_deformer_submits_cpu_skin_only_while_needed() {
+        use super::super::combat::effects::{Binding, Creation, EffectConfig, Renderer};
+        let Some(dir) = client() else { return };
+        let store = RecordStore::open(&dir).unwrap();
+        let mut assets = ActorAssets::new(&store).unwrap();
+        let spawn = captured_posture_player();
+        let who = spawn.header.target.instance;
+        let mut world = Dynels { dir: Some(dir.clone()), ..Default::default() };
+        world.on_message(&spawn);
+        let c = &world.chars[&who];
+        let key = c.key;
+        let built = build(&store, &mut assets, &c.look).unwrap();
+        world.asked.insert(key);
+        world.models.insert(key, Model::Ready { built: Box::new(built), uploaded: false });
+        let pos = scene_pos(world.chars[&who].pose.pos);
+        let eye = [pos[0], pos[1] + 1.5, pos[2] + 4.0];
+        let mut host = Host::headless();
+        world.update_with_collision(0.0, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
+        let actor = host.actors.iter().find(|a| a.id == who as u32).unwrap();
+        assert!(actor.skin.is_none() && actor.skin_pose.is_some(), "ordinary remote submission is palette-only");
+        assert!(world.chars[&who].current_skin.borrow().is_none(), "ordinary submission never CPU skins");
+        let source = glam::Mat4::from_cols_array_2d(&actor.transform);
+        let identity = (CHAR_KIND as u32, who as u32);
+        let mut effects = Renderer::open(&dir).unwrap();
+        effects.prepare_anchor(identity, 0, Some(source));
+        effects.spawn_configured(Binding { group: 0, attractor: 0, effect: 31201, note: 0, color: 0 },
+            source, source.w_axis.truncate(), EffectConfig { creation: Creation::Dynel, source_identity: Some(identity), ..Default::default() }).unwrap();
+        world.effects = Some(effects);
+        assert!(world.needs_effect_source_mesh(identity));
+        for _ in 0..4 {
+            host.actors.clear();
+            world.update_with_collision(0.025, eye, [0.0, 0.0, -1.0], &mut host, None, |_| None);
+        }
+        let actor = host.actors.iter().find(|a| a.id == who as u32).unwrap();
+        let skin = actor.skin.as_ref().expect("renderer must receive the CPU body that Deformer edits");
+        assert!(actor.skin_pose.is_some(), "CPU skin overrides the retained render palette");
+        let original = world.chars[&who].current_skin.borrow();
+        let original = original.as_ref().unwrap();
+        assert_eq!(skin.len(), original.len());
+        assert!(!skin.is_empty());
+        assert!(skin.iter().zip(original.iter()).any(|(a, b)| a.pos != b.pos), "Deformer must edit the submitted body, not just a detached source clone");
+    }
 
     #[test]
     fn effect_roots_exist_before_async_meshes_and_disappear_with_dynels() {
@@ -3865,21 +3924,21 @@ mod tests {
     }
 
     #[test]
-    fn skip_cpu_skin_culls_behind_camera_but_not_in_front() {
+    fn skip_pose_sample_culls_behind_camera_but_not_in_front() {
         // Camera at the origin looking down -Z (`Camera::forward`'s convention elsewhere in this file's tests).
         let planes = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], super::super::camera::FOV_HORIZONTAL);
         let behind = [0.0, 0.0, 10.0];
         let in_front = [0.0, 0.0, -10.0];
-        assert!(skip_cpu_skin(&planes, behind, 1.0, 1.0, false, true), "an actor behind the camera is CPU-skin-skipped");
-        assert!(!skip_cpu_skin(&planes, in_front, 1.0, 1.0, false, true), "an actor in front of the camera still skins");
+        assert!(skip_pose_sample(&planes, behind, 1.0, 1.0, false, true), "an actor behind the camera retains its palette");
+        assert!(!skip_pose_sample(&planes, in_front, 1.0, 1.0, false, true), "an actor in front of the camera still samples");
     }
 
     #[test]
-    fn skip_cpu_skin_never_skips_without_a_prior_skin_or_with_needs_effect_pose() {
+    fn skip_pose_sample_never_skips_without_a_palette_or_with_needs_effect_pose() {
         let planes = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], super::super::camera::FOV_HORIZONTAL);
         let behind = [0.0, 0.0, 10.0];
-        assert!(!skip_cpu_skin(&planes, behind, 1.0, 1.0, false, false), "no skin pose yet: the first frame always skins");
-        assert!(!skip_cpu_skin(&planes, behind, 1.0, 1.0, true, true), "needs_effect_pose forces a fresh skin even off-screen");
+        assert!(!skip_pose_sample(&planes, behind, 1.0, 1.0, false, false), "the first frame always samples bones and mounts");
+        assert!(!skip_pose_sample(&planes, behind, 1.0, 1.0, true, true), "needs_effect_pose forces a fresh palette even off-screen");
     }
 
     #[test]
@@ -3887,15 +3946,15 @@ mod tests {
         // Audit item 16 prerequisite: a character 55 degrees off-centre is outside retail's fixed-90-degree cull cone
         // (half-angle 45 degrees) but inside the real frustum once the Enhanced widescreen option widens the lens
         // past 90 degrees horizontal (e.g. 120.6 degrees at a 21:9 aspect) -- it must not stop animating.
-        // Far enough out that `skip_cpu_skin`'s fixed `POSE_MARGIN` cull-radius inflation (`ao_render::POSE_MARGIN`,
+        // Far enough out that `skip_pose_sample`'s fixed `POSE_MARGIN` cull-radius inflation (`ao_render::POSE_MARGIN`,
         // additive, independent of distance) is negligible next to how far past/short of the frustum edge this
         // point sits.
         let angle = 55f32.to_radians();
         let pos = [angle.sin() * 1000.0, 0.0, -angle.cos() * 1000.0];
         let retail = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], super::super::camera::FOV_HORIZONTAL);
-        assert!(skip_cpu_skin(&retail, pos, 0.1, 1.0, false, true), "55 degrees off-centre must be outside retail's fixed 90 degree cull cone");
+        assert!(skip_pose_sample(&retail, pos, 0.1, 1.0, false, true), "55 degrees off-centre must be outside retail's fixed 90 degree cull cone");
         let wide = skin_frustum_planes([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], super::super::camera::horizontal_fov(true, 21.0 / 9.0));
-        assert!(!skip_cpu_skin(&wide, pos, 0.1, 1.0, false, true), "widescreen FOV must widen the cull cone so edge characters keep animating");
+        assert!(!skip_pose_sample(&wide, pos, 0.1, 1.0, false, true), "widescreen FOV must widen the cull cone so edge characters keep animating");
     }
 
     #[test]
@@ -4092,7 +4151,7 @@ mod tests {
                         parts, part_attractors: rig.part_attractors(), skin: Some(Arc::new(vertices.clone())), alpha: 1.0, always: true, ..Default::default()
                     };
                     let png = output.join(format!("remote-current-{frame_no:04}.png"));
-                    ao_render::render_to_png_actors(scene, &[(key, built.model.clone())], vec![actor],
+                    ao_render::render_to_png_actors(scene, &[(key, (*built.model).clone())], vec![actor],
                         [3.0, 1.4, 3.0], [0.0, 0.9, 0.0], 640, 480, &png, 0.0).unwrap();
                 }
                 previous_vertices = Some(vertices);
@@ -4685,11 +4744,11 @@ mod tests {
         // sorts collision distance, not the identity whose centre we aimed at.
         assert!(body.hit(origin, toward, 100.0).is_some(), "aimed corpse has a collision");
         let characters = z.world.pick_bodies(z.char_id as i32);
-        let mut expected: Vec<_> = characters.iter()
-            .map(|b| (b, ao_net::msg::Identity { kind: CHAR_KIND, instance: b.id }))
-            .chain(picks.iter().map(|(b, id)| (b, *id)))
-            .filter_map(|(b, id)| b.hit(origin, toward, 100.0).map(|distance| (distance, b.id, id)))
-            .collect();
+        let ray = crate::play::hud_target::Ray { origin, dir: toward, len: 100.0 };
+        let mut expected: Vec<_> = characters.iter().filter_map(|b| {
+            z.world.pick_character_hit(b, &ray, true)
+                .map(|distance| (distance, b.id, ao_net::msg::Identity { kind: CHAR_KIND, instance: b.id }))
+        }).chain(picks.iter().filter_map(|(b, id)| b.hit(origin, toward, 100.0).map(|distance| (distance, b.id, *id)))).collect();
         expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         assert_eq!(hit, expected.into_iter().map(|(_, _, id)| id).collect::<Vec<_>>(), "all intersecting identities in native distance order");
         assert_eq!(hit.iter().filter(|id| *id == who).count(), 1, "aimed corpse retained exactly once");
@@ -4725,7 +4784,7 @@ mod tests {
             if let Some(id) = target_actor {
                 let actor = actors.iter().find(|a| a.id == id).expect("screenshot target was culled");
                 if z.world.chars.contains_key(&(id as i32)) {
-                    assert!(actor.skin.is_some(), "new screenshot renderer requires the target's current pose");
+                    assert!(actor.skin.is_some() || actor.skin_pose.is_some(), "new screenshot renderer requires the target's current pose");
                 }
             }
             ao_render::render_to_png_actors(&scene, &models, actors, cam, at, 1200, 700, std::path::Path::new(&out), 0.0).unwrap();

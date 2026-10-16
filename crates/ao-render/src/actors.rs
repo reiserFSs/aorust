@@ -1,10 +1,17 @@
 //! Dynamic actors (players, NPCs, ...) drawn after the world: the model's index buffers, materials and textures are uploaded once
 //! per model key ([`Renderer::add_actor_model`]); the body mesh gets one vertex buffer per actor, rewritten when the app supplies a
-//! new pose ([`ao_scene::ActorFrame::skin`]); rigid parts (head, weapons) share the model's vertex buffer and only get a transform.
+//! new pose ([`ao_scene::ActorFrame::skin_pose`] for native CAT compute, [`ao_scene::ActorFrame::skin`] for CPU-authored effects);
+//! rigid parts (head, weapons) share the model's vertex buffer and only get a transform.
 
 use super::*;
 use ao_scene::ActorFrame;
 use std::sync::{Arc, Weak};
+
+#[path = "skinning.rs"]
+mod skinning;
+#[cfg(test)]
+#[path = "native_skin_tests.rs"]
+mod native_skin_tests;
 
 /// Native archive identity plus every input that changes the uploaded bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,6 +103,8 @@ struct Model {
     textures: Vec<Arc<ActorTexture>>,
     identities: HashMap<TextureKey, TextureIdentity>,
     topology: Vec<(usize, Vec<ao_scene::Submesh>)>,
+    /// Attribute/count buffers and the minimum palette length for all actively read bone indices.
+    native_skin: Option<(wgpu::Buffer, wgpu::Buffer, u64)>,
 }
 
 struct ActorGpu {
@@ -105,6 +114,7 @@ struct ActorGpu {
     /// Model key of the last submitted frame (a replaced model only invalidates its own actors' buffers).
     model: u64,
     skin: Option<std::sync::Arc<Vec<ao_scene::Vertex>>>,
+    pose: Option<skinning::PoseGpu>,
 }
 
 /// One visible (actor, model mesh) with its slot in the instance buffer.
@@ -152,6 +162,8 @@ pub(crate) struct ActorLayer {
     /// capacity, since the layer started: a regression counter, not drained. Converges once the actor's largest
     /// frame has been seen; a model whose geometry size never exceeds its first frame never grows at all.
     pub(crate) mesh_buffer_grows: u64,
+    skin_pipeline: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    pub(super) native_metal: bool,
 }
 
 impl ActorLayer {
@@ -198,6 +210,9 @@ impl Renderer {
 
     /// Uploads a model for [`ActorFrame::model`] `key`: `scene.meshes[0]` is the (skinned) body, the others are rigid parts.
     /// Replaces a model of the same key.
+    ///
+    /// # Panics
+    /// Panics if native skin attributes do not match mesh 0's vertex count.
     pub fn add_actor_model(&mut self, key: u64, scene: &Scene) {
         self.upload_actor_model(key, scene, false);
     }
@@ -212,9 +227,13 @@ impl Renderer {
     /// dynamic buff/particle/effect geometry whose vertex or index *count* merely varies frame to frame. A
     /// changed material (a different texture, blend, tint, ...) still falls through to a full rebuild, which is
     /// the only place bind groups are created.
+    ///
+    /// # Panics
+    /// Panics if native skin attributes do not match mesh 0's vertex count.
     pub fn update_actor_model(&mut self, key: u64, scene: &Scene) {
         let eligible = self.act.models.get(&key).is_some_and(|model| {
-            scene.textures.iter().all(|(k, texture)| model.identities.get(k) == Some(&TextureIdentity::new(*k, texture, self.texture_policy)))
+            scene.native_skin.is_none() && model.native_skin.is_none()
+                && scene.textures.iter().all(|(k, texture)| model.identities.get(k) == Some(&TextureIdentity::new(*k, texture, self.texture_policy)))
                 && model.topology.len() == scene.meshes.len()
                 && model.meshes.len() == scene.meshes.len()
                 && model.topology.iter().zip(&scene.meshes).zip(&model.meshes).all(|(((_, subs), mesh), gpu)| {
@@ -282,6 +301,10 @@ impl Renderer {
     }
 
     fn upload_actor_model(&mut self, key: u64, scene: &Scene, retain_textures: bool) {
+        if let Some(skin) = &scene.native_skin {
+            assert!(scene.meshes.first().is_some_and(|body| body.vertices.len() == skin.len()),
+                "native skin attributes must match the body mesh vertex count");
+        }
         let old = if retain_textures { self.act.models.remove(&key) } else { None };
         let (mut views, mut view_of, mut textures, mut identities) = match old {
             Some(model) => (model.views, model.view_of, model.textures, model.identities),
@@ -331,7 +354,7 @@ impl Renderer {
             let vbytes = mesh.vertices.len() * 12;
             let vertex_capacity = ((vbytes * 4) as u64).next_power_of_two().max(1);
             let vb = self.device.create_buffer_tracked(&wgpu::BufferDescriptor {
-                label: None, size: vertex_capacity, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+                label: None, size: vertex_capacity, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
             });
             self.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&mesh.vertices));
             let (mut indices, mut draws, mut submesh_mats) = (Vec::with_capacity(idx_total), vec![], Vec::with_capacity(mesh.submeshes.len()));
@@ -389,12 +412,26 @@ impl Renderer {
             meshes.push(Some(ModelMesh { vb, ib, vertex_capacity, index_capacity, nverts: mesh.vertices.len(), draws, submesh_mats, sphere: (c, r) }));
         }
         let topology = scene.meshes.iter().map(|mesh| (mesh.vertices.len(), submesh_shape(&mesh.submeshes))).collect();
-        self.act.models.insert(key, Model { meshes, mats, holo, views, view_of, textures, identities, topology });
+        let native_skin = scene.native_skin.as_ref().filter(|s| !s.is_empty()).map(|s| (
+            self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
+                label: Some("immutable CAT attributes"), contents: bytemuck::cast_slice(s.as_slice()), usage: wgpu::BufferUsages::STORAGE,
+            }),
+            self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
+                label: Some("CAT vertex count"), contents: bytemuck::cast_slice(&[s.len() as u32, 0, 0, 0]), usage: wgpu::BufferUsages::UNIFORM,
+            }),
+            s.iter().map(|v| {
+                let bone = if v.weight >= 0.999 { v.bone0 } else { v.bone0.max(v.bone1) };
+                u64::from(bone) + 1
+            }).max().unwrap_or(0),
+        ));
+        self.act.models.insert(key, Model { meshes, mats, holo, views, view_of, textures, identities, topology, native_skin });
+        self.act.vb_pool.remove(&key);
         self.act.textures.retain(|_, texture| texture.strong_count() != 0);
         // actors of a replaced model rebuild their body buffer at the next pose
         for a in self.act.actors.values_mut().filter(|a| a.model == key) {
             a.vb = None;
             a.skin = None;
+            a.pose = None;
         }
     }
 
@@ -409,20 +446,49 @@ impl Renderer {
         self.act.models.clear();
         self.act.textures.clear();
         self.act.actors.clear();
+        self.act.vb_pool.clear(); // New model uploads invalidate these model-specific pools anyway.
         self.act.frames.clear();
     }
 
     /// The actors to draw from now on (until the next call); new body poses are uploaded immediately.
+    ///
+    /// # Panics
+    /// Panics if an active native pose has a nonempty palette too short for its model's bone indices.
+    /// Panics if two drawable frames share an actor ID.
+    /// A correctly sized CPU skin takes precedence over the palette; an empty palette selects bind pose.
     pub fn set_actors(&mut self, mut frames: Vec<ActorFrame>) {
+        // Validate the whole batch before changing actors or leaving any pending GPU work behind.
+        for frame in &frames {
+            let Some(model) = self.act.models.get(&frame.model) else { continue };
+            let Some((_, _, required_bones)) = &model.native_skin else { continue };
+            let Some(body) = model.meshes.first().and_then(Option::as_ref) else { continue };
+            if frame.skin.as_ref().is_some_and(|skin| skin.len() == body.nverts) { continue; }
+            if let Some(palette) = &frame.skin_pose {
+                assert!(palette.is_empty() || palette.len() as u64 >= *required_bones,
+                    "native skin palette is too short for the model's active bone indices");
+            }
+        }
         self.act.tick += 1;
         let tick = self.act.tick;
         for f in &mut frames {
             let Some(body) = self.act.models.get(&f.model).and_then(|m| m.meshes.first()).and_then(Option::as_ref) else { continue };
-            let a = self.act.actors.entry(f.id).or_insert(ActorGpu { vb: None, seen: tick, model: f.model, skin: None });
+            let a = match self.act.actors.entry(f.id) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    assert_ne!(entry.get().seen, tick, "actor IDs must be unique within a frame batch");
+                    entry.into_mut()
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(ActorGpu {
+                    vb: None, seen: tick, model: f.model, skin: None, pose: None,
+                }),
+            };
             a.seen = tick;
-            if a.model != f.model { if let Some(vb) = a.vb.take() { self.act.vb_pool.entry(a.model).or_default().push(vb); } a.skin = None; }
+            if a.model != f.model { if let Some(vb) = a.vb.take() { self.act.vb_pool.entry(a.model).or_default().push(vb); } a.skin = None; a.pose = None; }
             a.model = f.model;
+            if f.skin.as_ref().is_none_or(|skin| skin.len() != body.nverts) && f.skin_pose.is_some() && self.act.models.get(&f.model).is_some_and(|m| m.native_skin.is_some()) {
+                continue;
+            }
             if let Some(skin) = f.skin.take().filter(|s| s.len() == body.nverts) {
+                f.skin_pose = None;
                 if a.skin.as_ref().is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &skin)) { continue; }
                 let bytes: &[u8] = bytemuck::cast_slice(skin.as_slice());
                 match &a.vb {
@@ -434,14 +500,16 @@ impl Renderer {
                             None => { self.act.vb_created += 1; self.device.create_buffer_init_tracked(&wgpu::util::BufferInitDescriptor {
                                 label: None,
                                 contents: bytes,
-                                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
                             }) }
                         });
                     }
                 }
                 a.skin = Some(skin);
+                a.pose = None;
             }
         }
+        self.prepare_actor_skins(&frames);
         let (keep, evicted): (HashMap<_, _>, HashMap<_, _>) = std::mem::take(&mut self.act.actors).into_iter().partition(|(_, a)| a.seen == tick);
         self.act.actors = keep;
         for (_, a) in evicted {
@@ -1135,8 +1203,8 @@ mod tests {
     fn model_removal_keeps_unrelated_actors_and_is_idempotent() {
         let mut layer = ActorLayer::default();
         for (id, model) in [(1, 7), (2, 8), (3, 7)] {
-            layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), textures: vec![], identities: HashMap::new(), topology: vec![] });
-            layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None });
+            layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), textures: vec![], identities: HashMap::new(), topology: vec![], native_skin: None });
+            layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None, pose: None });
             layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
             layer.items.push(Item { actor: id, model, mesh: 0, bucket: 0, faded: false, rendering_effect: 0, priority: None });
         }
@@ -1234,5 +1302,8 @@ mod tests {
             renderer.set_actors(actors);
         }
         assert_eq!(renderer.actor_vb_creations(), warm, "steady-state churn of {} more spawns created {} more buffers instead of reusing the pool", 600 * 60, renderer.actor_vb_creations() - warm);
+        assert!(!renderer.act.vb_pool.is_empty(), "churn must exercise a retained buffer pool");
+        renderer.clear_actors();
+        assert!(renderer.act.vb_pool.is_empty(), "a new zone must release pools belonging to removed models");
     }
 }

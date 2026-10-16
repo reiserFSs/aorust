@@ -261,6 +261,67 @@ the last model releases the allocation. The Arc regression proves the upload que
 retains the original scene allocation rather than copying decoded geometry/RGBA.
 These structural results are independent of noisy end-to-end timings.
 
+### Recorded GPU-skin comparison (2026-10-16)
+
+The measured baseline is `6e8269c` plus the texture-sharing/Arc changes, before the
+GPU-skin changes and final upstream rebases (local measured snapshot `2c858d7`).
+Those resource changes are published as `d2d8ebd` and `5e87597`; unrelated later
+native-fidelity changes are not attributed to this performance comparison.
+Same three independent ICC replays and medians, 600 completed measured frames after
+120 warmup frames. These shared-Mac numbers are observations, not isolated causal
+estimates. Extra immutable skin attributes/palettes increase Metal allocation:
+
+| Configuration | Frame p50 / p95 (ms) | Thread CPU mean (ms) | Metal allocated (MiB) | RSS at report (MiB) | Zone ready (s) |
+|---|---:|---:|---:|---:|---:|
+| CPU skin, 1× | 5.4520 / 6.8850 | 2.6470 | 451.22 | 694.28 | 6.406 |
+| GPU skin, 1× | 3.6072 / 4.9442 | 2.0659 | 452.25 | 693.64 | 6.320 |
+| CPU skin, 4× | 5.5302 / 7.8823 | 2.8283 | 451.73 | 697.47 | 6.512 |
+| GPU skin, 4× | 3.6327 / 5.3428 | 2.1548 | 452.80 | 696.36 | 6.412 |
+
+| Calling-thread CPU stage mean (ms) | CPU 1× | GPU 1× | CPU 4× | GPU 4× |
+|---|---:|---:|---:|---:|
+| Update | 0.0497 | 0.0407 | 0.0542 | 0.0415 |
+| Frontend | 1.3256 | 1.0999 | 1.4030 | 1.1244 |
+| Upload | 0.2063 | 0.1095 | 0.2234 | 0.1216 |
+| Render encoding/submission | 0.7864 | 0.6385 | 0.8484 | 0.6729 |
+| GUI encoding/submission | 0.1122 | 0.0844 | 0.1235 | 0.0910 |
+| Completion wait CPU | 0.1605 | 0.0998 | 0.1759 | 0.1035 |
+
+The tighter fixture `native_skin_sixty_actor_performance` alternates CPU/GPU order
+in one process: eight installed rigs, 60 actors, 1280×800, 32 warmup pairs discarded,
+120 measured pairs per run, three runs. Both paths sample the same layers/times,
+draw actual models/attachments/effect materials, and wait for completed GPU work.
+Targets persist and no PNG/readback occurs in timed frames. These stages are wall
+times, **not** calling-thread CPU or GPU timestamps:
+
+| Paired crowd stage, p50 / p95 (ms) | CPU skin | GPU skin |
+|---|---:|---:|
+| Pose preparation | 0.3293 / 0.3916 | 0.1020 / 0.1213 |
+| Actor upload | 0.5673 / 0.6946 | 0.1771 / 0.2241 |
+| Render encoding/submission | 0.3640 / 0.4190 | 0.4134 / 0.4968 |
+| GPU completion wait | 1.7373 / 1.8297 | 1.5688 / 1.6772 |
+| Completed frame | 3.0173 / 3.2284 | 2.2583 / 2.5449 |
+
+This fixture observed roughly 25% lower median completed-frame latency, while
+compute encoding itself costs more CPU wall time. Exact vertex-byte and rendered
+RGBA comparisons passed for the same eight rigs individually and in 60-actor
+crowds across bind/animated transitions, including heads, weapons, Light Bar and
+native material effects. Separate own/remote Deformer regressions and 35 avatar
+tests passed: source-mesh effects still receive CPU geometry, and ordinary
+submissions stay palette-only. Kernel safety tests cover active bone bounds,
+attribute-count mismatch, duplicate IDs and pending initialization across two
+submissions before rendering. A separate warmed `sample` profile observed palette
+sampling rather than the ordinary CPU vertex-skin loop; sampling was excluded
+from timings. Live measurements remain deferred by the maintenance restriction.
+
+Final integration after native-filtering publication passed
+`cargo test --release --workspace -j 2`: 2091 passed, 64 ignored, plus strict
+workspace/all-target release clippy. The own-body selection regression now uses a
+real palette-only Player and an actual triangle hit to test Select, Shift-Info and
+first-person exclusion; bounds without a Player are not exact geometry.
+The subsequent additive Knowledge/Team rebase passed the affected `aomac` tests
+(1254 passed, 53 ignored) and another strict workspace/all-target release clippy.
+
 ## Social/economy coverage inventory (2026-10-15)
 
 This sweep is headless only: no application windows, desktop input or screenshots. Live verification is blocked by the user's confirmed PRK maintenance; no login attempts are permitted until explicitly resumed. Existing captures remain evidence only for the particular exchanges they contain, not for new live acceptance.

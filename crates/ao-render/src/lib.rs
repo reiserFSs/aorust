@@ -830,7 +830,8 @@ impl Renderer {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                required_features: adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES),
+                required_features: (adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES))
+                    | if adapter.get_info().backend == wgpu::Backend::Metal { wgpu::Features::PASSTHROUGH_SHADERS } else { wgpu::Features::empty() },
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
@@ -992,6 +993,7 @@ impl Renderer {
             act: Default::default(),
             screen: Default::default(),
         };
+        r.act.native_metal = adapter.get_info().backend == wgpu::Backend::Metal;
         r.upload(&Scene::default());
         Ok(r)
     }
@@ -1807,6 +1809,8 @@ impl Renderer {
         }
         self.frame = (self.frame + 1) % INST_RING;
         self.prepare_actors(cam.pos, &planes);
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        self.encode_actor_skins(&mut enc);
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         if let Some(buf) = inst_buf {
             if !self.vis.is_empty() {
@@ -1892,7 +1896,6 @@ impl Renderer {
         self.sorted.sort_by(|a, b| b.0.total_cmp(&a.0)); // stable: ties keep submesh order
 
         let calls = std::cell::Cell::new(0usize);
-        let mut enc = self.device.create_command_encoder(&Default::default());
         self.screen.prepare(&self.device,&self.queue,self.format,t.size);
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {

@@ -181,6 +181,7 @@ struct Mount {
 #[derive(Default)]
 pub struct PoseCache {
     frames: Vec<Option<Xf>>,
+    animated: bool,
 }
 
 pub struct ActorRig {
@@ -213,7 +214,10 @@ impl ActorRig {
         let mut bind = bind_frames(&cat);
         let skin = skin_bind(&cat, &bind);
         let (mut model, ..) = assemble(store, &cat, &skin, overrides, layers, head.is_some());
-        let used = (0..cat.submeshes.len()).filter(|&i| !(head.is_some() && cat.parts[cat.submeshes[i].material as usize].name == "head")).collect();
+        let used: Vec<usize> = (0..cat.submeshes.len()).filter(|&i| !(head.is_some() && cat.parts[cat.submeshes[i].material as usize].name == "head")).collect();
+        model.native_skin = Some(Arc::new(used.iter().flat_map(|&si| cat.submeshes[si].vertices.iter()).map(|v| ao_scene::NativeSkinVertex {
+            local0: v.local[0], weight: v.weight, local1: v.local[1], bone0: v.bones[0], normal: v.normal, bone1: v.bones[1],
+        }).collect()));
         let mut mounts = vec![];
         let mut head_att = None;
         // `RVisual_t::ApplyStateChanges` (randy31 @0x1004cbe1) and the material delta-state apply inside
@@ -458,14 +462,32 @@ impl ActorRig {
     }
 
     pub fn pose_composed_cached<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>, cache: &mut PoseCache) -> (Vec<Vertex>, Vec<[[f32; 4]; 4]>) {
-        let animated = layers.clone().any(|l| l.clip.signature == self.cat.signature);
+        self.sample_cached(layers, cache);
+        (self.skin_cached(cache), self.cached_parts(cache))
+    }
+
+    /// Samples bones and rigid mounts without touching body vertices. Empty palette means authored bind pose.
+    pub fn pose_palette_composed_cached<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>, cache: &mut PoseCache) -> (Arc<Vec<ao_scene::SkinBone>>, Vec<[[f32; 4]; 4]>) {
+        self.sample_cached(layers, cache);
+        let palette = Arc::new(if cache.animated {
+            cache.frames.iter().map(|frame| {
+                let frame = frame.unwrap_or(Xf::ID);
+                ao_scene::SkinBone { rows: std::array::from_fn(|i| [frame.r[i][0], frame.r[i][1], frame.r[i][2], frame.t[i]]) }
+            }).collect()
+        } else { Vec::new() });
+        (palette, self.cached_parts(cache))
+    }
+
+    fn sample_cached<'a>(&self, layers: impl Clone + Iterator<Item = AnimLayer<'a>>, cache: &mut PoseCache) {
+        cache.animated = layers.clone().any(|l| l.clip.signature == self.cat.signature);
+        cache.frames = if cache.animated { self.world(layers) } else { self.bind.clone() };
+    }
+
+    /// CPU geometry for an actual picking/effect consumer, using exactly the last displayed sample.
+    pub fn skin_cached(&self, cache: &PoseCache) -> Vec<Vertex> {
         let mut verts = self.model.meshes[0].vertices.clone();
-        let frames: Vec<Option<Xf>> = if animated {
-            self.world(layers)
-        } else {
-            self.bind.clone()
-        };
-        if animated {
+        let frames = &cache.frames;
+        if cache.animated {
             let mut out = verts.iter_mut();
             for &si in &self.used {
                 for v in &self.cat.submeshes[si].vertices {
@@ -485,10 +507,15 @@ impl ActorRig {
                 }
             }
         }
+        verts
+    }
+
+    fn cached_parts(&self, cache: &PoseCache) -> Vec<[[f32; 4]; 4]> {
+        let frames = &cache.frames;
         let mut parts = vec![IDENTITY; self.model.meshes.len()];
         for m in &self.mounts {
             let att = &self.cat.attractors[m.attractor];
-            let Some(bone) = frames[att.bone as usize].or_else(|| self.nearest_frame(&frames, att.bone as usize)) else { continue };
+            let Some(bone) = frames[att.bone as usize].or_else(|| self.nearest_frame(frames, att.bone as usize)) else { continue };
             let w = bone.mul(&Xf::from_qt(att.rot, att.pos));
             // mount meshes are already mirrored (Z negated): conjugate the transform by the mirror
             let flip = |i: usize, j: usize| if (i == 2) != (j == 2) { -1.0 } else { 1.0 };
@@ -501,8 +528,7 @@ impl ActorRig {
             t[3] = [w.t[0], w.t[1], -w.t[2], 1.0];
             parts[m.mesh] = t;
         }
-        cache.frames = frames;
-        (verts, parts)
+        parts
     }
 
     /// Whether any worn mesh needs a posed light transform.
