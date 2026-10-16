@@ -151,6 +151,7 @@ impl Interact {
         let Ok(m) = n3::decode(f) else { return };
         let who = m.header.target;
         self.shop.literacy = zone.skill_value(0xa1).unwrap_or(0).min(3000);
+        self.watch_reclaim_events(gui, zone);
         self.watch_objects(gui, &m, zone);
         self.shop_watch(&m);
         self.use_actions.on_message(&m, zone);

@@ -7,7 +7,33 @@ use ao_net::n3::inventory::{self as inv, InventoryMsg};
 impl Zone {
     /// `N3Msg_ToggleReclaim` queries registered container kind DEAE (GC 0x1003f03e).
     pub(in crate::play) fn reclaim_registered(&self) -> bool {
-        self.containers.keys().any(|&(kind, _)| kind == 0xdeae)
+        !self.reclaim_registrations.is_empty()
+    }
+
+    /// GC1001753e ->10046bb5 ->1012584a: DEAE selects the current manager+180
+    /// inventory, regardless of requested instance or registration membership.
+    pub(in crate::play) fn container_inventory<'a>(
+        &'a self,
+        container: Identity,
+        mut can30: impl FnMut(ao_net::n3::world::AcgItem) -> Option<i32> + 'a,
+    ) -> impl Iterator<Item = ao_net::n3::world::InventoryEntry> + 'a {
+        let registered = if container.kind == 0xdeae {
+            self.containers.iter().find(|((kind, _), _)| *kind == 0xdeae)
+        } else {
+            self.containers.get_key_value(&(container.kind, container.instance))
+        };
+        let all = registered.is_none_or(|(&(kind, instance), _)| kind != 0xdeae || instance == self.char_id as i32);
+        registered.into_iter().flat_map(|(_, (_, entries))| entries).filter_map(move |entry| {
+            // Occupancy is the presence of a cell (1002a379), not raw.a bit 1.
+            if !all && entry.a & 0x20 == 0 && can30(entry.item).unwrap_or(0) & 0x40 == 0 {
+                return None;
+            }
+            let mut entry = *entry;
+            if container.kind == 0xdeae {
+                entry.id = Identity { kind: 0x6a, instance: entry.slot as i32 };
+            }
+            Some(entry)
+        })
     }
 
     /// The own character's identity (`{0xC350, char_id}`).
@@ -225,7 +251,30 @@ impl Zone {
                 self.containers.insert((0xdead, self.char_id as i32), (0, entries.clone()));
             }
             InventoryMsg::Reclaim { entries, instance } => {
-                self.containers.insert((0xdeae, *instance), (0, entries.clone()));
+                // Native activation first resolves an existing SimpleChar. Its
+                // +140 emission flag is set by own SCFU10077af2/SetMainDynel10019f77.
+                if self.own().is_none() { return; }
+                // GC10071de0 creates DEAE:0; 10071e95 replaces its instance with
+                // the trailing wire word and replaces manager+180, not a second list.
+                self.containers.retain(|&(kind, _), _| kind != 0xdeae);
+                let mut entries = entries.clone();
+                entries.sort_by_key(|entry| entry.slot);
+                self.containers.insert((0xdeae, *instance), (0, entries));
+                if self.reclaim_registrations.insert(*instance) {
+                    self.reclaim_events.push((Identity { kind: 0xdeae, instance: *instance }, true));
+                }
+            }
+            // GC1004ad44 ->10046b0b: reclaim always takes the first free bag cell.
+            InventoryMsg::ContainerAdd { item, container, .. }
+                if item.kind == 0x6a && (*container == self.own_identity() || *container == Identity::default()) =>
+            {
+                let Some(slot) = self.free_bag_slot() else { return };
+                let Some((_, (_, entries))) = self.containers.iter_mut().find(|((kind, _), _)| *kind == 0xdeae) else { return };
+                let Some(at) = entries.iter().position(|e| e.slot as i32 == item.instance && e.a & 3 != 0) else { return };
+                let mut entry = entries.remove(at);
+                entry.slot = slot;
+                entry.id = inv::item_identity(slot);
+                self.inventory.insert(slot, entry);
             }
             InventoryMsg::ContainerAdd { item, container, .. }
                 if container.kind == 0xc749 || (container.kind == 0xdead && container.instance == self.char_id as i32) =>
@@ -387,6 +436,65 @@ impl Zone {
 mod tests {
     use super::*;
     use ao_net::n3::world::{AcgItem, InventoryEntry};
+
+    #[test]
+    fn native_10071e95_10046bb5_1012584a_reclaim_projection_and_context() {
+        use ao_net::{wire::Writer, n3::{action, outgoing::n3_frame}};
+        let mut z = Zone::new(7);
+        let mut items = super::super::items::Items::new(std::path::Path::new("/nonexistent/reclaim-fixture"));
+        let acg = |id| AcgItem { low_id: id, high_id: id, level: 1 };
+        items.insert_test_acg(acg(10), &[(30, 0), (0, 0x40)]);
+        items.insert_test_acg(acg(20), &[(30, 0x40), (0, 0)]);
+        let query = Identity { kind: 0xdeae, instance: -123 };
+        let registration = |instance| {
+            let mut w = Writer::default();
+            w.u32(inv::BANK_CORPSE);
+            w.i32(0xc350); w.i32(7); w.u8(1);
+            w.i32(0x3f1 * 5);
+            // Sparse occupied cells: native1002a379 checks cell pointers, not a&1.
+            for (slot, a, id) in [(9, 0, 10), (2, 0x20, 999), (6, 0, 20), (4, 0, 999)] {
+                w.i32(slot); w.i16(a); w.i16(1);
+                w.i32(0); w.i32(0);
+                w.i32(id); w.i32(id); w.i32(1);
+                w.i32(0);
+            }
+            w.i32(instance);
+            n3_frame(0, 0, w.0)
+        };
+        assert_eq!(z.container_inventory(query, |_| None).count(), 0);
+        z.on_frame(&registration(7));
+        assert!(!z.reclaim_registered(), "10071e95 ignores an absent target SimpleChar");
+        z.dynels.insert(7, super::super::super::zone::DynelState {
+            name: String::new(), pos: [0.0; 3], yaw: None, npc: false, side: 0, level: 1, health: 10, max_health: 10,
+        });
+        z.on_frame(&registration(7));
+        assert_eq!(z.reclaim_events, [(Identity { kind: 0xdeae, instance: 7 }, true)]);
+        z.reclaim_events.clear();
+        z.on_frame(&registration(7));
+        assert!(z.reclaim_events.is_empty(), "registered identity is not another open");
+        let rows = z.container_inventory(query, |item| items.acg_stat(item, 30).ok().flatten()).collect::<Vec<_>>();
+        assert_eq!(rows.iter().map(|e| e.slot).collect::<Vec<_>>(), [2, 4, 6, 9]);
+        assert!(rows.iter().all(|e| e.id == Identity { kind: 0x6a, instance: e.slot as i32 }));
+        z.on_frame(&registration(8));
+        assert!(!z.containers.contains_key(&(0xdeae, 7)), "10071e95 replaces the active context");
+        let rows = z.container_inventory(query, |item| items.acg_stat(item, 30).ok().flatten()).collect::<Vec<_>>();
+        assert_eq!(rows.iter().map(|e| e.slot).collect::<Vec<_>>(), [2, 6], "1002ace0: raw0x20 OR resolved Can30&0x40; Flags0 is not Can");
+        assert_eq!(z.containers[&(0xdeae, 8)].1.len(), 4, "projection never filters raw storage");
+        let off = action::simple(0x6e, Identity::default(), Identity::default());
+        z.on_frame(&n3_frame(0, 0, action::character_action(7, &off)));
+        assert_eq!(z.reclaim_events.last(), Some(&(Identity { kind: 0xdeae, instance: 8 }, false)));
+        assert!(z.reclaim_registrations.contains(&7), "off removes only current identity");
+        assert!(!z.reclaim_registrations.contains(&8));
+        assert_eq!(z.container_inventory(query, |_| None).map(|e| e.slot).collect::<Vec<_>>(), [2], "off preserves manager+180 raw data; absent Can still rejects non0x20 rows");
+        z.reclaim_events.clear();
+        z.on_frame(&n3_frame(0, 0, action::character_action(7, &off)));
+        assert!(z.reclaim_events.is_empty(), "duplicate off has no native close");
+        z.on_frame(&registration(7));
+        z.reset_world();
+        assert_eq!(z.container_inventory(query, |_| None).count(), 0);
+        assert!(z.reclaim_registrations.is_empty());
+        assert!(z.reclaim_events.is_empty());
+    }
 
     #[test]
     fn acg_endpoint_can_and_flags_follow_quality_and_tie_high_for_stack_eligibility() {

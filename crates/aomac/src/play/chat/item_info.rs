@@ -21,6 +21,11 @@ fn runtime_quality(zone:&Zone,id:Identity,item:AcgItem,inventory:bool)->Option<i
 fn inventory_item(zone:&Zone,id:Identity,container:Identity)->Option<(AcgItem,i32)> {
     if let Some(e)=zone.inventory.get(&(id.instance as u32)).filter(|e|inv::item_identity(e.slot)==id || e.id==id && id!=Identity::default()) { return Some((e.item,i32::from(e.b as u16))); }
     if let Some(e)=zone.offered_item(id) { return Some((e.item,i32::from(e.b as u16))); }
+    if id.kind == 0x6a {
+        return zone.containers.iter().find(|((kind, _), _)| *kind == 0xdeae)
+            .and_then(|(_, (_, entries))| entries.iter().find(|e| e.slot as i32 == id.instance))
+            .map(|e| (e.item, i32::from(e.b as u16)));
+    }
     if id.kind==inv::KIND_CONTRACT {
         return zone.containers.iter().filter(|((kind,instance),_)|*kind==0xdeaa && (container==Identity::default() || container==Identity{kind:*kind,instance:*instance}))
             .find_map(|(_,(_,entries))|entries.iter().find(|e|e.slot as i32==id.instance).map(|e|(e.item,i32::from(e.b as u16))));

@@ -58,7 +58,7 @@ impl Items {
         self.equip[&key].as_ref().map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    pub(super) fn acg_stat(&mut self, item: AcgItem, stat: u32) -> anyhow::Result<Option<i32>> {
+    pub(in crate::play) fn acg_stat(&mut self, item: AcgItem, stat: u32) -> anyhow::Result<Option<i32>> {
         Ok(self.equip_criteria(item)?.stat(stat))
     }
 

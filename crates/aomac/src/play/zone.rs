@@ -171,6 +171,11 @@ pub struct Zone {
     pub containers: HashMap<(i32, i32), (i32, Vec<ao_net::n3::world::InventoryEntry>)>,
     /// Native inventory access mask (`Inventory_t + 0x24`), supplied by inventory updates.
     pub(super) container_access: HashMap<(i32, i32), i32>,
+    /// GC action manager+80 registration list, distinct from inventory manager+180 data.
+    /// DEAE has a fixed kind; the full remaining identity word is retained.
+    pub(super) reclaim_registrations: std::collections::HashSet<i32>,
+    /// Native GlobalSignals+84/+88 transitions (identity, opened), consumed by Interact.
+    pub(super) reclaim_events: Vec<(Identity, bool)>,
     /// Other players / NPCs as renderer actors (`play/dynels.rs`).
     pub world: super::dynels::Dynels,
     /// Character projection of `InputConfig_t+0xc0`; character-only combat/skill consumers use this.
@@ -443,6 +448,10 @@ impl Zone {
         self.set_target(None);
         self.containers.clear();
         self.container_access.clear();
+        // Native StopPlayfield destroys the own SimpleChar and both its managers,
+        // not merely the visual producer (N3 100076ad/1000ccbd/1000cdcc).
+        self.reclaim_registrations.clear();
+        self.reclaim_events.clear();
         self.trade_state = None;
         self.dynels.clear();
         self.character_stats.clear();
@@ -782,7 +791,11 @@ impl Zone {
                 // Reclaim-off acknowledgment: GC 1005d8ad -> 10046c13 -> 1003f3b2
                 // unregisters the reclaim container. Sending the request alone does not.
                 if a.action == 0x6e {
-                    self.containers.retain(|&(kind, _), _| kind != 0xdeae);
+                    if let Some(instance) = self.containers.keys().find_map(|&(kind, instance)| (kind == 0xdeae).then_some(instance)) {
+                        if self.reclaim_registrations.remove(&instance) && self.own().is_some() {
+                            self.reclaim_events.push((Identity { kind: 0xdeae, instance }, false));
+                        }
+                    }
                 }
                 // GC 1005efdf[action - 1]: 0x3b -> case 0xf, 0x3c -> case 0x10.
                 // Both remove identity_b; only completion plays the own character's side sound.
@@ -864,6 +877,11 @@ impl Zone {
                 }
             }
             N3::Misc(Misc::ToClientQuit) if who.kind == CHAR_KIND => {
+                if who.instance == self.char_id as i32 {
+                    // Own character destruction releases both manager contexts.
+                    self.reclaim_events.extend(self.reclaim_registrations.drain().map(|instance| (Identity { kind: 0xdeae, instance }, false)));
+                    self.containers.retain(|&(kind, _), _| kind != 0xdeae);
+                }
                 self.dynels.remove(&who.instance);
                 self.tip_npc_state.remove(&who.instance);
                 self.character_stats.remove(&who.instance);

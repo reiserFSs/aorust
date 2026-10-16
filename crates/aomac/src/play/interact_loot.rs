@@ -32,6 +32,16 @@ struct Loot {
     tip: Option<(usize, bool, String)>,
 }
 
+impl Loot {
+    fn item_identity(&self, entry: &InventoryEntry) -> Identity {
+        match self.container.kind {
+            0xdead => Identity { kind: 0x69, instance: entry.slot as i32 },
+            0xdeae => Identity { kind: 0x6a, instance: entry.slot as i32 },
+            _ => container_item_identity(self.word, entry.slot),
+        }
+    }
+}
+
 /// `(container, [(container slot, item low id, name)])` of every open window, for the harness and the tests.
 #[cfg(test)]
 pub type LootRows = Vec<(Identity, Vec<(u32, i32, String)>)>;
@@ -114,10 +124,10 @@ impl LootUi {
     pub fn refresh_containers(&mut self, gui: &mut Gui, zone: &super::zone::Zone) {
         for at in 0..self.open.len() {
             let c = self.open[at].container;
-            let Some((_, entries)) = zone.containers.get(&(c.kind, c.instance)) else { continue };
-            if self.open[at].entries != *entries {
-                self.open[at].entries = entries.clone();
-                self.open[at].entries.sort_by_key(|e| e.slot);
+            let items = &mut self.items;
+            if !zone.container_inventory(c, |item| items.as_mut().and_then(|items| items.acg_stat(item, 30).ok().flatten())).eq(self.open[at].entries.iter().copied()) {
+                self.open[at].entries.clear();
+                self.open[at].entries.extend(zone.container_inventory(c, |item| items.as_mut().and_then(|items| items.acg_stat(item, 30).ok().flatten())));
                 self.open[at].tip = None;
                 self.draw(gui, at);
             }
@@ -125,7 +135,14 @@ impl LootUi {
     }
 
     pub fn close_bank(&mut self, gui: &mut Gui) {
-        if let Some(at) = self.open.iter().position(|l| l.container.kind == 0xdead) {
+        if let Some(container) = self.open.iter().find(|l| l.container.kind == 0xdead).map(|l| l.container) {
+            self.close_container(gui, container);
+        }
+    }
+
+    /// GUI100c6b2f: close the matching registered identity only.
+    pub(super) fn close_container(&mut self, gui: &mut Gui, container: Identity) {
+        if let Some(at) = self.open.iter().position(|l| l.container == container) {
             if self.drag.is_some_and(|d| d.source == self.open[at].window) {
                 if let Some(ghost) = self.drag.take().and_then(|d| d.ghost) { gui.close_window(ghost); }
             }
@@ -150,11 +167,21 @@ impl LootUi {
         }
     }
 
+    /// Production updates always query the canonical presentation, never raw storage.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn update_from_zone(&mut self, gui: &mut Gui, dir: Option<&Path>, screen: (u32, u32), zone: &super::zone::Zone, container: Identity, title: &str, u: &InventoryUpdate, owned: bool) {
+        if self.items.is_none() { self.items = dir.map(Items::new); }
+        let items = &mut self.items;
+        let entries = zone.container_inventory(container, |item| items.as_mut().and_then(|items| items.acg_stat(item, 30).ok().flatten())).collect();
+        let projected = InventoryUpdate { entries, capacity: u.capacity, access: u.access, container: u.container, word: u.word, flag: u.flag };
+        self.update(gui, dir, screen, container, title, &projected, owned);
+    }
+
     /// `InventoryUpdateIIR_t` for `container` [GC 0x100a040e]: the contents are replaced; with `u.flag` the container is opened (a window appears
     /// unless one is open already, `SlotContainerOpened`), without it only an open window is refreshed (`+0x8c`, container changed).
     #[allow(clippy::too_many_arguments)]
     pub fn update(&mut self, gui: &mut Gui, dir: Option<&Path>, screen: (u32, u32), container: Identity, title: &str, u: &InventoryUpdate, owned: bool) {
-        let slots = match container.kind { 0xdead => 0x66, 0xdeaa => 100, _ => SLOTS };
+        let slots = match container.kind { 0xdead => 0x66, 0xdeaa | 0xdeae => 100, _ => SLOTS };
         if self.items.is_none() {
             self.items = dir.map(Items::new);
         }
@@ -168,7 +195,7 @@ impl LootUi {
                 let xml = if container.kind == 0xdeaa {
                     // GUI100cdb3a: contracts force name-sorted list mode, max100.
                     format!("<root><MultiListView name=\"contracts\" feature_flags=\"64\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point({w},{})\" max_size=\"Point(16000,16000)\"/></root>", canvas_size_for(SLOTS).1)
-                } else if container.kind == 0xdead {
+                } else if matches!(container.kind, 0xdead | 0xdeae) {
                     format!("<root><ScrollView name=\"scrollview\" v_scrollbar_mode=\"auto\" h_scrollbar_mode=\"auto\" min_size=\"Point({w},1)\" max_size=\"Point(16000,16000)\"><ScrollViewChild view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></ScrollViewChild></ScrollView></root>")
                 } else {
                     format!("<root><View view_layout=\"vertical\"><CanvasView name=\"grid\" min_size=\"Point({w},{h})\" max_size=\"Point({w},{h})\"/></View></root>")
@@ -176,7 +203,7 @@ impl LootUi {
                 // [UNRESOLVED guess] bank's saved InventoryView frame is not loaded here:
                 // reuse the existing three-column viewport until bank config persistence is ported.
                 // Searched GUI 0x100cc2ca/0x100cdb3a and shipped CharPrefs.xml; capacity, not initial viewport, is fixed by code.
-                let size = if container.kind == 0xdead { WindowSize::Fixed(w, canvas_size_for(SLOTS).1) } else { WindowSize::Preferred };
+                let size = if matches!(container.kind, 0xdead | 0xdeae) { WindowSize::Fixed(w, canvas_size_for(SLOTS).1) } else { WindowSize::Preferred };
                 let Ok(window) = gui.open_tabbed_window_xml("LootView", title, &xml, (0, 0), size) else { return };
                 let (ow, oh) = gui.outer_size(window);
                 // `Window::MoveToCenter` is the default of a window without a saved frame (`container_position` is not stored)
@@ -250,7 +277,7 @@ impl LootUi {
             };
             if loot.tip.as_ref().is_some_and(|(old, enabled, _)| *old == cell && *enabled == descriptions) { continue; }
             let body = if descriptions {
-                let request = super::chat::ItemRequest::Identity { id: container_item_identity(loot.word, entry.slot), shop: false, container: loot.container };
+                let request = super::chat::ItemRequest::Identity { id: loot.item_identity(&entry), shop: false, container: loot.container };
                 match super::chat::item_html(zone, &request, text) {
                     Ok(body) => body.unwrap_or_default(),
                     Err(error) => { eprintln!("container tooltip: {error:#}"); String::new() }
@@ -309,7 +336,7 @@ impl LootUi {
             Event::CanvasPress { window, view, x, y, button, .. } if view == "grid" => {
                 let l = self.open.iter_mut().find(|l| l.window == *window)?;
                 let Some(n) = cell_at_for(*x, *y, l.slots).filter(|&n| n < l.entries.len()) else { return Some(None) };
-                let item = if l.container.kind == 0xdead { Identity { kind: 0x69, instance: l.entries[n].slot as i32 } } else { container_item_identity(l.word, l.entries[n].slot) };
+                let item = l.item_identity(&l.entries[n]);
                 if *button == ao_gui::MouseButton::Left && self.info_click {
                     l.clicked = None;
                     self.info_urls.push(format!("itemid://{}/{}", item.kind, item.instance));
@@ -364,7 +391,7 @@ impl LootUi {
                 let Some(n) = cell_at_for(*x, *y, l.slots).filter(|&n| n < l.entries.len()) else { return Some(None) };
                 let double = l.clicked.is_some_and(|(c, t)| c == n && now - t <= ao_gui::DOUBLE_CLICK_TIME);
                 l.clicked = if double { None } else { Some((n, now)) };
-                Some(double.then(|| if l.container.kind == 0xdead { Identity { kind: 0x69, instance: l.entries[n].slot as i32 } } else { container_item_identity(l.word, l.entries[n].slot) }))
+                Some(double.then(|| l.item_identity(&l.entries[n])))
             }
             Event::CloseRequested { window } | Event::Escape { window } if self.open.iter().any(|l| l.window == *window) => {
                 let i = self.open.iter().position(|l| l.window == *window)?;

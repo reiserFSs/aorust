@@ -1416,6 +1416,9 @@ mod tests {
         let texts = TextDb::load(&client).unwrap();
         let mut chat = Chat::new(false);
         let mut zone = Zone::new(7);
+        zone.dynels.insert(7, crate::play::zone::DynelState {
+            name: String::new(), pos: [0.0; 3], yaw: None, npc: false, side: 0, level: 1, health: 10, max_health: 10,
+        });
         // BankCorpseIIR_t: own header, empty inventory vector, reclaim instance 9.
         let registration = n3_frame(0, 0, vec![
             0x52, 0x21, 0x34, 0x20, 0, 0, 0xc3, 0x50, 0, 0, 0, 7, 1,

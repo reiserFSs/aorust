@@ -255,6 +255,21 @@ impl Interact {
         (BAG_FIRST..BAG_FIRST + BAG_SLOTS).all(|s| zone.inventory.contains_key(&s))
     }
 
+    /// Native action-manager registration transitions, not dataset arrival.
+    pub(super) fn watch_reclaim_events(&mut self, gui: &mut Gui, zone: &mut Zone) {
+        for at in 0..zone.reclaim_events.len() {
+            let (container, opened) = zone.reclaim_events[at];
+            let ui = &mut self.use_ui;
+            if opened {
+                let u = inventory::InventoryUpdate { capacity: 100, access: 3, entries: vec![], container, word: 0, flag: true };
+                ui.loot.update_from_zone(gui, ui.dir.as_deref(), self.screen, zone, container, "Reclaim", &u, false);
+            } else {
+                ui.loot.close_container(gui, container);
+            }
+        }
+        zone.reclaim_events.clear();
+    }
+
     /// Every decoded zone frame: corpse names, and `InventoryUpdateIIR_t` for a container that is not the own character's (`FUN_100a040e` [GC 0x100a040e]:
     /// the header must be a character, the container a `Chest_t`; the contents are replaced, the window opens with the message's flag).
     pub(super) fn watch_objects(&mut self, gui: &mut Gui, m: &Message, zone: &Zone) {
@@ -263,7 +278,13 @@ impl Interact {
                 let container = Identity { kind: 0xdead, instance: self.own as i32 };
                 let u = inventory::InventoryUpdate { capacity: 0x66, access: 3, entries: entries.clone(), container, word: 0, flag: true };
                 let ui = &mut self.use_ui;
-                ui.loot.update(gui, ui.dir.as_deref(), self.screen, container, "Bank", &u, false);
+                ui.loot.update_from_zone(gui, ui.dir.as_deref(), self.screen, zone, container, "Bank", &u, false);
+            }
+            N3::Inventory(InventoryMsg::Reclaim { .. }) if m.header.target == self.own_id() => {
+                // Replacing manager+180 refreshes every existing DEAE consumer,
+                // including older identities; an already registered identity
+                // must not reopen a window the user closed.
+                self.use_ui.loot.refresh_containers(gui, zone);
             }
             N3::World(World::Corpse(c)) => {
                 let name = c.base.blob.split(|&b| b == 0).next().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
@@ -279,7 +300,7 @@ impl Interact {
                         if let Some(name) = ui.loot.item_title(gui, ui.dir.as_deref(), entry.item) { title = name; }
                     }
                 }
-                ui.loot.update(gui, ui.dir.as_deref(), self.screen, u.container, &title, u, owned);
+                ui.loot.update_from_zone(gui, ui.dir.as_deref(), self.screen, zone, u.container, &title, u, owned);
             }
             // the server's answer to the take: `{0x6b, word << 16 | slot}` goes into our bag, the corpse list loses it (zone side: `Zone::apply_inventory`)
             N3::Inventory(InventoryMsg::ContainerAdd { item, container, .. })
@@ -338,6 +359,79 @@ mod tests {
     use ao_net::n3::outgoing::{message_key, n3_frame};
 
     const DOOR: Identity = Identity { kind: 0xC748, instance: 0x1234 };
+
+    #[test]
+    fn native_reclaim_registration_opens_projected_container_and_withdraws_kind_6a() {
+        use ao_net::wire::Writer;
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/gui").exists() { return; }
+        let mut gui = Gui::new(&dir, None).unwrap();
+        let mut zone = Zone::new(7);
+        zone.dynels.insert(7, super::super::zone::DynelState {
+            name: String::new(), pos: [0.0; 3], yaw: None, npc: false, side: 0, level: 1, health: 10, max_health: 10,
+        });
+        let mut interact = Interact::new(7, (800, 600));
+        let registration = |instance| {
+            let mut w = Writer::default();
+            w.u32(inventory::BANK_CORPSE);
+            w.i32(DYNEL_CHAR); w.i32(7); w.u8(1);
+            w.i32(0x3f1 * 3);
+            for (slot, flags) in [(9, 1), (2, 0x21)] {
+                w.i32(slot); w.i16(flags); w.i16(1);
+                w.i32(0); w.i32(0);
+                w.i32(10); w.i32(10); w.i32(1);
+                w.i32(0);
+            }
+            w.i32(instance);
+            n3_frame(0, 0, w.0)
+        };
+        let frame = registration(7);
+        zone.on_frame(&frame);
+        interact.on_frame(&mut gui, &frame, &mut zone);
+        assert!(interact.use_ui.loot.is_open(Identity { kind: 0xdeae, instance: 7 }));
+        assert_eq!(interact.loot_entry_id(0), Some(Identity { kind: 0x6a, instance: 2 }));
+        assert_eq!(interact.loot_entry_id(1), Some(Identity { kind: 0x6a, instance: 9 }));
+        let first = Identity { kind: 0xdeae, instance: 7 };
+        let first_window = interact.use_ui.loot.window_of(first).unwrap();
+        zone.on_frame(&frame);
+        interact.on_frame(&mut gui, &frame, &mut zone);
+        assert_eq!(interact.use_ui.loot.window_of(first), Some(first_window));
+        let frame = registration(8);
+        zone.on_frame(&frame);
+        interact.on_frame(&mut gui, &frame, &mut zone);
+        interact.use_ui.loot.refresh_containers(&mut gui, &zone);
+        assert_eq!(interact.loot_entry_id(1), None, "existing consumers refresh through native conditional query");
+        let second = Identity { kind: 0xdeae, instance: 8 };
+        assert!(interact.use_ui.loot.is_open(second));
+        let off = n3_frame(0, 0, ao_net::n3::action::character_action(7, &ao_net::n3::action::simple(0x6e, Identity::default(), Identity::default())));
+        zone.on_frame(&off);
+        interact.on_frame(&mut gui, &off, &mut zone);
+        assert!(!interact.use_ui.loot.is_open(second), "100117f6/+88 closes matching current identity");
+        assert!(interact.use_ui.loot.is_open(first), "older registered window is not current");
+        assert_eq!(interact.loot_entry_id(1), None, "older identity still queries current manager+180 data");
+        assert!(interact.loot_take(&mut gui, &mut zone, 0));
+        assert_eq!(payloads(&mut interact), [inventory::move_item_to_inventory(7, Identity { kind: 0x6a, instance: 2 }, ANY_BAG_SLOT)]);
+        zone.apply_inventory(&InventoryMsg::ContainerAdd { item: Identity { kind: 0x6a, instance: 2 }, container: Identity { kind: DYNEL_CHAR, instance: 7 }, slot: 90 });
+        assert_eq!(zone.inventory[&BAG_FIRST].item.low_id, 10, "10046b0b ignores destination slot");
+        interact.use_ui.loot.refresh_containers(&mut gui, &zone);
+        assert_eq!(interact.loot_entry_id(0), None);
+        interact.use_ui.loot.event(&mut gui, &ao_gui::Event::CloseRequested { window: first_window }, 2.0);
+        let frame = registration(7);
+        zone.on_frame(&frame);
+        interact.on_frame(&mut gui, &frame, &mut zone);
+        assert!(!interact.use_ui.loot.is_open(first), "user-close plus repeated registered dataset must not reopen");
+        zone.on_frame(&off);
+        interact.on_frame(&mut gui, &off, &mut zone);
+        zone.on_frame(&frame);
+        interact.on_frame(&mut gui, &frame, &mut zone);
+        assert!(interact.use_ui.loot.is_open(first), "unregister then register is a genuine open");
+        let quit = n3_frame(0, 0, Misc::ToClientQuit.encode(Identity { kind: DYNEL_CHAR, instance: 7 }, 0));
+        zone.on_frame(&quit);
+        interact.on_frame(&mut gui, &quit, &mut zone);
+        assert!(!interact.use_ui.loot.is_open(first), "own character destruction ends registration context");
+        assert!(!zone.reclaim_registered());
+        assert!(!zone.containers.keys().any(|&(kind, _)| kind == 0xdeae));
+    }
 
     fn payloads(i: &mut Interact) -> Vec<Vec<u8>> {
         i.take_outbox().into_iter().map(|f| f.payload).collect()
@@ -462,7 +556,7 @@ mod tests {
         assert_eq!(payloads(&mut i).len(), 1);
     }
 
-    /// `InventoryUpdateIIR_t` (header = the own character) for the corpse `{0xC76A, 5}`: capacity 0x15, kind 0, `items` = (slot, item id), word 0x70, flag.
+    /// `InventoryUpdateIIR_t` for corpse `{0xC76A, 5}`: capacity0x15, access3 (withdraw/deposit), word0x70 and open flag.
     fn loot_frame(own: u32, items: &[(u32, i32)], flag: bool) -> ao_net::frame::Frame {
         let mut b = vec![];
         let put = |b: &mut Vec<u8>, v: u32| b.extend(v.to_be_bytes());
@@ -471,7 +565,7 @@ mod tests {
         put(&mut b, own);
         b.push(0);
         put(&mut b, 0x15);
-        put(&mut b, 0);
+        put(&mut b, 3);
         put(&mut b, (items.len() as u32 + 1) * 0x3f1);
         for &(slot, id) in items {
             put(&mut b, slot);
@@ -533,9 +627,13 @@ mod tests {
         let mut i = Interact::new(0x6584, (1280, 800));
         i.set_client_dir(client);
         let corpse = Identity { kind: 0xC76A, instance: 5 };
-        i.on_frame(&mut gui, &loot_frame(0x6584, &[(0, 21_797), (4, 21_797)], false), &mut zone);
+        let update = loot_frame(0x6584, &[(0, 21_797), (4, 21_797)], false);
+        zone.on_frame(&update);
+        i.on_frame(&mut gui, &update, &mut zone);
         assert!(i.loot_dump(&mut gui).is_empty(), "no window without the open flag");
-        i.on_frame(&mut gui, &loot_frame(0x6584, &[(0, 21_797), (4, 21_797)], true), &mut zone);
+        let update = loot_frame(0x6584, &[(0, 21_797), (4, 21_797)], true);
+        zone.on_frame(&update);
+        i.on_frame(&mut gui, &update, &mut zone);
         let dump = i.loot_dump(&mut gui);
         assert_eq!(dump.len(), 1);
         assert_eq!((dump[0].0, dump[0].1.len()), (corpse, 2));
@@ -571,7 +669,9 @@ mod tests {
             let (_, dir, hex) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
             if dir == "<" {
                 let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
-                i.on_frame(&mut gui, &ao_net::frame::Frame::decode_with(&b, false).unwrap().unwrap().0, &mut zone);
+                let frame = ao_net::frame::Frame::decode_with(&b, false).unwrap().unwrap().0;
+                zone.on_frame(&frame);
+                i.on_frame(&mut gui, &frame, &mut zone);
                 rows.push(i.loot_dump(&mut gui).iter().map(|(_, r)| r.len()).sum::<usize>());
             }
         }
