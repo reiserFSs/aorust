@@ -147,15 +147,22 @@ fn add_outdoor_liquid(p: [[f32; 3]; 3], kind: u32, out: &mut Vec<(Tri, u32)>) ->
     anyhow::ensure!(out.len() < 1_000_000, "implausible liquid collision triangle count");
     if area > 10_000.0 {
         let [a, b, c] = p;
-        let midpoint = |a, b| scale_v(add_v(a, b), 0.5);
+        // Native stores subtraction, division and addition separately; the reverse
+        // edge midpoint need not round to the same f32 as the forward midpoint.
+        let midpoint = |a, b| add_v(a, scale_v(sub(b, a), 0.5));
         let (ab, bc, ca) = (midpoint(a, b), midpoint(b, c), midpoint(c, a));
-        for child in [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]] {
+        for child in [[a, ab, midpoint(a, c)], [b, bc, midpoint(b, a)], [c, ca, midpoint(c, b)], [ab, bc, ca]] {
             add_outdoor_liquid(child, kind, out)?;
         }
-    } else if let Some(mut tri) = Tri::from_world(p[0], p[1], p[2]) {
+    } else if n.iter().any(|v| v.abs() >= 1e-5) {
+        // DS 0x10039f14 zeros normals whose every component is below 1e-5.
+        let Some(mut tri) = Tri::from_world(p[0], p[1], p[2]) else { return Ok(()) };
         // DS 0x1003a0d6 rejects centroids outside its 60×60, 100 m bucket index.
-        let x = ((p[1][0] + p[0][0] + p[2][0]) / 3.0) as f64 / 100.0;
-        let z = ((p[1][2] + p[0][2] + p[2][2]) / 3.0) as f64 / -100.0;
+        // x87 sums/divides without intermediate f32 stores, then stores the
+        // centroid before dividing by the double bucket-size constants.
+        let centroid = |axis: usize| ((p[1][axis] as f64 + p[0][axis] as f64 + p[2][axis] as f64) / 3.0) as f32;
+        let x = centroid(0) as f64 / 100.0;
+        let z = centroid(2) as f64 / -100.0;
         let bucket = (x as i64).wrapping_sub((z as i64).wrapping_mul(60)) as u64;
         if bucket >= 3600 { return Ok(()); }
         if tri.n[1] < 0.0 { tri.n = tri.n.map(|v| -v); }
@@ -758,32 +765,34 @@ fn room_floor(g: &super::dungeon::Gnda, room: &Room, id: u16, out: &mut Vec<Tri>
     }
 }
 
-/// `PlayfieldAnarchy_t::GetSafePos` for a room (Gamecode @0x10121815): the room centre with `y` forced to the highest of the four tile
-/// corner heights (`n3Room_t::ForcePosInY` @0x100112cb) when the centre tile is walkable, else the centre of the first walkable tile
-/// (x outer, z inner, `GetAPosInRoom` @0x100111a0; its height uses the same corner rule: [GUESS], `GetTileCenterGlobalPos` not decoded).
+/// `PlayfieldAnarchy_t::GetSafePos` (GC 0x10121815): centre with max-corner Y
+/// (`ForcePosInY`, N3 0x100112cb), else first walkable tile in x/z order
+/// (`GetAPosInRoom`, 0x100111a0). Its centre uses that tile's DHGA sample,
+/// not the max-corner height (`GetTileCenterGlobalPos`, 0x10010895).
 fn room_safe_pos(g: &Gnda, room: &Room, min_floor: f32) -> [f32; 3] {
     let [x1, z1, x2, z2] = room.rect.map(|v| v as i32);
     let (wp, hp) = ((((x2 - x1 - 1) & !1) + 1), (((z2 - z1 - 1) & !1) + 1));
     let h = |x: i32, z: i32| {
         let (x, z) = (x.max(0).min(g.w as i32 - 1) as usize, z.max(0).min(g.h as i32 - 1) as usize);
-        g.floor[z * g.w + x] as f32 * g.height_scale - min_floor + room.pos[1]
+        g.floor[z * g.w + x] as f32 * g.height_scale
     };
     let walkable = |tx: i32, tz: i32| tx >= 0 && tz >= 0 && (tx as usize) < g.w && (tz as usize) < g.h && g.ty[tz as usize * g.w + tx as usize] & 0x7f != 0;
     let top = |tx: i32, tz: i32| h(tx, tz).max(h(tx - 1, tz)).max(h(tx - 1, tz - 1)).max(h(tx, tz - 1));
     let (c, s) = [(1.0f32, 0.0f32), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)][(room.rot & 3) as usize];
-    let (ctx, ctz) = ((x1 * 2 + wp + 1).div_euclid(2), (z1 * 2 + hp + 1).div_euclid(2));
+    let (ox, oz) = (wp as f32 * 0.5 * g.cell + 1.0, hp as f32 * 0.5 * g.cell + 1.0);
+    let (ctx, ctz) = (x1 + (ox / g.cell) as i32, z1 + (oz / g.cell) as i32);
     if walkable(ctx, ctz) {
-        return [room.pos[0], top(ctx, ctz), -room.pos[2]];
+        return [room.pos[0], (top(ctx, ctz) - min_floor) + room.pos[1], -room.pos[2]];
     }
     for tx in x1..x2 {
         for tz in z1..z2 {
             if walkable(tx, tz) {
-                let (dx, dz) = (tx as f32 * 2.0 + 1.0 - x1 as f32 * 2.0 - (wp + 1) as f32, tz as f32 * 2.0 + 1.0 - z1 as f32 * 2.0 - (hp + 1) as f32);
-                return [room.pos[0] + dx * c + dz * s, top(tx, tz), -(room.pos[2] - dx * s + dz * c)];
+                let (dx, dz) = (((tx - x1) as f32 + 0.5) * g.cell - ox, ((tz - z1) as f32 + 0.5) * g.cell - oz);
+                return [room.pos[0] + dx * c + dz * s, (h(tx, tz) - min_floor) + room.pos[1], -(room.pos[2] - dx * s + dz * c)];
             }
         }
     }
-    [room.pos[0], room.pos[1], -room.pos[2]]
+    [0.0; 3]
 }
 
 #[cfg(test)]
@@ -891,6 +900,86 @@ mod tests {
         add_outdoor_liquid([[0.0, 2.0, 0.0], [200.0, 2.0, 0.0], [0.0, 2.0, 200.0]], 2, &mut split).unwrap();
         assert_eq!(split.len(), 4);
         assert!(split.iter().all(|(t, _)| t.n[1] > 0.0));
+        let mut tiny = Vec::new();
+        add_outdoor_liquid([[0.0, 2.0, 0.0], [0.001, 2.0, 0.0], [0.0, 2.0, 0.001]], 0, &mut tiny).unwrap();
+        assert!(tiny.is_empty(), "DS 10039f14 rejects sub-1e-5 cross-product components");
+    }
+
+    /// Installed GNDA fixture; the altered DHGA/DCGA cells isolate N3 10010895
+    /// from 100112cb without depending on a particular generated room's shape.
+    #[test]
+    fn installed_room_safe_position_distinguishes_tile_sample_from_max_corner() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let store = RecordStore::open(&dir).unwrap();
+        let raw = store.get(RECORD, 4604).unwrap().unwrap();
+        let rec = record::parse(&raw).unwrap();
+        let mut g = parse_gnda(&store.get(TILEMAP, rec.tilemap).unwrap().unwrap()).unwrap();
+        let mut room = rec.rooms[0].clone();
+        assert!(g.w > 4 && g.h > 4);
+        room.rect = [1, 1, 4, 4];
+        room.pos = [100.0, 0.25, 200.0];
+        g.ty.fill(0);
+        g.floor.fill(0);
+        g.cell = 2.0;
+        g.height_scale = 0.5;
+        g.ty[g.w + 1] = 1;
+        g.floor[g.w + 1] = 2;
+        g.floor[0] = 8; // highest corner, but NOT the first tile's own sample
+        let expected = [[97.0, -0.75, -197.0], [97.0, -0.75, -203.0],
+                        [103.0, -0.75, -203.0], [103.0, -0.75, -197.0]];
+        for (rot, want) in expected.into_iter().enumerate() {
+            room.rot = rot as u8;
+            assert_eq!(room_safe_pos(&g, &room, 2.0), want, "N3 10010895, rotation {rot}");
+        }
+        // The centre path still takes max(raw corners), then subtracts minFloor
+        // and finally adds posY, with f32 stores between these operations.
+        g.ty[3 * g.w + 3] = 1;
+        g.floor[2 * g.w + 2] = 10;
+        assert_eq!(room_safe_pos(&g, &room, 2.0), [100.0, 3.25, -200.0]);
+        g.ty.fill(0);
+        assert_eq!(room_safe_pos(&g, &room, 2.0), [0.0; 3], "N3 100111a0 empty room");
+    }
+
+    #[test]
+    fn installed_outdoor_liquid_creation_binds_authored_sources_to_queries() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let dir = std::path::PathBuf::from(home).join("Games/ProjectRubiKa/client");
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        let store = RecordStore::open(&dir).unwrap();
+        let c = Collision::load(&store, 566).unwrap();
+        assert!(c.terrain.is_some(), "GC 100b7f61 uses the playfield's own tilemap");
+        let raw = store.get(RECORD, 566).unwrap().unwrap();
+        let rec = record::parse(&raw).unwrap();
+        let sources = water::parse(&mut Rd::new(&raw, rec.tail)).unwrap();
+        let mut infos = Vec::new();
+        for source in sources.iter().filter(|w| w.kind & 1 == 0) {
+            for indices in &source.tris {
+                add_outdoor_liquid(indices.map(|i| source.verts[i as usize]), source.kind, &mut infos).unwrap();
+            }
+        }
+        assert!(!infos.is_empty(), "installed playfield 566 has authored collision sources");
+        assert_eq!(infos.len(), c.liquids.len(), "DS 10039b5a emits one info per accepted leaf triangle");
+        let mut queried = false;
+        for ((t, kind), (loaded, loaded_kind)) in infos.iter().zip(&c.liquids) {
+            assert_eq!((t.a, t.b, t.c, t.n, kind), (loaded.a, loaded.b, loaded.c, loaded.n, loaded_kind));
+            let p = [t.a[0] * 0.23 + t.b[0] * 0.31 + t.c[0] * 0.46, -0.5,
+                     t.a[2] * 0.23 + t.b[2] * 0.31 + t.c[2] * 0.46];
+            let level = t.y_at(p[0], p[2]);
+            let depth = if kind >> 5 == 0 { 100_000.0 } else { (kind >> 5) as f32 / 10.0 };
+            let single = Collision::build(Vec::new(), None, None, vec![(*t, *kind)]);
+            if level > 0.0 && level - depth < p[1] && t.liquid_contains_xz(p[0], p[2]) {
+                assert_eq!(single.liquid_at(p).unwrap().kind, *kind & 0x1f);
+                let upper_y = t.a[1].max(t.b[1]).max(t.c[1]);
+                assert!(single.liquid_at([p[0], upper_y, p[2]]).is_none(), "DS 10039d3c uses the triangle's upper Y, not the local plane height");
+                assert!(single.liquid_at([p[0], level - depth, p[2]]).is_some(), "N3 1001abe8 includes depth equality");
+                assert!(single.liquid_at([p[0], level - depth - 1.0, p[2]]).is_none(), "below authored depth");
+                assert!(single.liquid_at(t.a).is_none(), "strict triangle edge");
+                queried = true;
+            }
+        }
+        assert!(queried, "native query construction accepts an installed source at negative queryY");
     }
 
     #[test]

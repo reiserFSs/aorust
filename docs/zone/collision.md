@@ -33,10 +33,50 @@ The port builds the same collision-only subdivision/order and uses these strict/
 Testing triangle membership against this ordered list is equivalent to restricting it to
 the registered zone list: every containing collision triangle was registered into the
 point's zone by the bounding-rectangle registration.
+Depth equality is **included**, unlike polygon edges and the upper Y boundary:
+outdoor `0x1001abdb..0x1001abeb` and dungeon `0x1001a847..0x1001a857`
+compare `level - depth` against query Y, then `TEST AH,0x41; JP miss`.
+Either less-than (C0) or equality (C3) has odd parity and returns the level;
+greater-than/unordered misses. The canonical query owner corrects the shared
+predicate to `level - depth <= queryY`; no second query implementation is needed.
+
+**[CODE] Creation re-traced:** DS `0x10039b5a` initializes **one** `0x6c`-byte
+`WaterCollisionInfo_t` per accepted leaf triangle, not an aggregate water surface:
+`+0/+4/+8` are maximum XYZ, `+0x44/+0x4c` minimum XZ, `+0xc..+0x2c`
+the three vertices, `+0x30` low-five-bit kind, `+0x34` authored depth,
+`+0x38..+0x40` upward normal, `+0x50` plane offset and `+0x54..+0x68`
+the three edge differences. Thus the port's per-triangle maximum Y was already correct.
+`0x10039f14` swaps B/C for downward winding and rejects a cross product when
+**all** components are below `1e-5` (f32 `0x1008c02c`); the port now retains
+that creation gate. `0x1003a3b4` computes directional midpoints as
+`a + ((b-a)/2)`, with stored f32 subtraction/division/addition, not `(a+b)/2`;
+opposite edges can round differently. The centroid calculation at
+`0x1003a0dc..0x1003a120` stores only after the three-coordinate sum/division
+by 3, then divides that f32 by the double bucket size.
+
+GC `0x100b7f61` constructs `VisualWater_t` with the loaded playfield's
+`GetGroundData`, width, height, height scale and cell size; collision-info vertices
+remain the authored triangle coordinates. Terrain data is not a replacement
+surface or another liquid scanner. N3 `GetLiquidSurfaceHeight` `0x1000cb1e`
+vetoes the point before replacing the `-1` height sentinel with query Y.
+The canonical wildlife helper reuses `liquid_at`/`liquid_probe` for this path.
+DS misses reset its transient cache height to **-100000** (`0x1008c028`);
+`GetPreviousLiquidCollisionTestData` `0x10039e97` consumes and resets that height
+but copies the last normal/kind. N3 zone/playfield misses (`0x1001abc5`,
+`0x1000cb1e`) instead clear the shared cache height to zero before returning
+their no-liquid sentinel. The port represents the missing query/cache payload
+with `None`, not a fabricated surface. This is distinct from Vehicle's
+dry-medium/submersion sentinel.
+
+Verified in the release workspace gate: `installed_outdoor_liquid_creation_binds_authored_sources_to_queries`
+loads playfield record 566, checks authored source/leaf ordering against the loaded
+collision and exercises negative query Y, strict surface/edge boundaries and inclusive depth equality.
+The small-normal creation gate is also covered by
+`outdoor_liquids_use_authored_order_depth_and_strict_edges`.
 
 `outdoor_liquids_use_authored_order_depth_and_strict_edges` covers first-not-highest
 selection, depth-failure short circuit, low-five-bit flags, excluded edges, four-child
-subdivision and upwards normal. It was added but not run by the implementation worker.
+subdivision and upwards normal. It passed in the same release workspace gate.
 
 **[CODE/DATA]** Shadow `GC 0x100ecee4` reads VisualEnvFX sun Light `+0x104`.
 DisplaySystem's GAME tweak update `FUN_1005cdcf` (the `TweakedSunDirection` variable copy to Light
@@ -172,12 +212,32 @@ Tile floor: atlas tile `(tx, tz)` (tile = 2 m; `rect.x1 + floor(local/2)`), corn
 `A = (tx*2, h(tx-1,tz-1))`, `B = (tx*2+2, h(tx,tz-1))`, `C = (tx*2+2, h(tx,tz))`, `D = (tx*2, h(tx-1,tz))` with
 `h = DHGA * height_scale - room.min_floor` (indices clamped at 0; `FUN_10016454` @0x10016454) + the room's `pos.y`;
 triangles `(A,C,D)` for `dx <= dz` else `(A,B,C)` (diagonal A-C; the alternative diagonal needs bit 14 `0x4000` of the tile word,
-which the 8 bit `DCGA` layer never has **[GUESS]**). The ray is cast from `y + 100` (`_DAT_1003d5a0` f64 100.0) straight down onto
+which the 8 bit `DCGA` layer cannot supply; no alternative-diagonal authored fixture is available). The ray is cast from `y + 100` (`_DAT_1003d5a0` f64 100.0) straight down onto
 that plane; the KD surface of the room (`piVar1 = room+8`) is asked with a 1 m downward ray (`FUN_1002e48e`: `param_3[1] = 1.0`)
 and its hit wins when it is higher (`local_c <= local_a0`); finally `y` is clamped to `[0.001, 1999.9]`.
 World placement of an atlas point: `pos + Ry(rot) (atlas - rect.origin*2 - (W'+1, H'+1))`, `y + pos.y`
 (`CalcGlobalFromLocalPos` @0x109b6, `W' = ((x2-x1-1) & !1) + 1`; same frame as `room_contains`). **[DATA]** In 4604 the KD volumes
 of the hall contain no floor at the spawn (rays hit only the hull top at y 54 and the ceiling at 9.56): the floor is the tile surface.
+
+**[CODE] Safe positions:** GC `GetSafePos` `0x10121815` first tries room 0's
+centre and N3 `ForcePosInY` `0x100112cb`. That path compares the four raw
+`FUN_10016454` DHGA samples, stores the maximum as f32, subtracts room minimum,
+then adds room Y. If the centre tile is empty, `GetAPosInRoom` `0x100111a0`
+searches x outer/z inner and calls `GetTileCenterGlobalPos` `0x10010895`:
+its Y uses **only DHGA(tx,tz)**, not the highest corner or a triangle interpolation.
+Its XZ starts at `((tile-rectStart)+0.5)*cell`, subtracts the stored room
+half-extent times cell plus `(1,0,1)`, rotates, then adds room position.
+If no tile is walkable, `GetAPosInRoom` returns `(0,0,0)`, not room position.
+The shared `room_safe_pos` now distinguishes these paths. Regression
+`installed_room_safe_position_distinguishes_tile_sample_from_max_corner`
+uses installed playfield 4604's GNDA with isolated DHGA/DCGA edits, covers all
+four room rotations, negative resulting Y, the centre/max-corner path and
+the empty-room return; passed in the release workspace gate.
+The rotation tables used here and by floor collision (`0x1005c6c0`,
+`0x1005c710`) are initialized at `0x1003afac`/`0x1003b042` with angles
+0, pi/2, pi, 3pi/2 (f32 constants `0x1003ccf8`, `0x1003ccfc`, `0x1003cf18`).
+Do not apply that rotation to room **liquid collision**: its separate
+`0x1001a9c5` zero multiplier remains a native collision/render quirk.
 
 ### 3.3 Dungeon walls = room membership, door rule
 `n3RoomSurface_t::VetoPosition` @0x10015587 keeps the fractional part of x / z inside `[0.01, 0.99]` (f64 @0x1003d628 / @0x1003d368), clamps to
@@ -263,13 +323,13 @@ Closed (AfCollision):
 * **Room liquids** (N3 `FUN_10012803` @0x10012803 room reader): `u32 (n+1)*0x3f1` (else "broken water data"), per liquid `kind, nv, nv x vec3 (y snapped to 1 cm), nt, nt x 3 u16`; even kinds with `nv != 3` become a fan around the vertex centroid. `n3Zone_t::AddLiquidCollisionData` @0x1001a9c5 multiplies the rotation `rot*pi/2` by the f64 constant 0.0 @0x1003cb08: vertices are room-local, **never rotated** (world = `room.pos + v`; verified on data). `FUN_1000b0d1` skips odd kinds. Test: `n3Zone_t::PerformLiquidCollisionTest` @0x1001a80c / `FUN_1000b498`: first triangle holding x/z with `ground.y < top` and local plane height > 0; counts when `level - depth <= y`, `depth = (kind>>5)/10` (none: 1e5). The inclusive lower bound is proved by dungeon assembly `1001a847–1001a857` and outdoor `1001abdb–1001abeb` (`FCOMPP; TEST AH,0x41; JP miss`). `Collision::liquid_probe`, `Room::waters`; outdoor construction/order is documented above, not a highest-surface query.
 * **Liquid medium** (`Vehicle+0xfc`, EnsureSurfaceAlignment tail 0x1000dd8c..): `vehicle.rs::medium`; modes 0..4, wade threshold `+0x100` = 1.19 (ctor), `+0x120` callback flag, `+0x10c` submersion. Player vehicle: mode 0 (no writer exists); callbacks `+0x80` = `FUN_1006f99e` (clear MechData, Transition 0x1a), `+0x84` = `FUN_1006ef74` (Transition 0x23); wired in `Movement::liquid_callbacks`; SwitchToSwim also writes WaitState 0.
 * **VetoRoomTransition radius** = `dynel->vtbl[+0x10]` = `n3Dynel_t::GetBodyCollSphereRadi` @0x10004dd3: torso `CollPrim` radius from `n3VisualDynel_t::UpdateCollision` @0x10019be4 (model torso sphere x body scale, 0.5 if negative). `SurfaceState::radius` defaults to 0.5. **Torso sphere** (verified): `VisualCATMesh_t::GetTorsoSphereRadi` @DisplaySystem 0x10072c22 = `this+0xbc`, set by `FUN_1007494b` from the CAT resource wrapper `+0x30` (4 floats: radius, x, y, z), which `FUN_10071ae2` reads with `FUN_1006aab4` from the **one `u32` after the part table** (the word `CatMesh::parse` used to skip): four signed bytes `c`, each `0.05 c + 6e-6 c^3` (`FUN_1006aa89`; byte 0..2 = x, y, z, byte 3 = radius) = `CatMesh::torso_sphere`; NOT `col_spheres[0]`. Wired: `Avatar::body_radius` (x body scale, 0.5 if negative) -> `Movement::set_body_radius` (kept across `teleport`). Push-back is `last + dir*0.1*R/2`, else `last - nudge`, else `GetSafePos`; standstill uses the backwards heading vector.
-* **GetSafePos** (`playfield+0x44` = resource `+0x4c`, zero from the ctor, never written): room 0, centre, y = max of 4 tile corners; not the last position. **Dynel `+0x74/+0x78`** = parent dynel id (`SetParentDynelID`); veto skipped while parented (`SurfaceState::parented`).
+* **GetSafePos** (`playfield+0x44` = resource `+0x4c`, zero from the ctor, never written): room 0, centre with max-corner Y if walkable, otherwise first walkable tile with its own DHGA Y (empty room: zero vector); not the last position. **Dynel `+0x74/+0x78`** = parent dynel id (`SetParentDynelID`); veto skipped while parented (`SurfaceState::parented`).
 * **Per-cell closest**: KD triangles are tagged with their zone/room; the closest-point query only sees the surface of the position's zone (`n3TilemapSurface_t::CalculateClosestPoint` @0x10018f0c `GetSurfaceForCell`).
 
 Open:
 * Dungeon `line` uses exact triangle tests (the client marches 1 m steps). KD miss outdoors not reproduced (never beats terrain).
 * Orientation modes 1/3/4, `Vehicle+0x13c`.
-* Tile diagonal bit 0x4000 assumed 0; v4 invisible surfaces (`EnableInvisCheck`) treated as visible.
+* Tile diagonal bit 0x4000 has no authored fixture: installed DCGA records supply only 8 bits. Version-4 invisible surfaces (`EnableInvisCheck`) remain unverified for `a != 0`, because no installed record contains that branch; they are treated as visible. Do not invent either kind of record to claim installed-data parity.
 * `Door_t::CanPass` is ported as "unlocked" only (`FUN_1007f74d`: open and `+0xfc` (= `IsLocked`, `Flags` bit 0x40; `FUN_100850c9` unlock tests it) false -> pass; `FUN_1007f58e`: stat 0xbd == 0 or not locked -> pass; the locked rest (stat 0x103 bit 0x10 refuses, bit 0x20 key check, owned buildings, team members) is "refused"). Doors that never get a model with node keyframes (no `ItemRig`) never reach the collision.
 
 Closed (AfDoors):
@@ -277,6 +337,24 @@ Closed (AfDoors):
 * **Fall-start callback** `FUN_1006ef34` = Player vehicle vtable `+0x70`, called by `Vehicle_t::Run` (Vehicle.dll 0x1000e849) when the speed `+0xcc` (3D length of the velocity, `Impact` does not touch it) goes from 0 to > 0 over the frame in the free branch (`+0x108 == 0`): `Transition(1)` ForwardStart, `3` ReverseStart when `Vehicle_t::GetDir < 0`. The speed is the length of the horizontal-plane velocity `+0x64..+0x6c` only (`FUN_1000e3d3` writes `+0xcc` from it; the vertical speed is the separate `+0x54`), so a standing jump (vertical only) does **not** fire it: retail jumps in place (Ghidra decompile of both functions). `Movement::start_moving_callback` (through the permission table; no-op while already moving forward).
 
 ## 6. Verification (commands, observed)
+
+Collision-semantics gate (2026-10-16, private worktree based on `9894f35`,
+canonical inclusive-depth dependency `2cc403c` retained):
+
+* `CARGO_TARGET_DIR=/private/tmp/CollisionSemanticsFix/target cargo test --release --workspace -j2`
+  exited 0: **2139 passed, 64 ignored**, including both installed regressions above,
+  the existing authored-order/depth tests and `collision_real` (11 passed, 1 ignored).
+* `CARGO_TARGET_DIR=/private/tmp/CollisionSemanticsFix/target cargo clippy --release --workspace --all-targets -j2 -- -D warnings`
+  exited 0.
+* Final additive rebase on `e4711e1`: `cargo test --release -j2 -p ao-formats playfield::collision::tests -- --nocapture`
+  exited 0 (**16 passed**); the same strict workspace/all-target Clippy command
+  exited 0 again. Both used the same private target. The full workspace gate above
+  was not repeated after this additive Loading-only rebase.
+* The initial focused run had 15 passes and one test-assertion failure: it incorrectly
+  used local plane Y as the upper bound for sloped installed triangles. The assertion
+  was corrected to native `max(vertexY)` (DS `0x10039d3c`); no query code was changed
+  to accommodate the fixture.
+* These are headless source/data gates, not frame, live-session or retail-visual claims.
 
 * `cargo test --release -p ao-formats collision`: unit tests (KD decoders, one sided line, wall head-on / diagonal slide numbers of 3.4, 0.3 m step passes and 0.6 m blocks, 30 degree
   ramp carries / 70 degree ramp does not support, edge fall, closest-point ray limits with terrain, outdoor veto) and `tests/collision_real.rs` (skip without the client):
