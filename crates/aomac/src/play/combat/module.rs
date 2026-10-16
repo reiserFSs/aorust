@@ -5,7 +5,7 @@
 //! combat-log.md, combat-anim.md, actions.md.
 
 use super::actions::{Actions, Event as ActionEvent};
-use super::anim::{plays_hit_sound, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, DEFAULT_DEATH_ANIM, STAT_DEATH_ANIM};
+use super::anim::{plays_hit_sound, DieEvent, Dying, ACTION_DEATH_DONE, ACTION_HIT, STAT_DEATH_ANIM};
 use super::arms::{ACTION_UNWIELD, ACTION_WIELD};
 use super::log::{FloatingNumber, Space, HUD_X};
 use super::state::{Combat, CombatEvent, ACTION_PLAY_ANIM, FIGHT_IDLE};
@@ -309,9 +309,9 @@ impl Module {
         self.combat.add_test_char(id, name, npc, health);
     }
 
-    /// Animation id of the own death: `CharacterAction` 99's `identity_b.instance` (stat 0x183), [`DEFAULT_DEATH_ANIM`] when the server sent none.
-    pub fn death_anim(&self) -> u16 {
-        self.dying.as_ref().map_or(DEFAULT_DEATH_ANIM, |d| d.anim)
+    /// Native CharDie request, absent until action 99 sets flag 0x10 and stat 0x183.
+    pub fn death_anim(&self) -> Option<u32> {
+        self.dying.as_ref().map(|dying| dying.anim)
     }
 
     pub fn numbers(&self) -> &[Number] {
@@ -408,10 +408,10 @@ impl Module {
                     // FUN_10069c68 cleared the controller's +0x79 guard after CanAttack(report = 0) passed
                     self.gate.on_attack_applied(true);
                 }
-                CombatEvent::Died { dynel, .. } if *dynel == self.own && self.dying.is_none() => {
-                    // `CharDie_t` ctor: the animation is `GetSkill(0x183)` (set by the server's action 99; 0 for a death the client computed itself)
+                CombatEvent::CharDie { dynel } if *dynel == self.own && self.dying.is_none() => {
+                    // GC1005d835 sets the flag; computed Health 0 does not enter CharDie.
                     let anim = self.combat.char(self.own).map_or(0, |c| c.stat(STAT_DEATH_ANIM as i32));
-                    self.dying = Some(Dying::new(if anim > 0 { anim as u16 } else { DEFAULT_DEATH_ANIM }, true));
+                    self.dying = Some(Dying::new(anim as u32, true));
                 }
                 _ => {}
             }
@@ -1172,10 +1172,10 @@ mod death_tests {
         let own = 0x82e8;
         let mut m = Module::with_texts(Box::new(Fixed::new()), own);
         m.combat.add_test_char(own as i32, "Aomacvolk", false, 100);
-        assert_eq!(m.death_anim(), DEFAULT_DEATH_ANIM);
+        assert_eq!(m.death_anim(), None);
         m.on_frame(&action(own as i32, 0, a_id(500), 99));
-        assert_eq!(m.death_anim(), 500);
-        assert!(m.take_events().iter().any(|e| matches!(e, CombatEvent::Died { dynel, cause: 0 } if *dynel == own as i32)));
+        assert_eq!(m.death_anim(), Some(500));
+        assert!(m.take_events().iter().any(|e| matches!(e, CombatEvent::CharDie { dynel } if *dynel == own as i32)));
         assert!(!m.update_death(10.0, false));
         assert!(m.take_outbox().is_empty(), "no timer until the actual holder completes");
         assert!(m.update_death(10.0, true));
@@ -1190,6 +1190,34 @@ mod death_tests {
             _ => None,
         }).collect();
         assert_eq!(done, [ACTION_DEATH_DONE], "sent exactly once");
+    }
+
+    #[test]
+    fn computed_death_does_not_activate_char_die_before_server_flag() {
+        for cause in 0..=7 {
+            for animation in [0, 503, 0x10001, u32::MAX] {
+                let own = 7;
+                let mut module = Module::with_texts(Box::new(Fixed::new()), own);
+                module.combat.add_test_char(own as i32, "Own", false, 100);
+                module.on_frame(&action(own as i32, 0, a_id(cause), super::super::state::ACTION_DEATH_CAUSE));
+                let events = module.take_events();
+                assert!(events.iter().any(|event| matches!(event, CombatEvent::Died { dynel: 7, cause: actual } if *actual == cause as u32)));
+                assert!(!events.iter().any(|event| matches!(event, CombatEvent::CharDie { .. })), "health/chat death cannot activate death sound or held playback");
+                assert_eq!(module.death_anim(), None);
+                assert!(!module.combat.char(7).unwrap().dead);
+                assert!(!module.update_death(100.0, true), "no WhiteOut without the native flag");
+                assert_eq!(module.combat.char(7).unwrap().health(), 0, "no invented post-animation Health 1");
+                assert!(module.take_outbox().is_empty(), "no death acknowledgement without action 99");
+
+                module.on_frame(&action(7, 0, a_id(animation as i32), super::super::anim::ACTION_DIE));
+                assert_eq!(module.death_anim(), Some(animation), "preserve server zero and unknown ids unchanged");
+                assert!(module.combat.char(7).unwrap().dead);
+                assert_eq!(module.combat.char(7).unwrap().stat(STAT_DEATH_ANIM as i32), animation as i32);
+                assert_eq!(module.take_events().iter().filter(|event| matches!(event, CombatEvent::CharDie { dynel: 7 })).count(), 1);
+                module.on_frame(&action(7, 0, a_id(animation as i32), super::super::anim::ACTION_DIE));
+                assert!(!module.take_events().iter().any(|event| matches!(event, CombatEvent::CharDie { .. })), "an already-set native flag cannot reenter CharDie");
+            }
+        }
     }
 
     /// Live kill of Aomacrceg (lvl 1 Solitus Soldier, bare hands) on a Beach Leet (12 HP) on the ICC beach (`docs/captures/zone_kill_ithaca.rec`, redacted
@@ -1218,7 +1246,7 @@ mod death_tests {
                     }
                     CombatEvent::FightStarted { who, .. } if who == own as i32 => started = true,
                     CombatEvent::FightStopped { who } if who == own as i32 => stopped = true,
-                    CombatEvent::Died { dynel, cause: 0 } if dynel == leet => died = true,
+                    CombatEvent::CharDie { dynel } if dynel == leet => died = true,
                     _ => {}
                 }
             }
@@ -1250,7 +1278,10 @@ mod death_tests {
                     CombatEvent::FightStarted { who, .. } if who == own as i32 => started = true,
                     CombatEvent::CombatMusic(false) => music_off = true,
                     CombatEvent::DeathMusic(true) => death_music = true,
-                    CombatEvent::Died { dynel, cause: 0 } if dynel == own as i32 => died = true,
+                    CombatEvent::CharDie { dynel } if dynel == own as i32 => {
+                        died = true;
+                        assert_eq!(m.death_anim(), Some(503), "captured own action99 key is preserved, not substituted");
+                    }
                     _ => {}
                 }
             }
@@ -1282,7 +1313,7 @@ mod death_tests {
             }
             let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
             m.on_frame(&Frame::decode_with(&b, false).unwrap().unwrap().0);
-            died |= m.take_events().iter().any(|e| matches!(e, CombatEvent::Died { dynel: 0xfd6a9, cause: 0 }));
+            died |= m.take_events().iter().any(|e| matches!(e, CombatEvent::CharDie { dynel: 0xfd6a9 }));
         }
         let c = m.combat().char(0xfd6a9).expect("the capture holds no quit of the leet");
         assert!(died && c.dead);

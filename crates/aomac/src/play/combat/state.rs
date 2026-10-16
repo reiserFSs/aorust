@@ -128,9 +128,10 @@ pub enum CombatEvent {
     OwnNewLevel { dynel: i32, level: i32, animation: u16, sound: &'static str, got_ip: bool, got_perk: bool, got_tech: bool },
     /// Own AlienLevel pair sets got_perk even when unchanged or decreased (GC 0x100a1aaf).
     OwnAlienLevel,
-    /// `dynel` died: `cause` = `FUN_1005ae91` mode (1 terminate, 2 reflect, 3 shield, 4 weapon, 5 spell, 6 fall, 7 liquid) or
-    /// 0 for the server's `CharacterAction` 99.
+    /// `FUN_1005ae91` health/chat bookkeeping, never the CharDie state transition.
     Died { dynel: i32, cause: u32 },
+    /// Action 99 raised native flag 0x10; the CharDie ctor reads stat 0x183.
+    CharDie { dynel: i32 },
 }
 
 /// `Feedback_DeathBy*` key of a death cause (`FUN_1005ae91` jump chain @ 0x1005aeb0).
@@ -316,11 +317,12 @@ impl Combat {
             }
             N3::World(World::CharacterAction(a)) if h.kind == CHAR_KIND && death_anim_from_action(a.action, a.identity_b.instance as u32).is_some() => {
                 if let Some(c) = self.chars.get_mut(&h.instance) {
+                    let entering = !c.dead;
                     c.dead = true;
                     // `FUN_1005d0d8` case 0x19: stat 0x183 := `identity_b.instance`, read by the `CharDie_t` ctor (`GetSkill(0x183)`)
                     c.stats.insert(STAT_DEATH_ANIM as i32, a.identity_b.instance);
                     self.stop_fight(h.instance, &mut ev);
-                    ev.push(CombatEvent::Died { dynel: h.instance, cause: 0 });
+                    if entering { ev.push(CombatEvent::CharDie { dynel: h.instance }); }
                 }
             }
             // `FUN_1005d0d8` case 0x32 (action 0x99, handler 0x1005d861): `FUN_1005ae91(identity_b.instance)` on the receiving character = the same
@@ -1099,7 +1101,7 @@ mod tests {
         assert_eq!(count(&ev, |e| matches!(e, CombatEvent::Hit { .. })), 122);
         assert_eq!(count(&ev, |e| matches!(e, CombatEvent::Miss { .. })), 11);
         assert_eq!(count(&ev, |e| matches!(e, CombatEvent::SpecialAttack { .. })), 3);
-        assert_eq!(count(&ev, |e| matches!(e, CombatEvent::Died { cause: 0, .. })), 15);
+        assert_eq!(count(&ev, |e| matches!(e, CombatEvent::CharDie { .. })), 15);
         assert_eq!(count(&ev, |e| matches!(e, CombatEvent::FightStarted { .. })), 127);
         assert_eq!(count(&ev, |e| matches!(e, CombatEvent::FightStopped { .. })), 118);
         // 122 hits + 3 specials, all on other chars: one world-space number and one line each; misses between bystanders: none

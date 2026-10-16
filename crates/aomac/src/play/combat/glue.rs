@@ -174,15 +174,6 @@ impl Play {
         let Some(m) = self.fight.as_mut() else { return };
         m.update(dt, &self.zone, self.audio.as_ref());
         let own = self.zone.char_id as i32;
-        if m.update_death(dt, self.player.as_ref().is_some_and(Player::death_animation_finished)) {
-            // SetStat(Health,1) is local state, not incoming damage/healing feedback.
-            self.zone.stats.insert(ao_formats::stats::HEALTH, 1);
-            self.zone.character_stats.entry(own).or_default().insert(ao_formats::stats::HEALTH, 1);
-            if let Some(character) = self.zone.dynels.get_mut(&own) { character.health = 1; }
-            if let Err(error) = self.zone.world.start_death_whiteout() {
-                self.zone.world.report_effect_failure(format_args!("own death WhiteOut3000: {error:#}"));
-            }
-        }
         if self.zone.world.update_attack_bars(own, m.attacking(), dt) {
             if let Some(c) = self.chat.as_mut() { c.feedback(&mut self.gui, "Feedback_ReloadingCompleted", &self.text); }
         }
@@ -202,10 +193,27 @@ impl Play {
                 }
             }
         }
+        // Construct the raw CharDie node before querying completion; sync queued health first.
+        if let Some(player) = self.player.as_mut() {
+            for event in &events {
+                if matches!(event, CombatEvent::CharDie { dynel } if *dynel == own) {
+                    if let Some(animation) = m.death_anim() { player.play_death(animation); }
+                }
+            }
+        }
+        if m.update_death(dt, self.player.as_ref().is_some_and(Player::death_animation_finished)) {
+            // SetStat(Health,1) is local state, not incoming damage/healing feedback.
+            self.zone.stats.insert(ao_formats::stats::HEALTH, 1);
+            self.zone.character_stats.entry(own).or_default().insert(ao_formats::stats::HEALTH, 1);
+            if let Some(character) = self.zone.dynels.get_mut(&own) { character.health = 1; }
+            if let Err(error) = self.zone.world.start_death_whiteout() {
+                self.zone.world.report_effect_failure(format_args!("own death WhiteOut3000: {error:#}"));
+            }
+        }
         if std::env::var_os("AOMAC_COMBAT_LOG").is_some() {
             for e in &events {
                 match e {
-                    CombatEvent::Hit { .. } | CombatEvent::Miss { .. } | CombatEvent::SpecialAttack { .. } | CombatEvent::Died { .. } | CombatEvent::FightStarted { .. } | CombatEvent::FightStopped { .. } | CombatEvent::CombatMusic(_) | CombatEvent::DeathMusic(_) => eprintln!("combat: {e:?}"),
+                    CombatEvent::Hit { .. } | CombatEvent::Miss { .. } | CombatEvent::SpecialAttack { .. } | CombatEvent::Died { .. } | CombatEvent::CharDie { .. } | CombatEvent::FightStarted { .. } | CombatEvent::FightStopped { .. } | CombatEvent::CombatMusic(_) | CombatEvent::DeathMusic(_) => eprintln!("combat: {e:?}"),
                     CombatEvent::Health { dynel, .. } if *dynel == own => eprintln!("combat: {e:?}"),
                     _ => {}
                 }
@@ -223,7 +231,7 @@ impl Play {
             if let CombatEvent::SpecialAttack { who, target, slot, .. } = e {
                 self.zone.world.special_hit_seen(*who, target.instance, *slot);
             }
-            if let CombatEvent::Died { dynel, .. } = e {
+            if let CombatEvent::Died { dynel, .. } | CombatEvent::CharDie { dynel } = e {
                 self.zone.world.cancel_nano_visuals(*dynel);
             }
         }
@@ -309,8 +317,8 @@ impl Play {
         }
         for e in &events {
             match e {
-                // `CharDie_t` is the state of the server's action 99 (cause 0); a death the client computed itself does not start it
-                CombatEvent::Died { dynel, cause: 0 } => self.zone.world.char_sound(*dynel, npc_sound::DEATH),
+                // Only the native flag transition constructs CharDie and plays its death sound.
+                CombatEvent::CharDie { dynel } => self.zone.world.char_sound(*dynel, npc_sound::DEATH),
                 CombatEvent::SpecialAttack { who, special, .. } => {
                     if let Some(name) = special_swing(*special).and_then(|s| s.sound) {
                         self.zone.world.sound_at(*who, name);
@@ -339,18 +347,6 @@ impl Play {
                     }
                 }
                 _ => {}
-            }
-        }
-        if let Some(p) = self.player.as_mut() {
-            for e in events {
-                match e {
-                    CombatEvent::Died { dynel, .. } if dynel == own => {
-                        let name = anim_name(m.death_anim()).map_or("die-knees", |a| a.0);
-                        p.play(Role::Clip(name.into()), true);
-                    }
-                    CombatEvent::Health { dynel, health, .. } if dynel == own && health > 0 && p.holding() => p.stand(),
-                    _ => {}
-                }
             }
         }
         for e in m.take_pose_events() {
@@ -577,7 +573,7 @@ fn fight_idle(world: &mut Dynels, player: &mut Option<&mut Player>, own: i32, wh
 /// holster, and the fight state stays 2 without a new draw), `FUN_10068b7f` the holster when a fight stops, `FUN_1006a700` the idle update when a weapon
 /// is wielded while the holder fights (`fighting`).
 pub(in crate::play) fn combat_animations(world: &mut Dynels, mut player: Option<&mut Player>, own: i32, events: &[CombatEvent], fighting: impl Fn(i32) -> bool, in_vehicle: impl Fn(i32) -> bool) {
-    let died = |who: i32| events.iter().any(|e| matches!(e, CombatEvent::Died { dynel, .. } if *dynel == who));
+    let died = |who: i32| events.iter().any(|event| matches!(event, CombatEvent::CharDie { dynel } if *dynel == who));
     for e in events {
         match e {
             CombatEvent::FightStarted { who, switched: false, .. } => fight_idle(world, &mut player, own, *who, true, true),

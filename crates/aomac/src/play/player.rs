@@ -93,6 +93,8 @@ pub(super) struct Player {
     clicks: Vec<ao_gui::MouseButton>,
     /// A one-shot body pose (emote, cast, death): the role and whether it holds its last frame.
     transient: Option<(Role, bool)>,
+    /// Native CharDie is active; bool records whether its raw holder Play returned a handle.
+    death_animation: Option<bool>,
     cast_loop: Option<bool>,
     cast_restart: bool,
     /// Playback rate factor of the hit reaction in `transient`.
@@ -186,6 +188,7 @@ impl Player {
                 game: Vec::new(),
                 clicks: Vec::new(),
                 transient: None,
+                death_animation: None,
                 cast_loop: None,
                 cast_restart: false,
                 clip_scale: None,
@@ -335,6 +338,20 @@ impl Player {
         self.cast_restart = false;
         self.clip_scale = None;
     }
+
+    pub fn play_death(&mut self, animation: u32) {
+        self.transient = None;
+        self.cast_loop = None;
+        self.cast_restart = false;
+        self.clip_scale = None;
+        self.death_animation = Some(match self.avatar.hold_animation(&self.store, animation) {
+            Ok(started) => started,
+            Err(error) => {
+                eprintln!("avatar death: {error:#}");
+                false
+            }
+        });
+    }
     /// Plays an own use/equipment abstract id without replacing the movement pose.
     pub fn play_action(&mut self, id: u16, layer: Option<u8>, priority: i32) -> bool {
         match self.avatar.play_action(&self.store, id, layer, priority) {
@@ -376,7 +393,7 @@ impl Player {
 
     /// Plays the hit reaction `role` once at `rate` times its speed (`FUN_1009b4ac`, `Dynels::react_to_hit`) unless one is playing.
     pub fn react(&mut self, role: Role, rate: f32) {
-        if self.transient.is_none() {
+        if self.transient.is_none() && !self.holding() {
             self.play(role, false);
             self.clip_scale = Some(rate);
         }
@@ -405,14 +422,18 @@ impl Player {
         self.transient.is_none() || self.avatar.finished()
     }
 
-    /// A held clip (death) is playing.
+    /// A native CharDie state or legacy held transient is active.
     pub fn holding(&self) -> bool {
-        self.transient.as_ref().is_some_and(|t| t.1)
+        self.death_animation.is_some() || self.transient.as_ref().is_some_and(|transient| transient.1)
     }
 
-    /// Death may be queued while the previous clip is already finished.
+    /// A failed raw Play waits for the holder-wide completion path (GC1007b58c).
     pub fn death_animation_finished(&self) -> bool {
-        self.transient.as_ref().is_some_and(|(role, hold)| *hold && self.avatar.finished_role(role))
+        match self.death_animation {
+            Some(true) => self.avatar.finished(),
+            Some(false) => self.avatar.holder_finished(),
+            None => self.transient.as_ref().is_some_and(|(role, hold)| *hold && self.avatar.finished_role(role)),
+        }
     }
 
     /// `Door_t` open / close and lock changes of the zone's doors into the collision world: the door's room link
@@ -453,6 +474,7 @@ impl Player {
 
     /// Ends a held clip (resurrection).
     pub fn stand(&mut self) {
+        if self.death_animation.take().is_some() { self.avatar.release_death(); }
         self.avatar.set_body_priority(0);
         self.transient = None;
         self.cast_loop = None;
@@ -660,7 +682,7 @@ impl Player {
         } else { None });
         // the new pose's enter / stop clip plays once over its idle clip (`Pose::transition_anim`, GC 0x1006d330)
         let now = Pose::from_role(&role);
-        if let Some(from) = self.pose.replace(now).filter(|&b| b != now && self.cast_loop.is_none()) {
+        if let Some(from) = self.pose.replace(now).filter(|&b| b != now && self.cast_loop.is_none() && self.death_animation.is_none()) {
             if let Some(id) = Pose::transition_anim(from, now) {
                 self.transient = None;
                 self.cast_loop = None;
@@ -680,7 +702,7 @@ impl Player {
         // the airborne->grounded edge plays the jump-landing clip once over the resuming movement pose (`jump-land-*`);
         // the clip's own `land` note then plays the ground-material footstep thud (`FUN_10045069`).
         let grounded = self.movement.grounded();
-        if was_jumping && self.movement.fsm().jump != 3 && grounded && self.cast_loop.is_none() {
+        if was_jumping && self.movement.fsm().jump != 3 && grounded && self.cast_loop.is_none() && self.death_animation.is_none() {
             let fsm = self.movement.fsm();
             if let Some(id) = super::combat::anim::landing_anim(u32::from(fsm.mode), fsm.fwd == 2, fsm.strafe == 2) {
                 if let Err(error) = self.avatar.play_intro_action(&self.store, id) { eprintln!("avatar landing: {error:#}"); }
@@ -701,8 +723,10 @@ impl Player {
         self.avatar.set_cast_loop(self.cast_loop == Some(true));
         self.avatar.set_airborne(!grounded);
         if std::mem::take(&mut self.cast_restart) { self.avatar.restart_cast_clip(); }
-        if let Err(e) = self.avatar.set_pose(&self.store, pose) {
-            eprintln!("avatar pose: {e:#}");
+        if self.death_animation.is_none() {
+            if let Err(e) = self.avatar.set_pose(&self.store, pose) {
+                eprintln!("avatar pose: {e:#}");
+            }
         }
         self.avatar.set_transform(scene_pos(pos), scene_yaw(yaw));
         self.avatar.update(dt);
@@ -1110,7 +1134,7 @@ mod tests {
         player.avatar.set_pose(&player.store, AvatarPose::still(Role::Clip("ground-stop".into()))).unwrap();
         player.avatar.update(100.0);
         assert!(player.avatar.finished(), "the preceding clip is already complete");
-        player.play(Role::Clip("die-shot".into()), true);
+        player.play_death(503);
         assert!(!player.death_animation_finished(), "queued death must not inherit previous clip completion");
         let mut host = Host::headless();
         player.frame(0.0, &mut host, &mut zone, false);
@@ -1119,6 +1143,34 @@ mod tests {
         assert!(player.holding() && player.death_animation_finished());
         player.stand();
         assert!(!player.death_animation_finished(), "resurrection ends the held death");
+    }
+
+    #[test]
+    fn own_char_die_without_a_handle_uses_native_holder_completion() {
+        use ao_net::msg::Identity;
+        use ao_net::n3::{outgoing::n3_frame, server_move as sm};
+        let dir = ao_gui::client_dir();
+        if !dir.join("cd_image/rdb.db").exists() { return; }
+        for animation in [0, u32::from(u16::MAX), 0x10001, u32::MAX] {
+            let mut zone = Zone::new(7);
+            zone.own_update = Some(Box::new(avatar::tests::own_update()));
+            let mut player = Player::new(&dir, &mut zone, 0).expect("captured own avatar");
+            player.collision = None;
+            player.zones = None;
+            player.play_death(animation);
+            assert!(player.holding(), "CharDie state exists even when Play returned -1");
+            assert_eq!(player.death_animation, Some(false));
+            assert!(player.death_animation_finished(), "infinite idle is ignored by holder-wide completion");
+            player.react(Role::Clip("imp-chest".into()), 0.5);
+            assert!(player.transient.is_none(), "hit reactions cannot manufacture a replacement death clip");
+            let mut host = Host::headless();
+            player.frame(0.0, &mut host, &mut zone, false);
+            assert!(player.death_animation_finished());
+            let resurrect = n3_frame(1, 0, sm::resurrect(Identity { kind: 0xc350, instance: 7 }, &sm::Resurrect { health: 77, nano: 33 }));
+            zone.on_frame(&resurrect);
+            player.frame(0.0, &mut host, &mut zone, false);
+            assert!(!player.holding() && !player.death_animation_finished());
+        }
     }
 
     /// Offline, real-CAT Player::frame regression, including the movement FSM and transient dispatch.

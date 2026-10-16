@@ -544,11 +544,6 @@ pub fn swing_speed_scale(note_time_ms: f32, item_delay_cs: i32) -> f32 {
 pub const ACTION_DIE: i32 = 0x63;
 /// Stat the dying character's animation id is stored in (`CharDie_t` ctor reads `GetSkill(0x183)`).
 pub const STAT_DEATH_ANIM: u32 = 0x183;
-/// Death animation of the own character when stat 0x183 is absent (no server action 99).
-/// **[UNRESOLVED GUESS]** 503 (`die-shot`) is only observed on server actions.
-/// Searched GC 0x1005ae91 / asm 0x1005af00: writes Health 0, not a default for
-/// 0x183; GC 0x1007b2ba reads that stat. Its initial value remains unproven.
-pub const DEFAULT_DEATH_ANIM: u16 = 503;
 /// JumpStop1006d821 chooses from movement intent, never the weapon's AnimSet.
 pub fn landing_anim(mode: u32, forward: bool, strafe: bool) -> Option<u16> {
     if !forward { return Some(if strafe { 0xb9 } else { 0xbb }); }
@@ -564,14 +559,14 @@ pub const DIE_WAIT_S: f32 = 3.0;
 pub const ACTION_DEATH_DONE: i32 = 0x98;
 
 /// Death animation requested by a received `CharacterAction`: `Some(AbstractAnimID)` for action 99.
-pub fn death_anim_from_action(action: i32, identity_b_instance: u32) -> Option<u16> {
-    (action == ACTION_DIE).then_some(identity_b_instance as u16)
+pub fn death_anim_from_action(action: i32, identity_b_instance: u32) -> Option<u32> {
+    (action == ACTION_DIE).then_some(identity_b_instance)
 }
 
 /// A dying character (`CharDie_t`): the animation to hold and the elapsed time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dying {
-    pub anim: u16,
+    pub anim: u32,
     pub elapsed: f32,
     /// The control (own) character: sends [`ACTION_DEATH_DONE`] when the wait is over.
     pub own: bool,
@@ -589,7 +584,7 @@ pub enum DieEvent {
 }
 
 impl Dying {
-    pub fn new(anim: u16, own: bool) -> Dying {
+    pub fn new(anim: u32, own: bool) -> Dying {
         Dying { anim, elapsed: 0.0, own, fading: false, done_sent: false }
     }
 
@@ -730,6 +725,7 @@ mod tests {
     #[test]
     fn death_flow() {
         assert_eq!(death_anim_from_action(99, 503), Some(503));
+        assert_eq!(death_anim_from_action(99, u32::MAX), Some(u32::MAX));
         assert_eq!(death_anim_from_action(98, 503), None);
         let mut d = Dying::new(503, true);
         assert_eq!(d.tick(10.0, false), None, "animation time is not death-wait time");
