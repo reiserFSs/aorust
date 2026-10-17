@@ -116,6 +116,7 @@ mod tests {
             assert!(r.enhanced_frame.is_none() && r.enhanced_shader.is_none());
             assert_eq!(r.enhanced_target_bytes(), 0);
             r.set_enhanced_settings(EnhancedSettings { ground_grass: true, grass_density: 0.0, ..Default::default() });
+            assert!(r.enhanced_shader.is_none(), "grass-only execution must reuse the native world shader");
             let neutral = capture(&mut r);
             let sample_count = u64::from(r.msaa_samples());
             let expected = 32 * 32 * (4 + 4 * sample_count + if sample_count > 1 { 4 * sample_count + 4 } else { 0 });

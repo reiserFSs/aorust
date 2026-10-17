@@ -864,7 +864,7 @@ fn compile_pipeline(
                 module: shader,
                 entry_point: Some(fs),
                 compilation_options: Default::default(),
-                targets: if settings.any_enabled() { &targets } else { &targets[..1] },
+                targets: if settings.ambient_occlusion || settings.emissive_bloom { &targets } else { &targets[..1] },
             }),
             primitive: wgpu::PrimitiveState {
                 topology: if effect == 14 { wgpu::PrimitiveTopology::PointList } else { wgpu::PrimitiveTopology::TriangleList },
@@ -1262,23 +1262,26 @@ impl Renderer {
     pub fn set_enhanced_settings(&mut self, settings: EnhancedSettings) {
         let settings = settings.clamped();
         if self.enhanced_settings == settings { return; }
-        let changed_path = self.enhanced_settings.any_enabled() != settings.any_enabled()
-            || self.enhanced_settings.sun_shadows != settings.sun_shadows
+        let changed_pipeline = self.enhanced_settings.sun_shadows != settings.sun_shadows
+            || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
+            || self.enhanced_settings.emissive_bloom != settings.emissive_bloom;
+        let changed_frame = self.enhanced_settings.any_enabled() != settings.any_enabled()
             || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
             || self.enhanced_settings.emissive_bloom != settings.emissive_bloom;
         self.enhanced_settings = settings;
         if !settings.ambient_occlusion { self.ambient_occlusion = None; }
         if !settings.sun_shadows { self.sun_shadows = None; }
-        if changed_path { self.enhanced_frame = None; }
-        if !settings.any_enabled() {
-            self.enhanced_frame = None;
+        if changed_frame { self.enhanced_frame = None; }
+        // Grass has its own shader. Keep the native world shader and cached pipelines
+        // unless a world-shading effect actually needs the Enhanced variant.
+        if !(settings.sun_shadows || settings.ambient_occlusion || settings.emissive_bloom) {
             self.enhanced_shader = None;
-        } else if self.enhanced_shader.is_none() || changed_path {
+        } else if self.enhanced_shader.is_none() || changed_pipeline {
             self.enhanced_shader = Some(self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(enhanced_shader::source(settings.sun_shadows, settings.ambient_occlusion, settings.emissive_bloom).into()),
             }));
         }
-        if changed_path {
+        if changed_pipeline {
             let shadow_layout = settings.sun_shadows.then(|| sun_shadows::receiver_layout(&self.device));
             let mut ordinary = vec![Some(&self.g_layout), Some(&self.tex_layout)];
             let mut holo = vec![Some(&self.g_layout), Some(&self.tex_layout), Some(&self.holo_layout)];
@@ -1290,7 +1293,7 @@ impl Renderer {
             self.holo_pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("holo optional shadow receiver"), bind_group_layouts: &holo, immediate_size: 0 });
         }
         if settings.any_enabled() { self.set_msaa_samples(self.msaa_samples); }
-        if changed_path {
+        if changed_pipeline {
             self.pipes.invalidate();
             self.actor_pipes.invalidate();
             self.ground_pipes.invalidate();
@@ -2213,7 +2216,7 @@ impl Renderer {
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: if enhanced_frame.is_some() { &attachments } else { &attachments[..1] },
+                color_attachments: if self.enhanced_settings.ambient_occlusion || self.enhanced_settings.emissive_bloom { &attachments } else { &attachments[..1] },
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
