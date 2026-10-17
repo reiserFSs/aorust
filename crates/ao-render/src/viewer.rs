@@ -1129,6 +1129,10 @@ impl OffscreenPerf {
             assert!(matches!(samples, 1 | 2 | 4 | 8), "AOMAC_PERF_MSAA must be 1, 2, 4, or 8");
             samples
         });
+        Self::explicit(r, size, msaa)
+    }
+
+    fn explicit(r: &Renderer, size: (u32, u32), msaa: Option<u32>) -> Self {
         let texture = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
             label: Some("offscreen performance target"),
             size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
@@ -1193,6 +1197,33 @@ impl Offscreen {
         let r = Renderer::new(&instance, None)?;
         let (targets, gr) = (Targets::new(&r, size.0, size.1), crate::GuiRenderer::new(&r, fe.gui()));
         Ok(Self { r, targets, gr, host: Host::headless(), size, live: None, perf: None, fixed_camera: None })
+    }
+
+    /// Explicit single-sample persistent target for frozen-snapshot timing, without environment overrides.
+    pub fn evidence_timing(fe: &dyn Frontend, size: (u32, u32)) -> Result<Self> {
+        let mut off = Self::evidence(fe, size)?;
+        off.perf = Some(OffscreenPerf::explicit(&off.r, size, Some(1)));
+        Ok(off)
+    }
+
+    /// Renders existing scene/actors/camera without frontend updates or capture/readback allocation.
+    /// Requires `evidence_timing`; read enabled GPU timers before calling this again.
+    pub fn render_frozen(&mut self) -> Result<()> {
+        let perf = self.perf.as_ref().ok_or_else(|| anyhow::anyhow!("render_frozen requires a persistent evidence target"))?;
+        self.r.render(&perf.view, &self.targets, &self.host.camera);
+        Ok(())
+    }
+
+    pub fn set_gpu_timing(&mut self, enabled: bool) -> Result<()> { self.r.set_gpu_timing(enabled) }
+    pub fn read_frame_gpu_ms(&mut self) -> Result<Option<f64>> { self.r.read_frame_gpu_ms() }
+    pub fn enhanced_target_bytes(&self) -> u64 { self.r.enhanced_target_bytes() }
+
+    /// Changes rendering resources while retaining the frozen actors and scene.
+    pub fn set_enhanced_settings(&mut self, settings: crate::EnhancedSettings) {
+        self.r.set_enhanced_settings(settings);
+        if self.targets.sample_count != self.r.msaa_samples() {
+            self.targets = Targets::new(&self.r, self.size.0, self.size.1);
+        }
     }
 
     /// Changes the render surface size without replacing the live frontend or its GUI state.
