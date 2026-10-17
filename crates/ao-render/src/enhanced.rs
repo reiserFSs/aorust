@@ -122,17 +122,17 @@ mod tests {
         for samples in r.msaa_supported.clone() {
             r.set_msaa_samples(samples);
             let faithful = capture(&mut r);
-            assert!(r.enhanced_frame.is_none() && r.enhanced_shader.is_none());
+            assert!(r.enhanced_frame.is_none() && r.world.shader.is_none());
             assert_eq!(r.enhanced_target_bytes(), 0);
             r.set_enhanced_settings(EnhancedSettings { ground_grass: true, grass_density: 0.0, ..Default::default() });
-            assert!(r.enhanced_shader.is_none(), "grass-only execution must reuse the native world shader");
+            assert!(r.world.shader.is_none(), "grass-only execution must reuse the native world shader");
             let neutral = capture(&mut r);
             let sample_count = u64::from(r.msaa_samples());
             let expected = 32 * 32 * (4 + 4 * sample_count + if sample_count > 1 { 4 * sample_count + 4 } else { 0 });
             assert_eq!(r.enhanced_target_bytes(), expected, "neutral allocates no ambient/emission masks");
             assert_eq!(faithful, neutral, "neutral UNORM must retain native blend/quantization at {samples}x");
             r.set_enhanced_settings(EnhancedSettings::default());
-            assert!(r.enhanced_frame.is_none() && r.enhanced_shader.is_none());
+            assert!(r.enhanced_frame.is_none() && r.world.shader.is_none());
             assert_eq!(r.enhanced_target_bytes(), 0);
             assert_eq!(faithful,capture(&mut r),"all-off roundtrip must be byte identical");
         }
