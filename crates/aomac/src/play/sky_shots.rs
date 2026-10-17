@@ -8,6 +8,8 @@ use ao_render::{Camera, Frontend, Host, Offscreen, Vec3};
 use ao_scene::{Lens, Scene};
 use std::path::PathBuf;
 
+mod ao_grain;
+
 struct Shot {
     gui: Gui,
     scene: Option<Scene>,

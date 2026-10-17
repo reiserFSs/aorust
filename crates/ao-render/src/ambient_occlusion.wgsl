@@ -1,6 +1,6 @@
 // HBAO-lite: current primary-view depth only; no actor lists or history.
-// Sampling pattern, interleaved-gradient noise and the sum/(directions*steps)
-// normalisation follow ao-vk rvk/shaders/ao.frag (MIT, wannabuh/ao-vk), see THIRD_PARTY.
+// Direction/step sampling and the sum/(directions*steps) normalisation follow
+// ao-vk rvk/shaders/ao.frag (MIT, wannabuh/ao-vk), see THIRD_PARTY.
 const TAU = 6.2831853;
 const DIRECTIONS = 6;
 const STEPS = 4;
@@ -45,9 +45,14 @@ fn depth_sample(pixel: vec2<i32>) -> vec2<f32> {
     let share = occluder_share_at(pixel);
     return vec2<f32>(select(z, 1.0, share == 0.0), share);
 }
-fn world(pixel: vec2<i32>, z: f32) -> vec3<f32> {
+// inverse_vp reconstructs world-axis positions relative to a nearby reference;
+// translation cancels from all AO deltas without losing small vectors in f32.
+fn world_homogeneous(pixel: vec2<i32>, z: f32) -> vec4<f32> {
     let uv = (vec2<f32>(pixel) + 0.5) / vec2<f32>(textureDimensions(depth));
-    let p = params.inverse_vp * vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), z, 1.0);
+    return params.inverse_vp * vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), z, 1.0);
+}
+fn world(pixel: vec2<i32>, z: f32) -> vec3<f32> {
+    let p = world_homogeneous(pixel, z);
     return p.xyz / p.w;
 }
 struct HalfSample {
@@ -99,13 +104,17 @@ fn selected_pixel(half: vec2<i32>, sample: vec2<u32>) -> vec2<i32> {
     let pixel = center.pixel;
     let z = center.z;
     if z >= 1.0 { return encoded(0.0, z, pixel); }
-    let p = world(pixel, z);
+    let homogeneous = world_homogeneous(pixel, z);
+    let p = homogeneous.xyz / homogeneous.w;
     let n = normal(pixel, p);
-    let clip = params.vp * vec4<f32>(p, 1.0);
+    // Translation leaves homogeneous w unchanged; vp cannot project relative p.
+    let clip_w = 1.0 / homogeneous.w;
     let projection_y = length(vec3<f32>(params.vp[0].y, params.vp[1].y, params.vp[2].y));
-    let radius_pixels = clamp(params.control.x * projection_y * f32(textureDimensions(depth).y) / (2.0 * max(clip.w, 0.01)), 1.0, 64.0);
-    // Fixed screen-space pattern (no time term): static frames are bit-stable.
-    let noise = fract(52.9829189 * fract(dot(position.xy, vec2<f32>(0.06711056, 0.00583715))));
+    let radius_pixels = clamp(params.control.x * projection_y * f32(textureDimensions(depth).y) / (2.0 * max(clip_w, 0.01)), 1.0, 64.0);
+    // Nine fixed phases repeat every 3x3 half-resolution pixels. The filter
+    // below weights every phase equally; neither rotation nor jitter uses time.
+    let tile = vec2<u32>(position.xy) % vec2<u32>(3u);
+    let noise = (f32((tile.x * 3u + tile.y * 7u) % 9u) + 0.5) / 9.0;
     var occlusion = 0.0;
     for (var direction = 0; direction < DIRECTIONS; direction++) {
         let angle = (f32(direction) + noise) * (TAU / f32(DIRECTIONS));
@@ -129,9 +138,17 @@ fn selected_pixel(half: vec2<i32>, sample: vec2<u32>) -> vec2<i32> {
     let open = 1.0 - clamp(OCCLUSION_GAIN * occlusion / f32(DIRECTIONS * STEPS), 0.0, 1.0);
     return encoded((1.0 - pow(open, params.control.y)) * center.share, z, pixel);
 }
-// Strict world-space depth rejection prevents background AO crossing silhouettes.
-fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
-    let distance = length(center - candidate);
+// Reject separation across either surface, not tangential separation along it:
+// a fixed Euclidean cutoff otherwise rejects even adjacent texels at distance.
+// The symmetric test also rejects a background lying in the foreground's plane
+// when its own plane disagrees (a grazing-angle silhouette).
+fn bilateral(center: vec3<f32>, center_normal: vec3<f32>, candidate: vec3<f32>, candidate_normal: vec3<f32>) -> f32 {
+    let delta = candidate - center;
+    var distance = max(abs(dot(delta, center_normal)), abs(dot(delta, candidate_normal)));
+    // Degenerate depth normals cannot establish surface continuity.
+    if dot(center_normal, center_normal) < 0.5 || dot(candidate_normal, candidate_normal) < 0.5 {
+        distance = length(delta);
+    }
     let cutoff = min(params.control.x * 0.15, 0.15);
     if distance >= cutoff { return 0.0; }
     return 1.0 - distance / max(cutoff, 0.001);
@@ -141,9 +158,11 @@ fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
     let center = textureLoad(ao_input, pixel, 0).rg;
     if depth_of(center) >= 1.0 { return center; }
     let p = world(selected_pixel(pixel, center), depth_of(center));
-    var sum = value_of(center);
-    var weight = 1.0;
-    // 5x5 removes the per-pixel rotation pattern; the strict depth test below keeps it inside silhouettes.
+    let n = normal(selected_pixel(pixel, center), p);
+    var sum = value_of(center) * 9.0;
+    var weight = 9.0;
+    // Two convolved 3-wide boxes give symmetric weights 1,2,3,2,1. Every
+    // modulo-3 phase has equal total weight, unlike a truncated Gaussian.
     for (var y = -2; y <= 2; y++) {
         for (var x = -2; x <= 2; x++) {
             if x == 0 && y == 0 { continue; }
@@ -151,7 +170,10 @@ fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
             if any(neighbor < vec2<i32>(0)) || any(neighbor >= vec2<i32>(textureDimensions(ao_input))) { continue; }
             let sample = textureLoad(ao_input, neighbor, 0).rg;
             if depth_of(sample) >= 1.0 { continue; }
-            let w = exp(-f32(x * x + y * y) / 4.5) * bilateral(p, world(selected_pixel(neighbor, sample), depth_of(sample)));
+            let sample_pixel = selected_pixel(neighbor, sample);
+            let sample_p = world(sample_pixel, depth_of(sample));
+            let spatial = f32((3 - abs(x)) * (3 - abs(y)));
+            let w = spatial * bilateral(p, n, sample_p, normal(sample_pixel, sample_p));
             sum += value_of(sample) * w;
             weight += w;
         }
@@ -165,6 +187,7 @@ fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
     let receiver = textureLoad(ambient, pixel, 0);
     if params.control.w > 0.0 && clamp(receiver.a + 1.0, 0.0, 1.0) == 0.0 { return vec4<f32>(0.0); }
     let p = world(pixel, z);
+    let n = normal(pixel, p);
     let half_coord = (vec2<f32>(pixel) + 0.5) * 0.5 - 0.5;
     let base = vec2<i32>(floor(half_coord));
     let fraction = fract(half_coord);
@@ -177,7 +200,9 @@ fn bilateral(center: vec3<f32>, candidate: vec3<f32>) -> f32 {
             let sample = textureLoad(ao_input, neighbor, 0).rg;
             if depth_of(sample) >= 1.0 { continue; }
             let spatial = select(1.0 - fraction.x, fraction.x, x == 1) * select(1.0 - fraction.y, fraction.y, y == 1);
-            let w = spatial * bilateral(p, world(selected_pixel(neighbor, sample), depth_of(sample)));
+            let sample_pixel = selected_pixel(neighbor, sample);
+            let sample_p = world(sample_pixel, depth_of(sample));
+            let w = spatial * bilateral(p, n, sample_p, normal(sample_pixel, sample_p));
             sum += value_of(sample) * w;
             weight += w;
         }

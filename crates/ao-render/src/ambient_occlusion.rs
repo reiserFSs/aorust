@@ -84,7 +84,13 @@ impl AmbientOcclusion {
             self.targets = Some(Targets { size, depth: depth.clone(), ambient: ambient.clone(), raw_bind: bind(&filtered), blur_bind: bind(&raw), raw, filtered });
         }
         let targets = self.targets.as_ref().expect("AO targets allocated");
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: vp.inverse().to_cols_array_2d(), vp: vp.to_cols_array_2d(), control: [radius, strength.clamp(0.0, 2.0), fog_depth, u32::from(grass_present) as f32] }));
+        // AO only needs relative world vectors. Remove a near-plane reference
+        // in f64 before upload so f32 depth reconstruction does not subtract
+        // large absolute positions to recover millimetre-scale normal vectors.
+        let inverse_vp = vp.as_dmat4().inverse();
+        let reference = inverse_vp.w_axis.truncate() / inverse_vp.w_axis.w;
+        let relative_inverse_vp = (glam::DMat4::from_translation(-reference) * inverse_vp).as_mat4();
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params { inverse_vp: relative_inverse_vp.to_cols_array_2d(), vp: vp.to_cols_array_2d(), control: [radius, strength.clamp(0.0, 2.0), fog_depth, u32::from(grass_present) as f32] }));
         for (index, (label, pipeline, input, output, load)) in [
             ("ambient AO estimate", &self.estimate, &targets.raw_bind, &targets.raw, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),
             ("ambient AO bilateral blur", &self.blur, &targets.blur_bind, &targets.filtered, wgpu::LoadOp::Clear(wgpu::Color::BLACK)),

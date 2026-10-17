@@ -484,8 +484,15 @@ the corpse to the dead character's relative position when closer than a threshol
 retail rendering. `ao-render/src/ambient_occlusion.rs` and its WGSL use only
 the current primary-view resolved depth, with no actor traversal or temporal
 history. Six directions with four bounded horizon samples run at half
-resolution; world-distance bilateral filtering and upsampling reject
-foreground/background discontinuities instead of bleeding an AO silhouette.
+resolution with a fixed nine-phase 3×3 screen-space pattern. A 5×5 triangular
+filter uses separable weights `1,2,3,2,1`, giving every modulo-three phase equal
+total weight. Symmetric tangent-plane depth rejection preserves silhouettes
+without discarding tangential neighbours at distance.
+The same rejection is used for full-resolution upsampling. Positions use a
+relative world frame: the CPU removes a near-plane reference from the inverse
+view-projection in f64 before uploading f32, avoiding large-coordinate
+cancellation in reconstructed normal/delta vectors. No time or frame index
+enters the pattern; no temporal history is allocated.
 The float shader subtracts a separately retained, lit nonemissive receiving
 colour back into native UNORM colour. It retains the indirect term and 80%
 of direct diffuse lighting so contact remains visible in daylight; specular,
@@ -497,7 +504,7 @@ fragment body without new texture samples or derivatives after discard.
 Depth at/beyond the current original fog end is rejected before normal
 reconstruction and gathering, so fully fog-hidden actors cannot influence
 nearer AO either. The switch remains off by default; its default enabled
-strength is 1.0 and radius 1 metre.
+strength is 1.5 and radius 1.75 metres.
 
 The asset-free offscreen regression
 `hidden_actor_cannot_change_visible_ao_and_zero_ambient_is_untouched`

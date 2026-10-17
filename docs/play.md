@@ -689,6 +689,181 @@ alongside `manifest.txt` and `status.txt`. Set `AOMAC_GFX_PNG_ONLY=1` to retain
 only PNG images (including repeat-failure images); byte-exact independent-repeat
 checks still run in memory, and baseline comparison then decodes the baseline PNG.
 
+### Static and subpixel-motion ICC AO grain regression
+
+`graphics_ao_static_grain` is an ignored installed-client test: no login, animation,
+or window. Normal runs assert recorded pre-fix bounds without requiring external
+PNG files. Optional baseline PNGs additionally provide paired before/after evidence.
+**Before captures must use the pre-fix CPU uniforms and matching pre-fix shaders.**
+The camera-relative inverse added by this fix changes that contract: overriding
+the new executable with an old raw AO shader is not a faithful pre-fix capture.
+Build the fixture in each revision and use its exact Cargo-printed executable:
+
+```sh
+# Pre-fix checkout: build the fixture with the original CPU/shader contract.
+# cargo test --profile fast -p aomac graphics_ao_static_grain -j 2 --no-run
+AOMAC_SHADER_DIR=/tmp/AoGrain/baseline-shaders \
+AOMAC_GFX_AO_CAPTURE_BASELINE=1 AOMAC_GFX_OUT=/tmp/ao-grain-before \
+  /absolute/path/to/pre-fix/aomac-<hash> graphics_ao_static_grain \
+  --ignored --nocapture --test-threads=1
+# Current checkout:
+cargo test --profile fast -p aomac graphics_ao_static_grain -j 2 --no-run
+AOMAC_SHADER_DIR=/tmp/AoGrain/wt/crates/ao-render/src \
+AOMAC_GFX_AO_BASELINE=/tmp/ao-grain-before AOMAC_GFX_OUT=/tmp/ao-grain-after \
+  /absolute/path/to/current/aomac-<hash> graphics_ao_static_grain \
+  --ignored --nocapture --test-threads=1
+```
+
+Both directories must be new. Omit `AOMAC_GFX_AO_BASELINE` for ordinary regression
+against the recorded bounds. Baseline capture is explicitly marked
+`baseline_only=true` / `BASELINE_ONLY_NO_GRAIN_BOUND_ASSERTED`: it skips only the
+measured improvement bounds, while still asserting static stability and nonempty,
+non-brightening AO. This mode is not an acceptance run.
+
+The fixture reuses the seeded clear-weather ICC 4582 scene at time 2648.69, day
+zero, baked collision sky exposure, player lens, 1920×1200, MSAA/anisotropy one.
+Camera `icc-coastal1` is `[660,24.3,-714]`, yaw 0, pitch −0.3. A single renderer
+warms 32 zero-dt frames, then settles each off/on effect phase for four additional
+zero-dt rendered frames before capturing eight consecutive static frames.
+The AO-off control keeps the AO Enhanced profile but sets strength zero,
+preserving the receiving attachment/pipeline boundary. The AO-on profile changes
+only that strength. Every adjacent static pair must be byte-identical; the
+manifest prints mean/max absolute RGB code differences, pixel count above two
+codes, and differing RGBA bytes. No nonzero baseline shimmer is required.
+The current AO spatial filter is a 5×5 triangular kernel with separable weights
+`1,2,3,2,1`, symmetric tangent-plane rejection, and the same rejection during
+upsampling. Each modulo-three noise phase has equal total kernel weight; the
+filter does not depend on time.
+
+
+Two further sequences capture AO-on/off at each **identical** pose: 16 samples of
+one vertical sine cycle, amplitude 0.001 m, and 16 orbit poses in 0.0005-radian
+increments around a target 10 m ahead. The 1 mm motion probes the idle eye-height
+changes documented in `docs/zone/camera.md` (27.587215 versus 27.585472 m);
+the orbit is an explicit fixture choice, not recovered retail camera motion.
+Scene and animation time remain frozen. Each sequence reports adjacent-frame
+mean/max changes and counts above two codes of the isolated AO contribution,
+not changes in the moving scene texture.
+
+The grain signal is `(Yoff-Yon)/max(Yoff,16)` using Rec.709 **display-code**
+luminance, not linear radiometry. Relative normalization removes multiplicative
+scene texture; the fixed 16-code floor prevents amplification in dark pixels.
+Grain is the mean squared residual against four cardinal neighbours, over fixed
+`cliff=(80,300,800,500)` and `grass=(320,850,1280,300)` screen rectangles (x,y,w,h),
+excluding each rectangle's one-pixel border. Inspect saved crops before treating
+these intended cliff/grass regions as continuous-surface-only evidence; they are
+not a semantic mask. Aggregate grain must be **strictly below** the decoded
+baseline PNG metric, without tolerance widening. The baseline AO-off image must
+match exactly; AO must not brighten any RGB channel or lose more than half its
+baseline mean contribution. Each moving sequence also requires strictly reduced
+mean temporal change and grain, with no increase in maximum change or >2 count.
+
+Recorded original pre-fix measurements (the constants are observed numbers, not
+relaxed tolerances):
+
+| Sequence | Grain MSE | Temporal mean codes | Temporal maximum codes | Temporal pixels >2 |
+| --- | ---: | ---: | ---: | ---: |
+| Static | 0.00709256425634166 | 0 | 0 | 0 |
+| Tiny | 0.00710534179313452 | 3.41843105766966504 | 254.81335725799095826 | 5661749 |
+| Orbit | 0.00712297271100228 | 8.27077672709192591 | 254.81212498469326988 | 7257147 |
+
+Default acceptance requires static grain and both moving sequences' grain and
+temporal mean strictly below these pre-fix values; temporal maxima/counts must
+not exceed them. The observed static mean normalized AO attenuation is
+0.22532198405713011. Every current static/moving frame must retain at least half
+that mean, so disabling AO cannot satisfy the grain checks. External PNG
+comparison adds the strict paired bounds above; it does not replace these
+durable recorded bounds. No tolerance is widened when a current run fails.
+
+
+Evidence filenames:
+`manifest.txt`, `status.txt`,
+`icc-coastal1-{off,on}-frame00.png` through `frame07.png`,
+`{before,after}-contribution.png` and
+`{before,after}-{cliff,grass}-contribution.png`.
+Baseline comparison additionally writes
+`icc-coastal1-{off,on}-{before,after,diff}.png`.
+Moving frames are `icc-coastal1-{tiny,orbit}-{off,on}-frame00.png` through
+`frame15.png`, with `before-` and `diff-` copies during comparison; contribution
+images/crops use `{tiny,orbit}-baseline{0,1}-frameNN` prefixes (0=current, 1=before).
+Contribution PNGs encode zero at midgray and positive attenuation brighter;
+metrics always use full-precision normalized values, not these preview PNGs.
+Static failures retain pair-diff PNGs. All manifest numbers are printed too.
+Optional `AOMAC_GFX_AO_TIMING=1` measures off/on/on/off phases with 30 warmup and
+60 GPU samples each. Its paired on-minus-off result is **whole-frame GPU cost**,
+not an isolated AO-pass timestamp.
+
+**Contact-shadow counterpart:** `graphics_contact_static_grain` reuses the same
+scene, fixed crops, static/tiny/orbit sequences, metrics and PNG filenames in a
+separate new output directory. It enables only contact shadows: all other
+Enhanced effect toggles remain off, and the paired control changes only
+`contact_strength` from 0.8 to zero while keeping the contact attachment enabled.
+Use `AOMAC_GFX_CONTACT_BASELINE`, `AOMAC_GFX_CONTACT_CAPTURE_BASELINE=1`, and
+optional `AOMAC_GFX_CONTACT_TIMING=1` instead of the AO environment names.
+AO's recorded bounds are never reused for contact shadows. Contact has its own
+recorded pre-fix bounds, so ordinary acceptance does not require external PNGs:
+
+| Contact sequence | Grain MSE | Temporal mean codes | Temporal maximum codes | Temporal pixels >2 |
+| --- | ---: | ---: | ---: | ---: |
+| Static | 0.00063275435109123 | 0 | 0 | 0 |
+| Tiny | 0.00063145381480343 | 1.318216025873466 | 119.63359267776153 | 2004863 |
+| Orbit | 0.00063780320461505 | 2.643878401054905 | 122.25109918158317 | 2604297 |
+
+The observed pre-fix mean normalized contact attenuation is 0.04738310448810818;
+current static/moving frames must retain at least half that mean. Grain and
+temporal mean must strictly improve, while maxima/counts must not increase,
+exactly as for AO. Four effect-phase warmup frames precede the eight static
+samples; no changed-byte tolerance is permitted within those eight samples.
+External PNGs add paired comparison/evidence; explicit baseline-only mode skips
+the measured improvement bounds, not stability or non-brightening assertions.
+
+```sh
+cargo test --profile fast -p aomac graphics_contact_static_grain -j 2 --no-run
+# Use the executable with the matching pre-fix CPU/shader contract for BEFORE.
+AOMAC_SHADER_DIR=/absolute/path/to/contact-before-shaders \
+AOMAC_GFX_CONTACT_CAPTURE_BASELINE=1 AOMAC_GFX_OUT=/tmp/contact-grain-before \
+  /absolute/path/to/pre-fix/aomac-<hash> graphics_contact_static_grain \
+  --ignored --nocapture --test-threads=1
+AOMAC_SHADER_DIR=/tmp/AoGrain/wt/crates/ao-render/src \
+AOMAC_GFX_CONTACT_BASELINE=/tmp/contact-grain-before \
+AOMAC_GFX_OUT=/tmp/contact-grain-after \
+  /absolute/path/to/current/aomac-<hash> graphics_contact_static_grain \
+  --ignored --nocapture --test-threads=1
+```
+
+**Recorded fix result (2026-10-18).** Accepted evidence:
+`~/aomac-handoff/gfx/v3/AoGrain/after-relative-five` (AO) and
+`~/aomac-handoff/gfx/v3/AoGrain/contact-final` (contact); other `after*`
+directories there are rejected or diagnostic runs.
+
+| Effect | Static grain MSE | Tiny mean codes | Tiny >2 count | Orbit mean codes | Orbit >2 count |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AO before | 0.00709256425634166 | 3.418431057669665 | 5661749 | 8.270776727091926 | 7257147 |
+| AO after | 0.00517782982414801 | 1.1980629383225236 | 1797442 | 6.358997685843572 | 5025889 |
+| Contact before | 0.00063275435109123 | 1.318216025873466 | 2004863 | 2.643878401054905 | 2604297 |
+| Contact after | 0.00047179592596340 | 0.34540546083893997 | 566951 | 2.07279738594694 | 2265083 |
+
+Both effects' on/off eight static frames are strictly byte-identical after 32
+common plus 4 effect-phase warmup frames; the AO-off and contact-off
+before/after PNGs are byte-exact. Paired ICC whole-frame contribution rose from
+0.399294067 to 1.071250400 ms (AO) and from 0.471834475 to 2.272893075 ms
+(contact). These are explicit cost increases from whole-frame on-minus-off
+pairs, not isolated GPU pass timers. A lazy-normal AO cost experiment
+(1.16066155 ms) was reverted; sample counts and thresholds were not reduced.
+
+Root cause: the original noise had already been fixed per frame, so an idle
+camera revealed spatial pepper rather than shimmer. Both CPU transforms now
+reconstruct world positions camera-relative in f64 before the f32 upload.
+Both filters use a full-period symmetric 5×5 triangular kernel (equal weight
+across all nine 2D modulo-three noise phases) plus a depth-aware gate. AO's original
+Euclidean gate rejected tangential neighbours; contact preserves its original
+4%-of-view-depth cutoff scale, applied to symmetric planes.
+
+Caveats: the scene contains native alpha foliage and silhouette changes. The
+normalized-contribution high-pass is not a pure semantic, texture-free AO term,
+and no claim is made that all edge differences vanish.
+
+
 **Known open strict-repeat failure (2026-10-17, frozen source `6031e9c7`):**
 LookLand's faithful and neutral matrices pass all seventeen views exactly, with
 neutral versus faithful zero differing bytes. The `all` and `all-no-bloom` profiles
