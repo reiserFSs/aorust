@@ -19,10 +19,13 @@ fn hidden_actor_present_absent_images_are_identical() {
         ],
         ..Default::default()
     };
+    // The camera sees the wall front; the sun sees its back. A one-sided statel
+    // must still occlude sunlight and cast all the way down to its base.
+    scene.meshes[1].submeshes[0].two_sided = false;
     scene.instances = (0..scene.meshes.len()).map(|mesh| ao_scene::Instance { mesh, transform: ao_scene::IDENTITY }).collect();
     renderer.upload(&scene);
-    renderer.shadow_sun = Some([-0.8, 0.5, 0.3]);
-    renderer.env.sun_dir = [-0.8, 0.5, 0.3];
+    renderer.shadow_sun = Some([-0.8, 0.5, -0.3]);
+    renderer.env.sun_dir = [-0.8, 0.5, -0.3];
     renderer.env.sun_color = [0.6; 3];
     renderer.env.ambient = [0.2; 3];
     renderer.env.fog_start = 100.0;
@@ -65,7 +68,7 @@ fn hidden_actor_present_absent_images_are_identical() {
     let projection = Mat4::perspective_rh(renderer.lens.vertical_fov(aspect), aspect, renderer.lens.near,
         renderer.lens.far.unwrap_or(132.0));
     let receiver = (projection * Mat4::look_to_rh(camera.pos, camera.forward(), camera.up()))
-        .project_point3(Vec3::new(-3.5, 0.0, -1.5625));
+        .project_point3(Vec3::new(-3.5, 0.0, -0.4375));
     let x = ((receiver.x * 0.5 + 0.5) * width as f32) as usize;
     let y = ((0.5 - receiver.y * 0.5) * height as f32) as usize;
     assert!(x < width as usize && y < height as usize);
@@ -91,8 +94,15 @@ fn hidden_actor_present_absent_images_are_identical() {
     renderer.set_actors(vec![]);
     renderer.shadow_sun = None;
     let unshadowed = capture(&mut renderer);
-    assert_ne!(absent, unshadowed, "enabled static shadow must change a receiver (non-vacuous shadow test)");
+    assert_ne!(absent, unshadowed, "one-sided statel back face did not cast a shadow");
     assert!(absent.iter().zip(&unshadowed).all(|(shadowed, original)| shadowed <= original), "shadowing increased the original image envelope");
+    let contact = (projection * Mat4::look_to_rh(camera.pos, camera.forward(), camera.up()))
+        .project_point3(Vec3::new(0.0, 0.0, 0.25));
+    let contact_pixel = (((0.5 - contact.y * 0.5) * height as f32) as usize * width as usize
+        + ((contact.x * 0.5 + 0.5) * width as f32) as usize) * 4;
+    assert!(absent[contact_pixel] < unshadowed[contact_pixel], "wall shadow detached from its base");
+    let ambient_floor = (renderer.env.ambient[0].powf(1.0 / 2.2) * 255.0).floor() as u8;
+    assert!(absent[contact_pixel] >= ambient_floor.saturating_sub(1), "shadow removed ambient, not just sun");
     for y in (height as usize * 2 / 3)..(height as usize * 11 / 12) {
         for x in (width as usize / 16)..(width as usize / 4) {
             let pixel = (y * width as usize + x) * 4;

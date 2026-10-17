@@ -762,3 +762,5 @@ Fully fogged actor pixels do not seed admission, so an actor hidden by the origi
 
 The nine PCF taps compare exact texel centers against the geometric receiver plane (normal derived before fragment discard). This removes planar self-shadow moiré without a large slope bias that detaches feet or objects from their shadows.
 
+Cascade casters are two-sided even when their native camera material is culled: thin one-sided statel walls must block light from behind, otherwise roof shadows detach from building bases. The primary actor-admission image retains native culling. The GPU regression includes a back-lit one-sided wall, base-contact coverage and preservation of its ambient-only lighting floor.
+

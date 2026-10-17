@@ -323,7 +323,10 @@ pub(crate) fn compile_pipeline(
             buffers: if spec.actor { &buffers } else { &buffers[..2] } },
         fragment: Some(wgpu::FragmentState { module: shader, entry_point: Some(fragment),
             compilation_options: Default::default(), targets: if primary { &targets } else { &[] } }),
-        primitive: wgpu::PrimitiveState { cull_mode: (!spec.two_sided).then_some(wgpu::Face::Back), ..Default::default() },
+        // Thin statel walls block sunlight from either side. Only camera admission
+        // retains the native material culling; light-view backface culling opens
+        // building bases and detaches their roof shadows from the sidewalk.
+        primitive: wgpu::PrimitiveState { cull_mode: (primary && !spec.two_sided).then_some(wgpu::Face::Back), ..Default::default() },
         depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
             depth_compare: Some(if !primary || spec.effect == 2 { wgpu::CompareFunction::LessEqual } else {
