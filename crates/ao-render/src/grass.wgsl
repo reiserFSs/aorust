@@ -35,7 +35,7 @@ fn grass_hash(input: u32) -> u32 {
 }
 // Share of a cell's blades that survive at a distance: the CPU instances only the ranks that can (grass.rs).
 fn thinning_keep(dist: f32) -> f32 {
-    let d = max(dist - 12.0, 0.0) / 12.0;
+    let d = max(dist - 12.0, 0.0) / 10.0;
     return 1.0 / (1.0 + d * d);
 }
 fn grass_unit(v: u32) -> f32 { return f32(v & 0x00ffffffu) / 16777216.0; }
@@ -261,8 +261,8 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let step = vertex >> 1u;
     let section = select(select(0u, step + 1u, step > 0u), step * 3u, band >= 2u);
     let t = SECTION_T[kind][section];
-    // Complete the geometric morph before the CPU can select band 2 (~33 m nearest cell edge).
-    let simple_tuft = smoothstep(24.0, 30.0, dist);
+    // Complete the geometric morph before the CPU can select band 2 (~29 m nearest cell edge).
+    let simple_tuft = smoothstep(22.0, 27.0, dist);
     // Half-resolution AO cannot resolve root/tip tufts: fade their receiving share with the geometry.
     o.coverage.y = 1.0 - simple_tuft;
     let profile = mix(SECTION_W[kind][section], 1.0 - t, simple_tuft);

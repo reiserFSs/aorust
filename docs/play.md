@@ -827,7 +827,7 @@ The design follows ao-vk's procedural grass (MIT, attribution in `THIRD_PARTY`):
   two-layer RGBA8 noise texture (`grass_noise.rs`, 128 KiB, 64 m period), never per frame.
 - *Distance*: eight instancing bands bound the work to the stable blade-rank prefix
   that can survive in each cell. Beyond 12 m density falls as
-  `1 / (1 + ((distance - 12) / 12)²)`; survivors widen into sparse tufts.
+  `1 / (1 + ((distance - 12) / 10)²)`; survivors widen into sparse tufts.
   Rank changes shrink blades smoothly, and the outer 30% of the field also fades
   with hardware alpha-to-coverage dithering under MSAA (single-sample retains geometric fade).
   From 24–80 m the colour converges on the root's native terrain texel, removing
@@ -835,7 +835,7 @@ The design follows ao-vk's procedural grass (MIT, attribution in `THIRD_PARTY`):
   ground rather than flickering. Cells outside the view frustum are culled on the CPU.
   The two nearest bands retain curved six-vertex blades. More distant bands use
   root/tip triangles; geometry morphs to this straight profile and head colour
-  fades out from 24–30 m, before the instancing switch, so neither can pop.
+  fades out from 22–27 m, before the instancing switch, so neither can pop.
 - *Wind*: waves running through the field along the native weather wind, a cross
   wave, each blade's flutter, and gust bands sweeping over it (the bent blades lighter).
   The native wind scales the lean; a light base breeze (the strength of a 0.35 bend)
@@ -905,7 +905,7 @@ terrain's Rec.709 luminance weights, avoiding darker blades on HDR-brightened gr
 No authored sun or zero shadow strength leaves native light intact.
 AO reuses the native surface's canonical sun/sky receiving budget, bounded by
 the blade's beauty colour and attenuated by the native fog equation (both factors
-for two-pass fog). Receiving follows the 24–30 m geometry morph; casting drops
+for two-pass fog). Receiving follows the 22–27 m geometry morph; casting drops
 earlier within that morph, depending on MSAA coverage. Half-resolution AO must
 not treat subpixel root/tip tufts as solid dark occluders.
 The existing ambient attachment's alpha encodes porosity; its negative far tag
@@ -1029,17 +1029,28 @@ GPU timings are explicitly unexercised. `AOMAC_GFX_AO`, `AOMAC_GFX_SHADOWS`
 individually. `AOMAC_GFX_ASSERT_SPECKS=0` is only for counterfactual diagnosis;
 normal acceptance enforces the speck limit.
 
-The controlled 4× capture on the native-DAY/shared-AO base `2e86c663` restores
-only the obsolete grass AO formula and opaque AO alpha for its BEFORE frame.
+The controlled 4× capture for frozen speck unit `6031e9c7` (12 m thinning scale)
+on the native-DAY/shared-AO base `2e86c663` restores only the obsolete grass AO
+formula and opaque AO alpha for its BEFORE frame.
 The grass-OFF RGB frames are byte-identical. BEFORE has 471 new outliers
 (610 total; paired OFF 163); AFTER has 36 new outliers (190 total), over
 252,301 eligible pixels, below the 127-pixel limit. Restoring the old formula
 fails the actual regression; the corrected shader passes.
 
-Quiet Newland timing for the speck fix (12 m thinning scale), on the same M4 Pro
+Quiet Newland timing for the frozen speck-fix unit `6031e9c7` (12 m thinning scale), on the same M4 Pro
 at 1920×1200 and actual 4× MSAA with all five effects: grass-on minus grass-off
 GPU p50 is 2.231 / 2.097 ms in opposite orders (mean 2.164 ms). Prepare p95 is
 0.049 / 0.045 ms. These use the newer native-DAY defaults: shadow strength 0.45,
 sun boost 0.6, grade 0.8 and contact strength 0.8; they are not a controlled
-performance comparison with the older `afb37e44` table above.
+performance comparison with the older `afb37e44` table above, nor a claim for the current 10 m scale.
+
+The 10 m thinning scale preserves every blade within 12 m and keeps the same
+160 m radius; only distant rank density changes, with surviving tufts widened.
+On the same settings/hardware, opposite-order GPU p50 contributions are
+1.862 / 1.991 ms (mean 1.926 ms), with prepare p95 0.052 / 0.049 ms.
+The 22–27 m geometry/head-colour morph finishes before band 2's nearest-edge
+threshold of about 29.3 m. The far-hill speck regression still passes:
+30 new dark outliers over 252,301 eligible pixels (paired OFF 163, ON 185).
+These are paired whole-frame GPU medians, not an isolated grass draw timestamp
+or a guarantee about tail latency.
 

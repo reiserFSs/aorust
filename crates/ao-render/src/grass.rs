@@ -409,7 +409,7 @@ fn slope_mask([a, b, c, d]: [f32; 4], size: f32, parity: u32) -> u32 {
 }
 /// Share of a cell's blades that survive at `distance` from the eye (grass.wgsl `thinning_keep`).
 fn thinning_keep(distance: f32) -> f32 {
-    let d = (distance - 12.0).max(0.0) / 12.0;
+    let d = (distance - 12.0).max(0.0) / 10.0;
     1.0 / (1.0 + d * d)
 }
 fn hash(mut value: u32) -> u32 { value ^= value >> 16; value = value.wrapping_mul(0x7feb352d); value ^= value >> 15; value = value.wrapping_mul(0x846ca68b); value ^ (value >> 16) }
@@ -807,12 +807,12 @@ mod tests {
         assert_eq!(slope_mask([0.0, 0.0, 0.0, 16.0], 4.0, 0), 1, "one cliff triangle cannot erase its flat neighbor");
         assert!(MAX_CELLS * (std::mem::size_of::<Cell>() + 4 * BANDS) + std::mem::size_of::<Params>() < 3 * 1024 * 1024);
         assert_eq!(thinning_keep(12.0), 1.0);
-        assert_eq!(thinning_keep(24.0), 0.5);
-        assert_eq!(thinning_keep(48.0), 0.1);
-        assert!(thinning_keep(30.0) > 0.25, "geometry morph must finish before a cell can use three vertices");
+        assert_eq!(thinning_keep(22.0), 0.5);
+        assert_eq!(thinning_keep(42.0), 0.1);
+        assert!(thinning_keep(27.0) > 0.25, "geometry morph must finish before a cell can use three vertices");
         let shader = include_str!("grass.wgsl");
-        assert!(shader.contains("max(dist - 12.0, 0.0) / 12.0"), "CPU and GPU thinning must agree");
-        assert!(shader.contains("smoothstep(24.0, 30.0, dist)"));
+        assert!(shader.contains("max(dist - 12.0, 0.0) / 10.0"), "CPU and GPU thinning must agree");
+        assert!(shader.contains("smoothstep(22.0, 27.0, dist)"));
         assert!(shader.contains("select(0.0, 1.0 - simple_tuft, is_head)"), "head colour must finish fading before the topology switch");
         let mut cell = Cell { origin: [0.0; 4], heights: [0.0, 2.0, 4.0, 8.0], identity: [0; 4], normals: [[0.0; 4]; 4] };
         for parity in 0..2 {
