@@ -535,10 +535,10 @@ Enhanced frame-time or retail visual-quality claims.
 | Clean `cargo build -p aomac` | release 259.79 s | fast 211.86 s |
 | Rebuild after `touch crates/ao-render/src/grade.wgsl` | release 259.68 s | fast 4.85 s |
 | First fixture test executable build after app build (`--no-run`) | release 286.21 s | fast 77.92 s |
-| Full faithful fixture, release, 14 views / 28 independent captures | 19.14 s | 13.71 s |
+| Full faithful fixture, release, 14 views / 28 independent captures | 19.14 s | 13.07 s (final merged source) |
 | Selected faithful fixture, release, `borealis-foliage-sun-high` | 6.03 s | 5.22 s |
-| Scene loads for full matrix | 14 | 6 (839.717 ms total loader time) |
-| Shader-only edit using existing executable + runtime sources | release rebuild required | **zero Rust compilation**; Enhanced-all selected-view run 15.83 s |
+| Scene loads for full matrix | 14 | 6 (776.807 ms total loader time) |
+| Shader-only edit using existing executable + runtime sources | release rebuild required | **zero Rust compilation**; final release Enhanced-all selected-view run 4.90 s |
 
 The exact-view filter already existed; no redundant filter was added. The full
 fixture now shares snapshots without sharing renderers or weakening repeats.
@@ -556,16 +556,19 @@ without deleting it and rejected a missing reference without creating a target.
 All 14 faithful views were byte-identical to the pre-change release baseline,
 including independent repeats, in both fast and release. All 14 runtime-loaded
 faithful views matched that baseline too; the Enhanced-all selected-view runtime
-override matched its embedded-source capture byte-for-byte. Evidence directories
-are `~/aomac-handoff/gfx/iterspeed-*` (plus `iterspeed-enhanced-*`).
-Headless release workspace gates passed: **2261 passed, 73 ignored** and strict
+override matched its embedded-source capture byte-for-byte. These comparisons
+also passed on the final merged grass/HDR/contact source: full faithful 13.07 s,
+Enhanced-all embedded 5.50 s and runtime-loaded 4.90 s. Evidence directories are
+`~/aomac-handoff/gfx/iterspeed-*` (plus `iterspeed-enhanced-*`).
+After rebasing over the HDR/contact/grass renderer updates, headless release
+workspace gates passed again: **2264 passed, 73 ignored** and strict
 `cargo clippy --release --workspace --all-targets -j 2 -- -D warnings`.
 
 ### Runtime shader overrides
 
 All file-backed WGSL/Metal sources use the override, including the world/Enhanced,
-grade, grass, shadow, AO and bloom paths. Shader equations and feature switches
-are unchanged.
+grade, grass (including `grass_shadow.wgsl`), shadow, contact shadow, AO and bloom
+(including `bloom_glare.wgsl`) paths. Shader equations and feature switches are unchanged.
 
 For shader-only iteration, build the fixture test once, then set
 `AOMAC_SHADER_DIR` to the **absolute** `crates/ao-render/src` directory in your
