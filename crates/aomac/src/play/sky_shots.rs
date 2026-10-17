@@ -404,6 +404,7 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         let actor = graphics_fixture_actor()?;
         let views = graphics_fixture_views(&actor);
         writeln!(manifest, "actor_source=docs/captures/zone_ithaca.rec actor_id=25988 actor_name={:?} actor_pos={:?} actor_yaw={:?} actor_pose=idle actor_time=0", actor.name, actor.pos, actor.yaw())?;
+        writeln!(manifest, "borealis_lightbar_fixture_override=Testy mount5 mesh26163 field0 byte0 pos[679.6,72.8,-482.7] yaw0 pose_idle_time0 native_mounted_lights=enabled")?;
         std::fs::write(out.join("manifest.txt"), &manifest)?;
         for (name, pf, time, fixed) in views {
             ao_scene::crt_srand(1);
@@ -421,9 +422,17 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 off.host.anisotropy = Some(1);
                 off.host.fog_density_scale = Some(1.0);
                 let mut list = off.frame(&mut shot, 0.0);
-                if name == "icc-actor-authored" {
-                    let avatar = super::avatar::Avatar::new(&store, &dir, 25988, &actor,
+                if matches!(name.as_str(), "icc-actor-authored" | "borealis-lightbar-night") {
+                    let lightbar = name == "borealis-lightbar-night";
+                    let mut appearance = actor.clone();
+                    if lightbar {
+                        appearance.attractors.retain(|mount| mount.place != 5);
+                        appearance.attractors.push(ao_net::n3::dynel::AttractorMesh { place: 5, mesh: 26163, field: 0, byte: 0 });
+                    }
+                    let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &appearance,
                         ao_formats::character::actor::ActorAssets::new(&store)?)?;
+                    if lightbar { avatar.set_transform([679.6, 72.8, -482.7], 0.0); }
+                    off.host.dynamic_lights.extend(avatar.lights());
                     off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
                     off.host.actors.push(avatar.frame());
                     list = off.frame(&mut shot, 0.0);
@@ -506,5 +515,7 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
     let actor_at = Vec3::new(actor.pos[0], actor.pos[1] + 1.2, -actor.pos[2]);
     views.push(("icc-actor-authored".into(), 4582, 2648.69,
         Camera::look_at(actor_at + Vec3::new(0.0, 1.0, 5.0), actor_at)));
+    views.push(("borealis-lightbar-night".into(), 800, 0.0,
+        Camera::look_at([679.6, 74.5, -476.7].into(), [679.6, 74.0, -482.7].into())));
     views
 }

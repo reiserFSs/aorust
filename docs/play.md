@@ -493,6 +493,10 @@ Condemned Subway 127 corridor (indoor lighting needs no day/night duplicate).
 ICC's authored frozen GAME clock is never overridden. The actor uses
 `zone_ithaca.rec` own-character 25988 appearance/position and the existing Avatar
 builder synchronously, without replay worker timing or a synthetic character.
+An additional Borealis night view equips that recorded actor with native Light Bar
+mesh 26163 on attractor 5, places it at the fixed street position, and includes the
+mount's real posed lights. These fixture equipment/placement overrides are explicit
+in the manifest; no emissive or other material is replaced.
 Every view uses a fixed 1920×1200 camera/lens, day zero, clear weather,
 CRT/cloud seed one, zero renderer/effect time, MSAA one and anisotropy one.
 Each immutable scene snapshot is rendered by two independently initialized
