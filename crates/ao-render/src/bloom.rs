@@ -603,6 +603,169 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn actor_emission_mrt_keeps_partial_tints_dark_and_native_effects_positive() {
+        use crate::{Camera, EnhancedSettings, Renderer, Targets, Vec3, texture_to_rgba};
+        use ao_scene::{ActorFrame, Blend, Environment, Mesh, Scene, Submesh, Texture, TextureKey, Vertex};
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("actor emitter regression requires headless GPU");
+        r.set_msaa_samples(1);
+        r.upload(&Scene { environment: Some(Environment {
+            sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 100.0, fog_end: 200.0,
+            ambient: [0.05; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0,
+        }), ..Default::default() });
+        r.set_enhanced_settings(EnhancedSettings { emissive_bloom: true, ..Default::default() });
+        let targets = Targets::new(&r, 64, 64);
+        let output = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Native actor emitter MRT regression"),
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = output.create_view(&Default::default());
+        // Exercise actual material, actor override and native delta-state pipelines.
+        // Mode 2 is RTriMesh-only; modes 4..6 select fs_mesh_add, mode 1 selects fs_holo.
+        for (index, (name, emissive, override_emissive, blend, effect, expected)) in [
+            ("partial-material", [0.5; 3], None, Blend::Opaque, 0, [false; 3]),
+            ("saturated-red-only", [1.0, 0.5, 0.0], None, Blend::Opaque, 0, [true, false, false]),
+            ("partial-actor-override", [1.0; 3], Some([0.5; 3]), Blend::Opaque, 0, [false; 3]),
+            ("saturated-actor-override", [0.5; 3], Some([1.0; 3]), Blend::Opaque, 0, [true; 3]),
+            ("native-additive", [0.5; 3], None, Blend::Additive, 0, [true; 3]),
+            ("native-additive-one", [0.5; 3], None, Blend::AdditiveOne, 0, [true; 3]),
+            ("native-space-fullbright", [1.0; 3], None, Blend::Opaque, 2, [true; 3]),
+            ("native-mesh-lit", [0.5; 3], None, Blend::Opaque, 4, [true; 3]),
+            ("native-mesh-unlit", [0.0; 3], None, Blend::Opaque, 5, [true; 3]),
+            ("native-mesh-unlit-six", [0.0; 3], None, Blend::Opaque, 6, [true; 3]),
+            ("native-holo", [0.0; 3], None, Blend::Opaque, 1, [true; 3]),
+        ].into_iter().enumerate() {
+            let vertices = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                .into_iter().map(|(x, y)| Vertex { pos: [x, y, -2.0], normal: [0.0, 0.0, 1.0],
+                    uv: [(x + 1.0) * 0.5, (1.0 - y) * 0.5], color: [1.0; 4] }).collect();
+            let submesh = Submesh { emissive, blend, two_sided: true, projection_pass: effect == 2,
+                ..Submesh::new(vec![0, 1, 2, 0, 2, 3], None) };
+            let mut model = Scene { meshes: vec![Mesh { vertices, submeshes: vec![submesh] }], ..Default::default() };
+            if effect == 1 {
+                // Same two native resource slots as native_holo_mesh_uses_two_textures_and_effect_local_timer.
+                for id in [0x28022, 0x28023] {
+                    model.textures.insert(TextureKey { rdb_type: 1, id }, Texture {
+                        source: Default::default(), width: 1, height: 1, rgba: vec![64, 64, 64, 255],
+                    });
+                }
+            }
+            let model_id = index as u64 + 1;
+            r.add_actor_model(model_id, &model);
+            r.set_actors(vec![ActorFrame { id: 1, model: model_id, emissive: override_emissive,
+                rendering_effect: effect, ..Default::default() }]);
+            r.render(&view, &targets, &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+            let beauty = texture_to_rgba(&r, &output, 64, 64).unwrap();
+            let seed = r.emissive_seed_rgba().unwrap().expect("bloom MRT seed");
+            let center = (32 * 64 + 32) * 4;
+            assert!(beauty[center..center + 3].iter().any(|&v| v > 0), "{name}: geometry must render");
+            for (channel, emits) in expected.into_iter().enumerate() {
+                assert_eq!(seed[center + channel] > 0, emits, "{name}: seed channel {channel}");
+                if !emits {
+                    assert!(seed.as_chunks::<4>().0.iter().all(|pixel| pixel[channel] == 0),
+                        "{name}: rejected emission channel {channel} must be exactly zero everywhere");
+                }
+            }
+        }
+    }
+    #[test]
+    #[ignore = "whole installed authored CAT population, headless MRT readback; new AOMAC_GFX_OUT required"]
+    fn graphics_bloom_authored_actor_survey() -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        use ao_formats::character::{CHAR_MESH_TYPE, CHAR_MESH_LOW_TYPE, NameTable, load_character_record};
+        use ao_scene::{ActorFrame, Environment, Lens, Scene};
+        use crate::{Camera, EnhancedSettings, Renderer, Targets, Vec3};
+        use std::fmt::Write;
+        let out = std::path::PathBuf::from(std::env::var_os("AOMAC_GFX_OUT").context("set AOMAC_GFX_OUT")?);
+        ensure!(!out.exists(), "refusing to overwrite {}", out.display());
+        std::fs::create_dir_all(&out)?;
+        let store = ao_rdb::RecordStore::open(&ao_gui::client_dir())?;
+        let names = NameTable::load(&store)?;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None)?;
+        r.set_msaa_samples(1);
+        r.upload(&Scene { environment: Some(Environment {
+            sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 100_000.0, fog_end: 200_000.0,
+            ambient: [0.05; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0,
+        }), ..Default::default() });
+        r.set_fog_density_scale(0.0);
+        r.set_enhanced_settings(EnhancedSettings { emissive_bloom: true, ..Default::default() });
+        let size = 128;
+        let targets = Targets::new(&r, size, size);
+        let output = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Authored CAT population MRT survey"),
+            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        });
+        let view = output.create_view(&Default::default());
+        let quote = |text: &str| format!("\"{}\"", text.replace('\"', "\"\""));
+        let mut csv = String::from("type,id,name,status,seed_nonzero_rgb_pixels,mesh,material,linear_emissive,glow_mask,lighting_enabled,blend,texture,error\n");
+        let (mut records, mut decoded, mut rendered, mut errors, mut nonzero_records, mut nonzero_pixels) =
+            (0_usize, 0_usize, 0_usize, 0_usize, 0_usize, 0_usize);
+        for ty in [CHAR_MESH_TYPE, CHAR_MESH_LOW_TYPE] {
+            for id in store.ids(ty)? {
+                records += 1;
+                r.set_actors(Vec::new());
+                r.remove_actor_model(1);
+                let name = quote(names.name(ty, id).unwrap_or(""));
+                let result = (|| -> anyhow::Result<usize> {
+                    let model = load_character_record(&store, ty, id, None)?;
+                    decoded += 1;
+                    let mut low = Vec3::splat(f32::INFINITY);
+                    let mut high = Vec3::splat(f32::NEG_INFINITY);
+                    for vertex in model.meshes.iter().flat_map(|mesh| &mesh.vertices) {
+                        low = low.min(vertex.pos.into());
+                        high = high.max(vertex.pos.into());
+                    }
+                    let radius = (high - low).length() * 0.5;
+                    ensure!(low.is_finite() && high.is_finite() && radius.is_finite() && radius > 0.0,
+                        "authored record has no finite nonempty geometry");
+                    let center = (low + high) * 0.5;
+                    let camera = Camera::look_at(center + Vec3::new(0.0, radius * 0.5, radius * 3.5), center);
+                    r.set_lens(Lens { near: (radius * 0.02).max(0.001), ..Default::default() });
+                    r.add_actor_model(1, &model);
+                    r.set_actors(vec![ActorFrame { id: 1, model: 1, ..Default::default() }]);
+                    r.render(&view, &targets, &camera);
+                    let seed = r.emissive_seed_rgba()?.context("missing bloom MRT seed")?;
+                    ensure!(seed.len() == (size * size * 4) as usize, "invalid MRT seed size");
+                    let nonzero = seed.as_chunks::<4>().0.iter().filter(|pixel|
+                        pixel[..3].iter().any(|&channel| channel != 0)).count();
+                    rendered += 1;
+                    for (mesh, body) in model.meshes.iter().enumerate() {
+                        for (material, submesh) in body.submeshes.iter().enumerate() {
+                            writeln!(csv, "{ty},{id},{name},rendered,{nonzero},{mesh},{material},{},{},{},{},{},",
+                                quote(&format!("{:?}", submesh.emissive)), submesh.glow_mask, submesh.lighting_enabled,
+                                quote(&format!("{:?}", submesh.blend)), quote(&format!("{:?}", submesh.texture)))?;
+                        }
+                    }
+                    Ok(nonzero)
+                })();
+                match result {
+                    Ok(count) => {
+                        nonzero_records += usize::from(count > 0);
+                        nonzero_pixels += count;
+                    }
+                    Err(error) => {
+                        errors += 1;
+                        writeln!(csv, "{ty},{id},{name},error,,,,,,,,,{}", quote(&format!("{error:#}")))?;
+                    }
+                }
+            }
+        }
+        r.set_actors(Vec::new());
+        r.remove_actor_model(1);
+        let summary = format!("scope=all CHAR_MESH_TYPE and CHAR_MESH_LOW_TYPE records; authored bind pose; no wire overrides or attachments; native effect0\nrenderer_contexts=1\nsize={size}x{size}\nmsaa=1\ntime=0\nambient_linear=0.05\nsun=0\nfog_density_scale=0\nshader_override={:?}\nrecords={records}\ndecoded={decoded}\nrendered={rendered}\nerrors={errors}\nnonzero_seed_records={nonzero_records}\nnonzero_seed_rgb_pixels={nonzero_pixels}\n",
+            std::env::var_os("AOMAC_SHADER_DIR"));
+        std::fs::write(out.join("authored-actor-seeds.csv"), csv)?;
+        std::fs::write(out.join("authored-actor-seeds.txt"), &summary)?;
+        eprintln!("{summary}");
+        ensure!(records > 0 && decoded == records && rendered == records && errors == 0,
+            "incomplete authored actor MRT survey: {summary}");
+        Ok(())
+    }
+    #[test]
     #[ignore = "explicit headless 120-warmup/600-sample GPU benchmark"]
     fn bloom_gpu_timing_1920x1200() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());

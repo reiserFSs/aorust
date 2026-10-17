@@ -1,10 +1,15 @@
 //! Survey of all character records: `cargo run --release -p ao-formats --example char_stats`.
+//! `--bloom` surveys authored CAT bloom eligibility (not rendered pixels), without animation/player surveys.
+//! Scope: authored bind pose, no wire texture/material overrides, rendering effect 0.
 use ao_formats::character::*;
 use ao_rdb::RecordStore;
 use std::collections::{BTreeMap, HashMap};
 
 fn main() -> anyhow::Result<()> {
     let store = RecordStore::open(&dirs_home().join("Games/ProjectRubiKa/client"))?;
+    if std::env::args().any(|a| a == "--bloom") {
+        return bloom_survey(&store);
+    }
     if std::env::args().any(|a| a == "--list") {
         // id, skeleton root, bind-pose height, vertices, bones, material texture names
         for id in store.ids(CHAR_MESH_TYPE)? {
@@ -151,6 +156,104 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!("player bodies (thin/normal/fat) with all five slots skin+default composited: {skinned}/{scenes}");
+    Ok(())
+}
+
+fn bloom_survey(store: &RecordStore) -> anyhow::Result<()> {
+    use ao_scene::Blend;
+    let names = NameTable::load(store)?;
+    let categories = ["raw_material_emissive", "effective_generic_emissive", "glow_mask", "unlit", "additive", "before_union", "after_union", "fullbright_emissive"];
+    println!("bloom eligibility: authored bind pose, effect=0, no wire texture overrides; no visibility/fog/lighting/saturation or bloom-threshold claim");
+    println!("raw_gamma is CAT emissive; material_linear is max(raw,0)^2.2; effective_linear=material_linear here");
+    println!("live overrides (not surveyed): part_materials[mesh].emissive.or(actor.emissive).unwrap_or(material); explicit zero replaces, never adds (ao-render actors.rs)");
+    println!("before_union=effective_generic_emissive|glow_mask|unlit|additive; after_union=fullbright_emissive|glow_mask|unlit|additive");
+    println!("old generic accepts effective linear channels >0; fullbright_emissive retains only channels >=1, with no tolerance");
+    println!("counts: records count once per category; submeshes are raw CAT groups, batches are assembled unique-material draws; empty index lists excluded");
+    let (mut total_records, mut total_submeshes, mut total_batches) = ([0usize; 8], [0usize; 8], [0usize; 8]);
+    let mut failures = 0;
+    for ty in [CHAR_MESH_TYPE, CHAR_MESH_LOW_TYPE] {
+        let mut ids = store.ids(ty)?;
+        ids.sort_unstable();
+        let (mut records, mut submeshes, mut batches) = ([0usize; 8], [0usize; 8], [0usize; 8]);
+        let (mut decoded, mut raw_count, mut batch_count, mut failed) = (0, 0, 0, 0);
+        for id in &ids {
+            let loaded = load_cat_mesh(store, ty, *id).and_then(|cat| load_character_record(store, ty, *id, None).map(|scene| (cat, scene)));
+            let (cat, scene) = match loaded {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    println!("FAIL\t{ty}/{id}\tname={:?}\t{e:#}", names.name(ty, *id));
+                    failed += 1;
+                    continue;
+                }
+            };
+            decoded += 1;
+            raw_count += cat.submeshes.iter().filter(|s| !s.indices.is_empty()).count();
+            // assemble() merges CAT groups by material, retaining first-use order.
+            let mut materials = Vec::new();
+            for s in cat.submeshes.iter().filter(|s| !s.indices.is_empty()) {
+                if !materials.contains(&s.material) {
+                    materials.push(s.material);
+                }
+            }
+            let rendered: Vec<_> = scene.meshes.iter().flat_map(|m| &m.submeshes).collect();
+            anyhow::ensure!(materials.len() == rendered.len(), "CAT assembly material count mismatch for {ty}/{id}");
+            let mut record = [false; 8];
+            let mut remaining = Vec::new();
+            for (material, s) in materials.into_iter().zip(rendered) {
+                batch_count += 1;
+                let raw = &cat.materials[material as usize];
+                let effective = s.emissive;
+                let additive_blend = matches!(s.blend, Blend::Additive | Blend::AdditiveOne | Blend::SourceColorOne);
+                let generic = !s.prelit && !s.liquid && s.lighting_enabled
+                    && !additive_blend && effective.iter().any(|&c| c > 0.0);
+                let glow = s.glow_mask && !s.prelit && !s.liquid && s.lighting_enabled && !additive_blend;
+                let unlit = !s.lighting_enabled && !s.liquid;
+                let additive = additive_blend && !s.liquid;
+                let fullbright_channels = effective.map(|c| c >= 1.0);
+                let fullbright = generic && fullbright_channels.iter().any(|&channel| channel);
+                let explicit = glow || unlit || additive;
+                let after = fullbright || explicit;
+                let flags = [raw.emissive.iter().any(|&c| c > 0.0), generic, glow, unlit, additive, generic || explicit, after, fullbright];
+                let multiplicity = cat.submeshes.iter().filter(|sm| sm.material == material && !sm.indices.is_empty()).count();
+                for (i, yes) in flags.into_iter().enumerate() {
+                    if yes {
+                        record[i] = true;
+                        submeshes[i] += multiplicity;
+                        batches[i] += 1;
+                    }
+                }
+                if flags[0] || flags[5] {
+                    let reasons: Vec<_> = [(glow, "alpha_glow_mask"), (unlit, "native_unlit"), (additive, "authored_additive"), (fullbright, "fullbright_emissive")]
+                        .into_iter().filter_map(|(yes, why)| yes.then_some(why)).collect();
+                    println!("material\t{ty}/{id}\tname={:?}\tmaterial={material}:{:?}\ttexture={:?}\tflags={:#x}\tdefault_alpha_mode={}\topacity={}\traw_gamma={:?}\tmaterial_linear={:?}\teffective_linear={effective:?}\told_generic={generic}\tfullbright_channels={fullbright_channels:?}\tafter={after}\twhy={}\tblend={:?}\traw_submeshes={multiplicity}",
+                        names.name(ty, *id), raw.name, s.texture, raw.flags, default_alpha_mode(raw.flags), raw.opacity, raw.emissive, s.emissive, reasons.join("+"), s.blend);
+                    if after {
+                        remaining.push(format!("{material}:{}:{}:effective_linear={effective:?}:fullbright_channels={fullbright_channels:?}", raw.name, reasons.join("+")));
+                    }
+                }
+            }
+            println!("record\t{ty}/{id}\tname={:?}\troot={:?}\traw_emissive={}\teffective_generic={}\tglow_mask={}\tunlit={}\tadditive={}\tbefore={}\tafter={}\tfullbright_emissive={}",
+                names.name(ty, *id), cat.root, record[0], record[1], record[2], record[3], record[4], record[5], record[6], record[7]);
+            if !remaining.is_empty() {
+                println!("remaining\t{ty}/{id}\tname={:?}\troot={:?}\twhy={}", names.name(ty, *id), cat.root, remaining.join(";"));
+            }
+            for (i, yes) in record.into_iter().enumerate() {
+                records[i] += usize::from(yes);
+            }
+        }
+        println!("population\t{ty}\tauthored={}\tdecoded={decoded}\tfailed={failed}\traw_submeshes={raw_count}\tmaterial_batches={batch_count}", ids.len());
+        for (i, category) in categories.iter().enumerate() {
+            println!("summary\t{ty}\t{category}\trecords={}\tsubmeshes={}\tbatches={}", records[i], submeshes[i], batches[i]);
+            total_records[i] += records[i];
+            total_submeshes[i] += submeshes[i];
+            total_batches[i] += batches[i];
+        }
+        failures += failed;
+    }
+    for (i, category) in categories.iter().enumerate() {
+        println!("total\t{category}\trecords={}\tsubmeshes={}\tbatches={}", total_records[i], total_submeshes[i], total_batches[i]);
+    }
+    anyhow::ensure!(failures == 0, "{failures} CAT records failed; bloom population survey is incomplete");
     Ok(())
 }
 

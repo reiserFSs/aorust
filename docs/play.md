@@ -606,6 +606,40 @@ AOMAC_GFX_SETTINGS=faithful \
 cargo test --profile fast -p aomac graphics_offline_fixture -j 2 -- \
   --ignored --nocapture --test-threads=1
 ```
+
+The real-asset `graphics_bloom_shore_snake_seed` regression reconstructs Shore Snake
+from `zone_ithaca.rec` (MonsterData 30252, CAT mesh 23353, texture 23354) and renders
+its actual actor body with bloom enabled. It requires exactly zero RGB seed pixels
+and byte-identical faithful/bloom body colour; native Light Bar mesh 26163 must
+still produce a positive seed. It writes framed body/control beauty and MRT PNG
+crops before assertions to a new `AOMAC_GFX_OUT` directory:
+
+```sh
+AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/my-new-bloom-seed-run" \
+cargo test --profile fast -p aomac graphics_bloom_shore_snake_seed -j 2 -- \
+  --ignored --nocapture --test-threads=1
+```
+
+`AOMAC_GFX_BASELINE=<previous-run>` additionally compares both faithful captures
+byte-for-byte with that directory. `cargo run --release -p ao-formats --example
+char_stats -- --bloom` surveys both full/low-detail authored CAT populations,
+listing partial-emission floors versus fully self-lit channels and native
+alpha-glow/unlit/additive eligibility, with every remaining actor's material reason.
+Survey eligibility does not claim visible pixels: native lighting saturation,
+fog, coverage and depth still determine the rendered mask. The companion
+`cargo run --release -p ao-formats --example mesh_stats -- --bloom` surveys both
+archive populations through the same decode path as statels and worn rigid
+equipment, retaining full-bright lamps/signs/screens rather than treating
+all nonzero emission as a glow source.
+The ignored `ao-render` test `graphics_bloom_authored_actor_survey` also renders
+every full/low-detail CAT record through one reused headless renderer at 128²,
+reading the actual emission attachment. Set a new `AOMAC_GFX_OUT`; it writes
+per-material CSV and complete/error/nonzero-record totals. The bind-pose survey
+uses fixed low ambient, no sun, fog or wire overrides, and retires each GPU model.
+The individual-object fixture additionally captures tree 6264, barchair 8752,
+cupboard 10295, shelf 10298, lamp 13937 and sign 6113, reporting per-object
+RGB/Rec.709 seed energy rather than asserting those author-fullbright assets dark.
+
 `AOMAC_GFX_SETTINGS` accepts `faithful` (default, all switches off), `neutral`
 (Enhanced boundary with zero-density grass), `shadows`, `ao`, `bloom`, `grass`,
 or `all`. `all-no-bloom` differs from `all` only by disabling bloom, for highlight

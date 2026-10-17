@@ -1085,3 +1085,5 @@ fn graphics_bloom_gpu_timing() -> anyhow::Result<()> {
 }
 #[path = "grass_shots.rs"]
 mod grass_shots;
+#[path = "bloom_seeds.rs"]
+mod bloom_seeds;

@@ -40,13 +40,17 @@ fn enhanced_ground_receiver(i: VOut, beauty: vec4<f32>, multiplier: bool) -> vec
     return vec4<f32>(min(clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), diffuse * ao_share(sky_fraction)), beauty.a);
 }
 fn enhanced_emission(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
-    // Liquid emission is native lighting authoring, not a bloom source.
-    // SourceColorOne and authored unlit materials use actual post-body beauty.
+    // SetMaterial (Randy1004b199) supplies a lighting floor, not a glow flag.
+    // Only channels that alone saturate native D3D7 lighting are self-lit;
+    // partial emission (Shore Snake's 0.5 grey) still depends on scene light.
+    // Alpha mode 5 (Randy10040645) separately authors a self-illumination mask.
     if (u32(mat.native.z) & 24u) != 0u || native_unlit() { return vec4<f32>(0.0); }
+    let authored_emissive = vec3<f32>(i.ao_info.w, i.sun_share.w, i.sun_spec_share.w);
     let t = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z);
     var emission = vec3<f32>(0.0);
     if mat.emissive.w < 1.5 {
-        emission = t.rgb * i.tint * min(i.light, to_g(vec3<f32>(i.ao_info.w, i.sun_share.w, i.sun_spec_share.w)));
+        let self_lit = select(vec3<f32>(0.0), to_g(authored_emissive), authored_emissive >= vec3<f32>(1.0));
+        emission = t.rgb * i.tint * min(i.light, self_lit);
     }
     if mat.emissive.w > 0.5 && mat.emissive.w < 1.5 && (i.effect == 0u || i.effect == 3u || i.effect == 7u) {
         emission = max(emission, t.rgb * i.tint * max(min(i.light + t.a, vec3<f32>(1.0)) - i.light, vec3<f32>(0.0)));
