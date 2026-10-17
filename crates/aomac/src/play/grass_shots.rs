@@ -37,7 +37,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
         ensure!(output.status.success(), "{program} failed");
         writeln!(report, "{key}={:?}", String::from_utf8(output.stdout)?.trim())?;
     }
-    let mut views = graphics_fixture_views(&actor);
+    let mut views = Vec::new();
     for (name, pf, time, reference) in [
         ("icc-grass-ground", 4582, 2648.69, ao_render::Vec3::new(933.5, 26.0, -748.0)),
         ("borealis-grass-ground", 800, 3240.0, ao_render::Vec3::new(652.0, 65.3, -420.0)),
@@ -52,6 +52,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
         views.push((format!("{name}-day"), pf, time, fixed));
         if pf == 800 { views.push((format!("{name}-night"), pf, 0.0, fixed)); }
     }
+    views.extend(graphics_fixture_views(&actor));
     std::fs::write(out.join("manifest.txt"), &report)?;
     for (name, pf, time, fixed) in views.into_iter().filter(|(name, _, _, _)| !matches!(name.as_str(), "icc-actor-authored" | "borealis-lightbar-night")) {
         ao_scene::crt_srand(1);
@@ -100,7 +101,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 let generation_stats = percentiles(&mut generation);
                 medians[variant] = gpu_stats.0;
                 allocated[variant] = off.gpu_allocated_bytes();
-                writeln!(report, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} settings={settings:?} round={round} variant={variant} gpu_ms_p50_p95_p99={gpu_stats:?} prepare_wall_ms_p50_p95_p99={prepare_stats:?} effect_gpu_payload_bytes={bytes} cells={cells} max_blade_candidates={}", cells * 16)?;
+                writeln!(report, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} settings={settings:?} round={round} variant={variant} gpu_ms_p50_p95_p99={gpu_stats:?} prepare_wall_ms_p50_p95_p99={prepare_stats:?} effect_gpu_payload_bytes={bytes} cells={cells} max_tuft_candidates={} max_blade_candidates={}", cells * 128, cells * 128 * 7)?;
                 writeln!(report, "generation_wall_ms_p50_p95_p99={generation_stats:?} generation_mean_ms={generation_mean} generation_max_ms={generation_max}")?;
                 writeln!(report, "native_metal_allocated_bytes={:?} shared_enhanced_target_bytes={}", allocated[variant], off.enhanced_target_bytes())?;
                 if round == 0 && variant == 1 { writeln!(report, "grass_diagnostics_view={name}\n{}", off.evidence_grass_diagnostics())?; }
@@ -180,11 +181,13 @@ fn grass_ground_camera(
             .filter(|neighbor| cells.contains_key(neighbor)).count();
         if best.as_ref().is_some_and(|old| neighbors < old.0 || (neighbors == old.0 && distance >= old.1)) { continue; }
         if !cell.samples.iter().all(|point| (exposure.query)(point.to_array()) && matches!(surface.ground_material(point.to_array()), 6 | 15)) { continue; }
-        let full_radius = 0.65 * 30.0f32.min((44.0 / 3.0 - 3.0) * cell.size).min(12.5 * cell.size);
+        let full_radius = 0.72 * 50.0f32.min((44.0 / 3.0 - 3.0) * cell.size).min(12.5 * cell.size);
         let offset = 8.0f32.min(full_radius * 0.6);
         for direction in [Vec3::Z, Vec3::X, -Vec3::Z, -Vec3::X] {
             let mut eye = cell.root + direction * offset;
-            let Some(ground) = surface.ground((eye + Vec3::Y * 15.0).to_array()) else { continue; };
+            let ground = [-2.0, 0.0, 2.0].into_iter().flat_map(|x| [-2.0, 0.0, 2.0].into_iter().map(move |z| [eye.x + x, eye.y + 15.0, eye.z + z]))
+                .filter_map(|point| surface.ground(point)).max_by(f32::total_cmp);
+            let Some(ground) = ground else { continue; };
             eye.y = ground + 1.7;
             if eye.distance(cell.root) >= full_radius { continue; }
             let at = cell.root + Vec3::Y * 0.2;

@@ -198,7 +198,7 @@ impl DValues {
         s.add("AomacShadowMapSize", Variant::Int(1024), true, CAT_MAIN, Some(Variant::Int(256)), Some(Variant::Int(4096)), false);
         for (name, default, max) in [
             ("AomacAoRadius", 1.0, 5.0), ("AomacAoStrength", 1.0, 1.0), ("AomacBloomStrength", 0.6, 1.0),
-            ("AomacGrassDensity", 1.0, 2.0), ("AomacGrassDistance", 30.0, 35.0),
+            ("AomacGrassDensity", 1.0, 2.0), ("AomacGrassDistance", 50.0, 60.0),
         ] {
             s.add(name, Variant::Float(default), true, CAT_MAIN, Some(Variant::Float(0.0)), Some(Variant::Float(max)), false);
         }

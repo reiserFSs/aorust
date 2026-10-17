@@ -1392,7 +1392,7 @@ MSAA is independently selectable; there is no player-facing master/HDR switch.
 | Ambient Occlusion Strength / `AomacAoStrength` | 1 | 0–1 |
 | Emissive Bloom Strength / `AomacBloomStrength` | 0.6 | 0–1 |
 | Ground Grass Density / `AomacGrassDensity` | 1 | 0–2 |
-| Ground Grass Distance / `AomacGrassDistance` | 30 m | 0–35 m |
+| Ground Grass Distance / `AomacGrassDistance` | 50 m | 0–60 m |
 
 These are aomac-only artistic controls, not reconstructed retail settings. Values are bounded
 at the renderer settings boundary; non-finite floats use the documented defaults.

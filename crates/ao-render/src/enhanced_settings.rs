@@ -19,7 +19,7 @@ impl Default for EnhancedSettings {
         Self {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false,
             shadow_map_size: 1024, ao_radius: 1.0, ao_strength: 1.0, bloom_strength: 0.6,
-            grass_density: 1.0, grass_distance: 30.0,
+            grass_density: 1.0, grass_distance: 50.0,
         }
     }
 }
@@ -41,7 +41,7 @@ impl EnhancedSettings {
             ao_strength: finite(self.ao_strength, 1.0, defaults.ao_strength),
             bloom_strength: finite(self.bloom_strength, 1.0, defaults.bloom_strength),
             grass_density: finite(self.grass_density, 2.0, defaults.grass_density),
-            grass_distance: finite(self.grass_distance, 35.0, defaults.grass_distance),
+            grass_distance: finite(self.grass_distance, 60.0, defaults.grass_distance),
             ..self
         }
     }
@@ -67,10 +67,10 @@ mod tests {
         }
         let bounded = EnhancedSettings {
             shadow_map_size: 0, ao_radius: -1.0, ao_strength: 3.0, bloom_strength: 2.0,
-            grass_density: 4.0, grass_distance: 50.0, ..defaults
+            grass_density: 4.0, grass_distance: 100.0, ..defaults
         }.clamped();
         assert_eq!((bounded.shadow_map_size, bounded.ao_radius, bounded.ao_strength), (256, 0.0, 1.0));
-        assert_eq!((bounded.bloom_strength, bounded.grass_density, bounded.grass_distance), (1.0, 2.0, 35.0));
+        assert_eq!((bounded.bloom_strength, bounded.grass_density, bounded.grass_distance), (1.0, 2.0, 60.0));
         assert_eq!(EnhancedSettings { shadow_map_size: u32::MAX, ..defaults }.clamped().shadow_map_size, 4096);
         for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert_eq!(EnhancedSettings {

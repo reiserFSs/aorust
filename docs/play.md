@@ -530,11 +530,15 @@ vegetation geometry. Only native ground material 15 (grass texture IDs 2/258) or
 6 (drygrass 291/685) admits blades; unknown materials, coarse terrain LOD cells,
 liquid-overlapped cells, room floors and roads do not. Source-triangle liquid
 bounds conservatively omit some shoreline grass. GPU expansion uses a fixed
-world-cell/texture hash, sixteen candidates per cell and at most 1024 cells
-(16,384 blades). Density rejects stable candidates rather than reseeding them.
-Distance fade ends at the smaller of the selected radius, 35 m and the original
-projection far plane, native fully-fine terrain radius and the fixed cell-budget
-radius. Collision and selection are unchanged.
+world-cell/texture hash, 128 tuft sites per cell and at most 1024 cells. Each tuft
+spreads 3–7 thin, tapered two-segment strips with curved lean and ±40% height
+variation; density thins stable tuft sites with distance
+rather than reseeding them. The default distance is 50 m (bounded to 60 m), further
+limited by the original projection far plane, native fully-fine terrain radius
+and fixed cell budget. Each native triangle admits grass up to about 40°;
+one steep half does not discard its valid neighbor. The slope uses actual
+triangle gradients, not the direction-dependent corner height range.
+Collision and selection are unchanged.
 
 Native substrate alone is not proof that terrain is exposed: statel floors may
 overlay a grass cell. An opt-in callback reuses the loaded native `Collision`
@@ -555,6 +559,10 @@ and interpolates them on the native diagonal, including per-corner saturation
 and ambient for the simple-ground path. Fused and two-pass fog composition retain
 their native equations. Blade tips never acquire a new light budget, and fog is
 at least the root's interpolated native fog.
+Blade tint samples the original texture at its root. Per-blade hue/brightness
+jitter and the darker-base/lighter-tip gradient only subtract from that budget;
+both faces use the same terrain-normal lighting. Ordered dither softens the far
+fade without adding light or retaining temporal/actor history.
 Wind uses the current native weather wind; time is the renderer's existing clock.
 Calm or unavailable weather stays still; no synthetic fallback breeze is invented.
 
