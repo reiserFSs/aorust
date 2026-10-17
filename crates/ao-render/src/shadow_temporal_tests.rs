@@ -140,6 +140,25 @@ fn temporal_shadow_world_receivers_remain_stable() {
         // Cross a real fog gradient: receiver clipping must not resize texels.
         renderer.fog = if case == "orbit_walk" { scene.fog_model.clone() } else { None };
         renderer.set_fog_density_scale(1.0);
+        let prepare = |renderer: &mut Renderer, frame: usize| {
+            let camera = camera(frame, case == "orbit_walk");
+            let sun = if case == "sun_time" {
+                Mat4::from_rotation_y(frame as f32 * 0.000025).transform_vector3(SUN)
+            } else { SUN };
+            renderer.time = frame as f32 / 60.0;
+            renderer.env.sun_dir = sun.to_array();
+            renderer.set_actors(if has_actor { vec![actor(frame, &model.meshes[0].vertices)] } else { vec![] });
+            renderer.shadow_sun = Some(sun.to_array());
+            (camera, sun)
+        };
+        // Capture controls first; the measured sequence must contain 90 genuinely
+        // consecutive shadow-on frames, starting with fresh shadow resources.
+        renderer.set_enhanced_settings(EnhancedSettings::default());
+        let references: Vec<_> = (0..FRAMES).map(|frame| {
+            let (camera, _) = prepare(&mut renderer, frame);
+            capture(&mut renderer, &camera)
+        }).collect();
+        renderer.set_enhanced_settings(EnhancedSettings { sun_shadows: true, ..Default::default() });
         let mut previous = vec![None::<(f32, bool)>; grid.len()];
         let mut first = Vec::new();
         let mut last = Vec::new();
@@ -154,21 +173,12 @@ fn temporal_shadow_world_receivers_remain_stable() {
         let mut min_lit = usize::MAX;
         let mut actor_motion = 0.0_f32;
         let mut sheet = vec![0; (WIDTH * 5 * HEIGHT * 2 * 4) as usize];
-        for frame in 0..FRAMES {
-            let camera = camera(frame, case == "orbit_walk");
-            let sun = if case == "sun_time" {
-                Mat4::from_rotation_y(frame as f32 * 0.000025).transform_vector3(SUN)
-            } else { SUN };
-            renderer.time = frame as f32 / 60.0;
-            renderer.env.sun_dir = sun.to_array();
-            renderer.set_actors(if has_actor { vec![actor(frame, &model.meshes[0].vertices)] } else { vec![] });
-            renderer.shadow_sun = Some(sun.to_array());
+        for (frame, unshadowed) in references.iter().enumerate() {
+            let (camera, sun) = prepare(&mut renderer, frame);
             let shadowed = capture(&mut renderer, &camera);
             if has_actor {
                 assert!(renderer.sun_shadows.as_ref().unwrap().actor_ids.contains(&1), "animated actor never entered the shadow pass");
             }
-            renderer.shadow_sun = None;
-            let unshadowed = capture(&mut renderer, &camera);
             let aspect = WIDTH as f32 / HEIGHT as f32;
             let vp = Mat4::perspective_rh(renderer.lens.vertical_fov(aspect), aspect,
                 renderer.lens.near, renderer.lens.far.unwrap_or(132.0))
@@ -196,7 +206,7 @@ fn temporal_shadow_world_receivers_remain_stable() {
                         && ground_visible(camera.pos, receiver, has_actor)
                 }));
                 if !footprint_clear { previous[index] = None; continue; }
-                let difference = (pixel_energy(&unshadowed, x, y) - pixel_energy(&shadowed, x, y)).max(0.0);
+                let difference = (pixel_energy(unshadowed, x, y) - pixel_energy(&shadowed, x, y)).max(0.0);
                 // Native fog mixes in gamma space. Divide out its transmittance
                 // so legitimate fog fading is not reported as shadow flicker.
                 let transmission = renderer.fog.as_ref().map_or(1.0, |fog| {
@@ -245,7 +255,7 @@ fn temporal_shadow_world_receivers_remain_stable() {
                 }
                 if let Some(directory) = &evidence {
                     write_png(&directory.join(format!("temporal_{case}_{frame:03}.png")), WIDTH, HEIGHT, &shadowed);
-                    let mask: Vec<_> = shadowed.chunks_exact(4).zip(unshadowed.chunks_exact(4))
+                    let mask: Vec<_> = shadowed.as_chunks::<4>().0.iter().zip(unshadowed.as_chunks::<4>().0)
                         .flat_map(|(a, b)| {
                             let d = b[0].saturating_sub(a[0]).saturating_mul(3);
                             [d, d, d, 255]
@@ -261,7 +271,7 @@ fn temporal_shadow_world_receivers_remain_stable() {
         renderer.shadow_sun = Some(SUN.to_array());
         renderer.set_actors(if has_actor { vec![actor(0, &model.meshes[0].vertices)] } else { vec![] });
         let repeated = capture(&mut renderer, &camera(0, false));
-        let repeated_pixels = first.chunks_exact(4).zip(repeated.chunks_exact(4)).filter(|(a, b)| a != b).count();
+        let repeated_pixels = first.as_chunks::<4>().0.iter().zip(repeated.as_chunks::<4>().0).filter(|(a, b)| a != b).count();
         let mean = interior_sum / interior_pairs.max(1) as f32;
         let edge_mean = edge_sum / edge_pairs.max(1) as f32;
         let metrics = format!("case={case} frames={FRAMES} interior_pairs={interior_pairs} interior_mean={mean:.8} interior_max={interior_max:.8} changed_over_2_codes={changed} edge_pairs={edge_pairs} edge_mean={edge_mean:.8} edge_max={edge_max:.8} min_dark={min_shadowed} min_lit={min_lit} repeated_changed_pixels={repeated_pixels} actor_motion={actor_motion:.8}\n");
