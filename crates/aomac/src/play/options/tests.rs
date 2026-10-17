@@ -899,7 +899,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     d.set("AomacShadowMapSize", Variant::Int(2048));
     for (name, value) in [
         ("AomacShadowStrength", 0.4), ("AomacShadowSoftness", 2.0), ("AomacAoRadius", 2.0), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
-        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5),
+        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5),
     ] {
         assert!(d.persists(name));
         d.set(name, Variant::Float(value));
@@ -939,7 +939,7 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     assert_eq!(r.d.enhanced_settings().shadow_map_size, 2048);
     for (name, value) in [
         ("AomacShadowStrength", 0.4), ("AomacShadowSoftness", 2.0), ("AomacAoRadius", 2.5), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
-        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5),
+        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5),
     ] {
         let view = r.show(name);
         let event = Event::SliderChanged { window: r.win(), view, value, final_change: true };

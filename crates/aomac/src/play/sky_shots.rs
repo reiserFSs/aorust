@@ -600,7 +600,7 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "bloom" => settings.emissive_bloom = true,
         "grass" => settings.ground_grass = true,
         "hdr" => settings.hdr = true,
-        "hdr-neutral" => { settings.hdr = true; settings.sun_boost = 0.0; }
+        "hdr-neutral" => { settings.hdr = true; settings.sun_boost = 0.0; settings.grade_strength = 0.0; }
         "all" => {
             settings.sun_shadows = true;
             settings.ambient_occlusion = true;

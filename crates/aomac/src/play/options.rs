@@ -312,6 +312,7 @@ fn enhanced_page() -> Page {
             Item::Opt(slider("AomacBloomStrength", "Emissive Bloom Strength", "%.2f")),
             Item::Opt(check("AomacHdr", "HDR Sunlight and Tonemap")),
             Item::Opt(slider("AomacSunBoost", "Sunlight Brightness", "%.2f")),
+            Item::Opt(slider("AomacGrade", "Colour Grade (warm sun, cool shade)", "%.2f")),
             Item::Opt(check("AomacGroundGrass", "Ground Grass")),
             Item::Opt(slider("AomacGrassDensity", "Ground Grass Density", "%.2fx")),
             Item::Opt(slider("AomacGrassDistance", "Ground Grass Distance", "%.1f m")),

@@ -1400,6 +1400,7 @@ sun-boosted.
 | Ambient Occlusion Radius / `AomacAoRadius` | 1 m | 0–5 m |
 | Ambient Occlusion Strength / `AomacAoStrength` | 1 | 0–1 |
 | Sunlight Brightness / `AomacSunBoost` | 0.35 | 0–0.6 (peak lift of fully sunlit daylight surfaces; 0 = faithful) |
+| Colour Grade / `AomacGrade` | 0.7 | 0–1 (HDR present only: saturation, warm sunlit / cool shade / cool night darks; every step renormalised to the input luminance and never above it, so it cannot lift night, shadow or fog luminance; 0 = off) |
 | Emissive Bloom Strength / `AomacBloomStrength` | 0.6 | 0–1 |
 | Ground Grass Density / `AomacGrassDensity` | 1 | 0–2 |
 | Ground Grass Distance / `AomacGrassDistance` | 50 m | 0–60 m |

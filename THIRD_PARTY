@@ -19,3 +19,12 @@ crates/ao-render/src/sun_shadows.wgsl follows the algorithm of
 `CascadeVisibility` in ao-vk (https://github.com/wannabuh/ao-vk,
 rvk/shaders/ffp_main.glsl), MIT licensed. The WGSL is an independent
 reimplementation of the algorithm, not copied source.
+
+HDR tonemap, grade and dither
+=============================
+
+The highlight knee, sunlit-warm / shade-cool chroma grade and interleaved-gradient
+dither in crates/ao-render/src/grade.wgsl follow the approach of `tonemap.frag`
+(`Grade()`, `Dither8`) in ao-vk (https://github.com/wannabuh/ao-vk), MIT licensed.
+The WGSL is an independent reimplementation: the tone curve, the luminance-preserving
+grade and the sun-weight gating are original to this project.

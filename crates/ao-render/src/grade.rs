@@ -36,7 +36,7 @@ impl Grade {
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         }).create_view(&Default::default());
-        let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Enhanced grade parameters"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Enhanced grade parameters"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let hdr_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced HDR scene"), layout: source_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr) }] });
         let aux_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced grade inputs"), layout: &aux_layout, entries: &[
@@ -46,7 +46,12 @@ impl Grade {
         Self { size, hdr_bg, hdr, aux_bg, params, expose: make("expose", HDR), present: make("present", output) }
     }
 
-    pub fn bytes(size: (u32, u32)) -> u64 { u64::from(size.0) * u64::from(size.1) * 8 + 16 }
+    pub fn bytes(size: (u32, u32)) -> u64 { u64::from(size.0) * u64::from(size.1) * 8 + 32 }
+
+    /// Chroma grade inputs: strength and the day / low-sun / night weights (see [`time_of_day`]).
+    pub fn set_grade(&self, queue: &wgpu::Queue, strength: f32, tod: [f32; 3]) {
+        queue.write_buffer(&self.params, 16, bytemuck::cast_slice(&[strength, tod[0], tod[1], tod[2]]));
+    }
 
     /// `base` is the native-range colour (bloomed when bloom is on); the result is written to `output`.
     pub fn encode(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, base: &wgpu::BindGroup, output: &wgpu::TextureView, boost: f32, timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>) {
@@ -67,6 +72,16 @@ impl Grade {
     }
 }
 
+/// Day, low-sun and night weights from the authored environment: day follows the authored sun strength, low sun the
+/// authored elevation (warm), night the absence of both sun and moon-lit ambient (cool darks).
+pub(super) fn time_of_day(sun_color: [f32; 3], sun_dir: [f32; 3]) -> [f32; 3] {
+    let smooth = |a: f32, b: f32, x: f32| { let t = ((x - a) / (b - a)).clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) };
+    let strength = 0.2126 * sun_color[0] + 0.7152 * sun_color[1] + 0.0722 * sun_color[2];
+    let elevation = glam::Vec3::from(sun_dir).normalize_or_zero().y;
+    let day = smooth(0.12, 0.45, strength);
+    [day, (1.0 - smooth(0.2, 0.6, elevation)) * day, 1.0 - day]
+}
+
 impl crate::Renderer {
     pub(super) fn prepare_enhanced_grade(&mut self) {
         if !self.enhanced_settings.hdr { self.grade = None; return; }
@@ -75,12 +90,47 @@ impl crate::Renderer {
             let sun = frame.sun.as_ref().expect("HDR owns its world sun mask");
             self.grade = Some(Grade::new(&self.device, self.format, frame.size, &frame.composite.get_bind_group_layout(0), sun));
         }
+        if let Some(grade) = &self.grade {
+            grade.set_grade(&self.queue, self.enhanced_settings.grade_strength, time_of_day(self.env.sun_color, self.env.sun_dir));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Colour ramp through expose + present with no sun boost, returning (native, graded) RGB.
+    fn grade_colours(strength: f32, tod: [f32; 3]) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
+        let native: Vec<[u8; 3]> = (0..=255u8).map(|i| [i, i / 2, 255 - i]).collect();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = crate::Renderer::new(&instance, None).expect("grade regression needs an offscreen GPU");
+        let texture = |format, usage| r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("grade regression"), size: wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[],
+        });
+        let base = texture(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let sun_tex = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let out = texture(r.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        let pixels: Vec<u8> = native.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+        let sun_data: Vec<f32> = (0..256).flat_map(|_| [0.0_f32, 0.0, 0.0, 1.0]).collect();
+        let copy = wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 };
+        r.queue.write_texture(base.as_image_copy(), &pixels, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024), rows_per_image: Some(1) }, copy);
+        r.queue.write_texture(sun_tex.as_image_copy(), bytemuck::cast_slice(&sun_data), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4096), rows_per_image: Some(1) }, copy);
+        let layout = r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None }] });
+        let base_view = base.create_view(&Default::default());
+        let base_bg = r.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&base_view) }] });
+        let grade = Grade::new(&r.device, r.format, (256, 1), &layout, &sun_tex.create_view(&Default::default()));
+        grade.set_grade(&r.queue, strength, tod);
+        let mut encoder = r.device.create_command_encoder(&Default::default());
+        grade.encode(&r.queue, &mut encoder, &base_bg, &out.create_view(&Default::default()), 0.0, None);
+        r.queue.submit([encoder.finish()]);
+        let rgba = crate::texture_to_rgba(&r, &out, 256, 1).unwrap();
+        let bgra = r.format == wgpu::TextureFormat::Bgra8Unorm;
+        (native, rgba.chunks(4).map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }).collect())
+    }
 
     /// Runs the real expose + present shaders over a 256x1 grey ramp; `sun` is the sun weight written to every pixel.
     fn ramp(boost: f32, sun: f32) -> Vec<u8> {
@@ -118,6 +168,23 @@ mod tests {
         assert_eq!(ramp(0.0, 1.0), native, "zero boost must reproduce the faithful codes despite dither");
         assert_eq!(ramp(0.35, 0.0), native, "pixels without a sun weight (night, shadow, fog, sky) are never lifted");
         assert_eq!(ramp(0.35, 0.25), native, "dusk-level sun shares stay below the daylight ramp");
+    }
+
+    /// Grey ramp is chroma-free, so grade it through colour: (i, i/2, 255-i) pixels, luminance compared per code.
+    #[test]
+    fn chroma_grade_preserves_luminance_and_is_off_at_zero_strength() {
+        let strength = |s: f32, tod: [f32; 3]| grade_colours(s, tod);
+        let luma = |p: [u8; 3]| 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]);
+        for tod in [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+            let (native, graded) = strength(1.0, tod);
+            assert!(native.iter().zip(&graded).any(|(a, b)| a != b), "grade must change chroma for {tod:?}");
+            for (a, b) in native.iter().zip(&graded) {
+                assert!(luma(*b) <= luma(*a) + 1.5, "grade lifted luminance {a:?} -> {b:?} at {tod:?}");
+                assert!(luma(*b) >= luma(*a) - 6.0, "grade dimmed luminance {a:?} -> {b:?} at {tod:?}");
+            }
+        }
+        let (native, graded) = strength(0.0, [1.0, 1.0, 0.0]);
+        assert_eq!(native, graded, "strength 0 keeps native codes");
     }
 
     #[test]

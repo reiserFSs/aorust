@@ -20,6 +20,8 @@ pub struct EnhancedSettings {
     pub grass_distance: f32,
     /// Peak extra brightness of a fully sunlit, unshadowed, unfogged daylight surface (0 = faithful).
     pub sun_boost: f32,
+    /// Chroma-only grade strength inside the HDR present (luminance-preserving; 0 = off).
+    pub grade_strength: f32,
 }
 
 impl Default for EnhancedSettings {
@@ -27,7 +29,7 @@ impl Default for EnhancedSettings {
         Self {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false,
             shadow_map_size: 2048, shadow_strength: 0.65, shadow_softness: 1.5, ao_radius: 1.0, ao_strength: 1.0, bloom_strength: 0.6,
-            grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.35,
+            grass_density: 1.0, grass_distance: 50.0, sun_boost: 0.35, grade_strength: 0.7,
         }
     }
 }
@@ -53,6 +55,7 @@ impl EnhancedSettings {
             grass_density: finite(self.grass_density, 2.0, defaults.grass_density),
             grass_distance: finite(self.grass_distance, 60.0, defaults.grass_distance),
             sun_boost: finite(self.sun_boost, 0.6, defaults.sun_boost),
+            grade_strength: finite(self.grade_strength, 1.0, defaults.grade_strength),
             ..self
         }
     }
@@ -72,7 +75,7 @@ mod tests {
             let settings = EnhancedSettings {
                 sun_shadows: mask & 1 != 0, ambient_occlusion: mask & 2 != 0,
                 emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, hdr: mask & 16 != 0,
-                ao_strength: 0.0, bloom_strength: 0.0, grass_density: 0.0, sun_boost: 0.0, ..defaults
+                ao_strength: 0.0, bloom_strength: 0.0, grass_density: 0.0, sun_boost: 0.0, grade_strength: 0.0, ..defaults
             };
             assert_eq!(settings.any_enabled(), mask != 0);
         }
@@ -90,7 +93,7 @@ mod tests {
         for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert_eq!(EnhancedSettings {
                 shadow_strength: invalid, shadow_softness: invalid, ao_radius: invalid, ao_strength: invalid, bloom_strength: invalid,
-                grass_density: invalid, grass_distance: invalid, sun_boost: invalid, ..defaults
+                grass_density: invalid, grass_distance: invalid, sun_boost: invalid, grade_strength: invalid, ..defaults
             }.clamped(), defaults);
         }
     }

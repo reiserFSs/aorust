@@ -199,7 +199,7 @@ impl DValues {
         for (name, default, max) in [
             ("AomacShadowStrength", 0.65, 1.0), ("AomacShadowSoftness", 1.5, 4.0),
             ("AomacAoRadius", 1.0, 5.0), ("AomacAoStrength", 1.0, 1.0), ("AomacBloomStrength", 0.6, 1.0),
-            ("AomacGrassDensity", 1.0, 2.0), ("AomacGrassDistance", 50.0, 60.0), ("AomacSunBoost", 0.35, 0.6),
+            ("AomacGrassDensity", 1.0, 2.0), ("AomacGrassDistance", 50.0, 60.0), ("AomacSunBoost", 0.35, 0.6), ("AomacGrade", 0.7, 1.0),
         ] {
             s.add(name, Variant::Float(default), true, CAT_MAIN, Some(Variant::Float(0.0)), Some(Variant::Float(max)), false);
         }
@@ -247,6 +247,7 @@ impl DValues {
             grass_density: self.get_f32("AomacGrassDensity").unwrap_or(defaults.grass_density),
             grass_distance: self.get_f32("AomacGrassDistance").unwrap_or(defaults.grass_distance),
             sun_boost: self.get_f32("AomacSunBoost").unwrap_or(defaults.sun_boost),
+            grade_strength: self.get_f32("AomacGrade").unwrap_or(defaults.grade_strength),
         }.clamped()
     }
 
