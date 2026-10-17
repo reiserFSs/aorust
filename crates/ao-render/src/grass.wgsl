@@ -170,7 +170,12 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let keep = thinning_keep(dist);
     let by_rank = smoothstep(0.0, min(0.08, keep * 0.25), max(keep - rank, 0.0));
     let by_range = 1.0 - smoothstep(0.7 * radius, radius, dist);
-    let fade = by_rank * by_range;
+    // Enhanced blades are added visibility, so they never appear where the authored playfield-time has no native
+    // daylight (ambient_g.w, grade::daylight_weight): the night rule forbids raising a night region's brightness
+    // or visibility above the original, and a blade can only add. The gate is exactly 1 for every authored
+    // daylight/dusk value (the smallest is dusk 0.25), so daylight ground is untouched.
+    let daylight_gate = smoothstep(0.0, 0.05, g.ambient_g.w);
+    let fade = by_rank * by_range * daylight_gate;
     if fade <= 0.002 { return o; }
     o.coverage = vec2<f32>(by_range, 1.0);
     let widen = min(inverseSqrt(keep), 6.0);

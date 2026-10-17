@@ -649,6 +649,93 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     Ok(())
 }
 
+/// Enhanced night rule regression: with bloom off, no Enhanced profile may make an authored-night pixel brighter
+/// than the faithful render by more than one Rec.709 code, measured exactly like
+/// `~/aomac-handoff/gfx/v3/LookLand/metrics.txt` (`+E_above1 = mean(max(0, Y_after - Y_faithful - 1))`).
+/// `AOMAC_GFX_OUT=<new directory>`; renders both night views twice (faithful, then each profile) through the
+/// same offline fixture path as `graphics_offline_fixture`.
+#[test]
+#[ignore = "offline night brightness regression; requires installed client and a new AOMAC_GFX_OUT"]
+fn graphics_offline_night_is_never_brighter_than_faithful() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use std::fmt::Write;
+    let out = PathBuf::from(std::env::var_os("AOMAC_GFX_OUT").context("set AOMAC_GFX_OUT to a new handoff directory")?);
+    ensure!(!out.exists(), "refusing to overwrite evidence {}", out.display());
+    std::fs::create_dir_all(&out)?;
+    let dir = ao_gui::client_dir();
+    let store = ao_rdb::RecordStore::open(&dir)?;
+    let weather = ao_formats::weather::State::clear();
+    let size = (1920, 1200);
+    let actor = graphics_fixture_actor()?;
+    let views = graphics_fixture_views(&actor);
+    // The authored-night snapshots: Newland 566 and Borealis 800 at time 0 (`scene.daylight == 0`).
+    let nights: Vec<_> = views.into_iter().filter(|(name, _, time, _)| {
+        *time == 0.0 && matches!(name.as_str(), "newland-night" | "borealis-foliage-night")
+    }).collect();
+    ensure!(nights.len() == 2, "the night-view set changed");
+    let mut report = String::from("metric=Rec.709 Y from sRGB codes; +E_above1=mean(max(0,Y_after-Y_faithful-1)); no tolerance\n");
+    for (name, pf, time, fixed) in nights {
+        ao_scene::crt_srand(1);
+        let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
+        ensure!(scene.daylight == Some(0.0), "{name}: not an authored-night snapshot");
+        let collision = ao_formats::playfield::collision::Collision::load(&store, pf)?;
+        super::player::bake_sky_open(&collision, &mut scene);
+        let fixed = if pf == 566 {
+            graphics_fixture_newland_camera(|point| collision.terrain_height(point))?
+        } else { fixed };
+        let exposure = super::player::grass_exposure_surface(std::rc::Rc::new(std::cell::RefCell::new(collision)));
+        let render = |profile: &str| -> anyhow::Result<Vec<u8>> {
+            let settings = graphics_fixture_settings(profile)?;
+            ao_scene::crt_srand(1);
+            let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
+            lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
+            let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
+            let mut off = Offscreen::evidence(&shot, size)?;
+            off.fixed_camera(Some(fixed));
+            off.host.msaa_samples = Some(1);
+            off.host.anisotropy = Some(1);
+            off.host.fog_density_scale = Some(1.0);
+            off.host.enhanced_settings = Some(settings);
+            off.host.grass_exposure = Some(exposure.clone());
+            off.host.grass_wind = weather.wind;
+            let list = off.frame(&mut shot, 0.0);
+            if settings.ground_grass { off.warm_grass_tiles(); }
+            off.rgba(&shot, &list)
+        };
+        let faithful = render("faithful")?;
+        // Rec.709 Y of the encoded sRGB codes, as the retained LookLand metrics define it.
+        let y = |raw: &[u8], pixel: usize| -> f32 {
+            let rgb = &raw[pixel * 4..pixel * 4 + 3];
+            0.2126 * f32::from(rgb[0]) + 0.7152 * f32::from(rgb[1]) + 0.0722 * f32::from(rgb[2])
+        };
+        for profile in ["grass", "all-no-bloom"] {
+            let after = render(profile)?;
+            ensure!(after.len() == faithful.len(), "{name}: {profile} image size changed");
+            let mut excess = 0.0f64;
+            let mut maximum = 0.0f32;
+            for pixel in 0..faithful.len() / 4 {
+                let difference = y(&after, pixel) - y(&faithful, pixel);
+                maximum = maximum.max(difference.max(0.0));
+                if difference > 1.0 {
+                    excess += f64::from(difference - 1.0);
+                }
+            }
+            writeln!(report, "{name} profile={profile} +E_above1={:.9} max_positive_Y={maximum:.4}",
+                excess / (faithful.len() / 4) as f64)?;
+            writeln!(report, "{name} profile={profile} differing_bytes={}",
+                faithful.iter().zip(&after).filter(|(a, b)| a != b).count())?;
+            image::save_buffer(out.join(format!("{name}-{profile}.png")), &after, size.0, size.1, image::ColorType::Rgba8)?;
+            ensure!(excess == 0.0,
+                "{name} {profile}: Enhanced raises {maximum:.2} Y codes above faithful at night");
+        }
+        image::save_buffer(out.join(format!("{name}-faithful.png")), &faithful, size.0, size.1, image::ColorType::Rgba8)?;
+        std::fs::write(out.join("night-brightness.txt"), &report)?;
+        eprintln!("{name}: night +E_above1 = 0 for grass and all-no-bloom");
+    }
+    std::fs::write(out.join("status.txt"), "status=pass\n")?;
+    Ok(())
+}
+
 fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::EnhancedSettings> {
     let mut settings = ao_render::EnhancedSettings::default();
     match profile {

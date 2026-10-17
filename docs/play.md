@@ -671,24 +671,43 @@ directories for the final sheets. No tolerance, retry-to-pass, or passing status
 was added. Main approved recording this open item instead of extending the
 investigation beyond its ten-minute limit.
 
-**Night fairness policy open item (`6031e9c7`, LookLand final sheets):**
-All five native night snapshots report `daylight=Some(0.0)` and exposure/meadow
-GPU gates add zero daylight energy. This is **not** whole-image zero brightening.
-With bloom disabled, the mean image is darker than faithful in every night view,
-but foliage and Newland retain positive pixel energy beyond one display code:
+**Night fairness policy — fixed (`e4d3881b` + grass daylight gate):**
+All five native night snapshots report `daylight=Some(0.0)`. Before the fix, with bloom disabled, foliage and Newland
+retained positive pixel energy beyond one display code (`gfx/v3/LookLand/metrics.txt`, source `6031e9c7`):
 
-| Night view | Mean Y change vs faithful | Mean positive Y change | Mean positive excess above 1 code | Maximum positive Y |
-|---|---:|---:|---:|---:|
-| Borealis foliage | -2.080203 | 0.080475 | 0.057036 | 19.1480 |
-| Newland | -3.509915 | 0.191571 | 0.153212 | 62.5596 |
-| Borealis street | -0.608888 | 0.057680 | 0 | 0.7192 |
-| Borealis light bar | -0.684295 | 0.041018 | 0 | 0.7192 |
-| Borealis light bar close | -0.838928 | 0.041626 | 0 | 0.7874 |
+| Night view | profile | Mean positive excess above 1 code | Maximum positive Y |
+|---|---|---:|---:|
+| Borealis foliage | all-no-bloom | 0.057036 | 19.1480 |
+| Newland | all-no-bloom | 0.153212 | 62.5596 |
+| Borealis foliage | grass only | 0.131737 | 20.2162 |
+| Newland | grass only | 0.548432 | 80.8030 |
+| Borealis street / light bar / light bar close | all-no-bloom | 0 | 0.7192 |
 
-Y is Rec.709 luminance of sRGB byte codes. **[INFERENCE]** changed grass geometry
-may lift night foliage/Newland above the native ground it replaces; the mechanism
-is not isolated and this remains a policy open item, not a blanket grass exemption.
-The three sub-code maxima are reported separately from those larger residuals.
+Y is Rec.709 luminance of sRGB byte codes; the metric is `mean(max(0, Y_after - Y_faithful - 1))`, no tolerance.
+
+Root cause: `crates/ao-render/src/grass.wgsl` blade shading. Blades are placed by ground colour and lit by the terrain's
+own vertex light, but a blade's albedo is the ground tile texel at its *root*, blended towards the authored meadow hue
+and lit with the authored ground light-map palette (`holo0`). Those are authored *daylight* data. At `newland-night` the
+native ground is `tile * (light + palette)` with `light` ≈ 0.0045 while the palette at a blade root reaches ≈ 0.08, and a
+near blade's screen coverage belongs to a root whose ground the covered pixel does not share: measured per pixel the
+blades were up to 62 (`newland-night`) and 19 (`borealis-foliage-night`) codes brighter than the ground pixel they
+covered. Ablations (`grass.wgsl` fragment: albedo, canopy gradient, gust term, root blend, vein, palette, mip level;
+`shader.wgsl` ground fragments: `i.light`/`i.dlight` dumps at the same pixels) isolate it to the authored-bright albedo
+driven by the light-map palette, not to the loam/AO terms. Blades are pure *added visibility*, which the Enhanced
+fairness policy forbids in a night region, so no per-blade value is provably at or below the covered pixel.
+
+Fix: `vs_grass` multiplies the blade fade by the native daylight gate `smoothstep(0.0, 0.05, g.ambient_g.w)`, where
+`ambient_g.w` is `grade::daylight_weight(daylight)`. No blade is generated where the authored playfield-time has no
+daylight, in every grass pass (colour, AO share, sun-shadow receiver). The gate is exactly 1 for every authored daylight
+value the fixtures contain (dusk/sunset 0.25, sun-low 0.4506173, sun-high/day 1.0), so those images are unchanged.
+
+After, measured with `graphics_offline_night_is_never_brighter_than_faithful` (bloom off, `msaa=1`): `grass` is
+byte-identical to `faithful` at both night views (0 differing bytes, 0.0000 maximum positive Y), and `all-no-bloom`
+reports `+E_above1 = 0.000000000` with a 0.7874 maximum positive Y (the pre-existing sub-code quantization residual of
+the other effects, below one code). All 17 views captured with the `grass` profile, and the `all-no-bloom` daylight
+views, are byte-identical to the `e4d3881b` shader sources; no tolerance. Ablation and before/after tables:
+`gfx/v3/NightGrass-fix/metrics.txt`.
+
 Bloom's approved uniform authored lens halo is also separate: with bloom enabled,
 street/light-bar/close mean changes become +0.691265/+0.699451/+1.169199 codes;
 Newland remains -2.103241 and foliage -2.080203. The maximum positive pixel change
@@ -885,6 +904,18 @@ meadow luminance of 0.42 if the texel is duller (the daylight policy). This lift
 requires native `GAME.CurrentDayIntensity` and raw sun visibility before the
 artistic retained-shadow floor; night and roof umbra cannot qualify. Native fog
 still attenuates the resulting surface radiance.
+Authored night generates no blades at all: `vs_grass` fades them by
+`smoothstep(0.0, 0.05, ambient_g.w)` (`ambient_g.w = grade::daylight_weight`).
+A blade's albedo is the root texel plus the authored meadow hue and the native
+ground light-map palette, so at night, where the palette outweighs the remaining
+light, a blade can measure brighter than the ground pixel it happens to cover and
+blades are added visibility the night rule forbids. Every authored daylight value
+the fixtures use (dusk/sunset 0.25, sun-low 0.4506173, day 1.0) leaves the gate at
+exactly 1, so no daylight image changes. Regression:
+`AOMAC_GFX_OUT=<new dir> cargo test --profile fast -p aomac
+graphics_offline_night_is_never_brighter_than_faithful -- --ignored --nocapture`
+asserts `mean(max(0, Y_after - Y_faithful - 1)) == 0` for the `grass` and
+`all-no-bloom` profiles at `newland-night` and `borealis-foliage-night`.
 Far roots also converge on the tile's 8×8 mip, matching native coarse composites
 rather than magnifying one full-resolution dark texel with a derivative-free UV.
 Normals use the native central height differences, cached at tile generation. The

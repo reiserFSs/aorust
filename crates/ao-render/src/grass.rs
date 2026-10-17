@@ -841,6 +841,10 @@ mod blade_appearance_tests {
             "grass and native ground must remove direct sun before palette saturation");
         assert!(grass.contains("textureSampleLevel(tex, samp_clamp, i.uv, coarse_level)"),
             "distant grass must use the same 8x8 tile mip as coarse terrain");
+        assert!(grass.contains("let daylight_gate = smoothstep(0.0, 0.05, g.ambient_g.w);"),
+            "night rule: no blade may be generated without native authored daylight");
+        assert!(grass.contains("let fade = by_rank * by_range * daylight_gate;"),
+            "the daylight gate must cull blades, not just dim them");
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let renderer = crate::Renderer::new(&instance, None).expect("grass WGSL requires offscreen GPU");
         for flags in 0..16 {
