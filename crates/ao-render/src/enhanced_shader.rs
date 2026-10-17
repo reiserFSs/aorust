@@ -12,11 +12,15 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
     source.replace_range(liquid_start..liquid_end, &liquid);
     source = source.replace("struct Lit {", "struct Lit {\n    ambient_share: vec3<f32>,\n    sun_share: vec3<f32>,\n    sun_spec_share: vec3<f32>,");
     source = source.replace("    return o;\n}\n\n// mode:", "    let base = to_g(emissive) + dl[0];\n    let direct = sun_diffuse * max(sn, 0.0);\n    o.ambient_share = max(o.light - min(base + direct, vec3<f32>(1.0)), vec3<f32>(0.0));\n    o.sun_share = max(o.light - min(base + g.ambient_g.rgb, vec3<f32>(1.0)), vec3<f32>(0.0));\n    o.sun_spec_share = max(o.spec - min(to_g(specular) * dl[1], vec3<f32>(1.0)), vec3<f32>(0.0));\n    return o;\n}\n\n// mode:");
-    source = source.replace("    var light = i.light;\n    var spec = i.spec;", "    var shadow = 0.0;\n    if any(i.sun_share > vec3<f32>(0.0)) || any(i.sun_spec_share > vec3<f32>(0.0)) { shadow = 1.0 - sun_visibility(i.wpos); }\n    var light = max(i.light - i.sun_share * shadow, vec3<f32>(0.0));\n    var spec = max(i.spec - i.sun_spec_share * shadow, vec3<f32>(0.0));");
+    if shadows {
+        source = source.replace("    var light = i.light;\n    var spec = i.spec;", "    var shadow = 0.0;\n    if any(i.sun_share > vec3<f32>(0.0)) || any(i.sun_spec_share > vec3<f32>(0.0)) { shadow = 1.0 - sun_visibility(i.wpos); }\n    var light = max(i.light - i.sun_share * shadow, vec3<f32>(0.0));\n    var spec = max(i.spec - i.sun_spec_share * shadow, vec3<f32>(0.0));");
+    }
     source = source.replace("    o.light = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + vertex_lights(o.wpos, n, 0.0)[0],", "    let ground_local = vertex_lights(o.wpos, n, 0.0)[0];\n    o.light = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + ground_local,");
     source = source.replace("    o.dlight = clamp(o.light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0));", "    o.dlight = clamp(o.light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    o.ambient_share = o.dlight - o.light;\n    o.sun_share = vec4<f32>(max(o.light - clamp(ground_local, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.0)), 0.0);\n    o.sun_spec_share = vec4<f32>(max(o.dlight - clamp(ground_local + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.0)), 0.0);");
-    source = source.replace("clamp(i.light + ground_palette(i),", "clamp(i.light - i.sun_share * (1.0 - sun_visibility(i.wpos)) + ground_palette(i),");
-    source = source.replace("ground_tile(i) * i.dlight", "ground_tile(i) * max(i.dlight - i.sun_spec_share * (1.0 - sun_visibility(i.wpos)), vec3<f32>(0.0))");
+    if shadows {
+        source = source.replace("clamp(i.light + ground_palette(i),", "clamp(i.light - i.sun_share * (1.0 - sun_visibility(i.wpos)) + ground_palette(i),");
+        source = source.replace("ground_tile(i) * i.dlight", "ground_tile(i) * max(i.dlight - i.sun_spec_share * (1.0 - sun_visibility(i.wpos)), vec3<f32>(0.0))");
+    }
     // Spare varying components carry emission without exceeding 16 variables.
     for (location, field, channel) in [(13, "ambient_share", "x"), (14, "sun_share", "y"), (15, "sun_spec_share", "z")] {
         source = source.replace(&format!("@location({location}) {field}: vec3<f32>"), &format!("@location({location}) {field}: vec4<f32>"));
