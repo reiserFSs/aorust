@@ -216,7 +216,7 @@ mod tests {
 "#);
             let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("contact phase fixture"), source: wgpu::ShaderSource::Wgsl(source.into()) });
             let layout = r.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&contact.layout)], immediate_size: 0 });
-            contact.estimate = r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            contact.estimate = crate::pipeline_creation::render(&r.device, &wgpu::RenderPipelineDescriptor {
                 label: Some("contact phase fixture"), layout: Some(&layout),
                 vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
                 fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("phase_fixture"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HALF, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
