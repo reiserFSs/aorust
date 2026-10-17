@@ -1,6 +1,7 @@
 //! wgpu renderer for `ao_scene::Scene`: windowed free-fly viewer (`viewer`) and offscreen PNG path.
 
 mod actors;
+mod bloom;
 mod gui;
 mod viewer;
 mod screen;
@@ -558,7 +559,10 @@ fn mat_uniform(s: &ao_scene::Submesh) -> [f32; 32] {
     let [fr, fg, fb] = s.sky_fog_color.unwrap_or([0.0; 3]);
     let fog_mode = if !s.sky_fog { 0.0 } else if s.sky_fog_color.is_some() { 2.0 } else { 1.0 };
     let native_flags = u32::from(s.alpha_test.is_some() || s.sprite_alpha_test)
-        | (u32::from(!s.fog_enabled) << 1) | (u32::from(!s.lighting_enabled) << 2);
+        | (u32::from(!s.fog_enabled) << 1) | (u32::from(!s.lighting_enabled) << 2)
+        // Authored SRCCOLOR/ONE effects use fs_blend, not the additive entry.
+        | (u32::from(s.blend == Blend::SourceColorOne && !s.liquid && !s.sky_points && !s.sky_fog) << 3)
+        | (u32::from(s.liquid) << 4);
     [s.base_color[0], s.base_color[1], s.base_color[2], s.base_color[3], s.emissive[0], s.emissive[1], s.emissive[2], if s.prelit { 2.0 } else { s.glow_mask as u32 as f32 }, s.uv_scroll[0], s.uv_scroll[1], fog_mode, s.sun_flicker as u32 as f32, wu, au, wv, av, s.specular[0], s.specular[1], s.specular[2], s.shininess, s.texture_clamp as u32 as f32, fr, fg, fb, s.uv_camera[0], s.uv_camera[1], s.uv_camera[2], s.uv_camera[3],
         s.stage1_env_texture.is_some() as u32 as f32, f32::from(s.alpha_test.unwrap_or(30)) / 255.0, native_flags as f32, f32::from(s.alpha_func)]
 }
@@ -607,6 +611,7 @@ pub struct Renderer {
     pub format: wgpu::TextureFormat,
     enhanced_settings: EnhancedSettings,
     enhanced_frame: Option<enhanced::EnhancedFrame>,
+    bloom: Option<bloom::Bloom>,
     enhanced_shader: Option<wgpu::ShaderModule>,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     gpu_timer: Option<FrameGpuTimer>,
@@ -1105,6 +1110,7 @@ impl Renderer {
             format,
             enhanced_settings: EnhancedSettings::default(),
             enhanced_frame: None,
+            bloom: None,
             enhanced_shader: None,
             ambient_occlusion: None,
             gpu_timer: None,
@@ -1251,6 +1257,7 @@ impl Renderer {
         self.actor_pipes.invalidate();
         self.ground_pipes.invalidate();
         self.enhanced_frame = None;
+        self.bloom = None;
         self.depth_clear_pipe = screen::depth_clear_pipeline(&self.device, self.world_format(), level, self.enhanced_settings);
     }
 
@@ -1271,7 +1278,7 @@ impl Renderer {
         self.enhanced_settings = settings;
         if !settings.ambient_occlusion { self.ambient_occlusion = None; }
         if !settings.sun_shadows { self.sun_shadows = None; }
-        if changed_frame { self.enhanced_frame = None; }
+        if changed_frame { self.enhanced_frame = None; self.bloom = None; }
         // Grass has its own shader. Keep the native world shader and cached pipelines
         // unless a world-shading effect actually needs the Enhanced variant.
         if !(settings.sun_shadows || settings.ambient_occlusion || settings.emissive_bloom) {
@@ -1309,6 +1316,7 @@ impl Renderer {
             let samples = u64::from(frame.sample_count);
             pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
         }) + self.ambient_occlusion.as_ref().map_or(0, ambient_occlusion::AmbientOcclusion::target_bytes)
+            + self.bloom.as_ref().map_or(0, |bloom| bloom.bytes)
     }
     fn world_format(&self) -> wgpu::TextureFormat { self.format }
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
@@ -2097,6 +2105,11 @@ impl Renderer {
                 else { self.pipes.ensure(d.pipe, &compile); }
             }
         }
+        if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.msaa_samples) {
+            self.bloom = None;
+            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.msaa_samples, self.enhanced_settings));
+        }
+        self.prepare_enhanced_bloom();
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.encode_actor_skins(&mut enc);
         if let Some(buf) = self.gpu.inst_bufs.get(self.frame) {
@@ -2192,9 +2205,6 @@ impl Renderer {
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         let sky_buf = self.sky.bufs.get(self.frame);
 
-        if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.msaa_samples) {
-            self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.msaa_samples, self.enhanced_settings));
-        }
         let calls = std::cell::Cell::new(0usize);
         self.screen.prepare(&self.device,&self.queue,self.format,t.size);
         self.heat_haze.update(t.size, vp, cam.pos, cam.forward(), self.liquids.iter().flat_map(|run| run.heat_spheres.iter()));
@@ -2310,9 +2320,10 @@ impl Renderer {
         if self.enhanced_settings.ambient_occlusion {
             self.encode_enhanced_ao(&mut enc, vp, ambient_occlusion::fog_depth_limit(self.lens.near, far, env.fog_end));
         }
+        if let Some(bloom) = &mut self.bloom { bloom.encode(&self.queue, &mut enc, self.enhanced_settings.bloom_strength); }
         if let Some(frame) = self.enhanced_frame.as_ref() {
             let timestamps = if self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
-            frame.composite(&mut enc, self.heat_haze.source().unwrap_or(resolve), None, timestamps);
+            frame.composite(&mut enc, self.heat_haze.source().unwrap_or(resolve), self.bloom.as_ref().map(|bloom| &bloom.present), timestamps);
         }
         let timestamps = if self.heat_haze.source().is_some() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
         self.heat_haze.draw(&mut enc, resolve, timestamps);

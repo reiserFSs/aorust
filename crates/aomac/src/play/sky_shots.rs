@@ -624,3 +624,61 @@ fn graphics_shadow_timing(off: &mut Offscreen, directory: &std::path::Path, name
     std::fs::write(directory.join(format!("{name}-gpu.txt")), report)?;
     Ok(())
 }
+
+#[test]
+#[ignore = "explicit headless Bloom ABBA benchmark: 120 warmup, 600 GPU samples per phase"]
+fn graphics_bloom_gpu_timing() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    let dir = ao_gui::client_dir();
+    let store = ao_rdb::RecordStore::open(&dir)?;
+    let actor = graphics_fixture_actor()?;
+    let (_, pf, time, fixed) = graphics_fixture_views(&actor).into_iter()
+        .find(|(name, _, _, _)| name == "borealis-lightbar-night").context("Light Bar fixture view")?;
+    ao_scene::crt_srand(1);
+    let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(
+        &store, &dir, pf, time, 0, Some(ao_formats::weather::State::clear()))?;
+    let mut summaries = [[0.0_f64; 3]; 4];
+    let mut bytes = [0_u64; 4];
+    for (phase, profile) in ["neutral", "bloom", "bloom", "neutral"].into_iter().enumerate() {
+        ao_scene::crt_srand(1);
+        let mut lens = camera::lens(scene.lens.unwrap_or_default(), false);
+        lens.far = Some(camera::far_plane(camera::VIEW_DISTANCE));
+        let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
+        let mut off = Offscreen::evidence_timing(&shot, (1920,1200))?;
+        off.fixed_camera(Some(fixed));
+        off.host.msaa_samples = Some(1);
+        off.host.anisotropy = Some(1);
+        off.host.fog_density_scale = Some(1.0);
+        off.host.enhanced_settings = Some(graphics_fixture_settings(profile)?);
+        off.frame(&mut shot, 0.0);
+        // Same captured appearance, native mount and placement as the PNG fixture.
+        let mut appearance = actor.clone();
+        appearance.attractors.retain(|mount| mount.place != 5);
+        appearance.attractors.push(ao_net::n3::dynel::AttractorMesh { place: 5, mesh: 26163, field: 0, byte: 0 });
+        let mut avatar = super::avatar::Avatar::new(&store, &dir, 25988, &appearance,
+            ao_formats::character::actor::ActorAssets::new(&store)?)?;
+        avatar.set_transform([679.6,72.8,-482.7], 0.0);
+        off.host.dynamic_lights.extend(avatar.lights());
+        off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
+        off.host.actors.push(avatar.frame());
+        off.frame(&mut shot, 0.0);
+        off.set_gpu_timing(true)?;
+        let mut samples = Vec::with_capacity(600);
+        for frame in 0..720 {
+            off.render_frozen()?;
+            let ms = off.read_frame_gpu_ms()?.context("GPU timestamp sample")?;
+            if frame >= 120 { samples.push(ms); }
+        }
+        samples.sort_by(f64::total_cmp);
+        summaries[phase] = [samples[299], samples[569], samples[593]];
+        bytes[phase] = off.enhanced_target_bytes();
+        eprintln!("BLOOM_FIXTURE_GPU phase={phase} profile={profile} view=borealis-lightbar-night size=1920x1200 warmup=120 samples=600 p50_ms={:.6} p95_ms={:.6} p99_ms={:.6} attachment_bytes={}",
+            summaries[phase][0], summaries[phase][1], summaries[phase][2], bytes[phase]);
+    }
+    ensure!(bytes[0] == bytes[3] && bytes[1] == bytes[2], "ABBA memory accounting changed");
+    let delta = std::array::from_fn::<_, 3, _>(|i|
+        (summaries[1][i] + summaries[2][i] - summaries[0][i] - summaries[3][i]) * 0.5);
+    eprintln!("BLOOM_FIXTURE_GPU_DELTA p50_ms={:.6} p95_ms={:.6} p99_ms={:.6} attachment_bytes={} uniform_bytes=16",
+        delta[0], delta[1], delta[2], bytes[1].checked_sub(bytes[0]).context("Bloom allocation delta")?);
+    Ok(())
+}
