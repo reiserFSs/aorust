@@ -72,7 +72,7 @@ struct Candidate {
     distance: f32,
 }
 pub(super) struct Grass {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: [wgpu::RenderPipeline; 2],
     bind: Option<wgpu::BindGroup>,
     layout: wgpu::BindGroupLayout,
     shadows: bool,
@@ -136,13 +136,28 @@ impl Grass {
             channels.2.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
         ];
         let target_count = if channels.2 { 4 } else if channels.0 || channels.1 { 3 } else { 1 };
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ground grass"), layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_grass"), compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_grass"), compilation_options: Default::default(), targets: &targets[..target_count] }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState { format: super::DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::LessEqual), stencil: Default::default(), bias: Default::default() }),
-            multisample: wgpu::MultisampleState { count: samples, alpha_to_coverage_enabled: samples > 1, ..Default::default() }, multiview_mask: None, cache: None,
+        let pipeline = [false, true].map(|night| {
+            let mut targets = targets.clone();
+            if night {
+                // Compare with the completed native ground in framebuffer space:
+                // exact tile/mip, palette, Gouraud lighting and two-pass fog, no copy.
+                targets[0].as_mut().unwrap().blend = Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Min },
+                    alpha: wgpu::BlendComponent::REPLACE,
+                });
+            }
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(if night { "night ground grass" } else { "ground grass" }), layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_grass"), compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &[("GRASS_NIGHT_PASS", f64::from(u8::from(night)))], ..Default::default()
+                }, buffers: &[] },
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_grass"), compilation_options: Default::default(), targets: &targets[..target_count] }),
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, cull_mode: None, ..Default::default() },
+                // MIN is order-independent. Do not let night blades depth-reject
+                // darker native foliage/statels that the native pass draws later.
+                depth_stencil: Some(wgpu::DepthStencilState { format: super::DEPTH, depth_write_enabled: Some(!night), depth_compare: Some(wgpu::CompareFunction::LessEqual), stencil: Default::default(), bias: Default::default() }),
+                multisample: wgpu::MultisampleState { count: samples, alpha_to_coverage_enabled: samples > 1, ..Default::default() }, multiview_mask: None, cache: None,
+            })
         });
         let cells_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass cell cache"), size: (MAX_CELLS * std::mem::size_of::<Cell>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let params_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass wind and benders"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -321,24 +336,28 @@ impl Grass {
         self.exposure_order.push_back(key);
         normals.is_some()
     }
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup, ground: &GroundRun, gpu: &super::Gpu, shadow_bind: Option<&wgpu::BindGroup>) -> usize {
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup, ground: &GroundRun, gpu: &super::Gpu, shadow_bind: Option<&wgpu::BindGroup>, daylight: f32) -> usize {
         if self.draws.is_empty() { return 0; }
-        pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, globals, &[]);
         pass.set_bind_group(3, shadow_bind.or(self.bind.as_ref()).expect("grass receiver prepared"), &[]);
         let mut draws = 0;
-        for draw in &self.draws {
-            let batch = &self.batches[draw.batch];
-            let patch = &ground.detail.patches()[batch.patch];
-            let Some(palette) = &ground.materials[patch.mesh] else { continue; };
-            let Some(gpu_draw) = gpu.opaque.get(ground.draws[batch.patch][batch.submesh]) else { continue; };
-            pass.set_bind_group(1, &gpu.mats[gpu_draw.mat], &[]);
-            pass.set_bind_group(2, palette, &[]);
-            // Near blades have three cross sections; distant blades need only root and tip.
-            // The instance index retains the distance band in its top four bits.
-            let (band, stride) = ((draw.band as u32) << 28, self.band_strides[draw.band]);
-            pass.draw(0..if draw.band >= 2 { 3 } else { 6 }, band + draw.slots.start * stride..band + draw.slots.end * stride);
-            draws += 1;
+        for night in [false, true] {
+            if (night && daylight >= 0.25) || (!night && daylight <= 0.0) { continue; }
+            pass.set_pipeline(&self.pipeline[usize::from(night)]);
+            for draw in &self.draws {
+                let batch = &self.batches[draw.batch];
+                let patch = &ground.detail.patches()[batch.patch];
+                let Some(palette) = &ground.materials[patch.mesh] else { continue; };
+                let Some(gpu_draw) = gpu.opaque.get(ground.draws[batch.patch][batch.submesh]) else { continue; };
+                pass.set_bind_group(1, &gpu.mats[gpu_draw.mat], &[]);
+                pass.set_bind_group(2, palette, &[]);
+                // Near blades have three cross sections; distant blades need only root and tip.
+                // The instance index retains the distance band in its top four bits.
+                let (band, stride) = ((draw.band as u32) << 28, self.band_strides[draw.band]);
+                pass.draw(0..if draw.band >= 2 { 3 } else { 6 }, band + draw.slots.start * stride..band + draw.slots.end * stride);
+                draws += 1;
+            }
         }
         draws
     }
@@ -612,7 +631,7 @@ impl super::Renderer {
     }
     pub(super) fn draw_enhanced_grass(&self, pass: &mut wgpu::RenderPass<'_>) -> usize {
         match (&self.grass, &self.ground) {
-            (Some(grass), Some(ground)) => grass.draw(pass, &self.globals_bg, ground, &self.gpu, self.sun_shadows.as_ref().and_then(|shadows| shadows.grass_receiver.as_ref())),
+            (Some(grass), Some(ground)) => grass.draw(pass, &self.globals_bg, ground, &self.gpu, self.sun_shadows.as_ref().and_then(|shadows| shadows.grass_receiver.as_ref()), crate::grade::daylight_weight(self.sky.pose.daylight)),
             _ => 0,
         }
     }
@@ -831,6 +850,97 @@ mod tests {
 #[cfg(test)]
 mod blade_appearance_tests {
     #[test]
+    fn night_blades_remain_visible_without_outshining_native_ground() {
+        use ao_scene::{ground_detail::{GroundCell, GroundPatch}, Environment, Instance, Mesh, Scene, Submesh, Texture, TextureKey, TextureSource, Vertex, IDENTITY};
+        use crate::{Camera, EnhancedSettings, GroundPath, Renderer, Targets, Vec3};
+
+        let tile = TextureKey { rdb_type: 1_010_006, id: 1 };
+        let palette = TextureKey { rdb_type: 1_000_007, id: 2 };
+        let mut scene = Scene {
+            daylight: Some(0.0),
+            environment: Some(Environment {
+                sky_color: [0.0; 3], fog_color: [0.0; 3], fog_start: 100.0, fog_end: 200.0,
+                ambient: [0.12f32, 0.16, 0.10].map(|v| v.powf(2.2)),
+                sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0,
+            }),
+            meshes: vec![Mesh {
+                vertices: [[0.0, 0.0, 0.0], [8.0, 0.0, 0.0], [0.0, 0.0, -8.0], [8.0, 0.0, -8.0]]
+                    .map(|pos| Vertex { pos, normal: [0.0, 1.0, 0.0], uv: [0.5; 2], color: [1.0; 4] }).to_vec(),
+                submeshes: vec![
+                    Submesh::new(vec![0, 1, 2, 1, 3, 2], Some(tile)),
+                    Submesh::new(vec![0; 6], Some(tile)),
+                ],
+            }],
+            instances: vec![Instance { mesh: 0, transform: IDENTITY }],
+            ground_detail: vec![GroundPatch {
+                mesh: 0, cells: 1, cell_size: 8.0, height_scale: 1.0, heights: vec![0; 4],
+                coarse_submesh: 1,
+                fine_cells: vec![GroundCell { submesh: 0, vertices: [0, 1, 2, 3], native_tile: 2, ..Default::default() }],
+                shadow_texture: Some(palette), shadow_uv_scale: [0.125; 2],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (key, rgb, source) in [
+            (tile, [60, 104, 40], TextureSource::GroundRgb),
+            (palette, [17, 31, 11], TextureSource::default()),
+        ] {
+            scene.textures.insert(key, Texture {
+                width: 8, height: 8, rgba: [rgb[0], rgb[1], rgb[2], 255].repeat(64), source,
+            });
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut renderer = Renderer::new(&instance, None).expect("night grass requires an offscreen GPU");
+        renderer.set_msaa_samples(1);
+        renderer.upload(&scene);
+        let camera = Camera::look_at(Vec3::new(4.0, 5.0, 1.0), Vec3::new(4.0, 0.0, -4.0));
+        let out = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("night grass regression"), size: wgpu::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = out.create_view(&Default::default());
+        let luma = |pixel: &[u8]| {
+            0.2126 * f32::from(pixel[0]) + 0.7152 * f32::from(pixel[1]) + 0.0722 * f32::from(pixel[2])
+        };
+        // The native mode history is significant: zero after shadows selects Simple.
+        for (mode, expected) in [(3, GroundPath::Fused), (1, GroundPath::ShadowsTwoPass), (0, GroundPath::Simple)] {
+            renderer.set_ground_rendering(mode);
+            assert_eq!(renderer.ground_rendering_path(), expected);
+            renderer.set_enhanced_settings(EnhancedSettings::default());
+            renderer.render(&view, &Targets::new(&renderer, 256, 256), &camera);
+            let ground = crate::texture_to_rgba(&renderer, &out, 256, 256).unwrap();
+            renderer.set_enhanced_settings(EnhancedSettings {
+                ground_grass: true, grass_density: 1.0, grass_distance: 60.0, ..Default::default()
+            });
+            renderer.set_enhanced_grass_exposure(Some(super::GrassExposure {
+                generation: 1, query: std::rc::Rc::new(|_| true), line_of_sight: std::rc::Rc::new(|_, _| true),
+            }));
+            renderer.warm_grass_tiles(&camera);
+            renderer.render(&view, &Targets::new(&renderer, 256, 256), &camera);
+            let blades = crate::texture_to_rgba(&renderer, &out, 256, 256).unwrap();
+            let reference = &ground[(128 * 256 + 128) * 4..][..3];
+            let mut darker_visible = 0;
+            // Only interior ground pixels: no silhouette against black sky can masquerade as a blade.
+            for y in 96..160 {
+                for x in 96..160 {
+                    let offset = (y * 256 + x) * 4;
+                    let bare = &ground[offset..offset + 3];
+                    let blade = &blades[offset..offset + 3];
+                    assert_eq!(bare, reference, "{expected:?}: the reference ground must be flat and constant");
+                    assert!(luma(bare) > 1.0, "{expected:?}: night ambient/palette must remain nonzero");
+                    assert!(luma(blade) <= luma(bare),
+                        "{expected:?} at ({x}, {y}): blade {blade:?} outshines native ground {bare:?}");
+                    if luma(blade) > 0.0 && luma(blade) < luma(bare) {
+                        darker_visible += 1;
+                    }
+                }
+            }
+            assert!(darker_visible > 0, "{expected:?}: night blades must be visibly darker, not culled or blacked out");
+        }
+    }
+
+    #[test]
     fn blades_never_hide_targets_and_every_receiver_variant_builds() {
         let grass = include_str!("grass.wgsl");
         assert!(grass.contains("const GRASS_MAX_HEIGHT: f32 = 0.5;"), "fairness: no blade, flower or seed head above half a unit");
@@ -841,10 +951,6 @@ mod blade_appearance_tests {
             "grass and native ground must remove direct sun before palette saturation");
         assert!(grass.contains("textureSampleLevel(tex, samp_clamp, i.uv, coarse_level)"),
             "distant grass must use the same 8x8 tile mip as coarse terrain");
-        assert!(grass.contains("let daylight_gate = smoothstep(0.0, 0.05, g.ambient_g.w);"),
-            "night rule: no blade may be generated without native authored daylight");
-        assert!(grass.contains("let fade = by_rank * by_range * daylight_gate;"),
-            "the daylight gate must cull blades, not just dim them");
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let renderer = crate::Renderer::new(&instance, None).expect("grass WGSL requires offscreen GPU");
         for flags in 0..16 {

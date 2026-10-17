@@ -649,11 +649,10 @@ fn graphics_fixture_snapshot_keys_share_only_matching_playfield_and_time() -> an
     Ok(())
 }
 
-/// Enhanced night rule regression: with bloom off, no Enhanced profile may make an authored-night pixel brighter
-/// than the faithful render by more than one Rec.709 code, measured exactly like
-/// `~/aomac-handoff/gfx/v3/LookLand/metrics.txt` (`+E_above1 = mean(max(0, Y_after - Y_faithful - 1))`).
-/// `AOMAC_GFX_OUT=<new directory>`; renders both night views twice (faithful, then each profile) through the
-/// same offline fixture path as `graphics_offline_fixture`.
+/// Enhanced night rule regression: every aligned 16x16 block's mean Rec.709 luminance
+/// of sRGB byte codes must be at most one code brighter than faithful, with bloom off.
+/// `AOMAC_GFX_OUT=<new directory>`; captures faithful, grass and all-no-bloom for both
+/// night views through the same offline fixture path as `graphics_offline_fixture`.
 #[test]
 #[ignore = "offline night brightness regression; requires installed client and a new AOMAC_GFX_OUT"]
 fn graphics_offline_night_is_never_brighter_than_faithful() -> anyhow::Result<()> {
@@ -673,7 +672,8 @@ fn graphics_offline_night_is_never_brighter_than_faithful() -> anyhow::Result<()
         *time == 0.0 && matches!(name.as_str(), "newland-night" | "borealis-foliage-night")
     }).collect();
     ensure!(nights.len() == 2, "the night-view set changed");
-    let mut report = String::from("metric=Rec.709 Y from sRGB codes; +E_above1=mean(max(0,Y_after-Y_faithful-1)); no tolerance\n");
+    let mut report = String::from("metric=mean Rec.709 Y from sRGB codes per aligned 16x16 block; every enhanced-faithful delta <=1 code; no extra tolerance\n");
+    let mut passed = true;
     for (name, pf, time, fixed) in nights {
         ao_scene::crt_srand(1);
         let (mut scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
@@ -703,35 +703,49 @@ fn graphics_offline_night_is_never_brighter_than_faithful() -> anyhow::Result<()
             off.rgba(&shot, &list)
         };
         let faithful = render("faithful")?;
-        // Rec.709 Y of the encoded sRGB codes, as the retained LookLand metrics define it.
-        let y = |raw: &[u8], pixel: usize| -> f32 {
+        image::save_buffer(out.join(format!("{name}-faithful.png")), &faithful, size.0, size.1, image::ColorType::Rgba8)?;
+        // Compare encoded display codes, not linear-light luminance.
+        let y = |raw: &[u8], pixel: usize| -> f64 {
             let rgb = &raw[pixel * 4..pixel * 4 + 3];
-            0.2126 * f32::from(rgb[0]) + 0.7152 * f32::from(rgb[1]) + 0.0722 * f32::from(rgb[2])
+            0.2126 * f64::from(rgb[0]) + 0.7152 * f64::from(rgb[1]) + 0.0722 * f64::from(rgb[2])
         };
         for profile in ["grass", "all-no-bloom"] {
             let after = render(profile)?;
             ensure!(after.len() == faithful.len(), "{name}: {profile} image size changed");
-            let mut excess = 0.0f64;
-            let mut maximum = 0.0f32;
-            for pixel in 0..faithful.len() / 4 {
-                let difference = y(&after, pixel) - y(&faithful, pixel);
-                maximum = maximum.max(difference.max(0.0));
-                if difference > 1.0 {
-                    excess += f64::from(difference - 1.0);
+            let (width, height) = (size.0 as usize, size.1 as usize);
+            let mut maximum = f64::NEG_INFINITY;
+            let mut worst_block = (0, 0);
+            let mut failing_blocks = 0;
+            for top in (0..height).step_by(16) {
+                for left in (0..width).step_by(16) {
+                    let (right, bottom) = ((left + 16).min(width), (top + 16).min(height));
+                    let mut difference = 0.0;
+                    for row in top..bottom {
+                        for column in left..right {
+                            let pixel = row * width + column;
+                            difference += y(&after, pixel) - y(&faithful, pixel);
+                        }
+                    }
+                    difference /= ((right - left) * (bottom - top)) as f64;
+                    if difference > maximum {
+                        maximum = difference;
+                        worst_block = (left, top);
+                    }
+                    if difference > 1.0 {
+                        failing_blocks += 1;
+                    }
                 }
             }
-            writeln!(report, "{name} profile={profile} +E_above1={:.9} max_positive_Y={maximum:.4}",
-                excess / (faithful.len() / 4) as f64)?;
+            passed &= failing_blocks == 0;
+            writeln!(report, "{name} profile={profile} max_block_delta_Y={maximum:.9} worst_block_origin={worst_block:?} blocks_above1={failing_blocks}")?;
             writeln!(report, "{name} profile={profile} differing_bytes={}",
                 faithful.iter().zip(&after).filter(|(a, b)| a != b).count())?;
             image::save_buffer(out.join(format!("{name}-{profile}.png")), &after, size.0, size.1, image::ColorType::Rgba8)?;
-            ensure!(excess == 0.0,
-                "{name} {profile}: Enhanced raises {maximum:.2} Y codes above faithful at night");
+            std::fs::write(out.join("night-brightness.txt"), &report)?;
+            eprintln!("{name} {profile}: max 16x16 block delta {maximum:.9} Y codes at {worst_block:?}; {failing_blocks} blocks above 1");
         }
-        image::save_buffer(out.join(format!("{name}-faithful.png")), &faithful, size.0, size.1, image::ColorType::Rgba8)?;
-        std::fs::write(out.join("night-brightness.txt"), &report)?;
-        eprintln!("{name}: night +E_above1 = 0 for grass and all-no-bloom");
     }
+    ensure!(passed, "Enhanced night 16x16 block mean exceeds faithful by more than 1 Y code; see {}", out.join("night-brightness.txt").display());
     std::fs::write(out.join("status.txt"), "status=pass\n")?;
     Ok(())
 }

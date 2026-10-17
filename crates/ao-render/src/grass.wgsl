@@ -28,6 +28,7 @@ const GRASS_MAX_HEIGHT: f32 = 0.5;
 const NOISE_PERIOD: f32 = 64.0;
 const MEADOW_LUMA: f32 = 0.42;
 const LUMA: vec3<f32> = vec3<f32>(0.299, 0.587, 0.114);
+override GRASS_NIGHT_PASS: bool = false;
 
 fn grass_hash(input: u32) -> u32 {
     var v = input ^ (input >> 16u); v *= 0x7feb352du;
@@ -156,6 +157,10 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let hk = grass_hash(seed ^ (k * 0x9e3779b9u + 0x68bc21ebu));
     let hv = grass_hash(hk ^ 0x5bf03635u);
     let hw = grass_hash(hv ^ 0x1b873593u);
+    // Complementary, root-stable passes: dusk changes the fraction using MIN,
+    // never the blade population, and never switches the whole carpet at once.
+    let darkness = 1.0 - smoothstep(0.0, 0.25, g.ambient_g.w);
+    if (grass_unit(grass_hash(hk ^ 0xe315da7bu)) < darkness) != GRASS_NIGHT_PASS { return o; }
     // Low-discrepancy scatter (R2): any prefix of the cell's blades is evenly spread, so the distance thinning
     // below removes blades without clumps or bare gaps.
     let uv = fract(vec2<f32>(grass_unit(seed), grass_unit(grass_hash(seed ^ 0xabcdu))) + f32(k + 1u) * vec2<f32>(0.7548776662, 0.5698402910));
@@ -170,12 +175,7 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let keep = thinning_keep(dist);
     let by_rank = smoothstep(0.0, min(0.08, keep * 0.25), max(keep - rank, 0.0));
     let by_range = 1.0 - smoothstep(0.7 * radius, radius, dist);
-    // Enhanced blades are added visibility, so they never appear where the authored playfield-time has no native
-    // daylight (ambient_g.w, grade::daylight_weight): the night rule forbids raising a night region's brightness
-    // or visibility above the original, and a blade can only add. The gate is exactly 1 for every authored
-    // daylight/dusk value (the smallest is dusk 0.25), so daylight ground is untouched.
-    let daylight_gate = smoothstep(0.0, 0.05, g.ambient_g.w);
-    let fade = by_rank * by_range * daylight_gate;
+    let fade = by_rank * by_range;
     if fade <= 0.002 { return o; }
     o.coverage = vec2<f32>(by_range, 1.0);
     let widen = min(inverseSqrt(keep), 6.0);
@@ -353,20 +353,42 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
         max(0.95 * smoothstep(24.0, 80.0, dist), min(0.7 * smoothstep(0.55 * radius, radius, dist) + 0.5 * (1.0 - 1.0 / widen_px), 0.85)),
         0.4 * through * sunlit, 0.94 + 0.12 * v0);
 
-    // Terrain lighting as the native ground has it: the sun at each of the four corners, Gouraud-interpolated, and
-    // the point/spot lights once at the root.
+    // Preserve the daylight appearance; night lamps use the native per-corner
+    // saturation and Gouraud order rather than relighting the root independently.
     o.root = root;
     o.uv = tile_uv;
     o.normal = vec4<f32>(ground_n, c.normals[0].w);
     o.path = u32(c.origin.w + 0.5);
-    let local = vertex_lights(root, ground_n, 0.0)[0];
-    let without_sun = clamp(local, vec3<f32>(0.0), vec3<f32>(1.0));
     let simple = c.origin.w < 0.5;
-    o.spec = select(without_sun, clamp(without_sun + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
-    for (var j = 0u; j < 4u; j += 1u) {
-        let light = clamp(g.sun_g.rgb * max(dot(c.normals[j].xyz, g.sun_dir.xyz), 0.0) + local, vec3<f32>(0.0), vec3<f32>(1.0));
-        o.light += w4[j] * select(light, clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
-        o.dlight += w4[j] * (clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) - light);
+    if darkness < 1.0 {
+        let local = vertex_lights(root, ground_n, 0.0)[0];
+        let without_sun = clamp(local, vec3<f32>(0.0), vec3<f32>(1.0));
+        o.spec = select(without_sun, clamp(without_sun + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
+        for (var j = 0u; j < 4u; j += 1u) {
+            let light = clamp(g.sun_g.rgb * max(dot(c.normals[j].xyz, g.sun_dir.xyz), 0.0) + local, vec3<f32>(0.0), vec3<f32>(1.0));
+            o.light += w4[j] * select(light, clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
+            o.dlight += w4[j] * (clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) - light);
+        }
+    }
+    if darkness > 0.0 {
+        // Native lighting saturates at each terrain vertex before Gouraud interpolation.
+        // Sampling lamps once at the blade root is not equivalent near a lamp/grid edge.
+        var native_light = vec3<f32>(0.0);
+        var native_dlight = vec3<f32>(0.0);
+        var native_spec = vec3<f32>(0.0);
+        for (var j = 0u; j < 4u; j += 1u) {
+            let corner = vec3<f32>(c.origin.x + f32(j & 1u) * size, c.heights[j], c.origin.y - f32(j >> 1u) * size);
+            let n = normalize(c.normals[j].xyz);
+            let lamps = vertex_lights(corner, n, 0.0)[0];
+            let diffuse = clamp(g.sun_g.rgb * max(dot(n, g.sun_dir.xyz), 0.0) + lamps, vec3<f32>(0.0), vec3<f32>(1.0));
+            let ambient = clamp(diffuse + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+            native_light += w4[j] * select(diffuse, ambient, simple);
+            native_dlight += w4[j] * (ambient - diffuse);
+            native_spec += w4[j] * select(clamp(lamps, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(lamps + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), simple);
+        }
+        o.light = mix(o.light, native_light, darkness);
+        o.dlight = mix(o.dlight, native_dlight, darkness);
+        o.spec = mix(o.spec, native_spec, darkness);
     }
     // Ground-root fog: raised tips cannot reduce native extinction. (Fog is linear in view depth, so the root's
     // equals the ground's own interpolation.)
@@ -421,6 +443,17 @@ fn fs_grass(i: GOut) -> GrassOutput {
     if i.path > 1u {
         // Preserve native two-pass fog multiplication, not the fused approximation.
         color = mix(albedo, g.fog_g.rgb, fog) * mix(light, vec3<f32>(1.0), fog);
+    }
+    // Night blades inherit the native root's complete gamma-space texture-stage result.
+    // Clamp after fog (and after both stages on the two-pass path), not the albedo or
+    // the pre-palette diffuse: those are not framebuffer brightness bounds.
+    if g.ambient_g.w < 0.25 {
+        var native_root = mix(ground * light, g.fog_g.rgb, fog);
+        if i.path > 1u {
+            native_root = mix(ground, g.fog_g.rgb, fog) * mix(light, vec3<f32>(1.0), fog);
+        }
+        let daylight_weight = smoothstep(0.0, 0.25, g.ambient_g.w);
+        color = mix(min(color, native_root), color, daylight_weight);
     }
     var output: GrassOutput;
     // Hardware alpha-to-coverage dithers the outer field without fragment discard.

@@ -267,12 +267,18 @@ fn grass_pixels_receive_sun_shadows_and_ao_without_emission() {
     let no_sun = capture(&mut renderer, grass);
     assert_eq!(no_sun, capture(&mut renderer, shadows), "missing authored shadow source must be neutral on grass");
     assert_eq!(blades, no_sun, "disabling the source changed the shadows-off grass image");
-    // Enhanced night rule: no authored daylight means no blade at all, so night is the native image.
+    // Authored night retains darker blades without lifting the native framebuffer.
     renderer.sky.pose.daylight = Some(0.0);
     let night_bare = capture(&mut renderer, EnhancedSettings { grass_density: 0.0, ..grass });
     let night_blades = capture(&mut renderer, grass);
     assert_eq!(renderer.enhanced_grass_cell_count(), 4, "the night capture dropped the fixture's grass cells");
-    assert_eq!(night_blades, night_bare, "blades were generated without native authored daylight");
+    let mut visible_night_blades = 0;
+    for (blade, ground) in night_blades.as_chunks::<4>().0.iter().zip(night_bare.as_chunks::<4>().0) {
+        assert!(blade[..3].iter().zip(&ground[..3]).all(|(a, b)| a <= b),
+            "night grass raised native ground: {blade:?} > {ground:?}");
+        visible_night_blades += usize::from(blade[..3] != ground[..3]);
+    }
+    assert!(visible_night_blades > 8, "night grass was removed instead of shaded");
     renderer.sky.pose.daylight = Some(1.0);
     assert_eq!(faithful, capture(&mut renderer, EnhancedSettings::default()), "all-off roundtrip changed the native image");
     assert!(renderer.grass.is_none(), "disabled grass retained its resources");

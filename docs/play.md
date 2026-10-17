@@ -671,9 +671,9 @@ directories for the final sheets. No tolerance, retry-to-pass, or passing status
 was added. Main approved recording this open item instead of extending the
 investigation beyond its ten-minute limit.
 
-**Night fairness policy — fixed (`e4d3881b` + grass daylight gate):**
-All five native night snapshots report `daylight=Some(0.0)`. Before the fix, with bloom disabled, foliage and Newland
-retained positive pixel energy beyond one display code (`gfx/v3/LookLand/metrics.txt`, source `6031e9c7`):
+**Night fairness policy — root lighting equality, visible night blades:**
+All five native night snapshots report `daylight=Some(0.0)`. Historical per-pixel measurements, with bloom disabled,
+showed foliage and Newland positive energy beyond one display code (`gfx/v3/LookLand/metrics.txt`, source `6031e9c7`):
 
 | Night view | profile | Mean positive excess above 1 code | Maximum positive Y |
 |---|---|---:|---:|
@@ -683,30 +683,54 @@ retained positive pixel energy beyond one display code (`gfx/v3/LookLand/metrics
 | Newland | grass only | 0.548432 | 80.8030 |
 | Borealis street / light bar / light bar close | all-no-bloom | 0 | 0.7192 |
 
-Y is Rec.709 luminance of sRGB byte codes; the metric is `mean(max(0, Y_after - Y_faithful - 1))`, no tolerance.
+Those historical numbers use Rec.709 luminance of sRGB byte codes and the per-pixel metric
+`mean(max(0, Y_after - Y_faithful - 1))`; they are not measurements of the current block-mean criterion.
 
-Root cause: `crates/ao-render/src/grass.wgsl` blade shading. Blades are placed by ground colour and lit by the terrain's
-own vertex light, but a blade's albedo is the ground tile texel at its *root*, blended towards the authored meadow hue
-and lit with the authored ground light-map palette (`holo0`). Those are authored *daylight* data. At `newland-night` the
-native ground is `tile * (light + palette)` with `light` ≈ 0.0045 while the palette at a blade root reaches ≈ 0.08, and a
-near blade's screen coverage belongs to a root whose ground the covered pixel does not share: measured per pixel the
-blades were up to 62 (`newland-night`) and 19 (`borealis-foliage-night`) codes brighter than the ground pixel they
-covered. Ablations (`grass.wgsl` fragment: albedo, canopy gradient, gust term, root blend, vein, palette, mip level;
-`shader.wgsl` ground fragments: `i.light`/`i.dlight` dumps at the same pixels) isolate it to the authored-bright albedo
-driven by the light-map palette, not to the loam/AO terms. Blades are pure *added visibility*, which the Enhanced
-fairness policy forbids in a night region, so no per-blade value is provably at or below the covered pixel.
+Night grass uses native terrain-corner lamp evaluation, saturation and interpolation at its root, with a
+post-fog native-root bound. The remaining brightness mismatch comes from magnifying a full-resolution root
+texel over a different covered ground pixel, not incorrect palette composition or gamma.
+Night blades therefore use component-wise Min blending against the completed native ground, preserving
+that pixel's mip, palette, lighting, fog and two-pass quantization without a framebuffer copy.
+The Min pass keeps depth testing but disables depth writes: native foliage and statels drawn later must not
+be rejected behind blade depth, which would otherwise hide darker native fragments and brighten Borealis.
+A stable per-blade hash partitions normal and Min passes; the Min fraction is
+`1 - smoothstep(0.0, 0.25, ambient_g.w)`, with lighting and the root bound interpolating over the same range.
+Only Min runs at authored night, only normal at full daylight, and both at twilight; blade population is unchanged.
+Night blades remain visible geometry rather than being removed by a daylight fade.
 
-Fix: `vs_grass` multiplies the blade fade by the native daylight gate `smoothstep(0.0, 0.05, g.ambient_g.w)`, where
-`ambient_g.w` is `grade::daylight_weight(daylight)`. No blade is generated where the authored playfield-time has no
-daylight, in every grass pass (colour, AO share, sun-shadow receiver). The gate is exactly 1 for every authored daylight
-value the fixtures contain (dusk/sunset 0.25, sun-low 0.4506173, sun-high/day 1.0), so those images are unchanged.
+The ignored, headless `graphics_offline_night_is_never_brighter_than_faithful` regression captures
+`borealis-foliage-night` and `newland-night`, each with `grass` and `all-no-bloom`, against the same view's
+`faithful` render. At fixed 1920×1200, MSAA one and bloom off, it partitions the full image into aligned,
+non-overlapping 16×16 blocks. For every block it requires
+`mean(Y_enhanced) - mean(Y_faithful) <= 1` code, with
+`Y = 0.2126 R + 0.7152 G + 0.0722 B` on encoded sRGB byte values (not linearized RGB).
+No extra tolerance, failing-block allowance, or global averaging is applied.
+`night-brightness.txt` and stderr report each view/profile's maximum signed block delta, worst block's top-left
+pixel coordinate, and count of blocks above one code. All four comparisons and their PNGs are retained before
+a brightness failure is returned; `status=pass` is written only when every comparison passes.
 
-After, measured with `graphics_offline_night_is_never_brighter_than_faithful` (bloom off, `msaa=1`): `grass` is
-byte-identical to `faithful` at both night views (0 differing bytes, 0.0000 maximum positive Y), and `all-no-bloom`
-reports `+E_above1 = 0.000000000` with a 0.7874 maximum positive Y (the pre-existing sub-code quantization residual of
-the other effects, below one code). All 17 views captured with the `grass` profile, and the `all-no-bloom` daylight
-views, are byte-identical to the `e4d3881b` shader sources; no tolerance. Ablation and before/after tables:
-`gfx/v3/NightGrass-fix/metrics.txt`.
+Measured 1920×1200 block regression, `e4d3881b` grass baseline → final fix:
+
+| Night view | Profile | Maximum block delta before → after (Y codes) | Blocks above 1 before → after |
+|---|---|---:|---:|
+| Borealis foliage | grass | 7.681262500 → 0 | 401 → 0 |
+| Borealis foliage | all-no-bloom | 5.968861719 → 0.057929688 | 43 → 0 |
+| Newland | grass | 20.947036719 → 0 | 854 → 0 |
+| Newland | all-no-bloom | 10.089657812 → 0.019624219 | 66 → 0 |
+
+All seventeen final `grass` fixture views had zero differing bytes between independent repeats.
+Against `e4d3881b`, all twelve non-night views and three night street/light-bar views were byte-identical;
+only `borealis-foliage-night` and `newland-night` changed. These fixture measurements are not a release-gate claim.
+
+Run with the installed client data and a new output directory; no application window or live login is needed:
+
+```sh
+AOMAC_GFX_OUT=/tmp/night-block-regression \
+  cargo test --profile fast -p aomac graphics_offline_night_is_never_brighter_than_faithful -j 2 -- --ignored --nocapture --test-threads=1
+```
+
+The earlier daylight-gated captures in `gfx/v3/NightGrass-fix/metrics.txt` made grass byte-identical to faithful
+by removing night blades. They are historical evidence only, not acceptance of root-lit visible night grass.
 
 Bloom's approved uniform authored lens halo is also separate: with bloom enabled,
 street/light-bar/close mean changes become +0.691265/+0.699451/+1.169199 codes;
@@ -904,25 +928,32 @@ meadow luminance of 0.42 if the texel is duller (the daylight policy). This lift
 requires native `GAME.CurrentDayIntensity` and raw sun visibility before the
 artistic retained-shadow floor; night and roof umbra cannot qualify. Native fog
 still attenuates the resulting surface radiance.
-Authored night generates no blades at all: `vs_grass` fades them by
-`smoothstep(0.0, 0.05, ambient_g.w)` (`ambient_g.w = grade::daylight_weight`).
-A blade's albedo is the root texel plus the authored meadow hue and the native
-ground light-map palette, so at night, where the palette outweighs the remaining
-light, a blade can measure brighter than the ground pixel it happens to cover and
-blades are added visibility the night rule forbids. Every authored daylight value
-the fixtures use (dusk/sunset 0.25, sun-low 0.4506173, day 1.0) leaves the gate at
-exactly 1, so no daylight image changes. Regression:
+Authored night retains visible blades rather than fading their geometry away.
+Night blade lighting follows native terrain-corner lamp evaluation, saturation
+and interpolation at the root, with a post-fog native-root bound. Component-wise
+Min blending against completed native ground also prevents a magnified root
+texel from brightening a different covered pixel; native palette and gamma
+composition are unchanged. Complementary normal/Min passes partition blades by
+a stable hash, with Min fraction `1 - smoothstep(0.0, 0.25, ambient_g.w)`.
+Lighting and root-bound strength interpolate over the same range. Only one pass
+runs at day/night endpoints, both at twilight; no blade population is removed.
+The Min pass depth-tests without writing depth, allowing later native foliage
+and statels to draw rather than rejecting their darker fragments behind blades.
+Regression:
 `AOMAC_GFX_OUT=<new dir> cargo test --profile fast -p aomac
-graphics_offline_night_is_never_brighter_than_faithful -- --ignored --nocapture`
-asserts `mean(max(0, Y_after - Y_faithful - 1)) == 0` for the `grass` and
-`all-no-bloom` profiles at `newland-night` and `borealis-foliage-night`.
+graphics_offline_night_is_never_brighter_than_faithful -- --ignored --nocapture --test-threads=1`
+requires every aligned 16×16 block's mean Rec.709 sRGB-code luminance to exceed
+faithful by at most one code for the `grass` and `all-no-bloom` profiles at
+`newland-night` and `borealis-foliage-night`; no additional tolerance is allowed.
 Far roots also converge on the tile's 8×8 mip, matching native coarse composites
 rather than magnifying one full-resolution dark texel with a derivative-free UV.
 Normals use the native central height differences, cached at tile generation. The
 shader evaluates the original four terrain-corner sun Gouraud values and
 interpolates them on the native diagonal, including per-corner saturation and
-ambient for the simple-ground path; point and spot lights are evaluated once at the
-root. Fused and two-pass fog composition retain their native equations, and fog is
+ambient for the simple-ground path. Daylight retains point and spot lighting
+evaluated once at the root; night evaluates these lamps at the native corners
+before saturation and interpolation. Fused and two-pass fog composition retain
+their native equations, and fog is
 at least the root's native fog, so a raised tip never reduces extinction. The sun
 also lights a rounded blade's near edge and shades its far one (zero-mean), shines
 through its thin upper part when the sun is behind it, and a dense canopy keeps a
