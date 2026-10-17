@@ -563,6 +563,9 @@ Enhanced-all embedded 5.50 s and runtime-loaded 4.90 s. Evidence directories are
 After rebasing over the HDR/contact/grass renderer updates, headless release
 workspace gates passed again: **2264 passed, 73 ignored** and strict
 `cargo clippy --release --workspace --all-targets -j 2 -- -D warnings`.
+The final conflict-free rebase over grass commit `a011137a` then passed affected
+`ao-render`/`aomac` tests under `--profile fast` (160 + 1328 + 1 passed), plus strict
+workspace/all-target fast clippy, before publication.
 
 ### Runtime shader overrides
 
