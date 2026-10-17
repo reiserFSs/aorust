@@ -462,10 +462,16 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             ensure!(repeat_differences == 0, "{name}: independent captures differ in {repeat_differences} bytes");
             if let Some(base) = &baseline {
                 let previous = std::fs::read(base.join(format!("{name}.rgba")))?;
+                ensure!(previous.len() == raw.len(), "{name}: baseline byte length changed");
                 let count = differing(&previous);
-                writeln!(manifest, "{name} baseline_differing_bytes={count}")?;
+                let maximum = raw.iter().zip(&previous).map(|(a,b)| a.abs_diff(*b)).max().unwrap_or(0);
+                writeln!(manifest, "{name} baseline_differing_bytes={count} baseline_max_byte_error={maximum}")?;
+                if profile == "neutral" && name == "icc-platform-authored" {
+                    writeln!(manifest, "{name} approved_envelope_max_byte_error=1 approved_envelope_differing_bytes=134")?;
+                }
                 std::fs::write(out.join("manifest.txt"), &manifest)?;
-                ensure!(count == 0, "{name}: baseline differs in {count} bytes");
+                ensure!(graphics_fixture_baseline_matches(&profile, &name, count, maximum),
+                    "{name}: baseline differs in {count} bytes, maximum byte error {maximum}");
             }
             eprintln!("{name}: {} bytes, independent repeat identical", raw.len());
         }
@@ -478,6 +484,22 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         Err(error) => std::fs::write(status, format!("status=failed\nerror={error:#}\nvisual_acceptance=unexercised\n"))?,
     }
     result
+}
+
+fn graphics_fixture_baseline_matches(profile: &str, view: &str, count: usize, maximum: u8) -> bool {
+    // User-approved known envelope, never a general tolerance or an all-off exception.
+    (count == 0 && maximum == 0)
+        || (profile == "neutral" && view == "icc-platform-authored" && count <= 134 && maximum <= 1)
+}
+
+#[test]
+fn graphics_fixture_baseline_envelope_is_view_specific() {
+    assert!(graphics_fixture_baseline_matches("neutral", "icc-platform-authored", 134, 1));
+    assert!(!graphics_fixture_baseline_matches("neutral", "icc-platform-authored", 135, 1));
+    assert!(!graphics_fixture_baseline_matches("neutral", "icc-platform-authored", 134, 2));
+    assert!(!graphics_fixture_baseline_matches("faithful", "icc-platform-authored", 1, 1));
+    assert!(!graphics_fixture_baseline_matches("neutral", "icc-landmark-authored", 1, 1));
+    assert!(graphics_fixture_baseline_matches("faithful", "icc-platform-authored", 0, 0));
 }
 
 fn graphics_fixture_actor() -> anyhow::Result<ao_net::n3::dynel::SimpleCharFullUpdate> {
