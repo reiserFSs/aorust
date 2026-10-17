@@ -404,6 +404,106 @@ mod tests {
         assert_eq!(faithful, capture(&mut r, 32, 32), "all-off roundtrip is byte exact");
     }
     #[test]
+    fn lightning_actor_emission_respects_fan_and_texture_alpha_on_dark_sky() {
+        use crate::{Camera, EnhancedSettings, Renderer, Targets, Vec3, texture_to_rgba};
+        use ao_scene::{ActorFrame, Blend, Environment, Lens, Mesh, Scene, Submesh, Texture, TextureKey, Vertex};
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("lightning coverage GPU");
+        r.set_msaa_samples(1);
+        r.upload(&Scene { environment: Some(Environment {
+            sky_color: [0.002; 3], fog_color: [0.002; 3], fog_start: 100.0, fog_end: 200.0,
+            ambient: [0.0; 3], sun_color: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_specular: 0.0,
+        }), ..Default::default() });
+        r.set_lens(Lens { fov: std::f32::consts::FRAC_PI_2, ..Default::default() });
+        let capture = |r: &mut Renderer, settings| {
+            r.set_enhanced_settings(settings);
+            let output = r.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Lightning alpha coverage regression"),
+                size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+            });
+            r.render(&output.create_view(&Default::default()), &Targets::new(r, 64, 64),
+                &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+            texture_to_rgba(r, &output, 64, 64).unwrap()
+        };
+        let off = EnhancedSettings::default();
+        let ao = EnhancedSettings { ambient_occlusion: true, ..off };
+        let shadows = EnhancedSettings { sun_shadows: true, ..off };
+        let bloom = EnhancedSettings { emissive_bloom: true, ..off };
+        let empty = capture(&mut r, off);
+        assert_eq!(empty, capture(&mut r, ao), "AO cannot mark an empty dark sky");
+        assert_eq!(empty, capture(&mut r, shadows), "shadows cannot mark an empty dark sky");
+        assert_eq!(empty, capture(&mut r, bloom), "dark sky is not a bloom emitter");
+        assert!(r.emissive_seed_rgba().unwrap().unwrap().chunks_exact(4)
+            .all(|pixel| pixel[..3] == [0, 0, 0]));
+
+        for textured in [false, true] {
+            let key = TextureKey { rdb_type: 0, id: 1 };
+            let mut vertices: Vec<_> = [(-1.0,-1.0),(1.0,-1.0),(1.0,1.0),(-1.0,1.0)]
+                .into_iter().map(|(x,y)| Vertex {
+                    pos: [x,y,-2.0], normal: [0.0,0.0,1.0], uv: [(x+1.0)*0.5,(1.0-y)*0.5],
+                    color: if textured { [0.6,0.6,0.6,1.0] } else { [0.0; 4] },
+                }).collect();
+            let indices = if textured { vec![0,1,2,0,2,3] } else {
+                vertices.push(Vertex { pos: [0.0,0.0,-2.0], color: [0.6,0.6,0.6,1.0], ..Default::default() });
+                vec![4,0,1,4,1,2,4,2,3,4,3,0]
+            };
+            // Native LightningFx uses an unlit, unfogged SRCALPHA/ONE actor,
+            // with a bright fan centre and transparent black corner vertices.
+            let mut model = Scene { meshes: vec![Mesh { vertices, submeshes: vec![Submesh {
+                blend: Blend::Additive, lighting_enabled: false, fog_enabled: false,
+                depth_write: Some(false), two_sided: true,
+                ..Submesh::new(indices, textured.then_some(key))
+            }] }], ..Default::default() };
+            if textured {
+                // RGB deliberately stays white even where alpha is zero: a
+                // brightness-only emission mask would expose the entire quad.
+                let rgba = (0..16).flat_map(|y| (0..16).flat_map(move |x|
+                    [255,255,255,if (6..10).contains(&x) && (6..10).contains(&y) { 255 } else { 0 }])).collect();
+                model.textures.insert(key, Texture { width: 16, height: 16, rgba, source: Default::default() });
+            }
+            let model_id = if textured { 2 } else { 1 };
+            r.add_actor_model(model_id, &model);
+            r.set_actors(vec![ActorFrame {
+                id: 1, model: model_id, always: true,
+                skin: Some(std::sync::Arc::new(model.meshes[0].vertices.clone())),
+                ..Default::default()
+            }]);
+            let faithful = capture(&mut r, off);
+            assert_ne!(empty, faithful, "lightning fixture must actually render: textured={textured}");
+            assert_eq!(faithful, capture(&mut r, ao), "AO must not stamp additive lightning: textured={textured}");
+            assert_eq!(faithful, capture(&mut r, shadows), "shadows must not stamp additive lightning: textured={textured}");
+            let glowing = capture(&mut r, bloom);
+            let emission = r.emissive_seed_rgba().unwrap().unwrap();
+            let center = (32 * 64 + 32) * 4;
+            assert!(emission[center..center+3].iter().any(|&value| value > 0),
+                "lightning centre must emit: textured={textured}");
+            assert_ne!(faithful, glowing, "lightning emission must reach bloom: textured={textured}");
+            for y in 0..64 {
+                for x in 0..64 {
+                    // At 90 degrees FOV the fan occupies [16,48]².
+                    // The quad's opaque texels occupy [28,36]²; [24,40]²
+                    // conservatively includes their bilinear-filter footprint.
+                    let support = if textured { 24..40 } else { 16..48 };
+                    if !support.contains(&x) || !support.contains(&y) {
+                        let pixel = (y * 64 + x) * 4;
+                        assert_eq!(&emission[pixel..pixel+3], &[0,0,0],
+                            "transparent lightning must emit exactly zero at ({x},{y}), textured={textured}");
+                        assert_eq!(&faithful[pixel..pixel+4], &empty[pixel..pixel+4],
+                            "transparent lightning must preserve dark sky at ({x},{y}), textured={textured}");
+                    }
+                }
+            }
+            if !textured {
+                let corner = (17 * 64 + 17) * 4;
+                assert!(emission[corner] < emission[center],
+                    "native fan emission must fade towards transparent corner vertices");
+            }
+            r.set_actors(Vec::new());
+        }
+    }
+    #[test]
     #[ignore = "explicit headless 120-warmup/600-sample GPU benchmark"]
     fn bloom_gpu_timing_1920x1200() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());

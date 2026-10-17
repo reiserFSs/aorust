@@ -808,7 +808,8 @@ impl Play {
                 let (scene, report) = ao_formats::playfield::load_playfield_report_on_day(&store, &dir, id, day_time, day)?;
                 zt("pf_terrain_statics_loaded");
                 let weather = ao_formats::playfield::open_weather(&store, id)?;
-                let _ = tx.send(Bg::Weather(id, Box::new(weather)));
+                let lightning = super::lightning::LightningFx::load(&store)?;
+                let _ = tx.send(Bg::Weather(id, Box::new((weather, lightning))));
                 let life = (|| -> anyhow::Result<_> {
                     let mut world = native_life_spawn::LifeWorld::load(&store, id)?;
                     let mut models = native_life_render::LifeModels::default();
@@ -893,7 +894,11 @@ impl Play {
                 }
                 Bg::Sky(id, c) if Some(id) == self.zone.playfield => self.world_sky = *c,
                 Bg::Sky(..) => {}
-                Bg::Weather(id, w) if Some(id) == self.zone.playfield => self.world_weather = Some(*w),
+                Bg::Weather(id, w) if Some(id) == self.zone.playfield => {
+                    let (weather, lightning) = *w;
+                    self.world_weather = Some(weather);
+                    self.world_lightning = lightning;
+                }
                 Bg::Weather(..) => {}
                 Bg::Life(id, result) if Some(id) == self.zone.playfield => {
                     match result {
