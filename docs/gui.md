@@ -1379,7 +1379,7 @@ mechanism as `DisplayCompressedTextures` (`DV Main`, account-independent, surviv
 
 The optional Sun Shadows (`AomacSunShadows`), Ambient Occlusion (`AomacAmbientOcclusion`),
 Emissive Bloom (`AomacEmissiveBloom`), Ground Grass (`AomacGroundGrass`) and HDR Sunlight and
-Tonemap (`AomacHdr`) checkboxes are
+Tonemap (`AomacHdr`) and Contact Shadows (`AomacContactShadows`) checkboxes are
 independent DV Main booleans, all **off** by default, including when an older preferences
 file lacks them. `DValues::enhanced_settings` maps them and the quality controls below to
 `ao_render::EnhancedSettings`; `flow.rs::frame` sends the value through `Host.enhanced_settings`.
@@ -1391,6 +1391,13 @@ RGBA16F target, and `present` tonemaps (identity below a knee, cubic to exactly 
 dithers the 8-bit write (fixed-pattern noise, +-0.35 level). Night, dusk, shadow, fog, sky, unlit and glow pixels get weight 0
 and keep their native codes (fixture `hdr-neutral`/`boost 0` matches faithful to within 1 code); grass blades are not
 sun-boosted.
+Contact Shadows (port of ao-vk `contact.frag`) march 12 jittered steps (0.6 m, fixed-pattern interleaved gradient noise) from each
+surface point towards the sun through the current frame's resolved primary-view depth at half resolution, with a normal-facing
+gate, a thickness gate and a distance fade, then depth-aware blur/upsample and darken the native colour (after AO, before
+bloom/expose) by `1 - contact x AomacContactStrength x daylight ramp(sun weight)`, the same `smoothstep(0.3, 0.7)` ramp as the HDR
+lift. It reads the same sun mask as HDR (the fourth world-pass attachment exists when either switch is on) but works with or
+without HDR. Night (moonlight weight is about 0.26), dusk, shadowed, fogged, sky, unlit and glow pixels fall below the ramp and
+are untouched, and no actor list or history is read, so hidden actors cannot change a pixel.
 
 | Quality control / DV Main key | Default | Bounds |
 |---|---|---|
@@ -1401,13 +1408,14 @@ sun-boosted.
 | Ambient Occlusion Strength / `AomacAoStrength` | 1 | 0–1 |
 | Sunlight Brightness / `AomacSunBoost` | 0.35 | 0–0.6 (peak lift of fully sunlit daylight surfaces; 0 = faithful) |
 | Colour Grade / `AomacGrade` | 0.7 | 0–1 (HDR present only: saturation, warm sunlit / cool shade / cool night darks; every step renormalised to the input luminance and never above it, so it cannot lift night, shadow or fog luminance; 0 = off) |
+| Contact Shadow Strength / `AomacContactStrength` | 0.4 | 0–1 (share of the direct sun a fully contact-shadowed daylight pixel loses) |
 | Emissive Bloom Strength / `AomacBloomStrength` | 0.6 | 0–1 |
 | Ground Grass Density / `AomacGrassDensity` | 1 | 0–2 |
 | Ground Grass Distance / `AomacGrassDistance` | 50 m | 0–60 m |
 
 These are aomac-only artistic controls, not reconstructed retail settings. Values are bounded
 at the renderer settings boundary; non-finite floats use the documented defaults.
-**Restore Original** clears only the four effect flags via ordinary DValue writes, preserving
+**Restore Original** clears only the effect flags via ordinary DValue writes, preserving
 quality values, anisotropy, MSAA, camera and text preferences; the next frame returns to all-off
 execution and the ordinary preference save persists it. Zero strength/density does not clear
 an enabled flag (offline fixtures can explicitly request neutral Enhanced execution).

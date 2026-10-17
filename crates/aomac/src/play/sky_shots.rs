@@ -601,14 +601,19 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "grass" => settings.ground_grass = true,
         "hdr" => settings.hdr = true,
         "hdr-neutral" => { settings.hdr = true; settings.sun_boost = 0.0; settings.grade_strength = 0.0; }
+        "contact" => settings.contact_shadows = true,
+        // Isolates the contact pass: shadows + hdr + contact vs `shadows-hdr`.
+        "shadows-hdr" => { settings.sun_shadows = true; settings.hdr = true; }
+        "shadows-hdr-contact" => { settings.sun_shadows = true; settings.hdr = true; settings.contact_shadows = true; }
         "all" => {
             settings.sun_shadows = true;
             settings.ambient_occlusion = true;
             settings.emissive_bloom = true;
             settings.ground_grass = true;
             settings.hdr = true;
+            settings.contact_shadows = true;
         }
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|hdr|hdr-neutral|all"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|hdr|hdr-neutral|contact|shadows-hdr|shadows-hdr-contact|all"),
     }
     Ok(settings)
 }
@@ -626,8 +631,12 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     ] {
         let s = graphics_fixture_settings(name).unwrap();
         assert_eq!([s.sun_shadows, s.ambient_occlusion, s.emissive_bloom, s.ground_grass], expected);
-        assert_eq!(s.hdr, name == "all");
+        assert_eq!((s.hdr, s.contact_shadows), (name == "all", name == "all"));
     }
+    assert!(graphics_fixture_settings("contact").unwrap().contact_shadows);
+    let isolated = graphics_fixture_settings("shadows-hdr-contact").unwrap();
+    assert!(isolated.sun_shadows && isolated.hdr && isolated.contact_shadows);
+    assert!(!graphics_fixture_settings("shadows-hdr").unwrap().contact_shadows);
     assert!(graphics_fixture_settings("hdr").unwrap().hdr);
     let neutral_hdr = graphics_fixture_settings("hdr-neutral").unwrap();
     assert!(neutral_hdr.hdr && neutral_hdr.sun_boost == 0.0);

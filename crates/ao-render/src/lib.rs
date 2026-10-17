@@ -2,6 +2,7 @@
 
 mod actors;
 mod bloom;
+mod contact_shadows;
 mod grade;
 mod grass;
 pub use grass::{GrassBender, GrassExposure};
@@ -635,6 +636,7 @@ pub struct Renderer {
     grade: Option<grade::Grade>,
     enhanced_shader: Option<wgpu::ShaderModule>,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
+    contact_shadows: Option<contact_shadows::ContactShadows>,
     gpu_timer: Option<FrameGpuTimer>,
     cpu_timings: Option<FrameCpuTimings>,
     pub stats: FrameStats,
@@ -867,7 +869,7 @@ fn compile_pipeline(
         };
         let target = wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let auxiliary = wgpu::ColorTargetState { format: enhanced::AUX, blend: state, write_mask: wgpu::ColorWrites::ALL };
-        let sun_mask = settings.hdr.then(|| auxiliary.clone());
+        let sun_mask = settings.needs_sun_mask().then(|| auxiliary.clone());
         let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then_some(auxiliary), sun_mask];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(fs),
@@ -1137,6 +1139,7 @@ impl Renderer {
             grade: None,
             enhanced_shader: None,
             ambient_occlusion: None,
+            contact_shadows: None,
             gpu_timer: None,
             cpu_timings: None,
             grass: None,
@@ -1273,7 +1276,7 @@ impl Renderer {
     /// live toggle). Callers that keep a [`Targets`] across frames must rebuild it when [`Renderer::msaa_samples`] changes
     /// (`Targets::sample_count`). The single world pass resolves once and discards its transient MSAA/depth attachments.
     pub fn set_msaa_samples(&mut self, requested: u32) {
-        let auxiliary = self.enhanced_settings.ambient_occlusion || self.enhanced_settings.emissive_bloom || self.enhanced_settings.hdr;
+        let auxiliary = self.enhanced_settings.ambient_occlusion || self.enhanced_settings.emissive_bloom || self.enhanced_settings.needs_sun_mask();
         let level = if auxiliary {
             self.msaa_supported.iter().copied().filter(|&count| count <= requested && self.auxiliary_msaa.sample_count_supported(count)).max().unwrap_or(1)
         } else { clamp_msaa_samples(requested.max(1), &self.msaa_supported) };
@@ -1299,23 +1302,24 @@ impl Renderer {
         let changed_pipeline = self.enhanced_settings.sun_shadows != settings.sun_shadows
             || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
             || self.enhanced_settings.emissive_bloom != settings.emissive_bloom
-            || self.enhanced_settings.hdr != settings.hdr;
+            || self.enhanced_settings.needs_sun_mask() != settings.needs_sun_mask();
         let changed_frame = self.enhanced_settings.any_enabled() != settings.any_enabled()
             || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
             || self.enhanced_settings.emissive_bloom != settings.emissive_bloom
-            || self.enhanced_settings.hdr != settings.hdr;
+            || self.enhanced_settings.needs_sun_mask() != settings.needs_sun_mask();
         self.enhanced_settings = settings;
         if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
         if !settings.ambient_occlusion { self.ambient_occlusion = None; }
+        if !settings.contact_shadows { self.contact_shadows = None; }
         if !settings.sun_shadows { self.sun_shadows = None; }
         if changed_frame { self.enhanced_frame = None; self.bloom = None; self.grade = None; }
         // Grass has its own shader. Keep the native world shader and cached pipelines
         // unless a world-shading effect actually needs the Enhanced variant.
-        if !(settings.sun_shadows || settings.ambient_occlusion || settings.emissive_bloom || settings.hdr) {
+        if !(settings.sun_shadows || settings.ambient_occlusion || settings.emissive_bloom || settings.needs_sun_mask()) {
             self.enhanced_shader = None;
         } else if self.enhanced_shader.is_none() || changed_pipeline {
             self.enhanced_shader = Some(self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(enhanced_shader::source(settings.sun_shadows, settings.ambient_occlusion, settings.emissive_bloom, settings.hdr).into()),
+                label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(enhanced_shader::source(settings.sun_shadows, settings.ambient_occlusion, settings.emissive_bloom, settings.needs_sun_mask()).into()),
             }));
         }
         if changed_pipeline {
@@ -1346,6 +1350,7 @@ impl Renderer {
             let samples = u64::from(frame.sample_count);
             pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
         }) + self.ambient_occlusion.as_ref().map_or(0, ambient_occlusion::AmbientOcclusion::target_bytes)
+            + self.contact_shadows.as_ref().map_or(0, contact_shadows::ContactShadows::target_bytes)
             + self.bloom.as_ref().map_or(0, |bloom| bloom.bytes)
             + self.grade.as_ref().map_or(0, |grade| grade::Grade::bytes(grade.size))
     }
@@ -2379,6 +2384,9 @@ impl Renderer {
             let ao_start = timed.then(std::time::Instant::now);
             self.encode_enhanced_ao(&mut enc, vp, ambient_occlusion::fog_depth_limit(self.lens.near, far, env.fog_end));
             if let Some(start) = ao_start { cpu.ao_ms = start.elapsed().as_secs_f64() * 1000.0; }
+        }
+        if self.enhanced_settings.contact_shadows {
+            self.encode_enhanced_contact_shadows(&mut enc, vp, cam.pos, Vec3::from(env.sun_dir), far);
         }
         if let Some(bloom) = &mut self.bloom {
             let bloom_start = timed.then(std::time::Instant::now);

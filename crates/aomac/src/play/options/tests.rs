@@ -878,17 +878,17 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     let tmp = crate::play::prefs::test_dir().join("aomac-enhanced-effects-persist");
     let _ = std::fs::remove_dir_all(&tmp);
     let mut d = DValues::new(&tmp);
-    let names = ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr"];
+    let names = ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"];
     assert_eq!(d.enhanced_settings(), EnhancedSettings::default());
     d.open_user(&tmp, "account", 7);
-    for mask in 0..32 {
+    for mask in 0..64 {
         for (bit, name) in names.iter().enumerate() {
             assert!(d.persists(name));
             d.set(name, Variant::Bool(mask & (1 << bit) != 0));
         }
         let expected = EnhancedSettings {
             sun_shadows: mask & 1 != 0, ambient_occlusion: mask & 2 != 0,
-            emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, hdr: mask & 16 != 0, ..Default::default()
+            emissive_bloom: mask & 4 != 0, ground_grass: mask & 8 != 0, hdr: mask & 16 != 0, contact_shadows: mask & 32 != 0, ..Default::default()
         };
         assert_eq!(d.enhanced_settings(), expected);
         d.save_user();
@@ -899,7 +899,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     d.set("AomacShadowMapSize", Variant::Int(2048));
     for (name, value) in [
         ("AomacShadowStrength", 0.4), ("AomacShadowSoftness", 2.0), ("AomacAoRadius", 2.0), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
-        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5),
+        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5), ("AomacContactStrength", 0.7),
     ] {
         assert!(d.persists(name));
         d.set(name, Variant::Float(value));
@@ -909,7 +909,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
     let quality = d.enhanced_settings();
     d.restore_original_graphics();
     assert_eq!(d.enhanced_settings(), EnhancedSettings {
-        sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, ..quality
+        sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false, hdr: false, contact_shadows: false, ..quality
     });
     assert!(!d.enhanced_settings().any_enabled());
     assert_eq!(d.get_i64("AomacTextureSharpening"), Some(4));
@@ -924,7 +924,7 @@ fn enhanced_graphics_default_persistence_independence_and_reset() {
 #[test]
 fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     let Some(mut r) = Rig::new() else { return };
-    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr"] {
+    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
         r.click(&view);
@@ -939,7 +939,7 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     assert_eq!(r.d.enhanced_settings().shadow_map_size, 2048);
     for (name, value) in [
         ("AomacShadowStrength", 0.4), ("AomacShadowSoftness", 2.0), ("AomacAoRadius", 2.5), ("AomacAoStrength", 0.5), ("AomacBloomStrength", 0.25),
-        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5),
+        ("AomacGrassDensity", 1.5), ("AomacGrassDistance", 35.0), ("AomacSunBoost", 0.5), ("AomacGrade", 0.5), ("AomacContactStrength", 0.7),
     ] {
         let view = r.show(name);
         let event = Event::SliderChanged { window: r.win(), view, value, final_change: true };
@@ -954,7 +954,7 @@ fn enhanced_effect_controls_quality_and_restore_use_normal_dispatch() {
     assert!(!r.d.enhanced_settings().any_enabled());
     assert_eq!(r.d.enhanced_settings().shadow_map_size, 2048);
     assert_eq!(r.d.get_i64("AomacEdgeSmoothing"), Some(2));
-    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr"] {
+    for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"] {
         let view = r.show(name);
         assert!(!r.gui.checked(r.win(), &view));
     }

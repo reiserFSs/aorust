@@ -6,7 +6,7 @@ pub(super) const AUX: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Colour attachments the world pass declares: 1 native, 3 with AO/bloom masks, 4 when the HDR sun mask exists.
 /// Every world-pass pipeline must declare the same count.
 pub(super) fn target_count(settings: &crate::EnhancedSettings) -> usize {
-    if settings.hdr { 4 } else if settings.ambient_occlusion || settings.emissive_bloom { 3 } else { 1 }
+    if settings.needs_sun_mask() { 4 } else if settings.ambient_occlusion || settings.emissive_bloom { 3 } else { 1 }
 }
 
 pub(super) struct EnhancedFrame {
@@ -34,10 +34,10 @@ impl EnhancedFrame {
         let colour = make(format, 1, "Enhanced native UNORM colour");
         let ambient = settings.ambient_occlusion.then(|| make(AUX, 1, "Enhanced ambient share"));
         let emissive = settings.emissive_bloom.then(|| make(AUX, 1, "Enhanced authored emission"));
-        let sun = settings.hdr.then(|| make(AUX, 1, "Enhanced sun mask"));
+        let sun = settings.needs_sun_mask().then(|| make(AUX, 1, "Enhanced sun mask"));
         let depth = make(DEPTH, samples, "Enhanced sampleable depth");
         let resolved_depth = if samples == 1 { depth.clone() } else { make(DEPTH, 1, "Enhanced resolved depth") };
-        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), settings.ambient_occlusion.then(|| make(AUX, samples, "Enhanced MSAA ambient")), settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")), settings.hdr.then(|| make(AUX, samples, "Enhanced MSAA sun mask"))]);
+        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), settings.ambient_occlusion.then(|| make(AUX, samples, "Enhanced MSAA ambient")), settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")), settings.needs_sun_mask().then(|| make(AUX, samples, "Enhanced MSAA sun mask"))]);
         let (composite, composite_bg) = pipeline(device, format, &colour, false);
         let depth_resolve = (samples > 1).then(|| pipeline(device, DEPTH, &depth, true));
         Self { size, sample_count: samples, colour, ambient, emissive, sun, depth, resolved_depth, msaa, composite, composite_bg, depth_resolve }

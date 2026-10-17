@@ -28,3 +28,9 @@ dither in crates/ao-render/src/grade.wgsl follow the approach of `tonemap.frag`
 (`Grade()`, `Dither8`) in ao-vk (https://github.com/wannabuh/ao-vk), MIT licensed.
 The WGSL is an independent reimplementation: the tone curve, the luminance-preserving
 grade and the sun-weight gating are original to this project.
+
+The half-resolution contact-shadow march, depth-aware blur and upsample in
+crates/ao-render/src/contact_shadows.{rs,wgsl} follow the algorithm of
+`rvk/shaders/contact.frag` and `ao_blur.frag` in ao-vk
+(https://github.com/wannabuh/ao-vk), MIT licensed. The WGSL is an independent
+reimplementation of the algorithm, not copied source.

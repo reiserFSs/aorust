@@ -192,14 +192,14 @@ impl DValues {
         // concrete renderer values in `options.rs::enhanced_page`/`flow.rs` (audit item 2 texture anisotropy, MSAA-option decision).
         s.add("AomacTextureSharpening", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(4)), false);
         s.add("AomacEdgeSmoothing", Variant::Int(0), true, CAT_MAIN, Some(Variant::Int(0)), Some(Variant::Int(3)), false);
-        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr"] {
+        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"] {
             s.add(name, Variant::Bool(false), true, CAT_MAIN, None, None, false);
         }
         s.add("AomacShadowMapSize", Variant::Int(2048), true, CAT_MAIN, Some(Variant::Int(256)), Some(Variant::Int(4096)), false);
         for (name, default, max) in [
             ("AomacShadowStrength", 0.65, 1.0), ("AomacShadowSoftness", 1.5, 4.0),
             ("AomacAoRadius", 1.0, 5.0), ("AomacAoStrength", 1.0, 1.0), ("AomacBloomStrength", 0.6, 1.0),
-            ("AomacGrassDensity", 1.0, 2.0), ("AomacGrassDistance", 50.0, 60.0), ("AomacSunBoost", 0.35, 0.6), ("AomacGrade", 0.7, 1.0),
+            ("AomacGrassDensity", 1.0, 2.0), ("AomacGrassDistance", 50.0, 60.0), ("AomacSunBoost", 0.35, 0.6), ("AomacContactStrength", 0.4, 1.0), ("AomacGrade", 0.7, 1.0),
         ] {
             s.add(name, Variant::Float(default), true, CAT_MAIN, Some(Variant::Float(0.0)), Some(Variant::Float(max)), false);
         }
@@ -238,6 +238,7 @@ impl DValues {
             emissive_bloom: self.flag("AomacEmissiveBloom"),
             ground_grass: self.flag("AomacGroundGrass"),
             hdr: self.flag("AomacHdr"),
+            contact_shadows: self.flag("AomacContactShadows"),
             shadow_map_size: self.get_i64("AomacShadowMapSize").unwrap_or(i64::from(defaults.shadow_map_size)).clamp(256, 4096) as u32,
             shadow_strength: self.get_f32("AomacShadowStrength").unwrap_or(defaults.shadow_strength),
             shadow_softness: self.get_f32("AomacShadowSoftness").unwrap_or(defaults.shadow_softness),
@@ -248,12 +249,13 @@ impl DValues {
             grass_distance: self.get_f32("AomacGrassDistance").unwrap_or(defaults.grass_distance),
             sun_boost: self.get_f32("AomacSunBoost").unwrap_or(defaults.sun_boost),
             grade_strength: self.get_f32("AomacGrade").unwrap_or(defaults.grade_strength),
+            contact_strength: self.get_f32("AomacContactStrength").unwrap_or(defaults.contact_strength),
         }.clamped()
     }
 
     /// Disable effects without changing quality knobs, MSAA or unrelated preferences.
     pub fn restore_original_graphics(&mut self) {
-        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr"] {
+        for name in ["AomacSunShadows", "AomacAmbientOcclusion", "AomacEmissiveBloom", "AomacGroundGrass", "AomacHdr", "AomacContactShadows"] {
             self.set(name, Variant::Bool(false));
         }
     }
