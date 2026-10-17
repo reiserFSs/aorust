@@ -488,6 +488,8 @@ struct GroundRun {
     has_shadow: Vec<bool>,
     texture_materials: Vec<(usize, TextureKey, [f32; 32])>,
     composites: Vec<native_ground::Composite>,
+    /// Which texels of each ground tile picture are green (Enhanced grass placement).
+    green: grass::GreenMasks,
 }
 
 type SkyMaterialKey = (Option<TextureKey>, Option<TextureKey>, bool, [u32; 32]);
@@ -1614,6 +1616,9 @@ impl Renderer {
         self.drawn_visuals.retain(|key, _| matches!(key, VisualKey::Actor(..)));
         self.liquids = scene.liquids.iter().cloned().map(native_liquid::LiquidRun::new).collect();
         self.heat_haze.reset();
+        // A new scene's ground has its own green masks: Enhanced grass is rebuilt on its first frame.
+        self.grass = None;
+        if let Some(shadows) = &mut self.sun_shadows { shadows.grass_receiver = None; }
         self.ground = (!scene.ground_detail.is_empty()).then(|| {
             let indices = scene.ground_detail.iter().map(|p| scene.meshes[p.mesh].submeshes.iter().map(|s| Vec::with_capacity(s.indices.len())).collect()).collect();
             let draws = scene.ground_detail.iter().map(|p| ground_materials[p.mesh].iter().map(|&mat| self.gpu.opaque.iter().position(|d| d.mesh == p.mesh && d.mat == mat).unwrap_or(usize::MAX)).collect()).collect();
@@ -1628,7 +1633,7 @@ impl Renderer {
                     entries: &[0, 1].map(|binding| wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) }),
                 }));
             }
-            GroundRun { detail: ao_scene::ground_detail::GroundDetail::new(scene.ground_detail.clone()), indices, draws, scratch: Vec::with_capacity(capacity), materials, has_shadow, texture_materials: ground_texture_materials.into_iter().map(|(mat,(key,u))| (mat,key,u)).collect(), composites }
+            GroundRun { detail: ao_scene::ground_detail::GroundDetail::new(scene.ground_detail.clone()), indices, draws, scratch: Vec::with_capacity(capacity), materials, has_shadow, texture_materials: ground_texture_materials.into_iter().map(|(mat,(key,u))| (mat,key,u)).collect(), composites, green: grass::green_masks(scene) }
         });
     }
 
@@ -2129,7 +2134,7 @@ impl Renderer {
         self.prepare_actors(cam.pos, cam.forward(), &planes);
         self.prepare_actor_pipelines();
         let grass_start = timed.then(std::time::Instant::now);
-        self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3));
+        self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3), 0.5 * t.size.1 as f32 / (0.5 * self.lens.vertical_fov(aspect)).tan());
         if let Some(start) = grass_start { cpu.grass_prepare_ms = start.elapsed().as_secs_f64() * 1000.0; }
         {
             let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);

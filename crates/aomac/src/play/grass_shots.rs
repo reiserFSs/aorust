@@ -24,6 +24,12 @@ fn grass_offline_capture_and_timing() -> anyhow::Result<()> {
 fn run(out: &std::path::Path) -> anyhow::Result<()> {
     let selected = std::env::var("AOMAC_GFX_VIEW").ok();
     let png_only = std::env::var("AOMAC_GFX_PNG_ONLY").is_ok_and(|value| value == "1");
+    // AOMAC_GFX_DENSITY: grass density (default 1); AOMAC_GFX_EFFECTS=1: shadows, AO and bloom on in both variants;
+    // AOMAC_GFX_HDR=1: the HDR present; AOMAC_GFX_MSAA: samples (default 1).
+    let density = std::env::var("AOMAC_GFX_DENSITY").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+    let effects = std::env::var("AOMAC_GFX_EFFECTS").is_ok_and(|value| value == "1");
+    let hdr = std::env::var("AOMAC_GFX_HDR").is_ok_and(|value| value == "1");
+    let msaa = std::env::var("AOMAC_GFX_MSAA").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
     let dir = ao_gui::client_dir();
     let store = ao_rdb::RecordStore::open(&dir)?;
     let actor = graphics_fixture_actor()?;
@@ -46,10 +52,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
         ("icc-grass-ground", 4582, 2648.69, ao_render::Vec3::new(933.5, 26.0, -748.0)),
         ("borealis-grass-ground", 800, 3240.0, ao_render::Vec3::new(652.0, 65.3, -420.0)),
     ] {
-        if selected.as_deref().is_some_and(|view|
-            view.strip_suffix("-day") != Some(name) && (pf != 800 || view.strip_suffix("-night") != Some(name))) {
-            continue;
-        }
+        if selected.as_deref().is_some_and(|view| !view.starts_with(name)) { continue; }
         ao_scene::crt_srand(1);
         let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
         let surface = Rc::new(RefCell::new(ao_formats::playfield::collision::Collision::load(&store, pf)?));
@@ -57,8 +60,23 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
         let (fixed, tile, grid) = grass_ground_camera(&scene, &surface.borrow(), &exposure, reference)
             .with_context(|| format!("finding exposed grass in {name}"))?;
         writeln!(report, "grass_view={name} pf={pf} native_tile={tile} grid={grid:?} camera={fixed:?}")?;
-        views.push((format!("{name}-day"), pf, time, fixed));
-        if pf == 800 { views.push((format!("{name}-night"), pf, 0.0, fixed)); }
+        // The same ground from further back and higher: mid and far fields, thinning towards the distance.
+        let forward = fixed.forward();
+        let flat = ao_render::Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+        let target = fixed.pos + forward * (8.0 / ao_render::Vec3::new(forward.x, 0.0, forward.z).length().max(0.1));
+        for (distance, lift, tag) in [(0.0, 0.0, ""), (14.0, 1.5, "mid-"), (30.0, 6.0, "far-")] {
+            let mut eye = fixed.pos - flat * distance;
+            if distance > 0.0 {
+                // Ground below the original eye's height: never a roof or a bridge above the field.
+                let ground = [-2.0, 0.0, 2.0].into_iter().flat_map(|x| [-2.0, 0.0, 2.0].into_iter().map(move |z| [eye.x + x, fixed.pos.y + 3.0, eye.z + z]))
+                    .filter_map(|point| surface.borrow().ground(point)).max_by(f32::total_cmp);
+                eye.y = ground.unwrap_or(fixed.pos.y - 1.7) + 1.7 + lift;
+            }
+            let view = if distance > 0.0 { ao_render::Camera::look_at(eye, target) } else { fixed };
+            for (light, light_time) in [("day", time), ("dusk", 4860.0)].into_iter().chain((pf == 800).then_some(("night", 0.0))) {
+                views.push((format!("{name}-{tag}{light}"), pf, light_time, view));
+            }
+        }
     }
     views.extend(graphics_fixture_views(&actor));
     for (name, pos) in [
@@ -90,12 +108,12 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 let mut shot = Shot { gui: Gui::new(&dir, None)?, scene: Some(scene.clone()), camera: fixed, lens };
                 let mut off = Offscreen::evidence_timing(&shot, size)?;
                 off.fixed_camera(Some(fixed));
-                off.host.msaa_samples = Some(1);
+                off.host.msaa_samples = Some(msaa);
                 off.host.anisotropy = Some(1);
                 off.host.fog_density_scale = Some(1.0);
                 off.host.grass_exposure = Some(exposure.clone());
                 off.host.grass_wind = weather.wind;
-                let settings = EnhancedSettings { ground_grass: true, grass_density: variant as f32, ..Default::default() };
+                let settings = EnhancedSettings { sun_shadows: effects, ambient_occlusion: effects, emissive_bloom: effects, hdr, ground_grass: true, grass_density: if variant == 0 { 0.0 } else { density }, ..Default::default() };
                 off.host.enhanced_settings = Some(settings);
                 off.set_gpu_timing(true)?;
                 let mut gpu = Vec::with_capacity(600);
@@ -120,7 +138,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                 let generation_stats = percentiles(&mut generation);
                 medians[variant] = gpu_stats.0;
                 allocated[variant] = off.gpu_allocated_bytes();
-                writeln!(report, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} settings={settings:?} round={round} variant={variant} gpu_ms_p50_p95_p99={gpu_stats:?} prepare_wall_ms_p50_p95_p99={prepare_stats:?} effect_gpu_payload_bytes={bytes} cells={cells} max_tuft_candidates={} max_blade_candidates={}", cells * 128, cells * 128 * 7)?;
+                writeln!(report, "view={name} pf={pf} time={time} camera={fixed:?} lens={lens:?} settings={settings:?} round={round} variant={variant} gpu_ms_p50_p95_p99={gpu_stats:?} prepare_wall_ms_p50_p95_p99={prepare_stats:?} effect_gpu_payload_bytes={bytes} cells={cells} max_blade_candidates={}", cells * 256 * variant)?;
                 writeln!(report, "generation_wall_ms_p50_p95_p99={generation_stats:?} generation_mean_ms={generation_mean} generation_max_ms={generation_max}")?;
                 writeln!(report, "native_metal_allocated_bytes={:?} shared_enhanced_target_bytes={}", allocated[variant], off.enhanced_target_bytes())?;
                 if round == 0 && variant == 1 { writeln!(report, "grass_diagnostics_view={name}\n{}", off.evidence_grass_diagnostics())?; }
@@ -138,7 +156,6 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
                         writeln!(report, "view={name} neutral_vs_grass_differing_bytes={differing}")?;
                         if differing > 0 { changed_views += 1; }
                         if pf == 127 { ensure!(cells == 0 && differing == 0, "indoor grass changed the image"); }
-                        if name == "icc-coastal2" { ensure!(differing == 0, "icc-coastal2: authored-vegetation ground gained generated grass"); }
                     }
                 }
             }
@@ -149,10 +166,8 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
             std::fs::write(out.join("manifest.txt"), &report)?;
         }
     }
-    // Authored vegetation excludes the visible coastal2 ground; generated roots lie outside the view.
-    let unchanged_expected = selected.as_deref() == Some("icc-coastal2");
-    writeln!(report, "changed_views={changed_views}\nunchanged_view_expected={unchanged_expected}")?;
-    ensure!(changed_views > 0 || unchanged_expected, "fixture has no visible grass contribution; do not claim a visual/performance pass");
+    writeln!(report, "changed_views={changed_views}")?;
+    ensure!(changed_views > 0, "fixture has no visible grass contribution; do not claim a visual/performance pass");
     std::fs::write(out.join("manifest.txt"), &report)?;
     Ok(())
 }
@@ -182,7 +197,7 @@ fn grass_ground_camera(
     let mut cells = std::collections::BTreeMap::new();
     for patch in &scene.ground_detail {
         for (index, cell) in patch.fine_cells.iter().enumerate() {
-            if cell.authored_vegetation || !matches!(cell.ground_material, 6 | 15) { continue; }
+            if !matches!(cell.ground_material, 6 | 15) { continue; }
             let (x, z) = (index % patch.cells, index / patch.cells);
             let grid = [patch.origin[0] + x as i32, patch.origin[1] + z as i32];
             let (wx, wz) = (grid[0] as f32 * patch.cell_size, -(grid[1] as f32) * patch.cell_size);

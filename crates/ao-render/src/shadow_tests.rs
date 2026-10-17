@@ -170,13 +170,15 @@ fn grass_pixels_receive_sun_shadows_and_ao_without_emission() {
             });
         }
     }
+    let green = ao_scene::TextureKey { rdb_type: 1_010_006, id: 1 };
     ground.submeshes = vec![
-        ao_scene::Submesh::new(fine_indices, None),
+        ao_scene::Submesh::new(fine_indices, Some(green)),
         ao_scene::Submesh::new(vec![lattice_start, lattice_start + 2, lattice_start + 6,
             lattice_start + 2, lattice_start + 8, lattice_start + 6], None),
     ];
     let sun = [0.0, 0.8, -0.6];
     let scene = Scene {
+        textures: [(green, ao_scene::Texture { width: 8, height: 8, rgba: [60, 104, 40, 255].repeat(64), source: ao_scene::TextureSource::GroundRgb })].into(),
         meshes: vec![
             ground,
             quad([[0.0, 0.0, -3.0], [4.0, 0.0, -3.0], [4.0, 3.0, -3.0], [0.0, 3.0, -3.0]], [0.0, 0.0, 1.0]),

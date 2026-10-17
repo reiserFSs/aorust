@@ -1198,7 +1198,7 @@ impl Offscreen {
     /// Warms only procedural tiles, preserving native render-count animation clocks.
     pub fn warm_grass_tiles(&mut self) { self.r.warm_grass_tiles(&self.host.camera); }
     /// Offline-only per-tile material, exposure and projected-root diagnostics.
-    pub fn evidence_grass_diagnostics(&self) -> String { self.r.grass_diagnostics(&self.host.camera, self.size) }
+    pub fn evidence_grass_diagnostics(&self) -> String { self.r.grass_diagnostics(&self.host.camera) }
     pub fn new(fe: &dyn Frontend, size: (u32, u32)) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = Renderer::new(&instance, None)?;

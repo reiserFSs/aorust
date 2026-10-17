@@ -21,7 +21,6 @@ mod spawn;
 mod shadow;
 mod statel;
 mod terrain;
-mod vegetation;
 mod water;
 mod zone;
 mod wildlife;
@@ -290,10 +289,6 @@ pub fn load_playfield_report_with_weather(
             }),
             None => spawn::density_spawn(&boxes, &|_, _| Some(low), 1.7),
         };
-    }
-    if let Some(tm) = &terrain {
-        let names = crate::character::NameTable::load(store)?;
-        vegetation::mark(&mut scene, &lod_items, &names, lod_tiles_x > 0, &|x, z| terrain_height(tm, x, z));
     }
     if lod_tiles_x > 0 {
         add_lod(store, &mut scene, &mut report, lod_items, lod_tiles_x, lod_zone_size, lod_count);
