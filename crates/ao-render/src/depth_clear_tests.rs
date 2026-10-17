@@ -26,7 +26,7 @@ struct Out { @builtin(position) p: vec4<f32>, @location(0) color: vec4<f32> }
         ViewportDepthClear {priority:2,position:[0.0;3]},
         ViewportDepthClear {priority:6,position:[0.0;3]},
     ];
-    r.prepare_actors(Vec3::ZERO,&[Vec4::ZERO;6]);
+    r.prepare_actors(Vec3::ZERO,-Vec3::Z,&[Vec4::ZERO;6]);
     let client=ao_gui::client_dir();
     let gui_fixture=if client.join("cd_image/gui").exists() {
         let mut gui=ao_gui::Gui::new(&client,None).expect("installed native GUI");

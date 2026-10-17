@@ -10,7 +10,12 @@ pub(crate) const SHADER: &str = concat!(include_str!("shader.wgsl"), "\n", inclu
 pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("sun shadow receiver"),
-        entries: &[
+        entries: &receiver_entries(),
+    })
+}
+
+pub(crate) fn receiver_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+    [
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<ShadowUniform>() as u64) }, count: None },
@@ -19,8 +24,7 @@ pub(crate) fn receiver_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                     view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None },
-        ],
-    })
+    ]
 }
 
 pub(super) fn horizon_fade(elevation: f32) -> f32 {
@@ -89,6 +93,9 @@ impl CascadeFrame {
 
 pub(crate) struct SunShadows {
     pub receiver: wgpu::BindGroup,
+    pub grass_receiver: Option<wgpu::BindGroup>,
+    array: wgpu::TextureView,
+    sampler: wgpu::Sampler,
     pub cascade_groups: [wgpu::BindGroup; CASCADES],
     pub layers: [wgpu::TextureView; CASCADES],
     /// Developer/offscreen cascade readback only; never a gameplay debug mode.
@@ -195,11 +202,22 @@ impl SunShadows {
             bind_group_layouts: &[Some(&renderer.g_layout), Some(&renderer.tex_layout)],
             immediate_size: 0,
         });
-        Self { receiver, cascade_groups, layers, _maps: maps,
+        Self { receiver, grass_receiver: None, array, sampler, cascade_groups, layers, _maps: maps,
             primary_depth, primary_ids, size, resolution, uniforms, shader, caster_pipeline_layout, primary_pipeline_layout,
             pipelines: Default::default(), static_commands: Vec::new(), static_transforms: Vec::new(),
             static_instances: None, static_capacity: 0, actor_ids: Vec::new(), actor_groups: Default::default(),
             actor_ids_buffer, actor_visibility, actor_capacity, caster_layout, visibility_layout, visibility_pipeline, visibility_group }
+    }
+    pub fn grass_bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, cells: &wgpu::Buffer, params: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+            label: Some("grass cells and shared sun receiver"), layout, entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: cells.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.uniforms[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.array) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        })
     }
     pub fn ensure_pipeline(&mut self, renderer: &super::Renderer, actor: bool, slot: usize, primary: bool, spec: super::PipelineSpec) {
         self.pipelines.entry((actor, slot, primary)).or_insert_with(|| compile_pipeline(

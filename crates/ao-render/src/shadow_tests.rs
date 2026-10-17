@@ -127,6 +127,140 @@ fn absent_unauthored_or_night_light_has_no_shadow_source() {
     assert!(shadow_pass::authored_sun(&scene).is_none());
 }
 
+#[test]
+fn grass_pixels_receive_sun_shadows_and_ao_without_emission() {
+    use ao_scene::ground_detail::{GroundCell, GroundPatch};
+    // A 1x1 patch has terminal roots: native selection never marks those
+    // high-quality, so it cannot exercise grass's fine-cell admission.
+    let mut ground = ao_scene::Mesh { vertices: vec![], submeshes: vec![] };
+    let mut fine_cells = Vec::new();
+    let mut fine_indices = Vec::new();
+    for z in 0..2 {
+        for x in 0..2 {
+            let first = ground.vertices.len() as u32;
+            for [dx, dz] in [[0, 0], [1, 0], [0, 1], [1, 1]] {
+                ground.vertices.push(ao_scene::Vertex {
+                    pos: [(x + dx) as f32 * 2.0, 0.0, -((z + dz) as f32) * 2.0],
+                    normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4],
+                });
+            }
+            fine_cells.push(GroundCell { submesh: 0, vertices: [first, first + 1, first + 2, first + 3],
+                native_tile: 2, ground_material: 15, ..Default::default() });
+            fine_indices.extend([first, first + 1, first + 2, first + 1, first + 3, first + 2]);
+        }
+    }
+    let lattice_start = ground.vertices.len() as u32;
+    for z in 0..=2 {
+        for x in 0..=2 {
+            ground.vertices.push(ao_scene::Vertex {
+                pos: [x as f32 * 2.0, 0.0, -(z as f32) * 2.0],
+                normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4],
+            });
+        }
+    }
+    ground.submeshes = vec![
+        ao_scene::Submesh::new(fine_indices, None),
+        ao_scene::Submesh::new(vec![lattice_start, lattice_start + 2, lattice_start + 6,
+            lattice_start + 2, lattice_start + 8, lattice_start + 6], None),
+    ];
+    let sun = [0.0, 0.8, -0.6];
+    let scene = Scene {
+        meshes: vec![
+            ground,
+            quad([[0.0, 0.0, -3.0], [4.0, 0.0, -3.0], [4.0, 3.0, -3.0], [0.0, 3.0, -3.0]], [0.0, 0.0, 1.0]),
+        ],
+        instances: (0..2).map(|mesh| ao_scene::Instance { mesh, transform: ao_scene::IDENTITY }).collect(),
+        ground_detail: vec![GroundPatch {
+            mesh: 0, cells: 2, cell_size: 2.0, height_scale: 1.0, heights: vec![0; 9],
+            lattice_start, coarse_submesh: 1, fine_cells,
+            ..Default::default()
+        }],
+        sun_authored: true,
+        ground_light: Some(([0.5; 3], sun)),
+        ..Default::default()
+    };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let mut renderer = Renderer::new(&instance, None).expect("headless grass receiver GPU");
+    renderer.set_msaa_samples(1);
+    renderer.upload(&scene);
+    renderer.shadow_sun = Some(sun);
+    renderer.env.sun_dir = sun;
+    renderer.env.sun_color = [0.5; 3];
+    renderer.env.ambient = [0.15; 3];
+    renderer.env.fog_start = 100.0;
+    renderer.env.fog_end = 120.0;
+    renderer.time = 0.0;
+    let camera = Camera::look_at(Vec3::new(2.0, 1.5, 3.0), Vec3::new(2.0, 0.2, -2.0));
+    let (width, height) = (384, 256);
+    let targets = Targets::new(&renderer, width, height);
+    let output = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("grass receiver image"), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: renderer.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+    });
+    let view = output.create_view(&Default::default());
+    let grass = EnhancedSettings { ground_grass: true, grass_density: 1.0, grass_distance: 30.0, ..Default::default() };
+    let capture = |renderer: &mut Renderer, settings: EnhancedSettings| {
+        renderer.set_enhanced_settings(settings);
+        if settings.ground_grass && settings.grass_density > 0.0 {
+            // This synthetic fixture explicitly supplies an exposed native cell;
+            // collision/exposure rejection is covered separately.
+            renderer.set_enhanced_grass_exposure(Some(GrassExposure {
+                generation: 1, query: std::rc::Rc::new(|_| true),
+                line_of_sight: std::rc::Rc::new(|_, _| true),
+            }));
+            renderer.warm_grass_tiles(&camera);
+        }
+        renderer.render(&view, &targets, &camera);
+        texture_to_rgba(renderer, &output, width, height).unwrap()
+    };
+    let faithful = capture(&mut renderer, EnhancedSettings::default());
+    let bare = capture(&mut renderer, EnhancedSettings { grass_density: 0.0, ..grass });
+    assert_eq!(faithful, bare, "zero-density grass changed the native image");
+    let blades = capture(&mut renderer, grass);
+    assert_eq!(renderer.enhanced_grass_cell_count(), 4, "fixture did not generate its native fine grass cells");
+    // With one sample and no postprocessing, only visible grass fragments can
+    // differ from the density-zero image. Ground/wall-only changes cannot pass.
+    let blade_mask: Vec<_> = blades.as_chunks::<4>().0.iter().zip(bare.as_chunks::<4>().0.iter()).map(|(a, b)| a != b).collect();
+    assert!(blade_mask.iter().filter(|&&blade| blade).count() > 100, "fixture has no substantial visible blade coverage");
+    let darkened_blades = |effect: &[u8], effect_bare: &[u8]| {
+        blade_mask.iter().zip(blades.as_chunks::<4>().0.iter()).zip(effect.as_chunks::<4>().0.iter().zip(effect_bare.as_chunks::<4>().0.iter()))
+            .filter(|((blade, original), (changed, ground))| {
+                **blade && changed != ground
+                    && changed[..3].iter().map(|&c| u32::from(c)).sum::<u32>()
+                        < original[..3].iter().map(|&c| u32::from(c)).sum::<u32>()
+            }).count()
+    };
+    let shadows = EnhancedSettings { sun_shadows: true, ..grass };
+    let shadow_bare = capture(&mut renderer, EnhancedSettings { grass_density: 0.0, ..shadows });
+    let shadow_blades = capture(&mut renderer, shadows);
+    assert!(darkened_blades(&shadow_blades, &shadow_bare) > 8, "caster did not darken actual grass pixels");
+    let ao = EnhancedSettings { ambient_occlusion: true, ao_radius: 2.0, ..grass };
+    let ao_bare = capture(&mut renderer, EnhancedSettings { grass_density: 0.0, ..ao });
+    let ao_blades = capture(&mut renderer, ao);
+    assert!(darkened_blades(&ao_blades, &ao_bare) > 8, "AO did not darken actual grass pixels");
+    assert_eq!(blades, capture(&mut renderer, EnhancedSettings { ao_strength: 0.0, ..ao }), "zero AO strength must be neutral on grass");
+    assert_eq!(blades, capture(&mut renderer, EnhancedSettings { ao_radius: 0.0, ..ao }), "zero AO radius must be neutral on grass");
+    let bloom = capture(&mut renderer, EnhancedSettings { emissive_bloom: true, bloom_strength: 1.0, ..grass });
+    assert_eq!(blades, bloom, "non-emissive grass seeded bloom");
+    let emission = renderer.emissive_seed_rgba().unwrap().expect("bloom emission attachment");
+    for (pixel, &blade) in emission.as_chunks::<4>().0.iter().zip(&blade_mask) {
+        if blade { assert_eq!(*pixel, [0; 4], "grass fragment wrote authored emission"); }
+    }
+    renderer.shadow_sun = None;
+    let no_sun = capture(&mut renderer, grass);
+    assert_eq!(no_sun, capture(&mut renderer, shadows), "missing authored shadow source must be neutral on grass");
+    assert_eq!(blades, no_sun, "disabling the source changed the shadows-off grass image");
+    assert_eq!(faithful, capture(&mut renderer, EnhancedSettings::default()), "all-off roundtrip changed the native image");
+    assert!(renderer.grass.is_none(), "disabled grass retained its resources");
+    write_evidence(&[
+        ("grass-bare", &bare), ("grass-blades", &blades),
+        ("grass-shadow-bare", &shadow_bare), ("grass-shadow-blades", &shadow_blades),
+        ("grass-ao-bare", &ao_bare), ("grass-ao-blades", &ao_blades),
+        ("grass-emission", &emission),
+    ], (width, height));
+}
+
 fn write_evidence(images: &[(&str, &[u8])], size: (u32, u32)) {
     let Some(directory) = std::env::var_os("AOMAC_GFX_SHADOW_FAIRNESS_OUT") else { return; };
     let directory = std::path::PathBuf::from(directory);

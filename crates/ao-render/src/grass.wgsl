@@ -84,6 +84,9 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let p = root + vec3<f32>(width.x + bend.x * curve, height * along, width.y + bend.y * curve);
     o.clip = g.vp * vec4<f32>(p, 1.0);
     o.wpos = root;
+    // Keep wpos at the native root for palette sampling; n carries the actual
+    // blade position for the shared geometric-plane shadow receiver.
+    o.n = p;
     o.uv = grass_uv(c.identity.y, uv);
     // Ground-root fog: raised tips cannot reduce native extinction.
     o.fog = max(vertex_fog(-(g.view * vec4<f32>(root, 1.0)).z), vertex_fog(-(g.view * vec4<f32>(p, 1.0)).z));
@@ -94,13 +97,20 @@ fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instanc
     let offsets = array<vec2<f32>, 4>(vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0));
     let weights = grass_weights(c.identity.z, uv);
     o.light = vec3<f32>(0.0);
+    o.spec = vec3<f32>(0.0);
+    o.dlight = vec3<f32>(0.0);
     var root_fog = 0.0;
     for (var j = 0u; j < 4u; j += 1u) {
         let position = vec3<f32>(c.origin.x + offsets[j].x * c.origin.z, c.heights[j], c.origin.y - offsets[j].y * c.origin.z);
         let normal = normalize(c.normals[j].xyz);
-        let light = clamp(g.sun_g.rgb * max(dot(normal, g.sun_dir.xyz), 0.0) + vertex_lights(position, normal, 0.0)[0], vec3<f32>(0.0), vec3<f32>(1.0));
+        let local = vertex_lights(position, normal, 0.0)[0];
+        let light = clamp(g.sun_g.rgb * max(dot(normal, g.sun_dir.xyz), 0.0) + local, vec3<f32>(0.0), vec3<f32>(1.0));
+        let without_sun = clamp(local, vec3<f32>(0.0), vec3<f32>(1.0));
         // Simple ground adds/saturates ambient at each corner before interpolation.
         o.light += weights[j] * select(clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), light, c.origin.w > 0.5);
+        // Subtract only the sun's surviving share after native saturation.
+        o.spec += weights[j] * select(clamp(without_sun + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), without_sun, c.origin.w > 0.5);
+        o.dlight += weights[j] * (clamp(light + g.ambient_g.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) - light);
         root_fog += weights[j] * vertex_fog(-(g.view * vec4<f32>(position, 1.0)).z);
     }
     o.fog = max(o.fog, root_fog);
@@ -113,7 +123,9 @@ struct GrassOutput {
 }
 @fragment
 fn fs_grass(i: VOut) -> GrassOutput {
-    let light = select(i.light, clamp(i.light + ground_palette(i), vec3<f32>(0.0), vec3<f32>(1.0)), i.color.r > 0.5);
+    let palette = ground_palette(i);
+    var light = select(i.light, clamp(i.light + palette, vec3<f32>(0.0), vec3<f32>(1.0)), i.color.r > 0.5);
+    //__SHADOW_RECEIVE__
     // Deterministic per-blade hue/brightness variation is subtractive: both
     // sides keep the terrain's lighting budget, and tips never exceed it.
     let jitter = vec3<f32>(0.88 + i.color.g * 0.12, 0.91 + i.color.b * 0.09, 0.82 + i.color.g * 0.18);
@@ -131,6 +143,7 @@ fn fs_grass(i: VOut) -> GrassOutput {
     var output: GrassOutput;
     output.color = vec4<f32>(color, 1.0);
     //__AMBIENT_WRITE__
+    //__AO_RECEIVE__
     //__EMISSIVE_WRITE__
     return output;
 }

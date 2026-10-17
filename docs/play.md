@@ -563,6 +563,14 @@ Blade tint samples the original texture at its root. Per-blade hue/brightness
 jitter and the darker-base/lighter-tip gradient only subtract from that budget;
 both faces use the same terrain-normal lighting. Ordered dither softens the far
 fade without adding light or retaining temporal/actor history.
+Enhanced sun shadows reuse the world's current-frame cascades, geometric receiver
+plane correction, PCF and cascade transitions at the actual blade position.
+The shader removes only the sun share surviving native corner saturation and
+palette addition; local light and baked palette light are never multiplied by
+sun visibility. No authored sun or zero shadow strength leaves native light intact.
+AO receives 80% of diffuse plus all of its surviving indirect share, bounded by
+the blade's beauty colour and attenuated by the native fog equation (both factors
+for two-pass fog). This is an approved Enhanced treatment, not retail behaviour.
 Wind uses the current native weather wind; time is the renderer's existing clock.
 Calm or unavailable weather stays still; no synthetic fallback breeze is invented.
 
@@ -573,19 +581,36 @@ frustum and clear the final camera's existing bidirectional collision/closed-doo
 line-of-sight query. Admission uses the current prepared draw list, including body
 fade/priority, before selecting the fifteen nearest remote sources. Camera shake
 or a renderer-rejected body therefore cannot evict a visible source at the cap.
+Remote admission also rejects a body bound whose nearest view-space depth is at
+or beyond the final camera fog end, after local fog evaluation. Rigid and current
+CPU-skinned geometry use their transformed local AABB, without the animation
+margin. Native GPU CAT poses retain the conservative bind sphere plus pose margin;
+this bound can straddle fog even when every actual posed vertex is fully fogged,
+so suppression of every such animated body remains unresolved (no CPU re-skin or
+GPU readback is introduced). A partially unfogged bound remains eligible; disabled fog,
+native fog-disabled body materials and rendering effects 2/4/5/6 preserve their
+native exemptions (`shader.wgsl::shade`, Randy `10041876` vertex-depth fog).
+Own-character interaction is unchanged. This only filters Enhanced benders;
+faithful actor rendering is untouched.
 CPU candidate allocations are exchanged with the host and reused; their size is
 bounded by the currently submitted character frames, while the GPU stays fixed
 at sixteen sources. Missing collision admits only own-character interaction.
 Repeated renders of the same actor snapshot preserve bends for screenshots;
 the next actor batch replaces all candidates, including an empty batch.
 No recovery grid or actor history exists; concealment, disappearance or a blocked
-ray removes the bend immediately. Optional source channels are cleared under grass so blades
-neither seed bloom nor expose the underlying terrain's AO/emissive contribution.
+ray removes the bend immediately. Grass overwrites the optional AO attachment
+with its own receiving contribution rather than inheriting the terrain beneath
+it. Its emissive attachment remains zero: grass never seeds bloom.
 
 Effect buffers are fixed-size and released on disable; all-off execution does
 not prepare cells, upload grass data or create a grass pipeline. Regression tests
-cover material allowlisting, stable density, submerged placement and an actor
+cover material allowlisting, stable density, submerged placement, fully fogged
+body admission (with visible, partial-body and fog-exempt controls), and an actor
 behind a synthetic wall producing exactly the same bender list as its absence.
+`grass_pixels_receive_sun_shadows_and_ao_without_emission` is a headless synthetic
+native-cell regression: density-zero/one renders identify actual blade pixels
+before asserting shadow and AO darkening, neutral zero-AO/no-sun paths, and zero
+emission. It is not retail-image or native-collision visual acceptance.
 
 The ignored `grass_offline_capture_and_timing` fixture compares density-zero
 neutral frames with grass using `FrameGpuTimer`, in both orderings. Alongside the

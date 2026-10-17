@@ -56,7 +56,9 @@ struct Candidate {
 }
 pub(super) struct Grass {
     pipeline: wgpu::RenderPipeline,
-    bind: wgpu::BindGroup,
+    bind: Option<wgpu::BindGroup>,
+    layout: wgpu::BindGroupLayout,
+    shadows: bool,
     cells_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
     cells: Vec<Cell>,
@@ -80,14 +82,19 @@ pub(super) struct Grass {
     pending: bool,
 }
 impl Grass {
-    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool), format: wgpu::TextureFormat) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(device: &wgpu::Device, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool), shadows: bool, format: wgpu::TextureFormat) -> Self {
+        let mut entries = vec![
+            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+        ];
+        if shadows {
+            entries.extend(crate::sun_shadows::receiver_entries().map(|mut entry| { entry.binding += 2; entry }));
+        }
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("grass cells and current visible benders"), entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            ],
+            label: Some("grass cells, benders and shared sun receiver"), entries: &entries,
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native material grass"), source: wgpu::ShaderSource::Wgsl(shader_source(channels).into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native material grass"), source: wgpu::ShaderSource::Wgsl(shader_source(channels, shadows).into()) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("grass"), bind_group_layouts: &[Some(globals), Some(material), Some(palette), Some(&layout)], immediate_size: 0 });
         let targets = [
             Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
@@ -105,11 +112,11 @@ impl Grass {
         });
         let cells_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass cell cache"), size: (MAX_CELLS * std::mem::size_of::<Cell>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let params_buffer = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("grass wind and benders"), size: std::mem::size_of::<Params>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("grass"), layout: &layout, entries: &[
+        let bind = (!shadows).then(|| device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("grass"), layout: &layout, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: cells_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
-        ] });
-        Self { pipeline, bind, cells_buffer, params_buffer, cells: Vec::with_capacity(MAX_CELLS), batches: Vec::with_capacity(MAX_CELLS), fine_mask: [0; 4096], samples, channels, wind: [0.0; 3], benders: [[0.0; 3]; MAX_BENDERS], bender_count: 0, inputs: Vec::with_capacity(MAX_BENDERS), prepare_cpu_ns: 0, exposure: None, exposure_cache: std::collections::HashMap::with_capacity(MAX_EXPOSURE_CELLS * 2), exposure_order: std::collections::VecDeque::with_capacity(MAX_EXPOSURE_CELLS), candidates: Vec::with_capacity(MAX_CELLS), order: Vec::with_capacity(MAX_CELLS), last_selection: None, last_radius: 0, last_path: super::GroundPath::Simple, pending: false }
+        ] }));
+        Self { pipeline, bind, layout, shadows, cells_buffer, params_buffer, cells: Vec::with_capacity(MAX_CELLS), batches: Vec::with_capacity(MAX_CELLS), fine_mask: [0; 4096], samples, channels, wind: [0.0; 3], benders: [[0.0; 3]; MAX_BENDERS], bender_count: 0, inputs: Vec::with_capacity(MAX_BENDERS), prepare_cpu_ns: 0, exposure: None, exposure_cache: std::collections::HashMap::with_capacity(MAX_EXPOSURE_CELLS * 2), exposure_order: std::collections::VecDeque::with_capacity(MAX_EXPOSURE_CELLS), candidates: Vec::with_capacity(MAX_CELLS), order: Vec::with_capacity(MAX_CELLS), last_selection: None, last_radius: 0, last_path: super::GroundPath::Simple, pending: false }
     }
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(&mut self, queue: &wgpu::Queue, ground: &GroundRun, liquids: &[super::native_liquid::LiquidRun], camera: Vec3, settings: super::EnhancedSettings, time: f32, path: super::GroundPath) {
@@ -219,11 +226,11 @@ impl Grass {
         self.exposure_order.push_back(key);
         normals.is_some()
     }
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup, ground: &GroundRun, gpu: &super::Gpu) -> usize {
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup, ground: &GroundRun, gpu: &super::Gpu, shadow_bind: Option<&wgpu::BindGroup>) -> usize {
         if self.batches.is_empty() { return 0; }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, globals, &[]);
-        pass.set_bind_group(3, &self.bind, &[]);
+        pass.set_bind_group(3, shadow_bind.or(self.bind.as_ref()).expect("grass receiver prepared"), &[]);
         let mut draws = 0;
         for batch in &self.batches {
             let patch = &ground.detail.patches()[batch.patch];
@@ -250,13 +257,21 @@ fn slope_mask([a, b, c, d]: [f32; 4], size: f32, parity: u32) -> u32 {
 fn hash(mut value: u32) -> u32 { value ^= value >> 16; value = value.wrapping_mul(0x7feb352d); value ^= value >> 15; value = value.wrapping_mul(0x846ca68b); value ^ (value >> 16) }
 fn cell_seed(x: u32, z: u32, tile: u16) -> u32 { hash(hash(x) ^ hash(z.rotate_left(16)) ^ u32::from(tile)) }
 
-fn shader_source(channels: (bool, bool)) -> String {
+fn shader_source(channels: (bool, bool), shadows: bool) -> String {
     let grass = include_str!("grass.wgsl")
         .replace("//__AMBIENT_FIELD__", if channels.0 { "@location(1) ambient: vec4<f32>," } else { "" })
         .replace("//__EMISSIVE_FIELD__", if channels.1 { "@location(2) emissive: vec4<f32>," } else { "" })
         .replace("//__AMBIENT_WRITE__", if channels.0 { "output.ambient = vec4<f32>(0.0, 0.0, 0.0, 1.0);" } else { "" })
-        .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0, 0.0, 0.0, 1.0);" } else { "" });
-    format!("{}\nconst GRASS_TUFTS: u32 = {TUFTS_PER_CELL}u;\nconst GRASS_BLADES: u32 = {BLADES_PER_TUFT}u;\n{grass}", include_str!("shader.wgsl"))
+        .replace("//__AO_RECEIVE__", if channels.0 {
+            "let indirect = select(i.dlight, max(clamp(i.light + palette, vec3<f32>(0.0), vec3<f32>(1.0)) - i.light, vec3<f32>(0.0)), i.color.r > 0.5);\n    let extinction = (1.0 - fog) * select(1.0, 1.0 - fog, i.color.r > 1.5);\n    let receiving = tile * (light * 0.8 + min(light, indirect) * 0.2) * extinction;\n    output.ambient = vec4<f32>(min(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), max(receiving, vec3<f32>(0.0))), 1.0);"
+        } else { "" })
+        .replace("//__SHADOW_RECEIVE__", if shadows {
+            "let without_sun = select(i.spec, clamp(i.spec + palette, vec3<f32>(0.0), vec3<f32>(1.0)), i.color.r > 0.5);\n    let sun_share = max(light - without_sun, vec3<f32>(0.0));\n    let receiver_normal = cross(dpdx(i.n), dpdy(i.n));\n    if any(sun_share > vec3<f32>(0.0)) {\n        light = max(light - sun_share * (1.0 - sun_visibility(i.n, receiver_normal)), vec3<f32>(0.0));\n    }"
+        } else { "" })
+        .replace("//__EMISSIVE_WRITE__", if channels.1 { "output.emissive = vec4<f32>(0.0);" } else { "" });
+    let mut source = format!("{}\nconst GRASS_TUFTS: u32 = {TUFTS_PER_CELL}u;\nconst GRASS_BLADES: u32 = {BLADES_PER_TUFT}u;\n{grass}", include_str!("shader.wgsl"));
+    if shadows { crate::enhanced_shader::append_shadow_receiver(&mut source, 2); }
+    source
 }
 fn cell_height(cell: &Cell, uv: [f32; 2]) -> f32 {
     let [a, b, c, d] = cell.heights;
@@ -347,8 +362,17 @@ impl super::Renderer {
         let settings = self.enhanced_settings();
         if !settings.ground_grass || settings.grass_density <= 0.0 || settings.grass_distance <= 0.0 || self.ground.is_none() {
             self.grass = None;
-        } else if self.grass.as_ref().is_none_or(|grass| grass.samples != self.msaa_samples() || grass.channels != (settings.ambient_occlusion, settings.emissive_bloom)) {
-            self.grass = Some(Grass::new(&self.device, &self.g_layout, &self.tex_layout, &self.holo_layout, self.msaa_samples(), (settings.ambient_occlusion, settings.emissive_bloom), self.format));
+            if let Some(shadows) = &mut self.sun_shadows { shadows.grass_receiver = None; }
+        } else if self.grass.as_ref().is_none_or(|grass| grass.samples != self.msaa_samples() || grass.channels != (settings.ambient_occlusion, settings.emissive_bloom) || grass.shadows != settings.sun_shadows) {
+            self.grass = Some(Grass::new(&self.device, &self.g_layout, &self.tex_layout, &self.holo_layout, self.msaa_samples(), (settings.ambient_occlusion, settings.emissive_bloom), settings.sun_shadows, self.format));
+            if let Some(shadows) = &mut self.sun_shadows { shadows.grass_receiver = None; }
+        }
+    }
+    pub(super) fn prepare_grass_shadow_receiver(&mut self) {
+        if let (Some(grass), Some(shadows)) = (&self.grass, &mut self.sun_shadows) {
+            if grass.shadows && shadows.grass_receiver.is_none() {
+                shadows.grass_receiver = Some(shadows.grass_bind(&self.device, &grass.layout, &grass.cells_buffer, &grass.params_buffer));
+            }
         }
     }
     pub(super) fn clear_enhanced_grass_inputs(&mut self) {
@@ -383,14 +407,14 @@ impl super::Renderer {
             grass.exposure = exposure;
         }
     }
-    pub(super) fn prepare_enhanced_grass(&mut self, cam: &super::Camera, vp: super::Mat4) {
+    pub(super) fn prepare_enhanced_grass(&mut self, cam: &super::Camera, vp: super::Mat4, fog_end: f32) {
         self.ensure_grass();
         if self.grass.is_none() { return; }
         let started = std::time::Instant::now();
         let settings = self.enhanced_settings();
         if let (Some(grass), Some(ground)) = (&mut self.grass, &self.ground) {
             let (selected, count) = select_benders(
-                &mut grass.inputs, cam.pos, vp, self.act.enhanced_grass_actor_ids(),
+                &mut grass.inputs, cam.pos, vp, self.act.enhanced_grass_actor_ids(fog_end),
                 grass.exposure.as_ref().map(|surface| surface.line_of_sight.as_ref()),
             );
             grass.benders = selected.map(|bender| bender.position);
@@ -401,7 +425,7 @@ impl super::Renderer {
     }
     pub(super) fn draw_enhanced_grass(&self, pass: &mut wgpu::RenderPass<'_>) -> usize {
         match (&self.grass, &self.ground) {
-            (Some(grass), Some(ground)) => grass.draw(pass, &self.globals_bg, ground, &self.gpu),
+            (Some(grass), Some(ground)) => grass.draw(pass, &self.globals_bg, ground, &self.gpu, self.sun_shadows.as_ref().and_then(|shadows| shadows.grass_receiver.as_ref())),
             _ => 0,
         }
     }

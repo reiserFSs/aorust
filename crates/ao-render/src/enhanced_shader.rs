@@ -70,9 +70,7 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
     }
     source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n)");
     if shadows {
-        let shader = include_str!("sun_shadows.wgsl");
-        source.push_str(shader.split("@group(3) @binding(3)").next().expect("shadow receiver declarations"));
-        source.push_str(&shader[shader.find("fn cascade_visibility(").expect("shadow receiver function")..]);
+        append_shadow_receiver(&mut source, 0);
     } else {
         source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> f32 { return 1.0; }\n");
     }
@@ -113,6 +111,25 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
         }
     }
     source
+}
+
+/// Reuse the world receiver verbatim; grass packs it beside its cell buffers.
+pub(super) fn append_shadow_receiver(source: &mut String, binding_offset: u32) {
+    let shader = include_str!("sun_shadows.wgsl");
+    let declarations = shader.split("@group(3) @binding(3)").next().expect("shadow receiver declarations");
+    for line in declarations.lines() {
+        let mut line = line.to_owned();
+        for binding in 0..3 {
+            let old = format!("@group(3) @binding({binding})");
+            if line.contains(&old) {
+                line = line.replace(&old, &format!("@group(3) @binding({})", binding + binding_offset));
+                break;
+            }
+        }
+        source.push_str(&line);
+        source.push('\n');
+    }
+    source.push_str(&shader[shader.find("fn cascade_visibility(").expect("shadow receiver function")..]);
 }
 
 const OUTPUT: &str = r#"

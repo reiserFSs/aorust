@@ -94,6 +94,7 @@ struct ModelMesh {
     submesh_mats: Vec<SubmeshMat>,
     /// Bind-pose bounding sphere.
     sphere: (Vec3, f32),
+    bounds: (Vec3, Vec3),
 }
 
 struct Model {
@@ -116,6 +117,7 @@ struct ActorGpu {
     /// Model key of the last submitted frame (a replaced model only invalidates its own actors' buffers).
     model: u64,
     skin: Option<std::sync::Arc<Vec<ao_scene::Vertex>>>,
+    skin_bounds: Option<(Vec3, Vec3)>,
     pose: Option<skinning::PoseGpu>,
 }
 
@@ -124,11 +126,19 @@ struct Item {
     actor: u32,
     model: u64,
     mesh: usize,
+    /// Nearest final-camera depth of the current body bound.
+    fog_depth: f32,
     bucket: i32,
     /// `ActorFrame::alpha < 1`: opaque / alpha-tested draws use the [`FADE_PIPE`] variants.
     faded: bool,
     rendering_effect: u32,
     priority: Option<i32>,
+}
+
+fn bounds_depth((center, half): (Vec3, Vec3), transform: Mat4, eye: Vec3, forward: Vec3) -> f32 {
+    let support = Vec3::new(forward.dot(transform.x_axis.truncate()),
+        forward.dot(transform.y_axis.truncate()), forward.dot(transform.z_axis.truncate())).abs();
+    forward.dot(transform.transform_point3(center) - eye) - support.dot(half)
 }
 
 fn actor_visual_key(item: &Item, draw: &Draw) -> Option<VisualKey> {
@@ -173,8 +183,14 @@ pub(crate) struct ActorLayer {
 }
 
 impl ActorLayer {
-    pub(super) fn enhanced_grass_actor_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.items.iter().filter(|item| item.mesh == 0 && !item.faded).map(|item| item.actor)
+    pub(super) fn enhanced_grass_actor_ids(&self, fog_end: f32) -> impl Iterator<Item = u32> + '_ {
+        self.items.iter().filter(move |item| {
+            if item.mesh != 0 || item.faded { return false; }
+            // Match shade()'s native fog exemptions; these bodies can remain visible.
+            if matches!(item.rendering_effect, 2 | 4..=6) { return true; }
+            let fogged = item.fog_depth >= fog_end;
+            !fogged || self.models[&item.model].topology[item.mesh].1.iter().any(|part| !part.fog_enabled)
+        }).map(|item| item.actor)
     }
     fn remove_model(&mut self, key: u64) {
         self.models.remove(&key);
@@ -309,6 +325,7 @@ impl Renderer {
                 let (lo, hi) = mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.pos)), h.max(Vec3::from(v.pos))));
                 let center = (lo + hi) * 0.5;
                 gpu.sphere = (center, mesh.vertices.iter().map(|v| (Vec3::from(v.pos) - center).length()).fold(0.0, f32::max));
+                gpu.bounds = (center, (hi - lo) * 0.5);
                 model.topology[i] = (mesh.vertices.len(), submesh_shape(&mesh.submeshes));
             }
             return;
@@ -430,7 +447,7 @@ impl Renderer {
             let (lo, hi) = mesh.vertices.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(l, h), v| (l.min(Vec3::from(v.pos)), h.max(Vec3::from(v.pos))));
             let c = (lo + hi) * 0.5;
             let r = mesh.vertices.iter().map(|v| (Vec3::from(v.pos) - c).length()).fold(0.0, f32::max);
-            meshes.push(Some(ModelMesh { vb, ib, vertex_capacity, index_capacity, nverts: mesh.vertices.len(), draws, submesh_mats, sphere: (c, r) }));
+            meshes.push(Some(ModelMesh { vb, ib, vertex_capacity, index_capacity, nverts: mesh.vertices.len(), draws, submesh_mats, sphere: (c, r), bounds: (c, (hi - lo) * 0.5) }));
         }
         let topology = scene.meshes.iter().map(|mesh| (mesh.vertices.len(), submesh_shape(&mesh.submeshes))).collect();
         let native_skin = scene.native_skin.as_ref().filter(|s| !s.is_empty()).map(|s| (
@@ -528,7 +545,7 @@ impl Renderer {
                     entry.into_mut()
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => entry.insert(ActorGpu {
-                    vb: None, seen: tick, model: f.model, skin: None, pose: None,
+                    vb: None, seen: tick, model: f.model, skin: None, skin_bounds: None, pose: None,
                 }),
             };
             a.seen = tick;
@@ -555,6 +572,9 @@ impl Renderer {
                         });
                     }
                 }
+                let (lo, hi) = skin.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                    |(lo, hi), v| (lo.min(Vec3::from(v.pos)), hi.max(Vec3::from(v.pos))));
+                a.skin_bounds = Some(((lo + hi) * 0.5, (hi - lo) * 0.5));
                 a.skin = Some(skin);
                 a.pose = None;
             }
@@ -605,7 +625,8 @@ impl Renderer {
     }
 
     /// Frustum-culls the submitted actors, fills the instance buffer; called by `render` before the pass.
-    pub(crate) fn prepare_actors(&mut self, cam: Vec3, planes: &[Vec4; 6]) {
+    pub(crate) fn prepare_actors(&mut self, cam: Vec3, forward: Vec3, planes: &[Vec4; 6]) {
+        let grass_enabled = self.enhanced_settings().ground_grass;
         let layer = &mut self.act;
         layer.items.clear();
         let mut xf: Vec<ActorInstance> = vec![];
@@ -633,7 +654,19 @@ impl Renderer {
                 }
                 let bucket = f.render_bucket.filter(|b| (0..=1800).contains(b))
                     .unwrap_or_else(|| render_bucket(m.w_axis.truncate().distance(cam)));
-                layer.items.push(Item { actor: f.id, model: f.model, mesh: mi, bucket, faded: alpha < 1.0, rendering_effect: f.rendering_effect, priority });
+                let fog_depth = if mi == 0 && grass_enabled {
+                    let bounds = if let Some(actor) = layer.actors.get(&f.id).filter(|actor| actor.vb.is_some()) {
+                        actor.skin.as_ref().and(actor.skin_bounds)
+                    } else { Some(mesh.bounds) };
+                    // Native CAT vertices live on the GPU. Keep the conservative pose
+                    // sphere: it may straddle fog even when all actual vertices do not.
+                    bounds.map_or_else(|| {
+                        let support = Vec3::new(forward.dot(m.x_axis.truncate()),
+                            forward.dot(m.y_axis.truncate()), forward.dot(m.z_axis.truncate())).length();
+                        (c - cam).dot(forward) - (mesh.sphere.1 + margin) * support
+                    }, |bounds| bounds_depth(bounds, m, cam, forward))
+                } else { f32::NEG_INFINITY };
+                layer.items.push(Item { actor: f.id, model: f.model, mesh: mi, fog_depth, bucket, faded: alpha < 1.0, rendering_effect: f.rendering_effect, priority });
                 // m0.w carries `alpha - 1` to the shader (the affine matrix' unused column element)
                 let mut a = m.to_cols_array_2d();
                 a[0][3] = alpha.min(1.0) - 1.0;
@@ -956,6 +989,54 @@ mod tests {
         }
     }
     use super::*;
+    #[test]
+    fn grass_admission_uses_final_camera_body_depth_and_native_fog_exemptions() {
+        let mut layer = ActorLayer::default();
+        layer.models.insert(1, Model { meshes: vec![], mats: vec![], holo: None, views: vec![],
+            view_of: HashMap::new(), textures: vec![], identities: HashMap::new(),
+            topology: vec![(0, vec![ao_scene::Submesh::new(vec![], None)])], native_skin: None });
+        layer.items.push(Item { actor: 7, model: 1, mesh: 0, fog_depth: 9.0,
+            bucket: 0, faded: false, rendering_effect: 0, priority: None });
+        let camera = Camera::look_at(Vec3::ZERO, -Vec3::Z);
+        let ids = |layer: &ActorLayer, end| layer.enhanced_grass_actor_ids(end).collect::<Vec<_>>();
+        assert_eq!(ids(&layer, 20.0), [7], "positive control: a drawn opaque body bends");
+        assert!(ids(&layer, 9.0).is_empty(), "the entire bound at fog end is equivalent to absence");
+        assert_eq!(ids(&layer, 9.01), [7], "a body crossing fog end must not be culled by its feet or center");
+        assert_eq!(ids(&layer, f32::MAX), [7], "disabled fog preserves admission");
+        let bounds = (Vec3::new(10.0, 1.0, -10.0), Vec3::new(0.4, 0.9, 0.0));
+        assert_eq!(bounds_depth(bounds, Mat4::IDENTITY, camera.pos, camera.forward()), 10.0, "view depth, not radial distance");
+        let moved = Camera::look_at(Vec3::new(0.0, 0.0, -2.0), Vec3::new(0.0, 0.0, -10.0));
+        assert_eq!(bounds_depth(bounds, Mat4::IDENTITY, moved.pos, moved.forward()), 8.0, "final camera movement");
+        let pitched = Camera::look_at(Vec3::ZERO, Vec3::new(0.0, 1.0, -1.0));
+        assert!(bounds_depth(bounds, Mat4::IDENTITY, pitched.pos, pitched.forward()) < 9.0, "camera pitch can expose part of the body");
+        let fixture_camera = Camera::look_at(Vec3::new(0.0, 3.0, 8.0), Vec3::new(0.0, 1.0, 0.0));
+        let fixture_bounds = (Vec3::new(0.0, 0.9, -1.0), Vec3::new(0.4, 0.9, 0.0));
+        let transform = Mat4::from_translation(Vec3::new(-5.0, 0.0, 0.0));
+        layer.items[0].fog_depth = bounds_depth(fixture_bounds, transform, fixture_camera.pos, fixture_camera.forward());
+        assert!((layer.items[0].fog_depth - 9.0223).abs() < 0.0001);
+        assert!(ids(&layer, 9.0).is_empty(), "the original rigid fog leak is rejected without the sphere's pose margin");
+        let transform = Mat4::from_scale_rotation_translation(Vec3::new(2.0, 0.5, 3.0),
+            glam::Quat::from_rotation_y(0.7), Vec3::new(1.0, -2.0, -4.0));
+        let corner_min = [-1.0, 1.0].into_iter().flat_map(|x| [-1.0, 1.0].into_iter().flat_map(move |y|
+            [-1.0, 1.0].into_iter().map(move |z| fixture_bounds.0 + fixture_bounds.1 * Vec3::new(x, y, z))))
+            .map(|corner| (transform.transform_point3(corner) - fixture_camera.pos).dot(fixture_camera.forward()))
+            .fold(f32::INFINITY, f32::min);
+        assert!((bounds_depth(fixture_bounds, transform, fixture_camera.pos, fixture_camera.forward()) - corner_min).abs() < 0.00001,
+            "scaled and rotated part bounds use their nearest transformed corner");
+        layer.models.get_mut(&1).unwrap().topology[0].1[0].fog_enabled = false;
+        assert_eq!(ids(&layer, 1.0), [7], "native material fog disable remains visible");
+        layer.models.get_mut(&1).unwrap().topology[0].1[0].fog_enabled = true;
+        for effect in [2, 4, 5, 6] {
+            layer.items[0].rendering_effect = effect;
+            assert_eq!(ids(&layer, 1.0), [7], "native effect {effect} disables fog");
+        }
+        layer.items[0].rendering_effect = 0;
+        layer.items[0].faded = true;
+        assert!(ids(&layer, f32::MAX).is_empty(), "fog disable does not bypass body alpha admission");
+        layer.items[0].faded = false;
+        layer.items[0].mesh = 1;
+        assert!(ids(&layer, f32::MAX).is_empty(), "only the current primary body admits a remote bender");
+    }
     #[test]
     fn immutable_actor_textures_share_uploads_pixels_and_reclaim() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -1331,9 +1412,9 @@ mod tests {
         let mut layer = ActorLayer::default();
         for (id, model) in [(1, 7), (2, 8), (3, 7)] {
             layer.models.entry(model).or_insert_with(|| Model { meshes: vec![], mats: vec![], holo: None, views: vec![], view_of: HashMap::new(), textures: vec![], identities: HashMap::new(), topology: vec![], native_skin: None });
-            layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None, pose: None });
+            layer.actors.insert(id, ActorGpu { vb: None, seen: 1, model, skin: None, skin_bounds: None, pose: None });
             layer.frames.push(ActorFrame { id, model, skin: Some(std::sync::Arc::new(vec![ao_scene::Vertex::default()])), ..Default::default() });
-            layer.items.push(Item { actor: id, model, mesh: 0, bucket: 0, faded: false, rendering_effect: 0, priority: None });
+            layer.items.push(Item { actor: id, model, mesh: 0, fog_depth: 0.0, bucket: 0, faded: false, rendering_effect: 0, priority: None });
         }
         for key in [7, 7, 99] {
             layer.remove_model(key);

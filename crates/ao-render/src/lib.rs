@@ -2086,9 +2086,9 @@ impl Renderer {
             self.vis_range.push(start..self.vis.len() as u32);
         }
         self.frame = (self.frame + 1) % INST_RING;
-        self.prepare_actors(cam.pos, &planes);
+        self.prepare_actors(cam.pos, cam.forward(), &planes);
         self.prepare_actor_pipelines();
-        self.prepare_enhanced_grass(cam, vp);
+        self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3));
         {
             let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);
             let format = self.world_format();
@@ -2208,6 +2208,7 @@ impl Renderer {
         self.sorted.sort_by(|a, b| actors::bucket_order(a.0, a.1, b.0, b.1)
             .then_with(|| b.4.cmp(&a.4)).then_with(|| a.3.cmp(&b.3)));
         self.encode_enhanced_shadows(&mut enc, cam, t.size, env, far);
+        self.prepare_grass_shadow_receiver();
         let inst_buf = self.gpu.inst_bufs.get(self.frame);
         let sky_buf = self.sky.bufs.get(self.frame);
 
