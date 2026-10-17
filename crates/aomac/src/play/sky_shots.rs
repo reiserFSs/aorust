@@ -673,6 +673,7 @@ fn graphics_bloom_gpu_timing() -> anyhow::Result<()> {
         off.host.actor_models.push((super::avatar::MODEL_KEY, std::sync::Arc::new(avatar.model().clone())));
         off.host.actors.push(avatar.frame());
         off.frame(&mut shot, 0.0);
+        off.prepare_frozen_rendering();
         off.set_gpu_timing(true)?;
         let mut samples = Vec::with_capacity(600);
         for frame in 0..720 {

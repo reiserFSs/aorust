@@ -53,20 +53,22 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
         let emission = if bloom { emission } else { "vec4<f32>(0.0)" };
         let ambient_sample = ambient.replace("beauty", "envelope");
         let emission_sample = emission.replace("beauty", "envelope");
-        let ambient_result = if ao && name == "fs_ground_shadow" { "ambient_sample" } else { "vec4<f32>(min(beauty.rgb, ambient_sample.rgb), beauty.a)" };
+        let ambient_result = if ao && name == "fs_ground_shadow" { "ambient_sample" } else { "vec4<f32>(min(bounded_beauty, max(ambient_sample.rgb, vec3<f32>(0.0))), beauty.a)" };
         let emission_result = if bloom && name == "fs_ground_shadow" {
             "emission_sample"
         } else if bloom && matches!(name.as_str(), "fs_add" | "fs_mesh_add" | "fs_add_one" | "fs_holo") {
-            "vec4<f32>(select(beauty.rgb * (1.0 - native_fog(i.fog)), vec3<f32>(0.0), (u32(mat.native.z) & 16u) != 0u), beauty.a)"
+            "vec4<f32>(select(bounded_beauty * (1.0 - native_fog(i.fog)), vec3<f32>(0.0), (u32(mat.native.z) & 16u) != 0u), beauty.a)"
         } else if bloom && name == "fs_blend" {
-            "vec4<f32>(select(min(beauty.rgb, emission_sample.rgb), beauty.rgb * (1.0 - native_fog(i.fog)), (u32(mat.native.z) & 24u) == 8u), beauty.a)"
+            "vec4<f32>(select(min(bounded_beauty, max(emission_sample.rgb, vec3<f32>(0.0))), bounded_beauty * (1.0 - native_fog(i.fog)), ((u32(mat.native.z) & 24u) == 8u || native_unlit()) && (u32(mat.native.z) & 16u) == 0u), beauty.a)"
+        } else if bloom && matches!(name.as_str(), "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_sprite") {
+            "vec4<f32>(select(min(bounded_beauty, max(emission_sample.rgb, vec3<f32>(0.0))), bounded_beauty * (1.0 - native_fog(i.fog)), native_unlit() && (u32(mat.native.z) & 16u) == 0u), beauty.a)"
         } else {
-            "vec4<f32>(min(beauty.rgb, emission_sample.rgb), beauty.a)"
+            "vec4<f32>(min(bounded_beauty, max(emission_sample.rgb, vec3<f32>(0.0))), beauty.a)"
         };
         let receiving = shadows && matches!(name.as_str(), "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" | "fs_sprite" | "fs_add" | "fs_mesh_add" | "fs_add_one" | "fs_ground_fused" | "fs_ground_shadow" | "fs_ground_simple");
         let geometric_normal = if receiving { "    var surface = i;\n    surface.n = cross(dpdx(i.wpos), dpdy(i.wpos));\n" } else { "" };
         let fragment_input = if receiving { "surface" } else { "i" };
-        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let ambient_sample = {ambient_sample};\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    return EnhancedOutput(beauty, {ambient_result}, {emission_result});\n}}\n"));
+        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let ambient_sample = {ambient_sample};\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient_result}, {emission_result});\n}}\n"));
     }
     source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n)");
     if shadows {
@@ -144,8 +146,8 @@ fn enhanced_ambient(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
 }
 fn enhanced_emission(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
     // Liquid emission is native lighting authoring, not a bloom source.
-    // SourceColorOne is handled after the native body, using actual beauty.
-    if (u32(mat.native.z) & 24u) != 0u { return vec4<f32>(0.0); }
+    // SourceColorOne and authored unlit materials use actual post-body beauty.
+    if (u32(mat.native.z) & 24u) != 0u || native_unlit() { return vec4<f32>(0.0); }
     let t = sample_clamped(tex, i.uv + mat.scroll.xy * g.fog.z);
     var emission = vec3<f32>(0.0);
     if mat.emissive.w < 1.5 {

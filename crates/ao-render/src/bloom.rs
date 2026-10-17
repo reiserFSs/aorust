@@ -147,7 +147,7 @@ impl crate::Renderer {
         self.queue.submit([encoder.finish()]);
         let mut pixels = crate::texture_to_rgba(self, &output, frame.size.0, frame.size.1)?;
         if self.format == wgpu::TextureFormat::Bgra8Unorm {
-            for pixel in pixels.chunks_exact_mut(4) { pixel.swap(0, 2); }
+            for pixel in pixels.as_chunks_mut::<4>().0 { pixel.swap(0, 2); }
         }
         Ok(Some(pixels))
     }

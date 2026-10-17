@@ -236,8 +236,8 @@ mod tests {
                 assert_eq!(has_ambient, mode == 0, "ambient MRT mode={mode} actor={actor_path}: only ordinary lit materials receive AO");
                 if mode == 0 {
                     assert!(capture(&r, true).as_chunks::<4>().0.iter().all(|pixel| pixel[..3] == [0,0,0]), "bright ordinary material is not emission");
-                } else if mode == 3 {
-                    assert!(capture(&r, true).as_chunks::<4>().0.iter().any(|pixel| pixel[..3] != [0,0,0]), "authored glow produces a nonzero visible emission mask");
+                } else if mode == 2 || mode == 3 {
+                    assert!(capture(&r, true).as_chunks::<4>().0.iter().any(|pixel| pixel[..3] != [0,0,0]), "authored unlit/glow produces a nonzero visible emission mask");
                 }
             }
         }
