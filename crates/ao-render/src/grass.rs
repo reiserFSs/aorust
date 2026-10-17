@@ -69,7 +69,7 @@ pub(super) struct Grass {
     batches: Vec<Batch>,
     fine_mask: [u8; 4096],
     samples: u32,
-    channels: (bool, bool),
+    channels: (bool, bool, bool),
     wind: [f32; 3],
     benders: [[f32; 3]; MAX_BENDERS],
     bender_count: usize,
@@ -87,7 +87,7 @@ pub(super) struct Grass {
 }
 impl Grass {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool), shadows: bool, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, globals: &wgpu::BindGroupLayout, material: &wgpu::BindGroupLayout, palette: &wgpu::BindGroupLayout, samples: u32, channels: (bool, bool, bool), shadows: bool, format: wgpu::TextureFormat) -> Self {
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
@@ -100,14 +100,16 @@ impl Grass {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("grass cells, benders and shared sun receiver"), entries: &entries,
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native material grass"), source: wgpu::ShaderSource::Wgsl(shader_source(channels, shadows).into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("native material grass"), source: wgpu::ShaderSource::Wgsl(shader_source((channels.0, channels.1), shadows).into()) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("grass"), bind_group_layouts: &[Some(globals), Some(material), Some(palette), Some(&layout)], immediate_size: 0 });
         let targets = [
             Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
             channels.0.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
             channels.1.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+            // HDR sun mask: declared to match the world pass, never written (blades get no sun brightening).
+            channels.2.then_some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::empty() }),
         ];
-        let target_count = if channels.0 || channels.1 { 3 } else { 1 };
+        let target_count = if channels.2 { 4 } else if channels.0 || channels.1 { 3 } else { 1 };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("ground grass"), layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_grass"), compilation_options: Default::default(), buffers: &[] },
@@ -373,8 +375,8 @@ impl super::Renderer {
         if !settings.ground_grass || settings.grass_density <= 0.0 || settings.grass_distance <= 0.0 || self.ground.is_none() {
             self.grass = None;
             if let Some(shadows) = &mut self.sun_shadows { shadows.grass_receiver = None; }
-        } else if self.grass.as_ref().is_none_or(|grass| grass.samples != self.msaa_samples() || grass.channels != (settings.ambient_occlusion, settings.emissive_bloom) || grass.shadows != settings.sun_shadows) {
-            self.grass = Some(Grass::new(&self.device, &self.queue, &self.g_layout, &self.tex_layout, &self.holo_layout, self.msaa_samples(), (settings.ambient_occlusion, settings.emissive_bloom), settings.sun_shadows, self.format));
+        } else if self.grass.as_ref().is_none_or(|grass| grass.samples != self.msaa_samples() || grass.channels != (settings.ambient_occlusion, settings.emissive_bloom, settings.hdr) || grass.shadows != settings.sun_shadows) {
+            self.grass = Some(Grass::new(&self.device, &self.queue, &self.g_layout, &self.tex_layout, &self.holo_layout, self.msaa_samples(), (settings.ambient_occlusion, settings.emissive_bloom, settings.hdr), settings.sun_shadows, self.format));
             if let Some(shadows) = &mut self.sun_shadows { shadows.grass_receiver = None; }
         }
     }

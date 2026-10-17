@@ -1378,12 +1378,19 @@ replaces, or to off/Auto for the ones with no retail equivalent, and persists th
 mechanism as `DisplayCompressedTextures` (`DV Main`, account-independent, survives restart).
 
 The optional Sun Shadows (`AomacSunShadows`), Ambient Occlusion (`AomacAmbientOcclusion`),
-Emissive Bloom (`AomacEmissiveBloom`) and Ground Grass (`AomacGroundGrass`) checkboxes are
+Emissive Bloom (`AomacEmissiveBloom`), Ground Grass (`AomacGroundGrass`) and HDR Sunlight and
+Tonemap (`AomacHdr`) checkboxes are
 independent DV Main booleans, all **off** by default, including when an older preferences
 file lacks them. `DValues::enhanced_settings` maps them and the quality controls below to
 `ao_render::EnhancedSettings`; `flow.rs::frame` sends the value through `Host.enhanced_settings`.
 Both windowed and offscreen viewers drain that request into `Renderer::set_enhanced_settings`.
-MSAA is independently selectable; there is no player-facing master/HDR switch.
+MSAA is independently selectable. HDR is a scene-path switch, not a master switch: with it on the world pass writes
+a fourth attachment (daylight sun weight = luma of the surface's direct-sun share x shadow visibility x (1 - native fog)),
+`grade.wgsl::expose` lifts only pixels whose weight rises through `smoothstep(0.3, 0.7)` by up to `AomacSunBoost` into an
+RGBA16F target, and `present` tonemaps (identity below a knee, cubic to exactly 1.0 at the pixel's own boosted white) and
+dithers the 8-bit write (fixed-pattern noise, +-0.35 level). Night, dusk, shadow, fog, sky, unlit and glow pixels get weight 0
+and keep their native codes (fixture `hdr-neutral`/`boost 0` matches faithful to within 1 code); grass blades are not
+sun-boosted.
 
 | Quality control / DV Main key | Default | Bounds |
 |---|---|---|
@@ -1392,6 +1399,7 @@ MSAA is independently selectable; there is no player-facing master/HDR switch.
 | Sun Shadow Softness / `AomacShadowSoftness` | 1.5 | 0–4 (penumbra growth with blocker distance; 0 = hard 3x3 PCF) |
 | Ambient Occlusion Radius / `AomacAoRadius` | 1 m | 0–5 m |
 | Ambient Occlusion Strength / `AomacAoStrength` | 1 | 0–1 |
+| Sunlight Brightness / `AomacSunBoost` | 0.35 | 0–0.6 (peak lift of fully sunlit daylight surfaces; 0 = faithful) |
 | Emissive Bloom Strength / `AomacBloomStrength` | 0.6 | 0–1 |
 | Ground Grass Density / `AomacGrassDensity` | 1 | 0–2 |
 | Ground Grass Distance / `AomacGrassDistance` | 50 m | 0–60 m |

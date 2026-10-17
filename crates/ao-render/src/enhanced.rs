@@ -3,17 +3,25 @@
 use crate::{gpu_stats::{GpuStatsExt, TextureViewStatsExt}, DEPTH};
 pub(super) const AUX: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Colour attachments the world pass declares: 1 native, 3 with AO/bloom masks, 4 when the HDR sun mask exists.
+/// Every world-pass pipeline must declare the same count.
+pub(super) fn target_count(settings: &crate::EnhancedSettings) -> usize {
+    if settings.hdr { 4 } else if settings.ambient_occlusion || settings.emissive_bloom { 3 } else { 1 }
+}
+
 pub(super) struct EnhancedFrame {
     pub size: (u32, u32),
     pub sample_count: u32,
     pub colour: wgpu::TextureView,
     pub ambient: Option<wgpu::TextureView>,
     pub emissive: Option<wgpu::TextureView>,
+    /// Sun-lit weight (r), sunlit fraction (g), shadow visibility (b) per pixel; HDR sun brightening and contact shadows.
+    pub sun: Option<wgpu::TextureView>,
     pub depth: wgpu::TextureView,
     pub resolved_depth: wgpu::TextureView,
-    pub msaa: Option<[Option<wgpu::TextureView>; 3]>,
+    pub msaa: Option<[Option<wgpu::TextureView>; 4]>,
     pub composite: wgpu::RenderPipeline,
-    composite_bg: wgpu::BindGroup,
+    pub composite_bg: wgpu::BindGroup,
     depth_resolve: Option<(wgpu::RenderPipeline, wgpu::BindGroup)>,
 }
 impl EnhancedFrame {
@@ -26,15 +34,16 @@ impl EnhancedFrame {
         let colour = make(format, 1, "Enhanced native UNORM colour");
         let ambient = settings.ambient_occlusion.then(|| make(AUX, 1, "Enhanced ambient share"));
         let emissive = settings.emissive_bloom.then(|| make(AUX, 1, "Enhanced authored emission"));
+        let sun = settings.hdr.then(|| make(AUX, 1, "Enhanced sun mask"));
         let depth = make(DEPTH, samples, "Enhanced sampleable depth");
         let resolved_depth = if samples == 1 { depth.clone() } else { make(DEPTH, 1, "Enhanced resolved depth") };
-        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), settings.ambient_occlusion.then(|| make(AUX, samples, "Enhanced MSAA ambient")), settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission"))]);
+        let msaa = (samples > 1).then(|| [Some(make(format, samples, "Enhanced MSAA native colour")), settings.ambient_occlusion.then(|| make(AUX, samples, "Enhanced MSAA ambient")), settings.emissive_bloom.then(|| make(AUX, samples, "Enhanced MSAA emission")), settings.hdr.then(|| make(AUX, samples, "Enhanced MSAA sun mask"))]);
         let (composite, composite_bg) = pipeline(device, format, &colour, false);
         let depth_resolve = (samples > 1).then(|| pipeline(device, DEPTH, &depth, true));
-        Self { size, sample_count: samples, colour, ambient, emissive, depth, resolved_depth, msaa, composite, composite_bg, depth_resolve }
+        Self { size, sample_count: samples, colour, ambient, emissive, sun, depth, resolved_depth, msaa, composite, composite_bg, depth_resolve }
     }
     pub fn attachment(&self, index: usize) -> Option<wgpu::RenderPassColorAttachment<'_>> {
-        let resolved = [Some(&self.colour), self.ambient.as_ref(), self.emissive.as_ref()][index]?;
+        let resolved = [Some(&self.colour), self.ambient.as_ref(), self.emissive.as_ref(), self.sun.as_ref()][index]?;
         let msaa = self.msaa.as_ref().and_then(|views| views[index].as_ref());
         Some(wgpu::RenderPassColorAttachment { view: msaa.unwrap_or(resolved), resolve_target: msaa.map(|_| resolved), depth_slice: None,
             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: if msaa.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } } })

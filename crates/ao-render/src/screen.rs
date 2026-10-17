@@ -114,12 +114,12 @@ pub(super) fn depth_clear_pipeline(device:&wgpu::Device,format:wgpu::TextureForm
     });
     let target = wgpu::ColorTargetState {format,blend:None,write_mask:wgpu::ColorWrites::empty()};
     let auxiliary=wgpu::ColorTargetState {format:crate::enhanced::AUX,blend:None,write_mask:wgpu::ColorWrites::empty()};
-    let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then_some(auxiliary)];
+    let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then(|| auxiliary.clone()), settings.hdr.then_some(auxiliary)];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label:Some("native viewport depth clear"),layout:Some(&layout),
         vertex:wgpu::VertexState {module:&shader,entry_point:Some("vs"),compilation_options:Default::default(),buffers:&[]},
         fragment:Some(wgpu::FragmentState {module:&shader,entry_point:Some("fs"),compilation_options:Default::default(),
-            targets:if settings.ambient_occlusion || settings.emissive_bloom {&targets} else {&targets[..1]}}),
+            targets:&targets[..crate::enhanced::target_count(&settings)]}),
         primitive:Default::default(),
         depth_stencil:Some(wgpu::DepthStencilState {format:DEPTH,depth_write_enabled:Some(true),depth_compare:Some(wgpu::CompareFunction::Always),stencil:Default::default(),bias:Default::default()}),
         multisample:wgpu::MultisampleState {count:samples,..Default::default()},multiview_mask:None,cache:None,

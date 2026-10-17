@@ -1,0 +1,132 @@
+//! Enhanced HDR scene: sun brightening into an RGBA16F target, then tonemap + dither to the 8-bit output.
+//! Owns no resources unless `EnhancedSettings::hdr` is on; the faithful path never reaches it.
+use crate::gpu_stats::GpuStatsExt;
+
+const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+pub(super) struct Grade {
+    pub size: (u32, u32),
+    hdr_bg: wgpu::BindGroup,
+    hdr: wgpu::TextureView,
+    aux_bg: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    expose: wgpu::RenderPipeline,
+    present: wgpu::RenderPipeline,
+}
+
+impl Grade {
+    /// `source_layout` is the Enhanced single-texture boundary layout; `sun` is the world pass's sun mask.
+    pub fn new(device: &wgpu::Device, output: wgpu::TextureFormat, size: (u32, u32), source_layout: &wgpu::BindGroupLayout, sun: &wgpu::TextureView) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Enhanced HDR grade"), source: wgpu::ShaderSource::Wgsl(include_str!("grade.wgsl").into()) });
+        let aux_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Enhanced grade inputs"), entries: &[
+            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+        ] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Enhanced grade"), bind_group_layouts: &[Some(source_layout), Some(&aux_layout)], immediate_size: 0 });
+        let make = |entry, format| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry), layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(entry), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+        });
+        let hdr = device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: Some("Enhanced HDR scene"), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+        }).create_view(&Default::default());
+        let params = device.create_buffer_tracked(&wgpu::BufferDescriptor { label: Some("Enhanced grade parameters"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let hdr_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced HDR scene"), layout: source_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hdr) }] });
+        let aux_bg = device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: Some("Enhanced grade inputs"), layout: &aux_layout, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(sun) },
+            wgpu::BindGroupEntry { binding: 1, resource: params.as_entire_binding() },
+        ] });
+        Self { size, hdr_bg, hdr, aux_bg, params, expose: make("expose", HDR), present: make("present", output) }
+    }
+
+    pub fn bytes(size: (u32, u32)) -> u64 { u64::from(size.0) * u64::from(size.1) * 8 + 16 }
+
+    /// `base` is the native-range colour (bloomed when bloom is on); the result is written to `output`.
+    pub fn encode(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, base: &wgpu::BindGroup, output: &wgpu::TextureView, boost: f32, timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>) {
+        queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&[boost, 0.0, 0.0, 0.0]));
+        for (label, pipeline, input, target, load, timestamp_writes) in [
+            ("Enhanced HDR expose", &self.expose, base, &self.hdr, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), None),
+            ("Enhanced tonemap present", &self.present, &self.hdr_bg, output, wgpu::LoadOp::Clear(wgpu::Color::BLACK), timestamps),
+        ] {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label), color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load, store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None, timestamp_writes, occlusion_query_set: None, multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, input, &[]);
+            pass.set_bind_group(1, &self.aux_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+}
+
+impl crate::Renderer {
+    pub(super) fn prepare_enhanced_grade(&mut self) {
+        if !self.enhanced_settings.hdr { self.grade = None; return; }
+        let Some(frame) = self.enhanced_frame.as_ref() else { self.grade = None; return; };
+        if self.grade.as_ref().is_none_or(|grade| grade.size != frame.size) {
+            let sun = frame.sun.as_ref().expect("HDR owns its world sun mask");
+            self.grade = Some(Grade::new(&self.device, self.format, frame.size, &frame.composite.get_bind_group_layout(0), sun));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the real expose + present shaders over a 256x1 grey ramp; `sun` is the sun weight written to every pixel.
+    fn ramp(boost: f32, sun: f32) -> Vec<u8> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let r = crate::Renderer::new(&instance, None).expect("grade regression needs an offscreen GPU");
+        let size = (256, 1);
+        let texture = |format, usage| r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("grade regression"), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[],
+        });
+        let base = texture(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let sun_tex = texture(wgpu::TextureFormat::Rgba32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let out = texture(r.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        let ramp: Vec<u8> = (0..=255u8).flat_map(|v| [v, v, v, 255]).collect();
+        let sun_data: Vec<f32> = (0..256).flat_map(|_| [sun, 0.0, 0.0, 1.0]).collect();
+        let copy = wgpu::Extent3d { width: size.0, height: 1, depth_or_array_layers: 1 };
+        r.queue.write_texture(base.as_image_copy(), &ramp, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024), rows_per_image: Some(1) }, copy);
+        r.queue.write_texture(sun_tex.as_image_copy(), bytemuck::cast_slice(&sun_data), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4096), rows_per_image: Some(1) }, copy);
+        let layout = r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None }] });
+        let base_view = base.create_view(&Default::default());
+        let base_bg = r.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&base_view) }] });
+        let grade = Grade::new(&r.device, r.format, size, &layout, &sun_tex.create_view(&Default::default()));
+        let mut encoder = r.device.create_command_encoder(&Default::default());
+        grade.encode(&r.queue, &mut encoder, &base_bg, &out.create_view(&Default::default()), boost, None);
+        r.queue.submit([encoder.finish()]);
+        let pixels = crate::texture_to_rgba(&r, &out, size.0, 1).unwrap();
+        pixels.chunks(4).map(|p| p[0]).collect()
+    }
+
+    #[test]
+    fn neutral_and_unlit_pixels_keep_every_native_8_bit_code() {
+        let native: Vec<u8> = (0..=255).collect();
+        assert_eq!(ramp(0.0, 1.0), native, "zero boost must reproduce the faithful codes despite dither");
+        assert_eq!(ramp(0.35, 0.0), native, "pixels without a sun weight (night, shadow, fog, sky) are never lifted");
+        assert_eq!(ramp(0.35, 0.25), native, "dusk-level sun shares stay below the daylight ramp");
+    }
+
+    #[test]
+    fn daylight_sun_brightens_monotonically_and_reaches_white_exactly() {
+        let lit = ramp(0.35, 1.0);
+        assert_eq!(lit, ramp(0.35, 1.0), "static frames are identical (fixed-pattern dither)");
+        assert_eq!(lit[255], 255);
+        assert!(lit.windows(2).all(|w| i32::from(w[0]) <= i32::from(w[1]) + 1), "tonemap must stay monotone within dither");
+        assert!(lit.iter().enumerate().all(|(i, &v)| i32::from(v) + 1 >= i as i32), "never darker than native");
+        assert!(lit[128] >= 128 + 30, "mid-tone sunlit surfaces gain visible brightness: {}", lit[128]);
+    }
+}

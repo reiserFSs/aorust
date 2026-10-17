@@ -2,6 +2,7 @@
 
 mod actors;
 mod bloom;
+mod grade;
 mod grass;
 pub use grass::{GrassBender, GrassExposure};
 mod gui;
@@ -631,6 +632,7 @@ pub struct Renderer {
     enhanced_settings: EnhancedSettings,
     enhanced_frame: Option<enhanced::EnhancedFrame>,
     bloom: Option<bloom::Bloom>,
+    grade: Option<grade::Grade>,
     enhanced_shader: Option<wgpu::ShaderModule>,
     ambient_occlusion: Option<ambient_occlusion::AmbientOcclusion>,
     gpu_timer: Option<FrameGpuTimer>,
@@ -865,7 +867,8 @@ fn compile_pipeline(
         };
         let target = wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let auxiliary = wgpu::ColorTargetState { format: enhanced::AUX, blend: state, write_mask: wgpu::ColorWrites::ALL };
-        let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then_some(auxiliary)];
+        let sun_mask = settings.hdr.then(|| auxiliary.clone());
+        let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then_some(auxiliary), sun_mask];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(fs),
             // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) use `fs_blend`,
@@ -889,7 +892,7 @@ fn compile_pipeline(
                 module: shader,
                 entry_point: Some(fs),
                 compilation_options: Default::default(),
-                targets: if settings.ambient_occlusion || settings.emissive_bloom { &targets } else { &targets[..1] },
+                targets: &targets[..enhanced::target_count(&settings)],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: if effect == 14 { wgpu::PrimitiveTopology::PointList } else { wgpu::PrimitiveTopology::TriangleList },
@@ -1131,6 +1134,7 @@ impl Renderer {
             enhanced_settings: EnhancedSettings::default(),
             enhanced_frame: None,
             bloom: None,
+            grade: None,
             enhanced_shader: None,
             ambient_occlusion: None,
             gpu_timer: None,
@@ -1269,7 +1273,7 @@ impl Renderer {
     /// live toggle). Callers that keep a [`Targets`] across frames must rebuild it when [`Renderer::msaa_samples`] changes
     /// (`Targets::sample_count`). The single world pass resolves once and discards its transient MSAA/depth attachments.
     pub fn set_msaa_samples(&mut self, requested: u32) {
-        let auxiliary = self.enhanced_settings.ambient_occlusion || self.enhanced_settings.emissive_bloom;
+        let auxiliary = self.enhanced_settings.ambient_occlusion || self.enhanced_settings.emissive_bloom || self.enhanced_settings.hdr;
         let level = if auxiliary {
             self.msaa_supported.iter().copied().filter(|&count| count <= requested && self.auxiliary_msaa.sample_count_supported(count)).max().unwrap_or(1)
         } else { clamp_msaa_samples(requested.max(1), &self.msaa_supported) };
@@ -1280,6 +1284,7 @@ impl Renderer {
         self.ground_pipes.invalidate();
         self.enhanced_frame = None;
         self.bloom = None;
+        self.grade = None;
         self.depth_clear_pipe = screen::depth_clear_pipeline(&self.device, self.world_format(), level, self.enhanced_settings);
     }
 
@@ -1293,22 +1298,24 @@ impl Renderer {
         if self.enhanced_settings == settings { return; }
         let changed_pipeline = self.enhanced_settings.sun_shadows != settings.sun_shadows
             || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
-            || self.enhanced_settings.emissive_bloom != settings.emissive_bloom;
+            || self.enhanced_settings.emissive_bloom != settings.emissive_bloom
+            || self.enhanced_settings.hdr != settings.hdr;
         let changed_frame = self.enhanced_settings.any_enabled() != settings.any_enabled()
             || self.enhanced_settings.ambient_occlusion != settings.ambient_occlusion
-            || self.enhanced_settings.emissive_bloom != settings.emissive_bloom;
+            || self.enhanced_settings.emissive_bloom != settings.emissive_bloom
+            || self.enhanced_settings.hdr != settings.hdr;
         self.enhanced_settings = settings;
         if !settings.ground_grass || settings.grass_density <= 0.0 { self.grass = None; }
         if !settings.ambient_occlusion { self.ambient_occlusion = None; }
         if !settings.sun_shadows { self.sun_shadows = None; }
-        if changed_frame { self.enhanced_frame = None; self.bloom = None; }
+        if changed_frame { self.enhanced_frame = None; self.bloom = None; self.grade = None; }
         // Grass has its own shader. Keep the native world shader and cached pipelines
         // unless a world-shading effect actually needs the Enhanced variant.
-        if !(settings.sun_shadows || settings.ambient_occlusion || settings.emissive_bloom) {
+        if !(settings.sun_shadows || settings.ambient_occlusion || settings.emissive_bloom || settings.hdr) {
             self.enhanced_shader = None;
         } else if self.enhanced_shader.is_none() || changed_pipeline {
             self.enhanced_shader = Some(self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(enhanced_shader::source(settings.sun_shadows, settings.ambient_occlusion, settings.emissive_bloom).into()),
+                label: Some("Enhanced world"), source: wgpu::ShaderSource::Wgsl(enhanced_shader::source(settings.sun_shadows, settings.ambient_occlusion, settings.emissive_bloom, settings.hdr).into()),
             }));
         }
         if changed_pipeline {
@@ -1335,11 +1342,12 @@ impl Renderer {
     pub fn enhanced_target_bytes(&self) -> u64 {
         self.enhanced_frame.as_ref().map_or(0, |frame| {
             let pixels = u64::from(frame.size.0) * u64::from(frame.size.1);
-            let colour = 4 + 8 * (u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()));
+            let colour = 4 + 8 * (u64::from(frame.ambient.is_some()) + u64::from(frame.emissive.is_some()) + u64::from(frame.sun.is_some()));
             let samples = u64::from(frame.sample_count);
             pixels * (colour + 4 * samples + if samples > 1 { colour * samples + 4 } else { 0 })
         }) + self.ambient_occlusion.as_ref().map_or(0, ambient_occlusion::AmbientOcclusion::target_bytes)
             + self.bloom.as_ref().map_or(0, |bloom| bloom.bytes)
+            + self.grade.as_ref().map_or(0, |grade| grade::Grade::bytes(grade.size))
     }
     fn world_format(&self) -> wgpu::TextureFormat { self.format }
     /// Explicit offline instrumentation; disabled by default and owns no resources then.
@@ -2142,9 +2150,11 @@ impl Renderer {
         }
         if self.enhanced_settings.any_enabled() && self.enhanced_frame.as_ref().is_none_or(|frame| frame.size != t.size || frame.sample_count != self.msaa_samples) {
             self.bloom = None;
+            self.grade = None;
             self.enhanced_frame = Some(enhanced::EnhancedFrame::new(&self.device, self.format, t.size, self.msaa_samples, self.enhanced_settings));
         }
         self.prepare_enhanced_bloom();
+        self.prepare_enhanced_grade();
         let encode_start = timed.then(std::time::Instant::now);
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.encode_actor_skins(&mut enc);
@@ -2257,6 +2267,7 @@ impl Renderer {
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)), store: if msaa_target.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } } }),
             enhanced_frame.and_then(|frame| frame.attachment(1)),
             enhanced_frame.and_then(|frame| frame.attachment(2)),
+            enhanced_frame.and_then(|frame| frame.attachment(3)),
         ];
         let final_world = enhanced_frame.is_none() && self.heat_haze.source().is_none() && self.screen.layers.is_empty();
         let timestamps = self.gpu_timer.as_mut().and_then(|timer| {
@@ -2265,7 +2276,7 @@ impl Renderer {
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: if self.enhanced_settings.ambient_occlusion || self.enhanced_settings.emissive_bloom { &attachments } else { &attachments[..1] },
+                color_attachments: &attachments[..enhanced_frame.map_or(1, |_| enhanced::target_count(&self.enhanced_settings))],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
@@ -2376,7 +2387,12 @@ impl Renderer {
         }
         if let Some(frame) = self.enhanced_frame.as_ref() {
             let timestamps = if self.heat_haze.source().is_none() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
-            frame.composite(&mut enc, self.heat_haze.source().unwrap_or(resolve), self.bloom.as_ref().map(|bloom| &bloom.present), timestamps);
+            let output = self.heat_haze.source().unwrap_or(resolve);
+            if let Some(grade) = &self.grade {
+                grade.encode(&self.queue, &mut enc, self.bloom.as_ref().map_or(&frame.composite_bg, |bloom| &bloom.present), output, self.enhanced_settings.sun_boost, timestamps);
+            } else {
+                frame.composite(&mut enc, output, self.bloom.as_ref().map(|bloom| &bloom.present), timestamps);
+            }
         }
         let timestamps = if self.heat_haze.source().is_some() && self.screen.layers.is_empty() { self.gpu_timer.as_mut().map(FrameGpuTimer::end_pass) } else { None };
         self.heat_haze.draw(&mut enc, resolve, timestamps);

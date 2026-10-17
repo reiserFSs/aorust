@@ -599,13 +599,16 @@ fn graphics_fixture_settings(profile: &str) -> anyhow::Result<ao_render::Enhance
         "ao" => settings.ambient_occlusion = true,
         "bloom" => settings.emissive_bloom = true,
         "grass" => settings.ground_grass = true,
+        "hdr" => settings.hdr = true,
+        "hdr-neutral" => { settings.hdr = true; settings.sun_boost = 0.0; }
         "all" => {
             settings.sun_shadows = true;
             settings.ambient_occlusion = true;
             settings.emissive_bloom = true;
             settings.ground_grass = true;
+            settings.hdr = true;
         }
-        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|all"),
+        _ => anyhow::bail!("unknown AOMAC_GFX_SETTINGS profile {profile:?}; use faithful|neutral|shadows|shadows-hard|ao|bloom|grass|hdr|hdr-neutral|all"),
     }
     Ok(settings)
 }
@@ -623,7 +626,11 @@ fn graphics_fixture_profiles_are_explicit_and_off_by_default() {
     ] {
         let s = graphics_fixture_settings(name).unwrap();
         assert_eq!([s.sun_shadows, s.ambient_occlusion, s.emissive_bloom, s.ground_grass], expected);
+        assert_eq!(s.hdr, name == "all");
     }
+    assert!(graphics_fixture_settings("hdr").unwrap().hdr);
+    let neutral_hdr = graphics_fixture_settings("hdr-neutral").unwrap();
+    assert!(neutral_hdr.hdr && neutral_hdr.sun_boost == 0.0);
     assert!(graphics_fixture_settings("unknown").is_err());
     let actor = graphics_fixture_actor().unwrap();
     assert_eq!(actor.name, "Testy");

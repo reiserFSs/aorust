@@ -1,6 +1,8 @@
 //! Enhanced-only shader generation; the faithful WGSL is never modified.
 
-pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
+pub(super) fn source(shadows: bool, ao: bool, bloom: bool, hdr: bool) -> String {
+    // The HDR sun mask needs the per-vertex sun shares even when shadows are off.
+    let sun_shares = shadows || hdr;
     let mut source = include_str!("shader.wgsl").to_owned();
     source = source.replace("    @location(12) env_uv: vec2<f32>,", "    @location(12) env_uv: vec2<f32>,\n    @location(13) ao_info: vec3<f32>,\n    @location(14) sun_share: vec3<f32>,\n    @location(15) sun_spec_share: vec3<f32>,");
     source = source.replace("    var o: VOut;", "    var o: VOut;\n    o.ao_info = vec3<f32>(0.0);\n    o.sun_share = vec3<f32>(0.0);\n    o.sun_spec_share = vec3<f32>(0.0);");
@@ -66,23 +68,34 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
         let receiving = shadows && matches!(name.as_str(), "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" | "fs_sprite" | "fs_add" | "fs_mesh_add" | "fs_add_one" | "fs_ground_fused" | "fs_ground_shadow" | "fs_ground_simple");
         let geometric_normal = if receiving { "    var surface = i;\n    surface.n = cross(dpdx(i.wpos), dpdy(i.wpos));\n" } else { "" };
         let fragment_input = if receiving { "surface" } else { "i" };
-        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {emission_result});\n}}\n"));
+        let sun = match name.as_str() {
+            _ if !hdr => "vec4<f32>(0.0)",
+            "fs_opaque" | "fs_fade_opaque" | "fs_fade_test" | "fs_test" | "fs_blend" => "enhanced_sun(i, beauty, false)",
+            "fs_ground_fused" | "fs_ground_base" | "fs_ground_simple" => "enhanced_sun(i, beauty, true)",
+            _ => "vec4<f32>(0.0, 0.0, 0.0, beauty.a)",
+        };
+        source.push_str(&format!("\n@fragment fn {name}(i: VOut) -> EnhancedOutput {{\n{geometric_normal}    let envelope = vec4<f32>(1.0);\n    let emission_sample = {emission_sample};\n    let beauty = enhanced_original_{name}({fragment_input});\n    let bounded_beauty = clamp(beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n    return EnhancedOutput(beauty, {ambient}, {emission_result}, {sun});\n}}\n"));
     }
     source = source.replace("sun_visibility(i.wpos)", "sun_visibility(i.wpos, i.n, i.clip.xy)");
     if shadows {
         append_shadow_receiver(&mut source, 0);
+        if hdr {
+            // Remember the final cascade-blended visibility for the sun-mask output.
+            source = source.replace("fn sun_visibility(", "fn sun_visibility_raw(");
+            source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 { let v = sun_visibility_raw(world, normal, pixel); enhanced_sun_visibility = v; return v; }\n");
+        }
     } else {
         source.push_str("\nfn sun_visibility(world: vec3<f32>, normal: vec3<f32>, pixel: vec2<f32>) -> f32 { return 1.0; }\n");
     }
     // Remove disabled effects structurally, not merely by multiplying by zero.
-    for (enabled, name) in [(ao, "enhanced_ao_receiver"), (ao, "enhanced_ground_receiver"), (bloom, "enhanced_emission")] {
+    for (enabled, name) in [(ao, "enhanced_ao_receiver"), (ao, "enhanced_ground_receiver"), (bloom, "enhanced_emission"), (hdr, "enhanced_sun")] {
         if !enabled {
             let start = source.find(&format!("fn {name}(")).expect("enhanced helper");
             let end = start + source[start..].find("\n}\n").expect("enhanced helper end") + 3;
             source.replace_range(start..end, "");
         }
     }
-    for (enabled, field, location) in [(ao, "ao_info", 13), (shadows, "sun_share", 14), (shadows, "sun_spec_share", 15)] {
+    for (enabled, field, location) in [(ao, "ao_info", 13), (sun_shares, "sun_share", 14), (sun_shares, "sun_spec_share", 15)] {
         if !enabled {
             source = source.replace(&format!("select(l.{field}, vec3<f32>(0.0), prelit)"), "vec3<f32>(0.0)");
             source = source.replace(&format!("l.{field}"), "vec3<f32>(0.0)");
@@ -100,7 +113,7 @@ pub(super) fn source(shadows: bool, ao: bool, bloom: bool) -> String {
             }
         }
     }
-    if !shadows {
+    if !sun_shares {
         source = source.replace("i.sun_share.xyz", "vec3<f32>(0.0)");
         source = source.replace("i.sun_spec_share.xyz", "vec3<f32>(0.0)");
     }
@@ -137,6 +150,7 @@ struct EnhancedOutput {
     @location(0) beauty: vec4<f32>,
     @location(1) ambient: vec4<f32>,
     @location(2) emission: vec4<f32>,
+    @location(3) sun: vec4<f32>,
 }
 // The receiving colour is evaluated after the native body: no new texture
 // samples or derivatives can occur after its cutout discard.
@@ -177,24 +191,35 @@ fn enhanced_emission(i: VOut, beauty: vec4<f32>) -> vec4<f32> {
     emission = min(beauty.rgb, emission * (1.0 - native_fog(i.fog)));
     return vec4<f32>(emission, beauty.a);
 }
+var<private> enhanced_sun_visibility: f32 = 1.0;
+// Daylight sun weight for the HDR stage: the surface's own direct-sun share, after the shadow map and
+// the native fog ramp. Zero for unlit/glow/effect surfaces, so only receivers lit by the sun can brighten.
+fn enhanced_sun(i: VOut, beauty: vec4<f32>, ground: bool) -> vec4<f32> {
+    if !ground && (native_unlit() || i.effect != 0u || (u32(mat.native.z) & 16u) != 0u || (mat.emissive.w > 0.5 && mat.emissive.w < 1.5)) {
+        return vec4<f32>(0.0, 0.0, 0.0, beauty.a);
+    }
+    let fog = select(native_fog(i.fog), ground_fog(i), ground);
+    let share = dot(i.sun_share.xyz, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return vec4<f32>(share * enhanced_sun_visibility * (1.0 - fog), share, enhanced_sun_visibility, beauty.a);
+}
 "#;
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn enhanced_preserves_native_entrypoints_and_separates_baked_light() {
-        let source = super::source(false, true, true);
+        let source = super::source(false, true, true, false);
         assert!(source.contains("@fragment fn fs_ground_shadow"));
         assert!(source.contains("@fragment fn fs_lava_crust"));
         assert!(!source.contains("@group(3)"));
         assert!(source.contains("o.ao_info = vec3<f32>(select(0.0, 1.0, all(emissive"));
         assert!(source.contains("let baked = select(1.0, 0.2"));
         assert!(!include_str!("shader.wgsl").contains("EnhancedOutput"));
-        let ao_only = super::source(false, true, false);
+        let ao_only = super::source(false, true, false, false);
         assert!(!ao_only.contains("sun_share:"));
         assert!(!ao_only.contains("sun_spec_share:"));
         assert!(!ao_only.contains("fn enhanced_emission"));
-        let shadows_only = super::source(true, false, false);
+        let shadows_only = super::source(true, false, false, false);
         assert!(!shadows_only.contains("ao_info:"));
         assert!(!shadows_only.contains("fn enhanced_ao_receiver"));
     }
@@ -203,11 +228,11 @@ mod tests {
     fn enhanced_shader_validates_on_gpu() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let renderer = crate::Renderer::new(&instance, None).expect("Enhanced WGSL requires offscreen GPU");
-        for flags in 0..8 {
-            let (shadows, ao, bloom) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+        for flags in 0..16 {
+            let (shadows, ao, bloom, hdr) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0);
             let _shader = renderer.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Enhanced ambient/emissive/shadow syntax regression"),
-                source: wgpu::ShaderSource::Wgsl(super::source(shadows, ao, bloom).into()),
+                source: wgpu::ShaderSource::Wgsl(super::source(shadows, ao, bloom, hdr).into()),
             });
         }
     }
