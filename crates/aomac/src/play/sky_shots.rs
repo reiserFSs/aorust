@@ -402,6 +402,8 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         writeln!(manifest, "icc_clock=authored_frozen2648.69\nsun_low_high_night_source=Borealis800")?;
         writeln!(manifest, "enhanced_settings={settings:?}")?;
         let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
+        let png_only = std::env::var_os("AOMAC_GFX_PNG_ONLY").is_some();
+        writeln!(manifest, "png_only={png_only}")?;
         let actor = graphics_fixture_actor()?;
         let mut views = graphics_fixture_views(&actor);
         let selected = std::env::var("AOMAC_GFX_VIEW").ok();
@@ -436,8 +438,8 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 off.host.grass_exposure = grass_exposure.clone();
                 off.host.grass_wind = weather.wind;
                 let mut list = off.frame(&mut shot, 0.0);
-                if matches!(name.as_str(), "icc-actor-authored" | "borealis-lightbar-night") {
-                    let lightbar = name == "borealis-lightbar-night";
+                let lightbar = matches!(name.as_str(), "borealis-lightbar-night" | "borealis-lightbar-night-close");
+                if name == "icc-actor-authored" || lightbar {
                     let mut appearance = actor.clone();
                     if lightbar {
                         appearance.attractors.retain(|mount| mount.place != 5);
@@ -458,9 +460,9 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 }
                 if grass_exposure.is_some() { off.warm_grass_tiles(); }
                 let raw = off.rgba(&shot, &list)?;
-                if measure && profile == "bloom" && name == "borealis-lightbar-night" {
+                if measure && profile == "bloom" && lightbar {
                     let mask = off.emissive_seed_rgba()?.context("Bloom emission mask")?;
-                    image::save_buffer(out.join("borealis-lightbar-night-emissive-mask.png"),
+                    image::save_buffer(out.join(format!("{name}-emissive-mask.png")),
                         &mask, size.0, size.1, image::ColorType::Rgba8)?;
                 }
                 if measure && profile == "shadows" && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_some() {
@@ -469,13 +471,19 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                 Ok((raw, lens, counts.0, counts.1))
             };
             let (raw, lens, meshes, instances) = capture(true).with_context(|| format!("capture {name}"))?;
-            std::fs::write(out.join(format!("{name}.rgba")), &raw)?;
+            if !png_only {
+                std::fs::write(out.join(format!("{name}.rgba")), &raw)?;
+            }
             image::save_buffer(out.join(format!("{name}.png")), &raw, size.0, size.1, image::ColorType::Rgba8)?;
             let (repeated, _, _, _) = capture(false).with_context(|| format!("repeat {name}"))?;
             let differing = |other: &[u8]| raw.iter().zip(other).filter(|(a, b)| a != b).count() + raw.len().abs_diff(other.len());
             let repeat_differences = differing(&repeated);
             if repeat_differences != 0 {
-                std::fs::write(out.join(format!("{name}-repeat.rgba")), &repeated)?;
+                if png_only {
+                    image::save_buffer(out.join(format!("{name}-repeat.png")), &repeated, size.0, size.1, image::ColorType::Rgba8)?;
+                } else {
+                    std::fs::write(out.join(format!("{name}-repeat.rgba")), &repeated)?;
+                }
                 for (index, (a, b)) in raw.iter().zip(&repeated).enumerate().filter(|(_, (a, b))| a != b).take(16) {
                     writeln!(manifest, "{name} difference x={} y={} channel={} first={a} repeat={b}", index / 4 % size.0 as usize, index / 4 / size.0 as usize, index % 4)?;
                 }
@@ -484,7 +492,11 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
             std::fs::write(out.join("manifest.txt"), &manifest)?;
             ensure!(repeat_differences == 0, "{name}: independent captures differ in {repeat_differences} bytes");
             if let Some(base) = &baseline {
-                let previous = std::fs::read(base.join(format!("{name}.rgba")))?;
+                let previous = if png_only {
+                    image::open(base.join(format!("{name}.png")))?.into_rgba8().into_raw()
+                } else {
+                    std::fs::read(base.join(format!("{name}.rgba")))?
+                };
                 ensure!(previous.len() == raw.len(), "{name}: baseline byte length changed");
                 let count = differing(&previous);
                 let maximum = raw.iter().zip(&previous).map(|(a,b)| a.abs_diff(*b)).max().unwrap_or(0);
@@ -568,6 +580,8 @@ fn graphics_fixture_views(actor: &ao_net::n3::dynel::SimpleCharFullUpdate) -> Ve
         Camera::look_at(actor_at + Vec3::new(0.0, 1.0, 5.0), actor_at)));
     views.push(("borealis-lightbar-night".into(), 800, 0.0,
         Camera::look_at([679.6, 74.5, -476.7].into(), [679.6, 74.0, -482.7].into())));
+    views.push(("borealis-lightbar-night-close".into(), 800, 0.0,
+        Camera::look_at([679.6, 74.0, -480.2].into(), [679.6, 74.0, -482.7].into())));
     views
 }
 

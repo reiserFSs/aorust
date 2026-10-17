@@ -13,6 +13,20 @@ fn load_fine(p: vec2<i32>) -> vec4<f32> {
     if any(p < vec2<i32>(0)) || any(p >= vec2<i32>(textureDimensions(fine))) { return vec4<f32>(0.0); }
     return textureLoad(fine, p, 0);
 }
+fn load_coarse(p: vec2<i32>) -> vec4<f32> {
+    if any(p < vec2<i32>(0)) || any(p >= vec2<i32>(textureDimensions(coarse))) { return vec4<f32>(0.0); }
+    return textureLoad(coarse, p, 0);
+}
+fn reconstruct(p: vec4<f32>) -> vec4<f32> {
+    // Fine-pixel centres in coarse texel space. Zero-border bilinear taps
+    // expand each coarse texel by at most 4x, including odd-sized edges.
+    let c = p.xy * 0.5 - 0.5;
+    let base = vec2<i32>(floor(c));
+    let f = fract(c);
+    let a = mix(load_coarse(base), load_coarse(base + vec2<i32>(1, 0)), f.x);
+    let b = mix(load_coarse(base + vec2<i32>(0, 1)), load_coarse(base + vec2<i32>(1, 1)), f.x);
+    return mix(a, b, f.y);
+}
 fn downsample(p: vec4<f32>, bounded: bool) -> vec4<f32> {
     var rgb = vec3<f32>(0.0);
     let origin = vec2<i32>(p.xy) * 2;
@@ -34,18 +48,16 @@ fn downsample(p: vec4<f32>, bounded: bool) -> vec4<f32> {
 @fragment fn down(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> { return downsample(p, false); }
 @fragment fn seed_down(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> { return downsample(p, true); }
 @fragment fn up(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
-    // ponytail: nearest expansion is conservative even at odd edges; use an
-    // energy-accounted tent reconstruction if coarse-level blocks are visible.
     let q = vec2<i32>(p.xy);
     let a = textureLoad(fine, q, 0);
-    let b = textureLoad(coarse, q / 2, 0);
+    let b = reconstruct(p);
     return vec4<f32>(a.rgb * 0.25 + b.rgb * 0.75, 0.0);
 }
 @fragment fn composite(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let q = vec2<i32>(p.xy);
     let raw_beauty = textureLoad(fine, q, 0);
     let beauty = vec4<f32>(clamp(raw_beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), raw_beauty.a);
-    let halo = textureLoad(coarse, q / 2, 0);
+    let halo = reconstruct(p);
     let strength = clamp(params.strength, 0.0, 1.0);
     // Add bounded optical glare without debiting the native emitter core.
     // The conservative pyramid bounds its own energy by the visible-source

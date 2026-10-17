@@ -54,7 +54,7 @@ fn run(out: &std::path::Path) -> anyhow::Result<()> {
     }
     views.extend(graphics_fixture_views(&actor));
     std::fs::write(out.join("manifest.txt"), &report)?;
-    for (name, pf, time, fixed) in views.into_iter().filter(|(name, _, _, _)| !matches!(name.as_str(), "icc-actor-authored" | "borealis-lightbar-night")) {
+    for (name, pf, time, fixed) in views.into_iter().filter(|(name, _, _, _)| !matches!(name.as_str(), "icc-actor-authored" | "borealis-lightbar-night" | "borealis-lightbar-night-close")) {
         ao_scene::crt_srand(1);
         let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(&store, &dir, pf, time, 0, Some(weather))?;
         let exposure = super::super::player::grass_exposure_surface(Rc::new(RefCell::new(

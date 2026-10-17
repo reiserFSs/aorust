@@ -499,17 +499,31 @@ Condemned Subway 127 corridor (indoor lighting needs no day/night duplicate).
 ICC's authored frozen GAME clock is never overridden. The actor uses
 `zone_ithaca.rec` own-character 25988 appearance/position and the existing Avatar
 builder synchronously, without replay worker timing or a synthetic character.
-An additional Borealis night view equips that recorded actor with native Light Bar
-mesh 26163 on attractor 5, places it at the fixed street position, and includes the
-mount's real posed lights. These fixture equipment/placement overrides are explicit
-in the manifest; no emissive or other material is replaced.
+Two Borealis night views equip that recorded Testy actor with native Light Bar
+mesh 26163 on attractor 5, place it at the fixed street position, and include the
+mount's real posed lights: `borealis-lightbar-night` and
+`borealis-lightbar-night-close` (camera `[679.6, 74.0, -480.2]`, looking at
+`[679.6, 74.0, -482.7]`, 2.5 m from the upper-body target / 2.77 m from actor origin).
+These fixture equipment/placement overrides are explicit in the manifest;
+no emissive or other material is replaced.
 Every view uses a fixed 1920×1200 camera/lens, day zero, clear weather,
 CRT/cloud seed one, zero renderer/effect time, MSAA one and anisotropy one.
 Each immutable scene snapshot is rendered by two independently initialized
 renderers; raw RGBA8 must match exactly before the run reports success.
-The same captured bytes are written as
-top-down tightly packed `.rgba` and `.png`, alongside `manifest.txt` and
-`status.txt`. A failed/interrupted run is never a pass.
+The same captured bytes are written as top-down tightly packed `.rgba` and `.png`,
+alongside `manifest.txt` and `status.txt`. Set `AOMAC_GFX_PNG_ONLY=1` to retain
+only PNG images (including repeat-failure images); byte-exact independent-repeat
+checks still run in memory, and baseline comparison then decodes the baseline PNG.
+A failed/interrupted run is never a pass. For close-up bloom evidence without raw
+RGBA files, select the view explicitly:
+
+```sh
+AOMAC_GFX_OUT="$HOME/aomac-handoff/gfx/lightbar-night-close-bloom" \
+AOMAC_GFX_SETTINGS=bloom AOMAC_GFX_VIEW=borealis-lightbar-night-close \
+AOMAC_GFX_PNG_ONLY=1 \
+cargo test --release -p aomac graphics_offline_fixture -j 2 -- \
+  --ignored --nocapture --test-threads=1
+```
 
 Set `AOMAC_GFX_BASELINE` to an earlier run directory to additionally require exact
 raw byte equality against that run. Keep evidence under `~/aomac-handoff/gfx/`,

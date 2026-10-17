@@ -286,11 +286,22 @@ mod tests {
         pixels[center] = [0x3c00; 4];
         sources[center] = [0x3c00; 4];
         let glare = run(&pixels, &sources);
+        let row = |x: u32| glare[(size.1 / 2 * size.0 + x) as usize];
+        assert!(row(16) > row(17) && row(17) > row(18),
+            "halo falls off smoothly instead of repeating nearest 2x2 blocks");
         assert!(glare.iter().enumerate().any(|(i, &v)| i != center && v > 0.0), "visible emission produces a halo");
         assert_eq!(glare[center], 1.0, "bloom must never dim the native emitter core");
         assert!(glare.iter().sum::<f32>() <= 1.501, "halo energy stays within the half-strength source budget");
         assert!(run(&pixels, &none).iter().enumerate().all(|(i, &v)| v == if i == center { 1.0 } else { 0.0 }),
             "a source fully removed by world depth leaves no bloom signal");
+        pixels[center] = [0, 0, 0, 0x3c00];
+        sources[center] = [0; 4];
+        pixels[count - 1] = [0x3c00; 4];
+        sources[count - 1] = [0x3c00; 4];
+        assert!(run(&pixels, &sources).iter().sum::<f32>() <= 1.501,
+            "reconstruction at the odd-size corner cannot mint halo energy");
+        pixels[count - 1] = [0, 0, 0, 0x3c00];
+        sources[count - 1] = [0; 4];
         pixels[center] = [0x4000; 4]; // Synthetic over-range input; displayed envelope stays one.
         sources[center] = [0x4000; 4];
         assert!(run(&pixels, &sources).iter().sum::<f32>() <= 1.501,
