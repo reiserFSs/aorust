@@ -1,5 +1,6 @@
 //! Half-resolution screen-space contact shadows (port of ao-vk `contact.frag`, MIT; see THIRD_PARTY). Inputs are exclusively
 //! the current frame's resolved primary-view depth and the world pass's sun mask; the result only darkens the sun's direct share.
+//! Weak night/dusk directional light remains eligible; native fog and mapped-shadow attenuation stay in the mask.
 use crate::gpu_stats::GpuStatsExt;
 use glam::{Mat4, Vec3};
 
@@ -195,10 +196,10 @@ mod tests {
     }
 
     #[test]
-    fn neutral_without_strength_or_sun_and_only_darkens() {
+    fn neutral_without_strength_or_directional_light_and_only_darkens() {
         let lit = run(0.8, 1.0, false, false);
         assert!(run(0.0, 1.0, false, false).iter().all(|&v| v == 128), "strength 0 is exactly neutral");
-        assert!(run(0.8, 0.0, false, false).iter().all(|&v| v == 128), "no sun weight (night, shadow, fog, sky, unlit): zero change");
+        assert!(run(0.8, 0.0, false, false).iter().all(|&v| v == 128), "no directional share (fully shadowed, fogged or unlit): zero change");
         assert!(lit.iter().all(|&v| v <= 128), "contact shadows never brighten");
         let darker = lit.iter().filter(|&&v| v < 120).count();
         assert!(darker > 20, "the ground at the wall's foot must be visibly shadowed: {darker}");
@@ -209,9 +210,23 @@ mod tests {
     }
 
     #[test]
+    fn weak_night_light_casts_contacts_and_fog_attenuates_them() {
+        let lit = run(0.8, 1.0, false, false);
+        let night = run(0.8, 0.2, false, false);
+        let fogged = run(0.8, 0.1, false, false);
+        assert!(night.iter().any(|&v| v < 128), "weak directional light must not be discarded by the daylight exposure threshold");
+        assert!(night.iter().zip(&lit).all(|(n, l)| n >= l), "weak light removes less colour than full light");
+        assert!(fogged.iter().zip(&night).all(|(f, n)| f >= n), "native fog attenuation must reduce contact darkening");
+        assert!(fogged.iter().zip(&night).any(|(f, n)| f > n));
+        assert!(night[..SIZE.0 as usize].iter().all(|&v| v == 128), "sky stays unchanged even with a nonzero light mask");
+    }
+
+    #[test]
     fn hidden_actor_cannot_change_visible_pixels_and_static_frames_repeat() {
-        assert_eq!(run(0.8, 1.0, false, false), run(0.8, 1.0, true, false), "wall-hidden geometry must not alter any pixel");
-        assert_eq!(run(0.8, 1.0, false, false), run(0.8, 1.0, false, true), "fixed-pattern jitter: identical static frames");
+        for sun_weight in [1.0, 0.2] {
+            assert_eq!(run(0.8, sun_weight, false, false), run(0.8, sun_weight, true, false), "wall-hidden geometry must not alter any pixel");
+            assert_eq!(run(0.8, sun_weight, false, false), run(0.8, sun_weight, false, true), "fixed-pattern jitter: identical static frames");
+        }
     }
 
     #[test]

@@ -823,6 +823,15 @@ fn make_clamp_sampler(device: &wgpu::Device, anisotropy: u16) -> wgpu::Sampler {
     device.create_sampler_tracked(&descriptor)
 }
 
+/// Ambient alpha tags the depth owner, independently of material RGB blending.
+fn ambient_target(state: Option<wgpu::BlendState>, depth_write: bool) -> wgpu::ColorTargetState {
+    wgpu::ColorTargetState {
+        format: enhanced::AUX,
+        blend: state.map(|state| wgpu::BlendState { alpha: wgpu::BlendComponent::REPLACE, ..state }),
+        write_mask: if depth_write { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::COLOR },
+    }
+}
+
 fn compile_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -894,7 +903,7 @@ fn compile_pipeline(
         let target = wgpu::ColorTargetState { format, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let auxiliary = wgpu::ColorTargetState { format: enhanced::AUX, blend: state, write_mask: wgpu::ColorWrites::ALL };
         let sun_mask = settings.needs_sun_mask().then(|| auxiliary.clone());
-        let targets = [Some(target), settings.ambient_occlusion.then(|| auxiliary.clone()), settings.emissive_bloom.then_some(auxiliary), sun_mask];
+        let targets = [Some(target), settings.ambient_occlusion.then(|| ambient_target(state, depth_write)), settings.emissive_bloom.then_some(auxiliary), sun_mask];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(fs),
             // Ground effects 8-11 sample `ground_palette` (holo0) at bind group 2; liquids (12/13) use `fs_blend`,
@@ -2750,6 +2759,19 @@ mod sky_tests {
 
     use super::*;
     use ao_scene::{Instance, Mesh, SkySpin, Submesh, Texture, TextureKey, Vertex, IDENTITY};
+
+    #[test]
+    fn ambient_alpha_follows_depth_owner_without_changing_rgb_blending() {
+        for state in [None, Some(wgpu::BlendState::ALPHA_BLENDING), Some(native_blend_state(Blend::SourceColorOne))] {
+            for depth_write in [false, true] {
+                let target = ambient_target(state, depth_write);
+                assert_eq!(target.format, enhanced::AUX);
+                assert_eq!(target.blend.map(|blend| blend.color), state.map(|blend| blend.color));
+                assert_eq!(target.blend.map(|blend| blend.alpha), state.map(|_| wgpu::BlendComponent::REPLACE));
+                assert_eq!(target.write_mask, if depth_write { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::COLOR });
+            }
+        }
+    }
 
     #[test]
     fn native_material_state_slots_keep_depth_alpha_and_blend_independent() {

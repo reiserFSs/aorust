@@ -113,8 +113,9 @@ fn similar(centre: f32, other: f32) -> f32 {
 @fragment fn composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(position.xy);
     let z = depth_at(pixel);
-    // Same daylight ramp as grade.wgsl `expose`: moonlight, dusk and shadow have a weight too low to count as direct sun.
-    let sun = smoothstep(0.3, 0.7, textureLoad(sun_mask, pixel, 0).r);
+    // Unlike daylight exposure, darkening also applies to weak moon/dusk light.
+    // The world mask already excludes unlit surfaces and attenuates native fog and mapped shadows.
+    let sun = clamp(textureLoad(sun_mask, pixel, 0).r, 0.0, 1.0);
     if z >= 1.0 || sun <= 0.0 { return vec4<f32>(0.0); }
     let w = view_depth(z);
     let half_coord = (vec2<f32>(pixel) + 0.5) * 0.5 - 0.5;
