@@ -1,6 +1,8 @@
 //! Half-resolution screen-space contact shadows (port of ao-vk `contact.frag`, MIT; see THIRD_PARTY). Inputs are exclusively
 //! the current frame's resolved primary-view depth and the world pass's sun mask; the result only darkens the sun's direct share.
 //! Weak night/dusk directional light remains eligible; native fog and mapped-shadow attenuation stay in the mask.
+//! A finite 3x3 march-phase tile is averaged over a full period using symmetric tangent-plane rejection,
+//! including at upsampling; sloping surfaces stay smooth without mixing foreground/background silhouettes.
 use crate::gpu_stats::GpuStatsExt;
 use glam::{Mat4, Vec3};
 
@@ -95,8 +97,15 @@ impl ContactShadows {
             self.targets = Some(Targets { size, depth: depth.clone(), sun: sun.clone(), raw_bind: bind(&filtered), blur_bind: bind(&raw), raw, filtered });
         }
         let targets = self.targets.as_ref().expect("contact shadow targets allocated");
+        // Reconstruct and march in camera-relative coordinates: f32 world
+        // positions at playfield distances lose precision under tiny motion.
+        // Form both transforms in f64 before uploading the relative f32 pair.
+        let reference = eye.as_dvec3();
+        let vp64 = vp.as_dmat4();
+        let relative_vp = vp64 * glam::DMat4::from_translation(reference);
+        let inverse_relative_vp = glam::DMat4::from_translation(-reference) * vp64.inverse();
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&Params {
-            inverse_vp: vp.inverse().to_cols_array_2d(), vp: vp.to_cols_array_2d(), eye: eye.extend(0.0).to_array(),
+            inverse_vp: inverse_relative_vp.as_mat4().to_cols_array_2d(), vp: relative_vp.as_mat4().to_cols_array_2d(), eye: [0.0; 4],
             sun: toward_sun.extend(RAY_LENGTH).to_array(), control: [strength.clamp(0.0, 1.0), near, far, FADE_FAR],
         }));
         for (label, pipeline, input, output, load) in [
@@ -146,10 +155,14 @@ mod tests {
     /// Ground plane + a wall the sun sits behind (+ optionally a small quad hidden behind that wall), then the real
     /// contact-shadow passes over a mid-grey colour target with a uniform sun-mask weight; returns the grey channel.
     fn run(strength: f32, sun_weight: f64, hidden_actor: bool, twice: bool) -> Vec<u8> {
+        run_scene(strength, sun_weight, hidden_actor, twice, 0.0, false)
+    }
+
+    fn run_scene(strength: f32, sun_weight: f64, hidden_actor: bool, twice: bool, eye_shift: f32, phase_fixture: bool) -> Vec<u8> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let r = crate::Renderer::new(&instance, None).expect("contact shadow regression needs an offscreen GPU");
-        let eye = Vec3::new(0.0, 4.0, 4.0);
-        let vp = Mat4::perspective_rh(0.9, 1.0, 0.1, 100.0) * Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+        let eye = Vec3::new(eye_shift, 4.0, 4.0);
+        let vp = Mat4::perspective_rh(0.9, 1.0, 0.1, 100.0) * Mat4::look_at_rh(eye, Vec3::new(eye_shift, 0.0, 0.0), Vec3::Y);
         let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("contact depth fixture"), source: wgpu::ShaderSource::Wgsl(r#"
 @group(0) @binding(0) var<uniform> vp: mat4x4<f32>;
 @vertex fn vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) stage: u32) -> @builtin(position) vec4<f32> {
@@ -178,6 +191,27 @@ mod tests {
         let colour_texture = texture(r.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
         let colour = colour_texture.create_view(&Default::default());
         let mut contact = ContactShadows::new(&r.device, r.format);
+        if phase_fixture {
+            // Exercise the actual phase generator, blur and
+            // upsample on the fixture's perspective-sloping ground. A complete
+            // phase cycle must become a constant 0.5, not retain a grain tile.
+            let source = format!("{}\n{}", crate::shader_source::load("contact_shadows.wgsl", include_str!("contact_shadows.wgsl")), r#"
+@fragment fn phase_fixture(@builtin(position) position: vec4<f32>) -> @location(0) vec2<f32> {
+    let pixel = half_pixel(vec2<i32>(position.xy));
+    let z = depth_at(pixel);
+    if z >= 1.0 { return vec2<f32>(0.0); }
+    return vec2<f32>(phase_noise(position.xy), view_depth(z));
+}
+"#);
+            let shader = r.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("contact phase fixture"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+            let layout = r.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&contact.layout)], immediate_size: 0 });
+            contact.estimate = r.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("contact phase fixture"), layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("phase_fixture"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: HALF, blend: None, write_mask: wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN })] }),
+                primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+            });
+        }
         let mut encoder = r.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor { label: Some("contact depth fixture"), color_attachments: &[],
@@ -228,6 +262,33 @@ mod tests {
         for sun_weight in [1.0, 0.2] {
             assert_eq!(run(0.8, sun_weight, false, false), run(0.8, sun_weight, true, false), "wall-hidden geometry must not alter any pixel");
             assert_eq!(run(0.8, sun_weight, false, false), run(0.8, sun_weight, false, true), "fixed-pattern jitter: identical static frames");
+        }
+    }
+
+    #[test]
+    fn full_phase_period_is_smooth_on_perspective_ground() {
+        for shift in [0.0, 0.001, -0.001] {
+            let image = run_scene(0.8, 1.0, false, false, shift, true);
+            // Below the wall and away from the ground perimeter: one plane,
+            // with substantial view-depth change across each filter footprint.
+            for y in 64..80 {
+                for x in 16..80 {
+                    let value = image[y * SIZE.0 as usize + x];
+                    assert!((76..=78).contains(&value), "full-period phase mean must be 0.5 on sloping ground: ({x}, {y}), shift {shift}, value {value}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn micro_camera_motion_keeps_contact_darkening_stable() {
+        let still = run_scene(0.8, 1.0, false, false, 0.0, false);
+        for shift in [0.001, -0.001] {
+            let moved = run_scene(0.8, 1.0, false, false, shift, false);
+            let difference: u64 = still.iter().zip(&moved).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum();
+            let mean = difference as f64 / still.len() as f64;
+            assert!(mean < 0.5, "millimetre camera translation must not reshuffle contact grain: mean byte delta {mean}, shift {shift}");
+            assert!(moved.iter().filter(|&&v| v < 120).count() > 20, "stability must retain the wall contact");
         }
     }
 

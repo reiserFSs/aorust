@@ -50,8 +50,13 @@ fn normal(pixel: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
     let down = world(pixel + vec2<i32>(0, 1), depth_at(pixel + vec2<i32>(0, 1))) - p;
     let dx = select(right, left, dot(left, left) < dot(right, right));
     let dy = select(down, up, dot(up, up) < dot(down, down));
-    let n = normalize(cross(dy, dx) + vec3<f32>(0.0, 0.00001, 0.0));
+    let cross_n = cross(dy, dx);
+    let n = cross_n / max(length(cross_n), 0.00001);
     return select(n, -n, dot(n, params.eye.xyz - p) < 0.0);
+}
+fn phase_noise(position: vec2<f32>) -> f32 {
+    let tile = vec2<u32>(position) % vec2<u32>(3u);
+    return (f32((tile.x * 3u + tile.y * 7u) % 9u) + 0.5) / 9.0;
 }
 @fragment fn estimate(@builtin(position) position: vec4<f32>) -> @location(0) vec2<f32> {
     let pixel = half_pixel(vec2<i32>(position.xy));
@@ -63,8 +68,9 @@ fn normal(pixel: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
     let n = normal(pixel, p);
     let toward_sun = params.sun.xyz;
     if dot(n, toward_sun) <= 0.0 { return vec2<f32>(0.0, w); } // faces away: no direct sun anyway
-    // Fixed-pattern interleaved gradient noise (no time term): static frames stay identical.
-    let noise = fract(52.9829189 * fract(dot(position.xy, vec2<f32>(0.06711056, 0.00583715))));
+    // Nine stable phases repeat every 3x3 half-resolution pixels. Unlike the
+    // unbounded gradient noise, the box filter covers a complete phase cycle.
+    let noise = phase_noise(position.xy);
     let origin = p + n * (0.01 * w + 0.02);
     let dims = vec2<f32>(size());
     var occlusion = 0.0;
@@ -86,23 +92,40 @@ fn normal(pixel: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
     let fade = 1.0 - smoothstep(0.7 * params.control.w, params.control.w, w);
     return vec2<f32>(occlusion * fade, w);
 }
-// Depth-aware weight: samples across a depth discontinuity (silhouettes) contribute nothing.
-fn similar(centre: f32, other: f32) -> f32 {
-    if other <= 0.0 { return 0.0; }
-    return max(1.0 - abs(centre - other) / (0.04 * centre + 0.04), 0.0);
+// Match the AO symmetric tangent-plane rejection: tangential depth gradients
+// on sloping ground must not discard phases, but silhouettes must not mix.
+// Keep contact's original view-depth-scaled cutoff, rather than AO's radius cutoff.
+fn bilateral(center: vec3<f32>, center_normal: vec3<f32>, candidate: vec3<f32>, candidate_normal: vec3<f32>, cutoff: f32) -> f32 {
+    let delta = candidate - center;
+    var distance = max(abs(dot(delta, center_normal)), abs(dot(delta, candidate_normal)));
+    if dot(center_normal, center_normal) < 0.5 || dot(candidate_normal, candidate_normal) < 0.5 {
+        distance = length(delta);
+    }
+    if distance >= cutoff { return 0.0; }
+    return 1.0 - distance / max(cutoff, 0.001);
 }
 @fragment fn blur(@builtin(position) position: vec4<f32>) -> @location(0) vec2<f32> {
     let pixel = vec2<i32>(position.xy);
     let centre = textureLoad(half_input, pixel, 0).rg;
     if centre.g <= 0.0 { return centre; }
-    var sum = centre.r;
-    var weight = 1.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
+    let selected = half_pixel(pixel);
+    let p = world(selected, depth_at(selected));
+    let n = normal(selected, p);
+    var sum = centre.r * 9.0;
+    var weight = 9.0;
+    // Two convolved 3-tap boxes: 1,2,3,2,1 per axis. Each of the
+    // three phase residues has total weight 3, so the wider symmetric
+    // footprint still cancels a complete phase cycle on a plane.
+    for (var y = -2; y <= 2; y++) {
+        for (var x = -2; x <= 2; x++) {
             let neighbor = pixel + vec2<i32>(x, y);
             if (x == 0 && y == 0) || any(neighbor < vec2<i32>(0)) || any(neighbor >= vec2<i32>(textureDimensions(half_input))) { continue; }
             let sample = textureLoad(half_input, neighbor, 0).rg;
-            let wgt = similar(centre.g, sample.g);
+            if sample.g <= 0.0 { continue; }
+            let sample_pixel = half_pixel(neighbor);
+            let sample_p = world(sample_pixel, depth_at(sample_pixel));
+            let spatial = f32((3 - abs(x)) * (3 - abs(y)));
+            let wgt = spatial * bilateral(p, n, sample_p, normal(sample_pixel, sample_p), 0.04 * centre.g + 0.04);
             sum += sample.r * wgt;
             weight += wgt;
         }
@@ -117,7 +140,8 @@ fn similar(centre: f32, other: f32) -> f32 {
     // The world mask already excludes unlit surfaces and attenuates native fog and mapped shadows.
     let sun = clamp(textureLoad(sun_mask, pixel, 0).r, 0.0, 1.0);
     if z >= 1.0 || sun <= 0.0 { return vec4<f32>(0.0); }
-    let w = view_depth(z);
+    let p = world(pixel, z);
+    let n = normal(pixel, p);
     let half_coord = (vec2<f32>(pixel) + 0.5) * 0.5 - 0.5;
     let base = vec2<i32>(floor(half_coord));
     let fraction = fract(half_coord);
@@ -128,12 +152,15 @@ fn similar(centre: f32, other: f32) -> f32 {
             let neighbor = base + vec2<i32>(x, y);
             if any(neighbor < vec2<i32>(0)) || any(neighbor >= vec2<i32>(textureDimensions(half_input))) { continue; }
             let sample = textureLoad(half_input, neighbor, 0).rg;
+            if sample.g <= 0.0 { continue; }
             let spatial = select(1.0 - fraction.x, fraction.x, x == 1) * select(1.0 - fraction.y, fraction.y, y == 1);
-            let wgt = spatial * similar(w, sample.g);
+            let sample_pixel = half_pixel(neighbor);
+            let sample_p = world(sample_pixel, depth_at(sample_pixel));
+            let wgt = spatial * bilateral(p, n, sample_p, normal(sample_pixel, sample_p), 0.04 * view_depth(z) + 0.04);
             sum += sample.r * wgt;
             weight += wgt;
         }
     }
-    let occlusion = select(0.0, sum / weight, weight > 0.0);
+    let occlusion = select(0.0, sum / max(weight, 0.00001), weight > 0.0);
     return vec4<f32>(0.0, 0.0, 0.0, clamp(occlusion * params.control.x * sun, 0.0, 1.0));
 }
