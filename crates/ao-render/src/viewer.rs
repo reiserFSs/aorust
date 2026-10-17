@@ -830,7 +830,7 @@ impl State {
         }
         self.raw_mouse.set_active(self.looking && self.focused && !self.fly());
         let (gui_out, quit) = self.run_gui(dt);
-        if self.targets.sample_count != self.renderer.msaa_samples() {
+        if !self.targets.matches_renderer(&self.renderer) {
             self.targets = Targets::new(&self.renderer, self.config.width, self.config.height);
         }
         if let Some(want) = self.gui.as_ref().filter(|_| !self.fly()).map(|g| g.host.look) {
@@ -1246,7 +1246,7 @@ impl Offscreen {
     /// Changes rendering resources while retaining the frozen actors and scene.
     pub fn set_enhanced_settings(&mut self, settings: crate::EnhancedSettings) {
         self.r.set_enhanced_settings(settings);
-        if self.targets.sample_count != self.r.msaa_samples() {
+        if !self.targets.matches_renderer(&self.r) {
             self.targets = Targets::new(&self.r, self.size.0, self.size.1);
         }
     }
@@ -1330,9 +1330,6 @@ impl Offscreen {
         if let Some(settings) = self.host.enhanced_settings.take() {
             self.r.set_enhanced_settings(settings);
         }
-        if self.targets.sample_count != self.r.msaa_samples() {
-            self.targets = Targets::new(&self.r, self.size.0, self.size.1);
-        }
         if let Some(scene) = self.host.scene.take() {
             self.r.upload(&scene);
         }
@@ -1349,6 +1346,9 @@ impl Offscreen {
         self.r.set_spaceships_shown(self.host.spaceships_shown);
         self.r.set_realistic_water(self.host.realistic_water);
         if let Some((realistic,simple))=self.host.cloud_preferences.take() {self.r.set_cloud_preferences(realistic,simple,false);}
+        if !self.targets.matches_renderer(&self.r) {
+            self.targets = Targets::new(&self.r, self.size.0, self.size.1);
+        }
         if let Some((quality, radius)) = self.host.ground_detail.take() {
             self.r.set_ground_detail(quality, radius);
         }

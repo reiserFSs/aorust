@@ -583,21 +583,33 @@ pub struct FrameStats {
     pub draw_calls: usize,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum CloudPrecisionProbe {
+    Grouped,
+    NativeDraws,
+    #[default]
+    BeautySky,
+}
+
 /// Colour + depth attachments sized to the output.
 pub struct Targets {
     /// `None` when MSAA is disabled (`Renderer::msaa_samples` == 1, the retail default): the colour pass writes straight into the
     /// resolve view instead of a separate multisampled target (audit item 2 / MSAA-option decision: no unnecessary resolve target).
     msaa: Option<wgpu::TextureView>,
     depth: wgpu::TextureView,
+    /// Backed depth/MSAA is required only for the isolated native sky pass.
+    backed: bool,
     pub size: (u32, u32),
-    /// The sample count these attachments were built for; callers that keep a `Targets` across frames (`State`, `Offscreen`) must
-    /// rebuild it when this no longer matches `Renderer::msaa_samples()`.
+    /// MSAA sample count. State/Offscreen also use `matches_renderer` to rebuild
+    /// when native sky backing requirements change after scene/settings updates.
     pub sample_count: u32,
 }
 
 impl Targets {
     pub fn new(r: &Renderer, w: u32, h: u32) -> Self {
         let samples = r.msaa_samples();
+        let backed = r.isolate_sky() && !r.enhanced_settings.any_enabled();
         let mk = |format, label| {
             r.device.create_texture_tracked(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -606,11 +618,15 @@ impl Targets {
                 sample_count: samples,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | if backed { wgpu::TextureUsages::empty() } else { wgpu::TextureUsages::TRANSIENT },
                 view_formats: &[],
             }).create_view_tracked(&Default::default())
         };
-        Self { msaa: (samples > 1).then(|| mk(r.format, "msaa")), depth: mk(DEPTH, "depth"), size: (w, h), sample_count: samples }
+        Self { msaa: (samples > 1).then(|| mk(r.format, "msaa")), depth: mk(DEPTH, "depth"), backed, size: (w, h), sample_count: samples }
+    }
+
+    pub(crate) fn matches_renderer(&self, r: &Renderer) -> bool {
+        self.sample_count == r.msaa_samples() && self.backed == (r.isolate_sky() && !r.enhanced_settings.any_enabled())
     }
 }
 
@@ -682,6 +698,9 @@ pub struct Renderer {
     water_light: Option<([f32; 3], [f32; 3])>,
     sky: SkyGpu,
     cloud_preferences: (bool, bool, bool),
+    sky_beauty_only: bool,
+    #[cfg(test)]
+    cloud_precision_probe: CloudPrecisionProbe,
     /// Sky textures by key; kept across [`Renderer::set_sky`] so a live sky only ships new textures.
     sky_views: HashMap<TextureKey, wgpu::TextureView>,
     /// The untextured-submesh placeholder view, lazily created once and reused (`set_sky`'s fast path runs about
@@ -1186,6 +1205,9 @@ impl Renderer {
             depth_clear_pipe,
             sky: SkyGpu::default(),
             cloud_preferences: (true, true, false),
+            sky_beauty_only: false,
+            #[cfg(test)]
+            cloud_precision_probe: CloudPrecisionProbe::default(),
             sky_views: HashMap::new(),
             sky_white_view: std::sync::OnceLock::new(),
             gpu: Gpu { meshes: vec![], inst_bufs: vec![], mats: vec![], opaque: vec![], blended: vec![], liquid: vec![], insts: vec![], mesh_range: vec![], radius: 100.0, grid: ([0.0; 4], [0; 4]) },
@@ -2059,6 +2081,13 @@ impl Renderer {
         self.cloud_preferences=(realistic,simple,disabled_realistic);
     }
 
+    fn isolate_sky(&self) -> bool {
+        #[cfg(test)]
+        if self.cloud_precision_probe != CloudPrecisionProbe::BeautySky { return false; }
+        !self.sky.clouds.is_empty() && ao_scene::cloud::resolution(
+            self.cloud_preferences.0, self.cloud_preferences.1, self.cloud_preferences.2) != 0
+    }
+
     /// Draws one frame into `resolve` (a view of the output texture).
     pub fn render(&mut self, resolve: &wgpu::TextureView, t: &Targets, cam: &Camera) -> wgpu::SubmissionIndex {
         let timed = self.cpu_timings.is_some();
@@ -2137,12 +2166,24 @@ impl Renderer {
         let grass_start = timed.then(std::time::Instant::now);
         self.prepare_enhanced_grass(cam, vp, env.fog_end.max(env.fog_start + 1e-3), 0.5 * t.size.1 as f32 / (0.5 * self.lens.vertical_fov(aspect)).tan());
         if let Some(start) = grass_start { cpu.grass_prepare_ms = start.elapsed().as_secs_f64() * 1000.0; }
+        let isolate_sky = self.isolate_sky();
+        if isolate_sky != self.sky_beauty_only {
+            self.pipes.invalidate_sky();
+            self.sky_beauty_only = isolate_sky;
+        }
         {
             let shader = self.enhanced_shader.as_ref().unwrap_or(&self.shader);
             let format = self.world_format();
             let settings = self.enhanced_settings;
-            let compile = |spec| compile_pipeline(&self.device, shader, format,
-                (&self.pipeline_layout, &self.holo_pipeline_layout), settings, self.msaa_samples, spec);
+            let compile = |spec: PipelineSpec| {
+                // Native sky never seeds auxiliary RGB. Render it with its faithful
+                // shader before the MRT world pass rather than changing its precision.
+                let (shader, settings) = if isolate_sky && spec.sky {
+                    (&self.shader, EnhancedSettings::default())
+                } else { (shader, settings) };
+                compile_pipeline(&self.device, shader, format,
+                    (&self.pipeline_layout, &self.holo_pipeline_layout), settings, self.msaa_samples, spec)
+            };
             if let Some(ground) = &self.ground {
                 for (mesh, material) in ground.materials.iter().enumerate() {
                     if material.is_none() || self.vis_range[mesh].is_empty() { continue; }
@@ -2273,27 +2314,34 @@ impl Renderer {
         let enhanced_frame = self.enhanced_frame.as_ref();
         let world_target = enhanced_frame.map_or(world_resolve, |frame| &frame.colour);
         let msaa_target = enhanced_frame.and_then(|frame| frame.msaa.as_ref().and_then(|views| views[0].as_ref())).or(t.msaa.as_ref().filter(|_| enhanced_frame.is_none()));
-        let attachments = [
-            Some(wgpu::RenderPassColorAttachment { view: msaa_target.unwrap_or(world_target), resolve_target: msaa_target.map(|_| world_target), depth_slice: None,
+        let mut attachments = [
+            Some(wgpu::RenderPassColorAttachment { view: msaa_target.unwrap_or(world_target), resolve_target: if isolate_sky { None } else { msaa_target.map(|_| world_target) }, depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(framebuffer_clear(env.sky_color)), store: if msaa_target.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } } }),
             enhanced_frame.and_then(|frame| frame.attachment(1)),
             enhanced_frame.and_then(|frame| frame.attachment(2)),
             enhanced_frame.and_then(|frame| frame.attachment(3)),
         ];
+        if isolate_sky { attachments[0].as_mut().unwrap().ops.store = wgpu::StoreOp::Store; }
         let final_world = enhanced_frame.is_none() && self.heat_haze.source().is_none() && self.screen.layers.is_empty();
         let timestamps = self.gpu_timer.as_mut().and_then(|timer| {
             if timer.is_recording() { final_world.then(|| timer.end_pass()) } else { Some(timer.begin_pass(final_world)) }
-        });
+        }).map(|writes| (writes.beginning_of_pass_write_index, writes.end_of_pass_write_index));
+        let timestamp_queries = self.gpu_timer.as_ref().map(|timer| timer.query_set());
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
-                color_attachments: &attachments[..enhanced_frame.map_or(1, |_| enhanced::target_count(&self.enhanced_settings))],
+                color_attachments: &attachments[..if isolate_sky { 1 } else { enhanced_frame.map_or(1, |_| enhanced::target_count(&self.enhanced_settings)) }],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if isolate_sky || enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: timestamps,
+                timestamp_writes: timestamps.and_then(|(begin, end)| {
+                    let end = if isolate_sky { None } else { end };
+                    (begin.is_some() || end.is_some()).then(|| wgpu::RenderPassTimestampWrites {
+                        query_set: timestamp_queries.unwrap(), beginning_of_pass_write_index: begin, end_of_pass_write_index: end,
+                    })
+                }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2349,9 +2397,40 @@ impl Renderer {
             if let Some(sky) = sky_buf {
                 pass.set_vertex_buffer(1, sky.slice(..));
                 for (d, k) in &self.sky.draws {
-                    if grid==0 && self.sky.clouds.iter().any(|run|run.layer.mesh==d.mesh) {continue;}
-                    draw(&mut pass, d, *k..*k + 1, true);
+                    let cloud = self.sky.clouds.iter().find(|run| run.layer.mesh == d.mesh);
+                    if grid == 0 && cloud.is_some() { continue; }
+                    if let Some(cloud) = cloud {
+                        // DS10054e07 submits each sheet separately; its four ranges only switch materials.
+                        let count = ((cloud.grid - 1).pow(2) * 6) as u32;
+                        #[cfg(test)]
+                        let count = if self.cloud_precision_probe == CloudPrecisionProbe::Grouped { d.count } else { count };
+                        for first_index in (d.first_index..d.first_index + d.count).step_by(count as usize) {
+                            draw(&mut pass, &Draw { first_index, count, ..*d }, *k..*k + 1, true);
+                        }
+                    } else {
+                        draw(&mut pass, d, *k..*k + 1, true);
+                    }
                 }
+            }
+            if isolate_sky {
+                drop(pass);
+                let beauty = attachments[0].as_mut().unwrap();
+                beauty.ops.load = wgpu::LoadOp::Load;
+                beauty.ops.store = if msaa_target.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store };
+                beauty.resolve_target = msaa_target.map(|_| world_target);
+                pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("native world after beauty-only sky"),
+                    color_attachments: &attachments[..enhanced_frame.map_or(1, |_| enhanced::target_count(&self.enhanced_settings))],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: enhanced_frame.map_or(&t.depth, |frame| &frame.depth),
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: if enhanced_frame.is_some() { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: timestamps.and_then(|(_, end)| end.map(|index| wgpu::RenderPassTimestampWrites {
+                        query_set: timestamp_queries.unwrap(), beginning_of_pass_write_index: None, end_of_pass_write_index: Some(index),
+                    })),
+                    occlusion_query_set: None, multiview_mask: None,
+                });
             }
             world_phase(&mut pass, 0);
             // AnarchyGround_t ctor 10033b97 sets priority 1. Complete the
@@ -2929,6 +3008,151 @@ mod sky_tests {
     }
 
     #[test]
+    fn native_cloud_submits_thirty_sheets_not_four_material_ranges() {
+        use ao_scene::cloud::{CloudLayer, Clouds};
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let mut r = Renderer::new(&instance, None).expect("cloud draw regression requires a GPU");
+        let mut mesh = Clouds::mesh();
+        mesh.submeshes = [(0, 2), (2, 4), (4, 27), (27, 30)].map(|(first, end)|
+            Submesh { blend: Blend::AlphaBlend, two_sided: true,
+                ..Submesh::new(Clouds::indices(10, first, end), None) }).into();
+        r.upload(&Scene {
+            meshes: vec![mesh], sky: vec![Instance { mesh: 0, transform: IDENTITY }],
+            single_clouds: vec![CloudLayer { mesh: 0, altitude: 100.0, wind: [0.0; 3],
+                storm: 0.0, thick: 0.0, sun_y: 1.0, light: [1.0; 3],
+                light_direction: [0.0, 1.0, 0.0], ambient: [0.0; 3] }],
+            ..Default::default()
+        });
+        let output = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("native cloud draw count"), size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        });
+        for (realistic, simple, expected) in [(true, true, 30), (false, true, 30), (false, false, 0)] {
+            r.set_cloud_preferences(realistic, simple, false);
+            let targets = Targets::new(&r, 64, 64);
+            r.render(&output.create_view(&Default::default()), &targets,
+                &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+            assert_eq!(r.stats.draw_calls, expected, "native sheet submissions, realistic={realistic} simple={simple}");
+            assert_eq!(targets.backed, expected != 0, "only active faithful clouds require backed depth");
+        }
+        r.set_cloud_preferences(true, true, false);
+        r.set_enhanced_settings(EnhancedSettings { ambient_occlusion: true, ..Default::default() });
+        r.render(&output.create_view(&Default::default()), &Targets::new(&r, 64, 64),
+            &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
+        assert_eq!(r.stats.draw_calls, 30, "native sky shader must remain compatible with MRT world attachments");
+    }
+
+    #[test]
+    #[ignore = "exclusive GPU ICC 4x cloud precision benchmark; writes handoff evidence"]
+    fn native_cloud_precision_four_sample_gpu_timing() -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        use std::{fmt::Write, path::PathBuf, time::Instant};
+        const SIZE: (u32, u32) = (1920, 1200);
+        const WARMUP: usize = 120;
+        const SAMPLES: usize = 600;
+        let out = PathBuf::from(std::env::var_os("AOMAC_GFX_SKY_TIMING_OUT")
+            .context("set AOMAC_GFX_SKY_TIMING_OUT to a new handoff directory")?);
+        let root = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?).join("aomac-handoff/gfx");
+        ensure!(out.starts_with(&root) && !out.components().any(|part| part == std::path::Component::ParentDir),
+            "output must be under {}", root.display());
+        ensure!(!out.exists(), "refusing to overwrite {}", out.display());
+        std::fs::create_dir_all(&out)?;
+        std::fs::write(out.join("status.txt"), "status=running\nvisual_acceptance=unexercised\n")?;
+        let result = (|| -> anyhow::Result<()> {
+            let dir = ao_gui::client_dir();
+            let store = ao_rdb::RecordStore::open(&dir)?;
+            let weather = ao_formats::weather::State::clear();
+            ao_scene::crt_srand(1);
+            let (scene, _) = ao_formats::playfield::load_playfield_report_with_weather(
+                &store, &dir, 4582, 2648.69, 0, Some(weather))?;
+            ensure!(!scene.single_clouds.is_empty(), "ICC snapshot must contain native cloud sheets");
+            let camera = Camera { pos: Vec3::new(940.0, 48.72, -874.78), yaw: 3.765, pitch: -0.2, roll: 0.0 };
+            let lens = ao_scene::Lens { fov: std::f32::consts::FRAC_PI_2, horizontal: true, near: 0.2, far: Some(800.0) };
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let modes = [CloudPrecisionProbe::Grouped, CloudPrecisionProbe::NativeDraws, CloudPrecisionProbe::BeautySky];
+            let names = ["grouped4", "native30", "native30-beauty-sky"];
+            let mut renderers = Vec::with_capacity(3);
+            let mut outputs = Vec::with_capacity(3);
+            let mut images = Vec::with_capacity(3);
+            let mut manifest = format!("fixture=native_cloud_precision_four_sample\nsize={}x{}\nmsaa=4\nprofile=faithful\npf=4582\ngame_time=2648.69\ngame_day=0\nrenderer_time=0\ncrt_seed=1\ncloud_seed=1\nweather={weather:?}\ncamera={camera:?}\nlens={lens:?}\norder=ABC,CBA\nwarmup_per_variant={WARMUP}\nsamples_per_variant={SAMPLES}\ncpu_interval=render_encode_submit_excludes_gpu_wait\nvisual_acceptance=unexercised\n", SIZE.0, SIZE.1);
+            for (index, mode) in modes.into_iter().enumerate() {
+                let mut r = Renderer::new(&instance, None)?;
+                r.cloud_precision_probe = mode;
+                ao_scene::crt_srand(1);
+                r.upload(&scene);
+                r.set_lens(lens);
+                r.set_msaa_samples(4);
+                ensure!(r.msaa_samples() == 4, "true 4x MSAA unavailable; refusing a clamped benchmark");
+                ensure!(!r.enhanced_settings.any_enabled(), "benchmark must remain faithful");
+                r.time = 0.0;
+                let target = r.device.create_texture_tracked(&wgpu::TextureDescriptor {
+                    label: Some("faithful 4x cloud precision benchmark"),
+                    size: wgpu::Extent3d { width: SIZE.0, height: SIZE.1, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+                });
+                let view = target.create_view_tracked(&Default::default());
+                let targets = Targets::new(&r, SIZE.0, SIZE.1);
+                ensure!(targets.sample_count == 4, "render attachments must be true 4x");
+                r.render(&view, &targets, &camera);
+                images.push(texture_to_rgba(&r, &target, SIZE.0, SIZE.1)?);
+                texture_to_png(&r, &target, SIZE.0, SIZE.1, &out.join(format!("{}-first.png", names[index])))?;
+                writeln!(manifest, "{}_target_samples={}\n{}_draw_calls={}",
+                    names[index], targets.sample_count, names[index], r.stats.draw_calls)?;
+                r.set_gpu_timing(true)?;
+                renderers.push(r);
+                outputs.push((target, view, targets));
+            }
+            for index in [1, 2] {
+                let count = images[0].iter().zip(&images[index]).filter(|(a, b)| a != b).count();
+                let maximum = images[0].iter().zip(&images[index]).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+                writeln!(manifest, "{}_baseline_differing_bytes={count}\n{}_baseline_max_byte_error={maximum}", names[index], names[index])?;
+            }
+            std::fs::write(out.join("manifest.txt"), &manifest)?;
+            let mut values: [Vec<(f64, f64)>; 3] = std::array::from_fn(|_| Vec::with_capacity(SAMPLES));
+            let mut csv = String::from("pair,variant,cpu_render_encode_submit_ms,gpu_frame_ms\n");
+            for pair in 0..WARMUP + SAMPLES {
+                for index in if pair % 2 == 0 { [0, 1, 2] } else { [2, 1, 0] } {
+                    let r = &mut renderers[index];
+                    let (_, view, targets) = &outputs[index];
+                    let start = Instant::now();
+                    r.render(view, targets, &camera);
+                    let cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let gpu_ms = r.read_frame_gpu_ms()?.context("GPU timing unexpectedly disabled")?;
+                    if pair >= WARMUP {
+                        values[index].push((cpu_ms, gpu_ms));
+                        writeln!(csv, "{},{},{cpu_ms:.9},{gpu_ms:.9}", pair - WARMUP, names[index])?;
+                    }
+                }
+            }
+            let mut gpu_p50 = [0.0; 3];
+            for (index, measurements) in values.iter().enumerate() {
+                for gpu in [false, true] {
+                    let mut sorted: Vec<_> = measurements.iter().map(|&(cpu, frame)| if gpu { frame } else { cpu }).collect();
+                    sorted.sort_by(f64::total_cmp);
+                    for percentile in [50usize, 95, 99] {
+                        let value = sorted[(sorted.len() * percentile).div_ceil(100) - 1];
+                        writeln!(manifest, "{}_{}_p{percentile}={value:.9}", names[index], if gpu { "gpu_frame_ms" } else { "cpu_render_encode_submit_ms" })?;
+                        if gpu && percentile == 50 { gpu_p50[index] = value; }
+                    }
+                }
+            }
+            writeln!(manifest, "beauty_sky_vs_grouped_gpu_p50_delta_ms={:.9}\nbeauty_sky_vs_native30_gpu_p50_delta_ms={:.9}\nwithin_0_1_ms_budget={}",
+                gpu_p50[2] - gpu_p50[0], gpu_p50[2] - gpu_p50[1], gpu_p50[2] - gpu_p50[0] <= 0.1)?;
+            std::fs::write(out.join("samples.csv"), csv)?;
+            std::fs::write(out.join("manifest.txt"), &manifest)?;
+            eprintln!("{manifest}");
+            Ok(())
+        })();
+        std::fs::write(out.join("status.txt"), match &result {
+            Ok(()) => "status=complete\nvisual_acceptance=unexercised\n".to_owned(),
+            Err(error) => format!("status=failed\nerror={error:#}\nvisual_acceptance=unexercised\n"),
+        })?;
+        result
+    }
+
+    #[test]
     fn framebuffer_clear_preserves_encoded_bytes() {
         let c = framebuffer_clear([0.0, 0.5, 1.0]);
         assert_eq!((c.r, c.a), (0.0, 1.0));
@@ -3007,6 +3231,17 @@ mod sky_tests {
                     assert_eq!(pipe, SKY_GLOW_PIPE);
                 }
             }
+        }
+        let (native, actors, _) = build_pipelines();
+        for index in 0..=SKY_LAST_PIPE {
+            let spec = native.spec(index);
+            if spec.sky {
+                assert!(!spec.actor && matches!(spec.effect, 0 | 14), "native sky must not select an emitting actor effect");
+            }
+        }
+        for effect in [1, 4, 5, 6] {
+            let spec = actors.spec(effect * MESH_EFFECT_STRIDE + SKY_PIPE);
+            assert!(spec.sky && spec.actor, "actor sky aliases must retain Enhanced emission handling");
         }
     }
 

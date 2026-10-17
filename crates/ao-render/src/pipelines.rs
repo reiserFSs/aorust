@@ -44,6 +44,11 @@ impl Pipelines {
     pub fn invalidate(&mut self) {
         for slot in &mut self.0 { slot.pipeline = None; }
     }
+    pub fn invalidate_sky(&mut self) {
+        for index in 0..self.0.len() {
+            if self.spec(index).sky { self.0[index].pipeline = None; }
+        }
+    }
 }
 impl Index<usize> for Pipelines {
     type Output = wgpu::RenderPipeline;

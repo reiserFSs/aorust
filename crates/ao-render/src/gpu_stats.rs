@@ -203,6 +203,8 @@ impl FrameGpuTimer {
         self.state == TimerState::Recording
     }
 
+    pub(crate) fn query_set(&self) -> &wgpu::QuerySet { &self.queries }
+
     /// Attach to the first compute pass only when it actually dispatches work.
     pub fn begin_compute_pass(&mut self) -> wgpu::ComputePassTimestampWrites<'_> {
         advance_timer(&mut self.state, TimerState::Idle, TimerState::Recording).expect("GPU timer begin requires previous readback");

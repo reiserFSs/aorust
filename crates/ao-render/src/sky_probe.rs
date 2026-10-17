@@ -19,6 +19,7 @@ fn vs_probe(v: VIn) -> VOut {
 struct ProbeOut {
     @location(0) texture_data: vec4<f32>,
     @location(1) geometry_data: vec4<f32>,
+    @location(2) source_data: vec4<f32>,
 }
 @fragment
 fn fs_probe(i: VOut) -> ProbeOut {
@@ -37,6 +38,7 @@ fn fs_probe(i: VOut) -> ProbeOut {
     out.texture_data = vec4<f32>(uv, sampled.a, base.a);
     out.geometry_data = vec4<f32>(f32(probe_triangle.x), i.color.a * mat.color.a, i.clip.z,
         clamp(log2(max(length(dx), length(dy))), 0.0, f32(textureNumLevels(tex) - 1u)));
+    out.source_data = shade_sky(i, 2u);
     return out;
 }
 "#;
@@ -58,7 +60,7 @@ impl Renderer {
         });
         let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
         let instance_attrs = wgpu::vertex_attr_array![4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4];
-        let targets: [_; 2] = std::array::from_fn(|_| Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba32Float, blend: None, write_mask: wgpu::ColorWrites::ALL }));
+        let targets: [_; 3] = std::array::from_fn(|_| Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba32Float, blend: None, write_mask: wgpu::ColorWrites::ALL }));
         let tag_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("portable triangle probe tag"),
             entries: &[wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -79,7 +81,7 @@ impl Renderer {
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
             depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
-        let textures: Vec<_> = (0..2).map(|_| self.device.create_texture(&wgpu::TextureDescriptor {
+        let textures: Vec<_> = (0..3).map(|_| self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sky probe float attachment"), size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
@@ -100,7 +102,7 @@ impl Renderer {
             }
         }
         anyhow::ensure!(!draws.is_empty(), "no uploaded sky draws for layer {layer}");
-        let slots = draws.len() * pixels.len() * 2;
+        let slots = draws.len() * pixels.len() * 3;
         anyhow::ensure!(slots > 0, "at least one sky probe pixel required");
         // Tag each real indexed triangle with a portable dynamic uniform. No
         // primitive-index builtin/extension or modified geometry is needed.
@@ -155,7 +157,7 @@ impl Renderer {
             for (p, &(x,y)) in pixels.iter().enumerate() {
                 for (attachment, texture) in textures.iter().enumerate() {
                     encoder.copy_texture_to_buffer(wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
-                        wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: ((ordinal * pixels.len() + p) * 2 + attachment) as u64 * 256, bytes_per_row: Some(256), rows_per_image: Some(1) } },
+                        wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: ((ordinal * pixels.len() + p) * 3 + attachment) as u64 * 256, bytes_per_row: Some(256), rows_per_image: Some(1) } },
                         wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
                 }
             }
@@ -182,8 +184,8 @@ impl Renderer {
             }
             writeln!(report, "draw{ordinal}: first_index={} count={} material={} texture={:?}", d.first_index, d.count, d.mat, material.and_then(|m| m.texture))?;
             for (p, &(x,y)) in pixels.iter().enumerate() {
-                let values: [[f32;4];2] = std::array::from_fn(|a| std::array::from_fn(|c| {
-                    let offset = ((ordinal * pixels.len() + p) * 2 + a) * 256 + c * 4;
+                let values: [[f32;4];3] = std::array::from_fn(|a| std::array::from_fn(|c| {
+                    let offset = ((ordinal * pixels.len() + p) * 3 + a) * 256 + c * 4;
                     f32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap())
                 }));
                 let [u,v,alpha,base] = values[0];
@@ -192,6 +194,7 @@ impl Renderer {
                 let sheet = cloud.zip(global).map(|(run,t)| t / ((run.grid - 1).pow(2) * 2));
                 let source_alpha = if triangle >= 0.0 { alpha * diffuse } else { -1.0 };
                 writeln!(report, "{x},{y},draw{ordinal},mesh{},pipe{},triangle={triangle},global_triangle={global:?},sheet={sheet:?},uv=({u:.9},{v:.9}),sampled_alpha={alpha:.9},uploaded_base_alpha={base:.9},diffuse_alpha={diffuse:.9},source_alpha={source_alpha:.9},depth={depth:.9},isotropic_lod={lod:.9}", d.mesh, d.pipe)?;
+                writeln!(report, "  source_rgba={:?} source_bits={:?}", values[2], values[2].map(f32::to_bits))?;
                 if triangle >= 0.0 {
                     if let Some(t) = texture {
                         let clamp = material.is_some_and(|m| m.texture_clamp);
@@ -253,6 +256,12 @@ mod tests {
             assert!((alpha - 64.0 / 255.0).abs() < 1e-5, "{field}: {center}");
         }
         assert!(center.contains("triangle=0,"));
+        let source = report.lines().skip_while(|line| !line.starts_with("32,32,")).nth(1).unwrap();
+        let rgba = source.strip_prefix("  source_rgba=[").unwrap().split_once(']').unwrap().0;
+        for (actual, expected) in rgba.split(", ").zip([20.0, 40.0, 60.0, 64.0]) {
+            assert!((actual.parse::<f32>().unwrap() - expected / 255.0).abs() < 1e-5, "{source}");
+        }
+        assert!(source.contains("source_bits="), "{source}");
         assert!(report.lines().any(|line| line.starts_with("0,0,") && line.contains("triangle=-1,") && line.contains("source_alpha=-1.000000000,")));
     }
 

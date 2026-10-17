@@ -63,6 +63,39 @@ Ported from the decompiled PRK launcher (`MainWindow.DownloadLatestVersion`, `Ht
 - Culling: per-mesh bounding sphere (AABB centre, max vertex distance) scaled by the largest transform axis length, tested against the 6 view-frustum planes on the CPU each frame.
 - wgpu 29 (not 24): `block v0.1.6` (future-incompat warning) is pulled in by `metal` 0.31-0.33, i.e. by wgpu-hal 24-28; wgpu-hal 29 uses objc2-metal and the warning is gone.
 - **Single world pass / transient targets**: `Renderer::render` keeps sky, actor priorities 0–2 interleaved with terrain base/shadow stages, opaque world + actor list3, liquids + actor list4, blended world and actor lists5/6/10/7 in their existing order within one render pass. Material pipelines/blend/depth state are unchanged. Native ordered depth clears (DisplaySystem `1000bc0b`, Randy `1004b75a`, including mesh-effect3) are full-viewport draws with depth Always/write1 and color writes disabled, not pass boundaries. wgpu29 `TextureUsages::TRANSIENT` is used for MSAA color and depth (a no-op on unsupported backends); both discard stores, with MSAA resolved once at world-pass end. Single-sample output remains stored. Viewport sprites still run after resolve to preserve their original per-pixel blending. Added, not run by this worker: `cargo test --release -p ao-render ordered_depth_clear_matches_split_pass_pixels` compares all RGBA bytes against split-pass attachment clears at every adapter-supported sample count, including rejected geometry, two ordered clears, alpha blending and a diagonal multisampled edge; interior pixels also have explicit expected colors.
+  **Active SingleCloud exception (2026-10-17):** the sky retains its faithful
+  shader and a single native UNORM beauty attachment, then the world MRT pass
+  loads beauty and authored depth and clears its auxiliary masks once. Sky never
+  seeds those masks. The native thirty sheet draws remain in the same sky pass;
+  there is no per-sheet store, float-format change, resampling or intermediate
+  colour quantizer. At MSAA, the original per-sample colour/depth is preserved
+  across the boundary and resolved only after world work. Non-cloud/disabled-cloud
+  frames retain the original single pass/transient targets. `Targets` caches
+  the backing requirement with MSAA; Enhanced reuses its already-backed frame.
+  Evidence `gfx/v3/LookV3/sky-precision-all134-unsplit` failed independent repeat
+  by 152 post-grade bytes while both 10,935-line GPU probe reports were identical,
+  including 3,870 source-RGBA float-bit rows and 2,325 runtime-vertex rows for all
+  129 historical failing pixels. **These separately compiled probes control
+  geometry/sampling; they do not prove identical original MRT fragment outputs.**
+  Native thirty draws, an MRT sky/world split and explicit fog FMA each still
+  failed stress. Keeping the faithful shader but disabling auxiliary writes in
+  the **same MRT pass** also failed by 153 bytes (`sky-shared-native-order-2-all-before`);
+  that combined shader/write-mask change without pass isolation was insufficient.
+  Full-source half/byte quantizers changed 38,961/308,215 faithful bytes (max2),
+  so were rejected. Per-sheet stores stabilized control runs but cost +3.402 ms
+  at actual4× MSAA, so were rejected too. The beauty-only sky control passed six
+  fixed independent pairs with zero faithful image differences (`sky-beauty-only-order-*`).
+  At true4× MSAA, 120 warmups/600 ABC/CBA samples gave GPU medians
+  1.472250/1.418250/1.367875 ms for grouped/native30/isolated beauty sky:
+  −0.104375 ms versus the original, with zero differing first-frame bytes
+  (`sky-4x-beauty-only-control`). The final coherent-source run
+  (`sky-4x-beauty-only-final`) measured 1.174417/1.163542/1.083167 ms respectively
+  (−0.091250 ms versus grouped), also with zero differing first-frame bytes;
+  CPU encode/submit medians were 1.296791/1.343583/1.325000 ms. These are
+  faithful full-world 1920×1200 runs at actual4× MSAA, not Enhanced-performance
+  or real-window claims. This isolates the native sky's dependence on world-MRT
+  pass context/lifetime; the precise driver compiler/tile mechanism remains
+  **[INFERENCE]**. No repeat tolerance or retry-to-pass is introduced.
 - **Enhanced MSAA capabilities**: requesting adapter-specific sample counts requires enabling wgpu29 `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` when the adapter offers it, not merely reading `get_texture_format_features`. Without that device feature, use the guaranteed format capabilities instead. Supported MSAA levels are the intersection for output color and `Depth32Float`; requests clamp downward to that intersection. This fixes validation for adapter-only 2×/8× levels without changing the retail-faithful default of 1 sample (MSAA off).
 - Camera: `Scene::spawn` (looking at `spawn_look_at`, else horizontally toward the bounds centre) if set, else a 3/4 view framing the instance bounds. `--eye/--at` override it for both the screenshot and the interactive viewer.
 - Viewer controls: WASD move, Space/E up, Ctrl/Q down, Shift ×5 speed, scroll = speed ×1.15 per notch, hold right mouse = mouse-look (cursor locked), Esc quits. Title shows FPS, position, speed. `AOMAC_NOVSYNC=1` disables vsync and keeps rendering uncapped. On macOS, vsynced rendering yields the AppKit runloop using `WaitUntil` at the current monitor's native refresh period instead of continuously filling the drawable queue; unavailable native refresh information retains GPU vsync without inventing a rate. Backing-scale changes update both GUI drawing and cursor conversion. `AOMAC_PERF=1` prints start camera, scene bounds and per-0.5-second frame/render CPU timings, surface acquisition, GUI/frame work, reconfigure, present, worst frame-entry gap, attempts/presented frames, visible instances and draw calls.
@@ -406,6 +439,13 @@ Runnable GPU regressions (added, not run by this worker): `cargo test --release 
 ### Sky, sun, time of day, view distance (`playfield/sky.rs`, `environment.rs`)
 The client has **no sky data in the playfield records**: the sky is a set of FXS tweak objects loaded from `cd_image/twk/*.txt` (`Tweak_Playfield_<id>.txt`, else `Tweak_Playfield_OutdoorDefault/IndoorDefault.txt`, which `!include` `Tweak_Rubi-Ka_{Atmosphere,SunLight,Sun,Horizon,ThickClouds,SingleClouds,Moon1..3,DotStars}.txt`; Shadowlands `Tweak_Shadowlands_*`; indoor: `Tweak_BlackBackground` + `Tweak_Rubi-Ka_IndoorLight`). RE evidence: `GfxVisualSkyrise` / `_GfxControlSkyRise_t` (Gamecode @0x100ef7a5) is the effect-object path, but the Rubi-Ka sky is plain tweak script. Expressions evaluate **left to right** (`This.CloudScrollX + GAME.HighAltitudeWindX % 1` only makes sense that way).
 * **Time and ICC's frozen interface [CODE+DATA]**: `GameDayTime` is the native 0..6480 export; normal `Tweak_GAME.txt` maps `CurrentDayTime = This.GameDayTime`, `DayTimeFactor = This.CurrentDayTime / 6480`, `DayTimeForGroundShadows = This.GameDayTime * 15`, and `Sun1/2Rotation = This.GameSun1/2Rotation`. **ICC (pf4582) deliberately freezes its sky**: `Tweak_Playfield_4582.txt` lines3–4 include OutdoorDefault then `Tweak_GAME_FrozenTime.txt`; the latter defines another `Object GAME` with `CurrentDayTime 2648.69`, fixed ground-shadow time `2648.69 * 15`, and fixed sun quaternions. This is not an ignored duplicate: FXS `ReadFromScript` @`1000132f` finds the existing named handle, calls `CleanObject` @`10003961` (clears all variable/child/state maps), and rereads the replacement; `SetVariable` @`100036fd` likewise replaces a same-name variable. Lazy external references resolve the final object through `QueryObject`/`GetVariable` (`100022d7`). DisplaySystem @`1005cdcf` rebinds changed objects (`class+4`) and writes **only** `GameDayTime` (`+2e8`, native environment `+10`) and `GameSun1/2Rotation` (`+2f0/+2f4`, native environment `+30/+40`), never the frozen `CurrentDayTime` or `Sun1/2Rotation`. Thus ICC sky colours, fog tint, ambient/sun/cloud lighting, moons, sun fans and ground-shadow selection remain at the authored frozen interfaces while the physical server clock, weather, wind and wave animation stay live. The port resolves final GAME interfaces in both resource snapshots and per-frame poses; no playfield-ID special case. Frozen quaternions are `q(0.900351,-0.0951056,0.344078,0.248863)` and `q(0.836913,-0.1626300,0.384351,0.354122)`. **`q(a,b,c,d)` is (x,y,z,w)** (FXS `10009c3b`); sun fan local −Z points toward sun1 at (−0.57,0.51,0.64), about31° elevation; `TweakedSunDirection = +Z [ROT] Sun1Rotation` is the opposite light-travel direction. Axis-angle uses written degrees (FXS `100098e8`/`10009a76`). Colour tracks use the native count-scaled cyclic sampler below, not the former N−1 guess. Added regressions cover replacement rather than merging, frozen interface versus live native exports, fixed ground-shadow time and real ICC sky/light invariance; this worker did not run them.
+  `Scene::daylight` independently samples the authored
+  `GAME.CurrentDayIntensity` (`DayIntensity` at that same native interface clock)
+  in `sky/layers.rs` during emission and pose updates. Finite values clamp to
+  `[0,1]`; missing/nonfinite data stays closed (`None`/zero eligibility).
+  Enhanced daylight/grass eligibility therefore does not infer day from bright
+  sun RGB. ICC retains its authored frozen-day classification; actual night
+  evidence comes from native Borealis/Newland clocks, not an ICC clock override.
 * **Float-array sampling and packed station tint [CODE, fresh RE 2026-10-15]**: FXS evaluator `10005600` dispatches a Float index to variable vtable `+0x38` → `10003d24`. For count N it computes `x=f32(N*factor)`, `i=u32(roundToNearestEven(x−f32(0.49999)))`, clamps unsigned `i>=N` to `N−1`, picks `next=i+1` when in range and **0 otherwise**, and returns `a[i]+(a[next]−a[i])*(x−i)`. Constant `10012480` is double0.49999. There is no factor clamp/modulo: factor1 reaches element0 through the last→first interval, and outside-domain factors extrapolate after the unsigned-index clamp. Vector sampler `10003e31` has the same indexing. Shared `sky::sample` now follows this code for atmosphere/light/fog/night tracks and scalar cross-object Float-array reads; the prior `(N−1)*factor` was an actual brightness/time mismatch, not retail evidence. Regression `float_arrays_follow_native_count_scaled_cyclic_end_and_unsigned_clamp` covers four-element fractional/end/outside fixtures. Station factors also formerly collapsed to zero because the scalar evaluator lacked `<|` clamps, external `Atmosphere.ColorTop*` references and packed `|`. `script::unsigned` preserves ARGB bits and applies native per-operation unsigned conversion (`10005600`, runtime result conversion `1000a9b7`): `0xFF*ColorR` becomes an integer byte **before** multiplication by `0x10000`, avoiding fractional-channel bleed. `packed_atmosphere_tint_preserves_unsigned_bits_and_cross_object_array_samples` covers that chain; the real-data horizon/station regression requires nonzero RGB and authored alpha48/255 for BattleStation_01,128/255 for _02..04. No checks were run by this worker.
 * **Atmosphere [CODE+DATA, fresh RE 2026-10-15]**: `Tweak_Rubi-Ka_Atmosphere.txt` lines3–8 authors exactly six strip points, AO `(±1,0,1)`, `(±1,.4,.2)`, `(±1,.4,−.5)`. FXS `GetPoint10001efd` → `10001d64` directly multiplies by Size1000 (no radial normalization). DisplaySystem `1005c917` applies Scale*far/1000, camera translation, and RotationType2 (`e_LockToCameraY`), deriving yaw from camera forward with atan2, never pitch. `Sky::atmosphere` now emits those six points and expands the strip into four triangles; `Scene.sky_yaw` follows camera yaw each frame. The invented 24×12 dome, curved elevation gradient and −15° below-horizon ring are removed. Bottom pair uses Bottom RGB/I; remaining four use Top RGB/I; no geometry below y0. CULL_NONE, ZFUNC_ALWAYS, no z write, alpha blend and source fog follow the script. Regression: `atmosphere_is_the_native_six_vertex_strip_not_a_below_horizon_dome`.
 * **Fog tint**: `AddFog(R,G,B,0.025)`, intensity `(BottomI+MiddleI)/2`, RGB `(Bottom+Middle)/2·intensity`. `VisualFog::AddFog1005820c` takes weighted mean `(d·new+D·old)/(d+D)` and max density; `process10058443` sets end=`far−(far−near−5)·D` when far−near>5. Density100% therefore ends at near+5, naturally fogging distant world/sky.
@@ -621,6 +661,16 @@ It is not the earlier south-facing beach view or a recovered retail capture.
   ALPHAREF24=0 (`10041fa7..aa`), ALPHAFUNC25=GREATEREQUAL7
   (`10041fb5..b9`; immaterial while disabled). The moon precedes the cloud,
   so a later moon cannot be rejected by a transparent cloud depth write.
+  Fresh `10054e07` raster-loop trace: the loop index advances once per sheet up
+  to `this+0x2f8` (30), and each nonzero-opacity sheet independently calls
+  `render_t::RenderTriangleList` with that sheet's vertex/index buffers
+  (`+0x744/+0x6cc`, `+0x7bc`, counts `+0x654/+0x834`). Materials change only
+  at sheet indices 0, 2, 4 and 27; these four material ranges are not four
+  native geometry submissions.
+  Randy's matching raw indexed overload `10021e41` immediately invokes
+  `IDirect3DDevice7::DrawIndexedPrimitive` at device vtable `+0x68` (or the
+  dynamic-VB indexed overload in debugger mode `0x200`), not a material-range
+  batch accumulator.
 * **Cloud diffuse alpha [CODE]:** `1005485a` computes sheet opacity
   `1 − storm²` (`10054cc7..10054cdf`); raster`10054e07` converts it to
   `trunc(255×opacity)` (`10054f38..10054f64`) and writes that same byte
