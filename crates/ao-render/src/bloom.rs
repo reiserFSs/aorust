@@ -2,7 +2,7 @@
 use crate::gpu_stats::{GpuStatsExt, TextureViewStatsExt};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-const LEVELS: usize = 4;
+const LEVELS: usize = 6;
 
 pub(super) struct Bloom {
     pub size: (u32, u32),
@@ -64,7 +64,7 @@ impl Pass {
 impl Bloom {
     pub fn new(device: &wgpu::Device, size: (u32, u32), beauty: &wgpu::TextureView,
         emission: &wgpu::TextureView, presentation: &wgpu::BindGroupLayout) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Energy-redistributing bloom"), source: wgpu::ShaderSource::Wgsl(include_str!("bloom.wgsl").into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Visible-source bounded bloom"), source: wgpu::ShaderSource::Wgsl(include_str!("bloom.wgsl").into()) });
         let entries = std::array::from_fn::<_, 4, _>(|i| wgpu::BindGroupLayoutEntry {
             binding: i as u32, visibility: wgpu::ShaderStages::FRAGMENT,
             ty: if i == 3 {
@@ -128,6 +128,29 @@ impl crate::Renderer {
                 &frame.composite.get_bind_group_layout(0)));
         }
     }
+    /// Explicit offline diagnostic; no resources or passes exist until requested.
+    pub fn emissive_seed_rgba(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(frame) = self.enhanced_frame.as_ref() else { return Ok(None); };
+        let Some(emission) = frame.emissive.as_ref() else { return Ok(None); };
+        let output = self.device.create_texture_tracked(&wgpu::TextureDescriptor {
+            label: Some("Authored emission mask diagnostic"),
+            size: wgpu::Extent3d { width: frame.size.0, height: frame.size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let bind = self.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor {
+            label: Some("Authored emission mask diagnostic"), layout: &frame.composite.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(emission) }],
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        frame.composite(&mut encoder, &output.create_view_tracked(&Default::default()), Some(&bind), None);
+        self.queue.submit([encoder.finish()]);
+        let mut pixels = crate::texture_to_rgba(self, &output, frame.size.0, frame.size.1)?;
+        if self.format == wgpu::TextureFormat::Bgra8Unorm {
+            for pixel in pixels.chunks_exact_mut(4) { pixel.swap(0, 2); }
+        }
+        Ok(Some(pixels))
+    }
 }
 
 #[cfg(test)]
@@ -135,7 +158,7 @@ mod tests {
     use super::*;
     #[test]
     fn half_resolution_pyramid_handles_odd_and_tiny_frames() {
-        assert_eq!(sizes((1920, 1200)), [(960,600),(480,300),(240,150),(120,75)]);
+        assert_eq!(sizes((1920, 1200)), [(960,600),(480,300),(240,150),(120,75),(60,38),(30,19)]);
         assert_eq!(sizes((3,5)), [(2,3),(1,2),(1,1)]);
         assert_eq!(sizes((1,1)), [(1,1)]);
     }
@@ -159,7 +182,7 @@ mod tests {
         material.base_color = [1.0; 4];
         material.prelit = true;
         material.lighting_enabled = false;
-        assert!(!marked(&material), "bright, prelit and unlit are not emission provenance");
+        assert!(!marked(&material), "brightness/prelit cannot become additive provenance; unlit uses its own native bit");
     }
     #[test]
     fn installed_light_bar_carries_authored_emission() {
@@ -203,7 +226,7 @@ mod tests {
                     view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None }] });
         let mut bloom = Bloom::new(&r.device, size, &bv, &ev, &presentation);
         assert_eq!(bloom.size, size);
-        assert_eq!(bloom.bytes, 12_344, "four levels, odd-size texture storage and one output, no history");
+        assert_eq!(bloom.bytes, 12_384, "odd-size texture storage and one output, no history");
         let upload = |texture: &wgpu::Texture, pixels: &[[u16; 4]]| r.queue.write_texture(
             texture.as_image_copy(), bytemuck::cast_slice(pixels),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.0 * 8), rows_per_image: Some(size.1) },
@@ -264,31 +287,32 @@ mod tests {
         sources[center] = [0x3c00; 4];
         let glare = run(&pixels, &sources);
         assert!(glare.iter().enumerate().any(|(i, &v)| i != center && v > 0.0), "visible emission produces a halo");
-        assert!(glare.iter().sum::<f32>() <= 1.001, "halo is paid by dimming its source");
+        assert_eq!(glare[center], 1.0, "bloom must never dim the native emitter core");
+        assert!(glare.iter().sum::<f32>() <= 1.501, "halo energy stays within the half-strength source budget");
         assert!(run(&pixels, &none).iter().enumerate().all(|(i, &v)| v == if i == center { 1.0 } else { 0.0 }),
             "a source fully removed by world depth leaves no bloom signal");
         pixels[center] = [0x4000; 4]; // Synthetic over-range input; displayed envelope stays one.
         sources[center] = [0x4000; 4];
-        assert!(run(&pixels, &sources).iter().sum::<f32>() <= 1.001,
-            "display clipping cannot mint an unpaid halo");
+        assert!(run(&pixels, &sources).iter().sum::<f32>() <= 1.501,
+            "display clipping cannot mint additional halo budget");
         pixels.fill([0x3400, 0x3400, 0x3400, 0x3c00]); // quarter-bright receivers
         pixels[center] = [0x3c00; 4];
         sources[center] = [0x3c00; 4];
         let lens = run(&pixels, &sources);
         assert!(lens.iter().enumerate().any(|(i, &v)| i != center && v > 0.25),
             "already-visible emission can produce lens glare over geometry");
-        assert!(lens.iter().enumerate().all(|(i, &v)| i == center || v <= 0.25 + 24.0 / 255.0),
-            "net lens glare is capped at 24 display-code luminance levels");
-        assert!(lens.iter().sum::<f32>() <= count as f32 * 0.25 + 0.751,
-            "geometry overlays remain paid by visible source energy");
+        assert!(lens.iter().enumerate().all(|(i, &v)| i == center || v <= 0.25 + 64.0 / 255.0),
+            "net lens glare is capped at 64 display-code luminance levels");
+        assert!(lens.iter().sum::<f32>() <= count as f32 * 0.25 + 1.251,
+            "added glare stays within the visible source's own half-strength budget");
         pixels.fill([0x2800, 0x2800, 0x2800, 0x3c00]);
         pixels[center] = [0x3c00; 4];
-        assert!(run(&pixels, &sources).iter().enumerate().all(|(i, &v)| i == center || v <= 0.03125 + 24.0 / 255.0),
+        assert!(run(&pixels, &sources).iter().enumerate().all(|(i, &v)| i == center || v <= 0.03125 + 64.0 / 255.0),
             "dark geometry uses the same receiver-independent glare cap");
         pixels[center] = [0x3c00, 0, 0, 0x3c00];
         sources[center] = [0x3c00, 0, 0, 0x3c00];
         assert!(run(&pixels, &sources).iter().enumerate().all(|(i, &v)|
-            i == center || (v - 0.03125) * 0.2126 <= 24.0 / 255.0),
+            i == center || (v - 0.03125) * 0.2126 <= 64.0 / 255.0),
             "saturated red glare obeys the luminance cap, not a white-source shortcut");
         pixels.fill([0x3c00; 4]);
         sources.fill([0x3c00; 4]);
@@ -296,11 +320,11 @@ mod tests {
         sources[center] = [0; 4];
         let capped = run(&pixels, &sources)[center];
         assert!(capped > 0.03125 + 1.0 / 255.0, "glare is visibly stronger than a one-level cap");
-        assert!(capped <= 0.03125 + 24.0 / 255.0, "dense sources cannot exceed the net luma cap");
+        assert!(capped <= 0.03125 + 64.0 / 255.0, "dense sources cannot exceed the net luma cap");
         for (i, (pixel, source)) in pixels.iter_mut().zip(&mut sources).enumerate() {
             if i != center { *pixel = [0x3c00, 0, 0, 0x3c00]; *source = *pixel; }
         }
-        assert!((run(&pixels, &sources)[center] - 0.03125) * 0.2126 <= 24.0 / 255.0,
+        assert!((run(&pixels, &sources)[center] - 0.03125) * 0.2126 <= 64.0 / 255.0,
             "dense saturated sources cannot bypass the luminance cap");
         assert!(!include_str!("bloom.wgsl").contains("texture_depth"),
             "lens reconstruction must not expose receiver depth silhouettes");

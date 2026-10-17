@@ -39,29 +39,27 @@ fn downsample(p: vec4<f32>, bounded: bool) -> vec4<f32> {
     let q = vec2<i32>(p.xy);
     let a = textureLoad(fine, q, 0);
     let b = textureLoad(coarse, q / 2, 0);
-    return vec4<f32>((a.rgb + b.rgb) * 0.5, 0.0);
+    return vec4<f32>(a.rgb * 0.25 + b.rgb * 0.75, 0.0);
 }
 @fragment fn composite(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let q = vec2<i32>(p.xy);
     let raw_beauty = textureLoad(fine, q, 0);
     let beauty = vec4<f32>(clamp(raw_beauty.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), raw_beauty.a);
-    let emission = textureLoad(seed, q, 0);
     let halo = textureLoad(coarse, q / 2, 0);
     let strength = clamp(params.strength, 0.0, 1.0);
-    let credit = min(max(emission.rgb, vec3<f32>(0.0)), beauty.rgb) * strength;
-    // Lens glare only: world lighting is unchanged. Its energy is paid by
-    // dimming visible emission, never by extracting ordinary bright surfaces.
+    // Add bounded optical glare without debiting the native emitter core.
+    // The conservative pyramid bounds its own energy by the visible-source
+    // budget; net camera-image energy gain is explicitly permitted.
     var received = halo.rgb * strength;
     // Source visibility comes ONLY from the world pass's depth-tested mask.
     // Never classify/gate receivers: doing so could silhouette a dark actor.
-    // Net lens-glare luma is capped at 24 display-code levels. Reserve f16
-    // rounding headroom; the pyramid's falloff and source debit bound energy.
+    // Net lens-glare luma is capped at 64 display-code levels. Reserve f16
+    // rounding headroom; pyramid falloff bounds the source's halo budget.
     let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
-    let safe_cap = 24.0 / 255.0 - 1.0 / 2048.0;
+    let safe_cap = 64.0 / 255.0 - 1.0 / 2048.0;
     let received_luma = dot(received, luma);
-    let credit_luma = dot(credit, luma);
-    if received_luma - credit_luma > safe_cap {
-        received *= (credit_luma + safe_cap) / received_luma;
+    if received_luma > safe_cap {
+        received *= safe_cap / received_luma;
     }
-    return vec4<f32>(clamp(beauty.rgb - credit + received, vec3<f32>(0.0), vec3<f32>(1.0)), beauty.a);
+    return vec4<f32>(clamp(beauty.rgb + received, vec3<f32>(0.0), vec3<f32>(1.0)), beauty.a);
 }

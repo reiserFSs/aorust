@@ -1390,7 +1390,7 @@ MSAA is independently selectable; there is no player-facing master/HDR switch.
 | Shadow Map Size / `AomacShadowMapSize` | 1024 | 256–4096 (UI choices 256/512/1024/2048/4096) |
 | Ambient Occlusion Radius / `AomacAoRadius` | 1 m | 0–5 m |
 | Ambient Occlusion Strength / `AomacAoStrength` | 1 | 0–1 |
-| Emissive Bloom Strength / `AomacBloomStrength` | 0.15 | 0–1 |
+| Emissive Bloom Strength / `AomacBloomStrength` | 0.6 | 0–1 |
 | Ground Grass Density / `AomacGrassDensity` | 1 | 0–2 |
 | Ground Grass Distance / `AomacGrassDistance` | 30 m | 0–35 m |
 

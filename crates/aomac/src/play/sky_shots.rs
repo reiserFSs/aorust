@@ -403,7 +403,13 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
         writeln!(manifest, "enhanced_settings={settings:?}")?;
         let baseline = std::env::var_os("AOMAC_GFX_BASELINE").map(PathBuf::from);
         let actor = graphics_fixture_actor()?;
-        let views = graphics_fixture_views(&actor);
+        let mut views = graphics_fixture_views(&actor);
+        let selected = std::env::var("AOMAC_GFX_VIEW").ok();
+        if let Some(name) = &selected {
+            views.retain(|(view, _, _, _)| view == name);
+            ensure!(!views.is_empty(), "unknown AOMAC_GFX_VIEW {name:?}");
+        }
+        writeln!(manifest, "selected_view={selected:?}")?;
         writeln!(manifest, "actor_source=docs/captures/zone_ithaca.rec actor_id=25988 actor_name={:?} actor_pos={:?} actor_yaw={:?} actor_pose=idle actor_time=0", actor.name, actor.pos, actor.yaw())?;
         writeln!(manifest, "borealis_lightbar_fixture_override=Testy mount5 mesh26163 field0 byte0 pos[679.6,72.8,-482.7] yaw0 pose_idle_time0 native_mounted_lights=enabled")?;
         std::fs::write(out.join("manifest.txt"), &manifest)?;
@@ -440,6 +446,11 @@ fn graphics_offline_fixture() -> anyhow::Result<()> {
                     list = off.frame(&mut shot, 0.0);
                 }
                 let raw = off.rgba(&shot, &list)?;
+                if measure && profile == "bloom" && name == "borealis-lightbar-night" {
+                    let mask = off.emissive_seed_rgba()?.context("Bloom emission mask")?;
+                    image::save_buffer(out.join("borealis-lightbar-night-emissive-mask.png"),
+                        &mask, size.0, size.1, image::ColorType::Rgba8)?;
+                }
                 if measure && profile == "shadows" && std::env::var_os("AOMAC_GFX_SHADOW_TIMING").is_some() {
                     graphics_shadow_timing(&mut off, &out, &name)?;
                 }

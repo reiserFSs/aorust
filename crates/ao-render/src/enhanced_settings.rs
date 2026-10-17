@@ -18,7 +18,7 @@ impl Default for EnhancedSettings {
     fn default() -> Self {
         Self {
             sun_shadows: false, ambient_occlusion: false, emissive_bloom: false, ground_grass: false,
-            shadow_map_size: 1024, ao_radius: 1.0, ao_strength: 1.0, bloom_strength: 0.15,
+            shadow_map_size: 1024, ao_radius: 1.0, ao_strength: 1.0, bloom_strength: 0.6,
             grass_density: 1.0, grass_distance: 30.0,
         }
     }
@@ -55,6 +55,7 @@ mod tests {
     fn defaults_flags_and_quality_bounds() {
         let defaults = EnhancedSettings::default();
         assert!(!defaults.any_enabled());
+        assert_eq!(defaults.bloom_strength, 0.6);
         assert_eq!(defaults.clamped(), defaults);
         for mask in 0..16 {
             let settings = EnhancedSettings {
