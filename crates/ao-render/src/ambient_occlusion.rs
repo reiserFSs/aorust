@@ -1,4 +1,4 @@
-//! Half-resolution ambient-only AO. Inputs are exclusively current visible depth.
+//! Half-resolution diffuse-contact AO. Inputs are exclusively current visible depth.
 use crate::gpu_stats::GpuStatsExt;
 use glam::Mat4;
 
@@ -42,7 +42,7 @@ impl AmbientOcclusion {
                 texture(3, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ambient-only HBAO-lite"), source: wgpu::ShaderSource::Wgsl(include_str!("ambient_occlusion.wgsl").into()) });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("diffuse-contact HBAO-lite"), source: wgpu::ShaderSource::Wgsl(include_str!("ambient_occlusion.wgsl").into()) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ambient AO"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let make_pipeline = |entry, format, blend| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(entry), layout: Some(&pipeline_layout),
@@ -170,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn world_mrt_excludes_baked_unlit_glow_and_occluded_emission() {
+    fn world_mrt_reduces_baked_excludes_unlit_glow_emissive_and_occluded_emission() {
         use crate::*;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let mut r = Renderer::new(&instance, None).expect("MRT fairness requires offscreen GPU");
@@ -195,9 +195,13 @@ mod tests {
         let output = r.device.create_texture_tracked(&wgpu::TextureDescriptor { label: Some("MRT byte probe"), size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: r.format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[] });
         let view = output.create_view(&Default::default());
         let targets = Targets::new(&r, 32, 32);
-        let capture = |r: &Renderer, emission| {
+        let capture = |r: &Renderer, emission: Option<bool>| {
             let frame = r.enhanced_frame.as_ref().unwrap();
-            let input = if emission { frame.emissive.as_ref().unwrap() } else { frame.ambient.as_ref().unwrap() };
+            let input = match emission {
+                Some(true) => frame.emissive.as_ref().unwrap(),
+                Some(false) => frame.ambient.as_ref().unwrap(),
+                None => &frame.colour,
+            };
             let bind = r.device.create_bind_group_tracked(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) }] });
             let mut encoder = r.device.create_command_encoder(&Default::default());
             {
@@ -207,10 +211,10 @@ mod tests {
             r.queue.submit([encoder.finish()]);
             texture_to_rgba(r, &output, 32, 32).unwrap()
         };
-        for mode in 0..4 {
+        for mode in 0..5 {
             let mesh = ao_scene::Mesh {
                 vertices: [(-0.5,-0.5),(0.5,-0.5),(0.5,0.5),(-0.5,0.5)].into_iter().map(|(x,y)| ao_scene::Vertex { pos: [x,y,0.0], normal: [0.0,0.0,1.0], color: [0.1,0.1,0.1,1.0], ..Default::default() }).collect(),
-                submeshes: vec![ao_scene::Submesh { two_sided: true, prelit: mode == 1, lighting_enabled: mode != 2, glow_mask: mode == 3, ..ao_scene::Submesh::new(vec![0,1,2,0,2,3], None) }],
+                submeshes: vec![ao_scene::Submesh { two_sided: true, prelit: mode == 1, lighting_enabled: mode != 2, glow_mask: mode == 3, emissive: if mode == 4 { [0.2; 3] } else { [0.0; 3] }, ..ao_scene::Submesh::new(vec![0,1,2,0,2,3], None) }],
             };
             let scene = Scene { meshes: vec![mesh], ..Default::default() };
             r.add_actor_model(mode + 1, &scene);
@@ -231,13 +235,19 @@ mod tests {
                 r.env.ambient = [0.2; 3];
                 r.env.sun_color = [0.0; 3];
                 r.render(&view, &targets, &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
-                let ambient = capture(&r, false);
+                let ambient = capture(&r, Some(false));
                 let has_ambient = ambient.as_chunks::<4>().0.iter().any(|pixel| pixel[..3] != [0,0,0]);
-                assert_eq!(has_ambient, mode == 0, "ambient MRT mode={mode} actor={actor_path}: only ordinary lit materials receive AO");
+                assert_eq!(has_ambient, mode <= 1, "AO receiver MRT mode={mode} actor={actor_path}: ordinary and reduced baked materials only");
+                if mode == 1 {
+                    let beauty = capture(&r, None);
+                    for (receiver, colour) in ambient.iter().zip(beauty.iter()).enumerate().filter_map(|(index, pair)| (index % 4 != 3).then_some(pair)) {
+                        assert!(i32::from(*receiver) * 5 <= i32::from(*colour) + 5, "baked receivers are bounded to 20% of native beauty");
+                    }
+                }
                 if mode == 0 {
-                    assert!(capture(&r, true).as_chunks::<4>().0.iter().all(|pixel| pixel[..3] == [0,0,0]), "bright ordinary material is not emission");
+                    assert!(capture(&r, Some(true)).as_chunks::<4>().0.iter().all(|pixel| pixel[..3] == [0,0,0]), "bright ordinary material is not emission");
                 } else if mode == 2 || mode == 3 {
-                    assert!(capture(&r, true).as_chunks::<4>().0.iter().any(|pixel| pixel[..3] != [0,0,0]), "authored unlit/glow produces a nonzero visible emission mask");
+                    assert!(capture(&r, Some(true)).as_chunks::<4>().0.iter().any(|pixel| pixel[..3] != [0,0,0]), "authored unlit/glow produces a nonzero visible emission mask");
                 }
             }
         }
@@ -247,7 +257,7 @@ mod tests {
         hidden_emitter.transform[3][2] = -3.0;
         r.set_actors(vec![wall, hidden_emitter]);
         r.render(&view, &targets, &Camera::look_at(Vec3::ZERO, Vec3::NEG_Z));
-        assert!(capture(&r, true).as_chunks::<4>().0.iter().all(|pixel| pixel[..3] == [0,0,0]), "occluded glow actor cannot seed bloom");
+        assert!(capture(&r, Some(true)).as_chunks::<4>().0.iter().all(|pixel| pixel[..3] == [0,0,0]), "occluded glow actor cannot seed bloom");
         assert!(r.ambient_occlusion_incremental_bytes() > 0);
         assert!(r.ambient_occlusion.is_some(), "AO must have encoded before testing resource retirement");
         r.set_enhanced_settings(EnhancedSettings::default());

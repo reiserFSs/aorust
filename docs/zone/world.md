@@ -478,7 +478,7 @@ the corpse to the dead character's relative position when closer than a threshol
   to `Play::dungeon`; a dungeon always says `EnteringNewArea` like `N3Msg_IsDungeon`, also when `pfnrmap.dat` names it.
 * **Not implemented**: `SaveAllPrefs` and the two `ParseList`/present passes of `TeleportStartedMessage` (no effect on state/visuals we draw).
 
-## 11. Optional Enhanced ambient occlusion
+## 11. Optional Enhanced diffuse-contact ambient occlusion
 
 `ambient_occlusion` defaults off. This is an enhancement, not a claim about
 retail rendering. `ao-render/src/ambient_occlusion.rs` and its WGSL use only
@@ -486,21 +486,27 @@ the current primary-view resolved depth, with no actor traversal or temporal
 history. Six directions with four bounded horizon samples run at half
 resolution; world-distance bilateral filtering and upsampling reject
 foreground/background discontinuities instead of bleeding an AO silhouette.
-The float shader subtracts only the separately retained ambient contribution
-back into native UNORM colour, never multiplying the whole scene. Fog
-attenuation remains in that contribution. Depth at/beyond the current
-original fog end is rejected before normal reconstruction and gathering,
-so fully fog-hidden actors cannot influence nearer AO either.
-Native unlit, self-lit, special actor effects and prelit room materials have
-zero AO contribution; baked terrain palette lighting is also excluded.
-Prelit rooms therefore receive no second baked-shadow darkening.
+The float shader subtracts a separately retained, lit nonemissive receiving
+colour back into native UNORM colour. It retains the indirect term and 80%
+of direct diffuse lighting so contact remains visible in daylight; specular,
+fog colour, emissive, unlit and self-lit surfaces, liquids and UI are excluded.
+Native ground paths receive AO, including their existing two-pass lightmap
+multiplier. Baked/prelit rooms receive only 20% strength, avoiding a second
+full baked-shadow darkening. The receiving colour is derived after the native
+fragment body without new texture samples or derivatives after discard.
+Depth at/beyond the current original fog end is rejected before normal
+reconstruction and gathering, so fully fog-hidden actors cannot influence
+nearer AO either. The switch remains off by default; its default enabled
+strength is 1.0 and radius 1 metre.
 
 The asset-free offscreen regression
 `hidden_actor_cannot_change_visible_ao_and_zero_ambient_is_untouched`
 compares every output byte with wall-hidden and fully fog-hidden actors
-absent/present, checks zero-ambient beauty is unchanged, and asserts AO never
-increases a component. The MRT regression covers both static and actor
-materials: ordinary, baked/prelit, unlit and self-lit, plus an occluded emitter.
+absent/present, checks a zero receiving mask leaves beauty unchanged, and
+asserts AO never increases a component. The MRT regression covers both static
+and actor materials: ordinary, reduced baked/prelit, unlit, self-lit and
+emissive, plus an occluded emitter; baked receiving colour is checked against
+20% of actual beauty.
 AO's two RG32U half-resolution targets cache the exact selected pixel offset,
 half-precision AO and full32 depth, avoiding repeated four-depth reselection
 inside the filters. Targets plus the uniform cost
